@@ -8753,20 +8753,42 @@ static int dt_set_j713_display_maps(const struct adt_segment_ranges *segments, u
 static int dt_set_dcp_fw27_clocks(const char *alias, const char *adt_engine);
 
 /*
+ * Firmware 27 DCPs are given their firmware clocks by the OS: the one rule by which dcp's are
+ * published (dt_set_dcp_fw27_clocks()) and the external processors' handoff is chosen.
+ *
+ * This is a release test because no ADT property separates the two interfaces: on the 26.5.1
+ * J713 and 26.6.2 J773 ADTs the external processors already run dcp's uuid and share its __TEXT
+ * (same address and size), as on 27.2, yet they take the firmware-ready path there. Any firmware
+ * 27 boot takes this path and publishes each processor with its own uuid, firmware-version and
+ * memory; the kernel decides which releases it drives, and such a boot never gets the 26.6.2
+ * ready marker.
+ */
+static bool dt_dcp_fw_clocks(void)
+{
+    return os_firmware.version >= V27_0;
+}
+
+/*
  * Publish the inherited DCP firmware mapping without starting a display driver, on any M4 Mac
  * whose ADT describes an internal panel on disp0, whatever its firmware. The kernel picks the
- * display backend from the firmware the DCP runs.
+ * display backend from the firmware the DCP runs. *internal says what was done, for the
+ * external display processors (dt_set_dcpext_handoff()).
  */
-static int dt_set_m4_dcp_handoff(void)
+static int dt_set_m4_dcp_handoff(enum dcp_internal *internal)
 {
+    *internal = DCP_INTERNAL_NONE;
     int dcp_node = fdt_path_offset(dt, "dcp");
     if (dcp_node < 0)
         return 0; /* Older DT with simple-framebuffer only. */
-    if (chip_id != T8132 || fdt_node_check_compatible(dt, dcp_node, "apple,t8132-dcp"))
-        bail("FDT: unsupported native DCP handoff target\n");
     /* A Mac mini's disp0 is external: its DCP drives a port, not a panel. */
     int disp0 = adt_path_offset(adt, "/arm-io/disp0");
-    if (disp0 < 0 || adt_getprop(adt, disp0, "external", NULL))
+    if (disp0 >= 0 && adt_getprop(adt, disp0, "external", NULL)) {
+        *internal = DCP_INTERNAL_NO_PANEL;
+        bail("FDT: no internal panel, no native DCP handoff\n");
+    }
+    if (chip_id != T8132 || fdt_node_check_compatible(dt, dcp_node, "apple,t8132-dcp"))
+        bail("FDT: unsupported native DCP handoff target\n");
+    if (disp0 < 0)
         bail("FDT: no internal panel, no native DCP handoff\n");
 
     int nub = adt_path_offset(adt, "/arm-io/dcp/iop-dcp-nub");
@@ -8836,6 +8858,12 @@ static int dt_set_m4_dcp_handoff(void)
     if (maps && dt_set_dcp_fw27_clocks("dcp", "/arm-io/disp0"))
         printf("FDT: M4 DCP firmware clocks not published\n");
 
+    /* Complete: the maps, and the clocks firmware 27 needs (the kernel admits on them). */
+    dcp_node = fdt_path_offset(dt, "dcp");
+    if (maps && (!dt_dcp_fw_clocks() ||
+                 (dcp_node >= 0 && fdt_getprop(dt, dcp_node, "apple,clock-ids", NULL))))
+        *internal = DCP_INTERNAL_COMPLETE;
+
     printf("FDT: M4 DCP firmware mappings published; display device status unchanged\n");
     return 0;
 }
@@ -8855,7 +8883,7 @@ static int dt_set_dcp_fw27_clocks(const char *alias, const char *adt_engine)
         return 0;
     strcpy(path, alias_path);
     int node = fdt_path_offset(dt, path);
-    if (node < 0 || os_firmware.version < V27_0 || fdt_getprop(dt, node, "apple,clock-ids", NULL))
+    if (node < 0 || !dt_dcp_fw_clocks() || fdt_getprop(dt, node, "apple,clock-ids", NULL))
         return 0;
 
     int disp = adt_path_offset(adt, adt_engine);
@@ -8960,9 +8988,16 @@ static int dt_set_display(void)
         disp0_piodma_alias = compat_piodma_alias;
 
     if (chip_id == T8132) {
-        if (dt_set_m4_dcp_handoff())
+        enum dcp_internal internal;
+        int refused = dt_set_m4_dcp_handoff(&internal);
+        if (refused && internal != DCP_INTERNAL_NO_PANEL)
             printf("FDT: M4 DCP handoff refused; keeping the boot framebuffer\n");
-        else
+        /*
+         * The external processors of firmware the OS gives clocks (firmware 27) are handed over
+         * from the ADT by kboot_display_handoff.c, beside a complete internal handoff or with no
+         * panel; those of older firmware keep the firmware-ready path.
+         */
+        if (!dt_set_dcpext_handoff(dt, internal, dt_dcp_fw_clocks()) && !refused)
             dt_reserve_j713_dcpext();
         return 0;
     }
