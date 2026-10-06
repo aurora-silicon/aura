@@ -608,6 +608,8 @@ static int t8152_cpufreq_init(void)
 
 __attribute__((used, retain, noinline)) u64 cpufreq_get_cluster_hz(unsigned int cluster)
 {
+    if (chip_id == T6040)
+        return cpufreq_t6040_get_hz(cluster);
     if (cluster >= 2 || t8152_cpufreq_init())
         return 0;
     struct t8152_clock *c = &t8152_clocks[cluster];
@@ -621,6 +623,8 @@ __attribute__((used, retain, noinline)) u64 cpufreq_get_cluster_hz(unsigned int 
 __attribute__((used, retain, noinline)) int cpufreq_set_cluster_pstate(unsigned int cluster,
                                                                        unsigned int pstate)
 {
+    if (chip_id == T6040)
+        return cpufreq_t6040_set_pstate(cluster, pstate);
     if (cluster >= 2 || t8152_cpufreq_init())
         return -1;
     struct t8152_clock *c = &t8152_clocks[cluster];
@@ -672,6 +676,8 @@ void cpufreq_payload_boost(bool enable)
 
 int cpufreq_init(void)
 {
+    if (chip_id == T6040)
+        return cpufreq_t6040_init();
     if (chip_id == T8140) {
         printf("cpufreq: skipping T8140 P-state hold pending register evidence\n");
         return 0;
@@ -699,6 +705,10 @@ int cpufreq_init(void)
 
 void cpufreq_fixup(void)
 {
+    if (chip_id == T6040) {
+        printf("cpufreq: T6040 retains firmware clock policy; low-state proxy tests available\n");
+        return;
+    }
     if (chip_id == T8140)
         return;
 
