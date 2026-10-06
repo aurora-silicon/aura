@@ -666,6 +666,15 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
         case P_CPUFREQ_INIT:
             reply->retval = cpufreq_init();
             break;
+        case P_CPUFREQ_GET_CLUSTER_HZ:
+            reply->retval =
+                request->args[0] > UINT32_MAX ? 0 : cpufreq_get_cluster_hz(request->args[0]);
+            break;
+        case P_CPUFREQ_SET_CLUSTER_PSTATE:
+            reply->retval = request->args[0] > UINT32_MAX || request->args[1] > UINT32_MAX
+                                ? -1
+                                : cpufreq_set_cluster_pstate(request->args[0], request->args[1]);
+            break;
 
         case P_READ_GIGALOCKER: {
             size_t size = 0;

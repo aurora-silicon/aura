@@ -171,6 +171,7 @@ OBJECTS := \
 	chickens.o \
 	clk.o \
 	cpufreq.o \
+	cpufreq_t6040.o \
 	dapf.o \
 	dart.o \
 	dcp.o \
