@@ -25,6 +25,9 @@ int pmgr_adt_path_offset_trace(const void *adt_ptr, int *path);
 
 int pmgr_adt_power_enable(const char *path);
 int pmgr_adt_power_disable(const char *path);
+int pmgr_adt_power_disable_recursive(const char *path);
+/* 1: all real devices in this path's parent closure are power-gated; 0: active; -1: unknown. */
+int pmgr_adt_power_is_off(const char *path);
 int pmgr_adt_power_enable_traced(const char *path);
 struct pmgr_saved_mode {
     uintptr_t addr;

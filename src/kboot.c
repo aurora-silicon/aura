@@ -5,6 +5,7 @@
 #include <stdint.h>
 
 #include "kboot.h"
+#include "kboot_gpu_t8122.h"
 #include "adt.h"
 #include "asc.h"
 #include "assert.h"
@@ -4815,6 +4816,9 @@ int kboot_prepare_dt(void *fdt)
     assert(dt_bufsize);
 
     dt_bufsize += 6 * SZ_16K; // Add 96K of buffer for modifications
+    // A T8122 also takes its PMP values, GPU setup and identity, and optional GPU diagnostics
+    if (chip_id == T8122)
+        dt_bufsize += 10 * SZ_16K;
     dt = memalign(DT_ALIGN, dt_bufsize);
 
     if (fdt_open_into(fdt, dt, dt_bufsize) < 0)
@@ -4980,6 +4984,10 @@ int kboot_prepare_dt(void *fdt)
      */
     if (dt_set_memory())
         return -1;
+
+    /* Optional export goes last so it cannot consume space needed by fixups. */
+    if (chip_id == T8122)
+        dt_gpu_t8122_diagnostics(dt);
 
     /* Last, so that its values never take room the steps above need. */
     if (chip_id == T8122)

@@ -2,6 +2,10 @@
 
 #include "firmware.h"
 #include "adt.h"
+#include "exception.h"
+#include "gfx_fw_image_info.h"
+#include "mcc.h"
+#include "memory.h"
 #include "stdint.h"
 #include "string.h"
 #include "types.h"
@@ -149,8 +153,9 @@ const struct fw_version_info fw_versions[NUM_FW_VERSIONS] = {
     [V14_6B1]    = {V14_6B1,    "14.6 beta",   {14, 5, 98, 1}, 4, "iBoot-10151.140.18"},
     [V14_6]      = {V14_6,      "14.6",        {14, 6, 0},     3, "iBoot-10151.140.19"},
     [V14_7]      = {V14_7,      "14.7",        {14, 7, 0},     3, "iBoot-10151.140.19.700.2"},
-    // Same as 14.7
-    // {V14_8_3, "14.8.3", {14, 8, 3}, 3, "iBoot-10151.140.19.700.2"},
+    // Same iBoot string as 14.7: detect_firmware() always picks V14_7 (first match).
+    // V14_8_3 is only selected from the loaded GPU firmware, see firmware_gfx_version().
+    [V14_8_3]    = {V14_8_3,    "14.8.3",      {14, 8, 3},     3, "iBoot-10151.140.19.700.2"},
     [V15_0B1]    = {V15_0B1,    "15.0 beta",   {14, 98, 1},    3, "iBoot-11881.0.80.0.2"},
     [V15_0B2]    = {V15_0B2,    "15.0 beta2",  {14, 98, 2},    3, "iBoot-11881.0.193.501.1"},
     [V15_0B3]    = {V15_0B3,    "15.0 beta3",  {14, 98, 3},    3, "iBoot-11881.0.224.0.2"},
@@ -311,4 +316,258 @@ int firmware_init(void)
     }
 
     return 0;
+}
+
+// clang-format off
+/*
+ * GPU (gfx-asc) firmware identification.
+ *
+ * The 14.8.3 firmware reports the same iBoot string as 14.7, so detect_firmware() cannot tell
+ * them apart. The GPU firmware ABI is fixed by the image iBoot loaded into the gfx-asc text segment,
+ * so identify that image by content instead. The image has an image-info header at text+0x4200
+ * that carries its UUID. The code reads these header fields and accepts only the table below:
+ *   +0x00 u32 branch over the header (b +0x44 = 0x14000011)
+ *   +0x04 u32 magic 'uuid' (0x64697575 LE)
+ *   +0x08 u32 header version (5)
+ *   +0x0c u32 text offset of the RTKit version string
+ *   +0x10 u32 TEXT offset of the client version pointer
+ *   +0x14 u8[16] image UUID
+ *   +0x24 u32[2] zero
+ *   +0x2c u32 patchbay offset, +0x30 u32 patchbay size, +0x34 u32 text size
+ *
+ * Only an exact match of the whole identifying part of the header (branch, magic, version, UUID,
+ * patchbay offset/size, text size) against the table below counts as a positive identification.
+ * Anything else (no header, unknown image, read fault, odd ADT) makes firmware_gfx_version() return
+ * NULL, and the caller must then leave the GPU disabled.
+ */
+// clang-format on
+struct gfx_fw_image {
+    u32 chip; /* the SoC whose GPU runs this image (chip_id) */
+    enum fw_version version;
+    const char *image;
+    u8 uuid[16];
+    u32 patchbay_off;
+    u32 patchbay_size;
+    u32 text_size;
+    bool experimental; /* identified only by firmware_gfx_version_ex(chip, true) */
+};
+
+// clang-format off
+static const struct gfx_fw_image gfx_fw_images[] = {
+    /* 14.8.3 G15S firmware (InitData ver_info 0x0c08e21e83800490) */
+    {T6030, V14_8_3, "g15s build a0", {0x0c, 0xbb, 0x17, 0xaf, 0x78, 0x3d, 0x36, 0x7b,
+                                       0x9c, 0xed, 0xd5, 0x91, 0x09, 0x44, 0x73, 0x1e},
+     0x58e88, 0x1e8, 0x5c000},
+    {T6030, V14_8_3, "g15s build b0", {0xdb, 0xf3, 0x7c, 0x40, 0xea, 0xd5, 0x37, 0x60,
+                                       0x94, 0x41, 0x99, 0x50, 0x18, 0x78, 0x29, 0x55},
+     0x58e88, 0x1e8, 0x5c000},
+    /*
+     * T8122 (M3, G15G): the image iBoot loads on the M3 Air (J613, chip revision C0, RTKit
+     * 2419.140.12). Experimental: its ABI is taken to be the 14.8.3 G15S one and is not validated,
+     * so firmware_gfx_version(T8122) still identifies nothing and only the opt-in T8122 experiment
+     * accepts it.
+     */
+    {T8122, V14_8_3, "g15g build c0", {0xdf, 0x69, 0x7f, 0x05, 0xf6, 0xb5, 0x33, 0xef,
+                                       0xa1, 0x37, 0x61, 0xc4, 0xa7, 0x3d, 0x66, 0x6a},
+     0x5d54a, 0x1e8, 0x64000, true},
+};
+// clang-format on
+
+static bool gfx_fw_range_is_carveout(u64 base, u64 size)
+{
+    for (size_t i = 0; i < mcc_carveout_count; i++) {
+        u64 cb = mcc_carveouts[i].base, ce = cb + mcc_carveouts[i].size;
+        if (base < ce && (base + size) > cb)
+            return true;
+    }
+    return false;
+}
+
+static bool gfx_fw_range_is_dram(u64 base, u64 size)
+{
+    if (!ram_base || !mem_size_actual)
+        return false;
+    if (base + size < base)
+        return false;
+    return base >= ram_base && (base + size) <= (ram_base + mem_size_actual);
+}
+
+/*
+ * Read the header with synchronous aborts and SErrors trapped. The dsb/isb before dropping the
+ * guard makes sure an asynchronous SError from these loads is taken while the guard is still armed.
+ */
+static int gfx_fw_read_header(u64 addr, u32 *hdr)
+{
+    int exc_before = exc_count;
+
+    exc_guard = GUARD_MARK | GUARD_SILENT;
+    for (int i = 0; i < GFX_FW_HDR_SIZE / 4; i++)
+        hdr[i] = read32(addr + 4 * i);
+    sysop("dsb sy");
+    sysop("isb");
+    exc_guard = GUARD_OFF;
+
+    return exc_count == exc_before ? 0 : -1;
+}
+
+/*
+ * Return only the fixed image-info identity of the already-loaded GFX image.
+ * This diagnostic is not an ABI allowlist and does not start the GPU. The
+ * address and length come from iBoot's ADT; reject MMIO, carveouts, malformed
+ * extents and any read that faults before copying fields to the caller.
+ */
+bool firmware_gfx_image_info(struct gfx_fw_image_info *out)
+{
+    if (!out)
+        return false;
+    int node = adt_path_offset(adt, "/arm-io/gfx-asc");
+    if (node < 0)
+        return false;
+
+    u32 len = 0;
+    const struct adt_segment_ranges *seg = adt_getprop(adt, node, "segment-ranges", &len);
+    if (!seg || len != 2 * sizeof(*seg))
+        return false;
+    const char *names = adt_getprop(adt, node, "segment-names", &len);
+    if (!names || len < sizeof("__TEXT;") - 1 ||
+        memcmp(names, "__TEXT;", sizeof("__TEXT;") - 1))
+        return false;
+
+    u64 phys = seg[0].phys;
+    u32 size = seg[0].size;
+    if (!phys || size < GFX_FW_HDR_OFFSET + GFX_FW_HDR_SIZE || (phys & 3) ||
+        phys + GFX_FW_HDR_OFFSET < phys)
+        return false;
+    u64 addr = phys + GFX_FW_HDR_OFFSET;
+    if (!gfx_fw_range_is_dram(addr, GFX_FW_HDR_SIZE) ||
+        gfx_fw_range_is_carveout(addr, GFX_FW_HDR_SIZE))
+        return false;
+
+    u32 hdr[GFX_FW_HDR_SIZE / 4];
+    if (gfx_fw_read_header(addr, hdr))
+        return false;
+    return gfx_fw_parse_image_info(hdr, size, out);
+}
+
+bool firmware_gfx_rtkit_version(char out[GFX_FW_VERSION_MAX])
+{
+    if (!out)
+        return false;
+    struct gfx_fw_image_info image;
+    if (!firmware_gfx_image_info(&image))
+        return false;
+    if (image.rtkit_version_offset > image.text_size ||
+        GFX_FW_VERSION_MAX > image.text_size - image.rtkit_version_offset)
+        return false;
+
+    int node = adt_path_offset(adt, "/arm-io/gfx-asc");
+    if (node < 0)
+        return false;
+    u32 len = 0;
+    const struct adt_segment_ranges *seg = adt_getprop(adt, node, "segment-ranges", &len);
+    if (!seg || len != 2 * sizeof(*seg) ||
+        seg[0].phys + image.rtkit_version_offset < seg[0].phys)
+        return false;
+    u64 addr = seg[0].phys + image.rtkit_version_offset;
+    if (!gfx_fw_range_is_dram(addr, GFX_FW_VERSION_MAX) ||
+        gfx_fw_range_is_carveout(addr, GFX_FW_VERSION_MAX))
+        return false;
+
+    u8 bytes[GFX_FW_VERSION_MAX];
+    int before = exc_count;
+    exc_guard = GUARD_MARK | GUARD_SILENT;
+    for (size_t i = 0; i < sizeof(bytes); i++)
+        bytes[i] = read8(addr + i);
+    sysop("dsb sy");
+    sysop("isb");
+    exc_guard = GUARD_OFF;
+    return exc_count == before && gfx_fw_parse_rtkit_version(bytes, out);
+}
+
+/*
+ * Returns the firmware version whose GPU ABI is loaded in gfx-asc memory, or NULL if the loaded
+ * image could not be positively identified as one of `chip`'s known images (with `experimental`,
+ * the experimental ones included). Never faults the boot.
+ */
+const struct fw_version_info *firmware_gfx_version_ex(u32 chip, bool experimental)
+{
+    int node = adt_path_offset(adt, "/arm-io/gfx-asc");
+    if (node < 0) {
+        printf("FW: GFX: /arm-io/gfx-asc not found\n");
+        return NULL;
+    }
+
+    u32 len = 0;
+    const struct adt_segment_ranges *seg = adt_getprop(adt, node, "segment-ranges", &len);
+    if (!seg || len < sizeof(*seg) || len % sizeof(*seg)) {
+        printf("FW: GFX: gfx-asc has no valid segment-ranges (len %u)\n", len);
+        return NULL;
+    }
+
+    for (u32 i = 0; i < len / sizeof(*seg); i++) {
+        u32 hdr[GFX_FW_HDR_SIZE / 4];
+        u64 phys = seg[i].phys;
+        u32 size = seg[i].size;
+        u64 addr = phys + GFX_FW_HDR_OFFSET;
+
+        if (!phys || size < GFX_FW_HDR_OFFSET + GFX_FW_HDR_SIZE || (phys & 3))
+            continue;
+        /* Never issue loads outside DRAM (MMIO reads can have side effects) or into a TZ carveout
+         */
+        if (!gfx_fw_range_is_dram(addr, GFX_FW_HDR_SIZE)) {
+            printf("FW: GFX: segment %u at 0x%lx is not in DRAM, not reading it\n", i, phys);
+            continue;
+        }
+        if (gfx_fw_range_is_carveout(addr, GFX_FW_HDR_SIZE)) {
+            printf("FW: GFX: segment %u at 0x%lx is in a carveout, not reading it\n", i, phys);
+            continue;
+        }
+        if (gfx_fw_read_header(addr, hdr)) {
+            printf("FW: GFX: fault reading segment %u at 0x%lx\n", i, phys);
+            continue;
+        }
+        if (hdr[1] != GFX_FW_HDR_MAGIC)
+            continue;
+
+        const u8 *uuid = (const u8 *)&hdr[5];
+        printf("FW: GFX: image uuid "
+               "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x"
+               " hdr v%u pb 0x%x+0x%x text 0x%x (text at 0x%lx)\n",
+               uuid[0], uuid[1], uuid[2], uuid[3], uuid[4], uuid[5], uuid[6], uuid[7], uuid[8],
+               uuid[9], uuid[10], uuid[11], uuid[12], uuid[13], uuid[14], uuid[15], hdr[2], hdr[11],
+               hdr[12], hdr[13], phys);
+
+        if (hdr[0] != GFX_FW_HDR_BRANCH || hdr[2] != GFX_FW_HDR_VER || hdr[13] > size) {
+            printf("FW: GFX: unexpected image-info header, GPU firmware not identified\n");
+            return NULL;
+        }
+
+        for (size_t j = 0; j < ARRAY_SIZE(gfx_fw_images); j++) {
+            const struct gfx_fw_image *img = &gfx_fw_images[j];
+
+            if (img->chip != chip || (img->experimental && !experimental))
+                continue;
+            if (memcmp(uuid, img->uuid, sizeof(img->uuid)) || hdr[11] != img->patchbay_off ||
+                hdr[12] != img->patchbay_size || hdr[13] != img->text_size)
+                continue;
+
+            const struct fw_version_info *ver = &fw_versions[img->version];
+            printf("FW: GFX: identified image %s, firmware %s\n", img->image, ver->string);
+            if (strcmp(ver->iboot, os_firmware.iboot))
+                printf("FW: GFX: note: OS firmware iBoot is %s, the image belongs to %s\n",
+                       os_firmware.iboot, ver->iboot);
+            return ver;
+        }
+
+        printf("FW: GFX: unknown GPU firmware image, not identified\n");
+        return NULL;
+    }
+
+    printf("FW: GFX: no image-info header found, GPU firmware not identified\n");
+    return NULL;
+}
+
+const struct fw_version_info *firmware_gfx_version(u32 chip)
+{
+    return firmware_gfx_version_ex(chip, false);
 }

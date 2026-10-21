@@ -298,6 +298,31 @@ static int pmgr_set_mode_recursive(u8 die, u16 id, u8 target_mode, bool recurse,
     return pmgr_set_mode_recursive_inner(die, id, target_mode, recurse, trace, 0);
 }
 
+static int pmgr_device_is_off_recursive(u8 die, u16 id, unsigned int depth)
+{
+    const struct pmgr_device *device;
+
+    if (!pmgr_initialized || !id || depth > 16 || pmgr_find_device(id, &device))
+        return -1;
+    if (!(device->flags & PMGR_FLAG_VIRTUAL)) {
+        uintptr_t addr = pmgr_device_get_addr(die, device);
+        if (!addr)
+            return -1;
+        if (FIELD_GET(PMGR_PS_ACTUAL, read32(addr)) != PMGR_PS_PWRGATE)
+            return 0;
+    }
+    u16 parents[2];
+    pmgr_adt_get_parents(device, parents);
+    for (int i = 0; i < 2; i++) {
+        if (!parents[i])
+            continue;
+        int ret = pmgr_device_is_off_recursive(die, parents[i], depth + 1);
+        if (ret != 1)
+            return ret;
+    }
+    return 1;
+}
+
 int pmgr_power_enable(u32 id)
 {
     u16 device = FIELD_GET(PMGR_DEVICE_ID, id);
@@ -440,6 +465,28 @@ int pmgr_adt_power_enable(const char *path)
 int pmgr_adt_power_disable(const char *path)
 {
     return pmgr_adt_devices_set_mode(path, PMGR_PS_PWRGATE, false, false);
+}
+
+int pmgr_adt_power_disable_recursive(const char *path)
+{
+    return pmgr_adt_devices_set_mode(path, PMGR_PS_PWRGATE, true, false);
+}
+
+int pmgr_adt_power_is_off(const char *path)
+{
+    const u32 *devices;
+    u32 n_devices;
+
+    if (pmgr_adt_find_devices(path, &devices, &n_devices) < 0)
+        return -1;
+    for (u32 i = 0; i < n_devices; i++) {
+        u16 device = FIELD_GET(PMGR_DEVICE_ID, devices[i]);
+        u8 die = FIELD_GET(PMGR_DIE_ID, devices[i]);
+        int ret = pmgr_device_is_off_recursive(die, device, 0);
+        if (ret != 1)
+            return ret;
+    }
+    return 1;
 }
 
 int pmgr_adt_power_enable_traced(const char *path)
