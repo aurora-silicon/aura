@@ -60,8 +60,35 @@ static const display_config_t display_config_j873_hdmi = {
     .num_dptxports = 2,
 };
 
+/* J873g HDMI next to a USB-C display: the base DCP drives USB-C, so HDMI goes
+ * through DCPEXT0 (dispext0, source select 1). */
+static const display_config_t display_config_j873_hdmi_ext = {
+    .dcp = "/arm-io/dcpext0",
+    .dcp_dart = "/arm-io/dart-dcpext0",
+    .disp_dart = "/arm-io/dart-dispext0",
+    .dp2hdmi_gpio = "/arm-io/dp2hdmi-gpio0",
+    .dptx_phy = "/arm-io/dptx-phy",
+    .pmgr_dev = "DISPEXT0_CPU0",
+    .dcp_alias = "dcpext0",
+    .dcp_index = 1,
+    .num_dptxports = 2,
+};
+
 /* Config used by display_start_dcp(); the USB-C route keeps the base DCP. */
 static const display_config_t *t8152_config = &display_config_m1;
+
+/* J873g second display (HDMI while USB-C is up). Its state is kept here and
+ * swapped with the globals while it is configured; the console stays on the
+ * first display. The loader reads display_second_video. */
+static struct {
+    dcp_dev_t *dcp;
+    dcp_iboot_if_t *iboot;
+    u64 fb_dva, fb_size;
+    const display_config_t *cfg;
+    struct boot_video video;
+} display_other;
+struct boot_video display_second_video;
+static bool display_force_new_fb;
 
 #define USE_DCPEXT 1
 
@@ -550,7 +577,7 @@ int display_configure(const char *config)
     size_t size =
         ALIGN_UP(tbest.width * tbest.height * ((cbest.bpp + 7) / 8) + 24 * SZ_16K, SZ_16K);
 
-    if (fb_size < size) {
+    if (fb_size < size || display_force_new_fb) {
         printf("display: current framebuffer is too small for new mode\n");
 
         /* rtkit uses 0x10000000 as DVA offset, FB starts in the first page */
@@ -698,6 +725,51 @@ static int display_init_t8152_hdmi(void)
     return 1;
 }
 
+static void display_swap_state(void)
+{
+#define SWAP(a, b)                                                                                 \
+    do {                                                                                           \
+        __typeof__(a) t = a;                                                                       \
+        a = b;                                                                                     \
+        b = t;                                                                                     \
+    } while (0)
+    SWAP(dcp, display_other.dcp);
+    SWAP(iboot, display_other.iboot);
+    SWAP(fb_dva, display_other.fb_dva);
+    SWAP(fb_size, display_other.fb_size);
+    SWAP(t8152_config, display_other.cfg);
+    SWAP(cur_boot_args.video, display_other.video);
+#undef SWAP
+}
+
+/* Configure the second display: bring it up on first use with its own
+ * framebuffer, or modeset it later (the loader calls this by symbol). */
+int display_configure_second(const char *config)
+{
+    bool first = !display_other.dcp;
+
+    if (first)
+        display_other.cfg = &display_config_j873_hdmi_ext;
+    display_swap_state();
+    display_force_new_fb = first;
+    int ret = display_configure(config);
+    display_force_new_fb = false;
+    if (ret > 0) {
+        display_second_video = cur_boot_args.video;
+    } else if (first && dcp) {
+        display_shutdown(DCP_QUIESCED);
+        dcp = NULL;
+        iboot = NULL;
+    }
+    display_swap_state();
+
+    /* display_configure moved the console and boot args to the second
+     * framebuffer; put both back on the first display. */
+    memcpy((void *)boot_args_addr, &cur_boot_args, sizeof(cur_boot_args));
+    fb_reinit();
+    return ret;
+}
+
 static int display_init_t8152(void)
 {
     /* A real firmware framebuffer already has a working transport. Adopt it
@@ -750,8 +822,12 @@ static int display_init_t8152(void)
 
     /* Start with the mode qualified for this route. Subsequent modesets use
      * the common display path and retain the normal framebuffer console. */
-    if (display_configure("1280x720@60") > 0)
+    if (display_configure("1280x720@60") > 0) {
+        printf("display: trying HDMI as second display (DCPEXT0)\n");
+        if (display_configure_second(NULL) <= 0)
+            printf("display: no second display\n");
         return 1;
+    }
 
 fail:
     printf("display: USB-C initialization failed\n");
