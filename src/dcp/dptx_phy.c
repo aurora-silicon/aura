@@ -84,8 +84,9 @@ static void dptx_t8152_apply_tunables(dptx_phy_t *phy)
 }
 
 /* AppleT8152DPTXPort::phySetActiveLaneCount: per-lane configuration on the
- * lane shm blocks; the trailing argument of each register write is the
- * lane-enabled bit. */
+ * lane shm blocks. The bits are lane-disable bits: macOS starts from 0xf and
+ * clears one bit per active lane, so 0x2420 holds the mask of unused lanes
+ * (0 with four lanes, as the macOS register snapshot shows). */
 static void dptx_t8152_set_active_lane_count(dptx_phy_t *phy, u32 num_lanes)
 {
     static const u32 offsets[] = {0x64, 0x24, 0x24, 0x48, 0x48, 0x5c, 0x5c, 0x48};
@@ -97,10 +98,10 @@ static void dptx_t8152_set_active_lane_count(dptx_phy_t *phy, u32 num_lanes)
     for (u32 lane = 0; lane < DPTX_MAX_LANES; lane++) {
         u32 base = DPTX_T8152_LANE0_OFFSET + lane * DPTX_T8152_LANE_STRIDE;
         for (size_t i = 0; i < ARRAY_SIZE(offsets); i++)
-            dptx_t8152_set_bits(phy, base + offsets[i], shifts[i], masks[i], lane < num_lanes);
+            dptx_t8152_set_bits(phy, base + offsets[i], shifts[i], masks[i], lane >= num_lanes);
     }
 
-    dptx_t8152_set_bits(phy, 0x2420, 0, 0xf, (1 << num_lanes) - 1);
+    dptx_t8152_set_bits(phy, 0x2420, 0, 0xf, 0xf & ~((1 << num_lanes) - 1));
     dptx_t8152_set_bits(phy, 0x2400, 0, 0x1, 1);
 }
 
