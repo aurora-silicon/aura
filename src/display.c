@@ -545,6 +545,7 @@ int display_configure(const char *config)
 
     u64 fb_pa = cur_boot_args.video.base;
     u64 tmp_dva = 0;
+    bool swapped = false;
 
     size_t size =
         ALIGN_UP(tbest.width * tbest.height * ((cbest.bpp + 7) / 8) + 24 * SZ_16K, SZ_16K);
@@ -581,11 +582,18 @@ int display_configure(const char *config)
         dart_unmap(dcp->dart_disp, fb_dva, fb_size);
         dart_unmap(dcp->dart_dcp, fb_dva, fb_size);
 
-        fb_dva = display_map_fb(fb_dva, fb_pa, size);
-        if (DART_IS_ERR(fb_dva)) {
-            printf("display: failed to map new fb\n");
-            fb_dva = 0;
-            return -1;
+        if (chip_id == T8152) {
+            /* The DCP already scans out the new framebuffer at tmp_dva; a
+             * second swap after moving it back to fb_dva times out here. */
+            fb_dva = tmp_dva;
+            swapped = true;
+        } else {
+            fb_dva = display_map_fb(fb_dva, fb_pa, size);
+            if (DART_IS_ERR(fb_dva)) {
+                printf("display: failed to map new fb\n");
+                fb_dva = 0;
+                return -1;
+            }
         }
 
         fb_size = size;
@@ -611,15 +619,17 @@ int display_configure(const char *config)
 
     // Swap!
     u32 stride = tbest.width * 4;
-    ret = display_swap(fb_dva, stride, tbest.width, tbest.height);
-    if (ret < 0)
-        return ret;
+    if (!swapped) {
+        ret = display_swap(fb_dva, stride, tbest.width, tbest.height);
+        if (ret < 0)
+            return ret;
 
-    printf("display: swapped! (swap_id=%d)\n", ret);
+        printf("display: swapped! (swap_id=%d)\n", ret);
 
-    // Wait until the swap completes before powering down DCP
-    // 50ms is too low, 100 works, 150 for good measure
-    mdelay(150);
+        // Wait until the swap completes before powering down DCP
+        // 50ms is too low, 100 works, 150 for good measure
+        mdelay(150);
+    }
 
     bool reinit = false;
     if (fb_pa != cur_boot_args.video.base || cur_boot_args.video.stride != stride ||
