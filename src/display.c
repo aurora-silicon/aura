@@ -89,8 +89,9 @@ static struct {
 } display_other;
 struct boot_video display_second_video;
 static bool display_force_new_fb;
-/* "max" mode config: the largest mode, without the boot-console preference
- * for modes up to 1920x1200 or for ones that fit the current framebuffer. */
+/* "max" mode config: the largest of the sink's own modes, without the
+ * boot-console preference for modes up to 1920x1200 or for ones that fit the
+ * current framebuffer. */
 static bool display_mode_max;
 
 #define USE_DCPEXT 1
@@ -181,6 +182,11 @@ static void display_choose_timing_mode(dcp_timing_mode_t *modes, int cnt, dcp_ti
         if (!display_mode_max) {
             COMPARE(modes[i].width <= 1920, best->width <= 1920);
             COMPARE(modes[i].height <= 1200, best->height <= 1200);
+        } else {
+            /* Byte 0 bit 6 marks standard modes a converter adds on its
+             * own (the J873g PS190 lists 3840x2160 for a 2560x1440 EIZO);
+             * the sink's EDID modes have it clear. */
+            COMPARE(!(modes[i].pad[0] & 0x40), !(best->pad[0] & 0x40));
         }
         COMPARE(modes[i].fps <= 60 << 16, best->fps <= 60 << 16);
         COMPARE(modes[i].width, best->width);
