@@ -539,6 +539,8 @@ static u32 dptxport_call_v2(afk_epic_service_t *service, u16 group, u32 command,
         return 0xe00002c7; /* kIOReturnUnsupported */
 
     dptx_port_t *port = service->cookie;
+    printf("DPTXV2: port %d group %u cmd %u size %zu\n", port ? (int)port->unit : -1, group,
+           command, data_size);
     if ((!port || !port->phy) &&
         (command == DPTX_APCALL_ACTIVATE || command == DPTX_APCALL_DEACTIVATE ||
          command == DPTX_APCALL_WILL_CHANGE_LINKG_CONFIG ||
@@ -567,17 +569,27 @@ static u32 dptxport_call_v2(afk_epic_service_t *service, u16 group, u32 command,
                        ? 0xe00002bc
                        : 0;
         case DPTX_APCALL_GET_MAX_LINK_RATE:
-            value = LINK_RATE_HBR;
+            value = port->phy ? dptx_phy_max_link_rate(port->phy) / 270 : LINK_RATE_HBR;
             break;
         case DPTX_APCALL_GET_LINK_RATE:
             value = port->link_rate;
             break;
-        case DPTX_APCALL_SET_LINK_RATE:
+        case DPTX_APCALL_SET_LINK_RATE: {
+            u8 rate;
             if (!data || data_size < 17)
                 return 0xe00002c2;
-            if (((const u8 *)data)[16] != LINK_RATE_HBR || port->link_rate != LINK_RATE_HBR)
+            rate = ((const u8 *)data)[16];
+            if (rate * 270 > dptx_phy_max_link_rate(port->phy))
                 return 0xe00002c7;
-            return dptx_phy_set_link_rate(port->phy, 2700) ? 0xe00002bc : 0;
+            /* A phy qualified only at HBR keeps that single rate. */
+            if (dptx_phy_max_link_rate(port->phy) == 2700 &&
+                (rate != LINK_RATE_HBR || port->link_rate != LINK_RATE_HBR))
+                return 0xe00002c7;
+            if (dptx_phy_set_link_rate(port->phy, rate * 270))
+                return 0xe00002bc;
+            port->link_rate = rate;
+            return 0;
+        }
         case DPTX_APCALL_GET_MAX_LANE_COUNT:
             value = 4;
             break;
@@ -627,6 +639,23 @@ static u32 dptxport_call_v2(afk_epic_service_t *service, u16 group, u32 command,
         case DPTX_APCALL_GET_SUPPORTS_HPD:
             value = 1;
             break;
+        case DPTX_APCALL_INACTIVE_SINK_DETECTED:
+        case DPTX_APCALL_DEVICE_NOT_RESPONDING:
+        case DPTX_APCALL_DEVICE_BUSY_TIMEOUT:
+        case DPTX_APCALL_DEVICE_NOT_STARTED:
+            /* Link fault reports: the native client acknowledges them with a
+             * zeroed retcode; they are not requests we can answer. */
+            dprintf("DPTXPort: firmware reports link fault %u\n", command);
+            memcpy(reply, data, min(reply_size, data_size));
+            if (reply_size > 4)
+                memset(reply, 0, 4);
+            return 0;
+        case DPTX_APCALL_SET_TILED_DISPLAY_HINTS: {
+            u32 retcode = 1;
+            memcpy(reply, data, min(reply_size, data_size));
+            memcpy(reply, &retcode, min(reply_size, sizeof(retcode)));
+            return 0;
+        }
         default:
             return 0xe00002c7;
     }

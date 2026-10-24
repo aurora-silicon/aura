@@ -45,6 +45,24 @@ static const display_config_t display_config_m1 = {
     .dcp_alias = "dcp",
 };
 
+/* J873g HDMI: as on macOS, the base DCP (dispint0) drives the dptx-phy in
+ * display-crossbar0's lpdptx slot, through the PS190 DP-to-HDMI converter
+ * powered from dp2hdmi-gpio0. */
+static const display_config_t display_config_j873_hdmi = {
+    .dcp = "/arm-io/dcp",
+    .dcp_dart = "/arm-io/dart-dcp",
+    .disp_dart = "/arm-io/dart-disp0",
+    .dp2hdmi_gpio = "/arm-io/dp2hdmi-gpio0",
+    .dptx_phy = "/arm-io/dptx-phy",
+    .pmgr_dev = "DISP0_CPU0",
+    .dcp_alias = "dcp",
+    .dcp_index = 0,
+    .num_dptxports = 2,
+};
+
+/* Config used by display_start_dcp(); the USB-C route keeps the base DCP. */
+static const display_config_t *t8152_config = &display_config_m1;
+
 #define USE_DCPEXT 1
 
 static const display_config_t display_config_m2 = {
@@ -255,6 +273,8 @@ const display_config_t *display_get_config(void)
         conf = &display_config_m2_pro_max;
     else if (adt_is_compatible(adt, 0, "J180dAP") || adt_is_compatible(adt, 0, "J475dAP"))
         conf = &display_config_m2_ultra;
+    else if (chip_id == T8152)
+        conf = t8152_config;
     else
         conf = &display_config_m1;
 
@@ -441,6 +461,9 @@ int display_configure(const char *config)
         ret = dcp_connect_dptx(dcp);
         if (ret < 0)
             return ret;
+        /* The DCP only brings the port up once HPD is asserted. On the HDMI
+         * path the sink's HPD reaches the AP gpio, so tell the firmware. */
+        dcp_dptx_hpd(dcp->dptx_ep, 0, true);
     }
 
     if (!display_is_external) {
@@ -645,6 +668,26 @@ static int display_t8152_work(u32 usec)
     return 0;
 }
 
+static int display_init_t8152_hdmi(void)
+{
+    printf("display: trying HDMI (dptx-phy)\n");
+    t8152_config = &display_config_j873_hdmi;
+
+    int ret = display_configure(NULL);
+
+    if (ret <= 0) {
+        printf("display: HDMI initialization failed\n");
+        if (dcp)
+            display_shutdown(DCP_QUIESCED);
+        dcp = NULL;
+        iboot = NULL;
+        t8152_config = &display_config_m1;
+        return ret < 0 ? ret : 0;
+    }
+
+    return 1;
+}
+
 static int display_init_t8152(void)
 {
     /* A real firmware framebuffer already has a working transport. Adopt it
@@ -665,7 +708,7 @@ static int display_init_t8152(void)
     dptx_phy_t *phy = dptx_phy_init("/arm-io/atc-phy3", 0);
     if (!phy) {
         printf("display: No supported USB-C display connected\n");
-        return 0;
+        return display_init_t8152_hdmi();
     }
 
     if (display_start_dcp() < 0) {

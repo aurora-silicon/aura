@@ -245,6 +245,9 @@ static void j873g_run_proxy(void)
     wdt_disable();
     if (smp_init() < 0)
         panic("Unsupported T8152 CPU topology\n");
+    /* The DCPEXT0/DPTX_PHY power gates are PMGR2 devices; without this the
+     * HDMI phy stays gated and the first register access aborts. */
+    pmgr_init();
 #ifdef USE_FB
     if (display_init() < 0)
         printf("display: initialization failed, continuing with firmware framebuffer\n");
