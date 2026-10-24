@@ -88,7 +88,9 @@ static struct {
     struct boot_video video;
 } display_other;
 struct boot_video display_second_video;
-static bool display_force_new_fb;
+/* Framebuffer size display_start_dcp maps instead of /vram (the first
+ * display's memory) when bringing up the second display. */
+static u64 display_fb_override_size;
 /* "max" mode config: the largest of the sink's own modes, without the
  * boot-console preference for modes up to 1920x1200 or for ones that fit the
  * current framebuffer. */
@@ -372,7 +374,10 @@ int display_start_dcp(void)
 
     // determine frame buffer PA and size from "/vram"
     u64 pa, size;
-    if (display_get_vram(&pa, &size)) {
+    if (display_fb_override_size) {
+        pa = cur_boot_args.video.base;
+        size = fb_size = display_fb_override_size;
+    } else if (display_get_vram(&pa, &size)) {
         // use a safe fb_size
         fb_size = cur_boot_args.video.stride * cur_boot_args.video.height *
                   ((cur_boot_args.video.depth + 7) / 8);
@@ -589,7 +594,7 @@ int display_configure(const char *config)
     size_t size =
         ALIGN_UP(tbest.width * tbest.height * ((cbest.bpp + 7) / 8) + 24 * SZ_16K, SZ_16K);
 
-    if (fb_size < size || display_force_new_fb) {
+    if (fb_size < size) {
         printf("display: current framebuffer is too small for new mode\n");
 
         /* rtkit uses 0x10000000 as DVA offset, FB starts in the first page */
@@ -658,6 +663,10 @@ int display_configure(const char *config)
 
     // Swap!
     u32 stride = tbest.width * 4;
+    /* A reused framebuffer still holds the previous console at another
+     * stride (the stage before left 640x1136 text there). */
+    if (chip_id == T8152 && !tmp_dva)
+        memset((void *)fb_pa, 0, (size_t)stride * tbest.height);
     if (!swapped) {
         ret = display_swap(fb_dva, stride, tbest.width, tbest.height);
         if (ret < 0)
@@ -760,12 +769,22 @@ int display_configure_second(const char *config)
 {
     bool first = !display_other.dcp;
 
-    if (first)
+    if (first) {
+        /* Its own framebuffer, mapped when the DCP starts, as /vram is for
+         * the first display; sized so that any mode up to 3840x2160 fits.
+         * Switching DCPEXT0 to a reallocated framebuffer later leaves it
+         * scanning out nothing. */
+        u64 size = ALIGN_UP(3840 * 2160 * 4 + 24 * SZ_16K, SZ_16K);
+        u64 pa = top_of_memory_alloc(size);
+        memset((void *)pa, 0, size);
         display_other.cfg = &display_config_j873_hdmi_ext;
+        display_other.video = (struct boot_video){
+            .base = pa, .stride = 3840 * 4, .width = 3840, .height = 2160, .depth = 32};
+        display_fb_override_size = size;
+    }
     display_swap_state();
-    display_force_new_fb = first;
     int ret = display_configure(config);
-    display_force_new_fb = false;
+    display_fb_override_size = 0;
     if (ret > 0) {
         display_second_video = cur_boot_args.video;
     } else if (first && dcp) {
