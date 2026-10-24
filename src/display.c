@@ -89,6 +89,9 @@ static struct {
 } display_other;
 struct boot_video display_second_video;
 static bool display_force_new_fb;
+/* "max" mode config: the largest mode, without the boot-console preference
+ * for modes up to 1920x1200 or for ones that fit the current framebuffer. */
+static bool display_mode_max;
 
 #define USE_DCPEXT 1
 
@@ -170,13 +173,15 @@ static void display_choose_timing_mode(dcp_timing_mode_t *modes, int cnt, dcp_ti
                     best->width == want->width && best->height == want->height);
             COMPARE(-abs((long)modes[i].fps - (long)want->fps),
                     -abs((long)best->fps - (long)want->fps));
-        } else {
+        } else if (!display_mode_max) {
             COMPARE(display_mode_fb_size(&modes[i]) <= fb_size,
                     display_mode_fb_size(best) <= fb_size);
         }
 
-        COMPARE(modes[i].width <= 1920, best->width <= 1920);
-        COMPARE(modes[i].height <= 1200, best->height <= 1200);
+        if (!display_mode_max) {
+            COMPARE(modes[i].width <= 1920, best->width <= 1920);
+            COMPARE(modes[i].height <= 1200, best->height <= 1200);
+        }
         COMPARE(modes[i].fps <= 60 << 16, best->fps <= 60 << 16);
         COMPARE(modes[i].width, best->width);
         COMPARE(modes[i].height, best->height);
@@ -398,8 +403,9 @@ struct display_options {
 int display_parse_mode(const char *config, dcp_timing_mode_t *mode, struct display_options *opts)
 {
     memset(mode, 0, sizeof(*mode));
+    display_mode_max = config && !strcmp(config, "max");
 
-    if (!config || !strcmp(config, "auto"))
+    if (!config || !strcmp(config, "auto") || display_mode_max)
         return 0;
 
     const char *s_w = config;
@@ -824,7 +830,7 @@ static int display_init_t8152(void)
      * the common display path and retain the normal framebuffer console. */
     if (display_configure("1280x720@60") > 0) {
         printf("display: trying HDMI as second display (DCPEXT0)\n");
-        if (display_configure_second(NULL) <= 0)
+        if (display_configure_second("max") <= 0)
             printf("display: no second display\n");
         return 1;
     }

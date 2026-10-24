@@ -162,6 +162,7 @@ static dcp_dev_t dcp_storage, *dcp = &dcp_storage;
 static struct dcp_iboot_if iboot_storage, *iboot = &iboot_storage;
 static u64 fb_dva, fb_size;
 static bool display_is_external, display_is_dptx, display_needs_power_cycle;
+static bool display_mode_max;
 static struct { struct { u64 base, stride, width, height, depth; } video; } cur_boot_args;
 static u64 boot_args_addr;
 static void *adt;
