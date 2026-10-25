@@ -720,6 +720,8 @@ class M1N1Proxy(Reloadable):
     P_DAPF_INIT = 0x1201
 
     P_CPUFREQ_INIT = 0x1300
+    P_CPUFREQ_GET_CLUSTER_HZ = 0x1301
+    P_CPUFREQ_SET_CLUSTER_PSTATE = 0x1302
 
     P_READ_GIGALOCKER = 0x1400
     P_FREE_GIGALOCKER = 0x1401
@@ -1244,6 +1246,11 @@ class M1N1Proxy(Reloadable):
 
     def cpufreq_init(self):
         return self.request(self.P_CPUFREQ_INIT)
+    def cpufreq_get_cluster_hz(self, cluster):
+        """ADT frequency for the accepted command state, not a measurement."""
+        return self.request(self.P_CPUFREQ_GET_CLUSTER_HZ, cluster)
+    def cpufreq_set_cluster_pstate(self, cluster, pstate):
+        return self.request(self.P_CPUFREQ_SET_CLUSTER_PSTATE, cluster, pstate, signed=True)
     def read_gigalocker(self, buf):
         return self.request(self.P_READ_GIGALOCKER, buf)
     def free_gigalocker(self, buf):
