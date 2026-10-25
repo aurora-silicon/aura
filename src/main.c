@@ -15,6 +15,7 @@
 #include "firmware.h"
 #include "gxf.h"
 #include "heapblock.h"
+#include "j873.h"
 #include "mcc.h"
 #include "memory.h"
 #include "nvme.h"
@@ -255,6 +256,10 @@ static void j873g_run_proxy(void)
     fb_display_logo();
     fb_set_active(true);
 #endif
+    /* What the J873 Linux device trees expect the loader to have done. */
+    j873_usb_prep();
+    j873_n1_power();
+    j873_pcie_prep();
     printf("Initialization complete. Running proxy...\n");
     uartproxy_run(NULL);
 }
