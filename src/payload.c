@@ -223,6 +223,8 @@ static bool check_var(u8 **p)
             nvme_adopt_live_session = true;
     } else if (IS_VAR("display=")) {
         display_configure(val);
+    } else if (IS_VAR("display2=")) {
+        display_configure_second(val);
     } else if (IS_VAR("mitigations=")) {
         mitigations_configure(val);
     } else if (IS_VAR("tso=")) {
