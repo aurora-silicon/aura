@@ -167,6 +167,14 @@ u64 display_mode_fb_size(dcp_timing_mode_t *mode)
 static void display_choose_timing_mode(dcp_timing_mode_t *modes, int cnt, dcp_timing_mode_t *best,
                                        dcp_timing_mode_t *want)
 {
+    /* Byte 0 bit 6 marks standard modes a converter adds on its own (the
+     * J873g PS190 lists 3840x2160 for a 2560x1440 EIZO); "max" skips them. */
+    for (int i = 0; i < cnt; i++)
+        printf("display: mode %4dx%-4d %3d.%02d Hz%s%s\n", modes[i].width, modes[i].height,
+               modes[i].fps >> 16, ((modes[i].fps & 0xffff) * 100 + 0x7fff) >> 16,
+               modes[i].valid ? "" : " (not valid)",
+               (modes[i].pad[0] & 0x40) ? " (added by the converter)" : "");
+
     *best = modes[0];
 
     for (int i = 1; i < cnt; i++) {
@@ -185,9 +193,8 @@ static void display_choose_timing_mode(dcp_timing_mode_t *modes, int cnt, dcp_ti
             COMPARE(modes[i].width <= 1920, best->width <= 1920);
             COMPARE(modes[i].height <= 1200, best->height <= 1200);
         } else {
-            /* Byte 0 bit 6 marks standard modes a converter adds on its
-             * own (the J873g PS190 lists 3840x2160 for a 2560x1440 EIZO);
-             * the sink's EDID modes have it clear. */
+            /* Skip modes a converter adds on its own (see above); the
+             * sink's EDID modes have byte 0 bit 6 clear. */
             COMPARE(!(modes[i].pad[0] & 0x40), !(best->pad[0] & 0x40));
         }
         COMPARE(modes[i].fps <= 60 << 16, best->fps <= 60 << 16);
