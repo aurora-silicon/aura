@@ -18,7 +18,8 @@ Only these are host models:
   unit runs without AddressSanitizer (its shadow occupies that range); it is
   built with UndefinedBehaviorSanitizer and -Wall -Wextra -Werror.
 - dart_gen3_tlb_invalidate() is aarch64 inline asm. The unit replaces only that
-  body with a stub that aborts, so any Gen3 invalidation fails the test.
+  body with a stub that aborts, so any Gen3 invalidation fails the test, except
+  in the T8152 cases, which allow and count it.
 
 Setup-region validation and dcp_init() early cleanup are deliberately not
 covered here: the narrowed candidate keeps dart_setup_pt_region() unchanged,
@@ -78,7 +79,8 @@ def production_unit():
     assert marker and dart.count("dart_gen3_tlb_invalidate(dart_dev_t *dart)") == 1
     stub = ("static void dart_gen3_tlb_invalidate(dart_dev_t *dart)\n{\n"
             "    /* Host limit: the production body is aarch64 inline asm. */\n"
-            "    (void)dart;\n    assert(!\"Gen3 TLBI reached\");\n}")
+            "    (void)dart;\n    assert(gen3_tlbi_allowed && \"Gen3 TLBI reached\");\n"
+            "    gen3_tlbis++;\n}")
     dart = dart[:marker.start()] + stub + dart[block(dart, marker.start()):]
     assert "dart_dev_t *dart_init_adt_display(" in dart, "source has no display view"
     return "\n".join((without_includes(read("types.h")), soc, utils, without_includes(read("adt.h")),
@@ -88,6 +90,8 @@ def production_unit():
 MOCK_DECLARATIONS = r'''
 /* Host models of the interfaces dart.c uses; definitions follow dart.c. */
 u32 chip_id;
+static bool gen3_tlbi_allowed;
+static unsigned int gen3_tlbis;
 static u32 read32(u64 addr);
 static void write32(u64 addr, u32 data);
 static u32 set32(u64 addr, u32 set);
@@ -308,8 +312,8 @@ static void reset(bool locked, unsigned int roots, u32 tcr, bool enabled)
     memset((void *)MEM_BASE, 0, MEM_PAGES * SZ_16K);
     memset(regs, 0, sizeof(regs));
     nwrites = reg_reads = tlbis = heap_used = heap_frees = adt_lookups = nprops = setprops = 0;
-    heap_exhausted = hand_out_far = false;
-    far_frees = 0;
+    heap_exhausted = hand_out_far = gen3_tlbi_allowed = false;
+    far_frees = gen3_tlbis = 0;
     legacy_l2_count = 0;
     memset(legacy_l2_pages, 0, sizeof(legacy_l2_pages));
     chip_id = T8103;
@@ -457,6 +461,88 @@ static void gen3_unchanged(void)
     assert(dart_map(dart, iova(0, 5, 7), (void *)PAGE(DATA), SZ_16K) == -1 && !nwrites);
     dart_shutdown(dart);
     assert(!live_objects);
+}
+
+/* A locked two-level Gen3 display stream on @chip, with an iBoot L2 table
+ * (page L2) at L1 index 5 of its root. */
+static u64 gen3_table(unsigned int page)
+{
+    return FIELD_PREP(DART_GEN3_PTE_OFFSET, PAGE(page) >> DART_PTE_OFFSET_SHIFT) | DART_PTE_VALID;
+}
+static u64 gen3_leaf(unsigned int page)
+{
+    return FIELD_PREP(DART_GEN3_PTE_OFFSET, PAGE(page) >> DART_PTE_OFFSET_SHIFT) |
+           dart_gen3.pte_flags;
+}
+static dart_dev_t *gen3_locked_view(u32 chip)
+{
+    reset(true, 0, 0, false);
+    chip_id = chip;
+    nodes[DART_NODE].compat = "dart,gen3";
+    u64 offset = 0x100;
+    u32 sid_count = 32;
+    put_prop(DART_NODE, "tlbi-aperture-offset", &offset, sizeof(offset));
+    put_prop(DART_NODE, "sid-count", &sid_count, sizeof(sid_count));
+    *reg(REGS) = 14U << 24;
+    *reg(REGS + 8) = 0x300;
+    *reg(REGS + DART_T8110_TCR_OFF + 4 * SID) = 1;
+    *reg(REGS + DART_T8110_ENABLE_STREAMS) = BIT(SID);
+    *reg(REGS + DART_T8110_TTBR_OFF + 4 * SID) =
+        DART_T8110_TTBR_VALID | FIELD_PREP(DART_T8110_TTBR_ADDR, PAGE(ROOT) >> DART_T8110_TTBR_SHIFT);
+    *reg(REGS + 0x200) = *reg(REGS + 0x208) = 1;
+    at(ROOT)[5] = gen3_table(L2);
+    dart_dev_t *dart = dart_init_adt_display(DCP_PATH, 0, SID);
+    assert(dart && dart->type == DART_GEN3 && dart->locked && !nwrites);
+    return dart;
+}
+static void gen3_t8152_tables_writable(void)
+{
+    /* T8152: the stream configuration stays locked, its page tables do not. */
+    dart_dev_t *dart = gen3_locked_view(T8152);
+    gen3_tlbi_allowed = true;
+    /* Into the inherited L2, and into an absent L1 slot (a new heap L2). */
+    assert(dart_map(dart, iova(0, 5, 7), (void *)PAGE(DATA), SZ_16K) == 0);
+    assert(at(L2)[7] == gen3_leaf(DATA));
+    assert(dart_translate(dart, iova(0, 5, 7) + 0x10) == (void *)(PAGE(DATA) + 0x10));
+    assert(dart_map(dart, iova(0, 6, 0), (void *)PAGE(DATA + 1), SZ_16K) == 0);
+    assert(heap_used == 1 && at(ROOT)[6] == gen3_table(HEAP) && at(HEAP)[0] == gen3_leaf(DATA + 1));
+    /* Only the tables change: no TTBR/TCR/stream register write, one TLBI each. */
+    assert(!nwrites && gen3_tlbis == 2);
+    dart_unmap(dart, iova(0, 5, 7), SZ_16K);
+    dart_unmap(dart, iova(0, 6, 0), SZ_16K);
+    assert(!at(L2)[7] && !at(HEAP)[0] && gen3_tlbis == 4);
+    /* Our empty L2 is released; the inherited one stays in its slot. */
+    dart_free_l2(dart, iova(0, 6, 0));
+    assert(!at(ROOT)[6] && heap_frees == 1);
+    dart_free_l2(dart, iova(0, 5, 0));
+    assert(at(ROOT)[5] == gen3_table(L2) && heap_frees == 1);
+    /* An L2 that still maps a page is kept. */
+    assert(dart_map(dart, iova(0, 6, 0), (void *)PAGE(DATA + 1), SZ_16K) == 0);
+    assert(at(ROOT)[6] == gen3_table(HEAP + 1));
+    dart_free_l2(dart, iova(0, 6, 0));
+    assert(at(ROOT)[6] == gen3_table(HEAP + 1) && heap_frees == 1);
+    /* Teardown keeps every table the firmware may still walk. */
+    take_snapshot();
+    dart_shutdown(dart);
+    assert(memory_unchanged() && !nwrites && heap_frees == 1);
+    assert(!live_objects);
+}
+static void gen3_other_chip_immutable(void)
+{
+    /* Every other chip keeps the locked Gen3 stream read-only, tables included. */
+    static const u32 chips[] = {T8103, T8122, T6040};
+    for (unsigned int i = 0; i < ARRAY_SIZE(chips); i++) {
+        dart_dev_t *dart = gen3_locked_view(chips[i]);
+        take_snapshot();
+        assert(dart_map(dart, iova(0, 5, 7), (void *)PAGE(DATA), SZ_16K) == -1);
+        assert(dart_map(dart, iova(0, 6, 0), (void *)PAGE(DATA), SZ_16K) == -1);
+        dart_unmap(dart, iova(0, 5, 7), SZ_16K);
+        dart_free_l2(dart, iova(0, 5, 0));
+        assert(dart_setup_pt_region(dart, DCP_PATH, SID, 0) == -1);
+        assert(memory_unchanged() && !nwrites && !heap_used && !heap_frees && !gen3_tlbis);
+        dart_shutdown(dart);
+        assert(memory_unchanged() && !live_objects);
+    }
 }
 
 /* ---- generic and FDT inspection handles stay immutable ---- */
@@ -697,6 +783,8 @@ static const struct { const char *name; void (*run)(void); } cases[] = {
     {"shutdown-retains-roots", shutdown_retains_roots},
     {"setup-refused-on-locked-view", setup_refused_on_locked_view},
     {"setup-stock-unlocked", setup_stock_unlocked},
+    {"gen3-t8152-tables-writable", gen3_t8152_tables_writable},
+    {"gen3-other-chip-immutable", gen3_other_chip_immutable},
     {"record-list-full", record_list_full},
     {"record-unencodable-refused", record_unencodable_refused},
 };
@@ -746,7 +834,8 @@ CASES = (
     "map-selected-root", "unmap-selected-root", "unmap-absent-allocates-nothing",
     "map-absent-root-refused", "map-new-l2-in-present-root", "map-conflict-rolls-back",
     "map-misaligned-refused", "shutdown-retains-roots", "setup-refused-on-locked-view",
-    "setup-stock-unlocked", "record-list-full", "record-unencodable-refused",
+    "setup-stock-unlocked", "gen3-t8152-tables-writable", "gen3-other-chip-immutable",
+    "record-list-full", "record-unencodable-refused",
 )
 
 

@@ -45,6 +45,62 @@ static const display_config_t display_config_m1 = {
     .dcp_alias = "dcp",
 };
 
+/* J873g HDMI: as on macOS, the base DCP (dispint0) drives the dptx-phy in
+ * display-crossbar0's lpdptx slot, through the PS190 DP-to-HDMI converter
+ * powered from dp2hdmi-gpio0. */
+static const display_config_t display_config_j873_hdmi = {
+    .dcp = "/arm-io/dcp",
+    .dcp_dart = "/arm-io/dart-dcp",
+    .disp_dart = "/arm-io/dart-disp0",
+    .dp2hdmi_gpio = "/arm-io/dp2hdmi-gpio0",
+    .dptx_phy = "/arm-io/dptx-phy",
+    .pmgr_dev = "DISP0_CPU0",
+    .dcp_alias = "dcp",
+    .dcp_index = 0,
+    .num_dptxports = 2,
+};
+
+/* J873g HDMI next to a USB-C display: the base DCP drives USB-C, so HDMI goes
+ * through DCPEXT0 (dispext0, source select 1). */
+static const display_config_t display_config_j873_hdmi_ext = {
+    .dcp = "/arm-io/dcpext0",
+    .dcp_dart = "/arm-io/dart-dcpext0",
+    .disp_dart = "/arm-io/dart-dispext0",
+    .dp2hdmi_gpio = "/arm-io/dp2hdmi-gpio0",
+    .dptx_phy = "/arm-io/dptx-phy",
+    .pmgr_dev = "DISPEXT0_CPU0",
+    .dcp_alias = "dcpext0",
+    .dcp_index = 1,
+    .num_dptxports = 2,
+};
+
+/* Config used by display_start_dcp(); the USB-C route keeps the base DCP. */
+static const display_config_t *t8152_config = &display_config_m1;
+
+/* J873g second display (HDMI while USB-C is up). Its state is kept here and
+ * swapped with the globals while it is configured; the console stays on the
+ * first display. The loader reads display_second_video. */
+static struct {
+    dcp_dev_t *dcp;
+    dcp_iboot_if_t *iboot;
+    u64 fb_dva, fb_size;
+    bool fb_dva_allocated;
+    bool is_dptx;
+    const display_config_t *cfg;
+    struct boot_video video;
+} display_other;
+struct boot_video display_second_video;
+/* Framebuffer size display_start_dcp maps instead of /vram (the first
+ * display's memory) when bringing up the second display. */
+static u64 display_fb_override_size;
+/* "max" mode config: the largest of the sink's own modes, without the
+ * boot-console preference for modes up to 1920x1200 or for ones that fit the
+ * current framebuffer. */
+static bool display_mode_max;
+/* fb_dva came from iova_alloc() (a T8152 framebuffer that grew) and goes back
+ * to the allocator when it is replaced. */
+static bool fb_dva_allocated;
+
 #define USE_DCPEXT 1
 
 static const display_config_t display_config_m2 = {
@@ -116,6 +172,14 @@ u64 display_mode_fb_size(dcp_timing_mode_t *mode)
 static void display_choose_timing_mode(dcp_timing_mode_t *modes, int cnt, dcp_timing_mode_t *best,
                                        dcp_timing_mode_t *want)
 {
+    /* Byte 0 bit 6 marks standard modes a converter adds on its own (the
+     * J873g PS190 lists 3840x2160 for a 2560x1440 EIZO); "max" skips them. */
+    for (int i = 0; i < cnt; i++)
+        printf("display: mode %4dx%-4d %3d.%02d Hz%s%s\n", modes[i].width, modes[i].height,
+               modes[i].fps >> 16, ((modes[i].fps & 0xffff) * 100 + 0x7fff) >> 16,
+               modes[i].valid ? "" : " (not valid)",
+               (modes[i].pad[0] & 0x40) ? " (added by the converter)" : "");
+
     *best = modes[0];
 
     for (int i = 1; i < cnt; i++) {
@@ -125,13 +189,19 @@ static void display_choose_timing_mode(dcp_timing_mode_t *modes, int cnt, dcp_ti
                     best->width == want->width && best->height == want->height);
             COMPARE(-abs((long)modes[i].fps - (long)want->fps),
                     -abs((long)best->fps - (long)want->fps));
-        } else {
+        } else if (!display_mode_max) {
             COMPARE(display_mode_fb_size(&modes[i]) <= fb_size,
                     display_mode_fb_size(best) <= fb_size);
         }
 
-        COMPARE(modes[i].width <= 1920, best->width <= 1920);
-        COMPARE(modes[i].height <= 1200, best->height <= 1200);
+        if (!display_mode_max) {
+            COMPARE(modes[i].width <= 1920, best->width <= 1920);
+            COMPARE(modes[i].height <= 1200, best->height <= 1200);
+        } else {
+            /* Skip modes a converter adds on its own (see above); the
+             * sink's EDID modes have byte 0 bit 6 clear. */
+            COMPARE(!(modes[i].pad[0] & 0x40), !(best->pad[0] & 0x40));
+        }
         COMPARE(modes[i].fps <= 60 << 16, best->fps <= 60 << 16);
         COMPARE(modes[i].width, best->width);
         COMPARE(modes[i].height, best->height);
@@ -255,6 +325,8 @@ const display_config_t *display_get_config(void)
         conf = &display_config_m2_pro_max;
     else if (adt_is_compatible(adt, 0, "J180dAP") || adt_is_compatible(adt, 0, "J475dAP"))
         conf = &display_config_m2_ultra;
+    else if (chip_id == T8152)
+        conf = t8152_config;
     else
         conf = &display_config_m1;
 
@@ -314,7 +386,10 @@ int display_start_dcp(void)
 
     // determine frame buffer PA and size from "/vram"
     u64 pa, size;
-    if (display_get_vram(&pa, &size)) {
+    if (display_fb_override_size) {
+        pa = cur_boot_args.video.base;
+        size = fb_size = display_fb_override_size;
+    } else if (display_get_vram(&pa, &size)) {
         // use a safe fb_size
         fb_size = cur_boot_args.video.stride * cur_boot_args.video.height *
                   ((cur_boot_args.video.depth + 7) / 8);
@@ -323,6 +398,7 @@ int display_start_dcp(void)
     }
 
     // Find the framebuffer DVA
+    fb_dva_allocated = false;
     fb_dva = dart_search(dcp->dart_disp, (void *)cur_boot_args.video.base);
     // framebuffer is not mapped on the M1 Ultra Mac Studio
     if (DART_IS_ERR(fb_dva) || !fb_dva)
@@ -351,8 +427,9 @@ struct display_options {
 int display_parse_mode(const char *config, dcp_timing_mode_t *mode, struct display_options *opts)
 {
     memset(mode, 0, sizeof(*mode));
+    display_mode_max = config && !strcmp(config, "max");
 
-    if (!config || !strcmp(config, "auto"))
+    if (!config || !strcmp(config, "auto") || display_mode_max)
         return 0;
 
     const char *s_w = config;
@@ -441,6 +518,11 @@ int display_configure(const char *config)
         ret = dcp_connect_dptx(dcp);
         if (ret < 0)
             return ret;
+        /* The T8152 DCP only brings the port up once HPD is asserted. On the
+         * J873g HDMI path the sink's HPD reaches the AP gpio, so tell the
+         * firmware. */
+        if (chip_id == T8152)
+            dcp_dptx_hpd(dcp->dptx_ep, 0, true);
     }
 
     if (!display_is_external) {
@@ -522,6 +604,7 @@ int display_configure(const char *config)
 
     u64 fb_pa = cur_boot_args.video.base;
     u64 tmp_dva = 0;
+    bool swapped = false;
 
     size_t size =
         ALIGN_UP(tbest.width * tbest.height * ((cbest.bpp + 7) / 8) + 24 * SZ_16K, SZ_16K);
@@ -558,11 +641,24 @@ int display_configure(const char *config)
         dart_unmap(dcp->dart_disp, fb_dva, fb_size);
         dart_unmap(dcp->dart_dcp, fb_dva, fb_size);
 
-        fb_dva = display_map_fb(fb_dva, fb_pa, size);
-        if (DART_IS_ERR(fb_dva)) {
-            printf("display: failed to map new fb\n");
-            fb_dva = 0;
-            return -1;
+        if (chip_id == T8152) {
+            /* The DCP already scans out the new framebuffer at tmp_dva; a
+             * second swap after moving it back to fb_dva times out here.
+             * tmp_dva becomes the framebuffer DVA, so it is no longer
+             * temporary: the cleanup below must not unmap or free it. */
+            if (fb_dva_allocated)
+                iova_free(dcp->iovad_dcp, fb_dva, fb_size);
+            fb_dva = tmp_dva;
+            fb_dva_allocated = true;
+            tmp_dva = 0;
+            swapped = true;
+        } else {
+            fb_dva = display_map_fb(fb_dva, fb_pa, size);
+            if (DART_IS_ERR(fb_dva)) {
+                printf("display: failed to map new fb\n");
+                fb_dva = 0;
+                return -1;
+            }
         }
 
         fb_size = size;
@@ -588,15 +684,21 @@ int display_configure(const char *config)
 
     // Swap!
     u32 stride = tbest.width * 4;
-    ret = display_swap(fb_dva, stride, tbest.width, tbest.height);
-    if (ret < 0)
-        return ret;
+    /* A reused framebuffer still holds the previous console at another
+     * stride (the stage before left 640x1136 text there). */
+    if (chip_id == T8152 && !swapped)
+        memset((void *)fb_pa, 0, (size_t)stride * tbest.height);
+    if (!swapped) {
+        ret = display_swap(fb_dva, stride, tbest.width, tbest.height);
+        if (ret < 0)
+            return ret;
 
-    printf("display: swapped! (swap_id=%d)\n", ret);
+        printf("display: swapped! (swap_id=%d)\n", ret);
 
-    // Wait until the swap completes before powering down DCP
-    // 50ms is too low, 100 works, 150 for good measure
-    mdelay(150);
+        // Wait until the swap completes before powering down DCP
+        // 50ms is too low, 100 works, 150 for good measure
+        mdelay(150);
+    }
 
     bool reinit = false;
     if (fb_pa != cur_boot_args.video.base || cur_boot_args.video.stride != stride ||
@@ -645,6 +747,95 @@ static int display_t8152_work(u32 usec)
     return 0;
 }
 
+static int display_init_t8152_hdmi(void)
+{
+    printf("display: trying HDMI (dptx-phy)\n");
+    t8152_config = &display_config_j873_hdmi;
+
+    int ret = display_configure(NULL);
+
+    if (ret <= 0) {
+        printf("display: HDMI initialization failed\n");
+        if (dcp)
+            display_shutdown(DCP_QUIESCED);
+        dcp = NULL;
+        iboot = NULL;
+        t8152_config = &display_config_m1;
+        return ret < 0 ? ret : 0;
+    }
+
+    return 1;
+}
+
+static void display_swap_state(void)
+{
+#define SWAP(a, b)                                                                                 \
+    do {                                                                                           \
+        __typeof__(a) t = a;                                                                       \
+        a = b;                                                                                     \
+        b = t;                                                                                     \
+    } while (0)
+    SWAP(dcp, display_other.dcp);
+    SWAP(iboot, display_other.iboot);
+    SWAP(fb_dva, display_other.fb_dva);
+    SWAP(fb_size, display_other.fb_size);
+    SWAP(fb_dva_allocated, display_other.fb_dva_allocated);
+    SWAP(display_is_dptx, display_other.is_dptx);
+    SWAP(t8152_config, display_other.cfg);
+    SWAP(cur_boot_args.video, display_other.video);
+#undef SWAP
+}
+
+/* Configure the second display: bring it up on first use with its own
+ * framebuffer, or modeset it later (the loader calls this by symbol). */
+int display_configure_second(const char *config)
+{
+    if (chip_id != T8152 || board_id != 0x24 || !adt_is_compatible(adt, 0, "J873gAP")) {
+        printf("display: no second display on this machine\n");
+        return -1;
+    }
+
+    bool first = !display_other.dcp;
+
+    if (first) {
+        /* Its own framebuffer, mapped when the DCP starts, as /vram is for
+         * the first display; sized so that any mode up to 3840x2160 fits.
+         * Switching DCPEXT0 to a reallocated framebuffer later leaves it
+         * scanning out nothing. A retry after a failed bring-up reuses it. */
+        u64 size = ALIGN_UP(3840 * 2160 * 4 + 24 * SZ_16K, SZ_16K);
+        if (!display_other.video.base) {
+            u64 pa = top_of_memory_alloc(size);
+            memset((void *)pa, 0, size);
+            display_other.video = (struct boot_video){
+                .base = pa, .stride = 3840 * 4, .width = 3840, .height = 2160, .depth = 32};
+        }
+        display_other.cfg = &display_config_j873_hdmi_ext;
+        display_fb_override_size = size;
+    }
+    display_swap_state();
+    int ret = display_configure(config);
+    display_fb_override_size = 0;
+    if (ret > 0) {
+        display_second_video = cur_boot_args.video;
+    } else if (first) {
+        /* Drop everything the failed bring-up set up; the first display's
+         * state is swapped back below untouched. */
+        if (dcp)
+            display_shutdown(DCP_QUIESCED);
+        dcp = NULL;
+        iboot = NULL;
+        fb_dva = fb_size = 0;
+        fb_dva_allocated = false;
+    }
+    display_swap_state();
+
+    /* display_configure moved the console and boot args to the second
+     * framebuffer; put both back on the first display. */
+    memcpy((void *)boot_args_addr, &cur_boot_args, sizeof(cur_boot_args));
+    fb_reinit();
+    return ret;
+}
+
 static int display_init_t8152(void)
 {
     /* A real firmware framebuffer already has a working transport. Adopt it
@@ -665,7 +856,7 @@ static int display_init_t8152(void)
     dptx_phy_t *phy = dptx_phy_init("/arm-io/atc-phy3", 0);
     if (!phy) {
         printf("display: No supported USB-C display connected\n");
-        return 0;
+        return display_init_t8152_hdmi();
     }
 
     if (display_start_dcp() < 0) {
@@ -697,8 +888,12 @@ static int display_init_t8152(void)
 
     /* Start with the mode qualified for this route. Subsequent modesets use
      * the common display path and retain the normal framebuffer console. */
-    if (display_configure("1280x720@60") > 0)
+    if (display_configure("1280x720@60") > 0) {
+        printf("display: trying HDMI as second display (DCPEXT0)\n");
+        if (display_configure_second("max") <= 0)
+            printf("display: no second display\n");
         return 1;
+    }
 
 fail:
     printf("display: USB-C initialization failed\n");

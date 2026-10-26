@@ -134,6 +134,16 @@ struct dart_dev {
 static u64 legacy_l2_pages[LEGACY_L2_MAX_PAGES];
 static size_t legacy_l2_count;
 
+/* On T8152 a locked Gen3 stream keeps its configuration (TTBR/TCR/stream
+ * select) out of reach, but its page tables are ordinary memory and firmware
+ * expects the AP side to add translations (RTKit buffers, __OS_LOG): on 26A434
+ * iBoot hands the J873g DCP DARTs over locked with those unmapped. Every other
+ * locked Gen3 DART stays read-only. */
+static inline bool dart_locked_pt_writable(dart_dev_t *dart)
+{
+    return chip_id == T8152 && dart->type == DART_GEN3;
+}
+
 static void dart_t8020_tlb_invalidate(dart_dev_t *dart)
 {
     write32(dart->regs + DART_T8020_STREAM_SELECT, BIT(dart->device));
@@ -635,7 +645,7 @@ int dart_collect_locked_tables(dart_dev_t *dart, u64 dram_base, u64 dram_size, u
 
 int dart_setup_pt_region(dart_dev_t *dart, const char *path, int device, u64 vm_base)
 {
-    if (dart->locked)
+    if (dart->locked && !dart_locked_pt_writable(dart))
         return -1;
 
     int node = adt_path_offset(adt, path);
@@ -781,7 +791,7 @@ static int dart_map_page(dart_dev_t *dart, uintptr_t iova, uintptr_t paddr, u32 
 
 int dart_map_flags(dart_dev_t *dart, uintptr_t iova, void *bfr, size_t len, u32 flags)
 {
-    if (dart->locked && !dart->legacy_mutable)
+    if (dart->locked && !dart->legacy_mutable && !dart_locked_pt_writable(dart))
         return -1;
 
     uintptr_t paddr = (uintptr_t)bfr;
@@ -833,7 +843,7 @@ static void dart_unmap_page(dart_dev_t *dart, uintptr_t iova)
 
 void dart_unmap(dart_dev_t *dart, uintptr_t iova, size_t len)
 {
-    if (dart->locked && !dart->legacy_mutable)
+    if (dart->locked && !dart->legacy_mutable && !dart_locked_pt_writable(dart))
         return;
 
     if (len % SZ_16K)
@@ -853,7 +863,7 @@ void dart_unmap(dart_dev_t *dart, uintptr_t iova, size_t len)
 
 void dart_free_l2(dart_dev_t *dart, uintptr_t iova)
 {
-    if (dart->locked)
+    if (dart->locked && !dart_locked_pt_writable(dart))
         return;
 
     if (iova & ((1 << 25) - 1)) {
@@ -875,6 +885,10 @@ void dart_free_l2(dart_dev_t *dart, uintptr_t iova)
             return;
         }
     }
+    /* A locked stream's inherited L2 tables belong to the bootloader; only
+     * the ones dart_get_l2() allocated are ours to release. */
+    if (dart->locked && !is_heap(l2))
+        return;
     dart->l1[ttbr][l1_index] = 0;
     free(l2);
 }

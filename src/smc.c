@@ -3,6 +3,7 @@
 #include "assert.h"
 #include "malloc.h"
 #include "smc.h"
+#include "soc.h"
 #include "string.h"
 #include "types.h"
 #include "utils.h"
@@ -62,13 +63,11 @@ static int smc_work(smc_dev_t *smc)
     int ret;
     struct rtkit_message msg;
 
-    while ((ret = rtkit_recv(smc->rtkit, &msg)) == 0)
-        ;
-
-    if (ret < 0) {
+    ret = rtkit_recv(smc->rtkit, &msg);
+    if (ret < 0)
         printf("SMC: rtkit_recv failed!\n");
+    if (ret <= 0)
         return ret;
-    }
 
     if (msg.ep != SMC_ENDPOINT) {
         printf("SMC: received message for unexpected endpoint 0x%02x\n", msg.ep);
@@ -99,8 +98,10 @@ static int smc_cmd(smc_dev_t *smc, u64 message)
     message |= FIELD_PREP(SMC_MSG_ID, id);
 
     smc_send(smc, message);
-    while (smc->outstanding[id])
-        smc_work(smc);
+    while (smc->outstanding[id]) {
+        if (smc_work(smc) < 0)
+            return -1;
+    }
 
     u64 result = smc->ret[id];
     u32 ret = FIELD_GET(SMC_RESULT_RESULT, result);
@@ -138,7 +139,12 @@ smc_dev_t *smc_init(void)
         goto out_asc;
     }
 
-    if (!rtkit_boot(smc->rtkit)) {
+    /* On T8152 (J873g) a previous stage leaves the SMC running with its RTKit
+     * session established; every other machine boots it as before. */
+    bool adopted = false;
+    bool booted =
+        chip_id == T8152 ? rtkit_boot_or_adopt(smc->rtkit, &adopted) : rtkit_boot(smc->rtkit);
+    if (!booted) {
         printf("SMC: failed to boot RTKit\n");
         goto out_rtkit;
     }
@@ -153,10 +159,16 @@ smc_dev_t *smc_init(void)
 
     smc_send(smc, initialize);
 
+    /* An adopted session is confirmed only by the SMC endpoint answering. */
+    u64 timeout = timeout_calculate(2 * USEC_PER_SEC);
     while (!smc->shmem) {
         int ret = smc_work(smc);
         if (ret < 0)
             goto out_rtkit;
+        if (adopted && timeout_expired(timeout)) {
+            printf("SMC: adopted session did not answer, giving up\n");
+            goto out_rtkit;
+        }
     }
 
     return smc;
@@ -171,6 +183,16 @@ out_free:
 }
 
 int smc_write_u32(smc_dev_t *smc, u32 key, u32 value)
+{
+    memcpy(smc->shmem, &value, sizeof(value));
+    u64 msg = FIELD_PREP(SMC_MSG_TYPE, SMC_WRITE_KEY);
+    msg |= FIELD_PREP(SMC_WRITE_KEY_SIZE, sizeof(value));
+    msg |= FIELD_PREP(SMC_WRITE_KEY_KEY, key);
+
+    return smc_cmd(smc, msg);
+}
+
+int smc_write_u64(smc_dev_t *smc, u32 key, u64 value)
 {
     memcpy(smc->shmem, &value, sizeof(value));
     u64 msg = FIELD_PREP(SMC_MSG_TYPE, SMC_WRITE_KEY);

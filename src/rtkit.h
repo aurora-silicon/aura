@@ -32,6 +32,7 @@ bool rtkit_has_owned_buffers(const rtkit_dev_t *rtk);
 
 bool rtkit_start_ep(rtkit_dev_t *rtk, u8 ep);
 bool rtkit_boot(rtkit_dev_t *rtk);
+bool rtkit_boot_or_adopt(rtkit_dev_t *rtk, bool *adopted);
 bool rtkit_boot_timed(rtkit_dev_t *rtk, u32 timeout_usec);
 u32 rtkit_get_timeout(rtkit_dev_t *rtk);
 

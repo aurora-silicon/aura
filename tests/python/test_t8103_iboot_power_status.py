@@ -96,7 +96,7 @@ _Static_assert(sizeof(u64) == 8 && sizeof(s64) == 8, "target LP64 integer sizes"
 #define FB_DEPTH_MASK 0xff
 #define FB_DEPTH_FLAG_RETINA 0x10000
 static u32 chip_id = T8103;
-typedef struct { void *dart_disp, *dart_dcp, *iovad_dcp; } dcp_dev_t;
+typedef struct { void *dart_disp, *dart_dcp, *iovad_dcp, *dptx_ep; } dcp_dev_t;
 typedef void afk_epic_ep_t;
 typedef struct dcp_iboot_if dcp_iboot_if_t;
 '''
@@ -162,12 +162,14 @@ static dcp_dev_t dcp_storage, *dcp = &dcp_storage;
 static struct dcp_iboot_if iboot_storage, *iboot = &iboot_storage;
 static u64 fb_dva, fb_size;
 static bool display_is_external, display_is_dptx, display_needs_power_cycle;
+static bool display_mode_max, fb_dva_allocated;
 static struct { struct { u64 base, stride, width, height, depth; } video; } cur_boot_args;
 static u64 boot_args_addr;
 static void *adt;
 static unsigned delays;
 static int display_start_dcp(void) { return 0; }
 static int dcp_connect_dptx(dcp_dev_t *d) { (void)d; assert(!"no DPTX on the internal panel"); return -1; }
+static int dcp_dptx_hpd(void *dptx, u32 port, bool hpd) { (void)dptx; (void)port; (void)hpd; assert(!"no DPTX on the internal panel"); return -1; }
 static int dcp_work(dcp_dev_t *d) { (void)d; return 0; }
 static void mdelay(unsigned ms) { (void)ms; delays++; }
 static u64 get_ticks(void) { return 0; }
