@@ -43,6 +43,14 @@
 #define NVME_LINEAR_SQ_CTRL    0x24908
 #define NVME_LINEAR_SQ_CTRL_EN BIT(0)
 
+/*
+ * ADT nvme-secure-reg-layout (T8152): AQA/ASQ/ACQ and the I/O queue registers
+ * move up by 0x4000 and LINEAR_SQ_CTRL moves into the NVMMU block. CC/CSTS,
+ * BOOT_STATUS, the doorbells and the NVMMU TCB registers stay.
+ */
+#define NVME_SECURE_QREG_SHIFT     0x4000
+#define NVME_SECURE_LINEAR_SQ_CTRL 0x2813c
+
 #define NVME_IOQ_CMDS           0x1200
 #define NVME_IOQ_CQES           0x1208
 #define NVME_MAX_PEND_CMDS_CTRL 0x1210
@@ -130,6 +138,7 @@ static enum {
 } nvme_type;
 
 static bool nvme_initialized = false;
+static bool nvme_secure_regs;
 static bool nvme_reboot_required;
 bool nvme_adopt_live_session = false;
 bool nvme_keep_running_for_linux = false;
@@ -155,18 +164,27 @@ static u64 nvme_read64_lo_hi(u64 addr)
     return lo | ((u64)read32(addr + 4) << 32);
 }
 
+static u64 nvme_qreg(u32 reg)
+{
+    return nvme_base + reg + (nvme_secure_regs ? NVME_SECURE_QREG_SHIFT : 0);
+}
+
+static u64 nvme_lsq_ctrl(void)
+{
+    return nvme_base + (nvme_secure_regs ? NVME_SECURE_LINEAR_SQ_CTRL : NVME_LINEAR_SQ_CTRL);
+}
+
 static void nvme_log_entry_state(bool running)
 {
     printf("nvme: entry RUN=%d BOOT_STATUS=0x%x handoff=%d\n", running,
            read32(nvme_base + NVME_BOOT_STATUS), nvme_adopt_live_session);
     printf("nvme: entry CC=0x%x CSTS=0x%x AQA=0x%x IOSQ=0x%lx IOCQ=0x%lx IOQA=0x%x\n",
-           read32(nvme_base + NVME_CC), read32(nvme_base + NVME_CSTS), read32(nvme_base + NVME_AQA),
-           nvme_read64_lo_hi(nvme_base + NVME_IOQ_CMDS),
-           nvme_read64_lo_hi(nvme_base + NVME_IOQ_CQES),
-           read32(nvme_base + NVME_MAX_PEND_CMDS_CTRL));
+           read32(nvme_base + NVME_CC), read32(nvme_base + NVME_CSTS), read32(nvme_qreg(NVME_AQA)),
+           nvme_read64_lo_hi(nvme_qreg(NVME_IOQ_CMDS)), nvme_read64_lo_hi(nvme_qreg(NVME_IOQ_CQES)),
+           read32(nvme_qreg(NVME_MAX_PEND_CMDS_CTRL)));
     printf("nvme: entry LINEAR_SQ=0x%x NVMMU_NUM=0x%x NVMMU_ASQ_TCB=0x%lx "
            "NVMMU_IOSQ_TCB=0x%lx\n",
-           read32(nvme_base + NVME_LINEAR_SQ_CTRL), read32(nvmmu_base + NVMMU_NUM),
+           read32(nvme_lsq_ctrl()), read32(nvmmu_base + NVMMU_NUM),
            nvme_read64_lo_hi(nvmmu_base + NVMMU_ASQ_BASE),
            nvme_read64_lo_hi(nvmmu_base + NVMMU_IOSQ_BASE));
 }
@@ -357,6 +375,7 @@ bool nvme_init(void)
 
     nvme_base = 0;
     nvmmu_base = 0;
+    nvme_secure_regs = false;
     nvme_die = 0;
     nvme_asc = NULL;
     nvme_rtkit = NULL;
@@ -387,6 +406,11 @@ bool nvme_init(void)
         // They use reg[3] for NVMMU registers and reg[9] for NVMe registers,
         // and require extra writes to set up the IO queues.
         nvme_type = NVME_T8132;
+    } else if (adt_get_property(adt, node, "nvme-secure-reg-layout")) {
+        // T8152 has the post-M4 queue setup in one reg[3] window like M1-M3,
+        // with the queue registers moved (nvme-secure-reg-layout).
+        nvme_type = NVME_T8132;
+        nvme_secure_regs = true;
     } else {
         // M1-M3 generations use reg[3] for both NVMMU and NVMe registers.
         nvme_type = NVME_T8103;
@@ -397,7 +421,7 @@ bool nvme_init(void)
         printf("nvme: Error getting NVMMU base address.\n");
         goto out_reset;
     }
-    if (nvme_type == NVME_T8132) {
+    if (nvme_type == NVME_T8132 && !nvme_secure_regs) {
         if (adt_get_reg(adt, adt_path, "reg", 9, &nvme_base, &nvme_size) < 0 || !nvme_base) {
             printf("nvme: Error getting NVMe base address.\n");
             goto out_reset;
@@ -488,8 +512,8 @@ bool nvme_init(void)
 
 setup_controller:
     /* setup controller and NVMMU for linear submission queue */
-    set32(nvme_base + NVME_LINEAR_SQ_CTRL, NVME_LINEAR_SQ_CTRL_EN);
-    write32(nvme_base + NVME_MAX_PEND_CMDS_CTRL,
+    set32(nvme_lsq_ctrl(), NVME_LINEAR_SQ_CTRL_EN);
+    write32(nvme_qreg(NVME_MAX_PEND_CMDS_CTRL),
             ((NVME_QUEUE_SIZE - 1) << 16) | (NVME_QUEUE_SIZE - 1));
     write32(nvmmu_base + NVMMU_NUM, NVME_QUEUE_SIZE - 1);
     write64_lo_hi(nvmmu_base + NVMMU_ASQ_BASE, (u64)adminq.tcbs);
@@ -500,9 +524,9 @@ setup_controller:
         printf("nvme: timeout while waiting for CSTS.RDY to clear\n");
         goto out_shutdown;
     }
-    write64_lo_hi(nvme_base + NVME_ASQ, (u64)adminq.cmds);
-    write64_lo_hi(nvme_base + NVME_ACQ, (u64)adminq.cqes);
-    write32(nvme_base + NVME_AQA, ((NVME_QUEUE_SIZE - 1) << 16) | (NVME_QUEUE_SIZE - 1));
+    write64_lo_hi(nvme_qreg(NVME_ASQ), (u64)adminq.cmds);
+    write64_lo_hi(nvme_qreg(NVME_ACQ), (u64)adminq.cqes);
+    write32(nvme_qreg(NVME_AQA), ((NVME_QUEUE_SIZE - 1) << 16) | (NVME_QUEUE_SIZE - 1));
     if (!nvme_ctrl_enable()) {
         printf("nvme: timeout while waiting for CSTS.RDY to be set\n");
         goto out_disable_ctrl;
@@ -538,8 +562,8 @@ setup_controller:
         // Extra write required to set up the IO queues on M4+.
         // Otherwise, the ANS crashes and the crashlog says
         // `I/O SQ  : 0x000000000` / `I/O CQ  : 0x000000000`.
-        write64_lo_hi(nvme_base + NVME_IOQ_CQES, (u64)ioq.cqes);
-        write64_lo_hi(nvme_base + NVME_IOQ_CMDS, (u64)ioq.cmds);
+        write64_lo_hi(nvme_qreg(NVME_IOQ_CQES), (u64)ioq.cqes);
+        write64_lo_hi(nvme_qreg(NVME_IOQ_CMDS), (u64)ioq.cmds);
     }
 
     nvme_initialized = true;
@@ -602,7 +626,8 @@ out_preserve:
 void nvme_ensure_shutdown(void)
 {
     int node = adt_path_offset(adt, "/arm-io/ans");
-    if (node >= 0 && adt_get_property(adt, node, "nvme-secure-bar")) {
+    if (node >= 0 && (adt_get_property(adt, node, "nvme-secure-bar") ||
+                      adt_get_property(adt, node, "nvme-secure-reg-layout"))) {
         printf("nvme: refusing post-M4 ANS power-down\n");
         return;
     }
@@ -670,7 +695,7 @@ bool nvme_shutdown(void)
     if (nvme_type == NVME_T8132 && (adminq.failed || ioq.failed))
         goto out_preserve;
 
-    if (nvme_type == NVME_T8132 && nvme_keep_running_for_linux) {
+    if (nvme_type == NVME_T8132 && nvme_keep_running_for_linux && !nvme_secure_regs) {
         u32 cc = read32(nvme_base + NVME_CC);
         u32 csts = read32(nvme_base + NVME_CSTS);
         u32 boot_status = read32(nvme_base + NVME_BOOT_STATUS);
@@ -718,8 +743,18 @@ bool nvme_shutdown(void)
     }
 
     if (nvme_type == NVME_T8132) {
-        write64_lo_hi(nvme_base + NVME_IOQ_CMDS, 0);
-        write64_lo_hi(nvme_base + NVME_IOQ_CQES, 0);
+        write64_lo_hi(nvme_qreg(NVME_IOQ_CMDS), 0);
+        write64_lo_hi(nvme_qreg(NVME_IOQ_CQES), 0);
+        if (nvme_secure_regs) {
+            /* Linux wakes the T8152 ANS with a fresh RTKit handshake and
+             * cannot adopt a live session; it neither restarts a stopped
+             * ANS. Quiesce RTKit and leave the ASC running, as iBoot does. */
+            if (!rtkit_quiesce(nvme_rtkit))
+                goto out_preserve;
+            nvme_initialized = false;
+            printf("nvme: controller disabled, RTKit quiesced\n");
+            return true;
+        }
         nvme_adopt_live_session = true;
         nvme_initialized = false;
         printf("nvme: controller disabled; preserving live RTKit session\n");
