@@ -9,6 +9,7 @@
 #include "iova.h"
 #include "malloc.h"
 #include "sart.h"
+#include "soc.h"
 #include "string.h"
 #include "types.h"
 #include "utils.h"
@@ -108,6 +109,8 @@ struct rtkit_dev {
     u32 syslog_cnt, syslog_size;
 
     bool crashed;
+    /* The last boot attempt got no HELLO after the wakeup. */
+    bool no_hello;
 };
 
 struct syslog_log {
@@ -362,13 +365,14 @@ static bool rtkit_handle_oslog_request(rtkit_dev_t *rtk, struct rtkit_message *m
     }
 
     if (addr) {
-        if (!rtk->dart && !rtk->sart && sz) {
-            /* Without an IOMMU the buffer address is physical. The SMC on
-             * T8152 pre-allocates its oslog inside an SPTM-protected window
-             * and only needs the address echoed back. */
+        if (rtk->sram && chip_id == T8152 && sz) {
+            /* As for SRAM buffers, the address is physical and the IOP owns
+             * it: the T8152 SMC pre-allocates its oslog inside an
+             * SPTM-protected window and only needs the address echoed back. */
             bfr->dva = addr;
             bfr->bfr = (void *)addr;
             bfr->sz = sz;
+            bfr->owned = false;
             rtkit_printf("pre-allocated oslog buffer (phys %#lx, size %#zx)\n", addr, sz);
             return true;
         }
@@ -616,6 +620,8 @@ static bool rtkit_boot_internal(rtkit_dev_t *rtk, u32 timeout_usec)
 {
     struct asc_message msg;
 
+    rtk->no_hello = false;
+
     /* boot the IOP if it isn't already */
     asc_cpu_start(rtk->asc);
     /* can be sent unconditionally to wake up a possibly sleeping IOP */
@@ -629,6 +635,7 @@ static bool rtkit_boot_internal(rtkit_dev_t *rtk, u32 timeout_usec)
 
     if (!asc_recv_timeout(rtk->asc, &msg, USEC_PER_SEC)) {
         rtkit_printf("did not receive HELLO\n");
+        rtk->no_hello = true;
         return false;
     }
 
@@ -775,6 +782,26 @@ static bool rtkit_boot_internal(rtkit_dev_t *rtk, u32 timeout_usec)
 bool rtkit_boot(rtkit_dev_t *rtk)
 {
     return rtkit_boot_internal(rtk, 0);
+}
+
+/* Boot the IOP, or adopt the session of one a previous stage left running. Such
+ * an IOP already completed HELLO/EPMAP and does not repeat them, so the only
+ * accepted evidence is a CPU that was running before the wakeup and no HELLO
+ * in reply to it; any other boot failure stays a failure. The caller must
+ * still confirm the adopted session on its own endpoint. */
+bool rtkit_boot_or_adopt(rtkit_dev_t *rtk, bool *adopted)
+{
+    bool running = asc_cpu_running(rtk->asc);
+
+    *adopted = false;
+    if (rtkit_boot(rtk))
+        return true;
+    if (!running || !rtk->no_hello)
+        return false;
+
+    rtkit_printf("running IOP sent no HELLO, adopting its session\n");
+    *adopted = true;
+    return true;
 }
 
 bool rtkit_boot_timed(rtkit_dev_t *rtk, u32 timeout_usec)
