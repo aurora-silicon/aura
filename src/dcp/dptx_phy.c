@@ -785,9 +785,10 @@ u32 dptx_phy_dcp_output(dptx_phy_t *phy)
     }
 }
 
-/* The phy register block is power-gated until its PMGR device is enabled.
- * Probe it under the exception guard so a gated block fails the init instead
- * of aborting in the middle of the activation sequence and rebooting. */
+/* The T8152 HDMI phy register block is power-gated until its PMGR device is
+ * enabled (see dcp_init). Probe it under the exception guard so a gated block
+ * fails the init instead of aborting in the middle of the activation sequence
+ * and rebooting. */
 static bool dptx_phy_accessible(dptx_phy_t *phy)
 {
     enum exc_guard_t guard = exc_guard;
@@ -851,7 +852,7 @@ dptx_phy_t *dptx_phy_init(const char *phy_node, u32 dcp_index)
         goto out_err;
     }
 
-    if (!dptx_phy_accessible(phy)) {
+    if (type == DPTX_PHY_T8152_HDMI && !dptx_phy_accessible(phy)) {
         printf("DPtx-phy: %s is not responding (power gate off?)\n", phy_node);
         goto out_err;
     }

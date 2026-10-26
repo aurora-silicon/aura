@@ -86,7 +86,7 @@ static int dcp_hdmi_dptx_init(dcp_dev_t *dcp, const display_config_t *cfg)
     const struct adt_function_smc_pw8 *pw8_dp2hdmi =
         adt_getprop(adt, node, "function-dp2hdmi_pwr_en", &pw8_size);
 
-    if (pw8_dp2hdmi && pw8_size == sizeof(*pw8_dp2hdmi)) {
+    if (chip_id == T8152 && pw8_dp2hdmi && pw8_size == sizeof(*pw8_dp2hdmi)) {
         u32 hdmi_size;
         const struct adt_function_smc_pw8 *pw8_hdmi =
             adt_getprop(adt, node, "function-hdmi_pwr_en", &hdmi_size);

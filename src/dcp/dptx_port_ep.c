@@ -10,6 +10,7 @@
 
 #include "../afk.h"
 #include "../dcp.h"
+#include "../soc.h"
 #include "../types.h"
 #include "../utils.h"
 
@@ -539,8 +540,8 @@ static u32 dptxport_call_v2(afk_epic_service_t *service, u16 group, u32 command,
         return 0xe00002c7; /* kIOReturnUnsupported */
 
     dptx_port_t *port = service->cookie;
-    printf("DPTXV2: port %d group %u cmd %u size %zu\n", port ? (int)port->unit : -1, group,
-           command, data_size);
+    dprintf("DPTXV2: port %d group %u cmd %u size %zu\n", port ? (int)port->unit : -1, group,
+            command, data_size);
     if ((!port || !port->phy) &&
         (command == DPTX_APCALL_ACTIVATE || command == DPTX_APCALL_DEACTIVATE ||
          command == DPTX_APCALL_WILL_CHANGE_LINKG_CONFIG ||
@@ -643,14 +644,19 @@ static u32 dptxport_call_v2(afk_epic_service_t *service, u16 group, u32 command,
         case DPTX_APCALL_DEVICE_NOT_RESPONDING:
         case DPTX_APCALL_DEVICE_BUSY_TIMEOUT:
         case DPTX_APCALL_DEVICE_NOT_STARTED:
-            /* Link fault reports: the native client acknowledges them with a
-             * zeroed retcode; they are not requests we can answer. */
+            /* Link fault reports: the native T8152 client acknowledges them
+             * with a zeroed retcode; they are not requests we can answer.
+             * Other machines keep answering them as unsupported. */
+            if (chip_id != T8152)
+                return 0xe00002c7;
             dprintf("DPTXPort: firmware reports link fault %u\n", command);
             memcpy(reply, data, min(reply_size, data_size));
             if (reply_size > 4)
                 memset(reply, 0, 4);
             return 0;
         case DPTX_APCALL_SET_TILED_DISPLAY_HINTS: {
+            if (chip_id != T8152)
+                return 0xe00002c7;
             u32 retcode = 1;
             memcpy(reply, data, min(reply_size, data_size));
             memcpy(reply, &retcode, min(reply_size, sizeof(retcode)));
