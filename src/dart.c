@@ -885,6 +885,10 @@ void dart_free_l2(dart_dev_t *dart, uintptr_t iova)
             return;
         }
     }
+    /* A locked stream's inherited L2 tables belong to the bootloader; only
+     * the ones dart_get_l2() allocated are ours to release. */
+    if (dart->locked && !is_heap(l2))
+        return;
     dart->l1[ttbr][l1_index] = 0;
     free(l2);
 }
