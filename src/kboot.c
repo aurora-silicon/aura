@@ -480,7 +480,9 @@ static int dt_set_chosen(void)
          * bootargs to prevent Linux from crashing in the idle loop and delay
          * function.
          */
-        const char to_append[] = " idle=nop arm64.nowfxt";
+        const char to_append_wfi[] = " idle=nop arm64.nowfxt";
+        /* The T8152 kernel preserves the state its cores lose in WFI. */
+        const char *to_append = chip_id == T8152 ? " arm64.nowfxt" : to_append_wfi;
         printf("FDT: appending to bootargs:%s\n", to_append);
 
         /*
@@ -493,12 +495,12 @@ static int dt_set_chosen(void)
 
         if (!fdt_get_property(dt, node, "bootargs", &oldlen) || oldlen < 1)
             oldlen = 1;
-        newlen = oldlen + sizeof(to_append) - 1;
+        newlen = oldlen + strlen(to_append);
 
         if (fdt_setprop_placeholder(dt, node, "bootargs", newlen, &prop_data))
             bail("FDT: failed to append to 'bootargs' property\n");
 
-        strncpy(prop_data + oldlen - 1, to_append, sizeof(to_append));
+        strncpy(prop_data + oldlen - 1, to_append, strlen(to_append) + 1);
     }
 
     return 0;
@@ -860,6 +862,8 @@ static int dt_set_cpus(void)
         aic = fdt_node_offset_by_compatible(dt, -1, "apple,aic2");
     if (aic == -FDT_ERR_NOTFOUND)
         aic = fdt_node_offset_by_compatible(dt, -1, "apple,t8122-aic3");
+    if (aic == -FDT_ERR_NOTFOUND)
+        aic = fdt_node_offset_by_compatible(dt, -1, "apple,t8152-aic3");
     if (aic < 0)
         bail_cleanup("FDT: Failed to find AIC node\n");
 
@@ -6149,6 +6153,85 @@ static int dt_setup_mtd_phram(void)
     return 0;
 }
 
+/*
+ * The second display (J873g HDMI on DCPEXT0 next to USB-C) becomes a second
+ * simple-framebuffer at the root: Linux creates a device only for the first
+ * simple-framebuffer child of /chosen.
+ */
+static int dt_set_fb2_t8152(void)
+{
+    const struct boot_video *v = &display_second_video;
+
+    if (!v->base)
+        return 0;
+    if ((v->depth & 0xff) != 32) {
+        printf("FDT: second framebuffer depth %lu unsupported, not adding it\n", v->depth);
+        return 0;
+    }
+
+    char name[32];
+    snprintf(name, sizeof(name), "framebuffer@%lx", v->base);
+    int node = fdt_add_subnode(dt, 0, name);
+    if (node < 0)
+        bail("FDT: couldn't add %s\n", name);
+
+    fdt64_t reg[2] = {cpu_to_fdt64(v->base), cpu_to_fdt64(v->stride * v->height)};
+    if (fdt_setprop_string(dt, node, "compatible", "simple-framebuffer") ||
+        fdt_setprop(dt, node, "reg", reg, sizeof(reg)) ||
+        fdt_setprop_u32(dt, node, "width", v->width) ||
+        fdt_setprop_u32(dt, node, "height", v->height) ||
+        fdt_setprop_u32(dt, node, "stride", v->stride) ||
+        fdt_setprop_string(dt, node, "format", "x8r8g8b8"))
+        bail("FDT: couldn't describe %s\n", name);
+
+    printf("FDT: %s %lux%lu\n", name, v->width, v->height);
+    return 0;
+}
+
+/*
+ * The J873g (T8152) device trees come with their own loader contract (Linux
+ * tools/aurora/j873/loader): the machine is brought up in j873g_run_proxy(),
+ * and beyond /chosen only the CPUs, MAC addresses, the second framebuffer and
+ * the memory map are filled in here.
+ */
+static int dt_prepare_t8152(void)
+{
+    if (dt_set_cpus())
+        return -1;
+    if (dt_set_mac_addresses())
+        return -1;
+    if (dt_set_fb2_t8152())
+        return -1;
+    if (dt_set_memory())
+        return -1;
+    if (fdt_pack(dt))
+        bail("FDT: fdt_pack() failed\n");
+
+    printf("FDT prepared at %p\n", dt);
+    return 0;
+}
+
+/* T8152 has no clock, USB, PCIe or DAPF setup here: j873g_run_proxy() did
+ * what the device tree expects, and Linux owns the rest. */
+static int kboot_boot_t8152(void *kernel)
+{
+    if (smp_has_pending_calls()) {
+        next_stage.entry = NULL;
+        bail("kboot: refusing handoff while secondary callbacks are pending\n");
+    }
+    printf("Setting SMP mode to WFE...\n");
+    smp_set_wfe_mode(true);
+    printf("Preparing to boot kernel at %p with fdt at %p\n", kernel, dt);
+    next_stage.entry = kernel;
+    next_stage.args[0] = (u64)dt;
+    next_stage.args[1] = 0;
+    next_stage.args[2] = 0;
+    next_stage.args[3] = 0;
+    next_stage.args[4] = 0;
+    next_stage.restore_logo = false;
+    return 0;
+}
+
 int kboot_prepare_dt(void *fdt)
 {
     if (smp_has_pending_calls()) {
@@ -6211,7 +6294,7 @@ int kboot_prepare_dt(void *fdt)
      * sit in this stage's heap and must stay out of Linux's allocator (J616C: ANS syslog lines
      * in page-cache pages at the SART-allowed heap addresses).
      */
-    if (chip_id == T8140 || chip_id == T6041) {
+    if (chip_id == T8140 || chip_id == T6041 || chip_id == T8152) {
         u64 ram_end, inherited = cur_boot_args.top_of_kernel_data;
         u64 high_water = heapblock_high_water();
 
@@ -6237,6 +6320,19 @@ int kboot_prepare_dt(void *fdt)
     }
     if (fdt_add_mem_rsv(dt, (u64)_base, image_end - (u64)_base))
         bail("FDT: couldn't add reservation for m1n1 and inherited high-water\n");
+
+    /*
+     * T8152: keep everything below this image as well (the earlier stage and
+     * what iBoot placed there), as the host loader did. With that range free,
+     * Linux took write permission faults there from secondary cores; the boot
+     * CPU's CTRR registers do not describe it.
+     */
+    if (chip_id == T8152 && (u64)_base > cur_boot_args.phys_base) {
+        if (fdt_add_mem_rsv(dt, cur_boot_args.phys_base, (u64)_base - cur_boot_args.phys_base))
+            bail("FDT: couldn't reserve the memory below this stage\n");
+        printf("FDT: reserved [0x%lx, 0x%lx) below this stage\n", cur_boot_args.phys_base,
+               (u64)_base);
+    }
 
     /*
      * A live ANS handed to Linux keeps every buffer an earlier stage gave it (on a normal boot
@@ -6311,6 +6407,8 @@ int kboot_prepare_dt(void *fdt)
 
     if (dt_set_chosen())
         return -1;
+    if (chip_id == T8152)
+        return dt_prepare_t8152();
     if (dt_set_speaker_safety())
         return -1;
     if (dt_set_uboot_config())
@@ -6430,6 +6528,9 @@ int kboot_prepare_dt(void *fdt)
 
 int kboot_boot(void *kernel)
 {
+    if (chip_id == T8152)
+        return kboot_boot_t8152(kernel);
+
     if (smp_has_pending_calls()) {
         next_stage.entry = NULL;
         bail("kboot: refusing handoff while secondary callbacks are pending\n");

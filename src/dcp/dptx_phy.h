@@ -20,6 +20,7 @@ int dptx_phy_set_active_lane_count(dptx_phy_t *phy, u32 num_lanes);
 u32 dptx_phy_get_active_lane_count(dptx_phy_t *phy);
 int dptx_phy_set_drive_settings(dptx_phy_t *phy, const dptx_drive_settings_t *settings, u32 count);
 int dptx_phy_set_link_rate(dptx_phy_t *phy, u32 link_rate);
+u32 dptx_phy_max_link_rate(dptx_phy_t *phy);
 
 u32 dptx_phy_dcp_output(dptx_phy_t *phy);
 

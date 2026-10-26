@@ -22,6 +22,40 @@ struct adt_function_smc_gpio {
     u32 unk;
 };
 
+/* T8152 encodes the pcon power enable as pKW8("pcIO", lo, hi): an eight-byte
+ * SMC write of (hi << 32) | lo | level. */
+struct adt_function_smc_pw8 {
+    u32 phandle;
+    char four_cc[4];
+    u32 key;
+    u32 lo;
+    u32 hi;
+};
+
+/* T8152 PMGR2 PSD service blocks (as in t8152-j873-gpu.dtsi): request at
+ * +0x90, acknowledge bit 0 at +0xbc, state at +0x80 (read after the ACK). */
+#define T8152_PSD_BASE    0x303a10000
+#define T8152_PSD_STRIDE  0x100
+#define T8152_PSD_STATE   0x80
+#define T8152_PSD_REQUEST 0x90
+#define T8152_PSD_ACK     0xbc
+
+static int t8152_psd_power_on(u32 service)
+{
+    u64 base = T8152_PSD_BASE + service * T8152_PSD_STRIDE;
+
+    if (!read32(base + T8152_PSD_STATE))
+        return 0;
+    write32(base + T8152_PSD_REQUEST, 0);
+    if (poll32(base + T8152_PSD_ACK, 1, 1, 1000000)) {
+        printf("dcp: PSD service %u did not acknowledge power on\n", service);
+        return -1;
+    }
+    u32 state = read32(base + T8152_PSD_STATE);
+    printf("dcp: PSD service %u state %u\n", service, state);
+    return state ? -1 : 0;
+}
+
 static char dcp_pmgr_dev[16] = "DISP0_CPU0";
 static u32 dcp_die;
 
@@ -48,25 +82,48 @@ static int dcp_hdmi_dptx_init(dcp_dev_t *dcp, const display_config_t *cfg)
         return -1;
     }
     struct adt_function_smc_gpio dp2hdmi_pwr, hdmi_pwr;
+    u32 pw8_size;
+    const struct adt_function_smc_pw8 *pw8_dp2hdmi =
+        adt_getprop(adt, node, "function-dp2hdmi_pwr_en", &pw8_size);
 
-    int err =
-        adt_getprop_copy(adt, node, "function-dp2hdmi_pwr_en", &dp2hdmi_pwr, sizeof(dp2hdmi_pwr));
-    if (err < 0)
-        printf("dcp: failed to get dp2hdmi_pwr_en gpio\n");
-    else
-        dcp->dp2hdmi_pwr_gpio = dp2hdmi_pwr.gpio;
-    err = adt_getprop_copy(adt, node, "function-hdmi_pwr_en", &hdmi_pwr, sizeof(hdmi_pwr));
-    if (err < 0)
-        printf("dcp: failed to get hdmi_pwr_en gpio\n");
-    else
-        dcp->hdmi_pwr_gpio = hdmi_pwr.gpio;
-
-    if (dcp->dp2hdmi_pwr_gpio && dcp->hdmi_pwr_gpio) {
+    if (pw8_dp2hdmi && pw8_size == sizeof(*pw8_dp2hdmi)) {
+        u32 hdmi_size;
+        const struct adt_function_smc_pw8 *pw8_hdmi =
+            adt_getprop(adt, node, "function-hdmi_pwr_en", &hdmi_size);
         smc_dev_t *smc = smc_init();
         if (smc) {
-            smc_write_u32(smc, dcp->dp2hdmi_pwr_gpio, 0x800001);
-            smc_write_u32(smc, dcp->hdmi_pwr_gpio, 0x800001);
+            int r1 = smc_write_u64(smc, pw8_dp2hdmi->key,
+                                   ((u64)pw8_dp2hdmi->hi << 32) | pw8_dp2hdmi->lo | 1);
+            int r2 = -1;
+            if (pw8_hdmi && hdmi_size == sizeof(*pw8_hdmi))
+                r2 =
+                    smc_write_u64(smc, pw8_hdmi->key, ((u64)pw8_hdmi->hi << 32) | pw8_hdmi->lo | 1);
+            if (r1 || r2)
+                printf("dcp: pcon power failed: dp2hdmi=%d hdmi=%d\n", r1, r2);
             smc_shutdown(smc);
+        } else {
+            printf("dcp: failed to initialize SMC for pcon power\n");
+        }
+    } else {
+        int err = adt_getprop_copy(adt, node, "function-dp2hdmi_pwr_en", &dp2hdmi_pwr,
+                                   sizeof(dp2hdmi_pwr));
+        if (err < 0)
+            printf("dcp: failed to get dp2hdmi_pwr_en gpio\n");
+        else
+            dcp->dp2hdmi_pwr_gpio = dp2hdmi_pwr.gpio;
+        err = adt_getprop_copy(adt, node, "function-hdmi_pwr_en", &hdmi_pwr, sizeof(hdmi_pwr));
+        if (err < 0)
+            printf("dcp: failed to get hdmi_pwr_en gpio\n");
+        else
+            dcp->hdmi_pwr_gpio = hdmi_pwr.gpio;
+
+        if (dcp->dp2hdmi_pwr_gpio && dcp->hdmi_pwr_gpio) {
+            smc_dev_t *smc = smc_init();
+            if (smc) {
+                smc_write_u32(smc, dcp->dp2hdmi_pwr_gpio, 0x800001);
+                smc_write_u32(smc, dcp->hdmi_pwr_gpio, 0x800001);
+                smc_shutdown(smc);
+            }
         }
     }
 
@@ -164,7 +221,10 @@ dcp_dev_t *dcp_init(const display_config_t *cfg)
     u32 sid;
 
     if (cfg && cfg->dptx_phy[0]) {
-        if (os_firmware.version != V13_5) {
+        /* J873g reports mBoot-20457.1.29, which is not in the OS firmware
+         * table, and the same dptx-port endpoint works on its USB-C route.
+         * Keep the V13_5 restriction for the machines it was written for. */
+        if (os_firmware.version != V13_5 && chip_id != T8152) {
             printf("dcp: dtpx-port is only supported with V13_5 OS firmware.\n");
             return NULL;
         }
@@ -172,7 +232,27 @@ dcp_dev_t *dcp_init(const display_config_t *cfg)
         strncpy(dcp_pmgr_dev, cfg->pmgr_dev, sizeof(dcp_pmgr_dev));
         dcp_die = cfg->die;
         pmgr_adt_power_enable(cfg->dcp);
-        pmgr_adt_power_enable(cfg->dptx_phy);
+        int phy_node = adt_path_offset(adt, cfg->dptx_phy);
+        if (phy_node >= 0 && adt_is_compatible(adt, phy_node, "dptx-phy,t8152")) {
+            /* The T8152 dptx-phy node lists gate 5 in power-gates, which is
+             * an E-core, not the phy's PMGR device. Enabling it leaves the
+             * phy gated and the first register access aborts. */
+            if (pmgr_power_on(dcp_die, "DPTX_PHY") < 0) {
+                printf("dcp: failed to power DPTX_PHY\n");
+                return NULL;
+            }
+            /* On PMGR2 that gate is a PSD service, as the GPU's sgx/gfx-asc
+             * gates are. It idles at state 6 until requested; the register
+             * interface works without it, the transmitter does not. */
+            u32 gate;
+            if (ADT_GETPROP(adt, phy_node, "power-gates", &gate) < 0 ||
+                t8152_psd_power_on(gate) < 0) {
+                printf("dcp: failed to power dptx-phy PSD service\n");
+                return NULL;
+            }
+        } else {
+            pmgr_adt_power_enable(cfg->dptx_phy);
+        }
         mdelay(25);
     }
 

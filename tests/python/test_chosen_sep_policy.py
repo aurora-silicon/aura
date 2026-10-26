@@ -27,6 +27,7 @@ typedef uint8_t u8;
 #define T6001 0x6001
 #define T6002 0x6002
 #define T8140 0x8140
+#define T8152 0x8152
 #define bail(...) return -1
 static unsigned char blob[4096];
 static void *dt = blob, *adt = blob;

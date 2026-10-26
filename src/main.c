@@ -15,6 +15,7 @@
 #include "firmware.h"
 #include "gxf.h"
 #include "heapblock.h"
+#include "j873.h"
 #include "mcc.h"
 #include "memory.h"
 #include "nvme.h"
@@ -245,6 +246,9 @@ static void j873g_run_proxy(void)
     wdt_disable();
     if (smp_init() < 0)
         panic("Unsupported T8152 CPU topology\n");
+    /* The DCPEXT0/DPTX_PHY power gates are PMGR2 devices; without this the
+     * HDMI phy stays gated and the first register access aborts. */
+    pmgr_init();
 #ifdef USE_FB
     if (display_init() < 0)
         printf("display: initialization failed, continuing with firmware framebuffer\n");
@@ -252,7 +256,22 @@ static void j873g_run_proxy(void)
     fb_display_logo();
     fb_set_active(true);
 #endif
-    printf("Initialization complete. Running proxy...\n");
+    /* What the J873 Linux device trees expect the loader to have done. */
+    j873_usb_prep();
+    j873_n1_power();
+    j873_pcie_prep();
+    printf("Initialization complete.\n");
+
+    /* An appended payload (or boot= from storage) boots directly. */
+    if (!aura_proxy_enabled()) {
+        printf("Checking for payloads...\n");
+        if (payload_run() == 0) {
+            printf("Valid payload found\n");
+            return;
+        }
+        printf("No valid payload found\n");
+    }
+    printf("Running proxy...\n");
     uartproxy_run(NULL);
 }
 
@@ -325,7 +344,7 @@ next_stage:
 
     printf("Preparing to run next stage at %p...\n", next_stage.entry);
 
-    if (chip_id != T8152 && !nvme_shutdown()) {
+    if (!nvme_shutdown()) {
         printf("NVMe handoff failed; returning to proxy\n");
         uartproxy_run(NULL);
         panic("NVMe handoff failed\n");

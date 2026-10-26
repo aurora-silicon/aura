@@ -362,6 +362,16 @@ static bool rtkit_handle_oslog_request(rtkit_dev_t *rtk, struct rtkit_message *m
     }
 
     if (addr) {
+        if (!rtk->dart && !rtk->sart && sz) {
+            /* Without an IOMMU the buffer address is physical. The SMC on
+             * T8152 pre-allocates its oslog inside an SPTM-protected window
+             * and only needs the address echoed back. */
+            bfr->dva = addr;
+            bfr->bfr = (void *)addr;
+            bfr->sz = sz;
+            rtkit_printf("pre-allocated oslog buffer (phys %#lx, size %#zx)\n", addr, sz);
+            return true;
+        }
         if (rtk->dart && sz && addr <= UINT64_MAX - sz) {
             u64 dva = addr & ~rtk->dva_base;
             u64 page = ALIGN_DOWN(dva, SZ_16K);

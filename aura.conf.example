@@ -17,6 +17,11 @@
 # Configure the boot display to 4K at 59.97Hz (or closest available)
 #display=3840x2160@59.94
 
+# Bring up a second display (J873g: HDMI next to USB-C) with this mode;
+# "max" picks the largest mode from the monitor's own EDID
+#display2=max
+#display2=1920x1080@60
+
 # Add an arbitrary property to /chosen in the device tree
 #chosen.foo=bar
 
