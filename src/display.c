@@ -84,6 +84,8 @@ static struct {
     dcp_dev_t *dcp;
     dcp_iboot_if_t *iboot;
     u64 fb_dva, fb_size;
+    bool fb_dva_allocated;
+    bool is_dptx;
     const display_config_t *cfg;
     struct boot_video video;
 } display_other;
@@ -95,6 +97,9 @@ static u64 display_fb_override_size;
  * boot-console preference for modes up to 1920x1200 or for ones that fit the
  * current framebuffer. */
 static bool display_mode_max;
+/* fb_dva came from iova_alloc() (a T8152 framebuffer that grew) and goes back
+ * to the allocator when it is replaced. */
+static bool fb_dva_allocated;
 
 #define USE_DCPEXT 1
 
@@ -393,6 +398,7 @@ int display_start_dcp(void)
     }
 
     // Find the framebuffer DVA
+    fb_dva_allocated = false;
     fb_dva = dart_search(dcp->dart_disp, (void *)cur_boot_args.video.base);
     // framebuffer is not mapped on the M1 Ultra Mac Studio
     if (DART_IS_ERR(fb_dva) || !fb_dva)
@@ -637,8 +643,14 @@ int display_configure(const char *config)
 
         if (chip_id == T8152) {
             /* The DCP already scans out the new framebuffer at tmp_dva; a
-             * second swap after moving it back to fb_dva times out here. */
+             * second swap after moving it back to fb_dva times out here.
+             * tmp_dva becomes the framebuffer DVA, so it is no longer
+             * temporary: the cleanup below must not unmap or free it. */
+            if (fb_dva_allocated)
+                iova_free(dcp->iovad_dcp, fb_dva, fb_size);
             fb_dva = tmp_dva;
+            fb_dva_allocated = true;
+            tmp_dva = 0;
             swapped = true;
         } else {
             fb_dva = display_map_fb(fb_dva, fb_pa, size);
@@ -674,7 +686,7 @@ int display_configure(const char *config)
     u32 stride = tbest.width * 4;
     /* A reused framebuffer still holds the previous console at another
      * stride (the stage before left 640x1136 text there). */
-    if (chip_id == T8152 && !tmp_dva)
+    if (chip_id == T8152 && !swapped)
         memset((void *)fb_pa, 0, (size_t)stride * tbest.height);
     if (!swapped) {
         ret = display_swap(fb_dva, stride, tbest.width, tbest.height);
@@ -767,6 +779,8 @@ static void display_swap_state(void)
     SWAP(iboot, display_other.iboot);
     SWAP(fb_dva, display_other.fb_dva);
     SWAP(fb_size, display_other.fb_size);
+    SWAP(fb_dva_allocated, display_other.fb_dva_allocated);
+    SWAP(display_is_dptx, display_other.is_dptx);
     SWAP(t8152_config, display_other.cfg);
     SWAP(cur_boot_args.video, display_other.video);
 #undef SWAP
@@ -776,19 +790,26 @@ static void display_swap_state(void)
  * framebuffer, or modeset it later (the loader calls this by symbol). */
 int display_configure_second(const char *config)
 {
+    if (chip_id != T8152 || board_id != 0x24 || !adt_is_compatible(adt, 0, "J873gAP")) {
+        printf("display: no second display on this machine\n");
+        return -1;
+    }
+
     bool first = !display_other.dcp;
 
     if (first) {
         /* Its own framebuffer, mapped when the DCP starts, as /vram is for
          * the first display; sized so that any mode up to 3840x2160 fits.
          * Switching DCPEXT0 to a reallocated framebuffer later leaves it
-         * scanning out nothing. */
+         * scanning out nothing. A retry after a failed bring-up reuses it. */
         u64 size = ALIGN_UP(3840 * 2160 * 4 + 24 * SZ_16K, SZ_16K);
-        u64 pa = top_of_memory_alloc(size);
-        memset((void *)pa, 0, size);
+        if (!display_other.video.base) {
+            u64 pa = top_of_memory_alloc(size);
+            memset((void *)pa, 0, size);
+            display_other.video = (struct boot_video){
+                .base = pa, .stride = 3840 * 4, .width = 3840, .height = 2160, .depth = 32};
+        }
         display_other.cfg = &display_config_j873_hdmi_ext;
-        display_other.video = (struct boot_video){
-            .base = pa, .stride = 3840 * 4, .width = 3840, .height = 2160, .depth = 32};
         display_fb_override_size = size;
     }
     display_swap_state();
@@ -796,10 +817,15 @@ int display_configure_second(const char *config)
     display_fb_override_size = 0;
     if (ret > 0) {
         display_second_video = cur_boot_args.video;
-    } else if (first && dcp) {
-        display_shutdown(DCP_QUIESCED);
+    } else if (first) {
+        /* Drop everything the failed bring-up set up; the first display's
+         * state is swapped back below untouched. */
+        if (dcp)
+            display_shutdown(DCP_QUIESCED);
         dcp = NULL;
         iboot = NULL;
+        fb_dva = fb_size = 0;
+        fb_dva_allocated = false;
     }
     display_swap_state();
 
