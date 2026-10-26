@@ -1,9 +1,9 @@
 /* SPDX-License-Identifier: MIT AND GPL-2.0-only */
 
-#include "adt.h"
 #include "assert.h"
 #include "malloc.h"
 #include "smc.h"
+#include "soc.h"
 #include "string.h"
 #include "types.h"
 #include "utils.h"
@@ -64,6 +64,8 @@ static int smc_work(smc_dev_t *smc)
     struct rtkit_message msg;
 
     ret = rtkit_recv(smc->rtkit, &msg);
+    if (ret < 0)
+        printf("SMC: rtkit_recv failed!\n");
     if (ret <= 0)
         return ret;
 
@@ -137,10 +139,14 @@ smc_dev_t *smc_init(void)
         goto out_asc;
     }
 
-    if (!rtkit_boot(smc->rtkit)) {
-        /* A previous owner already completed HELLO/EPMAP for this session;
-         * the firmware will not repeat them. */
-        printf("SMC: adopting the running IOP session\n");
+    /* On T8152 (J873g) a previous stage leaves the SMC running with its RTKit
+     * session established; every other machine boots it as before. */
+    bool adopted = false;
+    bool booted =
+        chip_id == T8152 ? rtkit_boot_or_adopt(smc->rtkit, &adopted) : rtkit_boot(smc->rtkit);
+    if (!booted) {
+        printf("SMC: failed to boot RTKit\n");
+        goto out_rtkit;
     }
 
     if (!rtkit_start_ep(smc->rtkit, SMC_ENDPOINT)) {
@@ -153,13 +159,14 @@ smc_dev_t *smc_init(void)
 
     smc_send(smc, initialize);
 
+    /* An adopted session is confirmed only by the SMC endpoint answering. */
     u64 timeout = timeout_calculate(2 * USEC_PER_SEC);
     while (!smc->shmem) {
         int ret = smc_work(smc);
         if (ret < 0)
             goto out_rtkit;
-        if (timeout_expired(timeout)) {
-            printf("SMC: timed out waiting for shared memory address\n");
+        if (adopted && timeout_expired(timeout)) {
+            printf("SMC: adopted session did not answer, giving up\n");
             goto out_rtkit;
         }
     }
