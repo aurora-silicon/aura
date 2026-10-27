@@ -6243,7 +6243,7 @@ int kboot_prepare_dt(void *fdt)
      * Stage 1 read the ESP, so the buffers are in Stage 1's heap, not this one's). Reserve each
      * SART-allowed range inside RAM; the nvme-apple adoption requires them reserved anyway.
      */
-    if (chip_id == T6041) {
+    if (chip_id == T6041 || chip_id == T8142) {
         sart_dev_t *sart = sart_init("/arm-io/sart-ans");
         u64 ram_start = cur_boot_args.phys_base;
         u64 ram_end = ram_start + cur_boot_args.mem_size;
