@@ -196,7 +196,7 @@ OBJECTS := \
 	memory.o memory_asm.o \
 	nvme.o \
 	payload.o \
-	pcie.o \
+	j813_n1.o pcie.o \
 	pmgr.o \
 	proxy.o \
 	ringbuffer.o \

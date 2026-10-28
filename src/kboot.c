@@ -25,6 +25,7 @@
 #include "malloc.h"
 #include "mcc.h"
 #include "memory.h"
+#include "j813_n1.h"
 #include "pcie.h"
 #include "pmgr.h"
 #include "rtkit.h"
@@ -6412,6 +6413,10 @@ int kboot_prepare_dt(void *fdt)
         dt_t6031_fw_uuids(dt);
         dt_t6031_facts(dt);
     }
+
+    /* J813: train the N1 Wi-Fi/Bluetooth link, or disable its ECAM host. */
+    if (j813_n1_prepare(dt))
+        bail("FDT: J813 N1 preparation failed\n");
 
     /* T8140 PCIe status is known only after pcie_init() in kboot_boot(). */
     if (chip_id != T8140 && fdt_pack(dt))
