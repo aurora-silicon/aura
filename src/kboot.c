@@ -6304,6 +6304,16 @@ int kboot_prepare_dt(void *fdt)
             printf("WARNING: M4+ SMP-RO is large (48KB)");
         if (fdt_add_mem_rsv(dt, ro_start, ro_end - ro_start))
             bail("FDT: couldn't add reservation for M4+ SMP-RO CTRR area\n");
+
+        // The secondaries also enforce CTRR_D: on J813 (M5) it covers the
+        // ~1 MiB just below the iBoot-loaded image.
+        ro_start = mrs(SYS_IMP_APL_CTRR_D_LWR_EL1);
+        ro_end = ALIGN_UP(mrs(SYS_IMP_APL_CTRR_D_UPR_EL1), SZ_4K) + SZ_4K;
+        if (ro_start && ro_start < ro_end) {
+            if (fdt_add_mem_rsv(dt, ro_start, ro_end - ro_start))
+                bail("FDT: couldn't add reservation for M4+ SMP-RO CTRR_D area\n");
+            printf("FDT: reserved M4+ SMP-RO CTRR_D [0x%lx, 0x%lx)\n", ro_start, ro_end);
+        }
     }
 
     /* setup console log buffer early to capture as much log as possible */
