@@ -2950,13 +2950,38 @@ static int dt_set_gpu_t8122(void *dt)
     return 0;
 }
 
-static int dt_set_gpu_t8140(void *dt)
+/* G17 SoCs whose firmware iBoot loads and whose UAT it sets up for a raw boot object */
+struct g17_soc {
+    const char *compat;     /* Linux compatible */
+    const char *adt_compat; /* the ADT's own compatible, also accepted */
+    const char *name;       /* for the log */
+    u32 count;              /* perf-state-count, also the number of OPP entries */
+    u32 num_states;         /* gpu-num-perf-states */
+};
+
+static const struct g17_soc g17_soc_t8140 = {
+    .compat = "apple,agx-t8140",
+    .adt_compat = "gpu,t8140",
+    .name = "T8140",
+    .count = 16,
+    .num_states = 15,
+};
+
+static const struct g17_soc g17_soc_t8142 = {
+    .compat = "apple,agx-t8142",
+    .adt_compat = "gpu,t8142",
+    .name = "T8142",
+    .count = 13,
+    .num_states = 12,
+};
+
+static int dt_set_gpu_g17(void *dt, const struct g17_soc *soc)
 {
     int gpu = fdt_path_offset(dt, "gpu");
     if (gpu < 0)
         return 0;
-    if (fdt_node_check_compatible(dt, gpu, "apple,agx-t8140") &&
-        fdt_node_check_compatible(dt, gpu, "gpu,t8140"))
+    if (fdt_node_check_compatible(dt, gpu, soc->compat) &&
+        fdt_node_check_compatible(dt, gpu, soc->adt_compat))
         return 0;
 
     int sgx = adt_path_offset(adt, "/arm-io/sgx");
@@ -2964,8 +2989,8 @@ static int dt_set_gpu_t8140(void *dt)
     const struct perf_state *states, *sram;
     if (sgx < 0 || ADT_GETPROP(adt, sgx, "perf-state-count", &count) != sizeof(count) ||
         ADT_GETPROP(adt, sgx, "gpu-num-perf-states", &num_states) != sizeof(num_states) ||
-        ADT_GETPROP(adt, sgx, "perf-state-table-count", &tables) != sizeof(tables) || count != 16 ||
-        num_states != 15 || tables != 1)
+        ADT_GETPROP(adt, sgx, "perf-state-table-count", &tables) != sizeof(tables) ||
+        count != soc->count || num_states != soc->num_states || tables != 1)
         goto disable;
     states = adt_getprop(adt, sgx, "perf-states", &len);
     if (!states || len != count * sizeof(*states))
@@ -2987,11 +3012,11 @@ static int dt_set_gpu_t8140(void *dt)
     int opp, opp_count = 0;
     fdt_for_each_subnode(opp, dt, table)
     {
-        if (++opp_count > 16 || !fdt_getprop(dt, opp, "opp-hz", &ph_len) || ph_len != sizeof(u64) ||
+        if ((u32)++opp_count > soc->count || !fdt_getprop(dt, opp, "opp-hz", &ph_len) || ph_len != sizeof(u64) ||
             !fdt_getprop(dt, opp, "opp-microvolt", &ph_len) || ph_len != sizeof(u32))
             goto disable;
     }
-    if (opp_count != 16)
+    if ((u32)opp_count != soc->count)
         goto disable;
 
     static const struct {
@@ -3036,7 +3061,7 @@ disable:
     gpu = fdt_path_offset(dt, "gpu");
     if (gpu >= 0 && fdt_setprop_string(dt, gpu, "status", "disabled"))
         return -1;
-    printf("FDT: GPU: invalid T8140 ADT or DT data, disabling GPU\n");
+    printf("FDT: GPU: invalid %s ADT or DT data, disabling GPU\n", soc->name);
     return 0;
 }
 
@@ -3582,7 +3607,9 @@ int dt_set_gpu(void *dt)
         return dt_set_gpu_m4(dt);
 
     if (chip_id == T8140)
-        return dt_set_gpu_t8140(dt);
+        return dt_set_gpu_g17(dt, &g17_soc_t8140);
+    if (chip_id == T8142)
+        return dt_set_gpu_g17(dt, &g17_soc_t8142);
 
     if (chip_id == T6040)
         return dt_set_gpu_t6040(dt);
