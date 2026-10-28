@@ -17,6 +17,7 @@
 #include "heapblock.h"
 #include "iodev.h"
 #include "isp.h"
+#include "j813_n1.h"
 #include "kboot_atc.h"
 #include "kboot_display_facts.h"
 #include "kboot_gpu_t8122.h"
@@ -8347,6 +8348,10 @@ int kboot_prepare_dt(void *fdt)
     } else if (chip_id == T6032) {
         dt_t6031_fw_uuids(dt);
     }
+
+    /* J813: train the N1 Wi-Fi/Bluetooth link, or disable its ECAM host. */
+    if (j813_n1_prepare(dt))
+        bail("FDT: J813 N1 preparation failed\n");
 
     /* T8140 PCIe status is known only after pcie_init() in kboot_boot(). */
     if (chip_id != T8140 && fdt_pack(dt))

@@ -202,7 +202,7 @@ OBJECTS := \
 	memory.o memory_asm.o \
 	nvme.o \
 	payload.o \
-	pcie.o pcie_fdt.o \
+	j813_n1.o pcie.o pcie_fdt.o \
 	pmgr.o \
 	proxy.o \
 	ringbuffer.o \
