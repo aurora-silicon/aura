@@ -416,6 +416,10 @@ bool nvme_init(void)
         if (chip_id == T6041 && nvmmu_base == 0x40dcc0000 && nvme_base == 0x44dcc0000 &&
             nvme_size == 0x10000)
             nvme_size = 0x30000;
+        /* J813 (T8142) has the same split layout: 64 KiB advertised, LSQ at +0x24908. */
+        if (chip_id == T8142 && nvmmu_base == 0x485cc0000 && nvme_base == 0x4c5cc0000 &&
+            nvme_size == 0x10000)
+            nvme_size = 0x30000;
         if (nvmmu_size < NVMMU_TCB_STAT + sizeof(u32) ||
             nvme_size < NVME_DB_LINEAR_IOSQ + sizeof(u32) || nvmmu_base > UINT64_MAX - nvmmu_size ||
             nvme_base > UINT64_MAX - nvme_size ||

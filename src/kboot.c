@@ -25,6 +25,7 @@
 #include "malloc.h"
 #include "mcc.h"
 #include "memory.h"
+#include "j813_n1.h"
 #include "pcie.h"
 #include "pmgr.h"
 #include "rtkit.h"
@@ -6243,7 +6244,7 @@ int kboot_prepare_dt(void *fdt)
      * Stage 1 read the ESP, so the buffers are in Stage 1's heap, not this one's). Reserve each
      * SART-allowed range inside RAM; the nvme-apple adoption requires them reserved anyway.
      */
-    if (chip_id == T6041) {
+    if (chip_id == T6041 || chip_id == T8142) {
         sart_dev_t *sart = sart_init("/arm-io/sart-ans");
         u64 ram_start = cur_boot_args.phys_base;
         u64 ram_end = ram_start + cur_boot_args.mem_size;
@@ -6412,6 +6413,10 @@ int kboot_prepare_dt(void *fdt)
         dt_t6031_fw_uuids(dt);
         dt_t6031_facts(dt);
     }
+
+    /* J813: train the N1 Wi-Fi/Bluetooth link, or disable its ECAM host. */
+    if (j813_n1_prepare(dt))
+        bail("FDT: J813 N1 preparation failed\n");
 
     /* T8140 PCIe status is known only after pcie_init() in kboot_boot(). */
     if (chip_id != T8140 && fdt_pack(dt))
