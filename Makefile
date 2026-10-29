@@ -202,6 +202,7 @@ OBJECTS := \
 	dart.o \
 	dcp.o \
 	dcp_iboot.o \
+	debugport.o \
 	devicetree.o \
 	display.o \
 	dockchannel_uart.o \

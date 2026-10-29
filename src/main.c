@@ -10,6 +10,7 @@
 #include "boot_options.h"
 #include "chainload.h"
 #include "cpufreq.h"
+#include "debugport.h"
 #include "display.h"
 #include "dockchannel_uart.h"
 #include "exception.h"
@@ -332,6 +333,8 @@ static void j873g_run_proxy(void)
     wdt_disable();
     if (smp_init() < 0)
         panic("Unsupported T8152 CPU topology\n");
+    /* Its SPMI port controllers need time in S0; the display bring-up covers most of it. */
+    debugport_powerup();
     /* The DCPEXT0/DPTX_PHY power gates are PMGR2 devices; without this the
      * HDMI phy stays gated and the first register access aborts. */
     pmgr_init();
@@ -346,6 +349,7 @@ static void j873g_run_proxy(void)
     j873_usb_prep();
     j873_n1_power();
     j873_pcie_prep();
+    debugport_check();
     printf("Initialization complete.\n");
 
     /* An appended payload (or boot= from storage) boots directly. */
