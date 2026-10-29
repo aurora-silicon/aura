@@ -32,7 +32,7 @@ typedef struct dptx_phy {
     atc_phy_t *atc;
 } dptx_phy_t;
 
-/* AppleT8152DPTXPort::setBitsInReg */
+/* Read-modify-write of a field in the core register block (regs[0]). */
 static void dptx_t8152_set_bits(dptx_phy_t *phy, u32 offset, u32 shift, u32 mask, u32 value)
 {
     u32 reg = read32(phy->regs[0] + offset);
@@ -44,7 +44,7 @@ struct dptx_t8152_tunable {
     u32 offset;
 };
 
-/* Table used by AppleT8152DPTXPort::handleSetTunables; all offsets are on the
+/* The T8152 DPTX tunable groups in the ADT and where each group starts in the
  * core register block (regs[0]). */
 static const struct dptx_t8152_tunable dptx_t8152_tunables[] = {
     {"asdc-txd-cfg-0-tunables", 0x5500},   {"asdc-txd-cfg-1-tunables", 0x7d00},
@@ -57,8 +57,8 @@ static const struct dptx_t8152_tunable dptx_t8152_tunables[] = {
     {"asdc-aux-shm-tunables", 0x1400},     {"asdc-cmn-tunables", 0x1c00},
 };
 
-/* AppleDPTXPort::writeTunables: every record is {offset, width, mask, pad,
- * value, pad} and applied as an unshifted read-modify-write. */
+/* Every ADT tunable record is {offset, width, mask, pad, value, pad} and is
+ * applied as an unshifted read-modify-write. */
 static void dptx_t8152_apply_tunables(dptx_phy_t *phy)
 {
     int node = adt_path_offset(adt, phy->path);
@@ -83,10 +83,9 @@ static void dptx_t8152_apply_tunables(dptx_phy_t *phy)
     }
 }
 
-/* AppleT8152DPTXPort::phySetActiveLaneCount: per-lane configuration on the
- * lane shm blocks. The bits are lane-disable bits: macOS starts from 0xf and
- * clears one bit per active lane, so 0x2420 holds the mask of unused lanes
- * (0 with four lanes, as the macOS register snapshot shows). */
+/* Per-lane configuration on the lane shm blocks. The bits are lane-disable
+ * bits: start from 0xf and clear one bit per active lane, so 0x2420 holds the
+ * mask of unused lanes (0 with four lanes, as read back on J873g). */
 static void dptx_t8152_set_active_lane_count(dptx_phy_t *phy, u32 num_lanes)
 {
     static const u32 offsets[] = {0x64, 0x24, 0x24, 0x48, 0x48, 0x5c, 0x5c, 0x48};
@@ -105,8 +104,7 @@ static void dptx_t8152_set_active_lane_count(dptx_phy_t *phy, u32 num_lanes)
     dptx_t8152_set_bits(phy, 0x2400, 0, 0x1, 1);
 }
 
-/* AppleT8152DPTXPort::getTunableConfig: the DPPLLConfig words for each link
- * rate (constant tables in AppleDisplayCrossbar, 26A434). */
+/* DP PLL configuration words for each supported link rate. */
 static const struct {
     u32 rate; /* MHz */
     u32 w[22];
@@ -118,8 +116,8 @@ static const struct {
     {8100, {0, 0x2a3, 0x2ffd, 0x3ffc, 1, 9, 1, 0, 0, 0x1a, 1, 0x5a, 1, 0, 0, 1, 0, 0, 0, 1, 1, 3}},
 };
 
-/* AppleT8152DPTXPort::pllPowerUp/pllPowerDown: command in 0x408[2:0],
- * request bit 3, acknowledge bit 19. */
+/* PLL power command: command in 0x408[2:0], request bit 3, acknowledge
+ * bit 19. */
 static int dptx_t8152_pll_command(dptx_phy_t *phy, u32 command)
 {
     int i;
@@ -141,8 +139,8 @@ static int dptx_t8152_pll_command(dptx_phy_t *phy, u32 command)
     return 0;
 }
 
-/* AppleDPTXPort::setLinkRate with the T8152 hooks: phyPowerDown,
- * pllPowerDown, pllConfigureFrequency, phy/pllSetHalfLinkRate, pllPowerUp. */
+/* Link rate change: PHY and PLL down, PLL frequency, half link rate for the
+ * PHY and PLL, then PLL up. */
 static int dptx_t8152_set_link_rate(dptx_phy_t *phy, u32 link_rate)
 {
     const u32 *w = NULL;
@@ -157,7 +155,7 @@ static int dptx_t8152_set_link_rate(dptx_phy_t *phy, u32 link_rate)
     if (dptx_t8152_pll_command(phy, 0))
         return -1;
 
-    /* pllConfigureFrequency, downspread off */
+    /* PLL frequency, downspread off */
     dptx_t8152_set_bits(phy, 0x6c0, 0, 0x7ff, w[1]);
     dptx_t8152_set_bits(phy, 0x6c0, 11, 0x800, w[6]);
     dptx_t8152_set_bits(phy, 0x6c0, 13, 0x2000, w[10]);
@@ -180,7 +178,7 @@ static int dptx_t8152_set_link_rate(dptx_phy_t *phy, u32 link_rate)
     dptx_t8152_set_bits(phy, 0x6cc, 24, 0x3000000, w[4]);
     dptx_t8152_set_bits(phy, 0x6cc, 26, 0xc000000, w[20]);
 
-    /* AppleT8112DPTXPort::updateLinkRateDependentShadowRegisters */
+    /* Latch the link-rate dependent shadow registers */
     set32(phy->regs[1] + 0xa0, BIT(3));
     set32(phy->regs[1] + 0xa0, BIT(2));
     set32(phy->regs[1] + 0xa0, BIT(18));
@@ -205,8 +203,8 @@ static int dptx_t8152_set_link_rate(dptx_phy_t *phy, u32 link_rate)
     return 0;
 }
 
-/* AppleT8152DPTXPort::performImpedanceCalibration: adapter reports completion
- * in bit 0 of 0x1c04 and the calibration result in 0x1c24. */
+/* Impedance calibration: the adapter reports completion in bit 0 of 0x1c04
+ * and the calibration result in 0x1c24. */
 static void dptx_t8152_impedance_calibration(dptx_phy_t *phy)
 {
     u32 i;
@@ -225,14 +223,14 @@ static void dptx_t8152_impedance_calibration(dptx_phy_t *phy)
     dptx_t8152_set_bits(phy, 0x1c18, 0xe, 0x4000, 1);
 }
 
-/* AppleDPTXPort::handleActivate for T8152: power up, apply the adapter
- * tunables from the devicetree, then run the PLL/PHY/AUX activation hooks. */
+/* T8152 activation: power up, apply the adapter tunables from the devicetree,
+ * then activate the PLL, PHY and AUX. */
 static int dptx_t8152_activate(dptx_phy_t *phy)
 {
-    /* AppleT8112DPTXPort::setDPTXSourceSelect: only the low nibble */
+    /* DPTX source select: only the low nibble */
     mask32(phy->regs[1] + 0x10, 0xf, phy->dcp_index);
 
-    /* pllSetPowerEnabled, auxSetPowerEnabled, phySetPowerEnabled */
+    /* PLL, AUX and PHY power enables */
     set32(phy->regs[1] + 0x48, 0x010);
     mdelay(1);
     set32(phy->regs[1] + 0x48, 0x020);
@@ -248,11 +246,11 @@ static int dptx_t8152_activate(dptx_phy_t *phy)
 
     dptx_t8152_apply_tunables(phy);
 
-    /* configurePll: single-ended clock output, no pclkdrv-select property */
+    /* PLL: single-ended clock output, no pclkdrv-select property */
     dptx_t8152_set_bits(phy, 0x08d0, 4, 0x10, 1);
-    dptx_t8152_set_bits(phy, 0x0000, 1, 0x02, 1);     /* activatePll */
-    dptx_t8152_set_bits(phy, 0x1400, 0, 0x01, 0);     /* auxSetupCmnControl */
-    dptx_t8152_set_bits(phy, 0x1c00, 4, 0x3f0, 0x3c); /* activatePhy */
+    dptx_t8152_set_bits(phy, 0x0000, 1, 0x02, 1);     /* PLL on */
+    dptx_t8152_set_bits(phy, 0x1400, 0, 0x01, 0);     /* AUX common control */
+    dptx_t8152_set_bits(phy, 0x1c00, 4, 0x3f0, 0x3c); /* PHY on */
     dptx_t8152_set_bits(phy, 0x0000, 0, 0x01, 1);
     mdelay(1);
 
@@ -260,7 +258,7 @@ static int dptx_t8152_activate(dptx_phy_t *phy)
     if (ret)
         return ret;
 
-    /* auxPowerUp and auxSetTerminationOverride are no-ops on T8152 */
+    /* T8152 needs no separate AUX power-up or termination override */
     dptx_t8152_impedance_calibration(phy);
 
     return 0;
@@ -529,8 +527,8 @@ u32 dptx_phy_get_active_lane_count(dptx_phy_t *phy)
 
 int dptx_phy_set_drive_settings(dptx_phy_t *phy, const dptx_drive_settings_t *settings, u32 count)
 {
-    /* AppleDPTXPort::setDriveSettings only records the request; the HDMI
-     * phy is not reprogrammed. */
+    /* The HDMI phy is not reprogrammed for drive settings; the request is
+     * only accepted. */
     if (phy && phy->type == DPTX_PHY_T8152_HDMI)
         return 0;
     if (!phy || phy->type != DPTX_PHY_T8152_ATC)

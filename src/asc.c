@@ -109,7 +109,7 @@ asc_dev_t *asc_init(const char *path)
             return NULL;
         }
 
-        /* 26A428 AppleMessageBoxMailbox: two 128-byte apertures per mailbox.
+        /* Two 128-byte apertures per mailbox.
          * The using-alias property selects the first 64 KiB register bank. */
         u64 offset = (2ULL * mailbox + !postoffice) * 0x80;
         if (!using_alias)
