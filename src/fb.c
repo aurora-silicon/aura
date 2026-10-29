@@ -63,9 +63,10 @@ extern u8 _binary_build_font_bin_start[];
 extern u8 _binary_build_font_retina_bin_start[];
 
 /*
- * The built-in boot logos are linked gzip-compressed (see the Makefile) and inflated into .bss
- * the first time one is used. That keeps about 330 KiB of pixels out of the part of the image
- * that is loaded from the file, which must stay small (see _file_end in aura-raw.ld).
+ * The built-in boot logos are linked gzip-compressed (see the Makefile) and inflated the first
+ * time one is used. The 128 and 256 px logos inflate into the heap: a raw Stage 1 carries its
+ * .bss in the file, and T6000 iBoot (13.5 stub firmware) refuses a Stage 1 of 4.39 MB. The
+ * 48 px logo stays in .bss as the fallback when the heap cannot hold a larger one.
  */
 struct builtin_logo {
     struct image img;
@@ -74,8 +75,6 @@ struct builtin_logo {
 };
 
 static u32 logo_48_px[48 * 48] ALIGNED(64);
-static u32 logo_128_px[128 * 128] ALIGNED(64);
-static u32 logo_256_px[256 * 256] ALIGNED(64);
 
 static struct builtin_logo logo_48 = {
     {logo_48_px, 48, 48},
@@ -85,14 +84,14 @@ static struct builtin_logo logo_48 = {
 };
 
 static struct builtin_logo logo_128 = {
-    {logo_128_px, 128, 128},
+    {NULL, 128, 128},
     LOGO_GZ_START(BUILTIN_LOGO, 128),
     LOGO_GZ_END(BUILTIN_LOGO, 128),
     false,
 };
 
 static struct builtin_logo logo_256 = {
-    {logo_256_px, 256, 256},
+    {NULL, 256, 256},
     LOGO_GZ_START(BUILTIN_LOGO, 256),
     LOGO_GZ_END(BUILTIN_LOGO, 256),
     false,
@@ -107,6 +106,14 @@ static const struct image *builtin_logo(struct builtin_logo *l)
 
     if (l->inflated)
         return &l->img;
+    if (!l->img.ptr) {
+        l->img.ptr = memalign(64, size);
+        if (!l->img.ptr) {
+            printf("fb: no memory for the %ux%u logo, using the 48x48 one\n", l->img.width,
+                   l->img.height);
+            return builtin_logo(&logo_48);
+        }
+    }
     l->inflated = true;
     if (tinf_gzip_uncompress(l->img.ptr, &len, l->gz, &gz_len) != TINF_OK || len != size) {
         printf("fb: built-in %ux%u logo did not inflate, left blank\n", l->img.width,
