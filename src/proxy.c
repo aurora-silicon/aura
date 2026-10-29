@@ -518,16 +518,24 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
         case P_DART_INIT:
             reply->retval = (u64)dart_init(request->args[0], request->args[1], request->args[2],
                                            request->args[3]);
+            if (dart_has_failed((dart_dev_t *)reply->retval))
+                reply->status = S_ERROR;
             break;
         case P_DART_SHUTDOWN:
-            dart_shutdown((dart_dev_t *)request->args[0]);
+            /* A failed shutdown keeps the domain: the client must keep its memory too. */
+            if (!dart_shutdown_checked((dart_dev_t *)request->args[0]))
+                reply->status = S_ERROR;
             break;
         case P_DART_MAP:
             reply->retval = dart_map((dart_dev_t *)request->args[0], request->args[1],
                                      (void *)request->args[2], request->args[3]);
+            if (reply->retval)
+                reply->status = S_ERROR;
             break;
         case P_DART_UNMAP:
-            dart_unmap((dart_dev_t *)request->args[0], request->args[1], request->args[2]);
+            if (!dart_unmap_checked((dart_dev_t *)request->args[0], request->args[1],
+                                    request->args[2]))
+                reply->status = S_ERROR;
             break;
 
         case P_HV_INIT:
