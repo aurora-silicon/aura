@@ -551,12 +551,79 @@ static void other_chips_are_unchanged(void)
         assert(run_base_field(next_stage.args[1]) == 0);
         check_staging(image, big, sepfw[0]);
 
-        /* The image itself would reach the live heap: refused, as before */
+        /*
+         * The image itself would reach the live heap: it runs from its staged copy and moves
+         * only its code and data to stage 1's base, which stay below the heap.
+         */
+        setup(chips[c], 0x1000000);
+        u64 heap_start = cur_boot_args.top_of_kernel_data;
+        assert(home + isz > heap_start);
+        assert(chainload_image(image, big, vars, NVARS) == 0);
+        u64 dest = next_stage.args[2];
+        assert(allocs == 1 && dest == next_stage.args[1] && dest >= live_heap);
+        assert(next_stage.args[3] == isz + fw_size);
+        assert(run_base_field(dest) == home);
+        check_staging(image, big, dest + isz);
+        u64 run, payload;
+        run_next_stage(&run, &payload);
+        assert(run == home && run + FOOTPRINT <= heap_start && payload == dest + FOOTPRINT);
+
+        /* ... but not when its code and data would reach the heap themselves */
+        setup(chips[c], 0x1000000);
+        cur_boot_args.top_of_kernel_data = home + FOOTPRINT - SZ_16K;
+        live_heap = heap_next = cur_boot_args.top_of_kernel_data + 0x1000000;
+        refused(chips[c], image, big, "overlaps the live heap");
+        assert(!allocs);
+        free(image);
+
+        /* ... nor when it has no load header (an older stage 2): refused, as before */
+        image = make_image(big, 0, 0, 0, 0);
         setup(chips[c], 0x1000000);
         refused(chips[c], image, big, "overlaps the live heap");
         assert(!allocs);
         free(image);
     }
+}
+
+/*
+ * T6000 (M1 Pro): iBoot, and m1n1 v1.5.2 when it chainloads, pack the boot object, SEPFW and
+ * boot_args, and stage 1's heap starts right after them. A stage 1 smaller than its stage 2 plus
+ * that block leaves too little room below the heap to copy the stage 2 to its base.
+ */
+static void t6000_stage1_before_larger_stage2(size_t stage1, size_t stage2, u64 footprint,
+                                              bool staged)
+{
+    setup(T6000, 0x1000000);
+    u64 stage1_end = ALIGN_UP(stage1 + 4, SZ_16K);
+    sepfw_src = sepfw[0] = home + stage1_end;
+    for (u64 i = 0; i < SEPFW_SIZE; i += 8)
+        *(u64 *)(sepfw_src + i) = 0x5345504657000000UL | i;
+    u64 heap_start = sepfw_src + ALIGN_UP(SEPFW_SIZE, SZ_16K) + SZ_16K;
+    cur_boot_args.top_of_kernel_data = heap_start;
+    live_heap = heap_next = heap_start + 0x1000000;
+    FOOTPRINT = footprint;
+    u8 *image = make_image(stage2, CHAINLOAD_HDR_MAGIC, CHAINLOAD_HDR_VERSION,
+                           CHAINLOAD_HDR_F_RUN_BASE, footprint);
+    u64 isz = image_size_for(stage2);
+
+    assert(chainload_image(image, stage2, vars, NVARS) == 0);
+    u64 dest = next_stage.args[2];
+    if (staged) {
+        assert(home + isz > heap_start);
+        assert(dest == next_stage.args[1] && dest >= live_heap);
+        assert(run_base_field(dest) == home);
+        check_staging(image, stage2, dest + isz);
+    } else {
+        assert(home + isz <= heap_start);
+        assert(dest == home && !run_base_field(next_stage.args[1]));
+        check_staging(image, stage2, sepfw[0]);
+    }
+    u64 run, payload;
+    run_next_stage(&run, &payload);
+    assert(run == home && run + footprint <= heap_start);
+    assert(!memcmp((void *)payload, image + footprint, stage2 - footprint));
+    free(image);
+    FOOTPRINT = 0x410000UL;
 }
 
 /* Optional built-image check: use the real header and payload, not synthetic bytes. */
@@ -618,6 +685,11 @@ int main(void)
     fitting_image_is_unchanged(0x400000 - 0x8000, false);
     no_room_is_refused();
     other_chips_are_unchanged();
+    /* An M1 Pro stage 2 (aura + DTBs + U-Boot): 0x808000 bytes, footprint 0x430000 */
+    t6000_stage1_before_larger_stage2(0x1a0000, 0x808000, 0x430000, true);  /* heap stacks */
+    t6000_stage1_before_larger_stage2(0x100088, 0x808000, 0x430000, true);  /* m1n1 1.5.2 size */
+    t6000_stage1_before_larger_stage2(0x3b0000, 0x808000, 0x430000, false); /* m1n1 v2.0.0 size */
+    t6000_stage1_before_larger_stage2(0x430000, 0x808000, 0x430000, false); /* aura 1.0.0b1 */
     composed_image_is_placed();
     puts("chainload run base matrix PASS");
     return 0;

@@ -109,6 +109,7 @@ int chainload_image(void *image, size_t size, char **vars, size_t var_cnt)
     u64 image_end = new_base + image_size;
     u64 packed_end = image_end + fw_size;
     u64 run_base = 0, footprint = 0;
+    bool must_stage = false;
     if (ro_status == 1 && image_end > ro_start && new_base < ro_end) {
         /*
          * T8140: the firmware RO range lies about 10 MiB above our base on a J700, and the
@@ -128,12 +129,24 @@ int chainload_image(void *image, size_t size, char **vars, size_t var_cnt)
         printf("chainload: image destination is invalid or overlaps firmware RO\n");
         return -1;
     } else if (live_heap > inherited_top && image_end > inherited_top && new_base < live_heap) {
-        printf("chainload: image span overlaps the live heap\n");
-        return -1;
+        /*
+         * The next stage is larger than the room our caller left between our base and the heap
+         * (a Stage 1 smaller than its Stage 2 plus the firmware block), so a copy to our base
+         * would run over the heap that holds the staged image. An aura image can run from where
+         * it is staged instead and move only its first footprint bytes to our base, which is
+         * safe while those stay below the heap.
+         */
+        footprint = chainload_run_footprint(image, size);
+        if (!footprint || (new_base & (SZ_16K - 1)) || inherited_top <= new_base ||
+            footprint > inherited_top - new_base) {
+            printf("chainload: image span overlaps the live heap\n");
+            return -1;
+        }
+        must_stage = true;
     }
 
     bool park_fw =
-        !run_base &&
+        !run_base && !must_stage &&
         ((ro_status == 1 && packed_end > ro_start && image_end < ro_end) ||
          (live_heap > inherited_top && packed_end > inherited_top && image_end < live_heap));
     u8 *parked = NULL;
@@ -177,6 +190,11 @@ int chainload_image(void *image, size_t size, char **vars, size_t var_cnt)
             footprint = run_footprint;
             run_base = new_base;
         }
+    }
+    if (must_stage && !run_base) {
+        printf("chainload: no room to stage the image above the live heap\n");
+        free(new_image);
+        return -1;
     }
     if (run_base) {
         /*
