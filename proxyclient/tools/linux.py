@@ -16,6 +16,9 @@ parser.add_argument('-t', '--tty', type=str)
 parser.add_argument('-u', '--u-boot', type=pathlib.Path, help="load u-boot before linux")
 parser.add_argument('-E', '--efi', action="store_true", help="payload is EFI stub (requires u-boot)")
 parser.add_argument('-T', '--tso', action="store_true", help="enable TSO")
+parser.add_argument('--no-smp', action="store_true",
+                    help="leave the secondary CPUs off (maxcpus=1 alone doesn't: this loader starts them first)")
+parser.add_argument('--no-cpufreq', action="store_true", help="keep the CPU clocks the firmware left")
 parser.add_argument('--capture', type=pathlib.Path, help="after the handoff, record the console to this file instead of TTY mode")
 parser.add_argument('--capture-seconds', type=float, default=120, help="seconds of --capture")
 parser.add_argument('--capture-until', help="stop --capture once the console shows this regex")
@@ -113,8 +116,10 @@ if args.u_boot:
         p.kboot_set_uboot("baudrate", "%d" % tty_dev.baudrate)
 
 
-p.cpufreq_init()
-p.smp_start_secondaries()
+if not args.no_cpufreq:
+    p.cpufreq_init()
+if not args.no_smp:
+    p.smp_start_secondaries()
 
 if args.tso:
     print("Enabling TSO:")
