@@ -4,6 +4,7 @@
 #include "adt.h"
 #include "aic.h"
 #include "aic_regs.h"
+#include "malloc.h"
 #include "cpu_regs.h"
 #include "memory.h"
 #include "pmgr.h"
@@ -44,8 +45,43 @@ void *_reset_stack_el1 SMP_SHARED;
 u8 dummy_stack[DUMMY_STACK_SIZE];     // Highest EL
 u8 dummy_stack_el1[DUMMY_STACK_SIZE]; // EL1 stack if EL3 exists
 
+#ifdef SMP_HEAP_STACKS
+/*
+ * Stage 1 is the boot object iBoot loads, and its raw image runs to the end of .bss (STACKBOT),
+ * so every byte of .bss is part of what iBoot places. The 2.25 MiB of secondary stacks took the
+ * image from the 1.5 MiB of m1n1 v1.6 to over 4 MiB. Stage 1 never hands its stacks to an OS
+ * (PSCI runs from the stage that boots the kernel), so it takes them from the heap as m1n1 v1.6
+ * did. The pointers are shared like smp_reset_stacks: a T8152 core reads its own in cpu_reset
+ * with the MMU off.
+ */
+u8 *secondary_stacks[MAX_CPUS] SMP_SHARED;
+u8 *secondary_stacks_el3[MAX_EL3_CPUS] SMP_SHARED;
+
+static int smp_alloc_stacks(void)
+{
+    for (int i = 0; i < MAX_CPUS; i++) {
+        if (!secondary_stacks[i])
+            secondary_stacks[i] = memalign(SZ_16K, SECONDARY_STACK_SIZE);
+        if (!secondary_stacks[i])
+            return -1;
+    }
+    for (int i = 0; has_el3() && i < MAX_EL3_CPUS; i++) {
+        if (!secondary_stacks_el3[i])
+            secondary_stacks_el3[i] = memalign(SZ_16K, SECONDARY_STACK_SIZE);
+        if (!secondary_stacks_el3[i])
+            return -1;
+    }
+    return 0;
+}
+#else
 u8 secondary_stacks[MAX_CPUS][SECONDARY_STACK_SIZE] ALIGNED(0x4000);
 u8 secondary_stacks_el3[MAX_EL3_CPUS][SECONDARY_STACK_SIZE] ALIGNED(0x4000);
+
+static int smp_alloc_stacks(void)
+{
+    return 0;
+}
+#endif
 
 static bool wfe_mode SMP_SHARED = false;
 
@@ -521,6 +557,11 @@ static int smp_init_t8152(void)
 
 int smp_init(void)
 {
+    if (smp_alloc_stacks() < 0) {
+        printf("SMP: could not allocate the secondary stacks\n");
+        return -1;
+    }
+
     if (chip_id == T8152)
         return smp_init_t8152();
 

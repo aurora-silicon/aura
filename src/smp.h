@@ -3,12 +3,19 @@
 #ifndef __SMP_H__
 #define __SMP_H__
 
+#include "../build/build_cfg.h"
 #include "smp_asm.h"
 #include "types.h"
 #include "utils.h"
 
+#ifdef SMP_HEAP_STACKS
+/* Allocated by smp_init() (smp_asm.h) */
+extern u8 *secondary_stacks[MAX_CPUS];
+extern u8 *secondary_stacks_el3[MAX_EL3_CPUS];
+#else
 extern u8 secondary_stacks[MAX_CPUS][SECONDARY_STACK_SIZE];
 extern u8 secondary_stacks_el3[MAX_EL3_CPUS][SECONDARY_STACK_SIZE];
+#endif
 
 void smp_secondary_entry(void);
 int smp_secondary_prepare(void);
