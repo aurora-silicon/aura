@@ -46,6 +46,26 @@ int main(void) {
     boot_options_init(0,0);
     assert(!aura_debug_enabled());
     assert(!boot_option_present("aura-debug",11,""));
+
+    /* aura-trial: set by the stage that starts a trial, copied forward by every later one */
+    boot_options_init("-v aura-trial", 14);
+    assert(aura_trial_enabled() && !aura_debug_enabled());
+    boot_options_init("aura-trials", 12);
+    assert(!aura_trial_enabled());
+    boot_options_set_trial(true);
+    assert(aura_trial_enabled());
+    char line[24] = "-v";
+    assert(boot_options_append(line, sizeof(line), "aura-trial") && !strcmp(line, "-v aura-trial"));
+    assert(!boot_options_append(line, sizeof(line), "aura-trial") && !strcmp(line, "-v aura-trial"));
+    char empty[11] = "";
+    assert(boot_options_append(empty, sizeof(empty), "aura-trial") && !strcmp(empty, "aura-trial"));
+    char tight[13] = "-v";
+    assert(!boot_options_append(tight, sizeof(tight), "aura-trial") && !strcmp(tight, "-v"));
+    char fits[14] = "-v";
+    assert(boot_options_append(fits, sizeof(fits), "aura-trial") && !strcmp(fits, "-v aura-trial"));
+    char full[4] = {'a','b','c','d'};
+    assert(!boot_options_append(full, sizeof(full), "x"));
+    assert(!boot_options_append(0, 8, "x") && !boot_options_append(line, sizeof(line), ""));
     return 0;
 }
 ''')

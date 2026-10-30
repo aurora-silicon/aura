@@ -15,5 +15,7 @@ bool nvme_flush(u32 nsid);
 bool nvme_read(u32 nsid, u64 lba, void *buffer);
 #define NVME_MAX_READ_BLOCKS 256
 bool nvme_read_blocks(u32 nsid, u64 lba, void *buffer, u32 count);
+/* One 4 KiB block from a 4 KiB aligned buffer: only the aura-try marker is written (trial.rs) */
+bool nvme_write(u32 nsid, u64 lba, const void *buffer);
 
 #endif

@@ -4,6 +4,7 @@
 #define __SMP_H__
 
 #include "../build/build_cfg.h"
+
 #include "smp_asm.h"
 #include "types.h"
 #include "utils.h"

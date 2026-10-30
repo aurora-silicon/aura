@@ -279,6 +279,8 @@ void aura_main(void)
     smp_init();
 #endif
     wdt_disable();
+    if (aura_trial_enabled() && wdt_arm_trial())
+        printf("WDT: could not arm the trial watchdog\n");
 #ifndef BRINGUP
     if (pmgr_init() && chip_id == T8140)
         panic("T8140 PMGR initialization failed\n");
@@ -348,6 +350,9 @@ next_stage:
     mmu_shutdown();
 #endif
 
+    /* Give the next stage of a trial boot the whole watchdog period. */
+    if (aura_trial_enabled() && wdt_arm_trial())
+        printf("WDT: could not arm the trial watchdog\n");
     printf("Vectoring to next stage...\n");
 #if defined(CHAINLOADING) && !defined(ESP_STAGE2)
     stage1_log_flush();

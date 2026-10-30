@@ -8,9 +8,11 @@ use fatfs::SeekFrom;
 extern "C" {
     pub(crate) fn nvme_read(nsid: u32, lba: u64, buffer: *mut c_void) -> bool;
     fn nvme_read_blocks(nsid: u32, lba: u64, buffer: *mut c_void, count: u32) -> bool;
+    pub(crate) fn nvme_write(nsid: u32, lba: u64, buffer: *const c_void) -> bool;
+    pub(crate) fn nvme_flush(nsid: u32) -> bool;
 }
 
-const SECTOR_SIZE: usize = 4096;
+pub(crate) const SECTOR_SIZE: usize = 4096;
 const BULK_SECTORS: usize = 256;
 
 pub type Error = ();
@@ -336,6 +338,17 @@ mod tests {
     #[no_mangle]
     extern "C" fn nvme_read(nsid: u32, lba: u64, buffer: *mut c_void) -> bool {
         nvme_read_blocks(nsid, lba, buffer, 1)
+    }
+
+    /* Only the aura-try marker writes (trial.rs), and its tests use their own block device. */
+    #[no_mangle]
+    extern "C" fn nvme_write(_nsid: u32, _lba: u64, _buffer: *const c_void) -> bool {
+        unreachable!()
+    }
+
+    #[no_mangle]
+    extern "C" fn nvme_flush(_nsid: u32) -> bool {
+        unreachable!()
     }
 
     #[test]

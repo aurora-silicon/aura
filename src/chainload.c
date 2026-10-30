@@ -4,6 +4,7 @@
 
 #include "chainload.h"
 #include "adt.h"
+#include "boot_options.h"
 #include "heapblock.h"
 #include "malloc.h"
 #include "memory.h"
@@ -15,7 +16,8 @@
 #include "xnuboot.h"
 
 #ifdef CHAINLOADING
-int rust_load_image(const char *spec, void **image, size_t *size, bool *proxy_request);
+int rust_load_image(const char *spec, void **image, size_t *size, bool *proxy_request, char *trial,
+                    size_t trial_capacity);
 void rust_free_image(void *image, size_t size);
 #endif
 
@@ -329,6 +331,32 @@ static void stage1_log_handoff(char **vars, size_t *var_cnt, size_t var_capacity
 }
 #endif
 
+/*
+ * A trial: an aura-try file at the ESP root names an image to boot once in place of the
+ * configured one (chainload.rs). It is spent on the ESP before the image is read, so a trial
+ * that never reaches Linux leaves the next boot on the configured path. The trial's stages run
+ * under the trial watchdog (wdt.c); Linux finds the path in chosen/aurora,trial.
+ */
+static char trial_path[128];
+static char trial_var[sizeof("chosen.aurora,trial=") + sizeof(trial_path)];
+
+static bool chainload_start_trial(char **vars, size_t *var_cnt, size_t var_capacity)
+{
+    size_t capacity = cur_boot_args.revision == 1   ? CMDLINE_LENGTH_RV1
+                      : cur_boot_args.revision == 2 ? CMDLINE_LENGTH_RV2
+                                                    : CMDLINE_LENGTH_RV3;
+    if (*var_cnt >= var_capacity ||
+        !boot_options_append(cur_boot_args.rv3.cmdline, capacity, "aura-trial")) {
+        printf("chainload: no room to mark the trial for the next stage\n");
+        return false;
+    }
+    snprintf(trial_var, sizeof(trial_var), "chosen.aurora,trial=%s", trial_path);
+    vars[(*var_cnt)++] = trial_var;
+    boot_options_set_trial(true);
+    printf("chainload: trial boot of %s\n", trial_path);
+    return true;
+}
+
 int chainload_load(const char *spec, char **vars, size_t *var_cnt, size_t var_capacity)
 {
     static char adopt_var[] = "nvme.adopt=live-rtkit-v1";
@@ -358,7 +386,11 @@ int chainload_load(const char *spec, char **vars, size_t *var_cnt, size_t var_ca
     }
 
     bool proxy_request = false;
-    ret = rust_load_image(spec, &image, &size, &proxy_request);
+    /* Only the first aura stage of a boot takes a trial: later ones already run in it. */
+    bool may_trial = !aura_trial_enabled();
+    trial_path[0] = 0;
+    ret = rust_load_image(spec, &image, &size, &proxy_request, may_trial ? trial_path : NULL,
+                          sizeof(trial_path));
 #ifndef ESP_STAGE2
     /*
      * An aura-proxy file at the ESP root asks Stage 1 to wait for a host. Hand NVMe
@@ -377,14 +409,39 @@ int chainload_load(const char *spec, char **vars, size_t *var_cnt, size_t var_ca
             printf("chainload: NVME init failed\n");
             return -1;
         }
-        ret = rust_load_image(spec, &image, &size, NULL);
+        /* The trial, if any, is spent already: the image it named is read again directly. */
+        ret = rust_load_image(spec, &image, &size, NULL, may_trial ? trial_path : NULL,
+                              sizeof(trial_path));
     }
     if (ret == 0)
         stage1_log_handoff(vars, var_cnt, var_capacity);
 #endif
+    char saved_cmdline[CMDLINE_LENGTH_RV3];
+    size_t saved_vars = *var_cnt;
+    bool trial = false;
+    if (ret == 0 && trial_path[0]) {
+        memcpy(saved_cmdline, cur_boot_args.rv3.cmdline, sizeof(saved_cmdline));
+        trial = chainload_start_trial(vars, var_cnt, var_capacity);
+        if (!trial) {
+            rust_free_image(image, size);
+            ret = rust_load_image(spec, &image, &size, NULL, NULL, 0);
+        }
+    }
     if (ret == 0) {
         ret = chainload_image(image, size, vars, *var_cnt);
         rust_free_image(image, size);
+    }
+    if (ret && trial) {
+        /* The trial image cannot be placed: boot the configured one, as the next boot would. */
+        memcpy(cur_boot_args.rv3.cmdline, saved_cmdline, sizeof(saved_cmdline));
+        *var_cnt = saved_vars;
+        boot_options_set_trial(false);
+        printf("chainload: trial image failed, loading the configured one\n");
+        ret = rust_load_image(spec, &image, &size, NULL, NULL, 0);
+        if (ret == 0) {
+            ret = chainload_image(image, size, vars, *var_cnt);
+            rust_free_image(image, size);
+        }
     }
     if (!nvme_shutdown()) {
         next_stage.entry = NULL;

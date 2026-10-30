@@ -17,18 +17,42 @@ def test_chainload_releases_loaded_image(tmp_path):
 #include <string.h>
 static struct { void *entry; } next_stage;
 static char image[16];
-static int load_error, copy_error, freed, copied, loads, windows;
-static bool shutdown_ok, request, host, stage1_chained;
+static int load_error, copy_error, freed, copied, loads, windows, trial_copy_error;
+static bool shutdown_ok, request, host, stage1_chained, marker, in_trial, trial_room = true;
+static int trials_started, trial_loads;
+#define CMDLINE_LENGTH_RV3 1024
+static struct { struct { char cmdline[CMDLINE_LENGTH_RV3]; } rv3; } cur_boot_args;
+static char trial_path[128];
+static bool aura_trial_enabled(void) { return in_trial; }
+static void boot_options_set_trial(bool trial) { in_trial = trial; }
+/* The real one marks the boot arguments and adds a variable; here it only counts. */
+static bool chainload_start_trial(char **vars, size_t *var_cnt, size_t var_capacity)
+{
+    if (!trial_room)
+        return false;
+    trials_started++;
+    in_trial = true;
+    return true;
+}
 static bool nvme_init(void) { return true; }
 static bool nvme_has_live_post_m4_session(void) { return true; }
 static bool nvme_shutdown(void) { return shutdown_ok; }
-static int rust_load_image(const char *spec, void **data, size_t *size, bool *proxy_request)
+static int rust_load_image(const char *spec, void **data, size_t *size, bool *proxy_request,
+                           char *trial, size_t trial_capacity)
 {
     loads++;
     /* The ESP is read for the request only on the first load. */
     assert(loads == 1 || !proxy_request);
     if (proxy_request)
         *proxy_request = request;
+    /* A spent marker never comes back: only the first load may take it. */
+    if (trial && !trial[0] && marker) {
+        assert(trial_capacity > 4);
+        strcpy(trial, "try");
+        marker = false;
+    }
+    if (trial && trial[0])
+        trial_loads++;
     *data = image;
     *size = sizeof(image);
     return load_error;
@@ -38,8 +62,11 @@ static int chainload_image(void *data, size_t size, char **vars, size_t count)
     assert(data == image && size == sizeof(image) && freed == loads - 1);
     assert(count == 1 && !strcmp(vars[0], "nvme.adopt=live-rtkit-v1"));
     copied++;
-    next_stage.entry = copy_error ? NULL : (void *)1;
-    return copy_error;
+    int error = copy_error;
+    if (in_trial && trial_copy_error)
+        error = trial_copy_error;
+    next_stage.entry = error ? NULL : (void *)1;
+    return error;
 }
 static void rust_free_image(void *data, size_t size)
 {
@@ -88,6 +115,47 @@ int main(void)
     count = 0;
     assert(chainload_load("test", vars, &count, 1) == 0);
     assert(windows == 1 && loads == 1 && freed == 1 && copied == 0 && next_stage.entry == (void *)2);
+
+    /* aura-try: the trial image is booted once, marked as a trial */
+    request = host = false;
+    marker = true;
+    freed = copied = loads = windows = trials_started = trial_loads = 0;
+    next_stage.entry = NULL;
+    count = 0;
+    assert(chainload_load("test", vars, &count, 1) == 0);
+    assert(trials_started == 1 && in_trial && trial_loads == 1 && loads == 1 && copied == 1);
+    /* A stage that already runs in a trial never takes another */
+    marker = true;
+    freed = copied = loads = trials_started = trial_loads = 0;
+    count = 0;
+    assert(chainload_load("test", vars, &count, 1) == 0);
+    assert(!trials_started && !trial_loads && marker);
+    in_trial = false;
+    /* With aura-proxy and no host the trial image is read again after the window */
+    request = true;
+    marker = true;
+    freed = copied = loads = windows = trials_started = trial_loads = 0;
+    count = 0;
+    assert(chainload_load("test", vars, &count, 1) == 0);
+    assert(windows == 1 && loads == 2 && trial_loads == 2 && trials_started == 1 && in_trial);
+    in_trial = false;
+    request = false;
+    /* A trial image that cannot be placed falls back to the configured one in the same boot */
+    marker = true;
+    trial_copy_error = -1;
+    freed = copied = loads = trials_started = trial_loads = 0;
+    count = 0;
+    assert(chainload_load("test", vars, &count, 1) == 0);
+    assert(trials_started == 1 && !in_trial && loads == 2 && copied == 2 && freed == 2);
+    assert(next_stage.entry == (void *)1);
+    trial_copy_error = 0;
+    /* No room to mark the trial: the configured image boots instead */
+    marker = true;
+    trial_room = false;
+    freed = copied = loads = trials_started = trial_loads = 0;
+    count = 0;
+    assert(chainload_load("test", vars, &count, 1) == 0);
+    assert(!trials_started && !in_trial && loads == 2 && copied == 1 && freed == 2);
     return 0;
 }
 '''

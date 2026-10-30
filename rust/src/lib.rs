@@ -25,6 +25,8 @@ pub mod gpu;
 #[cfg(feature = "chainload")]
 pub mod nvme;
 pub mod print;
+#[cfg(feature = "chainload")]
+pub mod trial;
 pub mod usb4;
 
 #[cfg(not(test))]

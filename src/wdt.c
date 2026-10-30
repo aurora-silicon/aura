@@ -58,13 +58,13 @@ void wdt_reboot(void)
     write32(wdt_base + WDT_CTL, 4);
 }
 
-int wdt_arm_seconds(unsigned seconds)
+static int wdt_arm(unsigned seconds)
 {
     int path[8];
     int node = adt_path_offset_trace(adt, "/arm-io/wdt", path);
     u64 primary, primary_size, secondary, secondary_size;
     u32 version;
-    if ((chip_id != T8140 && chip_id != T6040) || seconds < 1 || seconds > 178 || node < 0 ||
+    if (seconds < 1 || seconds > 178 || node < 0 ||
         ADT_GETPROP(adt, node, "wdt-version", &version) < 0 || version != 2 ||
         adt_get_reg(adt, path, "reg", 0, &primary, &primary_size) ||
         adt_get_reg(adt, path, "reg", 2, &secondary, &secondary_size) || (primary & 3) ||
@@ -81,4 +81,23 @@ int wdt_arm_seconds(unsigned seconds)
         return -1;
     wdt_base = primary;
     return 0;
+}
+
+int wdt_arm_seconds(unsigned seconds)
+{
+    if (chip_id != T8140 && chip_id != T6040)
+        return -1;
+    return wdt_arm(seconds);
+}
+
+/*
+ * A trial boot (aura-try, chainload.c) has nobody to reset it if a stage hangs, so each aura
+ * stage of it disarms iBoot's watchdog as usual and then arms its own, from the ADT's version 2
+ * layout, until Linux's driver finds it running and keeps it fed. The next boot takes the
+ * normal path, as the trial marker is already spent.
+ */
+int wdt_arm_trial(void)
+{
+    wdt_disable();
+    return wdt_arm(WDT_TRIAL_SECONDS);
 }

@@ -967,3 +967,23 @@ bool nvme_read(u32 nsid, u64 lba, void *buffer)
 {
     return nvme_read_blocks(nsid, lba, buffer, 1);
 }
+
+bool nvme_write(u32 nsid, u64 lba, const void *buffer)
+{
+    struct nvme_command cmd;
+
+    if (nvme_reboot_required || !nvme_initialized || ioq.failed || ((u64)buffer & (SZ_4K - 1)))
+        return false;
+
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.opcode = NVME_CMD_WRITE;
+    cmd.nsid = nsid;
+    cmd.prp1 = (u64)buffer;
+    cmd.cdw10 = lba;
+    cmd.cdw11 = lba >> 32;
+    cmd.cdw12 = 0;
+    /* Shut the controller down normally so it writes back its cache. */
+    nvme_wrote = true;
+
+    return nvme_exec_command(&ioq, &cmd, NULL);
+}
