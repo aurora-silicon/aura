@@ -78,6 +78,9 @@
 
 #define IOVA_MASK GENMASK(35, 0)
 
+/* Bound on an IOP power state change, for a firmware that has stopped answering. */
+#define RTKIT_IOP_POWER_TIMEOUT 5000000
+
 enum rtkit_power_state {
     RTKIT_POWER_OFF = 0x00,
     RTKIT_POWER_SLEEP = 0x01,
@@ -872,7 +875,13 @@ static bool rtkit_switch_power_state(rtkit_dev_t *rtk, enum rtkit_power_state ta
         return false;
     }
 
-    u64 timeout = timeout_calculate(rtk->timeout_usec ? rtk->timeout_usec : 1000000);
+    /*
+     * The IOP finishes its own work before it acknowledges a sleep: the M1-M3 ANS completes its
+     * background GC bitmap rebuild and saves its context first, which its log times at up to
+     * about 0.55 s on the M2 and leaves the whole handshake as close as 0.77 s to a one second
+     * limit. Allow it the same five seconds as an NVMe normal shutdown.
+     */
+    u64 timeout = timeout_calculate(rtk->timeout_usec ? rtk->timeout_usec : RTKIT_IOP_POWER_TIMEOUT);
     while (rtk->iop_power != target) {
         if (timeout_expired(timeout)) {
             rtkit_printf("IOP power transition timed out\n");
@@ -939,4 +948,27 @@ bool rtkit_sleep(rtkit_dev_t *rtk)
 
     asc_cpu_stop(rtk->asc);
     return true;
+}
+
+static void rtkit_drain(rtkit_dev_t *rtk)
+{
+    struct asc_message msg;
+
+    for (int i = 0; i < 64 && asc_recv(rtk->asc, &msg); i++)
+        rtkit_printf("dropping late message 0x%02x: %lx\n", msg.msg1, msg.msg0);
+}
+
+/*
+ * Stop an IOP that did not complete a power transition. Its CPU is left with RUN set and its
+ * acknowledgement may still arrive, so a later owner would find a running coprocessor and stale
+ * mailbox traffic instead of a fresh boot. Stop the CPU and drop what it sent, so that a reset
+ * after this leaves the same state as a completed sleep.
+ */
+void rtkit_stop(rtkit_dev_t *rtk)
+{
+    rtkit_drain(rtk);
+    asc_cpu_stop(rtk->asc);
+    udelay(1000);
+    rtkit_drain(rtk);
+    rtk->crashed = true;
 }

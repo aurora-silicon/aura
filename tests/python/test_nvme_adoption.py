@@ -12,6 +12,9 @@ def test_adopted_queue_lifetime(tmp_path):
     # The queue register helpers, which place the registers for the secure layout too.
     qregs = source[source.index("static u64 nvme_qreg(u32 reg)"):source.index("static void nvme_log_entry_state")]
     init = source[source.index("bool nvme_init(void)"):source.index("void nvme_ensure_shutdown(void)")]
+    # The M1-M3 sleep-and-reset helper that every legacy power-down goes through.
+    sleep_reset = source[source.index("static bool nvme_ans_sleep_and_reset(void)"):
+                         source.index("static bool nvme_exec_command(")]
     shutdown = source[source.index("bool nvme_has_live_post_m4_session(void)"):
                       source.index("bool nvme_flush(")]
     harness = r'''
@@ -117,10 +120,16 @@ static void sart_free(sart_dev_t *s) {}
 static rtkit_dev_t *rtkit_init(const char *name, asc_dev_t *a, void *d, void *i,
                               sart_dev_t *s, bool sram) { return &rtkit; }
 static bool rtkit_boot(rtkit_dev_t *r) { boots++; started = failure != 8; return failure != 8; }
-static bool rtkit_sleep(rtkit_dev_t *r) { return true; }
+/* M1-M3 power-down order, one letter per step: S sleep acked, F sleep failed, X stop, R reset. */
+static char events[64];
+static bool sleep_fails;
+static void event(char c) { size_t n = strlen(events); if (n + 1 < sizeof(events)) events[n] = c; }
+static bool rtkit_sleep(rtkit_dev_t *r) { event(sleep_fails ? 'F' : 'S'); return !sleep_fails; }
+static void rtkit_stop(rtkit_dev_t *r) { event('X'); }
+static void asc_cpu_stop(asc_dev_t *a) { event('X'); }
 static bool rtkit_quiesce(rtkit_dev_t *r) { return true; }
 static void rtkit_free(rtkit_dev_t *r) {}
-static void pmgr_reset(u8 die, const char *name) { resets++; }
+static void pmgr_reset(u8 die, const char *name) { resets++; event('R'); }
 static int poll32(u64 a, u32 mask, u32 value, unsigned timeout) { return 0; }
 static bool nvme_ctrl_disable(void)
 { disable_calls++; return failure != 2 && !(shutdown_fault == 4 && disable_calls == 2); }
@@ -136,11 +145,36 @@ static bool nvme_exec_command(struct nvme_queue *q, struct nvme_command *cmd, vo
     }
     return !((failure == 4 && commands == 1) || (failure == 5 && commands == 2));
 }
-''' + qregs + init + shutdown + r'''
+''' + qregs + sleep_reset + init + shutdown + r'''
 int main(int argc, char **argv)
 {
     assert(argc == 2);
     failure = atoi(argv[1]);
+    if (failure == 28 || failure == 29) {
+        /*
+         * M1-M3 handoff from a stage that only read. The firmware does its shutdown work
+         * either way, so the normal shutdown still runs. A sleep that is never acknowledged
+         * must stop the CPU before the reset, never reset under a running ANS.
+         */
+        sleep_fails = failure == 29;
+        failure = 7;
+        nvme_adopt_live_session = false;
+        assert(nvme_init());
+        assert(!nvme_wrote);
+        assert(nvme_shutdown());
+        assert(shutdown_calls == 1 && disable_calls == 2);
+        assert(!strcmp(events, sleep_fails ? "FXRR" : "SRR"));
+        assert(!nvme_initialized && !nvme_reboot_required && queue_frees == 2);
+        /* The next owner gets a stopped, reset ANS and can boot it again. */
+        sleep_fails = false;
+        memset(events, 0, sizeof(events));
+        assert(nvme_init());
+        assert(nvme_shutdown());
+        assert(!strcmp(events, "SRR"));
+        for (unsigned i = 0; i < allocated; i++)
+            free(allocations[i]);
+        return 0;
+    }
     if (failure >= 15 && failure <= 22) {
         shutdown_fault = failure - 14;
         failure = 0;
@@ -233,5 +267,5 @@ int main(int argc, char **argv)
          "-Wno-unused-variable", "-Wno-format", "-x", "c", "-", "-o", str(binary)],
         input=harness, text=True, check=True,
     )
-    for failure in range(28):
+    for failure in range(30):
         subprocess.run([str(binary), str(failure)], check=True)
