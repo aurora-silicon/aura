@@ -42,6 +42,8 @@ typedef int sart_dev_t;
 #define T8142 0x8142
 static u32 chip_id = T8140;
 static void *adt;
+static u64 get_ticks(void) { return 0; }
+static u64 ticks_to_msecs(u64 ticks) { return ticks; }
 ''' + declarations + r'''
 static int failure, queue_frees, asc_frees, publications, commands;
 static int shutdown_fault, disable_calls, shutdown_calls, cleared_ioq;

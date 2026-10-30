@@ -147,6 +147,8 @@ bool nvme_adopt_live_session = false;
 static bool nvme_wrote;
 bool nvme_keep_running_for_linux = false;
 static u8 nvme_die;
+/* When this stage started the ANS firmware, for the shutdown timing line. */
+static u64 nvme_boot_ticks;
 
 static asc_dev_t *nvme_asc = NULL;
 static rtkit_dev_t *nvme_rtkit = NULL;
@@ -396,6 +398,7 @@ bool nvme_init(void)
     nvme_multi_verified = false;
     nvme_prp_list = NULL;
     nvme_verify_bounce = NULL;
+    nvme_boot_ticks = 0;
 
     bool adopting = false;
     int adt_path[8];
@@ -535,6 +538,7 @@ bool nvme_init(void)
 
     if (!rtkit_boot(nvme_rtkit))
         goto out_rtkit;
+    nvme_boot_ticks = get_ticks();
 
     if (poll32(nvme_base + NVME_BOOT_STATUS, 0xffffffff, NVME_BOOT_STATUS_OK, USEC_PER_SEC) < 0) {
         printf("nvme: ANS did not boot correctly.\n");
@@ -746,6 +750,7 @@ bool nvme_shutdown(void)
     }
 
     struct nvme_command cmd;
+    u64 t_start = get_ticks();
 
     memset(&cmd, 0, sizeof(cmd));
     cmd.opcode = NVME_ADMIN_CMD_DELETE_SQ;
@@ -770,6 +775,7 @@ bool nvme_shutdown(void)
      * on post-M4 ANS. With nothing written by this stage there is nothing to flush, and the
      * controller disable below still stops it cleanly.
      */
+    u64 t_queues = get_ticks();
     if (nvme_wrote && !nvme_ctrl_shutdown()) {
         printf("nvme: timeout while waiting for controller shutdown\n");
         if (nvme_type == NVME_T8132)
@@ -812,7 +818,18 @@ bool nvme_shutdown(void)
         return true;
     }
 
-    rtkit_sleep(nvme_rtkit);
+    u64 t_disabled = get_ticks();
+    bool asleep = rtkit_sleep(nvme_rtkit);
+    u64 t_asleep = get_ticks();
+    /*
+     * The sleep handshake waits for the ANS firmware to finish its own work first. Name the
+     * phases, so a slow handoff shows where it spent its time and how long the firmware had run.
+     */
+    printf("nvme: shutdown %lu ms: queues %lu ms, %s %lu ms, %s %lu ms; ANS up %lu ms\n",
+           ticks_to_msecs(t_asleep - t_start), ticks_to_msecs(t_queues - t_start),
+           nvme_wrote ? "shutdown+disable" : "disable", ticks_to_msecs(t_disabled - t_queues),
+           asleep ? "IOP sleep" : "IOP sleep FAILED", ticks_to_msecs(t_asleep - t_disabled),
+           nvme_boot_ticks ? ticks_to_msecs(t_asleep - nvme_boot_ticks) : 0);
     // Some machines call this ANS, some ANS2...
     pmgr_reset(nvme_die, "ANS");
     pmgr_reset(nvme_die, "ANS2");
