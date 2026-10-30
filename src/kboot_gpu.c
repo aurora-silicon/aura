@@ -2124,6 +2124,14 @@ static int g15_probed_hw(void *dt, int gpu, const struct g15_soc *soc, u32 *core
 /* 25G83 calibration on the scratch DT: this Mac's ADT and fuse, no unit tables.
  * The G15S-derived power model remains experimental. Release every power vote
  * after the bounded identity read; Linux owns firmware admission and startup.
+ *
+ * The kernel's T8122 admission requires the bounded powered-identity witness
+ * in /chosen/asahi,t8122-gpu-powered-identity. Reserve it (probe-result
+ * NOT_RUN) before power-on, retain g15_read_hw()'s genuine guarded read of
+ * this boot's ID/core-mask registers, and publish it only after the SGX
+ * power vote is confirmed released. The caller runs this on a scratch copy
+ * of the DT, so any failure here discards the reserved node together with
+ * the rest of the handoff and leaves the GPU disabled.
  */
 int dt_gpu_t8122_26_calibrate(void *dt)
 {
@@ -2131,6 +2139,7 @@ int dt_gpu_t8122_26_calibrate(void *dt)
     u32 count, tables, clusters, enabled, cores[G15_MAX_CLUSTERS], power[MAX_PSTATES];
     const struct perf_state *ps;
     struct g15_power_values pv;
+    struct t8122_powered_identity identity = {.result = T8122_ID_NOT_RUN};
     if (gpu < 0 || sgx < 0 || !t8122_fuse_valid ||
         g15_get_pstates(&g15_soc_t8122_standin, sgx, &count, &tables, &ps) ||
         g15_get_power_props(sgx, count, tables, ps, &pv))
@@ -2140,18 +2149,38 @@ int dt_gpu_t8122_26_calibrate(void *dt)
     if (!ref || len != 4)
         return -1;
     u32 opps = fdt32_ld(ref);
+    /* Reserve the witness before power-on; never replace an input witness. */
+    if (t8122_full_identity_prepare(dt) < 0) {
+        printf("FDT: GPU: T8122 25G83 powered identity node unavailable; GPU stays disabled\n");
+        return -1;
+    }
+    gpu = fdt_path_offset(dt, "gpu");
+    if (gpu < 0)
+        return -1;
     bool previous = t8122_fuse_use;
     t8122_fuse_use = true;
     g15_powered = false;
     float leak;
-    int ret = g15_read_hw(dt, gpu, &g15_soc_t8122_standin, cores, &clusters, &enabled, &leak, NULL);
+    int ret =
+        g15_read_hw(dt, gpu, &g15_soc_t8122_standin, cores, &clusters, &enabled, &leak, &identity);
     t8122_fuse_use = previous;
     if (g15_powered && (pmgr_adt_power_disable_recursive("/arm-io/sgx") ||
-                        pmgr_adt_power_is_off("/arm-io/sgx") != 1))
+                        pmgr_adt_power_is_off("/arm-io/sgx") != 1)) {
+        printf("FDT: GPU: T8122 25G83 failed to release SGX power vote; GPU stays disabled\n");
         ret = -1;
+    }
     g15_powered = false;
     if (ret || tables > clusters)
         return -1;
+    /* Power is confirmed off: publish the real read, PASS last. */
+    if (t8122_full_identity_publish(dt, &identity)) {
+        printf("FDT: GPU: T8122 25G83 powered identity publication failed; GPU stays disabled\n");
+        return -1;
+    }
+    printf("FDT: GPU: T8122 25G83 powered identity result %u: ID_VERSION 0x%08x ID_COUNTS_1 "
+           "0x%08x core masks 0x%x 0x%x 0x%x\n",
+           identity.result, identity.id_version, identity.id_counts_1, identity.core_mask[0],
+           identity.core_mask[1], identity.core_mask[2]);
     calc_power_t8122_standin(count, ps, leak, enabled, power);
     if (power[count - 1] < 1000 || g15_set_opps(dt, opps, count, tables, clusters, ps, power) ||
         g15_set_power_props(dt, &pv) ||
