@@ -6,6 +6,7 @@
 #include "payload.h"
 #include "adt.h"
 #include "assert.h"
+#include "boot_options.h"
 #include "boot_storage.h"
 #include "chainload.h"
 #include "cpufreq.h"
@@ -270,6 +271,17 @@ static bool check_var(u8 **p)
     printf("Found variable %.*s\n", (int)(val - (char *)*p - 1), (char *)*p);
 
     if (IS_VAR("chosen.")) {
+        /* Linux can select the next boot's host mode by editing the ESP
+         * configuration and rebooting. This is deliberately boot-time only:
+         * NV2 changes the EL2 regime and cannot be toggled while Linux runs. */
+        if (!strncmp((char *)*p, "chosen.aura,nv2=", sizeof("chosen.aura,nv2=") - 1)) {
+            if (!strcmp(val, "1") || !strcmp(val, "on"))
+                boot_options_set_nv2_override(1);
+            else if (!strcmp(val, "0") || !strcmp(val, "off"))
+                boot_options_set_nv2_override(0);
+            else
+                printf("Unknown chosen.aura,nv2 value '%s'; keeping boot policy\n", val);
+        }
         if (chosen_cnt >= MAX_CHOSEN_VARS) {
             printf("Too many chosen vars, ignoring %.*s\n", (int)(val - (char *)*p - 1),
                    (char *)*p);

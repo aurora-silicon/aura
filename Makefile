@@ -232,6 +232,7 @@ OBJECTS := \
 	smc.o \
 	monitor.o \
 	nv2.o nv2_asm.o \
+	pv_kvm.o \
 	psci.o \
 	smp.o \
 	spmi.o pmu_counter.o ace3.o \

@@ -1,8 +1,15 @@
 # J700 NV2 and the T8140 fixed counters
 
-NV2 remains explicitly selected with `aura-nv2` or `NV2_BOOT=1`. Ordinary
-physical-EL1 handoff is unchanged. The monitor exposes VHE-only NV2, keeps
-NV/NV2 together, and never sets NV1.
+NV2 is explicitly selected with `aura-nv2` or `NV2_BOOT=1`. `NV2_BOOT=1` is a
+development-build default, and `aura-nv2=0` or the runtime config below can
+turn that default off. A deployed Stage 2 can select the policy from Linux for
+the next reboot by adding `chosen.aura,nv2=1` or `chosen.aura,nv2=0` to the ESP
+Aura configuration (the usual `/etc/aura.conf` followed by the platform's Aura
+update command). The value is applied only while building the next boot's
+`/chosen` data; it never changes the running EL2 regime. Ordinary physical-EL1
+handoff is unchanged. The monitor exposes VHE-only NV2, keeps NV/NV2 together,
+and never sets NV1. TSO is configured independently by the Mach-O payload's
+`tso=` setting and is not enabled by NV2.
 
 T8140 has working hardware performance counters. Proxy measurements on both
 core types found PMUVer=0xf, ten 64-bit Apple counters, and fixed cycles on

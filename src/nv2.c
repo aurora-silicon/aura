@@ -248,11 +248,7 @@ static inline struct nv2_cpu *nv2_this(void)
 
 bool nv2_requested(void)
 {
-#ifdef NV2_BOOT
-    return true;
-#else
     return aura_nv2_enabled();
-#endif
 }
 
 void nv2_prepare(void)

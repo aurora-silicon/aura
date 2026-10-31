@@ -10,6 +10,7 @@
 #include "monitor.h"
 #include "nv2.h"
 #include "psci.h"
+#include "pv_kvm.h"
 #include "uart.h"
 #include "utils.h"
 
@@ -304,6 +305,22 @@ void exc_sync(u64 *regs)
     if (ec == ESR_EC_HVC && in_el2() && !in_gl12() && elsp == SPSR_M_EL1H) {
         // Hypercall
         u32 imm = mrs(ESR_EL2) & 0xffff;
+        /* PV calls use the architected HVC #0 immediate but are identified by
+         * the versioned function ID in x0. Guest-origin calls never reach this
+         * EL1h path, and the monitor is the authority for the current world. */
+        if (imm == 0 && pv_kvm_active) {
+            if (pv_kvm_handle_hvc(regs)) {
+                msr(SPSR_EL2, spsr);
+                msr(ELR_EL2, elr + 4);
+                return;
+            }
+            /* PV owns the host HVC #0 namespace. Do not let an unknown
+             * function fall through to Aura's legacy EL1-return path. */
+            regs[0] = AURA_PV_STATUS_NOSYS;
+            msr(SPSR_EL2, spsr);
+            msr(ELR_EL2, elr + 4);
+            return;
+        }
         switch (imm) {
             case 0:
                 // On clean EL1 return, let the normal exception return

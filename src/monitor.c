@@ -77,7 +77,8 @@ bool monitor_required(void)
 void monitor_el2_setup(void)
 {
     /* No stage 2. IRQ, FIQ, SError and external aborts all go to EL1. */
-    reg_clr(HCR_EL2, HCR_TGE | HCR_AMO | HCR_IMO | HCR_FMO | HCR_TEA | HCR_VM);
+    reg_clr(HCR_EL2,
+            HCR_TGE | HCR_AMO | HCR_IMO | HCR_FMO | HCR_TEA | HCR_VM | HCR_NV | HCR_NV1 | HCR_NV2);
     /* Trap SMC to the monitor for PSCI (Apple has no EL3). */
     reg_set(HCR_EL2, HCR_TSC);
     msr(VTTBR_EL2, 0);

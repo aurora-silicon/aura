@@ -29,6 +29,7 @@
 #include "nv2.h"
 #include "pcie.h"
 #include "pmgr.h"
+#include "pv_kvm.h"
 #include "rtkit.h"
 #include "sart.h"
 #include "sep.h"
@@ -7193,6 +7194,8 @@ int kboot_prepare_dt(void *fdt)
     assert(dt_bufsize);
 
     dt_bufsize += 6 * SZ_16K; // Add 96K of buffer for modifications
+    if (pv_kvm_requested())
+        dt_bufsize += SZ_16K;
     // A T6030 or T8122 also takes its PMP values
     if (chip_id == T6030 || chip_id == T8122)
         dt_bufsize += 2 * SZ_16K;
@@ -7496,6 +7499,22 @@ int kboot_prepare_dt(void *fdt)
     if (dt_set_memory())
         return -1;
 
+    if (pv_kvm_requested()) {
+        int hypervisor = fdt_path_offset(dt, "/hypervisor");
+        if (hypervisor < 0)
+            hypervisor = fdt_add_subnode(dt, 0, "hypervisor");
+        if (hypervisor < 0 ||
+            fdt_setprop_string(dt, hypervisor, "compatible", "aurora,aura-kvm-pv-0") ||
+            fdt_setprop_string(dt, hypervisor, "method", "hvc") ||
+            fdt_setprop_u32(dt, hypervisor, "abi-major", AURA_PV_ABI_MAJOR) ||
+            fdt_setprop_u32(dt, hypervisor, "abi-minor", AURA_PV_ABI_MINOR) ||
+            fdt_setprop_u32(dt, hypervisor, "uid-function", AURA_PV_FUNC_UID) ||
+            fdt_setprop_u32(dt, hypervisor, "version-function", AURA_PV_FUNC_VERSION) ||
+            fdt_setprop_u32(dt, hypervisor, "caps-function", AURA_PV_FUNC_GET_CAPS) ||
+            fdt_setprop_u32(dt, hypervisor, "run-function", AURA_PV_FUNC_RUN))
+            bail("FDT: couldn't describe Aura PV-KVM\n");
+    }
+
     /* Last, so that its 15K never takes room the steps above need. */
     if (dt_set_pmp_t6030())
         return -1;
@@ -7627,7 +7646,7 @@ int kboot_boot(void *kernel)
     next_stage.args[3] = 0;
     next_stage.args[4] = 0;
     next_stage.restore_logo = false;
-    next_stage.monitor = monitor_required();
+    next_stage.monitor = monitor_required() || pv_kvm_requested();
 
     return 0;
 }
