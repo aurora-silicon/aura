@@ -321,7 +321,7 @@ void __attribute__((noreturn)) smp_park_loop(struct spin_table *me)
 /* PSCI CPU_OFF: the dying CPU abandons its OS stack and re-parks. */
 void __attribute__((noreturn)) smp_reenter_park(int index)
 {
-    extern void _smp_reenter_park(struct spin_table *me, u64 sp) __attribute__((noreturn));
+    extern void _smp_reenter_park(struct spin_table * me, u64 sp) __attribute__((noreturn));
     struct spin_table *me = &spin_table[index];
     me->target = 0;
     me->retval = 0;
