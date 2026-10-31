@@ -7333,6 +7333,17 @@ int kboot_prepare_dt(void *fdt)
             bail("FDT: couldn't reserve CTXR_D\n");
         printf("FDT: reserved CTXR_D [0x%lx, 0x%lx)\n", start, end);
     }
+    if (nv2_requested() && monitor_required()) {
+        u64 base, size;
+        nv2_trace_region(&base, &size);
+        if (size) {
+            char name[40];
+            snprintf(name, sizeof(name), "nv2-trace@%lx", base);
+            if (dt_get_or_add_reserved_mem(name, "aura,nv2-trace", true, base, size) < 0)
+                bail("FDT: couldn't reserve the NV2 trace ring\n");
+            printf("FDT: NV2 trace ring at [0x%lx, 0x%lx)\n", base, base + size);
+        }
+    }
 
     if (chip_id == T8140) {
         u64 ro_start, ro_end;

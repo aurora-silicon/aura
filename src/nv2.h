@@ -30,6 +30,10 @@ void nv2_enter_os(u64 entry, u64 a0, u64 a1, u64 a2) __attribute__((noreturn));
 bool nv2_handle_sync(u64 *regs);
 bool nv2_handle_async(u64 *regs, int kind);
 
+/* NV2_TRACE builds: the event ring, for a reserved-memory node. */
+void nv2_trace_region(u64 *base, u64 *size);
+void nv2_note_unhandled(u64 esr, u64 elr, u64 spsr);
+
 /* Proxy diagnostics: arm this CPU's NV2 state for an nv2_probe_call(). */
 u64 nv2_probe_arm(u64 vncr, u64 avncr, u64 hcr);
 void nv2_probe_disarm(void);

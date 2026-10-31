@@ -137,6 +137,8 @@ struct nv2_cpu {
     u64 *vncr, *avncr; /* L1's pages */
     u64 hcr;           /* real HCR_EL2 while L1 runs */
     bool armed;
+    /* L1's real EL2 trap controls, restored at every child exit */
+    u64 l1_hfgrtr, l1_hfgwtr, l1_hfgitr, l1_hdfgrtr, l1_hdfgwtr, l1_hcrx, l1_cptr, l1_cnthctl;
 
     /* EL2 registers that trap under NV2 and are held here for L1. */
     u64 cnthctl, mdcr, hacr, actlr, hpfar, sre, cntkctl12, spsr32[4];
@@ -152,6 +154,68 @@ struct nv2_cpu {
 } ALIGNED(64);
 
 static struct nv2_cpu nv2_cpus[MAX_CPUS];
+
+/*
+ * NV2_TRACE development builds log NV2 events to a per-CPU ring in a no-map
+ * reserved-memory node ("aura,nv2-trace") that the OS can read through
+ * /dev/mem while it runs. Nothing is printed: once the OS owns the console a
+ * monitor printf can stall a CPU for a second per byte.
+ */
+#ifdef NV2_TRACE
+#define NV2_TRACE_CPU_BYTES 0x10000
+#define NV2_TRACE_RECS      (NV2_TRACE_CPU_BYTES / 64 - 1)
+struct nv2_trace_rec {
+    u64 ts, type, a, b, c, d, e, f;
+};
+struct nv2_trace_cpu {
+    u64 magic, head, cpu, rsvd[5];
+    struct nv2_trace_rec rec[NV2_TRACE_RECS];
+};
+static struct nv2_trace_cpu *nv2_trace_buf;
+
+static void nv2_trace(u64 type, u64 a, u64 b, u64 c, u64 d, u64 e, u64 f)
+{
+    if (!nv2_trace_buf)
+        return;
+    struct nv2_trace_cpu *t = &nv2_trace_buf[smp_id()];
+    struct nv2_trace_rec *r = &t->rec[t->head % NV2_TRACE_RECS];
+    r->ts = mrs(CNTPCT_EL0);
+    r->type = type;
+    r->a = a;
+    r->b = b;
+    r->c = c;
+    r->d = d;
+    r->e = e;
+    r->f = f;
+    sysop("dmb ish");
+    t->head++;
+}
+
+void nv2_trace_region(u64 *base, u64 *size)
+{
+    *base = (u64)nv2_trace_buf;
+    *size = nv2_trace_buf ? MAX_CPUS * NV2_TRACE_CPU_BYTES : 0;
+}
+#else
+#define nv2_trace(...) (void)0
+void nv2_trace_region(u64 *base, u64 *size)
+{
+    *base = *size = 0;
+}
+#endif
+
+enum {
+    NV2_T_ENTER = 1,
+    NV2_T_EXIT,
+    NV2_T_SYSREG,
+    NV2_T_UNKNOWN,
+    NV2_T_TLBI,
+    NV2_T_AT,
+    NV2_T_ERET,
+    NV2_T_INJECT,
+    NV2_T_FAIL,
+    NV2_T_KICK,
+};
 static u8 *nv2_pages[MAX_CPUS];
 
 static inline struct nv2_cpu *nv2_this(void)
@@ -170,6 +234,18 @@ bool nv2_requested(void)
 
 void nv2_prepare(void)
 {
+#ifdef NV2_TRACE
+    if (!nv2_trace_buf) {
+        nv2_trace_buf = memalign(SZ_16K, MAX_CPUS * NV2_TRACE_CPU_BYTES);
+        if (!nv2_trace_buf)
+            panic("NV2: no memory for the trace ring\n");
+        memset(nv2_trace_buf, 0, MAX_CPUS * NV2_TRACE_CPU_BYTES);
+        for (int i = 0; i < MAX_CPUS; i++) {
+            nv2_trace_buf[i].magic = 0x4e5632545243ULL; /* "NV2TRC" */
+            nv2_trace_buf[i].cpu = i;
+        }
+    }
+#endif
     for (int i = 0; i < MAX_CPUS; i++) {
         if (nv2_pages[i] || (i != boot_cpu_idx && !smp_is_alive(i)))
             continue;
@@ -275,13 +351,17 @@ static bool nv2_timers_exit(struct nv2_cpu *c)
     msr(SYS_CNTV_CVAL02, c->l1_tmr[3]);
     msr(SYS_CNTP_CTL02, c->l1_tmr[0] & 3);
     msr(SYS_CNTV_CTL02, c->l1_tmr[2] & 3);
-    msr(CNTHCTL_EL2, CNTHCTL_EL1PTEN | CNTHCTL_EL1PCTEN | (mrs(CNTHCTL_EL2) & GENMASK(9, 0)));
+    msr(CNTHCTL_EL2, (c->l1_cnthctl & GENMASK(17, 10)) | (mrs(CNTHCTL_EL2) & GENMASK(9, 0)));
 
     u64 ena = AV(c, A_VM_TMR_FIQ_ENA);
     msr(SYS_VMTMR_FIQENA, c->parent_vmtmr);
 #define FIRING(ctl) (((ctl) & 7) == 5)
-    return ((ena & 2) && FIRING(pctl)) || ((ena & 1) && FIRING(vctl));
+    bool firing = ((ena & 2) && FIRING(pctl)) || ((ena & 1) && FIRING(vctl));
 #undef FIRING
+    if (firing)
+        nv2_trace(NV2_T_KICK, pctl, vctl, ena, VN(c, V_CNTP_CVAL), VN(c, V_CNTV_CVAL),
+                  mrs(CNTPCT_EL0) - VN(c, V_CNTVOFF));
+    return firing;
 }
 
 static u64 nv2_ich_lr_read(int i)
@@ -415,7 +495,7 @@ static bool nv2_child_enter(struct nv2_cpu *c, u64 spsr, u64 elr)
     bool vm = vhcr & HCR_VM;
 
     if (vhcr & (HCR_NV | HCR_NV1 | HCR_NV2)) {
-        printf("NV2: nested hypervisor guests are not supported yet (vHCR %#lx)\n", vhcr);
+        nv2_trace(NV2_T_FAIL, 0x1a, spsr, elr, vhcr, 1, 0); /* nested NV guest: not yet */
         return false;
     }
 
@@ -455,6 +535,7 @@ static bool nv2_child_enter(struct nv2_cpu *c, u64 spsr, u64 elr)
     c->child = true;
     c->vm = vm;
     c->n_entry++;
+    nv2_trace(NV2_T_ENTER, elr, spsr, vhcr, VN(c, V_VTTBR), VN(c, V_VTCR), VN(c, V_ICH_HCR));
     return true;
 }
 
@@ -483,8 +564,8 @@ static void nv2_child_exit(struct nv2_cpu *c, int kind, u64 esr)
     u64 far = kind ? 0 : mrs(FAR_EL2);
     bool kick = false;
 
-    /* First: the child's traps cover EL2 too, and the bank includes SMCR. */
-    msr(SYS_CPTR_EL2, CPTR_E2H_FPEN | (nv2_has_sme ? CPTR_E2H_SMEN : 0));
+    /* First: the child's FP traps cover EL2 too. */
+    msr(SYS_CPTR_EL2, c->l1_cptr);
     sysop("isb");
 
     if (c->vm) {
@@ -498,11 +579,11 @@ static void nv2_child_exit(struct nv2_cpu *c, int kind, u64 esr)
         msr(HSTR_EL2, 0);
         msr(HACR_EL2, 0);
         msr(MDCR_EL2, 0);
-        msr(SYS_HFGRTR_EL2, 0);
-        msr(SYS_HFGWTR_EL2, 0);
-        msr(SYS_HDFGRTR_EL2, 0);
-        msr(SYS_HDFGWTR_EL2, 0);
-        msr(SYS_HCRX_EL2, 0);
+        msr(SYS_HFGRTR_EL2, c->l1_hfgrtr);
+        msr(SYS_HFGWTR_EL2, c->l1_hfgwtr);
+        msr(SYS_HDFGRTR_EL2, c->l1_hdfgrtr);
+        msr(SYS_HDFGWTR_EL2, c->l1_hdfgwtr);
+        msr(SYS_HCRX_EL2, c->l1_hcrx);
     }
 
     nv2_bank_save(c->vncr);
@@ -511,7 +592,7 @@ static void nv2_child_exit(struct nv2_cpu *c, int kind, u64 esr)
     nv2_bank_load(c->parent);
     msr(SP_EL1, c->parent_sp1);
     msr(SYS_CNTKCTL_EL12, c->parent_cntkctl);
-    msr(SYS_HFGITR_EL2, HFGITR_VMALLE1_ALL);
+    msr(SYS_HFGITR_EL2, c->l1_hfgitr);
     msr(HCR_EL2, c->hcr);
 
     msr(SYS_ELR_EL12, elr);
@@ -525,13 +606,15 @@ static void nv2_child_exit(struct nv2_cpu *c, int kind, u64 esr)
     sysop("isb");
     c->child = false;
     c->n_exit++;
+    nv2_trace(NV2_T_EXIT, kind | ((u64)kick << 8), esr, elr, far, c->hpfar, mrs(ELR_EL2));
 
     /* A guest timer asserting at exit is now held only in the VNCR page.
      * Its physical FIQ went with the guest, so raise one for L1 with a
      * self-IPI: L1's interrupt handler then finds the guest timer firing
      * through the VNCR page as it would in hardware. */
-    if (kick)
+    if (kick) {
         msr(SYS_IMP_APL_IPI_RR_LOCAL_EL1, mrs(MPIDR_EL1) & 0xff);
+    }
 }
 
 /* Synchronous exception from a running child. */
@@ -726,22 +809,10 @@ static void nv2_at(struct nv2_cpu *c, unsigned op, bool own, u64 va)
     (((u64)(op0) << 20) | ((u64)(op2) << 17) | ((u64)(op1) << 14) | ((u64)(crn) << 10) |           \
      ((u64)(crm) << 1))
 
-static u64 nv2_unknown_keys[16];
-
 static void nv2_note_unknown(struct nv2_cpu *c, u64 key, bool read)
 {
     c->n_unknown++;
-    for (unsigned i = 0; i < ARRAY_SIZE(nv2_unknown_keys); i++) {
-        if (nv2_unknown_keys[i] == key)
-            return;
-        if (!nv2_unknown_keys[i]) {
-            nv2_unknown_keys[i] = key;
-            break;
-        }
-    }
-    printf("NV2: %s of unhandled s%lu_%lu_c%lu_c%lu_%lu at %#lx, RAZ/WI\n", read ? "read" : "write",
-           (key >> 20) & 3, (key >> 14) & 7, (key >> 10) & 0xf, (key >> 1) & 0xf, (key >> 17) & 7,
-           mrs(ELR_EL2));
+    nv2_trace(NV2_T_UNKNOWN, key, read, mrs(ELR_EL2), 0, 0, 0);
 }
 
 /* The child's timer TVAL views, on its timer in the VNCR page. */
@@ -755,7 +826,17 @@ static u64 nv2_tval(struct nv2_cpu *c, bool virt, bool read, u64 value)
     return 0;
 }
 
+static bool nv2_sysreg_do(struct nv2_cpu *c, u64 *regs, u64 esr);
+
 static bool nv2_sysreg(struct nv2_cpu *c, u64 *regs, u64 esr)
+{
+    if (nv2_sysreg_do(c, regs, esr))
+        return true;
+    nv2_trace(NV2_T_FAIL, 0x18, esr, mrs(ELR_EL2), regs[(esr >> 5) & 31], 7, 0);
+    return false;
+}
+
+static bool nv2_sysreg_do(struct nv2_cpu *c, u64 *regs, u64 esr)
 {
     u64 key = esr & ESR_ISS & ~(ESR_ISS_MSR_Rt | ESR_ISS_MSR_DIR);
     unsigned rt = (esr >> 5) & 31;
@@ -979,6 +1060,7 @@ static bool nv2_sysreg(struct nv2_cpu *c, u64 *regs, u64 esr)
 done:
     if (read && rt != 31)
         regs[rt] = value;
+    nv2_trace(NV2_T_SYSREG, esr, value, mrs(ELR_EL2), 0, 0, 0);
     sysop("isb");
     msr(ELR_EL2, mrs(ELR_EL2) + 4);
     return true;
@@ -994,8 +1076,9 @@ static bool nv2_eret(struct nv2_cpu *c)
     unsigned m = spsr & 0x1f;
 
     c->n_eret++;
+    nv2_trace(NV2_T_ERET, spsr, elr, vhcr, 0, 0, 0);
     if (m & 0x10) {
-        printf("NV2: AArch32 ERET target %#lx\n", spsr);
+        nv2_trace(NV2_T_FAIL, 0x1a, spsr, elr, vhcr, 2, 0); /* AArch32 target */
         return false;
     }
     switch (m) {
@@ -1010,12 +1093,12 @@ static bool nv2_eret(struct nv2_cpu *c)
         case 0x4:
         case 0x5:
             if (vhcr & HCR_TGE) {
-                printf("NV2: ERET to EL1 with TGE set (SPSR %#lx)\n", spsr);
+                nv2_trace(NV2_T_FAIL, 0x1a, spsr, elr, vhcr, 3, 0); /* EL1 with TGE */
                 return false;
             }
             return nv2_child_enter(c, spsr, elr);
         default:
-            printf("NV2: bad ERET target %#lx\n", spsr);
+            nv2_trace(NV2_T_FAIL, 0x1a, spsr, elr, vhcr, 4, 0);
             return false;
     }
     msr(SPSR_EL2, spsr);
@@ -1028,6 +1111,7 @@ static bool nv2_eret(struct nv2_cpu *c)
 static void nv2_inject_self(u64 esr)
 {
     u64 elr = mrs(ELR_EL2), spsr = mrs(SPSR_EL2);
+    nv2_trace(NV2_T_INJECT, esr, elr, spsr, 0, 0, 0);
     /* It took the exception at virtual EL2: report EL2t/EL2h. */
     u64 vspsr = (spsr & ~0xfUL) | ((spsr & 1) ? 0x9 : 0x8);
     msr(SYS_ELR_EL12, elr);
@@ -1050,8 +1134,10 @@ bool nv2_handle_sync(u64 *regs)
 
     /* From L1. Its userspace (EL0) runs with real TGE clear and reaches EL2
      * only through traps L1 itself never asked for. */
-    if ((mrs(SPSR_EL2) & 0xc) != 0x4)
+    if ((mrs(SPSR_EL2) & 0xc) != 0x4) {
+        nv2_trace(NV2_T_FAIL, ec, esr, mrs(ELR_EL2), mrs(SPSR_EL2), 6, 0);
         return false;
+    }
 
     switch (ec) {
         case 0x1a:
@@ -1064,9 +1150,17 @@ bool nv2_handle_sync(u64 *regs)
                 return false;
             nv2_inject_self(esr);
             return true;
+        case ESR_EC_SMC:
+            return false; /* PSCI */
         default:
-            return false; /* SMC: PSCI */
+            nv2_trace(NV2_T_FAIL, ec, esr, mrs(ELR_EL2), mrs(SPSR_EL2), 5, 0);
+            return false;
     }
+}
+
+void nv2_note_unhandled(u64 esr, u64 elr, u64 spsr)
+{
+    nv2_trace(NV2_T_FAIL, esr >> 26, esr, elr, spsr, 0xdead, mrs(FAR_EL2));
 }
 
 bool nv2_handle_async(u64 *regs, int kind)
@@ -1093,6 +1187,14 @@ static void nv2_cpu_arm(struct nv2_cpu *c, u64 vncr, u64 avncr, u64 hcr)
     c->hcr = hcr;
     c->sre = 0xf;
     c->cnthctl = CNTHCTL_EL1PTEN | CNTHCTL_EL1PCTEN;
+    c->l1_hfgrtr = mrs(SYS_HFGRTR_EL2);
+    c->l1_hfgwtr = mrs(SYS_HFGWTR_EL2);
+    c->l1_hfgitr = HFGITR_VMALLE1_ALL;
+    c->l1_hdfgrtr = mrs(SYS_HDFGRTR_EL2);
+    c->l1_hdfgwtr = mrs(SYS_HDFGWTR_EL2);
+    c->l1_hcrx = mrs(SYS_HCRX_EL2);
+    c->l1_cptr = mrs(SYS_CPTR_EL2);
+    c->l1_cnthctl = mrs(CNTHCTL_EL2);
     nv2_has_sme = FIELD_GET(ID_AA64PFR1_SME, mrs(SYS_ID_AA64PFR1_EL1));
     nv2_ich_lrs = (mrs(SYS_ICH_VTR) & 0x1f) + 1;
     c->armed = true;

@@ -353,6 +353,9 @@ void exc_sync(u64 *regs)
     sysop("isb");
     sysop("dsb sy");
 
+    if (nv2_active)
+        nv2_note_unhandled(esr, elr, spsr);
+
     if (!(exc_guard & GUARD_SILENT))
         print_regs(regs, el12);
 

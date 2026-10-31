@@ -121,6 +121,11 @@ ifeq ($(NV2_BOOT),1)
 CFG += NV2_BOOT
 endif
 
+# Development builds only: log the first FEAT_NV2 guest entries and exits.
+ifeq ($(NV2_TRACE),1)
+CFG += NV2_TRACE
+endif
+
 
 LDFLAGS := -EL -maarch64elf --no-undefined -X -Bsymbolic \
 	-z notext --no-apply-dynamic-relocs --orphan-handling=warn \
