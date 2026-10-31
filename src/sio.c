@@ -233,8 +233,7 @@ int find_key_index(const char *keylist[], u32 needle)
     int i;
     for (i = 0; keylist[i]; i++) {
         const char *s = keylist[i];
-        u32 key = ((u32)(u8)s[0]) << 24 | ((u32)(u8)s[1]) << 16 |
-                  ((u32)(u8)s[2]) << 8 | (u8)s[3];
+        u32 key = ((u32)(u8)s[0]) << 24 | ((u32)(u8)s[1]) << 16 | ((u32)(u8)s[2]) << 8 | (u8)s[3];
         if (key != 0xffffffff && key == needle)
             break;
     }

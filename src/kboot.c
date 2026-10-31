@@ -5968,7 +5968,8 @@ static int dt_set_sio_fwdata(const char *adt_path, const char *fdt_alias)
         }
         uint32_t mem_phandle = fdt_get_phandle(dt, mem_node);
 
-        ret = dt_device_set_reserved_mem(mem_node, node_name, phandle, mapping->iova, mapping->size);
+        ret =
+            dt_device_set_reserved_mem(mem_node, node_name, phandle, mapping->iova, mapping->size);
         if (ret < 0)
             goto err;
 
@@ -6051,8 +6052,7 @@ static int dt_setup_t604x_sio(void)
     if (!iommus || length != 2 * sizeof(*iommus) || fdt32_to_cpu(iommus[1]))
         goto refused;
     int dart = fdt_node_offset_by_phandle(dt, fdt32_to_cpu(iommus[0]));
-    if (mailbox < 0 || dart < 0 ||
-        fdt_node_check_compatible(dt, mailbox, "apple,asc-mailbox-v4") ||
+    if (mailbox < 0 || dart < 0 || fdt_node_check_compatible(dt, mailbox, "apple,asc-mailbox-v4") ||
         fdt_node_check_compatible(dt, dart, "apple,t6041-dart") ||
         fdt_get_path(dt, mailbox, paths[1], sizeof(paths[1])) ||
         fdt_get_path(dt, dart, paths[2], sizeof(paths[2])))
