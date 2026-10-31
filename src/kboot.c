@@ -5962,18 +5962,19 @@ static int dt_set_sio_fwdata(const char *adt_path, const char *fdt_alias)
 
         int mem_node = dt_get_or_add_reserved_mem(node_name, "apple,asc-mem", true, mapping->phys,
                                                   mapping->size);
-        if (mem_node < 0)
-            return -1;
+        if (mem_node < 0) {
+            ret = -1;
+            goto err;
+        }
         uint32_t mem_phandle = fdt_get_phandle(dt, mem_node);
 
-        int ret =
-            dt_device_set_reserved_mem(mem_node, node_name, phandle, mapping->iova, mapping->size);
+        ret = dt_device_set_reserved_mem(mem_node, node_name, phandle, mapping->iova, mapping->size);
         if (ret < 0)
-            return ret;
+            goto err;
 
         ret = dt_device_add_mem_region(fdt_alias, mem_phandle, NULL);
         if (ret < 0)
-            return ret;
+            goto err;
     }
 
     node = fdt_path_offset(dt, fdt_alias);
@@ -5992,7 +5993,7 @@ static int dt_set_sio_fwdata(const char *adt_path, const char *fdt_alias)
 
 err:
     free(siodata);
-    return 0;
+    return ret;
 }
 
 static int dt_setup_sio(void)
@@ -6017,6 +6018,77 @@ static int dt_setup_sio(void)
         fdt_setprop_string(dt, node, "status", "okay");
     }
 
+    return 0;
+}
+
+/* The T604x provider group is published only after the complete loader handoff. */
+static int dt_setup_t604x_sio(void)
+{
+    int node = fdt_path_offset(dt, "sio");
+    if (node < 0) {
+        node = fdt_node_offset_by_compatible(dt, -1, "apple,t6041-sio");
+        if (node < 0)
+            return 0;
+        if (fdt_node_offset_by_compatible(dt, node, "apple,t6041-sio") >= 0)
+            bail("FDT: ambiguous T604x SIO nodes\n");
+    }
+    if (fdt_node_check_compatible(dt, node, "apple,t6041-sio"))
+        bail("FDT: sio alias is not a T604x SIO\n");
+
+    char paths[6][128];
+    if (fdt_get_path(dt, node, paths[0], sizeof(paths[0])))
+        return -1;
+    /* Refusal must also disable a tree that arrived with SIO already enabled. */
+    if (fdt_setprop_string(dt, node, "status", "disabled"))
+        return -1;
+    node = fdt_path_offset(dt, paths[0]);
+    int length;
+    const fdt32_t *mbox = fdt_getprop(dt, node, "mboxes", &length);
+    if (!mbox || length != sizeof(*mbox))
+        goto refused;
+    int mailbox = fdt_node_offset_by_phandle(dt, fdt32_to_cpu(*mbox));
+    const fdt32_t *iommus = fdt_getprop(dt, node, "iommus", &length);
+    if (!iommus || length != 2 * sizeof(*iommus) || fdt32_to_cpu(iommus[1]))
+        goto refused;
+    int dart = fdt_node_offset_by_phandle(dt, fdt32_to_cpu(iommus[0]));
+    if (mailbox < 0 || dart < 0 ||
+        fdt_node_check_compatible(dt, mailbox, "apple,asc-mailbox-v4") ||
+        fdt_node_check_compatible(dt, dart, "apple,t6041-dart") ||
+        fdt_get_path(dt, mailbox, paths[1], sizeof(paths[1])) ||
+        fdt_get_path(dt, dart, paths[2], sizeof(paths[2])))
+        goto refused;
+    int power_count = dt_t8140_power_paths(node, &paths[3], ARRAY_SIZE(paths) - 3);
+    if (power_count <= 0)
+        goto refused;
+    size_t count = 3 + power_count;
+
+    void *saved = malloc(dt_bufsize);
+    if (!saved)
+        goto refused;
+    memcpy(saved, dt, dt_bufsize);
+    int ret = dt_reserve_asc_firmware("/arm-io/sio", NULL, paths[0], true, 0);
+    if (!ret) {
+        node = fdt_path_offset(dt, paths[0]);
+        ret = fdt_delprop(dt, node, "apple,sio-firmware-params");
+        if (!ret || ret == -FDT_ERR_NOTFOUND)
+            ret = dt_set_sio_fwdata("/arm-io/sio", paths[0]);
+    }
+    /* Refresh every offset: reservations and status writes relocate FDT nodes. */
+    for (size_t i = 1; !ret && i < count; i++) {
+        node = fdt_path_offset(dt, paths[i]);
+        ret = node < 0 ? node : fdt_setprop_string(dt, node, "status", "okay");
+    }
+    if (!ret) {
+        node = fdt_path_offset(dt, paths[0]);
+        ret = node < 0 ? node : fdt_setprop_string(dt, node, "status", "okay");
+    }
+    if (ret)
+        memcpy(dt, saved, dt_bufsize);
+    free(saved);
+    if (!ret)
+        return 0;
+refused:
+    printf("FDT: T604x SIO handoff refused; SIO left disabled\n");
     return 0;
 }
 
@@ -7406,7 +7478,7 @@ int kboot_prepare_dt(void *fdt)
         return -1;
     if (dt_disable_missing_j700_touch_id())
         return -1;
-    if (dt_setup_sio())
+    if ((chip_id == T6040 || chip_id == T6041) ? dt_setup_t604x_sio() : dt_setup_sio())
         return -1;
     if (dt_set_aop_firmware())
         return -1;
