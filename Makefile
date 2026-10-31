@@ -214,6 +214,7 @@ OBJECTS := \
 	sio.o \
 	smc.o \
 	monitor.o \
+	psci.o \
 	smp.o \
 	spmi.o pmu_counter.o ace3.o \
 	start.o \

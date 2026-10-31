@@ -7,6 +7,8 @@
 #include "gxf.h"
 #include "iodev.h"
 #include "memory.h"
+#include "monitor.h"
+#include "psci.h"
 #include "uart.h"
 #include "utils.h"
 
@@ -324,6 +326,13 @@ void exc_sync(u64 *regs)
             default:
                 printf("Unknown SMC: 0x%x\n", imm);
                 break;
+        }
+    } else if (monitor_active && ec == ESR_EC_SMC && in_el2() && !in_gl && elsp == SPSR_M_EL1H) {
+        /* An EL1 OS SMC trapped by HCR_EL2.TSC: a PSCI/SMCCC call. */
+        if (psci_handle_smc(regs)) {
+            elr += 4;
+            msr(ELR_EL1, elr);
+            return;
         }
     } else {
         if (!(exc_guard & GUARD_SILENT))
