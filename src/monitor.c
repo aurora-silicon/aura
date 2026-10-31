@@ -6,6 +6,7 @@
 #include "exception.h"
 #include "malloc.h"
 #include "memory.h"
+#include "nv2.h"
 #include "smp.h"
 #include "soc.h"
 #include "string.h"
@@ -129,6 +130,8 @@ void monitor_el2_setup(void)
 
 void monitor_enter_os(u64 entry, u64 a0, u64 a1, u64 a2)
 {
+    if (nv2_active)
+        nv2_enter_os(entry, a0, a1, a2);
     monitor_el2_setup();
     monitor_eret(entry, a0, a1, a2);
 }

@@ -7,28 +7,31 @@
 
 /*
  * FEAT_NV2 nested virtualization for the EL2 monitor. When active, the monitor
- * runs Linux at EL1 as a *virtual EL2* (HCR_EL2.NV|NV2|E2H): the guest's EL2
- * register accesses redirect to a per-CPU VNCR page (Apple IMPDEF ones to the
- * AVNCR page), and its ERETs trap here so the monitor can enter the guest's own
- * EL0, or its nested guest (L2), on its behalf. This lets KVM in the Linux
- * guest run VMs. Confirmed on T8140: redirection at the ARM VNCR offsets and
- * the ERET trap both work with no SPTM.
+ * runs the OS at EL1 as a *virtual EL2* (HCR_EL2.NV|NV2, NV1 clear, VHE only):
+ * the guest's EL2 register accesses redirect to a per-CPU VNCR page (Apple
+ * IMPDEF ones to the AVNCR page), the rest trap here and are emulated, and its
+ * ERETs trap so the monitor can enter the guest's own EL0, or its guest, on its
+ * behalf. KVM in the OS can then run hardware-virtualized VMs, whose stage 2
+ * the monitor installs directly from the guest's VTTBR/VTCR.
  *
- * Opt-in: off until the dispatch is complete, so the plain EL1 boot is
- * unaffected.
+ * Opt-in (aura-nv2, or an NV2_BOOT development build): a plain EL1 boot never
+ * sets HCR_EL2.NV2 and the ERET gate in the vectors is a compare and a branch.
  */
-
-struct nv2_cpu {
-    u64 vncr_pa;  /* native VNCR page for this CPU */
-    u64 avncr_pa; /* Apple AVNCR page (the page after VNCR) */
-};
 
 extern bool nv2_active;
 
-/* From exc_sync on a guest sync exception when nv2_active. ec is the decoded
- * ESR_EL2.EC. Returns true if handled: the caller returns and the normal
- * exception-return ERET resumes the guest (or its EL0/L2). */
+bool nv2_requested(void);
+/* Allocate the per-CPU NV pages; before the OS memory map is fixed. */
+void nv2_prepare(void);
 void nv2_enter_os(u64 entry, u64 a0, u64 a1, u64 a2) __attribute__((noreturn));
-bool nv2_handle_sync(u64 *regs, u32 ec);
+
+/* Exception hooks: true if handled, and the exception return resumes the
+ * virtual-EL2 guest or the guest it runs. kind: 1 IRQ, 2 FIQ, 3 SError. */
+bool nv2_handle_sync(u64 *regs);
+bool nv2_handle_async(u64 *regs, int kind);
+
+/* Proxy diagnostics: arm this CPU's NV2 state for an nv2_probe_call(). */
+u64 nv2_probe_arm(u64 vncr, u64 avncr, u64 hcr);
+void nv2_probe_disarm(void);
 
 #endif

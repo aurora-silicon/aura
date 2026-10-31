@@ -26,6 +26,7 @@
 #include "mcc.h"
 #include "memory.h"
 #include "monitor.h"
+#include "nv2.h"
 #include "pcie.h"
 #include "pmgr.h"
 #include "rtkit.h"
@@ -7184,6 +7185,9 @@ int kboot_prepare_dt(void *fdt)
 
     /* Need to init ISP early to carve out heap */
     isp_init();
+    /* Likewise the NV pages, before the retained heap extent is fixed. */
+    if (nv2_requested() && monitor_required())
+        nv2_prepare();
 
     dt_bufsize = fdt_totalsize(fdt);
     assert(dt_bufsize);

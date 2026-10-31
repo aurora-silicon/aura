@@ -14,6 +14,48 @@
 .type _v_sp0_sync, @function
 _v_sp0_sync:
     msr pan, #0
+    /*
+     * FEAT_NV2 ERET gate. A virtual-EL2 guest's ERET traps here (EC 0x1a). Its
+     * returns to its own userspace (EL0t with vHCR.{E2H,TGE}) and to itself
+     * (EL2t/EL2h, run as EL1t/EL1h) are register-only and complete here;
+     * anything else (a nested guest entry) takes the full path. Without NV2
+     * this costs a compare and a branch.
+     */
+    stp x0, x1, [sp, #-16]!
+    mrs x0, esr_el2
+    lsr x1, x0, #26
+    cmp x1, #0x1a
+    b.ne 9f
+    mov x1, #0x6a000000             // plain ERET; ERETAx need the slow path
+    cmp x0, x1
+    b.ne 9f
+    mrs x0, hcr_el2
+    tbz x0, #45, 9f                 // NV2 armed on this CPU
+    mrs x0, spsr_el2
+    and x0, x0, #0xc
+    cmp x0, #4                      // trapped at EL1 (virtual EL2)
+    b.ne 9f
+    mrs x0, S3_5_C4_C0_0            // SPSR_EL12: the guest's requested PSTATE
+    tst x0, #0x10                   // AArch32 target: slow path
+    b.ne 9f
+    and x1, x0, #0xf
+    cbz x1, 2f                      // EL0t
+    cmp x1, #8                      // EL2t/EL2h: local return
+    b.lo 9f
+    cmp x1, #9
+    b.hi 9f
+    sub x0, x0, #4
+    b 3f
+2:  mrs x1, S3_4_C2_C2_0            // VNCR_EL2
+    ldr x1, [x1, #0x78]             // the guest's HCR_EL2
+    tbz x1, #27, 9f                 // TGE: its own userspace
+    tbz x1, #34, 9f                 // E2H
+3:  msr spsr_el2, x0
+    mrs x0, S3_5_C4_C0_1            // ELR_EL12
+    msr elr_el2, x0
+    ldp x0, x1, [sp], #16
+    eret
+9:  ldp x0, x1, [sp], #16
     sub sp, sp, #(SIZEOF_EXC_INFO - 32 * 8)
     str x30, [sp, #-16]!
     bl _exc_entry
