@@ -31,6 +31,15 @@ static void *adt;
 static bool g15_powered;
 static bool t8122_fuse_valid = true, t8122_fuse_use;
 static bool powered, fail_read, fail_release, fail_release_stuck;
+enum late_failure {
+    FAIL_NONE,
+    FAIL_OPPS,
+    FAIL_POWER_PROPS,
+    FAIL_CORE_LEAK,
+    FAIL_SRAM_LEAK,
+};
+static enum late_failure fail_late;
+static bool late_failure_seen;
 static unsigned enables, disables, reads;
 static u32 hw_id, hw_masks[3], hw_counts, hw_counts2;
 static const u64 sgx_base = 0x10000000, asc_base = 0x20000000;
@@ -111,13 +120,33 @@ static void calc_power_t8122_standin(u32 count, const struct perf_state *core, f
     for (u32 i = 0; i < count; i++)
         max_pwr[i] = 5000;
 }
+static u32 identity_prop(void *dt, const char *name);
+
+static int post_publish_result(void *dt, enum late_failure stage)
+{
+    if (fail_late != stage)
+        return 0;
+    assert(identity_prop(dt, "probe-result") == T8122_ID_PASS);
+    assert(!powered);
+    late_failure_seen = true;
+    return -1;
+}
+
 static int g15_set_opps(void *dt, u32 ph, u32 count, u32 tables, u32 clusters,
                         const struct perf_state *ps, const u32 *pwr)
 {
-    return 0;
+    return post_publish_result(dt, FAIL_OPPS);
 }
-static int g15_set_power_props(void *dt, const struct g15_power_values *pv) { return 0; }
-static int g15_set_float_array(void *dt, const char *name, float val, int count) { return 0; }
+static int g15_set_power_props(void *dt, const struct g15_power_values *pv)
+{
+    return post_publish_result(dt, FAIL_POWER_PROPS);
+}
+static int g15_set_float_array(void *dt, const char *name, float val, int count)
+{
+    enum late_failure stage = !strcmp(name, "apple,core-leak-coef") ? FAIL_CORE_LEAK :
+                                                                   FAIL_SRAM_LEAK;
+    return post_publish_result(dt, stage);
+}
 static int stub_read_leak(const struct g15_soc *soc, float *leak)
 {
     *leak = 100.0f;
@@ -147,6 +176,8 @@ static int calibrate_txn(void *dt, void *arg)
 static void reset_hw(void)
 {
     powered = fail_read = fail_release = fail_release_stuck = false;
+    fail_late = FAIL_NONE;
+    late_failure_seen = false;
     enables = disables = reads = 0;
     hw_id = 0x07022000;
     hw_masks[0] = 0x3ff;
@@ -239,6 +270,25 @@ int main(void)
         assert(identity_prop(dt, "id-counts-1") == hw_counts);
     }
 
+    /* Fail after PASS publication: the caller must discard the entire private DT. */
+    for (enum late_failure stage = FAIL_OPPS; stage <= FAIL_SRAM_LEAK; stage++) {
+        reset_hw();
+        fail_late = stage;
+        make_dt(dt, "1", true, false);
+        size = fdt_totalsize(dt);
+        memcpy(before, dt, size);
+        assert(t8122_fdt_transaction(dt, calibrate_txn, NULL));
+        assert(late_failure_seen);
+        expect_rollback(dt, before, size);
+        assert(fdt_path_offset(dt, "/chosen/asahi,t8122-gpu-powered-identity") ==
+               -FDT_ERR_NOTFOUND);
+        int gpu = fdt_path_offset(dt, "gpu");
+        assert(gpu >= 0);
+        const char *status = fdt_getprop(dt, gpu, "status", NULL);
+        assert(status && !strcmp(status, "disabled"));
+        assert(reads >= 5 && enables == 1 && disables == 1 && !powered);
+    }
+
     /* Failed read: rollback, power released, no PASS. */
     reset_hw();
     fail_read = true;
@@ -322,7 +372,7 @@ int main(void)
     expect_rollback(dt, before, size);
     assert(enables == 0 && !powered);
 
-    puts("gpu26 powered identity: genuine publish, rollback, bad fields, failed read and "
+    puts("gpu26 powered identity: genuine publish, late rollback, bad fields, failed read and "
          "power-release controls PASS");
     return 0;
 }
