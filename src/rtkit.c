@@ -881,7 +881,8 @@ static bool rtkit_switch_power_state(rtkit_dev_t *rtk, enum rtkit_power_state ta
      * about 0.55 s on the M2 and leaves the whole handshake as close as 0.77 s to a one second
      * limit. Allow it the same five seconds as an NVMe normal shutdown.
      */
-    u64 timeout = timeout_calculate(rtk->timeout_usec ? rtk->timeout_usec : RTKIT_IOP_POWER_TIMEOUT);
+    u64 timeout =
+        timeout_calculate(rtk->timeout_usec ? rtk->timeout_usec : RTKIT_IOP_POWER_TIMEOUT);
     while (rtk->iop_power != target) {
         if (timeout_expired(timeout)) {
             rtkit_printf("IOP power transition timed out\n");
