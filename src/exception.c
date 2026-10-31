@@ -7,6 +7,9 @@
 #include "gxf.h"
 #include "iodev.h"
 #include "memory.h"
+#include "monitor.h"
+#include "nv2.h"
+#include "psci.h"
 #include "uart.h"
 #include "utils.h"
 
@@ -23,6 +26,7 @@ volatile int exc_count = 0;
 
 void el0_ret(void);
 void el1_ret(void);
+void nv2_probe_ret(void);
 
 static char *m_table[0x10] = {
     [SPSR_M_EL0] = "EL0t",  //
@@ -263,6 +267,10 @@ void exc_sync(u64 *regs)
     u32 ec = (esr & ESR_EC) >> ESR_EC_SHIFT;
     u32 iss = esr & ESR_ISS;
 
+    /* An OS at virtual EL2 (FEAT_NV2), or the guest it runs. */
+    if (nv2_active && !in_gl && !el3 && nv2_handle_sync(regs))
+        return;
+
     // check brk instructions
     if (ec == ESR_EC_BRK && iss == 0 && elsp == SPSR_M_EL0) {
         // brk 0
@@ -301,6 +309,11 @@ void exc_sync(u64 *regs)
                 msr(SPSR_EL2, 0x09); // EL2h
                 msr(ELR_EL2, el1_ret);
                 return;
+            case 1:
+                /* End of an nv2_probe_call EL1 stub. */
+                msr(SPSR_EL2, 0x09); // EL2h
+                msr(ELR_EL2, nv2_probe_ret);
+                return;
             case 0x10 ... 0x1f:
                 if (!(exc_guard & GUARD_SILENT))
                     printf("EL1 Exception: 0x%x\n", imm);
@@ -325,6 +338,13 @@ void exc_sync(u64 *regs)
                 printf("Unknown SMC: 0x%x\n", imm);
                 break;
         }
+    } else if (monitor_active && ec == ESR_EC_SMC && in_el2() && !in_gl && elsp == SPSR_M_EL1H) {
+        /* An EL1 OS SMC trapped by HCR_EL2.TSC: a PSCI/SMCCC call. */
+        if (psci_handle_smc(regs)) {
+            elr += 4;
+            msr(ELR_EL1, elr);
+            return;
+        }
     } else {
         if (!(exc_guard & GUARD_SILENT))
             printf("Exception: SYNC\n");
@@ -332,6 +352,9 @@ void exc_sync(u64 *regs)
 
     sysop("isb");
     sysop("dsb sy");
+
+    if (nv2_active)
+        nv2_note_unhandled(esr, elr, spsr);
 
     if (!(exc_guard & GUARD_SILENT))
         print_regs(regs, el12);
@@ -379,6 +402,9 @@ void exc_sync(u64 *regs)
 
 void exc_irq(u64 *regs)
 {
+    if (nv2_handle_async(regs, 1))
+        return;
+
     u64 spsr = in_gl12() ? mrs(SYS_IMP_APL_SPSR_GL1) : mrs(SPSR_EL1);
     u32 reason = aic_ack();
 
@@ -397,6 +423,9 @@ void exc_irq(u64 *regs)
 
 void exc_fiq(u64 *regs)
 {
+    if (nv2_handle_async(regs, 2))
+        return;
+
     u64 spsr = in_gl12() ? mrs(SYS_IMP_APL_SPSR_GL1) : mrs(SPSR_EL1);
     printf("Exception: FIQ (from %s) cnt: %lx\n", get_exception_source(spsr), mrs(CNTPCT_EL0));
 
@@ -465,6 +494,9 @@ void exc_fiq(u64 *regs)
 
 void exc_serr(u64 *regs)
 {
+    if (nv2_handle_async(regs, 3))
+        return;
+
     if (!(exc_guard & GUARD_SILENT))
         printf("Exception: SError\n");
 

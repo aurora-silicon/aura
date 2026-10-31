@@ -5,6 +5,7 @@ static bool debug_enabled;
 static bool proxy_requested;
 static bool trial_running;
 static bool is_stage1;
+static bool nv2_option;
 
 static bool boot_space(char c)
 {
@@ -43,12 +44,19 @@ void boot_options_init(const char *line, size_t capacity)
     debug_enabled = boot_option_present(line, capacity, "aura-debug");
     proxy_requested = boot_option_present(line, capacity, "aura-proxy");
     trial_running = boot_option_present(line, capacity, "aura-trial");
+    nv2_option = boot_option_present(line, capacity, "aura-nv2");
     is_stage1 = true;
 }
 
 bool aura_debug_enabled(void)
 {
     return debug_enabled;
+}
+
+/* Run the OS at virtual EL2 under FEAT_NV2 so it can host VMs (opt-in). */
+bool aura_nv2_enabled(void)
+{
+    return nv2_option;
 }
 
 void boot_options_set_stage1(bool stage1)

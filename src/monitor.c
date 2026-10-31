@@ -6,6 +6,7 @@
 #include "exception.h"
 #include "malloc.h"
 #include "memory.h"
+#include "nv2.h"
 #include "smp.h"
 #include "soc.h"
 #include "string.h"
@@ -73,10 +74,12 @@ bool monitor_required(void)
  * up: it has no SVE, GCS, MTE, MPAM, AMU, SPE, TRBE or BRBE, and its PMU is
  * IMPDEF, which HACR_EL2 leaves to EL1.
  */
-void monitor_enter_os(u64 entry, u64 a0, u64 a1, u64 a2)
+void monitor_el2_setup(void)
 {
     /* No stage 2. IRQ, FIQ, SError and external aborts all go to EL1. */
     reg_clr(HCR_EL2, HCR_TGE | HCR_AMO | HCR_IMO | HCR_FMO | HCR_TEA | HCR_VM);
+    /* Trap SMC to the monitor for PSCI (Apple has no EL3). */
+    reg_set(HCR_EL2, HCR_TSC);
     msr(VTTBR_EL2, 0);
     msr(HACR_EL2, 0);
     msr(HSTR_EL2, 0);
@@ -123,5 +126,12 @@ void monitor_enter_os(u64 entry, u64 a0, u64 a1, u64 a2)
         msr(SYS_LORC_EL1, 0);
 
     sysop("isb");
+}
+
+void monitor_enter_os(u64 entry, u64 a0, u64 a1, u64 a2)
+{
+    if (nv2_active)
+        nv2_enter_os(entry, a0, a1, a2);
+    monitor_el2_setup();
     monitor_eret(entry, a0, a1, a2);
 }
