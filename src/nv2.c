@@ -120,6 +120,15 @@ bool nv2_active = false;
 /* HFGITR_EL2 TLBI VMALLE1OS/IS/VMALLE1: the only EL1 TLBIs whose target L1
  * cannot express without a stage-2 context; L1's own TLBIs stay native. */
 #define HFGITR_VMALLE1_ALL (BIT(18) | BIT(28) | BIT(42))
+/* Every EL1 TLBI (HFGITR bits 18-47). KVM emulating a guest hypervisor's
+ * TLBIs issues all of them under that guest's VMID with its TGE clear, so a
+ * CPU that has run a guest hypervisor traps them all from then on. */
+#define HFGITR_TLBI_EL1_ALL GENMASK(47, 18)
+#define HFGWTR_CPACR_EL1    BIT(12)
+
+/* CPTR_EL2 bits (E2H layout) a guest's trap control is made of. */
+#define CPTR_GUEST_MASK (CPTR_E2H_FPEN | CPTR_E2H_SMEN | (3UL << 16) | BIT(28) | BIT(30) | BIT(31))
+#define CPTR_TCPAC      BIT(31)
 
 /* Bits of L1's HCR_EL2 view a child may run with. NV/NV1/NV2/TGE/E2H are
  * the monitor's: a child never sees TGE, E2H is RAO, NV1 is never set. */
@@ -140,6 +149,9 @@ struct nv2_cpu {
     bool armed;
     /* L1's real EL2 trap controls, restored at every child exit */
     u64 l1_hfgrtr, l1_hfgwtr, l1_hfgitr, l1_hdfgrtr, l1_hdfgwtr, l1_hcrx, l1_cptr, l1_cnthctl;
+    /* Set once this CPU has run a guest hypervisor (see nv2_child_enter). */
+    bool nested_mode;
+    u64 vcptr; /* L1's CPTR_EL2 as written, all bits, in nested mode */
 
     /* EL2 registers that trap under NV2 and are held here for L1. */
     u64 cnthctl, mdcr, hacr, actlr, hpfar, sre, cntkctl12, spsr32[4];
@@ -151,7 +163,7 @@ struct nv2_cpu {
     u64 l1_tmr[4]; /* L1's real EL1 timers: P ctl, P cval, V ctl, V cval */
 
     /* counters, read by the proxy */
-    u64 n_eret, n_sysreg, n_entry, n_exit, n_irq, n_tlbi, n_at, n_unknown;
+    u64 n_eret, n_sysreg, n_entry, n_exit, n_irq, n_tlbi, n_at, n_unknown, n_tlbi_own;
 } ALIGNED(64);
 
 static struct nv2_cpu nv2_cpus[MAX_CPUS];
@@ -527,6 +539,20 @@ static bool nv2_child_enter(struct nv2_cpu *c, u64 spsr, u64 elr)
             return false;
         }
         nested_vncr = (res & GENMASK(47, 12)) | (va & 0xfff);
+        if (!c->nested_mode) {
+            /*
+             * From now on this CPU traps all of L1's EL1 TLBIs (KVM emulates
+             * a guest hypervisor's TLBIs under its VMID with TGE clear) and
+             * its CPACR_EL1 writes: L1 writes its CPTR_EL2 through CPACR_EL1,
+             * whose hardware drops TCPAC, the bit KVM uses (without
+             * FEAT_NV2p1) to trap a guest hypervisor's own CPACR accesses.
+             * This first entry's TCPAC is that rule; later ones are exact.
+             */
+            c->nested_mode = true;
+            c->l1_hfgitr = HFGITR_TLBI_EL1_ALL;
+            c->l1_hfgwtr |= HFGWTR_CPACR_EL1;
+            c->vcptr = mrs(SYS_CPACR_EL12) | CPTR_TCPAC;
+        }
     }
 
     nv2_bank_save(c->parent);
@@ -537,8 +563,7 @@ static bool nv2_child_enter(struct nv2_cpu *c, u64 spsr, u64 elr)
     msr(SYS_CNTKCTL_EL12, c->cntkctl12);
 
     /* L1's CPACR_EL1 is its VHE CPTR_EL2: it is the child's trap control. */
-    msr(SYS_CPTR_EL2, c->parent[V_CPACR / 8] & (CPTR_E2H_FPEN | CPTR_E2H_SMEN | (3UL << 16) |
-                                                BIT(28) | BIT(30) | BIT(31)));
+    msr(SYS_CPTR_EL2, (c->nested_mode ? c->vcptr : c->parent[V_CPACR / 8]) & CPTR_GUEST_MASK);
     msr(SYS_HFGITR_EL2, VN(c, V_HFGITR)); /* not L1's VMALLE1 traps */
 
     if (vm) {
@@ -690,26 +715,41 @@ static bool nv2_child_sync(struct nv2_cpu *c, u64 esr)
         __asm__ volatile("sys #4, c8, c" #crm ", #" #op2 ", %0" ::"r"(val) : "memory");            \
         return true;
 
-/* EL1-form TLBIs: L1's own (EL2&0 regime, run as EL1&0 with VMID 0), and the
- * VMALLE1 family that FGT traps. */
+/* EL1-form TLBIs: L1's own (EL2&0 regime, run as EL1&0 with VMID 0), and
+ * those FGT traps (all of them once a guest hypervisor ran). */
 static bool nv2_tlbi_el1(unsigned crm, unsigned op2, u64 val)
 {
     switch (crm * 8 + op2) {
         TLBI1(1, 0)
         TLBI1(1, 1)
+        TLBI1(1, 2)
+        TLBI1(1, 3)
         TLBI1(1, 5)
-        TLBI1(2, 1)
-        TLBI1(2, 5)
+        TLBI1(1, 7)
         TLBI1(3, 0)
         TLBI1(3, 1)
+        TLBI1(3, 2)
+        TLBI1(3, 3)
         TLBI1(3, 5)
-        TLBI1(5, 1)
-        TLBI1(5, 5)
-        TLBI1(6, 1)
-        TLBI1(6, 5)
+        TLBI1(3, 7)
         TLBI1(7, 0)
         TLBI1(7, 1)
+        TLBI1(7, 2)
+        TLBI1(7, 3)
         TLBI1(7, 5)
+        TLBI1(7, 7)
+        TLBI1(2, 1)
+        TLBI1(2, 3)
+        TLBI1(2, 5)
+        TLBI1(2, 7)
+        TLBI1(5, 1)
+        TLBI1(5, 3)
+        TLBI1(5, 5)
+        TLBI1(5, 7)
+        TLBI1(6, 1)
+        TLBI1(6, 3)
+        TLBI1(6, 5)
+        TLBI1(6, 7)
         default:
             return false;
     }
@@ -750,8 +790,10 @@ static bool nv2_tlbi(struct nv2_cpu *c, unsigned op1, unsigned crm, unsigned op2
     /* L1's own translations: the trapped VMALLE1 family with its TGE set, and
      * the *E2 forms, whose EL2&0 regime is the real EL1&0 one with VMID 0. */
     bool e2 = op1 == 4 && crm != 0 && crm != 4 && (op2 == 0 || op2 == 1 || op2 == 5);
-    if (e2 || (op1 == 0 && (VN(c, V_HCR) & HCR_TGE)))
+    if (e2 || (op1 == 0 && (VN(c, V_HCR) & HCR_TGE))) {
+        c->n_tlbi_own++;
         return nv2_tlbi_el1(crm, op2, val);
+    }
 
     /* A guest's VMID: run it under the guest's VTTBR. */
     u64 vttbr = mrs(VTTBR_EL2);
@@ -1018,11 +1060,14 @@ static bool nv2_sysreg_do(struct nv2_cpu *c, u64 *regs, u64 esr)
             else
                 msr(SYS_SCTLR_EL12, value);
             break;
+        case KEY(3, 0, 1, 0, 2): /* CPACR_EL1, write-trapped in nested mode */
         case KEY(3, 4, 1, 1, 2): /* CPTR_EL2 (E2H layout) */
-            if (read)
-                value = mrs(SYS_CPACR_EL12);
-            else
+            if (read) {
+                value = c->nested_mode ? c->vcptr : mrs(SYS_CPACR_EL12);
+            } else {
+                c->vcptr = value;
                 msr(SYS_CPACR_EL12, value);
+            }
             break;
         case KEY(3, 4, 1, 2, 6): {
             /* T8140 traps SMCR_EL12 at EL2 while CPACR_EL1 has SME off. */
@@ -1198,7 +1243,8 @@ static bool nv2_sysreg_do(struct nv2_cpu *c, u64 *regs, u64 esr)
 done:
     if (read && rt != 31)
         regs[rt] = value;
-    nv2_trace(NV2_T_SYSREG, esr, value, mrs(ELR_EL2), 0, 0, 0);
+    if (!(op0 == 1 && crn == 8 && op1 == 0 && (VN(c, V_HCR) & HCR_TGE)))
+        nv2_trace(NV2_T_SYSREG, esr, value, mrs(ELR_EL2), 0, 0, 0);
     sysop("isb");
     msr(ELR_EL2, mrs(ELR_EL2) + 4);
     return true;
