@@ -23,6 +23,8 @@ extern char _el1_vectors_start[0];
 
 volatile enum exc_guard_t exc_guard = GUARD_OFF;
 volatile int exc_count = 0;
+/* Syndrome of the last guarded exception, for proxy probes. */
+volatile u64 exc_last_esr, exc_last_afsr1;
 
 void el0_ret(void);
 void el1_ret(void);
@@ -363,6 +365,9 @@ void exc_sync(u64 *regs)
         u64 l2c_err_sts = mrs(SYS_IMP_APL_L2C_ERR_STS);
         msr(SYS_IMP_APL_L2C_ERR_STS, l2c_err_sts); // Clear the L2C_ERR flag bits
     }
+
+    exc_last_esr = esr;
+    exc_last_afsr1 = (in_gl || el3) ? 0 : mrs(SYS_AFSR1_EL1);
 
     switch (exc_guard & GUARD_TYPE_MASK) {
         case GUARD_SKIP:

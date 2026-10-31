@@ -41,6 +41,7 @@ static_assert((sizeof(struct exc_info) & 15) == 0, "SIZEOF_EXC_INFO must be a mu
 
 extern volatile enum exc_guard_t exc_guard;
 extern volatile int exc_count;
+extern volatile u64 exc_last_esr, exc_last_afsr1;
 
 void exception_initialize(void);
 void exception_shutdown(void);

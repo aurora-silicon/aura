@@ -78,6 +78,7 @@ bool nv2_active = false;
 #define V_WORDS      (0x500 / 8)
 
 #define A_AVNCR          0x008
+#define A_PMCR1          0x3c0 /* PMCR1_EL12: the guest's PMC filters */
 #define A_VM_TMR_FIQ_ENA 0x408
 
 #define VN(c, off) ((c)->vncr[(off) / 8])
@@ -116,6 +117,7 @@ bool nv2_active = false;
 #define SYS_ICH_AP0R0    sys_reg(3, 4, 12, 8, 0)
 #define SYS_ICH_AP1R0    sys_reg(3, 4, 12, 9, 0)
 #define SYS_VMTMR_FIQENA sys_reg(3, 5, 15, 1, 3)
+#define SYS_PMCR1_EL12   sys_reg(3, 1, 15, 7, 2)
 
 /* HFGITR_EL2 TLBI VMALLE1OS/IS/VMALLE1: the only EL1 TLBIs whose target L1
  * cannot express without a stage-2 context; L1's own TLBIs stay native. */
@@ -159,11 +161,12 @@ struct nv2_cpu {
     /* The child running on this CPU, if any. */
     bool child, vm, nested;
     u64 parent[NV2_BANK_WORDS]; /* L1's EL1 register file, VNCR layout */
-    u64 parent_sp1, parent_cntkctl, parent_vmtmr;
+    u64 parent_sp1, parent_cntkctl, parent_vmtmr, parent_pmcr1;
     u64 l1_tmr[4]; /* L1's real EL1 timers: P ctl, P cval, V ctl, V cval */
 
     /* counters, read by the proxy */
     u64 n_eret, n_sysreg, n_entry, n_exit, n_irq, n_tlbi, n_at, n_unknown, n_tlbi_own;
+    u64 last_unknown; /* key | read << 63 of the latest unemulated register */
 } ALIGNED(64);
 
 static struct nv2_cpu nv2_cpus[MAX_CPUS];
@@ -581,6 +584,11 @@ static bool nv2_child_enter(struct nv2_cpu *c, u64 spsr, u64 elr)
         msr(SYS_HCRX_EL2, VN(c, V_HCRX));
         nv2_timers_enter(c);
         nv2_gic_enter(c);
+        /* Apple banks PMCR1 by EL: L1 sets its guest's PMC filters through
+         * PMCR1_EL12, which lands in the AVNCR page; the hardware applies the
+         * EL1 copy, which holds L1's own filters while L1 runs. */
+        c->parent_pmcr1 = mrs(SYS_PMCR1_EL12);
+        msr(SYS_PMCR1_EL12, AV(c, A_PMCR1));
     }
 
     if (nested) {
@@ -639,6 +647,7 @@ static void nv2_child_exit(struct nv2_cpu *c, int kind, u64 esr)
         msr(HSTR_EL2, 0);
         msr(HACR_EL2, 0);
         msr(MDCR_EL2, 0);
+        msr(SYS_PMCR1_EL12, c->parent_pmcr1);
         msr(SYS_HFGRTR_EL2, c->l1_hfgrtr);
         msr(SYS_HFGWTR_EL2, c->l1_hfgwtr);
         msr(SYS_HDFGRTR_EL2, c->l1_hdfgrtr);
@@ -665,6 +674,11 @@ static void nv2_child_exit(struct nv2_cpu *c, int kind, u64 esr)
     if (!kind) {
         msr(SYS_ESR_EL12, esr);
         msr(SYS_FAR_EL12, far);
+        /* Apple's IMPDEF traps (EC 0x3f: the PMUv3 registers under
+         * HACR_EL2[56]) leave their sysreg ISS in AFSR1_EL2. L1's AFSR1_EL2
+         * is the EL1 register while it runs. */
+        if ((esr >> 26) == ESR_EC_IMPDEF)
+            msr(SYS_AFSR1_EL12, mrs(SYS_AFSR1_EL1));
     }
     msr(ELR_EL2, mrs(SYS_VBAR_EL12) + 0x400 + kind * 0x80);
     msr(SPSR_EL2, nv2_entry_pstate(spsr));
@@ -894,6 +908,7 @@ static void nv2_at(struct nv2_cpu *c, unsigned op, bool own, u64 va)
 static void nv2_note_unknown(struct nv2_cpu *c, u64 key, bool read)
 {
     c->n_unknown++;
+    c->last_unknown = key | ((u64)read << 63);
     nv2_trace(NV2_T_UNKNOWN, key, read, mrs(ELR_EL2), 0, 0, 0);
 }
 
