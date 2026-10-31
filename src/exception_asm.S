@@ -23,18 +23,11 @@ _v_sp0_sync:
      */
     stp x0, x1, [sp, #-16]!
     mrs x0, esr_el2
-    lsr x1, x0, #26
-    cmp x1, #0x1a
-    b.ne 9f
     mov x1, #0x6a000000             // plain ERET; ERETAx need the slow path
     cmp x0, x1
     b.ne 9f
-    mrs x0, hcr_el2
-    tbz x0, #45, 9f                 // NV2 armed on this CPU
-    mrs x0, spsr_el2
-    and x0, x0, #0xc
-    cmp x0, #4                      // trapped at EL1 (virtual EL2)
-    b.ne 9f
+    /* An ERET traps only at EL1 with HCR_EL2.NV, which the monitor sets
+     * only together with NV2: no need to look at HCR_EL2 or SPSR_EL2. */
     mrs x0, S3_5_C4_C0_0            // SPSR_EL12: the guest's requested PSTATE
     tst x0, #0x10                   // AArch32 target: slow path
     b.ne 9f
