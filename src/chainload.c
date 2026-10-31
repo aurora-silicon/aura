@@ -314,6 +314,9 @@ static void stage1_log_handoff(char **vars, size_t *var_cnt, size_t var_capacity
 int chainload_load(const char *spec, char **vars, size_t *var_cnt, size_t var_capacity)
 {
     static char adopt_var[] = "nvme.adopt=live-rtkit-v1";
+#if defined(DEBUGUSB_PROXY) && !defined(ESP_STAGE2)
+    static char host_window_var[] = "aura.host-window=done";
+#endif
     void *image;
     size_t size;
     int ret;
@@ -361,6 +364,11 @@ int chainload_load(const char *spec, char **vars, size_t *var_cnt, size_t var_ca
         }
         ret = rust_load_image(spec, &image, &size, NULL);
     }
+#ifdef DEBUGUSB_PROXY
+    /* The next aura stage skips its debugusb window when this one offered a window already. */
+    if (ret == 0 && stage1_window_offered() && *var_cnt < var_capacity)
+        vars[(*var_cnt)++] = host_window_var;
+#endif
     if (ret == 0)
         stage1_log_handoff(vars, var_cnt, var_capacity);
 #endif

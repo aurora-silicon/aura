@@ -11,6 +11,7 @@
 #include "chainload.h"
 #include "cpufreq.h"
 #include "display.h"
+#include "dockchannel_uart.h"
 #include "exception.h"
 #include "fb.h"
 #include "firmware.h"
@@ -89,13 +90,8 @@ static void stage1_run_host_proxy(void)
         uartproxy_run(NULL);
 }
 
-bool stage1_proxy_request_window(void)
+static bool stage1_wait_request_window(void)
 {
-    if (stage1_window_done || stage1_chained)
-        return false;
-    stage1_window_done = true;
-    printf("Stage 1: aura-proxy on the ESP, waiting %u s for a host\n",
-           STAGE1_PROXY_REQUEST_MS / 1000);
     stage1_window_result = uartproxy_wait_stage1(STAGE1_PROXY_REQUEST_MS);
     if (stage1_window_result == STAGE1_PROXY_CDC || stage1_window_result == STAGE1_PROXY_KIS) {
         stage1_run_host_proxy();
@@ -104,6 +100,38 @@ bool stage1_proxy_request_window(void)
     printf("Stage 1: proxy window ended\n");
     return false;
 }
+
+bool stage1_proxy_request_window(void)
+{
+    if (stage1_window_done || stage1_chained)
+        return false;
+    stage1_window_done = true;
+    printf("Stage 1: aura-proxy on the ESP, waiting %u s for a host\n",
+           STAGE1_PROXY_REQUEST_MS / 1000);
+    return stage1_wait_request_window();
+}
+
+#ifdef DEBUGUSB_PROXY
+bool stage1_window_offered(void)
+{
+    return stage1_window_done;
+}
+
+/*
+ * A boot started by a VDM `reboot debugusb` with a host reading the DockChannel console gets the
+ * aura-proxy window, once per chain: not after an earlier aura stage offered one.
+ */
+bool debugusb_proxy_window(void)
+{
+    if (stage1_window_done || stage1_chained || stage1_window_passed ||
+        !dockchannel_uart_host_seen())
+        return false;
+    stage1_window_done = true;
+    printf("aura: debugusb boot, opening proxy window\n");
+    printf("Stage 1: waiting %u s for a host\n", STAGE1_PROXY_REQUEST_MS / 1000);
+    return stage1_wait_request_window();
+}
+#endif
 
 void run_actions(void)
 {

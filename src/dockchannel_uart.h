@@ -19,4 +19,7 @@ size_t dockchannel_uart_read(void *buf, size_t count);
 void dockchannel_uart_puts(const char *s);
 int dockchannel_uart_printf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 
+/* DEBUGUSB_PROXY builds only. */
+bool dockchannel_uart_host_seen(void);
+
 #endif

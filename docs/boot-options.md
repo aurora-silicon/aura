@@ -20,6 +20,29 @@ The boot-argument tokens are matched exactly:
 The options may be combined. `aura-debug` alone does not request a proxy pause.
 Normal payload failure still follows the existing recovery fallback.
 
+## DebugUSB interception (development builds)
+
+A build made with `DEBUGUSB_PROXY=1` also opens the 15 second `aura-proxy`
+window when the boot was started by a VDM `macvdmtool reboot debugusb` and a
+host is reading the DockChannel console (kisd, for example). That gives a way
+back into a Mac whose Stage 2 or kernel hangs, without the ESP file or NVRAM.
+It logs `aura: debugusb boot, opening proxy window`.
+
+The signal is the DockChannel TX FIFO. Nothing on the SoC drains it: without a
+reader on the dock side it only fills, so its free space plus every byte this
+stage has written stays at the free space it had when the stage started. A
+debugusb host reads the console out, which breaks that sum by the size of the
+log. A byte waiting on the RX side (a catcher sending NOPs) counts as well. The
+check is two register reads, so a normal boot does not wait for it. A Mac
+without a DockChannel UART never sees it.
+
+The window opens after the payload scan and before NVMe is touched, in Stage 1
+and in a Stage 2 built with the flag. It runs once per chain: a Stage 1 that
+offered any window passes `aura.host-window=done` to the next stage, and a
+Stage 2 started with a live ANS session from Stage 1 skips it too. A debugusb
+boot with a reader attached therefore takes 15 seconds longer when no host
+claims the window. Without the flag nothing changes.
+
 ## Common build profiles
 
 Stage 1: `make RELEASE=1 CHAINLOADING=1 BUILTIN_LOGO=aurora`.

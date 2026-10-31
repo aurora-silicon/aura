@@ -107,6 +107,12 @@ endif
 CFG += ESP_STAGE2
 endif
 
+# Development builds only: a boot started by a VDM `reboot debugusb` with a host reading the
+# DockChannel console opens the same 15 s proxy window as an aura-proxy request.
+ifeq ($(DEBUGUSB_PROXY),1)
+CFG += DEBUGUSB_PROXY
+endif
+
 
 LDFLAGS := -EL -maarch64elf --no-undefined -X -Bsymbolic \
 	-z notext --no-apply-dynamic-relocs --orphan-handling=warn \

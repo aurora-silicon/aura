@@ -15,6 +15,12 @@ u32 stage1_config_window_ms(void);
 bool stage1_proxy_request_window(void);
 /* True when an earlier aura stage started this one (it handed its NVMe session over). */
 extern bool stage1_chained;
+#ifdef DEBUGUSB_PROXY
+/* An earlier aura stage offered a proxy window on this boot (aura.host-window=done). */
+extern bool stage1_window_passed;
+bool stage1_window_offered(void);
+bool debugusb_proxy_window(void);
+#endif
 const char *stage1_config_target(void);
 const char *stage1_config_esp_uuid(void);
 

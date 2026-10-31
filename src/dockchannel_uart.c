@@ -2,11 +2,18 @@
 
 #include <stdarg.h>
 
+#include "../build/build_cfg.h"
+
+#include "dockchannel_uart.h"
 #include "adt.h"
 #include "iodev.h"
 #include "types.h"
 #include "utils.h"
 #include "vsprintf.h"
+
+#ifdef DEBUGUSB_PROXY
+#include "stage1_proxy.h"
+#endif
 
 #define DATA_TX8      0x4004
 #define DATA_TX_FREE  0x4014
@@ -14,6 +21,16 @@
 #define DATA_RX_COUNT 0x402c
 
 static u64 uart_base = 0;
+
+#ifdef DEBUGUSB_PROXY
+/* TX FIFO accounting for dockchannel_uart_host_seen(). */
+static u32 tx_free_mask = ~0u;
+static u32 tx_free_at_init;
+static u64 tx_accepted;
+#define TX_ACCEPTED(n) (tx_accepted += (n))
+#else
+#define TX_ACCEPTED(n) ((void)0)
+#endif
 
 #ifndef DOCKCHANNEL_UART_CHANNEL
 #define DOCKCHANNEL_UART_CHANNEL 1
@@ -23,7 +40,8 @@ int dockchannel_uart_init(void)
 {
     int path[8];
 
-    if (adt_path_offset_trace(adt, "/arm-io/dockchannel-uart", path) < 0)
+    int node = adt_path_offset_trace(adt, "/arm-io/dockchannel-uart", path);
+    if (node < 0)
         return -1;
 
     if (adt_get_reg(adt, path, "reg", 0, &uart_base, NULL)) {
@@ -37,6 +55,13 @@ int dockchannel_uart_init(void)
     if (chosen >= 0 && ADT_GETPROP(adt, chosen, "chip-id", &chip) >= 0 && chip == T8140)
         channel = 0;
     uart_base += channel * 0x10000;
+
+#ifdef DEBUGUSB_PROXY
+    u32 mask;
+    if (ADT_GETPROP(adt, node, "dock-wstat-mask", &mask) >= 0 && mask)
+        tx_free_mask = mask;
+    tx_free_at_init = read32(uart_base + DATA_TX_FREE) & tx_free_mask;
+#endif
 
     printf("Initialized dockchannel UART channel %d at 0x%lx\n", channel, uart_base);
 
@@ -60,6 +85,7 @@ void dockchannel_uart_putbyte(u8 c)
     }
 
     write32(uart_base + DATA_TX8, c);
+    TX_ACCEPTED(1);
 }
 
 u8 dockchannel_uart_getbyte(void)
@@ -174,6 +200,7 @@ static ssize_t dockchannel_uart_iodev_write_nonblocking(void *opaque, const void
     const u8 *p = buf;
     for (size_t i = 0; i < count; i++)
         write32(uart_base + DATA_TX8, p[i]);
+    TX_ACCEPTED(count);
 
     return count;
 }
@@ -188,6 +215,7 @@ static ssize_t dockchannel_uart_iodev_write_atomic(void *opaque, const void *buf
     const u8 *p = buf;
     for (size_t i = 0; i < len; i++)
         write32(uart_base + DATA_TX8, p[i]);
+    TX_ACCEPTED(len);
 
     return len;
 }
@@ -206,3 +234,19 @@ struct iodev iodev_dockchannel_uart = {
     .usage = USAGE_CONSOLE | USAGE_UARTPROXY,
     .lock = SPINLOCK_INIT,
 };
+
+#ifdef DEBUGUSB_PROXY
+/*
+ * True when a host has read this channel since this stage started, which needs a debugusb link
+ * (a VDM `reboot debugusb`) and a reader such as kisd. Two register reads: no wait on a normal
+ * boot.
+ */
+bool dockchannel_uart_host_seen(void)
+{
+    if (!uart_base)
+        return false;
+    return stage1_proxy_dockchannel_host(tx_free_at_init, tx_accepted,
+                                         read32(uart_base + DATA_TX_FREE) & tx_free_mask,
+                                         read32(uart_base + DATA_RX_COUNT));
+}
+#endif

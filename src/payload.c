@@ -65,6 +65,9 @@ static char stage1_esp_chosen[96];
 static void *load_one_payload(void *start, size_t size);
 
 bool stage1_chained;
+#ifdef DEBUGUSB_PROXY
+bool stage1_window_passed;
+#endif
 
 /* Length of the "aura_<tag>" (or legacy "m1n1_<tag>") record header at p, or 0. */
 static size_t payload_record(const u8 *p, const u8 *tag, size_t tag_len)
@@ -288,6 +291,10 @@ static bool check_var(u8 **p)
             /* Started by an earlier aura stage, which has had its host window already. */
             stage1_chained = true;
         }
+#ifdef DEBUGUSB_PROXY
+    } else if (IS_VAR("aura.host-window=")) {
+        stage1_window_passed = true;
+#endif
     } else if (IS_VAR("display=")) {
         display_configure(val);
     } else if (IS_VAR("display2=")) {
@@ -453,6 +460,12 @@ int payload_run(void)
         }
         stage1_config_applied = true;
     }
+#endif
+
+#ifdef DEBUGUSB_PROXY
+    /* Before NVMe is touched: a host that takes the window finds it as the firmware left it. */
+    if (debugusb_proxy_window())
+        return next_stage.entry ? 0 : -1;
 #endif
 
     if (chainload_spec && boot_spec) {
