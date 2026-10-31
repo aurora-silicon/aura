@@ -131,7 +131,13 @@ _exc_return:
     ldp x14, x15, [sp], #16
     ldp x16, x17, [sp], #16
     ldr x18, [sp], #8
-    add sp, sp, #88
+    /* Reload x19-x29 too: a handler may emulate a load into any of them. */
+    ldr x19, [sp], #8
+    ldp x20, x21, [sp], #16
+    ldp x22, x23, [sp], #16
+    ldp x24, x25, [sp], #16
+    ldp x26, x27, [sp], #16
+    ldp x28, x29, [sp], #16
     ldr x30, [sp], #16
 
     add sp, sp, #(SIZEOF_EXC_INFO - 32 * 8)

@@ -135,6 +135,7 @@ bool nv2_active = false;
 
 struct nv2_cpu {
     u64 *vncr, *avncr; /* L1's pages */
+    u64 *scratch;      /* AVNCR for a nested hypervisor guest L1 gave none */
     u64 hcr;           /* real HCR_EL2 while L1 runs */
     bool armed;
     /* L1's real EL2 trap controls, restored at every child exit */
@@ -144,7 +145,7 @@ struct nv2_cpu {
     u64 cnthctl, mdcr, hacr, actlr, hpfar, sre, cntkctl12, spsr32[4];
 
     /* The child running on this CPU, if any. */
-    bool child, vm;
+    bool child, vm, nested;
     u64 parent[NV2_BANK_WORDS]; /* L1's EL1 register file, VNCR layout */
     u64 parent_sp1, parent_cntkctl, parent_vmtmr;
     u64 l1_tmr[4]; /* L1's real EL1 timers: P ctl, P cval, V ctl, V cval */
@@ -189,6 +190,12 @@ static void nv2_trace(u64 type, u64 a, u64 b, u64 c, u64 d, u64 e, u64 f)
     r->f = f;
     sysop("dmb ish");
     t->head++;
+#ifdef NV2_TRACE_PRINT
+    /* Early boot only: the monitor may print until the OS owns the console. */
+    if (t->head <= 300)
+        printf("NV2[%d] %lu t%lu %lx %lx %lx %lx %lx %lx\n", smp_id(), t->head, type, a, b, c, d, e,
+               f);
+#endif
 }
 
 void nv2_trace_region(u64 *base, u64 *size)
@@ -215,6 +222,7 @@ enum {
     NV2_T_INJECT,
     NV2_T_FAIL,
     NV2_T_KICK,
+    NV2_T_GIC,
 };
 static u8 *nv2_pages[MAX_CPUS];
 
@@ -275,8 +283,6 @@ void nv2_prepare(void)
     OP(SYS_FAR_EL12, V_FAR)                                                                        \
     OP(SYS_ELR_EL12, V_ELR)                                                                        \
     OP(SYS_VBAR_EL12, V_VBAR)
-
-static bool nv2_has_sme;
 
 static void nv2_bank_save(u64 *b)
 {
@@ -430,6 +436,9 @@ static void nv2_gic_enter(struct nv2_cpu *c)
 
 static void nv2_gic_exit(struct nv2_cpu *c)
 {
+    nv2_trace(NV2_T_GIC, mrs(sys_reg(3, 4, 12, 11, 2)),
+              mrs(sys_reg(3, 4, 12, 11, 3)) | (mrs(sys_reg(3, 4, 12, 11, 5)) << 32),
+              mrs(SYS_ICH_VMCR), mrs(SYS_ICH_HCR), nv2_ich_lr_read(0), mrs(SYS_VMTMR_FIQENA));
     VN(c, V_ICH_HCR) = mrs(SYS_ICH_HCR);
     msr(SYS_ICH_HCR, 0);
     for (int i = 0; i < nv2_ich_lrs; i++)
@@ -494,9 +503,30 @@ static bool nv2_child_enter(struct nv2_cpu *c, u64 spsr, u64 elr)
     u64 vhcr = VN(c, V_HCR);
     bool vm = vhcr & HCR_VM;
 
-    if (vhcr & (HCR_NV | HCR_NV1 | HCR_NV2)) {
-        nv2_trace(NV2_T_FAIL, 0x1a, spsr, elr, vhcr, 1, 0); /* nested NV guest: not yet */
-        return false;
+    /*
+     * A guest hypervisor (recursion): L1 runs it with NV|NV2 and its own VNCR
+     * page, named by an L1 virtual address. Translate that while L1's stage
+     * 1 is live; with no stage 2 for L1 the result is the PA the hardware
+     * redirects to. NV1 is never set (VHE only), and Linux's KVM does not
+     * know AVNCR, so the guest's Apple EL2 registers go to a scratch page.
+     */
+    u64 nested_vncr = 0;
+    bool nested = vhcr & (HCR_NV | HCR_NV1 | HCR_NV2);
+    if (nested) {
+        if ((vhcr & (HCR_NV | HCR_NV1 | HCR_NV2)) != (HCR_NV | HCR_NV2) || !vm) {
+            nv2_trace(NV2_T_FAIL, 0x1a, spsr, elr, vhcr, 1, 0);
+            return false;
+        }
+        u64 va = VN(c, V_VNCR), par = mrs(PAR_EL1);
+        __asm__ volatile("at s1e1w, %0" ::"r"(va) : "memory");
+        sysop("isb");
+        u64 res = mrs(PAR_EL1);
+        msr(PAR_EL1, par);
+        if ((res & 1) || (va & 0xfff)) {
+            nv2_trace(NV2_T_FAIL, 0x1a, spsr, va, res, 8, 0);
+            return false;
+        }
+        nested_vncr = (res & GENMASK(47, 12)) | (va & 0xfff);
     }
 
     nv2_bank_save(c->parent);
@@ -528,7 +558,12 @@ static bool nv2_child_enter(struct nv2_cpu *c, u64 spsr, u64 elr)
         nv2_gic_enter(c);
     }
 
-    msr(HCR_EL2, nv2_child_hcr(vhcr));
+    if (nested) {
+        msr(VNCR_EL2, nested_vncr);
+        msr(AVNCR_EL2, (u64)c->scratch);
+    }
+    msr(HCR_EL2, nv2_child_hcr(vhcr) | (nested ? HCR_NV | HCR_NV2 : 0));
+    c->nested = nested;
     msr(SPSR_EL2, spsr);
     msr(ELR_EL2, elr);
     sysop("isb");
@@ -586,6 +621,11 @@ static void nv2_child_exit(struct nv2_cpu *c, int kind, u64 esr)
         msr(SYS_HCRX_EL2, c->l1_hcrx);
     }
 
+    if (c->nested) {
+        msr(VNCR_EL2, (u64)c->vncr);
+        msr(AVNCR_EL2, (u64)c->avncr);
+        c->nested = false;
+    }
     nv2_bank_save(c->vncr);
     VN(c, V_SP_EL1) = mrs(SP_EL1);
     c->cntkctl12 = mrs(SYS_CNTKCTL_EL12);
@@ -815,6 +855,97 @@ static void nv2_note_unknown(struct nv2_cpu *c, u64 key, bool read)
     nv2_trace(NV2_T_UNKNOWN, key, read, mrs(ELR_EL2), 0, 0, 0);
 }
 
+/*
+ * Group 3 ID registers under HCR.TID3: the hardware's values, except that
+ * ID_AA64MMFR4_EL1 tells L1 the truth about what it runs on here: VHE only
+ * (E2H0 = NI_NV1, so it never asks for NV1) and FEAT_NV2 without FEAT_NV
+ * (NV_frac = NV2_ONLY). Linux reads these at boot and CPU bring-up only.
+ */
+#define IDR(crm, op2)                                                                              \
+    case (crm) * 8 + (op2):                                                                        \
+        return mrs(sys_reg(3, 0, 0, crm, op2));
+
+static u64 nv2_idreg_hw(unsigned crm, unsigned op2)
+{
+    switch (crm * 8 + op2) {
+        IDR(1, 0)
+        IDR(1, 1)
+        IDR(1, 2)
+        IDR(1, 3)
+        IDR(1, 4)
+        IDR(1, 5)
+        IDR(1, 6)
+        IDR(1, 7)
+        IDR(2, 0)
+        IDR(2, 1)
+        IDR(2, 2)
+        IDR(2, 3)
+        IDR(2, 4)
+        IDR(2, 5)
+        IDR(2, 6)
+        IDR(2, 7)
+        IDR(3, 0)
+        IDR(3, 1)
+        IDR(3, 2)
+        IDR(3, 3)
+        IDR(3, 4)
+        IDR(3, 5)
+        IDR(3, 6)
+        IDR(3, 7)
+        IDR(4, 0)
+        IDR(4, 1)
+        IDR(4, 2)
+        IDR(4, 3)
+        IDR(4, 4)
+        IDR(4, 5)
+        IDR(4, 6)
+        IDR(4, 7)
+        IDR(5, 0)
+        IDR(5, 1)
+        IDR(5, 2)
+        IDR(5, 3)
+        IDR(5, 4)
+        IDR(5, 5)
+        IDR(5, 6)
+        IDR(5, 7)
+        IDR(6, 0)
+        IDR(6, 1)
+        IDR(6, 2)
+        IDR(6, 3)
+        IDR(6, 4)
+        IDR(6, 5)
+        IDR(6, 6)
+        IDR(6, 7)
+        IDR(7, 0)
+        IDR(7, 1)
+        IDR(7, 2)
+        IDR(7, 3)
+        IDR(7, 4)
+        IDR(7, 5)
+        IDR(7, 6)
+        IDR(7, 7)
+        default:
+            return 0;
+    }
+}
+#undef IDR
+
+#define MMFR4_NV_FRAC GENMASK(23, 20)
+#define MMFR4_E2H0    GENMASK(27, 24)
+
+static u64 nv2_idreg(unsigned crm, unsigned op2)
+{
+    u64 v = nv2_idreg_hw(crm, op2);
+#ifdef NV2_MMFR4_PASSTHRU
+    if (0)
+#else
+    if (crm == 7 && op2 == 4) /* ID_AA64MMFR4_EL1 */
+#endif
+        v = (v & ~(MMFR4_NV_FRAC | MMFR4_E2H0)) | FIELD_PREP(MMFR4_E2H0, 0xe) |
+            FIELD_PREP(MMFR4_NV_FRAC, 1);
+    return v;
+}
+
 /* The child's timer TVAL views, on its timer in the VNCR page. */
 static u64 nv2_tval(struct nv2_cpu *c, bool virt, bool read, u64 value)
 {
@@ -869,6 +1000,13 @@ static bool nv2_sysreg_do(struct nv2_cpu *c, u64 *regs, u64 esr)
         } else {
             return false;
         }
+        goto done;
+    }
+
+    if (op0 == 3 && op1 == 0 && crn == 0 && crm >= 1 && crm <= 7) {
+        if (!read)
+            return false;
+        value = nv2_idreg(crm, op2);
         goto done;
     }
 
@@ -1134,9 +1272,18 @@ bool nv2_handle_sync(u64 *regs)
 
     /* From L1. Its userspace (EL0) runs with real TGE clear and reaches EL2
      * only through traps L1 itself never asked for. */
-    if ((mrs(SPSR_EL2) & 0xc) != 0x4) {
-        nv2_trace(NV2_T_FAIL, ec, esr, mrs(ELR_EL2), mrs(SPSR_EL2), 6, 0);
-        return false;
+    if ((mrs(SPSR_EL2) & 0xc) == 0x0) {
+        /* From L1's userspace: what L1 would have taken at its EL1 with
+         * its TGE set (e.g. an ID register read under TID3). */
+        u64 elr = mrs(ELR_EL2), spsr = mrs(SPSR_EL2);
+        nv2_trace(NV2_T_INJECT, esr, elr, spsr, 1, 0, 0);
+        msr(SYS_ELR_EL12, elr);
+        msr(SYS_SPSR_EL12, spsr);
+        msr(SYS_ESR_EL12, esr);
+        msr(SYS_FAR_EL12, mrs(FAR_EL2));
+        msr(ELR_EL2, mrs(SYS_VBAR_EL12) + 0x400);
+        msr(SPSR_EL2, nv2_entry_pstate(spsr));
+        return true;
     }
 
     switch (ec) {
@@ -1195,7 +1342,6 @@ static void nv2_cpu_arm(struct nv2_cpu *c, u64 vncr, u64 avncr, u64 hcr)
     c->l1_hcrx = mrs(SYS_HCRX_EL2);
     c->l1_cptr = mrs(SYS_CPTR_EL2);
     c->l1_cnthctl = mrs(CNTHCTL_EL2);
-    nv2_has_sme = FIELD_GET(ID_AA64PFR1_SME, mrs(SYS_ID_AA64PFR1_EL1));
     nv2_ich_lrs = (mrs(SYS_ICH_VTR) & 0x1f) + 1;
     c->armed = true;
 }
@@ -1203,6 +1349,7 @@ static void nv2_cpu_arm(struct nv2_cpu *c, u64 vncr, u64 avncr, u64 hcr)
 __attribute__((used, retain)) u64 nv2_probe_arm(u64 vncr, u64 avncr, u64 hcr)
 {
     nv2_cpu_arm(nv2_this(), vncr, avncr, hcr);
+    nv2_this()->scratch = (u64 *)(avncr + SZ_4K);
     msr(SYS_HFGITR_EL2, HFGITR_VMALLE1_ALL);
     nv2_active = true;
     return (u64)nv2_this();
@@ -1234,8 +1381,10 @@ void nv2_enter_os(u64 entry, u64 a0, u64 a1, u64 a2)
     memset(nv2_pages[cpu], 0, SZ_16K);
     ((u64 *)vncr)[V_HCR / 8] = HCR_RW | HCR_E2H;
 
-    u64 hcr = (mrs(HCR_EL2) & ~(HCR_TGE | HCR_NV1 | HCR_TTLB)) | HCR_NV | HCR_NV2 | HCR_AT;
+    u64 hcr =
+        (mrs(HCR_EL2) & ~(HCR_TGE | HCR_NV1 | HCR_TTLB)) | HCR_NV | HCR_NV2 | HCR_AT | HCR_TID3;
     nv2_cpu_arm(&nv2_cpus[cpu], vncr, avncr, hcr);
+    nv2_cpus[cpu].scratch = (u64 *)(vncr + 2 * SZ_4K);
 
     msr(VNCR_EL2, vncr);
     msr(AVNCR_EL2, avncr);
