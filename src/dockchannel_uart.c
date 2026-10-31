@@ -1,8 +1,8 @@
 /* SPDX-License-Identifier: MIT AND GPL-2.0-only */
 
-#include <stdarg.h>
-
 #include "../build/build_cfg.h"
+
+#include <stdarg.h>
 
 #include "dockchannel_uart.h"
 #include "adt.h"
