@@ -2952,12 +2952,12 @@ static int dt_set_gpu_t8122(void *dt)
 
 /* G17 SoCs whose firmware iBoot loads and whose UAT it sets up for a raw boot object */
 struct g17_soc {
-    const char *compat;     /* Linux compatible */
-    const char *adt_compat; /* the ADT's own compatible, also accepted */
-    const char *name;       /* for the log */
-    u32 count;              /* perf-state-count, also the number of OPP entries */
-    u32 num_states;         /* gpu-num-perf-states */
-    bool firmware_data;     /* also hand over gfx-data/gfx1-data (the firmware __DATA) */
+    const char *compat;           /* Linux compatible */
+    const char *adt_compat;       /* the ADT's own compatible, also accepted */
+    const char *name;             /* for the log */
+    u32 count;                    /* perf-state-count, also the number of OPP entries */
+    u32 num_states;               /* gpu-num-perf-states */
+    bool firmware_data;           /* also hand over gfx-data/gfx1-data (the firmware __DATA) */
     bool (*firmware_known)(void); /* when true, /chosen gets firmware_profile_prop */
     const char *firmware_profile_prop;
     const char *firmware_profile;
@@ -3071,8 +3071,9 @@ static int dt_set_gpu_g17(void *dt, const struct g17_soc *soc)
     int opp, opp_count = 0;
     fdt_for_each_subnode(opp, dt, table)
     {
-        if ((u32)++opp_count > soc->count || !fdt_getprop(dt, opp, "opp-hz", &ph_len) || ph_len != sizeof(u64) ||
-            !fdt_getprop(dt, opp, "opp-microvolt", &ph_len) || ph_len != sizeof(u32))
+        if ((u32)++opp_count > soc->count || !fdt_getprop(dt, opp, "opp-hz", &ph_len) ||
+            ph_len != sizeof(u64) || !fdt_getprop(dt, opp, "opp-microvolt", &ph_len) ||
+            ph_len != sizeof(u32))
             goto disable;
     }
     if ((u32)opp_count != soc->count)
@@ -3123,8 +3124,8 @@ static int dt_set_gpu_g17(void *dt, const struct g17_soc *soc)
         int chosen = fdt_path_offset(dt, "/chosen");
         if (!soc->firmware_known())
             printf("FDT: GPU: unknown %s firmware build, Linux will not start it\n", soc->name);
-        else if (chosen < 0 || fdt_setprop_string(dt, chosen, soc->firmware_profile_prop,
-                                                  soc->firmware_profile))
+        else if (chosen < 0 ||
+                 fdt_setprop_string(dt, chosen, soc->firmware_profile_prop, soc->firmware_profile))
             goto disable;
     }
     return 0;
