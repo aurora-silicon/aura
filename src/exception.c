@@ -8,6 +8,7 @@
 #include "iodev.h"
 #include "memory.h"
 #include "monitor.h"
+#include "nv2.h"
 #include "psci.h"
 #include "uart.h"
 #include "utils.h"
@@ -334,6 +335,10 @@ void exc_sync(u64 *regs)
             msr(ELR_EL1, elr);
             return;
         }
+    } else if (nv2_active && in_el2() && !in_gl && (ec == 0x1a || ec == 0x18)) {
+        /* ERET or EL2-register trap from a virtual-EL2 guest (FEAT_NV2). */
+        if (nv2_handle_sync(regs, ec))
+            return;
     } else {
         if (!(exc_guard & GUARD_SILENT))
             printf("Exception: SYNC\n");

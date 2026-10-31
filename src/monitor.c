@@ -73,7 +73,7 @@ bool monitor_required(void)
  * up: it has no SVE, GCS, MTE, MPAM, AMU, SPE, TRBE or BRBE, and its PMU is
  * IMPDEF, which HACR_EL2 leaves to EL1.
  */
-void monitor_enter_os(u64 entry, u64 a0, u64 a1, u64 a2)
+void monitor_el2_setup(void)
 {
     /* No stage 2. IRQ, FIQ, SError and external aborts all go to EL1. */
     reg_clr(HCR_EL2, HCR_TGE | HCR_AMO | HCR_IMO | HCR_FMO | HCR_TEA | HCR_VM);
@@ -125,5 +125,10 @@ void monitor_enter_os(u64 entry, u64 a0, u64 a1, u64 a2)
         msr(SYS_LORC_EL1, 0);
 
     sysop("isb");
+}
+
+void monitor_enter_os(u64 entry, u64 a0, u64 a1, u64 a2)
+{
+    monitor_el2_setup();
     monitor_eret(entry, a0, a1, a2);
 }
