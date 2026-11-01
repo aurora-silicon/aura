@@ -54,8 +54,25 @@ u64 dt_get_address(void *dt, int node)
         parent = fdt_parent_offset(dt, parent);
     }
 
-    if (parent < 0)
-        return 0;
+    if (parent < 0) {
+        /* A direct root child already uses the root's physical address
+         * space. Flat native board trees need no artificial bus/ranges.
+         * Keep the existing rejection for untranslated non-root buses.
+         */
+        int len, addr_cells, size_cells;
+        const fdt32_t *reg;
+        if (fdt_parent_offset(dt, node) != 0)
+            return 0;
+        addr_cells = fdt_address_cells(dt, 0);
+        size_cells = fdt_size_cells(dt, 0);
+        if (addr_cells < 1 || addr_cells > 2 || size_cells < 0 || size_cells > 2)
+            return 0;
+        reg = fdt_getprop(dt, node, "reg", &len);
+        int entry_size = (addr_cells + size_cells) * sizeof(*reg);
+        if (!reg || len < entry_size || len % entry_size)
+            return 0;
+        return addr_cells == 2 ? fdt64_ld((const fdt64_t *)reg) : fdt32_ld(reg);
+    }
 
     // parse ranges for address translation
     struct dt_ranges_tbl ranges[DT_MAX_RANGES] = {0};
