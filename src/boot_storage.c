@@ -4,6 +4,7 @@
 
 #include "boot_storage.h"
 #include "adt.h"
+#include "boot_options.h"
 #include "heapblock.h"
 #include "kboot.h"
 #include "malloc.h"
@@ -20,7 +21,9 @@
 #define IMAGE_ALIGN   (2 * SZ_1M)
 
 #ifdef CHAINLOADING
-int rust_load_image(const char *spec, void **image, size_t *size, bool *proxy_request);
+int rust_load_image(const char *spec, void **image, size_t *size, bool *proxy_request, char *trial,
+                    size_t trial_capacity);
+int rust_take_boot_trial(const char *uuid, char *buf, size_t capacity);
 void rust_free_image(void *image, size_t size);
 
 static int boot_image_header(const void *data, size_t file_size, u64 *text_offset, u64 *image_size)
@@ -113,6 +116,94 @@ static int boot_check_dtb(const void *data, size_t size)
 }
 #endif
 
+#ifdef CHAINLOADING
+/*
+ * Load and check <kernel>;<dtb>;<initramfs> (names[0..2], the initramfs "-" for none) from the
+ * partition uuid; on success the kernel is prepared and *kernel and *fdt are set.
+ */
+static int boot_storage_files(const char *uuid, char *const names[3], struct kernel_header **kernel,
+                              void **fdt)
+{
+    bool have_initrd = strcmp(names[2], "-") != 0;
+    size_t cap = strlen(uuid) + 2 * BOOT_SPEC_MAX + 2;
+    char *file_spec = malloc(cap);
+    void *files[3] = {0};
+    size_t sizes[3] = {0};
+    int ret = -1;
+
+    if (!file_spec)
+        return -1;
+    for (size_t i = 0; i < (have_initrd ? 3 : 2); i++) {
+        int len = snprintf(file_spec, cap, "%s;%s", uuid, names[i]);
+        if (len < 0 || (size_t)len >= cap ||
+            rust_load_image(file_spec, &files[i], &sizes[i], NULL, NULL, 0) || !files[i] ||
+            !sizes[i])
+            goto out;
+    }
+
+    if (boot_check_dtb(files[1], sizes[1]))
+        goto out;
+    if (have_initrd &&
+        !((sizes[2] >= 18 && ((u8 *)files[2])[0] == 0x1f && ((u8 *)files[2])[1] == 0x8b) ||
+          (sizes[2] >= 6 && (!memcmp(files[2], "070701", 6) || !memcmp(files[2], "070702", 6)))))
+        goto out;
+
+    struct kernel_header *prepared = boot_prepare_image(files[0], sizes[0]);
+    if (!prepared)
+        goto out;
+    kboot_set_initrd(files[2], sizes[2]);
+    *kernel = prepared;
+    *fdt = files[1];
+    files[1] = files[2] = NULL;
+    printf("boot: ESP image and DTB validated%s\n",
+           have_initrd ? " with initramfs" : " without initramfs");
+    ret = 0;
+
+out:
+    for (size_t i = 0; i < 3; i++)
+        rust_free_image(files[i], sizes[i]);
+    free(file_spec);
+    return ret;
+}
+
+/*
+ * aura-try for boot=: an armed marker at the ESP root naming "<kernel>;<dtb>;<initramfs>" boots
+ * those files once instead of the configured ones (trial.rs). The marker is spent before they
+ * are read, so if the trial never comes up, the next boot takes the configured files again.
+ * Linux finds the line in chosen/aurora,trial.
+ */
+static bool boot_storage_trial(const char *uuid, struct kernel_header **kernel, void **fdt)
+{
+    if (aura_trial_enabled())
+        return false;
+    /* The line as taken, then a copy split into its three names. */
+    char *trial = malloc(2 * (BOOT_SPEC_MAX + 1));
+    char *names[3];
+    if (!trial || rust_take_boot_trial(uuid, trial, BOOT_SPEC_MAX + 1))
+        goto none;
+    names[0] = strcpy(trial + BOOT_SPEC_MAX + 1, trial);
+    names[1] = strchr(names[0], ';');
+    names[2] = names[1] ? strchr(names[1] + 1, ';') : NULL;
+    if (!names[2])
+        goto none;
+    *names[1]++ = 0;
+    *names[2]++ = 0;
+    printf("boot: aura-try: booting %s once\n", trial);
+    if (boot_storage_files(uuid, names, kernel, fdt)) {
+        printf("boot: aura-try files failed; booting the configured files\n");
+        goto none;
+    }
+    if (kboot_set_chosen("aurora,trial", trial) < 0)
+        printf("boot: could not record the trial in chosen\n");
+    free(trial);
+    return true;
+
+none:
+    free(trial);
+    return false;
+}
+#endif
+
 int boot_storage_load(const char *spec, struct kernel_header **kernel, void **fdt)
 {
 #ifndef CHAINLOADING
@@ -129,12 +220,8 @@ int boot_storage_load(const char *spec, struct kernel_header **kernel, void **fd
         return -1;
 
     char *fields = malloc(spec_len + 1);
-    char *file_spec = malloc(spec_len + 1);
-    if (!fields || !file_spec) {
-        free(fields);
-        free(file_spec);
+    if (!fields)
         return -1;
-    }
     memcpy(fields, spec, spec_len + 1);
     char *part[4];
     char *cursor = fields;
@@ -151,47 +238,20 @@ int boot_storage_load(const char *spec, struct kernel_header **kernel, void **fd
         }
     }
 
-    /* EFI payloads such as U-Boot let the selected OS supply its initramfs. */
-    bool have_initrd = strcmp(part[3], "-") != 0;
+    /* EFI payloads such as U-Boot let the selected OS supply its initramfs ("-"). */
     if (!nvme_init())
         goto fail_specs;
-    void *files[3] = {0};
-    size_t sizes[3] = {0};
-    for (size_t i = 0; i < (have_initrd ? 3 : 2); i++) {
-        int len = snprintf(file_spec, spec_len + 1, "%s;%s", part[0], part[i + 1]);
-        if (len < 0 || (size_t)len > spec_len ||
-            rust_load_image(file_spec, &files[i], &sizes[i], NULL) || !files[i] || !sizes[i])
-            goto fail;
-    }
-
-    if (boot_check_dtb(files[1], sizes[1]))
+    if (!boot_storage_trial(part[0], kernel, fdt) &&
+        boot_storage_files(part[0], &part[1], kernel, fdt))
         goto fail;
-    if (have_initrd &&
-        !((sizes[2] >= 18 && ((u8 *)files[2])[0] == 0x1f && ((u8 *)files[2])[1] == 0x8b) ||
-          (sizes[2] >= 6 && (!memcmp(files[2], "070701", 6) || !memcmp(files[2], "070702", 6)))))
-        goto fail;
-
-    struct kernel_header *prepared = boot_prepare_image(files[0], sizes[0]);
-    if (!prepared)
-        goto fail;
-    kboot_set_initrd(files[2], sizes[2]);
-    *kernel = prepared;
-    *fdt = files[1];
-    printf("boot: ESP image and DTB validated%s\n",
-           have_initrd ? " with initramfs" : " without initramfs");
-    rust_free_image(files[0], sizes[0]);
     free(fields);
-    free(file_spec);
     return 0;
 
 fail:
     printf("boot: internal storage load failed; returning to proxy\n");
     nvme_shutdown();
-    for (size_t i = 0; i < 3; i++)
-        rust_free_image(files[i], sizes[i]);
 fail_specs:
     free(fields);
-    free(file_spec);
     return -1;
 #endif
 }
