@@ -1077,8 +1077,16 @@ static int dt_set_cpus(void)
 
         u64 dt_mpidr = fdt64_ld(prop);
 
-        if (dt_mpidr == (mrs(MPIDR_EL1) & 0xFFFFFF))
+        if (dt_mpidr == (mrs(MPIDR_EL1) & 0xFFFFFF)) {
+            /* cpuidle-psci only binds when every CPU, the boot CPU included,
+             * uses PSCI. */
+            if (psci) {
+                fdt_delprop(dt, node, "cpu-release-addr");
+                if (fdt_setprop_string(dt, node, "enable-method", "psci"))
+                    bail_cleanup("FDT: couldn't set cpu enable-method to psci\n");
+            }
             goto next_cpu;
+        }
 
         /*
          * DT and ADT CPU numbering can differ: J616s has no ADT cpu9, while
