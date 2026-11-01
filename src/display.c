@@ -977,7 +977,8 @@ int display_init(void)
     else
         printf("display: Display is internal\n");
 
-    if (chip_id == T8140 || chip_id == T8132) {
+    if (chip_id == T8140 || chip_id == T8132 ||
+        (chip_id == T6040 && board_id == 4 && adt_is_compatible(adt, 0, "J614sAP"))) {
         printf("display: preserving inherited display (%ldx%ld)\n", cur_boot_args.video.width,
                cur_boot_args.video.height);
         return 0;
