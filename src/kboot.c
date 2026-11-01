@@ -8359,6 +8359,74 @@ static int dt_disable_j713_pcie(void)
     return 0;
 }
 
+/* J614s AOP handoff. Run only after the DAPF result is known. */
+static int dt_finish_j614s_aop(void *tree, bool ready)
+{
+    fdt32_t keep[2];
+    u32 remove[8], handles[8];
+    int len, count, code = 0, log = 0, nkeep = 0, nremove = 0;
+    int aop = fdt_node_offset_by_compatible(tree, -1, "apple,t6041-aop");
+    const fdt32_t *refs;
+
+    if (!ready || aop < 0)
+        return -1;
+    refs = fdt_getprop(tree, aop, "memory-region", &len);
+    if (!refs || len <= 0 || len > (int)sizeof(handles) || len % 4)
+        return -1;
+    count = len / 4;
+    for (int i = 0; i < count; i++)
+        handles[i] = fdt32_ld(refs + i);
+    for (int i = 0; i < count; i++) {
+        int node = fdt_node_offset_by_phandle(tree, handles[i]), bytes;
+        const fdt64_t *reg;
+        const fdt32_t *maps;
+        u64 phys, size, iova, span;
+        if (node < 0)
+            return -1;
+        reg = fdt_getprop(tree, node, "reg", &bytes);
+        if (!reg || bytes != 16 || !fdt_getprop(tree, node, "no-map", NULL))
+            return -1;
+        phys = fdt64_ld(reg);
+        size = fdt64_ld(reg + 1);
+        maps = fdt_getprop(tree, node, "iommu-addresses", &bytes);
+        if (!maps || bytes != 20 || fdt32_ld(maps) != fdt_get_phandle(tree, aop))
+            return -1;
+        iova = (u64)fdt32_ld(maps + 1) << 32 | fdt32_ld(maps + 2);
+        span = (u64)fdt32_ld(maps + 3) << 32 | fdt32_ld(maps + 4);
+        if (!size || size != span || (phys & 0x3fff) || (size & 0x3fff) ||
+            (iova & 0x3fff) || phys > UINT64_MAX - size || iova > UINT64_MAX - size)
+            return -1;
+        if (iova != 0x10000000000ULL && iova != phys) {
+            remove[nremove++] = handles[i];
+            continue;
+        }
+        if (nkeep == 2)
+            return -1;
+        code += iova == 0x10000000000ULL;
+        log += iova == phys;
+        keep[nkeep++] = cpu_to_fdt32(handles[i]);
+    }
+    if (code != 1 || log != 1 || nkeep != 2)
+        return -1;
+    for (int i = 0; i < nremove; i++) {
+        int node = fdt_node_offset_by_phandle(tree, remove[i]);
+        if (node < 0 || fdt_delprop(tree, node, "iommu-addresses"))
+            return -1;
+    }
+    aop = fdt_node_offset_by_compatible(tree, -1, "apple,t6041-aop");
+    if (aop < 0 || fdt_setprop(tree, aop, "memory-region", keep, sizeof(keep)))
+        return -1;
+    aop = fdt_node_offset_by_compatible(tree, -1, "apple,t6041-aop");
+    refs = fdt_getprop(tree, aop, "iommus", &len);
+    if (!refs || len < 8)
+        return -1;
+    int dart = fdt_node_offset_by_phandle(tree, fdt32_ld(refs));
+    if (dart < 0 || fdt_setprop_string(tree, dart, "status", "okay"))
+        return -1;
+    return 0;
+}
+
+
 int kboot_boot(void *kernel)
 {
     if (chip_id == T8152)
@@ -8420,6 +8488,30 @@ int kboot_boot(void *kernel)
         return -1;
     }
 
+    if (chip_id == T6040 && board_id == 4 && adt_is_compatible(adt, 0, "J614sAP") &&
+        !fdt_node_check_compatible(dt, 0, "apple,j614s")) {
+        if (fdt_open_into(dt, dt, dt_bufsize))
+            return -1;
+        void *aop_tree = malloc(dt_bufsize);
+        if (!aop_tree)
+            return -1;
+        int aop_ret = fdt_open_into(dt, aop_tree, dt_bufsize);
+        if (!aop_ret)
+            aop_ret = dt_finish_j614s_aop(aop_tree, dapf_j614s_aop_ready());
+        if (!aop_ret) {
+            memcpy(dt, aop_tree, dt_bufsize);
+        } else {
+            int aop = fdt_node_offset_by_compatible(dt, -1, "apple,t6041-aop");
+            if (aop >= 0 && fdt_setprop_string(dt, aop, "status", "disabled")) {
+                free(aop_tree);
+                return -1;
+            }
+            printf("FDT: J614s AOP handoff failed, keeping AOP disabled\n");
+        }
+        free(aop_tree);
+        if (fdt_pack(dt))
+            return -1;
+    }
     printf("Setting SMP mode to WFE...\n");
     smp_set_wfe_mode(true);
     if (chip_id == T8140 && dt_t8140_recheck_display())

@@ -29,6 +29,7 @@ typedef unsigned long u64;
 _Static_assert(sizeof(u64) == 8, "the aura host fixture requires an LP64 host");
 #define PACKED __attribute__((packed))
 #define static_assert _Static_assert
+#define T6040 0x6040
 #define T8132 0x8132
 #define T8140 0x8140
 #define PMGR_FLAG_VIRTUAL 0x10
@@ -43,6 +44,7 @@ _Static_assert(sizeof(u64) == 8, "the aura host fixture requires an LP64 host");
 #define SZ_16K (1 << 14)
 static int chip_id = T8132, pmgr_initialized = 1;
 static void *adt;
+static int board_id = 4;
 struct node {
  const char *name;
  const u8 *instance, *config;
@@ -86,7 +88,7 @@ static int adt_get_reg(const void *tree,int *trace,const char *key,int index,u64
  *base=n->base[index];if(size)*size=n->size[index];return 0;
 }
 static bool adt_is_compatible(const void *tree,int id,const char *compat)
-{(void)tree;(void)id;return !strcmp(compat,"dart,t8110");}
+{(void)tree;(void)id;return !strcmp(compat,"dart,t8110") || !strcmp(compat,"J614sAP");}
 static int pmgr_adt_power_enable(const char *p) {
  int id=find(p);assert(id>0);
  if(id<=3) {dart_enables++;return 0;}
@@ -185,6 +187,21 @@ int main(void) {
  /* The central T8132 branch is the only change to the legacy flow. */
  reset();chip_id=0x8110;dart_gates=true;assert(!dapf_init("/arm-io/dart-aop",1));
  assert(filter_writes==5*(nodes[0].config_len/52)&&dart_enables==1&&disables==1);
+ reset();chip_id=T6040;dart_gates=true;j614s_aop_ready=0;
+ nodes[0].instance=NULL;nodes[0].instance_len=0;
+ assert(dapf_init("/arm-io/dart-aop",1)<0);
+ assert(dart_enables==1&&disables==1&&!filter_writes&&!j614s_aop_ready);
+ reset();chip_id=T6040;dart_gates=true;j614s_aop_ready=0;
+ nodes[0].instance_len=16;
+ assert(dapf_init_fdt(NULL)<0);
+ assert(!(j614s_aop_ready&1)&&dart_enables==2&&disables==2);
+ reset();chip_id=T6040;dart_gates=true;j614s_aop_ready=0;
+ nodes[0].config_len=1;
+ assert(dapf_init("/arm-io/dart-aop",1)<0);
+ assert(dart_enables==1&&disables==1&&!filter_writes&&!j614s_aop_ready);
+ reset();chip_id=T6040;dart_gates=true;j614s_aop_ready=0;
+ assert(dapf_init_fdt(NULL)>=0);
+ assert((j614s_aop_ready&1)&&filter_writes&&dart_enables==2&&disables==2);
  puts("DAPF: actual PMP preservation/power, inactive AOP/MTP, typed refusal, malformed/duplicate metadata, direct calls, caller count/errors and legacy pass");
  return 0;
 }
