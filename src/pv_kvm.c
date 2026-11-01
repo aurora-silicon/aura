@@ -90,9 +90,11 @@ static bool pv_caps(u64 *regs)
     caps->minor = AURA_PV_ABI_MINOR;
     caps->bytes = sizeof(*caps);
     caps->layout_id = AURA_PV_LAYOUT_CAPS;
-    caps->features = AURA_PV_FEATURE_BOUNDED_INT | AURA_PV_FEATURE_HOST_STATE;
+    caps->features = AURA_PV_FEATURE_BOUNDED_INT | AURA_PV_FEATURE_HOST_STATE |
+                    AURA_PV_FEATURE_EL1_STEP;
     caps->max_control_bytes = AURA_PV_PAGE_BYTES;
     caps->shared_alignment = 64;
+    /* Linux remains the physical-EL1 host; Aura owns the EL2 monitor. */
     caps->host_el = 1;
     caps->reserved_base = (u64)_base;
     caps->reserved_end = (u64)_end;
@@ -129,8 +131,17 @@ static bool pv_run(u64 *regs)
     host_cntkctl = mrs(SYS_CNTKCTL_EL12);
     c->host_sctlr_before = host_sctlr;
     c->host_cntkctl_before = host_cntkctl;
-    c->host_sentinel_status = (regs[19] == AURA_PV_SENTINEL_X19 ? BIT(0) : 0) |
-                              (regs[20] == AURA_PV_SENTINEL_X20 ? BIT(1) : 0);
+    c->host_sentinel_status = (regs[19] == AURA_PV_SENTINEL_X19 ? AURA_PV_HOST_X19_OK : 0) |
+                              (regs[20] == AURA_PV_SENTINEL_X20 ? AURA_PV_HOST_X20_OK : 0);
+    /* A RUN result is useful only when the monitor preserved the complete
+     * callee-saved sentinel pair. Keep the failure visible in both the
+     * status and the shared record; callers must never accept a partial
+     * host-state proof as a successful run. */
+    if (c->host_sentinel_status != (AURA_PV_HOST_X19_OK | AURA_PV_HOST_X20_OK)) {
+        c->host_sentinel_status |= AURA_PV_HOST_ERROR;
+        pv_set_error(c, seq, AURA_PV_STATUS_HOST);
+        goto out;
+    }
     words = c->program_words;
     if (!words || words > AURA_PV_MAX_PROGRAM) {
         pv_set_error(c, seq, AURA_PV_STATUS_INVAL);
@@ -178,6 +189,27 @@ bool pv_kvm_handle_hvc(u64 *regs)
             return pv_caps(regs);
         case AURA_PV_FUNC_RUN:
             return pv_run(regs);
+        case AURA_PV_FUNC_EL1_STEP: {
+            /* The Linux client performs the fixed add while still at EL1.
+             * Aura validates that result after the HVC transition and keeps
+             * the callee-saved sentinels part of the proof. */
+            u64 input = regs[3];
+            u64 expected = input + 7;
+
+            if (!regs[2] || regs[1] != expected ||
+                regs[19] != AURA_PV_SENTINEL_X19 ||
+                regs[20] != AURA_PV_SENTINEL_X20) {
+                regs[0] = AURA_PV_STATUS_INVAL;
+                regs[1] = 0;
+                regs[2] = 0;
+                regs[3] = 0;
+                return true;
+            }
+            regs[0] = AURA_PV_STATUS_OK;
+            /* x1 is the EL1-produced result and x2 is the request sequence. */
+            regs[3] = 0;
+            return true;
+        }
         default:
             return false;
     }

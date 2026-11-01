@@ -311,14 +311,18 @@ void exc_sync(u64 *regs)
         if (imm == 0 && pv_kvm_active) {
             if (pv_kvm_handle_hvc(regs)) {
                 msr(SPSR_EL2, spsr);
-                msr(ELR_EL2, elr + 4);
+                /* HVC already records the preferred return address after
+                 * the instruction in ELR_EL2; do not skip the caller's next
+                 * instruction by adding another four bytes. */
+                msr(ELR_EL2, elr);
                 return;
             }
             /* PV owns the host HVC #0 namespace. Do not let an unknown
              * function fall through to Aura's legacy EL1-return path. */
             regs[0] = AURA_PV_STATUS_NOSYS;
             msr(SPSR_EL2, spsr);
-            msr(ELR_EL2, elr + 4);
+            /* Keep HVC's architected preferred return address. */
+            msr(ELR_EL2, elr);
             return;
         }
         switch (imm) {
