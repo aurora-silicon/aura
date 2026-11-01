@@ -93,5 +93,21 @@ object and derives `kcbz : 0`. On a MacBook Neo (T8140, J700) a proxy Stage 1
 built this way cold-boots, and the installed Fedora kernel boots to a login
 at EL1 with pointer authentication on and all six CPUs up.
 
-Not tested: a raw boot with `src/monitor.c` in the tree, a filled Stage 1 that
-loads Stage 2 from the ESP, and any chip other than T8140.
+On a MacBook Air M5 (T8142, J813) the same holds. A single-stage boot object
+(a `CHAINLOADING=1 ESP_STAGE2=1` build with its `boot=` and `chosen.bootargs`
+variables appended, then wrapped) cold-boots, loads the kernel, DTB and
+initramfs from the ESP, and Linux reports `CPU: All CPU(s) started at EL1`
+with all ten CPUs, NVMe, Wi-Fi and the GPU working. The kernel then detects
+Apple TSO (the ACTLR_EL1 bit toggles) and `PR_SET_MEM_MODEL` switches a
+process to TSO.
+
+A filled Stage 1 that chainloads a Stage 2 from the ESP does not work in this
+mode. The CTXR windows cover the enrolled Stage 1, not the chainloaded Stage 2,
+so the secondaries Stage 2 starts run outside them at EL2. On J813 every
+secondary took an exception as soon as Stage 2 handed over to Linux, and
+the machine rebooted in a loop. A Stage 2 that leaves the secondaries parked
+in Stage 1 boots Linux on the boot CPU, at EL2 or, with the monitor, at EL1.
+Boot single-stage instead; kernel updates stay on the ESP.
+
+Not tested: a raw boot with `src/monitor.c` in the tree, and chips other than
+T8140 and T8142.
