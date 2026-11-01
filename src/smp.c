@@ -237,6 +237,8 @@ static int smp_prepare_rvbar(const struct cpu_info *cpu)
     return 0;
 }
 
+void smp_park_loop(struct spin_table *me) __attribute__((noreturn));
+
 void smp_secondary_entry(void)
 {
     u64 mpidr = mrs(MPIDR_EL1) & 0xFFFFFF;
@@ -273,11 +275,20 @@ void smp_secondary_entry(void)
     sysop("dmb sy");
     me->flag++;
     sysop("dmb sy");
-    u64 target;
     if (chip_id != T8152 && !cpu_features->fast_ipi)
         aic_write(AIC_IPI_MASK_SET, AIC_IPI_SELF); // we only use the "other" IPI
 
+    smp_park_loop(me);
+}
+
+/* The parked-secondary wait. A CPU sits here until smp_call4() (or PSCI
+ * CPU_ON, which uses it) sets a target, then runs it. monitor_enter_os() and
+ * the OS never return, so a PSCI CPU_OFF re-enters this loop on a fresh stack
+ * (smp_reenter_park) to put the core back in the pool. */
+void __attribute__((noreturn)) smp_park_loop(struct spin_table *me)
+{
     while (1) {
+        u64 target;
         while (!(target = me->target)) {
             if (wfe_mode) {
                 sysop("wfe");
@@ -305,6 +316,24 @@ void smp_secondary_entry(void)
         me->target = 0;
         sysop("dmb sy");
     }
+}
+
+/* PSCI CPU_OFF: the dying CPU abandons its OS stack and re-parks. */
+void __attribute__((noreturn)) smp_reenter_park(int index)
+{
+    extern void _smp_reenter_park(struct spin_table * me, u64 sp) __attribute__((noreturn));
+    struct spin_table *me = &spin_table[index];
+    me->target = 0;
+    me->retval = 0;
+    sysop("dmb sy");
+    _smp_reenter_park(me, (u64)secondary_stacks[index] + SECONDARY_STACK_SIZE);
+}
+
+bool smp_os_started(int cpu)
+{
+    if (cpu < 0 || cpu >= MAX_CPUS)
+        return false;
+    return spin_table[cpu].target != 0;
 }
 
 void smp_secondary_prep_el3(void)

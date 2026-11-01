@@ -32,6 +32,8 @@ int smp_stop_secondaries(bool deep_sleep);
 #define smp_call3(i, f, a, b, c) smp_call4(i, f, a, b, c, 0)
 
 int smp_call4(int cpu, void *func, u64 arg0, u64 arg1, u64 arg2, u64 arg3);
+void smp_reenter_park(int index) __attribute__((noreturn));
+bool smp_os_started(int cpu);
 
 #define SMP_TIMEOUT -2
 
