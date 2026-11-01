@@ -2886,6 +2886,169 @@ static int dt_set_ave(void)
     return 0;
 }
 
+/*
+ * The M4 Pro Neural Engine runs firmware that iBoot preloads into DRAM below
+ * the OS: /arm-io/ane0 is pre-loaded, with exactly a __TEXT and a __DATA
+ * segment range. Reserve both segments no-map and give them to the ANE node
+ * as its "firmware-text" and "firmware-data" memory regions, with the device
+ * addresses the firmware runs them at (their remap addresses) as
+ * apple,firmware-iovas. A DT that describes the two regions as placeholders
+ * gets them filled in place, renamed to their physical addresses and
+ * enabled; a DT without them gets them added. The node's status is left as
+ * the DT has it, except that a node whose preload cannot be handed over is
+ * disabled.
+ */
+static const char *const ane_compatibles[] = {
+    "apple,t6041-ane",
+};
+
+static int dt_ane_fill_region(int resv, uint32_t phandle, const char *kind, u64 phys, u64 size)
+{
+    int node = fdt_node_offset_by_phandle(dt, phandle);
+    if (node < 0 || fdt_parent_offset(dt, node) != resv)
+        return -1;
+
+    char name[48];
+    snprintf(name, sizeof(name), "ane-firmware-%s@%lx", kind, phys);
+    int other = fdt_subnode_offset(dt, resv, name);
+    if (other >= 0 && other != node)
+        return -1;
+
+    u64 reg[2] = {cpu_to_fdt64(phys), cpu_to_fdt64(size)};
+    if (fdt_setprop(dt, node, "reg", reg, sizeof(reg)) || fdt_setprop_empty(dt, node, "no-map") ||
+        fdt_setprop_string(dt, node, "status", "okay"))
+        return -1;
+    node = fdt_node_offset_by_phandle(dt, phandle);
+    if (node < 0 || fdt_set_name(dt, node, name))
+        return -1;
+    return 0;
+}
+
+static int dt_set_ane_node(int node)
+{
+    static const char names_expected[] = "__TEXT;__DATA";
+    static const char *const kinds[2] = {"text", "data"};
+
+    char path[64];
+    if (fdt_get_path(dt, node, path, sizeof(path)))
+        bail("FDT: ANE node path too long\n");
+
+    const char *reason = "invalid ADT firmware segments";
+    int anode = adt_path_offset(adt, "/arm-io/ane0");
+    if (anode < 0)
+        anode = adt_path_offset(adt, "/arm-io/ane");
+    if (anode < 0) {
+        reason = "ADT node absent";
+        goto disable;
+    }
+
+    u32 preloaded;
+    if (ADT_GETPROP(adt, anode, "pre-loaded", &preloaded) != sizeof(preloaded) || preloaded != 1) {
+        reason = "firmware not preloaded";
+        goto disable;
+    }
+
+    u32 seg_len, names_len;
+    const struct adt_segment_ranges *seg = adt_getprop(adt, anode, "segment-ranges", &seg_len);
+    const char *names = adt_getprop(adt, anode, "segment-names", &names_len);
+    if (!seg || seg_len != 2 * sizeof(*seg) || !names || names_len < sizeof(names_expected) - 1 ||
+        names_len > sizeof(names_expected) ||
+        memcmp(names, names_expected, sizeof(names_expected) - 1) ||
+        (names_len == sizeof(names_expected) && names[names_len - 1]))
+        goto disable;
+
+    int chosen = adt_path_offset(adt, "/chosen");
+    u64 dram_base;
+    if (chosen < 0 || ADT_GETPROP(adt, chosen, "dram-base", &dram_base) != sizeof(dram_base) ||
+        dram_base > cur_boot_args.phys_base)
+        goto disable;
+
+    u64 span[2];
+    for (int i = 0; i < 2; i++) {
+        span[i] = ALIGN_UP((u64)seg[i].size, SZ_16K);
+        if (!seg[i].size || !seg[i].remap || (seg[i].phys & (SZ_16K - 1)) ||
+            (seg[i].remap & (SZ_16K - 1)) || seg[i].phys < dram_base ||
+            seg[i].phys > cur_boot_args.phys_base ||
+            span[i] > cur_boot_args.phys_base - seg[i].phys || seg[i].remap > UINT64_MAX - span[i])
+            goto disable;
+    }
+    if ((seg[0].phys < seg[1].phys + span[1] && seg[1].phys < seg[0].phys + span[0]) ||
+        (seg[0].remap < seg[1].remap + span[1] && seg[1].remap < seg[0].remap + span[0]))
+        goto disable;
+
+    int resv = fdt_path_offset(dt, "/reserved-memory");
+    const fdt32_t *ac = resv < 0 ? NULL : fdt_getprop(dt, resv, "#address-cells", NULL);
+    const fdt32_t *sc = resv < 0 ? NULL : fdt_getprop(dt, resv, "#size-cells", NULL);
+    if (!ac || !sc || fdt32_ld(ac) != 2 || fdt32_ld(sc) != 2) {
+        reason = "no 64-bit /reserved-memory";
+        goto disable;
+    }
+
+    reason = "firmware reservation failed";
+    int len = 0;
+    node = fdt_path_offset(dt, path);
+    const fdt32_t *regions = node < 0 ? NULL : fdt_getprop(dt, node, "memory-region", &len);
+    uint32_t phandles[2];
+    if (regions) {
+        /* Placeholders from the DT: fill them where they are. */
+        if (len != sizeof(phandles))
+            goto disable;
+        phandles[0] = fdt32_ld(&regions[0]);
+        phandles[1] = fdt32_ld(&regions[1]);
+        for (int i = 0; i < 2; i++) {
+            resv = fdt_path_offset(dt, "/reserved-memory");
+            if (dt_ane_fill_region(resv, phandles[i], kinds[i], seg[i].phys, span[i]))
+                goto disable;
+        }
+    } else {
+        for (int i = 0; i < 2; i++) {
+            char name[48];
+            snprintf(name, sizeof(name), "ane-firmware-%s@%lx", kinds[i], seg[i].phys);
+            int mem = dt_get_or_add_reserved_mem(name, "apple,asc-mem", true, seg[i].phys, span[i]);
+            if (mem < 0)
+                goto disable;
+            phandles[i] = fdt_get_phandle(dt, mem);
+            if (!phandles[i])
+                goto disable;
+        }
+    }
+
+    fdt32_t region_cells[2] = {cpu_to_fdt32(phandles[0]), cpu_to_fdt32(phandles[1])};
+    static const char region_names[] = "firmware-text\0firmware-data";
+    fdt64_t iovas[2] = {cpu_to_fdt64(seg[0].remap), cpu_to_fdt64(seg[1].remap)};
+    node = fdt_path_offset(dt, path);
+    if (node < 0 || fdt_setprop(dt, node, "memory-region", region_cells, sizeof(region_cells)))
+        goto disable;
+    node = fdt_path_offset(dt, path);
+    if (node < 0 ||
+        fdt_setprop(dt, node, "memory-region-names", region_names, sizeof(region_names)))
+        goto disable;
+    node = fdt_path_offset(dt, path);
+    if (node < 0 || fdt_setprop(dt, node, "apple,firmware-iovas", iovas, sizeof(iovas)))
+        goto disable;
+
+    printf("FDT: %s: ANE firmware TEXT 0x%lx DATA 0x%lx reserved\n", path, seg[0].phys,
+           seg[1].phys);
+    return 0;
+
+disable:
+    node = fdt_path_offset(dt, path);
+    if (node < 0 || fdt_setprop_string(dt, node, "status", "disabled"))
+        return -1;
+    printf("FDT: ANE disabled: %s\n", reason);
+    return 0;
+}
+
+static int dt_set_ane_firmware(void)
+{
+    for (size_t i = 0; i < ARRAY_SIZE(ane_compatibles); i++) {
+        int node = fdt_node_offset_by_compatible(dt, -1, ane_compatibles[i]);
+        if (node >= 0)
+            return dt_set_ane_node(node);
+    }
+    return 0;
+}
+
 static const char dcpext_aliases[][8] = {
     "dcpext",  "dcpext0", "dcpext1", "dcpext2", "dcpext3",
     "dcpext4", "dcpext5", "dcpext6", "dcpext7",
@@ -7443,6 +7606,8 @@ int kboot_prepare_dt(void *fdt)
     if (dt_set_pcie_tunables())
         return -1;
     if (dt_set_ave())
+        return -1;
+    if (dt_set_ane_firmware())
         return -1;
     if (dt_set_display())
         return -1;
