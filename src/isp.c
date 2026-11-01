@@ -45,6 +45,8 @@ static const struct {
 #define ISP_T8142_HEAP_TOP 0x1800000
 #define ISP_T8142_SEG_END  0x16ec000
 
+#define PMGR_PS_TARGET GENMASK(3, 0)
+
 // PMGR offset to enable to get the version info to work
 #define ISP_PMGR_T8103 0x4018
 #define ISP_PMGR_T6000 0x8
@@ -178,6 +180,16 @@ int isp_init(void)
             int ret = pmgr_set_mode(addr, PMGR_PS_ACTIVE);
             printf("isp: %s power on at 0x%lx: 0x%x%s\n", isp_t8140_domains[i].name, addr,
                    read32(addr), ret ? " failed" : "");
+            /*
+             * J813: the ISP_CPU_CORE1 slot ignores writes, its target reads
+             * back 0 whatever is written, also from the OS. Boot without it.
+             */
+            if (ret && t8142 && isp_t8140_domains[i].offset == 0x4010 &&
+                !(read32(addr) & PMGR_PS_TARGET)) {
+                printf("isp: %s ignores power requests on T8142, skipping it\n",
+                       isp_t8140_domains[i].name);
+                continue;
+            }
             if (ret)
                 goto out;
         }
