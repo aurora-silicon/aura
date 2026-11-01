@@ -7519,7 +7519,8 @@ int kboot_prepare_dt(void *fdt)
             fdt_setprop_u32(dt, hypervisor, "uid-function", AURA_PV_FUNC_UID) ||
             fdt_setprop_u32(dt, hypervisor, "version-function", AURA_PV_FUNC_VERSION) ||
             fdt_setprop_u32(dt, hypervisor, "caps-function", AURA_PV_FUNC_GET_CAPS) ||
-            fdt_setprop_u32(dt, hypervisor, "run-function", AURA_PV_FUNC_RUN))
+            fdt_setprop_u32(dt, hypervisor, "run-function", AURA_PV_FUNC_RUN) ||
+            fdt_setprop_u32(dt, hypervisor, "el1-step-function", AURA_PV_FUNC_EL1_STEP))
             bail("FDT: couldn't describe Aura PV-KVM\n");
     }
 
