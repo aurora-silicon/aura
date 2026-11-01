@@ -398,10 +398,16 @@ static bool dapf_is_j614s(void)
 }
 
 static bool j614s_aop_ready;
+static bool j614s_isp_ready;
 
 bool dapf_j614s_aop_ready(void)
 {
     return j614s_aop_ready;
+}
+
+bool dapf_j614s_isp_ready(void)
+{
+    return j614s_isp_ready;
 }
 
 int dapf_init(const char *path, int index)
@@ -426,7 +432,8 @@ int dapf_init(const char *path, int index)
         return -1;
     }
 
-    bool required = dapf_is_j614s() && !strcmp(path, "/arm-io/dart-aop");
+    bool required = dapf_is_j614s() && (!strcmp(path, "/arm-io/dart-aop") ||
+                                        !strcmp(path, "/arm-io/dart-isp0"));
     u32 pwr;
     if (!adt_getprop(adt, node, "clock-gates", &pwr))
         pwr = 0;
@@ -603,6 +610,7 @@ static int dapf_init_j713(void *dt)
 int dapf_init_fdt(const void *fdt)
 {
     j614s_aop_ready = false;
+    j614s_isp_ready = false;
     if (chip_id == T8132) {
         if (!fdt || fdt_node_check_compatible(fdt, 0, "apple,j713"))
             return 0; /* No other M4 board's power/DAPF contract is qualified. */
@@ -650,6 +658,8 @@ int dapf_init_fdt(const void *fdt)
             ret = -1;
         } else if (dapf_is_j614s() && !strcmp(entry->path, "/arm-io/dart-aop")) {
             j614s_aop_ready = true;
+        } else if (dapf_is_j614s() && !strcmp(entry->path, "/arm-io/dart-isp0")) {
+            j614s_isp_ready = true;
         }
         entry++;
         count += 1;
