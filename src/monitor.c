@@ -35,7 +35,8 @@ bool monitor_required(void)
     if (required >= 0)
         return required;
     required = 0;
-    if (chip_id != T8140)
+    /* T8142 (M5, J813) confines its secondaries the same way. */
+    if (chip_id != T8140 && chip_id != T8142)
         return false;
 
     int cpu;
