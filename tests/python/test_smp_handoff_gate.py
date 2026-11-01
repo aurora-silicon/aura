@@ -61,7 +61,6 @@ static int fdt_pack(void *p) { return 0; }
 static u32 fdt_totalsize(void *p) { return 0x8000; }
 static int dapf_init_fdt(void *p) { return 0; }
 static int dapf_init_all(void) { return 0; }
-static int dapf_init_t6041_ane(void *p) { return 0; }
 static void pcie_shutdown(void) {}
 static void smp_set_wfe_mode(bool value) {}
 static int dt_t8140_recheck_display(void)

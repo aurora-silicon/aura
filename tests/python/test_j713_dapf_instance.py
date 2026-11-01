@@ -31,8 +31,6 @@ _Static_assert(sizeof(u64) == 8, "the aura host fixture requires an LP64 host");
 #define static_assert _Static_assert
 #define T8132 0x8132
 #define T8140 0x8140
-#define T6040 0x6040
-#define T6041 0x6041
 #define PMGR_FLAG_VIRTUAL 0x10
 #define PMGR_DEVICE_ID 0xffffU
 #define PMGR_DIE_ID 0xffff0000U
@@ -114,8 +112,6 @@ static int fdt_stringlist_search(const void *dt,int id,const char *key,const cha
 }
 static int fdt_node_check_compatible(const void *dt,int node,const char *compat)
 {(void)dt;(void)node;(void)compat;return 0;}
-static int fdt_node_offset_by_compatible(const void *dt,int start,const char *compat)
-{(void)dt;(void)start;(void)compat;return -1;}
 '''
 
 TESTS = r'''

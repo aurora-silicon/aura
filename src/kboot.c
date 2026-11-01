@@ -7773,9 +7773,6 @@ int kboot_boot(void *kernel)
     }
     ret = (chip_id == T8142 || chip_id == T6041 || chip_id == T8132) ? dapf_init_fdt(dt)
                                                                      : dapf_init_all();
-    /* Fail-soft: without it the OS ANE driver refuses to map, nothing else changes. */
-    if (dapf_init_t6041_ane(dt) < 0)
-        printf("kboot: ANE DAPF not programmed\n");
     if (ret < 0 && chip_id == T8140) {
         printf("kboot: refusing T8140 handoff after DAPF failure\n");
         pcie_shutdown();

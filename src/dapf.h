@@ -8,7 +8,6 @@
 int dapf_init_all(void);
 int dapf_init_fdt(const void *fdt);
 int dapf_init(const char *path, int index);
-int dapf_init_t6041_ane(const void *fdt);
 
 /* A DAPF window, merged to whole 16K pages: [start, end). */
 struct dapf_window {
