@@ -193,12 +193,13 @@ static const struct dapf_t8110_config *dapf_t8132_config(const char *path, int n
 }
 
 /*
- * Program a genuine T8132 DAPF bank with the t8110 records of its
- * dapf-instance property, in the t8110 register order, then read every slice
- * back. The low two bits of an end and all but the low byte of r0 do not read
- * back. On any mismatch, every slice gets its previous values back.
+ * Program a t8110 DAPF bank (the T8132 banks, the T6040/T6041 ANE bank) with
+ * the records of its dapf-instance property, in the t8110 register order,
+ * then read every slice back. The low two bits of an end and all but the low
+ * byte of r0 do not read back. On any mismatch, every slice gets its previous
+ * values back.
  */
-static int dapf_program_t8132(const char *path, u64 base, int node, u32 instance)
+static int dapf_program_bank(const char *path, u64 base, int node, u32 instance)
 {
     struct dapf_slice want[T8132_DAPF_SLICES], had[T8132_DAPF_SLICES];
     u32 count;
@@ -237,12 +238,12 @@ static int dapf_program_t8132(const char *path, u64 base, int node, u32 instance
             (read32(slice + 0x00) & 0xff) != want[i].r0 || read32(slice + 0x20) != want[i].r20) {
             for (u32 j = 0; j < count; j++)
                 dapf_t8132_put(base + 0x40 * j, &had[j]);
-            printf("dapf: T8132 DAPF slice %u for %s did not read back; restored\n", i, path);
+            printf("dapf: DAPF slice %u for %s did not read back; restored\n", i, path);
             return -1;
         }
     }
 
-    printf("dapf: Programmed %u T8132 DAPF slices for %s\n", count, path);
+    printf("dapf: Programmed %u DAPF slices for %s\n", count, path);
     return 0;
 }
 
@@ -336,7 +337,7 @@ int dapf_init_t8132_halted(const char *path, int index)
         printf("dapf: Error getting DAPF %s base address.\n", path);
         return -1;
     }
-    return dapf_program_t8132(path, base, node, instance);
+    return dapf_program_bank(path, base, node, instance);
 }
 
 /*
@@ -390,6 +391,103 @@ int dapf_t8132_windows(const char *path, int index, struct dapf_window *out, int
         }
     }
     return used;
+}
+
+static u64 dapf_be64(const u8 *p)
+{
+    u64 v = 0;
+
+    for (int i = 0; i < 8; i++)
+        v = (v << 8) | p[i];
+    return v;
+}
+
+/*
+ * The T6040/T6041 ANE DART has one DAPF bank: the reg entry its instance
+ * property tags FPAD. Its other two translation instances have none, and
+ * their registers at the same offset are unbacked. The OS's ANE driver only
+ * reads this bank, so program it here from its dapf-instance records, once
+ * they match the apple,dapf-ranges the OS compares them with, and read every
+ * record back. The DART stays powered: the bank is in the ANE_SYS domain and
+ * the records must still be there when the OS takes that domain over.
+ * T8140's ANE DAPF stays with its Linux driver.
+ */
+int dapf_init_t6041_ane(const void *fdt)
+{
+    static const char path[] = "/arm-io/dart-ane0";
+    int dart_path[8];
+
+    if (chip_id != T6040 && chip_id != T6041)
+        return 0;
+    int ane = fdt ? fdt_node_offset_by_compatible(fdt, -1, "apple,t6041-ane") : -1;
+    if (ane < 0) {
+        printf("dapf: no ANE node in the DT; leaving %s alone\n", path);
+        return 0;
+    }
+
+    int node = adt_path_offset_trace(adt, path, dart_path);
+    if (node < 0 || !adt_is_compatible(adt, node, "dart,t8110")) {
+        printf("dapf: no t8110 %s in the ADT\n", path);
+        return -1;
+    }
+
+    u32 length;
+    const struct dapf_instance *instances = adt_getprop(adt, node, "instance", &length);
+    if (!instances || !length || length % sizeof(*instances)) {
+        printf("dapf: invalid instance metadata for %s\n", path);
+        return -1;
+    }
+    int index = -1;
+    for (u32 i = 0; i < length / sizeof(*instances); i++) {
+        if (instances[i].type != DAPF_INSTANCE_DAPF)
+            continue;
+        if (index >= 0) {
+            printf("dapf: %s has more than one DAPF bank\n", path);
+            return -1;
+        }
+        index = i;
+    }
+    u64 base, size;
+    if (index < 0 || adt_get_reg(adt, dart_path, "reg", index, &base, &size) < 0 ||
+        (base & 0x3fff) || size != 0x4000) {
+        printf("dapf: no valid DAPF bank for %s\n", path);
+        return -1;
+    }
+
+    u32 count;
+    const struct dapf_t8110_config *config =
+        dapf_t8132_config(path, node, instances[index].instance, &count);
+    if (!config)
+        return -1;
+    int len;
+    const u8 *ranges = fdt_getprop(fdt, ane, "apple,dapf-ranges", &len);
+    if (!ranges || len < 0 || (u32)len != count * 16) {
+        printf("dapf: DT apple,dapf-ranges does not have the %u ADT records of %s\n", count, path);
+        return -1;
+    }
+    for (u32 i = 0; i < count; i++) {
+        if (dapf_be64(ranges + 16 * i) != config[i].start ||
+            dapf_be64(ranges + 16 * i + 8) != config[i].end) {
+            printf("dapf: DT apple,dapf-ranges record %u differs from the ADT for %s\n", i, path);
+            return -1;
+        }
+    }
+
+    u32 gates = 0;
+    if (!adt_getprop(adt, node, "clock-gates", &gates))
+        gates = 0;
+    int powered = gates ? pmgr_adt_is_powered(path) : 1;
+    if (gates && pmgr_adt_power_enable(path) < 0) {
+        printf("dapf: failed to power %s\n", path);
+        return -1;
+    }
+    if (dapf_program_bank(path, base, node, instances[index].instance)) {
+        if (gates && powered != 1 && pmgr_adt_power_disable(path))
+            printf("dapf: failed to power down %s\n", path);
+        return -1;
+    }
+    printf("dapf: %s DAPF bank verified; its power stays on for the OS\n", path);
+    return 0;
 }
 
 int dapf_init(const char *path, int index)
