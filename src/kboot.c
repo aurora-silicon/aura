@@ -7111,8 +7111,9 @@ static int dt_set_isp(void)
 {
     u64 heap_phys, heap_iova, heap_size;
 
-    /* A T8140 ISP that isp_init() did not bring up has no firmware to reserve. */
-    if (chip_id == T8140 && isp_get_heap(&heap_phys, &heap_iova, &heap_size)) {
+    /* A T8140/T8142 ISP that isp_init() did not bring up has no firmware to reserve. */
+    if ((chip_id == T8140 || chip_id == T8142) &&
+        isp_get_heap(&heap_phys, &heap_iova, &heap_size)) {
         if (!dt_set_isp_fwdata())
             return 0;
     } else if (!dt_reserve_asc_firmware("/arm-io/isp", "/arm-io/isp0", "isp", false,
