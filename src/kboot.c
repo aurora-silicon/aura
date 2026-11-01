@@ -8364,7 +8364,7 @@ static int dt_disable_j713_pcie(void)
     return 0;
 }
 
-/* J614s AOP handoff. Run only after the DAPF result is known. */
+/* J614s ISP handoff. Run only after the DAPF result is known. */
 static int dt_finish_j614s_isp(bool ready)
 {
     static const char expected_names[] = "text\0data\0heap";
@@ -8457,6 +8457,7 @@ static int dt_finish_j614s_isp(bool ready)
     return 0;
 }
 
+/* J614s AOP handoff. Run only after the DAPF result is known. */
 static int dt_finish_j614s_aop(void *tree, bool ready)
 {
     fdt32_t keep[2];
