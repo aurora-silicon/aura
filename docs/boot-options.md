@@ -32,6 +32,8 @@ it cannot change the EL2 regime of a running kernel.
 when NV2 is selected. The current PV ABI is a bounded discovery/RUN prototype,
 not a complete `/dev/kvm` backend; Linux integration and guest state switching
 remain required before enabling it on a production boot.
+An ESP `chosen.aura,pv=1` or `chosen.aura,pv=0` configuration line selects the
+PV policy for the next reboot. It does not change a running kernel.
 
 The `tso=` payload setting is independent of both KVM modes. It controls the
 Mach-O handoff's TSO setup and does not imply NV2 or PV-KVM.
