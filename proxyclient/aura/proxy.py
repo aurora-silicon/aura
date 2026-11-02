@@ -667,6 +667,7 @@ class AuraProxy(Reloadable):
 
     P_TUNABLES_APPLY_GLOBAL = 0xa00
     P_TUNABLES_APPLY_LOCAL = 0xa01
+    P_TUNABLES_APPLY_LOCAL_ADDR = 0xa02
 
     P_DART_INIT = 0xb00
     P_DART_SHUTDOWN = 0xb01
@@ -1148,7 +1149,7 @@ class AuraProxy(Reloadable):
     def tunables_apply_local(self, path, prop, reg_offset):
         return self.request(self.P_TUNABLES_APPLY_LOCAL, path, prop, reg_offset)
     def tunables_apply_local_addr(self, path, prop, base):
-        return self.request(self.P_TUNABLES_APPLY_LOCAL, path, prop, base)
+        return self.request(self.P_TUNABLES_APPLY_LOCAL_ADDR, path, prop, base)
 
     def dart_init(self, base, sid, dart_type=DART.T8020):
         return self.request(self.P_DART_INIT, base, sid, dart_type)
