@@ -318,6 +318,9 @@ static u32 cpu_start_bit(int index, const struct cpu_info *cpu)
     /* T8142 has six E cores followed by four P cores, not four-core banks. */
     if (chip_id == T8142)
         return BIT(index);
+    /* T6050 has six start slots per cluster (18 bits per die; cpu-ids skip slot 5). */
+    if (chip_id == T6050)
+        return BIT(6 * cpu->cluster + cpu->core);
 
     return BIT(4 * cpu->cluster + cpu->core);
 }
