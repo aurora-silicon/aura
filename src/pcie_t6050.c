@@ -691,6 +691,56 @@ static int iommu_for_rid(void *dt, int host, u32 rid)
     return -FDT_ERR_NOTFOUND;
 }
 
+/* The ADT's local tunable records: offset, size, mask, value */
+struct adt_tunable {
+    u32 offset;
+    u32 size;
+    u64 mask;
+    u64 value;
+} PACKED;
+
+/*
+ * Copy an up port's link tunables from its ADT bridge onto its root port node as apple,<name>, in
+ * (offset, 4, mask, value) cells: what Linux applies when it resets and retrains the root port
+ * (the N1's port cycle). Only 32-bit records exist in these lists; anything else is refused.
+ */
+static int copy_port_tunables(void *dt, int rp, const struct port_regs *pp)
+{
+    static const char *const props[] = {
+        "apcie-config-tunables",        "pcie-rc-tunables",
+        "pcie-rc-gen3-shadow-tunables", "pcie-rc-gen4-shadow-tunables",
+        "pcie-rc-gen5-shadow-tunables",
+    };
+    int bridge = adt_path_offset(adt, pp->bridge);
+
+    if (bridge < 0)
+        return -1;
+    for (size_t i = 0; i < ARRAY_SIZE(props); i++) {
+        u32 len;
+        const struct adt_tunable *t = adt_getprop(adt, bridge, props[i], &len);
+        fdt32_t cells[4 * 16];
+        char name[48];
+        size_t n = t ? len / sizeof(*t) : 0;
+
+        if (!t)
+            continue;
+        if (len % sizeof(*t) || n > ARRAY_SIZE(cells) / 4)
+            return -1;
+        for (size_t k = 0; k < n; k++) {
+            if (t[k].size != 4 || t[k].mask >> 32 || t[k].value >> 32)
+                return -1;
+            cells[4 * k] = cpu_to_fdt32(t[k].offset);
+            cells[4 * k + 1] = cpu_to_fdt32(4);
+            cells[4 * k + 2] = cpu_to_fdt32((u32)t[k].mask);
+            cells[4 * k + 3] = cpu_to_fdt32((u32)t[k].value);
+        }
+        snprintf(name, sizeof(name), "apple,%s", props[i]);
+        if (fdt_setprop(dt, rp, name, cells, n * 4 * sizeof(*cells)))
+            return -1;
+    }
+    return 0;
+}
+
 /* Disable each optional port that is not up in the handed-over tree: its root port node
  * (pci@<port>,0) and the DART its secondary bus maps to. Linux probes an enabled DART whether or
  * not the port trained, and an untrained port's DART takes an SError. */
@@ -701,11 +751,18 @@ int pcie_t6050_handoff_fdt(void *dt)
     if (host < 0)
         return 0;
     for (size_t i = 0; i < ARRAY_SIZE(ports); i++) {
-        if (pr[i].up || ports[i].required)
-            continue;
         char name[16];
         snprintf(name, sizeof(name), "pci@%d,0", ports[i].port);
         int rp = fdt_subnode_offset(dt, host, name);
+        if (pr[i].up) {
+            if (rp >= 0 && copy_port_tunables(dt, rp, &pr[i])) {
+                printf("pcie-t6050: port %d: could not copy its tunables\n", ports[i].port);
+                return -1;
+            }
+            continue;
+        }
+        if (ports[i].required)
+            continue;
         int dart = iommu_for_rid(dt, host, (u32)ports[i].bus << 8);
         /* A port the tree describes needs both; one it does not (no root port, no iommu-map entry)
          * is not Linux's to probe, and nothing is disabled for it */
