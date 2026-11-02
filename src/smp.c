@@ -395,7 +395,7 @@ static int smp_start_cpu(int index, const struct cpu_info *cpu)
         write64(cpu->impl_reg, (u64)_vectors_start);
     }
 
-    u64 start_base = cpu_start_base + cpu->die * PMGR_DIE_OFFSET;
+    u64 start_base = cpu_start_base + cpu->die * pmgr_die_stride();
 
     // Some kind of system level startup/status bit
     // Without this, IRQs don't work
@@ -441,7 +441,7 @@ static int smp_stop_cpu(int index, const struct cpu_info *cpu, bool deep_sleep)
         }
 
         printf("Stopping CPU %d (%d:%d:%d)... ", index, cpu->die, cpu->cluster, cpu->core);
-        u64 start_base = cpu_start_base + cpu->die * PMGR_DIE_OFFSET;
+        u64 start_base = cpu_start_base + cpu->die * pmgr_die_stride();
         cpu_stop_state[index].flag = spin_table[index].flag;
         cpu_stop_state[index].deep_sleep = deep_sleep;
         cpu_stop_state[index].pending = true;

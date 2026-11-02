@@ -7218,7 +7218,7 @@ static int dt_disable_missing_devs(const char *adt_prefix, const char *dt_prefix
             int die_node = fdt_path_offset(dt, path);
             if (die_node < 0) {
                 /* this should use aliases for the soc nodes */
-                u64 die_unit_addr = die * PMGR_DIE_OFFSET + 0x200000000;
+                u64 die_unit_addr = die * pmgr_die_stride() + 0x200000000;
                 snprintf(path, sizeof(path), "/soc@%lx", die_unit_addr);
             }
         }

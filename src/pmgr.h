@@ -5,6 +5,7 @@
 
 #include "types.h"
 
+/* Die-to-die MMIO stride when the ADT has no /arm-io/pmgr die-stride (T6002, T6022). */
 #define PMGR_DIE_OFFSET 0x2000000000
 
 #define PMGR_DEVICE_ID GENMASK(15, 0)
@@ -17,6 +18,7 @@
 extern const char *pmgr_name;
 
 int pmgr_init(void);
+u64 pmgr_die_stride(void);
 
 int pmgr_power_enable(u32 id);
 int pmgr_power_disable(u32 id);
