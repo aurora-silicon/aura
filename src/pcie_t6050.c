@@ -3,6 +3,7 @@
 #include "adt.h"
 #include "pcie.h"
 #include "pmgr.h"
+#include "smc.h"
 #include "string.h"
 #include "tunables.h"
 #include "utils.h"
@@ -27,16 +28,19 @@
 #define T6050_GP_PORTS 4
 
 /* The ports brought up, in order. Port 2 is required (the result of pcie_t6050_init); the rest are
- * optional: a stop there leaves that port down and the others as they are. */
+ * optional: a stop there leaves that port down and the others as they are. A port whose bridge has an
+ * SMC function-reset (port 0: the N1, gP13) has it released before its link comes up. */
 static const struct t6050_port {
     int port;
     int bus; /* its root port's secondary bus */
-    u32 endpoint_id;
+    u32 endpoint_id[2]; /* function 0's vendor/device; the second, if set, an alternative */
     const char *endpoint;
     bool required;
 } ports[] = {
-    {2, 1, 0x812710ec, "RTL8127A", true},
-    {3, 2, 0x21421b21, "ASM3142 xHCI", false},
+    {2, 1, {0x812710ec}, "RTL8127A", true},
+    {3, 2, {0x21421b21}, "ASM3142 xHCI", false},
+    /* The N1's control function: 1900 in its ROM personality, 1901 once its firmware runs */
+    {0, 3, {0x1900106b, 0x1901106b}, "N1 Wi-Fi/Bluetooth", false},
 };
 
 /* apcie0 "reg": shared windows, then six per port */
@@ -367,10 +371,17 @@ static int stage_a(void)
     static const char *const raise[] = {"APCIE_SYS_GP", "APCIE_PHY_SW", "APHY_GP_AUS5"};
 
     /* Every port still to be brought up is held in reset as iBoot leaves it */
-    for (size_t i = 0; i < ARRAY_SIZE(ports); i++)
-        if (pr[i].ctl && !(read32(pr[i].ctl + PORT_LINKSTS) & BIT(0)) &&
-            (read32(pr[i].perst) & GPIO_PERST_MASK) != GPIO_PERST_LOW)
+    for (size_t i = 0; i < ARRAY_SIZE(ports); i++) {
+        if (!pr[i].ctl || read32(pr[i].ctl + PORT_LINKSTS) & BIT(0) ||
+            (read32(pr[i].perst) & GPIO_PERST_MASK) == GPIO_PERST_LOW)
+            continue;
+        if (ports[i].required)
             FAIL("port %d PERST# is not output-low: 0x%x\n", ports[i].port, read32(pr[i].perst));
+        /* An optional port not left in reset is not ours to sequence: it stays as found */
+        printf("pcie-t6050: port %d PERST# is not output-low (0x%x): left down\n", ports[i].port,
+               read32(pr[i].perst));
+        pr[i].ctl = 0;
+    }
     for (size_t i = 0; i < ARRAY_SIZE(keep); i++)
         if (pmgr_power_is_on(0, keep[i]) != 1)
             FAIL("%s is not active, and it is not ours to raise\n", keep[i]);
@@ -564,8 +575,9 @@ static int stage_f(const struct port_regs *pp)
         FAIL("secondary bus is %d, not %d\n", (buses >> 8) & 0xff, bus);
     }
     u32 id = read32(r.ecam + ((u64)bus << 20));
-    if (id != pp->p->endpoint_id)
+    if (id != pp->p->endpoint_id[0] && (!pp->p->endpoint_id[1] || id != pp->p->endpoint_id[1]))
         FAIL("endpoint %02x:00.0 is 0x%08x\n", bus, id);
+    printf("pcie-t6050: port %d endpoint %04x:%04x\n", pp->p->port, id & 0xffff, id >> 16);
     return 0;
 }
 
@@ -577,8 +589,14 @@ static int stage_g(const struct port_regs *pp)
     for (int i = 0; i < 64; i++)
         if (read32(p2 + PORT_RID2SID + 4 * i) & PORT_RID2SID_EN)
             FAIL("RID route %d is already valid\n", i);
-    if (read32(r.ecam + ((u64)pp->p->bus << 20) + PCI_COMMAND) & 7)
-        FAIL("endpoint I/O, memory or bus mastering enabled\n");
+    /* Every function present (the N1 is multi-function): no decoding, no bus mastering */
+    for (int fn = 0; fn < 8; fn++) {
+        u64 cfg = r.ecam + ((u64)pp->p->bus << 20) + ((u64)fn << 12);
+        if (read32(cfg) == 0xffffffff)
+            continue;
+        if (read32(cfg + PCI_COMMAND) & 7)
+            FAIL("endpoint function %d I/O, memory or bus mastering enabled\n", fn);
+    }
     if (read32(pp->dart + 0x200) || read32(pp->dart + 0x208) || read32(pp->dart + 0xc00))
         FAIL("DART%d protection or streams no longer 0\n", pp->p->port);
     return 0;
@@ -592,6 +610,11 @@ static int port_up(struct port_regs *pp)
     if (read32(p2 + PORT_LINKSTS) & BIT(0)) {
         printf("pcie-t6050: port %d already has a link: adopting it\n", pp->p->port);
     } else {
+        int ret = smc_adt_function_reset(pp->bridge, 50);
+        if (ret < 0)
+            FAIL("port %d: its SMC function-reset was not released\n", pp->p->port);
+        if (!ret)
+            mdelay(100); /* the endpoint out of reset before the port's own reset table */
         TRY(stage_b(pp));
         TRY(stage_c(pp));
         TRY(stage_d(pp));
@@ -628,7 +651,7 @@ int pcie_t6050_init(void)
 
     bool any_down = false;
     for (size_t i = 0; i < ARRAY_SIZE(ports); i++)
-        any_down |= !(read32(pr[i].ctl + PORT_LINKSTS) & BIT(0));
+        any_down |= pr[i].ctl && !(read32(pr[i].ctl + PORT_LINKSTS) & BIT(0));
     if (any_down || !(read32(r.rc + 0x58) & BIT(0))) {
         TRY(stage_a());
         TRY(storage_check("after A", false));
@@ -684,6 +707,12 @@ int pcie_t6050_handoff_fdt(void *dt)
         snprintf(name, sizeof(name), "pci@%d,0", ports[i].port);
         int rp = fdt_subnode_offset(dt, host, name);
         int dart = iommu_for_rid(dt, host, (u32)ports[i].bus << 8);
+        /* A port the tree describes needs both; one it does not (no root port, no iommu-map entry)
+         * is not Linux's to probe, and nothing is disabled for it */
+        if (rp == -FDT_ERR_NOTFOUND && dart == -FDT_ERR_NOTFOUND) {
+            printf("pcie-t6050: port %d down and not in the tree\n", ports[i].port);
+            continue;
+        }
         if (rp < 0 || dart < 0) {
             printf("pcie-t6050: port %d down, but its %s is not in the tree\n", ports[i].port,
                    rp < 0 ? "root port" : "DART");
