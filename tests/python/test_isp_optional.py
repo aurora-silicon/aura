@@ -35,6 +35,7 @@ typedef unsigned long u64;
 typedef uint32_t u32;
 #define PACKED __attribute__((packed))
 #define T6030 0x6030
+#define T6040 0x6040
 #define T8140 0x8140
 #define T8132 0x8132
 #define SZ_16K 16384
@@ -44,6 +45,9 @@ typedef uint32_t u32;
 #define ADT_GETPROP(a, n, k, v) ((size_t)0)
 static void *dt, *adt;
 static u32 chip_id = 0x8122;
+static u32 board_id;
+static bool adt_is_compatible(const void *tree, int node, const char *compat)
+{ (void)tree; (void)node; (void)compat; return false; }
 static unsigned char blob[32768];
 ''' + layout + r'''
 static struct adt_segment_ranges segments[2];
