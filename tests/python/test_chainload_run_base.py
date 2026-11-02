@@ -67,7 +67,9 @@ int main(void)
 def test_chainload_places_images_around_t8140_firmware_ro(tmp_path):
     source = (REPO / "src/chainload.c").read_text()
     bodies = function(source, "chainload_run_footprint") + "\n" + \
-        function(source, "chainload_image")
+        function(source, "chainload_run_footprint_at") + "\n" + \
+        function(source, "chainload_image_at") + "\n" + \
+        "#define chainload_image(i, s, v, n) chainload_image_at(i, s, CHAINLOAD_ENTRY_OFFSET, v, n)\n"
     harness = r'''
 #define _GNU_SOURCE
 #include <assert.h>

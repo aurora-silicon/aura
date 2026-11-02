@@ -9,6 +9,7 @@
 #include "malloc.h"
 #include "memory.h"
 #include "nvme.h"
+#include "smp.h"
 #include "stage1_config.h"
 #include "string.h"
 #include "types.h"
@@ -48,7 +49,14 @@ static u64 chainload_run_footprint(const void *image, size_t size)
     return hdr.footprint;
 }
 
-int chainload_image(void *image, size_t size, char **vars, size_t var_cnt)
+/* Running from the staged copy needs a raw image's load header (start.S); a Mach-O has none. */
+static u64 chainload_run_footprint_at(const void *image, size_t size, u64 entry_off)
+{
+    return entry_off == CHAINLOAD_ENTRY_OFFSET ? chainload_run_footprint(image, size) : 0;
+}
+
+/* entry_off: CHAINLOAD_ENTRY_OFFSET for a raw image, from LC_UNIXTHREAD for a flattened Mach-O */
+static int chainload_image_at(void *image, size_t size, u64 entry_off, char **vars, size_t var_cnt)
 {
     u64 new_base = (u64)_base;
     u64 image_size = size;
@@ -120,7 +128,7 @@ int chainload_image(void *image, size_t size, char **vars, size_t var_cnt)
          * base (start.S) while its payload, SEPFW and boot_args stay in the staged copy, below
          * the new high-water.
          */
-        footprint = chainload_run_footprint(image, size);
+        footprint = chainload_run_footprint_at(image, size, entry_off);
         if (!footprint || (new_base & (SZ_16K - 1)) || new_base >= ro_start ||
             footprint > ro_start - new_base) {
             printf("chainload: image overlaps firmware RO and cannot run below it\n");
@@ -138,7 +146,7 @@ int chainload_image(void *image, size_t size, char **vars, size_t var_cnt)
          * it is staged instead and move only its first footprint bytes to our base, which is
          * safe while those stay below the heap.
          */
-        footprint = chainload_run_footprint(image, size);
+        footprint = chainload_run_footprint_at(image, size, entry_off);
         if (!footprint || (new_base & (SZ_16K - 1)) || inherited_top <= new_base ||
             footprint > inherited_top - new_base) {
             printf("chainload: image span overlaps the live heap\n");
@@ -186,7 +194,7 @@ int chainload_image(void *image, size_t size, char **vars, size_t var_cnt)
         copy_size + stub_size <= ram_end - staged &&
         !(ro_status == 1 && staged < ro_end && staged + copy_size + stub_size > ro_start);
     if (!run_base && !park_fw && fits_staged) {
-        u64 run_footprint = chainload_run_footprint(image, size);
+        u64 run_footprint = chainload_run_footprint_at(image, size, entry_off);
         if (run_footprint && !(new_base & (SZ_16K - 1)) && staged >= new_base + run_footprint &&
             (ro_status != 1 || new_base + run_footprint <= ro_start || new_base >= ro_end)) {
             footprint = run_footprint;
@@ -285,10 +293,177 @@ int chainload_image(void *image, size_t size, char **vars, size_t var_cnt)
     next_stage.args[1] = (u64)new_image;
     next_stage.args[2] = new_base;
     next_stage.args[3] = copy_size;
-    next_stage.args[4] = new_base + CHAINLOAD_ENTRY_OFFSET;
+    next_stage.args[4] = new_base + entry_off;
     next_stage.restore_logo = false;
     next_stage.monitor = false;
     return 0;
+}
+
+#define MH_MAGIC_64           0xfeedfacf
+#define LC_SEGMENT_64         0x19
+#define LC_UNIXTHREAD         0x5
+#define ARM_THREAD_STATE64    6
+#define MACHO_FLAT_CAP        (64 * SZ_1M)
+#define MACHO_SEGNAME_PAYLOAD "PYLD"
+
+struct macho_header {
+    u32 magic, cputype, cpusubtype, filetype, ncmds, sizeofcmds, flags, reserved;
+};
+
+struct macho_segment {
+    u32 cmd, cmdsize;
+    char segname[16];
+    u64 vmaddr, vmsize, fileoff, filesize;
+    u32 maxprot, initprot, nsects, flags;
+};
+
+/*
+ * A Mach-O Aura (T6050 enrolls Stage 1 as one), laid out as the host's chainload.py maps it: each
+ * segment at its offset from the lowest vmaddr, zero-filled to its vmsize. The payload segment
+ * (PYLD) comes last and keeps only the file's bytes from its fileoff (boot= and chosen.* lines
+ * appended to the file, as to a raw image); chainload_image_at() appends the variables after those.
+ */
+static int macho_next_cmd(const u8 *file, const struct macho_header *hdr, size_t *off, u32 cmd[2])
+{
+    size_t end = sizeof(*hdr) + hdr->sizeofcmds;
+
+    if (*off > end || end - *off < 2 * sizeof(u32))
+        return -1;
+    memcpy(cmd, file + *off, 2 * sizeof(u32));
+    if (cmd[1] < 2 * sizeof(u32) || cmd[1] > end - *off)
+        return -1;
+    return 0;
+}
+
+static void *chainload_macho_flatten(const u8 *file, size_t file_size, size_t *size, u64 *entry_off)
+{
+    struct macho_header hdr;
+    struct macho_segment seg, pyld = {0};
+    u64 vmin = UINT64_MAX, vmax = 0, entry = 0, text_off = 0, text_size = 0;
+    size_t off;
+    u32 cmd[2];
+
+    if (file_size < sizeof(hdr))
+        return NULL;
+    memcpy(&hdr, file, sizeof(hdr));
+    if (hdr.magic != MH_MAGIC_64 || hdr.sizeofcmds > file_size - sizeof(hdr))
+        return NULL;
+
+    off = sizeof(hdr);
+    for (u32 i = 0; i < hdr.ncmds; i++, off += cmd[1]) {
+        if (macho_next_cmd(file, &hdr, &off, cmd))
+            goto bad;
+        if (cmd[0] == LC_UNIXTHREAD) {
+            /* flavor, count, then x0-x28, fp, lr, sp, pc */
+            u32 state[2];
+            if (entry || cmd[1] < 2 * sizeof(u32) + sizeof(state) + 33 * sizeof(u64))
+                goto bad;
+            memcpy(state, file + off + 2 * sizeof(u32), sizeof(state));
+            if (state[0] != ARM_THREAD_STATE64)
+                goto bad;
+            memcpy(&entry, file + off + 2 * sizeof(u32) + sizeof(state) + 32 * sizeof(u64),
+                   sizeof(entry));
+            continue;
+        }
+        if (cmd[0] != LC_SEGMENT_64)
+            continue;
+        if (cmd[1] < sizeof(seg))
+            goto bad;
+        memcpy(&seg, file + off, sizeof(seg));
+        if (seg.vmaddr > UINT64_MAX - seg.vmsize || seg.fileoff > file_size)
+            goto bad;
+        vmin = min(vmin, seg.vmaddr);
+        /* PYLD's filesize is its capacity (aura.ld): its bytes are the file's from fileoff */
+        if (!strncmp(seg.segname, MACHO_SEGNAME_PAYLOAD, sizeof(seg.segname))) {
+            if (pyld.cmd)
+                goto bad;
+            pyld = seg;
+            continue;
+        }
+        if (seg.filesize > file_size - seg.fileoff || seg.filesize > seg.vmsize)
+            goto bad;
+        vmax = max(vmax, seg.vmaddr + seg.vmsize);
+        if (!strncmp(seg.segname, "TEXT", sizeof(seg.segname))) {
+            text_off = seg.vmaddr;
+            text_size = seg.vmsize;
+        }
+    }
+    /* The payload follows everything else, in memory and in the file */
+    if (!entry || !pyld.cmd || !text_size || vmin >= vmax || pyld.vmaddr < vmax ||
+        pyld.vmaddr - vmin > MACHO_FLAT_CAP || entry < vmin || entry >= vmax)
+        goto bad;
+    u64 extra = file_size - pyld.fileoff;
+    u64 flat_size = pyld.vmaddr - vmin + extra;
+    if (extra > pyld.vmsize || flat_size > MACHO_FLAT_CAP)
+        goto bad;
+    text_off -= vmin;
+    *entry_off = entry - vmin;
+
+    /*
+     * T6050: released secondaries execute at EL2 only inside CTXR_D, which iBoot set around the
+     * enrolled Stage 1. The next image runs at this base: its TEXT must fall inside that span,
+     * with its vectors where the locked RVBARs point, and its entry inside TEXT.
+     */
+    if (chip_id == T6050) {
+        u64 lo, end, base = (u64)_base;
+        if (smp_el2_exec_span(&lo, &end) || text_off != SMP_T6050_VECTORS_OFFSET ||
+            base + text_off < lo || base + text_off > end || text_size > end - (base + text_off) ||
+            *entry_off < text_off || *entry_off - text_off >= text_size) {
+            printf("chainload: T6050 image TEXT [+0x%lx, +0x%lx) is not inside CTXR_D\n", text_off,
+                   text_off + text_size);
+            return NULL;
+        }
+    }
+
+    u8 *flat = memalign(SZ_16K, flat_size);
+    if (!flat) {
+        printf("chainload: no memory for the Mach-O image\n");
+        return NULL;
+    }
+    memset(flat, 0, flat_size);
+    off = sizeof(hdr);
+    for (u32 i = 0; i < hdr.ncmds; i++, off += cmd[1]) {
+        macho_next_cmd(file, &hdr, &off, cmd); /* checked above */
+        if (cmd[0] != LC_SEGMENT_64)
+            continue;
+        memcpy(&seg, file + off, sizeof(seg));
+        if (!strncmp(seg.segname, MACHO_SEGNAME_PAYLOAD, sizeof(seg.segname)))
+            continue;
+        if (seg.fileoff + seg.filesize > pyld.fileoff) {
+            free(flat);
+            goto bad;
+        }
+        memcpy(flat + (seg.vmaddr - vmin), file + seg.fileoff, seg.filesize);
+    }
+    memcpy(flat + (pyld.vmaddr - vmin), file + pyld.fileoff, extra);
+    *size = flat_size;
+    printf("chainload: Mach-O image 0x%lx bytes, entry +0x%lx\n", flat_size, *entry_off);
+    return flat;
+
+bad:
+    printf("chainload: malformed Mach-O\n");
+    return NULL;
+}
+
+/* Place a loaded image as the next stage: a raw image as it is, a Mach-O flattened first. */
+int chainload_image(void *image, size_t size, char **vars, size_t var_cnt)
+{
+    if (size >= sizeof(u32) && *(const u32 *)image == MH_MAGIC_64) {
+        size_t flat_size = 0;
+        u64 entry_off = 0;
+        void *flat = chainload_macho_flatten(image, size, &flat_size, &entry_off);
+        if (!flat)
+            return -1;
+        int ret = chainload_image_at(flat, flat_size, entry_off, vars, var_cnt);
+        free(flat);
+        return ret;
+    }
+    if (chip_id == T6050) {
+        /* A raw image's vectors sit at its base, not where T6050's locked RVBARs point */
+        printf("chainload: T6050 loads only a Mach-O image\n");
+        return -1;
+    }
+    return chainload_image_at(image, size, CHAINLOAD_ENTRY_OFFSET, vars, var_cnt);
 }
 
 #ifdef CHAINLOADING
