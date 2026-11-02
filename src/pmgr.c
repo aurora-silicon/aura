@@ -661,16 +661,21 @@ int pmgr_adt_reset(const char *path)
     return ret;
 }
 
+/* The real device named `name`: a virtual (no_ps) child may share its parent's name (T6050
+ * APCIE_PHY_SW). */
+static const struct pmgr_device *pmgr_find_device_by_name(const char *name)
+{
+    for (size_t i = 0; i < pmgr_devices_len; i++) {
+        const struct pmgr_device *dev = &pmgr_devices[i];
+        if (!(dev->flags & PMGR_FLAG_VIRTUAL) && !strncmp(dev->name, name, sizeof(dev->name)))
+            return dev;
+    }
+    return NULL;
+}
+
 int pmgr_reset(int die, const char *name)
 {
-    const struct pmgr_device *dev = NULL;
-
-    for (unsigned int i = 0; i < pmgr_devices_len; ++i) {
-        if (strncmp(pmgr_devices[i].name, name, 0x10) == 0) {
-            dev = &pmgr_devices[i];
-            break;
-        }
-    }
+    const struct pmgr_device *dev = pmgr_find_device_by_name(name);
 
     if (!dev)
         return -1;
@@ -678,23 +683,18 @@ int pmgr_reset(int die, const char *name)
     return pmgr_reset_device(die, dev);
 }
 
-int pmgr_power_on(int die, const char *name)
+uintptr_t pmgr_psreg_by_name(int die, const char *name)
 {
     if (die < 0 || die >= pmgr_dies)
-        return -1;
-    const struct pmgr_device *dev = NULL;
+        return 0;
+    const struct pmgr_device *dev = pmgr_find_device_by_name(name);
 
-    for (unsigned int i = 0; i < pmgr_devices_len; ++i) {
-        if (strncmp(pmgr_devices[i].name, name, 0x10) == 0) {
-            dev = &pmgr_devices[i];
-            break;
-        }
-    }
+    return dev ? pmgr_device_get_addr(die, dev) : 0;
+}
 
-    if (!dev)
-        return -1;
-
-    uintptr_t addr = pmgr_device_get_addr(die, dev);
+int pmgr_power_on(int die, const char *name)
+{
+    uintptr_t addr = pmgr_psreg_by_name(die, name);
 
     if (!addr)
         return -1;
@@ -704,18 +704,11 @@ int pmgr_power_on(int die, const char *name)
 
 int pmgr_power_is_on(int die, const char *name)
 {
-    if (die < 0 || die >= pmgr_dies)
+    uintptr_t addr = pmgr_psreg_by_name(die, name);
+
+    if (!addr)
         return -1;
-    for (size_t i = 0; i < pmgr_devices_len; i++) {
-        const struct pmgr_device *dev = &pmgr_devices[i];
-        if (strncmp(dev->name, name, sizeof(dev->name)))
-            continue;
-        uintptr_t addr = pmgr_device_get_addr(die, dev);
-        if (!addr)
-            return -1;
-        return FIELD_GET(PMGR_PS_ACTUAL, read32(addr)) == PMGR_PS_ACTIVE;
-    }
-    return -1;
+    return FIELD_GET(PMGR_PS_ACTUAL, read32(addr)) == PMGR_PS_ACTIVE;
 }
 
 /*
