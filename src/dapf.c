@@ -432,8 +432,6 @@ int dapf_init(const char *path, int index)
         return -1;
     }
 
-    bool required = dapf_is_j614s() && (!strcmp(path, "/arm-io/dart-aop") ||
-                                        !strcmp(path, "/arm-io/dart-isp0"));
     u32 pwr;
     if (!adt_getprop(adt, node, "clock-gates", &pwr))
         pwr = 0;
@@ -449,8 +447,6 @@ int dapf_init(const char *path, int index)
      */
     u32 inst_len;
     const char *inst = adt_getprop(adt, node, "instance", &inst_len);
-    if (required && (!inst || inst_len < 16 || inst_len % 16))
-        goto out;
     if (inst && inst_len >= 16 && !(inst_len % 16)) {
         int found = -1;
         for (u32 i = 0; i < inst_len / 16; i++) {
@@ -461,27 +457,12 @@ int dapf_init(const char *path, int index)
         }
         if (found < 0) {
             printf("dapf: %s has no DAPF instance; leaving it to firmware\n", path);
-            if (required)
-                goto out;
             ret = 0;
             goto out_nodapf;
         }
         if (found != index)
             printf("dapf: %s: using DAPF reg %d from the ADT (not %d)\n", path, found, index);
         index = found;
-    }
-
-    if (required) {
-        u32 len;
-        u64 check_base, check_size;
-        const void *table = adt_getprop(adt, node, "dapf-instance-0", &len);
-        if (!adt_is_compatible(adt, node, "dart,t8110") || !table || !len ||
-            len % sizeof(struct dapf_t8110_config) ||
-            len % sizeof(struct dapf_t8110b_config) == 0 ||
-            adt_get_reg(adt, dart_path, "reg", index, &check_base, &check_size) < 0 ||
-            !check_base || (check_base & 0x3fff) ||
-            len / sizeof(struct dapf_t8110_config) > check_size / 0x40)
-            goto out;
     }
 
     u64 base;
@@ -622,12 +603,6 @@ int dapf_init_fdt(const void *fdt)
     struct entry *entry = dapf_entries;
 
     while (entry->path != NULL) {
-        if (dapf_is_j614s() && strcmp(entry->path, "/arm-io/dart-mtp") &&
-            strcmp(entry->path, "/arm-io/dart-aop") &&
-            strcmp(entry->path, "/arm-io/dart-isp0")) {
-            entry++;
-            continue;
-        }
         if (chip_id == T8140 && strcmp(entry->path, "/arm-io/dart-mtp") &&
             strcmp(entry->path, "/arm-io/dart-pmp")) {
             printf("dapf: preserving inherited %s state on T8140\n", entry->path);
