@@ -8423,6 +8423,12 @@ int kboot_boot(void *kernel)
         printf("kboot: refusing T6050 handoff after the apcie0 port 2 bring-up stopped\n");
         return -1;
     }
+    /* prepare_dt packed the tree: reopen it into its spare capacity for the status edits */
+    if (chip_id == T6050 &&
+        (fdt_open_into(dt, dt, dt_bufsize) || pcie_t6050_handoff_fdt(dt) || fdt_pack(dt))) {
+        printf("kboot: refusing T6050 handoff: could not mark the down PCIe ports\n");
+        return -1;
+    }
     if (chip_id == T8140) {
         if (ret < 0) {
             printf("kboot: refusing T8140 handoff after partial PCIe setup\n");
