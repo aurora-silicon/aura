@@ -76,13 +76,24 @@ void dockchannel_uart_putbyte(u8 c)
     /*
      * A stalled or undrained FIFO must not block every printf. Wait up to
      * 1 s, which is long enough for a host that drains in bursts not to
-     * lose proxy replies, then drop the byte.
+     * lose proxy replies, then drop the byte. After one such timeout, drop
+     * bytes without waiting until the FIFO has room again: waiting 1 s per
+     * byte turns a stalled host into a boot that looks hung (J775D's KIS
+     * link stops draining at varying points).
      */
-    u64 deadline = mrs(CNTPCT_EL0) + mrs(CNTFRQ_EL0);
-    while (read32(uart_base + DATA_TX_FREE) == 0) {
-        if ((s64)(mrs(CNTPCT_EL0) - deadline) >= 0)
+    static bool stalled = false;
+    if (read32(uart_base + DATA_TX_FREE) == 0) {
+        if (stalled)
             return;
+        u64 deadline = mrs(CNTPCT_EL0) + mrs(CNTFRQ_EL0);
+        while (read32(uart_base + DATA_TX_FREE) == 0) {
+            if ((s64)(mrs(CNTPCT_EL0) - deadline) >= 0) {
+                stalled = true;
+                return;
+            }
+        }
     }
+    stalled = false;
 
     write32(uart_base + DATA_TX8, c);
     TX_ACCEPTED(1);
