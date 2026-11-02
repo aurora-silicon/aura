@@ -1,0 +1,70 @@
+From b065dfb521989dc89741e747721cae7e41fe162a Mon Sep 17 00:00:00 2001
+From: fbalazsy <frantisekbalazsy@gmail.com>
+Date: Tue, 27 Oct 2026 15:29:38 +0100
+Subject: [PATCH 04/11] drm/apple: dual pipe: install the pair with the mode's
+ VRR range
+
+The pair was installed first with adaptive sync off, because the CRTC
+still had VRR disabled, and the compositor then switched VRR on: that
+stopped the pair and installed it again.  When the sink drops its link
+in between (a monitor waking up or switching its input layout), the
+second install fails (set_digital_out_mode 0x6) and the display stays
+dark until the next replug.
+
+Install the pair with the mode's minimum refresh rate from the start,
+whatever the CRTC asks.  A VRR toggle then finds the pair with the same
+timing, colour and rate and keeps it.  Swaps on a VRR mode carry their
+timestamps either way, so the compositor still paces the frames.
+---
+ drivers/gpu/drm/apple/dcp-peer-v26_6.inc | 7 ++++---
+ drivers/gpu/drm/apple/iomfb_template.c   | 9 ++++++---
+ 2 files changed, 10 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/gpu/drm/apple/dcp-peer-v26_6.inc b/drivers/gpu/drm/apple/dcp-peer-v26_6.inc
+index 70e16c5330a2..67dea03eb5d1 100644
+--- a/drivers/gpu/drm/apple/dcp-peer-v26_6.inc
++++ b/drivers/gpu/drm/apple/dcp-peer-v26_6.inc
+@@ -1040,9 +1040,10 @@ int dcp_peer_drm_modeset_26_6(struct apple_dcp *dcp, u32 hdisplay,
+ 	/*
+ 	 * DRM sets the same mode again right after the pair came up.  The
+ 	 * merged pipe no longer resolves the original timing in A364, so a
+-	 * second install would fail and tear the pair down: keep it.  A
+-	 * changed adaptive-sync rate (VRR switched on or off) is applied with a
+-	 * mode set, as on one pipe: the pair is stopped and installed again.
++	 * second install would fail and tear the pair down: keep it.  The pair
++	 * runs with the mode's adaptive-sync rate, so VRR switched on or off
++	 * keeps it too; only a changed rate for the same timing (a new mode
++	 * list) stops the pair and installs it again.
+ 	 */
+ 	scoped_guard(mutex, &dcp_peer_lock) {
+ 		if (dcp->peer_tiling.modeset_complete &&
+diff --git a/drivers/gpu/drm/apple/iomfb_template.c b/drivers/gpu/drm/apple/iomfb_template.c
+index 3d1d0b54f92f..d6334e88d3ed 100644
+--- a/drivers/gpu/drm/apple/iomfb_template.c
++++ b/drivers/gpu/drm/apple/iomfb_template.c
+@@ -3012,7 +3012,11 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
+ 
+ 	/*
+ 	 * A mode wider than one pipe goes to both pipes of a reserved pair,
+-	 * with adaptive sync set the same on both.
++	 * with adaptive sync set the same on both.  The pair takes the mode's
++	 * VRR range from its first install, whatever the CRTC asks: switching
++	 * VRR on later would stop and install the pair again, and an install
++	 * that fails (the sink dropped its link meanwhile) leaves the display
++	 * dark.  Swaps keep their timestamps, so the compositor still paces it.
+ 	 */
+ 	if (!dcp->main_display) {
+ 		dev_dbg(dcp->dev, "modeset %ux%u vrr %u min %#x enabled %u\n",
+@@ -3021,8 +3025,7 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
+ 		ret = dcp_peer_drm_modeset_26_6(dcp, crtc_state->mode.hdisplay,
+ 						mode->timing_mode_id,
+ 						mode->color_mode_id,
+-						mode->vrr && crtc_state->vrr_enabled ?
+-						mode->min_vrr : 0);
++						mode->vrr ? mode->min_vrr : 0);
+ 		if (ret != -EOPNOTSUPP) {
+ 			dcp->desktop->mode_live = !ret;
+ 			if (!ret)
+-- 
+2.56.0
+

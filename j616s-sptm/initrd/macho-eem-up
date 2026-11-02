@@ -1,0 +1,21 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+# F33: EEM as its own step, from the ACM shell. The gadget re-enumerates with ACM 0, ACM 1 and EEM; the ACM shell and log come back
+# on the host. Each sub-step is named on the panel before it runs. A stop after "EEM: link up" is the first bulk OUT traffic.
+say() { echo "$1" > /dev/kmsg; }
+# the UDC rebind hangs up ttyGS0 and with it this shell's session: go on detached, the panel and ACM 1 carry the lines
+[ "$1" = --detached ] || { setsid "$0" --detached </dev/null >/dev/null 2>&1 & echo "macho-eem-up runs detached, watch the log"; exit 0; }
+g=/sys/kernel/config/usb_gadget/macho
+[ -d $g ] || { say "EEM: no gadget, run usb_acm_up first"; exit 1; }
+say "EEM: insmod usb_f_eem"; insmod /lib/modules/usb_f_eem.ko 2>/dev/kmsg; say "EEM: insmod rc=$?"
+say "EEM: unbinding UDC (ACM drops for a moment)"; echo "" > $g/UDC
+mkdir -p $g/functions/eem.usb0; ln -s $g/functions/eem.usb0 $g/configs/c.1/eem.usb0 2>/dev/null
+say "EEM: binding UDC"; echo 392280000.usb > $g/UDC; say "EEM: bound rc=$?"
+i=0; while [ "$(cat /sys/class/udc/392280000.usb/state 2>/dev/null)" != configured ] && [ $i -lt 100 ]; do sleep 0.1; i=$((i+1)); done
+n=$(cat $g/functions/eem.usb0/ifname 2>/dev/null); say "EEM: state $(cat /sys/class/udc/392280000.usb/state) iface $n"
+ip link set lo up; ip addr add 192.168.77.2/24 dev "$n" 2>/dev/kmsg
+say "EEM: link up next (rx requests mapped FROM_DEVICE, host packets arrive)"; ip link set "$n" up 2>/dev/kmsg; say "EEM: link up rc=$?"
+sleep 2; say "EEM: after 2 s rx $(cat /sys/class/net/$n/statistics/rx_packets) tx $(cat /sys/class/net/$n/statistics/tx_packets)"
+mkdir -p /dev/pts /run /var/empty; mount -t devpts devpts /dev/pts 2>/dev/null
+say "EEM: sshd next"; /usr/bin/sshd -f /etc/ssh/sshd_config 2>/dev/kmsg; say "EEM: sshd rc=$? on 192.168.77.2:22"
+sleep 5; say "EEM: after 7 s rx $(cat /sys/class/net/$n/statistics/rx_packets) tx $(cat /sys/class/net/$n/statistics/tx_packets)"

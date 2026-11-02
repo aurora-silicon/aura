@@ -1,0 +1,768 @@
+From a8f2181a16df31f034d1fbb41d6735eb1f404e87 Mon Sep 17 00:00:00 2001
+From: Dj <43033058+DjDeveloperr@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 02:34:15 -0400
+Subject: [PATCH 11/11] nvme: apple: Add resident T6050 ANS over APIF
+
+Add resident ANS queue support through APIF, including retained queue metadata, completion handling, and native SART ownership. Port the controller changes onto the current NVMe implementation while preserving the newer platform profiles.
+
+Source snapshot: t6050-gpu ee68abb105200e99636a5edfc647a5cfc1d89954
+Integration base: 9cbdd0734d9e186c5f5f5949a21b909d10c2571b
+
+Signed-off-by: Dj <43033058+DjDeveloperr@users.noreply.github.com>
+(cherry picked from commit 3883df4948fce7d9d4e712b0eb5bb51e436bf7f5)
+---
+ .../bindings/nvme/apple,nvme-apif.yaml        |  79 ++++
+ drivers/nvme/host/Kconfig                     |   1 +
+ drivers/nvme/host/apple-apif.h                | 343 ++++++++++++++++++
+ drivers/nvme/host/apple.c                     |  88 ++++-
+ tools/testing/selftests/aurora-apif/nvme.py   |   7 +
+ 5 files changed, 511 insertions(+), 7 deletions(-)
+ create mode 100644 Documentation/devicetree/bindings/nvme/apple,nvme-apif.yaml
+ create mode 100644 drivers/nvme/host/apple-apif.h
+ create mode 100755 tools/testing/selftests/aurora-apif/nvme.py
+
+diff --git a/Documentation/devicetree/bindings/nvme/apple,nvme-apif.yaml b/Documentation/devicetree/bindings/nvme/apple,nvme-apif.yaml
+new file mode 100644
+index 000000000000..9d5b357a5637
+--- /dev/null
++++ b/Documentation/devicetree/bindings/nvme/apple,nvme-apif.yaml
+@@ -0,0 +1,79 @@
++# SPDX-License-Identifier: GPL-2.0-only
++%YAML 1.2
++---
++$id: http://devicetree.org/schemas/nvme/apple,nvme-apif.yaml#
++$schema: http://devicetree.org/meta-schemas/core.yaml#
++
++title: Resident Apple ANS controller using the Aurora platform interface
++
++maintainers:
++  - Dj <hey@djdev.me>
++
++description: |
++  A boot-time guest description for the native table-6 ABI with 64-entry
++  linear queues. The producer stops all NVMe DMA and quiesces both sides
++  of RTKit before handoff. Native queue registrations survive controller
++  disable, so the consumer must reuse the four registered queue pages.
++  This binding describes an ABI, not a promise of support for every SoC.
++  The controller uses identity DMA addresses and coherent shared memory.
++
++properties:
++  compatible:
++    const: apple,nvme-apif
++  reg:
++    items:
++      - description: NVMe controller registers
++      - description: ANS coprocessor control registers
++  reg-names:
++    items:
++      - const: nvme
++      - const: ans
++  interrupts:
++    maxItems: 1
++  mboxes:
++    maxItems: 1
++  apple,sart:
++    $ref: /schemas/types.yaml#/definitions/phandle
++    description: SART provider for the resident controller
++  aurora,apif:
++    $ref: /schemas/types.yaml#/definitions/phandle
++    description: Version-2 native APIF transport
++  dma-coherent: true
++  asahi,rtkit-quiesced:
++    type: boolean
++    description: Both RTKit peers were stopped before their buffers were released
++  memory-region:
++    minItems: 4
++    maxItems: 4
++  memory-region-names:
++    items:
++      - const: admin-sq
++      - const: admin-cq
++      - const: io-sq
++      - const: io-cq
++  power-domains:
++    minItems: 2
++    maxItems: 3
++  power-domain-names:
++    minItems: 2
++    items:
++      - const: ans
++      - const: apcie0
++      - enum: [apcie1, apcie_phy]
++  resets:
++    maxItems: 1
++
++required:
++  - compatible
++  - reg
++  - reg-names
++  - interrupts
++  - mboxes
++  - apple,sart
++  - aurora,apif
++  - dma-coherent
++  - asahi,rtkit-quiesced
++  - memory-region
++  - memory-region-names
++
++additionalProperties: false
+diff --git a/drivers/nvme/host/Kconfig b/drivers/nvme/host/Kconfig
+index de0fa1409628..139d0d691e6b 100644
+--- a/drivers/nvme/host/Kconfig
++++ b/drivers/nvme/host/Kconfig
+@@ -128,6 +128,7 @@ config NVME_APPLE
+ 	depends on APPLE_RTKIT && APPLE_SART
+ 	depends on ARCH_APPLE || COMPILE_TEST
+ 	select BLK_INLINE_ENCRYPTION
++	select AURORA_APIF_MMIO if ARM64_16K_PAGES
+ 	select NVME_CORE
+ 	help
+ 	  This provides support for the NVMe controller embedded in Apple SoCs
+diff --git a/drivers/nvme/host/apple-apif.h b/drivers/nvme/host/apple-apif.h
+new file mode 100644
+index 000000000000..53d29b5c3b8c
+--- /dev/null
++++ b/drivers/nvme/host/apple-apif.h
+@@ -0,0 +1,343 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/* Resident ANS uses native table 6; Linux owns queue and DMA lifetimes. */
++#define APPLE_NVME_APIF_PAGES 257
++#define APPLE_NVME_APIF_LIST_SIZE SZ_4K
++
++static inline void **apple_nvme_iod_list(struct request *req);
++static inline struct apple_nvme *
++queue_to_apple_nvme(struct apple_nvme_queue *q);
++
++static int apple_nvme_apif_translate(struct apple_nvme *anv, u64 address,
++				     size_t size, u64 *pa)
++{
++	struct aurora_apif_op op = {
++		.selector = AURORA_APIF_SELECTOR(AURORA_APIF_SERVICE,
++						 AURORA_APIF_TRANSLATE),
++		.arg = { address, size },
++	};
++	int ret = aurora_apif_submit(anv->apif, &op, 1, NULL);
++
++	if (!ret)
++		*pa = op.ret;
++	return ret;
++}
++
++static int apple_nvme_apif_handoff(struct apple_nvme *anv)
++{
++	static const char *const names[] = {
++		"admin-sq",
++		"admin-cq",
++		"io-sq",
++		"io-cq",
++	};
++	struct device_node *np = anv->dev->of_node;
++	phys_addr_t addresses[ARRAY_SIZE(names)];
++	int i, j;
++
++	/* Only admit an explicit stopped mailbox and four pinned queue pages.
++	 * CC.EN/RDY describe controller state, not ownership of the RTKit session.
++	 */
++	if (!IS_ENABLED(CONFIG_AURORA_APIF_MMIO) ||
++	    !of_property_read_bool(np, "asahi,rtkit-quiesced") ||
++	    !dev_is_dma_coherent(anv->dev) ||
++	    of_count_phandle_with_args(np, "memory-region", NULL) !=
++		    ARRAY_SIZE(names) ||
++	    of_property_count_strings(np, "memory-region-names") !=
++		    ARRAY_SIZE(names))
++		return -EINVAL;
++	for (i = 0; i < ARRAY_SIZE(names); i++) {
++		struct device_node *node;
++		struct reserved_mem *rmem;
++		int index = of_property_match_string(np, "memory-region-names",
++						     names[i]);
++
++		if (index < 0)
++			return index;
++		node = of_parse_phandle(np, "memory-region", index);
++		if (!node)
++			return -EINVAL;
++		rmem = of_reserved_mem_lookup(node);
++		if (!rmem || !of_property_read_bool(node, "no-map") ||
++		    !IS_ALIGNED(rmem->base, SZ_16K) || rmem->size != SZ_16K) {
++			of_node_put(node);
++			return -EINVAL;
++		}
++		addresses[i] = rmem->base;
++		of_node_put(node);
++		for (j = 0; j < i; j++)
++			if (addresses[j] == addresses[i])
++				return -EINVAL;
++	}
++	return 0;
++}
++
++static void apple_nvme_apif_free(void *data)
++{
++	struct apple_nvme *anv = data;
++
++	if (READ_ONCE(anv->quarantined))
++		return;
++	if (anv->apif_scratch)
++		dma_free_coherent(anv->dev, SZ_16K, anv->apif_scratch,
++				  anv->apif_scratch_dma);
++	kfree(anv->apif_ops);
++	aurora_apif_put(anv->apif);
++}
++
++static int apple_nvme_apif_init(struct apple_nvme *anv)
++{
++	int ret;
++
++	anv->apif = aurora_apif_get(anv->dev);
++	if (IS_ERR(anv->apif))
++		return PTR_ERR(anv->apif);
++	ret = devm_add_action_or_reset(anv->dev, apple_nvme_apif_free, anv);
++	if (ret)
++		return ret;
++	anv->apif_ops = kcalloc(APPLE_NVME_APIF_PAGES, sizeof(*anv->apif_ops),
++				GFP_KERNEL);
++	anv->apif_scratch = dma_alloc_coherent(
++		anv->dev, SZ_16K, &anv->apif_scratch_dma, GFP_KERNEL);
++	return anv->apif_ops && anv->apif_scratch ? 0 : -ENOMEM;
++}
++
++static void apple_nvme_apif_queue_free(struct apple_nvme *anv,
++				       struct apple_nvme_queue *q)
++{
++	if ((q->apif_grants & BIT(0)) &&
++	    apple_sart_remove_allowed_region(anv->sart, q->sq_dma_addr, SZ_16K))
++		dev_err(anv->dev,
++			"retaining pinned SQ grant after failed SART unmap\n");
++	if ((q->apif_grants & BIT(1)) &&
++	    apple_sart_remove_allowed_region(anv->sart, q->cq_dma_addr, SZ_16K))
++		dev_err(anv->dev,
++			"retaining pinned CQ grant after failed SART unmap\n");
++	if (q->tcbs && apple_sart_remove_allowed_region(
++			       anv->sart, q->tcb_dma_addr, SZ_16K)) {
++		dev_err(anv->dev,
++			"retaining TCB page after failed SART unmap\n");
++		return;
++	}
++	if (q->tcbs)
++		dma_free_coherent(anv->dev, SZ_16K, q->tcbs, q->tcb_dma_addr);
++	/* SQ/CQ pages remain reserved for the entire machine boot. */
++}
++
++static int apple_nvme_apif_queue_alloc(struct apple_nvme *anv,
++				       struct apple_nvme_queue *q)
++{
++	struct device_node *np = anv->dev->of_node;
++	const char *names[] = { q->is_adminq ? "admin-sq" : "io-sq",
++				q->is_adminq ? "admin-cq" : "io-cq" };
++	int i, ret;
++
++	for (i = 0; i < ARRAY_SIZE(names); i++) {
++		struct device_node *node;
++		struct reserved_mem *rmem;
++		void *buffer;
++		int index = of_property_match_string(np, "memory-region-names",
++						     names[i]);
++
++		if (index < 0)
++			return index;
++		node = of_parse_phandle(np, "memory-region", index);
++		rmem = of_reserved_mem_lookup(node);
++		of_node_put(node);
++		if (!rmem)
++			return -EINVAL;
++		buffer = devm_memremap(anv->dev, rmem->base, SZ_16K,
++				       MEMREMAP_WB);
++		if (IS_ERR(buffer))
++			return PTR_ERR(buffer);
++		ret = apple_sart_add_allowed_region(
++			anv->sart, phys_to_dma(anv->dev, rmem->base), SZ_16K);
++		if (ret)
++			return ret;
++		q->apif_grants |= BIT(i);
++		memset(buffer, 0, SZ_16K);
++		if (!i) {
++			q->sqes = buffer;
++			q->sq_dma_addr = phys_to_dma(anv->dev, rmem->base);
++		} else {
++			q->cqes = buffer;
++			q->cq_dma_addr = phys_to_dma(anv->dev, rmem->base);
++		}
++	}
++	q->tcbs = dma_alloc_coherent(anv->dev, SZ_16K, &q->tcb_dma_addr,
++				     GFP_KERNEL);
++	if (!q->tcbs)
++		return -ENOMEM;
++	ret = apple_sart_add_allowed_region(anv->sart, q->tcb_dma_addr, SZ_16K);
++	if (ret) {
++		dma_free_coherent(anv->dev, SZ_16K, q->tcbs, q->tcb_dma_addr);
++		q->tcbs = NULL;
++		return ret;
++	}
++	q->cq_phase = 1;
++	return 0;
++}
++
++static int apple_nvme_apif_admin(struct apple_nvme *anv)
++{
++	struct aurora_apif_op ops[] = {
++		{ .selector = AURORA_APIF_SELECTOR(6, 3), .arg = { 253, 2 } },
++		{ .selector = AURORA_APIF_SELECTOR(6, 0) },
++		{ .selector = AURORA_APIF_SELECTOR(6, 4),
++		  .arg = { 0, APPLE_NVME_AQ_DEPTH - 1, 0,
++			   APPLE_NVME_AQ_DEPTH - 1 } },
++		{ .selector = AURORA_APIF_SELECTOR(6, 5),
++		  .arg = { anv->hw->max_queue_depth - 1,
++			   anv->hw->max_queue_depth - 1 } },
++		{ .selector = AURORA_APIF_SELECTOR(6, 7) },
++		{ .selector = AURORA_APIF_SELECTOR(6, 6) },
++	};
++	int ret;
++
++	ret = apple_nvme_apif_translate(
++		anv, dma_to_phys(anv->dev, anv->adminq.sq_dma_addr), SZ_16K,
++		&ops[2].arg[0]);
++	if (ret)
++		return ret;
++	ret = apple_nvme_apif_translate(
++		anv, dma_to_phys(anv->dev, anv->adminq.cq_dma_addr), SZ_16K,
++		&ops[2].arg[2]);
++	if (ret)
++		return ret;
++	ret = apple_nvme_apif_translate(
++		anv, dma_to_phys(anv->dev, anv->ioq.cq_dma_addr), SZ_16K,
++		&ops[4].arg[0]);
++	if (ret)
++		return ret;
++	ret = apple_nvme_apif_translate(
++		anv, dma_to_phys(anv->dev, anv->ioq.sq_dma_addr), SZ_16K,
++		&ops[5].arg[0]);
++	if (ret)
++		return ret;
++	/* These queue control endpoints have void native results. */
++	return aurora_apif_submit(anv->apif, ops, ARRAY_SIZE(ops), NULL);
++}
++
++/* The shared scratch page is protected by anv->lock, alongside CQ processing. */
++static int apple_nvme_apif_request(struct apple_nvme_queue *q,
++				   struct request *req, bool map)
++{
++	struct apple_nvme *anv = queue_to_apple_nvme(q);
++	struct apple_nvme_iod *iod = blk_mq_rq_to_pdu(req);
++	u32 tag = nvme_tag_from_cid(iod->cmd.common.command_id);
++	struct apple_nvmmu_tcb *copy =
++		anv->apif_scratch + APPLE_NVME_APIF_LIST_SIZE;
++	u64 *list = anv->apif_scratch;
++	struct aurora_apif_op op;
++	u64 first, second, scratch_pa;
++	u32 count, i, done;
++	int ret;
++
++	lockdep_assert_held(&anv->lock);
++	if (tag >= anv->hw->max_queue_depth)
++		return -EINVAL;
++	if (!map) {
++		if (!iod->apif_registered)
++			return 0;
++		op = (struct aurora_apif_op){
++			.selector = AURORA_APIF_SELECTOR(6, 2),
++			.arg = { q->is_adminq ? 0 : 1, tag, 0 },
++		};
++		ret = aurora_apif_submit(anv->apif, &op, 1, NULL);
++		if (ret || op.ret != 1)
++			return ret ?: -EIO;
++		iod->apif_registered = false;
++		return 0;
++	}
++	if (anv->apif_uncertain)
++		return -EIO;
++	first = le64_to_cpu(iod->cmd.common.dptr.prp1);
++	second = le64_to_cpu(iod->cmd.common.dptr.prp2);
++	count = blk_rq_payload_bytes(req) ?
++			DIV_ROUND_UP((first & (SZ_4K - 1)) +
++					     blk_rq_payload_bytes(req),
++				     SZ_4K) :
++			!!first;
++	if (count > APPLE_NVME_APIF_PAGES ||
++	    (count == 1 && !IS_ALIGNED(first, SZ_4K)))
++		return -EINVAL;
++	if (count) {
++		list[0] = first;
++		if (count == 2)
++			list[1] = second;
++		else if (count > 2) {
++			__le64 *prps = apple_nvme_iod_list(req)[0];
++
++			for (i = 1; i < count; i++)
++				list[i] = le64_to_cpu(prps[i - 1]);
++		}
++	}
++	for (i = 0; i < count; i++) {
++		if (i && !IS_ALIGNED(list[i], SZ_4K))
++			return -EINVAL;
++		anv->apif_ops[i] = (struct aurora_apif_op){
++			.selector = AURORA_APIF_SELECTOR(AURORA_APIF_SERVICE,
++							 AURORA_APIF_TRANSLATE),
++			.arg = { dma_to_phys(anv->dev, list[i] & ~(SZ_4K - 1)),
++				 SZ_4K },
++		};
++	}
++	if (count) {
++		ret = aurora_apif_submit(anv->apif, anv->apif_ops, count, NULL);
++		if (ret)
++			return ret;
++		/* Commands and PRP chains carry DMA addresses directly. Until ANS
++		 * supports another aperture, require the identity handoff contract.
++		 */
++		for (i = 0; i < count; i++)
++			if (anv->apif_ops[i].ret != (list[i] & ~(SZ_4K - 1)))
++				return -EINVAL;
++	}
++	ret = apple_nvme_apif_translate(
++		anv, dma_to_phys(anv->dev, anv->apif_scratch_dma), SZ_16K,
++		&scratch_pa);
++	if (ret)
++		return ret;
++	memcpy(copy, &q->tcbs[tag], sizeof(*copy));
++	copy->length = cpu_to_le16(
++		count ? count - ((first & (SZ_4K - 1)) ? 2 : 1) : 0);
++	op = (struct aurora_apif_op){
++		.selector = AURORA_APIF_SELECTOR(6, 1),
++		.arg = { q->is_adminq ? 0 : 1, tag,
++			 scratch_pa + APPLE_NVME_APIF_LIST_SIZE, scratch_pa,
++			 count },
++	};
++	dma_wmb();
++	/* Mark before dispatch: a lost response cannot prove MAP did not run. */
++	iod->apif_registered = true;
++	ret = aurora_apif_submit(anv->apif, &op, 1, &done);
++	if (ret)
++		anv->apif_uncertain = true;
++	return ret;
++}
++
++struct apple_nvme_apif_drain {
++	int error;
++};
++
++static bool apple_nvme_apif_drain_request(struct request *req, void *data)
++{
++	struct apple_nvme_apif_drain *drain = data;
++	struct apple_nvme_iod *iod = blk_mq_rq_to_pdu(req);
++
++	if (iod->apif_registered && apple_nvme_apif_request(iod->q, req, false))
++		drain->error = -EIO;
++	return true;
++}
++
++static int apple_nvme_apif_drain(struct apple_nvme *anv)
++{
++	struct apple_nvme_apif_drain drain = {};
++
++	blk_mq_tagset_busy_iter(&anv->tagset, apple_nvme_apif_drain_request,
++				&drain);
++	blk_mq_tagset_busy_iter(&anv->admin_tagset,
++				apple_nvme_apif_drain_request, &drain);
++	if (!drain.error)
++		anv->apif_uncertain = false;
++	return drain.error;
++}
+diff --git a/drivers/nvme/host/apple.c b/drivers/nvme/host/apple.c
+index 85c74d43873a..0a183af302a3 100644
+--- a/drivers/nvme/host/apple.c
++++ b/drivers/nvme/host/apple.c
+@@ -15,6 +15,7 @@
+ #include <linux/blkdev.h>
+ #include <linux/blk-mq.h>
+ #include <linux/device.h>
++#include <linux/dma-direct.h>
+ #include <linux/dma-mapping.h>
+ #include <linux/dmapool.h>
+ #include <linux/interrupt.h>
+@@ -31,12 +32,14 @@
+ #include <linux/mutex.h>
+ #include <linux/pm_runtime.h>
+ #include <linux/of.h>
++#include <linux/of_reserved_mem.h>
+ #include <linux/of_platform.h>
+ #include <linux/once.h>
+ #include <linux/platform_device.h>
+ #include <linux/pm_domain.h>
+ #include <linux/soc/apple/rtkit.h>
+ #include <linux/soc/apple/sart.h>
++#include <linux/soc/aurora/apif-mmio.h>
+ #include <linux/reset.h>
+ #include <linux/time64.h>
+ 
+@@ -142,6 +145,7 @@ struct apple_nvmmu_tcb {
+  * a MMIO register.
+  */
+ struct apple_nvme_queue {
++	u8 apif_grants;
+ 	struct nvme_command *sqes;
+ 	struct nvme_completion *cqes;
+ 	struct apple_nvmmu_tcb *tcbs;
+@@ -188,6 +192,7 @@ struct apple_nvme_iod {
+ 	struct nvme_request req;
+ 	struct nvme_command cmd;
+ 	struct apple_nvme_queue *q;
++	bool apif_registered;
+ 	int npages; /* In the PRP list. 0 means small pool in use */
+ 	int nents; /* Used in scatterlist */
+ 	dma_addr_t first_dma;
+@@ -210,6 +215,7 @@ struct apple_nvme_hw {
+ 	bool needs_ioq_registers;
+ 	/* T8132 needs a PMGR reset when starting a stopped coprocessor. */
+ 	bool cold_reset;
++	bool apif;
+ 	u32 max_queue_depth;
+ 	unsigned long quirks;
+ };
+@@ -245,6 +251,11 @@ struct apple_nvme {
+ 	struct apple_sart *sart;
+ 	struct apple_rtkit *rtk;
+ 	struct reset_control *reset;
++	struct aurora_apif *apif;
++	struct aurora_apif_op *apif_ops;
++	void *apif_scratch;
++	dma_addr_t apif_scratch_dma;
++	bool apif_uncertain;
+ 	bool owns_rtkit;
+ 	bool inherited_rtkit;
+ 	/* first inclusive, end exclusive pairs; immutable */
+@@ -341,10 +352,16 @@ static void apple_nvme_put_resource_owner(void *data)
+ 		kref_put(&anv->ref, apple_nvme_release);
+ }
+ 
++static int apple_nvme_apif_request(struct apple_nvme_queue *q,
++				   struct request *req, bool map);
++#include "apple-apif.h"
++
+ static bool apple_nvme_can_adopt_rtkit(struct apple_nvme *anv)
+ {
+ 	u32 cc, csts;
+ 
++	if (anv->hw->apif && of_property_read_bool(anv->dev->of_node, "asahi,rtkit-quiesced"))
++		return false;
+ 	if (!anv->hw->needs_ioq_registers ||
+ 	    !(readl(anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL) &
+ 	      APPLE_ANS_COPROC_CPU_CONTROL_RUN) ||
+@@ -380,6 +397,8 @@ static int apple_nvme_read_handoff(struct apple_nvme *anv)
+ 	const char *handoff;
+ 	int ret;
+ 
++	if (anv->hw->apif)
++		return apple_nvme_apif_handoff(anv);
+ 	ret = of_property_read_string(anv->dev->of_node, "apple,rtkit-handoff",
+ 				      &handoff);
+ 	if (ret == -EINVAL)
+@@ -536,6 +555,8 @@ static int apple_nvme_sart_dma_setup(void *cookie,
+ 		return ret;
+ 	}
+ 
++	if (anv->hw->apif)
++		bfr->size = ALIGN(bfr->size, SZ_16K);
+ 	bfr->buffer =
+ 		dma_alloc_coherent(anv->dev, bfr->size, &bfr->iova, GFP_KERNEL);
+ 	if (!bfr->buffer)
+@@ -564,7 +585,10 @@ static void apple_nvme_sart_dma_destroy(void *cookie,
+ 		kfree(mapping);
+ 		return;
+ 	}
+-	apple_sart_remove_allowed_region(anv->sart, bfr->iova, bfr->size);
++	if (apple_sart_remove_allowed_region(anv->sart, bfr->iova, bfr->size)) {
++		dev_err(anv->dev, "retaining RTKit buffer after failed SART unmap\n");
++		return;
++	}
+ 	dma_free_coherent(anv->dev, bfr->size, bfr->buffer, bfr->iova);
+ }
+ 
+@@ -649,6 +673,12 @@ static void apple_nvme_submit_cmd_t8103(struct apple_nvme_queue *q,
+ 	 * and the final CQ update.
+ 	 */
+ 	spin_lock_irq(&anv->lock);
++	if (anv->hw->apif && apple_nvme_apif_request(q, req, true)) {
++		spin_unlock_irq(&anv->lock);
++		/* Timeout recovery stops DMA before cancellation releases this tag. */
++		return;
++	}
++	dma_wmb();
+ 	writel(tag, q->sq_db);
+ 	spin_unlock_irq(&anv->lock);
+ }
+@@ -932,7 +962,7 @@ apple_nvme_queue_tagset(struct apple_nvme *anv, struct apple_nvme_queue *q)
+ 		return anv->tagset.tags[0];
+ }
+ 
+-static inline void apple_nvme_handle_cqe(struct apple_nvme_queue *q,
++static inline bool apple_nvme_handle_cqe(struct apple_nvme_queue *q,
+ 					 struct io_comp_batch *iob, u16 idx)
+ {
+ 	struct apple_nvme *anv = queue_to_apple_nvme(q);
+@@ -940,20 +970,23 @@ static inline void apple_nvme_handle_cqe(struct apple_nvme_queue *q,
+ 	__u16 command_id = READ_ONCE(cqe->command_id);
+ 	struct request *req;
+ 
+-	if (anv->hw->has_lsq_nvmmu)
++	if (anv->hw->has_lsq_nvmmu && !anv->hw->apif)
+ 		apple_nvmmu_inval(q, command_id);
+ 
+ 	req = nvme_find_rq(apple_nvme_queue_tagset(anv, q), command_id);
+ 	if (unlikely(!req)) {
+ 		dev_warn(anv->dev, "invalid id %d completed", command_id);
+-		return;
++		return true;
+ 	}
+ 
++	if (anv->hw->apif && apple_nvme_apif_request(q, req, false))
++		return false;
+ 	if (!nvme_try_complete_req(req, cqe->status, cqe->result) &&
+ 	    !blk_mq_add_to_batch(req, iob,
+ 				 nvme_req(req)->status != NVME_SC_SUCCESS,
+ 				 apple_nvme_complete_batch))
+ 		apple_nvme_complete_rq(req);
++	return true;
+ }
+ 
+ static inline void apple_nvme_update_cq_head(struct apple_nvme_queue *q)
+@@ -981,7 +1014,8 @@ static bool apple_nvme_poll_cq(struct apple_nvme_queue *q,
+ 		 * the cqe requires a full read memory barrier
+ 		 */
+ 		dma_rmb();
+-		apple_nvme_handle_cqe(q, iob, q->cq_head);
++		if (!apple_nvme_handle_cqe(q, iob, q->cq_head))
++			break;
+ 		apple_nvme_update_cq_head(q);
+ 	}
+ 
+@@ -1220,6 +1254,7 @@ static int apple_nvme_init_request(struct blk_mq_tag_set *set,
+ 	struct nvme_request *nreq = nvme_req(req);
+ 
+ 	iod->q = q;
++	iod->apif_registered = false;
+ 	nreq->ctrl = &anv->ctrl;
+ 	nreq->cmd = &iod->cmd;
+ 
+@@ -1367,6 +1402,16 @@ static int apple_nvme_disable_locked(struct apple_nvme *anv, bool shutdown)
+ 		return ret;
+ 	}
+ 
++	if (anv->hw->apif) {
++		spin_lock_irqsave(&anv->lock, flags);
++		ret = apple_nvme_apif_drain(anv);
++		spin_unlock_irqrestore(&anv->lock, flags);
++		if (ret) {
++			apple_nvme_quarantine(anv, ret);
++			return ret;
++		}
++	}
++
+ 	spin_lock_irqsave(&anv->lock, flags);
+ 	apple_nvme_handle_cq(&anv->ioq, true);
+ 	apple_nvme_handle_cq(&anv->adminq, true);
+@@ -1778,6 +1823,12 @@ static void apple_nvme_reset_work(struct work_struct *work)
+ 
+ 	dma_set_max_seg_size(anv->dev, 0xffffffff);
+ 
++	if (anv->hw->apif) {
++		ret = apple_nvme_apif_admin(anv);
++		if (ret)
++			goto out;
++		goto queues_programmed;
++	}
+ 	if (anv->hw->has_lsq_nvmmu) {
+ 		/*
+ 		 * Enable NVMMU and linear submission queues which is required
+@@ -1842,6 +1893,7 @@ static void apple_nvme_reset_work(struct work_struct *work)
+ 				  anv->mmio_nvmmu + APPLE_NVMMU_IOSQ_TCB_BASE);
+ 	}
+ 
++queues_programmed:
+ 	anv->ctrl.sqsize =
+ 		anv->hw->max_queue_depth - 1; /* 0's based queue depth */
+ 	anv->ctrl.cap = readq(anv->mmio_nvme + NVME_REG_CAP);
+@@ -1893,7 +1945,7 @@ static void apple_nvme_reset_work(struct work_struct *work)
+ 		}
+ 	}
+ 	apple_nvme_init_queue(&anv->ioq);
+-	if (anv->hw->needs_ioq_registers) {
++	if (anv->hw->needs_ioq_registers && !anv->hw->apif) {
+ 		/*
+ 		 * Post-M4 firmware also takes the I/O queue addresses through
+ 		 * dedicated registers. Without them it crashes and its crash log
+@@ -2124,6 +2176,10 @@ static void apple_nvme_free_queue(void *data)
+ 
+ 	if (READ_ONCE(anv->quarantined))
+ 		return;
++	if (anv->hw->apif) {
++		apple_nvme_apif_queue_free(anv, q);
++		return;
++	}
+ 	if (q->tcbs)
+ 		dma_free_coherent(anv->dev,
+ 				  anv->hw->max_queue_depth * sizeof(struct apple_nvmmu_tcb),
+@@ -2145,6 +2201,8 @@ static int apple_nvme_queue_alloc(struct apple_nvme *anv,
+ 	ret = devm_add_action_or_reset(anv->dev, apple_nvme_free_queue, q);
+ 	if (ret)
+ 		return ret;
++	if (anv->hw->apif)
++		return apple_nvme_apif_queue_alloc(anv, q);
+ 	q->cqes = dma_alloc_coherent(anv->dev,
+ 				     depth * sizeof(struct nvme_completion),
+ 				     &q->cq_dma_addr, GFP_KERNEL);
+@@ -2425,7 +2483,9 @@ static struct apple_nvme *apple_nvme_alloc(struct platform_device *pdev)
+ 		goto out_detach_genpd;
+ 	}
+ 
+-	anv->reset = devm_reset_control_array_get_exclusive(anv->dev);
++	anv->reset = anv->hw->apif ?
++		devm_reset_control_array_get_optional_exclusive(anv->dev) :
++		devm_reset_control_array_get_exclusive(anv->dev);
+ 	if (IS_ERR(anv->reset)) {
+ 		ret = dev_err_probe(dev, PTR_ERR(anv->reset),
+ 				    "Failed to get reset control");
+@@ -2437,6 +2497,11 @@ static struct apple_nvme *apple_nvme_alloc(struct platform_device *pdev)
+ 	INIT_WORK(&anv->recovery_work, apple_nvme_recovery_work);
+ 	spin_lock_init(&anv->lock);
+ 
++	if (anv->hw->apif) {
++		ret = apple_nvme_apif_init(anv);
++		if (ret)
++			goto out_detach_genpd;
++	}
+ 	ret = apple_nvme_queue_alloc(anv, &anv->adminq);
+ 	if (ret)
+ 		goto out_detach_genpd;
+@@ -2787,7 +2852,16 @@ static const struct apple_nvme_hw apple_nvme_j616_partition_hw = {
+ 	.quirks = NVME_QUIRK_NO_APST,
+ };
+ 
++static const struct apple_nvme_hw apple_nvme_apif_hw = {
++	.has_lsq_nvmmu = true,
++	.needs_ioq_registers = true,
++	.apif = true,
++	.max_queue_depth = 64,
++	.quirks = NVME_QUIRK_BROKEN_FUA,
++};
++
+ static const struct of_device_id apple_nvme_of_match[] = {
++	{ .compatible = "apple,nvme-apif", .data = &apple_nvme_apif_hw },
+ 	{ .compatible = "lab,j616-nvme-partition-25g83", .data = &apple_nvme_j616_partition_hw },
+ 	{ .compatible = "apple,t6041-nvme-ans2", .data = &apple_nvme_t6040_hw },
+ 	{ .compatible = "apple,t8015-nvme-ans2", .data = &apple_nvme_t8015_hw },
+diff --git a/tools/testing/selftests/aurora-apif/nvme.py b/tools/testing/selftests/aurora-apif/nvme.py
+new file mode 100755
+index 000000000000..32e42d2ae40e
+--- /dev/null
++++ b/tools/testing/selftests/aurora-apif/nvme.py
+@@ -0,0 +1,7 @@
++#!/usr/bin/env python3
++# SPDX-License-Identifier: GPL-2.0-only
++"""Run the production NVME fault harness."""
++from apif_mmio import run_tests, nvme_test
++
++if __name__ == "__main__":
++    run_tests([("nvme", nvme_test)])
+-- 
+2.56.0
+

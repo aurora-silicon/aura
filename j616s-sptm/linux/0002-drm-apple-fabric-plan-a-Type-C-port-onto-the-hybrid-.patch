@@ -1,0 +1,199 @@
+From 99a7909cc522ce3c430fece904e5df83e41349e6 Mon Sep 17 00:00:00 2001
+From: fbalazsy <frantisekbalazsy@gmail.com>
+Date: Tue, 27 Oct 2026 15:29:37 +0100
+Subject: [PATCH 02/11] drm/apple: fabric: plan a Type-C port onto the hybrid
+ pipeline from the DT, no debounce without a sink
+
+apple,typec-hybrid-first on dcpext0 (the J616s: the only pipe that can be
+the primary of a display wider than one pipe) makes the fabric plan a
+Type-C port onto the hybrid pipeline first, as appledrm.typec_hybrid_first
+does, so a 7680 px sink on USB-C is paired at boot without a module
+parameter. The pipeline is only available while its fixed output has no
+sink, so an HDMI display plugged in first keeps it.
+
+The HDMI presence debounce (ten seconds) delayed a sample that finds no
+sink where there was none before, at start-up and after system sleep.
+The pipeline still counted as taken when the port was planned at
+start-up, or re-planned after the sink dropped its link in sleep, and
+the port went to the other pipe (a flattened 3840x2160, and after sleep
+no pair). Such a sample now stays absent; a sample after a real unplug is
+debounced as before.
+---
+ .../bindings/display/apple,dcp.yaml           |  9 +++++
+ .../boot/dts/apple/t6040-j616s-extdisp.dtsi   |  2 ++
+ drivers/gpu/drm/apple/dcp-fabric.c            | 35 ++++++++++++++++---
+ drivers/gpu/drm/apple/dcp-internal.h          |  2 ++
+ drivers/gpu/drm/apple/dcp.c                   |  2 ++
+ drivers/gpu/drm/apple/dcp.h                   |  2 ++
+ 6 files changed, 48 insertions(+), 4 deletions(-)
+
+diff --git a/Documentation/devicetree/bindings/display/apple,dcp.yaml b/Documentation/devicetree/bindings/display/apple,dcp.yaml
+index 4297fb616730..38be82bc7d1b 100644
+--- a/Documentation/devicetree/bindings/display/apple,dcp.yaml
++++ b/Documentation/devicetree/bindings/display/apple,dcp.yaml
+@@ -214,6 +214,15 @@ properties:
+     $ref: /schemas/types.yaml#/definitions/uint32
+     description: Display coprocessor index on multi-DCP systems.
+ 
++  apple,typec-hybrid-first:
++    type: boolean
++    description:
++      A hybrid pipeline (a fixed output plus Type-C routes) is planned for a
++      Type-C port before the other pipelines, while its fixed output has no
++      sink, instead of being kept back for that output. Set where this
++      pipeline is the only one that can be the primary of a display wider than
++      one pipe.
++
+   apple,dcp-endpoint:
+     $ref: /schemas/types.yaml#/definitions/uint32
+     description:
+diff --git a/arch/arm64/boot/dts/apple/t6040-j616s-extdisp.dtsi b/arch/arm64/boot/dts/apple/t6040-j616s-extdisp.dtsi
+index c38c36853b02..b6486f293da9 100644
+--- a/arch/arm64/boot/dts/apple/t6040-j616s-extdisp.dtsi
++++ b/arch/arm64/boot/dts/apple/t6040-j616s-extdisp.dtsi
+@@ -75,6 +75,8 @@ dcpext0: dcp@3a2e00000 {
+ 		apple,bw-scratch = <&pmgr_dcp 0 4 0x28000>;
+ 		/* firmware Disp_Index, the dual-pipe endpoint ID */
+ 		apple,dcp-endpoint = <1>;
++		/* the only pipe that can be the primary of a two-pipe display */
++		apple,typec-hybrid-first;
+ 		status = "disabled";
+ 
+ 		dispext0_piodma: piodma {
+diff --git a/drivers/gpu/drm/apple/dcp-fabric.c b/drivers/gpu/drm/apple/dcp-fabric.c
+index b49e277cd840..6e0e049d4700 100644
+--- a/drivers/gpu/drm/apple/dcp-fabric.c
++++ b/drivers/gpu/drm/apple/dcp-fabric.c
+@@ -50,6 +50,19 @@ module_param(typec_follow_crtc, bool, 0444);
+ static bool typec_hybrid_first;
+ module_param(typec_hybrid_first, bool, 0644);
+ MODULE_PARM_DESC(typec_hybrid_first, "Type-C ports take the hybrid (HDMI) pipeline first (dual-pipe primary)");
++
++/* Set by a pipeline whose device tree asks for it (apple,typec-hybrid-first). */
++static bool typec_hybrid_first_dt;
++
++void dcp_typec_hybrid_first_dt(void)
++{
++	WRITE_ONCE(typec_hybrid_first_dt, true);
++}
++
++static bool dcp_typec_hybrid_first(void)
++{
++	return READ_ONCE(typec_hybrid_first) || READ_ONCE(typec_hybrid_first_dt);
++}
+ MODULE_PARM_DESC(typec_follow_crtc,
+ 		 "Let direct DP-alt routes follow their selected CRTC (default: on)");
+ 
+@@ -206,7 +219,7 @@ static bool dcp_typec_route_available(struct apple_dcp_typec_route *route)
+ 	};
+ 
+ 	struct dcp_fabric_policy policy = { .dual_stream = dcp_typec_ordered_dual_stream(),
+-					    .hybrid_first = typec_hybrid_first };
++					    .hybrid_first = dcp_typec_hybrid_first() };
+ 
+ 	pipeline.presence = dcp_hdmi_presence(route->dcp);
+ 	return dcp_fabric_available(&pipeline, &policy);
+@@ -740,6 +753,8 @@ static u64 dcp_hdmi_edge(struct apple_dcp *dcp)
+ 	if (!dcp_hdmi_settle_enabled(dcp))
+ 		return 0;
+ 	spin_lock_irqsave(&dcp->hdmi_presence_lock, flags);
++	if (dcp->hdmi_presence.state != DCP_FABRIC_SETTLING)
++		dcp->hdmi_presence_prev = dcp->hdmi_presence.state;
+ 	generation = dcp_fabric_presence_edge(&dcp->hdmi_presence, jiffies,
+ 					      msecs_to_jiffies(DCP_HDMI_HOLD_MS));
+ 	spin_unlock_irqrestore(&dcp->hdmi_presence_lock, flags);
+@@ -776,6 +791,17 @@ static bool dcp_hdmi_sample(struct apple_dcp *dcp, u64 generation, int level)
+ 	accepted = dcp_fabric_presence_sample(&dcp->hdmi_presence, generation,
+ 					      level > 0, jiffies,
+ 					      msecs_to_jiffies(DCP_HDMI_HOLD_MS));
++	/*
++	 * The debounce guards against a glitch after an unplug.  A sample that
++	 * finds no sink where there was none before (start-up, and the sample
++	 * after system sleep) has nothing to debounce: the pipeline is free
++	 * now, not ten seconds later, when a Type-C port has already been
++	 * planned or moved onto another pipeline.
++	 */
++	if (accepted && level == 0 && dcp->hdmi_presence_prev == DCP_FABRIC_ABSENT) {
++		dcp->hdmi_presence.state = DCP_FABRIC_ABSENT;
++		dcp->hdmi_presence.deadline = 0;
++	}
+ 	spin_unlock_irqrestore(&dcp->hdmi_presence_lock, flags);
+ 	dcp_hdmi_schedule(dcp);
+ 	return accepted;
+@@ -854,6 +880,7 @@ void dcp_fabric_init(struct apple_dcp *dcp)
+ {
+ 	spin_lock_init(&dcp->hdmi_presence_lock);
+ 	dcp->hdmi_presence.state = DCP_FABRIC_ABSENT;
++	dcp->hdmi_presence_prev = DCP_FABRIC_ABSENT;
+ 	INIT_DELAYED_WORK(&dcp->hdmi_settle_wq, dcp_hdmi_settle_work);
+ 	INIT_DELAYED_WORK(&dcp->hdmi_recheck_wq, dcp_hdmi_recheck_work);
+ 	disable_delayed_work(&dcp->hdmi_settle_wq);
+@@ -1082,7 +1109,7 @@ dcp_typec_free_route(struct apple_dcp_typec_port *port)
+ 	struct dcp_fabric_policy policy = {
+ 		.dual_stream = dcp_typec_ordered_dual_stream(),
+ 		.follow = dcp_typec_port_follows(port),
+-		.hybrid_first = typec_hybrid_first,
++		.hybrid_first = dcp_typec_hybrid_first(),
+ 	};
+ 
+ 	dcp_fabric_snapshot_port(port, false);
+@@ -2059,7 +2086,7 @@ static int dcp_tb_candidate(void *data)
+ 		struct dcp_fabric_policy policy = {
+ 			.dual_stream = dcp_typec_ordered_dual_stream(),
+ 			.follow = dcp_typec_port_follows(port),
+-			.hybrid_first = typec_hybrid_first,
++			.hybrid_first = dcp_typec_hybrid_first(),
+ 		};
+ 		struct dcp_fabric_route *chosen;
+ 		bool connector_present = dpin ? !!port->secondary_connector : !!port->connector;
+@@ -2792,7 +2819,7 @@ static int dcp_typec_follow_decide(struct apple_dcp *dcp, struct drm_crtc *crtc,
+ 				   struct dcp_typec_follow *follow)
+ {
+ 	struct dcp_fabric_policy policy = { .dual_stream = dcp_typec_ordered_dual_stream(),
+-					    .hybrid_first = typec_hybrid_first };
++					    .hybrid_first = dcp_typec_hybrid_first() };
+ 	struct apple_dcp_typec_route *from, *to, *holder, *back = NULL;
+ 	struct apple_dcp_typec_port *port, *other = NULL;
+ 	bool secondary, off = false;
+diff --git a/drivers/gpu/drm/apple/dcp-internal.h b/drivers/gpu/drm/apple/dcp-internal.h
+index 545d688b2ea5..f233e9486f78 100644
+--- a/drivers/gpu/drm/apple/dcp-internal.h
++++ b/drivers/gpu/drm/apple/dcp-internal.h
+@@ -713,6 +713,8 @@ struct apple_dcp {
+ 	/* Hardirq, resume and expiry share one generation under this lock. */
+ 	spinlock_t hdmi_presence_lock;
+ 	struct dcp_fabric_presence hdmi_presence;
++	/* The state before the current series of HPD edges began. */
++	enum dcp_fabric_presence_state hdmi_presence_prev;
+ 	unsigned long hdmi_edge_jiffies;
+ 	bool hdmi_edge_seen;
+ 	struct delayed_work hdmi_settle_wq;
+diff --git a/drivers/gpu/drm/apple/dcp.c b/drivers/gpu/drm/apple/dcp.c
+index c472ebdb47a2..786f505dd9ea 100644
+--- a/drivers/gpu/drm/apple/dcp.c
++++ b/drivers/gpu/drm/apple/dcp.c
+@@ -5247,6 +5247,8 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
+ 	dcp->connector_type = dcp->fixed_connector_type;
+ 	of_property_read_u32(dev->of_node, "apple,dcp-index", &dcp->index);
+ 	of_property_read_u32(dev->of_node, "apple,dcp-endpoint", &dcp->peer_endpoint);
++	if (of_property_read_bool(dev->of_node, "apple,typec-hybrid-first"))
++		dcp_typec_hybrid_first_dt();
+ 	of_property_read_u32(dev->of_node, "apple,dptx-phy", &dcp->dptx_phy);
+ 	of_property_read_u32(dev->of_node, "apple,dptx-die", &dcp->dptx_die);
+ 	dcp->fixed_dptx_phy = dcp->dptx_phy;
+diff --git a/drivers/gpu/drm/apple/dcp.h b/drivers/gpu/drm/apple/dcp.h
+index 1b62f3df7889..86007f00c9a4 100644
+--- a/drivers/gpu/drm/apple/dcp.h
++++ b/drivers/gpu/drm/apple/dcp.h
+@@ -143,6 +143,8 @@ unsigned int apple_j613_25g83_clock_hz(void);
+ /* A J613, or a J615 whose boot loader carries the experimental opt-in. */
+ bool apple_t8122_25g83_board(void);
+ 
++void dcp_typec_hybrid_first_dt(void);
++
+ /* Desktop 26.6 dual-pipe peer (dcp-peer-v26_6.inc, included from dcp.c) */
+ struct dptx_port;
+ int dcp_peer_hints_26_6(struct apple_dcp *dcp, struct dptx_port *port,
+-- 
+2.56.0
+

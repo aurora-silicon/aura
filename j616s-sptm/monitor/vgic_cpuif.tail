@@ -1,0 +1,22 @@
+// SPDX-License-Identifier: GPL-2.0-only
+
+u64 mhv_get_lr(unsigned int lr) { return __gic_v3_get_lr(lr); }
+void mhv_set_lr(u64 val, unsigned int lr) { __gic_v3_set_lr(val, lr); }
+u64 mhv_get_ap0r(unsigned int n) { return __vgic_v3_read_ap0rn(n); }
+u64 mhv_get_ap1r(unsigned int n) { return __vgic_v3_read_ap1rn(n); }
+void mhv_set_ap0r(u64 val, unsigned int n) { __vgic_v3_write_ap0rn(val, n); }
+void mhv_set_ap1r(u64 val, unsigned int n) { __vgic_v3_write_ap1rn(val, n); }
+
+/* 1 when the trapped MSR/MRS was a vGIC register and is emulated; LRs and VMCR are the guest's, it continues by eret */
+int mhv_cpuif_access(struct gctx *c, struct mhv_run *r)
+{
+	if (!(r->ich_hcr & 1))
+		return 0;                        /* no in-kernel GIC: __vgic_v3_perform_cpuif_access checks vgic_model, KVM makes it UNDEF */
+	struct kvm_vcpu v = { .c = c };
+	v.arch.vgic_cpu.vgic_v3.used_lrs = r->used_lrs;
+	v.arch.vgic_cpu.vgic_v3.vgic_hcr = r->ich_hcr;
+	int ret = __vgic_v3_perform_cpuif_access(&v);
+	if (ret)
+		r->nr_cpuif_fast++;
+	return ret;
+}

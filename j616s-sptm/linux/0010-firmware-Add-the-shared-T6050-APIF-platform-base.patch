@@ -1,0 +1,5126 @@
+From dc0c695b76adfb91986d8f0c4a8327fa20610991 Mon Sep 17 00:00:00 2001
+From: Dj <43033058+DjDeveloperr@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 02:34:15 -0400
+Subject: [PATCH 10/11] firmware: Add the shared T6050 APIF platform base
+
+Provide the APIF MMIO transport, DART/SART ownership backends, T6050 CPU identification, shared RTKit/mailbox support, and common consumer interfaces on Linux 7.3. The native platform drivers continue to use their existing paths. Shared headers, build declarations, documentation, and host-test support let the remaining driver changes be reviewed as sibling PRs.
+
+Source snapshot: t6050-gpu ee68abb105200e99636a5edfc647a5cfc1d89954
+Integration base: 9cbdd0734d9e186c5f5f5949a21b909d10c2571b
+
+Signed-off-by: Dj <43033058+DjDeveloperr@users.noreply.github.com>
+(cherry picked from commit d9d9ee64e7d81211402377dc18d6bcb9a8f28177)
+---
+ .mailmap                                      |    1 +
+ .../arch/arm64/aurora-apif-centauri.rst       |   78 +
+ .../arch/arm64/aurora-apif-platform.rst       |  109 +
+ Documentation/arch/arm64/index.rst            |    7 +
+ .../bindings/firmware/aurora,apif-mmio.yaml   |   36 +
+ .../bindings/iommu/apple,dart-apif.yaml       |   84 +
+ .../bindings/mailbox/apple,ascwrap-v6.yaml    |    7 +-
+ .../bindings/soc/apple/apple,sart-apif.yaml   |   35 +
+ .../firmware/aurora-apif-display.rst          |   99 +
+ .../driver-api/firmware/aurora-apif-nvme.rst  |   39 +
+ .../driver-api/firmware/aurora-apif-pcie.rst  |   30 +
+ .../driver-api/firmware/aurora-apif-pmp.rst   |   35 +
+ .../driver-api/firmware/aurora-apif.rst       |  100 +
+ Documentation/driver-api/firmware/index.rst   |    4 +
+ MAINTAINERS                                   |   40 +
+ arch/arm64/configs/aurora-apif.config         |    6 +
+ arch/arm64/include/asm/cputype.h              |    4 +
+ arch/arm64/lib/delay.c                        |    5 +-
+ drivers/firmware/Kconfig                      |   10 +
+ drivers/firmware/Makefile                     |    2 +
+ drivers/firmware/aurora-apif-mmio.c           |  255 +++
+ drivers/iommu/Kconfig                         |   12 +
+ drivers/iommu/Makefile                        |    2 +
+ drivers/iommu/apple-dart-apif.c               | 2016 +++++++++++++++++
+ drivers/net/wireless/Kconfig                  |    1 +
+ drivers/net/wireless/Makefile                 |    2 +
+ drivers/net/wireless/apple/Kconfig            |   19 +
+ drivers/net/wireless/apple/Makefile           |    2 +
+ drivers/net/wireless/apple/centauri/Makefile  |    4 +
+ .../net/wireless/apple/centauri/centauri.h    |   87 +
+ drivers/soc/apple/Kconfig                     |   10 +
+ drivers/soc/apple/Makefile                    |    2 +
+ drivers/soc/apple/apple-sart-apif.c           |  167 ++
+ drivers/soc/apple/mailbox.c                   |   92 +
+ drivers/soc/apple/rtkit-internal.h            |    4 +-
+ drivers/soc/apple/rtkit.c                     |   41 +-
+ drivers/soc/apple/sart-backend.h              |   21 +
+ drivers/soc/apple/sart.c                      |   36 +-
+ include/linux/apple-centauri.h                |   12 +
+ include/linux/apple-dart-apif.h               |   18 +
+ include/linux/pci-apple-apif.h                |   16 +
+ .../linux/soc/apple/display-event-debugfs.h   |   85 +
+ include/linux/soc/apple/display-event-log.h   |  213 ++
+ include/linux/soc/apple/dp-tunnel.h           |    7 +-
+ include/linux/soc/apple/mailbox.h             |    2 +
+ include/linux/soc/aurora/apif-mmio.h          |   66 +
+ rust/bindings/bindings_helper.h               |    1 +
+ rust/kernel/soc/apple/rtkit.rs                |    6 +-
+ tools/testing/selftests/Makefile              |    1 +
+ tools/testing/selftests/aurora-apif/Makefile  |    5 +
+ .../selftests/aurora-apif/apif_mmio.py        |  409 ++++
+ tools/testing/selftests/aurora-apif/common.py |   19 +
+ .../selftests/aurora-apif/dart_retained.py    |   53 +
+ 53 files changed, 4401 insertions(+), 16 deletions(-)
+ create mode 100644 Documentation/arch/arm64/aurora-apif-centauri.rst
+ create mode 100644 Documentation/arch/arm64/aurora-apif-platform.rst
+ create mode 100644 Documentation/devicetree/bindings/firmware/aurora,apif-mmio.yaml
+ create mode 100644 Documentation/devicetree/bindings/iommu/apple,dart-apif.yaml
+ create mode 100644 Documentation/devicetree/bindings/soc/apple/apple,sart-apif.yaml
+ create mode 100644 Documentation/driver-api/firmware/aurora-apif-display.rst
+ create mode 100644 Documentation/driver-api/firmware/aurora-apif-nvme.rst
+ create mode 100644 Documentation/driver-api/firmware/aurora-apif-pcie.rst
+ create mode 100644 Documentation/driver-api/firmware/aurora-apif-pmp.rst
+ create mode 100644 Documentation/driver-api/firmware/aurora-apif.rst
+ create mode 100644 arch/arm64/configs/aurora-apif.config
+ create mode 100644 drivers/firmware/aurora-apif-mmio.c
+ create mode 100644 drivers/iommu/apple-dart-apif.c
+ create mode 100644 drivers/net/wireless/apple/Kconfig
+ create mode 100644 drivers/net/wireless/apple/Makefile
+ create mode 100644 drivers/net/wireless/apple/centauri/Makefile
+ create mode 100644 drivers/net/wireless/apple/centauri/centauri.h
+ create mode 100644 drivers/soc/apple/apple-sart-apif.c
+ create mode 100644 drivers/soc/apple/sart-backend.h
+ create mode 100644 include/linux/apple-centauri.h
+ create mode 100644 include/linux/apple-dart-apif.h
+ create mode 100644 include/linux/pci-apple-apif.h
+ create mode 100644 include/linux/soc/apple/display-event-debugfs.h
+ create mode 100644 include/linux/soc/apple/display-event-log.h
+ create mode 100644 include/linux/soc/aurora/apif-mmio.h
+ create mode 100644 tools/testing/selftests/aurora-apif/Makefile
+ create mode 100755 tools/testing/selftests/aurora-apif/apif_mmio.py
+ create mode 100644 tools/testing/selftests/aurora-apif/common.py
+ create mode 100755 tools/testing/selftests/aurora-apif/dart_retained.py
+
+diff --git a/.mailmap b/.mailmap
+index 0a0be49bc4de..73ab51cf6640 100644
+--- a/.mailmap
++++ b/.mailmap
+@@ -268,6 +268,7 @@ Dengcheng Zhu <dzhu@wavecomp.com> <dengcheng.zhu@mips.com>
+ <dev.kurt@vandijck-laurijssen.be> <kurt.van.dijck@eia.be>
+ Dikshita Agarwal <dikshita.agarwal@oss.qualcomm.com> <dikshita@codeaurora.org>
+ Dikshita Agarwal <dikshita.agarwal@oss.qualcomm.com> <quic_dikshita@quicinc.com>
++Dj <hey@djdev.me> <43033058+DjDeveloperr@users.noreply.github.com>
+ Dmitry Baryshkov <lumag@kernel.org> <dbaryshkov@gmail.com>
+ Dmitry Baryshkov <lumag@kernel.org> <[dbaryshkov@gmail.com]>
+ Dmitry Baryshkov <lumag@kernel.org> <dmitry_baryshkov@mentor.com>
+diff --git a/Documentation/arch/arm64/aurora-apif-centauri.rst b/Documentation/arch/arm64/aurora-apif-centauri.rst
+new file mode 100644
+index 000000000000..c24f4d6fb7cb
+--- /dev/null
++++ b/Documentation/arch/arm64/aurora-apif-centauri.rst
+@@ -0,0 +1,78 @@
++.. SPDX-License-Identifier: GPL-2.0-only
++
++N1 firmware and PCI transport
++=============================
++
++The Control function owns the firmware bootstrap and its DMA allocations.
++Alpha and Beta use their own PCI-function DMA mappings. The driver requires
++an APIF host with the supported isolated Gen3 x1 reset layout. All endpoint
++DMA/MSI must be quiesced and the endpoint left in the stopped ROM personality;
++live sessions cannot be adopted by this interface.
++
++The Control PCI DT node supplies ``firmware-name``,
++``apple,centauri-platform-id`` and ``apple,centauri-protocol = <27>``. The
++platform identifier and personalized FTAB must agree with the actual device.
++These are firmware inputs supplied by the boot producer, rather than a
++machine-name lookup in the driver. No firmware or calibration data is shipped
++in this series. The driver loads the firmware directly and starts asynchronously;
++a missing file or failed phase requires correcting the input and reprobe.
++
++The host's native DART reset requires exclusive Linux ownership and no retained
++firmware streams on that unit. The boot producer must resolve ownership before
++handoff. This driver cannot discard retained streams to make a reset succeed.
++A failed link transition prevents further endpoint accesses. Published DMA and
++vectors remain pinned when shutdown cannot be proved; a platform reset is then
++required. This is an error path, not a supported live-session handoff.
++
++Bootstrap command rings are bounded and used once. Radio data-plane ring sizes
++and batching are separate from bootstrap. The transport builds without the
++Wi-Fi consumer; it still starts the shared firmware for the later Alpha/Beta
++consumers. Wi-Fi and Bluetooth are separate follow-up changes. Hardware
++qualification of this cleaned series, including suspend/resume, remains pending.
++
++Wi-Fi station consumer
++----------------------
++
++``CONFIG_APPLE_CENTAURI_WIFI`` adds the Alpha cfg80211/netdev consumer within
++this transport module. It supports the protocol-27 command profile, active
++2.4/5 GHz scanning and WPA2-PSK/CCMP station connections with firmware handshake
++offload. The matched profile uses a raw 32-byte PMK supplied by cfg80211;
++there is no separate passphrase interface. Unknown profiles are rejected by
++the Control driver. Passive scan encoding is not established, so disabled and
++NO_IR channels are excluded from active scans. WPA3, 6 GHz, roaming and wider
++security/radio qualification remain outside the established driver scope.
++
++Data uses the original 2,048-entry rings and coalesced completions. IRQs and
++queued packets schedule the consumer; no periodic data poller or diagnostic
++packet flow is added. Malformed frames and completion spans cannot index beyond
++the coherent window. A lost command completion poisons further commands and
++stops new transmission. Its key payload is cleared only after the transfer-ring
++tail proves consumption; uncertain ownership keeps backing memory pinned.
++Safe IPC teardown scrubs buffers after verified DMA shutdown. The cleaned
++consumer still needs hardware traffic and suspend/resume qualification.
++
++Bluetooth consumer
++------------------
++
++``CONFIG_BT_HCICENTAURI`` adds the Beta HCI/ACL PCI driver. A managed device
++link requires the Control supplier to have established shared firmware and
++orders removal and suspend against it. The Beta DT node supplies the factory
++``local-mac-address`` in network byte order; no board-name or temporary-address
++fallback selects initialization behavior.
++
++Protocol-27 initialization provisions the address, completes firmware setup
++and supplies a fresh random seed. The connection-command adaptation is enabled
++only after the firmware's capability bit confirms support. Status and connection
++completion events are normalized to the standard HCI command being tracked.
++The firmware duplicate filter is reset in the HCI command-sync path before
++filtered scanning starts; other drivers without that callback keep their
++existing behavior. Standard report lengths are checked before applying the
++matched legacy scan-response fixup.
++
++The driver uses IRQ-triggered work and the original ring geometry. Diagnostic
++capture, unrelated auxiliary rings, manual mode switches and success logging
++are excluded. SCO and ISO delivery are not implemented. Coordinated firmware
++teardown remains unqualified: a published Beta arena stays pinned on detach,
++and rebinding requires a fresh shared-firmware boot. This is not a reset of the
++Wi-Fi function. The cleaned driver still needs hardware HCI/ACL, repeated-scan
++and suspend/resume qualification.
+diff --git a/Documentation/arch/arm64/aurora-apif-platform.rst b/Documentation/arch/arm64/aurora-apif-platform.rst
+new file mode 100644
+index 000000000000..af062d4c09a5
+--- /dev/null
++++ b/Documentation/arch/arm64/aurora-apif-platform.rst
+@@ -0,0 +1,109 @@
++.. SPDX-License-Identifier: GPL-2.0-only
++
++M5 Pro non-GPU platform series
++=============================
++
++The APIF platform series separates transport/provider support from device
++consumers. The shared ``t6050/base`` PR targets ``integration/aurora`` on
++Linux 7.3; every other PR targets ``t6050/base``. Consumer dependencies are
++recorded separately, so the review branches do not form a linear chain.
++The source snapshot is ``t6050-gpu`` at ``ee68abb105200``. This review map
++covers its non-GPU platform changes; hardware qualification of the rebased
++combination remains separate.
++
++.. list-table:: Review branches
++   :header-rows: 1
++
++   * - Area
++     - Branch
++   * - APIF transport, DART and SART
++     - `t6050/base <https://github.com/aurora-silicon/linux/tree/t6050/base>`_
++   * - Native ANS/NVMe queues
++     - `t6050/nvme <https://github.com/aurora-silicon/linux/tree/t6050/nvme>`_
++   * - Preinitialized PCIe and MSI
++     - `t6050/pcie <https://github.com/aurora-silicon/linux/tree/t6050/pcie>`_
++   * - PMP firmware registry
++     - `t6050/pmp <https://github.com/aurora-silicon/linux/tree/t6050/pmp>`_
++   * - Guest DT conversion
++     - `t6050/guest-wiring <https://github.com/aurora-silicon/linux/tree/t6050/guest-wiring>`_
++   * - Generation-4 SPMI
++     - `t6050/spmi <https://github.com/aurora-silicon/linux/tree/t6050/spmi>`_
++   * - SPMI PMU RTC
++     - `t6050/pmu-rtc <https://github.com/aurora-silicon/linux/tree/t6050/pmu-rtc>`_
++   * - SMC consumers and pcIO GPIO
++     - `t6050/smc <https://github.com/aurora-silicon/linux/tree/t6050/smc>`_
++   * - DP/USB combo PHY and crossbar
++     - `t6050/display-phy <https://github.com/aurora-silicon/linux/tree/t6050/display-phy>`_
++   * - CPU frequency profile
++     - `t6050/cpufreq <https://github.com/aurora-silicon/linux/tree/t6050/cpufreq>`_
++   * - N1 firmware and PCI lifetime
++     - `t6050/centauri-core <https://github.com/aurora-silicon/linux/tree/t6050/centauri-core>`_
++   * - N1 Wi-Fi
++     - `t6050/centauri-wifi <https://github.com/aurora-silicon/linux/tree/t6050/centauri-wifi>`_
++   * - N1 Bluetooth
++     - `t6050/centauri-bluetooth <https://github.com/aurora-silicon/linux/tree/t6050/centauri-bluetooth>`_
++   * - Firmware-27 AFK, DCP and DPTX
++     - `t6050/dcp <https://github.com/aurora-silicon/linux/tree/t6050/dcp>`_
++   * - Host GPIO interrupt groups
++     - `t6050/gpio-irqs <https://github.com/aurora-silicon/linux/tree/t6050/gpio-irqs>`_
++   * - Initial SPMI Type-C events
++     - `t6050/typec-events <https://github.com/aurora-silicon/linux/tree/t6050/typec-events>`_
++   * - DWC3 controller
++     - `t6050/usb <https://github.com/aurora-silicon/linux/tree/t6050/usb>`_
++   * - Power-domain handoff
++     - `t6050/pmgr <https://github.com/aurora-silicon/linux/tree/t6050/pmgr>`_
++   * - MTP keyboard reports
++     - `t6050/mtp <https://github.com/aurora-silicon/linux/tree/t6050/mtp>`_
++   * - Composed platform configuration
++     - `t6050/platform-wiring <https://github.com/aurora-silicon/linux/tree/t6050/platform-wiring>`_
++
++CPU identification, idle register preservation and delay handling are
++already represented by the base. Existing public interrupt-controller,
++USB, I2C/SPI, DockChannel HID, MTP helper and standard platform drivers are
++preserved rather than replaced with older copies. The fragment enables
++their dependencies alongside the new providers and consumers.
++
++AGX acceleration, its dedicated mailbox transports and diagnostic system
++register probes are outside this series. Firmware binaries, board
++calibration data and factory addresses are not included.
++
++Configuration
++-------------
++
++Apply aurora-apif.config after defconfig and asahi.config, then run
++olddefconfig. The fragment makes the selected platform consumers built-in;
++firmware and loader metadata are still required.
++
++The existing HID interface uses explicit apple,power-method and
++apple,firmware-managed-reset properties. The latter is valid only for a
++power-method-2 multi-touch interface with firmware-owned reset. The loader
++must describe the actual ownership; no board-name or firmware-filename
++guess selects it.
++
++Loader and qualification requirements
++-------------------------------------
++
++* NVMe needs a stopped RTKit session and four distinct, reserved queue
++  pages. The new profile does not adopt an unqualified live queue session.
++* N1 cold bootstrap needs its packed platform identifier, protocol 27,
++  factory Bluetooth address and an exclusively owned PCIe/DART unit.
++  Unqualified live-session adoption is not enabled.
++* CPU frequency control requires an explicit, qualified firmware thermal
++  ownership claim covering every exposed OPP, including after PMP setup.
++  The DT conversion tool does not invent that claim.
++* DCP needs a running firmware-27 session, inherited framebuffer region,
++  ordered provider clock table and the coprocessor physical register view
++  when guest resource addresses differ.
++* GPIO interrupt groups and HID reset ownership must match the loader's
++  retained firmware ownership.
++
++The conversion tool validates supplied metadata; it cannot establish that
++firmware has stopped using a queue, stream, reset line or clock policy.
++
++Validation
++----------
++
++The series has native driver builds and host protocol/bounds tests.
++Hardware qualification must separately cover boot, storage I/O, network
++traffic, physical Type-C attach/detach, display, brightness and suspend.
++Retained firmware/DMA state is not reset as a fallback after a timeout.
+diff --git a/Documentation/arch/arm64/index.rst b/Documentation/arch/arm64/index.rst
+index 128d3de94bb5..d335b9e43fe9 100644
+--- a/Documentation/arch/arm64/index.rst
++++ b/Documentation/arch/arm64/index.rst
+@@ -9,6 +9,13 @@ ARM64 Architecture
+ 
+     acpi_object_usage
+     amu
++    ../../driver-api/firmware/aurora-apif
++    ../../driver-api/firmware/aurora-apif-nvme
++    ../../driver-api/firmware/aurora-apif-pcie
++    ../../driver-api/firmware/aurora-apif-pmp
++    ../../driver-api/firmware/aurora-apif-display
++    aurora-apif-centauri
++    aurora-apif-platform
+     apple-j813
+     apple-m6-cpu
+     arm-acpi
+diff --git a/Documentation/devicetree/bindings/firmware/aurora,apif-mmio.yaml b/Documentation/devicetree/bindings/firmware/aurora,apif-mmio.yaml
+new file mode 100644
+index 000000000000..c154786a0593
+--- /dev/null
++++ b/Documentation/devicetree/bindings/firmware/aurora,apif-mmio.yaml
+@@ -0,0 +1,36 @@
++# SPDX-License-Identifier: GPL-2.0-only
++%YAML 1.2
++---
++$id: http://devicetree.org/schemas/firmware/aurora,apif-mmio.yaml#
++$schema: http://devicetree.org/meta-schemas/core.yaml#
++
++title: Aurora Platform Interface over Memory-Mapped I/O
++
++maintainers:
++  - Dj <hey@djdev.me>
++
++description: |
++  Synthetic MMIO transport supplied by Aura's EL2-resident monitor. Version 2
++  forwards native SPTM selectors and arguments and provides memory-ownership
++  services. Peripheral policy belongs to consumers, which reference this node
++  through the aurora,apif phandle. The register page must be absent from the
++  guest stage-2 mappings so accesses reach Aura.
++
++properties:
++  compatible:
++    const: aurora,apif-mmio
++  reg:
++    maxItems: 1
++
++required:
++  - compatible
++  - reg
++
++additionalProperties: false
++
++examples:
++  - |
++    apif: firmware@61ff0000 {
++        compatible = "aurora,apif-mmio";
++        reg = <0x61ff0000 0x4000>;
++    };
+diff --git a/Documentation/devicetree/bindings/iommu/apple,dart-apif.yaml b/Documentation/devicetree/bindings/iommu/apple,dart-apif.yaml
+new file mode 100644
+index 000000000000..dbf1169dae26
+--- /dev/null
++++ b/Documentation/devicetree/bindings/iommu/apple,dart-apif.yaml
+@@ -0,0 +1,84 @@
++# SPDX-License-Identifier: GPL-2.0-only
++%YAML 1.2
++---
++$id: http://devicetree.org/schemas/iommu/apple,dart-apif.yaml#
++$schema: http://devicetree.org/meta-schemas/core.yaml#
++
++title: Apple DART mediated through Aura APIF
++
++maintainers:
++  - Dj <hey@djdev.me>
++
++description: |
++  A DART instance accessed through native SPTM calls rather than guest MMIO.
++  Linux owns stream grouping, table setup, mapping rollback and DMA apertures.
++  Firmware-owned streams are adopted without replacing their roots or replaying
++  retained mappings. Unit identifiers are firmware metadata, not chip IDs.
++
++properties:
++  compatible:
++    const: apple,dart-apif
++  '#iommu-cells':
++    const: 1
++    description: Stream identifier.
++  aurora,apif:
++    $ref: /schemas/types.yaml#/definitions/phandle
++    description: APIF version-2 transport provider.
++  power-domains:
++    maxItems: 1
++    description: |
++      Native register-clock dependency needed before the first APIF DART call.
++      The provider must be powered independently of consumer probe ordering.
++      For T6050 ATC2 USB DART this is the ATC2_USB domain shared with DWC3.
++  apple,apif-dart-id:
++    $ref: /schemas/types.yaml#/definitions/uint32
++    maximum: 255
++    description: Native SPTM DART unit identifier.
++  apple,apif-num-streams:
++    $ref: /schemas/types.yaml#/definitions/uint32
++    minimum: 1
++    maximum: 256
++    default: 256
++    description: Number of streams supported by this unit.
++  apple,apif-retained-sids:
++    $ref: /schemas/types.yaml#/definitions/uint32-array
++    minItems: 1
++    maxItems: 256
++    uniqueItems: true
++    items:
++      maximum: 255
++    description: Firmware-owned stream IDs which Aura adopted at bootstrap.
++  apple,apif-iova-force:
++    $ref: /schemas/types.yaml#/definitions/uint64
++    enum: [0, 1099511627776]
++    description: |
++      Optional native bit-40 force mask for a low-address device DMA view.
++      Must not overlap apple,dma-range. Omit for a native DVA aperture.
++  apple,apif-reserve-last-page:
++    type: boolean
++    description: Native aperture forbids allocating its final 16 KiB granule.
++  apple,dma-range:
++    $ref: /schemas/types.yaml#/definitions/uint64-array
++    minItems: 2
++    maxItems: 2
++    description: |
++      Device-visible DMA aperture base and size, aligned to 16 KiB and within
++      42 bits. Defaults to the low 4 GiB. This is not a CPU mapping.
++
++required:
++  - compatible
++  - '#iommu-cells'
++  - aurora,apif
++  - apple,apif-dart-id
++
++additionalProperties: false
++
++examples:
++  - |
++    iommu {
++        compatible = "apple,dart-apif";
++        #iommu-cells = <1>;
++        aurora,apif = <&apif>;
++        apple,apif-dart-id = <5>;
++        apple,apif-num-streams = <16>;
++    };
+diff --git a/Documentation/devicetree/bindings/mailbox/apple,ascwrap-v6.yaml b/Documentation/devicetree/bindings/mailbox/apple,ascwrap-v6.yaml
+index 09b3b45b4ed9..f060194de4b9 100644
+--- a/Documentation/devicetree/bindings/mailbox/apple,ascwrap-v6.yaml
++++ b/Documentation/devicetree/bindings/mailbox/apple,ascwrap-v6.yaml
+@@ -4,13 +4,13 @@
+ $id: http://devicetree.org/schemas/mailbox/apple,ascwrap-v6.yaml#
+ $schema: http://devicetree.org/meta-schemas/core.yaml#
+ 
+-title: Apple ASCWrap v6 GPU mailbox
++title: Apple ASCWrap v6 mailbox
+ 
+ maintainers:
+   - Ryan Murray <ryan@aurorasilicon.org>
+ 
+ description:
+-  Mailbox interface of the GPU coprocessors of the T8140 and T6040. The
++  Mailbox interface of the GPU coprocessors of the T8140, T6040 and T6050. The
+   wrapper resource contains the coprocessor control registers and mailbox
+   FIFOs. A separate resource provides the coprocessor vector-base register.
+   The firmware role identifies which GPU firmware instance uses the mailbox;
+@@ -21,6 +21,9 @@ properties:
+     enum:
+       - apple,t6040-ascwrap-v6
+       - apple,t8140-ascwrap-v6
++      - apple,t6050-apif-ascwrap-v6
++      - apple,t6050-ascwrap-v6
++      - apple,t6050-x1n1-ascwrap-v6
+ 
+   reg:
+     items:
+diff --git a/Documentation/devicetree/bindings/soc/apple/apple,sart-apif.yaml b/Documentation/devicetree/bindings/soc/apple/apple,sart-apif.yaml
+new file mode 100644
+index 000000000000..4e5ece8bebaf
+--- /dev/null
++++ b/Documentation/devicetree/bindings/soc/apple/apple,sart-apif.yaml
+@@ -0,0 +1,35 @@
++# SPDX-License-Identifier: GPL-2.0-only
++%YAML 1.2
++---
++$id: http://devicetree.org/schemas/soc/apple/apple,sart-apif.yaml#
++$schema: http://devicetree.org/meta-schemas/core.yaml#
++
++title: Apple SART mediated through Aura APIF
++
++maintainers:
++  - Dj <hey@djdev.me>
++
++description: |
++  SART provider using native SPTM table-5 calls. Existing consumers reference
++  this provider through their apple,sart phandle. Linux tracks only its own
++  regions; unknown firmware grants are not reported as inherited regions.
++
++properties:
++  compatible:
++    const: apple,sart-apif
++  aurora,apif:
++    $ref: /schemas/types.yaml#/definitions/phandle
++    description: APIF version-2 transport provider.
++
++required:
++  - compatible
++  - aurora,apif
++
++additionalProperties: false
++
++examples:
++  - |
++    sart {
++        compatible = "apple,sart-apif";
++        aurora,apif = <&apif>;
++    };
+diff --git a/Documentation/driver-api/firmware/aurora-apif-display.rst b/Documentation/driver-api/firmware/aurora-apif-display.rst
+new file mode 100644
+index 000000000000..8da1054cc8c7
+--- /dev/null
++++ b/Documentation/driver-api/firmware/aurora-apif-display.rst
+@@ -0,0 +1,99 @@
++.. SPDX-License-Identifier: GPL-2.0-only
++
++DCP display in an Aura guest
++===========================
++
++The firmware-27 display profile uses the normal IOMFB shared-memory
++transport and compact AFK framing. It supplies a separate method/callback
++table and present serializer. The existing queued present, framebuffer
++retention, backlight policy, Type-C routing and suspend drain are shared
++with the public driver.
++
++This is display-controller support. It does not add AGX acceleration.
++
++Loader contract
++---------------
++
++The loader leaves each coprocessor running with its firmware translations
++intact. The driver negotiates RTKit without writing its CPU run state or
++restarting the coprocessor. A missing running session or a firmware ABI
++other than the explicit apple,firmware-compat = <27 0 0> is rejected.
++
++The internal and external providers use apple,t6050-dcp and
++apple,t6050-dcpext respectively. The profile uses a 41-bit DMA
++aperture for the coprocessor CPU; scanout and PIODMA retain their independent apertures.
++
++Each provider describes its inherited framebuffer region using
++memory-region and the framebuffer entry in memory-region-names.
++Default-surface allocation uses firmware-reported geometry, format and
++compression. Unsupported layouts or allocations larger than that region
++are rejected.
++
++apple,clock-ids describes the ordered firmware provider clock table.
++Its entry count must match clocks. An explicitly empty property is
++accepted for a provider with no clocks; a missing property is rejected.
++A callback clock index selects the corresponding Linux clock.
++
++Display register callbacks normally use resource physical addresses.
++If Linux resources are translated guest addresses, the loader supplies
++apple,firmware-physical-regs in complete register-table order,
++including the bandwidth scratch and optional doorbell apertures. These
++addresses are returned to the coprocessor, not dereferenced by Linux.
++
++The loader must also grant the reserved firmware buffers needed by AFK
++through the corresponding IOMMU provider. Remote requests remain bounded
++and fail if their device addresses cannot be translated.
++
++Direct DisplayPort routes
++-------------------------
++
++Protocol-27 DPTX uses endpoint 0x2c and its own drive-settings records.
++The explicit service unit takes precedence over the transport interface
++identifier. Drive requests validate lane count and voltage/pre-emphasis
++before changing the PHY.
++
++The PHY reports its live clock and coding mode to the crossbar consumer.
++A missing required provider or conflicting clock configuration fails the
++link operation. Other PHY types retain their existing routing behavior.
++
++Session lifetime
++----------------
++
++An adopted session has no confirmed DMA stop boundary. Failed probes and
++unbind therefore retain published buffers, mappings and device/domain
++references until a fresh firmware boot. Rebinding a retained session is
++unsupported. No timeout falls back to resetting a live coprocessor.
++
++Validation
++----------
++
++Native arm64 display-driver builds and host tests cover the present wire
++layout and framebuffer sizing/bounds. These checks do not establish boot,
++physical hotplug, brightness or suspend behavior on hardware.
++
++Paired firmware-27 scanout
++-------------------------
++
++The T6050 peer allocator consumes reported endpoint capacity and explicit
++firmware tiling metadata. It may reserve only an idle, otherwise unrouted
++peer on the same DRM device and display die. Physical Type-C routes remain
++owned by their normal allocator. The current qualification gates are
++``appledrm.peer_allocation_probe=1`` and ``appledrm.peer_scanout=1``; they
++match the private baseline's explicit configuration and remain off until
++the cleaned combination is qualified. ``appledrm.show_notch=1`` is independent.
++
++Both wire records are serialized from the primary's logical atomic input
++without mutating it. Cross-endpoint start replies, errors and combined
++completion watermarks are copied to a bounded callback queue on the owning
++IOMFB worker. They never take another endpoint's IOMFB lock from a receive
++callback. Normal command/transaction ordering and retained-framebuffer
++ownership remain in the common IOMFB implementation. One physical engine's
++completion cannot retire the pair. A failed peer submission may follow
++acceptance by the primary, so it retains the active transaction and scanout
++references as a crashed session rather than treating the error as retirement.
++
++The background-only paired probe also uses one tracked transaction per
++endpoint and cannot run while the paired production completion owner is active.
++Host checks cover copied callback dispatch, stop/cancellation, paired completion
++coverage and split-wire serialization. Build/host evidence does not replace
++physical display, hotplug, DPMS, sleep or paired-frame qualification.
+diff --git a/Documentation/driver-api/firmware/aurora-apif-nvme.rst b/Documentation/driver-api/firmware/aurora-apif-nvme.rst
+new file mode 100644
+index 000000000000..ab4e9b7088ba
+--- /dev/null
++++ b/Documentation/driver-api/firmware/aurora-apif-nvme.rst
+@@ -0,0 +1,39 @@
++Resident ANS over APIF
++======================
++
++``apple,nvme-apif`` selects the native table-6 queue ABI. It keeps the
++existing Apple NVMe queue depth, batching, crypto fields, recovery ownership
++and synchronous post-M4 flush policy. Linux builds and translates the TCB
++and physical page list; Aura forwards selectors and arguments unchanged.
++No payload copying or monitor-side NVMe policy is required.
++
++The boot producer must quiesce RTKit and stop controller DMA before Linux
++starts. It supplies ``asahi,rtkit-quiesced`` and four distinct reserved-memory
++pages named ``admin-sq``, ``admin-cq``, ``io-sq`` and ``io-cq``. Each is coherent,
++16 KiB aligned, 16 KiB sized and ``no-map``. Their guest addresses must map to
++the native physical pages already registered with the firmware. Linux clears
++and reuses those pages; it does not substitute new queue addresses. They stay
++reserved after unbind because the native queue registrations survive it.
++
++This profile requires an identity DMA aperture. It checks each request's
++physical translation against the DMA address in its command and PRP chain.
++An offset aperture is rejected before native request registration. Native
++metadata addresses are independently translated, including the scratch TCB
++and page list. Queue-control and MAP endpoints return void; UNMAP must return
++one before a request's backing can be reused.
++
++A lost MAP response retains that request and prevents new registration until
++recovery has stopped the controller and explicitly invalidated every retained
++tag. Failed invalidation quarantines the controller and retains its DMA,
++requests and APIF client until platform reset. SART unmap failures also retain
++Linux-owned backing. These are ownership failures, not successful I/O.
++
++Live RTKit adoption is deliberately excluded from this new profile: controller
++CC.EN/RDY alone cannot prove a live mailbox session or authorize inherited
++buffers outside guest RAM. Existing raw-controller profiles keep their existing
++validated adoption path. The guest producer must provide the stopped handoff
++above; a version-1 live-session DT is not a drop-in replacement.
++
++Build and host fault tests do not qualify this path on hardware. Boot,
++read/write/flush durability, controller reset and teardown must be tested with
++the matching Aura version-2 monitor and generated handoff description.
+diff --git a/Documentation/driver-api/firmware/aurora-apif-pcie.rst b/Documentation/driver-api/firmware/aurora-apif-pcie.rst
+new file mode 100644
+index 000000000000..fd366c73ef77
+--- /dev/null
++++ b/Documentation/driver-api/firmware/aurora-apif-pcie.rst
+@@ -0,0 +1,30 @@
++.. SPDX-License-Identifier: GPL-2.0-only
++
++Preinitialized PCIe guests
++=========================
++
++``apple,apif-pcie`` admits an ECAM host whose producer has already configured
++its clocks, PHY, link, address windows and RID-to-SID routes. The producer
++must stop endpoint DMA and MSI before transferring ownership. Linux allocates
++MSI vectors from the single native four-cell AIC edge range in ``msi-ranges``;
++the doorbell is supplied by ``apple,msi-address``. Vector counts and addresses
++are checked before the routing tables are touched. No polling interrupt path
++or fixed IRQ assignment per function is introduced.
++
++A second compatible, ``apple,t6050-pcie-apif``, selects the known port-0
++register layout and supplies port, PHY, PERST and interrupt-to-AXI resources.
++It restores explicit ``apple,rid-to-sid`` tuples and the same declared MSI
++range after a controlled preboot cycle. Tunables come from the boot producer.
++Unknown layouts use only ECAM/MSI; they cannot enter the T6050 reset sequence.
++
++``apple_apif_pcie_cycle()`` is for the isolated N1 ROM/preboot function before
++radio functions are enumerated or have live DMA. The caller must quiesce all
++activity on that unit. PCI topology locking excludes sibling functions, and
++DART transitions refuse other Linux groups or retained firmware streams.
++Timeouts are bounded. A partial transition leaves bus mastering and bridge
++decoding stopped; it does not attempt a speculative DMA restart. This is not
++a general PCI bus reset API and does not add N1 Wi-Fi/Bluetooth drivers.
++
++The generic host and its matched port sequence require hardware qualification
++with the matching Aura monitor and boot description. Host sequence tests and
++native builds do not establish link recovery or radio firmware behavior.
+diff --git a/Documentation/driver-api/firmware/aurora-apif-pmp.rst b/Documentation/driver-api/firmware/aurora-apif-pmp.rst
+new file mode 100644
+index 000000000000..e15e69bf07ee
+--- /dev/null
++++ b/Documentation/driver-api/firmware/aurora-apif-pmp.rst
+@@ -0,0 +1,35 @@
++.. SPDX-License-Identifier: GPL-2.0-only
++
++Registry-v2 PMP guests
++======================
++
++The matched ``apple,t6050-pmp-v2`` firmware ABI uses 88-byte registry
++descriptors, firmware-assigned 16-bit IDs, negotiated value buffers, and
++update opcode ``0x36``. Linux validates descriptor sizes and names, rejects
++duplicate live IDs, and bounds every shared-buffer copy. Boot arguments are
++validated completely before any patch is written back. Board and calibration
++values come from the boot description; no machine-name policy is embedded.
++
++The existing T6000 protocol and T8140 42-bit DMA mask remain unchanged.
++Registry-v2 configures a 48-bit mailbox DMA address mask and requires an
++attached IOMMU domain before starting the processor. Its APIF DART description
++must retain the firmware streams, aperture and final-page guard reported by
++the producer. A missing provider must not permit direct-DMA fallback.
++
++Probe accepts only the known cold context marker with the CPU stopped and no
++retained DMA context. Unbind and reboot request RTKit idle, verify the matched
++context-save marker/version and save counter, then clear CPU_RUN and check
++its readback. Firmware allocations cannot be freed merely because RTKit
++acknowledged a power state. A failed stop drains callbacks but retains both
++shared RTKit backing and the PMP allocation owner until platform reset; it
++also leaves the cold-reprobe check unable to admit the retained context.
++
++The driver owns registry-v2 RTKit outside the callback context, avoiding an
++Arc ownership cycle. The notifier is removed and drained before the RTKit
++handle or context is released. Probe failure after firmware start follows
++the same stop-or-retain ownership path. Endpoint-7 auxiliary buffers are
++session-owned; identical requests reuse them rather than replacing live DMA.
++
++This is support for the inspected firmware ABI, not a generic promise that
++later PMP layouts use the same context registers. Hardware cold boot,
++registry exchange, idle/save, reboot and unbind qualification remain pending.
+diff --git a/Documentation/driver-api/firmware/aurora-apif.rst b/Documentation/driver-api/firmware/aurora-apif.rst
+new file mode 100644
+index 000000000000..1622f49dd426
+--- /dev/null
++++ b/Documentation/driver-api/firmware/aurora-apif.rst
+@@ -0,0 +1,100 @@
++.. SPDX-License-Identifier: GPL-2.0-only
++
++===============================================
++Aurora Platform Interface over Memory-Mapped I/O
++===============================================
++
++Aura is Aurora's EL2-resident monitor for Apple Silicon, providing SPTM
++mediation and nested virtualization. APIF is a synchronous, trusted-kernel
++transport. Linux supplies native selectors and endpoint arguments; Aura
++forwards them unchanged. Invalid native calls can stop the machine. This
++interface does not isolate an untrusted kernel.
++
++Wire contract
++=============
++
++The version-2 synthetic register page occupies 16 KiB at guest IPA 0x61ff0000.
++Registers are little-endian 64-bit fields: magic at 0x000 is
++0x4f494d4d46495041 (APIFMMIO), version at 0x008 is 2, maximum operations at
++0x010, and feature flags at 0x018 (bit 0 native, bit 1 memory, bit 2 I/O).
++A 64-bit write at 0x100 supplies a 16-byte-aligned guest IPA for the batch.
++The entire buffer must fit within one guest RAM bank. The register page is
++unmapped at guest stage 2; Aura handles its data aborts.
++
++A batch has a 16-byte header (u32 count, u32 flags, s32 status, u32 done),
++then count 64-byte operations (u64 selector, u64 arg[6], u64 ret). Flags are
++zero. Selector upper/lower halves give native table/endpoint (x16); arguments
++are native x0-x5 and ret is native x0, unchanged. Transport status does not
++interpret native results. Void and boolean endpoints need different caller
++handling. A failed Aura service stops the batch; done is the completed prefix.
++
++Each client owns a physically contiguous buffer and serializes its submissions
++with IRQs masked. The transport orders memory around the trapping store and
++preserves the Linux stack in x9 across the synchronous redispatch contract.
++Device links order supplier lifetime; client revocation drains submissions and
++subsequent calls return ENODEV. It is safe to call from atomic context. Provider
++and consumers must be described together in the guest DT; this series does not
++rewrite existing board DTs or enable the backend on an existing boot.
++
++Ownership services
++==================
++
++Table 0xffffffff supplies Aura services (other tables are native selectors):
++
++* 1 TRANSLATE(guest IPA, size): native PA for a contiguous guest range.
++* 2 ALLOC_FRAME(owner, address): zeroed 16 KiB native frame, CPU alias removed.
++* 3 FREE_FRAME(PA): restore Aura's alias after detachment and retype to type 11.
++* 4 MAP_IO(guest IPA, PA, size, readonly): map bounded page-aligned device I/O.
++* 5 GUEST_ROOT(): guest stage-2 root PA.
++* 6 BOOT_IOMMU(kind, unit, SID, index, output IPA, size): bootstrap snapshot.
++* 7 BOOT_TABLE(kind, unit, SID, address, level): existing bootstrap table PA.
++* 8 FIND_FRAME(owner, address): registered lent frame PA or zero.
++* 9 TAG_FRAME(PA, owner, address): register a unique opaque key after attachment.
++
++Unused arguments are zero. Frame keys are bookkeeping, not an ownership
++transition. The pool is capped at 1024 frames. Never free attached or uncertain
++frames. MAP_IO does not roll back a partially successful mapping; a failed
++mapping requires recovery before its address range can be reused. Initialize
++batch status to EINPROGRESS so a missing completion cannot be mistaken for
++success. Lost table-operation completion stops further DART transactions.
++
++BOOT_IOMMU kind 0 means DART. Index U64_MAX returns root level, run count and
++DVA aperture; another index returns a retained mapping. The 64-byte output is
++u64 level, count, base, size, pa, ipa, attrs, reserved. An unavailable IPA is
++U64_MAX. BOOT_TABLE levels 0-2 return existing bootstrap tables, while U64_MAX
++returns the bootstrap initialized flag. Bootstrap queries never replay maps.
++
++DART and SART providers
++=======================
++
++APPLE_DART_APIF supplies an IOMMU provider for apple,dart-apif. It preserves
++stream groups, shared IOVA allocation, retained mappings, bounded batches and
++partial-prefix rollback. Linux builds native physical page lists, complements
++IOMMU allow bits into native deny bits, and sets up typed tables. Both DMA
++backing and list-buffer pointers are translated before native calls. Retained
++streams remain reserved and are excluded from ordinary power-down.
++
++APPLE_SART_APIF supplies apple,sart-apif through the existing apple_sart API.
++The raw MMIO provider continues using its current operations. The APIF provider
++tracks Linux-owned regions and respects endpoint-specific return semantics;
++unknown firmware grants are not advertised as inherited. Neither provider
++prints routine successful calls or runs probe-time mapping self-tests.
++
++The existing arm64 TSO task interface discovers guest ACTLR support through
++its toggle/readback probe; APIF does not add a second TSO protocol. The Apple
++WFI preservation quirk also covers captured T6050 parts 0x064/0x065. These
++parts also avoid unsafe timed waits in arbitrary delay callers. The current
++boot-time idle quirk and existing CPU handling are preserved. This does not claim future Ultra support.
++
++Validation
++==========
++
++Build the providers and run the production-function host tests with::
++
++  make ARCH=arm64 LLVM=1 Image
++  make -C tools/testing/selftests/aurora-apif run_tests
++
++Host tests exercise framing, prefix completion, ownership ordering, list
++translation and endpoint return handling. Hardware validation of this cleaned
++version-2 integration is pending. GPU backend changes are outside this series;
++legacy version-1 Aura aliases remain available to existing clients.
+diff --git a/Documentation/driver-api/firmware/index.rst b/Documentation/driver-api/firmware/index.rst
+index 86a3dd4bc3f8..ada189185094 100644
+--- a/Documentation/driver-api/firmware/index.rst
++++ b/Documentation/driver-api/firmware/index.rst
+@@ -4,6 +4,10 @@ Linux Firmware API
+ 
+ .. toctree::
+ 
++   aurora-apif
++   aurora-apif-nvme
++   aurora-apif-pcie
++   aurora-apif-pmp
+    introduction
+    core
+    efi/index
+diff --git a/MAINTAINERS b/MAINTAINERS
+index 897becc509f6..b6d17fba7be4 100644
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@ -4509,6 +4509,46 @@ F:	rust/helpers/auxiliary.c
+ F:	rust/kernel/auxiliary.rs
+ F:	samples/rust/rust_driver_auxiliary.rs
+ 
++AURORA APPLE SPMI PMU RTC
++M:	Dj <hey@djdev.me>
++L:	linux-rtc@vger.kernel.org
++S:	Maintained
++F:	Documentation/devicetree/bindings/rtc/apple,abbey-pmu-rtc.yaml
++F:	drivers/rtc/rtc-apple-spmi-pmu.c
++
++AURORA N1 CENTAURI TRANSPORT
++M:	Dj <hey@djdev.me>
++L:	linux-wireless@vger.kernel.org
++S:	Maintained
++F:	Documentation/arch/arm64/aurora-apif-centauri.rst
++F:	Documentation/devicetree/bindings/net/wireless/apple,centauri.yaml
++F:	Documentation/devicetree/bindings/net/bluetooth/apple,centauri.yaml
++F:	drivers/bluetooth/btcentauri.c
++F:	include/linux/apple-centauri.h
++F:	drivers/net/wireless/apple/
++
++AURORA PLATFORM MMIO INTERFACE
++M:	Dj <hey@djdev.me>
++S:	Maintained
++F:	Documentation/devicetree/bindings/firmware/aurora,apif-mmio.yaml
++F:	Documentation/devicetree/bindings/iommu/apple,dart-apif.yaml
++F:	Documentation/devicetree/bindings/soc/apple/apple,sart-apif.yaml
++F:	Documentation/driver-api/firmware/aurora-apif*.rst
++F:	Documentation/devicetree/bindings/nvme/apple,nvme-apif.yaml
++F:	Documentation/devicetree/bindings/pci/apple,apif-pcie.yaml
++F:	arch/arm64/configs/aurora-apif.config
++F:	drivers/nvme/host/apple-apif.h
++F:	drivers/pci/controller/apple-apif/
++F:	include/linux/pci-apple-apif.h
++F:	tools/aurora-apif/
++F:	drivers/firmware/aurora-apif-mmio.c
++F:	drivers/iommu/apple-dart-apif.c
++F:	drivers/soc/apple/apple-sart-apif.c
++F:	drivers/soc/apple/sart-backend.h
++F:	include/linux/apple-dart-apif.h
++F:	include/linux/soc/aurora/apif-mmio.h
++F:	tools/testing/selftests/aurora-apif/
++
+ AUXILIARY DISPLAY DRIVERS
+ M:	Andy Shevchenko <andy@kernel.org>
+ R:	Geert Uytterhoeven <geert@linux-m68k.org>
+diff --git a/arch/arm64/configs/aurora-apif.config b/arch/arm64/configs/aurora-apif.config
+new file mode 100644
+index 000000000000..dbc1e6457399
+--- /dev/null
++++ b/arch/arm64/configs/aurora-apif.config
+@@ -0,0 +1,6 @@
++# Common T6050 APIF providers. Add the platform-wiring PR for all consumers.
++CONFIG_ARM64_16K_PAGES=y
++CONFIG_AURORA_APIF_MMIO=y
++CONFIG_APPLE_DART_APIF=y
++CONFIG_APPLE_SART=y
++CONFIG_APPLE_SART_APIF=y
+diff --git a/arch/arm64/include/asm/cputype.h b/arch/arm64/include/asm/cputype.h
+index 8164bd21218e..8215a3b1dac4 100644
+--- a/arch/arm64/include/asm/cputype.h
++++ b/arch/arm64/include/asm/cputype.h
+@@ -162,6 +162,8 @@
+ #define APPLE_CPU_PART_TAHITI_P		0x061
+ #define APPLE_CPU_PART_T8142_E		0x062
+ #define APPLE_CPU_PART_T8142_P		0x063
++#define APPLE_CPU_PART_T6050_064		0x064
++#define APPLE_CPU_PART_T6050_065		0x065
+ #define APPLE_CPU_PART_T8152_E		0x072
+ #define APPLE_CPU_PART_T8152_P		0x073
+ 
+@@ -265,6 +267,8 @@
+ #define MIDR_APPLE_TAHITI_P MIDR_CPU_MODEL(ARM_CPU_IMP_APPLE, APPLE_CPU_PART_TAHITI_P)
+ #define MIDR_APPLE_T8142_E MIDR_CPU_MODEL(ARM_CPU_IMP_APPLE, APPLE_CPU_PART_T8142_E)
+ #define MIDR_APPLE_T8142_P MIDR_CPU_MODEL(ARM_CPU_IMP_APPLE, APPLE_CPU_PART_T8142_P)
++#define MIDR_APPLE_T6050_064 MIDR_CPU_MODEL(ARM_CPU_IMP_APPLE, APPLE_CPU_PART_T6050_064)
++#define MIDR_APPLE_T6050_065 MIDR_CPU_MODEL(ARM_CPU_IMP_APPLE, APPLE_CPU_PART_T6050_065)
+ #define MIDR_APPLE_T8152_E MIDR_CPU_MODEL(ARM_CPU_IMP_APPLE, APPLE_CPU_PART_T8152_E)
+ #define MIDR_APPLE_T8152_P MIDR_CPU_MODEL(ARM_CPU_IMP_APPLE, APPLE_CPU_PART_T8152_P)
+ #define MIDR_AMPERE1 MIDR_CPU_MODEL(ARM_CPU_IMP_AMPERE, AMPERE_CPU_PART_AMPERE1)
+diff --git a/arch/arm64/lib/delay.c b/arch/arm64/lib/delay.c
+index e0c5e615b5e5..591c25521477 100644
+--- a/arch/arm64/lib/delay.c
++++ b/arch/arm64/lib/delay.c
+@@ -44,14 +44,15 @@ void __delay(unsigned long cycles)
+ 	cycles_t start = __delay_cycles();
+ 
+ 	/*
+-	 * T8142 can clear registers on WFIT just as it does on WFI. A delay
++	 * T8142 and T6050 can clear registers on WFIT just as it does on WFI. A delay
+ 	 * may run with live kernel SIMD state, so the idle task's save/flush
+ 	 * path is not applicable here. Keep the core awake for short delays.
+ 	 */
+ 	if (IS_ENABLED(CONFIG_ARCH_APPLE)) {
+ 		u32 midr = read_cpuid_id() & MIDR_CPU_MODEL_MASK;
+ 
+-		if (midr == MIDR_APPLE_T8142_E || midr == MIDR_APPLE_T8142_P)
++		if (midr == MIDR_APPLE_T8142_E || midr == MIDR_APPLE_T8142_P ||
++		    midr == MIDR_APPLE_T6050_064 || midr == MIDR_APPLE_T6050_065)
+ 			goto counter_delay;
+ 	}
+ 
+diff --git a/drivers/firmware/Kconfig b/drivers/firmware/Kconfig
+index b7cc11e4fbfa..c4f9285d3f36 100644
+--- a/drivers/firmware/Kconfig
++++ b/drivers/firmware/Kconfig
+@@ -6,6 +6,16 @@
+ 
+ menu "Firmware Drivers"
+ 
++config AURORA_APIF_MMIO
++	tristate "Aurora platform MMIO interface"
++	depends on ARM64 && OF
++	help
++	  Submit synchronous, batched platform operations to an Aura monitor.
++	  The interface forwards native SPTM selectors, arguments and results
++	  without interpreting peripheral policy. Clients own their buffers.
++	  Submission is synchronous and supports atomic-context consumers.
++
++
+ source "drivers/firmware/arm_scmi/Kconfig"
+ 
+ config ARM_SCPI_PROTOCOL
+diff --git a/drivers/firmware/Makefile b/drivers/firmware/Makefile
+index be46f1e1dc77..8d5c56e4cfbf 100644
+--- a/drivers/firmware/Makefile
++++ b/drivers/firmware/Makefile
+@@ -39,3 +39,5 @@ obj-y				+= samsung/
+ obj-y				+= smccc/
+ obj-y				+= tegra/
+ obj-y				+= xilinx/
++
++obj-$(CONFIG_AURORA_APIF_MMIO) += aurora-apif-mmio.o
+diff --git a/drivers/firmware/aurora-apif-mmio.c b/drivers/firmware/aurora-apif-mmio.c
+new file mode 100644
+index 000000000000..aa6ec65c6248
+--- /dev/null
++++ b/drivers/firmware/aurora-apif-mmio.c
+@@ -0,0 +1,255 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* Aurora Platform Interface over Memory-Mapped I/O. */
++#include <linux/device.h>
++#include <linux/io.h>
++#include <linux/kref.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/of_platform.h>
++#include <linux/platform_device.h>
++#include <linux/sizes.h>
++#include <linux/slab.h>
++#include <linux/spinlock.h>
++#include <linux/soc/aurora/apif-mmio.h>
++
++#define APIF_MAGIC 0x4f494d4d46495041ULL
++#define APIF_VERSION 2
++#define APIF_REG_MAGIC 0x000
++#define APIF_REG_VERSION 0x008
++#define APIF_REG_MAX_OPS 0x010
++#define APIF_REG_FEATURES 0x018
++#define APIF_REG_DOORBELL 0x100
++#define APIF_FEAT_NATIVE BIT_ULL(0)
++#define APIF_BATCH_BYTES SZ_16K
++
++struct apif_batch {
++	u32 count, flags;
++	s32 status;
++	u32 done;
++	struct aurora_apif_op ops[];
++};
++
++#define APIF_BATCH_MAX                                    \
++	((APIF_BATCH_BYTES - sizeof(struct apif_batch)) / \
++	 sizeof(struct aurora_apif_op))
++
++struct apif_provider {
++	void __iomem *regs;
++	u32 max_ops;
++};
++
++struct aurora_apif {
++	struct kref refs;
++	raw_spinlock_t lock;
++	bool live;
++	void __iomem *doorbell;
++	struct apif_batch *batch;
++	u32 max_ops;
++};
++
++static struct platform_driver apif_driver;
++static_assert(sizeof(struct apif_batch) == 16);
++static_assert(sizeof(struct aurora_apif_op) == 64);
++static_assert(sizeof(struct aurora_apif_boot_iommu) == 64);
++
++/* SPTM redispatch restores SP_EL1 from its exception-stack contract. Keep the
++ * Linux stack in a preserved GPR across the trapping store. The monitor must
++ * preserve all GPRs, including x9, and return synchronously after the batch.
++ */
++static void apif_ring(struct aurora_apif *apif)
++{
++	u64 pa = virt_to_phys(apif->batch);
++
++	/* Publish the request before its synchronous doorbell. */
++	wmb();
++	asm volatile("mov x9, sp\n"
++		     "str %x[pa], [%[db]]\n"
++		     "mov sp, x9\n"
++		     :
++		     : [pa] "r"(pa), [db] "r"(apif->doorbell)
++		     : "x9", "memory");
++	/* Observe completion and returned fields after redispatch. */
++	rmb();
++}
++
++int aurora_apif_submit(struct aurora_apif *apif, struct aurora_apif_op *ops,
++		       u32 count, u32 *done)
++{
++	unsigned long flags;
++	u32 total = 0;
++	int ret = 0;
++
++	if (done)
++		*done = 0;
++	if (!apif || (count && !ops))
++		return -EINVAL;
++	raw_spin_lock_irqsave(&apif->lock, flags);
++	if (!apif->live) {
++		ret = -ENODEV;
++		goto out;
++	}
++	while (total < count) {
++		u32 n = min(count - total, apif->max_ops);
++		u32 reported;
++
++		apif->batch->count = n;
++		apif->batch->flags = 0;
++		apif->batch->status = -EINPROGRESS;
++		apif->batch->done = 0;
++		memcpy(apif->batch->ops, ops + total, n * sizeof(*ops));
++		apif_ring(apif);
++		reported = READ_ONCE(apif->batch->done);
++		if (reported > n) {
++			ret = -EIO;
++			break;
++		}
++		memcpy(ops + total, apif->batch->ops, n * sizeof(*ops));
++		total += reported;
++		ret = READ_ONCE(apif->batch->status);
++		if (ret || reported != n) {
++			if (ret >= 0 || ret == -EINPROGRESS)
++				ret = -EIO;
++			break;
++		}
++	}
++out:
++	raw_spin_unlock_irqrestore(&apif->lock, flags);
++	if (done)
++		*done = total;
++	return ret;
++}
++EXPORT_SYMBOL_GPL(aurora_apif_submit);
++
++static void apif_free(struct kref *refs)
++{
++	kfree(container_of(refs, struct aurora_apif, refs));
++}
++
++void aurora_apif_put(struct aurora_apif *apif)
++{
++	kref_put(&apif->refs, apif_free);
++}
++EXPORT_SYMBOL_GPL(aurora_apif_put);
++
++static void apif_revoke(void *data)
++{
++	struct aurora_apif *apif = data;
++	unsigned long flags;
++
++	raw_spin_lock_irqsave(&apif->lock, flags);
++	apif->live = false;
++	apif->doorbell = NULL;
++	apif->batch = NULL;
++	raw_spin_unlock_irqrestore(&apif->lock, flags);
++	aurora_apif_put(apif);
++}
++
++struct aurora_apif *aurora_apif_get(struct device *dev)
++{
++	struct device_node *node;
++	struct platform_device *supplier;
++	struct apif_provider *provider;
++	struct aurora_apif *apif;
++	struct device_link *link;
++	int ret;
++
++	node = of_parse_phandle(dev->of_node, "aurora,apif", 0);
++	if (!node)
++		return ERR_PTR(-ENODEV);
++	supplier = of_find_device_by_node(node);
++	of_node_put(node);
++	if (!supplier)
++		return ERR_PTR(-EPROBE_DEFER);
++	if (supplier->dev.driver != &apif_driver.driver) {
++		ret = -EPROBE_DEFER;
++		goto put_device;
++	}
++	link = device_link_add(dev, &supplier->dev,
++			       DL_FLAG_AUTOREMOVE_CONSUMER);
++	if (!link) {
++		ret = -ENOMEM;
++		goto put_device;
++	}
++	provider = platform_get_drvdata(supplier);
++	if (!provider) {
++		ret = -EPROBE_DEFER;
++		goto remove_link;
++	}
++	apif = kzalloc(sizeof(*apif), GFP_KERNEL);
++	if (!apif) {
++		ret = -ENOMEM;
++		goto remove_link;
++	}
++	kref_init(&apif->refs);
++	raw_spin_lock_init(&apif->lock);
++	apif->batch = devm_kzalloc(dev, APIF_BATCH_BYTES, GFP_KERNEL);
++	if (!apif->batch) {
++		ret = -ENOMEM;
++		aurora_apif_put(apif);
++		goto remove_link;
++	}
++	apif->max_ops = provider->max_ops;
++	apif->doorbell = provider->regs + APIF_REG_DOORBELL;
++	apif->live = true;
++	kref_get(&apif->refs);
++	ret = devm_add_action_or_reset(dev, apif_revoke, apif);
++	if (ret) {
++		aurora_apif_put(apif);
++		goto remove_link;
++	}
++	put_device(&supplier->dev);
++	return apif;
++remove_link:
++	device_link_del(link);
++put_device:
++	put_device(&supplier->dev);
++	return ERR_PTR(ret);
++}
++EXPORT_SYMBOL_GPL(aurora_apif_get);
++
++static int apif_probe(struct platform_device *pdev)
++{
++	struct apif_provider *provider;
++	struct resource *resource;
++	u64 max_ops;
++
++	resource = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	if (!resource ||
++	    resource_size(resource) < APIF_REG_DOORBELL + sizeof(u64))
++		return -EINVAL;
++	provider = devm_kzalloc(&pdev->dev, sizeof(*provider), GFP_KERNEL);
++	if (!provider)
++		return -ENOMEM;
++	provider->regs = devm_platform_ioremap_resource(pdev, 0);
++	if (IS_ERR(provider->regs))
++		return PTR_ERR(provider->regs);
++	if (readq(provider->regs + APIF_REG_MAGIC) != APIF_MAGIC ||
++	    readq(provider->regs + APIF_REG_VERSION) != APIF_VERSION ||
++	    !(readq(provider->regs + APIF_REG_FEATURES) & APIF_FEAT_NATIVE))
++		return dev_err_probe(&pdev->dev, -ENODEV,
++				     "unsupported APIF interface\n");
++	max_ops = readq(provider->regs + APIF_REG_MAX_OPS);
++	if (!max_ops)
++		return -EINVAL;
++	provider->max_ops = min_t(u64, max_ops, APIF_BATCH_MAX);
++	platform_set_drvdata(pdev, provider);
++	return 0;
++}
++
++static const struct of_device_id apif_of_match[] = {
++	{ .compatible = "aurora,apif-mmio" },
++	{}
++};
++MODULE_DEVICE_TABLE(of, apif_of_match);
++
++static struct platform_driver apif_driver = {
++	.driver = {
++		.name = "aurora-apif-mmio",
++		.of_match_table = apif_of_match,
++	},
++	.probe = apif_probe,
++};
++module_platform_driver(apif_driver);
++
++MODULE_DESCRIPTION("Aurora Platform Interface over Memory-Mapped I/O");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/iommu/Kconfig b/drivers/iommu/Kconfig
+index 78d6cbb543d1..03a3c6d3759e 100644
+--- a/drivers/iommu/Kconfig
++++ b/drivers/iommu/Kconfig
+@@ -328,6 +328,18 @@ config APPLE_DART_J713_DCP
+ 
+ 	  Leave this disabled for ordinary DART use, including APPLE_DART=m.
+ 
++config APPLE_DART_APIF
++	bool "Apple DART over the Aurora platform interface"
++	depends on ARM64_16K_PAGES && OF
++	depends on ARCH_APPLE || COMPILE_TEST
++	select AURORA_APIF_MMIO
++	select IOMMU_API
++	help
++	  Apple DART backend for a trusted Linux guest under Aura and SPTM.
++	  Native mapping and retyping policy lives in Linux; the monitor
++	  provides call transport, frame ownership and bootstrap metadata.
++	  Existing raw-MMIO DART drivers continue to serve other systems.
++
+ config APPLE_DART_KUNIT_TEST
+ 	bool "KUnit tests for Apple DART domains and commands" if !KUNIT_ALL_TESTS
+ 	depends on APPLE_DART=y && KUNIT=y
+diff --git a/drivers/iommu/Makefile b/drivers/iommu/Makefile
+index 2f05725eaab1..43893f2c03db 100644
+--- a/drivers/iommu/Makefile
++++ b/drivers/iommu/Makefile
+@@ -38,3 +38,5 @@ obj-$(CONFIG_SPRD_IOMMU) += sprd-iommu.o
+ obj-$(CONFIG_APPLE_DART) += apple-dart.o
+ obj-$(CONFIG_VSI_IOMMU) += vsi-iommu.o
+ obj-$(CONFIG_IOMMU_DEBUG_PAGEALLOC) += iommu-debug-pagealloc.o
++
++obj-$(CONFIG_APPLE_DART_APIF) += apple-dart-apif.o
+diff --git a/drivers/iommu/apple-dart-apif.c b/drivers/iommu/apple-dart-apif.c
+new file mode 100644
+index 000000000000..7c1519c70e3b
+--- /dev/null
++++ b/drivers/iommu/apple-dart-apif.c
+@@ -0,0 +1,2016 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* Apple DART IOMMU backend using Aura's native SPTM call transport.
++ * Linux owns stream topology, translation-table setup, DMA apertures and
++ * transactional mapping bookkeeping. Aura forwards native selectors 1:1.
++ */
++
++#include <linux/apple-dart-apif.h>
++#include <linux/soc/aurora/apif-mmio.h>
++#include <linux/bitmap.h>
++#include <linux/dma-mapping.h>
++#include <linux/err.h>
++#include <linux/io.h>
++#include <linux/iommu.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/of.h>
++#include <linux/of_platform.h>
++#include <linux/overflow.h>
++#include <linux/platform_device.h>
++#include <linux/pci.h>
++#include <linux/slab.h>
++#include <linux/spinlock.h>
++#include <linux/xarray.h>
++
++#include "dma-iommu.h"
++
++/* Internal operations used by the IOMMU bookkeeping; not the APIF wire ABI. */
++#define APIF_DART_INIT 1 /* ()                       INIT + POWERUP */
++#define APIF_DART_ATTACH 2 /* (sid, dva, level) */
++#define APIF_DART_MAP 3 /* (sid, dva, ipa, size, prot) */
++#define APIF_DART_UNMAP 4 /* (sid, dva, size) */
++#define APIF_DART_ENABLE 5 /* (sid) */
++#define APIF_DART_DISABLE 6 /* (sid) */
++
++#define APIF_DART_RETAINED_INFO 9
++#define APIF_DART_RETAINED_RUN 10
++
++struct apif_op {
++	u32 op;
++	u32 flags;
++	u64 arg[6];
++	u64 ret;
++};
++
++struct apif_batch {
++	u32 count;
++	u32 flags;
++	s32 status;
++	u32 done;
++	struct apif_op op[];
++};
++
++#define DART_APIF_PAGE_SHIFT 14
++#define DART_APIF_PAGE_SIZE (1UL << DART_APIF_PAGE_SHIFT) /* 16 KiB */
++/* apif's DART MAP forwards one contiguous run within a single 32 MiB leaf-table
++ * span, so every MAP op must stay inside one aligned block.
++ */
++#define DART_APIF_BLOCK_SHIFT 25
++#define DART_APIF_BLOCK_SIZE (1UL << DART_APIF_BLOCK_SHIFT) /* 32 MiB */
++
++#define DART_APIF_MAX_STREAMS 256
++#define DART_APIF_APERTURE_END (SZ_4G - 1)
++#define DART_APIF_NATIVE_APERTURE_END GENMASK_ULL(41, 0)
++
++/* Preserve batched per-block operations and the existing rollback accounting. */
++#define APIF_BATCH_MAX_OPS \
++	((PAGE_SIZE - sizeof(struct apif_batch)) / sizeof(struct apif_op))
++
++static const struct iommu_ops apple_dart_apif_ops;
++
++struct apif_retained_run {
++	u64 dva, ipa, size;
++};
++struct apif_retained_sid {
++	unsigned int root_level, count;
++	struct apif_retained_run *runs;
++};
++
++struct apple_dart_apif {
++	struct device *dev;
++	struct iommu_device iommu;
++	struct aurora_apif *apif;
++	struct aurora_apif_op *native_ops;
++	struct aurora_apif_boot_iommu *boot_info;
++	u64 *page_lists[APIF_BATCH_MAX_OPS];
++	u64 page_list_pa[APIF_BATCH_MAX_OPS];
++	u32 dart_id;
++	u32 num_streams;
++	u64 iova_force; /* Native address force mask, hidden from DMA API/device addresses. */
++	u64 dma_min, dma_max;
++	bool reserve_last_page;
++	bool inited;
++	bool boot_mappings; /* U-Boot retained the running MTP's DMA tables. */
++	bool ownership_uncertain; /* A table operation needs a fresh boot after lost completion. */
++	struct apif_retained_sid *retained[DART_APIF_MAX_STREAMS];
++	struct mutex init_lock; /* serialises one-time init */
++	/* Protected by apple_dart_apif_groups_lock; group-owned lifetime. */
++	struct iommu_group *sid2group[DART_APIF_MAX_STREAMS];
++
++	struct apif_batch *batch; /* internal mapping-operation buffer */
++	spinlock_t batch_lock; /* protects operation buffers and stream updates */
++};
++
++/* Match the native DART driver's capacity for shared display DMA domains. */
++#define APIF_MAX_DARTS 8
++
++struct apif_stream_map {
++	struct apple_dart_apif *dart;
++	DECLARE_BITMAP(sids, DART_APIF_MAX_STREAMS);
++};
++
++struct apple_dart_apif_master {
++	unsigned int num_darts;
++	struct apif_stream_map streams[APIF_MAX_DARTS];
++};
++
++struct apple_dart_apif_domain {
++	struct iommu_domain domain;
++	unsigned int num_darts;
++	struct apif_stream_map streams[APIF_MAX_DARTS];
++	struct mutex lock; /* serialises domain attachments */
++	/* Mapping calls may run concurrently on distinct ranges. An attachment
++	 * must replay a stable mapping set before publishing its new streams.
++	 */
++	rwlock_t streams_lock;
++	/* Key: dart-id:8, sid:8, block:40. SPTM tables cannot be attached twice. */
++	struct xarray l2_attached;
++	bool has_retained;
++	/* One canonical mapping set and IOVA allocator for every DART. */
++	struct xarray mappings;
++};
++
++static struct apif_stream_map *
++apif_find_stream(struct apple_dart_apif_domain *dom,
++		 struct apple_dart_apif *dart)
++{
++	if (dom)
++		for (unsigned int i = 0; i < dom->num_darts; i++)
++			if (dom->streams[i].dart == dart)
++				return &dom->streams[i];
++	return NULL;
++}
++
++/* Domain topology is fixed before the first attachment. Later devices can
++ * add SIDs on these DARTs, but cannot change an active allocator's aperture.
++ */
++static int apif_domain_configure(struct apple_dart_apif_domain *dom,
++				 const struct apple_dart_apif_master *master)
++{
++	u64 start = 0, end = DART_APIF_NATIVE_APERTURE_END;
++
++	if (!master || !master->num_darts)
++		return -ENODEV;
++	if (dom->num_darts) {
++		for (unsigned int i = 0; i < master->num_darts; i++)
++			if (!apif_find_stream(dom, master->streams[i].dart))
++				return -EINVAL;
++		return 0;
++	}
++	for (unsigned int i = 0; i < master->num_darts; i++) {
++		start = max(start, master->streams[i].dart->dma_min);
++		end = min(end, master->streams[i].dart->dma_max);
++	}
++	if (start > end)
++		return -EINVAL;
++	for (unsigned int i = 0; i < master->num_darts; i++)
++		dom->streams[i].dart = master->streams[i].dart;
++	dom->domain.geometry.aperture_start = start;
++	dom->domain.geometry.aperture_end = end;
++	dom->num_darts = master->num_darts;
++	return 0;
++}
++
++static struct apple_dart_apif_domain *to_apif_domain(struct iommu_domain *dom)
++{
++	return container_of(dom, struct apple_dart_apif_domain, domain);
++}
++
++/* The native DMA address space strips the force bits before returning a device DMA address
++ * and restores it for DART operations. Translate only the bounded transport
++ * batch; all live-map bookkeeping and the DMA aperture remain device-visible.
++ * The force bits are disjoint from the validated low-4-GiB aperture.
++ */
++static void apif_force_iovas(struct apple_dart_apif *dart, bool restore)
++{
++	if (!dart->iova_force)
++		return;
++	for (u32 i = 0; i < dart->batch->count; i++) {
++		struct apif_op *op = &dart->batch->op[i];
++
++		switch (op->op) {
++		case APIF_DART_ATTACH:
++		case APIF_DART_MAP:
++		case APIF_DART_UNMAP:
++			if (restore)
++				op->arg[1] &= ~dart->iova_force;
++			else
++				op->arg[1] |= dart->iova_force;
++			break;
++		}
++	}
++}
++
++static void apif_put_transport(void *data)
++{
++	aurora_apif_put(data);
++}
++
++static void apif_free_page_lists(void *data)
++{
++	struct apple_dart_apif *dart = data;
++
++	for (unsigned int i = 0; i < APIF_BATCH_MAX_OPS; i++)
++		kfree(dart->page_lists[i]);
++}
++
++static int apif_one(struct apple_dart_apif *dart, struct aurora_apif_op *op)
++{
++	return aurora_apif_submit(dart->apif, op, 1, NULL);
++}
++
++static int apif_prepare_table(struct apple_dart_apif *dart, u64 sid, u64 dva,
++			      u64 level)
++{
++	u64 base = level ? round_down(dva, 1ULL << (level == 1 ? 36 : 25)) : 0;
++	u64 owner = 0x4441525400000000ULL | ((u64)dart->dart_id << 16) |
++		    (sid << 8) | level;
++	struct aurora_apif_op op = {
++		.selector = AURORA_APIF_SELECTOR(AURORA_APIF_SERVICE,
++						 AURORA_APIF_BOOT_TABLE),
++		.arg = { AURORA_APIF_BOOT_DART, dart->dart_id, sid, dva,
++			 level },
++	};
++	u64 pa;
++	int ret;
++
++	if (sid >= dart->num_streams || level > 2)
++		return -EINVAL;
++	if (level == 2 && dart->retained[sid] &&
++	    !dart->retained[sid]->root_level) {
++		ret = apif_prepare_table(dart, sid, dva, 1);
++		if (ret)
++			return ret;
++	}
++	ret = apif_one(dart, &op);
++	if (ret || op.ret)
++		return ret;
++	op = (struct aurora_apif_op){
++		.selector = AURORA_APIF_SELECTOR(AURORA_APIF_SERVICE,
++						 AURORA_APIF_FIND_FRAME),
++		.arg = { owner, base },
++	};
++	ret = apif_one(dart, &op);
++	if (ret || op.ret)
++		return ret;
++	op = (struct aurora_apif_op){
++		.selector = AURORA_APIF_SELECTOR(AURORA_APIF_SERVICE,
++						 AURORA_APIF_ALLOC_FRAME),
++	};
++	ret = apif_one(dart, &op);
++	if (ret)
++		return ret;
++	pa = op.ret;
++	op = (struct aurora_apif_op){
++		.selector = AURORA_APIF_SELECTOR(0, 1), /* RETYPE */
++		.arg = { pa, 11, 24,
++			 (((level << 16) | (sid << 8) | dart->dart_id) << 32) |
++				 5 },
++	};
++	ret = apif_one(dart, &op);
++	if (ret) {
++		dart->ownership_uncertain = true;
++		return ret; /* Retain the frame until a fresh boot. */
++	}
++	if (!op.ret) {
++		op = (struct aurora_apif_op){
++			.selector = AURORA_APIF_SELECTOR(
++				AURORA_APIF_SERVICE, AURORA_APIF_FREE_FRAME),
++			.arg = { pa },
++		};
++		apif_one(dart, &op);
++		return -EIO;
++	}
++	op = (struct aurora_apif_op){
++		.selector = AURORA_APIF_SELECTOR(3, 0), /* DART MAP_TABLE */
++		.arg = { dart->dart_id, sid, dva, level, pa },
++	};
++	ret = apif_one(dart, &op);
++	if (ret) {
++		dart->ownership_uncertain = true;
++		return ret;
++	}
++	/* Publish the opaque ownership key only after the table is attached. */
++	op = (struct aurora_apif_op){
++		.selector = AURORA_APIF_SELECTOR(AURORA_APIF_SERVICE,
++						 AURORA_APIF_TAG_FRAME),
++		.arg = { pa, owner, base },
++	};
++	ret = apif_one(dart, &op);
++	if (ret)
++		dart->ownership_uncertain = true;
++	return ret;
++}
++
++static int apif_boot_query(struct apple_dart_apif *dart,
++			   struct apif_op *request)
++{
++	struct apif_retained_sid *r = request->arg[0] < dart->num_streams ?
++		dart->retained[request->arg[0]] : NULL;
++
++	if (dart->boot_mappings && r) {
++		if (request->op == APIF_DART_RETAINED_INFO) {
++			request->arg[1] = r->root_level;
++			request->arg[2] = r->count;
++			request->arg[3] = dart->dma_min;
++			request->arg[4] = dart->dma_max - dart->dma_min + 1;
++			request->arg[5] = 1;
++		} else {
++			const struct apif_retained_run *run;
++
++			if (request->arg[1] >= r->count)
++				return -EINVAL;
++			run = &r->runs[request->arg[1]];
++			request->arg[2] = run->dva;
++			request->arg[3] = run->ipa;
++			request->arg[4] = run->size;
++			request->arg[5] = 0;
++		}
++		return 0;
++	}
++
++	struct aurora_apif_boot_iommu *info = dart->boot_info;
++	struct aurora_apif_op op = {
++		.selector = AURORA_APIF_SELECTOR(AURORA_APIF_SERVICE,
++						 AURORA_APIF_BOOT_IOMMU),
++		.arg = { AURORA_APIF_BOOT_DART, dart->dart_id, request->arg[0],
++			 request->op == APIF_DART_RETAINED_INFO ?
++				 U64_MAX :
++				 request->arg[1],
++			 virt_to_phys(info), sizeof(*info) },
++	};
++	int ret = apif_one(dart, &op);
++
++	if (ret)
++		return ret;
++	if (request->op == APIF_DART_RETAINED_INFO) {
++		request->arg[1] = info->level;
++		request->arg[2] = info->count;
++		request->arg[3] = info->base;
++		request->arg[4] = info->size;
++		request->arg[5] = 1;
++	} else {
++		request->arg[2] = info->base;
++		request->arg[3] = info->ipa;
++		request->arg[4] = info->size;
++		request->arg[5] = info->attrs;
++	}
++	return 0;
++}
++
++/* Build native calls in Linux, including address lists and permission flags.
++ * Address translations form a separate batch, so failure cannot send a MAP
++ * with an untranslated pointer. Mapping batches keep the original capacity
++ * and prefix-completion accounting used by rollback. Caller holds batch_lock.
++ */
++static int apif_ring(struct apple_dart_apif *dart)
++{
++	struct aurora_apif_op *native = dart->native_ops;
++	u32 count = dart->batch->count, n = 0, translated = 0, done = 0;
++	u32 ends[APIF_BATCH_MAX_OPS];
++	int ret = 0;
++
++	dart->batch->done = 0;
++	if (dart->ownership_uncertain) {
++		dart->batch->status = -EIO;
++		return -EIO;
++	}
++	if (count > APIF_BATCH_MAX_OPS)
++		return -EINVAL;
++	apif_force_iovas(dart, false);
++	for (u32 i = 0; i < count; i++) {
++		struct apif_op *op = &dart->batch->op[i];
++
++		if (op->flags) {
++			ret = -EINVAL;
++			goto out;
++		}
++		if (op->op == APIF_DART_MAP) {
++			if (op->arg[4] &
++			    ~(IOMMU_READ | IOMMU_WRITE | IOMMU_CACHE |
++			      IOMMU_NOEXEC | IOMMU_MMIO)) {
++				ret = -EINVAL;
++				goto out;
++			}
++			if (!dart->page_lists[i])
++				dart->page_lists[i] =
++					kmalloc(SZ_16K, GFP_ATOMIC);
++			if (!dart->page_lists[i]) {
++				ret = -ENOMEM;
++				goto out;
++			}
++			native[translated++] = (struct aurora_apif_op){
++				.selector = AURORA_APIF_SELECTOR(
++					AURORA_APIF_SERVICE,
++					AURORA_APIF_TRANSLATE),
++				.arg = { op->arg[2], op->arg[3] },
++			};
++			native[translated++] = (struct aurora_apif_op){
++				.selector = AURORA_APIF_SELECTOR(
++					AURORA_APIF_SERVICE,
++					AURORA_APIF_TRANSLATE),
++				.arg = { virt_to_phys(dart->page_lists[i]),
++					 SZ_16K },
++			};
++		}
++	}
++	if (translated) {
++		ret = aurora_apif_submit(dart->apif, native, translated, NULL);
++		if (ret)
++			goto out;
++		translated = 0;
++		for (u32 i = 0; i < count; i++)
++			if (dart->batch->op[i].op == APIF_DART_MAP) {
++				dart->batch->op[i].arg[5] =
++					native[translated++].ret;
++				dart->page_list_pa[i] =
++					native[translated++].ret;
++			}
++	}
++	for (u32 i = 0; i < count; i++) {
++		struct apif_op *op = &dart->batch->op[i];
++		u64 *a = op->arg;
++		struct aurora_apif_op call = {};
++
++		call.arg[0] = dart->dart_id;
++		call.arg[1] = a[0];
++		op->ret = 0;
++		switch (op->op) {
++		case APIF_DART_INIT: {
++			if (dart->boot_mappings)
++				break;
++			struct aurora_apif_op query = {
++				.selector = AURORA_APIF_SELECTOR(
++					AURORA_APIF_SERVICE,
++					AURORA_APIF_BOOT_TABLE),
++				.arg = { AURORA_APIF_BOOT_DART, dart->dart_id,
++					 0, 0, U64_MAX },
++			};
++
++			ret = apif_one(dart, &query);
++			if (ret)
++				goto out;
++			if (!query.ret) {
++				call.selector =
++					AURORA_APIF_SELECTOR(3, 6); /* INIT */
++				native[n++] = call;
++				call.selector = AURORA_APIF_SELECTOR(
++					3, 5); /* POWERUP */
++				native[n++] = call;
++			}
++			break;
++		}
++		case APIF_DART_ATTACH:
++			ret = apif_prepare_table(dart, a[0], a[1], a[2]);
++			if (ret)
++				goto out;
++			break;
++		case APIF_DART_RETAINED_INFO:
++		case APIF_DART_RETAINED_RUN:
++			ret = apif_boot_query(dart, op);
++			if (ret)
++				goto out;
++			break;
++		case APIF_DART_MAP: {
++			u64 pa = a[5], size = a[3];
++
++			if (!size || size > DART_APIF_BLOCK_SIZE ||
++			    ((a[1] | pa | size) & (DART_APIF_PAGE_SIZE - 1)) ||
++			    (a[1] >> 25) != ((a[1] + size - 1) >> 25)) {
++				ret = -EINVAL;
++				goto out;
++			}
++			for (u64 p = 0; p < size / DART_APIF_PAGE_SIZE; p++)
++				dart->page_lists[i][p] =
++					pa + p * DART_APIF_PAGE_SIZE;
++			call.selector = AURORA_APIF_SELECTOR(3, 2); /* MAP */
++			call.arg[2] = a[1];
++			call.arg[3] = dart->page_list_pa[i];
++			call.arg[4] = size;
++			call.arg[5] = (~a[4]) & 7;
++			native[n++] = call;
++			break;
++		}
++		case APIF_DART_UNMAP:
++			call.selector = AURORA_APIF_SELECTOR(3, 3);
++			call.arg[2] = a[1];
++			call.arg[3] = a[2];
++			call.arg[4] = 2;
++			native[n++] = call;
++			break;
++		case APIF_DART_ENABLE:
++		case APIF_DART_DISABLE:
++			if (a[0] >= dart->num_streams) {
++				ret = -EINVAL;
++				goto out;
++			}
++			/* Live firmware retains stream state across Linux domain
++			 * attachment and teardown, just as for power transitions.
++			 */
++			if (dart->retained[a[0]])
++				break;
++			call.selector = AURORA_APIF_SELECTOR(
++				3, op->op == APIF_DART_ENABLE ? 8 : 7);
++			native[n++] = call;
++			break;
++		case 7: /* POWERUP */
++		case 8: /* POWERDOWN */
++			for (u32 sid = 0; sid < dart->num_streams; sid++)
++				if (dart->retained[sid]) {
++					if (op->op == 8) {
++						ret = -EBUSY;
++						goto out;
++					}
++					goto prepared;
++				}
++			call.selector =
++				AURORA_APIF_SELECTOR(3, op->op == 7 ? 5 : 4);
++			native[n++] = call;
++			break;
++		default:
++			ret = -EINVAL;
++			goto out;
++		}
++prepared:
++		ends[i] = n;
++	}
++	ret = aurora_apif_submit(dart->apif, native, n, &done);
++	for (u32 i = 0; i < count && ends[i] <= done; i++)
++		dart->batch->done = i + 1;
++out:
++	apif_force_iovas(dart, true);
++	dart->batch->status = ret;
++	return ret;
++}
++
++/* Setup-only host queries. Firmware-owned mappings are reserved, never replayed
++ * through MAP, and never inserted in the Linux-owned mappings xarray.
++ */
++static int apif_load_boot_mappings(struct apple_dart_apif *dart)
++{
++	struct device_node *np = dart->dev->of_node;
++	struct apif_retained_sid *r;
++	u64 cells[32], sid, previous = 0;
++	int count, ret;
++
++	if (!of_find_property(np, "apple,apif-boot-mappings", NULL))
++		return 0;
++	count = of_property_count_u64_elems(np, "apple,apif-boot-mappings");
++	if (count < 4 || count > ARRAY_SIZE(cells) || count % 4 || dart->iova_force)
++		return -EINVAL;
++	ret = of_property_read_u64_array(np, "apple,apif-boot-mappings", cells, count);
++	if (ret)
++		return ret;
++	sid = cells[0];
++	if (sid >= dart->num_streams || dart->retained[sid])
++		return -EINVAL;
++	r = devm_kzalloc(dart->dev, sizeof(*r), GFP_KERNEL);
++	if (!r)
++		return -ENOMEM;
++	r->root_level = 1;
++	r->count = count / 4;
++	r->runs = devm_kcalloc(dart->dev, r->count, sizeof(*r->runs), GFP_KERNEL);
++	if (!r->runs)
++		return -ENOMEM;
++	for (unsigned int i = 0; i < r->count; i++) {
++		struct apif_retained_run *run = &r->runs[i];
++
++		run->dva = cells[i * 4 + 1];
++		run->ipa = cells[i * 4 + 2];
++		run->size = cells[i * 4 + 3];
++		if (cells[i * 4] != sid || !run->size ||
++		    (run->dva | run->ipa | run->size) & (DART_APIF_PAGE_SIZE - 1) ||
++		    run->dva < dart->dma_min || run->dva > dart->dma_max ||
++		    run->size - 1 > dart->dma_max - run->dva ||
++		    run->size > U64_MAX - run->ipa || (i && run->dva < previous))
++			return -EINVAL;
++		previous = run->dva + run->size;
++	}
++	dart->retained[sid] = r;
++	dart->boot_mappings = true;
++	dev_info(dart->dev, "retaining %u boot DMA mappings on stream %llu\n", r->count, sid);
++	return 0;
++}
++
++static int apif_load_retained(struct apple_dart_apif *dart)
++{
++	struct device_node *np = dart->dev->of_node;
++	int count = of_property_count_u32_elems(np, "apple,apif-retained-sids");
++	int ret;
++
++	if (!of_find_property(np, "apple,apif-retained-sids", NULL))
++		return 0;
++	if (count < 1 || count > dart->num_streams || dart->iova_force)
++		return -EINVAL;
++	for (int i = 0; i < count; i++) {
++		struct apif_retained_sid *r;
++		u32 sid;
++		u64 previous = 0;
++		struct apif_op *op = &dart->batch->op[0];
++
++		if (of_property_read_u32_index(np, "apple,apif-retained-sids",
++					       i, &sid) ||
++		    sid >= dart->num_streams || dart->retained[sid])
++			return -EINVAL;
++		dart->batch->count = 1;
++		*op = (struct apif_op){ .op = APIF_DART_RETAINED_INFO,
++					.arg = { sid } };
++		ret = apif_ring(dart);
++		if (ret)
++			return ret;
++		if (op->arg[1] > 1 || op->arg[2] > 131072 || op->arg[5] != 1 ||
++		    op->arg[3] != dart->dma_min ||
++		    op->arg[4] != dart->dma_max - dart->dma_min + 1)
++			return -EINVAL;
++		r = devm_kzalloc(dart->dev, sizeof(*r), GFP_KERNEL);
++		if (!r)
++			return -ENOMEM;
++		r->root_level = op->arg[1];
++		r->count = op->arg[2];
++		r->runs = devm_kcalloc(dart->dev, r->count, sizeof(*r->runs),
++				       GFP_KERNEL);
++		if (r->count && !r->runs)
++			return -ENOMEM;
++		for (u64 j = 0; j < r->count; j++) {
++			struct apif_retained_run *run = &r->runs[j];
++
++			*op = (struct apif_op){ .op = APIF_DART_RETAINED_RUN,
++						.arg = { sid, j } };
++			ret = apif_ring(dart);
++			if (ret)
++				return ret;
++			run->dva = op->arg[2];
++			run->ipa = op->arg[3];
++			run->size = op->arg[4];
++			if (!run->size ||
++			    (run->dva | run->size) &
++				    (DART_APIF_PAGE_SIZE - 1) ||
++			    run->dva < dart->dma_min ||
++			    run->dva > dart->dma_max ||
++			    run->size - 1 > dart->dma_max - run->dva ||
++			    (j && run->dva < previous) ||
++			    (run->ipa != U64_MAX &&
++			     ((run->ipa & (DART_APIF_PAGE_SIZE - 1)) ||
++			      run->size > U64_MAX - run->ipa)))
++				return -EINVAL;
++			previous = run->dva + run->size;
++		}
++		dart->retained[sid] = r;
++	}
++	return 0;
++}
++
++static const struct apif_retained_run *
++apif_retained_lookup(const struct apif_retained_sid *r, u64 dva, u64 size)
++{
++	unsigned int low = 0, high = r->count;
++
++	while (low < high) {
++		unsigned int mid = low + (high - low) / 2;
++		const struct apif_retained_run *run = &r->runs[mid];
++
++		if (run->dva + run->size <= dva)
++			low = mid + 1;
++		else
++			high = mid;
++	}
++	return low < r->count && r->runs[low].dva < dva + size ? &r->runs[low] :
++								 NULL;
++}
++
++static bool apif_retained_overlap(struct apple_dart_apif_domain *dom, u64 dva,
++				  u64 size)
++{
++	unsigned int sid;
++
++	if (!dom->has_retained)
++		return false;
++	for (unsigned int i = 0; i < dom->num_darts; i++) {
++		struct apif_stream_map *stream = &dom->streams[i];
++
++		for_each_set_bit(sid, stream->sids, stream->dart->num_streams) {
++			struct apif_retained_sid *r =
++				stream->dart->retained[sid];
++
++			if (r && apif_retained_lookup(r, dva, size))
++				return true;
++		}
++	}
++	return false;
++}
++
++static phys_addr_t apif_retained_translate(struct apple_dart_apif_domain *dom,
++					   u64 dva)
++{
++	unsigned int sid;
++	u64 result = 0;
++
++	if (!dom->has_retained)
++		return 0;
++	/* Firmware may retain different mappings on different display engines.
++	 * Only a unanimous translation is meaningful for their shared domain.
++	 */
++	for (unsigned int i = 0; i < dom->num_darts; i++) {
++		struct apif_stream_map *stream = &dom->streams[i];
++
++		for_each_set_bit(sid, stream->sids, stream->dart->num_streams) {
++			struct apif_retained_sid *r =
++				stream->dart->retained[sid];
++			const struct apif_retained_run *run =
++				r ? apif_retained_lookup(r, dva, 1) : NULL;
++			u64 pa;
++
++			if (!run || dva < run->dva || run->ipa == U64_MAX)
++				return 0;
++			pa = run->ipa + dva - run->dva;
++			if (result && result != pa)
++				return 0;
++			result = pa;
++		}
++	}
++	return result;
++}
++
++/* Bring the DART up in SPTM exactly once, before any stream is enabled. */
++static int apple_dart_apif_ensure_init(struct apple_dart_apif *dart)
++{
++	int ret = 0;
++
++	mutex_lock(&dart->init_lock);
++	if (!dart->inited) {
++		unsigned long flags;
++
++		spin_lock_irqsave(&dart->batch_lock, flags);
++		dart->batch->count = 1;
++		dart->batch->op[0] = (struct apif_op){ .op = APIF_DART_INIT };
++		ret = apif_ring(dart);
++		spin_unlock_irqrestore(&dart->batch_lock, flags);
++		if (ret)
++			ret = -EIO;
++		else
++			dart->inited = true;
++	}
++	mutex_unlock(&dart->init_lock);
++	return ret;
++}
++
++/* Live mappings are indexed by IOVA page. Normal map/unmap only touches the
++ * requested range; a complete walk is needed solely when adding a new SID.
++ * Zero tagged values reserve XArray storage before any hardware mapping.
++ */
++#define APIF_MAP_PROT_BITS 8
++
++static unsigned long apif_mapping_value(phys_addr_t pa, int prot)
++{
++	return ((pa >> DART_APIF_PAGE_SHIFT) << APIF_MAP_PROT_BITS) | prot;
++}
++
++static int apif_reserve_mappings(struct apple_dart_apif_domain *dom,
++				 unsigned long iova, size_t size, gfp_t gfp)
++{
++	unsigned long first = iova >> DART_APIF_PAGE_SHIFT;
++	unsigned long pages = size >> DART_APIF_PAGE_SHIFT;
++	unsigned long page;
++	int ret;
++
++	for (page = 0; page < pages; page++) {
++		ret = xa_insert(&dom->mappings, first + page, xa_mk_value(0),
++				gfp);
++		if (ret)
++			goto undo;
++	}
++	return 0;
++undo:
++	while (page)
++		xa_erase(&dom->mappings, first + --page);
++	return ret;
++}
++
++static void apif_release_reservations(struct apple_dart_apif_domain *dom,
++				      unsigned long iova, size_t size)
++{
++	unsigned long first = iova >> DART_APIF_PAGE_SHIFT;
++	unsigned long pages = size >> DART_APIF_PAGE_SHIFT;
++
++	for (unsigned long page = 0; page < pages; page++)
++		if (xa_load(&dom->mappings, first + page) == xa_mk_value(0))
++			xa_erase(&dom->mappings, first + page);
++}
++
++static void apif_record_mapping(struct apple_dart_apif_domain *dom, u64 iova,
++				u64 pa, size_t size, int prot)
++{
++	for (size_t off = 0; off < size; off += DART_APIF_PAGE_SIZE) {
++		unsigned long index = (iova + off) >> DART_APIF_PAGE_SHIFT;
++		void *entry = xa_mk_value(apif_mapping_value(pa + off, prot));
++
++		/* Reserved entries retain their nodes, so replacing a reservation
++		 * requires no allocation, even in this IRQ-disabled section.
++		 */
++		WARN_ON(xa_err(
++			xa_store(&dom->mappings, index, entry, GFP_NOWAIT)));
++	}
++}
++
++static void apif_forget_mapping(struct apple_dart_apif_domain *dom, u64 iova,
++				size_t size)
++{
++	for (size_t off = 0; off < size; off += DART_APIF_PAGE_SIZE)
++		xa_erase(&dom->mappings, (iova + off) >> DART_APIF_PAGE_SHIFT);
++}
++
++static int apif_prepare_leaf(struct apple_dart_apif_domain *dom,
++			     struct apif_stream_map *stream, unsigned int sid,
++			     u64 iova)
++{
++	struct apple_dart_apif *dart = stream->dart;
++	unsigned long key = ((unsigned long)dart->dart_id << 48) |
++			    ((unsigned long)sid << 40) |
++			    (iova >> DART_APIF_BLOCK_SHIFT);
++	int ret;
++
++	if (xa_load(&dom->l2_attached, key))
++		return 0;
++	ret = xa_insert(&dom->l2_attached, key, xa_mk_value(0), GFP_ATOMIC);
++	if (ret)
++		return ret;
++	dart->batch->count = 1;
++	dart->batch->op[0] = (struct apif_op){
++		.op = APIF_DART_ATTACH,
++		.arg = { sid, iova, 2 },
++	};
++	ret = apif_ring(dart);
++	if (ret) {
++		xa_erase(&dom->l2_attached, key);
++		return ret;
++	}
++	WARN_ON(xa_err(
++		xa_store(&dom->l2_attached, key, xa_mk_value(1), GFP_NOWAIT)));
++	return 0;
++}
++
++/* Return the next physically contiguous, same-protection run, stopping at a
++ * leaf-table boundary. Reservations are not yet live and are skipped.
++ */
++static bool apif_next_mapping(struct apple_dart_apif_domain *dom,
++			      unsigned long *cursor, struct apif_op *op,
++			      unsigned int sid)
++{
++	unsigned long index = *cursor, value, first;
++	void *entry;
++	u64 iova, pa;
++	size_t size;
++	int prot;
++
++	for (;;) {
++		entry = xa_find(&dom->mappings, &index, ULONG_MAX, XA_PRESENT);
++		if (!entry)
++			return false;
++		value = xa_to_value(entry);
++		if (value)
++			break;
++		index++;
++	}
++	first = index;
++	prot = value & ((1UL << APIF_MAP_PROT_BITS) - 1);
++	pa = (value >> APIF_MAP_PROT_BITS) << DART_APIF_PAGE_SHIFT;
++	iova = (u64)first << DART_APIF_PAGE_SHIFT;
++	size = DART_APIF_PAGE_SIZE;
++	while ((iova + size) & (DART_APIF_BLOCK_SIZE - 1)) {
++		entry = xa_load(&dom->mappings, index + 1);
++		if (entry != xa_mk_value(apif_mapping_value(pa + size, prot)))
++			break;
++		index++;
++		size += DART_APIF_PAGE_SIZE;
++	}
++	*cursor = index + 1;
++	*op = (struct apif_op){
++		.op = APIF_DART_MAP,
++		.arg = { sid, iova, pa, size, prot },
++	};
++	return true;
++}
++
++static int apif_undo_replay(struct apple_dart_apif_domain *dom,
++			    struct apif_stream_map *stream, unsigned int sid,
++			    u64 mapped_end)
++{
++	struct apple_dart_apif *dart = stream->dart;
++	unsigned long cursor = 0;
++	struct apif_op op;
++
++	while (apif_next_mapping(dom, &cursor, &op, sid) &&
++	       op.arg[1] < mapped_end) {
++		dart->batch->count = 1;
++		dart->batch->op[0] = (struct apif_op){
++			.op = APIF_DART_UNMAP,
++			.arg = { sid, op.arg[1],
++				 min_t(u64, op.arg[3],
++				       mapped_end - op.arg[1]) },
++		};
++		if (apif_ring(dart)) {
++			dev_err(dart->dev, "failed to undo SID %u replay\n",
++				sid);
++			return -EIO;
++		}
++	}
++	return 0;
++}
++
++/* New SID is disabled throughout replay. On failure, keep it disabled and
++ * remove the successful replay prefix. Existing SIDs/maps stay untouched.
++ */
++static int apif_replay_sid(struct apple_dart_apif_domain *dom,
++			   struct apif_stream_map *stream, unsigned int sid)
++{
++	struct apple_dart_apif *dart = stream->dart;
++	unsigned long cursor = 0;
++	struct apif_op op;
++	u64 mapped_end = 0;
++	u32 n = 0;
++	int ret;
++
++	while (apif_next_mapping(dom, &cursor, &op, sid)) {
++		if (dart->retained[sid] &&
++		    apif_retained_lookup(dart->retained[sid], op.arg[1],
++					 op.arg[3]))
++			return -EBUSY;
++		ret = apif_prepare_leaf(dom, stream, sid, op.arg[1]);
++		if (ret)
++			return ret;
++	}
++	cursor = 0;
++	for (;;) {
++		bool have = apif_next_mapping(dom, &cursor, &op, sid);
++
++		if (have)
++			dart->batch->op[n++] = op;
++		if (n == APIF_BATCH_MAX_OPS || (!have && n)) {
++			dart->batch->count = n;
++			ret = apif_ring(dart);
++			for (u32 i = 0; i < min(dart->batch->done, n); i++)
++				mapped_end = dart->batch->op[i].arg[1] +
++					     dart->batch->op[i].arg[3];
++			if (ret)
++				goto undo;
++			n = 0;
++		}
++		if (!have)
++			return 0;
++	}
++undo:
++	apif_undo_replay(dom, stream, sid, mapped_end);
++	return ret;
++}
++
++static int apple_dart_apif_attach_dev(struct iommu_domain *domain,
++				      struct device *dev,
++				      struct iommu_domain *old)
++{
++	struct apple_dart_apif_master *master = dev_iommu_priv_get(dev);
++	struct apple_dart_apif_domain *dom = to_apif_domain(domain);
++	struct apple_dart_apif_domain *prior = NULL;
++	unsigned long added[APIF_MAX_DARTS]
++			   [BITS_TO_LONGS(DART_APIF_MAX_STREAMS)] = {};
++	unsigned long moved[APIF_MAX_DARTS]
++			   [BITS_TO_LONGS(DART_APIF_MAX_STREAMS)] = {};
++	unsigned long flags;
++	unsigned int sid;
++	int ret;
++
++	if (!master || !master->num_darts)
++		return -ENODEV;
++	for (unsigned int i = 0; i < master->num_darts; i++) {
++		ret = apple_dart_apif_ensure_init(master->streams[i].dart);
++		if (ret)
++			return ret;
++	}
++	if (old && old != domain && old->owner == &apple_dart_apif_ops &&
++	    old->ops == apple_dart_apif_ops.default_domain_ops)
++		prior = to_apif_domain(old);
++	if (prior && (unsigned long)prior < (unsigned long)dom) {
++		mutex_lock(&prior->lock);
++		mutex_lock_nested(&dom->lock, SINGLE_DEPTH_NESTING);
++	} else {
++		mutex_lock(&dom->lock);
++		if (prior)
++			mutex_lock_nested(&prior->lock, SINGLE_DEPTH_NESTING);
++	}
++	ret = apif_domain_configure(dom, master);
++	if (ret)
++		goto unlock_mutex;
++
++	local_irq_save(flags);
++	if (prior && (unsigned long)prior < (unsigned long)dom) {
++		write_lock(&prior->streams_lock);
++		write_lock_nested(&dom->streams_lock, SINGLE_DEPTH_NESTING);
++	} else {
++		write_lock(&dom->streams_lock);
++		if (prior)
++			write_lock_nested(&prior->streams_lock,
++					  SINGLE_DEPTH_NESTING);
++	}
++	for (unsigned int i = 0; i < master->num_darts && !ret; i++) {
++		struct apple_dart_apif *dart = master->streams[i].dart;
++		struct apif_stream_map *stream = apif_find_stream(dom, dart);
++		struct apif_stream_map *before = apif_find_stream(prior, dart);
++
++		spin_lock(&dart->batch_lock);
++		for_each_set_bit(sid, master->streams[i].sids,
++				 dart->num_streams) {
++			if (test_bit(sid, stream->sids))
++				continue;
++			if (dart->retained[sid] && before &&
++			    test_bit(sid, before->sids)) {
++				set_bit(sid, moved[i]);
++				ret = apif_undo_replay(prior, before, sid,
++						       U64_MAX);
++				if (ret)
++					break;
++			}
++			dart->batch->count = dart->retained[sid] ? 1 : 2;
++			dart->batch->op[0] = (struct apif_op){
++				.op = dart->retained[sid] ?
++					      APIF_DART_RETAINED_INFO :
++					      APIF_DART_DISABLE,
++				.arg = { sid },
++			};
++			if (!dart->retained[sid])
++				dart->batch->op[1] = (struct apif_op){
++					.op = APIF_DART_ATTACH,
++					.arg = { sid, dart->dma_min, 1 },
++				};
++			ret = apif_ring(dart);
++			if (ret)
++				break;
++			ret = apif_replay_sid(dom, stream, sid);
++			if (ret)
++				break;
++			/* Include this SID in unwind even when ENABLE's completion fails. */
++			set_bit(sid, added[i]);
++			dart->batch->count = 1;
++			dart->batch->op[0] = (struct apif_op){
++				.op = dart->retained[sid] ?
++					      APIF_DART_RETAINED_INFO :
++					      APIF_DART_ENABLE,
++				.arg = { sid },
++			};
++			ret = apif_ring(dart);
++			if (ret)
++				break;
++			dom->has_retained |= !!dart->retained[sid];
++			set_bit(sid, stream->sids);
++		}
++		spin_unlock(&dart->batch_lock);
++	}
++
++	/* Attach is one transaction across all of the master's DARTs. */
++	for (unsigned int i = 0; i < master->num_darts; i++) {
++		struct apple_dart_apif *dart = master->streams[i].dart;
++		struct apif_stream_map *stream = apif_find_stream(dom, dart);
++		struct apif_stream_map *before = apif_find_stream(prior, dart);
++
++		spin_lock(&dart->batch_lock);
++		if (ret) {
++			for_each_set_bit(sid, added[i], dart->num_streams) {
++				dart->batch->count = 1;
++				dart->batch->op[0] = (struct apif_op){
++					.op = dart->retained[sid] ?
++						      APIF_DART_RETAINED_INFO :
++						      APIF_DART_DISABLE,
++					.arg = { sid },
++				};
++				if (apif_ring(dart))
++					dev_err(dart->dev,
++						"failed to disable SID %u during attach unwind\n",
++						sid);
++				apif_undo_replay(dom, stream, sid, U64_MAX);
++				clear_bit(sid, stream->sids);
++			}
++		}
++		for_each_set_bit(sid, moved[i], dart->num_streams) {
++			if (ret) {
++				if (apif_replay_sid(prior, before, sid))
++					dev_err(dart->dev,
++						"failed to restore previous domain SID %u\n",
++						sid);
++			} else {
++				clear_bit(sid, before->sids);
++			}
++		}
++		spin_unlock(&dart->batch_lock);
++	}
++	if (prior)
++		write_unlock(&prior->streams_lock);
++	write_unlock(&dom->streams_lock);
++	local_irq_restore(flags);
++unlock_mutex:
++	if (prior)
++		mutex_unlock(&prior->lock);
++	mutex_unlock(&dom->lock);
++	return ret;
++}
++
++struct apif_map_progress {
++	size_t mapped;
++	unsigned int streams;
++	struct apif_op partial;
++};
++
++/* Track only fully installed stream cohorts. The batch may split one cohort
++ * without reducing batching; keep its progress across doorbells.
++ */
++static int apif_flush_maps(struct apple_dart_apif_domain *dom,
++			   struct apif_stream_map *stream,
++			   struct apif_map_progress *progress)
++{
++	struct apple_dart_apif *dart = stream->dart;
++	unsigned int total_streams =
++		bitmap_weight(stream->sids, dart->num_streams);
++	int ret = apif_ring(dart);
++
++	for (u32 i = 0; i < min(dart->batch->done, dart->batch->count); i++) {
++		struct apif_op *op = &dart->batch->op[i];
++
++		progress->partial = *op;
++		if (++progress->streams == total_streams) {
++			progress->mapped += op->arg[3];
++			progress->streams = 0;
++		}
++	}
++	if (ret && progress->streams) {
++		unsigned int sid;
++		u32 n = 0;
++
++		for_each_set_bit(sid, stream->sids, dart->num_streams) {
++			if (n == progress->streams)
++				break;
++			dart->batch->op[n++] = (struct apif_op){
++				.op = APIF_DART_UNMAP,
++				.arg = { sid, progress->partial.arg[1],
++					 progress->partial.arg[3] },
++			};
++		}
++		dart->batch->count = n;
++		if (apif_ring(dart))
++			dev_err(dart->dev, "failed to undo partial DART map\n");
++	}
++	return ret;
++}
++
++static int apif_map_streams(struct apple_dart_apif_domain *dom,
++			    struct apif_stream_map *stream, unsigned long iova,
++			    phys_addr_t paddr, size_t pgsize, size_t pgcount,
++			    int prot, gfp_t gfp, size_t *mapped)
++{
++	struct apple_dart_apif *dart = stream->dart;
++	struct apif_map_progress progress = {};
++	size_t total;
++	unsigned long flags;
++	u32 n = 0;
++	int ret;
++
++	*mapped = 0;
++	if (!dart || bitmap_empty(stream->sids, dart->num_streams))
++		return -ENODEV;
++	if (pgsize != DART_APIF_PAGE_SIZE || !pgcount ||
++	    check_mul_overflow(pgsize, pgcount, &total) ||
++	    (iova | paddr) & (DART_APIF_PAGE_SIZE - 1) ||
++	    prot & ~(IOMMU_READ | IOMMU_WRITE | IOMMU_CACHE | IOMMU_NOEXEC |
++		     IOMMU_MMIO) ||
++	    !paddr || iova < dart->dma_min || iova > dart->dma_max ||
++	    total - 1 > dart->dma_max - iova ||
++	    iova + total > DART_APIF_NATIVE_APERTURE_END)
++		return -EINVAL;
++	spin_lock_irqsave(&dart->batch_lock, flags);
++	/* Install all leaf tables before accumulating the mapping batch. */
++	for (size_t pos = 0; pos < total;) {
++		u64 cur = iova + pos;
++		size_t chunk =
++			min_t(size_t, total - pos,
++			      DART_APIF_BLOCK_SIZE -
++				      (cur & (DART_APIF_BLOCK_SIZE - 1)));
++		unsigned int sid;
++
++		for_each_set_bit(sid, stream->sids, dart->num_streams) {
++			ret = apif_prepare_leaf(dom, stream, sid, cur);
++			if (ret)
++				goto out;
++		}
++		pos += chunk;
++	}
++	for (size_t pos = 0; pos < total;) {
++		u64 cur = iova + pos;
++		size_t chunk =
++			min_t(size_t, total - pos,
++			      DART_APIF_BLOCK_SIZE -
++				      (cur & (DART_APIF_BLOCK_SIZE - 1)));
++		unsigned int sid;
++
++		for_each_set_bit(sid, stream->sids, dart->num_streams) {
++			dart->batch->op[n++] = (struct apif_op){
++				.op = APIF_DART_MAP,
++				.arg = { sid, cur, paddr + pos, chunk, prot },
++			};
++			if (n == APIF_BATCH_MAX_OPS) {
++				dart->batch->count = n;
++				ret = apif_flush_maps(dom, stream, &progress);
++				if (ret)
++					goto out;
++				n = 0;
++			}
++		}
++		pos += chunk;
++	}
++	if (n) {
++		dart->batch->count = n;
++		ret = apif_flush_maps(dom, stream, &progress);
++	}
++out:
++	spin_unlock_irqrestore(&dart->batch_lock, flags);
++	*mapped = progress.mapped;
++	return ret ? -EIO : 0;
++}
++
++static int apif_restore_partial_unmap(struct apple_dart_apif_domain *dom,
++				      struct apif_stream_map *stream,
++				      const struct apif_op *partial,
++				      unsigned int streams)
++{
++	struct apple_dart_apif *dart = stream->dart;
++	unsigned long cursor = partial->arg[1] >> DART_APIF_PAGE_SHIFT;
++	u64 end = partial->arg[1] + partial->arg[2];
++	struct apif_op op;
++	u32 n = 0;
++
++	while (apif_next_mapping(dom, &cursor, &op, 0) && op.arg[1] < end) {
++		unsigned int sid, count = 0;
++
++		op.arg[3] = min_t(u64, op.arg[3], end - op.arg[1]);
++		for_each_set_bit(sid, stream->sids, dart->num_streams) {
++			if (count++ == streams)
++				break;
++			op.arg[0] = sid;
++			dart->batch->op[n++] = op;
++			if (n == APIF_BATCH_MAX_OPS) {
++				dart->batch->count = n;
++				if (apif_ring(dart))
++					return -EIO;
++				n = 0;
++			}
++		}
++	}
++	if (!n)
++		return 0;
++	dart->batch->count = n;
++	return apif_ring(dart);
++}
++
++static int apif_flush_unmaps(struct apple_dart_apif_domain *dom,
++			     struct apif_stream_map *stream,
++			     struct apif_map_progress *progress)
++{
++	struct apple_dart_apif *dart = stream->dart;
++	unsigned int total_streams =
++		bitmap_weight(stream->sids, dart->num_streams);
++	int ret = apif_ring(dart);
++
++	for (u32 i = 0; i < min(dart->batch->done, dart->batch->count); i++) {
++		struct apif_op *op = &dart->batch->op[i];
++
++		progress->partial = *op;
++		if (++progress->streams == total_streams) {
++			progress->mapped += op->arg[2];
++			progress->streams = 0;
++		}
++	}
++	if (ret && progress->streams &&
++	    apif_restore_partial_unmap(dom, stream, &progress->partial,
++				       progress->streams))
++		dev_err(dart->dev, "failed to restore partial DART unmap\n");
++	return ret;
++}
++
++static size_t apif_unmap_streams(struct apple_dart_apif_domain *dom,
++				 struct apif_stream_map *stream,
++				 unsigned long iova, size_t pgsize,
++				 size_t pgcount,
++				 struct iommu_iotlb_gather *gather)
++{
++	struct apple_dart_apif *dart = stream->dart;
++	struct apif_map_progress progress = {};
++	size_t total;
++	unsigned long flags;
++	u32 n = 0;
++
++	if (!dart || bitmap_empty(stream->sids, dart->num_streams) ||
++	    pgsize != DART_APIF_PAGE_SIZE || !pgcount ||
++	    check_mul_overflow(pgsize, pgcount, &total) ||
++	    (iova & (DART_APIF_PAGE_SIZE - 1)) || iova < dart->dma_min ||
++	    iova > dart->dma_max || total - 1 > dart->dma_max - iova)
++		return 0;
++	spin_lock_irqsave(&dart->batch_lock, flags);
++	for (size_t pos = 0; pos < total;) {
++		u64 cur = iova + pos;
++		size_t chunk =
++			min_t(size_t, total - pos,
++			      DART_APIF_BLOCK_SIZE -
++				      (cur & (DART_APIF_BLOCK_SIZE - 1)));
++		unsigned int sid;
++
++		for_each_set_bit(sid, stream->sids, dart->num_streams) {
++			dart->batch->op[n++] = (struct apif_op){
++				.op = APIF_DART_UNMAP,
++				.arg = { sid, cur, chunk },
++			};
++			if (n == APIF_BATCH_MAX_OPS) {
++				dart->batch->count = n;
++				if (apif_flush_unmaps(dom, stream, &progress))
++					goto out;
++				n = 0;
++			}
++		}
++		pos += chunk;
++	}
++	if (n) {
++		dart->batch->count = n;
++		apif_flush_unmaps(dom, stream, &progress);
++	}
++out:
++	spin_unlock_irqrestore(&dart->batch_lock, flags);
++	return progress.mapped;
++}
++
++/* A buffer has one IOVA and one software mapping, regardless of how many
++ * display engines can scan it out. Forward whole batches to each DART; do
++ * not split them into per-page or per-stream transactions.
++ */
++static int apple_dart_apif_map_pages(struct iommu_domain *domain,
++				     unsigned long iova, phys_addr_t paddr,
++				     size_t pgsize, size_t pgcount, int prot,
++				     gfp_t gfp, size_t *mapped)
++{
++	struct apple_dart_apif_domain *dom = to_apif_domain(domain);
++	size_t done[APIF_MAX_DARTS] = {}, total;
++	unsigned long flags;
++	unsigned int active = 0;
++	int ret;
++
++	*mapped = 0;
++	if (!dom->num_darts)
++		return -ENODEV;
++	if (pgsize != DART_APIF_PAGE_SIZE || !pgcount ||
++	    check_mul_overflow(pgsize, pgcount, &total) ||
++	    (iova | paddr) & (DART_APIF_PAGE_SIZE - 1) || !paddr ||
++	    total - 1 > U64_MAX - paddr ||
++	    prot & ~(IOMMU_READ | IOMMU_WRITE | IOMMU_CACHE | IOMMU_NOEXEC |
++		     IOMMU_MMIO) ||
++	    iova < domain->geometry.aperture_start ||
++	    iova > domain->geometry.aperture_end ||
++	    total - 1 > domain->geometry.aperture_end - iova ||
++	    iova + total > DART_APIF_NATIVE_APERTURE_END)
++		return -EINVAL;
++	ret = apif_reserve_mappings(dom, iova, total, gfp);
++	if (ret)
++		return ret;
++	read_lock_irqsave(&dom->streams_lock, flags);
++	if (apif_retained_overlap(dom, iova, total)) {
++		ret = -EBUSY;
++		goto out;
++	}
++	for (unsigned int i = 0; i < dom->num_darts; i++) {
++		struct apif_stream_map *stream = &dom->streams[i];
++
++		if (bitmap_empty(stream->sids, stream->dart->num_streams))
++			continue;
++		active++;
++		ret = apif_map_streams(dom, stream, iova, paddr, pgsize,
++				       pgcount, prot, gfp, &done[i]);
++		if (ret)
++			break;
++	}
++	if (!active)
++		ret = -ENODEV;
++	if (!ret) {
++		apif_record_mapping(dom, iova, paddr, total, prot);
++		*mapped = total;
++	} else {
++		/* A later DART failed. Undo the successful prefixes on every
++		 * engine before letting the DMA layer reuse this IOVA.
++		 */
++		for (unsigned int i = 0; i < dom->num_darts; i++)
++			if (done[i] &&
++			    apif_unmap_streams(dom, &dom->streams[i], iova,
++					       pgsize, done[i] / pgsize,
++					       NULL) != done[i])
++				dev_err(dom->streams[i].dart->dev,
++					"failed to unwind multi-DART mapping\n");
++	}
++out:
++	read_unlock_irqrestore(&dom->streams_lock, flags);
++	if (ret)
++		apif_release_reservations(dom, iova, total);
++	return ret;
++}
++
++static size_t apple_dart_apif_unmap_pages(struct iommu_domain *domain,
++					  unsigned long iova, size_t pgsize,
++					  size_t pgcount,
++					  struct iommu_iotlb_gather *gather)
++{
++	struct apple_dart_apif_domain *dom = to_apif_domain(domain);
++	size_t done[APIF_MAX_DARTS] = {}, total, common;
++	unsigned long flags;
++	unsigned int active = 0;
++
++	if (!dom->num_darts || pgsize != DART_APIF_PAGE_SIZE || !pgcount ||
++	    check_mul_overflow(pgsize, pgcount, &total) ||
++	    (iova & (DART_APIF_PAGE_SIZE - 1)) ||
++	    iova < domain->geometry.aperture_start ||
++	    iova > domain->geometry.aperture_end ||
++	    total - 1 > domain->geometry.aperture_end - iova)
++		return 0;
++	read_lock_irqsave(&dom->streams_lock, flags);
++	if (apif_retained_overlap(dom, iova, total)) {
++		common = 0;
++		goto out;
++	}
++	for (unsigned int i = 0; i < dom->num_darts; i++) {
++		struct apif_stream_map *stream = &dom->streams[i];
++
++		if (bitmap_empty(stream->sids, stream->dart->num_streams))
++			continue;
++		active++;
++		done[i] = apif_unmap_streams(dom, stream, iova, pgsize, pgcount,
++					     gather);
++		if (done[i] != total)
++			break;
++	}
++	common = active ? total : 0;
++	for (unsigned int i = 0; i < dom->num_darts; i++)
++		if (!bitmap_empty(dom->streams[i].sids,
++				  dom->streams[i].dart->num_streams))
++			common = min(common, done[i]);
++	/* Preserve the canonical mapping until all engines have agreed. On
++	 * failure restore the suffix removed from earlier engines, retaining
++	 * their existing leaf tables and full-sized transport batches.
++	 */
++	for (unsigned int i = 0; i < dom->num_darts; i++) {
++		struct apif_stream_map *stream = &dom->streams[i];
++		struct apple_dart_apif *dart = stream->dart;
++		struct apif_op suffix = {
++			.arg = { 0, iova + common, done[i] - common },
++		};
++
++		if (done[i] <= common)
++			continue;
++		spin_lock(&dart->batch_lock);
++		if (apif_restore_partial_unmap(
++			    dom, stream, &suffix,
++			    bitmap_weight(stream->sids, dart->num_streams)))
++			dev_err(dart->dev,
++				"failed to restore multi-DART unmap suffix\n");
++		spin_unlock(&dart->batch_lock);
++	}
++	apif_forget_mapping(dom, iova, common);
++out:
++	read_unlock_irqrestore(&dom->streams_lock, flags);
++	return common;
++}
++
++static void apple_dart_apif_iotlb_sync(struct iommu_domain *domain,
++				       struct iommu_iotlb_gather *gather)
++{
++	/* apif invalidates inside every MAP/UNMAP it forwards to SPTM, so a
++	 * separate flush is a no-op.
++	 */
++}
++
++static phys_addr_t apple_dart_apif_iova_to_phys(struct iommu_domain *domain,
++						dma_addr_t iova)
++{
++	struct apple_dart_apif_domain *dom = to_apif_domain(domain);
++	void *entry = xa_load(&dom->mappings, iova >> DART_APIF_PAGE_SHIFT);
++	unsigned long value = entry ? xa_to_value(entry) : 0;
++
++	if (!value)
++		return apif_retained_translate(dom, iova);
++	return ((value >> APIF_MAP_PROT_BITS) << DART_APIF_PAGE_SHIFT) |
++	       (iova & (DART_APIF_PAGE_SIZE - 1));
++}
++
++static void apple_dart_apif_domain_free(struct iommu_domain *domain)
++{
++	struct apple_dart_apif_domain *dom = to_apif_domain(domain);
++
++	if (dom->has_retained) {
++		for (unsigned int i = 0; i < dom->num_darts; i++) {
++			struct apif_stream_map *stream = &dom->streams[i];
++			unsigned int sid;
++			unsigned long flags;
++
++			spin_lock_irqsave(&stream->dart->batch_lock, flags);
++			for_each_set_bit(sid, stream->sids,
++					 stream->dart->num_streams)
++				apif_undo_replay(dom, stream, sid, U64_MAX);
++			spin_unlock_irqrestore(&stream->dart->batch_lock,
++					       flags);
++		}
++	}
++	xa_destroy(&dom->l2_attached);
++	xa_destroy(&dom->mappings);
++	kfree(dom);
++}
++
++static struct iommu_domain *
++apple_dart_apif_domain_alloc_paging(struct device *dev)
++{
++	struct apple_dart_apif_domain *dom;
++	int ret;
++
++	dom = kzalloc_obj(*dom);
++	if (!dom)
++		return NULL;
++	mutex_init(&dom->lock);
++	rwlock_init(&dom->streams_lock);
++	xa_init(&dom->l2_attached);
++	xa_init(&dom->mappings);
++	dom->domain.pgsize_bitmap = DART_APIF_PAGE_SIZE;
++	dom->domain.geometry.aperture_end = DART_APIF_APERTURE_END;
++	dom->domain.geometry.force_aperture = true;
++	if (dev && dev_iommu_priv_get(dev)) {
++		ret = apif_domain_configure(dom, dev_iommu_priv_get(dev));
++		if (ret) {
++			kfree(dom);
++			return ERR_PTR(ret);
++		}
++	}
++	return &dom->domain;
++}
++
++static struct iommu_device *apple_dart_apif_probe_device(struct device *dev)
++{
++	struct apple_dart_apif_master *master = dev_iommu_priv_get(dev);
++
++	if (!dev_iommu_fwspec_get(dev) || !master || !master->num_darts)
++		return ERR_PTR(-ENODEV);
++	for (unsigned int i = 0; i < master->num_darts; i++)
++		device_link_add(dev, master->streams[i].dart->dev,
++				DL_FLAG_PM_RUNTIME |
++					DL_FLAG_AUTOREMOVE_SUPPLIER);
++	return &master->streams[0].dart->iommu;
++}
++
++static void apple_dart_apif_release_device(struct device *dev)
++{
++	kfree(dev_iommu_priv_get(dev));
++}
++
++static int apple_dart_apif_of_xlate(struct device *dev,
++				    const struct of_phandle_args *args)
++{
++	struct apple_dart_apif_master *master = dev_iommu_priv_get(dev);
++	struct platform_device *iommu_pdev;
++	struct apple_dart_apif *dart;
++	u32 sid;
++
++	if (args->args_count != 1)
++		return -EINVAL;
++	sid = args->args[0];
++	if (sid >= DART_APIF_MAX_STREAMS)
++		return -EINVAL;
++
++	iommu_pdev = of_find_device_by_node(args->np);
++	if (!iommu_pdev)
++		return -ENODEV;
++	dart = platform_get_drvdata(iommu_pdev);
++	put_device(&iommu_pdev->dev);
++	if (!dart)
++		return -ENODEV;
++
++	if (sid >= dart->num_streams)
++		return -EINVAL;
++	if (!master) {
++		master = kzalloc_obj(*master);
++		if (!master)
++			return -ENOMEM;
++		dev_iommu_priv_set(dev, master);
++	}
++	for (unsigned int i = 0; i < master->num_darts; i++) {
++		if (master->streams[i].dart == dart) {
++			set_bit(sid, master->streams[i].sids);
++			return 0;
++		}
++	}
++	if (master->num_darts == APIF_MAX_DARTS)
++		return -EINVAL;
++	master->streams[master->num_darts].dart = dart;
++	set_bit(sid, master->streams[master->num_darts].sids);
++	master->num_darts++;
++	return 0;
++}
++
++/* Devices sharing a stream cannot have independent IOVA allocators. PCI
++ * multifunction/topology grouping is also required even with distinct SIDs.
++ * Mirrors the native Apple DART lifetime model: the group owns its SID union,
++ * and its release callback clears the reverse lookup before freeing it.
++ */
++static DEFINE_MUTEX(apple_dart_apif_groups_lock);
++
++static void apple_dart_apif_release_group(void *data)
++{
++	struct apple_dart_apif_master *group_master = data;
++	unsigned int sid;
++
++	mutex_lock(&apple_dart_apif_groups_lock);
++	for (unsigned int i = 0; i < group_master->num_darts; i++) {
++		struct apif_stream_map *stream = &group_master->streams[i];
++
++		for_each_set_bit(sid, stream->sids, stream->dart->num_streams)
++			stream->dart->sid2group[sid] = NULL;
++	}
++	mutex_unlock(&apple_dart_apif_groups_lock);
++	kfree(group_master);
++}
++
++static int apif_merge_master(struct apple_dart_apif_master *dst,
++			     const struct apple_dart_apif_master *src)
++{
++	struct apple_dart_apif_master merged = *dst;
++
++	for (unsigned int i = 0; i < src->num_darts; i++) {
++		const struct apif_stream_map *from = &src->streams[i];
++		unsigned int j;
++
++		for (j = 0; j < merged.num_darts; j++)
++			if (merged.streams[j].dart == from->dart)
++				break;
++		if (j == merged.num_darts) {
++			if (j == APIF_MAX_DARTS)
++				return -EINVAL;
++			merged.streams[j] = *from;
++			merged.num_darts++;
++		} else {
++			bitmap_or(merged.streams[j].sids,
++				  merged.streams[j].sids, from->sids,
++				  from->dart->num_streams);
++		}
++	}
++	*dst = merged;
++	return 0;
++}
++
++static struct iommu_group *apple_dart_apif_device_group(struct device *dev)
++{
++	struct apple_dart_apif_master *master = dev_iommu_priv_get(dev);
++	struct apple_dart_apif_master *group_master;
++	struct iommu_group *group = NULL, *put_group = NULL;
++	struct iommu_group *result = ERR_PTR(-EINVAL);
++	unsigned int sid;
++
++	if (!master || !master->num_darts)
++		return result;
++	mutex_lock(&apple_dart_apif_groups_lock);
++	for (unsigned int i = 0; i < master->num_darts; i++) {
++		struct apif_stream_map *stream = &master->streams[i];
++
++		for_each_set_bit(sid, stream->sids, stream->dart->num_streams) {
++			struct iommu_group *existing =
++				stream->dart->sid2group[sid];
++
++			if (!existing)
++				continue;
++			if (group && existing != group)
++				goto out;
++			group = existing;
++		}
++	}
++	if (group) {
++		group = iommu_group_ref_get(group);
++	} else {
++#ifdef CONFIG_PCI
++		if (dev_is_pci(dev))
++			group = pci_device_group(dev);
++		else
++#endif
++			group = generic_device_group(dev);
++	}
++	if (IS_ERR(group)) {
++		result = group;
++		goto out;
++	}
++	if (!group) {
++		result = ERR_PTR(-ENOMEM);
++		goto out;
++	}
++	group_master = iommu_group_get_iommudata(group);
++	if (!group_master) {
++		group_master = kmemdup(master, sizeof(*master), GFP_KERNEL);
++		if (!group_master) {
++			result = ERR_PTR(-ENOMEM);
++			put_group = group;
++			goto out;
++		}
++		iommu_group_set_iommudata(group, group_master,
++					  apple_dart_apif_release_group);
++	} else if (apif_merge_master(group_master, master)) {
++		put_group = group;
++		goto out;
++	}
++	for (unsigned int i = 0; i < master->num_darts; i++) {
++		struct apif_stream_map *stream = &master->streams[i];
++
++		for_each_set_bit(sid, stream->sids, stream->dart->num_streams)
++			stream->dart->sid2group[sid] = group;
++	}
++	result = group;
++out:
++	mutex_unlock(&apple_dart_apif_groups_lock);
++	/* Dropping the last reference can invoke release_group: do it unlocked. */
++	if (put_group)
++		iommu_group_put(put_group);
++	return result;
++}
++
++static bool apple_dart_apif_capable(struct device *dev, enum iommu_cap cap)
++{
++	return cap == IOMMU_CAP_CACHE_COHERENCY;
++}
++
++/* PCIe captures the MSI doorbell before DART translation. Advertise the
++ * identity MSI page to the DMA layer so it never tries to map this non-RAM
++ * address through the SPTM transport. Other devices retain normal reservations.
++ * This follows apple-dart.c's hardware MSI reservation (Asahi contributors).
++ */
++static void apple_dart_apif_get_resv_regions(struct device *dev,
++					     struct list_head *head)
++{
++	struct apple_dart_apif_master *master = dev_iommu_priv_get(dev);
++	unsigned int sid;
++
++	for (unsigned int i = 0; master && i < master->num_darts; i++) {
++		struct apif_stream_map *stream = &master->streams[i];
++
++		/* Reserve the exclusive-end granule when required by the aperture.
++		 * Narrower native apertures declare that restriction in DT.
++		 */
++		if (stream->dart->dma_max == DART_APIF_NATIVE_APERTURE_END ||
++		    stream->dart->reserve_last_page) {
++			struct iommu_resv_region *region =
++				iommu_alloc_resv_region(
++					stream->dart->dma_max + 1 -
++						DART_APIF_PAGE_SIZE,
++					DART_APIF_PAGE_SIZE, 0,
++					IOMMU_RESV_RESERVED, GFP_KERNEL);
++
++			if (region)
++				list_add_tail(&region->list, head);
++		}
++		for_each_set_bit(sid, stream->sids, stream->dart->num_streams) {
++			struct apif_retained_sid *r =
++				stream->dart->retained[sid];
++			if (!r)
++				continue;
++			for (unsigned int i = 0; i < r->count; i++) {
++				struct iommu_resv_region *region =
++					iommu_alloc_resv_region(
++						r->runs[i].dva, r->runs[i].size,
++						0, IOMMU_RESV_RESERVED,
++						GFP_KERNEL);
++				if (region)
++					list_add_tail(&region->list, head);
++			}
++		}
++	}
++	if (dev_is_pci(dev)) {
++		struct pci_host_bridge *bridge =
++			pci_find_host_bridge(to_pci_dev(dev)->bus);
++		struct device_node *np = bridge->dev.parent->of_node;
++		struct iommu_resv_region *region;
++		u64 address;
++
++		if (of_device_is_compatible(np, "apple,apif-pcie") &&
++		    !of_property_read_u64(np, "apple,msi-address", &address)) {
++			region = iommu_alloc_resv_region(
++				address & PAGE_MASK, PAGE_SIZE,
++				IOMMU_WRITE | IOMMU_NOEXEC | IOMMU_MMIO,
++				IOMMU_RESV_MSI, GFP_KERNEL);
++			if (region)
++				list_add_tail(&region->list, head);
++		}
++	}
++	iommu_dma_get_resv_regions(dev, head);
++}
++
++static const struct iommu_ops apple_dart_apif_ops = {
++	.get_resv_regions = apple_dart_apif_get_resv_regions,
++	.capable = apple_dart_apif_capable,
++	.domain_alloc_paging = apple_dart_apif_domain_alloc_paging,
++	.probe_device = apple_dart_apif_probe_device,
++	.release_device = apple_dart_apif_release_device,
++	.device_group = apple_dart_apif_device_group,
++	.of_xlate = apple_dart_apif_of_xlate,
++	.owner = THIS_MODULE,
++	.default_domain_ops =
++		&(const struct iommu_domain_ops){
++			.attach_dev = apple_dart_apif_attach_dev,
++			.map_pages = apple_dart_apif_map_pages,
++			.unmap_pages = apple_dart_apif_unmap_pages,
++			.iotlb_sync = apple_dart_apif_iotlb_sync,
++			.iova_to_phys = apple_dart_apif_iova_to_phys,
++			.free = apple_dart_apif_domain_free,
++		},
++};
++
++/* Used only after the PCI host has stopped every endpoint on this DART.
++ * Native POWERDOWN/POWERUP retains the SPTM-owned tables and live mappings.
++ */
++static int apif_other_group_device(struct device *member, void *data)
++{
++	return member == data ? 0 : -EBUSY;
++}
++
++int apple_dart_apif_set_power(struct device *dev, bool on)
++{
++	struct apple_dart_apif_master *master;
++	struct apple_dart_apif *dart;
++	struct iommu_group *group;
++	unsigned long flags;
++	int ret;
++
++	if (!dev->iommu || !dev->iommu->iommu_dev ||
++	    dev->iommu->iommu_dev->ops != &apple_dart_apif_ops)
++		return -ENODEV;
++	master = dev_iommu_priv_get(dev);
++	if (!master || master->num_darts != 1)
++		return -ENODEV;
++	dart = master->streams[0].dart;
++	group = iommu_group_get(dev);
++	if (!group)
++		return -ENODEV;
++	ret = iommu_group_for_each_dev(group, dev, apif_other_group_device);
++	if (ret)
++		goto put_group;
++	mutex_lock(&apple_dart_apif_groups_lock);
++	/* Native DISABLE affects the entire unit. Retained firmware streams or
++	 * another Linux group must never be stopped by one endpoint's reset.
++	 */
++	for (unsigned int sid = 0; sid < dart->num_streams; sid++) {
++		if (dart->retained[sid] ||
++		    (dart->sid2group[sid] && dart->sid2group[sid] != group)) {
++			ret = -EBUSY;
++			goto unlock_groups;
++		}
++	}
++	mutex_lock(&dart->init_lock);
++	if (!dart->inited || dart->ownership_uncertain) {
++		ret = -EINVAL;
++		goto out;
++	}
++	spin_lock_irqsave(&dart->batch_lock, flags);
++	dart->batch->count = 1;
++	dart->batch->op[0] = (struct apif_op){ .op = on ? 7 : 8 };
++	ret = apif_ring(dart);
++	spin_unlock_irqrestore(&dart->batch_lock, flags);
++out:
++	mutex_unlock(&dart->init_lock);
++unlock_groups:
++	mutex_unlock(&apple_dart_apif_groups_lock);
++put_group:
++	iommu_group_put(group);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(apple_dart_apif_set_power);
++
++static int apple_dart_apif_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct apple_dart_apif *dart;
++	int ret;
++
++	dart = devm_kzalloc(dev, sizeof(*dart), GFP_KERNEL);
++	if (!dart)
++		return -ENOMEM;
++
++	dart->dev = dev;
++	mutex_init(&dart->init_lock);
++	spin_lock_init(&dart->batch_lock);
++
++	dart->apif = aurora_apif_get(dev);
++	if (IS_ERR(dart->apif))
++		return dev_err_probe(dev, PTR_ERR(dart->apif),
++				     "APIF transport unavailable\n");
++	ret = devm_add_action_or_reset(dev, apif_put_transport, dart->apif);
++	if (ret)
++		return ret;
++	dart->native_ops = devm_kcalloc(dev, 2 * APIF_BATCH_MAX_OPS,
++					sizeof(*dart->native_ops), GFP_KERNEL);
++	if (!dart->native_ops)
++		return -ENOMEM;
++	dart->boot_info =
++		devm_kzalloc(dev, sizeof(*dart->boot_info), GFP_KERNEL);
++	if (!dart->boot_info)
++		return -ENOMEM;
++	if (of_property_read_u32(dev->of_node, "apple,apif-dart-id",
++				 &dart->dart_id))
++		return dev_err_probe(dev, -EINVAL,
++				     "missing apple,apif-dart-id\n");
++	if (dart->dart_id > 0xff)
++		return dev_err_probe(dev, -EINVAL, "dart-id out of range\n");
++
++	dart->dma_max = DART_APIF_APERTURE_END;
++	if (of_find_property(dev->of_node, "apple,dma-range", NULL)) {
++		u64 range[2], end;
++
++		if (of_property_read_u64_array(dev->of_node, "apple,dma-range",
++					       range, 2) ||
++		    !range[1] ||
++		    (range[0] | range[1]) & (DART_APIF_PAGE_SIZE - 1) ||
++		    check_add_overflow(range[0], range[1] - 1, &end) ||
++		    end > DART_APIF_NATIVE_APERTURE_END)
++			return dev_err_probe(dev, -EINVAL, "bad DMA range\n");
++		dart->dma_min = range[0];
++		dart->dma_max = end;
++	}
++	if (of_find_property(dev->of_node, "apple,apif-iova-force", NULL)) {
++		if (of_property_read_u64(dev->of_node, "apple,apif-iova-force",
++					 &dart->iova_force) ||
++		    (dart->iova_force && dart->iova_force != BIT_ULL(40)))
++			return dev_err_probe(dev, -EINVAL,
++					     "unsupported IOVA force mask\n");
++		/* A native DVA aperture already contains its high address bits.
++		 * Hidden force bits are only valid for the low-address device view.
++		 */
++		if (dart->iova_force && dart->dma_max >= dart->iova_force)
++			return dev_err_probe(
++				dev, -EINVAL,
++				"IOVA force overlaps DMA aperture\n");
++	}
++
++	dart->reserve_last_page = of_property_read_bool(
++		dev->of_node, "apple,apif-reserve-last-page");
++	dart->num_streams = DART_APIF_MAX_STREAMS;
++	of_property_read_u32(dev->of_node, "apple,apif-num-streams",
++			     &dart->num_streams);
++	if (!dart->num_streams || dart->num_streams > DART_APIF_MAX_STREAMS)
++		return dev_err_probe(dev, -EINVAL, "bad stream count\n");
++
++	dart->batch = devm_kzalloc(dev, PAGE_SIZE, GFP_KERNEL);
++	if (!dart->batch)
++		return -ENOMEM;
++	ret = apif_load_retained(dart);
++	if (ret)
++		return dev_err_probe(dev, ret,
++				     "retained DART discovery failed\n");
++	ret = apif_load_boot_mappings(dart);
++	if (ret)
++		return dev_err_probe(dev, ret, "invalid boot DMA mappings\n");
++
++	ret = devm_add_action_or_reset(dev, apif_free_page_lists, dart);
++	if (ret)
++		return ret;
++	platform_set_drvdata(pdev, dart);
++
++	ret = iommu_device_sysfs_add(&dart->iommu, dev, NULL,
++				     "apple-dart-apif.%s", dev_name(dev));
++	if (ret)
++		return ret;
++
++	ret = iommu_device_register(&dart->iommu, &apple_dart_apif_ops, dev);
++	if (ret)
++		goto err_sysfs;
++
++	return 0;
++
++err_sysfs:
++	iommu_device_sysfs_remove(&dart->iommu);
++	return ret;
++}
++
++static void apple_dart_apif_remove(struct platform_device *pdev)
++{
++	struct apple_dart_apif *dart = platform_get_drvdata(pdev);
++
++	iommu_device_unregister(&dart->iommu);
++	iommu_device_sysfs_remove(&dart->iommu);
++}
++
++static const struct of_device_id apple_dart_apif_of_match[] = {
++	{ .compatible = "apple,dart-apif" },
++	{},
++};
++MODULE_DEVICE_TABLE(of, apple_dart_apif_of_match);
++
++static struct platform_driver apple_dart_apif_driver = {
++	.driver = {
++		.name = "apple-dart-apif",
++		.suppress_bind_attrs = true,
++		.of_match_table = apple_dart_apif_of_match,
++	},
++	.probe = apple_dart_apif_probe,
++	.remove = apple_dart_apif_remove,
++};
++module_platform_driver(apple_dart_apif_driver);
++
++MODULE_DESCRIPTION("Apple DART IOMMU over the Aurora platform interface");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/net/wireless/Kconfig b/drivers/net/wireless/Kconfig
+index f4f969fdbc02..6b0603abd960 100644
+--- a/drivers/net/wireless/Kconfig
++++ b/drivers/net/wireless/Kconfig
+@@ -19,6 +19,7 @@ menuconfig WLAN
+ if WLAN
+ 
+ source "drivers/net/wireless/admtek/Kconfig"
++source "drivers/net/wireless/apple/Kconfig"
+ source "drivers/net/wireless/ath/Kconfig"
+ source "drivers/net/wireless/atmel/Kconfig"
+ source "drivers/net/wireless/broadcom/Kconfig"
+diff --git a/drivers/net/wireless/Makefile b/drivers/net/wireless/Makefile
+index fa3100ff3bf7..e22d2b1a4ed6 100644
+--- a/drivers/net/wireless/Makefile
++++ b/drivers/net/wireless/Makefile
+@@ -25,3 +25,5 @@ obj-$(CONFIG_WLAN_VENDOR_TI) += ti/
+ obj-$(CONFIG_WLAN_VENDOR_ZYDAS) += zydas/
+ 
+ obj-$(CONFIG_WLAN) += virtual/
++
++obj-$(CONFIG_WLAN_VENDOR_APPLE) += apple/
+diff --git a/drivers/net/wireless/apple/Kconfig b/drivers/net/wireless/apple/Kconfig
+new file mode 100644
+index 000000000000..e40d5d9c5fd5
+--- /dev/null
++++ b/drivers/net/wireless/apple/Kconfig
+@@ -0,0 +1,19 @@
++# SPDX-License-Identifier: GPL-2.0-only
++config WLAN_VENDOR_APPLE
++	bool "Apple wireless devices"
++	default y
++
++if WLAN_VENDOR_APPLE
++config APPLE_CENTAURI
++	tristate "Apple N1 Centauri firmware and IPC transport"
++	depends on ARCH_APPLE || COMPILE_TEST
++	depends on PCI && CFG80211 && PCIE_APPLE_APIF
++	select FW_LOADER
++	help
++	  Boot the shared N1 firmware and establish its PCI DMA contexts.
++	  Requires a preinitialized APIF host with the supported reset layout
++	  and DT-supplied personalized firmware name and platform identifier.
++	  The endpoint must start in the stopped ROM personality. Firmware
++	  and per-device calibration are external inputs and are not included.
++
++endif
+diff --git a/drivers/net/wireless/apple/Makefile b/drivers/net/wireless/apple/Makefile
+new file mode 100644
+index 000000000000..ca72cd0b4da0
+--- /dev/null
++++ b/drivers/net/wireless/apple/Makefile
+@@ -0,0 +1,2 @@
++# SPDX-License-Identifier: GPL-2.0-only
++obj-$(CONFIG_APPLE_CENTAURI) += centauri/
+diff --git a/drivers/net/wireless/apple/centauri/Makefile b/drivers/net/wireless/apple/centauri/Makefile
+new file mode 100644
+index 000000000000..ddd250199888
+--- /dev/null
++++ b/drivers/net/wireless/apple/centauri/Makefile
+@@ -0,0 +1,4 @@
++# SPDX-License-Identifier: GPL-2.0-only
++obj-$(CONFIG_APPLE_CENTAURI) += apple_centauri.o
++apple_centauri-y := centauri_pci.o centauri_ipc.o
++apple_centauri-$(CONFIG_APPLE_CENTAURI_WIFI) += centauri_wifi.o
+diff --git a/drivers/net/wireless/apple/centauri/centauri.h b/drivers/net/wireless/apple/centauri/centauri.h
+new file mode 100644
+index 000000000000..55106d4ef079
+--- /dev/null
++++ b/drivers/net/wireless/apple/centauri/centauri.h
+@@ -0,0 +1,87 @@
++
++#ifndef AURORA_CENTAURI_H
++#define AURORA_CENTAURI_H
++#include <linux/dma-mapping.h>
++#include <linux/interrupt.h>
++#include <linux/mutex.h>
++#include <linux/pci.h>
++#include <linux/sizes.h>
++#include <linux/workqueue.h>
++
++#define CEN_ALPHA_WINDOW_SIZE SZ_32M
++#define CEN_ALPHA_SCRATCH_OFFSET SZ_8M
++#define CEN_ALPHA_SCRATCH_SIZE (5 * SZ_1M)
++
++struct centauri_ipc;
++struct centauri_wifi;
++struct centauri_irqs {
++	struct pci_dev *pdev;
++	void *data;
++	unsigned int count;
++};
++
++struct cen_alpha_resources {
++	struct pci_dev *pdev;
++	void *context, *messages, *window;
++	dma_addr_t context_dma, messages_dma, window_dma;
++	void __iomem *bar;
++	u32 index[4], mtr, mcr;
++};
++enum centauri_boot_phase {
++	CEN_BOOT_ROM,
++	CEN_BOOT_CYCLE,
++	CEN_BOOT_IPC,
++	CEN_BOOT_READY,
++	CEN_BOOT_FAILED,
++	CEN_BOOT_STOPPED,
++};
++
++struct centauri {
++	struct pci_dev *pdev;
++	void __iomem *bar;
++	resource_size_t size;
++	u32 platform_id, protocol;
++	const char *firmware_name;
++	struct dentry *debug;
++	struct mutex boot_lock;
++	struct delayed_work boot_work;
++	enum centauri_boot_phase boot_phase;
++	bool removing, ready;
++	void *firmware, *descriptor;
++	struct centauri_irqs irqs, alpha_irqs;
++	dma_addr_t firmware_dma, descriptor_dma;
++	size_t firmware_size;
++	u32 image_response;
++	bool boot_attempted;
++	bool link_ready;
++	struct centauri_ipc *ipc;
++	struct centauri_wifi *wifi;
++};
++
++int centauri_request_irqs(struct centauri_irqs *irqs, struct pci_dev *pdev,
++			 unsigned int count, irq_handler_t handler, void *data);
++void centauri_free_irqs(struct centauri_irqs *irqs);
++
++int centauri_start_ipc(struct centauri *c);
++void centauri_free_ipc(struct centauri *c);
++int centauri_alpha_resources(struct centauri *c, struct cen_alpha_resources *resources);
++bool centauri_stop_dma(struct pci_dev *pdev);
++
++#if IS_ENABLED(CONFIG_APPLE_CENTAURI_WIFI)
++irqreturn_t centauri_alpha_irq(int irq, void *data);
++int centauri_wifi_register(struct centauri *c);
++void centauri_wifi_unregister(struct centauri *c);
++#else
++static inline irqreturn_t centauri_alpha_irq(int irq, void *data)
++{
++	return IRQ_HANDLED;
++}
++static inline int centauri_wifi_register(struct centauri *c)
++{
++	return 0;
++}
++static inline void centauri_wifi_unregister(struct centauri *c)
++{
++}
++#endif
++#endif
+diff --git a/drivers/soc/apple/Kconfig b/drivers/soc/apple/Kconfig
+index cbd8a0f0d430..6206b8bfbbf3 100644
+--- a/drivers/soc/apple/Kconfig
++++ b/drivers/soc/apple/Kconfig
+@@ -93,6 +93,16 @@ config APPLE_SART
+ 
+ 	  Say 'y' here if you have an Apple SoC.
+ 
++config APPLE_SART_APIF
++	bool "Apple SART over the Aurora platform interface"
++	depends on ARM64 && OF && APPLE_SART=y
++	select AURORA_APIF_MMIO
++	help
++	  SART provider for a trusted Linux guest under Aura and SPTM.
++	  Consumers retain the existing Apple SART API. Native call selection,
++	  region tracking and completion interpretation stay in this backend.
++	  Existing raw-MMIO SART providers continue to serve other systems.
++
+ config APPLE_TUNABLE
+ 	tristate
+ 	depends on ARCH_APPLE || COMPILE_TEST
+diff --git a/drivers/soc/apple/Makefile b/drivers/soc/apple/Makefile
+index 65d7c9d27c9c..2933241dbfaa 100644
+--- a/drivers/soc/apple/Makefile
++++ b/drivers/soc/apple/Makefile
+@@ -55,3 +55,5 @@ obj-$(CONFIG_APPLE_MCC) += apple-mcc.o
+ apple-mcc-y := mcc.o
+ 
+ obj-$(CONFIG_APPLE_CLPC) += clpc.o
++
++obj-$(CONFIG_APPLE_SART_APIF) += apple-sart-apif.o
+diff --git a/drivers/soc/apple/apple-sart-apif.c b/drivers/soc/apple/apple-sart-apif.c
+new file mode 100644
+index 000000000000..3bbdaea96984
+--- /dev/null
++++ b/drivers/soc/apple/apple-sart-apif.c
+@@ -0,0 +1,167 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* SART policy stays in Linux; native table-5 calls use the common APIF client. */
++#include <linux/dma-direct.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/sizes.h>
++#include <linux/slab.h>
++#include <linux/soc/aurora/apif-mmio.h>
++
++#include "sart-backend.h"
++
++#define SART_APIF_MAX_REGIONS 16
++
++struct sart_apif {
++	struct device *dev;
++	struct aurora_apif *apif;
++	struct mutex lock;
++	bool active;
++	struct {
++		phys_addr_t address;
++		size_t size;
++	} regions[SART_APIF_MAX_REGIONS];
++};
++
++static int sart_apif_region(struct apple_sart *sart, phys_addr_t address,
++			    size_t size, bool map)
++{
++	struct sart_apif *state = apple_sart_backend_data(sart);
++	struct aurora_apif_op op;
++	u64 pa;
++	int i, ret;
++
++	if (!size || ((address | size) & (SZ_16K - 1)) ||
++	    address > PHYS_ADDR_MAX - (size - 1))
++		return -EINVAL;
++	mutex_lock(&state->lock);
++	for (i = 0; i < SART_APIF_MAX_REGIONS; i++)
++		if (map ? !state->regions[i].size :
++			  state->regions[i].address == address &&
++				    state->regions[i].size == size)
++			break;
++	if (i == SART_APIF_MAX_REGIONS) {
++		ret = map ? -EBUSY : -ENOENT;
++		goto out;
++	}
++	op = (struct aurora_apif_op){
++		.selector = AURORA_APIF_SELECTOR(AURORA_APIF_SERVICE,
++						 AURORA_APIF_TRANSLATE),
++		.arg = { dma_to_phys(state->dev, address), size },
++	};
++	ret = aurora_apif_submit(state->apif, &op, 1, NULL);
++	if (ret)
++		goto out;
++	pa = op.ret;
++	if (!state->active) {
++		op = (struct aurora_apif_op){
++			.selector = AURORA_APIF_SELECTOR(
++				5, 0), /* SET_STATE, void result */
++			.arg = { 1 },
++		};
++		ret = aurora_apif_submit(state->apif, &op, 1, NULL);
++		if (ret)
++			goto out;
++		state->active = true;
++	}
++	op = (struct aurora_apif_op){
++		.selector = AURORA_APIF_SELECTOR(5, map ? 1 : 2),
++		.arg = { pa, size, map, map },
++	};
++	ret = aurora_apif_submit(state->apif, &op, 1, NULL);
++	/* MAP is void; UNMAP returns status. A refused unmap keeps the region
++	 * live so the consumer cannot treat its DMA backing as released.
++	 */
++	if (!ret && !map && op.ret)
++		ret = -EIO;
++	if (!ret) {
++		state->regions[i].address = map ? address : 0;
++		state->regions[i].size = map ? size : 0;
++	}
++out:
++	mutex_unlock(&state->lock);
++	return ret;
++}
++
++static int sart_apif_add(struct apple_sart *sart, phys_addr_t address,
++			 size_t size)
++{
++	return sart_apif_region(sart, address, size, true);
++}
++
++static int sart_apif_remove(struct apple_sart *sart, phys_addr_t address,
++			    size_t size)
++{
++	return sart_apif_region(sart, address, size, false);
++}
++
++static const struct apple_sart_backend sart_apif_backend = {
++	.add = sart_apif_add,
++	.remove = sart_apif_remove,
++};
++
++static void sart_apif_put(void *data)
++{
++	aurora_apif_put(data);
++}
++
++static int sart_apif_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct sart_apif *state;
++	struct apple_sart *sart;
++	int ret;
++
++	state = devm_kzalloc(dev, sizeof(*state), GFP_KERNEL);
++	if (!state)
++		return -ENOMEM;
++	state->dev = dev;
++	mutex_init(&state->lock);
++	state->apif = aurora_apif_get(dev);
++	if (IS_ERR(state->apif))
++		return dev_err_probe(dev, PTR_ERR(state->apif),
++				     "APIF transport unavailable\n");
++	ret = devm_add_action_or_reset(dev, sart_apif_put, state->apif);
++	if (ret)
++		return ret;
++	sart = apple_sart_create_backend(dev, &sart_apif_backend, state);
++	if (IS_ERR(sart))
++		return PTR_ERR(sart);
++	platform_set_drvdata(pdev, sart);
++	return 0;
++}
++
++static void sart_apif_shutdown(struct platform_device *pdev)
++{
++	struct apple_sart *sart = platform_get_drvdata(pdev);
++	struct sart_apif *state = apple_sart_backend_data(sart);
++
++	/* Supplier ordering stops consumers before their Linux-owned grants. */
++	for (unsigned int i = 0; i < SART_APIF_MAX_REGIONS; i++)
++		if (state->regions[i].size &&
++		    sart_apif_remove(sart, state->regions[i].address,
++				     state->regions[i].size))
++			dev_err(state->dev,
++				"failed to release DMA region at shutdown\n");
++}
++
++static const struct of_device_id sart_apif_of_match[] = {
++	{ .compatible = "apple,sart-apif" },
++	{}
++};
++MODULE_DEVICE_TABLE(of, sart_apif_of_match);
++
++static struct platform_driver sart_apif_driver = {
++	.driver = {
++		.name = "apple-sart-apif",
++		.of_match_table = sart_apif_of_match,
++		.suppress_bind_attrs = true,
++	},
++	.probe = sart_apif_probe,
++	.shutdown = sart_apif_shutdown,
++};
++module_platform_driver(sart_apif_driver);
++
++MODULE_DESCRIPTION("Apple SART over the Aurora platform interface");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/soc/apple/mailbox.c b/drivers/soc/apple/mailbox.c
+index a85e5b585f31..75b0fdb94c67 100644
+--- a/drivers/soc/apple/mailbox.c
++++ b/drivers/soc/apple/mailbox.c
+@@ -53,6 +53,7 @@
+ #define APPLE_ASCWRAP_V6_WRAPPER_SIZE 0x88000
+ #define APPLE_ASCWRAP_V6_IOP_VBAR_SIZE 0x8
+ #define APPLE_ASCWRAP_V6_CPU_CONTROL 0x44
++#define APPLE_ASCWRAP_V6_CPU_STATUS 0x48
+ #define APPLE_ASCWRAP_V6_CPU_RUN BIT(4)
+ #define APPLE_ASCWRAP_V6_CPU_STOP_SECOND_CLEAR BIT(5)
+ 
+@@ -62,6 +63,7 @@
+ #define APPLE_T8140_GFX1_IOP_VBAR_BASE 0x482850000ULL
+ #define APPLE_T6040_GFX_WRAPPER_BASE 0x28a600000ULL
+ #define APPLE_T6040_GFX_IOP_VBAR_BASE 0x28a050000ULL
++#define APPLE_T6050_ASCWRAP_BASE_DELTA 0x380000000ULL
+ 
+ static_assert(APPLE_ASCWRAP_V6_MBOX_OFFSET + APPLE_ASC_MBOX_A2I_CONTROL ==
+ 	      0x8110);
+@@ -286,6 +288,26 @@ static bool apple_mbox_is_g17(const struct apple_mbox *mbox)
+ 	return mbox->ascwrap_v6.role == APPLE_MBOX_ASCWRAP_V6_ROLE_GFX ||
+ 	       mbox->ascwrap_v6.role == APPLE_MBOX_ASCWRAP_V6_ROLE_GFX1;
+ }
++int apple_mbox_ascwrap_v6_get_cpu_state(struct apple_mbox *mbox,
++				     u32 *control, u32 *status)
++{
++	int ret = 0;
++
++	if (!mbox || !control || !status || !mbox->hw->is_ascwrap_v6 ||
++	    !mbox->wrapper_regs)
++		return -EOPNOTSUPP;
++	mutex_lock(&mbox->lifecycle_lock);
++	if (mbox->removing) {
++		ret = -ENODEV;
++	} else {
++		*control = readl(mbox->wrapper_regs + APPLE_ASCWRAP_V6_CPU_CONTROL);
++		*status = readl(mbox->wrapper_regs + APPLE_ASCWRAP_V6_CPU_STATUS);
++	}
++	mutex_unlock(&mbox->lifecycle_lock);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(apple_mbox_ascwrap_v6_get_cpu_state);
++
+ 
+ int apple_mbox_send(struct apple_mbox *mbox, const struct apple_mbox_msg msg,
+ 		    bool atomic)
+@@ -362,13 +384,26 @@ int apple_mbox_send(struct apple_mbox *mbox, const struct apple_mbox_msg msg,
+ 		t = wait_for_completion_interruptible_timeout(
+ 			&mbox->tx_empty, remaining);
+ 		if (t <= 0) {
++			u32 a2i = 0, i2a = 0;
++			bool removing;
++
+ 			/* A late IRQ may already have masked this under tx_lock. */
+ 			spin_lock_irqsave(&mbox->tx_lock, flags);
++			removing = READ_ONCE(mbox->removing);
++			if (!removing) {
++				a2i = readl_relaxed(mbox->regs + mbox->hw->a2i_control);
++				i2a = readl_relaxed(mbox->regs + mbox->hw->i2a_control);
++			}
+ 			if (mbox->tx_irq_unmasked) {
+ 				disable_irq_nosync(mbox->irq_send_empty);
+ 				mbox->tx_irq_unmasked = false;
+ 			}
+ 			spin_unlock_irqrestore(&mbox->tx_lock, flags);
++			dev_err(mbox->dev,
++				"TX wait failed ret=%ld a2i=%#x i2a=%#x full=%#x send_irq=%d recv_irq=%d removing=%d msg=%#llx/%#x\n",
++				t, a2i, i2a, mbox->hw->control_full,
++				mbox->irq_send_empty, mbox->irq_recv_not_empty,
++				removing, msg.msg0, msg.msg1);
+ 			return t < 0 ? t : -ETIMEDOUT;
+ 		}
+ 
+@@ -973,11 +1008,68 @@ static const struct apple_mbox_hw apple_mbox_m3_hw = {
+ 	.irq_bit_send_empty = APPLE_M3_MBOX_IRQ_A2I_EMPTY,
+ };
+ 
++
++/* T6050's native ASCWrap v6 uses the same RUN/stop sequence. Aura grants
++ * these complete wrapper/VBAR windows in the retained GPU aperture. */
++static const struct apple_mbox_ascwrap_v6_role_desc apple_mbox_t6050_ascwrap_v6_roles[] = {
++	{ "GFX", APPLE_MBOX_ASCWRAP_V6_ROLE_GFX,
++	  APPLE_T8140_GFX_WRAPPER_BASE + APPLE_T6050_ASCWRAP_BASE_DELTA,
++	  APPLE_T8140_GFX_IOP_VBAR_BASE + APPLE_T6050_ASCWRAP_BASE_DELTA },
++	{ "GFX1", APPLE_MBOX_ASCWRAP_V6_ROLE_GFX1,
++	  APPLE_T8140_GFX1_WRAPPER_BASE + APPLE_T6050_ASCWRAP_BASE_DELTA,
++	  APPLE_T8140_GFX1_IOP_VBAR_BASE + APPLE_T6050_ASCWRAP_BASE_DELTA },
++};
++
++static const struct apple_mbox_ascwrap_v6_role_desc apple_mbox_t6050_apif_ascwrap_v6_roles[] = {
++	{ "GFX", APPLE_MBOX_ASCWRAP_V6_ROLE_GFX,
++	  APPLE_T8140_GFX_WRAPPER_BASE,
++	  APPLE_T8140_GFX_IOP_VBAR_BASE + APPLE_T6050_ASCWRAP_BASE_DELTA },
++	{ "GFX1", APPLE_MBOX_ASCWRAP_V6_ROLE_GFX1,
++	  APPLE_T8140_GFX1_WRAPPER_BASE,
++	  APPLE_T8140_GFX1_IOP_VBAR_BASE + APPLE_T6050_ASCWRAP_BASE_DELTA },
++};
++
++static const struct apple_mbox_hw apple_mbox_t6050_ascwrap_v6_hw = {
++	.reg_offset = APPLE_ASCWRAP_V6_MBOX_OFFSET,
++	.is_ascwrap_v6 = true,
++	.ascwrap_v6_roles = apple_mbox_t6050_ascwrap_v6_roles,
++	.num_ascwrap_v6_roles = ARRAY_SIZE(apple_mbox_t6050_ascwrap_v6_roles),
++	.control_full = APPLE_ASC_MBOX_CONTROL_FULL,
++	.control_empty = APPLE_ASC_MBOX_CONTROL_EMPTY,
++	.a2i_control = APPLE_ASC_MBOX_A2I_CONTROL,
++	.a2i_send0 = APPLE_ASC_MBOX_A2I_SEND0,
++	.a2i_send1 = APPLE_ASC_MBOX_A2I_SEND1,
++	.i2a_control = APPLE_ASC_MBOX_I2A_CONTROL,
++	.i2a_recv0 = APPLE_ASC_MBOX_I2A_RECV0,
++	.i2a_recv1 = APPLE_ASC_MBOX_I2A_RECV1,
++	.has_irq_controls = false,
++};
++
++/* Retained compatibility profile: unshifted wrapper aliases, native VBAR. */
++static const struct apple_mbox_hw apple_mbox_t6050_apif_ascwrap_v6_hw = {
++	.reg_offset = APPLE_ASCWRAP_V6_MBOX_OFFSET,
++	.is_ascwrap_v6 = true,
++	.ascwrap_v6_roles = apple_mbox_t6050_apif_ascwrap_v6_roles,
++	.num_ascwrap_v6_roles = ARRAY_SIZE(apple_mbox_t6050_apif_ascwrap_v6_roles),
++	.control_full = APPLE_ASC_MBOX_CONTROL_FULL,
++	.control_empty = APPLE_ASC_MBOX_CONTROL_EMPTY,
++	.a2i_control = APPLE_ASC_MBOX_A2I_CONTROL,
++	.a2i_send0 = APPLE_ASC_MBOX_A2I_SEND0,
++	.a2i_send1 = APPLE_ASC_MBOX_A2I_SEND1,
++	.i2a_control = APPLE_ASC_MBOX_I2A_CONTROL,
++	.i2a_recv0 = APPLE_ASC_MBOX_I2A_RECV0,
++	.i2a_recv1 = APPLE_ASC_MBOX_I2A_RECV1,
++	.has_irq_controls = false,
++};
++
+ static const struct of_device_id apple_mbox_of_match[] = {
+ 	{ .compatible = "apple,t6031-agx-asc-mailbox", .data = &apple_mbox_asc_hw },
+ 	{ .compatible = "apple,t8122-agx-asc-mailbox", .data = &apple_mbox_asc_hw },
+ 	{ .compatible = "apple,t6040-ascwrap-v6", .data = &apple_mbox_t6040_ascwrap_v6_hw },
+ 	{ .compatible = "apple,t8140-ascwrap-v6", .data = &apple_mbox_t8140_ascwrap_v6_hw },
++	{ .compatible = "apple,t6050-apif-ascwrap-v6", .data = &apple_mbox_t6050_apif_ascwrap_v6_hw },
++	{ .compatible = "apple,t6050-ascwrap-v6", .data = &apple_mbox_t6050_ascwrap_v6_hw },
++	{ .compatible = "apple,t6050-x1n1-ascwrap-v6", .data = &apple_mbox_t6050_ascwrap_v6_hw },
+ 	{ .compatible = "apple,t8140-asc-mailbox", .data = &apple_mbox_t8140_asc_hw },
+ 	{ .compatible = "apple,t8140-aop-setup-mailbox", .data = &apple_mbox_t8140_aop_setup_hw },
+ 	/*
+diff --git a/drivers/soc/apple/rtkit-internal.h b/drivers/soc/apple/rtkit-internal.h
+index dbbb6f2086b0..0c5acb7fc709 100644
+--- a/drivers/soc/apple/rtkit-internal.h
++++ b/drivers/soc/apple/rtkit-internal.h
+@@ -1,4 +1,4 @@
+-/* SPDX-License-Identifier: GPL-2.0-only OR MIT */
++/* SPDX-License-Identifier: (GPL-2.0-only OR MIT) AND GPL-2.0-only */
+ /*
+  * Apple RTKit IPC library
+  * Copyright (C) The Asahi Linux Contributors
+@@ -70,6 +70,8 @@ struct apple_rtkit {
+ 	struct apple_rtkit_shmem oslog_buffer;
+ 	struct apple_rtkit_shmem kdebug_buffer0;
+ 	struct apple_rtkit_shmem kdebug_buffer1;
++	struct apple_rtkit_shmem pmp_aux_buffer;
++	bool pmp_registry_v2;
+ 
+ 	struct apple_rtkit_shmem syslog_buffer;
+ 	char *syslog_msg_buffer;
+diff --git a/drivers/soc/apple/rtkit.c b/drivers/soc/apple/rtkit.c
+index a84c1bdc34a6..a56de0472b3e 100644
+--- a/drivers/soc/apple/rtkit.c
++++ b/drivers/soc/apple/rtkit.c
+@@ -1,10 +1,11 @@
+-// SPDX-License-Identifier: GPL-2.0-only OR MIT
++// SPDX-License-Identifier: (GPL-2.0-only OR MIT) AND GPL-2.0-only
+ /*
+  * Apple RTKit IPC library
+  * Copyright (C) The Asahi Linux Contributors
+  */
+ 
+ #include "rtkit-internal.h"
++#include <linux/of.h>
+ 
+ #include <linux/jiffies.h>
+ #include <linux/of.h>
+@@ -27,6 +28,7 @@ enum {
+ 	APPLE_RTKIT_EP_DEBUG = 3,
+ 	APPLE_RTKIT_EP_IOREPORT = 4,
+ 	APPLE_RTKIT_EP_COREANALYTICS = 7,
++	APPLE_RTKIT_EP_PMP_AUX = 7,
+ 	APPLE_RTKIT_EP_OSLOG = 8,
+ 	APPLE_RTKIT_EP_TRACEKIT = 0xa,
+ };
+@@ -260,9 +262,8 @@ static void apple_rtkit_management_rx_epmap(struct apple_rtkit *rtk, u64 msg)
+ 		case APPLE_RTKIT_EP_MGMT:
+ 			break;
+ 
+-		/* Only clients with a qualified startup dependency opt into EP7. */
+ 		case APPLE_RTKIT_EP_COREANALYTICS:
+-			if (!apple_rtkit_needs_coreanalytics(rtk))
++			if (!rtk->pmp_registry_v2 && !apple_rtkit_needs_coreanalytics(rtk))
+ 				break;
+ 			fallthrough;
+ 
+@@ -430,7 +431,9 @@ static int apple_rtkit_common_rx_get_buffer(struct apple_rtkit *rtk,
+ 					    buffer->iova >> 12);
+ 		} else {
+ 			reply = FIELD_PREP(APPLE_RTKIT_SYSLOG_TYPE,
+-					   APPLE_RTKIT_BUFFER_REQUEST);
++					   ep == APPLE_RTKIT_EP_PMP_AUX ?
++						   5 :
++						   APPLE_RTKIT_BUFFER_REQUEST);
+ 			reply |= FIELD_PREP(APPLE_RTKIT_BUFFER_REQUEST_SIZE,
+ 					    buffer->size >> 12);
+ 			reply |= FIELD_PREP(APPLE_RTKIT_BUFFER_REQUEST_IOVA,
+@@ -445,8 +448,9 @@ static int apple_rtkit_common_rx_get_buffer(struct apple_rtkit *rtk,
+ 	return 0;
+ 
+ error:
+-	dev_err(rtk->dev, "RTKit: failed buffer request for 0x%zx bytes (%d)\n",
+-		request.size, err);
++	dev_err(rtk->dev,
++		"RTKit: failed buffer request ep=%#x for 0x%zx bytes at %pad msg=%#llx (%d)\n",
++		ep, request.size, &request.iova, msg, err);
+ 	return err;
+ }
+ 
+@@ -948,6 +952,22 @@ static void apple_rtkit_oslog_rx(struct apple_rtkit *rtk, u64 msg)
+ 	}
+ }
+ 
++/* Registry-v2 firmware requests one 8 KiB auxiliary buffer at endpoint 7.
++ * Identical requests reuse the session buffer; changed geometry is refused.
++ */
++static void apple_rtkit_pmp_aux_rx(struct apple_rtkit *rtk, u64 msg)
++{
++	if (!rtk->pmp_registry_v2 ||
++	    msg != (FIELD_PREP(APPLE_RTKIT_SYSLOG_TYPE,
++			       APPLE_RTKIT_BUFFER_REQUEST) |
++		    FIELD_PREP(APPLE_RTKIT_BUFFER_REQUEST_SIZE, 2))) {
++		dev_err(rtk->dev, "RTKit: refused auxiliary buffer request\n");
++		return;
++	}
++	apple_rtkit_common_rx_get_buffer(rtk, &rtk->pmp_aux_buffer,
++					 APPLE_RTKIT_EP_PMP_AUX, msg);
++}
++
+ static void apple_rtkit_rx_work(struct work_struct *work)
+ {
+ 	struct apple_rtkit_rx_work *rtk_work =
+@@ -979,7 +999,10 @@ static void apple_rtkit_rx_work(struct work_struct *work)
+ 				 rtk_work->ep, rtk_work->msg);
+ 		break;
+ 	case APPLE_RTKIT_EP_COREANALYTICS:
+-		apple_rtkit_coreanalytics_rx(rtk, rtk_work->msg);
++		if (rtk->pmp_registry_v2)
++			apple_rtkit_pmp_aux_rx(rtk, rtk_work->msg);
++		else
++			apple_rtkit_coreanalytics_rx(rtk, rtk_work->msg);
+ 		break;
+ 	case APPLE_RTKIT_EP_OSLOG:
+ 		apple_rtkit_oslog_rx(rtk, rtk_work->msg);
+@@ -1346,6 +1369,8 @@ static struct apple_rtkit *__apple_rtkit_init(struct device *dev, void *cookie,
+ 	ret = apple_rtkit_inherit_buffers(rtk, buffers, count);
+ 	if (ret)
+ 		goto free_rtk;
++	rtk->pmp_registry_v2 =
++		of_device_is_compatible(dev->of_node, "apple,t6050-pmp-v2");
+ 
+ 	init_completion(&rtk->epmap_completion);
+ 	init_completion(&rtk->coreanalytics_completion);
+@@ -1486,6 +1511,7 @@ int apple_rtkit_reinit(struct apple_rtkit *rtk)
+ 	apple_rtkit_free_buffer(rtk, &rtk->ioreport_buffer);
+ 	apple_rtkit_free_buffer(rtk, &rtk->crashlog_buffer);
+ 	apple_rtkit_free_buffer(rtk, &rtk->oslog_buffer);
++	apple_rtkit_free_buffer(rtk, &rtk->pmp_aux_buffer);
+ 	apple_rtkit_free_buffer(rtk, &rtk->syslog_buffer);
+ 	apple_rtkit_free_buffer(rtk, &rtk->kdebug_buffer0);
+ 	apple_rtkit_free_buffer(rtk, &rtk->kdebug_buffer1);
+@@ -1759,6 +1785,7 @@ void apple_rtkit_free(struct apple_rtkit *rtk)
+ 	apple_rtkit_free_buffer(rtk, &rtk->ioreport_buffer);
+ 	apple_rtkit_free_buffer(rtk, &rtk->crashlog_buffer);
+ 	apple_rtkit_free_buffer(rtk, &rtk->oslog_buffer);
++	apple_rtkit_free_buffer(rtk, &rtk->pmp_aux_buffer);
+ 	apple_rtkit_free_buffer(rtk, &rtk->syslog_buffer);
+ 	apple_rtkit_free_buffer(rtk, &rtk->kdebug_buffer0);
+ 	apple_rtkit_free_buffer(rtk, &rtk->kdebug_buffer1);
+diff --git a/drivers/soc/apple/sart-backend.h b/drivers/soc/apple/sart-backend.h
+new file mode 100644
+index 000000000000..8a130fa48ccb
+--- /dev/null
++++ b/drivers/soc/apple/sart-backend.h
+@@ -0,0 +1,21 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef APPLE_SART_BACKEND_H
++#define APPLE_SART_BACKEND_H
++
++#include <linux/soc/apple/sart.h>
++
++/* Alternate providers retain the existing consumer API. */
++struct apple_sart_backend {
++	int (*add)(struct apple_sart *sart, phys_addr_t address, size_t size);
++	int (*remove)(struct apple_sart *sart, phys_addr_t address,
++		      size_t size);
++	bool (*inherited)(struct apple_sart *sart, phys_addr_t address,
++			  size_t size);
++};
++
++struct apple_sart *
++apple_sart_create_backend(struct device *dev,
++			  const struct apple_sart_backend *backend, void *data);
++void *apple_sart_backend_data(struct apple_sart *sart);
++
++#endif
+diff --git a/drivers/soc/apple/sart.c b/drivers/soc/apple/sart.c
+index e62d1eee8e36..6cedcb867c61 100644
+--- a/drivers/soc/apple/sart.c
++++ b/drivers/soc/apple/sart.c
+@@ -1,4 +1,4 @@
+-// SPDX-License-Identifier: GPL-2.0-only OR MIT
++// SPDX-License-Identifier: (GPL-2.0-only OR MIT) AND GPL-2.0-only
+ /*
+  * Apple SART device driver
+  * Copyright (C) The Asahi Linux Contributors
+@@ -23,6 +23,7 @@
+ #include <linux/of_platform.h>
+ #include <linux/platform_device.h>
+ #include <linux/types.h>
++#include "sart-backend.h"
+ 
+ #define APPLE_SART_MAX_ENTRIES 16
+ 
+@@ -82,8 +83,33 @@ struct apple_sart {
+ 
+ 	unsigned long protected_entries;
+ 	unsigned long used_entries;
++	const struct apple_sart_backend *backend;
++	void *backend_data;
+ };
+ 
++struct apple_sart *apple_sart_create_backend(struct device *dev,
++		const struct apple_sart_backend *backend, void *data)
++{
++	struct apple_sart *sart;
++
++	if (!backend || !backend->add || !backend->remove)
++		return ERR_PTR(-EINVAL);
++	sart = devm_kzalloc(dev, sizeof(*sart), GFP_KERNEL);
++	if (!sart)
++		return ERR_PTR(-ENOMEM);
++	sart->dev = dev;
++	sart->backend = backend;
++	sart->backend_data = data;
++	return sart;
++}
++EXPORT_SYMBOL_GPL(apple_sart_create_backend);
++
++void *apple_sart_backend_data(struct apple_sart *sart)
++{
++	return sart->backend_data;
++}
++EXPORT_SYMBOL_GPL(apple_sart_backend_data);
++
+ static void sart0_get_entry(struct apple_sart *sart, int index, u8 *flags,
+ 	phys_addr_t *paddr, size_t *size)
+ {
+@@ -256,6 +282,8 @@ bool apple_sart_is_inherited_region(struct apple_sart *sart, phys_addr_t paddr,
+ {
+ 	int i;
+ 
++	if (sart->backend)
++		return sart->backend->inherited && sart->backend->inherited(sart, paddr, size);
+ 	if (!size || paddr > PHYS_ADDR_MAX - (size - 1))
+ 		return false;
+ 	for (i = 0; i < APPLE_SART_MAX_ENTRIES; i++) {
+@@ -298,6 +326,8 @@ int apple_sart_add_allowed_region(struct apple_sart *sart, phys_addr_t paddr,
+ {
+ 	int i, ret;
+ 
++	if (sart->backend)
++		return sart->backend->add(sart, paddr, size);
+ 	for (i = 0; i < APPLE_SART_MAX_ENTRIES; ++i) {
+ 		if (test_bit(i, &sart->protected_entries))
+ 			continue;
+@@ -332,6 +362,8 @@ int apple_sart_remove_allowed_region(struct apple_sart *sart, phys_addr_t paddr,
+ {
+ 	int i;
+ 
++	if (sart->backend)
++		return sart->backend->remove(sart, paddr, size);
+ 	dev_dbg(sart->dev,
+ 		"will remove [paddr: %pa, size: 0x%zx] from allowed regions\n",
+ 		&paddr, size);
+@@ -403,6 +435,6 @@ static struct platform_driver apple_sart_driver = {
+ };
+ module_platform_driver(apple_sart_driver);
+ 
+-MODULE_LICENSE("Dual MIT/GPL");
++MODULE_LICENSE("GPL");
+ MODULE_AUTHOR("Sven Peter <sven@svenpeter.dev>");
+ MODULE_DESCRIPTION("Apple SART driver");
+diff --git a/include/linux/apple-centauri.h b/include/linux/apple-centauri.h
+new file mode 100644
+index 000000000000..0766371a60d1
+--- /dev/null
++++ b/include/linux/apple-centauri.h
+@@ -0,0 +1,12 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef _LINUX_APPLE_CENTAURI_H
++#define _LINUX_APPLE_CENTAURI_H
++
++#include <linux/types.h>
++
++struct pci_dev;
++
++/* The caller must hold a managed device link to the Control supplier. */
++bool apple_centauri_control_ready(struct pci_dev *pdev);
++
++#endif
+diff --git a/include/linux/apple-dart-apif.h b/include/linux/apple-dart-apif.h
+new file mode 100644
+index 000000000000..814b2a91aba9
+--- /dev/null
++++ b/include/linux/apple-dart-apif.h
+@@ -0,0 +1,18 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef _LINUX_APPLE_DART_APIF_H
++#define _LINUX_APPLE_DART_APIF_H
++#include <linux/device.h>
++#include <linux/errno.h>
++#include <linux/kconfig.h>
++#if IS_REACHABLE(CONFIG_APPLE_DART_APIF)
++/* Caller must quiesce every device on this DART before powering it down.
++ * Tables and mappings survive the native SPTM power transition.
++ */
++int apple_dart_apif_set_power(struct device *dev, bool on);
++#else
++static inline int apple_dart_apif_set_power(struct device *dev, bool on)
++{
++	return -EOPNOTSUPP;
++}
++#endif
++#endif
+diff --git a/include/linux/pci-apple-apif.h b/include/linux/pci-apple-apif.h
+new file mode 100644
+index 000000000000..d3094cc976a8
+--- /dev/null
++++ b/include/linux/pci-apple-apif.h
+@@ -0,0 +1,16 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef _LINUX_PCI_APPLE_APIF_H
++#define _LINUX_PCI_APPLE_APIF_H
++#include <linux/errno.h>
++#include <linux/kconfig.h>
++struct pci_dev;
++#if IS_REACHABLE(CONFIG_PCIE_APPLE_APIF)
++/* Preboot N1 transition only, before radio function enumeration or DMA. */
++int apple_apif_pcie_cycle(struct pci_dev *pdev);
++#else
++static inline int apple_apif_pcie_cycle(struct pci_dev *pdev)
++{
++	return -EOPNOTSUPP;
++}
++#endif
++#endif
+diff --git a/include/linux/soc/apple/display-event-debugfs.h b/include/linux/soc/apple/display-event-debugfs.h
+new file mode 100644
+index 000000000000..81322e64bf02
+--- /dev/null
++++ b/include/linux/soc/apple/display-event-debugfs.h
+@@ -0,0 +1,85 @@
++/* SPDX-License-Identifier: GPL-2.0-only OR MIT */
++#ifndef _LINUX_APPLE_DISPLAY_EVENT_DEBUGFS_H
++#define _LINUX_APPLE_DISPLAY_EVENT_DEBUGFS_H
++#include <linux/debugfs.h>
++#include <linux/fs.h>
++#include <linux/module.h>
++#include <linux/seq_file.h>
++#include <linux/slab.h>
++#include <linux/vmalloc.h>
++#include <linux/soc/apple/display-event-log.h>
++
++static int apple_display_events_show(struct seq_file *s, void *unused)
++{
++	const struct apple_display_event_snapshot *p = s->private;
++	u32 i, j;
++
++	seq_printf(s, "apple-display-events version=1 name=%s capacity=512 clock=mono_fast\n", p->name);
++	seq_printf(s, "snapshot ns=%llu/%llu seq=%llu/%llu count=%u copied=%u gaps=%u complete=%u\n",
++		p->start_ns, p->end_ns, p->seq_start, p->seq_end,
++		p->record_count, p->copied, p->gaps, p->complete);
++	seq_printf(s, "before committed=%llu attempts=%llu busy=%llu sequence=%llu overwritten=%llu\n",
++		p->start.committed, p->start.attempts, p->start.busy_drops,
++		p->start.sequence_drops, p->start.overwritten);
++	seq_printf(s, "after committed=%llu attempts=%llu busy=%llu sequence=%llu overwritten=%llu\n",
++		p->end.committed, p->end.attempts, p->end.busy_drops,
++		p->end.sequence_drops, p->end.overwritten);
++	for (i = 0; i < p->record_count; i++) {
++		const struct apple_display_event_record *r = &p->records[i];
++
++		if (!p->valid[i]) {
++			seq_printf(s, "gap index=%u\n", i);
++			continue;
++		}
++		seq_printf(s, "event seq=%llu ns=%llu type=%u flags=%#x result=%d data=",
++			r->sequence, r->timestamp_ns, r->type, r->flags, r->result);
++		for (j = 0; j < 9; j++)
++			seq_printf(s, "%s%016llx", j ? "," : "", r->data[j]);
++		seq_putc(s, '\n');
++	}
++	return 0;
++}
++
++static int apple_display_events_open(struct inode *inode, struct file *file)
++{
++	struct apple_display_event_snapshot *snapshot;
++	struct dentry *dentry = file->f_path.dentry;
++	int ret;
++
++	/* No owner pointer is read until debugfs removal protection is held. */
++	snapshot = kvzalloc(sizeof(*snapshot), GFP_KERNEL);
++	if (!snapshot)
++		return -ENOMEM;
++	ret = debugfs_file_get(dentry);
++	if (ret)
++		goto free;
++	ret = apple_display_event_snapshot_copy(inode->i_private, snapshot);
++	debugfs_file_put(dentry);
++	if (ret)
++		goto free;
++	/* Only standalone bytes remain: formatting may outlive the device. */
++	ret = single_open(file, apple_display_events_show, snapshot);
++	if (ret)
++		goto free;
++	return 0;
++free:
++	kvfree(snapshot);
++	return ret;
++}
++
++static int apple_display_events_release(struct inode *inode, struct file *file)
++{
++	struct seq_file *s = file->private_data;
++
++	kvfree(s->private);
++	return single_release(inode, file);
++}
++
++static const struct file_operations apple_display_events_fops = {
++	.owner = THIS_MODULE,
++	.open = apple_display_events_open,
++	.read = seq_read,
++	.llseek = seq_lseek,
++	.release = apple_display_events_release,
++};
++#endif
+diff --git a/include/linux/soc/apple/display-event-log.h b/include/linux/soc/apple/display-event-log.h
+new file mode 100644
+index 000000000000..9d7cdee5c755
+--- /dev/null
++++ b/include/linux/soc/apple/display-event-log.h
+@@ -0,0 +1,213 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef _LINUX_SOC_APPLE_DISPLAY_EVENT_LOG_H
++#define _LINUX_SOC_APPLE_DISPLAY_EVENT_LOG_H
++
++#include <linux/atomic.h>
++#include <linux/build_bug.h>
++#include <linux/errno.h>
++#include <linux/spinlock.h>
++#include <linux/string.h>
++#include <linux/timekeeping.h>
++#include <linux/types.h>
++
++#define APPLE_DISPLAY_EVENT_CAPACITY 512U
++#define APPLE_DISPLAY_EVENT_CHUNK 8U
++#define APPLE_DISPLAY_EVENT_SCHEMA 1U
++
++struct apple_display_event_record {
++	u64 timestamp_ns;
++	u64 sequence;
++	u16 type;
++	u16 flags;
++	s32 result;
++	u64 data[9];
++};
++static_assert(sizeof(struct apple_display_event_record) == 96);
++
++/* Atomics count attempted calls, including callers which cannot take lock. */
++struct apple_display_event_log {
++	raw_spinlock_t lock;
++	char name[64];
++	atomic64_t attempts;
++	atomic64_t busy_drops;
++	atomic64_t sequence_drops;
++	u64 committed;
++	struct apple_display_event_record records[APPLE_DISPLAY_EVENT_CAPACITY];
++};
++
++/* Atomic counters are individually sampled, not one atomic transaction. */
++struct apple_display_event_counters {
++	u64 committed;
++	u64 attempts;
++	u64 busy_drops;
++	u64 sequence_drops;
++	u64 overwritten;
++};
++
++/* Standalone storage: no device, ring, lock or callback pointer survives copy. */
++struct apple_display_event_snapshot {
++	char name[64];
++	struct apple_display_event_counters start;
++	struct apple_display_event_counters end;
++	u64 seq_start;
++	u64 seq_end;
++	u64 start_ns;
++	u64 end_ns;
++	u32 record_count;
++	u32 copied;
++	u32 gaps;
++	bool complete;
++	u8 valid[APPLE_DISPLAY_EVENT_CAPACITY];
++	struct apple_display_event_record records[APPLE_DISPLAY_EVENT_CAPACITY];
++};
++
++/* Owner allocates/initializes before publishing, and quiesces before freeing. */
++static inline void apple_display_event_log_init(struct apple_display_event_log *log,
++					       const char *name)
++{
++	memset(log, 0, sizeof(*log));
++	raw_spin_lock_init(&log->lock);
++	atomic64_set(&log->attempts, 0);
++	atomic64_set(&log->busy_drops, 0);
++	atomic64_set(&log->sequence_drops, 0);
++	strscpy(log->name, name, sizeof(log->name));
++}
++
++static inline void __apple_display_event_record(struct apple_display_event_log *log,
++						u16 type, s32 result, u16 flags,
++						const u64 data[9])
++{
++	struct apple_display_event_record *record;
++	unsigned long irqflags;
++	u64 sequence;
++
++	atomic64_inc(&log->attempts);
++	if (!raw_spin_trylock_irqsave(&log->lock, irqflags)) {
++		atomic64_inc(&log->busy_drops);
++		return;
++	}
++	/* Never wrap to sequence zero or relabel old records after exhaustion. */
++	if (log->committed == ~(u64)0) {
++		atomic64_inc(&log->sequence_drops);
++		raw_spin_unlock_irqrestore(&log->lock, irqflags);
++		return;
++	}
++	sequence = log->committed + 1;
++	record = &log->records[(sequence - 1) % APPLE_DISPLAY_EVENT_CAPACITY];
++	record->timestamp_ns = ktime_get_mono_fast_ns();
++	record->sequence = sequence;
++	record->type = type;
++	record->flags = flags;
++	record->result = result;
++	memcpy(record->data, data, sizeof(record->data));
++	log->committed = sequence;
++	raw_spin_unlock_irqrestore(&log->lock, irqflags);
++}
++
++/* Disabled means no payload evaluation, clock read, lock or counter access.
++ * Payload expressions must still be POD observations, never hardware helpers.
++ */
++#define APPLE_DISPLAY_EVENT_RECORD(log_, type_, result_, flags_, \
++				   a_, b_, c_, d_, e_, f_, g_, h_, i_) do { \
++	struct apple_display_event_log *__event_log = (log_); \
++	if (__event_log) { \
++		const u64 __event_data[9] = { (a_), (b_), (c_), (d_), (e_), \
++					     (f_), (g_), (h_), (i_) }; \
++		__apple_display_event_record(__event_log, (type_), (result_), \
++					     (flags_), __event_data); \
++	} \
++} while (0)
++
++/* Caller holds the recorder lock; no hardware or owner state is accessed. */
++static inline void __apple_display_event_counters(struct apple_display_event_log *log,
++						 struct apple_display_event_counters *out)
++{
++	out->committed = log->committed;
++	out->attempts = (u64)atomic64_read(&log->attempts);
++	out->busy_drops = (u64)atomic64_read(&log->busy_drops);
++	out->sequence_drops = (u64)atomic64_read(&log->sequence_drops);
++	out->overwritten = log->committed > APPLE_DISPLAY_EVENT_CAPACITY ?
++		log->committed - APPLE_DISPLAY_EVENT_CAPACITY : 0;
++}
++
++/* Allocate snapshot before acquiring any owner reference/lock. EAGAIN is not
++ * retried here: a reader must never spin waiting for a producer or vice versa.
++ */
++static inline int apple_display_event_snapshot_begin(struct apple_display_event_log *log,
++						     struct apple_display_event_snapshot *out)
++{
++	unsigned long irqflags;
++
++	memset(out, 0, sizeof(*out));
++	out->start_ns = ktime_get_mono_fast_ns();
++	if (!raw_spin_trylock_irqsave(&log->lock, irqflags))
++		return -EAGAIN;
++	memcpy(out->name, log->name, sizeof(out->name));
++	__apple_display_event_counters(log, &out->start);
++	out->seq_end = log->committed;
++	out->record_count = log->committed < APPLE_DISPLAY_EVENT_CAPACITY ?
++		log->committed : APPLE_DISPLAY_EVENT_CAPACITY;
++	out->seq_start = out->record_count ?
++		out->seq_end - out->record_count + 1 : 0;
++	raw_spin_unlock_irqrestore(&log->lock, irqflags);
++	return 0;
++}
++
++/* Return 1 for more chunks, 0 when complete, or EAGAIN without blocking.
++ * The fixed begin bounds never expand to include later writes. Each requested
++ * sequence is checked under lock; an overwrite is explicitly retained as a gap.
++ */
++static inline int apple_display_event_snapshot_next(struct apple_display_event_log *log,
++						    struct apple_display_event_snapshot *out)
++{
++	unsigned long irqflags;
++	u32 limit, i;
++	bool finished;
++
++	if (out->complete)
++		return 0;
++	if (!raw_spin_trylock_irqsave(&log->lock, irqflags))
++		return -EAGAIN;
++	limit = out->record_count - out->copied;
++	if (limit > APPLE_DISPLAY_EVENT_CHUNK)
++		limit = APPLE_DISPLAY_EVENT_CHUNK;
++	for (i = 0; i < limit; i++) {
++		u32 index = out->copied++;
++		u64 sequence = out->seq_start + index;
++		struct apple_display_event_record *source =
++			&log->records[(sequence - 1) % APPLE_DISPLAY_EVENT_CAPACITY];
++
++		if (source->sequence == sequence) {
++			out->records[index] = *source;
++			out->valid[index] = 1;
++		} else {
++			/* Cleared by begin: do not expose the replacement payload. */
++			out->records[index].sequence = sequence;
++			out->gaps++;
++		}
++	}
++	finished = out->copied == out->record_count;
++	if (finished)
++		__apple_display_event_counters(log, &out->end);
++	raw_spin_unlock_irqrestore(&log->lock, irqflags);
++	if (finished) {
++		out->end_ns = ktime_get_mono_fast_ns();
++		out->complete = true;
++	}
++	return finished ? 0 : 1;
++}
++
++static inline int apple_display_event_snapshot_copy(struct apple_display_event_log *log,
++						    struct apple_display_event_snapshot *out)
++{
++	int ret = apple_display_event_snapshot_begin(log, out);
++
++	if (ret)
++		return ret;
++	do {
++		ret = apple_display_event_snapshot_next(log, out);
++	} while (ret > 0);
++	return ret;
++}
++
++#endif /* _LINUX_SOC_APPLE_DISPLAY_EVENT_LOG_H */
+diff --git a/include/linux/soc/apple/dp-tunnel.h b/include/linux/soc/apple/dp-tunnel.h
+index 540d48fe8e0d..6fbcbab2d127 100644
+--- a/include/linux/soc/apple/dp-tunnel.h
++++ b/include/linux/soc/apple/dp-tunnel.h
+@@ -1,4 +1,4 @@
+-/* SPDX-License-Identifier: GPL-2.0-only OR MIT */
++/* SPDX-License-Identifier: (GPL-2.0-only OR MIT) AND GPL-2.0-only */
+ /*
+  * DisplayPort over Thunderbolt on Apple silicon: the pieces that bring up a
+  * DP tunnel live in the Thunderbolt glue, appledrm, the ATC PHY and the
+@@ -68,6 +68,11 @@ int apple_atc_dp_tunnel_open(struct phy *phy);
+  * enable set and link_up() re-asserts it. The caller keeps the output
+  * selected (holds the mux) around both. Supports t8103 and T602X crossbars.
+  */
++/* Fixed DP PHY: obtain its live clock and coding; other PHYs return unsupported. */
++int apple_dp_phy_link_config(struct phy *phy, unsigned int *pclk, bool *uhbr);
++
++/* Configure a selected, inactive route on the four-clock crossbar layout. */
++int apple_dpxbar_link_configure(struct mux_control *mux, unsigned int pclk, bool uhbr);
+ int apple_dpxbar_link_down(struct mux_control *mux);
+ int apple_dpxbar_link_up(struct mux_control *mux);
+ int apple_dpxbar_tunnel_select_source(struct mux_control *mux, int state);
+diff --git a/include/linux/soc/apple/mailbox.h b/include/linux/soc/apple/mailbox.h
+index fcb17eaf2d5a..63542c632b67 100644
+--- a/include/linux/soc/apple/mailbox.h
++++ b/include/linux/soc/apple/mailbox.h
+@@ -106,5 +106,7 @@ int apple_mbox_ascwrap_v6_get_lifecycle(
+ int apple_mbox_ascwrap_v6_require_safe_cpu_lifecycle(struct apple_mbox *mbox);
+ int apple_mbox_ascwrap_v6_start_cpu(struct apple_mbox *mbox);
+ int apple_mbox_ascwrap_v6_stop_cpu(struct apple_mbox *mbox);
++int apple_mbox_ascwrap_v6_get_cpu_state(struct apple_mbox *mbox,
++				     u32 *control, u32 *status);
+ 
+ #endif
+diff --git a/include/linux/soc/aurora/apif-mmio.h b/include/linux/soc/aurora/apif-mmio.h
+new file mode 100644
+index 000000000000..fbf865f3a24c
+--- /dev/null
++++ b/include/linux/soc/aurora/apif-mmio.h
+@@ -0,0 +1,66 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef _LINUX_SOC_AURORA_APIF_MMIO_H
++#define _LINUX_SOC_AURORA_APIF_MMIO_H
++
++#include <linux/types.h>
++#include <linux/err.h>
++#include <linux/kconfig.h>
++
++struct device;
++struct aurora_apif;
++
++#define AURORA_APIF_SELECTOR(table, endpoint) \
++	(((u64)(table) << 32) | (endpoint))
++#define AURORA_APIF_SERVICE 0xffffffffU
++#define AURORA_APIF_TRANSLATE 1
++#define AURORA_APIF_ALLOC_FRAME 2
++#define AURORA_APIF_FREE_FRAME 3
++#define AURORA_APIF_MAP_IO 4
++#define AURORA_APIF_GUEST_ROOT 5
++#define AURORA_APIF_BOOT_IOMMU 6
++#define AURORA_APIF_BOOT_TABLE 7
++#define AURORA_APIF_FIND_FRAME 8
++#define AURORA_APIF_TAG_FRAME 9
++#define AURORA_APIF_BOOT_DART 0
++
++struct aurora_apif_op {
++	u64 selector;
++	u64 arg[6];
++	u64 ret;
++};
++
++struct aurora_apif_boot_iommu {
++	u64 level, count, base, size, pa, ipa, attrs, reserved;
++};
++
++/* Each client owns a buffer. Submission is synchronous and atomic-context
++ * safe. Unbind drains the client and subsequent calls return -ENODEV.
++ */
++#if IS_REACHABLE(CONFIG_AURORA_APIF_MMIO)
++struct aurora_apif *aurora_apif_get(struct device *dev);
++void aurora_apif_put(struct aurora_apif *apif);
++/* @done counts executed operations. The transport does not interpret native
++ * results; endpoint-specific status and ownership belong to the caller.
++ */
++int aurora_apif_submit(struct aurora_apif *apif, struct aurora_apif_op *ops,
++		       u32 count, u32 *done);
++
++#else
++static inline struct aurora_apif *aurora_apif_get(struct device *dev)
++{
++	return ERR_PTR(-ENODEV);
++}
++static inline void aurora_apif_put(struct aurora_apif *apif)
++{
++}
++static inline int aurora_apif_submit(struct aurora_apif *apif,
++				     struct aurora_apif_op *ops, u32 count,
++				     u32 *done)
++{
++	if (done)
++		*done = 0;
++	return -ENODEV;
++}
++#endif
++
++#endif
+diff --git a/rust/bindings/bindings_helper.h b/rust/bindings/bindings_helper.h
+index c1dac3bcb388..23aa68592336 100644
+--- a/rust/bindings/bindings_helper.h
++++ b/rust/bindings/bindings_helper.h
+@@ -95,6 +95,7 @@
+ #include <linux/pwm.h>
+ #include <linux/random.h>
+ #include <linux/refcount.h>
++#include <linux/reboot.h>
+ #include <linux/regulator/consumer.h>
+ #include <linux/sched.h>
+ #include <linux/security.h>
+diff --git a/rust/kernel/soc/apple/rtkit.rs b/rust/kernel/soc/apple/rtkit.rs
+index 16946dacfaa1..ca7a3c534fb4 100644
+--- a/rust/kernel/soc/apple/rtkit.rs
++++ b/rust/kernel/soc/apple/rtkit.rs
+@@ -1,4 +1,4 @@
+-// SPDX-License-Identifier: GPL-2.0-only OR MIT
++// SPDX-License-Identifier: (GPL-2.0-only OR MIT) AND GPL-2.0-only
+ 
+ //! Support for Apple RTKit coprocessors.
+ //!
+@@ -305,6 +305,10 @@ fn new_with_ops(
+         })
+     }
+ 
++    /// Borrows the C handle without transferring ownership.
++    /// The owner must outlive each unsafe C operation and its callbacks.
++    pub fn as_raw(&self) -> *mut bindings::apple_rtkit { self.rtk }
++
+     /// Requests acknowledged RTKit shutdown using the C core's bounded waits.
+     ///
+     /// The caller must not hold a lock needed by its receive callbacks: the
+diff --git a/tools/testing/selftests/Makefile b/tools/testing/selftests/Makefile
+index 5ded8372001a..90ea8b9c4dd5 100644
+--- a/tools/testing/selftests/Makefile
++++ b/tools/testing/selftests/Makefile
+@@ -4,6 +4,7 @@ TARGETS += alloc_tag
+ TARGETS += alsa
+ TARGETS += amd-pstate
+ TARGETS += arm64
++TARGETS += aurora-apif
+ TARGETS += bpf
+ TARGETS += breakpoints
+ TARGETS += cachestat
+diff --git a/tools/testing/selftests/aurora-apif/Makefile b/tools/testing/selftests/aurora-apif/Makefile
+new file mode 100644
+index 000000000000..fba0d147f924
+--- /dev/null
++++ b/tools/testing/selftests/aurora-apif/Makefile
+@@ -0,0 +1,5 @@
++# SPDX-License-Identifier: GPL-2.0-only
++# Each sibling PR contributes its own tests to the shared base.
++TEST_PROGS := $(filter-out common.py,$(wildcard *.py))
++TEST_FILES := common.py
++include ../lib.mk
+diff --git a/tools/testing/selftests/aurora-apif/apif_mmio.py b/tools/testing/selftests/aurora-apif/apif_mmio.py
+new file mode 100755
+index 000000000000..8cc3484814f4
+--- /dev/null
++++ b/tools/testing/selftests/aurora-apif/apif_mmio.py
+@@ -0,0 +1,409 @@
++#!/usr/bin/env python3
++# SPDX-License-Identifier: GPL-2.0-only
++"""Host fault injection against production APIF functions; no firmware calls."""
++import os
++from pathlib import Path
++import re
++import shlex
++import subprocess
++import tempfile
++
++ROOT = Path(__file__).resolve().parents[4]
++
++
++def function(path, name):
++    source = (ROOT / path).read_text()
++    match = re.search(r"^.*\b" + name + r"\([^;]*?\)\n\{", source, re.M)
++    if not match:
++        raise RuntimeError(f"missing production function {name}")
++    start = match.start()
++    pos = match.end() - 1
++    depth = 0
++    for end in range(pos, len(source)):
++        if source[end] == "{":
++            depth += 1
++        elif source[end] == "}":
++            depth -= 1
++            if not depth:
++                return source[start:end + 1]
++    raise RuntimeError(f"unterminated function {name}")
++
++
++HEADER = r'''
++#include <assert.h>
++#include <stdbool.h>
++#include <stdint.h>
++#include <stddef.h>
++#include <stdlib.h>
++#include <string.h>
++#include <errno.h>
++typedef uint16_t u16;
++typedef uint32_t u32;
++typedef int32_t s32;
++typedef uint64_t u64;
++typedef uintptr_t phys_addr_t;
++#define __packed __attribute__((packed))
++#define U64_MAX UINT64_MAX
++#define PHYS_ADDR_MAX UINTPTR_MAX
++#define SZ_16K 16384UL
++#define SZ_4G (1ULL << 32)
++#define PAGE_SIZE SZ_16K
++#define IOMMU_READ 1
++#define IOMMU_WRITE 2
++#define IOMMU_CACHE 4
++#define IOMMU_NOEXEC 8
++#define IOMMU_MMIO 16
++#define GENMASK_ULL(h,l) ((~0ULL << (l)) & (~0ULL >> (63-(h))))
++#define IS_REACHABLE(x) 1
++#define GFP_ATOMIC 0
++#define kmalloc(n,flags) malloc(n)
++#define virt_to_phys(p) ((u64)(uintptr_t)(p))
++#define round_down(v,a) ((v) & ~((a)-1))
++#define min(a,b) ((a)<(b)?(a):(b))
++#define READ_ONCE(v) (v)
++#define raw_spin_lock_irqsave(lock,flags) ((void)(lock), (flags)=0)
++#define raw_spin_unlock_irqrestore(lock,flags) ((void)(lock), (void)(flags))
++#define mutex_lock(lock) ((void)(lock))
++#define mutex_unlock(lock) ((void)(lock))
++'''
++api = (ROOT / "include/linux/soc/aurora/apif-mmio.h").read_text()
++api = "\n".join(line for line in api.splitlines() if not line.startswith("#include"))
++HEADER += api + "\n"
++
++
++def transport_test():
++    submit = function("drivers/firmware/aurora-apif-mmio.c", "aurora_apif_submit")
++    return HEADER + r'''
++struct apif_batch { u32 count, flags; s32 status; u32 done; struct aurora_apif_op ops[3]; };
++struct aurora_apif { int lock; bool live; struct apif_batch *batch; u32 max_ops; };
++static unsigned rings;
++static int mode;
++static void apif_ring(struct aurora_apif *apif)
++{
++    rings++;
++    apif->batch->done = apif->batch->count;
++    apif->batch->status = 0;
++    for (u32 i = 0; i < apif->batch->count; i++) apif->batch->ops[i].ret = U64_MAX;
++    if (mode == 1) { apif->batch->done = 1; apif->batch->status = -EINVAL; }
++    if (mode == 2) apif->batch->done++;
++    if (mode == 3) { apif->batch->done = 0; apif->batch->status = -EINPROGRESS; }
++    if (mode == 4) { apif->batch->done = 0; apif->batch->status = 1; }
++    if (mode == 5) { apif->batch->done = 1; }
++}
++''' + submit + r'''
++int main(void)
++{
++    struct apif_batch batch = {};
++    struct aurora_apif client = { .live = true, .batch = &batch, .max_ops = 3 };
++    struct aurora_apif_op ops[8] = {};
++    u32 done;
++    assert(!aurora_apif_submit(&client, ops, 8, &done));
++    assert(done == 8 && rings == 3 && ops[7].ret == U64_MAX);
++    assert(!aurora_apif_submit(&client, NULL, 0, &done) && !done && rings == 3);
++    assert(aurora_apif_submit(&client, NULL, 1, &done) == -EINVAL && !done);
++    mode = 1;
++    assert(aurora_apif_submit(&client, ops, 8, &done) == -EINVAL && done == 1);
++    mode = 2;
++    assert(aurora_apif_submit(&client, ops, 8, &done) == -EIO && !done);
++    mode = 3;
++    assert(aurora_apif_submit(&client, ops, 8, &done) == -EIO && !done);
++    mode = 4;
++    assert(aurora_apif_submit(&client, ops, 8, &done) == -EIO && !done);
++    mode = 5;
++    assert(aurora_apif_submit(&client, ops, 8, &done) == -EIO && done == 1);
++    client.live = false;
++    assert(aurora_apif_submit(&client, ops, 1, &done) == -ENODEV && !done);
++    return 0;
++}
++'''
++
++
++def dart_test():
++    path = "drivers/iommu/apple-dart-apif.c"
++    source = (ROOT / path).read_text()
++    constants = source[source.index("#define APIF_DART_INIT"):source.index("static const struct iommu_ops")]
++    funcs = "\n".join(function(path, name) for name in
++                      ["apif_force_iovas", "apif_one", "apif_prepare_table", "apif_boot_query", "apif_ring"])
++    return HEADER + constants + r'''
++struct apif_retained_run { u64 dva, ipa, size; };
++struct apif_retained_sid { unsigned root_level; u32 count; struct apif_retained_run *runs; };
++struct apple_dart_apif {
++    struct aurora_apif *apif;
++    struct aurora_apif_op native_ops[2 * APIF_BATCH_MAX_OPS];
++    struct aurora_apif_boot_iommu *boot_info;
++    u64 *page_lists[APIF_BATCH_MAX_OPS], page_list_pa[APIF_BATCH_MAX_OPS];
++    u32 dart_id, num_streams;
++    u64 iova_force, dma_min, dma_max;
++    bool boot_mappings;
++    bool ownership_uncertain;
++    struct apif_retained_sid *retained[DART_APIF_MAX_STREAMS];
++    struct apif_batch *batch;
++};
++static struct aurora_apif_op calls[2048];
++static unsigned ncalls;
++static u64 boot_table, found_table, retype_result = 1, fail_selector;
++static int fail_status;
++static int native_done = -1;
++int aurora_apif_submit(struct aurora_apif *client, struct aurora_apif_op *ops, u32 count, u32 *done)
++{
++    (void)client;
++    if (done) *done = 0;
++    for (u32 i = 0; i < count; i++) {
++        struct aurora_apif_op *op = &ops[i];
++        calls[ncalls++] = *op;
++        if (fail_selector && op->selector == fail_selector) return fail_status;
++        if (native_done >= 0 && (op->selector >> 32) != AURORA_APIF_SERVICE && i >= (u32)native_done)
++            return -EIO;
++        op->ret = 0;
++        if (op->selector == AURORA_APIF_SELECTOR(AURORA_APIF_SERVICE, AURORA_APIF_TRANSLATE))
++            op->ret = op->arg[0] + SZ_4G;
++        if (op->selector == AURORA_APIF_SELECTOR(AURORA_APIF_SERVICE, AURORA_APIF_BOOT_TABLE))
++            op->ret = boot_table;
++        if (op->selector == AURORA_APIF_SELECTOR(AURORA_APIF_SERVICE, AURORA_APIF_FIND_FRAME))
++            op->ret = found_table;
++        if (op->selector == AURORA_APIF_SELECTOR(AURORA_APIF_SERVICE, AURORA_APIF_ALLOC_FRAME))
++            op->ret = 0x90000000;
++        if (op->selector == AURORA_APIF_SELECTOR(0, 1)) op->ret = retype_result;
++        /* A void endpoint is allowed to return nonzero. */
++        if (op->selector == AURORA_APIF_SELECTOR(3, 0)) op->ret = U64_MAX;
++        if (done) *done = i + 1;
++    }
++    return 0;
++}
++''' + funcs + r'''
++int main(void)
++{
++    struct apple_dart_apif dart = { .dart_id = 5, .num_streams = 16 };
++    struct aurora_apif_boot_iommu info = {};
++    dart.boot_info = &info;
++    dart.batch = calloc(1, PAGE_SIZE);
++    assert(dart.batch);
++    boot_table = 0x80000000;
++    assert(!apif_prepare_table(&dart, 3, 0x2000000, 2) && ncalls == 1);
++    boot_table = 0; found_table = 0x80000000; ncalls = 0;
++    assert(!apif_prepare_table(&dart, 3, 0x2000000, 2) && ncalls == 2);
++    found_table = 0; ncalls = 0;
++    assert(!apif_prepare_table(&dart, 3, 0x2000000, 2) && ncalls == 6);
++    assert(calls[3].selector == AURORA_APIF_SELECTOR(0, 1));
++    assert(calls[3].arg[0] == 0x90000000 && calls[3].arg[1] == 11 && calls[3].arg[2] == 24);
++    assert(calls[4].selector == AURORA_APIF_SELECTOR(3, 0));
++    assert(calls[4].arg[0] == 5 && calls[4].arg[1] == 3 && calls[4].arg[4] == 0x90000000);
++    assert(calls[5].selector == AURORA_APIF_SELECTOR(AURORA_APIF_SERVICE, AURORA_APIF_TAG_FRAME));
++    retype_result = 0; ncalls = 0;
++    assert(apif_prepare_table(&dart, 3, 0, 2) == -EIO && ncalls == 5);
++    assert(calls[4].selector == AURORA_APIF_SELECTOR(AURORA_APIF_SERVICE, AURORA_APIF_FREE_FRAME));
++    retype_result = 1; ncalls = 0;
++    fail_selector = AURORA_APIF_SELECTOR(3, 0); fail_status = -ETIMEDOUT;
++    assert(apif_prepare_table(&dart, 3, 0, 2) == -ETIMEDOUT && dart.ownership_uncertain);
++    assert(apif_ring(&dart) == -EIO && !dart.batch->done);
++    dart.ownership_uncertain = false; fail_selector = 0; ncalls = 0;
++    dart.iova_force = 1ULL << 40;
++    dart.batch->count = 2;
++    for (unsigned i = 0; i < 2; i++) {
++        dart.batch->op[i] = (struct apif_op){ .op = APIF_DART_MAP,
++            .arg = { 3, i * 0x4000, 0x800000 + i * 0x4000, 0x4000, 3 | IOMMU_NOEXEC } };
++    }
++    assert(!apif_ring(&dart) && dart.batch->done == 2 && ncalls == 6);
++    assert(calls[4].selector == AURORA_APIF_SELECTOR(3, 2));
++    assert(calls[4].arg[2] == (1ULL << 40));
++    assert(calls[4].arg[3] == virt_to_phys(dart.page_lists[0]) + SZ_4G);
++    assert(dart.page_lists[0][0] == 0x100800000ULL);
++    assert(calls[4].arg[5] == 4 && dart.batch->op[0].arg[1] == 0);
++    ncalls = 0; native_done = 1;
++    assert(apif_ring(&dart) == -EIO && dart.batch->done == 1);
++    assert(dart.batch->op[0].arg[1] == 0 && dart.batch->op[1].arg[1] == 0x4000);
++    native_done = -1; ncalls = 0;
++    dart.batch->op[0].arg[4] = 256;
++    assert(apif_ring(&dart) == -EINVAL && !ncalls && !dart.batch->done);
++    for (unsigned i = 0; i < APIF_BATCH_MAX_OPS; i++) free(dart.page_lists[i]);
++    free(dart.batch);
++    return 0;
++}
++'''
++
++
++def sart_test():
++    return HEADER + r'''
++struct device {};
++struct mutex { int unused; };
++struct sart_apif {
++    struct device *dev;
++    struct aurora_apif *apif;
++    struct mutex lock;
++    bool active;
++    struct { phys_addr_t address; size_t size; } regions[16];
++};
++struct apple_sart { struct sart_apif *state; };
++#define SART_APIF_MAX_REGIONS 16
++#define apple_sart_backend_data(sart) ((sart)->state)
++#define dma_to_phys(dev,address) (address)
++static struct aurora_apif_op calls[8];
++static unsigned ncalls;
++static u64 unmap_result;
++int aurora_apif_submit(struct aurora_apif *client, struct aurora_apif_op *ops, u32 count, u32 *done)
++{
++    (void)client; (void)done;
++    assert(count == 1);
++    calls[ncalls++] = *ops;
++    ops->ret = U64_MAX;
++    if (ops->selector == AURORA_APIF_SELECTOR(AURORA_APIF_SERVICE, AURORA_APIF_TRANSLATE))
++        ops->ret = ops->arg[0] + SZ_4G;
++    if (ops->selector == AURORA_APIF_SELECTOR(5, 2)) ops->ret = unmap_result;
++    return 0;
++}
++''' + function("drivers/soc/apple/apple-sart-apif.c", "sart_apif_region") + r'''
++int main(void)
++{
++    struct sart_apif state = {};
++    struct apple_sart sart = { &state };
++    assert(sart_apif_region(&sart, 0, 0, true) == -EINVAL);
++    assert(sart_apif_region(&sart, 1, SZ_16K, true) == -EINVAL);
++    assert(!sart_apif_region(&sart, 0x800000, SZ_16K, true));
++    assert(ncalls == 3 && state.active && state.regions[0].size == SZ_16K);
++    assert(calls[2].selector == AURORA_APIF_SELECTOR(5, 1) && calls[2].arg[0] == 0x100800000ULL);
++    ncalls = 0; unmap_result = 1;
++    assert(sart_apif_region(&sart, 0x800000, SZ_16K, false) == -EIO);
++    assert(state.regions[0].size == SZ_16K);
++    ncalls = 0; unmap_result = 0;
++    assert(!sart_apif_region(&sart, 0x800000, SZ_16K, false) && !state.regions[0].size);
++    assert(sart_apif_region(&sart, 0x800000, SZ_16K, false) == -ENOENT);
++    return 0;
++}
++'''
++
++
++def nvme_test():
++    helpers = "\n".join(function("drivers/nvme/host/apple-apif.h", name) for name in
++                         ["apple_nvme_apif_translate", "apple_nvme_apif_request"])
++    return HEADER + r'''
++#define SZ_4K 4096UL
++#define APPLE_NVME_APIF_PAGES 257
++#define APPLE_NVME_APIF_LIST_SIZE SZ_4K
++#define DIV_ROUND_UP(n,d) (((n)+(d)-1)/(d))
++#define IS_ALIGNED(n,a) (!((n)&((a)-1)))
++#define lockdep_assert_held(p) ((void)(p))
++#define dma_wmb() ((void)0)
++#define cpu_to_le16(v) (v)
++#define le64_to_cpu(v) (v)
++typedef uint64_t __le64;
++struct command { struct { struct {u64 prp1, prp2;} dptr; u32 command_id; } common; };
++struct apple_nvmmu_tcb { u32 pad; unsigned short length; char rest[122]; };
++struct apple_nvme_iod { struct command cmd; bool apif_registered; __le64 *prps; };
++struct request { struct apple_nvme_iod iod; u32 bytes; };
++struct apple_nvme_hw { u32 max_queue_depth; };
++struct apple_nvme { void *dev; int lock; struct aurora_apif *apif; struct apple_nvme_hw *hw;
++    struct aurora_apif_op *apif_ops; void *apif_scratch; u64 apif_scratch_dma; bool apif_uncertain; };
++struct apple_nvme_queue { struct apple_nvme *anv; bool is_adminq; struct apple_nvmmu_tcb tcbs[64]; };
++static struct apple_nvme *queue_to_apple_nvme(struct apple_nvme_queue *q) {return q->anv;}
++static struct apple_nvme_iod *blk_mq_rq_to_pdu(struct request *r) {return &r->iod;}
++static u32 nvme_tag_from_cid(u32 tag) {return tag;}
++static u32 blk_rq_payload_bytes(struct request *r) {return r->bytes;}
++static void **apple_nvme_iod_list(struct request *r) {return (void **)&r->iod.prps;}
++static u64 dma_to_phys(void *dev, u64 p) {(void)dev; return p;}
++static int map_calls, translate_calls, mode;
++static struct aurora_apif_op mapped;
++int aurora_apif_submit(struct aurora_apif *apif, struct aurora_apif_op *ops, u32 n, u32 *done) {
++    (void)apif; if(done) *done=n;
++    for(u32 i=0;i<n;i++) {
++        if(ops[i].selector == AURORA_APIF_SELECTOR(AURORA_APIF_SERVICE,AURORA_APIF_TRANSLATE)) {
++            translate_calls++; ops[i].ret=ops[i].arg[0]+(mode==3?SZ_16K:0);
++        } else if(ops[i].selector == AURORA_APIF_SELECTOR(6,1)) {
++            mapped=ops[i]; map_calls++; ops[i].ret=U64_MAX;
++            if(mode==1) return -EIO;
++        } else { assert(ops[i].selector==AURORA_APIF_SELECTOR(6,2)); ops[i].ret=mode==2?0:1; }
++    }
++    return 0;
++}
++''' + helpers + r'''
++int main(void) {
++    struct apple_nvme_hw hw={64};
++    struct aurora_apif_op ops[257];
++    unsigned char scratch[SZ_16K];
++    struct apple_nvme anv={.hw=&hw,.apif_ops=ops,.apif_scratch=scratch,.apif_scratch_dma=0x800000};
++    struct apple_nvme_queue q={.anv=&anv,.is_adminq=true};
++    struct request r={.iod.cmd.common={.dptr={0x100000,0},.command_id=3}};
++    /* A no-payload Create SQ still admits its queue page. MAP is void. */
++    assert(!apple_nvme_apif_request(&q,&r,true));
++    assert(map_calls==1 && mapped.arg[4]==1 && mapped.arg[1]==3);
++    assert(mapped.arg[2]==0x801000 && mapped.arg[3]==0x800000 && r.iod.apif_registered);
++    mode=2; assert(apple_nvme_apif_request(&q,&r,false)==-EIO && r.iod.apif_registered);
++    mode=0; assert(!apple_nvme_apif_request(&q,&r,false) && !r.iod.apif_registered);
++    mode=1; assert(apple_nvme_apif_request(&q,&r,true)==-EIO);
++    assert(r.iod.apif_registered && anv.apif_uncertain);
++    int maps=map_calls; assert(apple_nvme_apif_request(&q,&r,true)==-EIO && map_calls==maps);
++    mode=0; assert(!apple_nvme_apif_request(&q,&r,false)); anv.apif_uncertain=false;
++    mode=3; assert(apple_nvme_apif_request(&q,&r,true)==-EINVAL && map_calls==maps);
++    mode=0; __le64 prps[256]; for(int i=0;i<256;i++) prps[i]=0x200000+(u64)i*SZ_4K;
++    r.bytes=1024*1024; r.iod.prps=prps; r.iod.cmd.common.dptr.prp1=0x100004;
++    assert(!apple_nvme_apif_request(&q,&r,true) && mapped.arg[4]==257);
++    assert(((struct apple_nvmmu_tcb *)(scratch+SZ_4K))->length==255);
++    assert(translate_calls>=257);
++    return 0;
++}
++'''
++
++
++def pcie_test():
++    layout = (ROOT / "drivers/pci/controller/apple-apif/t6050_pcie_sequence.h").read_text()
++    gpio = (ROOT / "drivers/pci/controller/apple-apif/t6050_pcie_gpio.h").read_text()
++    layout = "\n".join(x for x in (layout + gpio).splitlines() if not x.startswith("#include"))
++    helpers = "\n".join(function("drivers/pci/controller/apple-apif/" + file, name) for file, name in
++                         [("t6050_pcie_msi.c", "t6050_pcie_configure_msi_port0"),
++                          ("t6050_pcie_gpio.c", "t6050_pcie_gpio_perst"),
++                          ("t6050_pcie_disable.c", "update"),
++                          ("t6050_pcie_disable.c", "t6050_pcie_disable_port0")])
++    return HEADER + layout + "\n" + helpers + r'''
++static u32 pad, address_lo, address_hi;
++static int writes, fail_write, power_calls, polls;
++static int fake_read(void *ctx,unsigned reg,unsigned off,u32 *v) {
++    (void)ctx;(void)reg;(void)off;*v=0;return 0;
++}
++static int fake_write(void *ctx,unsigned reg,unsigned off,u32 v) {
++    (void)ctx;assert(reg==T6050_PCIE_PORT0);writes++;
++    if(fail_write==writes) return -EIO;
++    if(off==0x16c) address_lo=v;
++    if(off==0x170) address_hi=v;
++    return 0;
++}
++static int fake_poll(void *ctx,unsigned reg,unsigned off,u32 mask,u32 value,unsigned timeout) {
++    (void)ctx;(void)reg;(void)off;(void)mask;(void)value;
++    assert(timeout>0 && timeout<=250000);polls++;return -ETIMEDOUT;
++}
++static void fake_delay(void *ctx,unsigned us) {(void)ctx;assert(us<=100000);}
++static int power(void *ctx,bool on) {(void)ctx;assert(!on);power_calls++;return -EBUSY;}
++static int pad_read(void *ctx,u32 *v) {(void)ctx;*v=pad;return 0;}
++static int pad_write(void *ctx,u32 v) {(void)ctx;pad=v;writes++;return 0;}
++int main(void) {
++    struct t6050_pcie_io io={.read=fake_read,.write=fake_write,.poll=fake_poll,.delay=fake_delay};
++    assert(!t6050_pcie_configure_msi_port0(&io,0x1fffff000ULL,64));
++    assert(writes==67 && address_hi==1 && address_lo==0xfffff000);
++    writes=0;fail_write=2;
++    assert(t6050_pcie_configure_msi_port0(&io,0xfffff000,32)==-EIO && writes==2);
++    writes=0;assert(t6050_pcie_configure_msi_port0(&io,1,32)==-EINVAL && !writes);
++    assert(t6050_pcie_configure_msi_port0(&io,0xfffff000,257)==-EINVAL);
++    assert(t6050_pcie_disable_port0(&io,power,250000)==-EBUSY);
++    assert(power_calls==1 && !writes && !polls);
++    struct t6050_gpio_pad_io g={.read=pad_read,.write=pad_write};
++    pad=1U<<21;assert(t6050_pcie_gpio_perst(&g,true)==-EIO && !writes);
++    pad=0;assert(!t6050_pcie_gpio_perst(&g,true) && (pad&0x27f)==0x202);
++    assert(!t6050_pcie_gpio_perst(&g,false) && (pad&0x27f)==0x203);
++    return 0;
++}
++'''
++
++
++def run_tests(tests):
++    compiler = shlex.split(os.environ.get("HOSTCC", "cc"))
++    print(f"TAP version 13\n1..{len(tests)}", flush=True)
++    with tempfile.TemporaryDirectory(prefix="apif-selftest-") as directory:
++        for i, (name, test) in enumerate(tests, 1):
++            path = Path(directory) / name
++            path.with_suffix(".c").write_text(test())
++            subprocess.run(compiler + ["-std=gnu11", "-Wall", "-Wextra", "-Werror",
++                                       str(path.with_suffix(".c")), "-o", str(path)], check=True)
++            subprocess.run([str(path)], check=True)
++            print(f"ok {i} - {name} production function", flush=True)
++
++
++if __name__ == "__main__":
++    run_tests([("transport", transport_test), ("dart", dart_test), ("sart", sart_test)])
+diff --git a/tools/testing/selftests/aurora-apif/common.py b/tools/testing/selftests/aurora-apif/common.py
+new file mode 100644
+index 000000000000..3476376b8026
+--- /dev/null
++++ b/tools/testing/selftests/aurora-apif/common.py
+@@ -0,0 +1,19 @@
++# SPDX-License-Identifier: GPL-2.0-only
++"""Production-source extraction shared by the APIF host tests."""
++import re
++
++def block(source, pattern):
++    match = re.search(pattern, source, re.M)
++    if not match:
++        raise RuntimeError(f"missing production block {pattern}")
++    start = match.start()
++    brace = source.index("{", match.end())
++    depth = 0
++    for pos in range(brace, len(source)):
++        if source[pos] == "{":
++            depth += 1
++        elif source[pos] == "}":
++            depth -= 1
++            if not depth:
++                return source[start:pos + 1]
++    raise RuntimeError("unterminated production block")
+diff --git a/tools/testing/selftests/aurora-apif/dart_retained.py b/tools/testing/selftests/aurora-apif/dart_retained.py
+new file mode 100755
+index 000000000000..a7c6f3c4d560
+--- /dev/null
++++ b/tools/testing/selftests/aurora-apif/dart_retained.py
+@@ -0,0 +1,53 @@
++#!/usr/bin/env python3
++# SPDX-License-Identifier: GPL-2.0-only
++"""Execute the production DART stream-state operation builder with retained SIDs."""
++from pathlib import Path
++import subprocess,tempfile,sys
++root=Path(__file__).resolve().parents[4]
++p=Path(sys.argv[1]) if len(sys.argv)>1 else root/'drivers/iommu/apple-dart-apif.c'
++s=p.read_text();start=s.index('\t\tcase APIF_DART_ENABLE:');end=s.index('\t\tcase 7:',start);fragment=s[start:end]
++code=r'''
++#include <assert.h>
++#include <stdbool.h>
++#include <stdint.h>
++#include <stdio.h>
++typedef uint64_t u64;
++#define APIF_DART_ENABLE 5
++#define APIF_DART_DISABLE 6
++#define AURORA_APIF_SELECTOR(t,e) (((u64)(t)<<32)|(e))
++#define EINVAL 22
++struct apple_dart_apif { unsigned dart_id,num_streams;void *retained[256]; };
++struct apif_op { unsigned op;u64 arg[6]; };
++struct aurora_apif_op { u64 selector,arg[6],ret; };
++static int build(struct apple_dart_apif *dart,unsigned opcode,u64 sid,unsigned *count,struct aurora_apif_op *native) {
++ struct apif_op request={.op=opcode,.arg={sid}};struct apif_op *op=&request;u64 *a=op->arg;
++ struct aurora_apif_op call={.arg={dart->dart_id,sid}};unsigned n=0;int ret=0;
++ switch(op->op) {
++''' + fragment + r'''
++ default:assert(false);
++ }
++out:*count=n;return ret;
++}
++int main(void) {
++ const unsigned sizes[]={1,16,256};unsigned checked=0;
++ for(unsigned k=0;k<3;k++) {
++  struct apple_dart_apif d={.dart_id=16,.num_streams=sizes[k]};
++  for(unsigned sid=0;sid<d.num_streams;sid++)d.retained[sid]=sid%3==0?(void *)1:0;
++  for(unsigned sid=0;sid<d.num_streams;sid++)for(unsigned op=5;op<=6;op++) {
++   unsigned n=99;struct aurora_apif_op out[2]={0};assert(build(&d,op,sid,&n,out)==0);
++   if(d.retained[sid])assert(n==0);
++   else {assert(n==1);assert(out[0].selector==AURORA_APIF_SELECTOR(3,op==5?8:7));assert(out[0].arg[0]==16&&out[0].arg[1]==sid);}
++   checked++;
++  }
++  for(unsigned op=5;op<=6;op++)for(unsigned invalid=0;invalid<2;invalid++) {
++   unsigned n=99;struct aurora_apif_op out[2]={0};u64 sid=invalid?UINT64_MAX:d.num_streams;
++   assert(build(&d,op,sid,&n,out)==-EINVAL);assert(n==0);checked++;
++  }
++ }
++ printf("DART retained/native stream-state contracts pass (%u requests)\n",checked);
++}
++'''
++with tempfile.TemporaryDirectory(prefix='m5-dart-retained-') as tmp:
++ t=Path(tmp);(t/'test.c').write_text(code)
++ subprocess.run(['cc','-std=gnu11','-fsanitize=address,undefined','-fno-omit-frame-pointer',str(t/'test.c'),'-o',str(t/'test')],check=True)
++ subprocess.run([str(t/'test')],check=True)
+-- 
+2.56.0
+

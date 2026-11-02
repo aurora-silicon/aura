@@ -1,0 +1,1029 @@
+#!/bin/busybox sh
+# SPDX-License-Identifier: GPL-2.0-only
+/bin/busybox --install -s /bin 2>/dev/null
+# sshd sessions get PATH /usr/local/sbin:/usr/local/bin:/usr/bin, without /bin; existing files are kept
+/bin/busybox --install -s /usr/bin 2>/dev/null
+mount -t devtmpfs dev /dev 2>/dev/null
+mount -t proc proc /proc 2>/dev/null
+mount -t sysfs sys /sys 2>/dev/null
+say() { echo "$1" > /dev/kmsg; }
+/tso-probe
+say "TSO-INIT: $(grep -m1 'CPU part' /proc/cpuinfo)"
+# M2 on the screen: timer count must advance, checked without sleep so a dead timer still reports
+ticks() { set -- $(grep -m1 arch_timer /proc/interrupts); echo "${2:-0}"; }
+t0=$(ticks)
+i=0; while [ $i -lt 300000 ]; do i=$((i+1)); done
+t1=$(ticks)
+insmod /lib/modules/macho-diag.ko 2>/dev/null
+# never hold here: a stuck timer still lets every later step name where it stops
+if [ "$t1" -gt "$t0" ]; then say "M2: timer ok $t0 to $t1"; timer=1; else say "M2: timer stuck at $t1, going on"; timer=; fi
+wait10ms() { if [ -n "$timer" ]; then usleep 10000; else j=0; while [ $j -lt 3000 ]; do j=$((j+1)); done; fi; }
+insmod /lib/modules/macho-diag.ko 2>/dev/null
+# F26: reset at 127.87 s with apple_wdt in the kernel. State of the block on the screen, reset enable off from the guest.
+say "WDT: driver $(ls /sys/bus/platform/drivers/apple-watchdog 2>/dev/null | grep -c watchdog) class $(ls /sys/class/watchdog 2>/dev/null | tr '\n' ' ')"
+insmod /lib/modules/macho-wdt.ko 2>/dev/kmsg; say "WDT: insmod rc=$?"
+# a silent screen must tell a stopped kernel from a long step
+( while :; do sleep 10; say "HB up=$(cut -d' ' -f1 /proc/uptime) ticks=$(ticks)"; done ) &
+hb_pid=$!
+for m in overlay macsmc-hwmon nvme-apple; do insmod /lib/modules/$m.ko 2>/dev/kmsg; done
+say "FANS: $(cat /sys/class/thermal/thermal_zone0/type 2>/dev/null) $(cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null) mC, cooling devices $(ls /sys/class/thermal | grep -c cooling)"
+# The monitor turns "mhold-pci" into "okay\0-pci": the first string is the status, as for the kernel.
+# Order: a stop keeps the lines of the steps before it. ADT, read-only NVMe matrix, SMP, the matrix again on all cores, then USB, Wi-Fi, TSO and KVM in an order drawn per boot (below),
+# mount, switch_root. vGIC is a later step of the sequencer: a stop there must not cost the desktop.
+# A step in D must not hold the boot: it runs aside, after its limit the boot goes on and the panel names what the step is doing. A panic of SPTM or a stuck core is not covered.
+# Every thread: a worker of tso-matrix or macho-kvm-test can sit in D or spin while main waits in join. R only for user tasks: flags field, PF_KTHREAD; cmdline would take mmap_lock and could hang here.
+d_dump() {
+  for q in /proc/[0-9]*/task/[0-9]*; do
+    s=$(cat $q/stat 2>/dev/null); [ -n "$s" ] || continue
+    c=${s#*\(}; c=${c%\)*}
+    set -- ${s##*) }
+    case "$1" in
+      D) ;;
+      R) [ $(( $7 & 0x200000 )) = 0 ] || continue ;;
+      *) continue ;;
+    esac
+    say "$n: task ${q##*/} ($c) state $1 cpu ${37} wchan $(cat $q/wchan 2>/dev/null) $(head -n3 $q/stack 2>/dev/null | tr '\n' ' ')"
+  done
+}
+bounded() {
+  n=$1; lim=$2; shift 2
+  "$@" &
+  p=$!
+  bpids="$bpids $p"
+  i=0; while [ $i -lt $lim ] && kill -0 $p 2>/dev/null; do sleep 1; i=$((i+1)); done
+  # aside as well: the dump reads what a stuck task may hold
+  if kill -0 $p 2>/dev/null; then say "$n: still running after $lim s, going on"; d_dump & fi
+}
+irq_dump() { grep -E 'arch_timer|IPI[0-6]:' /proc/interrupts | while IFS= read -r l; do say "IRQ $1: $l"; done
+  say "AIC2 per cpu $1: $(awk '/AIC2/{for(i=2;i<=15;i++)s[i]+=$i} END{for(i=2;i<=15;i++)printf "%d ",s[i]}' /proc/interrupts)"; }
+say "STEP: adt"
+insmod /lib/modules/macho-adt.ko 2>/dev/kmsg; say "ADT: insmod rc=$? $(wc -c < /proc/macho-adt) B sha256 $(sha256sum < /proc/macho-adt | cut -c1-16)"
+# Properties that switch SPTM and XNU branches and that the static tree lacks; on the panel, so a run without any link still tells.
+cp /proc/macho-adt /run/macho-adt.bin 2>/dev/null
+a=; for p in nvme-tl-wa nvme-vdma-wa nvme-prp-flush-wa nvme-secure-reg-layout nvme-ans-sha-present nvme-num-sl debug-enabled gpu-iouat awl-scratch-supported apt-carveout-size-mb effective-production-status-ap; do grep -qa "$p" /run/macho-adt.bin && a="$a $p"; done
+say "ADT: props$a"
+say "STEP: nvme-matrix"
+i=0; while [ ! -b /dev/nvme0n1 ] && [ $i -lt 100 ]; do sleep 0.1; i=$((i+1)); done
+[ -b /dev/nvme0n1 ] && /macho-nvme-matrix -k >/dev/null || say "NVME-MX: rc=$? device $(ls /dev/nvme0n1 2>/dev/null)"
+# dart_up 392f00000 USB: a unit probes only if its name is in apif_only. Who comes first loads the driver, the order is drawn per boot: the next adds its unit.
+dart_up() {
+  if [ -e /sys/module/apple_dart_apif ]; then
+    say "$2: apple-dart-apif loaded, adding iommu@$1"
+    echo "$(cat /sys/module/apple_dart_apif/parameters/apif_only),$1.iommu,iommu@$1" > /sys/module/apple_dart_apif/parameters/apif_only
+    for d in iommu@$1 $1.iommu; do [ -e /sys/bus/platform/devices/$d ] && echo $d > /sys/bus/platform/drivers_probe; done
+  else
+    say "$2: insmod apple-dart-apif"
+    insmod /lib/modules/apple-dart-apif.ko apif_only=$1.iommu,iommu@$1 2>/dev/kmsg; say "$2: dart rc=$?"
+  fi
+  say "$2: dart driver $(ls /sys/bus/platform/drivers/apple-dart-apif 2>/dev/null | grep iommu | tr '\n' ' ')"
+}
+# usb-drd2 as a device for Hypnos: the kernel log goes out on ttyGS0 (console=), ACM carries a shell, EEM an address for sshd.
+usb_up() {
+  [ "$(tr '\0' '\n' < /sys/firmware/devicetree/base/iommu@392f00000/status 2>/dev/null | head -n1)" = okay ] || { say "USB: not enabled by the monitor"; return; }
+  dart_up 392f00000 USB
+  # a master probed before its unit carries on without an IOMMU (deferred probe timeout 0, HW F26 dwc3-apple): direct DMA, -110 on the host, nothing named
+  [ -e /sys/bus/platform/drivers/apple-dart-apif/iommu@392f00000 ] || [ -e /sys/bus/platform/drivers/apple-dart-apif/392f00000.iommu ] || { say "USB: DART not bound, no master"; return; }
+  left_hold
+  while read -r m; do [ -f /lib/modules/$m.ko ] || continue; a=; case $m in dwc3) a=j616s_skip_empty_starttransfer=1;; usb_f_acm) a=j616s_suppress_notifications=1;; esac; say "USB: insmod $m $a"; insmod /lib/modules/$m.ko $a 2>/dev/kmsg; say "USB: $m rc=$?"; done < /lib/modules/usb.order
+  i=0; while [ ! -e /sys/class/udc/392280000.usb ] && [ $i -lt 50 ]; do sleep 0.1; i=$((i+1)); done
+  [ -e /sys/class/udc/392280000.usb ] || { say "USB: no UDC 392280000.usb"; return; }
+  mount -t configfs none /sys/kernel/config 2>/dev/kmsg
+  g=/sys/kernel/config/usb_gadget/macho
+  mkdir -p $g/strings/0x409 $g/configs/c.1/strings/0x409 $g/functions/acm.GS0 $g/functions/eem.usb0
+  echo 0x0525 > $g/idVendor; echo 0xa4a7 > $g/idProduct
+  echo macho > $g/strings/0x409/serialnumber; echo macho-tso > $g/strings/0x409/manufacturer; echo "macho console" > $g/strings/0x409/product
+  echo "ACM + EEM" > $g/configs/c.1/strings/0x409/configuration; echo 0xc0 > $g/configs/c.1/bmAttributes; echo 2 > $g/configs/c.1/MaxPower
+  ln -s $g/functions/acm.GS0 $g/configs/c.1/acm.GS0; ln -s $g/functions/eem.usb0 $g/configs/c.1/eem.usb0
+  echo 392280000.usb > $g/UDC; say "USB: gadget bound rc=$? state $(cat /sys/class/udc/392280000.usb/state 2>/dev/null)"
+  sleep 3; say "USB: after 3 s state $(cat /sys/class/udc/392280000.usb/state 2>/dev/null) typec $(ls /sys/class/typec 2>/dev/null | tr '\n' ' ') role $(cat /sys/class/usb_role/*/role 2>/dev/null | tr '\n' ' ')"
+  say "USB: iommu group $(basename "$(readlink /sys/bus/platform/devices/392280000.usb/iommu_group)" 2>/dev/null) type $(cat /sys/bus/platform/devices/392280000.usb/iommu_group/type 2>/dev/null)"
+  say "USB: irq $(grep -E 'dwc3|sn201202x|spmi' /proc/interrupts | tr -s ' ' | tr '\n' ';')"
+  n=$(cat $g/functions/eem.usb0/ifname 2>/dev/null); ip link set lo up; ip addr add 192.168.77.2/24 dev "$n" 2>/dev/kmsg; ip link set "$n" up 2>/dev/kmsg
+  setsid sh -c 'while :; do sh -i; sleep 1; done' </dev/ttyGS0 >/dev/ttyGS0 2>&1 &
+  echo $! > /run/usb-shell
+  mkdir -p /dev/pts /run /var/empty; mount -t devpts devpts /dev/pts 2>/dev/null
+  /usr/bin/sshd -f /etc/ssh/sshd_config 2>/dev/kmsg; say "USB: sshd rc=$? on 192.168.77.2:22, iface $n"
+}
+# F33 IO first: ACM only (no EEM, no kernel console on ttyGS0). ACM 0 carries a shell, ACM 1 the kernel log read from /dev/kmsg by
+# a user process: a stall in the USB path stops that process, never printk or the panel. Every sub-step is named on the panel
+# before it runs, so the last line says which one stopped. EEM is a separate, later step (/macho-eem-up), run from the shell.
+# F38: the left masters stay unbound until their own DART unit is bound (dwc3-apple here and udev coldplug would bind them
+# without an IOMMU: HW klog-110353/112016/113158 no iommu group for 382280000/38a280000.usb, xHCI DMA through an unmapped DART)
+left_hold() { for u in 382280000 38a280000; do [ -e /sys/bus/platform/devices/$u.usb/driver_override ] && echo macho-hold > /sys/bus/platform/devices/$u.usb/driver_override; done; }
+usb_acm_up() {
+  [ "$(tr '\0' '\n' < /sys/firmware/devicetree/base/iommu@392f00000/status 2>/dev/null | head -n1)" = okay ] || { say "USB-A: not enabled by the monitor"; return; }
+  say "USB-A: dart up"; dart_up 392f00000 USB
+  [ -e /sys/bus/platform/drivers/apple-dart-apif/iommu@392f00000 ] || [ -e /sys/bus/platform/drivers/apple-dart-apif/392f00000.iommu ] || { say "USB-A: DART not bound, no master"; return; }
+  left_hold
+  while read -r m; do [ -f /lib/modules/$m.ko ] || continue; [ "$m" = usb_f_eem ] && continue; a=; case $m in dwc3) a=j616s_skip_empty_starttransfer=1;; usb_f_acm) a=j616s_suppress_notifications=1;; esac; say "USB-A: insmod $m $a"; insmod /lib/modules/$m.ko $a 2>/dev/kmsg; say "USB-A: $m rc=$?"; done < /lib/modules/usb.order
+  i=0; while [ ! -e /sys/class/udc/392280000.usb ] && [ $i -lt 50 ]; do sleep 0.1; i=$((i+1)); done
+  [ -e /sys/class/udc/392280000.usb ] || { say "USB-A: no UDC 392280000.usb"; return; }
+  mount -t configfs none /sys/kernel/config 2>/dev/kmsg
+  g=/sys/kernel/config/usb_gadget/macho
+  mkdir -p $g/strings/0x409 $g/configs/c.1/strings/0x409 $g/functions/acm.GS0 $g/functions/acm.GS1
+  echo 0x0525 > $g/idVendor; echo 0xa4a7 > $g/idProduct
+  echo macho > $g/strings/0x409/serialnumber; echo macho-tso > $g/strings/0x409/manufacturer; echo "macho console" > $g/strings/0x409/product
+  echo "ACM shell + ACM log" > $g/configs/c.1/strings/0x409/configuration; echo 0xc0 > $g/configs/c.1/bmAttributes; echo 2 > $g/configs/c.1/MaxPower
+  ln -s $g/functions/acm.GS0 $g/configs/c.1/acm.GS0; ln -s $g/functions/acm.GS1 $g/configs/c.1/acm.GS1
+  say "USB-A: binding UDC"; echo 392280000.usb > $g/UDC; say "USB-A: gadget bound rc=$? state $(cat /sys/class/udc/392280000.usb/state 2>/dev/null)"
+  i=0; while [ "$(cat /sys/class/udc/392280000.usb/state 2>/dev/null)" != configured ] && [ $i -lt 100 ]; do sleep 0.1; i=$((i+1)); done
+  say "USB-A: state $(cat /sys/class/udc/392280000.usb/state 2>/dev/null) after $i x 100 ms, iommu group $(basename "$(readlink /sys/bus/platform/devices/392280000.usb/iommu_group)" 2>/dev/null)"
+  say "USB-A: opening ttyGS0 (16 OUT requests mapped FROM_DEVICE, first host-to-device writes only when Hypnos types)"
+  setsid sh -c 'while :; do sh -i; sleep 1; done' </dev/ttyGS0 >/dev/ttyGS0 2>&1 &
+  echo $! > /run/usb-shell
+  sleep 1; say "USB-A: shell on ttyGS0 started, HB follows"
+  say "USB-A: starting the log pump /dev/kmsg -> ttyGS1"
+  setsid sh -c 'while :; do cat /dev/kmsg; sleep 1; done' </dev/null >/dev/ttyGS1 2>/dev/null &   # cat ends on EPIPE after a ring overrun: restart, the next read goes on
+  echo $! > /run/usb-log
+  sleep 1; say "USB-A: log pump running, IO up; EEM: run /macho-eem-up from the shell"
+}
+# M3 before Wi-Fi: secondaries one by one, the line names the core if the machine stops. Same order and 90 C guard as macho-status. Kernel cmdline macho.nosmp skips it.
+temp_max() { cat /sys/class/thermal/thermal_zone*/temp 2>/dev/null | sort -n | tail -1; }
+smp_early() {
+  grep -qw macho.nosmp /proc/cmdline && { say "SMP: skipped, macho.nosmp"; return; }
+  cpus="1 9 5 2 10 6 3 11 7 4 12 8 13"; grep -qwE 'macho.litmus|macho.reliable|macho.io|macho.e2e|macho.final' /proc/cmdline && cpus="1 9 5 2"   # e2e (F34), final (F35): the rest in the sequencer
+  [ "$1" = rest ] && cpus="10 6 3 11 7 4 12 8 13"
+  for c in $cpus; do
+    t=$(temp_max)
+    if [ -n "$t" ] && [ "$t" -gt 90000 ]; then say "SMP: stop before cpu$c, $t mC above 90000"; break; fi
+    if [ -z "$t" ] && [ $c != 1 ] && [ $c != 9 ] && [ $c != 5 ]; then say "SMP: no temperature reading, stop at the litmus cores"; break; fi
+    say "SMP: next cpu$c, $t mC, online $(cat /sys/devices/system/cpu/online)"
+    sync
+    echo 1 > /sys/devices/system/cpu/cpu$c/online; rc=$?
+    say "SMP: cpu$c rc=$rc online=$(cat /sys/devices/system/cpu/cpu$c/online) all $(cat /sys/devices/system/cpu/online)"
+    [ "$rc" = 0 ] || { say "SMP: cpu$c failed, no further CPUs"; break; }
+  done
+  say "SMP: finished, online $(cat /sys/devices/system/cpu/online), $(temp_max) mC"
+}
+say "STEP: smp"
+smp_early
+irq_dump smp
+# ep1 on one core and ep2 on another, the completion IRQ after hotplug, waiting on the monitor's APIF lock: nothing measured them before the root needs them
+say "STEP: nvme-matrix-smp"
+if [ -b /dev/nvme0n1 ]; then bounded NVME-MX 90 /macho-nvme-matrix -k >/dev/null; else say "NVME-MX: no disk"; fi
+# idle=nop: every online core spins until the desktop's guard runs; the same guard here, stopped before switch_root
+thermal_early() {
+  while :; do
+    t=$(temp_max)
+    if [ -n "$t" ] && [ "$t" -gt 95000 ]; then
+      say "THERMAL: $t mC above 95000, offlining all secondaries"
+      for c in 13 12 11 10 9 8 7 6 5 4 3 2 1; do [ "$(cat /sys/devices/system/cpu/cpu$c/online 2>/dev/null)" = 1 ] && echo 0 > /sys/devices/system/cpu/cpu$c/online; done
+    elif [ -n "$t" ] && [ "$t" -gt 90000 ]; then
+      say "THERMAL: $t mC above 90000, offlining the nine extra cores, litmus cores 1 2 5 9 stay"
+      for c in 13 12 11 10 8 7 6 4 3; do [ "$(cat /sys/devices/system/cpu/cpu$c/online 2>/dev/null)" = 1 ] && echo 0 > /sys/devices/system/cpu/cpu$c/online; done
+    fi
+    sleep 10
+  done
+}
+thermal_early &
+thermal_pid=$!
+# F26 stayed on the TSO step until the reset at 128 s: never wait on it unbounded, a task in D would hold a plain timeout for ever
+tso_run() {
+  say "TSO-MX: exec tso-matrix -e (pins below name each core before and after)"
+  timeout 15 /tso-matrix -e 2>&1 | while read -r l; do say "$l"; done; irq_dump el0
+  timeout 45 /tso-matrix -q 2>&1 | while read -r l; do say "$l"; done; irq_dump tso; say "TSO-MX: init slice ended"
+}
+kvm_early() {
+  echo 1 > /sys/kernel/macho_kvm/enable 2>/dev/kmsg || { say "KVM: enable failed $(cat /sys/kernel/macho_kvm/status 2>/dev/null)"; return; }
+  say "KVM: run 1, no vGIC"; timeout 60 /macho-kvm-test --no-vgic --expect-tso 2>&1 | while read -r l; do say "$l"; done
+  say "KVM: run 1 ended"
+}
+step_usb() { say "STEP: usb"; bounded USB 40 usb_up; }
+step_wifi() { say "STEP: wifi"; bounded NET 150 wifi_ssh_up; }
+step_tso() { say "STEP: tso"; bounded TSO-MX 65 tso_run; }
+step_kvm() { say "STEP: kvm"; bounded KVM 70 kvm_early; }
+# === initrd Wi-Fi + SSH, BEFORE the NVMe root wait, so a direct shell exists even if the NVMe root never mounts.
+# Independent of NVMe: brings up the PCIe DART (the HW make-or-break), brcmfmac Wi-Fi, a static IP and sshd.
+# This also FIRST-TESTS the DART/Wi-Fi path on real HW (macho-net only ran after switch_root, which NVMe blocks).
+wifi_ssh_up() {
+  say "NET: initrd Wi-Fi+SSH (NVMe-independent) start up=$(cut -d' ' -f1 /proc/uptime)"
+  mkdir -p /dev/pts /run/wpa_supplicant /var/empty /run
+  mount -t devpts devpts /dev/pts 2>/dev/null
+  if [ "$(tr '\0' '\n' < /sys/firmware/devicetree/base/iommu@410000000/status 2>/dev/null | head -n1)" != okay ]; then
+    say "NET: PCIe DART node not enabled by the monitor, Wi-Fi skipped"; return
+  fi
+  dart_up 410000000 NET
+  # INIT, POWERUP and attach of SID 1, 2 run inside insmod pcie-apple (enumeration). A master before its unit carries on without an IOMMU (HW F26 dwc3-apple)
+  [ -e /sys/bus/platform/drivers/apple-dart-apif/iommu@410000000 ] || [ -e /sys/bus/platform/drivers/apple-dart-apif/410000000.iommu ] || { say "NET: DART not bound, no master"; return; }
+  # F34: module parameters for pcie-macho-init from the ACM shell, e.g. `echo 'xnu_order=1 xnu_phy=1 ps_strict=0' > /run/macho-pmi-args` before `echo wifi > /run/macho-cmd`
+  pmi_args=$(cat /run/macho-pmi-args 2>/dev/null); [ -n "$pmi_args" ] && say "NET: pcie-macho-init args: $pmi_args"
+  # a second attempt with other parameters: the unbound module goes out first (pcie-apple was never loaded in that case, see the guard below)
+  if [ -e /sys/module/pcie_macho_init ] && ! [ -e /sys/bus/platform/drivers/pcie-macho-init/pcie-macho-init ]; then rmmod pcie-macho-init 2>/dev/kmsg; say "NET: unbound pcie-macho-init removed for a retry rc=$?"; fi
+  for m in pcie-macho-init pcie-apple cfg80211 brcmutil brcmfmac brcmfmac-wcc; do
+    a=; [ "$m" = pcie-macho-init ] && a=$pmi_args
+    [ -f /lib/modules/$m.ko ] && { insmod /lib/modules/$m.ko $a 2>/dev/kmsg; say "NET: $m rc=$?"; }
+    # insmod returns 0 even when the probe fails: pcie-apple must not touch a host the init did not prepare (unpowered block = bus stall)
+    [ $m = pcie-macho-init ] && ! [ -e /sys/bus/platform/drivers/pcie-macho-init/pcie-macho-init ] && {
+      say "NET: pcie-macho-init did not bind, last: $(dmesg | grep -E 'pcie-macho-init' | tail -2 | cut -c1-150 | tr '\n' ' ')"; say "NET: pcie-apple not loaded"; return; }
+  done
+  # brcmfmac registers wlan0; wld0 is the name udev gives it on the installed system, and the initrd has no udev
+  w=
+  for i in $(seq 1 40); do
+    for n in /sys/class/net/*; do [ -d "$n/wireless" ] && w=${n##*/}; done
+    [ -n "$w" ] && break; sleep 1
+  done
+  [ -n "$w" ] && [ "$w" != wld0 ] && { ip link set dev "$w" name wld0 2>/dev/kmsg; say "NET: renamed $w to wld0 rc=$?"; }
+  say "NET: ifaces $(ls /sys/class/net 2>/dev/null | tr '\n' ' ')"
+  [ -d /sys/class/net/wld0 ] || { say "NET: no wld0, Wi-Fi hardware did not come up"; return; }
+  ip link set wld0 up 2>/dev/kmsg
+  /usr/bin/wpa_supplicant -i wld0 -c /etc/wpa/wpa.conf -B 2>/dev/kmsg; say "NET: wpa rc=$?"
+  for i in $(seq 1 30); do
+    s=$(cat /sys/class/net/wld0/operstate 2>/dev/null); [ "$s" = up ] && break; sleep 1
+  done
+  ip addr add 192.168.1.131/24 dev wld0 2>/dev/kmsg
+  ip route add default via 192.168.1.1 2>/dev/kmsg
+  say "NET: wld0 $(ip -4 addr show wld0 2>/dev/null | grep -o 'inet [0-9./]*') oper=$(cat /sys/class/net/wld0/operstate 2>/dev/null)"
+  [ -n "$(cat /run/usb-shell 2>/dev/null)" ] || /usr/bin/sshd -f /etc/ssh/sshd_config 2>/dev/kmsg; say "NET: sshd rc=$? on 192.168.1.131:22"
+}
+insmod /lib/modules/macho-ipi.ko 2>/dev/kmsg; say "IPI: insmod rc=$?"
+insmod /lib/modules/macho-tso.ko 2>/dev/kmsg; say "TSO: knob insmod rc=$? set $(cat /sys/kernel/macho_tso/set 2>/dev/null) clear $(cat /sys/kernel/macho_tso/clear 2>/dev/null) (XNU state: echo 0x12 > set; echo 0xe00 > clear)"
+if grep -qw macho.io /proc/cmdline; then
+  say "IO: mode on - ACM shell + ACM log first; no EEM, Wi-Fi, NVMe root, TSO or KVM until a remote command asks"
+  usb_acm_up
+  say "IO: holding; remote steps: /macho-pinstep, /tso-matrix, /tso_litmus, /macho-eem-up"
+  while :; do sleep 20; say "HB up=$(cut -d' ' -f1 /proc/uptime) ticks=$(ticks) io-hold online $(cat /sys/devices/system/cpu/online) udc $(cat /sys/class/udc/392280000.usb/state 2>/dev/null)"; done
+fi
+if grep -qw macho.litmus /proc/cmdline; then
+  say "LITMUS: mode on - usb-ssh + litmus only, no wifi/nvme/kvm (ssh root@192.168.77.2)"
+  step_usb
+  step_tso; step_tso
+  say "LITMUS: runs done, holding with USB-SSH up"
+  while :; do sleep 20; say "HB up=$(cut -d' ' -f1 /proc/uptime) ticks=$(ticks) litmus-hold online $(cat /sys/devices/system/cpu/online)"; done
+fi
+rel=; grep -qw macho.reliable /proc/cmdline && { rel=1; say "RELIABLE: no USB, Wi-Fi, DART or KVM; straight to the NVMe root and the desktop, TSO litmus in the desktop (sequencer step tso)"; }
+# Any of USB, Wi-Fi, TSO and KVM can be the first to stop the machine, and a stop hides what comes after it: the order differs by boot, a plain power cycle draws again (no 1TR).
+# Order 3 goes straight to the root: Wi-Fi, TSO and KVM run in the sequencer, USB not at all, so the desktop is seen even when one of them stops every boot it runs in.
+mkdir -p /run
+draw=$(( $(cut -d. -f2 /proc/uptime | cut -d' ' -f1 | sed 's/^0*//;s/^$/0/') % 4 ))
+[ -n "$rel" ] && draw=3
+# e2e: one fixed order, no draw. Steps HW-proven in F31 ran above (adt, nvme-matrix, smp, ipi). The TSO answer comes first and
+# short, so a later stop cannot hide it; USB IO next, then a hold in which the remote session drives steps over that IO
+# (write litmus, wifi, tso or kvm to /run/macho-cmd, touch /run/macho-go to go on; any command runs directly in the ACM shell); without a command the order goes on by itself.
+e2e=; grep -qw macho.e2e /proc/cmdline && e2e=1
+# final (F35): every step HW-proven on F34 (11-02), in its proven order, without the hold and without the long TSO runs
+fin=; grep -qw macho.final /proc/cmdline && fin=1
+litmus_i() {   # pair, iterations: TSO off is the positive control
+  say "LITMUS: start pair cpu$1 cpu$2, $3 iterations per test"
+  /tso_litmus "$1" "$2" "$3" > /run/litmus-$1-$2.log 2>&1; rc=$?
+  grep -E 'pinned|\[probe\]|MP forbidden|SB outcome|DEFAULT MP|TSO     MP|TSO     SB|XNU     MP|XNU     SB|>>>' /run/litmus-$1-$2.log | cut -c1-110 | while read -r l; do say "LITMUS $1-$2: $l"; done
+  say "LITMUS-RESULT pair $1-$2 rc=$rc (0 TSO ordered, 1 TSO NOT enforced, 2 no prctl, 3 inconclusive, 4 only the XNU state 0x12/~0xe00 orders)"
+}
+litmus_run() { for p in "1 9" "5 9" "1 2"; do set -- $p; [ "$(cat /sys/devices/system/cpu/cpu$1/online 2>/dev/null)" = 1 ] && [ "$(cat /sys/devices/system/cpu/cpu$2/online 2>/dev/null)" = 1 ] && litmus_i $1 $2 ${LITMUS_N:-10000000}; done; say "LITMUS: init pass ended"; }
+step_litmus() { say "STEP: litmus"; bounded LITMUS 120 litmus_run; }
+remote_hold() {   # seconds without a command before the order goes on
+  [ -e /run/usb-shell ] || [ -e /run/macho-io ] || { say "HOLD: no IO up, going on"; return; }
+  say "HOLD: IO up; steps by name into /run/macho-cmd (smp litmus wifi tso kvm), touch /run/macho-go to go on; $1 s idle limit"
+  : > /run/macho-cmd; i=0
+  while [ $i -lt $1 ] && [ ! -e /run/macho-go ]; do
+    if [ -s /run/macho-cmd ]; then
+      c=$(cat /run/macho-cmd); : > /run/macho-cmd; i=0
+      case "$c" in smp) say "HOLD: remote step smp (the other nine cores)"; smp_early rest; irq_dump smp2 ;;
+      litmus|wifi|tso|kvm) say "HOLD: remote step $c"; step_$c; [ "$c" = wifi ] && touch /run/macho-wifi-done; [ "$c" = litmus ] && touch /run/macho-litmus-done; say "HOLD: remote step $c ended" ;; *) say "HOLD: unknown step $c" ;; esac
+    fi
+    sleep 1; i=$((i+1))
+  done
+  say "HOLD: over ($( [ -e /run/macho-go ] && echo go || echo idle limit))"
+}
+if [ -n "$e2e" ]; then
+  draw=e2e
+  say "ORDER: e2e io hold litmus wifi, then the root and the desktop (kvm in the sequencer)"
+  # IO first: F26 and F31 both stopped at STEP: tso, whose first act pins a user task to each core; with IO up the
+  # remote session runs those pieces one at a time. Without a command the order goes on by itself.
+  say "STEP: io"; bounded USB-A 40 usb_acm_up    # ACM shell + ACM log only; EEM only on request (/macho-eem-up)
+  remote_hold 300
+  [ -e /run/macho-litmus-done ] || step_litmus
+  [ -e /run/macho-wifi-done ] || step_wifi
+  # no kvm here: never run on HW under the monitor, the sequencer runs it after the desktop; "kvm" into /run/macho-cmd runs it early
+fi
+# F36 fluent: everything the staged boots proved (F34 11-02, F35 x3) comes up here, before the root, so the desktop starts once, on the
+# panel's own card and the GPU: the other nine cores, WFI idle + cpufreq, the DART units, keyboard/trackpad, DCP, asahi.
+flu=; grep -qw macho.fluent /proc/cmdline && flu=1
+dart_unit_up() {   # dart_unit_up <addr> <tag>: one apple,dart-apif unit by name (as the root's macho-late-load dart-unit)
+  [ "$(tr '\0' '\n' < /sys/firmware/devicetree/base/iommu@$1/status 2>/dev/null | head -n1)" = okay ] || { say "$2: iommu@$1 not enabled by the monitor"; return 1; }
+  dart_up $1 $2
+  [ -e /sys/bus/platform/drivers/apple-dart-apif/iommu@$1 ] || [ -e /sys/bus/platform/drivers/apple-dart-apif/$1.iommu ] || { say "$2: iommu@$1 not bound"; return 1; }
+}
+ins() { [ -f /lib/modules/$1.ko ] || { say "FLUENT: $1 not in the initrd"; return 1; }; insmod /lib/modules/$1.ko $2 2>/dev/kmsg; say "FLUENT: insmod $1 rc=$?"; }
+fluent_up() {
+  say "FLUENT: the other nine cores"; smp_early rest
+  if [ -e /sys/module/idle/parameters/mode ]; then echo wfi > /sys/module/idle/parameters/mode; say "FLUENT: idle WFI"; fi
+  ins apple-soc-cpufreq; for g in /sys/devices/system/cpu/cpufreq/policy*/scaling_governor; do [ -e "$g" ] && echo schedutil > "$g"; done
+  ins macsmc-power
+  say "FLUENT: input"
+  if dart_unit_up 514800000 MTP; then ins apple-dockchannel; ins apple-rtkit-helper; ins dockchannel-hid; fi
+  say "FLUENT: display (DCP takes the panel from simplefb)"
+  if dart_unit_up 402340000 DCP && dart_unit_up 402300000 DISP; then
+    ins drm_dma_helper; ins dcp-fabric-core; ins appledrm t6041_dcpext=0
+    i=0; while [ ! -e /dev/dri/by-path/platform-display-subsystem-card ] && [ $i -lt 30 ]; do sleep 1; i=$((i+1)); done
+    say "FLUENT: display card $(ls /dev/dri/by-path 2>/dev/null | tr '\n' ' ') after ${i}s"
+  fi
+  say "FLUENT: gpu"; ins asahi
+  i=0; while [ ! -e /dev/dri/renderD128 ] && [ $i -lt 30 ]; do sleep 1; i=$((i+1)); done
+  say "FLUENT: render node $(ls /dev/dri 2>/dev/null | tr '\n' ' ') after ${i}s, $(cat /sys/devices/system/cpu/online) online, $(temp_max) mC"
+  # F36.1: no runtime suspend of the panel pipe or the GPU: DPMS-off / idle power-down of DCP and asahi never ran under the monitor
+  # (F36 HW 11-02 froze at 261 s, about 150 s after the session started = Omarchy's screensaver timeout)
+  for d in /sys/bus/platform/devices/402e00000.dcp /sys/bus/platform/devices/28a600000.gpu /sys/bus/platform/devices/402300000.iommu /sys/bus/platform/devices/402340000.iommu; do [ -e $d/power/control ] && echo on > $d/power/control; done
+  say "FLUENT: runtime PM: dcp $(cat /sys/bus/platform/devices/402e00000.dcp/power/control 2>/dev/null) gpu $(cat /sys/bus/platform/devices/28a600000.gpu/power/control 2>/dev/null)"
+}
+if [ -n "$fin" ]; then
+  draw=final
+  say "ORDER: final io wifi, then the root and the desktop; the sequencer runs input smp dispgpu late kvmon litmus1 (F34 HW 11-02)"
+  say "STEP: io"; bounded USB-A 40 usb_acm_up    # ACM shell + ACM log, the debug link of every later step (EEM: /macho-eem-up)
+  step_wifi
+  [ -n "$flu" ] && { say "STEP: fluent"; bounded FLUENT 150 fluent_up; }
+fi
+case $draw in
+0) say "ORDER: 0 usb wifi tso kvm"; step_usb; step_wifi; step_tso; step_kvm ;;
+1) say "ORDER: 1 tso kvm usb wifi"; step_tso; step_kvm; step_usb; step_wifi ;;
+2) say "ORDER: 2 wifi usb kvm tso"; step_wifi; step_usb; step_kvm; step_tso ;;
+3) say "ORDER: 3 none, all left to the sequencer" ;;
+esac
+found=
+for i in $(seq 1 3000); do
+    [ -b /dev/nvme0n1p3 ] && { found=1; break; }
+    wait10ms
+done
+if [ -z "$found" ]; then
+    say "NVME: no root partition after 30 s, holding"
+    while :; do sleep 30; say "HB up=$(cut -d' ' -f1 /proc/uptime) ticks=$(ticks)"; done
+fi
+say "NVME: controller up, partitions present"
+hold_forever() { say "$1, holding"; while :; do sleep 30; say "HB up=$(cut -d' ' -f1 /proc/uptime) ticks=$(ticks)"; done; }
+# F35: the first writes under SPTM go to the empty scratch slot p5 (1 MiB window at +1 GiB, saved and put back byte for byte),
+# never to the root: the root is mounted read-write only when they verify, else the boot falls back to read-only + overlay.
+nvme_write_gate() {
+  P=/dev/nvme0n1p5; OFF=262144; W=/run/nwt; rc=0
+  mkdir -p $W
+  [ "$(cat /sys/block/nvme0n1/nvme0n1p5/start 2>/dev/null)" = 1926947192 ] && [ "$(cat /sys/block/nvme0n1/nvme0n1p5/size 2>/dev/null)" = 16777216 ] || { say "NVME-WT: p5 geometry unexpected, no writes"; return 1; }
+  dd if=$P of=$W/orig bs=4096 skip=$OFF count=256 iflag=direct 2>/dev/null || { say "NVME-WT: backup read failed"; return 1; }
+  blockdev --setrw /dev/nvme0n1; blockdev --setrw $P
+  d0=$(dmesg | wc -l)
+  for kb in 4 64 1024; do
+    head -c $((kb * 1024)) /dev/urandom > $W/pat
+    dd if=$W/pat of=$P bs=4096 seek=$OFF count=$((kb / 4)) oflag=direct conv=fsync,notrunc 2>/dev/null || { say "NVME-WT: write ${kb}K failed"; rc=1; break; }
+    dd if=$P of=$W/rb bs=4096 skip=$OFF count=$((kb / 4)) iflag=direct 2>/dev/null
+    if cmp -s $W/pat $W/rb; then say "NVME-WT: write ${kb}K OK, verified"; else say "NVME-WT: write ${kb}K readback differs"; rc=1; break; fi
+    if [ "$(dmesg | tail -n +$((d0 + 1)) | grep -cE 'apif timeout|I/O error|sct 0x|reset_work')" != 0 ]; then
+      dmesg | tail -n +$((d0 + 1)) | grep -E 'apif timeout|I/O error|sct 0x|reset_work' | tail -3 | cut -c1-150 | while read -r l; do say "NVME-WT: kernel: $l"; done
+      rc=1; break
+    fi
+  done
+  dd if=$W/orig of=$P bs=4096 seek=$OFF count=256 oflag=direct conv=fsync,notrunc 2>/dev/null
+  dd if=$P of=$W/after bs=4096 skip=$OFF count=256 iflag=direct 2>/dev/null
+  if cmp -s $W/orig $W/after; then say "NVME-WT: p5 window put back as found"; else say "NVME-WT: RESTORE MISMATCH on p5"; rc=1; fi
+  if [ $rc = 0 ]; then say "NVME-WT: writes under SPTM verified, the root goes read-write"; else blockdev --setro $P; blockdev --setro /dev/nvme0n1; say "NVME-WT: FAILED, the root stays read-only with the overlay in RAM"; fi
+  return $rc
+}
+rw=; grep -qw macho.rw /proc/cmdline && rw=1
+if [ -n "$rw" ] && ! nvme_write_gate; then rw=; fi
+if [ -n "$rw" ]; then
+  # F35b: the root on NVMe read-write, as the daily system boots it. The write policy is the kernel guard (nvme-apple refuses every
+  # write outside /chosen/m4,write-lba-range: p3 and the scratch slot p5); every other node stays setro as a second fence.
+  # /etc and /usr/local are overlaid in RAM: every macho tweak below is volatile, the daily system never sees it; /home, /var, /usr persist.
+  for d in /dev/nvme*n*; do case $d in /dev/nvme0n1|/dev/nvme0n1p3|/dev/nvme0n1p5) ;; *) blockdev --setro "$d" 2>/dev/null ;; esac; done
+  say "NVME: rw disk $(blockdev --getro /dev/nvme0n1) p3 $(blockdev --getro /dev/nvme0n1p3), others ro p1 $(blockdev --getro /dev/nvme0n1p1) p2 $(blockdev --getro /dev/nvme0n1p2), max_hw_sectors_kb $(cat /sys/block/nvme0n1/queue/max_hw_sectors_kb)"
+  mkdir -p /new
+  if ! mount -t ext4 -o rw /dev/nvme0n1p3 /new || [ ! -x /new/usr/lib/systemd/systemd ]; then hold_forever "NVME: root not mountable read-write"; fi
+  say "NVME-ROOT-OK read-write: $(grep -m1 PRETTY /new/etc/os-release); $(dmesg | grep -oE 'EXT4-fs \(nvme0n1p3\): (recovery complete|mounted filesystem [^ ]+ r[wo][^.]*)' | tail -1)"
+  /tso-probe
+  mount -t tmpfs -o mode=755 tmpfs /new/run || hold_forever "tmpfs on /run failed"
+  for o in etc usr/local; do
+    mkdir -p /new/run/macho-ov/$o/up /new/run/macho-ov/$o/work
+    mount -t overlay overlay -o lowerdir=/new/$o,upperdir=/new/run/macho-ov/$o/up,workdir=/new/run/macho-ov/$o/work /new/$o || hold_forever "OVERLAY on /$o failed"
+  done
+  echo "# macho boot: root read-write on NVMe (p3); /etc and /usr/local overlaid in RAM" > /new/etc/fstab
+  mkdir -p /new/var/lib/macho
+else
+# nothing below may write to the disk: every NVMe node read-only, root ro without journal replay, writes go to RAM
+for d in /dev/nvme*n*; do blockdev --setro "$d" 2>/dev/null; done
+say "NVME: ro disk $(blockdev --getro /dev/nvme0n1) p3 $(blockdev --getro /dev/nvme0n1p3), max_hw_sectors_kb $(cat /sys/block/nvme0n1/queue/max_hw_sectors_kb)"
+mkdir -p /lower /upper /new
+if ! mount -t ext4 -o ro,noload /dev/nvme0n1p3 /lower || [ ! -x /lower/usr/lib/systemd/systemd ]; then
+    say "NVME: root not mountable, holding"
+    while :; do sleep 30; say "HB up=$(cut -d' ' -f1 /proc/uptime) ticks=$(ticks)"; done
+fi
+say "NVME-ROOT-OK read-only, noload: $(grep -m1 PRETTY /lower/etc/os-release)"
+/tso-probe
+mount -t tmpfs -o mode=755 tmpfs /upper
+mkdir -p /upper/up /upper/work
+mount -t overlay overlay -o lowerdir=/lower,upperdir=/upper/up,workdir=/upper/work /new || { say "OVERLAY failed, holding"; while :; do sleep 30; done; }
+echo "# macho boot: root read-only, overlay in RAM" > /new/etc/fstab
+fi
+[ "$draw" = 3 ] && touch /new/etc/macho-no-net
+for u in fstrim.timer fstrim.service systemd-fsck-root.service systemd-hibernate-resume.service systemd-suspend.service systemd-hibernate.service; do
+    ln -sf /dev/null /new/etc/systemd/system/$u
+done
+mkdir -p /new/usr/lib/modules/7.3.0-m4.macho /new/etc/systemd/user
+cp /lib/modules/*.ko /lib/modules/modules.* /new/usr/lib/modules/7.3.0-m4.macho/ 2>/dev/null
+# user units are masked system-wide in /etc/systemd/user (volatile), never in /home: a read-write root keeps /home as the daily system left it
+# software session on simpledrm: Mesa falls back to llvmpipe by itself (KVM reproduction, same result without these); kept for the clients
+# no asahi yet: Mesa falls back to software by itself (KVM); nothing may force it, the GPU session restart below inherits this file
+# visible proof after switch_root: TSO prctl, CPU die temperature, fan speeds, system state
+cp /tso-probe /new/usr/local/bin/macho-tso-probe
+[ -f /macho-nvme-wt ] && cp /macho-nvme-wt /new/usr/local/bin/macho-nvme-wt && chmod 755 /new/usr/local/bin/macho-nvme-wt   # F35: the NVMe write test (sequencer step nvmew)
+cp /usr/local/bin/macho-nvme-sizes /new/usr/local/bin/macho-nvme-sizes
+cp /tso_litmus /new/usr/local/bin/macho-tso-litmus
+cp /macho-kvm-test /new/usr/local/bin/macho-kvm-test
+cp /tso-matrix /new/usr/local/bin/macho-tso-matrix
+cat > /new/usr/local/bin/macho-status <<'S'
+#!/bin/bash
+L=/run/macho-status.log
+touch $L; chmod 644 $L
+fans() { for h in /sys/class/hwmon/hwmon*; do [ "$(cat $h/name)" = macsmc_hwmon ] && cat $h/fan*_input 2>/dev/null | tr '\n' ' '; done; }
+line() { echo "$1" | tee -a $L > /dev/kmsg; }
+/usr/local/bin/macho-tso-probe
+# M3: secondaries one by one, each named on the log before the PSCI call, so the last line names the core if the machine
+# stops. Order: an E core and a P core of the other cluster first (the litmus pair), then the rest. Logical numbers follow
+# guest-native.dts: 0 = boot 0x10100; 1-4 E 0x0-0x3; 5-8 0x10101-4; 9-13 0x10200-4. Kernel cmdline macho.nosmp skips all of it.
+temp_max() { cat /sys/class/thermal/thermal_zone*/temp 2>/dev/null | sort -n | tail -1; }
+litmus() {
+  line "LITMUS: start pair cpu$1 cpu$2, $3 iterations per test (TSO off is the positive control)"
+  /usr/local/bin/macho-tso-litmus "$1" "$2" "$3" > /run/macho-litmus-$1-$2.log 2>&1; rc=$?
+  grep -E 'pinned|\[probe\]|MP forbidden|SB outcome|DEFAULT MP|TSO     MP|TSO     SB|XNU     MP|XNU     SB|>>>' /run/macho-litmus-$1-$2.log | cut -c1-110 | while read -r l; do line "LITMUS $1-$2: $l"; done
+  line "LITMUS-RESULT pair $1-$2 rc=$rc (0 TSO ordered, 1 TSO NOT enforced, 2 no prctl, 3 inconclusive, 4 only the XNU state 0x12/~0xe00 orders)"
+}
+smp_up() {
+  grep -qw macho.nosmp /proc/cmdline && { line "SMP: skipped, macho.nosmp"; return; }
+  for c in 1 9 5 2 10 6 3 11 7 4 12 8 13; do
+    [ "$(cat /sys/devices/system/cpu/cpu$c/online 2>/dev/null)" = 1 ] && continue    # the initrd started it
+    t=$(temp_max)
+    if [ -n "$t" ] && [ "$t" -gt 90000 ]; then line "SMP: stop before cpu$c, $t mC above 90000"; break; fi
+    if [ -z "$t" ] && [ $c != 1 ] && [ $c != 9 ] && [ $c != 5 ]; then line "SMP: no temperature reading, stop at the litmus cores"; break; fi
+    line "SMP: next cpu$c, $t mC, online $(cat /sys/devices/system/cpu/online)"
+    sync
+    [ -e /etc/macho-final ] && sleep 1 || sleep 3    # final: all thirteen came up one by one on F34, the pause only names the core on the log
+    echo 1 > /sys/devices/system/cpu/cpu$c/online; rc=$?
+    line "SMP: cpu$c rc=$rc online=$(cat /sys/devices/system/cpu/cpu$c/online) all $(cat /sys/devices/system/cpu/online)"
+    dmesg | grep -E "CPU$c:|cpu$c|psci" | tail -3 | cut -c1-140 | while read -r l; do line "SMP-K: $l"; done
+    [ "$rc" = 0 ] || { line "SMP: cpu$c failed, no further CPUs"; break; }
+    [ -e /etc/macho-final ] && sleep 1 || sleep 5
+  done
+  line "SMP: finished, online $(cat /sys/devices/system/cpu/online), $(temp_max) mC"
+}
+kvm_step() {
+  line "KVM-TEST: enabling kvm-arm.mode=sptm"
+  if [ -e /dev/kvm ] || echo 1 > /sys/kernel/macho_kvm/enable 2>>$L; then
+    line "KVM-TEST: enabled, $(dmesg | grep -m1 'kvm .*sptm:' | cut -c1-120)"
+    # without the vGIC first: it has never run under the monitor, and a stop there must not cost the rest of the result
+    line "KVM-TEST: run 1 of 2, --no-vgic"
+    timeout 120 /usr/local/bin/macho-kvm-test --no-vgic --expect-tso 2>&1 | while IFS= read -r l; do line "$l"; done
+    sync
+    line "KVM-TEST: run 2 of 2, with vGIC; a stop after this line is the vGIC"
+    timeout 120 /usr/local/bin/macho-kvm-test --expect-tso 2>&1 | while IFS= read -r l; do line "$l"; done
+    line "KVM-TEST: test process ended"
+  else
+    line "KVM-TEST: enable failed, status $(cat /sys/kernel/macho_kvm/status 2>/dev/null): $(dmesg | grep -E 'kvm \[' | tail -2 | cut -c1-160 | tr '\n' ' ')"
+  fi
+}
+# appledrm takes the panel from simpledrm: the session stops first, it holds simpledrm's card. A stop after "insmod appledrm" is the DCP, DART table 3 on the live scanout.
+display_step() {
+  dart_step
+  systemctl stop display-manager
+  i=0; while pgrep -x Hyprland >/dev/null && [ $i -lt 15 ]; do sleep 1; i=$((i+1)); done
+  /usr/local/bin/macho-late-load display
+  i=0; while [ ! -e /dev/dri/by-path/platform-display-subsystem-card ] && [ $i -lt 30 ]; do sleep 1; i=$((i+1)); done
+  dmesg | grep -E 'apple-dcp|apple-drm|takeover|apif' | tail -n 30 | cut -c1-170 >> $L
+  if [ -e /dev/dri/by-path/platform-display-subsystem-card ]; then mkdir -p /run/m4; echo ok > /run/m4/display-ready; line "DCP: card up, eDP-1 $(cat /sys/class/drm/card*-eDP-1/status 2>/dev/null), modes $(sort -u /sys/class/drm/card*-eDP-1/modes 2>/dev/null | tr '\n' ' '), backlight $(ls /sys/class/backlight 2>/dev/null | tr '\n' ' ')"
+  else line "DCP: no display card after 30 s, simpledrm stays: $(ls /sys/class/drm | tr '\n' ' ')"; fi
+  systemctl start display-manager
+  line "DCP: session started again, Hyprland $(sleep 15; pgrep -x Hyprland | head -1)"
+}
+# final (F35): DCP, then the GPU, with the session stopped, and one restart onto the panel's card and the render node (F34 did both with a restart each)
+dispgpu_step() {
+  dart_step
+  systemctl stop display-manager
+  i=0; while pgrep -x Hyprland >/dev/null && [ $i -lt 15 ]; do sleep 1; i=$((i+1)); done
+  /usr/local/bin/macho-late-load display
+  i=0; while [ ! -e /dev/dri/by-path/platform-display-subsystem-card ] && [ $i -lt 30 ]; do sleep 1; i=$((i+1)); done
+  dmesg | grep -E 'apple-dcp|apple-drm|takeover|apif' | tail -n 30 | cut -c1-170 >> $L
+  if [ -e /dev/dri/by-path/platform-display-subsystem-card ]; then mkdir -p /run/m4; echo ok > /run/m4/display-ready; line "DCP: card up, eDP-1 $(cat /sys/class/drm/card*-eDP-1/status 2>/dev/null), modes $(sort -u /sys/class/drm/card*-eDP-1/modes 2>/dev/null | tr '\n' ' '), backlight $(ls /sys/class/backlight 2>/dev/null | tr '\n' ' ')"
+  else line "DCP: no display card after 30 s, simpledrm stays: $(ls /sys/class/drm | tr '\n' ' ')"; fi
+  MACHO_GPU_NORESTART=1 timeout 300 /usr/local/bin/macho-gpu
+  systemctl start display-manager
+  line "DISPGPU: session started, Hyprland $(sleep 15; pgrep -x Hyprland | head -1)"
+  H=$(ls -t /run/user/1001/hypr/*/hyprland.log 2>/dev/null | head -1)
+  [ -n "$H" ] && grep -aE 'Creating CDRMRenderer|Renderer:' "$H" | head -3 | cut -c1-140 | while IFS= read -r l; do line "DISPGPU: $l"; done
+}
+# the driver alone: a unit probes when its own step names it, so on order 3 a stop in the PCIe unit stays in the wifi step and input, DCP and GPU are seen
+dart_step() { [ -e /sys/module/apple_dart_apif ] || /usr/local/bin/macho-late-load dart-driver; }
+thermal_guard() {
+  while :; do
+    t=$(temp_max)
+    if [ -n "$t" ] && [ "$t" -gt 90000 ]; then
+      line "THERMAL: $t mC above 90000, offlining secondaries"
+      for c in 13 12 11 10 9 8 7 6 5 4 3 2 1; do [ "$(cat /sys/devices/system/cpu/cpu$c/online 2>/dev/null)" = 1 ] && echo 0 > /sys/devices/system/cpu/cpu$c/online; done
+      touch /run/macho-thermal-off
+      line "THERMAL: online now $(cat /sys/devices/system/cpu/online)"
+    elif [ -e /etc/macho-final ] && [ -e /run/macho-thermal-off ] && [ -n "$t" ] && [ "$t" -lt 75000 ]; then
+      # final (F35): a daily system must not stay on one core after a hot minute; the cores come back one by one as in smp_up (F34 HW)
+      rm -f /run/macho-thermal-off
+      for c in 1 9 5 2 10 6 3 11 7 4 12 8 13; do [ "$(cat /sys/devices/system/cpu/cpu$c/online 2>/dev/null)" = 0 ] && { echo 1 > /sys/devices/system/cpu/cpu$c/online; sleep 1; }; done
+      line "THERMAL: $t mC below 75000, secondaries back, online $(cat /sys/devices/system/cpu/online)"
+    fi
+    sleep 10
+  done
+}
+# One step at a time, in an order drawn per boot: a stop names its step on the panel, and a plain power cycle (no 1TR) then gives the other steps their turn.
+step_body() {
+  case $1 in
+    wifi) /usr/local/bin/macho-late-load dart; timeout 300 /usr/local/bin/macho-wifi ;;
+    smp) smp_up ;;
+    tso)
+      for p in "1 9" "5 9" "1 2"; do set -- $p; [ "$(cat /sys/devices/system/cpu/cpu$1/online 2>/dev/null)" = 1 ] && [ "$(cat /sys/devices/system/cpu/cpu$2/online 2>/dev/null)" = 1 ] && litmus $1 $2 40000000; done
+      timeout 1800 /usr/local/bin/macho-tso-matrix 2>&1 | while IFS= read -r l; do line "$l"; done ;;
+    late) timeout 300 /usr/local/bin/macho-late ;;
+    input) dart_step; timeout 180 /usr/local/bin/macho-late-load input ;;
+    kvm) kvm_step ;;
+    display) display_step ;;
+    gpu) timeout 400 /usr/local/bin/macho-gpu ;;
+    dispgpu) dispgpu_step ;;
+    kvmon) if [ -e /dev/kvm ] || echo 1 > /sys/kernel/macho_kvm/enable 2>>$L; then line "KVM: enabled, /dev/kvm $(ls /dev/kvm 2>/dev/null), $(dmesg | grep -m1 'kvm .*sptm:' | cut -c1-100)"; else line "KVM: enable failed, status $(cat /sys/kernel/macho_kvm/status 2>/dev/null)"; fi ;;
+    litmus1) [ "$(cat /sys/devices/system/cpu/cpu1/online 2>/dev/null)" = 1 ] && [ "$(cat /sys/devices/system/cpu/cpu2/online 2>/dev/null)" = 1 ] && litmus 1 2 10000000 ;;
+    nvmew) timeout 240 /usr/local/bin/macho-nvme-wt   # F35: first write under SPTM, scratch p5 only, restored byte for byte
+           if grep -qE '^/dev/nvme0n1p3 / ext4 rw' /proc/mounts; then   # F35b: a line on the persistent root, visible to the next boot and to the daily system
+             mkdir -p /var/lib/macho && echo "macho rw boot $(date -u +%FT%TZ) $(uname -r)" >> /var/lib/macho/boots.log && sync && line "ROOTW: /var/lib/macho/boots.log now $(wc -l < /var/lib/macho/boots.log) lines, errors $(dmesg | grep -c 'I/O error')"
+           fi ;;
+    provision) timeout 300 /usr/local/bin/macho-provision ;;   # F35: the full module set of this build onto the root (hypnos pack, sha pinned)
+    # F35 devices, one per step, each named on the log before it runs (DT nodes from guest-final.dtsi / guest-usb01.dtsi)
+    coldplug) udevadm trigger -c add -s platform -s spmi -s i2c -s nvmem 2>>$L; sleep 8
+              line "COLDPLUG: rtc $(ls /dev/rtc* 2>/dev/null | tr '\n' ' ') hwclock $(hwclock -r 2>&1 | head -1) cpuidle $(cat /sys/devices/system/cpu/cpuidle/current_driver 2>/dev/null) i2c $(ls /sys/bus/i2c/devices 2>/dev/null | tr '\n' ' ') leds $(ls /sys/class/leds 2>/dev/null | tr '\n' ' ')"
+              line "COLDPLUG: failed probes $(ls /sys/kernel/debug/devices_deferred 2>/dev/null && cat /sys/kernel/debug/devices_deferred | tr '\n' ' ')" ;;
+    kbdbl) l=/sys/class/leds/apple::kbd_backlight; [ -e $l ] || { modprobe pwm-apple; modprobe leds-pwm; sleep 2; }
+           if [ -e $l ]; then echo 96 > $l/brightness; line "KBDBL: brightness $(cat $l/brightness)/$(cat $l/max_brightness)"; else line "KBDBL: no apple::kbd_backlight"; fi ;;
+    bt) modprobe hci_bcm4377 2>>$L; i=0; while [ ! -e /sys/class/bluetooth/hci0 ] && [ $i -lt 60 ]; do sleep 1; i=$((i+1)); done
+        line "BT: $(ls /sys/class/bluetooth 2>/dev/null | tr '\n' ' ') after ${i}s; $(dmesg | grep -iE 'bcm4377|Bluetooth: hci0' | tail -2 | cut -c1-120 | tr '\n' '|')"
+        [ -e /sys/class/bluetooth/hci0 ] && systemctl start bluetooth 2>>$L ;;
+    aop) dart_step; /usr/local/bin/macho-late-load dart-unit iommu@510f00000 || { line "AOP: DART not up, aop skipped"; return; }
+         for m in aop apple-admac; do line "AOP: modprobe $m"; timeout 60 modprobe $m 2>>$L; line "AOP: $m rc=$? $(dmesg | tail -n 1 | cut -c1-120)"; sleep 3; done
+         line "AOP: driver $(ls -l /sys/bus/platform/devices/510600000.aop/driver 2>/dev/null | sed 's/.*-> //') als $(ls /sys/bus/iio/devices 2>/dev/null | tr '\n' ' ') $(dmesg | grep -iE 'aop' | tail -3 | cut -c1-120 | tr '\n' '|')" ;;
+    audio) for m in snd-soc-aop snd-soc-tas2764 snd-soc-cs42l84 snd-soc-macaudio; do line "AUDIO: modprobe $m"; timeout 60 modprobe $m 2>>$L; line "AUDIO: $m rc=$?"; sleep 2; done
+           sleep 5; line "AUDIO: cards $(cat /proc/asound/cards 2>/dev/null | grep -E '^ *[0-9]' | awk '{print $3}' | tr '\n' ' '); $(dmesg | grep -iE 'macaudio|tas2764|cs42l84' | tail -3 | cut -c1-120 | tr '\n' '|')"
+           grep -q AppleJ616 /proc/asound/cards 2>/dev/null && { systemctl start speakersafetyd 2>>$L; line "AUDIO: speakersafetyd $(systemctl is-active speakersafetyd)"; } ;;
+    usb0|usb1) n=${st#usb}; d=382f00000; [ $n = 1 ] && d=38af00000
+           dart_step; /usr/local/bin/macho-late-load dart-unit iommu@$d || { line "USB$n: DART not up, port skipped"; return; }
+           u=382280000; [ $n = 1 ] && u=38a280000; D=/sys/bus/platform/devices/$u.usb
+           [ -e $D/driver ] && { line "USB$n: $u.usb already bound before its DART (no IOMMU), port skipped"; return 1; }
+           for m in phy-apple-t6040-usb2 sn201202x dwc3-apple; do line "USB$n: modprobe $m"; timeout 60 modprobe $m 2>>$L; line "USB$n: $m rc=$? $(dmesg | tail -n 1 | cut -c1-120)"; sleep 3; done
+           echo > $D/driver_override; echo $u.usb > /sys/bus/platform/drivers_probe 2>>$L
+           [ -e $D/iommu_group ] || { echo $u.usb > $D/driver/unbind 2>>$L; echo macho-hold > $D/driver_override; line "USB$n: $u.usb has no IOMMU group after bind, unbound, port skipped"; return 1; }
+           line "USB$n: $u.usb bound, iommu group $(basename $(readlink $D/iommu_group))"
+           line "USB$n: modprobe xhci-plat-hcd"; timeout 60 modprobe xhci-plat-hcd 2>>$L; line "USB$n: xhci-plat-hcd rc=$?"; sleep 3
+           line "USB$n: $(dmesg | grep -iE 'atcphy|dwc3|xhci|usb-pd|tps6598|sn2012' | tail -4 | cut -c1-120 | tr '\n' '|') hosts $(ls /sys/bus/usb/devices 2>/dev/null | tr '\n' ' ')" ;;
+    *) line "SEQ: unknown step $1" ;;
+  esac
+}
+# what stuck: every thread in D, user threads in R. No cmdline, it takes mmap_lock
+task_dump() {
+  for q in /proc/[0-9]*/task/[0-9]*; do
+    s=$(cat $q/stat 2>/dev/null); [ -n "$s" ] || continue
+    c=${s#*\(}; c=${c%\)*}
+    set -- ${s##*) }
+    case "$1" in
+      D) ;;
+      R) [ $(( $7 & 0x200000 )) = 0 ] || continue ;;
+      *) continue ;;
+    esac
+    line "TASK: ${q##*/} ($c) state $1 cpu ${37} wchan $(cat $q/wchan 2>/dev/null) $(head -n3 $q/stack 2>/dev/null | tr '\n' ' ')"
+  done
+}
+# aside and bounded: a task in D holds a plain timeout for ever, and it must not hide the later steps and the remote loop
+# F35: a ledger on the root (persistent when the root is read-write): a step that began and never ended on an earlier boot is
+# skipped on this one, so a stop in a new device cannot repeat on every power cycle (rm /var/lib/macho/steps/<step>.failed to retry)
+LEDGER=/var/lib/macho/steps
+ledger_open() { mkdir -p $LEDGER 2>/dev/null; for f in $LEDGER/*.attempt; do [ -e "$f" ] || continue; mv "$f" "${f%.attempt}.failed"; line "SEQ: ${f##*/} did not finish on an earlier boot, skipped now"; done; }
+run_step() {
+  local st=$1 p i=0 lim
+  case $st in wifi) lim=340 ;; smp) lim=200 ;; tso) lim=2100 ;; late) lim=320 ;; input) lim=200 ;; kvm) lim=300 ;; display) lim=200 ;; gpu) lim=450 ;; dispgpu) lim=560 ;; litmus1) lim=120 ;; nvmew) lim=260 ;; provision) lim=320 ;; coldplug) lim=90 ;; kbdbl) lim=30 ;; bt) lim=150 ;; aop) lim=200 ;; audio) lim=200 ;; usb0|usb1) lim=200 ;; *) lim=60 ;; esac
+  if [ -e $LEDGER/$st.failed ]; then line "SEQ: $st skipped (failed on an earlier boot; rm $LEDGER/$st.failed to retry)"; return; fi
+  touch $LEDGER/$st.attempt 2>/dev/null; sync
+  line "SEQ: >>> $st, up=$(cut -d' ' -f1 /proc/uptime) $(temp_max) mC"
+  step_body "$st" & p=$!
+  while kill -0 $p 2>/dev/null && [ $i -lt $lim ]; do sleep 1; i=$((i+1)); done
+  if kill -0 $p 2>/dev/null; then
+    line "SEQ: $st still running after $lim s, going on"
+    task_dump &
+  else
+    wait $p
+    line "SEQ: <<< $st rc=$? up=$(cut -d' ' -f1 /proc/uptime)"
+    rm -f $LEDGER/$st.attempt; touch $LEDGER/$st.ok 2>/dev/null; sync
+  fi
+}
+sequencer() {
+  mkfifo /run/macho-step 2>/dev/null
+  # macho-net brings Wi-Fi + sshd + the reverse link up right after switch_root, independent of the desktop. The moment the
+  # link is up, hand control to the remote session: it drives steps by writing a name (smp|tso|late|input|kvm|display|gpu) to /run/macho-step.
+  # No 300 s desktop wait on the SSH path, so the box is reachable in seconds even if the desktop never comes.
+  i=0
+  while [ $i -lt 300 ]; do
+    # a host on the USB gadget is a link: the shell and SSH of Hypnos drive the steps
+    [ "$(cat /sys/class/udc/392280000.usb/state 2>/dev/null)" = configured ] && touch /run/macho-link-up
+    # final: the order stops and restarts the session (dispgpu), so it waits for a running desktop even with a link up
+    [ -e /run/macho-link-up ] && [ ! -e /etc/macho-final ] && { line "SEQ: link up at ${i}s, remote control via /run/macho-step"; break; }
+    pgrep -x Hyprland >/dev/null && [ "$(systemctl is-active graphical.target)" = active ] && break
+    sleep 5; i=$((i+5))
+  done
+  # nobody may be there to drive: the flash stops every session on this Mac. A remote command within a minute takes over, else the autonomous order runs.
+  exec 3<>/run/macho-step
+  wt=60; [ -e /etc/macho-final ] && wt=5    # final: nothing waits for a remote session; a step name into /run/macho-step still runs at any time after the order
+  if [ -e /run/macho-link-up ] && read -t $wt -r st <&3; then
+    touch /run/macho-remote
+    run_step "$st"
+  fi
+  [ -e /run/macho-remote ] || line "SEQ: no remote command, autonomous order; link $(ls /run/macho-link-up 2>/dev/null), Hyprland $(pgrep -x Hyprland | head -1)"
+  # The desktop first, DCP before the GPU so the session restart lands on the panel's own card. WFI (late) last: a freeze there must not hide the rest on every power cycle.
+  # One boot in four KVM and TSO first and the GPU before DCP, so a stop in either cannot hide the other forever.
+  order=$(printf 'smp input display gpu kvm tso late\nsmp input display gpu kvm tso late\nsmp input display gpu kvm tso late\nsmp kvm tso input gpu display late\n' | shuf -n1)
+  [ -e /etc/macho-no-net ] && order="${order% late} wifi late"     # initrd order 3: nothing brought Wi-Fi up yet; WFI stays last
+  [ -e /etc/macho-reliable ] && order="tso"
+  [ -e /etc/macho-e2e ] && order="tso smp input display gpu kvm late"   # fixed, the TSO answer first, then the other nine cores; a remote command within 60 s takes over
+  [ -e /etc/macho-final ] && order="input smp dispgpu late kvmon litmus1 nvmew provision coldplug kbdbl bt usb0 usb1"   # F35.1: the F34-proven core, the module pack, then the new devices by rising risk; aop/audio out until the F35 stop in the first dart-aop INIT is understood
+  [ -e /etc/macho-fluent ] && order="provision coldplug kbdbl bt usb0 usb1 kvmon"   # F36.2: cores, idle, cpufreq, input, DCP and GPU came up in the initrd; F38: usb0/usb1 back: the F36 xHCI stop was dwc3-apple bound to the left ports at 8.7 s, before their DART (~117 s), so no IOMMU (left_hold)
+  ledger_open
+  line "SEQ: order $order"
+  for st in $order; do
+    [ -e /run/macho-remote ] && break
+    run_step "$st"
+    sleep 10
+  done
+  [ -e /etc/macho-reliable ] && ( while :; do sleep 60; grep -v "^SUMMARY" $L | grep -hE "LITMUS-RESULT|TSO-MX: MP|TSO-MX: done" | tail -8 | while IFS= read -r x; do line "SUMMARY $x"; done; done ) &
+  while :; do read -r st <&3 && run_step "$st"; done
+}
+thermal_guard &
+sequencer &
+n=0
+while :; do
+  line "STATUS up=$(cut -d' ' -f1 /proc/uptime) $(systemctl is-system-running 2>/dev/null) target=$(systemctl is-active graphical.target) die=$(cat /sys/class/thermal/thermal_zone*/temp 2>/dev/null | tr '\n' ' ') fans=$(fans)"
+  n=$((n+1))
+  if [ $n = 4 ]; then
+    dmesg | grep -E 'TSO-|MDIAG|M2:|FANS:|NVME|SWITCH:' | cut -c1-200 >> $L
+    grep -E 'arch_timer|nvme|macsmc' /proc/interrupts | cut -c1-90 >> $L
+    echo "--- failed units" >> $L
+    systemctl --failed --no-legend --plain 2>/dev/null | cut -c1-90 | head -25 >> $L
+    echo "--- desktop" >> $L
+    ps -eo pid,etimes,time,comm --sort=-time | head -14 >> $L
+  fi
+  sleep 30
+done
+S
+chmod 755 /new/usr/local/bin/macho-status
+cat > /new/etc/systemd/system/macho-status.service <<'S'
+[Unit]
+Description=macho status lines on the kernel log
+DefaultDependencies=no
+After=sysinit.target
+[Service]
+ExecStart=/usr/local/bin/macho-status
+StandardOutput=kmsg
+StandardError=kmsg
+[Install]
+WantedBy=sysinit.target
+S
+# udev must not load these on the coldplug modalias: only macho-late does, by name. m4-cpufreq would load cpufreq at boot, before anything has reported.
+mkdir -p /new/etc/modprobe.d
+# the USB three too: order 3 leaves USB out, and coldplug would otherwise start dwc3-apple before its DART (no IOMMU, HW F26) on a boot meant to avoid it.
+for m in macsmc_power pcie_apple pcie_macho_init apple_soc_cpufreq brcmfmac brcmfmac_wcc hci_bcm4377 asahi appledrm apple_dart_apif apple_dockchannel apple_rtkit_helper dockchannel_hid dwc3_apple phy_apple_t6040_usb2 sn201202x; do echo "blacklist $m"; done > /new/etc/modprobe.d/macho-late.conf
+ln -sf /dev/null /new/etc/systemd/system/m4-cpufreq.service
+# Late, one by one, each step named on the panel and in the desktop status window before it runs
+cat > /new/usr/local/bin/macho-late <<'S'
+#!/bin/bash
+L=/run/macho-status.log
+say() { echo "LATE: $1 up=$(cut -d' ' -f1 /proc/uptime)" | tee -a $L > /dev/kmsg; sync; sleep 2; }
+step() { # step NAME module...
+  say "start $1"
+  for m in "${@:2}"; do
+    timeout 60 modprobe -v "$m" 2>&1 | tail -3 | cut -c1-160 | tee -a $L > /dev/kmsg
+    say "$1 $m rc=${PIPESTATUS[0]}"
+  done
+}
+[ -e /run/macho-late.off ] && exit 0
+step battery macsmc-power
+say "battery: $(cat /sys/class/power_supply/macsmc-battery/capacity 2>/dev/null)% $(cat /sys/class/power_supply/macsmc-battery/status 2>/dev/null)"
+# F35.1: WFI before cpufreq: 14 cores spinning in idle=nop at the schedutil maximum reached 95 C on F35 (HW 11-02) and tripped the thermal guard
+if [ -e /sys/module/idle/parameters/mode ]; then
+  say "idle: switching this CPU to WFI now; a freeze here means no wake from WFI"
+  echo wfi > /sys/module/idle/parameters/mode
+  sleep 5
+  say "idle: WFI survived, ticks $(grep -m1 arch_timer /proc/interrupts | cut -c1-40)"
+fi
+step cpufreq apple-soc-cpufreq
+say "cpufreq before: $(cat /sys/devices/system/cpu/cpufreq/policy*/scaling_cur_freq 2>/dev/null | tr '\n' ' ')"
+for g in /sys/devices/system/cpu/cpufreq/policy*/scaling_governor; do [ -e "$g" ] && echo schedutil > "$g"; done
+sleep 5
+say "cpufreq schedutil: $(cat /sys/devices/system/cpu/cpufreq/policy*/scaling_cur_freq 2>/dev/null | tr '\n' ' ') die=$(cat /sys/class/thermal/thermal_zone*/temp 2>/dev/null | tr '\n' ' ')"
+say "done"
+S
+chmod 755 /new/usr/local/bin/macho-late
+cat > /new/usr/local/bin/macho-wifi <<'S'
+#!/bin/bash
+# Wi-Fi only, so a working link can carry the log of every later step. NetworkManager connects with the profile already on the root.
+L=/run/macho-status.log
+say() { echo "WIFI: $1 up=$(cut -d' ' -f1 /proc/uptime)" | tee -a $L > /dev/kmsg; sleep 2; }
+step() { for m in "$@"; do say "modprobe $m"; timeout 60 modprobe -v "$m" 2>&1 | tail -3 | cut -c1-160 | tee -a $L > /dev/kmsg; say "$m rc=${PIPESTATUS[0]}"; done; }
+if [ "$(tr '\0' '\n' < /sys/firmware/devicetree/base/iommu@410000000/status 2>/dev/null | head -n1)" != okay ]; then systemctl start sshd 2>>$L; say "skipped, PCIe DART not enabled by the monitor; sshd $(systemctl is-active sshd)"; exit 0; fi
+if [ -e /etc/macho-initrd-link ]; then
+  # the initrd associated wld0 and set 192.168.1.131; its wpa_supplicant keeps running and NetworkManager leaves wld0 alone
+  systemctl start sshd 2>>$L; say "initrd link kept, sshd $(systemctl is-active sshd)"
+  a=$(ip -4 -br addr show wld0 2>/dev/null); say "link $a"
+  case "$a" in *.*.*.*) touch /run/macho-link-up; systemd-run --unit=macho-link /usr/local/bin/macho-link >/dev/null 2>&1; say "macho-link started" ;; esac
+  exit 0
+fi
+[ -e /sys/bus/platform/drivers/apple-dart-apif/iommu@410000000 ] || [ -e /sys/bus/platform/drivers/apple-dart-apif/410000000.iommu ] || { say "PCIe DART not bound, no master"; exit 0; }
+step pcie-macho-init
+[ -e /sys/bus/platform/drivers/pcie-macho-init/pcie-macho-init ] || { say "pcie-macho-init did not bind: $(dmesg | grep -E 'pcie-macho-init' | tail -2 | cut -c1-150 | tr '\n' ' '); pcie-apple not loaded"; systemctl start sshd 2>>$L; exit 0; }
+step pcie-apple cfg80211 brcmutil brcmfmac
+# sshd listens on 0.0.0.0 regardless of the IP, so bring it up first — a reachable shell the moment Wi-Fi associates
+systemctl start sshd 2>>$L; say "sshd $(systemctl is-active sshd)"
+# NM is not up this early in boot; start it and drive the connection by hand. The Wi-Fi profile name (and its PSK) live only on
+# the root, read at run time, so neither the SSID nor the key is baked into the flashed image.
+systemctl start dbus 2>>$L; systemctl start NetworkManager 2>>$L; say "NM $(systemctl is-active NetworkManager)"
+nmcli radio wifi on 2>>$L
+wprof=$(nmcli -t -f NAME,TYPE con show 2>/dev/null | awk -F: '$2 ~ /wireless/{print $1; exit}')
+[ -n "$wprof" ] && timeout 60 nmcli -w 60 con up "$wprof" 2>&1 | tail -1 | cut -c1-120 | tee -a $L > /dev/kmsg
+for i in $(seq 1 24); do
+  a=$(ip -4 -br addr show 2>/dev/null | awk '$1 ~ /^wl/ {print $1, $2, $3}')
+  case "$a" in *.*.*.*) say "link $a"; break ;; esac
+  sleep 5
+done
+say "nm $(nmcli -t -f DEVICE,STATE,CONNECTION device 2>/dev/null | tr '\n' ' ' | cut -c1-120)"
+case "$a" in *.*.*.*) touch /run/macho-link-up; systemd-run --unit=macho-link /usr/local/bin/macho-link >/dev/null 2>&1; say "macho-link started" ;; *) say "no IP, sshd still up on any later-assigned address" ;; esac
+S
+chmod 755 /new/usr/local/bin/macho-wifi
+# Early, desktop-independent network: SSH reachable within the first seconds of switch_root, BEFORE any NVMe/ANS instability
+# (the F8 HW boot showed an ANS reset + I/O error at ~31 s), and whether or not the desktop ever starts. The 840 GB root does
+# not fit in RAM, so only a curated SSH-critical set is warmed into the page cache, in the first seconds, so a later NVMe stall
+# cannot make the shell unreadable.
+cat > /new/usr/local/bin/macho-net <<'S'
+#!/bin/bash
+L=/run/macho-status.log
+say() { echo "NET: $1 up=$(cut -d' ' -f1 /proc/uptime)" | tee -a $L > /dev/kmsg; }
+warm() {
+  W="/usr/bin/bash /usr/bin/sshd /usr/sbin/sshd /usr/bin/nmcli /usr/bin/systemctl /usr/bin/journalctl /usr/bin/dmesg /usr/bin/ip /usr/bin/modprobe /usr/bin/kmod /usr/bin/cat /usr/bin/ls /usr/bin/grep /usr/bin/gawk /usr/bin/sed /usr/bin/cut /usr/bin/head /usr/bin/tail /usr/bin/tee /usr/bin/sleep /usr/bin/find /usr/bin/sort /usr/bin/tr /usr/bin/runuser /usr/bin/timeout /usr/bin/ssh /usr/bin/nvme /usr/bin/lsblk /usr/bin/xargs /usr/bin/ps /usr/bin/pgrep /usr/bin/nmap"
+  { for f in $W; do [ -e "$f" ] && { echo "$f"; ldd "$f" 2>/dev/null | awk '{print $3}' | grep '^/'; }; done
+    ls /usr/lib/firmware/brcm/* 2>/dev/null
+    ls /usr/lib/systemd/systemd /usr/lib/systemd/systemd-* 2>/dev/null
+    ls /usr/lib/NetworkManager/*/*.so* /usr/lib/libnm.so* 2>/dev/null; } | sort -u | while read -r p; do cat "$p" >/dev/null 2>&1; done
+}
+warm & say "cache warm started pid $!"
+[ -e /etc/macho-no-net ] && { say "initrd order 3: Wi-Fi left to the sequencer"; exit 0; }
+# PCIe DART first (apif_only = the PCIe unit): this is the HW make-or-break — if SPTM's live-register verify rejects the SID
+# config it panics here with a named string, which is itself the result we need.
+/usr/local/bin/macho-late-load dart
+/usr/local/bin/macho-wifi
+say "net done sshd=$(systemctl is-active sshd) ip=$(ip -4 -br addr show 2>/dev/null | awk '/^wl/{print $3}' | head -1)"
+S
+chmod 755 /new/usr/local/bin/macho-net
+mkdir -p /new/etc/systemd/system/sysinit.target.wants
+cat > /new/etc/systemd/system/macho-net.service <<'S'
+[Unit]
+Description=macho early network: SSH up right after switch_root, desktop-independent
+DefaultDependencies=no
+After=sysinit.target
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+TimeoutStartSec=300
+ExecStart=/usr/local/bin/macho-net
+StandardOutput=kmsg
+StandardError=kmsg
+[Install]
+WantedBy=sysinit.target
+S
+ln -sf ../macho-net.service /new/etc/systemd/system/sysinit.target.wants/macho-net.service
+# Outbound from the Mac, so no address on the LAN has to be known: reverse port 2222 and the live kernel and status log on Hypnos.
+# The log line that reached Hypnos last names the step if the machine stops.
+cat > /new/usr/local/bin/macho-link <<'S'
+#!/bin/bash
+B=$(cut -c1-8 /proc/sys/kernel/random/boot_id)
+O="-o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3"
+hssh() { runuser -u morpheus -- ssh $O "$@"; }
+( until hssh hypnos "mkdir -p macho-link; cat > macho-link/$B.adt" < /proc/macho-adt; do sleep 5; done ) &
+( while :; do hssh -N -o ExitOnForwardFailure=yes -R 127.0.0.1:2222:127.0.0.1:22 hypnos; sleep 5; done ) &
+( while :; do tail -n +1 -F /run/macho-status.log | hssh hypnos "mkdir -p macho-link; cat >> macho-link/$B.status"; sleep 5; done ) &
+while :; do dmesg -w --time-format=iso | hssh hypnos "mkdir -p macho-link; cat >> macho-link/$B.dmesg"; sleep 5; done
+S
+chmod 755 /new/usr/local/bin/macho-link
+# a read-only trial boot with a network: nothing that acts on its own off this machine
+for u in cronie.service m4-boot-ok.service m4-boot-pending.service m4-gpu.service m4-display.service m4-bt-connect.service m4-bt-keyshare.service archlinux-keyring-wkd-sync.timer ufw.service m4-kbd-idle.service docker.socket cups.path cups.socket; do ln -sf /dev/null /new/etc/systemd/system/$u; done
+for u in omarchy-tailscale-receive.service bt-agent.service; do ln -sf /dev/null /new/etc/systemd/user/$u; done
+# F35: the full module set of this very build (230 .ko, same vermagic, hypnos:~/macho-link/F35/modpack-*.tar.zst, sha pinned here) lands on the
+# root once, persistent on a read-write root, in RAM otherwise; every later device step is a plain modprobe. The initrd keeps only the boot set.
+cat > /new/usr/local/bin/macho-provision <<'S'
+#!/bin/bash
+L=/run/macho-status.log; R=7.3.0-m4.macho; M=/usr/lib/modules/$R
+say() { echo "PROVISION: $1" | tee -a $L > /dev/kmsg; }
+WANT=26204c368f014664d5254ea8223ac72ca7abd641ff0476ae0b4dc4721beec9b2
+if [ -f $M/.modpack-sha ] && [ "$(cat $M/.modpack-sha)" = "$WANT" ] && [ -d $M/kernel ]; then say "module pack already on the root ($(find $M/kernel -name '*.ko' | wc -l) .ko), depmod"; depmod $R; exit 0; fi
+T=/run/modpack; mkdir -p $T
+# F35.1: plain HTTP from the recovery server (F35 HW 11-02: the user's ssh to hypnos needs an agent, all six scp tries failed)
+for i in 1 2 3 4 5 6; do
+  curl -fsS --max-time 120 -o $T/pack.tar.zst http://192.168.1.25:8616/modpack-$R.tar.zst 2>>$L && break
+  say "fetch from 192.168.1.25:8616 failed, try $i: $(tail -n 1 $L | cut -c1-80)"; sleep 10
+done
+[ -s $T/pack.tar.zst ] || { say "no module pack, the boot set stays"; exit 1; }
+got=$(sha256sum < $T/pack.tar.zst | cut -c1-64)
+[ "$got" = "$WANT" ] || { say "module pack sha mismatch ($got), refused"; rm -f $T/pack.tar.zst; exit 1; }
+# never extract onto /: the archive's "lib/" would replace the /lib -> usr/lib symlink with a directory and take the loader away
+# (F35 HW 11-02 10:38, repaired by hand over the ACM busybox). Unpack aside, then copy only this release's tree into place.
+rm -rf $T/x && mkdir -p $T/x && tar --zstd -xf $T/pack.tar.zst -C $T/x && [ -d $T/x/lib/modules/$R ] || { say "module pack has no lib/modules/$R, refused"; exit 1; }
+mkdir -p $M && cp -a $T/x/lib/modules/$R/. $M/ && rm -rf $T/x
+# the pack's nvme-apple.ko is the stock build; the write-capable one of this image stays alone under $M (copied from the initrd at boot)
+rm -f $M/kernel/drivers/nvme/host/nvme-apple.ko
+echo "$WANT" > $M/.modpack-sha && depmod $R && sync
+say "module pack installed: $(find $M/kernel -name '*.ko' | wc -l) .ko under $M, root $(grep -oE '^/dev/nvme0n1p3 / ext4 r[wo]' /proc/mounts | awk '{print $4}')"
+rm -f $T/pack.tar.zst
+S
+chmod 755 /new/usr/local/bin/macho-provision
+cat > /new/etc/systemd/system/macho-late.service <<'S'
+[Unit]
+Description=macho late hardware, one step at a time
+After=graphical.target
+[Service]
+ExecStart=/usr/local/bin/macho-late
+StandardOutput=journal
+[Install]
+WantedBy=graphical.target
+S
+mkdir -p /new/etc/systemd/system/graphical.target.wants
+# Network on, nothing else talks for this boot: RC services stay masked, no sync timers
+for u in tailscaled.service; do ln -sf /dev/null /new/etc/systemd/system/$u; done
+# the same lines in a window on the desktop: photographable without a keyboard. No input before the input step: Omarchy's idle (screensaver 150 s, lock 300 s) would cover it.
+# final (F35): input is the first sequencer step, so Omarchy keeps its own idle settings and no status window covers the desktop (the log stays in /run/macho-status.log)
+AL=/new/home/morpheus/.config/hypr/autostart.lua
+# F36.1: on every macho boot the desktop never blanks or locks: DPMS-off / DCP+GPU runtime suspend under the monitor is unqualified (F36 froze at the screensaver timeout).
+# shell.json lives in /home (persistent): the values are saved once in /var/lib/macho and put back by the daily boot's own tooling if ever needed.
+SJ=/new/home/morpheus/.config/omarchy/shell.json
+if [ -f $SJ ] && ! [ -f /new/var/lib/macho/shell.json.orig ] 2>/dev/null; then mkdir -p /new/var/lib/macho 2>/dev/null && cp $SJ /new/var/lib/macho/shell.json.orig 2>/dev/null; fi
+sed -i -E 's/("(lock|screensaver|dpms|suspend)": *)[0-9]+/\10/' $SJ 2>/dev/null && chown 1001:1001 $SJ
+if [ -z "$fin" ] && [ -z "$rw" ]; then
+cat >> $AL <<'S'
+hl.on("hyprland.start", function()
+  hl.exec_cmd("foot --maximized --title macho-status sh -c 'tail -n 2000 -F /run/macho-status.log'")
+end)
+S
+fi
+# idempotent: on a read-write root this file persists, and the rule is inert under the daily boot (no Unknown-1 connector there)
+grep -q 'output = "Unknown-1"' $AL 2>/dev/null || cat >> $AL <<'S'
+-- simpledrm's connector is Unknown-1, so the eDP-1 rule of the M4 profile does not apply: same panel scale as the daily system
+pcall(function() hl.monitor({ output = "Unknown-1", mode = "preferred", position = "auto", scale = 2 }) end)
+S
+mkdir -p /new/etc/systemd/system/sysinit.target.wants
+ln -sf ../macho-status.service /new/etc/systemd/system/sysinit.target.wants/macho-status.service
+# input and accelerated display: one module at a time, each named on the screen before it can stop anything. The first module
+# that touches a device behind apple,dart-apif makes the first table 3 calls of this boot. No devices in the DT: nothing to load.
+cat > /new/usr/local/bin/macho-late-load <<'S'
+#!/bin/bash
+M=/usr/lib/modules/7.3.0-m4.macho
+L=/run/macho-status.log
+line() { echo "LATE: $1" | tee -a $L > /dev/kmsg; }
+load() {
+  [ -f "$M/$1.ko" ] || { line "$1 not in the image"; return 1; }
+  line "insmod $*"
+  # a task in D holds a plain timeout for ever, and the steps after it with it
+  timeout 30 insmod "$M/$1.ko" ${2:-} & p=$!
+  i=0; while kill -0 $p 2>/dev/null && [ $i -lt 40 ]; do sleep 1; i=$((i+1)); done
+  if kill -0 $p 2>/dev/null; then line "$1 still in insmod after 40 s: $(for c in $(pgrep -x insmod); do head -n3 /proc/$c/stack 2>/dev/null; done | tr '\n' ' ')"; return 1; fi
+  wait $p; rc=$?
+  line "$1 rc=$rc $(dmesg | tail -n 1 | cut -c1-120)"
+  sleep 3
+  return $rc
+}
+on() { [ "$(tr '\0' '\n' < "/sys/firmware/devicetree/base/$1/status" 2>/dev/null | head -n1)" = okay ]; }
+case "$1" in
+dart)
+  # the PCIe unit alone first: Wi-Fi carries the log and the shell of every later step, and a stop in another unit's INIT cannot take it.
+  # apif_only matches the platform device name. A DART node with reg is "410000000.iommu" (raw DT); the guest nodes have no reg, so the
+  # name is the node name "iommu@410000000" (of_device_make_bus_id, HW F26). A list without it defers the unit for ever. Both are listed.
+  [ -e /sys/module/apple_dart_apif ] || "$0" dart-driver
+  [ -e /sys/bus/platform/drivers/apple-dart-apif/iommu@410000000 ] || ! on iommu@410000000 || "$0" dart-unit iommu@410000000
+  ;;
+dart-driver)
+  on iommu@514800000 || on iommu@402340000 || on iommu@410000000 || { line "no DART nodes enabled by the monitor"; exit 0; }
+  # "none" matches no unit (apple-dart-apif.c strstr): each is added by name in its own step
+  line "insmod apple-dart-apif apif_only=none"; timeout 30 insmod "$M/apple-dart-apif.ko" apif_only=none; line "apple-dart-apif rc=$?"
+  ;;
+dart-unit)
+  # One unit, named: "echo >" stores "\n", not an empty string, and every unit would keep deferring (KVM 11-01). A truly empty list would let the next bind probe all the others.
+  # A master probed before its unit gets no IOMMU at all (DRIVER_DEFERRED_PROBE_TIMEOUT=0, HW F26 dwc3-apple), so the caller stops here if the unit is not bound.
+  [ -e "/sys/bus/platform/devices/$2" ] || { line "$2: no such device"; exit 1; }
+  p=/sys/module/apple_dart_apif/parameters/apif_only
+  ( flock 9; echo "$(cat $p),$2" > $p ) 9>/run/macho-dart.lock    # macho-net and the sequencer can both be here
+  line "probe $2"; echo "$2" > /sys/bus/platform/drivers_probe; sleep 3
+  [ -e "/sys/bus/platform/drivers/apple-dart-apif/$2" ] || { line "$2 not bound"; exit 1; }
+  line "$2 bound"
+  ;;
+display)
+  on dcp@402e00000 || { line "DCP stays off (monitor kept the node), simple framebuffer stays"; exit 0; }
+  # first table 3 calls on the live scanout: a stop after these lines is INIT or POWERUP of that unit
+  "$0" dart-unit iommu@402340000 && "$0" dart-unit iommu@402300000 || { line "DCP DART not up, simpledrm stays"; exit 0; }
+  # internal panel only: the guest DT has no dcpext nodes. A takeover the driver refuses leaves simpledrm on the screen.
+  load drm_dma_helper; load dcp-fabric-core; load appledrm t6041_dcpext=0
+  ls /sys/class/drm | tr '\n' ' ' | sed 's/^/LATE: drm /' > /dev/kmsg
+  ;;
+input)
+  on mtp@514600000 || { line "MTP stays off (monitor kept the node)"; exit 0; }
+  "$0" dart-unit iommu@514800000 || { line "MTP DART not up, input skipped"; exit 0; }
+  for m in apple-dockchannel apple-rtkit-helper; do load "$m" || exit 0; done
+  line "mtp driver $(ls -l /sys/bus/platform/devices/514600000.mtp/driver 2>/dev/null | sed 's/.*-> //')"
+  load dockchannel-hid
+  sleep 5
+  line "input: $(grep -h Name= /proc/bus/input/devices | cut -d= -f2 | tr '\n' ';')"
+  ;;
+esac
+S
+chmod 755 /new/usr/local/bin/macho-late-load
+cat > /new/etc/systemd/system/macho-late-input.service <<'S'
+[Unit]
+Description=macho late load: keyboard and trackpad
+After=multi-user.target
+[Service]
+Type=oneshot
+TimeoutStartSec=180
+ExecStart=/usr/local/bin/macho-late-load input
+StandardOutput=kmsg
+StandardError=kmsg
+S
+mkdir -p /new/etc/systemd/system/graphical.target.wants
+# M8: asahi late and by hand of a timer, one log line first. The session moves to the GPU at the end of this script.
+cp /lib/modules/asahi.ko /new/usr/local/lib/macho-asahi.ko
+cat > /new/usr/local/bin/macho-gpu <<'S'
+#!/bin/sh
+L=/run/macho-status.log
+say() { echo "GPU: $1" | tee -a "$L" > /dev/kmsg; }
+say "insmod asahi now; a stop after this line is the driver"
+insmod /usr/local/lib/macho-asahi.ko > /run/macho-gpu.out 2>&1; rc=$?; cat /run/macho-gpu.out >> "$L"
+say "insmod returned $rc"
+for i in 1 2 3 4 5 6; do dmesg | grep -E 'asahi|UAT:' | tail -n 8 >> "$L"; sleep 5; done
+[ -e /dev/dri/renderD128 ] || { say "no render node, staying on the software renderer"; exit 0; }
+say "render node up, vulkaninfo"
+timeout 30 vulkaninfo --summary 2>&1 | grep -E 'deviceName|driverName' >> "$L"
+# the desktop moves to the GPU: simpledrm keeps scanning out, Hyprland renders on the sole renderD (aquamarine). A stop from here on is the first real GPU work.
+mkdir -p /run/m4; printf 'ok aurora\n' > /run/m4/gpu-ready
+# final (F35): the caller (dispgpu) starts the stopped session itself, once, on the panel's card and this render node
+[ -n "$MACHO_GPU_NORESTART" ] && { say "render node ready, the session starts on it next"; exit 0; }
+say "restarting the session on the GPU; a stop after this line is the first GPU work"
+systemctl restart display-manager
+sleep 30
+H=$(ls -t /run/user/1001/hypr/*/hyprland.log | head -1)
+grep -aE 'sole renderD|Creating CDRMRenderer|Vendor:|Renderer:' "$H" | head -6 | cut -c1-140 >> "$L"
+say "Hyprland pid $(pgrep -x Hyprland | head -1), failed GPU work: $(dmesg | grep -c 'asahi.*fail')"
+S
+chmod +x /new/usr/local/bin/macho-gpu
+cat > /new/etc/systemd/system/macho-gpu.service <<'S'
+[Unit]
+Description=macho GPU bring-up, late
+After=graphical.target
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/macho-gpu
+[Install]
+WantedBy=graphical.target
+S
+mkdir -p /new/etc/systemd/system/graphical.target.wants
+# switch_root deletes the initramfs, sshd-session with it, so the initrd sshd can start no session afterwards and still holds
+# :22. Keep the initrd link (wpa_supplicant runs from memory, the address stays), keep NetworkManager off wld0, and let
+# macho-wifi start the root's sshd on it. Open initrd sessions end here; the collectors reconnect to the root's sshd.
+if ip -4 addr show wld0 2>/dev/null | grep -q 192.168.1.131; then
+  mkdir -p /new/etc/NetworkManager/conf.d
+  printf '[keyfile]\nunmanaged-devices=interface-name:wld0\n' > /new/etc/NetworkManager/conf.d/90-macho-initrd-link.conf
+  touch /new/etc/macho-initrd-link
+  killall sshd-session sshd 2>/dev/null
+  say "NET: initrd link kept for the root, initrd sshd stopped"
+fi
+[ -n "$e2e" ] && { touch /new/etc/macho-e2e; say "E2E: sequencer order tso input display gpu kvm late, remote via /run/macho-step"; }
+[ -n "$fin" ] && { touch /new/etc/macho-final; say "FINAL: sequencer order input smp dispgpu late kvmon litmus1, remote steps via /run/macho-step"; }
+if [ -n "$flu" ]; then
+  touch /new/etc/macho-fluent
+  # the daily m4 session profile reads these: the panel's card and the GPU are up before the display manager starts
+  mkdir -p /new/run/m4; echo ok > /new/run/m4/display-ready; printf 'ok aurora\n' > /new/run/m4/gpu-ready
+  # the Unknown-1 (simplefb) monitor rule would be stale: the panel is eDP-1 from the first session on
+  sed -i '/output = "Unknown-1"/d; /simpledrm.s connector is Unknown-1/d' /new/home/morpheus/.config/hypr/autostart.lua 2>/dev/null
+  say "FLUENT: desktop starts once on $(ls /dev/dri/by-path 2>/dev/null | tr '\n' ' '); sequencer provision coldplug kbdbl bt usb0 usb1 kvmon"
+fi
+if [ -n "$rel" ]; then
+  touch /new/etc/macho-reliable
+  for u in macho-net.service macho-late.service macho-late-input.service macho-gpu.service; do ln -sf /dev/null /new/etc/systemd/system/$u; done
+  say "RELIABLE: masked macho-net, macho-late, macho-late-input, macho-gpu; sequencer runs tso only"
+fi
+kill "$thermal_pid" "$hb_pid" 2>/dev/null
+# the 8 s of the cmdline are for the matrix. On the desktop a stall of the ANS above them would reset the controller and fail every command; XNU has 35 s here
+echo 35000 > /sys/block/nvme0n1/queue/io_timeout; say "NVME: io_timeout $(cat /sys/block/nvme0n1/queue/io_timeout) ms"
+say "SWITCH: Omarchy from NVMe, overlay in RAM, $(grep MemTotal /proc/meminfo)"
+mount --move /dev /new/dev
+# a step past its limit must not go on from a deleted initramfs: it would start an initrd sshd on :22 after the killall below
+kill -9 $bpids 2>/dev/null
+# the ACM shell crosses switch_root inside the overlay (RAM): a stuck NVMe cannot take its busybox away. Read here: USB may have finished after its limit.
+usb_shell=$(cat /run/usb-shell 2>/dev/null)
+if [ -n "$usb_shell" ]; then
+  mkdir -p /new/usr/local/bbin
+  cp /bin/busybox /new/usr/local/bbin/busybox
+  for a in $(/bin/busybox --list); do [ "$a" = busybox ] || ln -sf busybox /new/usr/local/bbin/$a; done
+  ln -sf /dev/null /new/etc/systemd/system/serial-getty@ttyGS0.service
+  mkdir -p /new/etc/NetworkManager/conf.d
+  printf '[keyfile]\nunmanaged-devices=interface-name:usb*\n' > /new/etc/NetworkManager/conf.d/91-macho-usb.conf
+  # /dev already moved: in this root the node is /new/dev/ttyGS0, a plain /dev/ttyGS0 never opened since F23
+  kill "$usb_shell" 2>/dev/null; fuser -k /new/dev/ttyGS0 2>/dev/null; killall sshd-session sshd 2>/dev/null
+  PATH=/usr/local/bbin /bin/busybox setsid /bin/busybox chroot /new /usr/local/bbin/sh -c 'while :; do sh -i; sleep 1; done' </new/dev/ttyGS0 >/new/dev/ttyGS0 2>&1 &
+fi
+mount --move /proc /new/proc
+mount --move /sys /new/sys
+exec switch_root /new /usr/lib/systemd/systemd

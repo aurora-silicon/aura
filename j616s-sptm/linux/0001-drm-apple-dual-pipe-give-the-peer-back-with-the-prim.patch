@@ -1,0 +1,112 @@
+From ff6a6909a82560ffdb798541f38b27275fc7d7dd Mon Sep 17 00:00:00 2001
+From: fbalazsy <frantisekbalazsy@gmail.com>
+Date: Tue, 27 Oct 2026 15:29:37 +0100
+Subject: [PATCH 01/11] drm/apple: dual pipe: give the peer back with the
+ primary's link
+
+A pair's peer stayed marked as its owner's peer after the owner's display
+was gone: after system sleep, or a cable change, the port could move to
+the peer pipe, and the peer then ran its own display with the owner
+recorded. dcp_peer_swap_complete_26_6() takes the swaps of a reserved
+peer for the pair's and discarded the display's own swaps: the picture
+stuttered and the CRTC retrained in a loop.
+
+The reservation is released when the primary disconnects its DPTX link
+(a merged pair is stopped first by the power-off, and a pair that still
+runs is kept); the next allocation reserves a peer again. A peer's swap
+is only taken for the pair's while the peer has no route of its own. A
+pipe that was unbound is no longer refused as a peer after it binds
+again.
+---
+ drivers/gpu/drm/apple/dcp-peer-v26_6.inc | 33 +++++++++++++++++++++++-
+ drivers/gpu/drm/apple/dcp.c              |  3 +++
+ drivers/gpu/drm/apple/dcp.h              |  2 ++
+ 3 files changed, 37 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/apple/dcp-peer-v26_6.inc b/drivers/gpu/drm/apple/dcp-peer-v26_6.inc
+index 8be2e69a03e5..70e16c5330a2 100644
+--- a/drivers/gpu/drm/apple/dcp-peer-v26_6.inc
++++ b/drivers/gpu/drm/apple/dcp-peer-v26_6.inc
+@@ -118,6 +118,36 @@ static int dcp_peer_call_oob(struct apple_dcp *dcp, const char *tag,
+ 
+ /* ---- peer release / forget ---- */
+ 
++/*
++ * The primary's display is gone (cable removed, port moved, system sleep):
++ * give the reserved peer back.  A merged pair is stopped first; a pair that
++ * still runs is kept.  The next allocation reserves a peer again.  Without
++ * this the peer stays marked as an owner's peer after its port was taken by
++ * another display, and swap_complete would discard that display's own swaps.
++ */
++void dcp_peer_release_26_6(struct apple_dcp *dcp)
++{
++	guard(mutex)(&dcp_peer_lock);
++	if (dcp->peer_reserved) {
++		struct apple_dcp *peer = dcp->peer_reserved;
++
++		if (dcp->peer_tiling.vftg || dcp->peer_tiling.member ||
++		    peer->peer_tiling.vftg || peer->peer_tiling.member)
++			return;
++		memset(&dcp->peer_tiling, 0, sizeof(dcp->peer_tiling));
++		memset(&peer->peer_tiling, 0, sizeof(peer->peer_tiling));
++		peer->peer_owner = NULL;
++		dcp->peer_reserved = NULL;
++		dcp->peer_active = false;
++	}
++}
++
++void dcp_peer_bound_26_6(struct apple_dcp *dcp)
++{
++	guard(mutex)(&dcp_peer_lock);
++	dcp->peer_unbinding = false;
++}
++
+ static void dcp_peer_forget(struct apple_dcp *dcp)
+ {
+ 	guard(mutex)(&dcp_peer_lock);
+@@ -971,7 +1001,8 @@ void dcp_peer_swap_submit_26_6(struct apple_dcp *dcp,
+  */
+ bool dcp_peer_swap_complete_26_6(struct apple_dcp *dcp, u32 swap_id)
+ {
+-	if (!READ_ONCE(dcp->peer_owner))
++	/* Only a peer without a display of its own: its swaps are the pair's. */
++	if (!READ_ONCE(dcp->peer_owner) || READ_ONCE(dcp->active_typec_route))
+ 		return false;
+ 	WRITE_ONCE(dcp->last_swap_id, swap_id);
+ 	WRITE_ONCE(dcp->have_swap_complete, true);
+diff --git a/drivers/gpu/drm/apple/dcp.c b/drivers/gpu/drm/apple/dcp.c
+index 447d882f933f..c472ebdb47a2 100644
+--- a/drivers/gpu/drm/apple/dcp.c
++++ b/drivers/gpu/drm/apple/dcp.c
+@@ -2631,6 +2631,8 @@ int dcp_dptx_disconnect(struct apple_dcp *dcp, u32 port)
+ 	if (!ret)
+ 		WRITE_ONCE(dcp->dptxport[port].tile_hint, false);
+ 	mutex_unlock(&dcp->hpd_mutex);
++	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP && !port)
++		dcp_peer_release_26_6(dcp);
+ 
+ 	return ret;
+ }
+@@ -4829,6 +4831,7 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
+ 
+ 	if (READ_ONCE(dcp->ext_dead))
+ 		return 0;
++	dcp_peer_bound_26_6(dcp);
+ 	ret = dcp_comp_bind_pipe(dev, main, data);
+ 	if (ret && dcp->ext_failsafe) {
+ 		dcp_ext_give_up(dcp, ret, "bind");
+diff --git a/drivers/gpu/drm/apple/dcp.h b/drivers/gpu/drm/apple/dcp.h
+index f6f1c4c5282b..1b62f3df7889 100644
+--- a/drivers/gpu/drm/apple/dcp.h
++++ b/drivers/gpu/drm/apple/dcp.h
+@@ -159,5 +159,7 @@ void dcp_peer_swap_submit_26_6(struct apple_dcp *dcp,
+ 			       u32 swap_id);
+ bool dcp_peer_swap_complete_26_6(struct apple_dcp *dcp, u32 swap_id);
+ int dcp_peer_stop_26_6(struct apple_dcp *dcp);
++void dcp_peer_release_26_6(struct apple_dcp *dcp);
++void dcp_peer_bound_26_6(struct apple_dcp *dcp);
+ 
+ #endif
+-- 
+2.56.0
+

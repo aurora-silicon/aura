@@ -1,0 +1,537 @@
+From 3b87da200afe88f7553a5bcacf40ddaaf7782975 Mon Sep 17 00:00:00 2001
+From: Ryan Murray <ryan@aurorasilicon.org>
+Date: Thu, 29 Oct 2026 09:39:01 +1100
+Subject: [PATCH 13/18] hwmon: macsmc: Register fans as thermal cooling devices
+
+On the M4 Pro MacBook Pro (J616s) the SMC keeps both fans in its own
+mode 3. With no operating system asking it for cooling, it leaves them
+off, or switches them on late and ramps them slowly, while the dies
+heat up: four busy CPU cores took the CPU die from 52 C to 95 C in two
+minutes with both fans at 0 rpm. Linux has to ask for the cooling.
+
+With #cooling-cells = <3> on the hwmon node, every fan registers a
+cooling device, named by its index among the fan-* nodes. State 0
+leaves the fan to the SMC; states 1 to 8 run it at speeds spread evenly
+from its minimum to its maximum, through the same manual mode and Ftst
+unlock as the fan_control target, which they do not need. A fan runs at
+the higher of the userspace target and its cooling state, so userspace
+cannot take it below what the thermal zones ask for, and it goes back
+to the SMC once neither asks for anything.
+
+Unlocking takes the SMC seconds, so states are applied from a work item.
+Any failure leaves the fan with the SMC. Suspend, shutdown and removal
+stop the work and hand every fan back; resume applies the cooling
+states again. Without #cooling-cells nothing changes.
+
+KUnit covers the state to speed mapping, cooling without fan_control,
+cooling together with a userspace target, the stopped state and a
+failed unlock.
+
+Assisted-by: LLM
+Signed-off-by: Ryan Murray <ryan@aurorasilicon.org>
+---
+ drivers/hwmon/macsmc-hwmon-test.c | 104 +++++++++++-
+ drivers/hwmon/macsmc-hwmon.c      | 264 ++++++++++++++++++++++++++----
+ 2 files changed, 332 insertions(+), 36 deletions(-)
+
+diff --git a/drivers/hwmon/macsmc-hwmon-test.c b/drivers/hwmon/macsmc-hwmon-test.c
+index 596e904a6f3e..312e752565e0 100644
+--- a/drivers/hwmon/macsmc-hwmon-test.c
++++ b/drivers/hwmon/macsmc-hwmon-test.c
+@@ -1,7 +1,8 @@
+ // SPDX-License-Identifier: GPL-2.0-only OR MIT
+ /*
+  * KUnit tests for the Apple SMC hwmon driver: channel numbering of the
+- * temperature sensors, which thermal zones depend on, and manual fan control.
++ * temperature sensors, which thermal zones depend on, and manual fan control
++ * by userspace and by the thermal framework.
+  *
+  * Included by macsmc-hwmon.c.
+  */
+@@ -217,6 +218,9 @@ static int macsmc_fan_test_init(struct kunit *test)
+ 	t->hwmon.fan.count = 2;
+ 	t->hwmon.fan.unlock_key = SMC_KEY(Ftst);
+ 	mutex_init(&t->hwmon.fan.lock);
++	INIT_WORK(&t->hwmon.fan.cool_work, macsmc_hwmon_fans_cool_work);
++	for (i = 0; i < 2; i++)
++		t->fans[i].hwmon = &t->hwmon;
+ 	test->priv = t;
+ 	fan_control = true;
+ 	kunit_activate_static_stub(test, apple_smc_read, fan_test_read);
+@@ -326,6 +330,99 @@ static void macsmc_fan_test_legacy(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, t->refused, 0);
+ }
+ 
++/* Cooling states spread over [min, max]; 0 asks for nothing. */
++static void macsmc_fan_test_state_rpm(struct kunit *test)
++{
++	KUNIT_EXPECT_EQ(test, macsmc_hwmon_fan_state_rpm(1350, 5777, 0), 0);
++	KUNIT_EXPECT_EQ(test, macsmc_hwmon_fan_state_rpm(1350, 5777, 1), 1350);
++	KUNIT_EXPECT_EQ(test, macsmc_hwmon_fan_state_rpm(1350, 5777, 4), 3247);
++	KUNIT_EXPECT_EQ(test, macsmc_hwmon_fan_state_rpm(1350, 5777,
++							 MACSMC_FAN_COOLING_STATES), 5777);
++	/* Never past the maximum, whatever the state. */
++	KUNIT_EXPECT_EQ(test, macsmc_hwmon_fan_state_rpm(1350, 5777,
++							 MACSMC_FAN_COOLING_STATES + 5), 5777);
++}
++
++/* Cooling needs no fan_control: unlock for a state, release at state 0. */
++static void macsmc_fan_test_cooling(struct kunit *test)
++{
++	struct macsmc_fan_test *t = test->priv;
++
++	fan_control = false;
++	t->fans[0].cool_state = 1;
++	macsmc_hwmon_fans_apply(&t->hwmon);
++	KUNIT_EXPECT_EQ(test, t->ftst, 1);
++	KUNIT_EXPECT_EQ(test, t->mode[0], MACSMC_FAN_MODE_MANUAL);
++	KUNIT_EXPECT_EQ(test, t->target[0], FAN_TEST_F1350);
++	/* The other fan asks for nothing and stays with the firmware. */
++	KUNIT_EXPECT_EQ(test, t->mode[1], MACSMC_FAN_MODE_AUTO);
++	KUNIT_EXPECT_FALSE(test, t->fans[1].manual);
++
++	t->fans[0].cool_state = MACSMC_FAN_COOLING_STATES;
++	macsmc_hwmon_fans_apply(&t->hwmon);
++	KUNIT_EXPECT_EQ(test, t->target[0], FAN_TEST_F5777);
++	KUNIT_EXPECT_EQ(test, t->ftst_writes, 1);
++
++	t->fans[0].cool_state = 0;
++	macsmc_hwmon_fans_apply(&t->hwmon);
++	fan_test_released(test, t);
++}
++
++/* A fan runs at the higher of the userspace target and the cooling state. */
++static void macsmc_fan_test_cooling_and_user(struct kunit *test)
++{
++	struct macsmc_fan_test *t = test->priv;
++
++	KUNIT_ASSERT_EQ(test, macsmc_hwmon_set_fan(&t->hwmon, 0, 2500), 0);
++	t->fans[0].cool_state = 1;
++	macsmc_hwmon_fans_apply(&t->hwmon);
++	KUNIT_EXPECT_EQ(test, t->target[0], FAN_TEST_F2500);
++
++	t->fans[0].cool_state = MACSMC_FAN_COOLING_STATES;
++	macsmc_hwmon_fans_apply(&t->hwmon);
++	KUNIT_EXPECT_EQ(test, t->target[0], FAN_TEST_F5777);
++	/* Userspace cannot take the fan below what cooling asks for. */
++	KUNIT_ASSERT_EQ(test, macsmc_hwmon_set_fan(&t->hwmon, 0, 1350), 0);
++	KUNIT_EXPECT_EQ(test, t->target[0], FAN_TEST_F5777);
++	KUNIT_ASSERT_EQ(test, macsmc_hwmon_set_fan(&t->hwmon, 0, 0), 0);
++	KUNIT_EXPECT_EQ(test, t->mode[0], MACSMC_FAN_MODE_MANUAL);
++
++	t->fans[0].cool_state = 0;
++	macsmc_hwmon_fans_apply(&t->hwmon);
++	fan_test_released(test, t);
++}
++
++/* Once stopped (suspend, shutdown, removal), no state takes a fan back. */
++static void macsmc_fan_test_cooling_stopped(struct kunit *test)
++{
++	struct macsmc_fan_test *t = test->priv;
++
++	t->fans[0].cool_state = 4;
++	t->fans[1].cool_state = 4;
++	macsmc_hwmon_fans_apply(&t->hwmon);
++	KUNIT_EXPECT_EQ(test, t->hwmon.fan.manual, 2);
++
++	macsmc_hwmon_fans_stop(&t->hwmon);
++	fan_test_released(test, t);
++
++	macsmc_hwmon_fans_apply(&t->hwmon);
++	fan_test_released(test, t);
++	KUNIT_EXPECT_EQ(test, t->ftst_writes, 2);
++}
++
++/* A failed unlock leaves the fan with the firmware. */
++static void macsmc_fan_test_cooling_unlock_fails(struct kunit *test)
++{
++	struct macsmc_fan_test *t = test->priv;
++
++	t->fail_key = SMC_KEY(Ftst);
++	t->fans[0].cool_state = MACSMC_FAN_COOLING_STATES;
++	macsmc_hwmon_fans_apply(&t->hwmon);
++	KUNIT_EXPECT_EQ(test, t->mode[0], MACSMC_FAN_MODE_SYSTEM);
++	KUNIT_EXPECT_EQ(test, t->hwmon.fan.manual, 0);
++	KUNIT_EXPECT_FALSE(test, t->hwmon.fan.unlocked);
++}
++
+ static struct kunit_case macsmc_fan_test_cases[] = {
+ 	KUNIT_CASE(macsmc_fan_test_unlock_and_release),
+ 	KUNIT_CASE(macsmc_fan_test_clamp),
+@@ -333,6 +430,11 @@ static struct kunit_case macsmc_fan_test_cases[] = {
+ 	KUNIT_CASE(macsmc_fan_test_two_fans),
+ 	KUNIT_CASE(macsmc_fan_test_no_unlock_key),
+ 	KUNIT_CASE(macsmc_fan_test_legacy),
++	KUNIT_CASE(macsmc_fan_test_state_rpm),
++	KUNIT_CASE(macsmc_fan_test_cooling),
++	KUNIT_CASE(macsmc_fan_test_cooling_and_user),
++	KUNIT_CASE(macsmc_fan_test_cooling_stopped),
++	KUNIT_CASE(macsmc_fan_test_cooling_unlock_fails),
+ 	{}
+ };
+ 
+diff --git a/drivers/hwmon/macsmc-hwmon.c b/drivers/hwmon/macsmc-hwmon.c
+index 76f07add003d..c0ca04e88d3d 100644
+--- a/drivers/hwmon/macsmc-hwmon.c
++++ b/drivers/hwmon/macsmc-hwmon.c
+@@ -36,6 +36,7 @@
+ #include <linux/string.h>
+ #include <linux/sysfs.h>
+ #include <linux/thermal.h>
++#include <linux/workqueue.h>
+ 
+ #define MAX_LABEL_LENGTH	32
+ 
+@@ -184,6 +185,13 @@ struct macsmc_hwmon_fan {
+ 	char label[MAX_LABEL_LENGTH];
+ 	u32 attrs;
+ 	bool manual;
++	/* Index of the fan node among the fan-* nodes: its cooling device id. */
++	u32 index;
++	struct macsmc_hwmon *hwmon;
++	/* Speed asked for through the fan_control target, 0 for none. */
++	long user_rpm;
++	/* Cooling state asked for by the thermal framework, 0 for none. */
++	unsigned long cool_state;
+ };
+ 
+ struct macsmc_hwmon_sensors {
+@@ -198,6 +206,13 @@ struct macsmc_hwmon_sensors {
+ /* The firmware's own fan policy; it refuses a manual mode request. */
+ #define MACSMC_FAN_MODE_SYSTEM	3
+ 
++/*
++ * Cooling states of a fan with #cooling-cells: 0 leaves the fan to the
++ * firmware, 1 to MACSMC_FAN_COOLING_STATES run it at speeds spread evenly
++ * from its minimum to its maximum.
++ */
++#define MACSMC_FAN_COOLING_STATES	8
++
+ /* How long the firmware gets to leave or re-enter its system mode */
+ #define MACSMC_FAN_MODE_TIMEOUT_MS	10000
+ #define MACSMC_FAN_MODE_POLL_MS		100
+@@ -216,6 +231,10 @@ struct macsmc_hwmon_fans {
+ 	bool unlocked;
+ 	/* Fans in manual mode */
+ 	u32 manual;
++	/* Applies the cooling states, which can take seconds to unlock. */
++	struct work_struct cool_work;
++	/* Suspended, shut down or going away: every fan stays with the SMC. */
++	bool stopped;
+ };
+ 
+ struct macsmc_hwmon {
+@@ -616,10 +635,63 @@ static int macsmc_hwmon_fan_manual(struct macsmc_hwmon *hwmon,
+ 	return 0;
+ }
+ 
++/* The speed of a cooling state of a fan running from @min to @max. */
++static long macsmc_hwmon_fan_state_rpm(long min, long max, unsigned long state)
++{
++	if (!state)
++		return 0;
++	state = min(state, MACSMC_FAN_COOLING_STATES);
++	return min + DIV_ROUND_CLOSEST((max - min) * (long)(state - 1),
++				       MACSMC_FAN_COOLING_STATES - 1);
++}
++
++/*
++ * Run a fan at the higher of the userspace target and the speed of its
++ * cooling state, or hand it to the firmware when neither asks for anything.
++ * Any failure leaves the fan with the firmware. Called with the fan lock held.
++ */
++static int macsmc_hwmon_fan_apply(struct macsmc_hwmon *hwmon,
++				  struct macsmc_hwmon_fan *fan)
++{
++	unsigned long state = READ_ONCE(fan->cool_state);
++	long min, max, rpm;
++	int ret;
++
++	if (hwmon->fan.stopped || (!fan->user_rpm && !state))
++		return macsmc_hwmon_fan_auto(hwmon, fan);
++
++	/*
++	 * The SMC does no sanity checks on requested fan speeds, so we need to.
++	 */
++	ret = macsmc_hwmon_read_key(hwmon->smc, &fan->min, 1, &min);
++	if (!ret)
++		ret = macsmc_hwmon_read_key(hwmon->smc, &fan->max, 1, &max);
++	if (!ret && (min <= 0 || max < min))
++		ret = -EIO;
++	if (ret) {
++		macsmc_hwmon_fan_auto(hwmon, fan);
++		return ret;
++	}
++
++	rpm = max(fan->user_rpm, macsmc_hwmon_fan_state_rpm(min, max, state));
++	rpm = clamp(rpm, min, max);
++
++	ret = macsmc_hwmon_fan_manual(hwmon, fan);
++	if (ret)
++		return ret;
++
++	ret = macsmc_hwmon_write_key(hwmon->smc, &fan->set, rpm);
++	if (ret < 0) {
++		macsmc_hwmon_fan_auto(hwmon, fan);
++		return ret;
++	}
++
++	return 0;
++}
++
+ static int macsmc_hwmon_set_fan(struct macsmc_hwmon *hwmon, int channel, long val)
+ {
+ 	struct macsmc_hwmon_fan *fan = &hwmon->fan.fans[channel];
+-	long min, max;
+ 	int ret;
+ 
+ 	if (!fan_control || fan->mode.macsmc_key == 0)
+@@ -629,36 +701,13 @@ static int macsmc_hwmon_set_fan(struct macsmc_hwmon *hwmon, int channel, long va
+ 
+ 	guard(mutex)(&hwmon->fan.lock);
+ 
+-	/* 0 hands the fan back to the firmware. */
+-	if (!val)
+-		return macsmc_hwmon_fan_auto(hwmon, fan);
+-
+-	/*
+-	 * The SMC does no sanity checks on requested fan speeds, so we need to.
+-	 */
+-	ret = macsmc_hwmon_read_key(hwmon->smc, &fan->min, 1, &min);
++	/* 0 drops the request; the fan goes back to the firmware unless cooling. */
++	fan->user_rpm = val;
++	ret = macsmc_hwmon_fan_apply(hwmon, fan);
+ 	if (ret)
+-		return ret;
++		fan->user_rpm = 0;
+ 
+-	ret = macsmc_hwmon_read_key(hwmon->smc, &fan->max, 1, &max);
+-	if (ret)
+-		return ret;
+-
+-	if (min <= 0 || max < min)
+-		return -EIO;
+-	val = clamp(val, min, max);
+-
+-	ret = macsmc_hwmon_fan_manual(hwmon, fan);
+-	if (ret)
+-		return ret;
+-
+-	ret = macsmc_hwmon_write_key(hwmon->smc, &fan->set, val);
+-	if (ret < 0) {
+-		macsmc_hwmon_fan_auto(hwmon, fan);
+-		return ret;
+-	}
+-
+-	return 0;
++	return ret;
+ }
+ 
+ static int macsmc_hwmon_write_fan(struct device *dev, u32 attr, int channel,
+@@ -677,11 +726,129 @@ static void macsmc_hwmon_fans_restore(struct macsmc_hwmon *hwmon)
+ 		macsmc_hwmon_fan_auto(hwmon, &hwmon->fan.fans[i]);
+ }
+ 
++/* Bring every fan in line with its requests, unless stopped. */
++static void macsmc_hwmon_fans_apply(struct macsmc_hwmon *hwmon)
++{
++	u32 i;
++	int ret;
++
++	guard(mutex)(&hwmon->fan.lock);
++	for (i = 0; i < hwmon->fan.count; i++) {
++		struct macsmc_hwmon_fan *fan = &hwmon->fan.fans[i];
++
++		ret = macsmc_hwmon_fan_apply(hwmon, fan);
++		if (ret)
++			dev_warn_ratelimited(hwmon->dev,
++					     "%s left to the SMC: cannot run cooling state %lu (%d)\n",
++					     fan->label, READ_ONCE(fan->cool_state), ret);
++	}
++}
++
++static void macsmc_hwmon_fans_cool_work(struct work_struct *work)
++{
++	macsmc_hwmon_fans_apply(container_of(work, struct macsmc_hwmon, fan.cool_work));
++}
++
++/*
++ * Stop applying cooling states and hand every fan back to the firmware, for
++ * suspend, shutdown and removal.
++ */
++static void macsmc_hwmon_fans_stop(struct macsmc_hwmon *hwmon)
++{
++	scoped_guard(mutex, &hwmon->fan.lock)
++		hwmon->fan.stopped = true;
++	cancel_work_sync(&hwmon->fan.cool_work);
++	macsmc_hwmon_fans_restore(hwmon);
++}
++
+ static void macsmc_hwmon_fans_restore_action(void *data)
+ {
+-	macsmc_hwmon_fans_restore(data);
++	macsmc_hwmon_fans_stop(data);
+ }
+ 
++#if IS_ENABLED(CONFIG_THERMAL_OF)
++static int macsmc_hwmon_fan_get_max_state(struct thermal_cooling_device *cdev,
++					  unsigned long *state)
++{
++	*state = MACSMC_FAN_COOLING_STATES;
++	return 0;
++}
++
++static int macsmc_hwmon_fan_get_cur_state(struct thermal_cooling_device *cdev,
++					  unsigned long *state)
++{
++	struct macsmc_hwmon_fan *fan = cdev->devdata;
++
++	*state = READ_ONCE(fan->cool_state);
++	return 0;
++}
++
++/*
++ * Unlocking the fans takes the firmware seconds, so the state is applied
++ * from a work item rather than from the thermal zone update.
++ */
++static int macsmc_hwmon_fan_set_cur_state(struct thermal_cooling_device *cdev,
++					  unsigned long state)
++{
++	struct macsmc_hwmon_fan *fan = cdev->devdata;
++
++	if (state > MACSMC_FAN_COOLING_STATES)
++		return -EINVAL;
++
++	WRITE_ONCE(fan->cool_state, state);
++	queue_work(system_freezable_wq, &fan->hwmon->fan.cool_work);
++	return 0;
++}
++
++static const struct thermal_cooling_device_ops macsmc_hwmon_fan_cooling_ops = {
++	.get_max_state = macsmc_hwmon_fan_get_max_state,
++	.get_cur_state = macsmc_hwmon_fan_get_cur_state,
++	.set_cur_state = macsmc_hwmon_fan_set_cur_state,
++};
++
++/*
++ * With #cooling-cells = <3> on the hwmon node, every fan is a cooling device
++ * for the thermal zones that map it as <&hwmon fan-index lower upper>, the
++ * index counting the fan-* nodes in order. Without it the fans stay with the
++ * firmware as before.
++ */
++static void macsmc_hwmon_fans_register_cooling(struct macsmc_hwmon *hwmon)
++{
++	const u32 needed = HWMON_F_MIN | HWMON_F_MAX | HWMON_F_TARGET;
++	u32 cells, i;
++
++	if (!hwmon->fan.count ||
++	    of_property_read_u32(hwmon->dev->of_node, "#cooling-cells", &cells))
++		return;
++	if (cells != 3) {
++		dev_warn(hwmon->dev, "#cooling-cells must be 3; fans left to the SMC\n");
++		return;
++	}
++
++	for (i = 0; i < hwmon->fan.count; i++) {
++		struct macsmc_hwmon_fan *fan = &hwmon->fan.fans[i];
++		struct thermal_cooling_device *cdev;
++
++		if ((fan->attrs & needed) != needed || !fan->mode.macsmc_key) {
++			dev_warn(hwmon->dev, "%s has no speed or mode keys; not a cooling device\n",
++				 fan->label);
++			continue;
++		}
++
++		cdev = devm_thermal_of_cooling_device_register(hwmon->dev, fan->index,
++								"macsmc-fan", fan,
++								&macsmc_hwmon_fan_cooling_ops);
++		if (IS_ERR(cdev))
++			dev_warn(hwmon->dev, "%s: cannot register a cooling device (%pe)\n",
++				 fan->label, cdev);
++	}
++}
++#else
++static void macsmc_hwmon_fans_register_cooling(struct macsmc_hwmon *hwmon)
++{
++}
++#endif
++
+ static int macsmc_hwmon_read(struct device *dev, enum hwmon_sensor_types type,
+ 			     u32 attr, int channel, long *val)
+ {
+@@ -1120,9 +1287,13 @@ static int macsmc_hwmon_populate_sensors(struct macsmc_hwmon *hwmon,
+ 		if (!hwmon->fan.fans)
+ 			return -ENOMEM;
+ 
++		n_fan = 0;
+ 		for_each_child_of_node_with_prefix(hwmon_node, key_node, "fan-") {
+-			if (!macsmc_hwmon_create_fan(hwmon->dev, hwmon->smc, key_node,
+-						     &hwmon->fan.fans[hwmon->fan.count]))
++			struct macsmc_hwmon_fan *fan = &hwmon->fan.fans[hwmon->fan.count];
++
++			fan->hwmon = hwmon;
++			fan->index = n_fan++;
++			if (!macsmc_hwmon_create_fan(hwmon->dev, hwmon->smc, key_node, fan))
+ 				hwmon->fan.count++;
+ 		}
+ 	}
+@@ -1513,6 +1684,7 @@ static int macsmc_hwmon_probe(struct platform_device *pdev)
+ 	ret = devm_mutex_init(&pdev->dev, &hwmon->fan.lock);
+ 	if (ret)
+ 		return ret;
++	INIT_WORK(&hwmon->fan.cool_work, macsmc_hwmon_fans_cool_work);
+ 
+ 	ret = macsmc_hwmon_populate_sensors(hwmon, hwmon->dev->of_node);
+ 	if (ret) {
+@@ -1576,6 +1748,12 @@ static int macsmc_hwmon_probe(struct platform_device *pdev)
+ 			return ret;
+ 	}
+ 
++	/*
++	 * Released before the restore action above, which stops the cooling
++	 * work and hands the fans back.
++	 */
++	macsmc_hwmon_fans_register_cooling(hwmon);
++
+ 	dev_dbg(hwmon->dev, "Registered SMC hwmon device. Sensors:\n");
+ 	dev_dbg(hwmon->dev,
+ 		"Current: %d, Fans: %d, Power: %d, Temperature: %d, Voltage: %d",
+@@ -1597,16 +1775,32 @@ static void macsmc_hwmon_shutdown(struct platform_device *pdev)
+ 	struct macsmc_hwmon *hwmon = platform_get_drvdata(pdev);
+ 
+ 	if (hwmon)
+-		macsmc_hwmon_fans_restore(hwmon);
++		macsmc_hwmon_fans_stop(hwmon);
+ }
+ 
+ static int macsmc_hwmon_suspend(struct device *dev)
+ {
+-	macsmc_hwmon_fans_restore(dev_get_drvdata(dev));
++	macsmc_hwmon_fans_stop(dev_get_drvdata(dev));
+ 	return 0;
+ }
+ 
+-static DEFINE_SIMPLE_DEV_PM_OPS(macsmc_hwmon_pm_ops, macsmc_hwmon_suspend, NULL);
++/* Cooling states asked for before suspend apply again; the zones update them. */
++static int macsmc_hwmon_resume(struct device *dev)
++{
++	struct macsmc_hwmon *hwmon = dev_get_drvdata(dev);
++
++	scoped_guard(mutex, &hwmon->fan.lock) {
++		hwmon->fan.stopped = false;
++		/* The userspace targets were dropped when the fans went back. */
++		for (u32 i = 0; i < hwmon->fan.count; i++)
++			hwmon->fan.fans[i].user_rpm = 0;
++	}
++	queue_work(system_freezable_wq, &hwmon->fan.cool_work);
++	return 0;
++}
++
++static DEFINE_SIMPLE_DEV_PM_OPS(macsmc_hwmon_pm_ops, macsmc_hwmon_suspend,
++				macsmc_hwmon_resume);
+ 
+ static struct platform_driver macsmc_hwmon_driver = {
+ 	.probe = macsmc_hwmon_probe,
+-- 
+2.56.0
+

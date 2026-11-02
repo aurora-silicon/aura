@@ -1,0 +1,59 @@
+--- a/drivers/nvme/host/apple.c
++++ b/drivers/nvme/host/apple.c
+@@ -1219,7 +1219,13 @@
+ 		goto out_free_cmd;
+ 	}
+ 
+-	/* Trial boot under the monitor: nothing that changes the disk, setro does not stop an admin passthrough. */
++	/*
++	 * Under the monitor: nothing that changes the disk, setro does not stop an admin passthrough.
++	 * Writes only inside the GPT-checked ranges the boot DT publishes (/chosen/m4,write-lba-range,
++	 * the daily loader's ABI; none published = read-only as before), through the same guard as the
++	 * daily driver: namespace 1, 4 KiB LBAs, the whole command inside one range. No discard, no
++	 * write-zeroes, no admin command that changes the SSD.
++	 */
+ 	if (anv->hw->apif &&
+ 	    (q->is_adminq ? (cmnd->common.opcode == nvme_admin_format_nvm ||
+ 			     cmnd->common.opcode == nvme_admin_sanitize_nvm ||
+@@ -1232,7 +1238,9 @@
+ 			     cmnd->common.opcode == nvme_admin_virtual_mgmt ||
+ 			     cmnd->common.opcode >= nvme_admin_vendor_start) :
+ 			    (cmnd->common.opcode != nvme_cmd_read &&
+-			     cmnd->common.opcode != nvme_cmd_flush))) {
++			     cmnd->common.opcode != nvme_cmd_flush &&
++			     !(cmnd->common.opcode == nvme_cmd_write && anv->write_lba_ranges &&
++			       apple_nvme_partition_allowed(anv, q, ns, cmnd))))) {
+ 		dev_warn_ratelimited(anv->dev, "apif: write opcode 0x%x refused\n", cmnd->common.opcode);
+ 		ret = BLK_STS_IOERR;
+ 		goto out_free_cmd;
+@@ -2444,7 +2452,7 @@
+ 		ret = -ENODEV;
+ 		goto out_detach_genpd;
+ 	}
+-	if (anv->hw->partition_write_probe) {
++	if (anv->hw->partition_write_probe || anv->hw->apif) {
+ 		/* The loader's GPT-checked ranges win over the board DT's fallback */
+ 		struct device_node *chosen = of_find_node_by_path("/chosen");
+ 		bool from_loader = of_property_present(chosen, "m4,write-lba-range");
+@@ -2453,6 +2461,13 @@
+ 		unsigned int i;
+ 
+ 		ret = of_property_count_u64_elems(np, prop);
++		if (anv->hw->apif && !anv->hw->partition_write_probe && ret <= 0) {
++			/* APIF (the monitor's guest): no ranges published means read-only, not a refused probe */
++			of_node_put(chosen);
++			dev_info(dev, "No write ranges published, the disk stays read-only\n");
++			ret = 0;
++			goto ranges_done;
++		}
+ 		if (ret > 0 && ret % 2 == 0 && ret <= ARRAY_SIZE(anv->write_lba_range)) {
+ 			anv->write_lba_ranges = ret / 2;
+ 			ret = of_property_read_u64_array(np, prop, anv->write_lba_range,
+@@ -2475,6 +2490,7 @@
+ 			dev_info(dev, "Writes restricted to namespace 1, 4096-byte LBAs [%llu,%llu) (%s)\n",
+ 				 anv->write_lba_range[2 * i], anv->write_lba_range[2 * i + 1],
+ 				 from_loader ? "loader" : "board DT");
++ranges_done:;
+ 	}
+ 
+ 	ret = apple_nvme_attach_genpd(anv);

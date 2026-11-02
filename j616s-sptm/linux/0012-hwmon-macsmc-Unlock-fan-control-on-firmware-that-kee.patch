@@ -1,0 +1,683 @@
+From 2e311c534703a5f3f3227c01573b2dfbd5698b53 Mon Sep 17 00:00:00 2001
+From: Ryan Murray <ryan@aurorasilicon.org>
+Date: Tue, 27 Oct 2026 18:06:29 +1100
+Subject: [PATCH 12/18] hwmon: macsmc: Unlock fan control on firmware that
+ keeps fans in system mode
+
+On the M4 Pro MacBook Pro (J616s) both fans start in mode 3, the
+firmware's own fan policy, and the SMC refuses the manual mode write
+of the fan_control path with an error, so fan control from Linux did
+nothing. Public reports for M4 describe the same refusal and the Ftst
+key that releases the fans to the OS.
+
+When userspace first asks for a target on a fan whose mode write is
+refused while it reads mode 3, set Ftst, wait for the fan to leave
+system mode and ask again. When the last manual fan goes back to
+auto, clear Ftst and wait for every fan to return to mode 3. Firmware
+that takes the mode write directly keeps the mode 0 restore; firmware
+that refuses it without an Ftst key gets the error as before.
+
+Hand every manual fan back on unbind or remove, at shutdown and before
+suspend, and whenever a write in the sequence fails. Targets are now
+clamped to the fan's minimum and maximum instead of refused, so a
+target can never go below the minimum. Everything stays behind the
+existing fan_control parameter; without it nothing is written.
+
+The new KUnit suite models locked and legacy firmware.
+
+Assisted-by: LLM
+Signed-off-by: Ryan Murray <ryan@aurorasilicon.org>
+---
+ drivers/hwmon/Kconfig             |   7 +-
+ drivers/hwmon/macsmc-hwmon-test.c | 262 +++++++++++++++++++++++++++++-
+ drivers/hwmon/macsmc-hwmon.c      | 261 +++++++++++++++++++++++++----
+ 3 files changed, 497 insertions(+), 33 deletions(-)
+
+diff --git a/drivers/hwmon/Kconfig b/drivers/hwmon/Kconfig
+index 54eb5745105f..9b6b0593310d 100644
+--- a/drivers/hwmon/Kconfig
++++ b/drivers/hwmon/Kconfig
+@@ -1252,10 +1252,13 @@ config SENSORS_MACSMC_HWMON_KUNIT_TEST
+ 	depends on SENSORS_MACSMC_HWMON && KUNIT=y
+ 	default KUNIT_ALL_TESTS
+ 	help
+-	  Unit tests for the channel numbering of the Apple SMC hwmon driver.
++	  Unit tests for the channel numbering and the manual fan control of
++	  the Apple SMC hwmon driver.
+ 	  Thermal zones refer to temperature channels by index, so a sensor
+ 	  that cannot be set up must keep its channel; the tests check that.
+-	  No SMC is needed. Only useful for kernel developers.
++	  No SMC is needed: the fan tests model its fan keys and need
++	  MFD_MACSMC_KUNIT_TEST for its read and write stubs. Only useful for
++	  kernel developers.
+ 
+ config SENSORS_MAX1111
+ 	tristate "Maxim MAX1111 Serial 8-bit ADC chip and compatibles"
+diff --git a/drivers/hwmon/macsmc-hwmon-test.c b/drivers/hwmon/macsmc-hwmon-test.c
+index e7239986ce3c..596e904a6f3e 100644
+--- a/drivers/hwmon/macsmc-hwmon-test.c
++++ b/drivers/hwmon/macsmc-hwmon-test.c
+@@ -1,11 +1,12 @@
+ // SPDX-License-Identifier: GPL-2.0-only OR MIT
+ /*
+  * KUnit tests for the Apple SMC hwmon driver: channel numbering of the
+- * temperature sensors, which thermal zones depend on.
++ * temperature sensors, which thermal zones depend on, and manual fan control.
+  *
+  * Included by macsmc-hwmon.c.
+  */
+ 
++#include <kunit/static_stub.h>
+ #include <kunit/test.h>
+ 
+ /* What macsmc_hwmon_create_sensor() leaves behind for one node. */
+@@ -84,4 +85,261 @@ static struct kunit_suite macsmc_hwmon_test_suite = {
+ 	.test_cases = macsmc_hwmon_test_cases,
+ };
+ 
+-kunit_test_suite(macsmc_hwmon_test_suite);
++/*
++ * Manual fan control against a model of the SMC fan keys. In "locked" firmware
++ * the fans start in system mode (3) and refuse manual mode until Ftst is 1;
++ * Ftst back to 0 returns them to system mode. "Legacy" firmware takes the mode
++ * write directly. The model needs the SMC read/write stubs of
++ * CONFIG_MFD_MACSMC_KUNIT_TEST.
++ */
++#define FAN_TEST_F1350	0x44a8c000	/* 1350.0f */
++#define FAN_TEST_F2500	0x451c4000	/* 2500.0f */
++#define FAN_TEST_F5777	0x45b48800	/* 5777.0f */
++
++struct macsmc_fan_test {
++	struct apple_smc smc;
++	struct kunit *test;
++	struct macsmc_hwmon hwmon;
++	struct macsmc_hwmon_fan fans[2];
++	bool legacy;
++	u8 mode[2];
++	u32 target[2];
++	u8 ftst;
++	int ftst_writes;
++	int refused;
++	smc_key fail_key;
++};
++
++static int fan_test_index(smc_key key)
++{
++	return ((key >> 16) & 0xff) - '0';
++}
++
++static int fan_test_read(struct apple_smc *smc, smc_key key, void *buf, size_t size)
++{
++	struct macsmc_fan_test *t = container_of(smc, struct macsmc_fan_test, smc);
++	u32 value;
++	int i = fan_test_index(key);
++
++	switch (key & 0xff00ffff) {
++	case __SMC_KEY('F', 0, 'M', 'd'):
++		value = t->mode[i];
++		break;
++	case __SMC_KEY('F', 0, 'M', 'n'):
++		value = FAN_TEST_F1350;
++		break;
++	case __SMC_KEY('F', 0, 'M', 'x'):
++		value = FAN_TEST_F5777;
++		break;
++	case __SMC_KEY('F', 0, 'T', 'g'):
++		value = t->target[i];
++		break;
++	default:
++		KUNIT_FAIL(t->test, "unexpected read of %08x", key);
++		return -EINVAL;
++	}
++	memcpy(buf, &value, size);
++	return size;
++}
++
++static int fan_test_write(struct apple_smc *smc, smc_key key, const void *buf, size_t size)
++{
++	struct macsmc_fan_test *t = container_of(smc, struct macsmc_fan_test, smc);
++	u32 value = 0;
++	int i = fan_test_index(key);
++
++	memcpy(&value, buf, min(size, sizeof(value)));
++	if (key == t->fail_key)
++		return -EIO;
++
++	if (key == SMC_KEY(Ftst)) {
++		t->ftst_writes++;
++		t->ftst = value;
++		for (i = 0; i < ARRAY_SIZE(t->mode); i++) {
++			if (value && t->mode[i] == MACSMC_FAN_MODE_SYSTEM)
++				t->mode[i] = MACSMC_FAN_MODE_AUTO;
++			else if (!value)
++				t->mode[i] = MACSMC_FAN_MODE_SYSTEM;
++		}
++		return size;
++	}
++
++	switch (key & 0xff00ffff) {
++	case __SMC_KEY('F', 0, 'M', 'd'):
++		if (!t->legacy && t->mode[i] == MACSMC_FAN_MODE_SYSTEM) {
++			t->refused++;
++			return -EIO;
++		}
++		t->mode[i] = value;
++		return size;
++	case __SMC_KEY('F', 0, 'T', 'g'):
++		t->target[i] = value;
++		return size;
++	}
++	KUNIT_FAIL(t->test, "unexpected write of %08x", key);
++	return -EINVAL;
++}
++
++static void fan_test_key(struct macsmc_hwmon_sensor *sensor, const char *key, u32 type)
++{
++	sensor->macsmc_key = _SMC_KEY(key);
++	sensor->info.type_code = type;
++	sensor->info.flags = APPLE_SMC_READABLE | APPLE_SMC_WRITABLE;
++}
++
++static int macsmc_fan_test_init(struct kunit *test)
++{
++	static const char *const keys[2][5] = {
++		{ "F0Ac", "F0Mn", "F0Mx", "F0Tg", "F0Md" },
++		{ "F1Ac", "F1Mn", "F1Mx", "F1Tg", "F1Md" },
++	};
++	const u32 flt = __SMC_KEY('f', 'l', 't', ' '), ui8 = __SMC_KEY('u', 'i', '8', ' ');
++	struct macsmc_fan_test *t;
++	int i;
++
++	if (!IS_ENABLED(CONFIG_MFD_MACSMC_KUNIT_TEST))
++		kunit_skip(test, "needs CONFIG_MFD_MACSMC_KUNIT_TEST for the SMC stubs");
++
++	t = kunit_kzalloc(test, sizeof(*t), GFP_KERNEL);
++	if (!t)
++		return -ENOMEM;
++	t->test = test;
++	for (i = 0; i < 2; i++) {
++		fan_test_key(&t->fans[i].now, keys[i][0], flt);
++		fan_test_key(&t->fans[i].min, keys[i][1], flt);
++		fan_test_key(&t->fans[i].max, keys[i][2], flt);
++		fan_test_key(&t->fans[i].set, keys[i][3], flt);
++		fan_test_key(&t->fans[i].mode, keys[i][4], ui8);
++		t->mode[i] = MACSMC_FAN_MODE_SYSTEM;
++	}
++	t->hwmon.smc = &t->smc;
++	t->hwmon.fan.fans = t->fans;
++	t->hwmon.fan.count = 2;
++	t->hwmon.fan.unlock_key = SMC_KEY(Ftst);
++	mutex_init(&t->hwmon.fan.lock);
++	test->priv = t;
++	fan_control = true;
++	kunit_activate_static_stub(test, apple_smc_read, fan_test_read);
++	kunit_activate_static_stub(test, apple_smc_write, fan_test_write);
++	return 0;
++}
++
++static void macsmc_fan_test_exit(struct kunit *test)
++{
++	fan_control = false;
++}
++
++static void fan_test_released(struct kunit *test, struct macsmc_fan_test *t)
++{
++	KUNIT_EXPECT_EQ(test, t->ftst, 0);
++	KUNIT_EXPECT_EQ(test, t->mode[0], MACSMC_FAN_MODE_SYSTEM);
++	KUNIT_EXPECT_EQ(test, t->mode[1], MACSMC_FAN_MODE_SYSTEM);
++	KUNIT_EXPECT_EQ(test, t->hwmon.fan.manual, 0);
++	KUNIT_EXPECT_FALSE(test, t->hwmon.fan.unlocked);
++	KUNIT_EXPECT_FALSE(test, t->fans[0].manual);
++}
++
++/* Locked firmware: unlock on the first manual request, release on auto. */
++static void macsmc_fan_test_unlock_and_release(struct kunit *test)
++{
++	struct macsmc_fan_test *t = test->priv;
++
++	KUNIT_ASSERT_EQ(test, macsmc_hwmon_set_fan(&t->hwmon, 0, 2500), 0);
++	KUNIT_EXPECT_EQ(test, t->ftst, 1);
++	KUNIT_EXPECT_EQ(test, t->mode[0], MACSMC_FAN_MODE_MANUAL);
++	KUNIT_EXPECT_EQ(test, t->target[0], FAN_TEST_F2500);
++	KUNIT_EXPECT_EQ(test, t->hwmon.fan.manual, 1);
++
++	/* A second target needs no new unlock. */
++	KUNIT_ASSERT_EQ(test, macsmc_hwmon_set_fan(&t->hwmon, 0, 2500), 0);
++	KUNIT_EXPECT_EQ(test, t->ftst_writes, 1);
++
++	KUNIT_ASSERT_EQ(test, macsmc_hwmon_set_fan(&t->hwmon, 0, 0), 0);
++	fan_test_released(test, t);
++	KUNIT_EXPECT_EQ(test, t->ftst_writes, 2);
++}
++
++/* Targets are clamped to [min, max]; negative ones are refused. */
++static void macsmc_fan_test_clamp(struct kunit *test)
++{
++	struct macsmc_fan_test *t = test->priv;
++
++	KUNIT_ASSERT_EQ(test, macsmc_hwmon_set_fan(&t->hwmon, 0, 100), 0);
++	KUNIT_EXPECT_EQ(test, t->target[0], FAN_TEST_F1350);
++	KUNIT_ASSERT_EQ(test, macsmc_hwmon_set_fan(&t->hwmon, 0, 100000), 0);
++	KUNIT_EXPECT_EQ(test, t->target[0], FAN_TEST_F5777);
++	KUNIT_EXPECT_EQ(test, macsmc_hwmon_set_fan(&t->hwmon, 0, -1), -EINVAL);
++	KUNIT_ASSERT_EQ(test, macsmc_hwmon_set_fan(&t->hwmon, 0, 0), 0);
++	fan_test_released(test, t);
++}
++
++/* A failed target write hands the fan straight back. */
++static void macsmc_fan_test_target_write_fails(struct kunit *test)
++{
++	struct macsmc_fan_test *t = test->priv;
++
++	t->fail_key = SMC_KEY(F0Tg);
++	KUNIT_EXPECT_EQ(test, macsmc_hwmon_set_fan(&t->hwmon, 0, 2500), -EIO);
++	fan_test_released(test, t);
++}
++
++/* Two manual fans: the unlock is released only with the last one. */
++static void macsmc_fan_test_two_fans(struct kunit *test)
++{
++	struct macsmc_fan_test *t = test->priv;
++
++	KUNIT_ASSERT_EQ(test, macsmc_hwmon_set_fan(&t->hwmon, 0, 2500), 0);
++	KUNIT_ASSERT_EQ(test, macsmc_hwmon_set_fan(&t->hwmon, 1, 2500), 0);
++	KUNIT_EXPECT_EQ(test, t->hwmon.fan.manual, 2);
++	KUNIT_ASSERT_EQ(test, macsmc_hwmon_set_fan(&t->hwmon, 0, 0), 0);
++	KUNIT_EXPECT_EQ(test, t->ftst, 1);
++	KUNIT_EXPECT_EQ(test, t->mode[1], MACSMC_FAN_MODE_MANUAL);
++	/* Removal, shutdown and suspend all restore through this. */
++	macsmc_hwmon_fans_restore(&t->hwmon);
++	fan_test_released(test, t);
++}
++
++/* Locked firmware without the unlock key: refused, nothing else written. */
++static void macsmc_fan_test_no_unlock_key(struct kunit *test)
++{
++	struct macsmc_fan_test *t = test->priv;
++
++	t->hwmon.fan.unlock_key = 0;
++	KUNIT_EXPECT_EQ(test, macsmc_hwmon_set_fan(&t->hwmon, 0, 2500), -EIO);
++	KUNIT_EXPECT_EQ(test, t->ftst_writes, 0);
++	KUNIT_EXPECT_EQ(test, t->mode[0], MACSMC_FAN_MODE_SYSTEM);
++	KUNIT_EXPECT_EQ(test, t->hwmon.fan.manual, 0);
++}
++
++/* Firmware that takes the mode directly keeps the mode 0 restore. */
++static void macsmc_fan_test_legacy(struct kunit *test)
++{
++	struct macsmc_fan_test *t = test->priv;
++
++	t->legacy = true;
++	t->mode[0] = MACSMC_FAN_MODE_AUTO;
++	KUNIT_ASSERT_EQ(test, macsmc_hwmon_set_fan(&t->hwmon, 0, 2500), 0);
++	KUNIT_EXPECT_EQ(test, t->mode[0], MACSMC_FAN_MODE_MANUAL);
++	KUNIT_ASSERT_EQ(test, macsmc_hwmon_set_fan(&t->hwmon, 0, 0), 0);
++	KUNIT_EXPECT_EQ(test, t->mode[0], MACSMC_FAN_MODE_AUTO);
++	KUNIT_EXPECT_EQ(test, t->ftst_writes, 0);
++	KUNIT_EXPECT_EQ(test, t->refused, 0);
++}
++
++static struct kunit_case macsmc_fan_test_cases[] = {
++	KUNIT_CASE(macsmc_fan_test_unlock_and_release),
++	KUNIT_CASE(macsmc_fan_test_clamp),
++	KUNIT_CASE(macsmc_fan_test_target_write_fails),
++	KUNIT_CASE(macsmc_fan_test_two_fans),
++	KUNIT_CASE(macsmc_fan_test_no_unlock_key),
++	KUNIT_CASE(macsmc_fan_test_legacy),
++	{}
++};
++
++static struct kunit_suite macsmc_fan_test_suite = {
++	.name = "macsmc-hwmon-fan",
++	.init = macsmc_fan_test_init,
++	.exit = macsmc_fan_test_exit,
++	.test_cases = macsmc_fan_test_cases,
++};
++kunit_test_suites(&macsmc_hwmon_test_suite, &macsmc_fan_test_suite);
+diff --git a/drivers/hwmon/macsmc-hwmon.c b/drivers/hwmon/macsmc-hwmon.c
+index 06d2c6e2d0ac..76f07add003d 100644
+--- a/drivers/hwmon/macsmc-hwmon.c
++++ b/drivers/hwmon/macsmc-hwmon.c
+@@ -23,12 +23,15 @@
+ #include <linux/bitfield.h>
+ #include <linux/ctype.h>
+ #include <linux/debugfs.h>
++#include <linux/delay.h>
+ #include <linux/hwmon.h>
+ #include <linux/math64.h>
+ #include <linux/mfd/macsmc.h>
+ #include <linux/module.h>
++#include <linux/mutex.h>
+ #include <linux/of.h>
+ #include <linux/platform_device.h>
++#include <linux/pm.h>
+ #include <linux/seq_file.h>
+ #include <linux/string.h>
+ #include <linux/sysfs.h>
+@@ -189,10 +192,30 @@ struct macsmc_hwmon_sensors {
+ 	u32 count;
+ };
+ 
++/* Fan mode key values */
++#define MACSMC_FAN_MODE_AUTO	0
++#define MACSMC_FAN_MODE_MANUAL	1
++/* The firmware's own fan policy; it refuses a manual mode request. */
++#define MACSMC_FAN_MODE_SYSTEM	3
++
++/* How long the firmware gets to leave or re-enter its system mode */
++#define MACSMC_FAN_MODE_TIMEOUT_MS	10000
++#define MACSMC_FAN_MODE_POLL_MS		100
++
+ struct macsmc_hwmon_fans {
+ 	struct hwmon_channel_info channel_info;
+ 	struct macsmc_hwmon_fan *fans;
+ 	u32 count;
++	/* Serialises manual fan control and its unlock. */
++	struct mutex lock;
++	/*
++	 * Firmware that keeps its fans in system mode releases them to the
++	 * OS only while this key is 1. Zero if the SMC has no such key.
++	 */
++	smc_key unlock_key;
++	bool unlocked;
++	/* Fans in manual mode */
++	u32 manual;
+ };
+ 
+ struct macsmc_hwmon {
+@@ -466,57 +489,199 @@ static int macsmc_hwmon_read_fan(struct macsmc_hwmon *hwmon, u32 attr, int chan,
+ 	}
+ }
+ 
+-static int macsmc_hwmon_write_fan(struct device *dev, u32 attr, int channel,
+-				  long val)
++static int macsmc_hwmon_fan_read_mode(struct macsmc_hwmon *hwmon,
++				      struct macsmc_hwmon_fan *fan, u8 *mode)
+ {
+-	struct macsmc_hwmon *hwmon = dev_get_drvdata(dev);
++	return apple_smc_read_u8(hwmon->smc, fan->mode.macsmc_key, mode);
++}
++
++/*
++ * Hand the fans back to the firmware once no fan is manual: clear the unlock
++ * key and wait for every fan to return to system mode. Called with the fan
++ * lock held.
++ */
++static int macsmc_hwmon_fans_relock(struct macsmc_hwmon *hwmon)
++{
++	unsigned long timeout;
++	u32 i;
++	u8 mode;
++	int ret;
++
++	ret = apple_smc_write_u8(hwmon->smc, hwmon->fan.unlock_key, 0);
++	if (ret < 0) {
++		dev_err(hwmon->dev, "cannot hand the fans back to the SMC (%d)\n", ret);
++		return ret;
++	}
++	hwmon->fan.unlocked = false;
++
++	timeout = jiffies + msecs_to_jiffies(MACSMC_FAN_MODE_TIMEOUT_MS);
++	for (i = 0; i < hwmon->fan.count; i++) {
++		struct macsmc_hwmon_fan *fan = &hwmon->fan.fans[i];
++
++		if (!fan->mode.macsmc_key)
++			continue;
++		for (;;) {
++			ret = macsmc_hwmon_fan_read_mode(hwmon, fan, &mode);
++			if (ret)
++				return ret;
++			if (mode == MACSMC_FAN_MODE_SYSTEM)
++				break;
++			if (time_after(jiffies, timeout)) {
++				dev_warn(hwmon->dev, "%s stays in mode %u after release\n",
++					 fan->label, mode);
++				return -ETIMEDOUT;
++			}
++			msleep(MACSMC_FAN_MODE_POLL_MS);
++		}
++	}
++
++	return 0;
++}
++
++/* Return a fan to firmware control. Called with the fan lock held. */
++static int macsmc_hwmon_fan_auto(struct macsmc_hwmon *hwmon,
++				 struct macsmc_hwmon_fan *fan)
++{
++	int ret, relock;
++
++	if (!fan->manual)
++		return 0;
++
++	ret = macsmc_hwmon_write_key(hwmon->smc, &fan->mode, MACSMC_FAN_MODE_AUTO);
++	fan->manual = false;
++	hwmon->fan.manual--;
++
++	if (hwmon->fan.unlocked && !hwmon->fan.manual) {
++		relock = macsmc_hwmon_fans_relock(hwmon);
++		if (relock)
++			return relock;
++	}
++
++	return ret < 0 ? ret : 0;
++}
++
++/*
++ * Put a fan in manual mode. Firmware in system mode refuses that until the
++ * unlock key is set; it then leaves system mode and accepts the request.
++ * Called with the fan lock held.
++ */
++static int macsmc_hwmon_fan_manual(struct macsmc_hwmon *hwmon,
++				   struct macsmc_hwmon_fan *fan)
++{
++	unsigned long timeout;
++	u8 mode;
++	int ret;
++
++	if (fan->manual)
++		return 0;
++
++	ret = macsmc_hwmon_write_key(hwmon->smc, &fan->mode, MACSMC_FAN_MODE_MANUAL);
++	if (ret < 0 && hwmon->fan.unlock_key && !hwmon->fan.unlocked &&
++	    !macsmc_hwmon_fan_read_mode(hwmon, fan, &mode) &&
++	    mode == MACSMC_FAN_MODE_SYSTEM) {
++		ret = apple_smc_write_u8(hwmon->smc, hwmon->fan.unlock_key, 1);
++		if (ret < 0) {
++			/* The key may have been set anyway; clear it. */
++			apple_smc_write_u8(hwmon->smc, hwmon->fan.unlock_key, 0);
++			return ret;
++		}
++		hwmon->fan.unlocked = true;
++
++		/* Ask again once the fan has left system mode. */
++		timeout = jiffies + msecs_to_jiffies(MACSMC_FAN_MODE_TIMEOUT_MS);
++		for (;;) {
++			ret = macsmc_hwmon_fan_read_mode(hwmon, fan, &mode);
++			if (!ret && mode == MACSMC_FAN_MODE_SYSTEM)
++				ret = -EBUSY;
++			else if (!ret)
++				ret = macsmc_hwmon_write_key(hwmon->smc, &fan->mode,
++							     MACSMC_FAN_MODE_MANUAL);
++			if (ret >= 0 || time_after(jiffies, timeout))
++				break;
++			msleep(MACSMC_FAN_MODE_POLL_MS);
++		}
++		if (ret < 0) {
++			dev_err(hwmon->dev, "%s refused manual mode after unlock (%d)\n",
++				fan->label, ret);
++			if (!hwmon->fan.manual)
++				macsmc_hwmon_fans_relock(hwmon);
++			return ret;
++		}
++	}
++	if (ret < 0)
++		return ret;
++
++	fan->manual = true;
++	hwmon->fan.manual++;
++	return 0;
++}
++
++static int macsmc_hwmon_set_fan(struct macsmc_hwmon *hwmon, int channel, long val)
++{
++	struct macsmc_hwmon_fan *fan = &hwmon->fan.fans[channel];
+ 	long min, max;
+ 	int ret;
+ 
+-	if (!fan_control || hwmon->fan.fans[channel].mode.macsmc_key == 0)
++	if (!fan_control || fan->mode.macsmc_key == 0)
+ 		return -EOPNOTSUPP;
++	if (val < 0)
++		return -EINVAL;
++
++	guard(mutex)(&hwmon->fan.lock);
++
++	/* 0 hands the fan back to the firmware. */
++	if (!val)
++		return macsmc_hwmon_fan_auto(hwmon, fan);
+ 
+ 	/*
+ 	 * The SMC does no sanity checks on requested fan speeds, so we need to.
+ 	 */
+-	ret = macsmc_hwmon_read_key(hwmon->smc, &hwmon->fan.fans[channel].min,
+-				    1, &min);
++	ret = macsmc_hwmon_read_key(hwmon->smc, &fan->min, 1, &min);
+ 	if (ret)
+ 		return ret;
+ 
+-	ret = macsmc_hwmon_read_key(hwmon->smc, &hwmon->fan.fans[channel].max,
+-				    1, &max);
++	ret = macsmc_hwmon_read_key(hwmon->smc, &fan->max, 1, &max);
+ 	if (ret)
+ 		return ret;
+ 
+-	if (val >= min && val <= max) {
+-		if (!hwmon->fan.fans[channel].manual) {
+-			/* Write 1 to mode key for manual control */
+-			ret = macsmc_hwmon_write_key(hwmon->smc,
+-						     &hwmon->fan.fans[channel].mode, 1);
+-			if (ret < 0)
+-				return ret;
++	if (min <= 0 || max < min)
++		return -EIO;
++	val = clamp(val, min, max);
+ 
+-			hwmon->fan.fans[channel].manual = true;
+-		}
+-		return macsmc_hwmon_write_key(hwmon->smc,
+-					      &hwmon->fan.fans[channel].set, val);
+-	} else if (!val) {
+-		if (hwmon->fan.fans[channel].manual) {
+-			ret = macsmc_hwmon_write_key(hwmon->smc,
+-						     &hwmon->fan.fans[channel].mode, 0);
+-			if (ret < 0)
+-				return ret;
++	ret = macsmc_hwmon_fan_manual(hwmon, fan);
++	if (ret)
++		return ret;
+ 
+-			hwmon->fan.fans[channel].manual = false;
+-		}
+-	} else {
+-		return -EINVAL;
++	ret = macsmc_hwmon_write_key(hwmon->smc, &fan->set, val);
++	if (ret < 0) {
++		macsmc_hwmon_fan_auto(hwmon, fan);
++		return ret;
+ 	}
+ 
+ 	return 0;
+ }
+ 
++static int macsmc_hwmon_write_fan(struct device *dev, u32 attr, int channel,
++				  long val)
++{
++	return macsmc_hwmon_set_fan(dev_get_drvdata(dev), channel, val);
++}
++
++/* Hand every manual fan back to the firmware. */
++static void macsmc_hwmon_fans_restore(struct macsmc_hwmon *hwmon)
++{
++	u32 i;
++
++	guard(mutex)(&hwmon->fan.lock);
++	for (i = 0; i < hwmon->fan.count; i++)
++		macsmc_hwmon_fan_auto(hwmon, &hwmon->fan.fans[i]);
++}
++
++static void macsmc_hwmon_fans_restore_action(void *data)
++{
++	macsmc_hwmon_fans_restore(data);
++}
++
+ static int macsmc_hwmon_read(struct device *dev, enum hwmon_sensor_types type,
+ 			     u32 attr, int channel, long *val)
+ {
+@@ -1343,6 +1508,11 @@ static int macsmc_hwmon_probe(struct platform_device *pdev)
+ 	hwmon->dev = &pdev->dev;
+ 	hwmon->smc = smc;
+ 	hwmon->register_thermal_zones = true;
++	platform_set_drvdata(pdev, hwmon);
++
++	ret = devm_mutex_init(&pdev->dev, &hwmon->fan.lock);
++	if (ret)
++		return ret;
+ 
+ 	ret = macsmc_hwmon_populate_sensors(hwmon, hwmon->dev->of_node);
+ 	if (ret) {
+@@ -1372,6 +1542,21 @@ static int macsmc_hwmon_probe(struct platform_device *pdev)
+ 	if (ret)
+ 		return ret;
+ 
++	if (hwmon->fan.count) {
++		struct apple_smc_key_info info;
++
++		if (!apple_smc_get_key_info(smc, SMC_KEY(Ftst), &info) &&
++		    info.type_code == __SMC_KEY('u', 'i', '8', ' ') &&
++		    (info.flags & APPLE_SMC_WRITABLE))
++			hwmon->fan.unlock_key = SMC_KEY(Ftst);
++
++		/* Runs after the hwmon device is gone, so no write races it. */
++		ret = devm_add_action_or_reset(&pdev->dev,
++					       macsmc_hwmon_fans_restore_action, hwmon);
++		if (ret)
++			return ret;
++	}
++
+ 	hwmon->chip_info.ops = &macsmc_hwmon_ops;
+ 	hwmon->chip_info.info =
+ 		(const struct hwmon_channel_info *const *)&hwmon->channel_infos;
+@@ -1407,11 +1592,29 @@ static const struct of_device_id macsmc_hwmon_of_table[] = {
+ };
+ MODULE_DEVICE_TABLE(of, macsmc_hwmon_of_table);
+ 
++static void macsmc_hwmon_shutdown(struct platform_device *pdev)
++{
++	struct macsmc_hwmon *hwmon = platform_get_drvdata(pdev);
++
++	if (hwmon)
++		macsmc_hwmon_fans_restore(hwmon);
++}
++
++static int macsmc_hwmon_suspend(struct device *dev)
++{
++	macsmc_hwmon_fans_restore(dev_get_drvdata(dev));
++	return 0;
++}
++
++static DEFINE_SIMPLE_DEV_PM_OPS(macsmc_hwmon_pm_ops, macsmc_hwmon_suspend, NULL);
++
+ static struct platform_driver macsmc_hwmon_driver = {
+ 	.probe = macsmc_hwmon_probe,
++	.shutdown = macsmc_hwmon_shutdown,
+ 	.driver = {
+ 		.name = "macsmc-hwmon",
+ 		.of_match_table = macsmc_hwmon_of_table,
++		.pm = pm_sleep_ptr(&macsmc_hwmon_pm_ops),
+ 	},
+ };
+ module_platform_driver(macsmc_hwmon_driver);
+-- 
+2.56.0
+

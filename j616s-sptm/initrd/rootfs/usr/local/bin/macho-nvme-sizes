@@ -1,0 +1,24 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+# macho-nvme-sizes [DEV] : read-only. Direct reads of growing size to find the largest command that completes under the monitor
+# (count = size / 4 KiB; SPTM flushes nothing on J616s, the question is whether count > 16 is the limit). Raises apif_max_kb to
+# 1024 with a controller reset, stops at the first read that does not finish, puts 64 back with another reset.
+D=${1:-/dev/nvme0n1}; P=/sys/module/nvme_apple/parameters/apif_max_kb; R=/sys/class/nvme/nvme0/reset_controller
+say() { echo "SIZES: $1" | tee /dev/kmsg; }
+setmax() { [ -w "$P" ] || return; echo "$1" > "$P"; echo 1 > "$R"; sleep 5; say "apif_max_kb $1, max_hw_sectors_kb $(cat /sys/block/${D##*/}/queue/max_hw_sectors_kb 2>/dev/null)"; }
+one() { # one KiB BYTE_OFFSET
+  t0=$(cut -d' ' -f1 /proc/uptime)
+  timeout 45 dd if="$D" of=/dev/null bs="$1"k count=1 skip="$2" iflag=direct,skip_bytes 2>/dev/null; rc=$?
+  say "$1 KiB (count $(($1 / 4))) at $2: rc=$rc start=$t0 end=$(cut -d' ' -f1 /proc/uptime)"
+  return $rc
+}
+setmax 1024
+# the read that failed on HW first: LBA 17481033, 32 blocks of 4 KiB, rounded down to a 1 MiB boundary for the larger sizes
+F=$((17481033 * 4096)); A=$((F / 1048576 * 1048576)); bad=
+for k in 4 8 12 16 32 60 64 68 72 80 96 128 256 512 1024; do
+  one "$k" "$A" || { bad=$k; break; }
+  A=$((A + 1048576))
+done
+[ -n "$bad" ] || { one 128 "$F" || bad=128-at-failing-LBA; }
+say "result: first failure ${bad:-none}"
+setmax 64

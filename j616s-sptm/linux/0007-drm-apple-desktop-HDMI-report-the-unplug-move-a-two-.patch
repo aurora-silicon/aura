@@ -1,0 +1,233 @@
+From 4eac1e6b6e6d5e8a41b098cf506e572666c1505a Mon Sep 17 00:00:00 2001
+From: fbalazsy <frantisekbalazsy@gmail.com>
+Date: Tue, 27 Oct 2026 15:29:38 +0100
+Subject: [PATCH 07/11] drm/apple: desktop HDMI: report the unplug, move a
+ two-pipe Type-C display onto the freed hybrid
+
+On a desktop 26.x processor the HDMI HPD handler left disconnects to the
+firmware.  The J616s's DP-to-HDMI converter (a Parade DP855) keeps its DP
+link up without a sink, so the firmware never reports an unplug: the
+HDMI connector stayed connected and the hybrid pipeline busy until the
+next plug.  Debounce both edges for 500 ms; when HPD stays low, report
+the unplug as a CRTC power-off with HPD low does, and start the HDMI
+presence hold, which frees the hybrid when it expires.
+
+A Type-C display wider than one pipe that came while HDMI held the
+hybrid sits on the Type-C-only pipeline, which pairs with nothing above
+it.  When the hybrid becomes free again, move such a display onto it,
+as a replug does, so that it gets both pipes.
+
+While the hybrid drives a Type-C display, an HDMI plug only waits: the
+cold-plug HPD pulse would have hit the Type-C display's link.
+---
+ drivers/gpu/drm/apple/dcp-fabric.c       | 78 ++++++++++++++++++++++++
+ drivers/gpu/drm/apple/dcp-internal.h     |  5 ++
+ drivers/gpu/drm/apple/dcp-peer-v26_6.inc |  2 +
+ drivers/gpu/drm/apple/dcp.c              | 32 +++++++---
+ drivers/gpu/drm/apple/dcp.h              |  1 +
+ 5 files changed, 108 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/gpu/drm/apple/dcp-fabric.c b/drivers/gpu/drm/apple/dcp-fabric.c
+index f1cede0e34e7..fa76b4ea9b7d 100644
+--- a/drivers/gpu/drm/apple/dcp-fabric.c
++++ b/drivers/gpu/drm/apple/dcp-fabric.c
+@@ -530,6 +530,8 @@ static int dcp_typec_route_deactivate(struct apple_dcp_typec_route *route)
+ 	bool ended_attachment;
+ 	int ret = 0;
+ 
++	WRITE_ONCE(dcp->peer_starved, false);
++
+ 	guard(mutex)(&dcp->external_lock);
+ 	if (dcp_is_external_h17p(dcp) &&
+ 	    (dcp->external_error || (dcp->external_power_attempted && !dcp->external_stopped)))
+@@ -737,6 +739,7 @@ static bool dcp_typec_keep_order(void)
+ 
+ static void dcp_typec_pipeline_freed(void);
+ static int dcp_fixed_output_select(struct apple_dcp *dcp);
++static void dcp_typec_port_attach(struct apple_dcp_typec_port *port);
+ 
+ static bool dcp_hdmi_settle_enabled(struct apple_dcp *dcp)
+ {
+@@ -821,9 +824,84 @@ static bool dcp_hdmi_sample(struct apple_dcp *dcp, u64 generation, int level)
+ 	return accepted;
+ }
+ 
++/*
++ * A Type-C display wider than one pipe sits on a Type-C-only pipeline,
++ * which has no peer above it, because the hybrid was taken when it came
++ * (by an HDMI display, gone since).  Move it onto the free hybrid, as a
++ * replug does, so that it gets both pipes.
++ */
++static void dcp_typec_move_starved_locked(void)
++{
++	struct apple_dcp_typec_port *port;
++
++	lockdep_assert_held(&dcp_typec_fabric_lock);
++	if (!dcp_typec_hybrid_first())
++		return;
++
++	list_for_each_entry(port, &dcp_typec_ports, link) {
++		struct apple_dcp_typec_route *owner = port->owner, *to = NULL;
++		struct apple_dcp_typec_route *route;
++		struct apple_dcp *dcp;
++
++		if (!owner || owner->tunnel || !READ_ONCE(owner->dcp->peer_starved))
++			continue;
++		list_for_each_entry(route, &port->routes, port_link) {
++			if (route != owner && route->dcp->fixed_phy &&
++			    dcp_typec_route_available(route)) {
++				to = route;
++				break;
++			}
++		}
++		if (!to)
++			continue;
++
++		dcp = owner->dcp;
++		dev_info(dcp->dev, "display wider than one pipe moves to the free %s\n",
++			 dev_name(to->dcp->dev));
++		if (dcp_dptx_disconnect_oob(to_platform_device(dcp->dev), 0))
++			continue;
++		port->preferred_route = to;
++		port->hpd = false;
++		if (dcp_typec_route_deactivate(owner))
++			continue;
++		port->owner = NULL;
++		if (dcp_typec_route_activate(to, to->xbar)) {
++			dev_warn(dcp->dev, "hybrid not taken, the display stays on its pipeline\n");
++			if (dcp_typec_route_activate(owner, owner->xbar))
++				continue;
++			to = owner;
++		}
++		port->owner = to;
++		dcp_typec_port_attach(port);
++	}
++}
++
+ static void dcp_hdmi_capacity_available(void *ctx)
+ {
+ 	dcp_typec_pipeline_freed();
++	dcp_typec_move_starved_locked();
++}
++
++/*
++ * Desktop 26.x: the HDMI display is gone (its converter's HPD fell and
++ * stayed low); its firmware reports no unplug.  Start the presence hold from
++ * here, as the edge handler of other machines does, also where presence was
++ * never tracked: when the hold expires, the desktop has let the HDMI CRTC go
++ * and the hybrid is free for a Type-C display again.
++ */
++void dcp_fabric_hdmi_unplugged(struct apple_dcp *dcp)
++{
++	unsigned long flags;
++	u64 generation;
++
++	guard(mutex)(&dcp_typec_fabric_lock);
++	generation = dcp_hdmi_edge(dcp);
++	if (!generation)
++		return;
++	spin_lock_irqsave(&dcp->hdmi_presence_lock, flags);
++	dcp->hdmi_presence_prev = DCP_FABRIC_PRESENT;
++	spin_unlock_irqrestore(&dcp->hdmi_presence_lock, flags);
++	dcp_hdmi_sample(dcp, generation, gpiod_get_value_cansleep(dcp->hdmi_hpd));
+ }
+ 
+ static void dcp_hdmi_settle_work(struct work_struct *work)
+diff --git a/drivers/gpu/drm/apple/dcp-internal.h b/drivers/gpu/drm/apple/dcp-internal.h
+index af5263bd31ca..48d47e057d10 100644
+--- a/drivers/gpu/drm/apple/dcp-internal.h
++++ b/drivers/gpu/drm/apple/dcp-internal.h
+@@ -293,6 +293,11 @@ struct apple_dcp {
+ 	 */
+ 	struct apple_dcp *peer_reserved;
+ 	struct apple_dcp *peer_owner;
++	/*
++	 * This pipeline's Type-C display is wider than one pipe and found no
++	 * peer above it: it needs the hybrid, which was taken when it came.
++	 */
++	bool peer_starved;
+ 	struct dcp_peer_tiling peer_tiling;
+ 	bool peer_unbinding;
+ 	/* Firmware display endpoint (its Disp_Index), apple,dcp-endpoint;
+diff --git a/drivers/gpu/drm/apple/dcp-peer-v26_6.inc b/drivers/gpu/drm/apple/dcp-peer-v26_6.inc
+index 67dea03eb5d1..94467fbf0bde 100644
+--- a/drivers/gpu/drm/apple/dcp-peer-v26_6.inc
++++ b/drivers/gpu/drm/apple/dcp-peer-v26_6.inc
+@@ -272,9 +272,11 @@ int dcp_peer_hints_26_6(struct apple_dcp *dcp, struct dptx_port *port,
+ 		}
+ 		if (!peer) {
+ 			dev_info(dcp->dev, "no idle peer pipe for a %u px display\n", width);
++			WRITE_ONCE(dcp->peer_starved, !!READ_ONCE(dcp->active_typec_route));
+ 			memset(&r->primary_id, 0, 32);
+ 			return 0;
+ 		}
++		WRITE_ONCE(dcp->peer_starved, false);
+ 		dcp->peer_reserved = peer;
+ 		peer->peer_owner = dcp;
+ 		dev_info(dcp->dev, "reserved peer %s endpoint %u for %ux%u\n",
+diff --git a/drivers/gpu/drm/apple/dcp.c b/drivers/gpu/drm/apple/dcp.c
+index 6b63f232b208..28b6d03bbc22 100644
+--- a/drivers/gpu/drm/apple/dcp.c
++++ b/drivers/gpu/drm/apple/dcp.c
+@@ -2010,24 +2010,36 @@ static int dcp_desktop_dptx_disconnect_oob(struct apple_dcp *dcp, u32 port)
+ }
+ 
+ /*
+- * HDMI HPD of a desktop 26.x external processor.  A disconnect is left to
+- * the firmware, which detects it itself.  A cold plug after boot finds the
+- * port connected without a sink: the firmware never saw this HPD, so pulse
+- * the AP-asserted HPD to make it export the modes now.
++ * HDMI HPD of a desktop 26.x external processor.  A cold plug after boot
++ * finds the port connected without a sink: the firmware never saw this HPD,
++ * so pulse the AP-asserted HPD to make it export the modes now.  An unplug
++ * is reported by nothing else: the DP-to-HDMI converter keeps its DP link
++ * up without a sink and the firmware sees no change.
+  */
+ irqreturn_t dcp_desktop_dp2hdmi_hpd(struct apple_dcp *dcp)
+ {
+ 	struct dptx_port *dptx = &dcp->dptxport[0];
+-	bool connected = gpiod_get_value_cansleep(dcp->hdmi_hpd);
++	bool connected;
+ 	int ret;
+ 
+-	if (connected) {
+-		msleep(500);
+-		connected = gpiod_get_value_cansleep(dcp->hdmi_hpd);
+-	}
++	msleep(500);
++	connected = gpiod_get_value_cansleep(dcp->hdmi_hpd);
+ 	dev_dbg(dcp->dev, "DP2HDMI HPD irq, connected:%d after 500 ms\n", connected);
+-	if (!connected)
++	if (!connected) {
++		if (!READ_ONCE(dcp->active_typec_route) && dcp->connector &&
++		    READ_ONCE(dcp->connector->connected)) {
++			dev_info(dcp->dev, "HDMI display unplugged\n");
++			disconnected_hpd_event(dcp->connector);
++			dcp_dptx_disconnect(dcp, 0);
++			dcp_fabric_hdmi_unplugged(dcp);
++		}
+ 		return IRQ_HANDLED;
++	}
++	/* The pipeline drives a Type-C display: the HDMI display waits for it. */
++	if (READ_ONCE(dcp->active_typec_route)) {
++		dev_info(dcp->dev, "HDMI display waits: its pipeline drives a Type-C display\n");
++		return IRQ_HANDLED;
++	}
+ 
+ 	mutex_lock(&dcp->hpd_mutex);
+ 	if (dptx_service_available(dptx) && dptx->connected &&
+diff --git a/drivers/gpu/drm/apple/dcp.h b/drivers/gpu/drm/apple/dcp.h
+index 89f72eed69ad..9d39c728ccd7 100644
+--- a/drivers/gpu/drm/apple/dcp.h
++++ b/drivers/gpu/drm/apple/dcp.h
+@@ -144,6 +144,7 @@ unsigned int apple_j613_25g83_clock_hz(void);
+ bool apple_t8122_25g83_board(void);
+ 
+ void dcp_typec_hybrid_first_dt(void);
++void dcp_fabric_hdmi_unplugged(struct apple_dcp *dcp);
+ void dcp_link_recovery_schedule(struct apple_dcp *dcp);
+ 
+ /* Desktop 26.6 dual-pipe peer (dcp-peer-v26_6.inc, included from dcp.c) */
+-- 
+2.56.0
+

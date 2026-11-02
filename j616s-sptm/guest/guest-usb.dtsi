@@ -1,0 +1,132 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// usb-drd2 (right USB-C) as a device for Hypnos: nodes of the running DT, recipe of aura docs/j616s-driver-contracts.md "Native Linux USB handoff".
+// dart-usb2 stream 1, the ADT stream m1n1 translates: SPTM programs a stream on every DART instance, so both banks get it. No port controller, VBUS forced in the PHY.
+	power-management@502800000 {
+		compatible = "apple,t6041-pmgr", "apple,pmgr", "syscon", "simple-mfd";
+		#address-cells = <1>;
+		#size-cells = <1>;
+		reg = <0x5 0x02800000 0x0 0x4000>;
+		ps_atc2_common: power-controller@3e0 {
+			compatible = "apple,t6041-pmgr-pwrstate", "apple,pmgr-pwrstate";
+			reg = <0x3e0 0x4>; #power-domain-cells = <0>; #reset-cells = <0>;
+			label = "atc2_common"; apple,always-on;
+		};
+	};
+	power-management@508300000 {
+		compatible = "apple,t6041-pmgr", "apple,pmgr", "syscon", "simple-mfd";
+		#address-cells = <1>;
+		#size-cells = <1>;
+		reg = <0x5 0x08300000 0x0 0x4000>;
+		ps_nub_spmi_a1: power-controller@70 {
+			compatible = "apple,t6041-pmgr-pwrstate", "apple,pmgr-pwrstate";
+			reg = <0x70 0x4>; #power-domain-cells = <0>; #reset-cells = <0>;
+			label = "nub_spmi_a1"; apple,always-on;
+		};
+		ps_atc2_usb_aon: power-controller@d8 {
+			compatible = "apple,t6041-pmgr-pwrstate", "apple,pmgr-pwrstate";
+			reg = <0xd8 0x4>; #power-domain-cells = <0>; #reset-cells = <0>;
+			label = "atc2_usb_aon"; apple,always-on;
+		};
+		ps_atc2_phymxwrap: power-controller@160 {
+			compatible = "apple,t6041-pmgr-pwrstate", "apple,pmgr-pwrstate";
+			reg = <0x160 0x4>; #power-domain-cells = <0>; #reset-cells = <0>;
+			label = "atc2_phymxwrap"; apple,always-on;
+			power-domains = <&ps_atc2_common>, <&ps_atc2_usb_aon>;
+		};
+		ps_atc2_common_dp: power-controller@b0 {
+			compatible = "apple,t6041-pmgr-pwrstate", "apple,pmgr-pwrstate";
+			reg = <0xb0 0x4>; #power-domain-cells = <0>; #reset-cells = <0>;
+			label = "atc2_common_dp"; apple,always-on;
+			power-domains = <&ps_atc2_phymxwrap>;
+		};
+		ps_atc2_usb: power-controller@140 {
+			compatible = "apple,t6041-pmgr-pwrstate", "apple,pmgr-pwrstate";
+			reg = <0x140 0x4>; #power-domain-cells = <0>; #reset-cells = <0>;
+			label = "atc2_usb"; apple,always-on;
+			power-domains = <&ps_atc2_common>, <&ps_atc2_usb_aon>;
+		};
+	};
+	// port controller of USB-C Right: without it the data path stays off (aura usb.c usb_init_one, tps6598x_powerup before USB)
+	spmi@509198000 {
+		compatible = "apple,t6041-spmi", "apple,t8103-spmi";
+		reg = <0x5 0x09198000 0x0 0x100>;
+		interrupt-parent = <&aic>;
+		interrupts = <0x0 0x364 0x4>;
+		interrupt-controller;
+		#interrupt-cells = <2>;
+		#address-cells = <2>;
+		#size-cells = <0>;
+		power-domains = <&ps_nub_spmi_a1>;
+		usb-pd@c {
+			compatible = "apple,sn201202x";
+			reg = <0xc 0x0>;
+			interrupts = <0xb 0x1 0xd 0x1 0x11 0x1 0x13 0x1>;
+			interrupt-names = "irq", "select", "sleep", "wake";
+			connector {
+				compatible = "usb-c-connector";
+				label = "USB-C Right";
+				power-role = "dual";
+				data-role = "dual";
+				ports {
+					#address-cells = <1>;
+					#size-cells = <0>;
+					port@0 {
+						reg = <0>;
+						hpm_usb_hs: endpoint { remote-endpoint = <&usb_hs_hpm>; };
+					};
+				};
+			};
+		};
+	};
+	dart_usb2: iommu@392f00000 {
+		compatible = "apple,dart-apif";
+		#iommu-cells = <1>;
+		aurora,apif = <&apif>;
+		apple,apif-dart-id = <0xba5e0801>;   // live ADT dart-usb2
+		apple,apif-num-streams = <16>;       // ADT sid-count
+		apple,dma-range = <0x100 0x4000 0x0 0xffff0000>;   // ADT vm-base, vm-size; monitor checks them
+		apple,apif-reserve-last-page;   // SPTM MAP: (dva+size)>>14 must stay below the end page
+		power-domains = <&ps_atc2_usb>;
+		status = "mhold-usb";
+	};
+	usb2_phy: phy@392a90000 {
+		compatible = "apple,t6040-atcphy";
+		reg = <0x3 0x92a90000 0x0 0x4000>, <0x3 0x92800000 0x0 0x4000>, <0x3 0x92a84000 0x0 0x4000>;
+		reg-names = "bank0", "bank1", "pipehandler";
+		#phy-cells = <1>;
+		#reset-cells = <0>;
+		power-domains = <&ps_atc2_common_dp>;
+		omarchy-m4,usb2-device;
+		nonposted-mmio;
+		status = "mhold-usb";
+	};
+	usb@392280000 {
+		compatible = "apple,t6040-dwc3", "apple,t8103-dwc3";
+		reg = <0x3 0x92280000 0x0 0xcd00>, <0x3 0x9228cd00 0x0 0x3200>, <0x3 0x92200000 0x0 0x4000>;
+		reg-names = "dwc3-core", "dwc3-apple", "drd-cfg";
+		interrupt-parent = <&aic>;
+		interrupts = <0x0 0x693 0x4>;
+		power-domains = <&ps_atc2_usb>;
+		iommus = <&dart_usb2 1>;
+		phys = <&usb2_phy 3>;
+		phy-names = "usb2-phy";
+		resets = <&usb2_phy>;
+		dr_mode = "peripheral";
+		maximum-speed = "high-speed";
+		snps,dis_u2_susphy_quirk;
+		snps,dis_u3_susphy_quirk;
+		snps,dis_enblslpm_quirk;
+		snps,usb2-gadget-lpm-disable;
+		omarchy-m4,device-only;
+		usb-role-switch;
+		role-switch-default-mode = "peripheral";
+		status = "mhold-usb";
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+			port@0 {
+				reg = <0>;
+				usb_hs_hpm: endpoint { remote-endpoint = <&hpm_usb_hs>; };
+			};
+		};
+	};

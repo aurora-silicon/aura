@@ -1,0 +1,7 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+# initrd: every login is uid 0, so the collectors' "sudo CMD" just runs CMD. busybox sh runs its own applet for a bare
+# name, so a wrapper in /usr/local/bin (dmesg -w) is called by path.
+[ "$1" = -n ] && shift
+[ -x "/usr/local/bin/$1" ] && { c=/usr/local/bin/$1; shift; exec "$c" "$@"; }
+exec "$@"

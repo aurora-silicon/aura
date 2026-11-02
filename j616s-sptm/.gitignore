@@ -1,0 +1,10 @@
+# generated on the user's machine, never committed: Wi-Fi calibration of the unit, Apple code, keys
+guest/guest-platform.dtsi
+monitor/build/
+*.macho
+*.im4p
+*.cpio
+*.dtb
+*.elf
+*.bin
+__pycache__/

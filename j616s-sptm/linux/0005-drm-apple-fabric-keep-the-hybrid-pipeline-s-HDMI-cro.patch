@@ -1,0 +1,186 @@
+From 0e7846672f8fbb1f447d1b7efeb9266ca634443f Mon Sep 17 00:00:00 2001
+From: fbalazsy <frantisekbalazsy@gmail.com>
+Date: Tue, 27 Oct 2026 15:29:38 +0100
+Subject: [PATCH 05/11] drm/apple: fabric: keep the hybrid pipeline's HDMI
+ crossbar apart from its Type-C route's
+
+On desktop 26.x a Type-C route sets dcp->xbar to its own crossbar control,
+for the compact DPTX link configuration.  dcp->xbar was also the fixed
+HDMI output's control, so on the hybrid dcpext0 every later use for HDMI
+went to the Type-C port's control instead: when the route was let go
+with an HDMI display present, handing the pipeline back to HDMI selected
+the Type-C port's control with the HDMI index.  The next route of that
+port, on dcpext1, then waited in mux_control_select() for good, holding
+the fabric lock, with the port controller's update work and interrupt
+thread stuck behind it (seen with a G95NC on USB-C and HDMI, switching
+its picture-by-picture layout).
+
+Keep the fixed output's control in dcp->fixed_xbar and select, release
+and check the fixed route with it only; dcp->xbar stays the control a
+link configuration takes up and down, and points at the fixed one again
+when the pipeline is handed back to HDMI.  A Type-C route's control is
+taken with mux_control_try_select(): only a route of the same port can
+hold it, and that one lets it go under the fabric lock held here, so a
+wait could never end.
+---
+ drivers/gpu/drm/apple/dcp-fabric.c   | 40 ++++++++++++++++++----------
+ drivers/gpu/drm/apple/dcp-internal.h |  6 +++++
+ drivers/gpu/drm/apple/dcp.c          |  8 +++---
+ 3 files changed, 37 insertions(+), 17 deletions(-)
+
+diff --git a/drivers/gpu/drm/apple/dcp-fabric.c b/drivers/gpu/drm/apple/dcp-fabric.c
+index 6e0e049d4700..4373ce946536 100644
+--- a/drivers/gpu/drm/apple/dcp-fabric.c
++++ b/drivers/gpu/drm/apple/dcp-fabric.c
+@@ -413,7 +413,7 @@ static int dcp_typec_route_activate(struct apple_dcp_typec_route *route,
+ 		return ret;
+ 
+ 	if (dcp->fixed_route_selected) {
+-		ret = mux_control_deselect(dcp->xbar);
++		ret = mux_control_deselect(dcp->fixed_xbar);
+ 		dcp->fixed_route_selected = false;
+ 		if (ret)
+ 			return ret;
+@@ -433,15 +433,22 @@ static int dcp_typec_route_activate(struct apple_dcp_typec_route *route,
+ 		ret = dcp_dpxbar_tunnel_select_source(xbar, route->mux_index);
+ 		if (ret == -EOPNOTSUPP)
+ 			ret = 0;
+-	} else {
+-		ret = xbar == route->xbar ?
+-			mux_control_select(xbar, route->mux_index) : 0;
++	} else if (xbar == route->xbar) {
++		/*
++		 * The control is only ever held by a route of this port, which
++		 * lets it go under the fabric lock held here: waiting for it
++		 * would wait for good, with the port controller's update work
++		 * and its interrupt stuck behind us.
++		 */
++		ret = mux_control_try_select(xbar, route->mux_index);
++		if (ret == -EBUSY)
++			dev_err(dcp->dev, "Type-C crossbar control still held, route not taken\n");
+ 	}
+ 	if (ret) {
+-		if (dcp->xbar) {
++		if (dcp->fixed_xbar) {
+ 			int restore_ret;
+ 
+-			restore_ret = mux_control_select(dcp->xbar,
++			restore_ret = mux_control_select(dcp->fixed_xbar,
+ 							 dcp->fixed_mux_index);
+ 			if (!restore_ret)
+ 				dcp->fixed_route_selected = true;
+@@ -627,8 +634,10 @@ static int dcp_typec_route_deactivate(struct apple_dcp_typec_route *route)
+ 			dcp->phy = dcp->fixed_phy;
+ 			dcp->dptx_phy = dcp->fixed_dptx_phy;
+ 
+-			if (dcp->xbar && !dcp->fixed_route_selected) {
+-				ret = mux_control_select(dcp->xbar,
++			if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP)
++				WRITE_ONCE(dcp->xbar, dcp->fixed_xbar);
++			if (dcp->fixed_xbar && !dcp->fixed_route_selected) {
++				ret = mux_control_select(dcp->fixed_xbar,
+ 							 dcp->fixed_mux_index);
+ 				if (ret)
+ 					return ret;
+@@ -945,10 +954,10 @@ static void dcp_fixed_hdmi_reinit_locked(struct apple_dcp *dcp, const char *why)
+ 		if (ret)
+ 			dev_warn(dcp->dev, "HDMI: PHY not set up again: %d\n", ret);
+ 	}
+-	if (dcp->xbar && dcp->fixed_route_selected && !dcp->active_typec_route) {
++	if (dcp->fixed_xbar && dcp->fixed_route_selected && !dcp->active_typec_route) {
+ 		scoped_guard(mutex, &dcp->tb_lock)
+ 			dcp->direct_xbar_up = NULL;
+-		ret = mux_control_deselect(dcp->xbar);
++		ret = mux_control_deselect(dcp->fixed_xbar);
+ 		dcp->fixed_route_selected = false;
+ 		if (!ret)
+ 			ret = dcp_fixed_output_select(dcp);
+@@ -1917,7 +1926,7 @@ int dcp_direct_crossbar_link(struct apple_dcp *dcp, bool up)
+ 	if (route && !route->tunnel && route->selected)
+ 		xbar = route->active_xbar ?: route->xbar;
+ 	else if (!route && dcp->fixed_route_selected)
+-		xbar = dcp->xbar;
++		xbar = dcp->fixed_xbar;
+ 	/* A deselected output went idle, and its clocks with it. */
+ 	if (dcp->direct_xbar_up && dcp->direct_xbar_up != xbar)
+ 		dcp->direct_xbar_up = NULL;
+@@ -3811,10 +3820,13 @@ static void dcp_fixed_restore_phy(void *ctx)
+ static int dcp_fixed_select_mux(void *ctx)
+ {
+ 	struct apple_dcp *dcp = ctx;
+-	int ret = mux_control_select(dcp->xbar, dcp->fixed_mux_index);
++	int ret = mux_control_select(dcp->fixed_xbar, dcp->fixed_mux_index);
+ 
+-	if (!ret)
++	if (!ret) {
+ 		dcp->fixed_route_selected = true;
++		if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP)
++			WRITE_ONCE(dcp->xbar, dcp->fixed_xbar);
++	}
+ 	return ret;
+ }
+ 
+@@ -3827,7 +3839,7 @@ static int dcp_fixed_output_select(struct apple_dcp *dcp)
+ {
+ 	lockdep_assert_held(&dcp_typec_fabric_lock);
+ 	return dcp_fabric_run_fixed(!!dcp->fixed_phy, !!dcp->active_typec_route,
+-				    dcp->xbar && !dcp->fixed_route_selected,
++				    dcp->fixed_xbar && !dcp->fixed_route_selected,
+ 				    &dcp_fixed_ops, dcp);
+ }
+ 
+diff --git a/drivers/gpu/drm/apple/dcp-internal.h b/drivers/gpu/drm/apple/dcp-internal.h
+index e2014142187e..af5263bd31ca 100644
+--- a/drivers/gpu/drm/apple/dcp-internal.h
++++ b/drivers/gpu/drm/apple/dcp-internal.h
+@@ -588,7 +588,13 @@ struct apple_dcp {
+ 	/* these fields are output port specific */
+ 	struct phy *phy;
+ 	struct phy *fixed_phy;
++	/*
++	 * The crossbar control a link configuration takes up and down: the
++	 * fixed output's, or on desktop 26.x the active Type-C route's.
++	 */
+ 	struct mux_control *xbar;
++	/* The fixed (HDMI) output's own crossbar control, selected for it. */
++	struct mux_control *fixed_xbar;
+ 	struct typec_mux *typec_mux;
+ 	struct apple_dcp_typec_route typec_routes[DCP_MAX_TYPEC_ROUTES];
+ 	struct apple_dcp_typec_route *active_typec_route;
+diff --git a/drivers/gpu/drm/apple/dcp.c b/drivers/gpu/drm/apple/dcp.c
+index e66e02120d4b..6b63f232b208 100644
+--- a/drivers/gpu/drm/apple/dcp.c
++++ b/drivers/gpu/drm/apple/dcp.c
+@@ -4417,7 +4417,7 @@ static void dcp_release_fixed_route(void *data)
+ 	struct apple_dcp *dcp = data;
+ 
+ 	if (dcp->fixed_route_selected) {
+-		mux_control_deselect(dcp->xbar);
++		mux_control_deselect(dcp->fixed_xbar);
+ 		dcp->fixed_route_selected = false;
+ 	}
+ 	typec_mux_put(dcp->typec_mux);
+@@ -5092,8 +5092,9 @@ static int dcp_fixed_output_error(struct apple_dcp *dcp, int err, const char *wh
+ 	dev_err(dcp->dev, "HDMI output unusable (%s: %d); USB-C displays are not affected\n",
+ 		what, err);
+ 	if (dcp->fixed_route_selected)
+-		mux_control_deselect(dcp->xbar);
++		mux_control_deselect(dcp->fixed_xbar);
+ 	dcp->fixed_route_selected = false;
++	dcp->fixed_xbar = NULL;
+ 	dcp->xbar = NULL;
+ 	if (!IS_ERR_OR_NULL(dcp->typec_mux))
+ 		typec_mux_put(dcp->typec_mux);
+@@ -5505,7 +5506,8 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
+ 			ret = devm_add_action_or_reset(dev, dcp_release_fixed_route, dcp);
+ 			if (ret)
+ 				return ret;
+-			ret = mux_control_select(dcp->xbar, mux_index);
++			dcp->fixed_xbar = dcp->xbar;
++			ret = mux_control_select(dcp->fixed_xbar, mux_index);
+ 			if (ret)
+ 				dev_warn(dev, "mux_control_select failed: %d\n", ret);
+ 			else
+-- 
+2.56.0
+

@@ -1,0 +1,204 @@
+From 89c93f13edbef4f979fdf199e555653e30f40978 Mon Sep 17 00:00:00 2001
+From: fbalazsy <frantisekbalazsy@gmail.com>
+Date: Tue, 27 Oct 2026 15:29:38 +0100
+Subject: [PATCH 03/11] drm/apple: connect a Type-C display again when a
+ retrain after a hotplug finds no mode
+
+A Type-C display that wakes from system sleep may list only its base modes
+at first: its EDID is not ready yet. The retrain after that hotplug then
+finds no mode for the active CRTC (the sink's 7680x2160 is not listed),
+and nothing reads the EDID again until the next HPD event, which can be
+a minute away; the compositor stays at a fallback mode (a 3840x2160
+picture stretched over a 7680x2160 monitor).
+
+Disconnect and connect the link again, as a replug does, two seconds
+after such a retrain failed, unless a mode set completed in between; at
+most four times per resume.
+
+The work goes with the other Type-C works: disabled at probe, while
+unbound and across system sleep, so that nothing arms it behind a
+cancel.
+---
+ drivers/gpu/drm/apple/dcp-internal.h          |  9 ++++
+ drivers/gpu/drm/apple/dcp.c                   | 42 +++++++++++++++++++
+ drivers/gpu/drm/apple/dcp.h                   |  1 +
+ .../drm/apple/dcp_external_announce_test.c    |  1 +
+ drivers/gpu/drm/apple/iomfb.c                 |  4 +-
+ drivers/gpu/drm/apple/iomfb_template.c        |  4 ++
+ 6 files changed, 60 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/apple/dcp-internal.h b/drivers/gpu/drm/apple/dcp-internal.h
+index f233e9486f78..e2014142187e 100644
+--- a/drivers/gpu/drm/apple/dcp-internal.h
++++ b/drivers/gpu/drm/apple/dcp-internal.h
+@@ -715,6 +715,15 @@ struct apple_dcp {
+ 	struct dcp_fabric_presence hdmi_presence;
+ 	/* The state before the current series of HPD edges began. */
+ 	enum dcp_fabric_presence_state hdmi_presence_prev;
++	/*
++	 * A desktop 26.x Type-C display that came back from system sleep with a
++	 * partial mode list (the sink was not ready for its EDID yet) is
++	 * connected again after a retrain found no mode.
++	 */
++	struct delayed_work link_recovery_wq;
++	unsigned int link_recovery_tries;
++	unsigned int link_recovery_snap;
++	atomic_t modesets_done;
+ 	unsigned long hdmi_edge_jiffies;
+ 	bool hdmi_edge_seen;
+ 	struct delayed_work hdmi_settle_wq;
+diff --git a/drivers/gpu/drm/apple/dcp.c b/drivers/gpu/drm/apple/dcp.c
+index 786f505dd9ea..e66e02120d4b 100644
+--- a/drivers/gpu/drm/apple/dcp.c
++++ b/drivers/gpu/drm/apple/dcp.c
+@@ -2328,6 +2328,43 @@ static void dcp_placeholder_edid_work(struct work_struct *work)
+ 	mutex_unlock(&dcp->hpd_mutex);
+ }
+ 
++#define DCP_LINK_RECOVERY_TRIES		4
++#define DCP_LINK_RECOVERY_DELAY_MS	2000
++
++/*
++ * A retrain after a hotplug found no mode for the active CRTC: the sink's
++ * EDID was incomplete (it had just woken from sleep and listed only its base
++ * modes).  Nothing re-reads it until the next HPD event, which can be a
++ * minute away, so a Type-C display stays at a fallback mode.  Connect the
++ * link again, as a replug does, unless a mode set completed in between.
++ */
++void dcp_link_recovery_schedule(struct apple_dcp *dcp)
++{
++	if (dcp->fw_compat != DCP_FIRMWARE_V_26_6_DESKTOP || dcp->main_display ||
++	    !dcp_is_typec_output(dcp) || !READ_ONCE(dcp->typec_cable_connected) ||
++	    dcp->link_recovery_tries >= DCP_LINK_RECOVERY_TRIES)
++		return;
++	dcp->link_recovery_snap = atomic_read(&dcp->modesets_done);
++	mod_delayed_work(system_freezable_wq, &dcp->link_recovery_wq,
++			 msecs_to_jiffies(DCP_LINK_RECOVERY_DELAY_MS));
++}
++
++static void dcp_link_recovery_work(struct work_struct *work)
++{
++	struct apple_dcp *dcp = container_of(to_delayed_work(work),
++					     struct apple_dcp, link_recovery_wq);
++	struct platform_device *pdev = to_platform_device(dcp->dev);
++
++	if (!READ_ONCE(dcp->typec_cable_connected) ||
++	    atomic_read(&dcp->modesets_done) != dcp->link_recovery_snap)
++		return;
++	dev_info(dcp->dev, "link recovery %u: connecting again after a retrain that found no mode\n",
++		 ++dcp->link_recovery_tries);
++	dcp_dptx_disconnect_oob(pdev, 0);
++	msleep(500);
++	dcp_dptx_connect_oob(pdev, 0);
++}
++
+ static void dcp_typec_reconnect_work(struct work_struct *work)
+ {
+ 	struct apple_dcp *dcp =
+@@ -4411,6 +4448,7 @@ VISIBLE_IF_KUNIT void dcp_disable_typec_work(struct apple_dcp *dcp, bool release
+ 	cancel_delayed_work_sync(&dcp->external_stop_retry_wq);
+ 	disable_delayed_work_sync(&dcp->hdmi_settle_wq);
+ 	disable_delayed_work_sync(&dcp->hdmi_recheck_wq);
++	disable_delayed_work_sync(&dcp->link_recovery_wq);
+ 	dcp_hdmi_disable(dcp);
+ }
+ 
+@@ -4424,6 +4462,7 @@ VISIBLE_IF_KUNIT void dcp_enable_typec_work(struct apple_dcp *dcp)
+ 	enable_delayed_work(&dcp->announce_wq);
+ 	enable_delayed_work(&dcp->hdmi_settle_wq);
+ 	enable_delayed_work(&dcp->hdmi_recheck_wq);
++	enable_delayed_work(&dcp->link_recovery_wq);
+ 	dcp_hdmi_enable(dcp);
+ 	scoped_guard(mutex, &dcp->hpd_mutex)
+ 		dcp->typec_work_enabled = true;
+@@ -5255,6 +5294,7 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
+ 	init_completion(&dcp->typec_iomfb_hpd_ready);
+ 	INIT_DELAYED_WORK(&dcp->typec_reconnect_wq,
+ 			  dcp_typec_reconnect_work);
++	INIT_DELAYED_WORK(&dcp->link_recovery_wq, dcp_link_recovery_work);
+ 	INIT_DELAYED_WORK(&dcp->placeholder_edid_wq,
+ 			  dcp_placeholder_edid_work);
+ 	INIT_DELAYED_WORK(&dcp->typec_relink_wq, dcp_typec_relink_work);
+@@ -5272,6 +5312,7 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
+ 	disable_delayed_work(&dcp->placeholder_edid_wq);
+ 	disable_delayed_work(&dcp->typec_relink_wq);
+ 	disable_delayed_work(&dcp->announce_wq);
++	disable_delayed_work(&dcp->link_recovery_wq);
+ 	dcp->announce.stopped = true;
+ 	/*
+ 	 * A native external pipe's bind enables these; firmware callbacks may
+@@ -6001,6 +6042,7 @@ static int dcp_platform_resume(struct device *dev)
+ 	if (READ_ONCE(dcp->ext_dead))
+ 		return 0;
+ 
++	dcp->link_recovery_tries = 0;
+ 	dcp_release_after_sleep(dcp);
+ 	dcp_enable_typec_work(dcp);
+ 	/* The HDMI output's PHY and crossbar may have lost their setup in sleep. */
+diff --git a/drivers/gpu/drm/apple/dcp.h b/drivers/gpu/drm/apple/dcp.h
+index 86007f00c9a4..89f72eed69ad 100644
+--- a/drivers/gpu/drm/apple/dcp.h
++++ b/drivers/gpu/drm/apple/dcp.h
+@@ -144,6 +144,7 @@ unsigned int apple_j613_25g83_clock_hz(void);
+ bool apple_t8122_25g83_board(void);
+ 
+ void dcp_typec_hybrid_first_dt(void);
++void dcp_link_recovery_schedule(struct apple_dcp *dcp);
+ 
+ /* Desktop 26.6 dual-pipe peer (dcp-peer-v26_6.inc, included from dcp.c) */
+ struct dptx_port;
+diff --git a/drivers/gpu/drm/apple/dcp_external_announce_test.c b/drivers/gpu/drm/apple/dcp_external_announce_test.c
+index bd0af843698f..021293c10ba1 100644
+--- a/drivers/gpu/drm/apple/dcp_external_announce_test.c
++++ b/drivers/gpu/drm/apple/dcp_external_announce_test.c
+@@ -111,6 +111,7 @@ static struct announce_test *announce_test_init(struct kunit *test)
+ 	INIT_DELAYED_WORK(&dcp->typec_relink_wq, announce_test_noop);
+ 	INIT_DELAYED_WORK(&dcp->hdmi_settle_wq, announce_test_noop);
+ 	INIT_DELAYED_WORK(&dcp->hdmi_recheck_wq, announce_test_noop);
++	INIT_DELAYED_WORK(&dcp->link_recovery_wq, announce_test_noop);
+ 	INIT_DELAYED_WORK(&dcp->bl_fallback_wq, announce_test_noop);
+ 	INIT_DELAYED_WORK(&dcp->backlight.fade_work, announce_test_noop);
+ 	INIT_WORK(&dcp->external_stop_work, announce_test_noop);
+diff --git a/drivers/gpu/drm/apple/iomfb.c b/drivers/gpu/drm/apple/iomfb.c
+index b2a34c28f300..7daa5ac848a5 100644
+--- a/drivers/gpu/drm/apple/iomfb.c
++++ b/drivers/gpu/drm/apple/iomfb.c
+@@ -1221,10 +1221,12 @@ void dcp_hotplug(struct work_struct *work)
+ 		 * callback has completed.
+ 		 */
+ 		ret = dcp_retrain_active_crtc(connector);
+-		if (ret)
++		if (ret) {
+ 			dev_warn(dcp->dev,
+ 				 "failed to retrain active CRTC after hotplug: %d\n",
+ 				 ret);
++			dcp_link_recovery_schedule(dcp);
++		}
+ 	}
+ 
+ 	dcp_test_point(dcp, DCP_TEST_HOTPLUG_EVENT);
+diff --git a/drivers/gpu/drm/apple/iomfb_template.c b/drivers/gpu/drm/apple/iomfb_template.c
+index 59f5c1bd622c..3d1d0b54f92f 100644
+--- a/drivers/gpu/drm/apple/iomfb_template.c
++++ b/drivers/gpu/drm/apple/iomfb_template.c
+@@ -3025,6 +3025,8 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
+ 						mode->min_vrr : 0);
+ 		if (ret != -EOPNOTSUPP) {
+ 			dcp->desktop->mode_live = !ret;
++			if (!ret)
++				atomic_inc(&dcp->modesets_done);
+ 			return ret;
+ 		}
+ 	}
+@@ -3116,6 +3118,8 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
+ 	kref_put(&cookie->refcount, release_wait_cookie);
+ 
+ 	dcp->desktop->mode_live = !ret;
++	if (!ret)
++		atomic_inc(&dcp->modesets_done);
+ 	return ret;
+ }
+ #else
+-- 
+2.56.0
+

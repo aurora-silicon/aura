@@ -1,0 +1,2490 @@
+From 2d200045079b89d1de5f6a49963d7f807d0bf76d Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Franti=C5=A1ek=20Bal=C3=A1zsy?= <frantisekbalazsy@gmail.com>
+Date: Mon, 26 Oct 2026 16:16:21 +0100
+Subject: [PATCH 09/11] M4 platform layer for this J616s on m4-loader (local,
+ not for aurora): nvme write guard, DART filter, CPU PMU, aop firmware
+ regions, unit DT, m4_defconfig
+
+(cherry picked from commit 343e54bd831ff4daafbb752b2235b9d9fe002078)
+(cherry picked from commit b047a49cc567bf7cd7b245fd03b4f5ab22ef085e)
+(cherry picked from commit 6d344272506cd7e50b47d5ea1808653807a783d0)
+(cherry picked from commit b7d1ca4ec458ce9d10d0e1455f415f6bea3d456b)
+---
+ .../devicetree/bindings/arm/pmu.yaml          |   2 +
+ .../devicetree/bindings/iommu/apple,dart.yaml |  19 +-
+ arch/arm64/boot/dts/apple/t6040-j616s-m4.dtsi | 396 ++++++++++++++++++
+ arch/arm64/boot/dts/apple/t6040-j616s.dts     |  79 ++--
+ arch/arm64/boot/dts/apple/t6040.dtsi          |  25 ++
+ arch/arm64/configs/m4_defconfig               | 379 +++++++++++++++++
+ drivers/iommu/apple-dart.c                    |  84 +++-
+ drivers/leds/leds-pwm.c                       |  86 +++-
+ drivers/nvme/host/apple-m4-partition.h        |  43 ++
+ drivers/nvme/host/apple-m4-readonly.h         |  27 ++
+ drivers/nvme/host/apple.c                     |  93 ++++
+ drivers/perf/apple_m1_cpu_pmu.c               | 303 +++++++++++++-
+ drivers/soc/apple/aop.rs                      | 352 +++++++---------
+ 13 files changed, 1644 insertions(+), 244 deletions(-)
+ create mode 100644 arch/arm64/boot/dts/apple/t6040-j616s-m4.dtsi
+ create mode 100644 arch/arm64/configs/m4_defconfig
+ create mode 100644 drivers/nvme/host/apple-m4-partition.h
+ create mode 100644 drivers/nvme/host/apple-m4-readonly.h
+
+diff --git a/Documentation/devicetree/bindings/arm/pmu.yaml b/Documentation/devicetree/bindings/arm/pmu.yaml
+index f47baaefcdac..2832f994ee32 100644
+--- a/Documentation/devicetree/bindings/arm/pmu.yaml
++++ b/Documentation/devicetree/bindings/arm/pmu.yaml
+@@ -22,6 +22,8 @@ properties:
+           - apm,potenza-pmu
+           - apple,avalanche-pmu
+           - apple,blizzard-pmu
++          - apple,brava-e-pmu
++          - apple,brava-p-pmu
+           - apple,firestorm-pmu
+           - apple,icestorm-pmu
+           - arm,armv8-pmuv3 # Only for s/w models
+diff --git a/Documentation/devicetree/bindings/iommu/apple,dart.yaml b/Documentation/devicetree/bindings/iommu/apple,dart.yaml
+index 025400ef9391..1c02b53a24af 100644
+--- a/Documentation/devicetree/bindings/iommu/apple,dart.yaml
++++ b/Documentation/devicetree/bindings/iommu/apple,dart.yaml
+@@ -61,7 +61,10 @@ properties:
+       error-mask policy rather than changing it for these streams.
+ 
+   reg:
+-    maxItems: 1
++    minItems: 1
++    items:
++      - description: DART registers
++      - description: Address filter (DAPF) registers
+ 
+   interrupts:
+     maxItems: 1
+@@ -134,6 +137,20 @@ properties:
+       and filtering state without a separate page-table root. Source and
+       destination must differ, and both must exist on the controller.
+ 
++  apple,dapf-entries:
++    $ref: /schemas/types.yaml#/definitions/uint64-matrix
++    minItems: 1
++    items:
++      items:
++        - description: First physical address the streams may reach
++        - description: Last physical address the streams may reach
++        - description: Entry configuration word (DAPF register 0x00)
++        - description: Entry register 0x04
++        - description: Entry register 0x20
++    description:
++      Address filter entries from the ADT, programmed into
++      the DAPF block (the second reg) before any stream behind the DART runs.
++
+ required:
+   - compatible
+   - reg
+diff --git a/arch/arm64/boot/dts/apple/t6040-j616s-m4.dtsi b/arch/arm64/boot/dts/apple/t6040-j616s-m4.dtsi
+new file mode 100644
+index 000000000000..23ba055f2aa7
+--- /dev/null
++++ b/arch/arm64/boot/dts/apple/t6040-j616s-m4.dtsi
+@@ -0,0 +1,396 @@
++// SPDX-License-Identifier: GPL-2.0+ OR MIT
++/*
++ * Not for upstream: what the daily J616s tree adds on top of the public
++ * t6040.dtsi, t6040-pmgr.dtsi and t6040-j616s.dts. Included last from
++ * t6040-j616s.dts in the daily tree only; the public files are not edited.
++ *
++ * 1. The M4 boot loader's contract (loader rev 11 and later). The loader
++ *    edits the tree by node path; a missing placeholder makes it boot the
++ *    rescue set (bad-board-dtb). Filled in at boot from the ADT and its own
++ *    layout (src/standalone/fixups.c):
++ *      /memory: reg (single multi-range node), /memreserve map
++ *      /chosen: bootargs, linux,initrd-*, rng-seed, m4,* records, lab,*
++ *        descriptor; framebuffer node reg/format/size/stride/status
++ *      /reserved-memory: reg of direct-smp-*, direct-desktop-*, aop-*;
++ *        dcp-map pool (name, reg, compatible, iommu-addresses);
++ *        memory-region lists
++ *      the display stack: status okay once the display capture is accepted
++ *      /cpus/cpu@*: cpu-release-addr from the SMP peer records
++ *      bluetooth@0,1: local-bd-address, brcm,taurus-bf-cal-blob;
++ *        wifi@0,0: brcm,cal-blob, apple,antenna-sku (ADT)
++ *      headphone-codec-probe: status, lab,admission-result,
++ *        lab,current-adt-validated (ADT contract)
++ *      keyboard: hid-country-code (ADT)
++ *    No kernel driver reads headphone-codec-probe, apple,m4-bt-otp-probe or
++ *    apple,m4-bt-admission-policy any more, but the loader's media fix-ups
++ *    and Bluetooth admission run on this tree and their source is not
++ *    available to prove they ignore them, so they stay until the loader is
++ *    checked. The NVMe node is the partition-guarded driver binding
++ *    (lab,write-lba-range limits writes to the Linux partitions: slot 6 and
++ *    slot 3).
++ * 2. The old apple,t6040-* names as second compatible entries on the nodes
++ *    the loader may find by compatible. Its PMP publication looks up
++ *    "apple,t6040-pmp-v2"; its display fix-ups edit the DCP, its mailbox and
++ *    DARTs, and their source is not available to prove they match by path
++ *    only; the requested AOP fix-up names the AOP by "apple,t6040-aop".
++ * 3. Hardware the public tree leaves out: the MagSafe 3 PD controller,
++ *    the AOP and ISP DART address filters (apple,dapf-entries) and three
++ *    DCP iomfb properties.
++ * 4. Properties the booted tree has that the public tree leaves out: the
++ *    AIC, AOP and DCP cell counts, the DCP firmware version the loader
++ *    rewrites on every boot, the disp0_piodma alias, and the phandles the
++ *    PCIe node carries, so they stay as booted.
++ * Drop an entry once the loader, or an upstream binding, no longer needs it.
++ */
++
++/* 1. The boot loader's contract */
++
++/ {
++
++	reserved-memory {
++		ranges;
++		#address-cells = <2>;
++		#size-cells = <2>;
++
++		aop-oslog {
++			no-map;
++		};
++
++		aop-etext {
++			no-map;
++		};
++
++		direct-desktop-host1 {
++			no-map;
++		};
++
++		direct-desktop-host0 {
++			no-map;
++		};
++
++		direct-desktop-capture {
++			no-map;
++		};
++
++		direct-smp-peers {
++			no-map;
++		};
++
++		direct-smp-stacks {
++			no-map;
++		};
++
++		direct-smp-records {
++			no-map;
++		};
++
++		direct-smp-code {
++			no-map;
++		};
++
++		direct-smp-vector {
++			no-map;
++		};
++
++		dcp-map-pool0 {
++			compatible = "apple,asc-mem";
++			no-map;
++			status = "disabled";
++		};
++
++		dcp-map-pool1 {
++			compatible = "apple,asc-mem";
++			no-map;
++			status = "disabled";
++		};
++
++		dcp-map-pool2 {
++			compatible = "apple,asc-mem";
++			no-map;
++			status = "disabled";
++		};
++
++		dcp-map-pool3 {
++			compatible = "apple,asc-mem";
++			no-map;
++			status = "disabled";
++		};
++
++		dcp-map-pool4 {
++			compatible = "apple,asc-mem";
++			no-map;
++			status = "disabled";
++		};
++
++		dcp-map-pool5 {
++			compatible = "apple,asc-mem";
++			no-map;
++			status = "disabled";
++		};
++
++		dcp-map-pool6 {
++			compatible = "apple,asc-mem";
++			no-map;
++			status = "disabled";
++		};
++
++		dcp-map-pool7 {
++			compatible = "apple,asc-mem";
++			no-map;
++			status = "disabled";
++		};
++
++		dcp-map-pool8 {
++			compatible = "apple,asc-mem";
++			no-map;
++			status = "disabled";
++		};
++
++		dcp-map-pool9 {
++			compatible = "apple,asc-mem";
++			no-map;
++			status = "disabled";
++		};
++
++		dcp-map-pool10 {
++			compatible = "apple,asc-mem";
++			no-map;
++			status = "disabled";
++		};
++
++		dcp-map-pool11 {
++			compatible = "apple,asc-mem";
++			no-map;
++			status = "disabled";
++		};
++
++		dcp-map-pool12 {
++			compatible = "apple,asc-mem";
++			no-map;
++			status = "disabled";
++		};
++
++		dcp-map-pool13 {
++			compatible = "apple,asc-mem";
++			no-map;
++			status = "disabled";
++		};
++
++		dcp-map-pool14 {
++			compatible = "apple,asc-mem";
++			no-map;
++			status = "disabled";
++		};
++
++		dcp-map-pool15 {
++			compatible = "apple,asc-mem";
++			no-map;
++			status = "disabled";
++		};
++	};
++
++	headphone-codec-probe {
++		compatible = "lab,j616s-headphone-control-v1";
++		reg = <4 0x29018000 0 0x4000 5 0x81e4000 0 0x4000>;
++		clock-frequency = <0x16e3600>;
++		codec-address = <0x4b>;
++		status = "disabled";
++	};
++};
++
++&nvme {
++	compatible = "lab,j616-nvme-partition-25g83";
++	/* slot 6 (this root), slot 3 (HP) */
++	lab,write-lba-range = <0 0xd9bd800 0 0xe7b5c00>,
++			      <0 0xc020f8c 0 0xce11402>;
++};
++
++&{/pcie@1cb0000000/pci@0,0/bluetooth@0,1} {
++	apple,m4-bt-otp-probe;
++	apple,m4-bt-admission-policy = "runtime-after-cold-reset-v1";
++};
++
++/* 2. The loader's apple,t6040-* names */
++
++&pmp {
++	compatible = "apple,t6041-pmp-v2", "apple,t6040-pmp-v2", "apple,t6000-pmp-v2";
++};
++
++&aop {
++	compatible = "apple,t6041-aop", "apple,t6040-aop";
++};
++
++&dcp {
++	compatible = "apple,t6041-dcp", "apple,t6040-dcp", "apple,dcp";
++};
++
++&dcp_mbox {
++	compatible = "apple,t6041-asc-mailbox", "apple,t6040-asc-mailbox", "apple,asc-mailbox-v4";
++};
++
++&dcp_dart {
++	compatible = "apple,t6041-dart", "apple,t6040-dart", "apple,t8110-dart";
++};
++
++&disp0_dart {
++	compatible = "apple,t6041-dart", "apple,t6040-dart", "apple,t8110-dart";
++};
++
++/* 3. Hardware without an upstream binding yet */
++
++/*
++ * hpm5, the MagSafe 3 port's PD controller on nub-spmi-a0 (ADT port-type
++ * 0x11, "Power In", no USB data path, no connector). tipd takes the port's
++ * capabilities from the controller and registers a Type-C port and a power
++ * supply for it, as for MagSafe on the M1 Pro/Max and the M2 Airs. Select
++ * is irq + 2.
++ */
++&nub_spmi_a0 {
++	usb-pd@8 {
++		compatible = "apple,sn201202x";
++		reg = <0x8 SPMI_USID>;
++		interrupts = <63 IRQ_TYPE_EDGE_RISING>,
++			     <65 IRQ_TYPE_EDGE_RISING>,
++			     <69 IRQ_TYPE_EDGE_RISING>,
++			     <71 IRQ_TYPE_EDGE_RISING>;
++		interrupt-names = "irq", "select", "sleep", "wake";
++	};
++};
++
++/*
++ * The AOP and ISP DARTs' address filters (DAPF), programmed from the J616s
++ * ADT's filter data: <start end r0 r4 r20>. The second register range is
++ * the filter block.
++ */
++&aop_dart {
++	reg = <0x5 0x10f00000 0x0 0xc000>, <0x5 0x10f10000 0x0 0x4000>;
++	apple,dapf-entries = /bits/ 64 <
++		0x5081e4020 0x5081e4043 0x31 0x0 0x1
++		0x5081e4880 0x5081e4c50 0x31 0x0 0x1
++		0x508240004 0x508240373 0x31 0x0 0x1
++		0x508304000 0x50830416b 0x31 0x0 0x1
++		0x508320280 0x50832048b 0x31 0x0 0x1
++		0x508370000 0x5083709a3 0x31 0x0 0x1
++		0x508900014 0x508900017 0x31 0x0 0x1
++		0x50c618110 0x50c61881f 0x31 0x0 0x1
++		0x50c634000 0x50c634003 0x31 0x0 0x1
++		0x50de00000 0x50defffff 0x31 0x0 0x1
++		0x508018000 0x50801bfff 0x31 0x0 0x1
++		0x50801c000 0x50801ffff 0x31 0x0 0x1
++	>;
++};
++
++&isp_dart0 {
++	reg = <0x5 0x828c0000 0x0 0xc000>, <0x5 0x828d0000 0x0 0x4000>;
++	apple,dapf-entries = /bits/ 64 <
++		0x502284000 0x50228402b 0x31 0x0 0x1
++		0x502880000 0x502887fff 0x31 0x0 0x1
++		0x500e3c000 0x500e3c003 0x31 0x0 0x1
++		0x51062c000 0x510648003 0x31 0x0 0x1
++		0x485660000 0x485660003 0x31 0x0 0x1
++		0x220004000 0x2201d62fc 0x31 0x0 0x1
++		0x222004000 0x2221d62fc 0x31 0x0 0x1
++		0x224004000 0x2241d62fc 0x31 0x0 0x1
++		0x226004000 0x2261d62fc 0x31 0x0 0x1
++		0x504824000 0x504824004 0x31 0x0 0x1
++		0x5003c0000 0x5003e4000 0x31 0x0 0x1
++	>;
++};
++
++/* The surface layout the imported M4 display driver reads */
++&dcp {
++	apple,iomfb-surface-order = <0 1>;
++	apple,iomfb-primary-surface = <0>;
++	apple,iomfb-max-layers = <2>;
++};
++
++/* 4. Kept as the booted tree has them */
++
++&aic {
++	#address-cells = <0>;
++};
++
++&aop {
++	#address-cells = <2>;
++	#size-cells = <2>;
++};
++
++&dcp {
++	#address-cells = <2>;
++	#size-cells = <2>;
++	/* The 26.6.2 boot firmware; the display handoff checks the ADT's build first. */
++	apple,firmware-version = <0x1a 6 2>;
++	apple,firmware-compat = <0x1a 6 2>;
++};
++
++/*
++ * The GPU driver identifies its firmware build by this, on its own node. The loader does not
++ * write it yet (its next revision writes os_firmware here, as m1n1 does): 26.6.2 for now.
++ */
++&gpu {
++	apple,firmware-version = <0x1a 6 2>;
++};
++
++/ {
++	aliases {
++		disp0_piodma = &disp0_piodma;
++	};
++};
++
++/*
++ * The PCIe node's phandles as the booted tree has them: the loader's
++ * Bluetooth admission runs on that node (rev 14 and later read only its
++ * config window and bus-range, so the extra port and PHY windows are
++ * fine). These are the phandles it carries or names (the AIC in msi-ranges
++ * and interrupt-parent, the DART, the CLKREQ pin, the SMC GPIO and AP pin
++ * controller, the port and itself).
++ */
++&aic {
++	phandle = <0x1>;
++};
++
++&pinctrl {
++	phandle = <0x49>;
++};
++
++&wifi_clkreq_pins {
++	phandle = <0x78>;
++};
++
++&pcie_dart {
++	phandle = <0x79>;
++};
++
++&pcie0 {
++	phandle = <0x7a>;
++};
++
++&port00 {
++	phandle = <0x7b>;
++};
++
++&smc_gpio {
++	phandle = <0x7c>;
++};
++
++/*
++ * The GPU, as the daily tree up to 7.3.0-m4.29 ran it (integration/aurora
++ * keeps it disabled for a boot loader that fills in the unit's values; this
++ * board's values are in t6040-j616s.dts): enabled, ps_afr and ps_gfx always
++ * on, pmp_gfx always-on so the PMP sees the GPU on while it is powered.
++ */
++&gpu {
++	status = "okay";
++};
++
++&ps_afr {
++	apple,always-on;
++};
++
++&ps_gfx {
++	apple,always-on;
++};
++
++&pmp_gfx {
++	apple,always-on;
++};
+diff --git a/arch/arm64/boot/dts/apple/t6040-j616s.dts b/arch/arm64/boot/dts/apple/t6040-j616s.dts
+index bccb16734015..06b1795c6ae4 100644
+--- a/arch/arm64/boot/dts/apple/t6040-j616s.dts
++++ b/arch/arm64/boot/dts/apple/t6040-j616s.dts
+@@ -139,9 +139,11 @@ led-0 {
+ 	/*
+ 	 * GPU performance states, one opp-microvolt cell per cluster (ADT
+ 	 * /arm-io/sgx perf-states and perf-states1). The operating points are
+-	 * binned per device: these are this unit's values until the boot
+-	 * loader fills them in. Entries keep the order of the GPU performance
+-	 * states, which is not sorted by frequency.
++	 * binned per device: these are the values of one J616s unit (its ADT
++	 * perf-states, perf-states1, cs-perf-states and afr-perf-states), a
++	 * placeholder until the boot loader fills in the running unit's own. Entries keep
++	 * the order of the GPU performance states, which is not sorted by
++	 * frequency.
+ 	 */
+ 	gpu_opp: opp-table-gpu {
+ 		compatible = "operating-points-v2";
+@@ -152,43 +154,43 @@ opp00 {
+ 		};
+ 		opp01 {
+ 			opp-hz = /bits/ 64 <338000000>;
+-			opp-microvolt = <605000 585000>;
++			opp-microvolt = <605000 600000>;
+ 		};
+ 		opp02 {
+ 			opp-hz = /bits/ 64 <618000000>;
+-			opp-microvolt = <655000 640000>;
++			opp-microvolt = <640000 655000>;
+ 		};
+ 		opp03 {
+ 			opp-hz = /bits/ 64 <796000000>;
+-			opp-microvolt = <690000 690000>;
++			opp-microvolt = <685000 700000>;
+ 		};
+ 		opp04 {
+ 			opp-hz = /bits/ 64 <924000000>;
+-			opp-microvolt = <715000 725000>;
++			opp-microvolt = <720000 730000>;
+ 		};
+ 		opp05 {
+ 			opp-hz = /bits/ 64 <952000000>;
+-			opp-microvolt = <755000 770000>;
++			opp-microvolt = <765000 780000>;
+ 		};
+ 		opp06 {
+ 			opp-hz = /bits/ 64 <1056000000>;
+-			opp-microvolt = <755000 770000>;
++			opp-microvolt = <765000 780000>;
+ 		};
+ 		opp07 {
+ 			opp-hz = /bits/ 64 <1062000000>;
+-			opp-microvolt = <795000 810000>;
++			opp-microvolt = <805000 820000>;
+ 		};
+ 		opp08 {
+ 			opp-hz = /bits/ 64 <1182000000>;
+-			opp-microvolt = <795000 810000>;
++			opp-microvolt = <805000 820000>;
+ 		};
+ 		opp09 {
+ 			opp-hz = /bits/ 64 <1182000000>;
+-			opp-microvolt = <845000 860000>;
++			opp-microvolt = <855000 870000>;
+ 		};
+ 		opp10 {
+ 			opp-hz = /bits/ 64 <1312000000>;
+-			opp-microvolt = <845000 860000>;
++			opp-microvolt = <855000 870000>;
+ 		};
+ 		opp11 {
+ 			opp-hz = /bits/ 64 <1242000000>;
+@@ -200,15 +202,15 @@ opp12 {
+ 		};
+ 		opp13 {
+ 			opp-hz = /bits/ 64 <1326000000>;
+-			opp-microvolt = <945000 960000>;
++			opp-microvolt = <940000 955000>;
+ 		};
+ 		opp14 {
+ 			opp-hz = /bits/ 64 <1470000000>;
+-			opp-microvolt = <945000 960000>;
++			opp-microvolt = <940000 955000>;
+ 		};
+ 		opp15 {
+ 			opp-hz = /bits/ 64 <1578000000>;
+-			opp-microvolt = <1030000 1045000>;
++			opp-microvolt = <1025000 1045000>;
+ 		};
+ 	};
+ 
+@@ -218,31 +220,31 @@ gpu_cs_opp: opp-table-gpucs {
+ 
+ 		opp00 {
+ 			opp-hz = /bits/ 64 <24000000>;
+-			opp-microvolt = <555000>;
++			opp-microvolt = <580000>;
+ 		};
+ 		opp01 {
+ 			opp-hz = /bits/ 64 <338000000>;
+-			opp-microvolt = <555000>;
++			opp-microvolt = <580000>;
+ 		};
+ 		opp02 {
+ 			opp-hz = /bits/ 64 <618000000>;
+-			opp-microvolt = <620000>;
++			opp-microvolt = <630000>;
+ 		};
+ 		opp03 {
+ 			opp-hz = /bits/ 64 <796000000>;
+-			opp-microvolt = <660000>;
++			opp-microvolt = <675000>;
+ 		};
+ 		opp04 {
+ 			opp-hz = /bits/ 64 <992000000>;
+-			opp-microvolt = <715000>;
++			opp-microvolt = <730000>;
+ 		};
+ 		opp05 {
+ 			opp-hz = /bits/ 64 <1188000000>;
+-			opp-microvolt = <780000>;
++			opp-microvolt = <795000>;
+ 		};
+ 		opp06 {
+ 			opp-hz = /bits/ 64 <1380000000>;
+-			opp-microvolt = <870000>;
++			opp-microvolt = <875000>;
+ 		};
+ 		opp07 {
+ 			opp-hz = /bits/ 64 <1470000000>;
+@@ -256,31 +258,31 @@ gpu_afr_opp: opp-table-gpuafr {
+ 
+ 		opp00 {
+ 			opp-hz = /bits/ 64 <24000000>;
+-			opp-microvolt = <555000>;
++			opp-microvolt = <580000>;
+ 		};
+ 		opp01 {
+ 			opp-hz = /bits/ 64 <338000000>;
+-			opp-microvolt = <555000>;
++			opp-microvolt = <580000>;
+ 		};
+ 		opp02 {
+ 			opp-hz = /bits/ 64 <618000000>;
+-			opp-microvolt = <620000>;
++			opp-microvolt = <630000>;
+ 		};
+ 		opp03 {
+ 			opp-hz = /bits/ 64 <796000000>;
+-			opp-microvolt = <660000>;
++			opp-microvolt = <675000>;
+ 		};
+ 		opp04 {
+ 			opp-hz = /bits/ 64 <992000000>;
+-			opp-microvolt = <715000>;
++			opp-microvolt = <730000>;
+ 		};
+ 		opp05 {
+ 			opp-hz = /bits/ 64 <1188000000>;
+-			opp-microvolt = <780000>;
++			opp-microvolt = <795000>;
+ 		};
+ 		opp06 {
+ 			opp-hz = /bits/ 64 <1380000000>;
+-			opp-microvolt = <870000>;
++			opp-microvolt = <875000>;
+ 		};
+ 		opp07 {
+ 			opp-hz = /bits/ 64 <1470000000>;
+@@ -828,6 +830,20 @@ &isp_dart2 {
+  * claims pmp_gfx always-on, so that the PMP sees the GPU on exactly while it
+  * is powered.
+  */
++
++/*
++ * The GPU driver identifies its firmware build by this. The M4 loader
++ * (rev15-j616s-6) does not write it on the GPU node: this unit's macOS
++ * firmware is 26.6.2.
++ */
++&gpu {
++	apple,firmware-version = <26 6 2>;
++};
++
++&gfx_mbox {
++	status = "okay";
++};
++
+ &gpu {
+ 	memory-region = <&uat_ttbs>, <&uat_pagetables>, <&uat_handoff>,
+ 			<&gpu_fw_data>, <&uat_l2_pagetables>, <&gpu_fw_text>;
+@@ -1087,6 +1103,9 @@ usb_drd2_hs: endpoint {
+ 
+ #include "t6040-j616s-usb3.dtsi"
+ 
++/* Daily tree only: the private additions (t6040-j616s-m4.dtsi), applied last. */
++#include "t6040-j616s-m4.dtsi"
++
+ /* External display chain, all disabled: the gate in drivers/soc/apple/t6041-display-gate.c enables it. */
+ #include "t6040-j616s-extdisp.dtsi"
+ #include "t6040-j616s-extdisp-mem-loader.dtsi"
+diff --git a/arch/arm64/boot/dts/apple/t6040.dtsi b/arch/arm64/boot/dts/apple/t6040.dtsi
+index 213723f3c34b..ac5c72f117f5 100644
+--- a/arch/arm64/boot/dts/apple/t6040.dtsi
++++ b/arch/arm64/boot/dts/apple/t6040.dtsi
+@@ -507,6 +507,18 @@ timer {
+ 			     <AIC_FIQ AIC_TMR_HV_VIRT IRQ_TYPE_LEVEL_HIGH>;
+ 	};
+ 
++	pmu-e {
++		compatible = "apple,brava-e-pmu";
++		interrupt-parent = <&aic>;
++		interrupts = <AIC_FIQ AIC_CPU_PMU_E IRQ_TYPE_LEVEL_HIGH>;
++	};
++
++	pmu-p {
++		compatible = "apple,brava-p-pmu";
++		interrupt-parent = <&aic>;
++		interrupts = <AIC_FIQ AIC_CPU_PMU_P IRQ_TYPE_LEVEL_HIGH>;
++	};
++
+ 	/* The 24 MHz reference clock (ADT clock-ids 4) of the I2C, PWM and watchdog blocks */
+ 	clkref: clock-ref {
+ 		compatible = "fixed-clock";
+@@ -978,6 +990,19 @@ aic: interrupt-controller@502400000 {
+ 		reg = <0x5 0x02400000 0x0 0x184000>,
+ 		      <0x5 0x02440000 0x0 0x4>;
+ 		reg-names = "core", "event";
++
++		affinities {
++			e-core-pmu-affinity {
++				apple,fiq-index = <AIC_CPU_PMU_E>;
++				cpus = <&cpu_e0 &cpu_e1 &cpu_e2 &cpu_e3>;
++			};
++
++			p-core-pmu-affinity {
++				apple,fiq-index = <AIC_CPU_PMU_P>;
++				cpus = <&cpu_p00 &cpu_p01 &cpu_p02 &cpu_p03 &cpu_p04
++					&cpu_p10 &cpu_p11 &cpu_p12 &cpu_p13 &cpu_p14>;
++			};
++		};
+ 	};
+ 
+ 	pmgr_aux: power-management@502800000 {
+diff --git a/arch/arm64/configs/m4_defconfig b/arch/arm64/configs/m4_defconfig
+new file mode 100644
+index 000000000000..fbc59c9f7d63
+--- /dev/null
++++ b/arch/arm64/configs/m4_defconfig
+@@ -0,0 +1,379 @@
++CONFIG_LOCALVERSION="-m4"
++# CONFIG_LOCALVERSION_AUTO is not set
++CONFIG_SYSVIPC=y
++CONFIG_POSIX_MQUEUE=y
++# CONFIG_CROSS_MEMORY_ATTACH is not set
++CONFIG_NO_HZ_IDLE=y
++CONFIG_HIGH_RES_TIMERS=y
++CONFIG_BPF_SYSCALL=y
++CONFIG_BPF_JIT=y
++CONFIG_PREEMPT=y
++CONFIG_PSI=y
++CONFIG_IKCONFIG=y
++CONFIG_IKCONFIG_PROC=y
++CONFIG_UCLAMP_TASK=y
++CONFIG_CGROUPS=y
++CONFIG_MEMCG=y
++CONFIG_CGROUP_SCHED=y
++CONFIG_UCLAMP_TASK_GROUP=y
++CONFIG_CGROUP_PIDS=y
++CONFIG_CGROUP_FREEZER=y
++CONFIG_CPUSETS=y
++CONFIG_CGROUP_DEVICE=y
++CONFIG_CGROUP_CPUACCT=y
++CONFIG_CGROUP_BPF=y
++CONFIG_NAMESPACES=y
++CONFIG_USER_NS=y
++CONFIG_BLK_DEV_INITRD=y
++# CONFIG_RD_BZIP2 is not set
++# CONFIG_RD_LZMA is not set
++# CONFIG_RD_LZO is not set
++# CONFIG_RD_LZ4 is not set
++# CONFIG_INITRAMFS_PRESERVE_MTIME is not set
++CONFIG_EXPERT=y
++# CONFIG_AIO is not set
++# CONFIG_IO_URING is not set
++# CONFIG_MEMBARRIER is not set
++# CONFIG_RSEQ is not set
++# CONFIG_CACHESTAT_SYSCALL is not set
++CONFIG_PERF_EVENTS=y
++CONFIG_RUST=y
++CONFIG_ARCH_APPLE=y
++# CONFIG_AMPERE_ERRATUM_AC03_CPU_38 is not set
++# CONFIG_AMPERE_ERRATUM_AC04_CPU_23 is not set
++# CONFIG_ARM64_ERRATUM_826319 is not set
++# CONFIG_ARM64_ERRATUM_827319 is not set
++# CONFIG_ARM64_ERRATUM_824069 is not set
++# CONFIG_ARM64_ERRATUM_819472 is not set
++# CONFIG_ARM64_ERRATUM_832075 is not set
++# CONFIG_ARM64_ERRATUM_843419 is not set
++# CONFIG_ARM64_ERRATUM_1024718 is not set
++# CONFIG_ARM64_ERRATUM_1165522 is not set
++# CONFIG_ARM64_ERRATUM_1319367 is not set
++# CONFIG_ARM64_ERRATUM_1530923 is not set
++# CONFIG_ARM64_ERRATUM_1463225 is not set
++# CONFIG_ARM64_ERRATUM_1508412 is not set
++# CONFIG_ARM64_ERRATUM_2051678 is not set
++# CONFIG_ARM64_ERRATUM_2077057 is not set
++# CONFIG_ARM64_ERRATUM_2658417 is not set
++# CONFIG_ARM64_ERRATUM_2054223 is not set
++# CONFIG_ARM64_ERRATUM_2067961 is not set
++# CONFIG_ARM64_ERRATUM_2645198 is not set
++# CONFIG_ARM64_ERRATUM_2966298 is not set
++# CONFIG_ARM64_ERRATUM_3117295 is not set
++# CONFIG_ARM64_ERRATUM_3194386 is not set
++# CONFIG_ARM64_ERRATUM_4311569 is not set
++# CONFIG_ARM64_ERRATUM_4118414 is not set
++# CONFIG_CAVIUM_ERRATUM_22375 is not set
++# CONFIG_CAVIUM_ERRATUM_23154 is not set
++# CONFIG_CAVIUM_ERRATUM_27456 is not set
++# CONFIG_CAVIUM_ERRATUM_30115 is not set
++# CONFIG_CAVIUM_TX2_ERRATUM_219 is not set
++# CONFIG_FUJITSU_ERRATUM_010001 is not set
++# CONFIG_HISILICON_ERRATUM_161600802 is not set
++# CONFIG_HISILICON_ERRATUM_162100801 is not set
++# CONFIG_QCOM_FALKOR_ERRATUM_1003 is not set
++# CONFIG_QCOM_FALKOR_ERRATUM_1009 is not set
++# CONFIG_QCOM_QDF2400_ERRATUM_0065 is not set
++# CONFIG_QCOM_FALKOR_ERRATUM_E1041 is not set
++# CONFIG_NVIDIA_CARMEL_CNP_ERRATUM is not set
++# CONFIG_ROCKCHIP_ERRATUM_3568002 is not set
++# CONFIG_ROCKCHIP_ERRATUM_3588001 is not set
++# CONFIG_SOCIONEXT_SYNQUACER_PREITS is not set
++CONFIG_ARM64_16K_PAGES=y
++CONFIG_ARM64_VA_BITS_47=y
++CONFIG_NR_CPUS=14
++# CONFIG_ARM64_TAGGED_ADDR_ABI is not set
++# CONFIG_ARM64_HW_AFDBM is not set
++# CONFIG_ARM64_RAS_EXTN is not set
++# CONFIG_ARM64_CNP is not set
++# CONFIG_ARM64_PTR_AUTH is not set
++# CONFIG_ARM64_AMU_EXTN is not set
++# CONFIG_ARM64_TLB_RANGE is not set
++# CONFIG_ARM64_BTI is not set
++# CONFIG_ARM64_E0PD is not set
++# CONFIG_ARM64_EPAN is not set
++# CONFIG_ARM64_POE is not set
++# CONFIG_ARM64_GCS is not set
++# CONFIG_ARM64_LSUI is not set
++# CONFIG_ARM64_SVE is not set
++CONFIG_ARM64_MEMORY_MODEL_CONTROL=y
++# CONFIG_EFI is not set
++CONFIG_PM_DEBUG=y
++CONFIG_CPU_IDLE=y
++CONFIG_CPU_FREQ=y
++CONFIG_CPU_FREQ_STAT=y
++CONFIG_CPU_FREQ_DEFAULT_GOV_POWERSAVE=y
++CONFIG_CPU_FREQ_GOV_PERFORMANCE=y
++CONFIG_CPU_FREQ_GOV_USERSPACE=y
++CONFIG_CPU_FREQ_GOV_SCHEDUTIL=y
++CONFIG_ARM_APPLE_SOC_CPUFREQ=m
++CONFIG_VIRTUALIZATION=y
++CONFIG_KVM=y
++# CONFIG_SCHED_SMT is not set
++# CONFIG_GCC_PLUGINS is not set
++CONFIG_MODULES=y
++CONFIG_MODULE_UNLOAD=y
++CONFIG_MODULE_COMPRESS=y
++CONFIG_MODULE_COMPRESS_ZSTD=y
++CONFIG_MODULE_DECOMPRESS=y
++# CONFIG_MQ_IOSCHED_KYBER is not set
++# CONFIG_SLAB_MERGE_DEFAULT is not set
++# CONFIG_COMPAT_BRK is not set
++# CONFIG_COMPACTION is not set
++# CONFIG_ZONE_DMA is not set
++# CONFIG_ZONE_DMA32 is not set
++# CONFIG_SECRETMEM is not set
++CONFIG_NET=y
++CONFIG_PACKET=y
++CONFIG_UNIX=y
++CONFIG_INET=y
++CONFIG_IP_ADVANCED_ROUTER=y
++CONFIG_IP_MULTIPLE_TABLES=y
++# CONFIG_IPV6_SIT is not set
++CONFIG_IPV6_MULTIPLE_TABLES=y
++CONFIG_NETFILTER=y
++CONFIG_BRIDGE_NETFILTER=m
++CONFIG_NF_CONNTRACK=m
++CONFIG_NF_CONNTRACK_PROCFS=y
++CONFIG_NF_CONNTRACK_EVENTS=y
++CONFIG_NF_CONNTRACK_FTP=m
++CONFIG_NF_CONNTRACK_TFTP=m
++CONFIG_NF_TABLES=m
++CONFIG_NF_TABLES_INET=y
++CONFIG_NFT_CT=m
++CONFIG_NFT_LOG=m
++CONFIG_NFT_LIMIT=m
++CONFIG_NFT_MASQ=m
++CONFIG_NFT_REDIR=m
++CONFIG_NFT_NAT=m
++CONFIG_NFT_REJECT=m
++CONFIG_NFT_COMPAT=m
++CONFIG_NETFILTER_XTABLES=y
++CONFIG_NETFILTER_XTABLES_LEGACY=y
++CONFIG_NETFILTER_XT_TARGET_LOG=m
++CONFIG_NETFILTER_XT_TARGET_NFLOG=m
++CONFIG_NETFILTER_XT_TARGET_REDIRECT=m
++CONFIG_NETFILTER_XT_TARGET_MASQUERADE=m
++CONFIG_NETFILTER_XT_TARGET_TCPMSS=m
++CONFIG_NETFILTER_XT_MATCH_ADDRTYPE=m
++CONFIG_NETFILTER_XT_MATCH_COMMENT=m
++CONFIG_NETFILTER_XT_MATCH_CONNMARK=m
++CONFIG_NETFILTER_XT_MATCH_CONNTRACK=m
++CONFIG_NETFILTER_XT_MATCH_HASHLIMIT=m
++CONFIG_NETFILTER_XT_MATCH_HL=m
++CONFIG_NETFILTER_XT_MATCH_LIMIT=m
++CONFIG_NETFILTER_XT_MATCH_MARK=m
++CONFIG_NETFILTER_XT_MATCH_MULTIPORT=m
++CONFIG_NETFILTER_XT_MATCH_PHYSDEV=m
++CONFIG_NETFILTER_XT_MATCH_RECENT=m
++CONFIG_NETFILTER_XT_MATCH_STATE=m
++CONFIG_NETFILTER_XT_MATCH_TCPMSS=m
++CONFIG_NFT_FIB_IPV4=m
++CONFIG_IP_NF_IPTABLES=m
++CONFIG_IP_NF_TARGET_REJECT=m
++CONFIG_IP_NF_NAT=m
++CONFIG_IP_NF_RAW=m
++CONFIG_NFT_FIB_IPV6=m
++CONFIG_IP6_NF_IPTABLES=m
++CONFIG_IP6_NF_MATCH_RT=m
++CONFIG_IP6_NF_TARGET_REJECT=m
++CONFIG_IP6_NF_RAW=m
++CONFIG_IP6_NF_NAT=m
++CONFIG_BRIDGE=m
++CONFIG_NET_SCHED=y
++CONFIG_NET_SCH_HTB=m
++CONFIG_NET_SCH_FQ_CODEL=m
++CONFIG_NET_CLS_CGROUP=m
++CONFIG_BT=m
++CONFIG_BT_RFCOMM=m
++CONFIG_BT_RFCOMM_TTY=y
++CONFIG_BT_BNEP=m
++CONFIG_BT_BNEP_MC_FILTER=y
++CONFIG_BT_BNEP_PROTO_FILTER=y
++CONFIG_BT_HIDP=m
++CONFIG_BT_HCIBCM4377=m
++CONFIG_CFG80211=m
++CONFIG_RFKILL=y
++CONFIG_PCI=y
++CONFIG_PCIE_APPLE=y
++CONFIG_PCI_HOST_GENERIC=y
++CONFIG_DEVTMPFS=y
++CONFIG_DEVTMPFS_MOUNT=y
++CONFIG_DEVTMPFS_SAFE=y
++CONFIG_DRIVER_DEFERRED_PROBE_TIMEOUT=0
++# CONFIG_STANDALONE is not set
++# CONFIG_PREVENT_FIRMWARE_BUILD is not set
++# CONFIG_ALLOW_DEV_COREDUMP is not set
++# CONFIG_ARM_SMCCC_SOC_ID is not set
++CONFIG_ZRAM=y
++CONFIG_ZRAM_BACKEND_LZ4=y
++CONFIG_BLK_DEV_LOOP=y
++CONFIG_VIRTIO_BLK=y
++CONFIG_BLK_DEV_NVME=m
++CONFIG_NVME_APPLE=m
++CONFIG_SCSI=m
++CONFIG_BLK_DEV_SD=m
++# CONFIG_BLK_DEV_BSG is not set
++CONFIG_NETDEVICES=y
++CONFIG_WIREGUARD=m
++CONFIG_TUN=m
++CONFIG_VETH=m
++CONFIG_VIRTIO_NET=y
++CONFIG_SLIP=y
++CONFIG_USB_USBNET=m
++# CONFIG_USB_NET_AX8817X is not set
++# CONFIG_USB_NET_AX88179_178A is not set
++CONFIG_BRCMFMAC=m
++CONFIG_BRCMFMAC_PCIE=y
++CONFIG_INPUT_EVDEV=y
++# CONFIG_KEYBOARD_ATKBD is not set
++# CONFIG_MOUSE_PS2 is not set
++CONFIG_INPUT_MISC=y
++CONFIG_INPUT_UINPUT=y
++CONFIG_INPUT_MACSMC_INPUT=m
++CONFIG_SERIO_LIBPS2=y
++# CONFIG_LEGACY_PTYS is not set
++# CONFIG_LEGACY_TIOCSTI is not set
++# CONFIG_LDISC_AUTOLOAD is not set
++CONFIG_SERIAL_AMBA_PL011=y
++CONFIG_SERIAL_AMBA_PL011_CONSOLE=y
++CONFIG_SERIAL_SAMSUNG=y
++CONFIG_SERIAL_SAMSUNG_CONSOLE=y
++# CONFIG_HW_RANDOM is not set
++# CONFIG_DEVMEM is not set
++# CONFIG_DEVPORT is not set
++CONFIG_I2C_CHARDEV=m
++CONFIG_I2C_APPLE=m
++CONFIG_SPMI=y
++CONFIG_SPMI_APPLE=y
++# CONFIG_PTP_1588_CLOCK is not set
++CONFIG_PINCTRL=y
++CONFIG_PINCTRL_APPLE_GPIO=y
++CONFIG_GPIO_MACSMC=y
++CONFIG_GPIO_SHARED_PROXY=y
++CONFIG_POWER_RESET_MACSMC=y
++CONFIG_MACSMC_POWER=m
++CONFIG_SENSORS_MACSMC_HWMON=m
++CONFIG_THERMAL=y
++CONFIG_CPU_THERMAL=y
++CONFIG_WATCHDOG=y
++CONFIG_APPLE_WATCHDOG=m
++CONFIG_MFD_MACSMC=y
++CONFIG_REGULATOR=y
++CONFIG_MEDIA_SUPPORT=m
++CONFIG_MEDIA_SUPPORT_FILTER=y
++# CONFIG_MEDIA_SUBDRV_AUTOSELECT is not set
++CONFIG_MEDIA_PLATFORM_SUPPORT=y
++CONFIG_V4L_PLATFORM_DRIVERS=y
++CONFIG_VIDEO_APPLE_ISP=m
++CONFIG_VIDEO_APPLE_AVD=m
++CONFIG_DRM=y
++CONFIG_DRM_FBDEV_EMULATION=y
++CONFIG_DRM_APPLE=m
++# CONFIG_DRM_APPLE_AUDIO is not set
++CONFIG_DRM_ASAHI=m
++CONFIG_DRM_SIMPLEDRM=y
++CONFIG_BACKLIGHT_CLASS_DEVICE=y
++CONFIG_SOUND=y
++CONFIG_SND=m
++CONFIG_SND_USB_AUDIO=m
++CONFIG_SND_SOC=m
++CONFIG_SND_SOC_APPLE_AOP_AUDIO=m
++CONFIG_SND_SOC_APPLE_MACAUDIO=m
++CONFIG_HIDRAW=y
++CONFIG_UHID=m
++CONFIG_HID_APPLE=y
++CONFIG_HID_LOGITECH=m
++CONFIG_HID_LOGITECH_HIDPP=m
++CONFIG_HID_MAGICMOUSE=y
++CONFIG_HID_DOCKCHANNEL=y
++CONFIG_USB=m
++# CONFIG_USB_PCI is not set
++CONFIG_USB_XHCI_HCD=m
++CONFIG_USB_ACM=m
++CONFIG_USB_STORAGE=m
++CONFIG_USB_UAS=m
++CONFIG_USB_DWC3=m
++# CONFIG_USB_DWC3_OF_SIMPLE is not set
++# CONFIG_USB_DWC3_GENERIC_PLAT is not set
++CONFIG_TYPEC=y
++CONFIG_TYPEC_SN201202X=m
++CONFIG_NEW_LEDS=y
++CONFIG_LEDS_CLASS=y
++CONFIG_LEDS_CLASS_MULTICOLOR=m
++CONFIG_LEDS_PWM=m
++CONFIG_RTC_CLASS=y
++# CONFIG_RTC_SYSTOHC is not set
++CONFIG_RTC_DRV_MACSMC=y
++CONFIG_DMADEVICES=y
++CONFIG_VIRTIO_MMIO=y
++# CONFIG_VHOST_MENU is not set
++# CONFIG_SURFACE_PLATFORMS is not set
++# CONFIG_ARM64_PLATFORM_DEVICES is not set
++# CONFIG_ARM_ARCH_TIMER_EVTSTREAM is not set
++# CONFIG_FSL_ERRATUM_A008585 is not set
++# CONFIG_HISILICON_ERRATUM_161010101 is not set
++# CONFIG_ARM64_ERRATUM_858921 is not set
++CONFIG_APPLE_DART=y
++CONFIG_APPLE_DOCKCHANNEL=y
++CONFIG_APPLE_MCC=m
++CONFIG_APPLE_RTKIT_HELPER=y
++CONFIG_APPLE_SART=y
++CONFIG_APPLE_PMP=m
++CONFIG_APPLE_CLPC=m
++CONFIG_IIO=y
++CONFIG_IIO_AOP_SENSOR_LAS=m
++CONFIG_IIO_AOP_SENSOR_ALS=m
++CONFIG_PWM=y
++CONFIG_PWM_APPLE=m
++CONFIG_PHY_APPLE_T6040_USB2=m
++CONFIG_APPLE_M1_CPU_PMU=y
++CONFIG_NVMEM_APPLE_SPMI=y
++CONFIG_EXT4_FS=y
++CONFIG_EXT4_FS_POSIX_ACL=y
++CONFIG_EXT4_FS_SECURITY=y
++# CONFIG_DNOTIFY is not set
++CONFIG_FANOTIFY=y
++CONFIG_AUTOFS_FS=y
++CONFIG_FUSE_FS=m
++CONFIG_OVERLAY_FS=m
++CONFIG_VFAT_FS=m
++CONFIG_EXFAT_FS=m
++CONFIG_NTFS3_FS=m
++# CONFIG_PROC_PAGE_MONITOR is not set
++CONFIG_TMPFS=y
++CONFIG_TMPFS_POSIX_ACL=y
++# CONFIG_MISC_FILESYSTEMS is not set
++CONFIG_NLS_CODEPAGE_437=m
++CONFIG_NLS_ISO8859_1=m
++CONFIG_NLS_UTF8=m
++CONFIG_KEY_DH_OPERATIONS=y
++CONFIG_SECURITY=y
++CONFIG_SECURITYFS=y
++CONFIG_SECURITY_LANDLOCK=y
++CONFIG_LSM="landlock"
++CONFIG_CRYPTO_USER=m
++CONFIG_CRYPTO_AES=m
++CONFIG_CRYPTO_CBC=m
++CONFIG_CRYPTO_CMAC=m
++CONFIG_CRYPTO_MD5=m
++CONFIG_CRYPTO_SHA1=m
++CONFIG_CRYPTO_SHA512=m
++CONFIG_CRYPTO_USER_API_HASH=m
++CONFIG_CRYPTO_USER_API_SKCIPHER=m
++CONFIG_CRYPTO_USER_API_RNG=m
++CONFIG_CRYPTO_USER_API_AEAD=m
++CONFIG_PKCS8_PRIVATE_KEY_PARSER=m
++# CONFIG_CRC_OPTIMIZATIONS is not set
++CONFIG_PRINTK_TIME=y
++# CONFIG_SYMBOLIC_ERRNAME is not set
++# CONFIG_DEBUG_BUGVERBOSE is not set
++# CONFIG_DEBUG_MISC is not set
++# CONFIG_SECTION_MISMATCH_WARN_ONLY is not set
++CONFIG_MAGIC_SYSRQ=y
++# CONFIG_MAGIC_SYSRQ_SERIAL is not set
++# CONFIG_SLUB_DEBUG is not set
++# CONFIG_RCU_TRACE is not set
++CONFIG_FUNCTION_TRACER=y
++# CONFIG_RUNTIME_TESTING_MENU is not set
+diff --git a/drivers/iommu/apple-dart.c b/drivers/iommu/apple-dart.c
+index ab61aa391c55..1f2137d13740 100644
+--- a/drivers/iommu/apple-dart.c
++++ b/drivers/iommu/apple-dart.c
+@@ -321,6 +321,11 @@ struct apple_dart {
+ 	DECLARE_BITMAP(remapped, DART_MAX_STREAMS);
+ 	u8 remap_target[DART_MAX_STREAMS];
+ 
++	/* address filter window and its "apple,dapf-entries" tuples */
++	void __iomem *dapf;
++	u64 *dapf_entries;
++	unsigned int dapf_count;
++
+ 	dma_addr_t dma_min;
+ 	dma_addr_t dma_max;
+ 	dma_addr_t dma_offset;
+@@ -1609,6 +1614,73 @@ static int apple_dart_read_remaps(struct apple_dart *dart)
+ 	return 0;
+ }
+ 
++/*
++ * The DART's address filter (DAPF), the block of the second reg: one 0x40-byte
++ * entry per "apple,dapf-entries" tuple <start end r0 r4 r20> (64-bit cells, as
++ * the ADT's filter data). The T6040 AOP firmware stops on a fault storm without it.
++ */
++#define DART_DAPF_ENTRY_SIZE	0x40
++
++static int apple_dart_write_dapf(struct apple_dart *dart)
++{
++	unsigned int i, bad = 0;
++
++	for (i = 0; i < dart->dapf_count; i++) {
++		void __iomem *r = dart->dapf + i * DART_DAPF_ENTRY_SIZE;
++		const u64 *e = &dart->dapf_entries[i * 5];
++
++		writel(e[3], r + 0x04);
++		writeq(e[0], r + 0x08);
++		writeq(e[1], r + 0x10);
++		writel(e[2], r + 0x00);
++		writel(e[4], r + 0x20);
++		/* the end address keeps only word granularity: its low two bits read back set */
++		if (readl(r + 0x04) != e[3] || readq(r + 0x08) != e[0] ||
++		    (readq(r + 0x10) | 3) != (e[1] | 3) ||
++		    (readl(r + 0x00) & 0xff) != e[2] || readl(r + 0x20) != e[4])
++			bad++;
++	}
++	if (bad) {
++		dev_err(dart->dev, "DAPF: %u of %u entries did not read back\n", bad,
++			dart->dapf_count);
++		return -EIO;
++	}
++	return 0;
++}
++
++/* Keep the entries: a DART that loses power loses them, see apple_dart_resume(). */
++static int apple_dart_init_dapf(struct platform_device *pdev, struct apple_dart *dart)
++{
++	struct device_node *np = pdev->dev.of_node;
++	const char *prop = "apple,dapf-entries";
++	struct resource *res;
++	int count, ret;
++
++	count = of_property_count_u64_elems(np, prop);
++	if (count <= 0)
++		return 0;
++	if (count % 5)
++		return -EINVAL;
++	dart->dapf = devm_platform_get_and_ioremap_resource(pdev, 1, &res);
++	if (IS_ERR(dart->dapf))
++		return PTR_ERR(dart->dapf);
++	if (count / 5 * DART_DAPF_ENTRY_SIZE > resource_size(res))
++		return -ERANGE;
++
++	dart->dapf_entries = devm_kmalloc_array(&pdev->dev, count, sizeof(u64), GFP_KERNEL);
++	if (!dart->dapf_entries)
++		return -ENOMEM;
++	ret = of_property_read_u64_array(np, prop, dart->dapf_entries, count);
++	if (ret)
++		return ret;
++	dart->dapf_count = count / 5;
++
++	ret = apple_dart_write_dapf(dart);
++	if (!ret)
++		dev_info(&pdev->dev, "DAPF: %u entries programmed\n", dart->dapf_count);
++	return ret;
++}
++
+ static void apple_dart_hw_apply_remaps(struct apple_dart *dart)
+ {
+ 	int sid;
+@@ -4150,6 +4222,10 @@ static int apple_dart_probe(struct platform_device *pdev)
+ 	if (ret)
+ 		goto err_clk_disable;
+ 
++	ret = apple_dart_init_dapf(pdev, dart);
++	if (ret)
++		goto err_clk_disable;
++
+ 	/* A hot-plug PCIe-C DART has no retained/locked translation context. */
+ 	if (tunneled)
+ 		dart->locked = false;
+@@ -4678,7 +4754,7 @@ static __maybe_unused int apple_dart_resume(struct device *dev)
+ {
+ 	struct apple_dart *dart = dev_get_drvdata(dev);
+ 	unsigned int sid, idx;
+-	int ret;
++	int ret, dapf_ret;
+ 
+ 	if (dart->managed_sids || dart->preserve_display || apple_dart_has_borrowed(dart))
+ 		return -EBUSY;
+@@ -4712,6 +4788,9 @@ static __maybe_unused int apple_dart_resume(struct device *dev)
+ 		return ret;
+ 	}
+ 
++	/* The address filter lost its entries with the translations. */
++	dapf_ret = apple_dart_write_dapf(dart);
++
+ 	ret = apple_dart_hw_reset(dart);
+ 
+ 	/*
+@@ -4740,6 +4819,9 @@ static __maybe_unused int apple_dart_resume(struct device *dev)
+ 
+ 	/* Should they fail again, the next resume repeats them. */
+ 	dart->reset_incomplete = ret;
++	/* Not a runtime PM error: that would fail every later resume of the DART. */
++	if (dapf_ret)
++		dev_err(dev, "address filter not restored on resume: %d\n", dapf_ret);
+ 	return ret;
+ }
+ 
+diff --git a/drivers/leds/leds-pwm.c b/drivers/leds/leds-pwm.c
+index efe5a97a1f4d..55fc51de2744 100644
+--- a/drivers/leds/leds-pwm.c
++++ b/drivers/leds/leds-pwm.c
+@@ -14,6 +14,7 @@
+ #include <linux/kernel.h>
+ #include <linux/leds.h>
+ #include <linux/module.h>
++#include <linux/mutex.h>
+ #include <linux/of.h>
+ #include <linux/platform_device.h>
+ #include <linux/pwm.h>
+@@ -32,6 +33,10 @@ struct led_pwm_data {
+ 	struct pwm_device	*pwm;
+ 	struct pwm_state	pwmstate;
+ 	unsigned int		active_low;
++	struct mutex		completion_lock;
++	u64			completed_sequence;
++	unsigned int		completed_brightness;
++	int			completed_error;
+ };
+ 
+ struct led_pwm_priv {
+@@ -45,7 +50,11 @@ static int led_pwm_set(struct led_classdev *led_cdev,
+ 	struct led_pwm_data *led_dat =
+ 		container_of(led_cdev, struct led_pwm_data, cdev);
+ 	unsigned int max = led_dat->cdev.max_brightness;
+-	unsigned long long duty = led_dat->pwmstate.period;
++	unsigned long long duty;
++	int ret;
++
++	mutex_lock(&led_dat->completion_lock);
++	duty = led_dat->pwmstate.period;
+ 
+ 	duty *= brightness;
+ 	do_div(duty, max);
+@@ -63,9 +72,80 @@ static int led_pwm_set(struct led_classdev *led_cdev,
+ 	 * LED might stay (or even go) on.
+ 	 */
+ 	led_dat->pwmstate.enabled = !(led_cdev->flags & LED_SUSPENDED);
+-	return pwm_apply_might_sleep(led_dat->pwm, &led_dat->pwmstate);
++	ret = pwm_apply_might_sleep(led_dat->pwm, &led_dat->pwmstate);
++	led_dat->completed_brightness = brightness;
++	led_dat->completed_error = ret;
++	led_dat->completed_sequence++;
++	mutex_unlock(&led_dat->completion_lock);
++	return ret;
+ }
+ 
++/*
++ * Read-only qualification boundary for the private keyboard LED consumer.
++ * LED metadata is cached before its work runs. Hold the same sysfs lock as
++ * brightness_store, drain that work without applying any new state, then read
++ * the provider through its existing guarded hardware callback. The separate
++ * completion lock also excludes a callback while collecting its result.
++ */
++static ssize_t m4_pwm_state_show(struct device *dev,
++			       struct device_attribute *attr, char *buf)
++{
++	struct led_classdev *led_cdev = dev_get_drvdata(dev);
++	struct led_pwm_data *led_dat =
++		container_of(led_cdev, struct led_pwm_data, cdev);
++	struct pwm_state state = { 0 };
++	ssize_t result;
++	int ret;
++
++	mutex_lock(&led_cdev->led_access);
++	if (led_cdev->blink_delay_on || led_cdev->blink_delay_off ||
++	    led_cdev->flags & (LED_SUSPENDED | LED_UNREGISTERING)) {
++		result = -EBUSY;
++		goto unlock;
++	}
++#ifdef CONFIG_LEDS_TRIGGERS
++	if (led_cdev->trigger) {
++		result = -EBUSY;
++		goto unlock;
++	}
++#endif
++	flush_work(&led_cdev->set_brightness_work);
++	mutex_lock(&led_dat->completion_lock);
++	ret = pwm_get_state_hw(led_dat->pwm, &state);
++	/* A producer outside sysfs must not race this settled witness. */
++	if (work_busy(&led_cdev->set_brightness_work) ||
++	    READ_ONCE(led_cdev->work_flags) ||
++	    led_cdev->blink_delay_on || led_cdev->blink_delay_off ||
++	    led_cdev->flags & (LED_SUSPENDED | LED_UNREGISTERING)) {
++		result = -EBUSY;
++		goto unlock_completion;
++	}
++#ifdef CONFIG_LEDS_TRIGGERS
++	if (led_cdev->trigger) {
++		result = -EBUSY;
++		goto unlock_completion;
++	}
++#endif
++	result = sysfs_emit(buf, "1 %llu %u %d %d %llu %llu %u %u\n",
++			    led_dat->completed_sequence,
++			    led_dat->completed_brightness,
++			    led_dat->completed_error, ret,
++			    state.period, state.duty_cycle,
++			    state.enabled, state.polarity);
++unlock_completion:
++	mutex_unlock(&led_dat->completion_lock);
++unlock:
++	mutex_unlock(&led_cdev->led_access);
++	return result;
++}
++static DEVICE_ATTR_RO(m4_pwm_state);
++
++static struct attribute *m4_pwm_attrs[] = {
++	&dev_attr_m4_pwm_state.attr,
++	NULL,
++};
++ATTRIBUTE_GROUPS(m4_pwm);
++
+ static int led_pwm_default_brightness_get(struct fwnode_handle *fwnode,
+ 					  int max_brightness)
+ {
+@@ -88,11 +168,13 @@ static int led_pwm_add(struct device *dev, struct led_pwm_priv *priv,
+ 	struct led_init_data init_data = { .fwnode = fwnode };
+ 	int ret;
+ 
++	mutex_init(&led_data->completion_lock);
+ 	led_data->active_low = led->active_low;
+ 	led_data->cdev.name = led->name;
+ 	led_data->cdev.brightness = LED_OFF;
+ 	led_data->cdev.max_brightness = led->max_brightness;
+ 	led_data->cdev.flags = LED_CORE_SUSPENDRESUME;
++	led_data->cdev.groups = m4_pwm_groups;
+ 
+ 	led_data->pwm = devm_fwnode_pwm_get(dev, fwnode, NULL);
+ 	if (IS_ERR(led_data->pwm))
+diff --git a/drivers/nvme/host/apple-m4-partition.h b/drivers/nvme/host/apple-m4-partition.h
+new file mode 100644
+index 000000000000..b8d0eb000c3e
+--- /dev/null
++++ b/drivers/nvme/host/apple-m4-partition.h
+@@ -0,0 +1,43 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/* Extends the read-only policy for the Linux partitions.
++ *
++ * The write ranges come from the boot loader, which checked each one against
++ * a GPT entry (exact first/last LBA and PARTUUID) before it booted Linux, and
++ * publishes them as /chosen/m4,write-lba-range. Such a range only has to stay
++ * clear of the GPT itself (LBA 0..7 in 4 KiB units).
++ *
++ * Loaders before rev 15 publish nothing; the node's lab,write-lba-range is used
++ * then, and only inside the two intervals of the author's own disk layout
++ * (a 110 GB store minus its first 50 GB, and one GPT slot). They fit no other
++ * machine: regenerate them from your GPT or let the loader publish ranges.
++ */
++#define APPLE_M4_WRITE_RANGES_MAX 4
++#define APPLE_M4_GPT_END 8ULL
++
++static inline bool apple_m4_partition_range_valid(u64 first, u64 end, bool from_loader)
++{
++	if (first >= end)
++		return false;
++	if (from_loader)
++		return first >= APPLE_M4_GPT_END;
++	return (first >= 228317114ULL && end <= 242965551ULL) ||
++	       (first >= 201461644ULL && end <= 216077314ULL);
++}
++
++static inline bool apple_m4_partition_allowed(bool admin, unsigned int opcode,
++		unsigned int feature, u32 nsid, unsigned int lba_shift,
++		u64 slba, unsigned int nlb, u64 first, u64 end)
++{
++	if (apple_m4_readonly_allowed(admin, opcode, feature))
++		return true;
++	/* [first, end) was checked once, at probe */
++	if (admin || nsid != 1 || lba_shift != 12)
++		return false;
++	/* Only flush data written under this same policy. No discard/format. */
++	if (opcode == nvme_cmd_flush)
++		return true;
++	/* NVMe encodes the block count minus one in an unsigned 16-bit field. */
++	return opcode == nvme_cmd_write && nlb <= 65535 &&
++	       slba >= first && slba < end && (u64)nlb + 1 <= end - slba;
++}
+diff --git a/drivers/nvme/host/apple-m4-readonly.h b/drivers/nvme/host/apple-m4-readonly.h
+new file mode 100644
+index 000000000000..794d53dc9b3b
+--- /dev/null
++++ b/drivers/nvme/host/apple-m4-readonly.h
+@@ -0,0 +1,27 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/* Qualification-only command policy. No runtime switch to enable writes. */
++static inline bool apple_m4_readonly_allowed(bool admin, unsigned int opcode, unsigned int feature)
++{
++	if (!admin)
++		return opcode == nvme_cmd_read;
++	/* Only volatile, standard host/runtime setup; the Save bit is refused. */
++	if (opcode == nvme_admin_set_features)
++		return feature == NVME_FEAT_ASYNC_EVENT ||
++		       feature == NVME_FEAT_AUTO_PST ||
++		       feature == NVME_FEAT_TIMESTAMP ||
++		       feature == NVME_FEAT_HOST_BEHAVIOR;
++	switch (opcode) {
++	case nvme_admin_delete_sq:
++	case nvme_admin_create_sq:
++	case nvme_admin_get_log_page:
++	case nvme_admin_delete_cq:
++	case nvme_admin_create_cq:
++	case nvme_admin_identify:
++	case nvme_admin_abort_cmd:
++	case nvme_admin_get_features:
++	case nvme_admin_async_event:
++		return true;
++	default:
++		return false;
++	}
++}
+diff --git a/drivers/nvme/host/apple.c b/drivers/nvme/host/apple.c
+index 1722096ec217..85c74d43873a 100644
+--- a/drivers/nvme/host/apple.c
++++ b/drivers/nvme/host/apple.c
+@@ -41,6 +41,8 @@
+ #include <linux/time64.h>
+ 
+ #include "nvme.h"
++#include "apple-m4-readonly.h"
++#include "apple-m4-partition.h"
+ 
+ #define APPLE_ANS_BOOT_TIMEOUT	  USEC_PER_SEC
+ 
+@@ -197,6 +199,8 @@ struct apple_nvme_hw {
+ 	bool has_lsq_nvmmu;
+ 	bool has_queue_count;
+ 	bool has_separate_nvmmu;
++	/* J616s guard: no namespace mutation commands outside one partition. */
++	bool partition_write_probe;
+ 	/*
+ 	 * T6040: the linear submission queue doorbells are in the NVMMU block
+ 	 * (the "nvme" block ends at 0x10000), and LINEAR_SQ_CTRL is left as the
+@@ -243,6 +247,9 @@ struct apple_nvme {
+ 	struct reset_control *reset;
+ 	bool owns_rtkit;
+ 	bool inherited_rtkit;
++	/* first inclusive, end exclusive pairs; immutable */
++	u64 write_lba_range[2 * APPLE_M4_WRITE_RANGES_MAX];
++	unsigned int write_lba_ranges;
+ 
+ 	struct dma_pool *prp_page_pool;
+ 	struct dma_pool *prp_small_pool;
+@@ -348,6 +355,16 @@ static bool apple_nvme_can_adopt_rtkit(struct apple_nvme *anv)
+ 	if (csts & NVME_CSTS_CFS)
+ 		return false;
+ 
++	/*
++	 * The J616s loader reads the SSD, disables the controller and leaves
++	 * its RTKit session running for this driver, and says so in
++	 * /chosen/m4,ans-live (m4 Boot ABI). That session is live although
++	 * the controller is no longer enabled.
++	 */
++	if (anv->hw->partition_write_probe && of_chosen &&
++	    of_property_present(of_chosen, "m4,ans-live"))
++		return true;
++
+ 	/*
+ 	 * CPU_RUN and BOOT_STATUS alone survive inactive sessions. A disabled
+ 	 * controller requires the producer's explicit live-session contract.
+@@ -1090,6 +1107,26 @@ static bool apple_nvme_delayed_flush(struct apple_nvme *anv, struct nvme_ns *ns,
+ 	return false;
+ }
+ 
++static bool apple_nvme_partition_allowed(struct apple_nvme *anv,
++					 struct apple_nvme_queue *q,
++					 struct nvme_ns *ns,
++					 struct nvme_command *cmnd)
++{
++	unsigned int i;
++
++	for (i = 0; i < anv->write_lba_ranges; i++)
++		if (apple_m4_partition_allowed(q->is_adminq, cmnd->common.opcode,
++				le32_to_cpu(cmnd->common.cdw10),
++				le32_to_cpu(cmnd->common.nsid),
++				ns && ns->head ? ns->head->lba_shift : 0,
++				le64_to_cpu(cmnd->rw.slba),
++				le16_to_cpu(cmnd->rw.length),
++				anv->write_lba_range[2 * i],
++				anv->write_lba_range[2 * i + 1]))
++			return true;
++	return false;
++}
++
+ static blk_status_t apple_nvme_queue_rq(struct blk_mq_hw_ctx *hctx,
+ 					const struct blk_mq_queue_data *bd)
+ {
+@@ -1132,6 +1169,15 @@ static blk_status_t apple_nvme_queue_rq(struct blk_mq_hw_ctx *hctx,
+ 		}
+ 	}
+ 
++	if (anv->hw->partition_write_probe &&
++	    !apple_nvme_partition_allowed(anv, q, ns, cmnd)) {
++		dev_warn_ratelimited(anv->dev,
++			"partition guard rejected %s opcode 0x%x\n",
++			q->is_adminq ? "admin" : "I/O", cmnd->common.opcode);
++		ret = BLK_STS_IOERR;
++		goto out_free_cmd;
++	}
++
+ 	if (blk_rq_nr_phys_segments(req)) {
+ 		ret = apple_nvme_map_data(anv, req, cmnd);
+ 		if (ret)
+@@ -2278,6 +2324,38 @@ static struct apple_nvme *apple_nvme_alloc(struct platform_device *pdev)
+ 		ret = -ENODEV;
+ 		goto out_detach_genpd;
+ 	}
++	if (anv->hw->partition_write_probe) {
++		/* The loader's GPT-checked ranges win over the board DT's fallback */
++		struct device_node *chosen = of_find_node_by_path("/chosen");
++		bool from_loader = of_property_present(chosen, "m4,write-lba-range");
++		struct device_node *np = from_loader ? chosen : dev->of_node;
++		const char *prop = from_loader ? "m4,write-lba-range" : "lab,write-lba-range";
++		unsigned int i;
++
++		ret = of_property_count_u64_elems(np, prop);
++		if (ret > 0 && ret % 2 == 0 && ret <= ARRAY_SIZE(anv->write_lba_range)) {
++			anv->write_lba_ranges = ret / 2;
++			ret = of_property_read_u64_array(np, prop, anv->write_lba_range,
++							 2 * anv->write_lba_ranges);
++		} else {
++			ret = -EINVAL;
++		}
++		of_node_put(chosen);
++		for (i = 0; !ret && i < anv->write_lba_ranges; i++)
++			if (!apple_m4_partition_range_valid(anv->write_lba_range[2 * i],
++							    anv->write_lba_range[2 * i + 1],
++							    from_loader))
++				ret = -EINVAL;
++		if (ret) {
++			dev_err(dev, "Missing/invalid partition write bounds\n");
++			ret = -EINVAL;
++			goto out_detach_genpd;
++		}
++		for (i = 0; i < anv->write_lba_ranges; i++)
++			dev_info(dev, "Writes restricted to namespace 1, 4096-byte LBAs [%llu,%llu) (%s)\n",
++				 anv->write_lba_range[2 * i], anv->write_lba_range[2 * i + 1],
++				 from_loader ? "loader" : "board DT");
++	}
+ 
+ 	ret = apple_nvme_attach_genpd(anv);
+ 	if (ret < 0) {
+@@ -2695,7 +2773,22 @@ static const struct apple_nvme_hw apple_nvme_t6040_hw = {
+ 	.quirks = NVME_QUIRK_NO_APST,
+ };
+ 
++/*
++ * J616s (T6040, 26.x firmware): the post-M4 controller of T8132 behind a
++ * command guard. Bound only by our own device tree.
++ */
++static const struct apple_nvme_hw apple_nvme_j616_partition_hw = {
++	.has_lsq_nvmmu = true,
++	.has_separate_nvmmu = true,
++	.needs_ioq_registers = true,
++	.partition_write_probe = true,
++	.lsq_in_nvmmu = true,
++	.max_queue_depth = 64,
++	.quirks = NVME_QUIRK_NO_APST,
++};
++
+ static const struct of_device_id apple_nvme_of_match[] = {
++	{ .compatible = "lab,j616-nvme-partition-25g83", .data = &apple_nvme_j616_partition_hw },
+ 	{ .compatible = "apple,t6041-nvme-ans2", .data = &apple_nvme_t6040_hw },
+ 	{ .compatible = "apple,t8015-nvme-ans2", .data = &apple_nvme_t8015_hw },
+ 	{ .compatible = "apple,t8103-nvme-ans2", .data = &apple_nvme_t8103_hw },
+diff --git a/drivers/perf/apple_m1_cpu_pmu.c b/drivers/perf/apple_m1_cpu_pmu.c
+index 81b6f1a62349..b8fa6047385f 100644
+--- a/drivers/perf/apple_m1_cpu_pmu.c
++++ b/drivers/perf/apple_m1_cpu_pmu.c
+@@ -22,6 +22,7 @@
+ #define M1_PMU_NR_COUNTERS		10
+ 
+ #define M1_PMU_CFG_EVENT		GENMASK(7, 0)
++#define M4_PMU_CFG_EVENT		GENMASK(15, 0)	/* brava: 16-bit PMESR fields and event space */
+ 
+ #define ANY_BUT_0_1			GENMASK(9, 2)
+ #define ONLY_2_TO_7			GENMASK(7, 2)
+@@ -119,10 +120,144 @@ enum m1_pmu_events {
+ 	 * From this point onwards, these are not actual HW events,
+ 	 * but attributes that get stored in hw->config_base.
+ 	 */
+-	M1_PMU_CFG_COUNT_USER					= BIT(8),
+-	M1_PMU_CFG_COUNT_KERNEL					= BIT(9),
+-	M1_PMU_CFG_COUNT_HOST					= BIT(10),
+-	M1_PMU_CFG_COUNT_GUEST					= BIT(11),
++	M1_PMU_CFG_COUNT_USER					= BIT(16),
++	M1_PMU_CFG_COUNT_KERNEL					= BIT(17),
++	M1_PMU_CFG_COUNT_HOST					= BIT(18),
++	M1_PMU_CFG_COUNT_GUEST					= BIT(19),
++};
++
++/*
++ * M4 (brava, XNU H16) CPMU event space. It is NOT the M1-M3 numbering:
++ * the M4 (and M5) PMU uses 16-bit event selectors, and the ARMv8 PMUv3 common events are present
++ * under their PMUv3 event IDs (CPU_CYCLES 0x11, INST_RETIRED 0x08,
++ * BR_RETIRED 0x21, BR_MIS_PRED_RETIRED 0x22, L1D_CACHE 0x04, STALL_*
++ * 0x23/0x24/0x3c-0x3f, L1I_CACHE_LMISS 0x4006, ...). The Apple-specific
++ * events sit at 0x1xx-0x8xx. Programming the M1 numbers (0x02, 0x8c)
++ * into a brava PMESR field counts nothing: verified on a T6040 with a
++ * register probe on 2026-10-25 (PMC2 with 0x11 counts cycles, 0x08
++ * instructions, 0x21 branches; 0x02/0x8c stay at 0).
++ *
++ * Counter masks: most Apple events may use PMC2-9
++ * (no mask given), the retired-instruction family PMC2-7 (0xfc), and a
++ * few only PMC7 (0x80). Fixed PMC0 counts cycles, PMC1 instructions.
++ */
++enum m4_pmu_events {
++	M4_PMU_PERFCTR_L1D_CACHE_REFILL				= 0x003,
++	M4_PMU_PERFCTR_L1D_CACHE				= 0x004,
++	M4_PMU_PERFCTR_INST_ALL					= 0x008,
++	M4_PMU_PERFCTR_BR_MIS_PRED				= 0x010,
++	M4_PMU_PERFCTR_CORE_ACTIVE_CYCLE			= 0x011,
++	M4_PMU_PERFCTR_BR_PRED					= 0x012,
++	M4_PMU_PERFCTR_INST_BRANCH				= 0x021,
++	M4_PMU_PERFCTR_BRANCH_MISPRED_NONSPEC			= 0x022,
++	M4_PMU_PERFCTR_STALL_FRONTEND				= 0x023,
++	M4_PMU_PERFCTR_STALL_BACKEND				= 0x024,
++	M4_PMU_PERFCTR_L1D_CACHE_LMISS_RD			= 0x039,
++	M4_PMU_PERFCTR_RETIRE_UOP				= 0x03a,
++	M4_PMU_PERFCTR_MAP_UOP					= 0x03b,
++	M4_PMU_PERFCTR_STALL					= 0x03c,
++	M4_PMU_PERFCTR_STALL_SLOT_BACKEND			= 0x03d,
++	M4_PMU_PERFCTR_STALL_SLOT_FRONTEND			= 0x03e,
++	M4_PMU_PERFCTR_STALL_SLOT				= 0x03f,
++	M4_PMU_PERFCTR_L1D_CACHE_RD				= 0x040,
++	M4_PMU_PERFCTR_L1I_TLB_MISS_DEMAND			= 0x1d4,
++	M4_PMU_PERFCTR_MAP_DISPATCH_BUBBLE			= 0x1d6,
++	M4_PMU_PERFCTR_FETCH_RESTART				= 0x1de,
++	M4_PMU_PERFCTR_INTERRUPT_PENDING			= 0x26c,
++	M4_PMU_PERFCTR_MAP_STALL_DISPATCH			= 0x270,
++	M4_PMU_PERFCTR_MAP_REWIND				= 0x275,
++	M4_PMU_PERFCTR_MAP_STALL				= 0x276,
++	M4_PMU_PERFCTR_MAP_INT_UOP				= 0x27c,
++	M4_PMU_PERFCTR_MAP_LDST_UOP				= 0x27d,
++	M4_PMU_PERFCTR_MAP_SIMD_UOP				= 0x27e,
++	M4_PMU_PERFCTR_SCHEDULE_UOP				= 0x283,
++	M4_PMU_PERFCTR_L1I_TLB_FILL				= 0x404,
++	M4_PMU_PERFCTR_L1D_TLB_FILL				= 0x405,
++	M4_PMU_PERFCTR_MMU_TABLE_WALK_INSTRUCTION		= 0x407,
++	M4_PMU_PERFCTR_MMU_TABLE_WALK_DATA			= 0x408,
++	M4_PMU_PERFCTR_L2_TLB_MISS_INSTRUCTION			= 0x40a,
++	M4_PMU_PERFCTR_L2_TLB_MISS_DATA				= 0x40b,
++	M4_PMU_PERFCTR_L1D_TLB_ACCESS				= 0x5a0,
++	M4_PMU_PERFCTR_L1D_TLB_MISS				= 0x5a1,
++	M4_PMU_PERFCTR_L1D_CACHE_MISS_ST			= 0x5a2,
++	M4_PMU_PERFCTR_L1D_CACHE_MISS_LD			= 0x5a3,
++	M4_PMU_PERFCTR_LD_UNIT_UOP				= 0x5a6,
++	M4_PMU_PERFCTR_ST_UNIT_UOP				= 0x5a7,
++	M4_PMU_PERFCTR_L1D_CACHE_WRITEBACK			= 0x5a8,
++	M4_PMU_PERFCTR_FLUSH_RESTART_OTHER_NONSPEC		= 0x884,
++	M4_PMU_PERFCTR_INST_BRANCH_CALL				= 0x88e,
++	M4_PMU_PERFCTR_INST_BRANCH_RET				= 0x88f,
++	M4_PMU_PERFCTR_INST_BRANCH_TAKEN			= 0x890,
++	M4_PMU_PERFCTR_INST_BRANCH_INDIR			= 0x893,
++	M4_PMU_PERFCTR_INST_BRANCH_COND				= 0x894,
++	M4_PMU_PERFCTR_INST_INT_LD				= 0x895,
++	M4_PMU_PERFCTR_INST_INT_ST				= 0x896,
++	M4_PMU_PERFCTR_INST_INT_ALU				= 0x897,
++	M4_PMU_PERFCTR_INST_SIMD_LD				= 0x898,
++	M4_PMU_PERFCTR_INST_SIMD_ST				= 0x899,
++	M4_PMU_PERFCTR_INST_SIMD_ALU				= 0x89a,
++	M4_PMU_PERFCTR_INST_LDST				= 0x89b,
++	M4_PMU_PERFCTR_INST_BARRIER				= 0x89c,
++	M4_PMU_PERFCTR_INST_SIMD_ALU_VEC			= 0x89f,
++	M4_PMU_PERFCTR_L1D_CACHE_MISS_LD_NONSPEC		= 0x8bf,
++	M4_PMU_PERFCTR_L1D_CACHE_MISS_ST_NONSPEC		= 0x8c0,
++	M4_PMU_PERFCTR_L1D_TLB_MISS_NONSPEC			= 0x8c1,
++	M4_PMU_PERFCTR_ST_MEMORY_ORDER_VIOLATION_NONSPEC	= 0x8c4,
++	M4_PMU_PERFCTR_BRANCH_COND_MISPRED_NONSPEC		= 0x8c5,
++	M4_PMU_PERFCTR_BRANCH_INDIR_MISPRED_NONSPEC		= 0x8c6,
++	M4_PMU_PERFCTR_BRANCH_RET_INDIR_MISPRED_NONSPEC		= 0x8c8,
++	M4_PMU_PERFCTR_BRANCH_CALL_INDIR_MISPRED_NONSPEC	= 0x8ca,
++	M4_PMU_PERFCTR_L1I_CACHE_MISS_DEMAND			= 0x4006,
++};
++
++static u16 m4_pmu_event_affinity(u16 event)
++{
++	switch (event) {
++	case M4_PMU_PERFCTR_CORE_ACTIVE_CYCLE:
++		return ANY_BUT_0_1 | BIT(0);
++	case M4_PMU_PERFCTR_INST_ALL:
++		return ONLY_2_TO_7 | BIT(1);
++	case M4_PMU_PERFCTR_INST_BRANCH:
++	case M4_PMU_PERFCTR_BRANCH_MISPRED_NONSPEC:
++	case M4_PMU_PERFCTR_RETIRE_UOP:
++	case M4_PMU_PERFCTR_INST_BRANCH_CALL:
++	case M4_PMU_PERFCTR_INST_BRANCH_RET:
++	case M4_PMU_PERFCTR_INST_BRANCH_TAKEN:
++	case M4_PMU_PERFCTR_INST_BRANCH_INDIR:
++	case M4_PMU_PERFCTR_INST_BRANCH_COND:
++	case M4_PMU_PERFCTR_INST_INT_LD:
++	case M4_PMU_PERFCTR_INST_SIMD_LD:
++	case M4_PMU_PERFCTR_INST_SIMD_ST:
++	case M4_PMU_PERFCTR_INST_BARRIER:
++	case M4_PMU_PERFCTR_L1D_CACHE_MISS_LD_NONSPEC:
++	case M4_PMU_PERFCTR_L1D_CACHE_MISS_ST_NONSPEC:
++	case M4_PMU_PERFCTR_L1D_TLB_MISS_NONSPEC:
++	case M4_PMU_PERFCTR_ST_MEMORY_ORDER_VIOLATION_NONSPEC:
++	case M4_PMU_PERFCTR_BRANCH_COND_MISPRED_NONSPEC:
++	case M4_PMU_PERFCTR_BRANCH_INDIR_MISPRED_NONSPEC:
++	case M4_PMU_PERFCTR_BRANCH_RET_INDIR_MISPRED_NONSPEC:
++	case M4_PMU_PERFCTR_BRANCH_CALL_INDIR_MISPRED_NONSPEC:
++		return ONLY_2_TO_7;
++	case M4_PMU_PERFCTR_INST_INT_ST:
++	case M4_PMU_PERFCTR_INST_INT_ALU:
++	case M4_PMU_PERFCTR_INST_SIMD_ALU:
++	case M4_PMU_PERFCTR_INST_LDST:
++	case M4_PMU_PERFCTR_INST_SIMD_ALU_VEC:
++		return BIT(7);
++	default:
++		return ANY_BUT_0_1;
++	}
++}
++
++static const unsigned m4_pmu_perf_map[PERF_COUNT_HW_MAX] = {
++	PERF_MAP_ALL_UNSUPPORTED,
++	[PERF_COUNT_HW_CPU_CYCLES]		= M4_PMU_PERFCTR_CORE_ACTIVE_CYCLE,
++	[PERF_COUNT_HW_INSTRUCTIONS]		= M4_PMU_PERFCTR_INST_ALL,
++	[PERF_COUNT_HW_BRANCH_INSTRUCTIONS]	= M4_PMU_PERFCTR_INST_BRANCH,
++	[PERF_COUNT_HW_BRANCH_MISSES]		= M4_PMU_PERFCTR_BRANCH_MISPRED_NONSPEC,
++	[PERF_COUNT_HW_STALLED_CYCLES_FRONTEND]	= M4_PMU_PERFCTR_STALL_FRONTEND,
++	[PERF_COUNT_HW_STALLED_CYCLES_BACKEND]	= M4_PMU_PERFCTR_STALL_BACKEND,
+ };
+ 
+ /*
+@@ -212,6 +347,25 @@ static const struct attribute_group m1_pmu_events_attr_group = {
+ 	.attrs = m1_pmu_event_attrs,
+ };
+ 
++static struct attribute *m4_pmu_event_attrs[] = {
++	M1_PMU_EVENT_ATTR(cycles, M4_PMU_PERFCTR_CORE_ACTIVE_CYCLE),
++	M1_PMU_EVENT_ATTR(instructions, M4_PMU_PERFCTR_INST_ALL),
++	M1_PMU_EVENT_ATTR(branches, M4_PMU_PERFCTR_INST_BRANCH),
++	M1_PMU_EVENT_ATTR(branch_misses, M4_PMU_PERFCTR_BRANCH_MISPRED_NONSPEC),
++	M1_PMU_EVENT_ATTR(stall_frontend, M4_PMU_PERFCTR_STALL_FRONTEND),
++	M1_PMU_EVENT_ATTR(stall_backend, M4_PMU_PERFCTR_STALL_BACKEND),
++	M1_PMU_EVENT_ATTR(l1d_cache, M4_PMU_PERFCTR_L1D_CACHE),
++	M1_PMU_EVENT_ATTR(l1d_cache_refill, M4_PMU_PERFCTR_L1D_CACHE_REFILL),
++	M1_PMU_EVENT_ATTR(retire_uop, M4_PMU_PERFCTR_RETIRE_UOP),
++	M1_PMU_EVENT_ATTR(map_uop, M4_PMU_PERFCTR_MAP_UOP),
++	NULL,
++};
++
++static const struct attribute_group m4_pmu_events_attr_group = {
++	.name = "events",
++	.attrs = m4_pmu_event_attrs,
++};
++
+ PMU_FORMAT_ATTR(event, "config:0-7");
+ 
+ static struct attribute *m1_pmu_format_attrs[] = {
+@@ -224,6 +378,23 @@ static const struct attribute_group m1_pmu_format_attr_group = {
+ 	.attrs = m1_pmu_format_attrs,
+ };
+ 
++/* brava: the "event" format is 16 bits wide; same attribute name for the perf tooling */
++static ssize_t m4_pmu_format_event_show(struct device *dev, struct device_attribute *attr, char *page)
++{
++	return sprintf(page, "config:0-15\n");
++}
++
++static struct device_attribute format_attr_event_m4 = __ATTR(event, 0444, m4_pmu_format_event_show, NULL);
++static struct attribute *m4_pmu_format_attrs[] = {
++	&format_attr_event_m4.attr,
++	NULL,
++};
++
++static const struct attribute_group m4_pmu_format_attr_group = {
++	.name = "format",
++	.attrs = m4_pmu_format_attrs,
++};
++
+ /* Low level accessors. No synchronisation. */
+ #define PMU_READ_COUNTER(_idx)						\
+ 	case _idx:	return read_sysreg_s(SYS_IMP_APL_PMC## _idx ##_EL1)
+@@ -376,9 +547,18 @@ static void __m1_pmu_configure_event_filter(unsigned int index, bool user,
+ 		sysreg_clear_set_s(SYS_IMP_APL_PMCR1_EL12, clear, set);
+ }
+ 
+-static void __m1_pmu_configure_eventsel(unsigned int index, u8 event)
++/*
++ * Width of the per-counter event field in PMESR0/1: 8 bits on M1 and M2,
++ * 16 bits from M3 on (XNU's CPMU_16BIT_EVENTS, so PMESR0 spans all 64
++ * bits for counters 2-5, PMESR1 for counters 6-9). The known events all
++ * fit in 8 bits, so the perf config format does not change.
++ */
++static unsigned int m1_pmu_pmesr_width = 8;
++static unsigned long m1_pmu_cfg_event_mask = M1_PMU_CFG_EVENT;
++
++static void __m1_pmu_configure_eventsel(unsigned int index, u16 event)
+ {
+-	u64 clear = 0, set = 0;
++	u64 clear, set;
+ 	int shift;
+ 
+ 	/*
+@@ -391,15 +571,15 @@ static void __m1_pmu_configure_eventsel(unsigned int index, u8 event)
+ 	case 0 ... 1:
+ 		break;
+ 	case 2 ... 5:
+-		shift = (index - 2) * 8;
+-		clear |= (u64)0xff << shift;
+-		set |= (u64)event << shift;
++		shift = (index - 2) * m1_pmu_pmesr_width;
++		clear = GENMASK_ULL(m1_pmu_pmesr_width - 1, 0) << shift;
++		set = (u64)event << shift;
+ 		sysreg_clear_set_s(SYS_IMP_APL_PMESR0_EL1, clear, set);
+ 		break;
+ 	case 6 ... 9:
+-		shift = (index - 6) * 8;
+-		clear |= (u64)0xff << shift;
+-		set |= (u64)event << shift;
++		shift = (index - 6) * m1_pmu_pmesr_width;
++		clear = GENMASK_ULL(m1_pmu_pmesr_width - 1, 0) << shift;
++		set = (u64)event << shift;
+ 		sysreg_clear_set_s(SYS_IMP_APL_PMESR1_EL1, clear, set);
+ 		break;
+ 	}
+@@ -411,7 +591,7 @@ static void m1_pmu_configure_counter(unsigned int index, unsigned long config_ba
+ 	bool guest = config_base & M1_PMU_CFG_COUNT_GUEST;
+ 	bool host = config_base & M1_PMU_CFG_COUNT_HOST;
+ 	bool user = config_base & M1_PMU_CFG_COUNT_USER;
+-	u8 evt = config_base & M1_PMU_CFG_EVENT;
++	u16 evt = config_base & m1_pmu_cfg_event_mask;
+ 
+ 	__m1_pmu_configure_event_filter(index, user && host, kernel && host, true);
+ 	__m1_pmu_configure_event_filter(index, user && guest, kernel && guest, false);
+@@ -421,13 +601,6 @@ static void m1_pmu_configure_counter(unsigned int index, unsigned long config_ba
+ /* arm_pmu backend */
+ static void m1_pmu_enable_event(struct perf_event *event)
+ {
+-	bool user, kernel;
+-	u8 evt;
+-
+-	evt = event->hw.config_base & M1_PMU_CFG_EVENT;
+-	user = event->hw.config_base & M1_PMU_CFG_COUNT_USER;
+-	kernel = event->hw.config_base & M1_PMU_CFG_COUNT_KERNEL;
+-
+ 	m1_pmu_configure_counter(event->hw.idx, event->hw.config_base);
+ 	m1_pmu_enable_counter(event->hw.idx);
+ 	m1_pmu_enable_counter_interrupt(event->hw.idx);
+@@ -516,6 +689,21 @@ static int m1_pmu_get_event_idx(struct pmu_hw_events *cpuc,
+ 	return -EAGAIN;
+ }
+ 
++static int m4_pmu_get_event_idx(struct pmu_hw_events *cpuc,
++				struct perf_event *event)
++{
++	u16 evtype = event->hw.config_base & M4_PMU_CFG_EVENT;
++	unsigned long affinity = m4_pmu_event_affinity(evtype);
++	int idx;
++
++	for_each_set_bit(idx, &affinity, M1_PMU_NR_COUNTERS) {
++		if (!test_and_set_bit(idx, cpuc->used_mask))
++			return idx;
++	}
++
++	return -EAGAIN;
++}
++
+ static void m1_pmu_clear_event_idx(struct pmu_hw_events *cpuc,
+ 				   struct perf_event *event)
+ {
+@@ -565,6 +753,41 @@ static int m2_pmu_map_event(struct perf_event *event)
+ 	return armpmu_map_event(event, &m1_pmu_perf_map, NULL, M1_PMU_CFG_EVENT);
+ }
+ 
++static int m4_pmu_map_event(struct perf_event *event)
++{
++	event->hw.flags |= ARMPMU_EVT_63BIT;
++	return armpmu_map_event(event, &m4_pmu_perf_map, NULL, M4_PMU_CFG_EVENT);
++}
++
++/*
++ * brava carries the PMUv3 common events under their own IDs (see
++ * enum m4_pmu_events), so the common-event space maps 1:1 where the
++ * database lists the event.
++ */
++static int m4_pmu_map_pmuv3_event(unsigned int eventsel)
++{
++	switch (eventsel) {
++	case ARMV8_PMUV3_PERFCTR_L1D_CACHE_REFILL:
++	case ARMV8_PMUV3_PERFCTR_L1D_CACHE:
++	case ARMV8_PMUV3_PERFCTR_INST_RETIRED:
++	case ARMV8_PMUV3_PERFCTR_BR_MIS_PRED:
++	case ARMV8_PMUV3_PERFCTR_CPU_CYCLES:
++	case ARMV8_PMUV3_PERFCTR_BR_PRED:
++	case ARMV8_PMUV3_PERFCTR_BR_RETIRED:
++	case ARMV8_PMUV3_PERFCTR_BR_MIS_PRED_RETIRED:
++	case ARMV8_PMUV3_PERFCTR_STALL_FRONTEND:
++	case ARMV8_PMUV3_PERFCTR_STALL_BACKEND:
++	case ARMV8_PMUV3_PERFCTR_L1D_CACHE_LMISS_RD:
++	case ARMV8_PMUV3_PERFCTR_STALL:
++	case ARMV8_PMUV3_PERFCTR_STALL_SLOT_BACKEND:
++	case ARMV8_PMUV3_PERFCTR_STALL_SLOT_FRONTEND:
++	case ARMV8_PMUV3_PERFCTR_STALL_SLOT:
++		return eventsel;
++	default:
++		return -EOPNOTSUPP;
++	}
++}
++
+ static int m1_pmu_map_pmuv3_event(unsigned int eventsel)
+ {
+ 	u16 m1_event = HW_OP_UNSUPPORTED;
+@@ -580,7 +803,7 @@ static void m1_pmu_init_pmceid(struct arm_pmu *pmu)
+ 	unsigned int event;
+ 
+ 	for (event = 0; event < ARMV8_PMUV3_MAX_COMMON_EVENTS; event++) {
+-		if (m1_pmu_map_pmuv3_event(event) >= 0)
++		if (pmu->map_pmuv3_event(event) >= 0)
+ 			set_bit(event, pmu->pmceid_bitmap);
+ 	}
+ }
+@@ -654,6 +877,25 @@ static int m1_pmu_init(struct arm_pmu *cpu_pmu, u32 flags)
+ 	return 0;
+ }
+ 
++static int m4_pmu_init(struct arm_pmu *cpu_pmu)
++{
++	int ret = m1_pmu_init(cpu_pmu, ARMPMU_EVT_63BIT);
++
++	if (ret)
++		return ret;
++
++	m1_pmu_pmesr_width = 16;
++	m1_pmu_cfg_event_mask = M4_PMU_CFG_EVENT;
++	cpu_pmu->map_event	  = m4_pmu_map_event;
++	cpu_pmu->get_event_idx	  = m4_pmu_get_event_idx;
++	cpu_pmu->map_pmuv3_event  = m4_pmu_map_pmuv3_event;
++	bitmap_zero(cpu_pmu->pmceid_bitmap, ARMV8_PMUV3_MAX_COMMON_EVENTS);
++	m1_pmu_init_pmceid(cpu_pmu);
++	cpu_pmu->attr_groups[ARMPMU_ATTR_GROUP_EVENTS] = &m4_pmu_events_attr_group;
++	cpu_pmu->attr_groups[ARMPMU_ATTR_GROUP_FORMATS] = &m4_pmu_format_attr_group;
++	return 0;
++}
++
+ /* Device driver gunk */
+ static int m1_pmu_ice_init(struct arm_pmu *cpu_pmu)
+ {
+@@ -679,9 +921,28 @@ static int m2_pmu_blizzard_init(struct arm_pmu *cpu_pmu)
+ 	return m1_pmu_init(cpu_pmu, ARMPMU_EVT_63BIT);
+ }
+ 
++/*
++ * M4 Pro/Max (T6040) cores: 64bit counters, 16bit event fields and the
++ * M4 event numbering (XNU H16: CPMU_64BIT_PMCS, CPMU_16BIT_EVENTS,
++ * CORE_NCTRS 10; enum m4_pmu_events).
++ */
++static int m4_pmu_brava_e_init(struct arm_pmu *cpu_pmu)
++{
++	cpu_pmu->name = "apple_brava_e_pmu";
++	return m4_pmu_init(cpu_pmu);
++}
++
++static int m4_pmu_brava_p_init(struct arm_pmu *cpu_pmu)
++{
++	cpu_pmu->name = "apple_brava_p_pmu";
++	return m4_pmu_init(cpu_pmu);
++}
++
+ static const struct of_device_id m1_pmu_of_device_ids[] = {
+ 	{ .compatible = "apple,avalanche-pmu",	.data = m2_pmu_avalanche_init, },
+ 	{ .compatible = "apple,blizzard-pmu",	.data = m2_pmu_blizzard_init, },
++	{ .compatible = "apple,brava-e-pmu",	.data = m4_pmu_brava_e_init, },
++	{ .compatible = "apple,brava-p-pmu",	.data = m4_pmu_brava_p_init, },
+ 	{ .compatible = "apple,icestorm-pmu",	.data = m1_pmu_ice_init, },
+ 	{ .compatible = "apple,firestorm-pmu",	.data = m1_pmu_fire_init, },
+ 	{ },
+diff --git a/drivers/soc/apple/aop.rs b/drivers/soc/apple/aop.rs
+index e72f025bb345..4bcf43a7060e 100644
+--- a/drivers/soc/apple/aop.rs
++++ b/drivers/soc/apple/aop.rs
+@@ -91,10 +91,17 @@
+ const ASC_MMIO_SIZE: usize = 0x4000;
+ const BOOTARGS_OFFSET: usize = 0x22c;
+ const BOOTARGS_SIZE: usize = 0x230;
+-/// The largest firmware segment the bootloader reserves in DRAM (T6040).
+-const FW_REGION_MAX_SIZE: u64 = 0x10_0000;
+-/// The DART page size the firmware segments are mapped with.
+-const FW_REGION_PAGE: u64 = 0x4000;
++/// On the T6040 the bootloader reserves the firmware's external code segment
++/// (`__ETEXT`, from the ADT) as `/reserved-memory/aop-etext@<phys>`. No
++/// mapping of it survives the DART reset, so this driver maps it itself.
++const ETEXT_NODE_PREFIX: &CStr = c_str!("aop-etext");
++/// The firmware's log segment (`__OS_LOG`), reserved the same way as
++/// `/reserved-memory/aop-oslog@<phys>` and used by the firmware at its
++/// physical address. Without it the firmware stops within a second on a DART
++/// fault storm.
++const OSLOG_NODE_PREFIX: &CStr = c_str!("aop-oslog");
++const ETEXT_MAX_SIZE: u64 = 0x10_0000;
++const ETEXT_PAGE: u64 = 0x4000;
+ const AFK_ENDPOINT_START: u8 = 0x20;
+ const AFK_ENDPOINT_COUNT: u8 = 0xf;
+ const AFK_OPC_GET_BUF: u64 = 0x89;
+@@ -1188,6 +1195,18 @@ fn unregister(self) {
+     }
+ }
+ 
++/// The IOVA mapping of the firmware's external code, owned by this driver
++/// (T6040 only).
++struct EtextMapping {
++    domain: *mut bindings::iommu_domain,
++    iova: u64,
++    size: usize,
++}
++
++// SAFETY: The domain pointer is only passed to `iommu_unmap()`, which may be
++// called from any thread; the domain outlives the device's binding.
++unsafe impl Send for EtextMapping {}
++
+ #[pin_data]
+ struct AopData {
+     dev: ARef<device::Device>,
+@@ -1206,6 +1225,9 @@ struct AopData {
+     /// The co-processor was started; only then is there anything to shut
+     /// down and to retain.
+     cpu_started: Atomic<bool>,
++    /// The firmware mappings made by `map_reserved()`.
++    #[pin]
++    etext: Mutex<KVec<EtextMapping>>,
+     /// Shut the co-processor down on removal, and if that cannot be
+     /// confirmed, retain everything it may still DMA to.
+     quiesce_on_unbind: bool,
+@@ -1353,6 +1375,7 @@ fn new(dev: &platform::Device<Core<'_>>, cfg: &AopHwConfig) -> Result<Arc<AopDat
+                     removing: Atomic::new(false),
+                     transport_closing: Atomic::new(false),
+                     cpu_started: Atomic::new(false),
++                    etext <- new_mutex!(KVec::new()),
+                     quiesce_on_unbind: cfg.quiesce_on_unbind,
+                     required_endpoints: cfg.required_endpoints,
+                     setup_queue,
+@@ -1553,186 +1576,126 @@ fn patch_bootargs(
+         Ok(())
+     }
+ 
+-    /// The physical address, IOVA and size of the `idx`-th `memory-region` of
+-    /// `np`. The IOVA comes from the region's `iommu-addresses` entry for
+-    /// `np`.
+-    fn fw_region(np: *mut bindings::device_node, idx: c_int) -> Result<(u64, u64, u64)> {
+-        // SAFETY: `np` is a valid node and the name is NUL-terminated.
+-        let region =
+-            unsafe { bindings::of_parse_phandle(np, c_str!("memory-region").as_char_ptr(), idx) };
+-        if region.is_null() {
+-            return Err(EINVAL);
+-        }
+-        // SAFETY: of_parse_phandle() returned a reference on `region`.
+-        let _put = ScopeGuard::new(|| unsafe { bindings::of_node_put(region) });
+-        let mut res = mem::MaybeUninit::<bindings::resource>::zeroed();
+-        // SAFETY: `region` is a valid node and `res` is writable storage for
+-        // one resource.
+-        if unsafe { bindings::of_address_to_resource(region, 0, res.as_mut_ptr()) } != 0 {
+-            return Err(EINVAL);
+-        }
+-        // SAFETY: of_address_to_resource() succeeded and filled it in.
+-        let res = unsafe { res.assume_init() };
+-        if res.end < res.start {
+-            return Err(EINVAL);
+-        }
+-        let phys = res.start as u64;
+-        let size = (res.end - res.start) as u64 + 1;
+-
+-        let mut len: c_int = 0;
+-        // SAFETY: `region` is a valid node and the name is NUL-terminated.
+-        let prop = unsafe {
+-            bindings::of_get_property(region, c_str!("iommu-addresses").as_char_ptr(), &mut len)
+-        }
+-        .cast::<u32>();
+-        let len = usize::try_from(len).map_err(|_| EINVAL)?;
+-        if prop.is_null() || len == 0 || len % mem::size_of::<u32>() != 0 {
+-            return Err(ENOENT);
+-        }
+-        let cells = len / mem::size_of::<u32>();
+-        // SAFETY: `np` is a valid node.
+-        let own = unsafe { (*np).phandle };
+-        let mut found = None;
+-        let mut pos = 0;
+-        // Each entry is an owner phandle and an address and size in the
+-        // owner's DMA address space.
+-        while pos < cells {
+-            // SAFETY: `pos` is below `cells`, inside the property.
+-            let phandle = u32::from_be(unsafe { prop.add(pos).read_unaligned() });
+-            pos += 1;
+-            if own != 0 && phandle == own {
+-                let mut iova: bindings::phys_addr_t = 0;
+-                let mut length: usize = 0;
+-                // SAFETY: `cells - pos` cells are left in the property, which
+-                // bounds the tuple.
+-                let next = unsafe {
+-                    bindings::of_translate_dma_region_checked(
+-                        np,
+-                        prop.add(pos),
+-                        cells - pos,
+-                        &mut iova,
+-                        &mut length,
+-                    )
+-                };
+-                if next.is_null() || found.is_some() {
+-                    return Err(EINVAL);
+-                }
+-                found = Some((iova as u64, length as u64));
+-                // SAFETY: `next` points into the same property, past `pos`.
+-                pos = usize::try_from(unsafe { next.offset_from(prop) }).map_err(|_| EINVAL)?;
+-            } else {
+-                // Another device's entry: skip it by its owner's cell count.
+-                // SAFETY: A lookup; the reference is dropped right below.
+-                let owner = unsafe { bindings::of_find_node_by_phandle(phandle) };
+-                if owner.is_null() {
+-                    return Err(EINVAL);
+-                }
+-                // SAFETY: `owner` is a valid node reference.
+-                let n = unsafe { bindings::of_dma_region_cells(owner) };
+-                // SAFETY: The reference taken by of_find_node_by_phandle().
+-                unsafe { bindings::of_node_put(owner) };
+-                let n = usize::try_from(n).map_err(|_| EINVAL)?;
+-                if n > cells - pos {
+-                    return Err(EINVAL);
+-                }
+-                pos += n;
+-            }
+-        }
+-        let (iova, length) = found.ok_or(ENOENT)?;
+-        if length != size {
+-            return Err(EINVAL);
+-        }
+-        Ok((phys, iova, size))
+-    }
+-
+-    /// Checks the firmware segments the AOP runs from DRAM (T6040). The
+-    /// bootloader reserves them and lists them in `memory-region`, and each
+-    /// one's `iommu-addresses` gives the IOVA the firmware uses for it. The
+-    /// IOMMU core maps them in the default domain when the device is added
+-    /// (one to one when the IOVA is the physical address, translated
+-    /// otherwise), so they are only checked here. Every page has to be mapped
+-    /// where the DT says, the external code (`__ETEXT`) at `ec0p` and any
+-    /// other segment (`__OS_LOG`) at its physical address.
+-    fn check_fw_regions(dev: &device::Device, ec0p: u64) -> Result<()> {
+-        // SAFETY: `dev` is a live device being probed.
+-        let np = unsafe { (*dev.as_raw()).of_node };
+-        if np.is_null() {
++    /// The physical range of the one `/reserved-memory/<prefix>@*` node.
++    fn find_reserved(prefix: &CStr) -> Result<(u64, u64)> {
++        // SAFETY: The path is NUL-terminated. The node reference is released
++        // below (OF_DYNAMIC is on since 7.3: pmdomain/apple selects it).
++        let resv = unsafe {
++            bindings::of_find_node_opts_by_path(
++                c_str!("/reserved-memory").as_char_ptr(),
++                ptr::null_mut(),
++            )
++        };
++        if resv.is_null() {
+             return Err(ENODEV);
+         }
+-        // SAFETY: `np` is the device's node, valid while it is bound.
+-        let count = unsafe { bindings::of_reserved_mem_region_count(np) };
+-        if count <= 0 {
+-            dev_err!(dev, "No firmware memory-region from the bootloader");
+-            return Err(ENOENT);
++        let mut found: Result<Option<(u64, u64)>> = Ok(None);
++        let mut child: *mut bindings::device_node = ptr::null_mut();
++        loop {
++            // SAFETY: `resv` is a valid node; `child` is null or its previous
++            // child, whose reference this call drops.
++            child = unsafe { bindings::of_get_next_child(resv, child) };
++            if child.is_null() {
++                break;
++            }
++            // SAFETY: `child` is a valid node and the prefix is NUL-terminated.
++            if !unsafe { bindings::of_node_name_prefix(child, prefix.as_char_ptr()) } {
++                continue;
++            }
++            let mut res = mem::MaybeUninit::<bindings::resource>::zeroed();
++            // SAFETY: `res` is writable storage for one resource.
++            if unsafe { bindings::of_address_to_resource(child, 0, res.as_mut_ptr()) } != 0 {
++                found = Err(EINVAL);
++                break;
++            }
++            // SAFETY: of_address_to_resource() succeeded and filled it in.
++            let res = unsafe { res.assume_init() };
++            if !matches!(found, Ok(None)) || res.end < res.start {
++                found = Err(EINVAL);
++                break;
++            }
++            found = Ok(Some((res.start as u64, (res.end - res.start) as u64 + 1)));
++        }
++        // SAFETY: Both are null or node references taken above; of_node_put()
++        // accepts null.
++        unsafe {
++            bindings::of_node_put(child);
++            bindings::of_node_put(resv);
++        }
++        found?.ok_or(ENOENT)
++    }
++
++    /// Maps the `/reserved-memory/<prefix>@*` segment into this device's DART
++    /// domain at `iova`, or at its physical address when `iova` is `None`.
++    /// Nothing is mapped unless every check passes.
++    fn map_reserved(&self, dev: &device::Device, prefix: &CStr, iova: Option<u64>) -> Result<()> {
++        let (phys, size) = Self::find_reserved(prefix)?;
++        let iova = iova.unwrap_or(phys);
++        if phys % ETEXT_PAGE != 0
++            || size == 0
++            || size % ETEXT_PAGE != 0
++            || size > ETEXT_MAX_SIZE
++            || iova % ETEXT_PAGE != 0
++            || iova.checked_add(size).is_none()
++            || phys.checked_add(size).is_none()
++        {
++            return Err(EINVAL);
+         }
+         // SAFETY: `dev` is a live device being probed.
+         let domain = unsafe { bindings::iommu_get_domain_for_dev(dev.as_raw()) };
+-        let ty = if domain.is_null() {
+-            bindings::IOMMU_DOMAIN_BLOCKED
+-        } else {
+-            // SAFETY: `domain` is the non-null domain returned above.
+-            unsafe { (*domain).type_ }
+-        };
+-        if ty == bindings::IOMMU_DOMAIN_IDENTITY || ty == bindings::IOMMU_DOMAIN_BLOCKED {
+-            dev_err!(dev, "No translated IOMMU domain for the firmware");
++        if domain.is_null() {
+             return Err(ENODEV);
+         }
+-        let mut etext = false;
+-        for idx in 0..count {
+-            let (phys, iova, size) = Self::fw_region(np, idx).inspect_err(|e| {
+-                dev_err!(dev, "Invalid firmware memory-region {} ({:?})", idx, e);
+-            })?;
+-            if phys % FW_REGION_PAGE != 0
+-                || size % FW_REGION_PAGE != 0
+-                || size > FW_REGION_MAX_SIZE
+-                || iova % FW_REGION_PAGE != 0
+-                || iova.checked_add(size).is_none()
+-                || phys.checked_add(size).is_none()
+-            {
+-                dev_err!(dev, "Invalid firmware memory-region {}", idx);
+-                return Err(EINVAL);
+-            }
+-            if iova == ec0p {
+-                if etext {
+-                    dev_err!(dev, "Two firmware memory-regions at EC0p {:#x}", ec0p);
+-                    return Err(EINVAL);
+-                }
+-                etext = true;
+-            } else if iova != phys {
+-                dev_err!(
+-                    dev,
+-                    "Firmware memory-region {} at IOVA {:#x}, neither EC0p {:#x} nor its physical address",
+-                    idx,
+-                    iova,
+-                    ec0p
+-                );
+-                return Err(EINVAL);
+-            }
+-            let mut off = 0;
+-            while off < size {
+-                // SAFETY: `domain` is the device's domain, live while it is
+-                // bound.
+-                let back =
+-                    unsafe { bindings::iommu_iova_to_phys(domain, (iova + off) as _) } as u64;
+-                if back != phys + off {
+-                    dev_err!(
+-                        dev,
+-                        "Firmware memory-region {} is not mapped at IOVA {:#x}",
+-                        idx,
+-                        iova + off
+-                    );
+-                    return Err(EIO);
+-                }
+-                off += FW_REGION_PAGE;
+-            }
++        // SAFETY: `domain` is the non-null domain returned above.
++        let ty = unsafe { (*domain).type_ };
++        if ty == bindings::IOMMU_DOMAIN_IDENTITY || ty == bindings::IOMMU_DOMAIN_BLOCKED {
++            return Err(ENODEV);
+         }
+-        if !etext {
+-            dev_err!(dev, "No firmware memory-region at EC0p {:#x}", ec0p);
+-            return Err(ENOENT);
++        let size_us = usize::try_from(size).map_err(|_| EOVERFLOW)?;
++        // SAFETY: The range was checked above; the DART domain validates the
++        // IOVA itself.
++        let ret = unsafe {
++            bindings::iommu_map(
++                domain,
++                iova as _,
++                phys as _,
++                size_us,
++                (bindings::IOMMU_READ | bindings::IOMMU_WRITE) as _,
++                bindings::GFP_KERNEL,
++            )
++        };
++        if ret != 0 {
++            return Err(Error::from_errno(ret));
++        }
++        // SAFETY: as above.
++        let back = unsafe { bindings::iommu_iova_to_phys(domain, iova as _) } as u64;
++        if back != phys {
++            // SAFETY: The range was mapped just above.
++            unsafe { bindings::iommu_unmap(domain, iova as _, size_us) };
++            return Err(EIO);
++        }
++        let map = EtextMapping {
++            domain,
++            iova,
++            size: size_us,
++        };
++        if self.etext.lock().push(map, GFP_KERNEL).is_err() {
++            // SAFETY: The range was mapped just above.
++            unsafe { bindings::iommu_unmap(domain, iova as _, size_us) };
++            return Err(ENOMEM);
+         }
+         Ok(())
+     }
+ 
++    /// Undoes `map_reserved()`; only once the firmware no longer runs.
++    fn unmap_etext(&self) {
++        let mut maps = self.etext.lock();
++        while let Some(map) = maps.pop() {
++            // SAFETY: The mapping was created by map_reserved() on this domain.
++            unsafe { bindings::iommu_unmap(map.domain, map.iova as _, map.size) };
++        }
++    }
++
+     /// Leaks every allocation the firmware may still access. Called when the
+     /// shutdown could not be confirmed; the memory is lost until reboot.
+     fn retain_dma_buffers(&self) {
+@@ -1992,6 +1955,9 @@ fn remove(&self) {
+             );
+             return;
+         }
++        // The firmware is stopped or was never started: it no longer fetches
++        // its external code.
++        self.unmap_etext();
+         let arena = self.setup.lock().arena.take();
+         drop(arena);
+         // The ring is DMA of the audio child; free it while the child is
+@@ -2447,10 +2413,10 @@ struct AopHwConfig {
+     quiesce_on_unbind: bool,
+     /// The endpoints that have to start; empty means all advertised ones.
+     required_endpoints: &'static [u8],
+-    /// The firmware runs segments from DRAM, which the bootloader reserves
+-    /// and lists in `memory-region`; check their IOMMU mappings before
+-    /// starting it (T6040).
+-    fw_regions: bool,
++    /// Map the firmware's external code at `ec0p` and its `__OS_LOG` at its
++    /// physical address before starting it: no bootloader mapping survives
++    /// the DART reset (T6040).
++    map_etext: bool,
+     /// Halt the co-processor again when its start fails (T6040).
+     halt_on_failed_start: bool,
+ }
+@@ -2464,7 +2430,7 @@ struct AopHwConfig {
+     setup_port: false,
+     quiesce_on_unbind: false,
+     required_endpoints: &[],
+-    fw_regions: false,
++    map_etext: false,
+     halt_on_failed_start: false,
+ };
+ const HW_CFG_T8112: AopHwConfig = AopHwConfig {
+@@ -2476,7 +2442,7 @@ struct AopHwConfig {
+     setup_port: false,
+     quiesce_on_unbind: false,
+     required_endpoints: &[],
+-    fw_regions: false,
++    map_etext: false,
+     halt_on_failed_start: false,
+ };
+ const HW_CFG_T6000: AopHwConfig = AopHwConfig {
+@@ -2488,7 +2454,7 @@ struct AopHwConfig {
+     setup_port: false,
+     quiesce_on_unbind: false,
+     required_endpoints: &[],
+-    fw_regions: false,
++    map_etext: false,
+     halt_on_failed_start: false,
+ };
+ const HW_CFG_T6020: AopHwConfig = AopHwConfig {
+@@ -2500,13 +2466,13 @@ struct AopHwConfig {
+     setup_port: false,
+     quiesce_on_unbind: false,
+     required_endpoints: &[],
+-    fw_regions: false,
++    map_etext: false,
+     halt_on_failed_start: false,
+ };
+ /// T6040 (J616s): macOS writes the same four boot arguments as for the
+-/// T6020. The firmware's external code and log live in DRAM, mapped through
+-/// the reserved regions the bootloader describes; the RTKit firmware is shut
+-/// down on unbind.
++/// T6020. The bootloader's mapping of the external code does not survive the
++/// DART reset, so it is mapped here; the RTKit firmware is shut down on
++/// unbind.
+ const HW_CFG_T6040: AopHwConfig = AopHwConfig {
+     ec0p: 0x0100_00000000,
+     aopt: 0,
+@@ -2516,7 +2482,7 @@ struct AopHwConfig {
+     setup_port: false,
+     quiesce_on_unbind: true,
+     required_endpoints: &[],
+-    fw_regions: true,
++    map_etext: true,
+     halt_on_failed_start: true,
+ };
+ /// T8140: the firmware is started with the boot arguments the bootloader
+@@ -2533,7 +2499,7 @@ struct AopHwConfig {
+     setup_port: true,
+     quiesce_on_unbind: true,
+     required_endpoints: &[0x20, 0x21, 0x22, 0x23, 0x2b],
+-    fw_regions: false,
++    map_etext: false,
+     halt_on_failed_start: false,
+ };
+ 
+@@ -2575,15 +2541,23 @@ fn probe<'bound>(
+         let asc_req = pdev.io_request_by_index(1).ok_or(EINVAL)?;
+         let asc_mmio = asc_req.iomap_sized::<ASC_MMIO_SIZE>()?;
+         let asc_mmio = asc_mmio.as_view().relaxed();
+-        if cfg.fw_regions {
+-            // Before anything is written to the AOP: no mapping, no start.
+-            AopData::check_fw_regions(pdev.as_ref(), cfg.ec0p)?;
+-        }
+         let data = AopData::new(pdev, cfg)?;
+         // Whatever fails below leaves the AOP running and its children
+         // registering; the same teardown as unbind's cleans that up.
+         let probe_guard = ScopeGuard::new_with_data(data.clone(), |data| data.remove());
+         let aop_mmio = aop_mmio.as_view();
++        if cfg.map_etext {
++            // Before anything is written to the AOP: no mapping, no start.
++            for (prefix, iova) in [
++                (ETEXT_NODE_PREFIX, Some(cfg.ec0p)),
++                (OSLOG_NODE_PREFIX, None),
++            ] {
++                if let Err(e) = data.map_reserved(pdev.as_ref(), prefix, iova) {
++                    dev_err!(pdev.as_ref(), "Failed to map {:?} ({:?})", prefix, e);
++                    return Err(e);
++                }
++            }
++        }
+         if cfg.patch_bootargs {
+             data.patch_bootargs(
+                 &aop_mmio,
+-- 
+2.56.0
+

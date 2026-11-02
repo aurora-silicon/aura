@@ -1,0 +1,4288 @@
+diff --git c/arch/arm64/include/asm/apple_cpufeature.h i/arch/arm64/include/asm/apple_cpufeature.h
+index 4370d91ffa3e..34b5d3bbf775 100644
+--- c/arch/arm64/include/asm/apple_cpufeature.h
++++ i/arch/arm64/include/asm/apple_cpufeature.h
+@@ -10,6 +10,6 @@
+ #define AIDR_APPLE_TSO		BIT(9)
+ 
+ #define ACTLR_APPLE_TSO_SHIFT	1
+-#define ACTLR_APPLE_TSO		BIT(1)
++#define ACTLR_APPLE_TSO		BIT(1)	/* EnTSO only, as upstream Asahi and the muvm guest FEX uses; bit 4 is EnAPFLG (XNU sets it for EL0 only) */
+ 
+ #endif
+diff --git c/arch/arm64/include/asm/kvm_asm.h i/arch/arm64/include/asm/kvm_asm.h
+index e5b92ac09e69..0b437ec3dc59 100644
+--- c/arch/arm64/include/asm/kvm_asm.h
++++ i/arch/arm64/include/asm/kvm_asm.h
+@@ -192,11 +192,12 @@ extern void *__vhe_undefined_symbol;
+ 					   ? CHOOSE_VHE_SYM(sym)	\
+ 					   : CHOOSE_NVHE_SYM(sym))
+ 
+-#define this_cpu_ptr_hyp_sym(sym)	(is_kernel_in_hyp_mode()	\
++extern bool kvm_sptm_active;
++#define this_cpu_ptr_hyp_sym(sym)	((is_kernel_in_hyp_mode() || kvm_sptm_active)	\
+ 					   ? this_cpu_ptr(&sym)		\
+ 					   : this_cpu_ptr_nvhe_sym(sym))
+ 
+-#define per_cpu_ptr_hyp_sym(sym, cpu)	(is_kernel_in_hyp_mode()	\
++#define per_cpu_ptr_hyp_sym(sym, cpu)	((is_kernel_in_hyp_mode() || kvm_sptm_active)	\
+ 					   ? per_cpu_ptr(&sym, cpu)	\
+ 					   : per_cpu_ptr_nvhe_sym(sym, cpu))
+ 
+diff --git c/arch/arm64/include/asm/kvm_host.h i/arch/arm64/include/asm/kvm_host.h
+index cd9b9d2462f9..ba465c644055 100644
+--- c/arch/arm64/include/asm/kvm_host.h
++++ i/arch/arm64/include/asm/kvm_host.h
+@@ -70,7 +70,9 @@ enum kvm_mode {
+ 	KVM_MODE_PROTECTED,
+ 	KVM_MODE_NV,
+ 	KVM_MODE_NONE,
++	KVM_MODE_SPTM,		/* under the macho monitor, see arch/arm64/kvm/sptm.c */
+ };
++extern bool kvm_sptm_active;
+ #ifdef CONFIG_KVM
+ enum kvm_mode kvm_get_mode(void);
+ #else
+@@ -308,6 +310,7 @@ enum fgt_group_id {
+ 
+ struct kvm_arch {
+ 	struct kvm_s2_mmu mmu;
++	unsigned long sptm_handle;	/* the monitor's VM, KVM_MODE_SPTM */
+ 
+ 	/*
+ 	 * Fine-Grained UNDEF, mimicking the FGT layout defined by the
+@@ -846,6 +849,7 @@ struct vncr_tlb;
+ 
+ struct kvm_vcpu_arch {
+ 	struct kvm_cpu_context ctxt;
++	void *sptm_run;			/* SPTM guest_state + struct mhv_run, KVM_MODE_SPTM */
+ 
+ 	/*
+ 	 * Guest floating point state
+@@ -1259,6 +1263,33 @@ void kvm_arm_resume_guest(struct kvm *kvm);
+ #define vcpu_has_run_once(vcpu)	(!!READ_ONCE((vcpu)->pid))
+ 
+ #ifndef __KVM_NVHE_HYPERVISOR__
++/*
++ * KVM_MODE_SPTM has no hyp code: what hyp does on the host's behalf happens in __kvm_vcpu_run's HVC or not at all. Stage-2
++ * invalidation is inside SPTM's map and unmap; vGIC and timer state travels with the run; the offsets stay zero.
++ */
++struct kvm_s2_mmu;
++struct kvm_vcpu;
++int sptm___kvm_vcpu_run(struct kvm_vcpu *vcpu);
++void sptm___kvm_flush_cpu_context(struct kvm_s2_mmu *mmu);
++int kvm_sptm_probe(void);
++int kvm_sptm_register_switch(void);
++int kvm_sptm_vcpu_init(struct kvm_vcpu *vcpu);
++void kvm_sptm_vcpu_destroy(struct kvm_vcpu *vcpu);
++int kvm_arm_init_late(void);
++#define sptm___kvm_adjust_pc(v)			__kvm_adjust_pc(v)
++#define sptm___kvm_flush_vm_context()		do { } while (0)
++#define sptm___kvm_tlb_flush_vmid(m)		do { } while (0)
++#define sptm___kvm_tlb_flush_vmid_ipa(m, i, l)	do { } while (0)
++#define sptm___kvm_tlb_flush_vmid_ipa_nsh(m, i, l) do { } while (0)
++#define sptm___kvm_tlb_flush_vmid_range(m, s, p) do { } while (0)
++#define sptm___kvm_timer_set_cntvoff(o)		do { } while (0)
++#define sptm___vgic_v3_init_lrs()		do { } while (0)
++#define sptm___vgic_v3_save_aprs(c)		do { } while (0)
++#define sptm___vgic_v3_restore_vmcr_aprs(c)	do { } while (0)
++#define sptm___vgic_v5_save_apr(c)		do { } while (0)
++#define sptm___vgic_v5_restore_vmcr_apr(c)	do { } while (0)
++#define sptm___vgic_v3_get_gic_config()		false	/* no GICv2 compat in this CPU interface */
++
+ #define kvm_call_hyp_nvhe(f, ...)					\
+ 	({								\
+ 		struct arm_smccc_res res;				\
+@@ -1280,6 +1311,8 @@ void kvm_arm_resume_guest(struct kvm *kvm);
+ 		if (has_vhe()) {					\
+ 			f(__VA_ARGS__);					\
+ 			isb();						\
++		} else if (kvm_sptm_active) {				\
++			sptm_##f(__VA_ARGS__);				\
+ 		} else {						\
+ 			kvm_call_hyp_nvhe(f, ##__VA_ARGS__);		\
+ 		}							\
+@@ -1291,6 +1324,8 @@ void kvm_arm_resume_guest(struct kvm *kvm);
+ 									\
+ 		if (has_vhe()) {					\
+ 			ret = f(__VA_ARGS__);				\
++		} else if (kvm_sptm_active) {				\
++			ret = sptm_##f(__VA_ARGS__);			\
+ 		} else {						\
+ 			ret = kvm_call_hyp_nvhe(f, ##__VA_ARGS__);	\
+ 		}							\
+diff --git c/arch/arm64/include/asm/kvm_pkvm.h i/arch/arm64/include/asm/kvm_pkvm.h
+index cad60569f061..7e99480cecd6 100644
+--- c/arch/arm64/include/asm/kvm_pkvm.h
++++ i/arch/arm64/include/asm/kvm_pkvm.h
+@@ -204,6 +204,20 @@ struct pkvm_mapping {
+ 	u64 __subtree_last;	/* Internal member for interval tree */
+ };
+ 
++int skvm_pgtable_stage2_init(struct kvm_pgtable *pgt, struct kvm_s2_mmu *mmu, struct kvm_pgtable_mm_ops *mm_ops);
++void skvm_pgtable_stage2_destroy_range(struct kvm_pgtable *pgt, u64 addr, u64 size);
++void skvm_pgtable_stage2_destroy_pgd(struct kvm_pgtable *pgt);
++int skvm_pgtable_stage2_map(struct kvm_pgtable *pgt, u64 addr, u64 size, u64 phys, enum kvm_pgtable_prot prot, void *mc,
++			    enum kvm_pgtable_walk_flags flags);
++int skvm_pgtable_stage2_unmap(struct kvm_pgtable *pgt, u64 addr, u64 size);
++int skvm_pgtable_stage2_wrprotect(struct kvm_pgtable *pgt, u64 addr, u64 size);
++int skvm_pgtable_stage2_flush(struct kvm_pgtable *pgt, u64 addr, u64 size);
++bool skvm_pgtable_stage2_test_clear_young(struct kvm_pgtable *pgt, u64 addr, u64 size, bool mkold);
++int skvm_pgtable_stage2_relax_perms(struct kvm_pgtable *pgt, u64 addr, enum kvm_pgtable_prot prot,
++				    enum kvm_pgtable_walk_flags flags);
++void skvm_pgtable_stage2_mkyoung(struct kvm_pgtable *pgt, u64 addr, enum kvm_pgtable_walk_flags flags);
++int skvm_pgtable_stage2_split(struct kvm_pgtable *pgt, u64 addr, u64 size, struct kvm_mmu_memory_cache *mc);
++void skvm_pgtable_stage2_free_unlinked(struct kvm_pgtable_mm_ops *mm_ops, void *pgtable, s8 level);
+ int pkvm_pgtable_stage2_init(struct kvm_pgtable *pgt, struct kvm_s2_mmu *mmu,
+ 			     struct kvm_pgtable_mm_ops *mm_ops);
+ void pkvm_pgtable_stage2_destroy_range(struct kvm_pgtable *pgt,
+diff --git c/arch/arm64/include/asm/macho_hv.h i/arch/arm64/include/asm/macho_hv.h
+new file mode 100644
+index 000000000000..e0f7681df18c
+--- /dev/null
++++ i/arch/arm64/include/asm/macho_hv.h
+@@ -0,0 +1,69 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/* macho hypervisor ABI: Linux at guest EL1 <-> this monitor. Same file in the kernel as asm/macho_hv.h.
++ * Only a trusted Linux calls this. x0 = function, x1.. args, x0 = result (0 or positive = ok). */
++#ifndef MACHO_HV_H
++#define MACHO_HV_H
++#define MHV_PROBE      0x7510   /* -> x0 MHV_MAGIC, x1 ICH_VTR_EL2, x2 ICC_SRE_EL2, x3 ID_AA64MMFR0. SMCCC 1.1: x4-x17 preserved by all calls */
++#define MHV_VM_CREATE  0x7511   /* -> x0 handle (> 0) or negative */
++#define MHV_VM_DESTROY 0x7512   /* x1 handle */
++#define MHV_MAP        0x7513   /* x1 handle, x2 ipa, x3 pa, x4 size, x5 stage-2 attrs (MHV_ATTR_MASK) */
++#define MHV_UNMAP      0x7514   /* x1 handle, x2 ipa, x3 size */
++#define MHV_RELAX      0x7515   /* x1 handle, x2 ipa, x3 attrs: new permissions on a valid page */
++#define MHV_RUN        0x7516   /* x1 PA of struct mhv_run -> x0 MHV_EXIT_* */
++#define MHV_LAST       0x7516
++#define MHV_MAGIC      0x3156484dUL   /* "MHV1" */
++
++#define MHV_EXIT_TRAP   0
++#define MHV_EXIT_IRQ    1
++#define MHV_EXIT_SERROR 2
++#define MHV_EXIT_BAD    3            /* the run page or handle was refused, the guest did not run */
++
++#define MHV_E_INVAL   (-22L)
++#define MHV_E_NOMEM   (-12L)
++#define MHV_E_BUSY    (-16L)
++#define MHV_E_SPTM    (-5L)
++
++/* AP, SH, AF, MemAttr, XN[54:53]. Bit 11 (FnXS) is forced on: UNMAP_REGION and a valid-PTE MAP_PAGE on a 0x21 root panic
++ * "FNXS is expected to be set" without it . */
++#define MHV_ATTR_MASK 0x00600000000007fcUL
++
++/* the SPTM guest_state occupies the first 0xa60 bytes of the page handed to GUEST_DISPATCH  */
++#define MHV_GS_ROOT    0x000
++#define MHV_GS_HCR     0x010
++#define MHV_GS_HACR    0x018
++#define MHV_GS_HCRX    0x020
++#define MHV_GS_SP_EL0  0x038
++#define MHV_GS_SP_EL1  0x040
++#define MHV_GS_MDSCR   0x048
++#define MHV_GS_TPIDR   0x050
++#define MHV_GS_TPIDR0  0x058
++#define MHV_GS_TPIDRRO 0x060
++#define MHV_GS_PAR     0x068
++#define MHV_GS_CSSELR  0x070
++#define MHV_GS_SCXT    0x088
++#define MHV_GS_CPTR    0x090
++#define MHV_GS_FPSR    0x098
++#define MHV_GS_FPCR    0x0a0
++#define MHV_GS_X0      0x0a8
++#define MHV_GS_Q0      0x1c0
++#define MHV_GS_PSTATE  0xa40
++#define MHV_GS_PC      0xa48
++#define MHV_GS_TLBFLAG 0xa58           /* bit 0: tlbi vmalle1 on this core before entry  */
++
++#define MHV_RUN_OFF    0x1000
++/* order of el1[]: the monitor's EL12 accessors in the same order */
++enum { MHV_TTBR0, MHV_TTBR1, MHV_TCR, MHV_MAIR, MHV_SCTLR, MHV_AMAIR, MHV_CPACR, MHV_VBAR, MHV_ELR, MHV_SPSR, MHV_ESR,
++       MHV_FAR, MHV_AFSR0, MHV_AFSR1, MHV_CONTEXTIDR, MHV_CNTKCTL, MHV_ACTLR, MHV_NR_EL1 };
++
++struct mhv_run {                       /* at page + MHV_RUN_OFF, in guest EL1's RAM, identity PA */
++	unsigned long handle;
++	unsigned long el1[MHV_NR_EL1];
++	unsigned long vmpidr, vpidr, mdcr, cnthctl_set;
++	unsigned long hfgrtr, hfgwtr, hfgitr, hdfgrtr, hdfgwtr;
++	unsigned long ich_hcr, ich_vmcr, used_lrs, ap0r[4], ap1r[4], lr[16];
++	unsigned long vsesr;
++	unsigned long pmc_on, pmc_val, pmuserenr;   /* PMCCNTR: val = base when on, the count when off */
++	/* filled on exit */
++	unsigned long esr, far, hpfar, nr_cpuif_fast, hcr;
++};
++#endif
+diff --git c/arch/arm64/kernel/cpufeature_impdef.c i/arch/arm64/kernel/cpufeature_impdef.c
+index aee7571fbadb..825f28c74ab5 100644
+--- c/arch/arm64/kernel/cpufeature_impdef.c
++++ i/arch/arm64/kernel/cpufeature_impdef.c
+@@ -39,7 +39,7 @@ static bool has_apple_tso(const struct arm64_cpu_capabilities *entry, int scope)
+ 
+ 	val = read_sysreg(actlr_el1);
+ 	write_sysreg(val ^ ACTLR_APPLE_TSO, actlr_el1);
+-	if (!((val ^ read_sysreg(actlr_el1)) & ACTLR_APPLE_TSO)) {
++	if (((val ^ read_sysreg(actlr_el1)) & ACTLR_APPLE_TSO) != ACTLR_APPLE_TSO) {
+ 		pr_info_once("CPU advertises Apple TSO but it is broken, ignoring\n");
+ 		return false;
+ 	}
+diff --git c/arch/arm64/kernel/idle.c i/arch/arm64/kernel/idle.c
+index f4ad1c3e9596..a07f684477ba 100644
+--- c/arch/arm64/kernel/idle.c
++++ i/arch/arm64/kernel/idle.c
+@@ -6,6 +6,9 @@
+ #include <linux/cpu.h>
+ #include <linux/init.h>
+ #include <linux/irqflags.h>
++#include <linux/moduleparam.h>
++#include <linux/string.h>
++#include <linux/sysfs.h>
+ 
+ #include <asm/apple-idle.h>
+ #include <asm/barrier.h>
+@@ -38,6 +41,31 @@ static int __init setup_idle(char *arg)
+ }
+ early_param("idle", setup_idle);
+ 
++/*
++ * Runtime switch for the Linux guest under the SPTM monitor: boot with idle=nop, change to WFI only after the desktop has reported, so a
++ * core that does not wake leaves the status lines on the panel.
++ */
++static int idle_mode_set(const char *val, const struct kernel_param *kp)
++{
++	int m = sysfs_streq(val, "wfi") ? ARM64_IDLE_WFI : sysfs_streq(val, "yield") ? ARM64_IDLE_YIELD :
++		sysfs_streq(val, "nop") ? ARM64_IDLE_NOP : -1;
++
++	if (m < 0)
++		return -EINVAL;
++	WRITE_ONCE(idle, m);
++	return 0;
++}
++
++static int idle_mode_get(char *buf, const struct kernel_param *kp)
++{
++	static const char * const n[] = { "wfi", "yield", "nop" };
++
++	return sysfs_emit(buf, "%s\n", n[READ_ONCE(idle)]);
++}
++
++static const struct kernel_param_ops idle_mode_ops = { .set = idle_mode_set, .get = idle_mode_get };
++module_param_cb(mode, &idle_mode_ops, NULL, 0644);
++
+ #ifdef CONFIG_ARCH_APPLE
+ /*
+  * Preserve general-purpose and FP/SIMD state across WFI on M4 and later
+diff --git c/arch/arm64/kernel/process.c i/arch/arm64/kernel/process.c
+index 3ef4660dc178..e1afcc21d491 100644
+--- c/arch/arm64/kernel/process.c
++++ i/arch/arm64/kernel/process.c
+@@ -734,6 +734,12 @@ static inline void debug_switch_state(void)
+ }
+ 
+ #ifdef CONFIG_ARM64_MEMORY_MODEL_CONTROL
++/* macho F34: what PR_SET_MEM_MODEL_TSO writes, changeable at run time (macho-diag /sys/kernel/macho_tso) so the HW litmus decides
++ * without a reflash: default bit 1 (EnTSO, Asahi and FEX); XNU's Rosetta thread state is set 0x12 (EnTSO|EnAPFLG), clear 0xe00. */
++unsigned long macho_tso_set = BIT(1), macho_tso_clr;
++EXPORT_SYMBOL_GPL(macho_tso_set);
++EXPORT_SYMBOL_GPL(macho_tso_clr);
++
+ int arch_prctl_mem_model_get(struct task_struct *t)
+ {
+ 	if (alternative_has_cap_unlikely(ARM64_HAS_TSO_APPLE) &&
+@@ -752,17 +758,31 @@ int arch_prctl_mem_model_set(struct task_struct *t, unsigned long val)
+ 	if (alternative_has_cap_unlikely(ARM64_HAS_TSO_APPLE)) {
+ 		WARN_ON(!system_has_actlr_state());
+ 
++		/* a preemption before the msr makes actlr_thread_switch save the old register over the new thread.actlr */
++		preempt_disable();
+ 		switch (val) {
+ 		case PR_SET_MEM_MODEL_TSO:
+-			t->thread.actlr |= ACTLR_APPLE_TSO;
++			t->thread.actlr = (t->thread.actlr & ~macho_tso_clr) | macho_tso_set | ACTLR_APPLE_TSO;
++			pr_info_once("macho: prctl TSO actlr %llx (set %lx clr %lx)\n", t->thread.actlr, macho_tso_set, macho_tso_clr);
+ 			break;
+ 		case PR_SET_MEM_MODEL_DEFAULT:
+-			t->thread.actlr &= ~ACTLR_APPLE_TSO;
++			t->thread.actlr &= ~(BIT(1) | BIT(4));	/* test mode 3 also sets EnAPFLG */
++			break;
++		case 2:	/* macho test only: EnTSO without EnAPFLG, what the muvm guest kernel sets */
++			t->thread.actlr = (t->thread.actlr & ~(BIT(1) | BIT(4))) | BIT(1);
++			pr_info_once("macho: prctl 2 actlr %llx\n", t->thread.actlr);
++			break;
++		case 3:	/* macho test only: 0x12 with bits 9-11 clear, the state XNU runs in */
++			t->thread.actlr = (t->thread.actlr & ~GENMASK(11, 9)) | BIT(1) | BIT(4);
++			pr_info_once("macho: prctl 3 actlr %llx\n", t->thread.actlr);
+ 			break;
+ 		default:
++			preempt_enable();
+ 			return -EINVAL;
+ 		}
++		dsb(sy);
+ 		write_sysreg(t->thread.actlr, actlr_el1);
++		preempt_enable();
+ 		return 0;
+ 	}
+ 
+@@ -784,6 +804,9 @@ static void actlr_thread_switch(struct task_struct *next)
+ 		return;
+ 
+ 	current->thread.actlr = read_sysreg(actlr_el1);
++	if (current->thread.actlr == next->thread.actlr)
++		return;
++	dsb(sy);
+ 	write_sysreg(next->thread.actlr, actlr_el1);
+ }
+ #else
+diff --git c/arch/arm64/kvm/Makefile i/arch/arm64/kvm/Makefile
+index 59612d2f277c..91a08205df4d 100644
+--- c/arch/arm64/kvm/Makefile
++++ i/arch/arm64/kvm/Makefile
+@@ -3,7 +3,7 @@
+ # Makefile for Kernel-based Virtual Machine module
+ #
+ 
+-ccflags-y += -I $(src)
++ccflags-y += -I $(src) -include $(src)/sptm_keepinit.h
+ 
+ include $(srctree)/virt/kvm/Makefile.kvm
+ 
+@@ -12,8 +12,9 @@ obj-$(CONFIG_KVM) += hyp/
+ 
+ CFLAGS_sys_regs.o += -Wno-override-init
+ CFLAGS_handle_exit.o += -Wno-override-init
++CFLAGS_pkvm.o += -DKVM_KEEPINIT_SKIP
+ 
+-kvm-y += arm.o mmu.o mmio.o psci.o hypercalls.o pvtime.o \
++kvm-y += sptm.o arm.o mmu.o mmio.o psci.o hypercalls.o pvtime.o \
+ 	 inject_fault.o va_layout.o handle_exit.o config.o \
+ 	 guest.o debug.o reset.o sys_regs.o stacktrace.o \
+ 	 vgic-sys-reg-v3.o fpsimd.o pkvm.o \
+diff --git c/arch/arm64/kvm/arch_timer.c i/arch/arm64/kvm/arch_timer.c
+index 6ac3321f4c57..b79370c4cc81 100644
+--- c/arch/arm64/kvm/arch_timer.c
++++ i/arch/arm64/kvm/arch_timer.c
+@@ -164,7 +164,13 @@ u64 kvm_phys_timer_read(void)
+ 
+ void get_timer_map(struct kvm_vcpu *vcpu, struct timer_map *map)
+ {
+-	if (vcpu_has_nv(vcpu)) {
++	if (kvm_sptm_active) {
++		/* the hardware timers stay Linux's own: guest access traps (CNTHCTL EL1TVT, no EL1PTEN) and is emulated */
++		map->direct_vtimer = NULL;
++		map->direct_ptimer = NULL;
++		map->emul_vtimer = vcpu_vtimer(vcpu);
++		map->emul_ptimer = vcpu_ptimer(vcpu);
++	} else if (vcpu_has_nv(vcpu)) {
+ 		if (is_hyp_ctxt(vcpu)) {
+ 			map->direct_vtimer = vcpu_hvtimer(vcpu);
+ 			map->direct_ptimer = vcpu_hptimer(vcpu);
+@@ -910,7 +916,8 @@ void kvm_timer_vcpu_load(struct kvm_vcpu *vcpu)
+ 
+ 	kvm_timer_unblocking(vcpu);
+ 
+-	timer_restore_state(map.direct_vtimer);
++	if (map.direct_vtimer)
++		timer_restore_state(map.direct_vtimer);
+ 	if (map.direct_ptimer)
+ 		timer_restore_state(map.direct_ptimer);
+ 	if (map.emul_vtimer)
+@@ -931,7 +938,8 @@ void kvm_timer_vcpu_put(struct kvm_vcpu *vcpu)
+ 
+ 	get_timer_map(vcpu, &map);
+ 
+-	timer_save_state(map.direct_vtimer);
++	if (map.direct_vtimer)
++		timer_save_state(map.direct_vtimer);
+ 	if (map.direct_ptimer)
+ 		timer_save_state(map.direct_ptimer);
+ 
+@@ -1060,7 +1068,8 @@ void kvm_timer_vcpu_reset(struct kvm_vcpu *vcpu)
+ 					     vcpu_get_timer(vcpu, i));
+ 
+ 		if (irqchip_in_kernel(vcpu->kvm)) {
+-			kvm_vgic_reset_mapped_irq(vcpu, timer_irq(map.direct_vtimer));
++			if (map.direct_vtimer)
++				kvm_vgic_reset_mapped_irq(vcpu, timer_irq(map.direct_vtimer));
+ 			if (map.direct_ptimer)
+ 				kvm_vgic_reset_mapped_irq(vcpu, timer_irq(map.direct_ptimer));
+ 		}
+@@ -1112,7 +1121,8 @@ void kvm_timer_vcpu_init(struct kvm_vcpu *vcpu)
+ 	/* Synchronize offsets across timers of a VM if not already provided */
+ 	if (!vcpu_is_protected(vcpu) &&
+ 	    !test_bit(KVM_ARCH_FLAG_VM_COUNTER_OFFSET, &vcpu->kvm->arch.flags)) {
+-		timer_set_offset(vcpu_vtimer(vcpu), kvm_phys_timer_read());
++		/* KVM_MODE_SPTM: no counter offset, see get_timer_map */
++		timer_set_offset(vcpu_vtimer(vcpu), kvm_sptm_active ? 0 : kvm_phys_timer_read());
+ 		timer_set_offset(vcpu_ptimer(vcpu), 0);
+ 	}
+ 
+@@ -1405,6 +1415,15 @@ static int kvm_irq_init(struct arch_timer_kvm_info *info)
+ 	return 0;
+ }
+ 
++/* raw test of the EL1TVT trap the monitor's guest world relies on */
++static bool force_el1tvt __initdata;
++static int __init early_force_el1tvt(char *arg)
++{
++	force_el1tvt = true;
++	return 0;
++}
++early_param("kvm-arm.force_el1tvt", early_force_el1tvt);
++
+ static void kvm_timer_handle_errata(void)
+ {
+ 	u64 mmfr0, mmfr1, mmfr4;
+@@ -1430,7 +1449,7 @@ static void kvm_timer_handle_errata(void)
+ 	    !SYS_FIELD_GET(ID_AA64MMFR4_EL1, E2H0, mmfr4)	&&
+ 	    SYS_FIELD_GET(ID_AA64MMFR0_EL1, ECV, mmfr0)		&&
+ 	    (has_vhe() || has_hvhe())				&&
+-	    cpus_have_final_cap(ARM64_WORKAROUND_QCOM_ORYON_CNTVOFF)) {
++	    (force_el1tvt || cpus_have_final_cap(ARM64_WORKAROUND_QCOM_ORYON_CNTVOFF))) {
+ 		static_branch_enable(&broken_cntvoff_key);
+ 		kvm_info("Broken CNTVOFF_EL2, trapping virtual timer\n");
+ 	}
+@@ -1449,6 +1468,10 @@ int __init kvm_timer_hyp_init(bool has_gic)
+ 		return -ENODEV;
+ 	}
+ 
++	/* no host IRQ belongs to the guest timers: host_vtimer_irq stays 0, its enable and disable do nothing */
++	if (kvm_sptm_active)
++		return 0;
++
+ 	err = kvm_irq_init(info);
+ 	if (err)
+ 		return err;
+@@ -1615,9 +1638,11 @@ int kvm_timer_enable(struct kvm_vcpu *vcpu)
+ 	for (int i = 0; i < nr_timers(vcpu); i++)
+ 		kvm_vgic_set_irq_ops(vcpu, timer_irq(vcpu_get_timer(vcpu, i)), ops);
+ 
+-	ret = kvm_vgic_map_phys_irq(vcpu,
+-				    map.direct_vtimer->host_timer_irq,
+-				    timer_irq(map.direct_vtimer));
++	ret = 0;
++	if (map.direct_vtimer)
++		ret = kvm_vgic_map_phys_irq(vcpu,
++					    map.direct_vtimer->host_timer_irq,
++					    timer_irq(map.direct_vtimer));
+ 	if (ret)
+ 		return ret;
+ 
+@@ -1731,6 +1756,9 @@ int kvm_arm_timer_has_attr(struct kvm_vcpu *vcpu, struct kvm_device_attr *attr)
+ int kvm_vm_ioctl_set_counter_offset(struct kvm *kvm,
+ 				    struct kvm_arm_counter_offset *offset)
+ {
++	if (kvm_sptm_active)
++		return -EOPNOTSUPP;
++
+ 	int ret = 0;
+ 
+ 	if (offset->reserved)
+diff --git c/arch/arm64/kvm/arm.c i/arch/arm64/kvm/arm.c
+index 0576c2022ef5..b82cfd6d4087 100644
+--- c/arch/arm64/kvm/arm.c
++++ i/arch/arm64/kvm/arm.c
+@@ -407,7 +407,11 @@ int kvm_vm_ioctl_check_extension(struct kvm *kvm, long ext)
+ 	case KVM_CAP_PTP_KVM:
+ 	case KVM_CAP_ARM_SYSTEM_SUSPEND:
+ 	case KVM_CAP_IRQFD_RESAMPLE:
++		r = 1;
++		break;
+ 	case KVM_CAP_COUNTER_OFFSET:
++		r = !kvm_sptm_active;
++		break;
+ 	case KVM_CAP_ARM_WRITABLE_IMP_ID_REGS:
+ 	case KVM_CAP_ARM_SEA_TO_USER:
+ 		r = 1;
+@@ -582,6 +586,11 @@ int kvm_arch_vcpu_create(struct kvm_vcpu *vcpu)
+ 	err = kvm_share_hyp(vcpu, vcpu + 1);
+ 	if (err)
+ 		kvm_vgic_vcpu_destroy(vcpu);
++	if (!err && kvm_sptm_active) {
++		err = kvm_sptm_vcpu_init(vcpu);
++		if (err)
++			kvm_vgic_vcpu_destroy(vcpu);
++	}
+ 
+ 	return err;
+ }
+@@ -592,6 +601,8 @@ void kvm_arch_vcpu_postcreate(struct kvm_vcpu *vcpu)
+ 
+ void kvm_arch_vcpu_destroy(struct kvm_vcpu *vcpu)
+ {
++	if (kvm_sptm_active)
++		kvm_sptm_vcpu_destroy(vcpu);
+ 	if (!is_protected_kvm_enabled())
+ 		kvm_mmu_free_memory_cache(&vcpu->arch.mmu_page_cache);
+ 	else
+@@ -2248,7 +2259,7 @@ static void cpu_init_hyp_mode(void)
+ 
+ static void cpu_hyp_reset(void)
+ {
+-	if (!is_kernel_in_hyp_mode())
++	if (!is_kernel_in_hyp_mode() && !kvm_sptm_active)
+ 		__hyp_reset_vectors();
+ }
+ 
+@@ -2288,13 +2299,14 @@ static void cpu_hyp_init_context(void)
+ 	kvm_init_host_cpu_context(host_data_ptr(host_ctxt));
+ 	kvm_init_host_debug_data();
+ 
+-	if (!is_kernel_in_hyp_mode())
++	if (!is_kernel_in_hyp_mode() && !kvm_sptm_active)
+ 		cpu_init_hyp_mode();
+ }
+ 
+ static void cpu_hyp_init_features(void)
+ {
+-	cpu_set_hyp_vector();
++	if (!kvm_sptm_active)
++		cpu_set_hyp_vector();
+ 
+ 	if (is_kernel_in_hyp_mode()) {
+ 		kvm_timer_init_vhe();
+@@ -3031,12 +3043,16 @@ void kvm_arch_irq_bypass_start(struct irq_bypass_consumer *cons)
+ }
+ 
+ /* Initialize Hyp-mode and memory mappings on all CPUs */
+-static __init int kvm_arm_init(void)
++static int kvm_arm_init(void)
+ {
+ 	int err;
+ 	bool in_hyp_mode;
+ 
+-	if (!is_hyp_mode_available()) {
++	if (kvm_sptm_active) {
++		err = kvm_sptm_probe();
++		if (err)
++			return err;
++	} else if (!is_hyp_mode_available()) {
+ 		kvm_info("HYP mode not available\n");
+ 		return -ENODEV;
+ 	}
+@@ -3052,7 +3068,8 @@ static __init int kvm_arm_init(void)
+ 		return err;
+ 	}
+ 
+-	in_hyp_mode = is_kernel_in_hyp_mode();
++	/* KVM_MODE_SPTM: no hyp to load, EL2 is the monitor's */
++	in_hyp_mode = is_kernel_in_hyp_mode() || kvm_sptm_active;
+ 
+ 	if (cpus_have_final_cap(ARM64_WORKAROUND_DEVICE_LOAD_ACQUIRE) ||
+ 	    cpus_have_final_cap(ARM64_WORKAROUND_1508412))
+@@ -3079,21 +3096,25 @@ static __init int kvm_arm_init(void)
+ 			goto out_err;
+ 	}
+ 
+-	err = kvm_init_vector_slots();
+-	if (err) {
+-		kvm_err("Cannot initialise vector slots\n");
+-		goto out_hyp;
++	if (!kvm_sptm_active) {
++		err = kvm_init_vector_slots();
++		if (err) {
++			kvm_err("Cannot initialise vector slots\n");
++			goto out_hyp;
++		}
+ 	}
+ 
+ 	err = init_subsystems();
+ 	if (err)
+ 		goto out_hyp;
+ 
+-	kvm_info("%s%sVHE%s mode initialized successfully\n",
++	kvm_info("%s%s%s%s%s mode initialized successfully\n",
++		 kvm_sptm_active ? "SPTM guest, no " : "",
+ 		 in_hyp_mode ? "" : (is_protected_kvm_enabled() ?
+ 				     "Protected " : "Hyp "),
+ 		 in_hyp_mode ? "" : (cpus_have_final_cap(ARM64_KVM_HVHE) ?
+ 				     "h" : "n"),
++		 "VHE",
+ 		 cpus_have_final_cap(ARM64_HAS_NESTED_VIRT) ? "+NV2": "");
+ 
+ 	/*
+@@ -3135,6 +3156,15 @@ static int __init early_kvm_mode_cfg(char *arg)
+ 		return 0;
+ 	}
+ 
++	/* only where the kernel really is the monitor's guest; on a raw boot the word has no effect */
++	if (strcmp(arg, "sptm") == 0) {
++		if (!is_hyp_mode_available()) {
++			kvm_mode = KVM_MODE_SPTM;
++			kvm_sptm_active = true;
++		}
++		return 0;
++	}
++
+ 	if (!is_hyp_mode_available()) {
+ 		pr_warn_once("KVM is not available. Ignoring kvm-arm.mode\n");
+ 		return 0;
+@@ -3198,4 +3228,15 @@ enum kvm_mode kvm_get_mode(void)
+ 	return kvm_mode;
+ }
+ 
+-module_init(kvm_arm_init);
++int kvm_arm_init_late(void)
++{
++	return kvm_arm_init();
++}
++
++static int __init kvm_arm_init_entry(void)
++{
++	if (kvm_sptm_active)
++		return kvm_sptm_register_switch();
++	return kvm_arm_init();
++}
++module_init(kvm_arm_init_entry);
+diff --git c/arch/arm64/kvm/mmu.c i/arch/arm64/kvm/mmu.c
+index bf6d6526639f..a9c9b7c8826c 100644
+--- c/arch/arm64/kvm/mmu.c
++++ i/arch/arm64/kvm/mmu.c
+@@ -35,7 +35,7 @@ u32 __ro_after_init __hyp_va_bits;
+ 
+ static unsigned long __ro_after_init io_map_base;
+ 
+-#define KVM_PGT_FN(fn)		(!is_protected_kvm_enabled() ? fn : p ## fn)
++#define KVM_PGT_FN(fn)		(kvm_sptm_active ? s ## fn : (!is_protected_kvm_enabled() ? fn : p ## fn))
+ 
+ static phys_addr_t __stage2_range_addr_end(phys_addr_t addr, phys_addr_t end,
+ 					   phys_addr_t size)
+@@ -411,7 +411,7 @@ void __init free_hyp_pgds(void)
+ 
+ static bool kvm_host_owns_hyp_mappings(void)
+ {
+-	if (is_kernel_in_hyp_mode())
++	if (is_kernel_in_hyp_mode() || kvm_sptm_active)
+ 		return false;
+ 
+ 	if (static_branch_likely(&kvm_protected_mode_initialized))
+@@ -556,7 +556,7 @@ int kvm_share_hyp(void *from, void *to)
+ 	int ret = 0;
+ 	u64 pfn;
+ 
+-	if (is_kernel_in_hyp_mode())
++	if (is_kernel_in_hyp_mode() || kvm_sptm_active)
+ 		return 0;
+ 
+ 	/*
+@@ -601,7 +601,7 @@ void kvm_unshare_hyp(void *from, void *to)
+ 	phys_addr_t start, end, cur;
+ 	u64 pfn;
+ 
+-	if (is_kernel_in_hyp_mode() || kvm_host_owns_hyp_mappings() || !from)
++	if (is_kernel_in_hyp_mode() || kvm_sptm_active || kvm_host_owns_hyp_mappings() || !from)
+ 		return;
+ 
+ 	start = ALIGN_DOWN(__pa(from), PAGE_SIZE);
+@@ -634,7 +634,7 @@ int create_hyp_mappings(void *from, void *to, enum kvm_pgtable_prot prot)
+ 	unsigned long start = kern_hyp_va((unsigned long)from);
+ 	unsigned long end = kern_hyp_va((unsigned long)to);
+ 
+-	if (is_kernel_in_hyp_mode())
++	if (is_kernel_in_hyp_mode() || kvm_sptm_active)
+ 		return 0;
+ 
+ 	if (!kvm_host_owns_hyp_mappings())
+@@ -2598,6 +2598,10 @@ int kvm_arch_prepare_memory_region(struct kvm *kvm,
+ 	hva_t hva, reg_end;
+ 	int ret = 0;
+ 
++	/* no write protection of stage 2 under the monitor yet */
++	if (kvm_sptm_active && change != KVM_MR_DELETE && (new->flags & KVM_MEM_LOG_DIRTY_PAGES))	/* new is NULL on DELETE */
++		return -EOPNOTSUPP;
++
+ 	if (kvm_vm_is_protected(kvm)) {
+ 		/* Cannot modify memslots once a pVM has run. */
+ 		if (pkvm_hyp_vm_is_created(kvm) &&
+diff --git c/arch/arm64/kvm/reset.c i/arch/arm64/kvm/reset.c
+index 10eb7249aa9e..b8e565181f2a 100644
+--- c/arch/arm64/kvm/reset.c
++++ i/arch/arm64/kvm/reset.c
+@@ -265,6 +265,9 @@ int __init kvm_set_ipa_limit(void)
+ 	}
+ 
+ 	kvm_ipa_limit = id_aa64mmfr0_parange_to_phys_shift(parange);
++	/* VTCR and the table geometry are SPTM's: T0SZ 22, whatever the CPU has  */
++	if (kvm_sptm_active && kvm_ipa_limit > 42)
++		kvm_ipa_limit = 42;
+ 	kvm_info("IPA Size Limit: %d bits%s\n", kvm_ipa_limit,
+ 		 ((kvm_ipa_limit < KVM_PHYS_SHIFT) ?
+ 		  " (Reduced IPA size, limited VM/VMM compatibility)" : ""));
+diff --git c/arch/arm64/kvm/sptm.c i/arch/arm64/kvm/sptm.c
+new file mode 100644
+index 000000000000..7346f0d4f366
+--- /dev/null
++++ i/arch/arm64/kvm/sptm.c
+@@ -0,0 +1,452 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * KVM under the macho monitor: this kernel is itself a guest at EL1 under the monitor, and the monitor and Apple's resident
++ * SPTM own EL2. Stage-2 tables are SPTM objects, so VMs get a root and VMID from the monitor; a vCPU run is an HVC with the
++ * whole register file in a page that doubles as SPTM's guest_state. kvm-arm.mode=sptm selects this; KVM then stays off until
++ * "1" is written to /sys/kernel/macho_kvm/enable.
++ */
++#include <linux/arm-smccc.h>
++#include <linux/irqchip/arm-gic-v3.h>
++#include <linux/kobject.h>
++#include <linux/kvm_host.h>
++#include <linux/sysfs.h>
++
++#include <asm/cacheflush.h>
++#include <asm/kvm_emulate.h>
++#include <asm/kvm_hyp.h>
++#include <asm/kvm_mmu.h>
++#include <asm/kvm_pgtable.h>
++#include <asm/kvm_pkvm.h>
++#include <asm/macho_hv.h>
++
++#include "sys_regs.h"
++#include "vgic/vgic.h"
++
++bool kvm_sptm_active __read_mostly;
++u64 kvm_sptm_ich_vtr __read_mostly;
++static DEFINE_PER_CPU(u32, sptm_need_tlbi);	/* one bit per monitor VM handle */
++
++static long mhv(unsigned long fn, unsigned long a1, unsigned long a2, unsigned long a3, unsigned long a4,
++		unsigned long a5, struct arm_smccc_res *res)
++{
++	struct arm_smccc_res r;
++
++	arm_smccc_1_1_hvc(fn, a1, a2, a3, a4, a5, &r);
++	if (res)
++		*res = r;
++	return (long)r.a0;
++}
++
++int kvm_sptm_probe(void)
++{
++	struct arm_smccc_res r;
++	u64 parange;
++
++	if (mhv(MHV_PROBE, 0, 0, 0, 0, 0, &r) != MHV_MAGIC) {
++		kvm_err("sptm: no macho monitor answered\n");
++		return -ENODEV;
++	}
++	/* guest vtimer emulation needs CNTHCTL_EL2.EL1TVT */
++	if (!cpuid_feature_extract_unsigned_field(r.a3, ID_AA64MMFR0_EL1_ECV_SHIFT)) {
++		kvm_err("sptm: no FEAT_ECV, mmfr0 %lx\n", r.a3);
++		return -ENODEV;
++	}
++	parange = cpuid_feature_extract_unsigned_field(r.a3, ID_AA64MMFR0_EL1_PARANGE_SHIFT);
++	kvm_sptm_ich_vtr = r.a1 & ~ICH_VTR_EL2_SEIS;   /* the cap needs EL2; every CPU under the monitor has the broken SEIS */
++	kvm_info("sptm: monitor ok, ICH_VTR %lx PARange %llu\n", r.a1, parange);
++	return 0;
++}
++
++void sptm___kvm_flush_cpu_context(struct kvm_s2_mmu *mmu)
++{
++	this_cpu_or(sptm_need_tlbi, BIT(kvm_s2_mmu_to_kvm(mmu)->arch.sptm_handle - 1));
++}
++
++/*
++ * A guest without a PMU, for guests that read one anyway: Windows reads PMCR_EL0 unconditionally, and its boot loader and kernel time
++ * with PMCCNTR_EL0. N = 0, the cycle counter is the system counter (24 MHz under SPTM), the rest reads as zero. Linux has no PMU here to back
++ * KVM's model: the monitor shadows its PMC registers. Needs HACR_EL2[56]; runtime switch for the first flash.
++ * PMCCNTR_EL0 holds the base while the counter runs, the count while it stands. A count that stands while it is enabled stops the boot
++ * loader at its "Press any key" (QEMU).
++ */
++static bool sptm_pmu_traps = true;
++module_param_named(sptm_pmu_traps, sptm_pmu_traps, bool, 0644);
++
++static bool sptm_pmc_on(struct kvm_vcpu *vcpu)
++{
++	return (__vcpu_sys_reg(vcpu, PMCR_EL0) & ARMV8_PMU_PMCR_E) && (__vcpu_sys_reg(vcpu, PMCNTENSET_EL0) & BIT(31));
++}
++
++bool kvm_sptm_pmu_access(struct kvm_vcpu *vcpu, struct sys_reg_params *p)
++{
++	u64 enc = sys_reg(p->Op0, p->Op1, p->CRn, p->CRm, p->Op2), v = 0, cur;
++
++	/* Op1 3 is the EL0 group. PMINTEN{SET,CLR}_EL1 are Op1 0: Windows writes PMINTENCLR before anything else */
++	if (p->Op0 != 3 || !((p->Op1 == 3 && ((p->CRn == 9 && p->CRm >= 12) || (p->CRn == 14 && p->CRm >= 8))) ||
++			     (p->Op1 == 0 && p->CRn == 9 && p->CRm == 14)))
++		return false;
++	if (!vcpu_mode_priv(vcpu)) {
++		u64 en = __vcpu_sys_reg(vcpu, PMUSERENR_EL0);
++		bool ok = en & ARMV8_PMU_USERENR_EN;
++
++		/* the Windows kernel sets only CR: EL0 reads the cycle counter with EN clear */
++		if (enc == SYS_PMCCNTR_EL0 && !p->is_write && (en & ARMV8_PMU_USERENR_CR))
++			ok = true;
++		if (enc == SYS_PMUSERENR_EL0)
++			ok = !p->is_write;
++		if (!ok || p->Op1 == 0) {
++			kvm_inject_undefined(vcpu);
++			return true;
++		}
++	}
++	cur = sptm_pmc_on(vcpu) ? kvm_phys_timer_read() - __vcpu_sys_reg(vcpu, PMCCNTR_EL0) : __vcpu_sys_reg(vcpu, PMCCNTR_EL0);
++	switch (enc) {
++	case SYS_PMCR_EL0:
++		if (p->is_write) {
++			if (p->regval & ARMV8_PMU_PMCR_C)
++				cur = 0;
++			__vcpu_assign_sys_reg(vcpu, PMCR_EL0, p->regval & (ARMV8_PMU_PMCR_E | ARMV8_PMU_PMCR_LC));
++		}
++		v = __vcpu_sys_reg(vcpu, PMCR_EL0);
++		break;
++	case SYS_PMCCNTR_EL0:
++		if (p->is_write)
++			cur = p->regval;
++		v = cur;
++		break;
++	case SYS_PMCNTENSET_EL0:
++		if (p->is_write)
++			__vcpu_rmw_sys_reg(vcpu, PMCNTENSET_EL0, |=, p->regval & BIT(31));
++		v = __vcpu_sys_reg(vcpu, PMCNTENSET_EL0) & BIT(31);
++		break;
++	case SYS_PMCNTENCLR_EL0:
++		if (p->is_write)
++			__vcpu_rmw_sys_reg(vcpu, PMCNTENSET_EL0, &=, ~(p->regval & BIT(31)));
++		v = __vcpu_sys_reg(vcpu, PMCNTENSET_EL0) & BIT(31);
++		break;
++	case SYS_PMUSERENR_EL0:
++		if (p->is_write)
++			__vcpu_assign_sys_reg(vcpu, PMUSERENR_EL0, p->regval & ARMV8_PMU_USERENR_MASK);
++		v = __vcpu_sys_reg(vcpu, PMUSERENR_EL0);
++		break;
++	case SYS_PMCCFILTR_EL0:
++		if (p->is_write)
++			__vcpu_assign_sys_reg(vcpu, PMCCFILTR_EL0, p->regval);
++		v = __vcpu_sys_reg(vcpu, PMCCFILTR_EL0);
++		break;
++	default:			/* PMCEID, PMOVS, PMINTEN, PMSELR, PMSWINC, PMXEV*, PMEV*: RAZ/WI */
++		break;
++	}
++	__vcpu_assign_sys_reg(vcpu, PMCCNTR_EL0, sptm_pmc_on(vcpu) ? kvm_phys_timer_read() - cur : cur);
++	if (!p->is_write)
++		p->regval = v;
++	kvm_incr_pc(vcpu);
++	return true;
++}
++
++/* the register file both ways; guest_state offsets from SPTM's entry tail */
++static inline void gs_w(void *gs, unsigned int off, u64 v)
++{
++	*(u64 *)(gs + off) = v;
++}
++
++static inline u64 gs_r(void *gs, unsigned int off)
++{
++	return *(u64 *)(gs + off);
++}
++
++#define EL1_REGS(X)							\
++	X(MHV_TTBR0, TTBR0_EL1) X(MHV_TTBR1, TTBR1_EL1) X(MHV_TCR, TCR_EL1) X(MHV_MAIR, MAIR_EL1)			\
++	X(MHV_SCTLR, SCTLR_EL1) X(MHV_AMAIR, AMAIR_EL1) X(MHV_CPACR, CPACR_EL1) X(MHV_VBAR, VBAR_EL1)		\
++	X(MHV_ELR, ELR_EL1) X(MHV_SPSR, SPSR_EL1) X(MHV_ESR, ESR_EL1) X(MHV_FAR, FAR_EL1)			\
++	X(MHV_AFSR0, AFSR0_EL1) X(MHV_AFSR1, AFSR1_EL1) X(MHV_CONTEXTIDR, CONTEXTIDR_EL1)			\
++	X(MHV_CNTKCTL, CNTKCTL_EL1) X(MHV_ACTLR, ACTLR_EL1)
++
++#define GS_REGS(X)							\
++	X(MHV_GS_SP_EL1, SP_EL1) X(MHV_GS_MDSCR, MDSCR_EL1) X(MHV_GS_TPIDR, TPIDR_EL1) X(MHV_GS_TPIDR0, TPIDR_EL0)	\
++	X(MHV_GS_TPIDRRO, TPIDRRO_EL0) X(MHV_GS_PAR, PAR_EL1) X(MHV_GS_CSSELR, CSSELR_EL1)
++
++static void vcpu_to_run(struct kvm_vcpu *vcpu, void *gs, struct mhv_run *r)
++{
++	struct vgic_v3_cpu_if *cpu_if = &vcpu->arch.vgic_cpu.vgic_v3;
++	struct kvm_cpu_context *ctxt = &vcpu->arch.ctxt;
++	struct user_pt_regs *regs = vcpu_gp_regs(vcpu);
++	int i;
++
++	gs_w(gs, MHV_GS_HCR, vcpu->arch.hcr_el2 & ~HCR_TGE);
++	if (cpus_have_final_cap(ARM64_HAS_HCX))
++		gs_w(gs, MHV_GS_HCRX, vcpu->arch.hcrx_el2);
++	gs_w(gs, MHV_GS_SP_EL0, regs->sp);
++	for (i = 0; i < 31; i++)
++		gs_w(gs, MHV_GS_X0 + i * 8, regs->regs[i]);
++	gs_w(gs, MHV_GS_PC, regs->pc);
++	gs_w(gs, MHV_GS_PSTATE, regs->pstate);
++#define X(o, s) gs_w(gs, o, __vcpu_sys_reg(vcpu, s));
++	GS_REGS(X)
++#undef X
++#define X(o, s) r->el1[o] = __vcpu_sys_reg(vcpu, s);
++	EL1_REGS(X)
++#undef X
++	memcpy(gs + MHV_GS_Q0, ctxt->fp_regs.vregs, sizeof(ctxt->fp_regs.vregs));
++	gs_w(gs, MHV_GS_FPSR, ctxt->fp_regs.fpsr);
++	gs_w(gs, MHV_GS_FPCR, ctxt->fp_regs.fpcr);
++	{
++		u32 me = BIT(vcpu->kvm->arch.sptm_handle - 1);
++
++		gs_w(gs, MHV_GS_TLBFLAG, !!(this_cpu_read(sptm_need_tlbi) & me));
++		this_cpu_and(sptm_need_tlbi, ~me);
++	}
++	gs_w(gs, MHV_GS_HACR, sptm_pmu_traps ? BIT(56) : 0);
++
++	r->handle = vcpu->kvm->arch.sptm_handle;
++	r->vmpidr = __vcpu_sys_reg(vcpu, MPIDR_EL1);
++	r->vpidr = kvm_read_vm_id_reg(vcpu->kvm, SYS_MIDR_EL1);
++	/*
++	 * Nothing switches the breakpoint and watchpoint registers: they stay Linux's, FGT keeps the guest in KVM's shadow. TDA would do that
++	 * too but also traps MDSCR_EL1, which Windows reads on every exception: 1.8 M exits to its Setup page (QEMU). SPTM loads
++	 * MDSCR from gs+0x48, so a read can go direct. XNU clears TDA on the first access  and switches the registers itself.
++	 */
++	r->mdcr = (vcpu->arch.mdcr_el2 & ~MDCR_EL2_TDA) | MDCR_EL2_TDOSA | MDCR_EL2_TDRA | MDCR_EL2_TDCC;	/* TDCC: the DCC registers TDA held */
++	if (kvm_host_owns_debug_regs(vcpu))
++		r->mdcr |= MDCR_EL2_TDA;
++	/* EL1PCTEN: the guest counter has no offset. No EL1PTEN and EL1TVT: both EL1 timers trap, KVM emulates them */
++	r->cnthctl_set = BIT(10) | BIT(13);
++	r->hfgrtr = *vcpu_fgt(vcpu, HFGRTR_EL2);
++	r->hfgwtr = *vcpu_fgt(vcpu, HFGWTR_EL2);
++	r->hfgitr = *vcpu_fgt(vcpu, HFGITR_EL2);
++	r->hdfgrtr = *vcpu_fgt(vcpu, HDFGRTR_EL2) | HDFGRTR_EL2_DBGBCRn_EL1 | HDFGRTR_EL2_DBGBVRn_EL1 | HDFGRTR_EL2_DBGWCRn_EL1 |
++		     HDFGRTR_EL2_DBGWVRn_EL1 | HDFGRTR_EL2_DBGCLAIM | HDFGRTR_EL2_DBGAUTHSTATUS_EL1 | HDFGRTR_EL2_DBGPRCR_EL1 |
++		     HDFGRTR_EL2_OSECCR_EL1;
++	r->hdfgwtr = *vcpu_fgt(vcpu, HDFGWTR_EL2) | HDFGWTR_EL2_DBGBCRn_EL1 | HDFGWTR_EL2_DBGBVRn_EL1 | HDFGWTR_EL2_DBGWCRn_EL1 |
++		     HDFGWTR_EL2_DBGWVRn_EL1 | HDFGWTR_EL2_DBGCLAIM | HDFGWTR_EL2_DBGPRCR_EL1 | HDFGWTR_EL2_MDSCR_EL1 |
++		     HDFGWTR_EL2_OSECCR_EL1;
++	r->pmc_on = sptm_pmc_on(vcpu);
++	r->pmc_val = __vcpu_sys_reg(vcpu, PMCCNTR_EL0);
++	r->pmuserenr = __vcpu_sys_reg(vcpu, PMUSERENR_EL0);
++	r->vsesr = vcpu->arch.vsesr_el2;
++	r->ich_hcr = cpu_if->vgic_hcr | vgic_ich_hcr_trap_bits();
++	r->ich_vmcr = cpu_if->vgic_vmcr;
++	r->used_lrs = cpu_if->used_lrs;
++	for (i = 0; i < 4; i++) {
++		r->ap0r[i] = cpu_if->vgic_ap0r[i];
++		r->ap1r[i] = cpu_if->vgic_ap1r[i];
++	}
++	for (i = 0; i < cpu_if->used_lrs; i++)
++		r->lr[i] = cpu_if->vgic_lr[i];
++}
++
++static void run_to_vcpu(struct kvm_vcpu *vcpu, void *gs, struct mhv_run *r)
++{
++	struct vgic_v3_cpu_if *cpu_if = &vcpu->arch.vgic_cpu.vgic_v3;
++	struct kvm_cpu_context *ctxt = &vcpu->arch.ctxt;
++	struct user_pt_regs *regs = vcpu_gp_regs(vcpu);
++	int i;
++
++	regs->sp = gs_r(gs, MHV_GS_SP_EL0);
++	for (i = 0; i < 31; i++)
++		regs->regs[i] = gs_r(gs, MHV_GS_X0 + i * 8);
++	regs->pc = gs_r(gs, MHV_GS_PC);
++	regs->pstate = gs_r(gs, MHV_GS_PSTATE);
++#define X(o, s) __vcpu_assign_sys_reg(vcpu, s, gs_r(gs, o));
++	GS_REGS(X)
++#undef X
++#define X(o, s) __vcpu_assign_sys_reg(vcpu, s, r->el1[o]);
++	EL1_REGS(X)
++#undef X
++	memcpy(ctxt->fp_regs.vregs, gs + MHV_GS_Q0, sizeof(ctxt->fp_regs.vregs));
++	ctxt->fp_regs.fpsr = gs_r(gs, MHV_GS_FPSR);
++	ctxt->fp_regs.fpcr = gs_r(gs, MHV_GS_FPCR);
++	vcpu->arch.fault.esr_el2 = r->esr;
++	vcpu->arch.fault.far_el2 = r->far;
++	vcpu->arch.fault.hpfar_el2 = r->hpfar;
++	vcpu->arch.fault.disr_el1 = 0;
++	if ((vcpu->arch.hcr_el2 & HCR_VSE) && !(r->hcr & HCR_VSE))
++		vcpu->arch.hcr_el2 &= ~HCR_VSE;    /* taken; hyp/include/hyp/switch.h does this on nVHE and VHE */
++	cpu_if->vgic_vmcr = r->ich_vmcr;
++	/* EOIcount is the one field of ICH_HCR the guest's run changes */
++	if (cpu_if->vgic_hcr & ICH_HCR_EL2_LRENPIE) {
++		cpu_if->vgic_hcr &= ~ICH_HCR_EL2_EOIcount;
++		cpu_if->vgic_hcr |= r->ich_hcr & ICH_HCR_EL2_EOIcount;
++	}
++	for (i = 0; i < 4; i++) {
++		cpu_if->vgic_ap0r[i] = r->ap0r[i];
++		cpu_if->vgic_ap1r[i] = r->ap1r[i];
++	}
++	for (i = 0; i < cpu_if->used_lrs; i++)
++		cpu_if->vgic_lr[i] = r->lr[i];
++}
++
++int sptm___kvm_vcpu_run(struct kvm_vcpu *vcpu)
++{
++	void *gs = vcpu->arch.sptm_run;
++	struct mhv_run *r = gs + MHV_RUN_OFF;
++	long code;
++
++	__kvm_adjust_pc(vcpu);
++	vcpu_to_run(vcpu, gs, r);
++	code = mhv(MHV_RUN, virt_to_phys(gs), 0, 0, 0, 0, NULL);
++	if (code == MHV_EXIT_BAD)
++		return ARM_EXCEPTION_IL;
++	run_to_vcpu(vcpu, gs, r);
++	if (code == MHV_EXIT_IRQ)
++		return ARM_EXCEPTION_IRQ;
++	if (code == MHV_EXIT_SERROR)
++		return ARM_EXCEPTION_EL1_SERROR;
++	return ARM_EXCEPTION_TRAP;
++}
++
++int kvm_sptm_vcpu_init(struct kvm_vcpu *vcpu)
++{
++	BUILD_BUG_ON(sizeof(struct mhv_run) > PAGE_SIZE - MHV_RUN_OFF);
++	vcpu->arch.sptm_run = (void *)get_zeroed_page(GFP_KERNEL_ACCOUNT);
++	return vcpu->arch.sptm_run ? 0 : -ENOMEM;
++}
++
++void kvm_sptm_vcpu_destroy(struct kvm_vcpu *vcpu)
++{
++	free_page((unsigned long)vcpu->arch.sptm_run);
++}
++
++/* stage 2: pgtable.c's interface, the tables live behind SPTM */
++static struct kvm *pgt_kvm(struct kvm_pgtable *pgt)
++{
++	return kvm_s2_mmu_to_kvm(pgt->mmu);
++}
++
++int skvm_pgtable_stage2_init(struct kvm_pgtable *pgt, struct kvm_s2_mmu *mmu, struct kvm_pgtable_mm_ops *mm_ops)
++{
++	long h = mhv(MHV_VM_CREATE, 0, 0, 0, 0, 0, NULL);
++
++	if (h <= 0) {
++		kvm_err("sptm: VM_CREATE: %ld\n", h);
++		return h ? (int)h : -ENOMEM;
++	}
++	pgt->mmu = mmu;
++	pgt->mm_ops = mm_ops;
++	kvm_s2_mmu_to_kvm(mmu)->arch.sptm_handle = h;
++	return 0;
++}
++
++void skvm_pgtable_stage2_destroy_range(struct kvm_pgtable *pgt, u64 addr, u64 size)
++{
++	WARN_ON(mhv(MHV_UNMAP, pgt_kvm(pgt)->arch.sptm_handle, addr, size, 0, 0, NULL));
++}
++
++void skvm_pgtable_stage2_destroy_pgd(struct kvm_pgtable *pgt)
++{
++	struct kvm *kvm = pgt_kvm(pgt);
++
++	WARN_ON(mhv(MHV_VM_DESTROY, kvm->arch.sptm_handle, 0, 0, 0, 0, NULL));
++	kvm->arch.sptm_handle = 0;
++}
++
++static u64 s2_attr(enum kvm_pgtable_prot prot)
++{
++	u64 a = BIT(10) | (3UL << 8);                       /* AF, inner shareable */
++
++	if (prot & KVM_PGTABLE_PROT_DEVICE)
++		a |= 1UL << 2;                              /* FWB Device-nGnRE */
++	else if (prot & KVM_PGTABLE_PROT_NORMAL_NC)
++		a |= 5UL << 2;                              /* FWB Normal-NC */
++	else
++		a |= 6UL << 2;                              /* FWB Normal WB: sptm_guest_enter forces HCR bit 46 */
++	if (prot & KVM_PGTABLE_PROT_R)
++		a |= BIT(6);
++	if (prot & KVM_PGTABLE_PROT_W)
++		a |= BIT(7);
++	if (!(prot & KVM_PGTABLE_PROT_X))
++		a |= 2UL << 53;
++	return a;
++}
++
++int skvm_pgtable_stage2_map(struct kvm_pgtable *pgt, u64 addr, u64 size, u64 phys, enum kvm_pgtable_prot prot, void *mc,
++			    enum kvm_pgtable_walk_flags flags)
++{
++	long r;
++
++	if (prot & KVM_PGTABLE_PROT_X)
++		__invalidate_icache_guest_page(phys_to_virt(phys), size);
++	r = mhv(MHV_MAP, pgt_kvm(pgt)->arch.sptm_handle, addr, phys, size, s2_attr(prot), NULL);
++	return r < 0 ? (int)r : 0;
++}
++
++int skvm_pgtable_stage2_unmap(struct kvm_pgtable *pgt, u64 addr, u64 size)
++{
++	return (int)mhv(MHV_UNMAP, pgt_kvm(pgt)->arch.sptm_handle, addr, size, 0, 0, NULL);
++}
++
++int skvm_pgtable_stage2_relax_perms(struct kvm_pgtable *pgt, u64 addr, enum kvm_pgtable_prot prot,
++				    enum kvm_pgtable_walk_flags flags)
++{
++	return (int)mhv(MHV_RELAX, pgt_kvm(pgt)->arch.sptm_handle, addr, s2_attr(prot), 0, 0, NULL);
++}
++
++/* SPTM invalidates inside UNMAP_REGION and MAP_PAGE; FWB makes the cleans moot; no dirty logging, no aging: AF is always set */
++int skvm_pgtable_stage2_flush(struct kvm_pgtable *pgt, u64 addr, u64 size)
++{
++	return 0;
++}
++
++int skvm_pgtable_stage2_wrprotect(struct kvm_pgtable *pgt, u64 addr, u64 size)
++{
++	return 0;
++}
++
++bool skvm_pgtable_stage2_test_clear_young(struct kvm_pgtable *pgt, u64 addr, u64 size, bool mkold)
++{
++	return false;
++}
++
++void skvm_pgtable_stage2_mkyoung(struct kvm_pgtable *pgt, u64 addr, enum kvm_pgtable_walk_flags flags)
++{
++}
++
++int skvm_pgtable_stage2_split(struct kvm_pgtable *pgt, u64 addr, u64 size, struct kvm_mmu_memory_cache *mc)
++{
++	return 0;
++}
++
++void skvm_pgtable_stage2_free_unlinked(struct kvm_pgtable_mm_ops *mm_ops, void *pgtable, s8 level)
++{
++}
++
++/* /sys/kernel/macho_kvm: the late switch. A failure stays here, on the writer's errno and in status. */
++static DEFINE_MUTEX(enable_lock);
++static int enable_result = -EAGAIN;
++
++static ssize_t enable_store(struct kobject *kobj, struct kobj_attribute *attr, const char *buf, size_t n)
++{
++	bool on;
++	int ret = kstrtobool(buf, &on);
++
++	if (ret)
++		return ret;
++	if (!on)
++		return -EINVAL;
++	mutex_lock(&enable_lock);
++	if (enable_result == -EAGAIN)
++		enable_result = kvm_arm_init_late();
++	ret = enable_result;
++	mutex_unlock(&enable_lock);
++	return ret ? ret : n;
++}
++
++static ssize_t status_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
++{
++	return sysfs_emit(buf, "%d\n", enable_result);
++}
++
++static struct kobj_attribute enable_attr = __ATTR_WO(enable);
++static struct kobj_attribute status_attr = __ATTR_RO(status);
++static struct attribute *attrs[] = { &enable_attr.attr, &status_attr.attr, NULL };
++static const struct attribute_group group = { .attrs = attrs };
++
++int kvm_sptm_register_switch(void)
++{
++	struct kobject *k = kobject_create_and_add("macho_kvm", kernel_kobj);
++
++	if (!k)
++		return -ENOMEM;
++	pr_info("kvm: mode sptm, off until /sys/kernel/macho_kvm/enable\n");
++	return sysfs_create_group(k, &group);
++}
+diff --git c/arch/arm64/kvm/sptm_keepinit.h i/arch/arm64/kvm/sptm_keepinit.h
+new file mode 100644
+index 000000000000..6ba32fd29b7e
+--- /dev/null
++++ i/arch/arm64/kvm/sptm_keepinit.h
+@@ -0,0 +1,17 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * kvm-arm.mode=sptm enables KVM from userspace after boot (macho_kvm/enable), long after init memory is gone, so nothing in
++ * this directory may live in init sections or in the read-only-after-init data.
++ */
++#ifndef KVM_KEEPINIT_SKIP	/* pkvm.c: only for early boot and only pKVM */
++#include <linux/init.h>
++#include <linux/cache.h>
++#undef __init
++#define __init
++#undef __initdata
++#define __initdata
++#undef __initconst
++#define __initconst
++#undef __ro_after_init
++#define __ro_after_init
++#endif
+diff --git c/arch/arm64/kvm/sys_regs.c i/arch/arm64/kvm/sys_regs.c
+index a2f4e769a428..80fd47fd165a 100644
+--- c/arch/arm64/kvm/sys_regs.c
++++ i/arch/arm64/kvm/sys_regs.c
+@@ -1789,11 +1789,13 @@ static int arch_timer_set_user(struct kvm_vcpu *vcpu,
+ 		break;
+ 	case SYS_CNTVCT_EL0:
+ 		if (!test_bit(KVM_ARCH_FLAG_VM_COUNTER_OFFSET, &vcpu->kvm->arch.flags))
+-			timer_set_offset(vcpu_vtimer(vcpu), kvm_phys_timer_read() - val);
++			if (!kvm_sptm_active)	/* guest CNTVCT is the real counter there */
++				timer_set_offset(vcpu_vtimer(vcpu), kvm_phys_timer_read() - val);
+ 		return 0;
+ 	case SYS_CNTPCT_EL0:
+ 		if (!test_bit(KVM_ARCH_FLAG_VM_COUNTER_OFFSET, &vcpu->kvm->arch.flags))
+-			timer_set_offset(vcpu_ptimer(vcpu), kvm_phys_timer_read() - val);
++			if (!kvm_sptm_active)
++				timer_set_offset(vcpu_ptimer(vcpu), kvm_phys_timer_read() - val);
+ 		return 0;
+ 	}
+ 
+@@ -5409,6 +5411,17 @@ int kvm_handle_sys_reg(struct kvm_vcpu *vcpu)
+ 
+ 	trace_kvm_handle_sys_reg(esr);
+ 
++	/* before the trap tables: FGU and pmu_visibility would make these UNDEF */
++	if (kvm_sptm_active) {
++		params = esr_sys64_to_params(esr);
++		params.regval = vcpu_get_reg(vcpu, Rt);
++		if (kvm_sptm_pmu_access(vcpu, &params)) {
++			if (!params.is_write)
++				vcpu_set_reg(vcpu, Rt, params.regval);
++			return 1;
++		}
++	}
++
+ 	if (triage_sysreg_trap(vcpu, &sr_idx))
+ 		return 1;
+ 
+diff --git c/arch/arm64/kvm/sys_regs.h i/arch/arm64/kvm/sys_regs.h
+index bd56a45abbf9..7db25fa5e8d5 100644
+--- c/arch/arm64/kvm/sys_regs.h
++++ i/arch/arm64/kvm/sys_regs.h
+@@ -292,4 +292,6 @@ int kvm_finalize_sys_regs(struct kvm_vcpu *vcpu);
+ 					      sys_reg_CRm(SYS_ ## r),	\
+ 					      sys_reg_Op2(SYS_ ## r))
+ 
++bool kvm_sptm_pmu_access(struct kvm_vcpu *vcpu, struct sys_reg_params *p);
++
+ #endif /* __ARM64_KVM_SYS_REGS_LOCAL_H__ */
+diff --git c/arch/arm64/kvm/vgic/vgic-v3.c i/arch/arm64/kvm/vgic/vgic-v3.c
+index 346bacb3198f..971aff241156 100644
+--- c/arch/arm64/kvm/vgic/vgic-v3.c
++++ i/arch/arm64/kvm/vgic/vgic-v3.c
+@@ -825,7 +825,7 @@ early_param("kvm-arm.vgic_v4_enable", early_gicv4_enable);
+ 
+ static __always_inline bool vgic_v3_broken_seis(void)
+ {
+-	return cpus_have_cap(ARM64_WORKAROUND_GICv3_BROKEN_SEIS);
++	return kvm_sptm_active || cpus_have_cap(ARM64_WORKAROUND_GICv3_BROKEN_SEIS);
+ }
+ 
+ void noinstr kvm_compute_ich_hcr_trap_bits(struct alt_instr *alt,
+diff --git c/arch/arm64/kvm/vgic/vgic.h i/arch/arm64/kvm/vgic/vgic.h
+index b71d486ae514..3e750932e5a5 100644
+--- c/arch/arm64/kvm/vgic/vgic.h
++++ i/arch/arm64/kvm/vgic/vgic.h
+@@ -74,10 +74,17 @@
+ void kvm_patch_ich_vtr_el2(struct alt_instr *alt,
+ 			   __le32 *origptr, __le32 *updptr, int nr_inst);
+ 
++extern u64 kvm_sptm_ich_vtr;
+ static inline u64 vgic_ich_vtr(void)
+ {
+ 	u64 vtr;
+ 
++	/* patched at boot from EL2 elsewhere; here only the monitor can read it */
++#ifndef __KVM_NVHE_HYPERVISOR__
++	if (kvm_sptm_active)
++		return kvm_sptm_ich_vtr;
++#endif
++
+ 	/* All non-RES0 bits are in the bottom 32bits */
+ 	asm volatile(ALTERNATIVE_CB("movz %0, #0\n"
+ 				    "movk %0, #0, lsl #16\n",
+diff --git c/drivers/firmware/aurora-apif-mmio.c i/drivers/firmware/aurora-apif-mmio.c
+index aa6ec65c6248..c01c3f2b97af 100644
+--- c/drivers/firmware/aurora-apif-mmio.c
++++ i/drivers/firmware/aurora-apif-mmio.c
+@@ -2,6 +2,8 @@
+ /* Aurora Platform Interface over Memory-Mapped I/O. */
+ #include <linux/device.h>
+ #include <linux/io.h>
++#include <linux/cpuhotplug.h>
++#include <linux/hrtimer.h>
+ #include <linux/kref.h>
+ #include <linux/module.h>
+ #include <linux/of.h>
+@@ -9,7 +11,10 @@
+ #include <linux/platform_device.h>
+ #include <linux/sizes.h>
+ #include <linux/slab.h>
++#include <linux/percpu.h>
++#include <asm/smp_plat.h>
+ #include <linux/spinlock.h>
++#include <linux/timekeeping.h>
+ #include <linux/soc/aurora/apif-mmio.h>
+ 
+ #define APIF_MAGIC 0x4f494d4d46495041ULL
+@@ -45,8 +50,191 @@ struct aurora_apif {
+ 	void __iomem *doorbell;
+ 	struct apif_batch *batch;
+ 	u32 max_ops;
++	const char *name;
+ };
+ 
++/* macho F33: a call that never comes back from the monitor or SPTM leaves its CPU at EL2 with IRQs masked, and every
++ * later APIF caller spins on the monitor's lock (guest.c g_apif_lock). Each CPU records the batch it rang; a pinned
++ * hrtimer on every online CPU reads the records of the others and names on the panel the first operation whose ret the
++ * monitor has not written yet (it writes ret after each op, apif.c gw64(opa + 56)). Any CPU still taking its timer
++ * reports. ret of an op that never ran stays APIF_RET_PENDING for the caller, it is not read without done.
++ */
++#define APIF_RET_PENDING 0xa9a9a9a9a9a9a9a9ULL
++#define APIF_WATCH_PERIOD_MS 250
++#define APIF_STUCK_MS 500
++struct apif_inflight {
++	struct apif_batch *batch;	/* NULL when idle */
++	const char *name;
++	u64 t0, seq;
++	u32 n;
++};
++static DEFINE_PER_CPU(struct apif_inflight, apif_inflight);
++static DEFINE_PER_CPU(struct hrtimer, apif_watch_timer);
++/* every timer run stamps its CPU: a core whose stamp stops is silent (IRQs masked at EL1, or held at EL2) */
++static DEFINE_PER_CPU(u64, apif_beat);
++static DEFINE_PER_CPU(u64, apif_silent_reported);
++#define APIF_SILENT_MS 1500
++/* monitor breadcrumb of another core (HVC 0x7504, monitor F33): x0 = stage | ec << 8, x1 sel, x2 a0, x3 cntpct at the
++ * stage, x4 exits, x5 cntpct now. An older monitor leaves x0 = 0x7504. */
++#define MACHO_HVC_WHERE 0x7504
++static void apif_ask_monitor(int cpu)
++{
++	register u64 x0 asm("x0") = MACHO_HVC_WHERE;
++	register u64 x1 asm("x1") = cpu_logical_map(cpu);
++	register u64 x2 asm("x2"), x3 asm("x3"), x4 asm("x4"), x5 asm("x5");
++
++	asm volatile("hvc #0" : "+r"(x0), "+r"(x1), "=r"(x2), "=r"(x3), "=r"(x4), "=r"(x5) : : "x6", "x7", "memory");
++	if (x0 == MACHO_HVC_WHERE) {
++		pr_emerg("CPU-SILENT cpu%d monitor has no breadcrumb call\n", cpu);
++		return;
++	}
++	/* stage 0 back in the guest, 1 waiting for the APIF lock, 2 in an APIF batch, 3 in SPTM for an op, 9 terminated */
++	pr_emerg("CPU-SILENT cpu%d EL2 stage %llu ec %#llx sel %llx a0 %llx since %llu us, exits %llu\n", cpu, x0 & 0xff,
++		 (x0 >> 8) & 0x3f, x1, x2, x5 > x3 ? (x5 - x3) * 1000000 / (read_sysreg(cntfrq_el0) ?: 1) : 0, x4);
++}
++/* F34: the T8110 DART error block of the DART a stuck table-3 op names (monitor HVC 0x7505, read-only map of +0x8000; XNU reads
++ * it directly in XNU's DART interrupt handler). A translation fault shows as a non-zero status word with the address. */
++#define MACHO_HVC_DARTERR 0x7505
++static void apif_ask_dart(u64 dart_id)
++{
++	for (u64 inst = 0; inst < 2; inst++) {
++		register u64 x0 asm("x0") = MACHO_HVC_DARTERR;
++		register u64 x1 asm("x1") = dart_id;
++		register u64 x2 asm("x2") = inst;
++		register u64 x3 asm("x3"), x4 asm("x4");
++
++		asm volatile("hvc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "=r"(x3), "=r"(x4) : : "x5", "x6", "x7", "memory");
++		if (x0 == MACHO_HVC_DARTERR) {
++			pr_emerg("DART-ERR dart %llu: monitor has no error-block call\n", dart_id);
++			return;
++		}
++		if (x0 == ~0ULL)
++			pr_emerg("DART-ERR dart %llu inst %llu: unit, reg or RO map missing\n", dart_id, inst);
++		else if (!x0)
++			pr_emerg("DART-ERR dart %llu inst %llu: hw %llx nsids %llu, no SID faults (exception bitmap 0)\n", dart_id, inst, x4 & 0xffff, x4 >> 16);
++		else
++			pr_emerg("DART-ERR dart %llu inst %llu: hw %llx nsids %llu, fault mask %llx, sid %llu status %llx addr %llx (status code bits 3:0, write bit 8)\n",
++				 dart_id, inst, x4 & 0xffff, x4 >> 16, x0, x3, x1, x2);
++	}
++}
++/* F34: the ATC2 (usb-drd2 fabric) state XNU restores after a power-up: PS ATC2_COMMON (pmgr afc page +0x3e0, read from the KC
++ * axi2af record 2: map 0, PS 0x3e0, bridge base 0x390000000) and the axi2af bridge words +0x104/+0x108 (bit 0 set by
++ * XNU's axi2af restore). Both pages are 1:1 in the guest (platform_io, Table B). The bridge is read
++ * only when the PS actual state is 0xf, as XNU does, so the report itself cannot hang on a gated block. */
++static void __iomem *apif_atc2_ps, *apif_atc2_axi;
++static void apif_atc2_report(void)
++{
++	u32 ps, b0 = 0, b1 = 0;
++
++	if (!apif_atc2_ps)
++		apif_atc2_ps = ioremap(0x5028003e0ULL, 4);
++	if (!apif_atc2_axi)
++		apif_atc2_axi = ioremap(0x390000100ULL, 0x10);
++	if (!apif_atc2_ps || !apif_atc2_axi) {
++		pr_emerg("ATC2: no mapping for the PS or the axi2af bridge\n");
++		return;
++	}
++	ps = readl(apif_atc2_ps);
++	if (((ps >> 4) & 0xf) == 0xf) {
++		b0 = readl(apif_atc2_axi + 4);
++		b1 = readl(apif_atc2_axi + 8);
++		pr_emerg("ATC2: ps %#x on, axi2af bridge +0x104 %#x +0x108 %#x (XNU keeps bit 0 set)\n", ps, b0, b1);
++	} else {
++		pr_emerg("ATC2: ps %#x, actual state %u, bridge not read\n", ps, (ps >> 4) & 0xf);
++	}
++}
++static atomic64_t apif_seq = ATOMIC64_INIT(0);
++static atomic64_t apif_reported_seq = ATOMIC64_INIT(0);
++static atomic64_t apif_reported_at = ATOMIC64_INIT(0);
++static u64 apif_slowest_ms;
++
++static void apif_watch_cpu(int cpu, u64 now)
++{
++	struct apif_inflight *f = per_cpu_ptr(&apif_inflight, cpu);
++	struct apif_batch *b = READ_ONCE(f->batch);
++	u64 seq = READ_ONCE(f->seq), t0 = READ_ONCE(f->t0), age;
++	u32 n = READ_ONCE(f->n), i;
++	s64 last;
++
++	if (!b || now < t0)
++		return;
++	age = (now - t0) / NSEC_PER_MSEC;
++	if (age < APIF_STUCK_MS)
++		return;
++	/* once per stall, then every 5 s with the new age */
++	last = atomic64_read(&apif_reported_at);
++	if (atomic64_read(&apif_reported_seq) == seq && age < (u64)last + 5000)
++		return;
++	if (atomic64_cmpxchg(&apif_reported_at, last, age) != last)
++		return;
++	atomic64_set(&apif_reported_seq, seq);
++	for (i = 0; i < n; i++)
++		if (READ_ONCE(b->ops[i].ret) == APIF_RET_PENDING)
++			break;
++	if (i == n) {
++		pr_emerg("APIF-STUCK cpu%d %s age %llu ms: all %u ops returned, status %d done %u (stuck after the monitor wrote ret)\n",
++			 cpu, f->name, age, n, READ_ONCE(b->status), READ_ONCE(b->done));
++		return;
++	}
++	pr_emerg("APIF-STUCK cpu%d %s age %llu ms op %u/%u sel %llx a0 %llx a1 %llx a2 %llx a3 %llx a4 %llx a5 %llx\n",
++		 cpu, f->name, age, i, n, READ_ONCE(b->ops[i].selector), READ_ONCE(b->ops[i].arg[0]),
++		 READ_ONCE(b->ops[i].arg[1]), READ_ONCE(b->ops[i].arg[2]), READ_ONCE(b->ops[i].arg[3]),
++		 READ_ONCE(b->ops[i].arg[4]), READ_ONCE(b->ops[i].arg[5]));
++	if (i)
++		pr_emerg("APIF-STUCK cpu%d previous op %u sel %llx ret %llx\n", cpu, i - 1,
++			 READ_ONCE(b->ops[i - 1].selector), READ_ONCE(b->ops[i - 1].ret));
++	if ((READ_ONCE(b->ops[i].selector) >> 32) == 3) {  /* table 3: T8110 DART, a0 is the dart id */
++		apif_ask_dart(READ_ONCE(b->ops[i].arg[0]));
++		apif_atc2_report();
++	}
++}
++
++static enum hrtimer_restart apif_watch(struct hrtimer *t)
++{
++	u64 now = ktime_get_mono_fast_ns();
++	int cpu;
++
++	this_cpu_write(apif_beat, now);
++	for_each_online_cpu(cpu) {
++		u64 beat;
++
++		if (cpu == smp_processor_id())
++			continue;
++		apif_watch_cpu(cpu, now);
++		beat = READ_ONCE(*per_cpu_ptr(&apif_beat, cpu));
++		if (!beat || now < beat || (now - beat) / NSEC_PER_MSEC < APIF_SILENT_MS)
++			continue;
++		/* one report per silence and core; the first live core to see it writes */
++		{
++			u64 old = READ_ONCE(*per_cpu_ptr(&apif_silent_reported, cpu));
++
++			if (old == beat || cmpxchg(per_cpu_ptr(&apif_silent_reported, cpu), old, beat) != old)
++				continue;
++		}
++		pr_emerg("CPU-SILENT cpu%d no timer for %llu ms, APIF %s\n", cpu, (now - beat) / NSEC_PER_MSEC,
++			 READ_ONCE(per_cpu_ptr(&apif_inflight, cpu)->batch) ? "in flight (see APIF-STUCK)" : "idle");
++		apif_ask_monitor(cpu);
++	}
++	hrtimer_forward_now(t, ms_to_ktime(APIF_WATCH_PERIOD_MS));
++	return HRTIMER_RESTART;
++}
++
++static int apif_watch_online(unsigned int cpu)
++{
++	struct hrtimer *t = this_cpu_ptr(&apif_watch_timer);
++
++	hrtimer_setup(t, apif_watch, CLOCK_MONOTONIC, HRTIMER_MODE_REL_PINNED);
++	hrtimer_start(t, ms_to_ktime(APIF_WATCH_PERIOD_MS), HRTIMER_MODE_REL_PINNED);
++	return 0;
++}
++
++static int apif_watch_offline(unsigned int cpu)
++{
++	hrtimer_cancel(this_cpu_ptr(&apif_watch_timer));
++	this_cpu_write(apif_beat, 0);
++	return 0;
++}
++
+ static struct platform_driver apif_driver;
+ static_assert(sizeof(struct apif_batch) == 16);
+ static_assert(sizeof(struct aurora_apif_op) == 64);
+@@ -97,7 +285,31 @@ int aurora_apif_submit(struct aurora_apif *apif, struct aurora_apif_op *ops,
+ 		apif->batch->status = -EINPROGRESS;
+ 		apif->batch->done = 0;
+ 		memcpy(apif->batch->ops, ops + total, n * sizeof(*ops));
++		for (u32 i = 0; i < n; i++)
++			apif->batch->ops[i].ret = APIF_RET_PENDING;
++		{
++			struct apif_inflight *f = this_cpu_ptr(&apif_inflight);
++
++			WRITE_ONCE(f->name, apif->name);
++			WRITE_ONCE(f->n, n);
++			WRITE_ONCE(f->seq, atomic64_inc_return(&apif_seq));
++			WRITE_ONCE(f->t0, ktime_get_mono_fast_ns());
++			smp_wmb();
++			WRITE_ONCE(f->batch, apif->batch);
++		}
+ 		apif_ring(apif);
++		{
++			struct apif_inflight *f = this_cpu_ptr(&apif_inflight);
++			u64 ms = (ktime_get_mono_fast_ns() - f->t0) / NSEC_PER_MSEC;
++
++			WRITE_ONCE(f->batch, NULL);
++			/* a long call that did come back: the panel names it once per new maximum */
++			if (ms >= 50 && ms > READ_ONCE(apif_slowest_ms)) {
++				WRITE_ONCE(apif_slowest_ms, ms);
++				pr_emerg("APIF-SLOW %s %llu ms for %u ops, first sel %llx a0 %llx\n", apif->name, ms, n,
++					 apif->batch->ops[0].selector, apif->batch->ops[0].arg[0]);
++			}
++		}
+ 		reported = READ_ONCE(apif->batch->done);
+ 		if (reported > n) {
+ 			ret = -EIO;
+@@ -189,6 +401,7 @@ struct aurora_apif *aurora_apif_get(struct device *dev)
+ 		goto remove_link;
+ 	}
+ 	apif->max_ops = provider->max_ops;
++	apif->name = dev_name(dev);
+ 	apif->doorbell = provider->regs + APIF_REG_DOORBELL;
+ 	apif->live = true;
+ 	kref_get(&apif->refs);
+@@ -233,6 +446,18 @@ static int apif_probe(struct platform_device *pdev)
+ 		return -EINVAL;
+ 	provider->max_ops = min_t(u64, max_ops, APIF_BATCH_MAX);
+ 	platform_set_drvdata(pdev, provider);
++	{
++		static bool watching;
++		int ret;
++
++		if (!watching) {
++			ret = cpuhp_setup_state(CPUHP_AP_ONLINE_DYN, "aurora/apif-watch:online",
++						apif_watch_online, apif_watch_offline);
++			watching = ret >= 0;
++			if (!watching)
++				dev_warn(&pdev->dev, "APIF watch not started: %d\n", ret);
++		}
++	}
+ 	return 0;
+ }
+ 
+diff --git c/drivers/gpu/drm/apple/iomfb_v26_6_desktop.c i/drivers/gpu/drm/apple/iomfb_v26_6_desktop.c
+index b5e71329eb9c..b98635addda6 100644
+--- c/drivers/gpu/drm/apple/iomfb_v26_6_desktop.c
++++ i/drivers/gpu/drm/apple/iomfb_v26_6_desktop.c
+@@ -247,6 +247,7 @@ static const struct dcp_cb_min_v26_6_desktop cb_min[IOMFB_MAX_CB] = {
+ 	[134] = CB_MIN(0, sizeof(u32)),
+ 	[201] = CB_MIN(sizeof(struct dcp_map_buf_req),
+ 		       sizeof(struct DCP_FW_NAME(dcp_map_buf_resp))),
++	[202] = CB_MIN(sizeof(struct dcp_unmap_buf_req_v26_6), 0),
+ 	[206] = CB_MIN(0, sizeof(u8)),
+ 	[207] = CB_MIN(0, sizeof(u8)),
+ 	[208] = CB_MIN(0, 0),
+@@ -264,6 +265,7 @@ static const struct dcp_cb_min_v26_6_desktop cb_min[IOMFB_MAX_CB] = {
+ 	[415] = CB_MIN(0, sizeof(u8)),
+ 	[451] = CB_MIN(sizeof(struct dcp_allocate_buffer_req),
+ 		       sizeof(struct dcp_allocate_buffer_resp)),
++	[454] = CB_MIN(sizeof(u32), sizeof(u32)),
+ 	[552] = CB_MIN(0, sizeof(u8)),
+ 	[561] = CB_MIN(0, sizeof(u8)),
+ 	[563] = CB_MIN(0, sizeof(u8)),
+diff --git c/drivers/gpu/drm/asahi/g17/data_segment.rs i/drivers/gpu/drm/asahi/g17/data_segment.rs
+index 02bcc66de8f5..5cb3c3dd4d0a 100644
+--- c/drivers/gpu/drm/asahi/g17/data_segment.rs
++++ i/drivers/gpu/drm/asahi/g17/data_segment.rs
+@@ -24,7 +24,9 @@
+ 
+ /// `size` bytes at `offset` of the firmware's data segment, mapped write-back.
+ pub(super) struct DataSegmentLog {
+-    mem: io::mem::Mem,
++    mem: Option<io::mem::Mem>,
++    /// Under SPTM the CPU cannot reach `fw-data`; RTKit reads zeros from here instead.
++    shadow: KVVec<u8>,
+     offset: usize,
+     size: usize,
+ }
+@@ -39,16 +41,34 @@ pub(super) fn map(dev: &device::Device, iova: usize, size: usize) -> Result<Self
+         if offset.checked_add(size).ok_or(EINVAL)? > res.size().try_into()? {
+             return Err(EINVAL);
+         }
++        if node.parse_phandle(c_str!("aurora,apif"), 0).is_some() {
++            let mut shadow = KVVec::with_capacity(size, GFP_KERNEL)?;
++            shadow.resize(size, 0, GFP_KERNEL)?;
++            return Ok(Self {
++                mem: None,
++                shadow,
++                offset: 0,
++                size,
++            });
++        }
+         // SAFETY: The boot loader reserved this RAM for the loaded GPU firmware, which keeps
+         // it until reboot; only the requested subrange is exposed.
+         let mem = unsafe { io::mem::Mem::try_new(res, io::mem::MemFlag::WB.into())? };
+-        Ok(Self { mem, offset, size })
++        Ok(Self {
++            mem: Some(mem),
++            shadow: KVVec::new(),
++            offset,
++            size,
++        })
+     }
+ 
+     /// The CPU view of the buffer.
+     pub(super) fn buf(&mut self) -> Result<IoSysMap<'_, Region>> {
+-        // SAFETY: map() checked that the range lies inside the mapping.
+-        let base = unsafe { self.mem.ptr().add(self.offset) };
++        let base = match &self.mem {
++            // SAFETY: map() checked that the range lies inside the mapping.
++            Some(mem) => unsafe { mem.ptr().add(self.offset) },
++            None => self.shadow.as_mut_ptr(),
++        };
+         let ptr = Region::<0>::ptr_try_from_raw_parts_mut(base, self.size)?;
+         // SAFETY: The range is mapped RAM for as long as this borrow of the mapping.
+         Ok(IoSysMap::Sys(unsafe { io::SysMem::new(ptr) }))
+diff --git c/drivers/gpu/drm/asahi/g17/mod.rs i/drivers/gpu/drm/asahi/g17/mod.rs
+index c63d5a325831..c1ba51f3f05e 100644
+--- c/drivers/gpu/drm/asahi/g17/mod.rs
++++ i/drivers/gpu/drm/asahi/g17/mod.rs
+@@ -1222,7 +1222,19 @@ fn firmware_variant(
+         let version = Self::os_firmware_version(dev);
+         if let Some(build) = builds.iter().find(|build| Some(build.os_version) == version) {
+             dev_info!(dev.as_ref(), "GPU firmware: {}\n", build.name);
+-            Self::identify_image(dev, build).map_err(|_| ENODEV)?;
++            // Under SPTM the guest cannot read the loaded image: fw-data is protected I/O, and the
++            // frame type of fw-text in a macho boot is unknown, so its map is not attempted.
++            // The version property alone selects the build here.
++            let on_sptm = dev
++                .as_ref()
++                .as_ref()
++                .of_node()
++                .is_some_and(|node| node.parse_phandle(c_str!("aurora,apif"), 0).is_some());
++            if on_sptm {
++                dev_warn!(dev.as_ref(), "GPU firmware image not measured under SPTM\n");
++            } else {
++                Self::identify_image(dev, build).map_err(|_| ENODEV)?;
++            }
+             return Ok(build.variant);
+         }
+         dev_err!(
+@@ -1393,7 +1405,10 @@ fn boot(
+         let ack = shared.variant.init_ack;
+         session.primary.init(session.init.root_va(Role::Primary)?, ack)?;
+         if ack == fw::variant::InitAck::Status {
+-            Self::wait_for_init_accepted(dev, &session.init, &session.primary)?;
++            if let Err(e) = Self::wait_for_init_accepted(dev, &session.init, &session.primary) {
++                let _ = session.bridge.regs.log_sapt_status();
++                return Err(e);
++            }
+         }
+         if let Some(secondary) = session.secondary.as_mut() {
+             secondary.init(session.init.root_va(Role::Secondary)?, ack)?;
+@@ -1404,7 +1419,12 @@ fn boot(
+                 secondary.notify(MSG_POWER_ON_DONE)?;
+             }
+         }
+-        Self::wait_for_opening(dev, &session.init, &session.primary, session.secondary.as_ref())?;
++        if let Err(e) =
++            Self::wait_for_opening(dev, &session.init, &session.primary, session.secondary.as_ref())
++        {
++            let _ = session.bridge.regs.log_sapt_status();
++            return Err(e);
++        }
+         session
+             .uat
+             .activate_render_context(&session._render_global)?;
+diff --git c/drivers/gpu/drm/asahi/mmu.rs i/drivers/gpu/drm/asahi/mmu.rs
+index 3522010949e3..1737292b475d 100644
+--- c/drivers/gpu/drm/asahi/mmu.rs
++++ i/drivers/gpu/drm/asahi/mmu.rs
+@@ -118,6 +118,14 @@
+ mod ppl;
+ mod residency;
+ mod shared;
++mod sptm;
++pub(crate) use sptm::State as SptmState;
++/// `MAP_BEGIN` option bits.
++pub(crate) mod sptm_opt {
++    pub(crate) use super::sptm::{
++        OPT_ATTR_DEV, OPT_ATTR_UNCACHED, OPT_FW_R, OPT_FW_W, OPT_HW_R, OPT_HW_W,
++    };
++}
+ pub(crate) use bind::PreparedUserBindBatch;
+ pub(crate) use lifetime::VmJobGuard;
+ pub(crate) use residency::{Gate as ResidencyGate, VmShrinker};
+@@ -1003,6 +1011,8 @@ pub(crate) struct Vm {
+     gpuvm: ARef<gpuvm::GpuVm<VmInner>>,
+     dummy_obj: ARef<gem::Object>,
+     binding: Arc<Mutex<VmBinding>>,
++    /// This address space as the resident SPTM sees it.
++    sptm_state: Option<Arc<SptmState>>,
+ }
+ no_debug!(Vm);
+ 
+@@ -1019,6 +1029,9 @@ pub(crate) struct ExecutionContext {
+ struct ExecutionRoot {
+     released: AtomicBool,
+     inner: Arc<UatInner>,
++    /// On the SPTM backend: the state that owns this context. A state has one context and a root
++    /// one state, so every queue of a `Vm` shares it; the last release clears the slot.
++    sptm: Option<Arc<SptmState>>,
+     id: u8,
+     generation: u8,
+     low: u64,
+@@ -1059,6 +1072,21 @@ fn release(&self) {
+             return;
+         }
+         let id = usize::from(self.id);
++        if let Some(state) = &self.sptm {
++            let mut inner = self.inner.lock();
++            inner.sptm_ctx_users[id] = inner.sptm_ctx_users[id].saturating_sub(1);
++            if inner.sptm_ctx_users[id] != 0 {
++                return;
++            }
++            let roots = &inner.ttbs()[id];
++            roots.ttb0.store(0, Ordering::Release);
++            roots.ttb1.store(0, Ordering::Release);
++            // An unremoved slot stays claimed: reusing it would be a terminal violation.
++            if state.remove_ctx().is_ok() {
++                inner.execution_contexts &= !(1u64 << id);
++            }
++            return;
++        }
+         let release = {
+             let inner = self.inner.lock();
+             inner.handoff_lock();
+@@ -1107,6 +1135,13 @@ impl slotalloc::SlotItem for SlotInner {
+ #[derive(Debug)]
+ pub(crate) struct VmBind(Vm, u32);
+ 
++impl Vm {
++    /// The SPTM state object of this address space, on the SPTM backend.
++    pub(crate) fn sptm_state(&self) -> Option<&Arc<SptmState>> {
++        self.sptm_state.as_ref()
++    }
++}
++
+ impl VmBind {
+     /// Returns the slot that this `Vm` is bound to.
+     pub(crate) fn slot(&self) -> u32 {
+@@ -1358,6 +1393,8 @@ pub(crate) fn timestamp_vmap(&self) -> Result<TimestampVmap> {
+         let mut mutated = false;
+         let result = (|| {
+             if self.0.uat_inner.firmware == UatFirmware::Handoff
++                // SPTM has no permission update, the change would reach only the shadow.
++                || self.0.uat_inner.sptm.is_some()
+                 || prefix == 0
+                 || prefix > self.size()
+                 || (prefix | self.size()) & UAT_PGMSK != 0
+@@ -1660,6 +1697,8 @@ fn drop(&mut self) {
+ struct UatShared {
+     kernel_ttb1: u64,
+     execution_contexts: u64,
++    /// Open execution contexts per TTBAT slot on the SPTM backend.
++    sptm_ctx_users: [u32; UAT_NUM_CTX],
+     context_generations: [u8; UAT_NUM_CTX],
+     /// Firmware-observed incarnations of application roots installed by the VM slot allocator.
+     binding_generations: [u64; UAT_NUM_CTX],
+@@ -1748,6 +1787,8 @@ struct UatInner {
+     quirks: UatQuirks,
+     /// No-map reserved regions holding firmware tables (`UatQuirks::reserved_tables`).
+     reserved: Option<Arc<pgtable::ReservedTables>>,
++    /// Under a resident SPTM: page tables and TTBAT slots are reached only through its table 7.
++    sptm: Option<Arc<sptm::Client>>,
+     #[pin]
+     shared: Mutex<UatShared>,
+     #[pin]
+@@ -2071,6 +2112,15 @@ fn new(
+             }
+             page_table
+         };
++        let sptm_state = match &uat_inner.sptm {
++            Some(client) if is_kernel => Some(sptm::State::global(client)?),
++            Some(client) => Some(sptm::State::new(client)?),
++            None => None,
++        };
++        let page_table = match &sptm_state {
++            Some(state) => page_table.with_sptm(state.clone()),
++            None => page_table,
++        };
+ 
+         let (va_range, gpuvm_range) = if is_kernel {
+             (geometry.kernel_range(), kernel_range.clone())
+@@ -2123,7 +2173,6 @@ fn new(
+             },
+         )?;
+         let gpuvm = ARef::from(&*unique_gpuvm);
+-
+         Ok(Vm {
+             dev: dev.as_ref().as_ref().into(),
+             id,
+@@ -2136,6 +2185,7 @@ fn new(
+             status: None,
+             dummy_obj: dummy_obj.gem.clone(),
+             binding,
++            sptm_state,
+         })
+     }
+ 
+@@ -3012,6 +3062,7 @@ fn new_adopted_inner(
+                     UatShared {
+                         kernel_ttb1: regions.kernel_root,
+                         execution_contexts: !EXECUTION_CONTEXT_MASK,
++                        sptm_ctx_users: [0; UAT_NUM_CTX],
+                         context_generations: [0; UAT_NUM_CTX],
+                         binding_generations: [0; UAT_NUM_CTX],
+                         binding_published: [false; UAT_NUM_CTX],
+@@ -3119,6 +3170,26 @@ fn map_region(
+         Ok(UatRegion { base, map })
+     }
+ 
++    /// A zeroed private page standing in for a region only SPTM may write.
++    fn shadow_region(size: usize) -> Result<UatRegion> {
++        if size > UAT_PGSZ {
++            return Err(EINVAL);
++        }
++        let base = kernel::page::Page::into_phys(kernel::page::Page::alloc_page(GFP_KERNEL | __GFP_ZERO)?);
++        // SAFETY: All-zero is a valid `struct resource` (no name, parent or children).
++        let mut raw: kernel::bindings::resource = unsafe { core::mem::zeroed() };
++        raw.start = base;
++        raw.end = base + UAT_PGSZ as PhysicalAddr - 1;
++        raw.flags = kernel::bindings::IORESOURCE_MEM as _;
++        // SAFETY: `Resource` is a transparent wrapper around `Opaque<bindings::resource>`, and
++        // `raw` describes the page allocated above.
++        let res: io::resource::Resource =
++            unsafe { core::mem::transmute(kernel::types::Opaque::new(raw)) };
++        // SAFETY: The page is private to this region and never freed.
++        let map = unsafe { io::mem::Mem::try_new(res, io::mem::MemFlag::WB.into()) }?;
++        Ok(UatRegion { base, map })
++    }
++
+     /// Returns a reference to the global kernel (upper half) `Vm`
+     pub(crate) fn kernel_vm(&self) -> &Vm {
+         &self.kernel_vm
+@@ -3174,6 +3245,10 @@ pub(crate) fn ttb_base(&self) -> u64 {
+ 
+     /// Binds a `Vm` to a slot, preferring the last used one.
+     pub(crate) fn bind(&self, vm: &Vm) -> Result<VmBind> {
++        // G17 runs on execution contexts; a state cannot hold a second, bind-slot context.
++        if self.inner.sptm.is_some() {
++            return Err(ENOTSUPP);
++        }
+         self.inner.check_m4()?;
+         let mut binding = vm.binding.lock();
+         self.inner.check_m4()?;
+@@ -3288,16 +3363,28 @@ pub(crate) fn new_execution_context(&self, vm: &Vm) -> Result<Arc<ExecutionConte
+                 return Err(EINVAL);
+             }
+         }
++        let sptm = vm.sptm_state().cloned();
+         let (id, generation) = {
+             let mut inner = self.inner.lock();
+-            let free = !inner.execution_contexts & EXECUTION_CONTEXT_MASK;
+-            if free == 0 {
+-                return Err(ENOSPC);
++            let shared = sptm.as_ref().and_then(|state| state.ctx());
++            if let Some(id) = shared {
++                let id = usize::from(id);
++                inner.sptm_ctx_users[id] += 1;
++                (id, inner.context_generations[id])
++            } else {
++                let free = !inner.execution_contexts & EXECUTION_CONTEXT_MASK;
++                if free == 0 {
++                    return Err(ENOSPC);
++                }
++                let id = free.trailing_zeros() as usize;
++                if let Some(state) = &sptm {
++                    state.set_ctx(id as u16)?;
++                    inner.sptm_ctx_users[id] = 1;
++                }
++                inner.execution_contexts |= 1u64 << id;
++                inner.context_generations[id] = inner.context_generations[id].wrapping_add(1);
++                (id, inner.context_generations[id])
+             }
+-            let id = free.trailing_zeros() as usize;
+-            inner.execution_contexts |= 1u64 << id;
+-            inner.context_generations[id] = inner.context_generations[id].wrapping_add(1);
+-            (id, inner.context_generations[id])
+         };
+         let low = tagged_root(vm.ttb(), id);
+         let high = tagged_root(self.kernel_vm.ttb(), id);
+@@ -3308,6 +3395,7 @@ pub(crate) fn new_execution_context(&self, vm: &Vm) -> Result<Arc<ExecutionConte
+                 root: ExecutionRoot {
+                     released: AtomicBool::new(false),
+                     inner: self.inner.clone(),
++                    sptm: sptm.clone(),
+                     id: id as u8,
+                     generation,
+                     low,
+@@ -3320,6 +3408,12 @@ pub(crate) fn new_execution_context(&self, vm: &Vm) -> Result<Arc<ExecutionConte
+         {
+             let inner = self.inner.lock();
+             let roots = &inner.ttbs()[id];
++            if sptm.is_some() {
++                // The shadow words serve `is_current`; SPTM already holds the real slot.
++                roots.ttb0.store(low, Ordering::Release);
++                roots.ttb1.store(high, Ordering::Release);
++                return Ok(context);
++            }
+             if roots.ttb0.load(Ordering::Acquire) != 0 || roots.ttb1.load(Ordering::Acquire) != 0 {
+                 return Err(EBUSY);
+             }
+@@ -3460,6 +3554,10 @@ pub(crate) fn activate_render_context(&self, vm: &Vm) -> Result {
+         inner.publish_slot(KERNEL_ALIAS_CTX);
+         inner.handoff_unlock();
+         core::mem::drop(inner);
++        // Under SPTM the slot in the shadow table does nothing: the hardware context comes from SET_CTX_ID.
++        if let Some(state) = vm.sptm_state() {
++            state.set_ctx(KERNEL_ALIAS_CTX as u16)?;
++        }
+         mem::sync();
+         mem::tlbi_asid(KERNEL_ALIAS_CTX as u8);
+         mem::sync();
+@@ -3473,9 +3571,21 @@ fn make_inner(
+         firmware: UatFirmware,
+         quirks: UatQuirks,
+         reserved: Option<Arc<pgtable::ReservedTables>>,
++        sptm_client: Option<Arc<sptm::Client>>,
+     ) -> Result<Arc<UatInner>> {
+-        let handoff_rgn = Self::map_region(dev.as_ref().as_ref(), c"handoff", HANDOFF_SIZE, true)?;
+-        let ttbs_rgn = Self::map_region(dev.as_ref().as_ref(), c"ttbs", SLOTS_SIZE, true)?;
++        let (handoff_rgn, ttbs_rgn) = if sptm_client.is_some() {
++            // Protected I/O under SPTM, which also owns their contents. The driver keeps its
++            // bookkeeping in private pages of the same layout.
++            (
++                Self::shadow_region(HANDOFF_SIZE)?,
++                Self::shadow_region(SLOTS_SIZE)?,
++            )
++        } else {
++            (
++                Self::map_region(dev.as_ref().as_ref(), c"handoff", HANDOFF_SIZE, true)?,
++                Self::map_region(dev.as_ref().as_ref(), c"ttbs", SLOTS_SIZE, true)?,
++            )
++        };
+ 
+         // SAFETY: The Handoff struct layout matches the firmware's view of memory at this address,
+         // and the region is at least large enough per the size specified above.
+@@ -3489,9 +3599,10 @@ fn make_inner(
+                 firmware,
+                 m4_adopted: false,
+                 failed: AtomicBool::new(false),
+-                clean_poc: quirks.clean_tables,
++                clean_poc: quirks.clean_tables && sptm_client.is_none(),
+                 quirks,
+                 reserved,
++                sptm: sptm_client,
+                 handoff_flush <- pin_init::pin_init_array_from_fn(|i| {
+                     new_mutex!(HandoffFlush(&handoff.flush[i]), "handoff_flush")
+                 }),
+@@ -3499,6 +3610,7 @@ fn make_inner(
+                     UatShared {
+                         kernel_ttb1: 0,
+                         execution_contexts: !EXECUTION_CONTEXT_MASK,
++                        sptm_ctx_users: [0; UAT_NUM_CTX],
+                         context_generations: [0; UAT_NUM_CTX],
+                         binding_generations: [0; UAT_NUM_CTX],
+                         binding_published: [false; UAT_NUM_CTX],
+@@ -3529,7 +3641,8 @@ pub(crate) fn new(
+ 
+         mem::set_page_tlbi(quirks.page_tlbi);
+         let of_node = dev.as_ref().as_ref().of_node().ok_or(EINVAL)?;
+-        let reserved = if quirks.reserved_tables {
++        let sptm_client = sptm::Client::probe(dev.as_ref().as_ref(), geometry.ias)?;
++        let reserved = if quirks.reserved_tables && sptm_client.is_none() {
+             let mut tables = pgtable::ReservedTables::new();
+             for name in [c"pagetables", c"l2-pagetables"] {
+                 let res = of_node.reserved_mem_region_to_resource_byname(name)?;
+@@ -3542,11 +3655,17 @@ pub(crate) fn new(
+             None
+         };
+ 
+-        let inner = Self::make_inner(dev.clone(), firmware, quirks, reserved)?;
++        let on_sptm = sptm_client.is_some();
++        let inner = Self::make_inner(dev.clone(), firmware, quirks, reserved, sptm_client)?;
+ 
+         let res = of_node.reserved_mem_region_to_resource_byname(c_str!("pagetables"))?;
+-        let ttb1 = res.start();
+         let ttb1size: usize = res.size().try_into()?;
++        let ttb1 = if on_sptm {
++            // The firmware's root stays in its protected range. This one is only a shadow.
++            kernel::page::Page::into_phys(kernel::page::Page::alloc_page(GFP_KERNEL | __GFP_ZERO)?)
++        } else {
++            res.start()
++        };
+ 
+         let (pagetables_size, secondary_ttb1) = match firmware {
+             UatFirmware::Handoff => (PAGETABLES_SIZE, None),
+@@ -3607,7 +3726,7 @@ pub(crate) fn new(
+         inner.secondary_ttb1 = secondary_ttb1;
+ 
+         inner.handoff().init(firmware, quirks.handoff_slot)?;
+-        if quirks.clean_tables {
++        if quirks.clean_tables && !on_sptm {
+             pgtable::clean_poc(inner.handoff() as *const Handoff as *const u8, HANDOFF_SIZE);
+             pgtable::poc_barrier();
+         }
+@@ -3635,7 +3754,7 @@ pub(crate) fn new(
+                 .ttb1
+                 .store(tagged_root(ttb1, KERNEL_ALIAS_CTX), Ordering::SeqCst);
+         }
+-        if quirks.clean_tables {
++        if quirks.clean_tables && !on_sptm {
+             pgtable::clean_poc(ttbs.as_ptr() as *const u8, SLOTS_SIZE);
+             pgtable::poc_barrier();
+         }
+@@ -3644,6 +3763,14 @@ pub(crate) fn new(
+ 
+         core::mem::drop(inner);
+ 
++        if on_sptm {
++            // Context 0 holds the kernel lower half. macOS leaves this slot alone (the only
++            // caller of SET_CTX_ID allocates from 1), so whether the firmware reads it from
++            // here is unknown: log first, it is the most likely place to stop.
++            dev_info!(dev.as_ref(), "UAT: SPTM backend: publishing context 0\n");
++            uat.kernel_lower_vm.sptm_state().ok_or(EINVAL)?.set_ctx(0)?;
++        }
++
+         dev_info!(dev.as_ref(), "MMU: initialized\n");
+ 
+         Ok(uat)
+diff --git c/drivers/gpu/drm/asahi/mmu/sptm.rs i/drivers/gpu/drm/asahi/mmu/sptm.rs
+new file mode 100644
+index 000000000000..88aa05e75553
+--- /dev/null
++++ i/drivers/gpu/drm/asahi/mmu/sptm.rs
+@@ -0,0 +1,532 @@
++// SPDX-License-Identifier: GPL-2.0-only OR MIT
++
++//! UAT backend for a guest under the resident SPTM, over APIF.
++//!
++//! Same shape as `apple-dart-apif.c`: the guest builds native SPTM calls, the monitor forwards
++//! them unchanged. Linux cannot reach the real tables: table frames are XNU_IOMMU (type 24), and
++//! the TTBAT, the shared L2 and the handoff page are protected I/O ranges (type 27).
++//!
++//! Selectors are table 7 of the SPTM:
++//!  0 INIT_STATE(state, root0, root1)      1 DESTROY_STATE(state)
++//!  2 MAP_TABLE(state, va, level, table)   3 UNMAP_TABLE(state, va, level)
++//!  4 MAP_BEGIN(state, va, segs, n, opts)  5 MAP_CONTINUE(state)
++//!  6 PREPARE_FW_UNMAP_BEGIN               7 PREPARE_FW_UNMAP_CONTINUE (inactive here)
++//!  8 UNMAP_BEGIN(state, segs, n)          9 UNMAP_CONTINUE(state)
++//! 10 SET_CTX_ID(state, ctx)              11 REMOVE_CTX_ID(state)
++//! 12 GET_INFO(selector)
++//!
++//! Rules of the firmware; a breach is a terminal SPTM violation, not an error return:
++//!  - one call at a time per state object (its guard byte), hence [`State::inner`];
++//!  - a table can be linked once (`prev_refcnt` must be 0), so tables are never shared;
++//!  - a root belongs to one state, and a state to one context;
++//!  - mapping over a valid leaf, or unmapping a free one, is fatal, so `pgtable.rs` passes only
++//!    ranges its shadow tree says are free or present.
++//!
++//! Nothing here has run on hardware.
++
++use super::*;
++use kernel::bindings;
++use core::pin::Pin;
++use kernel::error::to_result;
++use pin_init::{pin_data, pinned_drop};
++use kernel::page::Page;
++
++const TABLE_UAT: u64 = 7;
++const IOMMU_ID_UAT: u64 = 3;
++
++const fn sel(table: u64, endpoint: u64) -> u64 {
++    (table << 32) | endpoint
++}
++
++const SEL_RETYPE: u64 = sel(0, 1);
++const SERVICE: u64 = 0xffff_ffff;
++const SVC_TRANSLATE: u64 = sel(SERVICE, 1);
++const SVC_ALLOC_FRAME: u64 = sel(SERVICE, 2);
++const SVC_FREE_FRAME: u64 = sel(SERVICE, 3);
++
++const EP_INIT_STATE: u64 = 0;
++const EP_DESTROY_STATE: u64 = 1;
++const EP_MAP_TABLE: u64 = 2;
++const EP_UNMAP_TABLE: u64 = 3;
++const EP_MAP_BEGIN: u64 = 4;
++const EP_MAP_CONTINUE: u64 = 5;
++const EP_UNMAP_BEGIN: u64 = 8;
++const EP_UNMAP_CONTINUE: u64 = 9;
++const EP_SET_CTX_ID: u64 = 10;
++const EP_REMOVE_CTX_ID: u64 = 11;
++const EP_GET_INFO: u64 = 12;
++
++const INFO_MODE: u64 = 0;
++const INFO_GLOBAL_STATE_PRIVATE: u64 = 2;
++const INFO_VA_TOP_BIT: u64 = 3;
++const INFO_SEGMENT_LIMIT: u64 = 5;
++const INFO_STATE_SIZE: u64 = 8;
++
++/// `agx-address-space-mgmt-mode` 1, as in the J616s ADT: dual-root states, global state type 8.
++const MODE_PRIVATE: u64 = 1;
++
++const FRAME_XNU_DEFAULT: u64 = 11;
++const FRAME_XNU_IOMMU: u64 = 24;
++
++/// Subtypes `uat_retype_in` accepts, passed in the upper half of the RETYPE parameter.
++const SUBTYPE_STATE: u64 = 0;
++const SUBTYPE_ROOT: u64 = 1;
++const SUBTYPE_L2: u64 = 4;
++const SUBTYPE_L3: u64 = 5;
++
++/// `MAP_CONTINUE` and `UNMAP_CONTINUE` return this while the operation has more pages.
++const STATUS_MORE: u64 = 1;
++
++const L1_SHIFT: u32 = 36;
++const L2_SHIFT: u32 = 25;
++const PAGE_SHIFT_UAT: u32 = 14;
++
++/// Option bits of `MAP_BEGIN`, as macOS's GPU driver sets them.
++pub(crate) const OPT_FW_R: u32 = 1 << 0;
++pub(crate) const OPT_FW_W: u32 = 1 << 1;
++pub(crate) const OPT_ATTR_DEV: u32 = 1 << 2;
++pub(crate) const OPT_ATTR_UNCACHED: u32 = 1 << 3;
++pub(crate) const OPT_HW_R: u32 = 1 << 8;
++pub(crate) const OPT_HW_W: u32 = 1 << 9;
++
++fn submit(raw: *mut bindings::aurora_apif, selector: u64, arg: [u64; 6]) -> Result<u64> {
++    let mut op = bindings::aurora_apif_op {
++        selector,
++        arg,
++        ret: 0,
++    };
++    // SAFETY: `raw` comes from `aurora_apif_get` and stays valid while `Client` lives; `op` is a
++    // single valid operation that outlives this synchronous call.
++    let ret = unsafe { bindings::aurora_apif_submit(raw, &mut op, 1, core::ptr::null_mut()) };
++    to_result(ret)?;
++    Ok(op.ret)
++}
++
++/// The per-device APIF client and the facts read from the SPTM once.
++pub(crate) struct Client {
++    raw: core::ptr::NonNull<bindings::aurora_apif>,
++    /// `/arm-io/sgx` VA top bit, as SPTM computed it from `uat-vaddr-size`.
++    va_top_bit: u32,
++    segment_limit: usize,
++    global_state: u64,
++}
++
++// SAFETY: `aurora_apif_submit` is documented as safe from any context; the pointer is immutable.
++unsafe impl Send for Client {}
++// SAFETY: See above.
++unsafe impl Sync for Client {}
++
++impl Drop for Client {
++    fn drop(&mut self) {
++        // SAFETY: We own one reference taken in `Client::new`.
++        unsafe { bindings::aurora_apif_put(self.raw.as_ptr()) };
++    }
++}
++
++impl Client {
++    /// Connects to the monitor named by the GPU node's `aurora,apif`, if any.
++    ///
++    /// Returns `None` without such a property: the raw boot path.
++    pub(crate) fn probe(dev: &device::Device, ias: u32) -> Result<Option<Arc<Self>>> {
++        let node = dev.of_node().ok_or(EINVAL)?;
++        if !node.parse_phandle(c_str!("aurora,apif"), 0).is_some() {
++            return Ok(None);
++        }
++
++        dev_info!(dev, "UAT: SPTM backend: connecting to the monitor\n");
++        // SAFETY: `dev` is a valid bound device for the duration of this call.
++        let raw = unsafe { bindings::aurora_apif_get(dev.as_raw()) };
++        let raw = kernel::error::from_err_ptr(raw)?;
++        let raw_nn = core::ptr::NonNull::new(raw).ok_or(ENODEV)?;
++
++        let info = |what: u64| submit(raw, sel(TABLE_UAT, EP_GET_INFO), [what, 0, 0, 0, 0, 0]);
++        let mut this = Self {
++            raw: raw_nn,
++            va_top_bit: 0,
++            segment_limit: 0,
++            global_state: 0,
++        };
++
++        let mode = info(INFO_MODE)?;
++        let top = info(INFO_VA_TOP_BIT)?;
++        let limit = info(INFO_SEGMENT_LIMIT)?;
++        let state_size = info(INFO_STATE_SIZE)?;
++        dev_info!(
++            dev,
++            "UAT: SPTM backend: mode {} va top bit {} segments {} state size {:#x}\n",
++            mode,
++            top,
++            limit,
++            state_size
++        );
++        if mode != MODE_PRIVATE || top != ias as u64 || limit == 0 {
++            dev_err!(dev, "UAT: SPTM backend: unexpected geometry, ias {}\n", ias);
++            return Err(ENODEV);
++        }
++        // GET_INFO 2 panics in any other mode, so only ask after the check above.
++        this.global_state = info(INFO_GLOBAL_STATE_PRIVATE)?;
++        this.va_top_bit = top as u32;
++        this.segment_limit = limit as usize;
++        dev_info!(
++            dev,
++            "UAT: SPTM backend: global state {:#x}\n",
++            this.global_state
++        );
++        Ok(Some(Arc::new(this, GFP_KERNEL)?))
++    }
++
++    fn call(&self, selector: u64, arg: [u64; 6]) -> Result<u64> {
++        submit(self.raw.as_ptr(), selector, arg)
++    }
++
++    fn uat(&self, endpoint: u64, arg: [u64; 6]) -> Result<u64> {
++        self.call(sel(TABLE_UAT, endpoint), arg)
++    }
++
++    /// Takes a monitor frame outside the guest's stage-2 map and makes it a UAT frame.
++    fn alloc_frame(&self, subtype: u64) -> Result<u64> {
++        let pa = self.call(SVC_ALLOC_FRAME, [0; 6])?;
++        if pa == 0 || pa == u64::MAX {
++            return Err(ENOMEM);
++        }
++        // RETYPE returns a pointer, not a status (as XNU builds this parameter).
++        let ret = self.call(
++            SEL_RETYPE,
++            [
++                pa,
++                FRAME_XNU_DEFAULT,
++                FRAME_XNU_IOMMU,
++                IOMMU_ID_UAT | (subtype << 32),
++                0,
++                0,
++            ],
++        )?;
++        if ret == 0 {
++            self.call(SVC_FREE_FRAME, [pa, 0, 0, 0, 0, 0])?;
++            return Err(EIO);
++        }
++        Ok(pa)
++    }
++
++    /// Returns a frame retyped by [`Self::alloc_frame`], once SPTM holds no reference to it.
++    /// The provider retypes it back: a second retype here is a terminal violation (0x42).
++    fn free_frame(&self, pa: u64) -> Result {
++        self.call(SVC_FREE_FRAME, [pa, 0, 0, 0, 0, 0])?;
++        Ok(())
++    }
++
++    fn translate(&self, phys: u64, size: u64) -> Result<u64> {
++        self.call(SVC_TRANSLATE, [phys, size, 0, 0, 0, 0])
++    }
++}
++
++/// One entry of the segment list `MAP_BEGIN` copies: a physical run.
++#[repr(C)]
++#[derive(Copy, Clone)]
++struct MapSegment {
++    pa: u64,
++    pages: u64,
++}
++
++/// One entry of the segment list `UNMAP_BEGIN` copies: a virtual run.
++#[repr(C)]
++#[derive(Copy, Clone)]
++struct UnmapSegment {
++    va: u64,
++    pages: u64,
++}
++
++#[derive(Copy, Clone)]
++struct TableKey {
++    /// VA shifted right by the span of the table's parent entry; sign bits kept.
++    index: u64,
++    level: u8,
++    pa: u64,
++}
++
++struct StateInner {
++    /// Tables this state linked, sorted by (level, index).
++    tables: KVec<TableKey>,
++    ctx: Option<u16>,
++    /// A guest page of type XNU_DEFAULT that carries segment lists to SPTM.
++    segments: kernel::types::Owned<Page>,
++    segments_ipa: u64,
++    /// A call failed in transport, so the table state is unknown: retain everything.
++    failed: bool,
++}
++
++/// One SPTM UAT state object: a `Vm`'s address space as SPTM sees it.
++#[pin_data(PinnedDrop)]
++pub(crate) struct State {
++    client: Arc<Client>,
++    pa: u64,
++    /// The boot-created global state: never destroyed, its L1 is not ours to link.
++    global: bool,
++    roots: [u64; 2],
++    /// Serializes every call on this state object: a second concurrent call is a violation.
++    #[pin]
++    inner: Mutex<StateInner>,
++}
++
++impl State {
++    fn alloc(client: &Arc<Client>, pa: u64, global: bool, roots: [u64; 2]) -> Result<Arc<Self>> {
++        let segments = Page::alloc_page(GFP_KERNEL | __GFP_ZERO)?;
++        let segments_ipa = client.translate(segments.phys(), UAT_PGSZ as u64)?;
++        Arc::pin_init(
++            pin_init!(Self {
++                client: client.clone(),
++                pa,
++                global,
++                roots,
++                inner <- new_mutex!(
++                    StateInner {
++                        tables: KVec::new(),
++                        ctx: None,
++                        segments,
++                        segments_ipa,
++                        failed: false,
++                    },
++                    "uat_sptm_state"
++                ),
++            }),
++            GFP_KERNEL,
++        )
++    }
++
++    /// Creates a dual-root state for a `Vm` (lower half and an empty upper half).
++    pub(crate) fn new(client: &Arc<Client>) -> Result<Arc<Self>> {
++        let pa = client.alloc_frame(SUBTYPE_STATE)?;
++        let root0 = client.alloc_frame(SUBTYPE_ROOT).inspect_err(|_| {
++            let _ = client.free_frame(pa);
++        })?;
++        let root1 = client.alloc_frame(SUBTYPE_ROOT).inspect_err(|_| {
++            let _ = client.free_frame(root0);
++            let _ = client.free_frame(pa);
++        })?;
++        // An error here is a transport failure, the frames' state is unknown: they stay.
++        client.uat(EP_INIT_STATE, [pa, root0, root1, 0, 0, 0])?;
++        Self::alloc(client, pa, false, [root0, root1]).inspect_err(|_| {
++            if client.uat(EP_DESTROY_STATE, [pa, 0, 0, 0, 0, 0]).is_ok() {
++                let _ = client.free_frame(root0);
++                let _ = client.free_frame(root1);
++                let _ = client.free_frame(pa);
++            }
++        })
++    }
++
++    /// Wraps the boot-created global state: the driver's kernel window lives in its shared L2.
++    pub(crate) fn global(client: &Arc<Client>) -> Result<Arc<Self>> {
++        Self::alloc(client, client.global_state, true, [0, 0])
++    }
++
++    /// Links missing tables for `va..va + pages`. The shared L2 of the global state exists.
++    fn ensure_tables(&self, inner: &mut StateInner, va: u64, pages: u64) -> Result {
++        let end = va + (pages << PAGE_SHIFT_UAT) - 1;
++        if !self.global {
++            let mut cur = va >> L1_SHIFT;
++            while cur <= end >> L1_SHIFT {
++                self.ensure_table(inner, 1, cur, cur << L1_SHIFT)?;
++                cur += 1;
++            }
++        }
++        let mut cur = va >> L2_SHIFT;
++        while cur <= end >> L2_SHIFT {
++            self.ensure_table(inner, 2, cur, cur << L2_SHIFT)?;
++            cur += 1;
++        }
++        Ok(())
++    }
++
++    fn ensure_table(&self, inner: &mut StateInner, level: u8, index: u64, va: u64) -> Result {
++        let key = |t: &TableKey| (t.level, t.index);
++        let position = match inner.tables.binary_search_by_key(&(level, index), key) {
++            Ok(_) => return Ok(()),
++            Err(position) => position,
++        };
++        let subtype = if level == 1 { SUBTYPE_L2 } else { SUBTYPE_L3 };
++        // An empty pool changes nothing in SPTM: an ordinary error, the state stays usable.
++        let pa = self.client.alloc_frame(subtype)?;
++        let linked = (|| -> Result {
++            self.client
++                .uat(EP_MAP_TABLE, [self.pa, va, level as u64, pa, 0, 0])?;
++            inner
++                .tables
++                .insert_within_capacity(position, TableKey { index, level, pa })
++                .or_else(|_| -> Result {
++                    inner.tables.reserve(16, GFP_KERNEL)?;
++                    inner
++                        .tables
++                        .insert_within_capacity(position, TableKey { index, level, pa })
++                        .map_err(|_| ENOMEM)
++                })
++        })();
++        // Linked and not tracked, or unknown: linking it again would be terminal.
++        if linked.is_err() {
++            inner.failed = true;
++        }
++        linked
++    }
++
++    /// Maps a physical run, or one physical page repeated, at free leaves.
++    pub(crate) fn map(
++        &self,
++        mut va: u64,
++        mut pa: u64,
++        mut pages: u64,
++        one_page: bool,
++        options: u32,
++    ) -> Result {
++        let mut guard = self.inner.lock();
++        let inner = &mut *guard;
++        if inner.failed {
++            return Err(EIO);
++        }
++        self.ensure_tables(inner, va, pages)?;
++        let ret = (|| -> Result {
++            while pages != 0 {
++                let (segments, covered) = if one_page {
++                    let n = pages.min(self.client.segment_limit as u64);
++                    (n, n)
++                } else {
++                    (1, pages)
++                };
++                inner.segments.with_page_mapped(|page| {
++                    let list = page.cast::<MapSegment>();
++                    for i in 0..segments as usize {
++                        let run = MapSegment {
++                            pa,
++                            pages: if one_page { 1 } else { covered },
++                        };
++                        // SAFETY: `segment_limit` entries fit a page: SPTM copies them into the
++                        // rest of its own state page, which is smaller.
++                        unsafe { list.add(i).write(run) };
++                    }
++                });
++                let mut status = self.client.uat(
++                    EP_MAP_BEGIN,
++                    [
++                        self.pa,
++                        va,
++                        inner.segments_ipa,
++                        segments,
++                        options as u64,
++                        0,
++                    ],
++                )?;
++                while status == STATUS_MORE {
++                    status = self.client.uat(EP_MAP_CONTINUE, [self.pa, 0, 0, 0, 0, 0])?;
++                }
++                if !one_page {
++                    pa += covered << PAGE_SHIFT_UAT;
++                }
++                va += covered << PAGE_SHIFT_UAT;
++                pages -= covered;
++            }
++            Ok(())
++        })();
++        if ret.is_err() {
++            inner.failed = true;
++        }
++        ret
++    }
++
++    /// Unmaps a virtual run of present leaves. SPTM invalidates the TLB when a context is set.
++    pub(crate) fn unmap(&self, va: u64, pages: u64) -> Result {
++        let mut guard = self.inner.lock();
++        let inner = &mut *guard;
++        if inner.failed {
++            return Err(EIO);
++        }
++        inner.segments.with_page_mapped(|page| {
++            // SAFETY: One entry fits the page.
++            unsafe { page.cast::<UnmapSegment>().write(UnmapSegment { va, pages }) };
++        });
++        let ret = (|| -> Result {
++            let mut status =
++                self.client
++                    .uat(EP_UNMAP_BEGIN, [self.pa, inner.segments_ipa, 1, 0, 0, 0])?;
++            while status == STATUS_MORE {
++                status = self
++                    .client
++                    .uat(EP_UNMAP_CONTINUE, [self.pa, 0, 0, 0, 0, 0])?;
++            }
++            Ok(())
++        })();
++        if ret.is_err() {
++            inner.failed = true;
++        }
++        ret
++    }
++
++    /// Publishes this state's roots in TTBAT slot `ctx`. Fatal if the slot is valid.
++    pub(crate) fn set_ctx(&self, ctx: u16) -> Result {
++        let mut inner = self.inner.lock();
++        if inner.failed || inner.ctx.is_some() {
++            return Err(EBUSY);
++        }
++        self.client
++            .uat(EP_SET_CTX_ID, [self.pa, ctx as u64, 0, 0, 0, 0])?;
++        inner.ctx = Some(ctx);
++        Ok(())
++    }
++
++    /// The TTBAT slot of this state, if published.
++    pub(crate) fn ctx(&self) -> Option<u16> {
++        self.inner.lock().ctx
++    }
++
++    /// Clears this state's TTBAT slot. SPTM invalidates the context's TLB entries.
++    pub(crate) fn remove_ctx(&self) -> Result {
++        let mut inner = self.inner.lock();
++        if inner.ctx.is_none() {
++            return Ok(());
++        }
++        // The slot stays valid in SPTM: the caller must keep it claimed.
++        if inner.failed {
++            return Err(EIO);
++        }
++        self.client
++            .uat(EP_REMOVE_CTX_ID, [self.pa, 0, 0, 0, 0, 0])?;
++        inner.ctx = None;
++        Ok(())
++    }
++}
++
++#[pinned_drop]
++impl PinnedDrop for State {
++    fn drop(self: Pin<&mut Self>) {
++        if self.global {
++            return;
++        }
++        let client = self.client.clone();
++        let pa = self.pa;
++        let roots = self.roots;
++        let inner = self.inner.lock();
++        if inner.failed {
++            pr_err!("UAT: SPTM state {:#x} retained after a failed call\n", pa);
++            return;
++        }
++        let ret = (|| -> Result {
++            if inner.ctx.is_some() {
++                client.uat(EP_REMOVE_CTX_ID, [pa, 0, 0, 0, 0, 0])?;
++            }
++            // Children first: tables sort by level, so walk from the leaves up.
++            for table in inner.tables.iter().rev() {
++                let shift = if table.level == 1 { L1_SHIFT } else { L2_SHIFT };
++                client.uat(
++                    EP_UNMAP_TABLE,
++                    [pa, table.index << shift, table.level as u64, 0, 0, 0],
++                )?;
++                client.free_frame(table.pa)?;
++            }
++            client.uat(EP_DESTROY_STATE, [pa, 0, 0, 0, 0, 0])?;
++            client.free_frame(roots[0])?;
++            client.free_frame(roots[1])?;
++            client.free_frame(pa)?;
++            Ok(())
++        })();
++        if ret.is_err() {
++            pr_err!("UAT: SPTM state {:#x} teardown failed, retained\n", pa);
++        }
++    }
++}
+diff --git c/drivers/gpu/drm/asahi/pgtable.rs i/drivers/gpu/drm/asahi/pgtable.rs
+index 2fabe6bee88d..6aaa3fc5c9cc 100644
+--- c/drivers/gpu/drm/asahi/pgtable.rs
++++ i/drivers/gpu/drm/asahi/pgtable.rs
+@@ -382,6 +382,37 @@ const fn as_pte(&self) -> u64 {
+             | UAT_AF
+     }
+ 
++    /// The `MAP_BEGIN` option bits of this protection, from the logical (not native) form.
++    ///
++    /// SPTM 26.7.1 uses exactly these permission encodings:
++    /// its index is (fw permission << 2) | hw permission, and it holds the AP and PXN/UXN bits.
++    pub(crate) const fn sptm_options(&self) -> Option<u32> {
++        use crate::mmu::sptm_opt::*;
++        let uxn = self.high_bits & HIGH_BITS_UXN != 0;
++        let pxn = self.high_bits & HIGH_BITS_PXN != 0;
++        let access = match (self.ap, uxn, pxn) {
++            (AP_FW_GPU, false, false) => 0,
++            (AP_FW_GPU, false, true) => OPT_FW_R | OPT_HW_R,
++            (AP_FW_GPU, true, false) => OPT_FW_W | OPT_HW_W,
++            (AP_FW_GPU, true, true) => OPT_FW_R | OPT_FW_W | OPT_HW_R | OPT_HW_W,
++            (AP_FW, false, false) => OPT_FW_R,
++            (AP_FW, false, true) => OPT_FW_W,
++            (AP_FW, true, false) => OPT_FW_R | OPT_FW_W,
++            (AP_FW, true, true) => OPT_FW_R | OPT_FW_W | OPT_HW_R,
++            (AP_GPU, false, false) => OPT_HW_R,
++            (AP_GPU, false, true) => OPT_HW_W,
++            (AP_GPU, true, false) => OPT_HW_R | OPT_HW_W,
++            _ => return None,
++        };
++        let attr = match self.memattr {
++            MEMATTR_CACHED => 0,
++            MEMATTR_DEV => OPT_ATTR_DEV,
++            MEMATTR_UNCACHED => OPT_ATTR_UNCACHED,
++            _ => return None,
++        };
++        Some(access | attr)
++    }
++
+     /// Whether this leaf allows the requested GPU accesses.
+     pub(crate) const fn allows_gpu(&self, need_read: bool, need_write: bool) -> bool {
+         let uxn = self.high_bits & HIGH_BITS_UXN != 0;
+@@ -439,6 +470,9 @@ pub(crate) struct UatPageTable {
+     /// firmware, so only the tables recorded here are ever freed. `None` if the driver owns the
+     /// tables below the root, as with the handoff firmware interface.
+     driver_tables: Option<KVec<PhysicalAddr>>,
++    /// SPTM state object receiving every leaf change; the walked tree is then a shadow that no
++    /// TTBAT context names, kept for the driver's own lookups.
++    sptm: Option<Arc<crate::mmu::SptmState>>,
+     va_range: Range<u64>,
+     ias_mask: u64,
+     oas_mask: u64,
+@@ -459,6 +493,7 @@ pub(crate) fn new(ias: u32, oas: u32) -> Result<Self> {
+             reserved: None,
+             native_gpu: false,
+             driver_tables: None,
++            sptm: None,
+             va_range: 0..(1u64 << ias),
+             ias_mask: (1u64 << ias) - 1,
+             oas_mask: (1u64 << oas) - 1,
+@@ -541,6 +576,7 @@ pub(crate) fn new_with_ttb(
+             reserved,
+             native_gpu: false,
+             driver_tables: shared_tables.then(KVec::new),
++            sptm: None,
+             va_range,
+             ias_mask: (1u64 << ias) - 1,
+             oas_mask: (1u64 << oas) - 1,
+@@ -548,6 +584,46 @@ pub(crate) fn new_with_ttb(
+         })
+     }
+ 
++    /// Sends every later leaf change to `state` as well. Call before anything is mapped.
++    pub(crate) fn with_sptm(mut self, state: Arc<crate::mmu::SptmState>) -> Self {
++        self.sptm = Some(state);
++        self
++    }
++
++    /// Unmaps from SPTM exactly the leaves the shadow tree holds in `range`. Unmapping a free
++    /// leaf is a terminal violation, and a partial map or a sparse range can hold holes.
++    fn sptm_unmap_present(&mut self, range: Range<u64>) -> Result {
++        let Some(state) = self.sptm.clone() else {
++            return Ok(());
++        };
++        // The walker hands out the IOVA inside the IAS. SPTM takes the whole VA, as map_pages
++        // gives it: the kernel window is in the upper half, a masked VA would be another leaf.
++        let upper = range.start & !self.ias_mask;
++        // One run at a time and no allocation: this also runs under the shrinker's eviction.
++        let mut run: Option<(u64, u64)> = None;
++        self.with_pages(range, false, false, |iova, ptes| {
++            for (idx, pte) in ptes.iter().enumerate() {
++                if pte.load(Ordering::Relaxed) & PTE_TYPE_BITS != PTE_TYPE_LEAF_TABLE {
++                    continue;
++                }
++                let va = upper | (iova + (idx * UAT_PGSZ) as u64);
++                match &mut run {
++                    Some((start, pages)) if *start + (*pages << UAT_PGBIT) == va => *pages += 1,
++                    _ => {
++                        if let Some((start, pages)) = run.replace((va, 1)) {
++                            state.unmap(start, pages)?;
++                        }
++                    }
++                }
++            }
++            Ok(())
++        })?;
++        match run {
++            Some((start, pages)) => state.unmap(start, pages),
++            None => Ok(()),
++        }
++    }
++
+     /// Retains every physical table after an uncertain M4 handoff. No other agent may reclaim
+     /// this tree merely because a userspace handle closed or a fence reported an error.
+     pub(crate) fn retain(&mut self) {
+@@ -961,9 +1037,35 @@ pub(crate) fn map_pages(
+         }
+ 
+         let pte_bits = self.pte_bits();
++        let sptm = match &self.sptm {
++            Some(state) => {
++                let options = prot.sptm_options().ok_or(EINVAL)?;
++                let pages = (iova_range.end - iova_range.start) >> UAT_PGBIT;
++                Some((state.clone(), iova_range.start, phys, pages, options))
++            }
++            None => None,
++        };
+         let prot = self.stored(prot);
+ 
+-        self.walk(iova_range, true, false, true, |iova, ptes| {
++        if sptm.is_some() {
++            // Mapping over a valid leaf is a terminal violation in SPTM, not an overwrite.
++            let mut busy = None;
++            self.with_pages(iova_range.clone(), false, false, |iova, ptes| {
++                if busy.is_none() {
++                    busy = ptes
++                        .iter()
++                        .position(|pte| pte.load(Ordering::Relaxed) != 0)
++                        .map(|idx| iova + (idx * UAT_PGSZ) as u64);
++                }
++                Ok(())
++            })?;
++            if let Some(iova) = busy {
++                pr_err!("UATPageTable::map_pages: Page at IOVA {:#x} is mapped\n", iova);
++                return Err(EBUSY);
++            }
++        }
++
++        let walked = self.walk(iova_range.clone(), true, false, true, |iova, ptes| {
+             for (idx, pte) in ptes.iter().enumerate() {
+                 let ptev = pte.load(Ordering::Relaxed);
+                 if ptev != 0 {
+@@ -979,7 +1081,26 @@ pub(crate) fn map_pages(
+                 }
+             }
+             Ok(())
+-        })
++        });
++        if let Err(e) = walked {
++            if sptm.is_some() {
++                // SPTM has none of these leaves: a rollback through discard_partial_map would
++                // unmap free leaves, which is terminal.
++                let _ = self.walk(iova_range, false, false, true, |_, ptes| {
++                    for pte in ptes {
++                        pte.store(0, Ordering::Relaxed);
++                    }
++                    Ok(())
++                });
++            }
++            return Err(e);
++        }
++        match sptm {
++            Some((state, va, pa, pages, options)) => {
++                state.map(va, pa as u64, pages, one_page, options)
++            }
++            None => Ok(()),
++        }
+     }
+ 
+     pub(crate) fn reprot_pages(&mut self, iova_range: Range<u64>, prot: Prot) -> Result {
+@@ -1008,6 +1129,7 @@ pub(crate) fn reprot_pages(&mut self, iova_range: Range<u64>, prot: Prot) -> Res
+ 
+     pub(crate) fn unmap_pages(&mut self, iova_range: Range<u64>) -> Result {
+         mod_pr_debug!("UATPageTable::unmap_pages: {:#x?}\n", iova_range);
++        self.sptm_unmap_present(iova_range.clone())?;
+         self.walk(iova_range, false, false, true, |iova, ptes| {
+             for (idx, pte) in ptes.iter().enumerate() {
+                 if pte.load(Ordering::Relaxed) & PTE_TYPE_LEAF_TABLE == 0 {
+@@ -1025,6 +1147,7 @@ pub(crate) fn unmap_pages(&mut self, iova_range: Range<u64>) -> Result {
+     /// Discards an aligned map operation that failed before acquiring a GPUVA owner.
+     /// Missing tables and leaves are expected; existing table storage stays allocated.
+     pub(crate) fn discard_partial_map(&mut self, iova_range: Range<u64>) -> Result {
++        self.sptm_unmap_present(iova_range.clone())?;
+         self.walk(iova_range, false, false, true, |_, ptes| {
+             for pte in ptes {
+                 pte.store(0, Ordering::Relaxed);
+diff --git c/drivers/gpu/drm/asahi/regs.rs i/drivers/gpu/drm/asahi/regs.rs
+index e8b845cba989..57b756755c32 100644
+--- c/drivers/gpu/drm/asahi/regs.rs
++++ i/drivers/gpu/drm/asahi/regs.rs
+@@ -307,6 +307,14 @@ fn sgx_read64<const OFF: usize>(&self) -> u64 {
+     /// Initialize the MMIO registers for the GPU.
+     pub(crate) fn init_mmio(&self) -> Result {
+         // Nothing to do for now...
++        // macho boot: the GPU MMU block as iBoot left it. Read only.
++        dev_info!(
++            self.dev.as_ref(),
++            "MMU from iBoot: enable {:#x} cfg {:#x} gptbat {:#x}\n",
++            self.sgx_read32::<0xd08000>(),
++            self.sgx_read32::<0xd08014>(),
++            self.sgx_read32::<0xd0802c>()
++        );
+ 
+         Ok(())
+     }
+@@ -584,6 +592,28 @@ pub(crate) fn new(pdev: &platform::Device<Core<'_>>) -> Result<G17Resources> {
+         })
+     }
+ 
++    /// macho boot: a latched SAPT violation, the firmware touched DRAM that SPTM has not opened
++    /// for it (as macOS's GPU driver does). Read only, after a failed start.
++    pub(crate) fn log_sapt_status(&self) -> Result {
++        let sgx = self.sgx.try_access().ok_or(ENODEV)?;
++        let sgx = (&*sgx).as_view();
++        let status = sgx.try_read32(0xd54044)?;
++        if status & (1 << 31) != 0 {
++            let req = sgx.try_read32(0xd54048)?;
++            let lo = sgx.try_read32(0xd54050)? as u64;
++            let hi = (sgx.try_read32(0xd54054)? & 0x3ff) as u64;
++            dev_err!(
++                self.dev.as_ref(),
++                "SAPT violation: addr {:#x} sid {} status {:#x} axi {:#x}\n",
++                lo | (hi << 32),
++                (req >> 24) & 0xf,
++                status,
++                req
++            );
++        }
++        Ok(())
++    }
++
+     /// Installs both render queues while the caller holds the device mutex.
+     /// No other port publisher may interleave between this power witness and
+     /// the final validity strobe. False means no write was attempted.
+diff --git c/drivers/hwmon/macsmc-hwmon.c i/drivers/hwmon/macsmc-hwmon.c
+index cb824b252ddc..af67979f5121 100644
+--- c/drivers/hwmon/macsmc-hwmon.c
++++ i/drivers/hwmon/macsmc-hwmon.c
+@@ -36,6 +36,7 @@
+ #include <linux/string.h>
+ #include <linux/sysfs.h>
+ #include <linux/thermal.h>
++#include <linux/workqueue.h>
+ 
+ #define MAX_LABEL_LENGTH	32
+ 
+@@ -87,6 +88,13 @@ struct macsmc_hwmon_fan {
+ 	bool manual;
+ 	/* The device tree allows a manual speed from userspace. */
+ 	bool manual_control;
++	/* Index of the fan node among the fan-* nodes: its cooling device id. */
++	u32 index;
++	struct macsmc_hwmon *hwmon;
++	/* Speed asked for through the fan_control target, 0 for none. */
++	long user_rpm;
++	/* Cooling state asked for by the thermal framework, 0 for none. */
++	unsigned long cool_state;
+ };
+ 
+ struct macsmc_hwmon_sensors {
+@@ -101,6 +109,13 @@ struct macsmc_hwmon_sensors {
+ /* The firmware's own fan policy; it refuses a manual mode request. */
+ #define MACSMC_FAN_MODE_SYSTEM	3
+ 
++/*
++ * Cooling states of a fan with #cooling-cells: 0 leaves the fan to the
++ * firmware, 1 to MACSMC_FAN_COOLING_STATES run it at speeds spread evenly
++ * from its minimum to its maximum.
++ */
++#define MACSMC_FAN_COOLING_STATES	8
++
+ /* How long the firmware gets to leave or re-enter its system mode */
+ #define MACSMC_FAN_MODE_TIMEOUT_MS	10000
+ #define MACSMC_FAN_MODE_POLL_MS		100
+@@ -119,6 +134,8 @@ struct macsmc_hwmon_fans {
+ 	bool unlocked;
+ 	/* Fans in manual mode */
+ 	u32 manual;
++	/* Applies the cooling states, which can take seconds to unlock. */
++	struct work_struct cool_work;
+ 	/* Suspended, shut down or going away: every fan stays with the SMC. */
+ 	bool stopped;
+ };
+@@ -480,66 +497,99 @@ static int macsmc_hwmon_fan_manual(struct macsmc_hwmon *hwmon,
+ 	if (fan->manual)
+ 		return 0;
+ 
+-	/* Older firmware may expose a write-only mode key. */
+-	if (!(fan->mode.info.flags & APPLE_SMC_READABLE))
+-		goto set_manual;
+-
+-	/* Do not send a mode write the firmware is known to refuse. */
+-	ret = macsmc_hwmon_fan_read_mode(hwmon, fan, &mode);
+-	if (ret)
+-		return ret;
+-
+-	if (mode == MACSMC_FAN_MODE_SYSTEM) {
+-		if (!hwmon->fan.unlock_key)
+-			return -EOPNOTSUPP;
+-
+-		if (!hwmon->fan.unlocked) {
+-			ret = apple_smc_write_u8(hwmon->smc, hwmon->fan.unlock_key, 1);
+-			if (ret < 0) {
+-				/* The key may have been set anyway; clear it. */
+-				apple_smc_write_u8(hwmon->smc, hwmon->fan.unlock_key, 0);
+-				return ret;
+-			}
+-			hwmon->fan.unlocked = true;
++	ret = macsmc_hwmon_write_key(hwmon->smc, &fan->mode, MACSMC_FAN_MODE_MANUAL);
++	if (ret < 0 && hwmon->fan.unlock_key && !hwmon->fan.unlocked &&
++	    !macsmc_hwmon_fan_read_mode(hwmon, fan, &mode) &&
++	    mode == MACSMC_FAN_MODE_SYSTEM) {
++		ret = apple_smc_write_u8(hwmon->smc, hwmon->fan.unlock_key, 1);
++		if (ret < 0) {
++			/* The key may have been set anyway; clear it. */
++			apple_smc_write_u8(hwmon->smc, hwmon->fan.unlock_key, 0);
++			return ret;
+ 		}
++		hwmon->fan.unlocked = true;
+ 
++		/* Ask again once the fan has left system mode. */
+ 		timeout = jiffies + msecs_to_jiffies(MACSMC_FAN_MODE_TIMEOUT_MS);
+ 		for (;;) {
+ 			ret = macsmc_hwmon_fan_read_mode(hwmon, fan, &mode);
+-			if (ret)
+-				goto relock;
+-			if (mode != MACSMC_FAN_MODE_SYSTEM) {
+-				/* Leaving system mode need not mean writes are ready. */
++			if (!ret && mode == MACSMC_FAN_MODE_SYSTEM)
++				ret = -EBUSY;
++			else if (!ret)
+ 				ret = macsmc_hwmon_write_key(hwmon->smc, &fan->mode,
+ 							     MACSMC_FAN_MODE_MANUAL);
+-				if (ret >= 0)
+-					goto manual;
+-				if (ret != -EIO && ret != -EBUSY)
+-					goto relock;
+-			}
+-			if (time_after(jiffies, timeout)) {
+-				if (mode == MACSMC_FAN_MODE_SYSTEM)
+-					ret = -ETIMEDOUT;
+-				goto relock;
+-			}
++			if (ret >= 0 || time_after(jiffies, timeout))
++				break;
+ 			msleep(MACSMC_FAN_MODE_POLL_MS);
+ 		}
++		if (ret < 0) {
++			dev_err(hwmon->dev, "%s refused manual mode after unlock (%d)\n",
++				fan->label, ret);
++			if (!hwmon->fan.manual)
++				macsmc_hwmon_fans_relock(hwmon);
++			return ret;
++		}
+ 	}
+-
+-set_manual:
+-	ret = macsmc_hwmon_write_key(hwmon->smc, &fan->mode, MACSMC_FAN_MODE_MANUAL);
+ 	if (ret < 0)
+-		goto relock;
++		return ret;
+ 
+-manual:
+ 	fan->manual = true;
+ 	hwmon->fan.manual++;
+ 	return 0;
++}
+ 
+-relock:
+-	if (hwmon->fan.unlocked && !hwmon->fan.manual)
+-		macsmc_hwmon_fans_relock(hwmon);
+-	return ret;
++/* The speed of a cooling state of a fan running from @min to @max. */
++static long macsmc_hwmon_fan_state_rpm(long min, long max, unsigned long state)
++{
++	if (!state)
++		return 0;
++	state = min(state, MACSMC_FAN_COOLING_STATES);
++	return min + DIV_ROUND_CLOSEST((max - min) * (long)(state - 1),
++				       MACSMC_FAN_COOLING_STATES - 1);
++}
++
++/*
++ * Run a fan at the higher of the userspace target and the speed of its
++ * cooling state, or hand it to the firmware when neither asks for anything.
++ * Any failure leaves the fan with the firmware. Called with the fan lock held.
++ */
++static int macsmc_hwmon_fan_apply(struct macsmc_hwmon *hwmon,
++				  struct macsmc_hwmon_fan *fan)
++{
++	unsigned long state = READ_ONCE(fan->cool_state);
++	long min, max, rpm;
++	int ret;
++
++	if (hwmon->fan.stopped || (!fan->user_rpm && !state))
++		return macsmc_hwmon_fan_auto(hwmon, fan);
++
++	/*
++	 * The SMC does no sanity checks on requested fan speeds, so we need to.
++	 */
++	ret = macsmc_hwmon_read_key(hwmon->smc, &fan->min, 1, &min);
++	if (!ret)
++		ret = macsmc_hwmon_read_key(hwmon->smc, &fan->max, 1, &max);
++	if (!ret && (min <= 0 || max < min))
++		ret = -EIO;
++	if (ret) {
++		macsmc_hwmon_fan_auto(hwmon, fan);
++		return ret;
++	}
++
++	rpm = max(fan->user_rpm, macsmc_hwmon_fan_state_rpm(min, max, state));
++	rpm = clamp(rpm, min, max);
++
++	ret = macsmc_hwmon_fan_manual(hwmon, fan);
++	if (ret)
++		return ret;
++
++	ret = macsmc_hwmon_write_key(hwmon->smc, &fan->set, rpm);
++	if (ret < 0) {
++		macsmc_hwmon_fan_auto(hwmon, fan);
++		return ret;
++	}
++
++	return 0;
+ }
+ 
+ /* Whether userspace may set this fan's speed. */
+@@ -551,7 +601,6 @@ static bool macsmc_hwmon_fan_user_control(const struct macsmc_hwmon_fan *fan)
+ static int macsmc_hwmon_set_fan(struct macsmc_hwmon *hwmon, int channel, long val)
+ {
+ 	struct macsmc_hwmon_fan *fan = &hwmon->fan.fans[channel];
+-	long min, max;
+ 	int ret;
+ 
+ 	if (!macsmc_hwmon_fan_user_control(fan))
+@@ -561,25 +610,11 @@ static int macsmc_hwmon_set_fan(struct macsmc_hwmon *hwmon, int channel, long va
+ 
+ 	guard(mutex)(&hwmon->fan.lock);
+ 
+-	if (!val)
+-		return macsmc_hwmon_fan_auto(hwmon, fan);
+-	if (hwmon->fan.stopped)
+-		return -EBUSY;
+-
+-	/* The SMC does no sanity checks on requested fan speeds. */
+-	ret = macsmc_hwmon_read_key(hwmon->smc, &fan->min, 1, &min);
+-	if (!ret)
+-		ret = macsmc_hwmon_read_key(hwmon->smc, &fan->max, 1, &max);
+-	if (!ret && (min <= 0 || max < min))
+-		ret = -EIO;
+-	if (!ret)
+-		ret = macsmc_hwmon_fan_manual(hwmon, fan);
+-	if (!ret) {
+-		ret = macsmc_hwmon_write_key(hwmon->smc, &fan->set, clamp(val, min, max));
+-		if (ret >= 0)
+-			return 0;
+-	}
+-	macsmc_hwmon_fan_auto(hwmon, fan);
++	/* 0 drops the request; the fan goes back to the firmware unless cooling. */
++	fan->user_rpm = val;
++	ret = macsmc_hwmon_fan_apply(hwmon, fan);
++	if (ret)
++		fan->user_rpm = 0;
+ 
+ 	return ret;
+ }
+@@ -600,15 +635,129 @@ static void macsmc_hwmon_fans_restore(struct macsmc_hwmon *hwmon)
+ 		macsmc_hwmon_fan_auto(hwmon, &hwmon->fan.fans[i]);
+ }
+ 
+-static void macsmc_hwmon_fans_restore_action(void *data)
++/* Bring every fan in line with its requests, unless stopped. */
++static void macsmc_hwmon_fans_apply(struct macsmc_hwmon *hwmon)
+ {
+-	struct macsmc_hwmon *hwmon = data;
++	u32 i;
++	int ret;
+ 
++	guard(mutex)(&hwmon->fan.lock);
++	for (i = 0; i < hwmon->fan.count; i++) {
++		struct macsmc_hwmon_fan *fan = &hwmon->fan.fans[i];
++
++		ret = macsmc_hwmon_fan_apply(hwmon, fan);
++		if (ret)
++			dev_warn_ratelimited(hwmon->dev,
++					     "%s left to the SMC: cannot run cooling state %lu (%d)\n",
++					     fan->label, READ_ONCE(fan->cool_state), ret);
++	}
++}
++
++static void macsmc_hwmon_fans_cool_work(struct work_struct *work)
++{
++	macsmc_hwmon_fans_apply(container_of(work, struct macsmc_hwmon, fan.cool_work));
++}
++
++/*
++ * Stop applying cooling states and hand every fan back to the firmware, for
++ * suspend, shutdown and removal.
++ */
++static void macsmc_hwmon_fans_stop(struct macsmc_hwmon *hwmon)
++{
+ 	scoped_guard(mutex, &hwmon->fan.lock)
+ 		hwmon->fan.stopped = true;
++	cancel_work_sync(&hwmon->fan.cool_work);
+ 	macsmc_hwmon_fans_restore(hwmon);
+ }
+ 
++static void macsmc_hwmon_fans_restore_action(void *data)
++{
++	macsmc_hwmon_fans_stop(data);
++}
++
++#if IS_ENABLED(CONFIG_THERMAL_OF)
++static int macsmc_hwmon_fan_get_max_state(struct thermal_cooling_device *cdev,
++					  unsigned long *state)
++{
++	*state = MACSMC_FAN_COOLING_STATES;
++	return 0;
++}
++
++static int macsmc_hwmon_fan_get_cur_state(struct thermal_cooling_device *cdev,
++					  unsigned long *state)
++{
++	struct macsmc_hwmon_fan *fan = cdev->devdata;
++
++	*state = READ_ONCE(fan->cool_state);
++	return 0;
++}
++
++/*
++ * Unlocking the fans takes the firmware seconds, so the state is applied
++ * from a work item rather than from the thermal zone update.
++ */
++static int macsmc_hwmon_fan_set_cur_state(struct thermal_cooling_device *cdev,
++					  unsigned long state)
++{
++	struct macsmc_hwmon_fan *fan = cdev->devdata;
++
++	if (state > MACSMC_FAN_COOLING_STATES)
++		return -EINVAL;
++
++	WRITE_ONCE(fan->cool_state, state);
++	queue_work(system_freezable_wq, &fan->hwmon->fan.cool_work);
++	return 0;
++}
++
++static const struct thermal_cooling_device_ops macsmc_hwmon_fan_cooling_ops = {
++	.get_max_state = macsmc_hwmon_fan_get_max_state,
++	.get_cur_state = macsmc_hwmon_fan_get_cur_state,
++	.set_cur_state = macsmc_hwmon_fan_set_cur_state,
++};
++
++/*
++ * With #cooling-cells = <3> on the hwmon node, every fan is a cooling device
++ * for the thermal zones that map it as <&hwmon fan-index lower upper>, the
++ * index counting the fan-* nodes in order. Without it the fans stay with the
++ * firmware as before.
++ */
++static void macsmc_hwmon_fans_register_cooling(struct macsmc_hwmon *hwmon)
++{
++	const u32 needed = HWMON_F_MIN | HWMON_F_MAX | HWMON_F_TARGET;
++	u32 cells, i;
++
++	if (!hwmon->fan.count ||
++	    of_property_read_u32(hwmon->dev->of_node, "#cooling-cells", &cells))
++		return;
++	if (cells != 3) {
++		dev_warn(hwmon->dev, "#cooling-cells must be 3; fans left to the SMC\n");
++		return;
++	}
++
++	for (i = 0; i < hwmon->fan.count; i++) {
++		struct macsmc_hwmon_fan *fan = &hwmon->fan.fans[i];
++		struct thermal_cooling_device *cdev;
++
++		if ((fan->attrs & needed) != needed || !fan->mode.macsmc_key) {
++			dev_warn(hwmon->dev, "%s has no speed or mode keys; not a cooling device\n",
++				 fan->label);
++			continue;
++		}
++
++		cdev = devm_thermal_of_cooling_device_register(hwmon->dev, fan->index,
++								"macsmc-fan", fan,
++								&macsmc_hwmon_fan_cooling_ops);
++		if (IS_ERR(cdev))
++			dev_warn(hwmon->dev, "%s: cannot register a cooling device (%pe)\n",
++				 fan->label, cdev);
++	}
++}
++#else
++static void macsmc_hwmon_fans_register_cooling(struct macsmc_hwmon *hwmon)
++{
++}
++#endif
++
+ static int macsmc_hwmon_read(struct device *dev, enum hwmon_sensor_types type,
+ 			     u32 attr, int channel, long *val)
+ {
+@@ -1059,6 +1208,8 @@ static int macsmc_hwmon_populate_sensors(struct macsmc_hwmon *hwmon,
+ 		for_each_child_of_node_with_prefix(hwmon_node, key_node, "fan-") {
+ 			struct macsmc_hwmon_fan *fan = &hwmon->fan.fans[hwmon->fan.count];
+ 
++			fan->hwmon = hwmon;
++			fan->index = n_fan++;
+ 			if (!macsmc_hwmon_create_fan(hwmon->dev, hwmon->smc, key_node, fan))
+ 				hwmon->fan.count++;
+ 		}
+@@ -1452,6 +1603,7 @@ static int macsmc_hwmon_probe(struct platform_device *pdev)
+ 	ret = devm_mutex_init(&pdev->dev, &hwmon->fan.lock);
+ 	if (ret)
+ 		return ret;
++	INIT_WORK(&hwmon->fan.cool_work, macsmc_hwmon_fans_cool_work);
+ 
+ 	ret = macsmc_hwmon_populate_sensors(hwmon, hwmon->dev->of_node);
+ 	if (ret) {
+@@ -1513,6 +1665,12 @@ static int macsmc_hwmon_probe(struct platform_device *pdev)
+ 	if (ret)
+ 		return ret;
+ 
++	/*
++	 * Released before the restore action above, which stops the cooling
++	 * work and hands the fans back.
++	 */
++	macsmc_hwmon_fans_register_cooling(hwmon);
++
+ 	dev_dbg(hwmon->dev, "Registered SMC hwmon device. Sensors:\n");
+ 	dev_dbg(hwmon->dev,
+ 		"Current: %d, Fans: %d, Power: %d, Temperature: %d, Voltage: %d",
+@@ -1534,22 +1692,27 @@ static void macsmc_hwmon_shutdown(struct platform_device *pdev)
+ 	struct macsmc_hwmon *hwmon = platform_get_drvdata(pdev);
+ 
+ 	if (hwmon)
+-		macsmc_hwmon_fans_restore_action(hwmon);
++		macsmc_hwmon_fans_stop(hwmon);
+ }
+ 
+ static int macsmc_hwmon_suspend(struct device *dev)
+ {
+-	macsmc_hwmon_fans_restore_action(dev_get_drvdata(dev));
++	macsmc_hwmon_fans_stop(dev_get_drvdata(dev));
+ 	return 0;
+ }
+ 
+-/* Manual requests end at suspend; resume never writes fan keys. */
++/* Cooling states asked for before suspend apply again; the zones update them. */
+ static int macsmc_hwmon_resume(struct device *dev)
+ {
+ 	struct macsmc_hwmon *hwmon = dev_get_drvdata(dev);
+ 
+-	guard(mutex)(&hwmon->fan.lock);
+-	hwmon->fan.stopped = false;
++	scoped_guard(mutex, &hwmon->fan.lock) {
++		hwmon->fan.stopped = false;
++		/* The userspace targets were dropped when the fans went back. */
++		for (u32 i = 0; i < hwmon->fan.count; i++)
++			hwmon->fan.fans[i].user_rpm = 0;
++	}
++	queue_work(system_freezable_wq, &hwmon->fan.cool_work);
+ 	return 0;
+ }
+ 
+diff --git c/drivers/iommu/Kconfig i/drivers/iommu/Kconfig
+index 03a3c6d3759e..0d3df90200aa 100644
+--- c/drivers/iommu/Kconfig
++++ i/drivers/iommu/Kconfig
+@@ -329,7 +329,7 @@ config APPLE_DART_J713_DCP
+ 	  Leave this disabled for ordinary DART use, including APPLE_DART=m.
+ 
+ config APPLE_DART_APIF
+-	bool "Apple DART over the Aurora platform interface"
++	tristate "Apple DART over the Aurora platform interface"
+ 	depends on ARM64_16K_PAGES && OF
+ 	depends on ARCH_APPLE || COMPILE_TEST
+ 	select AURORA_APIF_MMIO
+diff --git c/drivers/iommu/apple-dart-apif.c i/drivers/iommu/apple-dart-apif.c
+index 7c1519c70e3b..89745b093bb4 100644
+--- c/drivers/iommu/apple-dart-apif.c
++++ i/drivers/iommu/apple-dart-apif.c
+@@ -1490,6 +1490,13 @@ static phys_addr_t apple_dart_apif_iova_to_phys(struct iommu_domain *domain,
+ 						dma_addr_t iova)
+ {
+ 	struct apple_dart_apif_domain *dom = to_apif_domain(domain);
++
++	/* RTKit firmware may name a buffer by the offset in the window, without
++	 * its base. The native DART driver takes both forms for the same reason.
++	 */
++	if (iova < domain->geometry.aperture_start &&
++	    domain->geometry.aperture_start)
++		iova += domain->geometry.aperture_start;
+ 	void *entry = xa_load(&dom->mappings, iova >> DART_APIF_PAGE_SHIFT);
+ 	unsigned long value = entry ? xa_to_value(entry) : 0;
+ 
+@@ -1882,12 +1889,22 @@ int apple_dart_apif_set_power(struct device *dev, bool on)
+ }
+ EXPORT_SYMBOL_GPL(apple_dart_apif_set_power);
+ 
++/* Late bring-up one unit at a time: a registered unit attaches its existing masters at once, so the first table 3 call of a unit
++ * happens at probe. When set, only the named units probe; clear it and write the name to drivers_probe for the others.
++ */
++static char *apif_only;
++module_param(apif_only, charp, 0644);
++MODULE_PARM_DESC(apif_only, "probe only DART units whose device name is listed");
++
+ static int apple_dart_apif_probe(struct platform_device *pdev)
+ {
+ 	struct device *dev = &pdev->dev;
+ 	struct apple_dart_apif *dart;
+ 	int ret;
+ 
++	if (apif_only && *apif_only && !strstr(apif_only, dev_name(dev)))
++		return -EPROBE_DEFER;
++
+ 	dart = devm_kzalloc(dev, sizeof(*dart), GFP_KERNEL);
+ 	if (!dart)
+ 		return -ENOMEM;
+diff --git c/drivers/nvme/host/apple-apif.h i/drivers/nvme/host/apple-apif.h
+index 53d29b5c3b8c..b31664e10b19 100644
+--- c/drivers/nvme/host/apple-apif.h
++++ i/drivers/nvme/host/apple-apif.h
+@@ -1,6 +1,8 @@
+ /* SPDX-License-Identifier: GPL-2.0-only */
+ /* Resident ANS uses native table 6; Linux owns queue and DMA lifetimes. */
+ #define APPLE_NVME_APIF_PAGES 257
++/* each ep2 call polls 250 us: at least the 1 s XNU allows */
++#define APPLE_NVME_APIF_UNMAP_TRIES 4000
+ #define APPLE_NVME_APIF_LIST_SIZE SZ_4K
+ 
+ static inline void **apple_nvme_iod_list(struct request *req);
+@@ -238,15 +240,35 @@ static int apple_nvme_apif_request(struct apple_nvme_queue *q,
+ 	if (!map) {
+ 		if (!iod->apif_registered)
+ 			return 0;
+-		op = (struct aurora_apif_op){
+-			.selector = AURORA_APIF_SELECTOR(6, 2),
+-			.arg = { q->is_adminq ? 0 : 1, tag, 0 },
+-		};
+-		ret = aurora_apif_submit(anv->apif, &op, 1, NULL);
+-		if (ret || op.ret != 1)
+-			return ret ?: -EIO;
+-		iod->apif_registered = false;
+-		return 0;
++		/*
++		 * With ADT nvme-tl-wa, SPTM ep2 waits 250 us for the SLs, then returns 0 and leaves the
++		 * cid in CID_FILLED_RETRY. From there only retry = 1 is legal, retry = 0 is the terminal
++		 * violation 0x3000006, also from the reset drain. XNU retries for 1 s.
++		 */
++		for (i = 0; i < APPLE_NVME_APIF_UNMAP_TRIES; i++) {
++			op = (struct aurora_apif_op){
++				.selector = AURORA_APIF_SELECTOR(6, 2),
++				.arg = { q->is_adminq ? 0 : 1, tag,
++					 iod->apif_unmap_retry },
++			};
++			ret = aurora_apif_submit(anv->apif, &op, 1, NULL);
++			if (ret)
++				return ret;
++			if (op.ret == 1) {
++				if (iod->apif_unmap_retry)
++					dev_warn_ratelimited(anv->dev,
++							     "apif: SL idle after %u retries, cid %u\n",
++							     i, tag);
++				iod->apif_registered = false;
++				iod->apif_unmap_retry = false;
++				return 0;
++			}
++			if (op.ret)
++				return -EIO;
++			iod->apif_unmap_retry = true;
++		}
++		dev_err_ratelimited(anv->dev, "apif: SL not idle, cid %u\n", tag);
++		return -EIO;
+ 	}
+ 	if (anv->apif_uncertain)
+ 		return -EIO;
+@@ -282,9 +304,12 @@ static int apple_nvme_apif_request(struct apple_nvme_queue *q,
+ 		};
+ 	}
+ 	if (count) {
+-		ret = aurora_apif_submit(anv->apif, anv->apif_ops, count, NULL);
+-		if (ret)
++		ret = aurora_apif_submit(anv->apif, anv->apif_ops, count, &done);
++		if (ret) {
++			dev_warn_ratelimited(anv->dev, "apif translate failed: tag %u page %u/%u pa %llx: %d\n",
++					     tag, done, count, done < count ? list[done] : 0, ret);
+ 			return ret;
++		}
+ 		/* Commands and PRP chains carry DMA addresses directly. Until ANS
+ 		 * supports another aperture, require the identity handoff contract.
+ 		 */
+diff --git c/drivers/nvme/host/apple.c i/drivers/nvme/host/apple.c
+index 0a183af302a3..dacb76c606f7 100644
+--- c/drivers/nvme/host/apple.c
++++ i/drivers/nvme/host/apple.c
+@@ -193,6 +193,7 @@ struct apple_nvme_iod {
+ 	struct nvme_command cmd;
+ 	struct apple_nvme_queue *q;
+ 	bool apif_registered;
++	bool apif_unmap_retry;
+ 	int npages; /* In the PRP list. 0 means small pool in use */
+ 	int nents; /* Used in scatterlist */
+ 	dma_addr_t first_dma;
+@@ -297,6 +298,10 @@ struct apple_nvme {
+  * unbind; never admit the same controller again until the platform has
+  * reset. Entries retain their owner.
+  */
++static unsigned int apif_max_kb = 64;
++module_param(apif_max_kb, uint, 0644);
++MODULE_PARM_DESC(apif_max_kb, "APIF transfer limit in KiB, 16 to 1024, applied at the next controller reset");
++
+ static DEFINE_MUTEX(apple_nvme_quarantine_lock);
+ static LIST_HEAD(apple_nvme_quarantines);
+ 
+@@ -674,6 +679,8 @@ static void apple_nvme_submit_cmd_t8103(struct apple_nvme_queue *q,
+ 	 */
+ 	spin_lock_irq(&anv->lock);
+ 	if (anv->hw->apif && apple_nvme_apif_request(q, req, true)) {
++		dev_warn_ratelimited(anv->dev, "apif map failed: tag %u, %u bytes\n",
++				     nvme_tag_from_cid(cmd->common.command_id), blk_rq_payload_bytes(req));
+ 		spin_unlock_irq(&anv->lock);
+ 		/* Timeout recovery stops DMA before cancellation releases this tag. */
+ 		return;
+@@ -1212,6 +1219,25 @@ static blk_status_t apple_nvme_queue_rq(struct blk_mq_hw_ctx *hctx,
+ 		goto out_free_cmd;
+ 	}
+ 
++	/* Trial boot under the monitor: nothing that changes the disk, setro does not stop an admin passthrough. */
++	if (anv->hw->apif &&
++	    (q->is_adminq ? (cmnd->common.opcode == nvme_admin_format_nvm ||
++			     cmnd->common.opcode == nvme_admin_sanitize_nvm ||
++			     cmnd->common.opcode == nvme_admin_ns_mgmt ||
++			     cmnd->common.opcode == nvme_admin_ns_attach ||
++			     cmnd->common.opcode == nvme_admin_activate_fw ||
++			     cmnd->common.opcode == nvme_admin_download_fw ||
++			     cmnd->common.opcode == nvme_admin_security_send ||
++			     cmnd->common.opcode == nvme_admin_directive_send ||
++			     cmnd->common.opcode == nvme_admin_virtual_mgmt ||
++			     cmnd->common.opcode >= nvme_admin_vendor_start) :
++			    (cmnd->common.opcode != nvme_cmd_read &&
++			     cmnd->common.opcode != nvme_cmd_flush))) {
++		dev_warn_ratelimited(anv->dev, "apif: write opcode 0x%x refused\n", cmnd->common.opcode);
++		ret = BLK_STS_IOERR;
++		goto out_free_cmd;
++	}
++
+ 	if (blk_rq_nr_phys_segments(req)) {
+ 		ret = apple_nvme_map_data(anv, req, cmnd);
+ 		if (ret)
+@@ -1255,6 +1281,7 @@ static int apple_nvme_init_request(struct blk_mq_tag_set *set,
+ 
+ 	iod->q = q;
+ 	iod->apif_registered = false;
++	iod->apif_unmap_retry = false;
+ 	nreq->ctrl = &anv->ctrl;
+ 	nreq->cmd = &iod->cmd;
+ 
+@@ -1484,8 +1511,31 @@ static enum blk_eh_timer_return apple_nvme_timeout(struct request *req)
+ 		return BLK_EH_DONE;
+ 	if (READ_ONCE(anv->quarantined))
+ 		return BLK_EH_RESET_TIMER;
++	if (anv->hw->apif)
++		dev_warn(anv->dev, "apif timeout: tag %u, %u bytes, %u segments, prp1 %llx prp2 %llx\n",
++			 nvme_tag_from_cid(iod->cmd.common.command_id), blk_rq_payload_bytes(req),
++			 blk_rq_nr_phys_segments(req), le64_to_cpu(iod->cmd.common.dptr.prp1),
++			 le64_to_cpu(iod->cmd.common.dptr.prp2));
+ 	cc = readl(anv->mmio_nvme + NVME_REG_CC);
+ 	csts = readl(anv->mmio_nvme + NVME_REG_CSTS);
++	if (anv->hw->apif)
++		dev_warn(anv->dev, "apif state: cq_head %u phase %u cqe.status %x cqe.cid %x csts %x uncertain %d\n",
++			 q->cq_head, q->cq_phase, le16_to_cpu(READ_ONCE(cqe->status)),
++			 READ_ONCE(cqe->command_id), csts, anv->apif_uncertain);
++	if (anv->hw->apif) {
++		u64 first = le64_to_cpu(iod->cmd.common.dptr.prp1);
++		u32 n = DIV_ROUND_UP((first & (SZ_4K - 1)) + blk_rq_payload_bytes(req), SZ_4K);
++		char prps[256];
++		int len = 0;
++
++		if (n > 2 && iod->npages >= 0) {
++			__le64 *list = apple_nvme_iod_list(req)[0];
++
++			for (u32 i = 0; i < n - 1 && i < 16; i++)
++				len += scnprintf(prps + len, sizeof(prps) - len, " %llx", le64_to_cpu(list[i]));
++			dev_warn(anv->dev, "apif prp list tag %u:%s\n", nvme_tag_from_cid(iod->cmd.common.command_id), prps);
++		}
++	}
+ 
+ 	/*
+ 	 * The first Identify runs while the controller is CONNECTING.  Poll the
+@@ -1824,6 +1874,18 @@ static void apple_nvme_reset_work(struct work_struct *work)
+ 	dma_set_max_seg_size(anv->dev, 0xffffffff);
+ 
+ 	if (anv->hw->apif) {
++		/*
++		 * Keep every command at 16 PRPs or fewer (64 KiB at 4 KiB LBAs). SPTM table-6 map_pages
++		 * copies a longer PRP list into its own scratch and
++		 * cleans it only when count > 16 and the ADT asks for nvme-prp-flush-wa; J616s does not.
++		 * Under the macho monitor the request a controller reset cancelled was a 128 KiB read
++		 * (count 32; sct 0x3/sc 0x71 is NVME_SC_HOST_ABORTED_CMD, set by the host), and the
++		 * failure repeats every ~31 s, the blk-mq timeout plus a reset. Whether count > 16 is the
++		 * cause is what this cap tests. 64 KiB is above the 16 KiB page minimum that
++		 * blk_validate_limits enforces; the earlier 4 KiB cap was below it and failed (-22).
++		 * apif_max_kb is read at every reset, so a script can measure the real limit.
++		 */
++		anv->ctrl.max_hw_sectors = clamp(READ_ONCE(apif_max_kb), 16U, 1024U) << 1;
+ 		ret = apple_nvme_apif_admin(anv);
+ 		if (ret)
+ 			goto out;
+diff --git c/drivers/pci/controller/Kconfig i/drivers/pci/controller/Kconfig
+index b758e0682ffd..a4eccd84dd6c 100644
+--- c/drivers/pci/controller/Kconfig
++++ i/drivers/pci/controller/Kconfig
+@@ -40,6 +40,12 @@ config PCIE_APPLE_MSI_DOORBELL_ADDR
+ 	default 0xfffff000
+ 	depends on PCIE_APPLE
+ 
++config PCIE_MACHO_INIT
++	tristate "J616s PCIe host init under the SPTM monitor"
++	depends on ARCH_APPLE
++	help
++	  Runs the host bring-up that m4-loader does in the raw boot, from the ADT copy the monitor leaves in guest RAM.
++
+ config PCIE_APPLE
+ 	tristate "Apple PCIe controller"
+ 	depends on ARCH_APPLE || COMPILE_TEST
+diff --git c/drivers/pci/controller/Makefile i/drivers/pci/controller/Makefile
+index 3bd9cdb5b119..cdfbcd9bcc20 100644
+--- c/drivers/pci/controller/Makefile
++++ i/drivers/pci/controller/Makefile
+@@ -39,6 +39,7 @@ obj-$(CONFIG_VMD) += vmd.o
+ obj-$(CONFIG_PCIE_BRCMSTB) += pcie-brcmstb.o
+ obj-$(CONFIG_PCI_LOONGSON) += pci-loongson.o
+ obj-$(CONFIG_PCIE_HISI_ERR) += pcie-hisi-error.o
++obj-$(CONFIG_PCIE_MACHO_INIT) += pcie-macho-init.o
+ obj-$(CONFIG_PCIE_APPLE) += pcie-apple.o
+ obj-$(CONFIG_PCIE_MT7621) += pcie-mt7621.o
+ obj-$(CONFIG_PCIE_ASPEED) += pcie-aspeed.o
+diff --git c/drivers/pci/controller/pcie-macho-init.c i/drivers/pci/controller/pcie-macho-init.c
+new file mode 100644
+index 000000000000..23e26fd24b11
+--- /dev/null
++++ i/drivers/pci/controller/pcie-macho-init.c
+@@ -0,0 +1,570 @@
++// SPDX-License-Identifier: GPL-2.0-only OR MIT
++// Copyright The Asahi Linux Contributors: the PCIe port bring-up sequence follows m4-loader src/pcie.c (MIT)
++/*
++ * Late PCIe host init for the J616s Linux guest under the resident SPTM monitor. In the raw boot m4-loader runs this sequence before
++ * Linux (src/pcie.c, pcie_init_controller, APCIE_T8132 with T8122 compat; T6041's ADT says "apcie,t6040"). Under the monitor nothing does:
++ * XNU's driver would, and XNU never runs. All values come from the ADT copy the monitor places in guest RAM. Loaded by hand, late, before
++ * pcie-apple. No register here is SPTM-owned: the monitor's build gate checks each page against the io-range tables.
++ */
++#include <linux/bitfield.h>
++#include <linux/delay.h>
++#include <linux/io.h>
++#include <linux/iopoll.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/of_address.h>
++#include <linux/platform_device.h>
++#include <linux/slab.h>
++
++#define PHY_CTRL		0x000
++#define  PHY_CLK0REQ		BIT(0)
++#define  PHY_CLK1REQ		BIT(1)
++#define  PHY_CLK0ACK		BIT(2)
++#define  PHY_CLK1ACK		BIT(3)
++#define  PHY_RESET_T8132	BIT(4)
++#define PHYCMN_CLK		0x000
++#define  PHYCMN_MODE		GENMASK(1, 0)
++#define PORT_LINKSTS		0x208
++#define  PORT_LINKSTS_BUSY	BIT(2)
++#define PORT_APPCLK		0x800
++#define PORT_STATUS		0x804
++#define PORT_RESET_T602X	0x82c
++#define PORT_MSIMAP		0x3800
++#define DWC_DBI_RO_WR		0x8bc
++#define SHARED_REGS		7
++#define POLL_US			250000
++#define PS_BUSY			BIT(11)
++#define AXI2AF_BRIDGE0		0x104	/* XNU's axi2af workaround: base+0x104, base+0x108, base = apcie0 reg 4 */
++#define AXI2AF_BRIDGE1		0x108
++
++/* XNU order (root complex enable): every clock gate but the last, AXI2AF, CIO3PLL, the PLL config,
++ * clkgen bit 5, then the last gate (APCIE_PHY_SW). 0 keeps the raw loader's order: all domains first, PLL only if lost (D6). */
++static bool xnu_order;              /* F34 (S2): XNU's cold boot is the clock enable (8 gates, ADT order) + root complex enable with iBoot's PLL kept:
++                                       that is the loader order; 1 = the wake path (PLL reprogrammed, PHY_SW last) */
++module_param(xnu_order, bool, 0444);
++/* F34 (S2): XNU waits 8 ms for a power state and goes on (panic only with a debug flag); F18 stopped on our hard 250 ms timeout at 0x388 */
++static bool ps_strict;
++module_param(ps_strict, bool, 0444);
++/* F34 (S2): PHY and port values where XNU 26.7.1 differs from m4-loader (the raw link-up proven on this Mac): 1 = XNU's values:
++ * phyP[0] |= bit 27 instead of 0x200, phyIP[0x90] &= ~bit 16, port 0x130 = 0x3020000, 0x13c = 0 */
++static bool xnu_phy;
++module_param(xnu_phy, bool, 0444);
++/* one panel line before each step and a short pause, so a stop shows the step it stopped in */
++static bool steptrace = true;
++module_param(steptrace, bool, 0444);
++
++struct adt_prop { char name[32]; u32 len; u8 val[]; };
++struct adt_node { u32 nprops, nchild; };
++struct tun { u32 off, size; u64 mask, val; } __packed;
++
++struct ctx {
++	struct device *dev;
++	unsigned int step;
++	const u8 *adt;
++	size_t adt_len;
++	const u8 *apcie, *armio;
++	void __iomem *axi;              /* reg 4, for the axi2af bridge bits right after APCIE_SYS_GP (S2 M5) */
++	u64 regs[64];
++	u32 nregs;
++};
++
++static const u8 *next_prop(const u8 *p)
++{
++	const struct adt_prop *a = (const void *)p;
++
++	return p + sizeof(*a) + ALIGN(a->len & 0x7fffffff, 4);
++}
++
++static const void *prop(const u8 *node, const char *name, u32 *len)
++{
++	const struct adt_node *n = (const void *)node;
++	const u8 *p = node + sizeof(*n);
++
++	for (u32 i = 0; i < n->nprops; i++, p = next_prop(p)) {
++		const struct adt_prop *a = (const void *)p;
++
++		if (!strncmp(a->name, name, sizeof(a->name))) {
++			if (len)
++				*len = a->len & 0x7fffffff;
++			return a->val;
++		}
++	}
++	return NULL;
++}
++
++static const u8 *skip_node(const u8 *node)
++{
++	const struct adt_node *n = (const void *)node;
++	const u8 *p = node + sizeof(*n);
++
++	for (u32 i = 0; i < n->nprops; i++)
++		p = next_prop(p);
++	for (u32 i = 0; i < n->nchild; i++)
++		p = skip_node(p);
++	return p;
++}
++
++static const u8 *child(const u8 *node, const char *name)
++{
++	const struct adt_node *n = (const void *)node;
++	const u8 *p = node + sizeof(*n);
++
++	for (u32 i = 0; i < n->nprops; i++)
++		p = next_prop(p);
++	for (u32 i = 0; i < n->nchild; i++, p = skip_node(p)) {
++		const char *nm = prop(p, "name", NULL);
++
++		if (nm && !strcmp(nm, name))
++			return p;
++	}
++	return NULL;
++}
++
++/* /arm-io ranges: <child parent size>, 64 bit each */
++static int translate(struct ctx *c, u64 addr, u64 *pa)
++{
++	u32 len;
++	const u64 *r = prop(c->armio, "ranges", &len);
++
++	for (u32 i = 0; r && i + 3 <= len / 8; i += 3)
++		if (addr >= r[i] && addr < r[i] + r[i + 2]) {
++			*pa = addr - r[i] + r[i + 1];
++			return 0;
++		}
++	return -ENOENT;
++}
++
++static void __iomem *reg_map(struct ctx *c, u32 idx)
++{
++	u32 len;
++	const u64 *r = prop(c->apcie, "reg", &len);
++	u64 pa;
++
++	if (!r || (idx + 1) * 16 > len || translate(c, r[idx * 2], &pa))
++		return NULL;
++	return devm_ioremap(c->dev, pa, r[idx * 2 + 1]);
++}
++
++static int apply(struct ctx *c, const u8 *node, const char *name, void __iomem *base, bool optional)
++{
++	u32 len;
++	const struct tun *t = prop(node, name, &len);
++
++	if (!t) {
++		if (!optional)
++			dev_err(c->dev, "no %s\n", name);
++		return optional ? 0 : -ENOENT;
++	}
++	dev_info(c->dev, "tunables %s: %u\n", name, len / (u32)sizeof(*t));
++	for (u32 i = 0; i < len / sizeof(*t); i++, t++) {
++		void __iomem *a = base + t->off;
++
++		switch (t->size) {
++		case 1: writeb((readb(a) & ~(u8)t->mask) | (u8)t->val, a); break;
++		case 2: writew((readw(a) & ~(u16)t->mask) | (u16)t->val, a); break;
++		case 4: writel((readl(a) & ~(u32)t->mask) | (u32)t->val, a); break;
++		case 8: writeq((readq(a) & ~t->mask) | t->val, a); break;
++		default: return -EINVAL;
++		}
++	}
++	return 0;
++}
++
++static void step(struct ctx *c, const char *what)
++{
++	dev_info(c->dev, "step %u: %s\n", ++c->step, what);
++	if (steptrace)
++		msleep(30);
++}
++
++static void set32(void __iomem *a, u32 v) { writel(readl(a) | v, a); }
++static void clr32(void __iomem *a, u32 v) { writel(readl(a) & ~v, a); }
++static int poll_set(void __iomem *a, u32 m)
++{
++	u32 v;
++
++	return readl_poll_timeout(a, v, (v & m) == m, 10, POLL_US);
++}
++
++static int pwrstates_n(struct device_node *np)
++{
++	struct property *pr = of_find_property(np, "pwrstates", NULL);
++
++	return pr ? pr->length / 8 : 0;
++}
++
++static int axi2af_bridge(struct ctx *c, void __iomem *axi);
++
++/* entries [from, to) of the DT list, in ADT clock-gates order with the parents first */
++static int pwrstates(struct ctx *c, struct device_node *np, int from, int to)
++{
++	for (int i = from; i < to; i++) {
++		u64 pa;
++		u32 v;
++		void __iomem *r;
++		int ret;
++
++		of_property_read_u64_index(np, "pwrstates", i, &pa);
++		r = devm_ioremap(c->dev, pa & ~3ULL, 4);
++		if (!r)
++			return -ENOMEM;
++		/* drivers/pmdomain/apple/pmgr-pwrstate.c: target in [3:0], actual in [7:4], active = 0xf */
++		/* XNU ApplePMGR::_setPSLevel 0x982d7f8: clear AUTO_ENABLE and WAS, wait for actual, then bits 30 and 10.
++		 * A domain that is already on and stays on (PS_AUTO f, as 0x370 = 1f0000ff under the running NVMe) is not touched. */
++		v = readl(r);
++		dev_info(c->dev, "pwrstate %llx was %x\n", pa, v);
++		if ((v & 0xff) == 0xff && !(v & (BIT(30) | BIT(10))) &&
++		    (!(v & BIT(28)) ||
++		     /* LLB leaves AUTO on 0x380..0x398, m4-loader pmgr_set_mode clears it before init */
++		     ((pa < 0x502280380ULL || pa > 0x502280398ULL) &&
++		      (v & GENMASK(27, 24)) == GENMASK(27, 24))))
++			continue;
++		writel((v & ~(BIT(28) | BIT(9) | BIT(8) | 0xfU)) | 0xf, r);
++		ret = readl_poll_timeout(r, v, ((v >> 4) & 0xf) == 0xf, 10, POLL_US);
++		dev_info(c->dev, "pwrstate %llx = %x%s\n", pa, v, ret ? (ps_strict ? " TIMEOUT" : " TIMEOUT, going on as XNU does") : "");
++		if (ret && ps_strict)
++			return ret;
++		if (!ret && (v & (BIT(30) | BIT(10))))
++			writel(v & ~(BIT(30) | BIT(10)), r);
++		/* S2 M5: XNU sets the APCIE_SYS_GP axi2af bridge bits as soon as 0x390 is on, before the ST gates */
++		if ((pa & ~3ULL) == 0x502280390ULL && c->axi) {
++			ret = axi2af_bridge(c, c->axi);
++			if (ret && ps_strict)
++				return ret;
++		}
++	}
++	return 0;
++}
++
++static int phy_clk(void __iomem *phy)
++{
++	set32(phy + PHY_CTRL, PHY_CLK0REQ);
++	if (poll_set(phy + PHY_CTRL, PHY_CLK0ACK))
++		return -ETIMEDOUT;
++	udelay(1);	/* as XNU's PHY init */
++	set32(phy + PHY_CTRL, PHY_CLK1REQ);
++	if (poll_set(phy + PHY_CTRL, PHY_CLK1ACK))
++		return -ETIMEDOUT;
++	return 0;
++}
++
++static int port_init(struct ctx *c, u32 port, u32 per_port, void __iomem *config, const u8 *bridge)
++{
++	u32 base = SHARED_REGS + port * per_port, i, lnk;
++	void __iomem *p = reg_map(c, base), *pp = reg_map(c, base + 2);
++	int ret;
++
++	if (!p || !pp)
++		return -ENOMEM;
++	static const struct { u16 off; u32 v; } w[] = {
++		{0x88, 0x110}, {0x100, 0xffffffff}, {0x148, 0xffffffff}, {0x210, 0xffffffff}, {0x80, 0}, {0x84, 0},
++		{0x104, 0xfffffff0}, {0x124, 0x100}, {0x16c, 0}, {0x13c, 0x10}, {0x800, 0x100100}, {0x808, 0x1000ff}, {0x82c, 0},
++	};
++	for (i = 0; i < ARRAY_SIZE(w); i++)
++		writel(w[i].v, p + w[i].off);
++	for (i = 0; i < 16; i++)
++		writel(0, p + 0x3000 + 4 * i);
++	for (i = 0; i < 512; i++)
++		writel(0, p + PORT_MSIMAP + 4 * i);
++	writel(xnu_phy ? 0x3020000 : 0x3000000, p + 0x130);   /* S2 M3: XNU value 0x3020000; m4-loader 0x3000000 */
++	if (xnu_phy)
++		writel(0, p + 0x13c);                           /* S2 M3b: XNU leaves 0x13c at 0; m4-loader 0x10 */
++	writel(0x10, p + 0x140);
++	writel(0x253770, p + 0x144);
++	writel(0, p + 0x21c);
++	writel(0, p + 0x834);
++	writel(0, p + 0x83c);
++	ret = apply(c, bridge, "apcie-config-tunables", p, false);
++	if (ret)
++		return ret;
++	set32(p + PORT_APPCLK, BIT(0));
++	clr32(pp + PHY_CTRL, PHY_CLK0REQ | PHY_CLK1REQ);
++	ret = phy_clk(pp);
++	if (ret)
++		return ret;
++	clr32(pp + PHY_CTRL, 0x10);
++	set32(pp + PHY_CTRL, 0x200);
++	set32(pp + PHY_CTRL, 0x400);
++	set32(p + PORT_RESET_T602X, BIT(0));
++	if (poll_set(p + PORT_STATUS, BIT(0)))
++		return -ETIMEDOUT;
++	ret = readl_poll_timeout(p + PORT_LINKSTS, lnk, !(lnk & PORT_LINKSTS_BUSY), 10, POLL_US);
++	if (ret)
++		return ret;
++	set32(config + DWC_DBI_RO_WR, BIT(0));
++	ret = apply(c, bridge, "pcie-rc-tunables", config, true) ?:
++	      apply(c, bridge, "pcie-rc-gen3-shadow-tunables", config, true) ?:
++	      apply(c, bridge, "pcie-rc-gen4-shadow-tunables", config, true);
++	if (ret)
++		return ret;
++	/* pcie.c: speed from maximum-link-speed (or the first child's target-link-speed when it says 1), one lane */
++	{
++		const u32 *ms = prop(bridge, "maximum-link-speed", NULL);
++
++		if (ms && *ms) {
++			u32 sp = *ms;
++
++			if (sp == 1) {
++				const struct adt_node *bn = (const void *)bridge;
++				const u8 *q = bridge + sizeof(*bn);
++
++				for (i = 0; i < bn->nprops; i++)
++					q = next_prop(q);
++				if (bn->nchild) {
++					const u32 *t = prop(q, "target-link-speed", NULL);
++
++					if (!t)
++						t = prop(q, "expected-link-speed", NULL);
++					if (t && (int)*t > 0)
++						sp = *t;
++				}
++			}
++			writel((readl(config + 0x70 + 0x0c) & ~GENMASK(3, 0)) | FIELD_PREP(GENMASK(3, 0), sp), config + 0x70 + 0x0c);
++			writel((readl(config + 0x70 + 0x2c) & ~GENMASK(6, 1)) | FIELD_PREP(GENMASK(6, 1), (1 << sp) - 1), config + 0x70 + 0x2c);
++			writew((readw(config + 0x70 + 0x30) & ~GENMASK(3, 0)) | FIELD_PREP(GENMASK(3, 0), sp), config + 0x70 + 0x30);
++			set32(config + 0x80c, BIT(17));
++		}
++	}
++	writel((readl(config + 0x710) & ~GENMASK(21, 16)) | FIELD_PREP(GENMASK(21, 16), 1), config + 0x710);
++	writel((readl(config + 0x80c) & ~GENMASK(12, 8)) | FIELD_PREP(GENMASK(12, 8), 1), config + 0x80c);
++	writel((readl(config + 0x70 + 0x0c) & ~GENMASK(9, 4)) | FIELD_PREP(GENMASK(9, 4), 1), config + 0x70 + 0x0c);
++	clr32(config + DWC_DBI_RO_WR, BIT(0));
++	(void)readl(p + PORT_LINKSTS);
++	dev_info(c->dev, "port %u prepared\n", port);
++	return 0;
++}
++
++/*
++ * T6041 axi2af workaround for APCIE_SYS_GP. XNU's PMGR restore sets bit 0 of
++ * base+0x104 and base+0x108 for every enabled record whose PS target is f (power-up branch); a later
++ * power-up first waits for actual f and bit 11 clear. Record 14 of XNU's workaround table:
++ * map 2, PS 0x390 (APCIE_SYS_GP), base 0x416000000 = apcie0 reg 4. ADT pmgr axi2af-hack = 0x7fff enables all 15.
++ * Nothing on the raw path writes these; if auto-PM gated the domain after LLB, they are 0 here.
++ */
++static int axi2af_bridge(struct ctx *c, void __iomem *axi)
++{
++	void __iomem *ps = devm_ioremap(c->dev, 0x502280390ULL, 4);
++	u32 v, b0, b1;
++	int ret;
++
++	if (!ps)
++		return -ENOMEM;
++	ret = readl_poll_timeout(ps, v, ((v >> 4) & 0xf) == 0xf && !(v & PS_BUSY), 10, POLL_US);
++	b0 = readl(axi + AXI2AF_BRIDGE0);
++	b1 = readl(axi + AXI2AF_BRIDGE1);
++	dev_info(c->dev, "axi2af: ps 0x390 = %x%s, bridge %x %x\n", v, ret ? " NOT READY" : "", b0, b1);
++	if (ret)
++		return ret;
++	writel(b0 | 1, axi + AXI2AF_BRIDGE0);
++	writel(b1 | 1, axi + AXI2AF_BRIDGE1);
++	dev_info(c->dev, "axi2af: bridge now %x %x\n", readl(axi + AXI2AF_BRIDGE0), readl(axi + AXI2AF_BRIDGE1));
++	return 0;
++}
++
++/* XNU root complex enable: CIO3PLL tunables, then the PLL config (PCIECLKGEN tunables, clkgen+4 |= bit 31,
++ * clkgen+0 = (v & ~6) | 1, wait bit 31 = 0), then clkgen+0 |= bit 5. Unconditional in XNU, on cold boot over LLB's PLL as well. */
++static int pll_xnu(struct ctx *c, void __iomem *r5, void __iomem *r6)
++{
++	u32 v;
++	int ret;
++
++	dev_info(c->dev, "cio3pll %x %x, clkgen %x %x before\n", readl(r5), readl(r5 + 4), readl(r6), readl(r6 + 4));
++	ret = apply(c, c->apcie, "apcie-cio3pllcore-tunables", r5, true) ?:
++	      apply(c, c->apcie, "apcie-pcieclkgen-tunables", r6, true);
++	if (ret)
++		return ret;
++	set32(r6 + 4, BIT(31));
++	writel((readl(r6) & ~6U) | 1, r6);
++	ret = readl_poll_timeout(r6, v, !(v & BIT(31)), 10, POLL_US);
++	dev_info(c->dev, "clkgen %x %x after%s\n", readl(r6), readl(r6 + 4), ret ? " TIMEOUT" : "");
++	if (ret)
++		return ret;
++	set32(r6, BIT(5));
++	return 0;
++}
++
++/* LLB programs these once and leaves the domains on AUTO, PS_MIN 0. XNU always redoes them,
++ * the raw loader never. Runs only if the first clkgen tunable is gone. */
++static int clkgen_restore(struct ctx *c, void __iomem *r5, void __iomem *r6)
++{
++	u32 len, v;
++	const struct tun *t = prop(c->apcie, "apcie-pcieclkgen-tunables", &len);
++	int ret;
++
++	if (!t || len < sizeof(*t) || (readl(r6 + t->off) & (u32)t->mask) == (u32)t->val)
++		return 0;
++	dev_warn(c->dev, "clkgen lost: %x %x, reprogramming\n", readl(r6), readl(r6 + 4));
++	ret = apply(c, c->apcie, "apcie-cio3pllcore-tunables", r5, true) ?:
++	      apply(c, c->apcie, "apcie-pcieclkgen-tunables", r6, false);
++	if (ret)
++		return ret;
++	/* the PLL config, then clkgen bit 5 */
++	set32(r6 + 4, BIT(31));
++	writel((readl(r6) & ~6U) | 1, r6);
++	ret = readl_poll_timeout(r6, v, !(v & BIT(31)), 10, POLL_US);
++	if (ret)
++		return ret;
++	set32(r6, BIT(5));
++	return 0;
++}
++
++static int macho_pcie_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct device_node *adt_np;
++	struct resource r;
++	struct ctx *c;
++	void __iomem *config, *rc, *phy, *phyb, *phyc, *ip, *axi;
++	const u32 *ports;
++	u32 rl, phy_i;
++	int ret, per_port, npw;
++
++	c = devm_kzalloc(dev, sizeof(*c), GFP_KERNEL);
++	if (!c)
++		return -ENOMEM;
++	c->dev = dev;
++	adt_np = of_parse_phandle(dev->of_node, "adt", 0);
++	if (!adt_np || of_address_to_resource(adt_np, 0, &r))
++		return -ENODEV;
++	c->adt_len = resource_size(&r);
++	c->adt = devm_memremap(dev, r.start, c->adt_len, MEMREMAP_WB);
++	if (IS_ERR(c->adt))
++		return PTR_ERR(c->adt);
++	c->armio = child(c->adt, "arm-io");
++	c->apcie = c->armio ? child(c->armio, "apcie0") : NULL;
++	if (!c->apcie)
++		return dev_err_probe(dev, -ENODEV, "no /arm-io/apcie0 in the ADT copy\n");
++	ports = prop(c->apcie, "#ports", NULL);
++	if (!prop(c->apcie, "reg", &rl) || !ports || !*ports)
++		return -EINVAL;
++	per_port = (rl / 16 - SHARED_REGS) / *ports;
++	config = reg_map(c, 0);
++	rc = reg_map(c, 1);
++	phy = reg_map(c, 2);
++	ip = reg_map(c, 3);
++	axi = reg_map(c, 4);
++	if (!config || !rc || !phy || !ip || !axi)
++		return -ENOMEM;
++	c->axi = axi;
++	npw = pwrstates_n(dev->of_node);
++	if (xnu_order) {
++		u64 last = 0;
++
++		of_property_read_u64_index(dev->of_node, "pwrstates", npw - 1, &last);
++		if (npw < 2 || last != 0x502280398ULL) {
++			dev_warn(dev, "last pwrstate %llx is not APCIE_PHY_SW, loader order\n", last);
++			xnu_order = false;
++		}
++	}
++	/* the last DT entry is APCIE_PHY_SW, the last ADT clock gate: XNU turns it on only after the PLL */
++	step(c, xnu_order ? "power domains but the PHY" : "power domains");
++	ret = pwrstates(c, dev->of_node, 0, xnu_order && npw > 1 ? npw - 1 : npw);
++	if (ret)
++		return dev_err_probe(dev, ret, "power domains\n");
++	/* m4-loader pcie.c: T8122 compat coalesces common and PHY 0 into reg[2]; tunables stay on reg[2] */
++	phyc = phy + 0x4000;
++	phyb = phy + 0x8000;
++	step(c, "axi2af bridge bits (XNU restore order)");
++	ret = axi2af_bridge(c, axi);
++	if (ret)
++		return dev_err_probe(dev, ret, "axi2af bridge\n");
++	step(c, "axi2af tunables");
++	ret = apply(c, c->apcie, "apcie-axi2af-tunables", axi, true);
++	if (ret)
++		return ret;
++	/* reg 5 CIO3PLL, reg 6 clkgen. XNU always programs them here; the raw loader never does, LLB did */
++	{
++		void __iomem *r5 = reg_map(c, 5), *r6 = reg_map(c, 6);
++
++		if (!r5 || !r6)
++			return dev_err_probe(dev, -ENOMEM, "no CIO3PLL or clkgen reg\n");
++		step(c, xnu_order ? "PLL (XNU wake order)" : "PLL if lost");
++		if (xnu_order) {
++			ret = pll_xnu(c, r5, r6);
++		} else {
++			dev_info(dev, "cio3pll %x %x, clkgen %x %x\n", readl(r5), readl(r5 + 4), readl(r6), readl(r6 + 4));
++			ret = clkgen_restore(c, r5, r6);
++		}
++		if (ret)
++			return dev_err_probe(dev, ret, "PCIe PLL\n");
++	}
++	if (xnu_order && npw > 1) {
++		step(c, "power domain APCIE_PHY_SW");
++		ret = pwrstates(c, dev->of_node, npw - 1, npw);
++		if (ret)
++			return dev_err_probe(dev, ret, "APCIE_PHY_SW\n");
++	}
++	step(c, "common and PHY tunables");
++	/* m4-loader pcie.c:429-443: after axi2af, before common */
++	writel(0, rc + 0x4);
++	ret = apply(c, c->apcie, "apcie-common-tunables", rc, true) ?:
++	      apply(c, c->apcie, "apcie-phy-tunables", phy, true);
++	if (ret)
++		return ret;
++	/* XNU root complex enable: refpll_clk_good, PhyCommon(0) bit 31, before the PHY init. XNU spins for ever; here a
++	 * missing bit is only reported, the CLK0/CLK1 acks below fail on their own if the reference clock is really absent */
++	step(c, "refpll_clk_good");
++	{
++		u32 v;
++
++		ret = readl_poll_timeout(phyc, v, v & BIT(31), 10, POLL_US);
++		dev_info(dev, "phy common %x%s\n", v, ret ? " refpll_clk_good NOT SET" : "");
++	}
++	/* one PHY at phy_base + 0, as the J616s ADT names no per-PHY tables when num_phys is 1 (pcie.c:505-512) */
++	for (phy_i = 0; phy_i < 1; phy_i++) {
++		step(c, "PHY clocks");
++		ret = phy_clk(phyb);
++		if (ret)
++			return dev_err_probe(dev, ret, "PHY clock, ctrl %x\n", readl(phyb + PHY_CTRL));
++		step(c, "PHY IP tunables");
++		clr32(phyb + PHY_CTRL, PHY_RESET_T8132);
++		udelay(1);
++		writel(readl(phyb + 4) | 1, phyb + 4);
++		ret = apply(c, c->apcie, "apcie-phy-ip-pll-tunables", ip, false) ?:
++		      apply(c, c->apcie, "apcie-phy-ip-auspma-tunables", ip, false);
++		if (ret)
++			return ret;
++		if (xnu_phy)
++			clr32(ip + 0x90, BIT(16));                      /* S2 M2: XNU between the AUSPMA tunables and phyP[4] |= 0x10 */
++		writel(readl(phyb + 4) | 0x10, phyb + 4);
++	}
++	step(c, "PHY common mode, max_pclk_good");
++	writel((readl(phyc + PHYCMN_CLK) & ~PHYCMN_MODE) | FIELD_PREP(PHYCMN_MODE, 1), phyc + PHYCMN_CLK);
++	if (poll_set(phyb + 0x8, 1))
++		return dev_err_probe(dev, -ETIMEDOUT, "PHY clock enable, %x\n", readl(phyb + 0x8));
++	set32(phyb + PHY_CTRL, xnu_phy ? BIT(27) : 0x200);      /* S2 M1: XNU sets bit 27; m4-loader 0x200 (raw link-up on this Mac) */
++	step(c, "RC init, gtb_initialized");
++	writel(0x140, rc + 0x54);
++	writel(1, rc + 0x50);
++	if (poll_set(rc + 0x58, 1))
++		return dev_err_probe(dev, -ETIMEDOUT, "RC init, %x\n", readl(rc + 0x58));
++	for (u32 port = 0; port < *ports; port++) {
++		char name[16];
++		const u8 *bridge;
++
++		snprintf(name, sizeof(name), "pci-bridge%u", port);
++		bridge = child(c->apcie, name);
++		if (!bridge)
++			continue;
++		step(c, name);
++		ret = port_init(c, port, per_port, config + ((resource_size_t)port << 15), bridge);
++		if (ret)
++			return dev_err_probe(dev, ret, "port %u\n", port);
++	}
++	dev_info(dev, "host prepared, pcie-apple may load\n");
++	return 0;
++}
++
++static const struct of_device_id macho_pcie_of[] = {
++	{ .compatible = "omarchy-m4,pcie-init" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, macho_pcie_of);
++
++static struct platform_driver macho_pcie_driver = {
++	.probe = macho_pcie_probe,
++	.driver = { .name = "pcie-macho-init", .of_match_table = macho_pcie_of },
++};
++module_platform_driver(macho_pcie_driver);
++MODULE_DESCRIPTION("J616s PCIe host init under the SPTM monitor (port of m4-loader pcie.c)");
++MODULE_LICENSE("Dual MIT/GPL");
+diff --git c/drivers/phy/apple/t6040-usb2.c i/drivers/phy/apple/t6040-usb2.c
+index 20fb5e9da5cb..a4efc08b3ad0 100644
+--- c/drivers/phy/apple/t6040-usb2.c
++++ i/drivers/phy/apple/t6040-usb2.c
+@@ -233,6 +233,7 @@ struct t6040_usb2_phy {
+ 	struct apple_tunable *tunable_pipehandler;
+ 	/* ADT tunable_USB2PHY_HOST, applied after the signal setup. */
+ 	struct apple_tunable *tunable_usb2_host;
++	bool device;
+ 	struct apple_rtkit *rtk;
+ 	struct completion app_reply;
+ 	enum typec_orientation orientation;
+@@ -275,7 +276,7 @@ static int t6040_usb2_set_mode(struct phy *phy, enum phy_mode mode, int submode)
+ {
+ 	struct t6040_usb2_phy *tphy = phy_get_drvdata(phy);
+ 
+-	if (mode != PHY_MODE_USB_HOST)
++	if (mode != (tphy->device ? PHY_MODE_USB_DEVICE : PHY_MODE_USB_HOST))
+ 		return -EOPNOTSUPP;
+ 
+ 	guard(mutex)(&tphy->lock);
+@@ -305,6 +306,26 @@ static u32 t6040_usb2_sig_want(struct t6040_usb2_phy *tphy)
+ 	return want & T6040_USB2_SIG_INIT;
+ }
+ 
++/* omarchy-m4,usb2-device: the writes of m1n1 usb_phy_bringup() (MIT, Copyright The Asahi Linux Contributors), which enumerates as a device on this port. */
++static int t6040_usb2_power_on_device(struct t6040_usb2_phy *tphy)
++{
++	writel(0x01c1000f, tphy->usb2 + T6040_USB2_SIG);
++	writel(T6040_USB2_CTL_RESET | T6040_USB2_CTL_PORT_RESET, tphy->usb2 + T6040_USB2_CTL);
++	t6040_usb2_clear32(tphy->usb2 + T6040_USB2_CTL, T6040_USB2_CTL_RESET);
++	t6040_usb2_clear32(tphy->usb2 + T6040_USB2_CTL, T6040_USB2_CTL_PORT_RESET);
++	writel(0x008c0813, tphy->usb2 + T6040_USB2_MISCTUNE);
++	writel(T6040_USB2_USBCTL_MODE_HOST, tphy->usb2 + T6040_USB2_USBCTL);
++
++	writel(FIELD_PREP(T6040_PIPEHANDLER_MUX_CTRL_CLK, T6040_PIPEHANDLER_MUX_CLK_DUMMY) |
++	       FIELD_PREP(T6040_PIPEHANDLER_MUX_CTRL_DATA, T6040_PIPEHANDLER_MUX_DATA_DUMMY),
++	       tphy->pipehandler + T6040_PIPEHANDLER_MUX_CTRL);
++	writel(0x9332, tphy->pipehandler + T6040_PIPEHANDLER_NONSELECTED_OVERRIDE);
++
++	tphy->powered = true;
++	dev_info(tphy->dev, "USB2 device sequence complete\n");
++	return 0;
++}
++
+ static int t6040_usb2_power_on(struct phy *phy)
+ {
+ 	struct t6040_usb2_phy *tphy = phy_get_drvdata(phy);
+@@ -314,6 +335,8 @@ static int t6040_usb2_power_on(struct phy *phy)
+ 	if (tphy->shutdown_failed)
+ 		return -EIO;
+ 
++	if (tphy->device)
++		return 0;   /* done at the reset deassert, m1n1's order: PHY, PIPE, then reset_n */
+ 	if (tphy->mode != PHY_MODE_USB_HOST)
+ 		return -EINVAL;
+ 	if (tphy->powered)
+@@ -1836,6 +1859,8 @@ static int t6040_usb2_reset_deassert(struct reset_controller_dev *rcdev,
+ 	guard(mutex)(&tphy->lock);
+ 	if (tphy->shutdown_failed)
+ 		return -EIO;
++	if (tphy->device && !tphy->powered)
++		t6040_usb2_power_on_device(tphy);
+ 	t6040_usb2_clear32(tphy->pipehandler + T6040_PIPEHANDLER_AON_GEN,
+ 			   T6040_PIPEHANDLER_AON_GEN_DWC3_FORCE_CLAMP_EN);
+ 	t6040_usb2_set32(tphy->pipehandler + T6040_PIPEHANDLER_AON_GEN,
+@@ -1907,7 +1932,8 @@ static int t6040_usb2_probe(struct platform_device *pdev)
+ 	 * provider implements exactly one mode, so start in it; set_mode
+ 	 * still rejects every request that is not PHY_MODE_USB_HOST.
+ 	 */
+-	tphy->mode = PHY_MODE_USB_HOST;
++	tphy->device = of_property_read_bool(dev->of_node, "omarchy-m4,usb2-device");
++	tphy->mode = tphy->device ? PHY_MODE_USB_DEVICE : PHY_MODE_USB_HOST;
+ 	mutex_init(&tphy->lock);
+ 	platform_set_drvdata(pdev, tphy);
+ 
+diff --git c/drivers/usb/dwc3/dwc3-apple.c i/drivers/usb/dwc3/dwc3-apple.c
+index 998b6cffe629..7d7abc75405d 100644
+--- c/drivers/usb/dwc3/dwc3-apple.c
++++ i/drivers/usb/dwc3/dwc3-apple.c
+@@ -139,6 +139,7 @@ struct dwc3_apple {
+ 	struct usb_role_switch *role_sw;
+ 	bool fixed_hub;
+ 	bool host_only;
++	bool device_only;
+ 
+ 	struct mutex lock;
+ 
+@@ -629,6 +630,9 @@ static bool dwc3_apple_host_only(struct device *dev)
+ 	if (!IS_ENABLED(CONFIG_USB_DWC3_GADGET) && !IS_ENABLED(CONFIG_USB_DWC3_DUAL_ROLE))
+ 		return true;
+ 
++	if (of_property_read_bool(dev->of_node, "omarchy-m4,device-only"))
++		return false;
++
+ 	return of_device_is_compatible(dev->of_node, "apple,t6040-dwc3");
+ }
+ 
+@@ -731,7 +735,7 @@ static int dwc3_usb_role_switch_set(struct usb_role_switch *sw, enum usb_role ro
+ 		return -ESHUTDOWN;
+ 
+ 	/* A controller behind a fixed hub is a host regardless of the connectors */
+-	if (appledwc->fixed_hub)
++	if (appledwc->fixed_hub || appledwc->device_only)
+ 		return 0;
+ 
+ 	/*
+@@ -839,6 +843,7 @@ static int dwc3_apple_probe(struct platform_device *pdev)
+ 	appledwc->dev = &pdev->dev;
+ 	appledwc->fixed_hub = dwc3_apple_has_fixed_hub(dev);
+ 	appledwc->host_only = dwc3_apple_host_only(dev);
++	appledwc->device_only = of_property_read_bool(dev->of_node, "omarchy-m4,device-only");
+ 	/* Tested on T6040 only, where the PHY driver and the DARTs follow runtime PM. */
+ 	appledwc->idle_rpm = of_device_is_compatible(dev->of_node, "apple,t6040-dwc3");
+ 	mutex_init(&appledwc->lock);
+@@ -910,6 +915,15 @@ static int dwc3_apple_probe(struct platform_device *pdev)
+ 	if (ret)
+ 		return dev_err_probe(&pdev->dev, ret, "Failed to setup role switch\n");
+ 
++	/* A device with no port controller in the tree: VBUS is forced in the PHY, nothing to wait for. */
++	if (appledwc->device_only) {
++		scoped_guard(mutex, &appledwc->lock)
++			ret = dwc3_apple_init(appledwc, DWC3_APPLE_DEVICE);
++		if (ret)
++			dev_err(dev, "Failed to start device mode, err=%d\n", ret);
++		return 0;
++	}
++
+ 	if (!appledwc->fixed_hub)
+ 		return 0;
+ 
+diff --git c/drivers/usb/dwc3/gadget.c i/drivers/usb/dwc3/gadget.c
+index ee837235630a..2abf88c89a26 100644
+--- c/drivers/usb/dwc3/gadget.c
++++ i/drivers/usb/dwc3/gadget.c
+@@ -9,6 +9,7 @@
+  */
+ 
+ #include <linux/kernel.h>
++#include <linux/moduleparam.h>
+ #include <linux/delay.h>
+ #include <linux/slab.h>
+ #include <linux/spinlock.h>
+@@ -27,6 +28,11 @@
+ #include "gadget.h"
+ #include "io.h"
+ 
++/* J616s, as on the raw native gadget 2026-10-20: omit only empty endpoint priming. */
++static bool j616s_skip_empty_starttransfer;
++module_param(j616s_skip_empty_starttransfer, bool, 0400);
++MODULE_PARM_DESC(j616s_skip_empty_starttransfer, "J616s high-speed: omit only empty endpoint priming");
++
+ #define DWC3_ALIGN_FRAME(d, n)	(((d)->frame_number + ((d)->interval * (n))) \
+ 					& ~((d)->interval - 1))
+ 
+@@ -971,8 +977,10 @@ static int __dwc3_gadget_ep_enable(struct dwc3_ep *dep, unsigned int action)
+ 	 * Issue StartTransfer here with no-op TRB so we can always rely on No
+ 	 * Response Update Transfer command.
+ 	 */
+-	if (usb_endpoint_xfer_bulk(desc) ||
+-			usb_endpoint_xfer_int(desc)) {
++	if (!(j616s_skip_empty_starttransfer && dwc->dr_mode == USB_DR_MODE_PERIPHERAL &&
++	      dwc->maximum_speed == USB_SPEED_HIGH && !dep->stream_capable) &&
++	    (usb_endpoint_xfer_bulk(desc) ||
++	     usb_endpoint_xfer_int(desc))) {
+ 		struct dwc3_gadget_ep_cmd_params params;
+ 		struct dwc3_trb	*trb;
+ 		dma_addr_t trb_dma;
+diff --git c/drivers/usb/gadget/function/f_acm.c i/drivers/usb/gadget/function/f_acm.c
+index c628d02bfb1d..0bfa1c59935c 100644
+--- c/drivers/usb/gadget/function/f_acm.c
++++ i/drivers/usb/gadget/function/f_acm.c
+@@ -534,12 +534,20 @@ static int acm_cdc_notify(struct f_acm *acm, u8 type, u16 value,
+ 	return status;
+ }
+ 
++/* J616s, as on the raw native gadget 2026-10-20; notification descriptors remain present. */
++static bool j616s_suppress_notifications;
++module_param(j616s_suppress_notifications, bool, 0400);
++MODULE_PARM_DESC(j616s_suppress_notifications, "J616s: suppress serial-state notifications only");
++
+ static int acm_notify_serial_state(struct f_acm *acm)
+ {
+ 	struct usb_composite_dev *cdev = acm->port.func.config->cdev;
+ 	int			status;
+ 	__le16			serial_state;
+ 
++	if (j616s_suppress_notifications)
++		return 0;
++
+ 	spin_lock(&acm->lock);
+ 	if (acm->notify_req) {
+ 		dev_dbg(&cdev->gadget->dev, "acm ttyGS%d serial state %04x\n",
+diff --git c/rust/bindings/bindings_helper.h i/rust/bindings/bindings_helper.h
+index 23aa68592336..896862273917 100644
+--- c/rust/bindings/bindings_helper.h
++++ i/rust/bindings/bindings_helper.h
+@@ -29,6 +29,7 @@
+ #include <linux/hrtimer_types.h>
+ 
+ #include <linux/acpi.h>
++#include <linux/soc/aurora/apif-mmio.h>
+ #include <linux/gpu_buddy.h>
+ #include <drm/drm_auth.h>
+ #include <drm/drm_device.h>

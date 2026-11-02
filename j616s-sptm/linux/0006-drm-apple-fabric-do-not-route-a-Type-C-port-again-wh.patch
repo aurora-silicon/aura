@@ -1,0 +1,93 @@
+From 289148ffb9ac5e21f551bac84fb66405b8353c48 Mon Sep 17 00:00:00 2001
+From: fbalazsy <frantisekbalazsy@gmail.com>
+Date: Tue, 27 Oct 2026 15:29:38 +0100
+Subject: [PATCH 06/11] drm/apple: fabric: do not route a Type-C port again
+ when its sink drops HPD
+
+When the sink of a desktop 26.x Type-C route drops HPD, the route gives
+its pipeline back and the freed pipeline goes to a port left waiting.
+The port's own DP state still said HPD at that point, so it was taken
+as waiting itself and routed again at once, onto the same pipeline or,
+with an HDMI display on the hybrid, onto the other one, and its
+connection was replayed against a sink without HPD.
+
+Clear the port's HPD before the pipeline is freed (the pairing pass
+still sees what it counted before), connect a live HDMI display the
+hybrid has gone back to, as the DP-exit path does, and leave a parked
+hybrid without a link crossbar: the released route's control may now
+belong to the other pipeline.  The error path that restores the fixed
+route points the link crossbar at it again.
+---
+ drivers/gpu/drm/apple/dcp-fabric.c | 26 +++++++++++++++++++++-----
+ 1 file changed, 21 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/gpu/drm/apple/dcp-fabric.c b/drivers/gpu/drm/apple/dcp-fabric.c
+index 4373ce946536..f1cede0e34e7 100644
+--- a/drivers/gpu/drm/apple/dcp-fabric.c
++++ b/drivers/gpu/drm/apple/dcp-fabric.c
+@@ -450,9 +450,11 @@ static int dcp_typec_route_activate(struct apple_dcp_typec_route *route,
+ 
+ 			restore_ret = mux_control_select(dcp->fixed_xbar,
+ 							 dcp->fixed_mux_index);
+-			if (!restore_ret)
++			if (!restore_ret) {
+ 				dcp->fixed_route_selected = true;
+-			else
++				if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP)
++					WRITE_ONCE(dcp->xbar, dcp->fixed_xbar);
++			} else
+ 				dev_err(dcp->dev,
+ 					"failed to restore fixed display route: %d\n",
+ 					restore_ret);
+@@ -646,6 +648,9 @@ static int dcp_typec_route_deactivate(struct apple_dcp_typec_route *route)
+ 		} else {
+ 			dcp->phy = dcp->typec_routes[0].phy;
+ 			dcp->dptx_phy = dcp->typec_routes[0].dptx_phy;
++			/* The released route's control may go to another pipeline. */
++			if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP)
++				WRITE_ONCE(dcp->xbar, NULL);
+ 		}
+ 	} else {
+ 		/*
+@@ -1555,6 +1560,10 @@ static int dcp_typec_route_set(struct typec_mux_dev *mux,
+ 	port->applied_conf = dp_conf;
+ 	/* Failed route acquisition must remain retryable on the next update. */
+ 	port->applied_valid = false;
++
++	/* did the pairing pass count this port's direct stream so far? */
++	was_counted = port->dp_wanted && port->dp_hpd;
++
+ 	/* Keep a direct route until DCP acknowledges release of its display. */
+ 	if (!hpd && port->owner && !port->owner->tunnel) {
+ 		struct apple_dcp *dcp = port->owner->dcp;
+@@ -1577,17 +1586,24 @@ static int dcp_typec_route_set(struct typec_mux_dev *mux,
+ 		if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP) {
+ 			port->preferred_route = port->owner;
+ 			port->hpd = false;
++			/*
++			 * Not waiting for a pipeline either until HPD returns:
++			 * the pipeline just freed must not route this port again.
++			 */
++			port->dp_hpd = false;
+ 			ret = dcp_typec_route_deactivate(port->owner);
+ 			if (ret)
+ 				return ret;
+ 			port->owner = NULL;
++
++			/* The hybrid went back to a live HDMI display. */
++			if (dcp->hdmi_hpd && dcp->active &&
++			    gpiod_get_value_cansleep(dcp->hdmi_hpd))
++				dcp_dptx_connect(dcp, 0);
+ 			dcp_typec_pipeline_freed();
+ 		}
+ 	}
+ 
+-	/* did the pairing pass count this port's direct stream so far? */
+-	was_counted = port->dp_wanted && port->dp_hpd;
+-
+ 	if (!is_dp) {
+ 		port->dp_wanted = false;
+ 		port->dp_hpd = false;
+-- 
+2.56.0
+

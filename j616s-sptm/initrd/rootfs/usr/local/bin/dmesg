@@ -1,0 +1,5 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+# busybox dmesg has no -w; the collectors use "dmesg -w" to follow the kernel log
+for a in "$@"; do case "$a" in -w|--follow|-*w*) exec cat /dev/kmsg ;; esac; done
+exec /bin/busybox dmesg "$@"

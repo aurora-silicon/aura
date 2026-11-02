@@ -1,0 +1,169 @@
+From 842b648cab135d7391ab61a12eb18b8a6afc6eb5 Mon Sep 17 00:00:00 2001
+From: Ryan Murray <ryan@aurorasilicon.org>
+Date: Sat, 31 Oct 2026 20:25:15 +1100
+Subject: [PATCH 18/18] hwmon: macsmc: Retry manual mode while the fan unlock
+ settles
+
+The firmware-policy change kept the read-side wait for a fan to leave
+system mode, but removed the bounded retry of the following manual-mode
+write. An EIO from that first write now aborts the user request and
+immediately relocks the fans. The previous path could retry it.
+
+Keep the mode read before unlocking and before each attempt, and retry
+EIO or EBUSY from the manual-mode write within the existing ten-second
+unlock budget. Only write the target after manual mode succeeds. Other
+errors still return immediately, and exhausted retries retain the last
+error and release the unlock when no other fan is manual.
+
+This does not reinstate the deliberately refused pre-unlock write or
+autonomous fan policy. Direct legacy mode writes are unchanged.
+
+Extend the KUnit model to reject manual mode temporarily after leaving
+system mode, starting with a zero target. Cover eventual acceptance,
+permanent refusal and relock without a target write, and takeover of an
+already spinning firmware fan.
+
+Fixes: cc3766d3c017 ("hwmon: macsmc: Leave fan policy to firmware until a user requests control")
+Assisted-by: LLM
+Signed-off-by: Ryan Murray <ryan@aurorasilicon.org>
+---
+ drivers/hwmon/macsmc-hwmon-test.c | 61 +++++++++++++++++++++++++++++++
+ drivers/hwmon/macsmc-hwmon.c      | 21 ++++++++---
+ 2 files changed, 76 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/hwmon/macsmc-hwmon-test.c b/drivers/hwmon/macsmc-hwmon-test.c
+index 1f8fa33dc2e0..e549c6d61441 100644
+--- a/drivers/hwmon/macsmc-hwmon-test.c
++++ b/drivers/hwmon/macsmc-hwmon-test.c
+@@ -110,6 +110,8 @@ struct macsmc_fan_test {
+ 	int ftst_writes;
+ 	int refused;
+ 	int mode_reads;
++	int manual_busy[2];
++	int target_writes;
+ 	smc_key fail_key;
+ };
+ 
+@@ -175,9 +177,15 @@ static int fan_test_write(struct apple_smc *smc, smc_key key, const void *buf, s
+ 			t->refused++;
+ 			return -EIO;
+ 		}
++		if (value == MACSMC_FAN_MODE_MANUAL && t->manual_busy[i]) {
++			t->manual_busy[i]--;
++			return -EIO;
++		}
+ 		t->mode[i] = value;
+ 		return size;
+ 	case __SMC_KEY('F', 0, 'T', 'g'):
++		KUNIT_EXPECT_EQ(t->test, t->mode[i], MACSMC_FAN_MODE_MANUAL);
++		t->target_writes++;
+ 		t->target[i] = value;
+ 		return size;
+ 	}
+@@ -395,7 +403,60 @@ static void macsmc_fan_test_unlock_fails(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, t->refused, 0);
+ }
+ 
++/* A stopped fan may leave mode 3 before the manual-mode write is ready. */
++static void macsmc_fan_test_stopped_manual_busy(struct kunit *test)
++{
++	struct macsmc_fan_test *t = test->priv;
++
++	KUNIT_ASSERT_EQ(test, t->target[0], 0);
++	t->manual_busy[0] = 2;
++	KUNIT_ASSERT_EQ(test, macsmc_hwmon_set_fan(&t->hwmon, 0, 2500), 0);
++	KUNIT_EXPECT_EQ(test, t->manual_busy[0], 0);
++	KUNIT_EXPECT_EQ(test, t->target[0], FAN_TEST_F2500);
++	KUNIT_EXPECT_EQ(test, t->target_writes, 1);
++	KUNIT_EXPECT_EQ(test, t->hwmon.fan.manual, 1);
++	/* Unlock, three mode attempts, then the target. No locked-mode write. */
++	KUNIT_EXPECT_EQ(test, t->writes, 5);
++	KUNIT_EXPECT_EQ(test, t->refused, 0);
++	KUNIT_ASSERT_EQ(test, macsmc_hwmon_set_fan(&t->hwmon, 0, 0), 0);
++	fan_test_released(test, t);
++	KUNIT_EXPECT_EQ(test, t->ftst_writes, 2);
++}
++
++/* Exhausting the post-unlock retries must release Ftst, without a target. */
++static void macsmc_fan_test_manual_busy_timeout(struct kunit *test)
++{
++	struct macsmc_fan_test *t = test->priv;
++
++	t->fail_key = SMC_KEY(F0Md);
++	KUNIT_EXPECT_EQ(test, macsmc_hwmon_set_fan(&t->hwmon, 0, 2500), -EIO);
++	fan_test_released(test, t);
++	KUNIT_EXPECT_GT(test, t->writes, 3);
++	KUNIT_EXPECT_EQ(test, t->target_writes, 0);
++	KUNIT_EXPECT_EQ(test, t->ftst_writes, 2);
++	KUNIT_EXPECT_EQ(test, t->refused, 0);
++}
++
++/* Taking over an already spinning firmware fan needs no unlock or retry. */
++static void macsmc_fan_test_spinning(struct kunit *test)
++{
++	struct macsmc_fan_test *t = test->priv;
++
++	t->mode[0] = MACSMC_FAN_MODE_AUTO;
++	t->target[0] = FAN_TEST_F1350;
++	KUNIT_ASSERT_EQ(test, macsmc_hwmon_set_fan(&t->hwmon, 0, 2500), 0);
++	KUNIT_EXPECT_EQ(test, t->target[0], FAN_TEST_F2500);
++	KUNIT_EXPECT_EQ(test, t->writes, 2);
++	KUNIT_EXPECT_EQ(test, t->ftst_writes, 0);
++	KUNIT_ASSERT_EQ(test, macsmc_hwmon_set_fan(&t->hwmon, 0, 0), 0);
++	KUNIT_EXPECT_EQ(test, t->mode[0], MACSMC_FAN_MODE_AUTO);
++	KUNIT_EXPECT_EQ(test, t->hwmon.fan.manual, 0);
++}
++
+ static struct kunit_case macsmc_fan_test_cases[] = {
++	KUNIT_CASE(macsmc_fan_test_stopped_manual_busy),
++	KUNIT_CASE(macsmc_fan_test_manual_busy_timeout),
++	KUNIT_CASE(macsmc_fan_test_spinning),
+ 	KUNIT_CASE(macsmc_fan_test_unlock_and_release),
+ 	KUNIT_CASE(macsmc_fan_test_clamp),
+ 	KUNIT_CASE(macsmc_fan_test_target_write_fails),
+diff --git a/drivers/hwmon/macsmc-hwmon.c b/drivers/hwmon/macsmc-hwmon.c
+index 097fa6c40c61..cb824b252ddc 100644
+--- a/drivers/hwmon/macsmc-hwmon.c
++++ b/drivers/hwmon/macsmc-hwmon.c
+@@ -506,16 +506,24 @@ static int macsmc_hwmon_fan_manual(struct macsmc_hwmon *hwmon,
+ 		timeout = jiffies + msecs_to_jiffies(MACSMC_FAN_MODE_TIMEOUT_MS);
+ 		for (;;) {
+ 			ret = macsmc_hwmon_fan_read_mode(hwmon, fan, &mode);
+-			if (ret || mode != MACSMC_FAN_MODE_SYSTEM)
+-				break;
++			if (ret)
++				goto relock;
++			if (mode != MACSMC_FAN_MODE_SYSTEM) {
++				/* Leaving system mode need not mean writes are ready. */
++				ret = macsmc_hwmon_write_key(hwmon->smc, &fan->mode,
++							     MACSMC_FAN_MODE_MANUAL);
++				if (ret >= 0)
++					goto manual;
++				if (ret != -EIO && ret != -EBUSY)
++					goto relock;
++			}
+ 			if (time_after(jiffies, timeout)) {
+-				ret = -ETIMEDOUT;
+-				break;
++				if (mode == MACSMC_FAN_MODE_SYSTEM)
++					ret = -ETIMEDOUT;
++				goto relock;
+ 			}
+ 			msleep(MACSMC_FAN_MODE_POLL_MS);
+ 		}
+-		if (ret)
+-			goto relock;
+ 	}
+ 
+ set_manual:
+@@ -523,6 +531,7 @@ static int macsmc_hwmon_fan_manual(struct macsmc_hwmon *hwmon,
+ 	if (ret < 0)
+ 		goto relock;
+ 
++manual:
+ 	fan->manual = true;
+ 	hwmon->fan.manual++;
+ 	return 0;
+-- 
+2.56.0
+

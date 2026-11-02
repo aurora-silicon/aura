@@ -1,0 +1,44 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-only
+# nvme-write-test.sh : first NVMe WRITE under the real SPTM, on the scratch partition nvme0n1p5 only.
+# Runs ON THE MAC as root (sudo). Backs the test window up to RAM first and restores it byte for byte at the end,
+# so p5 is left exactly as found. Root p3 and every other node stay read-only the whole time.
+# Window: 8 MiB at +1 GiB into p5 (4 KiB LBAs: p5 start 240868399, +262144). Sizes 4K, 64K (apif_max_kb), 1M, 8M.
+set -u
+P=/dev/nvme0n1p5; D=/dev/nvme0n1; OFF=262144; N=2048; W=/run/nvme-wt; mkdir -p $W
+say() { echo "NVME-WT: $1" | tee -a /run/macho-status.log > /dev/kmsg; }
+fail() { say "FAIL: $1"; restore; exit 1; }
+restore() {
+  say "restore: writing the saved 8 MiB back"
+  dd if=$W/orig.bin of=$P bs=4096 seek=$OFF count=$N oflag=direct,sync conv=notrunc 2>>$W/log || say "restore dd rc=$?"
+  dd if=$P of=$W/after.bin bs=4096 skip=$OFF count=$N iflag=direct 2>>$W/log
+  cmp -s $W/orig.bin $W/after.bin && say "restore verified, p5 as found" || say "RESTORE MISMATCH, p5 window differs from the original (saved copy: $W/orig.bin)"
+  # back to how the nodes were found: on a read-write root the disk must stay writable (F35 HW 11-02: setro here broke the root for 20 s)
+  [ "$ro_p" = 1 ] && blockdev --setro $P; [ "$ro_d" = 1 ] && blockdev --setro $D
+  say "nodes as found: disk ro=$(blockdev --getro $D) p5 ro=$(blockdev --getro $P)"
+}
+# identity of the target: exact start and size of p5 on this Mac (sysfs counts 512-byte sectors: 240868399 * 8, 2097152 * 8)
+s=$(cat /sys/block/nvme0n1/nvme0n1p5/start); z=$(cat /sys/block/nvme0n1/nvme0n1p5/size)
+[ "$s" = 1926947192 ] && [ "$z" = 16777216 ] || { say "p5 geometry unexpected: start $s size $z, nothing done"; exit 2; }
+grep -q " $P " /proc/mounts && { say "p5 is mounted, nothing done"; exit 2; }
+d0=$(dmesg | wc -l)
+ro_d=$(blockdev --getro $D); ro_p=$(blockdev --getro $P)
+say "start: p5 window +1GiB 8MiB, disk ro=$ro_d p5 ro=$ro_p, apif_max_kb=$(cat /sys/module/nvme_apple/parameters/apif_max_kb 2>/dev/null)"
+dd if=$P of=$W/orig.bin bs=4096 skip=$OFF count=$N iflag=direct 2>>$W/log || { say "backup read failed"; exit 1; }
+say "backup: $(sha256sum < $W/orig.bin | cut -c1-16) nonzero bytes $(tr -d '\0' < $W/orig.bin | wc -c)"
+blockdev --setrw $D && blockdev --setrw $P || fail "setrw"
+say "rw: disk $(blockdev --getro $D) p5 $(blockdev --getro $P); p3 ro=$(blockdev --getro /dev/nvme0n1p3)"
+for kb in 4 64 1024 8192; do
+  c=$((kb / 4)); head -c $((kb * 1024)) /dev/urandom > $W/pat-$kb.bin
+  t0=$(date +%s.%N)
+  dd if=$W/pat-$kb.bin of=$P bs=4096 seek=$OFF count=$c oflag=direct,sync conv=notrunc 2>>$W/log || fail "write ${kb}K dd rc=$?"
+  t1=$(date +%s.%N)
+  dd if=$P of=$W/rb-$kb.bin bs=4096 skip=$OFF count=$c iflag=direct 2>>$W/log || fail "readback ${kb}K"
+  cmp -s $W/pat-$kb.bin $W/rb-$kb.bin && say "write ${kb}K: OK, verified, $(echo "$t1 - $t0" | bc) s" || fail "write ${kb}K: readback differs"
+  e=$(dmesg | tail -n +$((d0 + 1)) | grep -cE 'apif timeout|I/O error|sct 0x|reset_work|RTKit: boot')
+  [ "$e" = 0 ] || { dmesg | tail -n +$((d0 + 1)) | grep -E 'apif timeout|I/O error|sct 0x|reset_work|RTKit: boot' | tail -5 | cut -c1-160 | while read -r l; do say "kernel: $l"; done; fail "errors in dmesg after ${kb}K"; }
+done
+sync; blockdev --flushbufs $P
+say "all sizes OK under SPTM"
+restore
+say "done; dmesg lines since start: $(( $(dmesg | wc -l) - d0 ))"

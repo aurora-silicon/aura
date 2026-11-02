@@ -1,0 +1,98 @@
+From f5a861787ae7ebfb8222a7d8247df24c5871d6a0 Mon Sep 17 00:00:00 2001
+From: Ryan Murray <ryan@aurorasilicon.org>
+Date: Sat, 31 Oct 2026 15:58:22 +1100
+Subject: [PATCH 17/18] hwmon: macsmc: Keep explicit control of write-only
+ legacy mode keys
+
+The mode preflight should not introduce a read requirement for a legacy
+write-only mode key. Use the metadata to keep its existing direct write
+path, still solely under an explicit user target. Readable system-mode
+keys keep the unlock-before-write sequence.
+
+Cover this metadata case with the SMC model, asserting no mode read and
+no unlock operation for the legacy write-only path.
+
+Assisted-by: LLM
+Signed-off-by: Ryan Murray <ryan@aurorasilicon.org>
+---
+ drivers/hwmon/macsmc-hwmon-test.c | 19 +++++++++++++++++++
+ drivers/hwmon/macsmc-hwmon.c      |  5 +++++
+ 2 files changed, 24 insertions(+)
+
+diff --git a/drivers/hwmon/macsmc-hwmon-test.c b/drivers/hwmon/macsmc-hwmon-test.c
+index 610a019ee59b..1f8fa33dc2e0 100644
+--- a/drivers/hwmon/macsmc-hwmon-test.c
++++ b/drivers/hwmon/macsmc-hwmon-test.c
+@@ -109,6 +109,7 @@ struct macsmc_fan_test {
+ 	int writes;
+ 	int ftst_writes;
+ 	int refused;
++	int mode_reads;
+ 	smc_key fail_key;
+ };
+ 
+@@ -125,6 +126,7 @@ static int fan_test_read(struct apple_smc *smc, smc_key key, void *buf, size_t s
+ 
+ 	switch (key & 0xff00ffff) {
+ 	case __SMC_KEY('F', 0, 'M', 'd'):
++		t->mode_reads++;
+ 		value = t->mode[i];
+ 		break;
+ 	case __SMC_KEY('F', 0, 'M', 'n'):
+@@ -330,6 +332,22 @@ static void macsmc_fan_test_legacy(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, t->refused, 0);
+ }
+ 
++/* A legacy write-only mode key keeps working without a new read requirement. */
++static void macsmc_fan_test_legacy_write_only(struct kunit *test)
++{
++	struct macsmc_fan_test *t = test->priv;
++
++	t->legacy = true;
++	t->mode[0] = MACSMC_FAN_MODE_AUTO;
++	t->fans[0].mode.info.flags &= ~APPLE_SMC_READABLE;
++	KUNIT_ASSERT_EQ(test, macsmc_hwmon_set_fan(&t->hwmon, 0, 2500), 0);
++	KUNIT_EXPECT_EQ(test, t->mode[0], MACSMC_FAN_MODE_MANUAL);
++	KUNIT_ASSERT_EQ(test, macsmc_hwmon_set_fan(&t->hwmon, 0, 0), 0);
++	KUNIT_EXPECT_EQ(test, t->mode[0], MACSMC_FAN_MODE_AUTO);
++	KUNIT_EXPECT_EQ(test, t->mode_reads, 0);
++	KUNIT_EXPECT_EQ(test, t->ftst_writes, 0);
++}
++
+ /* Suspend, resume and shutdown do not write untouched fan keys. */
+ static void macsmc_fan_test_untouched(struct kunit *test)
+ {
+@@ -384,6 +402,7 @@ static struct kunit_case macsmc_fan_test_cases[] = {
+ 	KUNIT_CASE(macsmc_fan_test_two_fans),
+ 	KUNIT_CASE(macsmc_fan_test_no_unlock_key),
+ 	KUNIT_CASE(macsmc_fan_test_legacy),
++	KUNIT_CASE(macsmc_fan_test_legacy_write_only),
+ 	KUNIT_CASE(macsmc_fan_test_untouched),
+ 	KUNIT_CASE(macsmc_fan_test_suspend_manual),
+ 	KUNIT_CASE(macsmc_fan_test_unlock_fails),
+diff --git a/drivers/hwmon/macsmc-hwmon.c b/drivers/hwmon/macsmc-hwmon.c
+index a8e47ee4b98f..097fa6c40c61 100644
+--- a/drivers/hwmon/macsmc-hwmon.c
++++ b/drivers/hwmon/macsmc-hwmon.c
+@@ -480,6 +480,10 @@ static int macsmc_hwmon_fan_manual(struct macsmc_hwmon *hwmon,
+ 	if (fan->manual)
+ 		return 0;
+ 
++	/* Older firmware may expose a write-only mode key. */
++	if (!(fan->mode.info.flags & APPLE_SMC_READABLE))
++		goto set_manual;
++
+ 	/* Do not send a mode write the firmware is known to refuse. */
+ 	ret = macsmc_hwmon_fan_read_mode(hwmon, fan, &mode);
+ 	if (ret)
+@@ -514,6 +518,7 @@ static int macsmc_hwmon_fan_manual(struct macsmc_hwmon *hwmon,
+ 			goto relock;
+ 	}
+ 
++set_manual:
+ 	ret = macsmc_hwmon_write_key(hwmon->smc, &fan->mode, MACSMC_FAN_MODE_MANUAL);
+ 	if (ret < 0)
+ 		goto relock;
+-- 
+2.56.0
+

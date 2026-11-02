@@ -1,0 +1,100 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 2012-2015 - ARM Ltd
+// Author: Marc Zyngier <marc.zyngier@arm.com>
+// The vGIC CPU interface emulation of KVM (arch/arm64/kvm/hyp/vgic-v3-sr.c, SPDX GPL-2.0-only, Marc Zyngier/ARM), lines
+// taken unchanged by gen-vgic-cpuif.sh, on this shim: the core traps every ICC access of a guest where ICH_VTR reports the
+// broken SEIS (T6040, kernel fcb377a25449), and here the LRs are live with no SPTM transition needed, so it runs in the exit.
+#include "mon.h"
+#include "mhv.h"
+typedef unsigned char u8;
+typedef int bool;
+#define true 1
+#define false 0
+#define unlikely(x) (x)
+#define likely(x) (x)
+#define WARN_ON_ONCE(x) ((void)0)
+#define BIT(n) (1UL << (n))
+#define GENMASK(h, l) (((~0UL) << (l)) & (~0UL >> (63 - (h))))
+#define __ffs(x) __builtin_ctzl(x)
+#define FIELD_GET(m, v) (((v) & (m)) >> __builtin_ctzl(m))
+#define FIELD_PREP(m, v) (((u64)(v) << __builtin_ctzl(m)) & (m))
+#define fallthrough __attribute__((fallthrough))
+#define unreachable() __builtin_unreachable()
+#define isb_sy() __asm__ volatile("isb")
+#undef isb
+#define isb() __asm__ volatile("isb" ::: "memory")
+#define read_gicreg(r) sysreg_read(r)
+#define write_gicreg(v, r) sysreg_write(r, (u64)(v))
+struct vgic_v3_cpu_if { u64 used_lrs, vgic_hcr; };
+struct kvm_vcpu {
+	struct { struct { struct vgic_v3_cpu_if vgic_v3; } vgic_cpu; } arch;
+	struct gctx *c;
+};
+static inline u64 vcpu_get_reg(struct kvm_vcpu *v, int r) { return r == 31 ? 0 : v->c->x[r]; }
+static inline void vcpu_set_reg(struct kvm_vcpu *v, int r, u64 val) { if (r != 31) v->c->x[r] = val; }
+static inline u64 kvm_vcpu_get_esr(struct kvm_vcpu *v) { return v->c->esr; }
+static inline int kvm_vcpu_sys_get_rt(struct kvm_vcpu *v) { return (v->c->esr >> 5) & 0x1f; }
+static inline void __kvm_skip_instr(struct kvm_vcpu *v) { v->c->pc += 4; }
+static inline u64 vgic_ich_vtr(void) { return sysreg_read(ich_vtr_el2) & ~BIT(22); }
+#define ICH_VTR_EL2_ListRegs GENMASK(4, 0)
+#define ICH_VTR_EL2_PREbits GENMASK(28, 26)
+#define ICH_VTR_EL2_PRIbits GENMASK(31, 29)
+#define ICH_VTR_EL2_SEIS BIT(22)
+#define ICH_VTR_EL2_A3V BIT(21)
+#define ICH_HCR_EL2_TDIR BIT(14)
+#define ICH_HCR_EL2_EOIcount GENMASK(31, 27)
+#define ICH_LR_VIRTUAL_ID_MASK ((1ULL << 32) - 1)
+#define ICH_LR_EOI (1ULL << 41)
+#define ICH_LR_GROUP (1ULL << 60)
+#define ICH_LR_HW (1ULL << 61)
+#define ICH_LR_STATE (3ULL << 62)
+#define ICH_LR_PENDING_BIT (1ULL << 62)
+#define ICH_LR_ACTIVE_BIT (1ULL << 63)
+#define ICH_LR_PHYS_ID_SHIFT 32
+#define ICH_LR_PHYS_ID_MASK (0x3ffULL << ICH_LR_PHYS_ID_SHIFT)
+#define ICH_LR_PRIORITY_SHIFT 48
+#define ICH_LR_PRIORITY_MASK (0xffULL << ICH_LR_PRIORITY_SHIFT)
+#define ICC_CTLR_EL1_EOImode_MASK (1UL << 1)
+#define ICC_CTLR_EL1_CBPR_MASK (1UL << 0)
+#define ICC_CTLR_EL1_PRI_BITS_SHIFT 8
+#define ICC_CTLR_EL1_ID_BITS_SHIFT 11
+#define ICC_CTLR_EL1_SEIS_SHIFT 14
+#define ICC_CTLR_EL1_A3V_SHIFT 15
+#define ICC_IAR1_EL1_SPURIOUS 0x3ff
+#define ICC_IAR0_EL1_SPURIOUS 0x3ff
+#define ICH_VMCR_EL2_VENG0 BIT(0)
+#define ICH_VMCR_EL2_VENG1 BIT(1)
+#define ICH_VMCR_EL2_VACKCTL BIT(2)
+#define ICH_VMCR_EL2_VFIQEN BIT(3)
+#define ICH_VMCR_EL2_VCBPR BIT(4)
+#define ICH_VMCR_EL2_VEOIM BIT(9)
+#define ICH_VMCR_EL2_VBPR1 GENMASK(20, 18)
+#define ICH_VMCR_EL2_VBPR0 GENMASK(23, 21)
+#define ICH_VMCR_EL2_VPMR GENMASK(31, 24)
+#define ICH_VMCR_EL2_VENG0_MASK ICH_VMCR_EL2_VENG0
+#define ICH_VMCR_EL2_VENG1_MASK ICH_VMCR_EL2_VENG1
+#define ICH_VMCR_EL2_VCBPR_MASK ICH_VMCR_EL2_VCBPR
+#define ICH_VMCR_EL2_VEOIM_MASK ICH_VMCR_EL2_VEOIM
+#define ICH_HCR_EL2_EOIcount_SHIFT 27
+#define VGIC_MIN_LPI 8192
+#define ESR_ELx_SYS64_ISS_CRM_SHIFT 1
+#define ESR_ELx_SYS64_ISS_CRM_MASK (0xfUL << 1)
+#define FIELD_MODIFY(m, p, v) (*(p) = (*(p) & ~(u64)(m)) | FIELD_PREP(m, v))
+static inline void gic_write_dir(u64 v) { __asm__ volatile("msr s3_0_c12_c11_1, %0; isb" :: "r"(v)); }
+#define sr(o0,o1,n,m,o2) (((o0)<<19)|((o1)<<16)|((n)<<12)|((m)<<8)|((o2)<<5))
+#define SYS_ICC_PMR_EL1 sr(3,0,4,6,0)
+#define SYS_ICC_IAR0_EL1 sr(3,0,12,8,0)
+#define SYS_ICC_EOIR0_EL1 sr(3,0,12,8,1)
+#define SYS_ICC_HPPIR0_EL1 sr(3,0,12,8,2)
+#define SYS_ICC_BPR0_EL1 sr(3,0,12,8,3)
+#define SYS_ICC_AP0Rn_EL1(n) sr(3,0,12,8,4|(n))
+#define SYS_ICC_AP1Rn_EL1(n) sr(3,0,12,9,(n))
+#define SYS_ICC_DIR_EL1 sr(3,0,12,11,1)
+#define SYS_ICC_RPR_EL1 sr(3,0,12,11,3)
+#define SYS_ICC_IAR1_EL1 sr(3,0,12,12,0)
+#define SYS_ICC_EOIR1_EL1 sr(3,0,12,12,1)
+#define SYS_ICC_HPPIR1_EL1 sr(3,0,12,12,2)
+#define SYS_ICC_BPR1_EL1 sr(3,0,12,12,3)
+#define SYS_ICC_CTLR_EL1 sr(3,0,12,12,4)
+#define SYS_ICC_IGRPEN0_EL1 sr(3,0,12,12,6)
+#define SYS_ICC_IGRPEN1_EL1 sr(3,0,12,12,7)

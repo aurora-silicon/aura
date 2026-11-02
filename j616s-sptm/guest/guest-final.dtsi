@@ -1,0 +1,367 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// F35 final: the devices the daily J616s DT has and the e2e guest lacked, ported node by node from the daily t6040-j616s DT
+// (7.3.0-m4.165) and the live ADT (11-02). Rules: every DART register page is SPTM Table A and is never
+// mapped, the guest's apple,dart-apif forwards table 3 through the monitor; every controller page here is Table B and the
+// monitor maps it 1:1 (platform-io.h, checked by tools/check-io.py). "mhold-aop" nodes come alive only when the monitor's
+// dart-aop facts match (iommu.c g_aop_ok); the rest is plain DT + MMIO.
+//
+// Deferred to a later candidate: USB-C ports 0/1 in host mode (the ATC PHY coprocessor "phy-cpu" never ran under the monitor;
+// the gadget profile alone would be useless to the user), AVD, PMP, ISP (3 DART instances + DAPF), dcpext0/1, ANE.
+/ {
+	// power states of the sio bus island: parents of i2c and fpwm (daily DT labels; the node merges into the e2e one)
+	power-management@502280000 {
+		compatible = "apple,t6041-pmgr", "apple,pmgr", "syscon", "simple-mfd";
+		#address-cells = <1>;
+		#size-cells = <1>;
+		reg = <0x5 0x02280000 0x0 0x4000>;
+		ps_sio: power-controller@120 {
+			compatible = "apple,t6041-pmgr-pwrstate", "apple,pmgr-pwrstate";
+			reg = <0x120 0x4>; #power-domain-cells = <0>; #reset-cells = <0>;
+			label = "sio"; apple,always-on;
+		};
+		ps_fpwm0: power-controller@138 {
+			compatible = "apple,t6041-pmgr-pwrstate", "apple,pmgr-pwrstate";
+			reg = <0x138 0x4>; #power-domain-cells = <0>; #reset-cells = <0>;
+			label = "fpwm0"; apple,always-on;
+			power-domains = <&ps_sio>;
+		};
+		ps_i2c1: power-controller@158 {
+			compatible = "apple,t6041-pmgr-pwrstate", "apple,pmgr-pwrstate";
+			reg = <0x158 0x4>; #power-domain-cells = <0>; #reset-cells = <0>;
+			label = "i2c1"; apple,always-on;
+			power-domains = <&ps_sio>;
+		};
+		ps_i2c2: power-controller@160 {
+			compatible = "apple,t6041-pmgr-pwrstate", "apple,pmgr-pwrstate";
+			reg = <0x160 0x4>; #power-domain-cells = <0>; #reset-cells = <0>;
+			label = "i2c2"; apple,always-on;
+			power-domains = <&ps_sio>;
+		};
+		ps_i2c3: power-controller@168 {
+			compatible = "apple,t6041-pmgr-pwrstate", "apple,pmgr-pwrstate";
+			reg = <0x168 0x4>; #power-domain-cells = <0>; #reset-cells = <0>;
+			label = "i2c3"; apple,always-on;
+			power-domains = <&ps_sio>;
+		};
+	};
+	power-management@508300000 {
+		compatible = "apple,t6041-pmgr", "apple,pmgr", "syscon", "simple-mfd";
+		#address-cells = <1>;
+		#size-cells = <1>;
+		reg = <0x5 0x08300000 0x0 0x4000>;
+		ps_gpio: power-controller@90 {
+			compatible = "apple,t6041-pmgr-pwrstate", "apple,pmgr-pwrstate";
+			reg = <0x90 0x4>; #power-domain-cells = <0>; #reset-cells = <0>;
+			label = "gpio"; apple,always-on;
+		};
+	};
+
+	// the AP pinctrl of the e2e guest (PERST/CLKREQ) becomes the interrupt controller the codecs and the sdz regulator use (daily DT)
+	pinctrl@51c000000 {
+		interrupt-controller;
+		#interrupt-cells = <2>;
+		interrupt-parent = <&aic>;
+		interrupts = <0x0 0x1de 0x4 0x0 0x1df 0x4 0x0 0x1e0 0x4 0x0 0x1e1 0x4 0x0 0x1e2 0x4 0x0 0x1e3 0x4 0x0 0x1e4 0x4>;
+		// the i2c pin groups live on this 200-pin controller (pins 58..63), not on the 61-pin pinctrl_ap (F35 HW 11-02: i2c3 and the jack reset collided there)
+		i2c1_pins: i2c1-pins { pinmux = <0x1003a 0x1003b>; };
+		i2c2_pins: i2c2-pins { pinmux = <0x1003c 0x1003d>; };
+		i2c3_pins: i2c3-pins { pinmux = <0x1003e 0x1003f>; };
+	};
+	pinctrl_ap: pinctrl@5081e4000 {
+		compatible = "apple,t6041-pinctrl", "apple,t8103-pinctrl";
+		reg = <0x5 0x081e4000 0x0 0x4000>;
+		power-domains = <&ps_gpio>;
+		gpio-controller;
+		#gpio-cells = <2>;
+		gpio-ranges = <&pinctrl_ap 0 0 0x3d>;
+		apple,npins = <0x3d>;
+		interrupt-parent = <&aic>;
+	};
+
+	// === speakers: six TAS2764 on i2c1/i2c3 behind one fail-closed shutdown line, the jack codec on i2c2 ===
+	speaker_sdz: regulator-sn012776-sdz {
+		compatible = "regulator-fixed";
+		regulator-name = "sn012776-sdz";
+		gpios = <&pinctrl 0x36 0>;
+		enable-active-high;
+	};
+	i2c1: i2c@429014000 {
+		compatible = "apple,t6041-i2c", "apple,t8103-i2c";
+		reg = <0x4 0x29014000 0x0 0x4000>;
+		clocks = <&clkref>;
+		interrupt-parent = <&aic>;
+		interrupts = <0x0 0x628 0x4>;
+		pinctrl-0 = <&i2c1_pins>;
+		pinctrl-names = "default";
+		power-domains = <&ps_i2c1>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+		status = "okay";
+		speaker_left_woofer1: codec@38 {
+			compatible = "ti,sn012776", "ti,tas2764";
+			reg = <0x38>;
+			SDZ-supply = <&speaker_sdz>;
+			apple,sdz-group-fail-closed;
+			#sound-dai-cells = <0>;
+			sound-name-prefix = "Left Woofer 1";
+			interrupts-extended = <&pinctrl 0x37 8>;
+			ti,imon-slot-no = <0>;
+			ti,vmon-slot-no = <2>;
+		};
+		speaker_left_woofer2: codec@39 {
+			compatible = "ti,sn012776", "ti,tas2764";
+			reg = <0x39>;
+			SDZ-supply = <&speaker_sdz>;
+			apple,sdz-group-fail-closed;
+			#sound-dai-cells = <0>;
+			sound-name-prefix = "Left Woofer 2";
+			interrupts-extended = <&pinctrl 0x37 8>;
+			ti,imon-slot-no = <8>;
+			ti,vmon-slot-no = <10>;
+		};
+		speaker_left_tweeter: codec@3a {
+			compatible = "ti,sn012776", "ti,tas2764";
+			reg = <0x3a>;
+			SDZ-supply = <&speaker_sdz>;
+			apple,sdz-group-fail-closed;
+			#sound-dai-cells = <0>;
+			sound-name-prefix = "Left Tweeter";
+			interrupts-extended = <&pinctrl 0x37 8>;
+			ti,imon-slot-no = <16>;
+			ti,vmon-slot-no = <18>;
+		};
+	};
+	i2c2: i2c@429018000 {
+		compatible = "apple,t6041-i2c", "apple,t8103-i2c";
+		reg = <0x4 0x29018000 0x0 0x4000>;
+		clocks = <&clkref>;
+		interrupt-parent = <&aic>;
+		interrupts = <0x0 0x629 0x4>;
+		pinctrl-0 = <&i2c2_pins>;
+		pinctrl-names = "default";
+		power-domains = <&ps_i2c2>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+		status = "okay";
+		jack_codec: codec@4b {
+			compatible = "cirrus,cs42l84";
+			reg = <0x4b>;
+			reset-gpios = <&pinctrl_ap 0x3a 0>;
+			#sound-dai-cells = <0>;
+			interrupts-extended = <&pinctrl 0x6a 8>;
+			sound-name-prefix = "Jack";
+		};
+	};
+	i2c3: i2c@42901c000 {
+		compatible = "apple,t6041-i2c", "apple,t8103-i2c";
+		reg = <0x4 0x2901c000 0x0 0x4000>;
+		clocks = <&clkref>;
+		interrupt-parent = <&aic>;
+		interrupts = <0x0 0x62a 0x4>;
+		pinctrl-0 = <&i2c3_pins>;
+		pinctrl-names = "default";
+		power-domains = <&ps_i2c3>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+		status = "okay";
+		speaker_right_woofer1: codec@3b {
+			compatible = "ti,sn012776", "ti,tas2764";
+			reg = <0x3b>;
+			SDZ-supply = <&speaker_sdz>;
+			apple,sdz-group-fail-closed;
+			#sound-dai-cells = <0>;
+			sound-name-prefix = "Right Woofer 1";
+			interrupts-extended = <&pinctrl 0x37 8>;
+			ti,imon-slot-no = <4>;
+			ti,vmon-slot-no = <6>;
+		};
+		speaker_right_woofer2: codec@3c {
+			compatible = "ti,sn012776", "ti,tas2764";
+			reg = <0x3c>;
+			SDZ-supply = <&speaker_sdz>;
+			apple,sdz-group-fail-closed;
+			#sound-dai-cells = <0>;
+			sound-name-prefix = "Right Woofer 2";
+			interrupts-extended = <&pinctrl 0x37 8>;
+			ti,imon-slot-no = <12>;
+			ti,vmon-slot-no = <14>;
+		};
+		speaker_right_tweeter: codec@3d {
+			compatible = "ti,sn012776", "ti,tas2764";
+			reg = <0x3d>;
+			SDZ-supply = <&speaker_sdz>;
+			apple,sdz-group-fail-closed;
+			#sound-dai-cells = <0>;
+			sound-name-prefix = "Right Tweeter";
+			interrupts-extended = <&pinctrl 0x37 8>;
+			ti,imon-slot-no = <20>;
+			ti,vmon-slot-no = <22>;
+		};
+	};
+
+	// === AOP: the always-on coprocessor (pre-loaded RTKit, adopted) and its DART; the audio DAI the speakers and mics hang on ===
+	dart_aop: iommu@510f00000 {
+		compatible = "apple,dart-apif";
+		#iommu-cells = <1>;
+		aurora,apif = <&apif>;
+		apple,apif-dart-id = <0xba5e0a01>;   // live ADT dart-aop (0xa); the monitor patches it when its checks pass
+		apple,apif-num-streams = <16>;       // ADT sid-count
+		apple,dma-range = <0x100 0x14000 0x2ff 0xfffec000>;   // ADT vm-base 0x10000014000, vm-size 0x2fffffec000 (4 levels, 42 bits)
+		apple,apif-reserve-last-page;
+		status = "disabled";   // F35.1: AOP off — the first dart-aop INIT stopped the Mac on F35 (11-02 10:16); back when the stop is understood
+	};
+	aop_mbox: mailbox@510608000 {
+		compatible = "apple,t6041-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <0x5 0x10608000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <0x0 0x2c6 0x4 0x0 0x2c7 0x4 0x0 0x2c8 0x4 0x0 0x2c9 0x4>;
+		interrupt-names = "send-empty", "send-not-empty", "recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+		status = "disabled";   // F35.1: AOP off — the first dart-aop INIT stopped the Mac on F35 (11-02 10:16); back when the stop is understood
+	};
+	admac_aop: dma-controller@513300000 {
+		compatible = "apple,t6041-admac", "apple,t8132-admac";
+		reg = <0x5 0x13300000 0x0 0x34000>;
+		#dma-cells = <1>;
+		dma-channels = <18>;
+		interrupts-extended = <&aic 0x0 0x2f5 0x4>, <0 0 0>;
+		iommus = <&dart_aop 10>;
+		status = "disabled";   // F35.1: AOP off — the first dart-aop INIT stopped the Mac on F35 (11-02 10:16); back when the stop is understood
+	};
+	admac_sio: dma-controller@513800000 {
+		compatible = "apple,t6041-admac", "apple,t8132-admac";
+		reg = <0x5 0x13800000 0x0 0x34000>;
+		#dma-cells = <1>;
+		dma-channels = <13>;
+		interrupts-extended = <&aic 0x0 0x2f2 0x4>, <0 0 0>;
+		iommus = <&dart_aop 8>;
+		status = "disabled";   // F35.1: AOP off — the first dart-aop INIT stopped the Mac on F35 (11-02 10:16); back when the stop is understood
+	};
+	aop: aop@510600000 {
+		compatible = "apple,t6041-aop", "apple,t6040-aop";
+		reg = <0x5 0x10c10000 0x0 0x2e0000>, <0x5 0x10600000 0x0 0x88000>, <0x5 0x10050000 0x0 0x4000>, <0x5 0x08328000 0x0 0x24>;
+		reg-names = "firmware", "asc", "asc-aux", "config";
+		mboxes = <&aop_mbox>;
+		mbox-names = "mbox";
+		iommus = <&dart_aop 0>;
+		#address-cells = <2>;
+		#size-cells = <2>;
+		status = "disabled";   // F35.1: AOP off — the first dart-aop INIT stopped the Mac on F35 (11-02 10:16); back when the stop is understood
+		aop_audio: audio {
+			compatible = "apple,t6041-aop-audio", "apple,t6030-aop-audio";
+			dmas = <&admac_aop 1>, <&admac_sio 0>, <&admac_sio 1>, <&admac_sio 4>, <&admac_sio 5>;
+			dma-names = "dma", "spkr", "sense", "cout", "cin";
+			#sound-dai-cells = <1>;
+			apple,chassis-name = "J616";
+			apple,machine-kind = "MacBook Pro";
+		};
+		als { compatible = "apple,t6041-aop-als", "apple,aop-als"; };
+		las { compatible = "apple,t6041-aop-las", "apple,aop-las"; };
+	};
+	sound {
+		compatible = "apple,j616-macaudio", "apple,macaudio";
+		model = "MacBook Pro J616";
+		#address-cells = <1>;
+		#size-cells = <0>;
+		status = "disabled";   // F35.1: AOP off — the first dart-aop INIT stopped the Mac on F35 (11-02 10:16); back when the stop is understood
+		dai-link@0 {
+			reg = <0>;
+			link-name = "Speakers";
+			dai-tdm-idle-mode-0 = "zero";
+			dai-tdm-idle-mode-1 = "zero";
+			dai-tdm-slot-tx-idle-mask-0 = <0xf0f0f0>;
+			dai-tdm-slot-tx-idle-mask-1 = <0xf0f0f>;
+			cpu { sound-dai = <&aop_audio 3>; };
+			codec { sound-dai = <&speaker_left_woofer1>, <&speaker_right_woofer1>, <&speaker_left_woofer2>, <&speaker_right_woofer2>, <&speaker_left_tweeter>, <&speaker_right_tweeter>; };
+		};
+	};
+	sound-jack {
+		compatible = "apple,j616-macaudio-jack", "apple,macaudio";
+		model = "MacBook Pro J616 Jack";
+		#address-cells = <1>;
+		#size-cells = <0>;
+		status = "disabled";   // F35.1: AOP off — the first dart-aop INIT stopped the Mac on F35 (11-02 10:16); back when the stop is understood
+		dai-link@0 {
+			reg = <0>;
+			link-name = "Headphone Jack";
+			cpu { sound-dai = <&aop_audio 4>; };
+			codec { sound-dai = <&jack_codec>; };
+		};
+	};
+
+	// === keyboard backlight ===
+	fpwm0: pwm@429040000 {
+		compatible = "apple,t6041-fpwm", "apple,s5l-fpwm";
+		reg = <0x4 0x29040000 0x0 0x4000>;
+		clocks = <&clkref>;
+		power-domains = <&ps_fpwm0>;
+		#pwm-cells = <2>;
+		status = "okay";
+	};
+	led-controller {
+		compatible = "pwm-leds";
+		led-0 {
+			pwms = <&fpwm0 0 0x9c40>;
+			label = "apple::kbd_backlight";
+			function = "kbd_backlight";
+			color = <0>;
+			max-brightness = <255>;
+		};
+	};
+
+	// === rtc and clean reboot: SMC children reading the pmic nvmem on the main spmi bus ===
+	spmi@509014000 {
+		compatible = "apple,t6041-spmi", "apple,t8103-spmi";
+		reg = <0x5 0x09014000 0x0 0x100>;
+		#address-cells = <2>;
+		#size-cells = <0>;
+		status = "okay";
+		pmic@e {
+			compatible = "apple,abbey-pmic", "apple,spmi-nvmem";
+			reg = <0xe 0x0>;
+			nvmem-layout {
+				compatible = "fixed-layout";
+				#address-cells = <1>;
+				#size-cells = <1>;
+				rtc_offset: rtc-offset@2100 { reg = <0x2100 0x6>; };
+				boot_stage: boot-stage@f801 { reg = <0xf801 0x1>; };
+				boot_error_count: boot-error-count@f802,0 { reg = <0xf802 0x1>; bits = <0 4>; };
+				panic_count: panic-count@f802,4 { reg = <0xf802 0x1>; bits = <4 4>; };
+				shutdown_flag: shutdown-flag@f80f,3 { reg = <0xf80f 0x1>; bits = <3 1>; };
+			};
+		};
+	};
+	smc@50c600000 {
+		// smc-reboot left out: on F35 (HW 11-02) its poweroff ("Preparing for reboot (offw)") never completed under the monitor and
+		// the machine sat there until the power button; the PSCI path of F34 is kept instead. rtc stays.
+		rtc {
+			compatible = "apple,smc-rtc";
+			nvmem-cells = <&rtc_offset>;
+			nvmem-cell-names = "rtc_offset";
+		};
+	};
+
+	// === PMC: the T6041 power-management controller (daily DT node, built-in driver apple_pmc). XNU's PMC driver drives the
+	// shutdown through it (RMBS at +0x60000, enable +0xac024): without this node macsmc-reboot's "off1" never completed on F35
+	// (HW 11-02, WDT ticks went on after "Preparing for reboot"). Its pages sit inside the 0x504800000+0xbc000 window the guest maps already.
+	pmc: power-management@5048aa000 {
+		compatible = "apple,t6041-pmc";
+		reg = <0x5 0x048aa000 0x0 0x3000>, <0x5 0x04800000 0x0 0x10000>;
+		reg-names = "rails", "voters";
+		nonposted-mmio;
+		#address-cells = <1>;
+		#size-cells = <0>;
+		apple,static-voters = <1 3>;
+		status = "okay";
+		performance-controller@1 {
+			compatible = "apple,t6041-clpc";
+			reg = <1>;
+		};
+	};
+
+	// === idle: WFI on both states on T6041 (cpuidle-apple collapses PWRDOWN to WFI; HW F34 WFI survived) ===
+	cpuidle {
+		compatible = "apple,t6041-cpuidle";
+		status = "okay";
+	};
+};

@@ -1,0 +1,126 @@
+From ae2035d362baee2738b9d2372c7bcf4e8b731628 Mon Sep 17 00:00:00 2001
+From: Ryan Murray <ryan@aurorasilicon.org>
+Date: Fri, 30 Oct 2026 14:50:53 +0000
+Subject: [PATCH 14/18] hwmon: macsmc: let the device tree allow manual fan
+ speeds
+
+fanX_target is only writable with the unsafe fan_control parameter, so a
+machine whose SMC is known to take manual speeds still needs a kernel
+parameter for it. Make fanX_target writable on the fans whose node has
+apple,fan-manual-control, and warn when the property is set on a fan
+without target and mode keys.
+
+fan_control stays. It is the documented mainline interface for this,
+and dropping it would leave existing command lines and modprobe options
+with an unknown-parameter warning and without the speeds they ask for.
+It now only adds fans the device tree does not allow. Nothing changes
+for machines without the property, the thermal cooling device path or
+the unlock and restore sequence.
+
+Assisted-by: LLM
+Signed-off-by: Ryan Murray <ryan@aurorasilicon.org>
+---
+ Documentation/hwmon/macsmc-hwmon.rst | 12 ++++++++----
+ drivers/hwmon/macsmc-hwmon.c         | 27 ++++++++++++++++++++++++---
+ 2 files changed, 32 insertions(+), 7 deletions(-)
+
+diff --git a/Documentation/hwmon/macsmc-hwmon.rst b/Documentation/hwmon/macsmc-hwmon.rst
+index 6903f76df62b..8aef3dd2bf75 100644
+--- a/Documentation/hwmon/macsmc-hwmon.rst
++++ b/Documentation/hwmon/macsmc-hwmon.rst
+@@ -22,10 +22,14 @@ the desktop Macs), sensors present on any given machine are described
+ via Devicetree. The driver picks these up and registers them with
+ hwmon when probed.
+ 
+-Manual fan speed is supported via the fan_control module parameter. This
+-is disabled by default and marked as unsafe, as it cannot be proven that
+-the system will fail safe if overheating due to manual fan control being
+-used.
++Manual fan speed is available on the fans whose Devicetree node has
++apple,fan-manual-control, which a machine's Devicetree sets once its SMC
++firmware is known to accept a manual speed and to take the fan back. On
++those fans fanX_target is writable; writing 0 hands the fan back to the
++firmware. The fan_control module parameter, disabled by default and marked
++as unsafe, allows manual speeds on every fan with a mode key whatever the
++Devicetree says. It cannot be proven that the system will fail safe if it
++overheats under a manual fan speed.
+ 
+ sysfs interface
+ ---------------
+diff --git a/drivers/hwmon/macsmc-hwmon.c b/drivers/hwmon/macsmc-hwmon.c
+index c0ca04e88d3d..e1685c2945d0 100644
+--- a/drivers/hwmon/macsmc-hwmon.c
++++ b/drivers/hwmon/macsmc-hwmon.c
+@@ -49,10 +49,15 @@
+ #define FLT_MANT_MASK	GENMASK(22, 0)
+ #define FLT_SIGN_MASK	BIT(31)
+ 
++/*
++ * Fans whose device tree node has apple,fan-manual-control take a target speed
++ * from userspace. This parameter, kept for compatibility, allows it for every
++ * fan with a mode key, whatever the device tree says.
++ */
+ static bool fan_control;
+ module_param_unsafe(fan_control, bool, 0644);
+ MODULE_PARM_DESC(fan_control,
+-		 "Override the SMC to set your own fan speeds on supported machines");
++		 "Allow manual fan speeds on every fan with a mode key, also where the device tree does not (default: the device tree decides)");
+ 
+ /*
+  * SoC die temperature keys: temperature channels labelled "SoC die <key>"
+@@ -185,6 +190,8 @@ struct macsmc_hwmon_fan {
+ 	char label[MAX_LABEL_LENGTH];
+ 	u32 attrs;
+ 	bool manual;
++	/* The device tree allows a manual speed from userspace. */
++	bool manual_control;
+ 	/* Index of the fan node among the fan-* nodes: its cooling device id. */
+ 	u32 index;
+ 	struct macsmc_hwmon *hwmon;
+@@ -689,12 +696,18 @@ static int macsmc_hwmon_fan_apply(struct macsmc_hwmon *hwmon,
+ 	return 0;
+ }
+ 
++/* Whether userspace may set this fan's speed. */
++static bool macsmc_hwmon_fan_user_control(const struct macsmc_hwmon_fan *fan)
++{
++	return fan->mode.macsmc_key && (fan->manual_control || fan_control);
++}
++
+ static int macsmc_hwmon_set_fan(struct macsmc_hwmon *hwmon, int channel, long val)
+ {
+ 	struct macsmc_hwmon_fan *fan = &hwmon->fan.fans[channel];
+ 	int ret;
+ 
+-	if (!fan_control || fan->mode.macsmc_key == 0)
++	if (!macsmc_hwmon_fan_user_control(fan))
+ 		return -EOPNOTSUPP;
+ 	if (val < 0)
+ 		return -EINVAL;
+@@ -899,7 +912,7 @@ static umode_t macsmc_hwmon_fan_is_visible(const struct macsmc_hwmon_fan *fan,
+ 					   u32 attr)
+ {
+ 	if (fan->attrs & BIT(attr)) {
+-		if (attr == hwmon_fan_target && fan_control && fan->mode.macsmc_key)
++		if (attr == hwmon_fan_target && macsmc_hwmon_fan_user_control(fan))
+ 			return 0644;
+ 
+ 		return 0444;
+@@ -1237,6 +1250,14 @@ static int macsmc_hwmon_create_fan(struct device *dev, struct apple_smc *smc,
+ 			return ret;
+ 	}
+ 
++	if (of_property_read_bool(fan_node, "apple,fan-manual-control")) {
++		if (fan->mode.macsmc_key && (fan->attrs & HWMON_F_TARGET))
++			fan->manual_control = true;
++		else
++			dev_warn(dev, "%s: apple,fan-manual-control needs apple,fan-target and apple,fan-mode\n",
++				 fan->label);
++	}
++
+ 	/* Initialise fan control mode to automatic */
+ 	fan->manual = false;
+ 
+-- 
+2.56.0
+

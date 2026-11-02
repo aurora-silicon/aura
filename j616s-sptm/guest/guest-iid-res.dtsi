@@ -1,0 +1,13 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// generated with guest-iid.dtsi: a second root block, dtc merges it with /reserved-memory
+/ {
+	reserved-memory {
+		dcp_heap: dcp-heap@0 { compatible = "apple,asc-mem"; reg = <0xba5e0700 0xba5e0701 0xba5e0702 0xba5e0703>; no-map; status = "mhold-dcp"; };
+		dcp_disp: dcp-disp@1 { compatible = "apple,asc-mem"; reg = <0xba5e0704 0xba5e0705 0xba5e0706 0xba5e0707>; no-map; status = "mhold-dcp"; };
+		dcp_pio: dcp-pio@2 { compatible = "apple,asc-mem"; reg = <0xba5e0708 0xba5e0709 0xba5e070a 0xba5e070b>; no-map; status = "mhold-dcp"; };
+		dcp_fb: dcp-fb@3 { compatible = "framebuffer"; reg = <0xba5e070c 0xba5e070d 0xba5e070e 0xba5e070f>; no-map; status = "mhold-dcp"; };
+		dcp_disp2: dcp-disp2@4 { compatible = "apple,asc-mem"; reg = <0xba5e0710 0xba5e0711 0xba5e0712 0xba5e0713>; no-map; status = "mhold-dcp"; };
+		dcp_text: dcp-text@5 { compatible = "apple,asc-mem"; reg = <0xba5e0714 0xba5e0715 0xba5e0716 0xba5e0717>; no-map; status = "mhold-dcp"; };
+		dcp_data: dcp-data@6 { compatible = "apple,asc-mem"; reg = <0xba5e0718 0xba5e0719 0xba5e071a 0xba5e071b>; no-map; status = "mhold-dcp"; };
+	};
+};

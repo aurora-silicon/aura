@@ -1,0 +1,303 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Full-stack guest DT: J616s omarchy under the resident-SPTM macho monitor. The kernel carries every driver; the monitor keeps a node
+// disabled when its checks fail (DCP: the segment shape of iommu.c:dcp_read). /memory, /chosen initrd cells, cpu MPIDR, apif/fb/queue PAs are patched at runtime.
+/dts-v1/;
+/ {
+	compatible = "omarchy-m4,sptm-guest", "apple,j616s", "apple,t6041", "apple,arm-platform";
+	#address-cells = <2>;
+	#size-cells = <2>;
+	interrupt-parent = <&aic>;
+	chosen {
+		bootargs = "earlycon=pl011,mmio32,0x09000000 nvme_core.io_timeout=8 console=tty0 loglevel=7 log_buf_len=4M plymouth.enable=0 idle=nop printk.devkmsg=on kvm-arm.mode=sptm arm64.nopauth arm64.nomops systemd.gpt_auto=0 fsck.mode=skip systemd.show_status=1 macho.final macho.rw macho.fluent rdinit=/init maxcpus=1";
+		// F35: GPT-checked write windows for nvme-apple (apif), the daily loader's ABI: <first end> pairs, 4 KiB LBAs, end exclusive.
+		// Only p5 (240868399..242965551, the empty 8 GiB scratch slot) until the first write under SPTM is measured; p3 (the root) comes with F35b.
+		m4,write-lba-range = <0x0 0x106b939 0x0 0xe5a5a2f>, <0x0 0xe5b5c2f 0x0 0xe7b5c2f>;   // F35b: p3 (the root, 17217849..240802351) and p5
+		linux,initrd-start = <0xba5e0001 0x1d7a5700>;
+		linux,initrd-end = <0xba5e0001 0x1d7a57ed>;
+		rng-seed = <0xba5e0900 0xba5e0901 0xba5e0902 0xba5e0903 0xba5e0904 0xba5e0905 0xba5e0906 0xba5e0907>;
+	};
+	memory@80000000 {
+		device_type = "memory";
+		reg = <0xba5e0002 0xba5e0003 0xba5e0004 0xba5e0005>;   // patched to the whole identity window
+	};
+	psci {
+		compatible = "arm,psci-1.0";
+		method = "hvc";
+	};
+	cpus {
+		#address-cells = <2>;
+		#size-cells = <0>;
+		cpu-map {
+			cluster0 {
+				core0 { cpu = <&cpu_e0>; };
+				core1 { cpu = <&cpu_e1>; };
+				core2 { cpu = <&cpu_e2>; };
+				core3 { cpu = <&cpu_e3>; };
+			};
+			cluster1 {
+				core0 { cpu = <&cpu_p00>; };
+				core1 { cpu = <&cpu_p01>; };
+				core2 { cpu = <&cpu_p02>; };
+				core3 { cpu = <&cpu_p03>; };
+				core4 { cpu = <&cpu_p04>; };
+			};
+			cluster2 {
+				core0 { cpu = <&cpu_p10>; };
+				core1 { cpu = <&cpu_p11>; };
+				core2 { cpu = <&cpu_p12>; };
+				core3 { cpu = <&cpu_p13>; };
+				core4 { cpu = <&cpu_p14>; };
+			};
+		};
+		cpu_e0: cpu@0 {
+			device_type = "cpu";
+			compatible = "apple,brava-e";
+			reg = <0x0 0x0>;
+			enable-method = "psci";
+			performance-domains = <&cpufreq_e>;
+			operating-points-v2 = <&cpu_opp_e>;
+		};
+		cpu_e1: cpu@1 {
+			device_type = "cpu";
+			compatible = "apple,brava-e";
+			reg = <0x0 0x1>;
+			enable-method = "psci";
+			performance-domains = <&cpufreq_e>;
+			operating-points-v2 = <&cpu_opp_e>;
+		};
+		cpu_e2: cpu@2 {
+			device_type = "cpu";
+			compatible = "apple,brava-e";
+			reg = <0x0 0x2>;
+			enable-method = "psci";
+			performance-domains = <&cpufreq_e>;
+			operating-points-v2 = <&cpu_opp_e>;
+		};
+		cpu_e3: cpu@3 {
+			device_type = "cpu";
+			compatible = "apple,brava-e";
+			reg = <0x0 0x3>;
+			enable-method = "psci";
+			performance-domains = <&cpufreq_e>;
+			operating-points-v2 = <&cpu_opp_e>;
+		};
+		cpu_p00: cpu@10100 {
+			device_type = "cpu";
+			compatible = "apple,brava-p";
+			reg = <0x0 0x10100>;
+			enable-method = "psci";
+			performance-domains = <&cpufreq_p0>;
+			operating-points-v2 = <&cpu_opp_p0>;
+		};
+		cpu_p01: cpu@10101 {
+			device_type = "cpu";
+			compatible = "apple,brava-p";
+			reg = <0x0 0x10101>;
+			enable-method = "psci";
+			performance-domains = <&cpufreq_p0>;
+			operating-points-v2 = <&cpu_opp_p0>;
+		};
+		cpu_p02: cpu@10102 {
+			device_type = "cpu";
+			compatible = "apple,brava-p";
+			reg = <0x0 0x10102>;
+			enable-method = "psci";
+			performance-domains = <&cpufreq_p0>;
+			operating-points-v2 = <&cpu_opp_p0>;
+		};
+		cpu_p03: cpu@10103 {
+			device_type = "cpu";
+			compatible = "apple,brava-p";
+			reg = <0x0 0x10103>;
+			enable-method = "psci";
+			performance-domains = <&cpufreq_p0>;
+			operating-points-v2 = <&cpu_opp_p0>;
+		};
+		cpu_p04: cpu@10104 {
+			device_type = "cpu";
+			compatible = "apple,brava-p";
+			reg = <0x0 0x10104>;
+			enable-method = "psci";
+			performance-domains = <&cpufreq_p0>;
+			operating-points-v2 = <&cpu_opp_p0>;
+		};
+		cpu_p10: cpu@10200 {
+			device_type = "cpu";
+			compatible = "apple,brava-p";
+			reg = <0x0 0x10200>;
+			enable-method = "psci";
+			
+			performance-domains = <&cpufreq_p1>;
+			operating-points-v2 = <&cpu_opp_p1>;
+		};
+		cpu_p11: cpu@10201 {
+			device_type = "cpu";
+			compatible = "apple,brava-p";
+			reg = <0x0 0x10201>;
+			enable-method = "psci";
+			
+			performance-domains = <&cpufreq_p1>;
+			operating-points-v2 = <&cpu_opp_p1>;
+		};
+		cpu_p12: cpu@10202 {
+			device_type = "cpu";
+			compatible = "apple,brava-p";
+			reg = <0x0 0x10202>;
+			enable-method = "psci";
+			
+			performance-domains = <&cpufreq_p1>;
+			operating-points-v2 = <&cpu_opp_p1>;
+		};
+		cpu_p13: cpu@10203 {
+			device_type = "cpu";
+			compatible = "apple,brava-p";
+			reg = <0x0 0x10203>;
+			enable-method = "psci";
+			
+			performance-domains = <&cpufreq_p1>;
+			operating-points-v2 = <&cpu_opp_p1>;
+		};
+		cpu_p14: cpu@10204 {
+			device_type = "cpu";
+			compatible = "apple,brava-p";
+			reg = <0x0 0x10204>;
+			enable-method = "psci";
+			
+			performance-domains = <&cpufreq_p1>;
+			operating-points-v2 = <&cpu_opp_p1>;
+		};
+	};
+	timer {
+		compatible = "arm,armv8-timer";
+		interrupt-names = "phys", "virt", "hyp-phys", "hyp-virt";
+		interrupts = <1 2 4>, <1 3 4>, <1 0 4>, <1 1 4>;
+	};
+	aic: interrupt-controller@502400000 {
+		compatible = "apple,t6041-aic3", "apple,t8122-aic3";
+		#interrupt-cells = <3>;
+		interrupt-controller;
+		reg = <0x5 0x02400000 0x0 0x184000>, <0x5 0x02440000 0x0 0x4>;
+		reg-names = "core", "event";
+		#address-cells = <0>;
+	};
+
+	// iBoot leaves its watchdog running (~128 s to reset, HW); upstream apple_wdt (built in) adopts and pings it
+	// (WATCHDOG_HANDLE_BOOT_ENABLED). Node copied from t6040.dtsi; the page is stage-2 mapped 1:1 by the monitor.
+	clkref: clock-ref {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <24000000>;
+		clock-output-names = "clkref";
+	};
+	wdt: watchdog@50836c000 {
+		compatible = "apple,t6041-wdt", "apple,t8103-wdt";
+		reg = <0x5 0x0836c000 0x0 0x4000>;
+		clocks = <&clkref>;
+		interrupt-parent = <&aic>;
+		interrupts = <0 827 4>;
+	};
+
+	// === RUNG 1: APIF v2 transport (provider = our macho-monitor; reg page unmapped, trap-emulated) ===
+	apif: firmware@61ff0000 {
+		compatible = "aurora,apif-mmio";
+		reg = <0x0 0x61ff0000 0x0 0x4000>;
+	};
+
+	// === RUNG 1: simple framebuffer (iBoot/DCP live scanout, Normal-NC). First light, no coprocessor. ===
+	framebuffer@10bd1474000 {
+		compatible = "apple,simple-framebuffer", "simple-framebuffer";
+		reg = <0xba5e0300 0xba5e0301 0x00 0x1d73c00>;   // base cells patched to live boot_args.video.base
+		width  = <0xd80>;                          // 3456
+		height = <0x8ba>;                          // 2234
+		stride = <0x3600>;                         // 13824 B/row
+		format = "x2r10g10b10";
+		status = "okay";
+	};
+	reserved-memory {
+		#address-cells = <0x02>;
+		#size-cells = <0x02>;
+		ranges;
+		framebuffer_region@10bd1474000 {
+			reg = <0x10b 0xd1474000 0x00 0x72c4000>;
+			no-map;
+		};
+		nvme_asq: admin-sq  { reg = <0xba5e0100 0xba5e0101 0x0 0x4000>; no-map; };
+		nvme_acq: admin-cq  { reg = <0xba5e0102 0xba5e0103 0x0 0x4000>; no-map; };
+		nvme_iosq: io-sq    { reg = <0xba5e0104 0xba5e0105 0x0 0x4000>; no-map; };
+		nvme_iocq: io-cq    { reg = <0xba5e0106 0xba5e0107 0x0 0x4000>; no-map; };
+		apple_adt: apple-adt { compatible = "omarchy-m4,adt-copy"; reg = <0xba5e0400 0xba5e0401 0x0 0xba5e0402>; no-map; };
+		// CTRR / AMCC read-only region: the monitor patches base (0200/0201) and size (0202/0203) from
+		// CTRR_LOWER/UPPER_EL1 so Linux never puts an NVMe DMA target or a secondary-CPU page in the
+		// AMCC-RO window. Reserving a range outside guest RAM is a harmless no-op. (Gravity kboot.c.)
+		// iBoot's carveouts inside the RAM it hands over, from the live ADT; m4-loader keeps them from Linux too
+		carve0: carve0 { reg = <0xba5e0910 0xba5e0911 0x0 0xba5e0912>; no-map; };
+		carve1: carve1 { reg = <0xba5e0913 0xba5e0914 0x0 0xba5e0915>; no-map; };
+		carve2: carve2 { reg = <0xba5e0916 0xba5e0917 0x0 0xba5e0918>; no-map; };
+		ctrr_resv: ctrr@ba5e0200 { reg = <0xba5e0200 0xba5e0201 0xba5e0202 0xba5e0203>; no-map; };
+	};
+
+/include/ "guest-smc.dtsi"
+/include/ "guest-platform.dtsi"
+
+	// === RUNG 2: NVMe root over APIF (table-6 queue ABI). ans mailbox + sart-apif + secure-BAR. ===
+	nvme_mbox: mailbox@409608000 {
+		compatible = "apple,t6041-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <0x4 0x09608000 0x0 0x4000>;
+		interrupts = <0x0 0x5fa 0x4>, <0x0 0x5fb 0x4>, <0x0 0x5fc 0x4>, <0x0 0x5fd 0x4>;
+		interrupt-names = "send-empty", "send-not-empty", "recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+	};
+	sart: sart {
+		compatible = "apple,sart-apif";
+		aurora,apif = <&apif>;
+	};
+	power-management@502280000 {
+		compatible = "apple,t6041-pmgr", "apple,pmgr", "syscon", "simple-mfd";
+		#address-cells = <1>;
+		#size-cells = <1>;
+		reg = <0x5 0x02280000 0x0 0x4000>;
+		ps_ans: power-controller@370 {
+			compatible = "apple,t6041-pmgr-pwrstate", "apple,pmgr-pwrstate";
+			reg = <0x370 0x4>; #power-domain-cells = <0>; #reset-cells = <0>;
+			label = "ans"; apple,always-on;
+		};
+		ps_apcie0: power-controller@380 {
+			compatible = "apple,t6041-pmgr-pwrstate", "apple,pmgr-pwrstate";
+			reg = <0x380 0x4>; #power-domain-cells = <0>; #reset-cells = <0>;
+			label = "apcie_sys_st0"; apple,always-on;
+			apple,no-auto-pm;   // PCIe sits idle from the handoff to pcie-macho-init: auto-PM would gate the block and lose iBoot's state (F18 0x380, 0x388 bit 28); raw clears it too
+		};
+		ps_apcie1: power-controller@388 {
+			compatible = "apple,t6041-pmgr-pwrstate", "apple,pmgr-pwrstate";
+			reg = <0x388 0x4>; #power-domain-cells = <0>; #reset-cells = <0>;
+			label = "apcie_sys_st1";
+			apple,no-auto-pm;   // no always-on here: without the parent 0x110 a domain short of f makes pm_genpd_init fail and takes the provider away from nvme
+		};
+	};
+	nvme: nvme@40dcc0000 {
+		compatible = "apple,nvme-apif";
+		reg = <0x4 0x0dcc0000 0x0 0x28000>, <0x4 0x09600000 0x0 0x4000>;
+		reg-names = "nvme", "ans";
+		interrupts = <0x0 0xa17 0x4>;
+		mboxes = <&nvme_mbox>;
+		apple,sart = <&sart>;
+		aurora,apif = <&apif>;
+		dma-coherent;
+		asahi,rtkit-quiesced;
+		memory-region = <&nvme_asq>, <&nvme_acq>, <&nvme_iosq>, <&nvme_iocq>;
+		memory-region-names = "admin-sq", "admin-cq", "io-sq", "io-cq";
+		power-domains = <&ps_ans>, <&ps_apcie0>, <&ps_apcie1>;
+		power-domain-names = "ans", "apcie0", "apcie1";
+		// monitor patches this: 1 = full transfer sizes, 0 = the driver caps transfers (always 0 today).
+		apple,nvme-shim = <0xba5e0210>;
+		status = "okay";
+	};
+
+	// === Accelerated display and input: nodes from the daily DT, enabled by the monitor from live ADT facts (iommu.c) ===
+/include/ "guest-iid.dtsi"
+/include/ "guest-usb.dtsi"
+};
+/include/ "guest-iid-res.dtsi"
+/include/ "guest-gpu.dtsi"
+/include/ "guest-final.dtsi"
+/include/ "guest-usb01.dtsi"
