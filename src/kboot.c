@@ -8197,8 +8197,10 @@ int kboot_prepare_dt(void *fdt)
         // on the secondary (non-boot) cores. Add a reserved-memory region to
         // prevent Linux from crashing when allocating this memory and writing
         // to it from a secondary core.
+        // UPR is the address of the last protected page (iBoot sets it to start + length - 4K), so
+        // the range ends one page past it, as for CTRR_D below.
         u64 ro_start = mrs(SYS_IMP_APL_CTRR_C_LWR_EL1);
-        u64 ro_end = ALIGN_UP(mrs(SYS_IMP_APL_CTRR_C_UPR_EL1), SZ_4K);
+        u64 ro_end = ALIGN_UP(mrs(SYS_IMP_APL_CTRR_C_UPR_EL1), SZ_4K) + SZ_4K;
         if (ro_end - ro_start > 12 * SZ_4K)
             printf("WARNING: M4+ SMP-RO is large (48KB)");
         if (fdt_add_mem_rsv(dt, ro_start, ro_end - ro_start))
