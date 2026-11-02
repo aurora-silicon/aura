@@ -15,6 +15,7 @@ parser.add_argument('-x', '--xnu', action="store_true", help="Set up for chainlo
 parser.add_argument('--vector-only', action="store_true", help="Return after vector reply without probing the next image")
 parser.add_argument('--capture', type=pathlib.Path, help="Write raw post-vector console bytes to this file")
 parser.add_argument('--capture-seconds', type=float, default=0, help="Seconds of raw console capture after vector")
+parser.add_argument('--capture-until', help="Stop the capture early once the console shows this regex")
 parser.add_argument('payload', type=pathlib.Path)
 parser.add_argument('boot_args', default=[], nargs="*")
 args = parser.parse_args()
@@ -239,12 +240,8 @@ elif args.vector_only:
     print(f"Vectoring to 0x{stub.addr:x}; no next-stage proxy request will be sent")
     p.request(p.P_VECTOR, stub.addr, fw_dest + bootargs_off, image_addr, new_base, copy_size)
     if args.capture:
-        deadline = time.monotonic() + max(0, args.capture_seconds)
-        with args.capture.open('wb') as output:
-            while time.monotonic() < deadline:
-                data = iface.dev.read(4096)
-                if data:
-                    output.write(data)
+        from aura.console import capture
+        capture(iface.dev, args.capture, args.capture_seconds, args.capture_until)
     sys.exit(0)
 else:
     print(f"Reloading into stub at 0x{stub.addr:x}")
