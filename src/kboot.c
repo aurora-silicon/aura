@@ -3527,12 +3527,11 @@ static int dt_set_ave(void)
 /*
  * The M4 Pro and A18 Pro Neural Engines run firmware that iBoot preloads into
  * DRAM below the OS: /arm-io/ane0 (M4 Pro) or /arm-io/ane (A18 Pro) is
- * pre-loaded, with exactly a __TEXT and a __DATA segment range. Reserve both segments no-map and give them to the ANE node
- * as its "firmware-text" and "firmware-data" memory regions, with the device
- * addresses the firmware runs them at (their remap addresses) as
- * apple,firmware-iovas. A DT that describes the two regions as placeholders
- * gets them filled in place, renamed to their physical addresses and
- * enabled; a DT without them gets them added. The node's status is left as
+ * pre-loaded, with exactly a __TEXT and a __DATA segment range. Reserve both segments no-map and
+ * give them to the ANE node as its "firmware-text" and "firmware-data" memory regions, with the
+ * device addresses the firmware runs them at (their remap addresses) as apple,firmware-iovas. A DT
+ * that describes the two regions as placeholders gets them filled in place, renamed to their
+ * physical addresses and enabled; a DT without them gets them added. The node's status is left as
  * the DT has it, except that a node whose preload cannot be handed over is
  * disabled.
  *
