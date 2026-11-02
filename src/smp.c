@@ -975,7 +975,12 @@ int smp_init(void)
         cpu_info[i].valid = true;
         cpu_info[i].core = FIELD_GET(CPU_REG_CORE, reg);
         cpu_info[i].cluster = FIELD_GET(CPU_REG_CLUSTER, reg);
-        cpu_info[i].die = FIELD_GET(CPU_REG_DIE, reg);
+        /* T6050 Ultra's reg puts the die at bit 12 (die 1 = 0x1000); use die-id where given. */
+        u32 die_id;
+        if (ADT_GETPROP(adt, cpu_node, "die-id", &die_id) == sizeof(die_id))
+            cpu_info[i].die = die_id;
+        else
+            cpu_info[i].die = FIELD_GET(CPU_REG_DIE, reg);
         cpu_info[i].impl_reg = cpu_impl_reg[0];
 
         /* Publish a permanent stack before the first reset, including late entries. */
