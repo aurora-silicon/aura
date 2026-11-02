@@ -610,6 +610,11 @@ static void mmu_add_default_mappings(void)
      */
     mmu_add_mapping(ram_base, ram_base, mem_size_actual, MAIR_IDX_NORMAL, PERM_RWX);
 
+    /* Before the carveout unmap, which must stay unmapped on top of this. */
+    if (chip_id == T6050 && mem_size_actual > ram_size)
+        mmu_add_mapping(ram_base + ram_size, ram_base + ram_size, mem_size_actual - ram_size,
+                        MAIR_IDX_DEVICE_nGnRnE, PERM_RW);
+
     /* Unmap carveout regions */
     if (mcc_unmap_carveouts() && (chip_id == T8140 || chip_id == T6040 || chip_id == T6050))
         panic("MMU: Firmware carveouts are unavailable\n");
@@ -643,6 +648,24 @@ static void mmu_add_default_mappings(void)
      * This allows executing from dynamic regions in EL1
      */
     mmu_add_mapping(ram_base | REGION_RX_EL1, ram_base, ram_size, MAIR_IDX_NORMAL, PERM_RX_EL0);
+
+    /*
+     * T6050's MCC TZ registers are unknown, so only region-id-4/2 above are known protected.
+     * The RAM outside what iBoot gave the kernel (below phys_base, and above the top of normal
+     * RAM, mapped as Device before the unmap) holds firmware, exclave and secure-kernel ranges
+     * (pmap-io-ranges SKIO/RSTD/CARV), and a protected access hangs the core. Map it as Device
+     * in every RAM view so the caches never touch it speculatively.
+     */
+    if (chip_id == T6050 && cur_boot_args.phys_base > ram_base) {
+        u64 low = cur_boot_args.phys_base - ram_base;
+        mmu_add_mapping(ram_base, ram_base, low, MAIR_IDX_DEVICE_nGnRnE, PERM_RW);
+        mmu_add_mapping(ram_base | REGION_RWX_EL0, ram_base, low, MAIR_IDX_DEVICE_nGnRnE,
+                        PERM_RW_EL0);
+        mmu_add_mapping(ram_base | REGION_RW_EL0, ram_base, low, MAIR_IDX_DEVICE_nGnRnE,
+                        PERM_RW_EL0);
+        mmu_add_mapping(ram_base | REGION_RX_EL1, ram_base, low, MAIR_IDX_DEVICE_nGnRnE,
+                        PERM_RW_EL0);
+    }
 
     /*
      * Create four separate full mappings of MMIO space, with different access types
