@@ -3383,6 +3383,11 @@ void dt_set_display_t6050(void *dt)
         printf("DCP: T6050: not armed (no chosen.aurora,t6050-display=1): no display handoff\n");
         return;
     }
+    if (os_firmware.version != V27_0 && os_firmware.version != V27_2) {
+        printf("DCP: T6050: OS firmware %s (%s) is not 27.0 or 27.2: no handoff\n",
+               os_firmware.string, os_firmware.iboot);
+        return;
+    }
     if (!e0.read || !e0.running || !(e0.protect_dcp & DART_T8110_PROTECT_TTBR_TCR) ||
         !(e0.protect_disp & DART_T8110_PROTECT_TTBR_TCR) || !e0.sid[0].ok || !e0.sid[1].ok ||
         !e0.sid[2].ok) {
@@ -3455,6 +3460,13 @@ void dt_set_display_t6050(void *dt)
         int at =
             fdt_get_path(dt, nodes[i], path, sizeof(path)) ? -1 : fdt_path_offset(scratch, path);
         err = at < 0 || dcp6_t6050_okay(scratch, at);
+    }
+    /* The kernel picks dcpext0's method table from these: the stub's firmware, known above. */
+    if (!err) {
+        char path[96];
+        int at = fdt_get_path(dt, dcp, path, sizeof(path)) ? -1 : fdt_path_offset(scratch, path);
+        err = at < 0 || firmware_set_fdt(scratch, at, "apple,firmware-version", &os_firmware) ||
+              firmware_set_fdt(scratch, at, "apple,firmware-compat", &os_firmware);
     }
     for (int i = 0; !err && i < typec.n; i++) {
         char path[96];
