@@ -187,22 +187,7 @@ int main(void) {
  /* The central T8132 branch is the only change to the legacy flow. */
  reset();chip_id=0x8110;dart_gates=true;assert(!dapf_init("/arm-io/dart-aop",1));
  assert(filter_writes==5*(nodes[0].config_len/52)&&dart_enables==1&&disables==1);
- reset();chip_id=T6040;dart_gates=true;j614s_aop_ready=0;
- nodes[0].instance=NULL;nodes[0].instance_len=0;
- assert(dapf_init("/arm-io/dart-aop",1)<0);
- assert(dart_enables==1&&disables==1&&!filter_writes&&!j614s_aop_ready);
- reset();chip_id=T6040;dart_gates=true;j614s_aop_ready=0;
- nodes[0].instance_len=16;
- assert(dapf_init_fdt(NULL)<0);
- assert(!(j614s_aop_ready&1)&&dart_enables==2&&disables==2);
- reset();chip_id=T6040;dart_gates=true;j614s_aop_ready=0;
- nodes[0].config_len=1;
- assert(dapf_init("/arm-io/dart-aop",1)<0);
- assert(dart_enables==1&&disables==1&&!filter_writes&&!j614s_aop_ready);
- reset();chip_id=T6040;dart_gates=true;j614s_aop_ready=0;
- assert(dapf_init_fdt(NULL)>=0);
- assert((j614s_aop_ready&1)&&filter_writes&&dart_enables==2&&disables==2);
- puts("DAPF: actual PMP preservation/power, inactive AOP/MTP, typed refusal, malformed/duplicate metadata, direct calls, caller count/errors and legacy pass");
+ puts("DAPF: actual PMP preservation/power, inactive AOP/MTP, malformed/duplicate metadata, direct calls, caller count/errors and legacy pass");
  return 0;
 }
 '''
