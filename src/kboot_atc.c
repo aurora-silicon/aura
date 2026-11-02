@@ -54,6 +54,8 @@ struct adt_tunable_info {
     size_t reg_offset;
     size_t reg_size;
     bool required;
+    /* Leading entries to pass, 0 for all of them. */
+    u32 max_entries;
 };
 
 struct atc_fuse_info {
@@ -225,6 +227,31 @@ static const struct adt_tunable_info atc_tunables_t6030_dp[] = {
     {"tunable_AUSCMN_SHM", "apple,tunable-dp-calibration", 0xa00, 0x200, true},
     {"tunable_CLKMON_CFG", "apple,tunable-dp-calibration", 0x2600, 0x100, true},
 };
+
+/*
+ * T6050 Type-C combo PHY (Linux apple,t6050-combo-phy), from /arm-io/atc-phyN. Offsets are within
+ * the bank each property names. The RX clock records hold the setting and then its reverse; the
+ * driver takes the setting, the first four entries.
+ */
+static const struct adt_tunable_info atc_tunables_t6050_combo[] = {
+    {"tunable_ATC0AXI2AF", "apple,tunable-axi2af", 0x0, 0x8000, true},
+    {"tunable_ATC_FABRIC", "apple,tunable-fabric", 0x0, 0x4000, true},
+    {"tunable_ATC_COMMON_CFG", "apple,tunable-common-cfg", 0x0, 0x4000, true},
+    {"tunable_ATC0AXI2AF_LIOA", "apple,tunable-lioa", 0x0, 0x4000, true},
+    {"tunable_LN0_RX_CFG_TX_OF_RXCLK", "apple,tunable-lane0-rx-clock", 0x0, 0x4000, true, 4},
+    {"tunable_LN1_RX_CFG_TX_OF_RXCLK", "apple,tunable-lane1-rx-clock", 0x0, 0x4000, true, 4},
+    {"tunable_LN0_RX_EQ_DFLT", "apple,tunable-lane0-rx-eq", 0x0, 0x4000, true},
+    {"tunable_LN1_RX_EQ_DFLT", "apple,tunable-lane1-rx-eq", 0x0, 0x4000, true},
+    {"tunable_AUSPLL_CORE", "apple,tunable-auspll", 0x0, 0x4000, true},
+    {"tunable_AUS40CMN_SHM", "apple,tunable-aus40cmn-shm", 0x0, 0x4000, true},
+    {"tunable_CIO4PLL_CORE", "apple,tunable-cio4pll", 0x0, 0x4000, true},
+    {"tunable_USB2PHY_DFLT", "apple,tunable-usb2-default", 0x0, 0x4000, true},
+    {"tunable_USB2PHY_HOST", "apple,tunable-usb2-host", 0x0, 0x4000, true},
+};
+
+/* From /arm-io/usb-drdN: the PIPE handler bank the combo PHY hands USB3 through. */
+static const struct adt_tunable_info atc_tunable_t6050_pipe = {
+    "tunable_PIPE_HANDLER_DEFAULT", "apple,tunable-pipe-default", 0x0, 0x4000, true};
 
 static const struct atc_fuse_info atc_fuses_t8103_port0[] = {
     {0x23d2bc434, 9, 6, CIO3PLL_DCO_NCTRL, CIO3PLL_DCO_COARSEBIN_EFUSE0},
@@ -476,6 +503,8 @@ static int dt_append_atc_tunable(void *dt, int adt_node, int fdt_node,
     }
 
     u32 n_tunables = tunables_len / sizeof(*tunable_adt);
+    if (tunable_info->max_entries && tunable_info->max_entries < n_tunables)
+        n_tunables = tunable_info->max_entries;
     for (size_t j = 0; j < n_tunables; j++) {
         const struct atc_tunable *tunable = &tunable_adt[j];
 
@@ -811,6 +840,33 @@ static void dt_copy_atc_t6030_dp_tunables(void *dt, int adt_node, int fdt_node,
     printf("FDT: Copied the DP calibration for %s\n", adt_path);
 }
 
+/* The whole T6050 combo-PHY set or none of it: the Linux driver refuses a partial one. */
+static void dt_copy_atc_t6050_combo_tunables(void *dt, int adt_node, int fdt_node, int port)
+{
+    char drd_path[32];
+    int drd_node;
+
+    snprintf(drd_path, sizeof(drd_path), "/arm-io/usb-drd%d", port);
+    drd_node = adt_path_offset(adt, drd_path);
+    for (size_t i = 0; i < ARRAY_SIZE(atc_tunables_t6050_combo); i++)
+        fdt_delprop(dt, fdt_node, atc_tunables_t6050_combo[i].fdt_name);
+    fdt_delprop(dt, fdt_node, atc_tunable_t6050_pipe.fdt_name);
+
+    for (size_t i = 0; i < ARRAY_SIZE(atc_tunables_t6050_combo); i++)
+        if (dt_append_atc_tunable(dt, adt_node, fdt_node, &atc_tunables_t6050_combo[i]))
+            goto cleanup;
+    if (drd_node < 0 || dt_append_atc_tunable(dt, drd_node, fdt_node, &atc_tunable_t6050_pipe))
+        goto cleanup;
+    printf("FDT: Copied the T6050 combo PHY tunables for atc-phy%d\n", port);
+    return;
+
+cleanup:
+    for (size_t i = 0; i < ARRAY_SIZE(atc_tunables_t6050_combo); i++)
+        fdt_delprop(dt, fdt_node, atc_tunables_t6050_combo[i].fdt_name);
+    fdt_delprop(dt, fdt_node, atc_tunable_t6050_pipe.fdt_name);
+    printf("FDT: T6050 combo PHY tunables for atc-phy%d incomplete; none passed\n", port);
+}
+
 /* Publish the complete USB3 bundle or none of it, preserving USB2 fallback. */
 static void dt_copy_t8132_usb3_tunables(void *dt, int adt_node, int fdt_node)
 {
@@ -876,6 +932,12 @@ static void dt_copy_atc_tunables(void *dt, const char *adt_path, const char *dt_
         !fdt_node_check_compatible(dt, fdt_node, "apple,t8132-atcphy") &&
         adt_is_compatible_at(adt, adt_node, "atc-phy,t8132", 0)) {
         dt_copy_t8132_usb3_tunables(dt, adt_node, fdt_node);
+        return;
+    }
+
+    if (!fdt_node_check_compatible(dt, fdt_node, "apple,t6050-combo-phy")) {
+        if (adt_is_compatible_at(adt, adt_node, "atc-phy,t6050", 0))
+            dt_copy_atc_t6050_combo_tunables(dt, adt_node, fdt_node, port);
         return;
     }
 

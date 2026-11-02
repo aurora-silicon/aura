@@ -3267,6 +3267,83 @@ static int dcp6_t6050_okay(void *dt, int node)
     return fdt_setprop_string(dt, node, "status", "okay");
 }
 
+#define DCP6_T6050_TYPEC_MAX 16
+
+struct dcp6_t6050_set {
+    int node[DCP6_T6050_TYPEC_MAX];
+    int n;
+};
+
+/* Add a disabled node once; an enabled one needs nothing, anything else fails the set. */
+static int dcp6_t6050_add(void *dt, struct dcp6_t6050_set *set, int node)
+{
+    const char *status = node < 0 ? NULL : fdt_getprop(dt, node, "status", NULL);
+    if (!status)
+        return node < 0 ? -1 : 0;
+    if (strcmp(status, "disabled"))
+        return 0;
+    for (int i = 0; i < set->n; i++)
+        if (set->node[i] == node)
+            return 0;
+    if (set->n == DCP6_T6050_TYPEC_MAX)
+        return -1;
+    set->node[set->n++] = node;
+    return 0;
+}
+
+/* Each phandle of a "<phandle cells...>" list property, with its power domains (recursively). */
+static int dcp6_t6050_add_refs(void *dt, struct dcp6_t6050_set *set, int node, const char *prop,
+                               int cells, int depth)
+{
+    int len;
+    const fdt32_t *v = fdt_getprop(dt, node, prop, &len);
+    if (!v)
+        return 0;
+    if (depth > 4 || len % (4 * (1 + cells)))
+        return -1;
+    for (int i = 0; i < len / 4; i += 1 + cells) {
+        int target = fdt_node_offset_by_phandle(dt, fdt32_ld(&v[i]));
+        if (dcp6_t6050_add(dt, set, target) ||
+            dcp6_t6050_add_refs(dt, set, target, "power-domains", 0, depth + 1))
+            return -1;
+    }
+    return 0;
+}
+
+/*
+ * The Type-C chain dcpext0's DisplayPort output takes, as the device tree describes it: the PHY
+ * (phys) with its mailbox and power domains, the crossbar (mux-controls) with its power domains,
+ * and the HPM its typec route's endpoint leads to, with the SPMI bus it sits on. 0 with set->n == 0
+ * when the dcpext node has no Type-C route.
+ */
+static int dcp6_t6050_typec(void *dt, int dcp, struct dcp6_t6050_set *set)
+{
+    set->n = 0;
+    if (!fdt_getprop(dt, dcp, "phys", NULL))
+        return 0;
+    if (dcp6_t6050_add_refs(dt, set, dcp, "phys", 1, 0) ||
+        dcp6_t6050_add_refs(dt, set, dcp, "mux-controls", 1, 0))
+        return -1;
+    int phy_count = set->n;
+    for (int i = 0; i < phy_count; i++)
+        if (dcp6_t6050_add_refs(dt, set, set->node[i], "mboxes", 0, 0))
+            return -1;
+
+    int ep = fdt_subnode_offset(dt, dcp, "typec-routes");
+    ep = ep < 0 ? ep : fdt_subnode_offset(dt, ep, "route@0");
+    ep = ep < 0 ? ep : fdt_subnode_offset(dt, ep, "port");
+    ep = ep < 0 ? ep : fdt_subnode_offset(dt, ep, "endpoint");
+    const fdt32_t *remote = ep < 0 ? NULL : fdt_getprop(dt, ep, "remote-endpoint", NULL);
+    int hpm = remote ? fdt_node_offset_by_phandle(dt, fdt32_ld(remote)) : -1;
+    for (int up = 0; hpm >= 0 && up < 5 && fdt_node_check_compatible(dt, hpm, "apple,sn201202x");
+         up++)
+        hpm = fdt_parent_offset(dt, hpm);
+    if (hpm < 0 || fdt_node_check_compatible(dt, hpm, "apple,sn201202x") ||
+        dcp6_t6050_add(dt, set, hpm) || dcp6_t6050_add(dt, set, fdt_parent_offset(dt, hpm)))
+        return -1;
+    return 0;
+}
+
 /*
  * T6050 (J775D, Mac Studio M5 Ultra): the external display engines iBoot leaves running. On every
  * boot, a read-only inventory of dcpext0..7 (see dcp6_t6050_engine). With the boot.bin config
@@ -3338,6 +3415,13 @@ void dt_set_display_t6050(void *dt)
         return;
     }
 
+    struct dcp6_t6050_set typec;
+    if (dcp6_t6050_typec(dt, dcp, &typec)) {
+        printf("DCP: T6050: dcpext0's Type-C route is not fully described and disabled: "
+               "handing off without it\n");
+        typec.n = 0;
+    }
+
     int adt_path[8];
     u64 vram, vram_size;
     if (adt_path_offset_trace(adt, "/vram", adt_path) < 0 ||
@@ -3372,6 +3456,13 @@ void dt_set_display_t6050(void *dt)
             fdt_get_path(dt, nodes[i], path, sizeof(path)) ? -1 : fdt_path_offset(scratch, path);
         err = at < 0 || dcp6_t6050_okay(scratch, at);
     }
+    for (int i = 0; !err && i < typec.n; i++) {
+        char path[96];
+        int at = fdt_get_path(dt, typec.node[i], path, sizeof(path))
+                     ? -1
+                     : fdt_path_offset(scratch, path);
+        err = at < 0 || dcp6_t6050_okay(scratch, at);
+    }
     if (err)
         free(scratch);
     if (err || dcp6_commit(dt, scratch)) {
@@ -3379,6 +3470,7 @@ void dt_set_display_t6050(void *dt)
         return;
     }
     printf("DCP: T6050: dcpext0 handed off: vram 0x%lx+0x%lx reserved as its framebuffer, "
-           "dcpext0, its DARTs, mailbox and the display subsystem enabled\n",
-           vram, vram_size);
+           "dcpext0, its DARTs, mailbox and the display subsystem enabled; %d Type-C route "
+           "nodes enabled\n",
+           vram, vram_size, typec.n);
 }
