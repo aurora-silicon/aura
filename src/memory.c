@@ -614,7 +614,7 @@ static void mmu_add_default_mappings(void)
     mmu_add_mapping(ram_base, ram_base, mem_size_actual, MAIR_IDX_NORMAL, PERM_RWX);
 
     /* Unmap carveout regions */
-    if (mcc_unmap_carveouts() && (chip_id == T8140 || chip_id == T6040))
+    if (mcc_unmap_carveouts() && (chip_id == T8140 || chip_id == T6040 || chip_id == T6050))
         panic("MMU: Firmware carveouts are unavailable\n");
 
     /*
