@@ -508,8 +508,9 @@ int payload_run(void)
             goto boot_failed;
         }
         cpufreq_init();
-        if (smp_start_secondaries() && chip_id == T8140) {
-            printf("SMP: refusing payload handoff with missing T8140 CPUs\n");
+        /* T6050's DT lists every core with a spin-table release word only this image serves */
+        if (smp_start_secondaries() && (chip_id == T8140 || chip_id == T6050)) {
+            printf("SMP: refusing payload handoff with missing CPUs\n");
             goto boot_failed;
         }
         int mitigation_ret = mitigations_perform();
