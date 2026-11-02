@@ -116,7 +116,10 @@ CFG += DEBUGUSB_PROXY
 endif
 
 
-LDFLAGS := -EL -maarch64elf --no-undefined -X -Bsymbolic \
+# T6050_EXEC_SPAN: the TEXT size of the enrolled T6050 Stage 1, whose CTXR_D every later image runs in
+T6050_EXEC_SPAN ?= 0
+LDFLAGS := --defsym=_t6050_exec_span=$(T6050_EXEC_SPAN) \
+	-EL -maarch64elf --no-undefined -X -Bsymbolic \
 	-z notext --no-apply-dynamic-relocs --orphan-handling=warn \
 	-z nocopyreloc --gc-sections -pie
 

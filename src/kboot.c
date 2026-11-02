@@ -8006,6 +8006,8 @@ static int kboot_boot_t8152(void *kernel)
 
 int kboot_prepare_dt(void *fdt)
 {
+    if (smp_check_el1_handoff())
+        return -1;
     if (smp_has_pending_calls()) {
         next_stage.entry = NULL;
         bail("FDT: refusing preparation while secondary callbacks are pending\n");
@@ -8158,9 +8160,9 @@ int kboot_prepare_dt(void *fdt)
         bail("FDT: couldn't add reservation for aura's old reset vector\n");
 
     /*
-     * CTXR_D starts below this image, and a secondary at EL1 that executes
-     * inside it takes an abort straight to EL2. The firmware RO range below
-     * covers windows A to C.
+     * CTXR_D starts below this image (T8140) or is its TEXT (T6050), and a
+     * secondary at EL1 that executes inside it takes an abort straight to
+     * EL2. The firmware RO range below covers windows A to C.
      */
     if (monitor_required()) {
         u64 start = ALIGN_DOWN(mrs(SYS_IMP_APL_CTXR_D_LWR_EL1), SZ_16K);

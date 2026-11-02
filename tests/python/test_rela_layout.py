@@ -79,8 +79,18 @@ def assemble(tmp_path):
 
 def ldflags():
     make = (REPO / "Makefile").read_text().replace("\\\n", " ")
-    flags = re.search(r"^LDFLAGS := (.*)$", make, re.M).group(1).split()
-    assert "-pie" in flags
+
+    # LDFLAGS names make variables (--defsym=_t6050_exec_span=$(T6050_EXEC_SPAN)): expand each to its
+    # one assignment in the Makefile, the value a plain `make` links with.
+    def expand(text):
+        def value(ref):
+            values = re.findall(rf"^{ref.group(1)}\s*[?:]?=[ \t]*(.*)$", make, re.M)
+            assert len(values) == 1, f"Makefile assigns {ref.group(1)} {len(values)} times"
+            return expand(values[0].strip())
+        return re.sub(r"\$\((\w+)\)", value, text)
+
+    flags = expand(re.search(r"^LDFLAGS := (.*)$", make, re.M).group(1)).split()
+    assert "-pie" in flags and not any("$" in flag for flag in flags), flags
     return flags
 
 

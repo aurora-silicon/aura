@@ -29,6 +29,7 @@ SECTIONS {
         *(.got.plt)
         . = ALIGN(0x10000);
     } :text
+    _text_end = .;
     _text_size = . - _text_start;
     .rodata : ALIGN(0x10000) {
         *(.rodata)

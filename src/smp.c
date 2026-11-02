@@ -183,6 +183,43 @@ static bool smp_old_vector_owned(u64 locked)
 }
 
 extern u64 relocated_from;
+extern u8 _text_start[], _text_end[];
+
+/* [start, end) of iBoot's CTXR_D; the upper register names the last page. */
+int smp_el2_exec_span(u64 *start, u64 *end)
+{
+    u64 lo = mrs(SYS_IMP_APL_CTXR_D_LWR_EL1);
+    u64 hi = mrs(SYS_IMP_APL_CTXR_D_UPR_EL1);
+
+    if (!lo || ((lo | hi) & (SZ_4K - 1)) || hi < lo || hi > UINT64_MAX - SZ_4K)
+        return -1;
+    *start = lo;
+    *end = hi + SZ_4K;
+    return 0;
+}
+
+/*
+ * T6050: iBoot's CTXR_D is the enrolled Stage 1's TEXT, and a released secondary fetches at EL2
+ * only inside it (outside, it hangs rather than faults). Everything a secondary runs at EL2, its
+ * reset vector included, must therefore be this image's TEXT at the enrolled base: a Mach-O
+ * image, not relocated, whose vectors sit SMP_T6050_VECTORS_OFFSET above its base.
+ */
+int smp_check_el1_handoff(void)
+{
+    if (chip_id != T6050 || !in_el2())
+        return 0;
+
+    u64 lo = 0, end = 0;
+    if (smp_el2_exec_span(&lo, &end) || relocated_from ||
+        (u64)_vectors_start != (u64)_base + SMP_T6050_VECTORS_OFFSET || (u64)_text_start < lo ||
+        (u64)_text_end > end) {
+        printf("SMP: T6050 needs this image's TEXT inside CTXR_D [0x%lx, 0x%lx) (a Mach-O at the "
+               "enrolled base)\n",
+               lo, end);
+        return -1;
+    }
+    return 0;
+}
 
 /* Where a core whose RVBAR is locked to the pre-move base enters (start.S) */
 static u64 old_vectors_start(void)
@@ -803,6 +840,8 @@ static void smp_start_t8152(void)
 
 int smp_start_secondaries(void)
 {
+    if (smp_check_el1_handoff())
+        return -1;
     if (chip_id == T8152) {
         smp_start_t8152();
         return smp_start_fail_mask ? -1 : 0;
@@ -897,6 +936,10 @@ void smp_send_ipi(int cpu)
 int smp_call4(int cpu, void *func, u64 arg0, u64 arg1, u64 arg2, u64 arg3)
 {
     if (cpu < 0 || cpu >= MAX_CPUS || cpu == boot_cpu_idx || !func)
+        return -1;
+    /* A T6050 secondary cannot fetch at EL2 outside TEXT: it would hang, not fault. */
+    if (chip_id == T6050 && in_el2() &&
+        ((u64)func < (u64)_text_start || (u64)func >= (u64)_text_end))
         return -1;
 
     struct spin_table *target = &spin_table[cpu];

@@ -35,6 +35,20 @@ bool monitor_required(void)
     if (required >= 0)
         return required;
     required = 0;
+    /*
+     * T6050: iBoot confines every released secondary's EL2 fetch to CTXR_D, the enrolled
+     * Stage 1's TEXT. A confined secondary that fetches outside it hangs instead of faulting,
+     * so the probe below would lose that CPU. Decide from the armed window instead.
+     */
+    if (chip_id == T6050) {
+        u64 start, end;
+        required = in_el2() && !smp_el2_exec_span(&start, &end);
+        if (required)
+            printf("monitor: T6050 secondaries are confined to CTXR_D [0x%lx, 0x%lx), entering "
+                   "the OS at EL1\n",
+                   start, end);
+        return required;
+    }
     if (chip_id != T8140)
         return false;
 

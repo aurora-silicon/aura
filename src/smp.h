@@ -45,6 +45,10 @@ bool smp_has_pending_calls(void);
 bool smp_is_alive(int cpu);
 uint64_t smp_get_mpidr(int cpu);
 u64 smp_get_release_addr(int cpu);
+/* T6050: a Mach-O Aura's vectors (its RVBAR) sit this far above its base, past its header */
+#define SMP_T6050_VECTORS_OFFSET 0x10000
+int smp_el2_exec_span(u64 *start, u64 *end);
+int smp_check_el1_handoff(void);
 void smp_set_wfe_mode(bool new_mode);
 void smp_send_ipi(int cpu);
 

@@ -134,7 +134,14 @@ SECTIONS {
         *(.got.plt)
         . = ALIGN(0x10000);
     } :text
+    _text_end = .;
     _text_size = . - _text_start;
+    /*
+     * T6050_EXEC_SPAN (make): T6050 secondaries fetch at EL2 only inside the enrolled Stage 1's
+     * TEXT, [base + 0x10000, base + 0x10000 + span). smp.c checks the live span at run time; this
+     * catches an image that cannot fit at link time. 0 (the default) skips the check.
+     */
+    ASSERT(_t6050_exec_span == 0 || _text_size <= _t6050_exec_span, "TEXT exceeds the T6050 CTXR_D span of the enrolled Stage 1")
     .rodata : ALIGN(0x10000) {
         *(.rodata)
         *(.rodata.*)
