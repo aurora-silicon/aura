@@ -69,9 +69,9 @@ bool monitor_required(void)
 
 /*
  * Leave EL2 the way the kernel's own init_el2_state and finalise_el2_state
- * would, so the OS takes no traps here. Only features this chip has are set
- * up: it has no SVE, GCS, MTE, MPAM, AMU, SPE, TRBE or BRBE, and its PMU is
- * IMPDEF, which HACR_EL2 leaves to EL1.
+ * would, so the OS takes no traps here. Each feature is set up only when the
+ * ID registers report it: the chips this runs on have no SVE, GCS, MTE, MPAM,
+ * SPE, TRBE or BRBE, and their PMU is IMPDEF, which HACR_EL2 leaves to EL1.
  */
 void monitor_enter_os(u64 entry, u64 a0, u64 a1, u64 a2)
 {
@@ -91,14 +91,15 @@ void monitor_enter_os(u64 entry, u64 a0, u64 a1, u64 a2)
 
     u64 cptr = CPTR_E2H_FPEN;
     u64 hfg = 0;
-    if (FIELD_GET(ID_AA64PFR1_SME, mrs(SYS_ID_AA64PFR1_EL1))) {
+    bool sme = FIELD_GET(ID_AA64PFR1_SME, mrs(SYS_ID_AA64PFR1_EL1));
+    if (sme) {
         cptr |= CPTR_E2H_SMEN;
         hfg |= HFGxTR_nSMPRI_EL1 | HFGxTR_nTPIDR2_EL0;
     }
     msr(SYS_CPTR_EL2, cptr);
     sysop("isb");
 
-    if (hfg) {
+    if (sme) {
         u64 smcr = SMCR_LEN;
         if (mrs(SYS_ID_AA64SMFR0_EL1) & ID_AA64SMFR0_FA64)
             smcr |= SMCR_FA64;
@@ -109,16 +110,41 @@ void monitor_enter_os(u64 entry, u64 a0, u64 a1, u64 a2)
             msr(SYS_SMPRIMAP_EL2, 0);
     }
 
+    /* Every kernel with S1PIE support programs PIR_EL1 and PIRE0_EL1. */
+    u64 mmfr3 = mrs(SYS_ID_AA64MMFR3_EL1);
+    if (FIELD_GET(ID_AA64MMFR3_S1PIE, mmfr3))
+        hfg |= HFGxTR_nPIR_EL1 | HFGxTR_nPIRE0_EL1;
+
     /* Fine-grained traps: the "n" bits trap when clear. */
+    u64 fgt = FIELD_GET(ID_AA64MMFR0_FGT, mrs(SYS_ID_AA64MMFR0_EL1));
     msr(SYS_HFGRTR_EL2, hfg);
     msr(SYS_HFGWTR_EL2, hfg);
     msr(SYS_HFGITR_EL2, 0);
     msr(SYS_HDFGRTR_EL2, 0);
     msr(SYS_HDFGWTR_EL2, 0);
+    /* AMUSERENR_EL0 is written by every kernel that knows the AMU. */
+    if (FIELD_GET(ID_AA64PFR0_AMU, mrs(SYS_ID_AA64PFR0_EL1)))
+        msr(SYS_HAFGRTR_EL2, 0);
+    if (fgt >= 2) {
+        msr(SYS_HDFGRTR2_EL2, 0);
+        msr(SYS_HDFGWTR2_EL2, 0);
+        msr(SYS_HFGRTR2_EL2, 0);
+        msr(SYS_HFGWTR2_EL2, 0);
+        msr(SYS_HFGITR2_EL2, 0);
+    }
 
+    /* As the kernel's __init_el2_hcrx: TCR2_EL1, FEAT_MOPS and FPMR untrapped where present. */
     u64 mmfr1 = mrs(SYS_ID_AA64MMFR1_EL1);
-    if (FIELD_GET(ID_AA64MMFR1_HCX, mmfr1))
-        msr(SYS_HCRX_EL2, 0);
+    if (FIELD_GET(ID_AA64MMFR1_HCX, mmfr1)) {
+        u64 hcrx = 0;
+        if (FIELD_GET(ID_AA64MMFR3_TCRX, mmfr3))
+            hcrx |= HCRX_TCR2En;
+        if (FIELD_GET(ID_AA64ISAR2_MOPS, mrs(SYS_ID_AA64ISAR2_EL1)))
+            hcrx |= HCRX_MSCEn;
+        if (FIELD_GET(ID_AA64PFR2_FPMR, mrs(SYS_ID_AA64PFR2_EL1)))
+            hcrx |= HCRX_EnFPM;
+        msr(SYS_HCRX_EL2, hcrx);
+    }
     if (FIELD_GET(ID_AA64MMFR1_LO, mmfr1))
         msr(SYS_LORC_EL1, 0);
 
