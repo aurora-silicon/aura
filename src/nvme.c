@@ -827,9 +827,11 @@ bool nvme_shutdown(void)
 #if defined(CHAINLOADING) && !defined(ESP_STAGE2)
         /* Stage 2 and U-Boot adopt this session without servicing its mailbox
          * (only Linux takes RTKit ownership again), so stop the IOP pushing
-         * log traffic at the AP before handing it on. Only T8132 has run
-         * this; the other M4-generation chips keep their stage 1 hand-off. */
-        if (chip_id == T8132) {
+         * log traffic at the AP before handing it on. Only T8132 and T6050
+         * have run this; the other M4-generation chips keep their stage 1
+         * hand-off. On T6050 an unserviced syslog ring fills the IOP's
+         * mailbox within a stage's startup and CC.EN never completes. */
+        if (chip_id == T8132 || chip_id == T6050) {
             if (nvme_rtkit && rtkit_quiesce_ap(nvme_rtkit))
                 printf("nvme: ANS AP power quiesced for the next stage\n");
             else
