@@ -8118,8 +8118,10 @@ int kboot_prepare_dt(void *fdt)
      * A live ANS handed to Linux keeps every buffer an earlier stage gave it (on a normal boot
      * Stage 1 read the ESP, so the buffers are in Stage 1's heap, not this one's). Reserve each
      * SART-allowed range inside RAM; the nvme-apple adoption requires them reserved anyway.
+     * T6050 (J775D): iBoot's ANS stays live into Linux (nvme-apple re-handshakes with it), and
+     * its SART v4 allows two DRAM windows; until now they only happened to lie outside RAM.
      */
-    if (chip_id == T6041 || chip_id == T8142) {
+    if (chip_id == T6041 || chip_id == T8142 || chip_id == T6050) {
         sart_dev_t *sart = sart_init("/arm-io/sart-ans");
         u64 ram_start = cur_boot_args.phys_base;
         u64 ram_end = ram_start + cur_boot_args.mem_size;
@@ -8130,8 +8132,13 @@ int kboot_prepare_dt(void *fdt)
             u64 paddr;
             size_t sz;
 
-            if (!sart_get_allowed(sart, i, &paddr, &sz) || paddr < ram_start || paddr >= ram_end)
+            if (!sart_get_allowed(sart, i, &paddr, &sz))
                 continue;
+            if (paddr < ram_start || paddr >= ram_end) {
+                printf("FDT: ANS window [0x%lx, 0x%lx) is outside RAM: not Linux's\n", paddr,
+                       paddr + sz);
+                continue;
+            }
             u64 start = ALIGN_DOWN(paddr, SZ_16K);
             u64 end = ALIGN_UP(min(paddr + sz, ram_end), SZ_16K);
             if (fdt_add_mem_rsv(dt, start, end - start)) {
