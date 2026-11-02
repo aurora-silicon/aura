@@ -7027,6 +7027,69 @@ static int dt_set_aop_firmware(void)
     return 0;
 }
 
+/*
+ * T6050 (J775D): iBoot places the __OS_LOG segment (flags 0xa) of each coprocessor it leaves
+ * running in DRAM it then hands to the OS: the eight dcpextN, the AOP and auss-cpu0/1 put theirs
+ * inside Linux's memory, at a new address every boot, and keep writing it. No per-device handoff
+ * covers them here (none of these devices has one on T6050 yet), so reserve each one, no-map, by
+ * physical address, whatever the device tree says about its owner. Taken from every ADT node's
+ * segment-ranges at boot; a segment outside RAM, or already reserved by name, is left.
+ */
+/* Reserve @at's in-RAM __OS_LOG segments; returns how many, or -1 */
+static int dt_reserve_oslogs_of(int at, u64 ram_lo, u64 ram_hi)
+{
+    u32 len = 0;
+    int n = 0;
+    const struct adt_segment_ranges *seg = adt_getprop(adt, at, "segment-ranges", &len);
+    if (!seg || !len || len % sizeof(*seg))
+        return 0;
+    for (u32 i = 0; i < len / sizeof(*seg); i++) {
+        struct adt_segment_ranges r;
+        memcpy(&r, &seg[i], sizeof(r));
+        if (r.unk != 0xa || !r.size || r.phys >= ram_hi || r.phys + r.size <= ram_lo)
+            continue;
+        u64 base = ALIGN_DOWN(r.phys, SZ_16K);
+        u64 size = ALIGN_UP(r.phys + r.size, SZ_16K) - base;
+        char name[32];
+        snprintf(name, sizeof(name), "os-log@%lx", base);
+        int resv = fdt_path_offset(dt, "/reserved-memory");
+        /* The owner (aop, dcpextN) and its nub (iop-dcpextN-nub) repeat the same segments. */
+        if (resv >= 0 && fdt_subnode_offset(dt, resv, name) >= 0)
+            continue;
+        if (dt_get_or_add_reserved_mem(name, "apple,os-log", true, base, size) < 0)
+            bail("FDT: T6050: could not reserve %s's __OS_LOG at 0x%lx\n", adt_get_name(adt, at),
+                 r.phys);
+        n++;
+    }
+    return n;
+}
+
+static int dt_reserve_t6050_oslogs(void)
+{
+    if (chip_id != T6050)
+        return 0;
+    u64 ram_lo = cur_boot_args.phys_base, ram_hi = ram_lo + cur_boot_args.mem_size;
+    int total = 0, dev = adt_path_offset(adt, "/arm-io");
+    if (dev < 0)
+        return 0;
+
+    ADT_FOREACH_CHILD(adt, dev)
+    {
+        int n = dt_reserve_oslogs_of(dev, ram_lo, ram_hi);
+        int nub = adt_get_child_count(adt, dev) ? adt_first_child_offset(adt, dev) : -1;
+        for (int k = nub < 0 ? 0 : adt_get_child_count(adt, dev); n >= 0 && k--;
+             nub = adt_next_sibling_offset(adt, nub)) {
+            int m = dt_reserve_oslogs_of(nub, ram_lo, ram_hi);
+            n = m < 0 ? m : n + m;
+        }
+        if (n < 0)
+            return -1;
+        total += n;
+    }
+    printf("FDT: T6050: reserved %d coprocessor __OS_LOG segments in RAM\n", total);
+    return 0;
+}
+
 struct isp_segment_ranges {
     u64 phys;
     u64 iova;
@@ -8297,6 +8360,8 @@ int kboot_prepare_dt(void *fdt)
     if (dt_setup_sio())
         return -1;
     if (dt_set_aop_firmware())
+        return -1;
+    if (dt_reserve_t6050_oslogs())
         return -1;
     if (dt_set_isp())
         return -1;
