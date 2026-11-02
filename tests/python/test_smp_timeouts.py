@@ -37,6 +37,11 @@ typedef uint32_t u32;
 ''' + table + r'''
 static struct spin_table spin_table[MAX_CPUS];
 static int boot_cpu_idx;
+/* smp_call4's T6050 EL2 TEXT check; the chip under test is not a T6050. */
+#define T6050 0x6050
+static int chip_id;
+static bool in_el2(void) { return false; }
+static unsigned char _text_start[1], _text_end[1];
 static bool wfe_mode = true;
 static u64 ticks;
 static bool complete;
@@ -336,6 +341,7 @@ typedef uint64_t u64;
 #define SMP_TIMEOUT -2
 #define T8152 0x8152
 #define PMGR_DIE_OFFSET 0x1000
+static u64 pmgr_die_stride(void) { return PMGR_DIE_OFFSET; }
 #define sysop(op) ((void)0)
 #define smp_call1(cpu, fn, a) smp_call4(cpu, fn, a, 0, 0, 0)
 struct spin_table { u64 flag, target; };
@@ -498,6 +504,11 @@ static int barriers;
 ''' + table + r'''
 static struct spin_table spin_table[MAX_CPUS];
 static int boot_cpu_idx;
+/* smp_call4's T6050 EL2 TEXT check; the chip under test is not a T6050. */
+#define T6050 0x6050
+static int chip_id;
+static bool in_el2(void) { return false; }
+static unsigned char _text_start[1], _text_end[1];
 static bool wfe_mode = true;
 static u64 ticks;
 static void smp_send_ipi(int cpu) {}
@@ -610,6 +621,11 @@ typedef uint32_t u32;
 ''' + table + r'''
 static struct spin_table spin_table[MAX_CPUS];
 static int boot_cpu_idx;
+/* smp_call4's T6050 EL2 TEXT check; the chip under test is not a T6050. */
+#define T6050 0x6050
+static int chip_id;
+static bool in_el2(void) { return false; }
+static unsigned char _text_start[1], _text_end[1];
 static bool wfe_mode = true;
 static u64 ticks, acknowledge_at, complete_at;
 static bool acknowledged;

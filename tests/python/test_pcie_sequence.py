@@ -32,9 +32,12 @@ typedef uint64_t u64;
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 #define FIELD_PREP(f, v) (((v) * ((f) & -(f))) & (f))
 #define T8140 0x8140
+#define T6050 0x6050
 #define ADT_GETPROP(a, n, p, v) adt_getprop_copy(a, n, p, v, sizeof(*(v)))
 static void *adt;
 static int chip_id = T8140;
+/* T6050 has its own bring-up (pcie_t6050.c), not modelled here. */
+static int pcie_t6050_init(void) { assert(0); return -1; }
 static const char *controller_compat = "apcie,t8140";
 static u64 regs[][2] = {
     {0x1cb0000000, 0x10000000}, {0x394000000, 0x4000},

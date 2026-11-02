@@ -22,6 +22,7 @@ typedef uint64_t u64;
 typedef uint32_t u32;
 #define MAX_CPUS 4
 #define T8140 0x8140
+#define T6050 0x6050
 #define SMP_TIMEOUT -2
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 #define smp_call0(cpu, fn) smp_call4(cpu, fn, 0, 0, 0, 0)
@@ -66,7 +67,7 @@ static void reset(void)
 }
 int main(void)
 {
-    int chips[] = {0x8103, 0x6000, 0x8112, 0x6020, 0x8122, 0x6030, T8140};
+    int chips[] = {0x8103, 0x6000, 0x8112, 0x6020, 0x8122, 0x6030, T8140, T6050};
     for (unsigned i = 0; i < ARRAY_SIZE(chips); i++) {
         chip_id = chips[i];
         reset();
@@ -89,7 +90,7 @@ int main(void)
         assert(!advertised_tso);
         assert(tso_calls == 1);
         reset(); start_error = -1;
-        assert(prepare_cpus() == (chip_id == T8140 ? -1 : 0));
+        assert(prepare_cpus() == (chip_id == T8140 || chip_id == T6050 ? -1 : 0));
     }
     return 0;
 }

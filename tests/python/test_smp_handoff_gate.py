@@ -33,6 +33,7 @@ typedef uint64_t u64; typedef uint32_t u32;
 #define T8152 0x8152
 #define T6040 0x6040
 #define T6041 0x6041
+#define T6050 0x6050
 #define SZ_16K 16384
 #define sysop(op) ((void)0)
 #define bail(...) do { printf(__VA_ARGS__); return -1; } while (0)
@@ -58,6 +59,10 @@ static int fdt_node_check_compatible(void *p, int node, const char *compatible) 
 static int dt_disable_j713_pcie(void) { return 0; }
 static int dt_disable_t8140_pcie(void) { return 0; }
 static int fdt_pack(void *p) { return 0; }
+/* T6050's EL2 fetch-window check and its PCIe status edits; not the chip under test here. */
+static int smp_check_el1_handoff(void) { return 0; }
+static int fdt_open_into(const void *p, void *q, int size) { return 0; }
+static int pcie_t6050_handoff_fdt(void *p) { return 0; }
 static u32 fdt_totalsize(void *p) { return 0x8000; }
 static int dapf_init_fdt(void *p) { return 0; }
 static int dapf_init_all(void) { return 0; }

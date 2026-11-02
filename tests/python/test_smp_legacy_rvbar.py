@@ -29,6 +29,9 @@ _Static_assert(sizeof(u64) == 8, "production u64 ABI");
 #define RVBAR_LOCK 1
 #define RVBAR_ADDR 0x0000fffffffff000ULL
 #define PMGR_DIE_OFFSET 0x100000
+static u64 pmgr_die_stride(void) { return PMGR_DIE_OFFSET; }
+/* T6050's EL2 fetch-window check; not the chip under test here. */
+static int smp_check_el1_handoff(void) { return 0; }
 #define T8103 0x8103
 #define T8140 0x8140
 #define T8142 0x8142

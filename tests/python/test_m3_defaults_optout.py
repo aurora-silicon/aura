@@ -223,6 +223,7 @@ static const char *adt_getprop(void *a, int node, const char *name, u32 *len) { 
 static void cpufreq_payload_boost(bool on) {}
 static void cpufreq_init(void) {}
 #define T8140 0x8140
+#define T6050 0x6050
 #define SMP_TIMEOUT -2
 #define MAX_CPUS 4
 static int smp_start_secondaries(void) { return 0; }

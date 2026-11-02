@@ -43,7 +43,10 @@ typedef int sart_dev_t;
 #define T6040 0x6040
 #define T6041 0x6041
 #define T8142 0x8142
+#define T6050 0x6050
 static u32 chip_id = T8140;
+/* T6050's apcie0 bring-up before storage; not the chip under test here. */
+static int pcie_init(void) { return 0; }
 static void *adt;
 static u64 get_ticks(void) { return 0; }
 static u64 ticks_to_msecs(u64 ticks) { return ticks; }
