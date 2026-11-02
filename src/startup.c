@@ -188,6 +188,9 @@ void _start_c(void *boot_args, void *base)
     size_t command_capacity = cur_boot_args.revision == 1   ? CMDLINE_LENGTH_RV1
                               : cur_boot_args.revision == 2 ? CMDLINE_LENGTH_RV2
                                                             : CMDLINE_LENGTH_RV3;
+#ifdef DEFAULT_BOOT_OPTIONS
+    boot_options_add_defaults(cur_boot_args.rv3.cmdline, command_capacity, DEFAULT_BOOT_OPTIONS);
+#endif
     boot_options_init(cur_boot_args.rv3.cmdline, command_capacity);
 #ifdef ESP_STAGE2
     boot_options_set_stage1(false);

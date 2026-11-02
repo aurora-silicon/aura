@@ -116,6 +116,9 @@ CFG += DEBUGUSB_PROXY
 endif
 
 
+# BOOT_OPTIONS (e.g. aura-debug) are added to the boot command line when it lacks them: an enrolled
+# Stage 1 gets an empty one from iBoot, and hands its own on to the next stage.
+BOOT_OPTIONS ?=
 # T6050_EXEC_SPAN: the TEXT size of the enrolled T6050 Stage 1, whose CTXR_D every later image runs in.
 # TEXT_ENVELOPE pads TEXT to this size, for a T6050 Stage 1 to enroll (aura.ld).
 T6050_EXEC_SPAN ?= 0
@@ -342,6 +345,7 @@ build-cfg src/../build/build_cfg.h &:
 	$(QUIET)mkdir -p build
 	$(QUIET)for i in $(CFG); do echo "#define $$i"; done > build/build_cfg.tmp
 	$(QUIET)echo "#define BUILTIN_LOGO $(BUILTIN_LOGO)" >> build/build_cfg.tmp
+	$(QUIET)$(if $(BOOT_OPTIONS),echo '#define DEFAULT_BOOT_OPTIONS "$(BOOT_OPTIONS)"' >> build/build_cfg.tmp)
 	$(QUIET)cmp -s build/build_cfg.h build/build_cfg.tmp 2>/dev/null || \
 	( mv -f build/build_cfg.tmp build/build_cfg.h && echo "  CFG   build/build_cfg.h" )
 

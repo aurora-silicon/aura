@@ -38,6 +38,29 @@ bool boot_option_present(const char *line, size_t capacity, const char *option)
     return false;
 }
 
+/* Append each option of defaults that line lacks, as far as line's capacity allows. */
+void boot_options_add_defaults(char *line, size_t capacity, const char *defaults)
+{
+    for (size_t pos = 0; defaults[pos];) {
+        if (boot_space(defaults[pos])) {
+            pos++;
+            continue;
+        }
+        size_t end = pos;
+        while (defaults[end] && !boot_space(defaults[end]))
+            end++;
+        char option[64];
+        size_t n = end - pos;
+        if (n < sizeof(option)) {
+            for (size_t i = 0; i < n; i++)
+                option[i] = defaults[pos + i];
+            option[n] = 0;
+            boot_options_append(line, capacity, option);
+        }
+        pos = end;
+    }
+}
+
 void boot_options_init(const char *line, size_t capacity)
 {
     debug_enabled = boot_option_present(line, capacity, "aura-debug");
