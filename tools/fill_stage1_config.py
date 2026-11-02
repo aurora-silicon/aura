@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-only
-"""Fill a J700 Stage 1 target without adding bytes after STACKBOT."""
+"""Fill a Stage 1 target in place: a raw image (J700; nothing added after STACKBOT) or a Mach-O (T6050
+enrolls Stage 1 as one; the block must lie in a file-backed segment, and no segment moves)."""
 
 import argparse
 import hashlib
@@ -22,6 +23,26 @@ def valid_path(path: str) -> bool:
             and all(component not in ("", ".", "..") for component in path.split("/")))
 
 
+MH_MAGIC_64 = 0xfeedfacf
+LC_SEGMENT_64 = 0x19
+
+
+def macho_file_segments(image: bytes):
+    """(name, fileoff, filesize) of each LC_SEGMENT_64 with file bytes in IMAGE."""
+    ncmds, sizeofcmds = struct.unpack_from("<II", image, 16)
+    off, segments = 32, []
+    for _ in range(ncmds):
+        cmd, size = struct.unpack_from("<II", image, off)
+        if size < 8 or off + size > 32 + sizeofcmds:
+            raise ValueError("malformed Mach-O load commands")
+        if cmd == LC_SEGMENT_64:
+            name = image[off + 8:off + 24].rstrip(b"\0").decode("ascii", "replace")
+            fileoff, filesize = struct.unpack_from("<QQ", image, off + 40)
+            segments.append((name, fileoff, min(filesize, max(0, len(image) - fileoff))))
+        off += size
+    return segments
+
+
 def fill(image: bytes, uuid: str, path: str, window_ms: int) -> bytes:
     if not UUID.fullmatch(uuid):
         raise ValueError("ESP PARTUUID must use canonical lowercase 8-4-4-4-12 hex")
@@ -32,13 +53,18 @@ def fill(image: bytes, uuid: str, path: str, window_ms: int) -> bytes:
         raise ValueError("Stage 2 path is too long")
     if not 0 <= window_ms <= 99999:
         raise ValueError("Proxy window must be 0..99999 ms")
-    if not image.endswith(b"STACKBOT"):
+    macho = len(image) >= 32 and struct.unpack_from("<I", image)[0] == MH_MAGIC_64
+    if not macho and not image.endswith(b"STACKBOT"):
         raise ValueError("Stage 1 image does not end at STACKBOT")
     if image.count(MAGIC) != 1:
         raise ValueError("Stage 1 config magic must occur exactly once")
 
     offset = image.index(MAGIC)
-    if offset + BLOCK_SIZE > len(image) - 8:
+    if macho:
+        if not any(name != "PYLD" and start <= offset and offset + BLOCK_SIZE <= start + size
+                   for name, start, size in macho_file_segments(image)):
+            raise ValueError("Stage 1 config block is not inside a file-backed Mach-O segment")
+    elif offset + BLOCK_SIZE > len(image) - 8:
         raise ValueError("Stage 1 config block extends past image data")
     version = struct.unpack_from("<I", image, offset + len(MAGIC))[0]
     if version != 1:
@@ -48,7 +74,7 @@ def fill(image: bytes, uuid: str, path: str, window_ms: int) -> bytes:
                      encoded.ljust(192, b"\0"))
     block = MAGIC + body + struct.pack("<I", zlib.crc32(body))
     result = image[:offset] + block + image[offset + BLOCK_SIZE:]
-    assert len(result) == len(image) and result.endswith(b"STACKBOT")
+    assert len(result) == len(image) and (macho or result.endswith(b"STACKBOT"))
     return result
 
 

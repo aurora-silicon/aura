@@ -133,15 +133,23 @@ SECTIONS {
         . = ALIGN(8);
         *(.got.plt)
         . = ALIGN(0x10000);
+        _text_code_end = .;
+        /*
+         * TEXT_ENVELOPE (make): zero-pad TEXT to this size. T6050's iBoot sets CTXR_D, the only range a
+         * released secondary may execute at EL2, to the enrolled Stage 1's TEXT; a padded Stage 1 leaves
+         * room for the Stage 2 images it loads into that span later.
+         */
+        . = MAX(., _text_start + _text_envelope);
     } :text
     _text_end = .;
     _text_size = . - _text_start;
     /*
      * T6050_EXEC_SPAN (make): T6050 secondaries fetch at EL2 only inside the enrolled Stage 1's
-     * TEXT, [base + 0x10000, base + 0x10000 + span). smp.c checks the live span at run time; this
-     * catches an image that cannot fit at link time. 0 (the default) skips the check.
+     * TEXT, [base + 0x10000, base + 0x10000 + span). smp.c and chainload.c check the live span at
+     * run time; this catches code that cannot fit at link time (TEXT_ENVELOPE's padding is not
+     * code). 0 (the default) skips the check.
      */
-    ASSERT(_t6050_exec_span == 0 || _text_size <= _t6050_exec_span, "TEXT exceeds the T6050 CTXR_D span of the enrolled Stage 1")
+    ASSERT(_t6050_exec_span == 0 || _text_code_end - _text_start <= _t6050_exec_span, "TEXT code exceeds the T6050 CTXR_D span of the enrolled Stage 1")
     .rodata : ALIGN(0x10000) {
         *(.rodata)
         *(.rodata.*)
@@ -165,6 +173,8 @@ SECTIONS {
         /* The load header's footprint (start.S) leaves an R_AARCH64_NONE here; keep it inside the
          * padding and out of the range apply_rela() walks, which only accepts relative entries. */
         *(.rela.init)
+        /* A free last page for the __info section a boot-object packager adds (kmutil inspect) */
+        . += 0x1000;
         . = ALIGN(0x10000);
     } :rodata
     _rodata_end = .;

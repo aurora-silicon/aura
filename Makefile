@@ -116,9 +116,11 @@ CFG += DEBUGUSB_PROXY
 endif
 
 
-# T6050_EXEC_SPAN: the TEXT size of the enrolled T6050 Stage 1, whose CTXR_D every later image runs in
+# T6050_EXEC_SPAN: the TEXT size of the enrolled T6050 Stage 1, whose CTXR_D every later image runs in.
+# TEXT_ENVELOPE pads TEXT to this size, for a T6050 Stage 1 to enroll (aura.ld).
 T6050_EXEC_SPAN ?= 0
-LDFLAGS := --defsym=_t6050_exec_span=$(T6050_EXEC_SPAN) \
+TEXT_ENVELOPE ?= 0
+LDFLAGS := --defsym=_t6050_exec_span=$(T6050_EXEC_SPAN) --defsym=_text_envelope=$(TEXT_ENVELOPE) \
 	-EL -maarch64elf --no-undefined -X -Bsymbolic \
 	-z notext --no-apply-dynamic-relocs --orphan-handling=warn \
 	-z nocopyreloc --gc-sections -pie
