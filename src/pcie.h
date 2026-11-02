@@ -7,6 +7,8 @@ int pcie_prepare_fdt(void *dt);
 int pcie_handoff_fdt(void *dt);
 int pcie_init(void);
 int pcie_shutdown(void);
+/* T6050 apcie0 port 2 (pcie_t6050.c): 0 up, -1 stopped (sticky for this boot) */
+int pcie_t6050_init(void);
 
 /* Disable optional J713 PCIe admission after rail/controller/DART failure. */
 int pcie_disable_j713_fdt(void *dt);

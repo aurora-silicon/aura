@@ -1077,6 +1077,12 @@ int pcie_init(void)
         return 1;
     }
 
+    if (chip_id == T6050) {
+        int ret = pcie_t6050_init();
+        pcie_initialized = !ret;
+        return ret;
+    }
+
     success |= pcie_init_controller(APCIE, "/arm-io/apcie") == 0;
     success |= pcie_init_controller(APCIE, "/arm-io/apcie0") == 0;
     success |= pcie_init_controller(APCIE_GE0, "/arm-io/apcie-ge0") == 0;

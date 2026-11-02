@@ -8418,6 +8418,11 @@ int kboot_boot(void *kernel)
                 return -1;
         }
     }
+    if (chip_id == T6050 && ret < 0) {
+        /* A stop may mean storage moved under nvme-apple; the port's state is unknown either way */
+        printf("kboot: refusing T6050 handoff after the apcie0 port 2 bring-up stopped\n");
+        return -1;
+    }
     if (chip_id == T8140) {
         if (ret < 0) {
             printf("kboot: refusing T8140 handoff after partial PCIe setup\n");
