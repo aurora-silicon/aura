@@ -6,6 +6,7 @@
 #include "assert.h"
 #include "malloc.h"
 #include "nvme.h"
+#include "pcie.h"
 #include "pmgr.h"
 #include "rtkit.h"
 #include "sart.h"
@@ -409,6 +410,12 @@ bool nvme_init(void)
         printf("nvme: already initialized\n");
         return true;
     }
+    /* T6050: apcie0's shared GP init runs once, before this stage drives storage on the same
+     * controller (it is measured with ANS idle). A stopped bring-up leaves storage alone too. */
+    if (chip_id == T6050 && pcie_init() < 0) {
+        printf("nvme: T6050 apcie0 bring-up stopped; not starting storage\n");
+        return false;
+    }
 
     nvme_base = 0;
     nvmmu_base = 0;
@@ -485,9 +492,9 @@ bool nvme_init(void)
          * On T6040/T6041 the "nvme" block really ends at 0x10000: LINEAR_SQ_CTRL and the
          * linear submission queue doorbells sit at the same offsets in the NVMMU block,
          * and the firmware enables the linear queues itself (as the Linux driver's
-         * apple,t6041-nvme-ans2 entry does).
+         * apple,t6041-nvme-ans2 entry does). T6050 has the same layout (apple,t6050-nvme-ans2).
          */
-        nvme_lsq_in_nvmmu = chip_id == T6040 || chip_id == T6041;
+        nvme_lsq_in_nvmmu = chip_id == T6040 || chip_id == T6041 || chip_id == T6050;
         u64 lsq_size = nvme_lsq_in_nvmmu ? nvmmu_size : nvme_size;
         u64 nvme_need =
             nvme_lsq_in_nvmmu ? NVME_BOOT_STATUS + sizeof(u32) : NVME_DB_LINEAR_IOSQ + sizeof(u32);
