@@ -3126,3 +3126,259 @@ int dt_set_display_handoff(void *dt)
         t6041_ext_handoffs(dt);
     return 0;
 }
+
+/*
+ * T6050 (J775D, Mac Studio M5 Ultra): a read-only inventory of the external display engines
+ * iBoot leaves, which the native handoff below checks before it changes anything.
+ * The Studio has no dcp/disp0, only dcpext0..7 (four per die). Per engine: the power states its
+ * ADT clock-gates resolve to, then, only if every one is on, the ASC CPU control and status, the
+ * PROTECT of dart-dcpextN and dart-dispextN, and the TCR/TTBR of the streams the ADT gives page
+ * tables (DCP SID 23, scanout SID 0, PIODMA SID 16) beside their ADT l1-tt. Nothing is written,
+ * reserved or published, and the device tree is not touched.
+ */
+/* One stream as iBoot left it: on, four-level, on the ADT's own root table */
+struct dcp6_t6050_sid {
+    u32 sid, tcr, ttbr;
+    u64 root, l1;
+    bool ok;
+};
+
+struct dcp6_t6050_engine {
+    u64 coproc, dart_dcp, dart_disp;
+    bool on, running, read; /* powered; ASC RUN; every register below was read */
+    u32 ctl, st, protect_dcp, protect_disp;
+    struct dcp6_t6050_sid sid[3]; /* DCP 23 on dart-dcp; scanout 0 and PIODMA 16 on dart-disp */
+};
+
+static void dcp6_t6050_stream(const char *dart_path, u64 base, struct dcp6_t6050_sid *s)
+{
+    char prop[24];
+    u64 flag;
+    int node = adt_path_offset(adt, dart_path);
+    snprintf(prop, sizeof(prop), "l1-tt-%u", s->sid);
+    s->l1 = 0;
+    if (node >= 0)
+        dcp6_adt_u64_pair(node, prop, &s->l1, &flag);
+
+    int g = dcp6_guard_begin();
+    s->tcr = read32(base + DART_T8110_TCR(s->sid));
+    s->ttbr = read32(base + DART_T8110_TTBR(s->sid));
+    if (dcp6_guard_end(g)) {
+        printf("DCP: T6050: %s SID %u: reading TCR/TTBR faulted\n", dart_path, s->sid);
+        return;
+    }
+    s->root = (u64)FIELD_GET(DART_T8110_TTBR_ADDR, s->ttbr) << DART_T8110_TTBR_SHIFT;
+    s->ok = s->tcr == (DART_T8110_TCR_TRANSLATE | DART_T8110_TCR_FOUR_LEVEL) &&
+            (s->ttbr & DART_T8110_TTBR_VALID) && s->l1 && s->root == s->l1;
+    printf("DCP: T6050: %s SID %u: TCR 0x%x TTBR 0x%x (root 0x%lx), ADT l1-tt 0x%lx: %s\n",
+           dart_path, s->sid, s->tcr, s->ttbr, s->root, s->l1,
+           !(s->ttbr & DART_T8110_TTBR_VALID) ? "no table"
+           : s->root == s->l1                 ? "the ADT's table"
+                                              : "NOT the ADT's table");
+}
+
+/* Read engine n as iBoot left it, logging every value; returns 0 if all of it could be read */
+static int dcp6_t6050_engine(int n, struct dcp6_t6050_engine *e)
+{
+    char dcp[24], dart_dcp[32], dart_disp[32];
+    memset(e, 0, sizeof(*e));
+    e->sid[0].sid = 23;
+    e->sid[1].sid = 0;
+    e->sid[2].sid = 16;
+    snprintf(dcp, sizeof(dcp), "/arm-io/dcpext%d", n);
+    snprintf(dart_dcp, sizeof(dart_dcp), "/arm-io/dart-dcpext%d", n);
+    snprintf(dart_disp, sizeof(dart_disp), "/arm-io/dart-dispext%d", n);
+    if (dcp6_adt_reg(dcp, 0, &e->coproc) || dcp6_adt_reg(dart_dcp, 0, &e->dart_dcp) ||
+        dcp6_adt_reg(dart_disp, 0, &e->dart_disp)) {
+        printf("DCP: T6050: dcpext%d: ADT nodes or reg missing\n", n);
+        return -1;
+    }
+
+    struct dcp6_ps ps[DCP6_PS_MAX];
+    u32 val[DCP6_PS_MAX];
+    int nps = 0;
+    for (u32 i = 0; i < DCP6_GATES_MAX; i++) {
+        struct pmgr_gate gate;
+        if (pmgr_adt_gate(dcp, "clock-gates", i, &gate) < 0)
+            break;
+        if (dcp6_ps_add(ps, &nps, &gate, 0)) {
+            printf("DCP: T6050: dcpext%d: clock-gates[%u] 0x%x does not resolve\n", n, i,
+                   gate.entry);
+            return -1;
+        }
+    }
+    if (!nps) {
+        printf("DCP: T6050: dcpext%d: no clock-gate with a power state\n", n);
+        return -1;
+    }
+    int g = dcp6_guard_begin();
+    for (int i = 0; i < nps; i++)
+        val[i] = read32(ps[i].addr);
+    if (dcp6_guard_end(g)) {
+        printf("DCP: T6050: dcpext%d: reading its power states faulted\n", n);
+        return -1;
+    }
+    e->on = true;
+    for (int i = 0; i < nps; i++) {
+        printf("DCP: T6050: dcpext%d: power %.16s 0x%lx = 0x%x\n", n, ps[i].name, ps[i].addr,
+               val[i]);
+        e->on &= dcp6_ps_on(val[i]);
+    }
+    if (!e->on) {
+        printf("DCP: T6050: dcpext%d: not powered, not read further\n", n);
+        return -1;
+    }
+
+    g = dcp6_guard_begin();
+    e->ctl = read32(e->coproc + ASC_CPU_CONTROL);
+    e->st = read32(e->coproc + ASC_CPU_STATUS);
+    e->protect_dcp = read32(e->dart_dcp + DART_T8110_PROTECT);
+    e->protect_disp = read32(e->dart_disp + DART_T8110_PROTECT);
+    if (dcp6_guard_end(g)) {
+        printf("DCP: T6050: dcpext%d: reading the ASC or DART PROTECT faulted\n", n);
+        return -1;
+    }
+    e->running = e->ctl & ASC_CPU_CONTROL_RUN;
+    printf("DCP: T6050: dcpext%d at 0x%lx: CPU_CONTROL 0x%x (%s) CPU_STATUS 0x%x; PROTECT "
+           "dart-dcp 0x%x dart-disp 0x%x\n",
+           n, e->coproc, e->ctl, e->running ? "running" : "stopped", e->st, e->protect_dcp,
+           e->protect_disp);
+    dcp6_t6050_stream(dart_dcp, e->dart_dcp, &e->sid[0]);
+    dcp6_t6050_stream(dart_disp, e->dart_disp, &e->sid[1]);
+    dcp6_t6050_stream(dart_disp, e->dart_disp, &e->sid[2]);
+    e->read = true;
+    return 0;
+}
+
+/* The FDT node a phandle property's first cell names, if it is "disabled" (Aura enables it) */
+static int dcp6_t6050_ref(void *dt, int node, const char *prop)
+{
+    int len;
+    const fdt32_t *cell = fdt_getprop(dt, node, prop, &len);
+    int target = cell && len >= 4 ? fdt_node_offset_by_phandle(dt, fdt32_ld(cell)) : -1;
+    const char *status = target < 0 ? NULL : fdt_getprop(dt, target, "status", NULL);
+    if (!status || strcmp(status, "disabled"))
+        return -1;
+    return target;
+}
+
+static int dcp6_t6050_okay(void *dt, int node)
+{
+    return fdt_setprop_string(dt, node, "status", "okay");
+}
+
+/*
+ * T6050 (J775D, Mac Studio M5 Ultra): the external display engines iBoot leaves running. On every
+ * boot, a read-only inventory of dcpext0..7 (see dcp6_t6050_engine). With the boot.bin config
+ * line chosen.aurora,t6050-display=1, also the handoff of dcpext0, natively: iBoot leaves its
+ * DARTs locked on its own roots, which the kernel's apple-dart keeps (fw_mirror). Only when dcpext0
+ * is powered and running, both its DARTs are locked (TCR/TTBR) and SIDs 23, 0 and 16 are on,
+ * four-level, on the ADT's l1-tt roots: reserve /vram (no-map, compatible "framebuffer"; it lies
+ * above the OS's memory, as do the DART tables and the firmware segments, so nothing else needs
+ * reserving), give it to the dcpext node and the display subsystem as their "framebuffer"
+ * memory-region, and enable the dcpext node, its piodma DART, mailbox, DARTs, bandwidth-scratch
+ * node and the display subsystem, all of which the device tree carries disabled. Anything else
+ * changes nothing.
+ */
+/* Not in dcp_socs[]: only names the log lines of the shared helpers (dlog) during this pass. */
+static const struct dcp_soc dcp_soc_t6050 = {
+    .name = "T6050",
+    .chip = T6050,
+    .compat = "apple,t6050",
+};
+
+void dt_set_display_t6050(void *dt)
+{
+    struct dcp6_t6050_engine e, e0;
+    if (chip_id != T6050)
+        return;
+    memset(&dcp6, 0, sizeof(dcp6));
+    dcp6.soc = &dcp_soc_t6050;
+    for (int n = 0; n < 8; n++) {
+        dcp6_t6050_engine(n, &e);
+        if (!n)
+            e0 = e;
+    }
+
+    int chosen = fdt_path_offset(dt, "/chosen"), len = 0;
+    const char *optin = chosen >= 0 ? fdt_getprop(dt, chosen, "aurora,t6050-display", &len) : NULL;
+    if (!optin || len != 2 || strcmp(optin, "1")) {
+        printf("DCP: T6050: not armed (no chosen.aurora,t6050-display=1): no display handoff\n");
+        return;
+    }
+    if (!e0.read || !e0.running || !(e0.protect_dcp & DART_T8110_PROTECT_TTBR_TCR) ||
+        !(e0.protect_disp & DART_T8110_PROTECT_TTBR_TCR) || !e0.sid[0].ok || !e0.sid[1].ok ||
+        !e0.sid[2].ok) {
+        printf("DCP: T6050: dcpext0 is not running on locked four-level ADT tables: no handoff\n");
+        return;
+    }
+
+    int dcp = fdt_node_offset_by_compatible(dt, -1, "apple,t6050-dcpext");
+    int disp = fdt_node_offset_by_compatible(dt, -1, "apple,display-subsystem");
+    u64 reg_addr = 0;
+    int reg_len;
+    const fdt64_t *reg = dcp < 0 ? NULL : fdt_getprop(dt, dcp, "reg", &reg_len);
+    if (reg && reg_len >= 16)
+        reg_addr = fdt64_ld(&reg[0]);
+    if (dcp < 0 || disp < 0 || reg_addr != e0.coproc) {
+        printf("DCP: T6050: the device tree has no disabled dcpext0 at 0x%lx: no handoff\n",
+               e0.coproc);
+        return;
+    }
+    int pio = fdt_subnode_offset(dt, dcp, "piodma");
+    int dart_dcp = dcp6_t6050_ref(dt, dcp, "iommus");
+    int dart_disp = dcp6_t6050_ref(dt, disp, "iommus");
+    int mbox = dcp6_t6050_ref(dt, dcp, "mboxes");
+    int pmc = dcp6_t6050_ref(dt, dcp, "apple,bw-scratch");
+    const fdt32_t *pio_iommu = pio < 0 ? NULL : fdt_getprop(dt, pio, "iommus", &len);
+    if (pio < 0 || dart_dcp < 0 || dart_disp < 0 || mbox < 0 || pmc < 0 || !pio_iommu || len != 8 ||
+        fdt_node_offset_by_phandle(dt, fdt32_ld(pio_iommu)) != dart_disp) {
+        printf("DCP: T6050: dcpext0's DARTs, mailbox, bw-scratch or piodma are not as expected: "
+               "no handoff\n");
+        return;
+    }
+
+    int adt_path[8];
+    u64 vram, vram_size;
+    if (adt_path_offset_trace(adt, "/vram", adt_path) < 0 ||
+        adt_get_reg(adt, adt_path, "reg", 0, &vram, &vram_size) || !vram_size ||
+        dcp6_resv_conflict(dt, vram, vram_size, "/vram")) {
+        printf("DCP: T6050: no usable ADT /vram: no handoff\n");
+        return;
+    }
+
+    /* All checks passed: edit a scratch copy, then replace the DT with it. */
+    void *scratch = dcp6_scratch(dt);
+    if (!scratch) {
+        printf("DCP: T6050: no scratch device tree: no handoff\n");
+        return;
+    }
+    char name[DCP6_NAME_LEN];
+    snprintf(name, sizeof(name), "vram@%lx", vram);
+    u32 ph = dcp6_add_resv(scratch, name, vram, vram_size, "framebuffer");
+    int err = !ph;
+    int nodes[] = {dcp, disp, dart_dcp, dart_disp, mbox, pmc};
+    for (unsigned i = 0; !err && i < 2; i++) {
+        /* Offsets are the same in the scratch copy until it is changed; refetch by path. */
+        char path[96];
+        int at =
+            fdt_get_path(dt, nodes[i], path, sizeof(path)) ? -1 : fdt_path_offset(scratch, path);
+        err = at < 0 || fdt_setprop_u32(scratch, at, "memory-region", ph) ||
+              fdt_setprop_string(scratch, at, "memory-region-names", "framebuffer");
+    }
+    for (unsigned i = 0; !err && i < ARRAY_SIZE(nodes); i++) {
+        char path[96];
+        int at =
+            fdt_get_path(dt, nodes[i], path, sizeof(path)) ? -1 : fdt_path_offset(scratch, path);
+        err = at < 0 || dcp6_t6050_okay(scratch, at);
+    }
+    if (err)
+        free(scratch);
+    if (err || dcp6_commit(dt, scratch)) {
+        printf("DCP: T6050: editing the device tree failed: no handoff\n");
+        return;
+    }
+    printf("DCP: T6050: dcpext0 handed off: vram 0x%lx+0x%lx reserved as its framebuffer, "
+           "dcpext0, its DARTs, mailbox and the display subsystem enabled\n",
+           vram, vram_size);
+}

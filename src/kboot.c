@@ -72,6 +72,7 @@ extern u64 relocated_from;
 
 int dt_set_gpu(void *dt);
 int dt_set_display_handoff(void *dt);
+void dt_set_display_t6050(void *dt);
 
 u64 kboot_ram_base(void)
 {
@@ -6295,6 +6296,11 @@ static int dt_set_display(void)
 {
     if (chip_id == T8140)
         return dt_set_display_t8140();
+    /* T6050 (J775D): the dcpext0..7 inventory, and dcpext0's handoff when armed. */
+    if (chip_id == T6050) {
+        dt_set_display_t6050(dt);
+        return 0;
+    }
 
     /* lock dart-disp0 to prevent old software from resetting it */
     dart_lock_adt("/arm-io/dart-disp0", 0);
