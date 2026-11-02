@@ -136,6 +136,19 @@ static int pmgr_find_device(u16 id, const struct pmgr_device **device)
     return -1;
 }
 
+/* T6050 has die-stride 0x4000000000; at 0x2000000000 its die 1 lands in die 0's MMIO. */
+u64 pmgr_die_stride(void)
+{
+    static u64 stride;
+
+    if (!stride) {
+        int node = adt_path_offset(adt, "/arm-io/pmgr");
+        if (node < 0 || ADT_GETPROP(adt, node, "die-stride", &stride) < 0 || !stride)
+            stride = PMGR_DIE_OFFSET;
+    }
+    return stride;
+}
+
 static uintptr_t pmgr_device_get_addr(u8 die, const struct pmgr_device *device)
 {
     if (die >= pmgr_dies)
@@ -148,7 +161,7 @@ static uintptr_t pmgr_device_get_addr(u8 die, const struct pmgr_device *device)
     if (addr == 0)
         return 0;
 
-    addr += PMGR_DIE_OFFSET * die;
+    addr += pmgr_die_stride() * die;
 
     if (pmgr_use_group_and_offset)
         addr += device->group_and_offset.offset;
