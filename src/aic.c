@@ -133,8 +133,14 @@ static int aic23_init(int version, int node)
     if (ext_intr_config) {
         printf("AIC: Configuring %d external interrupts\n", ext_intr_config_len / 3);
         for (u32 i = 0; i < ext_intr_config_len; i += 3) {
-            u8 die = ext_intr_config[i + 1] >> 4;
-            u16 irq = ext_intr_config[i] | ((ext_intr_config[i + 1] & 0xf) << 8);
+            /*
+             * The 12-bit field is an ADT interrupt number, which is flat across dies
+             * (die * nr_irq + irq, as in the "interrupts" properties): T6050's lists IRQ 411
+             * on die 1 as 0xdbb. The M1 Ultra's AIC2 names the die in the high nibble instead.
+             */
+            u16 flat = ext_intr_config[i] | ((ext_intr_config[i + 1] & 0xf) << 8);
+            u8 die = (ext_intr_config[i + 1] >> 4) + flat / aic->nr_irq;
+            u16 irq = flat % aic->nr_irq;
             u8 target = ext_intr_config[i + 2];
             assert(die < aic->nr_die);
             assert(irq < aic->nr_irq);
