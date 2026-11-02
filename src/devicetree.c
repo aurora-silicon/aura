@@ -4,28 +4,44 @@
 
 #include "libfdt/libfdt.h"
 
+static u64 dt_read_cells(const fdt32_t *cells, int count)
+{
+    u64 value = 0;
+
+    while (count--)
+        value = (value << 32) | fdt32_ld(cells++);
+    return value;
+}
+
 void dt_parse_ranges(void *dt, int node, struct dt_ranges_tbl *ranges)
 {
     int len;
-    const struct fdt_property *ranges_prop = fdt_get_property(dt, node, "ranges", &len);
-    if (ranges_prop && len > 0) {
-        int idx = 0;
-        int num_entries = len / sizeof(fdt64_t);
-        if (num_entries > DT_MAX_RANGES)
-            num_entries = DT_MAX_RANGES;
+    const fdt32_t *cells = fdt_getprop(dt, node, "ranges", &len);
+    int parent = fdt_parent_offset(dt, node);
 
-        const fdt64_t *entry = (const fdt64_t *)ranges_prop->data;
-        for (int i = 0; i < num_entries; ++i) {
-            u64 start = fdt64_ld(entry++);
-            u64 parent = fdt64_ld(entry++);
-            u64 size = fdt64_ld(entry++);
-            if (size) {
-                ranges[idx].start = start;
-                ranges[idx].parent = parent;
-                ranges[idx].size = size;
-                idx++;
-            }
-        }
+    if (!cells || len <= 0 || parent < 0)
+        return;
+
+    /* Each entry is (child address, parent address, size), at the nodes' own cell widths. */
+    int child_ac = fdt_address_cells(dt, node);
+    int child_sc = fdt_size_cells(dt, node);
+    int parent_ac = fdt_address_cells(dt, parent);
+    if (child_ac < 1 || child_ac > 2 || child_sc < 1 || child_sc > 2 || parent_ac < 1 ||
+        parent_ac > 2)
+        return;
+
+    int stride = child_ac + parent_ac + child_sc;
+    int num_entries = len / (int)(stride * sizeof(fdt32_t));
+    int idx = 0;
+
+    for (int i = 0; i < num_entries && idx < DT_MAX_RANGES; i++, cells += stride) {
+        u64 size = dt_read_cells(cells + child_ac + parent_ac, child_sc);
+        if (!size)
+            continue;
+        ranges[idx].start = dt_read_cells(cells, child_ac);
+        ranges[idx].parent = dt_read_cells(cells + child_ac, parent_ac);
+        ranges[idx].size = size;
+        idx++;
     }
 }
 
