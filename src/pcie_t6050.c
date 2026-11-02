@@ -7,6 +7,8 @@
 #include "tunables.h"
 #include "utils.h"
 
+#include "libfdt/libfdt.h"
+
 /*
  * T6050 apcie0: cold bring-up of J775D's GP ports, the sequence measured on port 2 (the onboard
  * RTL8127A) step by step from the proxy (stages A, S, B-G below).
@@ -103,6 +105,7 @@ struct port_regs {
     u64 perst;
     u32 refclk_to_perst_us;
     u64 dart;
+    bool up;
 };
 static struct port_regs pr[ARRAY_SIZE(ports)];
 
@@ -598,6 +601,7 @@ static int port_up(struct port_regs *pp)
     TRY(storage_check("after F", false));
     TRY(stage_g(pp));
     printf("pcie-t6050: port %d up, %s at %02x:00.0\n", pp->p->port, pp->p->endpoint, pp->p->bus);
+    pp->up = true;
     return 0;
 }
 
@@ -645,5 +649,51 @@ int pcie_t6050_init(void)
         }
     }
     state = 0;
+    return 0;
+}
+
+/* The DART that apcie0's iommu-map names for RID `rid`, or a negative libfdt error */
+static int iommu_for_rid(void *dt, int host, u32 rid)
+{
+    int len;
+    const fdt32_t *map = fdt_getprop(dt, host, "iommu-map", &len);
+
+    if (!map || len % (4 * sizeof(*map)))
+        return -FDT_ERR_BADVALUE;
+    for (int pos = 0; pos + 4 <= len / (int)sizeof(*map); pos += 4) {
+        u32 base = fdt32_ld(&map[pos]), count = fdt32_ld(&map[pos + 3]);
+        if (rid >= base && rid - base < count)
+            return fdt_node_offset_by_phandle(dt, fdt32_ld(&map[pos + 1]));
+    }
+    return -FDT_ERR_NOTFOUND;
+}
+
+/* Disable each optional port that is not up in the handed-over tree: its root port node
+ * (pci@<port>,0) and the DART its secondary bus maps to. Linux probes an enabled DART whether or
+ * not the port trained, and an untrained port's DART takes an SError. */
+int pcie_t6050_handoff_fdt(void *dt)
+{
+    int host = fdt_node_offset_by_compatible(dt, -1, "apple,t6050-pcie");
+
+    if (host < 0)
+        return 0;
+    for (size_t i = 0; i < ARRAY_SIZE(ports); i++) {
+        if (pr[i].up || ports[i].required)
+            continue;
+        char name[16];
+        snprintf(name, sizeof(name), "pci@%d,0", ports[i].port);
+        int rp = fdt_subnode_offset(dt, host, name);
+        int dart = iommu_for_rid(dt, host, (u32)ports[i].bus << 8);
+        if (rp < 0 || dart < 0) {
+            printf("pcie-t6050: port %d down, but its %s is not in the tree\n", ports[i].port,
+                   rp < 0 ? "root port" : "DART");
+            return -1;
+        }
+        if (fdt_setprop_string(dt, rp, "status", "disabled") ||
+            fdt_setprop_string(dt, dart, "status", "disabled"))
+            return -1;
+        printf("pcie-t6050: port %d down: disabled %s and its DART in the DT\n", ports[i].port,
+               name);
+    }
     return 0;
 }
