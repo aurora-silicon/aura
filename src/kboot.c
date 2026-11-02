@@ -3525,9 +3525,9 @@ static int dt_set_ave(void)
 }
 
 /*
- * The M4 Pro Neural Engine runs firmware that iBoot preloads into DRAM below
- * the OS: /arm-io/ane0 is pre-loaded, with exactly a __TEXT and a __DATA
- * segment range. Reserve both segments no-map and give them to the ANE node
+ * The M4 Pro and A18 Pro Neural Engines run firmware that iBoot preloads into
+ * DRAM below the OS: /arm-io/ane0 (M4 Pro) or /arm-io/ane (A18 Pro) is
+ * pre-loaded, with exactly a __TEXT and a __DATA segment range. Reserve both segments no-map and give them to the ANE node
  * as its "firmware-text" and "firmware-data" memory regions, with the device
  * addresses the firmware runs them at (their remap addresses) as
  * apple,firmware-iovas. A DT that describes the two regions as placeholders
@@ -3535,9 +3535,15 @@ static int dt_set_ave(void)
  * enabled; a DT without them gets them added. The node's status is left as
  * the DT has it, except that a node whose preload cannot be handed over is
  * disabled.
+ *
+ * When aura runs on bare metal (EL2, booted from iBoot, not a guest of a
+ * hypervisor that may have run another OS first) and the hand-off succeeds,
+ * /chosen/apple,ane-cold-boot tells the driver that nothing has run the ANE
+ * since iBoot loaded it, so it may start the preloaded firmware itself.
  */
 static const char *const ane_compatibles[] = {
     "apple,t6041-ane",
+    "apple,t8140-ane",
 };
 
 static int dt_ane_fill_region(int resv, uint32_t phandle, const char *kind, u64 phys, u64 size)
@@ -3667,6 +3673,14 @@ static int dt_set_ane_node(int node)
 
     printf("FDT: %s: ANE firmware TEXT 0x%lx DATA 0x%lx reserved\n", path, seg[0].phys,
            seg[1].phys);
+
+    if (in_el2()) {
+        static const char marker[] = "raw-no-xnu-ane-untouched-v1";
+        int chosen_dt = fdt_path_offset(dt, "/chosen");
+        if (chosen_dt < 0 ||
+            fdt_setprop(dt, chosen_dt, "apple,ane-cold-boot", marker, sizeof(marker)))
+            printf("FDT: ANE cold-boot marker not set\n");
+    }
     return 0;
 
 disable:
