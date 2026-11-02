@@ -385,7 +385,10 @@ def test_t6040_gpu_fill(tmp_path):
     source = (ROOT / "src/kboot_gpu.c").read_text()
     defs = source[source.index("#define MAX_PSTATES"):source.index("int32_t rust_gpu_initdata_size(")]
     start = source.index("/*\n * T6040 (M4 Pro).")
-    t6040 = source[start:source.index("int dt_set_gpu_m4(void *dt);", start)]
+    end = source.index("int dt_set_gpu_m4(void *dt);", start)
+    # The T6050 section follows T6040's; it is not part of this model.
+    t6050 = source.find("/*\n * T6050 (", start, end)
+    t6040 = source[start:t6050 if t6050 >= 0 else end]
     # The rounding barrier uses an AArch64 register constraint; a memory one works on any host.
     t6040, replaced = re.subn(r'#define T6040_ROUND\(x\) __asm__\(""\s*:\s*"\+w"\(x\)\)',
                               '#define T6040_ROUND(x) __asm__("" : "+m"(x))', t6040)
