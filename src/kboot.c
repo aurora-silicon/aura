@@ -8250,6 +8250,13 @@ int kboot_prepare_dt(void *fdt)
         return -1;
     if (dt_set_display())
         return -1;
+    if (chip_id == T6040 && board_id == 4 && adt_is_compatible(adt, 0, "J614sAP") &&
+        !fdt_node_check_compatible(dt, 0, "apple,j614s") && !kboot_j614s_hdmi_ready()) {
+        int node = fdt_path_offset(dt, "/dcp@3a2e00000");
+        int ret = node < 0 ? -FDT_ERR_NOTFOUND : fdt_delprop(dt, node, "memory-region");
+        if (ret && ret != -FDT_ERR_NOTFOUND)
+            return -1;
+    }
     if (dt_set_gpu(dt))
         return -1;
     if (dt_set_multitouch())
