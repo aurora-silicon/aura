@@ -88,6 +88,11 @@ void monitor_enter_os(u64 entry, u64 a0, u64 a1, u64 a2)
 
     msr(CNTHCTL_EL2, CNTHCTL_EL1PTEN | CNTHCTL_EL1PCTEN);
     msr(CNTVOFF_EL2, 0);
+    /* One counter rate on every CPU, including secondaries the firmware never ran. */
+    if (monitor_cntfrq)
+        msr(CNTFRQ_EL0, monitor_cntfrq);
+    /* With TGE clear the OS's timers are the guest timers: let them raise their FIQs. */
+    reg_set(SYS_IMP_APL_VM_TMR_FIQ_ENA_EL2, VM_TMR_FIQ_ENA_ENA_V | VM_TMR_FIQ_ENA_ENA_P);
 
     u64 cptr = CPTR_E2H_FPEN;
     u64 hfg = 0;

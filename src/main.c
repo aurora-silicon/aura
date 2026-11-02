@@ -421,7 +421,9 @@ next_stage:
 #endif
     if (next_stage.monitor) {
         monitor_active = true;
+        monitor_cntfrq = mrs(CNTFRQ_EL0);
         dc_cvac_range(&monitor_active, sizeof(monitor_active));
+        dc_cvac_range(&monitor_cntfrq, sizeof(monitor_cntfrq));
         sysop("dsb sy");
     }
     mmu_shutdown();

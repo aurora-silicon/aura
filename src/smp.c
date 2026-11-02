@@ -144,6 +144,7 @@ struct smp_reset_stack smp_reset_stacks[MAX_CPUS] SMP_SHARED = {
 extern u8 _vectors_start[0];
 
 bool monitor_active SMP_SHARED;
+u64 monitor_cntfrq SMP_SHARED;
 extern u8 _stack_bot[0];
 int boot_cpu_idx SMP_SHARED = -1;
 u64 boot_cpu_mpidr SMP_SHARED = 0;
