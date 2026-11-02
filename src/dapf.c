@@ -392,6 +392,18 @@ int dapf_t8132_windows(const char *path, int index, struct dapf_window *out, int
     return used;
 }
 
+static bool dapf_is_j614s(void)
+{
+    return chip_id == T6040 && board_id == 4 && adt_is_compatible(adt, 0, "J614sAP");
+}
+
+static bool j614s_aop_ready;
+
+bool dapf_j614s_aop_ready(void)
+{
+    return j614s_aop_ready;
+}
+
 int dapf_init(const char *path, int index)
 {
     int ret = -1;
@@ -572,6 +584,7 @@ static int dapf_init_j713(void *dt)
 
 int dapf_init_fdt(const void *fdt)
 {
+    j614s_aop_ready = false;
     if (chip_id == T8132) {
         if (!fdt || fdt_node_check_compatible(fdt, 0, "apple,j713"))
             return 0; /* No other M4 board's power/DAPF contract is qualified. */
@@ -611,6 +624,8 @@ int dapf_init_fdt(const void *fdt)
         }
         if (dapf_init(entry->path, entry->index) < 0) {
             ret = -1;
+        } else if (dapf_is_j614s() && !strcmp(entry->path, "/arm-io/dart-aop")) {
+            j614s_aop_ready = true;
         }
         entry++;
         count += 1;
