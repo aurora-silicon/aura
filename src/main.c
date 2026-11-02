@@ -380,8 +380,8 @@ void aura_main(void)
 #if defined(CHAINLOADING) && !defined(ESP_STAGE2)
     stage1_read_boot_record();
 #endif
-    /* T6040, T8140: nothing else in an aura tether chain clears iBoot's failed-boot count. */
-    if (chip_id == T6040 || chip_id == T8140)
+    /* T6040, T8140, T6050: nothing else in an aura chain clears iBoot's failed-boot count. */
+    if (chip_id == T6040 || chip_id == T8140 || chip_id == T6050)
         pmu_clear_panic_counter();
 
     printf("Initialization complete.\n");
