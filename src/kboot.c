@@ -6655,6 +6655,114 @@ static int dt_set_pmp_t8122(void)
     return 0;
 }
 
+/* J614s warm SEP shares physical ranges with live DCP logs. Retain the
+ * entire firmware descriptor while leaving the DCP no-map nodes intact.
+ * This runs after the other firmware reservations have been published. */
+struct sep_interval {
+    u64 start, end;
+};
+
+static int dt_split_j614s_sep_reservations(void)
+{
+    struct sep_interval spans[64], tmp;
+    u64 start, end, cursor;
+    const fdt64_t *reg;
+    const fdt32_t *ref;
+    const char *name;
+    u32 phandle;
+    int parent, sep, fw, node, len, count = 0, i, j, ret;
+
+    parent = fdt_path_offset(dt, "/reserved-memory");
+    if (parent < 0 || fdt_address_cells(dt, parent) != 2 || fdt_size_cells(dt, parent) != 2)
+        return -1;
+    sep = fdt_path_offset(dt, "/sep@406600000");
+    fw = fdt_path_offset(dt, "/reserved-memory/sep-firmware");
+    if (fw == -FDT_ERR_NOTFOUND)
+        return 0;
+    if (sep < 0 || fw < 0 || fdt_node_check_compatible(dt, sep, "apple,sep") ||
+        fdt_node_check_compatible(dt, fw, "apple,asc-mem") || fdt_getprop(dt, fw, "no-map", NULL))
+        return -1;
+    reg = fdt_getprop(dt, fw, "reg", &len);
+    if (!reg || len != 16)
+        return -1;
+    start = fdt64_ld(reg);
+    end = start + fdt64_ld(reg + 1);
+    if (!start || end <= start || (start & 0x3fff) || (end & 0x3fff))
+        return -1;
+    phandle = fdt_get_phandle(dt, fw);
+    ref = fdt_getprop(dt, sep, "memory-region", &len);
+    if (!phandle || !ref || len != 4 || fdt32_ld(ref) != phandle)
+        return -1;
+    name = fdt_getprop(dt, sep, "memory-region-names", &len);
+    if (!name || len != 6 || memcmp(name, "sepfw", 6))
+        return -1;
+    fdt_for_each_subnode(node, dt, parent)
+    {
+        u64 a, b;
+        if (node == fw)
+            continue;
+        reg = fdt_getprop(dt, node, "reg", &len);
+        if (!reg)
+            continue;
+        if (len != 16)
+            return -1;
+        a = fdt64_ld(reg);
+        b = a + fdt64_ld(reg + 1);
+        if (b < a)
+            return -1;
+        /* Empty placeholders reserve no physical memory. */
+        if (a == b)
+            continue;
+        if (a >= end || b <= start)
+            continue;
+        if (!fdt_getprop(dt, node, "no-map", NULL) ||
+            (fdt_node_check_compatible(dt, node, "apple,asc-mem") &&
+             !fdt_getprop(dt, node, "apple,dcp-os-log", NULL)) ||
+            count == 64)
+            return -1;
+        spans[count++] = (struct sep_interval){a < start ? start : a, b > end ? end : b};
+    }
+    if (!count)
+        return 0;
+    for (i = 1; i < count; i++)
+        for (j = i; j > 0 && spans[j].start < spans[j - 1].start; j--) {
+            tmp = spans[j];
+            spans[j] = spans[j - 1];
+            spans[j - 1] = tmp;
+        }
+    /* Existing reservations must themselves be disjoint. */
+    for (i = 1; i < count; i++)
+        if (spans[i].start < spans[i - 1].end)
+            return -1;
+    if (fdt_delprop(dt, sep, "memory-region"))
+        return -1;
+    sep = fdt_path_offset(dt, "/sep@406600000");
+    if (fdt_delprop(dt, sep, "memory-region-names"))
+        return -1;
+    fw = fdt_path_offset(dt, "/reserved-memory/sep-firmware");
+    if (fdt_del_node(dt, fw))
+        return -1;
+    cursor = start;
+    for (i = 0; i <= count; i++) {
+        u64 limit = i == count ? end : spans[i].start;
+        if (cursor < limit) {
+            char path[64];
+            fdt64_t cells[2] = {cpu_to_fdt64(cursor), cpu_to_fdt64(limit - cursor)};
+            parent = fdt_path_offset(dt, "/reserved-memory");
+            snprintf(path, sizeof(path), "sep-retained@%llx", (unsigned long long)cursor);
+            ret = fdt_add_subnode(dt, parent, path);
+            if (ret < 0)
+                return ret;
+            if (fdt_setprop(dt, ret, "reg", cells, sizeof(cells)))
+                return -1;
+        }
+        if (i < count)
+            cursor = spans[i].end;
+    }
+    printf("J614s: retained warm SEP range around %d existing no-map regions\n", count);
+    return 0;
+}
+
 static int dt_set_sep(void)
 {
     int aliases = fdt_path_offset(dt, "/aliases");
@@ -8334,6 +8442,10 @@ int kboot_prepare_dt(void *fdt)
     } else if (chip_id == T6032) {
         dt_t6031_fw_uuids(dt);
     }
+
+    if (chip_id == T6040 && board_id == 4 && adt_is_compatible(adt, 0, "J614sAP") &&
+        !fdt_node_check_compatible(dt, 0, "apple,j614s") && dt_split_j614s_sep_reservations())
+        bail("FDT: could not split J614s SEP reservations\n");
 
     /* T8140 PCIe status is known only after pcie_init() in kboot_boot(). */
     if (chip_id != T8140 && fdt_pack(dt))
