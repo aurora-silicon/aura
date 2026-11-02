@@ -184,6 +184,9 @@ void run_actions(void)
     if (aura_proxy_enabled() && window_ms < STAGE1_PROXY_REQUEST_MS) {
         printf("aura-proxy: waiting %u s for a host\n", STAGE1_PROXY_REQUEST_MS / 1000);
         window_ms = STAGE1_PROXY_REQUEST_MS;
+    } else if (window_ms) {
+        /* Announced as aura-proxy's window is: host tools claim the window on this line */
+        printf("Stage 1: waiting %u s for a host\n", window_ms / 1000);
     }
     if (window_ms) {
         window_result = stage1_window_result = uartproxy_wait_stage1(window_ms);
