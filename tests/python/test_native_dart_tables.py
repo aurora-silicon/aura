@@ -29,13 +29,13 @@ static u32 read32(uintptr_t a) {
  assert(a==DART_T8110_TTBR_OFF+20);return ttbr;
 }
 '''+function(s,'dart_table_in_dram')+function(s,'dart_collect_native_t8110')+r'''
-static u64 base,*root,pages[4];static size_t count;
+static u64 base,*root,pages[4];static size_t count;static char detail[256];
 static void setup(void) {
  memset(root,0,4*SZ_16K);tcr=1;protect=1;reads=0;change=false;count=99;
  ttbr=FIELD_PREP(DART_T8110_TTBR_ADDR,base>>14)|1;
  root[0]=FIELD_PREP(DART_T6000_PTE_OFFSET,(base+SZ_16K)>>14)|1;
 }
-static int collect(size_t cap){return dart_collect_native_t8110(0,5,base,4*SZ_16K,pages,cap,&count);}
+static int collect(size_t cap){return dart_collect_native_t8110(0,5,base,4*SZ_16K,pages,cap,&count,detail,sizeof(detail));}
 int main(void) {
  root=MAP_FAILED;
  for(unsigned i=0;i<64;i++) {
@@ -55,12 +55,12 @@ int main(void) {
  setup();protect=0;assert(collect(4)==-3&&!count);
  setup();ttbr=0;assert(collect(4)==-3&&!count);
  setup();ttbr=FIELD_PREP(DART_T8110_TTBR_ADDR,(base+4*SZ_16K)>>14)|1;assert(collect(4)==-4&&!count);
- setup();root[0]=FIELD_PREP(DART_T6000_PTE_OFFSET,(base+4*SZ_16K)>>14)|1;assert(collect(4)==-5&&!count);
- setup();root[0]=FIELD_PREP(DART_T6000_PTE_OFFSET,base>>14)|1;assert(collect(4)==-5&&!count);
- setup();assert(collect(1)==-6&&!count);
+ setup();root[0]=FIELD_PREP(DART_T6000_PTE_OFFSET,(base+4*SZ_16K)>>14)|1;assert(collect(4)==-5&&!count);assert(strstr(detail,"substep=L1-target l1=0")&&strstr(detail,"dram="));
+ setup();root[0]=FIELD_PREP(DART_T6000_PTE_OFFSET,base>>14)|1;assert(collect(4)==-5&&!count);assert(strstr(detail,"substep=L1-target l1=0")&&strstr(detail,"dram="));
+ setup();assert(collect(1)==-6&&!count);assert(strstr(detail,"expected-pages=2 actual-capacity=1"));
  setup();change=true;assert(collect(4)==-7&&!count);
- setup();assert(dart_collect_native_t8110(0,16,base,4*SZ_16K,pages,4,&count)==-2&&!count);
- setup();assert(dart_collect_native_t8110(0,5,base,~0UL,pages,4,&count)==-2&&!count);
+ setup();assert(dart_collect_native_t8110(0,16,base,4*SZ_16K,pages,4,&count,detail,sizeof(detail))==-2&&!count);
+ setup();assert(dart_collect_native_t8110(0,5,base,~0UL,pages,4,&count,detail,sizeof(detail))==-2&&!count);
  assert(!munmap(root,4*SZ_16K));puts("PASS native table ownership, firmware attributes, 1-TiB addresses, deduplication, capacity and refusal diagnostics");
 }
 '''

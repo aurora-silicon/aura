@@ -4146,18 +4146,21 @@ static int dt_display_transaction(int (*apply)(unsigned int), unsigned int index
 
 /* Native26 validates the inherited stream using the public locked-DART walker. */
 static const char *ext26_step = "not-started";
+static char ext26_detail[256];
 
 static void dt_ext26_step(const char *step)
 {
     ext26_step = step;
+    ext26_detail[0] = 0;
     printf("FDT: J613 ext26 step=%s\n", step);
 }
 
 /* This receipt is written to the original tree after commit/rollback. */
 static void dt_ext26_result(int error)
 {
-    char result[160];
-    snprintf(result, sizeof(result), "step=%s error=%d", ext26_step, error);
+    char result[512];
+    snprintf(result, sizeof(result), "step=%s error=%d%s%s", ext26_step, error,
+             ext26_detail[0] ? " " : "", ext26_detail);
     printf("FDT: J613 ext26 result: %s\n", result);
     int chosen = fdt_path_offset(dt, "/chosen");
     int ret = chosen < 0 ? chosen
@@ -4319,10 +4322,12 @@ static int dt_ext26_snapshot_inner(const char *alias)
     size_t count = 0;
     int result = -1;
     if (!tables) {
+        snprintf(ext26_detail, sizeof(ext26_detail), "substep=allocation expected-bytes=%zu actual=null", 2049 * sizeof(*tables));
         result = -12;
         goto done;
     }
-    result = dart_collect_native_t8110(iommu, 5, dram, size, tables, 2049, &count);
+    result = dart_collect_native_t8110(iommu, 5, dram, size, tables, 2049, &count,
+                                          ext26_detail, sizeof(ext26_detail));
     if (result)
         goto done;
     result = -1;
@@ -4352,6 +4357,9 @@ static int dt_ext26_snapshot(const char *alias)
     sysop("isb");
     exc_guard = previous;
     if (exc_count != faults) {
+        char prior_detail[sizeof(ext26_detail)];
+        memcpy(prior_detail, ext26_detail, sizeof(prior_detail));
+        snprintf(ext26_detail, sizeof(ext26_detail), "substep=guard-fault prior=%.190s", prior_detail);
         printf("FDT: J613 ext26 MMIO fault during %s\n", ext26_step);
         return -1;
     }
