@@ -12,26 +12,16 @@ REPO = Path(__file__).resolve().parents[2]
 # The Apple DTS shapes: M1/M2 laptops (t8103/t8112/t600x dtsi) point serial0 at the Samsung
 # UART, the MacBook Neo (t8140-j700.dts) at the DockChannel UART. The J616s DTS sets none.
 BOARDS = {
-    "m2-s5l": ("apple,s5l-uart", '"serial0"'),
-    "m1pro-s5l": ("apple,s5l-uart", '"serial0:115200n8"'),
-    "neo-dockchannel": ("apple,dockchannel-uart", '"serial0"'),
-    "neo-full-path": ("apple,dockchannel-uart", '"/soc/serial@30812c000"'),
+    "m2-s5l": ("apple,s5l-uart", "serial0"),
+    "m1pro-s5l": ("apple,s5l-uart", "serial0:115200n8"),
+    "neo-dockchannel": ("apple,dockchannel-uart", "serial0"),
+    "neo-full-path": ("apple,dockchannel-uart", "/soc/serial@30812c000"),
 }
 
-DTS = r'''/dts-v1/;
-/ {
-    #address-cells = <2>;
-    #size-cells = <2>;
-    aliases { serial0 = &serial0; serial1 = &other; };
-    chosen { %(chosen)s };
-    soc {
-        #address-cells = <2>;
-        #size-cells = <2>;
-        serial0: serial@30812c000 { compatible = "%(compatible)s"; status = "okay"; };
-        other: serial@1000 { compatible = "vendor,real-uart"; };
-    };
-};
-'''
+# Each tree is built with libfdt (no dtc on the CI runners):
+#   / { aliases { serial0 = "/soc/serial@30812c000"; serial1 = "/soc/serial@1000"; };
+#       chosen { [stdout-path] [linux,stdout-path] };
+#       soc { serial@30812c000 { compatible = <UART>; }; serial@1000 { "vendor,real-uart" }; }; }
 
 
 def definition(source, start_text, terminator="\n}\n"):
@@ -58,14 +48,30 @@ static bool aura_console_enabled(void) { return console_on; }
 static bool dockchannel_uart_host_seen(void) { return host_on; }
 ''' + "%(code)s" + r'''
 static unsigned char blob[65536];
-static void load(const char *path)
+/* path "-" adds no stdout-path; legacy also adds linux,stdout-path */
+static void build(const char *compatible, const char *path, bool legacy)
 {
-    FILE *f = fopen(path, "rb");
-    assert(f);
-    size_t n = fread(blob, 1, sizeof(blob), f);
-    fclose(f);
-    assert(n > 0 && fdt_open_into(blob, blob, sizeof(blob)) == 0);
     dt = blob;
+    assert(fdt_create_empty_tree(dt, sizeof(blob)) == 0);
+    /* Adding a node moves the offsets after it: look each one up again before use */
+    assert(fdt_add_subnode(dt, 0, "aliases") >= 0);
+    assert(fdt_add_subnode(dt, 0, "chosen") >= 0);
+    assert(fdt_add_subnode(dt, 0, "soc") >= 0);
+    int aliases = fdt_path_offset(dt, "/aliases");
+    assert(!fdt_setprop_string(dt, aliases, "serial0", "/soc/serial@30812c000"));
+    assert(!fdt_setprop_string(dt, aliases, "serial1", "/soc/serial@1000"));
+    assert(fdt_add_subnode(dt, fdt_path_offset(dt, "/soc"), "serial@30812c000") >= 0);
+    assert(fdt_add_subnode(dt, fdt_path_offset(dt, "/soc"), "serial@1000") >= 0);
+    assert(!fdt_setprop_string(dt, fdt_path_offset(dt, "/soc/serial@30812c000"), "compatible",
+                               compatible));
+    assert(!fdt_setprop_string(dt, fdt_path_offset(dt, "/soc/serial@1000"), "compatible",
+                               "vendor,real-uart"));
+    int chosen = fdt_path_offset(dt, "/chosen");
+    if (strcmp(path, "-")) {
+        assert(!fdt_setprop_string(dt, chosen, "stdout-path", path));
+        if (legacy)
+            assert(!fdt_setprop_string(dt, chosen, "linux,stdout-path", path));
+    }
 }
 static bool has(const char *prop)
 {
@@ -79,11 +85,13 @@ static void set_config(const char *name, const char *value)
         chosen_params[0][1] = (char *)value;
     }
 }
-/* argv: dtb, debug, console, host, config name or "-", config value, expect kept */
+/* argv: compatible, stdout path or "-", legacy, debug, console, host, config name or "-",
+ * config value, expect kept */
 int main(int argc, char **argv)
 {
-    assert(argc == 8);
-    load(argv[1]);
+    assert(argc == 10);
+    build(argv[1], argv[2], argv[3][0] == '1');
+    argv += 2;
     debug_on = argv[2][0] == '1';
     console_on = argv[3][0] == '1';
     host_on = argv[4][0] == '1';
@@ -127,27 +135,20 @@ def runner(tmp_path_factory):
         input=HARNESS % {"code": code}, text=True, check=True,
     )
 
-    def run(compatible, chosen, debug=0, console=0, host=0, config=("-", ""), keep=False):
-        dts = tmp / "t.dts"
-        dtb = tmp / "t.dtb"
-        dts.write_text(DTS % {"chosen": chosen, "compatible": compatible})
-        subprocess.run(["dtc", "-q", "-I", "dts", "-O", "dtb", "-o", str(dtb), str(dts)],
+    def run(compatible, path, legacy=False, debug=0, console=0, host=0, config=("-", ""),
+            keep=False):
+        subprocess.run([str(binary), compatible, path, "1" if legacy else "0", str(debug),
+                        str(console), str(host), config[0], config[1], "1" if keep else "0"],
                        check=True)
-        subprocess.run([str(binary), str(dtb), str(debug), str(console), str(host),
-                        config[0], config[1], "1" if keep else "0"], check=True)
 
     return run
-
-
-def chosen_for(path, legacy=False):
-    return f"stdout-path = {path};" + (f" linux,stdout-path = {path};" if legacy else "")
 
 
 @pytest.mark.parametrize("board", BOARDS)
 @pytest.mark.parametrize("legacy", [False, True], ids=["stdout-path", "with-linux,stdout-path"])
 def test_normal_boot_removes_debug_uart_console(runner, board, legacy):
     compatible, path = BOARDS[board]
-    runner(compatible, chosen_for(path, legacy), keep=False)
+    runner(compatible, path, legacy, keep=False)
 
 
 @pytest.mark.parametrize("board", BOARDS)
@@ -156,34 +157,36 @@ def test_normal_boot_removes_debug_uart_console(runner, board, legacy):
 ], ids=["aura-debug", "aura-console", "debugusb-host"])
 def test_debug_boot_keeps_it(runner, board, flags):
     compatible, path = BOARDS[board]
-    runner(compatible, chosen_for(path, True), keep=True, **flags)
+    runner(compatible, path, True, keep=True, **flags)
 
 
 @pytest.mark.parametrize("board", BOARDS)
 def test_config_opt_in_keeps_it(runner, board):
     compatible, path = BOARDS[board]
-    runner(compatible, chosen_for(path), config=("aura,serial-console", "1"), keep=True)
+    runner(compatible, path, config=("aura,serial-console", "1"), keep=True)
     # An owner's own stdout-path config line is an opt-in as well
-    runner(compatible, chosen_for(path), config=("stdout-path", "serial0"), keep=True)
+    runner(compatible, path, config=("stdout-path", "serial0"), keep=True)
 
 
 @pytest.mark.parametrize("board", BOARDS)
 def test_config_opt_out_wins_over_debug_boot(runner, board):
     compatible, path = BOARDS[board]
-    runner(compatible, chosen_for(path), debug=1, console=1, host=1,
+    runner(compatible, path, debug=1, console=1, host=1,
            config=("aura,serial-console", "0"), keep=False)
 
 
 def test_other_consoles_are_untouched(runner):
     # A stdout-path to a UART that is not a debug-only one, or to nothing, is left alone
-    runner("apple,s5l-uart", 'stdout-path = "serial1";', keep=True)
-    runner("apple,s5l-uart", 'stdout-path = "serial7";', keep=True)
-    runner("apple,dockchannel-uart", 'stdout-path = "/soc/nothing";', keep=True)
+    runner("apple,s5l-uart", "serial1", keep=True)
+    runner("apple,s5l-uart", "serial7", keep=True)
+    runner("apple,dockchannel-uart", "/soc/nothing", keep=True)
+    # U-Boot points it at the framebuffer on M1/M2 when it finds a keyboard
+    runner("apple,s5l-uart", "/chosen/framebuffer", keep=True)
 
 
 def test_no_stdout_path_is_fine(runner):
     # J616s (T6040) sets no stdout-path at all
-    runner("apple,dockchannel-uart", "", keep=False)
+    runner("apple,dockchannel-uart", "-", keep=False)
 
 
 def test_boot_option_parsing():
