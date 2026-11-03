@@ -32,6 +32,7 @@ typedef uint32_t u32;
 #define ALIGN_UP(v,a) (((v)+(a)-1)&~((a)-1))
 static void *dt;
 static const char *ext26_step;
+static char ext26_detail[256];
 ''' + seg_type + page_type + function('dt_ext26_page', 'int') +
           function('dt_t8122_dcpext_armed', 'bool') + function('dt_ext26_publish', 'int') + function('dt_ext26_result', 'void') + function('dt_display_transaction', 'int') + r'''
 static int reject_transaction(unsigned int n) {
@@ -88,6 +89,10 @@ int main(void) {
  dt_ext26_result(ret); chosen=fdt_path_offset(dt,"/chosen");
  assert(!fdt_getprop(dt,chosen,"partial-test-property",NULL));
  assert(!strcmp(fdt_getprop(dt,chosen,"asahi,j613-25g83-dcpext-result",NULL),"step=fixture-rollback error=-17"));
+ strcpy(ext26_detail,"substep=L1-target l1=7 descriptor=123 page=456 bytes=4000");
+ ext26_step="locked-table-collection";dt_ext26_result(-5);chosen=fdt_path_offset(dt,"/chosen");
+ assert(!strcmp(fdt_getprop(dt,chosen,"asahi,j613-25g83-dcpext-result",NULL),"step=locked-table-collection error=-5 substep=L1-target l1=7 descriptor=123 page=456 bytes=4000"));
+ ext26_detail[0]=0;
  external=fdt_path_offset(dt,"dcpext");
  int n;const char *published=fdt_getprop(dt,external,"apple,firmware-uuid",&n);
  assert(published && n==37 && !strcmp(published,uuid));
