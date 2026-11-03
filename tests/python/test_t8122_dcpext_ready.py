@@ -47,6 +47,7 @@ static void *dt, *adt;
 static u32 chip_id = T8122;
 #define V26_6_2 2662
 static const struct { int version; } os_firmware = {147};
+static int dt_ext26_retain_cpu(const char *alias) { (void)alias; assert(0 && "native CPU lease on classic path"); return -1; }
 static void dt_ext26_step(const char *step) { (void)step; }
 static void dt_ext26_result(int error) { (void)error; assert(0 && "native receipt on classic path"); }
 
