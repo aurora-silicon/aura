@@ -22,6 +22,7 @@ struct kernel_header {
 
 void kboot_set_initrd(void *start, size_t size);
 bool kboot_initrd_is(const void *start);
+void kboot_set_hibernate_layout(void);
 int kboot_set_chosen(const char *name, const char *value);
 void kboot_delete_chosen(const char *name);
 void kboot_set_config_lost(void);

@@ -60,6 +60,59 @@
 static void *dt = NULL;
 static int dt_bufsize = 0;
 static u64 retained_heap_end;
+
+/*
+ * Hibernation layout (T6040, config hib=1). Where iBoot loads the boot object, and what it places
+ * after it, changes between boots, so the reserved and no-map ranges Linux sees, the heap
+ * (kernel, initramfs and device tree copies) and the end of the RAM handed back above the heap
+ * all move. A hibernation image restores every saved page to the frame it came from, so the
+ * resuming boot must give Linux the same RAM and the same reserved ranges. With hib=1 the heap
+ * restarts at a fixed address above every place the object has been seen to reach, everything
+ * from the start of RAM to a fixed end above the heap is kept from Linux as one reservation, and
+ * region-id-45 is handed back from that fixed end on. /chosen/aura,hibernate-layout gives Linux
+ * the start and end of the range kept from it.
+ */
+#define HIB_OBJECT_WINDOW (160 * SZ_1M)
+#define HIB_HEAP_SPAN     (128 * SZ_1M)
+/*
+ * The device tree Linux is started with goes to a fixed slot at the start of the heap, below
+ * everything the heap hands out. A resume from disk restores the kernel that was started with
+ * the tree of an earlier boot; the slot lies in the range kept from Linux, which the image does
+ * not save, so that kernel finds this boot's tree at the address it was started with (some
+ * firmware segments move between boots, e.g. the AOP log). /chosen/aura,hibernate-dt names the
+ * slot. Linux maps at most 2M of device tree.
+ */
+#define HIB_DT_SLOT (2 * SZ_1M)
+static u64 hib_heap_base, hib_heap_end, hib_dt_base;
+
+void kboot_set_hibernate_layout(void)
+{
+    u64 lo, base, end, ram_end;
+
+    if (chip_id != T6040) {
+        printf("hib: fixed layout only on T6040, ignored\n");
+        return;
+    }
+    if (!cur_boot_args.mem_size || cur_boot_args.phys_base > UINT64_MAX - cur_boot_args.mem_size) {
+        printf("hib: invalid RAM extent, layout refused\n");
+        return;
+    }
+    ram_end = cur_boot_args.phys_base + cur_boot_args.mem_size;
+    lo = ALIGN_UP(cur_boot_args.phys_base, SZ_32M);
+    base = lo + HIB_OBJECT_WINDOW;
+    end = base + HIB_HEAP_SPAN;
+    if (cur_boot_args.top_of_kernel_data > base || end > ram_end ||
+        !heapblock_raise_base(base + HIB_DT_SLOT)) {
+        printf("hib: layout refused (top_of_kdata 0x%lx, heap 0x%lx, fixed heap 0x%lx..0x%lx)\n",
+               cur_boot_args.top_of_kernel_data, heapblock_high_water(), base, end);
+        return;
+    }
+    hib_dt_base = base;
+    hib_heap_base = base + HIB_DT_SLOT;
+    hib_heap_end = end;
+    printf("hib: fixed layout, top_of_kdata 0x%lx, device tree 0x%lx, heap 0x%lx..0x%lx\n",
+           cur_boot_args.top_of_kernel_data, hib_dt_base, hib_heap_base, end);
+}
 static void *initrd_start = NULL;
 static size_t initrd_size = 0;
 static char *chosen_params[MAX_CHOSEN_PARAMS][2];
@@ -650,6 +703,16 @@ static int dt_set_chosen(void)
     if (chip_id == T8140 && dt_set_t8140_wfx_args(node))
         return -1;
 
+    if (hib_heap_end) {
+        fdt64_t layout[2] = {cpu_to_fdt64(cur_boot_args.phys_base), cpu_to_fdt64(hib_heap_end)};
+        if (fdt_setprop(dt, node, "aura,hibernate-layout", layout, sizeof(layout)))
+            bail("FDT: couldn't set chosen.aura,hibernate-layout\n");
+        printf("FDT: hibernation layout, RAM 0x%lx..0x%lx kept from Linux\n",
+               cur_boot_args.phys_base, hib_heap_end);
+        if (fdt_setprop_u64(dt, node, "aura,hibernate-dt", hib_dt_base))
+            bail("FDT: couldn't set chosen.aura,hibernate-dt\n");
+    }
+
     if (initrd_start && initrd_size) {
         if (fdt_setprop_u64(dt, node, "linux,initrd-start", (u64)initrd_start))
             bail("FDT: couldn't set chosen.linux,initrd-start property\n");
@@ -905,8 +968,16 @@ static int dt_t6040_memory_holes(u64 dram_min, u64 dram_max, void *reg_out, int 
         u64 start = range[0], end = range[0] + range[1];
         if (!range[1])
             continue;
-        if (!strcmp(prop->name, "region-id-45"))
-            start = max(start, ALIGN_UP(heapblock_high_water(), SZ_16K));
+        if (!strcmp(prop->name, "region-id-45")) {
+            if (hib_heap_end) {
+                if (heapblock_high_water() > hib_heap_end)
+                    bail("hib: heap 0x%lx past the fixed end 0x%lx\n", heapblock_high_water(),
+                         hib_heap_end);
+                start = max(start, hib_heap_end);
+            } else {
+                start = max(start, ALIGN_UP(heapblock_high_water(), SZ_16K));
+            }
+        }
 
         for (int i = n - 1; i >= 0; i--) {
             if (start >= r[i].end || end <= r[i].start)
@@ -8312,8 +8383,13 @@ int kboot_prepare_dt(void *fdt)
         u64 heap_top = max(inherited, high_water);
         /* Building this tree still allocates, and dt_set_memory() gives Linux what is above the
          * high water it sees then. Keep what it will have used. */
-        if (chip_id == T6040)
+        if (chip_id == T6040 && hib_heap_end) {
+            if (heap_top + 8 * SZ_1M > hib_heap_end)
+                bail("hib: heap 0x%lx too close to the fixed end 0x%lx\n", heap_top, hib_heap_end);
+            heap_top = hib_heap_end;
+        } else if (chip_id == T6040) {
             heap_top = min(heap_top + 8 * SZ_1M, ram_end);
+        }
         if (heap_top > (u64)_end) {
             if (heap_top > UINT64_MAX - (SZ_16K - 1))
                 bail("FDT: retained heap extent overflows\n");
@@ -8726,8 +8802,30 @@ int kboot_boot(void *kernel)
         next_stage.entry = NULL;
         bail("kboot: secondary callback became pending before kernel entry\n");
     }
+    void *handoff_dt = dt;
+    if (hib_dt_base) {
+        /* Last: nothing writes the tree after this copy. */
+        u32 dt_size = fdt_totalsize(dt);
+        uintptr_t high_water = heapblock_high_water();
+        if (dt_size > HIB_DT_SLOT) {
+            next_stage.entry = NULL;
+            bail("hib: device tree (%u bytes) does not fit the fixed slot 0x%lx\n", dt_size,
+                 hib_dt_base);
+        }
+        /* The same margin dt_set_memory() kept: what aura still allocates stays below the end. */
+        if (high_water + 8 * SZ_1M > hib_heap_end) {
+            next_stage.entry = NULL;
+            bail("hib: heap high water 0x%lx too close to the fixed end 0x%lx\n", high_water,
+                 hib_heap_end);
+        }
+        memcpy((void *)hib_dt_base, dt, dt_size);
+        handoff_dt = (void *)hib_dt_base;
+        printf("hib: device tree copied to its fixed slot 0x%lx (%u bytes), heap high water 0x%lx "
+               "of 0x%lx..0x%lx\n",
+               hib_dt_base, dt_size, high_water, hib_heap_base, hib_heap_end);
+    }
     next_stage.entry = kernel;
-    next_stage.args[0] = (u64)dt;
+    next_stage.args[0] = (u64)handoff_dt;
     next_stage.args[1] = 0;
     next_stage.args[2] = 0;
     next_stage.args[3] = 0;

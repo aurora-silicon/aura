@@ -183,6 +183,7 @@ static void kboot_set_initrd(void *start, size_t size) {}
 /* An inline initramfs is compared against the payload area and copied only under the monitor */
 static bool monitor_required(void) { return false; }
 static bool kboot_initrd_is(const void *start) { return false; }
+static void kboot_set_hibernate_layout(void) {}
 char _payload_start[1];
 static struct { u64 top_of_kernel_data; } cur_boot_args;
 static int kboot_prepare_dt(void *fdt)
