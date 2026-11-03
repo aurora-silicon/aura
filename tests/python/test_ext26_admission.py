@@ -122,3 +122,44 @@ int main(void) {
  return 0;
 }
 ''')
+
+
+def test_native26_reservation_reuse(tmp_path):
+    src = (ROOT / 'src/kboot.c').read_text()
+    start = src.index('static int dt_ext26_existing_reservation(')
+    helper = src[start:src.index('\n}', start) + 2]
+    run_c(tmp_path, 'native26-reservation-reuse', r'''
+#include <assert.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include "libfdt.h"
+typedef uint64_t u64;
+static void *dt;
+''' + helper + r'''
+static void reserve(const char *name, u64 start, u64 size, bool nomap) {
+ int parent = fdt_path_offset(dt, "/reserved-memory");
+ int node = fdt_add_subnode(dt, parent, name); assert(node >= 0);
+ fdt64_t reg[] = {cpu_to_fdt64(start), cpu_to_fdt64(size)};
+ assert(!fdt_setprop(dt, node, "reg", reg, sizeof(reg)));
+ if (nomap) assert(!fdt_setprop_empty(dt, node, "no-map"));
+}
+int main(void) {
+ unsigned char blob[4096]; dt = blob;
+ assert(!fdt_create_empty_tree(dt, sizeof(blob)));
+ assert(fdt_add_subnode(dt, 0, "reserved-memory") >= 0);
+ reserve("text", 0x100000, 0x8000, true);
+ reserve("data", 0x200000, 0x4000, true);
+ reserve("mapped", 0x300000, 0x4000, false);
+ /* Shared text reuses the exact internal reservation. */
+ int text = dt_ext26_existing_reservation(0x100000, 0x8000, true);
+ assert(text == fdt_path_offset(dt, "/reserved-memory/text"));
+ /* Writable data or heap with an exact match is still refused. */
+ assert(dt_ext26_existing_reservation(0x200000, 0x4000, false) == -FDT_ERR_INTERNAL);
+ /* Partial overlaps and mapped reservations are refused even when shared. */
+ assert(dt_ext26_existing_reservation(0x104000, 0x8000, true) == -FDT_ERR_INTERNAL);
+ assert(dt_ext26_existing_reservation(0x300000, 0x4000, true) == -FDT_ERR_INTERNAL);
+ /* No overlap leaves the caller to add its own reservation. */
+ assert(dt_ext26_existing_reservation(0x400000, 0x4000, false) == -FDT_ERR_NOTFOUND);
+ return 0;
+}
+''')
