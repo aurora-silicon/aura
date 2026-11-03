@@ -128,9 +128,6 @@ endif
 ifeq ($(NV2_TRACE_PRINT),1)
 CFG += NV2_TRACE_PRINT
 endif
-ifeq ($(NV2_MMFR4_PASSTHRU),1)
-CFG += NV2_MMFR4_PASSTHRU
-endif
 
 
 LDFLAGS := -EL -maarch64elf --no-undefined -X -Bsymbolic \

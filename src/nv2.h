@@ -14,11 +14,15 @@
  * behalf. KVM in the OS can then run hardware-virtualized VMs, whose stage 2
  * the monitor installs directly from the guest's VTTBR/VTCR.
  *
- * Opt-in (aura-nv2, or an NV2_BOOT development build): a plain EL1 boot never
- * sets HCR_EL2.NV2 and the ERET gate in the vectors is a compare and a branch.
+ * Opt-in (aura-nv2, or an NV2_BOOT development build), on any CPU implementing
+ * FEAT_NV2: a plain EL1 boot never sets HCR_EL2.NV2. The ERET gate sits in the
+ * lower-EL sync vector only, where an OS exception without NV2 costs a
+ * CurrentEL check, an ESR_EL2 read, a compare and a branch.
  */
 
 extern bool nv2_active;
+/* Set only while a proxy nv2_probe_call()/nv2_probe_arm() is in flight. */
+extern bool nv2_probe_active;
 
 bool nv2_requested(void);
 /* Allocate the per-CPU NV pages; before the OS memory map is fixed. */
@@ -33,6 +37,10 @@ bool nv2_handle_async(u64 *regs, int kind);
 /* NV2_TRACE builds: the event ring, for a reserved-memory node. */
 void nv2_trace_region(u64 *base, u64 *size);
 void nv2_note_unhandled(u64 esr, u64 elr, u64 spsr);
+
+/* Reflect an unhandled OS trap back into the OS as an UNDEF rather than
+ * resetting the machine. Handles both plain EL1 and an NV2 virtual-EL2 OS. */
+void monitor_reflect_undef(u64 elr, u64 spsr);
 
 /* Proxy diagnostics: arm this CPU's NV2 state for an nv2_probe_call(). */
 u64 nv2_probe_arm(u64 vncr, u64 avncr, u64 hcr);

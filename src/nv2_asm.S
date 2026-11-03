@@ -55,6 +55,11 @@ nv2_probe_call:
     stp x0, x1, [sp, #-16]!
     msr daifset, #0xf
 
+    /* Mark a proxy probe in flight so exc_sync's `hvc #1` gate opens. */
+    ldr x1, =nv2_probe_active
+    mov w2, #1
+    strb w2, [x1]
+
     mrs x1, hcr_el2
     str x1, [x0, #NV2P_HCR]
     mrs x2, S3_5_C12_C0_0           // VBAR_EL12
@@ -125,6 +130,9 @@ nv2_probe_ret:
     str x4, [x2, #NV2P_DONE]
     dmb sy
     msr daif, x3
+    /* The probe is over; close the `hvc #1` proxy-return gate. */
+    ldr x4, =nv2_probe_active
+    strb wzr, [x4]
     ldp x19, x20, [sp], #16
     ldp x21, x22, [sp], #16
     ldp x23, x24, [sp], #16

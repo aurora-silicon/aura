@@ -32,6 +32,12 @@
 
 bool nv2_active = false;
 
+/* True only while a proxy nv2_probe_call()/nv2_probe_arm() diagnostic is in
+ * flight. It gates the `hvc #1` proxy-return path so a production guest's own
+ * `hvc #1` cannot be redirected into proxy-only code. Also set/cleared from
+ * nv2_asm.S (nv2_probe_call / nv2_probe_ret). */
+bool nv2_probe_active = false;
+
 /* VNCR page offsets */
 #define V_VTTBR      0x020
 #define V_VTCR       0x040
@@ -53,6 +59,7 @@ bool nv2_active = false;
 #define V_ESR        0x138
 #define V_MAIR       0x140
 #define V_AMAIR      0x148
+#define V_MDSCR      0x158
 #define V_SPSR       0x160
 #define V_CNTV_CVAL  0x168
 #define V_CNTV_CTL   0x170
@@ -246,9 +253,23 @@ static inline struct nv2_cpu *nv2_this(void)
     return &nv2_cpus[smp_id()];
 }
 
+/*
+ * The VNCR layout and the AVNCR map of Apple's own registers are architectural,
+ * so the path lights up on any Apple CPU that implements FEAT_NV2; the trap set
+ * was characterized on T8140. FEAT_NV2 (ID_AA64MMFR2_EL1.NV >= 2) must be present.
+ */
 bool nv2_requested(void)
 {
-    return aura_nv2_enabled();
+    static int supported = -1;
+
+    if (!aura_nv2_enabled())
+        return false;
+    if (supported < 0) {
+        supported = FIELD_GET(ID_AA64MMFR2_NV, mrs(SYS_ID_AA64MMFR2_EL1)) >= 2;
+        if (!supported)
+            printf("NV2: requested, but this CPU lacks FEAT_NV2; ignoring\n");
+    }
+    return supported;
 }
 
 void nv2_prepare(void)
@@ -288,6 +309,7 @@ void nv2_prepare(void)
     OP(SYS_ESR_EL12, V_ESR)                                                                        \
     OP(SYS_MAIR_EL12, V_MAIR)                                                                      \
     OP(SYS_AMAIR_EL12, V_AMAIR)                                                                    \
+    OP(SYS_MDSCR_EL1, V_MDSCR)                                                                     \
     OP(SYS_SPSR_EL12, V_SPSR)                                                                      \
     OP(SYS_TTBR0_EL12, V_TTBR0)                                                                    \
     OP(SYS_TTBR1_EL12, V_TTBR1)                                                                    \
@@ -989,11 +1011,7 @@ static u64 nv2_idreg_hw(unsigned crm, unsigned op2)
 static u64 nv2_idreg(unsigned crm, unsigned op2)
 {
     u64 v = nv2_idreg_hw(crm, op2);
-#ifdef NV2_MMFR4_PASSTHRU
-    if (0)
-#else
-    if (crm == 7 && op2 == 4) /* ID_AA64MMFR4_EL1 */
-#endif
+    if (crm == 7 && op2 == 4) /* ID_AA64MMFR4_EL1: report VHE-only, NV2 present */
         v = (v & ~(MMFR4_NV_FRAC | MMFR4_E2H0)) | FIELD_PREP(MMFR4_E2H0, 0xe) |
             FIELD_PREP(MMFR4_NV_FRAC, 1);
     return v;
@@ -1262,7 +1280,7 @@ done:
 }
 
 /* ---------------------------------------------------------------------- */
-/* ERET from L1 (the asm gate in _v_sp0_sync takes the common cases) */
+/* ERET from L1 (the asm gate in _v_lower_sync takes the common cases) */
 
 static bool nv2_eret(struct nv2_cpu *c)
 {
@@ -1349,8 +1367,10 @@ bool nv2_handle_sync(u64 *regs)
         case ESR_EC_MSR:
             return nv2_sysreg(c, regs, esr);
         case ESR_EC_HVC:
-            /* hvc #1 ends a proxy probe; L1 never issues it to itself. */
-            if ((esr & 0xffff) == 1)
+            /* hvc #1 ends a proxy probe; outside one it is the guest's own and
+             * is reflected to it like any other hvc, never sent to the proxy
+             * return path. */
+            if ((esr & 0xffff) == 1 && nv2_probe_active)
                 return false;
             nv2_inject_self(esr);
             return true;
@@ -1364,7 +1384,35 @@ bool nv2_handle_sync(u64 *regs)
 
 void nv2_note_unhandled(u64 esr, u64 elr, u64 spsr)
 {
+    /* The arguments feed only the trace ring, which a non-NV2_TRACE build
+     * compiles away. */
+    UNUSED(esr);
+    UNUSED(elr);
+    UNUSED(spsr);
     nv2_trace(NV2_T_FAIL, esr >> 26, esr, elr, spsr, 0xdead, mrs(FAR_EL2));
+}
+
+/*
+ * Reflect a trap the monitor does not service back into the OS as an UNDEF
+ * ("unknown reason") exception, instead of resetting the whole machine. Under
+ * NV2 the OS runs at virtual EL2, so inject at its current-EL vector; otherwise
+ * the OS is at plain EL1. elr/spsr are the faulting context (ELR_EL2/SPSR_EL2
+ * under VHE). Lives here because the EL12 register plumbing does.
+ */
+void monitor_reflect_undef(u64 elr, u64 spsr)
+{
+    const u64 undef = 0x02000000; /* EC_UNKNOWN, IL=1 */
+    if (nv2_active) {
+        nv2_inject_self(undef); /* re-reads ELR_EL2/SPSR_EL2; targets virtual EL2 */
+        return;
+    }
+    msr(SYS_ESR_EL12, undef);
+    msr(SYS_ELR_EL12, elr);
+    msr(SYS_SPSR_EL12, spsr);
+    /* From EL1: the current-EL (SPx) vector; from EL0: the lower-EL vector. */
+    msr(ELR_EL2, mrs(SYS_VBAR_EL12) + ((spsr & 0xf) ? 0x200 : 0x400));
+    msr(SPSR_EL2, (spsr & GENMASK(31, 28)) | 0x3c5); /* EL1h, DAIF masked */
+    sysop("isb");
 }
 
 bool nv2_handle_async(u64 *regs, int kind)
@@ -1408,6 +1456,7 @@ __attribute__((used, retain)) u64 nv2_probe_arm(u64 vncr, u64 avncr, u64 hcr)
     nv2_cpu_arm(nv2_this(), vncr, avncr, hcr);
     nv2_this()->scratch = (u64 *)(avncr + SZ_4K);
     msr(SYS_HFGITR_EL2, HFGITR_VMALLE1_ALL);
+    nv2_probe_active = true;
     nv2_active = true;
     return (u64)nv2_this();
 }
@@ -1415,6 +1464,7 @@ __attribute__((used, retain)) u64 nv2_probe_arm(u64 vncr, u64 avncr, u64 hcr)
 __attribute__((used, retain)) void nv2_probe_disarm(void)
 {
     nv2_this()->armed = false;
+    nv2_probe_active = false;
     msr(SYS_HFGITR_EL2, 0);
 }
 
