@@ -7,6 +7,12 @@
 bool boot_option_present(const char *line, size_t capacity, const char *option);
 void boot_options_init(const char *line, size_t capacity);
 bool aura_debug_enabled(void);
+bool aura_nv2_enabled(void);
+bool aura_pv_enabled(void);
+/* Override the NV2 policy from an ESP config line. -1 clears the override. */
+void boot_options_set_nv2_override(int enabled);
+/* Override the PV policy from an ESP config line. -1 clears the override. */
+void boot_options_set_pv_override(int enabled);
 void boot_options_set_stage1(bool stage1);
 bool aura_proxy_enabled(void);
 bool aura_trial_enabled(void);
