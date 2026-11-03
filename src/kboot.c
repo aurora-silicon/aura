@@ -3578,12 +3578,12 @@ static int dt_reserve_asc_segments(const char *adt_path, const char *adt_path_al
         uint32_t mem_phandle = fdt_get_phandle(dt, mem_node);
 
         /*
-         * The OS log segment (flags 0xa) of a T6030 display coprocessor runs at
-         * its physical address and is not reached through the DART: reserve
-         * its RAM, marked as such, without an IOMMU mapping.
+         * The OS log segment (flags 0xa) of a T6030 or T8132 display coprocessor,
+         * internal or external, runs at its physical address and is not reached
+         * through the DART: reserve its RAM, marked as such, without an IOMMU
+         * mapping.
          */
-        if (((chip_id == T6030 && !strncmp(fdt_path, "dcp", 3)) ||
-             (chip_id == T8132 && !strcmp(fdt_path, "dcp"))) &&
+        if ((chip_id == T6030 || chip_id == T8132) && !strncmp(fdt_path, "dcp", 3) &&
             seg->unk == 0xa)
             ret = fdt_setprop_empty(dt, mem_node, "apple,dcp-os-log");
         else
@@ -3932,8 +3932,9 @@ static int dt_display_transaction(int (*apply)(unsigned int), unsigned int index
 }
 
 #define T8122_DCPEXT_READY "apple,t8122-dcpext-firmware-ready"
+#define T8132_DCPEXT_READY "apple,t8132-dcpext-firmware-ready"
 
-static int dt_reserve_t8122_dcpext_one(unsigned int n)
+static int dt_reserve_dcpext_ready(unsigned int n, const char *marker)
 {
     if (n >= ARRAY_SIZE(dcpext_aliases))
         return -1;
@@ -3961,7 +3962,100 @@ static int dt_reserve_t8122_dcpext_one(unsigned int n)
     if (dt_reserve_asc_firmware(path, NULL, alias, true, 0) || dt_set_dcp_firmware(alias))
         return -1;
     int node = fdt_path_offset(dt, alias);
-    return node < 0 ? node : fdt_setprop_u32(dt, node, T8122_DCPEXT_READY, 1);
+    return node < 0 ? node : fdt_setprop_u32(dt, node, marker, 1);
+}
+
+static int dt_reserve_t8122_dcpext_one(unsigned int n)
+{
+    return dt_reserve_dcpext_ready(n, T8122_DCPEXT_READY);
+}
+
+static int dt_reserve_j713_dcpext_one(unsigned int n)
+{
+    if (n >= ARRAY_SIZE(dcpext_aliases))
+        return -1;
+    const char *alias = dcpext_aliases[n];
+    char path[48];
+    u32 len = 0;
+
+    /* The kernel checks the firmware it adopts by UUID, as for the internal DCP. */
+    snprintf(path, sizeof(path), "/arm-io/%s/iop-%s-nub", alias, alias);
+    int nub = adt_path_offset(adt, path);
+    const char *uuid = nub < 0 ? NULL : adt_getprop(adt, nub, "uuid", &len);
+    int node = fdt_path_offset(dt, alias);
+    if (!uuid || len != 37 || uuid[len - 1] || node < 0 ||
+        fdt_setprop_string(dt, node, "apple,firmware-uuid", uuid))
+        return -1;
+    return dt_reserve_dcpext_ready(n, T8132_DCPEXT_READY);
+}
+
+/*
+ * iBoot leaves an external DCP it started with DISPEXTn SYS and FE on, and its CPU domain
+ * targeted on but gated by hardware while the controller idles. Read only: the CPU domain and
+ * the controller's registers are left to the kernel.
+ */
+static bool dt_j713_dcpext_powered(const char *alias)
+{
+    char sys[16], fe[16], cpu[16];
+
+    /* dcpext0 and dcpext1 only: DISPEXT0 and DISPEXT1. */
+    if (strlen(alias) != 7 || (alias[6] != '0' && alias[6] != '1'))
+        return false;
+    snprintf(sys, sizeof(sys), "DISPEXT%c_SYS", alias[6]);
+    snprintf(fe, sizeof(fe), "DISPEXT%c_FE", alias[6]);
+    snprintf(cpu, sizeof(cpu), "DISPEXT%c_CPU", alias[6]);
+    return pmgr_power_is_on(0, sys) == 1 && pmgr_power_is_on(0, fe) == 1 &&
+           pmgr_power_is_requested(0, cpu) == 1;
+}
+
+/*
+ * J713: iBoot starts both external DCPs and leaves them quiesced, as it does the internal one,
+ * with their DARTs set up. Reserve their firmware memory and mark each disabled
+ * apple,t8132-dcpext node ready for the kernel to adopt the running controller. Only with the
+ * boot.bin config line chosen.asahi,j713-dcpext=1, only after the internal DCP was handed over
+ * (an external DCP must never cost the panel), and only for a controller iBoot left powered.
+ */
+static void dt_reserve_j713_dcpext(void)
+{
+    int chosen = fdt_path_offset(dt, "/chosen");
+    int len = 0;
+    const char *opt = chosen < 0 ? NULL : fdt_getprop(dt, chosen, "asahi,j713-dcpext", &len);
+    int dcp = fdt_path_offset(dt, "dcp");
+    bool armed = opt && len == 2 && opt[0] == '1' && opt[1] == '\0' && dcp >= 0 &&
+                 fdt_getprop(dt, dcp, "apple,firmware-uuid", NULL);
+
+    for (size_t n = 0; n < ARRAY_SIZE(dcpext_aliases); n++) {
+        const char *alias = dcpext_aliases[n];
+        int node = fdt_path_offset(dt, alias);
+        if (node < 0)
+            continue;
+
+        /* Withdraw a previous promise before attempting a fresh transaction. */
+        int ret = fdt_delprop(dt, node, T8132_DCPEXT_READY);
+        if (ret && ret != -FDT_ERR_NOTFOUND) {
+            printf("FDT: cannot clear the '%s' firmware marker\n", alias);
+            continue;
+        }
+        if (!armed) {
+            printf("FDT: '%s' firmware not reserved (needs chosen.asahi,j713-dcpext=1 and the "
+                   "internal display handoff); kernel gate remains closed\n",
+                   alias);
+            continue;
+        }
+        node = fdt_path_offset(dt, alias);
+        const char *status = fdt_getprop(dt, node, "status", &len);
+        if (!status || len != sizeof("disabled") || strcmp(status, "disabled") ||
+            fdt_node_check_compatible(dt, node, "apple,t8132-dcpext"))
+            continue;
+        if (!dt_j713_dcpext_powered(alias)) {
+            printf("FDT: '%s' is not powered; kernel gate remains closed\n", alias);
+            continue;
+        }
+        if (dt_display_transaction(dt_reserve_j713_dcpext_one, n))
+            printf("FDT: '%s' firmware not ready; kernel gate remains closed\n", alias);
+        else
+            printf("FDT: '%s' firmware reserved, left to the kernel\n", alias);
+    }
 }
 
 /*
@@ -6526,6 +6620,8 @@ static int dt_set_display(void)
     if (chip_id == T8132) {
         if (dt_set_j713_dcp_handoff())
             printf("FDT: J713 DCP handoff refused; keeping the boot framebuffer\n");
+        else
+            dt_reserve_j713_dcpext();
         return 0;
     }
 
