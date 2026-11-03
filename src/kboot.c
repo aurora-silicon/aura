@@ -7655,7 +7655,7 @@ int kboot_boot(void *kernel)
     next_stage.args[3] = 0;
     next_stage.args[4] = 0;
     next_stage.restore_logo = false;
-    next_stage.monitor = monitor_required() || pv_kvm_requested();
+    next_stage.monitor = monitor_required();
 
     return 0;
 }

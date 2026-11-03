@@ -4,6 +4,7 @@
 #include "boot_options.h"
 #include "cpu_regs.h"
 #include "memory.h"
+#include "monitor.h"
 #include "nv2.h"
 #include "string.h"
 #include "utils.h"
@@ -45,9 +46,11 @@ static void pv_set_error(struct aura_pv_control_v0 *c, u64 seq, s64 status)
     c->exit_reason = (u64)status;
 }
 
+/* PV runs only beside the EL1 monitor, which sets EL2 up for chips that have
+ * fine-grained traps; elsewhere the OS keeps EL2 and the request is ignored. */
 bool pv_kvm_requested(void)
 {
-    return aura_pv_enabled() && !nv2_requested();
+    return aura_pv_enabled() && !nv2_requested() && monitor_required();
 }
 
 void pv_kvm_prepare(void)
@@ -90,8 +93,8 @@ static bool pv_caps(u64 *regs)
     caps->minor = AURA_PV_ABI_MINOR;
     caps->bytes = sizeof(*caps);
     caps->layout_id = AURA_PV_LAYOUT_CAPS;
-    caps->features = AURA_PV_FEATURE_BOUNDED_INT | AURA_PV_FEATURE_HOST_STATE |
-                    AURA_PV_FEATURE_EL1_STEP;
+    caps->features =
+        AURA_PV_FEATURE_BOUNDED_INT | AURA_PV_FEATURE_HOST_STATE | AURA_PV_FEATURE_EL1_STEP;
     caps->max_control_bytes = AURA_PV_PAGE_BYTES;
     caps->shared_alignment = 64;
     /* Linux remains the physical-EL1 host; Aura owns the EL2 monitor. */
@@ -196,8 +199,7 @@ bool pv_kvm_handle_hvc(u64 *regs)
             u64 input = regs[3];
             u64 expected = input + 7;
 
-            if (!regs[2] || regs[1] != expected ||
-                regs[19] != AURA_PV_SENTINEL_X19 ||
+            if (!regs[2] || regs[1] != expected || regs[19] != AURA_PV_SENTINEL_X19 ||
                 regs[20] != AURA_PV_SENTINEL_X20) {
                 regs[0] = AURA_PV_STATUS_INVAL;
                 regs[1] = 0;

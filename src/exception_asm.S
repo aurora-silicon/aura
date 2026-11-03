@@ -14,14 +14,31 @@
 .type _v_sp0_sync, @function
 _v_sp0_sync:
     msr pan, #0
-    /*
-     * FEAT_NV2 ERET gate. A virtual-EL2 guest's ERET traps here (EC 0x1a). Its
-     * returns to its own userspace (EL0t with vHCR.{E2H,TGE}) and to itself
-     * (EL2t/EL2h, run as EL1t/EL1h) are register-only and complete here;
-     * anything else (a nested guest entry) takes the full path. Without NV2
-     * this costs a compare and a branch.
-     */
+_v_sync_body:
+    sub sp, sp, #(SIZEOF_EXC_INFO - 32 * 8)
+    str x30, [sp, #-16]!
+    bl _exc_entry
+    bl exc_sync
+
+    b _exc_return
+
+/*
+ * Synchronous exceptions from a lower EL. At EL2 this is where a FEAT_NV2
+ * guest's ERET traps (EC 0x1a): its returns to its own userspace (EL0t with
+ * vHCR.{E2H,TGE}) and to itself (EL2t/EL2h, run as EL1t/EL1h) are
+ * register-only and complete here, and anything else (a nested guest entry)
+ * takes the full path. Aura itself can run at EL1 (as a hypervisor guest, or
+ * below EL3), where the _EL2 registers are UNDEFINED, so look at CurrentEL
+ * first. Exceptions taken at the current EL never come through here.
+ */
+.globl _v_lower_sync
+.type _v_lower_sync, @function
+_v_lower_sync:
+    msr pan, #0
     stp x0, x1, [sp, #-16]!
+    mrs x0, CurrentEL
+    cmp x0, #(2 << 2)
+    b.ne 9f
     mrs x0, esr_el2
     mov x1, #0x6a000000             // plain ERET; ERETAx need the slow path
     cmp x0, x1
@@ -49,12 +66,7 @@ _v_sp0_sync:
     ldp x0, x1, [sp], #16
     eret
 9:  ldp x0, x1, [sp], #16
-    sub sp, sp, #(SIZEOF_EXC_INFO - 32 * 8)
-    str x30, [sp, #-16]!
-    bl _exc_entry
-    bl exc_sync
-
-    b _exc_return
+    b _v_sync_body
 
 .globl _v_sp0_irq
 .type _v_sp0_irq, @function
