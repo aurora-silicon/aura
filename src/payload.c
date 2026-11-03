@@ -42,6 +42,8 @@ static const u8 img4_magic[] = {0x16, 0x04, 'I', 'M', 'G', '4'}; // IA5String 'I
 #define PAYLOAD_PREFIX_LEN 5
 static const u8 payload_prefix[PAYLOAD_PREFIX_LEN] = {'a', 'u', 'r', 'a', '_'};
 static const u8 legacy_payload_prefix[PAYLOAD_PREFIX_LEN] = {'m', '1', 'n', '1', '_'};
+/* __PRELINK_INFO follows the raw image in a Mach-O boot object (macho_boot_object.py) */
+static const u8 prelink_xml[] = {'<', '?', 'x', 'm', 'l'};
 static const u8 sig_magic[] = {'s', 'i', 'g'};
 static const u8 initramfs_magic[] = {'i', 'n', 'i', 't', 'r', 'a', 'm', 'f', 's'};
 // followed by size as little endian uint32_t
@@ -370,7 +372,7 @@ static void *load_one_payload(void *start, size_t size)
         printf("Found a custom logo payload at %p, skipping 0x%lx bytes\n", p,
                hdr + CUSTOM_LOGO_SIZE);
         return p + hdr + CUSTOM_LOGO_SIZE;
-    } else if (!memcmp(p, empty, sizeof empty) ||
+    } else if (!memcmp(p, empty, sizeof empty) || !memcmp(p, prelink_xml, sizeof prelink_xml) ||
                !memcmp(p + 0x05, img4_magic, sizeof img4_magic)) { // SEPFW after aura
         /* Before check_var(): an end whose bytes also read as a line is still the end */
         printf("No more payloads at %p\n", p);
