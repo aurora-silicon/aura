@@ -34,7 +34,7 @@ static void *dt;
 static const char *ext26_step;
 static char ext26_detail[256];
 ''' + seg_type + page_type + function('dt_ext26_page', 'int') +
-          function('dt_t8122_dcpext_armed', 'bool') + function('dt_ext26_publish', 'int') + function('dt_ext26_result', 'void') + function('dt_display_transaction', 'int') + r'''
+          function('dt_t8122_dcpext_armed', 'bool') + function('dt_ext26_retain_cpu', 'int') + function('dt_ext26_publish', 'int') + function('dt_ext26_result', 'void') + function('dt_display_transaction', 'int') + r'''
 static int reject_transaction(unsigned int n) {
  (void)n; int c=fdt_path_offset(dt,"/chosen");
  assert(!fdt_setprop_string(dt,c,"partial-test-property","uncommitted"));
@@ -77,6 +77,22 @@ int main(void) {
  int external=fdt_add_subnode(dt,0,"external");assert(external>=0);
  assert(!fdt_setprop_string(dt,external,"status","disabled"));
  aliases=fdt_path_offset(dt,"/aliases");assert(!fdt_setprop_string(dt,aliases,"dcpext","/external"));
+ int cpu=fdt_add_subnode(dt,0,"cpu-domain"); assert(cpu>=0);
+ assert(!fdt_setprop_u32(dt,cpu,"phandle",77));
+ assert(!fdt_setprop_string(dt,cpu,"compatible","apple,t8122-pmgr-pwrstate"));
+ assert(!fdt_setprop_string(dt,cpu,"label","dispext_cpu"));
+ fdt32_t regs[]={cpu_to_fdt32(0x488),cpu_to_fdt32(4)};
+ assert(!fdt_setprop(dt,cpu,"reg",regs,sizeof(regs)));
+ external=fdt_path_offset(dt,"dcpext");
+ assert(dt_ext26_retain_cpu("dcpext")); /* missing domain refuses */
+ assert(!fdt_setprop_u32(dt,external,"power-domains",77));
+ assert(!dt_ext26_retain_cpu("dcpext"));
+ cpu=fdt_path_offset(dt,"/cpu-domain");
+ assert(fdt_getprop(dt,cpu,"apple,firmware-owned",NULL));
+ assert(!dt_ext26_retain_cpu("dcpext")); /* existing boolean updates */
+ cpu=fdt_path_offset(dt,"/cpu-domain");
+ assert(!fdt_setprop_string(dt,cpu,"label","other"));
+ assert(dt_ext26_retain_cpu("dcpext"));
  const char *uuid="C042E95C-B9D8-3F0E-94B3-582A08AA6FDD";
  const u32 state[]={cpu_to_fdt32(1),cpu_to_fdt32(16),cpu_to_fdt32(34),cpu_to_fdt32(1)};
  assert(!dt_ext26_publish("dcpext",state,uuid));external=fdt_path_offset(dt,"dcpext");
