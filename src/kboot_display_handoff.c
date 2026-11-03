@@ -74,12 +74,13 @@
  * whether it knows that image. No ADT description is logged (the ADT reaches Linux whole, and the
  * log ring is 16K); the DART stream registers are.
  *
- * T6041 display block of the M4 Pro (chip T6040, J616s only), with the desktop 26.6.2 DCP firmware:
+ * T6041 display block of the M4 Pro (chip T6040, J616s only) and of the M4 Max (chip T6041, J616C
+ * only, the same block at the same addresses), with the desktop 26.6.2 DCP firmware:
  * the T6031 handoff with T6041 values. There is no /chosen opt-in: the handoff is attempted on
- * every boot whose chip is T6040, whose root is apple,j616s, whose OS firmware matches the known
- * profile, and whose device tree describes the T6041 display block (aliases dcp and disp0,
- * compatible apple,t6041-dcp and apple,display-subsystem). Anything else gets nothing at all: no
- * __OS_LOG reservation, no register access, no DT edit. On a supported boot the __OS_LOG
+ * every boot whose chip is T6040 with root apple,j616s, or T6041 with root apple,j616c, whose OS
+ * firmware matches the known profile, and whose device tree describes the T6041 display block
+ * (aliases dcp and disp0, compatible apple,t6041-dcp and apple,display-subsystem). Anything else
+ * gets nothing at all: no __OS_LOG reservation, no register access, no DT edit. On a supported boot the __OS_LOG
  * reservation and every check below run as on T6031, and the handoff is published only if all of
  * them pass. The DCP maps through dart-dcp SID 23 and the display and its piodma through dart-disp0
  * SIDs 0 and 16, of 32 streams each, so these SIDs are per SoC (struct dcp_soc .sids). Marker
@@ -421,8 +422,44 @@ static const struct dcp_soc dcp_soc_t6041 = {
     .vm_size = DCP6_DART_VM_SIZE,
 };
 
+/*
+ * The same T6041 display block on the M4 Max itself (T6041, J616C). The J616C ADT has the J616s's
+ * addresses and streams: dcp at 0x402e00000 through dart-dcp SID 23, disp0 and its piodma through
+ * dart-disp0 SIDs 0 and 16, of 32 streams each; the iop-dcp-nub segments come from the ADT as on
+ * the J616s. Same 26.6.2 firmware gate and no opt-in.
+ */
+static const char *const dcp_boards_t6041_j616c[] = {"apple,j616c", NULL};
+
+static const struct dcp_soc dcp_soc_t6041_j616c = {
+    .name = "T6041",
+    .chip = T6041,
+    .compat = "apple,t6041",
+    .boards = dcp_boards_t6041_j616c,
+    .boards_desc = "J616C",
+    .dcp_compat = "apple,t6041-dcp",
+    .disp_compat = "apple,display-subsystem",
+    .marker = "apple,t6041-handoff",
+    .adt_psreg = true,
+    .board_gate = true,
+    .any_uuid = true,
+    .log_streams = true,
+    .sids = true,
+    .oslog_in_rsv = true,
+    .sid_dcp = 23,
+    .sid_disp = 0,
+    .sid_piodma = 16,
+    .streams = 32,
+    .os_fw = V26_6_2,
+    .os_fw_name = "26.6.2",
+    .coproc = 0x402e00000UL,
+    .dart_dcp = 0x402340000UL,
+    .dart_disp = 0x402300000UL,
+    .vm_base = DCP6_DART_VM_BASE,
+    .vm_size = DCP6_DART_VM_SIZE,
+};
+
 static const struct dcp_soc *const dcp_socs[] = {&dcp_soc_t6030, &dcp_soc_t8122, &dcp_soc_t6031,
-                                                 &dcp_soc_t6041};
+                                                 &dcp_soc_t6041, &dcp_soc_t6041_j616c};
 
 struct dcp6_seg {
     u64 phys;
@@ -3122,7 +3159,7 @@ int dt_set_display_handoff(void *dt)
         dlog("not armed (no chosen.%s=1): no display handoff\n", dcp6.soc->optin);
     if (dcp6.soc->ext)
         dcpext6_handoffs(dt);
-    if (dcp6.soc == &dcp_soc_t6041)
+    if (dcp6.soc == &dcp_soc_t6041 || dcp6.soc == &dcp_soc_t6041_j616c)
         t6041_ext_handoffs(dt);
     return 0;
 }
