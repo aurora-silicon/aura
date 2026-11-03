@@ -687,6 +687,20 @@ int pcie_t6050_init(void)
 
     if (state <= 0)
         return state;
+    /* The GP bring-up below is J775D's. A board whose apcie0 has no bridge for a required port
+     * (J716c: ports 0 and 1 only) has none measured: its GP side stays as iBoot left it, and
+     * storage runs. */
+    for (size_t i = 0; i < ARRAY_SIZE(ports); i++) {
+        char bridge[40];
+
+        snprintf(bridge, sizeof(bridge), "%s/pci-bridge%d", apcie_path, ports[i].port);
+        if (ports[i].required && adt_path_offset(adt, bridge) < 0) {
+            printf("pcie-t6050: no %s (%s) on this board: GP ports left as found\n",
+                   ports[i].endpoint, bridge);
+            state = 0;
+            return 0;
+        }
+    }
     state = -1;
     TRY(find_regs());
     TRY(storage_find());
