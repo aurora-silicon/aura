@@ -97,3 +97,38 @@ at EL1 with pointer authentication on and all six CPUs up.
 
 Not tested: a raw boot with `src/monitor.c` in the tree, a filled Stage 1 that
 loads Stage 2 from the ESP, and any chip other than T8140.
+
+## M4 Pro MacBook Pro (J616s, T6040)
+
+The J616s boots Linux from a boot object that carries the kernel. Append
+the payloads to `build/aura.bin` before wrapping it: the device tree, the
+initramfs (`aura_initramfs`, its size and the cpio), the configuration
+lines, then the kernel `Image`, and wrap the result with
+`tools/macho_boot_object.py`. The payload scan ends at the
+`__PRELINK_INFO` that follows the raw image.
+
+As on T8140, the secondaries are confined, so the monitor enters the OS at
+EL1, or at virtual EL2 in a build made with `NV2_BOOT=1`. kboot then also
+keeps CTXR windows A to C out of Linux and copies an inline initramfs out of
+the boot object. It starts ANS for the inline kernel and hands the session
+to Linux.
+
+### Hibernation
+
+A hibernation image restores every page to the frame it was saved from, so
+the resuming boot must give Linux the same RAM map. The configuration line
+`hib=1` fixes it on T6040:
+
+- the heap restarts 160 MiB above the 32 MiB aligned start of RAM;
+- RAM from its start to 128 MiB above that is kept from Linux, and
+  `region-id-45` is handed back from that end;
+- the device tree Linux is started with is copied into a 2 MiB slot at the
+  start of that heap as the last step before the handoff.
+
+`/chosen/aura,hibernate-layout` holds the start and end of the range kept
+from Linux, and `/chosen/aura,hibernate-dt` the address of the device tree
+slot. A kernel resumed from an image finds the resuming boot's tree there.
+Without `hib=1` nothing changes.
+
+PSCI `SYSTEM_OFF` halts with the watchdog stopped instead of resetting, so a
+power-off that did not take effect does not boot back into the image.
