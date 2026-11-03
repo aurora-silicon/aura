@@ -8193,7 +8193,7 @@ int kboot_prepare_dt(void *fdt)
      * Linux's allocator (J616C: ANS syslog lines in page-cache pages at the SART-allowed heap
      * addresses).
      */
-    if (chip_id == T8140 || chip_id == T6041 || chip_id == T8152 ||
+    if (chip_id == T8140 || chip_id == T6041 || chip_id == T6040 || chip_id == T8152 ||
         (chip_id == T8132 && !fdt_node_check_compatible(dt, 0, "apple,j713"))) {
         u64 ram_end, inherited = cur_boot_args.top_of_kernel_data;
         u64 high_water = heapblock_high_water();
@@ -8239,7 +8239,7 @@ int kboot_prepare_dt(void *fdt)
      * Stage 1 read the ESP, so the buffers are in Stage 1's heap, not this one's). Reserve each
      * SART-allowed range inside RAM; the nvme-apple adoption requires them reserved anyway.
      */
-    if (chip_id == T6041 || chip_id == T8142) {
+    if (chip_id == T6041 || chip_id == T6040 || chip_id == T8142) {
         sart_dev_t *sart = sart_init("/arm-io/sart-ans");
         u64 ram_start = cur_boot_args.phys_base;
         u64 ram_end = ram_start + cur_boot_args.mem_size;
