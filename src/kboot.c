@@ -4145,6 +4145,27 @@ static int dt_display_transaction(int (*apply)(unsigned int), unsigned int index
 #define T8132_DCPEXT_READY "apple,t8132-dcpext-firmware-ready"
 
 /* Native26 validates the inherited stream using the public locked-DART walker. */
+static const char *ext26_step = "not-started";
+
+static void dt_ext26_step(const char *step)
+{
+    ext26_step = step;
+    printf("FDT: J613 ext26 step=%s\n", step);
+}
+
+/* This receipt is written to the original tree after commit/rollback. */
+static void dt_ext26_result(int error)
+{
+    char result[160];
+    snprintf(result, sizeof(result), "step=%s error=%d", ext26_step, error);
+    printf("FDT: J613 ext26 result: %s\n", result);
+    int chosen = fdt_path_offset(dt, "/chosen");
+    int ret = chosen < 0 ? chosen
+                         : fdt_setprop_string(dt, chosen, "asahi,j613-25g83-dcpext-result", result);
+    if (ret)
+        printf("FDT: J613 ext26 result publication failed: %d\n", ret);
+}
+
 struct dt_ext26_pages {
     const struct adt_segment_ranges *segments;
     u64 seen[4];
@@ -4176,6 +4197,8 @@ static int dt_ext26_power(const struct pmgr_gate *gate, unsigned int depth)
         if (!gate->psreg)
             return -1;
         u32 state = read32(gate->psreg);
+        printf("FDT: J613 ext26 power gate=%u address=%lx state=%x\n", gate->id, gate->psreg,
+               state);
         if (((state >> 4) & 15) != 15 && !((state & BIT(28)) && (state & 15) == 15))
             return -1;
     }
@@ -4193,7 +4216,8 @@ static int dt_ext26_power(const struct pmgr_gate *gate, unsigned int depth)
 static int dt_ext26_publish(const char *alias, const u32 state[4], const char *uuid)
 {
     int node = fdt_path_offset(dt, alias);
-    if (node < 0 ||
+    const fdt32_t compat[] = {cpu_to_fdt32(26), cpu_to_fdt32(6), cpu_to_fdt32(2)};
+    if (node < 0 || fdt_setprop(dt, node, "apple,firmware-compat", compat, sizeof(compat)) ||
         fdt_setprop(dt, node, "apple,j613-25g83-dcpext-boot-state", state, 4 * sizeof(*state)) ||
         fdt_setprop_string(dt, node, "apple,firmware-uuid", uuid))
         return -1;
@@ -4204,15 +4228,20 @@ static int dt_ext26_publish(const char *alias, const u32 state[4], const char *u
 static int dt_ext26_snapshot_inner(const char *alias)
 {
     int panel = fdt_path_offset(dt, "dcp"), ext = fdt_path_offset(dt, alias), length;
+    dt_ext26_step("internal-mapping-handoff");
     if (panel < 0 || !fdt_getprop(dt, panel, "apple,j613-25g83-mapping-handoff", NULL))
-        return 0; /* The unchanged classic reservation path. */
+        return os_firmware.version == V26_6_2 ? -1
+                                              : 0; /* The unchanged classic reservation path. */
+    dt_ext26_step("board-firmware-alias");
     if (ext < 0 || chip_id != T8122 || os_firmware.version != V26_6_2 ||
         fdt_node_check_compatible(dt, 0, "apple,j613") || strcmp(alias, "dcpext"))
         return -1;
+    dt_ext26_step("ADT-external-nub");
     int nub = adt_path_offset(adt, "/arm-io/dcpext/iop-dcpext-nub");
     u32 bytes, loaded;
     if (nub < 0)
         return -1;
+    dt_ext26_step("ADT-segments-UUID-preloaded");
     const struct adt_segment_ranges *segments = adt_getprop(adt, nub, "segment-ranges", &bytes);
     const char *uuid = adt_getprop(adt, nub, "uuid", &loaded);
     if (!segments || bytes != 4 * sizeof(*segments) || !uuid ||
@@ -4220,11 +4249,13 @@ static int dt_ext26_snapshot_inner(const char *alias)
         memcmp(uuid, "C042E95C-B9D8-3F0E-94B3-582A08AA6FDD", loaded) ||
         ADT_GETPROP(adt, nub, "pre-loaded", &loaded) != sizeof(loaded) || loaded != 1)
         return -1;
+    dt_ext26_step("segment-flags");
     const u32 flags[] = {1, 0, 10, 2};
     for (unsigned int i = 0; i < 4; i++)
         if (segments[i].unk != flags[i])
             return -1;
     /* Require the complete power ancestry before reading processor MMIO. */
+    dt_ext26_step("power-ancestry");
     struct pmgr_gate gate;
     unsigned int gates = 0;
     while (!pmgr_adt_gate("/arm-io/dcpext", "clock-gates", gates, &gate)) {
@@ -4233,6 +4264,7 @@ static int dt_ext26_snapshot_inner(const char *alias)
     }
     if (!gates)
         return -1;
+    dt_ext26_step("ADT-register-resources");
     u64 coproc, span, iommu;
     int path[8];
     if (adt_path_offset_trace(adt, "/arm-io/dcpext", path) < 0 ||
@@ -4240,36 +4272,47 @@ static int dt_ext26_snapshot_inner(const char *alias)
         adt_path_offset_trace(adt, "/arm-io/dart-dcpext", path) < 0 ||
         adt_get_reg(adt, path, "reg", 0, &iommu, &span))
         return -1;
+    dt_ext26_step("DT-coproc-register");
     const fdt64_t *reg = fdt_getprop(dt, ext, "reg", &length);
     if (!reg || length < 16 || fdt64_ld(reg) != coproc)
         return -1;
+    dt_ext26_step("DT-firmware-DART-register");
     int provider = dt_get_iommu_node(ext, 0);
     reg = provider < 0 ? NULL : fdt_getprop(dt, provider, "reg", &length);
     if (!reg || length < 16 || fdt64_ld(reg) != iommu)
         return -1;
+    dt_ext26_step("ADT-DART-window");
     u64 window, window_size;
     int adart = adt_path_offset(adt, "/arm-io/dart-dcpext");
     if (ADT_GETPROP(adt, adart, "vm-base", &window) != sizeof(window) ||
         ADT_GETPROP(adt, adart, "vm-size", &window_size) != sizeof(window_size))
         return -1;
+    dt_ext26_step("DT-DART-window");
     const fdt64_t *range = fdt_getprop(dt, provider, "apple,dma-range", &length);
     if (!range || length != 16 || fdt64_ld(range) != window || fdt64_ld(range + 1) != window_size)
         return -1;
+    dt_ext26_step("hardware-boot-state");
     u32 state[4] = {1, read32(coproc + 0x44), read32(coproc + 0x48), read32(iommu + 0x200)};
+    printf("FDT: J613 ext26 power=%u control=%x status=%x protect=%x\n", state[0], state[1],
+           state[2], state[3]);
     if (!(state[3] & 1))
         return -1;
+    dt_ext26_step("ADT-DRAM");
     int chosen = adt_path_offset(adt, "/chosen");
     u64 dram, size;
     if (chosen < 0 || ADT_GETPROP(adt, chosen, "dram-base", &dram) != sizeof(dram) ||
         ADT_GETPROP(adt, chosen, "dram-size", &size) != sizeof(size))
         return -1;
+    dt_ext26_step("locked-stream5-pages");
     struct dt_ext26_pages maps = {.segments = segments};
     if (dart_walk_locked_t8110(iommu, 5, dram, size, dt_ext26_page, &maps))
         return -1;
+    dt_ext26_step("segment-page-coverage");
     for (unsigned int i = 0; i < 4; i++)
         if (i != 2 && maps.seen[i] != ALIGN_UP((u64)segments[i].size, SZ_16K))
             return -1;
     /* Reserve every inherited root/leaf page, retaining the public DART view. */
+    dt_ext26_step("locked-table-collection");
     dart_dev_t *view = dart_init_adt_display("/arm-io/dart-dcpext", 0, 5);
     u64 *tables = malloc(2049 * sizeof(*tables));
     size_t count = 0;
@@ -4278,6 +4321,7 @@ static int dt_ext26_snapshot_inner(const char *alias)
         goto done;
     if (dart_collect_locked_tables(view, dram, size, tables, 2049, &count))
         goto done;
+    dt_ext26_step("table-reservations");
     for (size_t i = 0; i < count; i++) {
         char name[64];
         snprintf(name, sizeof(name), "dcpext26-tables@%lx", tables[i]);
@@ -4286,6 +4330,7 @@ static int dt_ext26_snapshot_inner(const char *alias)
     }
     for (unsigned int i = 0; i < 4; i++)
         state[i] = cpu_to_fdt32(state[i]);
+    dt_ext26_step("identity-state-publication");
     result = dt_ext26_publish(alias, state, uuid);
 done:
     if (view)
@@ -4303,7 +4348,11 @@ static int dt_ext26_snapshot(const char *alias)
     sysop("dsb sy");
     sysop("isb");
     exc_guard = previous;
-    return exc_count == faults ? result : -1;
+    if (exc_count != faults) {
+        printf("FDT: J613 ext26 MMIO fault during %s\n", ext26_step);
+        return -1;
+    }
+    return result;
 }
 
 static int dt_ext26_reserve(const char *alias)
@@ -4363,6 +4412,8 @@ static int dt_reserve_dcpext_ready(unsigned int n, const char *marker, bool nati
     const char *alias = dcpext_aliases[n];
     char path[48];
     snprintf(path, sizeof(path), "/arm-io/%s/iop-%s-nub", alias, alias);
+    if (native26)
+        dt_ext26_step("segment-DRAM-bounds");
     int nub = adt_path_offset(adt, path);
     int chosen = adt_path_offset(adt, "/chosen");
     u32 len = 0;
@@ -4387,10 +4438,14 @@ static int dt_reserve_dcpext_ready(unsigned int n, const char *marker, bool nati
     int ext = fdt_path_offset(dt, alias);
     bool native =
         native26 && ext >= 0 && fdt_getprop(dt, ext, "apple,j613-25g83-dcpext-handoff", NULL);
+    if (native)
+        dt_ext26_step("firmware-memory-reservations");
     if (native
             ? dt_ext26_reserve(alias)
             : (dt_reserve_asc_firmware(path, NULL, alias, true, 0) || dt_set_dcp_firmware(alias)))
         return -1;
+    if (native)
+        dt_ext26_step("firmware-ready-publication");
     int node = fdt_path_offset(dt, alias);
     return node < 0 ? node : fdt_setprop_u32(dt, node, marker, 1);
 }
@@ -4550,7 +4605,13 @@ static int dt_reserve_dcpext_firmware(bool enable)
             int ret = fdt_delprop(dt, dcpext_node, T8122_DCPEXT_READY);
             if (ret && ret != -FDT_ERR_NOTFOUND)
                 return ret;
+            bool native26 =
+                os_firmware.version == V26_6_2 && !fdt_node_check_compatible(dt, 0, "apple,j613");
+            if (native26)
+                dt_ext26_step("native-switch-and-internal-handoff");
             if (!dt_t8122_dcpext_armed()) {
+                if (native26)
+                    dt_ext26_result(-1);
                 printf("FDT: '%s' firmware not reserved (needs chosen.asahi,t8122-dcpext=1 "
                        "and the internal display handoff); kernel gate remains closed\n",
                        dcpext_alias);
@@ -4560,9 +4621,17 @@ static int dt_reserve_dcpext_firmware(bool enable)
             int len = 0;
             const char *status = fdt_getprop(dt, dcpext_node, "status", &len);
             if (!status || len != sizeof("disabled") || strcmp(status, "disabled") ||
-                fdt_node_check_compatible(dt, dcpext_node, "apple,t8122-dcpext"))
+                fdt_node_check_compatible(dt, dcpext_node, "apple,t8122-dcpext")) {
+                if (native26) {
+                    dt_ext26_step("external-disabled-compatible");
+                    dt_ext26_result(-1);
+                }
                 continue;
-            if (dt_display_transaction(dt_reserve_t8122_dcpext_one, n))
+            }
+            int result = dt_display_transaction(dt_reserve_t8122_dcpext_one, n);
+            if (native26)
+                dt_ext26_result(result);
+            if (result)
                 printf("FDT: '%s' firmware not ready; kernel gate remains closed\n", dcpext_alias);
             else
                 printf("FDT: '%s' firmware reserved, left to the kernel\n", dcpext_alias);

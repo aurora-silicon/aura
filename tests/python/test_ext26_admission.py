@@ -22,6 +22,7 @@ def test_native26_admission(tmp_path):
 #include <stdint.h>
 #include <stdbool.h>
 #include <string.h>
+#include <stdio.h>
 #include "libfdt.h"
 typedef uint64_t u64;
 typedef uint32_t u32;
@@ -29,8 +30,9 @@ typedef uint32_t u32;
 #define SZ_16K 16384
 #define ALIGN_UP(v,a) (((v)+(a)-1)&~((a)-1))
 static void *dt;
+static const char *ext26_step;
 ''' + seg_type + page_type + function('dt_ext26_page', 'int') +
-          function('dt_t8122_dcpext_armed', 'bool') + function('dt_ext26_publish', 'int') + r'''
+          function('dt_t8122_dcpext_armed', 'bool') + function('dt_ext26_publish', 'int') + function('dt_ext26_result', 'void') + r'''
 int main(void) {
  unsigned char blob[8192]; dt=blob;
  assert(!fdt_create_empty_tree(dt,sizeof(blob)));
@@ -71,6 +73,12 @@ int main(void) {
  const char *uuid="C042E95C-B9D8-3F0E-94B3-582A08AA6FDD";
  const u32 state[]={cpu_to_fdt32(1),cpu_to_fdt32(16),cpu_to_fdt32(34),cpu_to_fdt32(1)};
  assert(!dt_ext26_publish("dcpext",state,uuid));external=fdt_path_offset(dt,"dcpext");
+ int compat_len; const fdt32_t *compat=fdt_getprop(dt,external,"apple,firmware-compat",&compat_len);
+ assert(compat && compat_len==12 && fdt32_ld(compat)==26 && fdt32_ld(compat+1)==6 && fdt32_ld(compat+2)==2);
+ ext26_step="locked-stream5-pages";dt_ext26_result(-7);
+ chosen=fdt_path_offset(dt,"/chosen");
+ assert(!strcmp(fdt_getprop(dt,chosen,"asahi,j613-25g83-dcpext-result",NULL),"step=locked-stream5-pages error=-7"));
+ external=fdt_path_offset(dt,"dcpext");
  int n;const char *published=fdt_getprop(dt,external,"apple,firmware-uuid",&n);
  assert(published && n==37 && !strcmp(published,uuid));
  const fdt32_t *marker=fdt_getprop(dt,external,"apple,j613-25g83-dcpext-handoff",&n);
