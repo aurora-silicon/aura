@@ -35,11 +35,11 @@ vCPUs crossed clusters. One common interface fixes this without restricting
 vCPU, emulator, or I/O-thread scheduling. Only cycles and instructions are
 mapped; unsupported hardware events fail rather than using unverified codes.
 
-Hardware validation on J700 with `7.3.0-nv2-pmu2` included all36 KVM init/run
-CPU combinations,100 alternating P/E phases, host counting/sampling on all six
-CPUs, and diskless Linux guests with1/2/4/6 vCPUs. Guest counters, overflow
+Hardware validation on J700 with `7.3.0-nv2-pmu2` included all 36 KVM init/run
+CPU combinations, 100 alternating P/E phases, host counting/sampling on all six
+CPUs, and diskless Linux guests with 1/2/4/6 vCPUs. Guest counters, overflow
 interrupts, intentional UNDEF with x19/x29 preservation, timers and IPIs pass.
-Windows11 Pro Arm64 build26300.9457 installed and booted its disk to the desktop,
+Windows 11 Pro Arm64 build 26300.9457 installed and booted its disk to the desktop,
 then repeat-booted with six vCPUs, completed parallel arithmetic, flushed disk
 write/readback and three benchmark rounds, and shut down cleanly. All six host
 CPUs remained available; no PMU-disable or whole-QEMU affinity workaround was
@@ -47,10 +47,10 @@ used. This is not a claim that Windows's emulated TPM is healthy: its System
 log reports TPM errors.
 
 Recursive Linux still boots L2 at vEL2 and L3 to userspace. L3 fixed counting,
-exceptions and PMU overflow delivery work, but a100k-instruction sampling
+exceptions and PMU overflow delivery work, but a 100k-instruction sampling
 period triggers Linux perf throttling and undercounts. A diagnostic with
-dynamic throttling disabled in the disposable guests counts20M+ instructions
-and200 samples per vCPU without loss. A1M period passes under ordinary policy.
+dynamic throttling disabled in the disposable guests counts 20M+ instructions
+and 200 samples per vCPU without loss. A 1M period passes under ordinary policy.
 Neither diagnostic changes production policy; high-rate recursive sampling
 cost remains an open limitation. Suspend/resume and EFI runtime services also
 remain unverified or problematic in the tested configurations.
