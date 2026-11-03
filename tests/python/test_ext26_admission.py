@@ -30,7 +30,7 @@ typedef uint32_t u32;
 #define ALIGN_UP(v,a) (((v)+(a)-1)&~((a)-1))
 static void *dt;
 ''' + seg_type + page_type + function('dt_ext26_page', 'int') +
-          function('dt_t8122_dcpext_armed', 'bool') + r'''
+          function('dt_t8122_dcpext_armed', 'bool') + function('dt_ext26_publish', 'int') + r'''
 int main(void) {
  unsigned char blob[8192]; dt=blob;
  assert(!fdt_create_empty_tree(dt,sizeof(blob)));
@@ -65,6 +65,21 @@ int main(void) {
  assert(dt_ext26_page(0x800008000,0x108000,&pages));
  assert(dt_ext26_page(0x800400000,0x300000,&pages)); /* OSLog is never DMA-mapped. */
  assert(pages.seen[0]==32768 && pages.seen[2]==0);
+ int external=fdt_add_subnode(dt,0,"external");assert(external>=0);
+ assert(!fdt_setprop_string(dt,external,"status","disabled"));
+ aliases=fdt_path_offset(dt,"/aliases");assert(!fdt_setprop_string(dt,aliases,"dcpext","/external"));
+ const char *uuid="C042E95C-B9D8-3F0E-94B3-582A08AA6FDD";
+ const u32 state[]={cpu_to_fdt32(1),cpu_to_fdt32(16),cpu_to_fdt32(34),cpu_to_fdt32(1)};
+ assert(!dt_ext26_publish("dcpext",state,uuid));external=fdt_path_offset(dt,"dcpext");
+ int n;const char *published=fdt_getprop(dt,external,"apple,firmware-uuid",&n);
+ assert(published && n==37 && !strcmp(published,uuid));
+ const fdt32_t *marker=fdt_getprop(dt,external,"apple,j613-25g83-dcpext-handoff",&n);
+ assert(marker && n==4 && fdt32_to_cpu(*marker)==1);
+ assert(!strcmp(fdt_getprop(dt,external,"status",NULL),"disabled"));
+ assert(!memcmp(fdt_getprop(dt,external,"apple,j613-25g83-dcpext-boot-state",&n),state,sizeof(state)) && n==16);
+ assert(!fdt_delprop(dt,external,"apple,j613-25g83-dcpext-handoff"));assert(!fdt_pack(dt));
+ assert(dt_ext26_publish("dcpext",state,uuid));
+ assert(!fdt_getprop(dt,fdt_path_offset(dt,"dcpext"),"apple,j613-25g83-dcpext-handoff",NULL));
  return 0;
 }
 ''')
