@@ -32,7 +32,9 @@ enum exc_guard_t { GUARD_OFF = 0, GUARD_SKIP, GUARD_MARK, GUARD_RETURN, GUARD_TY
                    GUARD_SILENT = 0x100 };
 static volatile int exc_guard;
 static volatile u64 exc_last_esr;
-static int chip_id, boot_cpu_idx, alive_mask, probe_faults, calls, printed;
+/* Set per case to model each chip; the probe must not read it. */
+static int chip_id __attribute__((unused));
+static int boot_cpu_idx, alive_mask, probe_faults, calls, printed;
 static void sysop_stub(void) {}
 #define sysop(op) sysop_stub()
 static bool smp_is_alive(int cpu) { return alive_mask & (1 << cpu); }
@@ -52,7 +54,7 @@ static int smp_call1(int cpu, void *fn, u64 arg) {
     return 0;
 }
 static int smp_wait(int cpu, u64 *ret) { *ret = result; return 0; }
-#define printf(...) (printed++, 0)
+#define printf(...) (printed++)
 ''' + "%s" + r'''
 #undef printf
 static int run(int chip, int alive, int faults) {
