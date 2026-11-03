@@ -5,6 +5,7 @@
 #include "chainload.h"
 #include "adt.h"
 #include "boot_options.h"
+#include "dockchannel_uart.h"
 #include "heapblock.h"
 #include "malloc.h"
 #include "memory.h"
@@ -426,6 +427,22 @@ int chainload_load(const char *spec, char **vars, size_t *var_cnt, size_t var_ca
     /* The next aura stage skips its debugusb window when this one offered a window already. */
     if (ret == 0 && stage1_window_offered() && *var_cnt < var_capacity)
         vars[(*var_cnt)++] = host_window_var;
+    /*
+     * A debugusb host reading the DockChannel console makes this a debug boot: the OS keeps the
+     * debug UART as its console (kboot.c, dt_set_stdout_path). Stage 2 is built without
+     * DEBUGUSB_PROXY, so the boot arguments carry it there, as they carry aura-trial.
+     */
+    if (ret == 0 && !aura_console_enabled() && dockchannel_uart_host_seen()) {
+        size_t capacity = cur_boot_args.revision == 1   ? CMDLINE_LENGTH_RV1
+                          : cur_boot_args.revision == 2 ? CMDLINE_LENGTH_RV2
+                                                        : CMDLINE_LENGTH_RV3;
+        if (boot_options_append(cur_boot_args.rv3.cmdline, capacity, "aura-console")) {
+            boot_options_set_console(true);
+            printf("chainload: debugusb host, the OS keeps the debug console\n");
+        } else {
+            printf("chainload: no room to pass aura-console on\n");
+        }
+    }
 #endif
     if (ret == 0)
         stage1_log_handoff(vars, var_cnt, var_capacity);

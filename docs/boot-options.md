@@ -17,6 +17,9 @@ The boot-argument tokens are matched exactly:
   NVRAM: `touch <esp>/aura-proxy` to turn it on, `rm <esp>/aura-proxy` to turn
   it off. Without either, Stage 1 boots straight through.
 
+- `aura-console` keeps the debug UART as the OS console (see below) without
+  the rest of `aura-debug`. `aura-debug` keeps it too.
+
 The options may be combined. `aura-debug` alone does not request a proxy pause.
 Normal payload failure still follows the existing recovery fallback.
 
@@ -62,6 +65,32 @@ offered any window passes `aura.host-window=done` to the next stage, and a
 Stage 2 started with a live ANS session from Stage 1 skips it too. A debugusb
 boot with a reader attached therefore takes 15 seconds longer when no host
 claims the window. Without the flag nothing changes.
+
+## The debug UART is the OS console on debug boots only
+
+The Apple device trees set `/chosen/stdout-path = "serial0"`: the Samsung UART
+on M1 and M2 laptops, the DockChannel UART on the MacBook Neo. Both are
+reachable only from a debug host over a VDM `debugusb` link. Linux makes the
+`stdout-path` UART a console when its command line has no `console=`, and
+Plymouth, finding a serial console, drops to text mode (ttyDC0 on the Neo,
+ttySAC0 on M1/M2).
+
+kboot therefore removes `stdout-path` and `linux,stdout-path` when they name an
+`apple,s5l-uart` or `apple,dockchannel-uart` node, unless this is a debug boot:
+
+- `aura-debug` or `aura-console` in the boot arguments;
+- a Stage 1 built with `DEBUGUSB_PROXY=1` saw a debugusb host reading the
+  DockChannel console (see below). It passes `aura-console` to the next stage
+  and logs `chainload: debugusb host, the OS keeps the debug console`;
+- `chosen.aura,serial-console=1` in the aura configuration, or a config line
+  that sets `chosen.stdout-path` itself.
+
+`chosen.aura,serial-console=0` removes it on every boot. The UART node stays,
+so `console=ttyDC0` (or `console=ttySAC0`) on the kernel command line still
+works. kboot logs `FDT: removed chosen.stdout-path (debug UART, not a debug
+boot)` or `FDT: keeping chosen.stdout-path on the debug UART (<reason>)`. A
+`stdout-path` to any other node is left alone. The J616s and J614s device trees
+set none.
 
 ## Common build profiles
 

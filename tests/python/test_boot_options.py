@@ -34,6 +34,11 @@ int main(void) {
     boot_options_init("aura-proxy=0", 13);
     assert(!aura_proxy_enabled());
 
+    boot_options_init("-v aura-console", 16);
+    assert(aura_console_enabled() && !aura_debug_enabled());
+    boot_options_init("aura-consoles aura-debug", 25);
+    assert(!aura_console_enabled() && aura_debug_enabled());
+
     boot_options_init("aura-nv2=1", 12);
     assert(aura_nv2_enabled());
     boot_options_init("aura-nv2=0", 12);

@@ -2,6 +2,7 @@
 #include "boot_options.h"
 
 static bool debug_enabled;
+static bool console_requested;
 static bool proxy_requested;
 static bool trial_running;
 static bool is_stage1;
@@ -45,6 +46,7 @@ bool boot_option_present(const char *line, size_t capacity, const char *option)
 void boot_options_init(const char *line, size_t capacity)
 {
     debug_enabled = boot_option_present(line, capacity, "aura-debug");
+    console_requested = boot_option_present(line, capacity, "aura-console");
     proxy_requested = boot_option_present(line, capacity, "aura-proxy");
     trial_running = boot_option_present(line, capacity, "aura-trial");
     nv2_option =
@@ -77,6 +79,17 @@ void boot_options_init(const char *line, size_t capacity)
 bool aura_debug_enabled(void)
 {
     return debug_enabled;
+}
+
+/* Keep the debug UART as the OS console (stdout-path) without the rest of aura-debug */
+bool aura_console_enabled(void)
+{
+    return console_requested;
+}
+
+void boot_options_set_console(bool console)
+{
+    console_requested = console;
 }
 
 /* Run the OS at virtual EL2 under FEAT_NV2 so it can host VMs (opt-in). */

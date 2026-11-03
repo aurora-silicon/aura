@@ -8,10 +8,12 @@
 #include "adt.h"
 #include "asc.h"
 #include "assert.h"
+#include "boot_options.h"
 #include "clk.h"
 #include "dapf.h"
 #include "devicetree.h"
 #include "display.h"
+#include "dockchannel_uart.h"
 #include "exception.h"
 #include "firmware.h"
 #include "heapblock.h"
@@ -549,6 +551,80 @@ static int dt_set_m3_defaults(void)
     return 0;
 }
 
+/*
+ * /chosen stdout-path makes Linux register that UART as a console when the command line names
+ * none. The Apple DTS sets it to serial0 on every laptop: the Samsung UART on M1 and M2, the
+ * DockChannel UART on the MacBook Neo. Both are reachable only from a debug host (a VDM
+ * `reboot debugusb` link), so on a normal boot the console is one nobody reads, and Plymouth,
+ * seeing a serial console, drops to its text mode. The property is kept on a debug boot only:
+ * aura-debug or aura-console in the boot arguments, a debugusb host reading the DockChannel
+ * console (DEBUGUSB_PROXY builds), chosen.aura,serial-console=1 in the config, or a config line
+ * that sets stdout-path itself. chosen.aura,serial-console=0 removes it on any boot. The UART
+ * node stays, so console=ttyDC0 or console=ttySAC0 on the command line still works.
+ */
+#define SERIAL_CONSOLE_SWITCH "aura,serial-console"
+
+static const char *const debug_uart_compatibles[] = {"apple,s5l-uart", "apple,dockchannel-uart"};
+
+/* True when the stdout path in prop names a node that is a debug-only UART */
+static bool dt_stdout_is_debug_uart(int chosen, const char *prop)
+{
+    int len;
+    const char *path = fdt_getprop(dt, chosen, prop, &len);
+
+    if (!path || len <= 0 || !memchr(path, 0, len))
+        return false;
+    const char *colon = strchr(path, ':');
+    int node = fdt_path_offset_namelen(dt, path, colon ? (int)(colon - path) : (int)strlen(path));
+    if (node < 0)
+        return false;
+    for (size_t i = 0; i < ARRAY_SIZE(debug_uart_compatibles); i++)
+        if (!fdt_node_check_compatible(dt, node, debug_uart_compatibles[i]))
+            return true;
+    return false;
+}
+
+/* Why this boot keeps the debug UART as the console, NULL on a normal boot */
+static const char *kboot_serial_console_reason(void)
+{
+    const char *sw = kboot_chosen_param(SERIAL_CONSOLE_SWITCH);
+
+    if (sw && !strcmp(sw, "0"))
+        return NULL;
+    if (sw && !strcmp(sw, "1"))
+        return "chosen." SERIAL_CONSOLE_SWITCH "=1";
+    if (kboot_chosen_param("stdout-path") || kboot_chosen_param("linux,stdout-path"))
+        return "a config line sets it";
+    if (aura_debug_enabled())
+        return "aura-debug";
+    if (aura_console_enabled())
+        return "aura-console";
+#ifdef DEBUGUSB_PROXY
+    if (dockchannel_uart_host_seen())
+        return "debugusb host";
+#endif
+    return NULL;
+}
+
+static int dt_set_stdout_path(int chosen)
+{
+    static const char *const props[] = {"stdout-path", "linux,stdout-path"};
+    const char *reason = kboot_serial_console_reason();
+
+    for (size_t i = 0; i < ARRAY_SIZE(props); i++) {
+        if (!dt_stdout_is_debug_uart(chosen, props[i]))
+            continue;
+        if (reason) {
+            printf("FDT: keeping chosen.%s on the debug UART (%s)\n", props[i], reason);
+            continue;
+        }
+        if (fdt_delprop(dt, chosen, props[i]))
+            bail("FDT: couldn't remove chosen.%s\n", props[i]);
+        printf("FDT: removed chosen.%s (debug UART, not a debug boot)\n", props[i]);
+    }
+    return 0;
+}
+
 static int dt_set_chosen(void)
 {
 
@@ -566,6 +642,9 @@ static int dt_set_chosen(void)
             bail("FDT: couldn't set chosen.%s property\n", name);
         printf("FDT: set chosen.%s\n", name);
     }
+
+    if (dt_set_stdout_path(node))
+        return -1;
 
     if (chip_id == T8140 && dt_set_t8140_wfx_args(node))
         return -1;
