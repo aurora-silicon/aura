@@ -43,6 +43,11 @@ static void *dt = (void *)0x1000;
 static int dt_bufsize = 0x10000;
 static int chip_id, mode, hardware_calls;
 static bool monitor_required(void) { return chip_id == T8140; }
+/* hib=1 is off: the fixed device tree slot is covered by test_t6040_hibernate_layout.py */
+#define SZ_1M 0x100000
+#define HIB_DT_SLOT (2 * SZ_1M)
+static u64 hib_dt_base, hib_heap_base, hib_heap_end;
+static uintptr_t heapblock_high_water(void) { return 0; }
 static jmp_buf refused;
 static _Noreturn void panic(const char *format, ...) { longjmp(refused, 1); }
 /* The T8152 handoff has its own path and is not modelled here. */

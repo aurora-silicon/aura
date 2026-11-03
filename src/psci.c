@@ -4,6 +4,7 @@
 #include "smp.h"
 #include "types.h"
 #include "utils.h"
+#include "wdt.h"
 
 /*
  * PSCI for an OS the monitor runs at EL1. Apple has no EL3, so the OS reaches
@@ -171,8 +172,21 @@ bool psci_handle_smc(u64 *regs)
             smp_reenter_park(smp_id()); /* no return */
             break;
         case PSCI_SYSTEM_OFF:
+            /*
+             * The OS powers off through the system management controller
+             * (macsmc); it only gets here when that did not take effect. A
+             * reset would boot straight back into the OS (and resume a
+             * hibernation image it just wrote), so stop this CPU instead and
+             * leave the console showing why. The OS stops its other CPUs
+             * before powering off.
+             */
+            printf("psci: SYSTEM_OFF without a power-off path, halting\n");
+            /* A running watchdog would reset into the OS (and resume its image) later. */
+            wdt_stop();
+            while (1)
+                sysop("wfi");
         case PSCI_SYSTEM_RESET:
-            reboot(); /* no poweroff path yet; reset is the safe action */
+            reboot();
             break;
         default:
             regs[0] = PSCI_RET_NOT_SUPPORTED;

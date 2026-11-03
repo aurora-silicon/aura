@@ -1487,6 +1487,14 @@ void nv2_enter_os(u64 entry, u64 a0, u64 a1, u64 a2)
     u64 vncr = (u64)nv2_pages[cpu], avncr = vncr + SZ_4K;
     memset(nv2_pages[cpu], 0, SZ_16K);
     ((u64 *)vncr)[V_HCR / 8] = HCR_RW | HCR_E2H;
+    /*
+     * L1 runs its EL2 on the EL1 registers. After a PSCI CPU_OFF they still
+     * hold the OS's translation regime (MMU on, its TTBRs and vectors), so a
+     * CPU_ON entry point would be fetched through stale tables. Enter with
+     * translation off, as on the first CPU_ON.
+     */
+    msr(SYS_SCTLR_EL12, 0);
+    sysop("isb");
 
     u64 hcr =
         (mrs(HCR_EL2) & ~(HCR_TGE | HCR_NV1 | HCR_TTLB)) | HCR_NV | HCR_NV2 | HCR_AT | HCR_TID3;

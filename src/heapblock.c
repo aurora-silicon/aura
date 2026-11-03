@@ -34,6 +34,18 @@ void heapblock_set_limit(void *limit)
     printf("Heap limit: %p (%ld MiB)\n", limit, ((u8 *)limit - (u8 *)heap_base) >> 20);
 }
 
+/*
+ * Move the next allocation up to at least @base. Allocations already made stay where they are.
+ * Fails when the heap has already passed @base.
+ */
+bool heapblock_raise_base(uintptr_t base)
+{
+    if ((uintptr_t)heap_base > base)
+        return false;
+    heap_base = (void *)base;
+    return true;
+}
+
 uintptr_t heapblock_high_water(void)
 {
     return (uintptr_t)heap_base;

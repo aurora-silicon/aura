@@ -30,6 +30,8 @@ typedef uint8_t u8;
 typedef uint32_t u32;
 typedef uint64_t u64;
 #include "firmware.h"
+#define T6040 0x6040
+static u32 chip_id = 0x6040, board_id = 6;
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 """ + table + "\n" + detector + """
 int main(void)

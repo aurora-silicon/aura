@@ -59,6 +59,60 @@
 
 static void *dt = NULL;
 static int dt_bufsize = 0;
+static u64 retained_heap_end;
+
+/*
+ * Hibernation layout (T6040, config hib=1). Where iBoot loads the boot object, and what it places
+ * after it, changes between boots, so the reserved and no-map ranges Linux sees, the heap
+ * (kernel, initramfs and device tree copies) and the end of the RAM handed back above the heap
+ * all move. A hibernation image restores every saved page to the frame it came from, so the
+ * resuming boot must give Linux the same RAM and the same reserved ranges. With hib=1 the heap
+ * restarts at a fixed address above every place the object has been seen to reach, everything
+ * from the start of RAM to a fixed end above the heap is kept from Linux as one reservation, and
+ * region-id-45 is handed back from that fixed end on. /chosen/aura,hibernate-layout gives Linux
+ * the start and end of the range kept from it.
+ */
+#define HIB_OBJECT_WINDOW (160 * SZ_1M)
+#define HIB_HEAP_SPAN     (128 * SZ_1M)
+/*
+ * The device tree Linux is started with goes to a fixed slot at the start of the heap, below
+ * everything the heap hands out. A resume from disk restores the kernel that was started with
+ * the tree of an earlier boot; the slot lies in the range kept from Linux, which the image does
+ * not save, so that kernel finds this boot's tree at the address it was started with (some
+ * firmware segments move between boots, e.g. the AOP log). /chosen/aura,hibernate-dt names the
+ * slot. Linux maps at most 2M of device tree.
+ */
+#define HIB_DT_SLOT (2 * SZ_1M)
+static u64 hib_heap_base, hib_heap_end, hib_dt_base;
+
+void kboot_set_hibernate_layout(void)
+{
+    u64 lo, base, end, ram_end;
+
+    if (chip_id != T6040) {
+        printf("hib: fixed layout only on T6040, ignored\n");
+        return;
+    }
+    if (!cur_boot_args.mem_size || cur_boot_args.phys_base > UINT64_MAX - cur_boot_args.mem_size) {
+        printf("hib: invalid RAM extent, layout refused\n");
+        return;
+    }
+    ram_end = cur_boot_args.phys_base + cur_boot_args.mem_size;
+    lo = ALIGN_UP(cur_boot_args.phys_base, SZ_32M);
+    base = lo + HIB_OBJECT_WINDOW;
+    end = base + HIB_HEAP_SPAN;
+    if (cur_boot_args.top_of_kernel_data > base || end > ram_end ||
+        !heapblock_raise_base(base + HIB_DT_SLOT)) {
+        printf("hib: layout refused (top_of_kdata 0x%lx, heap 0x%lx, fixed heap 0x%lx..0x%lx)\n",
+               cur_boot_args.top_of_kernel_data, heapblock_high_water(), base, end);
+        return;
+    }
+    hib_dt_base = base;
+    hib_heap_base = base + HIB_DT_SLOT;
+    hib_heap_end = end;
+    printf("hib: fixed layout, top_of_kdata 0x%lx, device tree 0x%lx, heap 0x%lx..0x%lx\n",
+           cur_boot_args.top_of_kernel_data, hib_dt_base, hib_heap_base, end);
+}
 static void *initrd_start = NULL;
 static size_t initrd_size = 0;
 static char *chosen_params[MAX_CHOSEN_PARAMS][2];
@@ -649,6 +703,16 @@ static int dt_set_chosen(void)
     if (chip_id == T8140 && dt_set_t8140_wfx_args(node))
         return -1;
 
+    if (hib_heap_end) {
+        fdt64_t layout[2] = {cpu_to_fdt64(cur_boot_args.phys_base), cpu_to_fdt64(hib_heap_end)};
+        if (fdt_setprop(dt, node, "aura,hibernate-layout", layout, sizeof(layout)))
+            bail("FDT: couldn't set chosen.aura,hibernate-layout\n");
+        printf("FDT: hibernation layout, RAM 0x%lx..0x%lx kept from Linux\n",
+               cur_boot_args.phys_base, hib_heap_end);
+        if (fdt_setprop_u64(dt, node, "aura,hibernate-dt", hib_dt_base))
+            bail("FDT: couldn't set chosen.aura,hibernate-dt\n");
+    }
+
     if (initrd_start && initrd_size) {
         if (fdt_setprop_u64(dt, node, "linux,initrd-start", (u64)initrd_start))
             bail("FDT: couldn't set chosen.linux,initrd-start property\n");
@@ -877,6 +941,86 @@ static int dt_set_uboot_config(void)
     return 0;
 }
 
+/*
+ * J616s (T6040): the carveouts iBoot lists inside usable RAM are left out of it, as the J616s
+ * m4-loader does: Linux has not been run with them as RAM. Region 24 is usable RAM itself. Region
+ * 45 holds this stage and its heap, so only its part above the heap is left out.
+ */
+static int dt_t6040_memory_holes(u64 dram_min, u64 dram_max, void *reg_out, int *count)
+{
+    struct {
+        u64 start, end;
+    } r[MAX_MEM_REGIONS] = {{dram_min, dram_max}};
+    int n = 1;
+    int node = adt_path_offset(adt, "/chosen/carveout-memory-map");
+
+    if (node < 0)
+        bail("ADT: /chosen/carveout-memory-map not found\n");
+
+    ADT_FOREACH_PROPERTY(adt, node, prop)
+    {
+        u64 range[2];
+
+        if (strncmp(prop->name, "region-id-", 10) || prop->size != sizeof(range) ||
+            !strcmp(prop->name, "region-id-24"))
+            continue;
+        memcpy(range, prop->value, sizeof(range));
+        u64 start = range[0], end = range[0] + range[1];
+        if (!range[1])
+            continue;
+        if (!strcmp(prop->name, "region-id-45")) {
+            if (hib_heap_end) {
+                if (heapblock_high_water() > hib_heap_end)
+                    bail("hib: heap 0x%lx past the fixed end 0x%lx\n", heapblock_high_water(),
+                         hib_heap_end);
+                start = max(start, hib_heap_end);
+            } else {
+                start = max(start, ALIGN_UP(heapblock_high_water(), SZ_16K));
+            }
+        }
+
+        for (int i = n - 1; i >= 0; i--) {
+            if (start >= r[i].end || end <= r[i].start)
+                continue;
+            u64 tail = r[i].end;
+            bool head = start > r[i].start;
+            if (head)
+                r[i].end = start;
+            if (end < tail) {
+                if (!head) {
+                    r[i].start = end;
+                } else {
+                    if (n >= MAX_MEM_REGIONS)
+                        bail("FDT: out of memory regions for carveouts\n");
+                    r[n].start = end;
+                    r[n++].end = tail;
+                }
+            } else if (!head) {
+                r[i] = r[--n];
+            }
+        }
+    }
+
+    /* The single pages between carveouts are guards, not RAM. In address order for the log. */
+    fdt64_t *out = reg_out;
+    int out_n = 0;
+    while (true) {
+        int low = -1;
+        for (int i = 0; i < n; i++)
+            if (r[i].end - r[i].start > SZ_16K && (low < 0 || r[i].start < r[low].start))
+                low = i;
+        if (low < 0)
+            break;
+        out[2 * out_n] = cpu_to_fdt64(r[low].start);
+        out[2 * out_n + 1] = cpu_to_fdt64(r[low].end - r[low].start);
+        out_n++;
+        printf("FDT: T6040 RAM 0x%lx..0x%lx\n", r[low].start, r[low].end);
+        r[low] = r[--n];
+    }
+    *count = out_n;
+    return 0;
+}
+
 static int dt_set_memory(void)
 {
     int anode = adt_path_offset(adt, "/chosen");
@@ -912,6 +1056,9 @@ static int dt_set_memory(void)
         fdt64_t size;
     } memreg[MAX_MEM_REGIONS] = {{cpu_to_fdt64(dram_min), cpu_to_fdt64(dram_max - dram_min)}};
     int num_regions = 1;
+
+    if (chip_id == T6040 && dt_t6040_memory_holes(dram_min, dram_max, memreg, &num_regions))
+        return -1;
 
     int resv_node = fdt_path_offset(dt, "/reserved-memory");
     if (resv_node < 0) {
@@ -6634,6 +6781,9 @@ static int dt_set_pmp(void)
     if (chip_id == T8122)
         return 0;
     int pmp_node = fdt_path_offset(dt, "pmp");
+    /* The J616s tree has no pmp alias. */
+    if (pmp_node < 0 && chip_id == T6040)
+        pmp_node = fdt_node_offset_by_compatible(dt, -1, "apple,t6040-pmp-v2");
     if (pmp_node < 0) {
         printf("FDT: pmp not found in devtree\n");
         return 0;
@@ -6668,6 +6818,21 @@ static int dt_set_pmp(void)
         snprintf(prop_name, sizeof(prop_name), "apple,tunable-%s", prop->name);
         if (fdt_setprop(dt, pmp_node, prop_name, prop->value, prop->size))
             bail("FDT: failed to transfer pmp tunable");
+    }
+    if (chip_id == T6040) {
+        /* The optional boot arguments the T6041 PMP driver patches into the firmware. */
+        static const char *const bootargs[] = {"dram-channel-disable", "pmc-msg-disabled",
+                                               "soc-chip-variant"};
+        for (size_t i = 0; i < ARRAY_SIZE(bootargs); i++) {
+            u32 val;
+            char prop_name[64];
+            if (ADT_GETPROP(adt, pmp_iop_anode, bootargs[i], &val) != sizeof(val))
+                continue;
+            snprintf(prop_name, sizeof(prop_name), "apple,%s", bootargs[i]);
+            if (fdt_setprop_u32(dt, pmp_node, prop_name, val))
+                bail("FDT: failed to set pmp boot argument\n");
+        }
+        return 0;
     }
     pmp_node = fdt_path_offset(dt, "pmp");
     fdt_setprop_string(dt, pmp_node, "status", "okay");
@@ -7825,6 +7990,11 @@ void kboot_set_initrd(void *start, size_t size)
     initrd_size = size;
 }
 
+bool kboot_initrd_is(const void *start)
+{
+    return initrd_start == start;
+}
+
 int kboot_set_chosen(const char *name, const char *value)
 {
     int i = 0;
@@ -8152,6 +8322,9 @@ int kboot_prepare_dt(void *fdt)
     // A T6030 also takes its display ADT facts (at most 46K, headers and strings included)
     if (chip_id == T6030)
         dt_bufsize += 4 * SZ_16K;
+    // A T6040 takes its PMP values (about 38K)
+    if (chip_id == T6040)
+        dt_bufsize += 4 * SZ_16K;
     // A T6031 takes its PMP values (32K) and its display, GPU and firmware handoff (about 16K)
     if (chip_id == T6031)
         dt_bufsize += 4 * SZ_16K;
@@ -8193,7 +8366,7 @@ int kboot_prepare_dt(void *fdt)
      * Linux's allocator (J616C: ANS syslog lines in page-cache pages at the SART-allowed heap
      * addresses).
      */
-    if (chip_id == T8140 || chip_id == T6041 || chip_id == T8152 ||
+    if (chip_id == T8140 || chip_id == T6041 || chip_id == T6040 || chip_id == T8152 ||
         (chip_id == T8132 && !fdt_node_check_compatible(dt, 0, "apple,j713"))) {
         u64 ram_end, inherited = cur_boot_args.top_of_kernel_data;
         u64 high_water = heapblock_high_water();
@@ -8208,6 +8381,15 @@ int kboot_prepare_dt(void *fdt)
             bail("FDT: invalid retained memory extent\n");
 
         u64 heap_top = max(inherited, high_water);
+        /* Building this tree still allocates, and dt_set_memory() gives Linux what is above the
+         * high water it sees then. Keep what it will have used. */
+        if (chip_id == T6040 && hib_heap_end) {
+            if (heap_top + 8 * SZ_1M > hib_heap_end)
+                bail("hib: heap 0x%lx too close to the fixed end 0x%lx\n", heap_top, hib_heap_end);
+            heap_top = hib_heap_end;
+        } else if (chip_id == T6040) {
+            heap_top = min(heap_top + 8 * SZ_1M, ram_end);
+        }
         if (heap_top > (u64)_end) {
             if (heap_top > UINT64_MAX - (SZ_16K - 1))
                 bail("FDT: retained heap extent overflows\n");
@@ -8216,6 +8398,7 @@ int kboot_prepare_dt(void *fdt)
             if (heap_end > ram_end || fdt_add_mem_rsv(dt, heap_start, heap_end - heap_start))
                 bail("FDT: couldn't reserve retained heap\n");
             printf("FDT: retained heap [0x%lx, 0x%lx)\n", heap_start, heap_end);
+            retained_heap_end = heap_end;
         }
     }
     if (fdt_add_mem_rsv(dt, (u64)_base, image_end - (u64)_base))
@@ -8225,9 +8408,10 @@ int kboot_prepare_dt(void *fdt)
      * T8152: keep everything below this image as well (the earlier stage and
      * what iBoot placed there), as the host loader did. With that range free,
      * Linux took write permission faults there from secondary cores; the boot
-     * CPU's CTRR registers do not describe it.
+     * CPU's CTRR registers do not describe it. T6040 keeps it as well: iBoot
+     * places the boot object above what it loaded before it.
      */
-    if (chip_id == T8152 && (u64)_base > cur_boot_args.phys_base) {
+    if ((chip_id == T8152 || chip_id == T6040) && (u64)_base > cur_boot_args.phys_base) {
         if (fdt_add_mem_rsv(dt, cur_boot_args.phys_base, (u64)_base - cur_boot_args.phys_base))
             bail("FDT: couldn't reserve the memory below this stage\n");
         printf("FDT: reserved [0x%lx, 0x%lx) below this stage\n", cur_boot_args.phys_base,
@@ -8239,7 +8423,7 @@ int kboot_prepare_dt(void *fdt)
      * Stage 1 read the ESP, so the buffers are in Stage 1's heap, not this one's). Reserve each
      * SART-allowed range inside RAM; the nvme-apple adoption requires them reserved anyway.
      */
-    if (chip_id == T6041 || chip_id == T8142) {
+    if (chip_id == T6041 || chip_id == T6040 || chip_id == T8142) {
         sart_dev_t *sart = sart_init("/arm-io/sart-ans");
         u64 ram_start = cur_boot_args.phys_base;
         u64 ram_end = ram_start + cur_boot_args.mem_size;
@@ -8282,6 +8466,30 @@ int kboot_prepare_dt(void *fdt)
         if (!start || end <= start || fdt_add_mem_rsv(dt, start, end - start))
             bail("FDT: couldn't reserve CTXR_D\n");
         printf("FDT: reserved CTXR_D [0x%lx, 0x%lx)\n", start, end);
+    }
+    /*
+     * T6040 has no firmware RO range of its own below: keep CTXR A to C, the three 16K windows
+     * the secondaries enforce, out of Linux's map as T8140 does.
+     */
+    if (chip_id == T6040 && monitor_required()) {
+        u64 start = mrs(SYS_IMP_APL_CTXR_A_LWR_EL1);
+        u64 end = ALIGN_UP(mrs(SYS_IMP_APL_CTXR_C_UPR_EL1) + 1, SZ_16K);
+        u64 ram_end = cur_boot_args.phys_base + cur_boot_args.mem_size;
+        int resv = fdt_path_offset(dt, "/reserved-memory");
+
+        if (start >= cur_boot_args.phys_base && !(start & (SZ_16K - 1)) &&
+            end == start + 3 * SZ_16K && end <= ram_end && resv >= 0) {
+            char name[48];
+            snprintf(name, sizeof(name), "aura-secondary-ro@%lx", start);
+            int node = fdt_add_subnode(dt, resv, name);
+            fdt64_t reg[] = {cpu_to_fdt64(start), cpu_to_fdt64(end - start)};
+            if (node < 0 || fdt_setprop(dt, node, "reg", reg, sizeof(reg)) ||
+                fdt_setprop_empty(dt, node, "no-map"))
+                bail("FDT: couldn't describe CTXR A-C node\n");
+            printf("FDT: reserved CTXR A-C [0x%lx, 0x%lx)\n", start, end);
+        } else {
+            printf("FDT: CTXR A-C not reserved: 0x%lx..0x%lx\n", start, end);
+        }
     }
     if (nv2_requested() && monitor_required()) {
         u64 base, size;
@@ -8506,6 +8714,9 @@ int kboot_prepare_dt(void *fdt)
             printf("FDT: free dt buffer space low, %u bytes left\n", dt_remain);
     }
 
+    if (chip_id == T6040 && heapblock_high_water() > retained_heap_end)
+        bail("FDT: heap grew past the range kept from Linux\n");
+
     printf("FDT prepared at %p\n", dt);
 
     return 0;
@@ -8591,8 +8802,30 @@ int kboot_boot(void *kernel)
         next_stage.entry = NULL;
         bail("kboot: secondary callback became pending before kernel entry\n");
     }
+    void *handoff_dt = dt;
+    if (hib_dt_base) {
+        /* Last: nothing writes the tree after this copy. */
+        u32 dt_size = fdt_totalsize(dt);
+        uintptr_t high_water = heapblock_high_water();
+        if (dt_size > HIB_DT_SLOT) {
+            next_stage.entry = NULL;
+            bail("hib: device tree (%u bytes) does not fit the fixed slot 0x%lx\n", dt_size,
+                 hib_dt_base);
+        }
+        /* The same margin dt_set_memory() kept: what aura still allocates stays below the end. */
+        if (high_water + 8 * SZ_1M > hib_heap_end) {
+            next_stage.entry = NULL;
+            bail("hib: heap high water 0x%lx too close to the fixed end 0x%lx\n", high_water,
+                 hib_heap_end);
+        }
+        memcpy((void *)hib_dt_base, dt, dt_size);
+        handoff_dt = (void *)hib_dt_base;
+        printf("hib: device tree copied to its fixed slot 0x%lx (%u bytes), heap high water 0x%lx "
+               "of 0x%lx..0x%lx\n",
+               hib_dt_base, dt_size, high_water, hib_heap_base, hib_heap_end);
+    }
     next_stage.entry = kernel;
-    next_stage.args[0] = (u64)dt;
+    next_stage.args[0] = (u64)handoff_dt;
     next_stage.args[1] = 0;
     next_stage.args[2] = 0;
     next_stage.args[3] = 0;

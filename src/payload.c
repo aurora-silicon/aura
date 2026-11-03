@@ -15,11 +15,13 @@
 #include "heapblock.h"
 #include "kboot.h"
 #include "mitigations.h"
+#include "monitor.h"
 #include "nvme.h"
 #include "payload_profile.h"
 #include "smp.h"
 #include "stage1_config.h"
 #include "utils.h"
+#include "xnuboot.h"
 
 #include "libfdt/libfdt.h"
 #include "minilzlib/minlzma.h"
@@ -42,7 +44,11 @@ static const u8 img4_magic[] = {0x16, 0x04, 'I', 'M', 'G', '4'}; // IA5String 'I
 #define PAYLOAD_PREFIX_LEN 5
 static const u8 payload_prefix[PAYLOAD_PREFIX_LEN] = {'a', 'u', 'r', 'a', '_'};
 static const u8 legacy_payload_prefix[PAYLOAD_PREFIX_LEN] = {'m', '1', 'n', '1', '_'};
+/* __PRELINK_INFO follows the raw image in a Mach-O boot object (macho_boot_object.py) */
+static const u8 prelink_xml[] = {'<', '?', 'x', 'm', 'l'};
 static const u8 sig_magic[] = {'s', 'i', 'g'};
+static void *inline_initrd;
+static size_t inline_initrd_size;
 static const u8 initramfs_magic[] = {'i', 'n', 'i', 't', 'r', 'a', 'm', 'f', 's'};
 // followed by size as little endian uint32_t
 static const u8 empty[] = {0, 0, 0, 0};
@@ -164,6 +170,11 @@ static void *load_cpio(void *p, size_t size)
         return NULL;
     }
 
+    /* Remember an initramfs carried in the payload area of the boot object: see payload_run(). */
+    if ((u8 *)p >= (u8 *)_payload_start && (u64)p < cur_boot_args.top_of_kernel_data) {
+        inline_initrd = p;
+        inline_initrd_size = size;
+    }
     kboot_set_initrd(p, size);
     return ((u8 *)p) + size;
 }
@@ -231,8 +242,8 @@ static bool config_seen = false;
 static bool config_lost_passed = false;
 
 static const char *const config_names[] = {
-    "chosen.",  "chainload=",   "boot=", "nvme.adopt=",
-    "display=", "mitigations=", "tso=",  "m1n1.config-lost="};
+    "chosen.", "chainload=",        "boot=", "nvme.adopt=", "display=", "mitigations=",
+    "tso=",    "m1n1.config-lost=", "hib="};
 
 /* The start of a line of a variable m1n1 knows */
 static bool config_line(const char *s)
@@ -323,6 +334,9 @@ static bool check_var(u8 **p)
         mitigations_configure(val);
     } else if (IS_VAR("tso=")) {
         enable_tso = val[0] == '1';
+    } else if (IS_VAR("hib=")) {
+        if (val[0] == '1')
+            kboot_set_hibernate_layout();
     } else {
         printf("Unknown variable %.*s\n", (int)(val - (char *)*p - 1), (char *)*p);
     }
@@ -370,7 +384,7 @@ static void *load_one_payload(void *start, size_t size)
         printf("Found a custom logo payload at %p, skipping 0x%lx bytes\n", p,
                hdr + CUSTOM_LOGO_SIZE);
         return p + hdr + CUSTOM_LOGO_SIZE;
-    } else if (!memcmp(p, empty, sizeof empty) ||
+    } else if (!memcmp(p, empty, sizeof empty) || !memcmp(p, prelink_xml, sizeof prelink_xml) ||
                !memcmp(p + 0x05, img4_magic, sizeof img4_magic)) { // SEPFW after aura
         /* Before check_var(): an end whose bytes also read as a line is still the end */
         printf("No more payloads at %p\n", p);
@@ -523,7 +537,9 @@ int payload_run(void)
     if (kernel && fdt) {
         /* The shared post-M4 U-Boot driver adopts ANS instead of starting it.
          * An inline ESP payload has not gone through boot_storage_load(). */
-        if (chip_id == T8132 && !fdt_node_check_compatible(fdt, 0, "apple,j713") && !nvme_init()) {
+        if (((chip_id == T8132 && !fdt_node_check_compatible(fdt, 0, "apple,j713")) ||
+             chip_id == T6040) &&
+            !nvme_init()) {
             printf("Payload: cannot prepare the M4 ANS session\n");
             goto boot_failed;
         }
@@ -574,6 +590,19 @@ int payload_run(void)
 
         if (config_lost)
             kboot_set_config_lost();
+        /*
+         * When the monitor runs the OS at EL1, an initramfs inside the boot object lies in
+         * CTXR_D. Linux frees it after unpacking, and a secondary that later executes from one of
+         * those pages aborts straight to EL2. Hand Linux a copy from the heap, outside the object,
+         * unless an initramfs loaded from storage has replaced it.
+         */
+        if (inline_initrd && kboot_initrd_is(inline_initrd) && monitor_required()) {
+            void *copy = heapblock_alloc_aligned(inline_initrd_size, SZ_16K);
+            memcpy(copy, inline_initrd, inline_initrd_size);
+            printf("Payload: copied the inline initramfs out of the boot object to %p\n", copy);
+            kboot_set_initrd(copy, inline_initrd_size);
+            inline_initrd = NULL;
+        }
         if (kboot_prepare_dt(fdt)) {
             printf("Failed to prepare FDT!\n");
             goto boot_failed;
@@ -581,13 +610,13 @@ int payload_run(void)
 
         if (kboot_boot(kernel))
             goto boot_failed;
-        if (boot_spec)
+        if (boot_spec || chip_id == T6040)
             nvme_keep_running_for_linux = true;
         return 0;
 
     boot_failed:
         next_stage.entry = NULL;
-        if (boot_spec) {
+        if (boot_spec || chip_id == T6040) {
             kboot_set_initrd(NULL, 0);
             nvme_keep_running_for_linux = false;
             nvme_shutdown();

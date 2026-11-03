@@ -248,6 +248,17 @@ void firmware_parse_version(const char *s, u32 *out)
 
 static void detect_firmware(struct fw_version_info *info, const char *ver)
 {
+    /*
+     * J616s (T6040, board 6): an OS 26.6.2 installed from Recovery reports this OS iBoot, which
+     * the table lists for 26.7. Its GPU and DCP firmware images are the 26.6.2 ones, and the Linux
+     * drivers still check the loaded image themselves, so hand it over under the version they know.
+     */
+    if (chip_id == T6040 && board_id == 6 && !strcmp(ver, "mBoot-18000.161.10.701.1")) {
+        *info = fw_versions[V26_6_2];
+        info->iboot = ver;
+        return;
+    }
+
     for (size_t i = 0; i < ARRAY_SIZE(fw_versions); i++) {
         if (fw_versions[i].iboot && !strcmp(fw_versions[i].iboot, ver)) {
             *info = fw_versions[i];

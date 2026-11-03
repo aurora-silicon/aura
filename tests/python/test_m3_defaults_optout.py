@@ -93,6 +93,7 @@ typedef uint64_t u64;
 #define BUILD_TAG "host-test"
 #define ARRAY_SIZE(s) (sizeof(s) / sizeof((s)[0]))
 #define ALIGN_UP(x, a) (((x) + (a) - 1) & ~((a) - 1))
+#define SZ_16K 0x4000
 ''' + between(header, "struct kernel_header {", "void kboot_set_initrd(") + r'''
 enum { V26_6_2 = 1 };
 static struct { int version; } os_firmware = {V26_6_2};
@@ -179,6 +180,12 @@ static void t6031_gpu_probe(void *d)
         function(gpu, "static int dt_set_gpu_t6031(void *dt)\n{") + r'''
 /* kboot's handoff: /chosen as dt_set_chosen() writes it, then what the GPU code would see */
 static void kboot_set_initrd(void *start, size_t size) {}
+/* An inline initramfs is compared against the payload area and copied only under the monitor */
+static bool monitor_required(void) { return false; }
+static bool kboot_initrd_is(const void *start) { return false; }
+static void kboot_set_hibernate_layout(void) {}
+char _payload_start[1];
+static struct { u64 top_of_kernel_data; } cur_boot_args;
 static int kboot_prepare_dt(void *fdt)
 {
     assert(!fdt_open_into(fdt, dt, sizeof(blob)));
@@ -235,6 +242,7 @@ static bool nvme_keep_running_for_linux;
 static bool nvme_adopt_live_session;
 static int display_configure(const char *s) { printf("DISPLAY %s\n", s); return 0; }
 static int display_configure_second(const char *s) { printf("DISPLAY2 %s\n", s); return 0; }
+#define T6040 0x6040
 #define T8132 0x8132
 static bool nvme_init(void) { printf("NVME init\n"); return true; }
 static void mitigations_configure(const char *s) {}

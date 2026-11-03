@@ -5,6 +5,7 @@
 
 void wdt_disable(void);
 void wdt_reboot(void);
+void wdt_stop(void);
 int wdt_arm_seconds(unsigned seconds);
 /* The longest the 24 MHz counter allows, for each stage of a trial boot */
 #define WDT_TRIAL_SECONDS 178

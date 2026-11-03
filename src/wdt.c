@@ -48,6 +48,13 @@ void wdt_disable(void)
     }
 }
 
+/* Stop the primary watchdog through the base cached at boot (no ADT walk at runtime). */
+void wdt_stop(void)
+{
+    if (wdt_base)
+        write32(wdt_base + WDT_CTL, 0);
+}
+
 void wdt_reboot(void)
 {
     if (!wdt_base)
