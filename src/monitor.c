@@ -23,6 +23,10 @@
 
 void monitor_eret(u64 entry, u64 a0, u64 a1, u64 a2) __attribute__((noreturn));
 
+/* SCTLR_EL1 with only its RES1 bits set: MMU, caches and alignment off, as the
+ * architecture leaves it out of reset and as an OS entry point expects it. */
+#define INIT_SCTLR_EL1_MMU_OFF 0x30d00800UL
+
 static const u32 probe_insns[] = {
     0xd2800020, /* mov x0, #1 */
     0xd65f03c0, /* ret */
@@ -135,5 +139,19 @@ void monitor_enter_os(u64 entry, u64 a0, u64 a1, u64 a2)
     if (nv2_active)
         nv2_enter_os(entry, a0, a1, a2);
     monitor_el2_setup();
+    /*
+     * A core re-entering the OS after a PSCI CPU_OFF (hotplug, or a kexec'd
+     * image) still has the EL1 MMU and TLBs the OS left configured. Linux's
+     * secondary entry and a freshly kexec'd kernel both run with the MMU off,
+     * so reset the OS's EL1 system control register to its MMU-off init value
+     * and drop stale EL1 translations before handing the core over. (NV2 keeps
+     * the EL1 MMU on for the virtual-EL2 guest and returns above.)
+     */
+    msr(SYS_SCTLR_EL12, INIT_SCTLR_EL1_MMU_OFF);
+    sysop("isb");
+    sysop("dsb ish");
+    sysop("tlbi alle1");
+    sysop("dsb ish");
+    sysop("isb");
     monitor_eret(entry, a0, a1, a2);
 }

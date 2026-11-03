@@ -46,7 +46,9 @@ static int mpidr_to_cpu(u64 mpidr)
 {
     mpidr &= 0xffffff;
     for (int i = 0; i < MAX_CPUS; i++)
-        if (smp_is_alive(i) && (smp_get_mpidr(i) & 0xffffff) == mpidr)
+        /* The boot CPU carries a valid MPIDR but is not a parking-pool member
+         * until it offlines itself, so match it explicitly. */
+        if ((smp_is_alive(i) || i == boot_cpu_idx) && (smp_get_mpidr(i) & 0xffffff) == mpidr)
             return i;
     return -1;
 }
@@ -56,6 +58,19 @@ static bool is_self(u64 mpidr)
     return (mpidr & 0xffffff) == (mrs(MPIDR_EL1) & 0xffffff);
 }
 
+/*
+ * Whether a CPU is currently executing the OS. A secondary runs once it has a
+ * dispatched target. The boot CPU runs the OS from the initial handoff and is
+ * not a pool member (no flag) until a CPU_OFF parks it, which clears its target
+ * and makes it a pool member; so it is on unless it has actually parked.
+ */
+static bool cpu_is_on(int cpu)
+{
+    if (cpu == boot_cpu_idx)
+        return !smp_is_alive(cpu) || smp_os_started(cpu);
+    return smp_os_started(cpu);
+}
+
 static s64 psci_cpu_on(u64 mpidr, u64 entry, u64 ctx)
 {
     if (is_self(mpidr))
@@ -63,7 +78,7 @@ static s64 psci_cpu_on(u64 mpidr, u64 entry, u64 ctx)
     int cpu = mpidr_to_cpu(mpidr);
     if (cpu < 0)
         return PSCI_RET_INVALID_PARAMS;
-    if (smp_os_started(cpu))
+    if (cpu_is_on(cpu))
         return PSCI_RET_ALREADY_ON;
     /* Release the parked core into the OS at EL1 (monitor_enter_os), with
      * x0 = context_id. smp_call4 returns once the core has taken the target. */
@@ -80,7 +95,7 @@ static s64 psci_affinity_info(u64 mpidr, u64 level)
     int cpu = mpidr_to_cpu(mpidr);
     if (cpu < 0)
         return PSCI_RET_INVALID_PARAMS;
-    return smp_os_started(cpu) ? PSCI_AFFINITY_ON : PSCI_AFFINITY_OFF;
+    return cpu_is_on(cpu) ? PSCI_AFFINITY_ON : PSCI_AFFINITY_OFF;
 }
 
 static s64 psci_features(u64 fn)
@@ -108,6 +123,15 @@ static s64 psci_features(u64 fn)
 bool psci_handle_smc(u64 *regs)
 {
     u64 fn = regs[0];
+
+    /* SMCCC: an SMC32 call (bit 30 of the function ID clear) passes its
+     * arguments in w1-w6; the upper 32 bits of x1-x6 are UNKNOWN and must be
+     * ignored. Only x1-x3 are consumed here. */
+    if (!(fn & BIT(30))) {
+        regs[1] = (u32)regs[1];
+        regs[2] = (u32)regs[2];
+        regs[3] = (u32)regs[3];
+    }
 
     switch (fn) {
         case PSCI_VERSION:
@@ -141,7 +165,10 @@ bool psci_handle_smc(u64 *regs)
             regs[0] = PSCI_RET_SUCCESS;
             break;
         case PSCI_CPU_OFF:
-            smp_reenter_park(mpidr_to_cpu(mrs(MPIDR_EL1))); /* no return */
+            /* The caller offlines itself: re-park by its own index, never a
+             * reverse MPIDR lookup (the boot CPU is not a pool member and would
+             * resolve to -1). */
+            smp_reenter_park(smp_id()); /* no return */
             break;
         case PSCI_SYSTEM_OFF:
         case PSCI_SYSTEM_RESET:

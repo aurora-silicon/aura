@@ -322,9 +322,15 @@ void __attribute__((noreturn)) smp_park_loop(struct spin_table *me)
 void __attribute__((noreturn)) smp_reenter_park(int index)
 {
     extern void _smp_reenter_park(struct spin_table * me, u64 sp) __attribute__((noreturn));
+    if (index < 0 || index >= MAX_CPUS)
+        panic("SMP: re-park requested for invalid CPU %d\n", index);
     struct spin_table *me = &spin_table[index];
     me->target = 0;
     me->retval = 0;
+    /* The boot CPU is not a pool member until it offlines itself here; give it
+     * a nonzero flag so a later PSCI CPU_ON (smp_call4) can redispatch it. */
+    if (!me->flag)
+        me->flag = 1;
     sysop("dmb sy");
     _smp_reenter_park(me, (u64)secondary_stacks[index] + SECONDARY_STACK_SIZE);
 }
