@@ -23,6 +23,7 @@ def test_native26_admission(tmp_path):
 #include <stdbool.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include "libfdt.h"
 typedef uint64_t u64;
 typedef uint32_t u32;
@@ -32,7 +33,12 @@ typedef uint32_t u32;
 static void *dt;
 static const char *ext26_step;
 ''' + seg_type + page_type + function('dt_ext26_page', 'int') +
-          function('dt_t8122_dcpext_armed', 'bool') + function('dt_ext26_publish', 'int') + function('dt_ext26_result', 'void') + r'''
+          function('dt_t8122_dcpext_armed', 'bool') + function('dt_ext26_publish', 'int') + function('dt_ext26_result', 'void') + function('dt_display_transaction', 'int') + r'''
+static int reject_transaction(unsigned int n) {
+ (void)n; int c=fdt_path_offset(dt,"/chosen");
+ assert(!fdt_setprop_string(dt,c,"partial-test-property","uncommitted"));
+ ext26_step="fixture-rollback"; return -17;
+}
 int main(void) {
  unsigned char blob[8192]; dt=blob;
  assert(!fdt_create_empty_tree(dt,sizeof(blob)));
@@ -78,6 +84,10 @@ int main(void) {
  ext26_step="locked-stream5-pages";dt_ext26_result(-7);
  chosen=fdt_path_offset(dt,"/chosen");
  assert(!strcmp(fdt_getprop(dt,chosen,"asahi,j613-25g83-dcpext-result",NULL),"step=locked-stream5-pages error=-7"));
+ int ret=dt_display_transaction(reject_transaction,0); assert(ret==-17);
+ dt_ext26_result(ret); chosen=fdt_path_offset(dt,"/chosen");
+ assert(!fdt_getprop(dt,chosen,"partial-test-property",NULL));
+ assert(!strcmp(fdt_getprop(dt,chosen,"asahi,j613-25g83-dcpext-result",NULL),"step=fixture-rollback error=-17"));
  external=fdt_path_offset(dt,"dcpext");
  int n;const char *published=fdt_getprop(dt,external,"apple,firmware-uuid",&n);
  assert(published && n==37 && !strcmp(published,uuid));
