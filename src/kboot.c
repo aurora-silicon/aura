@@ -4284,6 +4284,8 @@ static int dt_ext26_snapshot_inner(const char *alias)
     dt_ext26_step("ADT-DART-window");
     u64 window, window_size;
     int adart = adt_path_offset(adt, "/arm-io/dart-dcpext");
+    if (adart < 0 || !adt_is_compatible(adt, adart, "dart,t8110"))
+        return -1;
     if (ADT_GETPROP(adt, adart, "vm-base", &window) != sizeof(window) ||
         ADT_GETPROP(adt, adart, "vm-size", &window_size) != sizeof(window_size))
         return -1;
@@ -4313,14 +4315,17 @@ static int dt_ext26_snapshot_inner(const char *alias)
             return -1;
     /* Reserve every inherited root/leaf page, retaining the public DART view. */
     dt_ext26_step("locked-table-collection");
-    dart_dev_t *view = dart_init_adt_display("/arm-io/dart-dcpext", 0, 5);
     u64 *tables = malloc(2049 * sizeof(*tables));
     size_t count = 0;
     int result = -1;
-    if (!view || !tables)
+    if (!tables) {
+        result = -12;
         goto done;
-    if (dart_collect_locked_tables(view, dram, size, tables, 2049, &count))
+    }
+    result = dart_collect_native_t8110(iommu, 5, dram, size, tables, 2049, &count);
+    if (result)
         goto done;
+    result = -1;
     dt_ext26_step("table-reservations");
     for (size_t i = 0; i < count; i++) {
         char name[64];
@@ -4333,8 +4338,6 @@ static int dt_ext26_snapshot_inner(const char *alias)
     dt_ext26_step("identity-state-publication");
     result = dt_ext26_publish(alias, state, uuid);
 done:
-    if (view)
-        dart_shutdown(view);
     free(tables);
     return result;
 }

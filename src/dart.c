@@ -824,6 +824,70 @@ int dart_collect_locked_tables(dart_dev_t *dart, u64 dram_base, u64 dram_size, u
     return 0;
 }
 
+/* Collect ownership from the same two-level translation accepted by the native
+ * page walker. This does not construct a DART view or write stream state. */
+int dart_collect_native_t8110(uintptr_t base, u8 sid, u64 dram_base, u64 dram_size,
+                              u64 *pages, size_t capacity, size_t *count)
+{
+    if (!count)
+        return -2;
+    *count = 0;
+    if (sid >= 16 || !pages || !capacity || dram_size < SZ_16K ||
+        dram_base + dram_size <= dram_base)
+        return -2;
+    u32 protect = read32(base + DART_T8110_PROTECT);
+    u32 tcr = read32(base + DART_T8110_TCR_OFF + 4 * sid);
+    u32 ttbr = read32(base + DART_T8110_TTBR_OFF + 4 * sid);
+    printf("dart: native table collection sid=%u protect=%x tcr=%x ttbr=%x\n",
+           sid, protect, tcr, ttbr);
+    if (!(protect & DART_T8110_PROTECT_TTBR_TCR) ||
+        !(tcr & DART_T8110_TCR_TRANSLATE_ENABLE) ||
+        (tcr & (DART_T8110_TCR_BYPASS_DART | DART_T8110_TCR_REMAP_EN)) ||
+        !(ttbr & DART_T8110_TTBR_VALID)) {
+        printf("dart: native table collection refused: locked translation control\n");
+        return -3;
+    }
+    u64 root = FIELD_GET(DART_T8110_TTBR_ADDR, ttbr) << DART_T8110_TTBR_SHIFT;
+    if (!dart_table_in_dram(root, dram_base, dram_size)) {
+        printf("dart: native table collection refused: root %lx outside DRAM\n", root);
+        return -4;
+    }
+    u64 entries[SZ_16K / sizeof(u64)];
+    memcpy(entries, (void *)root, sizeof(entries));
+    size_t used = 1;
+    pages[0] = root;
+    for (size_t i = 0; i < ARRAY_SIZE(entries); i++) {
+        if (!(entries[i] & DART_PTE_VALID))
+            continue;
+        u64 page = FIELD_GET(DART_T6000_PTE_OFFSET, entries[i]) << DART_PTE_OFFSET_SHIFT;
+        if (!dart_table_in_dram(page, dram_base, dram_size) || page == root) {
+            printf("dart: native table collection refused: l1[%zu]=%lx page=%lx\n",
+                   i, entries[i], page);
+            return -5;
+        }
+        size_t j;
+        for (j = 0; j < used && pages[j] != page; j++)
+            ;
+        if (j != used)
+            continue;
+        if (used == capacity) {
+            printf("dart: native table collection refused: capacity at l1[%zu]\n", i);
+            return -6;
+        }
+        pages[used++] = page;
+    }
+    if (memcmp(entries, (void *)root, sizeof(entries)) ||
+        read32(base + DART_T8110_PROTECT) != protect ||
+        read32(base + DART_T8110_TCR_OFF + 4 * sid) != tcr ||
+        read32(base + DART_T8110_TTBR_OFF + 4 * sid) != ttbr) {
+        printf("dart: native table collection refused: changed root or controls\n");
+        return -7;
+    }
+    *count = used;
+    printf("dart: native table collection accepted root=%lx pages=%zu\n", root, used);
+    return 0;
+}
+
 int dart_setup_pt_region(dart_dev_t *dart, const char *path, int device, u64 vm_base)
 {
     if (dart->locked && !dart_locked_pt_writable(dart))
