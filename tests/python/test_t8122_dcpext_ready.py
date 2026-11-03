@@ -45,6 +45,11 @@ typedef uint32_t u32;
 #define bail(...) do { return -1; } while (0)
 static void *dt, *adt;
 static u32 chip_id = T8122;
+#define V26_6_2 2662
+static const struct { int version; } os_firmware = {147};
+static void dt_ext26_step(const char *step) { (void)step; }
+static void dt_ext26_result(int error) { (void)error; assert(0 && "native receipt on classic path"); }
+
 static int fault, reservations;
 static unsigned char blob[32768];
 ''' + layout + r'''
