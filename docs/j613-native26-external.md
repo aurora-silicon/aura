@@ -12,8 +12,8 @@ also refuses an unlocked firmware DART; it never locks or resets hardware.
 
 The public locked-DART walker must account for every non-log firmware page
 exactly at its remap address. Inherited root/leaf pages are reserved. Firmware
-text may reuse the exact internal reservation; other overlapping reservations
-are refused. The physical OSLog buffer is retained without an IOMMU mapping.
+text and the OSLog buffer may reuse an exact no-map internal reservation; any
+other overlap, including writable data and heap, is refused. The physical OSLog buffer is retained without an IOMMU mapping.
 
 Only a completed reservation transaction publishes both
 `apple,j613-25g83-dcpext-handoff = <1>` and the existing firmware-ready marker.

@@ -4135,12 +4135,13 @@ static int dt_ext26_snapshot_inner(const char *alias)
     size_t count = 0;
     int result = -1;
     if (!tables) {
-        snprintf(ext26_detail, sizeof(ext26_detail), "substep=allocation expected-bytes=%zu actual=null", 2049 * sizeof(*tables));
+        snprintf(ext26_detail, sizeof(ext26_detail),
+                 "substep=allocation expected-bytes=%zu actual=null", 2049 * sizeof(*tables));
         result = -12;
         goto done;
     }
-    result = dart_collect_native_t8110(iommu, 5, dram, size, tables, 2049, &count,
-                                          ext26_detail, sizeof(ext26_detail));
+    result = dart_collect_native_t8110(iommu, 5, dram, size, tables, 2049, &count, ext26_detail,
+                                       sizeof(ext26_detail));
     if (result)
         goto done;
     result = -1;
@@ -4172,11 +4173,37 @@ static int dt_ext26_snapshot(const char *alias)
     if (exc_count != faults) {
         char prior_detail[sizeof(ext26_detail)];
         memcpy(prior_detail, ext26_detail, sizeof(prior_detail));
-        snprintf(ext26_detail, sizeof(ext26_detail), "substep=guard-fault prior=%.190s", prior_detail);
+        snprintf(ext26_detail, sizeof(ext26_detail), "substep=guard-fault prior=%.190s",
+                 prior_detail);
         printf("FDT: J613 ext26 MMIO fault during %s\n", ext26_step);
         return -1;
     }
     return result;
+}
+
+/*
+ * Find an existing reservation for a native26 segment. Only an exact no-map
+ * match of a segment the internal DCP shares may be reused; any other overlap
+ * is refused with -FDT_ERR_INTERNAL. No overlap returns -FDT_ERR_NOTFOUND.
+ */
+static int dt_ext26_existing_reservation(u64 physical, u64 bytes, bool shared)
+{
+    int parent = fdt_path_offset(dt, "/reserved-memory"), node, found = -FDT_ERR_NOTFOUND;
+    fdt_for_each_subnode(node, dt, parent)
+    {
+        int len;
+        const fdt64_t *reg = fdt_getprop(dt, node, "reg", &len);
+        if (!reg || len != 16)
+            continue;
+        u64 start = fdt64_ld(reg), span = fdt64_ld(reg + 1);
+        if (start >= physical + bytes || physical >= start + span)
+            continue;
+        if (!shared || start != physical || span != bytes || found >= 0 ||
+            !fdt_getprop(dt, node, "no-map", NULL))
+            return -FDT_ERR_INTERNAL;
+        found = node;
+    }
+    return found;
 }
 
 static int dt_ext26_reserve(const char *alias)
@@ -4193,21 +4220,10 @@ static int dt_ext26_reserve(const char *alias)
     for (unsigned int i = 0; i < 4; i++) {
         u64 physical = segments[i].phys;
         u64 bytes = ALIGN_UP((u64)segments[i].size, SZ_16K);
-        int parent = fdt_path_offset(dt, "/reserved-memory"), node, found = -1;
-        fdt_for_each_subnode(node, dt, parent)
-        {
-            int len;
-            const fdt64_t *reg = fdt_getprop(dt, node, "reg", &len);
-            if (!reg || len != 16)
-                continue;
-            u64 start = fdt64_ld(reg), span = fdt64_ld(reg + 1);
-            if (start >= physical + bytes || physical >= start + span)
-                continue;
-            if (start != physical || span != bytes || found >= 0 ||
-                !fdt_getprop(dt, node, "no-map", NULL))
-                return -1;
-            found = node;
-        }
+        /* Only firmware text and the log buffer are shared with the internal DCP. */
+        int found = dt_ext26_existing_reservation(physical, bytes, i == 0 || i == 2);
+        if (found == -FDT_ERR_INTERNAL)
+            return -1;
         if (found < 0) {
             char name[64];
             snprintf(name, sizeof(name), "ext26-%s@%lx", names[i], physical);
