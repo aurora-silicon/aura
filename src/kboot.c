@@ -6634,6 +6634,9 @@ static int dt_set_pmp(void)
     if (chip_id == T8122)
         return 0;
     int pmp_node = fdt_path_offset(dt, "pmp");
+    /* The J616s tree has no pmp alias. */
+    if (pmp_node < 0 && chip_id == T6040)
+        pmp_node = fdt_node_offset_by_compatible(dt, -1, "apple,t6040-pmp-v2");
     if (pmp_node < 0) {
         printf("FDT: pmp not found in devtree\n");
         return 0;
@@ -6668,6 +6671,21 @@ static int dt_set_pmp(void)
         snprintf(prop_name, sizeof(prop_name), "apple,tunable-%s", prop->name);
         if (fdt_setprop(dt, pmp_node, prop_name, prop->value, prop->size))
             bail("FDT: failed to transfer pmp tunable");
+    }
+    if (chip_id == T6040) {
+        /* The optional boot arguments the T6041 PMP driver patches into the firmware. */
+        static const char *const bootargs[] = {"dram-channel-disable", "pmc-msg-disabled",
+                                               "soc-chip-variant"};
+        for (size_t i = 0; i < ARRAY_SIZE(bootargs); i++) {
+            u32 val;
+            char prop_name[64];
+            if (ADT_GETPROP(adt, pmp_iop_anode, bootargs[i], &val) != sizeof(val))
+                continue;
+            snprintf(prop_name, sizeof(prop_name), "apple,%s", bootargs[i]);
+            if (fdt_setprop_u32(dt, pmp_node, prop_name, val))
+                bail("FDT: failed to set pmp boot argument\n");
+        }
+        return 0;
     }
     pmp_node = fdt_path_offset(dt, "pmp");
     fdt_setprop_string(dt, pmp_node, "status", "okay");
@@ -8151,6 +8169,9 @@ int kboot_prepare_dt(void *fdt)
         dt_bufsize += 8 * SZ_16K;
     // A T6030 also takes its display ADT facts (at most 46K, headers and strings included)
     if (chip_id == T6030)
+        dt_bufsize += 4 * SZ_16K;
+    // A T6040 takes its PMP values (about 38K)
+    if (chip_id == T6040)
         dt_bufsize += 4 * SZ_16K;
     // A T6031 takes its PMP values (32K) and its display, GPU and firmware handoff (about 16K)
     if (chip_id == T6031)
