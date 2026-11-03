@@ -8386,6 +8386,30 @@ int kboot_prepare_dt(void *fdt)
             bail("FDT: couldn't reserve CTXR_D\n");
         printf("FDT: reserved CTXR_D [0x%lx, 0x%lx)\n", start, end);
     }
+    /*
+     * T6040 has no firmware RO range of its own below: keep CTXR A to C, the three 16K windows
+     * the secondaries enforce, out of Linux's map as T8140 does.
+     */
+    if (chip_id == T6040 && monitor_required()) {
+        u64 start = mrs(SYS_IMP_APL_CTXR_A_LWR_EL1);
+        u64 end = ALIGN_UP(mrs(SYS_IMP_APL_CTXR_C_UPR_EL1) + 1, SZ_16K);
+        u64 ram_end = cur_boot_args.phys_base + cur_boot_args.mem_size;
+        int resv = fdt_path_offset(dt, "/reserved-memory");
+
+        if (start >= cur_boot_args.phys_base && !(start & (SZ_16K - 1)) &&
+            end == start + 3 * SZ_16K && end <= ram_end && resv >= 0) {
+            char name[48];
+            snprintf(name, sizeof(name), "aura-secondary-ro@%lx", start);
+            int node = fdt_add_subnode(dt, resv, name);
+            fdt64_t reg[] = {cpu_to_fdt64(start), cpu_to_fdt64(end - start)};
+            if (node < 0 || fdt_setprop(dt, node, "reg", reg, sizeof(reg)) ||
+                fdt_setprop_empty(dt, node, "no-map"))
+                bail("FDT: couldn't describe CTXR A-C node\n");
+            printf("FDT: reserved CTXR A-C [0x%lx, 0x%lx)\n", start, end);
+        } else {
+            printf("FDT: CTXR A-C not reserved: 0x%lx..0x%lx\n", start, end);
+        }
+    }
     if (nv2_requested() && monitor_required()) {
         u64 base, size;
         nv2_trace_region(&base, &size);
