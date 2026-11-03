@@ -4008,6 +4008,27 @@ static int dt_ext26_power(const struct pmgr_gate *gate, unsigned int depth)
     return 0;
 }
 
+/* Hold the inherited CPU carrier before Linux's power-domain provider probes. */
+static int dt_ext26_retain_cpu(const char *alias)
+{
+    int ext = fdt_path_offset(dt, alias), len;
+    const fdt32_t *pd = ext < 0 ? NULL : fdt_getprop(dt, ext, "power-domains", &len);
+    if (!pd || len != sizeof(*pd))
+        return -1;
+    int cpu = fdt_node_offset_by_phandle(dt, fdt32_ld(pd));
+    const char *label = cpu < 0 ? NULL : fdt_getprop(dt, cpu, "label", &len);
+    if (!label || len != sizeof("dispext_cpu") || memcmp(label, "dispext_cpu", len) ||
+        fdt_node_check_compatible(dt, cpu, "apple,t8122-pmgr-pwrstate"))
+        return -1;
+    const fdt32_t *reg = fdt_getprop(dt, cpu, "reg", &len);
+    if (!reg || len != 8 || fdt32_ld(reg) != 0x488 || fdt32_ld(reg + 1) != 4)
+        return -1;
+    if (fdt_setprop(dt, cpu, "apple,firmware-owned", NULL, 0))
+        return -1;
+    printf("FDT: J613 ext26 CPU domain retained before Linux PMGR probe; no power/reset write\n");
+    return 0;
+}
+
 static int dt_ext26_publish(const char *alias, const u32 state[4], const char *uuid)
 {
     int node = fdt_path_offset(dt, alias);
@@ -4247,8 +4268,12 @@ static int dt_reserve_dcpext_ready(unsigned int n, const char *marker, bool nati
             ? dt_ext26_reserve(alias)
             : (dt_reserve_asc_firmware(path, NULL, alias, true, 0) || dt_set_dcp_firmware(alias)))
         return -1;
-    if (native)
+    if (native) {
+        dt_ext26_step("CPU-domain-retention");
+        if (dt_ext26_retain_cpu(alias))
+            return -1;
         dt_ext26_step("firmware-ready-publication");
+    }
     int node = fdt_path_offset(dt, alias);
     return node < 0 ? node : fdt_setprop_u32(dt, node, marker, 1);
 }
