@@ -333,10 +333,16 @@ void exc_sync(u64 *regs)
                 msr(ELR_EL2, el1_ret);
                 return;
             case 1:
-                /* End of an nv2_probe_call EL1 stub. */
-                msr(SPSR_EL2, 0x09); // EL2h
-                msr(ELR_EL2, nv2_probe_ret);
-                return;
+                /* End of an nv2_probe_call EL1 stub, but only while a proxy
+                 * probe is actually in flight: a production guest's own hvc #1
+                 * must not be redirected into proxy-only code. */
+                if (nv2_probe_active) {
+                    msr(SPSR_EL2, 0x09); // EL2h
+                    msr(ELR_EL2, nv2_probe_ret);
+                    return;
+                }
+                printf("Unknown HVC: 0x%x\n", imm);
+                break;
             case 0x10 ... 0x1f:
                 if (!(exc_guard & GUARD_SILENT))
                     printf("EL1 Exception: 0x%x\n", imm);
@@ -378,6 +384,19 @@ void exc_sync(u64 *regs)
 
     if (nv2_active)
         nv2_note_unhandled(esr, elr, spsr);
+
+    /*
+     * Under the monitor, a synchronous trap from the OS (a lower EL) that the
+     * monitor does not itself service is the OS's own to handle: reflect it as
+     * an UNDEF into the OS instead of taking down the whole machine. The
+     * monitor's own EL2 faults and active proxy guards still fall through to
+     * the recovery logic below.
+     */
+    if (monitor_active && !in_gl && !el3 && !(spsr & 0x8) &&
+        (exc_guard & GUARD_TYPE_MASK) == GUARD_OFF) {
+        monitor_reflect_undef(elr, spsr);
+        return;
+    }
 
     if (!(exc_guard & GUARD_SILENT))
         print_regs(regs, el12);
