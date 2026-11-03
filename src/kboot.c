@@ -26,8 +26,10 @@
 #include "mcc.h"
 #include "memory.h"
 #include "monitor.h"
+#include "nv2.h"
 #include "pcie.h"
 #include "pmgr.h"
+#include "pv_kvm.h"
 #include "rtkit.h"
 #include "sart.h"
 #include "sep.h"
@@ -1672,6 +1674,26 @@ static int dt_set_cpus(void)
     if (cpus < 0)
         bail("FDT: /cpus node not found in devtree\n");
 
+    /* When the monitor runs the OS at EL1 it owns the secondary pool and
+     * services PSCI over SMC; expose a /psci node and switch the cpus below
+     * from spin-table to it. Without the monitor the OS boots at EL2 and keeps
+     * spin-table. */
+    bool psci = monitor_required();
+    if (psci) {
+        int node = fdt_path_offset(dt, "/psci");
+        if (node < 0)
+            node = fdt_add_subnode(dt, 0, "psci");
+        if (node < 0 || fdt_setprop_string(dt, node, "compatible", "arm,psci-1.0") ||
+            fdt_appendprop_string(dt, node, "compatible", "arm,psci-0.2") ||
+            fdt_setprop_string(dt, node, "method", "smc") ||
+            fdt_setprop_string(dt, node, "status", "okay"))
+            bail("FDT: couldn't set up the /psci node\n");
+        /* The offset may have moved. */
+        cpus = fdt_path_offset(dt, "/cpus");
+        if (cpus < 0)
+            bail("FDT: /cpus node not found in devtree\n");
+    }
+
     uint32_t *pruned_phandles = calloc(MAX_CPUS, sizeof(uint32_t));
     size_t pruned = 0;
     if (!pruned_phandles)
@@ -1693,8 +1715,16 @@ static int dt_set_cpus(void)
 
         u64 dt_mpidr = fdt64_ld(prop);
 
-        if (dt_mpidr == (mrs(MPIDR_EL1) & 0xFFFFFF))
+        if (dt_mpidr == (mrs(MPIDR_EL1) & 0xFFFFFF)) {
+            /* cpuidle-psci only binds when every CPU, the boot CPU included,
+             * uses PSCI. */
+            if (psci) {
+                fdt_delprop(dt, node, "cpu-release-addr");
+                if (fdt_setprop_string(dt, node, "enable-method", "psci"))
+                    bail_cleanup("FDT: couldn't set cpu enable-method to psci\n");
+            }
             goto next_cpu;
+        }
 
         /*
          * DT and ADT CPU numbering can differ: J616s has no ADT cpu9, while
@@ -1724,11 +1754,17 @@ static int dt_set_cpus(void)
         }
 
         u64 mpidr = smp_get_mpidr(idx);
-        u64 release_addr = smp_get_release_addr(idx);
-        if (fdt_setprop_inplace_u64(dt, node, "cpu-release-addr", release_addr))
-            bail_cleanup("FDT: couldn't set cpu-release-addr property\n");
-
-        printf("FDT: CPU %d MPIDR=0x%lx release-addr=0x%lx\n", cpu, mpidr, release_addr);
+        if (psci) {
+            fdt_delprop(dt, node, "cpu-release-addr");
+            if (fdt_setprop_string(dt, node, "enable-method", "psci"))
+                bail_cleanup("FDT: couldn't set cpu enable-method to psci\n");
+            printf("FDT: CPU %d MPIDR=0x%lx psci\n", cpu, mpidr);
+        } else {
+            u64 release_addr = smp_get_release_addr(idx);
+            if (fdt_setprop_inplace_u64(dt, node, "cpu-release-addr", release_addr))
+                bail_cleanup("FDT: couldn't set cpu-release-addr property\n");
+            printf("FDT: CPU %d MPIDR=0x%lx release-addr=0x%lx\n", cpu, mpidr, release_addr);
+        }
 
     next_cpu:
         cpu++;
@@ -8017,12 +8053,17 @@ int kboot_prepare_dt(void *fdt)
 
     /* Need to init ISP early to carve out heap */
     isp_init();
+    /* Likewise the NV pages, before the retained heap extent is fixed. */
+    if (nv2_requested() && monitor_required())
+        nv2_prepare();
 
     dt_bufsize = fdt_totalsize(fdt);
     assert(dt_bufsize);
 
     dt_bufsize += 6 * SZ_16K; // Add 96K of buffer for modifications
     dt_bufsize += SZ_16K;     // and the SMBIOS description U-Boot builds its tables from (about 6K)
+    if (pv_kvm_requested())
+        dt_bufsize += SZ_16K;
     // A T6030 or T8122 also takes its PMP values
     if (chip_id == T6030 || chip_id == T8122)
         dt_bufsize += 2 * SZ_16K;
@@ -8162,6 +8203,17 @@ int kboot_prepare_dt(void *fdt)
         if (!start || end <= start || fdt_add_mem_rsv(dt, start, end - start))
             bail("FDT: couldn't reserve CTXR_D\n");
         printf("FDT: reserved CTXR_D [0x%lx, 0x%lx)\n", start, end);
+    }
+    if (nv2_requested() && monitor_required()) {
+        u64 base, size;
+        nv2_trace_region(&base, &size);
+        if (size) {
+            char name[40];
+            snprintf(name, sizeof(name), "nv2-trace@%lx", base);
+            if (dt_get_or_add_reserved_mem(name, "aura,nv2-trace", true, base, size) < 0)
+                bail("FDT: couldn't reserve the NV2 trace ring\n");
+            printf("FDT: NV2 trace ring at [0x%lx, 0x%lx)\n", base, base + size);
+        }
     }
 
     if (chip_id == T8140) {
@@ -8318,6 +8370,23 @@ int kboot_prepare_dt(void *fdt)
         return -1;
     if (dt_set_smbios_firmware())
         return -1;
+
+    if (pv_kvm_requested()) {
+        int hypervisor = fdt_path_offset(dt, "/hypervisor");
+        if (hypervisor < 0)
+            hypervisor = fdt_add_subnode(dt, 0, "hypervisor");
+        if (hypervisor < 0 ||
+            fdt_setprop_string(dt, hypervisor, "compatible", "aurora,aura-kvm-pv-0") ||
+            fdt_setprop_string(dt, hypervisor, "method", "hvc") ||
+            fdt_setprop_u32(dt, hypervisor, "abi-major", AURA_PV_ABI_MAJOR) ||
+            fdt_setprop_u32(dt, hypervisor, "abi-minor", AURA_PV_ABI_MINOR) ||
+            fdt_setprop_u32(dt, hypervisor, "uid-function", AURA_PV_FUNC_UID) ||
+            fdt_setprop_u32(dt, hypervisor, "version-function", AURA_PV_FUNC_VERSION) ||
+            fdt_setprop_u32(dt, hypervisor, "caps-function", AURA_PV_FUNC_GET_CAPS) ||
+            fdt_setprop_u32(dt, hypervisor, "run-function", AURA_PV_FUNC_RUN) ||
+            fdt_setprop_u32(dt, hypervisor, "el1-step-function", AURA_PV_FUNC_EL1_STEP))
+            bail("FDT: couldn't describe Aura PV-KVM\n");
+    }
 
     /* Last, so that its 15K never takes room the steps above need. */
     if (dt_set_pmp_t6030())

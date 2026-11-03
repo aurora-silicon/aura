@@ -6,6 +6,7 @@
 #include "exception.h"
 #include "malloc.h"
 #include "memory.h"
+#include "nv2.h"
 #include "smp.h"
 #include "soc.h"
 #include "string.h"
@@ -22,6 +23,10 @@
 
 void monitor_eret(u64 entry, u64 a0, u64 a1, u64 a2) __attribute__((noreturn));
 
+/* SCTLR_EL1 with only its RES1 bits set: MMU, caches and alignment off, as the
+ * architecture leaves it out of reset and as an OS entry point expects it. */
+#define INIT_SCTLR_EL1_MMU_OFF 0x30d00800UL
+
 static const u32 probe_insns[] = {
     0xd2800020, /* mov x0, #1 */
     0xd65f03c0, /* ret */
@@ -35,7 +40,8 @@ bool monitor_required(void)
     if (required >= 0)
         return required;
     required = 0;
-    if (chip_id != T8140)
+    /* T8142 (M5, J813) confines its secondaries the same way. */
+    if (chip_id != T8140 && chip_id != T8142)
         return false;
 
     int cpu;
@@ -73,10 +79,13 @@ bool monitor_required(void)
  * up: it has no SVE, GCS, MTE, MPAM, AMU, SPE, TRBE or BRBE, and its PMU is
  * IMPDEF, which HACR_EL2 leaves to EL1.
  */
-void monitor_enter_os(u64 entry, u64 a0, u64 a1, u64 a2)
+void monitor_el2_setup(void)
 {
     /* No stage 2. IRQ, FIQ, SError and external aborts all go to EL1. */
-    reg_clr(HCR_EL2, HCR_TGE | HCR_AMO | HCR_IMO | HCR_FMO | HCR_TEA | HCR_VM);
+    reg_clr(HCR_EL2,
+            HCR_TGE | HCR_AMO | HCR_IMO | HCR_FMO | HCR_TEA | HCR_VM | HCR_NV | HCR_NV1 | HCR_NV2);
+    /* Trap SMC to the monitor for PSCI (Apple has no EL3). */
+    reg_set(HCR_EL2, HCR_TSC);
     msr(VTTBR_EL2, 0);
     msr(HACR_EL2, 0);
     msr(HSTR_EL2, 0);
@@ -122,6 +131,27 @@ void monitor_enter_os(u64 entry, u64 a0, u64 a1, u64 a2)
     if (FIELD_GET(ID_AA64MMFR1_LO, mmfr1))
         msr(SYS_LORC_EL1, 0);
 
+    sysop("isb");
+}
+
+void monitor_enter_os(u64 entry, u64 a0, u64 a1, u64 a2)
+{
+    if (nv2_active)
+        nv2_enter_os(entry, a0, a1, a2);
+    monitor_el2_setup();
+    /*
+     * A core re-entering the OS after a PSCI CPU_OFF (hotplug, or a kexec'd
+     * image) still has the EL1 MMU and TLBs the OS left configured. Linux's
+     * secondary entry and a freshly kexec'd kernel both run with the MMU off,
+     * so reset the OS's EL1 system control register to its MMU-off init value
+     * and drop stale EL1 translations before handing the core over. (NV2 keeps
+     * the EL1 MMU on for the virtual-EL2 guest and returns above.)
+     */
+    msr(SYS_SCTLR_EL12, INIT_SCTLR_EL1_MMU_OFF);
+    sysop("isb");
+    sysop("dsb ish");
+    sysop("tlbi alle1");
+    sysop("dsb ish");
     sysop("isb");
     monitor_eret(entry, a0, a1, a2);
 }

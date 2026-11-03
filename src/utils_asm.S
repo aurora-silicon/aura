@@ -172,3 +172,9 @@ _deep_wfi_helper:
     ldp x30, x0, [sp], #16
 
     ret
+
+.globl _smp_reenter_park
+.type _smp_reenter_park, @function
+_smp_reenter_park:
+    mov sp, x1
+    b smp_park_loop
