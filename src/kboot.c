@@ -59,6 +59,7 @@
 
 static void *dt = NULL;
 static int dt_bufsize = 0;
+static u64 retained_heap_end;
 static void *initrd_start = NULL;
 static size_t initrd_size = 0;
 static char *chosen_params[MAX_CHOSEN_PARAMS][2];
@@ -877,6 +878,78 @@ static int dt_set_uboot_config(void)
     return 0;
 }
 
+/*
+ * J616s (T6040): the carveouts iBoot lists inside usable RAM are left out of it, as the J616s
+ * m4-loader does: Linux has not been run with them as RAM. Region 24 is usable RAM itself. Region
+ * 45 holds this stage and its heap, so only its part above the heap is left out.
+ */
+static int dt_t6040_memory_holes(u64 dram_min, u64 dram_max, void *reg_out, int *count)
+{
+    struct {
+        u64 start, end;
+    } r[MAX_MEM_REGIONS] = {{dram_min, dram_max}};
+    int n = 1;
+    int node = adt_path_offset(adt, "/chosen/carveout-memory-map");
+
+    if (node < 0)
+        bail("ADT: /chosen/carveout-memory-map not found\n");
+
+    ADT_FOREACH_PROPERTY(adt, node, prop)
+    {
+        u64 range[2];
+
+        if (strncmp(prop->name, "region-id-", 10) || prop->size != sizeof(range) ||
+            !strcmp(prop->name, "region-id-24"))
+            continue;
+        memcpy(range, prop->value, sizeof(range));
+        u64 start = range[0], end = range[0] + range[1];
+        if (!range[1])
+            continue;
+        if (!strcmp(prop->name, "region-id-45"))
+            start = max(start, ALIGN_UP(heapblock_high_water(), SZ_16K));
+
+        for (int i = n - 1; i >= 0; i--) {
+            if (start >= r[i].end || end <= r[i].start)
+                continue;
+            u64 tail = r[i].end;
+            bool head = start > r[i].start;
+            if (head)
+                r[i].end = start;
+            if (end < tail) {
+                if (!head) {
+                    r[i].start = end;
+                } else {
+                    if (n >= MAX_MEM_REGIONS)
+                        bail("FDT: out of memory regions for carveouts\n");
+                    r[n].start = end;
+                    r[n++].end = tail;
+                }
+            } else if (!head) {
+                r[i] = r[--n];
+            }
+        }
+    }
+
+    /* The single pages between carveouts are guards, not RAM. In address order for the log. */
+    fdt64_t *out = reg_out;
+    int out_n = 0;
+    while (true) {
+        int low = -1;
+        for (int i = 0; i < n; i++)
+            if (r[i].end - r[i].start > SZ_16K && (low < 0 || r[i].start < r[low].start))
+                low = i;
+        if (low < 0)
+            break;
+        out[2 * out_n] = cpu_to_fdt64(r[low].start);
+        out[2 * out_n + 1] = cpu_to_fdt64(r[low].end - r[low].start);
+        out_n++;
+        printf("FDT: T6040 RAM 0x%lx..0x%lx\n", r[low].start, r[low].end);
+        r[low] = r[--n];
+    }
+    *count = out_n;
+    return 0;
+}
+
 static int dt_set_memory(void)
 {
     int anode = adt_path_offset(adt, "/chosen");
@@ -912,6 +985,9 @@ static int dt_set_memory(void)
         fdt64_t size;
     } memreg[MAX_MEM_REGIONS] = {{cpu_to_fdt64(dram_min), cpu_to_fdt64(dram_max - dram_min)}};
     int num_regions = 1;
+
+    if (chip_id == T6040 && dt_t6040_memory_holes(dram_min, dram_max, memreg, &num_regions))
+        return -1;
 
     int resv_node = fdt_path_offset(dt, "/reserved-memory");
     if (resv_node < 0) {
@@ -8229,6 +8305,10 @@ int kboot_prepare_dt(void *fdt)
             bail("FDT: invalid retained memory extent\n");
 
         u64 heap_top = max(inherited, high_water);
+        /* Building this tree still allocates, and dt_set_memory() gives Linux what is above the
+         * high water it sees then. Keep what it will have used. */
+        if (chip_id == T6040)
+            heap_top = min(heap_top + 8 * SZ_1M, ram_end);
         if (heap_top > (u64)_end) {
             if (heap_top > UINT64_MAX - (SZ_16K - 1))
                 bail("FDT: retained heap extent overflows\n");
@@ -8237,6 +8317,7 @@ int kboot_prepare_dt(void *fdt)
             if (heap_end > ram_end || fdt_add_mem_rsv(dt, heap_start, heap_end - heap_start))
                 bail("FDT: couldn't reserve retained heap\n");
             printf("FDT: retained heap [0x%lx, 0x%lx)\n", heap_start, heap_end);
+            retained_heap_end = heap_end;
         }
     }
     if (fdt_add_mem_rsv(dt, (u64)_base, image_end - (u64)_base))
@@ -8246,9 +8327,10 @@ int kboot_prepare_dt(void *fdt)
      * T8152: keep everything below this image as well (the earlier stage and
      * what iBoot placed there), as the host loader did. With that range free,
      * Linux took write permission faults there from secondary cores; the boot
-     * CPU's CTRR registers do not describe it.
+     * CPU's CTRR registers do not describe it. T6040 keeps it as well: iBoot
+     * places the boot object above what it loaded before it.
      */
-    if (chip_id == T8152 && (u64)_base > cur_boot_args.phys_base) {
+    if ((chip_id == T8152 || chip_id == T6040) && (u64)_base > cur_boot_args.phys_base) {
         if (fdt_add_mem_rsv(dt, cur_boot_args.phys_base, (u64)_base - cur_boot_args.phys_base))
             bail("FDT: couldn't reserve the memory below this stage\n");
         printf("FDT: reserved [0x%lx, 0x%lx) below this stage\n", cur_boot_args.phys_base,
@@ -8526,6 +8608,9 @@ int kboot_prepare_dt(void *fdt)
         if (dt_remain < SZ_16K)
             printf("FDT: free dt buffer space low, %u bytes left\n", dt_remain);
     }
+
+    if (chip_id == T6040 && heapblock_high_water() > retained_heap_end)
+        bail("FDT: heap grew past the range kept from Linux\n");
 
     printf("FDT prepared at %p\n", dt);
 

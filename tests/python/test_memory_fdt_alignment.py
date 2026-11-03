@@ -21,6 +21,9 @@ def test_reserved_memory_reg_alignment(tmp_path):
 typedef unsigned long u64;
 _Static_assert(sizeof(u64) == 8, "the aura host fixture requires an LP64 host");
 #define MAX_MEM_REGIONS 32
+#define T6040 0x6040
+static const unsigned chip_id = 0x8103;
+#define dt_t6040_memory_holes(...) 0
 #define bail(...) do { printf(__VA_ARGS__); return -1; } while (0)
 static _Alignas(8) unsigned char blob[8192];
 static void *dt = blob, *adt;
