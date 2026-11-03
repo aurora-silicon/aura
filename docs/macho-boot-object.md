@@ -73,7 +73,9 @@ On T8140 the windows change where a secondary can execute:
 An OS therefore cannot run at EL2 in this mode. Aura stays at EL2 as a
 monitor and enters the OS at EL1 on every CPU (`src/monitor.c`). At kboot,
 `monitor_required()` asks a secondary to run two instructions from the heap
-and uses EL1 only if that faults. There is no build option. When it does
+and uses EL1 only if that faults. The probe runs on every chip, not on a list
+of chips: a Mac without the windows (M1 to M3, or any raw boot object) runs it
+and keeps the OS at EL2. There is no build option. When it does
 use EL1, kboot reserves `CTXR_D` so Linux never allocates from it.
 `monitor_enter_os()` leaves EL2 the way the kernel's `init_el2_state` and
 `finalise_el2_state` would, for the features this chip has, so the OS takes

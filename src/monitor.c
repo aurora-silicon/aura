@@ -32,7 +32,13 @@ static const u32 probe_insns[] = {
     0xd65f03c0, /* ret */
 };
 
-/* Ask a secondary to run code outside the boot object. */
+/*
+ * Ask a secondary to run code outside the boot object. This is the whole test:
+ * it is not limited to the chips where the confinement was first seen (T8140,
+ * then T8142), because any Mac whose iBoot entered a kcbz-0 boot object may
+ * leave the windows armed, and one that did not (M1 to M3, or a raw boot
+ * object) runs the probe and keeps the OS at EL2.
+ */
 bool monitor_required(void)
 {
     static int required = -1;
@@ -40,9 +46,6 @@ bool monitor_required(void)
     if (required >= 0)
         return required;
     required = 0;
-    /* T8142 (M5, J813) confines its secondaries the same way. */
-    if (chip_id != T8140 && chip_id != T8142)
-        return false;
 
     int cpu;
     for (cpu = 0; cpu < MAX_CPUS; cpu++)
@@ -61,6 +64,7 @@ bool monitor_required(void)
     sysop("isb");
 
     u64 ret = 0;
+    exc_last_esr = 0;
     exc_guard = GUARD_RETURN | GUARD_SILENT;
     if (!smp_call1(cpu, probe, 0))
         smp_wait(cpu, &ret);
@@ -69,7 +73,9 @@ bool monitor_required(void)
 
     required = ret != 1;
     if (required)
-        printf("monitor: secondaries are confined at EL2, entering the OS at EL1\n");
+        printf("monitor: CPU %d could not run the heap probe (ESR 0x%lx): secondaries are "
+               "confined at EL2, entering the OS at EL1\n",
+               cpu, exc_last_esr);
     return required;
 }
 
