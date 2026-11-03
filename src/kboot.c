@@ -4144,7 +4144,212 @@ static int dt_display_transaction(int (*apply)(unsigned int), unsigned int index
 #define T8122_DCPEXT_READY "apple,t8122-dcpext-firmware-ready"
 #define T8132_DCPEXT_READY "apple,t8132-dcpext-firmware-ready"
 
-static int dt_reserve_dcpext_ready(unsigned int n, const char *marker)
+/* Native26 validates the inherited stream using the public locked-DART walker. */
+struct dt_ext26_pages {
+    const struct adt_segment_ranges *segments;
+    u64 seen[4];
+};
+
+static int dt_ext26_page(u64 iova, u64 physical, void *cookie)
+{
+    struct dt_ext26_pages *p = cookie;
+    for (unsigned int index = 0; index < 4; index++) {
+        const struct adt_segment_ranges *s = p->segments + index;
+        u64 bytes = ALIGN_UP((u64)s->size, SZ_16K);
+        u64 start = s->remap & ((1UL << 36) - 1);
+        if (index == 2 || iova < start || iova - start >= bytes)
+            continue;
+        if (physical != s->phys + iova - start)
+            return -1;
+        p->seen[index] += SZ_16K;
+        return 0;
+    }
+    return -1;
+}
+
+/* No power or DART writes: an unlocked inherited stream is refused. */
+static int dt_ext26_power(const struct pmgr_gate *gate, unsigned int depth)
+{
+    if (!gate->found || depth == 16)
+        return -1;
+    if (!gate->virt) {
+        if (!gate->psreg)
+            return -1;
+        u32 state = read32(gate->psreg);
+        if (((state >> 4) & 15) != 15 && !((state & BIT(28)) && (state & 15) == 15))
+            return -1;
+    }
+    for (unsigned int parent = 0; parent < 2; parent++) {
+        struct pmgr_gate ancestor;
+        u16 id = gate->parent[parent];
+        if (!id || id == gate->id)
+            continue;
+        if (pmgr_device_gate(gate->die, id, &ancestor) || dt_ext26_power(&ancestor, depth + 1))
+            return -1;
+    }
+    return 0;
+}
+
+static int dt_ext26_snapshot_inner(const char *alias)
+{
+    int panel = fdt_path_offset(dt, "dcp"), ext = fdt_path_offset(dt, alias), length;
+    if (panel < 0 || !fdt_getprop(dt, panel, "apple,j613-25g83-mapping-handoff", NULL))
+        return 0; /* The unchanged classic reservation path. */
+    if (ext < 0 || chip_id != T8122 || os_firmware.version != V26_6_2 ||
+        fdt_node_check_compatible(dt, 0, "apple,j613") || strcmp(alias, "dcpext"))
+        return -1;
+    int nub = adt_path_offset(adt, "/arm-io/dcpext/iop-dcpext-nub");
+    u32 bytes, loaded;
+    if (nub < 0)
+        return -1;
+    const struct adt_segment_ranges *segments = adt_getprop(adt, nub, "segment-ranges", &bytes);
+    const char *uuid = adt_getprop(adt, nub, "uuid", &loaded);
+    if (!segments || bytes != 4 * sizeof(*segments) || !uuid ||
+        loaded != sizeof("C042E95C-B9D8-3F0E-94B3-582A08AA6FDD") ||
+        memcmp(uuid, "C042E95C-B9D8-3F0E-94B3-582A08AA6FDD", loaded) ||
+        ADT_GETPROP(adt, nub, "pre-loaded", &loaded) != sizeof(loaded) || loaded != 1)
+        return -1;
+    const u32 flags[] = {1, 0, 10, 2};
+    for (unsigned int i = 0; i < 4; i++)
+        if (segments[i].unk != flags[i])
+            return -1;
+    /* Require the complete power ancestry before reading processor MMIO. */
+    struct pmgr_gate gate;
+    unsigned int gates = 0;
+    while (!pmgr_adt_gate("/arm-io/dcpext", "clock-gates", gates, &gate)) {
+        if (gates++ == 16 || dt_ext26_power(&gate, 0))
+            return -1;
+    }
+    if (!gates)
+        return -1;
+    u64 coproc, span, iommu;
+    int path[8];
+    if (adt_path_offset_trace(adt, "/arm-io/dcpext", path) < 0 ||
+        adt_get_reg(adt, path, "reg", 0, &coproc, &span) ||
+        adt_path_offset_trace(adt, "/arm-io/dart-dcpext", path) < 0 ||
+        adt_get_reg(adt, path, "reg", 0, &iommu, &span))
+        return -1;
+    const fdt64_t *reg = fdt_getprop(dt, ext, "reg", &length);
+    if (!reg || length < 16 || fdt64_ld(reg) != coproc)
+        return -1;
+    int provider = dt_get_iommu_node(ext, 0);
+    reg = provider < 0 ? NULL : fdt_getprop(dt, provider, "reg", &length);
+    if (!reg || length < 16 || fdt64_ld(reg) != iommu)
+        return -1;
+    u64 window, window_size;
+    int adart = adt_path_offset(adt, "/arm-io/dart-dcpext");
+    if (ADT_GETPROP(adt, adart, "vm-base", &window) != sizeof(window) ||
+        ADT_GETPROP(adt, adart, "vm-size", &window_size) != sizeof(window_size))
+        return -1;
+    const fdt64_t *range = fdt_getprop(dt, provider, "apple,dma-range", &length);
+    if (!range || length != 16 || fdt64_ld(range) != window || fdt64_ld(range + 1) != window_size)
+        return -1;
+    u32 state[4] = {1, read32(coproc + 0x44), read32(coproc + 0x48), read32(iommu + 0x200)};
+    if (!(state[3] & 1))
+        return -1;
+    int chosen = adt_path_offset(adt, "/chosen");
+    u64 dram, size;
+    if (chosen < 0 || ADT_GETPROP(adt, chosen, "dram-base", &dram) != sizeof(dram) ||
+        ADT_GETPROP(adt, chosen, "dram-size", &size) != sizeof(size))
+        return -1;
+    struct dt_ext26_pages maps = {.segments = segments};
+    if (dart_walk_locked_t8110(iommu, 5, dram, size, dt_ext26_page, &maps))
+        return -1;
+    for (unsigned int i = 0; i < 4; i++)
+        if (i != 2 && maps.seen[i] != ALIGN_UP((u64)segments[i].size, SZ_16K))
+            return -1;
+    /* Reserve every inherited root/leaf page, retaining the public DART view. */
+    dart_dev_t *view = dart_init_adt_display("/arm-io/dart-dcpext", 0, 5);
+    u64 *tables = malloc(2049 * sizeof(*tables));
+    size_t count = 0;
+    int result = -1;
+    if (!view || !tables)
+        goto done;
+    if (dart_collect_locked_tables(view, dram, size, tables, 2049, &count))
+        goto done;
+    for (size_t i = 0; i < count; i++) {
+        char name[64];
+        snprintf(name, sizeof(name), "dcpext26-tables@%lx", tables[i]);
+        if (dt_get_or_add_reserved_mem(name, "apple,asc-mem", true, tables[i], SZ_16K) < 0)
+            goto done;
+    }
+    for (unsigned int i = 0; i < 4; i++)
+        state[i] = cpu_to_fdt32(state[i]);
+    ext = fdt_path_offset(dt, alias);
+    if (fdt_setprop(dt, ext, "apple,j613-25g83-dcpext-boot-state", state, sizeof(state)))
+        goto done;
+    ext = fdt_path_offset(dt, alias);
+    result = fdt_setprop_u32(dt, ext, "apple,j613-25g83-dcpext-handoff", 1);
+done:
+    if (view)
+        dart_shutdown(view);
+    free(tables);
+    return result;
+}
+
+static int dt_ext26_snapshot(const char *alias)
+{
+    int previous = exc_guard;
+    int faults = exc_count;
+    exc_guard = GUARD_MARK | GUARD_SILENT;
+    int result = dt_ext26_snapshot_inner(alias);
+    sysop("dsb sy");
+    sysop("isb");
+    exc_guard = previous;
+    return exc_count == faults ? result : -1;
+}
+
+static int dt_ext26_reserve(const char *alias)
+{
+    int nub = adt_path_offset(adt, "/arm-io/dcpext/iop-dcpext-nub");
+    u32 length;
+    const struct adt_segment_ranges *segments = adt_getprop(adt, nub, "segment-ranges", &length);
+    int owner = fdt_path_offset(dt, alias);
+    u32 phandle = fdt_get_phandle(dt, owner);
+    if (!phandle &&
+        (fdt_generate_phandle(dt, &phandle) || fdt_setprop_u32(dt, owner, "phandle", phandle)))
+        return -1;
+    const char *names[] = {"asc-firmware", "dcp_data", "os_log", "heap"};
+    for (unsigned int i = 0; i < 4; i++) {
+        u64 physical = segments[i].phys;
+        u64 bytes = ALIGN_UP((u64)segments[i].size, SZ_16K);
+        int parent = fdt_path_offset(dt, "/reserved-memory"), node, found = -1;
+        fdt_for_each_subnode(node, dt, parent)
+        {
+            int len;
+            const fdt64_t *reg = fdt_getprop(dt, node, "reg", &len);
+            if (!reg || len != 16)
+                continue;
+            u64 start = fdt64_ld(reg), span = fdt64_ld(reg + 1);
+            if (start >= physical + bytes || physical >= start + span)
+                continue;
+            if (start != physical || span != bytes || found >= 0 ||
+                !fdt_getprop(dt, node, "no-map", NULL))
+                return -1;
+            found = node;
+        }
+        if (found < 0) {
+            char name[64];
+            snprintf(name, sizeof(name), "ext26-%s@%lx", names[i], physical);
+            found = dt_get_or_add_reserved_mem(name, "apple,asc-mem", true, physical, bytes);
+        }
+        if (found < 0)
+            return -1;
+        u32 mem = fdt_get_phandle(dt, found);
+        if (!mem)
+            return -1;
+        if (i != 2 &&
+            dt_device_set_reserved_mem(found, names[i], phandle, segments[i].remap, bytes))
+            return -1;
+        if (i == 2 && fdt_getprop(dt, found, "iommu-addresses", NULL))
+            return -1;
+        if (dt_device_add_mem_region(alias, mem, names[i]))
+            return -1;
+    }
+    return dt_set_dcp_firmware(alias);
+}
+
+static int dt_reserve_dcpext_ready(unsigned int n, const char *marker, bool native26)
 {
     if (n >= ARRAY_SIZE(dcpext_aliases))
         return -1;
@@ -4169,7 +4374,15 @@ static int dt_reserve_dcpext_ready(unsigned int n, const char *marker)
             segments[i].remap > UINT64_MAX - size)
             return -1;
     }
-    if (dt_reserve_asc_firmware(path, NULL, alias, true, 0) || dt_set_dcp_firmware(alias))
+    /* Only T8122 can take the J613 native26 path; J713 keeps the shared reservation. */
+    if (native26 && dt_ext26_snapshot(alias))
+        return -1;
+    int ext = fdt_path_offset(dt, alias);
+    bool native =
+        native26 && ext >= 0 && fdt_getprop(dt, ext, "apple,j613-25g83-dcpext-handoff", NULL);
+    if (native
+            ? dt_ext26_reserve(alias)
+            : (dt_reserve_asc_firmware(path, NULL, alias, true, 0) || dt_set_dcp_firmware(alias)))
         return -1;
     int node = fdt_path_offset(dt, alias);
     return node < 0 ? node : fdt_setprop_u32(dt, node, marker, 1);
@@ -4177,7 +4390,7 @@ static int dt_reserve_dcpext_ready(unsigned int n, const char *marker)
 
 static int dt_reserve_t8122_dcpext_one(unsigned int n)
 {
-    return dt_reserve_dcpext_ready(n, T8122_DCPEXT_READY);
+    return dt_reserve_dcpext_ready(n, T8122_DCPEXT_READY, true);
 }
 
 static int dt_reserve_j713_dcpext_one(unsigned int n)
@@ -4196,7 +4409,7 @@ static int dt_reserve_j713_dcpext_one(unsigned int n)
     if (!uuid || len != 37 || uuid[len - 1] || node < 0 ||
         fdt_setprop_string(dt, node, "apple,firmware-uuid", uuid))
         return -1;
-    return dt_reserve_dcpext_ready(n, T8132_DCPEXT_READY);
+    return dt_reserve_dcpext_ready(n, T8132_DCPEXT_READY, false);
 }
 
 /*
@@ -4286,11 +4499,15 @@ static bool dt_t8122_dcpext_armed(void)
     int chosen = fdt_path_offset(dt, "/chosen");
     int len = 0;
     const char *opt = chosen < 0 ? NULL : fdt_getprop(dt, chosen, "asahi,t8122-dcpext", &len);
+    int panel = fdt_path_offset(dt, "dcp");
+    bool native = panel >= 0 && fdt_getprop(dt, panel, "apple,j613-25g83-mapping-handoff", NULL);
+    if (native)
+        opt = chosen < 0 ? NULL : fdt_getprop(dt, chosen, "asahi,j613-25g83-dcpext", &len);
 
     if (!opt || len != 2 || opt[0] != '1' || opt[1] != '\0')
         return false;
     int dcp = fdt_path_offset(dt, "dcp");
-    return dcp >= 0 && fdt_getprop(dt, dcp, "apple,t8122-handoff", NULL);
+    return native || (dcp >= 0 && fdt_getprop(dt, dcp, "apple,t8122-handoff", NULL));
 }
 
 /*
