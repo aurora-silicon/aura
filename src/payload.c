@@ -15,11 +15,13 @@
 #include "heapblock.h"
 #include "kboot.h"
 #include "mitigations.h"
+#include "monitor.h"
 #include "nvme.h"
 #include "payload_profile.h"
 #include "smp.h"
 #include "stage1_config.h"
 #include "utils.h"
+#include "xnuboot.h"
 
 #include "libfdt/libfdt.h"
 #include "minilzlib/minlzma.h"
@@ -45,6 +47,8 @@ static const u8 legacy_payload_prefix[PAYLOAD_PREFIX_LEN] = {'m', '1', 'n', '1',
 /* __PRELINK_INFO follows the raw image in a Mach-O boot object (macho_boot_object.py) */
 static const u8 prelink_xml[] = {'<', '?', 'x', 'm', 'l'};
 static const u8 sig_magic[] = {'s', 'i', 'g'};
+static void *inline_initrd;
+static size_t inline_initrd_size;
 static const u8 initramfs_magic[] = {'i', 'n', 'i', 't', 'r', 'a', 'm', 'f', 's'};
 // followed by size as little endian uint32_t
 static const u8 empty[] = {0, 0, 0, 0};
@@ -166,6 +170,11 @@ static void *load_cpio(void *p, size_t size)
         return NULL;
     }
 
+    /* Remember an initramfs carried in the payload area of the boot object: see payload_run(). */
+    if ((u8 *)p >= (u8 *)_payload_start && (u64)p < cur_boot_args.top_of_kernel_data) {
+        inline_initrd = p;
+        inline_initrd_size = size;
+    }
     kboot_set_initrd(p, size);
     return ((u8 *)p) + size;
 }
@@ -578,6 +587,19 @@ int payload_run(void)
 
         if (config_lost)
             kboot_set_config_lost();
+        /*
+         * When the monitor runs the OS at EL1, an initramfs inside the boot object lies in
+         * CTXR_D. Linux frees it after unpacking, and a secondary that later executes from one of
+         * those pages aborts straight to EL2. Hand Linux a copy from the heap, outside the object,
+         * unless an initramfs loaded from storage has replaced it.
+         */
+        if (inline_initrd && kboot_initrd_is(inline_initrd) && monitor_required()) {
+            void *copy = heapblock_alloc_aligned(inline_initrd_size, SZ_16K);
+            memcpy(copy, inline_initrd, inline_initrd_size);
+            printf("Payload: copied the inline initramfs out of the boot object to %p\n", copy);
+            kboot_set_initrd(copy, inline_initrd_size);
+            inline_initrd = NULL;
+        }
         if (kboot_prepare_dt(fdt)) {
             printf("Failed to prepare FDT!\n");
             goto boot_failed;

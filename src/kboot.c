@@ -7919,6 +7919,11 @@ void kboot_set_initrd(void *start, size_t size)
     initrd_size = size;
 }
 
+bool kboot_initrd_is(const void *start)
+{
+    return initrd_start == start;
+}
+
 int kboot_set_chosen(const char *name, const char *value)
 {
     int i = 0;
