@@ -23,6 +23,11 @@
  *
  * Linux (pcie-apple's T6050 adoption) then takes each link as is: no RID route, the endpoint's
  * command register clear, DART untouched (stage G).
+ *
+ * Bus numbers are Linux's: its PCI core renumbers every root port's secondary bus, 1, 2, ... in
+ * devfn (port) order over the root ports that answer config space. Bring-up numbers each port as it
+ * trains; once every port has been tried, the up ports are renumbered that way (pcie_t6050_init),
+ * and the handed-over tree is made to match (pcie_t6050_handoff_fdt).
  */
 
 #define T6050_GP_PORTS 4
@@ -32,15 +37,14 @@
  * SMC function-reset (port 0: the N1, gP13) has it released before its link comes up. */
 static const struct t6050_port {
     int port;
-    int bus; /* its root port's secondary bus */
     u32 endpoint_id[2]; /* function 0's vendor/device; the second, if set, an alternative */
     const char *endpoint;
     bool required;
 } ports[] = {
-    {2, 1, {0x812710ec}, "RTL8127A", true},
-    {3, 2, {0x21421b21}, "ASM3142 xHCI", false},
+    {2, {0x812710ec}, "RTL8127A", true},
+    {3, {0x21421b21}, "ASM3142 xHCI", false},
     /* The N1's control function: 1900 in its ROM personality, 1901 once its firmware runs */
-    {0, 3, {0x1900106b, 0x1901106b}, "N1 Wi-Fi/Bluetooth", false},
+    {0, {0x1900106b, 0x1901106b}, "N1 Wi-Fi/Bluetooth", false},
 };
 
 /* apcie0 "reg": shared windows, then six per port */
@@ -109,6 +113,7 @@ struct port_regs {
     u64 perst;
     u32 refclk_to_perst_us;
     u64 dart;
+    u32 bus; /* its root port's secondary bus, once numbered (F) */
     bool up;
 };
 static struct port_regs pr[ARRAY_SIZE(ports)];
@@ -200,9 +205,7 @@ static int find_regs(void)
     if (ADT_GETPROP(adt, node, "lane-cfg", &lane_cfg) < 0 || lane_cfg)
         FAIL("lane-cfg is not 0\n");
 
-    int max_bus = 0;
-    for (size_t i = 0; i < ARRAY_SIZE(ports); i++)
-        max_bus = max(max_bus, ports[i].bus);
+    int max_bus = T6050_GP_PORTS; /* one secondary bus per root port */
     u64 unused;
     struct {
         u64 *dst, *span;
@@ -553,11 +556,31 @@ static int stage_e(const struct port_regs *pp)
     return 0;
 }
 
+/* Whether an up port's root port has secondary bus `bus` */
+static bool bus_taken(u32 bus)
+{
+    for (size_t i = 0; i < ARRAY_SIZE(ports); i++)
+        if (pr[i].up && pr[i].bus == bus)
+            return true;
+    return false;
+}
+
+/* Number a root port's buses: primary 0, secondary and subordinate `bus` */
+static int set_bus(u64 rp, u32 bus)
+{
+    u32 want = (read32(rp + PCI_PRIMARY_BUS) & 0xff000000) | (bus << 16) | (bus << 8);
+
+    write32(rp + PCI_PRIMARY_BUS, want);
+    if (read32(rp + PCI_PRIMARY_BUS) != want)
+        FAIL("bus numbers did not take\n");
+    return 0;
+}
+
 /* F: bus numbers and the endpoint's ID */
-static int stage_f(const struct port_regs *pp)
+static int stage_f(struct port_regs *pp)
 {
     u64 p2 = pp->ctl, rp = pp->rp;
-    u32 bus = pp->p->bus;
+    u32 bus = 0;
 
     if (!(read32(p2 + PORT_STATUS) & BIT(0)) || !(read32(p2 + PORT_LINKSTS) & BIT(0)))
         FAIL("port not ready or link down\n");
@@ -565,15 +588,20 @@ static int stage_f(const struct port_regs *pp)
     TRY(cap);
     u16 lnksta = read16(rp + cap + PCI_EXP_LNKSTA);
     printf("pcie-t6050: port %d link Gen%d x%d\n", pp->p->port, lnksta & 0xf, (lnksta >> 4) & 0x3f);
+    /* An adopted port keeps its number; a new one takes the lowest no up port has. Either may
+     * change when the up ports are renumbered (pcie_t6050_init). */
     u32 buses = read32(rp + PCI_PRIMARY_BUS);
-    if (!((buses >> 8) & 0xff)) {
-        u32 want = (buses & 0xff000000) | (bus << 16) | (bus << 8);
-        write32(rp + PCI_PRIMARY_BUS, want);
-        if (read32(rp + PCI_PRIMARY_BUS) != want)
-            FAIL("bus numbers did not take\n");
-    } else if (((buses >> 8) & 0xff) != bus) {
-        FAIL("secondary bus is %d, not %d\n", (buses >> 8) & 0xff, bus);
+    if ((buses >> 8) & 0xff) {
+        bus = (buses >> 8) & 0xff;
+        if ((buses & 0xff) || ((buses >> 16) & 0xff) != bus || bus > T6050_GP_PORTS ||
+            bus_taken(bus))
+            FAIL("found bus numbers 0x%06x\n", buses & 0xffffff);
+    } else {
+        for (bus = 1; bus_taken(bus); bus++)
+            ;
+        TRY(set_bus(rp, bus));
     }
+    pp->bus = bus;
     u32 id = read32(r.ecam + ((u64)bus << 20));
     if (id != pp->p->endpoint_id[0] && (!pp->p->endpoint_id[1] || id != pp->p->endpoint_id[1]))
         FAIL("endpoint %02x:00.0 is 0x%08x\n", bus, id);
@@ -591,7 +619,7 @@ static int stage_g(const struct port_regs *pp)
             FAIL("RID route %d is already valid\n", i);
     /* Every function present (the N1 is multi-function): no decoding, no bus mastering */
     for (int fn = 0; fn < 8; fn++) {
-        u64 cfg = r.ecam + ((u64)pp->p->bus << 20) + ((u64)fn << 12);
+        u64 cfg = r.ecam + ((u64)pp->bus << 20) + ((u64)fn << 12);
         if (read32(cfg) == 0xffffffff)
             continue;
         if (read32(cfg + PCI_COMMAND) & 7)
@@ -623,8 +651,31 @@ static int port_up(struct port_regs *pp)
     TRY(stage_f(pp));
     TRY(storage_check("after F", false));
     TRY(stage_g(pp));
-    printf("pcie-t6050: port %d up, %s at %02x:00.0\n", pp->p->port, pp->p->endpoint, pp->p->bus);
+    printf("pcie-t6050: port %d up, %s at %02x:00.0\n", pp->p->port, pp->p->endpoint, pp->bus);
     pp->up = true;
+    return 0;
+}
+
+/* Renumber the up ports' secondary buses as Linux will: 1, 2, ... in devfn order over every root
+ * port that answers config space, which includes a port that stopped after it was enabled (Linux
+ * numbers that one itself). Nothing reaches config space while two root ports briefly share a
+ * number (Linux renumbers the same way). */
+static int number_like_linux(void)
+{
+    u32 bus = 0;
+
+    for (int port = 0; port < T6050_GP_PORTS; port++) {
+        if (read32(r.ecam + ((u64)port << 15)) == 0xffffffff) /* 00:<port>.0 */
+            continue;
+        bus++;
+        for (size_t i = 0; i < ARRAY_SIZE(ports); i++) {
+            if (ports[i].port != port || !pr[i].up || pr[i].bus == bus)
+                continue;
+            TRY(set_bus(pr[i].rp, bus));
+            printf("pcie-t6050: port %d renumbered to bus %02x, as Linux numbers it\n", port, bus);
+            pr[i].bus = bus;
+        }
+    }
     return 0;
 }
 
@@ -671,24 +722,9 @@ int pcie_t6050_init(void)
             printf("pcie-t6050: port %d left down\n", ports[i].port);
         }
     }
+    TRY(number_like_linux());
     state = 0;
     return 0;
-}
-
-/* The DART that apcie0's iommu-map names for RID `rid`, or a negative libfdt error */
-static int iommu_for_rid(void *dt, int host, u32 rid)
-{
-    int len;
-    const fdt32_t *map = fdt_getprop(dt, host, "iommu-map", &len);
-
-    if (!map || len % (4 * sizeof(*map)))
-        return -FDT_ERR_BADVALUE;
-    for (int pos = 0; pos + 4 <= len / (int)sizeof(*map); pos += 4) {
-        u32 base = fdt32_ld(&map[pos]), count = fdt32_ld(&map[pos + 3]);
-        if (rid >= base && rid - base < count)
-            return fdt_node_offset_by_phandle(dt, fdt32_ld(&map[pos + 1]));
-    }
-    return -FDT_ERR_NOTFOUND;
 }
 
 /* The ADT's local tunable records: offset, size, mask, value */
@@ -741,45 +777,141 @@ static int copy_port_tunables(void *dt, int rp, const struct port_regs *pp)
     return 0;
 }
 
-/* Disable each optional port that is not up in the handed-over tree: its root port node
- * (pci@<port>,0) and the DART its secondary bus maps to. Linux probes an enabled DART whether or
- * not the port trained, and an untrained port's DART takes an SError. */
+/* apcie0's node and port `port`'s root port node (pci@<port>,0), looked up afresh after each edit
+ * (an edit that resizes a property moves the nodes after it) */
+static int t6050_host(void *dt)
+{
+    return fdt_node_offset_by_compatible(dt, -1, "apple,t6050-pcie");
+}
+
+static int t6050_port_node(void *dt, int port)
+{
+    char name[16];
+    int host = t6050_host(dt);
+
+    snprintf(name, sizeof(name), "pci@%d,0", port);
+    return host < 0 ? host : fdt_subnode_offset(dt, host, name);
+}
+
+/* Set the status of port `i`'s root port node and of the DART with phandle `dart` */
+static int t6050_port_status(void *dt, size_t i, u32 dart, const char *status)
+{
+    int rp = t6050_port_node(dt, ports[i].port);
+
+    if (rp < 0 || fdt_setprop_string(dt, rp, "status", status))
+        return -1;
+    int node = fdt_node_offset_by_phandle(dt, dart);
+    return node < 0 || fdt_setprop_string(dt, node, "status", status) ? -1 : 0;
+}
+
+/* Renumber an up port's root port node to bus `bus`: its bus-range and its functions' reg */
+static int t6050_port_renumber(void *dt, int rp, u32 bus)
+{
+    fdt32_t br[2] = {cpu_to_fdt32(bus), cpu_to_fdt32(bus)};
+    int child;
+
+    if (fdt_setprop_inplace(dt, rp, "bus-range", br, sizeof(br)))
+        return -1;
+    fdt_for_each_subnode(child, dt, rp)
+    {
+        int len;
+        const fdt32_t *reg = fdt_getprop(dt, child, "reg", &len);
+        if (!reg || len < 4)
+            return -1;
+        u32 hi = (fdt32_ld(reg) & ~0xff0000u) | bus << 16;
+        fdt32_t cell = cpu_to_fdt32(hi);
+        if (fdt_setprop_inplace_namelen_partial(dt, child, "reg", 3, 0, &cell, 4))
+            return -1;
+    }
+    return 0;
+}
+
+/*
+ * Make the handed-over tree match the ports as they are. The tree numbers each root port node's
+ * bus (its bus-range, its functions' reg, its apcie0 iommu-map entry) for the ports a default boot
+ * brings up; Linux numbers the buses itself (see the top of this file). So:
+ *  - an up port gets the bus it has now (pcie_t6050_init numbered it as Linux will), its root port
+ *    node and its DART enabled, and its link tunables (copy_port_tunables);
+ *  - an optional port that is down gets its root port node and its DART disabled, and its iommu-map
+ *    entry dropped: Linux probes an enabled DART whether or not the port trained, and an untrained
+ *    port's DART takes an SError.
+ */
 int pcie_t6050_handoff_fdt(void *dt)
 {
-    int host = fdt_node_offset_by_compatible(dt, -1, "apple,t6050-pcie");
+    struct {
+        u32 bus, dart; /* the tree's bus for the port, and its DART's phandle */
+    } tp[ARRAY_SIZE(ports)] = {};
+    fdt32_t map[4 * 8];
+    int host = t6050_host(dt), len;
 
     if (host < 0)
         return 0;
+    const fdt32_t *m = fdt_getprop(dt, host, "iommu-map", &len);
+    if (!m || len % 16 || len > (int)sizeof(map)) {
+        printf("pcie-t6050: apcie0's iommu-map is missing or too long\n");
+        return -1;
+    }
+    memcpy(map, m, len);
+    int n = len / 16;
+
     for (size_t i = 0; i < ARRAY_SIZE(ports); i++) {
-        char name[16];
-        snprintf(name, sizeof(name), "pci@%d,0", ports[i].port);
-        int rp = fdt_subnode_offset(dt, host, name);
+        int rp = t6050_port_node(dt, ports[i].port);
+        if (rp == -FDT_ERR_NOTFOUND) {
+            printf("pcie-t6050: port %d %s and not in the tree\n", ports[i].port,
+                   pr[i].up ? "up" : "down");
+            continue;
+        }
+        const fdt32_t *br = rp < 0 ? NULL : fdt_getprop(dt, rp, "bus-range", &len);
+        if (br && len == 8 && fdt32_ld(&br[0]) == fdt32_ld(&br[1]))
+            tp[i].bus = fdt32_ld(&br[0]);
+        for (int k = 0; tp[i].bus && k < n; k++)
+            if (fdt32_ld(&map[4 * k]) == tp[i].bus << 8)
+                tp[i].dart = fdt32_ld(&map[4 * k + 1]);
+        if (!tp[i].bus || !tp[i].dart) {
+            printf("pcie-t6050: port %d: the tree gives it no bus-range or no iommu-map entry\n",
+                   ports[i].port);
+            return -1;
+        }
+    }
+
+    /* The iommu-map: an up port's entry moves to its bus, a down port's goes */
+    int out = 0;
+    for (int k = 0; k < n; k++) {
+        u32 base = fdt32_ld(&map[4 * k]);
+        bool keep = true;
+        for (size_t i = 0; i < ARRAY_SIZE(ports); i++) {
+            if (!tp[i].bus || base != tp[i].bus << 8)
+                continue;
+            keep = pr[i].up;
+            map[4 * k] = cpu_to_fdt32(pr[i].bus << 8);
+            break;
+        }
+        if (keep)
+            memmove(&map[4 * out++], &map[4 * k], 16);
+    }
+    if (fdt_setprop(dt, t6050_host(dt), "iommu-map", map, out * 16))
+        return -1;
+
+    for (size_t i = 0; i < ARRAY_SIZE(ports); i++) {
+        if (!tp[i].bus)
+            continue;
         if (pr[i].up) {
-            if (rp >= 0 && copy_port_tunables(dt, rp, &pr[i])) {
-                printf("pcie-t6050: port %d: could not copy its tunables\n", ports[i].port);
+            int rp = t6050_port_node(dt, ports[i].port);
+            if (rp < 0 || t6050_port_renumber(dt, rp, pr[i].bus) ||
+                copy_port_tunables(dt, rp, &pr[i]) ||
+                t6050_port_status(dt, i, tp[i].dart, "okay")) {
+                printf("pcie-t6050: port %d: could not describe it in the tree\n", ports[i].port);
                 return -1;
             }
-            continue;
+            if (pr[i].bus != tp[i].bus)
+                printf("pcie-t6050: port %d: the tree's bus %02x is now %02x\n", ports[i].port,
+                       tp[i].bus, pr[i].bus);
+        } else if (!ports[i].required) {
+            if (t6050_port_status(dt, i, tp[i].dart, "disabled"))
+                return -1;
+            printf("pcie-t6050: port %d down: disabled pci@%d,0 and its DART in the DT\n",
+                   ports[i].port, ports[i].port);
         }
-        if (ports[i].required)
-            continue;
-        int dart = iommu_for_rid(dt, host, (u32)ports[i].bus << 8);
-        /* A port the tree describes needs both; one it does not (no root port, no iommu-map entry)
-         * is not Linux's to probe, and nothing is disabled for it */
-        if (rp == -FDT_ERR_NOTFOUND && dart == -FDT_ERR_NOTFOUND) {
-            printf("pcie-t6050: port %d down and not in the tree\n", ports[i].port);
-            continue;
-        }
-        if (rp < 0 || dart < 0) {
-            printf("pcie-t6050: port %d down, but its %s is not in the tree\n", ports[i].port,
-                   rp < 0 ? "root port" : "DART");
-            return -1;
-        }
-        if (fdt_setprop_string(dt, rp, "status", "disabled") ||
-            fdt_setprop_string(dt, dart, "status", "disabled"))
-            return -1;
-        printf("pcie-t6050: port %d down: disabled %s and its DART in the DT\n", ports[i].port,
-               name);
     }
     return 0;
 }
