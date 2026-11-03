@@ -3982,6 +3982,17 @@ static int dt_ext26_power(const struct pmgr_gate *gate, unsigned int depth)
     return 0;
 }
 
+static int dt_ext26_publish(const char *alias, const u32 state[4], const char *uuid)
+{
+    int node = fdt_path_offset(dt, alias);
+    if (node < 0 ||
+        fdt_setprop(dt, node, "apple,j613-25g83-dcpext-boot-state", state, 4 * sizeof(*state)) ||
+        fdt_setprop_string(dt, node, "apple,firmware-uuid", uuid))
+        return -1;
+    node = fdt_path_offset(dt, alias);
+    return node < 0 ? -1 : fdt_setprop_u32(dt, node, "apple,j613-25g83-dcpext-handoff", 1);
+}
+
 static int dt_ext26_snapshot_inner(const char *alias)
 {
     int panel = fdt_path_offset(dt, "dcp"), ext = fdt_path_offset(dt, alias), length;
@@ -4067,11 +4078,7 @@ static int dt_ext26_snapshot_inner(const char *alias)
     }
     for (unsigned int i = 0; i < 4; i++)
         state[i] = cpu_to_fdt32(state[i]);
-    ext = fdt_path_offset(dt, alias);
-    if (fdt_setprop(dt, ext, "apple,j613-25g83-dcpext-boot-state", state, sizeof(state)))
-        goto done;
-    ext = fdt_path_offset(dt, alias);
-    result = fdt_setprop_u32(dt, ext, "apple,j613-25g83-dcpext-handoff", 1);
+    result = dt_ext26_publish(alias, state, uuid);
 done:
     if (view)
         dart_shutdown(view);
