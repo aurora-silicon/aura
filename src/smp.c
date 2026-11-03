@@ -200,6 +200,27 @@ static int smp_prepare_rvbar(const struct cpu_info *cpu)
     /* A stage that moved above the chainloaded image keeps entry at its old base. */
     if (relocated_from && locked == old_vectors_start())
         return 0;
+    /*
+     * Mach-O boot object: an iBoot that does not take the vector address from the object (kcev)
+     * may lock RVBAR at the object's load base, its Mach-O header, 64K below the raw image.
+     * Forward from there with a branch over the header.
+     */
+    u32 hop = 0x14000000 | ((target - locked) >> 2);
+    if (chip_id == T6040 && (rvbar & RVBAR_LOCK) && target - locked == 0x10000 &&
+        read32(locked) == hop)
+        return 0;
+    if (chip_id == T6040 && (rvbar & RVBAR_LOCK) && target - locked == 0x10000 &&
+        read32(locked) == 0xfeedfacf) {
+        mmu_add_mapping(locked, locked, SZ_16K, MAIR_IDX_NORMAL, PERM_RW);
+        write32(locked, hop);
+        dc_cvac_range((void *)locked, sizeof(hop));
+        ic_ivau_range((void *)locked, sizeof(hop));
+        sysop("dsb sy");
+        sysop("isb");
+        mmu_add_mapping(locked, locked, SZ_16K, MAIR_IDX_NORMAL, PERM_RX);
+        printf("SMP: RVBAR at the load base 0x%lx, forwarded to 0x%lx\n", locked, target);
+        return read32(locked) == hop ? 0 : -1;
+    }
     if (chip_id != T8140 || !(rvbar & RVBAR_LOCK)) {
         printf("SMP: RVBAR 0x%lx differs from vector 0x%lx; refusing start\n", locked, target);
         return -1;
