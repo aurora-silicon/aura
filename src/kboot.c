@@ -1679,8 +1679,13 @@ static int dt_prune_cpu_cooling(void *fdt, const u32 *pruned, const u32 *pruned_
         int len;
         const fdt32_t *list = fdt_getprop(fdt, node, "cooling-device", &len);
         if (list) {
-            if (len <= 0 || len % sizeof(*list))
-                return -FDT_ERR_BADVALUE;
+            char path[256];
+            if (fdt_get_path(fdt, node, path, sizeof(path)))
+                snprintf(path, sizeof(path), "node at offset %d", node);
+            if (len <= 0 || len % sizeof(*list)) {
+                printf("FDT: %s: malformed cooling-device, leaving unchanged\n", path);
+                goto next;
+            }
             fdt32_t *kept = malloc(len);
             if (!kept)
                 return -FDT_ERR_NOSPACE;
@@ -1705,7 +1710,9 @@ static int dt_prune_cpu_cooling(void *fdt, const u32 *pruned, const u32 *pruned_
                 }
                 if (!phandle || args == UINT32_MAX || args > count - i - 1) {
                     free(kept);
-                    return -FDT_ERR_BADVALUE;
+                    printf("FDT: %s: invalid cooling specifier or unknown cell count, "
+                           "leaving unchanged\n", path);
+                    goto next;
                 }
                 size_t cells = 1 + args;
                 if (drop) {
@@ -1717,20 +1724,23 @@ static int dt_prune_cpu_cooling(void *fdt, const u32 *pruned, const u32 *pruned_
                 i += cells;
             }
             if (changed) {
-                /* An empty map no longer describes a cooling action. Refuse
-                 * to publish it rather than silently drop thermal policy. */
+                /* Keep the zone and its trips even when this map has no
+                 * remaining cooling action. */
                 int ret = used
                               ? fdt_setprop(fdt, node, "cooling-device", kept, used * sizeof(*kept))
-                              : -FDT_ERR_BADVALUE;
+                              : fdt_delprop(fdt, node, "cooling-device");
                 free(kept);
                 if (ret)
                     return ret;
+                if (!used)
+                    printf("FDT: %s: removed empty cooling-device\n", path);
             } else {
                 free(kept);
             }
         } else if (len != -FDT_ERR_NOTFOUND) {
             return len;
         }
+    next:
         node = fdt_next_node(fdt, node, &depth);
     }
     return node == -FDT_ERR_NOTFOUND || depth < 0 ? 0 : node;
@@ -1818,8 +1828,9 @@ static int dt_set_cpus(void)
         bail_cleanup("FDT: error iterating through CPUs\n");
     }
 
-    if (dt_prune_cpu_cooling(dt, pruned_phandles, pruned_cooling_cells, pruned))
-        bail_cleanup("FDT: could not prune CPU cooling references\n");
+    int cooling_ret = dt_prune_cpu_cooling(dt, pruned_phandles, pruned_cooling_cells, pruned);
+    if (cooling_ret)
+        printf("FDT: could not prune CPU cooling references (%d), continuing\n", cooling_ret);
 
     /* Prune AIC PMU affinities */
     int aic = fdt_node_offset_by_compatible(dt, -1, "apple,aic");
