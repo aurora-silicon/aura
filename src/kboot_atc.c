@@ -1022,7 +1022,14 @@ static const struct j614s_atc_tunable j614s_atc_tunables[] = {
     {"tunable_LINK_REGS_DEFAULT", "apple,tunable-link", "dwc3-apple", 0, 0x300, 0x800, true, true},
 };
 
-static const char *const j614s_phys[] = {"/phy@382a90000", "/phy@38aa90000", "/phy@392a90000"};
+static bool j614s_hdmi_ready;
+static const char *const j614s_phys[] = {"/phy@382a90000", "/phy@38aa90000",
+                                        "/phy@392a90000", "/phy@39aa90000"};
+
+bool kboot_j614s_hdmi_ready(void)
+{
+    return j614s_hdmi_ready;
+}
 static const char *const j614s_controllers[] = {"/usb@382280000", "/usb@38a280000",
                                                 "/usb@392280000"};
 
@@ -1042,20 +1049,28 @@ static int j614s_export_atc(void *dt, int port)
 {
     char adt_path[32];
     const char *phy_path = j614s_phys[port];
-    const char *usb_path = j614s_controllers[port];
-    int phy, usb, source, usb_source;
+    const char *usb_path = port < 3 ? j614s_controllers[port] : NULL;
+    int phy, usb = -1, source, usb_source = -1;
 
     phy = fdt_path_offset(dt, phy_path);
     snprintf(adt_path, sizeof(adt_path), "/arm-io/atc-phy%d", port);
     source = adt_path_offset(adt, adt_path);
     if (phy < 0 || source < 0 || fdt_node_check_compatible(dt, phy, "apple,t6040-atcphy"))
         return -1;
-    usb = fdt_path_offset(dt, usb_path);
-    snprintf(adt_path, sizeof(adt_path), "/arm-io/usb-drd%d", port);
-    usb_source = adt_path_offset(adt, adt_path);
-    if (usb < 0 || usb_source < 0 || fdt_node_check_compatible(dt, usb, "apple,t6040-dwc3"))
-        return -1;
-    for (size_t i = 0; i < ARRAY_SIZE(j614s_atc_tunables); i++) {
+    if (port == 3) {
+        int len;
+        const char *status = fdt_getprop(dt, phy, "status", &len);
+        if (!status || len != sizeof("disabled") || memcmp(status, "disabled", len))
+            return -1;
+    } else {
+        usb = fdt_path_offset(dt, usb_path);
+        snprintf(adt_path, sizeof(adt_path), "/arm-io/usb-drd%d", port);
+        usb_source = adt_path_offset(adt, adt_path);
+        if (usb < 0 || usb_source < 0 || fdt_node_check_compatible(dt, usb, "apple,t6040-dwc3"))
+            return -1;
+    }
+    size_t count = port == 3 ? 9 : ARRAY_SIZE(j614s_atc_tunables);
+    for (size_t i = 0; i < count; i++) {
         const struct j614s_atc_tunable *item = &j614s_atc_tunables[i];
         const char *target_path = item->controller_target ? usb_path : phy_path;
         int target = fdt_path_offset(dt, target_path);
@@ -1074,6 +1089,8 @@ static int j614s_export_atc(void *dt, int port)
         if ((ret && ret != -FDT_ERR_NOTFOUND) || dt_append_atc_tunable(dt, src, target, &info))
             return -1;
     }
+    if (port == 3)
+        return 0; /* The PMP-aware display gate owns PHY power. */
     phy = fdt_path_offset(dt, phy_path);
     if (phy < 0 || fdt_setprop_string(dt, phy, "status", "okay"))
         return -1;
@@ -1090,12 +1107,15 @@ int kboot_setup_atc(void *dt)
         !fdt_node_check_compatible(dt, 0, "apple,j614s")) {
         int capacity = fdt_totalsize(dt);
         void *scratch = malloc(capacity);
+        j614s_hdmi_ready = false;
         for (size_t i = 0; i < ARRAY_SIZE(j614s_phys); i++) {
             int ret = scratch ? fdt_open_into(dt, scratch, capacity) : -1;
             if (!ret)
                 ret = j614s_export_atc(scratch, i);
             if (!ret) {
                 memcpy(dt, scratch, capacity);
+                if (i == 3)
+                    j614s_hdmi_ready = true;
             } else {
                 printf("FDT: J614s ATC%zu tuning unavailable\n", i);
                 int node = fdt_path_offset(dt, j614s_phys[i]);
@@ -1103,7 +1123,7 @@ int kboot_setup_atc(void *dt)
                     free(scratch);
                     return -1;
                 }
-                node = fdt_path_offset(dt, j614s_controllers[i]);
+                node = i < 3 ? fdt_path_offset(dt, j614s_controllers[i]) : -1;
                 if (node >= 0 && fdt_setprop_string(dt, node, "status", "disabled")) {
                     free(scratch);
                     return -1;
