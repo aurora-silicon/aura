@@ -115,6 +115,7 @@ struct port_regs {
     u64 dart;
     u32 bus; /* its root port's secondary bus, once numbered (F) */
     bool up;
+    bool absent; /* no bridge for it in this board's ADT */
 };
 static struct port_regs pr[ARRAY_SIZE(ports)];
 
@@ -687,30 +688,35 @@ int pcie_t6050_init(void)
 
     if (state <= 0)
         return state;
-    /* The GP bring-up below is J775D's. A board whose apcie0 has no bridge for a required port
-     * (J716c: ports 0 and 1 only) has none measured: its GP side stays as iBoot left it, and
-     * storage runs. */
-    for (size_t i = 0; i < ARRAY_SIZE(ports); i++) {
-        char bridge[40];
-
-        snprintf(bridge, sizeof(bridge), "%s/pci-bridge%d", apcie_path, ports[i].port);
-        if (ports[i].required && adt_path_offset(adt, bridge) < 0) {
-            printf("pcie-t6050: no %s (%s) on this board: GP ports left as found\n",
-                   ports[i].endpoint, bridge);
-            state = 0;
-            return 0;
-        }
-    }
     state = -1;
     TRY(find_regs());
     TRY(storage_find());
+    /* A port whose bridge this board's ADT lacks (J716c: ports 2 and 3) is not on the board: it
+     * is neither required nor tried. With none of the ports here, the GP side stays as found. */
+    bool any_present = false;
     for (size_t i = 0; i < ARRAY_SIZE(ports); i++) {
+        char bridge[40];
+
         pr[i].p = &ports[i];
+        snprintf(bridge, sizeof(bridge), "%s/pci-bridge%d", apcie_path, ports[i].port);
+        pr[i].absent = adt_path_offset(adt, bridge) < 0;
+        if (pr[i].absent) {
+            printf("pcie-t6050: port %d (%s): no bridge on this board\n", ports[i].port,
+                   ports[i].endpoint);
+            pr[i].ctl = 0;
+            continue;
+        }
+        any_present = true;
         if (find_port_regs(&pr[i])) {
             if (ports[i].required)
                 return -1;
             pr[i].ctl = 0; /* left down: stages skip it */
         }
+    }
+    if (!any_present) {
+        printf("pcie-t6050: none of the GP ports is on this board: left as found\n");
+        state = 0;
+        return 0;
     }
     TRY(storage_check("before", true));
 
@@ -731,7 +737,7 @@ int pcie_t6050_init(void)
         if (!pr[i].ctl) /* its resources were not found: reported above */
             continue;
         if (port_up(&pr[i]) < 0) {
-            if (ports[i].required)
+            if (ports[i].required && !pr[i].absent)
                 return -1;
             printf("pcie-t6050: port %d left down\n", ports[i].port);
         }
