@@ -11,7 +11,8 @@ def test_root_address(tmp_path):
 #include <assert.h>
 #include <stdint.h>
 #include <libfdt.h>
-#include "devicetree.h"
+/* Keep firmware-only typedefs out of the host SDK headers. */
+uint64_t dt_get_address(void *dt, int node);
 
 static void put_reg(void *fdt, const char *path, const fdt32_t *reg, int len)
 {
