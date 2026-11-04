@@ -1745,6 +1745,89 @@ static int dt_set_smbios_firmware(void)
     return 0;
 }
 
+/* Remove cooling-device entries whose CPU providers were pruned. Cooling
+ * specifiers have provider-defined argument counts; preserve other providers. */
+static int dt_prune_cpu_cooling(void *fdt, const u32 *pruned, const u32 *pruned_cells,
+                                size_t pruned_count)
+{
+    int node = fdt_path_offset(fdt, "/thermal-zones"), depth = 0;
+    if (node == -FDT_ERR_NOTFOUND || !pruned_count)
+        return 0;
+    if (node < 0)
+        return node;
+
+    while (node >= 0 && depth >= 0) {
+        int len;
+        const fdt32_t *list = fdt_getprop(fdt, node, "cooling-device", &len);
+        if (list) {
+            char path[256];
+            if (fdt_get_path(fdt, node, path, sizeof(path)))
+                snprintf(path, sizeof(path), "node at offset %d", node);
+            if (len <= 0 || len % sizeof(*list)) {
+                printf("FDT: %s: malformed cooling-device, leaving unchanged\n", path);
+                goto next;
+            }
+            fdt32_t *kept = malloc(len);
+            if (!kept)
+                return -FDT_ERR_NOSPACE;
+            size_t count = len / sizeof(*list), i = 0, used = 0;
+            bool changed = false;
+            while (i < count) {
+                u32 phandle = fdt32_ld(list + i), args = UINT32_MAX;
+                bool drop = false;
+                for (size_t j = 0; j < pruned_count; j++) {
+                    if (phandle && pruned[j] == phandle) {
+                        args = pruned_cells[j];
+                        drop = true;
+                        break;
+                    }
+                }
+                if (!drop) {
+                    int provider = fdt_node_offset_by_phandle(fdt, phandle), bytes;
+                    const fdt32_t *prop =
+                        provider < 0 ? NULL : fdt_getprop(fdt, provider, "#cooling-cells", &bytes);
+                    if (prop && bytes == sizeof(*prop))
+                        args = fdt32_ld(prop);
+                }
+                if (!phandle || args == UINT32_MAX || args > count - i - 1) {
+                    free(kept);
+                    printf("FDT: %s: invalid cooling specifier or unknown cell count, "
+                           "leaving unchanged\n",
+                           path);
+                    goto next;
+                }
+                size_t cells = 1 + args;
+                if (drop) {
+                    changed = true;
+                } else {
+                    memcpy(kept + used, list + i, cells * sizeof(*list));
+                    used += cells;
+                }
+                i += cells;
+            }
+            if (changed) {
+                /* Keep the zone and its trips even when this map has no
+                 * remaining cooling action. */
+                int ret = used
+                              ? fdt_setprop(fdt, node, "cooling-device", kept, used * sizeof(*kept))
+                              : fdt_delprop(fdt, node, "cooling-device");
+                free(kept);
+                if (ret)
+                    return ret;
+                if (!used)
+                    printf("FDT: %s: removed empty cooling-device\n", path);
+            } else {
+                free(kept);
+            }
+        } else if (len != -FDT_ERR_NOTFOUND) {
+            return len;
+        }
+    next:
+        node = fdt_next_node(fdt, node, &depth);
+    }
+    return node == -FDT_ERR_NOTFOUND || depth < 0 ? 0 : node;
+}
+
 static int dt_set_cpus(void)
 {
     int ret = 0;
@@ -1775,6 +1858,7 @@ static int dt_set_cpus(void)
 
     uint32_t *pruned_phandles = calloc(MAX_CPUS, sizeof(uint32_t));
     size_t pruned = 0;
+    u32 pruned_cooling_cells[MAX_CPUS];
     if (!pruned_phandles)
         bail("FDT: out of memory\n");
 
@@ -1823,7 +1907,12 @@ static int dt_set_cpus(void)
 
         if (idx < 0) {
             printf("FDT: CPU %d (MPIDR 0x%lx) is not alive, disabling...\n", cpu, dt_mpidr);
-            pruned_phandles[pruned++] = fdt_get_phandle(dt, node);
+            int cells_len;
+            const fdt32_t *cooling_cells = fdt_getprop(dt, node, "#cooling-cells", &cells_len);
+            pruned_phandles[pruned] = fdt_get_phandle(dt, node);
+            pruned_cooling_cells[pruned++] = cooling_cells && cells_len == sizeof(*cooling_cells)
+                                                 ? fdt32_ld(cooling_cells)
+                                                 : UINT32_MAX;
 
             int next = fdt_next_subnode(dt, node);
             fdt_nop_node(dt, node);
@@ -1854,6 +1943,10 @@ static int dt_set_cpus(void)
     if ((node < 0) && (node != -FDT_ERR_NOTFOUND)) {
         bail_cleanup("FDT: error iterating through CPUs\n");
     }
+
+    int cooling_ret = dt_prune_cpu_cooling(dt, pruned_phandles, pruned_cooling_cells, pruned);
+    if (cooling_ret)
+        printf("FDT: could not prune CPU cooling references (%d), continuing\n", cooling_ret);
 
     /* Prune AIC PMU affinities */
     int aic = fdt_node_offset_by_compatible(dt, -1, "apple,aic");
