@@ -8608,6 +8608,13 @@ int kboot_prepare_dt(void *fdt)
         if (ret && ret != -FDT_ERR_NOTFOUND)
             return -1;
     }
+    /*
+     * The first core of a cluster has a power-gate slot here, and iBoot leaves the boot core's
+     * clear, so that core and its cluster never power off. macOS sets it at every boot.
+     */
+    if (chip_id == T6041)
+        set32(0x50282c040, BIT(31));
+
     if (dt_set_gpu(dt))
         return -1;
     if (dt_set_multitouch())
