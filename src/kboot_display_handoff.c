@@ -74,9 +74,9 @@
  * whether it knows that image. No ADT description is logged (the ADT reaches Linux whole, and the
  * log ring is 16K); the DART stream registers are.
  *
- * T6041 display block of the M4 Pro (chip T6040, J616s only), with the desktop 26.6.2 DCP firmware:
+ * T6041 display block of the M4 Pro (chip T6040, J616s and J614s), with the desktop 26.6.2 DCP firmware:
  * the T6031 handoff with T6041 values. There is no /chosen opt-in: the handoff is attempted on
- * every boot whose chip is T6040, whose root is apple,j616s, whose OS firmware matches the known
+ * every J616s and J614s boot whose OS firmware matches the known
  * profile, and whose device tree describes the T6041 display block (aliases dcp and disp0,
  * compatible apple,t6041-dcp and apple,display-subsystem). Anything else gets nothing at all: no
  * __OS_LOG reservation, no register access, no DT edit. On a supported boot the __OS_LOG
@@ -391,14 +391,14 @@ static const struct dcp_soc dcp_soc_t6031 = {
  * the kernel accepts only the 26.6.2 firmware. No opt-in: nothing happens unless the device tree
  * describes this display block (dcp6_dt_describes()), and the display nodes stay disabled.
  */
-static const char *const dcp_boards_t6041[] = {"apple,j616s", NULL};
+static const char *const dcp_boards_t6041[] = {"apple,j616s", "apple,j614s", NULL};
 
 static const struct dcp_soc dcp_soc_t6041 = {
     .name = "T6041",
     .chip = T6040,
     .compat = "apple,t6040",
     .boards = dcp_boards_t6041,
-    .boards_desc = "J616s",
+    .boards_desc = "J616s/J614s",
     .dcp_compat = "apple,t6041-dcp",
     .disp_compat = "apple,display-subsystem",
     .marker = "apple,t6041-handoff",

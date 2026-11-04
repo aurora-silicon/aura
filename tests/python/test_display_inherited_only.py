@@ -40,7 +40,7 @@ enum fw_version { V15_0B1 = 1, V_UNKNOWN = 2 };
 #define FW_MAX V_UNKNOWN
 typedef struct { const char *dcp, *dcp_dart, *disp_dart; } display_config_t;
 
-static u32 chip_id;
+static u32 chip_id, board_id;
 static bool is_mac = true;
 static bool display_is_external, display_needs_power_cycle;
 static struct { struct { u64 base, width, height, depth; } video; } cur_boot_args;
@@ -118,13 +118,13 @@ int main(void)
 def test_t8140_t8132_return_before_the_dart_path(tmp_path):
     display = (SOURCE / "src/display.c").read_text()
     soc = (SOURCE / "src/soc.h").read_text()
-    chips = "\n".join(re.findall(r"^#define (?:T8140|T8132|T8152|T6000|S5L8960X)\s+0x[0-9a-fA-F]+\s*$",
+    chips = "\n".join(re.findall(r"^#define (?:T8140|T8132|T8152|T6000|T6040|S5L8960X)\s+0x[0-9a-fA-F]+\s*$",
                                  soc, re.M))
     panel = function(display, "static bool display_internal_panel_absent(")
     init = function(display, "int display_init(void)")
     inherited = function(display, "bool display_dart_tables_inherited(void)")
     # The early return the PR cites, ahead of the dummy framebuffer path.
-    early = init.index("if (chip_id == T8140 || chip_id == T8132)")
+    early = init.index("if (chip_id == T8140 || chip_id == T8132 ||")
     assert early < init.index("Dummy framebuffer found") and "return 0;" in init[early:init.index("}", early)]
     line = display[:display.index(init)].count("\n") + init[:early].count("\n") + 1
     print(f"display_init() returns early for T8140/T8132 at src/display.c:{line}")

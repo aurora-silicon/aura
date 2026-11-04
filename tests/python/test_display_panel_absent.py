@@ -38,7 +38,7 @@ typedef unsigned long u64;
 enum fw_version { V15_0B1 = 1, V_UNKNOWN = 2 };
 #define FW_MAX V_UNKNOWN
 
-static u32 chip_id;
+static u32 chip_id, board_id;
 static bool is_mac = true;
 static bool display_is_external, display_needs_power_cycle;
 static struct { struct { u64 base, width, height, depth; } video; } cur_boot_args;
@@ -153,13 +153,13 @@ int main(void)
 def test_panel_less_mac_skips_the_status_wait(tmp_path):
     display = (SOURCE / "src/display.c").read_text()
     soc = (SOURCE / "src/soc.h").read_text()
-    chips = "\n".join(re.findall(r"^#define (?:T8140|T8132|T8152|T6000|S5L8960X)\s+0x[0-9a-fA-F]+\s*$",
+    chips = "\n".join(re.findall(r"^#define (?:T8140|T8132|T8152|T6000|T6040|S5L8960X)\s+0x[0-9a-fA-F]+\s*$",
                                  soc, re.M))
     panel = function(display, "static bool display_internal_panel_absent(")
     init = function(display, "int display_init(void)")
     # The skip comes after the T8140/T8132 early return and before any modeset path.
     skip = init.index("display_internal_panel_absent(node, product)")
-    assert init.index("if (chip_id == T8140 || chip_id == T8132)") < skip
+    assert init.index("if (chip_id == T8140 || chip_id == T8132 ||") < skip
     assert skip < init.index("Dummy framebuffer found") < init.index("External display found")
     code = tmp_path / "panel-absent.c"
     code.write_text(HARNESS % {"chips": chips, "panel": panel, "display_init": init})
