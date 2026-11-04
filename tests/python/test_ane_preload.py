@@ -1,31 +1,44 @@
 # SPDX-License-Identifier: MIT
-"""The M4 Pro ANE preload handoff: reservations, memory regions and firmware IOVAs.
+"""The M4 Pro and A18 Pro ANE preload handoff: reservations, memory regions and firmware IOVAs.
 
 Runs kboot.c's dt_set_ane_firmware(), dt_set_ane_node(), dt_ane_fill_region() and
 dt_get_or_add_reserved_mem() as they are, on real FDTs built with aura's libfdt, against a
-fake ADT. Segment values are the J616s 26.6.2 ane0 segment-ranges.
+fake ADT. Segment values are the J616s 26.6.2 /arm-io/ane0 and the Neo (J700) 26.6.2
+/arm-io/ane segment-ranges.
 """
 
 from pathlib import Path
+
+import pytest
 from test_siliconforest_handoff import run_c
 
 ROOT = Path(__file__).resolve().parents[2]
 
 
-def test_ane_preload_handoff(tmp_path):
+BOARDS = {
+    "j616s": dict(compat="apple,t6041-ane", node="ane@484000000", adt="/arm-io/ane0",
+                  text=0x100009D8000, data=0x1000196C000),
+    "j700": dict(compat="apple,t8140-ane", node="ane@400000000", adt="/arm-io/ane",
+                 text=0x10000768000, data=0x100019A0000),
+}
+
+
+@pytest.mark.parametrize("board", sorted(BOARDS))
+def test_ane_preload_handoff(tmp_path, board):
+    b = BOARDS[board]
     source = (ROOT / "src/kboot.c").read_text()
 
     def function(name):
         start = source.index("static int " + name + "(")
         return source[start:source.index("\n}", start) + 2] + "\n"
 
-    start = source.index("/*\n * The M4 Pro Neural Engine")
+    start = source.index("/*\n * The M4 Pro and A18 Pro Neural Engines")
     end = source.index("\n}", source.index("static int dt_set_ane_firmware(void)")) + 2
     production = function("dt_get_or_add_reserved_mem") + source[start:end] + "\n"
     header = (ROOT / "src/adt.h").read_text()
     start = header.index("struct adt_segment_ranges {")
     layout = header[start:header.index("} PACKED;", start) + len("} PACKED;")]
-    run_c(tmp_path, "ane-preload", r'''
+    program = r'''
 #include <assert.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -41,6 +54,8 @@ typedef uint32_t u32;
 #define ALIGN_UP(x, a) (((x) + (a) - 1) & ~((a) - 1))
 #define bail(...) do { printf(__VA_ARGS__); return -1; } while (0)
 static void *dt, *adt;
+static bool el2 = true;
+static bool in_el2(void) { return el2; }
 static struct { u64 phys_base; } cur_boot_args = { 0x10002000000UL };
 ''' + layout + r'''
 static struct adt_segment_ranges segments[2];
@@ -52,7 +67,7 @@ static u64 dram_base;
 static int adt_path_offset(void *tree, const char *path)
 {
     (void)tree;
-    if (!strcmp(path, "/arm-io/ane0"))
+    if (!strcmp(path, "@ADT@"))
         return have_ane0 ? 1 : -1;
     if (!strcmp(path, "/chosen"))
         return 2;
@@ -89,11 +104,12 @@ static unsigned char blob[16384], before[16384];
 
 static void reset_adt(void)
 {
+    el2 = true;
     have_ane0 = true;
     preloaded = 1;
     dram_base = 0x10000000000UL;
-    segments[0] = (struct adt_segment_ranges){0x100009d8000UL, 0, 0x10000000000UL, 0xc0000, 1};
-    segments[1] = (struct adt_segment_ranges){0x1000196c000UL, 0xc0000, 0x100000c0000UL,
+    segments[0] = (struct adt_segment_ranges){@TEXT@UL, 0, 0x10000000000UL, 0xc0000, 1};
+    segments[1] = (struct adt_segment_ranges){@DATA@UL, 0xc0000, 0x100000c0000UL,
                                               0x2ac000, 0};
     segments_len = sizeof(segments);
     segment_names = "__TEXT;__DATA";
@@ -126,13 +142,14 @@ static void build(bool placeholders, const char *status, bool ane)
             assert(!fdt_setprop_u32(dt, n, "phandle", 0x10 + i));
         }
     }
+    assert(fdt_add_subnode(dt, 0, "chosen") >= 0);
     int soc = fdt_add_subnode(dt, 0, "soc");
     assert(soc >= 0);
     if (!ane)
         return;
-    int n = fdt_add_subnode(dt, soc, "ane@484000000");
+    int n = fdt_add_subnode(dt, soc, "@NODE@");
     assert(n >= 0);
-    assert(!fdt_setprop_string(dt, n, "compatible", "apple,t6041-ane"));
+    assert(!fdt_setprop_string(dt, n, "compatible", "@COMPAT@"));
     assert(!fdt_setprop_string(dt, n, "status", status));
     if (placeholders) {
         fdt32_t regions[2] = {cpu_to_fdt32(0x10), cpu_to_fdt32(0x11)};
@@ -143,7 +160,7 @@ static void build(bool placeholders, const char *status, bool ane)
 
 static const char *status(void)
 {
-    return fdt_getprop(dt, fdt_path_offset(dt, "/soc/ane@484000000"), "status", NULL);
+    return fdt_getprop(dt, fdt_path_offset(dt, "/soc/@NODE@"), "status", NULL);
 }
 
 static void check_region(const fdt32_t *regions, int i, const char *name, u64 phys, u64 size)
@@ -160,15 +177,22 @@ static void check_region(const fdt32_t *regions, int i, const char *name, u64 ph
     assert(!st || !strcmp(st, "okay"));
 }
 
+static const char *marker(void)
+{
+    return fdt_getprop(dt, fdt_path_offset(dt, "/chosen"), "apple,ane-cold-boot", NULL);
+}
+
 static void check_handoff(const char *want_status)
 {
-    int ane = fdt_path_offset(dt, "/soc/ane@484000000");
+    int ane = fdt_path_offset(dt, "/soc/@NODE@");
     int len;
+    const char *m = fdt_getprop(dt, fdt_path_offset(dt, "/chosen"), "apple,ane-cold-boot", &len);
+    assert(m && len == 28 && !strcmp(m, "raw-no-xnu-ane-untouched-v1"));
     assert(!strcmp(status(), want_status));
     const fdt32_t *regions = fdt_getprop(dt, ane, "memory-region", &len);
     assert(regions && len == 8);
-    check_region(regions, 0, "ane-firmware-text@100009d8000", 0x100009d8000UL, 0xc0000);
-    check_region(regions, 1, "ane-firmware-data@1000196c000", 0x1000196c000UL, 0x2ac000);
+    check_region(regions, 0, "ane-firmware-text@@TEXTN@", @TEXT@UL, 0xc0000);
+    check_region(regions, 1, "ane-firmware-data@@DATAN@", @DATA@UL, 0x2ac000);
     const char *names = fdt_getprop(dt, ane, "memory-region-names", &len);
     assert(names && len == 28 && !memcmp(names, "firmware-text\0firmware-data", 28));
     const fdt64_t *iovas = fdt_getprop(dt, ane, "apple,firmware-iovas", &len);
@@ -193,8 +217,9 @@ static void check_refused(void (*fault)(void), const char *what)
             count++;
         }
         assert(count == (form ? 2 : 0));
-        assert(!fdt_getprop(dt, fdt_path_offset(dt, "/soc/ane@484000000"),
+        assert(!fdt_getprop(dt, fdt_path_offset(dt, "/soc/@NODE@"),
                             "apple,firmware-iovas", NULL));
+        assert(!marker());
         printf("refused (%s, %s DT): ok\n", what, form ? "placeholder" : "older");
     }
 }
@@ -251,6 +276,15 @@ int main(void)
     assert(!memcmp(before, blob, sizeof(blob)));
     printf("no ANE node, DT unchanged: ok\n");
 
+    /* Under a hypervisor (EL1 guest) the regions are handed over without the marker. */
+    reset_adt();
+    el2 = false;
+    build(true, "okay", true);
+    assert(dt_set_ane_firmware() == 0);
+    assert(!marker());
+    assert(fdt_getprop(dt, fdt_path_offset(dt, "/soc/@NODE@"), "apple,firmware-iovas", NULL));
+    printf("EL1 guest: regions handed over, no cold-boot marker: ok\n");
+
     check_refused(no_ane0, "no ADT node");
     check_refused(not_preloaded, "not preloaded");
     check_refused(three_segments, "three segments");
@@ -271,11 +305,16 @@ int main(void)
     int stray = fdt_add_subnode(dt, soc, "stray");
     assert(stray >= 0 && !fdt_setprop_u32(dt, stray, "phandle", 0x20));
     fdt32_t regions[2] = {cpu_to_fdt32(0x10), cpu_to_fdt32(0x20)};
-    assert(!fdt_setprop(dt, fdt_path_offset(dt, "/soc/ane@484000000"), "memory-region", regions,
+    assert(!fdt_setprop(dt, fdt_path_offset(dt, "/soc/@NODE@"), "memory-region", regions,
                         sizeof(regions)));
     assert(dt_set_ane_firmware() == 0);
     assert(!strcmp(status(), "disabled"));
     printf("stray placeholder refused: ok\n");
     return 0;
 }
-''')
+'''
+    for key, value in (("@ADT@", b["adt"]), ("@COMPAT@", b["compat"]), ("@NODE@", b["node"]),
+                       ("@TEXTN@", "%x" % b["text"]), ("@DATAN@", "%x" % b["data"]),
+                       ("@TEXT@", "0x%x" % b["text"]), ("@DATA@", "0x%x" % b["data"])):
+        program = program.replace(key, value)
+    run_c(tmp_path, "ane-preload-" + board, program)

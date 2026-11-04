@@ -23,6 +23,7 @@ def test_pending_calls_block_dt_preparation_and_kernel_publication(tmp_path):
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <setjmp.h>
 typedef uint64_t u64; typedef uint32_t u32;
@@ -63,6 +64,17 @@ static int dapf_init_fdt(void *p) { return 0; }
 static int dapf_init_all(void) { return 0; }
 static void pcie_shutdown(void) {}
 static void smp_set_wfe_mode(bool value) {}
+/* The J614s AOP/ISP handoff is gated on the board; no modelled chip is a J614s. */
+static int board_id;
+static void *adt;
+static bool adt_is_compatible(void *tree, int node, const char *compatible) { return false; }
+static int fdt_open_into(void *from, void *to, int size) { return -1; }
+static int fdt_node_offset_by_compatible(void *p, int start, const char *compatible) { return -1; }
+static int fdt_setprop_string(void *p, int node, const char *name, const char *value) { return -1; }
+static bool dapf_j614s_aop_ready(void) { return false; }
+static bool dapf_j614s_isp_ready(void) { return false; }
+static int dt_finish_j614s_aop(void *tree, bool ready) { return -1; }
+static int dt_finish_j614s_isp(bool ready) { return -1; }
 static int dt_t8140_recheck_display(void)
 { if (mode == 3) spin_table[1].target = 0x1234; return 0; }
 ''' + pending + prepare + boot + '\nstatic int main_stage_guard(void)\n{\n' + final_guard + r'''

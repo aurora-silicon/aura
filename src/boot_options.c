@@ -2,9 +2,14 @@
 #include "boot_options.h"
 
 static bool debug_enabled;
+static bool console_requested;
 static bool proxy_requested;
 static bool trial_running;
 static bool is_stage1;
+static bool nv2_option;
+static bool pv_option;
+static int nv2_override = -1;
+static int pv_override = -1;
 
 static bool boot_space(char c)
 {
@@ -41,14 +46,72 @@ bool boot_option_present(const char *line, size_t capacity, const char *option)
 void boot_options_init(const char *line, size_t capacity)
 {
     debug_enabled = boot_option_present(line, capacity, "aura-debug");
+    console_requested = boot_option_present(line, capacity, "aura-console");
     proxy_requested = boot_option_present(line, capacity, "aura-proxy");
     trial_running = boot_option_present(line, capacity, "aura-trial");
+    nv2_option =
+#ifdef NV2_BOOT
+        true;
+#else
+        false;
+#endif
+    nv2_option = nv2_option || boot_option_present(line, capacity, "aura-nv2");
+    pv_option = boot_option_present(line, capacity, "aura-pv");
+    if (boot_option_present(line, capacity, "aura-pv=1") ||
+        boot_option_present(line, capacity, "aura-pv=on"))
+        pv_option = true;
+    else if (boot_option_present(line, capacity, "aura-pv=0") ||
+             boot_option_present(line, capacity, "aura-pv=off"))
+        pv_option = false;
+    /* A value-bearing token is useful when the OS supplies the boot command
+     * line. Keep the historical bare token as the opt-in spelling. */
+    if (boot_option_present(line, capacity, "aura-nv2=1") ||
+        boot_option_present(line, capacity, "aura-nv2=on"))
+        nv2_option = true;
+    else if (boot_option_present(line, capacity, "aura-nv2=0") ||
+             boot_option_present(line, capacity, "aura-nv2=off"))
+        nv2_option = false;
+    nv2_override = -1;
+    pv_override = -1;
     is_stage1 = true;
 }
 
 bool aura_debug_enabled(void)
 {
     return debug_enabled;
+}
+
+/* Keep the debug UART as the OS console (stdout-path) without the rest of aura-debug */
+bool aura_console_enabled(void)
+{
+    return console_requested;
+}
+
+void boot_options_set_console(bool console)
+{
+    console_requested = console;
+}
+
+/* Run the OS at virtual EL2 under FEAT_NV2 so it can host VMs (opt-in). */
+bool aura_nv2_enabled(void)
+{
+    return nv2_override >= 0 ? nv2_override : nv2_option;
+}
+
+void boot_options_set_nv2_override(int enabled)
+{
+    nv2_override = enabled < 0 ? -1 : !!enabled;
+}
+
+/* Keep PV discovery/RUN separate from the NV2 host mode. */
+bool aura_pv_enabled(void)
+{
+    return pv_override >= 0 ? pv_override : pv_option;
+}
+
+void boot_options_set_pv_override(int enabled)
+{
+    pv_override = enabled < 0 ? -1 : !!enabled;
 }
 
 void boot_options_set_stage1(bool stage1)

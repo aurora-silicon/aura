@@ -222,6 +222,8 @@
 #define SYS_ID_AA64MMFR1_EL1 sys_reg(3, 0, 0, 7, 1)
 #define ID_AA64MMFR1_HCX     GENMASK(43, 40)
 #define ID_AA64MMFR1_LO      GENMASK(19, 16)
+#define SYS_ID_AA64MMFR2_EL1 sys_reg(3, 0, 0, 7, 2)
+#define ID_AA64MMFR2_NV      GENMASK(27, 24)
 
 #define SYS_ID_AA64MMFR0_EL1   sys_reg(3, 0, 0, 7, 0)
 #define ID_AA64MMFR0_ECV       GENMASK(63, 60)

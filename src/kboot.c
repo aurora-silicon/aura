@@ -8,10 +8,12 @@
 #include "adt.h"
 #include "asc.h"
 #include "assert.h"
+#include "boot_options.h"
 #include "clk.h"
 #include "dapf.h"
 #include "devicetree.h"
 #include "display.h"
+#include "dockchannel_uart.h"
 #include "exception.h"
 #include "firmware.h"
 #include "heapblock.h"
@@ -26,8 +28,10 @@
 #include "mcc.h"
 #include "memory.h"
 #include "monitor.h"
+#include "nv2.h"
 #include "pcie.h"
 #include "pmgr.h"
+#include "pv_kvm.h"
 #include "rtkit.h"
 #include "sart.h"
 #include "sep.h"
@@ -547,6 +551,80 @@ static int dt_set_m3_defaults(void)
     return 0;
 }
 
+/*
+ * /chosen stdout-path makes Linux register that UART as a console when the command line names
+ * none. The Apple DTS sets it to serial0 on every laptop: the Samsung UART on M1 and M2, the
+ * DockChannel UART on the MacBook Neo. Both are reachable only from a debug host (a VDM
+ * `reboot debugusb` link), so on a normal boot the console is one nobody reads, and Plymouth,
+ * seeing a serial console, drops to its text mode. The property is kept on a debug boot only:
+ * aura-debug or aura-console in the boot arguments, a debugusb host reading the DockChannel
+ * console (DEBUGUSB_PROXY builds), chosen.aura,serial-console=1 in the config, or a config line
+ * that sets stdout-path itself. chosen.aura,serial-console=0 removes it on any boot. The UART
+ * node stays, so console=ttyDC0 or console=ttySAC0 on the command line still works.
+ */
+#define SERIAL_CONSOLE_SWITCH "aura,serial-console"
+
+static const char *const debug_uart_compatibles[] = {"apple,s5l-uart", "apple,dockchannel-uart"};
+
+/* True when the stdout path in prop names a node that is a debug-only UART */
+static bool dt_stdout_is_debug_uart(int chosen, const char *prop)
+{
+    int len;
+    const char *path = fdt_getprop(dt, chosen, prop, &len);
+
+    if (!path || len <= 0 || !memchr(path, 0, len))
+        return false;
+    const char *colon = strchr(path, ':');
+    int node = fdt_path_offset_namelen(dt, path, colon ? (int)(colon - path) : (int)strlen(path));
+    if (node < 0)
+        return false;
+    for (size_t i = 0; i < ARRAY_SIZE(debug_uart_compatibles); i++)
+        if (!fdt_node_check_compatible(dt, node, debug_uart_compatibles[i]))
+            return true;
+    return false;
+}
+
+/* Why this boot keeps the debug UART as the console, NULL on a normal boot */
+static const char *kboot_serial_console_reason(void)
+{
+    const char *sw = kboot_chosen_param(SERIAL_CONSOLE_SWITCH);
+
+    if (sw && !strcmp(sw, "0"))
+        return NULL;
+    if (sw && !strcmp(sw, "1"))
+        return "chosen." SERIAL_CONSOLE_SWITCH "=1";
+    if (kboot_chosen_param("stdout-path") || kboot_chosen_param("linux,stdout-path"))
+        return "a config line sets it";
+    if (aura_debug_enabled())
+        return "aura-debug";
+    if (aura_console_enabled())
+        return "aura-console";
+#ifdef DEBUGUSB_PROXY
+    if (dockchannel_uart_host_seen())
+        return "debugusb host";
+#endif
+    return NULL;
+}
+
+static int dt_set_stdout_path(int chosen)
+{
+    static const char *const props[] = {"stdout-path", "linux,stdout-path"};
+    const char *reason = kboot_serial_console_reason();
+
+    for (size_t i = 0; i < ARRAY_SIZE(props); i++) {
+        if (!dt_stdout_is_debug_uart(chosen, props[i]))
+            continue;
+        if (reason) {
+            printf("FDT: keeping chosen.%s on the debug UART (%s)\n", props[i], reason);
+            continue;
+        }
+        if (fdt_delprop(dt, chosen, props[i]))
+            bail("FDT: couldn't remove chosen.%s\n", props[i]);
+        printf("FDT: removed chosen.%s (debug UART, not a debug boot)\n", props[i]);
+    }
+    return 0;
+}
+
 static int dt_set_chosen(void)
 {
 
@@ -564,6 +642,9 @@ static int dt_set_chosen(void)
             bail("FDT: couldn't set chosen.%s property\n", name);
         printf("FDT: set chosen.%s\n", name);
     }
+
+    if (dt_set_stdout_path(node))
+        return -1;
 
     if (chip_id == T8140 && dt_set_t8140_wfx_args(node))
         return -1;
@@ -1754,6 +1835,26 @@ static int dt_set_cpus(void)
     if (cpus < 0)
         bail("FDT: /cpus node not found in devtree\n");
 
+    /* When the monitor runs the OS at EL1 it owns the secondary pool and
+     * services PSCI over SMC; expose a /psci node and switch the cpus below
+     * from spin-table to it. Without the monitor the OS boots at EL2 and keeps
+     * spin-table. */
+    bool psci = monitor_required();
+    if (psci) {
+        int node = fdt_path_offset(dt, "/psci");
+        if (node < 0)
+            node = fdt_add_subnode(dt, 0, "psci");
+        if (node < 0 || fdt_setprop_string(dt, node, "compatible", "arm,psci-1.0") ||
+            fdt_appendprop_string(dt, node, "compatible", "arm,psci-0.2") ||
+            fdt_setprop_string(dt, node, "method", "smc") ||
+            fdt_setprop_string(dt, node, "status", "okay"))
+            bail("FDT: couldn't set up the /psci node\n");
+        /* The offset may have moved. */
+        cpus = fdt_path_offset(dt, "/cpus");
+        if (cpus < 0)
+            bail("FDT: /cpus node not found in devtree\n");
+    }
+
     uint32_t *pruned_phandles = calloc(MAX_CPUS, sizeof(uint32_t));
     size_t pruned = 0;
     u32 pruned_cooling_cells[MAX_CPUS];
@@ -1776,8 +1877,16 @@ static int dt_set_cpus(void)
 
         u64 dt_mpidr = fdt64_ld(prop);
 
-        if (dt_mpidr == (mrs(MPIDR_EL1) & 0xFFFFFF))
+        if (dt_mpidr == (mrs(MPIDR_EL1) & 0xFFFFFF)) {
+            /* cpuidle-psci only binds when every CPU, the boot CPU included,
+             * uses PSCI. */
+            if (psci) {
+                fdt_delprop(dt, node, "cpu-release-addr");
+                if (fdt_setprop_string(dt, node, "enable-method", "psci"))
+                    bail_cleanup("FDT: couldn't set cpu enable-method to psci\n");
+            }
             goto next_cpu;
+        }
 
         /*
          * DT and ADT CPU numbering can differ: J616s has no ADT cpu9, while
@@ -1812,11 +1921,17 @@ static int dt_set_cpus(void)
         }
 
         u64 mpidr = smp_get_mpidr(idx);
-        u64 release_addr = smp_get_release_addr(idx);
-        if (fdt_setprop_inplace_u64(dt, node, "cpu-release-addr", release_addr))
-            bail_cleanup("FDT: couldn't set cpu-release-addr property\n");
-
-        printf("FDT: CPU %d MPIDR=0x%lx release-addr=0x%lx\n", cpu, mpidr, release_addr);
+        if (psci) {
+            fdt_delprop(dt, node, "cpu-release-addr");
+            if (fdt_setprop_string(dt, node, "enable-method", "psci"))
+                bail_cleanup("FDT: couldn't set cpu enable-method to psci\n");
+            printf("FDT: CPU %d MPIDR=0x%lx psci\n", cpu, mpidr);
+        } else {
+            u64 release_addr = smp_get_release_addr(idx);
+            if (fdt_setprop_inplace_u64(dt, node, "cpu-release-addr", release_addr))
+                bail_cleanup("FDT: couldn't set cpu-release-addr property\n");
+            printf("FDT: CPU %d MPIDR=0x%lx release-addr=0x%lx\n", cpu, mpidr, release_addr);
+        }
 
     next_cpu:
         cpu++;
@@ -3617,19 +3732,24 @@ static int dt_set_ave(void)
 }
 
 /*
- * The M4 Pro Neural Engine runs firmware that iBoot preloads into DRAM below
- * the OS: /arm-io/ane0 is pre-loaded, with exactly a __TEXT and a __DATA
- * segment range. Reserve both segments no-map and give them to the ANE node
- * as its "firmware-text" and "firmware-data" memory regions, with the device
- * addresses the firmware runs them at (their remap addresses) as
- * apple,firmware-iovas. A DT that describes the two regions as placeholders
- * gets them filled in place, renamed to their physical addresses and
- * enabled; a DT without them gets them added. The node's status is left as
+ * The M4 Pro and A18 Pro Neural Engines run firmware that iBoot preloads into
+ * DRAM below the OS: /arm-io/ane0 (M4 Pro) or /arm-io/ane (A18 Pro) is
+ * pre-loaded, with exactly a __TEXT and a __DATA segment range. Reserve both segments no-map and
+ * give them to the ANE node as its "firmware-text" and "firmware-data" memory regions, with the
+ * device addresses the firmware runs them at (their remap addresses) as apple,firmware-iovas. A DT
+ * that describes the two regions as placeholders gets them filled in place, renamed to their
+ * physical addresses and enabled; a DT without them gets them added. The node's status is left as
  * the DT has it, except that a node whose preload cannot be handed over is
  * disabled.
+ *
+ * When aura runs on bare metal (EL2, booted from iBoot, not a guest of a
+ * hypervisor that may have run another OS first) and the hand-off succeeds,
+ * /chosen/apple,ane-cold-boot tells the driver that nothing has run the ANE
+ * since iBoot loaded it, so it may start the preloaded firmware itself.
  */
 static const char *const ane_compatibles[] = {
     "apple,t6041-ane",
+    "apple,t8140-ane",
 };
 
 static int dt_ane_fill_region(int resv, uint32_t phandle, const char *kind, u64 phys, u64 size)
@@ -3759,6 +3879,14 @@ static int dt_set_ane_node(int node)
 
     printf("FDT: %s: ANE firmware TEXT 0x%lx DATA 0x%lx reserved\n", path, seg[0].phys,
            seg[1].phys);
+
+    if (in_el2()) {
+        static const char marker[] = "raw-no-xnu-ane-untouched-v1";
+        int chosen_dt = fdt_path_offset(dt, "/chosen");
+        if (chosen_dt < 0 ||
+            fdt_setprop(dt, chosen_dt, "apple,ane-cold-boot", marker, sizeof(marker)))
+            printf("FDT: ANE cold-boot marker not set\n");
+    }
     return 0;
 
 disable:
@@ -6747,6 +6875,114 @@ static int dt_set_pmp_t8122(void)
     return 0;
 }
 
+/* J614s warm SEP shares physical ranges with live DCP logs. Retain the
+ * entire firmware descriptor while leaving the DCP no-map nodes intact.
+ * This runs after the other firmware reservations have been published. */
+struct sep_interval {
+    u64 start, end;
+};
+
+static int dt_split_j614s_sep_reservations(void)
+{
+    struct sep_interval spans[64], tmp;
+    u64 start, end, cursor;
+    const fdt64_t *reg;
+    const fdt32_t *ref;
+    const char *name;
+    u32 phandle;
+    int parent, sep, fw, node, len, count = 0, i, j, ret;
+
+    parent = fdt_path_offset(dt, "/reserved-memory");
+    if (parent < 0 || fdt_address_cells(dt, parent) != 2 || fdt_size_cells(dt, parent) != 2)
+        return -1;
+    sep = fdt_path_offset(dt, "/sep@406600000");
+    fw = fdt_path_offset(dt, "/reserved-memory/sep-firmware");
+    if (fw == -FDT_ERR_NOTFOUND)
+        return 0;
+    if (sep < 0 || fw < 0 || fdt_node_check_compatible(dt, sep, "apple,sep") ||
+        fdt_node_check_compatible(dt, fw, "apple,asc-mem") || fdt_getprop(dt, fw, "no-map", NULL))
+        return -1;
+    reg = fdt_getprop(dt, fw, "reg", &len);
+    if (!reg || len != 16)
+        return -1;
+    start = fdt64_ld(reg);
+    end = start + fdt64_ld(reg + 1);
+    if (!start || end <= start || (start & 0x3fff) || (end & 0x3fff))
+        return -1;
+    phandle = fdt_get_phandle(dt, fw);
+    ref = fdt_getprop(dt, sep, "memory-region", &len);
+    if (!phandle || !ref || len != 4 || fdt32_ld(ref) != phandle)
+        return -1;
+    name = fdt_getprop(dt, sep, "memory-region-names", &len);
+    if (!name || len != 6 || memcmp(name, "sepfw", 6))
+        return -1;
+    fdt_for_each_subnode(node, dt, parent)
+    {
+        u64 a, b;
+        if (node == fw)
+            continue;
+        reg = fdt_getprop(dt, node, "reg", &len);
+        if (!reg)
+            continue;
+        if (len != 16)
+            return -1;
+        a = fdt64_ld(reg);
+        b = a + fdt64_ld(reg + 1);
+        if (b < a)
+            return -1;
+        /* Empty placeholders reserve no physical memory. */
+        if (a == b)
+            continue;
+        if (a >= end || b <= start)
+            continue;
+        if (!fdt_getprop(dt, node, "no-map", NULL) ||
+            (fdt_node_check_compatible(dt, node, "apple,asc-mem") &&
+             !fdt_getprop(dt, node, "apple,dcp-os-log", NULL)) ||
+            count == 64)
+            return -1;
+        spans[count++] = (struct sep_interval){a < start ? start : a, b > end ? end : b};
+    }
+    if (!count)
+        return 0;
+    for (i = 1; i < count; i++)
+        for (j = i; j > 0 && spans[j].start < spans[j - 1].start; j--) {
+            tmp = spans[j];
+            spans[j] = spans[j - 1];
+            spans[j - 1] = tmp;
+        }
+    /* Existing reservations must themselves be disjoint. */
+    for (i = 1; i < count; i++)
+        if (spans[i].start < spans[i - 1].end)
+            return -1;
+    if (fdt_delprop(dt, sep, "memory-region"))
+        return -1;
+    sep = fdt_path_offset(dt, "/sep@406600000");
+    if (fdt_delprop(dt, sep, "memory-region-names"))
+        return -1;
+    fw = fdt_path_offset(dt, "/reserved-memory/sep-firmware");
+    if (fdt_del_node(dt, fw))
+        return -1;
+    cursor = start;
+    for (i = 0; i <= count; i++) {
+        u64 limit = i == count ? end : spans[i].start;
+        if (cursor < limit) {
+            char path[64];
+            fdt64_t cells[2] = {cpu_to_fdt64(cursor), cpu_to_fdt64(limit - cursor)};
+            parent = fdt_path_offset(dt, "/reserved-memory");
+            snprintf(path, sizeof(path), "sep-retained@%llx", (unsigned long long)cursor);
+            ret = fdt_add_subnode(dt, parent, path);
+            if (ret < 0)
+                return ret;
+            if (fdt_setprop(dt, ret, "reg", cells, sizeof(cells)))
+                return -1;
+        }
+        if (i < count)
+            cursor = spans[i].end;
+    }
+    printf("J614s: retained warm SEP range around %d existing no-map regions\n", count);
+    return 0;
+}
+
 static int dt_set_sep(void)
 {
     int aliases = fdt_path_offset(dt, "/aliases");
@@ -7189,6 +7425,11 @@ static int dt_set_isp_fwdata(void)
 static int dt_set_isp(void)
 {
     u64 heap_phys, heap_iova, heap_size;
+
+    /* J614s consumes the boot firmware's segments after DAPF setup. */
+    if (chip_id == T6040 && board_id == 4 && adt_is_compatible(adt, 0, "J614sAP") &&
+        !fdt_node_check_compatible(dt, 0, "apple,j614s"))
+        return 0;
 
     /* A T8140 ISP that isp_init() did not bring up has no firmware to reserve. */
     if (chip_id == T8140 && isp_get_heap(&heap_phys, &heap_iova, &heap_size)) {
@@ -8096,12 +8337,17 @@ int kboot_prepare_dt(void *fdt)
 
     /* Need to init ISP early to carve out heap */
     isp_init();
+    /* Likewise the NV pages, before the retained heap extent is fixed. */
+    if (nv2_requested() && monitor_required())
+        nv2_prepare();
 
     dt_bufsize = fdt_totalsize(fdt);
     assert(dt_bufsize);
 
     dt_bufsize += 6 * SZ_16K; // Add 96K of buffer for modifications
     dt_bufsize += SZ_16K;     // and the SMBIOS description U-Boot builds its tables from (about 6K)
+    if (pv_kvm_requested())
+        dt_bufsize += SZ_16K;
     // A T6030 or T8122 also takes its PMP values
     if (chip_id == T6030 || chip_id == T8122)
         dt_bufsize += 2 * SZ_16K;
@@ -8198,7 +8444,8 @@ int kboot_prepare_dt(void *fdt)
      * Stage 1 read the ESP, so the buffers are in Stage 1's heap, not this one's). Reserve each
      * SART-allowed range inside RAM; the nvme-apple adoption requires them reserved anyway.
      */
-    if (chip_id == T6041 || chip_id == T8142) {
+    if (chip_id == T6041 || chip_id == T8142 ||
+        (chip_id == T6040 && !fdt_node_check_compatible(dt, 0, "apple,j614s"))) {
         sart_dev_t *sart = sart_init("/arm-io/sart-ans");
         u64 ram_start = cur_boot_args.phys_base;
         u64 ram_end = ram_start + cur_boot_args.mem_size;
@@ -8241,6 +8488,17 @@ int kboot_prepare_dt(void *fdt)
         if (!start || end <= start || fdt_add_mem_rsv(dt, start, end - start))
             bail("FDT: couldn't reserve CTXR_D\n");
         printf("FDT: reserved CTXR_D [0x%lx, 0x%lx)\n", start, end);
+    }
+    if (nv2_requested() && monitor_required()) {
+        u64 base, size;
+        nv2_trace_region(&base, &size);
+        if (size) {
+            char name[40];
+            snprintf(name, sizeof(name), "nv2-trace@%lx", base);
+            if (dt_get_or_add_reserved_mem(name, "aura,nv2-trace", true, base, size) < 0)
+                bail("FDT: couldn't reserve the NV2 trace ring\n");
+            printf("FDT: NV2 trace ring at [0x%lx, 0x%lx)\n", base, base + size);
+        }
     }
 
     if (chip_id == T8140) {
@@ -8342,6 +8600,13 @@ int kboot_prepare_dt(void *fdt)
         return -1;
     if (dt_set_display())
         return -1;
+    if (chip_id == T6040 && board_id == 4 && adt_is_compatible(adt, 0, "J614sAP") &&
+        !fdt_node_check_compatible(dt, 0, "apple,j614s") && !kboot_j614s_hdmi_ready()) {
+        int node = fdt_path_offset(dt, "/dcp@3a2e00000");
+        int ret = node < 0 ? -FDT_ERR_NOTFOUND : fdt_delprop(dt, node, "memory-region");
+        if (ret && ret != -FDT_ERR_NOTFOUND)
+            return -1;
+    }
     if (dt_set_gpu(dt))
         return -1;
     if (dt_set_multitouch())
@@ -8398,6 +8663,23 @@ int kboot_prepare_dt(void *fdt)
     if (dt_set_smbios_firmware())
         return -1;
 
+    if (pv_kvm_requested()) {
+        int hypervisor = fdt_path_offset(dt, "/hypervisor");
+        if (hypervisor < 0)
+            hypervisor = fdt_add_subnode(dt, 0, "hypervisor");
+        if (hypervisor < 0 ||
+            fdt_setprop_string(dt, hypervisor, "compatible", "aurora,aura-kvm-pv-0") ||
+            fdt_setprop_string(dt, hypervisor, "method", "hvc") ||
+            fdt_setprop_u32(dt, hypervisor, "abi-major", AURA_PV_ABI_MAJOR) ||
+            fdt_setprop_u32(dt, hypervisor, "abi-minor", AURA_PV_ABI_MINOR) ||
+            fdt_setprop_u32(dt, hypervisor, "uid-function", AURA_PV_FUNC_UID) ||
+            fdt_setprop_u32(dt, hypervisor, "version-function", AURA_PV_FUNC_VERSION) ||
+            fdt_setprop_u32(dt, hypervisor, "caps-function", AURA_PV_FUNC_GET_CAPS) ||
+            fdt_setprop_u32(dt, hypervisor, "run-function", AURA_PV_FUNC_RUN) ||
+            fdt_setprop_u32(dt, hypervisor, "el1-step-function", AURA_PV_FUNC_EL1_STEP))
+            bail("FDT: couldn't describe Aura PV-KVM\n");
+    }
+
     /* Last, so that its 15K never takes room the steps above need. */
     if (dt_set_pmp_t6030())
         return -1;
@@ -8427,6 +8709,10 @@ int kboot_prepare_dt(void *fdt)
         dt_t6031_fw_uuids(dt);
     }
 
+    if (chip_id == T6040 && board_id == 4 && adt_is_compatible(adt, 0, "J614sAP") &&
+        !fdt_node_check_compatible(dt, 0, "apple,j614s") && dt_split_j614s_sep_reservations())
+        bail("FDT: could not split J614s SEP reservations\n");
+
     /* T8140 PCIe status is known only after pcie_init() in kboot_boot(). */
     if (chip_id != T8140 && fdt_pack(dt))
         bail("FDT: fdt_pack() failed\n");
@@ -8450,6 +8736,167 @@ static int dt_disable_j713_pcie(void)
         return -1;
     return 0;
 }
+
+/* J614s ISP handoff. Run only after the DAPF result is known. */
+static int dt_finish_j614s_isp(bool ready)
+{
+    static const char expected_names[] = "text\0data\0heap";
+    static const char segment_names[] = "__TEXT;__DATA";
+    static const char *const paths[] = {"/reserved-memory/isp-firmware-text",
+                                        "/reserved-memory/isp-firmware-data",
+                                        "/reserved-memory/isp-heap"};
+    const struct adt_segment_ranges *segments;
+    const fdt32_t *refs, *map;
+    u64 phys[2], iova[2], size[2], dram_base, dram_size;
+    u32 isp_phandle, handles[3], darts[3], len;
+    int bytes, chosen, adt_isp, isp;
+
+    if (!ready || os_firmware.version != V26_6_2)
+        return -1;
+    chosen = adt_path_offset(adt, "/chosen");
+    adt_isp = adt_path_offset(adt, "/arm-io/isp0");
+    isp = fdt_node_offset_by_compatible(dt, -1, "apple,t6041-isp");
+    if (chosen < 0 || adt_isp < 0 || isp < 0 ||
+        ADT_GETPROP(adt, chosen, "dram-base", &dram_base) != sizeof(dram_base) ||
+        ADT_GETPROP(adt, chosen, "dram-size", &dram_size) != sizeof(dram_size) ||
+        !dram_size || dram_base > UINT64_MAX - dram_size)
+        return -1;
+    const char *names = adt_getprop(adt, adt_isp, "segment-names", &len);
+    if (!names || len != sizeof(segment_names) || memcmp(names, segment_names, len))
+        return -1;
+    segments = adt_getprop(adt, adt_isp, "segment-ranges", &len);
+    if (!segments || len != 2 * sizeof(*segments))
+        return -1;
+    for (int i = 0; i < 2; i++) {
+        phys[i] = segments[i].phys;
+        iova[i] = segments[i].remap;
+        size[i] = ALIGN_UP((u64)segments[i].size, SZ_16K);
+        if (!size[i] || size[i] > 32 * SZ_1M || (phys[i] & (SZ_16K - 1)) ||
+            (iova[i] & (SZ_16K - 1)) || phys[i] < dram_base || size[i] > dram_size ||
+            phys[i] - dram_base > dram_size - size[i] || iova[i] > UINT64_MAX - size[i])
+            return -1;
+    }
+    if (iova[0] != 0x10000000000ULL || iova[1] != iova[0] + size[0] ||
+        size[0] + size[1] > 32 * SZ_1M ||
+        (phys[0] < phys[1] + size[1] && phys[1] < phys[0] + size[0]))
+        return -1;
+
+    names = fdt_getprop(dt, isp, "memory-region-names", &bytes);
+    if (!names || bytes != sizeof(expected_names) || memcmp(names, expected_names, bytes))
+        return -1;
+    refs = fdt_getprop(dt, isp, "memory-region", &bytes);
+    if (!refs || bytes != sizeof(handles))
+        return -1;
+    for (int i = 0; i < 3; i++) {
+        handles[i] = fdt32_ld(refs + i);
+        int node = fdt_path_offset(dt, paths[i]);
+        if (node < 0 || fdt_node_offset_by_phandle(dt, handles[i]) != node)
+            return -1;
+    }
+    isp_phandle = fdt_get_phandle(dt, isp);
+    int heap = fdt_path_offset(dt, paths[2]);
+    map = fdt_getprop(dt, heap, "iommu-addresses", &bytes);
+    if (!isp_phandle || !map || bytes != 5 * sizeof(*map) || fdt32_ld(map) != isp_phandle ||
+        fdt32_ld(map + 1) != 0x100 || fdt32_ld(map + 2) || fdt32_ld(map + 3) ||
+        fdt32_ld(map + 4) != 32 * SZ_1M)
+        return -1;
+    refs = fdt_getprop(dt, isp, "iommus", &bytes);
+    if (!refs || bytes != 6 * sizeof(*refs))
+        return -1;
+    for (int i = 0; i < 3; i++)
+        darts[i] = fdt32_ld(refs + i * 2);
+
+    for (int i = 0; i < 2; i++) {
+        const char *name = i ? "isp-firmware-data" : "isp-firmware-text";
+        int node = dt_get_or_add_reserved_mem(name, "apple,asc-mem", true, phys[i], size[i]);
+        if (node < 0)
+            return -1;
+        int ret = fdt_delprop(dt, node, "iommu-addresses");
+        if ((ret && ret != -FDT_ERR_NOTFOUND) ||
+            dt_device_set_reserved_mem(node, name, isp_phandle, iova[i], size[i]))
+            return -1;
+    }
+    isp = fdt_node_offset_by_compatible(dt, -1, "apple,t6041-isp");
+    if (isp < 0 || firmware_set_fdt(dt, isp, "apple,firmware-version", &os_firmware) < 0)
+        return -1;
+    isp = fdt_node_offset_by_compatible(dt, -1, "apple,t6041-isp");
+    if (isp < 0 || fdt_setprop_string(dt, isp, "status", "okay"))
+        return -1;
+    for (int i = 0; i < 3; i++) {
+        int dart = fdt_node_offset_by_phandle(dt, darts[i]);
+        if (dart < 0 || fdt_setprop_string(dt, dart, "status", "okay"))
+            return -1;
+    }
+    return 0;
+}
+
+/* J614s AOP handoff. Run only after the DAPF result is known. */
+static int dt_finish_j614s_aop(void *tree, bool ready)
+{
+    fdt32_t keep[2];
+    u32 remove[8], handles[8];
+    int len, count, code = 0, log = 0, nkeep = 0, nremove = 0;
+    int aop = fdt_node_offset_by_compatible(tree, -1, "apple,t6041-aop");
+    const fdt32_t *refs;
+
+    if (!ready || aop < 0)
+        return -1;
+    refs = fdt_getprop(tree, aop, "memory-region", &len);
+    if (!refs || len <= 0 || len > (int)sizeof(handles) || len % 4)
+        return -1;
+    count = len / 4;
+    for (int i = 0; i < count; i++)
+        handles[i] = fdt32_ld(refs + i);
+    for (int i = 0; i < count; i++) {
+        int node = fdt_node_offset_by_phandle(tree, handles[i]), bytes;
+        const fdt64_t *reg;
+        const fdt32_t *maps;
+        u64 phys, size, iova, span;
+        if (node < 0)
+            return -1;
+        reg = fdt_getprop(tree, node, "reg", &bytes);
+        if (!reg || bytes != 16 || !fdt_getprop(tree, node, "no-map", NULL))
+            return -1;
+        phys = fdt64_ld(reg);
+        size = fdt64_ld(reg + 1);
+        maps = fdt_getprop(tree, node, "iommu-addresses", &bytes);
+        if (!maps || bytes != 20 || fdt32_ld(maps) != fdt_get_phandle(tree, aop))
+            return -1;
+        iova = (u64)fdt32_ld(maps + 1) << 32 | fdt32_ld(maps + 2);
+        span = (u64)fdt32_ld(maps + 3) << 32 | fdt32_ld(maps + 4);
+        if (!size || size != span || (phys & 0x3fff) || (size & 0x3fff) ||
+            (iova & 0x3fff) || phys > UINT64_MAX - size || iova > UINT64_MAX - size)
+            return -1;
+        if (iova != 0x10000000000ULL && iova != phys) {
+            remove[nremove++] = handles[i];
+            continue;
+        }
+        if (nkeep == 2)
+            return -1;
+        code += iova == 0x10000000000ULL;
+        log += iova == phys;
+        keep[nkeep++] = cpu_to_fdt32(handles[i]);
+    }
+    if (code != 1 || log != 1 || nkeep != 2)
+        return -1;
+    for (int i = 0; i < nremove; i++) {
+        int node = fdt_node_offset_by_phandle(tree, remove[i]);
+        if (node < 0 || fdt_delprop(tree, node, "iommu-addresses"))
+            return -1;
+    }
+    aop = fdt_node_offset_by_compatible(tree, -1, "apple,t6041-aop");
+    if (aop < 0 || fdt_setprop(tree, aop, "memory-region", keep, sizeof(keep)))
+        return -1;
+    aop = fdt_node_offset_by_compatible(tree, -1, "apple,t6041-aop");
+    refs = fdt_getprop(tree, aop, "iommus", &len);
+    if (!refs || len < 8)
+        return -1;
+    int dart = fdt_node_offset_by_phandle(tree, fdt32_ld(refs));
+    if (dart < 0 || fdt_setprop_string(tree, dart, "status", "okay"))
+        return -1;
+    return 0;
+}
+
 
 int kboot_boot(void *kernel)
 {
@@ -8512,6 +8959,47 @@ int kboot_boot(void *kernel)
         return -1;
     }
 
+    if (chip_id == T6040 && board_id == 4 && adt_is_compatible(adt, 0, "J614sAP") &&
+        !fdt_node_check_compatible(dt, 0, "apple,j614s")) {
+        if (fdt_open_into(dt, dt, dt_bufsize))
+            return -1;
+        void *aop_tree = malloc(dt_bufsize);
+        if (!aop_tree)
+            return -1;
+        int aop_ret = fdt_open_into(dt, aop_tree, dt_bufsize);
+        if (!aop_ret)
+            aop_ret = dt_finish_j614s_aop(aop_tree, dapf_j614s_aop_ready());
+        if (!aop_ret) {
+            memcpy(dt, aop_tree, dt_bufsize);
+        } else {
+            int aop = fdt_node_offset_by_compatible(dt, -1, "apple,t6041-aop");
+            if (aop >= 0 && fdt_setprop_string(dt, aop, "status", "disabled")) {
+                free(aop_tree);
+                return -1;
+            }
+            printf("FDT: J614s AOP handoff failed, keeping AOP disabled\n");
+        }
+        int isp_ret = fdt_open_into(dt, aop_tree, dt_bufsize);
+        if (!isp_ret) {
+            void *original = dt;
+            dt = aop_tree;
+            isp_ret = dt_finish_j614s_isp(dapf_j614s_isp_ready());
+            dt = original;
+        }
+        if (!isp_ret) {
+            memcpy(dt, aop_tree, dt_bufsize);
+        } else {
+            int isp = fdt_node_offset_by_compatible(dt, -1, "apple,t6041-isp");
+            if (isp >= 0 && fdt_setprop_string(dt, isp, "status", "disabled")) {
+                free(aop_tree);
+                return -1;
+            }
+            printf("FDT: J614s ISP handoff failed, keeping ISP disabled\n");
+        }
+        free(aop_tree);
+        if (fdt_pack(dt))
+            return -1;
+    }
     printf("Setting SMP mode to WFE...\n");
     smp_set_wfe_mode(true);
     if (chip_id == T8140 && dt_t8140_recheck_display())
