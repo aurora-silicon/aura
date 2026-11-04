@@ -1023,8 +1023,8 @@ static const struct j614s_atc_tunable j614s_atc_tunables[] = {
 };
 
 static bool j614s_hdmi_ready;
-static const char *const j614s_phys[] = {"/phy@382a90000", "/phy@38aa90000",
-                                        "/phy@392a90000", "/phy@39aa90000"};
+static const char *const j614s_phys[] = {"/phy@382a90000", "/phy@38aa90000", "/phy@392a90000",
+                                         "/phy@39aa90000"};
 
 bool kboot_j614s_hdmi_ready(void)
 {

@@ -1792,7 +1792,8 @@ static int dt_prune_cpu_cooling(void *fdt, const u32 *pruned, const u32 *pruned_
                 if (!phandle || args == UINT32_MAX || args > count - i - 1) {
                     free(kept);
                     printf("FDT: %s: invalid cooling specifier or unknown cell count, "
-                           "leaving unchanged\n", path);
+                           "leaving unchanged\n",
+                           path);
                     goto next;
                 }
                 size_t cells = 1 + args;
@@ -8758,8 +8759,8 @@ static int dt_finish_j614s_isp(bool ready)
     isp = fdt_node_offset_by_compatible(dt, -1, "apple,t6041-isp");
     if (chosen < 0 || adt_isp < 0 || isp < 0 ||
         ADT_GETPROP(adt, chosen, "dram-base", &dram_base) != sizeof(dram_base) ||
-        ADT_GETPROP(adt, chosen, "dram-size", &dram_size) != sizeof(dram_size) ||
-        !dram_size || dram_base > UINT64_MAX - dram_size)
+        ADT_GETPROP(adt, chosen, "dram-size", &dram_size) != sizeof(dram_size) || !dram_size ||
+        dram_base > UINT64_MAX - dram_size)
         return -1;
     const char *names = adt_getprop(adt, adt_isp, "segment-names", &len);
     if (!names || len != sizeof(segment_names) || memcmp(names, segment_names, len))
@@ -8864,8 +8865,8 @@ static int dt_finish_j614s_aop(void *tree, bool ready)
             return -1;
         iova = (u64)fdt32_ld(maps + 1) << 32 | fdt32_ld(maps + 2);
         span = (u64)fdt32_ld(maps + 3) << 32 | fdt32_ld(maps + 4);
-        if (!size || size != span || (phys & 0x3fff) || (size & 0x3fff) ||
-            (iova & 0x3fff) || phys > UINT64_MAX - size || iova > UINT64_MAX - size)
+        if (!size || size != span || (phys & 0x3fff) || (size & 0x3fff) || (iova & 0x3fff) ||
+            phys > UINT64_MAX - size || iova > UINT64_MAX - size)
             return -1;
         if (iova != 0x10000000000ULL && iova != phys) {
             remove[nremove++] = handles[i];
@@ -8896,7 +8897,6 @@ static int dt_finish_j614s_aop(void *tree, bool ready)
         return -1;
     return 0;
 }
-
 
 int kboot_boot(void *kernel)
 {

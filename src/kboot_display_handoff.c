@@ -74,11 +74,11 @@
  * whether it knows that image. No ADT description is logged (the ADT reaches Linux whole, and the
  * log ring is 16K); the DART stream registers are.
  *
- * T6041 display block of the M4 Pro (chip T6040, J616s and J614s), with the desktop 26.6.2 DCP firmware:
- * the T6031 handoff with T6041 values. There is no /chosen opt-in: the handoff is attempted on
- * every J616s and J614s boot whose OS firmware matches the known
- * profile, and whose device tree describes the T6041 display block (aliases dcp and disp0,
- * compatible apple,t6041-dcp and apple,display-subsystem). Anything else gets nothing at all: no
+ * T6041 display block of the M4 Pro (chip T6040, J616s and J614s), with the desktop 26.6.2 DCP
+ * firmware: the T6031 handoff with T6041 values. There is no /chosen opt-in: the handoff is
+ * attempted on every J616s and J614s boot whose OS firmware matches the known profile, and whose
+ * device tree describes the T6041 display block (aliases dcp and disp0, compatible apple,t6041-dcp
+ * and apple,display-subsystem). Anything else gets nothing at all: no
  * __OS_LOG reservation, no register access, no DT edit. On a supported boot the __OS_LOG
  * reservation and every check below run as on T6031, and the handoff is published only if all of
  * them pass. The DCP maps through dart-dcp SID 23 and the display and its piodma through dart-disp0
