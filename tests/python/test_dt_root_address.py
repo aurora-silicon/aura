@@ -11,8 +11,11 @@ def test_root_address(tmp_path):
 #include <assert.h>
 #include <stdint.h>
 #include <libfdt.h>
-/* Keep firmware-only typedefs out of the host SDK headers. */
-uint64_t dt_get_address(void *dt, int node);
+/* Compile the actual implementation with host types, without importing
+ * firmware-only uintptr_t/ssize_t typedefs into the macOS SDK headers. */
+#define TYPES_H
+typedef uint64_t u64;
+#include "devicetree.c"
 
 static void put_reg(void *fdt, const char *path, const fdt32_t *reg, int len)
 {
@@ -56,6 +59,6 @@ int main(void)
     binary = tmp_path / "dt-root"
     subprocess.run(["cc", "-std=gnu11", "-Wall", "-Wextra", "-Werror",
                     "-I", str(repo / "src"), "-I", str(libfdt), str(cfile),
-                    str(repo / "src/devicetree.c"), *(str(p) for p in sources),
+                    *(str(p) for p in sources),
                     "-o", str(binary)], check=True)
     subprocess.run([str(binary)], check=True)
