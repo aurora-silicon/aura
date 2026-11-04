@@ -28,12 +28,15 @@ typedef unsigned long u64;
 typedef uint32_t u32;
 #define SZ_16K 0x4000
 #define T6030 0x6030
+#define T6041 0x6041
 #define T8132 0x8132
 /* Only the dram_only segment filter reads properties this way. */
 #define ADT_GETPROP(a, n, k, v) ((size_t)0)
 static u32 chip_id;
 static unsigned int mappings, links;
 #define ALIGN_UP(x, a) (((x) + (a) - 1) & ~((a) - 1))
+/* Stub: the T6041 ISP handoff isn't exercised here. */
+__attribute__((unused)) static int dt_set_isp_t6041(int node) { (void)node; return 0; }
 #define V13_5 0
 #define V13_6_1 1
 #define bail(...) do { return -1; } while (0)

@@ -26,6 +26,7 @@ typedef uint64_t u64;
 #define T6030 0x6030
 #define T6031 0x6031
 #define T6034 0x6034
+#define T6041 0x6041
 #define T8140 0x8140
 #define V12_3 1
 #define V12_4 2
@@ -38,6 +39,8 @@ typedef uint64_t u64;
 #define SZ_16K 0x4000
 #define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
 #define ALIGN_UP(x, a) (((x) + (a) - 1) & ~((a) - 1))
+/* Stub: the T6041 ISP handoff isn't exercised here. */
+__attribute__((unused)) static int dt_set_isp_t6041(int node) { (void)node; return 0; }
 
 struct adt_segment_ranges {
     u64 phys, iova, remap;
@@ -314,6 +317,9 @@ def test_isp_fdt_fails_closed_and_exports_heap(tmp_path):
 #include <string.h>
 typedef uint64_t u64;
 typedef uint32_t u32;
+#define T6041 0x6041
+static u32 chip_id;
+static int dt_set_isp_t6041(int node) { (void)node; return 0; }
 #define V13_6_1 1
 #define V13_5 2
 #define bail(...) do { fprintf(stderr, __VA_ARGS__); return -1; } while (0)
