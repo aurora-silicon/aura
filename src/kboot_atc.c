@@ -992,11 +992,147 @@ cleanup:
     printf("FDT: Unable to setup ATC tunables for %s - USB3/Thunderbolt will not work\n", adt_path);
 }
 
+/* T6040 uses separate register resources for these tables. */
+struct j614s_atc_tunable {
+    const char *adt_name, *fdt_name, *resource;
+    u32 bias, window, limit;
+    bool controller_source, controller_target;
+};
+
+static const struct j614s_atc_tunable j614s_atc_tunables[] = {
+    {"tunable_ATC0AXI2AF", "apple,tunable-axi2af", "axi2af", 0, 0, 0, false, false},
+    {"tunable_ATC_FABRIC", "apple,tunable-fabric", "fabric", 0, 0, 0, false, false},
+    {"tunable_ATC_COMMON_CFG", "apple,tunable-common-cfg", "common-cfg", 0, 0, 0, false, false},
+    {"tunable_ATC0AXI2AF_LIOA", "apple,tunable-axi2af-lioa", "axi2af-lioa", 0, 0, 0, false, false},
+    {"tunable_LN0_RX_CFG_TX_OF_RXCLK", "apple,tunable-lane0", "core", 0xd000, 0, 0, false, false},
+    {"tunable_LN1_RX_CFG_TX_OF_RXCLK", "apple,tunable-lane1", "core", 0x1d000, 0, 0, false, false},
+    {"tunable_AUS40CMN_SHM", "apple,tunable-aus40cmn-shm", "core", 0xa00, 0, 0, false, false},
+    {"tunable_AUSPLL_CORE", "apple,tunable-auspll", "core", 0x3200, 0, 0, false, false},
+    {"tunable_CIO4PLL_CORE", "apple,tunable-cio4pll", "core", 0x3a00, 0, 0, false, false},
+    {"tunable_USB2PHY_HOST", "apple,tunable-usb2-host", "bank0", 0, 0, 0, false, false},
+    {"tunable_PIPE_HANDLER_DEFAULT", "apple,tunable-pipehandler", "pipehandler", 0, 0, 0, true,
+     false},
+    {"tunable_DRD_USB31_GBL_DEFAULT", "apple,tunable-gbl-default", "dwc3-core", 0, 0xc100, 0x600,
+     true, true},
+    {"tunable_DRD_USB31_GBL_HOST", "apple,tunable-gbl-host", "dwc3-core", 0, 0xc100, 0x600, true,
+     true},
+    {"tunable_DRD_USB31_DBG_DEFAULT", "apple,tunable-dbg", "dwc3-apple", 0, 0xb00, 0x800, true,
+     true},
+    {"tunable_DRD_USB31_CFG_HOST", "apple,tunable-cfg-host", "drd-cfg", 0, 0, 0, true, true},
+    {"tunable_LINK_REGS_DEFAULT", "apple,tunable-link", "dwc3-apple", 0, 0x300, 0x800, true, true},
+};
+
+static bool j614s_hdmi_ready;
+static const char *const j614s_phys[] = {"/phy@382a90000", "/phy@38aa90000",
+                                        "/phy@392a90000", "/phy@39aa90000"};
+
+bool kboot_j614s_hdmi_ready(void)
+{
+    return j614s_hdmi_ready;
+}
+static const char *const j614s_controllers[] = {"/usb@382280000", "/usb@38a280000",
+                                                "/usb@392280000"};
+
+static int j614s_resource_size(void *dt, int node, const char *name, u64 *size)
+{
+    int parent = fdt_parent_offset(dt, node), len;
+    int index = fdt_stringlist_search(dt, node, "reg-names", name);
+    const fdt64_t *reg = fdt_getprop(dt, node, "reg", &len);
+    if (parent < 0 || fdt_address_cells(dt, parent) != 2 || fdt_size_cells(dt, parent) != 2 ||
+        index < 0 || !reg || len < 0 || len % 16 || (u32)index >= (u32)len / 16)
+        return -1;
+    *size = fdt64_ld(reg + 2 * index + 1);
+    return *size ? 0 : -1;
+}
+
+static int j614s_export_atc(void *dt, int port)
+{
+    char adt_path[32];
+    const char *phy_path = j614s_phys[port];
+    const char *usb_path = port < 3 ? j614s_controllers[port] : NULL;
+    int phy, usb = -1, source, usb_source = -1;
+
+    phy = fdt_path_offset(dt, phy_path);
+    snprintf(adt_path, sizeof(adt_path), "/arm-io/atc-phy%d", port);
+    source = adt_path_offset(adt, adt_path);
+    if (phy < 0 || source < 0 || fdt_node_check_compatible(dt, phy, "apple,t6040-atcphy"))
+        return -1;
+    if (port == 3) {
+        int len;
+        const char *status = fdt_getprop(dt, phy, "status", &len);
+        if (!status || len != sizeof("disabled") || memcmp(status, "disabled", len))
+            return -1;
+    } else {
+        usb = fdt_path_offset(dt, usb_path);
+        snprintf(adt_path, sizeof(adt_path), "/arm-io/usb-drd%d", port);
+        usb_source = adt_path_offset(adt, adt_path);
+        if (usb < 0 || usb_source < 0 || fdt_node_check_compatible(dt, usb, "apple,t6040-dwc3"))
+            return -1;
+    }
+    size_t count = port == 3 ? 9 : ARRAY_SIZE(j614s_atc_tunables);
+    for (size_t i = 0; i < count; i++) {
+        const struct j614s_atc_tunable *item = &j614s_atc_tunables[i];
+        const char *target_path = item->controller_target ? usb_path : phy_path;
+        int target = fdt_path_offset(dt, target_path);
+        int src = item->controller_source ? usb_source : source;
+        u64 size;
+        u32 len;
+        if (target < 0 || j614s_resource_size(dt, target, item->resource, &size) ||
+            item->window > size || (item->limit && item->limit > size - item->window) ||
+            item->bias >= (item->limit ? item->limit : size - item->window) ||
+            !adt_getprop(adt, src, item->adt_name, &len) || !len)
+            return -1;
+        struct adt_tunable_info info = {
+            item->adt_name, item->fdt_name, item->bias,
+            (item->limit ? item->limit : size - item->window) - item->bias, true};
+        int ret = fdt_delprop(dt, target, item->fdt_name);
+        if ((ret && ret != -FDT_ERR_NOTFOUND) || dt_append_atc_tunable(dt, src, target, &info))
+            return -1;
+    }
+    if (port == 3)
+        return 0; /* The PMP-aware display gate owns PHY power. */
+    phy = fdt_path_offset(dt, phy_path);
+    if (phy < 0 || fdt_setprop_string(dt, phy, "status", "okay"))
+        return -1;
+    usb = fdt_path_offset(dt, usb_path);
+    return usb < 0 ? -1 : fdt_setprop_string(dt, usb, "status", "okay");
+}
+
 int kboot_setup_atc(void *dt)
 {
     char adt_path[32];
     char fdt_alias[32];
 
+    if (chip_id == T6040 && board_id == 4 && adt_is_compatible(adt, 0, "J614sAP") &&
+        !fdt_node_check_compatible(dt, 0, "apple,j614s")) {
+        int capacity = fdt_totalsize(dt);
+        void *scratch = malloc(capacity);
+        j614s_hdmi_ready = false;
+        for (size_t i = 0; i < ARRAY_SIZE(j614s_phys); i++) {
+            int ret = scratch ? fdt_open_into(dt, scratch, capacity) : -1;
+            if (!ret)
+                ret = j614s_export_atc(scratch, i);
+            if (!ret) {
+                memcpy(dt, scratch, capacity);
+                if (i == 3)
+                    j614s_hdmi_ready = true;
+            } else {
+                printf("FDT: J614s ATC%zu tuning unavailable\n", i);
+                int node = fdt_path_offset(dt, j614s_phys[i]);
+                if (node >= 0 && fdt_setprop_string(dt, node, "status", "disabled")) {
+                    free(scratch);
+                    return -1;
+                }
+                node = i < 3 ? fdt_path_offset(dt, j614s_controllers[i]) : -1;
+                if (node >= 0 && fdt_setprop_string(dt, node, "status", "disabled")) {
+                    free(scratch);
+                    return -1;
+                }
+            }
+        }
+        free(scratch);
+        return 0;
+    }
     for (int i = 0; i < MAX_ATC_DEVS; ++i) {
         memset(adt_path, 0, sizeof(adt_path));
         snprintf(adt_path, sizeof(adt_path), "/arm-io/atc-phy%d", i);

@@ -703,6 +703,7 @@ static void world_ext(int which)
 }
 
 static const char J616S[] = "apple,j616s\0apple,t6040\0apple,arm-platform";
+static const char OTHER[] = "apple,j999s\0apple,t6040\0apple,arm-platform";
 static const char J614S[] = "apple,j614s\0apple,t6040\0apple,arm-platform";
 
 /* ---- checks ---- */
@@ -983,7 +984,9 @@ static const struct scenario scenarios[] = {
     {"oslog-in-memreserve", PUBLISH, "an __OS_LOG wholly inside a /memreserve/ is still described"},
     /* chip, board and device tree */
     {"wrong-chip", NOTHING, "chip T6041 with a T6040 device tree"},
-    {"wrong-board", NOTHING, "a T6040 board other than the J616s"},
+    {"wrong-board", NOTHING, "an unsupported T6040 board"},
+    {"j614-no-optin", PUBLISH, "J614s publishes without an explicit opt-in"},
+    {"j614-optin", PUBLISH, "J614s ignores a stale explicit opt-in"},
     {"no-display-dt", NOTHING, "a J616s device tree without the display block"},
     {"no-dcp-alias", NOTHING, "a J616s device tree without the dcp alias"},
     {"wrong-dcp-compat", NOTHING, "dcp is not apple,t6041-dcp"},
@@ -1056,7 +1059,9 @@ int main(int argc, char **argv)
     world_j616s(&o);
 
     static u8 dt[DT_SIZE], in[DT_SIZE];
-    build_dt(dt, is(s, "wrong-board") ? J614S : J616S, sizeof(J616S));
+    const char *board = is(s, "wrong-board") ? OTHER :
+                        (is(s, "j614-no-optin") || is(s, "j614-optin")) ? J614S : J616S;
+    build_dt(dt, board, sizeof(J616S));
     if (is(s, "external") || is(s, "external-refuse")) {
         for (int i = 0; i < 2; i++) {
             build_ext(dt, i);
@@ -1133,7 +1138,7 @@ int main(int argc, char **argv)
     if (is(s, "oslog-straddles"))
         OK(fdt_add_mem_rsv(dt, segs[SEG_OSLOG].phys + 0x4000, seg_size(SEG_OSLOG)));
     int chosen = fdt_path_offset(dt, "/chosen");
-    if (is(s, "stale-optin") || is(s, "stale-optin-no-dcp") || is(s, "stale-optin-wrong-disp") ||
+    if (is(s, "j614-optin") || is(s, "stale-optin") || is(s, "stale-optin-no-dcp") || is(s, "stale-optin-wrong-disp") ||
         is(s, "stale-optin-wrong-os"))
         OK(fdt_setprop_string(dt, chosen, OPTIN, "1"));
     if (is(s, "stale-optin-zero"))

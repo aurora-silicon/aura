@@ -26,6 +26,10 @@
 #display2=max
 #display2=1920x1080@60
 
+# Keep the debug UART (ttyDC0 on the MacBook Neo, ttySAC0 on M1/M2) as the OS console
+# from /chosen/stdout-path. By default only debug boots keep it; 0 removes it on every boot
+#chosen.aura,serial-console=1
+
 # Add an arbitrary property to /chosen in the device tree
 #chosen.foo=bar
 

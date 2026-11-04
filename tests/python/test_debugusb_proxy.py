@@ -351,11 +351,26 @@ static size_t seen_count;
 static bool nvme_init(void) { return true; }
 static bool nvme_has_live_post_m4_session(void) { return false; }
 static bool nvme_shutdown(void) { return true; }
+#define CMDLINE_LENGTH_RV1 256
+#define CMDLINE_LENGTH_RV2 608
 #define CMDLINE_LENGTH_RV3 1024
-static struct { struct { char cmdline[CMDLINE_LENGTH_RV3]; } rv3; } cur_boot_args;
+static struct { int revision; struct { char cmdline[CMDLINE_LENGTH_RV3]; } rv3; } cur_boot_args = {.revision = 3};
 static char trial_path[128];
 static bool aura_trial_enabled(void) { return false; }
 static void boot_options_set_trial(bool trial) {}
+static bool host_seen, console_on, append_full;
+static bool dockchannel_uart_host_seen(void) { return host_seen; }
+static bool aura_console_enabled(void) { return console_on; }
+static void boot_options_set_console(bool console) { console_on = console; }
+static bool boot_options_append(char *line, size_t capacity, const char *option)
+{
+    if (append_full || strlen(line) + strlen(option) + 2 > capacity)
+        return false;
+    if (line[0])
+        strcat(line, " ");
+    strcat(line, option);
+    return true;
+}
 static bool chainload_start_trial(char **vars, size_t *var_cnt, size_t var_capacity)
 {
     return false;
@@ -397,6 +412,24 @@ int main(void)
     count = 2;
     vars[0] = vars[1] = "chosen.x=1";
     assert(chainload_load("test", vars, &count, 2) == 0 && count == 2);
+    assert(!console_on && !strstr(cur_boot_args.rv3.cmdline, "aura-console"));
+
+    /* A debugusb host reading the console: the next stage keeps the debug UART console. */
+    offered = false;
+    host_seen = true;
+    strcpy(cur_boot_args.rv3.cmdline, "-v");
+    count = 0;
+    assert(chainload_load("test", vars, &count, 2) == 0 && count == 0);
+    assert(console_on && !strcmp(cur_boot_args.rv3.cmdline, "-v aura-console"));
+    /* Once is enough */
+    assert(chainload_load("test", vars, &count, 2) == 0);
+    assert(!strcmp(cur_boot_args.rv3.cmdline, "-v aura-console"));
+    /* No room in the boot arguments: boot anyway, as a normal boot. */
+    console_on = false;
+    append_full = true;
+    strcpy(cur_boot_args.rv3.cmdline, "-v");
+    assert(chainload_load("test", vars, &count, 2) == 0);
+    assert(!console_on && !strcmp(cur_boot_args.rv3.cmdline, "-v"));
     return 0;
 }
 '''
