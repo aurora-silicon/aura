@@ -20,6 +20,7 @@
 #include "iodev.h"
 #include "isp.h"
 #include "kboot_atc.h"
+#include "kboot_audio.h"
 #include "kboot_display_facts.h"
 #include "kboot_gpu_t8122.h"
 #include "kboot_pmp_t8122.h"
@@ -8669,6 +8670,7 @@ int kboot_prepare_dt(void *fdt)
         return dt_prepare_t8152();
     if (dt_set_speaker_safety())
         return -1;
+    kboot_audio_amp_config(dt, adt);
     if (dt_set_uboot_config())
         return -1;
     if (dt_set_serial_number())
