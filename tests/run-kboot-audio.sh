@@ -75,6 +75,7 @@ six() { # six <addr> <group index>: an amp of the six-amps group
 }
 expect() { # expect <scenario>: the amp lines that scenario must give (tree order 0x40, 0x42, 0x41)
     case $1 in
+    identity-*) ;;
     group)
         amp 40 $BOP $DCB $R0 $Z0
         amp 42 $BOP $DCB $R2 $Z2
@@ -125,6 +126,13 @@ for s in $(python3 -I tests/kboot_audio_adt.py scenarios); do
         diff -u "$tmp/$s.want" "$tmp/$s.got" || true
         fail "$s"
     fi
+    if [ "$s" = identity-valid ]; then
+        echo 'acoustic 00000023' > "$tmp/identity.want"
+    else
+        echo 'acoustic -' > "$tmp/identity.want"
+    fi
+    grep '^acoustic ' "$tmp/$s.out" > "$tmp/identity.got"
+    cmp -s "$tmp/identity.got" "$tmp/identity.want" || fail "$s: wrong acoustic identity"
     echo "ok $s: $(grep -v '^amp ' "$tmp/$s.out" | tail -n 1)"
     n=$((n + 1))
 done

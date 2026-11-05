@@ -8670,6 +8670,8 @@ int kboot_prepare_dt(void *fdt)
         return dt_prepare_t8152();
     if (dt_set_speaker_safety())
         return -1;
+    if (kboot_audio_identity(dt, adt))
+        bail("FDT: could not export audio identity\n");
     kboot_audio_amp_config(dt, adt);
     if (dt_set_uboot_config())
         return -1;

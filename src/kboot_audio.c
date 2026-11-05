@@ -234,3 +234,53 @@ int kboot_audio_amp_config(void *dt, const void *adt)
     }
     return 0;
 }
+
+/* Export an independently collected AID for userspace speaker-tuning binding.
+ * ADT words are little endian on Apple Silicon; FDT cells are big endian.
+ * Refuse ambiguity (including equal values) and discard stale DTB data. */
+static int acoustic_id_walk(const void *adt, int node, u32 *aid, int depth, u32 *budget)
+{
+    if (depth > 64 || !*budget)
+        return -1;
+    --*budget;
+    int count = 0;
+    const char *name = adt_get_name(adt, node);
+    u32 len;
+    const void *raw = adt_getprop(adt, node, "acoustic-id", &len);
+    if (name && !strcmp(name, "audio") && raw) {
+        if (len != sizeof(*aid))
+            return -1;
+        memcpy(aid, raw, sizeof(*aid));
+        if (!*aid || *aid >= 100000)
+            return -1;
+        count = 1;
+    }
+    int child = node;
+    ADT_FOREACH_CHILD(adt, child)
+    {
+        int n = acoustic_id_walk(adt, child, aid, depth + 1, budget);
+        if (n < 0 || count + n > 1)
+            return -1;
+        count += n;
+    }
+    return count;
+}
+
+int kboot_audio_identity(void *dt, const void *adt)
+{
+    const char *prop = "asahi,acoustic-id";
+    int chosen = fdt_path_offset(dt, "/chosen");
+    if (chosen >= 0) {
+        int ret = fdt_delprop(dt, chosen, prop);
+        if (ret && ret != -FDT_ERR_NOTFOUND)
+            return ret;
+    }
+    u32 aid, budget = 65536;
+    if (acoustic_id_walk(adt, 0, &aid, 0, &budget) != 1)
+        return 0;
+    if (chosen < 0)
+        chosen = fdt_add_subnode(dt, 0, "chosen");
+    if (chosen < 0)
+        return chosen;
+    return fdt_setprop_u32(dt, chosen, prop, aid);
+}

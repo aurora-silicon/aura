@@ -79,7 +79,7 @@ int main(int argc, char **argv)
         return 2;
     }
 
-    if (kboot_audio_amp_config(dt, adt)) {
+    if (kboot_audio_identity(dt, adt) || kboot_audio_amp_config(dt, adt)) {
         printf("kboot_audio_amp_config failed\n");
         return 1;
     }
@@ -87,6 +87,17 @@ int main(int argc, char **argv)
         printf("result is not a valid device tree\n");
         return 1;
     }
+
+    int chosen = fdt_path_offset(dt, "/chosen");
+    int len = 0;
+    const unsigned char *aid = chosen < 0 ? NULL : fdt_getprop(dt, chosen, "asahi,acoustic-id", &len);
+    printf("acoustic ");
+    if (!aid)
+        printf("-");
+    else
+        for (int i = 0; i < len; i++)
+            printf("%02x", aid[i]);
+    printf("\n");
 
     for (int node = fdt_node_offset_by_compatible(dt, -1, "ti,sn012776"); node >= 0;
          node = fdt_node_offset_by_compatible(dt, node, "ti,sn012776")) {

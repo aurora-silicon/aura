@@ -97,6 +97,17 @@ ZD6 = bytes(range(0x30, 0x30 + 48))
 
 def scenario(name):
     """(ADT, DTS) for one scenario"""
+    if name.startswith("identity-"):
+        raw = {"identity-valid": u32(35), "identity-short": b"\x23",
+               "identity-zero": u32(0), "identity-large": u32(100000),
+               "identity-big-endian": struct.pack(">I", 35)}.get(name, u32(35))
+        children = [Node("product", children=[Node("audio", {"acoustic-id": raw})])]
+        if name == "identity-ambiguous":
+            children.append(Node("arm-io", children=[Node("audio", {"acoustic-id": u32(35)})]))
+        if name == "identity-missing":
+            children = []
+        return Node("device-tree", children=children), dts([]).replace(
+            '\tother@0', '\tchosen { asahi,acoustic-id = <999>; };\n\tother@0')
     three = [(0, 0x40), (1, 0x41), (0, 0x42)]
     group = [Node("i2c0", {}, [amp("audio-speaker", 0x40, 0x10, GROUP3),
                                 amp("audio-speaker-b", 0x42, 0x12)]),
@@ -150,7 +161,8 @@ def scenario(name):
     raise SystemExit("unknown scenario %s" % name)
 
 
-SCENARIOS = ["group", "no-dcblocker", "six-amps", "short-speaker-config", "single-amp", "amp-missing-in-dt", "amp-not-unique-in-dt",
+SCENARIOS = ["identity-valid", "identity-short", "identity-zero", "identity-large",
+             "identity-big-endian", "identity-ambiguous", "identity-missing", "group", "no-dcblocker", "six-amps", "short-speaker-config", "single-amp", "amp-missing-in-dt", "amp-not-unique-in-dt",
              "dangling-phandle", "no-amps"]
 
 
