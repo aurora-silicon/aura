@@ -20,6 +20,9 @@ BOARDS = {
                   text=0x100009D8000, data=0x1000196C000),
     "j700": dict(compat="apple,t8140-ane", node="ane@400000000", adt="/arm-io/ane",
                  text=0x10000768000, data=0x100019A0000),
+    # J775c (M5 Max), macOS 27.0 26A425 /arm-io/ane0 segment-ranges
+    "j775c": dict(compat="apple,t6050-ane", node="ane@508000000", adt="/arm-io/ane0",
+                  text=0x10000D4C000, data=0x1000154C000),
 }
 
 

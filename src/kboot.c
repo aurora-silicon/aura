@@ -4208,7 +4208,8 @@ static int dt_set_ave(void)
 
 /*
  * The M4 Pro and A18 Pro Neural Engines run firmware that iBoot preloads into
- * DRAM below the OS: /arm-io/ane0 (M4 Pro) or /arm-io/ane (A18 Pro) is
+ * DRAM below the OS (as does the M5 Max's, /arm-io/ane0 on T6050):
+ * /arm-io/ane0 (M4 Pro) or /arm-io/ane (A18 Pro) is
  * pre-loaded, with exactly a __TEXT and a __DATA segment range. Reserve both segments no-map and
  * give them to the ANE node as its "firmware-text" and "firmware-data" memory regions, with the
  * device addresses the firmware runs them at (their remap addresses) as apple,firmware-iovas. A DT
@@ -4225,6 +4226,7 @@ static int dt_set_ave(void)
 static const char *const ane_compatibles[] = {
     "apple,t6041-ane",
     "apple,t8140-ane",
+    "apple,t6050-ane",
 };
 
 static int dt_ane_fill_region(int resv, uint32_t phandle, const char *kind, u64 phys, u64 size)
