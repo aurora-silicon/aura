@@ -30,6 +30,10 @@
 # from /chosen/stdout-path. By default only debug boots keep it; 0 removes it on every boot
 #chosen.aura,serial-console=1
 
+# M4 MacBook Air (J713): hand the external display coprocessors over to the kernel
+# for external displays. Needs a kernel that adopts them
+#chosen.asahi,j713-dcpext=1
+
 # Add an arbitrary property to /chosen in the device tree
 #chosen.foo=bar
 

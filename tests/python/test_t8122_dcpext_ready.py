@@ -106,7 +106,8 @@ static int set_u32(void *tree, int node, const char *name, uint32_t value)
 ''' + function("dt_enable_dcp_with_typec_routes") +
         function("dt_device_set_reserved_mem") + function("dt_device_add_mem_region") +
         function("dt_reserve_asc_segments") + function("dt_reserve_asc_firmware") + aliases + "\n" +
-        function("dt_display_transaction") + function("dt_reserve_t8122_dcpext_one") +
+        function("dt_display_transaction") + function("dt_reserve_dcpext_ready") +
+        function("dt_reserve_t8122_dcpext_one") +
         function("dt_t8122_dcpext_armed", "static bool ") +
         function("dt_reserve_dcpext_firmware") + r'''
 static void world(void)
