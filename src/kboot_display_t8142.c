@@ -201,8 +201,8 @@ int kboot_t8142_display_reserve(void *dt, const char *alias)
          * still map the resident firmware; all three roots and their L2
          * tables must be validated and retained even when they are empty.
          */
-        if (!i && !m.ram_pages) {
-            printf("FDT: %s SID%u: no resident firmware mappings\n", alias, m.stream.sid);
+        if (!m.ram_pages && (!i || !strcmp(alias, "dcp"))) {
+            printf("FDT: %s SID%u: required RAM mappings are absent\n", alias, m.stream.sid);
             goto out;
         }
         dart_dev_t *dart = dart_init_fdt_locked(dt, m.stream.provider, m.stream.sid);
