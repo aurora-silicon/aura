@@ -7267,12 +7267,14 @@ static bool dt_display_phys_reserved(u64 phys, u64 size)
  * physical field differs from the active DART translation (__OS_LOG).
  * IOVA-only reservations avoid overlapping physical reserved-memory nodes
  * when a segment is already contained in a carveout or the framebuffer.
+ * The external DCPs share the layout; their __TEXT is the internal DCP's.
+ * With locked_only, a DART that iBoot did not lock is left alone: the
+ * coprocessor was not started, and inspecting the DART would program it.
  */
-static int dt_reserve_m5_display_segments(void)
+static int dt_reserve_m5_display_segments(const char *alias, const char *nub_path, bool locked_only)
 {
-    const char *alias = "dcp";
     int owner = fdt_path_offset(dt, alias);
-    int nub = adt_path_offset(adt, "/arm-io/dcp/iop-dcp-nub");
+    int nub = adt_path_offset(adt, nub_path);
     int chosen = adt_path_offset(adt, "/chosen");
     u64 dram, dram_size;
     u32 len = 0;
@@ -7282,15 +7284,24 @@ static int dt_reserve_m5_display_segments(void)
     if (owner < 0)
         return 0;
     if (nub < 0 || chosen < 0 || ADT_GETPROP(adt, chosen, "dram-base", &dram) != sizeof(dram) ||
-        ADT_GETPROP(adt, chosen, "dram-size", &dram_size) != sizeof(dram_size))
+        ADT_GETPROP(adt, chosen, "dram-size", &dram_size) != sizeof(dram_size) ||
+        dram_size < SZ_16K || dram > UINT64_MAX - dram_size)
         bail("ADT: missing M5 display firmware memory bounds\n");
     segments = adt_getprop(adt, nub, "segment-ranges", &len);
     if (!segments || !len || len % sizeof(*segments) || len / sizeof(*segments) > 64)
         bail("ADT: invalid M5 display segment inventory\n");
     u32 owner_phandle = fdt_get_phandle(dt, owner);
-    dart_dev_t *dart = dt_init_dart_by_node(owner, 0);
+    dart_dev_t *dart = NULL;
+    if (locked_only) {
+        int iommus_len;
+        const fdt32_t *iommus = fdt_getprop(dt, owner, "iommus", &iommus_len);
+        if (iommus && iommus_len >= 8)
+            dart = dart_init_fdt_locked(dt, fdt32_ld(&iommus[0]), fdt32_ld(&iommus[1]));
+    } else {
+        dart = dt_init_dart_by_node(owner, 0);
+    }
     if (!dart)
-        bail("FDT: cannot inspect M5 display firmware translations\n");
+        bail("FDT: cannot inspect %s firmware translations\n", alias);
 
     u64 total = 0;
     for (u32 i = 0; i < len / sizeof(*segments); i++) {
@@ -7298,8 +7309,7 @@ static int dt_reserve_m5_display_segments(void)
         u64 size = ALIGN_UP((u64)segments[i].size, SZ_16K);
         total += size;
         if (!size || (start & (SZ_16K - 1)) || start < (1ULL << 40) ||
-            start - (1ULL << 40) >= (1ULL << 36) || size > (1ULL << 36) - (start - (1ULL << 40)) ||
-            total > 128 * SZ_1M)
+            start - (1ULL << 40) >= (1ULL << 36) || size > (1ULL << 36) - (start - (1ULL << 40)))
             bail_cleanup("ADT: unsupported M5 display firmware segment\n");
         /*
          * Some boots list the 0xa segment (__OS_LOG) at its physical address,
@@ -7307,7 +7317,7 @@ static int dt_reserve_m5_display_segments(void)
          * reach it then, so there is no live mapping to preserve.
          */
         if (segments[i].remap == segments[i].phys && !dart_translate_silent(dart, start)) {
-            printf("FDT: M5 display segment %u at 0x%lx (0x%x bytes) is not mapped, skipped\n", i,
+            printf("FDT: %s segment %u at 0x%lx (0x%x bytes) is not mapped, skipped\n", alias, i,
                    start, segments[i].size);
             continue;
         }
@@ -7328,10 +7338,10 @@ static int dt_reserve_m5_display_segments(void)
             char name[64];
             int node;
             if (!reserved) {
-                snprintf(name, sizeof(name), "dcp-firmware@%lx", phys);
+                snprintf(name, sizeof(name), "%s-firmware@%lx", alias, phys);
                 node = dt_get_or_add_reserved_mem(name, "apple,asc-mem", true, phys, count);
             } else {
-                snprintf(name, sizeof(name), "dcp-iova-%lx", iova);
+                snprintf(name, sizeof(name), "%s-iova-%lx", alias, iova);
                 int parent = fdt_path_offset(dt, "/reserved-memory");
                 node = fdt_add_subnode(dt, parent, name);
                 if (node < 0)
@@ -7351,7 +7361,7 @@ static int dt_reserve_m5_display_segments(void)
             offset += count;
         }
     }
-    printf("FDT: reserved live M5 display firmware segments (%lu bytes)\n", total);
+    printf("FDT: %s: reserved live firmware segments (%lu bytes)\n", alias, total);
 err:
     dart_shutdown(dart);
     return ret;
@@ -8088,6 +8098,159 @@ static int dt_set_m4_dcp_handoff(void)
     return 0;
 }
 
+/* A two-level 16K T8110 stream has one root and at most 2048 L2 tables. */
+static int dt_reserve_t8142_display_tables(const char *alias)
+{
+    int node = fdt_path_offset(dt, alias), len;
+    if (node < 0)
+        return 0;
+    const fdt32_t *prop = fdt_getprop(dt, node, "iommus", &len);
+    if (!prop || len <= 0 || len % 8 || len > (int)(16 * sizeof(*prop)))
+        return -1;
+    fdt32_t refs[16];
+    memcpy(refs, prop, len);
+    int chosen = adt_path_offset(adt, "/chosen");
+    u64 dram, size;
+    if (chosen < 0 || ADT_GETPROP(adt, chosen, "dram-base", &dram) != sizeof(dram) ||
+        ADT_GETPROP(adt, chosen, "dram-size", &size) != sizeof(size))
+        return -1;
+    u64 *pages = malloc((1 + SZ_16K / sizeof(u64)) * sizeof(*pages));
+    if (!pages)
+        return -1;
+    int ret = -1;
+    for (int i = 0; i < len / (int)sizeof(*prop); i += 2) {
+        dart_dev_t *dart = dart_init_fdt_locked(dt, fdt32_ld(&refs[i]), fdt32_ld(&refs[i + 1]));
+        size_t count;
+        if (!dart)
+            goto out;
+        ret = dart_collect_locked_tables(dart, dram, size, pages, 1 + SZ_16K / sizeof(u64), &count);
+        dart_shutdown(dart);
+        if (ret)
+            goto out;
+        for (size_t j = 0; j < count; j++) {
+            /* Tables remain CPU-mapped: Linux may extend an inherited root. */
+            if (fdt_add_mem_rsv(dt, pages[j], SZ_16K)) {
+                ret = -1;
+                goto out;
+            }
+        }
+    }
+    ret = 0;
+out:
+    free(pages);
+    return ret;
+}
+
+/* Withdraw native consumers and their mapper/mailbox suppliers together. */
+static int dt_refuse_t8142_display(void)
+{
+    static const char *const compats[] = {
+        "apple,t8142-dcp", "apple,t8142-dcpext", "apple,display-subsystem",
+    };
+    for (size_t i = 0; i < ARRAY_SIZE(compats); i++) {
+        int node = -1;
+        while ((node = fdt_node_offset_by_compatible(dt, node, compats[i])) >= 0) {
+            char path[256];
+            if (fdt_get_path(dt, node, path, sizeof(path)) ||
+                dt_t8140_disable_refs(node, "iommus", "#iommu-cells"))
+                return -1;
+            node = fdt_path_offset(dt, path);
+            if (node < 0 || dt_t8140_disable_refs(node, "mboxes", "#mbox-cells"))
+                return -1;
+            node = fdt_path_offset(dt, path);
+            if (node < 0 || fdt_setprop_string(dt, node, "status", "disabled") ||
+                dt_t8140_disable_typec_routes(path))
+                return -1;
+            node = fdt_path_offset(dt, path);
+        }
+    }
+    /* The internal scanout/PIODMA mapper can otherwise reset a live stream. */
+    static const char *const aliases[] = {"disp0", "disp0_piodma", "disp0-piodma"};
+    for (size_t i = 0; i < ARRAY_SIZE(aliases); i++) {
+        int node = fdt_path_offset(dt, aliases[i]);
+        if (node < 0)
+            continue;
+        if (dt_t8140_disable_refs(node, "iommus", "#iommu-cells"))
+            return -1;
+        node = fdt_path_offset(dt, aliases[i]);
+        if (node < 0 || fdt_setprop_string(dt, node, "status", "disabled"))
+            return -1;
+    }
+    return 0;
+}
+
+/* T8142: the internal DCP iBoot left running, with its carveouts, framebuffer and segments. */
+static int dt_set_t8142_dcp(unsigned int unused)
+{
+    UNUSED(unused);
+
+    if (dt_reserve_t8142_display_tables("dcp") ||
+        dt_reserve_t8142_display_tables("disp0") ||
+        dt_reserve_t8142_display_tables("disp0_piodma") ||
+        dt_reserve_t8142_display_tables("disp0-piodma"))
+        return -1;
+
+    int ret =
+        dt_carveout_reserved_regions("dcp", "disp0", "disp0_piodma", disp_reserved_regions_t8142,
+                                     ARRAY_SIZE(disp_reserved_regions_t8142));
+    if (ret)
+        return ret;
+    ret = dt_vram_reserved_region("dcp", "disp0");
+    if (ret)
+        return ret;
+    return dt_reserve_m5_display_segments("dcp", "/arm-io/dcp/iop-dcp-nub", true);
+}
+
+/*
+ * T8142: an external DCP that iBoot started (its firmware DART is locked and
+ * translates the firmware segments) is handed over like the internal one and
+ * enabled for the kernel to adopt.
+ */
+static int dt_set_t8142_dcpext(unsigned int n)
+{
+    if (n >= ARRAY_SIZE(dcpext_aliases))
+        return -1;
+    const char *alias = dcpext_aliases[n];
+    char nub[48];
+
+    snprintf(nub, sizeof(nub), "/arm-io/%s/iop-%s-nub", alias, alias);
+    if (dt_reserve_t8142_display_tables(alias) ||
+        dt_reserve_m5_display_segments(alias, nub, true) || dt_set_dcp_firmware(alias))
+        return -1;
+    return dt_enable_dcp_with_typec_routes(alias);
+}
+
+/*
+ * Every part of the T8142 display handoff is optional: a refused internal DCP
+ * leaves the boot framebuffer to the OS, a refused external DCP stays disabled.
+ * An external DCP is only handed over together with the internal one.
+ */
+static int dt_set_display_t8142(void)
+{
+    if (!fdt_get_alias(dt, "dcp"))
+        return 0;
+    if (dt_display_transaction(dt_set_t8142_dcp, 0)) {
+        printf("FDT: T8142 display handoff refused; keeping the boot framebuffer\n");
+        return dt_refuse_t8142_display();
+    }
+
+    for (unsigned int n = 0; n < ARRAY_SIZE(dcpext_aliases); n++) {
+        const char *alias = dcpext_aliases[n];
+        int node = fdt_path_offset(dt, alias);
+        int len;
+        const char *status = node < 0 ? NULL : fdt_getprop(dt, node, "status", &len);
+
+        if (!status || len != sizeof("disabled") || strcmp(status, "disabled") ||
+            fdt_node_check_compatible(dt, node, "apple,t8142-dcpext"))
+            continue;
+        if (dt_display_transaction(dt_set_t8142_dcpext, n))
+            printf("FDT: '%s' not handed over; it stays disabled\n", alias);
+        else
+            printf("FDT: '%s' handed over\n", alias);
+    }
+    return 0;
+}
+
 static int dt_set_display(void)
 {
     if (chip_id == T8140)
@@ -8095,6 +8258,8 @@ static int dt_set_display(void)
 
     /* lock dart-disp0 to prevent old software from resetting it */
     dart_lock_adt("/arm-io/dart-disp0", 0);
+    if (chip_id == T8142)
+        return dt_set_display_t8142();
     const char compat_piodma_alias[] = "disp0_piodma";
     const char piodma_alias[] = "disp0-piodma";
     const char *disp0_piodma_alias = piodma_alias;
@@ -8218,12 +8383,6 @@ static int dt_set_display(void)
     } else if (!fdt_node_check_compatible(dt, 0, "apple,t6050")) {
         /* Fail-soft (kboot_display_handoff.c): __OS_LOG reservations and the internal panel. */
         return dt_set_display_handoff(dt);
-    } else if (!fdt_node_check_compatible(dt, 0, "apple,t8142")) {
-        ret = dt_carveout_reserved_regions("dcp", "disp0", "disp0_piodma",
-                                           disp_reserved_regions_t8142,
-                                           ARRAY_SIZE(disp_reserved_regions_t8142));
-        if (ret)
-            return ret;
     } else {
         printf("FDT: unknown compatible, skip display reserved-memory setup\n");
         return 0;
@@ -8243,12 +8402,7 @@ static int dt_set_display(void)
 
     const display_config_t *disp_cfg = display_get_config();
 
-    ret = dt_vram_reserved_region(disp_cfg ? disp_cfg->dcp_alias : "dcp", "disp0");
-    if (ret)
-        return ret;
-    if (!fdt_node_check_compatible(dt, 0, "apple,t8142"))
-        return dt_reserve_m5_display_segments();
-    return 0;
+    return dt_vram_reserved_region(disp_cfg ? disp_cfg->dcp_alias : "dcp", "disp0");
 }
 
 /* PMP DEVICE DVFS START */
