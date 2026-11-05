@@ -18,6 +18,8 @@ import sys
 # Made-up configuration blobs: the code under test copies bytes and never reads them
 BOP = bytes(range(0xA0, 0xA0 + 24))
 DCB = bytes([0x5A, 0x01, 0x00, 0x00])
+# One four-byte row per amp of a three-amp group, in the group's order
+ROWS = bytes([0xC0, 0xC1, 0xC2, 0xC3, 0xD0, 0xD1, 0xD2, 0xD3, 0xE0, 0xE1, 0xE2, 0xE3])
 
 
 def u32(v):
@@ -81,9 +83,10 @@ def dts(amps, stale=None):
     return "\n".join(out)
 
 
-GROUP3 = {"bop-config": BOP, "amp-dcblocker-config": DCB,
+GROUP3 = {"bop-config": BOP, "amp-dcblocker-config": DCB, "speaker-config": ROWS,
           "speaker1": u32(0x11), "speaker2": u32(0x12)}
-STALE = {"apple,amp-dcblocker-config": b"\xee\xee", "apple,bop-config": b"\xee"}
+STALE = {"apple,amp-dcblocker-config": b"\xee\xee", "apple,bop-config": b"\xee",
+         "apple,speaker-config": b"\xee\xee\xee\xee"}
 
 
 def scenario(name):
@@ -97,6 +100,13 @@ def scenario(name):
     if name == "no-dcblocker":
         g = dict(GROUP3)
         del g["amp-dcblocker-config"]
+        buses = [Node("i2c0", {}, [amp("audio-speaker", 0x40, 0x10, g),
+                                    amp("audio-speaker-b", 0x42, 0x12)]),
+                 Node("i2c1", {}, [amp("audio-speaker-a", 0x41, 0x11)])]
+        return adt(buses), dts(three, {(1, 0x41): STALE})
+    if name == "short-speaker-config":
+        g = dict(GROUP3)
+        g["speaker-config"] = ROWS[:8]
         buses = [Node("i2c0", {}, [amp("audio-speaker", 0x40, 0x10, g),
                                     amp("audio-speaker-b", 0x42, 0x12)]),
                  Node("i2c1", {}, [amp("audio-speaker-a", 0x41, 0x11)])]
@@ -120,7 +130,7 @@ def scenario(name):
     raise SystemExit("unknown scenario %s" % name)
 
 
-SCENARIOS = ["group", "no-dcblocker", "single-amp", "amp-missing-in-dt", "amp-not-unique-in-dt",
+SCENARIOS = ["group", "no-dcblocker", "short-speaker-config", "single-amp", "amp-missing-in-dt", "amp-not-unique-in-dt",
              "dangling-phandle", "no-amps"]
 
 

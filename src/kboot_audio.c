@@ -12,11 +12,15 @@
  *   bop-config            -> apple,bop-config            (the brownout prevention block)
  *   amp-dcblocker-config  -> apple,amp-dcblocker-config  (the DC blocker setting)
  *
- * A property the group does not have is removed from its amps, so the kernel never sees a
- * value that did not come from this Mac. Amps are matched to the DT's ti,sn012776 nodes by I2C
- * address, which must name exactly one node. A group with an amp that cannot be matched is left
- * as it is: the kernel gets either the whole group's configuration or none of it. Nothing here
- * stops the boot.
+ * The group's speaker-config has one four-byte row per amp, in the group's order (the first amp,
+ * then speaker1, speaker2, ...); each amp gets its own row as apple,speaker-config. It carries
+ * the amp's operating level and its slots.
+ *
+ * A property the group does not have (or a speaker-config without a row for every amp) is
+ * removed from its amps, so the kernel never sees a value that did not come from this Mac. Amps
+ * are matched to the DT's ti,sn012776 nodes by I2C address, which must name exactly one node. A
+ * group with an amp that cannot be matched is left as it is: the kernel gets either the whole
+ * group's configuration or none of it. Nothing here stops the boot.
  */
 
 #include "kboot_audio.h"
@@ -29,6 +33,7 @@
 #define AMP_ADT_COMPAT "audio-control,sn012776"
 #define AMP_DT_COMPAT  "ti,sn012776"
 #define MAX_GROUP_AMPS 16
+#define SPEAKER_ROW    4
 
 static const struct {
     const char *adt;
@@ -92,6 +97,26 @@ static int dt_amp_by_addr(const void *dt, u32 addr)
     return found;
 }
 
+/* Set @name on the DT amp at @addr to @val (remove it when @val is NULL) */
+static int dt_amp_setprop(void *dt, u32 addr, const char *name, const void *val, u32 len)
+{
+    /* Offsets move with every change to the tree: look the amp up each time */
+    int node = dt_amp_by_addr(dt, addr);
+    int ret;
+
+    if (node < 0)
+        return -1;
+    if (val)
+        ret = fdt_setprop(dt, node, name, val, len);
+    else
+        ret = fdt_delprop(dt, node, name);
+    if (ret && !(ret == -FDT_ERR_NOTFOUND && !val)) {
+        printf("kboot: audio: could not set %s on the amp at 0x%x: %d\n", name, addr, ret);
+        return -1;
+    }
+    return 0;
+}
+
 static int setup_amp_group(void *dt, const void *adt, int arm_io, int group)
 {
     const char *name = adt_get_name(adt, group);
@@ -144,22 +169,24 @@ static int setup_amp_group(void *dt, const void *adt, int arm_io, int group)
         const void *val = adt_getprop(adt, group, amp_group_props[p].adt, &len);
 
         for (int i = 0; i < n; i++) {
-            /* Offsets move with every change to the tree: look the amp up each time */
-            int node = dt_amp_by_addr(dt, addrs[i]);
-            int ret;
-
-            if (node < 0)
+            if (dt_amp_setprop(dt, addrs[i], amp_group_props[p].dt, val, len))
                 return -1;
-            if (val)
-                ret = fdt_setprop(dt, node, amp_group_props[p].dt, val, len);
-            else
-                ret = fdt_delprop(dt, node, amp_group_props[p].dt);
-            if (ret && !(ret == -FDT_ERR_NOTFOUND && !val)) {
-                printf("kboot: audio: %s: could not set %s on the amp at 0x%x: %d\n", name,
-                       amp_group_props[p].dt, addrs[i], ret);
-                return -1;
-            }
         }
+    }
+
+    /* One speaker-config row per amp, in the group's order */
+    u32 len = 0;
+    const u8 *rows = adt_getprop(adt, group, "speaker-config", &len);
+
+    if (rows && len < (u32)n * SPEAKER_ROW) {
+        printf("kboot: audio: %s: speaker-config has %u bytes for %d amps, not passed on\n", name,
+               len, n);
+        rows = NULL;
+    }
+    for (int i = 0; i < n; i++) {
+        if (dt_amp_setprop(dt, addrs[i], "apple,speaker-config",
+                           rows ? rows + i * SPEAKER_ROW : NULL, SPEAKER_ROW))
+            return -1;
     }
 
     printf("kboot: audio: %s: amp configuration for %d amps\n", name, n);
@@ -185,7 +212,8 @@ int kboot_audio_amp_config(void *dt, const void *adt)
             /* Only a group's first amp has speakerN or the group's configuration */
             if (!adt_getprop(adt, dev, "speaker1", NULL) &&
                 !adt_getprop(adt, dev, "bop-config", NULL) &&
-                !adt_getprop(adt, dev, "amp-dcblocker-config", NULL))
+                !adt_getprop(adt, dev, "amp-dcblocker-config", NULL) &&
+                !adt_getprop(adt, dev, "speaker-config", NULL))
                 continue;
             setup_amp_group(dt, adt, arm_io, dev);
         }

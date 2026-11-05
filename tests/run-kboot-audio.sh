@@ -57,30 +57,41 @@ BOP=a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7
 DCB=5a010000
 STALE_DCB=eeee
 STALE_BOP=ee
-expect() { # expect <scenario>: the amp lines that scenario must give
+R0=c0c1c2c3
+R1=d0d1d2d3
+R2=e0e1e2e3
+STALE_ROW=eeeeeeee
+amp() { # amp <addr> <bop> <dcb> <row>
+    printf 'amp 0x%s apple,bop-config=%s apple,amp-dcblocker-config=%s apple,speaker-config=%s\n' "$@"
+}
+expect() { # expect <scenario>: the amp lines that scenario must give (tree order 0x40, 0x42, 0x41)
     case $1 in
     group)
-        printf 'amp 0x40 apple,bop-config=%s apple,amp-dcblocker-config=%s\n' $BOP $DCB
-        printf 'amp 0x42 apple,bop-config=%s apple,amp-dcblocker-config=%s\n' $BOP $DCB
-        printf 'amp 0x41 apple,bop-config=%s apple,amp-dcblocker-config=%s\n' $BOP $DCB ;;
+        amp 40 $BOP $DCB $R0
+        amp 42 $BOP $DCB $R2
+        amp 41 $BOP $DCB $R1 ;;
     no-dcblocker)
-        printf 'amp 0x40 apple,bop-config=%s apple,amp-dcblocker-config=-\n' $BOP
-        printf 'amp 0x42 apple,bop-config=%s apple,amp-dcblocker-config=-\n' $BOP
-        printf 'amp 0x41 apple,bop-config=%s apple,amp-dcblocker-config=-\n' $BOP ;;
+        amp 40 $BOP - $R0
+        amp 42 $BOP - $R2
+        amp 41 $BOP - $R1 ;;
+    short-speaker-config)
+        amp 40 $BOP $DCB -
+        amp 42 $BOP $DCB -
+        amp 41 $BOP $DCB - ;;
     single-amp)
-        printf 'amp 0x40 apple,bop-config=%s apple,amp-dcblocker-config=-\n' $BOP ;;
+        amp 40 $BOP - - ;;
     amp-missing-in-dt)
-        printf 'amp 0x40 apple,bop-config=- apple,amp-dcblocker-config=-\n'
-        printf 'amp 0x42 apple,bop-config=%s apple,amp-dcblocker-config=%s\n' $STALE_BOP $STALE_DCB ;;
+        amp 40 - - -
+        amp 42 $STALE_BOP $STALE_DCB $STALE_ROW ;;
     amp-not-unique-in-dt)
-        printf 'amp 0x40 apple,bop-config=- apple,amp-dcblocker-config=-\n'
-        printf 'amp 0x42 apple,bop-config=- apple,amp-dcblocker-config=-\n'
-        printf 'amp 0x41 apple,bop-config=- apple,amp-dcblocker-config=-\n'
-        printf 'amp 0x42 apple,bop-config=- apple,amp-dcblocker-config=-\n' ;;
+        amp 40 - - -
+        amp 42 - - -
+        amp 41 - - -
+        amp 42 - - - ;;
     dangling-phandle|no-amps)
-        printf 'amp 0x40 apple,bop-config=- apple,amp-dcblocker-config=-\n'
-        printf 'amp 0x42 apple,bop-config=- apple,amp-dcblocker-config=-\n'
-        printf 'amp 0x41 apple,bop-config=%s apple,amp-dcblocker-config=%s\n' $STALE_BOP $STALE_DCB ;;
+        amp 40 - - -
+        amp 42 - - -
+        amp 41 $STALE_BOP $STALE_DCB $STALE_ROW ;;
     *) fail "no expected result for $1" ;;
     esac
 }
