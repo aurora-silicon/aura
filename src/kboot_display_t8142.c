@@ -190,16 +190,33 @@ int kboot_t8142_display_reserve(void *dt, const char *alias)
         m.size = m.ram_pages = 0;
         if (dart_walk_locked_t8110(m.stream.base, m.stream.span, m.stream.sid, m.dram, m.dram_size,
                                    preserve_page, &m) ||
-            !m.ram_pages || flush_mapping(&m))
+            flush_mapping(&m)) {
+            printf("FDT: %s SID%u: cannot preserve inherited translations\n", alias, m.stream.sid);
             goto out;
+        }
+        /*
+         * An idle external pipe has valid, locked SID0/SID16 roots with no
+         * mappings until its first modeset/PIODMA allocation. Requiring RAM
+         * in those streams prevents handing it over for hotplug. SID23 must
+         * still map the resident firmware; all three roots and their L2
+         * tables must be validated and retained even when they are empty.
+         */
+        if (!i && !m.ram_pages) {
+            printf("FDT: %s SID%u: no resident firmware mappings\n", alias, m.stream.sid);
+            goto out;
+        }
         dart_dev_t *dart = dart_init_fdt_locked(dt, m.stream.provider, m.stream.sid);
         size_t count;
-        if (!dart)
+        if (!dart) {
+            printf("FDT: %s SID%u: no locked translation root\n", alias, m.stream.sid);
             goto out;
+        }
         ret = dart_collect_locked_tables(dart, m.dram, m.dram_size, tables, capacity, &count);
         dart_shutdown(dart);
-        if (ret)
+        if (ret) {
+            printf("FDT: %s SID%u: invalid inherited page tables\n", alias, m.stream.sid);
             goto out;
+        }
         ret = -1;
         for (size_t j = 0; j < count; j++)
             if (fdt_add_mem_rsv(dt, tables[j], SZ_16K))
@@ -251,13 +268,47 @@ static int display_clocks(void *dt, const char *alias)
     return fdt_setprop(dt, owner, "clock-names", "video\0reference", sizeof("video\0reference"));
 }
 
+/* Publish the retained PMGR chain only for a validated, powered session. */
+static int enable_power_domains(void *dt, u32 phandle, unsigned int depth)
+{
+    int node = fdt_node_offset_by_phandle(dt, phandle), len;
+    if (node < 0 || depth > 8)
+        return -1;
+    const fdt32_t *domains = fdt_getprop(dt, node, "power-domains", &len);
+    if (!domains)
+        return len == -FDT_ERR_NOTFOUND ? 0 : -1;
+    /* The T8142 display islands have one parent, with no argument cells. */
+    if (len != sizeof(*domains))
+        return -1;
+    u32 parent = fdt32_ld(domains);
+    int supplier = fdt_node_offset_by_phandle(dt, parent);
+    const fdt32_t *cells = supplier < 0 ? NULL :
+        fdt_getprop(dt, supplier, "#power-domain-cells", &len);
+    if (!cells || len != sizeof(*cells) || fdt32_ld(cells) ||
+        enable_power_domains(dt, parent, depth + 1))
+        return -1;
+    supplier = fdt_node_offset_by_phandle(dt, parent);
+    return supplier < 0 ? -1 : fdt_setprop_string(dt, supplier, "status", "okay");
+}
+
 int kboot_t8142_display_enable(void *dt, const char *alias)
 {
     struct display_stream streams[3];
     struct display_session session;
     if (session_streams(dt, alias, streams) || session_description(alias, &session) ||
-        display_clocks(dt, alias))
+        display_clocks(dt, alias) || enable_power_domains(dt, streams[0].owner, 0))
         return -1;
+    int controller = fdt_path_offset(dt, alias), len;
+    const fdt32_t *mboxes = fdt_getprop(dt, controller, "mboxes", &len);
+    if (mboxes) {
+        if (len != sizeof(*mboxes))
+            return -1;
+        int mailbox = fdt_node_offset_by_phandle(dt, fdt32_ld(mboxes));
+        if (mailbox < 0 || fdt_setprop_string(dt, mailbox, "status", "okay"))
+            return -1;
+    } else if (len != -FDT_ERR_NOTFOUND) {
+        return -1;
+    }
     for (size_t i = 0; i < ARRAY_SIZE(streams); i++) {
         int node = fdt_node_offset_by_phandle(dt, streams[i].provider);
         if (node < 0 || fdt_setprop_string(dt, node, "status", "okay"))

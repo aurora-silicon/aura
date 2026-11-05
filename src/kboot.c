@@ -7245,6 +7245,12 @@ static struct disp_mapping disp_reserved_regions_t8142[] = {
     {"region-id-95", "region95", true, false, true},
 };
 
+/* DCPEXT1 owns these carveouts; its TEXT is shared with the internal DCP. */
+static struct disp_mapping dcpext1_reserved_regions_t8142[] = {
+    {"region-id-88", "dcpext1_data", true, false, false},
+    {"region-id-89", "region89", true, false, false},
+};
+
 static bool dt_display_phys_reserved(u64 phys, u64 size)
 {
     int parent = fdt_path_offset(dt, "/reserved-memory");
@@ -8168,6 +8174,10 @@ static int dt_set_t8142_dcpext(unsigned int n)
     char nub[48];
 
     snprintf(nub, sizeof(nub), "/arm-io/%s/iop-%s-nub", alias, alias);
+    if (!strcmp(alias, "dcpext1") &&
+        dt_carveout_reserved_regions(alias, NULL, NULL, dcpext1_reserved_regions_t8142,
+                                     ARRAY_SIZE(dcpext1_reserved_regions_t8142)))
+        return -1;
     if (dt_reserve_m5_display_segments(alias, nub, true) || dt_set_dcp_firmware(alias) ||
         kboot_t8142_display_enable(dt, alias))
         return -1;
@@ -8199,11 +8209,18 @@ static int dt_set_display_t8142(void)
         if (!status || len != sizeof("disabled") || strcmp(status, "disabled") ||
             fdt_node_check_compatible(dt, node, "apple,t8142-dcpext"))
             continue;
-        if (kboot_t8142_display_reserve(dt, alias) ||
-            dt_display_transaction(dt_set_t8142_dcpext, n))
-            printf("FDT: '%s' not handed over; it stays disabled\n", alias);
-        else
-            printf("FDT: '%s' handed over\n", alias);
+        const char *result = "okay";
+        if (kboot_t8142_display_reserve(dt, alias))
+            result = "translation reservation failed";
+        else if (dt_display_transaction(dt_set_t8142_dcpext, n))
+            result = "firmware publication failed";
+        printf("FDT: %s handoff: %s\n", alias, result);
+        /* Keep the result visible after a boot without a serial console. */
+        char property[48];
+        snprintf(property, sizeof(property), "aurora,%s-handoff", alias);
+        int chosen = fdt_path_offset(dt, "/chosen");
+        if (chosen < 0 || fdt_setprop_string(dt, chosen, property, result))
+            return -1;
     }
     return kboot_t8142_display_prune(dt);
 }
