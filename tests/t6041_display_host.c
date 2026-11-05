@@ -703,6 +703,7 @@ static void world_ext(int which)
 }
 
 static const char J616S[] = "apple,j616s\0apple,t6040\0apple,arm-platform";
+static const char OTHER[] = "apple,j999s\0apple,t6040\0apple,arm-platform";
 static const char J614S[] = "apple,j614s\0apple,t6040\0apple,arm-platform";
 static const char J616C[] = "apple,j616c\0apple,t6041\0apple,arm-platform";
 
@@ -984,7 +985,9 @@ static const struct scenario scenarios[] = {
     {"oslog-in-memreserve", PUBLISH, "an __OS_LOG wholly inside a /memreserve/ is still described"},
     /* chip, board and device tree */
     {"wrong-chip", NOTHING, "chip T6041 with a T6040 device tree"},
-    {"wrong-board", NOTHING, "a T6040 board other than the J616s"},
+    {"wrong-board", NOTHING, "an unsupported T6040 board"},
+    {"j614-no-optin", PUBLISH, "J614s publishes without an explicit opt-in"},
+    {"j614-optin", PUBLISH, "J614s ignores a stale explicit opt-in"},
     {"j616c", PUBLISH, "a J616C (chip T6041) boot publishes"},
     {"j616c-external", PUBLISH, "J616C external firmware memories come from the ADT"},
     {"j616c-on-t6040", NOTHING, "chip T6040 with a J616C device tree"},
@@ -1062,7 +1065,11 @@ int main(int argc, char **argv)
     static u8 dt[DT_SIZE], in[DT_SIZE];
     bool j616c = !strncmp(s, "j616c", 5);
     _Static_assert(sizeof(J616C) == sizeof(J616S), "root compatibles of equal length");
-    build_dt(dt, is(s, "wrong-board") ? J614S : j616c ? J616C : J616S, sizeof(J616S));
+    const char *board = is(s, "wrong-board")                            ? OTHER
+                        : (is(s, "j614-no-optin") || is(s, "j614-optin")) ? J614S
+                        : j616c                                          ? J616C
+                                                                         : J616S;
+    build_dt(dt, board, sizeof(J616S));
     if (is(s, "external") || is(s, "external-refuse") || is(s, "j616c-external")) {
         for (int i = 0; i < 2; i++) {
             build_ext(dt, i);
@@ -1139,7 +1146,7 @@ int main(int argc, char **argv)
     if (is(s, "oslog-straddles"))
         OK(fdt_add_mem_rsv(dt, segs[SEG_OSLOG].phys + 0x4000, seg_size(SEG_OSLOG)));
     int chosen = fdt_path_offset(dt, "/chosen");
-    if (is(s, "stale-optin") || is(s, "stale-optin-no-dcp") || is(s, "stale-optin-wrong-disp") ||
+    if (is(s, "j614-optin") || is(s, "stale-optin") || is(s, "stale-optin-no-dcp") || is(s, "stale-optin-wrong-disp") ||
         is(s, "stale-optin-wrong-os"))
         OK(fdt_setprop_string(dt, chosen, OPTIN, "1"));
     if (is(s, "stale-optin-zero"))

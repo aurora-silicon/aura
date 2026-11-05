@@ -89,8 +89,10 @@ REASONS = {
     "stale-optin-zero": PUBLISHED,
     "repeat": "handoff already published",
     "oslog-in-memreserve": "lies inside /memreserve/",
-    "wrong-chip": "not a J616s (chip 0x6041): nothing done",
-    "wrong-board": "not a J616s (chip 0x6040): nothing done",
+    "wrong-chip": "not a J616s/J614s (chip 0x6041): nothing done",
+    "wrong-board": "not a J616s/J614s (chip 0x6040): nothing done",
+    "j614-no-optin": PUBLISHED,
+    "j614-optin": PUBLISHED,
     "j616c": PUBLISHED,
     "j616c-external": PUBLISHED,
     "j616c-on-t6040": "not a J616C (chip 0x6040): nothing done",
@@ -159,7 +161,7 @@ def test_t6041_record_has_no_optin():
     start = source.index("static const struct dcp_soc dcp_soc_t6041 = {")
     record = source[start:source.index("\n};", start)]
     assert ".optin" not in record
-    assert "asahi,t6041-dcp" not in source
+    assert 'optin_name = "asahi,t6041-dcp"' not in source
     assert "asahi,t6041-dcp" not in (ROOT / "src/kboot.c").read_text()
 
 

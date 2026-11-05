@@ -6,5 +6,6 @@
 #include "types.h"
 
 int kboot_setup_atc(void *dt);
+bool kboot_j614s_hdmi_ready(void);
 
 #endif

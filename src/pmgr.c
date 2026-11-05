@@ -718,6 +718,28 @@ int pmgr_power_is_on(int die, const char *name)
     return -1;
 }
 
+/*
+ * Whether the named device's power state is on or will be: actually on, or targeted on with
+ * hardware gating it while idle (AUTO_ENABLE). Read only.
+ */
+int pmgr_power_is_requested(int die, const char *name)
+{
+    if (die < 0 || die >= pmgr_dies)
+        return -1;
+    for (size_t i = 0; i < pmgr_devices_len; i++) {
+        const struct pmgr_device *dev = &pmgr_devices[i];
+        if (strncmp(dev->name, name, sizeof(dev->name)))
+            continue;
+        uintptr_t addr = pmgr_device_get_addr(die, dev);
+        if (!addr)
+            return -1;
+        u32 reg = read32(addr);
+        return FIELD_GET(PMGR_PS_ACTUAL, reg) == PMGR_PS_ACTIVE ||
+               (FIELD_GET(PMGR_PS_TARGET, reg) == PMGR_PS_ACTIVE && (reg & PMGR_AUTO_ENABLE));
+    }
+    return -1;
+}
+
 int pmgr_adt_path_offset_trace(const void *adt_ptr, int *path)
 {
     int offset = adt_path_offset_trace(adt_ptr, pmgr_name, path);

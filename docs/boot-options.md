@@ -92,6 +92,30 @@ boot)` or `FDT: keeping chosen.stdout-path on the debug UART (<reason>)`. A
 `stdout-path` to any other node is left alone. The J616s and J614s device trees
 set none.
 
+## External displays on the M4 MacBook Air (J713)
+
+On the J713, iBoot starts both external display coprocessors, dcpext0 and
+dcpext1, and leaves them quiesced with their DARTs set up. A kernel that drives
+external displays adopts them as they are. With `chosen.asahi,j713-dcpext=1`
+in the aura configuration, kboot hands each one over: it reserves its firmware
+memory (the OS log segment by physical address, as for the internal DCP),
+publishes the firmware UUID and marks the node
+`apple,t8132-dcpext-firmware-ready`. The node stays disabled.
+
+A controller is handed over only when:
+
+- the internal display was handed over too, so an external display never costs
+  the panel;
+- its device-tree node is a disabled `apple,t8132-dcpext`;
+- iBoot left it powered: DISPEXTn SYS and FE on, and its CPU domain on or
+  targeted on with hardware gating it while idle.
+
+PMGR is only read. The CPU domain and the controller are left to the kernel.
+The value must be exactly `1`. Without it, or when any check fails, nothing is
+reserved for that controller and a marker already in the tree is removed.
+kboot logs `FDT: 'dcpext0' firmware reserved, left to the kernel`, or the
+reason followed by `kernel gate remains closed`.
+
 ## Common build profiles
 
 Stage 1: `make RELEASE=1 CHAINLOADING=1 BUILTIN_LOGO=aurora`.
