@@ -267,7 +267,7 @@ OBJECTS := \
 	memory.o memory_asm.o \
 	nvme.o \
 	payload.o \
-	j813_n1.o pcie.o pcie_fdt.o pcie_t6050.o \
+	j813_n1.o pcie.o pcie_fdt.o pcie_t6050.o kboot_display_t8142.o \
 	pmgr.o \
 	proxy.o \
 	ringbuffer.o \

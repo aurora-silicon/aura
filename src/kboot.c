@@ -23,6 +23,7 @@
 #include "j813_n1.h"
 #include "kboot_atc.h"
 #include "kboot_audio.h"
+#include "kboot_display_t8142.h"
 #include "kboot_display_facts.h"
 #include "kboot_gpu_t8122.h"
 #include "kboot_mte.h"
@@ -3787,7 +3788,7 @@ static dart_dev_t *dt_init_dart_by_node(int node, u32 num)
 
     printf("FDT: iommu phande:%u stream:%u\n", iommu_phandle, iommu_stream);
 
-    if (chip_id == T8140)
+    if (chip_id == T8140 || chip_id == T8142)
         return dart_init_fdt_locked(dt, iommu_phandle, iommu_stream);
     return dart_init_fdt(dt, iommu_phandle, iommu_stream, true);
 }
@@ -8098,49 +8099,6 @@ static int dt_set_m4_dcp_handoff(void)
     return 0;
 }
 
-/* A two-level 16K T8110 stream has one root and at most 2048 L2 tables. */
-static int dt_reserve_t8142_display_tables(const char *alias)
-{
-    int node = fdt_path_offset(dt, alias), len;
-    if (node < 0)
-        return 0;
-    const fdt32_t *prop = fdt_getprop(dt, node, "iommus", &len);
-    if (!prop || len <= 0 || len % 8 || len > (int)(16 * sizeof(*prop)))
-        return -1;
-    fdt32_t refs[16];
-    memcpy(refs, prop, len);
-    int chosen = adt_path_offset(adt, "/chosen");
-    u64 dram, size;
-    if (chosen < 0 || ADT_GETPROP(adt, chosen, "dram-base", &dram) != sizeof(dram) ||
-        ADT_GETPROP(adt, chosen, "dram-size", &size) != sizeof(size))
-        return -1;
-    u64 *pages = malloc((1 + SZ_16K / sizeof(u64)) * sizeof(*pages));
-    if (!pages)
-        return -1;
-    int ret = -1;
-    for (int i = 0; i < len / (int)sizeof(*prop); i += 2) {
-        dart_dev_t *dart = dart_init_fdt_locked(dt, fdt32_ld(&refs[i]), fdt32_ld(&refs[i + 1]));
-        size_t count;
-        if (!dart)
-            goto out;
-        ret = dart_collect_locked_tables(dart, dram, size, pages, 1 + SZ_16K / sizeof(u64), &count);
-        dart_shutdown(dart);
-        if (ret)
-            goto out;
-        for (size_t j = 0; j < count; j++) {
-            /* Tables remain CPU-mapped: Linux may extend an inherited root. */
-            if (fdt_add_mem_rsv(dt, pages[j], SZ_16K)) {
-                ret = -1;
-                goto out;
-            }
-        }
-    }
-    ret = 0;
-out:
-    free(pages);
-    return ret;
-}
-
 /* Withdraw native consumers and their mapper/mailbox suppliers together. */
 static int dt_refuse_t8142_display(void)
 {
@@ -8184,12 +8142,6 @@ static int dt_set_t8142_dcp(unsigned int unused)
 {
     UNUSED(unused);
 
-    if (dt_reserve_t8142_display_tables("dcp") ||
-        dt_reserve_t8142_display_tables("disp0") ||
-        dt_reserve_t8142_display_tables("disp0_piodma") ||
-        dt_reserve_t8142_display_tables("disp0-piodma"))
-        return -1;
-
     int ret =
         dt_carveout_reserved_regions("dcp", "disp0", "disp0_piodma", disp_reserved_regions_t8142,
                                      ARRAY_SIZE(disp_reserved_regions_t8142));
@@ -8198,7 +8150,9 @@ static int dt_set_t8142_dcp(unsigned int unused)
     ret = dt_vram_reserved_region("dcp", "disp0");
     if (ret)
         return ret;
-    return dt_reserve_m5_display_segments("dcp", "/arm-io/dcp/iop-dcp-nub", true);
+    if (dt_reserve_m5_display_segments("dcp", "/arm-io/dcp/iop-dcp-nub", true))
+        return -1;
+    return kboot_t8142_display_enable(dt, "dcp");
 }
 
 /*
@@ -8214,8 +8168,8 @@ static int dt_set_t8142_dcpext(unsigned int n)
     char nub[48];
 
     snprintf(nub, sizeof(nub), "/arm-io/%s/iop-%s-nub", alias, alias);
-    if (dt_reserve_t8142_display_tables(alias) ||
-        dt_reserve_m5_display_segments(alias, nub, true) || dt_set_dcp_firmware(alias))
+    if (dt_reserve_m5_display_segments(alias, nub, true) || dt_set_dcp_firmware(alias) ||
+        kboot_t8142_display_enable(dt, alias))
         return -1;
     return dt_enable_dcp_with_typec_routes(alias);
 }
@@ -8229,7 +8183,9 @@ static int dt_set_display_t8142(void)
 {
     if (!fdt_get_alias(dt, "dcp"))
         return 0;
-    if (dt_display_transaction(dt_set_t8142_dcp, 0)) {
+    /* A refused session may still DMA; its proven RAM/table reservations stay. */
+    if (kboot_t8142_display_reserve(dt, "dcp") ||
+        dt_display_transaction(dt_set_t8142_dcp, 0)) {
         printf("FDT: T8142 display handoff refused; keeping the boot framebuffer\n");
         return dt_refuse_t8142_display();
     }
@@ -8243,12 +8199,13 @@ static int dt_set_display_t8142(void)
         if (!status || len != sizeof("disabled") || strcmp(status, "disabled") ||
             fdt_node_check_compatible(dt, node, "apple,t8142-dcpext"))
             continue;
-        if (dt_display_transaction(dt_set_t8142_dcpext, n))
+        if (kboot_t8142_display_reserve(dt, alias) ||
+            dt_display_transaction(dt_set_t8142_dcpext, n))
             printf("FDT: '%s' not handed over; it stays disabled\n", alias);
         else
             printf("FDT: '%s' handed over\n", alias);
     }
-    return 0;
+    return kboot_t8142_display_prune(dt);
 }
 
 static int dt_set_display(void)
@@ -8256,10 +8213,10 @@ static int dt_set_display(void)
     if (chip_id == T8140)
         return dt_set_display_t8140();
 
-    /* lock dart-disp0 to prevent old software from resetting it */
-    dart_lock_adt("/arm-io/dart-disp0", 0);
     if (chip_id == T8142)
         return dt_set_display_t8142();
+    /* lock dart-disp0 to prevent old software from resetting it */
+    dart_lock_adt("/arm-io/dart-disp0", 0);
     const char compat_piodma_alias[] = "disp0_piodma";
     const char piodma_alias[] = "disp0-piodma";
     const char *disp0_piodma_alias = piodma_alias;
