@@ -61,37 +61,53 @@ R0=c0c1c2c3
 R1=d0d1d2d3
 R2=e0e1e2e3
 STALE_ROW=eeeeeeee
-amp() { # amp <addr> <bop> <dcb> <row>
-    printf 'amp 0x%s apple,bop-config=%s apple,amp-dcblocker-config=%s apple,speaker-config=%s\n' "$@"
+STALE_ZD=eeeeeeeeeeeeeeee
+Z0=1011121314151617
+Z1=18191a1b1c1d1e1f
+Z2=2021222324252627
+amp() { # amp <addr> <bop> <dcb> <row> <zd row>
+    printf 'amp 0x%s apple,bop-config=%s apple,amp-dcblocker-config=%s apple,speaker-config=%s apple,amp-tx-zd-config=%s\n' "$@"
+}
+six() { # six <addr> <group index>: an amp of the six-amps group
+    i=$2
+    amp $1 $BOP $DCB "$(printf '%02x%02x%02x%02x' $((0x60 + i)) $((0x70 + i)) $((0x80 + i)) $((0x90 + i)))" \
+        "$(printf '%02x' $(seq $((0x30 + 8 * i)) $((0x37 + 8 * i))) | tr -d '\n')"
 }
 expect() { # expect <scenario>: the amp lines that scenario must give (tree order 0x40, 0x42, 0x41)
     case $1 in
     group)
-        amp 40 $BOP $DCB $R0
-        amp 42 $BOP $DCB $R2
-        amp 41 $BOP $DCB $R1 ;;
-    no-dcblocker)
-        amp 40 $BOP - $R0
-        amp 42 $BOP - $R2
-        amp 41 $BOP - $R1 ;;
+        amp 40 $BOP $DCB $R0 $Z0
+        amp 42 $BOP $DCB $R2 $Z2
+        amp 41 $BOP $DCB $R1 $Z1 ;;
+    no-dcblocker) # as on the 14"/16" M1 Pro/Max, whose ADT has no DC blocker setting
+        amp 40 $BOP - $R0 $Z0
+        amp 42 $BOP - $R2 $Z2
+        amp 41 $BOP - $R1 $Z1 ;;
+    six-amps) # tree order 0x38..0x3d; group order 0x38 0x3b 0x39 0x3c 0x3a 0x3d
+        six 38 0
+        six 39 2
+        six 3a 4
+        six 3b 1
+        six 3c 3
+        six 3d 5 ;;
     short-speaker-config)
-        amp 40 $BOP $DCB -
-        amp 42 $BOP $DCB -
-        amp 41 $BOP $DCB - ;;
+        amp 40 $BOP $DCB - -
+        amp 42 $BOP $DCB - -
+        amp 41 $BOP $DCB - - ;;
     single-amp)
-        amp 40 $BOP - - ;;
+        amp 40 $BOP - - - ;;
     amp-missing-in-dt)
-        amp 40 - - -
-        amp 42 $STALE_BOP $STALE_DCB $STALE_ROW ;;
+        amp 40 - - - -
+        amp 42 $STALE_BOP $STALE_DCB $STALE_ROW $STALE_ZD ;;
     amp-not-unique-in-dt)
-        amp 40 - - -
-        amp 42 - - -
-        amp 41 - - -
-        amp 42 - - - ;;
+        amp 40 - - - -
+        amp 42 - - - -
+        amp 41 - - - -
+        amp 42 - - - - ;;
     dangling-phandle|no-amps)
-        amp 40 - - -
-        amp 42 - - -
-        amp 41 $STALE_BOP $STALE_DCB $STALE_ROW ;;
+        amp 40 - - - -
+        amp 42 - - - -
+        amp 41 $STALE_BOP $STALE_DCB $STALE_ROW $STALE_ZD ;;
     *) fail "no expected result for $1" ;;
     esac
 }

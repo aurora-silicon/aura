@@ -20,6 +20,8 @@ BOP = bytes(range(0xA0, 0xA0 + 24))
 DCB = bytes([0x5A, 0x01, 0x00, 0x00])
 # One four-byte row per amp of a three-amp group, in the group's order
 ROWS = bytes([0xC0, 0xC1, 0xC2, 0xC3, 0xD0, 0xD1, 0xD2, 0xD3, 0xE0, 0xE1, 0xE2, 0xE3])
+# One eight-byte row per amp
+ZD = bytes(range(0x10, 0x28))
 
 
 def u32(v):
@@ -84,9 +86,13 @@ def dts(amps, stale=None):
 
 
 GROUP3 = {"bop-config": BOP, "amp-dcblocker-config": DCB, "speaker-config": ROWS,
-          "speaker1": u32(0x11), "speaker2": u32(0x12)}
+          "amp-tx-zd-config": ZD, "speaker1": u32(0x11), "speaker2": u32(0x12)}
 STALE = {"apple,amp-dcblocker-config": b"\xee\xee", "apple,bop-config": b"\xee",
-         "apple,speaker-config": b"\xee\xee\xee\xee"}
+         "apple,speaker-config": b"\xee\xee\xee\xee", "apple,amp-tx-zd-config": b"\xee" * 8}
+# Six amps over two buses, as the 14"/16" MacBook Pros have them: the first amp and speaker1..5
+SIX = [(0, 0x38), (0, 0x39), (0, 0x3a), (1, 0x3b), (1, 0x3c), (1, 0x3d)]
+ROWS6 = bytes(b for i in range(6) for b in (0x60 + i, 0x70 + i, 0x80 + i, 0x90 + i))
+ZD6 = bytes(range(0x30, 0x30 + 48))
 
 
 def scenario(name):
@@ -104,9 +110,23 @@ def scenario(name):
                                     amp("audio-speaker-b", 0x42, 0x12)]),
                  Node("i2c1", {}, [amp("audio-speaker-a", 0x41, 0x11)])]
         return adt(buses), dts(three, {(1, 0x41): STALE})
+    if name == "six-amps":
+        # group order: 0x38, then 0x3b, 0x39, 0x3c, 0x3a, 0x3d (speaker1..5), as on those Macs
+        order = [0x38, 0x3b, 0x39, 0x3c, 0x3a, 0x3d]
+        g = {"bop-config": BOP, "amp-dcblocker-config": DCB, "speaker-config": ROWS6,
+             "amp-tx-zd-config": ZD6}
+        for k, a in enumerate(order[1:], 1):
+            g["speaker%d" % k] = u32(0x20 + k)
+        nodes = {0: [], 1: []}
+        for k, a in enumerate(order):
+            bus = 0 if a <= 0x3a else 1
+            nodes[bus].append(amp("audio-speaker" if k == 0 else "audio-speaker-%d" % k, a,
+                                  0x20 + k, g if k == 0 else None))
+        return adt([Node("i2c0", {}, nodes[0]), Node("i2c1", {}, nodes[1])]), dts(SIX)
     if name == "short-speaker-config":
         g = dict(GROUP3)
         g["speaker-config"] = ROWS[:8]
+        g["amp-tx-zd-config"] = ZD[:16]
         buses = [Node("i2c0", {}, [amp("audio-speaker", 0x40, 0x10, g),
                                     amp("audio-speaker-b", 0x42, 0x12)]),
                  Node("i2c1", {}, [amp("audio-speaker-a", 0x41, 0x11)])]
@@ -130,7 +150,7 @@ def scenario(name):
     raise SystemExit("unknown scenario %s" % name)
 
 
-SCENARIOS = ["group", "no-dcblocker", "short-speaker-config", "single-amp", "amp-missing-in-dt", "amp-not-unique-in-dt",
+SCENARIOS = ["group", "no-dcblocker", "six-amps", "short-speaker-config", "single-amp", "amp-missing-in-dt", "amp-not-unique-in-dt",
              "dangling-phandle", "no-amps"]
 
 

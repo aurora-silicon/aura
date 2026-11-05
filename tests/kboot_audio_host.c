@@ -6,8 +6,9 @@
  *   kboot-audio-host <in.adt> <in.dtb>
  *
  * Runs kboot_audio_amp_config() and prints, for every ti,sn012776 node of the result in tree
- * order, its I2C address and its apple,bop-config, apple,amp-dcblocker-config and
- * apple,speaker-config ("-" when absent), one line each ("amp ..."), after aura's own log lines.
+ * order, its I2C address and its apple,bop-config, apple,amp-dcblocker-config,
+ * apple,speaker-config and apple,amp-tx-zd-config ("-" when absent), one line each ("amp ..."),
+ * after aura's own log lines.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -95,6 +96,7 @@ int main(int argc, char **argv)
         print_prop(dt, node, "apple,bop-config");
         print_prop(dt, node, "apple,amp-dcblocker-config");
         print_prop(dt, node, "apple,speaker-config");
+        print_prop(dt, node, "apple,amp-tx-zd-config");
         printf("\n");
     }
     return 0;

@@ -12,11 +12,13 @@
  *   bop-config            -> apple,bop-config            (the brownout prevention block)
  *   amp-dcblocker-config  -> apple,amp-dcblocker-config  (the DC blocker setting)
  *
- * The group's speaker-config has one four-byte row per amp, in the group's order (the first amp,
- * then speaker1, speaker2, ...); each amp gets its own row as apple,speaker-config. It carries
- * the amp's operating level and its slots.
+ * Two of the group's properties have one row per amp, in the group's order (the first amp, then
+ * speaker1, speaker2, ...); each amp gets its own row:
  *
- * A property the group does not have (or a speaker-config without a row for every amp) is
+ *   speaker-config        -> apple,speaker-config        (4 bytes: operating level and slots)
+ *   amp-tx-zd-config      -> apple,amp-tx-zd-config      (8 bytes: sense output idle slots)
+ *
+ * A property the group does not have (or one without a row for every amp) is
  * removed from its amps, so the kernel never sees a value that did not come from this Mac. Amps
  * are matched to the DT's ti,sn012776 nodes by I2C address, which must name exactly one node. A
  * group with an amp that cannot be matched is left as it is: the kernel gets either the whole
@@ -33,7 +35,6 @@
 #define AMP_ADT_COMPAT "audio-control,sn012776"
 #define AMP_DT_COMPAT  "ti,sn012776"
 #define MAX_GROUP_AMPS 16
-#define SPEAKER_ROW    4
 
 static const struct {
     const char *adt;
@@ -41,6 +42,15 @@ static const struct {
 } amp_group_props[] = {
     {"bop-config", "apple,bop-config"},
     {"amp-dcblocker-config", "apple,amp-dcblocker-config"},
+};
+
+static const struct {
+    const char *adt;
+    const char *dt;
+    u32 row;
+} amp_row_props[] = {
+    {"speaker-config", "apple,speaker-config", 4},
+    {"amp-tx-zd-config", "apple,amp-tx-zd-config", 8},
 };
 
 /* The I2C address of an ADT amp node: the first word of its reg */
@@ -174,19 +184,22 @@ static int setup_amp_group(void *dt, const void *adt, int arm_io, int group)
         }
     }
 
-    /* One speaker-config row per amp, in the group's order */
-    u32 len = 0;
-    const u8 *rows = adt_getprop(adt, group, "speaker-config", &len);
+    /* One row per amp, in the group's order */
+    for (size_t p = 0; p < ARRAY_SIZE(amp_row_props); p++) {
+        u32 len = 0;
+        u32 row = amp_row_props[p].row;
+        const u8 *rows = adt_getprop(adt, group, amp_row_props[p].adt, &len);
 
-    if (rows && len < (u32)n * SPEAKER_ROW) {
-        printf("kboot: audio: %s: speaker-config has %u bytes for %d amps, not passed on\n", name,
-               len, n);
-        rows = NULL;
-    }
-    for (int i = 0; i < n; i++) {
-        if (dt_amp_setprop(dt, addrs[i], "apple,speaker-config",
-                           rows ? rows + i * SPEAKER_ROW : NULL, SPEAKER_ROW))
-            return -1;
+        if (rows && len < (u32)n * row) {
+            printf("kboot: audio: %s: %s has %u bytes for %d amps, not passed on\n", name,
+                   amp_row_props[p].adt, len, n);
+            rows = NULL;
+        }
+        for (int i = 0; i < n; i++) {
+            if (dt_amp_setprop(dt, addrs[i], amp_row_props[p].dt, rows ? rows + i * row : NULL,
+                               row))
+                return -1;
+        }
     }
 
     printf("kboot: audio: %s: amp configuration for %d amps\n", name, n);
@@ -213,7 +226,8 @@ int kboot_audio_amp_config(void *dt, const void *adt)
             if (!adt_getprop(adt, dev, "speaker1", NULL) &&
                 !adt_getprop(adt, dev, "bop-config", NULL) &&
                 !adt_getprop(adt, dev, "amp-dcblocker-config", NULL) &&
-                !adt_getprop(adt, dev, "speaker-config", NULL))
+                !adt_getprop(adt, dev, "speaker-config", NULL) &&
+                !adt_getprop(adt, dev, "amp-tx-zd-config", NULL))
                 continue;
             setup_amp_group(dt, adt, arm_io, dev);
         }
