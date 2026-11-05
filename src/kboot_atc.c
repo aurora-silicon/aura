@@ -1298,6 +1298,53 @@ static bool t6041_max_atc(void *dt)
                                  !fdt_node_check_compatible(dt, 0, "apple,j616c")));
 }
 
+/* T8142 DP uses two banks outside the core; missing DP tuning leaves USB usable. */
+static void dt_copy_t8142_dp_banks(void *dt, const char *adt_path, const char *alias)
+{
+    static const struct adt_tunable_info groups[] = {
+        {"tunable_ATCAXI2AF_LIOA_IOA", "apple,tunable-dp-lioa", 0, 0x4000, true},
+        {"tunable_ATC_COMMON_CFG", "apple,tunable-dp-common-config", 0, 0x4000, true},
+    };
+    static const char *const resources[] = {"lioa", "lpdptx"};
+    int source = adt_path_offset(adt, adt_path);
+    int node = fdt_path_offset(dt, alias);
+    if (chip_id != T8142 || source < 0 || node < 0 ||
+        fdt_node_check_compatible(dt, node, "apple,t8142-atcphy"))
+        return;
+    int capacity = fdt_totalsize(dt);
+    void *scratch = malloc(capacity);
+    int ret = scratch ? fdt_open_into(dt, scratch, capacity) : -1;
+    for (size_t i = 0; !ret && i < ARRAY_SIZE(groups); i++) {
+        node = fdt_path_offset(scratch, alias);
+        u64 span;
+        u32 len;
+        const void *input = adt_getprop(adt, source, groups[i].adt_name, &len);
+        if (!input || !len || j614s_resource_size(scratch, node, resources[i], &span) ||
+            span < groups[i].reg_size) {
+            ret = -1;
+            break;
+        }
+        ret = fdt_delprop(scratch, node, groups[i].fdt_name);
+        if (ret == -FDT_ERR_NOTFOUND)
+            ret = 0;
+        node = fdt_path_offset(scratch, alias);
+        if (!ret)
+            ret = dt_append_atc_tunable(scratch, source, node, &groups[i]);
+    }
+    if (!ret)
+        memcpy(dt, scratch, capacity);
+    else {
+        /* Withdraw both properties together without disturbing USB's lists. */
+        for (size_t i = 0; i < ARRAY_SIZE(groups); i++) {
+            node = fdt_path_offset(dt, alias);
+            if (node >= 0)
+                fdt_delprop(dt, node, groups[i].fdt_name);
+        }
+        printf("FDT: %s: DP bank tunables unavailable; keeping USB tuning\n", alias);
+    }
+    free(scratch);
+}
+
 int kboot_setup_atc(void *dt)
 {
     char adt_path[32];
@@ -1353,6 +1400,7 @@ int kboot_setup_atc(void *dt)
         snprintf(fdt_alias, sizeof(fdt_alias), "atcphy%d", i);
 
         dt_copy_atc_tunables(dt, adt_path, fdt_alias, i);
+        dt_copy_t8142_dp_banks(dt, adt_path, fdt_alias);
     }
 
     return 0;
