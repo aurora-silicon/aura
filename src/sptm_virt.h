@@ -61,6 +61,7 @@ void sptm_virt_cpu_reset(void) __attribute__((noreturn));
 void sptm_virt_cpu_arm(void);
 void sptm_virt_amx_ctl_el2_write(u64 v);
 u64 sptm_virt_amx_ctl_el2_read(void);
+bool sptm_virt_s2_dabort(u64 *regs);
 
 /* exception.c */
 bool sptm_virt_peek_fault(bool in_gl);

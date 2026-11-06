@@ -271,6 +271,38 @@ void nv2_prepare(void)
     }
 }
 
+/*
+ * aura's own stage 2 for L1 (the OS at vEL2), to trap a few pages. nv2_enter_os leaves HCR.VM
+ * clear, so the guest's own bring-up runs as without it; the caller arms it per CPU with
+ * nv2_l1_stage2_enable_here at a point it chooses. A child's exit restores it instead of
+ * VTTBR = 0.
+ */
+static u64 nv2_l1_vtcr, nv2_l1_vttbr;
+
+void nv2_set_l1_stage2_deferred(u64 vtcr, u64 vttbr)
+{
+    nv2_l1_vtcr = vtcr;
+    nv2_l1_vttbr = vttbr;
+    dc_cvac_range(&nv2_l1_vtcr, sizeof(nv2_l1_vtcr));
+    dc_cvac_range(&nv2_l1_vttbr, sizeof(nv2_l1_vttbr));
+}
+
+bool nv2_l1_stage2_enable_here(void)
+{
+    if (!nv2_l1_vttbr)
+        return false;
+    struct nv2_cpu *c = nv2_this();
+    msr(VTCR_EL2, nv2_l1_vtcr);
+    msr(VTTBR_EL2, nv2_l1_vttbr);
+    c->hcr |= HCR_VM;
+    msr(HCR_EL2, mrs(HCR_EL2) | HCR_VM);
+    sysop("isb");
+    __asm__ volatile("tlbi vmalls12e1" ::: "memory");
+    sysop("dsb nsh");
+    sysop("isb");
+    return true;
+}
+
 /* Keep the per-CPU HCR copy (restored on child exit) in step with a live HCR change. With
  * aura's GXF/SPRR live, HCR_EL2 is writable only from GL2 (a write from plain EL2, e.g. in an
  * FIQ taken from XNU, UNDEFs), so go through gl2_call there. */
@@ -668,7 +700,9 @@ static void nv2_child_exit(struct nv2_cpu *c, int kind, u64 esr)
             c->hpfar = mrs(SYS_HPFAR_EL2);
         nv2_gic_exit(c);
         kick = nv2_timers_exit(c);
-        msr(VTTBR_EL2, 0);
+        msr(VTTBR_EL2, nv2_l1_vttbr);
+        if (nv2_l1_vttbr)
+            msr(VTCR_EL2, nv2_l1_vtcr);
         msr(VPIDR_EL2, mrs(MIDR_EL1));
         msr(VMPIDR_EL2, mrs(MPIDR_EL1));
         msr(HSTR_EL2, 0);
@@ -1391,6 +1425,9 @@ bool nv2_handle_sync(u64 *regs)
     }
 
     switch (ec) {
+        case ESR_EC_DABORT_LOWER:
+            /* A stage-2 fault on one of the pages aura traps (sptm_virt_s2.c). */
+            return nv2_l1_vttbr && sptm_virt_s2_dabort(regs);
         case 0x1a:
             return nv2_eret(c);
         case ESR_EC_MSR:

@@ -97,6 +97,40 @@ static bool sptm_virt_guest_rd64(u64 va, u64 *out)
     return sptm_virt_peek64(pa, out);
 }
 
+/* A word at a PA aura may not map: use the mapping if there is one, else map the page read-only
+ * for the read. aura's EL2 tables are shared by every core, so the map/unmap is serialized. */
+static spinlock_t sptm_pa_read_lock = SPINLOCK_INIT;
+
+static bool sptm_virt_pa_read64(u64 pa, u64 *out)
+{
+    if (sptm_virt_peek64(pa, out))
+        return true;
+    spin_lock(&sptm_pa_read_lock);
+    u64 page = pa & ~0x3fffUL;
+    mmu_add_mapping(page, page, 0x4000, MAIR_IDX_NORMAL, PERM_RO);
+    *out = read64(pa);
+    mmu_rm_mapping(page, 0x4000);
+    sysop("dsb ish");
+    sysop("tlbi alle2is");
+    sysop("dsb ish");
+    sysop("isb");
+    spin_unlock(&sptm_pa_read_lock);
+    return true;
+}
+
+/* A word at a virtual address of whatever EL1 regime is loaded (XNU's, or cL4's). */
+bool sptm_virt_el1_va_read64(u64 va, u64 *out)
+{
+    u64 par0 = mrs(PAR_EL1);
+    __asm__ volatile("at s1e1r, %0" ::"r"(va) : "memory");
+    sysop("isb");
+    u64 par = mrs(PAR_EL1);
+    msr(PAR_EL1, par0);
+    if (par & 1)
+        return false;
+    return sptm_virt_pa_read64((par & GENMASK(47, 12)) | (va & 0xfff), out);
+}
+
 /* ---- the guest's GL2 register file -------------------------------------------------------- */
 
 #define SPTM_GL2_SLOTS 512u
@@ -517,6 +551,10 @@ bool sptm_virt_gl_sync(u64 *regs, u64 esr, u64 elr, u64 spsr)
             break;
         case ESR_EC_IMPDEF:
             if (iss == ESR_ISS_GEXIT_UP && sptm_virt_guarded_gexit())
+                goto done;
+            break;
+        case ESR_EC_DABORT_LOWER:
+            if (sptm_virt_xnu_live && sptm_virt_s2_dabort_gl(regs))
                 goto done;
             break;
         case ESR_EC_MSR:

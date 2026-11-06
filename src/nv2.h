@@ -28,6 +28,9 @@ extern bool nv2_guarded;
 /* Allocate the per-CPU NV pages; before the OS memory map is fixed. */
 void nv2_prepare(void);
 void nv2_cpu_reset_invalidate(int cpu);
+/* aura's own stage 2 for L1, armed per CPU with nv2_l1_stage2_enable_here. */
+void nv2_set_l1_stage2_deferred(u64 vtcr, u64 vttbr);
+bool nv2_l1_stage2_enable_here(void);
 void nv2_hcr_update(u64 set, u64 clr);
 void nv2_enter_os(u64 entry, u64 a0, u64 a1, u64 a2) __attribute__((noreturn));
 

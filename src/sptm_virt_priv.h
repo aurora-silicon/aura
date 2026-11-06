@@ -13,12 +13,14 @@
 /* sptm_virt.c */
 extern volatile bool sptm_virt_xnu_live;
 extern u32 sptm_virt_cpu_entries[MAX_CPUS];
+int sptm_virt_layout(struct sptm_virt_layout *out);
 void sptm_virt_cpu_enters_xnu(int cpu);
 
 /* sptm_virt_gl.c */
 extern volatile bool sptm_virt_peek_active_cpu[MAX_CPUS];
 extern volatile bool sptm_virt_peek_faulted_cpu[MAX_CPUS];
 bool sptm_virt_peek64(u64 phys, u64 *out);
+bool sptm_virt_el1_va_read64(u64 va, u64 *out);
 int sptm_virt_gl_alloc(void);
 u64 *sptm_virt_gl2_slot(int cpu, u16 key);
 void sptm_virt_amx_host(void);
@@ -50,5 +52,11 @@ void sptm_virt_amx_host(void);
         sptm_virt_peek_active_cpu[_c] = false;                                                     \
         sptm_virt_peek_faulted_cpu[_c];                                                            \
     })
+
+/* sptm_virt_s2.c */
+void sptm_virt_s2_setup(void);
+void sptm_virt_s2_enter_xnu(int cpu);
+bool sptm_virt_s2_dabort_gl(u64 *regs);
+void sptm_virt_mmio_rw(u64 addr, u64 *val, bool write, int width);
 
 #endif

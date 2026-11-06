@@ -149,7 +149,7 @@ static u64 sptm_virt_low_floor(u64 limit)
     return ALIGN_UP(floor, SZ_32M); /* SPTM maps its window in 32 MiB blocks */
 }
 
-static int sptm_virt_layout(struct sptm_virt_layout *out)
+int sptm_virt_layout(struct sptm_virt_layout *out)
 {
     u64 ram_base = ALIGN_DOWN(cur_boot_args.phys_base, BIT(32));
     int rc = sptm_virt_compute_layout(cur_boot_args.phys_base, cur_boot_args.mem_size, ram_base,
@@ -319,6 +319,7 @@ void sptm_virt_cpu_enters_xnu(int cpu)
         return;
     sptm_cpu_in_xnu[cpu] = true;
     nv2_hcr_update(0, HCR_TWE);
+    sptm_virt_s2_enter_xnu(cpu);
 }
 
 __attribute__((used, retain)) void sptm_virt_enter(void)
@@ -337,6 +338,7 @@ __attribute__((used, retain)) void sptm_virt_enter(void)
 
     /* The proxy flow never passes through kboot's nv2_prepare. */
     nv2_prepare();
+    sptm_virt_s2_setup();
 
     /*
      * Every other core reaches the guest through a hardware reset into aura
