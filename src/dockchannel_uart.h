@@ -7,6 +7,7 @@
 
 int dockchannel_uart_init(void);
 
+void dockchannel_uart_set_tx_timeout(u32 ms);
 void dockchannel_uart_putbyte(u8 c);
 u8 dockchannel_uart_getbyte(void);
 
