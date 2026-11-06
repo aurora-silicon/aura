@@ -3,13 +3,9 @@
 #include "monitor.h"
 #include "arm_cpu_regs.h"
 #include "cpu_regs.h"
-#include "exception.h"
-#include "malloc.h"
-#include "memory.h"
+#include "ctxr_exec.h"
 #include "nv2.h"
 #include "smp.h"
-#include "soc.h"
-#include "string.h"
 #include "utils.h"
 
 /*
@@ -17,8 +13,8 @@
  *
  * A boot object with no __TEXT_BOOT_EXEC (kcbz 0) runs without SPTM, but iBoot
  * leaves CTXR windows armed and locked on the secondary CPUs. At EL2 they can
- * then execute only inside the boot object, so an OS cannot run there. At EL1
- * the rule inverts: they can execute anywhere except inside it.
+ * then execute only inside the boot object, so an OS outside it cannot run there.
+ * At EL1 the rule inverts: they can execute anywhere except inside it.
  */
 
 void monitor_eret(u64 entry, u64 a0, u64 a1, u64 a2) __attribute__((noreturn));
@@ -27,56 +23,9 @@ void monitor_eret(u64 entry, u64 a0, u64 a1, u64 a2) __attribute__((noreturn));
  * architecture leaves it out of reset and as an OS entry point expects it. */
 #define INIT_SCTLR_EL1_MMU_OFF 0x30d00800UL
 
-static const u32 probe_insns[] = {
-    0xd2800020, /* mov x0, #1 */
-    0xd65f03c0, /* ret */
-};
-
-/*
- * Ask a secondary to run code outside the boot object. This is the whole test:
- * it is not limited to the chips where the confinement was first seen (T8140,
- * then T8142), because any Mac whose iBoot entered a kcbz-0 boot object may
- * leave the windows armed, and one that did not (M1 to M3, or a raw boot
- * object) runs the probe and keeps the OS at EL2.
- */
-bool monitor_required(void)
+bool monitor_resident(void)
 {
-    static int required = -1;
-
-    if (required >= 0)
-        return required;
-    required = 0;
-
-    int cpu;
-    for (cpu = 0; cpu < MAX_CPUS; cpu++)
-        if (cpu != boot_cpu_idx && smp_is_alive(cpu))
-            break;
-    if (cpu == MAX_CPUS)
-        return false;
-
-    u32 *probe = memalign(SZ_16K, SZ_16K);
-    if (!probe)
-        return false;
-    memcpy(probe, probe_insns, sizeof(probe_insns));
-    dc_cvau_range(probe, sizeof(probe_insns));
-    ic_ivau_range(probe, sizeof(probe_insns));
-    sysop("dsb ish");
-    sysop("isb");
-
-    u64 ret = 0;
-    exc_last_esr = 0;
-    exc_guard = GUARD_RETURN | GUARD_SILENT;
-    if (!smp_call1(cpu, probe, 0))
-        smp_wait(cpu, &ret);
-    exc_guard = GUARD_OFF;
-    free(probe);
-
-    required = ret != 1;
-    if (required)
-        printf("monitor: CPU %d could not run the heap probe (ESR 0x%lx): secondaries are "
-               "confined at EL2, entering the OS at EL1\n",
-               cpu, exc_last_esr);
-    return required;
+    return ctxr_exec_confined() && !ctxr_exec_window(NULL, NULL);
 }
 
 /*

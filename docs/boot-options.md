@@ -34,6 +34,18 @@ it cannot change the EL2 regime of a running kernel.
 The `tso=` payload setting is independent of it. It controls the Mach-O
 handoff's TSO setup and does not imply NV2.
 
+## CTXR exec (development)
+
+`aura-ctxr-exec` (or `aura-ctxr-exec=1`) confines the kernel's executable code to
+a CTXR window by emitting `/chosen/aurora,ctxr-exec-window`. Where iBoot armed a
+large enough window, aura also moves the kernel into it and enters it at EL2 with
+no monitor. NV2 and PV-KVM need the monitor, so this mode turns them off.
+`aura-ctxr-exec=0` disables it. `aura-ctxr-exec-noenforce` makes a confinement
+violation in the kernel non-fatal. An ESP `chosen.aura,ctxr-exec=1` or
+`chosen.aura,ctxr-exec=0` configuration line selects the policy for the next
+reboot, so a Stage 2 can carry it without NVRAM boot arguments. [The boot object notes](macho-boot-object.md#running-the-os-at-el2-inside-the-window)
+list what it needs and when aura keeps the monitor instead.
+
 ## DebugUSB interception (development builds)
 
 A build made with `DEBUGUSB_PROXY=1` also opens the 15 second `aura-proxy`

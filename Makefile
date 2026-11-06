@@ -227,6 +227,7 @@ OBJECTS := \
 	stage1_proxy.o \
 	sio.o \
 	smc.o \
+	ctxr_exec.o \
 	monitor.o \
 	nv2.o nv2_asm.o \
 	psci.o \

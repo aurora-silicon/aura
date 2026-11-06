@@ -10,6 +10,7 @@
 #include "assert.h"
 #include "boot_options.h"
 #include "clk.h"
+#include "ctxr_exec.h"
 #include "dapf.h"
 #include "devicetree.h"
 #include "display.h"
@@ -627,6 +628,67 @@ static int dt_set_stdout_path(int chosen)
     return 0;
 }
 
+/*
+ * Publish the physical window the OS runs in at EL2. With CONFIG_ARM64_CTXR_EXECMEM
+ * the kernel confines all of its executable code (static text, modules, BPF,
+ * kprobes, ftrace) to it, and U-Boot places itself and the kernel inside it.
+ */
+static int dt_set_ctxr_exec_window(int node)
+{
+    u64 base, size;
+
+    if (!ctxr_exec_window(&base, &size))
+        return 0;
+
+    fdt64_t win[2] = {cpu_to_fdt64(base), cpu_to_fdt64(size)};
+    if (fdt_setprop(dt, node, "aurora,ctxr-exec-window", win, sizeof(win)))
+        bail("FDT: couldn't set aurora,ctxr-exec-window\n");
+
+    printf("FDT: CTXR exec window base 0x%lx size 0x%lx\n", base, size);
+    return 0;
+}
+
+/* fdt_add_mem_rsv(), leaving out the window the OS owns. */
+static int dt_reserve_outside_exec_window(u64 start, u64 size)
+{
+    u64 window, window_size;
+
+    if (!ctxr_exec_window(&window, &window_size))
+        return fdt_add_mem_rsv(dt, start, size);
+
+    u64 end = start + size, window_end = window + window_size;
+
+    if (start < window && fdt_add_mem_rsv(dt, start, min(end, window) - start))
+        return -1;
+    if (end > window_end) {
+        u64 above = max(start, window_end);
+        if (fdt_add_mem_rsv(dt, above, end - above))
+            return -1;
+    }
+    return 0;
+}
+
+/* Windows A to C, which T8140's firmware RO range covers and other chips may not describe. */
+static int dt_reserve_ctxr_low_windows(void)
+{
+    const u64 windows[][2] = {
+        {mrs(SYS_IMP_APL_CTXR_A_LWR_EL1), mrs(SYS_IMP_APL_CTXR_A_UPR_EL1)},
+        {mrs(SYS_IMP_APL_CTXR_B_LWR_EL1), mrs(SYS_IMP_APL_CTXR_B_UPR_EL1)},
+        {mrs(SYS_IMP_APL_CTXR_C_LWR_EL1), mrs(SYS_IMP_APL_CTXR_C_UPR_EL1)},
+    };
+
+    for (size_t i = 0; i < ARRAY_SIZE(windows); i++) {
+        if (!windows[i][0] || windows[i][1] < windows[i][0])
+            continue;
+        u64 start = ALIGN_DOWN(windows[i][0], SZ_16K);
+        u64 end = ALIGN_UP(windows[i][1] + SZ_4K, SZ_16K);
+        if (fdt_add_mem_rsv(dt, start, end - start))
+            return -1;
+        printf("FDT: reserved CTXR window [0x%lx, 0x%lx)\n", start, end);
+    }
+    return 0;
+}
+
 static int dt_set_chosen(void)
 {
 
@@ -646,6 +708,9 @@ static int dt_set_chosen(void)
     }
 
     if (dt_set_stdout_path(node))
+        return -1;
+
+    if (dt_set_ctxr_exec_window(node))
         return -1;
 
     if (chip_id == T8140 && dt_set_t8140_wfx_args(node))
@@ -1004,7 +1069,7 @@ static int dt_reserve_bootloader_handoff(void)
             return -1;
         }
 
-        if (fdt_add_mem_rsv(dt, start, size))
+        if (dt_reserve_outside_exec_window(start, size))
             return -1;
 
         printf("FDT: reserved described bootloader handoff 0x%lx..0x%lx\n", start, start + size);
@@ -1842,7 +1907,7 @@ static int dt_set_cpus(void)
      * services PSCI over SMC; expose a /psci node and switch the cpus below
      * from spin-table to it. Without the monitor the OS boots at EL2 and keeps
      * spin-table. */
-    bool psci = monitor_required();
+    bool psci = monitor_resident();
     if (psci) {
         int node = fdt_path_offset(dt, "/psci");
         if (node < 0)
@@ -8697,6 +8762,35 @@ static int dt_prepare_t8152(void)
     return 0;
 }
 
+/*
+ * On a confined machine a secondary executes only inside the armed window, and
+ * spin-table releases it into the kernel's own text. The kernel has to be there:
+ * move it from the heap, above the window.
+ */
+static int kboot_move_to_exec_window(void **kernel)
+{
+    struct kernel_header *hdr = *kernel;
+    u64 base, size;
+
+    if (!ctxr_exec_window(&base, &size))
+        return 0;
+
+    u64 image_size = hdr->image_size, text_offset = hdr->text_offset;
+    if (!image_size || image_size > size || text_offset > size - image_size)
+        bail("kboot: kernel (offset 0x%lx size 0x%lx) does not fit the CTXR exec window\n",
+             text_offset, image_size);
+
+    void *dest = (void *)(base + text_offset);
+    memmove(dest, hdr, image_size);
+    dc_cvac_range(dest, image_size);
+    sysop("dsb sy");
+    ic_ivau_range(dest, image_size);
+    sysop("dsb sy");
+    sysop("isb");
+    *kernel = dest;
+    return 0;
+}
+
 /* T8152 has no clock, USB, PCIe or DAPF setup here: j873g_run_proxy() did
  * what the device tree expects, and Linux owns the rest. */
 static int kboot_boot_t8152(void *kernel)
@@ -8714,6 +8808,8 @@ static int kboot_boot_t8152(void *kernel)
         dt_ready = false;
         bail("kboot: secondary kernel park failed\n");
     }
+    if (kboot_move_to_exec_window(&kernel))
+        return -1;
     printf("Preparing to boot kernel at %p with fdt at %p\n", kernel, dt);
     next_stage.entry = kernel;
     next_stage.args[0] = (u64)dt;
@@ -8738,11 +8834,14 @@ int kboot_prepare_dt(void *fdt)
 
     dt_ready = false;
 
+    if (!ctxr_exec_os_may_start())
+        return -1;
+
     /* Need to init ISP early to carve out heap */
     if (chip_id != T8152)
         isp_init();
     /* Likewise the NV pages, before the retained heap extent is fixed. */
-    if (nv2_requested() && monitor_required())
+    if (nv2_requested() && monitor_resident())
         nv2_prepare();
 
     dt_bufsize = fdt_totalsize(fdt);
@@ -8820,12 +8919,13 @@ int kboot_prepare_dt(void *fdt)
                 bail("FDT: retained heap extent overflows\n");
             u64 heap_start = ALIGN_DOWN((u64)_end, SZ_16K);
             u64 heap_end = ALIGN_UP(heap_top, SZ_16K);
-            if (heap_end > ram_end || fdt_add_mem_rsv(dt, heap_start, heap_end - heap_start))
+            if (heap_end > ram_end ||
+                dt_reserve_outside_exec_window(heap_start, heap_end - heap_start))
                 bail("FDT: couldn't reserve retained heap\n");
             printf("FDT: retained heap [0x%lx, 0x%lx)\n", heap_start, heap_end);
         }
     }
-    if (fdt_add_mem_rsv(dt, (u64)_base, image_end - (u64)_base))
+    if (dt_reserve_outside_exec_window((u64)_base, image_end - (u64)_base))
         bail("FDT: couldn't add reservation for aura and inherited high-water\n");
 
     /*
@@ -8879,19 +8979,20 @@ int kboot_prepare_dt(void *fdt)
         bail("FDT: couldn't add reservation for aura's old reset vector\n");
 
     /*
-     * CTXR_D starts below this image, and a secondary at EL1 that executes
-     * inside it takes an abort straight to EL2. The firmware RO range below
-     * covers windows A to C.
+     * The OS owns its window in CTXR_D. Keep the rest of the windows out of its
+     * allocator, because EL0 cannot execute in them on a confined core.
      */
-    if (monitor_required()) {
+    if (ctxr_exec_confined()) {
         u64 start = ALIGN_DOWN(mrs(SYS_IMP_APL_CTXR_D_LWR_EL1), SZ_16K);
         u64 end = ALIGN_UP(mrs(SYS_IMP_APL_CTXR_D_UPR_EL1) + SZ_4K, SZ_16K);
 
-        if (!start || end <= start || fdt_add_mem_rsv(dt, start, end - start))
+        if (!start || end <= start || dt_reserve_outside_exec_window(start, end - start))
             bail("FDT: couldn't reserve CTXR_D\n");
-        printf("FDT: reserved CTXR_D [0x%lx, 0x%lx)\n", start, end);
+        printf("FDT: reserved CTXR_D [0x%lx, 0x%lx) less the OS window\n", start, end);
+        if (chip_id != T8140 && dt_reserve_ctxr_low_windows())
+            bail("FDT: couldn't reserve CTXR windows A to C\n");
     }
-    if (nv2_requested() && monitor_required()) {
+    if (nv2_requested() && monitor_resident()) {
         u64 base, size;
         nv2_trace_region(&base, &size);
         if (size) {
@@ -8959,7 +9060,7 @@ int kboot_prepare_dt(void *fdt)
             return -1;
         u64 start = min(ALIGN_UP((u64)adt + cur_boot_args.devtree_size, SZ_16K), (u64)_base);
         u64 end = cur_boot_args.top_of_kernel_data;
-        if (end > start && fdt_add_mem_rsv(dt, start, end - start))
+        if (end > start && dt_reserve_outside_exec_window(start, end - start))
             bail("FDT: couldn't reserve the J713 chainload high-water interval\n");
     }
 
@@ -9297,6 +9398,10 @@ static int dt_finish_j614s_aop(void *tree, bool ready)
 
 int kboot_boot(void *kernel)
 {
+    if (!ctxr_exec_os_may_start()) {
+        next_stage.entry = NULL;
+        return -1;
+    }
     if (chip_id == T8152)
         return kboot_boot_t8152(kernel);
 
@@ -9401,6 +9506,8 @@ int kboot_boot(void *kernel)
     smp_set_wfe_mode(true);
     if (chip_id == T8140 && dt_t8140_recheck_display())
         return -1;
+    if (kboot_move_to_exec_window(&kernel))
+        return -1;
     printf("Preparing to boot kernel at %p with fdt at %p\n", kernel, dt);
 
     if (smp_has_pending_calls()) {
@@ -9414,7 +9521,7 @@ int kboot_boot(void *kernel)
     next_stage.args[3] = 0;
     next_stage.args[4] = 0;
     next_stage.restore_logo = false;
-    next_stage.monitor = monitor_required();
+    next_stage.monitor = monitor_resident();
 
     return 0;
 }

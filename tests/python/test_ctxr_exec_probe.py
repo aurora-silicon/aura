@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: MIT
-"""monitor_required() decides by its probe alone, on every chip."""
+"""ctxr_exec_confined() decides by its probe alone, on every chip."""
 
 from test_smp_timeouts import REPO, compile_and_run
 
 
-def monitor_required_source():
-    source = (REPO / "src/monitor.c").read_text()
+def probe_source():
+    source = (REPO / "src/ctxr_exec.c").read_text()
     start = source.index("static const u32 probe_insns[]")
-    end = source.index("\n}\n", source.index("bool monitor_required(void)")) + 3
+    end = source.index("\n}\n", source.index("bool ctxr_exec_confined(void)")) + 3
     return source[start:end]
 
 
@@ -56,35 +56,35 @@ static int smp_wait(int cpu, u64 *ret) { *ret = result; return 0; }
 ''' + "%s" + r'''
 #undef printf
 static int run(int chip, int alive, int faults) {
-    /* monitor_required() caches its answer per boot: model each case as a fresh boot. */
+    /* ctxr_exec_confined() caches its answer per boot: model each case as a fresh boot. */
     chip_id = chip; alive_mask = alive; probe_faults = faults; calls = 0; printed = 0;
-    return monitor_required();
+    return ctxr_exec_confined();
 }
 int main(void) {
-    /* M4 Pro / M4 Max / A18 Pro / M5 with the windows armed: EL1. */
+    /* M4 Pro / M4 Max / A18 Pro / M5 with the windows armed. */
     int chips[] = { T6040, T6041, T8140, T8142, 0x1234 };
     for (unsigned i = 0; i < sizeof(chips) / sizeof(chips[0]); i++) {
         assert(run(chips[i], 0x2, 1) == 1 && calls == 1 && printed == 1);
     }
-    /* M1 to M3, or any raw boot object: the probe runs and the OS stays at EL2. */
+    /* M1 to M3, or any raw boot object: the probe runs and nothing is confined. */
     for (unsigned i = 0; i < sizeof(chips) / sizeof(chips[0]); i++)
         assert(run(chips[i], 0x2, 0) == 0 && calls == 1 && printed == 0);
     assert(run(T8112, 0xe, 0) == 0 && calls == 1);
-    /* No secondary to ask: EL2, as before. */
+    /* No secondary to ask, so nothing to confine. */
     assert(run(T6040, 0x1, 1) == 0 && calls == 0);
-    puts("monitor probe OK");
+    puts("ctxr exec probe OK");
     return 0;
 }
 '''
 
 
 def build(tmp_path, cases_source):
-    body = monitor_required_source()
+    body = probe_source()
     # Each case is a fresh boot: drop the static cache so one binary can run them all.
-    body = body.replace("static int required = -1;", "int required = -1;")
-    function = body[body.index("bool monitor_required(void)"):]
-    assert "chip_id" not in function, "monitor_required() must not filter by chip ID"
-    compile_and_run(tmp_path, "monitor_probe", HARNESS % body)
+    body = body.replace("static int confined = -1;", "int confined = -1;")
+    function = body[body.index("bool ctxr_exec_confined(void)"):]
+    assert "chip_id" not in function, "ctxr_exec_confined() must not filter by chip ID"
+    compile_and_run(tmp_path, "ctxr_exec_probe", HARNESS % body)
 
 
 def test_probe_decides_on_every_chip(tmp_path):
@@ -92,15 +92,17 @@ def test_probe_decides_on_every_chip(tmp_path):
 
 
 def test_answer_is_cached_per_boot():
-    body = monitor_required_source()
-    assert "static int required = -1;" in body
-    assert body.index("if (required >= 0)") < body.index("smp_call1(")
+    body = probe_source()
+    assert "static int confined = -1;" in body
+    assert body.index("if (confined >= 0)") < body.index("smp_call1(")
 
 
 def test_reports_the_fault():
-    body = monitor_required_source()
+    body = probe_source()
     assert "exc_last_esr = 0;" in body and "ESR 0x%lx" in body
 
 
 def test_callers_use_the_probe():
-    assert "monitor_required()" in (REPO / "src/kboot.c").read_text()
+    assert "monitor_resident()" in (REPO / "src/kboot.c").read_text()
+    source = (REPO / "src/monitor.c").read_text()
+    assert "return ctxr_exec_confined() && !ctxr_exec_window(NULL, NULL);" in source

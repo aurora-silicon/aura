@@ -70,8 +70,8 @@ On T8140 the windows change where a secondary can execute:
 - At EL1 the rule inverts. Executing inside `CTXR_D` takes an instruction
   abort straight to EL2 (ESR 0x8200000c), and execution elsewhere works.
 
-An OS therefore cannot run at EL2 in this mode. Aura stays at EL2 as a
-monitor and enters the OS at EL1 on every CPU (`src/monitor.c`). At kboot,
+An OS outside the windows therefore cannot run at EL2 in this mode. Aura stays
+at EL2 as a monitor and enters the OS at EL1 on every CPU (`src/monitor.c`). At kboot,
 `monitor_required()` asks a secondary to run two instructions from the heap
 and uses EL1 only if that faults. The probe runs on every chip, not on a list
 of chips: a Mac without the windows (M1 to M3, or any raw boot object) runs it
@@ -88,12 +88,53 @@ system registers we tracked survive, including the pointer authentication
 keys. WFE wipes nothing. Linux has to save registers around idle, and the
 Aurora kernel does.
 
+## Running the OS at EL2 inside the window
+
+A kernel whose executable pages all sit inside `CTXR_D` may run at EL2.
+`aura-ctxr-exec`, or a `chosen.aura,ctxr-exec=1` line in the ESP Stage 2, does
+that when iBoot armed a large enough window. It takes a
+boot object padded by aurora-installer (Utilities, Expanded Code Window) and a
+kernel built with `CONFIG_ARM64_CTXR_EXECMEM`. The padding gives a 128 MiB window,
+which holds the kernel image and the code of every module with room to spare. RAM
+in the window that the kernel doesn't use is lost to the rest of the system.
+
+`ctxr_exec_window()` in `src/monitor.c` finds the window. It starts at the first
+2 MiB boundary past aura's 16 MiB slot and ends where `CTXR_D` ends. The device
+tree, the trust cache and aura are in `CTXR_D` too, below that start, so the
+window holds only memory the kernel owns. The kernel builds its executable pool
+from the memory in the window that nothing has reserved.
+
+In this mode aura moves the kernel from the heap to the start of the window and
+publishes the window as `/chosen/aurora,ctxr-exec-window`. It keeps spin-table
+with no `/psci` node, so the kernel releases each secondary into its own text. It
+reserves the rest of `CTXR_D` and the firmware RO range but not the window, then
+enters the kernel directly, as on M1 to M3. The monitor is never installed, so
+NV2 and PV-KVM are off.
+
+Aura keeps the monitor and prints why if the window fails a check: an object
+that was not padded, a chip other than T8140, or firmware RO, `boot_args` or the
+heap inside it. The kernel then gets a base-0 window, which confines it in
+software only, and runs at EL1.
+
+A kernel aura loads itself, with `boot=` or an inline payload, can use this
+directly. Booting through U-Boot and GRUB needs U-Boot support for the window
+(aurora-silicon/u-boot#32): when `/chosen/aurora,ctxr-exec-window` is present,
+U-Boot loads an arm64 `Image` at the lowest free 2 MiB boundary inside it, on
+both the EFI path (GRUB's `LoadImage`) and `booti`, and tells the EFI stub to
+run it in place. Without that U-Boot change the image lands outside the window
+and an enforcing kernel panics in `ctxr_exec_reserve()`. A compressed (zboot)
+kernel cannot be pinned and is refused while enforcing. Spin-table has no CPU
+off, so CPU hotplug does not work in this mode.
+
 ## Status
 
 kmutil from macOS 27.2 and from macOS 26.6.2 (25G83) parses the boot
 object and derives `kcbz : 0`. On a MacBook Neo (T8140, J700) a proxy Stage 1
 built this way cold-boots, and the installed Fedora kernel boots to a login
-at EL1 with pointer authentication on and all six CPUs up.
+at EL1 with pointer authentication on and all six CPUs up. A proxy Stage 1
+padded for 256 MiB also cold-boots, with `CTXR_D` ending where `kcrz` predicts,
+and from it Linux reaches a login at EL2 on all six CPUs through U-Boot's `booti`.
 
 Not tested: a raw boot with `src/monitor.c` in the tree, a filled Stage 1 that
-loads Stage 2 from the ESP, and any chip other than T8140.
+loads Stage 2 from the ESP, any chip other than T8140, a 128 MiB window on
+hardware, and the EL2 path through GRUB.
