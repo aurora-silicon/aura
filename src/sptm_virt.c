@@ -1,13 +1,16 @@
 /* SPDX-License-Identifier: MIT */
 
 /*
- * Virtualized SPTM: the carve-out, the host's loader entry points and the guest entry.
+ * Virtualized SPTM: the carve-out, the host's loader entry points, the guest entry and the reset
+ * path every other core takes into the guest.
  */
 
 #include "sptm_virt.h"
 #include "adt.h"
 #include "cpu_regs.h"
+#include "dockchannel_uart.h"
 #include "fb.h"
+#include "gxf.h"
 #include "heapblock.h"
 #include "memory.h"
 #include "nv2.h"
@@ -26,10 +29,14 @@
 #define SPTM_VIRT_AURA_HEAP (512UL << 20)
 #define SPTM_VIRT_ALIGN     (2UL << 20) /* an L2 block */
 
+volatile bool sptm_virt_guest_live;
 volatile bool sptm_virt_xnu_live;
+u32 sptm_virt_cpu_entries[MAX_CPUS];
 
 static u64 sptm_entry_pa, sptm_handoff_pa;
 static bool sptm_images_loaded;
+static u64 sptm_reset_pa;
+static u32 sptm_cpu_resets[MAX_CPUS];
 /* False while a core runs SPTM's own (re)entry path, true from its first GEXIT into XNU. */
 static volatile bool sptm_cpu_in_xnu[MAX_CPUS];
 
@@ -276,7 +283,13 @@ __attribute__((used, retain)) int sptm_virt_load(u64 sptm_entry, u64 handoff)
 /* The last step of every guest entry on a core, from nv2_enter_os. */
 void sptm_virt_cpu_arm(void)
 {
-    sptm_cpu_in_xnu[smp_id()] = false;
+    int cpu = smp_id();
+    u32 ent = sptm_virt_cpu_entries[cpu]++;
+
+    sptm_cpu_in_xnu[cpu] = false;
+    if (sptm_virt_guest_live && (ent < 4 || (ent & 0xff) == 0))
+        printf("SPTM-virt[smp]: cpu%d (MPIDR 0x%06lx) enters SPTM, entry #%u, TWE armed\n", cpu,
+               mrs(MPIDR_EL1) & 0xffffff, ent);
 
     /* GXF and SPRR run natively below aura: nothing traps GENTER/GEXIT or their configuration. */
     msr(HACR_EL2, 0);
@@ -325,6 +338,24 @@ __attribute__((used, retain)) void sptm_virt_enter(void)
     /* The proxy flow never passes through kboot's nv2_prepare. */
     nv2_prepare();
 
+    /*
+     * Every other core reaches the guest through a hardware reset into aura
+     * (sptm_virt_cpu_reset), which enters SPTM's reset vector: the first instruction of the 16K
+     * page holding its cold entry. Give each one its GL stacks now and publish its reset stack.
+     */
+    sptm_reset_pa = sptm_entry_pa & ~0x3fffUL;
+    for (int i = 0; i < MAX_CPUS; i++)
+        if (smp_cpu_valid(i))
+            gxf_prealloc(i);
+    int ready = smp_prepare_guest_resets();
+    sptm_virt_guest_live = true;
+    /* From here aura prints from the guest's traps on its own cores. */
+    dockchannel_uart_set_tx_timeout(20);
+    dc_cvac_range((void *)&sptm_virt_guest_live, sizeof(sptm_virt_guest_live));
+    dc_cvac_range((void *)&sptm_reset_pa, sizeof(sptm_reset_pa));
+    printf("SPTM-virt: SMP: %d cores reach aura on reset; SPTM reset vector 0x%lx (insn 0x%x)\n",
+           ready, sptm_reset_pa, read32(sptm_reset_pa));
+
     /* MMU-off fetches must not see stale I-cache lines of whatever ran here. */
     ic_iallu();
     sysop("dsb sy");
@@ -336,4 +367,46 @@ __attribute__((used, retain)) void sptm_virt_enter(void)
 #endif
 
     nv2_enter_os(sptm_entry_pa, sptm_handoff_pa, 0, 0);
+}
+
+/*
+ * A core out of a hardware reset while the guest is live: XNU started it (PMGR CPUSTART), or it
+ * power-gated in idle or sleep and woke. Its iBoot-locked RVBAR lands in aura, MMU off, on the
+ * stack smp_prepare_guest_resets published. Rebuild its GL2 and EL2 state and enter SPTM's reset
+ * vector at virtual EL2; SPTM picks cold start or resume itself.
+ */
+void sptm_virt_cpu_reset(void)
+{
+    msr(DAIF, 0xfUL << 6);
+    u64 mpidr = mrs(MPIDR_EL1) & 0xffffff;
+    int cpu = smp_index_for_mpidr(mpidr);
+    if (cpu < 0) {
+        printf("SPTM-virt[smp]: reset of unknown core MPIDR 0x%lx; parking\n", mpidr);
+        while (1)
+            sysop("wfe");
+    }
+    msr(TPIDR_EL2, cpu);
+
+    /* Everything so far went straight to DRAM: drop stale lines an earlier life of this core
+     * left in the cluster cache before the caches come back on. */
+    u64 sbase, ssize;
+    smp_reset_stack_range(cpu, &sbase, &ssize);
+    if (ssize)
+        dc_ivac_range((void *)sbase, ssize);
+    nv2_cpu_reset_invalidate(cpu);
+    sysop("dsb sy");
+
+    u32 n = sptm_cpu_resets[cpu]++;
+    if (n < 4 || (n & 0xff) == 0)
+        printf("SPTM-virt[smp]: cpu%d (MPIDR 0x%06lx) reset #%u -> SPTM reset vector 0x%lx\n", cpu,
+               mpidr, n, sptm_reset_pa);
+
+    gxf_init();
+
+    msr(SYS_SCTLR_EL12, mrs(SYS_SCTLR_EL12) & ~(SCTLR_M | SCTLR_C | SCTLR_I));
+    ic_iallu();
+    sysop("dsb sy");
+    sysop("isb");
+
+    nv2_enter_os(sptm_reset_pa, 0, 0, 0);
 }

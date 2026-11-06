@@ -258,7 +258,10 @@ void nv2_prepare(void)
     }
 #endif
     for (int i = 0; i < MAX_CPUS; i++) {
-        if (nv2_pages[i] || (i != boot_cpu_idx && !smp_is_alive(i)))
+        /* A guarded guest (SPTM) brings every core up itself, through a reset, so
+         * give each ADT core its pages now (the reset path runs with the MMU off). */
+        if (nv2_pages[i] ||
+            (i != boot_cpu_idx && !smp_is_alive(i) && !(nv2_guarded && smp_cpu_valid(i))))
             continue;
         /* VNCR and AVNCR: adjacent 4 KiB pages in the retained heap. */
         nv2_pages[i] = memalign(SZ_16K, SZ_16K);
@@ -290,6 +293,13 @@ void nv2_hcr_update(u64 set, u64 clr)
         gl2_call(nv2_hcr_write_gl2, v, 0, 0, 0);
     else
         msr(HCR_EL2, v);
+}
+
+/* A core re-entering through reset: drop any stale cached copy of its NV pages. */
+void nv2_cpu_reset_invalidate(int cpu)
+{
+    if (cpu >= 0 && cpu < MAX_CPUS && nv2_pages[cpu])
+        dc_ivac_range(nv2_pages[cpu], SZ_16K);
 }
 
 /* ---------------------------------------------------------------------- */

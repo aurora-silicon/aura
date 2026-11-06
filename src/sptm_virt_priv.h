@@ -12,6 +12,7 @@
 
 /* sptm_virt.c */
 extern volatile bool sptm_virt_xnu_live;
+extern u32 sptm_virt_cpu_entries[MAX_CPUS];
 void sptm_virt_cpu_enters_xnu(int cpu);
 
 /* sptm_virt_gl.c */

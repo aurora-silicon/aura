@@ -169,8 +169,9 @@ void exception_initialize(void)
             break;
     }
 
-    /* Initial T8152 bring-up polls KIS without configuring the AIC. */
-    if (is_boot_cpu() && chip_id != T8152)
+    /* Initial T8152 bring-up polls KIS without configuring the AIC. A core reset while the
+     * virtualized SPTM's guest is live must not take the guest's interrupts at EL2. */
+    if (is_boot_cpu() && chip_id != T8152 && !sptm_virt_guest_live)
         msr(DAIF, 0 << 6); // Enable SError, IRQ and FIQ
     else
         msr(DAIF, 3 << 6); // Disable IRQ and FIQ

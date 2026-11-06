@@ -42,6 +42,9 @@ struct sptm_virt_placement {
 
 #ifdef SPTM_VIRT
 
+/* Set once the boot CPU has entered the guest; read with the MMU off by the reset path. */
+extern volatile bool sptm_virt_guest_live;
+
 bool sptm_virt_requested(void);
 bool sptm_virt_heap_window(u64 *base, u64 *limit);
 
@@ -50,6 +53,9 @@ int sptm_virt_place(struct sptm_virt_placement *out);
 int sptm_virt_load(u64 sptm_entry, u64 handoff);
 void sptm_virt_flush(u64 pa, u64 size);
 void sptm_virt_enter(void) __attribute__((noreturn));
+
+/* A core coming out of reset while the guest is live (startup.c). */
+void sptm_virt_cpu_reset(void) __attribute__((noreturn));
 
 /* nv2.c: the last step of every guest entry on a core. */
 void sptm_virt_cpu_arm(void);
@@ -62,6 +68,8 @@ bool sptm_virt_gl_sync(u64 *regs, u64 esr, u64 elr, u64 spsr);
 bool sptm_virt_el1_wfx(u64 *regs, u64 esr);
 
 #else
+
+#define sptm_virt_guest_live false
 
 static inline bool sptm_virt_heap_window(u64 *base, u64 *limit)
 {
