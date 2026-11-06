@@ -62,17 +62,11 @@ static bool hv_should_exit[MAX_CPUS];
 bool hv_started_cpus[MAX_CPUS];
 u64 hv_cpus_in_guest;
 
-/*
- * T8142's architectural CNTPCT view is redirected/trapped for the guest and
- * is not a dependable EL2 bookkeeping clock. Apple's always-on counter alias
- * is the same source used to emulate guest CNTPCT_EL0 reads.
- */
+/* The common clock uses the qualified T8142 alias in architectural timer
+ * units, including the epoch used by the physical timer comparators. */
 u64 hv_host_counter(void)
 {
-    if (chip_id == T8142)
-        return mrs(SYS_IMP_APL_CNTVCT_ALIAS_EL0);
-
-    return mrs(CNTPCT_EL0);
+    return get_ticks();
 }
 
 /*
@@ -245,6 +239,10 @@ int hv_init(void)
     /* Device and guest state is single-session; reload Aura before another boot. */
     if (hv_windows_initialized) {
         printf("HV: reload the Windows personality before another session\n");
+        return -1;
+    }
+    if (!timer_prepare_windows()) {
+        printf("HV: T8142 counter frequency/rate qualification failed\n");
         return -1;
     }
     hv_windows_initialized = true;
@@ -624,7 +622,7 @@ void hv_fb_report(void)
     if (!hv_fb_shadow)
         return;
 
-    u64 now = mrs(CNTPCT_EL0);
+    u64 now = get_ticks();
     if (now < hv_fb_report_next)
         return;
     hv_fb_report_next = now + mrs(CNTFRQ_EL0);

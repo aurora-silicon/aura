@@ -358,11 +358,22 @@ static unsigned int hv_timer_diag_source(bool physical)
     return physical ? 0 : 1;
 }
 
+static u64 hv_guest_timer_counter(bool physical)
+{
+    if (physical)
+        return hv_host_counter();
+    /* CNTVOFF and stolen_time use architectural ticks. Avoid the frozen
+     * T8142 CNTVCT view while retaining the guest's virtual timer epoch. */
+    if (chip_id == T8142)
+        return hv_host_counter() - mrs(CNTVOFF_EL2);
+    return mrs(CNTVCT_EL0);
+}
+
 static void hv_timer_diag_note_fiq(bool physical)
 {
     unsigned int source = hv_timer_diag_source(physical);
     struct hv_native_aic_timer_diag *diag = &native_aic_timer_diag[smp_id()];
-    u64 guest_counter = physical ? hv_host_counter() : mrs(CNTVCT_EL0);
+    u64 guest_counter = hv_guest_timer_counter(physical);
     u64 cval = physical ? mrs(CNTP_CVAL_EL02) : mrs(CNTV_CVAL_EL02);
     u64 lateness = (s64)(guest_counter - cval) > 0 ? guest_counter - cval : 0;
 
@@ -4594,14 +4605,9 @@ static bool hv_handle_msr_unlocked(struct exc_info *ctx, u64 iss)
         case SYSREG_ISS(sys_reg(3, 3, 14, 0, 1)): /* CNTPCT_EL0 */
             if (!is_read || chip_id != T8142)
                 return false;
-            /*
-             * T8142's standard physical and virtual counter views remain frozen
-             * while an EL1 exception is active.  Apple's ACNTVCT_EL0 alias is
-             * monotonic at the same CNTFRQ in that context, so use it as the
-             * timebase for the trapped physical-counter read.  Mu and bootmgfw
-             * only depend on monotonic deltas here.
-             */
-            regs[rt] = mrs(SYS_IMP_APL_CNTVCT_ALIAS_EL0);
+            /* Raw alias ticks run at 24 MHz, while CNTFRQ and physical timer
+             * compare values use 1 GHz. Share the qualified host scale/epoch. */
+            regs[rt] = get_ticks();
             return true;
             /* Architectural timer, for ECV */
 #ifdef ENABLE_NATIVE_AIC_PASSTHROUGH
