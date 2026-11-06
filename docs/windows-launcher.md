@@ -225,8 +225,10 @@ driver operation or permit a second attempt without a fresh Aura load.
 `mtp` defaults to `disabled`; all Windows profiles publish a disabled MTP
 marker until preparation actually succeeds. `j813-v1` requires T8142/Mac17,3,
 automatically reserves the complete 2 MiB staging/grant region, and performs
-the bounded preboot handoff during `hv_init`. It requires the matching Mu MTP
-admission gate. See the [experimental MTP contract](windows-mtp-handoff.md).
+the bounded preboot handoff during `hv_init`. This reservation guards host
+placement. Mu must also exclude the range from allocatable EFI memory before
+DXE and implement the matching MTP admission gate. See the
+[experimental MTP contract](windows-mtp-handoff.md).
 
 `reserved_memory` optionally declares up to 16 firmware-owned physical ranges.
 Each has a unique `name`, a positive `size`, and exactly one of `base` or
