@@ -457,12 +457,41 @@ static bool sptm_virt_guarded_eret(void)
     return true;
 }
 
+/* XNU's frame chain at a GEXIT into it, at most every 5 s per core. Nothing XNU sees changes:
+ * SPTM preserves x29, and XNU's EL1 regime is the one loaded. */
+static void sptm_virt_xnu_bt(u64 *regs, u64 target)
+{
+    static u64 next[MAX_CPUS];
+    static u32 nbt[MAX_CPUS];
+    int cpu = smp_id();
+    u64 now = mrs(CNTPCT_EL0);
+
+    if (now < next[cpu] || nbt[cpu] >= 2000)
+        return;
+    next[cpu] = now + 5 * mrs(CNTFRQ_EL0);
+    nbt[cpu]++;
+    char line[320];
+    int len = snprintf(line, sizeof(line), "SPTM-virt[xbt c%d #%u]: ret 0x%lx x0 0x%lx |", cpu,
+                       nbt[cpu], target, regs[0]);
+    u64 fp = regs[29];
+    for (int i = 0; i < 12 && fp && len < (int)sizeof(line) - 24; i++) {
+        u64 nfp, lr;
+        if (!sptm_virt_el1_va_read64(fp, &nfp) || !sptm_virt_el1_va_read64(fp + 8, &lr))
+            break;
+        len += snprintf(line + len, sizeof(line) - len, " %lx", lr | 0xffff000000000000UL);
+        if (nfp <= fp)
+            break;
+        fp = nfp;
+    }
+    printf("%s\n", line);
+}
+
 /*
  * SPTM's GEXIT out of its guarded world to its own normal world (virtual EL2), which physical GL1
  * cannot reach, so it traps up. It consumes the guest's GL bank: return to ELR/SPSR_GL12 in the
  * world ASPSR_GL12 names, virtual EL2 at physical EL1, copying the guest's ASPSR exactly.
  */
-static bool sptm_virt_guarded_gexit(void)
+static bool sptm_virt_guarded_gexit(u64 *regs)
 {
     static u32 n;
     u64 pc = mrs(ELR_EL1); /* mirrored from GL2's bank by the trap entry */
@@ -493,6 +522,8 @@ static bool sptm_virt_guarded_gexit(void)
             printf("SPTM-virt: XNU entered on cpu%d\n", cpu);
         }
         sptm_virt_cpu_enters_xnu(cpu);
+        if ((sptm_virt_flags & SPTM_VIRT_XNU_BT) && el == 2)
+            sptm_virt_xnu_bt(regs, target);
     }
 
     msr(ELR_EL1, target);
@@ -572,7 +603,7 @@ bool sptm_virt_gl_sync(u64 *regs, u64 esr, u64 elr, u64 spsr)
                 goto done;
             break;
         case ESR_EC_IMPDEF:
-            if (iss == ESR_ISS_GEXIT_UP && sptm_virt_guarded_gexit())
+            if (iss == ESR_ISS_GEXIT_UP && sptm_virt_guarded_gexit(regs))
                 goto done;
             break;
         case ESR_EC_DABORT_LOWER:

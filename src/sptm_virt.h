@@ -40,6 +40,9 @@ struct sptm_virt_placement {
     u64 managed_base, managed_end;
 };
 
+/* Host configuration (sptm_virt_config), set over the proxy before sptm_virt_enter. */
+#define SPTM_VIRT_XNU_BT BIT(5) /* sample XNU backtraces at GEXIT */
+
 #ifdef SPTM_VIRT
 
 /* Set once the boot CPU has entered the guest; read with the MMU off by the reset path. */
@@ -52,6 +55,7 @@ bool sptm_virt_heap_window(u64 *base, u64 *limit);
 int sptm_virt_place(struct sptm_virt_placement *out);
 int sptm_virt_load(u64 sptm_entry, u64 handoff);
 void sptm_virt_flush(u64 pa, u64 size);
+void sptm_virt_config(u64 flags);
 void sptm_virt_enter(void) __attribute__((noreturn));
 
 /* A core coming out of reset while the guest is live (startup.c). */

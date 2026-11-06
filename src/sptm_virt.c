@@ -31,6 +31,7 @@
 
 volatile bool sptm_virt_guest_live;
 volatile bool sptm_virt_xnu_live;
+u64 sptm_virt_flags;
 u32 sptm_virt_cpu_entries[MAX_CPUS];
 
 static u64 sptm_entry_pa, sptm_handoff_pa;
@@ -278,6 +279,12 @@ __attribute__((used, retain)) int sptm_virt_load(u64 sptm_entry, u64 handoff)
     printf("SPTM-virt: images recorded, entry 0x%lx handoff 0x%lx; ready to enter\n", sptm_entry,
            handoff);
     return 0;
+}
+
+__attribute__((used, retain)) void sptm_virt_config(u64 flags)
+{
+    sptm_virt_flags = flags;
+    printf("SPTM-virt: flags 0x%lx\n", flags);
 }
 
 /* The last step of every guest entry on a core, from nv2_enter_os. */

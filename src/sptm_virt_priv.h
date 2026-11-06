@@ -12,6 +12,7 @@
 
 /* sptm_virt.c */
 extern volatile bool sptm_virt_xnu_live;
+extern u64 sptm_virt_flags;
 extern u32 sptm_virt_cpu_entries[MAX_CPUS];
 int sptm_virt_layout(struct sptm_virt_layout *out);
 void sptm_virt_cpu_enters_xnu(int cpu);

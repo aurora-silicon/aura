@@ -16,6 +16,7 @@ Environment (all optional; 1 enables a switch):
                            <build>__MacOS/Firmware)
   AURA_XNU_SERIAL=<node>   XNU's console device under /arm-io, e.g. uart0 (aura's vuart)
   AURA_HIDE_DOCKCHANNEL    hide the DockChannel that carries aura's console and proxy
+  AURA_XNU_BT              sample XNU backtraces every few seconds per core
   AURA_TAIL_SECS, AURA_TAIL_IDLE   keep reading the console after entry, until idle
   XNU_BOOTARGS             XNU's command line
 
@@ -42,6 +43,10 @@ DEFAULT_BOOTARGS = ("serial=3 disable-uart-irq=1 -v -nobsdmgroot wdt=-1 sprr_tpr
                     "sprr_tpro_pagers=0 msgbuf=1048576 -vm_compressor_wk_sw CAEnableMedina=0 "
                     "-noprogress")
 
+# Configuration flags, sptm_virt.h SPTM_VIRT_*
+CONFIG_FLAGS = {
+    "AURA_XNU_BT": 1 << 5,
+}
 KNOWN_ENV = {
     "AURA_KEEP_EXCLAVES",
     "AURA_EXCLAVE_FW",
@@ -49,7 +54,7 @@ KNOWN_ENV = {
     "AURA_HIDE_DOCKCHANNEL",
     "AURA_TAIL_SECS",
     "AURA_TAIL_IDLE",
-}
+} | set(CONFIG_FLAGS)
 
 # The debug link: DockChannel plus the ATC0 port's PD controller, USB controller and PHY path.
 # XNU must never drive them (it resets the port about 3 s into IOKit and the link drops).
@@ -242,6 +247,11 @@ def patch_sptm(p, sym, entry):
         print(f"{what}: [0x{pa:x}] 0x{before:08x} -> 0x{p.read32(pa):08x}")
 
 
+def configure(p, sym):
+    flags = sum(bit for name, bit in CONFIG_FLAGS.items() if env_on(name))
+    p.call(sym["sptm_virt_config"], flags)
+
+
 def tail_console(iface, secs, idle):
     """Keep reading the console after the entry call: a serial read error reopens the device,
     and the tail stops after secs, or after idle seconds of silence."""
@@ -364,6 +374,7 @@ def main():
 
     write_plan(p, u, iface, sym, plan, images)
     patch_sptm(p, sym, entry)
+    configure(p, sym)
     if p.call(sym["sptm_virt_load"], entry, handoff) != 0:
         raise SystemExit("sptm_virt_load rejected the entry/handoff (see aura's console)")
     if args.no_enter:
