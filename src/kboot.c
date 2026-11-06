@@ -6795,9 +6795,9 @@ static int adt_get_u32_exact(int node, const char *name, u32 *val)
 }
 
 /*
- * Copies this Mac's PMP values from the ADT onto the FDT node @pmp_node, for dt_pass_pmp() on
- * T6030 and T8122. Stricter than dt_set_pmp(), which M1 and M2 Macs with a pmp node take: every
- * value must be exactly a u32.
+ * Copies this Mac's PMP values from the ADT onto the FDT node @pmp_node. Used for
+ * T6000/T8112 and by dt_pass_pmp() on T6030 and T8122. Scalar values must be
+ * exactly a u32; calibration tables stay in their original byte order.
  */
 static int dt_fill_pmp(int pmp_node)
 {
@@ -6844,6 +6844,21 @@ static int dt_set_pmp(void)
     if (chip_id == T8122)
         return 0;
     int pmp_node = fdt_path_offset(dt, "pmp");
+    /*
+     * T6000 and T8112 ship a disabled node without the optional pmp alias.
+     * Populate that node too: changing status alone must not leave Linux
+     * without BDID, DVID or this boot's calibration. Keep activation in the
+     * DT's hands, including when an alias is present. APPLE_USE_PMP also
+     * selects the consumer report-domain topology, not just the alias.
+     */
+    if (chip_id == T6000 || chip_id == T8112) {
+        if (pmp_node < 0)
+            pmp_node = fdt_node_offset_by_compatible(
+                dt, -1, chip_id == T8112 ? "apple,t8112-pmp-v2" : "apple,t6000-pmp-v2");
+        if (pmp_node < 0)
+            return 0;
+        return dt_fill_pmp(pmp_node);
+    }
     if (pmp_node < 0) {
         printf("FDT: pmp not found in devtree\n");
         return 0;
