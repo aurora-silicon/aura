@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
-"""Run the existing N1 producer protocol model against a source snapshot."""
+"""Run the N1 preparation and guarded census model against a source snapshot."""
 import argparse
 import hashlib
 import json
@@ -15,10 +15,15 @@ CASES = (
     "success", "chip", "board", "model", "resource", "perst", "locked", "dart",
     "busy", "pre-bme", "train", "post-bme", "identity", "bar-mask", "bar-high",
     "bar-drop", "rom", "clamp-fail",
+    "census-unprepared", "census-failed-prepare", "census-valid", "census-magic",
+    "census-bsp", "census-version", "census-reserved", "census-address",
+    "census-guard", "census-masked", "census-pending", "census-load-fault",
+    "census-barrier-fault",
 )
 SOURCES = (
     "src/hv/windows/windows_n1.c", "src/hv/windows/windows_n1.h",
-    "src/hv/windows/hv.h", "src/j813_n1.c", "src/j813_n1.h",
+    "src/hv/windows/hv.h", "src/hv/windows/hv_exc.c", "src/j813_n1.c", "src/j813_n1.h",
+    "src/smp.h",
     "src/adt.h", "sysinc/string.h", "src/types.h", "src/utils.h", "src/exception.h",
     "tests/e2e/windows_n1/producer_host.c", "tests/e2e/windows_n1/failure-model.md",
     "tools/windows_n1_e2e.py", "docs/windows-n1.md",
@@ -51,11 +56,12 @@ def main():
     output.mkdir(parents=True, exist_ok=False)
     report = {
         "result": "failed", "hardware_accessed": False, "hardware_qualified": False,
-        "scope": "production N1 producer with independent ADT/MMIO endpoint model",
+        "scope": "production N1 preparation and census with independent ADT/MMIO model",
         "limitations": [
             "Linux PHY/SMC training call is modelled, not executed",
             "No physical reset/drain, Windows PnP, interrupts or DMA qualification",
             "Host preparation gate is stubbed enabled; this is not a launcher lifecycle test",
+            "The HVC instruction/dispatcher and physical fault delivery are not executed",
         ],
         "commands": [], "sources": {}, "cases": [],
     }

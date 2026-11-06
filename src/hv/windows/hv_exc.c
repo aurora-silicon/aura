@@ -14,6 +14,7 @@
 #include "uart.h"
 #include "uartproxy.h"
 #include "utils.h"
+#include "windows_n1.h"
 
 #define TIME_ACCOUNTING
 //
@@ -1907,68 +1908,12 @@ static u64 hv_timer_reflect_guest_repost(bool physical)
         return true;
 
 /*
- * Per-CPU one-shot ID-register doorbell.
- *
- * HCR_EL2.TID3 traps the whole AArch64 ID group 3 space and this file answers
- * all of it at EL2, so nothing in that space reaches the proxy client any more.
- * The Windows debug module in the driver repo needs *some* deterministic point
- * at which it is called with a live guest context, per CPU, in order to install
- * its checkpoints; before this it abused the sheer volume of unhandled ID reads
- * as a clock, which is exactly what made boots slow.
- *
- * So forward the *first* ID group 3 read executed on each physical CPU to the
- * proxy, and answer every subsequent one at EL2.  That is a bounded MAX_CPUS
- * serial round trips for an entire boot instead of one per instruction, and it
- * is an ordering guarantee rather than a timing hope: a CPU cannot run guest
- * code without first running the kernel's own per-CPU feature detection, which
- * reads these registers.  The host therefore always gets a callback on a CPU
- * before that CPU can execute anything the host wants to intercept.
- *
- * ID_AA64PFR0_EL1 is deliberately NOT a doorbell.  Its case ORs in the GICv3
- * sysreg-interface bit, while the proxy services a trapped read by issuing its
- * own remote mrs and overwriting regs[rt]; forwarding it would silently discard
- * that bit.  Every other encoding here is a plain pass-through whose proxy
- * answer is bit-identical to the EL2 answer, so forwarding one is unobservable
- * to the guest.
- */
-static bool hv_id_doorbell_rung[MAX_CPUS];
-
-static bool hv_ring_id_doorbell(void)
-{
-    int cpu = smp_id();
-
-    if (cpu < 0 || cpu >= MAX_CPUS)
-        return false;
-    if (hv_id_doorbell_rung[cpu])
-        return false;
-
-    hv_id_doorbell_rung[cpu] = true;
-    return true;
-}
-
-/*
- * Identical to SYSREG_PASS, except that the first access on each CPU falls
- * through to hv_exc_proxy() so the host sees one deterministic callback per CPU.
- */
-#define SYSREG_PASS_DOORBELL(sr)                                                                   \
-    case SYSREG_ISS(sr):                                                                           \
-        if (is_read && hv_ring_id_doorbell())                                                      \
-            return false;                                                                          \
-        if (is_read)                                                                               \
-            regs[rt] = _mrs(sr_tkn(sr));                                                           \
-        else                                                                                       \
-            _msr(sr_tkn(sr), regs[rt]);                                                            \
-        return true;
-
-/*
- * Identical to SYSREG_PASS_DOORBELL, except that `clr` is cleared from the
+ * Identical to SYSREG_PASS, except that `clr` is cleared from the
  * value handed to the guest.  For ID registers whose hardware answer is
  * architecturally correct but advertises a feature the guest must not reach.
  */
-#define SYSREG_PASS_DOORBELL_CLR(sr, clr)                                                          \
+#define SYSREG_PASS_CLR(sr, clr)                                                                   \
     case SYSREG_ISS(sr):                                                                           \
-        if (is_read && hv_ring_id_doorbell())                                                      \
-            return false;                                                                          \
         if (is_read)                                                                               \
             regs[rt] = _mrs(sr_tkn(sr)) & ~((u64)(clr));                                           \
         else                                                                                       \
@@ -5396,7 +5341,7 @@ static bool hv_handle_msr_unlocked(struct exc_info *ctx, u64 iss)
             // for) is unconfirmed; left as-is rather than guessed at, see
             // docs/windows-native-aic.md.
             //
-            SYSREG_PASS_DOORBELL(ID_AA64PFR1_EL1)
+            SYSREG_PASS(ID_AA64PFR1_EL1)
             //
             // T8142 reports ID_AA64DFR0_EL1.PMUVer == 0b1111, the architectural
             // encoding for "IMPLEMENTATION DEFINED performance monitors supported,
@@ -5420,14 +5365,14 @@ static bool hv_handle_msr_unlocked(struct exc_info *ctx, u64 iss)
             // interface available to a guest here, and it keeps every Microsoft
             // image untouched.  The IMP-DEF bank stays private to EL2 either way.
             //
-            SYSREG_PASS_DOORBELL_CLR(ID_AA64DFR0_EL1, ID_AA64DFR0_PMUVER_MASK)
-            SYSREG_PASS_DOORBELL(ID_AA64DFR1_EL1)
-            SYSREG_PASS_DOORBELL(ID_AA64ISAR0_EL1)
-            SYSREG_PASS_DOORBELL(ID_AA64ISAR1_EL1)
-            SYSREG_PASS_DOORBELL(SYS_ID_AA64MMFR0_EL1)
-            SYSREG_PASS_DOORBELL(SYS_ID_AA64MMFR1_EL1)
-            SYSREG_PASS_DOORBELL(ID_AA64AFR0_EL1)
-            SYSREG_PASS_DOORBELL(ID_AA64AFR1_EL1)
+            SYSREG_PASS_CLR(ID_AA64DFR0_EL1, ID_AA64DFR0_PMUVER_MASK)
+            SYSREG_PASS(ID_AA64DFR1_EL1)
+            SYSREG_PASS(ID_AA64ISAR0_EL1)
+            SYSREG_PASS(ID_AA64ISAR1_EL1)
+            SYSREG_PASS(SYS_ID_AA64MMFR0_EL1)
+            SYSREG_PASS(SYS_ID_AA64MMFR1_EL1)
+            SYSREG_PASS(ID_AA64AFR0_EL1)
+            SYSREG_PASS(ID_AA64AFR1_EL1)
             //
             // The remainder of the AArch64 ID group 3 space.  TID3 traps all of it,
             // and anything not answered here falls through to hv_exc_proxy(), which
@@ -5438,14 +5383,14 @@ static bool hv_handle_msr_unlocked(struct exc_info *ctx, u64 iss)
             // dominates boot time.  ID_AA64MMFR2_EL1 and ID_AA64ISAR2_EL1 were both
             // observed taking that path on ten-CPU boots.
             //
-            SYSREG_PASS_DOORBELL(ID_AA64PFR2_EL1)
-            SYSREG_PASS_DOORBELL(ID_AA64ZFR0_EL1)
-            SYSREG_PASS_DOORBELL(ID_AA64SMFR0_EL1)
-            SYSREG_PASS_DOORBELL(ID_AA64ISAR2_EL1)
-            SYSREG_PASS_DOORBELL(ID_AA64ISAR3_EL1)
-            SYSREG_PASS_DOORBELL(SYS_ID_AA64MMFR2_EL1)
-            SYSREG_PASS_DOORBELL(SYS_ID_AA64MMFR3_EL1)
-            SYSREG_PASS_DOORBELL(SYS_ID_AA64MMFR4_EL1)
+            SYSREG_PASS(ID_AA64PFR2_EL1)
+            SYSREG_PASS(ID_AA64ZFR0_EL1)
+            SYSREG_PASS(ID_AA64SMFR0_EL1)
+            SYSREG_PASS(ID_AA64ISAR2_EL1)
+            SYSREG_PASS(ID_AA64ISAR3_EL1)
+            SYSREG_PASS(SYS_ID_AA64MMFR2_EL1)
+            SYSREG_PASS(SYS_ID_AA64MMFR3_EL1)
+            SYSREG_PASS(SYS_ID_AA64MMFR4_EL1)
         case SYSREG_ISS(ID_AA64PFR0_EL1):
             if (is_read) {
                 //
@@ -5468,12 +5413,6 @@ static bool hv_handle_msr_unlocked(struct exc_info *ctx, u64 iss)
             // trips per instruction.  ID_AA64PFR0_EL1 is roughly four fifths of
             // all ID-register traffic during Windows' per-CPU bring-up, so this
             // is where the boot time went.
-            //
-            // This case is never a doorbell (see SYSREG_PASS_DOORBELL): the
-            // proxy's answer differs from ours by exactly the GIC bit, so
-            // forwarding even one access would hand the guest a value this case
-            // exists to prevent.  The other ID encodings are plain pass-throughs
-            // and carry the doorbell instead.
             //
             return true;
 #endif
@@ -6061,7 +6000,8 @@ void hv_exc_sync(struct exc_info *ctx)
              * too; it carries its own immediate so it cannot be mistaken for a
              * "NTSRG" forwarding call.
              */
-            handled = hv_handle_t8142_undef_trampoline(ctx) || hv_handle_smc(ctx);
+            handled = (FIELD_GET(ESR_ISS, ctx->esr) == 0 && hv_windows_n1_census_hvc(ctx->regs)) ||
+                      hv_handle_t8142_undef_trampoline(ctx) || hv_handle_smc(ctx);
             break;
         case ESR_EC_IMPDEF:
             hv_wdt_breadcrumb('a');

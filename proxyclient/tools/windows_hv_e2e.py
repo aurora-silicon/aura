@@ -26,7 +26,7 @@ from aura.proxy import AuraProxy, EXC, EXC_RET, IODEV, ProxyCommandError, START
 from aura.tgtypes import BootArgs_r2, BootArgs_r3
 from aura.windows import (CAPS_MAGIC, CONFIGURATION, FRAMEBUFFER_SHADOW, REQUIRED_CAPS,
                           HardwareSession, N1_HANDOFF, N1_PROPERTY, N1_RESOURCES,
-                          prepare_n1_handoff, source_manifest)
+                          MEMORY_PREFLIGHT, memory_reservation_preflight, prepare_n1_handoff, source_manifest)
 
 
 def fixture():
@@ -91,8 +91,9 @@ def wire_namespace():
             opcode, *args = struct.unpack("<7Q", payload)
             observed.append(opcode)
             assert opcode not in range(0xc11, 0xc19), "unsafe legacy PSCI opcode"
-            assert opcode in (0xc80, 0xc81, 0xc82)
+            assert opcode in (0xc80, 0xc81, 0xc82, 0xc83)
             if opcode == 0xc82: assert args[:2] == [0x1000, 128]
+            if opcode == 0xc83: assert args == [0] * 6
             if self.legacy:
                 return struct.pack("<QqQ", opcode, AuraProxy.S_BADCMD, 0)
             value = CAPS_MAGIC | 1 << 16 | REQUIRED_CAPS | CONFIGURATION if opcode == 0xc80 else 0
@@ -102,6 +103,7 @@ def wire_namespace():
     assert proxy.hv_windows_capabilities() >> 32 == CAPS_MAGIC >> 32
     assert proxy.hv_windows_configure(0) == 0
     assert proxy.hv_windows_prepare_n1(0x1000, 128) == 0
+    assert proxy.hv_windows_heap_high_water() == 0
     wire.legacy = True
     try:
         proxy.hv_windows_capabilities()
@@ -109,7 +111,7 @@ def wire_namespace():
         pass
     else:
         raise AssertionError("legacy resident accepted capability probe")
-    assert observed == [0xc80, 0xc81, 0xc82, 0xc80]
+    assert observed == [0xc80, 0xc81, 0xc82, 0xc83, 0xc80]
     return {"case": "serialized-safe-opcode-namespace", "opcodes": [hex(op) for op in observed]}
 
 
@@ -155,6 +157,87 @@ def identity_translation(case):
     return {"case": case, "reads": reads}
 
 
+def reservation_prepare_flow(case):
+    """Use real HardwareSession, ProxyUtils and HV admission; model only I/O."""
+    adt, _, args = fixture()
+    ranges = [{"name": "handoff", "base": 0x850000000, "size": 0x404000},
+              {"name": "uefi-workspace", "from_ram_top": 0x8000000, "size": 0x8000000}]
+    if case == "reservation-prepare-default": ranges = []
+    if case == "reservation-prepare-payload": ranges[0]["base"] = 0x821020000
+    if case == "reservation-prepare-heap": ranges[0]["base"] = 0x819000000
+    if case == "reservation-prepare-outside": ranges[0]["base"] = 0x880000000
+    if case == "reservation-prepare-overlap": ranges[1] = {"name": "overlap", "base": 0x850001000, "size": 0x1000}
+    if case == "reservation-prepare-source": adt["/chosen/memory-map"].SEPFW = (0x850000000, 0x1000)
+    if case == "reservation-prepare-framebuffer": args.video.base = 0x850000000
+    blob = adt.build()
+    trace, heap_queries = [], 0
+    plan = SimpleNamespace(chip_id=0x8142, model="Mac17,3", framebuffer="native",
+                           guest_compatibility="none", usb="disabled", n1="disabled",
+                           image=bytes(range(256)) * 32, reserved_memory=tuple(ranges))
+    class Interface:
+        dev = SimpleNamespace(timeout=3)
+        tty_log = None
+        def nop(self): trace.append("nop")
+        def readmem(self, address, size):
+            if address == 0x800008000:
+                return BootArgs_r2.build(args)
+            assert address == 0x800100000 and size == args.devtree_size
+            return blob.ljust(size, b"\0")
+        def readstruct(self, address, layout): return layout.parse(self.readmem(address, layout.sizeof()))
+        def set_handler(self, *args): pass
+        def set_event_handler(self, *args): pass
+    class Proxy:
+        def hv_windows_capabilities(self):
+            trace.append("caps")
+            flags = REQUIRED_CAPS | CONFIGURATION
+            if case != "reservation-prepare-missing-capability": flags |= MEMORY_PREFLIGHT
+            return CAPS_MAGIC | 1 << 16 | flags
+        def hv_windows_heap_high_water(self):
+            nonlocal heap_queries
+            heap_queries += 1
+            trace.append("heap-query")
+            return 0x810004000 + (0x4000 if case == "reservation-prepare-heap-drift" and heap_queries > 1 else 0)
+        def get_bootargs_rev(self): return (0x800008000, 2)
+        def get_base(self): return 0x800000000
+        def get_cpu_features(self): return SimpleNamespace(apple_sysregs_unlocked=False)
+        def iodev_whoami(self): return IODEV.USB0
+        def heapblock_alloc(self, size):
+            assert size == 0
+            trace.append("mutate-heap-alignment")
+            return 0x810004000
+        def heapblock_set_limit(self, limit):
+            assert limit == 0x818004000
+            trace.append("mutate-heap-limit")
+        def hv_windows_configure(self, flags):
+            assert flags == 0
+            trace.append("mutate-config")
+            return 0
+        def iodev_set_usage(self, *args): trace.append("mutate-iodev")
+        def hv_init(self): trace.append("mutate-hv-init"); return 0
+        def hv_map_vuart(self, *args): trace.append("mutate-vuart"); return 0
+        def unexpected(self, *args): raise AssertionError("unexpected modeled proxy operation")
+        call = el0_call = el1_call = gl1_call = gl2_call = unexpected
+        read8 = read16 = read32 = write8 = write16 = write32 = unexpected
+    session = HardwareSession.__new__(HardwareSession)
+    session.iface, session.proxy, session.hv = Interface(), Proxy(), None
+    session.proxy.iface = session.iface
+    identity = session.identity()
+    assert identity["model"] == "Mac17,3"
+    expected_success = case in ("reservation-prepare-success", "reservation-prepare-default")
+    try:
+        session.prepare(plan)
+        assert expected_success
+        assert "mutate-hv-init" in trace
+        if case == "reservation-prepare-default": assert heap_queries == 0
+        else:
+            assert heap_queries == 2
+            assert session.hv.windows_memory_guard["layout"]["guest_base"] == 0x821020000
+    except ValueError:
+        assert not expected_success
+        assert not any(event.startswith("mutate-") for event in trace), trace
+    return {"case": case, "trace": trace, "declared_ranges": ranges}
+
+
 def lifecycle(case, output):
     adt, blob, args = fixture()
     if case == "adt-overflow-init":
@@ -167,7 +250,7 @@ def lifecycle(case, output):
     class Proxy:
         def hv_windows_capabilities(self):
             trace.append("caps")
-            return CAPS_MAGIC | 1 << 16 | REQUIRED_CAPS | CONFIGURATION | FRAMEBUFFER_SHADOW | N1_HANDOFF
+            return CAPS_MAGIC | 1 << 16 | REQUIRED_CAPS | CONFIGURATION | FRAMEBUFFER_SHADOW | N1_HANDOFF | MEMORY_PREFLIGHT
         def hv_windows_configure(self, flags):
             trace.append(["config", flags])
             return -1 if case == "config-rejected" else 0
@@ -264,6 +347,14 @@ def lifecycle(case, output):
     if case == "watchdog-failure": hv.wdt_cpu = 1
     payload = bytes(range(256)) * 32
     if case == "chunked-upload": payload = bytes(range(256)) * ((16 * 1024 * 1024 + 8192) // 256)
+    if case.startswith("reservation-"):
+        plan = SimpleNamespace(image=payload, reserved_memory=(
+            {"name": "handoff", "base": 0x850000000, "size": 0x404000},
+            {"name": "uefi-workspace", "from_ram_top": 0x8000000, "size": 0x8000000}))
+        hv.windows_memory_guard = memory_reservation_preflight(
+            plan, args, adt, hv.u.heap_top - 0x10000000, 0x800000000,
+            0x800008000, BootArgs_r2.sizeof(), 0x800100000)
+        if case == "reservation-layout-drift": hv.u.heap_top += 0x4000
     previous = {signum: signal.getsignal(signum) for signum in (signal.SIGINT, signal.SIGQUIT)}
     try:
         hv.init()
@@ -274,10 +365,11 @@ def lifecycle(case, output):
         if case == "adt-overflow-start": hv.adt.overflow = "x" * 0x20000
         start_trace_index = len(trace)
         hv.start()
-        assert case in ("success", "n1-success", "chunked-upload")
+        assert case in ("success", "n1-success", "chunked-upload", "reservation-success")
         assert trace.index(["config", 3]) < trace.index("hv_init") < trace.index("upload-image") < trace.index("start")
     except (RuntimeError, ValueError, OSError):
-        assert case not in ("success", "n1-success", "chunked-upload")
+        assert case not in ("success", "n1-success", "chunked-upload", "reservation-success")
+        if case == "reservation-layout-drift": assert "upload-image" not in trace and "start" not in trace
         if case.startswith("n1-"):
             assert "upload-image" not in trace and "start" not in trace
             if case != "n1-unprepared":
@@ -320,7 +412,12 @@ def main():
             "success", "chunked-upload", "config-rejected", "out-of-ram", "adt-overflow-init", "adt-overflow-start",
             "watchdog-failure", "forwarded-exception", "forwarded-panic", "transport-error",
             "n1-success", "n1-producer-failure", "n1-bad-header", "n1-bad-resource", "n1-read-failure",
-            "n1-unprepared")]
+            "n1-unprepared", "reservation-success", "reservation-layout-drift")]
+        cases += [reservation_prepare_flow(case) for case in (
+            "reservation-prepare-success", "reservation-prepare-default", "reservation-prepare-payload",
+            "reservation-prepare-heap", "reservation-prepare-outside", "reservation-prepare-overlap",
+            "reservation-prepare-source", "reservation-prepare-framebuffer",
+            "reservation-prepare-missing-capability", "reservation-prepare-heap-drift")]
     report = {"result": "passed", "hardware_qualified": False,
               "scope": "Real Python HV init/load/start, modeled transport; no C backend or guest execution",
               "cases": cases, "host_sources": source_manifest(),
