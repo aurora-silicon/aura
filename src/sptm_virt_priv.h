@@ -10,6 +10,8 @@
 #include "types.h"
 #include "utils.h"
 
+struct exc_info;
+
 /* sptm_virt.c */
 extern volatile bool sptm_virt_xnu_live;
 extern u64 sptm_virt_flags;
@@ -66,6 +68,10 @@ bool sptm_virt_cl4_reflect(u64 *regs, u64 esr);
 void sptm_virt_s2_setup(void);
 void sptm_virt_s2_enter_xnu(int cpu);
 bool sptm_virt_s2_dabort_gl(u64 *regs);
+bool sptm_virt_rg_owns(u64 page);
 void sptm_virt_mmio_rw(u64 addr, u64 *val, bool write, int width);
+
+/* sptm_virt_s2r.c */
+void sptm_virt_s2r_setup(bool cdc);
 
 #endif

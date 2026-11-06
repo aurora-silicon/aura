@@ -210,7 +210,7 @@ static bool sptm_virt_rg_hook(struct exc_info *ctx, u64 addr, u64 *val, bool wri
     return true;
 }
 
-static bool sptm_virt_rg_owns(u64 page)
+bool sptm_virt_rg_owns(u64 page)
 {
     for (int i = 0; i < rg_n; i++)
         if (rg_pages[i].base == page)
@@ -368,6 +368,8 @@ void sptm_virt_s2_setup(void)
     sptm_virt_aura_guard_setup();
     sptm_virt_s2_split_ctrr_blocks();
     sptm_virt_reset_guard_setup();
+    /* After the guard, whose pages the sleep path leaves alone. */
+    sptm_virt_s2r_setup(uartproxy_iodev >= IODEV_USB0 && uartproxy_iodev < IODEV_MAX);
 
     /* SPTM's own bring-up runs without it; each core arms it at its GEXIT into XNU, after
      * checking that nothing changed the tree in between. */

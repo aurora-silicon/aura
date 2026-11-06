@@ -364,6 +364,46 @@ static int pmgr_adt_find_devices(const char *path, const u32 **devices, u32 *n_d
     return 0;
 }
 
+/*
+ * PS register addresses (die 0) of a node's clock-gates and all their ancestors, for a caller that
+ * must keep a device powered (the virtualized SPTM keeps its debug link up under macOS).
+ */
+int pmgr_adt_collect_psregs(const char *path, u64 *out, int max)
+{
+    const u32 *devices;
+    u32 n_devices;
+    u16 stack[64];
+    int sp = 0, cnt = 0;
+
+    if (!pmgr_devices || pmgr_adt_find_devices(path, &devices, &n_devices) < 0)
+        return -1;
+    for (u32 i = 0; i < n_devices && sp < (int)ARRAY_SIZE(stack); i++)
+        stack[sp++] = FIELD_GET(PMGR_DEVICE_ID, devices[i]);
+    while (sp) {
+        const struct pmgr_device *device;
+        u16 id = stack[--sp], parents[2];
+        if (!id || pmgr_find_device(id, &device))
+            continue;
+        /* A virtual device has no PS word: its address computes to the group base, which is the
+         * first real domain's (ECPU_0). Follow its parents, but don't list it. */
+        if (!(device->flags & PMGR_FLAG_VIRTUAL)) {
+            u64 addr = pmgr_device_get_addr(0, device);
+            bool dup = !addr;
+            for (int i = 0; i < cnt; i++)
+                dup |= out[i] == addr;
+            if (dup)
+                continue;
+            if (cnt < max)
+                out[cnt++] = addr;
+        }
+        pmgr_adt_get_parents(device, parents);
+        for (int i = 0; i < 2 && sp < (int)ARRAY_SIZE(stack); i++)
+            if (parents[i])
+                stack[sp++] = parents[i];
+    }
+    return cnt;
+}
+
 static int pmgr_save_parents(u8 die, u16 id, struct pmgr_saved_modes *saved, size_t depth)
 {
     const struct pmgr_device *device;
