@@ -19,3 +19,8 @@ versions = { path = "./versions" }
 
 [features]
 chainload = ["dep:fatfs", "dep:uuid"]
+
+# One codegen unit: with the default 16, functions are ordered differently from build to
+# build, and the same tree gives a different image.
+[profile.release]
+codegen-units = 1
