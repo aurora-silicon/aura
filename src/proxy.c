@@ -626,7 +626,7 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
         case P_HV_WINDOWS_CAPS:
             /* Read-only personality/ABI probe; never initializes hardware. */
 #ifdef AURA_WINDOWS
-            reply->retval = 0x4157494e000107ffULL;
+            reply->retval = 0x4157494e00010fffULL;
 #else
             reply->retval = 0;
 #endif
@@ -740,6 +740,12 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
             break;
 
         case P_CPUFREQ_INIT:
+#ifdef AURA_WINDOWS
+            if (hv_windows_cpufreq_owned()) {
+                reply->retval = -1;
+                break;
+            }
+#endif
             reply->retval = cpufreq_init();
             break;
         case P_CPUFREQ_GET_CLUSTER_HZ:
@@ -747,6 +753,12 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
                 request->args[0] > UINT32_MAX ? 0 : cpufreq_get_cluster_hz(request->args[0]);
             break;
         case P_CPUFREQ_SET_CLUSTER_PSTATE:
+#ifdef AURA_WINDOWS
+            if (hv_windows_cpufreq_owned()) {
+                reply->retval = -1;
+                break;
+            }
+#endif
             reply->retval = request->args[0] > UINT32_MAX || request->args[1] > UINT32_MAX
                                 ? -1
                                 : cpufreq_set_cluster_pstate(request->args[0], request->args[1]);

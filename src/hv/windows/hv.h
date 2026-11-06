@@ -21,6 +21,7 @@ bool hv_windows_guest_compat_enabled(void);
 bool hv_windows_serial_capture_enabled(void);
 bool hv_windows_serial_cdc_enabled(void);
 bool hv_windows_mtp_enabled(void);
+bool hv_windows_cpufreq_owned(void);
 bool hv_windows_can_prepare_device(void);
 void hv_windows_quarantine(void);
 #define HV_WINDOWS_GUEST_COMPAT   BIT(0)
@@ -28,6 +29,7 @@ void hv_windows_quarantine(void);
 #define HV_WINDOWS_SERIAL_CAPTURE BIT(2)
 #define HV_WINDOWS_SERIAL_CDC     BIT(3)
 #define HV_WINDOWS_MTP            BIT(4)
+#define HV_WINDOWS_CPUFREQ        BIT(5)
 
 typedef bool(hv_hook_t)(struct exc_info *ctx, u64 addr, u64 *val, bool write, int width);
 
