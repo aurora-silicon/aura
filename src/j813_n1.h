@@ -6,4 +6,7 @@
 /* Train the J813 N1 PCIe link before Linux; disables the ECAM host on failure. */
 int j813_n1_prepare(void *dt);
 
+/* Explicit Windows handoff only; caller validates the live ADT/resources. */
+int j813_n1_train_windows(void);
+
 #endif

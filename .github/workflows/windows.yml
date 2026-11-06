@@ -1,0 +1,51 @@
+name: Windows boot backend
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-replay:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y clang llvm lld
+          python -m pip install -r requirements.txt
+          rustup target add aarch64-unknown-none-softfloat
+      - name: Build Windows personality
+        run: |
+          mkdir -p build
+          make -j2 WINDOWS=1 USE_CLANG=1 TOOLCHAIN=/usr/bin/ LLDDIR=/usr/bin/ 2>&1 | tee build/windows-build.log
+          sha256sum build/aura.bin build/aura.macho > build/windows-sha256.txt
+      - name: Replay host launch and build hardware probe
+        run: |
+          python proxyclient/tools/windows_launcher_e2e.py --out build/windows-admission
+          python proxyclient/tools/windows_hv_e2e.py --out build/windows-host-hv
+          python tools/windows_n1_e2e.py --output build/windows-n1
+          python tools/windows_hv_smoke.py --build-only --chip-id 0x8142 --model Mac17,3 --output build/windows-hardware-probe
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: windows-boot-offline-evidence
+          if-no-files-found: error
+          path: |
+            build/aura.bin
+            build/aura.macho
+            build/windows-build.log
+            build/windows-sha256.txt
+            build/windows-admission
+            build/windows-host-hv
+            build/windows-hardware-probe
+            build/windows-n1
