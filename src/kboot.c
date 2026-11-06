@@ -7495,6 +7495,54 @@ disable:
 }
 
 /*
+ * USB 2.0 signal tuning for the eUSB2 repeater and the USB hub sideband
+ * interface on i2c2. The OS drivers apply these firmware tuning lists
+ * (four-byte register, mask, value, reserved entries); copy them verbatim from
+ * the ADT into the matching OS nodes. A missing source or OS node leaves the
+ * device untuned, which the OS drivers treat as "no tuning".
+ */
+static void dt_copy_i2c_tunable(int anode, const char *adt_prop, int node, const char *prop,
+                                const char *what)
+{
+    u32 len = 0;
+    const void *val = adt_getprop(adt, anode, adt_prop, &len);
+
+    if (!val || !len)
+        return;
+    if (len % 4) {
+        printf("FDT: %s: ADT %s is %u bytes, not whole entries; skipped\n", what, adt_prop, len);
+        return;
+    }
+    if (fdt_setprop(dt, node, prop, val, len))
+        printf("FDT: %s: cannot set %s\n", what, prop);
+}
+
+static void dt_set_i2c_usb_tunables(void)
+{
+    static const struct {
+        const char *adt_path;
+        const char *compatible;
+        const char *adt_prop;
+        const char *prop;
+    } copies[] = {
+        {"/arm-io/i2c2/usb-repeater-i2c", "ti,cd2e22", "tunable", "apple,tunable"},
+        {"/arm-io/i2c2/usb-hub-i2c", "via,vl122", "tunable-vl", "apple,tunable-vl"},
+        {"/arm-io/i2c2/usb-hub-i2c", "via,vl122", "tunable-vlf0", "apple,tunable-vlf0"},
+        {"/arm-io/i2c2/usb-hub-i2c", "via,vl122", "tunable-gl", "apple,tunable-gl"},
+    };
+
+    for (size_t i = 0; i < ARRAY_SIZE(copies); i++) {
+        int anode = adt_path_offset(adt, copies[i].adt_path);
+        int node = fdt_node_offset_by_compatible(dt, -1, copies[i].compatible);
+
+        if (anode < 0 || node < 0)
+            continue;
+        dt_copy_i2c_tunable(anode, copies[i].adt_prop, node, copies[i].prop,
+                            copies[i].compatible);
+    }
+}
+
+/*
  * The AOP's accelerometer and gyroscope report only once the OS has sent them
  * the machine's calibration. Copy it from the ADT services into the matching
  * children of the OS AOP node; a missing service or property is skipped.
@@ -9144,6 +9192,7 @@ int kboot_prepare_dt(void *fdt)
         return -1;
     if (dt_set_ipd())
         return -1;
+    dt_set_i2c_usb_tunables();
     if (dt_disable_missing_devs("usb-drd", "usb@", 8, 0))
         return -1;
     if (dt_disable_missing_devs("acio", "cio@", 8, 2))
