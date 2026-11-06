@@ -85,8 +85,11 @@ With no secondary running there is nobody to ask, which happens where
 `smp_start_secondaries()` fails. Aura then keeps no answer, reads `CTXR_D` under an
 exception guard, and warns if it is armed. The OS still starts, outside the window,
 on the boot CPU alone, because `dt_set_cpus()` drops every CPU that isn't running.
-A probe that was sent and didn't finish also counts as not confined, and is not
-repeated.
+A probe that couldn't be sent counts as not confined too.
+
+A secondary that takes the probe but doesn't answer within 500 ms stops the boot.
+The call stays in its slot, and kboot never hands off with a call pending, so aura
+says so on the panel and doesn't start the OS. The probe isn't sent again.
 
 WFI wipes the general registers, the vector registers and NZCV on these
 cores, from EL2, EL1 and EL0, on E and P cores. FPCR, `SP_EL0` and the 33

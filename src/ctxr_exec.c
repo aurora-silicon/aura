@@ -67,6 +67,12 @@ static const u32 probe_insns[] = {
     0xd65f03c0, /* ret */
 };
 
+/* A secondary gets this long to answer, which is far more than two instructions or a fault take. */
+#define CTXR_PROBE_TIMEOUT_MS 500
+
+/* The CPU still holding an unanswered probe, or -1. */
+static int probe_stuck_cpu = -1;
+
 /*
  * Nothing answered, so the question stays open for a later call. Say so once, and
  * what CTXR_D reads, since an OS started now runs outside any window on this CPU.
@@ -129,21 +135,32 @@ bool ctxr_exec_confined(void)
     exc_guard = GUARD_RETURN | GUARD_SILENT;
     int err = smp_call1(cpu, probe, 0);
     if (!err)
-        err = smp_wait(cpu, &ret);
+        err = smp_wait_timed(cpu, &ret, CTXR_PROBE_TIMEOUT_MS);
     exc_guard = GUARD_OFF;
 
-    /*
-     * A probe that never ran says nothing about confinement. Treating it as confined would
-     * refuse to boot a Mac that may have no window at all (M1 to M3), while booting outside
-     * the window at worst leaves the confined secondaries offline.
-     */
     if (err) {
+        /* Not asked again: that could wait out the same timeout and lose another page. */
+        confined = 0;
         /* The secondary may still run the probe later, so its page is not freed. */
+        if (err == SMP_TIMEOUT) {
+            /*
+             * The call is still in the CPU's slot, and kboot never hands off with a call
+             * pending, so the OS can't start this boot. ctxr_exec_os_may_start() stops it
+             * before any device is handed over.
+             */
+            probe_stuck_cpu = cpu;
+            printf("CTXR exec: CPU %d did not answer the probe within %d ms\n", cpu,
+                   CTXR_PROBE_TIMEOUT_MS);
+            return false;
+        }
+        /*
+         * A probe that was never sent says nothing about confinement. Treating it as confined
+         * would refuse to boot a Mac that may have no window at all (M1 to M3), while booting
+         * outside the window at worst leaves the confined secondaries offline.
+         */
         printf("CTXR exec: CPU %d did not run the probe (%d); treating the secondaries as "
                "not confined\n",
                cpu, err);
-        /* Asking again could wait out the same timeout and lose another page. */
-        confined = 0;
         return false;
     }
     free(probe);
@@ -257,7 +274,18 @@ bool ctxr_exec_window(u64 *base, u64 *size)
 
 bool ctxr_exec_os_may_start(void)
 {
-    if (!ctxr_exec_confined() || !ctxr_exec_problem())
+    bool confined = ctxr_exec_confined();
+
+    if (probe_stuck_cpu >= 0) {
+        fb_set_active(true);
+        printf("\nCTXR exec: secondary CPU %d did not answer and still holds a call.\n"
+               "  Not starting the OS.\n"
+               "  Hold the power button to shut down, then hold it again to choose another\n"
+               "  system.\n",
+               probe_stuck_cpu);
+        return false;
+    }
+    if (!confined || !ctxr_exec_problem())
         return true;
 
     /* Shown on the panel: this is where a user without a USB host ends up. */

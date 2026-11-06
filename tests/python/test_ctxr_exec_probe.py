@@ -57,7 +57,10 @@ static bool smp_is_alive(int cpu) { return alive_mask & (1 << cpu); }
 static void *memalign(size_t a, size_t s) { return aligned_alloc(a, s); }
 static void dc_cvau_range(void *p, size_t s) {}
 static void ic_ivau_range(void *p, size_t s) {}
+#define SMP_TIMEOUT -2
 static u64 result;
+/* call_fails: -1 the call was never sent, SMP_TIMEOUT it was not acknowledged. */
+static int wait_times_out, last_timeout_ms;
 static int smp_call1(int cpu, void *fn, u64 arg) {
     calls++;
     assert(cpu != boot_cpu_idx && smp_is_alive(cpu));
@@ -67,11 +70,20 @@ static int smp_call1(int cpu, void *fn, u64 arg) {
     const u32 *insn = fn;
     assert(insn[0] == 0xd2800020 && insn[1] == 0xd65f03c0);
     if (call_fails)
-        return -1;
+        return call_fails;
     if (probe_faults) { exc_last_esr = 0x8600000f; result = 0; } else { result = 1; }
     return 0;
 }
-static int smp_wait(int cpu, u64 *ret) { *ret = result; return 0; }
+/* As smp.c: a call still in the slot when the time runs out is SMP_TIMEOUT. */
+static int smp_wait_timed(int cpu, u64 *ret, u32 timeout_ms)
+{
+    assert(exc_guard == (GUARD_RETURN | GUARD_SILENT));
+    last_timeout_ms = timeout_ms;
+    if (wait_times_out)
+        return SMP_TIMEOUT;
+    *ret = result;
+    return 0;
+}
 #define printf(format, ...) (printed++, last_format = (format))
 ''' + "%s"
 
@@ -80,7 +92,7 @@ MAIN = r'''
 static int run(int chip, int alive, int faults) {
     /* ctxr_exec_confined() caches its answer per boot: model each case as a fresh boot. */
     chip_id = chip; alive_mask = alive; probe_faults = faults; calls = 0; printed = 0;
-    call_fails = 0; reads = 0; unprobed_warned = false;
+    call_fails = 0; reads = 0; unprobed_warned = false; wait_times_out = 0;
     int ret = ctxr_exec_confined();
     assert(exc_guard == GUARD_OFF);
     return ret;
@@ -96,8 +108,8 @@ int main(void) {
         assert(run(chips[i], 0x2, 0) == 0 && calls == 1 && printed == 0 && !reads);
     assert(run(T8112, 0xe, 0) == 0 && calls == 1 && !reads);
     /* A probe that never ran is not evidence of confinement: say so, do not refuse. */
-    chip_id = T8112; alive_mask = 0x2; probe_faults = 0; calls = 0; printed = 0; call_fails = 1;
-    assert(ctxr_exec_confined() == 0 && calls == 1 && printed == 1);
+    chip_id = T8112; alive_mask = 0x2; probe_faults = 0; calls = 0; printed = 0; call_fails = -1;
+    assert(ctxr_exec_confined() == 0 && calls == 1 && printed == 1 && probe_stuck_cpu < 0);
     assert(exc_guard == GUARD_OFF);
     /* No secondary to ask: not confined, and the log says what CTXR_D reads. */
     SYS_IMP_APL_CTXR_D_LWR_EL1 = 0; SYS_IMP_APL_CTXR_D_UPR_EL1 = 0;
@@ -144,11 +156,28 @@ int main(void) {
 STUCK_MAIN = r'''
 #undef printf
 int main(void) {
-    /* A probe that did not run is not repeated: it could wait out the timeout each time. */
-    alive_mask = 0x3; call_fails = 1;
-    assert(!ctxr_exec_confined() && !ctxr_exec_confined());
-    assert(calls == 1 && printed == 1);
+    /*
+     * The secondary took the call and never finished it: the wait gives up within a second,
+     * the guard comes off, the CPU is remembered as holding the call, and nothing is sent again.
+     */
+    alive_mask = 0x3; wait_times_out = 1;
+    assert(!ctxr_exec_confined() && exc_guard == GUARD_OFF);
+    assert(calls == 1 && printed == 1 && probe_stuck_cpu == 1);
+    assert(last_timeout_ms >= 100 && last_timeout_ms <= 1000);
+    assert(!ctxr_exec_confined() && calls == 1 && printed == 1);
     puts("ctxr exec probe stuck OK");
+    return 0;
+}
+'''
+
+UNACKED_MAIN = r'''
+#undef printf
+int main(void) {
+    /* Not acknowledged: the call is in the slot all the same. */
+    alive_mask = 0x3; call_fails = SMP_TIMEOUT;
+    assert(!ctxr_exec_confined() && exc_guard == GUARD_OFF && probe_stuck_cpu == 1);
+    assert(!ctxr_exec_confined() && calls == 1);
+    puts("ctxr exec probe unacknowledged OK");
     return 0;
 }
 '''
@@ -202,6 +231,9 @@ def test_a_stuck_probe_is_not_repeated(tmp_path):
     compile_and_run(tmp_path, "ctxr_exec_probe_stuck", HARNESS % probe_source() + STUCK_MAIN)
 
 
+def test_an_unacknowledged_probe_is_stuck_too(tmp_path):
+    compile_and_run(tmp_path, "ctxr_exec_probe_unacked", HARNESS % probe_source() + UNACKED_MAIN)
+
 
 def test_ranges_are_read_under_a_guard(tmp_path):
     compile_and_run(tmp_path, "ctxr_range", HARNESS % probe_source() + RANGE_MAIN)
@@ -215,5 +247,7 @@ def test_reports_the_fault():
 def test_callers_use_the_probe():
     source = (REPO / "src/ctxr_exec.c").read_text()
     assert "if (!ctxr_exec_confined() || ctxr_exec_problem())" in source
-    assert "if (!ctxr_exec_confined() || !ctxr_exec_problem())" in source
+    os_may_start = source[source.index("bool ctxr_exec_os_may_start(void)"):]
+    assert "bool confined = ctxr_exec_confined();" in os_may_start
+    assert os_may_start.index("probe_stuck_cpu >= 0") < os_may_start.index("if (!confined || !ctxr_exec_problem())")
     assert "if (ctxr_exec_confined()) {" in (REPO / "src/kboot.c").read_text()

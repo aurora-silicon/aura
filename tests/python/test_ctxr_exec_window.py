@@ -28,7 +28,7 @@ typedef unsigned long u64;
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 enum exc_guard_t { GUARD_OFF = 0, GUARD_MARK = 2, GUARD_SILENT = 0x100 };
 static volatile int exc_guard, exc_count;
-static int register_reads, reads_fault, at_el1;
+static int register_reads, reads_fault, at_el1, probe_stuck_cpu = -1;
 static bool in_el2(void) { return !at_el1; }
 static u64 read_register(u64 value)
 {
@@ -72,7 +72,7 @@ static void expanded(void)
     window_checked = false; window_problem = NULL; window_base = window_size = 0;
     confined = 1; ro_status = 1; register_reads = 0; fb_active = 0; console[0] = 0;
     features.apple_sysregs_unlocked = false;
-    reads_fault = 0;
+    reads_fault = 0; probe_stuck_cpu = -1;
     _base = BASE; _end = BASE + 0x3d0000;
     SYS_IMP_APL_CTXR_D_LWR_EL1 = BASE - 0xd8000;
     SYS_IMP_APL_CTXR_D_UPR_EL1 = BASE + 16 * MIB + 2 * MIB - SZ_16K + WINDOW - SZ_4K;
@@ -227,6 +227,11 @@ int main(void)
     expanded();
     cur_boot_args.top_of_kernel_data = start + 64 * MIB;
     assert(refused("heap"));
+    /* A secondary still holding the probe stops the boot, confined or not, with no Recovery advice. */
+    expanded();
+    confined = 0; probe_stuck_cpu = 3; console[0] = 0;
+    assert(!ctxr_exec_os_may_start() && fb_active && strstr(console, "CPU 3") &&
+           strstr(console, "Not starting the OS") && !strstr(console, "Recovery"));
     puts("ctxr exec window OK");
     return 0;
 }

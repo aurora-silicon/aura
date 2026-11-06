@@ -21,7 +21,7 @@ bool ctxr_range(enum ctxr_range range, u64 *start, u64 *end);
 bool ctxr_exec_confined(void);
 /* The physical window the OS runs in at EL2, false if there is none to use. */
 bool ctxr_exec_window(u64 *base, u64 *size);
-/* False on a confined machine with no window, having said why: don't enter the OS. */
+/* False on a confined machine with no window, or with a probe still pending, having said why. */
 bool ctxr_exec_os_may_start(void);
 
 #endif
