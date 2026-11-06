@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: MIT
 """monitor_required() decides by its probe alone, on every chip."""
 
-import pytest
-
 from test_smp_timeouts import REPO, compile_and_run
 
 
@@ -104,6 +102,5 @@ def test_reports_the_fault():
     assert "exc_last_esr = 0;" in body and "ESR 0x%lx" in body
 
 
-@pytest.mark.parametrize("name", ["kboot.c", "pv_kvm.c"])
-def test_callers_use_the_probe(name):
-    assert "monitor_required()" in (REPO / "src" / name).read_text()
+def test_callers_use_the_probe():
+    assert "monitor_required()" in (REPO / "src/kboot.c").read_text()

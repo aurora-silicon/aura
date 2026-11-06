@@ -31,17 +31,8 @@ including in a build made with `NV2_BOOT=1`. An ESP `chosen.aura,nv2=1` or
 `chosen.aura,nv2=0` configuration line selects the policy for the next reboot;
 it cannot change the EL2 regime of a running kernel.
 
-`aura-pv` selects the separate physical-EL1 PV-KVM prototype. It is rejected
-when NV2 is selected. The current PV ABI is a bounded discovery/RUN prototype with an optional
-EL1-step context probe, not a complete `/dev/kvm` backend; Linux integration
-and guest state switching remain required before enabling it on a production
-boot. RUN refuses success unless both callee-saved sentinels survive the HVC
-round trip.
-An ESP `chosen.aura,pv=1` or `chosen.aura,pv=0` configuration line selects the
-PV policy for the next reboot. It does not change a running kernel.
-
-The `tso=` payload setting is independent of both KVM modes. It controls the
-Mach-O handoff's TSO setup and does not imply NV2 or PV-KVM.
+The `tso=` payload setting is independent of it. It controls the Mach-O
+handoff's TSO setup and does not imply NV2.
 
 ## DebugUSB interception (development builds)
 
