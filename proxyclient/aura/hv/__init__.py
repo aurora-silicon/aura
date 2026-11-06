@@ -86,6 +86,9 @@ class HV(Reloadable):
         self.windows_usb = "disabled"
         self.windows_usb_removed = []
         self.windows_n1 = "disabled"
+        self.windows_mtp = "disabled"
+        self.windows_mtp_ready = False
+        self.windows_mtp_attempted = False
         self.windows_initialized = False
         self.windows_n1_attempted = False
         self.windows_n1_ready = False
@@ -1042,8 +1045,10 @@ class HV(Reloadable):
         self.p.exit(0)
 
     def _abort_windows_guest(self, reason, code, info):
-        self.windows_abort_reason = {"reason": int(reason), "code": int(code), "info": hex(info)}
-        self.log(f"Windows guest forwarded an exception to Python: {self.windows_abort_reason}")
+        event = {"reason": int(reason), "code": int(code), "info": hex(info)}
+        if self.windows_abort_reason is None:
+            self.windows_abort_reason = event
+        self.log(f"Windows guest forwarded an exception to Python: {event}")
         self.p.exit(EXC_RET.EXIT_GUEST)
 
     def attach_virtio(self, dev, base=None, irq=None, verbose=False):
@@ -1402,10 +1407,18 @@ class HV(Reloadable):
         if self.windows:
             from ..windows import (CONFIGURATION, CONFIG_FRAMEBUFFER_SHADOW,
                                    CONFIG_T8142_EXPERIMENTAL, CONFIG_SERIAL_CAPTURE,
-                                   CONFIG_SERIAL_CDC, validate_capabilities)
+                                   CONFIG_SERIAL_CDC, CONFIG_MTP, MTP_DISABLED_PROPERTY,
+                                   MTP_RESERVED_BASE, MTP_RESERVED_SIZE, validate_capabilities)
             caps = validate_capabilities(self.p.hv_windows_capabilities(), self.windows_framebuffer,
                                          self.windows_guest_compatibility, self.windows_n1,
-                                         self.windows_memory_guard is not None, self.windows_serial)
+                                         self.windows_memory_guard is not None, self.windows_serial,
+                                         self.windows_mtp)
+            if self.windows_mtp != "disabled":
+                guard = self.windows_memory_guard
+                if not guard or not any(r["base"] == MTP_RESERVED_BASE and
+                                        r["size"] == MTP_RESERVED_SIZE
+                                        for r in guard["reservations"]):
+                    raise ValueError("MTP requires its complete guarded physical reservation")
             if self.windows_serial == "capture" and self.windows_serial_recorder is None:
                 raise ValueError("Windows serial capture requires an artifact recorder")
             # The Windows C personality owns these architectural features.
@@ -1433,6 +1446,8 @@ class HV(Reloadable):
                     flags |= CONFIG_SERIAL_CAPTURE
                 elif self.windows_serial == "cdc":
                     flags |= CONFIG_SERIAL_CDC
+                if self.windows_mtp == "j813-v1":
+                    flags |= CONFIG_MTP
                 if self.p.hv_windows_configure(flags) != 0:
                     raise RuntimeError("Windows hypervisor configuration rejected")
 
@@ -1443,9 +1458,23 @@ class HV(Reloadable):
                 self.p.iodev_set_usage(iodev, 0)
 
         print("Initializing hypervisor over iodev %s" % self.iodev)
-        result = self.p.hv_init()
+        if self.windows and self.windows_mtp != "disabled":
+            self.windows_mtp_attempted = True
+            previous_timeout = self.iface.dev.timeout
+            self.iface.dev.timeout = max(previous_timeout or 0, 12)
+            try:
+                result = self.p.hv_init()
+            finally:
+                self.iface.dev.timeout = previous_timeout
+        else:
+            result = self.p.hv_init()
         if self.windows and result != 0:
             raise RuntimeError(f"Windows hypervisor initialization failed: {result}")
+        if self.windows and self.windows_mtp == "j813-v1":
+            # The producer returns success only after preparation and initial
+            # stage-2 mapping. Its final remap is also required before entry.
+            self.windows_mtp_ready = True
+            self.adt["/chosen"]._properties[MTP_DISABLED_PROPERTY] = 0
 
         self.iface.set_handler(START.EXCEPTION_LOWER, EXC.SYNC, self.handle_exception)
         self.iface.set_handler(START.EXCEPTION_LOWER, EXC.IRQ, self.handle_exception)
@@ -1740,8 +1769,14 @@ class HV(Reloadable):
     def setup_adt(self):
         if self.windows:
             self._disable_windows_usb()
-            from ..windows import N1_BYTES, N1_PROPERTY
+            from ..windows import N1_BYTES, N1_PROPERTY, MTP_DISABLED_PROPERTY
             chosen = self.adt["/chosen"]
+            if self.windows_mtp not in ("disabled", "j813-v1") or (
+                    self.windows_mtp == "j813-v1" and
+                    (chosen.chip_id != 0x8142 or self.adt.model != "Mac17,3")):
+                raise ValueError("MTP handoff requires the explicit J813 profile")
+            chosen._properties[MTP_DISABLED_PROPERTY] = 1
+            chosen._types[MTP_DISABLED_PROPERTY] = (Int32ul, False)
             if self.windows_n1 == "j813-v1":
                 if chosen.chip_id != 0x8142 or self.adt.model != "Mac17,3":
                     raise ValueError("N1 handoff requires the J813 target")
@@ -2121,6 +2156,8 @@ class HV(Reloadable):
         exec(code, self.shell_locals)
 
     def _validate_windows_n1_ready(self):
+        if (self.windows_mtp != "disabled" or self.windows_mtp_attempted) and not self.windows_mtp_ready:
+            raise RuntimeError("MTP handoff is incomplete; guest loading/entry is forbidden")
         if (self.windows_n1 != "disabled" or self.windows_n1_attempted) and not self.windows_n1_ready:
             raise RuntimeError("N1 handoff is incomplete; guest loading/entry is forbidden")
 

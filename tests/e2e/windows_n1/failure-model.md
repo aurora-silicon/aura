@@ -44,3 +44,19 @@ SMC reset-provider failure model (recorded before the admission fix):
 - Run the existing complete production preparation/census replay against that
   fixture before editing production code, then rerun with the corrected gate.
   Modeled training/MMIO still do not establish physical handoff success.
+# Power admission regression, recorded before the correction
+
+The J813 hardware run reached the N1 producer after identity validation but
+lost the proxy before any training log. The producer currently reads DART
+registers before the public Linux helper powers APCIE. An unpowered fabric
+read may never complete; an exception guard cannot make it safe.
+
+- Validate the complete target identity before requesting power.
+- Enable the same ADT APCIE power domains as Linux before any N1 register
+  access, then require the domains to report active.
+- A failed enable, inactive readback or unknown power state must produce no
+  N1 MMIO, training, descriptor, or retry. Keep the resident one-shot.
+- After power admission, retain every existing clean-DART, BME, reset and
+  descriptor check. Power admission does not prove an idle DMA owner.
+- Record phase boundaries before power, clean-state checks and training so
+  a physical stall can be localized without another blind register probe.

@@ -9,6 +9,7 @@
 #define TYPES_H
 #define UTILS_H
 #define HV_H
+#define PMGR_H
 static bool hv_windows_can_prepare_device(void) { return true; }
 #define __SMP_H__
 static int model_cpu;
@@ -36,11 +37,23 @@ static void model_sysop(const char *op) {
 #define sysop(x) model_sysop(x)
 u32 chip_id=0x8142, board_id=0x24; void *adt;
 static const char *scenario; static unsigned trains,writes,reads; static bool trained,held;
+static bool powered;
+static unsigned power_requests;
 struct cell {u64 a;u32 v;}; static struct cell cells[300]; static unsigned count;
 static u32 get(u64 a) {for(unsigned i=0;i<count;i++)if(cells[i].a==a)return cells[i].v;return 0;}
 static void put(u64 a,u32 v){for(unsigned i=0;i<count;i++)if(cells[i].a==a){cells[i].v=v;return;}assert(count<300);cells[count++]=(struct cell){a,v};}
 static bool is(const char*s){return !strcmp(scenario,s);}
-static u32 read32(u64 a){reads++;if(fault_load){assert(exc_guard==(GUARD_MARK|GUARD_SILENT));exc_count++;return 0xabad1dea;}if(a==0x1cb0100010ULL && get(a)==0xffffffff)return is("bar-mask")?0xfffe0001:0xffff0004;if(a==0x1cb0100014ULL && get(a)==0xffffffff)return is("bar-high")?0xfffffffe:0xffffffff;return get(a);}
+int pmgr_adt_power_enable(const char *path) {
+    assert(!strcmp(path, "/arm-io/apcie") && !reads && !writes && !trains);
+    power_requests++;
+    powered = !is("power-enable") && !is("power-inactive") && !is("power-unknown");
+    return is("power-enable") ? -1 : 0;
+}
+int pmgr_adt_is_powered(const char *path) {
+    assert(!strcmp(path, "/arm-io/apcie") && power_requests == 1);
+    return is("power-unknown") ? -1 : powered;
+}
+static u32 read32(u64 a){assert(powered);reads++;if(fault_load){assert(exc_guard==(GUARD_MARK|GUARD_SILENT));exc_count++;return 0xabad1dea;}if(a==0x1cb0100010ULL && get(a)==0xffffffff)return is("bar-mask")?0xfffe0001:0xffff0004;if(a==0x1cb0100014ULL && get(a)==0xffffffff)return is("bar-high")?0xfffffffe:0xffffffff;return get(a);}
 static u16 read16(u64 a){return read32(a&~3ULL)>>((a&2)*8);}
 static void write32(u64 a,u32 v){writes++;if(is("bar-drop")&&a==0x1cb0100010ULL&&v==0x80000004)return;put(a,v);if(a==0x39a000300ULL&&(v&15)==2){held=true;if(!is("clamp-fail")){put(0x488028208ULL,0);put(0x488028804ULL,0);put(0x488028820ULL,0);put(0x1cb0000728ULL,0x14);}}}
 static void write16(u64 a,u16 v){u64 b=a&~3ULL;unsigned sh=(a&2)*8;write32(b,(get(b)&~(0xffffU<<sh))|((u32)v<<sh));}

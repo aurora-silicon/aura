@@ -441,15 +441,10 @@ dart_dev_t *dart_init(uintptr_t base, u8 device, bool keep_pts, enum dart_type_t
         case DART_T6000:
             if (read32(dart->regs + DART_T8020_CONFIG) & DART_T8020_CONFIG_LOCK)
                 dart->locked = true;
-            if (!dart->locked)
-                set32(dart->regs + DART_T8020_ENABLED_STREAMS, BIT(device & 0x1f));
             break;
         case DART_T8110:
             if (read32(dart->regs + DART_T8110_PROTECT) & DART_T8110_PROTECT_TTBR_TCR)
                 dart->locked = true;
-            if (!dart->locked)
-                write32(dart->regs + DART_T8110_ENABLE_STREAMS + 4 * (device >> 5),
-                        BIT(device & 0x1f));
             break;
         default:
             break; /* Unsupported types were rejected above. */
@@ -464,6 +459,9 @@ dart_dev_t *dart_init(uintptr_t base, u8 device, bool keep_pts, enum dart_type_t
         }
     }
 
+    /* Allocate every missing root before publishing a table or enabling DMA.
+     * A later allocation failure must leave the inherited hardware untouched. */
+    u32 allocated_roots = 0;
     for (int i = 0; i < dart->params->ttbr_count; i++) {
         if (dart->l1[i])
             continue;
@@ -475,14 +473,30 @@ dart_dev_t *dart_init(uintptr_t base, u8 device, bool keep_pts, enum dart_type_t
         dart->l1[i] = memalign(SZ_16K, SZ_16K);
         if (!dart->l1[i])
             goto error;
+        allocated_roots |= BIT(i);
         memset(dart->l1[i], 0, SZ_16K);
+        dc_cvac_range(dart->l1[i], SZ_16K);
+    }
 
+    /* Complete table cleans before any root becomes visible to the DART. */
+    if (allocated_roots)
+        sysop("dsb sy");
+
+    for (int i = 0; i < dart->params->ttbr_count; i++) {
+        if (!(allocated_roots & BIT(i)))
+            continue;
         write32(DART_TTBR(dart, i),
                 dart->params->ttbr_valid |
                     FIELD_PREP(dart->params->ttbr_addr,
                                ((uintptr_t)dart->l1[i]) >> dart->params->ttbr_shift));
     }
 
+    if (!dart->locked) {
+        if (type == DART_T8110)
+            write32(dart->regs + DART_T8110_ENABLE_STREAMS + 4 * (device >> 5), BIT(device & 0x1f));
+        else
+            set32(dart->regs + DART_T8020_ENABLED_STREAMS, BIT(device & 0x1f));
+    }
     if (!dart->locked && !keep_pts)
         write32(DART_TCR(dart), dart->params->tcr_enabled);
 
@@ -491,8 +505,9 @@ dart_dev_t *dart_init(uintptr_t base, u8 device, bool keep_pts, enum dart_type_t
     return dart;
 
 error:
-    if (!dart->locked)
-        free(dart->l1);
+    for (int i = 0; i < dart->params->ttbr_count; i++)
+        if (allocated_roots & BIT(i))
+            free(dart->l1[i]);
     free(dart);
     return NULL;
 }

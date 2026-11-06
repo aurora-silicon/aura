@@ -3,6 +3,8 @@
 #ifndef RTKIT_H
 #define RTKIT_H
 
+#include "../build/build_cfg.h"
+
 #include "asc.h"
 #include "dart.h"
 #include "iova.h"
@@ -21,6 +23,9 @@ struct rtkit_buffer {
     u64 dva;
     size_t sz;
     bool owned;
+#ifdef AURA_WINDOWS
+    bool pooled;
+#endif
 };
 
 rtkit_dev_t *rtkit_init(const char *name, asc_dev_t *asc, dart_dev_t *dart,
@@ -48,5 +53,14 @@ bool rtkit_unmap(rtkit_dev_t *rtk, u64 dva, size_t sz);
 
 bool rtkit_alloc_buffer(rtkit_dev_t *rtk, struct rtkit_buffer *bfr, size_t sz);
 bool rtkit_free_buffer(rtkit_dev_t *rtk, struct rtkit_buffer *bfr);
+
+#ifdef AURA_WINDOWS
+/* Explicit pre-boot mode. Caller owns/stops the IOP before releasing storage. */
+bool rtkit_set_phys_window(rtkit_dev_t *rtk, u64 base, size_t size);
+bool rtkit_set_buffer_pool(rtkit_dev_t *rtk, u64 base, size_t size);
+bool rtkit_set_early_ap_power(rtkit_dev_t *rtk, bool enable);
+/* Single ASC owner; returns handled count, or a latched failure. Never waits. */
+int rtkit_service_quiet(rtkit_dev_t *rtk, int max_msgs);
+#endif
 
 #endif

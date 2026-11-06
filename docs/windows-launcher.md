@@ -88,17 +88,19 @@ reservation checks. Bit 8 advertises opt-in, framed outbound guest serial
 capture; the selected carrier must also support nonblocking atomic frames.
 Bit 9 advertises isolated dedicated-CDC guest serial mode, which suppresses
 guest `HVLOG: ` forwarding onto the primary proxy connection.
+Bit 10 advertises the explicitly requested J813 MTP handoff.
 Normal builds return zero. The launcher does not treat a capability bit as
 hardware qualification.
 
 `P_HV_WINDOWS_CONFIG = 0xc81` sets Windows options before `hv_init`: argument bit
 0 opts into the experimental T8142 instruction/vector rewrites and guessed SP
 repair; bit 1 requests BGRA shadow conversion; bit 2 requests framed serial
-capture; bit 3 selects isolated dedicated-CDC serial mode. Bits 2 and 3 are
+capture; bit 3 selects isolated dedicated-CDC serial mode; bit 4 requests the
+experimental J813 MTP handoff. Bits 2 and 3 are
 mutually exclusive, and bit 3 requires a USB CDC proxy carrier. It returns 0 on acceptance and
 -1 for invalid flags, unsupported target or an invalid lifecycle state. The
 host requires capability bit 6 for these options, bit 8 for serial capture,
-and bit 9 for dedicated CDC.
+bit 9 for dedicated CDC, and bits 7 and 10 for MTP.
 The C backend verifies the
 scanout format, creates the shadow and changes guest boot arguments only after
 successful setup; the host never spoofs depth. An unsuccessful requested
@@ -219,6 +221,12 @@ preflight. Any producer, readback or validation failure prevents guest loading
 and entry for that session, including an attempt to switch back to disabled.
 It requires the matching opt-in Mu profile; it does not establish Windows
 driver operation or permit a second attempt without a fresh Aura load.
+
+`mtp` defaults to `disabled`; all Windows profiles publish a disabled MTP
+marker until preparation actually succeeds. `j813-v1` requires T8142/Mac17,3,
+automatically reserves the complete 2 MiB staging/grant region, and performs
+the bounded preboot handoff during `hv_init`. It requires the matching Mu MTP
+admission gate. See the [experimental MTP contract](windows-mtp-handoff.md).
 
 `reserved_memory` optionally declares up to 16 firmware-owned physical ranges.
 Each has a unique `name`, a positive `size`, and exactly one of `base` or

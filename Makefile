@@ -196,7 +196,7 @@ HV_OBJECTS := $(patsubst %,hv/%, \
 ifeq ($(WINDOWS),1)
 HV_OBJECTS := $(patsubst %,hv/windows/%, \
 	hv.o hv_aic.o hv_asm.o hv_exc.o hv_vgic.o hv_psci.o \
-	hv_aic_alias.o fb_capture.o windows_compat.o windows_n1.o serial_capture.o) \
+	hv_aic_alias.o fb_capture.o windows_compat.o windows_n1.o serial_capture.o mtp_handoff.o) \
 	hv/hv_vm.o hv/hv_virtio.o hv/hv_vuart.o hv/hv_wdt.o hv/hv_sprr.o
 endif
 

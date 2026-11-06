@@ -22,10 +22,15 @@ CONFIGURATION = 0x0040
 MEMORY_PREFLIGHT = 0x0080
 SERIAL_CAPTURE = 0x0100
 SERIAL_CDC_ISOLATED = 0x0200
+MTP_HANDOFF = 0x0400
 CONFIG_T8142_EXPERIMENTAL = 0x0001
 CONFIG_FRAMEBUFFER_SHADOW = 0x0002
 CONFIG_SERIAL_CAPTURE = 0x0004
 CONFIG_SERIAL_CDC = 0x0008
+CONFIG_MTP = 0x0010
+MTP_DISABLED_PROPERTY = "aura,windows-mtp-disabled"
+MTP_RESERVED_BASE = 0x10020000000
+MTP_RESERVED_SIZE = 0x200000
 MAX_IMAGE = 1024 * 1024 * 1024
 N1_PROPERTY = "aura,windows-n1-v1"
 N1_BYTES = 128
@@ -50,14 +55,15 @@ def number(value, label):
 
 
 def validate_capabilities(value, framebuffer="native", guest_compatibility="none", n1="disabled",
-                          reserved_memory=False, serial="disabled"):
+                          reserved_memory=False, serial="disabled", mtp="disabled"):
     require(isinstance(value, int) and value >> 32 == CAPS_MAGIC >> 32,
             "resident is not an explicit Windows Aura personality")
     require((value >> 16) & 0xffff == CAPS_ABI, "unsupported Windows Aura capability ABI")
     require(value & REQUIRED_CAPS == REQUIRED_CAPS, "resident lacks required Windows capabilities")
     if framebuffer == "bgra-shadow":
         require(value & FRAMEBUFFER_SHADOW, "resident lacks the framebuffer conversion backend")
-    if framebuffer != "native" or guest_compatibility != "none" or serial in ("capture", "cdc"):
+    if (framebuffer != "native" or guest_compatibility != "none" or serial in ("capture", "cdc")
+            or mtp != "disabled"):
         require(value & CONFIGURATION, "resident lacks explicit Windows configuration")
     if n1 != "disabled":
         require(value & N1_HANDOFF, "resident lacks the N1 handoff producer")
@@ -67,6 +73,9 @@ def validate_capabilities(value, framebuffer="native", guest_compatibility="none
         require(value & SERIAL_CAPTURE, "resident lacks framed Windows serial capture")
     if serial == "cdc":
         require(value & SERIAL_CDC_ISOLATED, "resident lacks isolated Windows CDC serial mode")
+    if mtp != "disabled":
+        require(value & MTP_HANDOFF and value & MEMORY_PREFLIGHT,
+                "resident lacks guarded Windows MTP handoff")
     return value & 0xffff
 
 
@@ -88,6 +97,7 @@ class LaunchPlan:
     reserved_memory: tuple
     boot_args: str
     serial: str = "disabled"
+    mtp: str = "disabled"
 
 
 def plan_profile(filename):
@@ -99,7 +109,7 @@ def plan_profile(filename):
     require(isinstance(profile, dict), "profile must be an object")
     require(profile.get("schema") == "aura.windows.boot.v1", "unsupported Windows boot profile")
     require(set(profile) <= {"schema", "name", "target", "mu", "append", "framebuffer", "boot_args",
-                             "guest_compatibility", "usb", "n1", "reserved_memory", "serial"},
+                             "guest_compatibility", "usb", "n1", "reserved_memory", "serial", "mtp"},
             "unknown Windows profile field")
     require(isinstance(profile.get("name"), str) and 0 < len(profile["name"]) <= 80, "profile name is required")
     target = profile.get("target")
@@ -155,6 +165,10 @@ def plan_profile(filename):
     require(n1 in ("disabled", "j813-v1"), "unsupported N1 handoff profile")
     require(n1 == "disabled" or (chip == 0x8142 and model == "Mac17,3"),
             "j813-v1 N1 handoff requires chip 0x8142 and model Mac17,3")
+    mtp = profile.get("mtp", "disabled")
+    require(mtp in ("disabled", "j813-v1"), "unsupported MTP handoff profile")
+    require(mtp == "disabled" or (chip == 0x8142 and model == "Mac17,3"),
+            "j813-v1 MTP handoff requires chip 0x8142 and model Mac17,3")
     declarations = profile.get("reserved_memory", [])
     require(isinstance(declarations, list) and len(declarations) <= 16,
             "reserved_memory must be a list of at most 16 ranges")
@@ -173,6 +187,11 @@ def plan_profile(filename):
         require((origin != "base" or start + size <= 1 << 64) and
                 (origin != "from_ram_top" or start >= size), "reserved memory range wraps its address space")
         reserved.append({"name": name, origin: start, "size": size})
+    if mtp != "disabled":
+        # This reservation is owned by the device ABI, not an optional hint.
+        require("aura-mtp-handoff" not in names, "aura-mtp-handoff is an automatic reservation")
+        reserved.append({"name": "aura-mtp-handoff", "base": MTP_RESERVED_BASE,
+                         "size": MTP_RESERVED_SIZE})
     boot_args = profile.get("boot_args", "")
     require(isinstance(boot_args, str) and len(boot_args.encode("ascii")) <= 255 and "\0" not in boot_args,
             "boot_args must be at most 255 ASCII bytes without NUL")
@@ -186,7 +205,7 @@ def plan_profile(filename):
         cursor = offset + len(content)
     return LaunchPlan(filename, profile, raw, hashlib.sha256(raw).hexdigest(), b"".join(composed),
                       tuple(images), entry, chip, model, framebuffer, compatibility, usb, n1,
-                      tuple(reserved), boot_args, serial)
+                      tuple(reserved), boot_args, serial, mtp)
 
 
 def _aligned(value, alignment):
@@ -387,7 +406,7 @@ class HardwareSession:
 
     def prepare(self, plan):
         validate_capabilities(self.capabilities(), plan.framebuffer, plan.guest_compatibility, plan.n1,
-                              bool(plan.reserved_memory), plan.serial)
+                              bool(plan.reserved_memory), plan.serial, plan.mtp)
         self.validate_serial_transport(plan)
         if plan.serial == "capture":
             from .windows_serial import WindowsSerialRecorder
@@ -405,6 +424,7 @@ class HardwareSession:
         preflight.emulate_sprr = False
         preflight.windows_usb = plan.usb
         preflight.windows_n1 = plan.n1
+        preflight.windows_mtp = plan.mtp
         preflight.setup_adt()
         preflight._windows_adt_blob()
         guard = None
@@ -426,6 +446,7 @@ class HardwareSession:
         self.hv.windows_guest_compatibility = plan.guest_compatibility
         self.hv.windows_usb = plan.usb
         self.hv.windows_n1 = plan.n1
+        self.hv.windows_mtp = plan.mtp
         self.hv.windows_serial = plan.serial
         self.hv.windows_serial_recorder = self.serial_capture
         self.hv.init()
@@ -440,7 +461,8 @@ class HardwareSession:
         return {"guest_base": hex(self.hv.guest_base), "entry": hex(self.hv.entry),
                 "bootargs": hex(self.hv.guest_base + self.hv.bootargs_off),
                 "usb": plan.usb, "usb_removed": self.hv.windows_usb_removed,
-                "n1": self.hv.windows_n1_handoff, "memory_preflight": self.hv.windows_memory_guard}
+                "n1": self.hv.windows_n1_handoff, "memory_preflight": self.hv.windows_memory_guard,
+                "mtp": {"profile": plan.mtp, "prepared": self.hv.windows_mtp_ready}}
 
     def start(self):
         return self.hv.start()
@@ -482,7 +504,7 @@ def launch_profile(filename, device, output, session_factory=HardwareSession, gu
             session = session_factory(device, log)
             caps = session.capabilities()
             validate_capabilities(caps, plan.framebuffer, plan.guest_compatibility, plan.n1,
-                                  bool(plan.reserved_memory), plan.serial)
+                                  bool(plan.reserved_memory), plan.serial, plan.mtp)
             identity = session.identity()
             require(identity["chip_id"] == plan.chip_id and identity["model"] == plan.model,
                     "target identity does not match the Windows profile")

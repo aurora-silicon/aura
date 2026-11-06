@@ -5,6 +5,7 @@
 #include "exception.h"
 #include "hv.h"
 #include "j813_n1.h"
+#include "pmgr.h"
 #include "smp.h"
 #include "string.h"
 #include "utils.h"
@@ -304,6 +305,14 @@ int hv_windows_n1_prepare(void *descriptor, size_t size)
     if (!hv_windows_can_prepare_device() || attempted || n1_identity())
         return -1;
     attempted = true;
+    /* Unpowered fabric accesses can hang instead of delivering a guarded
+     * abort. Match Linux's power prerequisite before the first DART read. */
+    printf("Windows N1: enabling APCIE power before register admission\n");
+    if (pmgr_adt_power_enable("/arm-io/apcie") || pmgr_adt_is_powered("/arm-io/apcie") != 1) {
+        printf("Windows N1: power admission failed; no N1 registers accessed\n");
+        return -1;
+    }
+    printf("Windows N1: power active; checking DART and endpoint ownership\n");
     if (n1_dart_clean())
         return -1;
     u32 link, pad;
@@ -312,6 +321,7 @@ int hv_windows_n1_prepare(void *descriptor, size_t size)
         return -1;
 
     /* One explicit reset/training operation; no firmware or DART programming. */
+    printf("Windows N1: clean ownership; starting Linux reset/PHY sequence\n");
     if (j813_n1_train_windows() || n1_poll(PORT + 0x208, 1, 1, 1000000) || n1_endpoints_clean() ||
         n1_assign_control() || n1_dart_clean() || n1_endpoints_clean() ||
         n1_read(BAR + 0x8000, 4, &link) || link != 0) {

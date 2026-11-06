@@ -9,6 +9,7 @@
 #include "exception.h"
 #include "hv_aic_alias.h"
 #include "hv_vgic.h"
+#include "mtp_handoff.h"
 #include "smp.h"
 #include "string.h"
 #include "uart.h"
@@ -989,6 +990,7 @@ static void _hv_exc_proxy(struct exc_info *ctx, uartproxy_boot_reason_t reason, 
             }
             break;
         case EXC_EXIT_GUEST:
+            hv_windows_abort_guest();
             hv_rendezvous();
             spin_unlock(&bhl);
             hv_exit_guest(); // does not return
@@ -5906,6 +5908,7 @@ static bool hv_handle_wfx(struct exc_info *ctx)
      * WFI with interrupts masked and its only pending work injected by m1n1 --
      * so waiting on one would stall until the next physical tick.
      */
+    hv_windows_mtp_poll();
     if (mrs(ISR_EL1) == 0 && !(mrs(HCR_EL2) & (HCR_VI | HCR_VF))) {
         /*
          * Bound the wait.  A virtual interrupt does not end a WFI executed at

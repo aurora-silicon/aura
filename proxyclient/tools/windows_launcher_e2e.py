@@ -9,7 +9,7 @@ import subprocess
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from aura.windows import CAPS_MAGIC, REQUIRED_CAPS, launch_profile, source_manifest
+from aura.windows import CAPS_MAGIC, REQUIRED_CAPS, CONFIGURATION, MEMORY_PREFLIGHT, MTP_HANDOFF, MTP_RESERVED_BASE, MTP_RESERVED_SIZE, launch_profile, source_manifest
 
 
 def main():
@@ -35,7 +35,8 @@ def main():
                  "append-offset", "append-contiguous", "append-overlap", "append-too-large",
                  "append-wrong-hash", "usb-unsupported", "n1-capability-missing", "n1-wrong-model",
                  "reservation-capability-missing", "reservation-wrap", "reservation-bad-fields",
-                 "serial-capability-missing", "serial-invalid"):
+                 "serial-capability-missing", "serial-invalid", "mtp-success", "mtp-capability-missing",
+                 "mtp-wrong-model", "mtp-invalid", "mtp-reservation-name"):
         profile = json.loads(json.dumps(baseline))
         expected_image = firmware_bytes
         if case.startswith("append-"):
@@ -49,6 +50,12 @@ def main():
             expected_image = firmware_bytes + bytes(gap) + ramdisk_bytes
         if case == "usb-unsupported": profile["usb"] = "enabled"
         if case.startswith("serial-"): profile["serial"] = "capture" if case == "serial-capability-missing" else "raw"
+        if case.startswith("mtp-"):
+            profile["mtp"] = "j813-v1"
+        if case == "mtp-wrong-model": profile["target"]["model"] = "Mac17,1"
+        if case == "mtp-invalid": profile["mtp"] = "automatic"
+        if case == "mtp-reservation-name":
+            profile["reserved_memory"] = [{"name": "aura-mtp-handoff", "base": hex(MTP_RESERVED_BASE), "size": hex(MTP_RESERVED_SIZE)}]
         if case.startswith("n1-"): profile["n1"] = "j813-v1"
         if case == "n1-wrong-model": profile["target"]["model"] = "Mac17,1"
         if case.startswith("reservation-"):
@@ -78,7 +85,8 @@ def main():
                 trace.append("read-capabilities")
                 if case == "normal-resident":
                     return 0
-                return CAPS_MAGIC | ((2 if case == "wrong-abi" else 1) << 16) | REQUIRED_CAPS
+                extra = CONFIGURATION | MEMORY_PREFLIGHT | MTP_HANDOFF if case == "mtp-success" else 0
+                return CAPS_MAGIC | ((2 if case == "wrong-abi" else 1) << 16) | REQUIRED_CAPS | extra
             def identity(self):
                 trace.append("read-identity")
                 return {"chip_id": 0x6020 if case == "wrong-chip" else 0x8142,
@@ -86,6 +94,9 @@ def main():
                         "resident_base": "0x10000000000"}
             def prepare(self, plan):
                 trace.append("mutate-prepare")
+                if case == "mtp-success":
+                    assert plan.mtp == "j813-v1"
+                    assert plan.reserved_memory == ({"name": "aura-mtp-handoff", "base": MTP_RESERVED_BASE, "size": MTP_RESERVED_SIZE},)
                 if case == "init-failure":
                     raise RuntimeError("injected hv_init failure")
             def load(self, plan):
@@ -102,7 +113,7 @@ def main():
                 trace.append("close")
 
         passed = False
-        expected_success = case in ("success", "poweroff", "reset", "append-offset", "append-contiguous")
+        expected_success = case in ("success", "poweroff", "reset", "append-offset", "append-contiguous", "mtp-success")
         try:
             result = launch_profile(filename, "model-device", out / (case + "-evidence"), session_factory=Endpoint)
             passed = expected_success

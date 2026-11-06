@@ -15,16 +15,19 @@
 #include "windows_regs.h"
 
 void hv_windows_system_exit(bool reset) __attribute__((noreturn));
+void hv_windows_abort_guest(void);
 int hv_windows_configure(u64 flags);
 bool hv_windows_guest_compat_enabled(void);
 bool hv_windows_serial_capture_enabled(void);
 bool hv_windows_serial_cdc_enabled(void);
+bool hv_windows_mtp_enabled(void);
 bool hv_windows_can_prepare_device(void);
 void hv_windows_quarantine(void);
 #define HV_WINDOWS_GUEST_COMPAT   BIT(0)
 #define HV_WINDOWS_FB_SHADOW      BIT(1)
 #define HV_WINDOWS_SERIAL_CAPTURE BIT(2)
 #define HV_WINDOWS_SERIAL_CDC     BIT(3)
+#define HV_WINDOWS_MTP            BIT(4)
 
 typedef bool(hv_hook_t)(struct exc_info *ctx, u64 addr, u64 *val, bool write, int width);
 

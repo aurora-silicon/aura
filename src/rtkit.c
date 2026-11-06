@@ -1,5 +1,7 @@
 /* SPDX-License-Identifier: MIT AND GPL-2.0-only */
 
+#include "../build/build_cfg.h"
+
 #include "../config.h"
 
 #include "rtkit.h"
@@ -14,10 +16,19 @@
 #include "types.h"
 #include "utils.h"
 
+#ifdef AURA_WINDOWS
+#include "memory.h"
+#define RTKIT_QUIET(rtk) ((rtk)->quiet)
+#else
+#define RTKIT_QUIET(rtk) false
+#endif
+
 #define rtkit_printf(...)                                                                          \
     do {                                                                                           \
-        debug_printf("rtkit(%s): ", rtk->name);                                                    \
-        debug_printf(__VA_ARGS__);                                                                 \
+        if (!RTKIT_QUIET(rtk)) {                                                                   \
+            debug_printf("rtkit(%s): ", rtk->name);                                                \
+            debug_printf(__VA_ARGS__);                                                             \
+        }                                                                                          \
     } while (0)
 
 #define RTKIT_EP_MGMT     0
@@ -116,6 +127,12 @@ struct rtkit_dev {
     bool crashed;
     /* The last boot attempt got no HELLO after the wakeup. */
     bool no_hello;
+#ifdef AURA_WINDOWS
+    bool windows_mode, windows_failed, boot_started, early_ap_power;
+    bool quiet, service_busy, pool_mapped;
+    u64 pool_base, pool_dva;
+    size_t pool_size, pool_used;
+#endif
 };
 
 struct syslog_log {
@@ -209,12 +226,73 @@ out_free_rtk:
     return NULL;
 }
 
+#ifdef AURA_WINDOWS
+static bool rtkit_windows_configurable(rtkit_dev_t *rtk)
+{
+    return rtk && !rtk->boot_started && !rtk->windows_failed && !rtk->sram && !rtk->sart &&
+           rtk->dart && rtk->dart_iovad && !rtk->pool_used && !rtk->syslog_bfr.bfr &&
+           !rtk->crashlog_bfr.bfr && !rtk->ioreport_bfr.bfr && !rtk->oslog_bfr.bfr;
+}
+
+bool rtkit_set_phys_window(rtkit_dev_t *rtk, u64 base, size_t size)
+{
+    if (!rtkit_windows_configurable(rtk) || !base || !size || base > UINT64_MAX - size ||
+        rtk->phys_window_size ||
+        (rtk->pool_size && base < rtk->pool_base + rtk->pool_size && rtk->pool_base < base + size))
+        return false;
+    rtk->windows_mode = true;
+    rtk->phys_window_base = base;
+    rtk->phys_window_size = size;
+    return true;
+}
+
+bool rtkit_set_buffer_pool(rtkit_dev_t *rtk, u64 base, size_t size)
+{
+    if (!rtkit_windows_configurable(rtk) || rtk->pool_mapped || !base || !size ||
+        size > 16 * 1024 * 1024 || (base & (SZ_16K - 1)) || (size & (SZ_16K - 1)) ||
+        base > UINT64_MAX - size ||
+        (rtk->phys_window_size && base < rtk->phys_window_base + rtk->phys_window_size &&
+         rtk->phys_window_base < base + size))
+        return false;
+    rtk->windows_mode = true;
+    u64 dva;
+    if (!rtkit_map(rtk, (void *)base, size, &dva)) {
+        rtk->windows_failed = true;
+        return false;
+    }
+    if ((dva & (SZ_16K - 1)) || dva > MSG_BUFFER_REQUEST_IOVA ||
+        size - 1 > MSG_BUFFER_REQUEST_IOVA - dva) {
+        rtkit_unmap(rtk, dva, size);
+        rtk->windows_failed = true;
+        return false;
+    }
+    rtk->pool_base = base;
+    rtk->pool_dva = dva;
+    rtk->pool_size = size;
+    rtk->pool_mapped = true;
+    return true;
+}
+
+bool rtkit_set_early_ap_power(rtkit_dev_t *rtk, bool enable)
+{
+    if (!rtkit_windows_configurable(rtk))
+        return false;
+    rtk->windows_mode = true;
+    rtk->early_ap_power = enable;
+    return true;
+}
+#endif
+
 void rtkit_free(rtkit_dev_t *rtk)
 {
     rtkit_free_buffer(rtk, &rtk->syslog_bfr);
     rtkit_free_buffer(rtk, &rtk->crashlog_bfr);
     rtkit_free_buffer(rtk, &rtk->ioreport_bfr);
     rtkit_free_buffer(rtk, &rtk->oslog_bfr);
+#ifdef AURA_WINDOWS
+    if (rtk->pool_mapped && !rtkit_unmap(rtk, rtk->pool_dva, rtk->pool_size))
+        return;
+#endif
     free(rtk->name);
     free(rtk);
 }
@@ -232,6 +310,10 @@ bool rtkit_send(rtkit_dev_t *rtk, const struct rtkit_message *msg)
 /* A failed handshake can already have granted host storage to firmware. */
 bool rtkit_has_owned_buffers(const rtkit_dev_t *rtk)
 {
+#ifdef AURA_WINDOWS
+    if (rtk && rtk->pool_mapped)
+        return true;
+#endif
     return rtk && (rtk->syslog_bfr.owned || rtk->crashlog_bfr.owned || rtk->ioreport_bfr.owned ||
                    rtk->oslog_bfr.owned);
 }
@@ -293,6 +375,22 @@ bool rtkit_alloc_buffer(rtkit_dev_t *rtk, struct rtkit_buffer *bfr, size_t sz)
         return false;
 
     size_t alloc_sz = ALIGN_UP(sz, SZ_16K);
+#ifdef AURA_WINDOWS
+    if (rtk->windows_mode) {
+        if (rtk->windows_failed || !rtk->pool_mapped || bfr->bfr ||
+            rtk->pool_used > rtk->pool_size || alloc_sz > rtk->pool_size - rtk->pool_used)
+            return false;
+        bfr->bfr = (void *)(rtk->pool_base + rtk->pool_used);
+        bfr->dva = rtk->pool_dva + rtk->pool_used;
+        bfr->sz = alloc_sz;
+        bfr->owned = bfr->pooled = true;
+        rtk->pool_used += alloc_sz;
+        memset(bfr->bfr, 0, alloc_sz);
+        dc_cvac_range(bfr->bfr, alloc_sz);
+        sysop("dsb sy");
+        return true;
+    }
+#endif
     bfr->bfr = memalign(SZ_16K, alloc_sz);
     if (!bfr->bfr) {
         rtkit_printf("unable to allocate %zu buffer\n", sz);
@@ -305,6 +403,9 @@ bool rtkit_alloc_buffer(rtkit_dev_t *rtk, struct rtkit_buffer *bfr, size_t sz)
         goto error;
 
     bfr->owned = true;
+#ifdef AURA_WINDOWS
+    bfr->pooled = false;
+#endif
     return true;
 
 error:
@@ -319,6 +420,14 @@ bool rtkit_free_buffer(rtkit_dev_t *rtk, struct rtkit_buffer *bfr)
         memset(bfr, 0, sizeof(*bfr));
         return true;
     }
+
+#ifdef AURA_WINDOWS
+    if (bfr->pooled) {
+        /* Pool mappings outlive individual grants; never recycle a live slice. */
+        memset(bfr, 0, sizeof(*bfr));
+        return true;
+    }
+#endif
 
     if (!rtkit_unmap(rtk, bfr->dva, bfr->sz))
         return false;
@@ -337,6 +446,17 @@ static bool rtkit_handle_buffer_request(rtkit_dev_t *rtk, struct rtkit_message *
 
     if (rtk->phys_window_size && (bfr->bfr || !sz))
         return false;
+
+#ifdef AURA_WINDOWS
+    if (rtk->windows_mode && addr) {
+        if (!rtk->phys_window_size || addr < rtk->phys_window_base ||
+            addr - rtk->phys_window_base >= rtk->phys_window_size ||
+            sz > rtk->phys_window_size - (addr - rtk->phys_window_base))
+            return false;
+        *bfr = (struct rtkit_buffer){.bfr = (void *)addr, .dva = addr, .sz = sz};
+        return true;
+    }
+#endif
 
     if (rtk->sram) {
         if (!addr || (rtk->phys_window_size &&
@@ -411,6 +531,10 @@ static bool rtkit_handle_oslog_request(rtkit_dev_t *rtk, struct rtkit_message *m
             return true;
         }
         if (rtk->dart && sz && addr <= UINT64_MAX - sz) {
+#ifdef AURA_WINDOWS
+            if (rtk->windows_mode)
+                return false;
+#endif
             u64 dva = addr & ~rtk->dva_base;
             u64 page = ALIGN_DOWN(dva, SZ_16K);
             u64 end = ALIGN_UP(dva + sz, SZ_16K);
@@ -452,13 +576,198 @@ static bool rtkit_handle_oslog_request(rtkit_dev_t *rtk, struct rtkit_message *m
     reply.msg0 |= FIELD_PREP(OSLOG_IOVA, bfr->dva >> 12);
     if (!asc_send(rtk->asc, &reply)) {
         rtkit_printf("unable to send oslog buffer reply\n");
-        rtkit_free_buffer(rtk, bfr);
+#ifdef AURA_WINDOWS
+        if (!rtk->windows_mode)
+#endif
+            rtkit_free_buffer(rtk, bfr);
         return false;
     }
 
     rtkit_printf("oslog buffer (dva %#lx, phys %p, size %#zx)\n", bfr->dva, bfr->bfr, sz);
     return true;
 }
+
+#ifdef AURA_WINDOWS
+/* This path never interprets firmware-owned log memory. Each supported message
+ * needs at most one TX slot, reserved by the sole ASC owner's capacity check. */
+static bool rtkit_windows_message(rtkit_dev_t *rtk, const struct asc_message *wire)
+{
+    if (wire->msg1 >= 0x20)
+        return false;
+    struct rtkit_message msg = {.ep = wire->msg1, .msg = wire->msg0};
+    u32 type = FIELD_GET(MGMT_TYPE, msg.msg);
+    switch (msg.ep) {
+        case RTKIT_EP_MGMT:
+            if (type == MGMT_MSG_IOP_PWR_STATE_ACK)
+                rtk->iop_power = FIELD_GET(MGMT_PWR_STATE, msg.msg);
+            else if (type == MGMT_MSG_AP_PWR_STATE_ACK)
+                rtk->ap_power = FIELD_GET(MGMT_PWR_STATE, msg.msg);
+            else
+                return false;
+            return true;
+        case RTKIT_EP_SYSLOG:
+            if (type == MSG_BUFFER_REQUEST)
+                return rtkit_handle_buffer_request(rtk, &msg, &rtk->syslog_bfr);
+            if (type == MSG_SYSLOG_INIT) {
+                rtk->syslog_cnt = FIELD_GET(MSG_SYSLOG_INIT_COUNT, msg.msg);
+                rtk->syslog_size = FIELD_GET(MSG_SYSLOG_INIT_ENTRYSIZE, msg.msg);
+                return rtk->syslog_cnt && rtk->syslog_size;
+            }
+            if (type == MSG_SYSLOG_LOG) {
+                u64 stride = rtk->syslog_size + sizeof(struct syslog_log);
+                if (!rtk->syslog_bfr.bfr || !rtk->syslog_cnt || !rtk->syslog_size ||
+                    FIELD_GET(MSG_SYSLOG_LOG_INDEX, msg.msg) >= rtk->syslog_cnt ||
+                    stride * rtk->syslog_cnt > rtk->syslog_bfr.sz)
+                    return false;
+                return asc_send(rtk->asc, wire);
+            }
+            return false;
+        case RTKIT_EP_CRASHLOG:
+            if (type != MSG_BUFFER_REQUEST)
+                return false;
+            if (rtk->crashlog_bfr.bfr) {
+                rtk->crashed = true;
+                return false;
+            }
+            return rtkit_handle_buffer_request(rtk, &msg, &rtk->crashlog_bfr);
+        case RTKIT_EP_IOREPORT:
+            if (type == MSG_BUFFER_REQUEST)
+                return rtkit_handle_buffer_request(rtk, &msg, &rtk->ioreport_bfr);
+            if (type == 8 || type == 0xc)
+                return asc_send(rtk->asc, wire);
+            return false;
+        case RTKIT_EP_OSLOG:
+            return FIELD_GET(OSLOG_TYPE, msg.msg) == OSLOG_TYPE_BUFFER_REQUEST &&
+                   rtkit_handle_oslog_request(rtk, &msg);
+        default:
+            return false;
+    }
+}
+
+int rtkit_service_quiet(rtkit_dev_t *rtk, int max_msgs)
+{
+    if (!rtk || !rtk->windows_mode || !rtk->boot_started || !rtk->pool_mapped ||
+        !rtk->phys_window_size || rtk->windows_failed || rtk->crashed || max_msgs < 1 ||
+        max_msgs > 64 || __atomic_test_and_set(&rtk->service_busy, __ATOMIC_ACQUIRE))
+        return -1;
+    int count = 0;
+    rtk->quiet = true;
+    while (count < max_msgs && asc_can_recv(rtk->asc)) {
+        if (!asc_can_send(rtk->asc))
+            break;
+        struct asc_message msg;
+        if (!asc_recv(rtk->asc, &msg))
+            break;
+        count++;
+        if (!rtkit_windows_message(rtk, &msg)) {
+            rtk->windows_failed = true;
+            count = -1;
+            break;
+        }
+    }
+    rtk->quiet = false;
+    __atomic_clear(&rtk->service_busy, __ATOMIC_RELEASE);
+    return count;
+}
+
+static bool rtkit_windows_send(rtkit_dev_t *rtk, const struct asc_message *msg, u64 deadline)
+{
+    do {
+        if (timeout_expired(deadline))
+            return false;
+    } while (!asc_can_send(rtk->asc));
+    return asc_send(rtk->asc, msg);
+}
+
+static bool rtkit_windows_recv(rtkit_dev_t *rtk, struct asc_message *msg, u64 deadline)
+{
+    do {
+        if (timeout_expired(deadline))
+            return false;
+    } while (!asc_can_recv(rtk->asc));
+    return asc_recv(rtk->asc, msg);
+}
+
+static bool rtkit_windows_boot(rtkit_dev_t *rtk, u32 usec)
+{
+    if (!usec || rtk->boot_started || rtk->windows_failed || !rtk->early_ap_power ||
+        !rtk->pool_mapped || !rtk->phys_window_size)
+        return false;
+    rtk->boot_started = true;
+    rtk->no_hello = false;
+    u64 deadline = timeout_calculate(usec);
+    asc_cpu_start(rtk->asc);
+    struct asc_message msg = {
+        .msg0 = FIELD_PREP(MGMT_TYPE, MGMT_MSG_IOP_PWR_STATE) | RTKIT_POWER_INIT,
+        .msg1 = RTKIT_EP_MGMT,
+    };
+    if (!rtkit_windows_send(rtk, &msg, deadline) || !rtkit_windows_recv(rtk, &msg, deadline) ||
+        msg.msg1 != RTKIT_EP_MGMT || FIELD_GET(MGMT_TYPE, msg.msg0) != MGMT_MSG_HELLO)
+        goto fail;
+    u32 min_ver = FIELD_GET(MGMT_MSG_HELLO_MINVER, msg.msg0);
+    u32 max_ver = FIELD_GET(MGMT_MSG_HELLO_MAXVER, msg.msg0);
+    if (min_ver > max_ver || min_ver > RTKIT_MAX_VERSION || max_ver < RTKIT_MIN_VERSION)
+        goto fail;
+    u32 version = min(max_ver, RTKIT_MAX_VERSION);
+    msg.msg0 = FIELD_PREP(MGMT_TYPE, MGMT_MSG_HELLO_ACK) |
+               FIELD_PREP(MGMT_MSG_HELLO_MINVER, version) |
+               FIELD_PREP(MGMT_MSG_HELLO_MAXVER, version);
+    if (!rtkit_windows_send(rtk, &msg, deadline))
+        goto fail;
+    u32 endpoints = 0, seen_maps = 0;
+    bool done = false;
+    while (!done) {
+        if (!rtkit_windows_recv(rtk, &msg, deadline) || msg.msg1 != RTKIT_EP_MGMT)
+            goto fail;
+        u32 type = FIELD_GET(MGMT_TYPE, msg.msg0);
+        if (type == MGMT_MSG_IOP_PWR_STATE_ACK || type == MGMT_MSG_AP_PWR_STATE_ACK) {
+            if (!rtkit_windows_message(rtk, &msg))
+                goto fail;
+            continue;
+        }
+        if (type != MGMT_MSG_EPMAP)
+            goto fail;
+        u32 base = FIELD_GET(MGMT_MSG_EPMAP_BASE, msg.msg0);
+        if (seen_maps & BIT(base))
+            goto fail;
+        seen_maps |= BIT(base);
+        if (!base)
+            endpoints = FIELD_GET(MGMT_MSG_EPMAP_BITMAP, msg.msg0);
+        done = msg.msg0 & MGMT_MSG_EPMAP_DONE;
+        msg.msg0 = FIELD_PREP(MGMT_TYPE, MGMT_MSG_EPMAP_REPLY) |
+                   FIELD_PREP(MGMT_MSG_EPMAP_BASE, base) |
+                   (done ? MGMT_MSG_EPMAP_REPLY_DONE : MGMT_MSG_EPMAP_REPLY_MORE);
+        if (!rtkit_windows_send(rtk, &msg, deadline))
+            goto fail;
+    }
+    /* Keep the existing known endpoint order, then start other advertised
+     * system endpoints as required by MTP. Never start app endpoints here. */
+    const u8 known[] = {RTKIT_EP_DEBUG, RTKIT_EP_CRASHLOG, RTKIT_EP_SYSLOG, RTKIT_EP_IOREPORT,
+                        RTKIT_EP_OSLOG};
+    for (unsigned i = 0; i < sizeof(known) + 31; i++) {
+        u8 ep = i < sizeof(known) ? known[i] : i - sizeof(known) + 1;
+        if (!(endpoints & BIT(ep)))
+            continue;
+        endpoints &= ~BIT(ep);
+        msg.msg0 = FIELD_PREP(MGMT_TYPE, MGMT_MSG_START_EP) | MGMT_MSG_START_EP_FLAG |
+                   FIELD_PREP(MGMT_MSG_START_EP_IDX, ep);
+        if (!rtkit_windows_send(rtk, &msg, deadline))
+            goto fail;
+    }
+    msg.msg0 = FIELD_PREP(MGMT_TYPE, MGMT_MSG_AP_PWR_STATE) | RTKIT_POWER_ON;
+    if (!rtkit_windows_send(rtk, &msg, deadline))
+        goto fail;
+    while (rtk->iop_power != RTKIT_POWER_ON || rtk->ap_power != RTKIT_POWER_ON) {
+        if (timeout_expired(deadline) || rtkit_service_quiet(rtk, 1) < 0)
+            goto fail;
+    }
+    if (!timeout_expired(deadline))
+        return true;
+fail:
+    rtk->windows_failed = true;
+    return false;
+}
+#endif
 
 static void rtkit_crashed(rtkit_dev_t *rtk)
 {
@@ -652,6 +961,9 @@ static bool rtkit_wait_for_power(rtkit_dev_t *rtk, enum rtkit_power_state *state
 
 static bool rtkit_boot_internal(rtkit_dev_t *rtk, u32 timeout_usec)
 {
+#ifdef AURA_WINDOWS
+    rtk->boot_started = true; /* Later setters must never replace live DMA policy. */
+#endif
     struct asc_message msg;
 
     rtk->no_hello = false;
@@ -815,6 +1127,10 @@ static bool rtkit_boot_internal(rtkit_dev_t *rtk, u32 timeout_usec)
 
 bool rtkit_boot(rtkit_dev_t *rtk)
 {
+#ifdef AURA_WINDOWS
+    if (rtk->windows_mode)
+        return false; /* Explicit mode requires one bounded boot attempt. */
+#endif
     return rtkit_boot_internal(rtk, 0);
 }
 
@@ -846,6 +1162,10 @@ bool rtkit_boot_timed(rtkit_dev_t *rtk, u32 timeout_usec)
     }
 
     rtk->timeout_usec = timeout_usec;
+#ifdef AURA_WINDOWS
+    if (rtk->windows_mode)
+        return rtkit_windows_boot(rtk, timeout_usec);
+#endif
     return rtkit_boot_internal(rtk, timeout_usec);
 }
 
