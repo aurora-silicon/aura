@@ -178,3 +178,26 @@ _deep_wfi_helper:
 _smp_reenter_park:
     mov sp, x1
     b smp_park_loop
+
+/* T8152 Linux spin-table entry, entered on an existing secondary stack. */
+.globl smp_kernel_park
+.type smp_kernel_park, @function
+smp_kernel_park:
+    msr daifset, #15
+    mov x19, x0
+    bl mmu_disable
+    mrs x1, sctlr_el2
+    str x1, [x19, #16]
+    mov x1, #1
+    str x1, [x19, #8]
+    dsb sy
+1:  wfe
+    ldr x4, [x19]
+    cbz x4, 1b
+    dsb sy
+    isb
+    mov x0, xzr
+    mov x1, xzr
+    mov x2, xzr
+    mov x3, xzr
+    br x4

@@ -1018,9 +1018,9 @@ int display_init(void)
 
 int display_shutdown(dcp_shutdown_mode mode)
 {
-    /* Linux owns the live J700/J713 controllers. Keep the inherited ASC session
+    /* Linux owns the live J700/J713/J873 controllers. Keep the inherited ASC session
      * and scanout intact at both the Stage 1 and Linux boundaries. */
-    if (chip_id == T8140 || chip_id == T8132)
+    if (chip_id == T8140 || chip_id == T8132 || chip_id == T8152)
         return 0;
 
     /* We have no DCP, so just exit */

@@ -250,7 +250,7 @@ OBJECTS := \
 	$(MINILZLIB_OBJECTS) $(TINF_OBJECTS) $(DLMALLOC_OBJECTS) $(LIBFDT_OBJECTS)
 
 FP_OBJECTS := \
-	kboot_gpu.o kboot_gpu_m4.o \
+	kboot_gpu.o kboot_gpu_t8152.o kboot_gpu_m4.o \
 	math/expf.o \
 	math/exp2f_data.o \
 	math/powf.o \

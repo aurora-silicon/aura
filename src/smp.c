@@ -149,15 +149,25 @@ int boot_cpu_idx SMP_SHARED = -1;
 u64 boot_cpu_mpidr SMP_SHARED = 0;
 static u64 installed_relay SMP_SHARED;
 
+/* Absolute reset-vector relay for a relocated T8152 image. */
+#define SMP_VENEER_LDR 0x58000050u
+#define SMP_VENEER_BR  0xd61f0200u
+
 static bool smp_old_vector_owned(u64 locked)
 {
-    u64 ro_start, ro_end;
+    u64 ro_start = UINT64_MAX, ro_end;
     u64 inherited_top = cur_boot_args.top_of_kernel_data;
     u64 image_start = (u64)_base;
     u64 image_end = (u64)_end;
 
-    if (memory_fw_ro_range(&ro_start, &ro_end) != 1 || !cur_boot_args.mem_size ||
-        cur_boot_args.phys_base > UINT64_MAX - cur_boot_args.mem_size ||
+    /* The CTRR firmware aperture is a T8140 interface. On T8152 require
+     * inherited RAM and the earlier image's vector tags and STACKBOT tail. */
+    if (memory_fw_ro_range(&ro_start, &ro_end) != 1) {
+        if (chip_id != T8152)
+            return false;
+        ro_start = UINT64_MAX;
+    }
+    if (!cur_boot_args.mem_size || cur_boot_args.phys_base > UINT64_MAX - cur_boot_args.mem_size ||
         locked < cur_boot_args.phys_base ||
         locked >= cur_boot_args.phys_base + cur_boot_args.mem_size || locked >= ro_start ||
         locked >= inherited_top || (locked >= image_start && locked < image_end))
@@ -171,7 +181,9 @@ static bool smp_old_vector_owned(u64 locked)
     if (limit - locked < 0x200 + sizeof("STACKBOT") - 1)
         return false;
     for (u64 off = 0; off <= 0x180; off += 0x80) {
-        if (read32(locked + off) != read32((u64)_vectors_start + off))
+        if (read32(locked + off) != read32((u64)_vectors_start + off) &&
+            !(chip_id == T8152 && !off && read32(locked) == SMP_VENEER_LDR &&
+              read32(locked + 4) == SMP_VENEER_BR))
             return false;
     }
     for (u64 p = locked + 0x200; p <= limit - (sizeof("STACKBOT") - 1); p += 8) {
@@ -195,14 +207,45 @@ static int smp_prepare_rvbar(const struct cpu_info *cpu)
     u64 locked = rvbar & RVBAR_ADDR;
     u64 target = (u64)_vectors_start;
 
-    if (locked == target || cpu_features->apple_sysregs_unlocked)
+    if (locked == target ||
+        (cpu_features->apple_sysregs_unlocked && (chip_id != T8152 || !(rvbar & RVBAR_LOCK))))
         return 0;
     /* A stage that moved above the chainloaded image keeps entry at its old base. */
     if (relocated_from && locked == old_vectors_start())
         return 0;
-    if (chip_id != T8140 || !(rvbar & RVBAR_LOCK)) {
+    if ((chip_id != T8140 && chip_id != T8152) || !(rvbar & RVBAR_LOCK)) {
         printf("SMP: RVBAR 0x%lx differs from vector 0x%lx; refusing start\n", locked, target);
         return -1;
+    }
+
+    if (chip_id == T8152) {
+        if (installed_relay == locked)
+            return read64(locked + 8) == target && read32(locked) == SMP_VENEER_LDR ? 0 : -1;
+        if (!smp_old_vector_owned(locked)) {
+            printf("SMP: RVBAR 0x%lx is not a verified earlier image vector\n", locked);
+            return -1;
+        }
+        u64 page = ALIGN_DOWN(locked, get_page_size());
+        if (mmu_active())
+            mmu_add_mapping(page, page, get_page_size(), MAIR_IDX_NORMAL, PERM_RW);
+        write64(locked + 8, target);
+        write32(locked + 4, SMP_VENEER_BR);
+        write32(locked, SMP_VENEER_LDR);
+        dc_cvac_range((void *)locked, 16);
+        sysop("dsb sy");
+        ic_ivau_range((void *)locked, 16);
+        sysop("dsb sy");
+        sysop("isb");
+        if (mmu_active())
+            mmu_add_mapping(page, page, get_page_size(), MAIR_IDX_NORMAL, PERM_RX);
+        if (read64(locked + 8) != target || read32(locked + 4) != SMP_VENEER_BR ||
+            read32(locked) != SMP_VENEER_LDR) {
+            printf("SMP: RVBAR veneer read-back failed at 0x%lx\n", locked);
+            return -1;
+        }
+        installed_relay = locked;
+        printf("SMP: installed RVBAR veneer at 0x%lx -> 0x%lx\n", locked, target);
+        return 0;
     }
 
     int64_t distance = (int64_t)target - (int64_t)locked;
@@ -798,7 +841,8 @@ static void smp_start_t8152(void)
             continue;
         const struct cpu_info *cpu = &cpu_info[i];
         u64 rvbar = read64(cpu->impl_reg);
-        if ((rvbar & RVBAR_LOCK) && (rvbar & RVBAR_ADDR) != (u64)_vectors_start) {
+        if ((rvbar & RVBAR_LOCK) && (rvbar & RVBAR_ADDR) != (u64)_vectors_start &&
+            smp_prepare_rvbar(cpu)) {
             smp_start_fail_mask |= BIT(i);
             break;
         }
@@ -1065,4 +1109,49 @@ u64 smp_get_release_addr(int cpu)
     target->args[2] = 0;
     target->args[3] = 0;
     return (u64)&target->target;
+}
+
+/* Separate from the callback slots: these remain usable with the MMU off. */
+struct kernel_park_slot {
+    u64 release, ready, sctlr;
+    u8 padding[128 - 3 * sizeof(u64)];
+} ALIGNED(128);
+static struct kernel_park_slot kernel_park[MAX_CPUS] SMP_SHARED;
+
+u64 smp_get_kernel_release_addr(int cpu)
+{
+    if (cpu < 0 || cpu >= MAX_CPUS || chip_id != T8152)
+        return 0;
+    return (u64)&kernel_park[cpu].release;
+}
+
+int smp_park_for_kernel(void)
+{
+    extern void smp_kernel_park(void);
+    if (chip_id != T8152 || board_id != 0x24 || smp_has_pending_calls())
+        return -1;
+    for (int cpu = 0; cpu < MAX_CPUS; cpu++) {
+        if (!smp_is_alive(cpu) || smp_get_mpidr(cpu) == (mrs(MPIDR_EL1) & 0xffffff))
+            continue;
+        struct kernel_park_slot *slot = &kernel_park[cpu];
+        memset(slot, 0, sizeof(*slot));
+        dc_civac_range(slot, sizeof(*slot));
+        /* The callback deliberately never returns; wait for its MMU-off ACK. */
+        int ret = smp_call4(cpu, smp_kernel_park, (u64)slot, 0, 0, 0);
+        if (ret && ret != SMP_TIMEOUT)
+            return -1;
+        u64 deadline = timeout_calculate(3000000);
+        do {
+            dc_civac_range(slot, sizeof(*slot));
+            if (slot->ready)
+                break;
+        } while (!timeout_expired(deadline));
+        if (slot->ready != 1 || (slot->sctlr & 0x1005))
+            return -1;
+        /* This is now a kernel park, no longer a pending Aura callback. */
+        spin_table[cpu].target = 0;
+        printf("SMP: CPU %d parked for Linux with MMU/cache off\n", cpu);
+    }
+    sysop("dsb sy");
+    return 0;
 }

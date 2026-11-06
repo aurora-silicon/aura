@@ -11,6 +11,7 @@ crate-type = [ "staticlib" ]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [dependencies]
+sha2 = { version = "0.10.9", default-features = false, features = ["force-soft"] }
 fatfs = { git = "https://github.com/aurora-silicon/fatfs", rev = "7d505fbfa37a945af5549517f47c1d2e87a8333e", default-features = false, features = ["lfn", "alloc", "explicit-fat32"], optional = true }
 sha1_smol = { version = "1.0.1" }
 uuid = {  version = "1.23", default-features = false, optional = true }
