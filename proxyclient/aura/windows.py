@@ -55,13 +55,13 @@ def validate_capabilities(value, framebuffer="native", guest_compatibility="none
     require(value & REQUIRED_CAPS == REQUIRED_CAPS, "resident lacks required Windows capabilities")
     if framebuffer == "bgra-shadow":
         require(value & FRAMEBUFFER_SHADOW, "resident lacks the framebuffer conversion backend")
-    if framebuffer != "native" or guest_compatibility != "none" or serial != "disabled":
+    if framebuffer != "native" or guest_compatibility != "none" or serial == "capture":
         require(value & CONFIGURATION, "resident lacks explicit Windows configuration")
     if n1 != "disabled":
         require(value & N1_HANDOFF, "resident lacks the N1 handoff producer")
     if reserved_memory:
         require(value & MEMORY_PREFLIGHT, "resident lacks read-only memory reservation preflight")
-    if serial != "disabled":
+    if serial == "capture":
         require(value & SERIAL_CAPTURE, "resident lacks framed Windows serial capture")
     return value & 0xffff
 
@@ -146,7 +146,7 @@ def plan_profile(filename):
     usb = profile.get("usb", "disabled")
     require(usb == "disabled", "USB handoff is not implemented; usb must be disabled")
     serial = profile.get("serial", "disabled")
-    require(serial in ("disabled", "capture"), "unsupported serial capture policy")
+    require(serial in ("disabled", "capture", "cdc"), "unsupported serial capture policy")
     n1 = profile.get("n1", "disabled")
     require(n1 in ("disabled", "j813-v1"), "unsupported N1 handoff profile")
     require(n1 == "disabled" or (chip == 0x8142 and model == "Mac17,3"),
@@ -297,7 +297,8 @@ def prepare_n1_handoff(hv):
 
 def source_manifest():
     root = Path(__file__).resolve().parents[1]
-    names = ("aura/windows.py", "aura/windows_serial.py", "aura/hv/__init__.py", "aura/proxy.py", "tools/boot_windows.py")
+    names = ("aura/windows.py", "aura/windows_serial.py", "aura/windows_cdc.py",
+             "aura/hv/__init__.py", "aura/proxy.py", "tools/boot_windows.py")
     return {name: hashlib.sha256((root / name).read_bytes()).hexdigest() for name in names}
 
 
@@ -333,12 +334,28 @@ class HardwareSession:
         from .proxy import AuraProxy, UartInterface
         self.iface = UartInterface(device)
         self.iface.tty_log = log
+        try:
+            # Features belong to the resident, not to this serial handle.
+            # Reopen can follow a CDC session that enabled checksum sentinels.
+            self.iface.nop()
+        except BaseException:
+            self.iface.dev.close()
+            raise
         self.proxy = AuraProxy(self.iface, debug=False)
         self.hv = None
         self.serial_capture = None
 
     def capabilities(self):
         return self.proxy.hv_windows_capabilities()
+
+    def validate_serial_transport(self, plan):
+        if plan.serial != "cdc":
+            return None
+        from .proxy import IODEV
+        iodev = self.proxy.iodev_whoami()
+        require(int(IODEV.USB0) <= iodev < int(IODEV.USB0) + 8,
+                "dedicated CDC logging requires a USB CDC proxy carrier")
+        return {"proxy_iodev": int(iodev)}
 
     def identity(self):
         from .adt import load_adt
@@ -367,6 +384,7 @@ class HardwareSession:
     def prepare(self, plan):
         validate_capabilities(self.capabilities(), plan.framebuffer, plan.guest_compatibility, plan.n1,
                               bool(plan.reserved_memory), plan.serial)
+        self.validate_serial_transport(plan)
         if plan.serial == "capture":
             from .windows_serial import WindowsSerialRecorder
             self.serial_capture = WindowsSerialRecorder(Path(self.iface.tty_log.name).parent)
@@ -434,9 +452,16 @@ class HardwareSession:
         return self.serial_capture.summary() if self.serial_capture is not None else {"mode": "disabled"}
 
 
-def launch_profile(filename, device, output, session_factory=HardwareSession):
+def launch_profile(filename, device, output, session_factory=HardwareSession, guest_serial_device=None):
     """Launch exactly the validated immutable image and preserve an honest receipt."""
     plan = plan_profile(filename)
+    if plan.serial == "cdc":
+        require(isinstance(guest_serial_device, str) and guest_serial_device,
+                "CDC logging requires an explicit guest serial device")
+        require(os.path.realpath(device) != os.path.realpath(guest_serial_device),
+                "guest serial device must differ from the proxy device")
+    else:
+        require(guest_serial_device is None, "guest serial device requires serial=cdc in the profile")
     output = Path(output).resolve()
     output.mkdir(parents=True, exist_ok=False)
     (output / "profile.json").write_bytes(plan.profile_bytes)
@@ -444,8 +469,10 @@ def launch_profile(filename, device, output, session_factory=HardwareSession):
               "profile_sha256": plan.profile_sha256, "images": plan.images,
               "host_sources": source_manifest(), "device": device,
               "combined_sha256": hashlib.sha256(plan.image).hexdigest(),
-              "hardware_qualified": False, "target_mutated": False, "windows_ready": False}
+              "hardware_qualified": False, "target_mutated": False, "windows_ready": False,
+              "serial": {"mode": plan.serial, "device": guest_serial_device}}
     session = None
+    cdc_recorder = None
     try:
         with (output / "console.log").open("w") as log:
             session = session_factory(device, log)
@@ -456,14 +483,24 @@ def launch_profile(filename, device, output, session_factory=HardwareSession):
             require(identity["chip_id"] == plan.chip_id and identity["model"] == plan.model,
                     "target identity does not match the Windows profile")
             report.update(capabilities=hex(caps), identity=identity)
+            if plan.serial == "cdc":
+                from .windows_cdc import CdcSerialRecorder
+                report["serial_transport"] = session.validate_serial_transport(plan)
+                cdc_recorder = CdcSerialRecorder(output, guest_serial_device)
+                cdc_recorder.wait_ready()
             report["target_mutated"] = True
             session.prepare(plan)
             report["loaded"] = session.load(plan)
-            if hasattr(session, "serial_summary"):
+            if cdc_recorder is not None:
+                cdc_recorder.check()
+                report["serial"] = cdc_recorder.summary()
+            elif hasattr(session, "serial_summary"):
                 report["serial"] = session.serial_summary()
             report["result"] = "guest-running"
             (output / "launch.json").write_text(json.dumps(report, indent=2) + "\n")
             result = session.start()
+            if cdc_recorder is not None:
+                cdc_recorder.check()
             require(result in (None, 0, 1, 2), "Windows guest returned an error")
             report["guest_exit_status"] = result
             report["result"] = {1: "guest-powered-off-unqualified",
@@ -477,9 +514,15 @@ def launch_profile(filename, device, output, session_factory=HardwareSession):
         raise
     finally:
         try:
-            if session is not None:
-                session.close()
+            try:
+                if cdc_recorder is not None:
+                    cdc_recorder.close()
+            finally:
+                if session is not None:
+                    session.close()
         finally:
-            if session is not None and hasattr(session, "serial_summary"):
+            if cdc_recorder is not None:
+                report["serial"] = cdc_recorder.summary()
+            elif plan.serial != "cdc" and session is not None and hasattr(session, "serial_summary"):
                 report["serial"] = session.serial_summary()
             (output / "launch.json").write_text(json.dumps(report, indent=2) + "\n")

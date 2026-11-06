@@ -33,8 +33,12 @@ jobs:
         run: |
           python proxyclient/tools/windows_launcher_e2e.py --out build/windows-admission
           python proxyclient/tools/windows_hv_e2e.py --out build/windows-host-hv
+          python proxyclient/tools/windows_session_e2e.py --out build/windows-session
+          python proxyclient/tools/windows_cdc_e2e.py --out build/windows-cdc
           python tools/windows_n1_e2e.py --output build/windows-n1
           python tools/windows_serial_e2e.py --output build/windows-serial
+          python tools/windows_vuart_e2e.py --output build/windows-vuart
+          python tools/windows_sgi_e2e.py --output build/windows-sgi
           python tools/windows_hv_smoke.py --build-only --chip-id 0x8142 --model Mac17,3 --output build/windows-hardware-probe
           python tools/windows_n1_smoke.py --build-only --output build/windows-n1-hardware-probe
       - uses: actions/upload-artifact@v7
@@ -49,7 +53,11 @@ jobs:
             build/windows-sha256.txt
             build/windows-admission
             build/windows-host-hv
+            build/windows-session
+            build/windows-cdc
             build/windows-hardware-probe
             build/windows-n1-hardware-probe
             build/windows-n1
             build/windows-serial
+            build/windows-vuart
+            build/windows-sgi

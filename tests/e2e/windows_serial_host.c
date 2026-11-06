@@ -31,8 +31,9 @@ typedef int32_t s32; typedef int64_t s64;
 #define DECLARE_SPINLOCK(n) int n = 0
 #define SPINLOCK_INIT 0
 typedef int spinlock_t;
-static void spin_lock(int *lock) { assert(!*lock); *lock = 1; }
-static void spin_unlock(int *lock) { assert(*lock); *lock = 0; }
+/* Aura locks recurse on the same CPU; preserve that contract in the model. */
+static void spin_lock(int *lock) { ++*lock; }
+static void spin_unlock(int *lock) { assert(*lock > 0); --*lock; }
 static bool mmu_active(void) { return true; }
 static bool is_boot_cpu(void) { return true; }
 static u32 chip_id;
@@ -64,14 +65,21 @@ static ssize_t model_atomic(void *opaque, const void *buffer, size_t count) {
     return count;
 }
 static bool no_write(void *opaque) { (void)opaque; return false; }
+static bool discard_ready(void *opaque) { (void)opaque; return true; }
+static ssize_t discard_write(void *opaque, const void *b, size_t n) {
+    (void)opaque; (void)b; return n;
+}
 static ssize_t no_read(void *opaque) { (void)opaque; return 0; }
 static ssize_t forbidden_write(void *opaque, const void *b, size_t n) {
     (void)opaque; (void)b; (void)n; assert(!"blocking write reached"); return -1;
 }
 static const struct iodev_ops atomic_ops = {.write=forbidden_write, .write_atomic=model_atomic};
 static const struct iodev_ops empty_ops = {.can_read=no_read, .can_write=no_write};
+static const struct iodev_ops vuart_ops = {
+    .can_read=no_read, .can_write=discard_ready, .write=discard_write
+};
 struct iodev iodev_uart = {.ops=&empty_ops}, iodev_fb = {.ops=&empty_ops},
-    iodev_log = {.ops=&empty_ops}, iodev_usb_vuart = {.ops=&empty_ops},
+    iodev_log = {.ops=&empty_ops}, iodev_usb_vuart = {.ops=&vuart_ops},
     iodev_dockchannel_uart = {.ops=&atomic_ops};
 #include "../../src/iodev.c"
 #include "../../src/uartproxy.c"
@@ -80,6 +88,7 @@ struct exc_info;
 static void uart_clear_irqs(void) { assert(!"physical UART should be unused in replay"); }
 static void aic_set_sw(int irq, bool on) { (void)irq; (void)on; }
 static void usb_iodev_vuart_setup(iodev_id_t id) { (void)id; }
+static void usb_dwc3_vuart_poll(void *dev) { (void)dev; }
 static int hv_map_hook(u64 base, bool (*fn)(struct exc_info *,u64,u64*,bool,int),u64 size) {
     (void)base; (void)fn; (void)size; return 0;
 }

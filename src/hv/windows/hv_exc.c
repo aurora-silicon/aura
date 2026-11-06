@@ -2278,14 +2278,15 @@ static void hv_gic_cpuif_send_sgi(u64 val)
     u64 aff1 = (val >> 16) & 0xff;
     u64 aff2 = (val >> 32) & 0xff;
     u64 aff3 = (val >> 48) & 0xff;
+    u64 rs = (val >> 44) & 0xf;
     u16 targets = val & 0xffff;
     int self = smp_id();
-    int count = smp_cpu_count();
-
-    if (count > MAX_CPUS)
-        count = MAX_CPUS;
-
-    for (int cpu = 0; cpu < count; cpu++) {
+    /* Use the same frame-to-physical-CPU map as the architectural SGI path.
+     * A secondary count excludes the BSP and cannot bound sparse CPU IDs. */
+    for (u16 frame = 0; frame < hv_vgic3_num_cpus(); frame++) {
+        int cpu = hv_vgic3_cpu_for_frame(frame);
+        if (cpu < 0)
+            continue;
         if (irm) {
             /* Routing mode 1 is "everyone but me". */
             if (cpu == self)
@@ -2297,7 +2298,7 @@ static void hv_gic_cpuif_send_sgi(u64 val)
             if (((mpidr >> 8) & 0xff) != aff1 || ((mpidr >> 16) & 0xff) != aff2 ||
                 ((mpidr >> 32) & 0xff) != aff3)
                 continue;
-            if (aff0 >= 16 || !(targets & (1u << aff0)))
+            if ((aff0 >> 4) != rs || !(targets & (1u << (aff0 & 0xf))))
                 continue;
         }
 

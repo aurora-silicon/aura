@@ -9,8 +9,14 @@ personality and a matching Mu image.
 
 - A normal, old or incompatible Aura resident must be rejected before changing
   baud, heap limits, registers, USB usage or guest mappings. Probe the read-only
-  Windows capability opcode first; a failed capability probe must not fall
+  Windows capability opcode before device setup; a failed capability probe must not fall
   through to the legacy allocator ABI.
+- A resident retains negotiated checksum features across host serial-port
+  reopen. A new interface starts with no features, so its first memory read
+  can disagree with the resident after another CDC session enabled checksum
+  sentinels. Negotiate the ordinary framed NOP on each new connection before
+  any proxy request or memory read. This must not bootstrap baud rates or
+  allocate target memory; a failed negotiation must close the new connection.
 - A malformed profile, wrong image hash, path, entry point, chip or model must
   fail before target mutation. Read identity from boot arguments and ADT using
   bounded reads without constructing the allocating ProxyUtils object.
@@ -184,6 +190,18 @@ incomplete. This does not establish Windows readiness or provide bidirectional
 KD. Unsupported atomic carriers reject capture configuration before guest
 entry. See the [serial protocol and replay procedure](windows-serial-capture.md).
 
+Set `"serial": "cdc"` to log from a separate, explicitly selected guest CDC
+port. Supply `--guest-serial-device` along with the primary `--device`; they
+must resolve to different paths. The primary proxy must identify itself as a
+USB CDC carrier, which is how Aura binds the separate guest UART pipe. Select
+both ports from the same intended physical target; the launcher does not infer
+or discover their relationship. This mode needs no framed-capture capability
+and does not enable configuration bit 2. It opens the guest port with DTR
+asserted and starts draining before target preparation. The same raw/readable
+artifact names are produced, but the receipt records that raw CDC has no
+verified target drop count or final marker. Reader errors are retained and
+reported; no background reader issues proxy commands.
+
 `n1` defaults to `disabled`, which removes any stale N1 handoff property and
 never invokes the producer. `j813-v1` is an explicit opt-in restricted to
 chip `0x8142`, model `Mac17,3`, and resident capability bit 5. After successful
@@ -226,6 +244,11 @@ retain the existing loader behavior and do not establish fixed-handoff safety.
 python3 proxyclient/tools/boot_windows.py validate --profile local-profile.json
 python3 proxyclient/tools/boot_windows.py boot --profile local-profile.json \
   --device /dev/cu.EXPLICIT_RESIDENT_DEVICE --out /tmp/windows-run-UNIQUE
+
+# With serial="cdc" in the profile:
+python3 proxyclient/tools/boot_windows.py boot --profile local-cdc-profile.json \
+  --device /dev/cu.EXPLICIT_PROXY_CDC --guest-serial-device /dev/cu.EXPLICIT_GUEST_CDC \
+  --out /tmp/windows-cdc-run-UNIQUE
 ```
 
 Validation is offline and opens no device. Boot checks capabilities and live
@@ -238,6 +261,12 @@ machine shutdown/reboot or that Windows reached readiness. A complete hardware
 acceptance receipt must additionally identify the resident build, Mu build,
 physical target and observed Windows milestones.
 
+Every new Windows transport session first negotiates the standard proxy NOP
+features. The resident can retain checksum settings from an earlier CDC
+connection or diagnostic tool; the new host must not assume its local default
+matches. This handshake does not change baud rate, allocate memory or initialize
+the hypervisor. A failed handshake closes the newly opened connection.
+
 An exception forwarded to Python requests guest exit and reports an error;
 the Windows path never opens the generic interactive exception shell. Guest
 return and error restore the prior host SIGINT/SIGQUIT handlers and serial
@@ -249,6 +278,8 @@ device recovery path before loading a fresh resident image.
 ```sh
 python3 proxyclient/tools/windows_launcher_e2e.py --out /tmp/windows-admission-UNIQUE
 python3 proxyclient/tools/windows_hv_e2e.py --out /tmp/windows-host-hv-UNIQUE
+python3 proxyclient/tools/windows_session_e2e.py --out /tmp/windows-session-UNIQUE
+python3 proxyclient/tools/windows_cdc_e2e.py --out /tmp/windows-cdc-UNIQUE
 ```
 
 The first exercises the real profile loader, CLI and launch orchestration with

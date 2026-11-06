@@ -33,6 +33,35 @@ decoder and HV handler. It must retain frames, raw capture, readable capture,
 source hashes, results, and its replay command. This is offline evidence;
 physical KIS/Mu/Windows capture still requires hardware validation.
 
+### Dedicated CDC reader failure model, before implementation
+
+- CDC logging must use an explicitly selected guest port, distinct from the
+  primary proxy even through filesystem aliases. Missing, reused or unexpected
+  guest-port arguments must fail before either port is opened; never discover
+  a substitute or infer a device from the Mac model.
+- Open the guest port with DTR asserted and begin draining before guest entry.
+  Validate the primary target first. Failure to open the requested logging
+  port must prevent target preparation and close every resource already owned.
+- The read loop must tolerate empty timed reads, arbitrary binary bytes, split
+  text and large bursts. It must never write incoming bytes to the proxy, feed
+  them to a shell, or emit terminal controls in the readable log.
+- Disconnect, disk errors and unexpected reader termination must appear in the
+  launch receipt. An error observed before target preparation prevents entry;
+  an error during guest execution is reported without issuing concurrent proxy
+  commands from the reader thread.
+- Stop, read cancellation, thread join and port closure have bounded waits.
+  A blocked reader must not indefinitely hang launch cleanup. Do not close
+  log files underneath a still-running writer; record failure to stop and let
+  the reader own its final file cleanup.
+- Raw CDC carries no framed sequence, cumulative target drop count or FINAL
+  marker. Its receipt must not claim completeness or lossless capture from a
+  clean host shutdown, zero errors or nonempty logs. Guest UART output still
+  does not establish Windows readiness or a functioning KD session.
+- Existing disabled and framed-capture profiles must retain their behavior.
+  Replay full launcher admission/prepare/start/cleanup with modeled serial
+  endpoints, preserve raw/log/receipt artifacts, and prove live draining,
+  pre-entry rejection, read failure and cleanup on guest exceptions.
+
 ## Use and scope
 
 Add `"serial": "capture"` to the hash-bound Windows launch profile, then use
@@ -59,6 +88,8 @@ producer may generate no Windows serial output. A firmware line is not proof
 that the Windows kernel reached readiness.
 
 ## Wire contract
+
+The following wire contract applies to `serial="capture"`, not raw CDC.
 
 Event ID `0x80` uses the existing `REQ_EVENT` envelope and its negotiated
 checksum mode. Its little-endian payload is `struct <HHIQHH>` followed by the
