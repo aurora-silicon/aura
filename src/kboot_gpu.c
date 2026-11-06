@@ -3674,6 +3674,154 @@ disable:
 
 int dt_set_gpu_m4(void *dt);
 
+/*
+ * T6041 (M4 Max).
+ *
+ * The driver runs a static profile per loaded firmware build on T6041, so only what differs
+ * between units and boots comes from here: the operating points (one voltage per cluster), the
+ * CS and AFR tables, the UAT and firmware regions (from the same ADT properties as on T6040) and
+ * the OS firmware version. The GPU is neither powered nor read.
+ *
+ * The fill runs only when the device tree enables the GPU. Anything unexpected disables the GPU
+ * node again, and the regions stay disabled unless everything was published.
+ */
+#define T6041_CLUSTERS 4
+
+static int dt_set_gpu_t6041(void *dt)
+{
+    int gpu = fdt_path_offset(dt, "gpu");
+    if (gpu < 0)
+        return 0;
+    if (fdt_node_check_compatible(dt, gpu, "apple,agx-t6041"))
+        return 0;
+
+    const char *status = fdt_getprop(dt, gpu, "status", NULL);
+    if (status && strcmp(status, "okay") && strcmp(status, "ok")) {
+        printf("FDT: GPU: T6041 GPU is disabled in the device tree, not filling it\n");
+        return 0;
+    }
+
+    size_t touched = 0;
+    int sgx = adt_path_offset(adt, "/arm-io/sgx");
+    u32 count, tables, num_states, len;
+    if (sgx < 0 || ADT_GETPROP(adt, sgx, "perf-state-count", &count) != sizeof(count) ||
+        ADT_GETPROP(adt, sgx, "perf-state-table-count", &tables) != sizeof(tables) ||
+        ADT_GETPROP(adt, sgx, "gpu-num-perf-states", &num_states) != sizeof(num_states) ||
+        count != T6040_OPPS || num_states != count - 1 || tables != T6041_CLUSTERS) {
+        printf("FDT: GPU: invalid T6041 raw OPP counts\n");
+        goto disable;
+    }
+
+    /* Operating point 0 is the off state; every cluster runs the same clocks. */
+    const struct perf_state *states = adt_getprop(adt, sgx, "perf-states", &len);
+    if (!states || len != count * tables * sizeof(*states))
+        goto disable;
+    for (u32 j = 0; j < tables; j++)
+        if (states[j * count].freq)
+            goto disable;
+    for (u32 j = 0; j < tables; j++)
+        for (u32 i = 1; i < count; i++)
+            if (!states[j * count + i].freq || states[j * count + i].freq != states[i].freq ||
+                states[j * count + i].volt < 400 || states[j * count + i].volt > 1300)
+                goto disable;
+
+    const struct aux_perf_states *aux[2];
+    const char *aux_name[2] = {"cs-perf-states", "afr-perf-states"};
+    for (int j = 0; j < 2; j++) {
+        aux[j] = adt_getprop(adt, sgx, aux_name[j], &len);
+        if (!aux[j] || len < sizeof(*aux[j]) || aux[j]->dies != 1 || aux[j]->count < 2 ||
+            aux[j]->count > MAX_PSTATES ||
+            len < sizeof(*aux[j]) + aux[j]->count * sizeof(aux[j]->states[0]))
+            goto disable;
+        for (u32 i = 0; i < aux[j]->count; i++)
+            if (!aux[j]->states[i].freq || aux[j]->states[i].volt < 400000 ||
+                aux[j]->states[i].volt > 1300000)
+                goto disable;
+    }
+
+    int asc = adt_path_offset(adt, "/arm-io/gfx-asc");
+    if (asc < 0)
+        goto disable;
+    const struct adt_segment_ranges *segments = adt_getprop(adt, asc, "segment-ranges", &len);
+    if (!segments || len != 2 * sizeof(*segments))
+        goto disable;
+
+    u64 region_base[ARRAY_SIZE(t6040_regions)], region_size[ARRAY_SIZE(t6040_regions)];
+    for (size_t i = 0; i < ARRAY_SIZE(t6040_regions); i++) {
+        char prop[64];
+        if (t6040_regions[i].name) {
+            snprintf(prop, sizeof(prop), "%s-base", t6040_regions[i].name);
+            if (ADT_GETPROP(adt, sgx, prop, &region_base[i]) != sizeof(u64))
+                goto disable;
+            snprintf(prop, sizeof(prop), "%s-size", t6040_regions[i].name);
+            if (ADT_GETPROP(adt, sgx, prop, &region_size[i]) != sizeof(u64))
+                goto disable;
+        } else {
+            region_base[i] = segments[0].phys;
+            region_size[i] = segments[0].size;
+        }
+        if (!region_base[i] || !region_size[i] || (region_base[i] & (SZ_16K - 1)) ||
+            (region_size[i] & (SZ_16K - 1)) || region_base[i] > UINT64_MAX - region_size[i] ||
+            region_base[i] + region_size[i] > (1ULL << 42) ||
+            fdt_path_offset(dt, t6040_regions[i].path) < 0)
+            goto disable;
+        for (size_t j = 0; j < i; j++)
+            if (region_base[i] < region_base[j] + region_size[j] &&
+                region_base[j] < region_base[i] + region_size[i])
+                goto disable;
+    }
+    if (segments[1].phys != region_base[4] || segments[1].size != region_size[4])
+        goto disable;
+    int table =
+        t6040_opp_table(dt, gpu, "operating-points-v2", count, T6041_CLUSTERS * sizeof(u32));
+    if (table < 0 || t6040_opp_table(dt, gpu, "apple,cs-opp", aux[0]->count, sizeof(u32)) < 0 ||
+        t6040_opp_table(dt, gpu, "apple,afr-opp", aux[1]->count, sizeof(u32)) < 0)
+        goto disable;
+
+    /* Everything is validated. Fill the GPU node, then publish the reserved regions last. */
+    int opp;
+    u32 i = 0;
+    fdt_for_each_subnode(opp, dt, table)
+    {
+        fdt32_t volts[T6041_CLUSTERS];
+        for (u32 j = 0; j < T6041_CLUSTERS; j++)
+            volts[j] = cpu_to_fdt32(states[i + j * count].volt * 1000);
+        if (fdt_setprop_inplace(dt, opp, "opp-microvolt", volts, sizeof(volts)) ||
+            fdt_setprop_inplace_u64(dt, opp, "opp-hz", states[i].freq))
+            goto disable;
+        i++;
+    }
+    if (fdt_set_aux_opp(dt, gpu, "apple,cs-opp", aux[0], 1) ||
+        fdt_set_aux_opp(dt, gpu, "apple,afr-opp", aux[1], 1))
+        goto disable;
+    gpu = fdt_path_offset(dt, "gpu");
+    if (gpu < 0 || firmware_set_fdt(dt, gpu, "apple,firmware-version", &os_firmware))
+        goto disable;
+
+    while (touched < ARRAY_SIZE(t6040_regions)) {
+        size_t r = touched++;
+        if (dt_set_resvmem(dt, t6040_regions[r].path, region_base[r], region_size[r]))
+            goto disable;
+    }
+
+    printf("FDT: GPU: T6041 top state %u MHz, OS firmware %s\n", states[count - 1].freq / 1000000,
+           os_firmware.string);
+    return 0;
+
+disable:
+    /* A region published before a failure would stay reserved for a disabled GPU. */
+    for (size_t r = 0; r < touched; r++) {
+        int node = fdt_path_offset(dt, t6040_regions[r].path);
+        if (node >= 0 && fdt_setprop_string(dt, node, "status", "disabled"))
+            return -1;
+    }
+    gpu = fdt_path_offset(dt, "gpu");
+    if (gpu >= 0 && fdt_setprop_string(dt, gpu, "status", "disabled"))
+        return -1;
+    printf("FDT: GPU: invalid T6041 ADT data, disabling GPU\n");
+    return 0;
+}
+
 int dt_set_gpu(void *dt)
 {
     if (chip_id == T8132)
@@ -3686,6 +3834,9 @@ int dt_set_gpu(void *dt)
 
     if (chip_id == T6040)
         return dt_set_gpu_t6040(dt);
+
+    if (chip_id == T6041)
+        return dt_set_gpu_t6041(dt);
 
     bool has_cs_afr = false;
     int (*calc_power)(u32 count, u32 table_count, const struct perf_state *core,
