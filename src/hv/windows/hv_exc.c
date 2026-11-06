@@ -40,7 +40,6 @@ extern spinlock_t bhl;
  */
 static bool t8142_sp_el0_repair_logged[MAX_CPUS];
 static bool t8142_sysreg_assist_logged;
-static bool t8142_sysreg_assist_ready_reported;
 #endif
 
 /*
@@ -5859,17 +5858,6 @@ static void hv_exc_exit(struct exc_info *ctx)
             t8142_sp_el0_repair_logged[smp_id()] = true;
             printf("HV: T8142: repaired truncated Mu SP_EL0 %#lx -> %#lx on CPU %u\n", truncated_sp,
                    ctx->sp[0], smp_id());
-        }
-
-        /*
-         * Reaching this repair proves that Mu has installed VBAR_EL1, brought
-         * up its AIC timer path, and supplied a usable firmware stack.  Yield
-         * once so an opt-in host debugger can patch Mu's exception vectors
-         * before PartitionDxe or the Windows loader can wedge silently.
-         */
-        if (!t8142_sysreg_assist_ready_reported) {
-            t8142_sysreg_assist_ready_reported = true;
-            hv_exc_proxy(ctx, START_HV, HV_SYSREG_ASSIST_READY, NULL);
         }
     }
 #endif
