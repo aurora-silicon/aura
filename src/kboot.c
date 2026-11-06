@@ -646,6 +646,14 @@ static int dt_set_ctxr_exec_window(int node)
     return 0;
 }
 
+static bool in_exec_window(u64 start, u64 size)
+{
+    u64 window, window_size;
+
+    return ctxr_exec_window(&window, &window_size) && start < window + window_size &&
+           start + size > window;
+}
+
 /* fdt_add_mem_rsv(), leaving out the window the OS owns. */
 static int dt_reserve_outside_exec_window(u64 start, u64 size)
 {
@@ -1067,7 +1075,14 @@ static int dt_reserve_bootloader_handoff(void)
             return -1;
         }
 
-        if (dt_reserve_outside_exec_window(start, size))
+        /* Whatever lives in this range is in the way of the kernel the window has to hold. */
+        if (in_exec_window(start, size)) {
+            printf("FDT: bootloader handoff 0x%lx..0x%lx overlaps the CTXR exec window\n", start,
+                   start + size);
+            return -1;
+        }
+
+        if (fdt_add_mem_rsv(dt, start, size))
             return -1;
 
         printf("FDT: reserved described bootloader handoff 0x%lx..0x%lx\n", start, start + size);
@@ -8738,10 +8753,19 @@ static int kboot_move_to_exec_window(void **kernel)
     if (!ctxr_exec_window(&base, &size))
         return 0;
 
+    if (hdr->magic != KERNEL_HEADER_MAGIC)
+        bail("kboot: the image at %p is not an arm64 kernel: can't place it in the window\n", hdr);
+
     u64 image_size = hdr->image_size, text_offset = hdr->text_offset;
     if (!image_size || image_size > size || text_offset > size - image_size)
         bail("kboot: kernel (offset 0x%lx size 0x%lx) does not fit the CTXR exec window\n",
              text_offset, image_size);
+
+    /* These stay where they are, and the kernel and its pool take the whole window. */
+    if (initrd_start && initrd_size && in_exec_window((u64)initrd_start, initrd_size))
+        bail("kboot: the initrd at %p overlaps the CTXR exec window\n", initrd_start);
+    if (in_exec_window((u64)dt, dt_bufsize))
+        bail("kboot: the device tree at %p overlaps the CTXR exec window\n", dt);
 
     void *dest = (void *)(base + text_offset);
     memmove(dest, hdr, image_size);

@@ -391,11 +391,18 @@ MOVE_HARNESS = r'''
 #include <stdlib.h>
 #include <string.h>
 typedef uint64_t u64;
-struct kernel_header { uint32_t code[2]; u64 text_offset; u64 image_size; };
+struct kernel_header {
+    uint32_t code[2]; u64 text_offset; u64 image_size; u64 flags, res2, res3, res4;
+    uint32_t magic, res5;
+};
+#define KERNEL_HEADER_MAGIC 0x644d5241
 #define bail(...) do { return -1; } while (0)
 #define sysop(op) ((void)0)
 static u64 window, window_size;
 static int cleaned, invalidated;
+static void *initrd_start, *dt;
+static size_t initrd_size;
+static int dt_bufsize;
 static bool ctxr_exec_window(u64 *b, u64 *s)
 { if (!window_size) return false; *b = window; *s = window_size; return true; }
 static void dc_cvac_range(void *p, size_t s) { cleaned = (p == (void *)(window + ((struct kernel_header *)p)->text_offset)); }
@@ -405,15 +412,35 @@ int main(void)
 {
     enum { SIZE = 0x8000 };
     static char source[SIZE], target[4 * SIZE];
+    static char elsewhere[SIZE];
     struct kernel_header *hdr = (void *)source;
     void *kernel = source;
 
-    /* No window: the kernel stays where the payload put it. */
+    /* No window: the kernel stays where the payload put it, whatever it looks like. */
     hdr->image_size = SIZE;
     assert(!kboot_move_to_exec_window(&kernel) && kernel == source);
     assert(!cleaned && !invalidated);
 
     window = (u64)target; window_size = sizeof(target);
+    /* image_size means nothing without the arm64 magic, and nothing moves. */
+    assert(kboot_move_to_exec_window(&kernel) == -1 && kernel == source && !cleaned);
+    hdr->magic = KERNEL_HEADER_MAGIC;
+
+    /* An initrd or device tree in the window refuses the move; elsewhere they are fine. */
+    dt = elsewhere; dt_bufsize = SIZE; initrd_start = elsewhere; initrd_size = SIZE;
+    initrd_start = target + sizeof(target) - 1;
+    assert(kboot_move_to_exec_window(&kernel) == -1 && kernel == source && !cleaned);
+    initrd_start = target - 1; initrd_size = 2;
+    assert(kboot_move_to_exec_window(&kernel) == -1 && kernel == source && !cleaned);
+    /* Touching the window's edge from below is not inside it. */
+    initrd_start = target - 2; initrd_size = 2;
+    assert(!kboot_move_to_exec_window(&kernel));
+    kernel = source; cleaned = invalidated = 0;
+    initrd_start = target; initrd_size = 0;
+    dt = target + SIZE;
+    assert(kboot_move_to_exec_window(&kernel) == -1 && kernel == source && !cleaned);
+    dt = elsewhere; initrd_start = NULL;
+
     memset(source + sizeof(*hdr), 0x5a, SIZE - sizeof(*hdr));
     assert(!kboot_move_to_exec_window(&kernel));
     assert(kernel == target && !memcmp(target, source, SIZE) && cleaned && invalidated);
@@ -441,8 +468,67 @@ int main(void)
 
 
 def test_kernel_moves_into_the_window(tmp_path):
-    body = function(kboot_source(), "kboot_move_to_exec_window")
+    source = kboot_source()
+    body = function(source, "in_exec_window") + "\n" + function(source, "kboot_move_to_exec_window")
     compile_and_run(tmp_path, "ctxr-exec-move", MOVE_HARNESS % body)
+
+
+HANDOFF_HARNESS = r'''
+#include <assert.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+typedef uint64_t u64;
+typedef uint64_t fdt64_t;
+#define SZ_16K 0x4000UL
+#define printf(...) ((void)0)
+#define fdt64_ld(p) (*(p))
+static void *dt;
+static u64 window, window_size, reg[2], rsv_start, rsv_size;
+static int nodes, deleted, reserved;
+static bool ctxr_exec_window(u64 *b, u64 *s)
+{ if (!window_size) return false; *b = window; *s = window_size; return true; }
+static int fdt_node_offset_by_compatible(void *p, int after, const char *c) { return nodes ? 1 : -1; }
+static const void *fdt_getprop(void *p, int node, const char *name, int *len)
+{ *len = sizeof(reg); return reg; }
+static const char *fdt_get_name(void *p, int node, int *len) { return "handoff"; }
+static int fdt_add_mem_rsv(void *p, u64 start, u64 size)
+{ reserved++; rsv_start = start; rsv_size = size; return 0; }
+static int fdt_del_node(void *p, int node) { nodes = 0; deleted++; return 0; }
+''' + "%s" + r'''
+#undef printf
+int main(void)
+{
+    /* No window: the described range is reserved, as ever. */
+    nodes = 1; reg[0] = 0x100000; reg[1] = 0x8000;
+    assert(!dt_reserve_bootloader_handoff());
+    assert(reserved == 1 && rsv_start == 0x100000 && rsv_size == 0x8000 && deleted == 1);
+
+    /* Clear of the window, on either side. */
+    window = 0x200000; window_size = 0x100000;
+    nodes = 1; reg[0] = 0x1f8000; reg[1] = 0x8000;
+    assert(!dt_reserve_bootloader_handoff() && reserved == 2);
+    nodes = 1; reg[0] = 0x300000; reg[1] = 0x8000;
+    assert(!dt_reserve_bootloader_handoff() && reserved == 3);
+
+    /* Touching it is a refusal: something lives there, and the kernel needs the room. */
+    nodes = 1; reg[0] = 0x1fc000; reg[1] = 0x8000;
+    assert(dt_reserve_bootloader_handoff() == -1 && reserved == 3 && deleted == 3);
+    nodes = 1; reg[0] = 0x2fc000; reg[1] = 0x8000;
+    assert(dt_reserve_bootloader_handoff() == -1 && reserved == 3);
+    nodes = 1; reg[0] = 0x100000; reg[1] = 0x400000;
+    assert(dt_reserve_bootloader_handoff() == -1 && reserved == 3);
+    puts("ctxr exec bootloader handoff OK");
+    return 0;
+}
+'''
+
+
+def test_a_described_handoff_in_the_window_refuses(tmp_path):
+    source = kboot_source()
+    body = function(source, "in_exec_window") + "\n" + function(source, "dt_reserve_bootloader_handoff")
+    compile_and_run(tmp_path, "ctxr-exec-handoff", HANDOFF_HARNESS % body)
 
 
 def test_no_path_enters_a_confined_kernel_without_a_window():
@@ -461,11 +547,9 @@ def test_no_path_enters_a_confined_kernel_without_a_window():
 
 def test_nothing_reserves_the_window_from_the_os():
     source = kboot_source()
-    # Each range that can span the window goes around it: the heap, the image, CTXR_D,
-    # a described bootloader handoff and the J713 high-water interval.
-    assert source.count("dt_reserve_outside_exec_window(") == 6
-    body = function(source, "dt_reserve_bootloader_handoff")
-    assert "dt_reserve_outside_exec_window(start, size)" in body and "fdt_add_mem_rsv" not in body
+    # Each range that can span the window goes around it: the heap, the image, CTXR_D
+    # and the J713 high-water interval.
+    assert source.count("dt_reserve_outside_exec_window(") == 5
     assert "dt_reserve_outside_exec_window(start, end - start))\n            bail(\"FDT: couldn't reserve the J713" in source
     # The firmware RO range stays reserved in every mode.
     assert "fdt_add_mem_rsv(dt, ro_start, ro_end - ro_start)" in source
