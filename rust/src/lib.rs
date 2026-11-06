@@ -25,6 +25,7 @@ pub mod gpu;
 #[cfg(feature = "chainload")]
 pub mod nvme;
 pub mod print;
+pub mod sha256;
 #[cfg(feature = "chainload")]
 pub mod trial;
 pub mod usb4;

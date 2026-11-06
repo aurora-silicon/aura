@@ -97,6 +97,8 @@ struct rtkit_dev {
     iova_domain_t *dart_iovad;
     sart_dev_t *sart;
     bool sram;
+    u64 phys_window_base;
+    size_t phys_window_size;
 
     u64 dva_base;
     u32 timeout_usec;
@@ -178,6 +180,27 @@ rtkit_dev_t *rtkit_init(const char *name, asc_dev_t *asc, dart_dev_t *dart,
 
     int iop_node = asc_get_iop_node(asc);
     ADT_GETPROP(adt, iop_node, "asc-dram-mask", &rtk->dva_base);
+
+    /* The already-running T8152 SMC grants firmware-owned SRAM buffers,
+     * including oslog, without a DART. Bind that exception to its ADT nub
+     * and the verified aperture; never accept arbitrary physical grants. */
+    if (chip_id == T8152 && sram) {
+        u64 base = 0;
+        u64 size = 0;
+        int smc_nub = adt_path_offset(adt, "/arm-io/smc/iop-smc-nub");
+        if (iop_node < 0 || iop_node != smc_nub ||
+            !adt_is_compatible(adt, iop_node, "iop-nub,rtbuddy-v2") ||
+            ADT_GETPROP(adt, iop_node, "region-base", &base) < 0 ||
+            ADT_GETPROP(adt, iop_node, "region-size", &size) < 0 || base != 0x30de00000UL ||
+            size != 0x120000) {
+            rtkit_printf("unqualified T8152 SRAM aperture\n");
+            free(rtk->name);
+            goto out_free_rtk;
+        }
+        rtk->phys_window_base = base;
+        rtk->phys_window_size = size;
+        rtkit_printf("adopted SMC SRAM window (%#lx, %#zx)\n", base, (size_t)size);
+    }
 
     return rtk;
 
@@ -312,8 +335,14 @@ static bool rtkit_handle_buffer_request(rtkit_dev_t *rtk, struct rtkit_message *
     size_t sz = n_4kpages << 12;
     u64 addr = FIELD_GET(MSG_BUFFER_REQUEST_IOVA, msg->msg);
 
+    if (rtk->phys_window_size && (bfr->bfr || !sz))
+        return false;
+
     if (rtk->sram) {
-        if (!addr) {
+        if (!addr || (rtk->phys_window_size &&
+                      (addr < rtk->phys_window_base ||
+                       addr - rtk->phys_window_base >= rtk->phys_window_size ||
+                       sz > rtk->phys_window_size - (addr - rtk->phys_window_base)))) {
             rtkit_printf("SRAM buffers needs to be provided by the IOP\n");
             return false;
         }
@@ -368,7 +397,9 @@ static bool rtkit_handle_oslog_request(rtkit_dev_t *rtk, struct rtkit_message *m
     }
 
     if (addr) {
-        if (rtk->sram && chip_id == T8152 && sz) {
+        if (rtk->phys_window_size && sz && addr >= rtk->phys_window_base &&
+            addr - rtk->phys_window_base < rtk->phys_window_size &&
+            sz <= rtk->phys_window_size - (addr - rtk->phys_window_base)) {
             /* As for SRAM buffers, the address is physical and the IOP owns
              * it: the T8152 SMC pre-allocates its oslog inside an
              * SPTM-protected window and only needs the address echoed back. */

@@ -47,6 +47,8 @@ bool smp_has_pending_calls(void);
 bool smp_is_alive(int cpu);
 uint64_t smp_get_mpidr(int cpu);
 u64 smp_get_release_addr(int cpu);
+u64 smp_get_kernel_release_addr(int cpu);
+int smp_park_for_kernel(void);
 void smp_set_wfe_mode(bool new_mode);
 void smp_send_ipi(int cpu);
 

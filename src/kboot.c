@@ -61,6 +61,7 @@
 
 static void *dt = NULL;
 static int dt_bufsize = 0;
+static bool dt_ready;
 static void *initrd_start = NULL;
 static size_t initrd_size = 0;
 static char *chosen_params[MAX_CHOSEN_PARAMS][2];
@@ -1930,7 +1931,9 @@ static int dt_set_cpus(void)
                 bail_cleanup("FDT: couldn't set cpu enable-method to psci\n");
             printf("FDT: CPU %d MPIDR=0x%lx psci\n", cpu, mpidr);
         } else {
-            u64 release_addr = smp_get_release_addr(idx);
+            u64 release_addr = chip_id == T8152 && fdt_getprop(dt, 0, "aurora,minimal-boot", NULL)
+                                   ? smp_get_kernel_release_addr(idx)
+                                   : smp_get_release_addr(idx);
             if (fdt_setprop_inplace_u64(dt, node, "cpu-release-addr", release_addr))
                 bail_cleanup("FDT: couldn't set cpu-release-addr property\n");
             printf("FDT: CPU %d MPIDR=0x%lx release-addr=0x%lx\n", cpu, mpidr, release_addr);
@@ -8622,8 +8625,63 @@ static int dt_set_fb2_t8152(void)
  * and beyond /chosen only the CPUs, MAC addresses, the second framebuffer and
  * the memory map are filled in here.
  */
+static int dt_set_display_t8152(void)
+{
+    int chosen = adt_path_offset(adt, "/chosen");
+    u64 dram, size;
+    if (chosen < 0 || ADT_GETPROP(adt, chosen, "dram-base", &dram) != 8 ||
+        ADT_GETPROP(adt, chosen, "dram-size", &size) != 8 || !size || dram > UINT64_MAX - size)
+        bail("FDT: invalid T8152 display DRAM bounds\n");
+    /* Reserve both physical views of every firmware segment, including the
+     * nub-only buffers. The firmware's remap field may differ from phys. */
+    const char *paths[] = {"/arm-io/dcp", "/arm-io/dcp/iop-dcp-nub"};
+    for (size_t i = 0; i < ARRAY_SIZE(paths); i++) {
+        int node = adt_path_offset(adt, paths[i]);
+        u32 len;
+        const struct adt_segment_ranges *seg =
+            node < 0 ? NULL : adt_getprop(adt, node, "segment-ranges", &len);
+        if (!seg || !len || len % sizeof(*seg))
+            bail("FDT: missing T8152 display segments: %s\n", paths[i]);
+        for (u32 s = 0; s < len / sizeof(*seg); s++) {
+            u64 addresses[] = {seg[s].phys, seg[s].remap};
+            for (size_t a = 0; a < ARRAY_SIZE(addresses); a++) {
+                u64 base = addresses[a], count = seg[s].size;
+                if (!count || base < dram || base > dram + size || count > dram + size - base)
+                    bail("FDT: invalid T8152 DCP segment %u\n", s);
+                u64 start = ALIGN_DOWN(base, SZ_16K);
+                u64 end = ALIGN_UP(base + count, SZ_16K);
+                if (fdt_add_mem_rsv(dt, start, end - start))
+                    bail("FDT: couldn't reserve T8152 DCP segment\n");
+            }
+        }
+    }
+    int trace[8];
+    u64 base, count;
+    if (adt_path_offset_trace(adt, "/vram", trace) < 0 ||
+        adt_get_reg(adt, trace, "reg", 0, &base, &count) || !count || base < dram ||
+        base > dram + size || count > dram + size - base || fdt_add_mem_rsv(dt, base, count))
+        bail("FDT: invalid T8152 VRAM reservation\n");
+    u64 fb = cur_boot_args.video.base, stride = cur_boot_args.video.stride;
+    u64 height = cur_boot_args.video.height;
+    if (!fb || !stride || !height || height > UINT64_MAX / stride || fb < dram ||
+        fb > dram + size || stride * height > dram + size - fb ||
+        fdt_add_mem_rsv(dt, ALIGN_DOWN(fb, SZ_16K),
+                        ALIGN_UP(fb + stride * height, SZ_16K) - ALIGN_DOWN(fb, SZ_16K)))
+        bail("FDT: invalid T8152 framebuffer reservation\n");
+    printf("FDT: retained live T8152 DCP firmware, VRAM and framebuffer\n");
+    return 0;
+}
+
 static int dt_prepare_t8152(void)
 {
+    if (fdt_getprop(dt, 0, "aurora,minimal-boot", NULL)) {
+        int aic = fdt_path_offset(dt, "/soc/interrupt-controller@301000000");
+        if (aic < 0 || fdt_node_check_compatible(dt, aic, "apple,t8152-aic3") ||
+            fdt_node_check_compatible(dt, aic, "apple,t8122-aic3"))
+            bail("FDT: T8152 requires the t8122 AIC3 fallback\n");
+        if (dt_set_serial_number() || dt_set_display_t8152() || dt_set_gpu(dt))
+            return -1;
+    }
     if (dt_set_cpus())
         return -1;
     if (dt_set_mac_addresses())
@@ -8635,6 +8693,7 @@ static int dt_prepare_t8152(void)
     if (fdt_pack(dt))
         bail("FDT: fdt_pack() failed\n");
 
+    dt_ready = true;
     printf("FDT prepared at %p\n", dt);
     return 0;
 }
@@ -8643,12 +8702,19 @@ static int dt_prepare_t8152(void)
  * what the device tree expects, and Linux owns the rest. */
 static int kboot_boot_t8152(void *kernel)
 {
+    if (!dt_ready)
+        bail("kboot: no successfully prepared device tree\n");
     if (smp_has_pending_calls()) {
         next_stage.entry = NULL;
         bail("kboot: refusing handoff while secondary callbacks are pending\n");
     }
     printf("Setting SMP mode to WFE...\n");
     smp_set_wfe_mode(true);
+    if (fdt_getprop(dt, 0, "aurora,minimal-boot", NULL) && smp_park_for_kernel()) {
+        next_stage.entry = NULL;
+        dt_ready = false;
+        bail("kboot: secondary kernel park failed\n");
+    }
     printf("Preparing to boot kernel at %p with fdt at %p\n", kernel, dt);
     next_stage.entry = kernel;
     next_stage.args[0] = (u64)dt;
@@ -8671,8 +8737,11 @@ int kboot_prepare_dt(void *fdt)
         dt = NULL;
     }
 
+    dt_ready = false;
+
     /* Need to init ISP early to carve out heap */
-    isp_init();
+    if (chip_id != T8152)
+        isp_init();
     /* Likewise the NV pages, before the retained heap extent is fixed. */
     if (nv2_requested() && monitor_required())
         nv2_prepare();
