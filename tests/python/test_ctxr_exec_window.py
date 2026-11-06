@@ -627,8 +627,9 @@ def test_nothing_reserves_the_window_from_the_os():
     # and the J713 high-water interval.
     assert source.count("dt_reserve_outside_exec_window(") == 5
     assert "dt_reserve_outside_exec_window(start, end - start))\n            bail(\"FDT: couldn't reserve the J713" in source
-    # The firmware RO range stays reserved in every mode.
-    assert "fdt_add_mem_rsv(dt, ro_start, ro_end - ro_start)" in source
+    # The firmware RO range stays reserved in every mode, before the EL1 guest goes its own way.
+    ro = function(source, "dt_reserve_secondary_ro")
+    assert ro.index("fdt_add_mem_rsv(dt, start, end - start)") < ro.index("if (!in_el2())")
     # Every confined chip reserves windows A to C, with no chip list.
     assert "        if (dt_reserve_ctxr_low_windows())\n" in source
 

@@ -698,48 +698,52 @@ static int dt_reserve_ctxr_low_windows(void)
     return 0;
 }
 
-/* T8140's firmware RO range: reserved, and kept out of the linear map, at either EL. */
-static int dt_reserve_firmware_ro(void)
-{
-    u64 ro_start, ro_end;
-    int ro_status = memory_fw_ro_range(&ro_start, &ro_end);
-
-    if (ro_status < 0)
-        bail("FDT: invalid firmware RO range\n");
-    if (!ro_status)
-        return 0;
-    if (fdt_add_mem_rsv(dt, ro_start, ro_end - ro_start))
-        bail("FDT: couldn't reserve the firmware RO range\n");
-
-    int resv = fdt_path_offset(dt, "/reserved-memory");
-    if (resv < 0)
-        bail("FDT: missing /reserved-memory for firmware RO range\n");
-    char name[48];
-    snprintf(name, sizeof(name), "aura-secondary-ro@%lx", ro_start);
-    int node = fdt_subnode_offset(dt, resv, name);
-    if (node < 0)
-        node = fdt_add_subnode(dt, resv, name);
-    if (node < 0)
-        bail("FDT: couldn't create firmware RO node\n");
-    fdt64_t reg[] = {cpu_to_fdt64(ro_start), cpu_to_fdt64(ro_end - ro_start)};
-    if (fdt_setprop(dt, node, "reg", reg, sizeof(reg)) || fdt_setprop_empty(dt, node, "no-map"))
-        bail("FDT: couldn't describe firmware RO node\n");
-    printf("FDT: reserved firmware RO [0x%lx, 0x%lx)\n", ro_start, ro_end);
-    return 0;
-}
-
 /*
- * On M4 and later the secondaries enforce CTRR_C and CTRR_D, and Linux crashes writing
- * there from one. Where aura knows the firmware RO range (T8140), CTRR_C is that range.
+ * What the secondaries can't write. T8140's firmware RO range is reserved, and kept out of
+ * the linear map, at either EL. On M4 and later the secondaries also enforce CTRR_C and
+ * CTRR_D, and Linux crashes writing there from one. Where aura knows the firmware RO range,
+ * CTRR_C is that range. CTRR_D: on J813 (M5) it covers the ~1 MiB below the iBoot-loaded image.
  */
-static int dt_reserve_secondary_ctrr(void)
+static int dt_reserve_secondary_ro(void)
 {
-    /* CTRR_D: on J813 (M5) it covers the ~1 MiB just below the iBoot-loaded image. */
     static const enum ctxr_range ranges[] = {CTRR_RANGE_C, CTRR_RANGE_D};
-    bool firmware_ro = memory_fw_ro_range(NULL, NULL);
+    u64 start, end;
+    int firmware_ro = memory_fw_ro_range(&start, &end);
 
+    if (firmware_ro < 0)
+        bail("FDT: invalid firmware RO range\n");
+    if (firmware_ro) {
+        if (fdt_add_mem_rsv(dt, start, end - start))
+            bail("FDT: couldn't reserve the firmware RO range\n");
+
+        int resv = fdt_path_offset(dt, "/reserved-memory");
+        if (resv < 0)
+            bail("FDT: missing /reserved-memory for firmware RO range\n");
+        char name[48];
+        snprintf(name, sizeof(name), "aura-secondary-ro@%lx", start);
+        int node = fdt_subnode_offset(dt, resv, name);
+        if (node < 0)
+            node = fdt_add_subnode(dt, resv, name);
+        if (node < 0)
+            bail("FDT: couldn't create firmware RO node\n");
+        fdt64_t reg[] = {cpu_to_fdt64(start), cpu_to_fdt64(end - start)};
+        if (fdt_setprop(dt, node, "reg", reg, sizeof(reg)) || fdt_setprop_empty(dt, node, "no-map"))
+            bail("FDT: couldn't describe firmware RO node\n");
+        printf("FDT: reserved firmware RO [0x%lx, 0x%lx)\n", start, end);
+    }
+    if (cpu_features->apple_sysregs_unlocked)
+        return 0;
+    if (!in_el2()) {
+        /*
+         * A guest under the aura hypervisor runs at EL1. The host keeps the
+         * SMP-RO range and starts the guest's CPUs itself, so the guest
+         * leaves it out. This is how the J616s guest boots.
+         */
+        printf("FDT: running at EL1, leaving %s to the host\n",
+               firmware_ro ? "CTRR_D" : "CTRR_C and CTRR_D");
+        return 0;
+    }
     for (size_t i = 0; i < ARRAY_SIZE(ranges); i++) {
-        u64 start, end;
         if ((!i && firmware_ro) || !ctxr_range(ranges[i], &start, &end))
             continue;
         if (fdt_add_mem_rsv(dt, start, end - start))
@@ -9036,18 +9040,8 @@ int kboot_prepare_dt(void *fdt)
             bail("FDT: couldn't reserve CTXR windows A to C\n");
     }
 
-    if (dt_reserve_firmware_ro())
+    if (dt_reserve_secondary_ro())
         return -1;
-    if (!cpu_features->apple_sysregs_unlocked && !in_el2()) {
-        /*
-         * A guest under the aura hypervisor runs at EL1. The host keeps the
-         * SMP-RO range and starts the guest's CPUs itself, so the guest
-         * leaves it out. This is how the J616s guest boots.
-         */
-        printf("FDT: running at EL1, leaving the M4+ SMP-RO range to the host\n");
-    } else if (!cpu_features->apple_sysregs_unlocked && dt_reserve_secondary_ctrr()) {
-        return -1;
-    }
 
     if (chip_id == T8132 && !fdt_node_check_compatible(dt, 0, "apple,j713")) {
         if (dt_reserve_bootloader_handoff())
