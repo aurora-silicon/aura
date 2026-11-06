@@ -33,6 +33,11 @@ boot-failure lifetime are tested separately; fdt_add_mem_rsv() aborts here.
 The record checks show that no path publishes an unrecorded table and that a
 refused allocation publishes nothing. The order of the record and the L1 store
 inside one call is not observable in this single-threaded model.
+
+Cache-clean failure model: the unlocked positive control must clean its one
+new, zeroed root before publishing it. A missing clean, a clean of an inherited
+root, an unexpected extra clean or publication before initialization must fail.
+The separate cold-root replay checks the architectural publication barrier.
 """
 from pathlib import Path
 import os
@@ -102,13 +107,10 @@ static void write32(u64 addr, u32 data);
 static u32 set32(u64 addr, u32 set);
 static int poll32(u64 addr, u32 mask, u32 target, u32 timeout);
 #define dma_wmb() ((void)0)
-/* Cold USB stream construction is outside this display-view model. */
-static void dc_cvac_range(void *addr, size_t size)
-{
-    (void)addr;
-    (void)size;
-    assert(!"cold-stream cache clean reached the display-view model");
-}
+/* The constructor's publication barrier is checked in the cold-root replay;
+ * this display-view model only validates the architectural operation. */
+#define sysop(op) assert(strcmp((op), "dsb sy") == 0)
+static void dc_cvac_range(void *addr, size_t size);
 bool is_heap(void *addr);
 static void *test_memalign(size_t align, size_t size);
 static void *test_calloc(size_t count, size_t size);
@@ -137,6 +139,8 @@ static unsigned int nwrites, reg_reads, tlbis;
 static unsigned int heap_used, heap_frees, live_objects, adt_lookups;
 static bool heap_exhausted, hand_out_far;
 static unsigned int far_frees;
+static void *expected_clean_root;
+static unsigned int root_cleans;
 /* Above the T8020 PTE address field (bits 39:14) and never mapped: touching it faults. */
 #define FAR_PAGE (1UL << 40)
 static u8 *snapshot;
@@ -161,6 +165,15 @@ static int poll32(u64 addr, u32 mask, u32 target, u32 timeout)
 {
     (void)timeout;
     return (read32(addr) & mask) == target ? 0 : -1;
+}
+static void dc_cvac_range(void *addr, size_t size)
+{
+    assert(expected_clean_root && addr == expected_clean_root && size == SZ_16K);
+    assert(root_cleans == 0 && nwrites == 0);
+    const u8 *bytes = addr;
+    for (size_t i = 0; i < size; i++)
+        assert(bytes[i] == 0);
+    root_cleans++;
 }
 bool is_heap(void *addr) { return (u64)addr >= PAGE(HEAP) && (u64)addr < PAGE(HEAP + HEAP_PAGES); }
 static void *test_memalign(size_t align, size_t size)
@@ -326,6 +339,8 @@ static void reset(bool locked, unsigned int roots, u32 tcr, bool enabled)
     nwrites = reg_reads = tlbis = heap_used = heap_frees = adt_lookups = nprops = setprops = 0;
     heap_exhausted = hand_out_far = gen3_tlbi_allowed = false;
     far_frees = gen3_tlbis = 0;
+    expected_clean_root = NULL;
+    root_cleans = 0;
     legacy_l2_count = 0;
     memset(legacy_l2_pages, 0, sizeof(legacy_l2_pages));
     chip_id = T8103;
@@ -434,10 +449,11 @@ static void stock_unlocked_view(void)
     /* Unlocked: the stock keep-PTs constructor adopts valid roots, creates the
      * missing one, enables the stream, then one initial invalidation. */
     reset(false, 0x7, 0, false);
+    expected_clean_root = at(HEAP);
     dart_dev_t *dart = open_view();
     for (int i = 0; i < 3; i++)
         assert(dart->l1[i] == at(ROOT + i));
-    assert(dart->l1[3] == at(HEAP) && heap_used == 1);
+    assert(dart->l1[3] == at(HEAP) && heap_used == 1 && root_cleans == 1);
     assert(*reg(ttbr_addr(3)) == (DART_T8020_TTBR_VALID |
            FIELD_PREP(DART_T8020_TTBR_ADDR, PAGE(HEAP) >> DART_T8020_TTBR_SHIFT)));
     assert(*reg(REGS + DART_T8020_ENABLED_STREAMS) & BIT(SID));

@@ -75,10 +75,27 @@ class HV(Reloadable):
     AIC_EVT_TYPE_HW = 1
     IRQTRACE_IRQ = 1
 
-    def __init__(self, iface, proxy, utils):
+    def __init__(self, iface, proxy, utils, *, windows=False):
         self.iface = iface
         self.p = proxy
         self.u = utils
+        self.windows = windows
+        self.windows_framebuffer = "native"
+        self.windows_guest_compatibility = "none"
+        self.windows_abort_reason = None
+        self.windows_usb = "disabled"
+        self.windows_usb_removed = []
+        self.windows_n1 = "disabled"
+        self.windows_mtp = "disabled"
+        self.windows_mtp_ready = False
+        self.windows_mtp_attempted = False
+        self.windows_initialized = False
+        self.windows_n1_attempted = False
+        self.windows_n1_ready = False
+        self.windows_n1_handoff = None
+        self.windows_memory_guard = None
+        self.windows_serial = "disabled"
+        self.windows_serial_recorder = None
         self.pac_mask = self.PAC_MASK
         self.user_pac_mask = self.PAC_MASK
         self.vbar_el1 = None
@@ -939,6 +956,9 @@ class HV(Reloadable):
             self._info_data = new_info
 
     def handle_exception(self, reason, code, info):
+        if self.windows:
+            self._abort_windows_guest(reason, code, info)
+            return
         self.exc_info = info
         self.exc_reason = reason
         if reason in (START.EXCEPTION_LOWER, START.EXCEPTION):
@@ -1012,6 +1032,9 @@ class HV(Reloadable):
             self._handle_sigint()
 
     def handle_bark(self, reason, code, info):
+        if self.windows:
+            self._abort_windows_guest(reason, code, info)
+            return
         self._in_handler = True
         self._sigint_pending = False
 
@@ -1020,6 +1043,13 @@ class HV(Reloadable):
         signal.signal(signal.SIGINT, self._handle_sigint)
 
         self.p.exit(0)
+
+    def _abort_windows_guest(self, reason, code, info):
+        event = {"reason": int(reason), "code": int(code), "info": hex(info)}
+        if self.windows_abort_reason is None:
+            self.windows_abort_reason = event
+        self.log(f"Windows guest forwarded an exception to Python: {event}")
+        self.p.exit(EXC_RET.EXIT_GUEST)
 
     def attach_virtio(self, dev, base=None, irq=None, verbose=False):
         if base is None:
@@ -1361,7 +1391,40 @@ class HV(Reloadable):
         self.print_tracer.log_file = fd
         self.iface.tty_log = fd
 
+    def _windows_adt_blob(self):
+        blob = self.adt.build()
+        capacity = align(self.u.ba.devtree_size)
+        if capacity <= 0 or len(blob) > capacity:
+            raise ValueError(f"Windows ADT needs {len(blob)} bytes, reserved capacity is {capacity}")
+        return blob
+
+    def handle_windows_serial(self, data):
+        if not self.windows or self.windows_serial != "capture" or self.windows_serial_recorder is None:
+            raise RuntimeError("unsolicited Windows serial event")
+        self.windows_serial_recorder.receive(data)
+
     def init(self):
+        if self.windows:
+            from ..windows import (CONFIGURATION, CONFIG_FRAMEBUFFER_SHADOW,
+                                   CONFIG_T8142_EXPERIMENTAL, CONFIG_SERIAL_CAPTURE,
+                                   CONFIG_SERIAL_CDC, CONFIG_MTP, MTP_DISABLED_PROPERTY,
+                                   MTP_RESERVED_BASE, MTP_RESERVED_SIZE, validate_capabilities)
+            caps = validate_capabilities(self.p.hv_windows_capabilities(), self.windows_framebuffer,
+                                         self.windows_guest_compatibility, self.windows_n1,
+                                         self.windows_memory_guard is not None, self.windows_serial,
+                                         self.windows_mtp)
+            if self.windows_mtp != "disabled":
+                guard = self.windows_memory_guard
+                if not guard or not any(r["base"] == MTP_RESERVED_BASE and
+                                        r["size"] == MTP_RESERVED_SIZE
+                                        for r in guard["reservations"]):
+                    raise ValueError("MTP requires its complete guarded physical reservation")
+            if self.windows_serial == "capture" and self.windows_serial_recorder is None:
+                raise ValueError("Windows serial capture requires an artifact recorder")
+            # The Windows C personality owns these architectural features.
+            self.emulate_sprr = False
+            if self.novm:
+                raise ValueError("Windows requires stage-2 translation")
         if self.emulate_sprr is None:
             self.emulate_sprr = not self.u.cpu_features.apple_sysregs_unlocked
         if self.emulate_sprr:
@@ -1372,6 +1435,21 @@ class HV(Reloadable):
         self.tba = self.u.ba.copy()
         self.device_addr_tbl = self.adt.build_addr_lookup()
         self.print_tracer = trace.PrintTracer(self, self.device_addr_tbl)
+        if self.windows:
+            self.setup_adt()
+            self._windows_adt_blob()
+            if caps & CONFIGURATION:
+                flags = (CONFIG_FRAMEBUFFER_SHADOW if self.windows_framebuffer == "bgra-shadow" else 0)
+                if self.windows_guest_compatibility == "t8142-experimental":
+                    flags |= CONFIG_T8142_EXPERIMENTAL
+                if self.windows_serial == "capture":
+                    flags |= CONFIG_SERIAL_CAPTURE
+                elif self.windows_serial == "cdc":
+                    flags |= CONFIG_SERIAL_CDC
+                if self.windows_mtp == "j813-v1":
+                    flags |= CONFIG_MTP
+                if self.p.hv_windows_configure(flags) != 0:
+                    raise RuntimeError("Windows hypervisor configuration rejected")
 
         # disable unused USB iodev early so interrupts can be reenabled in hv_init()
         for iodev in IODEV:
@@ -1380,7 +1458,23 @@ class HV(Reloadable):
                 self.p.iodev_set_usage(iodev, 0)
 
         print("Initializing hypervisor over iodev %s" % self.iodev)
-        self.p.hv_init()
+        if self.windows and self.windows_mtp != "disabled":
+            self.windows_mtp_attempted = True
+            previous_timeout = self.iface.dev.timeout
+            self.iface.dev.timeout = max(previous_timeout or 0, 12)
+            try:
+                result = self.p.hv_init()
+            finally:
+                self.iface.dev.timeout = previous_timeout
+        else:
+            result = self.p.hv_init()
+        if self.windows and result != 0:
+            raise RuntimeError(f"Windows hypervisor initialization failed: {result}")
+        if self.windows and self.windows_mtp == "j813-v1":
+            # The producer returns success only after preparation and initial
+            # stage-2 mapping. Its final remap is also required before entry.
+            self.windows_mtp_ready = True
+            self.adt["/chosen"]._properties[MTP_DISABLED_PROPERTY] = 0
 
         self.iface.set_handler(START.EXCEPTION_LOWER, EXC.SYNC, self.handle_exception)
         self.iface.set_handler(START.EXCEPTION_LOWER, EXC.IRQ, self.handle_exception)
@@ -1396,11 +1490,20 @@ class HV(Reloadable):
         self.iface.set_handler(START.HV, HV_EVENT.PANIC, self.handle_bark)
         self.iface.set_event_handler(EVENT.MMIOTRACE, self.handle_mmiotrace)
         self.iface.set_event_handler(EVENT.IRQTRACE, self.handle_irqtrace)
+        if self.windows and self.windows_serial == "capture":
+            self.iface.set_event_handler(EVENT.WINDOWS_SERIAL, self.handle_windows_serial)
 
         # Map MMIO ranges as HW by default
         for r in self.adt["/arm-io"].ranges:
             print(f"Mapping MMIO range: {r.parent_addr:#x} .. {r.parent_addr + r.size:#x}")
             self.add_tracer(irange(r.parent_addr, r.size), "HW", TraceMode.OFF)
+
+        if self.windows:
+            # Preserve C-owned HCR/HACR/MDCR and timer/PMU policy. The generic
+            # host setup below is for the ordinary Aura guest personality.
+            self.map_vuart()
+            self.windows_initialized = True
+            return
 
         hcr = HCR(self.u.mrs(HCR_EL2))
         if self.novm:
@@ -1609,7 +1712,81 @@ class HV(Reloadable):
         self.started_cpus[index] = (die, cluster, cpu)
         self.p.hv_start_secondary(index, entry)
 
+    def _disable_windows_usb(self):
+        import re
+        if self.windows_usb != "disabled":
+            raise ValueError("Windows USB handoff is not implemented")
+        removed = set()
+        for node in list(self.adt["/arm-io"]):
+            if re.fullmatch(r"(?:usb-drd|dart-usb)\d+", node.name):
+                path = "/arm-io/" + node.name
+                del self.adt[path]
+                removed.add(path)
+
+        def reference(value):
+            if isinstance(value, bytes):
+                try:
+                    value = value.rstrip(b"\0").decode("ascii")
+                except UnicodeDecodeError:
+                    return None
+            if not isinstance(value, str):
+                return None
+            if value.startswith("IODeviceTree:"):
+                value = value[len("IODeviceTree:"):]
+            value = value.split(":", 1)[0].rstrip("/")
+            if value.startswith("/device-tree/"):
+                value = value[len("/device-tree"):]
+            return value
+
+        aliases_removed = set()
+        def removed_reference(value):
+            value = reference(value)
+            return value is not None and (value in aliases_removed or any(
+                value == path or value.startswith(path + "/") for path in removed))
+
+        if "/aliases" in self.adt:
+            aliases = self.adt["/aliases"]
+            # Alias chains are bounded by the number of alias properties.
+            for _ in range(len(aliases._properties)):
+                stale = [key for key, value in aliases._properties.items()
+                         if key != "name" and removed_reference(value)]
+                if not stale:
+                    break
+                for key in stale:
+                    del aliases._properties[key]
+                    aliases_removed.add(key)
+        chosen = self.adt["/chosen"]
+        for key in ("stdout-path", "stdin-path", "linux,stdout-path"):
+            if key in chosen._properties and removed_reference(chosen._properties[key]):
+                del chosen._properties[key]
+        marker = "aura,windows-usb-disabled"
+        chosen._properties[marker] = 1
+        chosen._types[marker] = (Int32ul, False)
+        self.windows_usb_removed = sorted(removed) + ["/aliases/" + key for key in sorted(aliases_removed)]
+        for path in self.windows_usb_removed:
+            print(f"Windows USB disabled: removed {path}")
+
     def setup_adt(self):
+        if self.windows:
+            self._disable_windows_usb()
+            from ..windows import N1_BYTES, N1_PROPERTY, MTP_DISABLED_PROPERTY
+            chosen = self.adt["/chosen"]
+            if self.windows_mtp not in ("disabled", "j813-v1") or (
+                    self.windows_mtp == "j813-v1" and
+                    (chosen.chip_id != 0x8142 or self.adt.model != "Mac17,3")):
+                raise ValueError("MTP handoff requires the explicit J813 profile")
+            chosen._properties[MTP_DISABLED_PROPERTY] = 1
+            chosen._types[MTP_DISABLED_PROPERTY] = (Int32ul, False)
+            if self.windows_n1 == "j813-v1":
+                if chosen.chip_id != 0x8142 or self.adt.model != "Mac17,3":
+                    raise ValueError("N1 handoff requires the J813 target")
+                chosen._properties[N1_PROPERTY] = bytes(N1_BYTES)
+                chosen._types[N1_PROPERTY] = (Bytes(N1_BYTES), False)
+            elif self.windows_n1 == "disabled":
+                chosen._properties.pop(N1_PROPERTY, None)
+                chosen._types.pop(N1_PROPERTY, None)
+            else:
+                raise ValueError("Unsupported N1 handoff profile")
         self.adt["product"].product_name += " on aura hypervisor"
         self.adt["product"].product_description += " on aura hypervisor"
         if self.emulate_sprr:
@@ -1705,6 +1882,9 @@ class HV(Reloadable):
 
 
     def load_raw(self, image, entryoffset=0x800, use_xnu_symbols=False, vmin=0):
+        if self.windows:
+            self._validate_windows_n1_ready()
+            self._windows_adt_blob()
         sepfw_start, sepfw_length = self.u.adt["chosen"]["memory-map"].SEPFW
         tc_start, tc_size = self.u.adt["chosen"]["memory-map"].TrustCache
         if hasattr(self.u.adt["chosen"]["memory-map"], "preoslog"):
@@ -1731,34 +1911,26 @@ class HV(Reloadable):
         guest_base += align(self.u.ba.devtree_size)
         tc_base = guest_base
         guest_base += align(tc_size)
+        if self.windows:
+            # Arm UEFI runtime regions require 64-KiB alignment.
+            guest_base = align_up(guest_base, 0x10000)
         self.guest_base = guest_base
         mem_top = self.u.ba.phys_base + self.u.ba.mem_size
         mem_size = mem_top - phys_base
+        if self.windows and (entryoffset < 0 or entryoffset >= len(image) or entryoffset % 4 or
+                             guest_base + image_size > mem_top or mem_size <= 0):
+            raise ValueError("Mu payload/entry does not fit the guest memory range")
+        if self.windows and self.windows_memory_guard is not None:
+            from ..windows import validate_reserved_layout
+            validate_reserved_layout(self.windows_memory_guard, {
+                "heap_top": phys_base, "adt_base": self.adt_base, "trust_base": tc_base,
+                "guest_base": guest_base, "bootargs": guest_base + self.bootargs_off,
+                "image_end": guest_base + image_size})
 
         print(f"Physical memory: 0x{phys_base:x} .. 0x{mem_top:x}")
         print(f"Guest region start: 0x{guest_base:x}")
         
         self.entry = guest_base + entryoffset
-
-        print(f"Mapping guest physical memory...")
-        self.add_tracer(irange(self.ram_base, self.u.ba.phys_base - self.ram_base), "RAM-LOW", TraceMode.OFF)
-        self.add_tracer(irange(phys_base, self.u.ba.mem_size_actual - phys_base + self.ram_base), "RAM-HIGH", TraceMode.OFF)
-        self.unmap_carveouts()
-
-        print(f"Loading kernel image (0x{len(image):x} bytes)...")
-        self.u.compressed_writemem(guest_base, image, True)
-        self.p.dc_cvau(guest_base, len(image))
-        self.p.ic_ivau(guest_base, len(image))
-
-        print(f"Copying SEPFW (0x{sepfw_length:x} bytes)...")
-        self.p.memcpy8(guest_base + sepfw_off, sepfw_start, sepfw_length)
-
-        print(f"Copying TrustCache (0x{tc_size:x} bytes)...")
-        self.p.memcpy8(tc_base, tc_start, tc_size)
-
-        if hasattr(self.u.adt["chosen"]["memory-map"], "preoslog"):
-            print(f"Copying preoslog (0x{preoslog_size:x} bytes)...")
-            self.p.memcpy8(guest_base + preoslog_off, preoslog_start, preoslog_size)
 
         print(f"Adjusting addresses in ADT...")
         self.adt["chosen"]["memory-map"].SEPFW = (guest_base + sepfw_off, sepfw_length)
@@ -1787,6 +1959,36 @@ class HV(Reloadable):
             for nub in node:
                 if hasattr(nub, "segment_names"):
                     remove_oslog(nub)
+
+        if self.windows:
+            self._windows_adt_blob()
+
+        print(f"Mapping guest physical memory...")
+        self.add_tracer(irange(self.ram_base, self.u.ba.phys_base - self.ram_base), "RAM-LOW", TraceMode.OFF)
+        self.add_tracer(irange(phys_base, self.u.ba.mem_size_actual - phys_base + self.ram_base), "RAM-HIGH", TraceMode.OFF)
+        self.unmap_carveouts()
+
+        print(f"Loading kernel image (0x{len(image):x} bytes)...")
+        if self.windows:
+            # A WinPE RAM disk can exceed the whole proxy heap and is commonly
+            # already compressed. Bound both staging memory and each transfer.
+            chunk_size = 16 * 1024 * 1024
+            for offset in range(0, len(image), chunk_size):
+                self.u.compressed_writemem(guest_base + offset, image[offset:offset + chunk_size], True)
+        else:
+            self.u.compressed_writemem(guest_base, image, True)
+        self.p.dc_cvau(guest_base, len(image))
+        self.p.ic_ivau(guest_base, len(image))
+
+        print(f"Copying SEPFW (0x{sepfw_length:x} bytes)...")
+        self.p.memcpy8(guest_base + sepfw_off, sepfw_start, sepfw_length)
+
+        print(f"Copying TrustCache (0x{tc_size:x} bytes)...")
+        self.p.memcpy8(tc_base, tc_start, tc_size)
+
+        if hasattr(self.u.adt["chosen"]["memory-map"], "preoslog"):
+            print(f"Copying preoslog (0x{preoslog_size:x} bytes)...")
+            self.p.memcpy8(guest_base + preoslog_off, preoslog_start, preoslog_size)
 
         print(f"Setting up bootargs at 0x{guest_base + self.bootargs_off:x}...")
 
@@ -1953,7 +2155,17 @@ class HV(Reloadable):
     def run_code(self, code):
         exec(code, self.shell_locals)
 
+    def _validate_windows_n1_ready(self):
+        if (self.windows_mtp != "disabled" or self.windows_mtp_attempted) and not self.windows_mtp_ready:
+            raise RuntimeError("MTP handoff is incomplete; guest loading/entry is forbidden")
+        if (self.windows_n1 != "disabled" or self.windows_n1_attempted) and not self.windows_n1_ready:
+            raise RuntimeError("N1 handoff is incomplete; guest loading/entry is forbidden")
+
     def start(self):
+        if self.windows:
+            self._validate_windows_n1_ready()
+            # Validate the final tree before device or page-table mutations.
+            adt_blob = self._windows_adt_blob()
         print("Disabling other iodevs...")
         for iodev in IODEV:
             if iodev != self.iodev:
@@ -1961,12 +2173,14 @@ class HV(Reloadable):
                 self.p.iodev_set_usage(iodev, 0)
 
         print("Doing essential MMIO remaps...")
-        self.map_essential()
+        if not self.windows:
+            self.map_essential()
 
         print("Updating page tables...")
         self.pt_update()
 
-        adt_blob = self.adt.build()
+        if not self.windows:
+            adt_blob = self.adt.build()
         print(f"Uploading ADT (0x{len(adt_blob):x} bytes)...")
         assert len(adt_blob) <= align(self.u.ba.devtree_size)
         self.iface.writemem(self.adt_base, adt_blob)
@@ -1977,7 +2191,9 @@ class HV(Reloadable):
         print("Shutting down framebuffer...")
         self.p.fb_shutdown(True)
 
-        if self.emulate_sprr:
+        if self.windows:
+            pass  # Windows C entry owns SPRR/GXF and register routing.
+        elif self.emulate_sprr:
             print("Enabling emulated SPRR/GXF...")
             self.p.hv_sprr_set_active(True)
         elif self.u.cpu_features.apple_sysregs_unlocked:
@@ -1989,21 +2205,32 @@ class HV(Reloadable):
 
         print(f"Jumping to entrypoint at 0x{self.entry:x}")
 
-        self.iface.dev.timeout = None
-        self.default_sigint = signal.signal(signal.SIGINT, self._handle_sigint)
-
-        set_sigquit_stackdump_handler()
-
-        if self.wdt_cpu is not None:
-            self.p.hv_wdt_start(self.wdt_cpu)
-        # Does not return
-
-        self.started = True
-        for cpu_node in list(self.adt["cpus"]):
-            if cpu_node.state == "running":
-                break
-        self.started_cpus[cpu_node.cpu_id] = (getattr(cpu_node, "die_id", 0), cpu_node.cluster_id, cpu_node.cpu_id)
-        self.sysreg[cpu_node.cpu_id] = {}
-        self.p.hv_start(self.entry, self.guest_base + self.bootargs_off)
+        restore = None
+        if self.windows:
+            restore = (self.iface.dev.timeout, signal.getsignal(signal.SIGINT), signal.getsignal(signal.SIGQUIT))
+        try:
+            self.iface.dev.timeout = None
+            self.default_sigint = signal.signal(signal.SIGINT, self._handle_sigint)
+            set_sigquit_stackdump_handler()
+            if self.wdt_cpu is not None:
+                result = self.p.hv_wdt_start(self.wdt_cpu)
+                if self.windows and result != 0:
+                    raise RuntimeError(f"Windows watchdog startup failed: {result}")
+            self.started = True
+            for cpu_node in list(self.adt["cpus"]):
+                if cpu_node.state == "running":
+                    break
+            self.started_cpus[cpu_node.cpu_id] = (getattr(cpu_node, "die_id", 0), cpu_node.cluster_id, cpu_node.cpu_id)
+            self.sysreg[cpu_node.cpu_id] = {}
+            result = self.p.hv_start(self.entry, self.guest_base + self.bootargs_off)
+            if self.windows and self.windows_abort_reason is not None:
+                raise RuntimeError(f"Windows guest aborted: {self.windows_abort_reason}")
+            return result
+        finally:
+            if restore is not None:
+                self.started = False
+                self.iface.dev.timeout = restore[0]
+                signal.signal(signal.SIGINT, restore[1])
+                signal.signal(signal.SIGQUIT, restore[2])
 
 from .. import trace

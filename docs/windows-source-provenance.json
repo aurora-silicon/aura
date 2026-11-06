@@ -1,0 +1,105 @@
+{
+  "repository": "https://github.com/aurora-silicon/m1n1",
+  "commit": "69534d4899e20108d2c7a085565a7097509fa17f",
+  "files": [
+    {
+      "source": "src/hv.c",
+      "destination": "src/hv/windows/hv.c",
+      "sha256": "77e07434d286f819b54ff88f271400ade794a8c6d98309caa95a58a9964f4a56",
+      "git_blob": "950c8a276f79f25e2202788ca1cd9f10f0ba04e1"
+    },
+    {
+      "source": "src/hv.h",
+      "destination": "src/hv/windows/hv.h",
+      "sha256": "2ad95d7d68abe44e5f6fd5c693cf5deb3a78328b159ebc50495433054722af48",
+      "git_blob": "8f7293a4a8f9d7e531b742a729e4a303818d5203"
+    },
+    {
+      "source": "src/hv_exc.c",
+      "destination": "src/hv/windows/hv_exc.c",
+      "sha256": "4b08e239f0dc20ce7bd09cdc7e4dff61c244b66b000f578ead6e7694b3510a4e",
+      "git_blob": "dcd3fe146b011331860cb4430379366f097ec714"
+    },
+    {
+      "source": "src/hv_aic.c",
+      "destination": "src/hv/windows/hv_aic.c",
+      "sha256": "480860a269e202cfe12c847f1cd5567fcc751b88c53875e48c20ab7cb5c4f6e6",
+      "git_blob": "aa492cd248e6e77dca85f4ad49c98e9722fd83b9"
+    },
+    {
+      "source": "src/hv_asm.S",
+      "destination": "src/hv/windows/hv_asm.S",
+      "sha256": "749d2a0cff5cf7e1b97ab4a200676dbe19ba4106544c46fc7c7d26b96adbe128",
+      "git_blob": "634eb097fc4c30154e2e8b116dadf4d724bb9f1b"
+    },
+    {
+      "source": "src/hv_vgic.c",
+      "destination": "src/hv/windows/hv_vgic.c",
+      "sha256": "02df8c9eeeb3f8ca6d5bee67e77bceca5f72f841cbbae1308e97362966dd3040",
+      "git_blob": "e4aae8c198c699176315465ff64d3d19777f122c"
+    },
+    {
+      "source": "src/hv_vgic.h",
+      "destination": "src/hv/windows/hv_vgic.h",
+      "sha256": "2025147b2b123c2fddaf3c272c1d413c1d1140790cf40c2e111d88875e075bf3",
+      "git_blob": "5ab8d0d6ec60a9f13c3d24ec4ebf5b578ebcf888"
+    },
+    {
+      "source": "src/hv_psci.c",
+      "destination": "src/hv/windows/hv_psci.c",
+      "sha256": "fd93523c4af4e9228c7b02946d4dfba90ed6af4c52c8299fea76f1cb23b18923",
+      "git_blob": "4708fac1cb3bf5d0733372026dcf32bb6a5a1362"
+    },
+    {
+      "source": "src/hv_psci.h",
+      "destination": "src/hv/windows/hv_psci.h",
+      "sha256": "410ffeabcab5ce68d50e40a23987daf43f25045b2c665ce18d22c96ecbf622e2",
+      "git_blob": "8db1548d8d3858c2bb1e6d971542e78764c4eba8"
+    },
+    {
+      "source": "src/hv_aic_alias.c",
+      "destination": "src/hv/windows/hv_aic_alias.c",
+      "sha256": "9e458b1157e3087efd20984000f234f423ac681d93a52c41b4a2f72476da9e51",
+      "git_blob": "23483e7b68ed00570d64354f8d9cc1fa906834e2"
+    },
+    {
+      "source": "src/hv_aic_alias.h",
+      "destination": "src/hv/windows/hv_aic_alias.h",
+      "sha256": "edb9babc616213945eee3670dfbc734fc11261266a417230efcc4f0c42366c29",
+      "git_blob": "314d43e03e7af14b53d2d2cfc1190dee6ddd39b0"
+    },
+    {
+      "source": "src/fb_capture.c",
+      "destination": "src/hv/windows/fb_capture.c",
+      "sha256": "94a0e65889a2575be3e49cfffa0bee75870a6f3365c7006145c73ebd90309975",
+      "git_blob": "217da2df7b1360cf4491249fadd1c6b31291c9a3"
+    },
+    {
+      "source": "src/fb_capture.h",
+      "destination": "src/hv/windows/fb_capture.h",
+      "sha256": "1d74597d3d2a5bc5798d653e922c429d4c6bfea791f24e57871bad833f9e1262",
+      "git_blob": "ed5f8fb0157c7ee6bbb8d42c4ab6a12e55fe58c2"
+    },
+    {
+      "source": "src/arm_cpu_regs.h",
+      "destination": "src/hv/windows/windows_regs.h",
+      "sha256": "61db1a396412d1eaeea42b5c5b08d100f0b971bb881d94aa174b04d50cdc4136",
+      "git_blob": "143914c714c6ec9de810fa39e38d6cc642950e67",
+      "selection": "Only missing definitions referenced by the Windows personality and their dependencies"
+    },
+    {
+      "source": "src/aic_regs.h",
+      "destination": "src/hv/windows/windows_compat.h",
+      "sha256": "a2ec35e44098b6e9b6283c151ef735f77dbbea73b6068355752bc1f37233c056",
+      "git_blob": "c3d9482f71d206dabb0dbe8942127e07fc4c6de9",
+      "selection": "AIC global configuration offset and enable bit"
+    },
+    {
+      "source": "src/utils.h",
+      "destination": "src/hv/windows/windows_compat.h",
+      "sha256": "849d2c0e60c8e81ee9132c8a5ac1043affc8344831106a5bd6a1fefc37bff848",
+      "git_blob": "dfaa13d7c7f4815cc2d25f50675eb74006b9cb35",
+      "selection": "MPIDR affinity extraction definitions"
+    }
+  ]
+}

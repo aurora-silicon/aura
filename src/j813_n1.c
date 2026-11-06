@@ -14,6 +14,7 @@
 
 #include "j813_n1.h"
 #include "adt.h"
+#include "exception.h"
 #include "pmgr.h"
 #include "smc.h"
 #include "tunables.h"
@@ -84,21 +85,27 @@ static int j813_n1_reset(void)
     return ret;
 }
 
-static int j813_n1_link(void)
+struct j813_n1_regs {
+    u64 ecam, rc, phy, phyphy, phyip, axi, port, lane;
+};
+
+static int j813_n1_regs(struct j813_n1_regs *r)
 {
     int path[8];
-    u64 ecam, rc, phy, phyphy, phyip, axi, port, lane;
-
     if (adt_path_offset_trace(adt, APCIE, path) < 0)
         return -1;
-    if (j813_reg(path, 0, &ecam) || j813_reg(path, 1, &rc) || j813_reg(path, 2, &phy) ||
-        j813_reg(path, 3, &phyphy) || j813_reg(path, 4, &phyip) || j813_reg(path, 5, &axi) ||
-        j813_reg(path, 8, &port) || j813_reg(path, 10, &lane))
-        return -1;
-    u64 phycommon = phy + PHY_COMMON_OFF;
+    return j813_reg(path, 0, &r->ecam) || j813_reg(path, 1, &r->rc) || j813_reg(path, 2, &r->phy) ||
+                   j813_reg(path, 3, &r->phyphy) || j813_reg(path, 4, &r->phyip) ||
+                   j813_reg(path, 5, &r->axi) || j813_reg(path, 8, &r->port) ||
+                   j813_reg(path, 10, &r->lane)
+               ? -1
+               : 0;
+}
 
-    if (pmgr_adt_power_enable(APCIE))
-        return -1;
+static int j813_n1_fabric(const struct j813_n1_regs *r)
+{
+    u64 rc = r->rc, phy = r->phy, phyphy = r->phyphy, phyip = r->phyip, axi = r->axi;
+    u64 phycommon = phy + PHY_COMMON_OFF;
 
     /* _apcieGPInit: PHY tunables, reference PLL. */
     if (j813_tunables(APCIE, "apcie-phy-tunables", phy) ||
@@ -135,6 +142,13 @@ static int j813_n1_link(void)
     if (j813_wait(rc + 0x58, BIT(0), BIT(0), 250000, "gtb_initialized"))
         return -1;
 
+    return 0;
+}
+
+static int j813_n1_finish(const struct j813_n1_regs *r, bool *port_ready)
+{
+    int before = exc_count;
+    u64 ecam = r->ecam, port = r->port, lane = r->lane;
     if (j813_n1_reset()) {
         printf("j813-n1: SMC N1 reset release failed\n");
         return -1;
@@ -181,6 +195,13 @@ static int j813_n1_link(void)
         j813_tunables(APCIE_PORT, "pcie-rc-gen4-shadow-tunables", ecam))
         return -1;
     clear32(ecam + DBI_RO_WR, BIT(0));
+    if (port_ready) {
+        sysop("dsb sy");
+        sysop("isb");
+        if (exc_count != before)
+            return -1;
+        *port_ready = true;
+    }
     write32(port + PORT_LTSSMCTL, 1);
     if (j813_wait(port + PORT_LINKSTS, BIT(0), BIT(0), 1000000, "link up"))
         return -1;
@@ -192,6 +213,14 @@ static int j813_n1_link(void)
     printf("j813-n1: link up (0x%x), endpoint %04x:%04x\n", read32(port + PORT_LINKSTS),
            ident & 0xffff, ident >> 16);
     return (ident & 0xffff) == 0x106b ? 0 : -1;
+}
+
+static int j813_n1_link(void)
+{
+    struct j813_n1_regs r;
+    if (j813_n1_regs(&r) || pmgr_adt_power_enable(APCIE) || j813_n1_fabric(&r))
+        return -1;
+    return j813_n1_finish(&r, NULL);
 }
 
 int j813_n1_prepare(void *dt)
@@ -214,4 +243,67 @@ int j813_n1_prepare(void *dt)
     /* An untrained link would hang Linux's first config access. */
     printf("j813-n1: N1 PCIe bring-up failed; disabling the ECAM host\n");
     return fdt_setprop_string(dt, node, "status", "disabled") ? -1 : 0;
+}
+
+/* The producer owns admission and PERST; these stages never run by default. */
+static bool windows_fabric_ready, windows_finish_attempted;
+
+int j813_n1_validate_windows(void)
+{
+    struct j813_n1_regs r;
+    if (chip_id != T8142 || board_id != 0x24 || j813_n1_regs(&r))
+        return -1;
+    return tunables_validate_local(APCIE, "apcie-phy-tunables", 0x40000) ||
+                   tunables_validate_local(APCIE, "apcie-phy-ip-pll-tunables", 0x20000) ||
+                   tunables_validate_local(APCIE, "apcie-phy-ip-auspma-tunables", 0x20000) ||
+                   tunables_validate_local(APCIE, "apcie-axi2af-tunables", 0x1000000) ||
+                   tunables_validate_local(APCIE_PORT, "apcie-config-tunables", 0x8000) ||
+                   tunables_validate_local(APCIE_PORT, "pcie-rc-tunables", 0x1000) ||
+                   tunables_validate_local(APCIE_PORT, "pcie-rc-gen3-shadow-tunables", 0x1000) ||
+                   tunables_validate_local(APCIE_PORT, "pcie-rc-gen4-shadow-tunables", 0x1000)
+               ? -1
+               : 0;
+}
+
+int j813_n1_prepare_fabric_windows(void)
+{
+    static bool attempted;
+    struct j813_n1_regs r;
+    if (attempted || j813_n1_validate_windows() || j813_n1_regs(&r))
+        return -1;
+    attempted = true;
+    if (pmgr_adt_power_enable(APCIE) || pmgr_adt_is_powered(APCIE) != 1)
+        return -1;
+    printf("Windows N1: power active; starting Linux PHY/root prefix\n");
+    enum exc_guard_t saved = exc_guard;
+    int before = exc_count;
+    exc_guard = GUARD_MARK | GUARD_SILENT;
+    int result = j813_n1_fabric(&r);
+    sysop("dsb sy");
+    sysop("isb");
+    exc_guard = saved;
+    if (result || exc_count != before)
+        return -1;
+    windows_fabric_ready = true;
+    printf("Windows N1: Linux PHY/root prefix complete; endpoint still clamped\n");
+    return 0;
+}
+
+int j813_n1_finish_windows(bool *port_ready)
+{
+    struct j813_n1_regs r;
+    if (!port_ready)
+        return -1;
+    *port_ready = false;
+    if (!windows_fabric_ready || windows_finish_attempted || j813_n1_regs(&r))
+        return -1;
+    windows_finish_attempted = true;
+    enum exc_guard_t saved = exc_guard;
+    int before = exc_count;
+    exc_guard = GUARD_MARK | GUARD_SILENT;
+    int result = j813_n1_finish(&r, port_ready);
+    sysop("dsb sy");
+    sysop("isb");
+    exc_guard = saved;
+    return result || exc_count != before ? -1 : 0;
 }

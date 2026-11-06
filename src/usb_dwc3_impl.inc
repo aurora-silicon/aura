@@ -1246,7 +1246,8 @@ static void usb_dwc3_cdc_start_bulk_out_xfer(dwc3_dev_t *dev, u8 endpoint_number
     if (!host2device)
         return;
 
-    if (ringbuffer_get_free(host2device) < XFER_SIZE)
+    /* get_free includes the slot reserved to distinguish empty from full. */
+    if (ringbuffer_get_free(host2device) <= XFER_SIZE)
         return;
 
 #if !USB_DWC3_SUPERSPEED
@@ -1579,6 +1580,12 @@ static void usb_dwc3_handle_event_dev(dwc3_dev_t *dev, const struct dwc3_event_d
             usb_dwc3_handle_event_usbrst(dev, true);
             if (dev->primary_was_open)
                 usb_cdc_recovery_arm(&dev->recovery, ticks_to_msecs(get_ticks()));
+            break;
+#elif defined(AURA_WINDOWS)
+        case DWC3_DEVT_DISCONN:
+            /* Preserve primary proxy state; detach only the guest debug FIFO.
+             * No DMA memory is freed or reused until normal reset/reopen. */
+            dev->pipe[CDC_ACM_PIPE_1].ready = false;
             break;
 #endif
         case DWC3_DEVT_CONNECTDONE:
@@ -2185,3 +2192,7 @@ void usb_dwc3_flush(dwc3_dev_t *dev, cdc_acm_pipe_id_t pipe)
         usb_dwc3_handle_events(dev);
     }
 }
+
+#ifdef AURA_WINDOWS
+#include "usb_dwc3_vuart.inc"
+#endif

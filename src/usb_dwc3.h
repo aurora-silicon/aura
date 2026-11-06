@@ -3,6 +3,8 @@
 #ifndef USB_DWC3_H
 #define USB_DWC3_H
 
+#include "../build/build_cfg.h"
+
 #include "dart.h"
 #include "types.h"
 
@@ -30,5 +32,13 @@ size_t usb_dwc3_read(dwc3_dev_t *dev, cdc_acm_pipe_id_t pipe, void *buf, size_t 
 size_t usb_dwc3_write(dwc3_dev_t *dev, cdc_acm_pipe_id_t pipe, const void *buf, size_t count);
 size_t usb_dwc3_queue(dwc3_dev_t *dev, cdc_acm_pipe_id_t pipe, const void *buf, size_t count);
 void usb_dwc3_flush(dwc3_dev_t *dev, cdc_acm_pipe_id_t pipe);
+
+#ifdef AURA_WINDOWS
+/* Secondary debug FIFO only. Capacity -1 means disconnected (discard/ready).
+ * Enqueue is all-or-none and never waits for the host. Poll starts transfers. */
+ssize_t usb_dwc3_vuart_capacity(dwc3_dev_t *dev);
+size_t usb_dwc3_vuart_write(dwc3_dev_t *dev, const void *buf, size_t count);
+void usb_dwc3_vuart_poll(dwc3_dev_t *dev);
+#endif
 
 #endif

@@ -1,5 +1,7 @@
 /* SPDX-License-Identifier: MIT AND GPL-2.0-only */
 
+#include "../build/build_cfg.h"
+
 #include "uartproxy.h"
 #include "assert.h"
 #include "exception.h"
@@ -431,3 +433,20 @@ void uartproxy_send_event(u16 event_type, void *data, u16 length)
     iodev_write(uartproxy_iodev, &csum, sizeof(csum));
     iodev_unlock(uartproxy_iodev);
 }
+
+#ifdef AURA_WINDOWS
+bool uartproxy_try_send_event(u16 event_type, const void *data, u16 length)
+{
+    /* A serial batch is at most 128 bytes plus its 20-byte ABI header. */
+    u8 frame[sizeof(UartEventHdr) + 148 + sizeof(u32)];
+    if (length > 148)
+        return false;
+    UartEventHdr hdr = {.type = REQ_EVENT, .len = length, .event_type = event_type};
+    memcpy(frame, &hdr, sizeof(hdr));
+    memcpy(frame + sizeof(hdr), data, length);
+    u32 sum = disable_data_csums ? CHECKSUM_SENTINEL : checksum(frame, sizeof(hdr) + length);
+    memcpy(frame + sizeof(hdr) + length, &sum, sizeof(sum));
+    size_t total = sizeof(hdr) + length + sizeof(sum);
+    return iodev_try_write_atomic(uartproxy_iodev, frame, total) == (ssize_t)total;
+}
+#endif

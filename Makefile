@@ -6,6 +6,13 @@ RUSTARCH ?= aarch64-unknown-none-softfloat
 BUILTIN_LOGO ?= aurora
 LOGO_DIR ?= data
 
+ifeq ($(WINDOWS),1)
+USE_CLANG ?= 1
+ifneq ($(USE_CLANG),1)
+$(error WINDOWS=1 requires Clang/LLD for the size-constrained LTO image)
+endif
+endif
+
 ifneq ($(words $(wildcard $(LOGO_DIR)/$(BUILTIN_LOGO)_48.bin $(LOGO_DIR)/$(BUILTIN_LOGO)_128.bin $(LOGO_DIR)/$(BUILTIN_LOGO)_256.bin)),3)
 $(error BUILTIN_LOGO assets $(LOGO_DIR)/$(BUILTIN_LOGO)_{48,128,256}.bin are missing)
 endif
@@ -78,9 +85,18 @@ BASE_CFLAGS := -Os -Wall -g -Wundef -Werror=strict-prototypes -fno-common -fno-P
 	-fno-stack-protector -mstrict-align -march=armv8.2-a \
 	$(EXTRA_CFLAGS)
 
+# Keep the optional Windows backend below the same DCP boundary as the default
+# personality. The linker assertion remains authoritative for both builds.
+ifeq ($(WINDOWS),1)
+BASE_CFLAGS += -Oz -flto
+endif
+
 CFLAGS := $(BASE_CFLAGS) -mgeneral-regs-only
 
 CFG :=
+ifeq ($(WINDOWS),1)
+CFG += AURA_WINDOWS
+endif
 ifeq ($(RELEASE),1)
 CFG += RELEASE
 endif
@@ -176,6 +192,13 @@ HV_OBJECTS := $(patsubst %,hv/%, \
 	hv_vm.o \
 	hv_vuart.o \
 	hv_wdt.o)
+
+ifeq ($(WINDOWS),1)
+HV_OBJECTS := $(patsubst %,hv/windows/%, \
+	hv.o hv_aic.o hv_asm.o hv_exc.o hv_vgic.o hv_psci.o \
+	hv_aic_alias.o fb_capture.o windows_compat.o windows_n1.o serial_capture.o mtp_handoff.o) \
+	hv/hv_vm.o hv/hv_virtio.o hv/hv_vuart.o hv/hv_wdt.o hv/hv_sprr.o
+endif
 
 OBJECTS := \
 	boot_storage.o \
@@ -277,6 +300,7 @@ format:
 	$(CLANG_FORMAT) -i src/*.c src/*.inc src/chickens/*.c src/dcp/*.c src/hv/*.c src/math/*.c src/*.h src/dcp/*.h src/hv/*.h src/math/*.h sysinc/*.h
 format-check:
 	$(CLANG_FORMAT) --dry-run --Werror src/*.c src/*.inc src/chickens/*.c src/dcp/*.c src/hv/*.c src/math/*.c src/*.h src/dcp/*.h src/hv/*.h src/math/*.h sysinc/*.h
+	$(CLANG_FORMAT) --dry-run --Werror src/hv/windows/*.c src/hv/windows/*.h
 rustfmt:
 	cd rust && cargo fmt
 rustfmt-check:

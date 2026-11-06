@@ -1,0 +1,67 @@
+/* SPDX-License-Identifier: MIT AND GPL-2.0-only */
+/* Architectural definitions from public m1n1 69534d48:src/arm_cpu_regs.h. */
+#ifndef WINDOWS_REGS_H
+#define WINDOWS_REGS_H
+#include "arm_cpu_regs.h"
+#define SYS_CNTHP_TVAL_EL2   sys_reg(3, 4, 14, 2, 0)
+#define MDCR_EL2_HPMN        GENMASK(4, 0)
+#define MDCR_EL2_TPMCR       BIT(5)
+#define MDCR_EL2_TPM         BIT(6)
+#define MDCR_EL2_HPME        BIT(7)
+#define ID_AA64PFR0_EL1      sys_reg(3, 0, 0, 4, 0)
+#define ID_AA64PFR1_EL1      sys_reg(3, 0, 0, 4, 1)
+#define ID_AA64DFR0_EL1      sys_reg(3, 0, 0, 5, 0)
+#define ID_AA64DFR1_EL1      sys_reg(3, 0, 0, 5, 1)
+#define ID_AA64ISAR0_EL1     sys_reg(3, 0, 0, 6, 0)
+#define ID_AA64ISAR1_EL1     sys_reg(3, 0, 0, 6, 1)
+#define ID_AA64AFR0_EL1      sys_reg(3, 0, 0, 5, 4)
+#define ID_AA64AFR1_EL1      sys_reg(3, 0, 0, 5, 5)
+#define ID_AA64PFR2_EL1      sys_reg(3, 0, 0, 4, 2)
+#define ID_AA64ZFR0_EL1      sys_reg(3, 0, 0, 4, 4)
+#define ID_AA64SMFR0_EL1     sys_reg(3, 0, 0, 4, 5)
+#define ID_AA64ISAR2_EL1     sys_reg(3, 0, 0, 6, 2)
+#define ID_AA64ISAR3_EL1     sys_reg(3, 0, 0, 6, 3)
+#define SYS_ID_AA64MMFR3_EL1 sys_reg(3, 0, 0, 7, 3)
+#define SYS_ID_AA64MMFR4_EL1 sys_reg(3, 0, 0, 7, 4)
+#define SYS_PMCR_EL0         sys_reg(3, 3, 9, 12, 0)
+#define PMCR_FZO             BIT(9) // stop event counters on overflow
+#define PMCR_C               BIT(2) // reset PMCCNTR
+#define PMCR_E               BIT(0) // enable
+#define SYS_PMCCNTR_EL0      sys_reg(3, 3, 9, 13, 0)
+#define SYS_PMCCFILTR_EL0    sys_reg(3, 3, 14, 15, 7)
+#define PMCCFILTR_P          BIT(31) // sets if el1 can count cycles
+#define PMCCFILTR_U          BIT(30) // sets if el0 can count cycles
+#define SYS_PMCEID0_EL0      sys_reg(3, 3, 9, 12, 6)
+#define SYS_PMCEID1_EL0      sys_reg(3, 3, 9, 12, 7)
+#define SYS_PMCNTENCLR_EL0   sys_reg(3, 3, 9, 12, 2) // perf mon counter enable clear (disable reg)
+#define SYS_PMCNTENSET_EL0   sys_reg(3, 3, 9, 12, 1)
+#define SYS_PMEVCNTR0_EL0    sys_reg(3, 3, 13, 8, 0)
+#define SYS_PMEVTYPER0_EL0   sys_reg(3, 3, 14, 12, 0)
+#define PMEVTYPER_P          BIT(31) // controls el1 counting
+#define SYS_PMINTENCLR_EL1   sys_reg(3, 0, 9, 14, 2)
+#define SYS_PMINTENSET_EL1   sys_reg(3, 0, 9, 14, 1)
+#define SYS_PMMIR_EL1        sys_reg(3, 0, 9, 13, 5)
+#define SYS_PMOVSCLR_EL0     sys_reg(3, 3, 9, 12, 3)
+#define SYS_PMOVSSET_EL0     sys_reg(3, 3, 9, 14, 3)
+#define SYS_PMSELR_EL0       sys_reg(3, 3, 9, 12, 5)
+#define SYS_PMSWINC_EL0      sys_reg(3, 3, 9, 12, 4)
+#define SYS_PMUSERENR_EL0    sys_reg(3, 3, 9, 14, 0)
+#define PMUSERENR_RESERVED   GENMASK(63, 4)
+#define SYS_PMXEVCNTR_EL0    sys_reg(3, 3, 9, 13, 2)
+#define SYS_PMXEVTYPER_EL0   sys_reg(3, 3, 9, 13, 1)
+#define ICC_SGI1R_EL1        sys_reg(3, 0, 12, 11, 5)
+#define ICC_DIR_EL1          sys_reg(3, 0, 12, 11, 1)
+#define ICC_EOIR1_EL1        sys_reg(3, 0, 12, 12, 1)
+#define ICC_BPR1_EL1         sys_reg(3, 0, 12, 12, 3)
+#define ICC_IGRPEN1_EL1      sys_reg(3, 0, 12, 12, 7)
+#define ICC_IAR1_EL1         sys_reg(3, 0, 12, 12, 0)
+#define ICC_SRE_EL1          sys_reg(3, 0, 12, 12, 5)
+#define ICC_CTLR_EL1         sys_reg(3, 0, 12, 12, 4)
+#define ICC_PMR_EL1          sys_reg(3, 0, 4, 6, 0)
+#define ICC_IGRPEN0_EL1      sys_reg(3, 0, 12, 12, 6)
+#define ICC_HPPIR1_EL1       sys_reg(3, 0, 12, 12, 2)
+#define ICC_RPR_EL1          sys_reg(3, 0, 12, 11, 3)
+#define ICC_SRE_SRE          BIT(0)
+#define ICC_SRE_DFB          BIT(1)
+#define ICC_SRE_DIB          BIT(2)
+#endif

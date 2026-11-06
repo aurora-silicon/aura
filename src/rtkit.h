@@ -3,6 +3,8 @@
 #ifndef RTKIT_H
 #define RTKIT_H
 
+#include "../build/build_cfg.h"
+
 #include "asc.h"
 #include "dart.h"
 #include "iova.h"
@@ -21,6 +23,9 @@ struct rtkit_buffer {
     u64 dva;
     size_t sz;
     bool owned;
+#ifdef AURA_WINDOWS
+    bool pooled;
+#endif
 };
 
 rtkit_dev_t *rtkit_init(const char *name, asc_dev_t *asc, dart_dev_t *dart,
@@ -48,5 +53,34 @@ bool rtkit_unmap(rtkit_dev_t *rtk, u64 dva, size_t sz);
 
 bool rtkit_alloc_buffer(rtkit_dev_t *rtk, struct rtkit_buffer *bfr, size_t sz);
 bool rtkit_free_buffer(rtkit_dev_t *rtk, struct rtkit_buffer *bfr);
+
+#ifdef AURA_WINDOWS
+enum rtkit_rejection_reason {
+    RTKIT_REJECT_NONE,
+    RTKIT_REJECT_ENDPOINT_RANGE,
+    RTKIT_REJECT_SYSTEM_ENDPOINT,
+    RTKIT_REJECT_MESSAGE,
+    RTKIT_REJECT_CRASH,
+};
+
+struct rtkit_rejection {
+    enum rtkit_rejection_reason reason;
+    u64 msg0, msg1;
+};
+
+struct rtkit_notification_counts {
+    u64 app, debug, oslog_notifications;
+};
+
+/* Explicit pre-boot mode. Caller owns/stops the IOP before releasing storage. */
+bool rtkit_set_phys_window(rtkit_dev_t *rtk, u64 base, size_t size);
+bool rtkit_set_buffer_pool(rtkit_dev_t *rtk, u64 base, size_t size);
+bool rtkit_set_early_ap_power(rtkit_dev_t *rtk, bool enable);
+/* Single ASC owner; returns handled count, or a latched failure. Never waits. */
+int rtkit_service_quiet(rtkit_dev_t *rtk, int max_msgs);
+/* Sole owner, after service returns; copies metadata only, never reads MMIO. */
+bool rtkit_get_first_rejection(const rtkit_dev_t *rtk, struct rtkit_rejection *out);
+bool rtkit_get_notification_counts(const rtkit_dev_t *rtk, struct rtkit_notification_counts *out);
+#endif
 
 #endif

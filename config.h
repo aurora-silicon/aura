@@ -3,6 +3,11 @@
 #ifndef CONFIG_H
 #define CONFIG_H
 
+#ifdef AURA_WINDOWS
+#define ENABLE_VGIC_MODULE
+#define ENABLE_NATIVE_AIC_PASSTHROUGH
+#endif
+
 // Enable framebuffer console
 #define USE_FB
 // Disable framebuffer console unless verbose boot is enabled
