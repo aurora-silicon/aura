@@ -46,12 +46,32 @@ static void write32(u64 a,u32 v){writes++;if(is("bar-drop")&&a==0x1cb0100010ULL&
 static void write16(u64 a,u16 v){u64 b=a&~3ULL;unsigned sh=(a&2)*8;write32(b,(get(b)&~(0xffffU<<sh))|((u32)v<<sh));}
 static void udelay(unsigned u){(void)u;}
 #include "../../../src/adt.h"
-static const char *paths[]={"/","/chosen","/arm-io/apcie","/arm-io/apcie/pci-bridge0","/arm-io/dart-apcie0","/arm-io/gpio0","/arm-io/smc"};
-int adt_path_offset(const void*d,const char*p){(void)d;for(unsigned i=0;i<ARRAY_SIZE(paths);i++)if(!strcmp(paths[i],p))return i;return -1;}
+#include "j813_reset_provider.h"
+static const char *paths[]={"/","/chosen","/arm-io/apcie","/arm-io/apcie/pci-bridge0","/arm-io/dart-apcie0","/arm-io/gpio0"};
+int adt_path_offset(const void*d,const char*p){
+    (void)d;
+    for(unsigned i=0;i<ARRAY_SIZE(paths);i++)if(!strcmp(paths[i],p))return i;
+    for(unsigned i=0;i<ARRAY_SIZE(j813_reset_nodes);i++) {
+        if (i==1 && is("smc-nub-missing")) continue;
+        if (i==2 && (is("smc-pmu-missing") || is("smc-pmu-outside"))) continue;
+        if(!strcmp(j813_reset_nodes[i].path,p)) return 6+i;
+    }
+    if(is("smc-pmu-outside") && !strcmp(p,"/arm-io/other/smc-pmu")) return 99;
+    return -1;
+}
 int adt_path_offset_trace(const void*d,const char*p,int*out){int n=adt_path_offset(d,p);out[0]=n;out[1]=-1;return n;}
-bool adt_is_compatible(const void*d,int n,const char*c){(void)d;return (n==2&&!strcmp(c,"apcie,t8142"))||(n==4&&!strcmp(c,"dart,t8110"))||(n==5&&!strcmp(c,"gpio,t8101"));}
+bool adt_is_compatible(const void*d,int n,const char*c){
+    (void)d;
+    if(n>=6 && n<=8) {
+        if ((n==6 && is("smc-controller-compatible")) ||
+            (n==7 && is("smc-nub-compatible")) ||
+            (n==8 && is("smc-pmu-compatible"))) return false;
+        return !strcmp(c,j813_reset_nodes[n-6].compatible);
+    }
+    return (n==2&&!strcmp(c,"apcie,t8142"))||(n==4&&!strcmp(c,"dart,t8110"))||(n==5&&!strcmp(c,"gpio,t8101"));
+}
 int adt_get_reg(const void*d,int*p,const char*prop,int i,u64*a,u64*z){(void)d;(void)prop;u64 b=0,l=0;if(p[0]==2){u64 bs[]={0x1cb0000000,0x48c000000,0x48f000000,0x48f020000,0x48f040000,0x48e000000,0,0,0x488028000,0,0x48f010000};u64 ls[]={0x10000000,0x4000,0x40000,0x4000,0x20000,0x1000000,0,0,0x8000,0,0x4000};if(i<0||i>10)return -1;b=bs[i];l=ls[i];}else if(p[0]==4){b=0x488000000;l=0x20000;}else if(p[0]==5){b=0x39a000000;l=0x100000;}else return -1;if(is("resource")&&p[0]==4)b+=0x1000;*a=b;if(z)*z=l;return 0;}
-const void*adt_getprop(const void*d,int n,const char*key,u32*len){(void)d;static u32 vals[7];memset(vals,0,sizeof(vals));const void*r=vals;*len=4;if(n==0&&!strcmp(key,"model")){r=is("model")?"Mac17,4":"Mac17,3";*len=8;}else if(n==1&&!strcmp(key,"chip-id"))vals[0]=chip_id;else if(n==1&&!strcmp(key,"board-id"))vals[0]=board_id;else if((n==5||n==6)&&!strcmp(key,"AAPL,phandle"))vals[0]=n==5?0xa0:0xd9;else if(n==3&&!strcmp(key,"function-perst")){*len=16;vals[0]=0xa0;vals[1]=0x4750494f;vals[2]=is("perst")?193:192;}else if(n==3&&!strcmp(key,"function-reset")){*len=16;vals[0]=0xd9;vals[1]=0x704b5734;vals[2]=0x67503133;vals[3]=0x800000;}else if(n==2&&!strcmp(key,"ranges")){*len=28;vals[0]=0x02000000;vals[1]=0x80000000;vals[3]=0x80000000;vals[4]=0xb;vals[5]=0x40000000;}else {*len=0;r=NULL;}return r;}
+const void*adt_getprop(const void*d,int n,const char*key,u32*len){(void)d;static u32 vals[7];memset(vals,0,sizeof(vals));const void*r=vals;*len=4;if(n==0&&!strcmp(key,"model")){r=is("model")?"Mac17,4":"Mac17,3";*len=8;}else if(n==1&&!strcmp(key,"chip-id"))vals[0]=chip_id;else if(n==1&&!strcmp(key,"board-id"))vals[0]=board_id;else if(n==5&&!strcmp(key,"AAPL,phandle"))vals[0]=0xa0;else if(n>=6&&n<=8&&!strcmp(key,"AAPL,phandle"))vals[0]=j813_reset_nodes[n-6].phandle;else if(n==3&&!strcmp(key,"function-perst")){*len=16;vals[0]=0xa0;vals[1]=0x4750494f;vals[2]=is("perst")?193:192;}else if(n==3&&!strcmp(key,"function-reset")){*len=16;memcpy(vals,j813_function_reset,sizeof(j813_function_reset));if(is("smc-controller-reset"))vals[0]=0xd7;if(is("smc-reset-handle"))vals[0]=0xff;if(is("smc-reset-op"))vals[2]++;}else if(n==2&&!strcmp(key,"ranges")){*len=28;vals[0]=0x02000000;vals[1]=0x80000000;vals[3]=0x80000000;vals[4]=0xb;vals[5]=0x40000000;}else {*len=0;r=NULL;}return r;}
 int adt_getprop_copy(const void*d,int n,const char*k,void*out,size_t size){u32 len;const void*p=adt_getprop(d,n,k,&len);if(!p||len!=size)return -1;memcpy(out,p,size);return len;}
 int j813_n1_train_windows(void){trains++;trained=true;put(0x488028208ULL,0x1001);put(0x1cb0000000ULL,0x100c106b);put(0x1cb0100000ULL,is("identity")?0x1234106b:0x1900106b);put(0x1cb0101000ULL,0xffff);put(0x1cb0102000ULL,0xffff);put(0x1cb0100010ULL,4);put(0x1cb0100004ULL,is("post-bme")?4:0);put(0xb80008000ULL,is("rom")?1:0);return is("train")||is("clamp-fail")?-1:0;}
 #include "../../../src/hv/windows/windows_n1.c"
@@ -131,4 +151,4 @@ static void census_scenario(void) {
 
 int main(int argc,char**argv){assert(argc==2);scenario=argv[1];model_cpu=boot_cpu_idx;if(is("chip"))chip_id=0x8112;if(is("board"))board_id=0x25;put(0x488000000ULL,14U<<24);put(0x488000008ULL,(42U<<24)|(36U<<16)|0x202);put(0x48800000cULL,16);put(0x488000200ULL,is("locked")?1:0);put(0x488001000ULL,is("dart")?1:0);put(0x488000080ULL,is("busy")?0x80000000:0);put(0x39a000300ULL,3);if(is("pre-bme")){put(0x488028208ULL,1);put(0x1cb0000000ULL,0x100c106b);put(0x1cb0100000ULL,0x1900106b);put(0x1cb0100004ULL,4);}
 if(!strncmp(scenario,"census-",7)){census_scenario();return 0;}
-unsigned char result[128];memset(result,0xaa,sizeof(result));int rc=hv_windows_n1_prepare(result,sizeof(result));bool success=is("success");if(success){assert(rc==0&&trains==1&&!held);u32 magic;memcpy(&magic,result,4);assert(magic==0x4831574e);FILE*f=fopen("descriptor.bin","wb");assert(f);assert(fwrite(result,1,128,f)==128);fclose(f);}else{assert(rc!=0);for(unsigned i=0;i<128;i++)assert(!result[i]);if(trained)assert(held);else assert(!writes);if(is("clamp-fail"))assert(rc==-2);}printf("%s rc=%d trains=%u writes=%u held=%d PASS\n",scenario,rc,trains,writes,held);}
+unsigned char result[128];memset(result,0xaa,sizeof(result));int rc=hv_windows_n1_prepare(result,sizeof(result));bool success=is("success");printf("%s observed rc=%d reads=%u writes=%u trains=%u\n",scenario,rc,reads,writes,trains);fflush(stdout);if(success){assert(rc==0&&trains==1&&!held);u32 magic;memcpy(&magic,result,4);assert(magic==0x4831574e);FILE*f=fopen("descriptor.bin","wb");assert(f);assert(fwrite(result,1,128,f)==128);fclose(f);}else{assert(rc!=0);for(unsigned i=0;i<128;i++)assert(!result[i]);if(trained)assert(held);else assert(!writes);if(is("clamp-fail"))assert(rc==-2);if(!strncmp(scenario,"smc-",4))assert(!reads&&!writes&&!trains);}printf("%s rc=%d trains=%u writes=%u held=%d PASS\n",scenario,rc,trains,writes,held);}

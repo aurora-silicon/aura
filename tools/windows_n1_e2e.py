@@ -15,6 +15,9 @@ CASES = (
     "success", "chip", "board", "model", "resource", "perst", "locked", "dart",
     "busy", "pre-bme", "train", "post-bme", "identity", "bar-mask", "bar-high",
     "bar-drop", "rom", "clamp-fail",
+    "smc-nub-missing", "smc-pmu-missing", "smc-pmu-outside",
+    "smc-controller-compatible", "smc-nub-compatible", "smc-pmu-compatible",
+    "smc-controller-reset", "smc-reset-handle", "smc-reset-op",
     "census-unprepared", "census-failed-prepare", "census-valid", "census-magic",
     "census-bsp", "census-version", "census-reserved", "census-address",
     "census-guard", "census-masked", "census-pending", "census-load-fault",
@@ -26,6 +29,7 @@ SOURCES = (
     "src/smp.h",
     "src/adt.h", "sysinc/string.h", "src/types.h", "src/utils.h", "src/exception.h",
     "tests/e2e/windows_n1/producer_host.c", "tests/e2e/windows_n1/failure-model.md",
+    "tests/e2e/windows_n1/j813_reset_provider.h",
     "tools/windows_n1_e2e.py", "docs/windows-n1.md",
 )
 

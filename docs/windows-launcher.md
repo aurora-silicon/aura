@@ -86,15 +86,19 @@ independently gated N1 handoff producer. Bit 6 advertises explicit configuration
 Bit 7 advertises the read-only heap high-water query used for declared memory
 reservation checks. Bit 8 advertises opt-in, framed outbound guest serial
 capture; the selected carrier must also support nonblocking atomic frames.
+Bit 9 advertises isolated dedicated-CDC guest serial mode, which suppresses
+guest `HVLOG: ` forwarding onto the primary proxy connection.
 Normal builds return zero. The launcher does not treat a capability bit as
 hardware qualification.
 
 `P_HV_WINDOWS_CONFIG = 0xc81` sets Windows options before `hv_init`: argument bit
 0 opts into the experimental T8142 instruction/vector rewrites and guessed SP
 repair; bit 1 requests BGRA shadow conversion; bit 2 requests framed serial
-capture. It returns 0 on acceptance and
+capture; bit 3 selects isolated dedicated-CDC serial mode. Bits 2 and 3 are
+mutually exclusive, and bit 3 requires a USB CDC proxy carrier. It returns 0 on acceptance and
 -1 for invalid flags, unsupported target or an invalid lifecycle state. The
-host requires capability bit 6 for these options and bit 8 for serial capture.
+host requires capability bit 6 for these options, bit 8 for serial capture,
+and bit 9 for dedicated CDC.
 The C backend verifies the
 scanout format, creates the shadow and changes guest boot arguments only after
 successful setup; the host never spoofs depth. An unsuccessful requested
@@ -195,8 +199,10 @@ port. Supply `--guest-serial-device` along with the primary `--device`; they
 must resolve to different paths. The primary proxy must identify itself as a
 USB CDC carrier, which is how Aura binds the separate guest UART pipe. Select
 both ports from the same intended physical target; the launcher does not infer
-or discover their relationship. This mode needs no framed-capture capability
-and does not enable configuration bit 2. It opens the guest port with DTR
+or discover their relationship. This mode requires capability bits 6 and 9
+and sets configuration bit 3 before hypervisor initialization. Older residents
+are rejected; there is no fallback to guest `HVLOG: ` forwarding on the primary
+connection. It opens the guest port with DTR
 asserted and starts draining before target preparation. The same raw/readable
 artifact names are produced, but the receipt records that raw CDC has no
 verified target drop count or final marker. Reader errors are retained and

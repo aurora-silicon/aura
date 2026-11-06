@@ -253,7 +253,7 @@ def lifecycle(case, output):
         def hv_windows_capabilities(self):
             trace.append("caps")
             serial_cap = 0 if case == "serial-missing-capability" else SERIAL_CAPTURE
-            return CAPS_MAGIC | 1 << 16 | REQUIRED_CAPS | CONFIGURATION | FRAMEBUFFER_SHADOW | N1_HANDOFF | MEMORY_PREFLIGHT | serial_cap
+            return CAPS_MAGIC | 1 << 16 | REQUIRED_CAPS | CONFIGURATION | FRAMEBUFFER_SHADOW | N1_HANDOFF | MEMORY_PREFLIGHT | serial_cap | 0x200
         def hv_windows_configure(self, flags):
             trace.append(["config", flags])
             return -1 if case in ("config-rejected", "serial-carrier-rejected") else 0
@@ -348,6 +348,7 @@ def lifecycle(case, output):
     hv.windows_guest_compatibility = "t8142-experimental"
     hv.windows_framebuffer = "bgra-shadow"
     serial_recorder = None
+    if case == "cdc-success": hv.windows_serial = "cdc"
     if case.startswith("serial-"):
         from aura.windows_serial import WindowsSerialRecorder
         folder = output / case
@@ -377,11 +378,12 @@ def lifecycle(case, output):
         if case == "adt-overflow-start": hv.adt.overflow = "x" * 0x20000
         start_trace_index = len(trace)
         hv.start()
-        assert case in ("success", "n1-success", "chunked-upload", "reservation-success", "serial-success")
-        assert trace.index(["config", 7 if case.startswith("serial-") else 3]) < trace.index("hv_init") < trace.index("upload-image") < trace.index("start")
+        assert case in ("success", "n1-success", "chunked-upload", "reservation-success", "serial-success", "cdc-success")
+        config = 11 if case == "cdc-success" else 7 if case.startswith("serial-") else 3
+        assert trace.index(["config", config]) < trace.index("hv_init") < trace.index("upload-image") < trace.index("start")
         if case == "serial-success": assert trace.index("serial-handler") < trace.index("start")
     except (RuntimeError, ValueError, OSError):
-        assert case not in ("success", "n1-success", "chunked-upload", "reservation-success", "serial-success")
+        assert case not in ("success", "n1-success", "chunked-upload", "reservation-success", "serial-success", "cdc-success")
         if case in ("serial-missing-capability", "serial-carrier-rejected"):
             assert "hv_init" not in trace and "upload-image" not in trace and "start" not in trace
         if case == "serial-missing-capability": assert trace == ["caps"]
@@ -426,7 +428,7 @@ def main():
         cases = [wire_namespace(), identity_translation("identity-modular-wrap"),
                  identity_translation("identity-outside-ram"),
                  identity_translation("identity-j813-recorded-addresses")] + [lifecycle(case, output) for case in (
-            "success", "serial-success", "serial-missing-capability", "serial-carrier-rejected",
+            "success", "cdc-success", "serial-success", "serial-missing-capability", "serial-carrier-rejected",
             "chunked-upload", "config-rejected", "out-of-ram", "adt-overflow-init", "adt-overflow-start",
             "watchdog-failure", "forwarded-exception", "forwarded-panic", "transport-error",
             "n1-success", "n1-producer-failure", "n1-bad-header", "n1-bad-resource", "n1-read-failure",

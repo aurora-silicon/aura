@@ -148,8 +148,12 @@ static u64 hv_windows_flags;
 
 int hv_windows_configure(u64 flags)
 {
-    if (hv_windows_initialized ||
-        flags & ~(HV_WINDOWS_GUEST_COMPAT | HV_WINDOWS_FB_SHADOW | HV_WINDOWS_SERIAL_CAPTURE))
+    if (hv_windows_initialized || flags & ~(HV_WINDOWS_GUEST_COMPAT | HV_WINDOWS_FB_SHADOW |
+                                            HV_WINDOWS_SERIAL_CAPTURE | HV_WINDOWS_SERIAL_CDC))
+        return -1;
+    if ((flags & HV_WINDOWS_SERIAL_CDC) &&
+        ((flags & HV_WINDOWS_SERIAL_CAPTURE) || uartproxy_iodev < IODEV_USB0 ||
+         uartproxy_iodev >= IODEV_USB0 + USB_IODEV_COUNT))
         return -1;
     if ((flags & HV_WINDOWS_GUEST_COMPAT) && chip_id != T8142)
         return -1;
@@ -167,6 +171,11 @@ bool hv_windows_guest_compat_enabled(void)
 bool hv_windows_serial_capture_enabled(void)
 {
     return (hv_windows_flags & HV_WINDOWS_SERIAL_CAPTURE) != 0;
+}
+
+bool hv_windows_serial_cdc_enabled(void)
+{
+    return (hv_windows_flags & HV_WINDOWS_SERIAL_CDC) != 0;
 }
 
 bool hv_windows_can_prepare_device(void)

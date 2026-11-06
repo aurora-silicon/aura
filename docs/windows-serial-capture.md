@@ -64,6 +64,21 @@ physical KIS/Mu/Windows capture still requires hardware validation.
 
 ## Use and scope
 
+### CDC isolation failure model, recorded before the fix
+
+- In CDC mode, a guest sequence beginning `HVLOG: ` must not reach any primary
+  console bytes. Subsequent proxy framing bytes can otherwise be consumed as
+  a reply/event by the primary reader, or enter a blocking primary writer.
+- Preserve the exact binary sequence on the dedicated secondary CDC pipe.
+  Framed capture must remain framed, and disabled/default modes retain their
+  existing behavior.
+- A CDC profile must require an explicit isolation capability and configure
+  it before hypervisor initialization. Old residents, missing configuration
+  support, conflicting capture/CDC flags and non-USB carriers must reject it.
+- Replay the real UART handler with `HVLOG: ` plus binary/proxy framing bytes;
+  assert zero primary output and byte-for-byte secondary output. Replay old
+  resident admission and the production host configuration sequence.
+
 Add `"serial": "capture"` to the hash-bound Windows launch profile, then use
 the normal `proxyclient/tools/boot_windows.py boot` command with an explicit
 resident device and a new output directory. The default is `disabled`.
@@ -81,6 +96,13 @@ as `\xNN`. No guest byte is interpreted as a terminal command. Capture mode
 suppresses the old `HVLOG: ` unframed passthrough. The separate USB VUART pipe
 keeps its existing behavior; this change neither creates that pipe over KIS
 nor adds input or a working Windows KD session.
+
+Dedicated `serial="cdc"` requires capability bit 9 and configuration bit 3,
+as well as the configuration capability. Its raw bytes stay on the secondary
+CDC pipe: guest `HVLOG: ` content cannot enter the primary console/parser.
+The backend rejects combined capture/CDC flags and rejects CDC mode on a
+non-USB primary carrier. Disabled profiles and the non-Windows backend retain
+their previous logging behavior. CDC mode does not emit framed capture events.
 
 Only bytes actually written by firmware or Windows to the mapped guest UART
 can be captured. A Windows boot without a configured UART logging/debugging

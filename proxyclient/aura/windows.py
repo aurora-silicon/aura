@@ -21,9 +21,11 @@ N1_HANDOFF = 0x0020
 CONFIGURATION = 0x0040
 MEMORY_PREFLIGHT = 0x0080
 SERIAL_CAPTURE = 0x0100
+SERIAL_CDC_ISOLATED = 0x0200
 CONFIG_T8142_EXPERIMENTAL = 0x0001
 CONFIG_FRAMEBUFFER_SHADOW = 0x0002
 CONFIG_SERIAL_CAPTURE = 0x0004
+CONFIG_SERIAL_CDC = 0x0008
 MAX_IMAGE = 1024 * 1024 * 1024
 N1_PROPERTY = "aura,windows-n1-v1"
 N1_BYTES = 128
@@ -55,7 +57,7 @@ def validate_capabilities(value, framebuffer="native", guest_compatibility="none
     require(value & REQUIRED_CAPS == REQUIRED_CAPS, "resident lacks required Windows capabilities")
     if framebuffer == "bgra-shadow":
         require(value & FRAMEBUFFER_SHADOW, "resident lacks the framebuffer conversion backend")
-    if framebuffer != "native" or guest_compatibility != "none" or serial == "capture":
+    if framebuffer != "native" or guest_compatibility != "none" or serial in ("capture", "cdc"):
         require(value & CONFIGURATION, "resident lacks explicit Windows configuration")
     if n1 != "disabled":
         require(value & N1_HANDOFF, "resident lacks the N1 handoff producer")
@@ -63,6 +65,8 @@ def validate_capabilities(value, framebuffer="native", guest_compatibility="none
         require(value & MEMORY_PREFLIGHT, "resident lacks read-only memory reservation preflight")
     if serial == "capture":
         require(value & SERIAL_CAPTURE, "resident lacks framed Windows serial capture")
+    if serial == "cdc":
+        require(value & SERIAL_CDC_ISOLATED, "resident lacks isolated Windows CDC serial mode")
     return value & 0xffff
 
 

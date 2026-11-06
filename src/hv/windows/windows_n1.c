@@ -75,12 +75,18 @@ static int n1_identity(void)
     int dart = adt_path_offset(adt, "/arm-io/dart-apcie0");
     int gpio = adt_path_offset(adt, "/arm-io/gpio0");
     int smc = adt_path_offset(adt, "/arm-io/smc");
+    int smc_nub = adt_path_offset(adt, "/arm-io/smc/iop-smc-nub");
+    int smc_pmu = adt_path_offset(adt, "/arm-io/smc/iop-smc-nub/smc-pmu");
     if (!model || len != sizeof("Mac17,3") || memcmp(model, "Mac17,3", len) || chosen < 0 ||
-        bridge < 0 || apcie < 0 || dart < 0 || gpio < 0 || smc < 0 ||
+        bridge < 0 || apcie < 0 || dart < 0 || gpio < 0 || smc < 0 || smc_nub < 0 || smc_pmu < 0 ||
         n1_property(chosen, "chip-id", &value, 1) || value != T8142 ||
         n1_property(chosen, "board-id", &value, 1) || value != 0x24 ||
         !adt_is_compatible(adt, apcie, "apcie,t8142") ||
-        !adt_is_compatible(adt, dart, "dart,t8110") || !adt_is_compatible(adt, gpio, "gpio,t8101"))
+        !adt_is_compatible(adt, dart, "dart,t8110") ||
+        !adt_is_compatible(adt, gpio, "gpio,t8101") ||
+        !adt_is_compatible(adt, smc, "iop,ascwrap-v6") ||
+        !adt_is_compatible(adt, smc_nub, "iop-nub,rtbuddy-v2") ||
+        !adt_is_compatible(adt, smc_pmu, "smc-pmu"))
         return -1;
     if (n1_reg("/arm-io/apcie", 0, ECAM, 0x10000000) || n1_reg("/arm-io/apcie", 8, PORT, 0x8000) ||
         n1_reg("/arm-io/apcie", 10, PHY, 0x4000) ||
@@ -98,7 +104,8 @@ static int n1_identity(void)
     if (n1_property(gpio, "AAPL,phandle", &phandle, 1) ||
         n1_property(bridge, "function-perst", function, 4) || function[0] != phandle ||
         function[1] != 0x4750494f || function[2] != 192 || function[3] != 0 ||
-        n1_property(smc, "AAPL,phandle", &phandle, 1) ||
+        /* The function provider is the PMU child, not the ASC controller. */
+        n1_property(smc_pmu, "AAPL,phandle", &phandle, 1) ||
         n1_property(bridge, "function-reset", function, 4) || function[0] != phandle ||
         function[1] != 0x704b5734 || function[2] != 0x67503133 || function[3] != 0x800000)
         return -1;

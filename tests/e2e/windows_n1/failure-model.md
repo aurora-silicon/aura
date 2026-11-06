@@ -28,3 +28,19 @@ N1 census HVC failure model (written before the census implementation):
 
 The protocol model injects exceptions through the same exception counter used by
 the production guard. It does not prove physical SError delivery or recovery.
+
+SMC reset-provider failure model (recorded before the admission fix):
+- The captured J813 ADT uses three distinct nodes: SMC controller, RTBuddy nub,
+  and its `smc-pmu` child. The PCI bridge's reset function references the child,
+  not the controller. Rejecting this valid topology prevents all N1 preparation.
+- The accepted provider must remain at the exact path below the known SMC
+  controller, with the captured controller/nub/provider compatible strings.
+  A missing ancestor, wrong type, arbitrary matching phandle elsewhere, or a
+  reset function pointing at the controller must fail before any MMIO or train.
+- Preserve the exact pKW4/gP13/reset-value tuple and reject changes to it.
+- The regression fixture contains only these public node paths, compatible
+  strings, phandles and reset words from the captured ADT, without serial
+  numbers, device identifiers, keys, or unrelated tree contents.
+- Run the existing complete production preparation/census replay against that
+  fixture before editing production code, then rerun with the corrected gate.
+  Modeled training/MMIO still do not establish physical handoff success.
