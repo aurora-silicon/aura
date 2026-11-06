@@ -65,27 +65,30 @@ peripherals, or other Mac models.
 ## J813 hardware observations
 
 The [2026-11-06 observation record](validation/windows-j813-20261106.json)
-binds the tested resident images and probe artifacts. Windows on internal NVMe
-reached `winlogon.exe`, `LogonUI.exe` and `dwm.exe` with MTP and N1 withheld;
-an early capture now shows the Windows logo and spinner, followed by an opaque
-black framebuffer at the later logon-stage observation. The display adapter and
-monitor report Started/D0 with no PnP problem, but interactive login is unverified.
-The AP-fault probe separately verified that a fault on CPU 0 drains all guest
-CPUs while the boot CPU is CPU 6 and returns control to the host.
+binds the tested resident images and probe artifacts. With Mu's complete MTP
+memory reservation, Windows on internal NVMe completed a ten-minute run on
+USB0 and reached the desktop in both shadow and native-scanout captures. The
+user confirmed the physical lock screen and working built-in keyboard and
+trackpad. The earlier black frame at 180 seconds was transient in this run;
+the lock screen appeared by 300 seconds.
 
-The CDC stress probe passed a sixty-second reader pause, a full TX queue,
-closed-DTR discard, exact receive/reopen sequences and clean SYSTEM_OFF.
-Its guest timing also verifies the T8142 counter conversion. This qualifies
-the tested virtual UART transport behavior, not Windows kernel debugging.
+The missing Mu reservation had allowed Windows to load `mup.sys` into MTP's
+firmware staging range. Its header was overwritten with MTP firmware bytes.
+The corrected run reserves all 512 pages before Windows starts and retains an
+intact `mup.sys` header. The older working boot's larger heap kept that range
+outside guest RAM. See the companion Mu memory-ownership documentation.
 
-The retained CDC text reaches Mu ExitBootServices. Windows logon-stage progress
-was verified separately from memory; a continuous Windows kernel log or KD
-session is not established. N1 cold admission rejects the inherited active
-PCIe power state before reset or power changes; functional N1 support remains
-unverified.
+Eight complete framebuffer reads transferred 136,314,880 bytes, including two
+matching terminal shadow rereads. The planned terminal abort drained every
+guest CPU and returned a responsive proxy. The separate AP-fault probe verified
+failure preservation when CPU 0 faults while CPU 6 is the boot CPU.
 
-With MTP preparation enabled, Aura completed the seven handoff phases and Mu
-published MTP0. Windows then started `AppleMtpHid`, its HID keyboard and
-mouse/trackpad stacks, all in D0 without reported PnP problems. Logon processes
-also started, but the later framebuffer remained black. Physical key/pointer
-input and interactive login have not yet been verified.
+CDC boot capture recorded 3,057,402 bytes with no reader issues. The separate
+stress probe covers a sixty-second reader pause, full TX queue, closed-DTR
+discard, exact receive/reopen sequences and clean SYSTEM_OFF. Raw CDC has no
+losslessness proof. Text reaches Mu ExitBootServices; later Windows progress
+was observed through memory and framebuffers, not a Windows KD session.
+
+N1 cold admission still rejects inherited active PCIe power state before
+reset or power changes. Operational N1/Wi-Fi, CPU scaling and accelerated
+WDDM graphics remain separate qualification work.
