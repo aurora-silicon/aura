@@ -1,8 +1,11 @@
 # SPDX-License-Identifier: MIT
 """Exercise the J713 ISP firmware handoff with production kboot code and real FDTs."""
 
+import shutil
 import subprocess
 from pathlib import Path
+
+import pytest
 from test_siliconforest_handoff import run_c
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -37,6 +40,8 @@ TREE = r'''/dts-v1/;
 
 
 def test_j713_isp_handoff_fills_placeholders_or_leaves_the_camera_off(tmp_path):
+    if not shutil.which("dtc"):
+        pytest.skip("needs dtc")
     kboot = (ROOT / "src/kboot.c").read_text()
 
     def function(name, kind="static int "):
