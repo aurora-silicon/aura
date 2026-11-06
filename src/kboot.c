@@ -8625,6 +8625,42 @@ static int dt_set_fb2_t8152(void)
  * and beyond /chosen only the CPUs, MAC addresses, the second framebuffer and
  * the memory map are filled in here.
  */
+static int dt_set_afk_handoff_t8152(void)
+{
+    const char *paths[] = {"/arm-io/dcp", "/arm-io/dcpext0"};
+    u64 bases[ARRAY_SIZE(paths)], sizes[ARRAY_SIZE(paths)];
+    for (size_t i = 0; i < ARRAY_SIZE(paths); i++) {
+        int trace[8];
+        if (adt_path_offset_trace(adt, paths[i], trace) < 0 ||
+            adt_get_reg(adt, trace, "reg", 0, &bases[i], &sizes[i]))
+            bail("FDT: missing T8152 DCP register range\n");
+    }
+    int node = -1;
+    while ((node = fdt_node_offset_by_compatible(dt, node, "apple,t8152-dcp-iboot")) >= 0) {
+        int len;
+        const fdt64_t *reg = fdt_getprop(dt, node, "reg", &len);
+        if (!reg || len < 16)
+            bail("FDT: invalid T8152 DCP register range\n");
+        u64 base = fdt64_to_cpu(reg[0]);
+        u64 size = fdt64_to_cpu(reg[1]);
+        int ret = fdt_delprop(dt, node, "apple,afk-active-endpoints");
+        if (ret && ret != -FDT_ERR_NOTFOUND)
+            return -1;
+        for (size_t i = 0; i < ARRAY_SIZE(paths); i++) {
+            u32 mask;
+            if (base != bases[i] || size != sizes[i])
+                continue;
+            if (display_active_afk_endpoints(paths[i], &mask))
+                break; /* Do not invent state for a controller we do not own. */
+            if (fdt_setprop_u32(dt, node, "apple,afk-active-endpoints", mask))
+                return -1;
+            printf("FDT: %s active AFK endpoints 0x%x (base 0x20)\n", paths[i], mask);
+            break;
+        }
+    }
+    return node == -FDT_ERR_NOTFOUND ? 0 : -1;
+}
+
 static int dt_set_display_t8152(void)
 {
     int chosen = adt_path_offset(adt, "/chosen");
@@ -8669,7 +8705,7 @@ static int dt_set_display_t8152(void)
                         ALIGN_UP(fb + stride * height, SZ_16K) - ALIGN_DOWN(fb, SZ_16K)))
         bail("FDT: invalid T8152 framebuffer reservation\n");
     printf("FDT: retained live T8152 DCP firmware, VRAM and framebuffer\n");
-    return 0;
+    return dt_set_afk_handoff_t8152();
 }
 
 static int dt_prepare_t8152(void)
