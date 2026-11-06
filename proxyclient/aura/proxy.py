@@ -691,6 +691,11 @@ class AuraProxy(Reloadable):
     P_HV_EXIT_CPU = 0xc0f
     P_HV_ADD_TIME = 0xc10
     P_HV_SPRR_SET_ACTIVE = 0xc11
+    # Dedicated namespace: legacy m1n1 uses c11..c18 for mutating PSCI ops.
+    # Never probe those opcodes to detect a Windows Aura personality.
+    P_HV_WINDOWS_CAPS = 0xc80
+    P_HV_WINDOWS_CONFIG = 0xc81
+    P_HV_WINDOWS_N1_PREPARE = 0xc82
 
     P_FB_INIT = 0xd00
     P_FB_SHUTDOWN = 0xd01
@@ -1197,6 +1202,15 @@ class AuraProxy(Reloadable):
         return self.request(self.P_HV_ADD_TIME, time)
     def hv_sprr_set_active(self, active):
         return self.request(self.P_HV_SPRR_SET_ACTIVE, int(bool(active)))
+    def hv_windows_capabilities(self):
+        """Read-only Windows personality and raw-Mu ABI query; no legacy fallback."""
+        return self.request(self.P_HV_WINDOWS_CAPS)
+
+    def hv_windows_configure(self, flags):
+        return self.request(self.P_HV_WINDOWS_CONFIG, flags, signed=True)
+
+    def hv_windows_prepare_n1(self, address, size):
+        return self.request(self.P_HV_WINDOWS_N1_PREPARE, address, size, signed=True)
 
     def fb_init(self):
         return self.request(self.P_FB_INIT)

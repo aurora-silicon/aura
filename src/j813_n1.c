@@ -14,6 +14,7 @@
 
 #include "j813_n1.h"
 #include "adt.h"
+#include "exception.h"
 #include "pmgr.h"
 #include "smc.h"
 #include "tunables.h"
@@ -214,4 +215,19 @@ int j813_n1_prepare(void *dt)
     /* An untrained link would hang Linux's first config access. */
     printf("j813-n1: N1 PCIe bring-up failed; disabling the ECAM host\n");
     return fdt_setprop_string(dt, node, "status", "disabled") ? -1 : 0;
+}
+
+/* Keep Windows on the same public reset/PHY training sequence as Linux. */
+int j813_n1_train_windows(void)
+{
+    if (chip_id != T8142 || board_id != 0x24)
+        return -1;
+    enum exc_guard_t saved = exc_guard;
+    int before = exc_count;
+    exc_guard = GUARD_MARK | GUARD_SILENT;
+    int result = j813_n1_link();
+    sysop("dsb sy");
+    sysop("isb");
+    exc_guard = saved;
+    return result || exc_count != before ? -1 : 0;
 }

@@ -1,3 +1,7 @@
+#include "../../build/build_cfg.h"
+#ifdef AURA_WINDOWS
+#include "windows/hv.h"
+#else
 /* SPDX-License-Identifier: MIT AND GPL-2.0-only */
 
 #ifndef HV_H
@@ -125,3 +129,5 @@ void hv_maybe_exit(void);
 void hv_tick(struct exc_info *ctx);
 
 #endif
+
+#endif /* AURA_WINDOWS */

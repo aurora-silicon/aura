@@ -35,6 +35,10 @@
 #include "minilzlib/minlzma.h"
 #include "tinf/tinf.h"
 
+#ifdef AURA_WINDOWS
+#include "hv/windows/windows_n1.h"
+#endif
+
 void *rust_read_gigalocker(size_t *);
 void rust_free_gigalocker(void *, size_t);
 
@@ -538,9 +542,19 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
             hv_map(request->args[0], request->args[1], request->args[2], request->args[3]);
             break;
         case P_HV_START:
+#ifdef AURA_WINDOWS
+        {
+            int result = hv_start((void *)request->args[0], &request->args[1]);
+            if (result < 0)
+                reply->status = S_ERROR;
+            else
+                reply->retval = result;
+        }
+#else
             if (hv_start((void *)request->args[0], &request->args[1]))
                 reply->status = S_ERROR;
-            break;
+#endif
+        break;
         case P_HV_TRANSLATE:
             reply->retval = hv_translate(request->args[0], request->args[1], request->args[2],
                                          (void *)request->args[3]);
@@ -591,6 +605,33 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
         case P_HV_SPRR_SET_ACTIVE:
             hv_sprr_set_active(request->args[0]);
             break;
+        case P_HV_WINDOWS_CAPS:
+            /* Read-only personality/ABI probe; never initializes hardware. */
+#ifdef AURA_WINDOWS
+            reply->retval = 0x4157494e0001007fULL;
+#else
+            reply->retval = 0;
+#endif
+            break;
+        case P_HV_WINDOWS_CONFIG:
+#ifdef AURA_WINDOWS
+            reply->retval = hv_windows_configure(request->args[0]);
+#else
+            reply->retval = -1;
+#endif
+            break;
+        case P_HV_WINDOWS_N1_PREPARE:
+#ifdef AURA_WINDOWS
+        {
+            int result = hv_windows_n1_prepare((void *)request->args[0], request->args[1]);
+            if (result)
+                hv_windows_quarantine();
+            reply->retval = result;
+        }
+#else
+            reply->retval = -1;
+#endif
+        break;
 
         case P_FB_INIT:
             fb_init(request->args[0]);
