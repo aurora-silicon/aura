@@ -17,30 +17,51 @@ u32 utrstat = 0;
 u32 ufstat = 0;
 
 int vuart_irq = 0;
+#ifdef AURA_WINDOWS
+/* Rejected raw-CDC TX bytes when a guest ignores an attached full FIFO.
+ * Independent from framed-capture loss accounting; inspect via the ELF symbol. */
+u64 vuart_tx_overruns;
+#endif
 
 static void update_irq(void)
 {
     ssize_t rx_queued;
 
+#ifdef AURA_WINDOWS
+    /* Generic I/O event dispatch also flushes every console, which can block
+     * on an unrelated transport. Poll only the guest debug controller here. */
+    iodev_lock(IODEV_USB_VUART);
+    usb_dwc3_vuart_poll(iodev_get_opaque(IODEV_USB_VUART));
+    iodev_unlock(IODEV_USB_VUART);
+#else
     iodev_handle_events(IODEV_USB_VUART);
+#endif
 
-    utrstat |= UTRSTAT_TXBE | UTRSTAT_TXE;
+    bool tx_ready = true;
+#ifdef AURA_WINDOWS
+    tx_ready = iodev_can_write(IODEV_USB_VUART);
+#endif
+    if (tx_ready)
+        utrstat |= UTRSTAT_TXBE | UTRSTAT_TXE;
+    else
+        utrstat &= ~(UTRSTAT_TXBE | UTRSTAT_TXE | UTRSTAT_TXTHRESH);
     utrstat &= ~UTRSTAT_RXD;
 
-    ufstat = 0;
+    u32 tx_status = tx_ready ? 0 : UFSTAT_TXFULL | FIELD_PREP(UFSTAT_TXCNT, 15);
+    ufstat = tx_status;
     if ((rx_queued = iodev_can_read(IODEV_USB_VUART))) {
         utrstat |= UTRSTAT_RXD;
         if (rx_queued > 15)
-            ufstat = FIELD_PREP(UFSTAT_RXCNT, 15) | UFSTAT_RXFULL;
+            ufstat = tx_status | FIELD_PREP(UFSTAT_RXCNT, 15) | UFSTAT_RXFULL;
         else
-            ufstat = FIELD_PREP(UFSTAT_RXCNT, rx_queued);
+            ufstat = tx_status | FIELD_PREP(UFSTAT_RXCNT, rx_queued);
 
         if (FIELD_GET(UCON_RXMODE, ucon) == UCON_MODE_IRQ && ucon & UCON_RXTO_ENA) {
             utrstat |= UTRSTAT_RXTO;
         }
     }
 
-    if (FIELD_GET(UCON_TXMODE, ucon) == UCON_MODE_IRQ && ucon & UCON_TXTHRESH_ENA) {
+    if (tx_ready && FIELD_GET(UCON_TXMODE, ucon) == UCON_MODE_IRQ && ucon & UCON_TXTHRESH_ENA) {
         utrstat |= UTRSTAT_TXTHRESH;
     }
 
@@ -99,9 +120,14 @@ static bool handle_vuart(struct exc_info *ctx, u64 addr, u64 *val, bool write, i
                 uint8_t b = *val;
 #ifdef AURA_WINDOWS
                 hv_windows_serial_putc(b);
-#endif
+                /* The Windows secondary CDC callback only enqueues once.
+                 * Unbound/closed consoles consume and discard, as before. */
+                if (iodev_write(IODEV_USB_VUART, &b, 1) != 1 && vuart_tx_overruns != ~0ULL)
+                    vuart_tx_overruns++;
+#else
                 if (iodev_can_write(IODEV_USB_VUART))
                     iodev_write(IODEV_USB_VUART, &b, 1);
+#endif
 #ifdef AURA_WINDOWS
                 if (!hv_windows_serial_capture_enabled())
 #endif
@@ -152,6 +178,9 @@ void hv_vuart_poll(void)
 
 void hv_map_vuart(u64 base, int irq, iodev_id_t iodev)
 {
+#ifdef AURA_WINDOWS
+    vuart_tx_overruns = 0;
+#endif
     hv_map_hook(base, handle_vuart, 0x1000);
     usb_iodev_vuart_setup(iodev);
     vuart_irq = irq;

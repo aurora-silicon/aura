@@ -5,6 +5,12 @@ from pathlib import Path
 import struct
 
 
+def escape_serial(data):
+    """A terminal-safe ASCII view; raw bytes remain authoritative."""
+    return "".join("\n" if byte == 10 else "\\\\" if byte == 92 else
+                   chr(byte) if 32 <= byte <= 126 else f"\\x{byte:02x}" for byte in data)
+
+
 class WindowsSerialRecorder:
     HEADER = struct.Struct("<HHIQHH")
     MAX_BATCH = 128
@@ -51,9 +57,7 @@ class WindowsSerialRecorder:
             self.bytes += length
             self.raw.flush()
             # Escape control/invalid bytes rather than emitting terminal codes.
-            view = "".join("\n" if byte == 10 else "\\\\" if byte == 92 else
-                           chr(byte) if 32 <= byte <= 126 else f"\\x{byte:02x}" for byte in payload)
-            self.text.write(view)
+            self.text.write(escape_serial(payload))
             self.text.flush()
             self.events += 1
             self.final |= bool(flags & self.FINAL)

@@ -282,7 +282,24 @@ dwc3_dev_t *usb_iodev_bringup(u32 idx)
     }
 
 USB_IODEV_WRAPPER(0, CDC_ACM_PIPE_0)
+#ifndef AURA_WINDOWS
 USB_IODEV_WRAPPER(1, CDC_ACM_PIPE_1)
+#else
+static ssize_t usb_1_can_read(void *dev)
+{
+    return usb_dwc3_can_read(dev, CDC_ACM_PIPE_1);
+}
+
+static ssize_t usb_1_read(void *dev, void *buf, size_t count)
+{
+    return usb_dwc3_read(dev, CDC_ACM_PIPE_1, buf, count);
+}
+
+static void usb_1_flush(void *dev)
+{
+    usb_dwc3_flush(dev, CDC_ACM_PIPE_1);
+}
+#endif
 
 static struct iodev_ops iodev_usb_ops = {
     .can_read = usb_0_can_read,
@@ -294,14 +311,38 @@ static struct iodev_ops iodev_usb_ops = {
     .handle_events = usb_0_handle_events,
 };
 
+#ifdef AURA_WINDOWS
+static bool usb_vuart_can_write(void *dev)
+{
+    return usb_dwc3_vuart_capacity(dev) != 0;
+}
+
+static ssize_t usb_vuart_write(void *dev, const void *buf, size_t count)
+{
+    return usb_dwc3_vuart_write(dev, buf, count);
+}
+
+static void usb_vuart_handle_events(void *dev)
+{
+    usb_dwc3_vuart_poll(dev);
+}
+#endif
+
 static struct iodev_ops iodev_usb_sec_ops = {
     .can_read = usb_1_can_read,
+#ifdef AURA_WINDOWS
+    .can_write = usb_vuart_can_write,
+    .write = usb_vuart_write,
+    .queue = usb_vuart_write,
+    .handle_events = usb_vuart_handle_events,
+#else
     .can_write = usb_1_can_write,
-    .read = usb_1_read,
     .write = usb_1_write,
     .queue = usb_1_queue,
-    .flush = usb_1_flush,
     .handle_events = usb_1_handle_events,
+#endif
+    .read = usb_1_read,
+    .flush = usb_1_flush,
 };
 
 struct iodev iodev_usb_vuart = {

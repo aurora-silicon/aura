@@ -16,12 +16,14 @@ def main():
     parser.add_argument("action", choices=("validate", "boot"))
     parser.add_argument("--profile", type=Path, required=True)
     parser.add_argument("--device", help="explicit resident Aura serial path; never inferred")
+    parser.add_argument("--guest-serial-device", help="distinct dedicated guest CDC port for serial=cdc")
     parser.add_argument("--out", type=Path, help="new retained evidence directory (required for boot)")
     args = parser.parse_args()
     if args.action == "boot":
         if not args.device or not args.out:
             parser.error("boot requires --device and --out")
-        result = launch_profile(args.profile, args.device, args.out)
+        result = launch_profile(args.profile, args.device, args.out,
+                                guest_serial_device=args.guest_serial_device)
     else:
         plan = plan_profile(args.profile)
         result = {"result": "profile-valid", "hardware_accessed": False,

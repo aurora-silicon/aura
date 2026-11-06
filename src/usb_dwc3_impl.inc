@@ -1580,6 +1580,12 @@ static void usb_dwc3_handle_event_dev(dwc3_dev_t *dev, const struct dwc3_event_d
             if (dev->primary_was_open)
                 usb_cdc_recovery_arm(&dev->recovery, ticks_to_msecs(get_ticks()));
             break;
+#elif defined(AURA_WINDOWS)
+        case DWC3_DEVT_DISCONN:
+            /* Preserve primary proxy state; detach only the guest debug FIFO.
+             * No DMA memory is freed or reused until normal reset/reopen. */
+            dev->pipe[CDC_ACM_PIPE_1].ready = false;
+            break;
 #endif
         case DWC3_DEVT_CONNECTDONE:
             usb_dwc3_handle_event_connect_done(dev);
@@ -2185,3 +2191,5 @@ void usb_dwc3_flush(dwc3_dev_t *dev, cdc_acm_pipe_id_t pipe)
         usb_dwc3_handle_events(dev);
     }
 }
+
+#include "usb_dwc3_vuart.inc"
