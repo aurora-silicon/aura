@@ -209,17 +209,76 @@ static int n1_poll(u64 address, u32 mask, u32 target, unsigned timeout)
 
 static int n1_dart_clean(void)
 {
-    u32 p1, p3, p4, protect, tcr, ttbr, command;
-    if (n1_read(DART, 4, &p1) || n1_read(DART + 8, 4, &p3) || n1_read(DART + 12, 4, &p4) ||
-        n1_read(DART + 0x200, 4, &protect) || n1_read(DART + 0x1000, 4, &tcr) ||
-        n1_read(DART + 0x1400, 4, &ttbr) || n1_read(DART + 0x80, 4, &command))
-        return -1;
+    const u32 offsets[] = {0, 8, 12, 0x200, 0x1000, 0x1400, 0x80};
+    u32 value[ARRAY_SIZE(offsets)];
+    for (unsigned i = 0; i < ARRAY_SIZE(offsets); i++) {
+        printf("Windows N1: DART read %#llx begin\n", (unsigned long long)(DART + offsets[i]));
+        if (n1_read(DART + offsets[i], 4, &value[i])) {
+            printf("Windows N1: DART read fault\n");
+            return -1;
+        }
+        printf("Windows N1: DART read complete %#x\n", value[i]);
+    }
+    u32 p1 = value[0], p3 = value[1], p4 = value[2], protect = value[3];
+    u32 tcr = value[4], ttbr = value[5], command = value[6];
     return ((p1 >> 24) & 15) != 14 || ((p3 >> 24) & 63) != 42 || ((p3 >> 16) & 63) < 36 ||
                    ((p3 >> 16) & 63) > 42 || (p3 & 0xffff) < 0x100 || (p3 & 0xffff) >= 0x300 ||
                    !(p4 & 511) || (p4 & 511) > 256 || (protect & 1) || tcr || ttbr ||
                    (command & 0x80000000)
                ? -1
                : 0;
+}
+
+/* Do not infer cold ownership from ANS or shared parents. State 4 retains
+ * clock-gated hardware; only power-gated target/actual state 0 is admitted. */
+static int n1_cold(void)
+{
+    static const struct {
+        u16 id, parent[2];
+        const char *name;
+    } expected[] = {
+        {74, {60, 0}, "APCIE_GP"},         {109, {74, 0}, "APCIE_SYS_GP"},
+        {110, {76, 0}, "APCIE_ST"},        {144, {76, 110}, "APCIE_SYS_ST"},
+        {152, {144, 109}, "APCIE_PHY_SW"}, {155, {152, 0}, "ST0_AUS5_AON"},
+        {156, {155, 0}, "ST0_AUS5"},
+    };
+    u32 gates[8];
+    int apcie = adt_path_offset(adt, "/arm-io/apcie");
+    if (n1_property(apcie, "clock-gates", gates, ARRAY_SIZE(gates)) || gates[0] != 76)
+        return -1;
+    struct pmgr_gate gate[ARRAY_SIZE(expected)];
+    for (unsigned i = 0; i < ARRAY_SIZE(expected); i++) {
+        if (gates[i + 1] != expected[i].id ||
+            pmgr_adt_gate("/arm-io/apcie", "clock-gates", i + 1, &gate[i]) || !gate[i].found ||
+            gate[i].virt || gate[i].die || gate[i].id != expected[i].id ||
+            gate[i].entry != expected[i].id || !gate[i].name ||
+            strncmp(gate[i].name, expected[i].name, 16) || !gate[i].psreg ||
+            gate[i].parent[0] != expected[i].parent[0] ||
+            gate[i].parent[1] != expected[i].parent[1])
+            return -1;
+        for (unsigned j = 0; j < i; j++)
+            if (gate[j].psreg == gate[i].psreg)
+                return -1;
+    }
+    bool cold = true;
+    for (unsigned i = 0; i < ARRAY_SIZE(expected); i++) {
+        u32 state;
+        if (n1_read(gate[i].psreg, 4, &state))
+            return -1;
+        printf("Windows N1: cold gate %s target=%u actual=%u reset=%u auto=%u raw=%#x\n",
+               expected[i].name, state & 15, (state >> 4) & 15, (state >> 31) & 1,
+               (state >> 28) & 1, state);
+        if (state & (0xffU | (1U << 31) | (1U << 28)))
+            cold = false;
+    }
+    return cold ? 0 : -1;
+}
+
+static int n1_gpio_hold(void)
+{
+    u32 pad;
+    return n1_read(PAD, 4, &pad) || (pad & BIT(21)) || n1_checked(PAD, 4, (pad & ~15U) | 2, 15) ? -1
+                                                                                                : 0;
 }
 
 static int n1_endpoints_clean(void)
@@ -305,34 +364,35 @@ int hv_windows_n1_prepare(void *descriptor, size_t size)
     if (!hv_windows_can_prepare_device() || attempted || n1_identity())
         return -1;
     attempted = true;
-    /* Unpowered fabric accesses can hang instead of delivering a guarded
-     * abort. Match Linux's power prerequisite before the first DART read. */
-    printf("Windows N1: enabling APCIE power before register admission\n");
-    if (pmgr_adt_power_enable("/arm-io/apcie") || pmgr_adt_is_powered("/arm-io/apcie") != 1) {
-        printf("Windows N1: power admission failed; no N1 registers accessed\n");
+    if (j813_n1_validate_windows() || n1_cold()) {
+        printf("Windows N1: cold/tunable admission rejected before reset or power changes\n");
         return -1;
     }
-    printf("Windows N1: power active; checking DART and endpoint ownership\n");
-    if (n1_dart_clean())
-        return -1;
-    u32 link, pad;
-    if (n1_read(PAD, 4, &pad) || (pad & BIT(21)) || n1_read(PORT + 0x208, 4, &link) ||
-        ((link & 1) && n1_endpoints_clean()))
-        return -1;
-
-    /* One explicit reset/training operation; no firmware or DART programming. */
-    printf("Windows N1: clean ownership; starting Linux reset/PHY sequence\n");
-    if (j813_n1_train_windows() || n1_poll(PORT + 0x208, 1, 1, 1000000) || n1_endpoints_clean() ||
-        n1_assign_control() || n1_dart_clean() || n1_endpoints_clean() ||
-        n1_read(BAR + 0x8000, 4, &link) || link != 0) {
-        if (n1_hold()) {
-            printf("Windows N1: cannot prove PERST/link drain; quarantined\n");
-            return -2;
-        }
-        printf("Windows N1: handoff rejected; held in reset\n");
-        return -1;
+    bool port_ready = false;
+    u32 link;
+    printf("Windows N1: cold gates admitted; clamping GPIO PERST\n");
+    if (n1_gpio_hold() || j813_n1_prepare_fabric_windows() || n1_dart_clean())
+        goto fail;
+    printf("Windows N1: clean DART; finishing Linux reset/port sequence\n");
+    if (j813_n1_finish_windows(&port_ready) || n1_poll(PORT + 0x208, 1, 1, 1000000) ||
+        n1_endpoints_clean() || n1_assign_control() || n1_dart_clean() || n1_endpoints_clean() ||
+        n1_read(BAR + 0x8000, 4, &link) || link != 0)
+        goto fail;
+    goto publish;
+fail:
+    if (!port_ready) {
+        int clamped = n1_gpio_hold();
+        printf("Windows N1: pre-port failure; GPIO clamp %s; drain unproved, quarantined\n",
+               clamped ? "failed" : "held");
+        return -2;
     }
-
+    if (n1_hold()) {
+        printf("Windows N1: cannot prove PERST/link drain; quarantined\n");
+        return -2;
+    }
+    printf("Windows N1: handoff rejected; held in reset\n");
+    return -1;
+publish:;
     u8 *out = descriptor;
     put_le(out, 0x4831574e, 4);
     put_le(out + 4, 1, 2);

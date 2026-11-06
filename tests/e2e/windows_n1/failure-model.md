@@ -60,3 +60,40 @@ read may never complete; an exception guard cannot make it safe.
   descriptor check. Power admission does not prove an idle DMA owner.
 - Record phase boundaries before power, clean-state checks and training so
   a physical stall can be localized without another blind register probe.
+
+# Cold fabric phases, recorded before splitting the Linux sequence
+
+The power-first hardware attempt still stopped inside the combined DART/port
+admission phase. It does not identify the exact register that failed. Linux
+performs PHY/PLL/pclk/AXI and root-controller setup before any port access, and
+never reads DART. Its successful sequence therefore does not prove DART is
+readable immediately after PMGR activation.
+
+- Validate all local tunable widths, alignment and bounds before changing a
+  reset signal or power state. Invalid firmware data may not escape the known
+  PHY, PHY-IP, AXI, port or first 4 KiB root DBI aperture.
+- A cold ownership predicate is required before asserting GPIO PERST or
+  powering the fabric. It must not infer cold state from shared ANS/ancestor
+  gates. Active/unknown N1 ownership is rejected, never silently reset.
+- Hold and read back the validated GPIO PERST before accessibility setup.
+  A failed GPIO operation cannot be followed by PHY setup or training.
+- Split the existing Linux sequence after root-controller readiness and before
+  its SMC N1 reset. Preserve the Linux entry's exact ordered hardware actions.
+  The Windows prefix must not access port/ECAM/DART or release PERST.
+- After the prefix, log each DART address before its guarded read and log
+  completion afterward. Keep all geometry/protection/TCR/TTBR/busy checks.
+  Readability at this new phase still needs physical qualification.
+- Only a clean DART allows the finish phase to reset/train the endpoint.
+  Never read endpoint config while the link is down. Validate all present
+  functions' bus-master bits after link establishment before BAR programming.
+- Before finish proves port/root readiness, failure cleanup uses only the
+  validated GPIO. It cannot call the existing port/ECAM drain routine. Retain
+  the reset clamp and return quarantined failure because link drain is unproved.
+- After readiness, preserve the existing full drain requirement. Any failure
+  leaves a zero descriptor and cannot authorize census reads or retry.
+- A guarded write fault before readiness is not successful setup. Before
+  marking the port ready or starting LTSSM, check that the finish phase's
+  exception count has not changed; otherwise retain GPIO-only quarantine.
+- Replay the production producer with inaccessible pre-prefix DART and
+  pre-ready PORT/ECAM boundaries, and compare the actual Linux sequence before
+  and after the split using the same deterministic MMIO/mailbox transcript.
