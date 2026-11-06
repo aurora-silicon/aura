@@ -76,6 +76,7 @@ def prepare(args, s, raw):
     p = s.p
     bootargs = ("earlycon=dockchannel,0x38812c000 console=tty0 console=ttyDC0 keep_bootcon "
                 "maxcpus=1 nokaslr rdinit=/init panic=0")
+    # Success is the chosen-table slot index, not necessarily zero.
     common.require(0 <= s.call("kboot_set_chosen", s.cstring("bootargs"), s.cstring(bootargs)) < 16,
                    "bootargs failed")
     common.require(0 <= s.call("kboot_set_chosen", s.cstring("stdout-path"),

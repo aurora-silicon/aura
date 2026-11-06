@@ -20,7 +20,8 @@ path. A port appearing is not a successful guard. Do not send proxy commands
 to a running Linux console.
 
 Choose `proxyclient/tools/boot_j813.py` or `proxyclient/tools/boot_j873.py` as
-`BOOT_TOOL`. Set `IMAGE_SHA256` to the SHA-256 of the corresponding image file
+`BOOT_TOOL`, and select the matching `j813_pmu_guard.py` or
+`j873_pmu_guard.py` as `PMU_TOOL`. Set `IMAGE_SHA256` to the SHA-256 of the corresponding image file
 above. Use a fresh `RUN` directory and an explicit CDC primary endpoint; do
 not guess from enumeration order. On macOS its name commonly includes the
 physical serial, but the tool also verifies the USB descriptor and live ADT.
@@ -52,7 +53,16 @@ CDC receipt to match the current session. All uploaded bytes are read back and
 hashed. The tools return with the prepared device tree and receipts for review;
 they do not enter Linux as part of the upload.
 
-Restore the previously verified host HPM port to debug USB **without rebooting**.
+Before changing host routing, take another physical PMU receipt on CDC:
+
+```sh
+python3 "$PMU_TOOL" --device "$CDC_PRIMARY" --serial "$SERIAL" \
+    --output "$RUN/restore-pmu"
+```
+
+Continue only when this command succeeds with `passed=true`,
+`offline_only=false` and `after_raw=0`. Restore the previously verified host
+HPM port to debug USB **without rebooting**.
 For hosts using `macvdmctl`, supply the mapped `--rid N` explicitly and use its
 `debugusb` action, not `reboot`. This is a host routing operation; the boot tools
 do not choose a host port or issue it automatically. Do not change the cable.
@@ -65,7 +75,9 @@ python3 "$BOOT_TOOL" boot --image "$BUILD" --image-sha256 "$IMAGE_SHA256" \
 ```
 
 The final action runs another PMU guard and rechecks the prepared state. Linux
-entry requires the restored KIS proxy. Retain `linux-console.bin` and the
+entry requires the restored KIS proxy. The tools retain the already-open
+proxy descriptor and save `aura-handoff-console.bin` alongside
+`linux-console.bin`, preserving early native CPU-park messages. Retain both and the
 workload's artifacts: a completed boot command or successful upload alone is
 not a hardware test pass. The initial J813 path keeps secondary CPUs stopped;
 J873 retains its existing native park and reserved-memory audit requirements.
@@ -82,3 +94,29 @@ stream, and bounds its power/PHY polls. Both use an explicit AP USB2 routing
 command with no port-controller reset. KIS polling remains available so the
 host can restore debug routing after the upload. Live/locked streams are not
 reinitialized, and allocations are retained after uncertain setup failures.
+M5/M6 USB2 console flushing is bounded so an opened but disconnected CDC pipe
+cannot hold a later RAM handoff indefinitely. Upload readback remains mandatory.
+
+## Hardware validation
+
+The 2026-11-06 macOS-host run passed on both machines, using runtime commit
+`d10758b1a9e0d69db5610f699ba1bb993df8a6d0` and the host-tool fixes through
+`e6d7a2a8`. Runtime C sources did not change after that build. The exact binary
+hashes, public Linux/Mesa dependencies and sanitized results are in
+[the validation artifact](validation/cdc-j813-j873-20261106.json).
+
+| Machine | Image + initramfs write/full readback | GPU smoke | Other checks |
+| --- | --- | --- | --- |
+| J813 | 10.15 s | 3 cases, 12,288 exact pixels | 16 checks, zero taint |
+| J873g | 12.72 s | 3 cases, 12,288 exact pixels | 23 checks, 3 matched retirements, 125 thermal channels, 11 native park acknowledgements |
+
+Both completed the 1 MiB CDC roundtrip, full device-tree upload/readback,
+explicit KIS restoration, prepared-tree audit and final Linux health check.
+Every physical PMU guard passed with a zero counter. Timings cover payload
+write plus full readback, not the complete boot. The runtime build used
+`RELEASE=1 CHAINLOADING=1 ESP_STAGE2=1 BUILDSTD=1 EXTRA_CFLAGS=-Oz`.
+
+This is a single-CPU, RAM-filesystem rendering smoke. It does not qualify
+SMP, suspend/resume, a full desktop or graphics conformance. Retained local
+evidence also includes the earlier failed host/transport attempts; their
+markers were preserved, and uncertain transitions were not treated as passes.
