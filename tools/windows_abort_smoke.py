@@ -170,8 +170,15 @@ def execute(args, out, nonce, report):
                     len(bsps) == 1 and aps, "no unambiguous boot CPU and waiting AP"
                 )
                 bsp, ap = bsps[0], aps[0]
-                target = int(ap.reg)
-                bsp_affinity = int(bsp.reg)
+                require(
+                    ap.cluster_type in ("E", "P") and bsp.cluster_type in ("E", "P"),
+                    "unknown CPU cluster type",
+                )
+                # Match the public PSCI topology: ADT omits Aff2 on P cores.
+                target = int(ap.reg) | ((1 << 16) if ap.cluster_type == "P" else 0)
+                bsp_affinity = int(bsp.reg) | (
+                    (1 << 16) if bsp.cluster_type == "P" else 0
+                )
                 require(
                     target != bsp_affinity and ap.cpu_id != bsp.cpu_id, "AP equals BSP"
                 )
@@ -262,7 +269,7 @@ def execute(args, out, nonce, report):
                 require(
                     len(replies) == 1
                     and replies[0]["status"] == session.proxy.S_ERROR
-                    and replies[0]["value"] == -1,
+                    and replies[0]["value"] == 0,
                     "abort did not return explicit failure after drain",
                 )
                 report["guest_state"] = "returned-failure"

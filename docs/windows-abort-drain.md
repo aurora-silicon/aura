@@ -48,11 +48,18 @@ starts that AP through PSCI, then the AP waits until it observes the boot CPU's
 heartbeat before reading a deliberately unmapped IPA. The runner checks the
 stage-2 mapping is absent before entry; it never points the fault at a device.
 
+ADT `reg` omits Aff2=1 on performance cores. CPU selection must include the
+validated E/P cluster type when forming the PSCI affinity and checking the
+guest MPIDR; comparing a performance core directly with `reg` rejects a valid
+run. Unknown cluster types must fail admission.
+
 The first exception bytes must be saved inside the callback before EXIT_GUEST,
 not recovered from the reused exception stack afterward. The faulting CPU,
-PC, FAR, nonce and result state must match the prepared guest. A negative
-P_HV_START result, the completed CPU-join log and a responsive proxy are all
-required. The boot CPU has a ten-second guest deadline and returns SYSTEM_OFF
+PC, FAR, nonce and result state must match the prepared guest. The P_HV_START wire reply must carry S_ERROR with its zero-initialized return
+value, because the public proxy maps a negative hv_start() result to status
+rather than copying it into retval. The completed CPU-join log and a responsive
+proxy are also required. A harness that instead requires retval == -1 would
+reject a correctly drained abort before collecting its final result page. The boot CPU has a ten-second guest deadline and returns SYSTEM_OFF
 with a failure marker if the abort incorrectly leaves it running. That path
 must fail qualification, as must a host timeout, an unexpected exception,
 successful return, missing heartbeat, or any continuation past the fault.
