@@ -629,7 +629,9 @@ static int dt_set_stdout_path(int chosen)
 /*
  * Publish the physical window the OS runs in at EL2. With CONFIG_ARM64_CTXR_EXECMEM
  * the kernel confines all of its executable code (static text, modules, BPF,
- * kprobes, ftrace) to it, and U-Boot places itself and the kernel inside it.
+ * kprobes, ftrace) to it. U-Boot relocates its image there, which holds its EFI
+ * runtime code, and loads the kernel there. A kernel that finds EFI runtime code
+ * outside the window turns runtime services off.
  */
 static int dt_set_ctxr_exec_window(int node)
 {

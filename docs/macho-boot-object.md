@@ -81,6 +81,14 @@ runs on every chip, not on a list of chips: a Mac without the windows (M1 to M3,
 or any raw boot object) runs it and boots as it always did, and aura never reads a
 `CTXR` register there. There is no boot option or build option.
 
+With no secondary running there is nobody to ask, which happens where
+`smp_start_secondaries()` fails, and on T6040 in Mach-O mode until the RVBAR at
+its load base can be forwarded. Aura then keeps no answer, reads `CTXR_D` under an
+exception guard, and warns if it is armed. The OS still starts, outside the window,
+on the boot CPU alone, because `dt_set_cpus()` drops every CPU that isn't running.
+A probe that was sent and didn't finish also counts as not confined, and is not
+repeated.
+
 WFI wipes the general registers, the vector registers and NZCV on these
 cores, from EL2, EL1 and EL0, on E and P cores. FPCR, `SP_EL0` and the 33
 system registers we tracked survive, including the pointer authentication
@@ -129,6 +137,11 @@ read the registers on each chip:
   Other chips use `CTXR_A` to `CTXR_C` and the `CTRR_C` and `CTRR_D` ranges.
 - `boot_args` is not in the window, and the heap starts above it.
 
+Later steps refuse too, and take the same failure path. `kboot_boot()` won't place
+an image without the `ARM\x64` magic, or one that doesn't fit the window. It also
+won't place one when the initrd or the device tree overlaps the window. A described
+bootloader handoff that overlaps the window fails `kboot_prepare_dt()`.
+
 ### Which Stage 2 a Stage 1 loads
 
 A Stage 2 from this tree can only run under a padded Stage 1, so on Mach-O chips a
@@ -143,13 +156,65 @@ bytes, and fatfs is built with long file names.
 
 A kernel aura loads itself, with `boot=` or an inline payload, can use the window
 directly. Booting through U-Boot and GRUB needs U-Boot support for it
-(aurora-silicon/u-boot#32): when `/chosen/aurora,ctxr-exec-window` is present,
-U-Boot loads an arm64 `Image` at the lowest free 2 MiB boundary inside it, on
-both the EFI path (GRUB's `LoadImage`) and `booti`, and tells the EFI stub to
-run it in place. Without that U-Boot change the image lands outside the window
-and an enforcing kernel panics in `ctxr_exec_reserve()`. A compressed (zboot)
-kernel cannot be pinned and is refused. Aura has no CPU off for spin-table, so
-taking a CPU offline and back is up to the kernel.
+(aurora-silicon/u-boot#32). When `/chosen/aurora,ctxr-exec-window` is present:
+
+- U-Boot relocates its image, which holds its EFI runtime code, to the top of the
+  window. Other EFI runtime code it allocates goes in the window too. Its malloc
+  area and EFI stack stay outside, since no confined core runs them.
+- It loads an arm64 `Image` at the lowest free 2 MiB boundary in the window, on both
+  the EFI path (GRUB's `LoadImage`) and `booti`, and tells the EFI stub to run it in
+  place.
+
+Without that U-Boot change the image lands outside the window and an enforcing
+kernel panics in `ctxr_exec_reserve()`. A kernel that finds EFI runtime code outside
+the window, or misaligned, warns and turns runtime services off for that boot. A
+compressed (zboot) kernel cannot be pinned and is refused.
+
+### What a confined Mac loses
+
+These all worked under the monitor, or were reachable through it:
+
+- **CPU hotplug.** Spin-table has no CPU off, and aura no longer parks a core for
+  the OS. The kernel in aurora-silicon/linux#985 has no `cpu_die` for spin-table, so
+  taking a CPU offline fails with `EOPNOTSUPP`. Suspend to RAM and hibernation take
+  the secondaries offline the same way, so they fail there too. A separate kernel
+  patch that parks the core itself ran once on a Neo, and it isn't in that PR.
+- **PSCI `SYSTEM_OFF` and `SYSTEM_RESET`.** Power-off now needs `macsmc-reboot`.
+  Restart needs that or the Apple watchdog. The J700 tree describes both, but
+  `macsmc-reboot` is a module in the asahi config, so a kernel that hasn't loaded it
+  can only restart through the watchdog and can't power off.
+- **kexec and kdump.** aurora-silicon/linux#985 refuses both with `EOPNOTSUPP` under
+  an enforcing window, because the relocation code runs outside it.
+- **`cpuidle-psci`.** This loses less than it sounds. No Apple tree in the kernel has
+  `cpu-idle-states`, so `cpuidle-psci` had no states to register under the monitor
+  either. `cpuidle-apple` binds on T8140 through `apple,t8140-cpuidle`, which the J700
+  tree enables. Both of its states are plain WFI there, because the deep state's
+  `CYC_OVRD` write is undefined on that chip. This comes from reading the driver and
+  trees, and no boot has confirmed it.
+- **NV2 and PV-KVM.** Both are gone, and with them the only `/dev/kvm` measured on a
+  confined Mac. KVM at EL2 in the window hasn't been tried.
+
+Idle power in this mode hasn't been measured, and the J700 is fanless, so it needs
+measuring on a Neo.
+
+### Device trees
+
+Every running secondary needs `cpu-release-addr` in the kernel's tree, or
+`dt_set_cpus()` fails the boot. The monitor used to replace it with PSCI. In
+`integration/aurora` of aurora-silicon/linux:
+
+| Chip  | Tree                                   | Result                            |
+| ----- | -------------------------------------- | --------------------------------- |
+| T8140 | `t8140.dtsi`                           | spin-table on all 6 CPUs          |
+| T8132 | `t8132.dtsi`                           | spin-table on all 10 CPUs         |
+| T8142 | `t8142-j813.dts`                       | spin-table on all 10 CPUs         |
+| T6041 | `t604x.dtsi`, `t6041.dtsi`             | spin-table on all 16 CPUs         |
+| T6040 | `t604x.dtsi`, `t6040.dtsi`             | all but `cpu@10100`, the boot CPU |
+| T605x | none                                   | no tree, so no Linux to boot      |
+
+T6040 only works if iBoot really boots it on `cpu@10100`, which the tree's comment
+says but nothing here has checked. None of this says those chips boot. It only
+means the tree doesn't rule them out.
 
 ## Status
 
@@ -160,4 +225,5 @@ earlier version of this code that had the window at 256 MiB, Linux reached a log
 at EL2 on all six CPUs from NVMe through U-Boot's `booti`, on one boot.
 
 Not tested: this code on any hardware, a 128 MiB window on hardware, the refusal
-path, and any chip other than T8140.
+path, idle power in this mode, restart and power-off without PSCI, and any chip
+other than T8140.
