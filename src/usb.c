@@ -474,6 +474,29 @@ void usb_iodev_vuart_setup(iodev_id_t iodev)
 
 int usb_cdc_link_start(void (*set_step)(unsigned step), bool force_swapped)
 {
+    if (chip_id == T8142) {
+        /* Normal J813 startup already initialized USB0. Do not reinitialize
+         * its live controller or DART during the carrier transition. */
+        return !force_swapped && board_id == 0x24 && iodev_get_opaque(IODEV_USB0) ? 0 : -1;
+    }
+    if (chip_id == T8152) {
+        if (force_swapped || iodev_get_opaque(IODEV_USB0))
+            return -1;
+        struct iodev *device = memalign(SPINLOCK_ALIGN, sizeof(*device));
+        if (!device)
+            return -1;
+        dwc3_dev_t *dwc = usb_t8152_init(set_step);
+        if (!dwc) {
+            free(device);
+            return -1;
+        }
+        device->ops = &iodev_usb_ops;
+        device->opaque = dwc;
+        device->usage = USAGE_CONSOLE | USAGE_UARTPROXY;
+        spin_init(&device->lock);
+        iodev_register_device(IODEV_USB0, device);
+        return 0;
+    }
     if (chip_id != T8140 || iodev_get_usage(IODEV_USB0))
         return -1;
     set_step(3);

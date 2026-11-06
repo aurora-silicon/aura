@@ -75,8 +75,8 @@ def test_status_and_power_reads_require_complete_values(tmp_path):
     source = (ROOT / "src/tps6598x.c").read_text()
     status = source[source.index("int tps6598x_cmd_status("):
                     source.index("int tps6598x_disable_irqs(")]
-    power = source[source.index("int tps6598x_powerup("):
-                   source.index("int tps6598x_enter_kis(")]
+    power_start = source.index("int tps6598x_powerup(")
+    power = source[power_start:source.index("\n}", power_start) + 2]
     harness = r'''
 #include <assert.h>
 #include <stdint.h>

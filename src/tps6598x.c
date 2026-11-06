@@ -316,19 +316,24 @@ int tps6598x_powerup(tps6598x_dev_t *dev)
     return 0;
 }
 
-int tps6598x_enter_kis(tps6598x_dev_t *dev)
+/*
+ * Unlock the port controller with the board key, enter DBMa, run one DVEn
+ * route action and leave DBMa again. The route action selects what the
+ * USB2 pair of this port carries; see tps6598x_enter_kis() and
+ * tps6598x_route_ap_usb2().
+ */
+static int tps6598x_dbma_route(tps6598x_dev_t *dev, const u8 vdm[4], const char *who, bool reset_ok)
 {
     u32 target_len = 0;
     const u8 *target = adt_getprop(adt, 0, "target-type", &target_len);
     u8 key[4] = {0};
     const u8 key_null[4] = {0, 0, 0, 0};
-    const u8 vdm[] = {0x06, 0x46, 0x82, 0x01};
     u32 mode = 0;
     u8 out = 0;
     u8 en = 1;
     int ret;
 
-    if (target_len < 4)
+    if (!target || target_len < 4)
         return -1;
 
     // reverse the key
@@ -337,6 +342,8 @@ int tps6598x_enter_kis(tps6598x_dev_t *dev)
 
     // check status and soft reset if it fails
     if (tps6598x_cmd_status(dev, "LOCK")) {
+        if (!reset_ok)
+            return -1;
         if (tps6598x_command(dev, "Gaid", NULL, 0, NULL, 0))
             return -1;
         mdelay(20);
@@ -344,26 +351,26 @@ int tps6598x_enter_kis(tps6598x_dev_t *dev)
 
     ret = tps6598x_command(dev, "LOCK", key, 4, (u8 *)&out, 1);
     if (ret || (out & 0xf)) {
-        printf("tps6598x_enter_kis: Failed to unlock using '%.4s': ret=%d result=0x%hhx\n", key,
-               ret, out & 0xf);
+        printf("%s: Failed to unlock using '%.4s': ret=%d result=0x%hhx\n", who, key, ret,
+               out & 0xf);
         return -1;
     }
 
     ret = tps6598x_command(dev, "DBMa", &en, 1, &out, 1);
     if (ret || (out & 0xf)) {
-        printf("tps6598x_enter_kis: DBMa cmd failed: ret=%d result=0x%hhx\n", ret, out & 0xf);
+        printf("%s: DBMa cmd failed: ret=%d result=0x%hhx\n", who, ret, out & 0xf);
         return -1;
     }
 
     ret = tps6598x_read_reg(dev, TPS_REG_MODE, (u8 *)&mode, 4);
     if (ret != 4 || mode != TPS_MODE_DBMA) {
-        printf("tps6598x_enter_kis: Failed to enter DBMa mode, mode=0x%08x\n", mode);
+        printf("%s: Failed to enter DBMa mode, mode=0x%08x\n", who, mode);
         return -1;
     }
 
-    ret = tps6598x_command(dev, "DVEn", vdm, sizeof(vdm), &out, 1);
+    ret = tps6598x_command(dev, "DVEn", vdm, 4, &out, 1);
     if (ret || (out & 0xf)) {
-        printf("tps6598x_enter_kis: DVEn cmd failed: ret=%d result=0x%hhx\n", ret, out & 0xf);
+        printf("%s: DVEn cmd failed: ret=%d result=0x%hhx\n", who, ret, out & 0xf);
         return -1;
     }
 
@@ -373,6 +380,25 @@ int tps6598x_enter_kis(tps6598x_dev_t *dev)
         return -1;
 
     return ret;
+}
+
+int tps6598x_enter_kis(tps6598x_dev_t *dev)
+{
+    /* DVEn 0x01824606: the debug (KIS) function on this port's USB2 pair. */
+    static const u8 vdm[] = {0x06, 0x46, 0x82, 0x01};
+    return tps6598x_dbma_route(dev, vdm, "tps6598x_enter_kis", true);
+}
+
+int tps6598x_route_ap_usb2(tps6598x_dev_t *dev)
+{
+    /*
+     * DVEn 0x01820606: connect this port's primary USB2 pair to the AP USB
+     * controller instead of the debug function. This ends KIS on the port
+     * until the host routes it back (macvdmctl debugusb). It is not the
+     * separate 0x0106 action, which reboots into DFU.
+     */
+    static const u8 vdm[] = {0x06, 0x06, 0x82, 0x01};
+    return tps6598x_dbma_route(dev, vdm, "tps6598x_route_ap_usb2", false);
 }
 
 int tps6598x_foreach_hpm(hpm_match_t *match, hpm_action_t *action, void *data)
