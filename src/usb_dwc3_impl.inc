@@ -1035,7 +1035,11 @@ static void usb_dwc3_ep0_handle_class(dwc3_dev_t *dev, const union usb_setup_pac
             } else {
                 usb_debug_printf("ACM device closed\n");
             }
-            if (usb_dwc3_start_status_phase(dev, USB_LEP_CTRL_IN)) {
+            if (chip_id == T8142 || chip_id == T8152) {
+                /* Wait for XferNotReady before the no-data status TRB on M5/M6,
+                 * for both DTR-open and DTR-close requests. */
+                dev->ep0_state = USB_DWC3_EP0_STATE_DATA_SEND_STATUS;
+            } else if (usb_dwc3_start_status_phase(dev, USB_LEP_CTRL_IN)) {
                 dev->pipe[pipe].ready = false;
 #if USB_DWC3_SUPERSPEED
                 dev->primary_dtr_pending = false;
@@ -2169,16 +2173,15 @@ void usb_dwc3_flush(dwc3_dev_t *dev, cdc_acm_pipe_id_t pipe)
         return;
 
     u8 ep = dev->pipe[pipe].ep_in;
-#if USB_DWC3_SUPERSPEED
+    /* After the host restores KIS, USB2 may retain an open pipe with TX
+     * pending. Console flushing must not block a guarded RAM handoff. */
+    bool bounded = USB_DWC3_SUPERSPEED || chip_id == T8142 || chip_id == T8152;
     u64 start = get_ticks();
-#endif
 
     while (CDC_LOOP_READY(dev, pipe) &&
            (ringbuffer_get_used(device2host) != 0 || dev->endpoints[ep].xfer_in_progress)) {
-#if USB_DWC3_SUPERSPEED
-        if (ticks_to_msecs(get_ticks() - start) >= CDC_IO_TIMEOUT_MS)
+        if (bounded && ticks_to_msecs(get_ticks() - start) >= 3000)
             return;
-#endif
         usb_dwc3_handle_events(dev);
     }
 }

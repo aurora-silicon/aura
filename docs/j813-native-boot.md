@@ -74,3 +74,11 @@ binary manifest; a build or proxy reconnect alone is not a boot pass.
 This milestone does not qualify SMP, KVM, cpufreq, suspend, native DCP/GPU,
 input, storage, audio, networking or USB host devices. Leave the installed
 bootloader and internal disks unchanged during RAM testing.
+
+## Guarded direct Image uploads
+
+`proxyclient/tools/boot_j813.py` provides separate prepare, audit and boot
+phases for the current public J813 kernel/firmware profile, plus optional
+verified CDC uploads. It checks the matching Mach-O/ELF pair, physical PMU
+receipts, full upload readbacks and the prepared device tree. See
+[CDC boot uploads](cdc-boot.md) for the guarded procedure and transport limits.

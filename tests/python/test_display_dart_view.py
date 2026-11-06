@@ -102,6 +102,13 @@ static void write32(u64 addr, u32 data);
 static u32 set32(u64 addr, u32 set);
 static int poll32(u64 addr, u32 mask, u32 target, u32 timeout);
 #define dma_wmb() ((void)0)
+/* Cold USB stream construction is outside this display-view model. */
+static void dc_cvac_range(void *addr, size_t size)
+{
+    (void)addr;
+    (void)size;
+    assert(!"cold-stream cache clean reached the display-view model");
+}
 bool is_heap(void *addr);
 static void *test_memalign(size_t align, size_t size);
 static void *test_calloc(size_t count, size_t size);
