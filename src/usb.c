@@ -132,9 +132,19 @@ static int usb_drd_adt_offset(u32 idx, char drd_path[sizeof(FMT_DRD_PATH)], int 
 /*
  * The ADT marks ports that must never run as a USB device with usb-device-disable, for
  * example the J773 front ports, whose hub prohibits device mode. Leave those alone.
+ *
+ * The T8140 CDC handoff (usb_cdc_link_start) is the exception: J700's ATC0 usb-drd carries
+ * the property too, yet that port is the debug port. The handoff has already cold-reset its
+ * HPM and taken the carrier over, and explicitly asks for device mode on it, so it bypasses
+ * the property. Every other bring-up still honours it.
  */
+static bool usb_cdc_device_override;
+
 static bool usb_device_mode_disabled(u32 idx)
 {
+    if (usb_cdc_device_override && chip_id == T8140 && idx == 0)
+        return false;
+
     int adt_drd_path[8];
     char drd_path[sizeof(FMT_DRD_PATH)];
     int node = usb_drd_adt_offset(idx, drd_path, adt_drd_path);
@@ -501,11 +511,16 @@ int usb_cdc_link_start(void (*set_step)(unsigned step), bool force_swapped)
         return -1;
     set_step(3);
     usb_cdc_atc_force_swapped(force_swapped);
-    if (usb_phy_bringup(0))
+    usb_cdc_device_override = true;
+    int phy = usb_phy_bringup(0);
+    if (phy) {
+        usb_cdc_device_override = false;
         return -1;
+    }
 
     set_step(4);
     dwc3_dev_t *dwc = usb_iodev_bringup(0);
+    usb_cdc_device_override = false;
     if (!dwc)
         return -1;
 
