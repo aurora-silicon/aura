@@ -22,5 +22,6 @@ typedef int64_t s64;
 #define HAVE_PTRDIFF_T 1
 #define HAVE_UINTPTR_T 1
 #define UPTRDIFF_T     uintptr_t
+#define PACKED         __attribute__((packed))
 
 #endif
