@@ -608,7 +608,7 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
         case P_HV_WINDOWS_CAPS:
             /* Read-only personality/ABI probe; never initializes hardware. */
 #ifdef AURA_WINDOWS
-            reply->retval = 0x4157494e000101ffULL;
+            reply->retval = 0x4157494e000103ffULL;
 #else
             reply->retval = 0;
 #endif

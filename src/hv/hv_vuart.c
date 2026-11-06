@@ -129,7 +129,7 @@ static bool handle_vuart(struct exc_info *ctx, u64 addr, u64 *val, bool write, i
                     iodev_write(IODEV_USB_VUART, &b, 1);
 #endif
 #ifdef AURA_WINDOWS
-                if (!hv_windows_serial_capture_enabled())
+                if (!hv_windows_serial_capture_enabled() && !hv_windows_serial_cdc_enabled())
 #endif
                     handle_vuart_passthrough(b);
                 break;

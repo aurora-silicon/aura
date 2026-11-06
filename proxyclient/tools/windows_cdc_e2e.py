@@ -46,7 +46,7 @@ def main():
     report = {"result": "failed", "hardware_accessed": False, "hardware_qualified": False,
               "host_sources": source_manifest(), "cases": []}
     try:
-        for case in ("success", "empty", "guest-error", "prepare-error", "open-error",
+        for case in ("old-resident-error", "missing-config-error", "success", "empty", "guest-error", "prepare-error", "open-error",
                      "initial-read-error", "running-read-error", "cancel-blocked-reader", "wrong-carrier-error"):
             trace, ports = [], []
             folder = out / case
@@ -92,8 +92,10 @@ def main():
                 validate_serial_transport = HardwareSession.validate_serial_transport
                 def capabilities(self):
                     trace.append("capabilities")
-                    # Raw CDC requires no framed-capture or configuration bit.
-                    return CAPS_MAGIC | (1 << 16) | REQUIRED_CAPS
+                    flags = REQUIRED_CAPS | 0x40 | 0x200
+                    if case == "old-resident-error": flags &= ~0x200
+                    if case == "missing-config-error": flags &= ~0x40
+                    return CAPS_MAGIC | (1 << 16) | flags
                 def identity(self):
                     trace.append("identity")
                     return {"chip_id": 0x8142, "model": "Mac17,3"}
@@ -138,9 +140,11 @@ def main():
             receipt = json.loads((folder / "launch.json").read_text())
             assert receipt["serial"]["mode"] == "cdc"
             assert not receipt["windows_ready"] and not receipt["hardware_qualified"]
-            if case in ("open-error", "initial-read-error", "wrong-carrier-error"):
+            if case in ("old-resident-error", "missing-config-error"):
+                assert trace == ["open-primary", "capabilities", "close-primary"] and not ports
+            if case in ("old-resident-error", "missing-config-error", "open-error", "initial-read-error", "wrong-carrier-error"):
                 assert not receipt["target_mutated"] and "prepare" not in trace
-            if case not in ("open-error", "wrong-carrier-error"):
+            if case not in ("old-resident-error", "missing-config-error", "open-error", "wrong-carrier-error"):
                 capture = receipt["serial"]
                 assert capture["reader_stopped"] and not capture["capture_complete"]
                 assert capture["target_dropped_bytes"] is None and not capture["received_final"]

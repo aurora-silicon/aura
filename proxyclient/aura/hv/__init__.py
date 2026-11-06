@@ -1401,7 +1401,8 @@ class HV(Reloadable):
     def init(self):
         if self.windows:
             from ..windows import (CONFIGURATION, CONFIG_FRAMEBUFFER_SHADOW,
-                                   CONFIG_T8142_EXPERIMENTAL, CONFIG_SERIAL_CAPTURE, validate_capabilities)
+                                   CONFIG_T8142_EXPERIMENTAL, CONFIG_SERIAL_CAPTURE,
+                                   CONFIG_SERIAL_CDC, validate_capabilities)
             caps = validate_capabilities(self.p.hv_windows_capabilities(), self.windows_framebuffer,
                                          self.windows_guest_compatibility, self.windows_n1,
                                          self.windows_memory_guard is not None, self.windows_serial)
@@ -1430,6 +1431,8 @@ class HV(Reloadable):
                     flags |= CONFIG_T8142_EXPERIMENTAL
                 if self.windows_serial == "capture":
                     flags |= CONFIG_SERIAL_CAPTURE
+                elif self.windows_serial == "cdc":
+                    flags |= CONFIG_SERIAL_CDC
                 if self.p.hv_windows_configure(flags) != 0:
                     raise RuntimeError("Windows hypervisor configuration rejected")
 

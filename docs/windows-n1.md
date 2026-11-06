@@ -7,6 +7,9 @@ Aura session. The operation does not load N1 firmware or install DART tables.
 
 The producer checks the live J813 identity (`T8142`, board `0x24`, `Mac17,3`),
 ADT register apertures, the PCI memory window and the GPIO/SMC reset functions.
+The SMC reset provider must be `smc-pmu` below
+`/arm-io/smc/iop-smc-nub`, with the expected controller, nub and provider types.
+The bridge's reset phandle names that PMU child, not the SMC controller itself.
 The exported six resources are subranges of those checked ADT apertures. Before
 training, SID0 must be disabled, unprotected and without a page-table root; the
 DART translation geometry and idle command state must also match. An existing
@@ -90,12 +93,17 @@ python3 tools/windows_n1_e2e.py --output build/windows-n1-e2e
 
 Use a new output directory for every run. The runner copies the production
 producer, its dependencies and the existing failure-first model into a source
-snapshot, compiles that snapshot with ASan/UBSan, and runs the 31 scenarios in
+snapshot, compiles that snapshot with ASan/UBSan, and runs the 40 scenarios in
 separate processes. The tests exercise the complete preparation entry point
 against modelled ADT, MMIO and endpoint behavior. They cover successful handoff,
 identity/resource/reset-function rejection, locked/active/busy DART, pre-existing
 or newly enabled bus mastering, training failure, wrong endpoint identity, BAR
 probe/readback faults, active ROM, and failed cleanup quarantine.
+The reset-provider fixture retains only paths, compatible strings, phandles and
+the reset tuple from a captured J813 ADT. It reproduces the controller-versus-PMU
+phandle mismatch and checks that missing, moved or mistyped providers and changed
+reset targets/operations are rejected before MMIO. The rest of the ADT service
+remains modeled; this does not test the production ADT parser.
 The census scenarios additionally exercise preparation gating, nonzero boot
 CPU identity, protocol/address rejection, all 17 allowed reads, nested guard
 and SError-state rejection, and load/barrier fault reporting without writes.

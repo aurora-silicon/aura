@@ -43,8 +43,9 @@ static void usb_iodev_init(void) {}
 static u64 get_ticks(void) { return 0; }
 static u64 ticks_to_msecs(u64 ticks) { return ticks; }
 static void write8(u64 address, u8 value) { (void)address; (void)value; }
-static bool model_enabled = true, model_ready = true;
+static bool model_enabled = true, model_ready = true, model_cdc;
 static bool hv_windows_serial_capture_enabled(void) { return model_enabled; }
+static bool hv_windows_serial_cdc_enabled(void) { return model_cdc; }
 static void udelay(unsigned x) { (void)x; }
 #define mdelay(x) udelay((x)*1000)
 #define sysop(x) ((void)(x))
@@ -54,7 +55,7 @@ static void hexdump(const void *a, size_t b) { (void)a; (void)b; }
 bool monitor_active;
 static unsigned atomic_calls;
 static size_t maximum_frame;
-static FILE *frames;
+static FILE *frames, *cdc_bytes;
 #include "../../src/iodev.h"
 static ssize_t model_atomic(void *opaque, const void *buffer, size_t count) {
     (void)opaque; atomic_calls++;
@@ -67,7 +68,9 @@ static ssize_t model_atomic(void *opaque, const void *buffer, size_t count) {
 static bool no_write(void *opaque) { (void)opaque; return false; }
 static bool discard_ready(void *opaque) { (void)opaque; return true; }
 static ssize_t discard_write(void *opaque, const void *b, size_t n) {
-    (void)opaque; (void)b; return n;
+    (void)opaque;
+    if (model_cdc) assert(fwrite(b, 1, n, cdc_bytes) == n);
+    return n;
 }
 static ssize_t no_read(void *opaque) { (void)opaque; return 0; }
 static ssize_t forbidden_write(void *opaque, const void *b, size_t n) {
@@ -95,7 +98,7 @@ static int hv_map_hook(u64 base, bool (*fn)(struct exc_info *,u64,u64*,bool,int)
 #include "../../src/hv/hv_vuart.c"
 
 int main(int argc, char **argv) {
-    assert(argc == 4);
+    assert(argc == 4 || argc == 5);
     const char *mode = argv[1];
     FILE *input = fopen(argv[2], "rb"); assert(input);
     frames = fopen(argv[3], "wb"); assert(frames);
@@ -104,6 +107,12 @@ int main(int argc, char **argv) {
     assert(!iodev_has_atomic_write(IODEV_NUM));
     assert(hv_windows_serial_available());
     if (!strcmp(mode, "disabled")) model_enabled = false;
+    if (!strcmp(mode, "cdc")) {
+        assert(argc == 5);
+        model_enabled = false;
+        model_cdc = true;
+        cdc_bytes = fopen(argv[4], "wb"); assert(cdc_bytes);
+    }
     if (!strcmp(mode, "unsupported")) {
         uartproxy_iodev = IODEV_UART;
         assert(!hv_windows_serial_available());
@@ -127,6 +136,7 @@ int main(int argc, char **argv) {
     assert(atomic_calls == before);
     if (!model_enabled || !strcmp(mode, "unsupported")) assert(atomic_calls == 0);
     fclose(input); fclose(frames);
+    if (cdc_bytes) fclose(cdc_bytes);
     printf("{\"atomic_calls\":%u,\"max_frame\":%zu,\"dropped\":%llu}\n",
            atomic_calls, maximum_frame, (unsigned long long)serial_dropped);
     return 0;

@@ -91,6 +91,21 @@ def main():
             return recorder.summary()
 
         binary_data = b"HVLOG: " + bytes(range(256)) + b"\xff\x55\xaa\x05\0\r\nTAIL"
+        folder = out / "cdc-isolation"
+        folder.mkdir()
+        cdc_data = b"HVLOG: \xff\x55\xaa\x05\xff\xff\0\0" + bytes(range(256))
+        (folder / "input.bin").write_bytes(cdc_data)
+        cdc_run = subprocess.run([str(binary), "cdc", str(folder / "input.bin"),
+                                  str(folder / "frames.bin"), str(folder / "secondary.bin")],
+                                 capture_output=True, timeout=10)
+        (folder / "native-stdout.bin").write_bytes(cdc_run.stdout)
+        (folder / "native-stderr.bin").write_bytes(cdc_run.stderr)
+        cdc_run.check_returncode()
+        cdc_native = json.loads(cdc_run.stdout)
+        assert cdc_native["atomic_calls"] == 0 and (folder / "frames.bin").read_bytes() == b""
+        assert (folder / "secondary.bin").read_bytes() == cdc_data
+        report["cases"].append({"case": "cdc-isolation", "native": cdc_native,
+                                 "secondary_sha256": digest(folder / "secondary.bin")})
         cases = {"binary": binary_data, "sentinel": binary_data,
                  "newline": b"first\nsecond\n", "tick": b"unterminated",
                  "overflow": b"Z" * 5000, "no-host": b"N" * 5000,

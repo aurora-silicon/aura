@@ -81,6 +81,10 @@ static bool hv_windows_serial_capture_enabled(void)
 {
     return true;
 }
+static bool hv_windows_serial_cdc_enabled(void)
+{
+    return false;
+}
 void hv_windows_serial_putc(u8 byte)
 {
     assert(capture_count < sizeof(capture_bytes));
