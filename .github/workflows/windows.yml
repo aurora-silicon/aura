@@ -34,6 +34,7 @@ jobs:
           python proxyclient/tools/windows_launcher_e2e.py --out build/windows-admission
           python proxyclient/tools/windows_hv_e2e.py --out build/windows-host-hv
           python tools/windows_n1_e2e.py --output build/windows-n1
+          python tools/windows_serial_e2e.py --output build/windows-serial
           python tools/windows_hv_smoke.py --build-only --chip-id 0x8142 --model Mac17,3 --output build/windows-hardware-probe
           python tools/windows_n1_smoke.py --build-only --output build/windows-n1-hardware-probe
       - uses: actions/upload-artifact@v7
@@ -51,3 +52,4 @@ jobs:
             build/windows-hardware-probe
             build/windows-n1-hardware-probe
             build/windows-n1
+            build/windows-serial

@@ -136,6 +136,25 @@ ssize_t iodev_write_atomic(iodev_id_t id, const void *buf, size_t length)
     return ret;
 }
 
+bool iodev_has_atomic_write(iodev_id_t id)
+{
+    return (unsigned)id < IODEV_NUM && iodevs[id] && iodevs[id]->ops &&
+           iodevs[id]->ops->write_atomic;
+}
+
+/* Unlike iodev_write_atomic(), never fall back to a blocking write. */
+ssize_t iodev_try_write_atomic(iodev_id_t id, const void *buf, size_t length)
+{
+    if (!iodev_has_atomic_write(id))
+        return -1;
+    if (mmu_active())
+        spin_lock(&iodevs[id]->lock);
+    ssize_t ret = iodevs[id]->ops->write_atomic(iodevs[id]->opaque, buf, length);
+    if (mmu_active())
+        spin_unlock(&iodevs[id]->lock);
+    return ret;
+}
+
 ssize_t iodev_queue(iodev_id_t id, const void *buf, size_t length)
 {
     if (!iodevs[id] || !iodevs[id]->ops->queue)

@@ -20,8 +20,10 @@ FRAMEBUFFER_SHADOW = 0x0010
 N1_HANDOFF = 0x0020
 CONFIGURATION = 0x0040
 MEMORY_PREFLIGHT = 0x0080
+SERIAL_CAPTURE = 0x0100
 CONFIG_T8142_EXPERIMENTAL = 0x0001
 CONFIG_FRAMEBUFFER_SHADOW = 0x0002
+CONFIG_SERIAL_CAPTURE = 0x0004
 MAX_IMAGE = 1024 * 1024 * 1024
 N1_PROPERTY = "aura,windows-n1-v1"
 N1_BYTES = 128
@@ -46,19 +48,21 @@ def number(value, label):
 
 
 def validate_capabilities(value, framebuffer="native", guest_compatibility="none", n1="disabled",
-                          reserved_memory=False):
+                          reserved_memory=False, serial="disabled"):
     require(isinstance(value, int) and value >> 32 == CAPS_MAGIC >> 32,
             "resident is not an explicit Windows Aura personality")
     require((value >> 16) & 0xffff == CAPS_ABI, "unsupported Windows Aura capability ABI")
     require(value & REQUIRED_CAPS == REQUIRED_CAPS, "resident lacks required Windows capabilities")
     if framebuffer == "bgra-shadow":
         require(value & FRAMEBUFFER_SHADOW, "resident lacks the framebuffer conversion backend")
-    if framebuffer != "native" or guest_compatibility != "none":
+    if framebuffer != "native" or guest_compatibility != "none" or serial != "disabled":
         require(value & CONFIGURATION, "resident lacks explicit Windows configuration")
     if n1 != "disabled":
         require(value & N1_HANDOFF, "resident lacks the N1 handoff producer")
     if reserved_memory:
         require(value & MEMORY_PREFLIGHT, "resident lacks read-only memory reservation preflight")
+    if serial != "disabled":
+        require(value & SERIAL_CAPTURE, "resident lacks framed Windows serial capture")
     return value & 0xffff
 
 
@@ -79,6 +83,7 @@ class LaunchPlan:
     n1: str
     reserved_memory: tuple
     boot_args: str
+    serial: str = "disabled"
 
 
 def plan_profile(filename):
@@ -90,7 +95,7 @@ def plan_profile(filename):
     require(isinstance(profile, dict), "profile must be an object")
     require(profile.get("schema") == "aura.windows.boot.v1", "unsupported Windows boot profile")
     require(set(profile) <= {"schema", "name", "target", "mu", "append", "framebuffer", "boot_args",
-                             "guest_compatibility", "usb", "n1", "reserved_memory"},
+                             "guest_compatibility", "usb", "n1", "reserved_memory", "serial"},
             "unknown Windows profile field")
     require(isinstance(profile.get("name"), str) and 0 < len(profile["name"]) <= 80, "profile name is required")
     target = profile.get("target")
@@ -140,6 +145,8 @@ def plan_profile(filename):
             "t8142-experimental compatibility requires chip 0x8142")
     usb = profile.get("usb", "disabled")
     require(usb == "disabled", "USB handoff is not implemented; usb must be disabled")
+    serial = profile.get("serial", "disabled")
+    require(serial in ("disabled", "capture"), "unsupported serial capture policy")
     n1 = profile.get("n1", "disabled")
     require(n1 in ("disabled", "j813-v1"), "unsupported N1 handoff profile")
     require(n1 == "disabled" or (chip == 0x8142 and model == "Mac17,3"),
@@ -175,7 +182,7 @@ def plan_profile(filename):
         cursor = offset + len(content)
     return LaunchPlan(filename, profile, raw, hashlib.sha256(raw).hexdigest(), b"".join(composed),
                       tuple(images), entry, chip, model, framebuffer, compatibility, usb, n1,
-                      tuple(reserved), boot_args)
+                      tuple(reserved), boot_args, serial)
 
 
 def _aligned(value, alignment):
@@ -290,7 +297,7 @@ def prepare_n1_handoff(hv):
 
 def source_manifest():
     root = Path(__file__).resolve().parents[1]
-    names = ("aura/windows.py", "aura/hv/__init__.py", "aura/proxy.py", "tools/boot_windows.py")
+    names = ("aura/windows.py", "aura/windows_serial.py", "aura/hv/__init__.py", "aura/proxy.py", "tools/boot_windows.py")
     return {name: hashlib.sha256((root / name).read_bytes()).hexdigest() for name in names}
 
 
@@ -328,6 +335,7 @@ class HardwareSession:
         self.iface.tty_log = log
         self.proxy = AuraProxy(self.iface, debug=False)
         self.hv = None
+        self.serial_capture = None
 
     def capabilities(self):
         return self.proxy.hv_windows_capabilities()
@@ -358,7 +366,10 @@ class HardwareSession:
 
     def prepare(self, plan):
         validate_capabilities(self.capabilities(), plan.framebuffer, plan.guest_compatibility, plan.n1,
-                              bool(plan.reserved_memory))
+                              bool(plan.reserved_memory), plan.serial)
+        if plan.serial == "capture":
+            from .windows_serial import WindowsSerialRecorder
+            self.serial_capture = WindowsSerialRecorder(Path(self.iface.tty_log.name).parent)
         from .adt import load_adt
         from .hv import HV
         from .proxyutils import ProxyUtils, bootstrap_port
@@ -393,6 +404,8 @@ class HardwareSession:
         self.hv.windows_guest_compatibility = plan.guest_compatibility
         self.hv.windows_usb = plan.usb
         self.hv.windows_n1 = plan.n1
+        self.hv.windows_serial = plan.serial
+        self.hv.windows_serial_recorder = self.serial_capture
         self.hv.init()
         self.hv.set_logfile(self.iface.tty_log)
         prepare_n1_handoff(self.hv)
@@ -411,7 +424,14 @@ class HardwareSession:
         return self.hv.start()
 
     def close(self):
-        self.iface.dev.close()
+        try:
+            if self.serial_capture is not None:
+                self.serial_capture.close()
+        finally:
+            self.iface.dev.close()
+
+    def serial_summary(self):
+        return self.serial_capture.summary() if self.serial_capture is not None else {"mode": "disabled"}
 
 
 def launch_profile(filename, device, output, session_factory=HardwareSession):
@@ -431,7 +451,7 @@ def launch_profile(filename, device, output, session_factory=HardwareSession):
             session = session_factory(device, log)
             caps = session.capabilities()
             validate_capabilities(caps, plan.framebuffer, plan.guest_compatibility, plan.n1,
-                                  bool(plan.reserved_memory))
+                                  bool(plan.reserved_memory), plan.serial)
             identity = session.identity()
             require(identity["chip_id"] == plan.chip_id and identity["model"] == plan.model,
                     "target identity does not match the Windows profile")
@@ -439,6 +459,8 @@ def launch_profile(filename, device, output, session_factory=HardwareSession):
             report["target_mutated"] = True
             session.prepare(plan)
             report["loaded"] = session.load(plan)
+            if hasattr(session, "serial_summary"):
+                report["serial"] = session.serial_summary()
             report["result"] = "guest-running"
             (output / "launch.json").write_text(json.dumps(report, indent=2) + "\n")
             result = session.start()
@@ -450,10 +472,14 @@ def launch_profile(filename, device, output, session_factory=HardwareSession):
             return report
     except BaseException as error:
         report.update(result="failed", error=type(error).__name__ + ": " + str(error))
+        if getattr(session, "serial_capture", None) is not None:
+            session.serial_capture.incomplete("launch-or-transport-error")
         raise
     finally:
         try:
             if session is not None:
                 session.close()
         finally:
+            if session is not None and hasattr(session, "serial_summary"):
+                report["serial"] = session.serial_summary()
             (output / "launch.json").write_text(json.dumps(report, indent=2) + "\n")

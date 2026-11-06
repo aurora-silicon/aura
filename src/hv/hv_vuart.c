@@ -7,6 +7,9 @@
 #include "uart.h"
 #include "uart_regs.h"
 #include "usb.h"
+#ifdef AURA_WINDOWS
+#include "windows/serial_capture.h"
+#endif
 
 bool active = false;
 
@@ -109,6 +112,9 @@ static bool handle_vuart(struct exc_info *ctx, u64 addr, u64 *val, bool write, i
                 break;
             case UTXH: {
                 uint8_t b = *val;
+#ifdef AURA_WINDOWS
+                hv_windows_serial_putc(b);
+#endif
                 /* After a sleep with the link re-taken, the S2R ring feeds the CDC pipe. */
                 bool ringed = sptm_virt_s2r_uart_byte(b);
                 if (!(ringed && vuart_tx_iodev == IODEV_USB_VUART) &&
@@ -117,7 +123,10 @@ static bool handle_vuart(struct exc_info *ctx, u64 addr, u64 *val, bool write, i
                 if (vuart_tx_mirror != IODEV_MAX && vuart_tx_mirror != vuart_tx_iodev &&
                     iodev_can_write(vuart_tx_mirror))
                     iodev_write(vuart_tx_mirror, &b, 1);
-                handle_vuart_passthrough(b);
+#ifdef AURA_WINDOWS
+                if (!hv_windows_serial_capture_enabled())
+#endif
+                    handle_vuart_passthrough(b);
                 break;
             }
             case UTRSTAT:

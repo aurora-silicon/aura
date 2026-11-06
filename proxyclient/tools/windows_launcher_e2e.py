@@ -34,7 +34,8 @@ def main():
                  "compatibility-missing", "compatibility-wrong-chip", "guest-error", "poweroff", "reset",
                  "append-offset", "append-contiguous", "append-overlap", "append-too-large",
                  "append-wrong-hash", "usb-unsupported", "n1-capability-missing", "n1-wrong-model",
-                 "reservation-capability-missing", "reservation-wrap", "reservation-bad-fields"):
+                 "reservation-capability-missing", "reservation-wrap", "reservation-bad-fields",
+                 "serial-capability-missing", "serial-invalid"):
         profile = json.loads(json.dumps(baseline))
         expected_image = firmware_bytes
         if case.startswith("append-"):
@@ -47,6 +48,7 @@ def main():
             gap = 0 if case == "append-contiguous" else 0x2000
             expected_image = firmware_bytes + bytes(gap) + ramdisk_bytes
         if case == "usb-unsupported": profile["usb"] = "enabled"
+        if case.startswith("serial-"): profile["serial"] = "capture" if case == "serial-capability-missing" else "raw"
         if case.startswith("n1-"): profile["n1"] = "j813-v1"
         if case == "n1-wrong-model": profile["target"]["model"] = "Mac17,1"
         if case.startswith("reservation-"):

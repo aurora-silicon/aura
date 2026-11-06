@@ -31,6 +31,7 @@ typedef enum _uartproxy_exc_ret_t {
 typedef enum _uartproxy_event_type_t {
     EVT_MMIOTRACE = 1,
     EVT_IRQTRACE = 2,
+    EVT_WINDOWS_SERIAL = 0x80,
 } uartproxy_event_type_t;
 
 struct uartproxy_msg_start {
@@ -44,5 +45,9 @@ int uartproxy_run(struct uartproxy_msg_start *start);
 enum stage1_proxy_result uartproxy_wait_stage1(unsigned int timeout_ms);
 int uartproxy_run_presynced(void);
 void uartproxy_send_event(u16 event_type, void *data, u16 length);
+#ifdef AURA_WINDOWS
+/* One complete frame, or no bytes. No blocking/partial-write fallback. */
+bool uartproxy_try_send_event(u16 event_type, const void *data, u16 length);
+#endif
 
 #endif
