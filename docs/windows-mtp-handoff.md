@@ -90,8 +90,12 @@ failure retains the existing allocation quarantine and prevents guest entry.
 The original phase 7 hardware log lacked this distinction. The next controlled
 run identified a rejected OSLog type-3 message, followed by type 4 on a later
 attempt. The exact replays and public non-buffer OSLog contract are documented
-in `windows-rtkit.md`. The corrected message handler still requires a new
-physical retest.
+in `windows-rtkit.md`. A subsequent J813 run with the corrected handler passed
+all preparation phases, consumed six OSLog notifications, preserved four
+DockChannel RX bytes, and let Mu publish MTP0. This proves the firmware handoff;
+Windows subsequently started `AppleMtpHid`, the HID keyboard and mouse/trackpad
+stacks in D0 without PnP problems. Physical key/pointer events and interactive
+login remain separate qualification gates.
 
 ## Repeatable offline evidence
 
