@@ -729,7 +729,9 @@
 #define SYS_IMP_APL_ASPSR_GL12 sys_reg(3, 6, 15, 9, 4)
 #define SYS_IMP_APL_ESR_GL12   sys_reg(3, 6, 15, 9, 5)
 #define SYS_IMP_APL_ELR_GL12   sys_reg(3, 6, 15, 9, 6)
+#define SYS_IMP_APL_FAR_GL12   sys_reg(3, 6, 15, 9, 7)
 #define SYS_IMP_APL_SP_GL12    sys_reg(3, 6, 15, 10, 0)
+#define SYS_IMP_APL_AFSR1_GL12 sys_reg(3, 6, 15, 0, 3)
 
 #define SYS_IMP_APL_AFSR1_GL1 sys_reg(3, 6, 15, 0, 1)
 

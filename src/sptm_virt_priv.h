@@ -24,6 +24,7 @@ bool sptm_virt_el1_va_read64(u64 va, u64 *out);
 int sptm_virt_gl_alloc(void);
 u64 *sptm_virt_gl2_slot(int cpu, u16 key);
 void sptm_virt_amx_host(void);
+void sptm_virt_amx_child(void);
 
 /* A system-register read that may UNDEF here: the fault is skipped (sptm_virt_peek_fault) and
  * the value reads as SAFE_MRS_FAILED. */
@@ -52,6 +53,13 @@ void sptm_virt_amx_host(void);
         sptm_virt_peek_active_cpu[_c] = false;                                                     \
         sptm_virt_peek_faulted_cpu[_c];                                                            \
     })
+
+/* sptm_virt_cl4.c */
+bool sptm_virt_in_cl4(void);
+void sptm_virt_cl4_seed(int cpu);
+void sptm_virt_cl4_world_enter(u64 target);
+void sptm_virt_cl4_world_exit(void);
+bool sptm_virt_cl4_reflect(u64 *regs, u64 esr);
 
 /* sptm_virt_s2.c */
 void sptm_virt_s2_setup(void);

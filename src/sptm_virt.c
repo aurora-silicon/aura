@@ -309,6 +309,7 @@ void sptm_virt_cpu_arm(void)
     msr(SYS_IMP_APL_GXF_CONFIG_EL1, GXF_CONFIG_EN);
     sysop("isb");
 
+    sptm_virt_cl4_seed(cpu);
     sptm_virt_amx_host();
 }
 

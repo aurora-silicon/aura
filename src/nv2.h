@@ -33,6 +33,10 @@ void nv2_set_l1_stage2_deferred(u64 vtcr, u64 vttbr);
 bool nv2_l1_stage2_enable_here(void);
 void nv2_hcr_update(u64 set, u64 clr);
 void nv2_enter_os(u64 entry, u64 a0, u64 a1, u64 a2) __attribute__((noreturn));
+/* Guarded nested child (cL4 under SPTM): load/restore the child's EL1 regime from
+ * SPTM's VNCR page across the SPTM<->cL4 guarded world switch. */
+void nv2_guarded_child_enter(void);
+void nv2_guarded_child_exit(void);
 
 /* Exception hooks: true if handled, and the exception return resumes the
  * virtual-EL2 guest or the guest it runs. kind: 1 IRQ, 2 FIQ, 3 SError. */

@@ -59,6 +59,12 @@ void sptm_virt_cpu_reset(void) __attribute__((noreturn));
 
 /* nv2.c: the last step of every guest entry on a core. */
 void sptm_virt_cpu_arm(void);
+/* nv2.c: Apple per-level state around the switch to and from an EL1 child. */
+void sptm_virt_world_child_pre_enter(void);
+void sptm_virt_world_child_post_enter(void);
+void sptm_virt_world_child_pre_exit(void);
+void sptm_virt_world_child_post_exit(void);
+u64 *sptm_virt_vel1_slot(unsigned op1, unsigned crn, unsigned crm, unsigned op2);
 void sptm_virt_amx_ctl_el2_write(u64 v);
 u64 sptm_virt_amx_ctl_el2_read(void);
 bool sptm_virt_s2_dabort(u64 *regs);
@@ -67,6 +73,7 @@ bool sptm_virt_s2_dabort(u64 *regs);
 bool sptm_virt_peek_fault(bool in_gl);
 bool sptm_virt_gl_sync(u64 *regs, u64 esr, u64 elr, u64 spsr);
 bool sptm_virt_el1_wfx(u64 *regs, u64 esr);
+bool sptm_virt_cl4_fiq(u64 *regs);
 
 #else
 

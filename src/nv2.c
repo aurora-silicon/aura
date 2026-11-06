@@ -170,7 +170,8 @@ struct nv2_cpu {
     bool child, vm, nested;
     u64 parent[NV2_BANK_WORDS]; /* L1's EL1 register file, VNCR layout */
     u64 parent_sp1, parent_cntkctl, parent_vmtmr, parent_pmcr1;
-    u64 l1_tmr[4]; /* L1's real EL1 timers: P ctl, P cval, V ctl, V cval */
+    u64 gchild_hcr; /* L1's real HCR_EL2 while its guarded child (cL4) runs */
+    u64 l1_tmr[4];  /* L1's real EL1 timers: P ctl, P cval, V ctl, V cval */
 
     /* counters, read by the proxy */
     u64 n_eret, n_sysreg, n_entry, n_exit, n_irq, n_tlbi, n_at, n_unknown, n_tlbi_own;
@@ -374,10 +375,62 @@ static void nv2_bank_load(const u64 *b)
     sysop("isb");
 }
 
+/*
+ * A guarded nested child (cL4 under SPTM). SPTM is an NV2 guest hypervisor, so the EL1 regime it
+ * programs for cL4 lands in its VNCR page, like an L2 guest's bank: load it from there when SPTM's
+ * guarded ERET enters cL4, and restore SPTM's own when cL4 returns. The guarded bank and the entry
+ * PC/PSTATE are the caller's (sptm_virt_cl4.c).
+ */
+static u64 nv2_child_hcr(u64 vhcr);
+static void nv2_timers_enter(struct nv2_cpu *c, bool guarded);
+static bool nv2_timers_exit(struct nv2_cpu *c, bool guarded);
+
+/* cL4 is SPTM's nested guest, so it runs under the HCR_EL2 SPTM programmed for it (its VNCR
+ * HCR_EL2), exactly as nv2_child_enter runs a KVM L2 - not under SPTM's own HCR. SPTM's HCR
+ * carries NV|NV2 (SPTM is a guest hypervisor at virtual EL2); cL4 is not, and with NV set the
+ * hardware treats it as a virtual-EL2 guest hypervisor too. SPTM's HCR is restored on exit. Must
+ * be called from GL2 (HCR_EL2 is GL2-writable only while aura's GXF is live). */
+void nv2_guarded_child_enter(void)
+{
+    struct nv2_cpu *c = nv2_this();
+    /* The same EL1 file swap as nv2_child_enter. */
+    nv2_bank_save(c->parent);
+    c->parent_sp1 = mrs(SP_EL1);
+    c->parent_cntkctl = mrs(SYS_CNTKCTL_EL12);
+    nv2_bank_load(c->vncr);
+    msr(SP_EL1, VN(c, V_SP_EL1));
+    msr(SYS_CNTKCTL_EL12, c->cntkctl12);
+    /* The host's scheduler timers are the physical EL1 timers here (its EL2 timers on real
+     * hardware): cL4 gets the ones SPTM programmed for it (VNCR), and the host's deadline
+     * moves to aura's EL2 timer. cL4's HCR has no FMO, so that FIQ reaches cL4 natively,
+     * as the host's EL2 timer FIQ does on real hardware. */
+    nv2_timers_enter(c, true);
+    c->gchild_hcr = mrs(HCR_EL2);
+    u64 chcr = nv2_child_hcr(VN(c, V_HCR));
+    msr(HCR_EL2, chcr);
+    sysop("isb");
+}
+
+void nv2_guarded_child_exit(void)
+{
+    struct nv2_cpu *c = nv2_this();
+    msr(HCR_EL2, c->gchild_hcr);
+    sysop("isb");
+    /* A child timer still asserting stays visible in the VNCR page (ISTATUS) for SPTM. */
+    nv2_timers_exit(c, true);
+    /* The child's EL1 regime goes back to the VNCR page: SPTM reads it there (NV2). */
+    nv2_bank_save(c->vncr);
+    VN(c, V_SP_EL1) = mrs(SP_EL1);
+    c->cntkctl12 = mrs(SYS_CNTKCTL_EL12);
+    nv2_bank_load(c->parent);
+    msr(SP_EL1, c->parent_sp1);
+    msr(SYS_CNTKCTL_EL12, c->parent_cntkctl);
+}
+
 /* ---------------------------------------------------------------------- */
 /* Timers and the vGIC around a guest */
 
-static void nv2_timers_enter(struct nv2_cpu *c)
+static void nv2_timers_enter(struct nv2_cpu *c, bool guarded)
 {
     c->l1_tmr[0] = mrs(SYS_CNTP_CTL02);
     c->l1_tmr[1] = mrs(SYS_CNTP_CVAL02);
@@ -405,12 +458,14 @@ static void nv2_timers_enter(struct nv2_cpu *c)
     msr(SYS_CNTP_CTL02, VN(c, V_CNTP_CTL) & 3);
     msr(SYS_CNTV_CTL02, VN(c, V_CNTV_CTL) & 3);
     msr(CNTHCTL_EL2, (c->cnthctl & GENMASK(17, 10)) | (mrs(CNTHCTL_EL2) & GENMASK(9, 0)));
+    if (guarded)
+        return; /* SPTM's guarded child is not a VM: Apple's VM timer-FIQ gate stays as is */
     c->parent_vmtmr = mrs(SYS_VMTMR_FIQENA);
     msr(SYS_VMTMR_FIQENA, (c->parent_vmtmr & ~3UL) | (AV(c, A_VM_TMR_FIQ_ENA) & 3));
 }
 
 /* Returns true if one of the guest's timers is asserting its FIQ. */
-static bool nv2_timers_exit(struct nv2_cpu *c)
+static bool nv2_timers_exit(struct nv2_cpu *c, bool guarded)
 {
     u64 pctl = mrs(SYS_CNTP_CTL02), vctl = mrs(SYS_CNTV_CTL02);
     VN(c, V_CNTP_CVAL) = mrs(SYS_CNTP_CVAL02);
@@ -429,8 +484,9 @@ static bool nv2_timers_exit(struct nv2_cpu *c)
     msr(SYS_CNTV_CTL02, c->l1_tmr[2] & 3);
     msr(CNTHCTL_EL2, (c->l1_cnthctl & GENMASK(17, 10)) | (mrs(CNTHCTL_EL2) & GENMASK(9, 0)));
 
-    u64 ena = AV(c, A_VM_TMR_FIQ_ENA);
-    msr(SYS_VMTMR_FIQENA, c->parent_vmtmr);
+    u64 ena = guarded ? 3 : AV(c, A_VM_TMR_FIQ_ENA);
+    if (!guarded)
+        msr(SYS_VMTMR_FIQENA, c->parent_vmtmr);
 #define FIRING(ctl) (((ctl) & 7) == 5)
     bool firing = ((ena & 2) && FIRING(pctl)) || ((ena & 1) && FIRING(vctl));
 #undef FIRING
@@ -615,12 +671,16 @@ static bool nv2_child_enter(struct nv2_cpu *c, u64 spsr, u64 elr)
 
     /* Under SPTM the host (SPTM/TXM/XNU) and this EL1 guest also differ in Apple's per-level
      * registers: switch them around the EL1 file swap, as for cL4 (sptm_virt_cl4.c). */
+    if (nv2_guarded)
+        sptm_virt_world_child_pre_enter();
     nv2_bank_save(c->parent);
     c->parent_sp1 = mrs(SP_EL1);
     c->parent_cntkctl = mrs(SYS_CNTKCTL_EL12);
     nv2_bank_load(c->vncr);
     msr(SP_EL1, VN(c, V_SP_EL1));
     msr(SYS_CNTKCTL_EL12, c->cntkctl12);
+    if (nv2_guarded)
+        sptm_virt_world_child_post_enter();
 
     /* L1's CPACR_EL1 is its VHE CPTR_EL2: it is the child's trap control. */
     msr(SYS_CPTR_EL2, (c->nested_mode ? c->vcptr : c->parent[V_CPACR / 8]) & CPTR_GUEST_MASK);
@@ -641,7 +701,7 @@ static bool nv2_child_enter(struct nv2_cpu *c, u64 spsr, u64 elr)
         msr(SYS_HDFGRTR_EL2, VN(c, V_HDFGRTR));
         msr(SYS_HDFGWTR_EL2, VN(c, V_HDFGWTR));
         msr(SYS_HCRX_EL2, VN(c, V_HCRX));
-        nv2_timers_enter(c);
+        nv2_timers_enter(c, false);
         nv2_gic_enter(c);
         /* Apple banks PMCR1 by EL: L1 sets its guest's PMC filters through
          * PMCR1_EL12, which lands in the AVNCR page; the hardware applies the
@@ -699,7 +759,7 @@ static void nv2_child_exit(struct nv2_cpu *c, int kind, u64 esr)
         if (!kind)
             c->hpfar = mrs(SYS_HPFAR_EL2);
         nv2_gic_exit(c);
-        kick = nv2_timers_exit(c);
+        kick = nv2_timers_exit(c, false);
         msr(VTTBR_EL2, nv2_l1_vttbr);
         if (nv2_l1_vttbr)
             msr(VTCR_EL2, nv2_l1_vtcr);
@@ -722,12 +782,16 @@ static void nv2_child_exit(struct nv2_cpu *c, int kind, u64 esr)
         msr(AVNCR_EL2, (u64)c->avncr);
         c->nested = false;
     }
+    if (nv2_guarded)
+        sptm_virt_world_child_pre_exit();
     nv2_bank_save(c->vncr);
     VN(c, V_SP_EL1) = mrs(SP_EL1);
     c->cntkctl12 = mrs(SYS_CNTKCTL_EL12);
     nv2_bank_load(c->parent);
     msr(SP_EL1, c->parent_sp1);
     msr(SYS_CNTKCTL_EL12, c->parent_cntkctl);
+    if (nv2_guarded)
+        sptm_virt_world_child_post_exit();
     msr(SYS_HFGITR_EL2, c->l1_hfgitr);
     msr(HCR_EL2, c->hcr);
 
@@ -1322,6 +1386,10 @@ static bool nv2_sysreg_do(struct nv2_cpu *c, u64 *regs, u64 esr)
                 value = mrs(SYS_IMP_APL_APSTS_EL1);
             break;
         default:
+            /* Under SPTM the host's _EL12 view of a per-level register is the store the world
+             * switch loads into its EL1 child. */
+            if (nv2_guarded && op0 == 3 && (slot = sptm_virt_vel1_slot(op1, crn, crm, op2)))
+                break;
             nv2_note_unknown(c, key, read);
             value = 0;
             break;
@@ -1490,7 +1558,12 @@ bool nv2_handle_async(u64 *regs, int kind)
 
 static void nv2_cpu_arm(struct nv2_cpu *c, u64 vncr, u64 avncr, u64 hcr)
 {
+    /* A guarded guest's core re-arms on every warm reset. Keep its EL1 child's CNTKCTL: nothing
+     * else holds it, SPTM has no restore for it and cL4 writes it only at its cold start, so
+     * zeroing it takes EL0's counter access away from cL4's tasks after a sleep. */
+    u64 cntkctl12 = nv2_guarded && c->armed ? c->cntkctl12 : 0;
     memset(c, 0, sizeof(*c));
+    c->cntkctl12 = cntkctl12;
     c->vncr = (u64 *)vncr;
     c->avncr = (u64 *)avncr;
     c->hcr = hcr;

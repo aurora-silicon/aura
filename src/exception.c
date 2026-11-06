@@ -284,7 +284,7 @@ void exc_sync(u64 *regs)
     u32 iss = esr & ESR_ISS;
 
 #ifdef SPTM_VIRT
-    /* The virtualized SPTM at GL1, trapped to aura's GL2. */
+    /* The virtualized SPTM (or its secure kernel) at GL1, trapped to aura's GL2. */
     if (in_gl && nv2_guarded && sptm_virt_gl_sync(regs, esr, elr, spsr))
         return;
 
@@ -502,6 +502,9 @@ void exc_fiq(u64 *regs)
 {
 #ifdef SPTM_VIRT
     if (nv2_handle_async(regs, 2))
+        return;
+    /* While the virtualized SPTM's secure kernel runs, an FIQ aura does not own preempts it. */
+    if (nv2_guarded && sptm_virt_cl4_fiq(regs))
         return;
 #endif
 

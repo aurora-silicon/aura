@@ -354,6 +354,11 @@ void sptm_virt_amx_host(void)
     sptm_amx_el2_set_en_el1(true);
 }
 
+void sptm_virt_amx_child(void)
+{
+    sptm_amx_el2_set_en_el1(sptm_amx_grant[smp_id()] != 0);
+}
+
 void sptm_virt_amx_ctl_el2_write(u64 v)
 {
     sptm_amx_grant[smp_id()] = v & AMX_CTL_EN_EL1;
@@ -420,7 +425,7 @@ static bool sptm_virt_gl2_sysreg(u64 *regs, u64 esr)
  */
 static bool sptm_virt_guarded_eret(void)
 {
-    static u32 n;
+    static u32 n, world_logs;
     u64 target = mrs(SYS_IMP_APL_ELR_GL12);
     u64 pstate = mrs(SYS_IMP_APL_SPSR_GL12);
     u64 aspsr = mrs(SYS_IMP_APL_ASPSR_GL1);
@@ -431,8 +436,19 @@ static bool sptm_virt_guarded_eret(void)
                (pstate & 1) ? 'h' : 't', pstate);
     if (m & 0x10)
         return false; /* AArch32: never from SPTM */
-    if (el == 2)
-        pstate -= 4; /* SPTM's own virtual EL2 runs at physical EL1 */
+    if (el == 2) {
+        /* SPTM's own virtual EL2 runs at physical EL1, leaving cL4 if it was there. */
+        pstate -= 4;
+        if (sptm_virt_in_cl4()) {
+            sptm_virt_cl4_world_exit();
+            if (world_logs++ < 8)
+                printf("SPTM-virt[world]: cL4 -> host by SPTM's own ERET to GL2\n");
+        }
+    } else if (el == 1 || el == 3) {
+        /* Into cL4, SPTM's guarded child. */
+        if (!sptm_virt_in_cl4())
+            sptm_virt_cl4_world_enter(target);
+    }
 
     msr(ELR_EL1, target);
     msr(SPSR_EL1, pstate);
@@ -529,7 +545,7 @@ static void sptm_virt_park_report(u64 *regs, u64 pc)
     sptm_virt_park_strings(regs);
 }
 
-/* A synchronous exception into aura's GL2 from SPTM at GL1. */
+/* A synchronous exception into aura's GL2 from SPTM (or cL4) at GL1. */
 bool sptm_virt_gl_sync(u64 *regs, u64 esr, u64 elr, u64 spsr)
 {
     u32 elsp = spsr & SPSR_M_EL;
@@ -538,6 +554,12 @@ bool sptm_virt_gl_sync(u64 *regs, u64 esr, u64 elr, u64 spsr)
 
     if (elsp != SPSR_M_EL1H && elsp != SPSR_M_EL1T)
         return false;
+    /* cL4 took an exception to the level above, SPTM's GL2: deliver it there. Its TLB
+     * maintenance (op0 1) is performed here instead, as SPTM would. */
+    if (sptm_virt_in_cl4() && !(ec == ESR_EC_MSR && ((iss >> 20) & 3) == 1) &&
+        sptm_virt_cl4_reflect(regs, esr))
+        goto done;
+
     switch (ec) {
         case ESR_EC_WFI:
             sptm_virt_park_report(regs, elr);
