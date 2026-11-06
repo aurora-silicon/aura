@@ -8507,7 +8507,6 @@ static int kboot_boot_t8152(void *kernel)
 
 int kboot_prepare_dt(void *fdt)
 {
-    dt_ready = false;
     if (smp_has_pending_calls()) {
         next_stage.entry = NULL;
         bail("FDT: refusing preparation while secondary callbacks are pending\n");
@@ -8516,6 +8515,8 @@ int kboot_prepare_dt(void *fdt)
         free(dt);
         dt = NULL;
     }
+
+    dt_ready = false;
 
     /* Need to init ISP early to carve out heap */
     if (chip_id != T8152)

@@ -155,19 +155,13 @@ static u64 installed_relay SMP_SHARED;
 
 static bool smp_old_vector_owned(u64 locked)
 {
-    u64 ro_start = UINT64_MAX, ro_end;
+    u64 ro_start, ro_end;
     u64 inherited_top = cur_boot_args.top_of_kernel_data;
     u64 image_start = (u64)_base;
     u64 image_end = (u64)_end;
 
-    /* The CTRR firmware aperture is a T8140 interface. On T8152 require
-     * inherited RAM and the earlier image's vector tags and STACKBOT tail. */
-    if (memory_fw_ro_range(&ro_start, &ro_end) != 1) {
-        if (chip_id != T8152)
-            return false;
-        ro_start = UINT64_MAX;
-    }
-    if (!cur_boot_args.mem_size || cur_boot_args.phys_base > UINT64_MAX - cur_boot_args.mem_size ||
+    if (memory_fw_ro_range(&ro_start, &ro_end) != 1 || !cur_boot_args.mem_size ||
+        cur_boot_args.phys_base > UINT64_MAX - cur_boot_args.mem_size ||
         locked < cur_boot_args.phys_base ||
         locked >= cur_boot_args.phys_base + cur_boot_args.mem_size || locked >= ro_start ||
         locked >= inherited_top || (locked >= image_start && locked < image_end))
@@ -181,9 +175,7 @@ static bool smp_old_vector_owned(u64 locked)
     if (limit - locked < 0x200 + sizeof("STACKBOT") - 1)
         return false;
     for (u64 off = 0; off <= 0x180; off += 0x80) {
-        if (read32(locked + off) != read32((u64)_vectors_start + off) &&
-            !(chip_id == T8152 && !off && read32(locked) == SMP_VENEER_LDR &&
-              read32(locked + 4) == SMP_VENEER_BR))
+        if (read32(locked + off) != read32((u64)_vectors_start + off))
             return false;
     }
     for (u64 p = locked + 0x200; p <= limit - (sizeof("STACKBOT") - 1); p += 8) {
@@ -207,45 +199,14 @@ static int smp_prepare_rvbar(const struct cpu_info *cpu)
     u64 locked = rvbar & RVBAR_ADDR;
     u64 target = (u64)_vectors_start;
 
-    if (locked == target ||
-        (cpu_features->apple_sysregs_unlocked && (chip_id != T8152 || !(rvbar & RVBAR_LOCK))))
+    if (locked == target || cpu_features->apple_sysregs_unlocked)
         return 0;
     /* A stage that moved above the chainloaded image keeps entry at its old base. */
     if (relocated_from && locked == old_vectors_start())
         return 0;
-    if ((chip_id != T8140 && chip_id != T8152) || !(rvbar & RVBAR_LOCK)) {
+    if (chip_id != T8140 || !(rvbar & RVBAR_LOCK)) {
         printf("SMP: RVBAR 0x%lx differs from vector 0x%lx; refusing start\n", locked, target);
         return -1;
-    }
-
-    if (chip_id == T8152) {
-        if (installed_relay == locked)
-            return read64(locked + 8) == target && read32(locked) == SMP_VENEER_LDR ? 0 : -1;
-        if (!smp_old_vector_owned(locked)) {
-            printf("SMP: RVBAR 0x%lx is not a verified earlier image vector\n", locked);
-            return -1;
-        }
-        u64 page = ALIGN_DOWN(locked, get_page_size());
-        if (mmu_active())
-            mmu_add_mapping(page, page, get_page_size(), MAIR_IDX_NORMAL, PERM_RW);
-        write64(locked + 8, target);
-        write32(locked + 4, SMP_VENEER_BR);
-        write32(locked, SMP_VENEER_LDR);
-        dc_cvac_range((void *)locked, 16);
-        sysop("dsb sy");
-        ic_ivau_range((void *)locked, 16);
-        sysop("dsb sy");
-        sysop("isb");
-        if (mmu_active())
-            mmu_add_mapping(page, page, get_page_size(), MAIR_IDX_NORMAL, PERM_RX);
-        if (read64(locked + 8) != target || read32(locked + 4) != SMP_VENEER_BR ||
-            read32(locked) != SMP_VENEER_LDR) {
-            printf("SMP: RVBAR veneer read-back failed at 0x%lx\n", locked);
-            return -1;
-        }
-        installed_relay = locked;
-        printf("SMP: installed RVBAR veneer at 0x%lx -> 0x%lx\n", locked, target);
-        return 0;
     }
 
     int64_t distance = (int64_t)target - (int64_t)locked;
@@ -277,6 +238,71 @@ static int smp_prepare_rvbar(const struct cpu_info *cpu)
     }
     installed_relay = locked;
     printf("SMP: installed RVBAR relay at 0x%lx -> 0x%lx (0x%x)\n", locked, target, branch);
+    return 0;
+}
+
+/* T8152 does not expose T8140's CTRR aperture. Admit only an earlier
+ * Aura image in inherited RAM, below the active image and its heap. */
+static bool smp_old_vector_owned_t8152(u64 locked)
+{
+    u64 low = cur_boot_args.phys_base, size = cur_boot_args.mem_size;
+    u64 top = cur_boot_args.top_of_kernel_data;
+    if (!size || low > UINT64_MAX - size || top > low + size || locked < low || locked >= top ||
+        locked >= (u64)_base)
+        return false;
+    u64 limit = min(top, (u64)_base);
+    limit = min(limit, locked + min((u64)16 * SZ_1M, UINT64_MAX - locked));
+    if (limit - locked < 0x200 + sizeof("STACKBOT") - 1)
+        return false;
+    for (u64 off = 0; off <= 0x180; off += 0x80) {
+        if (read32(locked + off) != read32((u64)_vectors_start + off) &&
+            !(off == 0 && read32(locked) == SMP_VENEER_LDR && read32(locked + 4) == SMP_VENEER_BR))
+            return false;
+    }
+    for (u64 p = locked + 0x200; p <= limit - (sizeof("STACKBOT") - 1); p += 8)
+        if (!memcmp((const void *)p, "STACKBOT", sizeof("STACKBOT") - 1))
+            return true;
+    return false;
+}
+
+static int smp_prepare_rvbar_t8152(const struct cpu_info *cpu)
+{
+    u64 rvbar = read64(cpu->impl_reg);
+    u64 locked = rvbar & RVBAR_ADDR;
+    u64 target = (u64)_vectors_start;
+    if (chip_id != T8152 || board_id != 0x24 || !(rvbar & RVBAR_LOCK))
+        return -1;
+    if (locked == target)
+        return 0;
+    if (installed_relay == locked)
+        return read64(locked + 8) == target && read32(locked) == SMP_VENEER_LDR &&
+                       read32(locked + 4) == SMP_VENEER_BR
+                   ? 0
+                   : -1;
+    if (!smp_old_vector_owned_t8152(locked)) {
+        printf("SMP: RVBAR 0x%lx is not a verified earlier image vector\n", locked);
+        return -1;
+    }
+    u64 page = ALIGN_DOWN(locked, get_page_size());
+    if (mmu_active())
+        mmu_add_mapping(page, page, get_page_size(), MAIR_IDX_NORMAL, PERM_RW);
+    write64(locked + 8, target);
+    write32(locked + 4, SMP_VENEER_BR);
+    write32(locked, SMP_VENEER_LDR);
+    dc_cvac_range((void *)locked, 16);
+    sysop("dsb sy");
+    ic_ivau_range((void *)locked, 16);
+    sysop("dsb sy");
+    sysop("isb");
+    if (mmu_active())
+        mmu_add_mapping(page, page, get_page_size(), MAIR_IDX_NORMAL, PERM_RX);
+    if (read64(locked + 8) != target || read32(locked + 4) != SMP_VENEER_BR ||
+        read32(locked) != SMP_VENEER_LDR) {
+        printf("SMP: RVBAR veneer read-back failed at 0x%lx\n", locked);
+        return -1;
+    }
+    installed_relay = locked;
+    printf("SMP: installed RVBAR veneer at 0x%lx -> 0x%lx\n", locked, target);
     return 0;
 }
 
@@ -842,7 +868,7 @@ static void smp_start_t8152(void)
         const struct cpu_info *cpu = &cpu_info[i];
         u64 rvbar = read64(cpu->impl_reg);
         if ((rvbar & RVBAR_LOCK) && (rvbar & RVBAR_ADDR) != (u64)_vectors_start &&
-            smp_prepare_rvbar(cpu)) {
+            smp_prepare_rvbar_t8152(cpu)) {
             smp_start_fail_mask |= BIT(i);
             break;
         }
