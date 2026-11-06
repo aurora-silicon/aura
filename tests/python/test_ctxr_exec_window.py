@@ -147,6 +147,13 @@ int main(void)
     features.secondary_ctrr = false;
     SYS_IMP_APL_CTRR_C_LWR_EL1 = start; SYS_IMP_APL_CTRR_C_UPR_EL1 = start + SZ_16K;
     assert(usable());
+    /* A chip with a firmware RO range is checked against the same registers as well. */
+    expanded();
+    SYS_IMP_APL_CTXR_C_LWR_EL1 = start; SYS_IMP_APL_CTXR_C_UPR_EL1 = start;
+    assert(refused("read-only firmware range"));
+    expanded();
+    SYS_IMP_APL_CTRR_C_LWR_EL1 = start; SYS_IMP_APL_CTRR_C_UPR_EL1 = start + SZ_16K;
+    assert(refused("read-only firmware range"));
 
     /* Everything below stops the boot: a confined secondary would fault in the kernel. */
     expanded();
@@ -291,14 +298,16 @@ typedef uint64_t u64;
 static u64 SYS_IMP_APL_CTXR_A_LWR_EL1, SYS_IMP_APL_CTXR_A_UPR_EL1, SYS_IMP_APL_CTXR_B_LWR_EL1,
     SYS_IMP_APL_CTXR_B_UPR_EL1, SYS_IMP_APL_CTXR_C_LWR_EL1, SYS_IMP_APL_CTXR_C_UPR_EL1;
 static void *dt;
-static u64 rsv[4][2];
-static int nrsv, fail_at = -1;
+static u64 rsv[4][2], ro_start_v, ro_end_v;
+static int nrsv, fail_at = -1, ro_status;
 static int fdt_add_mem_rsv(void *p, u64 start, u64 size)
 {
     if (nrsv == fail_at) return -1;
     rsv[nrsv][0] = start; rsv[nrsv][1] = size; nrsv++;
     return 0;
 }
+static int memory_fw_ro_range(u64 *start, u64 *end)
+{ *start = ro_start_v; *end = ro_end_v; return ro_status; }
 #define printf(...) ((void)0)
 ''' + "%s" + r'''
 #undef printf
@@ -319,6 +328,17 @@ int main(void)
     SYS_IMP_APL_CTXR_B_LWR_EL1 = 0x180000; SYS_IMP_APL_CTXR_B_UPR_EL1 = 0x17c000;
     assert(!dt_reserve_ctxr_low_windows() && nrsv == 2);
 
+    /* A window inside the firmware RO range (T8140) is reserved with that range. */
+    nrsv = 0; ro_status = 1; ro_start_v = 0x200000; ro_end_v = 0x20c000;
+    assert(!dt_reserve_ctxr_low_windows() && nrsv == 1 && rsv[0][0] == 0x100000);
+    /* One that reaches past it is reserved on its own. */
+    nrsv = 0; ro_end_v = 0x204000;
+    assert(!dt_reserve_ctxr_low_windows() && nrsv == 2);
+    /* So is everything when the range is unknown or invalid. */
+    nrsv = 0; ro_status = -1; ro_end_v = 0x20c000;
+    assert(!dt_reserve_ctxr_low_windows() && nrsv == 2);
+    ro_status = 0;
+
     nrsv = 0; fail_at = 1;
     assert(dt_reserve_ctxr_low_windows() == -1);
     puts("ctxr low windows OK");
@@ -327,7 +347,7 @@ int main(void)
 '''
 
 
-def test_other_chips_reserve_windows_a_to_c(tmp_path):
+def test_every_chip_reserves_windows_a_to_c(tmp_path):
     body = function(kboot_source(), "dt_reserve_ctxr_low_windows")
     compile_and_run(tmp_path, "ctxr-low-windows", LOW_WINDOWS_HARNESS % body)
 
@@ -553,8 +573,8 @@ def test_nothing_reserves_the_window_from_the_os():
     assert "dt_reserve_outside_exec_window(start, end - start))\n            bail(\"FDT: couldn't reserve the J713" in source
     # The firmware RO range stays reserved in every mode.
     assert "fdt_add_mem_rsv(dt, ro_start, ro_end - ro_start)" in source
-    # T8140's firmware RO range covers windows A to C; other chips reserve them on their own.
-    assert "chip_id != T8140 && dt_reserve_ctxr_low_windows()" in source
+    # Every confined chip reserves windows A to C, with no chip list.
+    assert "        if (dt_reserve_ctxr_low_windows())\n" in source
 
 
 def test_no_option_turns_it_off():

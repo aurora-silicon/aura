@@ -82,8 +82,7 @@ or any raw boot object) runs it and boots as it always did, and aura never reads
 `CTXR` register there. There is no boot option or build option.
 
 With no secondary running there is nobody to ask, which happens where
-`smp_start_secondaries()` fails, and on T6040 in Mach-O mode until the RVBAR at
-its load base can be forwarded. Aura then keeps no answer, reads `CTXR_D` under an
+`smp_start_secondaries()` fails. Aura then keeps no answer, reads `CTXR_D` under an
 exception guard, and warns if it is armed. The OS still starts, outside the window,
 on the boot CPU alone, because `dt_set_cpus()` drops every CPU that isn't running.
 A probe that was sent and didn't finish also counts as not confined, and is not
@@ -95,7 +94,13 @@ system registers we tracked survive, including the pointer authentication
 keys. WFE wipes nothing. Linux has to save registers around idle, and the
 Aurora kernel does.
 
-### System registers
+### Reset vector and system registers
+
+iBoot locks each secondary's RVBAR. When it doesn't point at aura's vectors, aura
+writes a branch where it does point, on any chip, if that is the boot object's
+Mach-O header 64 KiB below the raw image (where iBoot locks it on T6040, which
+doesn't take the vector from the object's `kcev`) or an earlier aura image's
+vector table. Anything else is refused.
 
 At EL2 aura can set `HACR_EL2`, the Apple `ACTLR` bits and the per-core deep sleep
 enable, but `CYC_OVRD` is undefined from M4 on and aura never touches it there. It
@@ -126,8 +131,8 @@ on M1 to M3.
 An object can arm more than the window, as one padded for 256 MiB does. The OS
 still gets 128 MiB at the same address, so a Mac enrolled at a larger size runs
 the same memory layout as a release. Everything else armed stays reserved:
-`CTXR_D` outside the window and the windows `CTXR_A` to `CTXR_C`, which T8140's
-firmware RO range already covers. It can't go back to the allocator, because EL0
+`CTXR_D` outside the window and the windows `CTXR_A` to `CTXR_C`, except one that
+lies inside T8140's firmware RO range, which is reserved already. It can't go back to the allocator, because EL0
 stalls executing there on a confined core and the OS pools only its window.
 
 ### No usable window
@@ -141,8 +146,9 @@ read the registers on each chip:
 - `CTXR_D` is armed, and aura lies inside it and in its slot.
 - `CTXR_D` reaches the end of the 128 MiB window. An object that wasn't padded
   arms about 5 MiB.
-- No read-only firmware range is in the window. T8140 uses its firmware RO range.
-  Other chips use `CTXR_A` to `CTXR_C` and the `CTRR_C` and `CTRR_D` ranges.
+- Nothing kboot keeps from the OS is in the window: `CTXR_A` to `CTXR_C`, the
+  `CTRR_C` and `CTRR_D` ranges the secondaries can't write, and on T8140 its
+  firmware RO range too. Every chip is checked against all of them.
 - `boot_args` is not in the window, and the heap starts above it.
 
 Later steps refuse too, and take the same failure path. `kboot_boot()` won't place
@@ -230,7 +236,9 @@ kmutil from macOS 27.2 and from macOS 26.6.2 (25G83) parses the boot
 object and derives `kcbz : 0`. On a MacBook Neo (T8140, J700) a proxy Stage 1
 padded for 256 MiB cold-boots, with `CTXR_D` ending where `kcrz` predicts. With an
 earlier version of this code that had the window at 256 MiB, Linux reached a login
-at EL2 on all six CPUs from NVMe through U-Boot's `booti`, on one boot.
+at EL2 on all six CPUs from NVMe through U-Boot's `booti`, on one boot. A J616s
+(T6040) started its secondaries through the Mach-O header branch in
+aurora-silicon/aura#66, with Linux under the monitor this tree no longer has.
 
 Not tested: this code on any hardware, a 128 MiB window on hardware, the refusal
 path, idle power in this mode, restart and power-off without PSCI, and any chip

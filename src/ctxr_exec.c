@@ -145,16 +145,17 @@ static bool ranges_overlap(u64 start_a, u64 end_a, u64 start_b, u64 end_b)
     return start_a < end_b && end_a > start_b;
 }
 
-/* Whether something the secondaries cannot write lies in [start, end). */
+/*
+ * Whether [start, end) holds something kboot keeps from the OS: the firmware RO range
+ * where aura knows one (T8140), the windows A to C, or what the secondaries can't write.
+ */
 static bool ctxr_exec_holds_ro_range(u64 start, u64 end)
 {
     u64 ro_start, ro_end;
     int status = memory_fw_ro_range(&ro_start, &ro_end);
 
-    if (status)
-        return status < 0 || ranges_overlap(ro_start, ro_end, start, end);
-
-    /* No firmware RO range known on this chip: read what its windows and kboot go by. */
+    if (status < 0 || (status && ranges_overlap(ro_start, ro_end, start, end)))
+        return true;
     if (ranges_overlap(mrs(SYS_IMP_APL_CTXR_A_LWR_EL1), mrs(SYS_IMP_APL_CTXR_A_UPR_EL1) + SZ_4K,
                        start, end) ||
         ranges_overlap(mrs(SYS_IMP_APL_CTXR_B_LWR_EL1), mrs(SYS_IMP_APL_CTXR_B_UPR_EL1) + SZ_4K,

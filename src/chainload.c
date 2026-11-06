@@ -60,7 +60,7 @@ int chainload_image(void *image, size_t size, char **vars, size_t var_cnt)
 
     printf("chainload: Preparing image...\n");
     next_stage.entry = NULL;
-    if (!image || !size || (chip_id == T8140 && ro_status != 1) ||
+    if (!image || !size || ro_status < 0 ||
         cur_boot_args.phys_base > UINT64_MAX - cur_boot_args.mem_size)
         return -1;
     ram_end = cur_boot_args.phys_base + cur_boot_args.mem_size;

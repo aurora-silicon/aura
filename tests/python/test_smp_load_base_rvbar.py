@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-"""T6040: forward a reset vector locked at a Mach-O boot object's load base.
+"""Forward a reset vector locked at a Mach-O boot object's load base, on any chip.
 
 MMIO is modeled; smp_prepare_rvbar() is the production body.
 """
@@ -7,7 +7,7 @@ from test_smp_timeouts import compile_and_run, REPO
 from test_locked_dart_tables import function
 
 
-def test_t6040_load_base_rvbar_is_forwarded_once(tmp_path):
+def test_load_base_rvbar_is_forwarded_once(tmp_path):
     current = function((REPO / "src/smp.c").read_text(), "smp_prepare_rvbar")
     harness = r'''
 #include <assert.h>
@@ -18,9 +18,6 @@ def test_t6040_load_base_rvbar_is_forwarded_once(tmp_path):
 typedef unsigned long u64;
 typedef uint32_t u32;
 _Static_assert(sizeof(u64) == 8, "production u64 ABI");
-#define T8140 0x8140
-#define T6040 0x6040
-#define SZ_16K 0x4000UL
 #define RVBAR_LOCK 1
 #define RVBAR_ADDR 0x0000fffffffff000UL
 #define MAIR_IDX_NORMAL 0
@@ -30,21 +27,21 @@ _Static_assert(sizeof(u64) == 8, "production u64 ABI");
 #define sysop(op) ((void)(op))
 struct cpu_info { u64 impl_reg; };
 static struct { bool legacy_impl_regs; } features, *cpu_features = &features;
-static unsigned char _vectors_start[4096] __attribute__((aligned(4096)));
-static int chip_id = T6040;
+static unsigned char _vectors_start[4096] __attribute__((aligned(0x4000)));
 static u64 installed_relay, relocated_from, rvbar, locked;
 static u32 word;
-static int writes, mappings[2], nmap;
+static int writes, mappings[2], nmap, owned_asks;
+static bool active = true;
 static u64 read64(u64 address) { assert(address == 8); return rvbar; }
 static u32 read32(u64 address) { assert(address == locked); return word; }
 static void write32(u64 address, u32 value) { assert(address == locked); word = value; writes++; }
 static u64 old_vectors_start(void) { return 0; }
-static bool smp_old_vector_owned(u64 address) { (void)address; return false; }
-static bool mmu_active(void) { return true; }
-static u64 get_page_size(void) { return 4096; }
+static bool smp_old_vector_owned(u64 address) { (void)address; owned_asks++; return false; }
+static bool mmu_active(void) { return active; }
+static u64 get_page_size(void) { return 0x4000; }
 static void mmu_add_mapping(u64 a, u64 b, u64 size, int attr, int perm)
 {
-    assert(a == locked && b == a && size == SZ_16K && attr == MAIR_IDX_NORMAL && nmap < 2);
+    assert(a == locked && b == a && size == 0x4000 && attr == MAIR_IDX_NORMAL && nmap < 2);
     mappings[nmap++] = perm;
 }
 static void dc_cvac_range(void *address, u64 size) { assert((u64)address == locked && size == 4); }
@@ -66,22 +63,32 @@ int main(void)
     /* The next secondary finds the branch and writes nothing. */
     assert(smp_prepare_rvbar(&cpu) == 0 && writes == 1 && nmap == 2);
 
+    /* A later stage at the same base accepts the branch an earlier one left. */
+    installed_relay = 0;
+    assert(smp_prepare_rvbar(&cpu) == 0 && writes == 1 && nmap == 2);
+
     /* Anything else at the load base is not ours to overwrite. */
     word = 0;
     nmap = 0;
-    assert(smp_prepare_rvbar(&cpu) == -1 && writes == 1 && !nmap);
+    assert(smp_prepare_rvbar(&cpu) == -1 && writes == 1 && !nmap && owned_asks == 1);
 
-    /* Another distance, or another chip, is refused as before. */
+    /* Another distance needs a retired image there, which this model never has. */
     locked = (u64)_vectors_start - 0x20000;
     rvbar = locked | RVBAR_LOCK;
     word = 0xfeedfacf;
-    assert(smp_prepare_rvbar(&cpu) == -1 && writes == 1);
-    chip_id = 0x6041;
+    assert(smp_prepare_rvbar(&cpu) == -1 && writes == 1 && owned_asks == 2);
+
+    /* An unlocked RVBAR that points elsewhere is refused before anything is read. */
     locked = (u64)_vectors_start - 0x10000;
+    rvbar = locked;
+    assert(smp_prepare_rvbar(&cpu) == -1 && writes == 1 && owned_asks == 2);
+
+    /* A7 to M3 set RVBAR at start, so nothing here touches it. */
+    features.legacy_impl_regs = true;
     rvbar = locked | RVBAR_LOCK;
-    assert(smp_prepare_rvbar(&cpu) == -1 && writes == 1);
-    puts("T6040 load-base RVBAR PASS");
+    assert(smp_prepare_rvbar(&cpu) == 0 && writes == 1);
+    puts("load-base RVBAR PASS");
     return 0;
 }
 '''
-    compile_and_run(tmp_path, "smp-t6040-load-base", harness)
+    compile_and_run(tmp_path, "smp-load-base", harness)

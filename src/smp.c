@@ -156,8 +156,12 @@ static bool smp_old_vector_owned(u64 locked)
     u64 inherited_top = cur_boot_args.top_of_kernel_data;
     u64 image_start = (u64)_base;
     u64 image_end = (u64)_end;
+    int ro_status = memory_fw_ro_range(&ro_start, &ro_end);
 
-    if (memory_fw_ro_range(&ro_start, &ro_end) != 1 || !cur_boot_args.mem_size ||
+    /* With no firmware RO range known, the inherited top alone bounds the search. */
+    if (!ro_status)
+        ro_start = UINT64_MAX;
+    if (ro_status < 0 || !cur_boot_args.mem_size ||
         cur_boot_args.phys_base > UINT64_MAX - cur_boot_args.mem_size ||
         locked < cur_boot_args.phys_base ||
         locked >= cur_boot_args.phys_base + cur_boot_args.mem_size || locked >= ro_start ||
@@ -202,41 +206,29 @@ static int smp_prepare_rvbar(const struct cpu_info *cpu)
     /* A stage that moved above the chainloaded image keeps entry at its old base. */
     if (relocated_from && locked == old_vectors_start())
         return 0;
-    /*
-     * Mach-O boot object: an iBoot that does not take the vector address from the object (kcev)
-     * may lock RVBAR at the object's load base, its Mach-O header, 64K below the raw image.
-     * Forward from there with a branch over the header.
-     */
-    u32 hop = 0x14000000 | ((target - locked) >> 2);
-    if (chip_id == T6040 && (rvbar & RVBAR_LOCK) && target - locked == 0x10000 &&
-        read32(locked) == hop)
-        return 0;
-    if (chip_id == T6040 && (rvbar & RVBAR_LOCK) && target - locked == 0x10000 &&
-        read32(locked) == 0xfeedfacf) {
-        mmu_add_mapping(locked, locked, SZ_16K, MAIR_IDX_NORMAL, PERM_RW);
-        write32(locked, hop);
-        dc_cvac_range((void *)locked, sizeof(hop));
-        ic_ivau_range((void *)locked, sizeof(hop));
-        sysop("dsb sy");
-        sysop("isb");
-        mmu_add_mapping(locked, locked, SZ_16K, MAIR_IDX_NORMAL, PERM_RX);
-        printf("SMP: RVBAR at the load base 0x%lx, forwarded to 0x%lx\n", locked, target);
-        return read32(locked) == hop ? 0 : -1;
-    }
-    if (chip_id != T8140 || !(rvbar & RVBAR_LOCK)) {
+    if (!(rvbar & RVBAR_LOCK)) {
         printf("SMP: RVBAR 0x%lx differs from vector 0x%lx; refusing start\n", locked, target);
         return -1;
     }
 
+    /*
+     * iBoot locked RVBAR somewhere else. Forward it with a branch when it is the boot object's
+     * Mach-O header (an iBoot that does not take the vector from the object's kcev locks the
+     * load base), or the vector table of an earlier aura image.
+     */
     int64_t distance = (int64_t)target - (int64_t)locked;
     if ((distance & 3) || distance < -0x8000000 || distance > 0x7fffffc)
         return -1;
 
     u32 branch = 0x14000000 | ((distance / 4) & 0x03ffffff);
-    if (installed_relay == locked)
+    /* The boot object's header starts with MH_MAGIC_64, 64K below the raw image. */
+    bool header = distance == 0x10000;
+    /* An earlier stage at this base may have forwarded the header already. */
+    if (installed_relay == locked || (header && read32(locked) == branch))
         return read32(locked) == branch ? 0 : -1;
-    if (!smp_old_vector_owned(locked)) {
-        printf("SMP: RVBAR 0x%lx is not a verified retired image vector\n", locked);
+    if (!(header && read32(locked) == 0xfeedfacf) && !smp_old_vector_owned(locked)) {
+        printf("SMP: RVBAR 0x%lx is neither the boot object header nor a retired image vector\n",
+               locked);
         return -1;
     }
     u64 page = ALIGN_DOWN(locked, get_page_size());
