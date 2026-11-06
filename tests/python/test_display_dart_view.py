@@ -102,6 +102,9 @@ static void write32(u64 addr, u32 data);
 static u32 set32(u64 addr, u32 set);
 static int poll32(u64 addr, u32 mask, u32 target, u32 timeout);
 #define dma_wmb() ((void)0)
+/* The constructor's publication barrier is checked in the cold-root replay;
+ * this display-view model only validates the architectural operation. */
+#define sysop(op) assert(strcmp((op), "dsb sy") == 0)
 /* Cold USB stream construction is outside this display-view model. */
 static void dc_cvac_range(void *addr, size_t size)
 {
