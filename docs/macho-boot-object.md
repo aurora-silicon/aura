@@ -59,7 +59,12 @@ kmutil inspect -z -B "$PWD/aura-boot.macho" --show-mach-boot-properties
 
 It must report `kcbz : 0`.
 
-## Running the OS
+An object wrapped this way arms only about 5 MiB of `CTXR_D`, which suits a
+proxy-only Stage 1. To boot an OS it has to be padded, as the installer does when
+it enrolls one (see [Running the OS](#running-the-os)). A Stage 2 from this tree
+refuses to start an OS under an unpadded Stage 1 on a confined machine.
+
+## The CTXR windows
 
 With `kcbz` zero, iBoot leaves four CTXR windows armed and locked on the
 secondary CPUs. The boot CPU reports the same bounds with enforcement off.
@@ -70,17 +75,11 @@ On T8140 the windows change where a secondary can execute:
 - At EL1 the rule inverts. Executing inside `CTXR_D` takes an instruction
   abort straight to EL2 (ESR 0x8200000c), and execution elsewhere works.
 
-An OS outside the windows therefore cannot run at EL2 in this mode. Aura stays
-at EL2 as a monitor and enters the OS at EL1 on every CPU (`src/monitor.c`). At kboot,
-`monitor_required()` asks a secondary to run two instructions from the heap
-and uses EL1 only if that faults. The probe runs on every chip, not on a list
-of chips: a Mac without the windows (M1 to M3, or any raw boot object) runs it
-and keeps the OS at EL2. There is no build option. When it does
-use EL1, kboot reserves `CTXR_D` so Linux never allocates from it.
-`monitor_enter_os()` leaves EL2 the way the kernel's `init_el2_state` and
-`finalise_el2_state` would, for the features this chip has, so the OS takes
-no traps. Linux reports `CPU: All CPU(s) started at EL1`, and KVM is not
-available yet.
+At kboot `ctxr_exec_confined()` (`src/ctxr_exec.c`) asks a secondary to run two
+instructions from the heap, and the machine is confined if that faults. The probe
+runs on every chip, not on a list of chips: a Mac without the windows (M1 to M3,
+or any raw boot object) runs it and boots as it always did, and aura never reads a
+`CTXR` register there. There is no boot option or build option.
 
 WFI wipes the general registers, the vector registers and NZCV on these
 cores, from EL2, EL1 and EL0, on E and P cores. FPCR, `SP_EL0` and the 33
@@ -88,53 +87,77 @@ system registers we tracked survive, including the pointer authentication
 keys. WFE wipes nothing. Linux has to save registers around idle, and the
 Aurora kernel does.
 
-## Running the OS at EL2 inside the window
+## Running the OS
 
-A kernel whose executable pages all sit inside `CTXR_D` may run at EL2.
-`aura-ctxr-exec`, or a `chosen.aura,ctxr-exec=1` line in the ESP Stage 2, does
-that when iBoot armed a large enough window. It takes a
-boot object padded by aurora-installer (Utilities, Expanded Code Window) and a
-kernel built with `CONFIG_ARM64_CTXR_EXECMEM`. The padding gives a 128 MiB window,
-which holds the kernel image and the code of every module with room to spare. RAM
-in the window that the kernel doesn't use is lost to the rest of the system.
+A kernel whose executable pages all sit inside `CTXR_D` can run at EL2, so on a
+confined machine that is where it runs, on every CPU, with nothing of aura's left
+under it. This takes a boot object padded by aurora-installer and a kernel built
+with `CONFIG_ARM64_CTXR_EXECMEM`.
 
-`ctxr_exec_window()` in `src/monitor.c` finds the window. It starts at the first
-2 MiB boundary past aura's 16 MiB slot and ends where `CTXR_D` ends. The device
-tree, the trust cache and aura are in `CTXR_D` too, below that start, so the
-window holds only memory the kernel owns. The kernel builds its executable pool
-from the memory in the window that nothing has reserved.
+`ctxr_exec_window()` in `src/ctxr_exec.c` finds the window. It starts at the first
+2 MiB boundary past aura's 16 MiB slot and is 128 MiB long, which holds the kernel
+image and the code of every module with room to spare. The device tree, the trust
+cache and aura are in `CTXR_D` too, below that start, so the window holds only
+memory the kernel owns. The kernel builds its executable pool from the memory in
+the window that nothing has reserved. RAM in the window that it doesn't use is lost
+to the rest of the system.
 
-In this mode aura moves the kernel from the heap to the start of the window and
-publishes the window as `/chosen/aurora,ctxr-exec-window`. It keeps spin-table
-with no `/psci` node, so the kernel releases each secondary into its own text. It
-reserves the rest of `CTXR_D` and the firmware RO range but not the window, then
-enters the kernel directly, as on M1 to M3. The monitor is never installed, so
-NV2 and PV-KVM are off.
+Aura moves the kernel from the heap to the start of the window and publishes the
+window as `/chosen/aurora,ctxr-exec-window`. It uses spin-table, so the kernel
+releases each secondary into its own text. It then enters the kernel directly, as
+on M1 to M3.
 
-Aura keeps the monitor and prints why if the window fails a check: an object
-that was not padded, a chip other than T8140, or firmware RO, `boot_args` or the
-heap inside it. The kernel then gets a base-0 window, which confines it in
-software only, and runs at EL1.
+An object can arm more than the window, as one padded for 256 MiB does. The OS
+still gets 128 MiB at the same address, so a Mac enrolled at a larger size runs
+the same memory layout as a release. Everything else armed stays reserved:
+`CTXR_D` outside the window and the windows `CTXR_A` to `CTXR_C`, which T8140's
+firmware RO range already covers. It can't go back to the allocator, because EL0
+stalls executing there on a confined core and the OS pools only its window.
 
-A kernel aura loads itself, with `boot=` or an inline payload, can use this
-directly. Booting through U-Boot and GRUB needs U-Boot support for the window
+### No usable window
+
+There is no fallback. If a check fails, kboot refuses at `kboot_prepare_dt()` and
+again at `kboot_boot()`, and prints the reason on the console and the panel with
+the way out, which is to enroll Stage 1 again through the installer's Recovery
+step. The boot then takes the existing failure path into the proxy. The checks
+read the registers on each chip:
+
+- `CTXR_D` is armed, and aura lies inside it and in its slot.
+- `CTXR_D` reaches the end of the 128 MiB window. An object that wasn't padded
+  arms about 5 MiB.
+- No read-only firmware range is in the window. T8140 uses its firmware RO range.
+  Other chips use `CTXR_A` to `CTXR_C` and the `CTRR_C` and `CTRR_D` ranges.
+- `boot_args` is not in the window, and the heap starts above it.
+
+### Which Stage 2 a Stage 1 loads
+
+A Stage 2 from this tree can only run under a padded Stage 1, so on Mach-O chips a
+padded Stage 1 is filled with `m1n1/boot-ctxr.bin` and an older one keeps
+`m1n1/boot.bin`, which package updates stop touching there. An old Stage 1 then
+can't load a Stage 2 that would refuse to boot. The installer fills the path with
+the same `tools/fill_stage1_config.py` format. Aura doesn't name either path: a
+Stage 1 reads its target from its configuration block, whose path field is 192
+bytes, and fatfs is built with long file names.
+
+### U-Boot and GRUB
+
+A kernel aura loads itself, with `boot=` or an inline payload, can use the window
+directly. Booting through U-Boot and GRUB needs U-Boot support for it
 (aurora-silicon/u-boot#32): when `/chosen/aurora,ctxr-exec-window` is present,
 U-Boot loads an arm64 `Image` at the lowest free 2 MiB boundary inside it, on
 both the EFI path (GRUB's `LoadImage`) and `booti`, and tells the EFI stub to
 run it in place. Without that U-Boot change the image lands outside the window
 and an enforcing kernel panics in `ctxr_exec_reserve()`. A compressed (zboot)
-kernel cannot be pinned and is refused while enforcing. Spin-table has no CPU
-off, so CPU hotplug does not work in this mode.
+kernel cannot be pinned and is refused. Aura has no CPU off for spin-table, so
+taking a CPU offline and back is up to the kernel.
 
 ## Status
 
 kmutil from macOS 27.2 and from macOS 26.6.2 (25G83) parses the boot
 object and derives `kcbz : 0`. On a MacBook Neo (T8140, J700) a proxy Stage 1
-built this way cold-boots, and the installed Fedora kernel boots to a login
-at EL1 with pointer authentication on and all six CPUs up. A proxy Stage 1
-padded for 256 MiB also cold-boots, with `CTXR_D` ending where `kcrz` predicts,
-and from it Linux reaches a login at EL2 on all six CPUs through U-Boot's `booti`.
+padded for 256 MiB cold-boots, with `CTXR_D` ending where `kcrz` predicts. With an
+earlier version of this code that had the window at 256 MiB, Linux reached a login
+at EL2 on all six CPUs from NVMe through U-Boot's `booti`, on one boot.
 
-Not tested: a raw boot with `src/monitor.c` in the tree, a filled Stage 1 that
-loads Stage 2 from the ESP, any chip other than T8140, a 128 MiB window on
-hardware, and the EL2 path through GRUB.
+Not tested: this code on any hardware, a 128 MiB window on hardware, the refusal
+path, and any chip other than T8140.
