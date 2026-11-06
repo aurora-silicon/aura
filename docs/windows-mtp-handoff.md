@@ -81,16 +81,17 @@ still requires a controlled hardware test and recovery path.
 
 The phase 7 refinement follows the failure model in
 [`windows-rtkit.md`](windows-rtkit.md#phase-7-compatibility-failure-model-before-implementation).
-It accepts public-compatible app/debug and observed OSLog type-3 notifications
+It accepts public-compatible app/debug and opaque non-buffer OSLog notifications
 while continuing to read DockChannel RX_COUNT without consuming INIT. Successful
 preparation logs their separate counts. Failure logs distinguish
 an RTKit MMIO fault, a rejected mailbox message (first reason and both raw words),
 invalid service state, a DockChannel MMIO fault and a readiness timeout. Each
 failure retains the existing allocation quarantine and prevents guest entry.
 The original phase 7 hardware log lacked this distinction. The next controlled
-run identified a rejected OSLog type-3 message; its precise replay and the narrow
-compatibility correction are documented in `windows-rtkit.md`. The corrected
-message handler still requires a new physical retest.
+run identified a rejected OSLog type-3 message, followed by type 4 on a later
+attempt. The exact replays and public non-buffer OSLog contract are documented
+in `windows-rtkit.md`. The corrected message handler still requires a new
+physical retest.
 
 ## Repeatable offline evidence
 

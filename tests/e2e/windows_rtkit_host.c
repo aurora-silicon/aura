@@ -108,11 +108,11 @@ struct dart_dev {
 struct iova_domain {
     u64 next;
 };
-static struct asc_message rx[128], tx[128];
+static struct asc_message rx[512], tx[128];
 static unsigned read_at, write_at, sent;
 static void queue(u32 ep, u64 value)
 {
-    assert(write_at < 128);
+    assert(write_at < sizeof(rx) / sizeof(rx[0]));
     rx[write_at++] = (struct asc_message){value, ep};
 }
 int asc_get_iop_node(asc_dev_t *a)
@@ -366,6 +366,7 @@ int main(int argc, char **argv)
             queue(3, 0x1234);
             queue(0x20, 0x5678);
             queue(0xff, 0x9abc);
+            queue(8, 0x04000020ce38cc21ULL); /* Exact next physical OSLog type 4. */
             queue(8, 0x03ff006ea3b0e3f6ULL); /* Exact physical OSLog type 3. */
             queue(2, (5ULL << 52) | 1);
             struct rtkit_buffer before_oslog = r->oslog_bfr;
@@ -375,7 +376,7 @@ int main(int argc, char **argv)
             assert(rtkit_service_quiet(r, 4) == 0 && read_at == before_read);
             struct rtkit_notification_counts counts;
             assert(rtkit_get_notification_counts(r, &counts));
-            assert(!counts.app && !counts.debug && !counts.oslog_type3);
+            assert(!counts.app && !counts.debug && !counts.oslog_notifications);
             tx_ready = true;
             assert(rtkit_service_quiet(r, 2) == 2 && read_at == before_read + 2);
             assert(sent == before_sent && !r->windows_failed);
@@ -384,14 +385,28 @@ int main(int argc, char **argv)
             assert(r->oslog_bfr.bfr == before_oslog.bfr && r->oslog_bfr.dva == before_oslog.dva &&
                    r->oslog_bfr.sz == before_oslog.sz && r->oslog_bfr.owned == before_oslog.owned &&
                    r->oslog_bfr.pooled == before_oslog.pooled && r->pool_used == before_pool);
-            assert(rtkit_service_quiet(r, 1) == 1 && read_at == before_read + 5);
+            assert(rtkit_service_quiet(r, 2) == 2 && read_at == before_read + 6);
             assert(sent == before_sent + 1 && !r->windows_failed);
             assert(tx[sent - 1].msg1 == 2 && tx[sent - 1].msg0 == ((5ULL << 52) | 1));
             struct rtkit_rejection rejection;
             assert(!rtkit_get_first_rejection(r, &rejection));
             assert(rejection.reason == RTKIT_REJECT_NONE);
             assert(rtkit_get_notification_counts(r, &counts));
-            assert(counts.app == 2 && counts.debug == 1 && counts.oslog_type3 == 1);
+            assert(counts.app == 2 && counts.debug == 1 && counts.oslog_notifications == 2);
+            unsigned before_maps = maps, before_cleans = cleans;
+            for (u64 type = 0; type < 256; type++) {
+                if (type == 1)
+                    continue; /* Buffer grants retain the separate strict path. */
+                queue(8, (type << 56) | 0x00ffffffffffffffULL);
+                assert(rtkit_service_quiet(r, 1) == 1);
+                assert(sent == before_sent + 1 && !r->windows_failed);
+            }
+            assert(rtkit_get_notification_counts(r, &counts));
+            assert(counts.oslog_notifications == 257 && maps == before_maps &&
+                   cleans == before_cleans && !heap_allocations && r->pool_used == before_pool);
+            assert(r->oslog_bfr.bfr == before_oslog.bfr && r->oslog_bfr.dva == before_oslog.dva &&
+                   r->oslog_bfr.sz == before_oslog.sz && r->oslog_bfr.owned == before_oslog.owned &&
+                   r->oslog_bfr.pooled == before_oslog.pooled);
             r->notifications =
                 (struct rtkit_notification_counts){UINT64_MAX, UINT64_MAX, UINT64_MAX};
             queue(3, 0);
@@ -400,7 +415,7 @@ int main(int argc, char **argv)
             assert(rtkit_service_quiet(r, 3) == 3);
             assert(rtkit_get_notification_counts(r, &counts));
             assert(counts.app == UINT64_MAX && counts.debug == UINT64_MAX &&
-                   counts.oslog_type3 == UINT64_MAX);
+                   counts.oslog_notifications == UINT64_MAX);
             quiet_boundary = false;
         }
         asc_cpu_stop(&asc);
@@ -420,8 +435,6 @@ int main(int argc, char **argv)
         {2, (5ULL << 52) | 0xff, RTKIT_REJECT_MESSAGE},
         {1, (1ULL << 52) | (1ULL << 44) | 0x390004000ULL, RTKIT_REJECT_CRASH},
         {4, 8ULL << 52, RTKIT_REJECT_MESSAGE},
-        {8, 2ULL << 56, RTKIT_REJECT_MESSAGE},
-        {8, 0xffULL << 56, RTKIT_REJECT_MESSAGE},
         {8, (1ULL << 56) | (0x4000ULL << 36), RTKIT_REJECT_MESSAGE},
     };
     for (unsigned i = 0; i < sizeof(rejected) / sizeof(rejected[0]); i++) {
@@ -454,7 +467,7 @@ int main(int argc, char **argv)
                first.msg1 == rejected[i].ep);
         assert(rtkit_service_quiet(r, 4) < 0 && read_at == before_read + 2);
         struct rtkit_notification_counts counts;
-        assert(rtkit_get_notification_counts(r, &counts) && !counts.oslog_type3);
+        assert(rtkit_get_notification_counts(r, &counts) && !counts.oslog_notifications);
         assert(rtkit_get_first_rejection(r, &again));
         assert(again.reason == first.reason && again.msg0 == first.msg0 &&
                again.msg1 == first.msg1);
@@ -465,5 +478,5 @@ int main(int argc, char **argv)
     }
     real_free(pool);
     puts("{\"passed\":true,\"heap_grants\":0,\"quiet_poll_bound\":64,"
-         "\"phase7_notifications\":true,\"oslog_type3\":true,\"rejection_transcripts\":11}");
+         "\"phase7_notifications\":true,\"oslog_opaque_types\":255,\"rejection_transcripts\":9}");
 }

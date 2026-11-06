@@ -42,7 +42,7 @@ typedef struct { unsigned marker; } iova_domain_t;
 typedef struct { unsigned marker; } rtkit_dev_t;
 /* Modeled snapshot boundary; production RTKit is replayed separately. */
 struct rtkit_rejection { unsigned reason; u64 msg0, msg1; };
-struct rtkit_notification_counts { u64 app, debug, oslog_type3; };
+struct rtkit_notification_counts { u64 app, debug, oslog_notifications; };
 static asc_dev_t asc_obj; static dart_dev_t dart_obj;
 static iova_domain_t iova_obj; static rtkit_dev_t rtkit_obj;
 static const char *scenario;
