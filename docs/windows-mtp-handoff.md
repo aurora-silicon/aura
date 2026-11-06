@@ -70,6 +70,14 @@ preparation and initial stage-2 mapping. Only then does the host serialize 0.
 Mu must implement the matching ACPI admission gate. A final stage-2 remap is
 checked immediately before guest entry; a failure aborts the launch.
 
+The host reservation is a placement guard; it does not create an EFI memory
+descriptor. Before DXE can allocate memory, Mu must exclude the complete
+`[0x10020000000, 0x10020200000)` staging and RTKit pool range from system RAM
+whenever it admits MTP, including its legacy marker-absent path. The range must
+remain `EfiReservedMemoryType` in the map supplied to Windows. Publishing MTP0
+without this exclusion lets Windows allocate boot-driver pages in the firmware
+buffer, which the MTP firmware copy can then overwrite.
+
 Resource admission precedes MMIO. Power is enabled and read back for declared
 clock gates; missing or empty gate lists mean the ADT declares no gate to enable.
 Cold ASC/DART ownership is required. Phase logs identify resource admission,

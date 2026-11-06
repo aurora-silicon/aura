@@ -251,5 +251,182 @@
       "serial_scope": "Mu UEFI through ExitBootServices; later Windows process and PnP evidence collected from memory",
       "termination": "deliberate observation interrupt followed by all-CPU drain"
     }
+  },
+  "historical_observations": "Earlier sections preserve their original run outcomes; windows_boot_after_mtp_reservation_fix is the latest completed run.",
+  "windows_boot_after_mtp_reservation_fix": {
+    "source_commit": "9bb221b9524942e4a6851315c931502ab9e3ff32",
+    "result": "ten-minute-boot-display-input-and-cdc-observation-passed",
+    "resident_bin_sha256": "e9929bb903de248e2800debcec50b3b03a141c18312b388d698612a5af2b017f",
+    "mu_fd_sha256": "27d2936cd4b4dcf285598b1c22e842036bf529ea1dd90e93204afe3348cb4254",
+    "transport": "USB0; same physical port as the reference comparison",
+    "storage": "Installed Windows on internal NVMe",
+    "mtp": "j813-v1 enabled",
+    "n1": "disabled",
+    "guest_usb": "withheld from Windows while Aura owns CDC",
+    "captures": [
+      {
+        "requested_seconds": 60.0,
+        "elapsed_seconds": 60.06001112499507,
+        "observed": "Windows boot logo",
+        "images": {
+          "shadow": {
+            "address": "0x10008a08000",
+            "expected_bytes": 17039360,
+            "complete": true,
+            "bytes": 17039360,
+            "sha256": "e02c56fe01cafbfd5e994ec65cae9de657dc42c34657febb760060e622b99198",
+            "nonzero_bytes": 312220
+          }
+        }
+      },
+      {
+        "requested_seconds": 180.0,
+        "elapsed_seconds": 180.13646854201215,
+        "observed": "Transient opaque black framebuffer",
+        "images": {
+          "shadow": {
+            "address": "0x10008a08000",
+            "expected_bytes": 17039360,
+            "complete": true,
+            "bytes": 17039360,
+            "sha256": "1cf86f8ba2086ac8188ae24d898c8ce34402cc3950b6da2f9e208a7dafe801fa",
+            "nonzero_bytes": 4259840
+          }
+        }
+      },
+      {
+        "requested_seconds": 300.0,
+        "elapsed_seconds": 300.045403666998,
+        "observed": "Windows lock screen",
+        "images": {
+          "shadow": {
+            "address": "0x10008a08000",
+            "expected_bytes": 17039360,
+            "complete": true,
+            "bytes": 17039360,
+            "sha256": "d4c5c19beba24053ca8b1255106bca4f18703a5310ed574358788784e86e9b5a",
+            "nonzero_bytes": 16958106
+          }
+        }
+      },
+      {
+        "requested_seconds": 450.0,
+        "elapsed_seconds": 450.0490671250154,
+        "observed": "Windows lock screen",
+        "images": {
+          "shadow": {
+            "address": "0x10008a08000",
+            "expected_bytes": 17039360,
+            "complete": true,
+            "bytes": 17039360,
+            "sha256": "3ffa63961ac30358271987974a8e5d929957f4e41dc2ed197b4b3211567a5333",
+            "nonzero_bytes": 16958106
+          }
+        }
+      },
+      {
+        "requested_seconds": 600.0,
+        "elapsed_seconds": 600.0407970000233,
+        "observed": "Windows desktop; shadow and native scanout both rendered",
+        "images": {
+          "shadow": {
+            "address": "0x10008a08000",
+            "expected_bytes": 17039360,
+            "complete": true,
+            "bytes": 17039360,
+            "sha256": "dd16d29d44e9773498b28aa2c4780c8a9195d621e71705f14a32020f40a5e6a6",
+            "nonzero_bytes": 16632101
+          },
+          "native": {
+            "address": "0x103e1e40000",
+            "expected_bytes": 17039360,
+            "complete": true,
+            "bytes": 17039360,
+            "sha256": "dd35f5d32609e95800f0634039098762d1defea78b797d4aa02a153d24af513a",
+            "nonzero_bytes": 15015964
+          },
+          "shadow-repeat-1": {
+            "address": "0x10008a08000",
+            "expected_bytes": 17039360,
+            "complete": true,
+            "bytes": 17039360,
+            "sha256": "dd16d29d44e9773498b28aa2c4780c8a9195d621e71705f14a32020f40a5e6a6",
+            "nonzero_bytes": 16632101,
+            "matches_terminal_shadow": true
+          },
+          "shadow-repeat-2": {
+            "address": "0x10008a08000",
+            "expected_bytes": 17039360,
+            "complete": true,
+            "bytes": 17039360,
+            "sha256": "dd16d29d44e9773498b28aa2c4780c8a9195d621e71705f14a32020f40a5e6a6",
+            "nonzero_bytes": 16632101,
+            "matches_terminal_shadow": true
+          }
+        }
+      }
+    ],
+    "framebuffer_bytes_read": 136314880,
+    "physical_confirmation": {
+      "source": "user direct observation of this corrected run",
+      "lock_screen": true,
+      "built_in_keyboard": true,
+      "built_in_trackpad": true
+    },
+    "desktop_evidence": "600-second shadow and native scanout independently viewed; physical desktop was also confirmed for the earlier reference run",
+    "drain": {
+      "guest_mask": 0,
+      "started_flags_clear": 32,
+      "native_exit_reason": -1,
+      "proxy_responded": true
+    },
+    "parent_returncode": 0,
+    "serial": {
+      "mode": "cdc",
+      "raw": "guest-serial.bin",
+      "readable": "guest-serial.log",
+      "bytes_received": 3057402,
+      "chunks_received": 299,
+      "sha256": "7f61724d9de3cdffb3e183397d3372c2db90d6c6d8ff383da62814e6f1d82ab2",
+      "reader_stopped": true,
+      "issues": [],
+      "target_dropped_bytes": null,
+      "drop_count_final": false,
+      "received_final": false,
+      "capture_complete": false,
+      "completeness": "unavailable-on-raw-cdc",
+      "bidirectional_kd": false
+    },
+    "serial_scope": "Mu boot text through ExitBootServices; later Windows progress observed through framebuffers and stopped memory, not a Windows KD session",
+    "mtp_reservation": {
+      "range": [
+        "0x10020000000",
+        "0x10020200000"
+      ],
+      "pages": 512,
+      "type": "EfiReservedMemoryType",
+      "observed_snapshots": [
+        "AppleANS",
+        "AcpiPlatform"
+      ],
+      "final_ebs_map_captured": false,
+      "evidence_sha256": "80651cd479aa4a7ece16146b18b2438494be6681afcec18e1b45928b676e1413"
+    },
+    "mup_after_fix": {
+      "header_valid": true,
+      "header_sha256": "f59253d2b252ddc9972f18ac17c8bafce7ad1ad5cf06bad5cbfa0edd5c0e540e",
+      "header_ipa": "0x1001f04e000",
+      "valid_mapped_pages_outside_mtp": 14,
+      "all_pages_verified": false,
+      "limitation": "ValueError: stage1 AF clear",
+      "evidence_sha256": "a3317a2f4f708e1dc1e4c8ed94504052c89286a9eab199338f6b9e59bbbc43d8"
+    },
+    "evidence_sha256": {
+      "receipt.json": "8be0f65238f18f2fba236dee52eef3201b4723a11d17cc9372a299b3454a68aa",
+      "physical-input-observation.json": "b9c2fd057d0c6677942efcff709c6f176561a3b58072489cde99f9137af5e5cf",
+      "frame-004/shadow.bin": "dd16d29d44e9773498b28aa2c4780c8a9195d621e71705f14a32020f40a5e6a6",
+      "frame-004/native.bin": "dd35f5d32609e95800f0634039098762d1defea78b797d4aa02a153d24af513a"
+    },
+    "qualification_limit": "One bounded corrected run; no general CDC losslessness, N1, Wi-Fi, CPU scaling or accelerated graphics qualification."
   }
 }
