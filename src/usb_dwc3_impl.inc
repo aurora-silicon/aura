@@ -1826,12 +1826,12 @@ dwc3_dev_t *usb_dwc3_init(uintptr_t regs, dart_dev_t *dart)
     set32(dev->regs + DWC3_GCTL, DWC3_GCTL_CORESOFTRESET);
     set32(dev->regs + DWC3_GUSB3PIPECTL(0), DWC3_GUSB3PIPECTL_PHYSOFTRST);
     set32(dev->regs + DWC3_GUSB2PHYCFG(0), DWC3_GUSB2PHYCFG_PHYSOFTRST);
-    mdelay(100);
+    usb_cdc_wait_us(100000);
     clear32(dev->regs + DWC3_GUSB3PIPECTL(0), DWC3_GUSB3PIPECTL_PHYSOFTRST);
     clear32(dev->regs + DWC3_GUSB2PHYCFG(0), DWC3_GUSB2PHYCFG_PHYSOFTRST);
-    mdelay(100);
+    usb_cdc_wait_us(100000);
     clear32(dev->regs + DWC3_GCTL, DWC3_GCTL_CORESOFTRESET);
-    mdelay(100);
+    usb_cdc_wait_us(100000);
 
 #if USB_DWC3_SUPERSPEED
     clear32(dev->regs + DWC3_GUSB2PHYCFG(0), DWC3_GUSB2PHYCFG_SUSPHY);

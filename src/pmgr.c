@@ -66,6 +66,9 @@ static u32 pmgr_devices_len = 0;
 static bool pmgr_u8id = false;
 static bool pmgr_use_group_and_offset = false;
 static bool pmgr_protected_addr(uintptr_t addr);
+/* While a running OS owns the PMGR (the debug link's re-take under the virtualized SPTM): a domain
+ * that is already on keeps its word, including the auto bits the OS configured. */
+bool pmgr_keep_configured;
 
 static bool pmgr_protected_device(const struct pmgr_device *device)
 {
@@ -102,6 +105,9 @@ int pmgr_set_mode(uintptr_t addr, u8 target_mode)
         printf("pmgr: refusing protected display CPU power transition at 0x%lx\n", addr);
         return -1;
     }
+    if (pmgr_keep_configured && target_mode && (read32(addr) & PMGR_PS_TARGET) &&
+        (read32(addr) & PMGR_PS_ACTUAL))
+        return 0;
     mask32(addr, PMGR_AUTO_ENABLE | PMGR_WAS_CLKGATED | PMGR_WAS_PWRGATED | PMGR_PS_TARGET,
            FIELD_PREP(PMGR_PS_TARGET, target_mode));
     if (poll32(addr, PMGR_PS_ACTUAL, FIELD_PREP(PMGR_PS_ACTUAL, target_mode), PMGR_POLL_TIMEOUT) <

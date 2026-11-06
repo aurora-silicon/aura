@@ -25,6 +25,8 @@ Environment (all optional; 1 enables a switch):
   AURA_S2R_DROP_USB        tear down aura's USB gadget at the sleep commit
   AURA_S2R_QUIESCE=<mask>  AMCC error-enable writes at the commit: 8 DSID_AGE_OUT,
                            16 UNEXP_RT_HIT_DIR
+  AURA_S2R_USB_RETAKE=<n>  take the CDC link again after a wake; n > 1 also drops it n s in
+  AURA_S2R_USB_RETAKE_MS   delay from XNU's return to the re-take (ms)
   AURA_XNU_BT              sample XNU backtraces every few seconds per core
   AURA_TAIL_SECS, AURA_TAIL_IDLE   keep reading the console after entry, until idle
   XNU_BOOTARGS             XNU's command line
@@ -69,6 +71,8 @@ KNOWN_ENV = {
     "AURA_KEEP_ERRH",
     "AURA_AMCC_CLEAR",
     "AURA_S2R_QUIESCE",
+    "AURA_S2R_USB_RETAKE",
+    "AURA_S2R_USB_RETAKE_MS",
     "AURA_TAIL_SECS",
     "AURA_TAIL_IDLE",
 } | set(CONFIG_FLAGS)
@@ -288,6 +292,9 @@ def configure(p, sym):
     if os.environ.get("AURA_S2R_QUIESCE"):
         p.write32(sym["sptm_virt_s2r_quiesce"], env_int("AURA_S2R_QUIESCE"))
         print("AMCC quiesce writes at the commit:", os.environ["AURA_S2R_QUIESCE"])
+    if os.environ.get("AURA_S2R_USB_RETAKE"):
+        p.write32(sym["sptm_virt_s2r_usb_retake"], env_int("AURA_S2R_USB_RETAKE"))
+        p.write32(sym["sptm_virt_s2r_usb_delay_ms"], env_int("AURA_S2R_USB_RETAKE_MS"))
     if env_on("AURA_KEEP_ERRH") or env_on("AURA_AMCC_CLEAR"):
         report_amcc(p, env_on("AURA_AMCC_CLEAR"))
 

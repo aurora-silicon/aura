@@ -14,7 +14,7 @@
  * mode lets the sleep happen as natively: from the first core's self-disable aura prints nothing
  * and its console moves to the always-on DockChannel; at the commit it hands the link's domains
  * the states XNU asked for and can tear its USB gadget down; the first reset after the commit is
- * the wake.
+ * the wake, and the link can be taken again on a running macOS.
  *
  * MMIO addresses are T8140's, as is everything in sptm_virt*.c.
  */
@@ -36,13 +36,16 @@
 #include "types.h"
 #include "uartproxy.h"
 #include "usb.h"
+#include "usb_cdc_atc.h"
 #include "utils.h"
 
 #define S2R_RING_BYTES (8UL << 20)
 
 /* The sleep rules start a while after setup: XNU's PMGR driver writes the same registers while
- * it boots, and a sleep comes minutes after the desktop. */
-#define S2R_ARM_AFTER_S 45
+ * it boots, and a sleep comes minutes after the desktop. After a wake with the link re-taken they
+ * come back quickly. */
+#define S2R_ARM_AFTER_S   45
+#define S2R_REARM_AFTER_S 3
 
 /* The S2R timer start in pmgr-aon-pst (ADT pmgr reg 31): the last step of XNU's quiesceHW. */
 #define S2R_TIMER_OFF 0x4000
@@ -81,7 +84,9 @@ volatile u64 sptm_virt_s2r_head; /* records ever appended */
 u32 sptm_virt_s2r_pages;         /* pages hooked */
 
 /* Set by the host before entry (run_guest_sptm.py). */
-u32 sptm_virt_s2r_quiesce; /* S2R_QUIESCE_* */
+u32 sptm_virt_s2r_quiesce;      /* S2R_QUIESCE_* */
+u32 sptm_virt_s2r_usb_retake;   /* 1: re-take the link after a wake; n > 1: also drop it n s in */
+u32 sptm_virt_s2r_usb_delay_ms; /* delay from XNU's return to the re-take, 0 = default */
 
 static struct {
     u64 page;
@@ -121,13 +126,18 @@ static const char *const s2r_link_paths[] = {"/arm-io/usb-drd", "/arm-io/dart-us
  * MMU-on contexts (the first guest trap, the first GEXIT into XNU, the hooks).
  */
 static volatile u64 s2r_commit_t;
-static volatile u64 s2r_wake_t;
+static volatile u64 s2r_wake_t, s2r_wake_commit_t;
 static volatile int s2r_wake_cpu = -1;
 static volatile u32 s2r_wake_count;
 static volatile u32 s2r_wake_traps; /* guest traps to log after a wake */
 static volatile u32 s2r_wake_mmio;  /* hooked accesses to log after a wake */
 static volatile bool s2r_wake_banner_done, s2r_wake_xnu_done;
-static u64 s2r_wake_head;
+static u64 s2r_commit_head, s2r_wake_head;
+
+static void s2r_usb_tick(bool byte);
+static void s2r_usb_quiesce(void);
+static void s2r_usb_wake(void);
+static void s2r_usb_setup(void);
 
 static void s2r_clean(const volatile void *p, size_t n)
 {
@@ -259,6 +269,7 @@ static bool s2r_armed(void)
  * uart0 and the CDC link are SoC-domain devices that are off at the wake. */
 static void s2r_console_to_aon(void)
 {
+    s2r_usb_quiesce();
     for (iodev_id_t id = 0; id < IODEV_MAX; id++)
         if (id != IODEV_DOCKCHANNEL_UART && id != IODEV_FB)
             iodev_set_usage(id, iodev_get_usage(id) & ~(USAGE_CONSOLE | USAGE_UARTPROXY));
@@ -353,6 +364,7 @@ static void s2r_commit(void)
 {
     s2r_commit_t = mrs(CNTPCT_EL0);
     s2r_clean(&s2r_commit_t, sizeof(s2r_commit_t));
+    s2r_clean(&sptm_virt_s2r_usb_retake, sizeof(sptm_virt_s2r_usb_retake));
     s2r_console_to_aon();
     s2r_release_kept();
     s2r_console_off();
@@ -492,6 +504,7 @@ static bool s2r_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int w
     if (timer) {
         s2r_timer_cpu = smp_id();
         s2r_marker("S2RTIMER", addr);
+        s2r_commit_head = sptm_virt_s2r_head;
         s2r_core_sleeps();
     }
     /* Each core disables itself in the PMGR CPU block on its way to its last WFI; a cluster armed
@@ -610,6 +623,7 @@ void sptm_virt_s2r_setup(bool cdc)
     s2r_drop_usb = flags & SPTM_VIRT_S2R_DROP_USB;
     /* In go mode the reset guard leaves macOS's sleep-time watchdog alone. */
     sptm_virt_rg_passthrough = s2r_go;
+    s2r_usb_setup();
 
     /* Each core's self-disable and the commit: a handful of accesses. */
     s2r_hook_adt("/arm-io/pmgr", 24, "pmgr-soc-misc", 0, 0);
@@ -663,6 +677,7 @@ void sptm_virt_s2r_wake(int cpu)
     u64 now = mrs(CNTPCT_EL0), frq = mrs(CNTFRQ_EL0);
     s2r_commit_t = 0;
     s2r_wake_t = now;
+    s2r_wake_commit_t = commit;
     s2r_wake_cpu = cpu;
     s2r_wake_count++;
     sptm_virt_s2r_quiet = false;
@@ -675,10 +690,11 @@ void sptm_virt_s2r_wake(int cpu)
     s2r_twi_mask = 0;
     s2r_timer_cpu = -1;
     /* the sleep rules come back for the next sleep */
-    s2r_arm_at = now + S2R_ARM_AFTER_S * frq;
+    s2r_arm_at = now + (sptm_virt_s2r_usb_retake ? S2R_REARM_AFTER_S : S2R_ARM_AFTER_S) * frq;
     s2r_clean(&s2r_commit_t, sizeof(s2r_commit_t));
     s2r_clean(&sptm_virt_s2r_quiet, sizeof(sptm_virt_s2r_quiet));
     s2r_clean(&s2r_wake_t, sizeof(s2r_wake_t));
+    s2r_clean(&s2r_wake_commit_t, sizeof(s2r_wake_commit_t));
     s2r_clean(&s2r_wake_cpu, sizeof(s2r_wake_cpu));
     s2r_clean(&s2r_wake_count, sizeof(s2r_wake_count));
     s2r_clean(&s2r_wake_banner_done, sizeof(s2r_wake_banner_done));
@@ -739,6 +755,7 @@ void sptm_virt_s2r_wake_trap(u64 esr, u64 elr, bool in_gl)
 /* A GEXIT into XNU's normal world: the first one after a wake means XNU runs again. */
 void sptm_virt_s2r_xnu_entry(int cpu, u64 target)
 {
+    s2r_usb_tick(false);
     if (!s2r_wake_t || s2r_wake_xnu_done)
         return;
     s2r_wake_xnu_done = true;
@@ -747,21 +764,365 @@ void sptm_virt_s2r_xnu_entry(int cpu, u64 target)
            "%lu ms after the reset\n",
            s2r_wake_count, cpu, target, frq ? (now - s2r_wake_t) * 1000 / frq : 0);
     s2r_marker("XNUBACK", cpu);
+    s2r_usb_wake();
 }
 
 /*
  * The wake's MMIO record (with the full trace): XNU stopping the AON watchdog ends its platform
- * wake, so everything the ring holds since the wake's first guest trap is the record.
+ * wake, so everything the ring holds since the wake's first guest trap is the record. With the
+ * link re-taken it is printed from the re-take's poll loop, a few records at a time.
  */
-static bool s2r_wakerec_done;
+static u64 s2r_wakerec_rp, s2r_wakerec_end;
 
 void sptm_virt_s2r_wd_stopped(void)
 {
-    if (s2r_wakerec_done || !s2r_fulltrace || !s2r_wake_t || !s2r_wake_banner_done)
+    if (s2r_wakerec_end || !s2r_fulltrace || !s2r_wake_t || !s2r_wake_banner_done)
         return;
-    s2r_wakerec_done = true;
-    printf("S2R-WAKEREC start: %lu records\n", sptm_virt_s2r_head - s2r_wake_head);
-    sptm_virt_s2r_dump_tail(min(sptm_virt_s2r_head - s2r_wake_head, 16384UL));
-    printf("S2R-WAKEREC end\n");
-    iodev_console_flush();
+    s2r_wakerec_rp = s2r_wake_head;
+    s2r_wakerec_end = sptm_virt_s2r_head;
+    if (!sptm_virt_s2r_usb_retake) {
+        printf("S2R-WAKEREC start: %lu records\n", s2r_wakerec_end - s2r_wakerec_rp);
+        sptm_virt_s2r_dump_tail(min(sptm_virt_s2r_head - s2r_wake_head, 16384UL));
+        printf("S2R-WAKEREC end\n");
+        iodev_console_flush();
+    }
+}
+
+static void s2r_wakerec_pump(void)
+{
+    static bool started;
+
+    if (!s2r_wakerec_end || s2r_wakerec_rp >= s2r_wakerec_end || !iodev_can_write(IODEV_USB0))
+        return;
+    if (!started) {
+        started = true;
+        printf("S2R-WAKEREC start: %lu records\n", s2r_wakerec_end - s2r_wakerec_rp);
+    }
+    for (int k = 0; k < 8 && s2r_wakerec_rp < s2r_wakerec_end; k++, s2r_wakerec_rp++)
+        if (!(sptm_virt_s2r_ring[s2r_wakerec_rp % sptm_virt_s2r_nrec].meta & S2R_MARKER))
+            s2r_print_rec(s2r_wakerec_rp);
+    if (s2r_wakerec_rp >= s2r_wakerec_end)
+        printf("S2R-WAKEREC end\n");
+}
+
+/* With the coprocessor mailboxes hooked, after the wake record: every mailbox access from before
+ * the commit to now, a few per poll. */
+static void s2r_coproc_pump(void)
+{
+    static u64 rp, end;
+    static int st;
+
+    if (!s2r_coproc || st == 2 || !s2r_wakerec_end || s2r_wakerec_rp < s2r_wakerec_end ||
+        !iodev_can_write(IODEV_USB0))
+        return;
+    u64 frq = mrs(CNTFRQ_EL0);
+    if (!st) {
+        u64 head = sptm_virt_s2r_head, from = s2r_wake_commit_t - (s2r_fulltrace ? 10 : 60) * frq;
+        u64 oldest = head > sptm_virt_s2r_nrec ? head - sptm_virt_s2r_nrec + 64 : 0;
+        rp = s2r_commit_head;
+        while (rp > oldest && sptm_virt_s2r_ring[(rp - 1) % sptm_virt_s2r_nrec].t >= from)
+            rp--;
+        end = head;
+        printf("S2R-COPROC start: %lu ring records, commit t=%lx wake t=%lx frq %lu\n", end - rp,
+               s2r_wake_commit_t, s2r_wake_t, frq);
+        st = 1;
+    }
+    int printed = 0;
+    for (int k = 0; k < 2000 && printed < 8 && rp < end; k++, rp++) {
+        struct s2r_rec *r = &sptm_virt_s2r_ring[rp % sptm_virt_s2r_nrec];
+        unsigned cpu = (r->meta >> 51) & 15;
+        if (r->meta & S2R_MARKER) {
+            printf("S2C t=%lx c%u MARK %.8s 0x%lx\n", r->t, cpu, (const char *)&r->pc, r->val);
+            printed++;
+            continue;
+        }
+        bool first;
+        u64 pa = r->meta & GENMASK(47, 0);
+        const char *what = s2r_page_name(pa & ~0x3fffUL, &first);
+        bool near = r->t >= s2r_wake_commit_t - 2 * frq && r->t <= s2r_wake_t;
+        if (!s2r_is_mbox(what) && strcmp(what, "pms-pmc") && !near)
+            continue;
+        printf("S2C t=%lx c%u %s %s%u 0x%lx = 0x%lx\n", r->t, cpu, what,
+               (r->meta & S2R_WRITE) ? "W" : "R", 8u << ((r->meta >> 48) & 3), pa, r->val);
+        printed++;
+    }
+    if (rp >= end) {
+        printf("S2R-COPROC end\n");
+        st = 2;
+    }
+}
+
+/* ---- the debug link after a wake -------------------------------------------------------------
+ *
+ * s2r_release_kept took the link down at the commit and usb_cdc_link_start brings it up, the same
+ * code stage 1 runs, except it cannot run all at once: it waits 300 ms in fixed delays, and XNU
+ * must not lose a core for that long. So it runs as a coroutine on its own stack. Each GEXIT into
+ * XNU and each trapped console access may resume it for one slice, and its waits
+ * (usb_cdc_wait_us, usb_cdc_poll32) switch back to the trap. Once the link is up the coroutine
+ * polls the controller, which nothing else does while XNU is quiet.
+ *
+ * The waits only switch during the bring-up, where no lock is held; the poll runs under the
+ * console lock, so there they just delay. The port controller is not touched: CC stays up across
+ * a sleep, and hpm0 shares its SPMI controller with XNU's hpm1.
+ */
+#define S2R_USB_STACK_BYTES 0x8000UL
+#define S2R_USB_RING_BYTES  0x10000UL /* XNU's console since the sleep, until the host opens it */
+#define S2R_USB_START_MS    300       /* after XNU's return; all cores are back by about 110 ms */
+#define S2R_USB_GAP_US      200       /* XNU runs at least this long between slices */
+#define S2R_USB_POLL_US     1000
+
+enum {
+    S2R_USB_OFF, /* not asked for, failed, or quiesced for a sleep */
+    S2R_USB_SELFTEST,
+    S2R_USB_PENDING,
+    S2R_USB_BRINGUP,
+    S2R_USB_UP,
+};
+static volatile u32 s2r_usb_state, s2r_usb_busy;
+static volatile u64 s2r_usb_next; /* CNTPCT of the next resume */
+static u8 *s2r_usb_stack;
+static u64 s2r_usb_co_sp, s2r_usb_main_sp;
+static bool s2r_usb_yieldable;
+static u64 s2r_usb_t0, s2r_usb_slice_max;
+static u32 s2r_usb_slices, s2r_usb_step_now;
+static u8 *s2r_usb_ring;
+static volatile u64 s2r_usb_ring_wp;
+static u64 s2r_usb_ring_rp;
+static volatile bool s2r_usb_capture;
+
+__attribute__((naked, noinline)) static void s2r_usb_switch(u64 *save_sp, u64 load_sp)
+{
+    __asm__("stp x19, x20, [sp, #-96]!\n"
+            "stp x21, x22, [sp, #16]\n"
+            "stp x23, x24, [sp, #32]\n"
+            "stp x25, x26, [sp, #48]\n"
+            "stp x27, x28, [sp, #64]\n"
+            "stp x29, x30, [sp, #80]\n"
+            "mov x9, sp\n"
+            "str x9, [x0]\n"
+            "mov sp, x1\n"
+            "ldp x21, x22, [sp, #16]\n"
+            "ldp x23, x24, [sp, #32]\n"
+            "ldp x25, x26, [sp, #48]\n"
+            "ldp x27, x28, [sp, #64]\n"
+            "ldp x29, x30, [sp, #80]\n"
+            "ldp x19, x20, [sp], #96\n"
+            "ret\n");
+}
+
+static void s2r_usb_yield(u64 ticks)
+{
+    s2r_usb_next = mrs(CNTPCT_EL0) + ticks;
+    s2r_usb_switch(&s2r_usb_co_sp, s2r_usb_main_sp);
+}
+
+/* usb.c: true if the caller runs on the re-take's coroutine, where waits switch back to XNU. */
+bool sptm_virt_s2r_usb_yieldable(void)
+{
+    u64 sp;
+    __asm__ volatile("mov %0, sp" : "=r"(sp));
+    return s2r_usb_yieldable && s2r_usb_stack && sp - (u64)s2r_usb_stack < S2R_USB_STACK_BYTES;
+}
+
+bool sptm_virt_s2r_usb_yield(u32 us)
+{
+    if (!sptm_virt_s2r_usb_yieldable())
+        return false;
+    s2r_usb_yield((u64)max(us, (u32)S2R_USB_GAP_US) * mrs(CNTFRQ_EL0) / 1000000);
+    return true;
+}
+
+static void s2r_usb_step(unsigned step)
+{
+    s2r_usb_step_now = step;
+}
+
+/* The keep rule again, before anything is powered, so XNU cannot lower the domains under the link.
+ * What XNU last asked for is what the hardware holds now: its writes went through since the commit.
+ */
+static void s2r_usb_keep_rearm(void)
+{
+    for (int k = 0; k < s2r_nkeep; k++) {
+        u32 v = read32(s2r_keep[k]);
+        s2r_keep_shadow[k] = v;
+        s2r_keep_low[k] = !(v & 0xf);
+        s2r_keep_told[k] = false;
+    }
+    sysop("dmb ish");
+    s2r_keep_released = false;
+}
+
+/* XNU's bytes since the sleep, then its live output, once the host has the port open. */
+static void s2r_usb_ring_drain(void)
+{
+    u64 wp = s2r_usb_ring_wp, rp = s2r_usb_ring_rp;
+
+    if (wp == rp || !iodev_can_write(IODEV_USB_VUART))
+        return;
+    if (wp - rp > S2R_USB_RING_BYTES) {
+        printf("USB-RETAKE: lost %lu bytes of XNU's console\n", wp - rp - S2R_USB_RING_BYTES);
+        rp = wp - S2R_USB_RING_BYTES;
+    }
+    u64 off = rp % S2R_USB_RING_BYTES;
+    u64 n = min(min(wp - rp, S2R_USB_RING_BYTES - off), 4096UL);
+    ssize_t w = iodev_write(IODEV_USB_VUART, s2r_usb_ring + off, n);
+    s2r_usb_ring_rp = rp + (w > 0 ? w : 0);
+}
+
+static void __attribute__((noreturn)) s2r_usb_main(void)
+{
+    u64 frq = mrs(CNTFRQ_EL0);
+
+    s2r_usb_keep_rearm();
+    pmgr_keep_configured = true;
+    s2r_usb_yieldable = true;
+    int ret = usb_cdc_link_start(s2r_usb_step, usb_cdc_atc_lane());
+    s2r_usb_yieldable = false;
+    pmgr_keep_configured = false;
+    if (ret) {
+        /* The domains stay on and the keep rule stands, so the next commit powers them down. */
+        printf("USB-RETAKE: failed at step %u\n", s2r_usb_step_now);
+        s2r_usb_state = S2R_USB_OFF;
+        while (1)
+            s2r_usb_yield(0);
+    }
+    hv_vuart_usb_back(IODEV_USB0);
+    uartproxy_iodev = IODEV_USB0;
+    printf("USB-RETAKE: controller up %lu ms after the start: %u slices, longest %lu us\n",
+           frq ? (mrs(CNTPCT_EL0) - s2r_usb_t0) * 1000 / frq : 0, s2r_usb_slices,
+           frq ? s2r_usb_slice_max * 1000000 / frq : 0);
+    /* The wake's own lines went out while the link was down, and the console buffer has usually
+     * dropped them by now: say again which wake this is. */
+    if (s2r_wake_t)
+        printf("SPTM-virt[s2r]: WAKE #%u: cpu%d reset after the sleep commit, link back %lu ms "
+               "after the reset\n",
+               s2r_wake_count, s2r_wake_cpu, frq ? (mrs(CNTPCT_EL0) - s2r_wake_t) * 1000 / frq : 0);
+    s2r_usb_state = S2R_USB_UP;
+    while (1) {
+        iodev_handle_events(IODEV_USB0);
+        s2r_usb_ring_drain();
+        s2r_wakerec_pump();
+        s2r_coproc_pump();
+        s2r_usb_yield(S2R_USB_POLL_US * frq / 1000000);
+    }
+}
+
+static void s2r_usb_wake(void)
+{
+    /* Nothing to do if the link never went down. */
+    if (!sptm_virt_s2r_usb_retake || !s2r_usb_stack || !s2r_keep_released)
+        return;
+    u32 ms = sptm_virt_s2r_usb_delay_ms ? sptm_virt_s2r_usb_delay_ms : S2R_USB_START_MS;
+    s2r_usb_next = mrs(CNTPCT_EL0) + (u64)ms * mrs(CNTFRQ_EL0) / 1000;
+    sysop("dmb ish");
+    s2r_usb_state = S2R_USB_PENDING;
+}
+
+/* Re-take value n > 1: also drop the link n seconds in with no sleep and take it again, which tests
+ * all of this under a running macOS without a sleep cycle. */
+static void s2r_usb_selftest(void)
+{
+    u32 want = S2R_USB_SELFTEST;
+
+    if (!__atomic_compare_exchange_n(&s2r_usb_state, &want, S2R_USB_OFF, false, __ATOMIC_SEQ_CST,
+                                     __ATOMIC_SEQ_CST))
+        return;
+    printf("USB-RETAKE: self-test: dropping the link on cpu%d\n", smp_id());
+    s2r_console_to_aon();
+    udelay(2000); /* other cores' in-flight writes to it */
+    s2r_release_kept();
+    s2r_usb_wake();
+}
+
+static void s2r_usb_tick(bool byte)
+{
+    u32 state = s2r_usb_state;
+
+    if (state == S2R_USB_OFF || (byte && state != S2R_USB_UP))
+        return;
+    u64 now = mrs(CNTPCT_EL0);
+    if (!byte && now < s2r_usb_next)
+        return;
+    if (state == S2R_USB_SELFTEST) {
+        s2r_usb_selftest();
+        return;
+    }
+    if (__atomic_exchange_n(&s2r_usb_busy, 1, __ATOMIC_ACQUIRE))
+        return;
+    state = s2r_usb_state;
+    if (state == S2R_USB_PENDING) {
+        /* A new coroutine; an earlier one is abandoned if a sleep overtook it. */
+        u64 *frame = (u64 *)(s2r_usb_stack + S2R_USB_STACK_BYTES - 96);
+        memset(frame, 0, 96);
+        frame[11] = (u64)s2r_usb_main; /* x30 in s2r_usb_switch's frame */
+        s2r_usb_co_sp = (u64)frame;
+        s2r_usb_t0 = now;
+        s2r_usb_slices = 0;
+        s2r_usb_slice_max = 0;
+        printf("USB-RETAKE: starting on cpu%d, lane %d\n", smp_id(), usb_cdc_atc_lane());
+        s2r_usb_state = state = S2R_USB_BRINGUP;
+    }
+    if (state != S2R_USB_OFF) {
+        s2r_usb_switch(&s2r_usb_main_sp, s2r_usb_co_sp);
+        if (state == S2R_USB_BRINGUP) {
+            u64 dt = mrs(CNTPCT_EL0) - now;
+            s2r_usb_slices++;
+            s2r_usb_slice_max = max(s2r_usb_slice_max, dt);
+        }
+    }
+    __atomic_store_n(&s2r_usb_busy, 0, __ATOMIC_RELEASE);
+}
+
+/* The re-take in reverse, first thing on the way into the next sleep. */
+static void s2r_usb_quiesce(void)
+{
+    if (!sptm_virt_s2r_usb_retake)
+        return;
+    s2r_usb_state = S2R_USB_OFF;
+    sysop("dsb ish");
+    while (__atomic_load_n(&s2r_usb_busy, __ATOMIC_ACQUIRE))
+        ;
+    s2r_usb_yieldable = false;
+    pmgr_keep_configured = false;
+    s2r_usb_capture = s2r_usb_ring;
+}
+
+static void s2r_usb_setup(void)
+{
+    if (!sptm_virt_s2r_usb_retake)
+        return;
+    if (!s2r_go || !s2r_keep_always || !s2r_drop_usb) {
+        printf("USB-RETAKE: needs go mode, the proxy on CDC and the USB drop; off\n");
+        sptm_virt_s2r_usb_retake = 0;
+        return;
+    }
+    s2r_usb_stack = memalign(0x4000, S2R_USB_STACK_BYTES);
+    s2r_usb_ring = memalign(0x4000, S2R_USB_RING_BYTES);
+    if (!s2r_usb_stack || !s2r_usb_ring) {
+        printf("USB-RETAKE: no memory; off\n");
+        sptm_virt_s2r_usb_retake = 0;
+        return;
+    }
+    if (sptm_virt_s2r_usb_retake > 1) {
+        s2r_usb_next = mrs(CNTPCT_EL0) + (u64)sptm_virt_s2r_usb_retake * mrs(CNTFRQ_EL0);
+        s2r_usb_state = S2R_USB_SELFTEST;
+    }
+    printf("USB-RETAKE: armed%s\n", sptm_virt_s2r_usb_retake > 1 ? ", with the self-test" : "");
+}
+
+/* hv_vuart: every trapped console access may resume the re-take. */
+void sptm_virt_s2r_uart_tick(void)
+{
+    s2r_usb_tick(false);
+}
+
+/* A trapped byte of XNU's console. True if the ring holds it, for the CDC pipe. */
+bool sptm_virt_s2r_uart_byte(u8 b)
+{
+    if (!s2r_usb_capture)
+        return false;
+    u64 i = __atomic_fetch_add(&s2r_usb_ring_wp, 1, __ATOMIC_RELAXED);
+    s2r_usb_ring[i % S2R_USB_RING_BYTES] = b;
+    s2r_usb_tick(true);
+    return true;
 }

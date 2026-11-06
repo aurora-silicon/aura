@@ -86,6 +86,11 @@ bool sptm_virt_cl4_fiq(u64 *regs);
 
 /* The sleep path (sptm_virt_s2r.c) */
 void sptm_virt_s2r_wake_trap(u64 esr, u64 elr, bool in_gl);
+void sptm_virt_s2r_uart_tick(void);
+bool sptm_virt_s2r_uart_byte(u8 b);
+/* usb.c: the link's bring-up after a wake runs on a coroutine whose waits give the core back. */
+bool sptm_virt_s2r_usb_yieldable(void);
+bool sptm_virt_s2r_usb_yield(u32 us);
 
 #else
 
@@ -100,6 +105,23 @@ static inline bool sptm_virt_heap_window(u64 *base, u64 *limit)
 static inline bool sptm_virt_peek_fault(bool in_gl)
 {
     (void)in_gl;
+    return false;
+}
+static inline void sptm_virt_s2r_uart_tick(void)
+{
+}
+static inline bool sptm_virt_s2r_uart_byte(u8 b)
+{
+    (void)b;
+    return false;
+}
+static inline bool sptm_virt_s2r_usb_yieldable(void)
+{
+    return false;
+}
+static inline bool sptm_virt_s2r_usb_yield(u32 us)
+{
+    (void)us;
     return false;
 }
 

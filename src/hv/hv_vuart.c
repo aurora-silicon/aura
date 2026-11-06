@@ -3,6 +3,7 @@
 #include "hv.h"
 #include "aic.h"
 #include "iodev.h"
+#include "sptm_virt.h"
 #include "uart.h"
 #include "uart_regs.h"
 #include "usb.h"
@@ -92,6 +93,7 @@ static void handle_vuart_passthrough(uint8_t b)
 
 static bool handle_vuart(struct exc_info *ctx, u64 addr, u64 *val, bool write, int width)
 {
+    sptm_virt_s2r_uart_tick();
     UNUSED(ctx);
     UNUSED(width);
 
@@ -107,7 +109,10 @@ static bool handle_vuart(struct exc_info *ctx, u64 addr, u64 *val, bool write, i
                 break;
             case UTXH: {
                 uint8_t b = *val;
-                if (iodev_can_write(vuart_tx_iodev))
+                /* After a sleep with the link re-taken, the S2R ring feeds the CDC pipe. */
+                bool ringed = sptm_virt_s2r_uart_byte(b);
+                if (!(ringed && vuart_tx_iodev == IODEV_USB_VUART) &&
+                    iodev_can_write(vuart_tx_iodev))
                     iodev_write(vuart_tx_iodev, &b, 1);
                 if (vuart_tx_mirror != IODEV_MAX && vuart_tx_mirror != vuart_tx_iodev &&
                     iodev_can_write(vuart_tx_mirror))
@@ -184,4 +189,14 @@ void hv_vuart_sleep_commit(iodev_id_t tx)
     vuart_hw_off = true;
     vuart_tx_iodev = tx;
     vuart_tx_only = true;
+}
+
+/* The CDC link is back after a wake (sptm_virt_s2r.c): undo the routing above. The real UART stays
+ * untouched. */
+void hv_vuart_usb_back(iodev_id_t iodev)
+{
+    usb_iodev_vuart_setup(iodev);
+    sysop("dmb ish");
+    vuart_tx_only = false;
+    vuart_tx_iodev = IODEV_USB_VUART;
 }
