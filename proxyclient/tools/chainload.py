@@ -15,6 +15,7 @@ parser.add_argument('-x', '--xnu', action="store_true", help="Set up for chainlo
 parser.add_argument('--vector-only', action="store_true", help="Return after vector reply without probing the next image")
 parser.add_argument('--capture', type=pathlib.Path, help="Write raw post-vector console bytes to this file")
 parser.add_argument('--capture-seconds', type=float, default=0, help="Seconds of raw console capture after vector")
+parser.add_argument('--relocate', action='store_true', help='Allocate a new raw-image span while retaining the live stage-1 heap')
 parser.add_argument('payload', type=pathlib.Path)
 parser.add_argument('boot_args', default=[], nargs="*")
 args = parser.parse_args()
@@ -57,6 +58,13 @@ image_only_size = align(len(image))
 blobs, bootargs_off = find_boot_blobs(u.adt["chosen"]["memory-map"]._properties, blob_names, 0)
 bootargs_size = 0x4000
 fw_size = bootargs_off + bootargs_size
+if args.relocate:
+    if not args.raw or args.xnu:
+        raise ValueError("Relocation requires a raw aura image")
+    new_base = p.memalign(0x4000, image_only_size + fw_size)
+    if not new_base:
+        raise MemoryError("No space for relocated image")
+    entry = new_base + args.entry_point
 packed_end = new_base + image_only_size + fw_size
 
 if not (u.ba.phys_base <= new_base < u.ba.phys_base + u.ba.mem_size):
@@ -80,10 +88,10 @@ inherited_top = u.ba.top_of_kernel_data
 image_end = new_base + image_only_size
 if ro_end and image_end > ro_start and new_base < ro_end:
     raise ValueError("Image itself overlaps firmware RO memory")
-if live_heap > inherited_top and image_end > inherited_top and new_base < live_heap:
+if not args.relocate and live_heap > inherited_top and image_end > inherited_top and new_base < live_heap:
     raise ValueError("Image overlaps live Stage 1 heap")
 
-park_fw = ((ro_end and packed_end > ro_start and image_end < ro_end) or
+park_fw = not args.relocate and ((ro_end and packed_end > ro_start and image_end < ro_end) or
            (live_heap > inherited_top and packed_end > inherited_top and image_end < live_heap))
 fw_dest = new_base + image_only_size
 if park_fw:
