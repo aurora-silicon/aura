@@ -2192,4 +2192,6 @@ void usb_dwc3_flush(dwc3_dev_t *dev, cdc_acm_pipe_id_t pipe)
     }
 }
 
+#ifdef AURA_WINDOWS
 #include "usb_dwc3_vuart.inc"
+#endif
