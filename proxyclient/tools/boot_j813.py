@@ -76,8 +76,10 @@ def prepare(args, s, raw):
     p = s.p
     bootargs = ("earlycon=dockchannel,0x38812c000 console=tty0 console=ttyDC0 keep_bootcon "
                 "maxcpus=1 nokaslr rdinit=/init panic=0")
-    p.kboot_set_chosen("bootargs", bootargs)
-    p.kboot_set_chosen("stdout-path", "serial0:1500000n8")
+    common.require(s.call("kboot_set_chosen", s.cstring("bootargs"), s.cstring(bootargs)) == 0,
+                   "bootargs failed")
+    common.require(s.call("kboot_set_chosen", s.cstring("stdout-path"),
+                          s.cstring("serial0:1500000n8")) == 0, "stdout-path failed")
     p.kboot_set_initrd(payloads["initramfs.cpio.gz"]["address"], payloads["initramfs.cpio.gz"]["size"])
     common.require(p.kboot_prepare_dt(payloads["t8142-j813.dtb"]["address"]) == 0,
                    "device-tree preparation failed; do not boot")
