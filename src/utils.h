@@ -500,18 +500,18 @@ enum cpufeat_uncore_version {
     UNCORE_V2,
 };
 
-/* The proxy reads this layout (proxyclient/aura/proxy.py): only append to it. */
+/* The proxy reads this layout (proxyclient/aura/proxy.py CPUFeatures). */
 struct midr_part_features {
     enum cpufeat_sleep_mode sleep_mode;
     enum cpufeat_uncore_version uncore_version;
     bool disable_dc_mva;
     bool acc_cfg;
     /*
-     * A7 to M3 implementation registers that M4 and later lock or have not been
-     * shown to have: RVBAR in cpu-impl-reg, the L2C, LSU, FED and MMU error
-     * status registers, and the hypervisor's AMX_CTL_EL2, VM keys and SPRR/GXF.
+     * CYC_OVRD and the registers that come with it (RVBAR, the L2C error status,
+     * SPRR/GXF): A7 to M3. False from M4 on, where CYC_OVRD is undefined, though
+     * HACR_EL2 and the ACTLR bits can still be set at EL2 there.
      */
-    bool legacy_impl_regs;
+    bool apple_sysregs_unlocked;
     bool workaround_cyclone_cache;
     bool nex_powergating;
     bool fast_ipi;
@@ -521,12 +521,6 @@ struct midr_part_features {
     bool actlr_el2;
     bool counter_redirect;
     bool unsafe_wfi;
-    /* CYC_OVRD exists. It is undefined on M4 and later. */
-    bool cyc_ovrd;
-    /* At EL2, HACR_EL2 and the ACTLR bits can be set, and on M4 and later the deep sleep enable. */
-    bool apple_sysregs_unlocked;
-    /* iBoot leaves CTRR_C and CTRR_D enforced on the secondaries (M4 and later). */
-    bool secondary_ctrr;
 };
 
 extern bool is_mac;

@@ -877,14 +877,13 @@ static int dt_set_chosen(void)
     }
 
     /*
-     * Without CYC_OVRD aura cannot turn WFI retention on, so the cores lose
-     * state in WFI. Upstream adds these for kernels that cannot survive that.
-     * Aurora's kernels for T8132, T6040 and T6041 boot without them, and
-     * idle=nop would keep every idle CPU spinning. T8140 adds only
-     * arm64.nowfxt, in dt_set_t8140_wfx_args().
+     * Upstream adds these on every chip with locked Apple system registers,
+     * for kernels that cannot survive WFI state loss. Aurora's kernels for
+     * T8132, T6040 and T6041 boot without them, and idle=nop would keep every
+     * idle CPU spinning. T8140 adds only arm64.nowfxt, in dt_set_wfx_args().
      */
-    if (!cpu_features->cyc_ovrd && chip_id != T8140 && chip_id != T8132 && chip_id != T6040 &&
-        chip_id != T6041) {
+    if (!cpu_features->apple_sysregs_unlocked && chip_id != T8140 && chip_id != T8132 &&
+        chip_id != T6040 && chip_id != T6041) {
         /*
          * M4 and later lose architectural state in WFI and WFIT. Add the
          * bootargs to prevent Linux from crashing in the idle loop and delay
@@ -9039,14 +9038,14 @@ int kboot_prepare_dt(void *fdt)
             bail("FDT: couldn't reserve CTXR windows A to C\n");
     }
 
-    if (cpu_features->secondary_ctrr && !in_el2()) {
+    if (!cpu_features->apple_sysregs_unlocked && !in_el2()) {
         /*
          * A guest under the aura hypervisor runs at EL1. The host keeps the
          * SMP-RO range and starts the guest's CPUs itself, so the guest
          * leaves it out. This is how the J616s guest boots.
          */
         printf("FDT: running at EL1, leaving the M4+ SMP-RO range to the host\n");
-    } else if (cpu_features->secondary_ctrr && dt_reserve_secondary_ro()) {
+    } else if (!cpu_features->apple_sysregs_unlocked && dt_reserve_secondary_ro()) {
         return -1;
     }
 

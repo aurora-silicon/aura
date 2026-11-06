@@ -43,8 +43,6 @@ struct midr_part_info {
 const struct midr_part_features features_a7 = {
     .disable_dc_mva = true,
     .acc_cfg = true,
-    .legacy_impl_regs = true,
-    .cyc_ovrd = true,
     .apple_sysregs_unlocked = true,
     .workaround_cyclone_cache = true,
     .sleep_mode = SLEEP_LEGACY,
@@ -53,8 +51,6 @@ const struct midr_part_features features_a7 = {
 const struct midr_part_features features_a10 = {
     .disable_dc_mva = true,
     .acc_cfg = true,
-    .legacy_impl_regs = true,
-    .cyc_ovrd = true,
     .apple_sysregs_unlocked = true,
     .workaround_cyclone_cache = false,
     .sleep_mode = SLEEP_GLOBAL,
@@ -63,8 +59,6 @@ const struct midr_part_features features_a10 = {
 const struct midr_part_features features_a11 = {
     .disable_dc_mva = true,
     .acc_cfg = true,
-    .legacy_impl_regs = true,
-    .cyc_ovrd = true,
     .apple_sysregs_unlocked = true,
     .sleep_mode = SLEEP_GLOBAL,
     .uncore_version = UNCORE_V1,
@@ -75,8 +69,6 @@ const struct midr_part_features features_a11 = {
 const struct midr_part_features features_m1 = {
     .disable_dc_mva = true,
     .acc_cfg = true,
-    .legacy_impl_regs = true,
-    .cyc_ovrd = true,
     .apple_sysregs_unlocked = true,
     .sleep_mode = SLEEP_GLOBAL,
     .uncore_version = UNCORE_V2,
@@ -90,8 +82,6 @@ const struct midr_part_features features_m1 = {
 const struct midr_part_features features_m2 = {
     .disable_dc_mva = true,
     .acc_cfg = true,
-    .legacy_impl_regs = true,
-    .cyc_ovrd = true,
     .apple_sysregs_unlocked = true,
     .sleep_mode = SLEEP_GLOBAL,
     .uncore_version = UNCORE_V2,
@@ -106,8 +96,6 @@ const struct midr_part_features features_m2 = {
 const struct midr_part_features features_m3 = {
     .disable_dc_mva = true,
     .acc_cfg = true,
-    .legacy_impl_regs = true,
-    .cyc_ovrd = true,
     .apple_sysregs_unlocked = true,
     .sleep_mode = SLEEP_GLOBAL,
     .uncore_version = UNCORE_V2,
@@ -126,8 +114,6 @@ const struct midr_part_features features_m4 = {
     .fast_ipi = true,
     .actlr_el2 = true,
     .unsafe_wfi = true,
-    .apple_sysregs_unlocked = true,
-    .secondary_ctrr = true,
 };
 
 /*
@@ -140,8 +126,6 @@ const struct midr_part_features features_m4 = {
  * implementation-defined tuning and fast IPIs off until separately qualified. */
 const struct midr_part_features features_m6 = {
     .sleep_mode = SLEEP_NONE,
-    .apple_sysregs_unlocked = true,
-    .secondary_ctrr = true,
 };
 
 const struct midr_part_info midr_parts[] = {
@@ -270,7 +254,7 @@ void init_cpu(void)
         reg_clr(SYS_IMP_APL_ACC_CFG, ACC_CFG_DEEP_SLEEP);
     }
 
-    if (cpu_features->cyc_ovrd) {
+    if (cpu_features->apple_sysregs_unlocked) {
         /* Unmask external IRQs, set WFI mode to up (2), enable WFI retention */
         reg_mask(SYS_IMP_APL_CYC_OVRD,
                  CYC_OVRD_FIQ_MODE_MASK | CYC_OVRD_IRQ_MODE_MASK | CYC_OVRD_WFI_MODE_MASK |

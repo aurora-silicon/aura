@@ -26,7 +26,7 @@ _Static_assert(sizeof(u64) == 8, "production u64 ABI");
 #define ALIGN_DOWN(x, a) ((x) & ~((a) - 1))
 #define sysop(op) ((void)(op))
 struct cpu_info { u64 impl_reg; };
-static struct { bool legacy_impl_regs; } features, *cpu_features = &features;
+static struct { bool apple_sysregs_unlocked; } features, *cpu_features = &features;
 static unsigned char _vectors_start[4096] __attribute__((aligned(0x4000)));
 static u64 installed_relay, relocated_from, rvbar, locked;
 static u32 word;
@@ -84,7 +84,7 @@ int main(void)
     assert(smp_prepare_rvbar(&cpu) == -1 && writes == 1 && owned_asks == 2);
 
     /* A7 to M3 set RVBAR at start, so nothing here touches it. */
-    features.legacy_impl_regs = true;
+    features.apple_sysregs_unlocked = true;
     rvbar = locked | RVBAR_LOCK;
     assert(smp_prepare_rvbar(&cpu) == 0 && writes == 1);
     puts("load-base RVBAR PASS");

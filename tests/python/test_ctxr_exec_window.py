@@ -30,7 +30,7 @@ static u64 SYS_IMP_APL_CTXR_A_LWR_EL1, SYS_IMP_APL_CTXR_A_UPR_EL1, SYS_IMP_APL_C
     SYS_IMP_APL_CTXR_B_UPR_EL1, SYS_IMP_APL_CTXR_C_LWR_EL1, SYS_IMP_APL_CTXR_C_UPR_EL1,
     SYS_IMP_APL_CTXR_D_LWR_EL1, SYS_IMP_APL_CTXR_D_UPR_EL1, SYS_IMP_APL_CTRR_C_LWR_EL1,
     SYS_IMP_APL_CTRR_C_UPR_EL1, SYS_IMP_APL_CTRR_D_LWR_EL1, SYS_IMP_APL_CTRR_D_UPR_EL1;
-static struct { bool secondary_ctrr; } features, *cpu_features = &features;
+static struct { bool apple_sysregs_unlocked; } features, *cpu_features = &features;
 static int confined, ro_status, fb_active;
 static u64 _base, _end, boot_args_addr, ro_start_v, ro_end_v;
 static struct { u64 top_of_kernel_data; } cur_boot_args;
@@ -51,7 +51,7 @@ static void expanded(void)
 {
     window_checked = false; window_problem = NULL; window_base = window_size = 0;
     confined = 1; ro_status = 1; register_reads = 0; fb_active = 0; console[0] = 0;
-    features.secondary_ctrr = true;
+    features.apple_sysregs_unlocked = false;
     _base = BASE; _end = BASE + 0x3d0000;
     SYS_IMP_APL_CTXR_D_LWR_EL1 = BASE - 0xd8000;
     SYS_IMP_APL_CTXR_D_UPR_EL1 = BASE + 16 * MIB + 2 * MIB - SZ_16K + WINDOW - SZ_4K;
@@ -142,9 +142,9 @@ int main(void)
     other_chip();
     SYS_IMP_APL_CTRR_D_LWR_EL1 = start + WINDOW - SZ_4K; SYS_IMP_APL_CTRR_D_UPR_EL1 = start + WINDOW;
     assert(refused("read-only firmware range"));
-    /* A CPU whose secondaries enforce no CTRR does not take the reads kboot would not make. */
+    /* Unlocked sysregs (M1 to M3) do not take the CTRR reads kboot would not make either. */
     other_chip();
-    features.secondary_ctrr = false;
+    features.apple_sysregs_unlocked = true;
     SYS_IMP_APL_CTRR_C_LWR_EL1 = start; SYS_IMP_APL_CTRR_C_UPR_EL1 = start + SZ_16K;
     assert(usable());
     /* A chip with a firmware RO range is checked against the same registers as well. */

@@ -210,7 +210,7 @@ int hv_init(void)
     }
 
     // Set deep WFI back to defaults
-    if (cpu_features->cyc_ovrd)
+    if (cpu_features->apple_sysregs_unlocked)
         reg_mask(SYS_IMP_APL_CYC_OVRD, CYC_OVRD_WFI_MODE_MASK, CYC_OVRD_WFI_MODE(0));
 
     hv_enable_sme_zt0();
@@ -303,7 +303,7 @@ int hv_start(void *entry, u64 regs[4])
 
 static void hv_init_secondary(struct hv_secondary_info_t *info)
 {
-    if (cpu_features->legacy_impl_regs)
+    if (cpu_features->apple_sysregs_unlocked)
         gxf_init();
 
     msr(VMPIDR_EL2, mrs(MPIDR_EL1));
@@ -316,7 +316,7 @@ static void hv_init_secondary(struct hv_secondary_info_t *info)
     msr(MDCR_EL2, info->mdcr);
     msr(MDSCR_EL1, info->mdscr);
 
-    if (cpu_features->legacy_impl_regs) {
+    if (cpu_features->apple_sysregs_unlocked) {
         msr(SYS_IMP_APL_AMX_CTL_EL2, info->amx_ctl);
         msr(SYS_IMP_APL_APVMKEYLO_EL2, info->apvmkeylo);
         msr(SYS_IMP_APL_APVMKEYHI_EL2, info->apvmkeyhi);
@@ -327,7 +327,7 @@ static void hv_init_secondary(struct hv_secondary_info_t *info)
         msr(SYS_ACTLR_EL12, info->actlr_el1);
     else
         msr(SYS_IMP_APL_ACTLR_EL12, info->actlr_el1);
-    if (cpu_features->legacy_impl_regs) {
+    if (cpu_features->apple_sysregs_unlocked) {
         msr(SYS_IMP_APL_SPRR_CONFIG_EL1, info->sprr_config);
         /* GXF_CONFIG is UNDEF unless SPRR is enabled */
         if (info->sprr_config & SPRR_CONFIG_EN)
@@ -338,7 +338,7 @@ static void hv_init_secondary(struct hv_secondary_info_t *info)
         msr(SYS_IMP_APL_AGTCNTRDIR_EL12, info->agt_cnt_rdir_el12);
     }
 
-    if (cpu_features->cyc_ovrd)
+    if (cpu_features->apple_sysregs_unlocked)
         reg_mask(SYS_IMP_APL_CYC_OVRD, CYC_OVRD_WFI_MODE_MASK, CYC_OVRD_WFI_MODE(0));
 
     hv_enable_sme_zt0();

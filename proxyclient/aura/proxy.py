@@ -527,7 +527,7 @@ CPUFeatures = Struct(
     "uncore_version" / UncoreVersion,
     "disable_dc_mva" / bool_,
     "acc_cfg" / bool_,
-    "legacy_impl_regs" / bool_,
+    "apple_sysregs_unlocked" / bool_,
     "workaround_cyclone_cache" / bool_,
     "nex_powergating" / bool_,
     "fast_ipi" / bool_,
@@ -537,10 +537,6 @@ CPUFeatures = Struct(
     "actlr_el2" / bool_,
     "counter_redirect" / bool_,
     "unsafe_wfi" / bool_,
-    "cyc_ovrd" / bool_,
-    "apple_sysregs_unlocked" / bool_,
-    "secondary_ctrr" / bool_,
-    Padding(1),  # the C struct's tail padding
 )
 
 # Uses UartInterface.proxyreq() to send requests to AURA and process

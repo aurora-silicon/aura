@@ -201,7 +201,7 @@ static int smp_prepare_rvbar(const struct cpu_info *cpu)
     u64 target = (u64)_vectors_start;
 
     /* A7 to M3: RVBAR is not locked, and smp_start_cpu() sets it. */
-    if (locked == target || cpu_features->legacy_impl_regs)
+    if (locked == target || cpu_features->apple_sysregs_unlocked)
         return 0;
     /* A stage that moved above the chainloaded image keeps entry at its old base. */
     if (relocated_from && locked == old_vectors_start())
@@ -468,7 +468,7 @@ static int smp_start_cpu(int index, const struct cpu_info *cpu)
 
     sysop("dsb sy");
 
-    if (cpu_features->legacy_impl_regs) {
+    if (cpu_features->apple_sysregs_unlocked) {
         // This also clears RVBAR_LOCK, so that HV can set RVBAR later when the core is running
         write64(cpu->impl_reg, (u64)_vectors_start);
     }

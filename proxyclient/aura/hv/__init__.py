@@ -716,7 +716,7 @@ class HV(Reloadable):
                 if enc in xlate:
                     value = self.p.hv_translate(value, True, False)
                 call=None
-                if self.u.cpu_features.legacy_impl_regs:
+                if self.u.cpu_features.apple_sysregs_unlocked:
                     call=self.p.gl2_call
                 self.u.msr(enc2, value, call=call)
                 self.log(f"Pass: msr {name}, x{iss.Rt} = {value:x} (OK) ({sysreg_name(enc2)})")
@@ -1363,7 +1363,7 @@ class HV(Reloadable):
 
     def init(self):
         if self.emulate_sprr is None:
-            self.emulate_sprr = not self.u.cpu_features.legacy_impl_regs
+            self.emulate_sprr = not self.u.cpu_features.apple_sysregs_unlocked
         if self.emulate_sprr:
             print("SPRR/GXF: emulating in EL2 (guest image will be patched)")
 
@@ -1439,7 +1439,7 @@ class HV(Reloadable):
         self.u.msr(MDCR_EL2, mdcr.value)
         self.u.msr(MDSCR_EL1, MDSCR(MDE=1).value)
 
-        if self.u.cpu_features.legacy_impl_regs:
+        if self.u.cpu_features.apple_sysregs_unlocked:
             # Enable AMX
             amx_ctl = AMX_CONFIG(self.u.mrs(AMX_CONFIG_EL1))
             amx_ctl.EN_EL1 = 1
@@ -1575,7 +1575,7 @@ class HV(Reloadable):
             self.map_hook(pmgr0_start + cpu_start, 0x20, write=cpustart_wh)
             self.add_tracer(zone, "CPU_START", TraceMode.RESERVED)
 
-        if not self.u.cpu_features.legacy_impl_regs:
+        if not self.u.cpu_features.apple_sysregs_unlocked:
 
             def rvbar_rh(base, off, width):
                 ret = self.entry & ~0xfff | 1
@@ -1598,7 +1598,7 @@ class HV(Reloadable):
             self.log("CPU not found!")
             return
 
-        if self.u.cpu_features.legacy_impl_regs:
+        if self.u.cpu_features.apple_sysregs_unlocked:
             entry = self.p.read64(node.cpu_impl_reg[0]) & 0xfffffffffff
         else:
             entry = self.entry & ~0xfff
@@ -1806,7 +1806,7 @@ class HV(Reloadable):
         elif self.tba.revision == 3:
             self.iface.writemem(guest_base + self.bootargs_off, BootArgs_r3.build(self.tba))
 
-        if self.u.cpu_features.legacy_impl_regs:
+        if self.u.cpu_features.apple_sysregs_unlocked:
             print("Setting secondary CPU RVBARs...")
             rvbar = self.entry & ~0xfff
             for cpu in self.adt["cpus"]:
@@ -1980,7 +1980,7 @@ class HV(Reloadable):
         if self.emulate_sprr:
             print("Enabling emulated SPRR/GXF...")
             self.p.hv_sprr_set_active(True)
-        elif self.u.cpu_features.legacy_impl_regs:
+        elif self.u.cpu_features.apple_sysregs_unlocked:
             print("Enabling SPRR...")
             self.u.msr(SPRR_CONFIG_EL1, 1)
 
