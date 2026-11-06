@@ -102,11 +102,92 @@ void __assert_fail(const char *assertion, const char *file, unsigned int line, c
     flush_and_reboot();
 }
 
+#ifdef AURA_WINDOWS
+bool timer_windows_ready;
+u64 timer_windows_offset;
+
+/* Run once on the boot CPU before entering any guest. Probe with a bounded
+ * iteration count: the clock being qualified cannot provide its own timeout. */
+bool timer_prepare_windows(void)
+{
+    if (chip_id != T8142)
+        return true;
+    if (__atomic_load_n(&timer_windows_ready, __ATOMIC_ACQUIRE))
+        return true;
+    u64 frequency = mrs(CNTFRQ_EL0);
+    if (frequency != 1000000000) {
+        printf("timer: reject frequency freq=%lu expected=1000000000\n", frequency);
+        return false;
+    }
+    /* Serialize every calibration read. On T8142 the plain read loop can
+     * exhaust the iteration cap in less than the required millisecond. */
+    sysop("isb");
+    u64 first = mrs(CNTPCT_EL0);
+    sysop("isb");
+    u64 alias_first = mrs(SYS_IMP_APL_CNTVCT_ALIAS_EL0);
+    sysop("isb");
+    u64 after = mrs(CNTPCT_EL0);
+    if (after < first || after - first > 10000) {
+        printf("timer: reject first-bracket freq=%lu raw=%lu..%lu alias=%lu width=%lu\n", frequency,
+               first, after, alias_first, after - first);
+        return false;
+    }
+    u64 start = first + (after - first) / 2;
+    u64 now = after;
+    unsigned i;
+    for (i = 0; i < 1000000; i++) {
+        sysop("isb");
+        now = mrs(CNTPCT_EL0);
+        if (now < after) {
+            printf("timer: reject poll-backward freq=%lu start=%lu now=%lu iteration=%u\n",
+                   frequency, after, now, i);
+            return false;
+        }
+        if (now - after >= 1000000)
+            break;
+    }
+    if (i == 1000000) {
+        printf("timer: reject iteration-limit freq=%lu start=%lu now=%lu elapsed=%lu "
+               "required=1000000 iterations=%u\n",
+               frequency, after, now, now - after, i);
+        return false;
+    }
+    sysop("isb");
+    first = mrs(CNTPCT_EL0);
+    sysop("isb");
+    u64 alias_last = mrs(SYS_IMP_APL_CNTVCT_ALIAS_EL0);
+    sysop("isb");
+    after = mrs(CNTPCT_EL0);
+    if (after < first || after - first > 10000 || alias_last < alias_first) {
+        printf("timer: reject last-bracket freq=%lu raw=%lu..%lu width=%lu "
+               "alias=%lu..%lu iterations=%u\n",
+               frequency, first, after, after - first, alias_first, alias_last, i);
+        return false;
+    }
+    u64 elapsed = first + (after - first) / 2 - start;
+    u64 alias_elapsed = timer_scale_alias(alias_last - alias_first);
+    u64 error = elapsed > alias_elapsed ? elapsed - alias_elapsed : alias_elapsed - elapsed;
+    if (error > elapsed / 100 + 20000) {
+        printf("timer: reject rate freq=%lu elapsed=%lu alias_delta=%lu scaled=%lu "
+               "error=%lu tolerance=%lu iterations=%u\n",
+               frequency, elapsed, alias_last - alias_first, alias_elapsed, error,
+               elapsed / 100 + 20000, i);
+        return false;
+    }
+    /* Anchor to the upper bracket, not an assumed power-on epoch. The first
+     * alias read is no earlier than this observed architectural counter. */
+    timer_windows_offset = after - timer_scale_alias(alias_last);
+    __atomic_store_n(&timer_windows_ready, true, __ATOMIC_RELEASE);
+    return true;
+}
+
+#endif
+
 void udelay(u32 d)
 {
     u64 delay = ((u64)d) * mrs(CNTFRQ_EL0) / 1000000;
-    u64 val = mrs(CNTPCT_EL0);
-    while ((mrs(CNTPCT_EL0) - val) < delay)
+    u64 val = get_ticks();
+    while ((get_ticks() - val) < delay)
         ;
     sysop("isb");
 }
@@ -126,12 +207,12 @@ u64 ticks_to_usecs(u64 ticks)
 u64 timeout_calculate(u32 usec)
 {
     u64 delay = ((u64)usec) * mrs(CNTFRQ_EL0) / 1000000;
-    return mrs(CNTPCT_EL0) + delay;
+    return get_ticks() + delay;
 }
 
 bool timeout_expired(u64 timeout)
 {
-    bool expired = mrs(CNTPCT_EL0) > timeout;
+    bool expired = get_ticks() > timeout;
     sysop("isb");
     return expired;
 }

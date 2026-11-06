@@ -3,6 +3,8 @@
 #ifndef UTILS_H
 #define UTILS_H
 
+#include "../build/build_cfg.h"
+
 #include "cpu_regs.h"
 #include "midr.h"
 #include "soc.h"
@@ -416,8 +418,25 @@ int snprintf(char *str, size_t size, const char *fmt, ...);
 int debug_printf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 void udelay(u32 d);
 
+#ifdef AURA_WINDOWS
+extern bool timer_windows_ready;
+extern u64 timer_windows_offset;
+bool timer_prepare_windows(void);
+
+/* T8142's measured 24 MHz alias in the 1 GHz architectural counter domain.
+ * Divide first so the intermediate multiply cannot overflow prematurely. */
+static inline u64 timer_scale_alias(u64 ticks)
+{
+    return (ticks / 3) * 125 + ((ticks % 3) * 125) / 3;
+}
+#endif
+
 static inline u64 get_ticks(void)
 {
+#ifdef AURA_WINDOWS
+    if (__atomic_load_n(&timer_windows_ready, __ATOMIC_ACQUIRE))
+        return timer_scale_alias(mrs(SYS_IMP_APL_CNTVCT_ALIAS_EL0)) + timer_windows_offset;
+#endif
     return mrs(CNTPCT_EL0);
 }
 u64 ticks_to_msecs(u64 ticks);

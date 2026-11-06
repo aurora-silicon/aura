@@ -38,6 +38,7 @@ jobs:
           python tools/windows_n1_e2e.py --output build/windows-n1
           python tools/windows_serial_e2e.py --output build/windows-serial
           python tools/windows_vuart_e2e.py --output build/windows-vuart
+          python tools/windows_counter_e2e.py --output build/windows-counter
           python tools/windows_sgi_e2e.py --output build/windows-sgi
           python tools/windows_abort_e2e.py --output build/windows-abort
           python tools/windows_mtp_e2e.py --output build/windows-mtp
@@ -68,6 +69,7 @@ jobs:
             build/windows-n1
             build/windows-serial
             build/windows-vuart
+            build/windows-counter
             build/windows-sgi
             build/windows-abort
             build/windows-mtp
