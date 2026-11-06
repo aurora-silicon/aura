@@ -12,7 +12,7 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 CASES = (
-    "success", "power-enable", "power-inactive", "power-unknown",
+    "success", "tunables", "cold-name", "cold-parent", "cold-alias", "cold-unknown", "cold-reset", "cold-auto", "cold-target", "cold-active", "cold-clkgate", "fabric", "finish-early", "power-enable", "power-inactive", "power-unknown",
     "chip", "board", "model", "resource", "perst", "locked", "dart",
     "busy", "pre-bme", "train", "post-bme", "identity", "bar-mask", "bar-high",
     "bar-drop", "rom", "clamp-fail",
@@ -31,6 +31,8 @@ SOURCES = (
     "src/adt.h", "sysinc/string.h", "src/types.h", "src/utils.h", "src/exception.h",
     "tests/e2e/windows_n1/producer_host.c", "tests/e2e/windows_n1/failure-model.md",
     "tests/e2e/windows_n1/j813_reset_provider.h",
+    "tests/e2e/windows_n1/sequence_host.c", "tests/e2e/windows_n1/linux_sequence.txt",
+    "src/smc.h", "src/tunables.h", "src/libfdt/libfdt.h",
     "tools/windows_n1_e2e.py", "docs/windows-n1.md",
 )
 
@@ -63,7 +65,7 @@ def main():
         "result": "failed", "hardware_accessed": False, "hardware_qualified": False,
         "scope": "production N1 preparation and census with independent ADT/MMIO model",
         "limitations": [
-            "Linux PHY/SMC training call is modelled, not executed",
+            "PHY/SMC production sequence replay uses modeled MMIO, tunables and SMC boundaries",
             "No physical reset/drain, Windows PnP, interrupts or DMA qualification",
             "Host preparation gate is stubbed enabled; this is not a launcher lifecycle test",
             "The HVC instruction/dispatcher and physical fault delivery are not executed",
@@ -106,6 +108,25 @@ def main():
         report["descriptor"] = {"path": str(descriptor),
                                 "bytes": descriptor.stat().st_size,
                                 "sha256": digest(descriptor)}
+        sequence = output / "sequence-host"
+        run([compiler, "-std=gnu11", "-O1", "-g", "-Wall", "-Wextra", "-Werror",
+             "-Wno-unused-function", "-fsanitize=address,undefined", "-Isrc",
+             "tests/e2e/windows_n1/sequence_host.c", "-o", sequence],
+            snapshot, output / "sequence-compile.log", report)
+        linux = run([sequence, "linux"], snapshot, output / "linux-sequence.log", report, env)
+        expected = snapshot / "tests/e2e/windows_n1/linux_sequence.txt"
+        if linux != expected.read_text():
+            raise RuntimeError("default Linux hardware-action sequence differs from pre-split baseline")
+        run([sequence, "windows"], snapshot, output / "windows-sequence.log", report, env)
+        run([sequence, "windows-fault"], snapshot, output / "windows-fault.log", report, env)
+        run([sequence, "windows-barrier-fault"], snapshot,
+            output / "windows-barrier-fault.log", report, env)
+        report["sequence"] = {
+            "linux_baseline_commit": "c30bec09",
+            "linux_transcript_sha256": digest(output / "linux-sequence.log"),
+            "windows_transcript_sha256": digest(output / "windows-sequence.log"),
+            "result": "passed",
+        }
         report["result"] = "passed"
     except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
         report["error"] = str(error)

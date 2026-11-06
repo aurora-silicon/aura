@@ -1,0 +1,73 @@
+power /arm-io/apcie
+tunable /arm-io/apcie apcie-phy-tunables 48f000000
+poll 48f004000 80000000 80000000 1000000
+set 48f020000 1
+poll 48f020000 4 4 1000000
+us 1000
+set 48f020000 2
+poll 48f020000 8 8 1000000
+clear 48f020000 10
+us 1000
+set 48f020004 1
+tunable /arm-io/apcie apcie-phy-ip-pll-tunables 48f040000
+tunable /arm-io/apcie apcie-phy-ip-auspma-tunables 48f040000
+clear 48f040090 10000
+set 48f020004 10
+poll 48f020008 1 1 1000000
+set 48f004000 1
+set 48f020000 8000000
+tunable /arm-io/apcie apcie-axi2af-tunables 48e000000
+write 48c000054 140
+set 48c000050 1
+poll 48c000058 1 1 250000
+smc init
+smc write 67503133 800000
+ms 50
+smc write 67503133 800001
+ms 50
+smc shutdown
+ms 100
+write 488028088 110
+write 488028148 ffffffff
+write 488028210 ffffffff
+write 488028084 0
+write 488028104 fffffff0
+write 488028124 100
+write 48802816c 0
+write 48802813c 0
+write 488028800 100100
+write 488028808 1001ff
+write 48802882c 10000
+write 488028130 3020000
+write 488028140 10
+write 488028144 253770
+write 488028834 0
+write 48802883c 0
+tunable /arm-io/apcie/pci-bridge0 apcie-config-tunables 488028000
+set 488028800 1
+set 48f010000 1
+poll 48f010000 4 4 100000
+set 48f010000 2
+poll 48f010000 8 8 100000
+clear 48f010000 10
+us 1000
+set 48f010000 200
+set 48f010000 400
+us 1000
+set 48802882c 1
+mask 39a000300 f 3
+poll 4880280a8 1 1 100000
+poll 488028804 1 1 250000
+poll 488028208 4 0 500000
+set 1cb00008bc 1
+tunable /arm-io/apcie/pci-bridge0 pcie-rc-tunables 1cb0000000
+tunable /arm-io/apcie/pci-bridge0 pcie-rc-gen3-shadow-tunables 1cb0000000
+tunable /arm-io/apcie/pci-bridge0 pcie-rc-gen4-shadow-tunables 1cb0000000
+clear 1cb00008bc 1
+write 488028080 1
+poll 488028208 1 1 1000000
+write 1cb0000018 10100
+ms 100
+read 1cb0100000
+read 488028208
+j813-n1: link up (0x1), endpoint 106b:1900
