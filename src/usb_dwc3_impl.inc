@@ -122,9 +122,7 @@ typedef struct dwc3_dev {
     dart_dev_t *dart;
 
     enum ep0_state ep0_state;
-#if USB_DWC3_SUPERSPEED
-    bool ep0_three_stage;
-#endif
+    bool ep0_three_stage; /* the control transfer has a data stage (wLength != 0) */
     const void *ep0_buffer;
     u32 ep0_buffer_len;
     void *ep0_read_buffer;
@@ -605,11 +603,9 @@ static int usb_dwc3_start_status_phase(dwc3_dev_t *dev, u8 ep)
     struct dwc3_trb *trb;
     uintptr_t trb_iova = usb_dwc3_init_trb(dev, ep, &trb);
 
-#if USB_DWC3_SUPERSPEED
+    /* The status stage of a transfer with a data stage is CONTROL_STATUS3, at every speed;
+     * CONTROL_STATUS2 is only for a two-stage transfer. */
     trb->ctrl |= dev->ep0_three_stage ? DWC3_TRBCTL_CONTROL_STATUS3 : DWC3_TRBCTL_CONTROL_STATUS2;
-#else
-    trb->ctrl |= DWC3_TRBCTL_CONTROL_STATUS2;
-#endif
     trb->size = DWC3_TRB_SIZE_LENGTH(0);
 #if USB_DWC3_SUPERSPEED
     trb->bpl = trb_iova;
@@ -1056,9 +1052,7 @@ static void usb_dwc3_ep0_handle_class(dwc3_dev_t *dev, const union usb_setup_pac
 static void usb_dwc3_ep0_handle_setup(dwc3_dev_t *dev)
 {
     const union usb_setup_packet *setup = dev->endpoints[0].xfer_buffer;
-#if USB_DWC3_SUPERSPEED
     dev->ep0_three_stage = !!setup->raw.wLength;
-#endif
 
     switch (setup->raw.bmRequestType & USB_REQUEST_TYPE_MASK) {
         case USB_REQUEST_TYPE_STANDARD:
