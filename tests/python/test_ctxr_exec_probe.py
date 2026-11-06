@@ -32,7 +32,7 @@ static volatile int exc_guard;
 static volatile u64 exc_last_esr;
 /* Set per case to model each chip; the probe must not read it. */
 static int chip_id __attribute__((unused));
-static int boot_cpu_idx, alive_mask, probe_faults, calls, printed;
+static int boot_cpu_idx, alive_mask, probe_faults, call_fails, calls, printed;
 static void sysop_stub(void) {}
 #define sysop(op) sysop_stub()
 static bool smp_is_alive(int cpu) { return alive_mask & (1 << cpu); }
@@ -48,6 +48,8 @@ static int smp_call1(int cpu, void *fn, u64 arg) {
      * confined one takes an instruction abort, which GUARD_RETURN turns into a return of 0. */
     const u32 *insn = fn;
     assert(insn[0] == 0xd2800020 && insn[1] == 0xd65f03c0);
+    if (call_fails)
+        return -1;
     if (probe_faults) { exc_last_esr = 0x8600000f; result = 0; } else { result = 1; }
     return 0;
 }
@@ -58,6 +60,7 @@ static int smp_wait(int cpu, u64 *ret) { *ret = result; return 0; }
 static int run(int chip, int alive, int faults) {
     /* ctxr_exec_confined() caches its answer per boot: model each case as a fresh boot. */
     chip_id = chip; alive_mask = alive; probe_faults = faults; calls = 0; printed = 0;
+    call_fails = 0;
     return ctxr_exec_confined();
 }
 int main(void) {
@@ -70,6 +73,9 @@ int main(void) {
     for (unsigned i = 0; i < sizeof(chips) / sizeof(chips[0]); i++)
         assert(run(chips[i], 0x2, 0) == 0 && calls == 1 && printed == 0);
     assert(run(T8112, 0xe, 0) == 0 && calls == 1);
+    /* A probe that never ran is not evidence of confinement: say so, do not refuse. */
+    chip_id = T8112; alive_mask = 0x2; probe_faults = 0; calls = 0; printed = 0; call_fails = 1;
+    assert(ctxr_exec_confined() == 0 && calls == 1 && printed == 1);
     /* No secondary to ask, so nothing to confine. */
     assert(run(T6040, 0x1, 1) == 0 && calls == 0);
     puts("ctxr exec probe OK");

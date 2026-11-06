@@ -56,9 +56,23 @@ bool ctxr_exec_confined(void)
     u64 ret = 0;
     exc_last_esr = 0;
     exc_guard = GUARD_RETURN | GUARD_SILENT;
-    if (!smp_call1(cpu, probe, 0))
-        smp_wait(cpu, &ret);
+    int err = smp_call1(cpu, probe, 0);
+    if (!err)
+        err = smp_wait(cpu, &ret);
     exc_guard = GUARD_OFF;
+
+    /*
+     * A probe that never ran says nothing about confinement. Treating it as confined would
+     * refuse to boot a Mac that may have no window at all (M1 to M3), while booting outside
+     * the window at worst leaves the confined secondaries offline.
+     */
+    if (err) {
+        /* The secondary may still run the probe later, so its page is not freed. */
+        printf("CTXR exec: CPU %d did not run the probe (%d); treating the secondaries as "
+               "not confined\n",
+               cpu, err);
+        return false;
+    }
     free(probe);
 
     confined = ret != 1;
