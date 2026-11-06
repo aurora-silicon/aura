@@ -7,6 +7,8 @@ import subprocess
 
 def test_optional_initramfs(tmp_path):
     source = (Path(__file__).resolve().parents[2] / "src/boot_storage.c").read_text()
+    files = source[source.index("static int boot_storage_files("):
+                   source.index("static bool boot_storage_trial(")]
     loader = source[source.index("int boot_storage_load("):]
     harness = r'''
 #include <assert.h>
@@ -28,9 +30,12 @@ static void *initrd;
 static size_t initrd_size;
 static bool nvme_init(void) { return true; }
 static bool nvme_shutdown(void) { shutdowns++; return true; }
-static int rust_load_image(const char *spec, void **data, size_t *size, bool *proxy_request)
+static int rust_load_image(const char *spec, void **data, size_t *size, bool *proxy_request,
+                           char *trial, size_t trial_capacity)
 {
     (void)proxy_request;
+    (void)trial;
+    (void)trial_capacity;
     loaded++;
     if (!strcmp(spec, "esp;image")) { *data = &image; *size = sizeof(image); }
     else if (!strcmp(spec, "esp;dtb")) { *data = &tree; *size = 1; }
@@ -46,6 +51,10 @@ static struct kernel_header *boot_prepare_image(const void *data, size_t size)
 { return data == &image && size == sizeof(image) ? &image : NULL; }
 static void kboot_set_initrd(void *data, size_t size)
 { initrd = data; initrd_size = size; }
+''' + files + r'''
+/* The aura-try marker is not under test here; the configured files load only. */
+static bool boot_storage_trial(const char *uuid, struct kernel_header **kernel, void **fdt)
+{ (void)uuid; (void)kernel; (void)fdt; return false; }
 ''' + loader + r'''
 int main(void)
 {
