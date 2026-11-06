@@ -7644,6 +7644,148 @@ static int dt_set_isp(void)
     return 0;
 }
 
+/*
+ * J713: iBoot loads the camera firmware, and the kernel starts it as iBoot left it. The
+ * segments move with the boot firmware, so the device tree describes the ISP disabled, with empty
+ * placeholders isp-firmware-text and isp-firmware-data and an isp-heap window for the
+ * firmware's main memory. Fill the placeholders from this boot's ADT isp segment-ranges: reg,
+ * and iommu-addresses where the firmware runs them. Then set the platform ID from the ADT's
+ * sensor-type and enable the ISP and its DARTs.
+ */
+static int dt_set_j713_isp_one(unsigned int unused)
+{
+    static const char dt_names[] = "text\0data\0heap";
+    static const char adt_names[] = "__TEXT;__DATA";
+    static const char *const paths[] = {"/reserved-memory/isp-firmware-text",
+                                        "/reserved-memory/isp-firmware-data",
+                                        "/reserved-memory/isp-heap"};
+    const struct adt_segment_ranges *segments;
+    const fdt32_t *refs, *map;
+    const fdt64_t *reg;
+    u64 phys[2], iova[2], size[2], heap_base, heap_size, dram_base, dram_size;
+    u32 isp_phandle, sensor, darts[3], len;
+    int isp, node, bytes;
+
+    UNUSED(unused);
+    isp = fdt_node_offset_by_compatible(dt, -1, "apple,t8132-isp");
+    isp_phandle = fdt_get_phandle(dt, isp);
+    const char *names = fdt_getprop(dt, isp, "memory-region-names", &bytes);
+    if (!isp_phandle || !names || bytes != sizeof(dt_names) ||
+        memcmp(names, dt_names, sizeof(dt_names)))
+        bail("FDT: J713 ISP memory regions are not text, data and heap\n");
+    refs = fdt_getprop(dt, isp, "memory-region", &bytes);
+    if (!refs || bytes != 3 * sizeof(*refs))
+        bail("FDT: J713 ISP has no three memory regions\n");
+    for (int i = 0; i < 3; i++) {
+        node = fdt_path_offset(dt, paths[i]);
+        if (node < 0 || fdt_node_offset_by_phandle(dt, fdt32_ld(refs + i)) != node)
+            bail("FDT: J713 ISP region %d is not %s\n", i, paths[i]);
+        if (i < 2) {
+            reg = fdt_getprop(dt, node, "reg", &bytes);
+            if (reg && (bytes != 2 * sizeof(*reg) || fdt64_ld(reg) || fdt64_ld(reg + 1)))
+                bail("FDT: %s is not an empty placeholder\n", paths[i]);
+        }
+    }
+    map = fdt_getprop(dt, fdt_path_offset(dt, paths[2]), "iommu-addresses", &bytes);
+    if (!map || bytes != 5 * sizeof(*map) || fdt32_ld(map) != isp_phandle)
+        bail("FDT: J713 ISP heap has no window\n");
+    heap_base = ((u64)fdt32_ld(map + 1) << 32) | fdt32_ld(map + 2);
+    heap_size = ((u64)fdt32_ld(map + 3) << 32) | fdt32_ld(map + 4);
+    if (heap_base != 0x10000000000ULL || !heap_size || heap_size > 64 * SZ_1M)
+        bail("FDT: J713 ISP heap window 0x%lx+0x%lx unexpected\n", heap_base, heap_size);
+    refs = fdt_getprop(dt, isp, "iommus", &bytes);
+    if (!refs || bytes != 6 * sizeof(*refs))
+        bail("FDT: J713 ISP has no three DARTs\n");
+    for (int i = 0; i < 3; i++)
+        darts[i] = fdt32_ld(refs + 2 * i);
+
+    int chosen = adt_path_offset(adt, "/chosen");
+    int adt_isp = adt_path_offset(adt, "/arm-io/isp");
+    if (chosen < 0 || adt_isp < 0 ||
+        ADT_GETPROP(adt, chosen, "dram-base", &dram_base) != sizeof(dram_base) ||
+        ADT_GETPROP(adt, chosen, "dram-size", &dram_size) != sizeof(dram_size) || !dram_size ||
+        dram_base > UINT64_MAX - dram_size)
+        bail("ADT: J713 ISP or DRAM bounds missing\n");
+    const char *segment_names = adt_getprop(adt, adt_isp, "segment-names", &len);
+    if (!segment_names || len != sizeof(adt_names) || memcmp(segment_names, adt_names, len))
+        bail("ADT: J713 ISP segments are not __TEXT;__DATA\n");
+    segments = adt_getprop(adt, adt_isp, "segment-ranges", &len);
+    if (!segments || len != 2 * sizeof(*segments))
+        bail("ADT: J713 ISP has no two segment ranges\n");
+    if (ADT_GETPROP(adt, adt_isp, "sensor-type", &sensor) != sizeof(sensor) || !sensor)
+        bail("ADT: J713 ISP has no sensor-type\n");
+    for (int i = 0; i < 2; i++) {
+        phys[i] = segments[i].phys;
+        iova[i] = segments[i].remap;
+        size[i] = ALIGN_UP((u64)segments[i].size, SZ_16K);
+        if (!size[i] || size[i] > heap_size || (phys[i] & (SZ_16K - 1)) ||
+            (iova[i] & (SZ_16K - 1)) || phys[i] < dram_base || size[i] > dram_size ||
+            phys[i] - dram_base > dram_size - size[i])
+            bail("ADT: J713 ISP segment %d 0x%lx+0x%lx outside DRAM\n", i, phys[i], size[i]);
+    }
+    /* TEXT at the start of the firmware's memory, DATA right above it, both below the heap top. */
+    if (iova[0] != heap_base || iova[1] != iova[0] + size[0] ||
+        size[1] > heap_base + heap_size - iova[1] ||
+        (phys[0] < phys[1] + size[1] && phys[1] < phys[0] + size[0]))
+        bail("ADT: J713 ISP segments at 0x%lx and 0x%lx do not fit the firmware window\n", iova[0],
+             iova[1]);
+
+    for (int i = 0; i < 2; i++) {
+        fdt64_t range[2] = {cpu_to_fdt64(phys[i]), cpu_to_fdt64(size[i])};
+        int ret;
+
+        node = fdt_path_offset(dt, paths[i]);
+        if (node < 0 || fdt_setprop(dt, node, "reg", range, sizeof(range)))
+            return -1;
+        node = fdt_path_offset(dt, paths[i]);
+        if (node < 0 || fdt_setprop_empty(dt, node, "no-map"))
+            return -1;
+        node = fdt_path_offset(dt, paths[i]);
+        if (node < 0 || fdt_setprop_string(dt, node, "status", "okay"))
+            return -1;
+        node = fdt_path_offset(dt, paths[i]);
+        ret = node < 0 ? node : fdt_delprop(dt, node, "iommu-addresses");
+        if (ret && ret != -FDT_ERR_NOTFOUND)
+            return -1;
+        node = fdt_path_offset(dt, paths[i]);
+        if (node < 0 || dt_device_set_reserved_mem(node, paths[i], isp_phandle, iova[i], size[i]))
+            return -1;
+        printf("FDT: J713 ISP %s at 0x%lx (+0x%lx), runs at 0x%lx\n", i ? "DATA" : "TEXT", phys[i],
+               size[i], iova[i]);
+    }
+    isp = fdt_node_offset_by_phandle(dt, isp_phandle);
+    if (isp < 0 || fdt_setprop_u32(dt, isp, "apple,platform-id", sensor))
+        return -1;
+    isp = fdt_node_offset_by_phandle(dt, isp_phandle);
+    if (isp < 0 || fdt_setprop_string(dt, isp, "status", "okay"))
+        return -1;
+    for (int i = 0; i < 3; i++) {
+        int dart = fdt_node_offset_by_phandle(dt, darts[i]);
+        if (dart < 0 || fdt_setprop_string(dt, dart, "status", "okay"))
+            return -1;
+    }
+    printf("FDT: J713 ISP handed over, platform ID 0x%x\n", sensor);
+    return 0;
+}
+
+/*
+ * Only a disabled ISP with the placeholders is a handoff target. A tree without them (no camera,
+ * or a kernel that reserves the firmware itself and enables the ISP) is left as it is. A refused
+ * handoff leaves the camera disabled; the boot goes on.
+ */
+static void dt_set_j713_isp(void)
+{
+    if (chip_id != T8132 || fdt_node_check_compatible(dt, 0, "apple,j713"))
+        return;
+    int isp = fdt_node_offset_by_compatible(dt, -1, "apple,t8132-isp");
+    const char *status = isp < 0 ? NULL : fdt_getprop(dt, isp, "status", NULL);
+    if (!status || strcmp(status, "disabled") ||
+        fdt_path_offset(dt, "/reserved-memory/isp-firmware-text") < 0)
+        return;
+    if (dt_display_transaction(dt_set_j713_isp_one, 0))
+        printf("FDT: J713 ISP handoff refused; keeping the camera disabled\n");
+}
+
 /* J700 is sold both with and without a built-in Touch ID sensor.  A paired
  * external keyboard is not evidence of the SPI sensor: iBoot omits spi2 from
  * the ADT on the sensorless variant.  Leave every other machine unchanged. */
@@ -8835,6 +8977,7 @@ int kboot_prepare_dt(void *fdt)
         return -1;
     if (dt_set_isp())
         return -1;
+    dt_set_j713_isp();
     if (dt_set_pmgr())
         return -1;
     if (chip_id == T8132 && !fdt_node_check_compatible(dt, 0, "apple,j713") &&
