@@ -17,6 +17,51 @@
  * then execute only inside those windows, so the OS has to run in one.
  */
 
+bool ctxr_range(enum ctxr_range range, u64 *start, u64 *end)
+{
+    u64 lower = 0, upper = 0;
+    int exc_before = exc_count;
+
+    /* Only EL2 can see them. Not every chip has them, and reading one there faults. */
+    if (!in_el2())
+        return false;
+
+    exc_guard = GUARD_MARK | GUARD_SILENT;
+    switch (range) {
+        case CTXR_RANGE_A:
+            lower = mrs(SYS_IMP_APL_CTXR_A_LWR_EL1);
+            upper = mrs(SYS_IMP_APL_CTXR_A_UPR_EL1);
+            break;
+        case CTXR_RANGE_B:
+            lower = mrs(SYS_IMP_APL_CTXR_B_LWR_EL1);
+            upper = mrs(SYS_IMP_APL_CTXR_B_UPR_EL1);
+            break;
+        case CTXR_RANGE_C:
+            lower = mrs(SYS_IMP_APL_CTXR_C_LWR_EL1);
+            upper = mrs(SYS_IMP_APL_CTXR_C_UPR_EL1);
+            break;
+        case CTXR_RANGE_D:
+            lower = mrs(SYS_IMP_APL_CTXR_D_LWR_EL1);
+            upper = mrs(SYS_IMP_APL_CTXR_D_UPR_EL1);
+            break;
+        case CTRR_RANGE_C:
+            lower = mrs(SYS_IMP_APL_CTRR_C_LWR_EL1);
+            upper = mrs(SYS_IMP_APL_CTRR_C_UPR_EL1);
+            break;
+        case CTRR_RANGE_D:
+            lower = mrs(SYS_IMP_APL_CTRR_D_LWR_EL1);
+            upper = mrs(SYS_IMP_APL_CTRR_D_UPR_EL1);
+            break;
+    }
+    exc_guard = GUARD_OFF;
+
+    if (exc_count != exc_before || !lower || upper < lower)
+        return false;
+    *start = lower;
+    *end = upper + SZ_4K;
+    return true;
+}
+
 static const u32 probe_insns[] = {
     0xd2800020, /* mov x0, #1 */
     0xd65f03c0, /* ret */
@@ -34,24 +79,12 @@ static void ctxr_exec_warn_unprobed(const char *why)
         return;
     unprobed_warned = true;
 
-    u64 lower = 0, upper = 0;
+    u64 lower, upper;
 
-    /* Only EL2 can see them. Not every chip has them, and reading one there faults. */
-    if (in_el2()) {
-        int exc_before = exc_count;
-
-        exc_guard = GUARD_MARK | GUARD_SILENT;
-        lower = mrs(SYS_IMP_APL_CTXR_D_LWR_EL1);
-        upper = mrs(SYS_IMP_APL_CTXR_D_UPR_EL1);
-        exc_guard = GUARD_OFF;
-        if (exc_count != exc_before)
-            lower = upper = 0;
-    }
-
-    if (lower && upper > lower)
+    if (ctxr_range(CTXR_RANGE_D, &lower, &upper))
         printf("CTXR exec: WARNING: %s, but CTXR_D is armed at [0x%lx, 0x%lx): the OS will run "
                "outside it, on this CPU only\n",
-               why, lower, upper + SZ_4K);
+               why, lower, upper);
     else
         printf("CTXR exec: %s and CTXR_D is not armed: treating the machine as not confined\n",
                why);
@@ -151,24 +184,23 @@ static bool ranges_overlap(u64 start_a, u64 end_a, u64 start_b, u64 end_b)
  */
 static bool ctxr_exec_holds_ro_range(u64 start, u64 end)
 {
+    static const enum ctxr_range windows[] = {CTXR_RANGE_A, CTXR_RANGE_B, CTXR_RANGE_C},
+                                 ctrr[] = {CTRR_RANGE_C, CTRR_RANGE_D};
     u64 ro_start, ro_end;
     int status = memory_fw_ro_range(&ro_start, &ro_end);
 
     if (status < 0 || (status && ranges_overlap(ro_start, ro_end, start, end)))
         return true;
-    if (ranges_overlap(mrs(SYS_IMP_APL_CTXR_A_LWR_EL1), mrs(SYS_IMP_APL_CTXR_A_UPR_EL1) + SZ_4K,
-                       start, end) ||
-        ranges_overlap(mrs(SYS_IMP_APL_CTXR_B_LWR_EL1), mrs(SYS_IMP_APL_CTXR_B_UPR_EL1) + SZ_4K,
-                       start, end) ||
-        ranges_overlap(mrs(SYS_IMP_APL_CTXR_C_LWR_EL1), mrs(SYS_IMP_APL_CTXR_C_UPR_EL1) + SZ_4K,
-                       start, end))
-        return true;
+    for (size_t i = 0; i < ARRAY_SIZE(windows); i++)
+        if (ctxr_range(windows[i], &ro_start, &ro_end) &&
+            ranges_overlap(ro_start, ro_end, start, end))
+            return true;
     if (cpu_features->apple_sysregs_unlocked)
         return false;
-    return ranges_overlap(mrs(SYS_IMP_APL_CTRR_C_LWR_EL1), mrs(SYS_IMP_APL_CTRR_C_UPR_EL1) + SZ_4K,
-                          start, end) ||
-           ranges_overlap(mrs(SYS_IMP_APL_CTRR_D_LWR_EL1), mrs(SYS_IMP_APL_CTRR_D_UPR_EL1) + SZ_4K,
-                          start, end);
+    for (size_t i = 0; i < ARRAY_SIZE(ctrr); i++)
+        if (ctxr_range(ctrr[i], &ro_start, &ro_end) && ranges_overlap(ro_start, ro_end, start, end))
+            return true;
+    return false;
 }
 
 /* Returns why there is no window to use, or NULL having set it. */

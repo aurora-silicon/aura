@@ -679,23 +679,18 @@ static int dt_reserve_outside_exec_window(u64 start, u64 size)
 /* Windows A to C. One inside the firmware RO range (T8140) is reserved with that range. */
 static int dt_reserve_ctxr_low_windows(void)
 {
-    const u64 windows[][2] = {
-        {mrs(SYS_IMP_APL_CTXR_A_LWR_EL1), mrs(SYS_IMP_APL_CTXR_A_UPR_EL1)},
-        {mrs(SYS_IMP_APL_CTXR_B_LWR_EL1), mrs(SYS_IMP_APL_CTXR_B_UPR_EL1)},
-        {mrs(SYS_IMP_APL_CTXR_C_LWR_EL1), mrs(SYS_IMP_APL_CTXR_C_UPR_EL1)},
-    };
+    static const enum ctxr_range windows[] = {CTXR_RANGE_A, CTXR_RANGE_B, CTXR_RANGE_C};
     u64 ro_start, ro_end;
 
     if (memory_fw_ro_range(&ro_start, &ro_end) != 1)
         ro_start = ro_end = 0;
 
     for (size_t i = 0; i < ARRAY_SIZE(windows); i++) {
-        if (!windows[i][0] || windows[i][1] < windows[i][0])
+        u64 lower, upper;
+        if (!ctxr_range(windows[i], &lower, &upper) || (lower >= ro_start && upper <= ro_end))
             continue;
-        if (windows[i][0] >= ro_start && windows[i][1] + SZ_4K <= ro_end)
-            continue;
-        u64 start = ALIGN_DOWN(windows[i][0], SZ_16K);
-        u64 end = ALIGN_UP(windows[i][1] + SZ_4K, SZ_16K);
+        u64 start = ALIGN_DOWN(lower, SZ_16K);
+        u64 end = ALIGN_UP(upper, SZ_16K);
         if (fdt_add_mem_rsv(dt, start, end - start))
             return -1;
         printf("FDT: reserved CTXR window [0x%lx, 0x%lx)\n", start, end);
@@ -703,54 +698,57 @@ static int dt_reserve_ctxr_low_windows(void)
     return 0;
 }
 
-/*
- * The secondaries can't write CTRR_C or CTRR_D. Where aura knows the firmware RO
- * range (T8140), that is CTRR_C, and it is also kept out of the linear map.
- */
-static int dt_reserve_secondary_ro(void)
+/* T8140's firmware RO range: reserved, and kept out of the linear map, at either EL. */
+static int dt_reserve_firmware_ro(void)
 {
     u64 ro_start, ro_end;
     int ro_status = memory_fw_ro_range(&ro_start, &ro_end);
 
     if (ro_status < 0)
         bail("FDT: invalid firmware RO range\n");
-    if (ro_status) {
-        if (fdt_add_mem_rsv(dt, ro_start, ro_end - ro_start))
-            bail("FDT: couldn't reserve the firmware RO range\n");
+    if (!ro_status)
+        return 0;
+    if (fdt_add_mem_rsv(dt, ro_start, ro_end - ro_start))
+        bail("FDT: couldn't reserve the firmware RO range\n");
 
-        int resv = fdt_path_offset(dt, "/reserved-memory");
-        if (resv < 0)
-            bail("FDT: missing /reserved-memory for firmware RO range\n");
-        char name[48];
-        snprintf(name, sizeof(name), "aura-secondary-ro@%lx", ro_start);
-        int node = fdt_subnode_offset(dt, resv, name);
-        if (node < 0)
-            node = fdt_add_subnode(dt, resv, name);
-        if (node < 0)
-            bail("FDT: couldn't create firmware RO node\n");
-        fdt64_t reg[] = {cpu_to_fdt64(ro_start), cpu_to_fdt64(ro_end - ro_start)};
-        if (fdt_setprop(dt, node, "reg", reg, sizeof(reg)) || fdt_setprop_empty(dt, node, "no-map"))
-            bail("FDT: couldn't describe firmware RO node\n");
-        printf("FDT: reserved firmware RO [0x%lx, 0x%lx)\n", ro_start, ro_end);
-    } else {
-        ro_start = mrs(SYS_IMP_APL_CTRR_C_LWR_EL1);
-        ro_end = mrs(SYS_IMP_APL_CTRR_C_UPR_EL1) + SZ_4K;
-        if (ro_start && ro_start < ro_end) {
-            if (ro_end - ro_start > 12 * SZ_4K)
-                printf("WARNING: M4+ SMP-RO is larger than 48 KiB\n");
-            if (fdt_add_mem_rsv(dt, ro_start, ro_end - ro_start))
-                bail("FDT: couldn't add reservation for M4+ SMP-RO CTRR area\n");
-            printf("FDT: reserved M4+ SMP-RO CTRR_C [0x%lx, 0x%lx)\n", ro_start, ro_end);
-        }
+    int resv = fdt_path_offset(dt, "/reserved-memory");
+    if (resv < 0)
+        bail("FDT: missing /reserved-memory for firmware RO range\n");
+    char name[48];
+    snprintf(name, sizeof(name), "aura-secondary-ro@%lx", ro_start);
+    int node = fdt_subnode_offset(dt, resv, name);
+    if (node < 0)
+        node = fdt_add_subnode(dt, resv, name);
+    if (node < 0)
+        bail("FDT: couldn't create firmware RO node\n");
+    fdt64_t reg[] = {cpu_to_fdt64(ro_start), cpu_to_fdt64(ro_end - ro_start)};
+    if (fdt_setprop(dt, node, "reg", reg, sizeof(reg)) || fdt_setprop_empty(dt, node, "no-map"))
+        bail("FDT: couldn't describe firmware RO node\n");
+    printf("FDT: reserved firmware RO [0x%lx, 0x%lx)\n", ro_start, ro_end);
+    return 0;
+}
+
+/*
+ * On M4 and later the secondaries enforce CTRR_C and CTRR_D, and Linux crashes writing
+ * there from one. Where aura knows the firmware RO range (T8140), CTRR_C is that range.
+ */
+static int dt_reserve_secondary_ctrr(void)
+{
+    u64 start, end;
+
+    if (!memory_fw_ro_range(NULL, NULL) && ctxr_range(CTRR_RANGE_C, &start, &end)) {
+        if (end - start > 12 * SZ_4K)
+            printf("WARNING: M4+ SMP-RO is larger than 48 KiB\n");
+        if (fdt_add_mem_rsv(dt, start, end - start))
+            bail("FDT: couldn't add reservation for M4+ SMP-RO CTRR area\n");
+        printf("FDT: reserved M4+ SMP-RO CTRR_C [0x%lx, 0x%lx)\n", start, end);
     }
 
     // CTRR_D: on J813 (M5) it covers the ~1 MiB just below the iBoot-loaded image.
-    ro_start = mrs(SYS_IMP_APL_CTRR_D_LWR_EL1);
-    ro_end = ALIGN_UP(mrs(SYS_IMP_APL_CTRR_D_UPR_EL1), SZ_4K) + SZ_4K;
-    if (ro_start && ro_start < ro_end) {
-        if (fdt_add_mem_rsv(dt, ro_start, ro_end - ro_start))
+    if (ctxr_range(CTRR_RANGE_D, &start, &end)) {
+        if (fdt_add_mem_rsv(dt, start, end - start))
             bail("FDT: couldn't add reservation for M4+ SMP-RO CTRR_D area\n");
-        printf("FDT: reserved M4+ SMP-RO CTRR_D [0x%lx, 0x%lx)\n", ro_start, ro_end);
+        printf("FDT: reserved M4+ SMP-RO CTRR_D [0x%lx, 0x%lx)\n", start, end);
     }
     return 0;
 }
@@ -9038,6 +9036,8 @@ int kboot_prepare_dt(void *fdt)
             bail("FDT: couldn't reserve CTXR windows A to C\n");
     }
 
+    if (dt_reserve_firmware_ro())
+        return -1;
     if (!cpu_features->apple_sysregs_unlocked && !in_el2()) {
         /*
          * A guest under the aura hypervisor runs at EL1. The host keeps the
@@ -9045,7 +9045,7 @@ int kboot_prepare_dt(void *fdt)
          * leaves it out. This is how the J616s guest boots.
          */
         printf("FDT: running at EL1, leaving the M4+ SMP-RO range to the host\n");
-    } else if (!cpu_features->apple_sysregs_unlocked && dt_reserve_secondary_ro()) {
+    } else if (!cpu_features->apple_sysregs_unlocked && dt_reserve_secondary_ctrr()) {
         return -1;
     }
 

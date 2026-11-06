@@ -6,9 +6,11 @@ from test_smp_timeouts import REPO, compile_and_run
 
 def probe_source():
     source = (REPO / "src/ctxr_exec.c").read_text()
-    start = source.index("static const u32 probe_insns[]")
+    header = (REPO / "src/ctxr_exec.h").read_text()
+    ranges = header[header.index("enum ctxr_range {"):header.index("};", header.index("enum ctxr_range {")) + 2]
+    start = source.index("bool ctxr_range(")
     end = source.index("\n}\n", source.index("bool ctxr_exec_confined(void)")) + 3
-    return source[start:end]
+    return ranges + "\n" + source[start:end]
 
 
 HARNESS = r'''
@@ -37,7 +39,10 @@ static int at_el1;
 static bool in_el2(void) { return !at_el1; }
 static const char *last_format;
 #define SZ_4K 4096
-static u64 SYS_IMP_APL_CTXR_D_LWR_EL1, SYS_IMP_APL_CTXR_D_UPR_EL1;
+static u64 SYS_IMP_APL_CTXR_D_LWR_EL1, SYS_IMP_APL_CTXR_D_UPR_EL1, SYS_IMP_APL_CTXR_A_LWR_EL1,
+    SYS_IMP_APL_CTXR_A_UPR_EL1, SYS_IMP_APL_CTXR_B_LWR_EL1, SYS_IMP_APL_CTXR_B_UPR_EL1,
+    SYS_IMP_APL_CTXR_C_LWR_EL1, SYS_IMP_APL_CTXR_C_UPR_EL1, SYS_IMP_APL_CTRR_C_LWR_EL1,
+    SYS_IMP_APL_CTRR_C_UPR_EL1, SYS_IMP_APL_CTRR_D_LWR_EL1, SYS_IMP_APL_CTRR_D_UPR_EL1;
 static u64 read_register(u64 value)
 {
     reads++;
@@ -76,7 +81,9 @@ static int run(int chip, int alive, int faults) {
     /* ctxr_exec_confined() caches its answer per boot: model each case as a fresh boot. */
     chip_id = chip; alive_mask = alive; probe_faults = faults; calls = 0; printed = 0;
     call_fails = 0; reads = 0; unprobed_warned = false;
-    return ctxr_exec_confined();
+    int ret = ctxr_exec_confined();
+    assert(exc_guard == GUARD_OFF);
+    return ret;
 }
 int main(void) {
     /* M4 Pro / M4 Max / A18 Pro / M5 with the windows armed. */
@@ -91,6 +98,7 @@ int main(void) {
     /* A probe that never ran is not evidence of confinement: say so, do not refuse. */
     chip_id = T8112; alive_mask = 0x2; probe_faults = 0; calls = 0; printed = 0; call_fails = 1;
     assert(ctxr_exec_confined() == 0 && calls == 1 && printed == 1);
+    assert(exc_guard == GUARD_OFF);
     /* No secondary to ask: not confined, and the log says what CTXR_D reads. */
     SYS_IMP_APL_CTXR_D_LWR_EL1 = 0; SYS_IMP_APL_CTXR_D_UPR_EL1 = 0;
     assert(run(T8112, 0x1, 0) == 0 && calls == 0 && printed == 1 && reads == 2);
@@ -145,6 +153,33 @@ int main(void) {
 }
 '''
 
+RANGE_MAIN = r'''
+#undef printf
+int main(void) {
+    u64 s = 0, e = 0;
+    /* Armed: [LWR, UPR + 4K), read under the guard, which comes off after. */
+    SYS_IMP_APL_CTRR_C_LWR_EL1 = 0x10000000000; SYS_IMP_APL_CTRR_C_UPR_EL1 = 0x10000008000;
+    assert(ctxr_range(CTRR_RANGE_C, &s, &e) && s == 0x10000000000 && e == 0x10000009000);
+    assert(reads == 2 && exc_guard == GUARD_OFF);
+    /* LWR 0, or UPR below LWR: not armed. */
+    SYS_IMP_APL_CTRR_C_LWR_EL1 = 0;
+    assert(!ctxr_range(CTRR_RANGE_C, &s, &e));
+    SYS_IMP_APL_CTRR_C_LWR_EL1 = 0x10000010000;
+    assert(!ctxr_range(CTRR_RANGE_C, &s, &e));
+    /* A register that faults here: not armed, and the boot goes on. */
+    SYS_IMP_APL_CTXR_A_LWR_EL1 = 0x10000000000; SYS_IMP_APL_CTXR_A_UPR_EL1 = 0x10000000000;
+    reads_fault = 1;
+    assert(!ctxr_range(CTXR_RANGE_A, &s, &e) && exc_guard == GUARD_OFF);
+    reads_fault = 0;
+    assert(ctxr_range(CTXR_RANGE_A, &s, &e));
+    /* At EL1 nothing is read. */
+    at_el1 = 1; reads = 0;
+    assert(!ctxr_range(CTXR_RANGE_A, &s, &e) && !reads);
+    puts("ctxr range OK");
+    return 0;
+}
+'''
+
 
 def build(tmp_path, cases_source):
     body = probe_source()
@@ -165,6 +200,11 @@ def test_only_a_real_answer_is_cached(tmp_path):
 
 def test_a_stuck_probe_is_not_repeated(tmp_path):
     compile_and_run(tmp_path, "ctxr_exec_probe_stuck", HARNESS % probe_source() + STUCK_MAIN)
+
+
+
+def test_ranges_are_read_under_a_guard(tmp_path):
+    compile_and_run(tmp_path, "ctxr_range", HARNESS % probe_source() + RANGE_MAIN)
 
 
 def test_reports_the_fault():

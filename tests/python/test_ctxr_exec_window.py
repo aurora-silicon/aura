@@ -7,7 +7,9 @@ from test_smp_timeouts import REPO, compile_and_run
 
 def window_source():
     source = (REPO / "src/ctxr_exec.c").read_text()
-    return source[source.index("#define CTXR_EXEC_AURA_SLOT"):]
+    header = (REPO / "src/ctxr_exec.h").read_text()
+    ranges = header[header.index("enum ctxr_range {"):header.index("};", header.index("enum ctxr_range {")) + 2]
+    return ranges + "\n" + function(source, "ctxr_range") + "\n" + source[source.index("#define CTXR_EXEC_AURA_SLOT"):]
 
 
 WINDOW_HARNESS = r'''
@@ -23,8 +25,17 @@ typedef unsigned long u64;
 #define SZ_1M (1 << 20)
 #define ALIGN_UP(x, a) (((x) + (a) - 1) & ~((a) - 1))
 #define ALIGN_DOWN(x, a) ((x) & ~((a) - 1))
-static int register_reads;
-static u64 read_register(u64 value) { register_reads++; return value; }
+#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
+enum exc_guard_t { GUARD_OFF = 0, GUARD_MARK = 2, GUARD_SILENT = 0x100 };
+static volatile int exc_guard, exc_count;
+static int register_reads, reads_fault, at_el1;
+static bool in_el2(void) { return !at_el1; }
+static u64 read_register(u64 value)
+{
+    register_reads++;
+    if (reads_fault && exc_guard == (GUARD_MARK | GUARD_SILENT)) { exc_count++; return 0xacce5515abad1dea; }
+    return value;
+}
 #define mrs(reg) read_register(reg)
 static u64 SYS_IMP_APL_CTXR_A_LWR_EL1, SYS_IMP_APL_CTXR_A_UPR_EL1, SYS_IMP_APL_CTXR_B_LWR_EL1,
     SYS_IMP_APL_CTXR_B_UPR_EL1, SYS_IMP_APL_CTXR_C_LWR_EL1, SYS_IMP_APL_CTXR_C_UPR_EL1,
@@ -46,12 +57,22 @@ static void fb_set_active(bool active) { fb_active = active; }
 #define MIB (1UL << 20)
 #define WINDOW (128 * MIB)
 static const u64 start = ALIGN_UP(BASE + 16 * MIB, 2 * MIB);
+static void place_low_windows(u64 at)
+{
+    SYS_IMP_APL_CTXR_A_LWR_EL1 = SYS_IMP_APL_CTRR_C_LWR_EL1 = at;
+    SYS_IMP_APL_CTXR_A_UPR_EL1 = at + SZ_16K - SZ_4K;
+    SYS_IMP_APL_CTXR_B_LWR_EL1 = at + SZ_16K;
+    SYS_IMP_APL_CTXR_B_UPR_EL1 = at + 2 * SZ_16K - SZ_4K;
+    SYS_IMP_APL_CTXR_C_LWR_EL1 = at + 2 * SZ_16K;
+    SYS_IMP_APL_CTXR_C_UPR_EL1 = SYS_IMP_APL_CTRR_C_UPR_EL1 = at + 3 * SZ_16K - SZ_4K;
+}
 /* A fresh boot on the layout of an object from aurora-installer's expandExecuteWindow, on a J700. */
 static void expanded(void)
 {
     window_checked = false; window_problem = NULL; window_base = window_size = 0;
     confined = 1; ro_status = 1; register_reads = 0; fb_active = 0; console[0] = 0;
     features.apple_sysregs_unlocked = false;
+    reads_fault = 0;
     _base = BASE; _end = BASE + 0x3d0000;
     SYS_IMP_APL_CTXR_D_LWR_EL1 = BASE - 0xd8000;
     SYS_IMP_APL_CTXR_D_UPR_EL1 = BASE + 16 * MIB + 2 * MIB - SZ_16K + WINDOW - SZ_4K;
@@ -59,13 +80,8 @@ static void expanded(void)
     ro_start_v = above + 0x6c0000; ro_end_v = ro_start_v + 3 * SZ_16K;
     boot_args_addr = above + 0x800000;
     cur_boot_args.top_of_kernel_data = above + 0x804000;
-    /* Below this image on every chip that describes them. */
-    SYS_IMP_APL_CTXR_A_LWR_EL1 = SYS_IMP_APL_CTRR_C_LWR_EL1 = BASE - 0x100000;
-    SYS_IMP_APL_CTXR_A_UPR_EL1 = SYS_IMP_APL_CTRR_C_UPR_EL1 = BASE - 0x100000 + SZ_16K - SZ_4K;
-    SYS_IMP_APL_CTXR_B_LWR_EL1 = BASE - 0xfc000;
-    SYS_IMP_APL_CTXR_B_UPR_EL1 = BASE - 0xfc000 + SZ_16K - SZ_4K;
-    SYS_IMP_APL_CTXR_C_LWR_EL1 = BASE - 0xf8000;
-    SYS_IMP_APL_CTXR_C_UPR_EL1 = BASE - 0xf8000 + SZ_16K - SZ_4K;
+    /* On T8140 windows A to C and CTRR_C are the firmware RO range, one 16K page each. */
+    place_low_windows(ro_start_v);
     SYS_IMP_APL_CTRR_D_LWR_EL1 = SYS_IMP_APL_CTRR_D_UPR_EL1 = 0;
 }
 /* The same object padded for 256 MiB, as the Neo's proxy Stage 1 is. */
@@ -83,6 +99,7 @@ static void other_chip(void)
 {
     expanded();
     ro_status = 0;
+    place_low_windows(BASE - 0x100000);
 }
 static bool usable(void) { u64 b, s; return ctxr_exec_window(&b, &s); }
 /* The boot stops, on the panel too, and says how to get out of it. */
@@ -147,6 +164,18 @@ int main(void)
     features.apple_sysregs_unlocked = true;
     SYS_IMP_APL_CTRR_C_LWR_EL1 = start; SYS_IMP_APL_CTRR_C_UPR_EL1 = start + SZ_16K;
     assert(usable());
+    /* A range whose LWR reads 0 is not armed, whatever its UPR says, as in kboot. */
+    other_chip();
+    SYS_IMP_APL_CTXR_B_LWR_EL1 = 0; SYS_IMP_APL_CTXR_B_UPR_EL1 = start + 8 * MIB;
+    assert(usable());
+    other_chip();
+    SYS_IMP_APL_CTRR_D_LWR_EL1 = 0; SYS_IMP_APL_CTRR_D_UPR_EL1 = start + 8 * MIB;
+    assert(usable());
+    /* A read that faults means nothing armed, and does not stop the boot. */
+    other_chip();
+    SYS_IMP_APL_CTRR_C_LWR_EL1 = start; SYS_IMP_APL_CTRR_C_UPR_EL1 = start + SZ_16K;
+    reads_fault = 1;
+    assert(usable() && exc_guard == GUARD_OFF);
     /* A chip with a firmware RO range is checked against the same registers as well. */
     expanded();
     SYS_IMP_APL_CTXR_C_LWR_EL1 = start; SYS_IMP_APL_CTXR_C_UPR_EL1 = start;
@@ -286,6 +315,7 @@ def test_reservations_leave_the_window_to_the_os(tmp_path):
 
 LOW_WINDOWS_HARNESS = r'''
 #include <assert.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 typedef uint64_t u64;
@@ -294,9 +324,18 @@ typedef uint64_t u64;
 #define ALIGN_UP(x, a) (((x) + (a) - 1) & ~((a) - 1))
 #define ALIGN_DOWN(x, a) ((x) & ~((a) - 1))
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
-#define mrs(reg) (reg)
 static u64 SYS_IMP_APL_CTXR_A_LWR_EL1, SYS_IMP_APL_CTXR_A_UPR_EL1, SYS_IMP_APL_CTXR_B_LWR_EL1,
     SYS_IMP_APL_CTXR_B_UPR_EL1, SYS_IMP_APL_CTXR_C_LWR_EL1, SYS_IMP_APL_CTXR_C_UPR_EL1;
+enum ctxr_range { CTXR_RANGE_A, CTXR_RANGE_B, CTXR_RANGE_C };
+/* As src/ctxr_exec.c reads them, which test_window_decision covers. */
+static bool ctxr_range(enum ctxr_range r, u64 *s, u64 *e)
+{
+    u64 l = r == CTXR_RANGE_A ? SYS_IMP_APL_CTXR_A_LWR_EL1 : r == CTXR_RANGE_B ? SYS_IMP_APL_CTXR_B_LWR_EL1 : SYS_IMP_APL_CTXR_C_LWR_EL1;
+    u64 u = r == CTXR_RANGE_A ? SYS_IMP_APL_CTXR_A_UPR_EL1 : r == CTXR_RANGE_B ? SYS_IMP_APL_CTXR_B_UPR_EL1 : SYS_IMP_APL_CTXR_C_UPR_EL1;
+    if (!l || u < l) return false;
+    *s = l; *e = u + SZ_4K;
+    return true;
+}
 static void *dt;
 static u64 rsv[4][2], ro_start_v, ro_end_v;
 static int nrsv, fail_at = -1, ro_status;
@@ -337,6 +376,13 @@ int main(void)
     /* So is everything when the range is unknown or invalid. */
     nrsv = 0; ro_status = -1; ro_end_v = 0x20c000;
     assert(!dt_reserve_ctxr_low_windows() && nrsv == 2);
+    /* The J700 layout the window test models: all three inside the range, so no new entry. */
+    nrsv = 0; ro_status = 1; ro_start_v = 0x300000; ro_end_v = 0x30c000;
+    SYS_IMP_APL_CTXR_A_LWR_EL1 = 0x300000; SYS_IMP_APL_CTXR_A_UPR_EL1 = 0x303000;
+    SYS_IMP_APL_CTXR_B_LWR_EL1 = 0x304000; SYS_IMP_APL_CTXR_B_UPR_EL1 = 0x307000;
+    SYS_IMP_APL_CTXR_C_LWR_EL1 = 0x308000; SYS_IMP_APL_CTXR_C_UPR_EL1 = 0x30b000;
+    assert(!dt_reserve_ctxr_low_windows() && nrsv == 0);
+    SYS_IMP_APL_CTXR_C_LWR_EL1 = 0x204000; SYS_IMP_APL_CTXR_C_UPR_EL1 = 0x204fff;
     ro_status = 0;
 
     nrsv = 0; fail_at = 1;
