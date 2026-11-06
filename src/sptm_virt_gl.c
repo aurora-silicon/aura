@@ -627,10 +627,11 @@ done:
     return true;
 }
 
-/* A WFE from the guest at virtual EL2 (physical EL1), trapped by TWE. */
+/* A WFI or WFE from the guest at virtual EL2 (physical EL1), trapped by TWE or TWI. */
 bool sptm_virt_el1_wfx(u64 *regs, u64 esr)
 {
-    UNUSED(esr);
+    if (sptm_virt_s2r_wfi(regs, esr))
+        return true;
     u64 pc = mrs(ELR_EL2);
     sptm_virt_park_report(regs, pc);
     msr(ELR_EL2, pc + 4);

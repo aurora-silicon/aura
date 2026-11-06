@@ -16,6 +16,8 @@ Environment (all optional; 1 enables a switch):
                            <build>__MacOS/Firmware)
   AURA_XNU_SERIAL=<node>   XNU's console device under /arm-io, e.g. uart0 (aura's vuart)
   AURA_HIDE_DOCKCHANNEL    hide the DockChannel that carries aura's console and proxy
+  AURA_S2R_TRACE           sleep path: hooks on the power blocks and the trace ring
+  AURA_S2R_COPROC          also hook the coprocessor and exclave mailboxes
   AURA_XNU_BT              sample XNU backtraces every few seconds per core
   AURA_TAIL_SECS, AURA_TAIL_IDLE   keep reading the console after entry, until idle
   XNU_BOOTARGS             XNU's command line
@@ -45,6 +47,8 @@ DEFAULT_BOOTARGS = ("serial=3 disable-uart-irq=1 -v -nobsdmgroot wdt=-1 sprr_tpr
 
 # Configuration flags, sptm_virt.h SPTM_VIRT_*
 CONFIG_FLAGS = {
+    "AURA_S2R_TRACE": 1 << 0,
+    "AURA_S2R_COPROC": 1 << 3,
     "AURA_XNU_BT": 1 << 5,
 }
 KNOWN_ENV = {

@@ -113,6 +113,7 @@ static void sptm_virt_s2_split_ctrr_blocks(void)
 #define WDT_ALARM      0x14
 #define WDT_CTL        0x1c
 #define WDT_CTL_RESET  BIT(2)
+#define WDT2_CTL       0x2c     /* the third timer: macOS's sleep-time reconfig watchdog */
 #define WDT_RESTART_TK 24000000 /* an alarm under ~1 s at 24 MHz is a restart */
 
 static struct {
@@ -140,6 +141,7 @@ static void sptm_virt_rg_report(struct exc_info *ctx, const char *what, u64 addr
     printf("SPTM-virt[rst]: RESET TRAPPED (%s) on cpu%d at XNU pc 0x%lx: the Mac stays up; XNU's "
            "panic text is in the console above. aura is entering the proxy.\n",
            what, smp_id(), ctx->elr);
+    sptm_virt_s2r_dump_tail(512); /* the power-management accesses that led here */
     iodev_console_flush();
     struct uartproxy_msg_start start = {
         .reason = START_HV,
@@ -155,6 +157,7 @@ static bool sptm_virt_rg_hook(struct exc_info *ctx, u64 addr, u64 *val, bool wri
 {
     u64 a = addr & ~3UL;
 
+    sptm_virt_s2r_note(ctx, addr, write ? *val : 0, write, width);
     if (!write) {
         sptm_virt_mmio_rw(addr, val, false, width);
         if (width == 2 && (a == rg_wdt + WDT_ALARM || a == rg_xwdt + WDT_ALARM))
@@ -208,6 +211,13 @@ static bool sptm_virt_rg_hook(struct exc_info *ctx, u64 addr, u64 *val, bool wri
                ctx->elr);
     sptm_virt_mmio_rw(addr, val, true, width);
     return true;
+}
+
+/* Stop mode: XNU armed its 5 s reconfig watchdog for the sleep, and the stop takes longer. */
+void sptm_virt_rg_stop_wd2(void)
+{
+    if (rg_wdt)
+        write32(rg_wdt + WDT2_CTL, 0);
 }
 
 bool sptm_virt_rg_owns(u64 page)

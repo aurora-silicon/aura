@@ -41,7 +41,9 @@ struct sptm_virt_placement {
 };
 
 /* Host configuration (sptm_virt_config), set over the proxy before sptm_virt_enter. */
-#define SPTM_VIRT_XNU_BT BIT(5) /* sample XNU backtraces at GEXIT */
+#define SPTM_VIRT_S2R        BIT(0) /* sleep-path hooks and the trace ring */
+#define SPTM_VIRT_S2R_COPROC BIT(3) /* also hook the RTKit and exclave mailboxes */
+#define SPTM_VIRT_XNU_BT     BIT(5) /* sample XNU backtraces at GEXIT */
 
 #ifdef SPTM_VIRT
 
