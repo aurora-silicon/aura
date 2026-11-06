@@ -149,8 +149,12 @@ bool ctxr_exec_confined(void)
              * before any device is handed over.
              */
             probe_stuck_cpu = cpu;
-            printf("CTXR exec: CPU %d did not answer the probe within %d ms\n", cpu,
-                   CTXR_PROBE_TIMEOUT_MS);
+            fb_set_active(true);
+            printf("\nCTXR exec: CPU %d did not answer the probe within %d ms and still holds it.\n"
+                   "  Not starting the OS.\n"
+                   "  Hold the power button to shut down, then hold it again to choose another\n"
+                   "  system.\n",
+                   cpu, CTXR_PROBE_TIMEOUT_MS);
             return false;
         }
         /*
@@ -201,21 +205,18 @@ static bool ranges_overlap(u64 start_a, u64 end_a, u64 start_b, u64 end_b)
  */
 static bool ctxr_exec_holds_ro_range(u64 start, u64 end)
 {
-    static const enum ctxr_range windows[] = {CTXR_RANGE_A, CTXR_RANGE_B, CTXR_RANGE_C},
-                                 ctrr[] = {CTRR_RANGE_C, CTRR_RANGE_D};
+    /* Windows A to C, then CTRR_C and CTRR_D, which kboot reads only with locked sysregs. */
+    static const enum ctxr_range ranges[] = {CTXR_RANGE_A, CTXR_RANGE_B, CTXR_RANGE_C, CTRR_RANGE_C,
+                                             CTRR_RANGE_D};
+    size_t count = cpu_features->apple_sysregs_unlocked ? 3 : ARRAY_SIZE(ranges);
     u64 ro_start, ro_end;
     int status = memory_fw_ro_range(&ro_start, &ro_end);
 
     if (status < 0 || (status && ranges_overlap(ro_start, ro_end, start, end)))
         return true;
-    for (size_t i = 0; i < ARRAY_SIZE(windows); i++)
-        if (ctxr_range(windows[i], &ro_start, &ro_end) &&
+    for (size_t i = 0; i < count; i++)
+        if (ctxr_range(ranges[i], &ro_start, &ro_end) &&
             ranges_overlap(ro_start, ro_end, start, end))
-            return true;
-    if (cpu_features->apple_sysregs_unlocked)
-        return false;
-    for (size_t i = 0; i < ARRAY_SIZE(ctrr); i++)
-        if (ctxr_range(ctrr[i], &ro_start, &ro_end) && ranges_overlap(ro_start, ro_end, start, end))
             return true;
     return false;
 }
@@ -276,15 +277,9 @@ bool ctxr_exec_os_may_start(void)
 {
     bool confined = ctxr_exec_confined();
 
-    if (probe_stuck_cpu >= 0) {
-        fb_set_active(true);
-        printf("\nCTXR exec: secondary CPU %d did not answer and still holds a call.\n"
-               "  Not starting the OS.\n"
-               "  Hold the power button to shut down, then hold it again to choose another\n"
-               "  system.\n",
-               probe_stuck_cpu);
+    /* ctxr_exec_confined() said why on the panel. */
+    if (probe_stuck_cpu >= 0)
         return false;
-    }
     if (!confined || !ctxr_exec_problem())
         return true;
 

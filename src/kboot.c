@@ -734,21 +734,17 @@ static int dt_reserve_firmware_ro(void)
  */
 static int dt_reserve_secondary_ctrr(void)
 {
-    u64 start, end;
+    /* CTRR_D: on J813 (M5) it covers the ~1 MiB just below the iBoot-loaded image. */
+    static const enum ctxr_range ranges[] = {CTRR_RANGE_C, CTRR_RANGE_D};
+    bool firmware_ro = memory_fw_ro_range(NULL, NULL);
 
-    if (!memory_fw_ro_range(NULL, NULL) && ctxr_range(CTRR_RANGE_C, &start, &end)) {
-        if (end - start > 12 * SZ_4K)
-            printf("WARNING: M4+ SMP-RO is larger than 48 KiB\n");
+    for (size_t i = 0; i < ARRAY_SIZE(ranges); i++) {
+        u64 start, end;
+        if ((!i && firmware_ro) || !ctxr_range(ranges[i], &start, &end))
+            continue;
         if (fdt_add_mem_rsv(dt, start, end - start))
-            bail("FDT: couldn't add reservation for M4+ SMP-RO CTRR area\n");
-        printf("FDT: reserved M4+ SMP-RO CTRR_C [0x%lx, 0x%lx)\n", start, end);
-    }
-
-    // CTRR_D: on J813 (M5) it covers the ~1 MiB just below the iBoot-loaded image.
-    if (ctxr_range(CTRR_RANGE_D, &start, &end)) {
-        if (fdt_add_mem_rsv(dt, start, end - start))
-            bail("FDT: couldn't add reservation for M4+ SMP-RO CTRR_D area\n");
-        printf("FDT: reserved M4+ SMP-RO CTRR_D [0x%lx, 0x%lx)\n", start, end);
+            bail("FDT: couldn't add reservation for M4+ SMP-RO CTRR_%c\n", 'C' + (int)i);
+        printf("FDT: reserved M4+ SMP-RO CTRR_%c [0x%lx, 0x%lx)\n", 'C' + (int)i, start, end);
     }
     return 0;
 }

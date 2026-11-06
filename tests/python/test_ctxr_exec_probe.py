@@ -56,6 +56,8 @@ static void sysop_stub(void) {}
 static bool smp_is_alive(int cpu) { return alive_mask & (1 << cpu); }
 static void *memalign(size_t a, size_t s) { return aligned_alloc(a, s); }
 static void dc_cvau_range(void *p, size_t s) {}
+static int panel;
+static void fb_set_active(bool active) { panel = active; }
 static void ic_ivau_range(void *p, size_t s) {}
 #define SMP_TIMEOUT -2
 static u64 result;
@@ -163,6 +165,8 @@ int main(void) {
     alive_mask = 0x3; wait_times_out = 1;
     assert(!ctxr_exec_confined() && exc_guard == GUARD_OFF);
     assert(calls == 1 && printed == 1 && probe_stuck_cpu == 1);
+    /* Said once, on the panel, with no Recovery advice: re-enrolling would not help. */
+    assert(panel && strstr(last_format, "Not starting the OS") && !strstr(last_format, "Recovery"));
     assert(last_timeout_ms >= 100 && last_timeout_ms <= 1000);
     assert(!ctxr_exec_confined() && calls == 1 && printed == 1);
     puts("ctxr exec probe stuck OK");

@@ -227,11 +227,10 @@ int main(void)
     expanded();
     cur_boot_args.top_of_kernel_data = start + 64 * MIB;
     assert(refused("heap"));
-    /* A secondary still holding the probe stops the boot, confined or not, with no Recovery advice. */
+    /* A secondary still holding the probe stops the boot, confined or not. The probe said why. */
     expanded();
     confined = 0; probe_stuck_cpu = 3; console[0] = 0;
-    assert(!ctxr_exec_os_may_start() && fb_active && strstr(console, "CPU 3") &&
-           strstr(console, "Not starting the OS") && !strstr(console, "Recovery"));
+    assert(!ctxr_exec_os_may_start() && !console[0]);
     puts("ctxr exec window OK");
     return 0;
 }
