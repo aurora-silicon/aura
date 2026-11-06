@@ -8802,7 +8802,8 @@ static int dt_prepare_t8152(void)
 /*
  * On a confined machine a secondary executes only inside the armed window, and
  * spin-table releases it into the kernel's own text. The kernel has to be there:
- * move it from the heap, above the window.
+ * move it from the heap, above the window. Where kboot_prepare_dt() keeps the heap
+ * reserved for firmware buffers, the copy left there stays reserved with it.
  */
 static int kboot_move_to_exec_window(void **kernel)
 {

@@ -78,8 +78,9 @@ On T8140 the windows change where a secondary can execute:
 At kboot `ctxr_exec_confined()` (`src/ctxr_exec.c`) asks a secondary to run two
 instructions from the heap, and the machine is confined if that faults. The probe
 runs on every chip, not on a list of chips: a Mac without the windows (M1 to M3,
-or any raw boot object) runs it and boots as it always did, and aura never reads a
-`CTXR` register there. There is no boot option or build option.
+or any raw boot object) runs it and boots as it always did. Aura reads a `CTXR`
+register there only when it has no secondary to ask, and then under an exception
+guard. There is no boot option or build option.
 
 With no secondary running there is nobody to ask, which happens where
 `smp_start_secondaries()` fails. Aura then keeps no answer, reads `CTXR_D` under an
@@ -131,12 +132,21 @@ window as `/chosen/aurora,ctxr-exec-window`. It uses spin-table, so the kernel
 releases each secondary into its own text. It then enters the kernel directly, as
 on M1 to M3.
 
+Aura can't tell whether a kernel was built with `CONFIG_ARM64_CTXR_EXECMEM`, and
+moves one without it all the same. Its secondaries then fault on the first code
+they run outside the window. On T8140, T6041, T8152 and the J713, which keep this
+stage's heap reserved for firmware buffers, the copy the kernel leaves in the heap
+stays reserved too. That is the size of the image: about 1 MiB for U-Boot, and about
+40 MiB for a kernel booted directly with `boot=`.
+
 An object can arm more than the window, as one padded for 256 MiB does. The OS
 still gets 128 MiB at the same address, so a Mac enrolled at a larger size runs
 the same memory layout as a release. Everything else armed stays reserved:
-`CTXR_D` outside the window and the windows `CTXR_A` to `CTXR_C`, except one that
-lies inside T8140's firmware RO range, which is reserved already. It can't go back to the allocator, because EL0
-stalls executing there on a confined core and the OS pools only its window.
+`CTXR_D` outside the window and the windows `CTXR_A` to `CTXR_C`. A window inside
+T8140's firmware RO range is left to that range's reservation. The monitor's Neo
+boots of 2026-10-31 relied on the range covering all three, so the J700 tree gains
+no entry for them. None of it can go back to the allocator, because EL0 stalls
+executing there on a confined core and the OS pools only its window.
 
 ### No usable window
 
@@ -189,15 +199,16 @@ compressed (zboot) kernel cannot be pinned and is refused.
 
 ### What a confined Mac loses
 
-These all worked under the monitor, or were reachable through it:
+These worked under the monitor, or were reachable through it, except power-off:
 
 - **CPU hotplug.** Spin-table has no CPU off, and aura no longer parks a core for
   the OS. The kernel in aurora-silicon/linux#985 has no `cpu_die` for spin-table, so
   taking a CPU offline fails with `EOPNOTSUPP`. Suspend to RAM and hibernation take
   the secondaries offline the same way, so they fail there too. A separate kernel
   patch that parks the core itself ran once on a Neo, and it isn't in that PR.
-- **PSCI `SYSTEM_OFF` and `SYSTEM_RESET`.** Power-off now needs `macsmc-reboot`.
-  Restart needs that or the Apple watchdog. The J700 tree describes both, but
+- **PSCI `SYSTEM_RESET`.** Restart now needs `macsmc-reboot` or the Apple watchdog.
+  The monitor answered `SYSTEM_OFF` with a reset as well, so power-off never worked
+  through it, and now needs `macsmc-reboot`. The J700 tree describes both, but
   `macsmc-reboot` is a module in the asahi config, so a kernel that hasn't loaded it
   can only restart through the watchdog and can't power off.
 - **kexec and kdump.** aurora-silicon/linux#985 refuses both with `EOPNOTSUPP` under
