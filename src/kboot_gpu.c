@@ -2950,13 +2950,97 @@ static int dt_set_gpu_t8122(void *dt)
     return 0;
 }
 
-static int dt_set_gpu_t8140(void *dt)
+/* G17 SoCs whose firmware iBoot loads and whose UAT it sets up for a raw boot object */
+struct g17_soc {
+    const char *compat;           /* Linux compatible */
+    const char *adt_compat;       /* the ADT's own compatible, also accepted */
+    const char *name;             /* for the log */
+    u32 count;                    /* perf-state-count, also the number of OPP entries */
+    u32 num_states;               /* gpu-num-perf-states */
+    bool firmware_data;           /* also hand over gfx-data/gfx1-data (the firmware __DATA) */
+    bool (*firmware_known)(void); /* when true, /chosen gets firmware_profile_prop */
+    const char *firmware_profile_prop;
+    const char *firmware_profile;
+};
+
+static const struct g17_soc g17_soc_t8140 = {
+    .compat = "apple,agx-t8140",
+    .adt_compat = "gpu,t8140",
+    .name = "T8140",
+    .count = 16,
+    .num_states = 15,
+};
+
+/*
+ * The M5 GPU firmware build Linux's M5 runtime is written for. iBoot fills a
+ * TLV block in each __TEXT with per-boot values (GKTS, ECAP, and addresses
+ * such as BPTP = gfx-shared-region), so the image is matched by its build
+ * string, its __TEXT size and the TLV layout, not by a hash.
+ */
+#define T8142_GPU_FIRMWARE_BUILD   "RTKit-3255.160.4.release"
+#define T8142_GPU_FIRMWARE_PROFILE "M5-" T8142_GPU_FIRMWARE_BUILD
+
+static bool t8142_gpu_firmware_role_known(const char *path, u32 text_size, const u32 tlv[2])
+{
+    int node = adt_path_offset(adt, path);
+    if (node < 0)
+        return false;
+
+    u32 len = 0;
+    const struct adt_segment_ranges *seg = adt_getprop(adt, node, "segment-ranges", &len);
+    if (!seg || len != 2 * sizeof(*seg) || seg[0].size != text_size || !seg[0].phys)
+        return false;
+    const char *names = adt_getprop(adt, node, "segment-names", &len);
+    if (!names || len < sizeof("__TEXT;__DATA") - 1 ||
+        memcmp(names, "__TEXT;__DATA", sizeof("__TEXT;__DATA") - 1))
+        return false;
+
+    const u8 *text = (const u8 *)seg[0].phys;
+    static const char tags[2][4] = {"GKTS", "ECAP"};
+    enum exc_guard_t guard = exc_guard;
+    int faults = exc_count;
+    bool ok = true;
+
+    exc_guard = GUARD_MARK | GUARD_SILENT;
+    for (int i = 0; ok && i < 2; i++)
+        ok = !memcmp(text + tlv[i], tags[i], 4) && read32((u64)text + tlv[i] + 4) == 8;
+    bool found = false;
+    size_t build_len = sizeof(T8142_GPU_FIRMWARE_BUILD) - 1;
+    for (u32 off = 0; ok && !found && off + build_len <= text_size; off++)
+        found = text[off] == 'R' && !memcmp(text + off, T8142_GPU_FIRMWARE_BUILD, build_len);
+    exc_guard = guard;
+
+    return ok && found && exc_count == faults;
+}
+
+static bool t8142_gpu_firmware_known(void)
+{
+    static const u32 gfx_tlv[2] = {0x45d09, 0x45dec};
+    static const u32 gfx1_tlv[2] = {0x45841, 0x45924};
+
+    return t8142_gpu_firmware_role_known("/arm-io/gfx-asc", 0x4c000, gfx_tlv) &&
+           t8142_gpu_firmware_role_known("/arm-io/gfx1-asc", 0x48000, gfx1_tlv);
+}
+
+static const struct g17_soc g17_soc_t8142 = {
+    .compat = "apple,agx-t8142",
+    .adt_compat = "gpu,t8142",
+    .name = "T8142",
+    .count = 13,
+    .num_states = 12,
+    .firmware_data = true,
+    .firmware_known = t8142_gpu_firmware_known,
+    .firmware_profile_prop = "aurora,m5-gpu-firmware-profile",
+    .firmware_profile = T8142_GPU_FIRMWARE_PROFILE,
+};
+
+static int dt_set_gpu_g17(void *dt, const struct g17_soc *soc)
 {
     int gpu = fdt_path_offset(dt, "gpu");
     if (gpu < 0)
         return 0;
-    if (fdt_node_check_compatible(dt, gpu, "apple,agx-t8140") &&
-        fdt_node_check_compatible(dt, gpu, "gpu,t8140"))
+    if (fdt_node_check_compatible(dt, gpu, soc->compat) &&
+        fdt_node_check_compatible(dt, gpu, soc->adt_compat))
         return 0;
 
     int sgx = adt_path_offset(adt, "/arm-io/sgx");
@@ -2964,8 +3048,8 @@ static int dt_set_gpu_t8140(void *dt)
     const struct perf_state *states, *sram;
     if (sgx < 0 || ADT_GETPROP(adt, sgx, "perf-state-count", &count) != sizeof(count) ||
         ADT_GETPROP(adt, sgx, "gpu-num-perf-states", &num_states) != sizeof(num_states) ||
-        ADT_GETPROP(adt, sgx, "perf-state-table-count", &tables) != sizeof(tables) || count != 16 ||
-        num_states != 15 || tables != 1)
+        ADT_GETPROP(adt, sgx, "perf-state-table-count", &tables) != sizeof(tables) ||
+        count != soc->count || num_states != soc->num_states || tables != 1)
         goto disable;
     states = adt_getprop(adt, sgx, "perf-states", &len);
     if (!states || len != count * sizeof(*states))
@@ -2987,24 +3071,29 @@ static int dt_set_gpu_t8140(void *dt)
     int opp, opp_count = 0;
     fdt_for_each_subnode(opp, dt, table)
     {
-        if (++opp_count > 16 || !fdt_getprop(dt, opp, "opp-hz", &ph_len) || ph_len != sizeof(u64) ||
-            !fdt_getprop(dt, opp, "opp-microvolt", &ph_len) || ph_len != sizeof(u32))
+        if ((u32)++opp_count > soc->count || !fdt_getprop(dt, opp, "opp-hz", &ph_len) ||
+            ph_len != sizeof(u64) || !fdt_getprop(dt, opp, "opp-microvolt", &ph_len) ||
+            ph_len != sizeof(u32))
             goto disable;
     }
-    if (opp_count != 16)
+    if ((u32)opp_count != soc->count)
         goto disable;
 
     static const struct {
         const char *name;
         const char *path;
+        bool firmware_data;
     } regions[] = {
         {"gfx-handoff", "/reserved-memory/uat-handoff"},
         {"gfx-shared-l2-region", "/reserved-memory/uat-l2-pagetables"},
         {"gfx-shared-region", "/reserved-memory/uat-pagetables"},
         {"gpu-region", "/reserved-memory/uat-ttbs"},
+        {"gfx-data", "/reserved-memory/gfx-data", true},
+        {"gfx1-data", "/reserved-memory/gfx1-data", true},
     };
+    size_t nregions = ARRAY_SIZE(regions) - (soc->firmware_data ? 0 : 2);
     u64 base[ARRAY_SIZE(regions)], size[ARRAY_SIZE(regions)];
-    for (size_t i = 0; i < ARRAY_SIZE(regions); i++) {
+    for (size_t i = 0; i < nregions; i++) {
         char prop[64];
         snprintf(prop, sizeof(prop), "%s-base", regions[i].name);
         if (ADT_GETPROP(adt, sgx, prop, &base[i]) != sizeof(u64))
@@ -3027,16 +3116,25 @@ static int dt_set_gpu_t8140(void *dt)
             goto disable;
         opp_count++;
     }
-    for (size_t i = 0; i < ARRAY_SIZE(regions); i++)
+    for (size_t i = 0; i < nregions; i++)
         if (dt_set_resvmem(dt, regions[i].path, base[i], size[i]))
             goto disable;
+
+    if (soc->firmware_known) {
+        int chosen = fdt_path_offset(dt, "/chosen");
+        if (!soc->firmware_known())
+            printf("FDT: GPU: unknown %s firmware build, Linux will not start it\n", soc->name);
+        else if (chosen < 0 ||
+                 fdt_setprop_string(dt, chosen, soc->firmware_profile_prop, soc->firmware_profile))
+            goto disable;
+    }
     return 0;
 
 disable:
     gpu = fdt_path_offset(dt, "gpu");
     if (gpu >= 0 && fdt_setprop_string(dt, gpu, "status", "disabled"))
         return -1;
-    printf("FDT: GPU: invalid T8140 ADT or DT data, disabling GPU\n");
+    printf("FDT: GPU: invalid %s ADT or DT data, disabling GPU\n", soc->name);
     return 0;
 }
 
@@ -3582,7 +3680,9 @@ int dt_set_gpu(void *dt)
         return dt_set_gpu_m4(dt);
 
     if (chip_id == T8140)
-        return dt_set_gpu_t8140(dt);
+        return dt_set_gpu_g17(dt, &g17_soc_t8140);
+    if (chip_id == T8142)
+        return dt_set_gpu_g17(dt, &g17_soc_t8142);
 
     if (chip_id == T6040)
         return dt_set_gpu_t6040(dt);
