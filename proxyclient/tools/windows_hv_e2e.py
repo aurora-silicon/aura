@@ -26,7 +26,9 @@ from aura.proxy import AuraProxy, EXC, EXC_RET, IODEV, ProxyCommandError, START
 from aura.tgtypes import BootArgs_r2, BootArgs_r3
 from aura.windows import (CAPS_MAGIC, CONFIGURATION, FRAMEBUFFER_SHADOW, REQUIRED_CAPS,
                           HardwareSession, N1_HANDOFF, N1_PROPERTY, N1_RESOURCES,
-                          MEMORY_PREFLIGHT, SERIAL_CAPTURE, memory_reservation_preflight, prepare_n1_handoff, source_manifest)
+                          MEMORY_PREFLIGHT, SERIAL_CAPTURE, MTP_HANDOFF, MTP_DISABLED_PROPERTY,
+                          MTP_RESERVED_BASE, MTP_RESERVED_SIZE,
+                          memory_reservation_preflight, prepare_n1_handoff, source_manifest)
 
 
 def fixture():
@@ -80,6 +82,10 @@ def fixture():
                      machine_type=0, devtree=0xfffffe0010100000,
                      devtree_size=0x10000, cmdline="", boot_flags=0)
     return load_adt(blob), blob, args
+
+
+def raw_property(node, name):
+    return next(p["value"] for p in node.tostruct()["properties"] if p["name"] == name)
 
 
 def wire_namespace():
@@ -172,7 +178,7 @@ def reservation_prepare_flow(case):
     blob = adt.build()
     trace, heap_queries = [], 0
     plan = SimpleNamespace(chip_id=0x8142, model="Mac17,3", framebuffer="native",
-                           guest_compatibility="none", usb="disabled", n1="disabled", serial="disabled",
+                           guest_compatibility="none", usb="disabled", n1="disabled", serial="disabled", mtp="disabled",
                            image=bytes(range(256)) * 32, reserved_memory=tuple(ranges))
     class Interface:
         dev = SimpleNamespace(timeout=3)
@@ -242,6 +248,9 @@ def reservation_prepare_flow(case):
 
 def lifecycle(case, output):
     adt, blob, args = fixture()
+    if case.startswith("mtp-"):
+        args.phys_base = 0x10000000000
+        args.mem_size = args.mem_size_actual = 0x400000000
     if case == "adt-overflow-init":
         adt.overflow = "x" * 0x20000
         blob = adt.build()
@@ -253,13 +262,20 @@ def lifecycle(case, output):
         def hv_windows_capabilities(self):
             trace.append("caps")
             serial_cap = 0 if case == "serial-missing-capability" else SERIAL_CAPTURE
-            return CAPS_MAGIC | 1 << 16 | REQUIRED_CAPS | CONFIGURATION | FRAMEBUFFER_SHADOW | N1_HANDOFF | MEMORY_PREFLIGHT | serial_cap | 0x200
+            mtp_cap = 0 if case == "mtp-missing-capability" else MTP_HANDOFF
+            return CAPS_MAGIC | 1 << 16 | REQUIRED_CAPS | CONFIGURATION | FRAMEBUFFER_SHADOW | N1_HANDOFF | MEMORY_PREFLIGHT | serial_cap | 0x200 | mtp_cap
         def hv_windows_configure(self, flags):
             trace.append(["config", flags])
             return -1 if case in ("config-rejected", "serial-carrier-rejected") else 0
         def iodev_whoami(self): return IODEV.UART
         def iodev_set_usage(self, *args): trace.append("iodev")
-        def hv_init(self): trace.append("hv_init"); return 0
+        def hv_init(self):
+            trace.append("hv_init")
+            if case.startswith("mtp-"):
+                assert hv.iface.dev.timeout == 12
+                assert raw_property(hv.adt["/chosen"], MTP_DISABLED_PROPERTY) == b"\x01\x00\x00\x00"
+            if case == "mtp-producer-transport-error": raise OSError("injected MTP producer transport error")
+            return -1 if case == "mtp-producer-failure" else 0
         def hv_windows_prepare_n1(self, address, size):
             assert "hv_init" in trace and size == 128
             trace.append("n1-prepare")
@@ -309,6 +325,8 @@ def lifecycle(case, output):
             marker = next(p for p in guest_adt["/chosen"].tostruct()["properties"]
                           if p["name"] == "aura,windows-usb-disabled")
             assert marker["value"] == b"\x01\x00\x00\x00"
+            assert raw_property(guest_adt["/chosen"], MTP_DISABLED_PROPERTY) == (
+                b"\x00\x00\x00\x00" if case == "mtp-success" else b"\x01\x00\x00\x00")
             if case == "n1-success":
                 assert guest_adt["/chosen"].getprop(N1_PROPERTY) == n1_descriptor
             else:
@@ -328,6 +346,7 @@ def lifecycle(case, output):
         def __init__(self):
             self.adt, self.ba = adt, args
             self.heap_top = 0x820004000
+            if case.startswith("mtp-"): self.heap_top = 0x10010004000
             self.cpu_features = SimpleNamespace(apple_sysregs_unlocked=False)
             if case == "out-of-ram": self.ba.mem_size = 0x10000
         def get_adt(self): return blob
@@ -357,6 +376,7 @@ def lifecycle(case, output):
         hv.windows_serial = "capture"
         hv.windows_serial_recorder = serial_recorder
     if case.startswith("n1-"): hv.windows_n1 = "j813-v1"
+    if case.startswith("mtp-"): hv.windows_mtp = "j813-v1"
     if case == "watchdog-failure": hv.wdt_cpu = 1
     payload = bytes(range(256)) * 32
     if case == "chunked-upload": payload = bytes(range(256)) * ((16 * 1024 * 1024 + 8192) // 256)
@@ -368,6 +388,12 @@ def lifecycle(case, output):
             plan, args, adt, hv.u.heap_top - 0x10000000, 0x800000000,
             0x800008000, BootArgs_r2.sizeof(), 0x800100000)
         if case == "reservation-layout-drift": hv.u.heap_top += 0x4000
+    if case.startswith("mtp-") and case != "mtp-missing-reservation":
+        plan = SimpleNamespace(image=payload, reserved_memory=(
+            {"name": "aura-mtp-handoff", "base": MTP_RESERVED_BASE, "size": MTP_RESERVED_SIZE},))
+        hv.windows_memory_guard = memory_reservation_preflight(
+            plan, args, adt, hv.u.heap_top - 0x10000000, 0x10000000000,
+            0x10000008000, BootArgs_r2.sizeof(), 0x10000010000)
     previous = {signum: signal.getsignal(signum) for signum in (signal.SIGINT, signal.SIGQUIT)}
     try:
         hv.init()
@@ -378,12 +404,26 @@ def lifecycle(case, output):
         if case == "adt-overflow-start": hv.adt.overflow = "x" * 0x20000
         start_trace_index = len(trace)
         hv.start()
-        assert case in ("success", "n1-success", "chunked-upload", "reservation-success", "serial-success", "cdc-success")
-        config = 11 if case == "cdc-success" else 7 if case.startswith("serial-") else 3
+        assert case in ("success", "n1-success", "chunked-upload", "reservation-success", "serial-success", "cdc-success", "mtp-success")
+        config = 19 if case == "mtp-success" else 11 if case == "cdc-success" else 7 if case.startswith("serial-") else 3
         assert trace.index(["config", config]) < trace.index("hv_init") < trace.index("upload-image") < trace.index("start")
         if case == "serial-success": assert trace.index("serial-handler") < trace.index("start")
     except (RuntimeError, ValueError, OSError):
-        assert case not in ("success", "n1-success", "chunked-upload", "reservation-success", "serial-success", "cdc-success")
+        assert case not in ("success", "n1-success", "chunked-upload", "reservation-success", "serial-success", "cdc-success", "mtp-success")
+        if case.startswith("mtp-"):
+            assert "upload-image" not in trace and "start" not in trace
+            assert not hv.windows_mtp_ready
+            if case in ("mtp-missing-capability", "mtp-missing-reservation"):
+                assert trace == ["caps"]
+            else:
+                assert raw_property(hv.adt["/chosen"], MTP_DISABLED_PROPERTY) == b"\x01\x00\x00\x00"
+                hv.windows_mtp = "disabled"
+                try:
+                    hv.load_raw(payload, 0x800)
+                except RuntimeError:
+                    pass
+                else:
+                    raise AssertionError("disabled profile bypassed failed MTP producer")
         if case in ("serial-missing-capability", "serial-carrier-rejected"):
             assert "hv_init" not in trace and "upload-image" not in trace and "start" not in trace
         if case == "serial-missing-capability": assert trace == ["caps"]
@@ -432,7 +472,9 @@ def main():
             "chunked-upload", "config-rejected", "out-of-ram", "adt-overflow-init", "adt-overflow-start",
             "watchdog-failure", "forwarded-exception", "forwarded-panic", "transport-error",
             "n1-success", "n1-producer-failure", "n1-bad-header", "n1-bad-resource", "n1-read-failure",
-            "n1-unprepared", "reservation-success", "reservation-layout-drift")]
+            "n1-unprepared", "reservation-success", "reservation-layout-drift",
+            "mtp-success", "mtp-missing-capability", "mtp-missing-reservation",
+            "mtp-producer-failure", "mtp-producer-transport-error")]
         cases += [reservation_prepare_flow(case) for case in (
             "reservation-prepare-success", "reservation-prepare-default", "reservation-prepare-payload",
             "reservation-prepare-heap", "reservation-prepare-outside", "reservation-prepare-overlap",

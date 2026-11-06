@@ -39,8 +39,14 @@ jobs:
           python tools/windows_serial_e2e.py --output build/windows-serial
           python tools/windows_vuart_e2e.py --output build/windows-vuart
           python tools/windows_sgi_e2e.py --output build/windows-sgi
+          python tools/windows_abort_e2e.py --output build/windows-abort
+          python tools/windows_mtp_e2e.py --output build/windows-mtp
+          python tools/windows_dart_init_e2e.py --output build/windows-dart
+          python tools/windows_rtkit_e2e.py --output build/windows-rtkit
           python tools/windows_hv_smoke.py --build-only --chip-id 0x8142 --model Mac17,3 --output build/windows-hardware-probe
           python tools/windows_n1_smoke.py --build-only --output build/windows-n1-hardware-probe
+          python tools/windows_vuart_smoke.py --chip-id 0x8142 --model Mac17,3 --output build/windows-vuart-hardware-probe
+          python tools/windows_abort_smoke.py --chip-id 0x8142 --model Mac17,3 --output build/windows-abort-hardware-probe
       - uses: actions/upload-artifact@v7
         if: always()
         with:
@@ -57,7 +63,13 @@ jobs:
             build/windows-cdc
             build/windows-hardware-probe
             build/windows-n1-hardware-probe
+            build/windows-vuart-hardware-probe
+            build/windows-abort-hardware-probe
             build/windows-n1
             build/windows-serial
             build/windows-vuart
             build/windows-sgi
+            build/windows-abort
+            build/windows-mtp
+            build/windows-dart
+            build/windows-rtkit

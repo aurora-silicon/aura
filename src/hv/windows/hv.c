@@ -10,6 +10,7 @@
 #include "gxf.h"
 #include "malloc.h"
 #include "memory.h"
+#include "mtp_handoff.h"
 #include "pcie.h"
 #include "serial_capture.h"
 #include "smp.h"
@@ -148,14 +149,17 @@ static u64 hv_windows_flags;
 
 int hv_windows_configure(u64 flags)
 {
-    if (hv_windows_initialized || flags & ~(HV_WINDOWS_GUEST_COMPAT | HV_WINDOWS_FB_SHADOW |
-                                            HV_WINDOWS_SERIAL_CAPTURE | HV_WINDOWS_SERIAL_CDC))
+    if (hv_windows_initialized ||
+        flags & ~(HV_WINDOWS_GUEST_COMPAT | HV_WINDOWS_FB_SHADOW | HV_WINDOWS_SERIAL_CAPTURE |
+                  HV_WINDOWS_SERIAL_CDC | HV_WINDOWS_MTP))
         return -1;
     if ((flags & HV_WINDOWS_SERIAL_CDC) &&
         ((flags & HV_WINDOWS_SERIAL_CAPTURE) || uartproxy_iodev < IODEV_USB0 ||
          uartproxy_iodev >= IODEV_USB0 + USB_IODEV_COUNT))
         return -1;
     if ((flags & HV_WINDOWS_GUEST_COMPAT) && chip_id != T8142)
+        return -1;
+    if ((flags & HV_WINDOWS_MTP) && (chip_id != T8142 || board_id != 0x24))
         return -1;
     if ((flags & HV_WINDOWS_SERIAL_CAPTURE) && !hv_windows_serial_available())
         return -1;
@@ -176,6 +180,11 @@ bool hv_windows_serial_capture_enabled(void)
 bool hv_windows_serial_cdc_enabled(void)
 {
     return (hv_windows_flags & HV_WINDOWS_SERIAL_CDC) != 0;
+}
+
+bool hv_windows_mtp_enabled(void)
+{
+    return (hv_windows_flags & HV_WINDOWS_MTP) != 0;
 }
 
 bool hv_windows_can_prepare_device(void)
@@ -263,16 +272,6 @@ int hv_init(void)
     hv_wdt_init();
 
     hv_pt_init();
-
-#if defined(ENABLE_NATIVE_AIC_PASSTHROUGH) && defined(ENABLE_J414S_WINDOWS_MTP_HANDOFF)
-    /*
-     * J414s-only Windows preboot handoff.  It boots the MTP IOP and prepares
-     * DAPF/DART, but leaves DockChannel INIT/ring ownership to AppleMtpHid.
-     * The helper has a second runtime chip/board guard; other m1n1 guests are
-     * therefore unaffected even when this Windows build option is compiled.
-     */
-    mtp_handoff_init();
-#endif
 
     // Configure hypervisor defaults
 
@@ -483,6 +482,10 @@ int hv_init(void)
     sysop("tlbi alle1is");
     sysop("dsb ish");
     sysop("isb");
+    if (!hv_windows_mtp_prepare()) {
+        hv_windows_quarantine();
+        return -1;
+    }
     hv_windows_ready = true;
     return 0;
 }
@@ -653,8 +656,11 @@ int hv_start(void *entry, u64 regs[4])
      * framebuffer before the guest sees it.
      */
     hv_windows_entered = true;
-    if (!hv_fb_init((struct boot_args *)regs[0]))
+    if (!hv_windows_mtp_map_guest() || !hv_fb_init((struct boot_args *)regs[0])) {
+        hv_windows_mtp_stop();
+        hv_windows_quarantine();
         return -1;
+    }
 
     memset(hv_should_exit, 0, sizeof(hv_should_exit));
     memset(hv_started_cpus, 0, sizeof(hv_started_cpus));
@@ -806,6 +812,8 @@ int hv_start(void *entry, u64 regs[4])
     // map the address of the (EL2) ADT to a fixed location so EL1 can patch it
     if (hv_map_hw(adt_base, (u64)adt, ALIGN_UP(cur_boot_args.devtree_size, SZ_16K)) < 0) {
         printf("HV: cannot map the Mu ADT alias\n");
+        hv_windows_mtp_stop();
+        hv_windows_quarantine();
         return -1;
     }
 
@@ -826,10 +834,14 @@ int hv_start(void *entry, u64 regs[4])
     spin_unlock(&bhl);
     int result = hv_join_cpus();
     if (!result) {
+        if (!hv_windows_mtp_stop()) {
+            hv_windows_quarantine();
+            result = -1;
+        }
         hv_windows_serial_finish();
         printf("HV: All CPUs exited\n");
     }
-    return result ? result : hv_windows_exit_reason;
+    return result ? result : __atomic_load_n(&hv_windows_exit_reason, __ATOMIC_ACQUIRE);
 }
 
 static void hv_init_secondary(struct hv_secondary_info_t *info)
@@ -957,13 +969,33 @@ setup_failed:
     return ret;
 }
 
+/* May also run while the exception proxy holds bhl. Do not acquire it here.
+ * Failure wins over every voluntary exit, including a racing SYSTEM_OFF. */
+static void hv_windows_request_exit(int reason)
+{
+    if (reason < 0) {
+        __atomic_store_n(&hv_windows_exit_reason, reason, __ATOMIC_RELEASE);
+    } else {
+        int expected = 0;
+        __atomic_compare_exchange_n(&hv_windows_exit_reason, &expected, reason, false,
+                                    __ATOMIC_RELEASE, __ATOMIC_RELAXED);
+    }
+    for (int cpu = 0; cpu < MAX_CPUS; cpu++)
+        __atomic_store_n(&hv_should_exit[cpu], true, __ATOMIC_RELEASE);
+}
+
+/* Request first, then let the exception proxy rendezvous/unlock/exit.
+ * The boot CPU also observes this flag and performs the normal join path. */
+void hv_windows_abort_guest(void)
+{
+    hv_windows_request_exit(-1);
+}
+
 /* Called from the unlocked synchronous SMC path. End the virtual machine;
  * the physical host remains in the proxy for an explicit subsequent boot. */
 void hv_windows_system_exit(bool reset)
 {
-    __atomic_store_n(&hv_windows_exit_reason, reset ? 2 : 1, __ATOMIC_RELEASE);
-    for (int cpu = 0; cpu < MAX_CPUS; cpu++)
-        __atomic_store_n(&hv_should_exit[cpu], true, __ATOMIC_RELEASE);
+    hv_windows_request_exit(reset ? 2 : 1);
     __atomic_and_fetch(&hv_cpus_in_guest, ~BIT(smp_id()), __ATOMIC_ACQUIRE);
     printf("HV: Windows requested SYSTEM_%s; draining guest CPUs\n", reset ? "RESET" : "OFF");
     hv_exit_guest();
@@ -1370,22 +1402,10 @@ void hv_tick(struct exc_info *ctx)
     hv_scan_t8142_guest_modules();
     hv_report_t8142_process(ctx);
     hv_report_t8142_gic_activity();
-    /*
-     * MTP IOP mailbox floor.  The primary servicer is the unlocked WFI-idle
-     * path in hv_exc.c (see hv_handle_wfx); this 1 Hz call only covers a
-     * guest that never idles.  Safe here now: mtp_handoff_poll() is
-     * rate-limited, single-servicer, message-bounded (rtkit_service_quiet,
-     * max 4), silent, and refuses to consume a message it cannot reply to,
-     * so asc_send()'s 200 ms poll can never run under the big lock.
-     *
-     * Historical note: an earlier call here used rtkit_recv(), which drains
-     * the whole mailbox per call and can block in asc_send(), and Setup
-     * crawled with CPU 6 taking ~10x the interrupts of any other core.  The
-     * heap-grant fear recorded at the time was already stale -- with
-     * rtkit_set_buffer_pool() installed (mtp_handoff.c), grants come from
-     * the reserved carveout and rtkit_alloc_buffer() has no heap fallback.
-     */
-
+    /* Bounded, non-allocating mailbox fallback for a guest that never idles.
+     * The primary servicer runs in the unlocked WFI path. */
+    hv_windows_mtp_poll();
+    hv_windows_mtp_report();
     hv_check_t8142_bugcheck();
     hv_recover_t8142_sysreg_undef(ctx);
     iodev_handle_events(uartproxy_iodev);

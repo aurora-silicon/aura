@@ -12,7 +12,8 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 CASES = (
-    "success", "chip", "board", "model", "resource", "perst", "locked", "dart",
+    "success", "power-enable", "power-inactive", "power-unknown",
+    "chip", "board", "model", "resource", "perst", "locked", "dart",
     "busy", "pre-bme", "train", "post-bme", "identity", "bar-mask", "bar-high",
     "bar-drop", "rom", "clamp-fail",
     "smc-nub-missing", "smc-pmu-missing", "smc-pmu-outside",
@@ -26,7 +27,7 @@ CASES = (
 SOURCES = (
     "src/hv/windows/windows_n1.c", "src/hv/windows/windows_n1.h",
     "src/hv/windows/hv.h", "src/hv/windows/hv_exc.c", "src/j813_n1.c", "src/j813_n1.h",
-    "src/smp.h",
+    "src/smp.h", "src/pmgr.h",
     "src/adt.h", "sysinc/string.h", "src/types.h", "src/utils.h", "src/exception.h",
     "tests/e2e/windows_n1/producer_host.c", "tests/e2e/windows_n1/failure-model.md",
     "tests/e2e/windows_n1/j813_reset_provider.h",
