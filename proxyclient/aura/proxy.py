@@ -60,6 +60,7 @@ class EXC(IntEnum):
 class EVENT(IntEnum):
     MMIOTRACE = 1
     IRQTRACE = 2
+    WINDOWS_SERIAL = 0x80
 
 class EXC_RET(IntEnum):
     UNHANDLED = 1

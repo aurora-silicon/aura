@@ -26,7 +26,7 @@ from aura.proxy import AuraProxy, EXC, EXC_RET, IODEV, ProxyCommandError, START
 from aura.tgtypes import BootArgs_r2, BootArgs_r3
 from aura.windows import (CAPS_MAGIC, CONFIGURATION, FRAMEBUFFER_SHADOW, REQUIRED_CAPS,
                           HardwareSession, N1_HANDOFF, N1_PROPERTY, N1_RESOURCES,
-                          MEMORY_PREFLIGHT, memory_reservation_preflight, prepare_n1_handoff, source_manifest)
+                          MEMORY_PREFLIGHT, SERIAL_CAPTURE, memory_reservation_preflight, prepare_n1_handoff, source_manifest)
 
 
 def fixture():
@@ -172,7 +172,7 @@ def reservation_prepare_flow(case):
     blob = adt.build()
     trace, heap_queries = [], 0
     plan = SimpleNamespace(chip_id=0x8142, model="Mac17,3", framebuffer="native",
-                           guest_compatibility="none", usb="disabled", n1="disabled",
+                           guest_compatibility="none", usb="disabled", n1="disabled", serial="disabled",
                            image=bytes(range(256)) * 32, reserved_memory=tuple(ranges))
     class Interface:
         dev = SimpleNamespace(timeout=3)
@@ -185,7 +185,8 @@ def reservation_prepare_flow(case):
             return blob.ljust(size, b"\0")
         def readstruct(self, address, layout): return layout.parse(self.readmem(address, layout.sizeof()))
         def set_handler(self, *args): pass
-        def set_event_handler(self, *args): pass
+        def set_event_handler(self, *args):
+            if int(args[0]) == 0x80: trace.append("serial-handler")
     class Proxy:
         def hv_windows_capabilities(self):
             trace.append("caps")
@@ -220,6 +221,7 @@ def reservation_prepare_flow(case):
         read8 = read16 = read32 = write8 = write16 = write32 = unexpected
     session = HardwareSession.__new__(HardwareSession)
     session.iface, session.proxy, session.hv = Interface(), Proxy(), None
+    session.serial_capture = None
     session.proxy.iface = session.iface
     identity = session.identity()
     assert identity["model"] == "Mac17,3"
@@ -250,10 +252,11 @@ def lifecycle(case, output):
     class Proxy:
         def hv_windows_capabilities(self):
             trace.append("caps")
-            return CAPS_MAGIC | 1 << 16 | REQUIRED_CAPS | CONFIGURATION | FRAMEBUFFER_SHADOW | N1_HANDOFF | MEMORY_PREFLIGHT
+            serial_cap = 0 if case == "serial-missing-capability" else SERIAL_CAPTURE
+            return CAPS_MAGIC | 1 << 16 | REQUIRED_CAPS | CONFIGURATION | FRAMEBUFFER_SHADOW | N1_HANDOFF | MEMORY_PREFLIGHT | serial_cap
         def hv_windows_configure(self, flags):
             trace.append(["config", flags])
-            return -1 if case == "config-rejected" else 0
+            return -1 if case in ("config-rejected", "serial-carrier-rejected") else 0
         def iodev_whoami(self): return IODEV.UART
         def iodev_set_usage(self, *args): trace.append("iodev")
         def hv_init(self): trace.append("hv_init"); return 0
@@ -315,7 +318,8 @@ def lifecycle(case, output):
     class Interface:
         dev = SimpleNamespace(timeout=3)
         def set_handler(self, *args): pass
-        def set_event_handler(self, *args): pass
+        def set_event_handler(self, *args):
+            if int(args[0]) == 0x80: trace.append("serial-handler")
         def writemem(self, address, data): writes[address] = bytes(data)
         def readmem(self, address, size):
             if case == "n1-read-failure": raise OSError("injected N1 read failure")
@@ -343,6 +347,14 @@ def lifecycle(case, output):
     hv = HV(Interface(), Proxy(), Utils(), windows=True)
     hv.windows_guest_compatibility = "t8142-experimental"
     hv.windows_framebuffer = "bgra-shadow"
+    serial_recorder = None
+    if case.startswith("serial-"):
+        from aura.windows_serial import WindowsSerialRecorder
+        folder = output / case
+        folder.mkdir()
+        serial_recorder = WindowsSerialRecorder(folder)
+        hv.windows_serial = "capture"
+        hv.windows_serial_recorder = serial_recorder
     if case.startswith("n1-"): hv.windows_n1 = "j813-v1"
     if case == "watchdog-failure": hv.wdt_cpu = 1
     payload = bytes(range(256)) * 32
@@ -365,10 +377,14 @@ def lifecycle(case, output):
         if case == "adt-overflow-start": hv.adt.overflow = "x" * 0x20000
         start_trace_index = len(trace)
         hv.start()
-        assert case in ("success", "n1-success", "chunked-upload", "reservation-success")
-        assert trace.index(["config", 3]) < trace.index("hv_init") < trace.index("upload-image") < trace.index("start")
+        assert case in ("success", "n1-success", "chunked-upload", "reservation-success", "serial-success")
+        assert trace.index(["config", 7 if case.startswith("serial-") else 3]) < trace.index("hv_init") < trace.index("upload-image") < trace.index("start")
+        if case == "serial-success": assert trace.index("serial-handler") < trace.index("start")
     except (RuntimeError, ValueError, OSError):
-        assert case not in ("success", "n1-success", "chunked-upload", "reservation-success")
+        assert case not in ("success", "n1-success", "chunked-upload", "reservation-success", "serial-success")
+        if case in ("serial-missing-capability", "serial-carrier-rejected"):
+            assert "hv_init" not in trace and "upload-image" not in trace and "start" not in trace
+        if case == "serial-missing-capability": assert trace == ["caps"]
         if case == "reservation-layout-drift": assert "upload-image" not in trace and "start" not in trace
         if case.startswith("n1-"):
             assert "upload-image" not in trace and "start" not in trace
@@ -390,6 +406,7 @@ def lifecycle(case, output):
         if case.startswith("forwarded-"):
             assert "exit-guest" in trace and hv.windows_abort_reason is not None
     finally:
+        if serial_recorder is not None: serial_recorder.close()
         assert hv.iface.dev.timeout == 3
         assert all(signal.getsignal(signum) == handler for signum, handler in previous.items())
         for signum, handler in previous.items(): signal.signal(signum, handler)
@@ -409,7 +426,8 @@ def main():
         cases = [wire_namespace(), identity_translation("identity-modular-wrap"),
                  identity_translation("identity-outside-ram"),
                  identity_translation("identity-j813-recorded-addresses")] + [lifecycle(case, output) for case in (
-            "success", "chunked-upload", "config-rejected", "out-of-ram", "adt-overflow-init", "adt-overflow-start",
+            "success", "serial-success", "serial-missing-capability", "serial-carrier-rejected",
+            "chunked-upload", "config-rejected", "out-of-ram", "adt-overflow-init", "adt-overflow-start",
             "watchdog-failure", "forwarded-exception", "forwarded-panic", "transport-error",
             "n1-success", "n1-producer-failure", "n1-bad-header", "n1-bad-resource", "n1-read-failure",
             "n1-unprepared", "reservation-success", "reservation-layout-drift")]

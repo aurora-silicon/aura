@@ -11,6 +11,7 @@
 #include "malloc.h"
 #include "memory.h"
 #include "pcie.h"
+#include "serial_capture.h"
 #include "smp.h"
 #include "string.h"
 #include "usb.h"
@@ -147,9 +148,12 @@ static u64 hv_windows_flags;
 
 int hv_windows_configure(u64 flags)
 {
-    if (hv_windows_initialized || flags & ~(HV_WINDOWS_GUEST_COMPAT | HV_WINDOWS_FB_SHADOW))
+    if (hv_windows_initialized ||
+        flags & ~(HV_WINDOWS_GUEST_COMPAT | HV_WINDOWS_FB_SHADOW | HV_WINDOWS_SERIAL_CAPTURE))
         return -1;
     if ((flags & HV_WINDOWS_GUEST_COMPAT) && chip_id != T8142)
+        return -1;
+    if ((flags & HV_WINDOWS_SERIAL_CAPTURE) && !hv_windows_serial_available())
         return -1;
     hv_windows_flags = flags;
     return 0;
@@ -158,6 +162,11 @@ int hv_windows_configure(u64 flags)
 bool hv_windows_guest_compat_enabled(void)
 {
     return (hv_windows_flags & HV_WINDOWS_GUEST_COMPAT) != 0;
+}
+
+bool hv_windows_serial_capture_enabled(void)
+{
+    return (hv_windows_flags & HV_WINDOWS_SERIAL_CAPTURE) != 0;
 }
 
 bool hv_windows_can_prepare_device(void)
@@ -807,8 +816,10 @@ int hv_start(void *entry, u64 regs[4])
     hv_started_cpus[boot_cpu_idx] = false;
     spin_unlock(&bhl);
     int result = hv_join_cpus();
-    if (!result)
+    if (!result) {
+        hv_windows_serial_finish();
         printf("HV: All CPUs exited\n");
+    }
     return result ? result : hv_windows_exit_reason;
 }
 
@@ -1320,6 +1331,7 @@ static void hv_sample_guest_pc(struct exc_info *ctx)
 void hv_tick(struct exc_info *ctx)
 {
     hv_wdt_pet();
+    hv_windows_serial_flush();
     /*
      * A floor, not the main path: this runs with the big hypervisor lock held,
      * so it converts only a band. Idle cores parking in WFI do the bulk of the

@@ -78,15 +78,18 @@ Bits 0–3 are required: Windows personality, native AIC, PSCI, and raw Mu loade
 contract. Bit 4 advertises a BGRA framebuffer shadow/converter. Bit 5 is the
 independently gated N1 handoff producer. Bit 6 advertises explicit configuration.
 Bit 7 advertises the read-only heap high-water query used for declared memory
-reservation checks.
+reservation checks. Bit 8 advertises opt-in, framed outbound guest serial
+capture; the selected carrier must also support nonblocking atomic frames.
 Normal builds return zero. The launcher does not treat a capability bit as
 hardware qualification.
 
 `P_HV_WINDOWS_CONFIG = 0xc81` sets Windows options before `hv_init`: argument bit
 0 opts into the experimental T8142 instruction/vector rewrites and guessed SP
-repair; bit 1 requests BGRA shadow conversion. It returns 0 on acceptance and
+repair; bit 1 requests BGRA shadow conversion; bit 2 requests framed serial
+capture. It returns 0 on acceptance and
 -1 for invalid flags, unsupported target or an invalid lifecycle state. The
-host requires capability bit 6 for either option. The C backend verifies the
+host requires capability bit 6 for these options and bit 8 for serial capture.
+The C backend verifies the
 scanout format, creates the shadow and changes guest boot arguments only after
 successful setup; the host never spoofs depth. An unsuccessful requested
 conversion prevents entry to the guest.
@@ -170,6 +173,16 @@ little-endian u32 value 1. This prevents Mu's early USB DART enumeration. A
 matching Mu build must also consume that property and set USB ACPI device
 status to zero; older Mu builds with static present USB devices are unsuitable
 for this profile. This policy preserves unrelated display nodes.
+
+`serial` defaults to `disabled`. Set `"serial": "capture"` to collect outbound
+guest UART bytes over framed events on the existing proxy connection, including
+KIS/DockChannel. This produces `guest-serial.bin` and an escaped, readable
+`guest-serial.log` while the guest runs, and adds capture counters, a raw SHA-256
+and final status to `launch.json`. A bounded target buffer can drop bytes;
+missing final status, recorded drops or protocol errors mark the capture
+incomplete. This does not establish Windows readiness or provide bidirectional
+KD. Unsupported atomic carriers reject capture configuration before guest
+entry. See the [serial protocol and replay procedure](windows-serial-capture.md).
 
 `n1` defaults to `disabled`, which removes any stale N1 handoff property and
 never invokes the producer. `j813-v1` is an explicit opt-in restricted to

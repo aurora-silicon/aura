@@ -6,6 +6,9 @@
 #include "uart.h"
 #include "uart_regs.h"
 #include "usb.h"
+#ifdef AURA_WINDOWS
+#include "windows/serial_capture.h"
+#endif
 
 bool active = false;
 
@@ -94,9 +97,15 @@ static bool handle_vuart(struct exc_info *ctx, u64 addr, u64 *val, bool write, i
                 break;
             case UTXH: {
                 uint8_t b = *val;
+#ifdef AURA_WINDOWS
+                hv_windows_serial_putc(b);
+#endif
                 if (iodev_can_write(IODEV_USB_VUART))
                     iodev_write(IODEV_USB_VUART, &b, 1);
-                handle_vuart_passthrough(b);
+#ifdef AURA_WINDOWS
+                if (!hv_windows_serial_capture_enabled())
+#endif
+                    handle_vuart_passthrough(b);
                 break;
             }
             case UTRSTAT:

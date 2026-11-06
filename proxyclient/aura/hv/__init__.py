@@ -91,6 +91,8 @@ class HV(Reloadable):
         self.windows_n1_ready = False
         self.windows_n1_handoff = None
         self.windows_memory_guard = None
+        self.windows_serial = "disabled"
+        self.windows_serial_recorder = None
         self.pac_mask = self.PAC_MASK
         self.user_pac_mask = self.PAC_MASK
         self.vbar_el1 = None
@@ -1391,13 +1393,20 @@ class HV(Reloadable):
             raise ValueError(f"Windows ADT needs {len(blob)} bytes, reserved capacity is {capacity}")
         return blob
 
+    def handle_windows_serial(self, data):
+        if not self.windows or self.windows_serial != "capture" or self.windows_serial_recorder is None:
+            raise RuntimeError("unsolicited Windows serial event")
+        self.windows_serial_recorder.receive(data)
+
     def init(self):
         if self.windows:
             from ..windows import (CONFIGURATION, CONFIG_FRAMEBUFFER_SHADOW,
-                                   CONFIG_T8142_EXPERIMENTAL, validate_capabilities)
+                                   CONFIG_T8142_EXPERIMENTAL, CONFIG_SERIAL_CAPTURE, validate_capabilities)
             caps = validate_capabilities(self.p.hv_windows_capabilities(), self.windows_framebuffer,
                                          self.windows_guest_compatibility, self.windows_n1,
-                                         self.windows_memory_guard is not None)
+                                         self.windows_memory_guard is not None, self.windows_serial)
+            if self.windows_serial == "capture" and self.windows_serial_recorder is None:
+                raise ValueError("Windows serial capture requires an artifact recorder")
             # The Windows C personality owns these architectural features.
             self.emulate_sprr = False
             if self.novm:
@@ -1419,6 +1428,8 @@ class HV(Reloadable):
                 flags = (CONFIG_FRAMEBUFFER_SHADOW if self.windows_framebuffer == "bgra-shadow" else 0)
                 if self.windows_guest_compatibility == "t8142-experimental":
                     flags |= CONFIG_T8142_EXPERIMENTAL
+                if self.windows_serial == "capture":
+                    flags |= CONFIG_SERIAL_CAPTURE
                 if self.p.hv_windows_configure(flags) != 0:
                     raise RuntimeError("Windows hypervisor configuration rejected")
 
@@ -1447,6 +1458,8 @@ class HV(Reloadable):
         self.iface.set_handler(START.HV, HV_EVENT.PANIC, self.handle_bark)
         self.iface.set_event_handler(EVENT.MMIOTRACE, self.handle_mmiotrace)
         self.iface.set_event_handler(EVENT.IRQTRACE, self.handle_irqtrace)
+        if self.windows and self.windows_serial == "capture":
+            self.iface.set_event_handler(EVENT.WINDOWS_SERIAL, self.handle_windows_serial)
 
         # Map MMIO ranges as HW by default
         for r in self.adt["/arm-io"].ranges:
