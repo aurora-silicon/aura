@@ -67,7 +67,10 @@ static const u32 probe_insns[] = {
     0xd65f03c0, /* ret */
 };
 
-/* A secondary gets this long to answer, which is far more than two instructions or a fault take. */
+/*
+ * A secondary that took the probe gets this long to answer, far more than two instructions
+ * or a fault take. smp_call4() has already given it 1000 ms to take it.
+ */
 #define CTXR_PROBE_TIMEOUT_MS 500
 
 /* The CPU still holding an unanswered probe, or -1. */
@@ -150,11 +153,12 @@ bool ctxr_exec_confined(void)
              */
             probe_stuck_cpu = cpu;
             fb_set_active(true);
-            printf("\nCTXR exec: CPU %d did not answer the probe within %d ms and still holds it.\n"
+            printf("\nCTXR exec: CPU %d did not take or did not answer the probe, and still holds "
+                   "it.\n"
                    "  Not starting the OS.\n"
                    "  Hold the power button to shut down, then hold it again to choose another\n"
                    "  system.\n",
-                   cpu, CTXR_PROBE_TIMEOUT_MS);
+                   cpu);
             return false;
         }
         /*
