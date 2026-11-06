@@ -1,14 +1,19 @@
 /* SPDX-License-Identifier: MIT */
 
 /*
- * Virtualized SPTM: the carve-out and the host's loader entry points.
+ * Virtualized SPTM: the carve-out, the host's loader entry points and the guest entry.
  */
 
 #include "sptm_virt.h"
 #include "adt.h"
+#include "cpu_regs.h"
+#include "fb.h"
 #include "heapblock.h"
 #include "memory.h"
+#include "nv2.h"
+#include "smp.h"
 #include "soc.h"
+#include "sptm_virt_priv.h"
 #include "string.h"
 #include "utils.h"
 #include "xnuboot.h"
@@ -20,6 +25,13 @@
  */
 #define SPTM_VIRT_AURA_HEAP (512UL << 20)
 #define SPTM_VIRT_ALIGN     (2UL << 20) /* an L2 block */
+
+volatile bool sptm_virt_xnu_live;
+
+static u64 sptm_entry_pa, sptm_handoff_pa;
+static bool sptm_images_loaded;
+/* False while a core runs SPTM's own (re)entry path, true from its first GEXIT into XNU. */
+static volatile bool sptm_cpu_in_xnu[MAX_CPUS];
 
 bool sptm_virt_requested(void)
 {
@@ -166,7 +178,7 @@ __attribute__((used, retain)) int sptm_virt_place(struct sptm_virt_placement *ou
     if (!out)
         return -1;
     memset(out, 0, sizeof(*out));
-    if (sptm_virt_layout(&l) < 0)
+    if (sptm_virt_layout(&l) < 0 || sptm_virt_gl_alloc() < 0)
         return -1;
     out->managed_base = l.managed_base;
     out->managed_end = l.managed_end;
@@ -240,6 +252,8 @@ __attribute__((used, retain)) int sptm_virt_load(u64 sptm_entry, u64 handoff)
         printf("SPTM-virt: load refused, no valid carve-out layout\n");
         return -1;
     }
+    if (sptm_virt_gl_alloc() < 0)
+        return -1;
     if (sptm_entry < l.managed_base || sptm_entry >= l.managed_end) {
         printf("SPTM-virt: load refused, entry 0x%lx outside managed RAM [0x%lx, 0x%lx)\n",
                sptm_entry, l.managed_base, l.managed_end);
@@ -251,7 +265,75 @@ __attribute__((used, retain)) int sptm_virt_load(u64 sptm_entry, u64 handoff)
     }
     if (sptm_virt_check_handoff(&l, handoff) < 0)
         return -1;
+    sptm_entry_pa = sptm_entry;
+    sptm_handoff_pa = handoff;
+    sptm_images_loaded = true;
     printf("SPTM-virt: images recorded, entry 0x%lx handoff 0x%lx; ready to enter\n", sptm_entry,
            handoff);
     return 0;
+}
+
+/* The last step of every guest entry on a core, from nv2_enter_os. */
+void sptm_virt_cpu_arm(void)
+{
+    sptm_cpu_in_xnu[smp_id()] = false;
+
+    /* GXF and SPRR run natively below aura: nothing traps GENTER/GEXIT or their configuration. */
+    msr(HACR_EL2, 0);
+    reg_clr(HCR_EL2, HCR_TIDCP);
+    /* Until this core's first GEXIT into XNU, a WFE is SPTM's panic park: trap it (see
+     * sptm_virt_el1_wfx), since under aura no event would ever end it. */
+    reg_set(HCR_EL2, HCR_TWE);
+    sysop("isb");
+
+    /*
+     * SPTM enables its own GXF from virtual EL2, which needs aura's GL2 to exist. SPRR first
+     * (GXF_CONFIG UNDEFs without it); the permission maps were loaded at boot (mmu_init_sprr),
+     * so aura's own pages stay accessible. Nothing above wrote EL2 state with GXF on.
+     */
+    msr(SYS_IMP_APL_SPRR_CONFIG_EL1, SPRR_CONFIG_EN);
+    sysop("isb");
+    msr(SYS_IMP_APL_GXF_CONFIG_EL1, GXF_CONFIG_EN);
+    sysop("isb");
+
+    sptm_virt_amx_host();
+}
+
+/* A GEXIT into XNU's normal world: this core runs XNU from now on. */
+void sptm_virt_cpu_enters_xnu(int cpu)
+{
+    if (sptm_cpu_in_xnu[cpu])
+        return;
+    sptm_cpu_in_xnu[cpu] = true;
+    nv2_hcr_update(0, HCR_TWE);
+}
+
+__attribute__((used, retain)) void sptm_virt_enter(void)
+{
+    if (!sptm_images_loaded)
+        panic("sptm_virt: no SPTM image recorded (call sptm_virt_load first)\n");
+
+    printf("\nSPTM-virt: entering SPTM at 0x%lx, boot_args 0x%lx\n", sptm_entry_pa,
+           sptm_handoff_pa);
+    nv2_active = true;
+    nv2_guarded = true;
+
+    /* iBoot's entry contract: EL1&0 MMU and caches off, x0 = boot_args. */
+    msr(SYS_SCTLR_EL12, mrs(SYS_SCTLR_EL12) & ~(SCTLR_M | SCTLR_C | SCTLR_I));
+    sysop("isb");
+
+    /* The proxy flow never passes through kboot's nv2_prepare. */
+    nv2_prepare();
+
+    /* MMU-off fetches must not see stale I-cache lines of whatever ran here. */
+    ic_iallu();
+    sysop("dsb sy");
+    sysop("isb");
+
+    /* The framebuffer is no-access to aura once SPRR is live: stop drawing the console into it. */
+#ifdef USE_FB
+    fb_set_active(false);
+#endif
+
+    nv2_enter_os(sptm_entry_pa, sptm_handoff_pa, 0, 0);
 }

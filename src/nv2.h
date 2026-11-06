@@ -27,6 +27,7 @@ extern bool nv2_guarded;
 
 /* Allocate the per-CPU NV pages; before the OS memory map is fixed. */
 void nv2_prepare(void);
+void nv2_hcr_update(u64 set, u64 clr);
 void nv2_enter_os(u64 entry, u64 a0, u64 a1, u64 a2) __attribute__((noreturn));
 
 /* Exception hooks: true if handled, and the exception return resumes the

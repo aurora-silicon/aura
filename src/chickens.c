@@ -3,6 +3,7 @@
 #include "chickens.h"
 #include "cpu_regs.h"
 #include "midr.h"
+#include "sptm_virt.h"
 #include "uart.h"
 #include "utils.h"
 
@@ -111,6 +112,12 @@ const struct midr_part_features features_m3 = {
 // XXX figure out what features are actually available on M4
 const struct midr_part_features features_m4 = {
     .sleep_mode = SLEEP_NONE, // XXX probably new mode required
+#ifdef SPTM_VIRT
+    /* The virtualized SPTM needs aura's own GL2 (SPRR and GXF), which iBoot leaves writable for a
+     * kcbz=0 boot object, and the error registers for its fault reports. */
+    .apple_sysregs_unlocked = true,
+    .mmu_sprr = true,
+#endif
     .fast_ipi = true,
     .actlr_el2 = true,
     .unsafe_wfi = true,
@@ -254,7 +261,8 @@ void init_cpu(void)
         reg_clr(SYS_IMP_APL_ACC_CFG, ACC_CFG_DEEP_SLEEP);
     }
 
-    if (cpu_features->apple_sysregs_unlocked) {
+    /* CYC_OVRD UNDEFs on parts without a sleep mode (M4 class, under SPTM_VIRT). */
+    if (cpu_features->apple_sysregs_unlocked && cpu_features->sleep_mode != SLEEP_NONE) {
         /* Unmask external IRQs, set WFI mode to up (2), enable WFI retention */
         reg_mask(SYS_IMP_APL_CYC_OVRD,
                  CYC_OVRD_FIQ_MODE_MASK | CYC_OVRD_IRQ_MODE_MASK | CYC_OVRD_WFI_MODE_MASK |

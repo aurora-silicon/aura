@@ -49,6 +49,17 @@ bool sptm_virt_heap_window(u64 *base, u64 *limit);
 int sptm_virt_place(struct sptm_virt_placement *out);
 int sptm_virt_load(u64 sptm_entry, u64 handoff);
 void sptm_virt_flush(u64 pa, u64 size);
+void sptm_virt_enter(void) __attribute__((noreturn));
+
+/* nv2.c: the last step of every guest entry on a core. */
+void sptm_virt_cpu_arm(void);
+void sptm_virt_amx_ctl_el2_write(u64 v);
+u64 sptm_virt_amx_ctl_el2_read(void);
+
+/* exception.c */
+bool sptm_virt_peek_fault(bool in_gl);
+bool sptm_virt_gl_sync(u64 *regs, u64 esr, u64 elr, u64 spsr);
+bool sptm_virt_el1_wfx(u64 *regs, u64 esr);
 
 #else
 
@@ -56,6 +67,11 @@ static inline bool sptm_virt_heap_window(u64 *base, u64 *limit)
 {
     (void)base;
     (void)limit;
+    return false;
+}
+static inline bool sptm_virt_peek_fault(bool in_gl)
+{
+    (void)in_gl;
     return false;
 }
 

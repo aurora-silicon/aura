@@ -5,9 +5,11 @@
 #include "nv2.h"
 #include "arm_cpu_regs.h"
 #include "cpu_regs.h"
+#include "gxf.h"
 #include "malloc.h"
 #include "memory.h"
 #include "smp.h"
+#include "sptm_virt.h"
 #include "string.h"
 #include "utils.h"
 
@@ -264,6 +266,30 @@ void nv2_prepare(void)
             panic("NV2: no memory for CPU %d's NV pages\n", i);
         memset(nv2_pages[i], 0, SZ_16K);
     }
+}
+
+/* Keep the per-CPU HCR copy (restored on child exit) in step with a live HCR change. With
+ * aura's GXF/SPRR live, HCR_EL2 is writable only from GL2 (a write from plain EL2, e.g. in an
+ * FIQ taken from XNU, UNDEFs), so go through gl2_call there. */
+static u64 nv2_hcr_write_gl2(u64 v, u64 a, u64 b, u64 c)
+{
+    UNUSED(a);
+    UNUSED(b);
+    UNUSED(c);
+    msr(HCR_EL2, v);
+    sysop("isb");
+    return 0;
+}
+
+void nv2_hcr_update(u64 set, u64 clr)
+{
+    struct nv2_cpu *c = nv2_this();
+    c->hcr = (c->hcr & ~clr) | set;
+    u64 v = (mrs(HCR_EL2) & ~clr) | set;
+    if (!in_gl12() && gxf_enabled())
+        gl2_call(nv2_hcr_write_gl2, v, 0, 0, 0);
+    else
+        msr(HCR_EL2, v);
 }
 
 /* ---------------------------------------------------------------------- */
@@ -564,7 +590,9 @@ static bool nv2_child_enter(struct nv2_cpu *c, u64 spsr, u64 elr)
         msr(VPIDR_EL2, VN(c, V_VPIDR));
         msr(VMPIDR_EL2, VN(c, V_VMPIDR));
         msr(HSTR_EL2, VN(c, V_HSTR));
-        msr(HACR_EL2, c->hacr);
+        /* A guarded guest's HACR_EL2 is aura's (sptm_virt_cpu_arm), not the child's. */
+        if (!nv2_guarded)
+            msr(HACR_EL2, c->hacr);
         msr(MDCR_EL2, c->mdcr);
         msr(SYS_HFGRTR_EL2, VN(c, V_HFGRTR));
         msr(SYS_HFGWTR_EL2, VN(c, V_HFGWTR));
@@ -634,7 +662,8 @@ static void nv2_child_exit(struct nv2_cpu *c, int kind, u64 esr)
         msr(VPIDR_EL2, mrs(MIDR_EL1));
         msr(VMPIDR_EL2, mrs(MPIDR_EL1));
         msr(HSTR_EL2, 0);
-        msr(HACR_EL2, 0);
+        if (!nv2_guarded)
+            msr(HACR_EL2, 0);
         msr(MDCR_EL2, 0);
         msr(SYS_PMCR1_EL12, c->parent_pmcr1);
         msr(SYS_HFGRTR_EL2, c->l1_hfgrtr);
@@ -1236,6 +1265,12 @@ static bool nv2_sysreg_do(struct nv2_cpu *c, u64 *regs, u64 esr)
             /* AGTCNTHP_CTL from EL2 (XNU's arm_init masks it): a per-CPU shadow. */
             slot = &c->agt_hp_ctl;
             break;
+        case KEY(3, 4, 15, 4, 7): /* AMX_CTL_EL2: the guest hypervisor's AMX policy, applied */
+            if (read)
+                value = nv2_guarded ? sptm_virt_amx_ctl_el2_read() : 0;
+            else if (nv2_guarded)
+                sptm_virt_amx_ctl_el2_write(value);
+            break;
         case KEY(3, 6, 15, 12, 4):
             /* APSTS_EL1: PAC is up on the hardware; a guest hypervisor (SPTM's __start) polls
              * its bit 0 before it configures APCTL. */
@@ -1535,6 +1570,10 @@ void nv2_enter_os(u64 entry, u64 a0, u64 a1, u64 a2)
     msr(CNTP_CTL_EL0, 0);
     msr(HCR_EL2, hcr);
     sysop("isb");
+
+    /* The virtualized SPTM: its per-core state, the last thing before the ERET. */
+    if (nv2_guarded)
+        sptm_virt_cpu_arm();
 
     nv2_enter_el1h(entry, a0, a1, a2);
 }

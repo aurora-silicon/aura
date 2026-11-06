@@ -12,6 +12,7 @@
 #include "monitor.h"
 #include "psci.h"
 #include "pv_kvm.h"
+#include "sptm_virt.h"
 #include "uart.h"
 #include "utils.h"
 
@@ -269,6 +270,10 @@ void exc_sync(u64 *regs)
     bool in_gl = in_gl12();
     bool el3 = in_el3();
 
+    /* One of the virtualized SPTM's fault-tolerant reads faulted: skip it. */
+    if (sptm_virt_peek_fault(in_gl))
+        return;
+
     u64 spsr = in_gl ? mrs(SYS_IMP_APL_SPSR_GL1) : (el3 ? mrs(SPSR_EL3) : mrs(SPSR_EL1));
     u64 esr = in_gl ? mrs(SYS_IMP_APL_ESR_GL1) : (el3 ? mrs(ESR_EL3) : mrs(ESR_EL1));
     u64 elr = in_gl ? mrs(SYS_IMP_APL_ELR_GL1) : (el3 ? mrs(ELR_EL3) : mrs(ELR_EL1));
@@ -278,9 +283,20 @@ void exc_sync(u64 *regs)
     u32 iss = esr & ESR_ISS;
 
 #ifdef SPTM_VIRT
+    /* The virtualized SPTM at GL1, trapped to aura's GL2. */
+    if (in_gl && nv2_guarded && sptm_virt_gl_sync(regs, esr, elr, spsr))
+        return;
+
     /* An OS at virtual EL2 (FEAT_NV2), or the guest it runs. */
     if (nv2_active && !in_gl && !el3 && nv2_handle_sync(regs))
         return;
+
+    /* A WFI or WFE the virtualized SPTM's guest trapped with TWE/TWI. */
+    if (nv2_guarded && !in_gl && ec == ESR_EC_WFI && (elsp == SPSR_M_EL1H || elsp == SPSR_M_EL1T) &&
+        sptm_virt_el1_wfx(regs, esr)) {
+        sysop("isb");
+        return;
+    }
 #endif
 
     // check brk instructions
