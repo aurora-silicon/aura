@@ -87,6 +87,7 @@ class HV(Reloadable):
         self.windows_usb_removed = []
         self.windows_n1 = "disabled"
         self.windows_mtp = "disabled"
+        self.windows_cpufreq = "disabled"
         self.windows_mtp_ready = False
         self.windows_mtp_attempted = False
         self.windows_initialized = False
@@ -1407,12 +1408,12 @@ class HV(Reloadable):
         if self.windows:
             from ..windows import (CONFIGURATION, CONFIG_FRAMEBUFFER_SHADOW,
                                    CONFIG_T8142_EXPERIMENTAL, CONFIG_SERIAL_CAPTURE,
-                                   CONFIG_SERIAL_CDC, CONFIG_MTP, MTP_DISABLED_PROPERTY,
+                                   CONFIG_SERIAL_CDC, CONFIG_MTP, CONFIG_CPUFREQ, MTP_DISABLED_PROPERTY,
                                    MTP_RESERVED_BASE, MTP_RESERVED_SIZE, validate_capabilities)
             caps = validate_capabilities(self.p.hv_windows_capabilities(), self.windows_framebuffer,
                                          self.windows_guest_compatibility, self.windows_n1,
                                          self.windows_memory_guard is not None, self.windows_serial,
-                                         self.windows_mtp)
+                                         self.windows_mtp, self.windows_cpufreq)
             if self.windows_mtp != "disabled":
                 guard = self.windows_memory_guard
                 if not guard or not any(r["base"] == MTP_RESERVED_BASE and
@@ -1448,6 +1449,8 @@ class HV(Reloadable):
                     flags |= CONFIG_SERIAL_CDC
                 if self.windows_mtp == "j813-v1":
                     flags |= CONFIG_MTP
+                if self.windows_cpufreq == "j813-manual-v1":
+                    flags |= CONFIG_CPUFREQ
                 if self.p.hv_windows_configure(flags) != 0:
                     raise RuntimeError("Windows hypervisor configuration rejected")
 
@@ -1769,8 +1772,25 @@ class HV(Reloadable):
     def setup_adt(self):
         if self.windows:
             self._disable_windows_usb()
-            from ..windows import N1_BYTES, N1_PROPERTY, MTP_DISABLED_PROPERTY
+            from ..windows import (N1_BYTES, N1_PROPERTY, MTP_DISABLED_PROPERTY,
+                                   CPUFREQ_PROPERTY, cpufreq_handoff_marker)
             chosen = self.adt["/chosen"]
+            opp_tables = None
+            if self.windows_cpufreq != "disabled":
+                if "/arm-io/pmgr" not in self.adt:
+                    raise ValueError("CPU frequency handoff requires the J813 PMGR node")
+                pmgr = self.adt["/arm-io/pmgr"]
+                opp_tables = [pmgr.getprop("voltage-states1-sram"),
+                              pmgr.getprop("voltage-states5-sram")]
+            marker = cpufreq_handoff_marker(self.windows_cpufreq, chosen.chip_id,
+                                           getattr(chosen, "board_id", None), self.adt.model,
+                                           opp_tables)
+            # Never inherit an ownership grant from a previous boot policy.
+            chosen._properties.pop(CPUFREQ_PROPERTY, None)
+            chosen._types.pop(CPUFREQ_PROPERTY, None)
+            if marker is not None:
+                chosen._properties[CPUFREQ_PROPERTY] = marker
+                chosen._types[CPUFREQ_PROPERTY] = (Bytes(4), False)
             if self.windows_mtp not in ("disabled", "j813-v1") or (
                     self.windows_mtp == "j813-v1" and
                     (chosen.chip_id != 0x8142 or self.adt.model != "Mac17,3")):

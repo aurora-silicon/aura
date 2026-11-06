@@ -144,8 +144,9 @@ static u64 hv_windows_flags;
 int hv_windows_configure(u64 flags)
 {
     if (hv_windows_initialized ||
+        ((hv_windows_flags & HV_WINDOWS_CPUFREQ) && !(flags & HV_WINDOWS_CPUFREQ)) ||
         flags & ~(HV_WINDOWS_GUEST_COMPAT | HV_WINDOWS_FB_SHADOW | HV_WINDOWS_SERIAL_CAPTURE |
-                  HV_WINDOWS_SERIAL_CDC | HV_WINDOWS_MTP))
+                  HV_WINDOWS_SERIAL_CDC | HV_WINDOWS_MTP | HV_WINDOWS_CPUFREQ))
         return -1;
     if ((flags & HV_WINDOWS_SERIAL_CDC) &&
         ((flags & HV_WINDOWS_SERIAL_CAPTURE) || uartproxy_iodev < IODEV_USB0 ||
@@ -153,7 +154,7 @@ int hv_windows_configure(u64 flags)
         return -1;
     if ((flags & HV_WINDOWS_GUEST_COMPAT) && chip_id != T8142)
         return -1;
-    if ((flags & HV_WINDOWS_MTP) && (chip_id != T8142 || board_id != 0x24))
+    if ((flags & (HV_WINDOWS_MTP | HV_WINDOWS_CPUFREQ)) && (chip_id != T8142 || board_id != 0x24))
         return -1;
     if ((flags & HV_WINDOWS_SERIAL_CAPTURE) && !hv_windows_serial_available())
         return -1;
@@ -179,6 +180,13 @@ bool hv_windows_serial_cdc_enabled(void)
 bool hv_windows_mtp_enabled(void)
 {
     return (hv_windows_flags & HV_WINDOWS_MTP) != 0;
+}
+
+bool hv_windows_cpufreq_owned(void)
+{
+    // Configuration cannot be changed after initialization. Keep ownership
+    // through debug pauses and terminal drain; a fresh resident releases it.
+    return (hv_windows_flags & HV_WINDOWS_CPUFREQ) != 0;
 }
 
 bool hv_windows_can_prepare_device(void)

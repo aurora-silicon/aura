@@ -178,7 +178,7 @@ def reservation_prepare_flow(case):
     blob = adt.build()
     trace, heap_queries = [], 0
     plan = SimpleNamespace(chip_id=0x8142, model="Mac17,3", framebuffer="native",
-                           guest_compatibility="none", usb="disabled", n1="disabled", serial="disabled", mtp="disabled",
+                           guest_compatibility="none", usb="disabled", n1="disabled", serial="disabled", mtp="disabled", cpufreq="disabled",
                            image=bytes(range(256)) * 32, reserved_memory=tuple(ranges))
     class Interface:
         dev = SimpleNamespace(timeout=3)

@@ -89,6 +89,7 @@ capture; the selected carrier must also support nonblocking atomic frames.
 Bit 9 advertises isolated dedicated-CDC guest serial mode, which suppresses
 guest `HVLOG: ` forwarding onto the primary proxy connection.
 Bit 10 advertises the explicitly requested J813 MTP handoff.
+Bit 11 advertises exclusive J813 CPU-frequency ownership.
 Normal builds return zero. The launcher does not treat a capability bit as
 hardware qualification.
 
@@ -96,11 +97,13 @@ hardware qualification.
 0 opts into the experimental T8142 instruction/vector rewrites and guessed SP
 repair; bit 1 requests BGRA shadow conversion; bit 2 requests framed serial
 capture; bit 3 selects isolated dedicated-CDC serial mode; bit 4 requests the
-experimental J813 MTP handoff. Bits 2 and 3 are
+experimental J813 MTP handoff; bit 5 grants J813 manual CPU-frequency
+ownership and prevents host INIT/SET requests until a fresh resident reset.
+Once granted, even pre-initialization reconfiguration cannot clear it. Bits 2 and 3 are
 mutually exclusive, and bit 3 requires a USB CDC proxy carrier. It returns 0 on acceptance and
 -1 for invalid flags, unsupported target or an invalid lifecycle state. The
 host requires capability bit 6 for these options, bit 8 for serial capture,
-bit 9 for dedicated CDC, and bits 7 and 10 for MTP.
+bit 9 for dedicated CDC, bits 7 and 10 for MTP, and bit 11 for CPU frequency.
 The C backend verifies the
 scanout format, creates the shadow and changes guest boot arguments only after
 successful setup; the host never spoofs depth. An unsuccessful requested
@@ -311,3 +314,9 @@ The same lifecycle artifact exercises the real `HardwareSession.prepare` and
 `ProxyUtils` paths with modeled I/O: declared-range collisions stop before
 target mutation, allocator drift cannot install a new heap limit, a changed
 raw layout cannot upload, and default profiles issue no heap-query opcode.
+
+`cpufreq` defaults to `disabled`. The explicit `j813-manual-v1` mode validates
+chip, board, model and both complete firmware frequency ladders, then grants
+the matching Mu `AURA8142` device access to its two controller pages. The guest
+driver supplies bounded manual requests; this does not enable automatic Windows
+processor power policy. See [the CPU-frequency handoff](windows-cpufreq-handoff.md).

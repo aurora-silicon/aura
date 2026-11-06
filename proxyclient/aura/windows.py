@@ -23,17 +23,20 @@ MEMORY_PREFLIGHT = 0x0080
 SERIAL_CAPTURE = 0x0100
 SERIAL_CDC_ISOLATED = 0x0200
 MTP_HANDOFF = 0x0400
+CPUFREQ_OWNERSHIP = 0x0800
 CONFIG_T8142_EXPERIMENTAL = 0x0001
 CONFIG_FRAMEBUFFER_SHADOW = 0x0002
 CONFIG_SERIAL_CAPTURE = 0x0004
 CONFIG_SERIAL_CDC = 0x0008
 CONFIG_MTP = 0x0010
+CONFIG_CPUFREQ = 0x0020
 MTP_DISABLED_PROPERTY = "aura,windows-mtp-disabled"
 MTP_RESERVED_BASE = 0x10020000000
 MTP_RESERVED_SIZE = 0x200000
 MAX_IMAGE = 1024 * 1024 * 1024
 N1_PROPERTY = "aura,windows-n1-v1"
 N1_BYTES = 128
+CPUFREQ_PROPERTY = "aura,windows-cpufreq-v1"
 AURA_HEAP_RESERVE = 128 * 1024 * 1024
 PROXY_HEAP_SIZE = 128 * 1024 * 1024
 N1_RESOURCES = ((0x1cb0000000, 0x200000), (0x488000000, 0x20000),
@@ -55,7 +58,7 @@ def number(value, label):
 
 
 def validate_capabilities(value, framebuffer="native", guest_compatibility="none", n1="disabled",
-                          reserved_memory=False, serial="disabled", mtp="disabled"):
+                          reserved_memory=False, serial="disabled", mtp="disabled", cpufreq="disabled"):
     require(isinstance(value, int) and value >> 32 == CAPS_MAGIC >> 32,
             "resident is not an explicit Windows Aura personality")
     require((value >> 16) & 0xffff == CAPS_ABI, "unsupported Windows Aura capability ABI")
@@ -76,6 +79,9 @@ def validate_capabilities(value, framebuffer="native", guest_compatibility="none
     if mtp != "disabled":
         require(value & MTP_HANDOFF and value & MEMORY_PREFLIGHT,
                 "resident lacks guarded Windows MTP handoff")
+    if cpufreq != "disabled":
+        require(value & CPUFREQ_OWNERSHIP and value & CONFIGURATION,
+                "resident lacks exclusive Windows CPU frequency ownership")
     return value & 0xffff
 
 
@@ -98,6 +104,7 @@ class LaunchPlan:
     boot_args: str
     serial: str = "disabled"
     mtp: str = "disabled"
+    cpufreq: str = "disabled"
 
 
 def plan_profile(filename):
@@ -109,7 +116,7 @@ def plan_profile(filename):
     require(isinstance(profile, dict), "profile must be an object")
     require(profile.get("schema") == "aura.windows.boot.v1", "unsupported Windows boot profile")
     require(set(profile) <= {"schema", "name", "target", "mu", "append", "framebuffer", "boot_args",
-                             "guest_compatibility", "usb", "n1", "reserved_memory", "serial", "mtp"},
+                             "guest_compatibility", "usb", "n1", "reserved_memory", "serial", "mtp", "cpufreq"},
             "unknown Windows profile field")
     require(isinstance(profile.get("name"), str) and 0 < len(profile["name"]) <= 80, "profile name is required")
     target = profile.get("target")
@@ -169,6 +176,10 @@ def plan_profile(filename):
     require(mtp in ("disabled", "j813-v1"), "unsupported MTP handoff profile")
     require(mtp == "disabled" or (chip == 0x8142 and model == "Mac17,3"),
             "j813-v1 MTP handoff requires chip 0x8142 and model Mac17,3")
+    cpufreq = profile.get("cpufreq", "disabled")
+    require(cpufreq in ("disabled", "j813-manual-v1"), "unsupported CPU frequency policy")
+    require(cpufreq == "disabled" or (chip == 0x8142 and model == "Mac17,3"),
+            "j813-manual-v1 CPU frequency handoff requires chip 0x8142 and model Mac17,3")
     declarations = profile.get("reserved_memory", [])
     require(isinstance(declarations, list) and len(declarations) <= 16,
             "reserved_memory must be a list of at most 16 ranges")
@@ -205,7 +216,7 @@ def plan_profile(filename):
         cursor = offset + len(content)
     return LaunchPlan(filename, profile, raw, hashlib.sha256(raw).hexdigest(), b"".join(composed),
                       tuple(images), entry, chip, model, framebuffer, compatibility, usb, n1,
-                      tuple(reserved), boot_args, serial, mtp)
+                      tuple(reserved), boot_args, serial, mtp, cpufreq)
 
 
 def _aligned(value, alignment):
@@ -280,6 +291,36 @@ def memory_reservation_preflight(plan, args, adt, high_water, resident_base,
              "reservations": reservations, "occupied": occupied, "layout": layout}
     validate_reserved_layout(guard, layout)
     return guard
+
+
+def cpufreq_handoff_marker(policy, chip, board, model, opp_tables=None):
+    """Transfer manual DVFS ownership only for the explicitly selected J813 ABI.
+
+    This is not processor power policy or a frequency measurement. The Windows
+    owner must bound changes to its validated boot-state/thermal limits.
+    """
+    require(policy in ("disabled", "j813-manual-v1"), "unsupported CPU frequency policy")
+    if policy == "disabled":
+        return None
+    require((chip, board, model) == (0x8142, 0x24, "Mac17,3"),
+            "CPU frequency ownership requires the exact J813 target")
+    # Public Linux 08fdca6772eb6a27be6291bdec0ced7a937a4cf0,
+    # t8142-j813-thermal.dtsi. ADT records are {kHz, mV}; index 0 is level 1.
+    # Preserve the P17/P18 ordering: this firmware ladder is not monotonic.
+    frequencies = (
+        (972000, 1152000, 1584000, 1992000, 2352000, 2700000, 2964000, 3048000),
+        (1308000, 1608000, 1932000, 2220000, 2508000, 2820000, 3072000,
+         3300000, 3516000, 3720000, 3876000, 4020000, 4176000, 4248000,
+         4272000, 4332000, 4428000, 4416000, 4464000),
+    )
+    require(isinstance(opp_tables, (list, tuple)) and len(opp_tables) == 2,
+            "CPU frequency handoff requires both firmware OPP tables")
+    for table, expected in zip(opp_tables, frequencies):
+        require(isinstance(table, (list, tuple)) and len(table) == 2 * len(expected)
+                and all(type(word) is int and 0 <= word <= 0xffffffff for word in table),
+                "malformed CPU frequency OPP table")
+        require(tuple(table[::2]) == expected, "firmware CPU OPP mapping differs from J813-v1")
+    return struct.pack("<I", 1)
 
 
 def validate_n1_descriptor(descriptor):
@@ -406,7 +447,7 @@ class HardwareSession:
 
     def prepare(self, plan):
         validate_capabilities(self.capabilities(), plan.framebuffer, plan.guest_compatibility, plan.n1,
-                              bool(plan.reserved_memory), plan.serial, plan.mtp)
+                              bool(plan.reserved_memory), plan.serial, plan.mtp, plan.cpufreq)
         self.validate_serial_transport(plan)
         if plan.serial == "capture":
             from .windows_serial import WindowsSerialRecorder
@@ -425,6 +466,7 @@ class HardwareSession:
         preflight.windows_usb = plan.usb
         preflight.windows_n1 = plan.n1
         preflight.windows_mtp = plan.mtp
+        preflight.windows_cpufreq = plan.cpufreq
         preflight.setup_adt()
         preflight._windows_adt_blob()
         guard = None
@@ -447,6 +489,7 @@ class HardwareSession:
         self.hv.windows_usb = plan.usb
         self.hv.windows_n1 = plan.n1
         self.hv.windows_mtp = plan.mtp
+        self.hv.windows_cpufreq = plan.cpufreq
         self.hv.windows_serial = plan.serial
         self.hv.windows_serial_recorder = self.serial_capture
         self.hv.init()
@@ -462,7 +505,8 @@ class HardwareSession:
                 "bootargs": hex(self.hv.guest_base + self.hv.bootargs_off),
                 "usb": plan.usb, "usb_removed": self.hv.windows_usb_removed,
                 "n1": self.hv.windows_n1_handoff, "memory_preflight": self.hv.windows_memory_guard,
-                "mtp": {"profile": plan.mtp, "prepared": self.hv.windows_mtp_ready}}
+                "mtp": {"profile": plan.mtp, "prepared": self.hv.windows_mtp_ready},
+                "cpufreq": {"profile": plan.cpufreq, "automatic_policy": False}}
 
     def start(self):
         return self.hv.start()
@@ -504,7 +548,7 @@ def launch_profile(filename, device, output, session_factory=HardwareSession, gu
             session = session_factory(device, log)
             caps = session.capabilities()
             validate_capabilities(caps, plan.framebuffer, plan.guest_compatibility, plan.n1,
-                                  bool(plan.reserved_memory), plan.serial, plan.mtp)
+                                  bool(plan.reserved_memory), plan.serial, plan.mtp, plan.cpufreq)
             identity = session.identity()
             require(identity["chip_id"] == plan.chip_id and identity["model"] == plan.model,
                     "target identity does not match the Windows profile")
