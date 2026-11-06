@@ -31,6 +31,46 @@ event/transfer completion and the host reader are modeled. Save source hashes,
 commands, output bytes and a receipt. Physical disconnect/reconnect and Windows
 KD transport still require hardware qualification.
 
+## Receive rearm failure model, recorded before the follow-up fix
+
+The physical CDC smoke received its close acknowledgement, reopened the port,
+and then waited for the guest to receive the next command. In the controller,
+`XFERNOTREADY` calls the bulk-OUT starter, but the starter returns when DTR is
+closed. Opening DTR only sets `ready`; it does not replay that event. The UART
+checks `can_read` before calling `read`, so an empty ring cannot reach the
+existing receive-start operation inside `read`. Polling only bulk IN therefore
+leaves an idle OUT endpoint waiting for an event which need not recur.
+The same hardware run also observed unexpected closed-window payload bytes;
+that separate timing/queue observation is not explained or qualified by this
+receive-side model.
+
+Independent review identified a second boundary before the follow-up capacity
+change: `ringbuffer_get_free()` includes the reserved empty/full slot. A bulk
+OUT transfer of `XFER_SIZE` bytes therefore requires strictly more than
+`XFER_SIZE` reported free slots. The replay must reject a start with exactly
+that count, allow it after one additional byte is drained, then complete a
+full-size transfer and verify every byte. Otherwise a maximum-size host packet
+can lose its last byte despite the endpoint having passed its admission check.
+
+The follow-up replay must consume a not-ready event while DTR is closed,
+reopen without another event, and deliver a host byte through the production
+OUT starter, ring, I/O dispatch and UART register read. Before the fix it must
+reproduce empty RX without starting a transfer. Afterward it must also prove:
+
+- Repeated polling never starts a duplicate active transfer.
+- Closed DTR, a failed controller, an unavailable TRB, a missing receive ring,
+  or insufficient receive-ring space cannot start a transfer.
+- Reading enough queued data restores receive progress without a new event.
+- Only secondary CDC OUT is primed; TX order, backpressure, discard behavior,
+  and the primary proxy remain unchanged.
+
+The new poll operation may try the existing bounded endpoint starter once; it
+must not allocate, wait for host data, consume input, or call the blocking
+reader. The fixture runs the production OUT starter and reader for both HS
+and SS compile modes, while modeling USB event delivery, DMA completion and
+endpoint command submission. Physical reopen recovery still requires rerunning
+the hardware smoke; this model does not qualify controller behavior.
+
 ## Implementation
 
 Only the Windows build selects the bounded secondary CDC callbacks. Primary
@@ -38,7 +78,9 @@ proxy CDC operations and the default backend keep their original callbacks.
 The secondary writer enqueues the entire request once or returns zero when
 there is insufficient space; it does no event processing, endpoint commands,
 or host-progress waiting. The UART status path and periodic UART polling
-service the controller and start queued transfers. These existing controller
+service the controller, start queued IN transfers, and try the secondary OUT
+starter once even when the receive ring is empty. The OUT helper preserves its
+existing active-transfer, DTR and receive-capacity guards. These controller
 operations still have their normal bounded hardware polling.
 Windows UART polling holds the secondary I/O lock and invokes the debug
 controller poll directly; it does not use the global console-flushing event
@@ -61,10 +103,12 @@ python3 tools/windows_serial_e2e.py --output build/windows-serial-replay
 
 Use a new output directory for each run. The first runner saves a source
 snapshot, dependency and compiler commands, ASan/UBSan output, executable hash,
-the exact `host-bytes.bin` stream, and `result.json`. Its sequence exercises
+the exact `host-bytes.bin` (HS) and `host-bytes-ss.bin` streams, extracted
+`production_rx.inc`, and `result.json`. Its sequence exercises
 unbound/DTR-closed discard, an attached stalled host, the reserved ring slot,
 all-or-nothing rejection, ignored-full overrun accounting, wraparound, resumed
-drain, a final byte drained only by polling, and controller failure. Capture
+drain, a final byte drained only by polling, controller failure, and receive
+rearm after a lost closed-DTR not-ready event. Capture
 receives every guest write independently. The separate serial replay covers
 the production framed encoder and atomic transport.
 

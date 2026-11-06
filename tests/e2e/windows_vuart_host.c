@@ -92,23 +92,82 @@ void hv_windows_serial_putc(u8 byte)
 }
 #include "../../src/ringbuffer.c"
 #define CDC_ACM_PIPE_1 1
+#define SZ_16K         16384
+#include "../../src/usb_cdc_bulk.h"
+#if USB_DWC3_SUPERSPEED
+#define XFER_SIZE                 CDC_BULK_CHAIN_BYTES
+#define CDC_LOOP_READY(dev, pipe) ((dev)->pipe[(pipe)].ready)
+#else
+#define XFER_SIZE                 SZ_16K
+#define CDC_LOOP_READY(dev, pipe) true
+#endif
+#define CDC_IO_TIMEOUT_MS      3000
+#define USB_LEP_CDC_BULK_OUT   4
+#define USB_LEP_CDC_BULK_OUT_2 8
+typedef int cdc_acm_pipe_id_t;
 typedef struct {
     bool failed;
     struct {
         bool ready;
-        ringbuffer_t *device2host;
-        u8 ep_in;
+        ringbuffer_t *device2host, *host2device;
+        u8 ep_in, ep_out;
     } pipe[2];
+    struct {
+        bool xfer_in_progress;
+        u8 *xfer_buffer;
+    } endpoints[16];
 } dwc3_dev_t;
-static void usb_dwc3_handle_events(dwc3_dev_t *dev)
+static unsigned out_starts, not_ready_events, received_bytes;
+static bool out_trb_available = true, pending_not_ready, pending_host_byte;
+static size_t pending_host_length = 1;
+static bool usb_dwc3_trb_available(dwc3_dev_t *dev, u8 ep)
 {
     (void)dev;
+    assert(ep == USB_LEP_CDC_BULK_OUT_2);
+    return out_trb_available;
+}
+static ringbuffer_t *usb_dwc3_cdc_get_ringbuffer(dwc3_dev_t *dev, u8 ep)
+{
+    assert(ep == USB_LEP_CDC_BULK_OUT_2);
+    return dev->pipe[1].host2device;
+}
+static int usb_dwc3_start_bulk_transfer(dwc3_dev_t *dev, u8 ep, size_t count)
+{
+    assert(ep == USB_LEP_CDC_BULK_OUT_2 && count == XFER_SIZE);
+    assert(dev->pipe[1].ready && !dev->failed);
+    assert(!dev->endpoints[ep].xfer_in_progress);
+    dev->endpoints[ep].xfer_in_progress = true;
+    ++out_starts;
+    return 0;
+}
+static void usb_dwc3_handle_events(dwc3_dev_t *dev);
+/* Whole production OUT starter, can_read and read functions, extracted by runner. */
+#include "production_rx.inc"
+static void usb_dwc3_handle_events(dwc3_dev_t *dev)
+{
     ++polls;
+    if (pending_not_ready) {
+        pending_not_ready = false;
+        ++not_ready_events;
+        /* The real XFERNOTREADY branch consumes the event and calls this. */
+        usb_dwc3_cdc_start_bulk_out_xfer(dev, USB_LEP_CDC_BULK_OUT_2);
+    }
+    if (pending_host_byte && dev->pipe[1].ready &&
+        dev->endpoints[USB_LEP_CDC_BULK_OUT_2].xfer_in_progress) {
+        /* Model one successful short OUT DMA completion, without another NRDY. */
+        const u8 command = 'R';
+        const u8 *bytes = pending_host_length == 1 ? &command : dev->endpoints[8].xfer_buffer;
+        assert(ringbuffer_write(bytes, pending_host_length, dev->pipe[1].host2device) ==
+               pending_host_length);
+        dev->endpoints[USB_LEP_CDC_BULK_OUT_2].xfer_in_progress = false;
+        pending_host_byte = false;
+        received_bytes += pending_host_length;
+    }
 }
 static void usb_dwc3_cdc_start_bulk_in_xfer(dwc3_dev_t *dev, u8 ep)
 {
     ++kicks;
-    assert(ep == 7);
+    assert(ep == 9);
     if (draining && dev->pipe[1].ready)
         host_count += ringbuffer_read(host_bytes + host_count, sizeof(host_bytes) - host_count,
                                       dev->pipe[1].device2host);
@@ -130,10 +189,13 @@ static void secondary_poll(void *dev)
 {
     usb_dwc3_vuart_poll(dev);
 }
-static ssize_t no_read(void *dev)
+static ssize_t secondary_can_read(void *dev)
 {
-    (void)dev;
-    return 0;
+    return usb_dwc3_can_read(dev, CDC_ACM_PIPE_1);
+}
+static ssize_t secondary_read(void *dev, void *buf, size_t count)
+{
+    return usb_dwc3_read(dev, CDC_ACM_PIPE_1, buf, count);
 }
 static ssize_t forbidden_write(void *dev, const void *buf, size_t size)
 {
@@ -148,8 +210,9 @@ static bool other_ready(void *dev)
     (void)dev;
     return true;
 }
-static const struct iodev_ops secondary_ops = {.can_read = no_read,
+static const struct iodev_ops secondary_ops = {.can_read = secondary_can_read,
                                                .can_write = secondary_ready,
+                                               .read = secondary_read,
                                                .write = secondary_write,
                                                .handle_events = secondary_poll};
 static const struct iodev_ops other_ops = {.can_write = other_ready, .write = forbidden_write};
@@ -195,13 +258,86 @@ static void check_ready(bool ready)
     assert(!!(read_reg(UTRSTAT) & UTRSTAT_TXBE) == ready);
     assert(!!(read_reg(UFSTAT) & UFSTAT_TXFULL) == !ready);
 }
+static bool check_receive_rearm(dwc3_dev_t *dev)
+{
+    u8 ep = dev->pipe[1].ep_out;
+    /* Model a closed pipe whose prior transfer has completed or been ended. */
+    dev->pipe[1].ready = false;
+    dev->endpoints[ep].xfer_in_progress = false;
+    unsigned starts = out_starts;
+    pending_not_ready = pending_host_byte = true;
+    usb_dwc3_vuart_poll(dev);
+    assert(not_ready_events == 1 && !pending_not_ready && out_starts == starts);
+    assert(!usb_dwc3_can_read(dev, CDC_ACM_PIPE_1));
+
+    /* No second NRDY: the host's byte can complete only after polling primes OUT. */
+    dev->pipe[1].ready = true;
+    read_reg(UTRSTAT);
+    u64 status = read_reg(UTRSTAT);
+#ifdef EXPECT_UNFIXED
+    assert(!(status & UTRSTAT_RXD) && out_starts == starts && pending_host_byte);
+    return false;
+#else
+    assert((status & UTRSTAT_RXD) && received_bytes == 1 && !pending_host_byte);
+    assert(read_reg(URXH) == 'R' && !usb_dwc3_can_read(dev, CDC_ACM_PIPE_1));
+    starts = out_starts;
+    for (int i = 0; i < 3; i++)
+        usb_dwc3_vuart_poll(dev);
+    assert(out_starts == starts); /* Already active: no duplicate command. */
+
+    dev->endpoints[ep].xfer_in_progress = false;
+    out_trb_available = false;
+    usb_dwc3_vuart_poll(dev);
+    assert(out_starts == starts);
+    out_trb_available = true;
+    ringbuffer_t *rx = dev->pipe[1].host2device;
+    dev->pipe[1].host2device = NULL;
+    usb_dwc3_vuart_poll(dev);
+    assert(out_starts == starts);
+    dev->pipe[1].host2device = rx;
+    dev->failed = true;
+    usb_dwc3_vuart_poll(dev);
+    assert(out_starts == starts);
+    dev->failed = false;
+
+    u8 fill[XFER_SIZE + 1];
+    memset(fill, 'A', sizeof(fill));
+    assert(ringbuffer_write(fill, sizeof(fill), rx) == sizeof(fill));
+    assert(ringbuffer_get_free(rx) == XFER_SIZE - 1);
+    usb_dwc3_vuart_poll(dev);
+    assert(out_starts == starts); /* RX queue cannot hold a complete transfer. */
+    assert(read_reg(URXH) == 'A');
+    assert(out_starts == starts); /* Exactly XFER_SIZE free includes the reserved slot. */
+    assert(read_reg(URXH) == 'A');
+    assert(out_starts == starts + 1); /* XFER_SIZE usable slots now exist. */
+    for (size_t i = 0; i < XFER_SIZE; ++i)
+        dev->endpoints[ep].xfer_buffer[i] = (u8)i;
+    pending_host_length = XFER_SIZE;
+    pending_host_byte = true;
+    usb_dwc3_vuart_poll(dev); /* Complete every byte of a maximum-size OUT transfer. */
+    assert(usb_dwc3_can_read(dev, CDC_ACM_PIPE_1) == 2 * XFER_SIZE - 1);
+    u8 received[2 * XFER_SIZE - 1];
+    assert(usb_dwc3_read(dev, CDC_ACM_PIPE_1, received, sizeof(received)) == sizeof(received));
+    for (size_t i = 0; i < XFER_SIZE - 1; ++i)
+        assert(received[i] == 'A');
+    for (size_t i = 0; i < XFER_SIZE; ++i)
+        assert(received[XFER_SIZE - 1 + i] == (u8)i);
+    assert(not_ready_events == 1); /* All progress after reopen was independent of NRDY. */
+    return true;
+#endif
+}
 int main(int argc, char **argv)
 {
     assert(argc == 2);
     dwc3_dev_t dev = {0};
-    dev.pipe[1].ep_in = 7;
+    dev.pipe[1].ep_in = 9;
+    dev.pipe[1].ep_out = USB_LEP_CDC_BULK_OUT_2;
+    u8 rx_dma[XFER_SIZE];
+    dev.endpoints[USB_LEP_CDC_BULK_OUT_2].xfer_buffer = rx_dma;
     dev.pipe[1].device2host = ringbuffer_alloc(8); /* Seven usable slots. */
     assert(dev.pipe[1].device2host);
+    dev.pipe[1].host2device = ringbuffer_alloc(2 * XFER_SIZE);
+    assert(dev.pipe[1].host2device);
     /* Debug polling must not flush another console's blocking backlog. */
     iodev_uart.usage = USAGE_CONSOLE;
     con_buf[0] = 'B';
@@ -251,6 +387,7 @@ int main(int argc, char **argv)
     draining = true;
     usb_dwc3_vuart_poll(&dev);
     assert(host_count == 15 && host_bytes[14] == 'z');
+    bool rx_rearmed = check_receive_rearm(&dev);
     dev.failed = true;
     check_ready(true);
     put_byte('F');
@@ -261,7 +398,10 @@ int main(int argc, char **argv)
     assert(fwrite(host_bytes, 1, host_count, f) == host_count);
     fclose(f);
     ringbuffer_free(dev.pipe[1].device2host);
-    printf("{\"passed\":true,\"host_bytes\":%zu,\"capture_bytes\":%zu,\"overruns\":%llu,\"polls\":%"
-           "u}\n",
-           host_count, capture_count, (unsigned long long)vuart_tx_overruns, polls);
+    ringbuffer_free(dev.pipe[1].host2device);
+    printf(
+        "{\"passed\":true,\"host_bytes\":%zu,\"capture_bytes\":%zu,\"overruns\":%llu,\"polls\":%u,"
+        "\"rx_rearmed\":%s,\"rx_starts\":%u,\"received_bytes\":%u,\"not_ready_events\":%u}\n",
+        host_count, capture_count, (unsigned long long)vuart_tx_overruns, polls,
+        rx_rearmed ? "true" : "false", out_starts, received_bytes, not_ready_events);
 }

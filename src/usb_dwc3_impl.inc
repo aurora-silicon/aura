@@ -1246,7 +1246,8 @@ static void usb_dwc3_cdc_start_bulk_out_xfer(dwc3_dev_t *dev, u8 endpoint_number
     if (!host2device)
         return;
 
-    if (ringbuffer_get_free(host2device) < XFER_SIZE)
+    /* get_free includes the slot reserved to distinguish empty from full. */
+    if (ringbuffer_get_free(host2device) <= XFER_SIZE)
         return;
 
 #if !USB_DWC3_SUPERSPEED

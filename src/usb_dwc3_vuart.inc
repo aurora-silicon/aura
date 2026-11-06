@@ -26,6 +26,10 @@ void usb_dwc3_vuart_poll(dwc3_dev_t *dev)
     if (!dev)
         return;
     usb_dwc3_handle_events(dev);
-    if (usb_dwc3_vuart_capacity(dev) >= 0)
+    if (usb_dwc3_vuart_capacity(dev) >= 0) {
         usb_dwc3_cdc_start_bulk_in_xfer(dev, dev->pipe[CDC_ACM_PIPE_1].ep_in);
+        /* A not-ready event consumed while DTR was closed need not recur.
+         * An empty UART RX ring cannot reach the normal read-side rearm. */
+        usb_dwc3_cdc_start_bulk_out_xfer(dev, dev->pipe[CDC_ACM_PIPE_1].ep_out);
+    }
 }
