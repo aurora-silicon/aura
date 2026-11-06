@@ -479,3 +479,9 @@ def test_no_option_turns_it_off():
         for gone in ["aura-ctxr-exec", "aura_ctxr_exec", "ctxr_exec_override", "chosen.aura,ctxr-exec",
                      "ctxr-exec-enforce"]:
             assert gone not in text, (name, gone)
+
+
+def test_a_confined_kernel_keeps_spin_table():
+    source = kboot_source()
+    assert "psci" not in source.lower()
+    assert "smp_get_release_addr(idx)" in function(source, "dt_set_cpus")

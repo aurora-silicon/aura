@@ -288,7 +288,6 @@ int chainload_image(void *image, size_t size, char **vars, size_t var_cnt)
     next_stage.args[3] = copy_size;
     next_stage.args[4] = new_base + CHAINLOAD_ENTRY_OFFSET;
     next_stage.restore_logo = false;
-    next_stage.monitor = false;
     return 0;
 }
 

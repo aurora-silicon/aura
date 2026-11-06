@@ -39,11 +39,10 @@ typedef uint64_t u64; typedef uint32_t u32;
 #define bail(...) do { printf(__VA_ARGS__); return -1; } while (0)
 ''' + table + r'''
 static struct spin_table spin_table[MAX_CPUS];
-static struct { void *entry; u64 args[5]; bool restore_logo; bool monitor; } next_stage;
+static struct { void *entry; u64 args[5]; bool restore_logo; } next_stage;
 static void *dt = (void *)0x1000;
 static int dt_bufsize = 0x10000;
 static int chip_id, mode, hardware_calls;
-static bool monitor_resident(void) { return chip_id == T8140; }
 static int kboot_move_to_exec_window(void **kernel) { return 0; }
 static bool ctxr_exec_os_may_start(void) { return true; }
 static jmp_buf refused;
@@ -114,7 +113,6 @@ int main(void)
             if (!mode) {
                 assert(!result && next_stage.entry == (void *)0xface);
                 assert(next_stage.args[0] == (u64)dt && !smp_has_pending_calls());
-                assert(next_stage.monitor == monitor_resident());
             } else {
                 assert(result == -1 && !next_stage.entry && smp_has_pending_calls());
                 assert(hardware_calls == (mode != 1));

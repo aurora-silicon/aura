@@ -103,6 +103,7 @@ def test_reports_the_fault():
 
 
 def test_callers_use_the_probe():
-    assert "monitor_resident()" in (REPO / "src/kboot.c").read_text()
-    source = (REPO / "src/monitor.c").read_text()
-    assert "return ctxr_exec_confined() && !ctxr_exec_window(NULL, NULL);" in source
+    source = (REPO / "src/ctxr_exec.c").read_text()
+    assert "if (!ctxr_exec_confined() || ctxr_exec_problem())" in source
+    assert "if (!ctxr_exec_confined() || !ctxr_exec_problem())" in source
+    assert "if (ctxr_exec_confined()) {" in (REPO / "src/kboot.c").read_text()

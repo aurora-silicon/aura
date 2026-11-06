@@ -131,7 +131,6 @@ static struct {
     void *entry;
     u64 args[5];
     bool restore_logo;
-    bool monitor;
 } next_stage;
 
 #define _chainload_stub_start stub_code
@@ -235,7 +234,6 @@ static void setup(int chip, u64 heap_used)
     chip_id = chip;
     memset(&cur_boot_args, 0, sizeof(cur_boot_args));
     memset(&next_stage, 0, sizeof(next_stage));
-    next_stage.monitor = true;
     cur_boot_args.revision = 3;
     cur_boot_args.phys_base = ram;
     cur_boot_args.mem_size = RAM_SIZE;
@@ -314,7 +312,6 @@ static void check_staging(const u8 *image, size_t size, u64 fw_base)
     struct boot_args *ba = (struct boot_args *)staged_view(next_stage.args[0]);
 
     assert(next_stage.entry == (void *)(staged + copy));
-    assert(!next_stage.monitor);
     assert(!memcmp(next_stage.entry, stub_code, STUB_SIZE));
     assert(next_stage.args[4] == dest + CHAINLOAD_ENTRY_OFFSET);
     assert(dest % SZ_16K == 0 && staged % SZ_16K == 0);

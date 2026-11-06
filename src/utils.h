@@ -484,7 +484,6 @@ struct vector_args {
     generic_func *entry;
     u64 args[5];
     bool restore_logo;
-    bool monitor;
 };
 
 extern u32 board_id, chip_id;

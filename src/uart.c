@@ -5,7 +5,6 @@
 #include "adt.h"
 #include "boot_options.h"
 #include "iodev.h"
-#include "monitor.h"
 #include "types.h"
 #include "uart.h"
 #include "uart_regs.h"
@@ -43,8 +42,7 @@ int uart_init(void)
 
 void uart_putbyte(u8 c)
 {
-    /* The OS owns the UART once the monitor runs it (see iodev_console_write). */
-    if (!uart_base || monitor_active)
+    if (!uart_base)
         return;
 
     while (!(read32(uart_base + UTRSTAT) & UTRSTAT_TXBE))
