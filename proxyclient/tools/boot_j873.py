@@ -75,6 +75,11 @@ class Session:
             self.base = self.p.get_base()
             self.raw, self.symbols = raw, symbols
             require(self.read(self.base, 0x4000) == raw[:0x4000], "running image identity mismatch")
+            version_offset = symbols["version_tag"]
+            version_end = raw.index(b"\0", version_offset, version_offset + 256) + 1
+            version = raw[version_offset:version_end]
+            require(self.read(self.base + version_offset, len(version)) == version,
+                    "running Aura build tag differs from the selected image")
             chip, model, target_type = {"j873": (0x8152, "Mac18,5", "J873g"),
                                         "j813": (0x8142, "Mac17,3", "J813")}[target]
             require(self.p.get_chipid() == chip and
