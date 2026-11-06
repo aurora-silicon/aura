@@ -23,6 +23,41 @@ static const u32 probe_insns[] = {
 };
 
 /*
+ * Nothing answered, so the question stays open for a later call. Say so once, and
+ * what CTXR_D reads, since an OS started now runs outside any window on this CPU.
+ */
+static bool unprobed_warned;
+
+static void ctxr_exec_warn_unprobed(const char *why)
+{
+    if (unprobed_warned)
+        return;
+    unprobed_warned = true;
+
+    u64 lower = 0, upper = 0;
+
+    /* Only EL2 can see them. Not every chip has them, and reading one there faults. */
+    if (in_el2()) {
+        int exc_before = exc_count;
+
+        exc_guard = GUARD_MARK | GUARD_SILENT;
+        lower = mrs(SYS_IMP_APL_CTXR_D_LWR_EL1);
+        upper = mrs(SYS_IMP_APL_CTXR_D_UPR_EL1);
+        exc_guard = GUARD_OFF;
+        if (exc_count != exc_before)
+            lower = upper = 0;
+    }
+
+    if (lower && upper > lower)
+        printf("CTXR exec: WARNING: %s, but CTXR_D is armed at [0x%lx, 0x%lx): the OS will run "
+               "outside it, on this CPU only\n",
+               why, lower, upper + SZ_4K);
+    else
+        printf("CTXR exec: %s and CTXR_D is not armed: treating the machine as not confined\n",
+               why);
+}
+
+/*
  * Ask a secondary to run code outside the boot object. This is the whole test:
  * it is not limited to the chips where the confinement was first seen (T8140,
  * then T8142), because any Mac whose iBoot entered a kcbz-0 boot object may
@@ -35,18 +70,21 @@ bool ctxr_exec_confined(void)
 
     if (confined >= 0)
         return confined;
-    confined = 0;
 
     int cpu;
     for (cpu = 0; cpu < MAX_CPUS; cpu++)
         if (cpu != boot_cpu_idx && smp_is_alive(cpu))
             break;
-    if (cpu == MAX_CPUS)
+    if (cpu == MAX_CPUS) {
+        ctxr_exec_warn_unprobed("no secondary is running to probe");
         return false;
+    }
 
     u32 *probe = memalign(SZ_16K, SZ_16K);
-    if (!probe)
+    if (!probe) {
+        ctxr_exec_warn_unprobed("no memory to probe a secondary");
         return false;
+    }
     memcpy(probe, probe_insns, sizeof(probe_insns));
     dc_cvau_range(probe, sizeof(probe_insns));
     ic_ivau_range(probe, sizeof(probe_insns));
@@ -71,6 +109,8 @@ bool ctxr_exec_confined(void)
         printf("CTXR exec: CPU %d did not run the probe (%d); treating the secondaries as "
                "not confined\n",
                cpu, err);
+        /* Asking again could wait out the same timeout and lose another page. */
+        confined = 0;
         return false;
     }
     free(probe);
