@@ -108,6 +108,12 @@ expect() { # expect <scenario>: the amp lines that scenario must give (tree orde
         amp 40 - - - -
         amp 42 - - - -
         amp 41 $STALE_BOP $STALE_DCB $STALE_ROW $STALE_ZD ;;
+    tas-group)
+        amp 51 - - 06032224 -
+        amp 54 - - 08042628 - ;;
+    tas-no-speaker-config)
+        amp 51 - - - -
+        amp 54 - - - - ;;
     *) fail "no expected result for $1" ;;
     esac
 }

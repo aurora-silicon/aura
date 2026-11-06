@@ -2,27 +2,26 @@
 /*
  * Speaker amp configuration from the ADT.
  *
- * The ADT describes a group of SN012776 speaker amps with one node: the group's first amp,
- * compatible "audio-control,sn012776", which carries the group's configuration, and whose
- * speakerN properties are the phandles of the group's other amps. macOS sets up every amp of
- * the group from that configuration. The parts of it that the kernel's amp driver programs go
- * to every amp of the group in the DT, byte for byte, so that no Linux tree has to carry a
- * copy:
+ * The ADT describes a group of speaker amps with one node: the group's first amp, which carries
+ * the group's configuration, and whose speakerN properties are the phandles of the group's other
+ * amps. The parts of it that the kernel's amp drivers consume go to every amp of the group in the
+ * DT, byte for byte, so that no Linux tree has to carry a copy.
  *
  *   bop-config            -> apple,bop-config            (the brownout prevention block)
  *   amp-dcblocker-config  -> apple,amp-dcblocker-config  (the DC blocker setting)
  *
- * Two of the group's properties have one row per amp, in the group's order (the first amp, then
+ * Two SN012776 group properties have one row per amp, in the group's order (the first amp, then
  * speaker1, speaker2, ...); each amp gets its own row:
  *
  *   speaker-config        -> apple,speaker-config        (4 bytes: operating level and slots)
  *   amp-tx-zd-config      -> apple,amp-tx-zd-config      (8 bytes: sense output idle slots)
  *
- * A property the group does not have (or one without a row for every amp) is
- * removed from its amps, so the kernel never sees a value that did not come from this Mac. Amps
- * are matched to the DT's ti,sn012776 nodes by I2C address, which must name exactly one node. A
- * group with an amp that cannot be matched is left as it is: the kernel gets either the whole
- * group's configuration or none of it. Nothing here stops the boot.
+ * TAS5770L groups use the same four-byte speaker-config rows. A property the group does not have
+ * (or one without a row for every amp) is removed from its amps, so the kernel never sees a value
+ * that did not come from this Mac. Amps are matched to the corresponding DT compatible by I2C
+ * address, which must name exactly one node. A group with an amp that cannot be matched is left as
+ * it is: the kernel gets either the whole group's configuration or none of it. Nothing here stops
+ * the boot.
  */
 
 #include "kboot_audio.h"
@@ -32,25 +31,35 @@
 
 #include "libfdt/libfdt.h"
 
-#define AMP_ADT_COMPAT "audio-control,sn012776"
-#define AMP_DT_COMPAT  "ti,sn012776"
 #define MAX_GROUP_AMPS 16
 
-static const struct {
-    const char *adt;
-    const char *dt;
-} amp_group_props[] = {
-    {"bop-config", "apple,bop-config"},
-    {"amp-dcblocker-config", "apple,amp-dcblocker-config"},
-};
-
-static const struct {
+struct amp_prop {
     const char *adt;
     const char *dt;
     u32 row;
-} amp_row_props[] = {
+};
+
+struct amp_family {
+    const char *adt_compat;
+    const char *dt_compat;
+    const struct amp_prop *props;
+    size_t nr_props;
+};
+
+static const struct amp_prop sn012776_props[] = {
+    {"bop-config", "apple,bop-config", 0},
+    {"amp-dcblocker-config", "apple,amp-dcblocker-config", 0},
     {"speaker-config", "apple,speaker-config", 4},
     {"amp-tx-zd-config", "apple,amp-tx-zd-config", 8},
+};
+
+static const struct amp_prop tas5770_props[] = {
+    {"speaker-config", "apple,speaker-config", 4},
+};
+
+static const struct amp_family amp_families[] = {
+    {"audio-control,sn012776", "ti,sn012776", sn012776_props, ARRAY_SIZE(sn012776_props)},
+    {"audio-control,tas5770", "ti,tas5770l", tas5770_props, ARRAY_SIZE(tas5770_props)},
 };
 
 /* The I2C address of an ADT amp node: the first word of its reg */
@@ -86,15 +95,15 @@ static int adt_amp_by_phandle(const void *adt, int arm_io, u32 phandle)
 }
 
 /*
- * The DT's ti,sn012776 node at I2C address @addr. Returns its offset, -1 if there is none and
- * -2 if more than one node has that address.
+ * The DT's @compat node at I2C address @addr. Returns its offset, -1 if there is none and -2 if
+ * more than one node has that address.
  */
-static int dt_amp_by_addr(const void *dt, u32 addr)
+static int dt_amp_by_addr(const void *dt, const char *compat, u32 addr)
 {
     int found = -1;
 
-    for (int node = fdt_node_offset_by_compatible(dt, -1, AMP_DT_COMPAT); node >= 0;
-         node = fdt_node_offset_by_compatible(dt, node, AMP_DT_COMPAT)) {
+    for (int node = fdt_node_offset_by_compatible(dt, -1, compat); node >= 0;
+         node = fdt_node_offset_by_compatible(dt, node, compat)) {
         int len;
         const fdt32_t *reg = fdt_getprop(dt, node, "reg", &len);
 
@@ -108,10 +117,11 @@ static int dt_amp_by_addr(const void *dt, u32 addr)
 }
 
 /* Set @name on the DT amp at @addr to @val (remove it when @val is NULL) */
-static int dt_amp_setprop(void *dt, u32 addr, const char *name, const void *val, u32 len)
+static int dt_amp_setprop(void *dt, const char *compat, u32 addr, const char *name,
+                          const void *val, u32 len)
 {
     /* Offsets move with every change to the tree: look the amp up each time */
-    int node = dt_amp_by_addr(dt, addr);
+    int node = dt_amp_by_addr(dt, compat, addr);
     int ret;
 
     if (node < 0)
@@ -127,7 +137,8 @@ static int dt_amp_setprop(void *dt, u32 addr, const char *name, const void *val,
     return 0;
 }
 
-static int setup_amp_group(void *dt, const void *adt, int arm_io, int group)
+static int setup_amp_group(void *dt, const void *adt, int arm_io, int group,
+                           const struct amp_family *family)
 {
     const char *name = adt_get_name(adt, group);
     u32 addrs[MAX_GROUP_AMPS];
@@ -159,7 +170,7 @@ static int setup_amp_group(void *dt, const void *adt, int arm_io, int group)
     }
 
     for (int i = 0; i < n; i++) {
-        int node = dt_amp_by_addr(dt, addrs[i]);
+        int node = dt_amp_by_addr(dt, family->dt_compat, addrs[i]);
 
         for (int j = 0; j < i; j++) {
             if (addrs[j] == addrs[i]) {
@@ -174,30 +185,22 @@ static int setup_amp_group(void *dt, const void *adt, int arm_io, int group)
         }
     }
 
-    for (size_t p = 0; p < ARRAY_SIZE(amp_group_props); p++) {
+    for (size_t p = 0; p < family->nr_props; p++) {
         u32 len = 0;
-        const void *val = adt_getprop(adt, group, amp_group_props[p].adt, &len);
+        u32 row = family->props[p].row;
+        const u8 *val = adt_getprop(adt, group, family->props[p].adt, &len);
 
-        for (int i = 0; i < n; i++) {
-            if (dt_amp_setprop(dt, addrs[i], amp_group_props[p].dt, val, len))
-                return -1;
-        }
-    }
-
-    /* One row per amp, in the group's order */
-    for (size_t p = 0; p < ARRAY_SIZE(amp_row_props); p++) {
-        u32 len = 0;
-        u32 row = amp_row_props[p].row;
-        const u8 *rows = adt_getprop(adt, group, amp_row_props[p].adt, &len);
-
-        if (rows && len < (u32)n * row) {
+        if (row && val && len != (u32)n * row) {
             printf("kboot: audio: %s: %s has %u bytes for %d amps, not passed on\n", name,
-                   amp_row_props[p].adt, len, n);
-            rows = NULL;
+                   family->props[p].adt, len, n);
+            val = NULL;
         }
         for (int i = 0; i < n; i++) {
-            if (dt_amp_setprop(dt, addrs[i], amp_row_props[p].dt, rows ? rows + i * row : NULL,
-                               row))
+            const void *amp_val = val && row ? val + i * row : val;
+            u32 amp_len = row ? row : len;
+
+            if (dt_amp_setprop(dt, family->dt_compat, addrs[i], family->props[p].dt,
+                               amp_val, amp_len))
                 return -1;
         }
     }
@@ -220,16 +223,19 @@ int kboot_audio_amp_config(void *dt, const void *adt)
 
         ADT_FOREACH_CHILD(adt, dev)
         {
-            if (!adt_is_compatible(adt, dev, AMP_ADT_COMPAT))
-                continue;
-            /* Only a group's first amp has speakerN or the group's configuration */
-            if (!adt_getprop(adt, dev, "speaker1", NULL) &&
-                !adt_getprop(adt, dev, "bop-config", NULL) &&
-                !adt_getprop(adt, dev, "amp-dcblocker-config", NULL) &&
-                !adt_getprop(adt, dev, "speaker-config", NULL) &&
-                !adt_getprop(adt, dev, "amp-tx-zd-config", NULL))
-                continue;
-            setup_amp_group(dt, adt, arm_io, dev);
+            for (size_t i = 0; i < ARRAY_SIZE(amp_families); i++) {
+                const struct amp_family *family = &amp_families[i];
+                bool configured = adt_getprop(adt, dev, "speaker1", NULL);
+
+                if (!adt_is_compatible(adt, dev, family->adt_compat))
+                    continue;
+                /* Only a group's first amp has speakerN or group configuration */
+                for (size_t p = 0; !configured && p < family->nr_props; p++)
+                    configured = adt_getprop(adt, dev, family->props[p].adt, NULL);
+                if (configured)
+                    setup_amp_group(dt, adt, arm_io, dev, family);
+                break;
+            }
         }
     }
     return 0;
