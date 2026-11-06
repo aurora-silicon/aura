@@ -5828,6 +5828,16 @@ static int dt_reserve_m5_display_segments(void)
             start - (1ULL << 40) >= (1ULL << 36) || size > (1ULL << 36) - (start - (1ULL << 40)) ||
             total > 128 * SZ_1M)
             bail_cleanup("ADT: unsupported M5 display firmware segment\n");
+        /*
+         * Some boots list the 0xa segment (__OS_LOG) at its physical address,
+         * not remapped, and leave it out of the DCP's DART: the DCP cannot
+         * reach it then, so there is no live mapping to preserve.
+         */
+        if (segments[i].remap == segments[i].phys && !dart_translate_silent(dart, start)) {
+            printf("FDT: M5 display segment %u at 0x%lx (0x%x bytes) is not mapped, skipped\n", i,
+                   start, segments[i].size);
+            continue;
+        }
         for (u64 offset = 0; offset < size;) {
             u64 iova = start + offset;
             u64 phys = (u64)dart_translate(dart, iova);
