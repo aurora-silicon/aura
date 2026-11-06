@@ -36,21 +36,25 @@ def serial(adt):
     return value.rstrip(b'\0').decode('ascii') if isinstance(value, bytes) else value
 
 
-def topology(adt):
-    require(adt['/chosen'].chip_id == 0x8152 and adt['/chosen'].board_id == 0x24,
+def topology(adt, target='j873'):
+    chip, model, target_type, pmu_type = {
+        'j873': (0x8152, 'Mac18,5', 'J873g', 'pmu,woodcote'),
+        'j813': (0x8142, 'Mac17,3', 'J813', 'pmu,abbey'),
+    }[target]
+    require(adt['/chosen'].chip_id == chip and adt['/chosen'].board_id == 0x24,
             'Wrong chip/board')
-    require(adt.target_type == 'J873g' and adt.model == 'Mac18,5', 'Wrong target/model')
+    require(adt.target_type == target_type and adt.model == model, 'Wrong target/model')
     path, bus = PMU.find_primary_pmu(adt)
     require(path == '/arm-io/nub-spmi0/pmu-main' and bus == 'spmi', 'Unexpected primary PMU')
     pmu = adt[path]
     controller = adt[path.rpartition('/')[0]]
     require(controller.gen == 4 and controller.compatible == ['aapl,spmi'], 'Wrong SPMI generation')
-    require(pmu.compatible == ['pmu,spmi', 'pmu,woodcote'] and pmu.is_primary == 1,
+    require(pmu.compatible == ['pmu,spmi', pmu_type] and pmu.is_primary == 1,
             'Wrong PMU compatibility/ownership')
     require(isinstance(pmu.reg, bytes) and len(pmu.reg) == 24, 'Unexpected PMU reg representation')
     require(pmu.reg[0] == 14 and int.from_bytes(pmu.reg[:4], 'little') == 14, 'Unexpected PMU slave')
     require(pmu.info_leg__scrpad[0] == 0xf800, 'Unexpected scratchpad base')
-    return dict(chip_id='0x8152', board_id='0x24', target=adt.target_type, model=adt.model,
+    return dict(chip_id=hex(chip), board_id='0x24', target=adt.target_type, model=adt.model,
                 serial_sha256=hashlib.sha256(serial(adt).encode()).hexdigest(),
                 controller_path=controller._path, generation=controller.gen,
                 controller_ranges=[list(controller.get_reg(i)) for i in range(len(controller.reg))],
@@ -117,16 +121,16 @@ def durable(path, value):
         os.close(descriptor)
 
 
-def main():
+def main(target='j873'):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--device', required=True)
-    parser.add_argument('--serial', required=True, help='Expected physical J873 serial number')
+    parser.add_argument('--serial', required=True, help='Expected physical target serial number')
     parser.add_argument('--output', type=Path, required=True, help='New receipt directory')
     args = parser.parse_args()
     require(__debug__ and not os.environ.get('PYTHONOPTIMIZE'), 'Run Python without -O')
     require(args.serial.isalnum(), 'Invalid serial number')
     device = args.device
-    lock = Path('/tmp/aura-j873-' + args.serial + '.lock').open('a+')
+    lock = Path('/tmp/aura-' + target + '-' + args.serial + '.lock').open('a+')
     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     receipt = dict(passed=False, offline_only=False, pmu_write_attempted=False,
                    phase='ownership', device=device,
@@ -160,7 +164,7 @@ def main():
                         for n in range(0, bootargs.devtree_size, 16384))
         adt = load_adt(data)
         require(serial(adt) == args.serial, 'Wrong physical target')
-        receipt['target'] = topology(adt)
+        receipt['target'] = topology(adt, target)
         receipt['live_adt_sha256'] = hashlib.sha256(data).hexdigest()
         receipt['aura_base'] = hex(proxy.get_base())
         receipt['iodev'] = proxy.iodev_whoami()
@@ -198,7 +202,7 @@ def main():
         if iface is not None:
             iface.dev.close()
         durable(args.output / 'receipt.json', receipt)
-    print('J873_PMU_GUARD_PASS' if receipt['passed'] else 'J873_PMU_GUARD_FAILED',
+    print(target.upper() + ('_PMU_GUARD_PASS' if receipt['passed'] else '_PMU_GUARD_FAILED'),
           json.dumps({k: receipt.get(k) for k in ('phase', 'before_raw', 'after_raw', 'pmu_write_attempted', 'error')}),
           flush=True)
     return 0 if receipt['passed'] else 1

@@ -1035,7 +1035,11 @@ static void usb_dwc3_ep0_handle_class(dwc3_dev_t *dev, const union usb_setup_pac
             } else {
                 usb_debug_printf("ACM device closed\n");
             }
-            if (usb_dwc3_start_status_phase(dev, USB_LEP_CTRL_IN)) {
+            if (chip_id == T8152) {
+                /* Wait for XferNotReady before the no-data status TRB on T8152,
+                 * for both DTR-open and DTR-close requests. */
+                dev->ep0_state = USB_DWC3_EP0_STATE_DATA_SEND_STATUS;
+            } else if (usb_dwc3_start_status_phase(dev, USB_LEP_CTRL_IN)) {
                 dev->pipe[pipe].ready = false;
 #if USB_DWC3_SUPERSPEED
                 dev->primary_dtr_pending = false;
