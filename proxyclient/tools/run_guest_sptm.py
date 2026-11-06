@@ -16,8 +16,15 @@ Environment (all optional; 1 enables a switch):
                            <build>__MacOS/Firmware)
   AURA_XNU_SERIAL=<node>   XNU's console device under /arm-io, e.g. uart0 (aura's vuart)
   AURA_HIDE_DOCKCHANNEL    hide the DockChannel that carries aura's console and proxy
+  AURA_KEEP_ERRH           keep the platform error handler visible to XNU
+  AURA_AMCC_CLEAR          clear the AMCC error latches stage 1 left, before entry
   AURA_S2R_TRACE           sleep path: hooks on the power blocks and the trace ring
+  AURA_S2R_GO              let the sleep proceed (otherwise stop in the proxy before it)
+  AURA_S2R_FULLTRACE       also hook the high-volume blocks
   AURA_S2R_COPROC          also hook the coprocessor and exclave mailboxes
+  AURA_S2R_DROP_USB        tear down aura's USB gadget at the sleep commit
+  AURA_S2R_QUIESCE=<mask>  AMCC error-enable writes at the commit: 8 DSID_AGE_OUT,
+                           16 UNEXP_RT_HIT_DIR
   AURA_XNU_BT              sample XNU backtraces every few seconds per core
   AURA_TAIL_SECS, AURA_TAIL_IDLE   keep reading the console after entry, until idle
   XNU_BOOTARGS             XNU's command line
@@ -48,7 +55,10 @@ DEFAULT_BOOTARGS = ("serial=3 disable-uart-irq=1 -v -nobsdmgroot wdt=-1 sprr_tpr
 # Configuration flags, sptm_virt.h SPTM_VIRT_*
 CONFIG_FLAGS = {
     "AURA_S2R_TRACE": 1 << 0,
+    "AURA_S2R_GO": 1 << 1,
+    "AURA_S2R_FULLTRACE": 1 << 2,
     "AURA_S2R_COPROC": 1 << 3,
+    "AURA_S2R_DROP_USB": 1 << 4,
     "AURA_XNU_BT": 1 << 5,
 }
 KNOWN_ENV = {
@@ -56,6 +66,9 @@ KNOWN_ENV = {
     "AURA_EXCLAVE_FW",
     "AURA_XNU_SERIAL",
     "AURA_HIDE_DOCKCHANNEL",
+    "AURA_KEEP_ERRH",
+    "AURA_AMCC_CLEAR",
+    "AURA_S2R_QUIESCE",
     "AURA_TAIL_SECS",
     "AURA_TAIL_IDLE",
 } | set(CONFIG_FLAGS)
@@ -69,7 +82,8 @@ KIS_PORT_NODES = (
     "/arm-io/i2c2/usb-repeater-i2c", "/arm-io/i2c2/usb-hub-i2c",
 )
 # Nothing drives the ANE yet, and the platform error handler panics on an AMCC DSID timeout.
-STRIP_NODES = ("/arm-io/ane", "/arm-io/dart-ane", "/arm-io/error-handler")
+STRIP_NODES = ("/arm-io/ane", "/arm-io/dart-ane")
+ERROR_HANDLER = "/arm-io/error-handler"
 # Without cL4 the exclaves stay NOT_SUPPORTED, so their nodes and the RTBuddy routes that resolve
 # through them would wait forever in IOKit. With cL4 they must stay: hidden, DCP never completes
 # its sleep power state.
@@ -108,6 +122,10 @@ SPTM_PATCHES = (
     ("AMCC CTRR match", 0x391ac, 0xffffffff, 0x54004a01, NOP),
     ("AMCC CTRR match", 0x391b8, 0xffffffff, 0x540049a2, NOP),
 )
+
+# AMCC error status words: four planes, seven words each.
+AMCC_STATUS = 0x220025004
+AMCC_PLANE_STRIDE = 0x40000
 
 
 def env_on(name):
@@ -251,9 +269,27 @@ def patch_sptm(p, sym, entry):
         print(f"{what}: [0x{pa:x}] 0x{before:08x} -> 0x{p.read32(pa):08x}")
 
 
+def report_amcc(p, clear):
+    """The AMCC error latches stage 1 left: XNU's error handler panics on them at its start."""
+    for plane in range(4):
+        for i in range(7):
+            addr = AMCC_STATUS + plane * AMCC_PLANE_STRIDE + i * 8
+            v = p.read32(addr)
+            if v:
+                print("AMCC plane %d INTSTS%d 0x%x = 0x%08x" % (plane, i, addr, v))
+                if clear:
+                    p.write32(addr, v)
+                    print("  cleared, now 0x%08x" % p.read32(addr))
+
+
 def configure(p, sym):
     flags = sum(bit for name, bit in CONFIG_FLAGS.items() if env_on(name))
     p.call(sym["sptm_virt_config"], flags)
+    if os.environ.get("AURA_S2R_QUIESCE"):
+        p.write32(sym["sptm_virt_s2r_quiesce"], env_int("AURA_S2R_QUIESCE"))
+        print("AMCC quiesce writes at the commit:", os.environ["AURA_S2R_QUIESCE"])
+    if env_on("AURA_KEEP_ERRH") or env_on("AURA_AMCC_CLEAR"):
+        report_amcc(p, env_on("AURA_AMCC_CLEAR"))
 
 
 def tail_console(iface, secs, idle):
@@ -346,6 +382,8 @@ def main():
 
     keep_exclaves = env_on("AURA_KEEP_EXCLAVES")
     hide = KIS_PORT_NODES + STRIP_NODES
+    if not env_on("AURA_KEEP_ERRH"):
+        hide += (ERROR_HANDLER,)
     if env_on("AURA_HIDE_DOCKCHANNEL"):
         hide += ("/arm-io/dockchannel-uart",)
     if not keep_exclaves:

@@ -396,6 +396,8 @@ void sptm_virt_cpu_reset(void)
             sysop("wfe");
     }
     msr(TPIDR_EL2, cpu);
+    if (sptm_virt_flags & SPTM_VIRT_S2R)
+        sptm_virt_s2r_wake(cpu);
 
     /* Everything so far went straight to DRAM: drop stale lines an earlier life of this core
      * left in the cluster cache before the caches come back on. */

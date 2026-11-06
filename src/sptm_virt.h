@@ -41,9 +41,12 @@ struct sptm_virt_placement {
 };
 
 /* Host configuration (sptm_virt_config), set over the proxy before sptm_virt_enter. */
-#define SPTM_VIRT_S2R        BIT(0) /* sleep-path hooks and the trace ring */
-#define SPTM_VIRT_S2R_COPROC BIT(3) /* also hook the RTKit and exclave mailboxes */
-#define SPTM_VIRT_XNU_BT     BIT(5) /* sample XNU backtraces at GEXIT */
+#define SPTM_VIRT_S2R          BIT(0) /* sleep-path hooks and the trace ring */
+#define SPTM_VIRT_S2R_GO       BIT(1) /* let the sleep proceed instead of stopping before it */
+#define SPTM_VIRT_S2R_FULL     BIT(2) /* also hook the high-volume blocks (go mode may reset) */
+#define SPTM_VIRT_S2R_COPROC   BIT(3) /* also hook the RTKit and exclave mailboxes */
+#define SPTM_VIRT_S2R_DROP_USB BIT(4) /* tear down aura's CDC gadget at the sleep commit */
+#define SPTM_VIRT_XNU_BT       BIT(5) /* sample XNU backtraces at GEXIT */
 
 #ifdef SPTM_VIRT
 
@@ -80,6 +83,9 @@ bool sptm_virt_peek_fault(bool in_gl);
 bool sptm_virt_gl_sync(u64 *regs, u64 esr, u64 elr, u64 spsr);
 bool sptm_virt_el1_wfx(u64 *regs, u64 esr);
 bool sptm_virt_cl4_fiq(u64 *regs);
+
+/* The sleep path (sptm_virt_s2r.c) */
+void sptm_virt_s2r_wake_trap(u64 esr, u64 elr, bool in_gl);
 
 #else
 

@@ -284,6 +284,9 @@ void exc_sync(u64 *regs)
     u32 iss = esr & ESR_ISS;
 
 #ifdef SPTM_VIRT
+    if (nv2_guarded)
+        sptm_virt_s2r_wake_trap(esr, in_gl ? elr : mrs(ELR_EL2), in_gl);
+
     /* The virtualized SPTM (or its secure kernel) at GL1, trapped to aura's GL2. */
     if (in_gl && nv2_guarded && sptm_virt_gl_sync(regs, esr, elr, spsr))
         return;

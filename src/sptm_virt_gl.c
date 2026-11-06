@@ -522,7 +522,9 @@ static bool sptm_virt_guarded_gexit(u64 *regs)
             printf("SPTM-virt: XNU entered on cpu%d\n", cpu);
         }
         sptm_virt_cpu_enters_xnu(cpu);
-        if ((sptm_virt_flags & SPTM_VIRT_XNU_BT) && el == 2)
+        if (sptm_virt_flags & SPTM_VIRT_S2R)
+            sptm_virt_s2r_xnu_entry(cpu, target);
+        if ((sptm_virt_flags & SPTM_VIRT_XNU_BT) && el == 2 && !sptm_virt_s2r_quiet)
             sptm_virt_xnu_bt(regs, target);
     }
 

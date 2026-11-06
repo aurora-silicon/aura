@@ -113,7 +113,8 @@ static void sptm_virt_s2_split_ctrr_blocks(void)
 #define WDT_ALARM      0x14
 #define WDT_CTL        0x1c
 #define WDT_CTL_RESET  BIT(2)
-#define WDT2_CTL       0x2c     /* the third timer: macOS's sleep-time reconfig watchdog */
+#define WDT2_CTL       0x2c /* the third timer: macOS's sleep-time reconfig watchdog */
+#define WDT2_CTL_EN    BIT(0)
 #define WDT_RESTART_TK 24000000 /* an alarm under ~1 s at 24 MHz is a restart */
 
 static struct {
@@ -125,6 +126,10 @@ static u64 rg_wdt, rg_wdt2, rg_xwdt; /* primary, secondary register, exclave wat
 static u64 rg_extra[4];              /* the wdt node's other single registers */
 static u32 rg_alarm_shadow[2];
 static u32 rg_events;
+
+/* Set while macOS sleeps in go mode: the guard records but changes nothing, so macOS programs its
+ * sleep-time watchdog exactly as natively. A restart is still caught. */
+volatile bool sptm_virt_rg_passthrough;
 
 static void sptm_virt_rg_report(struct exc_info *ctx, const char *what, u64 addr, u64 val,
                                 bool park)
@@ -158,6 +163,25 @@ static bool sptm_virt_rg_hook(struct exc_info *ctx, u64 addr, u64 *val, bool wri
     u64 a = addr & ~3UL;
 
     sptm_virt_s2r_note(ctx, addr, write ? *val : 0, write, width);
+    if (sptm_virt_rg_passthrough) {
+        for (int w = 0; write && width == 2 && w < 2; w++) {
+            u64 base = w ? rg_xwdt : rg_wdt;
+            if (!base)
+                continue;
+            if (a == base + WDT_ALARM)
+                rg_alarm_shadow[w] = *val;
+            if (a == base + WDT_CTL && (*val & WDT_CTL_RESET) &&
+                rg_alarm_shadow[w] < WDT_RESTART_TK) {
+                sptm_virt_rg_report(ctx, w ? "exclave watchdog CTL" : "SoC watchdog CTL", addr,
+                                    *val, true);
+                return true;
+            }
+            if (a == base + WDT2_CTL && !(*val & WDT2_CTL_EN))
+                sptm_virt_s2r_wd_stopped();
+        }
+        sptm_virt_mmio_rw(addr, val, write, width);
+        return true;
+    }
     if (!write) {
         sptm_virt_mmio_rw(addr, val, false, width);
         if (width == 2 && (a == rg_wdt + WDT_ALARM || a == rg_xwdt + WDT_ALARM))

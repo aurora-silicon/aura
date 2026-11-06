@@ -1,25 +1,33 @@
 /* SPDX-License-Identifier: MIT */
 
 /*
- * The trace of macOS's suspend to RAM under the virtualized SPTM.
+ * macOS suspend to RAM under the virtualized SPTM, and its trace.
  *
  * aura's debug link (DockChannel, and the ATC0 USB port the CDC proxy uses) is hidden from XNU,
  * but XNU's PMGR driver still lowers the link's power domains: a hook on those PS words keeps them
  * on while macOS runs. With the sleep path enabled (SPTM_VIRT_S2R), pass-through stage-2 hooks on
- * the power-management blocks record every access into a ring in aura's heap, and two of them
- * mark the sleep: each core disabling itself in pmgr-soc-misc, and the boot core starting the S2R
- * timer in pmgr-aon-pst, the commit. aura stops in the proxy before the commit, with the whole
- * entry sequence in the ring.
+ * the power-management blocks record every access into a ring in aura's heap (the carve-out, which
+ * survives the sleep in self-refresh), and two of them mark the sleep: each core disabling itself
+ * in pmgr-soc-misc, and the boot core starting the S2R timer in pmgr-aon-pst, the commit.
+ *
+ * Stop mode stops in the proxy before the commit, with the whole entry sequence in the ring. Go
+ * mode lets the sleep happen as natively: from the first core's self-disable aura prints nothing
+ * and its console moves to the always-on DockChannel; at the commit it hands the link's domains
+ * the states XNU asked for and can tear its USB gadget down; the first reset after the commit is
+ * the wake.
  *
  * MMIO addresses are T8140's, as is everything in sptm_virt*.c.
  */
 
 #include "sptm_virt.h"
 #include "adt.h"
+#include "aic.h"
 #include "arm_cpu_regs.h"
 #include "exception.h"
 #include "hv.h"
+#include "iodev.h"
 #include "malloc.h"
+#include "memory.h"
 #include "nv2.h"
 #include "pmgr.h"
 #include "smp.h"
@@ -27,6 +35,7 @@
 #include "string.h"
 #include "types.h"
 #include "uartproxy.h"
+#include "usb.h"
 #include "utils.h"
 
 #define S2R_RING_BYTES (8UL << 20)
@@ -37,6 +46,20 @@
 
 /* The S2R timer start in pmgr-aon-pst (ADT pmgr reg 31): the last step of XNU's quiesceHW. */
 #define S2R_TIMER_OFF 0x4000
+
+/* The always-on NUB's AP wake-source status words. */
+#define S2R_NUB_WAKE_STATUS 0x308004028UL
+#define S2R_NUB_WAKE_WORDS  8
+
+/*
+ * The AMCC error-enable writes macOS's error handler makes at quiesce, for when that handler is
+ * hidden from XNU (as it is from Linux): an enabled, pending memory-controller error at the commit
+ * wakes the SoC within 20 ms. Word 0 bit 25 is DSID_AGE_OUT, word 1 bit 8 UNEXP_RT_HIT_DIR.
+ */
+#define S2R_AMCC_ERR_EN(plane, word) (0x220025000UL + ((u64)(plane) << 18) + (word) * 8)
+#define S2R_AMCC_PLANES              4
+#define S2R_QUIESCE_DSID_AGE_OUT     BIT(3)
+#define S2R_QUIESCE_RT_HIT_DIR       BIT(4)
 
 struct s2r_rec {
     u64 t;    /* CNTPCT_EL0 */
@@ -57,22 +80,28 @@ u64 sptm_virt_s2r_nrec;          /* capacity in records */
 volatile u64 sptm_virt_s2r_head; /* records ever appended */
 u32 sptm_virt_s2r_pages;         /* pages hooked */
 
+/* Set by the host before entry (run_guest_sptm.py). */
+u32 sptm_virt_s2r_quiesce; /* S2R_QUIESCE_* */
+
 static struct {
     u64 page;
     const char *what;
     bool seen;
 } s2r_pages[160];
 
-static bool s2r_coproc;
+static bool s2r_go, s2r_fulltrace, s2r_coproc, s2r_drop_usb;
 static u64 s2r_arm_at;
 /* Cores with their last WFI trapped (stop mode), parked there, and the core that committed. */
 static volatile u32 s2r_twi_mask, s2r_parked_mask;
 static volatile int s2r_timer_cpu = -1;
+/* Go mode, from the first core's self-disable until the wake: aura prints nothing. Printing in
+ * that window delays the boot core's last steps past macOS's 5 s reconfig watchdog. */
+volatile bool sptm_virt_s2r_quiet;
 
 /*
  * The debug link's power domains: the PS words of the ATC0 USB controller, its DART and PHY, and
  * all their ancestors. A write that lowers one is not performed, and reads then report what XNU
- * asked for, so its polls complete.
+ * asked for, so its polls complete. At the commit the states XNU asked for are applied.
  */
 #define S2R_KEEP_MAX 32
 static u64 s2r_keep[S2R_KEEP_MAX];
@@ -82,8 +111,40 @@ static int s2r_nkeep;
 /* With the proxy on CDC the rule holds from setup: XNU lowers three of these domains about a
  * second into its boot. */
 static bool s2r_keep_always;
+static volatile bool s2r_keep_released;
 static const char *const s2r_link_paths[] = {"/arm-io/usb-drd", "/arm-io/dart-usb",
                                              "/arm-io/atc-phy0"};
+
+/*
+ * The wake. The commit time is cleaned to DRAM, since the first reset after it reads it with the
+ * MMU off; that reset only records the wake, and the banner and the trail are printed later from
+ * MMU-on contexts (the first guest trap, the first GEXIT into XNU, the hooks).
+ */
+static volatile u64 s2r_commit_t;
+static volatile u64 s2r_wake_t;
+static volatile int s2r_wake_cpu = -1;
+static volatile u32 s2r_wake_count;
+static volatile u32 s2r_wake_traps; /* guest traps to log after a wake */
+static volatile u32 s2r_wake_mmio;  /* hooked accesses to log after a wake */
+static volatile bool s2r_wake_banner_done, s2r_wake_xnu_done;
+static u64 s2r_wake_head;
+
+static void s2r_clean(const volatile void *p, size_t n)
+{
+    dc_civac_range((void *)p, n);
+    sysop("dsb sy");
+}
+
+/* Count down a bounded log budget shared by all cores; false once it is spent. */
+static bool s2r_take(volatile u32 *budget)
+{
+    u32 left = *budget;
+    while (left)
+        if (__atomic_compare_exchange_n(budget, &left, left - 1, false, __ATOMIC_RELAXED,
+                                        __ATOMIC_RELAXED))
+            return true;
+    return false;
+}
 
 /* ---- the ring ------------------------------------------------------------------------------- */
 
@@ -118,8 +179,9 @@ static void s2r_marker(const char *tag, u64 arg)
         r->val = arg;
         r->pc = t;
     }
-    printf("SPTM-virt[s2r]: marker %.8s 0x%lx (cpu%d, rec %lu)\n", tag, arg, smp_id(),
-           sptm_virt_s2r_head);
+    if (!sptm_virt_s2r_quiet)
+        printf("SPTM-virt[s2r]: marker %.8s 0x%lx (cpu%d, rec %lu)\n", tag, arg, smp_id(),
+               sptm_virt_s2r_head);
 }
 
 static void s2r_print_rec(u64 i)
@@ -162,6 +224,12 @@ static const char *s2r_page_name(u64 page, bool *first)
     return "?";
 }
 
+static bool s2r_is_mbox(const char *what)
+{
+    size_t n = strlen(what);
+    return n > 5 && !strcmp(what + n - 5, "-mbox");
+}
+
 /* A 16-byte access (a trapped LDP/STP: width 4 and two values) as one LDP/STP, as the guest issued
  * it. The ASC mailboxes take their messages as such a pair. */
 static void s2r_rw128(u64 addr, u64 *val, bool write)
@@ -187,20 +255,108 @@ static bool s2r_armed(void)
 
 /* ---- the sleep ------------------------------------------------------------------------------ */
 
+/* From the commit everything aura writes (console, proxy, XNU's vuart TX) goes to DockChannel:
+ * uart0 and the CDC link are SoC-domain devices that are off at the wake. */
+static void s2r_console_to_aon(void)
+{
+    for (iodev_id_t id = 0; id < IODEV_MAX; id++)
+        if (id != IODEV_DOCKCHANNEL_UART && id != IODEV_FB)
+            iodev_set_usage(id, iodev_get_usage(id) & ~(USAGE_CONSOLE | USAGE_UARTPROXY));
+    iodev_set_usage(IODEV_DOCKCHANNEL_UART,
+                    iodev_get_usage(IODEV_DOCKCHANNEL_UART) | USAGE_CONSOLE | USAGE_UARTPROXY);
+    uartproxy_iodev = IODEV_DOCKCHANNEL_UART;
+    hv_vuart_sleep_commit(IODEV_DOCKCHANNEL_UART);
+}
+
+static void s2r_console_off(void)
+{
+    for (iodev_id_t id = 0; id < IODEV_MAX; id++)
+        iodev_set_usage(id, iodev_get_usage(id) & ~USAGE_CONSOLE);
+    sptm_virt_s2r_quiet = true;
+    s2r_clean(&sptm_virt_s2r_quiet, sizeof(sptm_virt_s2r_quiet));
+}
+
+/*
+ * At the commit, power the debug link the way a real sleep leaves it. XNU never manages ATC0, so it
+ * would stay on, an armed USB wake source (ATC0_PMGR_USB_WAKEUP) whose half-done wakes trip macOS's
+ * reconfig watchdog. The gadget goes first (with SPTM_VIRT_S2R_DROP_USB), while its domains are
+ * still on: its shutdown touches DWC3 and its DART, and the host then sees a real disconnect.
+ */
+static void s2r_release_kept(void)
+{
+    int n = 0;
+
+    if (s2r_drop_usb) {
+        s2r_marker("USBDROP", 0);
+        usb_iodev_shutdown();
+    }
+    for (int k = 0; k < s2r_nkeep; k++) {
+        if (!s2r_keep_low[k])
+            continue;
+        write32(s2r_keep[k], s2r_keep_shadow[k]);
+        s2r_keep_low[k] = false;
+        n++;
+    }
+    s2r_keep_released = true;
+    int failed = 0;
+    for (unsigned i = 0; i < ARRAY_SIZE(s2r_link_paths); i++)
+        failed += pmgr_adt_power_disable(s2r_link_paths[i]) < 0;
+    if (!sptm_virt_s2r_quiet)
+        printf("SPTM-virt[s2r]: released %d debug-link domains; powered the ATC0 link down%s\n", n,
+               failed ? " (some domains refused)" : "");
+}
+
+static void s2r_quiesce(void)
+{
+    if (sptm_virt_s2r_quiesce & S2R_QUIESCE_DSID_AGE_OUT)
+        for (int p = 0; p < S2R_AMCC_PLANES; p++)
+            clear32(S2R_AMCC_ERR_EN(p, 0), BIT(25));
+    if (sptm_virt_s2r_quiesce & S2R_QUIESCE_RT_HIT_DIR)
+        for (int p = 0; p < S2R_AMCC_PLANES; p++)
+            clear32(S2R_AMCC_ERR_EN(p, 1), BIT(8));
+    sysop("dsb sy");
+}
+
 /*
  * A core taking part in the sleep: it disabled itself in PMGR, or the boot core armed the
- * clusters off. Its last WFI is trapped (sptm_virt_s2r_wfi).
+ * clusters off or committed. Go mode gets out of its way for good: its last WFI powers it down
+ * natively, aura's EL2 timers are stopped on it, and from the first such core aura is silent.
+ * Stop mode traps its last WFI instead (sptm_virt_s2r_wfi).
  */
 static void s2r_core_sleeps(void)
 {
     int cpu = smp_id();
     if (s2r_twi_mask & BIT(cpu))
         return;
-    __atomic_or_fetch(&s2r_twi_mask, BIT(cpu), __ATOMIC_SEQ_CST);
-    nv2_hcr_update(HCR_TWI, 0);
-    if (s2r_timer_cpu < 0)
-        s2r_timer_cpu = cpu;
-    s2r_marker("TWI-ARM", cpu);
+    bool first = !__atomic_fetch_or(&s2r_twi_mask, BIT(cpu), __ATOMIC_SEQ_CST);
+    if (!s2r_go) {
+        nv2_hcr_update(HCR_TWI, 0);
+        if (s2r_timer_cpu < 0)
+            s2r_timer_cpu = cpu;
+        s2r_marker("TWI-ARM", cpu);
+        return;
+    }
+    if (first) {
+        printf("SPTM-virt[s2r]: cpu%d opens the sleep window: aura silent until the wake\n", cpu);
+        s2r_console_to_aon();
+        iodev_console_flush();
+        s2r_console_off();
+    }
+    msr(CNTP_CTL_EL0, 0); /* aura's EL2 physical timer (E2H: CNTHP) */
+    msr(CNTV_CTL_EL0, 0); /* aura's EL2 virtual timer (CNTHV) */
+    sysop("isb");
+    s2r_marker("SLEEPS", cpu);
+}
+
+/* The commit in go mode, before the S2R timer write goes through. */
+static void s2r_commit(void)
+{
+    s2r_commit_t = mrs(CNTPCT_EL0);
+    s2r_clean(&s2r_commit_t, sizeof(s2r_commit_t));
+    s2r_console_to_aon();
+    s2r_release_kept();
+    s2r_console_off();
+    s2r_quiesce();
 }
 
 /*
@@ -266,7 +422,9 @@ bool sptm_virt_s2r_wfi(u64 *regs, u64 esr)
 
 static bool s2r_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int width)
 {
-    int k = width == 2 && (s2r_keep_always || s2r_armed()) ? s2r_keep_idx(addr) : -1;
+    int k = width == 2 && !s2r_keep_released && (s2r_keep_always || s2r_armed())
+                ? s2r_keep_idx(addr)
+                : -1;
 
     /* The link's domains: XNU's lowering writes are shadowed, and reads then see them. */
     if (k >= 0 && write && (*val & 0xf) < (read32(addr) & 0xf)) {
@@ -298,12 +456,19 @@ static bool s2r_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int w
 
     bool first;
     const char *what = s2r_page_name(addr & ~0x3fffUL, &first);
-    if (write && width <= 3 && *val == 1 && !strcmp(what, "pmgr-aon-pst") &&
-        (addr & 0x7fff) == S2R_TIMER_OFF && s2r_armed()) {
+    bool timer = write && width <= 3 && *val == 1 && !strcmp(what, "pmgr-aon-pst") &&
+                 (addr & 0x7fff) == S2R_TIMER_OFF && s2r_armed();
+    if (timer && !s2r_go) {
         sptm_virt_rg_stop_wd2();
         sptm_virt_s2r_note(ctx, addr, *val, true, width);
         s2r_stop_before_timer(ctx, addr, *val);
     }
+    if (timer)
+        s2r_commit();
+
+    if (s2r_wake_mmio && !s2r_is_mbox(what) && s2r_take(&s2r_wake_mmio))
+        printf("S2R-WAKE c%d %s %s%u 0x%lx%s0x%lx pc 0x%lx\n", smp_id(), what, write ? "W" : "R",
+               8u << width, addr, write ? " = " : " (before read) ", write ? *val : 0UL, ctx->elr);
 
     if (width == 4) {
         s2r_rw128(addr, val, write);
@@ -319,11 +484,16 @@ static bool s2r_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int w
     sptm_virt_mmio_rw(addr, val, write, width);
     sptm_virt_s2r_note(ctx, addr, *val, write, width);
 
-    if (first)
+    if (first && !sptm_virt_s2r_quiet)
         printf("SPTM-virt[s2r]: first access to %s page 0x%lx: %s 0x%lx <- 0x%lx pc 0x%lx\n", what,
                addr & ~0x3fffUL, write ? "wr" : "rd", addr, *val, ctx->elr);
     if (!s2r_armed())
         return true;
+    if (timer) {
+        s2r_timer_cpu = smp_id();
+        s2r_marker("S2RTIMER", addr);
+        s2r_core_sleeps();
+    }
     /* Each core disables itself in the PMGR CPU block on its way to its last WFI; a cluster armed
      * off is the same moment for the boot core. */
     if (write && (!strcmp(what, "pmgr-soc-misc") ||
@@ -434,7 +604,12 @@ void sptm_virt_s2r_setup(bool cdc)
     memset(sptm_virt_s2r_ring, 0, S2R_RING_BYTES);
     sptm_virt_s2r_nrec = S2R_RING_BYTES / sizeof(struct s2r_rec);
     sptm_virt_s2r_head = 0;
+    s2r_go = flags & SPTM_VIRT_S2R_GO;
+    s2r_fulltrace = flags & SPTM_VIRT_S2R_FULL;
     s2r_coproc = flags & SPTM_VIRT_S2R_COPROC;
+    s2r_drop_usb = flags & SPTM_VIRT_S2R_DROP_USB;
+    /* In go mode the reset guard leaves macOS's sleep-time watchdog alone. */
+    sptm_virt_rg_passthrough = s2r_go;
 
     /* Each core's self-disable and the commit: a handful of accesses. */
     s2r_hook_adt("/arm-io/pmgr", 24, "pmgr-soc-misc", 0, 0);
@@ -458,13 +633,135 @@ void sptm_virt_s2r_setup(bool cdc)
         s2r_hook_adt("/arm-io/dcp-exclave-mailbox", 0, "dcpx-mbox", 0, 0);
         s2r_hook_adt("/arm-io/esm", 0, "esm-mbox", 0, 0);
     }
-    s2r_hook_full();
+    /*
+     * The full entry trace. Not in a plain go-mode sleep: XNU hammers these blocks in the last
+     * second of its quiesce, and trapping each access slows the power-down past the 5 s
+     * reconfig watchdog.
+     */
+    if (!s2r_go || s2r_fulltrace)
+        s2r_hook_full();
 
     s2r_keep_setup();
 
     s2r_arm_at = mrs(CNTPCT_EL0) + S2R_ARM_AFTER_S * mrs(CNTFRQ_EL0);
     s2r_marker("S2RSETUP", sptm_virt_s2r_pages);
-    printf("SPTM-virt[s2r]: %u pages hooked, %lu-record ring at 0x%lx; stop mode: stopping "
-           "before the S2R timer start\n",
-           sptm_virt_s2r_pages, sptm_virt_s2r_nrec, (u64)sptm_virt_s2r_ring);
+    printf("SPTM-virt[s2r]: %u pages hooked, %lu-record ring at 0x%lx; %s\n", sptm_virt_s2r_pages,
+           sptm_virt_s2r_nrec, (u64)sptm_virt_s2r_ring,
+           !s2r_go         ? "stop mode: stopping before the S2R timer start"
+           : s2r_fulltrace ? "GO mode + full trace (heavy; expect a reset)"
+                           : "GO mode: minimal hooks, the sleep proceeds at native speed");
+}
+
+/* ---- the wake ------------------------------------------------------------------------------- */
+
+/* sptm_virt_cpu_reset, MMU off: the first reset after a commit is the wake. */
+void sptm_virt_s2r_wake(int cpu)
+{
+    u64 commit = s2r_commit_t;
+    if (!commit)
+        return;
+    u64 now = mrs(CNTPCT_EL0), frq = mrs(CNTFRQ_EL0);
+    s2r_commit_t = 0;
+    s2r_wake_t = now;
+    s2r_wake_cpu = cpu;
+    s2r_wake_count++;
+    sptm_virt_s2r_quiet = false;
+    iodev_set_usage(IODEV_DOCKCHANNEL_UART,
+                    iodev_get_usage(IODEV_DOCKCHANNEL_UART) | USAGE_CONSOLE | USAGE_UARTPROXY);
+    s2r_wake_banner_done = false;
+    s2r_wake_xnu_done = false;
+    s2r_wake_traps = 48;
+    s2r_wake_mmio = 160;
+    s2r_twi_mask = 0;
+    s2r_timer_cpu = -1;
+    /* the sleep rules come back for the next sleep */
+    s2r_arm_at = now + S2R_ARM_AFTER_S * frq;
+    s2r_clean(&s2r_commit_t, sizeof(s2r_commit_t));
+    s2r_clean(&sptm_virt_s2r_quiet, sizeof(sptm_virt_s2r_quiet));
+    s2r_clean(&s2r_wake_t, sizeof(s2r_wake_t));
+    s2r_clean(&s2r_wake_cpu, sizeof(s2r_wake_cpu));
+    s2r_clean(&s2r_wake_count, sizeof(s2r_wake_count));
+    s2r_clean(&s2r_wake_banner_done, sizeof(s2r_wake_banner_done));
+    s2r_clean(&s2r_wake_xnu_done, sizeof(s2r_wake_xnu_done));
+    s2r_clean(&s2r_wake_traps, sizeof(s2r_wake_traps));
+    s2r_clean(&s2r_wake_mmio, sizeof(s2r_wake_mmio));
+    s2r_clean(&s2r_twi_mask, sizeof(s2r_twi_mask));
+    s2r_clean(&s2r_timer_cpu, sizeof(s2r_timer_cpu));
+    s2r_clean(&s2r_arm_at, sizeof(s2r_arm_at));
+    printf("SPTM-virt[s2r]: WAKE #%u: cpu%d reset after the sleep commit; counter 0x%lx, commit "
+           "0x%lx (%ld s)\n",
+           s2r_wake_count, cpu, now, commit, frq ? (long)((s64)(now - commit) / (s64)frq) : -1L);
+}
+
+static void s2r_aic_dump(const char *tag)
+{
+    if (!aic)
+        return;
+    for (u32 w = 0; w <= aic->nr_irq / 32; w++) {
+        /* The raw line state, the array right after MASK_CLR: asserting lines, masked or not. */
+        u32 hw = read32(aic->base + aic->regs.mask_clr + (aic->max_irq >> 5) * 4 + 4 * w);
+        u32 sw = read32(aic->base + aic->regs.sw_set + 4 * w);
+        if (hw | sw)
+            printf("AIC[%s]: irq %u..: hw 0x%08x sw 0x%08x mask 0x%08x\n", tag, w * 32, hw, sw,
+                   read32(aic->base + aic->regs.mask_set + 4 * w));
+    }
+    /* All ones here at a wake: XNU's quiesce masks survived, so the AIC kept its state. */
+    printf("AIC[%s]: mask word 0 0x%08x, last 0x%08x\n", tag,
+           read32(aic->base + aic->regs.mask_set),
+           read32(aic->base + aic->regs.mask_set + 4 * (aic->nr_irq / 32)));
+}
+
+/* exc_sync: the first guest trap after a wake prints the banner; a bounded trail follows. */
+void sptm_virt_s2r_wake_trap(u64 esr, u64 elr, bool in_gl)
+{
+    if (!s2r_wake_t)
+        return;
+    if (!s2r_wake_banner_done &&
+        !__atomic_exchange_n(&s2r_wake_banner_done, true, __ATOMIC_SEQ_CST)) {
+        s2r_wake_head = sptm_virt_s2r_head;
+        u64 frq = mrs(CNTFRQ_EL0), now = mrs(CNTPCT_EL0);
+        printf("SPTM-virt[s2r]: WAKE #%u banner: first guest trap on cpu%d, %lu us after the "
+               "reset on cpu%d\n",
+               s2r_wake_count, smp_id(), frq ? (now - s2r_wake_t) * 1000000 / frq : 0,
+               s2r_wake_cpu);
+        printf("SPTM-virt[s2r]: AON wake-source status 0x308004028..44:");
+        for (int i = 0; i < S2R_NUB_WAKE_WORDS; i++)
+            printf(" %08x", read32(S2R_NUB_WAKE_STATUS + 4 * i));
+        printf("\n");
+        s2r_aic_dump("wake");
+        s2r_marker("WAKE", s2r_wake_cpu);
+    }
+    if (s2r_wake_traps && s2r_take(&s2r_wake_traps))
+        printf("S2R-WAKE-TRAP c%d %s EC 0x%02lx iss 0x%06lx pc 0x%lx\n", smp_id(),
+               in_gl ? "GL" : "EL", (esr >> 26) & 0x3f, esr & 0x1ffffff, elr);
+}
+
+/* A GEXIT into XNU's normal world: the first one after a wake means XNU runs again. */
+void sptm_virt_s2r_xnu_entry(int cpu, u64 target)
+{
+    if (!s2r_wake_t || s2r_wake_xnu_done)
+        return;
+    s2r_wake_xnu_done = true;
+    u64 frq = mrs(CNTFRQ_EL0), now = mrs(CNTPCT_EL0);
+    printf("SPTM-virt[s2r]: WAKE #%u: XNU running again on cpu%d at 0x%lx, "
+           "%lu ms after the reset\n",
+           s2r_wake_count, cpu, target, frq ? (now - s2r_wake_t) * 1000 / frq : 0);
+    s2r_marker("XNUBACK", cpu);
+}
+
+/*
+ * The wake's MMIO record (with the full trace): XNU stopping the AON watchdog ends its platform
+ * wake, so everything the ring holds since the wake's first guest trap is the record.
+ */
+static bool s2r_wakerec_done;
+
+void sptm_virt_s2r_wd_stopped(void)
+{
+    if (s2r_wakerec_done || !s2r_fulltrace || !s2r_wake_t || !s2r_wake_banner_done)
+        return;
+    s2r_wakerec_done = true;
+    printf("S2R-WAKEREC start: %lu records\n", sptm_virt_s2r_head - s2r_wake_head);
+    sptm_virt_s2r_dump_tail(min(sptm_virt_s2r_head - s2r_wake_head, 16384UL));
+    printf("S2R-WAKEREC end\n");
+    iodev_console_flush();
 }

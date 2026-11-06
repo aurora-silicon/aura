@@ -19,6 +19,9 @@ int vuart_irq = 0;
  * and keep RX off (reading the shared channel would steal the proxy's framed replies). */
 static iodev_id_t vuart_tx_iodev = IODEV_USB_VUART;
 static bool vuart_tx_only = false;
+/* Set at a suspend-to-RAM commit: the real UART powers off with the SoC and is clock-gated when the
+ * AP wakes, so from then on the vuart never touches it. */
+static bool vuart_hw_off = false;
 /* With the proxy on CDC, XNU's TX is also copied to DockChannel (always-on, bounded writes): if
  * the CDC link goes away, `macvdmtool debugusb` brings XNU's console back on KIS. */
 static iodev_id_t vuart_tx_mirror = IODEV_MAX;
@@ -51,7 +54,8 @@ static void update_irq(void)
     }
 
     if (vuart_irq) {
-        uart_clear_irqs();
+        if (!vuart_hw_off)
+            uart_clear_irqs();
         if (utrstat & (UTRSTAT_TXTHRESH | UTRSTAT_RXTHRESH | UTRSTAT_RXTO)) {
             aic_set_sw(vuart_irq, true);
         } else {
@@ -168,4 +172,16 @@ void hv_map_vuart(u64 base, int irq, iodev_id_t iodev)
     }
     vuart_irq = irq;
     active = true;
+}
+
+/*
+ * Suspend-to-RAM commit (sptm_virt_s2r.c): the guest's TX goes to an always-on iodev (DockChannel)
+ * from now on, and the real UART is left alone. A DWC3 CDC pair is a SoC-domain device too, so the
+ * mirror leaves it as well.
+ */
+void hv_vuart_sleep_commit(iodev_id_t tx)
+{
+    vuart_hw_off = true;
+    vuart_tx_iodev = tx;
+    vuart_tx_only = true;
 }
