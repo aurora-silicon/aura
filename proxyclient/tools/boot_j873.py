@@ -392,6 +392,12 @@ def finish_preparation(s, args, state, dtb_name):
     release_slots = {str(cpu): s.call("smp_get_kernel_release_addr", cpu)
                      for cpu in range(12) if cpu != 6}
     require(p.heapblock_alloc(0) < kernel_addr, "native heap overlaps kernel")
+    # Native preparation packs the tree. Restore its allocated capacity before
+    # adding the final reservation; never grow beyond Aura's buffer.
+    capacity = p.read32(s.base + symbols["dt_bufsize"])
+    packed_size = struct.unpack_from(">I", s.read(dt, 8), 4)[0]
+    require(0 < packed_size <= capacity < 0x80000, "invalid FDT capacity")
+    require(s.call("fdt_open_into", dt, dt, capacity) == 0, "FDT reopen failed")
     require(s.call("fdt_add_mem_rsv", dt, s.ba.phys_base, kernel_addr - s.ba.phys_base) == 0,
             "retained aura heap reservation failed")
     require(s.call("fdt_pack", dt) == 0, "final DT pack failed")
