@@ -228,13 +228,14 @@ static bool ctxr_exec_holds_ro_range(u64 start, u64 end)
 /* Returns why there is no window to use, or NULL having set it. */
 static const char *ctxr_exec_find_window(u64 *base, u64 *size)
 {
-    u64 lower = mrs(SYS_IMP_APL_CTXR_D_LWR_EL1);
-    u64 armed_end = ALIGN_DOWN(mrs(SYS_IMP_APL_CTXR_D_UPR_EL1) + SZ_4K, SZ_16K);
+    u64 lower = 0, armed_end = 0;
     u64 start = ALIGN_UP((u64)_base + CTXR_EXEC_AURA_SLOT, CTXR_EXEC_ALIGN);
     u64 end = start + CTXR_EXEC_WINDOW_SIZE;
 
+    if (ctxr_range(CTXR_RANGE_D, &lower, &armed_end))
+        armed_end = ALIGN_DOWN(armed_end, SZ_16K);
     printf("CTXR exec: armed [0x%lx, 0x%lx)\n", lower, armed_end);
-    if (!lower || armed_end <= lower)
+    if (armed_end <= lower)
         return "CTXR_D reads as empty";
     if ((u64)_base < lower || (u64)_end > start)
         return "aura is not inside CTXR_D and its slot";

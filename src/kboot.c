@@ -9023,10 +9023,13 @@ int kboot_prepare_dt(void *fdt)
      * allocator, because EL0 cannot execute in them on a confined core.
      */
     if (ctxr_exec_confined()) {
-        u64 start = ALIGN_DOWN(mrs(SYS_IMP_APL_CTXR_D_LWR_EL1), SZ_16K);
-        u64 end = ALIGN_UP(mrs(SYS_IMP_APL_CTXR_D_UPR_EL1) + SZ_4K, SZ_16K);
+        u64 start, end;
 
-        if (!start || end <= start || dt_reserve_outside_exec_window(start, end - start))
+        if (!ctxr_range(CTXR_RANGE_D, &start, &end))
+            bail("FDT: couldn't reserve CTXR_D\n");
+        start = ALIGN_DOWN(start, SZ_16K);
+        end = ALIGN_UP(end, SZ_16K);
+        if (dt_reserve_outside_exec_window(start, end - start))
             bail("FDT: couldn't reserve CTXR_D\n");
         printf("FDT: reserved CTXR_D [0x%lx, 0x%lx) less the OS window\n", start, end);
         if (dt_reserve_ctxr_low_windows())

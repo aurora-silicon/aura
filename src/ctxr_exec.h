@@ -14,8 +14,11 @@ enum ctxr_range {
     CTRR_RANGE_D,
 };
 
-/* An armed range as [start, end), or false if it reads as empty, or can't be read here. */
-bool ctxr_range(enum ctxr_range range, u64 *start, u64 *end);
+/*
+ * An armed range as [start, end), or false if it reads as empty, or can't be read here.
+ * Kept out of line: inlined copies cost Stage 1 room it doesn't have.
+ */
+__attribute__((noinline)) bool ctxr_range(enum ctxr_range range, u64 *start, u64 *end);
 /* Secondaries can't execute outside the armed CTXR windows at EL2. Asks a secondary, once a boot.
  */
 bool ctxr_exec_confined(void);
