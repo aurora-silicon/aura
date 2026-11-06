@@ -40,6 +40,9 @@ typedef struct { unsigned marker; } asc_dev_t;
 typedef struct { unsigned marker; } dart_dev_t;
 typedef struct { unsigned marker; } iova_domain_t;
 typedef struct { unsigned marker; } rtkit_dev_t;
+/* Modeled snapshot boundary; production RTKit is replayed separately. */
+struct rtkit_rejection { unsigned reason; u64 msg0, msg1; };
+struct rtkit_notification_counts { u64 app, debug, oslog_type3; };
 static asc_dev_t asc_obj; static dart_dev_t dart_obj;
 static iova_domain_t iova_obj; static rtkit_dev_t rtkit_obj;
 static const char *scenario;
@@ -61,7 +64,10 @@ static bool timeout_expired(u64 deadline) { clock_us += 10000; return clock_us >
 static u32 read32(u64 address) {
     assert(prepared_power); ++reads;
     if (is("mmio-fault") && reads == 1) ++exc_count;
-    if (address == 0x394b3402cULL) return is("no-init") ? 0 : 12;
+    if (address == 0x394b3402cULL) {
+        if (is("readiness-mmio")) ++exc_count;
+        return is("no-init") ? 0 : 12;
+    }
     assert(address >= 0x394800000ULL && address < 0x39480c000ULL);
     switch (address - 0x394800000ULL) {
     case 0x200: return is("locked");
@@ -149,7 +155,18 @@ static bool rtkit_boot_timed(rtkit_dev_t *rtk, u32 timeout) {
 }
 static int rtkit_service_quiet(rtkit_dev_t *rtk, int count) {
     assert(rtk == &rtkit_obj && count == 4); ++polls;
+    if (is("service-mmio")) ++exc_count;
     return is("service-fail") || (is("runtime-fail") && maps) ? -1 : 0;
+}
+static bool __attribute__((unused)) rtkit_get_first_rejection(const rtkit_dev_t *rtk, struct rtkit_rejection *out) {
+    assert(rtk == &rtkit_obj);
+    *out = (struct rtkit_rejection){3, 0x123456789abcdef0ULL, 2};
+    return true;
+}
+static bool __attribute__((unused)) rtkit_get_notification_counts(const rtkit_dev_t *rtk, struct rtkit_notification_counts *out) {
+    assert(rtk == &rtkit_obj);
+    *out = (struct rtkit_notification_counts){2, 1, 3};
+    return true;
 }
 static int hv_map_hw(u64 ipa, u64 pa, u64 size) {
     assert(ipa == 0x1800000 && pa == 0x10020000000ULL && size == 0x100000 && pool);
