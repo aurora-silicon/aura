@@ -8,7 +8,7 @@ J813 controller pages must be published, with no fabricated PEP/CPPC support or
 measured-frequency claims. Aura initialization may set a boot P-state; its live
 Windows path must have no background DVFS writer. Host tooling must not issue
 CPU-frequency writes while the guest owns the controllers. The guest driver
-serializes requests, validates the public OPP ladder and keeps a conservative
+serializes requests, validates the exact observed firmware OPP ladder and keeps a conservative
 boot-state ceiling until a separate thermal/PEP policy is qualified.
 
 A source-bound handoff replay will exercise actual profile admission and marker
@@ -29,10 +29,14 @@ requires capability bit 11 and sets native configuration bit 5. Admission binds
 chip `0x8142`, board `0x24`, model `Mac17,3`, and exact kHz entries in PMGR's
 `voltage-states1-sram`/`voltage-states5-sram`. The parser consumes complete
 `{u32 kHz, u32 mV}` records. Voltage fields are not used to program voltage.
-The 8 E/19 P entries match public Linux commit
-`08fdca6772eb6a27be6291bdec0ced7a937a4cf0`,
-`arch/arm64/boot/dts/apple/t8142-j813-thermal.dtsi`, including the nonmonotonic
-P17/P18 order. The retained real J813 ADT passed this admission offline.
+The 8 E/19 P entries are independently decoded from the retained real J813
+PMGR ADT, including the nonmonotonic P17/P18 order. That ADT passed this
+admission offline. The companion driver retains the source hash and extracted
+entries in `docs/validation/j813-cpu-opp-20261106.json`. The public register
+reference is Linux `33bec4016c466985bfbb5ff4c2089fcab8242dcf`,
+`drivers/cpufreq/apple-soc-cpufreq.c`; its public J813 DTS has different OPP
+entries/indexing and is not the source of this exact firmware ladder. The
+earlier `linux-aurora` table link was private, not public provenance.
 
 Aura removes inherited markers. Enabled mode emits little-endian u32 one in
 `/chosen/aura,windows-cpufreq-v1`. Mu's `J813CPUF` SSDT gate requires that exact

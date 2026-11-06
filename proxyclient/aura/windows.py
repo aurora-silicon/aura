@@ -304,8 +304,8 @@ def cpufreq_handoff_marker(policy, chip, board, model, opp_tables=None):
         return None
     require((chip, board, model) == (0x8142, 0x24, "Mac17,3"),
             "CPU frequency ownership requires the exact J813 target")
-    # Public Linux 08fdca6772eb6a27be6291bdec0ced7a937a4cf0,
-    # t8142-j813-thermal.dtsi. ADT records are {kHz, mV}; index 0 is level 1.
+    # Retained J813 PMGR ADT frequencies, independently decoded from hardware.
+    # ADT records are {kHz, mV}; index 0 is firmware level 1.
     # Preserve the P17/P18 ordering: this firmware ladder is not monotonic.
     frequencies = (
         (972000, 1152000, 1584000, 1992000, 2352000, 2700000, 2964000, 3048000),
