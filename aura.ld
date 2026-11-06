@@ -132,6 +132,7 @@ SECTIONS {
          */
         *hv/hv_vm.o(.text .text.*)
         *hv/hv_sprr.o(.text .text.*)
+        *sptm_virt*.o(.text .text.*)
     } :text
     .text : ALIGN(0x10000) {
         *(.text)

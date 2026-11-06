@@ -1,5 +1,7 @@
 /* SPDX-License-Identifier: MIT AND GPL-2.0-only */
 
+#include "../build/build_cfg.h"
+
 #include "exception.h"
 #include "aic.h"
 #include "aic_regs.h"
@@ -8,11 +10,14 @@
 #include "iodev.h"
 #include "memory.h"
 #include "monitor.h"
-#include "nv2.h"
 #include "psci.h"
 #include "pv_kvm.h"
 #include "uart.h"
 #include "utils.h"
+
+#ifdef SPTM_VIRT
+#include "nv2.h"
+#endif
 
 #define EL0_STACK_SIZE 0x4000
 
@@ -29,7 +34,9 @@ volatile u64 exc_last_esr, exc_last_afsr1;
 
 void el0_ret(void);
 void el1_ret(void);
+#ifdef SPTM_VIRT
 void nv2_probe_ret(void);
+#endif
 
 static char *m_table[0x10] = {
     [SPSR_M_EL0] = "EL0t",  //
@@ -270,9 +277,11 @@ void exc_sync(u64 *regs)
     u32 ec = (esr & ESR_EC) >> ESR_EC_SHIFT;
     u32 iss = esr & ESR_ISS;
 
+#ifdef SPTM_VIRT
     /* An OS at virtual EL2 (FEAT_NV2), or the guest it runs. */
     if (nv2_active && !in_gl && !el3 && nv2_handle_sync(regs))
         return;
+#endif
 
     // check brk instructions
     if (ec == ESR_EC_BRK && iss == 0 && elsp == SPSR_M_EL0) {
@@ -333,6 +342,7 @@ void exc_sync(u64 *regs)
                 msr(ELR_EL2, el1_ret);
                 return;
             case 1:
+#ifdef SPTM_VIRT
                 /* End of an nv2_probe_call EL1 stub, but only while a proxy
                  * probe is actually in flight: a production guest's own hvc #1
                  * must not be redirected into proxy-only code. */
@@ -341,6 +351,7 @@ void exc_sync(u64 *regs)
                     msr(ELR_EL2, nv2_probe_ret);
                     return;
                 }
+#endif
                 printf("Unknown HVC: 0x%x\n", imm);
                 break;
             case 0x10 ... 0x1f:
@@ -382,6 +393,7 @@ void exc_sync(u64 *regs)
     sysop("isb");
     sysop("dsb sy");
 
+#ifdef SPTM_VIRT
     if (nv2_active)
         nv2_note_unhandled(esr, elr, spsr);
 
@@ -397,6 +409,7 @@ void exc_sync(u64 *regs)
         nv2_reflect_undef(elr, spsr);
         return;
     }
+#endif
 
     if (!(exc_guard & GUARD_SILENT))
         print_regs(regs, el12);
@@ -447,8 +460,10 @@ void exc_sync(u64 *regs)
 
 void exc_irq(u64 *regs)
 {
+#ifdef SPTM_VIRT
     if (nv2_handle_async(regs, 1))
         return;
+#endif
 
     u64 spsr = in_gl12() ? mrs(SYS_IMP_APL_SPSR_GL1) : mrs(SPSR_EL1);
     u32 reason = aic_ack();
@@ -468,8 +483,10 @@ void exc_irq(u64 *regs)
 
 void exc_fiq(u64 *regs)
 {
+#ifdef SPTM_VIRT
     if (nv2_handle_async(regs, 2))
         return;
+#endif
 
     u64 spsr = in_gl12() ? mrs(SYS_IMP_APL_SPSR_GL1) : mrs(SPSR_EL1);
     printf("Exception: FIQ (from %s) cnt: %lx\n", get_exception_source(spsr), mrs(CNTPCT_EL0));
@@ -539,8 +556,10 @@ void exc_fiq(u64 *regs)
 
 void exc_serr(u64 *regs)
 {
+#ifdef SPTM_VIRT
     if (nv2_handle_async(regs, 3))
         return;
+#endif
 
     if (!(exc_guard & GUARD_SILENT))
         printf("Exception: SError\n");

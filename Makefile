@@ -123,6 +123,15 @@ ifeq ($(NV2_TRACE_PRINT),1)
 CFG += NV2_TRACE_PRINT
 endif
 
+# Development builds only: run macOS's stock SPTM, secure kernel and XNU as a FEAT_NV2
+# guest on T8140 (docs/sptm-nv2-virt.md). The image must stay at stage 1's base.
+ifeq ($(SPTM_VIRT),1)
+ifneq ($(CHAINLOADING),1)
+$(error SPTM_VIRT requires CHAINLOADING=1)
+endif
+CFG += SPTM_VIRT
+endif
+
 
 LDFLAGS := -EL -maarch64elf --no-undefined -X -Bsymbolic \
 	-z notext --no-apply-dynamic-relocs --orphan-handling=warn \
@@ -222,7 +231,6 @@ OBJECTS := \
 	sio.o \
 	smc.o \
 	monitor.o \
-	nv2.o nv2_asm.o \
 	pv_kvm.o \
 	psci.o \
 	smp.o \
@@ -242,6 +250,10 @@ OBJECTS := \
 	$(DCP_OBJECTS) \
 	$(HV_OBJECTS) \
 	$(MINILZLIB_OBJECTS) $(TINF_OBJECTS) $(DLMALLOC_OBJECTS) $(LIBFDT_OBJECTS)
+
+ifeq ($(SPTM_VIRT),1)
+OBJECTS += nv2.o nv2_asm.o sptm_virt.o
+endif
 
 FP_OBJECTS := \
 	kboot_gpu.o kboot_gpu_t8152.o kboot_gpu_m4.o \

@@ -1,5 +1,7 @@
 /* SPDX-License-Identifier: MIT */
 
+#include "../build/build_cfg.h"
+
 #include "exception.h"
 #include "memory.h"
 
@@ -23,8 +25,9 @@ _v_sync_body:
     b _exc_return
 
 /*
- * Synchronous exceptions from a lower EL. At EL2 this is where a FEAT_NV2
- * guest's ERET traps (EC 0x1a): its returns to its own userspace (EL0t with
+ * Synchronous exceptions from a lower EL. In SPTM_VIRT builds, at EL2 this is
+ * where a FEAT_NV2 guest's ERET traps (EC 0x1a): its returns to its own
+ * userspace (EL0t with
  * vHCR.{E2H,TGE}) and to itself (EL2t/EL2h, run as EL1t/EL1h) are
  * register-only and complete here, and anything else (a nested guest entry)
  * takes the full path. Aura itself can run at EL1 (as a hypervisor guest, or
@@ -35,6 +38,7 @@ _v_sync_body:
 .type _v_lower_sync, @function
 _v_lower_sync:
     msr pan, #0
+#ifdef SPTM_VIRT
     stp x0, x1, [sp, #-16]!
     mrs x0, CurrentEL
     cmp x0, #(2 << 2)
@@ -43,8 +47,8 @@ _v_lower_sync:
     mov x1, #0x6a000000             // plain ERET; ERETAx need the slow path
     cmp x0, x1
     b.ne 9f
-    /* An ERET traps only at EL1 with HCR_EL2.NV, which the monitor sets
-     * only together with NV2: no need to look at HCR_EL2 or SPSR_EL2. */
+    /* An ERET traps only at EL1 with HCR_EL2.NV, which aura sets only
+     * together with NV2: no need to look at HCR_EL2 or SPSR_EL2. */
     mrs x0, S3_5_C4_C0_0            // SPSR_EL12: the guest's requested PSTATE
     tst x0, #0x10                   // AArch32 target: slow path
     b.ne 9f
@@ -66,6 +70,7 @@ _v_lower_sync:
     ldp x0, x1, [sp], #16
     eret
 9:  ldp x0, x1, [sp], #16
+#endif
     b _v_sync_body
 
 .globl _v_sp0_irq
