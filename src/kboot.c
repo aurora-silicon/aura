@@ -4123,8 +4123,8 @@ static int dt_ext26_snapshot_inner(const char *alias)
         return -1;
     dt_ext26_step("locked-stream5-pages");
     struct dt_ext26_pages maps = {.segments = segments};
-    if (dart_walk_locked_t8110(iommu, min(span, fdt64_ld(reg + 1)), 5, dram, size,
-                               dt_ext26_page, &maps))
+    if (dart_walk_locked_t8110(iommu, min(span, fdt64_ld(reg + 1)), 5, dram, size, dt_ext26_page,
+                               &maps))
         return -1;
     dt_ext26_step("segment-page-coverage");
     for (unsigned int i = 0; i < 4; i++)
