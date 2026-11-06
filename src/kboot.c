@@ -7465,6 +7465,81 @@ struct isp_segment_ranges {
     u32 unk;
 } PACKED;
 
+/*
+ * T6041 (M4 Pro/Max) ISP: iBoot loads the firmware and Linux starts it as iBoot left it
+ * (aurora-silicon/linux#384). Its TEXT and DATA live wherever this boot's iBoot put them, so fill
+ * the kernel DT's placeholders /reserved-memory/isp-firmware-text and isp-firmware-data from the
+ * ADT segment-ranges: reg (no-map) at the physical address and iommu-addresses at the address the
+ * firmware runs them at. Without a placeholder, or with the ISP disabled, nothing is done.
+ */
+static int dt_set_isp_t6041(int fdt_node)
+{
+    static const struct {
+        const char *segment;
+        const char *node;
+    } wanted[] = {{"__TEXT", "isp-firmware-text"}, {"__DATA", "isp-firmware-data"}};
+
+    const char *status = fdt_getprop(dt, fdt_node, "status", NULL);
+    if (status && strcmp(status, "okay") && strcmp(status, "ok"))
+        return 0;
+
+    int adt_node = adt_path_offset(adt, "/arm-io/isp0");
+    if (adt_node < 0)
+        bail("ADT: /arm-io/isp0 not found\n");
+
+    u32 names_len, ranges_len;
+    const char *names = adt_getprop(adt, adt_node, "segment-names", &names_len);
+    const struct adt_segment_ranges *seg =
+        adt_getprop(adt, adt_node, "segment-ranges", &ranges_len);
+    if (!names || !seg)
+        bail("ADT: isp0 segment-names/segment-ranges missing\n");
+
+    uint32_t isp_phandle = fdt_get_phandle(dt, fdt_node);
+    int resv = fdt_path_offset(dt, "/reserved-memory");
+    if (!isp_phandle || resv < 0)
+        bail("FDT: ISP phandle or /reserved-memory missing\n");
+
+    unsigned int count = ranges_len / sizeof(*seg);
+    const char *name = names;
+    for (unsigned int i = 0; i < count && name < names + names_len; i++) {
+        const char *end = memchr(name, ';', names + names_len - name);
+        size_t len = end ? (size_t)(end - name) : strnlen(name, names + names_len - name);
+
+        for (size_t w = 0; w < ARRAY_SIZE(wanted); w++) {
+            if (len != strlen(wanted[w].segment) || memcmp(name, wanted[w].segment, len))
+                continue;
+
+            if (!seg[i].size || seg[i].size > 64 * SZ_1M || (seg[i].phys & (SZ_16K - 1)) ||
+                (seg[i].size & (SZ_16K - 1)))
+                bail("ADT: ISP segment %s has a bad range\n", wanted[w].segment);
+
+            int node = fdt_subnode_offset(dt, resv, wanted[w].node);
+            if (node < 0) {
+                printf("FDT: no /reserved-memory/%s placeholder, ISP left as is\n", wanted[w].node);
+                return 0;
+            }
+
+            fdt64_t reg[2] = {cpu_to_fdt64(seg[i].phys), cpu_to_fdt64(seg[i].size)};
+            fdt32_t iommu[5] = {cpu_to_fdt32(isp_phandle), cpu_to_fdt32(seg[i].remap >> 32),
+                                cpu_to_fdt32(seg[i].remap), cpu_to_fdt32((u64)seg[i].size >> 32),
+                                cpu_to_fdt32(seg[i].size)};
+            if (fdt_setprop(dt, node, "reg", reg, sizeof(reg)) ||
+                fdt_setprop_empty(dt, node, "no-map") ||
+                fdt_setprop(dt, node, "iommu-addresses", iommu, sizeof(iommu)))
+                bail("FDT: could not fill /reserved-memory/%s\n", wanted[w].node);
+            /* the offsets moved: look the parent up again for the next segment */
+            resv = fdt_path_offset(dt, "/reserved-memory");
+            printf("FDT: ISP %s at 0x%lx (+0x%x), runs at 0x%lx\n", wanted[w].segment, seg[i].phys,
+                   seg[i].size, seg[i].remap);
+        }
+        if (!end)
+            break;
+        name = end + 1;
+    }
+
+    return 0;
+}
+
 static int dt_set_isp_fwdata(void)
 {
     const char *fdt_path = "isp";
@@ -7494,6 +7569,10 @@ static int dt_set_isp_fwdata(void)
 
     if (firmware_set_fdt(dt, fdt_node, "apple,firmware-compat", compat) < 0)
         bail("FDT: Could not set apple,firmware-compat for %s\n", fdt_path);
+
+    /* T6041: iBoot's firmware, not m1n1's heap setup */
+    if (chip_id == T6041)
+        return dt_set_isp_t6041(fdt_node);
 
     if (isp_get_heap(&phys, &iova, &size)) {
         const char *status = fdt_getprop(dt, fdt_node, "status", NULL);
