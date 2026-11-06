@@ -48,6 +48,7 @@ int afk_epic_shutdown_ep(afk_epic_ep_t *epic);
 
 int afk_epic_work(afk_epic_t *afk, int endpoint);
 bool afk_epic_is_v2(const afk_epic_ep_t *epic);
+int afk_epic_active_endpoints(const afk_epic_t *afk, u32 *mask);
 int afk_epic_start_interface(afk_epic_ep_t *epic, void *intf, int expected, size_t insize,
                              size_t outsize);
 int afk_epic_command(afk_epic_ep_t *epic, int channel, u16 sub_type, void *txbuf, size_t txsize,

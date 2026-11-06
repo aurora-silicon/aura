@@ -496,6 +496,24 @@ bool afk_epic_is_v2(const afk_epic_ep_t *epic)
     return epic->afkv2;
 }
 
+/* Describe only sessions this instance owns completely. A half-started
+ * endpoint cannot safely be advertised to the next owner as stopped. */
+int afk_epic_active_endpoints(const afk_epic_t *afk, u32 *mask)
+{
+    if (!afk || !mask)
+        return -1;
+    *mask = 0;
+    for (u32 i = 0; i < ARRAY_SIZE(afk->endpoint); i++) {
+        const afk_epic_ep_t *ep = afk->endpoint[i];
+        if (!ep)
+            continue;
+        if (!ep->started)
+            return -1;
+        *mask |= BIT(i);
+    }
+    return 0;
+}
+
 static afk_epic_service_t *afk_epic_find_service(afk_epic_ep_t *epic, u32 channel)
 {
     for (u32 i = 0; i < epic->num_channels; i++)

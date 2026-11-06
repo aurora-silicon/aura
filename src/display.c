@@ -1016,6 +1016,18 @@ int display_init(void)
     }
 }
 
+int display_active_afk_endpoints(const char *adt_path, u32 *mask)
+{
+    if (chip_id != T8152 || !adt_path || !mask)
+        return -1;
+    if (dcp && !strcmp(adt_path, t8152_config->dcp))
+        return afk_epic_active_endpoints(dcp->afk, mask);
+    if (display_other.dcp && display_other.cfg &&
+        !strcmp(adt_path, display_other.cfg->dcp))
+        return afk_epic_active_endpoints(display_other.dcp->afk, mask);
+    return -1;
+}
+
 int display_shutdown(dcp_shutdown_mode mode)
 {
     /* Linux owns the live J700/J713/J873 controllers. Keep the inherited ASC session

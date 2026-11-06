@@ -22,6 +22,7 @@ int display_configure_second(const char *config);
 int display_shutdown(dcp_shutdown_mode mode);
 const display_config_t *display_get_config(void);
 bool display_dart_tables_inherited(void);
+int display_active_afk_endpoints(const char *adt_path, u32 *mask);
 
 /* The second display's framebuffer (J873g HDMI next to USB-C), base 0 if none. */
 extern struct boot_video display_second_video;
