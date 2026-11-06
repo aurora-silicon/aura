@@ -394,7 +394,7 @@ void exc_sync(u64 *regs)
      */
     if (monitor_active && !in_gl && !el3 && !(spsr & 0x8) &&
         (exc_guard & GUARD_TYPE_MASK) == GUARD_OFF) {
-        monitor_reflect_undef(elr, spsr);
+        nv2_reflect_undef(elr, spsr);
         return;
     }
 

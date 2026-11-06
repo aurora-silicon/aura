@@ -115,12 +115,6 @@ ifeq ($(DEBUGUSB_PROXY),1)
 CFG += DEBUGUSB_PROXY
 endif
 
-# Development builds only: run the OS at virtual EL2 under FEAT_NV2 without
-# the aura-nv2 boot argument (for test images whose boot arguments are fixed).
-ifeq ($(NV2_BOOT),1)
-CFG += NV2_BOOT
-endif
-
 # Development builds only: log the first FEAT_NV2 guest entries and exits.
 ifeq ($(NV2_TRACE),1)
 CFG += NV2_TRACE

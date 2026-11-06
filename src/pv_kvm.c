@@ -5,7 +5,6 @@
 #include "cpu_regs.h"
 #include "memory.h"
 #include "monitor.h"
-#include "nv2.h"
 #include "string.h"
 #include "utils.h"
 #include "xnuboot.h"
@@ -50,7 +49,7 @@ static void pv_set_error(struct aura_pv_control_v0 *c, u64 seq, s64 status)
  * fine-grained traps; elsewhere the OS keeps EL2 and the request is ignored. */
 bool pv_kvm_requested(void)
 {
-    return aura_pv_enabled() && !nv2_requested() && monitor_required();
+    return aura_pv_enabled() && monitor_required();
 }
 
 void pv_kvm_prepare(void)

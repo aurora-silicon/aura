@@ -6,9 +6,7 @@ static bool console_requested;
 static bool proxy_requested;
 static bool trial_running;
 static bool is_stage1;
-static bool nv2_option;
 static bool pv_option;
-static int nv2_override = -1;
 static int pv_override = -1;
 
 static bool boot_space(char c)
@@ -49,13 +47,6 @@ void boot_options_init(const char *line, size_t capacity)
     console_requested = boot_option_present(line, capacity, "aura-console");
     proxy_requested = boot_option_present(line, capacity, "aura-proxy");
     trial_running = boot_option_present(line, capacity, "aura-trial");
-    nv2_option =
-#ifdef NV2_BOOT
-        true;
-#else
-        false;
-#endif
-    nv2_option = nv2_option || boot_option_present(line, capacity, "aura-nv2");
     pv_option = boot_option_present(line, capacity, "aura-pv");
     if (boot_option_present(line, capacity, "aura-pv=1") ||
         boot_option_present(line, capacity, "aura-pv=on"))
@@ -63,15 +54,6 @@ void boot_options_init(const char *line, size_t capacity)
     else if (boot_option_present(line, capacity, "aura-pv=0") ||
              boot_option_present(line, capacity, "aura-pv=off"))
         pv_option = false;
-    /* A value-bearing token is useful when the OS supplies the boot command
-     * line. Keep the historical bare token as the opt-in spelling. */
-    if (boot_option_present(line, capacity, "aura-nv2=1") ||
-        boot_option_present(line, capacity, "aura-nv2=on"))
-        nv2_option = true;
-    else if (boot_option_present(line, capacity, "aura-nv2=0") ||
-             boot_option_present(line, capacity, "aura-nv2=off"))
-        nv2_option = false;
-    nv2_override = -1;
     pv_override = -1;
     is_stage1 = true;
 }
@@ -92,18 +74,7 @@ void boot_options_set_console(bool console)
     console_requested = console;
 }
 
-/* Run the OS at virtual EL2 under FEAT_NV2 so it can host VMs (opt-in). */
-bool aura_nv2_enabled(void)
-{
-    return nv2_override >= 0 ? nv2_override : nv2_option;
-}
-
-void boot_options_set_nv2_override(int enabled)
-{
-    nv2_override = enabled < 0 ? -1 : !!enabled;
-}
-
-/* Keep PV discovery/RUN separate from the NV2 host mode. */
+/* The PV-KVM prototype's discovery/RUN interface (opt-in). */
 bool aura_pv_enabled(void)
 {
     return pv_override >= 0 ? pv_override : pv_option;

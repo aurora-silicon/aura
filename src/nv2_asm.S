@@ -140,3 +140,18 @@ nv2_probe_ret:
     ldp x27, x28, [sp], #16
     ldp x29, x30, [sp], #16
     ret
+
+// nv2_enter_el1h(entry, x0, x1, x2): enter the OS at EL1h with DAIF masked.
+.globl nv2_enter_el1h
+.type nv2_enter_el1h, @function
+nv2_enter_el1h:
+    msr elr_el2, x0
+    mov x4, #0x3c5
+    msr spsr_el2, x4
+    msr sp_el1, xzr
+    mov x0, x1
+    mov x1, x2
+    mov x2, x3
+    mov x3, xzr
+    isb
+    eret

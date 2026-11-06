@@ -4,26 +4,23 @@
 
 #include "nv2.h"
 #include "arm_cpu_regs.h"
-#include "boot_options.h"
 #include "cpu_regs.h"
 #include "malloc.h"
 #include "memory.h"
-#include "monitor.h"
 #include "smp.h"
 #include "string.h"
 #include "utils.h"
 
 /*
- * Names used below: L1 is the OS the monitor runs at virtual EL2 (real EL1
- * with HCR_EL2.NV|NV2). A "child" is anything L1 enters with an ERET that is
- * not to itself or its own userspace: its EL1 kernel during early boot (with
- * its stage 2 off) and, after that, KVM's guests (L2). Only one context runs
- * on a CPU at a time; the monitor swaps the EL1 register file between L1 and
- * the child at each entry and exit, using the VNCR page as the child's bank.
+ * Names used below: L1 is the OS aura runs at virtual EL2 (real EL1 with
+ * HCR_EL2.NV|NV2). A "child" is anything L1 enters with an ERET that is not
+ * to itself or its own userspace: its EL1 kernel during early boot (with its
+ * stage 2 off) and, after that, its own guests (L2). Only one context runs on
+ * a CPU at a time; aura swaps the EL1 register file between L1 and the child
+ * at each entry and exit, using the VNCR page as the child's bank.
  *
- * There is no SPTM here: L1 runs with no stage 2 of its own, so the IPA->PA
- * stage 2 its KVM builds for a guest is already in physical addresses, and the
- * monitor installs the guest's VTTBR/VTCR into the hardware as they are.
+ * L1's IPAs are physical addresses, so the stage 2 it builds for a child is
+ * too, and aura installs the child's VTTBR/VTCR into the hardware as they are.
  *
  * Offsets in the VNCR page are ARM's, measured on T8140 (2026-10-31). The
  * Apple AVNCR page holds L1's VM_TMR_FIQ_ENA_EL2 view at 0x408 and the nested
@@ -140,7 +137,7 @@ bool nv2_probe_active = false;
 #define CPTR_TCPAC      BIT(31)
 
 /* Bits of L1's HCR_EL2 view a child may run with. NV/NV1/NV2/TGE/E2H are
- * the monitor's: a child never sees TGE, E2H is RAO, NV1 is never set. */
+ * aura's: a child never sees TGE, E2H is RAO, NV1 is never set. */
 #define CHILD_HCR_PASS                                                                             \
     (HCR_VM | HCR_SWIO | HCR_PTW | HCR_FMO | HCR_IMO | HCR_AMO | HCR_VF | HCR_VI | HCR_VSE |       \
      HCR_FB | HCR_BSU | HCR_DC | HCR_TWI | HCR_TWE | HCR_TID0 | HCR_TID1 | HCR_TID2 | HCR_TID3 |   \
@@ -179,10 +176,9 @@ struct nv2_cpu {
 static struct nv2_cpu nv2_cpus[MAX_CPUS];
 
 /*
- * NV2_TRACE development builds log NV2 events to a per-CPU ring in a no-map
- * reserved-memory node ("aura,nv2-trace") that the OS can read through
- * /dev/mem while it runs. Nothing is printed: once the OS owns the console a
- * monitor printf can stall a CPU for a second per byte.
+ * NV2_TRACE development builds log NV2 events to a per-CPU ring at
+ * nv2_trace_buf. Nothing is printed unless NV2_TRACE_PRINT: once the OS owns
+ * the console a printf from aura can stall a CPU for a second per byte.
  */
 #ifdef NV2_TRACE
 #define NV2_TRACE_CPU_BYTES 0x10000
@@ -213,24 +209,14 @@ static void nv2_trace(u64 type, u64 a, u64 b, u64 c, u64 d, u64 e, u64 f)
     sysop("dmb ish");
     t->head++;
 #ifdef NV2_TRACE_PRINT
-    /* Early boot only: the monitor may print until the OS owns the console. */
+    /* Early boot only: aura may print until the OS owns the console. */
     if (t->head <= 300)
         printf("NV2[%d] %lu t%lu %lx %lx %lx %lx %lx %lx\n", smp_id(), t->head, type, a, b, c, d, e,
                f);
 #endif
 }
-
-void nv2_trace_region(u64 *base, u64 *size)
-{
-    *base = (u64)nv2_trace_buf;
-    *size = nv2_trace_buf ? MAX_CPUS * NV2_TRACE_CPU_BYTES : 0;
-}
 #else
 #define nv2_trace(...) (void)0
-void nv2_trace_region(u64 *base, u64 *size)
-{
-    *base = *size = 0;
-}
 #endif
 
 enum {
@@ -251,25 +237,6 @@ static u8 *nv2_pages[MAX_CPUS];
 static inline struct nv2_cpu *nv2_this(void)
 {
     return &nv2_cpus[smp_id()];
-}
-
-/*
- * The VNCR layout and the AVNCR map of Apple's own registers are architectural,
- * so the path lights up on any Apple CPU that implements FEAT_NV2; the trap set
- * was characterized on T8140. FEAT_NV2 (ID_AA64MMFR2_EL1.NV >= 2) must be present.
- */
-bool nv2_requested(void)
-{
-    static int supported = -1;
-
-    if (!aura_nv2_enabled())
-        return false;
-    if (supported < 0) {
-        supported = FIELD_GET(ID_AA64MMFR2_NV, mrs(SYS_ID_AA64MMFR2_EL1)) >= 2;
-        if (!supported)
-            printf("NV2: requested, but this CPU lacks FEAT_NV2; ignoring\n");
-    }
-    return supported;
 }
 
 void nv2_prepare(void)
@@ -1340,7 +1307,7 @@ bool nv2_handle_sync(u64 *regs)
     u64 esr = mrs(ESR_EL2);
     u32 ec = esr >> 26;
 
-    if (!c->armed || (mrs(SPSR_EL2) & 0xc) == 0x8) /* the monitor's own */
+    if (!c->armed || (mrs(SPSR_EL2) & 0xc) == 0x8) /* aura's own */
         return false;
     if (c->child)
         return nv2_child_sync(c, esr);
@@ -1374,8 +1341,6 @@ bool nv2_handle_sync(u64 *regs)
                 return false;
             nv2_inject_self(esr);
             return true;
-        case ESR_EC_SMC:
-            return false; /* PSCI */
         default:
             nv2_trace(NV2_T_FAIL, ec, esr, mrs(ELR_EL2), mrs(SPSR_EL2), 5, 0);
             return false;
@@ -1393,20 +1358,14 @@ void nv2_note_unhandled(u64 esr, u64 elr, u64 spsr)
 }
 
 /*
- * Reflect a trap the monitor does not service back into the OS as an UNDEF
- * ("unknown reason") exception, instead of resetting the whole machine. Under
- * NV2 the OS runs at virtual EL2, so inject at its current-EL vector; otherwise
- * the OS is at plain EL1. elr/spsr are the faulting context (ELR_EL2/SPSR_EL2
- * under VHE). Lives here because the EL12 register plumbing does.
+ * Reflect a trap aura does not service back into an OS at EL1 as an UNDEF
+ * ("unknown reason") exception, instead of resetting the whole machine.
+ * elr/spsr are the faulting context (ELR_EL2/SPSR_EL2 under VHE). Lives here
+ * because the EL12 register plumbing does.
  */
-void monitor_reflect_undef(u64 elr, u64 spsr)
+void nv2_reflect_undef(u64 elr, u64 spsr)
 {
-    const u64 undef = 0x02000000; /* EC_UNKNOWN, IL=1 */
-    if (nv2_active) {
-        nv2_inject_self(undef); /* re-reads ELR_EL2/SPSR_EL2; targets virtual EL2 */
-        return;
-    }
-    msr(SYS_ESR_EL12, undef);
+    msr(SYS_ESR_EL12, 0x02000000); /* EC_UNKNOWN, IL=1 */
     msr(SYS_ELR_EL12, elr);
     msr(SYS_SPSR_EL12, spsr);
     /* From EL1: the current-EL (SPx) vector; from EL0: the lower-EL vector. */
@@ -1468,16 +1427,73 @@ __attribute__((used, retain)) void nv2_probe_disarm(void)
     msr(SYS_HFGITR_EL2, 0);
 }
 
+void nv2_enter_el1h(u64 entry, u64 a0, u64 a1, u64 a2) __attribute__((noreturn));
+
+/* The EL2 state under an OS at virtual EL2, before nv2_enter_os adds the NV2 traps. */
+static void nv2_el2_setup(void)
+{
+    /* No stage 2. IRQ, FIQ, SError and external aborts all go to EL1, and an SMC is not trapped:
+     * with no EL3 it is UNDEFINED, as on the bare machine. */
+    reg_clr(HCR_EL2, HCR_TGE | HCR_AMO | HCR_IMO | HCR_FMO | HCR_TEA | HCR_TSC | HCR_VM | HCR_NV |
+                         HCR_NV1 | HCR_NV2);
+    msr(VTTBR_EL2, 0);
+    msr(HACR_EL2, 0);
+    msr(HSTR_EL2, 0);
+    msr(MDCR_EL2, 0);
+
+    /* With TGE clear, EL1 reads these in place of MIDR_EL1 and MPIDR_EL1. */
+    msr(VPIDR_EL2, mrs(MIDR_EL1));
+    msr(VMPIDR_EL2, mrs(MPIDR_EL1));
+
+    msr(CNTHCTL_EL2, CNTHCTL_EL1PTEN | CNTHCTL_EL1PCTEN);
+    msr(CNTVOFF_EL2, 0);
+
+    u64 cptr = CPTR_E2H_FPEN;
+    u64 hfg = 0;
+    if (FIELD_GET(ID_AA64PFR1_SME, mrs(SYS_ID_AA64PFR1_EL1))) {
+        cptr |= CPTR_E2H_SMEN;
+        hfg |= HFGxTR_nSMPRI_EL1 | HFGxTR_nTPIDR2_EL0;
+    }
+    msr(SYS_CPTR_EL2, cptr);
+    sysop("isb");
+
+    if (hfg) {
+        u64 smcr = SMCR_LEN;
+        if (mrs(SYS_ID_AA64SMFR0_EL1) & ID_AA64SMFR0_FA64)
+            smcr |= SMCR_FA64;
+        if (FIELD_GET(ID_AA64SMFR0_SMEVER, mrs(SYS_ID_AA64SMFR0_EL1)))
+            smcr |= SMCR_EZT0;
+        msr(SYS_SMCR_EL2, smcr);
+        if (mrs(SYS_SMIDR_EL1) & SMIDR_SMPS)
+            msr(SYS_SMPRIMAP_EL2, 0);
+    }
+
+    /* Fine-grained traps: the "n" bits trap when clear. */
+    msr(SYS_HFGRTR_EL2, hfg);
+    msr(SYS_HFGWTR_EL2, hfg);
+    msr(SYS_HFGITR_EL2, 0);
+    msr(SYS_HDFGRTR_EL2, 0);
+    msr(SYS_HDFGWTR_EL2, 0);
+
+    u64 mmfr1 = mrs(SYS_ID_AA64MMFR1_EL1);
+    if (FIELD_GET(ID_AA64MMFR1_HCX, mmfr1))
+        msr(SYS_HCRX_EL2, 0);
+    if (FIELD_GET(ID_AA64MMFR1_LO, mmfr1))
+        msr(SYS_LORC_EL1, 0);
+
+    sysop("isb");
+}
+
 /*
- * Enter the OS at virtual EL2 instead of plain EL1. The base EL2 passthrough
- * is monitor_el2_setup's; on top of it NV|NV2 redirect the OS's EL2 register
- * accesses to this CPU's VNCR/AVNCR pages and trap its ERETs, HCR.AT and the
- * VMALLE1 FGT traps let the monitor run those under a guest's context. The
- * EL2 MMU stays on so the redirected accesses are cacheable.
+ * Enter the OS at virtual EL2. On top of nv2_el2_setup's passthrough, NV|NV2
+ * redirect the OS's EL2 register accesses to this CPU's VNCR/AVNCR pages and
+ * trap its ERETs, and HCR.AT and the VMALLE1 FGT traps let aura run those
+ * under a guest's context. The EL2 MMU stays on so the redirected accesses
+ * are cacheable.
  */
 void nv2_enter_os(u64 entry, u64 a0, u64 a1, u64 a2)
 {
-    monitor_el2_setup();
+    nv2_el2_setup();
     if (!(mrs(SCTLR_EL1) & SCTLR_M))
         mmu_init_secondary_local();
 
@@ -1501,5 +1517,5 @@ void nv2_enter_os(u64 entry, u64 a0, u64 a1, u64 a2)
     msr(HCR_EL2, hcr);
     sysop("isb");
 
-    monitor_eret(entry, a0, a1, a2);
+    nv2_enter_el1h(entry, a0, a1, a2);
 }

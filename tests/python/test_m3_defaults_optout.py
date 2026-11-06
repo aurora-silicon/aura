@@ -240,7 +240,6 @@ static bool nvme_init(void) { printf("NVME init\n"); return true; }
 static void mitigations_configure(const char *s) {}
 static int boot_storage_load(const char *spec, struct kernel_header **k, void **f) { return -1; }
 /* The ESP policy overrides payload_run() applies from chosen.aura,* lines. */
-static void boot_options_set_nv2_override(int enabled) { (void)enabled; }
 static void boot_options_set_pv_override(int enabled) { (void)enabled; }
 /* A stage 1 configured with its target (stage1_config.c), or not (NULL) */
 static const char *stage1_target;
