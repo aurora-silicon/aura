@@ -28,6 +28,7 @@
  */
 
 bool nv2_active = false;
+bool nv2_guarded = false;
 
 /* True only while a proxy nv2_probe_call()/nv2_probe_arm() diagnostic is in
  * flight. It gates the `hvc #1` proxy-return path so a production guest's own
@@ -155,6 +156,7 @@ struct nv2_cpu {
     bool armed;
     /* L1's real EL2 trap controls, restored at every child exit */
     u64 l1_hfgrtr, l1_hfgwtr, l1_hfgitr, l1_hdfgrtr, l1_hdfgwtr, l1_hcrx, l1_cptr, l1_cnthctl;
+    u64 agt_hp_ctl;
     /* Set once this CPU has run a guest hypervisor (see nv2_child_enter). */
     bool nested_mode;
     u64 vcptr; /* L1's CPTR_EL2 as written, all bits, in nested mode */
@@ -543,6 +545,8 @@ static bool nv2_child_enter(struct nv2_cpu *c, u64 spsr, u64 elr)
         }
     }
 
+    /* Under SPTM the host (SPTM/TXM/XNU) and this EL1 guest also differ in Apple's per-level
+     * registers: switch them around the EL1 file swap, as for cL4 (sptm_virt_cl4.c). */
     nv2_bank_save(c->parent);
     c->parent_sp1 = mrs(SP_EL1);
     c->parent_cntkctl = mrs(SYS_CNTKCTL_EL12);
@@ -1020,7 +1024,10 @@ static bool nv2_sysreg_do(struct nv2_cpu *c, u64 *regs, u64 esr)
     if (op0 == 1) {
         if (read)
             return false;
-        if (crn == 8) {
+        if (crn == 8 || crn == 9) {
+            /* CRn=9 holds the FEAT_XS "NXS" TLBI variants (TLBI *NXS); the
+             * invalidation semantics are identical to the CRn=8 forms (NXS only
+             * changes which DSB completes them), so emulate them the same way. */
             if (!nv2_tlbi(c, op1, crm, op2, value))
                 return false;
         } else if (crn == 7 && (crm == 8 || crm == 9)) {
@@ -1225,6 +1232,16 @@ static bool nv2_sysreg_do(struct nv2_cpu *c, u64 *regs, u64 esr)
                 return false;
             value = nv2_gic_status(c, op2);
             break;
+        case KEY(3, 1, 15, 13, 4):
+            /* AGTCNTHP_CTL from EL2 (XNU's arm_init masks it): a per-CPU shadow. */
+            slot = &c->agt_hp_ctl;
+            break;
+        case KEY(3, 6, 15, 12, 4):
+            /* APSTS_EL1: PAC is up on the hardware; a guest hypervisor (SPTM's __start) polls
+             * its bit 0 before it configures APCTL. */
+            if (read)
+                value = mrs(SYS_IMP_APL_APSTS_EL1);
+            break;
         default:
             nv2_note_unknown(c, key, read);
             value = 0;
@@ -1373,7 +1390,6 @@ void nv2_reflect_undef(u64 elr, u64 spsr)
     msr(SPSR_EL2, (spsr & GENMASK(31, 28)) | 0x3c5); /* EL1h, DAIF masked */
     sysop("isb");
 }
-
 bool nv2_handle_async(u64 *regs, int kind)
 {
     UNUSED(regs);
@@ -1504,8 +1520,11 @@ void nv2_enter_os(u64 entry, u64 a0, u64 a1, u64 a2)
     memset(nv2_pages[cpu], 0, SZ_16K);
     ((u64 *)vncr)[V_HCR / 8] = HCR_RW | HCR_E2H;
 
-    u64 hcr =
-        (mrs(HCR_EL2) & ~(HCR_TGE | HCR_NV1 | HCR_TTLB)) | HCR_NV | HCR_NV2 | HCR_AT | HCR_TID3;
+    /* A guarded guest (SPTM) reads its real IDs and runs GXF/SPRR natively, so
+     * it takes neither the ID-register trap nor the ID_AA64MMFR4 NV2-only
+     * rewrite the Linux guest needs. The NV|NV2 redirection and ERET gate stay. */
+    u64 hcr = (mrs(HCR_EL2) & ~(HCR_TGE | HCR_NV1 | HCR_TTLB)) | HCR_NV | HCR_NV2 | HCR_AT |
+              (nv2_guarded ? 0 : HCR_TID3);
     nv2_cpu_arm(&nv2_cpus[cpu], vncr, avncr, hcr);
     nv2_cpus[cpu].scratch = (u64 *)(vncr + 2 * SZ_4K);
 

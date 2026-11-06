@@ -18,6 +18,13 @@ extern bool nv2_active;
 /* Set only while a proxy nv2_probe_call()/nv2_probe_arm() is in flight. */
 extern bool nv2_probe_active;
 
+/*
+ * A guarded guest (the stock SPTM, see sptm_virt.c) runs its own GXF/SPRR world natively below
+ * EL2. When set before nv2_enter_os, aura leaves its ID registers, its IMPDEF registers and
+ * GENTER/GEXIT untrapped, while keeping the FEAT_NV2 EL2 redirection and the ERET gate.
+ */
+extern bool nv2_guarded;
+
 /* Allocate the per-CPU NV pages; before the OS memory map is fixed. */
 void nv2_prepare(void);
 void nv2_enter_os(u64 entry, u64 a0, u64 a1, u64 a2) __attribute__((noreturn));
