@@ -242,15 +242,106 @@ def check_trailing_bytes(worker, report):
     require(tail['prefetched_bytes'] == tail['fresh_bytes'] == 0,
             'unexpected trailing guest bytes after final marker/SYSTEM_OFF')
 
+class FailureDiagnostics:
+    """Preserve the first live context before the normal Windows abort handshake."""
+
+    def __init__(self, session, out, report, address, guest_base, parser, hard_deadline,
+                 now=time.monotonic):
+        self.session, self.out, self.report = session, out, report
+        self.address, self.guest_base, self.parser = address, guest_base, parser
+        self.hard_deadline, self.now = hard_deadline, now
+        self.started = None
+        self.requested = self.hard_expired = False
+        self.events = report['diagnostic_events'] = []
+        self.replies = report['hv_start_replies'] = []
+
+    def install(self):
+        self.original_abort = self.session.hv._abort_windows_guest
+        self.original_proxyreq = self.session.iface.proxyreq
+        self.session.hv._abort_windows_guest = self.capture
+        self.session.iface.proxyreq = self.proxyreq
+
+    def begin(self):
+        self.started = self.now()
+        self.report['guest_started_monotonic'] = self.started
+        return min(230, self.hard_deadline - self.started)
+
+    def alarm(self):
+        now = self.now()
+        if now >= self.hard_deadline:
+            self.hard_expired = True
+            raise TimeoutError('hardware deadline; guest state unknown unless return was recorded')
+        if self.started is not None and not self.requested and not self.events:
+            remaining = self.started + 230 - now
+            if remaining > 0:
+                return min(remaining, self.hard_deadline - now)
+            self.requested = True
+            self.report['diagnostic_interrupt_monotonic'] = now
+            self.session.hv.interrupt()
+        return self.hard_deadline - now
+
+    def capture(self, reason, code, info):
+        index = len(self.events)
+        event = {'reason': int(reason), 'code': int(code), 'info': hex(info),
+                 'monotonic': self.now(),
+                 'kind': ('deadline-interrupt' if self.requested and int(reason) == 3 and
+                          int(code) == 3 else 'guest-exception')}
+        self.events.append(event)
+        try:
+            raw = self.session.iface.readmem(info, self.parser.sizeof())
+            (self.out / f'exception-{index:02d}.bin').write_bytes(raw)
+            ctx = self.parser.parse(raw)
+            event.update(cpu=int(ctx.cpu_id), elr=hex(ctx.elr), far=hex(ctx.far), esr=int(ctx.esr),
+                         spsr=int(ctx.spsr), regs=[hex(x) for x in ctx.regs],
+                         sp=[hex(x) for x in ctx.sp], guest_pc_offset=ctx.elr - self.guest_base)
+            result = self.session.iface.readmem(self.address, SIZE)
+            (self.out / f'result-at-exception-{index:02d}.bin').write_bytes(result)
+            event['result_words'] = [hex(x) for x in struct.unpack('<32Q', result)]
+        except Exception as error:
+            event['capture_error'] = type(error).__name__ + ': ' + str(error)
+            if self.hard_expired:
+                raise
+        finally:
+            try:
+                (self.out / 'diagnostic-events.json').write_text(json.dumps(self.events, indent=2) + '\n')
+            except OSError as error:
+                event['artifact_error'] = str(error)
+            # At the hard deadline the transport may be stuck; do not start an
+            # unbounded second operation after the last alarm has expired.
+            if not self.hard_expired:
+                self.original_abort(reason, code, info)
+
+    def proxyreq(self, request, *args, **kwargs):
+        reply = self.original_proxyreq(request, *args, **kwargs)
+        if struct.unpack_from('<Q', request)[0] == self.session.proxy.P_HV_START and reply is not None:
+            opcode, status, value = struct.unpack('<Qqq', reply)
+            self.replies.append({'opcode': opcode, 'status': status, 'value': value})
+            (self.out / 'hv-start-reply.bin').write_bytes(reply)
+        return reply
+
+    @property
+    def returned(self):
+        return len(self.replies) == 1 and self.replies[0]['opcode'] == self.session.proxy.P_HV_START
+
+
 def execute(args, out, nonce, report):
     import serial
     from aura.adt import load_adt
+    from aura.proxy import ExcInfo, ProxyRemoteError
     from aura.windows import HardwareSession, validate_capabilities
     report['usb_binding'] = bind_cdc(args.device, args.guest_device, out)
-    session = worker = port = None
+    session = worker = port = diagnostics = None
+    hard_deadline = time.monotonic() + 250
     saved = {s: signal.getsignal(s) for s in (signal.SIGALRM, signal.SIGINT, signal.SIGQUIT)}
     def expired(signum, frame):
-        raise TimeoutError('hardware deadline; guest state unknown unless return was recorded')
+        remaining = hard_deadline - time.monotonic()
+        # Arm the hard limit before a soft-interrupt write or callback can block.
+        if remaining > 0:
+            signal.setitimer(signal.ITIMER_REAL, remaining)
+        if diagnostics is None:
+            raise TimeoutError('hardware deadline before guest entry')
+        delay = diagnostics.alarm()
+        signal.setitimer(signal.ITIMER_REAL, delay)
     signal.signal(signal.SIGALRM, expired)
     signal.setitimer(signal.ITIMER_REAL, 250)
     try:
@@ -281,15 +372,33 @@ def execute(args, out, nonce, report):
                 before = session.iface.readmem(address, SIZE)
                 (out / 'result-before.bin').write_bytes(before)
                 require(before == plan.image[OFFSET:OFFSET + SIZE], 'uploaded input block mismatch')
+                diagnostics = FailureDiagnostics(session, out, report, address,
+                                                 int(loaded['guest_base'], 0), ExcInfo, hard_deadline)
+                diagnostics.install()
                 worker = HostProtocol(port, nonce, out); worker.start()
                 report['guest_state'] = 'running-until-verified-return'
                 (out / 'receipt.json').write_text(json.dumps(report, indent=2) + '\n')
-                status = session.start(); report['host_return_status'] = status
-                report['guest_state'] = 'returned'
-                require(status == 1, 'expected virtual SYSTEM_OFF and completed drain')
+                delay = diagnostics.begin()
+                if delay <= 0:
+                    diagnostics.alarm()
+                signal.setitimer(signal.ITIMER_REAL, delay)
+                status = start_error = None
+                try:
+                    status = session.start()
+                except (ProxyRemoteError, RuntimeError) as error:
+                    start_error = type(error).__name__ + ': ' + str(error)
+                    report['start_error'] = start_error
+                report['host_return_status'] = status
+                require(diagnostics.returned, 'no matching P_HV_START reply; guest state unknown')
+                diagnostics.started = None
+                report['guest_state'] = ('returned-failure' if diagnostics.replies[0]['status'] else 'returned')
+                report['first_abort_reason'] = session.hv.windows_abort_reason
                 raw = session.iface.readmem(address, SIZE)
                 (out / 'result-after.bin').write_bytes(raw)
                 report['proxy_responsive'] = session.capabilities() == caps
+                require(start_error is None and not diagnostics.events and not diagnostics.requested,
+                        'guest aborted or diagnostic deadline reached: ' + str(start_error))
+                require(status == 1, 'expected virtual SYSTEM_OFF and completed drain')
                 worker.join(1)
                 require(not worker.is_alive() and worker.error is None, 'host protocol failed: ' + str(worker.error))
                 check_trailing_bytes(worker, report)
