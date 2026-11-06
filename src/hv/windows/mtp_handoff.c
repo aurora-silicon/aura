@@ -282,18 +282,42 @@ bool hv_windows_mtp_prepare(void)
     u32 count = 0;
     printf("mtp-handoff: phase7 non-consuming DockChannel readiness\n");
     do {
-        if (rtkit_service_quiet(mtp.rtkit, 4) < 0 || exc_count != before)
+        int serviced = rtkit_service_quiet(mtp.rtkit, 4);
+        if (exc_count != before) {
+            printf("mtp-handoff: phase7 RTKit MMIO fault\n");
             goto fail;
+        }
+        if (serviced < 0) {
+            struct rtkit_rejection rejection;
+            if (rtkit_get_first_rejection(mtp.rtkit, &rejection))
+                printf("mtp-handoff: phase7 RTKit rejected reason=%u msg0=%#lx msg1=%#lx\n",
+                       (unsigned)rejection.reason, (unsigned long)rejection.msg0,
+                       (unsigned long)rejection.msg1);
+            else
+                printf("mtp-handoff: phase7 RTKit service state failure\n");
+            goto fail;
+        }
         count = read32(MTP_DATA + 0x2c); /* RX_COUNT only; never consume INIT. */
+        if (exc_count != before) {
+            printf("mtp-handoff: phase7 DockChannel MMIO fault\n");
+            goto fail;
+        }
         if (count)
             break;
     } while (!timeout_expired(deadline));
-    if (!count || exc_count != before)
+    if (!count) {
+        printf("mtp-handoff: phase7 readiness timeout\n");
         goto fail;
+    }
     __atomic_store_n(&mtp.ready, true, __ATOMIC_RELEASE);
     if (!hv_windows_mtp_map_guest() || exc_count != before)
         goto fail;
     exc_guard = saved;
+    struct rtkit_notification_counts notifications = {0};
+    rtkit_get_notification_counts(mtp.rtkit, &notifications);
+    printf("mtp-handoff: phase7 notifications app=%lu debug=%lu oslog3=%lu\n",
+           (unsigned long)notifications.app, (unsigned long)notifications.debug,
+           (unsigned long)notifications.oslog_type3);
     printf("mtp-handoff: J813 ready, preserved DockChannel RX=%u, DART SID0, pool %#lx/+%#lx\n",
            count, (unsigned long)(MTP_STAGE_PA + MTP_STAGE_SIZE), (unsigned long)MTP_STAGE_SIZE);
     return true;

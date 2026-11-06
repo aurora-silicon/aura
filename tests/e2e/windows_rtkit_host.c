@@ -46,7 +46,7 @@ static bool adt_is_compatible(void *a, int n, const char *p)
     (void)p;
     return false;
 }
-static bool quiet_boundary, tx_ready = true, fail_map, omit_ap_ack;
+static bool quiet_boundary, tx_ready = true, fail_map, omit_ap_ack, fail_send;
 static u64 now;
 static unsigned maps, unmaps, cleans, heap_allocations, barriers;
 #define sysop(op)                                                                                  \
@@ -168,6 +168,8 @@ bool asc_send(asc_dev_t *a, const struct asc_message *m)
     (void)a;
     assert(barriers == cleans);
     assert(tx_ready && sent < 128);
+    if (fail_send)
+        return false;
     tx[sent++] = *m;
     if (m->msg1 == 0 && FIELD_GET(GENMASK(59, 52), m->msg0) == 0xb && (m->msg0 & 0xffff) == 0x20) {
         queue(2, (1ULL << 52) | (1ULL << 44));
@@ -239,12 +241,13 @@ static void reset_bus(void)
     read_at = write_at = sent = 0;
     tx_ready = true;
     omit_ap_ack = false;
+    fail_send = false;
     now = 0;
 }
 static void boot_messages(void)
 {
     queue(0, (1ULL << 52) | 11 | (12ULL << 16));
-    queue(0, (8ULL << 52) | BIT(51) | BIT(1) | BIT(2) | BIT(4) | BIT(8) | BIT(10));
+    queue(0, (8ULL << 52) | BIT(51) | BIT(1) | BIT(2) | BIT(3) | BIT(4) | BIT(8) | BIT(10));
 }
 int main(int argc, char **argv)
 {
@@ -359,14 +362,108 @@ int main(int argc, char **argv)
             assert(now <= 1020 && r->windows_failed && rtkit_has_owned_buffers(r));
         } else {
             assert(rtkit_boot_timed(r, 1000));
-            queue(0x20, 0x1234);
+            unsigned before_read = read_at, before_sent = sent;
+            queue(3, 0x1234);
+            queue(0x20, 0x5678);
+            queue(0xff, 0x9abc);
+            queue(8, 0x03ff006ea3b0e3f6ULL); /* Exact physical OSLog type 3. */
+            queue(2, (5ULL << 52) | 1);
+            struct rtkit_buffer before_oslog = r->oslog_bfr;
+            size_t before_pool = r->pool_used;
             quiet_boundary = true;
-            assert(rtkit_service_quiet(r, 1) < 0 && r->windows_failed);
+            tx_ready = false;
+            assert(rtkit_service_quiet(r, 4) == 0 && read_at == before_read);
+            struct rtkit_notification_counts counts;
+            assert(rtkit_get_notification_counts(r, &counts));
+            assert(!counts.app && !counts.debug && !counts.oslog_type3);
+            tx_ready = true;
+            assert(rtkit_service_quiet(r, 2) == 2 && read_at == before_read + 2);
+            assert(sent == before_sent && !r->windows_failed);
+            assert(rtkit_service_quiet(r, 2) == 2 && read_at == before_read + 4);
+            assert(sent == before_sent && !r->windows_failed);
+            assert(r->oslog_bfr.bfr == before_oslog.bfr && r->oslog_bfr.dva == before_oslog.dva &&
+                   r->oslog_bfr.sz == before_oslog.sz && r->oslog_bfr.owned == before_oslog.owned &&
+                   r->oslog_bfr.pooled == before_oslog.pooled && r->pool_used == before_pool);
+            assert(rtkit_service_quiet(r, 1) == 1 && read_at == before_read + 5);
+            assert(sent == before_sent + 1 && !r->windows_failed);
+            assert(tx[sent - 1].msg1 == 2 && tx[sent - 1].msg0 == ((5ULL << 52) | 1));
+            struct rtkit_rejection rejection;
+            assert(!rtkit_get_first_rejection(r, &rejection));
+            assert(rejection.reason == RTKIT_REJECT_NONE);
+            assert(rtkit_get_notification_counts(r, &counts));
+            assert(counts.app == 2 && counts.debug == 1 && counts.oslog_type3 == 1);
+            r->notifications =
+                (struct rtkit_notification_counts){UINT64_MAX, UINT64_MAX, UINT64_MAX};
+            queue(3, 0);
+            queue(0x20, 0);
+            queue(8, 3ULL << 56);
+            assert(rtkit_service_quiet(r, 3) == 3);
+            assert(rtkit_get_notification_counts(r, &counts));
+            assert(counts.app == UINT64_MAX && counts.debug == UINT64_MAX &&
+                   counts.oslog_type3 == UINT64_MAX);
             quiet_boundary = false;
         }
         asc_cpu_stop(&asc);
         rtkit_free(r);
     }
+    /* A fresh full handshake for each fatal boundary; accepted notifications
+     * before a rejection cannot hide it or consume the message after it. */
+    const struct {
+        u64 ep, msg;
+        enum rtkit_rejection_reason reason;
+    } rejected[] = {
+        {0x100, 0x1234, RTKIT_REJECT_ENDPOINT_RANGE},
+        {0xffffff20, 0x5678, RTKIT_REJECT_ENDPOINT_RANGE},
+        {5, 0x1234, RTKIT_REJECT_SYSTEM_ENDPOINT},
+        {0, 1ULL << 52, RTKIT_REJECT_MESSAGE},
+        {2, (1ULL << 52) | (1ULL << 44), RTKIT_REJECT_MESSAGE},
+        {2, (5ULL << 52) | 0xff, RTKIT_REJECT_MESSAGE},
+        {1, (1ULL << 52) | (1ULL << 44) | 0x390004000ULL, RTKIT_REJECT_CRASH},
+        {4, 8ULL << 52, RTKIT_REJECT_MESSAGE},
+        {8, 2ULL << 56, RTKIT_REJECT_MESSAGE},
+        {8, 0xffULL << 56, RTKIT_REJECT_MESSAGE},
+        {8, (1ULL << 56) | (0x4000ULL << 36), RTKIT_REJECT_MESSAGE},
+    };
+    for (unsigned i = 0; i < sizeof(rejected) / sizeof(rejected[0]); i++) {
+        reset_bus();
+        r = rtkit_init("reject", &asc, &dart, &iova, NULL, false);
+        assert(r && rtkit_set_phys_window(r, 0x390000000ULL, 0x100000));
+        assert(rtkit_set_buffer_pool(r, (u64)pool, pool_size));
+        assert(rtkit_set_early_ap_power(r, true));
+        boot_messages();
+        assert(rtkit_boot_timed(r, 1000));
+        quiet_boundary = true;
+        if (rejected[i].reason == RTKIT_REJECT_CRASH) {
+            queue(rejected[i].ep, rejected[i].msg);
+            assert(rtkit_service_quiet(r, 1) == 1); /* Initial valid crash buffer. */
+        }
+        fail_send = i == 7;
+        queue(0x20, 0x9876);
+        queue(rejected[i].ep, rejected[i].msg);
+        queue(8, 0x03ff006ea3b0e3f6ULL);
+        unsigned before_read = read_at;
+        int serviced = rtkit_service_quiet(r, 4);
+        if (serviced >= 0 || !r->windows_failed)
+            fprintf(stderr, "rejection case %u returned %d failed=%d\n", i, serviced,
+                    r->windows_failed);
+        assert(serviced < 0 && r->windows_failed);
+        assert(read_at == before_read + 2);
+        struct rtkit_rejection first, again;
+        assert(rtkit_get_first_rejection(r, &first));
+        assert(first.reason == rejected[i].reason && first.msg0 == rejected[i].msg &&
+               first.msg1 == rejected[i].ep);
+        assert(rtkit_service_quiet(r, 4) < 0 && read_at == before_read + 2);
+        struct rtkit_notification_counts counts;
+        assert(rtkit_get_notification_counts(r, &counts) && !counts.oslog_type3);
+        assert(rtkit_get_first_rejection(r, &again));
+        assert(again.reason == first.reason && again.msg0 == first.msg0 &&
+               again.msg1 == first.msg1);
+        assert(!heap_allocations && rtkit_has_owned_buffers(r));
+        quiet_boundary = false;
+        asc_cpu_stop(&asc);
+        rtkit_free(r);
+    }
     real_free(pool);
-    puts("{\"passed\":true,\"heap_grants\":0,\"quiet_poll_bound\":64}");
+    puts("{\"passed\":true,\"heap_grants\":0,\"quiet_poll_bound\":64,"
+         "\"phase7_notifications\":true,\"oslog_type3\":true,\"rejection_transcripts\":11}");
 }

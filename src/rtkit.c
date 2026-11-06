@@ -57,6 +57,7 @@
 
 #define OSLOG_TYPE                GENMASK(63, 56)
 #define OSLOG_TYPE_BUFFER_REQUEST 1
+#define OSLOG_TYPE_3              3
 #define OSLOG_SIZE                GENMASK(55, 36)
 #define OSLOG_IOVA                GENMASK(35, 0)
 
@@ -132,6 +133,8 @@ struct rtkit_dev {
     bool quiet, service_busy, pool_mapped;
     u64 pool_base, pool_dva;
     size_t pool_size, pool_used;
+    struct rtkit_rejection rejection;
+    struct rtkit_notification_counts notifications;
 #endif
 };
 
@@ -588,12 +591,45 @@ static bool rtkit_handle_oslog_request(rtkit_dev_t *rtk, struct rtkit_message *m
 }
 
 #ifdef AURA_WINDOWS
+static bool rtkit_windows_reject(rtkit_dev_t *rtk, const struct asc_message *wire,
+                                 enum rtkit_rejection_reason reason)
+{
+    if (rtk->rejection.reason == RTKIT_REJECT_NONE)
+        rtk->rejection = (struct rtkit_rejection){reason, wire->msg0, wire->msg1};
+    return false;
+}
+
+bool rtkit_get_first_rejection(const rtkit_dev_t *rtk, struct rtkit_rejection *out)
+{
+    if (!rtk || !out)
+        return false;
+    *out = rtk->rejection;
+    return out->reason != RTKIT_REJECT_NONE;
+}
+
+bool rtkit_get_notification_counts(const rtkit_dev_t *rtk, struct rtkit_notification_counts *out)
+{
+    if (!rtk || !out)
+        return false;
+    *out = rtk->notifications;
+    return true;
+}
+
 /* This path never interprets firmware-owned log memory. Each supported message
  * needs at most one TX slot, reserved by the sole ASC owner's capacity check. */
 static bool rtkit_windows_message(rtkit_dev_t *rtk, const struct asc_message *wire)
 {
-    if (wire->msg1 >= 0x20)
-        return false;
+    if (wire->msg1 >= 0x100)
+        return rtkit_windows_reject(rtk, wire, RTKIT_REJECT_ENDPOINT_RANGE);
+    /* The public MTP boot caller ignores unowned app notifications while
+     * waiting for DockChannel INIT. DEBUG is also a known no-reply endpoint.
+     * They still consume the caller's bounded mailbox budget. */
+    if (wire->msg1 >= 0x20 || wire->msg1 == RTKIT_EP_DEBUG) {
+        u64 *count = wire->msg1 >= 0x20 ? &rtk->notifications.app : &rtk->notifications.debug;
+        if (*count != UINT64_MAX)
+            ++*count;
+        return true;
+    }
     struct rtkit_message msg = {.ep = wire->msg1, .msg = wire->msg0};
     u32 type = FIELD_GET(MGMT_TYPE, msg.msg);
     switch (msg.ep) {
@@ -637,10 +673,18 @@ static bool rtkit_windows_message(rtkit_dev_t *rtk, const struct asc_message *wi
                 return asc_send(rtk->asc, wire);
             return false;
         case RTKIT_EP_OSLOG:
+            /* Public Aura/Linux ignore non-buffer OSLog messages without
+             * replying. Admit the observed J813 type only; its payload has no
+             * established buffer/address semantics and must remain opaque. */
+            if (FIELD_GET(OSLOG_TYPE, msg.msg) == OSLOG_TYPE_3) {
+                if (rtk->notifications.oslog_type3 != UINT64_MAX)
+                    rtk->notifications.oslog_type3++;
+                return true;
+            }
             return FIELD_GET(OSLOG_TYPE, msg.msg) == OSLOG_TYPE_BUFFER_REQUEST &&
                    rtkit_handle_oslog_request(rtk, &msg);
         default:
-            return false;
+            return rtkit_windows_reject(rtk, wire, RTKIT_REJECT_SYSTEM_ENDPOINT);
     }
 }
 
@@ -660,6 +704,8 @@ int rtkit_service_quiet(rtkit_dev_t *rtk, int max_msgs)
             break;
         count++;
         if (!rtkit_windows_message(rtk, &msg)) {
+            rtkit_windows_reject(rtk, &msg,
+                                 rtk->crashed ? RTKIT_REJECT_CRASH : RTKIT_REJECT_MESSAGE);
             rtk->windows_failed = true;
             count = -1;
             break;

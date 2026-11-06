@@ -13,7 +13,8 @@ segment-size segment-overflow segment-alias gates-size ram-outside heap-overlap
 adt-overlap firmware-overlap power-fail power-inactive asc-allocation running locked
 active-root active-stream bypass tlbi-busy mmio-fault dapf dart-allocation
 iova-allocation dart-map translation rtkit-allocation sram-window pool-map
-boot-timeout no-init service-fail stage2-map final-map runtime-fail stop-fail""".split()
+boot-timeout no-init service-fail service-mmio readiness-mmio stage2-map final-map
+runtime-fail stop-fail""".split()
 
 
 def main():
@@ -45,6 +46,17 @@ def main():
             result = subprocess.run([out / "mtp-host", case], capture_output=True, text=True, timeout=10)
             (out / f"{case}.log").write_text(result.stdout + result.stderr)
             result.check_returncode()
+            expected = {
+                "no-init": "phase7 readiness timeout",
+                "service-fail": "phase7 RTKit rejected reason=3 msg0=0x123456789abcdef0 msg1=0x2",
+                "service-mmio": "phase7 RTKit MMIO fault",
+                "readiness-mmio": "phase7 DockChannel MMIO fault",
+            }.get(case)
+            if expected:
+                assert expected in result.stdout, (case, result.stdout)
+                assert "failed; allocations retained" in result.stdout
+            if case in {"success", "runtime-fail", "stop-fail", "final-map"}:
+                assert "phase7 notifications app=2 debug=1 oslog3=3" in result.stdout
             report["cases"].append(case)
         report["result"] = "passed"
     finally:
