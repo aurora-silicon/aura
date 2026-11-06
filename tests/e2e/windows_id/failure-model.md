@@ -35,3 +35,26 @@ cases to ensure normal reads still execute MRS, DFR0 still applies its mask,
 and PFR0 still applies its GIC bit. These are build/source checks, not hardware
 proof. The existing physical failure and its replay are the E2E regression;
 no source-pattern unit test duplicates that replay.
+
+## Mu sysreg-assist readiness notification
+
+The next replay, `build/windows-hardware/mu-diagnostic-02/launch/console.log`,
+progressed to Mu timer readiness, then logged a repaired SP_EL0 on CPU 6.
+Its next diagnostic reported a failed rendezvous waiting for CPU mask `0x40`,
+which includes that same current CPU. This failure model was recorded before
+removing the notification.
+
+`hv_exc_exit()` had already unlocked `bhl` and marked its own CPU in-guest
+before it sent `HV_SYSREG_ASSIST_READY`. The proxy/rendezvous path requires
+that lock and a CPU already removed from the in-guest mask. The notification
+also expected an old host debugger to patch guest vectors; the public launcher
+does not implement that consumer.
+
+Remove only that readiness notification and its one-shot state. Keep the
+explicitly enabled T8142 SP repair and preserve genuine guest exceptions,
+device requests, timer callbacks and user interrupts. Keep the event-number
+slot intact to avoid changing the existing event ABI.
+
+The physical replay must progress beyond the repaired-SP message without a
+self-rendezvous or host debug notification from this path. Any later guest
+exception remains a separate failure and must still be reported normally.
