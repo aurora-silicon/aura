@@ -162,7 +162,7 @@ static bool ctxr_exec_holds_ro_range(u64 start, u64 end)
         ranges_overlap(mrs(SYS_IMP_APL_CTXR_C_LWR_EL1), mrs(SYS_IMP_APL_CTXR_C_UPR_EL1) + SZ_4K,
                        start, end))
         return true;
-    if (cpu_features->apple_sysregs_unlocked)
+    if (!cpu_features->secondary_ctrr)
         return false;
     return ranges_overlap(mrs(SYS_IMP_APL_CTRR_C_LWR_EL1), mrs(SYS_IMP_APL_CTRR_C_UPR_EL1) + SZ_4K,
                           start, end) ||

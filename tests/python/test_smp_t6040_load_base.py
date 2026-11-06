@@ -29,7 +29,7 @@ _Static_assert(sizeof(u64) == 8, "production u64 ABI");
 #define ALIGN_DOWN(x, a) ((x) & ~((a) - 1))
 #define sysop(op) ((void)(op))
 struct cpu_info { u64 impl_reg; };
-static struct { bool apple_sysregs_unlocked; } features, *cpu_features = &features;
+static struct { bool legacy_impl_regs; } features, *cpu_features = &features;
 static unsigned char _vectors_start[4096] __attribute__((aligned(4096)));
 static int chip_id = T6040;
 static u64 installed_relay, relocated_from, rvbar, locked;

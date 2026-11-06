@@ -95,6 +95,14 @@ system registers we tracked survive, including the pointer authentication
 keys. WFE wipes nothing. Linux has to save registers around idle, and the
 Aurora kernel does.
 
+### System registers
+
+At EL2 aura can set `HACR_EL2`, the Apple `ACTLR` bits and the per-core deep sleep
+enable, but `CYC_OVRD` is undefined from M4 on and aura never touches it there. It
+never sets the deep sleep enable for the OS: a secondary in deep WFI with it set
+stopped a Neo within 2 seconds. Linux finds the `ACTLR` features it uses by
+itself, so the device tree says nothing about them.
+
 ## Running the OS
 
 A kernel whose executable pages all sit inside `CTXR_D` can run at EL2, so on a

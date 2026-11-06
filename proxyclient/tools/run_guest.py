@@ -46,7 +46,7 @@ iface = UartInterface()
 p = AuraProxy(iface, debug=False)
 bootstrap_port(iface, p)
 
-if args.emulate_sprr or not p.get_cpu_features().apple_sysregs_unlocked:
+if args.emulate_sprr or not p.get_cpu_features().legacy_impl_regs:
     aura_heap_mb = 1024
 else:
     aura_heap_mb = 128

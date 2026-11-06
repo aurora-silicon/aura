@@ -313,7 +313,7 @@ class ProxyUtils(Reloadable):
         print(f"  L2C_ERR_ADR: {self.mrs(L2C_ERR_ADR_EL1):#x}");
         print(f"  L2C_ERR_INF: {self.mrs(L2C_ERR_INF_EL1):#x}");
 
-        if self.cpu_features.apple_sysregs_unlocked:
+        if self.cpu_features.legacy_impl_regs:
             self.msr(L2C_ERR_STS_EL1, l2c_err_sts) # Clear the flag bits
         self.msr(DAIF, self.mrs(DAIF) | 0x100) # Re-enable SError exceptions
 

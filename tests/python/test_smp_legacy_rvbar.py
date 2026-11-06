@@ -65,7 +65,7 @@ static u8 secondary_stacks[MAX_CPUS][SECONDARY_STACK_SIZE],
 static u8 dummy_stack[DUMMY_STACK_SIZE], dummy_stack_el1[DUMMY_STACK_SIZE];
 static void *_reset_stack, *_reset_stack_el1;
 static struct {
-  bool apple_sysregs_unlocked, unsafe_wfi;
+  bool legacy_impl_regs, unsafe_wfi;
 } feature_data, *cpu_features = &feature_data;
 static u64 read64(u64 a) {
   assert(a < MAX_CPUS);
@@ -123,7 +123,7 @@ static void smp_set_wfe_mode(bool a) { (void)a; }
 ''' + bodies + r'''
 static void setup(int chip, bool unlocked) {
   chip_id = chip;
-  cpu_features->apple_sysregs_unlocked = unlocked;
+  cpu_features->legacy_impl_regs = unlocked;
   installed_relay = relocated_from = 0;
   write64_count = write32_count = 0;
   memset(spin_table, 0, sizeof(spin_table));
@@ -195,9 +195,9 @@ def test_t8140_owned_relay_and_m3_relocation_keep_existing_behavior(tmp_path):
     # Reconstruct just the old admission expression to compare both production
     # tails under identical inputs, without requiring git history in CI.
     old = current.replace(
-        "locked == target || cpu_features->apple_sysregs_unlocked",
+        "locked == target || cpu_features->legacy_impl_regs",
         "locked == target || (!(rvbar & RVBAR_LOCK) && "
-        "cpu_features->apple_sysregs_unlocked)",
+        "cpu_features->legacy_impl_regs)",
     ).replace("smp_prepare_rvbar(", "old_prepare_rvbar(", 1)
     harness = r'''
 #include <assert.h>
@@ -219,7 +219,7 @@ _Static_assert(sizeof(u64) == 8, "production u64 ABI");
 #define ALIGN_DOWN(x, a) ((x) & ~((a) - 1))
 #define sysop(op) event(op, 0, 0)
 struct cpu_info { u64 impl_reg; };
-static struct { bool apple_sysregs_unlocked; } features, *cpu_features = &features;
+static struct { bool legacy_impl_regs; } features, *cpu_features = &features;
 static unsigned char _vectors_start[4096] __attribute__((aligned(4096)));
 static int chip_id;
 static u64 installed_relay, relocated_from, old_vector, locked_vector, rvbar;
@@ -282,7 +282,7 @@ static void ic_ivau_range(void *address, u64 size)
 static void reset(void)
 {
     chip_id = T8140;
-    features.apple_sysregs_unlocked = false;
+    features.legacy_impl_regs = false;
     locked_vector = (u64)_vectors_start - 0x4000;
     rvbar = locked_vector | RVBAR_LOCK;
     installed_relay = relocated_from = old_vector = 0;
@@ -331,7 +331,7 @@ int main(void)
      * The helper writes nothing; the established caller owns any RVBAR write. */
     reset();
     chip_id = 0x6030;
-    features.apple_sysregs_unlocked = true;
+    features.legacy_impl_regs = true;
     relocated_from = 0x800000000UL;
     old_vector = locked_vector;
     assert(smp_prepare_rvbar(&cpu) == 0 && event_count == 1);

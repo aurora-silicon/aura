@@ -819,13 +819,14 @@ static int dt_set_chosen(void)
     }
 
     /*
-     * Upstream adds these on every chip with locked Apple system registers,
-     * for kernels that cannot survive WFI state loss. Aurora's kernels for
-     * T8132, T6040 and T6041 boot without them, and idle=nop would keep every
-     * idle CPU spinning. T8140 adds only arm64.nowfxt, in dt_set_wfx_args().
+     * Without CYC_OVRD aura cannot turn WFI retention on, so the cores lose
+     * state in WFI. Upstream adds these for kernels that cannot survive that.
+     * Aurora's kernels for T8132, T6040 and T6041 boot without them, and
+     * idle=nop would keep every idle CPU spinning. T8140 adds only
+     * arm64.nowfxt, in dt_set_t8140_wfx_args().
      */
-    if (!cpu_features->apple_sysregs_unlocked && chip_id != T8140 && chip_id != T8132 &&
-        chip_id != T6040 && chip_id != T6041) {
+    if (!cpu_features->cyc_ovrd && chip_id != T8140 && chip_id != T8132 && chip_id != T6040 &&
+        chip_id != T6041) {
         /*
          * M4 and later lose architectural state in WFI and WFIT. Add the
          * bootargs to prevent Linux from crashing in the idle loop and delay
@@ -9001,14 +9002,14 @@ int kboot_prepare_dt(void *fdt)
         if (fdt_setprop(dt, node, "reg", reg, sizeof(reg)) || fdt_setprop_empty(dt, node, "no-map"))
             bail("FDT: couldn't describe firmware RO node\n");
         printf("FDT: reserved firmware RO [0x%lx, 0x%lx)\n", ro_start, ro_end);
-    } else if (!cpu_features->apple_sysregs_unlocked && !in_el2()) {
+    } else if (cpu_features->secondary_ctrr && !in_el2()) {
         /*
          * A guest under the aura hypervisor runs at EL1. The host keeps the
          * SMP-RO range and starts the guest's CPUs itself, so the guest
          * leaves it out. This is how the J616s guest boots.
          */
         printf("FDT: running at EL1, leaving the M4+ SMP-RO range to the host\n");
-    } else if (!cpu_features->apple_sysregs_unlocked) {
+    } else if (cpu_features->secondary_ctrr) {
         // On M4* / A18 Pro / M5*, there is a CTRR instance left enabled only
         // on the secondary (non-boot) cores. Add a reserved-memory region to
         // prevent Linux from crashing when allocating this memory and writing

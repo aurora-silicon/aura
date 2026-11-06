@@ -236,7 +236,7 @@ extern void _deep_wfi_helper(void);
 void deep_wfi(void)
 {
     u64 cyc_ovrd;
-    const bool apple_sysregs_unlocked = cpu_features->apple_sysregs_unlocked;
+    const bool has_cyc_ovrd = cpu_features->cyc_ovrd;
 
     if (!supports_arch_retention()) {
         // A7 - A11 does not support state retention across deep WFI
@@ -245,14 +245,14 @@ void deep_wfi(void)
         return;
     }
 
-    if (apple_sysregs_unlocked) {
+    if (has_cyc_ovrd) {
         cyc_ovrd = mrs(SYS_IMP_APL_CYC_OVRD);
         msr(SYS_IMP_APL_CYC_OVRD, cyc_ovrd | CYC_OVRD_WFI_MODE(3));
     }
 
     _deep_wfi_helper();
 
-    if (apple_sysregs_unlocked)
+    if (has_cyc_ovrd)
         msr(SYS_IMP_APL_CYC_OVRD, cyc_ovrd);
 }
 
@@ -275,13 +275,13 @@ void cpu_sleep(bool deep)
                 break;
         }
     } else {
-        if (cpu_features->apple_sysregs_unlocked) {
+        if (cpu_features->cyc_ovrd) {
             reg_mask(SYS_IMP_APL_CYC_OVRD, CYC_OVRD_FIQ_MODE_MASK | CYC_OVRD_IRQ_MODE_MASK,
                      CYC_OVRD_FIQ_MODE(2) | CYC_OVRD_IRQ_MODE(2));
         }
     }
 
-    if (cpu_features->apple_sysregs_unlocked) {
+    if (cpu_features->cyc_ovrd) {
         // disable wfi retention mode to allow deepest sleep states
         reg_mask(SYS_IMP_APL_CYC_OVRD, CYC_OVRD_WFI_MODE_MASK,
                  CYC_OVRD_WFI_MODE(3) | CYC_OVRD_DISABLE_WFI_RET);

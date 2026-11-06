@@ -38,7 +38,8 @@
 void *rust_read_gigalocker(size_t *);
 void rust_free_gigalocker(void *, size_t);
 
-_Static_assert(sizeof(struct midr_part_features) == 20, "proxy CPU features ABI changed");
+/* proxyclient/aura/proxy.py CPUFeatures has this layout. A client of another size is refused. */
+_Static_assert(sizeof(struct midr_part_features) == 24, "proxy CPU features ABI changed");
 
 int proxy_process(ProxyRequest *request, ProxyReply *reply)
 {

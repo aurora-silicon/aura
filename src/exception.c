@@ -227,7 +227,7 @@ void print_regs(u64 *regs, int el12)
     const char *ec_desc = ec_table[(esr >> 26) & 0x3f];
     printf("ESR:      0x%lx (%s)\n", esr, ec_desc ? ec_desc : "?");
 
-    if (cpu_features->apple_sysregs_unlocked) {
+    if (cpu_features->legacy_impl_regs) {
         u64 sts = mrs(SYS_IMP_APL_L2C_ERR_STS);
         printf("L2C_ERR_STS: 0x%lx\n", sts);
         printf("L2C_ERR_ADR: 0x%lx\n", mrs(SYS_IMP_APL_L2C_ERR_ADR));
@@ -246,7 +246,7 @@ void print_regs(u64 *regs, int el12)
                 printf("MMU_ERR_STS: 0x%lx\n", mrs(SYS_IMP_APL_MMU_ERR_STS));
         }
     } else {
-        printf("Apple error registers locked; skipping diagnostics\n");
+        printf("Apple error registers not known on this CPU; skipping diagnostics\n");
     }
 }
 
@@ -338,7 +338,7 @@ void exc_sync(u64 *regs)
     if (!(exc_guard & GUARD_SILENT))
         print_regs(regs, el12);
 
-    if (cpu_features->apple_sysregs_unlocked) {
+    if (cpu_features->legacy_impl_regs) {
         u64 l2c_err_sts = mrs(SYS_IMP_APL_L2C_ERR_STS);
         msr(SYS_IMP_APL_L2C_ERR_STS, l2c_err_sts); // Clear the L2C_ERR flag bits
     }

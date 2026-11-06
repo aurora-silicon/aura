@@ -31,7 +31,7 @@ typedef uint8_t u8;
 #define T6040 0x6040
 #define T6041 0x6041
 #define bail(...) do { printf(__VA_ARGS__); return -1; } while (0)
-static struct { bool apple_sysregs_unlocked; } features = {true}, *cpu_features = &features;
+static struct { bool cyc_ovrd; } features = {true}, *cpu_features = &features;
 #define T8152 0x8152
 static unsigned char blob[4096];
 static void *dt = blob, *adt = blob;
@@ -102,8 +102,8 @@ int main(void)
     assert(chosen_tail() == 0);
     assert(!fdt_getprop(dt, fdt_path_offset(dt, "/chosen"), "apfs-preboot-uuid", NULL));
 
-    /* With locked system registers, only chips without their own idle policy get idle=nop. */
-    features.apple_sysregs_unlocked = false;
+    /* Without CYC_OVRD, only chips without their own idle policy get idle=nop. */
+    features.cyc_ovrd = false;
     int locked[] = {0x8132, 0x6040, 0x6041, 0x8140, 0x8142, 0x8152};
     for (unsigned i = 0; i < sizeof(locked) / sizeof(locked[0]); i++) {
         chip_id = locked[i];
@@ -118,7 +118,7 @@ int main(void)
                                                : "console=tty0 idle=nop arm64.nowfxt";
         assert(args && !strcmp(args, want));
     }
-    features.apple_sysregs_unlocked = true;
+    features.cyc_ovrd = true;
     return 0;
 }
 '''
