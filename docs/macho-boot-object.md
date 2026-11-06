@@ -162,7 +162,8 @@ read the registers on each chip:
   arms about 5 MiB.
 - Nothing kboot keeps from the OS is in the window: `CTXR_A` to `CTXR_C`, the
   `CTRR_C` and `CTRR_D` ranges the secondaries can't write, and on T8140 its
-  firmware RO range too. Every chip is checked against all of them.
+  firmware RO range too. Every chip is checked against all of them, except that
+  one with unlocked Apple system registers (M1 to M3) skips CTRR, as kboot does.
 - `boot_args` is not in the window, and the heap starts above it.
 
 Later steps refuse too, and take the same failure path. `kboot_boot()` won't place

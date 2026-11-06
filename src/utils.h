@@ -507,9 +507,10 @@ struct midr_part_features {
     bool disable_dc_mva;
     bool acc_cfg;
     /*
-     * CYC_OVRD and the registers that come with it (RVBAR, the L2C error status,
-     * SPRR/GXF): A7 to M3. False from M4 on, where CYC_OVRD is undefined, though
-     * HACR_EL2 and the ACTLR bits can still be set at EL2 there.
+     * CYC_OVRD, and what aura sets up along with it (RVBAR, the L2C error status, the
+     * hypervisor's SPRR/GXF): A7 to M3. False from M4 on, where CYC_OVRD is undefined.
+     * At EL2 there HACR_EL2 and the ACTLR bits can still be set, and with a kcbz-0 boot
+     * object the GXF registers are writable too, but aura doesn't use them.
      */
     bool apple_sysregs_unlocked;
     bool workaround_cyclone_cache;
