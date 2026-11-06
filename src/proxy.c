@@ -608,7 +608,7 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
         case P_HV_WINDOWS_CAPS:
             /* Read-only personality/ABI probe; never initializes hardware. */
 #ifdef AURA_WINDOWS
-            reply->retval = 0x4157494e0001007fULL;
+            reply->retval = 0x4157494e000100ffULL;
 #else
             reply->retval = 0;
 #endif
@@ -616,6 +616,14 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
         case P_HV_WINDOWS_CONFIG:
 #ifdef AURA_WINDOWS
             reply->retval = hv_windows_configure(request->args[0]);
+#else
+            reply->retval = -1;
+#endif
+            break;
+        case P_HV_WINDOWS_HEAP_HIGH_WATER:
+#ifdef AURA_WINDOWS
+            /* Unlike heapblock_alloc(0), this query does not align or advance the heap. */
+            reply->retval = heapblock_high_water();
 #else
             reply->retval = -1;
 #endif

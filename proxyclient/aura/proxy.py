@@ -696,6 +696,7 @@ class AuraProxy(Reloadable):
     P_HV_WINDOWS_CAPS = 0xc80
     P_HV_WINDOWS_CONFIG = 0xc81
     P_HV_WINDOWS_N1_PREPARE = 0xc82
+    P_HV_WINDOWS_HEAP_HIGH_WATER = 0xc83
 
     P_FB_INIT = 0xd00
     P_FB_SHUTDOWN = 0xd01
@@ -1211,6 +1212,9 @@ class AuraProxy(Reloadable):
 
     def hv_windows_prepare_n1(self, address, size):
         return self.request(self.P_HV_WINDOWS_N1_PREPARE, address, size, signed=True)
+
+    def hv_windows_heap_high_water(self):
+        return self.request(self.P_HV_WINDOWS_HEAP_HIGH_WATER)
 
     def fb_init(self):
         return self.request(self.P_FB_INIT)

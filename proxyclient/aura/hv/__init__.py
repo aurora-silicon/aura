@@ -90,6 +90,7 @@ class HV(Reloadable):
         self.windows_n1_attempted = False
         self.windows_n1_ready = False
         self.windows_n1_handoff = None
+        self.windows_memory_guard = None
         self.pac_mask = self.PAC_MASK
         self.user_pac_mask = self.PAC_MASK
         self.vbar_el1 = None
@@ -1395,7 +1396,8 @@ class HV(Reloadable):
             from ..windows import (CONFIGURATION, CONFIG_FRAMEBUFFER_SHADOW,
                                    CONFIG_T8142_EXPERIMENTAL, validate_capabilities)
             caps = validate_capabilities(self.p.hv_windows_capabilities(), self.windows_framebuffer,
-                                         self.windows_guest_compatibility, self.windows_n1)
+                                         self.windows_guest_compatibility, self.windows_n1,
+                                         self.windows_memory_guard is not None)
             # The Windows C personality owns these architectural features.
             self.emulate_sprr = False
             if self.novm:
@@ -1867,6 +1869,12 @@ class HV(Reloadable):
         if self.windows and (entryoffset < 0 or entryoffset >= len(image) or entryoffset % 4 or
                              guest_base + image_size > mem_top or mem_size <= 0):
             raise ValueError("Mu payload/entry does not fit the guest memory range")
+        if self.windows and self.windows_memory_guard is not None:
+            from ..windows import validate_reserved_layout
+            validate_reserved_layout(self.windows_memory_guard, {
+                "heap_top": phys_base, "adt_base": self.adt_base, "trust_base": tc_base,
+                "guest_base": guest_base, "bootargs": guest_base + self.bootargs_off,
+                "image_end": guest_base + image_size})
 
         print(f"Physical memory: 0x{phys_base:x} .. 0x{mem_top:x}")
         print(f"Guest region start: 0x{guest_base:x}")

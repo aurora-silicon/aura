@@ -58,6 +58,17 @@ personality and a matching Mu image.
   virtual ADT address must resolve correctly, while the resulting complete
   physical span must remain inside the reported RAM window. Reject invalid
   spans before reading ADT memory and perform no target mutation in identity.
+- Firmware may copy boot arguments and ADT to fixed guest physical addresses
+  before its allocator is initialized. A profile declaring those destinations
+  must be checked against the current resident, both heaps, source metadata,
+  framebuffer and the complete payload/relocation span before any target
+  mutation. Its top-of-RAM UEFI workspace must likewise not alias the image or
+  handoff. Reject invalid, wrapping, overlapping or out-of-RAM declarations;
+  do not infer firmware addresses from the Mac model or silently move them.
+- Heap prediction requires a dedicated read-only high-water query. Missing
+  capability, an unexpected allocator base, or a changed layout must fail
+  before guest entry; a profile without declared reservations cannot establish
+  safety for an unknown firmware's fixed-address copies.
 
 ## Capability contract
 
@@ -66,6 +77,8 @@ bits 63:32 `0x4157494e` (AWIN), bits 31:16 ABI version 1, and low 16 feature bit
 Bits 0–3 are required: Windows personality, native AIC, PSCI, and raw Mu loader
 contract. Bit 4 advertises a BGRA framebuffer shadow/converter. Bit 5 is the
 independently gated N1 handoff producer. Bit 6 advertises explicit configuration.
+Bit 7 advertises the read-only heap high-water query used for declared memory
+reservation checks.
 Normal builds return zero. The launcher does not treat a capability bit as
 hardware qualification.
 
@@ -82,6 +95,10 @@ The dedicated `0xc80` namespace deliberately avoids legacy m1n1 PSCI opcodes
 `0xc11..0xc18`, which can mutate CPU state. In particular, never probe `0xc12`
 or `0xc13` for capabilities. `0xc82` is the separate N1 preparation
 operation. Unknown capability commands are rejected without a legacy fallback.
+
+`P_HV_WINDOWS_HEAP_HIGH_WATER = 0xc83` returns the resident's current heap
+high-water address without aligning or advancing the allocator. It takes no
+arguments. Only profiles with `reserved_memory` use it; they require bit 7.
 
 The raw loader contract is the existing public boot-arguments ABI: the guest
 receives its boot-arguments pointer in x0, the image starts at a 64-KiB-aligned
@@ -114,7 +131,11 @@ target and the exact Mu build; paths are relative to the profile file:
   "framebuffer": "native",
   "guest_compatibility": "none",
   "usb": "disabled",
-  "n1": "disabled"
+  "n1": "disabled",
+  "reserved_memory": [
+    {"name": "mu-boot-handoff", "base": "0x10220000000", "size": "0x404000"},
+    {"name": "mu-uefi-workspace", "from_ram_top": "0x8000000", "size": "0x8000000"}
+  ]
 }
 ```
 
@@ -162,6 +183,32 @@ and entry for that session, including an attempt to switch back to disabled.
 It requires the matching opt-in Mu profile; it does not establish Windows
 driver operation or permit a second attempt without a fresh Aura load.
 
+`reserved_memory` optionally declares up to 16 firmware-owned physical ranges.
+Each has a unique `name`, a positive `size`, and exactly one of `base` or
+`from_ram_top`. The latter places its base that many bytes below the end of
+RAM reported by boot arguments. All values must be 4-KiB aligned. Ranges must
+not overlap one another, host allocations, source metadata, framebuffer, or
+the complete image and relocated metadata; they must fit the available guest
+RAM. The launcher predicts the existing 128-MiB Aura heap reservation and
+128-MiB proxy heap before changing target state, rechecks the allocator before
+installing its limit, and checks the actual raw-loader layout before upload.
+Profiles using this feature cannot also override the heap with `AURAHEAP`.
+
+The example ranges match the current T8142 Mu build. It copies boot arguments
+to `0x10220000000` and the ADT to `0x10220004000` before memory initialization.
+The conservative `0x404000` span covers the maximum 4-MiB ADT plus its 16-KiB
+prefix. Its normal initial UEFI workspace is the final 128 MiB of RAM. These
+addresses are build-specific: other SoCs use different PCD values. Keep the
+full firmware allocation below the workspace, including any reserved FD tail
+larger than its file; pad a hash-bound input when that extra extent is not
+already covered by the composed image. The host does not infer PCDs from an FD.
+
+Declaring a range is a host placement check, not a firmware memory-map update.
+The matching Mu build must still reserve its copied handoff and workspace
+against later UEFI allocation. An omitted range or an unknown fixed-address
+firmware write is outside this check's guarantee; profiles without declarations
+retain the existing loader behavior and do not establish fixed-handoff safety.
+
 ```sh
 python3 proxyclient/tools/boot_windows.py validate --profile local-profile.json
 python3 proxyclient/tools/boot_windows.py boot --profile local-profile.json \
@@ -200,3 +247,7 @@ payload placement, unchanged depth and out-of-RAM rejection. Its artifact
 includes uploaded image/ADT/boot-arguments blobs, hashes and a host log. Both
 produce `result.json` with replay commands and source hashes. Neither executes
 the C backend or guest, so neither replaces hardware testing before merge.
+The same lifecycle artifact exercises the real `HardwareSession.prepare` and
+`ProxyUtils` paths with modeled I/O: declared-range collisions stop before
+target mutation, allocator drift cannot install a new heap limit, a changed
+raw layout cannot upload, and default profiles issue no heap-query opcode.

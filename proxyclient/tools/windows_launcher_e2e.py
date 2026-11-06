@@ -33,7 +33,8 @@ def main():
                  "wrong-hash", "missing-image", "entry-outside", "conversion-missing", "init-failure",
                  "compatibility-missing", "compatibility-wrong-chip", "guest-error", "poweroff", "reset",
                  "append-offset", "append-contiguous", "append-overlap", "append-too-large",
-                 "append-wrong-hash", "usb-unsupported", "n1-capability-missing", "n1-wrong-model"):
+                 "append-wrong-hash", "usb-unsupported", "n1-capability-missing", "n1-wrong-model",
+                 "reservation-capability-missing", "reservation-wrap", "reservation-bad-fields"):
         profile = json.loads(json.dumps(baseline))
         expected_image = firmware_bytes
         if case.startswith("append-"):
@@ -48,6 +49,10 @@ def main():
         if case == "usb-unsupported": profile["usb"] = "enabled"
         if case.startswith("n1-"): profile["n1"] = "j813-v1"
         if case == "n1-wrong-model": profile["target"]["model"] = "Mac17,1"
+        if case.startswith("reservation-"):
+            profile["reserved_memory"] = [{"name": "mu-handoff", "base": "0x10220000000", "size": "0x404000"}]
+        if case == "reservation-wrap": profile["reserved_memory"][0]["base"] = "0xfffffffffffff000"
+        if case == "reservation-bad-fields": profile["reserved_memory"][0]["from_ram_top"] = "0x8000000"
         if case == "wrong-hash":
             profile["mu"]["sha256"] = "0" * 64
         if case == "missing-image":

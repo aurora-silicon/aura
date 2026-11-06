@@ -10,6 +10,10 @@
 #define UTILS_H
 #define HV_H
 static bool hv_windows_can_prepare_device(void) { return true; }
+#define __SMP_H__
+static int model_cpu;
+int boot_cpu_idx = 2;
+static int smp_id(void) { return model_cpu; }
 #define __EXCEPTION_H__
 typedef uint8_t u8; typedef uint16_t u16; typedef uint32_t u32; typedef uint64_t u64;
 #define BIT(x) (1ULL << (x))
@@ -17,16 +21,26 @@ typedef uint8_t u8; typedef uint16_t u16; typedef uint32_t u32; typedef uint64_t
 #define PACKED __attribute__((packed))
 #define UNUSED(x) ((void)(x))
 #define T8142 0x8142
-#define sysop(x) ((void)0)
 enum exc_guard_t { GUARD_OFF, GUARD_SKIP, GUARD_MARK, GUARD_RETURN, GUARD_SILENT=0x100 };
 volatile enum exc_guard_t exc_guard; volatile int exc_count;
+static u64 model_DAIF, model_ISR_EL1;
+#define mrs(reg) model_##reg
+static bool fault_load, fault_barrier;
+static void model_sysop(const char *op) {
+    if (fault_barrier && !strcmp(op, "dsb sy")) {
+        assert(exc_guard == (GUARD_MARK | GUARD_SILENT));
+        ++exc_count;
+        fault_barrier = false;
+    }
+}
+#define sysop(x) model_sysop(x)
 u32 chip_id=0x8142, board_id=0x24; void *adt;
-static const char *scenario; static unsigned trains,writes; static bool trained,held;
+static const char *scenario; static unsigned trains,writes,reads; static bool trained,held;
 struct cell {u64 a;u32 v;}; static struct cell cells[300]; static unsigned count;
 static u32 get(u64 a) {for(unsigned i=0;i<count;i++)if(cells[i].a==a)return cells[i].v;return 0;}
 static void put(u64 a,u32 v){for(unsigned i=0;i<count;i++)if(cells[i].a==a){cells[i].v=v;return;}assert(count<300);cells[count++]=(struct cell){a,v};}
 static bool is(const char*s){return !strcmp(scenario,s);}
-static u32 read32(u64 a){if(a==0x1cb0100010ULL && get(a)==0xffffffff)return is("bar-mask")?0xfffe0001:0xffff0004;if(a==0x1cb0100014ULL && get(a)==0xffffffff)return is("bar-high")?0xfffffffe:0xffffffff;return get(a);}
+static u32 read32(u64 a){reads++;if(fault_load){assert(exc_guard==(GUARD_MARK|GUARD_SILENT));exc_count++;return 0xabad1dea;}if(a==0x1cb0100010ULL && get(a)==0xffffffff)return is("bar-mask")?0xfffe0001:0xffff0004;if(a==0x1cb0100014ULL && get(a)==0xffffffff)return is("bar-high")?0xfffffffe:0xffffffff;return get(a);}
 static u16 read16(u64 a){return read32(a&~3ULL)>>((a&2)*8);}
 static void write32(u64 a,u32 v){writes++;if(is("bar-drop")&&a==0x1cb0100010ULL&&v==0x80000004)return;put(a,v);if(a==0x39a000300ULL&&(v&15)==2){held=true;if(!is("clamp-fail")){put(0x488028208ULL,0);put(0x488028804ULL,0);put(0x488028820ULL,0);put(0x1cb0000728ULL,0x14);}}}
 static void write16(u64 a,u16 v){u64 b=a&~3ULL;unsigned sh=(a&2)*8;write32(b,(get(b)&~(0xffffU<<sh))|((u32)v<<sh));}
@@ -41,5 +55,80 @@ const void*adt_getprop(const void*d,int n,const char*key,u32*len){(void)d;static
 int adt_getprop_copy(const void*d,int n,const char*k,void*out,size_t size){u32 len;const void*p=adt_getprop(d,n,k,&len);if(!p||len!=size)return -1;memcpy(out,p,size);return len;}
 int j813_n1_train_windows(void){trains++;trained=true;put(0x488028208ULL,0x1001);put(0x1cb0000000ULL,0x100c106b);put(0x1cb0100000ULL,is("identity")?0x1234106b:0x1900106b);put(0x1cb0101000ULL,0xffff);put(0x1cb0102000ULL,0xffff);put(0x1cb0100010ULL,4);put(0x1cb0100004ULL,is("post-bme")?4:0);put(0xb80008000ULL,is("rom")?1:0);return is("train")||is("clamp-fail")?-1:0;}
 #include "../../../src/hv/windows/windows_n1.c"
-int main(int argc,char**argv){assert(argc==2);scenario=argv[1];if(is("chip"))chip_id=0x8112;if(is("board"))board_id=0x25;put(0x488000000ULL,14U<<24);put(0x488000008ULL,(42U<<24)|(36U<<16)|0x202);put(0x48800000cULL,16);put(0x488000200ULL,is("locked")?1:0);put(0x488001000ULL,is("dart")?1:0);put(0x488000080ULL,is("busy")?0x80000000:0);put(0x39a000300ULL,3);if(is("pre-bme")){put(0x488028208ULL,1);put(0x1cb0000000ULL,0x100c106b);put(0x1cb0100000ULL,0x1900106b);put(0x1cb0100004ULL,4);}
+static void census_request(u64 address, u64 version, u64 reserved, bool success,
+                           unsigned expected_reads) {
+    u64 regs[4] = {0x4e3152443332ULL, address, version, reserved};
+    unsigned before_reads = reads, before_writes = writes, before_trains = trains;
+    enum exc_guard_t before_guard = exc_guard;
+    assert(hv_windows_n1_census_hvc(regs));
+    assert(regs[0] == 0x4e3141434b31ULL && regs[3] == 1);
+    assert(reads == before_reads + expected_reads);
+    assert(writes == before_writes && trains == before_trains);
+    assert(exc_guard == before_guard);
+    if (success) {
+        assert(regs[1] == 0 && regs[2] == get(address));
+        assert(regs[2] <= UINT32_MAX);
+    } else {
+        assert((int64_t)regs[1] < 0 && regs[2] == 0);
+    }
+}
+
+static void census_scenario(void) {
+    bool prepared = !is("census-unprepared") && !is("census-failed-prepare");
+    if (!is("census-unprepared")) {
+        u8 descriptor[128];
+        if (is("census-failed-prepare"))
+            scenario = "train";
+        int result = hv_windows_n1_prepare(descriptor, sizeof(descriptor));
+        if (prepared) {
+            assert(result == 0 && trains == 1 && !held);
+        } else {
+            assert(result == -1 && held);
+            for (unsigned i = 0; i < sizeof(descriptor); ++i)
+                assert(descriptor[i] == 0);
+            scenario = "census-failed-prepare";
+        }
+    }
+    if (!prepared) {
+        census_request(0x488028208ULL, 1, 0, false, 0);
+    } else if (is("census-magic")) {
+        u64 regs[4] = {0x4e3152443333ULL, 0x488028208ULL, 1, 0};
+        u64 original[4];
+        memcpy(original, regs, sizeof(regs));
+        unsigned before_reads = reads, before_writes = writes;
+        assert(!hv_windows_n1_census_hvc(regs));
+        assert(!memcmp(original, regs, sizeof(regs)));
+        assert(reads == before_reads && writes == before_writes);
+    } else if (is("census-address")) {
+        const u64 denied[] = {0, 0x488028204ULL, 0x1cb0100008ULL,
+            0x488000080ULL, 0xb80008004ULL, 0x488028209ULL,
+            0x1cb0200000ULL, UINT64_MAX};
+        for (unsigned i = 0; i < ARRAY_SIZE(denied); ++i)
+            census_request(denied[i], 1, 0, false, 0);
+    } else if (is("census-valid")) {
+        const u64 allowed[] = {0x488028208ULL, 0x1cb0000000ULL,
+            0x1cb0100000ULL, 0x1cb0100004ULL, 0x1cb0100010ULL,
+            0x1cb0100014ULL, 0x1cb0101000ULL, 0x1cb0101004ULL,
+            0x1cb0102000ULL, 0x1cb0102004ULL, 0xb80008000ULL,
+            0x488000000ULL, 0x488000008ULL, 0x48800000cULL,
+            0x488000200ULL, 0x488001000ULL, 0x488001400ULL};
+        put(0x1cb0101004ULL, 0xfedcba98); /* Must not sign-extend. */
+        for (unsigned i = 0; i < ARRAY_SIZE(allowed); ++i)
+            census_request(allowed[i], 1, 0, true, 1);
+    } else {
+        if (is("census-bsp")) model_cpu = 0; /* Boot CPU need not be CPU 0. */
+        if (is("census-guard")) exc_guard = GUARD_RETURN;
+        if (is("census-masked")) model_DAIF = 1U << 8;
+        if (is("census-pending")) model_ISR_EL1 = 1U << 8;
+        fault_load = is("census-load-fault");
+        fault_barrier = is("census-barrier-fault");
+        census_request(0x488028208ULL, is("census-version") ? 2 : 1,
+                       is("census-reserved") ? 1 : 0, false,
+                       fault_load || fault_barrier ? 1 : 0);
+    }
+    printf("%s reads=%u writes=%u trains=%u PASS\n", scenario, reads, writes, trains);
+}
+
+int main(int argc,char**argv){assert(argc==2);scenario=argv[1];model_cpu=boot_cpu_idx;if(is("chip"))chip_id=0x8112;if(is("board"))board_id=0x25;put(0x488000000ULL,14U<<24);put(0x488000008ULL,(42U<<24)|(36U<<16)|0x202);put(0x48800000cULL,16);put(0x488000200ULL,is("locked")?1:0);put(0x488001000ULL,is("dart")?1:0);put(0x488000080ULL,is("busy")?0x80000000:0);put(0x39a000300ULL,3);if(is("pre-bme")){put(0x488028208ULL,1);put(0x1cb0000000ULL,0x100c106b);put(0x1cb0100000ULL,0x1900106b);put(0x1cb0100004ULL,4);}
+if(!strncmp(scenario,"census-",7)){census_scenario();return 0;}
 unsigned char result[128];memset(result,0xaa,sizeof(result));int rc=hv_windows_n1_prepare(result,sizeof(result));bool success=is("success");if(success){assert(rc==0&&trains==1&&!held);u32 magic;memcpy(&magic,result,4);assert(magic==0x4831574e);FILE*f=fopen("descriptor.bin","wb");assert(f);assert(fwrite(result,1,128,f)==128);fclose(f);}else{assert(rc!=0);for(unsigned i=0;i<128;i++)assert(!result[i]);if(trained)assert(held);else assert(!writes);if(is("clamp-fail"))assert(rc==-2);}printf("%s rc=%d trains=%u writes=%u held=%d PASS\n",scenario,rc,trains,writes,held);}

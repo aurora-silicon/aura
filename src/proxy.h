@@ -156,6 +156,7 @@ typedef enum {
     P_HV_WINDOWS_CAPS = 0xc80,
     P_HV_WINDOWS_CONFIG = 0xc81,
     P_HV_WINDOWS_N1_PREPARE = 0xc82,
+    P_HV_WINDOWS_HEAP_HIGH_WATER = 0xc83,
 
     P_FB_INIT = 0xd00,
     P_FB_SHUTDOWN,

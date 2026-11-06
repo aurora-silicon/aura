@@ -5,6 +5,7 @@
 #include "exception.h"
 #include "hv.h"
 #include "j813_n1.h"
+#include "smp.h"
 #include "string.h"
 #include "utils.h"
 
@@ -19,6 +20,7 @@
 static const u64 n1_resources[6][2] = {
     {ECAM, 0x200000}, {DART, 0x20000}, {PORT, 0x4000}, {PHY, 0x1000}, {PAD, 4}, {BAR, 0x600000},
 };
+static bool n1_prepared;
 
 static u32 le32(const void *data)
 {
@@ -122,6 +124,42 @@ static int n1_read(u64 address, unsigned width, u32 *value)
     sysop("isb");
     exc_guard = saved;
     return before == exc_count ? 0 : -1;
+}
+/* Mu's v1 census only; resource membership alone never authorizes a read. */
+static bool n1_census_address(u64 address)
+{
+    static const u64 addresses[] = {
+        PORT + 0x208,  ECAM,          CTRL,          CTRL + 4,      CTRL + 0x10,   CTRL + 0x14,
+        CTRL + 0x1000, CTRL + 0x1004, CTRL + 0x2000, CTRL + 0x2004, BAR + 0x8000,  DART,
+        DART + 8,      DART + 0xc,    DART + 0x200,  DART + 0x1000, DART + 0x1400,
+    };
+    for (unsigned i = 0; i < ARRAY_SIZE(addresses); ++i)
+        if (address == addresses[i])
+            return true;
+    return false;
+}
+bool hv_windows_n1_census_hvc(u64 regs[4])
+{
+    if (regs[0] != HV_WINDOWS_N1_READ_CALL)
+        return false;
+
+    int status = HV_WINDOWS_N1_READ_UNAVAILABLE;
+    u32 value = 0;
+    /* The shared exception guard is used under the HV lock, on the BSP only.
+     * A pending/masked SError cannot safely be attributed to this read. */
+    if (!n1_prepared || smp_id() != boot_cpu_idx || exc_guard != GUARD_OFF ||
+        (mrs(DAIF) & BIT(8)) || (mrs(ISR_EL1) & BIT(8)))
+        goto out;
+    status = HV_WINDOWS_N1_READ_INVALID;
+    if (regs[2] != HV_WINDOWS_N1_READ_VERSION || regs[3] || !n1_census_address(regs[1]))
+        goto out;
+    status = n1_read(regs[1], 4, &value) ? HV_WINDOWS_N1_READ_FAULT : HV_WINDOWS_N1_READ_OK;
+out:
+    regs[0] = HV_WINDOWS_N1_READ_ACK;
+    regs[1] = status;
+    regs[2] = status == HV_WINDOWS_N1_READ_OK ? value : 0;
+    regs[3] = HV_WINDOWS_N1_READ_VERSION;
+    return true;
 }
 
 static int n1_write(u64 address, unsigned width, u32 value)
@@ -293,5 +331,6 @@ int hv_windows_n1_prepare(void *descriptor, size_t size)
         put_le(out + 40 + i * 16, n1_resources[i][1], 8);
     }
     printf("Windows N1: NW1H v1 ready; cold ROM, SID0 disabled, BME off\n");
+    n1_prepared = true;
     return 0;
 }
