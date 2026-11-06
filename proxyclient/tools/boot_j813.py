@@ -103,20 +103,7 @@ def boot(args, s, raw):
     state["stage"] = "entering"
     common.save(args.output / "linux.json", state)
     common.require(s.p.request(s.p.P_KBOOT_BOOT, kernel["address"]) == 0, "kernel entry refused")
-    s.close()
-    import serial
-    with serial.Serial(args.console, timeout=0.2) as console:
-        tail = b""
-        deadline = time.monotonic() + 300
-        with (args.output / "linux-console.bin").open("xb") as log:
-            while time.monotonic() < deadline:
-                data = console.read(65536)
-                if data:
-                    log.write(data)
-                    log.flush()
-                    tail = (tail + data)[-65536:]
-                    if b"J813_ARTIFACT_BASE64_END" in tail or b"Kernel panic" in tail:
-                        break
+    common.capture_consoles(args, s, 300, b"J813_ARTIFACT_BASE64_END")
     print("Console captured; inspect linux-console.bin for the kernel result.", flush=True)
 
 

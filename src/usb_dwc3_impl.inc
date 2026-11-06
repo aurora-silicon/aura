@@ -2173,16 +2173,15 @@ void usb_dwc3_flush(dwc3_dev_t *dev, cdc_acm_pipe_id_t pipe)
         return;
 
     u8 ep = dev->pipe[pipe].ep_in;
-#if USB_DWC3_SUPERSPEED
+    /* After the host restores KIS, USB2 may retain an open pipe with TX
+     * pending. Console flushing must not block a guarded RAM handoff. */
+    bool bounded = USB_DWC3_SUPERSPEED || chip_id == T8142 || chip_id == T8152;
     u64 start = get_ticks();
-#endif
 
     while (CDC_LOOP_READY(dev, pipe) &&
            (ringbuffer_get_used(device2host) != 0 || dev->endpoints[ep].xfer_in_progress)) {
-#if USB_DWC3_SUPERSPEED
-        if (ticks_to_msecs(get_ticks() - start) >= CDC_IO_TIMEOUT_MS)
+        if (bounded && ticks_to_msecs(get_ticks() - start) >= 3000)
             return;
-#endif
         usb_dwc3_handle_events(dev);
     }
 }

@@ -117,6 +117,30 @@ class Session:
         self.f.dev.close()
 
 
+def capture_consoles(args, session, seconds, end_marker):
+    """Keep the existing KIS descriptor open so early handoff logs survive."""
+    import serial
+    captured = bytearray()
+    proxy = session.f.dev
+    proxy.timeout = 0
+    with serial.Serial(args.console, timeout=0.2) as console, \
+            (args.output / "linux-console.bin").open("xb") as log, \
+            (args.output / "aura-handoff-console.bin").open("xb") as aura_log:
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            aura_log.write(proxy.read(65536))
+            aura_log.flush()
+            data = console.read(65536)
+            if data:
+                captured.extend(data)
+                log.write(data)
+                log.flush()
+                if end_marker in captured or b"Kernel panic" in captured:
+                    break
+        aura_log.write(proxy.read(65536))
+    return captured
+
+
 def guard(args, device, phase=None):
     phase = phase or args.action
     directory = args.output / (phase + "-pmu")
@@ -323,20 +347,7 @@ def boot_linux(args, raw, symbols, receipt):
             state["stage"] = "handoff_sent"
             save(args.output / "linux.json", state)
             p.request(p.P_KBOOT_BOOT, state["kernel"], no_reply=True)
-            s.close()
-            import serial
-            with serial.Serial(args.console, timeout=0.2) as console:
-                captured = bytearray()
-                deadline = time.monotonic() + 150
-                with (args.output / "linux-console.bin").open("xb") as log:
-                    while time.monotonic() < deadline:
-                        data = console.read(65536)
-                        if data:
-                            captured.extend(data)
-                            log.write(data)
-                            log.flush()
-                            if b"J873_ARTIFACT_BASE64_END" in captured or b"Kernel panic" in captured:
-                                break
+            captured = capture_consoles(args, s, 150, b"J873_ARTIFACT_BASE64_END")
             state.update(console_has_thermal_marker=b"J873_LINUX_THERMAL_TELEMETRY_READY" in captured,
                          console_has_ready_marker=b"AURORA_J873_LINUX_INITRAMFS_READY" in captured,
                          console_sha256=sha(captured))
