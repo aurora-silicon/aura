@@ -57,7 +57,6 @@
 
 #define OSLOG_TYPE                GENMASK(63, 56)
 #define OSLOG_TYPE_BUFFER_REQUEST 1
-#define OSLOG_TYPE_3              3
 #define OSLOG_SIZE                GENMASK(55, 36)
 #define OSLOG_IOVA                GENMASK(35, 0)
 
@@ -673,16 +672,13 @@ static bool rtkit_windows_message(rtkit_dev_t *rtk, const struct asc_message *wi
                 return asc_send(rtk->asc, wire);
             return false;
         case RTKIT_EP_OSLOG:
-            /* Public Aura/Linux ignore non-buffer OSLog messages without
-             * replying. Admit the observed J813 type only; its payload has no
-             * established buffer/address semantics and must remain opaque. */
-            if (FIELD_GET(OSLOG_TYPE, msg.msg) == OSLOG_TYPE_3) {
-                if (rtk->notifications.oslog_type3 != UINT64_MAX)
-                    rtk->notifications.oslog_type3++;
-                return true;
-            }
-            return FIELD_GET(OSLOG_TYPE, msg.msg) == OSLOG_TYPE_BUFFER_REQUEST &&
-                   rtkit_handle_oslog_request(rtk, &msg);
+            if (FIELD_GET(OSLOG_TYPE, msg.msg) == OSLOG_TYPE_BUFFER_REQUEST)
+                return rtkit_handle_oslog_request(rtk, &msg);
+            /* Public Aura/Linux ignore every non-buffer OSLog message without
+             * replying. The payload is opaque; never interpret it as a grant. */
+            if (rtk->notifications.oslog_notifications != UINT64_MAX)
+                rtk->notifications.oslog_notifications++;
+            return true;
         default:
             return rtkit_windows_reject(rtk, wire, RTKIT_REJECT_SYSTEM_ENDPOINT);
     }

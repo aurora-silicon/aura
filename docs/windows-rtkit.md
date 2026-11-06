@@ -1,6 +1,30 @@
 # Explicit Windows RTKit service mode
 
+## Opaque OSLog notifications failure model (before implementation)
+
+A later physical run sent endpoint `8`, message `0x04000020ce38cc21`, OSLog
+type `4`, and hit the deliberately narrow type-3-only handler. Match the full
+public Aura/Linux endpoint contract now: only type `1` is a buffer request;
+every other OSLog type is an opaque, no-reply notification. This rule is confined
+to OSLog, not unknown system endpoints. Payload semantics remain unspecified.
+
+- Every non-type-1 value, including `0`, `2`, `3`, `4` and `0xff`, consumes the
+  normal per-call budget without parsing a payload, accessing log memory,
+  allocating, changing buffer ownership/mappings or sending a reply.
+- Type `1` still takes the existing validated grant path. A malformed/duplicate
+  grant, invalid endpoint, unknown system endpoint or crash still latches failure
+  before any later notification is consumed.
+- Rename the saturating counter to `oslog_notifications` so telemetry describes
+  all non-buffer types. Full TX and latched failure leave its count unchanged.
+- First replay the exact newly rejected type-4 wire against candidate17 bytes;
+  then replay all 255 non-buffer type values after a complete production boot,
+  checking the unchanged OSLog buffer/pool and zero additional replies. Keep
+  malformed type-1 failure transcripts, source snapshots and repeatable receipts.
+
 ## OSLog type 3 failure model (before implementation)
+
+This records the earlier restricted correction; the opaque OSLog contract above
+supersedes its type-3-only admission rule.
 
 The next physical run identified endpoint `8`, message `0x03ff006ea3b0e3f6`,
 with rejection reason `3` (generic protocol rejection). OSLog uses bits 63:56
@@ -110,10 +134,11 @@ other mailbox writers, ordinary `rtkit_recv()`, and concurrent boot/free are
 outside this contract. A return of zero means no work or TX backpressure, and a
 negative return requires the caller's quarantine path. Endpoint IDs `0x20..0xff`
 and known debug endpoint `3` are unowned notifications, consumed without replies
-within the same budget. OSLog endpoint `8`, type `3`, is also consumed without a
-reply, matching the observed message and public behavior. Other unsupported
-OSLog types, unknown system IDs and values at or above `0x100` are errors. No
-logging buffers are parsed by this path.
+within the same budget. OSLog endpoint `8` uses its own type byte: type `1` takes
+the validated buffer-grant path, and every other type is consumed without a
+reply or payload interpretation, matching the public handler. Unknown system
+IDs and values at or above `0x100` are errors. No logging buffers are parsed by
+this path.
 
 After service returns, the sole owner can call `rtkit_get_first_rejection()` to
 copy the first rejected `msg0` and `msg1`. Reason codes are 1 for an out-of-range
@@ -123,7 +148,7 @@ rejection was recorded (for example, invalid service arguments or reentry).
 The snapshot is immutable after the first rejection; callers must not race it
 with service or free. No MMIO, allocation, or firmware-buffer parsing is involved.
 `rtkit_get_notification_counts()` follows the same sole-owner rule and copies
-separate saturating app/debug/OSLog-type-3 counters. MTP reports these after successful
+separate saturating app/debug/OSLog-notification counters. MTP reports these after successful
 preparation, making a zero-notification run distinguishable from one that used
 the compatibility behavior.
 
@@ -146,8 +171,8 @@ complete boot through system endpoint startup, both power acknowledgements,
 AP pool grants, SRAM adoption and runtime replies. It also checks full TX,
 service bounds/reentry, pool exhaustion, failed mapping, absent/reversed HELLO,
 repeated endpoint maps, missing AP acknowledgement, bounded app/debug traffic,
-invalid endpoint IDs, the exact physical OSLog type-3 message, malformed protocol
-traffic, failed replies and crashes.
+invalid endpoint IDs, the exact physical OSLog type-3/type-4 messages, all 255
+non-buffer OSLog types, malformed grants, failed replies and crashes.
 The output includes `result.json`, exact source hashes, compile/replay logs and
 `mailbox.bin` containing the successful AP-to-IOP wire transcript. Hardware was
 not accessed; this is production-code protocol validation with modeled ASC,

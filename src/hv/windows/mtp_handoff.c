@@ -315,9 +315,9 @@ bool hv_windows_mtp_prepare(void)
     exc_guard = saved;
     struct rtkit_notification_counts notifications = {0};
     rtkit_get_notification_counts(mtp.rtkit, &notifications);
-    printf("mtp-handoff: phase7 notifications app=%lu debug=%lu oslog3=%lu\n",
+    printf("mtp-handoff: phase7 notifications app=%lu debug=%lu oslog=%lu\n",
            (unsigned long)notifications.app, (unsigned long)notifications.debug,
-           (unsigned long)notifications.oslog_type3);
+           (unsigned long)notifications.oslog_notifications);
     printf("mtp-handoff: J813 ready, preserved DockChannel RX=%u, DART SID0, pool %#lx/+%#lx\n",
            count, (unsigned long)(MTP_STAGE_PA + MTP_STAGE_SIZE), (unsigned long)MTP_STAGE_SIZE);
     return true;

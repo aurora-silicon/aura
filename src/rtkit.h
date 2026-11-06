@@ -69,7 +69,7 @@ struct rtkit_rejection {
 };
 
 struct rtkit_notification_counts {
-    u64 app, debug, oslog_type3;
+    u64 app, debug, oslog_notifications;
 };
 
 /* Explicit pre-boot mode. Caller owns/stops the IOP before releasing storage. */

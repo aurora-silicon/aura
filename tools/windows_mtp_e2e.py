@@ -56,7 +56,7 @@ def main():
                 assert expected in result.stdout, (case, result.stdout)
                 assert "failed; allocations retained" in result.stdout
             if case in {"success", "runtime-fail", "stop-fail", "final-map"}:
-                assert "phase7 notifications app=2 debug=1 oslog3=3" in result.stdout
+                assert "phase7 notifications app=2 debug=1 oslog=3" in result.stdout
             report["cases"].append(case)
         report["result"] = "passed"
     finally:
