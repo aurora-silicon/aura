@@ -23,16 +23,27 @@ required to be off. Every observed state is logged; an active or unknown gate
 rejects preparation before GPIO or power changes.
 
 After admission, GPIO PERST is asserted and read back. The producer executes
-the public Linux PHY/PLL/pclk/AXI and root-controller prefix, leaving N1 in
-reset and avoiding port and ECAM accesses. Only then does it read the DART,
-logging the address before each read and completion afterward. SID0 must be
-disabled, unprotected and without a page-table root; translation geometry and
-idle command state must also match. Linux does not itself read DART, so DART
-accessibility at this boundary still requires physical qualification.
+the public Linux PHY/PLL/pclk/AXI and root-controller prefix, then completes the
+unchanged SMC reset, port/refclk/PERST and root DBI sequence. It requires link
+establishment and verifies every present endpoint's identity and bus-master bit
+before the first DART access. No endpoint bus-master enable or firmware load is
+added. Active or unknown ownership is rejected by cold-gate admission before
+this reset sequence.
 
-The finish phase preserves Linux's SMC reset, port/refclk/PERST and root DBI
-sequence. After link establishment, every present endpoint must have bus
-mastering disabled. Control BAR0 is assigned and read back, ROM must be at cold
+The [physical held-reset prefix probe](validation/j813-n1-held-reset-dart-20261106.json)
+completed, but its first DART read at
+`0x488000000` stalled with SError. Thus neither PMGR activation nor PHY/root
+setup alone proves DART accessibility. The public Linux
+[J813 N1 device tree](https://github.com/aurora-silicon/linux/blob/3a0da31bcc027d4b0a28b0501e649522c7a232f6/arch/arm64/boot/dts/apple/t8142-j813-n1.dtsi)
+requires loader-trained PCIe before Linux takes over the ordinary T8110 DART.
+The revised ordering follows that boundary; hardware qualification of this
+candidate remains pending.
+
+Both clean-DART checks remain: before and after Control BAR assignment. Each
+address is logged before its guarded read and on completion. SID0 must be
+disabled, unprotected and without a page-table root; translation geometry and
+idle command state must match. An active or busy DART is rejected, never cleared.
+Every present endpoint must still have bus mastering disabled. Control BAR0 is assigned and read back, ROM must be at cold
 stage 0, and DART/endpoint state is rechecked before producing the record.
 The ordinary Linux entry still runs the same complete ordered sequence.
 
@@ -110,7 +121,8 @@ producer, its dependencies and the existing failure-first model into a source
 snapshot, compiles that snapshot with ASan/UBSan, and runs the producer/census scenarios in
 separate processes. The tests exercise the complete preparation entry point
 against modelled ADT, MMIO and endpoint behavior. They cover successful handoff,
-identity/resource/reset-function rejection, locked/active/busy DART, cold owner rejection and newly enabled bus mastering, training failure, wrong endpoint identity, BAR
+identity/resource/reset-function rejection, locked/active/busy DART, cold owner rejection and bus mastering on any of the three functions, first-DART faults,
+translation state changed at BAR assignment, training failure, wrong endpoint identity, BAR
 probe/readback faults, active ROM, and failed cleanup quarantine.
 The reset-provider fixture retains only paths, compatible strings, phandles and
 the reset tuple from a captured J813 ADT. It reproduces the controller-versus-PMU
@@ -138,3 +150,59 @@ instruction/exception dispatcher, hypervisor lifecycle gating, physical PHY/SMC
 operations, Windows PnP, interrupt delivery or DMA. A physical Aura → Mu →
 Windows handoff and reset/drain receipt is required before merge or a hardware
 support claim.
+
+
+## Physical admission attempt: 2026-11-06
+
+The candidate at `3a86afbb5184b25810b7d6f53ff4618d4ca79054` was RAM-chainloaded
+and exercised through the production N1 census-microguest launcher. It rejected
+the seven inherited APCIE gate states before any N1 reset/power write, DART read,
+descriptor publication or guest entry. The new post-link DART boundary was not
+reached, so it remains unqualified on hardware.
+
+The [admission and recovery receipt](validation/j813-n1-dart-order-20261106.json)
+retains all seven raw words and the source/image/log hashes. They exactly match
+the gate values captured before any HV/guest preparation in the earlier
+held-reset diagnostic. This is an ownership-handoff prerequisite, not evidence
+that the reordered DART read succeeded. The earlier GPIO snapshot is separately
+labelled; this attempt did not read GPIO after rejecting the gates. No admission
+condition was relaxed or unknown owner state cleared to proceed.
+
+The attempt was followed by a separate external reset and restoration of the
+qualified CPU Aura/Mu images. The complete 1 MiB CDC readback and zero-exception
+guard passed; the Windows agent responded, and the installed CPU driver again
+reported Running/Code0 with its exact signed binary hash and E2/P10 state.
+No frequency SET, N1 firmware load, endpoint bus-master enable or DART mapping
+was performed in the restored Windows session.
+
+## Linux reset diagnostic: 2026-11-06
+
+A separate no-guest diagnostic used the same saved Windows image and its
+unchanged native Linux helpers after validating the complete live PMGR consumer
+graph and activating only the seven exclusive N1 gates. The SMC reset, port
+reset, reference-clock setup and training completed: link status was
+`0x9a001001`, Control identified as `106b:1900`, and the production endpoint
+identity/bus-master-clear check returned success. ANS and both excluded OCLA
+gate words matched at every recorded checkpoint.
+
+All seven late DART reads then completed. The production clean-state check
+correctly rejected SID0 TCR `0x1` and TTBR `0x1400c000`; the other parameter,
+protection and command-busy predicates passed. This establishes the post-link
+access order on this image. It does not establish ownership of the inherited
+translation state. No DART write, BAR assignment, firmware load, ownership
+descriptor or guest entry followed. The failed native call was the final target
+operation; there is no post-failure exception or protected-state snapshot.
+
+The [sanitized reset diagnostic receipt](validation/j813-n1-linux-reset-20261106.json)
+retains the native-stage results, register words, source/image hashes and trace
+hashes. Its host diagnostic has a 219-case failure-injection replay; the preceding
+port-only census has 647 cases. These isolate hardware boundaries and do not
+qualify DMA, interrupt delivery or Windows Wi-Fi. Production cold admission is
+unchanged. The next prerequisite is an explicit Linux-derived inherited-DART
+disable/invalidation sequence, followed by the actual Aura/Mu ownership handoff.
+
+A separate external reset restored the qualified Windows boot. The 1 MiB CDC
+roundtrip, serial-agent response, exact signed CPU driver, MADT and ten-CPU
+identity/class join passed; E2/P10 stayed unchanged without a frequency SET.
+The [recovery receipt](validation/j813-n1-linux-reset-recovery-20261106.json)
+records those checks. N1 remains disabled in this recovered Windows session.

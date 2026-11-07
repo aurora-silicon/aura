@@ -50,6 +50,7 @@ u32 chip_id = 0x8142, board_id = 0x24;
 void *adt;
 static const char *scenario;
 static unsigned trains, writes, reads;
+static unsigned dart_reads, endpoint_command_reads;
 static bool trained, held;
 static bool powered, fabric_ready, validated;
 static unsigned fabric_calls;
@@ -145,9 +146,20 @@ static u32 read32(u64 a)
                                                                        : get(a);
     }
     if (a != 0x39a000300ULL) {
-        assert(powered && fabric_ready);
-        if (a < 0x488000000ULL || a >= 0x488020000ULL)
-            assert(trained);
+        assert(powered && fabric_ready && trained);
+        if (a >= 0x488000000ULL && a < 0x488020000ULL) {
+            assert(endpoint_command_reads && !held);
+            dart_reads++;
+            if (is("dart-load-fault")) {
+                assert(dart_reads == 1 && exc_guard == (GUARD_MARK | GUARD_SILENT));
+                exc_count++;
+                return 0xabad1dea;
+            }
+            if (is("post-dart-active") && a == 0x488001400ULL && get(0x1cb0100010ULL) == 0x80000004)
+                return 1;
+        }
+        if (a == 0x1cb0100004ULL || a == 0x1cb0101004ULL || a == 0x1cb0102004ULL)
+            endpoint_command_reads++;
     }
     reads++;
     if (fault_load) {
@@ -354,8 +366,10 @@ int j813_n1_finish_windows(bool *ready)
     put(0x488028208ULL, 0x1001);
     put(0x1cb0000000ULL, 0x100c106b);
     put(0x1cb0100000ULL, is("identity") ? 0x1234106b : 0x1900106b);
-    put(0x1cb0101000ULL, 0xffff);
-    put(0x1cb0102000ULL, 0xffff);
+    put(0x1cb0101000ULL, is("secondary-bme") ? 0x1902106b : 0xffff);
+    put(0x1cb0102000ULL, is("tertiary-bme") ? 0x1903106b : 0xffff);
+    put(0x1cb0101004ULL, is("secondary-bme") ? 4 : 0);
+    put(0x1cb0102004ULL, is("tertiary-bme") ? 4 : 0);
     put(0x1cb0100010ULL, 4);
     put(0x1cb0100004ULL, is("post-bme") ? 4 : 0);
     put(0xb80008000ULL, is("rom") ? 1 : 0);
@@ -496,6 +510,12 @@ int main(int argc, char **argv)
             assert(held && rc == -2);
         if (is("clamp-fail"))
             assert(rc == -2);
+        if (is("post-bme") || is("secondary-bme") || is("tertiary-bme"))
+            assert(!dart_reads && get(0x1cb0100010ULL) == 4);
+        if (is("dart-load-fault"))
+            assert(dart_reads == 1 && get(0x1cb0100010ULL) == 4);
+        if (is("post-dart-active"))
+            assert(dart_reads > 7);
         if (!strncmp(scenario, "smc-", 4))
             assert(!reads && !writes && !trains);
         if (is("tunables") || !strncmp(scenario, "cold-", 5) || is("pre-bme"))
