@@ -105,6 +105,7 @@ class LaunchPlan:
     serial: str = "disabled"
     mtp: str = "disabled"
     cpufreq: str = "disabled"
+    g17: str = "disabled"
 
 
 def plan_profile(filename):
@@ -116,7 +117,7 @@ def plan_profile(filename):
     require(isinstance(profile, dict), "profile must be an object")
     require(profile.get("schema") == "aura.windows.boot.v1", "unsupported Windows boot profile")
     require(set(profile) <= {"schema", "name", "target", "mu", "append", "framebuffer", "boot_args",
-                             "guest_compatibility", "usb", "n1", "reserved_memory", "serial", "mtp", "cpufreq"},
+                             "guest_compatibility", "usb", "n1", "reserved_memory", "serial", "mtp", "cpufreq", "g17"},
             "unknown Windows profile field")
     require(isinstance(profile.get("name"), str) and 0 < len(profile["name"]) <= 80, "profile name is required")
     target = profile.get("target")
@@ -180,6 +181,11 @@ def plan_profile(filename):
     require(cpufreq in ("disabled", "j813-manual-v1"), "unsupported CPU frequency policy")
     require(cpufreq == "disabled" or (chip == 0x8142 and model == "Mac17,3"),
             "j813-manual-v1 CPU frequency handoff requires chip 0x8142 and model Mac17,3")
+    from .windows_g17 import POLICY as G17_POLICY
+    g17 = profile.get("g17", "disabled")
+    require(g17 in ("disabled", G17_POLICY), "unsupported G17 preservation policy")
+    require(g17 == "disabled" or (chip == 0x8142 and model == "Mac17,3"),
+            "G17 preservation requires chip 0x8142 and model Mac17,3")
     declarations = profile.get("reserved_memory", [])
     require(isinstance(declarations, list) and len(declarations) <= 16,
             "reserved_memory must be a list of at most 16 ranges")
@@ -216,7 +222,7 @@ def plan_profile(filename):
         cursor = offset + len(content)
     return LaunchPlan(filename, profile, raw, hashlib.sha256(raw).hexdigest(), b"".join(composed),
                       tuple(images), entry, chip, model, framebuffer, compatibility, usb, n1,
-                      tuple(reserved), boot_args, serial, mtp, cpufreq)
+                      tuple(reserved), boot_args, serial, mtp, cpufreq, g17)
 
 
 def _aligned(value, alignment):
@@ -239,6 +245,9 @@ def predict_windows_layout(args, adt, heap_top, image_length):
 
 def validate_reserved_layout(guard, layout):
     require(layout == guard["layout"], "Windows memory layout changed after reservation preflight")
+    if "g17_source" in guard:
+        from .windows_g17 import validate_exclusions
+        validate_exclusions(guard["g17_source"], guard, layout)
     for reservation in guard["reservations"]:
         start, end = reservation["base"], reservation["base"] + reservation["size"]
         require(layout["heap_top"] <= start < end <= guard["ram_end"],
@@ -361,7 +370,7 @@ def prepare_n1_handoff(hv):
 
 def source_manifest():
     root = Path(__file__).resolve().parents[1]
-    names = ("aura/windows.py", "aura/windows_serial.py", "aura/windows_cdc.py",
+    names = ("aura/windows.py", "aura/windows_g17.py", "aura/windows_serial.py", "aura/windows_cdc.py",
              "aura/hv/__init__.py", "aura/proxy.py", "tools/boot_windows.py")
     return {name: hashlib.sha256((root / name).read_bytes()).hexdigest() for name in names}
 
@@ -427,7 +436,8 @@ class HardwareSession:
         address, revision = self.proxy.get_bootargs_rev()
         require(revision in (1, 2, 3), "unsupported resident boot-arguments revision")
         layout = {1: BootArgs_r1, 2: BootArgs_r2, 3: BootArgs_r3}[revision]
-        args = layout.parse(self.iface.readmem(address, layout.sizeof()))
+        self._identity_bootargs_blob = self.iface.readmem(address, layout.sizeof())
+        args = layout.parse(self._identity_bootargs_blob)
         require(0 < args.devtree_size <= 4 * 1024 * 1024, "resident ADT exceeds bounds")
         physical = (args.devtree - args.virt_base + args.phys_base) & ((1 << 64) - 1)
         ram_end = args.phys_base + args.mem_size
@@ -447,7 +457,8 @@ class HardwareSession:
 
     def prepare(self, plan):
         validate_capabilities(self.capabilities(), plan.framebuffer, plan.guest_compatibility, plan.n1,
-                              bool(plan.reserved_memory), plan.serial, plan.mtp, plan.cpufreq)
+                              bool(plan.reserved_memory) or plan.g17 != "disabled",
+                              plan.serial, plan.mtp, plan.cpufreq)
         self.validate_serial_transport(plan)
         if plan.serial == "capture":
             from .windows_serial import WindowsSerialRecorder
@@ -470,11 +481,50 @@ class HardwareSession:
         preflight.setup_adt()
         preflight._windows_adt_blob()
         guard = None
-        if plan.reserved_memory:
+        if plan.reserved_memory or plan.g17 != "disabled":
             guard = memory_reservation_preflight(
                 plan, self._identity_bootargs, preflight.adt, self.proxy.hv_windows_heap_high_water(),
                 self._identity_resident_base, self._identity_bootargs_address,
                 self._identity_bootargs_size, self._identity_adt_physical)
+        if plan.g17 != "disabled":
+            from . import windows_g17
+            from .proxy import Feature
+            source = windows_g17.observe(preflight.adt, self._identity_bootargs)
+            # The native MEMREAD path probes all bytes under GUARD_RETURN only
+            # when transfer checksums are enabled. Re-negotiate before TEXT reads.
+            features = self.iface.enabled_features
+            transport_complete = False
+
+            def read_firmware_text(address, size):
+                nonlocal transport_complete
+                transport_complete = False
+                image = self.iface.readmem(address, size)
+                transport_complete = True
+                return image
+
+            try:
+                self.iface.nop(features=Feature(0))
+                transport_complete = True
+                require(not self.iface.enabled_features & Feature.DISABLE_DATA_CSUMS,
+                        "G17 admission requires checksummed, exception-guarded TEXT reads")
+                record, receipt = windows_g17.admit(source, guard, read_firmware_text)
+            finally:
+                # A timeout, corrupt frame or device loss leaves channel state
+                # ambiguous. Never send cleanup commands after a failed call.
+                if transport_complete:
+                    self.iface.nop(features=features)
+            guard["g17_source"] = source
+            preflight.windows_memory_guard = guard
+            preflight.windows_g17 = plan.g17
+            preflight.windows_g17_source = source
+            preflight.windows_g17_record = record
+            preflight.windows_g17_receipt = receipt
+            windows_g17.update_adt(preflight)
+            preflight._windows_adt_blob()
+            require(self.iface.readmem(self._identity_bootargs_address, self._identity_bootargs_size) ==
+                    self._identity_bootargs_blob, "G17 source boot arguments changed before allocation")
+            require(self.iface.readmem(self._identity_adt_physical, self._identity_bootargs.devtree_size) ==
+                    self._identity_adt_blob, "G17 source ADT changed before allocation")
         bootstrap_port(self.iface, self.proxy)
         allocator_proxy = _GuardedHeapProxy(self.proxy, guard) if guard is not None else self.proxy
         utils = ProxyUtils(allocator_proxy, heap_size=PROXY_HEAP_SIZE, aura_heap=AURA_HEAP_RESERVE)
@@ -490,6 +540,10 @@ class HardwareSession:
         self.hv.windows_n1 = plan.n1
         self.hv.windows_mtp = plan.mtp
         self.hv.windows_cpufreq = plan.cpufreq
+        self.hv.windows_g17 = plan.g17
+        self.hv.windows_g17_source = preflight.windows_g17_source
+        self.hv.windows_g17_record = preflight.windows_g17_record
+        self.hv.windows_g17_receipt = preflight.windows_g17_receipt
         self.hv.windows_serial = plan.serial
         self.hv.windows_serial_recorder = self.serial_capture
         self.hv.init()
@@ -506,7 +560,8 @@ class HardwareSession:
                 "usb": plan.usb, "usb_removed": self.hv.windows_usb_removed,
                 "n1": self.hv.windows_n1_handoff, "memory_preflight": self.hv.windows_memory_guard,
                 "mtp": {"profile": plan.mtp, "prepared": self.hv.windows_mtp_ready},
-                "cpufreq": {"profile": plan.cpufreq, "automatic_policy": False}}
+                "cpufreq": {"profile": plan.cpufreq, "automatic_policy": False},
+                "g17": self.hv.windows_g17_receipt}
 
     def start(self):
         return self.hv.start()
@@ -548,7 +603,8 @@ def launch_profile(filename, device, output, session_factory=HardwareSession, gu
             session = session_factory(device, log)
             caps = session.capabilities()
             validate_capabilities(caps, plan.framebuffer, plan.guest_compatibility, plan.n1,
-                                  bool(plan.reserved_memory), plan.serial, plan.mtp, plan.cpufreq)
+                                  bool(plan.reserved_memory) or plan.g17 != "disabled",
+                                  plan.serial, plan.mtp, plan.cpufreq)
             identity = session.identity()
             require(identity["chip_id"] == plan.chip_id and identity["model"] == plan.model,
                     "target identity does not match the Windows profile")
