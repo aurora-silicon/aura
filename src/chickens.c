@@ -213,7 +213,9 @@ void init_cpu(void)
     if (!quiet)
         printf("  CPU: %s\n", midr_part_info->name);
 
-    cpu_features = midr_part_info->features;
+    /* A T8142 secondary cannot write aura's data under macOS 27.0 (CTRR_D, smp.c). */
+    if (cpu_features != midr_part_info->features)
+        cpu_features = midr_part_info->features;
 
     if (cpu_features->disable_dc_mva) {
         /* This is performed unconditionally on all cores (necessary?) */

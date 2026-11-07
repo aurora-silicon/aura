@@ -86,7 +86,9 @@ static bool wfe_mode SMP_SHARED = false;
 
 static int target_cpu SMP_SHARED;
 static int cpu_nodes[MAX_CPUS];
-static struct spin_table spin_table[MAX_CPUS] SMP_SHARED;
+static struct spin_table spin_table_image[MAX_CPUS] SMP_SHARED;
+/* T8142 moves it out of the boot object (smp_t8142_block_init) */
+static struct spin_table *spin_table SMP_SHARED = spin_table_image;
 
 struct cpu_info {
     bool valid;
@@ -140,6 +142,56 @@ struct smp_reset_stack smp_reset_stacks[MAX_CPUS] SMP_SHARED = {
 };
 
 extern u8 _vectors_start[0];
+
+/*
+ * macOS 27.0 iBoot locks CTRR_D over the whole boot object for the T8142 secondaries: they may
+ * run aura's code there, but every store of theirs into it faults, with the MMU on or off. Their
+ * stacks and the spin table live in one heap block above it instead, uncached like
+ * .data.smp_shared, and kboot keeps that block from the OS (smp_secondary_block()).
+ */
+static u8 *t8142_block SMP_SHARED;
+static size_t t8142_block_size;
+
+static u64 secondary_stack_top(int index)
+{
+    if (t8142_block)
+        return (u64)t8142_block + (u64)(index + 1) * SECONDARY_STACK_SIZE;
+    return (u64)secondary_stacks[index] + SECONDARY_STACK_SIZE;
+}
+
+u8 *smp_secondary_stack(int index)
+{
+    return (u8 *)(secondary_stack_top(index) - SECONDARY_STACK_SIZE);
+}
+
+bool smp_secondary_block(u64 *base, u64 *size)
+{
+    if (!t8142_block)
+        return false;
+    *base = (u64)t8142_block;
+    *size = t8142_block_size;
+    return true;
+}
+
+static int smp_t8142_block_init(int cpus)
+{
+    size_t stacks = (size_t)cpus * SECONDARY_STACK_SIZE;
+    size_t size = ALIGN_UP(stacks + sizeof(spin_table_image), SZ_16K);
+    u8 *block = memalign(SZ_16K, size);
+
+    if (!block)
+        return -1;
+    memset(block, 0, size);
+    memcpy(block + stacks, spin_table_image, sizeof(spin_table_image));
+    dc_civac_range(block, size);
+    mmu_map_uncached((u64)block, size);
+    t8142_block_size = size;
+    t8142_block = block;
+    spin_table = (struct spin_table *)(block + stacks);
+    sysop("dsb sy");
+    printf("SMP: T8142 secondary stacks and spin table at [%p, %p)\n", block, block + size);
+    return 0;
+}
 
 extern u8 _stack_bot[0];
 int boot_cpu_idx SMP_SHARED = -1;
@@ -334,8 +386,12 @@ void smp_secondary_entry(void)
         }
     }
 
-    smp_reset_stacks[index].stack = (u64)secondary_stacks[index] + SECONDARY_STACK_SIZE;
-    smp_reset_stacks[index].mpidr = mpidr;
+    /* On T8142 the table is read-only here (CTRR_D); smp_init() published this entry. */
+    u64 stack = secondary_stack_top(index);
+    if (smp_reset_stacks[index].stack != stack || smp_reset_stacks[index].mpidr != mpidr) {
+        smp_reset_stacks[index].stack = stack;
+        smp_reset_stacks[index].mpidr = mpidr;
+    }
     sysop("dsb sy");
 
     struct spin_table *me = &spin_table[index];
@@ -462,9 +518,9 @@ static int smp_start_cpu(int index, const struct cpu_info *cpu)
     target_cpu = index;
     if (has_el3()) {
         _reset_stack = secondary_stacks_el3[index] + SECONDARY_STACK_SIZE; // EL3
-        _reset_stack_el1 = secondary_stacks[index] + SECONDARY_STACK_SIZE; // EL1
+        _reset_stack_el1 = (void *)secondary_stack_top(index); // EL1
     } else
-        _reset_stack = secondary_stacks[index] + SECONDARY_STACK_SIZE;
+        _reset_stack = (void *)secondary_stack_top(index);
 
     sysop("dsb sy");
 
@@ -774,6 +830,17 @@ int smp_init(void)
             msr(TPIDR_EL1, boot_cpu_idx);
     }
 
+    if (chip_id == T8142 && !t8142_block) {
+        int cpus = 0;
+        for (int i = 0; i < MAX_CPUS; i++)
+            if (cpu_nodes[i])
+                cpus = i + 1;
+        if (smp_t8142_block_init(cpus) < 0) {
+            printf("SMP: could not allocate the T8142 secondary block\n");
+            return -1;
+        }
+    }
+
     spin_table[boot_cpu_idx].mpidr = mrs(MPIDR_EL1) & 0xFFFFFF;
     smp_reset_stacks[boot_cpu_idx].stack = (u64)_stack_bot;
     smp_reset_stacks[boot_cpu_idx].mpidr = spin_table[boot_cpu_idx].mpidr;
@@ -810,7 +877,7 @@ int smp_init(void)
         if (chip_id == T8142 && i != boot_cpu_idx) {
             /* ADT reg omits Aff2, which is 1 on the M5 performance cluster. */
             smp_reset_stacks[i].mpidr = (reg & 0xFFFFFF) | (cpu_info[i].cluster ? BIT(16) : 0);
-            smp_reset_stacks[i].stack = (u64)secondary_stacks[i] + SECONDARY_STACK_SIZE;
+            smp_reset_stacks[i].stack = secondary_stack_top(i);
         }
     }
 
@@ -846,7 +913,7 @@ static void smp_start_t8152(void)
             smp_start_fail_mask |= BIT(i);
             break;
         }
-        dc_civac_range(secondary_stacks[i], SECONDARY_STACK_SIZE);
+        dc_civac_range(smp_secondary_stack(i), SECONDARY_STACK_SIZE);
         if (!(rvbar & RVBAR_LOCK))
             write64(cpu->impl_reg, (u64)_vectors_start);
         sysop("dsb sy");
