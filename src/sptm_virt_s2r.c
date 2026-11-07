@@ -890,25 +890,34 @@ static volatile u64 s2r_usb_ring_wp;
 static u64 s2r_usb_ring_rp;
 static volatile bool s2r_usb_capture;
 
-__attribute__((naked, noinline)) static void s2r_usb_switch(u64 *save_sp, u64 load_sp)
-{
-    __asm__("stp x19, x20, [sp, #-96]!\n"
-            "stp x21, x22, [sp, #16]\n"
-            "stp x23, x24, [sp, #32]\n"
-            "stp x25, x26, [sp, #48]\n"
-            "stp x27, x28, [sp, #64]\n"
-            "stp x29, x30, [sp, #80]\n"
-            "mov x9, sp\n"
-            "str x9, [x0]\n"
-            "mov sp, x1\n"
-            "ldp x21, x22, [sp, #16]\n"
-            "ldp x23, x24, [sp, #32]\n"
-            "ldp x25, x26, [sp, #48]\n"
-            "ldp x27, x28, [sp, #64]\n"
-            "ldp x29, x30, [sp, #80]\n"
-            "ldp x19, x20, [sp], #96\n"
-            "ret\n");
-}
+/*
+ * Saves the callee-saved registers on this stack, stores sp in *save_sp, then loads load_sp and
+ * returns into whatever saved its frame there. Top-level asm: gcc ignores naked here and drops
+ * the arguments. The frame is 12 words, x30 at word 11.
+ */
+void s2r_usb_switch(u64 *save_sp, u64 load_sp);
+__asm__(".pushsection .text.s2r_usb_switch, \"ax\", %progbits\n"
+        ".p2align 2\n"
+        ".type s2r_usb_switch, %function\n"
+        "s2r_usb_switch:\n"
+        "stp x19, x20, [sp, #-96]!\n"
+        "stp x21, x22, [sp, #16]\n"
+        "stp x23, x24, [sp, #32]\n"
+        "stp x25, x26, [sp, #48]\n"
+        "stp x27, x28, [sp, #64]\n"
+        "stp x29, x30, [sp, #80]\n"
+        "mov x9, sp\n"
+        "str x9, [x0]\n"
+        "mov sp, x1\n"
+        "ldp x21, x22, [sp, #16]\n"
+        "ldp x23, x24, [sp, #32]\n"
+        "ldp x25, x26, [sp, #48]\n"
+        "ldp x27, x28, [sp, #64]\n"
+        "ldp x29, x30, [sp, #80]\n"
+        "ldp x19, x20, [sp], #96\n"
+        "ret\n"
+        ".size s2r_usb_switch, . - s2r_usb_switch\n"
+        ".popsection\n");
 
 static void s2r_usb_yield(u64 ticks)
 {
