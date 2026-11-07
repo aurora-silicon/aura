@@ -1,0 +1,202 @@
+{
+  "schema": "j813-n1-linux-reset-diagnostic-v1",
+  "date": "2026-11-06",
+  "target": {
+    "board": "J813",
+    "model": "Mac17,3",
+    "chip_id": "0x8142",
+    "board_id": "0x24"
+  },
+  "qualification": {
+    "result": "late-dart-readable-inherited-sid0-state-rejected",
+    "complete": false,
+    "ownership_granted": false,
+    "guest_prepared": false,
+    "windows_wifi_qualified": false,
+    "post_link_dart_access_observed": true,
+    "production_cold_admission_unchanged": true,
+    "default_linux_flow_changed": false
+  },
+  "implementation": {
+    "source_commit": "3a86afbb5184b25810b7d6f53ff4618d4ca79054",
+    "image_sha256": "6741db1e6217feda5236f3bd82f2d0ce7f58399f394689e889abd648814da74a",
+    "elf_sha256": "114face4b42f2d932cb4ece88384806dbf4f272f43ce259511a802051c8dd5c4",
+    "manifest_sha256": "b4c455bdf8d520e6e9ac720d89f792d787a981a741d411c43e60d1bd99a0315a",
+    "helper_sha256": "2482c3ec2065413175f54ef477b8fa70e725a107b26124b6018d6ab38d672f8a"
+  },
+  "native_stages": [
+    {
+      "name": "j813_n1_validate_windows",
+      "return_u32": "0x0",
+      "trace_sequence": 60
+    },
+    {
+      "name": "j813_n1_regs",
+      "return_u32": "0x0",
+      "trace_sequence": 66
+    },
+    {
+      "name": "j813_n1_fabric",
+      "return_u32": "0x0",
+      "trace_sequence": 74
+    },
+    {
+      "name": "j813_n1_finish",
+      "return_u32": "0x0",
+      "trace_sequence": 104
+    },
+    {
+      "name": "n1_endpoints_clean",
+      "return_u32": "0x0",
+      "trace_sequence": 134
+    },
+    {
+      "name": "n1_dart_clean",
+      "return_u32": "0xffffffff",
+      "trace_sequence": 140
+    }
+  ],
+  "link": {
+    "status_raw": "0x9a001001",
+    "control_vendor_id": "0x106b",
+    "control_device_id": "0x1900",
+    "endpoint_identity_and_bme_check_returned_zero": true
+  },
+  "dart": {
+    "base": "0x488000000",
+    "reads": [
+      {
+        "offset": "0x0",
+        "value": "0x9e313020"
+      },
+      {
+        "offset": "0x8",
+        "value": "0x2a2a0204"
+      },
+      {
+        "offset": "0xc",
+        "value": "0x11013"
+      },
+      {
+        "offset": "0x200",
+        "value": "0x0"
+      },
+      {
+        "offset": "0x1000",
+        "value": "0x1"
+      },
+      {
+        "offset": "0x1400",
+        "value": "0x1400c000"
+      },
+      {
+        "offset": "0x80",
+        "value": "0x300c71f"
+      }
+    ],
+    "all_seven_guarded_reads_completed": true,
+    "read_fault_logged": false,
+    "clean_predicates": {
+      "parameter1_bits27_24_is_14": true,
+      "parameter3_bits29_24_is_42": true,
+      "parameter3_bits21_16_is_36_through_42": true,
+      "parameter3_low16_is_0x100_through_0x2ff": true,
+      "parameter4_low9_is_1_through_256": true,
+      "protect_bit0_is_clear": true,
+      "sid0_tcr_is_zero": false,
+      "sid0_ttbr_is_zero": false,
+      "command_busy_bit31_is_clear": true
+    },
+    "rejected_inherited_state": {
+      "sid0_tcr": "0x1",
+      "sid0_ttbr": "0x1400c000"
+    },
+    "state_writes_performed": false,
+    "interpretation_limit": "Readability and rejection of nonzero inherited SID0 state are observed; no DART reset, invalidation, table ownership or DMA drain is qualified."
+  },
+  "protected_state": {
+    "port_census_before_after_identical": true,
+    "native_snapshots": [
+      {
+        "phase": "live-native-binding",
+        "values": {
+          "ANS": "0xf0020ff",
+          "SYS_GP_OCLA": "0x300",
+          "SYS_ST_OCLA": "0x300",
+          "GPIO192_PERST": "0x70a02"
+        },
+        "trace_sequences": {
+          "ANS": 30,
+          "SYS_GP_OCLA": 32,
+          "SYS_ST_OCLA": 34,
+          "GPIO192_PERST": 36
+        }
+      },
+      {
+        "phase": "j813_n1_fabric",
+        "values": {
+          "ANS": "0xf0020ff",
+          "SYS_GP_OCLA": "0x300",
+          "SYS_ST_OCLA": "0x300",
+          "GPIO192_PERST": "0x70a02"
+        },
+        "trace_sequences": {
+          "ANS": 76,
+          "SYS_GP_OCLA": 78,
+          "SYS_ST_OCLA": 80,
+          "GPIO192_PERST": 82
+        }
+      },
+      {
+        "phase": "j813_n1_finish",
+        "values": {
+          "ANS": "0xf0020ff",
+          "SYS_GP_OCLA": "0x300",
+          "SYS_ST_OCLA": "0x300",
+          "GPIO192_PERST": "0x70a03"
+        },
+        "trace_sequences": {
+          "ANS": 108,
+          "SYS_GP_OCLA": 110,
+          "SYS_ST_OCLA": 112,
+          "GPIO192_PERST": 114
+        }
+      }
+    ],
+    "ans_ocla_equal_at_all_recorded_checkpoints": true,
+    "gpio_transition": "0x70a02 to 0x70a03 during unchanged Linux finish",
+    "final_snapshot_after_failed_dart_call": null,
+    "limitation": "ANS/OCLA equality is proved at recorded checkpoints only; no post-failure protected-state read was made."
+  },
+  "stop_evidence": {
+    "port_census_operations": 207,
+    "linux_reset_operations": 140,
+    "last_operation": "native n1_dart_clean returned 0xffffffff",
+    "last_operation_sequence": 140,
+    "followup_target_operations_after_failure": 0,
+    "zero_exception_counter_observations_before_final_call": 70,
+    "last_counter_observation_sequence": 139,
+    "post_failure_exception_counter_observed": false,
+    "child_exited": true,
+    "child_exit_code": 1,
+    "parent_reported_no_followup_transport": true,
+    "external_recovery_required": true,
+    "recovery_result": "recorded separately by root; not asserted by this diagnostic artifact"
+  },
+  "evidence_sha256": {
+    "console.log": "17a0b3888d32539b5d687cdf223446d0a3fa989a7b03b930a3e52e73c6841efe",
+    "linux-reset/events.jsonl": "ea0e7679f1696def2a4d1d43b2788692b579767e4089a824172e707e9ac20d5e",
+    "linux-reset/receipt.json": "1376b23308a02d25f2afa0b5071673187ce57310acd9c32037b4696e3a6c04e2",
+    "port-census/events.jsonl": "4ff70e31395b678761c6ebfe1279a3b724f829057419e04a14521411f6faf4b0",
+    "port-census/receipt.json": "72466ccc8bdd990e69ab70ea5e69dd40b8dd1c2733aed320cd14fb676114155c",
+    "parent-receipt.json": "d13465f22397846d200377e22056caea23c3c91a4d0c9bcffaad8c7dd6c577cc",
+    "child-receipt.json": "c9bebe932402ef2765a9b143866b5de33619f1b03d2b1c7810b36f1163bfd7c4",
+    "identity-binding.json": "8e8159e17d93766194925b1d80481e0e0c22b251f08dc476eabca90654ab7693",
+    "runner.log": "8bd1d774203fbf1052db1216b0c796eb57c77d1b0c4e81412f6a560f4c76e011"
+  },
+  "remaining_work": [
+    "Source-backed drain/invalidation and inherited DART ownership transition",
+    "Production acquisition path and Mu/Windows positive ownership handoff",
+    "Windows N1 Control firmware start and Wi-Fi hardware qualification"
+  ]
+}
