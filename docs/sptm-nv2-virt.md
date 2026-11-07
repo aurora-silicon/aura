@@ -1,4 +1,4 @@
-# Virtualized SPTM under aura (T8140)
+# Virtualized SPTM under aura (T8140, T8132)
 
 aura can run macOS's own stock SPTM, TXM, the cL4 secure kernel with its exclaves, and XNU as a
 FEAT_NV2 guest at virtual EL2, with their guarded world (GXF and SPRR) running natively one
@@ -7,10 +7,25 @@ it suspends to RAM and wakes as it does natively. It is a development tool: aura
 power-management access macOS makes, which is how the sleep sequence for Linux was recorded.
 
 It is built only with `SPTM_VIRT=1` (which needs `CHAINLOADING=1`) and only does anything on
-T8140 booted as a kcbz=0 Mach-O boot object (`docs/macho-boot-object.md`): iBoot then skips its
+T8140 or T8132 booted as a kcbz=0 Mach-O boot object (`docs/macho-boot-object.md`): iBoot then skips its
 own SPTM loader, leaves GXF and SPRR writable, and jumps to aura at EL2. aura's NV2 support is
 built only with `SPTM_VIRT=1` as well: other images, the Linux boot included, carry none of it.
 The host side is `proxyclient/tools/run_guest_sptm.py`.
+
+The boot object has to be enrolled on the volume group of the macOS it boots. iBoot brings the SEP
+up for the volume group it booted: from another one (a Linux stub's), XNU mounts the sealed root
+only with that macOS's `/chosen` values, and then panics in `SEPEpoch::getFullEpochs` when the SEP
+does not answer for its xART.
+
+### T8132 (J713, MacBook Air M4)
+
+25G83 boots the same way on a J713 to loginwindow, on all ten cores. Its build manifest has no
+`Ap,ExclaveOS` or `Ap,cL4`, so the guest is SPTM, TXM and XNU only (no `AURA_KEEP_EXCLAVES`).
+TXM and the static trust cache are the J700's files; the kernel is `kernelcache.release.mac16g`.
+`sptm.t8132.release` is the T8140 build with `init_pre_late_io_reservation` 0xc4 later, so the
+host shifts only the four AMCC patches. The debug port is hpm0 behind `usb-drd0`/`dart-usb0`/
+`atc-phy0`, which also carries Thunderbolt (`acio0`, `apciec0`), and all of it is hidden from
+XNU. The sleep path (`sptm_virt_s2r.c`) stays T8140-only: its S2R flags are ignored on T8132.
 
 The code:
 

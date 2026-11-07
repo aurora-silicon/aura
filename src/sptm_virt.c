@@ -43,8 +43,8 @@ static volatile bool sptm_cpu_in_xnu[MAX_CPUS];
 
 bool sptm_virt_requested(void)
 {
-    /* Only T8140 boots as a kcbz=0 Mach-O object with GXF unlocked. */
-    return chip_id == T8140;
+    /* T8140 and T8132 boot as a kcbz=0 Mach-O object with GXF unlocked. */
+    return chip_id == T8140 || chip_id == T8132;
 }
 
 int sptm_virt_compute_layout(u64 phys_base, u64 mem_size, u64 ram_base, u64 ram_top, u64 fw_high,
@@ -283,6 +283,12 @@ __attribute__((used, retain)) int sptm_virt_load(u64 sptm_entry, u64 handoff)
 
 __attribute__((used, retain)) void sptm_virt_config(u64 flags)
 {
+    /* The sleep path's MMIO addresses are T8140's (sptm_virt_s2r.c). */
+    if (chip_id != T8140 && (flags & SPTM_VIRT_S2R)) {
+        printf("SPTM-virt: sleep-path hooks are T8140-only; ignoring the S2R flags\n");
+        flags &= ~(SPTM_VIRT_S2R | SPTM_VIRT_S2R_GO | SPTM_VIRT_S2R_FULL | SPTM_VIRT_S2R_COPROC |
+                   SPTM_VIRT_S2R_DROP_USB);
+    }
     sptm_virt_flags = flags;
     printf("SPTM-virt: flags 0x%lx\n", flags);
 }
