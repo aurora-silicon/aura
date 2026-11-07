@@ -114,8 +114,7 @@ const struct midr_part_features features_m4 = {
     .sleep_mode = SLEEP_NONE, // XXX probably new mode required
 #ifdef SPTM_VIRT
     /* The virtualized SPTM needs aura's own GL2 (SPRR and GXF), which iBoot leaves writable for a
-     * kcbz=0 boot object, and the error registers for its fault reports. */
-    .apple_sysregs_unlocked = true,
+     * kcbz=0 boot object. apple_sysregs_unlocked stays false: CYC_OVRD is locked. */
     .mmu_sprr = true,
 #endif
     .fast_ipi = true,
@@ -261,8 +260,7 @@ void init_cpu(void)
         reg_clr(SYS_IMP_APL_ACC_CFG, ACC_CFG_DEEP_SLEEP);
     }
 
-    /* CYC_OVRD UNDEFs on parts without a sleep mode (M4 class, under SPTM_VIRT). */
-    if (cpu_features->apple_sysregs_unlocked && cpu_features->sleep_mode != SLEEP_NONE) {
+    if (cpu_features->apple_sysregs_unlocked) {
         /* Unmask external IRQs, set WFI mode to up (2), enable WFI retention */
         reg_mask(SYS_IMP_APL_CYC_OVRD,
                  CYC_OVRD_FIQ_MODE_MASK | CYC_OVRD_IRQ_MODE_MASK | CYC_OVRD_WFI_MODE_MASK |
