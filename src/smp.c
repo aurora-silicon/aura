@@ -142,6 +142,7 @@ struct smp_reset_stack smp_reset_stacks[MAX_CPUS] SMP_SHARED = {
 extern u8 _vectors_start[0];
 
 extern u8 _stack_bot[0];
+extern char _stack_top[], _data_start[], _bss_end[];
 int boot_cpu_idx SMP_SHARED = -1;
 u64 boot_cpu_mpidr SMP_SHARED = 0;
 static u64 installed_relay SMP_SHARED;
@@ -1154,4 +1155,89 @@ int smp_park_for_kernel(void)
     }
     sysop("dsb sy");
     return 0;
+}
+
+/*
+ * Under the virtualized SPTM every core enters the guest through a hardware reset, as natively:
+ * XNU starts a core with PMGR CPUSTART, and a core that power-gates in idle or sleep comes back
+ * the same way, at its iBoot-locked RVBAR, which must reach aura (sptm_virt_cpu_reset). So nothing
+ * is started here: publish each core's reset stack by MPIDR (cpu_reset finds it with the MMU
+ * off), make sure its RVBAR lands in aura, and clean the image to DRAM for MMU-off readers.
+ */
+int smp_prepare_guest_resets(void)
+{
+    int ready = 0;
+
+    if (!smp_initialized)
+        return -1;
+
+    for (int i = 0; i < MAX_CPUS; i++) {
+        struct cpu_info *cpu = &cpu_info[i];
+        if (!cpu->valid)
+            continue;
+        /* ADT reg omits Aff2, which is 1 on the performance cluster (as on T8142). */
+        u64 mpidr = ((u64)cpu->cluster << 8) | cpu->core | (cpu->cluster ? BIT(16) : 0);
+        u64 rvbar = read64(cpu->impl_reg);
+        int rc = 0;
+
+        if (i == boot_cpu_idx) {
+            if (smp_reset_stacks[i].mpidr != mpidr)
+                printf("SMP-guest: boot cpu%d MPIDR 0x%lx, ADT-derived 0x%lx\n", i,
+                       smp_reset_stacks[i].mpidr, mpidr);
+        } else {
+            if (!secondary_stacks[i]) {
+                printf("SMP-guest: cpu%d has no reset stack\n", i);
+                continue;
+            }
+            smp_reset_stacks[i].mpidr = mpidr;
+            smp_reset_stacks[i].stack = (u64)secondary_stacks[i] + SECONDARY_STACK_SIZE;
+            rc = smp_prepare_rvbar(cpu);
+        }
+        /* A secondary must be powered off here: XNU's CPUSTART only resets a core that is
+         * off, and one left running (an earlier stage's park loop) never reaches SPTM. */
+        u64 state = read64(cpu->impl_reg + 0x100) & 0xff;
+        printf("SMP-guest: cpu%d mpidr 0x%06lx rvbar 0x%lx%s -> %s, core state 0x%lx%s\n", i,
+               smp_reset_stacks[i].mpidr, rvbar & RVBAR_ADDR, (rvbar & RVBAR_LOCK) ? " locked" : "",
+               rc ? "UNREACHABLE (no relay)" : "aura", state,
+               (i != boot_cpu_idx && state) ? " (RUNNING!)" : "");
+        if (!rc)
+            ready++;
+    }
+
+    /* Text/rodata, then data+bss. Not the stacks: the boot stack has an unmapped guard
+     * page at _stack_top (a clean over [_base, _end) faults there), and no other core
+     * reads another's stack. */
+    dc_cvac_range((void *)_base, _rodata_end - (char *)_base);
+    dc_cvac_range((void *)_data_start, _bss_end - _data_start);
+    mmu_publish_secondary();
+    sysop("dsb sy");
+    return ready;
+}
+
+int smp_index_for_mpidr(u64 mpidr)
+{
+    mpidr &= 0xffffff;
+    for (int i = 0; i < MAX_CPUS; i++)
+        if (smp_reset_stacks[i].mpidr == mpidr && smp_reset_stacks[i].stack &&
+            (i == boot_cpu_idx || cpu_info[i].valid))
+            return i;
+    return -1;
+}
+
+bool smp_cpu_valid(int cpu)
+{
+    return cpu >= 0 && cpu < MAX_CPUS && cpu_info[cpu].valid;
+}
+
+/* The memory a core's reset path writes with the MMU off: invalidate any line a previous
+ * (cacheable) life of this core left in the cluster cache before it turns its MMU on. */
+void smp_reset_stack_range(int cpu, u64 *base, u64 *size)
+{
+    if (cpu == boot_cpu_idx) {
+        *base = (u64)_stack_top;
+        *size = (u64)_stack_bot - (u64)_stack_top;
+    } else {
+        *base = (u64)secondary_stacks[cpu];
+        *size = secondary_stacks[cpu] ? SECONDARY_STACK_SIZE : 0;
+    }
 }

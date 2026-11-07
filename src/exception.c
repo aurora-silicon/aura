@@ -1,5 +1,7 @@
 /* SPDX-License-Identifier: MIT AND GPL-2.0-only */
 
+#include "../build/build_cfg.h"
+
 #include "exception.h"
 #include "aic.h"
 #include "aic_regs.h"
@@ -7,8 +9,13 @@
 #include "gxf.h"
 #include "iodev.h"
 #include "memory.h"
+#include "sptm_virt.h"
 #include "uart.h"
 #include "utils.h"
+
+#ifdef SPTM_VIRT
+#include "nv2.h"
+#endif
 
 #define EL0_STACK_SIZE 0x4000
 
@@ -25,6 +32,9 @@ volatile u64 exc_last_esr, exc_last_afsr1;
 
 void el0_ret(void);
 void el1_ret(void);
+#ifdef SPTM_VIRT
+void nv2_probe_ret(void);
+#endif
 
 static char *m_table[0x10] = {
     [SPSR_M_EL0] = "EL0t",  //
@@ -156,8 +166,9 @@ void exception_initialize(void)
             break;
     }
 
-    /* Initial T8152 bring-up polls KIS without configuring the AIC. */
-    if (is_boot_cpu() && chip_id != T8152)
+    /* Initial T8152 bring-up polls KIS without configuring the AIC. A core reset while the
+     * virtualized SPTM's guest is live must not take the guest's interrupts at EL2. */
+    if (is_boot_cpu() && chip_id != T8152 && !sptm_virt_guest_live)
         msr(DAIF, 0 << 6); // Enable SError, IRQ and FIQ
     else
         msr(DAIF, 3 << 6); // Disable IRQ and FIQ
@@ -257,6 +268,10 @@ void exc_sync(u64 *regs)
     bool in_gl = in_gl12();
     bool el3 = in_el3();
 
+    /* One of the virtualized SPTM's fault-tolerant reads faulted: skip it. */
+    if (sptm_virt_peek_fault(in_gl))
+        return;
+
     u64 spsr = in_gl ? mrs(SYS_IMP_APL_SPSR_GL1) : (el3 ? mrs(SPSR_EL3) : mrs(SPSR_EL1));
     u64 esr = in_gl ? mrs(SYS_IMP_APL_ESR_GL1) : (el3 ? mrs(ESR_EL3) : mrs(ESR_EL1));
     u64 elr = in_gl ? mrs(SYS_IMP_APL_ELR_GL1) : (el3 ? mrs(ELR_EL3) : mrs(ELR_EL1));
@@ -264,6 +279,26 @@ void exc_sync(u64 *regs)
     u32 elsp = spsr & SPSR_M_EL;
     u32 ec = (esr & ESR_EC) >> ESR_EC_SHIFT;
     u32 iss = esr & ESR_ISS;
+
+#ifdef SPTM_VIRT
+    if (nv2_guarded)
+        sptm_virt_s2r_wake_trap(esr, in_gl ? elr : mrs(ELR_EL2), in_gl);
+
+    /* The virtualized SPTM (or its secure kernel) at GL1, trapped to aura's GL2. */
+    if (in_gl && nv2_guarded && sptm_virt_gl_sync(regs, esr, elr, spsr))
+        return;
+
+    /* An OS at virtual EL2 (FEAT_NV2), or the guest it runs. */
+    if (nv2_active && !in_gl && !el3 && nv2_handle_sync(regs))
+        return;
+
+    /* A WFI or WFE the virtualized SPTM's guest trapped with TWE/TWI. */
+    if (nv2_guarded && !in_gl && ec == ESR_EC_WFI && (elsp == SPSR_M_EL1H || elsp == SPSR_M_EL1T) &&
+        sptm_virt_el1_wfx(regs, esr)) {
+        sysop("isb");
+        return;
+    }
+#endif
 
     // check brk instructions
     if (ec == ESR_EC_BRK && iss == 0 && elsp == SPSR_M_EL0) {
@@ -303,6 +338,19 @@ void exc_sync(u64 *regs)
                 msr(SPSR_EL2, 0x09); // EL2h
                 msr(ELR_EL2, el1_ret);
                 return;
+#ifdef SPTM_VIRT
+            case 1:
+                /* End of an nv2_probe_call EL1 stub, but only while a proxy
+                 * probe is actually in flight: a production guest's own hvc #1
+                 * must not be redirected into proxy-only code. */
+                if (nv2_probe_active) {
+                    msr(SPSR_EL2, 0x09); // EL2h
+                    msr(ELR_EL2, nv2_probe_ret);
+                    return;
+                }
+                printf("Unknown HVC: 0x%x\n", imm);
+                break;
+#endif
             case 0x10 ... 0x1f:
                 if (!(exc_guard & GUARD_SILENT))
                     printf("EL1 Exception: 0x%x\n", imm);
@@ -334,6 +382,11 @@ void exc_sync(u64 *regs)
 
     sysop("isb");
     sysop("dsb sy");
+
+#ifdef SPTM_VIRT
+    if (nv2_active)
+        nv2_note_unhandled(esr, elr, spsr);
+#endif
 
     if (!(exc_guard & GUARD_SILENT))
         print_regs(regs, el12);
@@ -384,6 +437,11 @@ void exc_sync(u64 *regs)
 
 void exc_irq(u64 *regs)
 {
+#ifdef SPTM_VIRT
+    if (nv2_handle_async(regs, 1))
+        return;
+#endif
+
     u64 spsr = in_gl12() ? mrs(SYS_IMP_APL_SPSR_GL1) : mrs(SPSR_EL1);
     u32 reason = aic_ack();
 
@@ -402,6 +460,14 @@ void exc_irq(u64 *regs)
 
 void exc_fiq(u64 *regs)
 {
+#ifdef SPTM_VIRT
+    if (nv2_handle_async(regs, 2))
+        return;
+    /* While the virtualized SPTM's secure kernel runs, an FIQ aura does not own preempts it. */
+    if (nv2_guarded && sptm_virt_cl4_fiq(regs))
+        return;
+#endif
+
     u64 spsr = in_gl12() ? mrs(SYS_IMP_APL_SPSR_GL1) : mrs(SPSR_EL1);
     printf("Exception: FIQ (from %s) cnt: %lx\n", get_exception_source(spsr), mrs(CNTPCT_EL0));
 
@@ -470,6 +536,11 @@ void exc_fiq(u64 *regs)
 
 void exc_serr(u64 *regs)
 {
+#ifdef SPTM_VIRT
+    if (nv2_handle_async(regs, 3))
+        return;
+#endif
+
     if (!(exc_guard & GUARD_SILENT))
         printf("Exception: SError\n");
 

@@ -3,6 +3,7 @@
 #include "chickens.h"
 #include "cpu_regs.h"
 #include "midr.h"
+#include "sptm_virt.h"
 #include "uart.h"
 #include "utils.h"
 
@@ -111,6 +112,11 @@ const struct midr_part_features features_m3 = {
 // XXX figure out what features are actually available on M4
 const struct midr_part_features features_m4 = {
     .sleep_mode = SLEEP_NONE, // XXX probably new mode required
+#ifdef SPTM_VIRT
+    /* The virtualized SPTM needs aura's own GL2 (SPRR and GXF), which iBoot leaves writable for a
+     * kcbz=0 boot object. apple_sysregs_unlocked stays false: CYC_OVRD is locked. */
+    .mmu_sprr = true,
+#endif
     .fast_ipi = true,
     .actlr_el2 = true,
     .unsafe_wfi = true,
@@ -196,7 +202,7 @@ void init_cpu(void)
     int part = FIELD_GET(MIDR_PART, midr);
     int rev = (FIELD_GET(MIDR_REV_HIGH, midr) << 4) | FIELD_GET(MIDR_REV_LOW, midr);
 
-    bool quiet = (chip_id == T8142 || chip_id == T8152) && !is_boot_cpu();
+    bool quiet = ((chip_id == T8142 || chip_id == T8152) && !is_boot_cpu()) || sptm_virt_guest_live;
     if (!quiet)
         printf("  CPU part: 0x%x rev: 0x%x\n", part, rev);
 

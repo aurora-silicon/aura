@@ -10,6 +10,7 @@
 #include "firmware.h"
 #include "midr.h"
 #include "smp.h"
+#include "sptm_virt.h"
 #include "string.h"
 #include "types.h"
 #include "uart.h"
@@ -66,6 +67,9 @@ void apply_rela(uint64_t base, struct rela_entry *rela_start, struct rela_entry 
 }
 
 extern uint32_t _v_sp0_sync[], _v_sp0_irq[], _v_sp0_fiq[], _v_sp0_serr[];
+#ifdef SPTM_VIRT
+extern uint32_t _v_lower_sync[]; /* nv2_asm.S */
+#endif
 void pan_fixup(void)
 {
     if (supports_pan())
@@ -76,6 +80,9 @@ void pan_fixup(void)
     _v_sp0_irq[0] = 0xd503201f;
     _v_sp0_fiq[0] = 0xd503201f;
     _v_sp0_serr[0] = 0xd503201f;
+#ifdef SPTM_VIRT
+    _v_lower_sync[0] = 0xd503201f;
+#endif
 
     sysop("isb");
 }
@@ -258,6 +265,15 @@ void _cpu_reset_c(void *stack)
         smp_secondary_entry();
         return;
     }
+#ifdef SPTM_VIRT
+    /* Under the virtualized SPTM a reset of any core (XNU's CPUSTART, idle power-down, sleep),
+     * the boot core included, re-enters the guest through SPTM's reset vector. */
+    if (sptm_virt_guest_live) {
+        init_cpu();
+        exception_initialize();
+        sptm_virt_cpu_reset();
+    }
+#endif
     bool quiet = chip_id == T8142 && !is_boot_cpu();
     if (!quiet) {
         if (!is_boot_cpu())

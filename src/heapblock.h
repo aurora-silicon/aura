@@ -11,5 +11,6 @@ void *heapblock_alloc(size_t size);
 void *heapblock_alloc_aligned(size_t size, size_t align);
 void heapblock_set_limit(void *limit);
 uintptr_t heapblock_high_water(void);
+uintptr_t heapblock_limit(void);
 
 #endif
