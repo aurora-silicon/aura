@@ -19,7 +19,7 @@ does not answer for its xART.
 
 ### T8132 (J713, MacBook Air M4)
 
-25G83 boots the same way on a J713 to loginwindow, on all ten cores. Its build manifest has no
+25G83 boots the same way on a J713 to a working desktop, on all ten cores. Its build manifest has no
 `Ap,ExclaveOS` or `Ap,cL4`, so the guest is SPTM, TXM and XNU only (no `AURA_KEEP_EXCLAVES`).
 TXM and the static trust cache are the J700's files; the kernel is `kernelcache.release.mac16g`.
 `sptm.t8132.release` is the T8140 build with `init_pre_late_io_reservation` 0xc4 later, so the
