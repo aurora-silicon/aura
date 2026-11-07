@@ -502,9 +502,9 @@ int payload_run(void)
     }
 
     if (kernel && fdt) {
-        /* The shared post-M4 U-Boot driver adopts ANS instead of starting it.
-         * An inline ESP payload has not gone through boot_storage_load(). */
-        if (chip_id == T8132 && !fdt_node_check_compatible(fdt, 0, "apple,j713") && !nvme_init()) {
+        /* The shared post-M4 U-Boot driver adopts ANS instead of starting it, on every
+         * T8132 board. An inline ESP payload has not gone through boot_storage_load(). */
+        if (chip_id == T8132 && !nvme_init()) {
             printf("Payload: cannot prepare the M4 ANS session\n");
             goto boot_failed;
         }

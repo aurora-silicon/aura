@@ -8943,8 +8943,7 @@ int kboot_prepare_dt(void *fdt)
      * Linux's allocator (J616C: ANS syslog lines in page-cache pages at the SART-allowed heap
      * addresses).
      */
-    if (chip_id == T8140 || chip_id == T6041 || chip_id == T8152 ||
-        (chip_id == T8132 && !fdt_node_check_compatible(dt, 0, "apple,j713"))) {
+    if (chip_id == T8140 || chip_id == T6041 || chip_id == T8152 || chip_id == T8132) {
         u64 ram_end, inherited = cur_boot_args.top_of_kernel_data;
         u64 high_water = heapblock_high_water();
 
@@ -9043,13 +9042,13 @@ int kboot_prepare_dt(void *fdt)
     if (dt_reserve_secondary_ro())
         return -1;
 
-    if (chip_id == T8132 && !fdt_node_check_compatible(dt, 0, "apple,j713")) {
+    if (chip_id == T8132) {
         if (dt_reserve_bootloader_handoff())
             return -1;
         u64 start = min(ALIGN_UP((u64)adt + cur_boot_args.devtree_size, SZ_16K), (u64)_base);
         u64 end = cur_boot_args.top_of_kernel_data;
         if (end > start && dt_reserve_outside_exec_window(start, end - start))
-            bail("FDT: couldn't reserve the J713 chainload high-water interval\n");
+            bail("FDT: couldn't reserve the T8132 chainload high-water interval\n");
     }
 
     /* setup console log buffer early to capture as much log as possible */
@@ -9135,8 +9134,7 @@ int kboot_prepare_dt(void *fdt)
     dt_set_j713_isp();
     if (dt_set_pmgr())
         return -1;
-    if (chip_id == T8132 && !fdt_node_check_compatible(dt, 0, "apple,j713") &&
-        (dt_set_ans_nvme(false) || dt_set_t8132_lifecycle()))
+    if (chip_id == T8132 && (dt_set_ans_nvme(false) || dt_set_t8132_lifecycle()))
         return -1;
 #ifndef RELEASE
     if (dt_transfer_virtios())

@@ -624,9 +624,9 @@ def test_no_path_enters_a_confined_kernel_without_a_window():
 def test_nothing_reserves_the_window_from_the_os():
     source = kboot_source()
     # Each range that can span the window goes around it: the heap, the image, CTXR_D
-    # and the J713 high-water interval.
+    # and the T8132 high-water interval.
     assert source.count("dt_reserve_outside_exec_window(") == 5
-    assert "dt_reserve_outside_exec_window(start, end - start))\n            bail(\"FDT: couldn't reserve the J713" in source
+    assert "dt_reserve_outside_exec_window(start, end - start))\n            bail(\"FDT: couldn't reserve the T8132" in source
     # The firmware RO range stays reserved in every mode, before the EL1 guest goes its own way.
     ro = function(source, "dt_reserve_secondary_ro")
     assert ro.index("fdt_add_mem_rsv(dt, start, end - start)") < ro.index("if (!in_el2())")
