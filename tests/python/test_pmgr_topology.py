@@ -32,6 +32,7 @@ typedef uint64_t u64;
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 #define PACKED __attribute__((packed))
 #define T8140 0x8140
+#define T8132 0x8132
 #define ADT_GETPROP(a, n, p, v) (-1)
 
 static int chip_id = 0x8122;

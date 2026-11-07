@@ -67,10 +67,23 @@ static bool pmgr_u8id = false;
 static bool pmgr_use_group_and_offset = false;
 static bool pmgr_protected_addr(uintptr_t addr);
 
+/*
+ * J773g (M4 Mac mini): iBoot leaves the main DCP running with its CPU domain under automatic
+ * power management (ps 0x1000030f: AUTO_ENABLE, target active, idle), and a write to DISP_CPU
+ * faults (Pavel Shago's J773g m1n1 bring-up). The DCP is only ever woken over RTKit, so its CPU
+ * domain is never powered, gated or reset from here.
+ */
+static bool pmgr_j773g_dcp_cpu(const struct pmgr_device *device)
+{
+    return chip_id == T8132 && !strncmp(device->name, "DISP_CPU", sizeof(device->name)) &&
+           adt_is_compatible(adt, 0, "J773gAP");
+}
+
 static bool pmgr_protected_device(const struct pmgr_device *device)
 {
-    return chip_id == T8140 && (!strncmp(device->name, "DISP_CPU", sizeof(device->name)) ||
-                                !strncmp(device->name, "DISPEXT0_CPU", sizeof(device->name)));
+    return (chip_id == T8140 && (!strncmp(device->name, "DISP_CPU", sizeof(device->name)) ||
+                                 !strncmp(device->name, "DISPEXT0_CPU", sizeof(device->name)))) ||
+           pmgr_j773g_dcp_cpu(device);
 }
 
 static uintptr_t pmgr_get_psreg(u8 idx)
@@ -173,7 +186,7 @@ static uintptr_t pmgr_device_get_addr(u8 die, const struct pmgr_device *device)
 
 static bool pmgr_protected_addr(uintptr_t addr)
 {
-    if (chip_id != T8140 || !pmgr_devices)
+    if ((chip_id != T8140 && chip_id != T8132) || !pmgr_devices)
         return false;
     for (size_t i = 0; i < pmgr_devices_len; i++) {
         if (!pmgr_protected_device(&pmgr_devices[i]))
@@ -967,7 +980,8 @@ int pmgr_init(void)
             if ((device->flags & PMGR_FLAG_VIRTUAL))
                 continue;
 
-            if (pmgr_protected_device(device))
+            /* The J773g DCP's parents are still checked, as before; DISP_CPU is not written. */
+            if (pmgr_protected_device(device) && !pmgr_j773g_dcp_cpu(device))
                 continue;
 
             uintptr_t addr = pmgr_device_get_addr(die, device);
