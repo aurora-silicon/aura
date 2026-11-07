@@ -196,8 +196,22 @@ int pmgr_set_mode(uintptr_t a, u8 mode)
         put(0x380700300ULL, 0xff);
     return is("acquire-power-failure") ? -1 : 0;
 }
+static u64 mmio_fingerprint = 14695981039346656037ULL;
+static void fingerprint_mmio(u64 address, u32 value, bool write)
+{
+    const u64 fields[] = {write, address, value};
+    for (unsigned i = 0; i < ARRAY_SIZE(fields); i++) {
+        u64 field = fields[i];
+        for (unsigned j = 0; j < 8; j++, field >>= 8) {
+            mmio_fingerprint ^= field & 0xff;
+            mmio_fingerprint *= 1099511628211ULL;
+        }
+    }
+}
+
 static u32 read32(u64 a)
 {
+    fingerprint_mmio(a, 0, false);
     if (model_pm_address(a)) {
         if (!acquiring)
             assert(!power_requests && !writes);
@@ -249,6 +263,7 @@ static u16 read16(u64 a)
 }
 static void write32(u64 a, u32 v)
 {
+    fingerprint_mmio(a, v, true);
     if (a != 0x39a000300ULL)
         assert(trained);
     writes++;
@@ -293,7 +308,9 @@ static void write32(u64 a, u32 v)
             assert(v == (0x8100 | tlbis) && tlbis < 19);
             assert(!get(0x488000104ULL));
             tlbis++;
-            put(a, is("acquire-command-timeout") ? 0x80000000 : 0);
+            put(a, is("acquire-command-timeout")   ? 0x80000000
+                   : is("acquire-captured-params") ? (0x03000000 | v)
+                                                   : 0);
             return;
         }
     }
@@ -825,9 +842,8 @@ int main(int argc, char **argv)
     int rc = acquiring ? hv_windows_n1_acquire(result, sizeof(result))
                        : hv_windows_n1_prepare(result, sizeof(result));
     bool success = is("success") || is("acquire-success") || is("acquire-captured-params") ||
-                   is("acquire-adt-large") ||
-                   is("acquire-invalid-roots") || is("acquire-unlock") || is("acquire-stale") ||
-                   is("acquire-exception-reserved") || is("acquire-retry") ||
+                   is("acquire-adt-large") || is("acquire-invalid-roots") || is("acquire-unlock") ||
+                   is("acquire-stale") || is("acquire-exception-reserved") || is("acquire-retry") ||
                    is("acquire-cold-retry");
     if (acquiring && success) {
         assert(tlbis == 19 && global_enabled && gate_writes == 7 && !power_requests);
@@ -847,7 +863,8 @@ int main(int argc, char **argv)
                 assert(!again[i]);
         }
     }
-    printf("%s observed rc=%d reads=%u writes=%u trains=%u\n", scenario, rc, reads, writes, trains);
+    printf("%s observed rc=%d reads=%u writes=%u trains=%u mmio=%016llx\n", scenario, rc, reads,
+           writes, trains, (unsigned long long)mmio_fingerprint);
     fflush(stdout);
     if (success) {
         assert(rc == 0 && trains == 1 && !held);

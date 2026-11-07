@@ -214,3 +214,19 @@ count must stop immediately after the three PARAMS reads, before PROTECT/CMD
 or version-specific registers. Strengthen the full-producer MMIO model to
 reject those premature reads before moving the admission predicate. The valid
 controller read/write sequence remains unchanged.
+
+BAR-assignment diagnostic failure, recorded before instrumentation: physical
+campaign 02 passed every first DART-clean predicate, including command
+0x03008112 with BUSY bit31 clear, then failed before the second DART census.
+This localizes the primary failure to control BAR assignment. Its subsequent
+unproved PERST/link drain returned -2 and must not conceal that primary stage.
+The earlier controller-only diagnostic did not cover BAR assignment.
+Before adding logs, replay the captured PARAMS1 with retained completed DART
+command bits through the entire producer. Record an ordered modeled MMIO
+fingerprint for every scenario so before/after artifacts can prove that logging
+adds no target operation and changes no ordering, admission mask or value.
+Require existing BAR-mask, high-half and dropped-write failures to report their
+actual observed values and the primary assignment stage before cleanup. Require
+a later ROM failure to retain its own primary stage. Do not infer a BAR size,
+type, window or readback correction from missing data; this change is diagnostic
+only and must preserve the same descriptor, rejection and quarantine behavior.

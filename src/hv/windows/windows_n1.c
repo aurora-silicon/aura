@@ -327,30 +327,75 @@ static int n1_hold(void)
     return failed ? -1 : 0;
 }
 
+/* Assignment diagnostics reuse the original accesses: no failure-only MMIO. */
+static int n1_assign_read(const char *stage, u64 address, u32 *value)
+{
+    if (n1_read(address, 4, value)) {
+        printf("Windows N1: BAR %s read fault at %#llx\n", stage, (unsigned long long)address);
+        return -1;
+    }
+    printf("Windows N1: BAR %s address=%#llx value=%#x\n", stage, (unsigned long long)address,
+           *value);
+    return 0;
+}
+
+static int n1_assign_write(const char *stage, u64 address, u32 value)
+{
+    int result = n1_write(address, 4, value);
+    printf("Windows N1: BAR %s address=%#llx value=%#x status=%d\n", stage,
+           (unsigned long long)address, value, result);
+    return result;
+}
+
+static int n1_assign_checked(const char *stage, u64 address, unsigned width, u32 value, u32 mask)
+{
+    u32 back;
+    if (n1_write(address, width, value)) {
+        printf("Windows N1: BAR %s write fault at %#llx\n", stage, (unsigned long long)address);
+        return -1;
+    }
+    if (n1_read(address, width, &back)) {
+        printf("Windows N1: BAR %s readback fault at %#llx\n", stage, (unsigned long long)address);
+        return -1;
+    }
+    printf("Windows N1: BAR %s address=%#llx readback=%#x expected=%#x mask=%#x\n", stage,
+           (unsigned long long)address, back, value, mask);
+    return ((back ^ value) & mask) ? -1 : 0;
+}
+
 static int n1_assign_control(void)
 {
     u32 old, high = 0, mask = 0, high_mask = ~0U;
-    if (n1_checked(CTRL + 4, 2, 0, 7) || n1_read(CTRL + 0x10, 4, &old) ||
-        ((old & 15) != 0 && (old & 15) != 4))
+    if (n1_assign_checked("control-command-off", CTRL + 4, 2, 0, 7) ||
+        n1_assign_read("original-low", CTRL + 0x10, &old) || ((old & 15) != 0 && (old & 15) != 4))
         return -1;
     bool wide = (old & 6) == 4;
-    if ((wide && n1_read(CTRL + 0x14, 4, &high)) || n1_write(CTRL + 0x10, 4, ~0U) ||
-        (wide && n1_write(CTRL + 0x14, 4, ~0U)))
+    if ((wide && n1_assign_read("original-high", CTRL + 0x14, &high)) ||
+        n1_assign_write("probe-low", CTRL + 0x10, ~0U) ||
+        (wide && n1_assign_write("probe-high", CTRL + 0x14, ~0U)))
         return -1;
-    int result = n1_read(CTRL + 0x10, 4, &mask) || (wide && n1_read(CTRL + 0x14, 4, &high_mask));
+    int result = n1_assign_read("mask-low", CTRL + 0x10, &mask) ||
+                 (wide && n1_assign_read("mask-high", CTRL + 0x14, &high_mask));
     /* Restore the probe before validation, including a failed read. */
-    if (n1_write(CTRL + 0x10, 4, old) || (wide && n1_write(CTRL + 0x14, 4, high)))
+    if (n1_assign_write("restore-low", CTRL + 0x10, old) ||
+        (wide && n1_assign_write("restore-high", CTRL + 0x14, high)))
         return -1;
     u32 size = ~(mask & ~15U) + 1;
+    printf("Windows N1: BAR probe old=%#x high=%#x mask=%#x high_mask=%#x size=%#x status=%d\n",
+           old, high, mask, high_mask, size, result);
     if (result || high_mask != ~0U || (mask & 15) != (old & 15) || !size || (size & (size - 1)) ||
         size < 0x10000 || size > 0x200000)
         return -1;
-    return n1_checked(ECAM + 0x18, 4, 0x00010100, 0x00ffffff) ||
-                   n1_checked(ECAM + 0x20, 4, 0x80508000, 0xfff0fff0) ||
-                   n1_checked(ECAM + 0x24, 4, 0x0000fff0, 0xfff0fff0) ||
-                   n1_checked(ECAM + 4, 2, 2, 7) ||
-                   n1_checked(CTRL + 0x10, 4, 0x80000000 | (old & 15), ~0U) ||
-                   (wide && n1_checked(CTRL + 0x14, 4, 0, ~0U)) || n1_checked(CTRL + 4, 2, 2, 7)
+    return n1_assign_checked("root-buses", ECAM + 0x18, 4, 0x00010100, 0x00ffffff) ||
+                   n1_assign_checked("root-memory-window", ECAM + 0x20, 4, 0x80508000,
+                                     0xfff0fff0) ||
+                   n1_assign_checked("root-prefetch-disable", ECAM + 0x24, 4, 0x0000fff0,
+                                     0xfff0fff0) ||
+                   n1_assign_checked("root-memory-enable", ECAM + 4, 2, 2, 7) ||
+                   n1_assign_checked("control-address-low", CTRL + 0x10, 4, 0x80000000 | (old & 15),
+                                     ~0U) ||
+                   (wide && n1_assign_checked("control-address-high", CTRL + 0x14, 4, 0, ~0U)) ||
+                   n1_assign_checked("control-memory-enable", CTRL + 4, 2, 2, 7)
                ? -1
                : 0;
 }
@@ -389,6 +434,7 @@ static int n1_prepare(void *descriptor, size_t size, bool acquire)
     }
     bool port_ready = false;
     u32 link;
+    const char *phase = "GPIO/power/Linux fabric";
     printf("Windows N1: %s ownership admitted; clamping GPIO PERST\n",
            acquire ? "whole-N1 scope" : "cold gate");
     if (n1_gpio_hold() ||
@@ -401,15 +447,36 @@ static int n1_prepare(void *descriptor, size_t size, bool acquire)
      * admission proved ownership above; no endpoint command enables bus mastering.
      * Check every present endpoint before DART reads or BAR assignment. */
     printf("Windows N1: finishing Linux reset/port sequence before DART census\n");
-    if (j813_n1_finish_windows(&port_ready) || n1_poll(PORT + 0x208, 1, 1, 1000000) ||
-        n1_endpoints_clean() ||
-        (acquire && (n1_scope_preserved() || n1_dart_acquire() || n1_scope_preserved())) ||
-        n1_dart_clean() || n1_assign_control() || n1_dart_clean() ||
-        (acquire && (n1_dart_all_clean() || n1_scope_preserved())) || n1_endpoints_clean() ||
-        n1_read(BAR + 0x8000, 4, &link) || link != 0)
+    phase = "Linux reset/port";
+    if (j813_n1_finish_windows(&port_ready) || n1_poll(PORT + 0x208, 1, 1, 1000000))
+        goto fail;
+    phase = "initial endpoint BME";
+    if (n1_endpoints_clean())
+        goto fail;
+    phase = "N1 controller acquisition";
+    if (acquire && (n1_scope_preserved() || n1_dart_acquire() || n1_scope_preserved()))
+        goto fail;
+    phase = "DART before BAR assignment";
+    if (n1_dart_clean())
+        goto fail;
+    phase = "control BAR assignment";
+    if (n1_assign_control())
+        goto fail;
+    phase = "DART after BAR assignment";
+    if (n1_dart_clean())
+        goto fail;
+    phase = "final N1 ownership";
+    if (acquire && (n1_dart_all_clean() || n1_scope_preserved()))
+        goto fail;
+    phase = "final endpoint BME";
+    if (n1_endpoints_clean())
+        goto fail;
+    phase = "control ROM";
+    if (n1_read(BAR + 0x8000, 4, &link) || link != 0)
         goto fail;
     goto publish;
 fail:
+    printf("Windows N1: primary failure at %s; starting owned-controller quarantine\n", phase);
     if (!port_ready) {
         int clamped = n1_gpio_hold();
         printf("Windows N1: pre-port failure; GPIO clamp %s; drain unproved, quarantined\n",

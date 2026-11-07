@@ -116,7 +116,25 @@ def main():
             case_dir = output / "cases" / case
             case_dir.mkdir(parents=True)
             log = case_dir / "transcript.log"
-            run([binary, case], case_dir, log, report, env)
+            transcript = run([binary, case], case_dir, log, report, env)
+            diagnostic_markers = {
+                "success": ("Windows N1: BAR probe old=", "BAR control-memory-enable"),
+                "acquire-captured-params": ("DART read complete 0x3008112",),
+                "bar-mask": ("mask=0xfffe0001", "primary failure at control BAR assignment"),
+                "bar-high": ("high_mask=0xfffffffe", "primary failure at control BAR assignment"),
+                "bar-drop": ("readback=0x4 expected=0x80000004", "primary failure at control BAR assignment"),
+                "rom": ("primary failure at control ROM",),
+            }
+            for marker in diagnostic_markers.get(case, ()):
+                if marker not in transcript:
+                    raise RuntimeError(f"{case}: missing diagnostic marker {marker!r}; see {log}")
+            if "primary failure at " in transcript:
+                primary = transcript.index("primary failure at ")
+                cleanup = min((transcript.find(marker) for marker in (
+                    "pre-port failure;", "cannot prove PERST/link drain;", "handoff rejected;")
+                    if marker in transcript), default=-1)
+                if cleanup < primary:
+                    raise RuntimeError(f"{case}: primary failure missing before cleanup; see {log}")
             report["cases"].append({"case": case, "result": "passed",
                                      "transcript_sha256": digest(log)})
         descriptor = output / "cases/success/descriptor.bin"
