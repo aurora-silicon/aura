@@ -161,23 +161,36 @@ def verify_record(record, source, guard):
 
 def update_adt(hv):
     from construct import Bytes
+    from . import windows_g17_report as report
     chosen = hv.adt["/chosen"]
     chosen._properties.pop(PROPERTY, None)
     chosen._types.pop(PROPERTY, None)
-    require(hv.windows_g17 in ("disabled", POLICY), "unknown policy")
+    chosen._properties.pop(report.PROPERTY, None)
+    chosen._types.pop(report.PROPERTY, None)
+    require(hv.windows_g17 in ("disabled", POLICY, report.POLICY), "unknown policy")
     if hv.windows_g17 == "disabled":
         return
     require(observe(hv.adt, hv.u.ba) == hv.windows_g17_source, "source ADT changed after admission")
     verify_record(hv.windows_g17_record, hv.windows_g17_source, hv.windows_memory_guard)
     chosen._properties[PROPERTY] = hv.windows_g17_record
     chosen._types[PROPERTY] = (Bytes(SIZE), False)
+    if hv.windows_g17 == report.POLICY:
+        chosen._properties[report.PROPERTY] = report.encode(hv.windows_g17_record)
+        chosen._types[report.PROPERTY] = (Bytes(report.SIZE), False)
 
 
 def verify_adt(hv):
+    from . import windows_g17_report as report
     chosen = hv.adt["/chosen"]
+    require(hv.windows_g17 in ("disabled", POLICY, report.POLICY), "unknown policy")
+    if hv.windows_g17 != report.POLICY:
+        require(report.PROPERTY not in chosen._properties, "inactive report policy inherited a marker")
     if hv.windows_g17 == "disabled":
         require(PROPERTY not in chosen._properties, "disabled policy inherited a marker")
         return
     require(raw_property(chosen, PROPERTY) == hv.windows_g17_record, "published marker changed")
     require(observe(hv.adt, hv.u.ba) == hv.windows_g17_source, "source ADT changed after admission")
     verify_record(hv.windows_g17_record, hv.windows_g17_source, hv.windows_memory_guard)
+    if hv.windows_g17 == report.POLICY:
+        require(raw_property(chosen, report.PROPERTY) == report.encode(hv.windows_g17_record),
+                "published diagnostic report changed")

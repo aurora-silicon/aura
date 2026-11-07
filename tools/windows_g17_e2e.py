@@ -117,6 +117,8 @@ def fixture():
     chosen._types["board-id"] = (Int32ul, False)
     chosen._properties[g17.PROPERTY] = b"stale"
     chosen._types[g17.PROPERTY] = (Bytes(5), False)
+    chosen._properties["aura,windows-g17-report-v1"] = b"stale"
+    chosen._types["aura,windows-g17-report-v1"] = (Bytes(5), False)
     regions = [(0x10050000000, 0x4000), (0x10050004000, 0x4000),
                (0x10050008000, 0x80000), (0x103fc000000, 0x4000),
                (0x10004000000, 0x134000), (0x10004200000, 0x130000),
@@ -145,7 +147,7 @@ def fixture():
     return load_adt(adt.build()), args, texts
 
 
-def run_host(case, folder, image):
+def run_host(case, folder, image, policy=None, require_report=False):
     folder.mkdir()
     adt, args, texts = fixture()
     sgx, chosen = adt["/arm-io/sgx"], adt["/chosen"]
@@ -175,7 +177,7 @@ def run_host(case, folder, image):
                "target": {"chip_id": "0x8142", "model": "Mac17,3"},
                "mu": {"path": str(image), "sha256": sha(image), "entry_offset": "0x800"},
                "usb": "disabled"}
-    if case != "disabled": profile["g17"] = g17.POLICY
+    if case != "disabled": profile["g17"] = policy or g17.POLICY
     if case == "unknown-policy": profile["g17"] = "auto"
     if case == "nonstring-policy": profile["g17"] = True
     if case == "reservation-collision":
@@ -274,7 +276,7 @@ def run_host(case, folder, image):
     session.iface, session.proxy, session.hv, session.serial_capture = Interface(), Proxy(), None, None
     session.proxy.iface = session.iface
     accepted = case in ("enabled", "disabled")
-    late_failure = case in ("late-marker", "late-source", "late-tree-size")
+    late_failure = case in ("late-marker", "late-source", "late-tree-size", "late-report")
     before_start = None
     result = {"case": case, "expected_acceptance": accepted}
     try:
@@ -293,10 +295,20 @@ def run_host(case, folder, image):
             session.hv.adt["/chosen"]._properties[g17.PROPERTY] = bytes(value)
         if case == "late-source": session.hv.adt["/arm-io/sgx"].gfx_handoff_base += 0x4000
         if case == "late-tree-size": session.hv.adt["/product"].product_name += " changed"
+        if case == "late-report":
+            value = bytearray(session.hv.adt["/chosen"]._properties["aura,windows-g17-report-v1"])
+            value[-1] ^= 1
+            session.hv.adt["/chosen"]._properties["aura,windows-g17-report-v1"] = bytes(value)
         before_start = len(trace)
         session.start()
         assert accepted, "unexpected admission: " + case
         guest = load_adt((folder / "guest.adt").read_bytes())
+        if require_report:
+            report_record = g17.raw_property(guest["/chosen"], "aura,windows-g17-report-v1")
+            assert len(report_record) == 688
+            (folder / "report.bin").write_bytes(report_record)
+        else:
+            assert "aura,windows-g17-report-v1" not in guest["/chosen"]._properties
         if accepted and case != "disabled":
             record = g17.raw_property(guest["/chosen"], g17.PROPERTY)
             (folder / "record.bin").write_bytes(record)
