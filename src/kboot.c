@@ -4115,7 +4115,7 @@ static bool dt_j713_dcpext_powered(const char *alias)
 
 /*
  * J713: iBoot starts both external DCPs and leaves them quiesced, as it does the internal one,
- * with their DARTs set up. Reserve their firmware memory and mark each disabled
+ * with their DARTs set up. Reserve their firmware memory and mark each
  * apple,t8132-dcpext node ready for the kernel to adopt the running controller. Only with the
  * boot.bin config line chosen.asahi,j713-dcpext=1, only after the internal DCP was handed over
  * (an external DCP must never cost the panel), and only for a controller iBoot left powered.
@@ -4149,7 +4149,14 @@ static void dt_reserve_j713_dcpext(void)
         }
         node = fdt_path_offset(dt, alias);
         const char *status = fdt_getprop(dt, node, "status", &len);
-        if (!status || len != sizeof("disabled") || strcmp(status, "disabled") ||
+        /* Older embedded trees disable the controller; current kernels keep it
+         * available and gate adoption on the ready marker. Preserve either form. */
+        bool supported_status =
+            (!status && len == -FDT_ERR_NOTFOUND) ||
+            (status && ((len == sizeof("disabled") && !memcmp(status, "disabled", len)) ||
+                        (len == sizeof("okay") && !memcmp(status, "okay", len)) ||
+                        (len == sizeof("ok") && !memcmp(status, "ok", len))));
+        if (!supported_status ||
             fdt_node_check_compatible(dt, node, "apple,t8132-dcpext"))
             continue;
         if (!dt_j713_dcpext_powered(alias)) {
