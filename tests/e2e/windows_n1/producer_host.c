@@ -217,6 +217,8 @@ static u32 read32(u64 a)
         assert(powered && fabric_ready && trained);
         if (a >= 0x488000000ULL && a < 0x488020000ULL) {
             assert(endpoint_command_reads && !held);
+            if (is("acquire-version") || is("acquire-stream-count") || is("acquire-geometry"))
+                assert(a == 0x488000000ULL || a == 0x488000008ULL || a == 0x48800000cULL);
             dart_reads++;
             if (is("dart-load-fault")) {
                 assert(dart_reads == 1 && exc_guard == (GUARD_MARK | GUARD_SILENT));
@@ -755,6 +757,8 @@ int main(int argc, char **argv)
     }
     if (acquiring) {
         acquire_fixture();
+        if (is("acquire-captured-params"))
+            put(0x488000000ULL, 0x9e313020);
         put(0x488000008ULL, 0x2a2a0204);
         put(0x48800000cULL, 0x11013);
         put(0x488000104ULL, 0xffffffffU);
@@ -803,8 +807,8 @@ int main(int argc, char **argv)
     }
     int rc = acquiring ? hv_windows_n1_acquire(result, sizeof(result))
                        : hv_windows_n1_prepare(result, sizeof(result));
-    bool success = is("success") || is("acquire-success") || is("acquire-invalid-roots") ||
-                   is("acquire-unlock") || is("acquire-stale") ||
+    bool success = is("success") || is("acquire-success") || is("acquire-captured-params") ||
+                   is("acquire-invalid-roots") || is("acquire-unlock") || is("acquire-stale") ||
                    is("acquire-exception-reserved") || is("acquire-retry") ||
                    is("acquire-cold-retry");
     if (acquiring && success) {

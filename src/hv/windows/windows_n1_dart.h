@@ -42,12 +42,15 @@ static int n1_dart_acquire(void)
 {
     u32 params1, params3, params4, protect, command, enable;
     if (n1_read(DART, 4, &params1) || n1_read(DART + 8, 4, &params3) ||
-        n1_read(DART + 12, 4, &params4) || n1_read(DART + 0x200, 4, &protect) ||
-        n1_read(DART + 0x80, 4, &command) || (params1 >> 24) != 14 || params3 != 0x2a2a0204 ||
-        (params4 & 0x1ff) != 19 || (protect & 1) || (command & BIT(31)))
+        n1_read(DART + 12, 4, &params4) || ((params1 >> 24) & 15) != 14 || params3 != 0x2a2a0204 ||
+        (params4 & 0x1ff) != 19)
+        return -1;
+    if (n1_read(DART + 0x200, 4, &protect) || n1_read(DART + 0x80, 4, &command) || (protect & 1) ||
+        (command & BIT(31)))
         return -1;
     /* Version2.4/19 streams is the qualified first acquisition profile. TCR1
-     * with an invalid root is an observed reset default, not an active table. */
+     * with an invalid root is observed initial state. Ownership comes from the
+     * explicit whole-controller graph admission, not from invalid root storage. */
     for (unsigned sid = 0; sid < 19; sid++) {
         u32 tcr, ttbr;
         if (n1_read(DART + 0x1000 + 4 * sid, 4, &tcr) || n1_read(DART + 0x1400 + 4 * sid, 4, &ttbr))

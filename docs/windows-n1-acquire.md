@@ -55,8 +55,10 @@ any DART access. No intermediate hold/drain is inserted before DART.
 This profile admits only the observed DART geometry: 16-KiB pages, PA42/VA42,
 version 2.4 and 19 streams. Protection and command busy reject admission. Every
 initial TCR must be exactly 0 or 1 and every TTBR must have its valid bit clear.
-Nonzero invalid roots are allowed; the loader never accesses or frees their
-referenced memory.
+Nonzero invalid roots are allowed as observed initial state; this does not
+prove firmware ownership or establish a reset default. Ownership comes from
+the explicit complete-controller scope admission. The loader never accesses
+or frees memory referenced by those roots.
 
 The whole-controller sequence follows public Linux `apple-dart.c` at
 [3a0da31bcc027d4b0a28b0501e649522c7a232f6](https://github.com/aurora-silicon/linux/blob/3a0da31bcc027d4b0a28b0501e649522c7a232f6/drivers/iommu/apple-dart.c),

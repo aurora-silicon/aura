@@ -12,7 +12,7 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 CASES = (
-    "acquire-success", "acquire-invalid-roots", "acquire-unlock", "acquire-stale",
+    "acquire-success", "acquire-captured-params", "acquire-invalid-roots", "acquire-unlock", "acquire-stale",
     "acquire-pmgr-address", "acquire-pmgr-descendant", "acquire-pmgr-virtual", "acquire-pmgr-duplicate",
     "acquire-clock-consumer", "acquire-power-consumer", "acquire-adt-malformed",
     "acquire-extra-mapper", "acquire-extra-consumer", "acquire-duplicate-phandle",
@@ -38,7 +38,7 @@ CASES = (
 )
 SOURCES = (
     "src/hv/windows/windows_n1_scope.h", "src/hv/windows/windows_n1_dart.h",
-    "AGENTS.md", "docs/windows-n1-acquire.md", "src/proxy.c", "src/proxy.h",
+    ".github/aurora/AGENTS.md", "docs/windows-n1-acquire.md", "src/proxy.c", "src/proxy.h",
     "src/pmgr.c", "src/hv/windows/windows_n1.c", "src/hv/windows/windows_n1.h",
     "src/hv/windows/hv.h", "src/hv/windows/hv_exc.c", "src/j813_n1.c", "src/j813_n1.h",
     "src/smp.h", "src/pmgr.h",

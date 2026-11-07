@@ -186,3 +186,15 @@ Cross-branch ABI failure found before freeze: CPUFREQ_OWNERSHIP already owns
 capability 0x800 in public PR93/94/95. A resident advertising only CPU ownership
 must reject j813-acquire-v1 before any mutation. Add that full launcher case
 before changing the conflicting allocation; reserve N1 acquisition at 0x1000.
+
+Captured-parameter review failure, before correction: physical PARAMS1 is
+0x9e313020. Its page-size field is bits27:24 (14); comparing the entire shifted
+byte wrongly rejects the controller because of unrelated upper bits. Replay
+the captured word through the complete acquisition producer before masking the
+field. Keep the existing wrong-page-size rejection.
+
+Parameter-phase failure boundary: an unsupported geometry, version or stream
+count must stop immediately after the three PARAMS reads, before PROTECT/CMD
+or version-specific registers. Strengthen the full-producer MMIO model to
+reject those premature reads before moving the admission predicate. The valid
+controller read/write sequence remains unchanged.

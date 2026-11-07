@@ -374,15 +374,16 @@ static int n1_prepare(void *descriptor, size_t size, bool acquire)
     }
     bool port_ready = false;
     u32 link;
-    printf("Windows N1: cold gates admitted; clamping GPIO PERST\n");
+    printf("Windows N1: %s ownership admitted; clamping GPIO PERST\n",
+           acquire ? "whole-N1 scope" : "cold gate");
     if (n1_gpio_hold() ||
         (acquire ? (n1_scope_power() || j813_n1_prepare_fabric_acquired_windows() ||
                     n1_scope_preserved())
                  : j813_n1_prepare_fabric_windows()))
         goto fail;
     /* The PHY/root prefix does not make DART accessible on J813. Match the
-     * Linux loader's complete port/refclk/reset sequence first. Cold gates
-     * admitted ownership above; no endpoint command enables bus mastering.
+     * Linux loader's complete port/refclk/reset sequence first. The selected
+     * admission proved ownership above; no endpoint command enables bus mastering.
      * Check every present endpoint before DART reads or BAR assignment. */
     printf("Windows N1: finishing Linux reset/port sequence before DART census\n");
     if (j813_n1_finish_windows(&port_ready) || n1_poll(PORT + 0x208, 1, 1, 1000000) ||
