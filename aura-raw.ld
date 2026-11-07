@@ -21,6 +21,12 @@ SECTIONS {
     .init : ALIGN(0x10000) {
         *(.init)
         *(.init.*)
+        /*
+         * Large code that only runs when aura hosts a guest, in this mostly empty slot. In .text
+         * it pushes .text past its next 64 KiB step, and .data past _file_limit.
+         */
+        *hv/hv_vm.o(.text .text.*)
+        *hv/hv_sprr.o(.text .text.*)
     } :text
     .text : ALIGN(0x10000) {
         *(.text)
