@@ -33,7 +33,12 @@ hidden debug port's parent, which stays on because nothing powers its devices do
 first core has disabled itself, reads of it report it off. Go mode sleeps and wakes over KIS with
 no further change. The KIS link stays up across the sleep, and with the error handler hidden no
 AMCC error wakes it early, so `AURA_S2R_QUIESCE` is not needed. The keyboard wakes it, which macOS
-reports as `MTP.DOCK.CHANNELS.AP0.IRQ RTP.keyboard`.
+reports as `MTP.DOCK.CHANNELS.AP0.IRQ RTP.keyboard`. With the full trace the wake is about 88
+writes on the boot core in 22 ms, the same shape as T8140's: both clusters on (`0x380780000/4 <-
+0xf`), the power gates, 15 domains to their targets with AUTO_ENABLE, about 40 unused domains
+lowered, then WD2 stopped (`0x3882b002c <- 0`). Over KIS the wake record is printed 2 s after the
+wake, paced by the DockChannel's free space. Printed at the watchdog stop, or in one burst, it
+overruns the link.
 
 The code:
 

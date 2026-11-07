@@ -24,6 +24,7 @@
 #include "adt.h"
 #include "aic.h"
 #include "arm_cpu_regs.h"
+#include "dockchannel_uart.h"
 #include "exception.h"
 #include "hv.h"
 #include "iodev.h"
@@ -511,6 +512,10 @@ bool sptm_virt_s2r_wfi(u64 *regs, u64 esr)
         sysop("wfe");
 }
 
+static void s2r_wakerec_fallback(void);
+static void s2r_wakerec_pump(void);
+static bool s2r_wakerec_printed;
+
 static bool s2r_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int width)
 {
     int k = width == 2 && !s2r_keep_released && (s2r_keep_always || s2r_armed())
@@ -581,6 +586,9 @@ static bool s2r_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int w
     }
     sptm_virt_mmio_rw(addr, val, write, width);
     sptm_virt_s2r_note(ctx, addr, *val, write, width);
+    s2r_wakerec_fallback();
+    if (s2r_wakerec_printed)
+        s2r_wakerec_pump();
 
     if (first && !sptm_virt_s2r_quiet)
         printf("SPTM-virt[s2r]: first access to %s page 0x%lx: %s 0x%lx <- 0x%lx pc 0x%lx\n", what,
@@ -867,6 +875,7 @@ void sptm_virt_s2r_xnu_entry(int cpu, u64 target)
  * link re-taken it is printed from the re-take's poll loop, a few records at a time.
  */
 static u64 s2r_wakerec_rp, s2r_wakerec_end;
+static u64 s2r_wakerec_wdstop;
 
 void sptm_virt_s2r_wd_stopped(void)
 {
@@ -874,27 +883,57 @@ void sptm_virt_s2r_wd_stopped(void)
         return;
     s2r_wakerec_rp = s2r_wake_head;
     s2r_wakerec_end = sptm_virt_s2r_head;
-    if (!sptm_virt_s2r_usb_retake) {
-        printf("S2R-WAKEREC start: %lu records\n", s2r_wakerec_end - s2r_wakerec_rp);
-        sptm_virt_s2r_dump_tail(min(sptm_virt_s2r_head - s2r_wake_head, 16384UL));
-        printf("S2R-WAKEREC end\n");
-        iodev_console_flush();
-    }
+    s2r_wakerec_wdstop = s2r_wakerec_end;
+    /* Without the re-take, s2r_wakerec_fallback schedules it once the link has settled. */
+}
+
+/*
+ * Without the re-take, the record starts 2 s after the wake and is paced by s2r_wakerec_pump from
+ * the hooks. Printed at the watchdog stop (about 22 ms in on T8132), or in one burst, it overruns
+ * the DockChannel. It runs from the wake's first guest trap, up to S2R_WAKEREC_MAX records, and
+ * names the watchdog stop's record.
+ */
+#define S2R_WAKEREC_MAX 4096UL
+
+static void s2r_wakerec_fallback(void)
+{
+    if (!s2r_fulltrace || s2r_wakerec_printed || sptm_virt_s2r_usb_retake || !s2r_wake_t ||
+        !s2r_wake_banner_done)
+        return;
+    if (mrs(CNTPCT_EL0) - s2r_wake_t < 2 * mrs(CNTFRQ_EL0))
+        return;
+    s2r_wakerec_printed = true;
+    s2r_wakerec_rp = s2r_wake_head;
+    s2r_wakerec_end = min(sptm_virt_s2r_head, s2r_wake_head + S2R_WAKEREC_MAX);
+    printf("SPTM-virt[s2r]: wake record: records %lu..%lu, watchdog stop at %lu\n", s2r_wakerec_rp,
+           s2r_wakerec_end, s2r_wakerec_wdstop);
 }
 
 static void s2r_wakerec_pump(void)
 {
     static bool started;
 
-    if (!s2r_wakerec_end || s2r_wakerec_rp >= s2r_wakerec_end || !iodev_can_write(IODEV_USB0))
+    if (!s2r_wakerec_end || s2r_wakerec_rp >= s2r_wakerec_end)
         return;
+    /* Over CDC when re-taken; otherwise the DockChannel, a record at a time while it has room. */
+    bool dock = !sptm_virt_s2r_usb_retake;
+    if (dock ? dockchannel_uart_tx_free() < 512 : !iodev_can_write(IODEV_USB0))
+        return;
+    if (dock && sptm_virt_s2r_head - s2r_wakerec_rp > sptm_virt_s2r_nrec) {
+        printf("SPTM-virt[s2r]: the wake record was overwritten in the ring\n");
+        s2r_wakerec_rp = s2r_wakerec_end;
+        return;
+    }
     if (!started) {
         started = true;
         printf("S2R-WAKEREC start: %lu records\n", s2r_wakerec_end - s2r_wakerec_rp);
     }
-    for (int k = 0; k < 8 && s2r_wakerec_rp < s2r_wakerec_end; k++, s2r_wakerec_rp++)
+    for (int k = 0; k < 8 && s2r_wakerec_rp < s2r_wakerec_end; k++, s2r_wakerec_rp++) {
+        if (dock && dockchannel_uart_tx_free() < 256)
+            break;
         if (!(sptm_virt_s2r_ring[s2r_wakerec_rp % sptm_virt_s2r_nrec].meta & S2R_MARKER))
             s2r_print_rec(s2r_wakerec_rp);
+    }
     if (s2r_wakerec_rp >= s2r_wakerec_end)
         printf("S2R-WAKEREC end\n");
 }
