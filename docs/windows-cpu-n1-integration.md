@@ -48,7 +48,7 @@ BGRA/CDC/CPU/MTP configuration flags equal 59. A native N1 rejection prevents
 payload upload and cannot be bypassed by changing its mode to disabled. Wrong
 CPU OPP input stops after the read-only capability request.
 
-The runtime profile artifact is derived from the existing CPU efficiency
+The offline profile artifact is derived from the existing CPU efficiency
 profile by changing only `n1` to `j813-acquire-v1`. Mu remains source `35d5d4ac`
 (code `113c98c3`) and image SHA-256
 `de09007eec9031a1d788da7d63b865307f03973f38805c027a45c1054b0160fd`.
@@ -66,3 +66,16 @@ python3 tools/windows_cpufreq_e2e.py --mu QUALIFIED_PUBLIC_MU_SOURCE --output NE
 
 These checks establish source/model/build compatibility. The combined native
 image still requires its own physical acquisition and Windows qualification.
+
+## Mu image blocker
+
+The retained `de09007e...` image is not sufficient for a Windows N1 boot: its
+build manifest sets `profile.n1_bus=false` and `PcdAppleN1BusHandoff=false`.
+Mu therefore withholds the N1 ACPI table before consuming NW1H. The derived
+profile is an offline profile/admission artifact only; unchanged Mu source
+containing N1 support does not prove that a particular image enables it.
+
+A separate isolated Mu build must enable N1 handoff while preserving the CPU
+efficiency source and other existing profile settings. That image and its new
+hash must be selected before physical CPU+N1 Windows qualification. This Aura
+integration changes no Mu source or firmware bytes.
