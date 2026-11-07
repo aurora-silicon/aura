@@ -1,6 +1,8 @@
-The producer must withhold the descriptor on wrong chip, board, model, ADT mapping,
-reset GPIO/function, or DART geometry before training. Any already-active DART,
-busy TLB or endpoint bus master is an existing owner and must not be reset.
+Current requirements are in the dated phase revisions below; earlier entries
+retain the assumptions tested by prior experiments. The producer must withhold
+the descriptor on wrong chip, board, model, ADT mapping, reset GPIO/function or
+DART geometry. Cold-gate admission rejects an existing or unknown power owner
+before resets. DART and endpoint checks never clear or adopt an active owner.
 After training, absent/mismatched identities, any BME, invalid BAR sizing,
 dropped BAR/bridge/command write, live ROM or changed DART state must hold PERST
 and prove link/port drain before returning a clean failure. A failed clamp must
@@ -97,3 +99,40 @@ readable immediately after PMGR activation.
 - Replay the production producer with inaccessible pre-prefix DART and
   pre-ready PORT/ECAM boundaries, and compare the actual Linux sequence before
   and after the split using the same deterministic MMIO/mailbox transcript.
+
+
+# First DART read after Linux link setup (recorded before implementation)
+
+The physical held-reset probe completed the PMGR and Linux PHY/root prefix,
+then stalled on its first 32-bit DART read at 0x488000000 with SError. The prefix
+alone is not a qualified DART accessibility boundary. The public Linux J813 N1
+DTS at 3a0da31bcc027d4b0a28b0501e649522c7a232f6 instead requires the loader to
+train the link before Linux owns the ordinary T8110 DART. It is not a tunneled
+PCIe-C DART and must not use that driver's parameter-read workaround.
+
+This supersedes the earlier tentative pre-finish DART boundary above:
+- Preserve exact target, tunable and seven cold-gate admission before resets.
+  Active, automatic, clock-retained, reset or unknown gates remain rejected
+  before any power/reset change; never reset an admitted existing owner.
+- Run the unchanged public Linux reset/port/refclk/link sequence before the
+  first DART read. No DART access is permitted on failed or incomplete finish.
+- Verify link and the identity and BME-clear command of every present endpoint
+  before any DART access or BAR assignment. Linux setup does not write endpoint
+  commands or load Control firmware; no endpoint bus-master enable is added.
+- Preserve both complete clean-DART checks: after endpoint admission and again
+  after BAR assignment. Reject active translation, protection, invalid geometry,
+  busy commands and changes during assignment; never repair or clear them.
+- A failed DART read must not be accepted as a parameter value or repeated.
+  Return no descriptor, no census authority and no further DART access. Use
+  the already-established port's existing reset/drain outcome, quarantining
+  if it cannot be proven. This model cannot establish real SError recovery.
+- BME on Control, Wi-Fi or Bluetooth must block all DART reads and assignment.
+- The default Linux sequence must remain byte-for-byte identical in the retained
+  production MMIO transcript. This change is default-disabled and unqualified
+  until a new bounded physical run and recovery receipt are retained.
+
+Before the production edit, strengthen the existing full-producer replay so
+all DART reads require completed link setup and a prior endpoint-command check.
+The old production sequence must fail this real phase-order regression. Extend
+that same replay for other-function BME, first-DART fault and state changed at
+BAR assignment; keep distinct identity, cold-owner and census coverage.
