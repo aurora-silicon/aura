@@ -19,6 +19,11 @@ This first profile requires T8142/J813 identity and the existing exact register,
 SMC reset-provider and GPIO PERST bindings. Native code validates bounded ADT
 bytes before walking properties, rejects duplicate properties, and validates
 the complete PMGR table and all clock/power consumers before hardware writes.
+The explicit J813 profile supports up to 256 properties per node, covering the
+226- and 152-property unrelated nodes found in its complete retained tree.
+This is a qualified profile bound, not a general ADT format limit. Remaining
+bytes also bound the possible property headers. Duplicate checks reuse static
+scratch before child traversal, preserving the recursive stack bound.
 
 Only these seven gates are activated, in order, through nonrecursive PMGR writes:
 

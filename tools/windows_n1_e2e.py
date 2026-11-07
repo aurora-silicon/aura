@@ -12,9 +12,10 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 CASES = (
-    "acquire-success", "acquire-captured-params", "acquire-invalid-roots", "acquire-unlock", "acquire-stale",
+    "acquire-success", "acquire-captured-params", "acquire-adt-large", "acquire-invalid-roots", "acquire-unlock", "acquire-stale",
     "acquire-pmgr-address", "acquire-pmgr-descendant", "acquire-pmgr-virtual", "acquire-pmgr-duplicate",
     "acquire-clock-consumer", "acquire-power-consumer", "acquire-adt-malformed",
+    "acquire-adt-large-duplicate", "acquire-adt-property-limit",
     "acquire-extra-mapper", "acquire-extra-consumer", "acquire-duplicate-phandle",
     "acquire-mapper-missing", "acquire-piodma-sid", "acquire-dart-function",
     "acquire-power-failure", "acquire-protected-change", "acquire-version",

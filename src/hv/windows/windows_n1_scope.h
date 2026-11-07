@@ -3,12 +3,18 @@
  * phandle values or raw ADT data are embedded here. Included by windows_n1.c. */
 #define N1_SCOPE_NODES 4096
 #define N1_SCOPE_PMGR  2048
+/* Qualified J813 bound, not an ADT format limit: the complete retained tree
+ * has unrelated nodes with 226 and 152 properties. */
+#define N1_SCOPE_PROPS 256
 struct n1_scope_node {
     u32 offset;
     int parent;
 };
 static struct n1_scope_node n1_nodes[N1_SCOPE_NODES];
 static unsigned n1_node_count;
+/* A node finishes duplicate checks before recursing, so this scratch can be
+ * reused by children without increasing the bounded recursive stack frame. */
+static u32 n1_scope_previous[N1_SCOPE_PROPS];
 static struct pmgr_gate n1_gates[13], n1_protected[3];
 static u32 n1_protected_state[3];
 static const struct {
@@ -34,12 +40,14 @@ static int n1_scope_walk(u32 *cursor, u32 size, int parent, unsigned depth)
         return -1;
     const u8 *base = adt;
     u32 props = le32(base + at), children = le32(base + at + 4);
-    if (props > 128 || children > N1_SCOPE_NODES)
+    if (props > N1_SCOPE_PROPS || props > (size - at - 8) / 36 || children > N1_SCOPE_NODES) {
+        printf("Windows N1: ADT structure rejected at %#x (%u properties, %u children)\n", at,
+               props, children);
         return -1;
+    }
     int self = n1_node_count++;
     n1_nodes[self] = (struct n1_scope_node){at, parent};
     at += 8;
-    u32 previous[128];
     for (unsigned i = 0; i < props; i++) {
         if (at > size || size - at < 36)
             return -1;
@@ -51,9 +59,9 @@ static int n1_scope_walk(u32 *cursor, u32 size, int parent, unsigned depth)
         if (!terminated)
             return -1;
         for (unsigned j = 0; j < i; j++)
-            if (!strncmp(prop->name, (const char *)(base + previous[j]), 32))
+            if (!strncmp(prop->name, (const char *)(base + n1_scope_previous[j]), 32))
                 return -1;
-        previous[i] = at;
+        n1_scope_previous[i] = at;
         u32 length = le32(base + at + 32) & 0x7fffffff;
         if (length > 0x40000 || length > size - at - 36)
             return -1;

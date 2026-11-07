@@ -361,12 +361,27 @@ static int n1_assign_control(void)
 static int n1_prepare(void *descriptor, size_t size, bool acquire)
 {
     static bool attempted;
-    if (!descriptor || size != HV_WINDOWS_N1_DESCRIPTOR_SIZE)
+    if (!descriptor || size != HV_WINDOWS_N1_DESCRIPTOR_SIZE) {
+        printf("Windows N1: descriptor buffer/size rejected before admission\n");
         return -1;
+    }
     memset(descriptor, 0, size);
-    if (!hv_windows_can_prepare_device() || attempted || (acquire && n1_scope_tree()) ||
-        n1_identity())
+    if (!hv_windows_can_prepare_device()) {
+        printf("Windows N1: Windows lifecycle rejected before admission\n");
         return -1;
+    }
+    if (attempted) {
+        printf("Windows N1: repeated attempt rejected before admission\n");
+        return -1;
+    }
+    if (acquire && n1_scope_tree()) {
+        printf("Windows N1: ADT structure rejected before ownership admission\n");
+        return -1;
+    }
+    if (n1_identity()) {
+        printf("Windows N1: J813 identity/resources rejected before ownership admission\n");
+        return -1;
+    }
     attempted = true;
     if (j813_n1_validate_windows() || (acquire ? n1_scope_admit() : n1_cold())) {
         printf("Windows N1: ownership/tunable admission rejected before reset or power changes\n");

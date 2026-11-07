@@ -336,7 +336,7 @@ static void udelay(unsigned u)
 #include "../../../src/adt.h"
 static int offsets[32];
 static bool fixture_ready;
-static u8 fixture[16384];
+static u8 fixture[32768];
 static u32 fixture_size;
 static int node_index(int n)
 {
@@ -547,7 +547,7 @@ int adt_getprop_copy(const void *d, int n, const char *k, void *out, size_t size
 }
 static void fixture_node(int index)
 {
-    static const int parents[] = {-1, 0, 9, 2, 9, 9, 9, 6, 7, 0, 4, 4, 4, 4, 3, 3, 3, 9, 9};
+    static const int parents[] = {-1, 0, 9, 2, 9, 9, 9, 6, 7, 0, 4, 4, 4, 4, 3, 3, 3, 9, 9, 1, 9};
     static const char *keys[] = {"model",
                                  "chip-id",
                                  "board-id",
@@ -582,7 +582,24 @@ static void fixture_node(int index)
         fixture_size += sizeof(*p) + ((len + 3) & ~3U);
         h.property_count++;
     }
+    bool large_adt = is("acquire-adt-large") || is("acquire-adt-large-duplicate") ||
+                     is("acquire-adt-property-limit");
+    if (large_adt && index >= 19) {
+        unsigned properties = index == 19 ? (is("acquire-adt-property-limit") ? 257 : 226) : 152;
+        for (unsigned i = 0; i < properties; i++) {
+            assert(fixture_size + sizeof(struct adt_property) + 4 <= sizeof(fixture));
+            struct adt_property *p = (void *)(fixture + fixture_size);
+            memset(p, 0, sizeof(*p) + 4);
+            unsigned key = is("acquire-adt-large-duplicate") && index == 19 && i == 225 ? 1 : i;
+            snprintf(p->name, sizeof(p->name), "sample%03u", key);
+            p->size = 4;
+            fixture_size += sizeof(*p) + 4;
+            h.property_count++;
+        }
+    }
     for (unsigned i = 1; i < ARRAY_SIZE(parents); i++) {
+        if (i >= 19 && !large_adt)
+            continue;
         int parent = parents[i];
         if (is("acquire-extra-mapper") && i == 18)
             parent = 4;
@@ -808,6 +825,7 @@ int main(int argc, char **argv)
     int rc = acquiring ? hv_windows_n1_acquire(result, sizeof(result))
                        : hv_windows_n1_prepare(result, sizeof(result));
     bool success = is("success") || is("acquire-success") || is("acquire-captured-params") ||
+                   is("acquire-adt-large") ||
                    is("acquire-invalid-roots") || is("acquire-unlock") || is("acquire-stale") ||
                    is("acquire-exception-reserved") || is("acquire-retry") ||
                    is("acquire-cold-retry");

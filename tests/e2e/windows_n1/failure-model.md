@@ -193,6 +193,22 @@ byte wrongly rejects the controller because of unrelated upper bits. Replay
 the captured word through the complete acquisition producer before masking the
 field. Keep the existing wrong-page-size rejection.
 
+Full-ADT admission failure, recorded before correction: the retained complete
+J813 tree contains unrelated nodes with 226 and 152 properties. The original
+128-property limit rejects that valid structure before ownership admission.
+Add generated unrelated nodes with those counts to the complete producer model
+and retain the failing baseline before changing the parser. No captured ADT
+bytes, identifying properties or values belong in the public fixture.
+
+Qualify a bounded 256-property limit, with the node's remaining bytes also
+bounding its possible property headers. Preserve duplicate detection past the
+old limit and reject 257 properties, impossible counts, excessive node/depth
+counts, truncated values and excessive value lengths. Duplicate-offset scratch
+must not enlarge each recursive stack frame: a node finishes its property
+checks before descending into its children. Preserve all existing ownership
+graph and device checks. Log lifecycle, repeated attempt, ADT structure and
+identity rejections before returning so a future early failure is attributable.
+
 Parameter-phase failure boundary: an unsupported geometry, version or stream
 count must stop immediately after the three PARAMS reads, before PROTECT/CMD
 or version-specific registers. Strengthen the full-producer MMIO model to
