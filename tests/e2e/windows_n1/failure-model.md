@@ -136,3 +136,53 @@ all DART reads require completed link setup and a prior endpoint-command check.
 The old production sequence must fail this real phase-order regression. Extend
 that same replay for other-function BME, first-DART fault and state changed at
 BAR assignment; keep distinct identity, cold-owner and census coverage.
+
+## Explicit whole-N1 acquisition (written before implementation)
+
+`j813-acquire-v1` is a separate capability-gated, one-attempt operation. The
+existing cold `j813-v1` contract must remain unchanged. There is no cold failure
+fallback. This acquisition owns the complete N1 DART only after proving the
+sanitized J813 PMGR descendant/consumer and four-mapper graph, including PIODMA.
+It does not own ANS, excluded OCLA gates, firmware, or inherited table memory.
+
+Failure model and full-producer scenarios:
+
+- Wrong/missing/aliased/duplicate PMGR entries, a new descendant (including a
+  virtual descendant), an unexpected clock or power consumer, malformed ADT,
+  excessive depth/count, duplicate properties or phandles, missing mapper,
+  extra mapper/consumer, wrong PIODMA SID/function relation: reject before any
+  MMIO write. Resolve phandles dynamically; captured numeric handles are not IDs.
+- Only the seven admitted PS registers may be activated, nonrecursively. ANS
+  and both OCLA states must remain identical at phase boundaries. A power
+  failure or protected-state change prevents publication. Linux fabric/finish
+  bodies remain byte-identical and retain the existing ordered sequence replay.
+- DART is inaccessible until full Linux link initialization and endpoint BME
+  checks. Reject unsupported version/geometry/stream count, protection, busy,
+  TCR other than 0/1, or any valid TTBR before the first DART write. A nonzero
+  invalid TTBR is permitted: power-up yielded all 19 TCR1 and invalid roots.
+- Match public Linux 3a0da31: all 19 TCR 0, all 19 TTBR 0 (never read/free old table
+  memory), global ENABLE write-one-set, stale exception capture/acknowledgment,
+  ordered readback, conditional 0x400 unlock, ERROR_MASK 0, all 19 0x8100|SID
+  invalidations. ENABLE may read 0 after a successful write; never require 1.
+- Capture reserved exception bits separately and acknowledge the exact observed
+  bitmap under whole-controller ownership. Reject persistent exception/block faults, command
+  pre/post timeouts, failed disable/root/mask readbacks, or guarded faults.
+  Preserve failure census and publish no descriptor; quarantine the session.
+  DIAG_LOCK bit1 configures lock-on-error and need not clear after unlock.
+- Post-reset changed TCR/root, BME, ROM, BAR, or protected power state must fail
+  existing final checks. Successful acquisition publishes exactly NW1H v1 and
+  supports its existing guarded census. A second cold/acquire attempt writes
+  nothing. No guest firmware, bus mastering, DMA buffers or Windows install.
+- Host profile/capability and HV lifecycle scenarios cover missing new bit,
+  wrong target, successful explicit acquisition, rejected native call, no cold
+  fallback, and exactly one opcode before ADT descriptor publication.
+
+Evidence is an immutable source snapshot, sanitizer-enabled complete producer
+transcripts and descriptor bytes, unchanged Linux sequence comparison, actual
+launcher/HV orchestration replay and native ARM64 build. These are offline
+artifacts, not physical ownership, DMA, Windows PnP or Wi-Fi qualification.
+
+Cross-branch ABI failure found before freeze: CPUFREQ_OWNERSHIP already owns
+capability 0x800 in public PR93/94/95. A resident advertising only CPU ownership
+must reject j813-acquire-v1 before any mutation. Add that full launcher case
+before changing the conflicting allocation; reserve N1 acquisition at 0x1000.

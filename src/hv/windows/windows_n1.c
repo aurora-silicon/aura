@@ -355,23 +355,30 @@ static int n1_assign_control(void)
                : 0;
 }
 
-int hv_windows_n1_prepare(void *descriptor, size_t size)
+#include "windows_n1_dart.h"
+#include "windows_n1_scope.h"
+
+static int n1_prepare(void *descriptor, size_t size, bool acquire)
 {
     static bool attempted;
     if (!descriptor || size != HV_WINDOWS_N1_DESCRIPTOR_SIZE)
         return -1;
     memset(descriptor, 0, size);
-    if (!hv_windows_can_prepare_device() || attempted || n1_identity())
+    if (!hv_windows_can_prepare_device() || attempted || (acquire && n1_scope_tree()) ||
+        n1_identity())
         return -1;
     attempted = true;
-    if (j813_n1_validate_windows() || n1_cold()) {
-        printf("Windows N1: cold/tunable admission rejected before reset or power changes\n");
+    if (j813_n1_validate_windows() || (acquire ? n1_scope_admit() : n1_cold())) {
+        printf("Windows N1: ownership/tunable admission rejected before reset or power changes\n");
         return -1;
     }
     bool port_ready = false;
     u32 link;
     printf("Windows N1: cold gates admitted; clamping GPIO PERST\n");
-    if (n1_gpio_hold() || j813_n1_prepare_fabric_windows())
+    if (n1_gpio_hold() ||
+        (acquire ? (n1_scope_power() || j813_n1_prepare_fabric_acquired_windows() ||
+                    n1_scope_preserved())
+                 : j813_n1_prepare_fabric_windows()))
         goto fail;
     /* The PHY/root prefix does not make DART accessible on J813. Match the
      * Linux loader's complete port/refclk/reset sequence first. Cold gates
@@ -379,8 +386,11 @@ int hv_windows_n1_prepare(void *descriptor, size_t size)
      * Check every present endpoint before DART reads or BAR assignment. */
     printf("Windows N1: finishing Linux reset/port sequence before DART census\n");
     if (j813_n1_finish_windows(&port_ready) || n1_poll(PORT + 0x208, 1, 1, 1000000) ||
-        n1_endpoints_clean() || n1_dart_clean() || n1_assign_control() || n1_dart_clean() ||
-        n1_endpoints_clean() || n1_read(BAR + 0x8000, 4, &link) || link != 0)
+        n1_endpoints_clean() ||
+        (acquire && (n1_scope_preserved() || n1_dart_acquire() || n1_scope_preserved())) ||
+        n1_dart_clean() || n1_assign_control() || n1_dart_clean() ||
+        (acquire && (n1_dart_all_clean() || n1_scope_preserved())) || n1_endpoints_clean() ||
+        n1_read(BAR + 0x8000, 4, &link) || link != 0)
         goto fail;
     goto publish;
 fail:
@@ -414,4 +424,14 @@ publish:;
     printf("Windows N1: NW1H v1 ready; cold ROM, SID0 disabled, BME off\n");
     n1_prepared = true;
     return 0;
+}
+
+int hv_windows_n1_prepare(void *descriptor, size_t size)
+{
+    return n1_prepare(descriptor, size, false);
+}
+
+int hv_windows_n1_acquire(void *descriptor, size_t size)
+{
+    return n1_prepare(descriptor, size, true);
 }

@@ -265,14 +265,14 @@ int j813_n1_validate_windows(void)
                : 0;
 }
 
-int j813_n1_prepare_fabric_windows(void)
+static int j813_n1_prepare_fabric_windows_mode(bool acquired)
 {
     static bool attempted;
     struct j813_n1_regs r;
     if (attempted || j813_n1_validate_windows() || j813_n1_regs(&r))
         return -1;
     attempted = true;
-    if (pmgr_adt_power_enable(APCIE) || pmgr_adt_is_powered(APCIE) != 1)
+    if (!acquired && (pmgr_adt_power_enable(APCIE) || pmgr_adt_is_powered(APCIE) != 1))
         return -1;
     printf("Windows N1: power active; starting Linux PHY/root prefix\n");
     enum exc_guard_t saved = exc_guard;
@@ -287,6 +287,17 @@ int j813_n1_prepare_fabric_windows(void)
     windows_fabric_ready = true;
     printf("Windows N1: Linux PHY/root prefix complete; endpoint still clamped\n");
     return 0;
+}
+
+int j813_n1_prepare_fabric_windows(void)
+{
+    return j813_n1_prepare_fabric_windows_mode(false);
+}
+
+/* Caller proved the whole ownership graph and activated only its seven gates. */
+int j813_n1_prepare_fabric_acquired_windows(void)
+{
+    return j813_n1_prepare_fabric_windows_mode(true);
 }
 
 int j813_n1_finish_windows(bool *port_ready)

@@ -25,7 +25,7 @@ from aura.hv import HV
 from aura.proxy import AuraProxy, EXC, EXC_RET, IODEV, ProxyCommandError, START
 from aura.tgtypes import BootArgs_r2, BootArgs_r3
 from aura.windows import (CAPS_MAGIC, CONFIGURATION, FRAMEBUFFER_SHADOW, REQUIRED_CAPS,
-                          HardwareSession, N1_HANDOFF, N1_PROPERTY, N1_RESOURCES,
+                          HardwareSession, N1_HANDOFF, N1_ACQUIRE, N1_PROPERTY, N1_RESOURCES,
                           MEMORY_PREFLIGHT, SERIAL_CAPTURE, MTP_HANDOFF, MTP_DISABLED_PROPERTY,
                           MTP_RESERVED_BASE, MTP_RESERVED_SIZE,
                           memory_reservation_preflight, prepare_n1_handoff, source_manifest)
@@ -97,8 +97,8 @@ def wire_namespace():
             opcode, *args = struct.unpack("<7Q", payload)
             observed.append(opcode)
             assert opcode not in range(0xc11, 0xc19), "unsafe legacy PSCI opcode"
-            assert opcode in (0xc80, 0xc81, 0xc82, 0xc83)
-            if opcode == 0xc82: assert args[:2] == [0x1000, 128]
+            assert opcode in (0xc80, 0xc81, 0xc82, 0xc83, 0xc84)
+            if opcode in (0xc82, 0xc84): assert args[:2] == [0x1000, 128]
             if opcode == 0xc83: assert args == [0] * 6
             if self.legacy:
                 return struct.pack("<QqQ", opcode, AuraProxy.S_BADCMD, 0)
@@ -109,6 +109,7 @@ def wire_namespace():
     assert proxy.hv_windows_capabilities() >> 32 == CAPS_MAGIC >> 32
     assert proxy.hv_windows_configure(0) == 0
     assert proxy.hv_windows_prepare_n1(0x1000, 128) == 0
+    assert proxy.hv_windows_acquire_n1(0x1000, 128) == 0
     assert proxy.hv_windows_heap_high_water() == 0
     wire.legacy = True
     try:
@@ -117,7 +118,7 @@ def wire_namespace():
         pass
     else:
         raise AssertionError("legacy resident accepted capability probe")
-    assert observed == [0xc80, 0xc81, 0xc82, 0xc83, 0xc80]
+    assert observed == [0xc80, 0xc81, 0xc82, 0xc84, 0xc83, 0xc80]
     return {"case": "serialized-safe-opcode-namespace", "opcodes": [hex(op) for op in observed]}
 
 
@@ -263,7 +264,7 @@ def lifecycle(case, output):
             trace.append("caps")
             serial_cap = 0 if case == "serial-missing-capability" else SERIAL_CAPTURE
             mtp_cap = 0 if case == "mtp-missing-capability" else MTP_HANDOFF
-            return CAPS_MAGIC | 1 << 16 | REQUIRED_CAPS | CONFIGURATION | FRAMEBUFFER_SHADOW | N1_HANDOFF | MEMORY_PREFLIGHT | serial_cap | 0x200 | mtp_cap
+            return CAPS_MAGIC | 1 << 16 | REQUIRED_CAPS | CONFIGURATION | FRAMEBUFFER_SHADOW | N1_HANDOFF | N1_ACQUIRE | MEMORY_PREFLIGHT | serial_cap | 0x200 | mtp_cap
         def hv_windows_configure(self, flags):
             trace.append(["config", flags])
             return -1 if case in ("config-rejected", "serial-carrier-rejected") else 0
@@ -280,6 +281,15 @@ def lifecycle(case, output):
             assert "hv_init" in trace and size == 128
             trace.append("n1-prepare")
             if case == "n1-producer-failure": return -1
+            value = bytearray(n1_descriptor)
+            if case == "n1-bad-header": value[8] ^= 1
+            if case == "n1-bad-resource": value[32] ^= 1
+            writes[address] = bytes(value)
+            return 0
+        def hv_windows_acquire_n1(self, address, size):
+            assert "hv_init" in trace and size == 128
+            trace.append("n1-acquire")
+            if case == "n1-acquire-failure": return -1
             value = bytearray(n1_descriptor)
             if case == "n1-bad-header": value[8] ^= 1
             if case == "n1-bad-resource": value[32] ^= 1
@@ -327,7 +337,7 @@ def lifecycle(case, output):
             assert marker["value"] == b"\x01\x00\x00\x00"
             assert raw_property(guest_adt["/chosen"], MTP_DISABLED_PROPERTY) == (
                 b"\x00\x00\x00\x00" if case == "mtp-success" else b"\x01\x00\x00\x00")
-            if case == "n1-success":
+            if case in ("n1-success", "n1-acquire-success"):
                 assert guest_adt["/chosen"].getprop(N1_PROPERTY) == n1_descriptor
             else:
                 assert N1_PROPERTY not in guest_adt["/chosen"]._properties
@@ -375,7 +385,7 @@ def lifecycle(case, output):
         serial_recorder = WindowsSerialRecorder(folder)
         hv.windows_serial = "capture"
         hv.windows_serial_recorder = serial_recorder
-    if case.startswith("n1-"): hv.windows_n1 = "j813-v1"
+    if case.startswith("n1-"): hv.windows_n1 = "j813-acquire-v1" if case.startswith("n1-acquire-") else "j813-v1"
     if case.startswith("mtp-"): hv.windows_mtp = "j813-v1"
     if case == "watchdog-failure": hv.wdt_cpu = 1
     payload = bytes(range(256)) * 32
@@ -404,12 +414,12 @@ def lifecycle(case, output):
         if case == "adt-overflow-start": hv.adt.overflow = "x" * 0x20000
         start_trace_index = len(trace)
         hv.start()
-        assert case in ("success", "n1-success", "chunked-upload", "reservation-success", "serial-success", "cdc-success", "mtp-success")
+        assert case in ("success", "n1-success", "n1-acquire-success", "chunked-upload", "reservation-success", "serial-success", "cdc-success", "mtp-success")
         config = 19 if case == "mtp-success" else 11 if case == "cdc-success" else 7 if case.startswith("serial-") else 3
         assert trace.index(["config", config]) < trace.index("hv_init") < trace.index("upload-image") < trace.index("start")
         if case == "serial-success": assert trace.index("serial-handler") < trace.index("start")
     except (RuntimeError, ValueError, OSError):
-        assert case not in ("success", "n1-success", "chunked-upload", "reservation-success", "serial-success", "cdc-success", "mtp-success")
+        assert case not in ("success", "n1-success", "n1-acquire-success", "chunked-upload", "reservation-success", "serial-success", "cdc-success", "mtp-success")
         if case.startswith("mtp-"):
             assert "upload-image" not in trace and "start" not in trace
             assert not hv.windows_mtp_ready
@@ -431,7 +441,8 @@ def lifecycle(case, output):
         if case.startswith("n1-"):
             assert "upload-image" not in trace and "start" not in trace
             if case != "n1-unprepared":
-                assert trace.count("n1-prepare") == 1 and "n1-free" in trace
+                assert trace.count("n1-acquire" if case.startswith("n1-acquire-") else "n1-prepare") == 1 and "n1-free" in trace
+                if case.startswith("n1-acquire-"): assert "n1-prepare" not in trace
                 hv.windows_n1 = "disabled"
                 try:
                     hv.load_raw(payload, 0x800)
@@ -471,7 +482,7 @@ def main():
             "success", "cdc-success", "serial-success", "serial-missing-capability", "serial-carrier-rejected",
             "chunked-upload", "config-rejected", "out-of-ram", "adt-overflow-init", "adt-overflow-start",
             "watchdog-failure", "forwarded-exception", "forwarded-panic", "transport-error",
-            "n1-success", "n1-producer-failure", "n1-bad-header", "n1-bad-resource", "n1-read-failure",
+            "n1-acquire-success", "n1-acquire-failure", "n1-success", "n1-producer-failure", "n1-bad-header", "n1-bad-resource", "n1-read-failure",
             "n1-unprepared", "reservation-success", "reservation-layout-drift",
             "mtp-success", "mtp-missing-capability", "mtp-missing-reservation",
             "mtp-producer-failure", "mtp-producer-transport-error")]

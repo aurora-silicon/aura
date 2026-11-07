@@ -1804,7 +1804,7 @@ class HV(Reloadable):
                 raise ValueError("MTP handoff requires the explicit J813 profile")
             chosen._properties[MTP_DISABLED_PROPERTY] = 1
             chosen._types[MTP_DISABLED_PROPERTY] = (Int32ul, False)
-            if self.windows_n1 == "j813-v1":
+            if self.windows_n1 in ("j813-v1", "j813-acquire-v1"):
                 if chosen.chip_id != 0x8142 or self.adt.model != "Mac17,3":
                     raise ValueError("N1 handoff requires the J813 target")
                 chosen._properties[N1_PROPERTY] = bytes(N1_BYTES)

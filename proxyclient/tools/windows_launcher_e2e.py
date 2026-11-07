@@ -9,7 +9,7 @@ import subprocess
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from aura.windows import CAPS_MAGIC, REQUIRED_CAPS, CONFIGURATION, MEMORY_PREFLIGHT, MTP_HANDOFF, MTP_RESERVED_BASE, MTP_RESERVED_SIZE, launch_profile, source_manifest
+from aura.windows import CAPS_MAGIC, REQUIRED_CAPS, CONFIGURATION, MEMORY_PREFLIGHT, MTP_HANDOFF, N1_HANDOFF, N1_ACQUIRE, MTP_RESERVED_BASE, MTP_RESERVED_SIZE, launch_profile, source_manifest
 
 
 def main():
@@ -36,7 +36,8 @@ def main():
                  "append-wrong-hash", "usb-unsupported", "n1-capability-missing", "n1-wrong-model",
                  "reservation-capability-missing", "reservation-wrap", "reservation-bad-fields",
                  "serial-capability-missing", "serial-invalid", "mtp-success", "mtp-capability-missing",
-                 "mtp-wrong-model", "mtp-invalid", "mtp-reservation-name"):
+                 "mtp-wrong-model", "mtp-invalid", "mtp-reservation-name",
+                 "n1-acquire-success", "n1-acquire-cpu-only", "n1-acquire-capability-missing", "n1-acquire-wrong-model"):
         profile = json.loads(json.dumps(baseline))
         expected_image = firmware_bytes
         if case.startswith("append-"):
@@ -57,7 +58,8 @@ def main():
         if case == "mtp-reservation-name":
             profile["reserved_memory"] = [{"name": "aura-mtp-handoff", "base": hex(MTP_RESERVED_BASE), "size": hex(MTP_RESERVED_SIZE)}]
         if case.startswith("n1-"): profile["n1"] = "j813-v1"
-        if case == "n1-wrong-model": profile["target"]["model"] = "Mac17,1"
+        if case.startswith("n1-acquire-"): profile["n1"] = "j813-acquire-v1"
+        if case in ("n1-wrong-model", "n1-acquire-wrong-model"): profile["target"]["model"] = "Mac17,1"
         if case.startswith("reservation-"):
             profile["reserved_memory"] = [{"name": "mu-handoff", "base": "0x10220000000", "size": "0x404000"}]
         if case == "reservation-wrap": profile["reserved_memory"][0]["base"] = "0xfffffffffffff000"
@@ -86,6 +88,8 @@ def main():
                 if case == "normal-resident":
                     return 0
                 extra = CONFIGURATION | MEMORY_PREFLIGHT | MTP_HANDOFF if case == "mtp-success" else 0
+                if case.startswith("n1-acquire-"):
+                    extra |= N1_HANDOFF | (0x0800 if case == "n1-acquire-cpu-only" else 0 if case == "n1-acquire-capability-missing" else N1_ACQUIRE)
                 return CAPS_MAGIC | ((2 if case == "wrong-abi" else 1) << 16) | REQUIRED_CAPS | extra
             def identity(self):
                 trace.append("read-identity")
@@ -113,7 +117,7 @@ def main():
                 trace.append("close")
 
         passed = False
-        expected_success = case in ("success", "poweroff", "reset", "append-offset", "append-contiguous", "mtp-success")
+        expected_success = case in ("success", "poweroff", "reset", "append-offset", "append-contiguous", "mtp-success", "n1-acquire-success")
         try:
             result = launch_profile(filename, "model-device", out / (case + "-evidence"), session_factory=Endpoint)
             passed = expected_success

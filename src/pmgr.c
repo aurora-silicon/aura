@@ -764,6 +764,30 @@ int pmgr_device_gate(u8 die, u16 id, struct pmgr_gate *gate)
     return 0;
 }
 
+int pmgr_device_count(void)
+{
+    return pmgr_initialized ? pmgr_devices_len * pmgr_dies : -1;
+}
+
+int pmgr_device_at(u32 index, struct pmgr_gate *gate)
+{
+    if (!pmgr_initialized || !pmgr_devices_len || index >= pmgr_devices_len * pmgr_dies)
+        return -1;
+    const struct pmgr_device *device = &pmgr_devices[index % pmgr_devices_len];
+    u8 die = index / pmgr_devices_len;
+    u16 id = pmgr_adt_get_id(device);
+    *gate = (struct pmgr_gate){.entry = FIELD_PREP(PMGR_DIE_ID, die) | id,
+                               .id = id,
+                               .die = die,
+                               .found = true,
+                               .virt = !!(device->flags & PMGR_FLAG_VIRTUAL),
+                               .name = device->name};
+    pmgr_adt_get_parents(device, gate->parent);
+    if (!gate->virt)
+        gate->psreg = pmgr_device_get_addr(die, device);
+    return 0;
+}
+
 static int pmgr_reset_device(int die, const struct pmgr_device *dev)
 {
     if (pmgr_protected_device(dev))

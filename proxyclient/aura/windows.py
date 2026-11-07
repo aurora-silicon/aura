@@ -18,6 +18,7 @@ CAPS_ABI = 1
 REQUIRED_CAPS = 0x000F
 FRAMEBUFFER_SHADOW = 0x0010
 N1_HANDOFF = 0x0020
+N1_ACQUIRE = 0x1000  # 0x0800 is reserved for CPUFREQ_OWNERSHIP (public PR93).
 CONFIGURATION = 0x0040
 MEMORY_PREFLIGHT = 0x0080
 SERIAL_CAPTURE = 0x0100
@@ -70,6 +71,8 @@ def validate_capabilities(value, framebuffer="native", guest_compatibility="none
         require(value & CONFIGURATION, "resident lacks explicit Windows configuration")
     if n1 != "disabled":
         require(value & N1_HANDOFF, "resident lacks the N1 handoff producer")
+    if n1 == "j813-acquire-v1":
+        require(value & N1_ACQUIRE, "resident lacks explicit whole-N1 acquisition")
     if reserved_memory:
         require(value & MEMORY_PREFLIGHT, "resident lacks read-only memory reservation preflight")
     if serial == "capture":
@@ -169,9 +172,9 @@ def plan_profile(filename):
     serial = profile.get("serial", "disabled")
     require(serial in ("disabled", "capture", "cdc"), "unsupported serial capture policy")
     n1 = profile.get("n1", "disabled")
-    require(n1 in ("disabled", "j813-v1"), "unsupported N1 handoff profile")
+    require(n1 in ("disabled", "j813-v1", "j813-acquire-v1"), "unsupported N1 handoff profile")
     require(n1 == "disabled" or (chip == 0x8142 and model == "Mac17,3"),
-            "j813-v1 N1 handoff requires chip 0x8142 and model Mac17,3")
+            "J813 N1 handoff requires chip 0x8142 and model Mac17,3")
     mtp = profile.get("mtp", "disabled")
     require(mtp in ("disabled", "j813-v1"), "unsupported MTP handoff profile")
     require(mtp == "disabled" or (chip == 0x8142 and model == "Mac17,3"),
@@ -339,17 +342,19 @@ def validate_n1_descriptor(descriptor):
 def prepare_n1_handoff(hv):
     if hv.windows_n1 == "disabled":
         return None
-    require(hv.windows_n1 == "j813-v1" and hv.windows_initialized,
+    require(hv.windows_n1 in ("j813-v1", "j813-acquire-v1") and hv.windows_initialized,
             "N1 handoff requires successful Windows HV initialization")
     require(not hv.windows_n1_attempted, "N1 handoff cannot be retried; load a fresh Aura resident")
     hv.windows_n1_attempted = True
     address = hv.u.memalign(16, N1_BYTES)
     try:
         hv.iface.writemem(address, bytes(N1_BYTES))
-        result = hv.p.hv_windows_prepare_n1(address, N1_BYTES)
+        producer = hv.p.hv_windows_acquire_n1 if hv.windows_n1 == "j813-acquire-v1" else hv.p.hv_windows_prepare_n1
+        result = producer(address, N1_BYTES)
         require(result == 0, f"N1 handoff producer failed: {result}; load a fresh Aura resident")
         descriptor = hv.iface.readmem(address, N1_BYTES)
         receipt = validate_n1_descriptor(descriptor)
+        receipt["acquisition"] = hv.windows_n1
         hv.adt["/chosen"]._properties[N1_PROPERTY] = descriptor
         hv._windows_adt_blob()
         hv.windows_n1_handoff = receipt

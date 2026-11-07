@@ -49,6 +49,9 @@ static void model_sysop(const char *op)
 u32 chip_id = 0x8142, board_id = 0x24;
 void *adt;
 static const char *scenario;
+static bool acquiring;
+static unsigned dart_writes, tlbis, unlocks, gate_writes;
+static bool global_enabled;
 static unsigned trains, writes, reads;
 static unsigned dart_reads, endpoint_command_reads;
 static bool trained, held;
@@ -68,12 +71,22 @@ static const char *gate_names[] = {"ANS",          "APCIE_GP",     "APCIE_SYS_GP
                                    "APCIE_SYS_ST", "APCIE_PHY_SW", "ST0_AUS5_AON", "ST0_AUS5"};
 static const u16 gate_parents[][2] = {{60, 0},   {60, 0},    {74, 0},  {76, 0},
                                       {76, 110}, {144, 109}, {152, 0}, {155, 0}};
+static const u64 model_pm_addresses[] = {
+    0x380700300ULL, 0x3807002f0ULL, 0x380700408ULL, 0x380700410ULL, 0x380700520ULL, 0x380700560ULL,
+    0x380700578ULL, 0x380700580ULL, 0x380700518ULL, 0x380700568ULL, 0x380000000ULL};
+static bool model_pm_address(u64 a)
+{
+    for (unsigned i = 0; i < ARRAY_SIZE(model_pm_addresses); i++)
+        if (a == model_pm_addresses[i])
+            return true;
+    return false;
+}
 static unsigned power_requests;
 struct cell {
     u64 a;
     u32 v;
 };
-static struct cell cells[300];
+static struct cell cells[512];
 static unsigned count;
 static u32 get(u64 a)
 {
@@ -89,7 +102,7 @@ static void put(u64 a, u32 v)
             cells[i].v = v;
             return;
         }
-    assert(count < 300);
+    assert(count < 512);
     cells[count++] = (struct cell){a, v};
 }
 static bool is(const char *s)
@@ -105,14 +118,16 @@ int pmgr_adt_gate(const char *path, const char *prop, u32 index, struct pmgr_gat
                             .id = gate_ids[index],
                             .found = true,
                             .name = gate_names[index],
-                            .psreg = 0x100000 + index * 4,
+                            .psreg = model_pm_addresses[index],
                             .parent = {gate_parents[index][0], gate_parents[index][1]}};
+    if (is("acquire-pmgr-address") && index == 2)
+        g->psreg += 4;
     if (is("cold-name") && index == 2)
         g->name = "other";
     if (is("cold-parent") && index == 2)
         g->parent[0]++;
     if (is("cold-alias") && index == 2)
-        g->psreg = 0x100004;
+        g->psreg = 0x3807002f0ULL;
     if (is("cold-unknown") && index == 2)
         g->found = false;
     return 0;
@@ -129,11 +144,64 @@ int pmgr_adt_is_powered(const char *path)
     assert(!strcmp(path, "/arm-io/apcie") && power_requests == 1);
     return is("power-unknown") ? -1 : powered;
 }
+int pmgr_device_count(void)
+{
+    return 15;
+}
+int pmgr_device_at(u32 index, struct pmgr_gate *g)
+{
+    static const u16 ids[] = {143, 153, 338, 339, 340, 341, 60};
+    static const char *names[] = {"SYS_GP_OCLA", "SYS_ST_OCLA",    "APCIE-GP-V", "APCIE-SYS-GP-V",
+                                  "APCIE-ST-V",  "APCIE-SYS-ST-V", "ROOT"};
+    static const u16 parents[] = {109, 144, 74, 109, 110, 144, 0};
+    if (index < 8)
+        return pmgr_adt_gate("/arm-io/apcie", "clock-gates", index, g);
+    if (index >= 15)
+        return -1;
+    unsigned j = index - 8;
+    *g = (struct pmgr_gate){.entry = ids[j],
+                            .id = ids[j],
+                            .found = true,
+                            .name = names[j],
+                            .virt = j >= 2 && j <= 5,
+                            .psreg = j < 2 ? model_pm_addresses[8 + j] : model_pm_addresses[10],
+                            .parent = {parents[j], 0}};
+    if (is("acquire-pmgr-descendant") && j == 6)
+        g->parent[0] = 155;
+    if (is("acquire-pmgr-virtual") && j == 5)
+        g->parent[0] = 60;
+    if (is("acquire-pmgr-duplicate") && j == 6)
+        g->id = g->entry = 74;
+    return 0;
+}
+int pmgr_device_gate(u8 die, u16 id, struct pmgr_gate *g)
+{
+    if (die)
+        return -1;
+    for (unsigned i = 0; i < 15; i++) {
+        pmgr_device_at(i, g);
+        if (g->id == id)
+            return 0;
+    }
+    return -1;
+}
+int pmgr_set_mode(uintptr_t a, u8 mode)
+{
+    assert(acquiring && held && validated && mode == 15 && a >= 0x3807002f0ULL &&
+           a <= 0x380700580ULL);
+    gate_writes++;
+    writes++;
+    put(a, 0xff);
+    if (is("acquire-protected-change"))
+        put(0x380700300ULL, 0xff);
+    return is("acquire-power-failure") ? -1 : 0;
+}
 static u32 read32(u64 a)
 {
-    if (a >= 0x100000 && a < 0x100020) {
-        assert(!power_requests && !writes);
-        if (a == 0x100004) {
+    if (model_pm_address(a)) {
+        if (!acquiring)
+            assert(!power_requests && !writes);
+        if (a == 0x3807002f0ULL) {
             if (is("cold-reset"))
                 return 1U << 31;
             if (is("cold-auto"))
@@ -141,9 +209,9 @@ static u32 read32(u64 a)
             if (is("cold-target"))
                 return 0xf;
         }
-        return ((is("cold-active") || is("pre-bme")) && a == 0x100004) ? 0xff
-               : (is("cold-clkgate") && a == 0x100004)                 ? 0x44
-                                                                       : get(a);
+        return ((is("cold-active") || is("pre-bme")) && a == 0x3807002f0ULL) ? 0xff
+               : (is("cold-clkgate") && a == 0x3807002f0ULL)                 ? 0x44
+                                                                             : get(a);
     }
     if (a != 0x39a000300ULL) {
         assert(powered && fabric_ready && trained);
@@ -182,6 +250,53 @@ static void write32(u64 a, u32 v)
     if (a != 0x39a000300ULL)
         assert(trained);
     writes++;
+    if (acquiring && a >= 0x488000000ULL && a < 0x488020000ULL) {
+        assert(trained && endpoint_command_reads && !held);
+        dart_writes++;
+        if (a >= 0x488001000ULL && a < 0x48800104cULL) {
+            assert(v == 0 && !global_enabled);
+            if (is("acquire-disable-drop"))
+                return;
+        }
+        if (a >= 0x488001400ULL && a < 0x48800144cULL) {
+            assert(v == 0 && !global_enabled);
+            if (is("acquire-root-drop"))
+                return;
+        }
+        if (a == 0x488000c00ULL) {
+            assert(v == 0xffffffffU);
+            for (unsigned i = 0; i < 19; i++)
+                assert(!get(0x488001000ULL + 4 * i) && !get(0x488001400ULL + 4 * i));
+            global_enabled = true;
+            return; /* W1S reads zero. */
+        }
+        if (a == 0x488004000ULL) {
+            assert(v == get(a) && global_enabled);
+            if (!is("acquire-exception-persistent"))
+                put(a, 0);
+            return;
+        }
+        if (a == 0x488000104ULL) {
+            assert(v == 0 && global_enabled);
+            if (is("acquire-mask-drop"))
+                return;
+        }
+        if (a == 0x488000080ULL) {
+            assert(global_enabled);
+            if (v == 0x400) {
+                unlocks++;
+                put(a, is("acquire-unlock-timeout") ? 0x80000000 : 0);
+                return;
+            }
+            assert(v == (0x8100 | tlbis) && tlbis < 19);
+            assert(!get(0x488000104ULL));
+            tlbis++;
+            put(a, is("acquire-command-timeout") ? 0x80000000 : 0);
+            return;
+        }
+    }
+    if (acquiring && is("acquire-final-dirty") && a == 0x1cb0100010ULL && v == 0x80000004)
+        put(0x488001448ULL, 1);
     if (is("bar-drop") && a == 0x1cb0100010ULL && v == 0x80000004)
         return;
     put(a, v);
@@ -201,6 +316,15 @@ static void write16(u64 a, u16 v)
     unsigned sh = (a & 2) * 8;
     write32(b, (get(b) & ~(0xffffU << sh)) | ((u32)v << sh));
 }
+static u64 model_ticks;
+static u64 timeout_calculate(u32 us)
+{
+    return model_ticks + us;
+}
+static bool timeout_expired(u64 deadline)
+{
+    return ++model_ticks > deadline;
+}
 static void udelay(unsigned u)
 {
     (void)u;
@@ -208,18 +332,53 @@ static void udelay(unsigned u)
 #include "j813_reset_provider.h"
 
 #include "../../../src/adt.h"
+static int offsets[32];
+static bool fixture_ready;
+static u8 fixture[16384];
+static u32 fixture_size;
+static int node_index(int n)
+{
+    if (!fixture_ready)
+        return n;
+    for (unsigned i = 0; i < 32; i++)
+        if (offsets[i] == n)
+            return i;
+    return -1;
+}
+u32 adt_get_size(void)
+{
+    return fixture_size;
+}
 static const char *paths[] = {"/",
                               "/chosen",
                               "/arm-io/apcie",
                               "/arm-io/apcie/pci-bridge0",
                               "/arm-io/dart-apcie0",
-                              "/arm-io/gpio0"};
+                              "/arm-io/gpio0",
+                              "/arm-io/smc",
+                              "/arm-io/smc/iop-smc-nub",
+                              "/arm-io/smc/iop-smc-nub/smc-pmu",
+                              "/arm-io",
+                              "/arm-io/dart-apcie0/mapper-apcie0-control",
+                              "/arm-io/dart-apcie0/mapper-apcie0-alpha",
+                              "/arm-io/dart-apcie0/mapper-apcie0-beta",
+                              "/arm-io/dart-apcie0/mapper-apcie0-piodma",
+                              "/arm-io/apcie/pci-bridge0/centauri-control",
+                              "/arm-io/apcie/pci-bridge0/centauri-alpha",
+                              "/arm-io/apcie/pci-bridge0/centauri-beta",
+                              "/arm-io/apcie0-piodma",
+                              "/arm-io/other"};
 int adt_path_offset(const void *d, const char *p)
 {
     (void)d;
-    for (unsigned i = 0; i < ARRAY_SIZE(paths); i++)
+    for (unsigned i = 0; i < ARRAY_SIZE(paths); i++) {
+        if (i >= 6 && i <= 8 && !acquiring)
+            continue;
+        if (acquiring && is("acquire-mapper-missing") && i == 11)
+            continue;
         if (!strcmp(paths[i], p))
-            return i;
+            return fixture_ready ? offsets[i] : (int)i;
+    }
     for (unsigned i = 0; i < ARRAY_SIZE(j813_reset_nodes); i++) {
         if (i == 1 && is("smc-nub-missing"))
             continue;
@@ -242,6 +401,11 @@ int adt_path_offset_trace(const void *d, const char *p, int *out)
 bool adt_is_compatible(const void *d, int n, const char *c)
 {
     (void)d;
+    n = node_index(n);
+    if (acquiring && n >= 10 && n <= 13)
+        return !strcmp(c, "iommu-mapper");
+    if (acquiring && n == 17)
+        return !strcmp(c, "pcie-apiodma,t6020");
     if (n >= 6 && n <= 8) {
         if ((n == 6 && is("smc-controller-compatible")) || (n == 7 && is("smc-nub-compatible")) ||
             (n == 8 && is("smc-pmu-compatible")))
@@ -255,6 +419,8 @@ int adt_get_reg(const void *d, int *p, const char *prop, int i, u64 *a, u64 *z)
 {
     (void)d;
     (void)prop;
+    int mapped[2] = {node_index(p[0]), -1};
+    p = mapped;
     u64 b = 0, l = 0;
     if (p[0] == 2) {
         u64 bs[] = {0x1cb0000000, 0x48c000000, 0x48f000000, 0x48f020000,
@@ -284,11 +450,49 @@ int adt_get_reg(const void *d, int *p, const char *prop, int i, u64 *a, u64 *z)
 const void *adt_getprop(const void *d, int n, const char *key, u32 *len)
 {
     (void)d;
+    n = node_index(n);
     static u32 vals[16];
     memset(vals, 0, sizeof(vals));
     const void *r = vals;
     *len = 4;
-    if (n == 2 && !strcmp(key, "clock-gates")) {
+    if (acquiring && n >= 10 && n <= 17 && !strcmp(key, "AAPL,phandle")) {
+        vals[0] = 0xa100 + n;
+        if (is("acquire-duplicate-phandle") && n == 11)
+            vals[0] = 0xa10a;
+    } else if (acquiring && n == 4 && !strcmp(key, "AAPL,phandle"))
+        vals[0] = 0xa104;
+    else if (acquiring && n == 4 && !strcmp(key, "sid-count"))
+        vals[0] = 19;
+    else if (acquiring && n == 4 && !strcmp(key, "sid")) {
+        *len = 12;
+        vals[0] = 16;
+        vals[1] = 17;
+        vals[2] = 18;
+    } else if (acquiring && n == 2 && !strcmp(key, "first-bypass-sid"))
+        vals[0] = 16;
+    else if (acquiring && n == 3 && !strcmp(key, "apcie-piodma"))
+        vals[0] = 0xa111;
+    else if (acquiring && n == 3 && !strcmp(key, "apcie-piodma-sid"))
+        vals[0] = is("acquire-piodma-sid") ? 18 : 17;
+    else if (acquiring && n == 3 && !strncmp(key, "function-dart_", 14)) {
+        *len = 8;
+        vals[0] = is("acquire-dart-function") ? 0xdead : 0xa104;
+        vals[1] = !strcmp(key, "function-dart_force_active")  ? 0x46616374
+                  : !strcmp(key, "function-dart_release_sid") ? 0x5352656c
+                  : !strcmp(key, "function-dart_request_sid") ? 0x53526571
+                                                              : 0x53656c66;
+    } else if (acquiring && n >= 14 && n <= 17 && !strcmp(key, "iommu-parent"))
+        vals[0] = 0xa100 + n - 4;
+    else if (acquiring && n == 13 && !strcmp(key, "reg"))
+        vals[0] = 17;
+    else if (acquiring && n == 18 && !strcmp(key, "iommu-parent") && is("acquire-extra-consumer"))
+        vals[0] = 0xa10a;
+    else if (acquiring && n == 18 &&
+             ((!strcmp(key, "clock-gates") && is("acquire-clock-consumer")) ||
+              (!strcmp(key, "power-gates") && is("acquire-power-consumer"))))
+        vals[0] = 155;
+    else if (n == 2 &&
+             (!strcmp(key, "clock-gates") || (acquiring && !strcmp(key, "power-gates")))) {
         *len = 32;
         for (unsigned i = 0; i < 8; i++)
             vals[i] = gate_ids[i];
@@ -338,6 +542,72 @@ int adt_getprop_copy(const void *d, int n, const char *k, void *out, size_t size
         return -1;
     memcpy(out, p, size);
     return len;
+}
+static void fixture_node(int index)
+{
+    static const int parents[] = {-1, 0, 9, 2, 9, 9, 9, 6, 7, 0, 4, 4, 4, 4, 3, 3, 3, 9, 9};
+    static const char *keys[] = {"model",
+                                 "chip-id",
+                                 "board-id",
+                                 "clock-gates",
+                                 "power-gates",
+                                 "AAPL,phandle",
+                                 "sid-count",
+                                 "sid",
+                                 "first-bypass-sid",
+                                 "apcie-piodma",
+                                 "apcie-piodma-sid",
+                                 "function-dart_force_active",
+                                 "function-dart_release_sid",
+                                 "function-dart_request_sid",
+                                 "function-dart_self",
+                                 "iommu-parent",
+                                 "reg"};
+    int start = fixture_size;
+    offsets[index] = start;
+    struct adt_node_hdr h = {0, 0};
+    fixture_size += sizeof(h);
+    for (unsigned k = 0; k < ARRAY_SIZE(keys); k++) {
+        u32 len;
+        const void *v = adt_getprop(NULL, index, keys[k], &len);
+        if (!v)
+            continue;
+        struct adt_property *p = (void *)(fixture + fixture_size);
+        memset(p, 0, sizeof(*p));
+        strcpy(p->name, keys[k]);
+        p->size = len;
+        memcpy(p->value, v, len);
+        fixture_size += sizeof(*p) + ((len + 3) & ~3U);
+        h.property_count++;
+    }
+    for (unsigned i = 1; i < ARRAY_SIZE(parents); i++) {
+        int parent = parents[i];
+        if (is("acquire-extra-mapper") && i == 18)
+            parent = 4;
+        if (parent == index) {
+            h.child_count++;
+            fixture_node(i);
+        }
+    }
+    memcpy(fixture + start, &h, sizeof(h));
+}
+static void acquire_fixture(void)
+{
+    for (unsigned i = 0; i < ARRAY_SIZE(offsets); i++)
+        offsets[i] = -1;
+    fixture_node(0);
+    adt = fixture;
+    fixture_ready = true;
+    if (is("acquire-adt-malformed"))
+        ((struct adt_node_hdr *)adt)->property_count = UINT32_MAX;
+}
+int j813_n1_prepare_fabric_acquired_windows(void)
+{
+    assert(acquiring && gate_writes == 7 && held && validated && !power_requests);
+    powered = true;
+    fabric_ready = true;
+    fabric_calls++;
+    return 0;
 }
 int j813_n1_validate_windows(void)
 {
@@ -461,9 +731,11 @@ static void census_scenario(void)
 
 int main(int argc, char **argv)
 {
+    setbuf(stdout, NULL);
     assert(argc == 2);
     scenario = argv[1];
     model_cpu = boot_cpu_idx;
+    acquiring = !strncmp(scenario, "acquire-", 8);
     if (is("chip"))
         chip_id = 0x8112;
     if (is("board"))
@@ -481,14 +753,78 @@ int main(int argc, char **argv)
         put(0x1cb0100000ULL, 0x1900106b);
         put(0x1cb0100004ULL, 4);
     }
+    if (acquiring) {
+        acquire_fixture();
+        put(0x488000008ULL, 0x2a2a0204);
+        put(0x48800000cULL, 0x11013);
+        put(0x488000104ULL, 0xffffffffU);
+        for (unsigned sid = 0; sid < 19; sid++) {
+            put(0x488001000ULL + 4 * sid, 1);
+            put(0x488001400ULL + 4 * sid, 0x1400e000 + sid * 4);
+        }
+        if (is("acquire-version"))
+            put(0x488000008ULL, 0x2a2a0201);
+        if (is("acquire-stream-count"))
+            put(0x48800000cULL, 18);
+        if (is("acquire-geometry"))
+            put(0x488000000ULL, 12U << 24);
+        if (is("acquire-protect"))
+            put(0x488000200ULL, 1);
+        if (is("acquire-busy"))
+            put(0x488000080ULL, 0x80000000);
+        if (is("acquire-tcr-bypass"))
+            put(0x488001044ULL, 6);
+        if (is("acquire-valid-root"))
+            put(0x488001444ULL, 0x1400e001);
+        if (is("acquire-unlock") || is("acquire-unlock-timeout"))
+            put(0x488000210ULL, 2);
+        if (is("acquire-stale") || is("acquire-exception-persistent"))
+            put(0x488004000ULL, 0x20001);
+        if (is("acquire-exception-reserved"))
+            put(0x488004000ULL, 0x80000000);
+        if (is("acquire-block-error"))
+            put(0x488000704ULL, 0x111);
+    }
     if (!strncmp(scenario, "census-", 7)) {
         census_scenario();
         return 0;
     }
     unsigned char result[128];
     memset(result, 0xaa, sizeof(result));
-    int rc = hv_windows_n1_prepare(result, sizeof(result));
-    bool success = is("success");
+    if (is("acquire-cold-retry")) {
+        put(0x3807002f0ULL, 0xff);
+        assert(hv_windows_n1_prepare(result, sizeof(result)) < 0);
+        unsigned before = writes;
+        assert(hv_windows_n1_acquire(result, sizeof(result)) < 0 && writes == before && !trains);
+        for (unsigned i = 0; i < sizeof(result); i++)
+            assert(!result[i]);
+        puts("cold failure then acquire: no retry or writes PASS");
+        return 0;
+    }
+    int rc = acquiring ? hv_windows_n1_acquire(result, sizeof(result))
+                       : hv_windows_n1_prepare(result, sizeof(result));
+    bool success = is("success") || is("acquire-success") || is("acquire-invalid-roots") ||
+                   is("acquire-unlock") || is("acquire-stale") ||
+                   is("acquire-exception-reserved") || is("acquire-retry") ||
+                   is("acquire-cold-retry");
+    if (acquiring && success) {
+        assert(tlbis == 19 && global_enabled && gate_writes == 7 && !power_requests);
+        for (unsigned i = 0; i < 19; i++)
+            assert(!get(0x488001000ULL + 4 * i) && !get(0x488001400ULL + 4 * i));
+        assert(!get(0x488000104ULL) && !get(0x488004000ULL));
+        if (is("acquire-unlock"))
+            assert(unlocks == 1 && get(0x488000210ULL) == 2);
+        census_request(0x488001000ULL, 1, 0, true, 1);
+        if (is("acquire-retry") || is("acquire-cold-retry")) {
+            u8 again[128];
+            unsigned before = writes;
+            int retry = is("acquire-retry") ? hv_windows_n1_acquire(again, sizeof(again))
+                                            : hv_windows_n1_prepare(again, sizeof(again));
+            assert(retry && before == writes);
+            for (unsigned i = 0; i < 128; i++)
+                assert(!again[i]);
+        }
+    }
     printf("%s observed rc=%d reads=%u writes=%u trains=%u\n", scenario, rc, reads, writes, trains);
     fflush(stdout);
     if (success) {
@@ -501,6 +837,15 @@ int main(int argc, char **argv)
         assert(fwrite(result, 1, 128, f) == 128);
         fclose(f);
     } else {
+        if (acquiring && (strstr(scenario, "pmgr-") || strstr(scenario, "consumer") ||
+                          strstr(scenario, "mapper") || strstr(scenario, "phandle") ||
+                          strstr(scenario, "piodma") || strstr(scenario, "dart-function") ||
+                          strstr(scenario, "adt-")))
+            assert(!writes && !trains);
+        if (acquiring && (is("acquire-version") || is("acquire-stream-count") ||
+                          is("acquire-geometry") || is("acquire-protect") || is("acquire-busy") ||
+                          is("acquire-tcr-bypass") || is("acquire-valid-root")))
+            assert(!dart_writes);
         assert(rc != 0);
         for (unsigned i = 0; i < 128; i++)
             assert(!result[i]);

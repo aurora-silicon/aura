@@ -12,6 +12,17 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 CASES = (
+    "acquire-success", "acquire-invalid-roots", "acquire-unlock", "acquire-stale",
+    "acquire-pmgr-address", "acquire-pmgr-descendant", "acquire-pmgr-virtual", "acquire-pmgr-duplicate",
+    "acquire-clock-consumer", "acquire-power-consumer", "acquire-adt-malformed",
+    "acquire-extra-mapper", "acquire-extra-consumer", "acquire-duplicate-phandle",
+    "acquire-mapper-missing", "acquire-piodma-sid", "acquire-dart-function",
+    "acquire-power-failure", "acquire-protected-change", "acquire-version",
+    "acquire-stream-count", "acquire-geometry", "acquire-protect", "acquire-busy",
+    "acquire-tcr-bypass", "acquire-valid-root", "acquire-disable-drop",
+    "acquire-root-drop", "acquire-command-timeout", "acquire-unlock-timeout",
+    "acquire-exception-reserved", "acquire-exception-persistent", "acquire-block-error",
+    "acquire-mask-drop", "acquire-final-dirty", "acquire-retry", "acquire-cold-retry",
     "success", "tunables", "cold-name", "cold-parent", "cold-alias", "cold-unknown", "cold-reset", "cold-auto", "cold-target", "cold-active", "cold-clkgate", "fabric", "finish-early", "power-enable", "power-inactive", "power-unknown",
     "chip", "board", "model", "resource", "perst", "locked", "dart",
     "busy", "pre-bme", "train", "post-bme", "secondary-bme", "tertiary-bme",
@@ -26,7 +37,9 @@ CASES = (
     "census-barrier-fault",
 )
 SOURCES = (
-    "src/hv/windows/windows_n1.c", "src/hv/windows/windows_n1.h",
+    "src/hv/windows/windows_n1_scope.h", "src/hv/windows/windows_n1_dart.h",
+    "AGENTS.md", "docs/windows-n1-acquire.md", "src/proxy.c", "src/proxy.h",
+    "src/pmgr.c", "src/hv/windows/windows_n1.c", "src/hv/windows/windows_n1.h",
     "src/hv/windows/hv.h", "src/hv/windows/hv_exc.c", "src/j813_n1.c", "src/j813_n1.h",
     "src/smp.h", "src/pmgr.h",
     "src/adt.h", "sysinc/string.h", "src/types.h", "src/utils.h", "src/exception.h",
@@ -109,6 +122,12 @@ def main():
         report["descriptor"] = {"path": str(descriptor),
                                 "bytes": descriptor.stat().st_size,
                                 "sha256": digest(descriptor)}
+        acquired = output / "cases/acquire-success/descriptor.bin"
+        if acquired.read_bytes() != descriptor.read_bytes():
+            raise RuntimeError("acquisition changed the existing NW1H v1 wire contract")
+        report["acquisition_descriptor"] = {"path": str(acquired),
+            "bytes": acquired.stat().st_size, "sha256": digest(acquired),
+            "matches_cold_descriptor": True}
         sequence = output / "sequence-host"
         run([compiler, "-std=gnu11", "-O1", "-g", "-Wall", "-Wextra", "-Werror",
              "-Wno-unused-function", "-fsanitize=address,undefined", "-Isrc",

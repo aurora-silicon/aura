@@ -626,7 +626,7 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
         case P_HV_WINDOWS_CAPS:
             /* Read-only personality/ABI probe; never initializes hardware. */
 #ifdef AURA_WINDOWS
-            reply->retval = 0x4157494e00010fffULL;
+            reply->retval = 0x4157494e00011fffULL;
 #else
             reply->retval = 0;
 #endif
@@ -646,10 +646,13 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
             reply->retval = -1;
 #endif
             break;
+        case P_HV_WINDOWS_N1_ACQUIRE:
         case P_HV_WINDOWS_N1_PREPARE:
 #ifdef AURA_WINDOWS
         {
-            int result = hv_windows_n1_prepare((void *)request->args[0], request->args[1]);
+            int result = request->opcode == P_HV_WINDOWS_N1_ACQUIRE
+                             ? hv_windows_n1_acquire((void *)request->args[0], request->args[1])
+                             : hv_windows_n1_prepare((void *)request->args[0], request->args[1]);
             if (result)
                 hv_windows_quarantine();
             reply->retval = result;

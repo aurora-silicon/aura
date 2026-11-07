@@ -66,6 +66,9 @@ struct pmgr_gate {
 
 int pmgr_adt_gate(const char *path, const char *prop, u32 index, struct pmgr_gate *gate);
 int pmgr_device_gate(u8 die, u16 id, struct pmgr_gate *gate);
+/* Read-only normalized enumeration, preserving duplicate entries for validation. */
+int pmgr_device_count(void);
+int pmgr_device_at(u32 index, struct pmgr_gate *gate);
 
 int pmgr_reset(int die, const char *name);
 int pmgr_power_on(int die, const char *name);

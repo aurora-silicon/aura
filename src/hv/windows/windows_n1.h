@@ -15,6 +15,7 @@ enum hv_windows_n1_read_status {
 /* Explicit pre-guest operation. -1 rejected/held; -2 cannot prove drain.
  * On failure the descriptor is cleared. No automatic call from hv_init. */
 int hv_windows_n1_prepare(void *descriptor, size_t size);
+int hv_windows_n1_acquire(void *descriptor, size_t size);
 /* HVC #0: x0=CALL, x1=physical address, x2=version, x3=0.
  * Return x0=ACK, x1=status, x2=u32 value (zero on failure), x3=version.
  * Caller holds the HV lock. Unknown magic leaves all registers unchanged. */
