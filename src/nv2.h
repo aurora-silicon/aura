@@ -46,10 +46,6 @@ bool nv2_handle_async(u64 *regs, int kind);
 /* NV2_TRACE builds: record a trap nothing handled. */
 void nv2_note_unhandled(u64 esr, u64 elr, u64 spsr);
 
-/* Reflect an unhandled trap from an OS at EL1 back into it as an UNDEF rather
- * than resetting the machine. */
-void nv2_reflect_undef(u64 elr, u64 spsr);
-
 /* Proxy diagnostics: arm this CPU's NV2 state for an nv2_probe_call(). */
 u64 nv2_probe_arm(u64 vncr, u64 avncr, u64 hcr);
 void nv2_probe_disarm(void);

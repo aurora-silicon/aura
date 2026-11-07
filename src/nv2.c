@@ -440,7 +440,7 @@ static void nv2_timers_enter(struct nv2_cpu *c, bool guarded)
     msr(SYS_CNTV_CTL02, 0);
 
     /* L1's scheduler deadline (its hyp timers are the real EL1 ones) moves to
-     * the monitor's EL2 physical timer while the guest owns those; its FIQ
+     * aura's EL2 physical timer while the guest owns those; its FIQ
      * exits the guest and L1 then finds its own timer firing. L1's CNTVOFF is
      * 0, so the virtual deadline is in the same units. */
     bool p_on = (c->l1_tmr[0] & 3) == 1, v_on = (c->l1_tmr[2] & 3) == 1;
@@ -1524,22 +1524,6 @@ void nv2_note_unhandled(u64 esr, u64 elr, u64 spsr)
     nv2_trace(NV2_T_FAIL, esr >> 26, esr, elr, spsr, 0xdead, mrs(FAR_EL2));
 }
 
-/*
- * Reflect a trap aura does not service back into an OS at EL1 as an UNDEF
- * ("unknown reason") exception, instead of resetting the whole machine.
- * elr/spsr are the faulting context (ELR_EL2/SPSR_EL2 under VHE). Lives here
- * because the EL12 register plumbing does.
- */
-void nv2_reflect_undef(u64 elr, u64 spsr)
-{
-    msr(SYS_ESR_EL12, 0x02000000); /* EC_UNKNOWN, IL=1 */
-    msr(SYS_ELR_EL12, elr);
-    msr(SYS_SPSR_EL12, spsr);
-    /* From EL1: the current-EL (SPx) vector; from EL0: the lower-EL vector. */
-    msr(ELR_EL2, mrs(SYS_VBAR_EL12) + ((spsr & 0xf) ? 0x200 : 0x400));
-    msr(SPSR_EL2, (spsr & GENMASK(31, 28)) | 0x3c5); /* EL1h, DAIF masked */
-    sysop("isb");
-}
 bool nv2_handle_async(u64 *regs, int kind)
 {
     UNUSED(regs);
