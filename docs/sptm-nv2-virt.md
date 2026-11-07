@@ -30,7 +30,10 @@ offsets from a SoC base 0x80000000 higher, under other PMGR reg indices. Stop mo
 entry to the commit (`0x3882d4000 <- 1`). It is T8140's sequence moved up, without the CLLT writes.
 `AppleT8132PMGR::_quiesceAxi2afWorkaround` panics if PS `0x380700378` is on at quiesce. That is the
 hidden debug port's parent, which stays on because nothing powers its devices down, so once the
-first core has disabled itself, reads of it report it off. Go mode is untested on T8132.
+first core has disabled itself, reads of it report it off. Go mode sleeps and wakes over KIS with
+no further change. The KIS link stays up across the sleep, and with the error handler hidden no
+AMCC error wakes it early, so `AURA_S2R_QUIESCE` is not needed. The keyboard wakes it, which macOS
+reports as `MTP.DOCK.CHANNELS.AP0.IRQ RTP.keyboard`.
 
 The code:
 
