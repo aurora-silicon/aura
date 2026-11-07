@@ -194,10 +194,11 @@ directly. Booting through U-Boot and GRUB needs U-Boot support for it
   the EFI path (GRUB's `LoadImage`) and `booti`, and tells the EFI stub to run it in
   place.
 
-Without that U-Boot change the image lands outside the window and an enforcing
-kernel panics in `ctxr_exec_reserve()`. A kernel that finds EFI runtime code outside
-the window, or misaligned, warns and turns runtime services off for that boot. A
-compressed (zboot) kernel cannot be pinned and is refused.
+Without that U-Boot change the image lands outside the window. The kernel then logs
+why and boots on the boot CPU alone, leaving the secondaries in aura. A kernel that
+finds EFI runtime code outside the window, or misaligned, warns and turns runtime
+services off for that boot. A compressed (zboot) kernel can't be placed in the
+window, so U-Boot warns and it boots on the boot CPU the same way.
 
 ### What a confined Mac loses
 
@@ -213,8 +214,8 @@ These worked under the monitor, or were reachable through it, except power-off:
   through it, and now needs `macsmc-reboot`. The J700 tree describes both, but
   `macsmc-reboot` is a module in the asahi config, so a kernel that hasn't loaded it
   can only restart through the watchdog and can't power off.
-- **kexec and kdump.** aurora-silicon/linux#985 refuses both with `EOPNOTSUPP` under
-  an enforcing window, because the relocation code runs outside it.
+- **kexec and kdump.** aurora-silicon/linux#985 refuses both with `EOPNOTSUPP` while
+  a window is active, because the relocation code runs outside it.
 - **`cpuidle-psci`.** This loses less than it sounds. No Apple tree in the kernel has
   `cpu-idle-states`, so `cpuidle-psci` had no states to register under the monitor
   either. `cpuidle-apple` binds on T8140 through `apple,t8140-cpuidle`, which the J700
