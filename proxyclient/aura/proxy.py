@@ -371,8 +371,9 @@ class UartInterface(Reloadable):
     def wait_and_handle_boot(self):
         self.handle_boot(self.wait_boot())
 
-    def nop(self):
-        features = Feature.get_all()
+    def nop(self, features=None):
+        if features is None:
+            features = Feature.get_all()
 
         # Send the supported feature flags in the NOP message (has no effect
         # if the target does not support it)

@@ -88,6 +88,10 @@ class HV(Reloadable):
         self.windows_n1 = "disabled"
         self.windows_mtp = "disabled"
         self.windows_cpufreq = "disabled"
+        self.windows_g17 = "disabled"
+        self.windows_g17_source = None
+        self.windows_g17_record = None
+        self.windows_g17_receipt = {"policy": "disabled"}
         self.windows_mtp_ready = False
         self.windows_mtp_attempted = False
         self.windows_initialized = False
@@ -1393,6 +1397,8 @@ class HV(Reloadable):
         self.iface.tty_log = fd
 
     def _windows_adt_blob(self):
+        from ..windows_g17 import verify_adt
+        verify_adt(self)
         blob = self.adt.build()
         capacity = align(self.u.ba.devtree_size)
         if capacity <= 0 or len(blob) > capacity:
@@ -1775,6 +1781,8 @@ class HV(Reloadable):
             from ..windows import (N1_BYTES, N1_PROPERTY, MTP_DISABLED_PROPERTY,
                                    CPUFREQ_PROPERTY, cpufreq_handoff_marker)
             chosen = self.adt["/chosen"]
+            from ..windows_g17 import update_adt as update_g17_adt
+            update_g17_adt(self)
             opp_tables = None
             if self.windows_cpufreq != "disabled":
                 if "/arm-io/pmgr" not in self.adt:
@@ -2016,6 +2024,8 @@ class HV(Reloadable):
         self.tba.phys_base = phys_base
         self.tba.virt_base = 0xfffffe0010000000 + (phys_base & (32 * 1024 * 1024 - 1))
         self.tba.devtree = self.adt_base - phys_base + self.tba.virt_base
+        if self.windows:
+            self.tba.devtree_size = len(self._windows_adt_blob())
         self.tba.top_of_kernel_data = guest_base + image_size
 
         if use_xnu_symbols == True:
@@ -2186,6 +2196,8 @@ class HV(Reloadable):
             self._validate_windows_n1_ready()
             # Validate the final tree before device or page-table mutations.
             adt_blob = self._windows_adt_blob()
+            if self.tba.devtree_size != len(adt_blob):
+                raise ValueError("Windows ADT size changed after boot arguments were serialized")
         print("Disabling other iodevs...")
         for iodev in IODEV:
             if iodev != self.iodev:
