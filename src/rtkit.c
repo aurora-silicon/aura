@@ -49,6 +49,11 @@
 #define OSLOG_SIZE                GENMASK(55, 36)
 #define OSLOG_IOVA                GENMASK(35, 0)
 
+/* The notify type is only bits 59:56 (Pavel Shago, m1n1 cf2e8187 "rtkit: answer oslog notifies
+ * so the 27.0 DCP quiesces"). */
+#define OSLOG_NOTIFY_TYPE GENMASK(59, 56)
+#define OSLOG_TYPE_NOTIFY 2
+
 #define MGMT_MSG_HELLO        1
 #define MGMT_MSG_HELLO_ACK    2
 #define MGMT_MSG_HELLO_MINVER GENMASK(15, 0)
@@ -104,6 +109,7 @@ struct rtkit_dev {
     u64 dva_base;
     u32 timeout_usec;
     struct rtkit_buffer oslog_bfr;
+    bool oslog_echo;
 
     enum rtkit_power_state iop_power;
     enum rtkit_power_state ap_power;
@@ -220,6 +226,17 @@ void rtkit_free(rtkit_dev_t *rtk)
         return;
     free(rtk->name);
     free(rtk);
+}
+
+/*
+ * Firmware that keeps its oslog channel open across AP sessions (the J773g DCP iBoot left
+ * running) acks AP QUIESCED only after the AP has echoed each type 2 "data available" notify,
+ * and must not be handed a second buffer for a channel it set up itself. Off by default.
+ * Based on Pavel Shago's m1n1 cf2e8187.
+ */
+void rtkit_set_oslog_echo(rtkit_dev_t *rtk, bool echo)
+{
+    rtk->oslog_echo = echo;
 }
 
 bool rtkit_send(rtkit_dev_t *rtk, const struct rtkit_message *msg)
@@ -608,6 +625,23 @@ int rtkit_recv(rtkit_dev_t *rtk, struct rtkit_message *msg)
                 }
                 break;
             case RTKIT_EP_OSLOG:
+                if (rtk->oslog_echo &&
+                    FIELD_GET(OSLOG_NOTIFY_TYPE, msg->msg) == OSLOG_TYPE_NOTIFY) {
+                    /* One echo per notify, nothing waited for. */
+                    if (!rtkit_send(rtk, msg)) {
+                        rtkit_printf("unable to echo oslog notify %lx\n", msg->msg);
+                        ok = false;
+                    }
+                    break;
+                }
+                if (rtk->oslog_echo &&
+                    FIELD_GET(OSLOG_NOTIFY_TYPE, msg->msg) == OSLOG_TYPE_BUFFER_REQUEST &&
+                    FIELD_GET(OSLOG_IOVA, msg->msg)) {
+                    /* As Linux does: answering makes the firmware re-init the channel. */
+                    rtkit_printf("oslog buffer %lx is the firmware's own; not answered\n",
+                                 msg->msg);
+                    break;
+                }
                 if (asc_is_v8(rtk->asc) &&
                     FIELD_GET(OSLOG_TYPE, msg->msg) == OSLOG_TYPE_BUFFER_REQUEST) {
                     ok = ok && rtkit_handle_oslog_request(rtk, msg);
