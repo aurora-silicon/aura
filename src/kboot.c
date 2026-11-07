@@ -11456,6 +11456,8 @@ int kboot_prepare_dt(void *fdt)
         return -1;
     if (dt_set_isp())
         return -1;
+    if (dt_disable_t8132_absent_isp(dt))
+        return -1;
     dt_set_j713_isp();
     if (dt_set_pmgr())
         return -1;
