@@ -11455,6 +11455,12 @@ int kboot_prepare_dt(void *fdt)
         return -1;
     if (dt_set_aop_firmware())
         return -1;
+    /*
+     * Before dt_set_isp(): on a Mac with no ISP in its ADT that disables the ISP but not its
+     * DARTs, and this rule leaves an ISP that is already disabled as it is.
+     */
+    if (dt_disable_t8132_absent_isp(dt))
+        return -1;
     if (dt_set_isp())
         return -1;
     dt_set_j713_isp();
