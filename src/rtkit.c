@@ -229,6 +229,16 @@ void rtkit_free(rtkit_dev_t *rtk)
 }
 
 /*
+ * The DVA high bits a coprocessor needs on every buffer it is given, for an IOP whose ADT has no
+ * asc-dram-mask. The J773g DCP's locked DARTs translate the window at vm-base 1 TiB (bit 40), and
+ * a DVA without that bit is not in the window (Pavel Shago's m1n1 dart_dva_base()).
+ */
+void rtkit_set_dva_base(rtkit_dev_t *rtk, u64 dva_base)
+{
+    rtk->dva_base = dva_base;
+}
+
+/*
  * Firmware that keeps its oslog channel open across AP sessions (the J773g DCP iBoot left
  * running) acks AP QUIESCED only after the AP has echoed each type 2 "data available" notify,
  * and must not be handed a second buffer for a channel it set up itself. Off by default.
