@@ -2576,8 +2576,11 @@ static const struct adt_tunable_info usb4_rc_tunables[] = {
     {"lbw_fabric_tunables", "apple,tunable-rc", 0x8000, 0x4000, true},
 };
 
-/* Type 7 firmware does not supply the four per-direction fabric tables. */
-static const struct adt_tunable_info usb4_t8142_nhi_tunables[] = {
+/*
+ * ACIO v2 routers (T8142, T6041, T6050) do not publish the four per-direction
+ * fabric tables, so they are optional here.
+ */
+static const struct adt_tunable_info usb4_v2_nhi_tunables[] = {
     {"hi_up_tx_desc_fabric_tunables", "apple,tunable-nhi", 0xe8000, 0x4000, false},
     {"hi_up_tx_data_fabric_tunables", "apple,tunable-nhi", 0xec000, 0x4000, false},
     {"hi_up_rx_desc_fabric_tunables", "apple,tunable-nhi", 0xf0000, 0x4000, false},
@@ -2739,24 +2742,52 @@ err:
     return -1;
 }
 
+/* The router generation is in the ADT: "acio" for v1, "acio,v2" for v2. */
+static bool adt_acio_is_v2(int adt_node)
+{
+    return adt_is_compatible(adt, adt_node, "acio,v2");
+}
+
+/*
+ * Which /arm-io/acioN register is the root complex block that the DT names
+ * its cio@ node after. v1 routers list a 0x30004 window ahead of it (reg 2),
+ * v2 routers drop that window (reg 1).
+ */
+static int adt_acio_rc_regnum(void)
+{
+    char adt_path[32];
+
+    for (int i = 0; i < MAX_CIO_DEVS; ++i) {
+        snprintf(adt_path, sizeof(adt_path), "/arm-io/acio%d", i);
+        int node = adt_path_offset(adt, adt_path);
+        if (node >= 0)
+            return adt_acio_is_v2(node) ? 1 : 2;
+    }
+
+    return 2;
+}
+
 static int dt_set_acio_tunables(void)
 {
     char adt_path[32];
     char fdt_alias[32];
     u64 router_uuid = rust_usb4_router_uuid();
-    const struct adt_tunable_info *nhi_tunables = usb4_nhi_tunables;
-    size_t n_nhi_tunables = ARRAY_SIZE(usb4_nhi_tunables);
-
-    if (chip_id == T8142) {
-        nhi_tunables = usb4_t8142_nhi_tunables;
-        n_nhi_tunables = ARRAY_SIZE(usb4_t8142_nhi_tunables);
-    }
 
     if (!router_uuid)
         bail("ADT: unable to generate USB4 router UUID\n");
 
     for (int i = 0; i < MAX_CIO_DEVS; ++i) {
+        const struct adt_tunable_info *nhi_tunables = usb4_nhi_tunables;
+        size_t n_nhi_tunables = ARRAY_SIZE(usb4_nhi_tunables);
+
         snprintf(adt_path, sizeof(adt_path), "/arm-io/acio%d", i);
+        int adt_node = adt_path_offset(adt, adt_path);
+        if (adt_node < 0)
+            continue;
+        if (adt_acio_is_v2(adt_node)) {
+            nhi_tunables = usb4_v2_nhi_tunables;
+            n_nhi_tunables = ARRAY_SIZE(usb4_v2_nhi_tunables);
+        }
 
         snprintf(fdt_alias, sizeof(fdt_alias), "usb4_%d_rc", i);
         if (!fdt_get_alias(dt, fdt_alias))
@@ -2853,20 +2884,43 @@ static int dt_copy_pciec_dart_tunables(const char *adt_path, const char *dt_alia
     int len;
     const fdt32_t *map = fdt_getprop(dt, host, "iommu-map", &len);
     /* PCIe-C describes one RID range and a one-cell stream specifier. */
-    if (!map || len != 4 * sizeof(*map))
+    if (!map || len != 4 * sizeof(*map)) {
+        printf("PCIEC: %s has no single-range iommu-map, DART tunables not copied\n", dt_alias);
         return -1;
+    }
     int dart = fdt_node_offset_by_phandle(dt, fdt32_to_cpu(map[1]));
-    if (dart < 0 || fdt_node_check_compatible(dt, dart, "apple,t8110-dart"))
+    if (dart < 0) {
+        printf("PCIEC: %s iommu-map names no DART node\n", dt_alias);
+        return -1;
+    }
+    /* Older (T8103) PCIe-C DARTs take no table. */
+    if (fdt_node_check_compatible(dt, dart, "apple,t8110-dart"))
         return -1;
 
     /* Keep existing board tables, including the qualified T600x values. */
     if (fdt_getprop(dt, dart, "apple,tunable", NULL))
         return 0;
     int adt_node = adt_path_offset(adt, adt_path);
-    if (adt_node < 0)
+    if (adt_node < 0) {
+        printf("PCIEC: %s not in the ADT, DART tunables not copied\n", adt_path);
         return -1;
+    }
+
+    /*
+     * Some SoCs (T8112) publish no table for this DART: iBoot asks for no
+     * tuning there. Say so with an empty list, so the kernel can tell it from
+     * a boot loader that did not look.
+     */
+    u32 table_len;
+    if (!adt_getprop(adt, adt_node, tunable.adt_name, &table_len)) {
+        printf("PCIEC: %s has no %s, handing over an empty table\n", adt_path, tunable.adt_name);
+        if (fdt_setprop_empty(dt, dart, "apple,tunable") < 0)
+            return -1;
+        return 0;
+    }
 
     if (dt_append_acio_tunable(adt_node, dart, &tunable)) {
+        printf("PCIEC: unable to convert %s/%s\n", adt_path, tunable.adt_name);
         /* The converter may have appended a prefix before rejecting input. */
         fdt_delprop(dt, dart, "apple,tunable");
         return -1;
@@ -9120,7 +9174,7 @@ int kboot_prepare_dt(void *fdt)
         return -1;
     if (dt_disable_missing_devs("usb-drd", "usb@", 8, 0))
         return -1;
-    if (dt_disable_missing_devs("acio", "cio@", 8, 2))
+    if (dt_disable_missing_devs("acio", "cio@", 8, adt_acio_rc_regnum()))
         return -1;
     if (dt_disable_missing_devs("i2c", "i2c@", 8, 0))
         return -1;
