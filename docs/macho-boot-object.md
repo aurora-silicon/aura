@@ -223,7 +223,9 @@ These worked under the monitor, or were reachable through it, except power-off:
   `CYC_OVRD` write is undefined on that chip. This comes from reading the driver and
   trees, and no boot has confirmed it.
 - **NV2 and PV-KVM.** Both are gone, and with them the only `/dev/kvm` measured on a
-  confined Mac. KVM at EL2 in the window hasn't been tried.
+  confined Mac. KVM at EL2 in the window hasn't been tried. NV2 is left only in
+  `SPTM_VIRT=1` development builds, for [the virtualized SPTM](sptm-nv2-virt.md), and
+  never runs Linux.
 
 Idle power in this mode hasn't been measured, and the J700 is fanless, so it needs
 measuring on a Neo.

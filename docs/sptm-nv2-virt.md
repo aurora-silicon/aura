@@ -21,7 +21,7 @@ The code:
 | `src/sptm_virt_cl4.c` | the cL4 world switch |
 | `src/sptm_virt_s2.c` | the stage 2 aura gives XNU: vuart, reset guard, aura's own memory unmapped |
 | `src/sptm_virt_s2r.c` | suspend to RAM and its trace |
-| `src/nv2.c`, `src/nv2_asm.S` | FEAT_NV2: the guest at virtual EL2, its EL2 setup and entry; `nv2_guarded` for a guest with its own GXF/SPRR world |
+| `src/nv2.c`, `src/nv2_asm.S` | FEAT_NV2: the guest at virtual EL2, its EL2 setup and entry, the lower-EL ERET gate (`_v_lower_sync`); `nv2_guarded` for a guest with its own GXF/SPRR world |
 | `proxyclient/aura/sptm_virt_plan.py` | the iBoot-to-SPTM handoff: blob layout, device tree, boot_args |
 | `proxyclient/aura/exclave_bundle.py` | the ExclaveCore bundle's cL4 regions |
 
@@ -37,7 +37,9 @@ accesses go to a per-CPU VNCR page, and its ERETs trap.
 SPTM's `__start` writes GL-only SPRR registers that UNDEF at non-guarded EL1, and HACR cannot trap
 them. So aura brings up its own GL2 (SPRR, then GXF; the permission maps are loaded at boot so
 aura's own pages stay accessible) before every entry, and SPTM's GENTER from virtual EL2 lands in
-GL1. What SPTM then does that needs GL2 traps to aura's GL2 (`sptm_virt_gl_sync`):
+GL1. An SPTM_VIRT build sets `mmu_sprr` on M4 for this. `apple_sysregs_unlocked` stays false
+there: it gates CYC_OVRD, which is locked, and nothing on this path touches CYC_OVRD. What SPTM
+then does that needs GL2 traps to aura's GL2 (`sptm_virt_gl_sync`):
 
 - GL2 register accesses: kept per CPU in a shadow (`sptm_virt_gl2_slot`), so reads see earlier
   writes. AMX_CTL_EL2 is applied, since aura is the real EL2.
