@@ -39,17 +39,6 @@ int main(void) {
     boot_options_init("aura-consoles aura-debug", 25);
     assert(!aura_console_enabled() && aura_debug_enabled());
 
-    boot_options_init("aura-pv=1", 10);
-    assert(aura_pv_enabled());
-    boot_options_init("aura-pv=0", 10);
-    assert(!aura_pv_enabled());
-    boot_options_init("aura-pv", 8);
-    boot_options_set_pv_override(0);
-    assert(!aura_pv_enabled());
-    boot_options_set_pv_override(1);
-    assert(aura_pv_enabled());
-    boot_options_set_pv_override(-1);
-    assert(aura_pv_enabled());
     char truncated[] = {'a','u','r','a','-','d','e','b','u','g'};
     boot_options_init(truncated,sizeof(truncated));
     assert(!aura_debug_enabled());

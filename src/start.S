@@ -21,7 +21,6 @@
 .extern _start_c
 .extern _stack_bot
 .extern _v_sp0_sync
-.extern _v_lower_sync
 .extern _v_sp0_irq
 .extern _v_sp0_fiq
 .extern _v_sp0_serr
@@ -56,7 +55,7 @@ _vectors_start:
     .align 7
     b _v_sp0_serr
     .align 7
-    b _v_lower_sync
+    b _v_sp0_sync
     .align 7
     b _v_sp0_irq
     .align 7

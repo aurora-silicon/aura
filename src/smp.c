@@ -7,7 +7,6 @@
 #include "cpu_regs.h"
 #include "malloc.h"
 #include "memory.h"
-#include "monitor.h"
 #include "pmgr.h"
 #include "soc.h"
 #include "string.h"
@@ -50,10 +49,9 @@ u8 dummy_stack_el1[DUMMY_STACK_SIZE]; // EL1 stack if EL3 exists
 /*
  * Stage 1 is the boot object iBoot loads, and its raw image runs to the end of .bss (STACKBOT),
  * so every byte of .bss is part of what iBoot places. The 2.25 MiB of secondary stacks took the
- * image from the 1.5 MiB of m1n1 v1.6 to over 4 MiB. Stage 1 never hands its stacks to an OS
- * (PSCI runs from the stage that boots the kernel), so it takes them from the heap as m1n1 v1.6
- * did. The pointers are shared like smp_reset_stacks: a T8152 core reads its own in cpu_reset
- * with the MMU off.
+ * image from the 1.5 MiB of m1n1 v1.6 to over 4 MiB. Stage 1 never hands its stacks to an OS, so
+ * it takes them from the heap as m1n1 v1.6 did. The pointers are shared like smp_reset_stacks: a
+ * T8152 core reads its own in cpu_reset with the MMU off.
  */
 u8 *secondary_stacks[MAX_CPUS] SMP_SHARED;
 u8 *secondary_stacks_el3[MAX_EL3_CPUS] SMP_SHARED;
@@ -143,7 +141,6 @@ struct smp_reset_stack smp_reset_stacks[MAX_CPUS] SMP_SHARED = {
 
 extern u8 _vectors_start[0];
 
-bool monitor_active SMP_SHARED;
 extern u8 _stack_bot[0];
 extern char _stack_top[], _data_start[], _bss_end[];
 int boot_cpu_idx SMP_SHARED = -1;
@@ -160,8 +157,12 @@ static bool smp_old_vector_owned(u64 locked)
     u64 inherited_top = cur_boot_args.top_of_kernel_data;
     u64 image_start = (u64)_base;
     u64 image_end = (u64)_end;
+    int ro_status = memory_fw_ro_range(&ro_start, &ro_end);
 
-    if (memory_fw_ro_range(&ro_start, &ro_end) != 1 || !cur_boot_args.mem_size ||
+    /* With no firmware RO range known, the inherited top alone bounds the search. */
+    if (!ro_status)
+        ro_start = UINT64_MAX;
+    if (ro_status < 0 || !cur_boot_args.mem_size ||
         cur_boot_args.phys_base > UINT64_MAX - cur_boot_args.mem_size ||
         locked < cur_boot_args.phys_base ||
         locked >= cur_boot_args.phys_base + cur_boot_args.mem_size || locked >= ro_start ||
@@ -200,25 +201,35 @@ static int smp_prepare_rvbar(const struct cpu_info *cpu)
     u64 locked = rvbar & RVBAR_ADDR;
     u64 target = (u64)_vectors_start;
 
+    /* A7 to M3: RVBAR is not locked, and smp_start_cpu() sets it. */
     if (locked == target || cpu_features->apple_sysregs_unlocked)
         return 0;
     /* A stage that moved above the chainloaded image keeps entry at its old base. */
     if (relocated_from && locked == old_vectors_start())
         return 0;
-    if (chip_id != T8140 || !(rvbar & RVBAR_LOCK)) {
+    if (!(rvbar & RVBAR_LOCK)) {
         printf("SMP: RVBAR 0x%lx differs from vector 0x%lx; refusing start\n", locked, target);
         return -1;
     }
 
+    /*
+     * iBoot locked RVBAR somewhere else. Forward it with a branch when it is the boot object's
+     * Mach-O header (an iBoot that does not take the vector from the object's kcev locks the
+     * load base), or the vector table of an earlier aura image.
+     */
     int64_t distance = (int64_t)target - (int64_t)locked;
     if ((distance & 3) || distance < -0x8000000 || distance > 0x7fffffc)
         return -1;
 
     u32 branch = 0x14000000 | ((distance / 4) & 0x03ffffff);
-    if (installed_relay == locked)
+    /* The boot object's header starts with MH_MAGIC_64, 64K below the raw image. */
+    bool header = distance == 0x10000;
+    /* An earlier stage at this base may have forwarded the header already. */
+    if (installed_relay == locked || (header && read32(locked) == branch))
         return read32(locked) == branch ? 0 : -1;
-    if (!smp_old_vector_owned(locked)) {
-        printf("SMP: RVBAR 0x%lx is not a verified retired image vector\n", locked);
+    if (!(header && read32(locked) == 0xfeedfacf) && !smp_old_vector_owned(locked)) {
+        printf("SMP: RVBAR 0x%lx is neither the boot object header nor a retired image vector\n",
+               locked);
         return -1;
     }
     u64 page = ALIGN_DOWN(locked, get_page_size());
@@ -307,8 +318,6 @@ static int smp_prepare_rvbar_t8152(const struct cpu_info *cpu)
     return 0;
 }
 
-void smp_park_loop(struct spin_table *me) __attribute__((noreturn));
-
 void smp_secondary_entry(void)
 {
     u64 mpidr = mrs(MPIDR_EL1) & 0xFFFFFF;
@@ -345,20 +354,11 @@ void smp_secondary_entry(void)
     sysop("dmb sy");
     me->flag++;
     sysop("dmb sy");
+    u64 target;
     if (chip_id != T8152 && !cpu_features->fast_ipi)
         aic_write(AIC_IPI_MASK_SET, AIC_IPI_SELF); // we only use the "other" IPI
 
-    smp_park_loop(me);
-}
-
-/* The parked-secondary wait. A CPU sits here until smp_call4() (or PSCI
- * CPU_ON, which uses it) sets a target, then runs it. monitor_enter_os() and
- * the OS never return, so a PSCI CPU_OFF re-enters this loop on a fresh stack
- * (smp_reenter_park) to put the core back in the pool. */
-void __attribute__((noreturn)) smp_park_loop(struct spin_table *me)
-{
     while (1) {
-        u64 target;
         while (!(target = me->target)) {
             if (wfe_mode) {
                 sysop("wfe");
@@ -378,38 +378,12 @@ void __attribute__((noreturn)) smp_park_loop(struct spin_table *me)
         sysop("dmb sy");
         me->flag++;
         sysop("dmb sy");
-        if (monitor_active)
-            monitor_enter_os(target, me->args[0], me->args[1], me->args[2]);
         me->retval = ((u64 (*)(u64 a, u64 b, u64 c, u64 d))target)(me->args[0], me->args[1],
                                                                    me->args[2], me->args[3]);
         sysop("dmb sy");
         me->target = 0;
         sysop("dmb sy");
     }
-}
-
-/* PSCI CPU_OFF: the dying CPU abandons its OS stack and re-parks. */
-void __attribute__((noreturn)) smp_reenter_park(int index)
-{
-    extern void _smp_reenter_park(struct spin_table * me, u64 sp) __attribute__((noreturn));
-    if (index < 0 || index >= MAX_CPUS)
-        panic("SMP: re-park requested for invalid CPU %d\n", index);
-    struct spin_table *me = &spin_table[index];
-    me->target = 0;
-    me->retval = 0;
-    /* The boot CPU is not a pool member until it offlines itself here; give it
-     * a nonzero flag so a later PSCI CPU_ON (smp_call4) can redispatch it. */
-    if (!me->flag)
-        me->flag = 1;
-    sysop("dmb sy");
-    _smp_reenter_park(me, (u64)secondary_stacks[index] + SECONDARY_STACK_SIZE);
-}
-
-bool smp_os_started(int cpu)
-{
-    if (cpu < 0 || cpu >= MAX_CPUS)
-        return false;
-    return spin_table[cpu].target != 0;
 }
 
 void smp_secondary_prep_el3(void)

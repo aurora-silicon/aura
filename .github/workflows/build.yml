@@ -42,3 +42,24 @@ jobs:
           path: |
             build/aura.macho
             build/aura.bin
+
+  stage1-clang:
+    # Stage 1 has to end below the panel DCP's log buffer (aura-raw.ld). Releases build with
+    # gcc. Link both stages with clang too, as a Mac builds them, so that a change that pushes
+    # Stage 1 over fails here.
+    runs-on: macos-26
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install LLVM, LLD and GNU make
+        run: brew install llvm lld make
+
+      - name: Install aarch64-unknown-none-softfloat rust target
+        run: rustup target install aarch64-unknown-none-softfloat
+
+      - name: Link Stage 1 and the ESP Stage 2 with clang
+        run: |
+          gmake -j3 RELEASE=1 CHAINLOADING=1 BUILTIN_LOGO=aurora
+          gmake clean
+          gmake -j3 RELEASE=1 CHAINLOADING=1 ESP_STAGE2=1 BUILTIN_LOGO=aurora

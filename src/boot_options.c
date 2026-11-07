@@ -6,8 +6,6 @@ static bool console_requested;
 static bool proxy_requested;
 static bool trial_running;
 static bool is_stage1;
-static bool pv_option;
-static int pv_override = -1;
 
 static bool boot_space(char c)
 {
@@ -47,14 +45,6 @@ void boot_options_init(const char *line, size_t capacity)
     console_requested = boot_option_present(line, capacity, "aura-console");
     proxy_requested = boot_option_present(line, capacity, "aura-proxy");
     trial_running = boot_option_present(line, capacity, "aura-trial");
-    pv_option = boot_option_present(line, capacity, "aura-pv");
-    if (boot_option_present(line, capacity, "aura-pv=1") ||
-        boot_option_present(line, capacity, "aura-pv=on"))
-        pv_option = true;
-    else if (boot_option_present(line, capacity, "aura-pv=0") ||
-             boot_option_present(line, capacity, "aura-pv=off"))
-        pv_option = false;
-    pv_override = -1;
     is_stage1 = true;
 }
 
@@ -72,17 +62,6 @@ bool aura_console_enabled(void)
 void boot_options_set_console(bool console)
 {
     console_requested = console;
-}
-
-/* The PV-KVM prototype's discovery/RUN interface (opt-in). */
-bool aura_pv_enabled(void)
-{
-    return pv_override >= 0 ? pv_override : pv_option;
-}
-
-void boot_options_set_pv_override(int enabled)
-{
-    pv_override = enabled < 0 ? -1 : !!enabled;
 }
 
 void boot_options_set_stage1(bool stage1)

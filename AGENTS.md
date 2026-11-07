@@ -14,6 +14,15 @@ merge. To change the policy, edit .github/aurora/AGENTS.md.
 - Only public code goes in. Never copy code from proprietary sources.
 - Changes are tested on the hardware they affect before they are merged.
 
-## To be expanded
+## Testing and collaboration
 
-Build, test and review conventions for this repository will go here.
+- Use the Context Mode plugin whenever it can reduce low-signal output.
+- Fan independent work out to isolated agents and preserve unrelated worktrees.
+- Never write unit tests after you write code.
+- Highly prefer E2E tests as the sole testing mechanism. Use them to verify
+  complex features work. At the end of E2E tests, produce a verifiable and
+  repeatable artifact.
+- If you must test a system in isolation, first write down all the ways it
+  could fail, then write the code.
+- Delete low-signal unit tests that would not catch a real bug missed by E2E
+  tests. Preserve tests that provide distinct failure coverage.

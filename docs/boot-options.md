@@ -23,19 +23,14 @@ The boot-argument tokens are matched exactly:
 The options may be combined. `aura-debug` alone does not request a proxy pause.
 Normal payload failure still follows the existing recovery fallback.
 
-## Resident KVM mode (development)
+The `tso=` payload setting controls the Mach-O handoff's TSO setup.
 
-`aura-pv` selects the physical-EL1 PV-KVM prototype. The current PV ABI is a
-bounded discovery/RUN prototype with an optional
-EL1-step context probe, not a complete `/dev/kvm` backend; Linux integration
-and guest state switching remain required before enabling it on a production
-boot. RUN refuses success unless both callee-saved sentinels survive the HVC
-round trip.
-An ESP `chosen.aura,pv=1` or `chosen.aura,pv=0` configuration line selects the
-PV policy for the next reboot. It does not change a running kernel.
+## CTXR execute window
 
-The `tso=` payload setting is independent of PV-KVM. It controls the Mach-O
-handoff's TSO setup and does not imply PV-KVM.
+There is no option for this. On a machine whose secondaries are confined, aura
+runs the OS inside the armed window and emits `/chosen/aurora,ctxr-exec-window`.
+With no usable window it does not start the OS. Elsewhere nothing changes.
+[The boot object notes](macho-boot-object.md#running-the-os) say what it needs.
 
 ## DebugUSB interception (development builds)
 

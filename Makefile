@@ -115,14 +115,6 @@ ifeq ($(DEBUGUSB_PROXY),1)
 CFG += DEBUGUSB_PROXY
 endif
 
-# Development builds only: log the first FEAT_NV2 guest entries and exits.
-ifeq ($(NV2_TRACE),1)
-CFG += NV2_TRACE
-endif
-ifeq ($(NV2_TRACE_PRINT),1)
-CFG += NV2_TRACE_PRINT
-endif
-
 # Development builds only: run macOS's stock SPTM, secure kernel and XNU as a FEAT_NV2
 # guest on T8140 (docs/sptm-nv2-virt.md). The image must stay at stage 1's base.
 ifeq ($(SPTM_VIRT),1)
@@ -130,6 +122,13 @@ ifneq ($(CHAINLOADING),1)
 $(error SPTM_VIRT requires CHAINLOADING=1)
 endif
 CFG += SPTM_VIRT
+# Log the first FEAT_NV2 guest entries and exits.
+ifeq ($(NV2_TRACE),1)
+CFG += NV2_TRACE
+endif
+ifeq ($(NV2_TRACE_PRINT),1)
+CFG += NV2_TRACE_PRINT
+endif
 endif
 
 
@@ -230,9 +229,7 @@ OBJECTS := \
 	stage1_proxy.o \
 	sio.o \
 	smc.o \
-	monitor.o \
-	pv_kvm.o \
-	psci.o \
+	ctxr_exec.o \
 	smp.o \
 	spmi.o pmu_counter.o ace3.o \
 	start.o \

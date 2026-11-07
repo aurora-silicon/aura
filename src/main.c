@@ -20,13 +20,11 @@
 #include "j873.h"
 #include "mcc.h"
 #include "memory.h"
-#include "monitor.h"
 #include "nvme.h"
 #include "payload.h"
 #include "pcie.h"
 #include "pmgr.h"
 #include "pmu_counter.h"
-#include "pv_kvm.h"
 #include "sep.h"
 #include "smp.h"
 #include "stage1_config.h"
@@ -420,22 +418,7 @@ next_stage:
 #ifdef USE_FB
     fb_shutdown(next_stage.restore_logo);
 #endif
-    if (next_stage.monitor) {
-        monitor_active = true;
-        dc_cvac_range(&monitor_active, sizeof(monitor_active));
-        pv_kvm_prepare();
-        dc_cvac_range(&pv_kvm_active, sizeof(pv_kvm_active));
-        sysop("dsb sy");
-    }
-    if (pv_kvm_active) {
-        /* PV retains the EL2 translation regime for monitor calls: keep it on, and let the
-         * secondaries enable theirs from these tables. */
-        printf("Resident monitor: keeping the EL2 MMU on; cleaning caches\n");
-        mmu_publish_secondary();
-        dcsw_op_all(DCSW_OP_DCCISW);
-    } else {
-        mmu_shutdown();
-    }
+    mmu_shutdown();
 #endif
 
     /* Give the next stage of a trial boot the whole watchdog period. */
@@ -446,9 +429,6 @@ next_stage:
     stage1_log_flush();
 #endif
 
-    if (next_stage.monitor)
-        monitor_enter_os((u64)next_stage.entry, next_stage.args[0], next_stage.args[1],
-                         next_stage.args[2]);
     next_stage.entry(next_stage.args[0], next_stage.args[1], next_stage.args[2], next_stage.args[3],
                      next_stage.args[4]);
 

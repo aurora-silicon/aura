@@ -1,7 +1,5 @@
 /* SPDX-License-Identifier: MIT */
 
-#include "../build/build_cfg.h"
-
 #include "exception.h"
 #include "memory.h"
 
@@ -16,62 +14,12 @@
 .type _v_sp0_sync, @function
 _v_sp0_sync:
     msr pan, #0
-_v_sync_body:
     sub sp, sp, #(SIZEOF_EXC_INFO - 32 * 8)
     str x30, [sp, #-16]!
     bl _exc_entry
     bl exc_sync
 
     b _exc_return
-
-/*
- * Synchronous exceptions from a lower EL. In SPTM_VIRT builds, at EL2 this is
- * where a FEAT_NV2 guest's ERET traps (EC 0x1a): its returns to its own
- * userspace (EL0t with
- * vHCR.{E2H,TGE}) and to itself (EL2t/EL2h, run as EL1t/EL1h) are
- * register-only and complete here, and anything else (a nested guest entry)
- * takes the full path. Aura itself can run at EL1 (as a hypervisor guest, or
- * below EL3), where the _EL2 registers are UNDEFINED, so look at CurrentEL
- * first. Exceptions taken at the current EL never come through here.
- */
-.globl _v_lower_sync
-.type _v_lower_sync, @function
-_v_lower_sync:
-    msr pan, #0
-#ifdef SPTM_VIRT
-    stp x0, x1, [sp, #-16]!
-    mrs x0, CurrentEL
-    cmp x0, #(2 << 2)
-    b.ne 9f
-    mrs x0, esr_el2
-    mov x1, #0x6a000000             // plain ERET; ERETAx need the slow path
-    cmp x0, x1
-    b.ne 9f
-    /* An ERET traps only at EL1 with HCR_EL2.NV, which aura sets only
-     * together with NV2: no need to look at HCR_EL2 or SPSR_EL2. */
-    mrs x0, S3_5_C4_C0_0            // SPSR_EL12: the guest's requested PSTATE
-    tst x0, #0x10                   // AArch32 target: slow path
-    b.ne 9f
-    and x1, x0, #0xf
-    cbz x1, 2f                      // EL0t
-    cmp x1, #8                      // EL2t/EL2h: local return
-    b.lo 9f
-    cmp x1, #9
-    b.hi 9f
-    sub x0, x0, #4
-    b 3f
-2:  mrs x1, S3_4_C2_C2_0            // VNCR_EL2
-    ldr x1, [x1, #0x78]             // the guest's HCR_EL2
-    tbz x1, #27, 9f                 // TGE: its own userspace
-    tbz x1, #34, 9f                 // E2H
-3:  msr spsr_el2, x0
-    mrs x0, S3_5_C4_C0_1            // ELR_EL12
-    msr elr_el2, x0
-    ldp x0, x1, [sp], #16
-    eret
-9:  ldp x0, x1, [sp], #16
-#endif
-    b _v_sync_body
 
 .globl _v_sp0_irq
 .type _v_sp0_irq, @function
@@ -276,21 +224,6 @@ el1_ret:
     msr daif, x29
     ldp x29, x30, [sp], #16
     ret
-
-// monitor_eret(entry, x0, x1, x2): enter the OS at EL1h with DAIF masked.
-.globl monitor_eret
-.type monitor_eret, @function
-monitor_eret:
-    msr elr_el2, x0
-    mov x4, #0x3c5
-    msr spsr_el2, x4
-    msr sp_el1, xzr
-    mov x0, x1
-    mov x1, x2
-    mov x2, x3
-    mov x3, xzr
-    isb
-    eret
 
 .align 11
 .globl _el1_vectors_start

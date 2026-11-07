@@ -9,9 +9,6 @@
 #include "gxf.h"
 #include "iodev.h"
 #include "memory.h"
-#include "monitor.h"
-#include "psci.h"
-#include "pv_kvm.h"
 #include "sptm_virt.h"
 #include "uart.h"
 #include "utils.h"
@@ -334,26 +331,6 @@ void exc_sync(u64 *regs)
     if (ec == ESR_EC_HVC && in_el2() && !in_gl12() && elsp == SPSR_M_EL1H) {
         // Hypercall
         u32 imm = mrs(ESR_EL2) & 0xffff;
-        /* PV calls use the architected HVC #0 immediate but are identified by
-         * the versioned function ID in x0. Guest-origin calls never reach this
-         * EL1h path, and the monitor is the authority for the current world. */
-        if (imm == 0 && pv_kvm_active) {
-            if (pv_kvm_handle_hvc(regs)) {
-                msr(SPSR_EL2, spsr);
-                /* HVC already records the preferred return address after
-                 * the instruction in ELR_EL2; do not skip the caller's next
-                 * instruction by adding another four bytes. */
-                msr(ELR_EL2, elr);
-                return;
-            }
-            /* PV owns the host HVC #0 namespace. Do not let an unknown
-             * function fall through to Aura's legacy EL1-return path. */
-            regs[0] = AURA_PV_STATUS_NOSYS;
-            msr(SPSR_EL2, spsr);
-            /* Keep HVC's architected preferred return address. */
-            msr(ELR_EL2, elr);
-            return;
-        }
         switch (imm) {
             case 0:
                 // On clean EL1 return, let the normal exception return
@@ -361,8 +338,8 @@ void exc_sync(u64 *regs)
                 msr(SPSR_EL2, 0x09); // EL2h
                 msr(ELR_EL2, el1_ret);
                 return;
-            case 1:
 #ifdef SPTM_VIRT
+            case 1:
                 /* End of an nv2_probe_call EL1 stub, but only while a proxy
                  * probe is actually in flight: a production guest's own hvc #1
                  * must not be redirected into proxy-only code. */
@@ -371,9 +348,9 @@ void exc_sync(u64 *regs)
                     msr(ELR_EL2, nv2_probe_ret);
                     return;
                 }
-#endif
                 printf("Unknown HVC: 0x%x\n", imm);
                 break;
+#endif
             case 0x10 ... 0x1f:
                 if (!(exc_guard & GUARD_SILENT))
                     printf("EL1 Exception: 0x%x\n", imm);
@@ -398,13 +375,6 @@ void exc_sync(u64 *regs)
                 printf("Unknown SMC: 0x%x\n", imm);
                 break;
         }
-    } else if (monitor_active && ec == ESR_EC_SMC && in_el2() && !in_gl && elsp == SPSR_M_EL1H) {
-        /* An EL1 OS SMC trapped by HCR_EL2.TSC: a PSCI/SMCCC call. */
-        if (psci_handle_smc(regs)) {
-            elr += 4;
-            msr(ELR_EL1, elr);
-            return;
-        }
     } else {
         if (!(exc_guard & GUARD_SILENT))
             printf("Exception: SYNC\n");
@@ -416,19 +386,6 @@ void exc_sync(u64 *regs)
 #ifdef SPTM_VIRT
     if (nv2_active)
         nv2_note_unhandled(esr, elr, spsr);
-
-    /*
-     * Under the monitor, a synchronous trap from the OS (a lower EL) that the
-     * monitor does not itself service is the OS's own to handle: reflect it as
-     * an UNDEF into the OS instead of taking down the whole machine. The
-     * monitor's own EL2 faults and active proxy guards still fall through to
-     * the recovery logic below.
-     */
-    if (monitor_active && !in_gl && !el3 && !(spsr & 0x8) &&
-        (exc_guard & GUARD_TYPE_MASK) == GUARD_OFF) {
-        nv2_reflect_undef(elr, spsr);
-        return;
-    }
 #endif
 
     if (!(exc_guard & GUARD_SILENT))
