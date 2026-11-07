@@ -25,7 +25,12 @@ TXM and the static trust cache are the J700's files; the kernel is `kernelcache.
 `sptm.t8132.release` is the T8140 build with `init_pre_late_io_reservation` 0xc4 later, so the
 host shifts only the four AMCC patches. The debug port is hpm0 behind `usb-drd0`/`dart-usb0`/
 `atc-phy0`, which also carries Thunderbolt (`acio0`, `apciec0`), and all of it is hidden from
-XNU. The sleep path (`sptm_virt_s2r.c`) stays T8140-only: its S2R flags are ignored on T8132.
+XNU. The sleep trace knows T8132's blocks (`s2r_socs` in `sptm_virt_s2r.c`): T8140's at the same
+offsets from a SoC base 0x80000000 higher, under other PMGR reg indices. Stop mode records the whole
+entry to the commit (`0x3882d4000 <- 1`). It is T8140's sequence moved up, without the CLLT writes.
+`AppleT8132PMGR::_quiesceAxi2afWorkaround` panics if PS `0x380700378` is on at quiesce. That is the
+hidden debug port's parent, which stays on because nothing powers its devices down, so once the
+first core has disabled itself, reads of it report it off. Go mode is untested on T8132.
 
 The code:
 
