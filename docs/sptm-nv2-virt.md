@@ -39,6 +39,9 @@ writes on the boot core in 22 ms, the same shape as T8140's: both clusters on (`
 lowered, then WD2 stopped (`0x3882b002c <- 0`). Over KIS the wake record is printed 2 s after the
 wake, paced by the DockChannel's free space. Printed at the watchdog stop, or in one burst, it
 overruns the link.
+The sleep record follows it: from 512 records before the first core's self-disable to the wake.
+On T8132 the commit is followed 3 ms later by four SPMI commands to the PMU (`nub-spmi0`, slave 0xe):
+read 0x2000, a 4-byte write at 0x2008, `0x200e <- 0`, and `0x2000 <- 0x41`, T8132's "go hib".
 
 The code:
 

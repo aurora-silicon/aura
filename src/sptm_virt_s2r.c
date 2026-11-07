@@ -170,6 +170,8 @@ static bool s2r_go, s2r_fulltrace, s2r_coproc, s2r_drop_usb;
 static u64 s2r_arm_at;
 /* Cores with their last WFI trapped (stop mode), parked there, and the core that committed. */
 static volatile u32 s2r_twi_mask, s2r_parked_mask;
+/* Go mode: the ring position where the first core opened the sleep window (0: none yet). */
+static volatile u64 s2r_sleep_head;
 static volatile int s2r_timer_cpu = -1;
 /* Go mode, from the first core's self-disable until the wake: aura prints nothing. Printing in
  * that window delays the boot core's last steps past macOS's 5 s reconfig watchdog. */
@@ -428,6 +430,8 @@ static void s2r_core_sleeps(void)
         return;
     }
     if (first) {
+        s2r_sleep_head = sptm_virt_s2r_head;
+        s2r_clean(&s2r_sleep_head, sizeof(s2r_sleep_head));
         printf("SPTM-virt[s2r]: cpu%d opens the sleep window: aura silent until the wake\n", cpu);
         s2r_console_to_aon();
         iodev_console_flush();
@@ -876,6 +880,10 @@ void sptm_virt_s2r_xnu_entry(int cpu, u64 target)
  */
 static u64 s2r_wakerec_rp, s2r_wakerec_end;
 static u64 s2r_wakerec_wdstop;
+/* After the wake record, the sleep record: from before the first self-disable to the wake. */
+#define S2R_SLEEPREC_BEFORE 512UL
+#define S2R_SLEEPREC_MAX    8192UL
+static u64 s2r_sleeprec_from, s2r_sleeprec_to;
 
 void sptm_virt_s2r_wd_stopped(void)
 {
@@ -905,13 +913,22 @@ static void s2r_wakerec_fallback(void)
     s2r_wakerec_printed = true;
     s2r_wakerec_rp = s2r_wake_head;
     s2r_wakerec_end = min(sptm_virt_s2r_head, s2r_wake_head + S2R_WAKEREC_MAX);
-    printf("SPTM-virt[s2r]: wake record: records %lu..%lu, watchdog stop at %lu\n", s2r_wakerec_rp,
-           s2r_wakerec_end, s2r_wakerec_wdstop);
+    if (s2r_sleep_head && s2r_sleep_head < s2r_wake_head) {
+        s2r_sleeprec_to = s2r_wake_head;
+        s2r_sleeprec_from =
+            s2r_sleep_head > S2R_SLEEPREC_BEFORE ? s2r_sleep_head - S2R_SLEEPREC_BEFORE : 0;
+        if (s2r_sleeprec_to - s2r_sleeprec_from > S2R_SLEEPREC_MAX)
+            s2r_sleeprec_to = s2r_sleeprec_from + S2R_SLEEPREC_MAX;
+    }
+    printf("SPTM-virt[s2r]: wake record: records %lu..%lu, watchdog stop at %lu; sleep record "
+           "%lu..%lu, sleep window opened at %lu\n",
+           s2r_wakerec_rp, s2r_wakerec_end, s2r_wakerec_wdstop, s2r_sleeprec_from, s2r_sleeprec_to,
+           (u64)s2r_sleep_head);
 }
 
 static void s2r_wakerec_pump(void)
 {
-    static bool started;
+    static int started;
 
     if (!s2r_wakerec_end || s2r_wakerec_rp >= s2r_wakerec_end)
         return;
@@ -925,7 +942,7 @@ static void s2r_wakerec_pump(void)
         return;
     }
     if (!started) {
-        started = true;
+        started = 1;
         printf("S2R-WAKEREC start: %lu records\n", s2r_wakerec_end - s2r_wakerec_rp);
     }
     for (int k = 0; k < 8 && s2r_wakerec_rp < s2r_wakerec_end; k++, s2r_wakerec_rp++) {
@@ -934,8 +951,19 @@ static void s2r_wakerec_pump(void)
         if (!(sptm_virt_s2r_ring[s2r_wakerec_rp % sptm_virt_s2r_nrec].meta & S2R_MARKER))
             s2r_print_rec(s2r_wakerec_rp);
     }
-    if (s2r_wakerec_rp >= s2r_wakerec_end)
-        printf("S2R-WAKEREC end\n");
+    if (s2r_wakerec_rp < s2r_wakerec_end)
+        return;
+    if (!s2r_sleeprec_to) {
+        printf(started == 2 ? "S2R-SLEEPREC end\n" : "S2R-WAKEREC end\n");
+        return;
+    }
+    /* The wake record is out: the sleep record follows through the same pump. */
+    printf("S2R-WAKEREC end\n");
+    printf("S2R-SLEEPREC start: %lu records\n", s2r_sleeprec_to - s2r_sleeprec_from);
+    started = 2;
+    s2r_wakerec_rp = s2r_sleeprec_from;
+    s2r_wakerec_end = s2r_sleeprec_to;
+    s2r_sleeprec_to = 0;
 }
 
 /* With the coprocessor mailboxes hooked, after the wake record: every mailbox access from before
