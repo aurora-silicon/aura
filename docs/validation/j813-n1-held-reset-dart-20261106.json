@@ -1,0 +1,51 @@
+{
+  "schema": 1,
+  "result": "PHY-root-prefix-completed-DART-read-still-faults",
+  "target": "J813 / T8142 / board0x24",
+  "boot_state": "fresh RAM Aura; no guest; endpoint held in reset throughout",
+  "resident_source_commit": "8758b16598b4413d511512bfc150b7eb0fd2128a",
+  "reference_public_commit": "98599af29c644e89ab7f844ce94633cd451fd63a",
+  "public_prefix_source_sha256": "79f2346e2bd92152b89f2b0d7df65f532c5bb707d50f84afc875fdbeab53662c",
+  "diagnostic_source_sha256": "13e50c580fa28ee6807806934786a4b2f5d73ed4c4a12f89dfeb74c6814a180a",
+  "selected_parent_first_gates": [
+    74,
+    109,
+    110,
+    144,
+    152,
+    155,
+    156
+  ],
+  "gate_write_count": 7,
+  "PHY_root_prefix_write_count": 250,
+  "protected_words": {
+    "ANS": 251666687,
+    "SYS_GP_OCLA": 768,
+    "SYS_ST_OCLA": 768,
+    "GPIO192_PERST": 461314
+  },
+  "protected_words_unchanged": true,
+  "prefix_complete": true,
+  "exception_count_immediately_before_DART": 0,
+  "final_read_address": "0x488000000",
+  "final_read_returned": false,
+  "console_FAR": "0x488000000",
+  "console_ESR": "0xbe000000",
+  "console_exception": "SError",
+  "deadline_seconds": 45,
+  "no_proxy_requests_after_final_read": true,
+  "PERST_GPIO_writes": 0,
+  "SMC_writes": 0,
+  "DART_writes": 0,
+  "ECAM_writes": 0,
+  "guest_prepared": false,
+  "recovery": "Fresh external reset, Aura chainload, CDC1MiB roundtrip and zero-exception guard passed; Windows recovery boot started separately.",
+  "console_sha256": "3dc81bed448430660202f8a55c182578d1babc41b9ef48ac24974eaad9f7fcb7",
+  "events_sha256": "1f89849f4fa6e0480a1c27574892ac6b3bc402240f845852e11af758f57690e4",
+  "diagnostic_receipt_sha256": "0b67b229c18367f5cbfbecc05512193a6ca175719a6d9040827e1ead5bf9f4c5",
+  "limits": [
+    "Clock normalization and the held-reset PHY/root prefix alone do not make the first DART register accessible.",
+    "This does not identify which remaining reset or power dependency is missing.",
+    "No DART ownership, DMA quiescence, N1 Control firmware boot, Wi-Fi scan or network connectivity is established."
+  ]
+}

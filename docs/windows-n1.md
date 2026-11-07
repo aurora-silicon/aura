@@ -23,16 +23,27 @@ required to be off. Every observed state is logged; an active or unknown gate
 rejects preparation before GPIO or power changes.
 
 After admission, GPIO PERST is asserted and read back. The producer executes
-the public Linux PHY/PLL/pclk/AXI and root-controller prefix, leaving N1 in
-reset and avoiding port and ECAM accesses. Only then does it read the DART,
-logging the address before each read and completion afterward. SID0 must be
-disabled, unprotected and without a page-table root; translation geometry and
-idle command state must also match. Linux does not itself read DART, so DART
-accessibility at this boundary still requires physical qualification.
+the public Linux PHY/PLL/pclk/AXI and root-controller prefix, then completes the
+unchanged SMC reset, port/refclk/PERST and root DBI sequence. It requires link
+establishment and verifies every present endpoint's identity and bus-master bit
+before the first DART access. No endpoint bus-master enable or firmware load is
+added. Active or unknown ownership is rejected by cold-gate admission before
+this reset sequence.
 
-The finish phase preserves Linux's SMC reset, port/refclk/PERST and root DBI
-sequence. After link establishment, every present endpoint must have bus
-mastering disabled. Control BAR0 is assigned and read back, ROM must be at cold
+The [physical held-reset prefix probe](validation/j813-n1-held-reset-dart-20261106.json)
+completed, but its first DART read at
+`0x488000000` stalled with SError. Thus neither PMGR activation nor PHY/root
+setup alone proves DART accessibility. The public Linux
+[J813 N1 device tree](https://github.com/aurora-silicon/linux/blob/3a0da31bcc027d4b0a28b0501e649522c7a232f6/arch/arm64/boot/dts/apple/t8142-j813-n1.dtsi)
+requires loader-trained PCIe before Linux takes over the ordinary T8110 DART.
+The revised ordering follows that boundary; hardware qualification of this
+candidate remains pending.
+
+Both clean-DART checks remain: before and after Control BAR assignment. Each
+address is logged before its guarded read and on completion. SID0 must be
+disabled, unprotected and without a page-table root; translation geometry and
+idle command state must match. An active or busy DART is rejected, never cleared.
+Every present endpoint must still have bus mastering disabled. Control BAR0 is assigned and read back, ROM must be at cold
 stage 0, and DART/endpoint state is rechecked before producing the record.
 The ordinary Linux entry still runs the same complete ordered sequence.
 
@@ -110,7 +121,8 @@ producer, its dependencies and the existing failure-first model into a source
 snapshot, compiles that snapshot with ASan/UBSan, and runs the producer/census scenarios in
 separate processes. The tests exercise the complete preparation entry point
 against modelled ADT, MMIO and endpoint behavior. They cover successful handoff,
-identity/resource/reset-function rejection, locked/active/busy DART, cold owner rejection and newly enabled bus mastering, training failure, wrong endpoint identity, BAR
+identity/resource/reset-function rejection, locked/active/busy DART, cold owner rejection and bus mastering on any of the three functions, first-DART faults,
+translation state changed at BAR assignment, training failure, wrong endpoint identity, BAR
 probe/readback faults, active ROM, and failed cleanup quarantine.
 The reset-provider fixture retains only paths, compatible strings, phandles and
 the reset tuple from a captured J813 ADT. It reproduces the controller-versus-PMU

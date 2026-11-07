@@ -14,7 +14,8 @@ ROOT = Path(__file__).resolve().parents[1]
 CASES = (
     "success", "tunables", "cold-name", "cold-parent", "cold-alias", "cold-unknown", "cold-reset", "cold-auto", "cold-target", "cold-active", "cold-clkgate", "fabric", "finish-early", "power-enable", "power-inactive", "power-unknown",
     "chip", "board", "model", "resource", "perst", "locked", "dart",
-    "busy", "pre-bme", "train", "post-bme", "identity", "bar-mask", "bar-high",
+    "busy", "pre-bme", "train", "post-bme", "secondary-bme", "tertiary-bme",
+    "dart-load-fault", "post-dart-active", "identity", "bar-mask", "bar-high",
     "bar-drop", "rom", "clamp-fail",
     "smc-nub-missing", "smc-pmu-missing", "smc-pmu-outside",
     "smc-controller-compatible", "smc-nub-compatible", "smc-pmu-compatible",
