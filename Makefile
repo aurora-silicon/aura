@@ -318,7 +318,7 @@ $(BUILD_FP_OBJS): build/%.o: src/%.c
 # leaves room in .init for more of the guest-only objects.
 build/sptm_virt_cl4.o: CFLAGS += -Oz
 # Run-once OS handoff code: -Oz keeps .text within its 64 KiB steps (see _file_limit).
-build/kboot.o build/kboot_t8132.o: CFLAGS += -Oz
+build/kboot.o build/kboot_atc.o build/kboot_t8132.o: CFLAGS += -Oz
 
 build/%.o: src/%.c build-tag build-cfg
 	$(QUIET)echo "  CC    $@"
