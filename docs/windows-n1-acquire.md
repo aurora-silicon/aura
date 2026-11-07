@@ -96,9 +96,9 @@ ordinary Aura builds remain required. These artifacts do not prove hardware
 reset/drain, Windows driver installation, DMA, interrupts or working Wi-Fi.
 
 Capability allocation is coordinated with public PR93 (`8758b165`), PR94
-(`1bd3e172`) and PR95 (`defe0f37`): `0x0800` remains CPUFREQ_OWNERSHIP and is
-not advertised by this standalone branch. N1 acquisition reserves `0x1000`;
-its resident capability word is `0x4157494e000117ff`. Those branches allocate
-no `0xc84` opcode. CPU-only capability 0x0800 cannot authorize acquisition.
-CPU/G17 integration and hardware qualification require a separate combined
-source revision; this standalone build does not silently include those paths.
+(`1bd3e172`) and PR95 (`defe0f37`): `0x0800` remains CPUFREQ_OWNERSHIP, and N1
+acquisition reserves `0x1000`. Those branches allocate no `0xc84` opcode.
+CPU-only capability `0x0800` cannot authorize N1 acquisition. Standalone N1
+revision `8b5264f2` advertised `0x4157494e000117ff`; the combined CPU/N1 tree
+advertises `0x4157494e00011fff`. See [CPU/N1 integration](windows-cpu-n1-integration.md)
+for the combined profile and its separate qualification boundaries.

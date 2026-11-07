@@ -19,7 +19,7 @@ import sys
 from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from construct import Array, Container, Int64ul
+from construct import Array, Container, Int32ul, Int64ul
 from aura.adt import ADTNode, load_adt
 from aura.hv import HV
 from aura.proxy import AuraProxy, EXC, EXC_RET, IODEV, ProxyCommandError, START
@@ -27,7 +27,7 @@ from aura.tgtypes import BootArgs_r2, BootArgs_r3
 from aura.windows import (CAPS_MAGIC, CONFIGURATION, FRAMEBUFFER_SHADOW, REQUIRED_CAPS,
                           HardwareSession, N1_HANDOFF, N1_ACQUIRE, N1_PROPERTY, N1_RESOURCES,
                           MEMORY_PREFLIGHT, SERIAL_CAPTURE, MTP_HANDOFF, MTP_DISABLED_PROPERTY,
-                          MTP_RESERVED_BASE, MTP_RESERVED_SIZE,
+                          MTP_RESERVED_BASE, MTP_RESERVED_SIZE, CPUFREQ_OWNERSHIP, CPUFREQ_PROPERTY,
                           memory_reservation_preflight, prepare_n1_handoff, source_manifest)
 
 
@@ -249,7 +249,18 @@ def reservation_prepare_flow(case):
 
 def lifecycle(case, output):
     adt, blob, args = fixture()
-    if case.startswith("mtp-"):
+    combined = case.startswith("combined-")
+    if combined:
+        adt["/chosen"].board_id = 0x24
+        ladders = ((972000,1152000,1584000,1992000,2352000,2700000,2964000,3048000),
+                   (1308000,1608000,1932000,2220000,2508000,2820000,3072000,3300000,3516000,3720000,3876000,4020000,4176000,4248000,4272000,4332000,4428000,4416000,4464000))
+        for name, ladder in zip(("voltage-states1-sram", "voltage-states5-sram"), ladders):
+            words = [word for khz in ladder for word in (khz, 900)]
+            if case == "combined-cpu-opp-failure": words[0] += 1
+            adt["/arm-io/pmgr"]._properties[name] = words
+            adt["/arm-io/pmgr"]._types[name] = (Array(len(words), Int32ul), False)
+        blob = adt.build()
+    if case.startswith("mtp-") or combined:
         args.phys_base = 0x10000000000
         args.mem_size = args.mem_size_actual = 0x400000000
     if case == "adt-overflow-init":
@@ -264,7 +275,7 @@ def lifecycle(case, output):
             trace.append("caps")
             serial_cap = 0 if case == "serial-missing-capability" else SERIAL_CAPTURE
             mtp_cap = 0 if case == "mtp-missing-capability" else MTP_HANDOFF
-            return CAPS_MAGIC | 1 << 16 | REQUIRED_CAPS | CONFIGURATION | FRAMEBUFFER_SHADOW | N1_HANDOFF | N1_ACQUIRE | MEMORY_PREFLIGHT | serial_cap | 0x200 | mtp_cap
+            return CAPS_MAGIC | 1 << 16 | REQUIRED_CAPS | CONFIGURATION | FRAMEBUFFER_SHADOW | N1_HANDOFF | N1_ACQUIRE | CPUFREQ_OWNERSHIP | MEMORY_PREFLIGHT | serial_cap | 0x200 | mtp_cap
         def hv_windows_configure(self, flags):
             trace.append(["config", flags])
             return -1 if case in ("config-rejected", "serial-carrier-rejected") else 0
@@ -272,7 +283,7 @@ def lifecycle(case, output):
         def iodev_set_usage(self, *args): trace.append("iodev")
         def hv_init(self):
             trace.append("hv_init")
-            if case.startswith("mtp-"):
+            if case.startswith("mtp-") or combined:
                 assert hv.iface.dev.timeout == 12
                 assert raw_property(hv.adt["/chosen"], MTP_DISABLED_PROPERTY) == b"\x01\x00\x00\x00"
             if case == "mtp-producer-transport-error": raise OSError("injected MTP producer transport error")
@@ -289,7 +300,7 @@ def lifecycle(case, output):
         def hv_windows_acquire_n1(self, address, size):
             assert "hv_init" in trace and size == 128
             trace.append("n1-acquire")
-            if case == "n1-acquire-failure": return -1
+            if case in ("n1-acquire-failure", "combined-n1-failure"): return -1
             value = bytearray(n1_descriptor)
             if case == "n1-bad-header": value[8] ^= 1
             if case == "n1-bad-resource": value[32] ^= 1
@@ -336,8 +347,10 @@ def lifecycle(case, output):
                           if p["name"] == "aura,windows-usb-disabled")
             assert marker["value"] == b"\x01\x00\x00\x00"
             assert raw_property(guest_adt["/chosen"], MTP_DISABLED_PROPERTY) == (
-                b"\x00\x00\x00\x00" if case == "mtp-success" else b"\x01\x00\x00\x00")
-            if case in ("n1-success", "n1-acquire-success"):
+                b"\x00\x00\x00\x00" if case in ("mtp-success", "combined-success") else b"\x01\x00\x00\x00")
+            if combined:
+                assert raw_property(guest_adt["/chosen"], CPUFREQ_PROPERTY) == b"\x01\x00\x00\x00"
+            if case in ("n1-success", "n1-acquire-success", "combined-success"):
                 assert guest_adt["/chosen"].getprop(N1_PROPERTY) == n1_descriptor
             else:
                 assert N1_PROPERTY not in guest_adt["/chosen"]._properties
@@ -356,15 +369,15 @@ def lifecycle(case, output):
         def __init__(self):
             self.adt, self.ba = adt, args
             self.heap_top = 0x820004000
-            if case.startswith("mtp-"): self.heap_top = 0x10010004000
+            if case.startswith("mtp-") or combined: self.heap_top = 0x10010004000
             self.cpu_features = SimpleNamespace(apple_sysregs_unlocked=False)
             if case == "out-of-ram": self.ba.mem_size = 0x10000
         def get_adt(self): return blob
         def memalign(self, alignment, size):
             assert alignment == 16 and size == 128
-            return 0x820001000
+            return 0x10010001000 if combined else 0x820001000
         def free(self, address):
-            assert address == 0x820001000
+            assert address == (0x10010001000 if combined else 0x820001000)
             trace.append("n1-free")
         def compressed_writemem(self, address, data, *args):
             if case == "chunked-upload": assert len(data) <= 16 * 1024 * 1024
@@ -386,7 +399,11 @@ def lifecycle(case, output):
         hv.windows_serial = "capture"
         hv.windows_serial_recorder = serial_recorder
     if case.startswith("n1-"): hv.windows_n1 = "j813-acquire-v1" if case.startswith("n1-acquire-") else "j813-v1"
-    if case.startswith("mtp-"): hv.windows_mtp = "j813-v1"
+    if case.startswith("mtp-") or combined: hv.windows_mtp = "j813-v1"
+    if combined:
+        hv.windows_n1 = "j813-acquire-v1"
+        hv.windows_cpufreq = "j813-manual-v1"
+        hv.windows_serial = "cdc"
     if case == "watchdog-failure": hv.wdt_cpu = 1
     payload = bytes(range(256)) * 32
     if case == "chunked-upload": payload = bytes(range(256)) * ((16 * 1024 * 1024 + 8192) // 256)
@@ -398,7 +415,7 @@ def lifecycle(case, output):
             plan, args, adt, hv.u.heap_top - 0x10000000, 0x800000000,
             0x800008000, BootArgs_r2.sizeof(), 0x800100000)
         if case == "reservation-layout-drift": hv.u.heap_top += 0x4000
-    if case.startswith("mtp-") and case != "mtp-missing-reservation":
+    if (case.startswith("mtp-") or combined) and case != "mtp-missing-reservation":
         plan = SimpleNamespace(image=payload, reserved_memory=(
             {"name": "aura-mtp-handoff", "base": MTP_RESERVED_BASE, "size": MTP_RESERVED_SIZE},))
         hv.windows_memory_guard = memory_reservation_preflight(
@@ -414,12 +431,22 @@ def lifecycle(case, output):
         if case == "adt-overflow-start": hv.adt.overflow = "x" * 0x20000
         start_trace_index = len(trace)
         hv.start()
-        assert case in ("success", "n1-success", "n1-acquire-success", "chunked-upload", "reservation-success", "serial-success", "cdc-success", "mtp-success")
-        config = 19 if case == "mtp-success" else 11 if case == "cdc-success" else 7 if case.startswith("serial-") else 3
+        assert case in ("success", "n1-success", "n1-acquire-success", "combined-success", "chunked-upload", "reservation-success", "serial-success", "cdc-success", "mtp-success")
+        config = 59 if combined else 19 if case == "mtp-success" else 11 if case == "cdc-success" else 7 if case.startswith("serial-") else 3
         assert trace.index(["config", config]) < trace.index("hv_init") < trace.index("upload-image") < trace.index("start")
         if case == "serial-success": assert trace.index("serial-handler") < trace.index("start")
     except (RuntimeError, ValueError, OSError):
-        assert case not in ("success", "n1-success", "n1-acquire-success", "chunked-upload", "reservation-success", "serial-success", "cdc-success", "mtp-success")
+        if combined:
+            assert "upload-image" not in trace and "start" not in trace
+            if case == "combined-n1-failure":
+                assert trace.count("n1-acquire") == 1 and "n1-prepare" not in trace
+                assert hv.windows_cpufreq == "j813-manual-v1" and hv.windows_mtp_ready
+                hv.windows_n1 = "disabled"
+                try: hv.load_raw(payload, 0x800)
+                except RuntimeError: pass
+                else: raise AssertionError("combined failure bypassed N1 admission")
+            if case == "combined-cpu-opp-failure": assert "hv_init" not in trace and "n1-acquire" not in trace
+        assert case not in ("success", "n1-success", "n1-acquire-success", "combined-success", "chunked-upload", "reservation-success", "serial-success", "cdc-success", "mtp-success")
         if case.startswith("mtp-"):
             assert "upload-image" not in trace and "start" not in trace
             assert not hv.windows_mtp_ready
@@ -479,7 +506,7 @@ def main():
         cases = [wire_namespace(), identity_translation("identity-modular-wrap"),
                  identity_translation("identity-outside-ram"),
                  identity_translation("identity-j813-recorded-addresses")] + [lifecycle(case, output) for case in (
-            "success", "cdc-success", "serial-success", "serial-missing-capability", "serial-carrier-rejected",
+            "combined-success", "combined-n1-failure", "combined-cpu-opp-failure", "success", "cdc-success", "serial-success", "serial-missing-capability", "serial-carrier-rejected",
             "chunked-upload", "config-rejected", "out-of-ram", "adt-overflow-init", "adt-overflow-start",
             "watchdog-failure", "forwarded-exception", "forwarded-panic", "transport-error",
             "n1-acquire-success", "n1-acquire-failure", "n1-success", "n1-producer-failure", "n1-bad-header", "n1-bad-resource", "n1-read-failure",
