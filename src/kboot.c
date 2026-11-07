@@ -10,6 +10,7 @@
 #include "assert.h"
 #include "boot_options.h"
 #include "clk.h"
+#include "ctxr_exec.h"
 #include "dapf.h"
 #include "devicetree.h"
 #include "display.h"
@@ -29,11 +30,8 @@
 #include "malloc.h"
 #include "mcc.h"
 #include "memory.h"
-#include "monitor.h"
-#include "nv2.h"
 #include "pcie.h"
 #include "pmgr.h"
-#include "pv_kvm.h"
 #include "rtkit.h"
 #include "sart.h"
 #include "sep.h"
@@ -628,6 +626,133 @@ static int dt_set_stdout_path(int chosen)
     return 0;
 }
 
+/*
+ * Publish the physical window the OS runs in at EL2. With CONFIG_ARM64_CTXR_EXECMEM
+ * the kernel confines all of its executable code (static text, modules, BPF,
+ * kprobes, ftrace) to it. U-Boot relocates its image there, which holds its EFI
+ * runtime code, and loads the kernel there. A kernel that finds EFI runtime code
+ * outside the window turns runtime services off.
+ */
+static int dt_set_ctxr_exec_window(int node)
+{
+    u64 base, size;
+
+    if (!ctxr_exec_window(&base, &size))
+        return 0;
+
+    fdt64_t win[2] = {cpu_to_fdt64(base), cpu_to_fdt64(size)};
+    if (fdt_setprop(dt, node, "aurora,ctxr-exec-window", win, sizeof(win)))
+        bail("FDT: couldn't set aurora,ctxr-exec-window\n");
+
+    printf("FDT: CTXR exec window base 0x%lx size 0x%lx\n", base, size);
+    return 0;
+}
+
+static bool in_exec_window(u64 start, u64 size)
+{
+    u64 window, window_size;
+
+    return ctxr_exec_window(&window, &window_size) && start < window + window_size &&
+           start + size > window;
+}
+
+/* fdt_add_mem_rsv(), leaving out the window the OS owns. */
+static int dt_reserve_outside_exec_window(u64 start, u64 size)
+{
+    u64 window, window_size;
+
+    if (!ctxr_exec_window(&window, &window_size))
+        return fdt_add_mem_rsv(dt, start, size);
+
+    u64 end = start + size, window_end = window + window_size;
+
+    if (start < window && fdt_add_mem_rsv(dt, start, min(end, window) - start))
+        return -1;
+    if (end > window_end) {
+        u64 above = max(start, window_end);
+        if (fdt_add_mem_rsv(dt, above, end - above))
+            return -1;
+    }
+    return 0;
+}
+
+/* Windows A to C. One inside the firmware RO range (T8140) is reserved with that range. */
+static int dt_reserve_ctxr_low_windows(void)
+{
+    static const enum ctxr_range windows[] = {CTXR_RANGE_A, CTXR_RANGE_B, CTXR_RANGE_C};
+    u64 ro_start, ro_end;
+
+    if (memory_fw_ro_range(&ro_start, &ro_end) != 1)
+        ro_start = ro_end = 0;
+
+    for (size_t i = 0; i < ARRAY_SIZE(windows); i++) {
+        u64 lower, upper;
+        if (!ctxr_range(windows[i], &lower, &upper) || (lower >= ro_start && upper <= ro_end))
+            continue;
+        u64 start = ALIGN_DOWN(lower, SZ_16K);
+        u64 end = ALIGN_UP(upper, SZ_16K);
+        if (fdt_add_mem_rsv(dt, start, end - start))
+            return -1;
+        printf("FDT: reserved CTXR window [0x%lx, 0x%lx)\n", start, end);
+    }
+    return 0;
+}
+
+/*
+ * What the secondaries can't write. T8140's firmware RO range is reserved, and kept out of
+ * the linear map, at either EL. On M4 and later the secondaries also enforce CTRR_C and
+ * CTRR_D, and Linux crashes writing there from one. Where aura knows the firmware RO range,
+ * CTRR_C is that range. CTRR_D: on J813 (M5) it covers the ~1 MiB below the iBoot-loaded image.
+ */
+static int dt_reserve_secondary_ro(void)
+{
+    static const enum ctxr_range ranges[] = {CTRR_RANGE_C, CTRR_RANGE_D};
+    u64 start, end;
+    int firmware_ro = memory_fw_ro_range(&start, &end);
+
+    if (firmware_ro < 0)
+        bail("FDT: invalid firmware RO range\n");
+    if (firmware_ro) {
+        if (fdt_add_mem_rsv(dt, start, end - start))
+            bail("FDT: couldn't reserve the firmware RO range\n");
+
+        int resv = fdt_path_offset(dt, "/reserved-memory");
+        if (resv < 0)
+            bail("FDT: missing /reserved-memory for firmware RO range\n");
+        char name[48];
+        snprintf(name, sizeof(name), "aura-secondary-ro@%lx", start);
+        int node = fdt_subnode_offset(dt, resv, name);
+        if (node < 0)
+            node = fdt_add_subnode(dt, resv, name);
+        if (node < 0)
+            bail("FDT: couldn't create firmware RO node\n");
+        fdt64_t reg[] = {cpu_to_fdt64(start), cpu_to_fdt64(end - start)};
+        if (fdt_setprop(dt, node, "reg", reg, sizeof(reg)) || fdt_setprop_empty(dt, node, "no-map"))
+            bail("FDT: couldn't describe firmware RO node\n");
+        printf("FDT: reserved firmware RO [0x%lx, 0x%lx)\n", start, end);
+    }
+    if (cpu_features->apple_sysregs_unlocked)
+        return 0;
+    if (!in_el2()) {
+        /*
+         * A guest under the aura hypervisor runs at EL1. The host keeps the
+         * SMP-RO range and starts the guest's CPUs itself, so the guest
+         * leaves it out. This is how the J616s guest boots.
+         */
+        printf("FDT: running at EL1, leaving %s to the host\n",
+               firmware_ro ? "CTRR_D" : "CTRR_C and CTRR_D");
+        return 0;
+    }
+    for (size_t i = 0; i < ARRAY_SIZE(ranges); i++) {
+        if ((!i && firmware_ro) || !ctxr_range(ranges[i], &start, &end))
+            continue;
+        if (fdt_add_mem_rsv(dt, start, end - start))
+            bail("FDT: couldn't add reservation for M4+ SMP-RO CTRR_%c\n", 'C' + (int)i);
+        printf("FDT: reserved M4+ SMP-RO CTRR_%c [0x%lx, 0x%lx)\n", 'C' + (int)i, start, end);
+    }
+    return 0;
+}
+
 static int dt_set_chosen(void)
 {
 
@@ -647,6 +772,9 @@ static int dt_set_chosen(void)
     }
 
     if (dt_set_stdout_path(node))
+        return -1;
+
+    if (dt_set_ctxr_exec_window(node))
         return -1;
 
     if (chip_id == T8140 && dt_set_t8140_wfx_args(node))
@@ -1002,6 +1130,13 @@ static int dt_reserve_bootloader_handoff(void)
         if (!size || (start | size) & (SZ_16K - 1)) {
             printf("FDT: unaligned resident bootloader range on %s\n",
                    fdt_get_name(dt, node, NULL));
+            return -1;
+        }
+
+        /* Whatever lives in this range is in the way of the kernel the window has to hold. */
+        if (in_exec_window(start, size)) {
+            printf("FDT: bootloader handoff 0x%lx..0x%lx overlaps the CTXR exec window\n", start,
+                   start + size);
             return -1;
         }
 
@@ -1839,26 +1974,6 @@ static int dt_set_cpus(void)
     if (cpus < 0)
         bail("FDT: /cpus node not found in devtree\n");
 
-    /* When the monitor runs the OS at EL1 it owns the secondary pool and
-     * services PSCI over SMC; expose a /psci node and switch the cpus below
-     * from spin-table to it. Without the monitor the OS boots at EL2 and keeps
-     * spin-table. */
-    bool psci = monitor_required();
-    if (psci) {
-        int node = fdt_path_offset(dt, "/psci");
-        if (node < 0)
-            node = fdt_add_subnode(dt, 0, "psci");
-        if (node < 0 || fdt_setprop_string(dt, node, "compatible", "arm,psci-1.0") ||
-            fdt_appendprop_string(dt, node, "compatible", "arm,psci-0.2") ||
-            fdt_setprop_string(dt, node, "method", "smc") ||
-            fdt_setprop_string(dt, node, "status", "okay"))
-            bail("FDT: couldn't set up the /psci node\n");
-        /* The offset may have moved. */
-        cpus = fdt_path_offset(dt, "/cpus");
-        if (cpus < 0)
-            bail("FDT: /cpus node not found in devtree\n");
-    }
-
     uint32_t *pruned_phandles = calloc(MAX_CPUS, sizeof(uint32_t));
     size_t pruned = 0;
     u32 pruned_cooling_cells[MAX_CPUS];
@@ -1881,16 +1996,8 @@ static int dt_set_cpus(void)
 
         u64 dt_mpidr = fdt64_ld(prop);
 
-        if (dt_mpidr == (mrs(MPIDR_EL1) & 0xFFFFFF)) {
-            /* cpuidle-psci only binds when every CPU, the boot CPU included,
-             * uses PSCI. */
-            if (psci) {
-                fdt_delprop(dt, node, "cpu-release-addr");
-                if (fdt_setprop_string(dt, node, "enable-method", "psci"))
-                    bail_cleanup("FDT: couldn't set cpu enable-method to psci\n");
-            }
+        if (dt_mpidr == (mrs(MPIDR_EL1) & 0xFFFFFF))
             goto next_cpu;
-        }
 
         /*
          * DT and ADT CPU numbering can differ: J616s has no ADT cpu9, while
@@ -1925,19 +2032,12 @@ static int dt_set_cpus(void)
         }
 
         u64 mpidr = smp_get_mpidr(idx);
-        if (psci) {
-            fdt_delprop(dt, node, "cpu-release-addr");
-            if (fdt_setprop_string(dt, node, "enable-method", "psci"))
-                bail_cleanup("FDT: couldn't set cpu enable-method to psci\n");
-            printf("FDT: CPU %d MPIDR=0x%lx psci\n", cpu, mpidr);
-        } else {
-            u64 release_addr = chip_id == T8152 && fdt_getprop(dt, 0, "aurora,minimal-boot", NULL)
-                                   ? smp_get_kernel_release_addr(idx)
-                                   : smp_get_release_addr(idx);
-            if (fdt_setprop_inplace_u64(dt, node, "cpu-release-addr", release_addr))
-                bail_cleanup("FDT: couldn't set cpu-release-addr property\n");
-            printf("FDT: CPU %d MPIDR=0x%lx release-addr=0x%lx\n", cpu, mpidr, release_addr);
-        }
+        u64 release_addr = chip_id == T8152 && fdt_getprop(dt, 0, "aurora,minimal-boot", NULL)
+                               ? smp_get_kernel_release_addr(idx)
+                               : smp_get_release_addr(idx);
+        if (fdt_setprop_inplace_u64(dt, node, "cpu-release-addr", release_addr))
+            bail_cleanup("FDT: couldn't set cpu-release-addr property\n");
+        printf("FDT: CPU %d MPIDR=0x%lx release-addr=0x%lx\n", cpu, mpidr, release_addr);
 
     next_cpu:
         cpu++;
@@ -8699,6 +8799,45 @@ static int dt_prepare_t8152(void)
     return 0;
 }
 
+/*
+ * On a confined machine a secondary executes only inside the armed window, and
+ * spin-table releases it into the kernel's own text. The kernel has to be there:
+ * move it from the heap, above the window. Where kboot_prepare_dt() keeps the heap
+ * reserved for firmware buffers, the copy left there stays reserved with it.
+ */
+static int kboot_move_to_exec_window(void **kernel)
+{
+    struct kernel_header *hdr = *kernel;
+    u64 base, size;
+
+    if (!ctxr_exec_window(&base, &size))
+        return 0;
+
+    if (hdr->magic != KERNEL_HEADER_MAGIC)
+        bail("kboot: the image at %p is not an arm64 kernel: can't place it in the window\n", hdr);
+
+    u64 image_size = hdr->image_size, text_offset = hdr->text_offset;
+    if (!image_size || image_size > size || text_offset > size - image_size)
+        bail("kboot: kernel (offset 0x%lx size 0x%lx) does not fit the CTXR exec window\n",
+             text_offset, image_size);
+
+    /* These stay where they are, and the kernel and its pool take the whole window. */
+    if (initrd_start && initrd_size && in_exec_window((u64)initrd_start, initrd_size))
+        bail("kboot: the initrd at %p overlaps the CTXR exec window\n", initrd_start);
+    if (in_exec_window((u64)dt, dt_bufsize))
+        bail("kboot: the device tree at %p overlaps the CTXR exec window\n", dt);
+
+    void *dest = (void *)(base + text_offset);
+    memmove(dest, hdr, image_size);
+    dc_cvac_range(dest, image_size);
+    sysop("dsb sy");
+    ic_ivau_range(dest, image_size);
+    sysop("dsb sy");
+    sysop("isb");
+    *kernel = dest;
+    return 0;
+}
+
 /* T8152 has no clock, USB, PCIe or DAPF setup here: j873g_run_proxy() did
  * what the device tree expects, and Linux owns the rest. */
 static int kboot_boot_t8152(void *kernel)
@@ -8716,6 +8855,8 @@ static int kboot_boot_t8152(void *kernel)
         dt_ready = false;
         bail("kboot: secondary kernel park failed\n");
     }
+    if (kboot_move_to_exec_window(&kernel))
+        return -1;
     printf("Preparing to boot kernel at %p with fdt at %p\n", kernel, dt);
     next_stage.entry = kernel;
     next_stage.args[0] = (u64)dt;
@@ -8740,20 +8881,18 @@ int kboot_prepare_dt(void *fdt)
 
     dt_ready = false;
 
+    if (!ctxr_exec_os_may_start())
+        return -1;
+
     /* Need to init ISP early to carve out heap */
     if (chip_id != T8152)
         isp_init();
-    /* Likewise the NV pages, before the retained heap extent is fixed. */
-    if (nv2_requested() && monitor_required())
-        nv2_prepare();
 
     dt_bufsize = fdt_totalsize(fdt);
     assert(dt_bufsize);
 
     dt_bufsize += 6 * SZ_16K; // Add 96K of buffer for modifications
     dt_bufsize += SZ_16K;     // and the SMBIOS description U-Boot builds its tables from (about 6K)
-    if (pv_kvm_requested())
-        dt_bufsize += SZ_16K;
     // A T6030 or T8122 also takes its PMP values
     if (chip_id == T6030 || chip_id == T8122)
         dt_bufsize += 2 * SZ_16K;
@@ -8824,12 +8963,13 @@ int kboot_prepare_dt(void *fdt)
                 bail("FDT: retained heap extent overflows\n");
             u64 heap_start = ALIGN_DOWN((u64)_end, SZ_16K);
             u64 heap_end = ALIGN_UP(heap_top, SZ_16K);
-            if (heap_end > ram_end || fdt_add_mem_rsv(dt, heap_start, heap_end - heap_start))
+            if (heap_end > ram_end ||
+                dt_reserve_outside_exec_window(heap_start, heap_end - heap_start))
                 bail("FDT: couldn't reserve retained heap\n");
             printf("FDT: retained heap [0x%lx, 0x%lx)\n", heap_start, heap_end);
         }
     }
-    if (fdt_add_mem_rsv(dt, (u64)_base, image_end - (u64)_base))
+    if (dt_reserve_outside_exec_window((u64)_base, image_end - (u64)_base))
         bail("FDT: couldn't add reservation for aura and inherited high-water\n");
 
     /*
@@ -8883,87 +9023,32 @@ int kboot_prepare_dt(void *fdt)
         bail("FDT: couldn't add reservation for aura's old reset vector\n");
 
     /*
-     * CTXR_D starts below this image, and a secondary at EL1 that executes
-     * inside it takes an abort straight to EL2. The firmware RO range below
-     * covers windows A to C.
+     * The OS owns its window in CTXR_D. Keep the rest of the windows out of its
+     * allocator, because EL0 cannot execute in them on a confined core.
      */
-    if (monitor_required()) {
-        u64 start = ALIGN_DOWN(mrs(SYS_IMP_APL_CTXR_D_LWR_EL1), SZ_16K);
-        u64 end = ALIGN_UP(mrs(SYS_IMP_APL_CTXR_D_UPR_EL1) + SZ_4K, SZ_16K);
+    if (ctxr_exec_confined()) {
+        u64 start, end;
 
-        if (!start || end <= start || fdt_add_mem_rsv(dt, start, end - start))
+        if (!ctxr_range(CTXR_RANGE_D, &start, &end))
             bail("FDT: couldn't reserve CTXR_D\n");
-        printf("FDT: reserved CTXR_D [0x%lx, 0x%lx)\n", start, end);
-    }
-    if (nv2_requested() && monitor_required()) {
-        u64 base, size;
-        nv2_trace_region(&base, &size);
-        if (size) {
-            char name[40];
-            snprintf(name, sizeof(name), "nv2-trace@%lx", base);
-            if (dt_get_or_add_reserved_mem(name, "aura,nv2-trace", true, base, size) < 0)
-                bail("FDT: couldn't reserve the NV2 trace ring\n");
-            printf("FDT: NV2 trace ring at [0x%lx, 0x%lx)\n", base, base + size);
-        }
+        start = ALIGN_DOWN(start, SZ_16K);
+        end = ALIGN_UP(end, SZ_16K);
+        if (dt_reserve_outside_exec_window(start, end - start))
+            bail("FDT: couldn't reserve CTXR_D\n");
+        printf("FDT: reserved CTXR_D [0x%lx, 0x%lx) less the OS window\n", start, end);
+        if (dt_reserve_ctxr_low_windows())
+            bail("FDT: couldn't reserve CTXR windows A to C\n");
     }
 
-    if (chip_id == T8140) {
-        u64 ro_start, ro_end;
-        if (memory_fw_ro_range(&ro_start, &ro_end) != 1)
-            bail("FDT: invalid T8140 firmware RO range\n");
-        if (fdt_add_mem_rsv(dt, ro_start, ro_end - ro_start))
-            bail("FDT: couldn't reserve T8140 firmware RO range\n");
-
-        int resv = fdt_path_offset(dt, "/reserved-memory");
-        if (resv < 0)
-            bail("FDT: missing /reserved-memory for firmware RO range\n");
-        char name[48];
-        snprintf(name, sizeof(name), "aura-secondary-ro@%lx", ro_start);
-        int node = fdt_subnode_offset(dt, resv, name);
-        if (node < 0)
-            node = fdt_add_subnode(dt, resv, name);
-        if (node < 0)
-            bail("FDT: couldn't create firmware RO node\n");
-        fdt64_t reg[] = {cpu_to_fdt64(ro_start), cpu_to_fdt64(ro_end - ro_start)};
-        if (fdt_setprop(dt, node, "reg", reg, sizeof(reg)) || fdt_setprop_empty(dt, node, "no-map"))
-            bail("FDT: couldn't describe firmware RO node\n");
-        printf("FDT: reserved firmware RO [0x%lx, 0x%lx)\n", ro_start, ro_end);
-    } else if (!cpu_features->apple_sysregs_unlocked && !in_el2()) {
-        /*
-         * A guest under the aura hypervisor runs at EL1. The host keeps the
-         * SMP-RO range and starts the guest's CPUs itself, so the guest
-         * leaves it out. This is how the J616s guest boots.
-         */
-        printf("FDT: running at EL1, leaving the M4+ SMP-RO range to the host\n");
-    } else if (!cpu_features->apple_sysregs_unlocked) {
-        // On M4* / A18 Pro / M5*, there is a CTRR instance left enabled only
-        // on the secondary (non-boot) cores. Add a reserved-memory region to
-        // prevent Linux from crashing when allocating this memory and writing
-        // to it from a secondary core.
-        u64 ro_start = mrs(SYS_IMP_APL_CTRR_C_LWR_EL1);
-        u64 ro_end = ALIGN_UP(mrs(SYS_IMP_APL_CTRR_C_UPR_EL1), SZ_4K);
-        if (ro_end - ro_start > 12 * SZ_4K)
-            printf("WARNING: M4+ SMP-RO is large (48KB)");
-        if (fdt_add_mem_rsv(dt, ro_start, ro_end - ro_start))
-            bail("FDT: couldn't add reservation for M4+ SMP-RO CTRR area\n");
-
-        // The secondaries also enforce CTRR_D: on J813 (M5) it covers the
-        // ~1 MiB just below the iBoot-loaded image.
-        ro_start = mrs(SYS_IMP_APL_CTRR_D_LWR_EL1);
-        ro_end = ALIGN_UP(mrs(SYS_IMP_APL_CTRR_D_UPR_EL1), SZ_4K) + SZ_4K;
-        if (ro_start && ro_start < ro_end) {
-            if (fdt_add_mem_rsv(dt, ro_start, ro_end - ro_start))
-                bail("FDT: couldn't add reservation for M4+ SMP-RO CTRR_D area\n");
-            printf("FDT: reserved M4+ SMP-RO CTRR_D [0x%lx, 0x%lx)\n", ro_start, ro_end);
-        }
-    }
+    if (dt_reserve_secondary_ro())
+        return -1;
 
     if (chip_id == T8132 && !fdt_node_check_compatible(dt, 0, "apple,j713")) {
         if (dt_reserve_bootloader_handoff())
             return -1;
         u64 start = min(ALIGN_UP((u64)adt + cur_boot_args.devtree_size, SZ_16K), (u64)_base);
         u64 end = cur_boot_args.top_of_kernel_data;
-        if (end > start && fdt_add_mem_rsv(dt, start, end - start))
+        if (end > start && dt_reserve_outside_exec_window(start, end - start))
             bail("FDT: couldn't reserve the J713 chainload high-water interval\n");
     }
 
@@ -9077,23 +9162,6 @@ int kboot_prepare_dt(void *fdt)
         return -1;
     if (dt_set_smbios_firmware())
         return -1;
-
-    if (pv_kvm_requested()) {
-        int hypervisor = fdt_path_offset(dt, "/hypervisor");
-        if (hypervisor < 0)
-            hypervisor = fdt_add_subnode(dt, 0, "hypervisor");
-        if (hypervisor < 0 ||
-            fdt_setprop_string(dt, hypervisor, "compatible", "aurora,aura-kvm-pv-0") ||
-            fdt_setprop_string(dt, hypervisor, "method", "hvc") ||
-            fdt_setprop_u32(dt, hypervisor, "abi-major", AURA_PV_ABI_MAJOR) ||
-            fdt_setprop_u32(dt, hypervisor, "abi-minor", AURA_PV_ABI_MINOR) ||
-            fdt_setprop_u32(dt, hypervisor, "uid-function", AURA_PV_FUNC_UID) ||
-            fdt_setprop_u32(dt, hypervisor, "version-function", AURA_PV_FUNC_VERSION) ||
-            fdt_setprop_u32(dt, hypervisor, "caps-function", AURA_PV_FUNC_GET_CAPS) ||
-            fdt_setprop_u32(dt, hypervisor, "run-function", AURA_PV_FUNC_RUN) ||
-            fdt_setprop_u32(dt, hypervisor, "el1-step-function", AURA_PV_FUNC_EL1_STEP))
-            bail("FDT: couldn't describe Aura PV-KVM\n");
-    }
 
     /* Last, so that its 15K never takes room the steps above need. */
     if (dt_set_pmp_t6030())
@@ -9318,6 +9386,10 @@ static int dt_finish_j614s_aop(void *tree, bool ready)
 
 int kboot_boot(void *kernel)
 {
+    if (!ctxr_exec_os_may_start()) {
+        next_stage.entry = NULL;
+        return -1;
+    }
     if (chip_id == T8152)
         return kboot_boot_t8152(kernel);
 
@@ -9422,6 +9494,8 @@ int kboot_boot(void *kernel)
     smp_set_wfe_mode(true);
     if (chip_id == T8140 && dt_t8140_recheck_display())
         return -1;
+    if (kboot_move_to_exec_window(&kernel))
+        return -1;
     printf("Preparing to boot kernel at %p with fdt at %p\n", kernel, dt);
 
     if (smp_has_pending_calls()) {
@@ -9435,7 +9509,6 @@ int kboot_boot(void *kernel)
     next_stage.args[3] = 0;
     next_stage.args[4] = 0;
     next_stage.restore_logo = false;
-    next_stage.monitor = monitor_required();
 
     return 0;
 }

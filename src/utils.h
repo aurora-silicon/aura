@@ -484,7 +484,6 @@ struct vector_args {
     generic_func *entry;
     u64 args[5];
     bool restore_logo;
-    bool monitor;
 };
 
 extern u32 board_id, chip_id;
@@ -501,11 +500,19 @@ enum cpufeat_uncore_version {
     UNCORE_V2,
 };
 
+/* The proxy reads this layout (proxyclient/aura/proxy.py CPUFeatures). */
 struct midr_part_features {
     enum cpufeat_sleep_mode sleep_mode;
     enum cpufeat_uncore_version uncore_version;
     bool disable_dc_mva;
     bool acc_cfg;
+    /*
+     * CYC_OVRD, and what aura sets up along with it (RVBAR, the L2C error status, the
+     * hypervisor's SPRR/GXF): A7 to M3. False from M4 on, where CYC_OVRD is locked.
+     * Only CYC_OVRD is: at EL2 HACR_EL2, the ACTLR bits and the per-core deep-sleep
+     * enable (s3_5_c15_c6_2) can be set, and with a kcbz-0 boot object the GXF
+     * registers are writable too. aura uses none of them for the OS.
+     */
     bool apple_sysregs_unlocked;
     bool workaround_cyclone_cache;
     bool nex_powergating;

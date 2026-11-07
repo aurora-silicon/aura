@@ -4,7 +4,6 @@
 
 #include "iodev.h"
 #include "memory.h"
-#include "monitor.h"
 #include "string.h"
 
 #ifdef DEBUG_IODEV
@@ -199,13 +198,6 @@ static void _iodev_console_write_helper(iodev_id_t iod, char prefix, const void 
 
 void iodev_console_write(const void *buf, size_t length)
 {
-    /*
-     * Once the monitor runs the OS, the console hardware is the OS's (and may be powered down): a
-     * core that PSCI CPU_ON restarted from reset must not print through it.
-     */
-    if (monitor_active)
-        return;
-
     bool do_lock = mmu_active();
 
     if (!do_lock && !is_boot_cpu()) {
