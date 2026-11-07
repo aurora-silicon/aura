@@ -244,3 +244,17 @@ and a probe that changes the PREFETCH bit. Preserve all original low attribute
 bits, exact probe-mask matching, upper mask, size/alignment limits, BME-off,
 DART/ownership checks and descriptor bytes. The test does not prove physical
 BAR sizing, successful Mu publication or Windows Wi-Fi.
+
+Actual-dispatch failure before correction: candidate04 published NW1H, but Mu
+returned validator -2, meaning its guarded-read callback failed. The native HVC
+fast switch invokes the census before hv_exc_entry's pending-aware SError
+unmask and hypervisor lock, contradicting the census's own preconditions.
+Replay unchanged production hv_exc_sync, hv_exc_entry/exit and the census
+together with architectural DAIF.A masked on entry. The model must reject
+MMIO outside the lock or with a pending/masked SError. Route only the exact
+N1 HVC through the existing slow lifecycle; preserve other HVC services and
+ordinary instruction ELR advancement. HVC ELR already points after HVC: an
+incomplete slow-path move that keeps unconditional ELR+4 must fail the same
+end-to-end return-pointer check. Keep unprepared, BSP, exception guard, version,
+address and read-fault rejection. The modeled peripheral services and exception
+delivery do not substitute for the next physical Mu/Windows handoff campaign.

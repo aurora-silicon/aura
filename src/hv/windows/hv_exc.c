@@ -5998,8 +5998,11 @@ void hv_exc_sync(struct exc_info *ctx)
              * too; it carries its own immediate so it cannot be mistaken for a
              * "NTSRG" forwarding call.
              */
-            handled = (FIELD_GET(ESR_ISS, ctx->esr) == 0 && hv_windows_n1_census_hvc(ctx->regs)) ||
-                      hv_handle_t8142_undef_trampoline(ctx) || hv_handle_smc(ctx);
+            /* The guarded N1 read shares exc_guard and requires the HV lock
+             * and pending-aware SError unmask performed by hv_exc_entry(). */
+            if (FIELD_GET(ESR_ISS, ctx->esr) == 0 && ctx->regs[0] == HV_WINDOWS_N1_READ_CALL)
+                break;
+            handled = hv_handle_t8142_undef_trampoline(ctx) || hv_handle_smc(ctx);
             break;
         case ESR_EC_IMPDEF:
             hv_wdt_breadcrumb('a');
@@ -6095,6 +6098,9 @@ void hv_exc_sync(struct exc_info *ctx)
     hv_exc_entry();
 
     switch (ec) {
+        case ESR_EC_HVC:
+            handled = FIELD_GET(ESR_ISS, ctx->esr) == 0 && hv_windows_n1_census_hvc(ctx->regs);
+            break;
         case ESR_EC_DABORT_LOWER:
             hv_wdt_breadcrumb('D');
             handled = hv_handle_dabort(ctx);
@@ -6115,7 +6121,10 @@ void hv_exc_sync(struct exc_info *ctx)
 
     if (handled) {
         hv_wdt_breadcrumb('+');
-        ctx->elr += 4;
+        /* HVC already records the following instruction, just as on the
+         * unlocked return path above. Preserve Mu's argument-pointer pop. */
+        if (ec != ESR_EC_HVC)
+            ctx->elr += 4;
     } else {
         hv_wdt_breadcrumb('-');
 #ifdef ENABLE_NATIVE_AIC_PASSTHROUGH
