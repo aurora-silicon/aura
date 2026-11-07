@@ -150,3 +150,27 @@ instruction/exception dispatcher, hypervisor lifecycle gating, physical PHY/SMC
 operations, Windows PnP, interrupt delivery or DMA. A physical Aura → Mu →
 Windows handoff and reset/drain receipt is required before merge or a hardware
 support claim.
+
+
+## Physical admission attempt: 2026-11-06
+
+The candidate at `3a86afbb5184b25810b7d6f53ff4618d4ca79054` was RAM-chainloaded
+and exercised through the production N1 census-microguest launcher. It rejected
+the seven inherited APCIE gate states before any N1 reset/power write, DART read,
+descriptor publication or guest entry. The new post-link DART boundary was not
+reached, so it remains unqualified on hardware.
+
+The [admission and recovery receipt](validation/j813-n1-dart-order-20261106.json)
+retains all seven raw words and the source/image/log hashes. They exactly match
+the gate values captured before any HV/guest preparation in the earlier
+held-reset diagnostic. This is an ownership-handoff prerequisite, not evidence
+that the reordered DART read succeeded. The earlier GPIO snapshot is separately
+labelled; this attempt did not read GPIO after rejecting the gates. No admission
+condition was relaxed or unknown owner state cleared to proceed.
+
+The attempt was followed by a separate external reset and restoration of the
+qualified CPU Aura/Mu images. The complete 1 MiB CDC readback and zero-exception
+guard passed; the Windows agent responded, and the installed CPU driver again
+reported Running/Code0 with its exact signed binary hash and E2/P10 state.
+No frequency SET, N1 firmware load, endpoint bus-master enable or DART mapping
+was performed in the restored Windows session.

@@ -1,0 +1,109 @@
+{
+  "schema": 1,
+  "result": "physical-cold-owner-admission-rejected",
+  "source_commit": "3a86afbb5184b25810b7d6f53ff4618d4ca79054",
+  "image_sha256": "6741db1e6217feda5236f3bd82f2d0ce7f58399f394689e889abd648814da74a",
+  "target": "J813 / T8142 / board 0x24",
+  "gates": [
+    {
+      "name": "APCIE_GP",
+      "target": 15,
+      "actual": 15,
+      "reset": 0,
+      "automatic": 0,
+      "raw": "0x2ff"
+    },
+    {
+      "name": "APCIE_SYS_GP",
+      "target": 15,
+      "actual": 0,
+      "reset": 0,
+      "automatic": 1,
+      "raw": "0x1000230f"
+    },
+    {
+      "name": "APCIE_ST",
+      "target": 15,
+      "actual": 15,
+      "reset": 0,
+      "automatic": 0,
+      "raw": "0x2ff"
+    },
+    {
+      "name": "APCIE_SYS_ST",
+      "target": 15,
+      "actual": 0,
+      "reset": 0,
+      "automatic": 1,
+      "raw": "0x1000030f"
+    },
+    {
+      "name": "APCIE_PHY_SW",
+      "target": 15,
+      "actual": 4,
+      "reset": 0,
+      "automatic": 1,
+      "raw": "0x1400024f"
+    },
+    {
+      "name": "ST0_AUS5_AON",
+      "target": 15,
+      "actual": 15,
+      "reset": 0,
+      "automatic": 0,
+      "raw": "0x2ff"
+    },
+    {
+      "name": "ST0_AUS5",
+      "target": 15,
+      "actual": 0,
+      "reset": 0,
+      "automatic": 1,
+      "raw": "0x1000030f"
+    }
+  ],
+  "n1_reset_or_power_writes": 0,
+  "dart_reads": 0,
+  "descriptor_published": false,
+  "guest_started": false,
+  "new_dart_ordering_executed": false,
+  "no_retry_or_followup_transport_request": true,
+  "interpretation": "Fresh boot still supplied active, automatic or clock-retained APCIE states; the existing ownership predicate rejected them before N1 mutations. This run does not qualify the new post-link DART boundary.",
+  "evidence_sha256": {
+    "parent-receipt.json": "e2bb8fcd7411620609d68e1e3d6b5d450e3204c85dcefa5428bb2743239b61d3",
+    "guard-binding.json": "4be482b50af4d853a421120967204c9c10ba8e57ddf90af8ad0bf69d5b9eaa6f",
+    "diagnostic/receipt.json": "2afe021e53b4ca00a3c3580883176a6be86e4c653f2d311241ae515b3cded67b",
+    "diagnostic/console.log": "776cc63052d207596fa44f45e3bef571c763dd2848e9c3bdcbd35d831e285fbc",
+    "diagnostic/host.log": "4bc2257b08850ea9ce9288606aa42ba81ebd49385a2dba842937b4863882751f"
+  },
+  "recovery": {
+    "external_reset": 57,
+    "cdc_roundtrip_bytes": 1048576,
+    "cdc_receipt_sha256": "b33bfde4a6c4f4227b85285af10405992b64c3f006a15edd4eef7d1e5b2b1322",
+    "guard_receipt_sha256": "7fa58d9013f36cc3e4ebbe507319424dc214f3ae237d2f9a251a55fc84a55df2",
+    "windows_boot": "windows-cpu-05",
+    "windows_agent_verified": true,
+    "cpu_driver_running": true,
+    "cpu_problem_code": 0,
+    "cpu_driver_sha256": "6d7979d17162a8fd69429b0ebbab8b64b6092c059b0c0d77b917e07e1ae402f0",
+    "restored_levels": [
+      2,
+      10
+    ],
+    "frequency_set_calls": 0,
+    "ping_receipt_sha256": "6d8c92962f4e5b20c6448c150d1e086aac4208cf98192ac4cd53b0ed5623f888",
+    "cpu_query_receipt_sha256": "0d0db2f176226d47d867874663f5f01b5c78831641a3ffbb4b706fe1c920232d",
+    "madt_sha256": "ca68bd6f5242d387dc3d0408a67885493fdea2aa57e6797f60a3c4fe0fdcdf34",
+    "topology_matches_qualified_boot": true,
+    "topology_receipt_sha256": "5210b6674a08121ab81d30858d17bef9795e11c2263b0768745c11ccff38737d",
+    "windows_efficiency_classes_verified": true,
+    "cpu_sets_receipt_sha256": "66f01c04b92ecac2c8755ad05dc7dda6b05246d398211aeea02136a35ef32869"
+  },
+  "comparison_to_prior_pre_hv_snapshot": {
+    "same_seven_raw_gate_values": true,
+    "prior_receipt_sha256": "0b67b229c18367f5cbfbecc05512193a6ca175719a6d9040827e1ead5bf9f4c5",
+    "prior_gpio_perst_raw": "0x70a02",
+    "prior_snapshot_had_no_guest_preparation": true,
+    "current_gpio_not_read_because_cold_admission_rejected": true
+  }
+}
