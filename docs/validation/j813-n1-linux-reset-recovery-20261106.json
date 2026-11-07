@@ -1,0 +1,119 @@
+{
+  "schema": "j813-n1-diagnostic-windows-recovery-v1",
+  "date": "2026-11-06",
+  "target": "J813",
+  "result": "passed",
+  "separate_external_reset": true,
+  "aura_image_sha256": "7f276e723baa18493c15c3b3fa9c6accad0b20cedb1171f2fce2185000a07606",
+  "mu_image_sha256": "de09007eec9031a1d788da7d63b865307f03973f38805c027a45c1054b0160fd",
+  "profile_sha256": "d2aabc3fc493940da62d5fdf76e66cc4f127f1a16ec2adae6dd181664209ebd7",
+  "cdc_roundtrip_bytes": 1048576,
+  "cdc_roundtrip_sha256": "fbbab289f7f94b25736c58be46a994c441fd02552cc6022352e3d86d2fab7c83",
+  "pre_guest_exception_count": 0,
+  "serial_agent_responded": true,
+  "cpu_driver": {
+    "state": "Running",
+    "problem_code": 0,
+    "signed_sys_sha256": "6d7979d17162a8fd69429b0ebbab8b64b6092c059b0c0d77b917e07e1ae402f0",
+    "levels": [
+      2,
+      10
+    ],
+    "frequency_SET_count_this_boot": 0
+  },
+  "madt_sha256": "ca68bd6f5242d387dc3d0408a67885493fdea2aa57e6797f60a3c4fe0fdcdf34",
+  "cpu_identity_class_join": [
+    {
+      "group": 0,
+      "logical_processor": 0,
+      "mpidr": "0x10100",
+      "uid": 6,
+      "efficiency_class": 1,
+      "scheduling_class": 1
+    },
+    {
+      "group": 0,
+      "logical_processor": 1,
+      "mpidr": "0x0",
+      "uid": 0,
+      "efficiency_class": 0,
+      "scheduling_class": 0
+    },
+    {
+      "group": 0,
+      "logical_processor": 2,
+      "mpidr": "0x1",
+      "uid": 1,
+      "efficiency_class": 0,
+      "scheduling_class": 0
+    },
+    {
+      "group": 0,
+      "logical_processor": 3,
+      "mpidr": "0x2",
+      "uid": 2,
+      "efficiency_class": 0,
+      "scheduling_class": 0
+    },
+    {
+      "group": 0,
+      "logical_processor": 4,
+      "mpidr": "0x3",
+      "uid": 3,
+      "efficiency_class": 0,
+      "scheduling_class": 0
+    },
+    {
+      "group": 0,
+      "logical_processor": 5,
+      "mpidr": "0x4",
+      "uid": 4,
+      "efficiency_class": 0,
+      "scheduling_class": 0
+    },
+    {
+      "group": 0,
+      "logical_processor": 6,
+      "mpidr": "0x5",
+      "uid": 5,
+      "efficiency_class": 0,
+      "scheduling_class": 0
+    },
+    {
+      "group": 0,
+      "logical_processor": 7,
+      "mpidr": "0x10101",
+      "uid": 7,
+      "efficiency_class": 1,
+      "scheduling_class": 1
+    },
+    {
+      "group": 0,
+      "logical_processor": 8,
+      "mpidr": "0x10102",
+      "uid": 8,
+      "efficiency_class": 1,
+      "scheduling_class": 1
+    },
+    {
+      "group": 0,
+      "logical_processor": 9,
+      "mpidr": "0x10103",
+      "uid": 9,
+      "efficiency_class": 1,
+      "scheduling_class": 1
+    }
+  ],
+  "n1_enabled_in_recovered_windows": false,
+  "new_n1_driver_installed": false,
+  "wifi_qualified": false,
+  "evidence_sha256": {
+    "cpu-next-shutdown-03/drain.json": "e8adf0e428bffba69f981d9e88577ebf6362b44b84355f09bc331a7739812bdb",
+    "cdc-42/receipt.json": "70bbe61c92d567f74837809cbd1c5d3a6ed4d18b038955b9210454bf1590a38c",
+    "guard-before-windows-cpu-06/receipt.json": "2033dda0bf57927a37f394622af0b5297130b4a6ec32d308487460ed520c73ca",
+    "cpu6-agent-ping-01/receipt.json": "2088e47ef804a23d46cec7040f62427c6e6c1962dddf8374df2ca689b47a0520",
+    "n1-linux-reset-campaign-01/recovery-cpu-query/response.txt": "0c967fda7585a715983ee4a290fb7395c4cf21cbb75b612e5e4655c060563b0f",
+    "n1-linux-reset-campaign-01/recovery-topology/response.txt": "61b612c19b01513f6d00002827e179cb07cfd78e789752a1615a508c62b6a17b",
+    "n1-linux-reset-campaign-01/recovery-cpu-sets/response.txt": "015e7832a1e06ec4cb5cdf48a81721670a7848cede0d226cc244708365a04ed7"
+  }
+}

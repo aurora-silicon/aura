@@ -174,3 +174,35 @@ guard passed; the Windows agent responded, and the installed CPU driver again
 reported Running/Code0 with its exact signed binary hash and E2/P10 state.
 No frequency SET, N1 firmware load, endpoint bus-master enable or DART mapping
 was performed in the restored Windows session.
+
+## Linux reset diagnostic: 2026-11-06
+
+A separate no-guest diagnostic used the same saved Windows image and its
+unchanged native Linux helpers after validating the complete live PMGR consumer
+graph and activating only the seven exclusive N1 gates. The SMC reset, port
+reset, reference-clock setup and training completed: link status was
+`0x9a001001`, Control identified as `106b:1900`, and the production endpoint
+identity/bus-master-clear check returned success. ANS and both excluded OCLA
+gate words matched at every recorded checkpoint.
+
+All seven late DART reads then completed. The production clean-state check
+correctly rejected SID0 TCR `0x1` and TTBR `0x1400c000`; the other parameter,
+protection and command-busy predicates passed. This establishes the post-link
+access order on this image. It does not establish ownership of the inherited
+translation state. No DART write, BAR assignment, firmware load, ownership
+descriptor or guest entry followed. The failed native call was the final target
+operation; there is no post-failure exception or protected-state snapshot.
+
+The [sanitized reset diagnostic receipt](validation/j813-n1-linux-reset-20261106.json)
+retains the native-stage results, register words, source/image hashes and trace
+hashes. Its host diagnostic has a 219-case failure-injection replay; the preceding
+port-only census has 647 cases. These isolate hardware boundaries and do not
+qualify DMA, interrupt delivery or Windows Wi-Fi. Production cold admission is
+unchanged. The next prerequisite is an explicit Linux-derived inherited-DART
+disable/invalidation sequence, followed by the actual Aura/Mu ownership handoff.
+
+A separate external reset restored the qualified Windows boot. The 1 MiB CDC
+roundtrip, serial-agent response, exact signed CPU driver, MADT and ten-CPU
+identity/class join passed; E2/P10 stayed unchanged without a frequency SET.
+The [recovery receipt](validation/j813-n1-linux-reset-recovery-20261106.json)
+records those checks. N1 remains disabled in this recovered Windows session.
