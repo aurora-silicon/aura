@@ -182,8 +182,9 @@ def plan_profile(filename):
     require(cpufreq == "disabled" or (chip == 0x8142 and model == "Mac17,3"),
             "j813-manual-v1 CPU frequency handoff requires chip 0x8142 and model Mac17,3")
     from .windows_g17 import POLICY as G17_POLICY
+    from .windows_g17_report import POLICY as G17_REPORT_POLICY
     g17 = profile.get("g17", "disabled")
-    require(g17 in ("disabled", G17_POLICY), "unsupported G17 preservation policy")
+    require(g17 in ("disabled", G17_POLICY, G17_REPORT_POLICY), "unsupported G17 preservation policy")
     require(g17 == "disabled" or (chip == 0x8142 and model == "Mac17,3"),
             "G17 preservation requires chip 0x8142 and model Mac17,3")
     declarations = profile.get("reserved_memory", [])
@@ -370,7 +371,7 @@ def prepare_n1_handoff(hv):
 
 def source_manifest():
     root = Path(__file__).resolve().parents[1]
-    names = ("aura/windows.py", "aura/windows_g17.py", "aura/windows_serial.py", "aura/windows_cdc.py",
+    names = ("aura/windows.py", "aura/windows_g17.py", "aura/windows_g17_report.py", "aura/windows_serial.py", "aura/windows_cdc.py",
              "aura/hv/__init__.py", "aura/proxy.py", "tools/boot_windows.py")
     return {name: hashlib.sha256((root / name).read_bytes()).hexdigest() for name in names}
 
@@ -508,6 +509,7 @@ class HardwareSession:
                 require(not self.iface.enabled_features & Feature.DISABLE_DATA_CSUMS,
                         "G17 admission requires checksummed, exception-guarded TEXT reads")
                 record, receipt = windows_g17.admit(source, guard, read_firmware_text)
+                receipt["policy"] = plan.g17
             finally:
                 # A timeout, corrupt frame or device loss leaves channel state
                 # ambiguous. Never send cleanup commands after a failed call.
