@@ -230,3 +230,17 @@ actual observed values and the primary assignment stage before cleanup. Require
 a later ROM failure to retain its own primary stage. Do not infer a BAR size,
 type, window or readback correction from missing data; this change is diagnostic
 only and must preserve the same descriptor, rejection and quarantine behavior.
+
+Captured BAR attribute failure before correction: candidate03 observed BAR0 low
+0x0000000c after successfully disabling command decoding. This is a 64-bit
+memory BAR with the independent PREFETCH bit set; rejecting every nibble except
+0/4 fails before the probe. Public Linux3a0da31 pci_regs.h defines bit3 separately
+from memory type bits2:1; setup-bus.c and setup-res.c permit prefetchable resources
+in a nonprefetchable window. Retain the current window and mapping policy.
+Replay this observed flag through the complete producer before changing code,
+using a synthetic supported-size mask because the physical size is not yet
+observed. Also cover 32-bit prefetchable memory, I/O, below1MiB/reserved types,
+and a probe that changes the PREFETCH bit. Preserve all original low attribute
+bits, exact probe-mask matching, upper mask, size/alignment limits, BME-off,
+DART/ownership checks and descriptor bytes. The test does not prove physical
+BAR sizing, successful Mu publication or Windows Wi-Fi.

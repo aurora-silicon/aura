@@ -12,7 +12,8 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 CASES = (
-    "acquire-success", "acquire-captured-params", "acquire-adt-large", "acquire-invalid-roots", "acquire-unlock", "acquire-stale",
+    "acquire-success", "acquire-prefetch-bar", "prefetch-bar32", "bar-io", "bar-below1m",
+    "bar-reserved-type", "prefetch-mask-change", "acquire-captured-params", "acquire-adt-large", "acquire-invalid-roots", "acquire-unlock", "acquire-stale",
     "acquire-pmgr-address", "acquire-pmgr-descendant", "acquire-pmgr-virtual", "acquire-pmgr-duplicate",
     "acquire-clock-consumer", "acquire-power-consumer", "acquire-adt-malformed",
     "acquire-adt-large-duplicate", "acquire-adt-property-limit",

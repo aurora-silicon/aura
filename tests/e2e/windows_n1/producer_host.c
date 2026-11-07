@@ -251,8 +251,13 @@ static u32 read32(u64 a)
         exc_count++;
         return 0xabad1dea;
     }
-    if (a == 0x1cb0100010ULL && get(a) == 0xffffffff)
+    if (a == 0x1cb0100010ULL && get(a) == 0xffffffff) {
+        if (is("acquire-prefetch-bar"))
+            return 0xffff000c;
+        if (is("prefetch-bar32"))
+            return 0xffff0008;
         return is("bar-mask") ? 0xfffe0001 : 0xffff0004;
+    }
     if (a == 0x1cb0100014ULL && get(a) == 0xffffffff)
         return is("bar-high") ? 0xfffffffe : 0xffffffff;
     return get(a);
@@ -677,6 +682,16 @@ int j813_n1_finish_windows(bool *ready)
     put(0x1cb0101004ULL, is("secondary-bme") ? 4 : 0);
     put(0x1cb0102004ULL, is("tertiary-bme") ? 4 : 0);
     put(0x1cb0100010ULL, 4);
+    if (is("acquire-prefetch-bar") || is("prefetch-mask-change"))
+        put(0x1cb0100010ULL, 0xc);
+    if (is("prefetch-bar32"))
+        put(0x1cb0100010ULL, 8);
+    if (is("bar-io"))
+        put(0x1cb0100010ULL, 0xd);
+    if (is("bar-below1m"))
+        put(0x1cb0100010ULL, 0xa);
+    if (is("bar-reserved-type"))
+        put(0x1cb0100010ULL, 0xe);
     put(0x1cb0100004ULL, is("post-bme") ? 4 : 0);
     put(0xb80008000ULL, is("rom") ? 1 : 0);
     return is("train") || is("clamp-fail") ? -1 : 0;
@@ -842,8 +857,9 @@ int main(int argc, char **argv)
     int rc = acquiring ? hv_windows_n1_acquire(result, sizeof(result))
                        : hv_windows_n1_prepare(result, sizeof(result));
     bool success = is("success") || is("acquire-success") || is("acquire-captured-params") ||
-                   is("acquire-adt-large") || is("acquire-invalid-roots") || is("acquire-unlock") ||
-                   is("acquire-stale") || is("acquire-exception-reserved") || is("acquire-retry") ||
+                   is("acquire-prefetch-bar") || is("prefetch-bar32") || is("acquire-adt-large") ||
+                   is("acquire-invalid-roots") || is("acquire-unlock") || is("acquire-stale") ||
+                   is("acquire-exception-reserved") || is("acquire-retry") ||
                    is("acquire-cold-retry");
     if (acquiring && success) {
         assert(tlbis == 19 && global_enabled && gate_writes == 7 && !power_requests);

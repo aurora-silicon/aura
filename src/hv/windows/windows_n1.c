@@ -367,7 +367,12 @@ static int n1_assign_control(void)
 {
     u32 old, high = 0, mask = 0, high_mask = ~0U;
     if (n1_assign_checked("control-command-off", CTRL + 4, 2, 0, 7) ||
-        n1_assign_read("original-low", CTRL + 0x10, &old) || ((old & 15) != 0 && (old & 15) != 4))
+        n1_assign_read("original-low", CTRL + 0x10, &old))
+        return -1;
+    /* PCI PREFETCH bit3 is independent of memory type bits2:1. Keep it in
+     * the assigned BAR; Linux also permits this BAR in a nonprefetch window. */
+    u32 memory_type = old & 6;
+    if ((old & 1) || (memory_type != 0 && memory_type != 4))
         return -1;
     bool wide = (old & 6) == 4;
     if ((wide && n1_assign_read("original-high", CTRL + 0x14, &high)) ||
