@@ -18,7 +18,6 @@
 #include "memory.h"
 #include "nv2.h"
 #include "smp.h"
-#include "soc.h"
 #include "sptm_virt_priv.h"
 #include "string.h"
 #include "uartproxy.h"
@@ -126,6 +125,8 @@ static int rg_n;
 static u64 rg_wdt, rg_wdt2, rg_xwdt; /* primary, secondary register, exclave watchdog */
 static u64 rg_extra[4];              /* the wdt node's other single registers */
 static u32 rg_alarm_shadow[2];
+static bool rg_xwdt_seeded;  /* the exclave watchdog's ALARM is read at the guest's first access */
+static bool rg_extra_passed; /* the wdt node's single registers are written while XNU starts */
 static u32 rg_events;
 
 /* Set while macOS sleeps in go mode: the guard records but changes nothing, so macOS programs its
@@ -163,6 +164,12 @@ static bool sptm_virt_rg_hook(struct exc_info *ctx, u64 addr, u64 *val, bool wri
 {
     u64 a = addr & ~3UL;
 
+    /* Not at setup: where the exclaves own it, an EL2 read of that page takes an SError, and the
+     * guest never touches it. */
+    if (rg_xwdt && !rg_xwdt_seeded && (a & ~0x3fffUL) == rg_xwdt) {
+        rg_alarm_shadow[1] = read32(rg_xwdt + WDT_ALARM);
+        rg_xwdt_seeded = true;
+    }
     sptm_virt_s2r_note(ctx, addr, write ? *val : 0, write, width);
     if (sptm_virt_rg_passthrough) {
         for (int w = 0; write && width == 2 && w < 2; w++) {
@@ -226,10 +233,10 @@ static bool sptm_virt_rg_hook(struct exc_info *ctx, u64 addr, u64 *val, bool wri
     }
     for (int i = 0; i < 4; i++) {
         if (rg_extra[i] && a == rg_extra[i]) {
-            /* On T8140 XNU writes these only on its way down, so the first attempt stops it. The
-             * J813's XNU writes one of them while IOKit starts, long before any reset, so there
-             * they are logged and performed and only the CTL paths above stop a reset. */
-            if (chip_id == T8142) {
+            /* With a version-2 watchdog XNU writes these only on its way down, so the first
+             * attempt stops it. With version 3 it writes one while IOKit starts, so they are
+             * logged and performed and only the CTL paths above stop a reset. */
+            if (rg_extra_passed) {
                 if (log)
                     printf("SPTM-virt[rst]: watchdog-node register 0x%lx <- 0x%lx (pc 0x%lx, "
                            "passed)\n",
@@ -282,6 +289,8 @@ static void sptm_virt_reset_guard_setup(void)
     int node = adt_path_offset_trace(adt, "/arm-io/wdt", path);
 
     if (node >= 0) {
+        u32 version = 0;
+        rg_extra_passed = ADT_GETPROP(adt, node, "wdt-version", &version) >= 0 && version >= 3;
         for (int i = 0; i < 5; i++) {
             if (adt_get_reg(adt, path, "reg", i, &pa, &sz) < 0)
                 break;
@@ -298,12 +307,8 @@ static void sptm_virt_reset_guard_setup(void)
         rg_alarm_shadow[0] = rg_wdt ? read32(rg_wdt + WDT_ALARM) : 0;
     }
     node = adt_path_offset_trace(adt, "/arm-io/hib-exclave-watchdog", path);
-    /* On T8142 a read of it from EL2 takes an SError (it is exclave-owned there): leave it be. */
-    if (node >= 0 && chip_id == T8142) {
-        printf("SPTM-virt[rst]: T8142: hib-exclave-watchdog not guarded\n");
-    } else if (node >= 0 && adt_get_reg(adt, path, "reg", 0, &pa, &sz) >= 0) {
+    if (node >= 0 && adt_get_reg(adt, path, "reg", 0, &pa, &sz) >= 0) {
         rg_xwdt = pa;
-        rg_alarm_shadow[1] = read32(rg_xwdt + WDT_ALARM);
         sptm_virt_rg_page(pa, "hib-exclave-watchdog");
     }
     printf("SPTM-virt[rst]: reset guard on %d pages (wdt 0x%lx, 2nd 0x%lx, "
