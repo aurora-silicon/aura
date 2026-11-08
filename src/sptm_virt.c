@@ -13,12 +13,14 @@
 #include "fb.h"
 #include "gxf.h"
 #include "heapblock.h"
+#include "iodev.h"
 #include "memory.h"
 #include "nv2.h"
 #include "smp.h"
 #include "soc.h"
 #include "sptm_virt_priv.h"
 #include "string.h"
+#include "uartproxy.h"
 #include "utils.h"
 #include "xnuboot.h"
 
@@ -44,8 +46,8 @@ static volatile bool sptm_cpu_in_xnu[MAX_CPUS];
 
 bool sptm_virt_requested(void)
 {
-    /* T8140, T8132 and T8142 boot as kcbz=0 Mach-O objects with GXF unlocked. */
-    return chip_id == T8140 || chip_id == T8132 || chip_id == T8142;
+    /* What the hypervisor needs from the CPU; the host refuses an SPTM it can't patch. */
+    return FIELD_GET(ID_AA64MMFR2_NV, mrs(SYS_ID_AA64MMFR2_EL1)) >= 2 && supports_gxf();
 }
 
 /* FEAT_MTE2: the SoC has allocation-tag storage. */
@@ -334,6 +336,27 @@ __attribute__((used, retain)) int sptm_virt_load(u64 sptm_entry, u64 handoff)
     printf("SPTM-virt: images recorded, entry 0x%lx handoff 0x%lx; ready to enter\n", sptm_entry,
            handoff);
     return 0;
+}
+
+/*
+ * The phandle of the USB PHY whose port aura's proxy runs on, 0 on any other transport (KIS):
+ * the host hides that port from the guest.
+ */
+__attribute__((used, retain)) u32 sptm_virt_proxy_phy(void)
+{
+    u32 phy = 0;
+
+    if (uartproxy_iodev < IODEV_USB0 || uartproxy_iodev >= IODEV_MAX)
+        return 0;
+    u32 idx = uartproxy_iodev - IODEV_USB0;
+    char path[32];
+    snprintf(path, sizeof(path), "/arm-io/usb-drd%u", idx);
+    int node = adt_path_offset(adt, path);
+    if (node < 0 && idx == 0)
+        node = adt_path_offset(adt, "/arm-io/usb-drd");
+    if (node < 0 || ADT_GETPROP(adt, node, "atc-phy-parent", &phy) < 0)
+        return 0;
+    return phy;
 }
 
 __attribute__((used, retain)) void sptm_virt_config(u64 flags)
