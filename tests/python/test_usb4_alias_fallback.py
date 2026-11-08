@@ -12,6 +12,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 HARNESS = r'''
 #include <assert.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -20,12 +21,22 @@ typedef uint32_t u32;
 typedef unsigned long u64;
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 #define MAX_CIO_DEVS 8
-#define T8142 0x8142
 #define bail(...) do { printf(__VA_ARGS__); return -1; } while (0)
 struct adt_tunable_info { const char *adt_name, *fdt_name; int a, b, c; };
 static const struct adt_tunable_info usb4_rc_tunables[1], usb4_pcie_adapter_tunables[1],
-    usb4_nhi_tunables[1], usb4_t8142_nhi_tunables[1];
-static __attribute__((unused)) u32 chip_id = 0x6000;
+    usb4_nhi_tunables[1], usb4_v2_nhi_tunables[1];
+/* Every /arm-io/acioN exists and is a v1 router. */
+static const void *adt;
+static int adt_path_offset(const void *tree, const char *path)
+{
+    (void)tree; (void)path;
+    return 0;
+}
+static bool adt_acio_is_v2(int node)
+{
+    (void)node;
+    return false;
+}
 static unsigned char blob[8192];
 static void *dt = blob;
 static char seen[64][32];
@@ -41,6 +52,13 @@ static void dt_copy_acio_tunables(const char *adt_path, const char *alias,
 static void dt_copy_usb4_drom(const char *adt_path, const char *alias, u64 uuid)
 {
     (void)adt_path; (void)alias; (void)uuid;
+}
+/* v1 routers only here: the router DART handover never runs. */
+static int dt_copy_usb4_dart_tunables(int index, const char *alias)
+{
+    (void)index; (void)alias;
+    assert(0);
+    return 0;
 }
 '''
 
