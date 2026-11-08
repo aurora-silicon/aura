@@ -182,10 +182,36 @@ void sptm_virt_cl4_seed(int cpu)
  * The per-level half of a host <-> EL1-child switch, in two steps around the EL1 bank swap: the
  * VMSA lock is dropped before the bank changes hands and applied last.
  */
+/*
+ * Who changes the EL1 world's pointer-authentication keys, and when.
+ *
+ * XNU runs with HCR_EL2.APK set, so its own key writes reach the hardware; aura's per-level
+ * bank applies the shadow of SPTM's _EL12 writes at every world entry. If one transition
+ * saves the live keys and another does not, the hardware key stops matching what the kernel
+ * signed with, and the kernel panics authenticating a return address ("PAC failure from kernel
+ * with IB key while returning"). This reports every change with the transition that saw it.
+ */
+static u64 pac_last[MAX_CPUS][2];
+static u32 pac_logs;
+
+void sptm_virt_pac_note(const char *where)
+{
+    int cpu = smp_id();
+    u64 lo = SAFE_MRS(CL4_ENC(6, 7, 2)), hi = SAFE_MRS(CL4_ENC(6, 7, 3));
+
+    if (lo == pac_last[cpu][0] && hi == pac_last[cpu][1])
+        return;
+    pac_last[cpu][0] = lo;
+    pac_last[cpu][1] = hi;
+    if (pac_logs++ < 48)
+        printf("SPTM-virt[pac]: cpu%d IB key -> 0x%lx:0x%lx at %s\n", cpu, lo, hi, where);
+}
+
 void sptm_virt_world_child_pre_enter(void)
 {
     struct sptm_world_cpu *w = &sptm_world[smp_id()];
 
+    sptm_virt_pac_note("child pre-enter (the host's own)");
     for (unsigned i = 0; i < CL4_GCFG_N; i++)
         w->host_lvl[i] = cl4_gcfg_rd(i);
     SAFE_MSR(CL4_VMSA_LOCK, 0);
@@ -206,6 +232,7 @@ static void sptm_virt_world_post_enter(u8 world)
     sptm_virt_amx_child();
     sysop("isb");
     w->world = world;
+    sptm_virt_pac_note(world == SPTM_WORLD_CL4 ? "cL4 entered" : "child entered");
 }
 
 void sptm_virt_world_child_post_enter(void)
@@ -225,6 +252,7 @@ void sptm_virt_world_child_pre_exit(void)
         if (v != SAFE_MRS_FAILED)
             *cl4_slot(cpu, i) = v;
     }
+    sptm_virt_pac_note("child pre-exit (the child's own)");
     SAFE_MSR(CL4_VMSA_LOCK, 0);
 }
 
@@ -244,6 +272,7 @@ void sptm_virt_world_child_post_exit(void)
     sptm_virt_amx_host();
     sysop("isb");
     w->world = SPTM_WORLD_HOST;
+    sptm_virt_pac_note("host restored");
 }
 
 /* XNU's trapped _EL12 accesses to a per-level register belong in the same store. */
