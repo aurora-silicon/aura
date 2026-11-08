@@ -86,6 +86,9 @@
  * SIDs 0 and 16, of 32 streams each, so these SIDs are per SoC (struct dcp_soc .sids). Marker
  * apple,t6041-handoff; the nodes stay disabled.
  *
+ * T6050 (M5 Pro/Max): the __OS_LOG buffers of every running display coprocessor are reserved on
+ * every boot.
+ *
  * Fail-soft: dt_set_display_handoff() always returns 0; a failed check is logged and changes
  * nothing. Transactional: DT edits are made on a scratch copy that replaces the DT only if every
  * step succeeded. The __OS_LOG reservations and the armed handoff are separate transactions.
@@ -243,6 +246,7 @@ struct dcp_soc {
     bool log_streams;   /* log the DART stream registers, without the ADT description */
     bool sids;          /* the stream IDs and stream count below; otherwise SIDs 5/0/4 of 16 */
     bool oslog_in_rsv;  /* an __OS_LOG wholly inside a /memreserve/ is still given its node */
+    bool t6050;         /* the T6050 path below, not the two-level table handoff */
     u8 sid_dcp, sid_disp, sid_piodma, streams;
     const char *uuid; /* DCP firmware image; NULL: none pinned, dry run only (unless any_uuid) */
     u32 os_fw;        /* enum fw_version the kernel's DCP interface is written for */
@@ -458,8 +462,24 @@ static const struct dcp_soc dcp_soc_t6041_max = {
     .vm_size = DCP6_DART_VM_SIZE,
 };
 
-static const struct dcp_soc *const dcp_socs[] = {&dcp_soc_t6030, &dcp_soc_t8122, &dcp_soc_t6031,
-                                                 &dcp_soc_t6041, &dcp_soc_t6041_max};
+/*
+ * T6050 (M5 Pro/Max). Every display coprocessor iBoot leaves running writes an __OS_LOG buffer in
+ * RAM handed to the OS, so those are reserved on every boot.
+ */
+static const struct dcp_soc dcp_soc_t6050 = {
+    .name = "T6050",
+    .chip = T6050,
+    .compat = "apple,t6050",
+    .dcp_compat = "apple,t6050-dcp",
+    .disp_compat = "apple,display-subsystem",
+    .os_fw = V27_0,
+    .os_fw_name = "27.0",
+    .t6050 = true,
+};
+
+static const struct dcp_soc *const dcp_socs[] = {&dcp_soc_t6030,       &dcp_soc_t8122,
+                                                 &dcp_soc_t6031,       &dcp_soc_t6041,
+                                                 &dcp_soc_t6041_max, &dcp_soc_t6050};
 
 struct dcp6_seg {
     u64 phys;
@@ -990,6 +1010,7 @@ static __attribute__((noinline)) void dcp6_reserve_oslogs(void *dt)
     if (dcp6_commit(dt, scratch))
         return;
 
+    dlog("%d __OS_LOG buffer(s) reserved, %d already present\n", nadd, have);
     for (int i = 0; i < dcp6.nnubs; i++)
         if (logs[i].add)
             dlog_debug("%s __OS_LOG reserved: /reserved-memory/%s (0x%lx+0x%lx, no-map)\n",
@@ -3116,6 +3137,14 @@ int dt_set_display_handoff(void *dt)
 
     if (dcp6.soc->chip == T8122 && dcp25_selected(dt))
         dcp6.soc = &dcp_soc_j613_25g83;
+
+    if (dcp6.soc->t6050) {
+        if (chip_id != T6050)
+            return 0;
+        dcp6_find_nubs();
+        dcp6_reserve_oslogs(dt);
+        return 0;
+    }
 
     if (dcp6.soc->board_gate && (chip_id != dcp6.soc->chip || !dcp6_board_ok(dt))) {
         dlog("not a %s (chip 0x%x): nothing done\n", dcp6.soc->boards_desc, chip_id);
