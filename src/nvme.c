@@ -585,6 +585,11 @@ bool nvme_init(void)
         goto out_ioq;
 
     if (nvme_type == NVME_T8132 && !nvme_secure_regs) {
+        /* ANS that an earlier owner powered off has nothing to read until its power is back. */
+        if (nvme_sart_saved_cnt && pcie_init()) {
+            printf("nvme: couldn't power ANS back on\n");
+            goto out_asc;
+        }
         bool running = asc_cpu_running(nvme_asc);
         nvme_log_entry_state(running);
         /*
