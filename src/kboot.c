@@ -10498,7 +10498,7 @@ static int dt_finish_j614s_isp(bool ready)
     u32 isp_phandle, handles[3], darts[3], len;
     int bytes, chosen, adt_isp, isp;
 
-    if (!ready || os_firmware.version != V26_6_2)
+    if (!ready || firmware_os_components() != V26_6_2)
         return -1;
     chosen = adt_path_offset(adt, "/chosen");
     adt_isp = adt_path_offset(adt, "/arm-io/isp0");

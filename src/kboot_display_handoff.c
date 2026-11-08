@@ -2227,7 +2227,7 @@ static int dcp6_check_adt(void)
 
     if (chip_id != soc->chip)
         bail("chip 0x%x is not %s\n", chip_id, soc->name);
-    if (os_firmware.version != soc->os_fw)
+    if (firmware_os_components() != soc->os_fw)
         bail("OS firmware %s is not %s\n", os_firmware.string, soc->os_fw_name);
 
     int nub = adt_path_offset(adt, DCP6_NUB);
@@ -3738,7 +3738,7 @@ int dt_set_display_handoff(void *dt)
 
     /* Reject unsupported firmware before reserving __OS_LOG or touching registers. */
     if (!dcp6.soc->optin &&
-        (dcp6.soc->os_fw == V_UNKNOWN || os_firmware.version != dcp6.soc->os_fw)) {
+        (dcp6.soc->os_fw == V_UNKNOWN || firmware_os_components() != dcp6.soc->os_fw)) {
         dlog("no qualified OS firmware for %s: nothing done\n", dcp6.soc->dcp_compat);
         return 0;
     }

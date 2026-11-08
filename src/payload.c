@@ -152,7 +152,7 @@ static void *decompress_xz(void *p, size_t size)
 
 static void *load_fdt(void *p, size_t size)
 {
-    int rank = payload_profile_rank(p, os_firmware.version == V26_6_2);
+    int rank = payload_profile_rank(p, firmware_os_components() == V26_6_2);
     if (rank && rank >= fdt_rank && fdt_node_check_compatible(p, 0, expect_compatible) == 0) {
         printf("Found a devicetree for %s at %p\n", expect_compatible, p);
         fdt = p;
