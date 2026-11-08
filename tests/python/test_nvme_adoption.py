@@ -148,7 +148,7 @@ static int poll32(u64 a, u32 mask, u32 value, unsigned timeout) { return 0; }
 static bool nvme_ctrl_disable(void)
 { disable_calls++; return failure != 2 && !(shutdown_fault == 4 && disable_calls == 2); }
 static bool nvme_ctrl_enable(void) { return failure != 3; }
-static bool nvme_ctrl_shutdown(u32 mode) { shutdown_calls++; return shutdown_fault != 3; }
+static bool nvme_ctrl_shutdown(void) { shutdown_calls++; return shutdown_fault != 3; }
 static void nvme_poll_syslog(void) {}
 static bool nvme_exec_command(struct nvme_queue *q, struct nvme_command *cmd, void *result)
 {
@@ -206,8 +206,9 @@ int main(int argc, char **argv)
         int cleared = shutdown_fault == 3 || shutdown_fault == 4 ? 2 : 0;
         assert(cleared_ioq == cleared && publications == saved_publications + cleared);
         assert(commands == (shutdown_fault == 1 ? 3 : shutdown_fault <= 4 ? 4 : 2));
-        assert(shutdown_calls == (shutdown_fault == 3 || shutdown_fault == 4));
-        assert(disable_calls == 1);
+        /* A stage that only read disables the controller before the power off, with no shutdown. */
+        assert(shutdown_calls == 0);
+        assert(disable_calls == 1 + (shutdown_fault == 3 || shutdown_fault == 4));
         int saved_commands = commands, saved_disable = disable_calls;
         shutdown_fault = 0;
         adminq.failed = ioq.failed = false;
