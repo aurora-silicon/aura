@@ -16,6 +16,7 @@
 #include "hv.h"
 #include "iodev.h"
 #include "malloc.h"
+#include "memory.h"
 #include "sptm_virt_priv.h"
 #include "string.h"
 #include "uartproxy.h"
@@ -125,6 +126,14 @@ static void gpu_park(struct exc_info *ctx, const char *why)
  * would never hand the ring back. Any other trapped access can offer the check instead; the
  * reset guard's watchdog writes arrive regularly.
  */
+/* Park on demand, for a caller that has found something worth stopping the world for. */
+void sptm_virt_gpu_park_now(struct exc_info *ctx, const char *why)
+{
+    if (gpu_parked)
+        return;
+    gpu_park(ctx, why);
+}
+
 /* Cheap enough to ask on every trap, before building a context to park with. */
 bool sptm_virt_gpu_deadline_due(void)
 {
@@ -238,6 +247,8 @@ void sptm_virt_gpu_setup(void)
         return;
     }
     memset(sptm_virt_gpu_ring, 0, GPU_RING_BYTES);
+    sptm_virt_bss_canary = 0xa5a5c0ffee5a5a5aUL; /* read back while the guest runs */
+    dc_cvac_range((void *)&sptm_virt_bss_canary, sizeof(sptm_virt_bss_canary));
     if (sptm_virt_gpu_stop_boot_secs)
         gpu_boot_stop_t = mrs(CNTPCT_EL0) +
                           (u64)sptm_virt_gpu_stop_boot_secs * mrs(CNTFRQ_EL0);

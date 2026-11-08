@@ -1370,7 +1370,13 @@ static bool nv2_sysreg_do(struct nv2_cpu *c, u64 *regs, u64 esr)
             value = nv2_gic_status(c, op2);
             break;
         case KEY(3, 1, 15, 13, 4):
-            /* AGTCNTHP_CTL from EL2 (XNU's arm_init masks it): a per-CPU shadow. */
+            /*
+             * AGTCNTHP_CTL from EL2 (XNU's arm_init masks it): a per-CPU shadow. Applying it to
+             * the hardware as well looked like the cure for the FIQ storm from GL1h and is not:
+             * the storm came back with it in place, and the register is not even readable from
+             * aura's level -- an mrs of this encoding at EL2 never returns and takes the parked
+             * proxy with it. The storm was the guest's PMU (see exc_fiq). Leave it shadowed.
+             */
             slot = &c->agt_hp_ctl;
             break;
         case KEY(3, 4, 15, 4, 7): /* AMX_CTL_EL2: the guest hypervisor's AMX policy, applied */

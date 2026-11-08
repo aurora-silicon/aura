@@ -27,6 +27,7 @@
 #include "nv2.h"
 #include "smp.h"
 #include "sptm_virt_priv.h"
+#include "string.h"
 #include "utils.h"
 
 enum { SPTM_WORLD_HOST, SPTM_WORLD_CL4, SPTM_WORLD_GUEST };
@@ -191,20 +192,23 @@ void sptm_virt_cl4_seed(int cpu)
  * signed with, and the kernel panics authenticating a return address ("PAC failure from kernel
  * with IB key while returning"). This reports every change with the transition that saw it.
  */
-static u64 pac_last[MAX_CPUS][2];
+static u64 pac_last[MAX_CPUS][4];
 static u32 pac_logs;
 
 void sptm_virt_pac_note(const char *where)
 {
     int cpu = smp_id();
-    u64 lo = SAFE_MRS(CL4_ENC(6, 7, 2)), hi = SAFE_MRS(CL4_ENC(6, 7, 3));
+    /* The kernel's own returns depend on more than the IB key: APCTL carries Apple's key
+     * diversification and KERNKEY is the kernel's own diversifier. */
+    u64 v[4] = {SAFE_MRS(CL4_ENC(6, 7, 2)), SAFE_MRS(CL4_ENC(6, 15, 0)),
+                SAFE_MRS(CL4_ENC(6, 2, 3)), SAFE_MRS(CL4_ENC(6, 2, 4))};
 
-    if (lo == pac_last[cpu][0] && hi == pac_last[cpu][1])
+    if (!memcmp(v, pac_last[cpu], sizeof(v)))
         return;
-    pac_last[cpu][0] = lo;
-    pac_last[cpu][1] = hi;
-    if (pac_logs++ < 48)
-        printf("SPTM-virt[pac]: cpu%d IB key -> 0x%lx:0x%lx at %s\n", cpu, lo, hi, where);
+    memcpy(pac_last[cpu], v, sizeof(v));
+    if (pac_logs++ < 64)
+        printf("SPTM-virt[pac]: cpu%d IB 0x%lx APCTL 0x%lx KERNKEY 0x%lx:0x%lx at %s\n", cpu,
+               v[0], v[1], v[2], v[3], where);
 }
 
 void sptm_virt_world_child_pre_enter(void)

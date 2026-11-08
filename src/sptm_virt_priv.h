@@ -14,6 +14,7 @@ struct exc_info;
 
 /* sptm_virt.c */
 extern volatile bool sptm_virt_xnu_live;
+extern volatile u64 sptm_virt_bss_canary;
 extern u64 sptm_virt_flags;
 extern u32 sptm_virt_cpu_entries[MAX_CPUS];
 int sptm_virt_layout(struct sptm_virt_layout *out);
@@ -71,6 +72,7 @@ void sptm_virt_s2_enter_xnu(int cpu);
 void sptm_virt_ctrr_publish_rorgn(void);
 void sptm_virt_gpu_deadline(struct exc_info *ctx);
 bool sptm_virt_gpu_deadline_due(void);
+void sptm_virt_gpu_park_now(struct exc_info *ctx, const char *why);
 void sptm_virt_fill_ctx(struct exc_info *ctx, u64 *regs, bool gl);
 void sptm_virt_pac_note(const char *where);
 bool sptm_virt_cpu_in_xnu(void);

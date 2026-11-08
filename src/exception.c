@@ -10,6 +10,7 @@
 #include "iodev.h"
 #include "memory.h"
 #include "sptm_virt.h"
+#include "sptm_virt_priv.h"
 #include "uart.h"
 #include "utils.h"
 
@@ -472,7 +473,10 @@ void exc_fiq(u64 *regs)
 #endif
 
     u64 spsr = in_gl12() ? mrs(SYS_IMP_APL_SPSR_GL1) : mrs(SPSR_EL1);
-    printf("Exception: FIQ (from %s) cnt: %lx\n", get_exception_source(spsr), mrs(CNTPCT_EL0));
+
+    static u32 fiq_reports;
+    if (fiq_reports++ < 16)
+        printf("Exception: FIQ (from %s) cnt: %lx\n", get_exception_source(spsr), mrs(CNTPCT_EL0));
 
     u64 reg = mrs(CNTP_CTL_EL0);
     if (reg == 0x5) {
@@ -500,9 +504,17 @@ void exc_fiq(u64 *regs)
     }
 
     reg = mrs(SYS_IMP_APL_PMCR0);
-    if ((reg & (PMCR0_IMODE_MASK | PMCR0_IACT)) == (PMCR0_IMODE_FIQ | PMCR0_IACT)) {
-        printf("  PMC IRQ, masking\n");
+    /*
+     * IACT reads set only while the counter's interrupt is actually asserted, and an FIQ that
+     * reaches here is one no other source claimed: with the PMU armed for FIQ that is the PMU,
+     * whether or not the bit is readable by the time aura looks. Masking is what keeps a guest
+     * whose kernel arms its counters -- XNU does, PMCR0 0x3403, counters 0 and 1 with PMI --
+     * from re-raising the same FIQ the instant aura returns.
+     */
+    if ((reg & PMCR0_IMODE_MASK) == PMCR0_IMODE_FIQ) {
+        printf("  PMC IRQ (IACT %d), masking\n", !!(reg & PMCR0_IACT));
         reg_clr(SYS_IMP_APL_PMCR0, PMCR0_IACT | PMCR0_IMODE_MASK);
+        return;
     }
 
     if (cpu_features->fast_ipi) {
@@ -532,6 +544,27 @@ void exc_fiq(u64 *regs)
             reg_clr(SYS_IMP_APL_UPMCR0, upmcr0_imode);
         }
     }
+
+#ifdef SPTM_VIRT
+    /*
+     * Nothing claimed it. Such an FIQ returns the moment aura erets, so it arrives again at once:
+     * one trial buried the console under 600k reports and the machine then came back only by a
+     * VDM reset. Hand it over instead, while it can still be looked at.
+     */
+    if (nv2_guarded && sptm_virt_guest_live) {
+        static u64 last;
+        static u32 storm;
+        u64 now = mrs(CNTPCT_EL0);
+
+        storm = (last && now - last < mrs(CNTFRQ_EL0) / 1000) ? storm + 1 : 1;
+        last = now;
+        if (storm == 64) {
+            struct exc_info pctx;
+            sptm_virt_fill_ctx(&pctx, regs, in_gl12());
+            sptm_virt_gpu_park_now(&pctx, "an FIQ no source claims, over and over");
+        }
+    }
+#endif
 
     UNUSED(regs);
     // print_regs(regs);

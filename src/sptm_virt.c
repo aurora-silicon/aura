@@ -34,6 +34,7 @@
 
 volatile bool sptm_virt_guest_live;
 volatile bool sptm_virt_xnu_live;
+volatile u64 sptm_virt_bss_canary;
 u64 sptm_virt_flags;
 u32 sptm_virt_cpu_entries[MAX_CPUS];
 

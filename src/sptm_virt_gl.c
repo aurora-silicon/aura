@@ -679,7 +679,21 @@ static bool sptm_virt_guarded_gexit(u64 *regs)
         if (el == 2 && (m & 1) && !sptm_virt_xnu_live) {
             sptm_virt_xnu_live = true;
             dc_cvac_range((void *)&sptm_virt_xnu_live, sizeof(sptm_virt_xnu_live));
-            printf("SPTM-virt: XNU entered on cpu%d\n", cpu);
+            /*
+             * This is a once-only message that the guest's run makes print again and again, as
+             * do every other static counter in aura: its writable data stops holding writes.
+             * Say which it is -- a write that never lands (the flag reads back zero here) or
+             * memory clobbered afterwards (it reads one, and a canary written once at setup is
+             * gone) -- and where, so the next run names the cause instead of the symptom.
+             */
+            bool again = sptm_virt_cpu_in_xnu(); /* this core has run XNU: the flag reverted */
+            static u32 entry_logs;
+            if (entry_logs++ < 8)
+                printf("SPTM-virt: XNU entered on cpu%d (live flag at %p reads %d, canary 0x%lx, "
+                       "in_xnu %d)%s\n",
+                       cpu, (void *)&sptm_virt_xnu_live, (int)sptm_virt_xnu_live,
+                       sptm_virt_bss_canary, (int)again, again ? " -- REVERTED" : "");
+
         }
         sptm_virt_cpu_enters_xnu(cpu);
         if (sptm_virt_flags & SPTM_VIRT_S2R)

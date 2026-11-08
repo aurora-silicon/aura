@@ -423,7 +423,19 @@ void sptm_virt_s2_setup(void)
     sptm_virt_s2_split_ctrr_blocks();
     sptm_virt_reset_guard_setup();
     /* After the guard, whose pages the sleep path leaves alone. */
-    sptm_virt_s2r_setup(uartproxy_iodev >= IODEV_USB0 && uartproxy_iodev < IODEV_MAX);
+    /*
+     * Keep the proxy link's power domains whichever transport carries it. Only the DWC3 CDC
+     * gadget asked for this before, so a proxy on the DockChannel the debug tether carries went
+     * unprotected: the guest's power manager switches that port off as it brings its own drivers
+     * up, around 95 s into the boot, and takes aura's console, the proxy and the park with it --
+     * which is why a trial could only be recovered by a VDM reset.
+     */
+    bool link_on_usb = uartproxy_iodev >= IODEV_USB0 && uartproxy_iodev < IODEV_MAX;
+    bool link_on_dockchannel = uartproxy_iodev == IODEV_DOCKCHANNEL_UART;
+    printf("SPTM-virt[s2]: proxy link on iodev %d (%s); its domains are %s\n", uartproxy_iodev,
+           link_on_usb ? "USB CDC" : link_on_dockchannel ? "DockChannel" : "other",
+           link_on_usb || link_on_dockchannel ? "kept on" : "NOT kept on");
+    sptm_virt_s2r_setup(link_on_usb || link_on_dockchannel);
     sptm_virt_gpu_setup();
 
     /* SPTM's own bring-up runs without it; each core arms it at its GEXIT into XNU, after
