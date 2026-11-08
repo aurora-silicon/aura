@@ -34,6 +34,7 @@ Environment (all optional; 1 enables a switch):
   AURA_SAMPLE              sample the guest's PC until each core's XNU entry (pre-XNU hangs)
   AURA_SAMPLE_HZ=<n>       samples per second (default 4)
   AURA_SAMPLE_MAX=<n>      stop printing after n samples (default 64)
+  AURA_XNU_RO_RELAX        patch XNU's zalloc_ro_mut RO-zone panic out (tracing only)
   AURA_TAIL_SECS, AURA_TAIL_IDLE   keep reading the console after entry, until idle
   XNU_BOOTARGS             XNU's command line
 
@@ -87,6 +88,7 @@ KNOWN_ENV = {
     "AURA_GPU_PRINT_MAX",
     "AURA_SAMPLE_HZ",
     "AURA_SAMPLE_MAX",
+    "AURA_XNU_RO_RELAX",
 } | set(CONFIG_FLAGS)
 
 # The debug link: DockChannel plus the ATC0 port's PD controller, USB controller and PHY path.
@@ -108,6 +110,12 @@ KIS_PORT_NODES_T8142 = (
 )
 # Nothing drives the ANE yet, and the platform error handler panics on an AMCC DSID timeout.
 STRIP_NODES = ("/arm-io/ane", "/arm-io/dart-ane")
+# T8142: AppleConvergedPCI panics XNU in zalloc_ro_mut on one of its own statics
+# (kernelcache+0x42e1e0) about a second into IOKit. Nothing here needs PCIe or Wi-Fi, so its nodes
+# are hidden; the Thunderbolt/CIO PCIe paths go with them.
+STRIP_NODES_T8142 = ("/arm-io/apcie", "/arm-io/dart-apcie0", "/arm-io/apcie0-piodma",
+                     "/arm-io/apciec0", "/arm-io/dart-apciec0", "/arm-io/apciec0-piodma",
+                     "/arm-io/centauri", "/arm-io/bluetooth", "/arm-io/aop-spmi0/spmi-wifibt")
 ERROR_HANDLER = "/arm-io/error-handler"
 # Without cL4 the exclaves stay NOT_SUPPORTED, so their nodes and the RTBuddy routes that resolve
 # through them would wait forever in IOKit. With cL4 they must stay: hidden, DCP never completes
@@ -191,6 +199,15 @@ SPTM_BUILDS = (
     ("25G83", SPTM_PATCHES, 0x2d8, 0xa50, None),
     ("26A428 t8142", SPTM_PATCHES_26A428_T8142, 0xfb0, 0x5f0, MTE_SEQ_26A428_T8142),
 )
+
+# Optional patches to the loaded kernelcache, for tracing only (AURA_XNU_RO_RELAX): region name,
+# offset into that region, the word expected there and its replacement.
+# 26A428's xnu-13432.1.9 panics in zalloc_ro_mut a second into userspace on the J813 ("source ...
+# not from RO zone map"), before the GPU firmware starts, which is what the GPU trace is after.
+# This takes the branch that skips the panic unconditionally, so the mutation it was asked for is
+# performed. It changes what the guest does: never on by default.
+XNU_RO_RELAX_26A428 = (("zalloc_ro_mut RO-zone check", "BootKC-rx", 0x3b27e4c, 0x540002a9,
+                        0x14000015),)
 
 # AMCC error status words: four planes, seven words each.
 AMCC_STATUS = 0x220025004
@@ -349,6 +366,20 @@ def rewrite_sptm_seq(p, sym, entry, name, seq):
     print(f"{name}: rewrote {len(new)} instructions at 0x{pa:x} (MTE tag storage from the window)")
 
 
+def patch_xnu(p, sym, plan, patches):
+    for what, region, off, expected, new in patches:
+        if region not in plan.regions:
+            raise SystemExit(f"{what}: the plan has no {region} region")
+        pa = plan.regions[region][0] + off
+        before = p.read32(pa)
+        if before != expected:
+            raise SystemExit(f"{what}: [0x{pa:x}] = 0x{before:08x}, expected 0x{expected:08x}: "
+                             f"not the kernelcache this patch is for")
+        p.write32(pa, new)
+        p.call(sym["sptm_virt_flush"], pa & ~0x3f, 0x80)
+        print(f"XNU {what}: [0x{pa:x}] 0x{before:08x} -> 0x{p.read32(pa):08x}")
+
+
 def patch_sptm(p, sym, entry, build):
     name, patches, gexit_po, stash_off, mte_seq = build
     for what, off, mask, expected, new in patches:
@@ -500,6 +531,8 @@ def main():
     chip = u.adt["/chosen"].chip_id
     keep_exclaves = env_on("AURA_KEEP_EXCLAVES")
     hide = (KIS_PORT_NODES_T8142 if chip == 0x8142 else KIS_PORT_NODES) + STRIP_NODES
+    if chip == 0x8142:
+        hide += STRIP_NODES_T8142
     if not env_on("AURA_KEEP_ERRH"):
         hide += (ERROR_HANDLER,)
     if env_on("AURA_HIDE_DOCKCHANNEL"):
@@ -534,6 +567,8 @@ def main():
 
     write_plan(p, u, iface, sym, plan, images)
     patch_sptm(p, sym, entry, build)
+    if env_on("AURA_XNU_RO_RELAX"):
+        patch_xnu(p, sym, plan, XNU_RO_RELAX_26A428)
     configure(p, sym, plan)
     if p.call(sym["sptm_virt_load"], entry, handoff) != 0:
         raise SystemExit("sptm_virt_load rejected the entry/handoff (see aura's console)")
