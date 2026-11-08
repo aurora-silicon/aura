@@ -45,6 +45,8 @@ static const struct t6050_port {
     {3, {0x21421b21}, "ASM3142 xHCI", false},
     /* The N1's control function: 1900 in its ROM personality, 1901 once its firmware runs */
     {0, {0x1900106b, 0x1901106b}, "N1 Wi-Fi/Bluetooth", false},
+    /* Existing links must reserve their buses before this newly trained port. */
+    {1, {0x975517a0}, "GL9755 SD reader", false},
 };
 
 /* apcie0 "reg": shared windows, then six per port */
@@ -631,11 +633,44 @@ static int stage_g(const struct port_regs *pp)
     return 0;
 }
 
+/* J775c ADT: sd_pwr_en = smc-pmu pKW8("pcIO", 0, 0x190000).
+ * Resolve and validate the native function before powering this optional endpoint.
+ * Leave it powered through the Linux handoff; no media-dependent gating here.
+ */
+static int sdreader_power(const struct port_regs *pp)
+{
+    char path[64];
+    u32 fn[5], phandle;
+    int smc_node = adt_path_offset(adt, "/arm-io/smc/iop-smc-nub/smc-pmu");
+    snprintf(path, sizeof(path), "%s/pcie-sdreader", pp->bridge);
+    int node = adt_path_offset(adt, path);
+    u32 len;
+    const void *prop = node < 0 ? NULL : adt_getprop(adt, node, "function-sd_pwr_en", &len);
+    if (!prop || len != sizeof(fn) || smc_node < 0 ||
+        ADT_GETPROP(adt, smc_node, "AAPL,phandle", &phandle) < 0)
+        FAIL("SD reader power function missing\n");
+    memcpy(fn, prop, sizeof(fn));
+    if (fn[0] != phandle || memcmp(&fn[1], "8WKp", 4) ||
+        fn[2] != 0x7063494f || fn[3] != 0 || fn[4] != 0x190000)
+        FAIL("SD reader power function differs\n");
+    smc_dev_t *smc = smc_init();
+    if (!smc)
+        return -1;
+    int ret = smc_write_u64(smc, fn[2], ((u64)fn[4] << 32) | fn[3] | 1);
+    smc_shutdown(smc);
+    if (ret)
+        FAIL("SD reader power enable failed: %d\n", ret);
+    mdelay(150);
+    return 0;
+}
+
 /* B-G for one port, after the shared A and S */
 static int port_up(struct port_regs *pp)
 {
     u64 p2 = pp->ctl;
 
+    if (pp->p->port == 1)
+        TRY(sdreader_power(pp));
     if (read32(p2 + PORT_LINKSTS) & BIT(0)) {
         printf("pcie-t6050: port %d already has a link: adopting it\n", pp->p->port);
     } else {
