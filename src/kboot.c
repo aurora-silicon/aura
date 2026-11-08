@@ -4083,7 +4083,7 @@ static int dt_reserve_j713_dcpext_one(unsigned int n)
     char path[48];
     u32 len = 0;
 
-    /* The kernel checks the firmware it adopts by UUID, as for the internal DCP. */
+    /* Published like the internal DCP's; the firmware version gates the adoption. */
     snprintf(path, sizeof(path), "/arm-io/%s/iop-%s-nub", alias, alias);
     int nub = adt_path_offset(adt, path);
     const char *uuid = nub < 0 ? NULL : adt_getprop(adt, nub, "uuid", &len);
@@ -6709,7 +6709,8 @@ static int dt_set_m4_dcp_handoff(void)
 
     dcp_node = fdt_path_offset(dt, "dcp");
     if (fdt_getprop(dt, dcp_node, "apple,j713-native-piodma", NULL)) {
-        if (strcmp(uuid, "81BAF476-679D-3CC0-8C6A-E6B6FA659D5E") ||
+        /* The DCP image is per firmware, the same on every M4 Mac. */
+        if (os_firmware.version != V26_6_2 ||
             dt_set_j713_display_maps(segments, count, dram_start, dram_size))
             printf("FDT: M4 PIODMA handoff unqualified; retaining disabled device\n");
     }
