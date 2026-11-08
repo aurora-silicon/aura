@@ -158,6 +158,14 @@ bool asc_cpu_running(asc_dev_t *asc)
     return read32(asc->cpu_base + ASC_CPU_CONTROL) & ASC_CPU_CONTROL_START;
 }
 
+/* Stopped in its idle loop, as an IOP that acknowledged an idle request reads. */
+bool asc_cpu_idle(asc_dev_t *asc)
+{
+    u32 status = read32(asc->cpu_base + ASC_CPU_STATUS);
+
+    return (status & ASC_CPU_STATUS_STOPPED) && (status & ASC_CPU_STATUS_IDLE);
+}
+
 static bool asc_mailbox_empty(u32 control)
 {
     return (control & (ASC_MBOX_CONTROL_ENABLE | ASC_MBOX_CONTROL_EMPTY)) ==
