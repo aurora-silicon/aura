@@ -99,6 +99,7 @@ KNOWN_ENV = {
     "AURA_TAIL_SECS",
     "AURA_TAIL_IDLE",
     "AURA_GPU_STOP_SECS",
+    "AURA_GPU_STOP_BOOT_SECS",
     "AURA_GPU_STOP_MSG",
     "AURA_GPU_PRINT_MAX",
     "AURA_SAMPLE_HZ",
@@ -556,6 +557,8 @@ def configure(p, sym, plan, adt):
             p.write32(sym[symbol], env_int(env))
     if os.environ.get("AURA_GPU_STOP_SECS"):
         p.write32(sym["sptm_virt_gpu_stop_secs"], env_int("AURA_GPU_STOP_SECS"))
+    if os.environ.get("AURA_GPU_STOP_BOOT_SECS"):
+        p.write32(sym["sptm_virt_gpu_stop_boot_secs"], env_int("AURA_GPU_STOP_BOOT_SECS"))
     if os.environ.get("AURA_GPU_STOP_MSG"):
         p.write64(sym["sptm_virt_gpu_stop_msg"], env_int("AURA_GPU_STOP_MSG"))
     if os.environ.get("AURA_GPU_PRINT_MAX"):

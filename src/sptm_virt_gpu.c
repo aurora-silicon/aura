@@ -39,6 +39,7 @@ volatile u64 sptm_virt_gpu_head;
 
 /* Set by the host before entry (run_guest_sptm.py). */
 u32 sptm_virt_gpu_stop_secs; /* park this long after the first GPU access; 0 = never */
+u32 sptm_virt_gpu_stop_boot_secs; /* park this long after the guest's entry, GPU or not; 0 = never */
 u64 sptm_virt_gpu_stop_msg;  /* park after a write of this value (a mailbox message); 0 = never */
 u32 sptm_virt_gpu_print_max = 20000;
 
@@ -54,6 +55,7 @@ static u32 gpu_nseen;
 static u64 gpu_first_t, gpu_stop_t;
 static volatile u32 gpu_printed;
 static volatile bool gpu_parked;
+static u64 gpu_boot_stop_t;
 
 static const char *gpu_range_name(u64 addr, u64 *off)
 {
@@ -117,6 +119,19 @@ static void gpu_park(struct exc_info *ctx, const char *why)
         sysop("wfe");
 }
 
+/*
+ * A deadline the host can rely on. The park lives in the GPU hook, so a guest that brings the
+ * GPU up and then leaves it alone -- which is every boot that does not reach WindowServer --
+ * would never hand the ring back. Any other trapped access can offer the check instead; the
+ * reset guard's watchdog writes arrive regularly.
+ */
+void sptm_virt_gpu_deadline(struct exc_info *ctx)
+{
+    if (gpu_parked || !gpu_boot_stop_t || mrs(CNTPCT_EL0) < gpu_boot_stop_t)
+        return;
+    gpu_park(ctx, "the deadline the host asked for");
+}
+
 static bool gpu_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int width)
 {
     u64 now = mrs(CNTPCT_EL0);
@@ -166,6 +181,8 @@ static bool gpu_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int w
 
     if (gpu_parked)
         return true;
+    if (gpu_boot_stop_t && now >= gpu_boot_stop_t)
+        gpu_park(ctx, "the deadline the host asked for");
     /* A message the host names is a repeatable park point; the seconds are not (the guest's own
      * timing varies from boot to boot by more than the whole bring-up lasts). */
     if (sptm_virt_gpu_stop_msg && write && (width == 4 ? val[0] : *val) == sptm_virt_gpu_stop_msg)
@@ -215,6 +232,9 @@ void sptm_virt_gpu_setup(void)
         return;
     }
     memset(sptm_virt_gpu_ring, 0, GPU_RING_BYTES);
+    if (sptm_virt_gpu_stop_boot_secs)
+        gpu_boot_stop_t = mrs(CNTPCT_EL0) +
+                          (u64)sptm_virt_gpu_stop_boot_secs * mrs(CNTFRQ_EL0);
     sptm_virt_gpu_nrec = GPU_RING_BYTES / sizeof(struct gpu_rec);
     sptm_virt_gpu_head = 0;
 

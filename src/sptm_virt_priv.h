@@ -69,6 +69,7 @@ extern volatile bool sptm_virt_rg_passthrough;
 void sptm_virt_s2_setup(void);
 void sptm_virt_s2_enter_xnu(int cpu);
 void sptm_virt_ctrr_publish_rorgn(void);
+void sptm_virt_gpu_deadline(struct exc_info *ctx);
 bool sptm_virt_cpu_in_xnu(void);
 bool sptm_virt_s2_dabort_gl(u64 *regs);
 bool sptm_virt_rg_owns(u64 page);

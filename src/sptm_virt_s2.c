@@ -198,6 +198,7 @@ static bool sptm_virt_rg_hook(struct exc_info *ctx, u64 addr, u64 *val, bool wri
     }
     u64 v = *val;
     bool log = rg_events++ < 64;
+    sptm_virt_gpu_deadline(ctx);
     for (int w = 0; w < 2; w++) {
         u64 base = w ? rg_xwdt : rg_wdt;
         if (!base || a < base || a >= base + 0x4000)
