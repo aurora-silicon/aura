@@ -2663,6 +2663,55 @@ static int adt_acio_rc_regnum(void)
     return 2;
 }
 
+/*
+ * A v2 router's own DART (ADT /arm-io/dart-acioN) is not set up by anything
+ * before the OS: its stream for the router's firmware is still translated and
+ * its table unapplied when the NHI starts its rings. Hand its table over like
+ * the PCIe-C DART's; the DART is the one the NHI's first iommus entry names.
+ * Calibration is copied from this machine's ADT at boot, never substituted.
+ */
+static int dt_copy_usb4_dart_tunables(int index, const char *nhi_alias)
+{
+    const struct adt_tunable_info tunable = {
+        .adt_name = "dart-tunables-instance-0",
+        .fdt_name = "apple,tunable",
+        .reg_size = 0x4000,
+        .required = true,
+    };
+    char adt_path[32];
+    int len;
+
+    snprintf(adt_path, sizeof(adt_path), "/arm-io/dart-acio%d", index);
+    int adt_node = adt_path_offset(adt, adt_path);
+    if (adt_node < 0 || !adt_getprop(adt, adt_node, tunable.adt_name, NULL))
+        return 0;
+
+    const char *fdt_path = fdt_get_alias(dt, nhi_alias);
+    if (!fdt_path)
+        return -1;
+    int nhi = fdt_path_offset(dt, fdt_path);
+    if (nhi < 0)
+        return -1;
+    const fdt32_t *iommus = fdt_getprop(dt, nhi, "iommus", &len);
+    if (!iommus || len < (int)sizeof(*iommus)) {
+        printf("USB4: %s has no iommus, router DART tunables not copied\n", nhi_alias);
+        return -1;
+    }
+    int dart = fdt_node_offset_by_phandle(dt, fdt32_to_cpu(iommus[0]));
+    if (dart < 0 || fdt_node_check_compatible(dt, dart, "apple,t8110-dart"))
+        return -1;
+    /* Keep a table the board already gives. */
+    if (fdt_getprop(dt, dart, tunable.fdt_name, NULL))
+        return 0;
+
+    if (dt_append_acio_tunable(adt_node, dart, &tunable)) {
+        printf("USB4: unable to convert %s/%s\n", adt_path, tunable.adt_name);
+        fdt_delprop(dt, dart, tunable.fdt_name);
+        return -1;
+    }
+    return 0;
+}
+
 static int dt_set_acio_tunables(void)
 {
     char adt_path[32];
@@ -2703,6 +2752,8 @@ static int dt_set_acio_tunables(void)
             snprintf(fdt_alias, sizeof(fdt_alias), "usb4-%d-nhi", i);
         dt_copy_acio_tunables(adt_path, fdt_alias, nhi_tunables, n_nhi_tunables);
         dt_copy_usb4_drom(adt_path, fdt_alias, router_uuid | i);
+        if (adt_acio_is_v2(adt_node))
+            dt_copy_usb4_dart_tunables(i, fdt_alias);
     }
 
     return 0;

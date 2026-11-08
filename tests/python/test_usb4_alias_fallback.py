@@ -53,6 +53,13 @@ static void dt_copy_usb4_drom(const char *adt_path, const char *alias, u64 uuid)
 {
     (void)adt_path; (void)alias; (void)uuid;
 }
+/* v1 routers only here: the router DART handover never runs. */
+static int dt_copy_usb4_dart_tunables(int index, const char *alias)
+{
+    (void)index; (void)alias;
+    assert(0);
+    return 0;
+}
 '''
 
 MAIN = r'''
