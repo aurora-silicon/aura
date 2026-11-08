@@ -336,12 +336,14 @@ def exclave_report(bundle, entry, virt, integrity, trustcache):
                 exclave_integrity=integrity, exclave_trustcache=trustcache), bundle.payload
 
 
-def exclave_firmware(fw_dir, plan_mod):
-    """The extracted exclave firmware of a macOS install: an ExclaveCore bundle directory and the
-    build's Firmware directory beside it."""
+def exclave_firmware(fw_dir, plan_mod, chip):
+    """The extracted exclave firmware of a macOS install: this SoC's ExclaveCore bundle directory
+    and the build's Firmware directory beside it. An install carries one bundle per SoC."""
     from aura.exclave_bundle import parse as parse_bundle
 
-    bdir = next(fw_dir.glob("exclavecore_bundle.*.RELEASE"))
+    bdir = fw_dir / f"exclavecore_bundle.t{chip:x}.RELEASE"
+    if not bdir.is_dir():
+        raise SystemExit(f"AURA_EXCLAVE_FW: no {bdir.name} in {fw_dir}")
     bundle = parse_bundle((bdir / bdir.name).read_bytes())
     kernel_file = bdir / "SYSTEM" / "kernel"
     entry, virt = exclave_cl4(plan_mod, bundle,
@@ -598,7 +600,8 @@ def main():
     if keep_exclaves and os.environ.get("AURA_EXCLAVE_BUNDLE"):
         cl4, images["cl4"] = exclave_files(plan_mod)
     elif keep_exclaves and os.environ.get("AURA_EXCLAVE_FW"):
-        cl4, images["cl4"] = exclave_firmware(pathlib.Path(os.environ["AURA_EXCLAVE_FW"]), plan_mod)
+        cl4, images["cl4"] = exclave_firmware(pathlib.Path(os.environ["AURA_EXCLAVE_FW"]), plan_mod,
+                                               chip)
     serial = os.environ.get("AURA_XNU_SERIAL")
 
     plan = plan_mod.plan_boot(
