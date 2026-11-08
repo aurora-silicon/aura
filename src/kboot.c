@@ -8029,6 +8029,27 @@ static int dt_set_pmp(void)
         if (fdt_setprop(dt, pmp_node, prop_name, prop->value, prop->size))
             bail("FDT: failed to transfer pmp tunable");
     }
+
+    /*
+     * The boot arguments the PMP driver patches into the firmware from an optional
+     * apple,<name>; the firmware's default for each is 0. iBoot sets them where they
+     * apply, e.g. a J616s has dram-channel-disable 0xffff0000.
+     */
+    static const char *const pmp_bootargs[] = {"dram-channel-disable", "pmc-msg-disabled",
+                                               "soc-chip-variant"};
+    for (size_t i = 0; i < ARRAY_SIZE(pmp_bootargs); i++) {
+        u32 val;
+        char arg_name[64];
+
+        if (adt_get_u32_exact(pmp_iop_anode, pmp_bootargs[i], &val))
+            continue;
+        snprintf(arg_name, sizeof(arg_name), "apple,%s", pmp_bootargs[i]);
+        pmp_node = fdt_path_offset(dt, "pmp");
+        if (fdt_setprop_u32(dt, pmp_node, arg_name, val))
+            bail("FDT: failed to set pmp boot argument %s\n", pmp_bootargs[i]);
+        printf("FDT: pmp %s = 0x%x\n", pmp_bootargs[i], val);
+    }
+
     pmp_node = fdt_path_offset(dt, "pmp");
     fdt_setprop_string(dt, pmp_node, "status", "okay");
     return 0;
@@ -10151,6 +10172,9 @@ int kboot_prepare_dt(void *fdt)
     // A T6032 takes only its firmware image UUID list (about 16K)
     if (chip_id == T6032)
         dt_bufsize += SZ_16K;
+    // A T6040 takes its PMP values (about 38K) and its firmware handoffs
+    if (chip_id == T6040)
+        dt_bufsize += 4 * SZ_16K;
     dt = memalign(DT_ALIGN, dt_bufsize);
 
     if (fdt_open_into(fdt, dt, dt_bufsize) < 0)
