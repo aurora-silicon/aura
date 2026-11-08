@@ -187,6 +187,7 @@ static void t6031_gpu_probe(void *d)
         function(gpu, "static int dt_set_gpu_t6031(void *dt)\n{") + r'''
 /* kboot's handoff: /chosen as dt_set_chosen() writes it, then what the GPU code would see */
 static void kboot_set_initrd(void *start, size_t size) {}
+static void kboot_request_hibernate_layout(bool on) { printf("HIB %d\n", on); }
 static int kboot_prepare_dt(void *fdt)
 {
     assert(!fdt_open_into(fdt, dt, sizeof(blob)));
@@ -900,3 +901,30 @@ def test_updater_read_loop_fix_keeps_a_last_line_without_newline(tools):
     b = run(tools, "stage2", image + forwarded)
     booted(b)
     assert b.chosen["asahi,t8122-gpu"] == "0"
+
+
+# ---- hib=: a line of stage 2's own asks kboot for the fixed hibernation layout ----
+
+def hib_requests(r):
+    return [line[4:] for line in r.stdout.splitlines() if line.startswith("HIB ")]
+
+
+@pytest.mark.parametrize("build", STAGE2)
+def test_hib_line_asks_for_the_layout_and_is_no_loss(tools, build):
+    b = boot(tools, build, b"hib=1\n")
+    booted(b)
+    assert hib_requests(b) == ["1"] and set(AIR) <= b.armed
+    b = boot(tools, build, b"hib=1\nhib=0\n")
+    booted(b)
+    assert hib_requests(b) == ["1", "0"]
+
+
+@pytest.mark.parametrize("build", STAGE2)
+def test_a_swallowed_hib_line_is_a_lost_line(tools, build):
+    b = boot(tools, build, GPU_ON + b"junk\nhib=1\n")
+    graphics_off(b)
+    assert not hib_requests(b)
+
+
+def test_stage1_does_not_hand_hib_on(tools):
+    assert b"hib=" not in stage1(tools, b"hib=1\n")

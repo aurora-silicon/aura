@@ -23,6 +23,7 @@ struct kernel_header {
 #define KERNEL_HEADER_MAGIC 0x644d5241
 
 void kboot_set_initrd(void *start, size_t size);
+void kboot_request_hibernate_layout(bool on);
 int kboot_set_chosen(const char *name, const char *value);
 void kboot_delete_chosen(const char *name);
 void kboot_set_config_lost(void);

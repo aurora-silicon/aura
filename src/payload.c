@@ -240,8 +240,8 @@ static bool config_seen = false;
 static bool config_lost_passed = false;
 
 static const char *const config_names[] = {
-    "chosen.",  "chainload=",   "boot=", "nvme.sart=",
-    "display=", "mitigations=", "tso=",  "m1n1.config-lost="};
+    "chosen.", "chainload=",        "boot=", "nvme.sart=", "display=", "mitigations=",
+    "tso=",    "m1n1.config-lost=", "hib="};
 
 /* The start of a line of a variable m1n1 knows */
 static bool config_line(const char *s)
@@ -314,6 +314,8 @@ static bool check_var(u8 **p)
         mitigations_configure(val);
     } else if (IS_VAR("tso=")) {
         enable_tso = val[0] == '1';
+    } else if (IS_VAR("hib=")) {
+        kboot_request_hibernate_layout(val[0] == '1');
     } else {
         printf("Unknown variable %.*s\n", (int)(val - (char *)*p - 1), (char *)*p);
     }

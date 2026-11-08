@@ -54,6 +54,27 @@ and the display. The mailbox sits in aura's image, which kboot reserves anyway, 
 takes no memory of its own. On A7 to M3 RVBAR isn't locked, so nothing is published,
 and a guest at EL1 gets nothing.
 
+## Hibernation layout (`hib=1`, T6040)
+
+A hibernation image restores every page the OS saved to the frame it came from, so the
+boot that resumes it must give the OS the same RAM and keep the same ranges from it.
+The payload line `hib=1`, in Stage 2's own lines (Stage 1 does not hand it on), asks
+kboot for a fixed layout on T6040:
+
+- everything from the start of RAM up to a fixed end is kept from the OS, except the
+  CTXR exec window;
+- the device tree the OS is started with is copied, last, into a 2 MiB slot 288 MiB
+  above the 32 MiB aligned start of RAM, and the heap restarts right above the slot;
+- `/chosen/aura,hibernate-layout` holds the start of RAM and the fixed end,
+  `/chosen/aura,hibernate-dt` the slot.
+
+kboot refuses the layout, says why, and boots without it when the window, aura, the
+boot arguments, what iBoot and Stage 1 placed, or the heap reach the slot, or when the
+fixed range meets a carveout or a firmware range. Without the properties Linux refuses
+to hibernate. Without `hib=1` nothing changes. Where iBoot loads the boot object, and
+with it the window and aura's image, is not fixed by this: hibernation also needs the
+object where it was on the boot that wrote the image.
+
 ## DebugUSB interception (development builds)
 
 A build made with `DEBUGUSB_PROXY=1` also opens the 15 second `aura-proxy`

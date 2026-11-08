@@ -860,6 +860,261 @@ static int dt_check_trial_esp(void)
     return -1;
 }
 
+/*
+ * Hibernation layout (T6040, config line hib=1).
+ *
+ * A hibernation image restores every page Linux saved to the frame it came from, so the boot that
+ * resumes it must give Linux the same RAM and keep the same ranges from it. Without hib=1 they
+ * move: iBoot picks where in a 32 MiB range it loads the boot object, in 16K steps, and what it
+ * places after the object, Stage 1's heap with the staged Stage 2, and this stage's heap with the
+ * device tree and the firmware buffers kboot reserves in it all follow, and so does the RAM between
+ * them.
+ *
+ * With hib=1, everything from the start of RAM to a fixed end is kept from Linux, but the CTXR
+ * exec window, which stays the OS's as without hib=1. The heap restarts at a fixed address. The
+ * device tree Linux is started with is copied, as the last step before the handoff, into a 2 MiB
+ * slot just below that heap: a kernel restored from an image was started with an earlier boot's
+ * tree, and the slot is in the range the image does not save, so that kernel finds this boot's
+ * tree at the address it was started with, and in it what moved (firmware segments such as the
+ * AOP log). Linux maps at most 2 MiB of device tree. /chosen/aura,hibernate-layout holds the start
+ * of RAM and the fixed end, /chosen/aura,hibernate-dt the slot.
+ *
+ * The slot is HIB_OBJECT_REGION above the 32 MiB aligned start of RAM. On the J616s iBoot has put
+ * every boot object, unpadded or padded by aurora-installer, 32 to 64 MiB above that. The padded
+ * Stage 1 is 146 MiB long, its 128 MiB window included, so the window ends at most 210 MiB above
+ * it, and the 78 MiB from there to the slot hold what iBoot places after the object (SEPFW, the
+ * boot arguments, firmware logs), Stage 1's heap with the staged Stage 2, and this stage's heap
+ * until now. The rover layout, for objects without the window, had the slot 160 MiB above; this is
+ * that plus the window. The heap span is the rover one, which held the kernel and the initramfs as
+ * well. A window or anything iBoot or aura placed that is not below the slot, or a fixed range
+ * that meets a range iBoot or the firmware owns, refuses the layout: kboot says why and boots
+ * without it, and Linux then refuses to hibernate.
+ *
+ * Where iBoot loads the object is not aura's to fix, and the window and this image (its spin tables
+ * and the S2R mailbox) move with it. The restored kernel runs from the pages it was saved from, so
+ * hibernation also needs the object where it was on the boot that wrote the image.
+ */
+#define HIB_RAM_ALIGN     SZ_32M
+#define HIB_OBJECT_REGION (288 * SZ_1M)
+#define HIB_HEAP_SPAN     (128 * SZ_1M)
+#define HIB_DT_SLOT       (2 * SZ_1M)
+/* What aura may still allocate after the last check, as in the rover layout */
+#define HIB_HEAP_MARGIN (8 * SZ_1M)
+
+static bool hib_requested, hib_decided;
+/* While the layout holds: the device tree slot, the heap above it, and the fixed end */
+static u64 hib_dt_base, hib_heap_base, hib_heap_end;
+/* The CTXR exec window inside the kept range, which the OS owns; empty without one */
+static u64 hib_window_base, hib_window_end;
+
+void kboot_request_hibernate_layout(bool on)
+{
+    hib_requested = on;
+}
+
+/* Whether [start, end) meets a range iBoot or the firmware owns, saying which. */
+static bool hib_fixed_range_taken(u64 start, u64 end)
+{
+    static const enum ctxr_range ranges[] = {CTXR_RANGE_A, CTXR_RANGE_B, CTXR_RANGE_C,
+                                             CTXR_RANGE_D, CTRR_RANGE_C, CTRR_RANGE_D};
+    static const char *const maps[] = {"/chosen/memory-map", "/chosen/carveout-memory-map"};
+    u64 a, b;
+    int ro = memory_fw_ro_range(&a, &b);
+
+    if (ro < 0 || (ro && a < end && b > start)) {
+        printf("hib: the fixed range meets the firmware RO range\n");
+        return true;
+    }
+    for (size_t i = 0; i < ARRAY_SIZE(ranges); i++) {
+        if (ctxr_range(ranges[i], &a, &b) && a < end && b > start) {
+            printf("hib: the fixed range meets CTXR/CTRR range %zu [0x%lx, 0x%lx)\n", i, a, b);
+            return true;
+        }
+    }
+    for (size_t i = 0; i < mcc_carveout_count; i++) {
+        a = mcc_carveouts[i].base;
+        b = a + mcc_carveouts[i].size;
+        if (mcc_carveouts[i].size && b > a && a < end && b > start) {
+            printf("hib: the fixed range meets MCC carveout [0x%lx, 0x%lx)\n", a, b);
+            return true;
+        }
+    }
+    for (size_t m = 0; m < ARRAY_SIZE(maps); m++) {
+        int node = adt_path_offset(adt, maps[m]);
+
+        if (node < 0) {
+            printf("hib: ADT %s not found\n", maps[m]);
+            return true;
+        }
+        ADT_FOREACH_PROPERTY(adt, node, prop)
+        {
+            u64 r[2];
+
+            if (prop->size != sizeof(r))
+                continue;
+            memcpy(r, prop->value, sizeof(r));
+            /* Region 24 is the usable RAM itself, region 45 the one iBoot loads the object in */
+            if (!r[1] || r[0] > UINT64_MAX - r[1] ||
+                (m && (!strcmp(prop->name, "region-id-24") || !strcmp(prop->name, "region-id-45"))))
+                continue;
+            if (r[0] < end && r[0] + r[1] > start) {
+                printf("hib: the fixed range meets ADT %s/%s [0x%lx, 0x%lx)\n", maps[m], prop->name,
+                       r[0], r[0] + r[1]);
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+/* Why this boot can't have the fixed layout, or NULL with it computed. Changes nothing. */
+static const char *hib_layout_refused(u64 *slot, u64 *end, u64 *window, u64 *window_end)
+{
+    u64 ram = cur_boot_args.phys_base, size = cur_boot_args.mem_size;
+    u64 lo, base, top, win = 0, win_size = 0;
+
+    if (chip_id != T6040)
+        return "the fixed layout is only known for T6040";
+    if (!size || ram > UINT64_MAX - size)
+        return "invalid RAM extent";
+    lo = ALIGN_UP(ram, HIB_RAM_ALIGN);
+    if (lo < ram || lo - ram > size || size - (lo - ram) < HIB_OBJECT_REGION + HIB_HEAP_SPAN)
+        return "too little RAM";
+    base = lo + HIB_OBJECT_REGION;
+    top = base + HIB_HEAP_SPAN;
+    if (ctxr_exec_window(&win, &win_size) && (win <= ram || win > base || win_size > base - win))
+        return "the CTXR exec window is not below the fixed slot";
+    if ((u64)_base < ram || (u64)_end > base)
+        return "aura is not below the fixed slot";
+    if (boot_args_addr < ram || boot_args_addr > base - SZ_16K)
+        return "boot_args is not below the fixed slot";
+    if (cur_boot_args.top_of_kernel_data > base)
+        return "what iBoot and Stage 1 placed reaches the fixed slot";
+    if (heapblock_high_water() > base)
+        return "the heap reaches the fixed slot";
+    if (hib_fixed_range_taken(base, top))
+        return "the fixed slot and heap meet a range iBoot or the firmware owns";
+    *slot = base;
+    *end = top;
+    *window = win;
+    *window_end = win + win_size;
+    return NULL;
+}
+
+/*
+ * Fix the layout, once a boot, before kboot_prepare_dt() allocates. When it can't, say why and
+ * change nothing: the boot goes on without the layout, and Linux refuses to hibernate.
+ */
+static void kboot_decide_hibernate_layout(void)
+{
+    u64 slot = 0, end = 0, win = 0, win_end = 0, heap = heapblock_high_water();
+    const char *why;
+
+    if (!hib_requested || hib_decided)
+        return;
+    hib_decided = true;
+
+    why = hib_layout_refused(&slot, &end, &win, &win_end);
+    if (!why && !heapblock_raise_base(slot + HIB_DT_SLOT))
+        why = "the heap reaches the fixed slot";
+    if (why) {
+        printf("hib: fixed layout refused: %s (RAM 0x%lx, aura 0x%lx..0x%lx, boot_args 0x%lx, "
+               "top 0x%lx, heap 0x%lx); Linux will not hibernate this boot\n",
+               why, cur_boot_args.phys_base, (u64)_base, (u64)_end, boot_args_addr,
+               cur_boot_args.top_of_kernel_data, heap);
+        return;
+    }
+    hib_dt_base = slot;
+    hib_heap_base = slot + HIB_DT_SLOT;
+    hib_heap_end = end;
+    hib_window_base = win;
+    hib_window_end = win_end;
+    printf("hib: fixed layout: RAM 0x%lx..0x%lx kept from Linux, device tree slot 0x%lx, heap "
+           "0x%lx..0x%lx (aura 0x%lx, top 0x%lx, heap was 0x%lx)\n",
+           cur_boot_args.phys_base, end, slot, hib_heap_base, end, (u64)_base,
+           cur_boot_args.top_of_kernel_data, heap);
+    if (win_end > win)
+        printf("hib: the OS keeps its CTXR exec window 0x%lx..0x%lx\n", win, win_end);
+}
+
+/* The layout no longer holds: take it out of the tree, so that Linux refuses to hibernate. */
+static int kboot_withdraw_hibernate_layout(const char *why)
+{
+    static const char *const props[] = {"aura,hibernate-layout", "aura,hibernate-dt"};
+    int node = fdt_path_offset(dt, "/chosen");
+
+    printf("hib: fixed layout withdrawn: %s; Linux will not hibernate this boot\n", why);
+    hib_dt_base = hib_heap_base = hib_heap_end = 0;
+    if (node < 0)
+        bail("FDT: /chosen not found to withdraw the hibernation layout\n");
+    for (size_t i = 0; i < ARRAY_SIZE(props); i++) {
+        int ret = fdt_delprop(dt, node, props[i]);
+        if (ret && ret != -FDT_ERR_NOTFOUND)
+            bail("FDT: couldn't remove chosen.%s\n", props[i]);
+    }
+    return 0;
+}
+
+/* Everything from the start of RAM to the fixed end, but the OS window. */
+static int dt_reserve_hibernate_layout(void)
+{
+    u64 ram = cur_boot_args.phys_base;
+
+    if (!hib_heap_end)
+        return 0;
+    if (hib_window_end > hib_window_base) {
+        if (fdt_add_mem_rsv(dt, ram, hib_window_base - ram) ||
+            fdt_add_mem_rsv(dt, hib_window_end, hib_heap_end - hib_window_end))
+            bail("FDT: couldn't reserve the hibernation layout\n");
+    } else if (fdt_add_mem_rsv(dt, ram, hib_heap_end - ram)) {
+        bail("FDT: couldn't reserve the hibernation layout\n");
+    }
+    printf("FDT: hibernation layout, RAM 0x%lx..0x%lx kept from Linux\n", ram, hib_heap_end);
+    return 0;
+}
+
+static int dt_set_hibernate_layout(int node)
+{
+    if (!hib_heap_end)
+        return 0;
+
+    fdt64_t layout[2] = {cpu_to_fdt64(cur_boot_args.phys_base), cpu_to_fdt64(hib_heap_end)};
+    if (fdt_setprop(dt, node, "aura,hibernate-layout", layout, sizeof(layout)))
+        bail("FDT: couldn't set chosen.aura,hibernate-layout\n");
+    if (fdt_setprop_u64(dt, node, "aura,hibernate-dt", hib_dt_base))
+        bail("FDT: couldn't set chosen.aura,hibernate-dt\n");
+    return 0;
+}
+
+/*
+ * The device tree Linux gets: with the layout, a copy in its fixed slot, made last so that nothing
+ * writes the tree after it. NULL when the layout could not be withdrawn from the tree.
+ */
+static void *kboot_hibernate_handoff_dt(void)
+{
+    const char *why = NULL;
+    u64 high_water = heapblock_high_water();
+    u32 size;
+
+    if (!hib_dt_base)
+        return dt;
+    size = fdt_totalsize(dt);
+    if (size > HIB_DT_SLOT)
+        why = "the device tree does not fit its slot";
+    else if (high_water > hib_heap_end - HIB_HEAP_MARGIN)
+        why = "the heap came within 8 MiB of the fixed end";
+    if (why)
+        return kboot_withdraw_hibernate_layout(why) ? NULL : dt;
+
+    memcpy((void *)hib_dt_base, dt, size);
+    dc_cvac_range((void *)hib_dt_base, size);
+    sysop("dsb sy");
+    printf("hib: device tree copied to its slot 0x%lx (%u bytes), heap high water 0x%lx of "
+           "0x%lx..0x%lx\n",
+           hib_dt_base, size, high_water, hib_heap_base, hib_heap_end);
+    return (void *)hib_dt_base;
+}
+
 static int dt_set_chosen(void)
 {
 
@@ -885,6 +1140,9 @@ static int dt_set_chosen(void)
         return -1;
 
     if (dt_set_s2r_mailbox(node))
+        return -1;
+
+    if (dt_set_hibernate_layout(node))
         return -1;
 
     if (chip_id == T8140 && dt_set_t8140_wfx_args(node))
@@ -10148,6 +10406,9 @@ int kboot_prepare_dt(void *fdt)
     if (!ctxr_exec_os_may_start())
         return -1;
 
+    /* Before the tree and anything kboot reserves are allocated */
+    kboot_decide_hibernate_layout();
+
     /* Need to init ISP early to carve out heap */
     if (chip_id != T8152)
         isp_init();
@@ -10179,6 +10440,13 @@ int kboot_prepare_dt(void *fdt)
 
     if (fdt_open_into(fdt, dt, dt_bufsize) < 0)
         bail("FDT: fdt_open_into() failed\n");
+
+    /*
+     * First in the map: U-Boot drops a reservation that overlaps one it has already recorded, and
+     * what kboot reserves after this inside the layout's range then goes instead.
+     */
+    if (dt_reserve_hibernate_layout())
+        return -1;
 
     if (fdt_add_mem_rsv(dt, (u64)dt, dt_bufsize))
         bail("FDT: couldn't add reservation for the devtree\n");
@@ -10494,6 +10762,10 @@ int kboot_prepare_dt(void *fdt)
             printf("FDT: free dt buffer space low, %u bytes left\n", dt_remain);
     }
 
+    if (hib_heap_end && heapblock_high_water() > hib_heap_end - HIB_HEAP_MARGIN &&
+        kboot_withdraw_hibernate_layout("the heap came within 8 MiB of the fixed end"))
+        return -1;
+
     printf("FDT prepared at %p\n", dt);
 
     return 0;
@@ -10800,8 +11072,13 @@ int kboot_boot(void *kernel)
         next_stage.entry = NULL;
         bail("kboot: secondary callback became pending before kernel entry\n");
     }
+    void *handoff_dt = kboot_hibernate_handoff_dt();
+    if (!handoff_dt) {
+        next_stage.entry = NULL;
+        return -1;
+    }
     next_stage.entry = kernel;
-    next_stage.args[0] = (u64)dt;
+    next_stage.args[0] = (u64)handoff_dt;
     next_stage.args[1] = 0;
     next_stage.args[2] = 0;
     next_stage.args[3] = 0;
