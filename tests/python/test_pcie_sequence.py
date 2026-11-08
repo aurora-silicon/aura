@@ -104,6 +104,7 @@ static int tunables_validate_local(const char *path, const char *prop, u64 span)
 }
 static int pmgr_adt_power_enable(const char *path) { powered++; return 0; }
 static int pmgr_adt_power_disable_index(const char *path, int i) { assert(0); return -1; }
+static int pmgr_adt_power_disable_under(const char *path, const char *name) { assert(0); return -1; }
 static void access_mmio(u64 addr)
 {
     assert(powered);
@@ -116,6 +117,8 @@ static u32 read32(u64 addr)
 {
     access_mmio(addr);
     if (addr == PHY) return phy_ctrl;
+    /* RUN_EN and RUN_EN2: ANS runs on the PHY, as on every boot this models. */
+    if (addr == PHY + 4) return 0x11;
     if (addr == PORT_PHY) return port_ctrl;
     if (addr == PORT + 0x800) return appclk;
     return 0;

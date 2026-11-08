@@ -485,6 +485,78 @@ int pmgr_adt_power_disable_recursive(const char *path)
     return pmgr_adt_devices_set_mode(path, PMGR_PS_PWRGATE, true, false);
 }
 
+static bool pmgr_depends_on(u16 id, u16 root, size_t depth)
+{
+    const struct pmgr_device *device;
+    u16 parents[2];
+
+    if (id == root)
+        return true;
+    if (depth >= PMGR_MAX_PARENT_DEPTH || pmgr_find_device(id, &device))
+        return false;
+    pmgr_adt_get_parents(device, parents);
+    return (parents[0] && pmgr_depends_on(parents[0], root, depth + 1)) ||
+           (parents[1] && pmgr_depends_on(parents[1], root, depth + 1));
+}
+
+/*
+ * Power off the gates of the ADT node at path that are the device named name or depend on it,
+ * children first. A virtual gate stands for its parent. The node's other gates stay on.
+ */
+int pmgr_adt_power_disable_under(const char *path, const char *name)
+{
+    const struct pmgr_device *device;
+    const u32 *devices;
+    u32 n_devices;
+    u16 root = 0, ids[16], parents[2];
+    u8 dies[16];
+    size_t count = 0;
+    bool has_root = false;
+
+    for (size_t i = 0; i < pmgr_devices_len; i++)
+        if (!(pmgr_devices[i].flags & PMGR_FLAG_VIRTUAL) &&
+            !strncmp(pmgr_devices[i].name, name, sizeof(pmgr_devices[i].name)))
+            root = pmgr_adt_get_id(&pmgr_devices[i]);
+    if (!root || pmgr_adt_find_devices(path, &devices, &n_devices) < 0)
+        return -1;
+
+    for (u32 i = 0; i < n_devices; i++) {
+        u16 id = FIELD_GET(PMGR_DEVICE_ID, devices[i]);
+        while (id && !pmgr_find_device(id, &device) && (device->flags & PMGR_FLAG_VIRTUAL)) {
+            pmgr_adt_get_parents(device, parents);
+            id = parents[0];
+        }
+        bool seen = false;
+        for (size_t j = 0; j < count; j++)
+            seen |= ids[j] == id;
+        if (!id || seen || !pmgr_depends_on(id, root, 0))
+            continue;
+        if (count == ARRAY_SIZE(ids))
+            return -1;
+        has_root |= id == root;
+        dies[count] = FIELD_GET(PMGR_DIE_ID, devices[i]);
+        ids[count++] = id;
+    }
+    if (!has_root) {
+        printf("pmgr: %s has no %s gate\n", path, name);
+        return -1;
+    }
+
+    while (count) {
+        size_t i = 0;
+        /* A gate no other remaining one depends on. The topology is validated acyclic. */
+        for (size_t j = 0; j < count; j++)
+            if (j != i && pmgr_depends_on(ids[j], ids[i], 0))
+                i = j, j = (size_t)-1;
+        if (pmgr_find_device(ids[i], &device) ||
+            pmgr_set_mode(pmgr_device_get_addr(dies[i], device), PMGR_PS_PWRGATE))
+            return -1;
+        ids[i] = ids[--count];
+        dies[i] = dies[count];
+    }
+    return 0;
+}
+
 int pmgr_adt_power_is_off(const char *path)
 {
     const u32 *devices;
