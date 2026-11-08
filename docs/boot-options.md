@@ -61,19 +61,31 @@ boot that resumes it must give the OS the same RAM and keep the same ranges from
 The payload line `hib=1`, in Stage 2's own lines (Stage 1 does not hand it on), asks
 kboot for a fixed layout on T6040:
 
-- everything from the start of RAM up to a fixed end is kept from the OS, except the
-  CTXR exec window;
-- the device tree the OS is started with is copied, last, into a 2 MiB slot 288 MiB
+- the CTXR exec window is the part of CTXR_D that every placement of the boot object
+  arms above aura's slot, at the same address on every boot (on the J616s with the
+  installer's padding: 96 MiB at 0x10008200000);
+- everything from the start of RAM up to a fixed end is kept from the OS, except that
+  window;
+- the device tree the OS is started with is copied, last, into a 2 MiB slot 320 MiB
   above the 32 MiB aligned start of RAM, and the heap restarts right above the slot;
 - `/chosen/aura,hibernate-layout` holds the start of RAM and the fixed end,
   `/chosen/aura,hibernate-dt` the slot.
 
-kboot refuses the layout, says why, and boots without it when the window, aura, the
-boot arguments, what iBoot and Stage 1 placed, or the heap reach the slot, or when the
-fixed range meets a carveout or a firmware range. Without the properties Linux refuses
-to hibernate. Without `hib=1` nothing changes. Where iBoot loads the boot object, and
-with it the window and aura's image, is not fixed by this: hibernation also needs the
-object where it was on the boot that wrote the image.
+iBoot loads the boot object at a different address on every boot, anywhere from 16 to
+48 MiB above the 32 MiB aligned start of RAM, and the window above aura's slot moves
+with it. The fixed window does not: a kernel that a loader places at its lowest free
+2 MiB lands at the same address on every boot. Each boot checks the fixed window
+against what CTXR_D arms; when it does not fit, the OS gets the window above aura's
+slot and kboot gives no layout. aura's own image, with its spin tables and its S2R
+mailbox, still moves with the object, inside the kept range: Linux uses the release
+addresses only when it starts, and a restored kernel reads this boot's mailbox from the
+tree in the slot.
+
+kboot refuses the layout, says why, and boots without it when the window is not the
+fixed one or is not below the slot, or when aura, the boot arguments, what iBoot and
+Stage 1 placed, or the heap reach the slot, or when the fixed range meets a carveout or
+a firmware range. Without the properties Linux refuses to hibernate. Without `hib=1`
+nothing changes, the window included.
 
 ## DebugUSB interception (development builds)
 

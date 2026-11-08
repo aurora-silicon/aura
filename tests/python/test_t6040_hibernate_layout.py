@@ -71,10 +71,16 @@ static bool ctxr_exec_window(u64 *base, u64 *size)
 {
     if (!confined)
         return false;
-    *base = window_base;
-    *size = window_size;
+    if (base)
+        *base = window_base;
+    if (size)
+        *size = window_size;
     return true;
 }
+/* ctxr_exec.c's fixed window, modelled: test_t6040_hibernate_fixed_window.py runs the real one. */
+static bool fixed_asked, window_fixed;
+static bool ctxr_exec_request_fixed_window(bool on) { fixed_asked = on; return true; }
+static bool ctxr_exec_window_is_fixed(void) { return confined && window_fixed; }
 /* [start, end) of each armed CTXR/CTRR range, as ctxr_range() reports them; end 0: not armed */
 static u64 armed[6][2];
 static bool ctxr_range(enum ctxr_range range, u64 *start, u64 *end)
@@ -147,11 +153,19 @@ static void *dt = blob;
 #define RAM      0x100032b8000UL
 #define RAM_SIZE 0xbc98d4000UL
 #define LO       0x10004000000UL /* the 32 MiB aligned start of RAM */
-#define SLOT     (LO + 288 * SZ_1M)
+#define SLOT     (LO + 320 * SZ_1M)
 #define END      (SLOT + 128 * SZ_1M)
 /* aurora-installer's padded Stage 1: 64K of headers, aura's 16 MiB slot, 2 MiB - 16K, the window */
 #define PADDED   (0x10000UL + 16 * SZ_1M + 2 * SZ_1M - SZ_16K + 128 * SZ_1M)
 #define TAIL     (3 * SZ_16K)
+/* The fixed window ctxr_exec.c gives this object on every placement */
+#define FIXED     (LO + 0x4200000UL)
+#define FIXED_END (LO + 0xa200000UL)
+/* Measured on the EL2 boots, above the object's load base: CTXR_D's start, the end of what
+ * iBoot placed (boot_args' top_of_kernel_data) and this stage's heap when the tree was allocated */
+#define BELOW     0xf4000UL
+#define TOP_OFF   0x98c0000UL
+#define HEAP_OFF  0xf064000UL
 
 static unsigned char input[1 << 16];
 
@@ -163,6 +177,8 @@ static void reset(void)
     maps_present = true;
     log_text[0] = 0;
     hib_requested = hib_decided = false;
+    fixed_asked = false;
+    window_fixed = true;
     hib_dt_base = hib_heap_base = hib_heap_end = hib_window_base = hib_window_end = 0;
     chip_id = T6040;
     cur_boot_args.phys_base = RAM;
@@ -183,37 +199,45 @@ static void reset(void)
 }
 
 /*
- * A boot with iBoot's object at @load. What iBoot places after it, then Stage 1's heap with the
- * staged Stage 2 and its firmware block, then this stage's heap so far: @after bytes in all.
+ * A boot with iBoot's object at @load: what iBoot places after it ends @top above @load (Stage 1's
+ * heap with the staged Stage 2 and its firmware block start there), and this stage's heap is at
+ * @heap above @load when kboot_prepare_dt() runs. The CTXR exec window is the fixed one.
  */
-static void boot(u64 load, u64 after)
+static void boot_at(u64 load, u64 top_off, u64 heap_off)
 {
     reset();
     u64 object_end = load + PADDED + TAIL;
     aura_base = load + 0x10000;
     aura_end = aura_base + 0x4a0000;
     confined = true;
-    window_base = ALIGN_UP(aura_base + 16 * SZ_1M, 2 * SZ_1M);
-    window_size = 128 * SZ_1M;
-    armed[CTXR_RANGE_D][0] = load - 0x104000;
+    window_base = FIXED;
+    window_size = FIXED_END - FIXED;
+    armed[CTXR_RANGE_D][0] = load - BELOW;
     armed[CTXR_RANGE_D][1] = load + PADDED + 0x3000;
     /* iBoot's pages for windows A to C and CTRR_C, after the object */
+    u64 top = load + top_off;
     for (int i = 0; i < 3; i++) {
-        armed[i][0] = object_end + 0x6a0000 + i * SZ_16K;
+        armed[i][0] = top - 3 * SZ_16K + i * SZ_16K;
         armed[i][1] = armed[i][0] + 0x1000;
     }
     armed[CTRR_RANGE_C][0] = armed[0][0];
     armed[CTRR_RANGE_C][1] = armed[2][1];
-    /* iBoot's DeviceTree and TrustCache below the object, the rest moved by Stage 1 */
-    u64 top = object_end + after / 2;
-    map_entry(1, "DeviceTree", load - 0x200000, 0x94000);
-    map_entry(1, "TrustCache", load - 0x160000, 0x60000);
-    map_entry(1, "SEPFW", top - 0x5f0000, 0x5ac000);
-    map_entry(1, "preoslog", top - 0x44000, 0x40000);
-    map_entry(1, "BootArgs", top - SZ_16K, SZ_16K);
-    boot_args_addr = top - SZ_16K;
+    /* iBoot's DeviceTree and TrustCache below the object, the rest after it */
+    map_entry(1, "DeviceTree", load - BELOW, 0x94000);
+    map_entry(1, "TrustCache", load - BELOW + 0x94000, 0x60000);
+    map_entry(1, "SEPFW", object_end + 0x4000, 0x5ac000);
+    map_entry(1, "preoslog", object_end + 0x5b0000, 0x40000);
+    map_entry(1, "BootArgs", top - 4 * SZ_16K, SZ_16K);
+    boot_args_addr = top - 4 * SZ_16K;
     cur_boot_args.top_of_kernel_data = top;
-    heap_base = (void *)(top + after / 2);
+    heap_base = (void *)(load + heap_off);
+}
+
+/* As the EL2 boots measured it */
+static void boot(u64 load, u64 unused)
+{
+    (void)unused;
+    boot_at(load, TOP_OFF, HEAP_OFF);
 }
 
 static bool meets(u64 a, u64 b, u64 c, u64 d) { return a < d && c < b; }
@@ -339,21 +363,22 @@ int main(int argc, char **argv)
     (void)argc;
     (void)argv;
     make_input();
-    assert(SLOT == 0x10016000000UL && END == 0x1001e000000UL);
+    assert(SLOT == 0x10018000000UL && END == 0x10020000000UL);
 
     /*
-     * Two placements at the ends of the 32 MiB range iBoot has loaded every boot object in, and
-     * one where a J616s put the padded Stage 1 (window at 0x10007a00000): the same layout.
+     * The two EL2 boots of 2026-11-08 (load bases 0x10005904000 and 0x10005cbc000) and the two
+     * ends of the range iBoot loads this object in (ctxr_exec.c): the same layout.
      */
-    static const u64 loads[] = {LO + 32 * SZ_1M, LO + 64 * SZ_1M - SZ_16K, 0x10006900000UL};
-    static const u64 afters[] = {40 * SZ_1M, 64 * SZ_1M, 20 * SZ_1M};
-    unsigned char props[3][64];
-    for (int i = 0; i < 3; i++) {
+    static const u64 loads[] = {0x10005904000UL, 0x10005cbc000UL, LO + 0x1004000UL + BELOW,
+                                LO + 0x3000000UL};
+    static const u64 afters[] = {0, 0, 0, 0};
+    unsigned char props[4][64];
+    for (int i = 0; i < 4; i++) {
         boot(loads[i], afters[i]);
         u64 win = window_base, win_end = window_base + window_size;
-        if (i == 2)
-            assert(win == 0x10007a00000UL);
+        assert(win == 0x10008200000UL && win_end == 0x1000e200000UL);
         kboot_request_hibernate_layout(true);
+        assert(fixed_asked);
         kboot_decide_hibernate_layout();
         assert(hib_dt_base == SLOT && hib_heap_base == SLOT + 2 * SZ_1M && hib_heap_end == END);
         assert(heapblock_high_water() == SLOT + 2 * SZ_1M);
@@ -388,7 +413,13 @@ int main(int argc, char **argv)
         kboot_decide_hibernate_layout();
         assert((u64)heap_base == heap && hib_dt_base == SLOT && strlen(log_text) == logged);
     }
-    assert(!memcmp(props[0], props[1], 24) && !memcmp(props[0], props[2], 24));
+    assert(!memcmp(props[0], props[1], 24) && !memcmp(props[0], props[2], 24) &&
+           !memcmp(props[0], props[3], 24));
+    /* Another chip doesn't ask ctxr_exec.c for the fixed window. */
+    boot(loads[0], afters[0]);
+    chip_id = T6041;
+    kboot_request_hibernate_layout(true);
+    assert(!fixed_asked);
 
     /* Without a window (a raw Stage 1, or no secondary to probe): one range, RAM to the end. */
     boot(loads[0], afters[0]);
@@ -399,7 +430,7 @@ int main(int argc, char **argv)
     assert(!prepare_dt() && rsv_covers(RAM, END));
 
     /* Without hib=1, and with hib=0 after hib=1: the tree, the heap and the handoff as before. */
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < 4; i++) {
         run_reference(loads[i], afters[i]);
         boot(loads[i], afters[i]);
         assert(unchanged(run(false)) && !strstr(log_text, "hib:"));
@@ -427,6 +458,7 @@ int main(int argc, char **argv)
         {"meets ADT /chosen/memory-map/SEPFW", 14},
         {"meets ADT /chosen/carveout-memory-map/region-id-46", 15},
         {"ADT /chosen/memory-map not found", 16},
+        {"the CTXR exec window is not at a fixed address", 17},
     };
     for (size_t i = 0; i < ARRAY_SIZE(cases); i++) {
         u64 load = loads[0], after = afters[0];
@@ -450,6 +482,7 @@ int main(int argc, char **argv)
         case 14: map_move(1, "SEPFW", SLOT + 2 * SZ_1M, 0x5ac000); break;
         case 15: map_move(2, "region-id-46", END - SZ_16K, 0x1e000000); break;
         case 16: maps_present = false; break;
+        case 17: window_fixed = false; break;
         }
         refused(cases[i].why);
         u64 heap = (u64)heap_base;
@@ -471,6 +504,7 @@ int main(int argc, char **argv)
         case 14: map_move(1, "SEPFW", SLOT + 2 * SZ_1M, 0x5ac000); break;
         case 15: map_move(2, "region-id-46", END - SZ_16K, 0x1e000000); break;
         case 16: maps_present = false; break;
+        case 17: window_fixed = false; break;
         default: continue; /* the heap or RAM itself is what is modeled away */
         }
         assert(unchanged(run(true)));

@@ -879,23 +879,27 @@ static int dt_check_trial_esp(void)
  * AOP log). Linux maps at most 2 MiB of device tree. /chosen/aura,hibernate-layout holds the start
  * of RAM and the fixed end, /chosen/aura,hibernate-dt the slot.
  *
- * The slot is HIB_OBJECT_REGION above the 32 MiB aligned start of RAM. On the J616s iBoot has put
- * every boot object, unpadded or padded by aurora-installer, 32 to 64 MiB above that. The padded
- * Stage 1 is 146 MiB long, its 128 MiB window included, so the window ends at most 210 MiB above
- * it, and the 78 MiB from there to the slot hold what iBoot places after the object (SEPFW, the
- * boot arguments, firmware logs), Stage 1's heap with the staged Stage 2, and this stage's heap
- * until now. The rover layout, for objects without the window, had the slot 160 MiB above; this is
- * that plus the window. The heap span is the rover one, which held the kernel and the initramfs as
- * well. A window or anything iBoot or aura placed that is not below the slot, or a fixed range
- * that meets a range iBoot or the firmware owns, refuses the layout: kboot says why and boots
- * without it, and Linux then refuses to hibernate.
+ * The slot is HIB_OBJECT_REGION above the 32 MiB aligned start of RAM. iBoot puts the boot object
+ * 16 to 48 MiB above that (ctxr_exec.c: its first virtual address is 16 MiB into a 32 MiB block,
+ * and the slide moves it by less than 32 MiB); the 28 placements seen on the J616s, rover and EL2
+ * objects alike, were all in that range, two of them at its lowest. The padded Stage 1 arms CTXR_D
+ * 146 MiB above its base, iBoot places SEPFW, the boot arguments and the CTXR_A-C pages after it,
+ * and Stage 1's heap with the staged Stage 2, then this stage's heap, follow: on the EL2 boots this
+ * stage's heap was 241 MiB above the object when the tree was allocated, so at most 289 MiB above
+ * the start for the highest object. The slot leaves 31 MiB above that. The heap span is the rover
+ * one, which held the kernel and the initramfs as well. Anything iBoot or aura placed that is not
+ * below the slot, or a fixed range that meets a range iBoot or the firmware owns, refuses the
+ * layout: kboot says why and boots without it, and Linux then refuses to hibernate.
  *
- * Where iBoot loads the object is not aura's to fix, and the window and this image (its spin tables
- * and the S2R mailbox) move with it. The restored kernel runs from the pages it was saved from, so
- * hibernation also needs the object where it was on the boot that wrote the image.
+ * Where iBoot loads the object is not aura's to fix, and the CTXR exec window above aura's slot
+ * moves with it. The restored kernel runs from the pages it was saved from, so hib=1 asks
+ * ctxr_exec.c for the window every placement of the object arms, at the same address on every
+ * boot, and a boot that can't have it gets no layout. This image (its spin tables and the S2R
+ * mailbox) still moves with the object: Linux uses the release addresses only when it starts, and
+ * a restored kernel reads the mailbox of the boot it runs on from the tree in the slot.
  */
 #define HIB_RAM_ALIGN     SZ_32M
-#define HIB_OBJECT_REGION (288 * SZ_1M)
+#define HIB_OBJECT_REGION (320 * SZ_1M)
 #define HIB_HEAP_SPAN     (128 * SZ_1M)
 #define HIB_DT_SLOT       (2 * SZ_1M)
 /* What aura may still allocate after the last check, as in the rover layout */
@@ -910,6 +914,8 @@ static u64 hib_window_base, hib_window_end;
 void kboot_request_hibernate_layout(bool on)
 {
     hib_requested = on;
+    /* The layout is only known for T6040; another chip keeps the window it always had. */
+    ctxr_exec_request_fixed_window(on && chip_id == T6040);
 }
 
 /* Whether [start, end) meets a range iBoot or the firmware owns, saying which. */
@@ -984,6 +990,8 @@ static const char *hib_layout_refused(u64 *slot, u64 *end, u64 *window, u64 *win
     top = base + HIB_HEAP_SPAN;
     if (ctxr_exec_window(&win, &win_size) && (win <= ram || win > base || win_size > base - win))
         return "the CTXR exec window is not below the fixed slot";
+    if (win_size && !ctxr_exec_window_is_fixed())
+        return "the CTXR exec window is not at a fixed address";
     if ((u64)_base < ram || (u64)_end > base)
         return "aura is not below the fixed slot";
     if (boot_args_addr < ram || boot_args_addr > base - SZ_16K)
