@@ -349,7 +349,7 @@ static bool offered, stage1_chained;
 static char *seen[4];
 static size_t seen_count;
 static bool nvme_init(void) { return true; }
-static bool nvme_has_live_post_m4_session(void) { return false; }
+static char *nvme_sart_var(void) { return NULL; }
 static bool nvme_shutdown(void) { return true; }
 #define CMDLINE_LENGTH_RV1 256
 #define CMDLINE_LENGTH_RV2 608

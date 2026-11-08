@@ -10,7 +10,8 @@ def test_poisoned_session_refuses_io_before_buffer_changes(tmp_path):
     root = Path(__file__).resolve().parents[2]
     source = Path(os.environ.get("NVME_SOURCE", root / "src/nvme.c")).read_text()
     declarations = source[source.index("#define NVME_TIMEOUT"):source.index("static u64 nvme_read64_lo_hi")]
-    execute = source[source.index("static bool nvme_exec_command("):source.index("bool nvme_init(void)")]
+    execute = source[source.index("static bool nvme_exec_command("):
+                     source.index("/* The ADT describes a post-M4 ANS")]
     read = source[source.index("bool nvme_flush("):]
     read_limit = next(line for line in (root / "src/nvme.h").read_text().splitlines()
                       if line.startswith("#define NVME_MAX_READ_BLOCKS "))
@@ -24,6 +25,7 @@ def test_poisoned_session_refuses_io_before_buffer_changes(tmp_path):
 #include <string.h>
 typedef uint8_t u8; typedef uint16_t u16; typedef uint32_t u32; typedef uint64_t u64;
 typedef int asc_dev_t; typedef int rtkit_dev_t; typedef int sart_dev_t;
+struct sart_entry { u8 index, flags; u64 paddr, size; };
 #define static_assert _Static_assert
 #define BIT(n) (1ULL << (n))
 #define GENMASK(h,l) (((~0ULL) >> (63-(h))) & ((~0ULL) << (l)))

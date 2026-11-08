@@ -232,11 +232,10 @@ static int smp_call_sync0(int cpu, void (*fn)(void)) { return 0; }
 static void do_enable_tso(void) {}
 static bool nvme_shutdown(void) { return true; }
 static bool nvme_keep_running_for_linux;
-static bool nvme_adopt_live_session;
+static bool nvme_set_sart_var(const char *v) { return true; }
 static int display_configure(const char *s) { printf("DISPLAY %s\n", s); return 0; }
 static int display_configure_second(const char *s) { printf("DISPLAY2 %s\n", s); return 0; }
 #define T8132 0x8132
-static bool nvme_init(void) { printf("NVME init\n"); return true; }
 static void mitigations_configure(const char *s) {}
 static int boot_storage_load(const char *spec, struct kernel_header **k, void **f) { return -1; }
 /* A stage 1 configured with its target (stage1_config.c), or not (NULL) */

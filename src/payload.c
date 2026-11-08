@@ -204,7 +204,7 @@ static void *load_kernel(void *p, size_t size)
 /* Passed after every other line to a chainloaded stage when a config line was lost */
 #define CONFIG_LOST_VAR "m1n1.config-lost=1"
 
-/* The two extra slots carry CONFIG_LOST_VAR and nvme.adopt without reducing the chosen limit. */
+/* The two extra slots carry CONFIG_LOST_VAR and nvme.sart without reducing the chosen limit. */
 #ifdef CHAINLOADING
 static size_t chosen_cnt = 1;
 static char *chosen[MAX_CHOSEN_VARS + 2] = {
@@ -231,7 +231,7 @@ static bool config_seen = false;
 static bool config_lost_passed = false;
 
 static const char *const config_names[] = {
-    "chosen.",  "chainload=",   "boot=", "nvme.adopt=",
+    "chosen.",  "chainload=",   "boot=", "nvme.sart=",
     "display=", "mitigations=", "tso=",  "m1n1.config-lost="};
 
 /* The start of a line of a variable m1n1 knows */
@@ -286,12 +286,10 @@ static bool check_var(u8 **p)
     } else if (IS_VAR("boot=")) {
         if (!boot_spec)
             boot_spec = val;
-    } else if (IS_VAR("nvme.adopt=")) {
-        if (!strcmp(val, "live-rtkit-v1")) {
-            nvme_adopt_live_session = true;
-            /* Started by an earlier aura stage, which has had its host window already. */
+    } else if (IS_VAR("nvme.sart=")) {
+        /* Started by an earlier aura stage, which has had its host window already. */
+        if (nvme_set_sart_var(val))
             stage1_chained = true;
-        }
 #ifdef DEBUGUSB_PROXY
     } else if (IS_VAR("aura.host-window=")) {
         stage1_window_passed = true;
@@ -502,12 +500,14 @@ int payload_run(void)
     }
 
     if (kernel && fdt) {
-        /* The shared post-M4 U-Boot driver adopts ANS instead of starting it, on every
-         * T8132 board. An inline ESP payload has not gone through boot_storage_load(). */
-        if (chip_id == T8132 && !nvme_init()) {
-            printf("Payload: cannot prepare the M4 ANS session\n");
+        /*
+         * Linux adopts a running post-M4 ANS from boot=. Any other payload starts ANS itself:
+         * power it off before kboot's pcie_init(), which brings its PCIe block and the radio's
+         * link back up, and kboot_prepare_dt() passes the SART entries on.
+         */
+        nvme_keep_running_for_linux = boot_spec != NULL;
+        if (!boot_spec && !nvme_shutdown())
             goto boot_failed;
-        }
         cpufreq_init();
         if (smp_start_secondaries() && chip_id == T8140) {
             printf("SMP: refusing payload handoff with missing T8140 CPUs\n");
@@ -562,8 +562,6 @@ int payload_run(void)
 
         if (kboot_boot(kernel))
             goto boot_failed;
-        if (boot_spec)
-            nvme_keep_running_for_linux = true;
         return 0;
 
     boot_failed:

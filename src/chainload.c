@@ -360,7 +360,6 @@ static bool chainload_start_trial(char **vars, size_t *var_cnt, size_t var_capac
 
 int chainload_load(const char *spec, char **vars, size_t *var_cnt, size_t var_capacity)
 {
-    static char adopt_var[] = "nvme.adopt=live-rtkit-v1";
 #if defined(DEBUGUSB_PROXY) && !defined(ESP_STAGE2)
     static char host_window_var[] = "aura.host-window=done";
 #endif
@@ -378,19 +377,19 @@ int chainload_load(const char *spec, char **vars, size_t *var_cnt, size_t var_ca
         return -1;
     }
 
-    if (nvme_has_live_post_m4_session()) {
+    /* Post-M4: the SART entries the next stage starts ANS again with, after nvme_shutdown(). */
+    char *sart_var = nvme_sart_var();
+    if (sart_var) {
         bool present = false;
-        for (size_t i = 0; i < *var_cnt; i++) {
-            if (!strcmp(vars[i], adopt_var))
-                present = true;
-        }
+        for (size_t i = 0; i < *var_cnt; i++)
+            present |= vars[i] == sart_var;
         if (!present) {
             if (*var_cnt >= var_capacity) {
-                printf("chainload: no room for ANS adoption variable\n");
+                printf("chainload: no room for nvme.sart\n");
                 nvme_shutdown();
                 return -1;
             }
-            vars[(*var_cnt)++] = adopt_var;
+            vars[(*var_cnt)++] = sart_var;
         }
     }
 

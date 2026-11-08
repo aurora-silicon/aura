@@ -30,6 +30,7 @@
 #include "malloc.h"
 #include "mcc.h"
 #include "memory.h"
+#include "nvme.h"
 #include "pcie.h"
 #include "pmgr.h"
 #include "rtkit.h"
@@ -8879,6 +8880,22 @@ static int kboot_boot_t8152(void *kernel)
     return 0;
 }
 
+/* The ANS NVMe node: an apple,sart phandle and an "...-nvme-ans2" compatible. */
+static int dt_ans_nvme_node(void)
+{
+    for (int node = fdt_next_node(dt, -1, NULL); node >= 0; node = fdt_next_node(dt, node, NULL)) {
+        int len;
+        const char *c = fdt_getprop(dt, node, "compatible", &len);
+
+        if (!c || !fdt_getprop(dt, node, "apple,sart", NULL))
+            continue;
+        for (const char *s = c; s < c + len; s += strlen(s) + 1)
+            if (strlen(s) >= 9 && !strcmp(s + strlen(s) - 9, "nvme-ans2"))
+                return node;
+    }
+    return -1;
+}
+
 int kboot_prepare_dt(void *fdt)
 {
     if (smp_has_pending_calls()) {
@@ -8949,12 +8966,11 @@ int kboot_prepare_dt(void *fdt)
             image_end = max(image_end, inherited);
     }
     /*
-     * Both post-M4 storage paths retain firmware buffers in this stage's heap. T6041 hands the
-     * live ANS over the same way (nvme.adopt=live-rtkit-v1): its RTKit buffers must stay out of
-     * Linux's allocator (J616C: ANS syslog lines in page-cache pages at the SART-allowed heap
-     * addresses).
+     * A post-M4 ANS keeps the firmware buffers an aura stage gave it in that stage's heap, running
+     * or powered off: they must stay out of Linux's allocator (J616C: ANS syslog lines in
+     * page-cache pages at the SART-allowed heap addresses).
      */
-    if (chip_id == T8140 || chip_id == T6041 || chip_id == T8152 || chip_id == T8132) {
+    if (nvme_post_m4()) {
         u64 ram_end, inherited = cur_boot_args.top_of_kernel_data;
         u64 high_water = heapblock_high_water();
 
@@ -8996,33 +9012,37 @@ int kboot_prepare_dt(void *fdt)
     }
 
     /*
-     * A live ANS handed to Linux keeps every buffer an earlier stage gave it (on a normal boot
-     * Stage 1 read the ESP, so the buffers are in Stage 1's heap, not this one's). Reserve each
-     * SART-allowed range inside RAM; the nvme-apple adoption requires them reserved anyway.
+     * A post-M4 ANS keeps every buffer an earlier stage gave it (on a normal boot Stage 1 read
+     * the ESP, so the buffers are in Stage 1's heap, not this one's), running or powered off.
+     * Reserve each SART-allowed range inside RAM. If ANS will be off when the payload starts,
+     * the SART has lost the entries, and its next start writes them back from the nvme node's
+     * apple,sart-entries: per entry, (index << 8 | flags), address and size, 64 bits each.
      */
-    if (chip_id == T6041 || chip_id == T8142 ||
-        (chip_id == T6040 && !fdt_node_check_compatible(dt, 0, "apple,j614s"))) {
-        sart_dev_t *sart = sart_init("/arm-io/sart-ans");
+    struct sart_entry sart[16];
+    bool ans_off;
+    int sart_cnt = nvme_sart_entries(sart, ARRAY_SIZE(sart), &ans_off);
+    fdt64_t sart_cells[3 * ARRAY_SIZE(sart)];
+    for (int i = 0; i < sart_cnt; i++) {
         u64 ram_start = cur_boot_args.phys_base;
         u64 ram_end = ram_start + cur_boot_args.mem_size;
 
-        if (!sart)
-            bail("FDT: cannot read the ANS SART\n");
-        for (int i = 0; i < 16; i++) {
-            u64 paddr;
-            size_t sz;
-
-            if (!sart_get_allowed(sart, i, &paddr, &sz) || paddr < ram_start || paddr >= ram_end)
-                continue;
-            u64 start = ALIGN_DOWN(paddr, SZ_16K);
-            u64 end = ALIGN_UP(min(paddr + sz, ram_end), SZ_16K);
-            if (fdt_add_mem_rsv(dt, start, end - start)) {
-                sart_release(sart);
-                bail("FDT: couldn't reserve ANS buffer\n");
-            }
-            printf("FDT: ANS buffer [0x%lx, 0x%lx) reserved\n", start, end);
-        }
-        sart_release(sart);
+        sart_cells[3 * i] = cpu_to_fdt64((u64)sart[i].index << 8 | sart[i].flags);
+        sart_cells[3 * i + 1] = cpu_to_fdt64(sart[i].paddr);
+        sart_cells[3 * i + 2] = cpu_to_fdt64(sart[i].size);
+        if (sart[i].paddr < ram_start || sart[i].paddr >= ram_end)
+            continue;
+        u64 start = ALIGN_DOWN(sart[i].paddr, SZ_16K);
+        u64 end = ALIGN_UP(min(sart[i].paddr + sart[i].size, ram_end), SZ_16K);
+        if (fdt_add_mem_rsv(dt, start, end - start))
+            bail("FDT: couldn't reserve ANS buffer\n");
+        printf("FDT: ANS buffer [0x%lx, 0x%lx) reserved\n", start, end);
+    }
+    if (sart_cnt && ans_off) {
+        int node = dt_ans_nvme_node();
+        if (node < 0 ||
+            fdt_setprop(dt, node, "apple,sart-entries", sart_cells, sart_cnt * 3 * sizeof(fdt64_t)))
+            bail("FDT: couldn't pass the ANS SART entries on\n");
+        printf("FDT: ANS will be off; %d SART entries passed on\n", sart_cnt);
     }
 
     // aura moved itself (start.S). On M3 it moved above the chainloaded image,

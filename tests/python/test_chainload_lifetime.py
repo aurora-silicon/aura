@@ -36,7 +36,8 @@ static bool chainload_start_trial(char **vars, size_t *var_cnt, size_t var_capac
     return true;
 }
 static bool nvme_init(void) { inits++; return true; }
-static bool nvme_has_live_post_m4_session(void) { return true; }
+static char sart_var[] = "nvme.sart=0";
+static char *nvme_sart_var(void) { return sart_var; }
 static bool nvme_shutdown(void) { return shutdown_ok; }
 static int rust_load_image(const char *spec, void **data, size_t *size, bool *proxy_request,
                            char *trial, size_t trial_capacity)
@@ -61,7 +62,7 @@ static int rust_load_image(const char *spec, void **data, size_t *size, bool *pr
 static int chainload_image(void *data, size_t size, char **vars, size_t count)
 {
     assert(data == image && size == sizeof(image) && freed == loads - 1);
-    assert(count == 1 && !strcmp(vars[0], "nvme.adopt=live-rtkit-v1"));
+    assert(count == 1 && vars[0] == sart_var);
     copied++;
     int error = copy_error;
     if (in_trial && trial_copy_error)
