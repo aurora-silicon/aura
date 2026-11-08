@@ -84,7 +84,7 @@ struct board {
     const char *name, *uuid;
     u64 dram_size;
     int external; /* /arm-io/disp0: 0 internal, 1 "external" present, -1 no node */
-    bool native;  /* the DT asks for PIODMA and scanout (t8132-j713-j715.dtsi) */
+    bool native;  /* the DT asks for PIODMA and scanout (t8132-laptop.dtsi) */
     unsigned count;
     struct adt_segment_ranges segs[7];
 };
@@ -99,7 +99,7 @@ static const struct board j713 = {"j713", FW2662, 16UL << 30, 0, true, 7, { /* A
     SEG(0x103e5c1c000, NONE, 0x10001b58000, 0x4000, 2),
     SEG(0x103e5b5c000, NONE, 0x10001b5c000, 0xc0000, 2),
     SEG(0x103e1bec000, NONE, 0x10001c1c000, 0x3f70000, 2)}};
-static const struct board j604 = {"j604", FW2662, 16UL << 30, 0, false, 7, { /* ADT 26.6.2 */
+static const struct board j604 = {"j604", FW2662, 16UL << 30, 0, true, 7, { /* ADT 26.6.2 */
     SEG(0x100002a8000, 0, 0x10007770000, 0x806000, 1),
     SEG(0x103dfcdc000, 0x806000, 0x10007f78000, 0x325000, 0),
     SEG(0x10006084000, 0xb2b000, 0x10006084000, 0x24000, 10),
@@ -285,7 +285,7 @@ static void published(bool piodma)
     assert(!!fdt_getprop(dt, fdt_path_offset(dt, "disp0"), "apple,j713-inherited-mappings",
                          NULL) == piodma);
     assert(!!fdt_getprop(dt, fdt_path_offset(dt, "disp0"), "memory-region", NULL) == piodma);
-    assert(walks == (b.native && !strcmp(b.uuid, FW2662) ? 2 : 0));
+    assert(walks == (b.native && os_firmware.version == V26_6_2 ? 2 : 0));
 }
 static void handed_over(const struct board *board, enum fw_version fw, bool piodma)
 {
@@ -316,15 +316,20 @@ int main(int argc, char **argv)
     handed_over(&old, V26_5, false);
     handed_over(&old, V27_0, false);
     handed_over(&old, V26_6, false);
-    /* The J713's disp0 is never read. */
+    /* The J713's disp0 is never read. PIODMA follows the firmware version, not the image. */
     old = j713; old.external = -1;
-    handed_over(&old, V26_6, true);
+    handed_over(&old, V26_6, false);
 
-    /* Every other M4 Mac with a panel, on 26.6.2. The J715's DT asks for PIODMA too. */
-    handed_over(&j604, V26_6_2, false);
+    /* Every other M4 Mac with a panel, on 26.6.2. The laptops' DT asks for PIODMA. */
+    handed_over(&j604, V26_6_2, true);
     handed_over(&j715, V26_6_2, true);
+    struct board other = j604;
+    other.name = "j604-other-image";
+    other.uuid = "0BC97BDD-E2FE-3A1B-96B4-8EA8FC5B8BE8"; /* any image on 26.6.2 */
+    handed_over(&other, V26_6_2, true);
     struct board imac = j604;
     imac.name = "j624";
+    imac.native = false;
     handed_over(&imac, V26_6_2, false);
 
     /* Any other firmware: nothing, as before. */
