@@ -48,6 +48,22 @@ u32 chip_id;
 volatile enum exc_guard_t exc_guard;
 volatile int exc_count;
 struct fw_version_info os_firmware;
+const struct fw_version_info fw_versions[V26_6_2 + 1] = {
+    [V14_7] = {V14_7, "14.7", {14, 7, 0}, 3, "iBoot"},
+    [V26_6_2] = {V26_6_2, "26.6.2", {26, 6, 2}, 3, "mBoot-18000.161.10"},
+};
+
+/* As src/firmware.c: an iBoot of the 18000.161.10 train loads the 26.6.2 images. */
+enum fw_version firmware_os_components(void)
+{
+    static const char train[] = "mBoot-18000.161.10.";
+
+    if (os_firmware.version == V26_6_2)
+        return V26_6_2;
+    if (os_firmware.iboot && !strncmp(os_firmware.iboot, train, sizeof(train) - 1))
+        return V26_6_2;
+    return os_firmware.version;
+}
 size_t mcc_carveout_count;
 struct mcc_carveout mcc_carveouts[8];
 static u64 ram_base, ram_size, fb_base;
@@ -854,9 +870,9 @@ static void contract_check(const void *dt)
     const char *uuid = fdt_getprop(dt, dcp, "apple,firmware-uuid", NULL);
     check(uuid && !strcmp(uuid, DCP_UUID), "published: dcp apple,firmware-uuid is the ADT's");
     const u32 v26[3] = {26, 6, 2};
-    check(u32s_are(dt, dcp, "apple,firmware-version", v26, 3) &&
+    check(u32s_are(dt, dcp, "apple,firmware-version", os_firmware.num, os_firmware.num_length) &&
               u32s_are(dt, dcp, "apple,firmware-compat", v26, 3),
-          "published: dcp apple,firmware-version and -compat are 26.6.2");
+          "published: dcp apple,firmware-version is the OS release, -compat 26.6.2");
 
     check(linked_segments(dt, dcp) == (1u << NSEGS) - 1 && region_count(dt, dcp) == NSEGS,
           "published: every iop-dcp-nub segment is one dcp memory-region");
@@ -985,6 +1001,7 @@ static const struct scenario scenarios[] = {
     {"stale-optin-zero", PUBLISH, "a left-over chosen.asahi,t6041-dcp=0 does not disable it"},
     {"repeat", PUBLISH, "a second call adds nothing"},
     {"oslog-in-memreserve", PUBLISH, "an __OS_LOG wholly inside a /memreserve/ is still described"},
+    {"os-26-7-train", PUBLISH, "26.7.1 booted by an 18000.161.10 train iBoot: compat 26.6.2, version 26.7.0"},
     /* chip, board and device tree */
     {"wrong-chip", NOTHING, "chip T6041 with a T6040 device tree"},
     {"wrong-board", NOTHING, "an unsupported T6040 board"},
@@ -1110,6 +1127,8 @@ int main(int argc, char **argv)
         prop_drop("/arm-io/dcp", "clock-gates");
     if (is(s, "wrong-os") || is(s, "stale-optin-wrong-os"))
         os_firmware = (struct fw_version_info){V14_7, "14.7", {14, 7, 0}, 3, "iBoot"};
+    if (is(s, "os-26-7-train"))
+        os_firmware = (struct fw_version_info){V26_7, "26.7", {26, 7, 0}, 3, "mBoot-18000.161.10.701.1"};
     if (is(s, "unknown-os"))
         os_firmware = (struct fw_version_info){V_UNKNOWN, "unknown", {0}, 0, "unknown"};
     if (is(s, "bad-uuid"))
