@@ -700,13 +700,21 @@ def plan_boot(sptm, txm, xnu, adt, *, dram_base, phys_base, mem_size, mem_size_a
                 notes.append("aura HIGH carve-out declared as region-id-%d %#x+%#x "
                              "(SPTM-reserved, must not manage)"
                              % (rid, aura_base, aura_end - aura_base))
+    # /chosen/mix-n-match-prevention-status: image4's "allow mix-n-match" knob, which Darwin
+    # reads straight out of /chosen (_darwinAllowsMixAndMatch: allowed iff the property is
+    # present and zero). iBoot sets it on a native boot and aura's tree has no such property,
+    # so every image4 evaluation that waives a policy for a mixed environment -- TXM's 'vnum'
+    # among them, which is what refuses the cryptex trust cache when the environment carries no
+    # OS version -- refuses instead. Declare an environment that allows it.
+    chosen = adt_find(root, "chosen")
+    if not any(p[0] == "mix-n-match-prevention-status" for p in chosen.props):
+        chosen.props.append(["mix-n-match-prevention-status", struct.pack("<I", 0), 0])
+        notes.append("injected /chosen/mix-n-match-prevention-status = 0 (mix-and-match allowed)")
+
     # /chosen/boot-command is iBoot's boot mode, and AppleImage4 switches on it: only the
     # ordinary values (1, 2, 9, 10, 11) leave NVRAM mutable, while 4 makes it decide "platform
-    # requires immutable NVRAM [Deconflicting]". NVRAM then cannot hold a nonce slot, the
-    # cryptex1 boot nonce never exists, and launchd's cryptex graft fails to load its trust
-    # cache -- which ends the boot in recovery. aura's own boot carries a value the guest must
-    # not inherit, so present an ordinary boot.
-    chosen = adt_find(root, "chosen")
+    # requires immutable NVRAM [Deconflicting]". aura's own boot carries an ordinary value, so
+    # this only says in the notes what the guest will see.
     for prop in chosen.props:
         if prop[0] == "boot-command":
             had = int.from_bytes(prop[1][:4], "little")

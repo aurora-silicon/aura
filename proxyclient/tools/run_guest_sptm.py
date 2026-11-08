@@ -123,6 +123,8 @@ STRIP_NODES = ("/arm-io/ane", "/arm-io/dart-ane")
 # comes up in recovery until someone clears it by hand -- so one failed guest boot costs a trip
 # through 1TR. Nothing here needs NVRAM (the boot arguments come through boot_args), so the device
 # is hidden: macOS reports "platform does not support NVRAM" and its writes go nowhere.
+# Hiding the device outright stalls the guest's IOKit at the display DART, so the writes are
+# patched out in XNU instead (the nvram_ro quirk); this is kept for reference.
 HOST_STATE_NODES = ("/arm-io/qspi/spinor/anvram",)
 ERROR_HANDLER = "/arm-io/error-handler"
 # Without cL4 the exclaves stay NOT_SUPPORTED, so their nodes and the RTBuddy routes that resolve
@@ -180,7 +182,15 @@ XNU_QUIRKS = (
          # and let the graft proceed. The guest then accepts a trust cache its supervisor refused:
          # a tracing switch, never on by default.
          tc_force=(("trust-cache load result", "BootKC-rx",
-                    0x37e1fd8, 0x340000e0, 0x14000007),)),
+                    0x37e1fd8, 0x340000e0, 0x14000007),),
+         # The guest needs a working NVRAM -- hiding the device stalls its IOKit, and Image4's
+         # nonce slots live there -- but nothing it writes should reach the flash, or a failed
+         # boot leaves recovery-boot-mode behind and the machine stops booting aura. Make
+         # AppleARMNORNVRAM::write return success without writing (keeping its BTI landing pad),
+         # so the guest keeps its in-memory NVRAM and the host's copy is untouched.
+         nvram_ro=(("AppleARMNORNVRAM::write", "BootKC-rx", 0x1c1bec, 0xaa0003e8, 0x52800000),
+                   ("AppleARMNORNVRAM::write return", "BootKC-rx", 0x1c1bf0, 0x52805840,
+                    0xd65f03c0))),
 )
 
 
@@ -669,10 +679,10 @@ def main():
         raise SystemExit("no debug-link USB port found in the ADT")
     print("debug-link port" + ("s" if len(phys) > 1 else "") + " hidden:", " ".join(port_nodes))
     keep_exclaves = env_on("AURA_KEEP_EXCLAVES")
-    # AURA_SHARE_NVRAM lets the guest reach the real NVRAM, which its Image4 nonce storage
-    # needs -- at the price of a failed boot leaving recovery-boot-mode behind.
-    host_state = () if env_on("AURA_SHARE_NVRAM") else HOST_STATE_NODES
-    hide = port_nodes + STRIP_NODES + host_state + tuple(quirks["hide"])
+    # The NVRAM device stays visible (the guest's IOKit stalls without it and its Image4 nonce
+    # slots live there); its writes are patched out instead, unless AURA_SHARE_NVRAM lets them
+    # through at the price of a failed boot leaving recovery-boot-mode behind.
+    hide = port_nodes + STRIP_NODES + tuple(quirks["hide"])
     if not env_on("AURA_KEEP_ERRH"):
         hide += (ERROR_HANDLER,)
     if env_on("AURA_HIDE_DOCKCHANNEL"):
@@ -726,6 +736,8 @@ def main():
         set_xnu_rorgn(p, sym, plan, quirks)
     if quirks.get("nvram_mutable"):
         patch_xnu(p, sym, plan, quirks["nvram_mutable"])
+    if quirks.get("nvram_ro") and not env_on("AURA_SHARE_NVRAM"):
+        patch_xnu(p, sym, plan, quirks["nvram_ro"])
     if env_on("AURA_XNU_TC_FORCE") and quirks.get("tc_force"):
         patch_xnu(p, sym, plan, quirks["tc_force"])
     configure(p, sym, plan, live_adt)
