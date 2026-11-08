@@ -1347,6 +1347,17 @@ static void dcp6_describe_segs(const char *path)
  * The ADT values a device tree and a handoff for this SoC need, for the serial console. Read
  * only, ADT memory only: no device is accessed here.
  */
+/*
+ * The interface the handed-over firmware speaks: the release whose coprocessor images the OS iBoot
+ * loaded (firmware_os_components()), which is what the handoff was checked against. A J616s on
+ * 26.7.1 runs the 26.6.2 images, and the kernel's desktop IOMFB admits only that compat;
+ * apple,firmware-version keeps the detected OS release.
+ */
+static const struct fw_version_info *dcp6_fw_compat(void)
+{
+    return &fw_versions[firmware_os_components()];
+}
+
 static __attribute__((noinline)) void dcp6_describe(void)
 {
     static const char *const nodes[] = {
@@ -2411,7 +2422,7 @@ static int dcp6_publish(void *dt, const struct dcp6_dt *n)
     if (dcp < 0 || firmware_set_fdt(dt, dcp, "apple,firmware-version", &os_firmware))
         return -1;
     dcp = fdt_path_offset(dt, n->dcp);
-    if (dcp < 0 || firmware_set_fdt(dt, dcp, "apple,firmware-compat", &os_firmware))
+    if (dcp < 0 || firmware_set_fdt(dt, dcp, "apple,firmware-compat", dcp6_fw_compat()))
         return -1;
     return 0;
 }
@@ -2694,7 +2705,7 @@ static int dcpext6_publish(void *dt, const struct dcpext6_inst *inst)
         fdt_setprop(dt, node, "memory-region-names", mr_names, sizeof(mr_names)) ||
         fdt_setprop_string(dt, node, "apple,firmware-uuid", DCP6_UUID) ||
         firmware_set_fdt(dt, node, "apple,firmware-version", &os_firmware) ||
-        firmware_set_fdt(dt, node, "apple,firmware-compat", &os_firmware) ||
+        firmware_set_fdt(dt, node, "apple,firmware-compat", dcp6_fw_compat()) ||
         fdt_setprop_u32(dt, node, DCPEXT6_MARKER, 1))
         return -1;
     return 0;
@@ -3113,7 +3124,7 @@ static int t6041_ext_fill(void *dt, const struct t6041_ext *ext)
         return -1;
     node = fdt_path_offset(dt, ext->dt_path);
     if (node < 0 || firmware_set_fdt(dt, node, "apple,firmware-version", &os_firmware) ||
-        firmware_set_fdt(dt, node, "apple,firmware-compat", &os_firmware))
+        firmware_set_fdt(dt, node, "apple,firmware-compat", dcp6_fw_compat()))
         return -1;
     return 0;
 }
