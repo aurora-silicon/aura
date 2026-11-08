@@ -183,11 +183,11 @@ static struct copy_rule copy_rules_v10[] = {
 };
 
 /*
- * The T6041 (M4 Pro/Max) SIO firmware also reports protocol 10, but its tables differ from
+ * The T6040/T6041 (M4 Pro/Max) SIO firmware also reports protocol 10, but its tables differ from
  * T6030's: only the shim records the ADT describes end in the all-ones selector (the empty slots
  * stay zero), and the response array (key 0x0b) belongs to the OS driver, which publishes it as an
  * entry count along with the segment array. The tables live in the SIO DART's address space,
- * which on T6041 begins after the preloaded firmware's segments (sio_iova_base()).
+ * which on these SoCs begins after the preloaded firmware's segments (sio_iova_base()).
  */
 static struct copy_rule copy_rules_t6041[] = {
     {
@@ -233,7 +233,7 @@ static struct copy_rule copy_rules_t6041[] = {
  */
 static int sio_iova_base(int node, u64 *base)
 {
-    if (chip_id != T6041) {
+    if (chip_id != T6040 && chip_id != T6041) {
         *base = 0x30000;
         return 0;
     }
@@ -296,7 +296,7 @@ struct sio_data *sio_setup_fwdata(const char *adt_path)
     if (chip_id == T6030) {
         rules = copy_rules_v10;
         nrules = ARRAY_SIZE(copy_rules_v10);
-    } else if (chip_id == T6041) {
+    } else if (chip_id == T6040 || chip_id == T6041) {
         rules = copy_rules_t6041;
         nrules = ARRAY_SIZE(copy_rules_t6041);
     }
