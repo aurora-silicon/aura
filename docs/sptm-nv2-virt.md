@@ -1,4 +1,4 @@
-# Virtualized SPTM under aura (T8140, T8132)
+# Virtualized SPTM under aura (M4 and later)
 
 aura can run macOS's own stock SPTM, TXM, the cL4 secure kernel with its exclaves, and XNU as a
 FEAT_NV2 guest at virtual EL2, with their guarded world (GXF and SPRR) running natively one
@@ -6,8 +6,9 @@ level below aura's own GL2. macOS boots to the desktop this way on all six cores
 it suspends to RAM and wakes as it does natively. It is a development tool: aura sees every
 power-management access macOS makes, which is how the sleep sequence for Linux was recorded.
 
-It is built only with `SPTM_VIRT=1` (which needs `CHAINLOADING=1`) and only does anything on
-T8140 or T8132 booted as a kcbz=0 Mach-O boot object (`docs/macho-boot-object.md`): iBoot then skips its
+It is built only with `SPTM_VIRT=1` (which needs `CHAINLOADING=1`) and only does anything on a CPU
+with FEAT_NV2 and GXF (M4 and later), booted as a kcbz=0 Mach-O boot object
+(`docs/macho-boot-object.md`): iBoot then skips its
 own SPTM loader, leaves GXF and SPRR writable, and jumps to aura at EL2. aura's NV2 support is
 built only with `SPTM_VIRT=1` as well: other images, the Linux boot included, carry none of it.
 The host side is `proxyclient/tools/run_guest_sptm.py`.
@@ -22,11 +23,10 @@ does not answer for its xART.
 25G83 boots the same way on a J713 to a working desktop, on all ten cores. Its build manifest has no
 `Ap,ExclaveOS` or `Ap,cL4`, so the guest is SPTM, TXM and XNU only (no `AURA_KEEP_EXCLAVES`).
 TXM and the static trust cache are the J700's files; the kernel is `kernelcache.release.mac16g`.
-`sptm.t8132.release` is the T8140 build with `init_pre_late_io_reservation` 0xc4 later, so the
-host shifts only the four AMCC patches. The debug port is hpm0 behind `usb-drd0`/`dart-usb0`/
-`atc-phy0`, which also carries Thunderbolt (`acio0`, `apciec0`), and all of it is hidden from
-XNU. The sleep trace knows T8132's blocks (`s2r_socs` in `sptm_virt_s2r.c`): T8140's at the same
-offsets from a SoC base 0x80000000 higher, under other PMGR reg indices. Stop mode records the whole
+The debug port is hpm0 behind `usb-drd0`/`dart-usb0`/`atc-phy0`, which also carries Thunderbolt
+(`acio0`, `apciec0`), and all of it is hidden from XNU. The sleep trace finds T8132's blocks in the
+ADT as everywhere (`sptm_virt_s2r_soc.c`): T8140's at the same offsets from a SoC base 0x80000000
+higher, under other PMGR reg indices. Stop mode records the whole
 entry to the commit (`0x3882d4000 <- 1`). It is T8140's sequence moved up, without the CLLT writes.
 `AppleT8132PMGR::_quiesceAxi2afWorkaround` panics if PS `0x380700378` is on at quiesce. That is the
 hidden debug port's parent, which stays on because nothing powers its devices down, so once the
@@ -81,9 +81,18 @@ then does that needs GL2 traps to aura's GL2 (`sptm_virt_gl_sync`):
 - Its GEXIT to its own normal world (virtual EL2), which physical GL1 cannot reach.
 
 The host also patches five checks in SPTM's text that compare the locked hardware against SPTM's
-own placement (`SPTM_PATCHES` in run_guest_sptm.py). The patch offsets, the CTRR stash layout and
-the GEXIT offset that marks XNU's entry are specific to the 25G83 SPTM; the host refuses an SPTM
-whose instructions don't match.
+own placement, and with MTE the sequence that places the tag storage
+(`proxyclient/aura/sptm_patch.py`). Each site is found by a short run of SPTM's own instructions
+with PC-relative immediates and load offsets masked, so a build whose code only moved needs no new
+entry; one where a site doesn't match exactly once is refused. The CTRR stash offset comes from the
+same code. XNU's entry is SPTM's first exit to its normal world at EL2h.
+
+Nothing else is per chip or per board. The debug port is the USB-C port aura's proxy runs on, or with
+the proxy on KIS every port with an ATC PHY (`AURA_DEBUG_PORT` narrows it); its nodes follow from the
+PHY through the ADT's phandles. The reset guard takes its watchdog behaviour from the ADT's
+`wdt-version`, and the sleep trace its blocks from the ADT. Workarounds for one firmware release are
+keyed on the kernelcache's XNU release (`XNU_QUIRKS`). `tests/python/test_sptm_virt_generic.py` runs
+the host's plan and the sleep path's discovery on real image sets (`SPTM_VIRT_IMAGE_SETS`).
 
 ## Memory
 
