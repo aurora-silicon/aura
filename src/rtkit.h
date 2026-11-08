@@ -28,6 +28,8 @@ rtkit_dev_t *rtkit_init(const char *name, asc_dev_t *asc, dart_dev_t *dart,
 bool rtkit_quiesce(rtkit_dev_t *rtk);
 bool rtkit_quiesce_ap(rtkit_dev_t *rtk);
 bool rtkit_sleep(rtkit_dev_t *rtk);
+bool rtkit_idle(rtkit_dev_t *rtk);
+bool rtkit_boot_warm(rtkit_dev_t *rtk, u32 last_mask);
 void rtkit_stop(rtkit_dev_t *rtk);
 void rtkit_free(rtkit_dev_t *rtk);
 bool rtkit_has_owned_buffers(const rtkit_dev_t *rtk);
