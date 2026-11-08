@@ -47,6 +47,11 @@ uint64_t smp_get_mpidr(int cpu);
 u64 smp_get_release_addr(int cpu);
 u64 smp_get_kernel_release_addr(int cpu);
 int smp_park_for_kernel(void);
+/* Let an OS at EL2 that powers cores off come back through this image: the mailbox, in smp.c. */
+bool smp_resets_return_here(void);
+u64 smp_s2r_publish(void);
+bool smp_s2r_published(void);
+void smp_s2r_return_to_os(void) __attribute__((noreturn));
 void smp_set_wfe_mode(bool new_mode);
 void smp_send_ipi(int cpu);
 

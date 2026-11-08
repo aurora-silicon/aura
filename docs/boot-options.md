@@ -32,6 +32,28 @@ runs the OS inside the armed window and emits `/chosen/aurora,ctxr-exec-window`.
 With no usable window it does not start the OS. Elsewhere nothing changes.
 [The boot object notes](macho-boot-object.md#running-the-os) say what it needs.
 
+## Sleep and CPU power-off for an OS at EL2
+
+There is no option for this. An OS that aura starts at EL2 has no monitor below
+it, so it powers cores off and suspends the system itself. From M4 on, the Neo's
+A18 Pro included, iBoot locks every core's reset vector to the boot object, so each
+core then restarts inside aura. On those chips kboot publishes
+`/chosen/aurora,s2r-mailbox`, the physical address of a 32-byte mailbox in aura's
+image:
+
+- a secondary comes back through its spin-table release address, which still holds
+  the OS's;
+- the boot core jumps to the resume address the OS left in the mailbox, at EL2 with
+  the MMU and caches off and interrupts masked, or reboots if the OS left none.
+
+The CPUs keep `spin-table`. The property says they can power off and come back:
+Linux with the T8140 sleep series gives them its parking spin table then, and an OS
+that doesn't know the property ignores it. Whether to deep-sleep is the OS's choice.
+Once the mailbox is published, reset paths don't print, since the OS owns the UART
+and the display. The mailbox sits in aura's image, which kboot reserves anyway, so it
+takes no memory of its own. On A7 to M3 RVBAR isn't locked, so nothing is published,
+and a guest at EL1 gets nothing.
+
 ## DebugUSB interception (development builds)
 
 A build made with `DEBUGUSB_PROXY=1` also opens the 15 second `aura-proxy`

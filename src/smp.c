@@ -317,6 +317,100 @@ static int smp_prepare_rvbar_t8152(const struct cpu_info *cpu)
     return 0;
 }
 
+/* Whether a core whose RVBAR iBoot locked at @locked resets into this image. */
+static bool smp_rvbar_reaches_here(u64 locked)
+{
+    u64 target = (u64)_vectors_start;
+    int64_t distance = (int64_t)target - (int64_t)locked;
+
+    if (locked == target || locked == installed_relay)
+        return true;
+    if (relocated_from && locked == old_vectors_start())
+        return true;
+    /* A branch here an earlier stage left, or smp_prepare_rvbar() accepted. */
+    return !(distance & 3) && distance >= -0x8000000 && distance <= 0x7fffffc &&
+           read32(locked) == (0x14000000 | ((distance / 4) & 0x03ffffff));
+}
+
+/*
+ * Whether a reset brings the cores back into this image. From M4 on (A18 Pro too), iBoot locks
+ * every core's RVBAR to the same address, the boot core's too, and smp_prepare_rvbar() checked a
+ * running secondary's before starting it. On A7 to M3 RVBAR isn't locked: the OS can point it
+ * anywhere.
+ */
+bool smp_resets_return_here(void)
+{
+    if (cpu_features->apple_sysregs_unlocked)
+        return false;
+    for (int i = 0; i < MAX_CPUS; i++) {
+        if (i == boot_cpu_idx || !cpu_info[i].valid || !smp_is_alive(i))
+            continue;
+        u64 rvbar = read64(cpu_info[i].impl_reg);
+        return (rvbar & RVBAR_LOCK) && smp_rvbar_reaches_here(rvbar & RVBAR_ADDR);
+    }
+    return false;
+}
+
+/*
+ * An OS at EL2 powers cores off and suspends itself, and the locked RVBAR brings every
+ * core back here. A secondary needs only its spin table entry, which still holds the
+ * OS's release target. The boot core takes resume_pa. Linux reads this layout in
+ * drivers/soc/apple/t8140-sleep.c.
+ */
+#define AURA_S2R_MAGIC 0x3152325341525541ULL /* "AURAS2R1" */
+
+struct aura_s2r_mailbox {
+    u64 magic;      /* aura, before the OS starts */
+    u64 boot_mpidr; /* aura: the only core that may take resume_pa */
+    u64 resume_pa;  /* OS, cleaned to PoC before it sleeps; aura clears it */
+    u64 resumes;    /* aura: resume_pa taken this many times */
+};
+
+static struct aura_s2r_mailbox s2r_mailbox SMP_SHARED ALIGNED(64);
+
+/* Returns the mailbox's physical address: aura's mapping is the identity. */
+u64 smp_s2r_publish(void)
+{
+    s2r_mailbox.magic = AURA_S2R_MAGIC;
+    s2r_mailbox.boot_mpidr = mrs(MPIDR_EL1) & 0xFFFFFF;
+    s2r_mailbox.resume_pa = 0;
+    s2r_mailbox.resumes = 0;
+    dc_cvac_range(&s2r_mailbox, sizeof(s2r_mailbox));
+    sysop("dsb sy");
+    return (u64)&s2r_mailbox;
+}
+
+/* Once it is, the OS owns the UART and the display: reset paths must not print. */
+bool smp_s2r_published(void)
+{
+    return s2r_mailbox.magic == AURA_S2R_MAGIC;
+}
+
+/*
+ * The boot core back from a sleep, with the OS live: nothing here may rerun the boot
+ * flow. The OS gets EL2h with the MMU and caches off and interrupts masked, as at
+ * first entry, and init_cpu() has redone the per-core setup. The watchdog is the
+ * OS's: it armed it, and it stops it.
+ */
+void smp_s2r_return_to_os(void)
+{
+    u64 entry = s2r_mailbox.resume_pa;
+
+    /* exception_initialize() unmasked everything. */
+    msr(DAIF, 0xf << 6);
+
+    /* A reset the OS didn't arm: reboot rather than guess what state it's in. */
+    if (!entry || (mrs(MPIDR_EL1) & 0xFFFFFF) != s2r_mailbox.boot_mpidr)
+        reboot();
+
+    s2r_mailbox.resume_pa = 0;
+    s2r_mailbox.resumes++;
+    sysop("dsb sy");
+
+    ((void (*)(void))entry)();
+    reboot();
+}
+
 void smp_secondary_entry(void)
 {
     u64 mpidr = mrs(MPIDR_EL1) & 0xFFFFFF;
@@ -345,7 +439,7 @@ void smp_secondary_entry(void)
     else
         msr(TPIDR_EL1, index);
 
-    if (chip_id != T8142 && chip_id != T8152)
+    if (chip_id != T8142 && chip_id != T8152 && !smp_s2r_published())
         printf("  Index: %d (table: %p)\n\n", index, me);
 
     me->mpidr = mpidr;

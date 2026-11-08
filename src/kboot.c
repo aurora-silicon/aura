@@ -648,6 +648,24 @@ static int dt_set_ctxr_exec_window(int node)
     return 0;
 }
 
+/*
+ * An OS at EL2 has no monitor below it, so it powers cores off and suspends the system
+ * itself, and where iBoot locked RVBAR a reset brings each core back through this image.
+ * The mailbox tells the OS so: a secondary returns through its spin-table release address,
+ * the boot core through the mailbox. The CPUs keep spin-table, which every kernel knows.
+ */
+static int dt_set_s2r_mailbox(int node)
+{
+    if (!in_el2() || !smp_resets_return_here())
+        return 0;
+
+    u64 mailbox = smp_s2r_publish();
+    if (fdt_setprop_u64(dt, node, "aurora,s2r-mailbox", mailbox))
+        bail("FDT: couldn't set aurora,s2r-mailbox\n");
+    printf("FDT: S2R mailbox at 0x%lx\n", mailbox);
+    return 0;
+}
+
 static bool in_exec_window(u64 start, u64 size)
 {
     u64 window, window_size;
@@ -775,6 +793,9 @@ static int dt_set_chosen(void)
         return -1;
 
     if (dt_set_ctxr_exec_window(node))
+        return -1;
+
+    if (dt_set_s2r_mailbox(node))
         return -1;
 
     if (chip_id == T8140 && dt_set_t8140_wfx_args(node))

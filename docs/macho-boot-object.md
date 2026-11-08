@@ -207,8 +207,10 @@ These worked under the monitor, or were reachable through it, except power-off:
 - **CPU hotplug.** Spin-table has no CPU off, and aura no longer parks a core for
   the OS. The kernel in aurora-silicon/linux#985 has no `cpu_die` for spin-table, so
   taking a CPU offline fails with `EOPNOTSUPP`. Suspend to RAM and hibernation take
-  the secondaries offline the same way, so they fail there too. A separate kernel
-  patch that parks the core itself ran once on a Neo, and it isn't in that PR.
+  the secondaries offline the same way, so they fail there too. aura publishes
+  `/chosen/aurora,s2r-mailbox` for an OS at EL2 on these chips, though, and a kernel
+  that reads it powers cores off and suspends itself
+  ([boot options](boot-options.md#sleep-and-cpu-power-off-for-an-os-at-el2)).
 - **PSCI `SYSTEM_RESET`.** Restart now needs `macsmc-reboot` or the Apple watchdog.
   The monitor answered `SYSTEM_OFF` with a reset as well, so power-off never worked
   through it, and now needs `macsmc-reboot`. The J700 tree describes both, but
