@@ -1,4 +1,4 @@
-# Virtualized SPTM under aura (T8140)
+# Virtualized SPTM under aura (T8140, T8132)
 
 aura can run macOS's own stock SPTM, TXM, the cL4 secure kernel with its exclaves, and XNU as a
 FEAT_NV2 guest at virtual EL2, with their guarded world (GXF and SPRR) running natively one
@@ -7,10 +7,41 @@ it suspends to RAM and wakes as it does natively. It is a development tool: aura
 power-management access macOS makes, which is how the sleep sequence for Linux was recorded.
 
 It is built only with `SPTM_VIRT=1` (which needs `CHAINLOADING=1`) and only does anything on
-T8140 booted as a kcbz=0 Mach-O boot object (`docs/macho-boot-object.md`): iBoot then skips its
+T8140 or T8132 booted as a kcbz=0 Mach-O boot object (`docs/macho-boot-object.md`): iBoot then skips its
 own SPTM loader, leaves GXF and SPRR writable, and jumps to aura at EL2. aura's NV2 support is
 built only with `SPTM_VIRT=1` as well: other images, the Linux boot included, carry none of it.
 The host side is `proxyclient/tools/run_guest_sptm.py`.
+
+The boot object has to be enrolled on the volume group of the macOS it boots. iBoot brings the SEP
+up for the volume group it booted: from another one (a Linux stub's), XNU mounts the sealed root
+only with that macOS's `/chosen` values, and then panics in `SEPEpoch::getFullEpochs` when the SEP
+does not answer for its xART.
+
+### T8132 (J713, MacBook Air M4)
+
+25G83 boots the same way on a J713 to a working desktop, on all ten cores. Its build manifest has no
+`Ap,ExclaveOS` or `Ap,cL4`, so the guest is SPTM, TXM and XNU only (no `AURA_KEEP_EXCLAVES`).
+TXM and the static trust cache are the J700's files; the kernel is `kernelcache.release.mac16g`.
+`sptm.t8132.release` is the T8140 build with `init_pre_late_io_reservation` 0xc4 later, so the
+host shifts only the four AMCC patches. The debug port is hpm0 behind `usb-drd0`/`dart-usb0`/
+`atc-phy0`, which also carries Thunderbolt (`acio0`, `apciec0`), and all of it is hidden from
+XNU. The sleep trace knows T8132's blocks (`s2r_socs` in `sptm_virt_s2r.c`): T8140's at the same
+offsets from a SoC base 0x80000000 higher, under other PMGR reg indices. Stop mode records the whole
+entry to the commit (`0x3882d4000 <- 1`). It is T8140's sequence moved up, without the CLLT writes.
+`AppleT8132PMGR::_quiesceAxi2afWorkaround` panics if PS `0x380700378` is on at quiesce. That is the
+hidden debug port's parent, which stays on because nothing powers its devices down, so once the
+first core has disabled itself, reads of it report it off. Go mode sleeps and wakes over KIS with
+no further change. The KIS link stays up across the sleep, and with the error handler hidden no
+AMCC error wakes it early, so `AURA_S2R_QUIESCE` is not needed. The keyboard wakes it, which macOS
+reports as `MTP.DOCK.CHANNELS.AP0.IRQ RTP.keyboard`. With the full trace the wake is about 88
+writes on the boot core in 22 ms, the same shape as T8140's: both clusters on (`0x380780000/4 <-
+0xf`), the power gates, 15 domains to their targets with AUTO_ENABLE, about 40 unused domains
+lowered, then WD2 stopped (`0x3882b002c <- 0`). Over KIS the wake record is printed 2 s after the
+wake, paced by the DockChannel's free space. Printed at the watchdog stop, or in one burst, it
+overruns the link.
+The sleep record follows it: from 512 records before the first core's self-disable to the wake.
+On T8132 the commit is followed 3 ms later by four SPMI commands to the PMU (`nub-spmi0`, slave 0xe):
+read 0x2000, a 4-byte write at 0x2008, `0x200e <- 0`, and `0x2000 <- 0x41`, T8132's "go hib".
 
 The code:
 

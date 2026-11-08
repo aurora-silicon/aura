@@ -85,6 +85,14 @@ KIS_PORT_NODES = (
     "/arm-io/atc0-dpxbar", "/arm-io/atc0-dpphy",
     "/arm-io/i2c2/usb-repeater-i2c", "/arm-io/i2c2/usb-hub-i2c",
 )
+# T8132 (J713): numbered USB nodes, and port 0 also carries Thunderbolt (ACIO and its PCIe).
+KIS_PORT_NODES_T8132 = (
+    "/arm-io/nub-spmi-a0/hpm0",
+    "/arm-io/usb-drd0", "/arm-io/dart-usb0", "/arm-io/atc-phy0",
+    "/arm-io/atc0-dpxbar", "/arm-io/atc0-dpphy", "/arm-io/atc0-dpin0", "/arm-io/atc0-dpin1",
+    "/arm-io/acio0", "/arm-io/acio-cpu0", "/arm-io/dart-acio0",
+    "/arm-io/apciec0", "/arm-io/dart-apciec0", "/arm-io/apciec0-piodma",
+)
 # Nothing drives the ANE yet, and the platform error handler panics on an AMCC DSID timeout.
 STRIP_NODES = ("/arm-io/ane", "/arm-io/dart-ane")
 ERROR_HANDLER = "/arm-io/error-handler"
@@ -126,6 +134,11 @@ SPTM_PATCHES = (
     ("AMCC CTRR match", 0x391ac, 0xffffffff, 0x54004a01, NOP),
     ("AMCC CTRR match", 0x391b8, 0xffffffff, 0x540049a2, NOP),
 )
+# sptm.t8132 (25G83) is the same build up to init_pre_late_io_reservation, which sits 0xc4 later.
+SPTM_PATCHES_T8132 = tuple(
+    (what, off + 0xc4 if what == "AMCC CTRR match" else off, mask, expected, new)
+    for what, off, mask, expected, new in SPTM_PATCHES)
+T8132 = 0x8132
 
 # AMCC error status words: four planes, seven words each.
 AMCC_STATUS = 0x220025004
@@ -261,8 +274,8 @@ def write_plan(p, u, iface, sym, plan, images):
     p.call(sym["sptm_virt_flush"], plan.boot_args_pa, len(plan.boot_args))
 
 
-def patch_sptm(p, sym, entry):
-    for what, off, mask, expected, new in SPTM_PATCHES:
+def patch_sptm(p, sym, entry, chip):
+    for what, off, mask, expected, new in SPTM_PATCHES_T8132 if chip == T8132 else SPTM_PATCHES:
         pa = entry + off
         before = p.read32(pa)
         if before & mask != expected:
@@ -362,8 +375,8 @@ def main():
     # below aura's carve-out.
     scratch = u.malloc(0x40)
     if p.call(sym["sptm_virt_place"], scratch) != 0:
-        raise SystemExit("sptm_virt_place failed: not an SPTM_VIRT build on a T8140, or no valid "
-                         "layout (see aura's console)")
+        raise SystemExit("sptm_virt_place failed: not an SPTM_VIRT build on a T8140 or T8132, or "
+                         "no valid layout (see aura's console)")
     managed_base, managed_end = (p.read64(scratch + 8 * i) for i in range(2))
     print(f"managed window from aura [0x{managed_base:x}, 0x{managed_end:x})")
 
@@ -388,7 +401,8 @@ def main():
     check_oslog(adt, sym.run_base, sym["_end"])
 
     keep_exclaves = env_on("AURA_KEEP_EXCLAVES")
-    hide = KIS_PORT_NODES + STRIP_NODES
+    chip = p.get_chipid()
+    hide = (KIS_PORT_NODES_T8132 if chip == T8132 else KIS_PORT_NODES) + STRIP_NODES
     if not env_on("AURA_KEEP_ERRH"):
         hide += (ERROR_HANDLER,)
     if env_on("AURA_HIDE_DOCKCHANNEL"):
@@ -422,7 +436,7 @@ def main():
         return
 
     write_plan(p, u, iface, sym, plan, images)
-    patch_sptm(p, sym, entry)
+    patch_sptm(p, sym, entry, chip)
     configure(p, sym)
     if p.call(sym["sptm_virt_load"], entry, handoff) != 0:
         raise SystemExit("sptm_virt_load rejected the entry/handoff (see aura's console)")
