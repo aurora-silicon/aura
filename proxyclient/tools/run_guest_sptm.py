@@ -32,6 +32,7 @@ Environment (all optional; 1 enables a switch):
   AURA_XNU_BT              sample XNU backtraces every few seconds per core
   AURA_GPU_TRACE           hook the GPU (sgx reg 0) and PMP registers, record every access
   AURA_GPU_STOP_SECS=<n>   park in the proxy n s after the first GPU access (read the ring)
+  AURA_GPU_STOP_MSG=<v>    park right after the guest writes v to the GPU (a mailbox message)
   AURA_GPU_PRINT_MAX=<n>   print at most n GPU accesses on aura's console (default 20000)
   AURA_SAMPLE              sample the guest's PC until each core's XNU entry (pre-XNU hangs)
   AURA_SAMPLE_HZ=<n>       samples per second (default 4)
@@ -96,6 +97,7 @@ KNOWN_ENV = {
     "AURA_TAIL_SECS",
     "AURA_TAIL_IDLE",
     "AURA_GPU_STOP_SECS",
+    "AURA_GPU_STOP_MSG",
     "AURA_GPU_PRINT_MAX",
     "AURA_SAMPLE_HZ",
     "AURA_SAMPLE_MAX",
@@ -493,6 +495,8 @@ def configure(p, sym, plan, adt):
             p.write32(sym[symbol], env_int(env))
     if os.environ.get("AURA_GPU_STOP_SECS"):
         p.write32(sym["sptm_virt_gpu_stop_secs"], env_int("AURA_GPU_STOP_SECS"))
+    if os.environ.get("AURA_GPU_STOP_MSG"):
+        p.write64(sym["sptm_virt_gpu_stop_msg"], env_int("AURA_GPU_STOP_MSG"))
     if os.environ.get("AURA_GPU_PRINT_MAX"):
         p.write32(sym["sptm_virt_gpu_print_max"], env_int("AURA_GPU_PRINT_MAX"))
     if os.environ.get("AURA_S2R_QUIESCE"):

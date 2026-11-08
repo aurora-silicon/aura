@@ -39,6 +39,7 @@ volatile u64 sptm_virt_gpu_head;
 
 /* Set by the host before entry (run_guest_sptm.py). */
 u32 sptm_virt_gpu_stop_secs; /* park this long after the first GPU access; 0 = never */
+u64 sptm_virt_gpu_stop_msg;  /* park after a write of this value (a mailbox message); 0 = never */
 u32 sptm_virt_gpu_print_max = 20000;
 
 static struct {
@@ -97,12 +98,12 @@ static void gpu_note(struct exc_info *ctx, u64 addr, u64 val, bool write, int wi
     r->pc = ctx ? ctx->elr : 0;
 }
 
-static void gpu_park(struct exc_info *ctx)
+static void gpu_park(struct exc_info *ctx, const char *why)
 {
     gpu_parked = true;
-    printf("SPTM-virt[gpu]: %u s after the first GPU access: parking cpu%d in the proxy at XNU pc "
+    printf("SPTM-virt[gpu]: %s: parking cpu%d in the proxy at XNU pc "
            "0x%lx; ring 0x%lx, %lu records of %lu written (head 0x%lx at 0x%lx)\n",
-           sptm_virt_gpu_stop_secs, smp_id(), ctx->elr, (u64)sptm_virt_gpu_ring,
+           why, smp_id(), ctx->elr, (u64)sptm_virt_gpu_ring,
            sptm_virt_gpu_head < sptm_virt_gpu_nrec ? sptm_virt_gpu_head : sptm_virt_gpu_nrec,
            sptm_virt_gpu_head, sptm_virt_gpu_head, (u64)&sptm_virt_gpu_head);
     iodev_console_flush();
@@ -163,8 +164,14 @@ static bool gpu_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int w
             printf("SPTM-virt[gpu]: print budget used up; the ring keeps recording\n");
     }
 
-    if (gpu_stop_t && now >= gpu_stop_t && !gpu_parked)
-        gpu_park(ctx);
+    if (gpu_parked)
+        return true;
+    /* A message the host names is a repeatable park point; the seconds are not (the guest's own
+     * timing varies from boot to boot by more than the whole bring-up lasts). */
+    if (sptm_virt_gpu_stop_msg && write && (width == 4 ? val[0] : *val) == sptm_virt_gpu_stop_msg)
+        gpu_park(ctx, "the write the host asked for");
+    else if (gpu_stop_t && now >= gpu_stop_t)
+        gpu_park(ctx, "the time the host asked for");
     return true;
 }
 
@@ -220,8 +227,8 @@ void sptm_virt_gpu_setup(void)
     gpu_hook_adt("/arm-io/mcc", 8, "pmp-ptd", 0, 0);
     gpu_hook_adt("/arm-io/mcc", 9, "pmp-ptd-upd", 0, 0);
     gpu_hook_adt("/arm-io/pmp", 0, "pmp-asc", 0, 0);
-    printf("SPTM-virt[gpu]: ring 0x%lx (%lu records, head at 0x%lx), stop after %u s, print budget "
-           "%u\n",
+    printf("SPTM-virt[gpu]: ring 0x%lx (%lu records, head at 0x%lx), stop after %u s or a write of "
+           "0x%lx, print budget %u\n",
            (u64)sptm_virt_gpu_ring, sptm_virt_gpu_nrec, (u64)&sptm_virt_gpu_head,
-           sptm_virt_gpu_stop_secs, sptm_virt_gpu_print_max);
+           sptm_virt_gpu_stop_secs, sptm_virt_gpu_stop_msg, sptm_virt_gpu_print_max);
 }
