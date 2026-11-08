@@ -12,8 +12,10 @@ Needs aura built with SPTM_VIRT=1 CHAINLOADING=1 and chainloaded, with its proxy
 
 Environment (all optional; 1 enables a switch):
   AURA_KEEP_EXCLAVES       keep the exclave nodes; with AURA_EXCLAVE_FW, run cL4 and ExclaveOS
-  AURA_EXCLAVE_FW=<dir>    extracted exclave firmware (exclavecore_bundle.t8140.RELEASE and
+  AURA_EXCLAVE_FW=<dir>    extracted exclave firmware (exclavecore_bundle.<soc>.RELEASE and
                            <build>__MacOS/Firmware)
+  AURA_EXCLAVE_BUNDLE=<f>  the IPSW's ExclaveCore bundle (Ap,cL4), instead of AURA_EXCLAVE_FW
+  AURA_EXCLAVE_INTEGRITY=<f>, AURA_EXCLAVE_TRUSTCACHE=<f>   the ExclaveOS catalogs beside it
   AURA_XNU_SERIAL=<node>   XNU's console device under /arm-io, e.g. uart0 (aura's vuart)
   AURA_HIDE_DOCKCHANNEL    hide the DockChannel that carries aura's console and proxy
   AURA_KEEP_ERRH           keep the platform error handler visible to XNU
@@ -75,6 +77,9 @@ CONFIG_FLAGS = {
 KNOWN_ENV = {
     "AURA_KEEP_EXCLAVES",
     "AURA_EXCLAVE_FW",
+    "AURA_EXCLAVE_BUNDLE",
+    "AURA_EXCLAVE_INTEGRITY",
+    "AURA_EXCLAVE_TRUSTCACHE",
     "AURA_XNU_SERIAL",
     "AURA_HIDE_DOCKCHANNEL",
     "AURA_KEEP_ERRH",
@@ -294,20 +299,52 @@ def check_oslog(adt, aura_base, aura_end):
         raise SystemExit("aura's .bss/stacks overlap a DCP __OS_LOG buffer: shrink .bss")
 
 
+def exclave_cl4(plan_mod, bundle, kernel_bytes=None):
+    """The cL4 kernel's entry and virtual base. The bundle carries its SYSTEM kernel's Mach-O
+    header at the start of its read-only region, so an extracted copy of that file is optional."""
+    if kernel_bytes is None:
+        kernel_bytes = bundle.payload[bundle.regions["CL4-ro"][0]:]
+    kernel = plan_mod.macho_info(kernel_bytes)
+    return kernel.entry, kernel.virtlo
+
+
+def exclave_report(bundle, entry, virt, integrity, trustcache):
+    print(f"exclaves: cL4 bundle 0x{len(bundle.payload):x} entry 0x{entry:x} virt 0x{virt:x}; "
+          f"exic 0x{len(integrity):x} extc 0x{len(trustcache):x}; regions "
+          + " ".join(f"{k}=0x{v[1]:x}" for k, v in bundle.regions.items())
+          + "; components " + " ".join(f"{c.name}({c.kind})" for c in bundle.components))
+    return dict(cl4_regions=bundle.regions, cl4_entry=entry, cl4_virt=virt,
+                exclave_integrity=integrity, exclave_trustcache=trustcache), bundle.payload
+
+
 def exclave_firmware(fw_dir, plan_mod):
+    """The extracted exclave firmware of a macOS install: an ExclaveCore bundle directory and the
+    build's Firmware directory beside it."""
     from aura.exclave_bundle import parse as parse_bundle
 
-    bdir = fw_dir / "exclavecore_bundle.t8140.RELEASE"
-    bundle = parse_bundle((bdir / "exclavecore_bundle.t8140.RELEASE").read_bytes())
-    kernel = plan_mod.macho_info((bdir / "SYSTEM" / "kernel").read_bytes())
+    bdir = next(fw_dir.glob("exclavecore_bundle.*.RELEASE"))
+    bundle = parse_bundle((bdir / bdir.name).read_bytes())
+    kernel_file = bdir / "SYSTEM" / "kernel"
+    entry, virt = exclave_cl4(plan_mod, bundle,
+                              kernel_file.read_bytes() if kernel_file.exists() else None)
     fw = next(fw_dir.glob("*__MacOS")) / "Firmware"
-    integrity = (fw / "exclave.integrity_catalog.bin").read_bytes()
-    trustcache = (fw / "exclave.trustcache.bin").read_bytes()
-    print(f"exclaves: cL4 bundle 0x{len(bundle.payload):x} entry 0x{kernel.entry:x} virt "
-          f"0x{kernel.virtlo:x}; exic 0x{len(integrity):x} extc 0x{len(trustcache):x}; regions "
-          + " ".join(f"{k}=0x{v[1]:x}" for k, v in bundle.regions.items()))
-    return dict(cl4_regions=bundle.regions, cl4_entry=kernel.entry, cl4_virt=kernel.virtlo,
-                exclave_integrity=integrity, exclave_trustcache=trustcache), bundle.payload
+    return exclave_report(bundle, entry, virt,
+                          (fw / "exclave.integrity_catalog.bin").read_bytes(),
+                          (fw / "exclave.trustcache.bin").read_bytes())
+
+
+def exclave_files(plan_mod):
+    """The three IPSW members directly: the ExclaveCore bundle (Ap,cL4), the ExclaveOS integrity
+    catalog and its trust cache, each an IM4P container as shipped."""
+    from aura.exclave_bundle import im4p_payload, parse as parse_bundle
+
+    bundle = parse_bundle(pathlib.Path(os.environ["AURA_EXCLAVE_BUNDLE"]).read_bytes())
+    entry, virt = exclave_cl4(plan_mod, bundle)
+    blobs = []
+    for env in ("AURA_EXCLAVE_INTEGRITY", "AURA_EXCLAVE_TRUSTCACHE"):
+        path = os.environ.get(env)
+        blobs.append(im4p_payload(pathlib.Path(path).read_bytes()) if path else b"")
+    return exclave_report(bundle, entry, virt, *blobs)
 
 
 def write_plan(p, u, iface, sym, plan, images):
@@ -540,7 +577,9 @@ def main():
     if not keep_exclaves:
         hide += EXCLAVE_NODES
     cl4 = {}
-    if keep_exclaves and os.environ.get("AURA_EXCLAVE_FW"):
+    if keep_exclaves and os.environ.get("AURA_EXCLAVE_BUNDLE"):
+        cl4, images["cl4"] = exclave_files(plan_mod)
+    elif keep_exclaves and os.environ.get("AURA_EXCLAVE_FW"):
         cl4, images["cl4"] = exclave_firmware(pathlib.Path(os.environ["AURA_EXCLAVE_FW"]), plan_mod)
     serial = os.environ.get("AURA_XNU_SERIAL")
 

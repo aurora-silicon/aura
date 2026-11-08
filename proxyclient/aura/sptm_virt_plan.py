@@ -402,9 +402,19 @@ def plan_boot(sptm, txm, xnu, adt, *, dram_base, phys_base, mem_size, mem_size_a
                                      "__DATA_CONST", "__DATA_SPTM"))
         + cl4_total
         + adt_size_rounded + tc_size + PAGE)  # PAGE: spare page after the ADT (in its entry)
+    if blob_base is None:
+        blob_base = phys_base
     lead = (xi.virtlo & L2_INDEX_MASK) - before_sptm
     if lead <= 0:
-        raise ValueError("BootKC L2 index leaves no room for the TXM/BootKC pieces below SPTM")
+        # This lead only sets the layout when the blob starts at the DRAM base; otherwise the
+        # placement shift below moves the whole blob to SPTM's first mapped block and supersedes
+        # it. 26A428 with exclaves needs 0x%x more than the BootKC's L2 index allows.
+        if blob_base <= dram_base:
+            raise ValueError("BootKC L2 index leaves no room for the TXM/BootKC pieces below SPTM")
+        notes.append("the pieces below SPTM (%#x) exceed the BootKC's L2 index (%#x) by %#x; the "
+                     "placement shift sets the layout instead"
+                     % (before_sptm, xi.virtlo & L2_INDEX_MASK, -lead))
+        lead = 0
     skip(lead)
     # SPTM's __start rounds physBase up to the NEXT 32 MiB boundary (strictly
     # above it) and only maps its window from there; a TXM below that has no
@@ -412,9 +422,7 @@ def plan_boot(sptm, txm, xnu, adt, *, dram_base, phys_base, mem_size, mem_size_a
     # is why TXM exactly at physBase failed). The whole blob must start at or
     # above that boundary.
     # blob_base lets the caller place the image blob above physBase (SPTM's frame-table base);
-    # by default the blob starts at physBase.
-    if blob_base is None:
-        blob_base = phys_base
+    # by default the blob starts at physBase (resolved above, for the lead).
     first_mapped = (blob_base + BLOCK) & ~(BLOCK - 1)
     shift = placement_shift
     if shift is None:
