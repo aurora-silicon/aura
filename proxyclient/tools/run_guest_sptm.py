@@ -40,6 +40,7 @@ Environment (all optional; 1 enables a switch):
   AURA_XNU_RO_RELAX        patch XNU's zalloc_ro_mut RO-zone panic out (tracing only; XNU_QUIRKS)
   AURA_XNU_TC_FORCE        accept a trust cache TXM refused, so the cryptex graft proceeds
   AURA_SHARE_NVRAM         let the guest reach the real NVRAM (a failed boot pollutes it)
+  AURA_XNU_TASK_KEYS       keep XNU's per-task PAC keys (its kernel frames then fail, XNU_QUIRKS)
   AURA_DEBUG_PORT=<n>      with the proxy on KIS, hide only USB-C port n (port-number), not all
   AURA_SPTM_DIAG           give SPTM a diagnostic record (boot_args revision 3, SPTMDebug)
   AURA_OS_LONG_VERSION     the guest's Ap,OSLongVersion (--os-long-version)
@@ -191,7 +192,27 @@ XNU_QUIRKS = (
          # so the guest keeps its in-memory NVRAM and the host's copy is untouched.
          nvram_ro=(("AppleARMNORNVRAM::write", "BootKC-rx", 0x1c1bec, 0xaa0003e8, 0x52800000),
                    ("AppleARMNORNVRAM::write return", "BootKC-rx", 0x1c1bf0, 0x52805840,
-                    0xd65f03c0))),
+                    0xd65f03c0)),
+         # XNU reprogrammes APIBKey/APDBKey_EL1 (plus s3_4_c15_c13_6/7) at every context switch
+         # to the incoming task's diversifier. On real hardware that is harmless to the kernel:
+         # it runs at EL2, whose pointer-authentication keys are a different bank from the EL1
+         # one those writes land in. Here the kernel runs at physical EL1, so the register it
+         # rewrites for userspace is the one its own pacibsp/retab use, and any kernel frame
+         # whose signing and authentication straddle a context switch fails -- which is what
+         # "PAC failure from kernel with IB key while returning" in the SPTM call stub is: the
+         # key, not the stack pointer or the return address, is what changed.
+         # Each of the four sites guards the key block with "b.eq past it" for a task whose key
+         # is already current; make that branch unconditional, so every task keeps the key the
+         # kernel signs with. All of the guest's tasks then share one key: a weaker guest than
+         # hardware gives, which is the price of the collapsed level.
+         pac_keys=(("task PAC key reprogramming (switch)", "BootKC-rx", 0x314834c, 0x540001e0,
+                    0x1400000f),
+                   ("task PAC key reprogramming (2)", "BootKC-rx", 0x3148414, 0x540001e0,
+                    0x1400000f),
+                   ("task PAC key reprogramming (3)", "BootKC-rx", 0x3148614, 0x540001e0,
+                    0x1400000f),
+                   ("task PAC key reprogramming (4)", "BootKC-rx", 0x31488c4, 0x540001e0,
+                    0x1400000f))),
 )
 
 
@@ -739,6 +760,8 @@ def main():
         set_xnu_rorgn(p, sym, plan, quirks)
     if quirks.get("nvram_mutable"):
         patch_xnu(p, sym, plan, quirks["nvram_mutable"])
+    if quirks.get("pac_keys") and not env_on("AURA_XNU_TASK_KEYS"):
+        patch_xnu(p, sym, plan, quirks["pac_keys"])
     if quirks.get("nvram_ro") and not env_on("AURA_SHARE_NVRAM"):
         patch_xnu(p, sym, plan, quirks["nvram_ro"])
     if env_on("AURA_XNU_TC_FORCE") and quirks.get("tc_force"):
