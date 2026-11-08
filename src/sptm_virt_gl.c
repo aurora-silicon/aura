@@ -6,7 +6,8 @@
  * registers, its guarded ERET and its GEXIT to its own normal world (virtual EL2). aura emulates
  * them here against a per-CPU shadow of the guest's GL2 register file.
  *
- * Some constants are SPTM build specific (25G83) and named where they are used.
+ * SPTM's static map and physmap VAs below (for the diagnostics' VA walks) are those of 25G83 and
+ * 26A428; the build-specific offsets come from the host (run_guest_sptm.py).
  */
 
 #include "sptm_virt.h"
@@ -24,10 +25,6 @@
 #define ESR_EC_ERET 0b011010
 /* A GEXIT from physical GL1 to SPTM's normal world, which GL1 cannot reach: EC 0x3f, ISS 0x22. */
 #define ESR_ISS_GEXIT_UP 0x22
-
-/* Page offset of SPTM's GEXIT into XNU's cold entry: 25G83's by default, the host sets another
- * build's (run_guest_sptm.py). */
-u32 sptm_virt_xnu_gexit_po = 0x2d8;
 
 /* SPTM's static map of its own image (VA = PA + base) and its physmap of DRAM (25G83). */
 #define SPTM_IMAGE_VA_OFFSET 0xfffffd0000000000UL
@@ -257,7 +254,7 @@ u64 *sptm_virt_gl2_slot(int cpu, u16 key)
     X(4, 15, 9, 5)  /* CTRR_LOCK_EL12 */                                                           \
     X(4, 15, 11, 0) /* CTRR_A_LWR_EL2 */                                                           \
     X(4, 15, 11, 1) /* CTRR_A_UPR_EL2 */                                                           \
-    X(0, 11, 9, 0)  /* TagOffset_EL2: T8142's MTE tag storage, which iBoot set */                  \
+    X(0, 11, 9, 0)  /* TagOffset_EL2: the MTE tag storage iBoot set */                             \
     X(0, 11, 9, 1)
 
 #define GL2KEY(o0, o1, cn, cm, o2) (((o0) << 14) | ((o1) << 11) | ((cn) << 7) | ((cm) << 3) | (o2))
@@ -269,7 +266,7 @@ u64 *sptm_virt_gl2_slot(int cpu, u16 key)
  * SPTM's expected bounds, {lwr, upr} for CTRR-C, CTRR-D and CTXR-A..D, at +0xa50 of a stash whose
  * base is x8 at its first ACC_CTRR_C_LWR read, and the CTXR CTL values it compares (25G83).
  */
-u32 sptm_virt_ctrr_stash_off = 0xa50; /* 26A428 (T8142): 0x5f0, set by the host */
+u32 sptm_virt_ctrr_stash_off = 0xa50; /* set by the host, from the image */
 static const u64 sptm_ctxr_ctl[4] = {
     0xc000000000aa019aUL,
     0xc0000000009a02aaUL,
@@ -522,7 +519,8 @@ static bool sptm_virt_guarded_gexit(u64 *regs)
 
     if (!guarded) {
         int cpu = smp_id();
-        if ((pc & 0xfff) == sptm_virt_xnu_gexit_po && !sptm_virt_xnu_live) {
+        /* XNU's cold entry: SPTM's first exit to its normal world at EL2h. */
+        if (el == 2 && (m & 1) && !sptm_virt_xnu_live) {
             sptm_virt_xnu_live = true;
             dc_cvac_range((void *)&sptm_virt_xnu_live, sizeof(sptm_virt_xnu_live));
             printf("SPTM-virt: XNU entered on cpu%d\n", cpu);

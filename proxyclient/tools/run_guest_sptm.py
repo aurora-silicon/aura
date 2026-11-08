@@ -36,7 +36,9 @@ Environment (all optional; 1 enables a switch):
   AURA_SAMPLE              sample the guest's PC until each core's XNU entry (pre-XNU hangs)
   AURA_SAMPLE_HZ=<n>       samples per second (default 4)
   AURA_SAMPLE_MAX=<n>      stop printing after n samples (default 64)
-  AURA_XNU_RO_RELAX        patch XNU's zalloc_ro_mut RO-zone panic out (tracing only)
+  AURA_XNU_RO_RELAX        patch XNU's zalloc_ro_mut RO-zone panic out (tracing only; XNU_QUIRKS)
+  AURA_DEBUG_PORT=<n>      with the proxy on KIS, hide only USB-C port n (port-number), not all
+  AURA_SPTM_DIAG           give SPTM a diagnostic record (boot_args revision 3, SPTMDebug)
   AURA_TAIL_SECS, AURA_TAIL_IDLE   keep reading the console after entry, until idle
   XNU_BOOTARGS             XNU's command line
 
@@ -47,7 +49,6 @@ Example:
 """
 
 import argparse
-import collections
 import os
 import pathlib
 import struct
@@ -95,42 +96,18 @@ KNOWN_ENV = {
     "AURA_SAMPLE_HZ",
     "AURA_SAMPLE_MAX",
     "AURA_XNU_RO_RELAX",
+    "AURA_DEBUG_PORT",
+    "AURA_SPTM_DIAG",
 } | set(CONFIG_FLAGS)
 
-# The debug link: DockChannel plus the ATC0 port's PD controller, USB controller and PHY path.
-# XNU must never drive them (it resets the port about 3 s into IOKit and the link drops).
-KIS_PORT_NODES = (
-    "/arm-io/nub-spmi-a0/hpm0",
-    "/arm-io/usb-drd", "/arm-io/dart-usb", "/arm-io/atc-phy0",
-    "/arm-io/atc0-dpxbar", "/arm-io/atc0-dpphy",
-    "/arm-io/i2c2/usb-repeater-i2c", "/arm-io/i2c2/usb-hub-i2c",
-)
-# T8132 (J713): numbered USB nodes, and port 0 also carries Thunderbolt (ACIO and its PCIe).
-KIS_PORT_NODES_T8132 = (
-    "/arm-io/nub-spmi-a0/hpm0",
-    "/arm-io/usb-drd0", "/arm-io/dart-usb0", "/arm-io/atc-phy0",
-    "/arm-io/atc0-dpxbar", "/arm-io/atc0-dpphy", "/arm-io/atc0-dpin0", "/arm-io/atc0-dpin1",
-    "/arm-io/acio0", "/arm-io/acio-cpu0", "/arm-io/dart-acio0",
-    "/arm-io/apciec0", "/arm-io/dart-apciec0", "/arm-io/apciec0-piodma",
-)
-# T8142 (J813): the debug link may be on either port, so both ports' USB-C paths are hidden.
-KIS_PORT_NODES_T8142 = (
-    "/arm-io/nub-spmi-a0/hpm0", "/arm-io/nub-spmi-a0/hpm1",
-    "/arm-io/usb-drd0", "/arm-io/dart-usb0", "/arm-io/atc-phy0",
-    "/arm-io/atc0-dpxbar", "/arm-io/atc0-dpphy", "/arm-io/atc0-dpin0", "/arm-io/atc0-dpin1",
-    "/arm-io/usb-drd1", "/arm-io/dart-usb1", "/arm-io/atc-phy1",
-    "/arm-io/atc1-dpxbar", "/arm-io/atc1-dpphy", "/arm-io/atc1-dpin0", "/arm-io/atc1-dpin1",
-    "/arm-io/i2c2/atcrt0", "/arm-io/i2c2/atcrt1",
-)
-KIS_PORT_NODES_BY_CHIP = {0x8132: KIS_PORT_NODES_T8132, 0x8142: KIS_PORT_NODES_T8142}
+# The debug link's USB-C port: XNU must never drive it (it resets the port about 3 s into IOKit
+# and the link drops). From its PHY, the nodes that belong to the port follow from the ADT's
+# phandles: forward from a node of the port through FWD, back to it through REV.
+PORT_FWD = ("atc-phy-parent", "atc-phy", "dpxbar-parent", "acio-parent", "acio-cpu", "iommu-parent",
+            "apciec-piodma", "usb-repeater")
+PORT_REV = ("atc-phy-parent", "atc-phy", "acio-parent", "usb-port", "dpxbar-parent")
 # Nothing drives the ANE yet, and the platform error handler panics on an AMCC DSID timeout.
 STRIP_NODES = ("/arm-io/ane", "/arm-io/dart-ane")
-# 26A428 (T8142): AppleConvergedPCI panics XNU in zalloc_ro_mut on one of its own statics
-# (kernelcache+0x42e1e0) about a second into IOKit. Nothing here needs PCIe or Wi-Fi, so its nodes
-# are hidden; the Thunderbolt/CIO PCIe paths go with them.
-STRIP_NODES_26A428_T8142 = ("/arm-io/apcie", "/arm-io/dart-apcie0", "/arm-io/apcie0-piodma",
-                     "/arm-io/apciec0", "/arm-io/dart-apciec0", "/arm-io/apciec0-piodma",
-                     "/arm-io/centauri", "/arm-io/bluetooth", "/arm-io/aop-spmi0/spmi-wifibt")
 ERROR_HANDLER = "/arm-io/error-handler"
 # Without cL4 the exclaves stay NOT_SUPPORTED, so their nodes and the RTBuddy routes that resolve
 # through them would wait forever in IOKit. With cL4 they must stay: hidden, DCP never completes
@@ -145,96 +122,32 @@ IBOOT_COPIES = ("RTBuddySeg", "SEPFW", "SEPPatches", "uStuff", "preoslog")
 
 NOP = 0xd503201f
 
-# Patches to the loaded SPTM text, relative to its entry point (25G83). Each is checked against
-# the instruction it expects and refuses to boot a different build.
-# (what, offset, mask, expected, replacement)
-SPTM_PATCHES = (
-    # __start polls APSTS_EL1 bit 0 (PAC ready) after it programs TTBR/MAIR. The bit is banked
-    # and the guest's copy reads 0 under aura, though PAC is up: drop the backward cbz.
-    ("APSTS poll", 0x3258, 0xff000000, 0xb4000000, NOP),
-    # ctrr_ctxr_check_region compares the locked hardware CTRR/CTXR bounds with the ones SPTM
-    # stashed for its own text. Stage 1 locked them for aura, so they never match: branch to the
-    # check's success tail, on the boot path (b.ne) and on the reset path (cbz w6).
-    ("CTRR check", 0x129ec, 0xffffffff, 0x54000ac1, 0x14000056),
-    ("CTRR reset-path check", 0x128c0, 0xffffffff, 0x34000986, 0x140000a1),
-    # ctXr_check_all_regions requires the per-core CTRR-A/B CTL to read locked; these do not
-    # trap to aura and cannot be set from EL2.
-    ("ctXr lock check", 0x12b1c, 0xff00001f, 0x54000001, NOP),
-    ("ctXr lock check", 0x12b28, 0xff00001f, 0x54000001, NOP),
-    ("ctXr lock check", 0x12b34, 0xff00001f, 0x54000001, NOP),
-    ("ctXr lock check", 0x12b40, 0xff00001f, 0x54000001, NOP),
-    # init_pre_late_io_reservation compares the AMCC CTRR-C/D range (stage 1's) with the ACC one
-    # (SPTM's), only to log a mismatch.
-    ("AMCC CTRR match", 0x39164, 0xffffffff, 0x54003e41, NOP),
-    ("AMCC CTRR match", 0x39170, 0xffffffff, 0x54003de2, NOP),
-    ("AMCC CTRR match", 0x391ac, 0xffffffff, 0x54004a01, NOP),
-    ("AMCC CTRR match", 0x391b8, 0xffffffff, 0x540049a2, NOP),
-)
-# sptm.t8132 (25G83) is the same build up to init_pre_late_io_reservation, which sits 0xc4 later.
-SPTM_PATCHES_T8132 = tuple(
-    (what, off + 0xc4 if what == "AMCC CTRR match" else off, mask, expected, new)
-    for what, off, mask, expected, new in SPTM_PATCHES)
+# Workarounds for one firmware release, keyed on the kernelcache's XNU release string: what a
+# guest of that release must not see, and optional patches for tracing (AURA_XNU_RO_RELAX).
+# xnu-13432.1.9 (macOS 27.0, 26A428) panics in zalloc_ro_mut on AppleConvergedPCI's statics about
+# a second into IOKit, and again in pid 1 a second into userspace. Nothing here needs PCIe or
+# Wi-Fi, so their nodes are hidden. The RO-relax patch takes the branch that skips the second
+# panic; it changes what the guest does, so it is never on by default.
+XNU_QUIRKS = {
+    b"xnu-13432.1.9~": dict(
+        hide=("/arm-io/apcie", "/arm-io/dart-apcie0", "/arm-io/apcie0-piodma",
+              "/arm-io/apciec0", "/arm-io/dart-apciec0", "/arm-io/apciec0-piodma",
+              "/arm-io/centauri", "/arm-io/bluetooth", "/arm-io/aop-spmi0/spmi-wifibt"),
+        ro_relax=(("zalloc_ro_mut RO-zone check", "BootKC-rx", 0x3b27e4c, 0x540002a9,
+                   0x14000015),)),
+}
 
-# The same five checks in macOS 27.0's sptm.t8142 (26A428): the CTRR checks sit 0xc10 higher,
-# the AMCC/ACC comparisons are init_pre_late_io_reservation's branches to its two mismatch panics.
-SPTM_PATCHES_26A428_T8142 = (
-    ("APSTS poll", 0x3258, 0xff000000, 0xb4000000, NOP),
-    ("CTRR check", 0x135fc, 0xffffffff, 0x54000ac1, 0x14000056),
-    ("CTRR reset-path check", 0x134d0, 0xffffffff, 0x34000986, 0x140000a1),
-    ("ctXr lock check", 0x1372c, 0xff00001f, 0x54000001, NOP),
-    ("ctXr lock check", 0x13738, 0xff00001f, 0x54000001, NOP),
-    ("ctXr lock check", 0x13744, 0xff00001f, 0x54000001, NOP),
-    ("ctXr lock check", 0x13750, 0xff00001f, 0x54000001, NOP),
-    ("AMCC CTRR-C match", 0x3d008, 0xffffffff, 0x54004461, NOP),
-    ("AMCC CTRR-C match", 0x3d014, 0xffffffff, 0x54004402, NOP),
-    ("AMCC CTRR-D match", 0x3d050, 0xffffffff, 0x54005801, NOP),
-    ("AMCC CTRR-D match", 0x3d05c, 0xffffffff, 0x540057a2, NOP),
-)
 
-# sptm_init_mte_boundaries takes the MTE tag storage from Apple's tag-offset register, which iBoot
-# programmed in the boot core's EL2 bank. The guest runs at EL1, where that register is not
-# accessible at all (a read UNDEFs; in the guarded world it reads 0), so SPTM would place the tag
-# storage at 0 and type 512 MiB of pages from there. It also computes, two instructions later, the
-# base it expects -- the end of its managed window less the tag bytes, which is where iBoot put it.
-# This reorders its own instructions so that value is the one stored and used, and drops the
-# comparison against the register. Every instruction below is one of the original eighteen; the
-# rewrite is refused unless all eighteen match.
-MTE_SEQ_26A428_T8142 = (
-    0x12a10,
-    # as shipped
-    (0xd538b908, 0x926c5508, 0xf0fffef4, 0xf9010688, 0xb9420329, 0xd372c529, 0x8b080128,
-     0xf0fffeea, 0xf9010948, 0xa9402b88, 0xcb090108, 0x8b0a0108, 0x926cad08, 0xd538b909,
-     0x9240f92a, 0xeb08015f, 0x54002861, 0xb6f82929),
-    # x9 = tag bytes; x8 = window base + size - x9, 1 MiB aligned; store it as the tag base and
-    # base + x9 as its end; then nothing
-    (0xb9420329, 0xd372c529, 0xf0fffef4, 0xa9402b88, 0xcb090108, 0x8b0a0108, 0x926cad08,
-     0xf0fffeea, 0xf9010688, 0x8b080128, 0xf9010948) + (NOP,) * 7,
-)
+def xnu_quirks(kernelcache):
+    for key, quirks in XNU_QUIRKS.items():
+        if key in kernelcache:
+            return key.decode().rstrip("~"), quirks
+    return None, dict(hide=(), ro_relax=())
 
-# Per SPTM build: its patches, the page offset of its GEXIT into XNU, the offset of its CTRR
-# stash (aura's sptm_virt_xnu_gexit_po and sptm_virt_ctrr_stash_off), an optional sequence
-# rewrite (offset, expected words, replacement words), whether SPTM gets a diagnostic record
-# (boot_args revision 3) and the nodes this release's XNU must not see.
-SptmBuild = collections.namedtuple("SptmBuild",
-                                   "name patches gexit_po stash_off mte_seq diag_record hide")
-SPTM_BUILDS = (
-    SptmBuild("25G83", SPTM_PATCHES, 0x2d8, 0xa50, None, False, ()),
-    SptmBuild("25G83 t8132", SPTM_PATCHES_T8132, 0x2d8, 0xa50, None, False, ()),
-    SptmBuild("26A428 t8142", SPTM_PATCHES_26A428_T8142, 0xfb0, 0x5f0, MTE_SEQ_26A428_T8142, True,
-              STRIP_NODES_26A428_T8142),
-)
 
-# Optional patches to the loaded kernelcache, for tracing only (AURA_XNU_RO_RELAX): region name,
-# offset into that region, the word expected there and its replacement.
-# 26A428's xnu-13432.1.9 panics in zalloc_ro_mut a second into userspace on the J813 ("source ...
-# not from RO zone map"), before the GPU firmware starts, which is what the GPU trace is after.
-# This takes the branch that skips the panic unconditionally, so the mutation it was asked for is
-# performed. It changes what the guest does: never on by default.
-XNU_RO_RELAX_26A428 = (("zalloc_ro_mut RO-zone check", "BootKC-rx", 0x3b27e4c, 0x540002a9,
-                        0x14000015),)
-
-# AMCC error status words: four planes, seven words each.
-AMCC_STATUS = 0x220025004
+# AMCC error status words: seven per plane, at +0x25004 of the AMCC the mcc node's
+# amcc-reg-idx names, a plane every 0x40000.
+AMCC_ERR_STATUS = 0x25004
 AMCC_PLANE_STRIDE = 0x40000
 
 
@@ -401,27 +314,18 @@ def write_plan(p, u, iface, sym, plan, images):
     p.call(sym["sptm_virt_flush"], plan.boot_args_pa, len(plan.boot_args))
 
 
-def sptm_build(sptm, entry_off):
-    """The SPTM_BUILDS entry whose every patch site matches the image, or None."""
-    for build in SPTM_BUILDS:
-        if all(struct.unpack_from("<I", sptm, entry_off + off)[0] & mask == expected
-               for _w, off, mask, expected, _n in build.patches):
-            return build
-    return None
-
-
-def rewrite_sptm_seq(p, sym, entry, name, seq):
+def rewrite_sptm_seq(p, sym, entry, seq):
     off, want, new = seq
     pa = entry + off
     have = tuple(p.read32(pa + 4 * i) for i in range(len(want)))
     if have != want:
-        raise SystemExit(f"{name}: the sequence at 0x{pa:x} is not the one this rewrite is for:\n"
-                         f"  have " + " ".join(f"{w:08x}" for w in have) + "\n"
+        raise SystemExit(f"MTE tag-storage sequence at 0x{pa:x} is not the one found in the "
+                         f"image:\n  have " + " ".join(f"{w:08x}" for w in have) + "\n"
                          f"  want " + " ".join(f"{w:08x}" for w in want))
     for i, w in enumerate(new):
         p.write32(pa + 4 * i, w)
     p.call(sym["sptm_virt_flush"], pa & ~0x3f, 0x80 + len(new) * 4)
-    print(f"{name}: rewrote {len(new)} instructions at 0x{pa:x} (MTE tag storage from the window)")
+    print(f"rewrote {len(new)} instructions at 0x{pa:x} (MTE tag storage from the window)")
 
 
 def patch_xnu(p, sym, plan, patches):
@@ -438,8 +342,8 @@ def patch_xnu(p, sym, plan, patches):
         print(f"XNU {what}: [0x{pa:x}] 0x{before:08x} -> 0x{p.read32(pa):08x}")
 
 
-def patch_sptm(p, sym, entry, build):
-    for what, off, mask, expected, new in build.patches:
+def patch_sptm(p, sym, entry, sp):
+    for what, off, mask, expected, new in sp["patches"]:
         pa = entry + off
         before = p.read32(pa)
         if before & mask != expected:
@@ -448,19 +352,37 @@ def patch_sptm(p, sym, entry, build):
         p.write32(pa, new)
         p.call(sym["sptm_virt_flush"], pa & ~0x3f, 0x80)
         print(f"{what}: [0x{pa:x}] 0x{before:08x} -> 0x{p.read32(pa):08x}")
-    if build.mte_seq:
-        rewrite_sptm_seq(p, sym, entry, build.name, build.mte_seq)
-    p.write32(sym["sptm_virt_xnu_gexit_po"], build.gexit_po)
-    p.write32(sym["sptm_virt_ctrr_stash_off"], build.stash_off)
-    print(f"SPTM {build.name}: XNU-entry GEXIT page offset 0x{build.gexit_po:x}, CTRR stash "
-          f"+0x{build.stash_off:x}")
+    if sp["mte"]:
+        rewrite_sptm_seq(p, sym, entry, sp["mte"])
+    p.write32(sym["sptm_virt_ctrr_stash_off"], sp["ctrr_stash_off"])
+    print(f"SPTM: CTRR stash +0x{sp['ctrr_stash_off']:x}")
 
 
-def report_amcc(p, clear):
+def amcc_status(adt):
+    """(base, planes) of the AMCC error status words, from the mcc node; None without an AMCC."""
+    from aura import sptm_virt_plan as plan_mod
+
+    root, _ = plan_mod.adt_parse(adt)
+    io = {k: v for k, v, _f in plan_mod.adt_find(root, "arm-io").props}
+    child, parent, _ = struct.unpack_from("<QQQ", io["ranges"], 0)
+    mcc = {k: v for k, v, _f in plan_mod.adt_find(root, "arm-io/mcc").props}
+    if "amcc-reg-idx" not in mcc:
+        return None
+    u32 = lambda name, dflt: struct.unpack_from("<I", mcc[name])[0] if name in mcc else dflt
+    base = struct.unpack_from("<Q", mcc["reg"], 16 * u32("amcc-reg-idx", 0))[0] + parent - child
+    return base + AMCC_ERR_STATUS, u32("amcc-count", 1) * u32("dcs-count-per-amcc", 1)
+
+
+def report_amcc(p, adt, clear):
     """The AMCC error latches stage 1 left: XNU's error handler panics on them at its start."""
-    for plane in range(4):
+    status = amcc_status(adt)
+    if not status:
+        print("no AMCC in the ADT (mcc amcc-reg-idx); nothing to report")
+        return
+    base, planes = status
+    for plane in range(planes):
         for i in range(7):
-            addr = AMCC_STATUS + plane * AMCC_PLANE_STRIDE + i * 8
+            addr = base + plane * AMCC_PLANE_STRIDE + i * 8
             v = p.read32(addr)
             if v:
                 print("AMCC plane %d INTSTS%d 0x%x = 0x%08x" % (plane, i, addr, v))
@@ -469,22 +391,72 @@ def report_amcc(p, clear):
                     print("  cleared, now 0x%08x" % p.read32(addr))
 
 
-def link_phys(adt, hide):
-    """Phandles of the USB PHYs among the hidden nodes: the ports aura's debug link uses."""
+def _u32(v):
+    return struct.unpack_from("<I", v)[0] if v and len(v) >= 4 else None
+
+
+def debug_port(adt, proxy_phy=0, port=None):
+    """The debug link's ports, from the ADT: the PHY aura's proxy runs on, or with the proxy on
+    DockChannel (KIS, which any USB-C port with an ATC PHY may carry) every such PHY, or only the
+    one whose port-number is `port`. Returns (PHY phandles, the ports' node paths)."""
     from aura import sptm_virt_plan as plan_mod
 
     root, _ = plan_mod.adt_parse(adt)
-    io = plan_mod.adt_find(root, "arm-io")
-    leaves = {h.rstrip("/").rpartition("/")[2] for h in hide}
-    out = []
-    for kid in io.kids:
-        props = {k: v for k, v, _f in kid.props}
-        if kid.name() in leaves and props.get("device_type", b"").rstrip(b"\0") == b"atc-phy":
-            out.append(struct.unpack_from("<I", props["AAPL,phandle"])[0])
-    return out
+    nodes, parent = {}, {}
+
+    def walk(n, path, par):
+        here = f"{path}/{n.name()}"
+        nodes[here] = {k: v for k, v, _f in n.props}
+        parent[here] = par
+        for kid in n.kids:
+            walk(kid, here, here)
+
+    for kid in root.kids:
+        walk(kid, "", None)
+    by_ph = {_u32(pr["AAPL,phandle"]): h for h, pr in nodes.items() if "AAPL,phandle" in pr}
+
+    def device(h):  # the /arm-io device (or I2C device) a node belongs to
+        while h.count("/") > (3 if h.startswith("/arm-io/i2c") else 2):
+            h = parent[h]
+        return h
+
+    phys = [h for h, pr in nodes.items() if h.count("/") == 2 and h.startswith("/arm-io/") and
+            pr.get("device_type", b"").rstrip(b"\0") == b"atc-phy"]
+    if proxy_phy:
+        phys = [h for h in phys if _u32(nodes[h].get("AAPL,phandle")) == proxy_phy]
+    elif port is not None:
+        phys = [h for h in phys if _u32(nodes[h].get("port-number")) == port]
+    out = set()
+    for phy in phys:
+        port_nodes = {phy}
+        number, kind = _u32(nodes[phy].get("port-number")), _u32(nodes[phy].get("port-type"))
+        for h, pr in nodes.items():  # the port's controller (HPM)
+            if h.rpartition("/")[2].startswith("hpm") and _u32(pr.get("port-number")) == number \
+               and _u32(pr.get("port-type")) == kind:
+                port_nodes.add(h)
+        # Its retimers name no port; they carry the PHY's index.
+        index = phy.rpartition("atc-phy")[2]
+        for h, pr in nodes.items():
+            if pr.get("compatible", b"").rstrip(b"\0") == b"atcrt" and h.endswith(f"rt{index}"):
+                port_nodes.add(h)
+        while True:
+            before = len(port_nodes)
+            for h in list(port_nodes):
+                for k in PORT_FWD:
+                    t = by_ph.get(_u32(nodes[h].get(k)))
+                    if t:
+                        port_nodes.add(device(t))
+            for h, pr in nodes.items():
+                if h.startswith("/arm-io/") and device(h) not in port_nodes and any(
+                        device(by_ph.get(_u32(pr.get(k)), "/x")) in port_nodes for k in PORT_REV):
+                    port_nodes.add(device(h))
+            if len(port_nodes) == before:
+                break
+        out |= port_nodes
+    return [_u32(nodes[h]["AAPL,phandle"]) for h in phys], tuple(sorted(out))
 
 
-def configure(p, sym, plan):
+def configure(p, sym, plan, adt):
     p.write64(sym["sptm_virt_diag_pa"], plan.diag_pa)
     if plan.diag_pa:
         print(f"SPTM diagnostic record at 0x{plan.diag_pa:x}")
@@ -505,7 +477,7 @@ def configure(p, sym, plan):
         p.write32(sym["sptm_virt_s2r_usb_retake"], env_int("AURA_S2R_USB_RETAKE"))
         p.write32(sym["sptm_virt_s2r_usb_delay_ms"], env_int("AURA_S2R_USB_RETAKE_MS"))
     if env_on("AURA_KEEP_ERRH") or env_on("AURA_AMCC_CLEAR"):
-        report_amcc(p, env_on("AURA_AMCC_CLEAR"))
+        report_amcc(p, adt, env_on("AURA_AMCC_CLEAR"))
 
 
 def tail_console(iface, secs, idle):
@@ -557,7 +529,7 @@ def main():
     if unknown:
         print("not run_guest_sptm.py switches, ignored:", " ".join(unknown))
 
-    from aura import sptm_virt_plan as plan_mod
+    from aura import sptm_patch, sptm_virt_plan as plan_mod
     from aura.proxy import AuraProxy, UartInterface
     from aura.proxyutils import ProxyUtils, bootstrap_port
 
@@ -571,8 +543,8 @@ def main():
     # below aura's carve-out.
     scratch = u.malloc(0x40)
     if p.call(sym["sptm_virt_place"], scratch) != 0:
-        raise SystemExit("sptm_virt_place failed: not an SPTM_VIRT build on a T8140, T8132 or "
-                         "T8142, or no valid layout (see aura's console)")
+        raise SystemExit("sptm_virt_place failed: not an SPTM_VIRT build, no FEAT_NV2 or GXF, or "
+                         "no valid layout (see aura's console)")
     managed_base, managed_end = (p.read64(scratch + 8 * i) for i in range(2))
     print(f"managed window from aura [0x{managed_base:x}, 0x{managed_end:x})")
 
@@ -597,14 +569,27 @@ def main():
     check_oslog(adt, sym.run_base, sym["_end"])
 
     entry_off = plan_mod.macho_info(images["sptm"]).entry - plan_mod.macho_info(images["sptm"]).virtlo
-    build = sptm_build(images["sptm"], entry_off)
-    if build is None:
-        raise SystemExit("unknown SPTM build: no SPTM_BUILDS patch set matches it")
-    print(f"SPTM build {build.name}")
+    try:
+        sp = sptm_patch.plan(images["sptm"], entry_off)
+    except sptm_patch.SptmPatchError as e:
+        raise SystemExit(f"this SPTM can't be patched: {e}")
+    print(f"SPTM: {len(sp['patches'])} patch sites found"
+          + (", MTE tag-storage sequence found" if sp["mte"] else ""))
+    xnu_release, quirks = xnu_quirks(images["xnu"])
+    if xnu_release:
+        print(f"XNU {xnu_release}: hiding " + " ".join(quirks["hide"]))
 
+    live_adt = u.get_adt()
     chip = u.adt["/chosen"].chip_id
+    proxy_phy = p.call(sym["sptm_virt_proxy_phy"])
+    phys, port_nodes = debug_port(live_adt, proxy_phy,
+                                  env_int("AURA_DEBUG_PORT") if os.environ.get("AURA_DEBUG_PORT")
+                                  else None)
+    if not phys:
+        raise SystemExit("no debug-link USB port found in the ADT")
+    print("debug-link port" + ("s" if len(phys) > 1 else "") + " hidden:", " ".join(port_nodes))
     keep_exclaves = env_on("AURA_KEEP_EXCLAVES")
-    hide = KIS_PORT_NODES_BY_CHIP.get(chip, KIS_PORT_NODES) + STRIP_NODES + build.hide
+    hide = port_nodes + STRIP_NODES + tuple(quirks["hide"])
     if not env_on("AURA_KEEP_ERRH"):
         hide += (ERROR_HANDLER,)
     if env_on("AURA_HIDE_DOCKCHANNEL"):
@@ -619,13 +604,12 @@ def main():
                                                chip)
     serial = os.environ.get("AURA_XNU_SERIAL")
 
-    live_adt = u.get_adt()
     plan = plan_mod.plan_boot(
         images["sptm"], images["txm"], images["xnu"], live_adt,
         dram_base=dram_base, phys_base=phys_base, mem_size=managed_end - phys_base,
         mem_size_actual=ba.mem_size_actual, cmdline=args.bootargs, blob_base=phys_base,
         trustcache=args.trustcache.read_bytes() if args.trustcache else b"",
-        iboot_copies=copies, hide_nodes=hide, diag_record=build.diag_record,
+        iboot_copies=copies, hide_nodes=hide, diag_record=env_on("AURA_SPTM_DIAG"),
         drop_props=() if keep_exclaves else ROUTES_PROPS,
         xnu_serial=f"/arm-io/{serial}" if serial else None, **cl4)
 
@@ -642,14 +626,14 @@ def main():
         return
 
     write_plan(p, u, iface, sym, plan, images)
-    patch_sptm(p, sym, entry, build)
-    phys = link_phys(live_adt, hide)[:2]
+    patch_sptm(p, sym, entry, sp)
+    phys = phys[:2]
     for i, ph in enumerate(phys + [0] * (2 - len(phys))):
         p.write32(sym["sptm_virt_link_phys"] + 4 * i, ph)
     print("debug-link USB PHYs (phandles):", " ".join(f"0x{ph:x}" for ph in phys) or "none")
     if env_on("AURA_XNU_RO_RELAX"):
-        patch_xnu(p, sym, plan, XNU_RO_RELAX_26A428)
-    configure(p, sym, plan)
+        patch_xnu(p, sym, plan, quirks["ro_relax"])
+    configure(p, sym, plan, live_adt)
     if p.call(sym["sptm_virt_load"], entry, handoff) != 0:
         raise SystemExit("sptm_virt_load rejected the entry/handoff (see aura's console)")
     if args.no_enter:
