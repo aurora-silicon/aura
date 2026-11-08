@@ -87,7 +87,8 @@ struct copy_rule {
     bool keyed;
     int blobsize;
     bool irq; // keyed records end in a u32 interrupt number, none (~0) from the ADT
-    bool irq_present; // only records the ADT describes get it; empty slots stay all zero
+    // only records the ADT describes get it; empty slots stay all zero
+    bool irq_present;
     u32 nkeys;
     const char *keys[10];
 };
