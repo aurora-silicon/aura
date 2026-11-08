@@ -258,7 +258,7 @@ void _cpu_reset_c(void *stack)
         smp_secondary_entry();
         return;
     }
-    bool quiet = chip_id == T8142 && !is_boot_cpu();
+    bool quiet = (chip_id == T8142 && !is_boot_cpu()) || smp_s2r_published();
     if (!quiet) {
         if (!is_boot_cpu())
             uart_puts("RVBAR entry on secondary CPU");
@@ -281,6 +281,8 @@ void _cpu_reset_c(void *stack)
 
     if (!is_boot_cpu())
         smp_secondary_entry();
+    else if (smp_s2r_published())
+        smp_s2r_return_to_os();
     else
         aura_main();
 }
