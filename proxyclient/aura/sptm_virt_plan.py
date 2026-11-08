@@ -707,7 +707,14 @@ def plan_boot(sptm, txm, xnu, adt, *, dram_base, phys_base, mem_size, mem_size_a
     # among them, which is what refuses the cryptex trust cache when the environment carries no
     # OS version -- refuses instead. Declare an environment that allows it.
     chosen = adt_find(root, "chosen")
-    if not any(p[0] == "mix-n-match-prevention-status" for p in chosen.props):
+    for prop in chosen.props:
+        if prop[0] == "mix-n-match-prevention-status":
+            had = int.from_bytes(prop[1][:4], "little")
+            prop[1] = struct.pack("<I", 0) + prop[1][4:]
+            notes.append(f"/chosen/mix-n-match-prevention-status {had} -> 0 "
+                         "(mix-and-match allowed)")
+            break
+    else:
         chosen.props.append(["mix-n-match-prevention-status", struct.pack("<I", 0), 0])
         notes.append("injected /chosen/mix-n-match-prevention-status = 0 (mix-and-match allowed)")
 
