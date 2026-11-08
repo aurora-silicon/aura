@@ -76,6 +76,9 @@ void sptm_virt_mmio_rw(u64 addr, u64 *val, bool write, int width);
 /* sptm_virt_s2r.c */
 extern volatile bool sptm_virt_s2r_quiet;
 void sptm_virt_s2r_setup(bool cdc);
+
+/* sptm_virt_gpu.c */
+void sptm_virt_gpu_setup(void);
 void sptm_virt_s2r_wake(int cpu);
 void sptm_virt_s2r_xnu_entry(int cpu, u64 target);
 void sptm_virt_s2r_note(struct exc_info *ctx, u64 addr, u64 val, bool write, int width);

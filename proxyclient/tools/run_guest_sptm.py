@@ -28,6 +28,9 @@ Environment (all optional; 1 enables a switch):
   AURA_S2R_USB_RETAKE=<n>  take the CDC link again after a wake; n > 1 also drops it n s in
   AURA_S2R_USB_RETAKE_MS   delay from XNU's return to the re-take (ms)
   AURA_XNU_BT              sample XNU backtraces every few seconds per core
+  AURA_GPU_TRACE           hook the GPU (sgx reg 0) and PMP registers, record every access
+  AURA_GPU_STOP_SECS=<n>   park in the proxy n s after the first GPU access (read the ring)
+  AURA_GPU_PRINT_MAX=<n>   print at most n GPU accesses on aura's console (default 20000)
   AURA_TAIL_SECS, AURA_TAIL_IDLE   keep reading the console after entry, until idle
   XNU_BOOTARGS             XNU's command line
 
@@ -62,6 +65,7 @@ CONFIG_FLAGS = {
     "AURA_S2R_COPROC": 1 << 3,
     "AURA_S2R_DROP_USB": 1 << 4,
     "AURA_XNU_BT": 1 << 5,
+    "AURA_GPU_TRACE": 1 << 6,
 }
 KNOWN_ENV = {
     "AURA_KEEP_EXCLAVES",
@@ -75,6 +79,8 @@ KNOWN_ENV = {
     "AURA_S2R_USB_RETAKE_MS",
     "AURA_TAIL_SECS",
     "AURA_TAIL_IDLE",
+    "AURA_GPU_STOP_SECS",
+    "AURA_GPU_PRINT_MAX",
 } | set(CONFIG_FLAGS)
 
 # The debug link: DockChannel plus the ATC0 port's PD controller, USB controller and PHY path.
@@ -341,6 +347,10 @@ def configure(p, sym, plan):
     print(f"SPTM diagnostic record at 0x{plan.diag_pa:x}")
     flags = sum(bit for name, bit in CONFIG_FLAGS.items() if env_on(name))
     p.call(sym["sptm_virt_config"], flags)
+    if os.environ.get("AURA_GPU_STOP_SECS"):
+        p.write32(sym["sptm_virt_gpu_stop_secs"], env_int("AURA_GPU_STOP_SECS"))
+    if os.environ.get("AURA_GPU_PRINT_MAX"):
+        p.write32(sym["sptm_virt_gpu_print_max"], env_int("AURA_GPU_PRINT_MAX"))
     if os.environ.get("AURA_S2R_QUIESCE"):
         p.write32(sym["sptm_virt_s2r_quiesce"], env_int("AURA_S2R_QUIESCE"))
         print("AMCC quiesce writes at the commit:", os.environ["AURA_S2R_QUIESCE"])

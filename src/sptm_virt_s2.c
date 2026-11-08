@@ -408,6 +408,7 @@ void sptm_virt_s2_setup(void)
     sptm_virt_reset_guard_setup();
     /* After the guard, whose pages the sleep path leaves alone. */
     sptm_virt_s2r_setup(uartproxy_iodev >= IODEV_USB0 && uartproxy_iodev < IODEV_MAX);
+    sptm_virt_gpu_setup();
 
     /* SPTM's own bring-up runs without it; each core arms it at its GEXIT into XNU, after
      * checking that nothing changed the tree in between. */

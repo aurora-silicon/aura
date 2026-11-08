@@ -47,6 +47,7 @@ struct sptm_virt_placement {
 #define SPTM_VIRT_S2R_COPROC   BIT(3) /* also hook the RTKit and exclave mailboxes */
 #define SPTM_VIRT_S2R_DROP_USB BIT(4) /* tear down aura's CDC gadget at the sleep commit */
 #define SPTM_VIRT_XNU_BT       BIT(5) /* sample XNU backtraces at GEXIT */
+#define SPTM_VIRT_GPU          BIT(6) /* hook and record the GPU and PMP registers */
 
 #ifdef SPTM_VIRT
 
