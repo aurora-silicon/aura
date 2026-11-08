@@ -109,21 +109,19 @@ static const struct s2r_soc s2r_socs[] = {
         .report_off = {0x380700378UL},
     },
 };
-static const struct s2r_soc *s2r_soc = &s2r_socs[0];
+static const struct s2r_soc *s2r_soc;
+
+static const struct s2r_soc *s2r_soc_find(void)
+{
+    for (unsigned i = 0; i < ARRAY_SIZE(s2r_socs); i++)
+        if (s2r_socs[i].chip == chip_id)
+            return &s2r_socs[i];
+    return NULL;
+}
 
 bool sptm_virt_s2r_supported(void)
 {
-    for (unsigned i = 0; i < ARRAY_SIZE(s2r_socs); i++)
-        if (s2r_socs[i].chip == chip_id)
-            return true;
-    return false;
-}
-
-static void s2r_soc_select(void)
-{
-    for (unsigned i = 0; i < ARRAY_SIZE(s2r_socs); i++)
-        if (s2r_socs[i].chip == chip_id)
-            s2r_soc = &s2r_socs[i];
+    return s2r_soc_find() != NULL;
 }
 
 /*
@@ -705,7 +703,12 @@ void sptm_virt_s2r_setup(bool cdc)
 {
     u64 flags = sptm_virt_flags;
 
-    s2r_soc_select();
+    s2r_soc = s2r_soc_find();
+    if (!s2r_soc) {
+        /* Nothing below knows this SoC's blocks. */
+        printf("SPTM-virt[s2r]: no sleep-path table for this SoC; debug-link domains not kept\n");
+        return;
+    }
     s2r_keep_always = cdc;
     if (!(flags & SPTM_VIRT_S2R)) {
         if (cdc)
