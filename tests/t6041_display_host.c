@@ -870,9 +870,9 @@ static void contract_check(const void *dt)
     const char *uuid = fdt_getprop(dt, dcp, "apple,firmware-uuid", NULL);
     check(uuid && !strcmp(uuid, DCP_UUID), "published: dcp apple,firmware-uuid is the ADT's");
     const u32 v26[3] = {26, 6, 2};
-    check(u32s_are(dt, dcp, "apple,firmware-version", os_firmware.num, os_firmware.num_length) &&
+    check(u32s_are(dt, dcp, "apple,firmware-version", v26, 3) &&
               u32s_are(dt, dcp, "apple,firmware-compat", v26, 3),
-          "published: dcp apple,firmware-version is the OS release, -compat 26.6.2");
+          "published: dcp apple,firmware-version and -compat are the 26.6.2 images");
 
     check(linked_segments(dt, dcp) == (1u << NSEGS) - 1 && region_count(dt, dcp) == NSEGS,
           "published: every iop-dcp-nub segment is one dcp memory-region");
@@ -1001,7 +1001,7 @@ static const struct scenario scenarios[] = {
     {"stale-optin-zero", PUBLISH, "a left-over chosen.asahi,t6041-dcp=0 does not disable it"},
     {"repeat", PUBLISH, "a second call adds nothing"},
     {"oslog-in-memreserve", PUBLISH, "an __OS_LOG wholly inside a /memreserve/ is still described"},
-    {"os-26-7-train", PUBLISH, "26.7.1 booted by an 18000.161.10 train iBoot: compat 26.6.2, version 26.7.0"},
+    {"os-26-7-train", PUBLISH, "26.7.1 booted by an 18000.161.10 train iBoot publishes the 26.6.2 images"},
     /* chip, board and device tree */
     {"wrong-chip", NOTHING, "chip T6041 with a T6040 device tree"},
     {"wrong-board", NOTHING, "an unsupported T6040 board"},
