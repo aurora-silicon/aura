@@ -8733,8 +8733,8 @@ static int dt_set_fb2_t8152(void)
 /*
  * The J873g (T8152) device trees come with their own loader contract (Linux
  * tools/aurora/j873/loader): the machine is brought up in j873g_run_proxy(),
- * and beyond /chosen only the CPUs, MAC addresses, the second framebuffer and
- * the memory map are filled in here.
+ * and beyond /chosen only the speaker amp configuration, the CPUs, MAC
+ * addresses, the second framebuffer and the memory map are filled in here.
  */
 static int dt_set_display_t8152(void)
 {
@@ -8785,6 +8785,9 @@ static int dt_set_display_t8152(void)
 
 static int dt_prepare_t8152(void)
 {
+    if (dt_set_speaker_safety())
+        return -1;
+    kboot_audio_amp_config(dt, adt);
     if (fdt_getprop(dt, 0, "aurora,minimal-boot", NULL)) {
         int aic = fdt_path_offset(dt, "/soc/interrupt-controller@301000000");
         if (aic < 0 || fdt_node_check_compatible(dt, aic, "apple,t8152-aic3") ||
