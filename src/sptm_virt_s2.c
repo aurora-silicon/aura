@@ -18,6 +18,7 @@
 #include "memory.h"
 #include "nv2.h"
 #include "smp.h"
+#include "soc.h"
 #include "sptm_virt_priv.h"
 #include "string.h"
 #include "uartproxy.h"
@@ -287,7 +288,10 @@ static void sptm_virt_reset_guard_setup(void)
         rg_alarm_shadow[0] = rg_wdt ? read32(rg_wdt + WDT_ALARM) : 0;
     }
     node = adt_path_offset_trace(adt, "/arm-io/hib-exclave-watchdog", path);
-    if (node >= 0 && adt_get_reg(adt, path, "reg", 0, &pa, &sz) >= 0) {
+    /* On T8142 a read of it from EL2 takes an SError (it is exclave-owned there): leave it be. */
+    if (node >= 0 && chip_id == T8142) {
+        printf("SPTM-virt[rst]: T8142: hib-exclave-watchdog not guarded\n");
+    } else if (node >= 0 && adt_get_reg(adt, path, "reg", 0, &pa, &sz) >= 0) {
         rg_xwdt = pa;
         rg_alarm_shadow[1] = read32(rg_xwdt + WDT_ALARM);
         sptm_virt_rg_page(pa, "hib-exclave-watchdog");

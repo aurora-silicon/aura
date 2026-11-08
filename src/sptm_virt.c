@@ -43,8 +43,18 @@ static volatile bool sptm_cpu_in_xnu[MAX_CPUS];
 
 bool sptm_virt_requested(void)
 {
-    /* Only T8140 boots as a kcbz=0 Mach-O object with GXF unlocked. */
-    return chip_id == T8140;
+    /* T8140 and T8142 boot as kcbz=0 Mach-O objects with GXF unlocked. */
+    return chip_id == T8140 || chip_id == T8142;
+}
+
+/*
+ * On T8142 iBoot programs MTE tag storage (TagOffset_EL2) as the top 512 MiB of the managed RAM it
+ * would hand SPTM, and SPTM checks it there (sptm_init_mte_boundaries), so SPTM's window keeps
+ * iBoot's end and aura's carve-out comes off its bottom instead.
+ */
+static bool sptm_virt_carveout_low(void)
+{
+    return chip_id == T8142;
 }
 
 int sptm_virt_compute_layout(u64 phys_base, u64 mem_size, u64 ram_base, u64 ram_top, u64 fw_high,
@@ -136,11 +146,13 @@ static u64 sptm_virt_low_floor(u64 limit)
 {
     u64 ro_start = 0, ro_end = 0;
     u64 floor = cur_boot_args.phys_base;
+    /* A low carve-out holds the heap itself, so only what lies below it counts. */
+    bool heap = !sptm_virt_carveout_low();
     const u64 cand[] = {
         (u64)_end,
         cur_boot_args.top_of_kernel_data,
-        (u64)heapblock_high_water(),
-        (u64)heapblock_limit(),
+        heap ? (u64)heapblock_high_water() : 0,
+        heap ? (u64)heapblock_limit() : 0,
         memory_fw_ro_range(&ro_start, &ro_end) > 0 ? ro_end : 0,
     };
 
@@ -150,9 +162,34 @@ static u64 sptm_virt_low_floor(u64 limit)
     return ALIGN_UP(floor, SZ_32M); /* SPTM maps its window in 32 MiB blocks */
 }
 
+/* The T8142 layout: aura's carve-out right above what aura and iBoot left low, SPTM's window from
+ * the next 32 MiB boundary to iBoot's end, with the tag storage still at its top. */
+static int sptm_virt_layout_low(u64 ram_base, struct sptm_virt_layout *out)
+{
+    u64 end = cur_boot_args.phys_base + cur_boot_args.mem_size;
+    u64 fw_high = sptm_virt_fw_high();
+
+    memset(out, 0, sizeof(*out));
+    if (fw_high && fw_high < end)
+        return -1; /* the tag storage would no longer be at the window's top */
+    out->ram_base = ram_base;
+    out->ram_top = ram_base + mem_size_actual;
+    out->fw_high = fw_high;
+    out->aura_size = SPTM_VIRT_AURA_HEAP;
+    out->aura_base = ALIGN_UP(sptm_virt_low_floor(end), SPTM_VIRT_ALIGN);
+    out->aura_top = out->aura_base + SPTM_VIRT_AURA_HEAP;
+    out->managed_base = ALIGN_UP(out->aura_top, SZ_32M);
+    out->managed_end = end;
+    if (out->managed_base + (2UL << 30) >= end)
+        return -1;
+    return 0;
+}
+
 int sptm_virt_layout(struct sptm_virt_layout *out)
 {
     u64 ram_base = ALIGN_DOWN(cur_boot_args.phys_base, BIT(32));
+    if (sptm_virt_carveout_low())
+        return sptm_virt_layout_low(ram_base, out);
     int rc = sptm_virt_compute_layout(cur_boot_args.phys_base, cur_boot_args.mem_size, ram_base,
                                       ram_base + mem_size_actual, sptm_virt_fw_high(),
                                       SPTM_VIRT_AURA_HEAP, out);
@@ -219,8 +256,8 @@ static int sptm_virt_check_handoff(const struct sptm_virt_layout *l, u64 handoff
     printf("SPTM-virt: handoff boot_args rev %u ver %u virtBase 0x%lx physBase 0x%lx memSize 0x%lx "
            "top 0x%lx\n",
            rev, ver, (u64)ba->virt_base, pbase, msize, top);
-    if (rev != 2 || ver != 2) {
-        printf("SPTM-virt: load refused, handoff is not a revision-2/version-2 boot_args\n");
+    if ((rev != 2 && rev != 3) || ver != 2) {
+        printf("SPTM-virt: load refused, handoff is not a revision-2/3 version-2 boot_args\n");
         return -1;
     }
     if (pbase < l->managed_base || pbase >= l->managed_end || msize > l->managed_end - pbase ||

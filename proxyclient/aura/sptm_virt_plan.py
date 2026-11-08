@@ -51,6 +51,11 @@ ABSENT = 0xFFFFFFFFFFFFFFFF  # an absent memory-map region ({ABSENT, ABSENT})
 OS_LOG_SEGMENT = 0xA  # segment-ranges flags of a coprocessor's __OS_LOG buffer
 
 BOOT_ARGS_SIZE = 0x480
+# SPTM's __start reads a diagnostic-record pointer at +0x480 when the revision is 3 or more, zeroes
+# 0x17c0 bytes there and stamps it; its EL1 exception vector records ESR/ELR/FAR (+0x20/+0x28/+0x30)
+# into it and halts. Without it an unexpected exception halts with nothing recorded.
+BOOT_ARGS_DIAG_OFF = 0x480
+BOOT_ARGS_DIAG_SIZE = 0x17c0
 BOOT_ARGS_REVISION = 2
 BOOT_ARGS_VERSION = 2
 CMDLINE_MAX = 1024
@@ -203,6 +208,7 @@ class Plan:
     loads: list
     boot_args: bytes
     boot_args_pa: int
+    diag_pa: int
     adt: bytes
     adt_pa: int
     adt_grew: bool
@@ -219,12 +225,13 @@ class Plan:
 
 
 def build_boot_args(virt_base, phys_base, mem_size, top_of_kernel_data, adt_va, adt_len,
-                    cmdline, mem_size_actual, boot_flags=0, video=None):
+                    cmdline, mem_size_actual, boot_flags=0, video=None, diag_va=0):
     cmd = cmdline.encode() if isinstance(cmdline, str) else cmdline
     if len(cmd) >= CMDLINE_MAX:
         raise ValueError("boot-args command line too long")
-    b = bytearray(BOOT_ARGS_SIZE + 8)  # +8: __start peeks [0x480]; keep it zero
-    struct.pack_into("<HH", b, 0, BOOT_ARGS_REVISION, BOOT_ARGS_VERSION)
+    b = bytearray(BOOT_ARGS_SIZE + 8)  # +8: the diagnostic-record pointer
+    struct.pack_into("<Q", b, BOOT_ARGS_DIAG_OFF, diag_va)
+    struct.pack_into("<HH", b, 0, 3 if diag_va else BOOT_ARGS_REVISION, BOOT_ARGS_VERSION)
     struct.pack_into("<QQQQ", b, 8, virt_base, phys_base, mem_size, top_of_kernel_data)
     vid = video or (0, 0, 0, 0, 0, 0)
     struct.pack_into("<6Q", b, 0x28, *vid)
@@ -534,6 +541,9 @@ def plan_boot(sptm, txm, xnu, adt, *, dram_base, phys_base, mem_size, mem_size_a
     boot_args_pa = head[0]
     head[0] += round_page(BOOT_ARGS_SIZE + 8)
     end_entry("BootArgs")
+    diag_pa = head[0]
+    head[0] += round_page(BOOT_ARGS_DIAG_SIZE)
+    end_entry("SPTMDiag")
     rd_pa = head[0]
     head[0] += round_page(ramdisk_size)
     end_entry("RAMDisk")
@@ -755,10 +765,12 @@ def plan_boot(sptm, txm, xnu, adt, *, dram_base, phys_base, mem_size, mem_size_a
             f"blob [0x{txm_pa:x}, 0x{blob_end:x}) does not fit managed RAM "
             f"[0x{phys_base:x}, 0x{phys_base + mem_size:x})")
     ba = build_boot_args(virt_base, phys_base, mem_size, top, adt_va, len(new_adt), cmdline,
-                         mem_size_actual, boot_flags)
+                         mem_size_actual, boot_flags, diag_va=diag_pa - phys_base + virt_base)
+    notes.append("boot_args revision 3: SPTM diagnostic record at %#x (va %#x), %#x bytes"
+                 % (diag_pa, diag_pa - phys_base + virt_base, BOOT_ARGS_DIAG_SIZE))
 
     return Plan(regions=regions, loads=loads, boot_args=ba, boot_args_pa=boot_args_pa,
-                adt=new_adt, adt_pa=adt_pa, adt_grew=adt_grew, sptm_pa=sptm_pa,
+                diag_pa=diag_pa, adt=new_adt, adt_pa=adt_pa, adt_grew=adt_grew, sptm_pa=sptm_pa,
                 sptm_entry_pa=vtop(si.entry), txm_pa=txm_pa, virt_base=virt_base,
                 phys_base=phys_base, mem_size=mem_size, top_of_kernel_data=top,
                 blob_start=txm_pa, blob_end=blob_end, notes=notes)

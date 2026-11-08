@@ -25,8 +25,9 @@
 /* A GEXIT from physical GL1 to SPTM's normal world, which GL1 cannot reach: EC 0x3f, ISS 0x22. */
 #define ESR_ISS_GEXIT_UP 0x22
 
-/* Page offset of SPTM's GEXIT into XNU's cold entry (25G83). */
-#define SPTM_XNU_ENTRY_GEXIT_PO 0x2d8
+/* Page offset of SPTM's GEXIT into XNU's cold entry: 25G83's by default, the host sets another
+ * build's (run_guest_sptm.py). */
+u32 sptm_virt_xnu_gexit_po = 0x2d8;
 
 /* SPTM's static map of its own image (VA = PA + base) and its physmap of DRAM (25G83). */
 #define SPTM_IMAGE_VA_OFFSET 0xfffffd0000000000UL
@@ -255,7 +256,9 @@ u64 *sptm_virt_gl2_slot(int cpu, u16 key)
     X(4, 15, 9, 4)  /* CTRR_CTL_EL12 */                                                            \
     X(4, 15, 9, 5)  /* CTRR_LOCK_EL12 */                                                           \
     X(4, 15, 11, 0) /* CTRR_A_LWR_EL2 */                                                           \
-    X(4, 15, 11, 1) /* CTRR_A_UPR_EL2 */
+    X(4, 15, 11, 1) /* CTRR_A_UPR_EL2 */                                                           \
+    X(0, 11, 9, 0)  /* TagOffset_EL2: T8142's MTE tag storage, which iBoot set */                  \
+    X(0, 11, 9, 1)
 
 #define GL2KEY(o0, o1, cn, cm, o2) (((o0) << 14) | ((o1) << 11) | ((cn) << 7) | ((cm) << 3) | (o2))
 
@@ -266,7 +269,7 @@ u64 *sptm_virt_gl2_slot(int cpu, u16 key)
  * SPTM's expected bounds, {lwr, upr} for CTRR-C, CTRR-D and CTXR-A..D, at +0xa50 of a stash whose
  * base is x8 at its first ACC_CTRR_C_LWR read, and the CTXR CTL values it compares (25G83).
  */
-#define SPTM_CTRR_STASH_OFF 0xa50
+u32 sptm_virt_ctrr_stash_off = 0xa50; /* 26A428 (T8142): 0x5f0, set by the host */
 static const u64 sptm_ctxr_ctl[4] = {
     0xc000000000aa019aUL,
     0xc0000000009a02aaUL,
@@ -301,10 +304,13 @@ static bool sptm_virt_ctrr_rw(u64 *regs, u64 esr)
         if (enc >= first && enc <= last) {
             unsigned i = enc - first;
             u64 v;
-            if (!i && !sptm_ctrr_stash)
+            if (!i && !sptm_ctrr_stash) {
                 sptm_ctrr_stash = regs[8];
+                printf("SPTM-virt: CTRR stash base 0x%lx (+0x%x)\n", sptm_ctrr_stash,
+                       sptm_virt_ctrr_stash_off);
+            }
             if (sptm_ctrr_stash &&
-                sptm_virt_guest_rd64(sptm_ctrr_stash + SPTM_CTRR_STASH_OFF + 8 * i, &v)) {
+                sptm_virt_guest_rd64(sptm_ctrr_stash + sptm_virt_ctrr_stash_off + 8 * i, &v)) {
                 if (rt != 31)
                     regs[rt] = (i & 1) ? (v & ~0xfffUL) : v;
                 return true;
@@ -516,7 +522,7 @@ static bool sptm_virt_guarded_gexit(u64 *regs)
 
     if (!guarded) {
         int cpu = smp_id();
-        if ((pc & 0xfff) == SPTM_XNU_ENTRY_GEXIT_PO && !sptm_virt_xnu_live) {
+        if ((pc & 0xfff) == sptm_virt_xnu_gexit_po && !sptm_virt_xnu_live) {
             sptm_virt_xnu_live = true;
             dc_cvac_range((void *)&sptm_virt_xnu_live, sizeof(sptm_virt_xnu_live));
             printf("SPTM-virt: XNU entered on cpu%d\n", cpu);
@@ -565,6 +571,33 @@ static void sptm_virt_park_strings(u64 *regs)
  * under aura would wait forever. Report it once per core and step over it; a WFE may complete
  * early anyway, so SPTM's own waits are unaffected.
  */
+/*
+ * SPTM's diagnostic record, whose PA the host passes (boot_args +0x480, revision 3): its EL1
+ * exception vector writes the exception it took there before it halts. Offsets: +0 magic 'SPTM',
+ * +0x20 ESR, +0x28 ELR, +0x30 FAR (the guarded vector stores the GL1 copies instead).
+ */
+u64 sptm_virt_diag_pa;
+
+static void sptm_virt_park_diag(void)
+{
+    u64 magic, esr, elr, far;
+
+    if (!sptm_virt_diag_pa || !sptm_virt_peek64(sptm_virt_diag_pa, &magic) ||
+        !sptm_virt_peek64(sptm_virt_diag_pa + 0x20, &esr) ||
+        !sptm_virt_peek64(sptm_virt_diag_pa + 0x28, &elr) ||
+        !sptm_virt_peek64(sptm_virt_diag_pa + 0x30, &far))
+        return;
+    dc_civac_range((void *)sptm_virt_diag_pa, 0x40);
+    sysop("dsb sy");
+    magic = read64(sptm_virt_diag_pa);
+    esr = read64(sptm_virt_diag_pa + 0x20);
+    elr = read64(sptm_virt_diag_pa + 0x28);
+    far = read64(sptm_virt_diag_pa + 0x30);
+    printf("SPTM-virt[park]: SPTM's record at 0x%lx: magic 0x%lx ESR 0x%lx (EC 0x%lx) ELR 0x%lx "
+           "FAR 0x%lx\n",
+           sptm_virt_diag_pa, magic, esr, (esr >> 26) & 0x3f, elr, far);
+}
+
 static void sptm_virt_park_report(u64 *regs, u64 pc)
 {
     static bool done[MAX_CPUS];
@@ -573,8 +606,12 @@ static void sptm_virt_park_report(u64 *regs, u64 pc)
     if (done[cpu])
         return;
     done[cpu] = true;
-    printf("SPTM-virt[park c%d]: wfe at pc=0x%lx x0=0x%lx x1=0x%lx x2=0x%lx x30=0x%lx\n", cpu, pc,
-           regs[0], regs[1], regs[2], regs[30]);
+    printf("SPTM-virt[park c%d]: wfe at pc=0x%lx\n", cpu, pc);
+    for (int r = 0; r < 31; r += 4)
+        printf("SPTM-virt[park]: x%-2d-x%-2d: 0x%016lx 0x%016lx 0x%016lx 0x%016lx\n", r,
+               r + 3 < 30 ? r + 3 : 30, regs[r], r + 1 < 31 ? regs[r + 1] : 0,
+               r + 2 < 31 ? regs[r + 2] : 0, r + 3 < 31 ? regs[r + 3] : 0);
+    sptm_virt_park_diag();
     sptm_virt_park_strings(regs);
 }
 

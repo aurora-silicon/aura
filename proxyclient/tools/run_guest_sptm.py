@@ -85,6 +85,15 @@ KIS_PORT_NODES = (
     "/arm-io/atc0-dpxbar", "/arm-io/atc0-dpphy",
     "/arm-io/i2c2/usb-repeater-i2c", "/arm-io/i2c2/usb-hub-i2c",
 )
+# T8142 (J813): the debug link may be on either port, so both ports' USB-C paths are hidden.
+KIS_PORT_NODES_T8142 = (
+    "/arm-io/nub-spmi-a0/hpm0", "/arm-io/nub-spmi-a0/hpm1",
+    "/arm-io/usb-drd0", "/arm-io/dart-usb0", "/arm-io/atc-phy0",
+    "/arm-io/atc0-dpxbar", "/arm-io/atc0-dpphy", "/arm-io/atc0-dpin0", "/arm-io/atc0-dpin1",
+    "/arm-io/usb-drd1", "/arm-io/dart-usb1", "/arm-io/atc-phy1",
+    "/arm-io/atc1-dpxbar", "/arm-io/atc1-dpphy", "/arm-io/atc1-dpin0", "/arm-io/atc1-dpin1",
+    "/arm-io/i2c2/atcrt0", "/arm-io/i2c2/atcrt1",
+)
 # Nothing drives the ANE yet, and the platform error handler panics on an AMCC DSID timeout.
 STRIP_NODES = ("/arm-io/ane", "/arm-io/dart-ane")
 ERROR_HANDLER = "/arm-io/error-handler"
@@ -125,6 +134,34 @@ SPTM_PATCHES = (
     ("AMCC CTRR match", 0x39170, 0xffffffff, 0x54003de2, NOP),
     ("AMCC CTRR match", 0x391ac, 0xffffffff, 0x54004a01, NOP),
     ("AMCC CTRR match", 0x391b8, 0xffffffff, 0x540049a2, NOP),
+)
+
+# The same five checks in macOS 27.0's sptm.t8142 (26A428): the CTRR checks sit 0xc10 higher,
+# the AMCC/ACC comparisons are init_pre_late_io_reservation's branches to its two mismatch panics.
+SPTM_PATCHES_26A428_T8142 = (
+    ("APSTS poll", 0x3258, 0xff000000, 0xb4000000, NOP),
+    ("CTRR check", 0x135fc, 0xffffffff, 0x54000ac1, 0x14000056),
+    ("CTRR reset-path check", 0x134d0, 0xffffffff, 0x34000986, 0x140000a1),
+    ("ctXr lock check", 0x1372c, 0xff00001f, 0x54000001, NOP),
+    ("ctXr lock check", 0x13738, 0xff00001f, 0x54000001, NOP),
+    ("ctXr lock check", 0x13744, 0xff00001f, 0x54000001, NOP),
+    ("ctXr lock check", 0x13750, 0xff00001f, 0x54000001, NOP),
+    ("AMCC CTRR-C match", 0x3d008, 0xffffffff, 0x54004461, NOP),
+    ("AMCC CTRR-C match", 0x3d014, 0xffffffff, 0x54004402, NOP),
+    ("AMCC CTRR-D match", 0x3d050, 0xffffffff, 0x54005801, NOP),
+    ("AMCC CTRR-D match", 0x3d05c, 0xffffffff, 0x540057a2, NOP),
+    # sptm_init_mte_boundaries compares the MTE tag-storage register (TagOffset_EL2) with the
+    # window it computed. The register is banked and the guest's copy reads 0 under aura, so skip
+    # both the compare and the enable-bit check; stage 1 left iBoot's tag storage programmed.
+    ("TagOffset compare", 0x12a50, 0xffffffff, 0x54002861, NOP),
+    ("TagOffset enable check", 0x12a54, 0xffffffff, 0xb6f82929, NOP),
+)
+
+# Per SPTM build: its patches, the page offset of its GEXIT into XNU and the offset of its CTRR
+# stash (aura's sptm_virt_xnu_gexit_po and sptm_virt_ctrr_stash_off).
+SPTM_BUILDS = (
+    ("25G83", SPTM_PATCHES, 0x2d8, 0xa50),
+    ("26A428 t8142", SPTM_PATCHES_26A428_T8142, 0xfb0, 0x5f0),
 )
 
 # AMCC error status words: four planes, seven words each.
@@ -261,8 +298,18 @@ def write_plan(p, u, iface, sym, plan, images):
     p.call(sym["sptm_virt_flush"], plan.boot_args_pa, len(plan.boot_args))
 
 
-def patch_sptm(p, sym, entry):
-    for what, off, mask, expected, new in SPTM_PATCHES:
+def sptm_build(sptm, entry_off):
+    """The SPTM_BUILDS entry whose every patch site matches the image, or None."""
+    for build in SPTM_BUILDS:
+        if all(struct.unpack_from("<I", sptm, entry_off + off)[0] & mask == expected
+               for _w, off, mask, expected, _n in build[1]):
+            return build
+    return None
+
+
+def patch_sptm(p, sym, entry, build):
+    name, patches, gexit_po, stash_off = build
+    for what, off, mask, expected, new in patches:
         pa = entry + off
         before = p.read32(pa)
         if before & mask != expected:
@@ -271,6 +318,9 @@ def patch_sptm(p, sym, entry):
         p.write32(pa, new)
         p.call(sym["sptm_virt_flush"], pa & ~0x3f, 0x80)
         print(f"{what}: [0x{pa:x}] 0x{before:08x} -> 0x{p.read32(pa):08x}")
+    p.write32(sym["sptm_virt_xnu_gexit_po"], gexit_po)
+    p.write32(sym["sptm_virt_ctrr_stash_off"], stash_off)
+    print(f"SPTM {name}: XNU-entry GEXIT page offset 0x{gexit_po:x}, CTRR stash +0x{stash_off:x}")
 
 
 def report_amcc(p, clear):
@@ -286,7 +336,9 @@ def report_amcc(p, clear):
                     print("  cleared, now 0x%08x" % p.read32(addr))
 
 
-def configure(p, sym):
+def configure(p, sym, plan):
+    p.write64(sym["sptm_virt_diag_pa"], plan.diag_pa)
+    print(f"SPTM diagnostic record at 0x{plan.diag_pa:x}")
     flags = sum(bit for name, bit in CONFIG_FLAGS.items() if env_on(name))
     p.call(sym["sptm_virt_config"], flags)
     if os.environ.get("AURA_S2R_QUIESCE"):
@@ -362,7 +414,7 @@ def main():
     # below aura's carve-out.
     scratch = u.malloc(0x40)
     if p.call(sym["sptm_virt_place"], scratch) != 0:
-        raise SystemExit("sptm_virt_place failed: not an SPTM_VIRT build on a T8140, or no valid "
+        raise SystemExit("sptm_virt_place failed: not an SPTM_VIRT build on a T8140/T8142, or no valid "
                          "layout (see aura's console)")
     managed_base, managed_end = (p.read64(scratch + 8 * i) for i in range(2))
     print(f"managed window from aura [0x{managed_base:x}, 0x{managed_end:x})")
@@ -387,8 +439,15 @@ def main():
               "xnu": args.xnu.read_bytes()}
     check_oslog(adt, sym.run_base, sym["_end"])
 
+    entry_off = plan_mod.macho_info(images["sptm"]).entry - plan_mod.macho_info(images["sptm"]).virtlo
+    build = sptm_build(images["sptm"], entry_off)
+    if build is None:
+        raise SystemExit("unknown SPTM build: no SPTM_BUILDS patch set matches it")
+    print(f"SPTM build {build[0]}")
+
+    chip = u.adt["/chosen"].chip_id
     keep_exclaves = env_on("AURA_KEEP_EXCLAVES")
-    hide = KIS_PORT_NODES + STRIP_NODES
+    hide = (KIS_PORT_NODES_T8142 if chip == 0x8142 else KIS_PORT_NODES) + STRIP_NODES
     if not env_on("AURA_KEEP_ERRH"):
         hide += (ERROR_HANDLER,)
     if env_on("AURA_HIDE_DOCKCHANNEL"):
@@ -422,8 +481,8 @@ def main():
         return
 
     write_plan(p, u, iface, sym, plan, images)
-    patch_sptm(p, sym, entry)
-    configure(p, sym)
+    patch_sptm(p, sym, entry, build)
+    configure(p, sym, plan)
     if p.call(sym["sptm_virt_load"], entry, handoff) != 0:
         raise SystemExit("sptm_virt_load rejected the entry/handoff (see aura's console)")
     if args.no_enter:
