@@ -226,8 +226,18 @@ static bool sptm_virt_rg_hook(struct exc_info *ctx, u64 addr, u64 *val, bool wri
     }
     for (int i = 0; i < 4; i++) {
         if (rg_extra[i] && a == rg_extra[i]) {
-            /* XNU writes these only on its way down: stop at the first attempt. */
-            sptm_virt_rg_report(ctx, "watchdog-node register", addr, v, v != 0);
+            /* On T8140 XNU writes these only on its way down, so the first attempt stops it. The
+             * J813's XNU writes one of them while IOKit starts, long before any reset, so there
+             * they are logged and performed and only the CTL paths above stop a reset. */
+            if (chip_id == T8142) {
+                if (log)
+                    printf("SPTM-virt[rst]: watchdog-node register 0x%lx <- 0x%lx (pc 0x%lx, "
+                           "passed)\n",
+                           addr, v, ctx->elr);
+                sptm_virt_mmio_rw(addr, val, true, width);
+            } else {
+                sptm_virt_rg_report(ctx, "watchdog-node register", addr, v, v != 0);
+            }
             return true;
         }
     }

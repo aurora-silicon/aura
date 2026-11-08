@@ -48,6 +48,7 @@ struct sptm_virt_placement {
 #define SPTM_VIRT_S2R_DROP_USB BIT(4) /* tear down aura's CDC gadget at the sleep commit */
 #define SPTM_VIRT_XNU_BT       BIT(5) /* sample XNU backtraces at GEXIT */
 #define SPTM_VIRT_GPU          BIT(6) /* hook and record the GPU and PMP registers */
+#define SPTM_VIRT_SAMPLE       BIT(7) /* sample the guest's PC until its XNU entry */
 
 #ifdef SPTM_VIRT
 
@@ -80,6 +81,7 @@ u64 sptm_virt_amx_ctl_el2_read(void);
 bool sptm_virt_s2_dabort(u64 *regs);
 
 /* exception.c */
+bool sptm_virt_sample_fiq(u64 *regs);
 bool sptm_virt_peek_fault(bool in_gl);
 bool sptm_virt_gl_sync(u64 *regs, u64 esr, u64 elr, u64 spsr);
 bool sptm_virt_el1_wfx(u64 *regs, u64 esr);
@@ -106,6 +108,11 @@ static inline bool sptm_virt_heap_window(u64 *base, u64 *limit)
 static inline bool sptm_virt_peek_fault(bool in_gl)
 {
     (void)in_gl;
+    return false;
+}
+static inline bool sptm_virt_sample_fiq(u64 *regs)
+{
+    (void)regs;
     return false;
 }
 static inline void sptm_virt_s2r_uart_tick(void)

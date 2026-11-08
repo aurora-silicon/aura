@@ -23,7 +23,7 @@
 
 #define GPU_RING_BYTES (16UL << 20)
 #define GPU_SEEN_MAX   2048
-#define GPU_MAX_RANGES 8
+#define GPU_MAX_RANGES 10
 
 struct gpu_rec {
     u64 t;    /* CNTPCT_EL0 */
@@ -213,6 +213,9 @@ void sptm_virt_gpu_setup(void)
 
     /* sgx reg 0 holds the GPU's PMGR (+0xe80000), its start control and both ASCs. */
     gpu_hook_adt("/arm-io/sgx", 0, "sgx", 0, 0);
+    /* Both GPU coprocessors' ASC windows: the mailboxes the driver and firmware talk over. */
+    gpu_hook_adt("/arm-io/gfx-asc", 0, "gfx-asc", 0, 0);
+    gpu_hook_adt("/arm-io/gfx1-asc", 0, "gfx1-asc", 0, 0);
     /* The PMP dashboard (PTD records, update words) and the PMP's mailbox. */
     gpu_hook_adt("/arm-io/mcc", 8, "pmp-ptd", 0, 0);
     gpu_hook_adt("/arm-io/mcc", 9, "pmp-ptd-upd", 0, 0);

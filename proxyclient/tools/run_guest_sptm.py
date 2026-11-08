@@ -31,6 +31,9 @@ Environment (all optional; 1 enables a switch):
   AURA_GPU_TRACE           hook the GPU (sgx reg 0) and PMP registers, record every access
   AURA_GPU_STOP_SECS=<n>   park in the proxy n s after the first GPU access (read the ring)
   AURA_GPU_PRINT_MAX=<n>   print at most n GPU accesses on aura's console (default 20000)
+  AURA_SAMPLE              sample the guest's PC until each core's XNU entry (pre-XNU hangs)
+  AURA_SAMPLE_HZ=<n>       samples per second (default 4)
+  AURA_SAMPLE_MAX=<n>      stop printing after n samples (default 64)
   AURA_TAIL_SECS, AURA_TAIL_IDLE   keep reading the console after entry, until idle
   XNU_BOOTARGS             XNU's command line
 
@@ -66,6 +69,7 @@ CONFIG_FLAGS = {
     "AURA_S2R_DROP_USB": 1 << 4,
     "AURA_XNU_BT": 1 << 5,
     "AURA_GPU_TRACE": 1 << 6,
+    "AURA_SAMPLE": 1 << 7,
 }
 KNOWN_ENV = {
     "AURA_KEEP_EXCLAVES",
@@ -81,6 +85,8 @@ KNOWN_ENV = {
     "AURA_TAIL_IDLE",
     "AURA_GPU_STOP_SECS",
     "AURA_GPU_PRINT_MAX",
+    "AURA_SAMPLE_HZ",
+    "AURA_SAMPLE_MAX",
 } | set(CONFIG_FLAGS)
 
 # The debug link: DockChannel plus the ATC0 port's PD controller, USB controller and PHY path.
@@ -156,18 +162,34 @@ SPTM_PATCHES_26A428_T8142 = (
     ("AMCC CTRR-C match", 0x3d014, 0xffffffff, 0x54004402, NOP),
     ("AMCC CTRR-D match", 0x3d050, 0xffffffff, 0x54005801, NOP),
     ("AMCC CTRR-D match", 0x3d05c, 0xffffffff, 0x540057a2, NOP),
-    # sptm_init_mte_boundaries compares the MTE tag-storage register (TagOffset_EL2) with the
-    # window it computed. The register is banked and the guest's copy reads 0 under aura, so skip
-    # both the compare and the enable-bit check; stage 1 left iBoot's tag storage programmed.
-    ("TagOffset compare", 0x12a50, 0xffffffff, 0x54002861, NOP),
-    ("TagOffset enable check", 0x12a54, 0xffffffff, 0xb6f82929, NOP),
 )
 
-# Per SPTM build: its patches, the page offset of its GEXIT into XNU and the offset of its CTRR
-# stash (aura's sptm_virt_xnu_gexit_po and sptm_virt_ctrr_stash_off).
+# sptm_init_mte_boundaries takes the MTE tag storage from Apple's tag-offset register, which iBoot
+# programmed in the boot core's EL2 bank. The guest runs at EL1, where that register is not
+# accessible at all (a read UNDEFs; in the guarded world it reads 0), so SPTM would place the tag
+# storage at 0 and type 512 MiB of pages from there. It also computes, two instructions later, the
+# base it expects -- the end of its managed window less the tag bytes, which is where iBoot put it.
+# This reorders its own instructions so that value is the one stored and used, and drops the
+# comparison against the register. Every instruction below is one of the original eighteen; the
+# rewrite is refused unless all eighteen match.
+MTE_SEQ_26A428_T8142 = (
+    0x12a10,
+    # as shipped
+    (0xd538b908, 0x926c5508, 0xf0fffef4, 0xf9010688, 0xb9420329, 0xd372c529, 0x8b080128,
+     0xf0fffeea, 0xf9010948, 0xa9402b88, 0xcb090108, 0x8b0a0108, 0x926cad08, 0xd538b909,
+     0x9240f92a, 0xeb08015f, 0x54002861, 0xb6f82929),
+    # x9 = tag bytes; x8 = window base + size - x9, 1 MiB aligned; store it as the tag base and
+    # base + x9 as its end; then nothing
+    (0xb9420329, 0xd372c529, 0xf0fffef4, 0xa9402b88, 0xcb090108, 0x8b0a0108, 0x926cad08,
+     0xf0fffeea, 0xf9010688, 0x8b080128, 0xf9010948) + (NOP,) * 7,
+)
+
+# Per SPTM build: its patches, the page offset of its GEXIT into XNU, the offset of its CTRR
+# stash (aura's sptm_virt_xnu_gexit_po and sptm_virt_ctrr_stash_off) and an optional sequence
+# rewrite (offset, expected words, replacement words).
 SPTM_BUILDS = (
-    ("25G83", SPTM_PATCHES, 0x2d8, 0xa50),
-    ("26A428 t8142", SPTM_PATCHES_26A428_T8142, 0xfb0, 0x5f0),
+    ("25G83", SPTM_PATCHES, 0x2d8, 0xa50, None),
+    ("26A428 t8142", SPTM_PATCHES_26A428_T8142, 0xfb0, 0x5f0, MTE_SEQ_26A428_T8142),
 )
 
 # AMCC error status words: four planes, seven words each.
@@ -313,8 +335,22 @@ def sptm_build(sptm, entry_off):
     return None
 
 
+def rewrite_sptm_seq(p, sym, entry, name, seq):
+    off, want, new = seq
+    pa = entry + off
+    have = tuple(p.read32(pa + 4 * i) for i in range(len(want)))
+    if have != want:
+        raise SystemExit(f"{name}: the sequence at 0x{pa:x} is not the one this rewrite is for:\n"
+                         f"  have " + " ".join(f"{w:08x}" for w in have) + "\n"
+                         f"  want " + " ".join(f"{w:08x}" for w in want))
+    for i, w in enumerate(new):
+        p.write32(pa + 4 * i, w)
+    p.call(sym["sptm_virt_flush"], pa & ~0x3f, 0x80 + len(new) * 4)
+    print(f"{name}: rewrote {len(new)} instructions at 0x{pa:x} (MTE tag storage from the window)")
+
+
 def patch_sptm(p, sym, entry, build):
-    name, patches, gexit_po, stash_off = build
+    name, patches, gexit_po, stash_off, mte_seq = build
     for what, off, mask, expected, new in patches:
         pa = entry + off
         before = p.read32(pa)
@@ -324,6 +360,8 @@ def patch_sptm(p, sym, entry, build):
         p.write32(pa, new)
         p.call(sym["sptm_virt_flush"], pa & ~0x3f, 0x80)
         print(f"{what}: [0x{pa:x}] 0x{before:08x} -> 0x{p.read32(pa):08x}")
+    if mte_seq:
+        rewrite_sptm_seq(p, sym, entry, name, mte_seq)
     p.write32(sym["sptm_virt_xnu_gexit_po"], gexit_po)
     p.write32(sym["sptm_virt_ctrr_stash_off"], stash_off)
     print(f"SPTM {name}: XNU-entry GEXIT page offset 0x{gexit_po:x}, CTRR stash +0x{stash_off:x}")
@@ -347,6 +385,10 @@ def configure(p, sym, plan):
     print(f"SPTM diagnostic record at 0x{plan.diag_pa:x}")
     flags = sum(bit for name, bit in CONFIG_FLAGS.items() if env_on(name))
     p.call(sym["sptm_virt_config"], flags)
+    for env, symbol in (("AURA_SAMPLE_HZ", "sptm_virt_sample_hz"),
+                        ("AURA_SAMPLE_MAX", "sptm_virt_sample_max")):
+        if os.environ.get(env):
+            p.write32(sym[symbol], env_int(env))
     if os.environ.get("AURA_GPU_STOP_SECS"):
         p.write32(sym["sptm_virt_gpu_stop_secs"], env_int("AURA_GPU_STOP_SECS"))
     if os.environ.get("AURA_GPU_PRINT_MAX"):

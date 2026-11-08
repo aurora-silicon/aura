@@ -56,7 +56,7 @@ def adt_blob():
     names = ["TXM-ro", "TXM-rx", "TXM-bx", "TXM-rw", "TXM-le", "TXM-entry", "TXM-virt", "TrustCache",
              "BootKC-rx", "BootKC-bx", "BootKC-ro", "BootKC-rs", "BootKC-rw", "BootKC-le",
              "BootKC-virt", "BootKC-entry", "DeviceTree", "SPTM-ro", "SPTM-rm", "SPTM-rx", "SPTM-rw",
-             "SPTM-le", "SPTM-entry", "SPTM-virt", "BootArgs", "SPTMDiag", "CL4-dummypage",
+             "SPTM-le", "SPTM-entry", "SPTM-virt", "BootArgs", "SPTMDebug", "CL4-dummypage",
              "RAMDisk",
              "slide", "CL4-entry", "CL4-virt", "CL4-rx", "CL4-ro"]
     mm = node([("name", b"memory-map\0")] + [region(n) for n in names])
@@ -128,10 +128,10 @@ def check(plan, sptm, adt, phys=PHYS):
     assert adt_va - virt == plan.adt_pa - PHYS and adt_len == len(plan.adt)
     assert plan.boot_args[0x6C:0x6C + 11] == b"serial=3 -v"
     # Revision 3: the diagnostic-record VA at +0x480, in the window, its own blob region.
-    (diag_va,) = struct.unpack_from("<Q", plan.boot_args, 0x480)
+    (diag,) = struct.unpack_from("<Q", plan.boot_args, 0x480)
     assert len(plan.boot_args) == 0x488
-    assert diag_va - virt == plan.diag_pa - PHYS
-    assert plan.regions["SPTMDiag"] == (plan.diag_pa, 0x4000)
+    assert diag == plan.diag_pa  # a PA: SPTM zeroes the record with its MMU off
+    assert plan.regions["SPTMDebug"] == (plan.diag_pa, 0x4000)
     # SPTM runs at sptm_pa + virtBase - physBase: that VA must be page aligned.
     assert (plan.sptm_pa - PHYS + virt) % PAGE == 0
 
