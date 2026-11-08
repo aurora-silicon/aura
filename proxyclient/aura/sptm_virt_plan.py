@@ -700,13 +700,31 @@ def plan_boot(sptm, txm, xnu, adt, *, dram_base, phys_base, mem_size, mem_size_a
                 notes.append("aura HIGH carve-out declared as region-id-%d %#x+%#x "
                              "(SPTM-reserved, must not manage)"
                              % (rid, aura_base, aura_end - aura_base))
+    # /chosen/boot-command is iBoot's boot mode, and AppleImage4 switches on it: only the
+    # ordinary values (1, 2, 9, 10, 11) leave NVRAM mutable, while 4 makes it decide "platform
+    # requires immutable NVRAM [Deconflicting]". NVRAM then cannot hold a nonce slot, the
+    # cryptex1 boot nonce never exists, and launchd's cryptex graft fails to load its trust
+    # cache -- which ends the boot in recovery. aura's own boot carries a value the guest must
+    # not inherit, so present an ordinary boot.
+    chosen = adt_find(root, "chosen")
+    for prop in chosen.props:
+        if prop[0] == "boot-command":
+            had = int.from_bytes(prop[1][:4], "little")
+            if had not in (1, 2, 9, 10, 11):
+                prop[1] = struct.pack("<I", 1) + prop[1][4:]
+                notes.append(f"/chosen/boot-command {had} -> 1 (Image4 keeps NVRAM mutable)")
+            else:
+                notes.append(f"/chosen/boot-command {had} (Image4 keeps NVRAM mutable)")
+            break
+    else:
+        notes.append("WARNING: no /chosen/boot-command in the tree")
+
     # /chosen/hibernation: SPTM sptm_hibentry (hib_get_key) REQUIRES this node at cold boot.
     # key-sptm-ctrr(48) + key-xnu-ctrr(48) are required present+non-zero (SPTM/XNU CTRR-image HMAC
     # keys); key-exclave(32)/key-exclave-entropy(32) are optional (exclaves skipped) but included
     # non-zero. SPTM only checks presence+exact-size+not-all-zero then copies+scrubs the DT source -
     # no boot-time crypto validation - so dummy non-zero material passes. aura's chainload ADT lacks
     # this node (iBoot populates it on a full/slid boot). The capture's keys are zeroed post-scrub.
-    chosen = adt_find(root, "chosen")
     if not any(k.name() == "hibernation" for k in chosen.kids):
         hib = RawNode()
         hib.props.append(["name", b"hibernation\0", 0])
