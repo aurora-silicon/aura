@@ -38,6 +38,8 @@ Environment (all optional; 1 enables a switch):
   AURA_SAMPLE_HZ=<n>       samples per second (default 4)
   AURA_SAMPLE_MAX=<n>      stop printing after n samples (default 64)
   AURA_XNU_RO_RELAX        patch XNU's zalloc_ro_mut RO-zone panic out (tracing only; XNU_QUIRKS)
+  AURA_XNU_TC_FORCE        accept a trust cache TXM refused, so the cryptex graft proceeds
+  AURA_SHARE_NVRAM         let the guest reach the real NVRAM (a failed boot pollutes it)
   AURA_DEBUG_PORT=<n>      with the proxy on KIS, hide only USB-C port n (port-number), not all
   AURA_SPTM_DIAG           give SPTM a diagnostic record (boot_args revision 3, SPTMDebug)
   AURA_OS_LONG_VERSION     the guest's Ap,OSLongVersion (--os-long-version)
@@ -103,6 +105,7 @@ KNOWN_ENV = {
     "AURA_SAMPLE_MAX",
     "AURA_XNU_RO_RELAX",
     "AURA_SHARE_NVRAM",
+    "AURA_XNU_TC_FORCE",
     "AURA_DEBUG_PORT",
     "AURA_SPTM_DIAG",
 } | set(CONFIG_FLAGS)
@@ -168,7 +171,16 @@ XNU_QUIRKS = (
          # With the device hidden the guest still reads iBoot's /chosen/nvram-proxy-data, so the
          # question is worth skipping either way.
          nvram_mutable=(("Image4 storageInit mix-and-match question", "BootKC-rx",
-                         0x2bc0a04, 0x34000080, 0x14000022),)),
+                         0x2bc0a04, 0x34000080, 0x14000022),),
+         # AURA_XNU_TC_FORCE. The cryptex graft loads cryptex1/current/os.dmg.trustcache through
+         # TXM, which refuses it: the manifest is the reduced-security one and its chip's nonce
+         # slot does not exist here (CHIP_CRYPTEX1_BOOT_AP_REDUCED, tag c1br), so launchd gives
+         # up and the boot ends in recovery. The static trust cache this host passes is that same
+         # cryptex's, so its binaries are trusted either way -- take the success path (cbz w0 -> b)
+         # and let the graft proceed. The guest then accepts a trust cache its supervisor refused:
+         # a tracing switch, never on by default.
+         tc_force=(("trust-cache load result", "BootKC-rx",
+                    0x37e1fd8, 0x340000e0, 0x14000007),)),
 )
 
 
@@ -714,6 +726,8 @@ def main():
         set_xnu_rorgn(p, sym, plan, quirks)
     if quirks.get("nvram_mutable"):
         patch_xnu(p, sym, plan, quirks["nvram_mutable"])
+    if env_on("AURA_XNU_TC_FORCE") and quirks.get("tc_force"):
+        patch_xnu(p, sym, plan, quirks["tc_force"])
     configure(p, sym, plan, live_adt)
     if p.call(sym["sptm_virt_load"], entry, handoff) != 0:
         raise SystemExit("sptm_virt_load rejected the entry/handoff (see aura's console)")
