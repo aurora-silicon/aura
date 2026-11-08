@@ -18,6 +18,7 @@
 #include "memory.h"
 #include "nv2.h"
 #include "smp.h"
+#include "soc.h"
 #include "sptm_virt_priv.h"
 #include "string.h"
 #include "uartproxy.h"
@@ -225,8 +226,18 @@ static bool sptm_virt_rg_hook(struct exc_info *ctx, u64 addr, u64 *val, bool wri
     }
     for (int i = 0; i < 4; i++) {
         if (rg_extra[i] && a == rg_extra[i]) {
-            /* XNU writes these only on its way down: stop at the first attempt. */
-            sptm_virt_rg_report(ctx, "watchdog-node register", addr, v, v != 0);
+            /* On T8140 XNU writes these only on its way down, so the first attempt stops it. The
+             * J813's XNU writes one of them while IOKit starts, long before any reset, so there
+             * they are logged and performed and only the CTL paths above stop a reset. */
+            if (chip_id == T8142) {
+                if (log)
+                    printf("SPTM-virt[rst]: watchdog-node register 0x%lx <- 0x%lx (pc 0x%lx, "
+                           "passed)\n",
+                           addr, v, ctx->elr);
+                sptm_virt_mmio_rw(addr, val, true, width);
+            } else {
+                sptm_virt_rg_report(ctx, "watchdog-node register", addr, v, v != 0);
+            }
             return true;
         }
     }
@@ -287,7 +298,10 @@ static void sptm_virt_reset_guard_setup(void)
         rg_alarm_shadow[0] = rg_wdt ? read32(rg_wdt + WDT_ALARM) : 0;
     }
     node = adt_path_offset_trace(adt, "/arm-io/hib-exclave-watchdog", path);
-    if (node >= 0 && adt_get_reg(adt, path, "reg", 0, &pa, &sz) >= 0) {
+    /* On T8142 a read of it from EL2 takes an SError (it is exclave-owned there): leave it be. */
+    if (node >= 0 && chip_id == T8142) {
+        printf("SPTM-virt[rst]: T8142: hib-exclave-watchdog not guarded\n");
+    } else if (node >= 0 && adt_get_reg(adt, path, "reg", 0, &pa, &sz) >= 0) {
         rg_xwdt = pa;
         rg_alarm_shadow[1] = read32(rg_xwdt + WDT_ALARM);
         sptm_virt_rg_page(pa, "hib-exclave-watchdog");
@@ -404,6 +418,7 @@ void sptm_virt_s2_setup(void)
     sptm_virt_reset_guard_setup();
     /* After the guard, whose pages the sleep path leaves alone. */
     sptm_virt_s2r_setup(uartproxy_iodev >= IODEV_USB0 && uartproxy_iodev < IODEV_MAX);
+    sptm_virt_gpu_setup();
 
     /* SPTM's own bring-up runs without it; each core arms it at its GEXIT into XNU, after
      * checking that nothing changed the tree in between. */

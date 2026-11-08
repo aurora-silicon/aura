@@ -12,8 +12,10 @@ Needs aura built with SPTM_VIRT=1 CHAINLOADING=1 and chainloaded, with its proxy
 
 Environment (all optional; 1 enables a switch):
   AURA_KEEP_EXCLAVES       keep the exclave nodes; with AURA_EXCLAVE_FW, run cL4 and ExclaveOS
-  AURA_EXCLAVE_FW=<dir>    extracted exclave firmware (exclavecore_bundle.t8140.RELEASE and
+  AURA_EXCLAVE_FW=<dir>    extracted exclave firmware (exclavecore_bundle.<soc>.RELEASE and
                            <build>__MacOS/Firmware)
+  AURA_EXCLAVE_BUNDLE=<f>  the IPSW's ExclaveCore bundle (Ap,cL4), instead of AURA_EXCLAVE_FW
+  AURA_EXCLAVE_INTEGRITY=<f>, AURA_EXCLAVE_TRUSTCACHE=<f>   the ExclaveOS catalogs beside it
   AURA_XNU_SERIAL=<node>   XNU's console device under /arm-io, e.g. uart0 (aura's vuart)
   AURA_HIDE_DOCKCHANNEL    hide the DockChannel that carries aura's console and proxy
   AURA_KEEP_ERRH           keep the platform error handler visible to XNU
@@ -28,6 +30,13 @@ Environment (all optional; 1 enables a switch):
   AURA_S2R_USB_RETAKE=<n>  take the CDC link again after a wake; n > 1 also drops it n s in
   AURA_S2R_USB_RETAKE_MS   delay from XNU's return to the re-take (ms)
   AURA_XNU_BT              sample XNU backtraces every few seconds per core
+  AURA_GPU_TRACE           hook the GPU (sgx reg 0) and PMP registers, record every access
+  AURA_GPU_STOP_SECS=<n>   park in the proxy n s after the first GPU access (read the ring)
+  AURA_GPU_PRINT_MAX=<n>   print at most n GPU accesses on aura's console (default 20000)
+  AURA_SAMPLE              sample the guest's PC until each core's XNU entry (pre-XNU hangs)
+  AURA_SAMPLE_HZ=<n>       samples per second (default 4)
+  AURA_SAMPLE_MAX=<n>      stop printing after n samples (default 64)
+  AURA_XNU_RO_RELAX        patch XNU's zalloc_ro_mut RO-zone panic out (tracing only)
   AURA_TAIL_SECS, AURA_TAIL_IDLE   keep reading the console after entry, until idle
   XNU_BOOTARGS             XNU's command line
 
@@ -62,10 +71,15 @@ CONFIG_FLAGS = {
     "AURA_S2R_COPROC": 1 << 3,
     "AURA_S2R_DROP_USB": 1 << 4,
     "AURA_XNU_BT": 1 << 5,
+    "AURA_GPU_TRACE": 1 << 6,
+    "AURA_SAMPLE": 1 << 7,
 }
 KNOWN_ENV = {
     "AURA_KEEP_EXCLAVES",
     "AURA_EXCLAVE_FW",
+    "AURA_EXCLAVE_BUNDLE",
+    "AURA_EXCLAVE_INTEGRITY",
+    "AURA_EXCLAVE_TRUSTCACHE",
     "AURA_XNU_SERIAL",
     "AURA_HIDE_DOCKCHANNEL",
     "AURA_KEEP_ERRH",
@@ -75,6 +89,11 @@ KNOWN_ENV = {
     "AURA_S2R_USB_RETAKE_MS",
     "AURA_TAIL_SECS",
     "AURA_TAIL_IDLE",
+    "AURA_GPU_STOP_SECS",
+    "AURA_GPU_PRINT_MAX",
+    "AURA_SAMPLE_HZ",
+    "AURA_SAMPLE_MAX",
+    "AURA_XNU_RO_RELAX",
 } | set(CONFIG_FLAGS)
 
 # The debug link: DockChannel plus the ATC0 port's PD controller, USB controller and PHY path.
@@ -93,8 +112,24 @@ KIS_PORT_NODES_T8132 = (
     "/arm-io/acio0", "/arm-io/acio-cpu0", "/arm-io/dart-acio0",
     "/arm-io/apciec0", "/arm-io/dart-apciec0", "/arm-io/apciec0-piodma",
 )
+# T8142 (J813): the debug link may be on either port, so both ports' USB-C paths are hidden.
+KIS_PORT_NODES_T8142 = (
+    "/arm-io/nub-spmi-a0/hpm0", "/arm-io/nub-spmi-a0/hpm1",
+    "/arm-io/usb-drd0", "/arm-io/dart-usb0", "/arm-io/atc-phy0",
+    "/arm-io/atc0-dpxbar", "/arm-io/atc0-dpphy", "/arm-io/atc0-dpin0", "/arm-io/atc0-dpin1",
+    "/arm-io/usb-drd1", "/arm-io/dart-usb1", "/arm-io/atc-phy1",
+    "/arm-io/atc1-dpxbar", "/arm-io/atc1-dpphy", "/arm-io/atc1-dpin0", "/arm-io/atc1-dpin1",
+    "/arm-io/i2c2/atcrt0", "/arm-io/i2c2/atcrt1",
+)
+KIS_PORT_NODES_BY_CHIP = {0x8132: KIS_PORT_NODES_T8132, 0x8142: KIS_PORT_NODES_T8142}
 # Nothing drives the ANE yet, and the platform error handler panics on an AMCC DSID timeout.
 STRIP_NODES = ("/arm-io/ane", "/arm-io/dart-ane")
+# T8142: AppleConvergedPCI panics XNU in zalloc_ro_mut on one of its own statics
+# (kernelcache+0x42e1e0) about a second into IOKit. Nothing here needs PCIe or Wi-Fi, so its nodes
+# are hidden; the Thunderbolt/CIO PCIe paths go with them.
+STRIP_NODES_T8142 = ("/arm-io/apcie", "/arm-io/dart-apcie0", "/arm-io/apcie0-piodma",
+                     "/arm-io/apciec0", "/arm-io/dart-apciec0", "/arm-io/apciec0-piodma",
+                     "/arm-io/centauri", "/arm-io/bluetooth", "/arm-io/aop-spmi0/spmi-wifibt")
 ERROR_HANDLER = "/arm-io/error-handler"
 # Without cL4 the exclaves stay NOT_SUPPORTED, so their nodes and the RTBuddy routes that resolve
 # through them would wait forever in IOKit. With cL4 they must stay: hidden, DCP never completes
@@ -138,7 +173,60 @@ SPTM_PATCHES = (
 SPTM_PATCHES_T8132 = tuple(
     (what, off + 0xc4 if what == "AMCC CTRR match" else off, mask, expected, new)
     for what, off, mask, expected, new in SPTM_PATCHES)
-T8132 = 0x8132
+
+# The same five checks in macOS 27.0's sptm.t8142 (26A428): the CTRR checks sit 0xc10 higher,
+# the AMCC/ACC comparisons are init_pre_late_io_reservation's branches to its two mismatch panics.
+SPTM_PATCHES_26A428_T8142 = (
+    ("APSTS poll", 0x3258, 0xff000000, 0xb4000000, NOP),
+    ("CTRR check", 0x135fc, 0xffffffff, 0x54000ac1, 0x14000056),
+    ("CTRR reset-path check", 0x134d0, 0xffffffff, 0x34000986, 0x140000a1),
+    ("ctXr lock check", 0x1372c, 0xff00001f, 0x54000001, NOP),
+    ("ctXr lock check", 0x13738, 0xff00001f, 0x54000001, NOP),
+    ("ctXr lock check", 0x13744, 0xff00001f, 0x54000001, NOP),
+    ("ctXr lock check", 0x13750, 0xff00001f, 0x54000001, NOP),
+    ("AMCC CTRR-C match", 0x3d008, 0xffffffff, 0x54004461, NOP),
+    ("AMCC CTRR-C match", 0x3d014, 0xffffffff, 0x54004402, NOP),
+    ("AMCC CTRR-D match", 0x3d050, 0xffffffff, 0x54005801, NOP),
+    ("AMCC CTRR-D match", 0x3d05c, 0xffffffff, 0x540057a2, NOP),
+)
+
+# sptm_init_mte_boundaries takes the MTE tag storage from Apple's tag-offset register, which iBoot
+# programmed in the boot core's EL2 bank. The guest runs at EL1, where that register is not
+# accessible at all (a read UNDEFs; in the guarded world it reads 0), so SPTM would place the tag
+# storage at 0 and type 512 MiB of pages from there. It also computes, two instructions later, the
+# base it expects -- the end of its managed window less the tag bytes, which is where iBoot put it.
+# This reorders its own instructions so that value is the one stored and used, and drops the
+# comparison against the register. Every instruction below is one of the original eighteen; the
+# rewrite is refused unless all eighteen match.
+MTE_SEQ_26A428_T8142 = (
+    0x12a10,
+    # as shipped
+    (0xd538b908, 0x926c5508, 0xf0fffef4, 0xf9010688, 0xb9420329, 0xd372c529, 0x8b080128,
+     0xf0fffeea, 0xf9010948, 0xa9402b88, 0xcb090108, 0x8b0a0108, 0x926cad08, 0xd538b909,
+     0x9240f92a, 0xeb08015f, 0x54002861, 0xb6f82929),
+    # x9 = tag bytes; x8 = window base + size - x9, 1 MiB aligned; store it as the tag base and
+    # base + x9 as its end; then nothing
+    (0xb9420329, 0xd372c529, 0xf0fffef4, 0xa9402b88, 0xcb090108, 0x8b0a0108, 0x926cad08,
+     0xf0fffeea, 0xf9010688, 0x8b080128, 0xf9010948) + (NOP,) * 7,
+)
+
+# Per SPTM build: its patches, the page offset of its GEXIT into XNU, the offset of its CTRR
+# stash (aura's sptm_virt_xnu_gexit_po and sptm_virt_ctrr_stash_off) and an optional sequence
+# rewrite (offset, expected words, replacement words).
+SPTM_BUILDS = (
+    ("25G83", SPTM_PATCHES, 0x2d8, 0xa50, None),
+    ("25G83 t8132", SPTM_PATCHES_T8132, 0x2d8, 0xa50, None),
+    ("26A428 t8142", SPTM_PATCHES_26A428_T8142, 0xfb0, 0x5f0, MTE_SEQ_26A428_T8142),
+)
+
+# Optional patches to the loaded kernelcache, for tracing only (AURA_XNU_RO_RELAX): region name,
+# offset into that region, the word expected there and its replacement.
+# 26A428's xnu-13432.1.9 panics in zalloc_ro_mut a second into userspace on the J813 ("source ...
+# not from RO zone map"), before the GPU firmware starts, which is what the GPU trace is after.
+# This takes the branch that skips the panic unconditionally, so the mutation it was asked for is
+# performed. It changes what the guest does: never on by default.
+XNU_RO_RELAX_26A428 = (("zalloc_ro_mut RO-zone check", "BootKC-rx", 0x3b27e4c, 0x540002a9,
+                        0x14000015),)
 
 # AMCC error status words: four planes, seven words each.
 AMCC_STATUS = 0x220025004
@@ -225,20 +313,52 @@ def check_oslog(adt, aura_base, aura_end):
         raise SystemExit("aura's .bss/stacks overlap a DCP __OS_LOG buffer: shrink .bss")
 
 
+def exclave_cl4(plan_mod, bundle, kernel_bytes=None):
+    """The cL4 kernel's entry and virtual base. The bundle carries its SYSTEM kernel's Mach-O
+    header at the start of its read-only region, so an extracted copy of that file is optional."""
+    if kernel_bytes is None:
+        kernel_bytes = bundle.payload[bundle.regions["CL4-ro"][0]:]
+    kernel = plan_mod.macho_info(kernel_bytes)
+    return kernel.entry, kernel.virtlo
+
+
+def exclave_report(bundle, entry, virt, integrity, trustcache):
+    print(f"exclaves: cL4 bundle 0x{len(bundle.payload):x} entry 0x{entry:x} virt 0x{virt:x}; "
+          f"exic 0x{len(integrity):x} extc 0x{len(trustcache):x}; regions "
+          + " ".join(f"{k}=0x{v[1]:x}" for k, v in bundle.regions.items())
+          + "; components " + " ".join(f"{c.name}({c.kind})" for c in bundle.components))
+    return dict(cl4_regions=bundle.regions, cl4_entry=entry, cl4_virt=virt,
+                exclave_integrity=integrity, exclave_trustcache=trustcache), bundle.payload
+
+
 def exclave_firmware(fw_dir, plan_mod):
+    """The extracted exclave firmware of a macOS install: an ExclaveCore bundle directory and the
+    build's Firmware directory beside it."""
     from aura.exclave_bundle import parse as parse_bundle
 
-    bdir = fw_dir / "exclavecore_bundle.t8140.RELEASE"
-    bundle = parse_bundle((bdir / "exclavecore_bundle.t8140.RELEASE").read_bytes())
-    kernel = plan_mod.macho_info((bdir / "SYSTEM" / "kernel").read_bytes())
+    bdir = next(fw_dir.glob("exclavecore_bundle.*.RELEASE"))
+    bundle = parse_bundle((bdir / bdir.name).read_bytes())
+    kernel_file = bdir / "SYSTEM" / "kernel"
+    entry, virt = exclave_cl4(plan_mod, bundle,
+                              kernel_file.read_bytes() if kernel_file.exists() else None)
     fw = next(fw_dir.glob("*__MacOS")) / "Firmware"
-    integrity = (fw / "exclave.integrity_catalog.bin").read_bytes()
-    trustcache = (fw / "exclave.trustcache.bin").read_bytes()
-    print(f"exclaves: cL4 bundle 0x{len(bundle.payload):x} entry 0x{kernel.entry:x} virt "
-          f"0x{kernel.virtlo:x}; exic 0x{len(integrity):x} extc 0x{len(trustcache):x}; regions "
-          + " ".join(f"{k}=0x{v[1]:x}" for k, v in bundle.regions.items()))
-    return dict(cl4_regions=bundle.regions, cl4_entry=kernel.entry, cl4_virt=kernel.virtlo,
-                exclave_integrity=integrity, exclave_trustcache=trustcache), bundle.payload
+    return exclave_report(bundle, entry, virt,
+                          (fw / "exclave.integrity_catalog.bin").read_bytes(),
+                          (fw / "exclave.trustcache.bin").read_bytes())
+
+
+def exclave_files(plan_mod):
+    """The three IPSW members directly: the ExclaveCore bundle (Ap,cL4), the ExclaveOS integrity
+    catalog and its trust cache, each an IM4P container as shipped."""
+    from aura.exclave_bundle import im4p_payload, parse as parse_bundle
+
+    bundle = parse_bundle(pathlib.Path(os.environ["AURA_EXCLAVE_BUNDLE"]).read_bytes())
+    entry, virt = exclave_cl4(plan_mod, bundle)
+    blobs = []
+    for env in ("AURA_EXCLAVE_INTEGRITY", "AURA_EXCLAVE_TRUSTCACHE"):
+        path = os.environ.get(env)
+        blobs.append(im4p_payload(pathlib.Path(path).read_bytes()) if path else b"")
+    return exclave_report(bundle, entry, virt, *blobs)
 
 
 def write_plan(p, u, iface, sym, plan, images):
@@ -274,8 +394,46 @@ def write_plan(p, u, iface, sym, plan, images):
     p.call(sym["sptm_virt_flush"], plan.boot_args_pa, len(plan.boot_args))
 
 
-def patch_sptm(p, sym, entry, chip):
-    for what, off, mask, expected, new in SPTM_PATCHES_T8132 if chip == T8132 else SPTM_PATCHES:
+def sptm_build(sptm, entry_off):
+    """The SPTM_BUILDS entry whose every patch site matches the image, or None."""
+    for build in SPTM_BUILDS:
+        if all(struct.unpack_from("<I", sptm, entry_off + off)[0] & mask == expected
+               for _w, off, mask, expected, _n in build[1]):
+            return build
+    return None
+
+
+def rewrite_sptm_seq(p, sym, entry, name, seq):
+    off, want, new = seq
+    pa = entry + off
+    have = tuple(p.read32(pa + 4 * i) for i in range(len(want)))
+    if have != want:
+        raise SystemExit(f"{name}: the sequence at 0x{pa:x} is not the one this rewrite is for:\n"
+                         f"  have " + " ".join(f"{w:08x}" for w in have) + "\n"
+                         f"  want " + " ".join(f"{w:08x}" for w in want))
+    for i, w in enumerate(new):
+        p.write32(pa + 4 * i, w)
+    p.call(sym["sptm_virt_flush"], pa & ~0x3f, 0x80 + len(new) * 4)
+    print(f"{name}: rewrote {len(new)} instructions at 0x{pa:x} (MTE tag storage from the window)")
+
+
+def patch_xnu(p, sym, plan, patches):
+    for what, region, off, expected, new in patches:
+        if region not in plan.regions:
+            raise SystemExit(f"{what}: the plan has no {region} region")
+        pa = plan.regions[region][0] + off
+        before = p.read32(pa)
+        if before != expected:
+            raise SystemExit(f"{what}: [0x{pa:x}] = 0x{before:08x}, expected 0x{expected:08x}: "
+                             f"not the kernelcache this patch is for")
+        p.write32(pa, new)
+        p.call(sym["sptm_virt_flush"], pa & ~0x3f, 0x80)
+        print(f"XNU {what}: [0x{pa:x}] 0x{before:08x} -> 0x{p.read32(pa):08x}")
+
+
+def patch_sptm(p, sym, entry, build):
+    name, patches, gexit_po, stash_off, mte_seq = build
+    for what, off, mask, expected, new in patches:
         pa = entry + off
         before = p.read32(pa)
         if before & mask != expected:
@@ -284,6 +442,11 @@ def patch_sptm(p, sym, entry, chip):
         p.write32(pa, new)
         p.call(sym["sptm_virt_flush"], pa & ~0x3f, 0x80)
         print(f"{what}: [0x{pa:x}] 0x{before:08x} -> 0x{p.read32(pa):08x}")
+    if mte_seq:
+        rewrite_sptm_seq(p, sym, entry, name, mte_seq)
+    p.write32(sym["sptm_virt_xnu_gexit_po"], gexit_po)
+    p.write32(sym["sptm_virt_ctrr_stash_off"], stash_off)
+    print(f"SPTM {name}: XNU-entry GEXIT page offset 0x{gexit_po:x}, CTRR stash +0x{stash_off:x}")
 
 
 def report_amcc(p, clear):
@@ -299,9 +462,19 @@ def report_amcc(p, clear):
                     print("  cleared, now 0x%08x" % p.read32(addr))
 
 
-def configure(p, sym):
+def configure(p, sym, plan):
+    p.write64(sym["sptm_virt_diag_pa"], plan.diag_pa)
+    print(f"SPTM diagnostic record at 0x{plan.diag_pa:x}")
     flags = sum(bit for name, bit in CONFIG_FLAGS.items() if env_on(name))
     p.call(sym["sptm_virt_config"], flags)
+    for env, symbol in (("AURA_SAMPLE_HZ", "sptm_virt_sample_hz"),
+                        ("AURA_SAMPLE_MAX", "sptm_virt_sample_max")):
+        if os.environ.get(env):
+            p.write32(sym[symbol], env_int(env))
+    if os.environ.get("AURA_GPU_STOP_SECS"):
+        p.write32(sym["sptm_virt_gpu_stop_secs"], env_int("AURA_GPU_STOP_SECS"))
+    if os.environ.get("AURA_GPU_PRINT_MAX"):
+        p.write32(sym["sptm_virt_gpu_print_max"], env_int("AURA_GPU_PRINT_MAX"))
     if os.environ.get("AURA_S2R_QUIESCE"):
         p.write32(sym["sptm_virt_s2r_quiesce"], env_int("AURA_S2R_QUIESCE"))
         print("AMCC quiesce writes at the commit:", os.environ["AURA_S2R_QUIESCE"])
@@ -375,8 +548,8 @@ def main():
     # below aura's carve-out.
     scratch = u.malloc(0x40)
     if p.call(sym["sptm_virt_place"], scratch) != 0:
-        raise SystemExit("sptm_virt_place failed: not an SPTM_VIRT build on a T8140 or T8132, or "
-                         "no valid layout (see aura's console)")
+        raise SystemExit("sptm_virt_place failed: not an SPTM_VIRT build on a T8140, T8132 or "
+                         "T8142, or no valid layout (see aura's console)")
     managed_base, managed_end = (p.read64(scratch + 8 * i) for i in range(2))
     print(f"managed window from aura [0x{managed_base:x}, 0x{managed_end:x})")
 
@@ -400,9 +573,17 @@ def main():
               "xnu": args.xnu.read_bytes()}
     check_oslog(adt, sym.run_base, sym["_end"])
 
+    entry_off = plan_mod.macho_info(images["sptm"]).entry - plan_mod.macho_info(images["sptm"]).virtlo
+    build = sptm_build(images["sptm"], entry_off)
+    if build is None:
+        raise SystemExit("unknown SPTM build: no SPTM_BUILDS patch set matches it")
+    print(f"SPTM build {build[0]}")
+
+    chip = u.adt["/chosen"].chip_id
     keep_exclaves = env_on("AURA_KEEP_EXCLAVES")
-    chip = p.get_chipid()
-    hide = (KIS_PORT_NODES_T8132 if chip == T8132 else KIS_PORT_NODES) + STRIP_NODES
+    hide = KIS_PORT_NODES_BY_CHIP.get(chip, KIS_PORT_NODES) + STRIP_NODES
+    if chip == 0x8142:
+        hide += STRIP_NODES_T8142
     if not env_on("AURA_KEEP_ERRH"):
         hide += (ERROR_HANDLER,)
     if env_on("AURA_HIDE_DOCKCHANNEL"):
@@ -410,7 +591,9 @@ def main():
     if not keep_exclaves:
         hide += EXCLAVE_NODES
     cl4 = {}
-    if keep_exclaves and os.environ.get("AURA_EXCLAVE_FW"):
+    if keep_exclaves and os.environ.get("AURA_EXCLAVE_BUNDLE"):
+        cl4, images["cl4"] = exclave_files(plan_mod)
+    elif keep_exclaves and os.environ.get("AURA_EXCLAVE_FW"):
         cl4, images["cl4"] = exclave_firmware(pathlib.Path(os.environ["AURA_EXCLAVE_FW"]), plan_mod)
     serial = os.environ.get("AURA_XNU_SERIAL")
 
@@ -436,8 +619,10 @@ def main():
         return
 
     write_plan(p, u, iface, sym, plan, images)
-    patch_sptm(p, sym, entry, chip)
-    configure(p, sym)
+    patch_sptm(p, sym, entry, build)
+    if env_on("AURA_XNU_RO_RELAX"):
+        patch_xnu(p, sym, plan, XNU_RO_RELAX_26A428)
+    configure(p, sym, plan)
     if p.call(sym["sptm_virt_load"], entry, handoff) != 0:
         raise SystemExit("sptm_virt_load rejected the entry/handoff (see aura's console)")
     if args.no_enter:

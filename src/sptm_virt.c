@@ -9,6 +9,7 @@
 #include "adt.h"
 #include "cpu_regs.h"
 #include "dockchannel_uart.h"
+#include "exception.h"
 #include "fb.h"
 #include "gxf.h"
 #include "heapblock.h"
@@ -43,8 +44,18 @@ static volatile bool sptm_cpu_in_xnu[MAX_CPUS];
 
 bool sptm_virt_requested(void)
 {
-    /* T8140 and T8132 boot as a kcbz=0 Mach-O object with GXF unlocked. */
-    return chip_id == T8140 || chip_id == T8132;
+    /* T8140, T8132 and T8142 boot as kcbz=0 Mach-O objects with GXF unlocked. */
+    return chip_id == T8140 || chip_id == T8132 || chip_id == T8142;
+}
+
+/*
+ * On T8142 iBoot programs MTE tag storage (TagOffset_EL2) as the top 512 MiB of the managed RAM it
+ * would hand SPTM, and SPTM checks it there (sptm_init_mte_boundaries), so SPTM's window keeps
+ * iBoot's end and aura's carve-out comes off its bottom instead.
+ */
+static bool sptm_virt_carveout_low(void)
+{
+    return chip_id == T8142;
 }
 
 int sptm_virt_compute_layout(u64 phys_base, u64 mem_size, u64 ram_base, u64 ram_top, u64 fw_high,
@@ -136,11 +147,13 @@ static u64 sptm_virt_low_floor(u64 limit)
 {
     u64 ro_start = 0, ro_end = 0;
     u64 floor = cur_boot_args.phys_base;
+    /* A low carve-out holds the heap itself, so only what lies below it counts. */
+    bool heap = !sptm_virt_carveout_low();
     const u64 cand[] = {
         (u64)_end,
         cur_boot_args.top_of_kernel_data,
-        (u64)heapblock_high_water(),
-        (u64)heapblock_limit(),
+        heap ? (u64)heapblock_high_water() : 0,
+        heap ? (u64)heapblock_limit() : 0,
         memory_fw_ro_range(&ro_start, &ro_end) > 0 ? ro_end : 0,
     };
 
@@ -150,9 +163,46 @@ static u64 sptm_virt_low_floor(u64 limit)
     return ALIGN_UP(floor, SZ_32M); /* SPTM maps its window in 32 MiB blocks */
 }
 
+/*
+ * The T8142 layout. Two constraints decide it:
+ *  - SPTM's window must end where iBoot's does, because the MTE tag storage is its top 512 MiB and
+ *    SPTM derives the tag base from the window's end.
+ *  - its physBase must lie in the first 512 MiB of DRAM; SPTM checks that (t8110dart's DAPF
+ *    bootstrap: physBase rounded down to 512 MiB must be the DRAM base).
+ * So aura's carve-out goes between what aura and iBoot left low and a cap inside that first
+ * 512 MiB, and SPTM manages everything above it.
+ */
+#define SPTM_VIRT_LOW_CAP  0x1e000000UL /* 480 MiB: physBase stays under the 512 MiB line */
+#define SPTM_VIRT_LOW_HEAP (192UL << 20)
+
+static int sptm_virt_layout_low(u64 ram_base, struct sptm_virt_layout *out)
+{
+    u64 end = cur_boot_args.phys_base + cur_boot_args.mem_size;
+    u64 fw_high = sptm_virt_fw_high();
+
+    memset(out, 0, sizeof(*out));
+    if (fw_high && fw_high < end)
+        return -1; /* the tag storage would no longer be at the window's top */
+    out->ram_base = ram_base;
+    out->ram_top = ram_base + mem_size_actual;
+    out->fw_high = fw_high;
+    out->aura_base = ALIGN_UP(sptm_virt_low_floor(end), SPTM_VIRT_ALIGN);
+    out->aura_top = ram_base + SPTM_VIRT_LOW_CAP;
+    out->aura_size = out->aura_top - out->aura_base;
+    out->managed_base = out->aura_top;
+    out->managed_end = end;
+    if (out->aura_top <= out->aura_base || out->aura_size < SPTM_VIRT_LOW_HEAP)
+        return -1; /* aura and iBoot left too little room below the cap */
+    if (out->managed_base + (2UL << 30) >= end)
+        return -1;
+    return 0;
+}
+
 int sptm_virt_layout(struct sptm_virt_layout *out)
 {
     u64 ram_base = ALIGN_DOWN(cur_boot_args.phys_base, BIT(32));
+    if (sptm_virt_carveout_low())
+        return sptm_virt_layout_low(ram_base, out);
     int rc = sptm_virt_compute_layout(cur_boot_args.phys_base, cur_boot_args.mem_size, ram_base,
                                       ram_base + mem_size_actual, sptm_virt_fw_high(),
                                       SPTM_VIRT_AURA_HEAP, out);
@@ -219,8 +269,8 @@ static int sptm_virt_check_handoff(const struct sptm_virt_layout *l, u64 handoff
     printf("SPTM-virt: handoff boot_args rev %u ver %u virtBase 0x%lx physBase 0x%lx memSize 0x%lx "
            "top 0x%lx\n",
            rev, ver, (u64)ba->virt_base, pbase, msize, top);
-    if (rev != 2 || ver != 2) {
-        printf("SPTM-virt: load refused, handoff is not a revision-2/version-2 boot_args\n");
+    if ((rev != 2 && rev != 3) || ver != 2) {
+        printf("SPTM-virt: load refused, handoff is not a revision-2/3 version-2 boot_args\n");
         return -1;
     }
     if (pbase < l->managed_base || pbase >= l->managed_end || msize > l->managed_end - pbase ||
@@ -293,6 +343,69 @@ __attribute__((used, retain)) void sptm_virt_config(u64 flags)
     printf("SPTM-virt: flags 0x%lx\n", flags);
 }
 
+/* ---- the pre-XNU sampling tick --------------------------------------------------------------
+ * Until a core's first GEXIT into XNU there is nothing to see if the guest spins without trapping:
+ * SPTM runs with its own FIQs masked and aura gets no tick. With SPTM_VIRT_SAMPLE, physical FIQ is
+ * routed to aura (HCR_FMO) while a core is pre-XNU and aura's own timer samples the guest's PC;
+ * EL1's mask does not apply to an interrupt routed to EL2, and SPTM has no FIQ of its own here.
+ * The routing is dropped at the core's XNU entry, so XNU keeps its interrupts.
+ */
+u32 sptm_virt_sample_hz = 4;
+u32 sptm_virt_sample_max = 64;
+static u32 sptm_sample_prints;
+
+static void sptm_virt_sample_arm_here(void)
+{
+    if (!(sptm_virt_flags & SPTM_VIRT_SAMPLE) || !sptm_virt_sample_hz)
+        return;
+    nv2_hcr_update(HCR_FMO, 0);
+    msr(CNTP_TVAL_EL0, mrs(CNTFRQ_EL0) / sptm_virt_sample_hz);
+    msr(CNTP_CTL_EL0, CNTx_CTL_ENABLE);
+    sysop("isb");
+}
+
+static void sptm_virt_sample_disarm_here(void)
+{
+    if (!(sptm_virt_flags & SPTM_VIRT_SAMPLE))
+        return;
+    msr(CNTP_CTL_EL0, 0);
+    sysop("isb");
+    nv2_hcr_update(0, HCR_FMO);
+}
+
+/* An FIQ at EL2 while this core is still in SPTM: aura's sampling timer (exc_fiq). */
+bool sptm_virt_sample_fiq(u64 *regs)
+{
+    if (!(sptm_virt_flags & SPTM_VIRT_SAMPLE) || !sptm_virt_guest_live)
+        return false;
+    if ((mrs(CNTP_CTL_EL0) & (CNTx_CTL_ISTATUS | CNTx_CTL_ENABLE)) !=
+        (CNTx_CTL_ISTATUS | CNTx_CTL_ENABLE))
+        return false;
+
+    bool gl = in_gl12();
+    u64 pc = gl ? mrs(SYS_IMP_APL_ELR_GL1) : mrs(ELR_EL2);
+    if (sptm_sample_prints++ < sptm_virt_sample_max) {
+        printf("SPTM-virt[sample c%d]: guest pc=0x%lx%s sp=0x%lx x0=0x%lx x1=0x%lx x8=0x%lx "
+               "x19=0x%lx x29=0x%lx lr=0x%lx\n",
+               smp_id(), pc, gl ? " (GL1)" : "", mrs(SP_EL1), regs[0], regs[1], regs[8], regs[19],
+               regs[29], regs[30]);
+        u64 fp = regs[29];
+        for (int i = 0; i < 8 && fp; i++) {
+            u64 nfp, lr;
+            if (!sptm_virt_el1_va_read64(fp, &nfp) || !sptm_virt_el1_va_read64(fp + 8, &lr))
+                break;
+            printf("SPTM-virt[sample]:   frame %d lr 0x%lx\n", i, lr);
+            if (nfp <= fp)
+                break;
+            fp = nfp;
+        }
+    }
+    msr(CNTP_TVAL_EL0, mrs(CNTFRQ_EL0) / sptm_virt_sample_hz);
+    msr(CNTP_CTL_EL0, CNTx_CTL_ENABLE);
+    sysop("isb");
+    return true;
+}
+
 /* The last step of every guest entry on a core, from nv2_enter_os. */
 void sptm_virt_cpu_arm(void)
 {
@@ -324,6 +437,7 @@ void sptm_virt_cpu_arm(void)
 
     sptm_virt_cl4_seed(cpu);
     sptm_virt_amx_host();
+    sptm_virt_sample_arm_here();
 }
 
 /* A GEXIT into XNU's normal world: this core runs XNU from now on. */
@@ -332,6 +446,7 @@ void sptm_virt_cpu_enters_xnu(int cpu)
     if (sptm_cpu_in_xnu[cpu])
         return;
     sptm_cpu_in_xnu[cpu] = true;
+    sptm_virt_sample_disarm_here();
     nv2_hcr_update(0, HCR_TWE);
     sptm_virt_s2_enter_xnu(cpu);
 }

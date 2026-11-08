@@ -56,7 +56,8 @@ def adt_blob():
     names = ["TXM-ro", "TXM-rx", "TXM-bx", "TXM-rw", "TXM-le", "TXM-entry", "TXM-virt", "TrustCache",
              "BootKC-rx", "BootKC-bx", "BootKC-ro", "BootKC-rs", "BootKC-rw", "BootKC-le",
              "BootKC-virt", "BootKC-entry", "DeviceTree", "SPTM-ro", "SPTM-rm", "SPTM-rx", "SPTM-rw",
-             "SPTM-le", "SPTM-entry", "SPTM-virt", "BootArgs", "CL4-dummypage", "RAMDisk",
+             "SPTM-le", "SPTM-entry", "SPTM-virt", "BootArgs", "SPTMDebug", "CL4-dummypage",
+             "RAMDisk",
              "slide", "CL4-entry", "CL4-virt", "CL4-rx", "CL4-ro"]
     mm = node([("name", b"memory-map\0")] + [region(n) for n in names])
     carve = node([("name", b"carveout-memory-map\0"),
@@ -119,14 +120,18 @@ def check(plan, sptm, adt, phys=PHYS):
 
     # boot_args: what SPTM's __start loads from x0.
     rev, ver = struct.unpack_from("<HH", plan.boot_args, 0)
-    assert (rev, ver) == (2, 2)
+    assert (rev, ver) == (3, 2)
     virt, phys, size, top = struct.unpack_from("<QQQQ", plan.boot_args, 8)
     assert phys == PHYS and size == END - PHYS and top == plan.blob_end
     assert virt == plan.virt_base
     adt_va, adt_len = struct.unpack_from("<QI", plan.boot_args, 0x60)
     assert adt_va - virt == plan.adt_pa - PHYS and adt_len == len(plan.adt)
     assert plan.boot_args[0x6C:0x6C + 11] == b"serial=3 -v"
-    assert len(plan.boot_args) == 0x488 and plan.boot_args[0x480:] == b"\0" * 8
+    # Revision 3: the diagnostic-record VA at +0x480, in the window, its own blob region.
+    (diag,) = struct.unpack_from("<Q", plan.boot_args, 0x480)
+    assert len(plan.boot_args) == 0x488
+    assert diag == plan.diag_pa  # a PA: SPTM zeroes the record with its MMU off
+    assert plan.regions["SPTMDebug"] == (plan.diag_pa, 0x4000)
     # SPTM runs at sptm_pa + virtBase - physBase: that VA must be page aligned.
     assert (plan.sptm_pa - PHYS + virt) % PAGE == 0
 

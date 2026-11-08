@@ -461,6 +461,9 @@ void exc_irq(u64 *regs)
 void exc_fiq(u64 *regs)
 {
 #ifdef SPTM_VIRT
+    /* aura's own sampling timer while a core is still inside SPTM. */
+    if (sptm_virt_sample_fiq(regs))
+        return;
     if (nv2_handle_async(regs, 2))
         return;
     /* While the virtualized SPTM's secure kernel runs, an FIQ aura does not own preempts it. */

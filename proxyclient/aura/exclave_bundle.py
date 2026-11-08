@@ -20,6 +20,10 @@ PAGE = 0x4000
 _SEQUENCE = 0x30
 _INTEGER = 0x02
 _PRINTABLE = 0x13
+_UTF8 = 0x0C
+# 25G83's bundle encodes the configuration's keys and string values as PrintableString, 26A428's
+# as UTF8String.
+_STRINGS = (_PRINTABLE, _UTF8)
 
 MACHO_KEYS = (
     "__MACHO__TEXTOFF", "__MACHO__TEXTSZ",
@@ -86,7 +90,7 @@ class Bundle:
 
 
 def _der_pairs(buf):
-    """Yield (key, value) for DER PrintableString followed by INTEGER/String.
+    """Yield (key, value) for a DER string key followed by an INTEGER or string value.
 
     The configuration encodes each attribute as SEQUENCE { PrintableString key,
     INTEGER|PrintableString value }. Walking the whole payload for that shape is
@@ -97,7 +101,7 @@ def _der_pairs(buf):
     i = 0
     end = len(buf)
     while i < end - 3:
-        if buf[i] != _PRINTABLE:
+        if buf[i] not in _STRINGS:
             i += 1
             continue
         klen = buf[i + 1]
@@ -122,7 +126,7 @@ def _der_pairs(buf):
         raw = buf[j + 2:j + 2 + vlen]
         if tag == _INTEGER:
             yield key, int.from_bytes(raw, "big")
-        elif tag == _PRINTABLE:
+        elif tag in _STRINGS:
             yield key, raw.decode("ascii", "replace")
         i = j + 2 + vlen
 

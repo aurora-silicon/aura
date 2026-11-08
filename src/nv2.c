@@ -1465,6 +1465,37 @@ static void nv2_inject_self(u64 esr)
     msr(SPSR_EL2, nv2_entry_pstate(spsr));
 }
 
+/*
+ * An exception the guest took at virtual EL2, forwarded by aura's own EL1 vector table: each of
+ * its sixteen slots is an `hvc 0x10 + slot`, so the slot says which vector the hardware picked.
+ * The guest's state is already where it belongs -- the hardware wrote the EL1 exception registers,
+ * which are the guest's vEL2 ones -- so only the vector entry is delivered. Its own VBAR is the
+ * one FEAT_NV2 redirected into the VNCR page; the hardware register stays aura's forwarder.
+ */
+static bool nv2_inject_forwarded(struct nv2_cpu *c, unsigned slot)
+{
+    u64 vbar = VN(c, V_VBAR);
+    static u32 logged;
+
+    if (!vbar) {
+        if (logged++ < 4)
+            printf("NV2[fwd c%d]: the guest has no vEL2 VBAR yet; its %s at 0x%lx (ESR 0x%lx FAR "
+                   "0x%lx) cannot be delivered\n",
+                   smp_id(), slot & 3 ? "exception" : "sync fault", mrs(SYS_ELR_EL12),
+                   mrs(SYS_ESR_EL12), mrs(SYS_FAR_EL12));
+        return false;
+    }
+    if (logged++ < 8)
+        printf("NV2[fwd c%d]: vector slot %u -> 0x%lx (ESR_EL1 0x%lx ELR_EL1 0x%lx FAR_EL1 "
+               "0x%lx)\n",
+               smp_id(), slot, vbar + slot * 0x80, mrs(SYS_ESR_EL12), mrs(SYS_ELR_EL12),
+               mrs(SYS_FAR_EL12));
+    msr(ELR_EL2, vbar + slot * 0x80);
+    msr(SPSR_EL2, nv2_entry_pstate(mrs(SPSR_EL2)));
+    sysop("isb");
+    return true;
+}
+
 bool nv2_handle_sync(u64 *regs)
 {
     struct nv2_cpu *c = nv2_this();
@@ -1506,6 +1537,9 @@ bool nv2_handle_sync(u64 *regs)
              * return path. */
             if ((esr & 0xffff) == 1 && nv2_probe_active)
                 return false;
+            /* 0x10..0x1f: aura's EL1 vector table forwarding an exception of the guest's own. */
+            if (((esr & 0xffff) - 0x10) < 16)
+                return nv2_inject_forwarded(c, (esr & 0xffff) - 0x10);
             nv2_inject_self(esr);
             return true;
         default:
@@ -1664,6 +1698,9 @@ void nv2_enter_os(u64 entry, u64 a0, u64 a1, u64 a2)
      * rewrite the Linux guest needs. The NV|NV2 redirection and ERET gate stay. */
     u64 hcr = (mrs(HCR_EL2) & ~(HCR_TGE | HCR_NV1 | HCR_TTLB)) | HCR_NV | HCR_NV2 | HCR_AT |
               (nv2_guarded ? 0 : HCR_TID3);
+    /* A guarded guest on an MTE SoC (T8142) tags its memory: let EL1 reach the allocation tags. */
+    if (nv2_guarded && FIELD_GET(ID_AA64PFR1_MTE, mrs(SYS_ID_AA64PFR1_EL1)) >= 2)
+        hcr |= HCR_ATA;
     nv2_cpu_arm(&nv2_cpus[cpu], vncr, avncr, hcr);
     nv2_cpus[cpu].scratch = (u64 *)(vncr + 2 * SZ_4K);
 
