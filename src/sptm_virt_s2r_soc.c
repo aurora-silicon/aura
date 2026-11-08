@@ -5,8 +5,8 @@
  *
  * The PMGR's reg list names none of its blocks. Its ps-regs (or ps-groups) give the PS area and
  * the always-on area; each block is the reg entry at its place in one of them. The PMS is the
- * PMGR's 16 MiB entry, the AMCC the mcc entry its amcc-reg-idx names. A chip whose reg list has
- * no entry at one of these places gets no sleep path.
+ * PMGR's 16 MiB entry, the AMCC the mcc entry its amcc-reg-idx names. A chip whose reg list lacks
+ * a block that marks the sleep gets no sleep path; one that only the trace reads is skipped.
  */
 
 #include "sptm_virt_s2r_soc.h"
@@ -18,21 +18,28 @@
 
 struct s2r_place {
     const char *what;
-    bool aon;     /* in the always-on area, else the PS area */
-    s64 offset;   /* from the area's base */
-    u64 size;     /* 0: any entry large enough for the clock pages */
-    size_t field; /* offsetof(struct s2r_soc, ...) */
+    bool aon;      /* in the always-on area, else the PS area */
+    bool required; /* else only traced, and skipped when the ADT has no entry there */
+    s64 offset;    /* from the area's base */
+    u64 size;      /* 0: any entry large enough for the clock pages */
+    size_t field;  /* offsetof(struct s2r_soc, ...) */
 };
 
-#define PLACE(name, aon, off, size)                                                                \
-    {"PMGR block " #name, aon, off, size, offsetof(struct s2r_soc, name)}
+#define PLACE(name, aon, req, off, size)                                                           \
+    {"PMGR block " #name, aon, req, off, size, offsetof(struct s2r_soc, name)}
 
+/* Each core's self-disable (soc_misc) and the S2R timer (aon_pst) mark the sleep; the rest is the
+ * trace. */
 static const struct s2r_place s2r_places[] = {
-    PLACE(soc_ps, false, 0, 0x18000),           PLACE(pwrgate, false, 0x24000, 0x4000),
-    PLACE(soc_misc, false, 0x30000, 0x14000),   PLACE(cllt, false, 0x68000, 0x4000),
-    PLACE(cluster_ctl, false, 0x80000, 0x4000), PLACE(aon, true, 0, 0x80000),
-    PLACE(aon_pst, true, 0x50000, 0x8000),      PLACE(nub_ap, true, -0x27c000, 0x1000),
-    PLACE(clkgen, false, -0x700000, 0),
+    PLACE(soc_misc, false, true, 0x30000, 0x14000),
+    PLACE(aon_pst, true, true, 0x50000, 0x8000),
+    PLACE(soc_ps, false, false, 0, 0x18000),
+    PLACE(pwrgate, false, false, 0x24000, 0x4000),
+    PLACE(cllt, false, false, 0x68000, 0x4000),
+    PLACE(cluster_ctl, false, false, 0x80000, 0x4000),
+    PLACE(aon, true, false, 0, 0x80000),
+    PLACE(nub_ap, true, false, -0x27c000, 0x1000),
+    PLACE(clkgen, false, false, -0x700000, 0),
 };
 
 #define S2R_CLKGEN_MIN 0x60000 /* the DCS and mux pages sit below this */
@@ -141,34 +148,35 @@ int s2r_soc_from_adt(const void *adt, const u32 *link_phys, int n_phys, struct s
     for (size_t p = 0; p < ARRAY_SIZE(s2r_places); p++) {
         const struct s2r_place *pl = &s2r_places[p];
         struct s2r_blk *blk = (void *)((u8 *)out + pl->field);
-        *missing = pl->what;
-        if (!area[pl->aon])
-            return -1;
         u64 want = area[pl->aon] + pl->offset;
-        for (u32 i = 0; i < n_reg && !blk->base; i++) {
+        for (u32 i = 0; i < n_reg && area[pl->aon] && !blk->base; i++) {
             u64 a, s;
             if (adt_get_reg(adt, path, "reg", i, &a, &s) < 0 || a != want || i == ps_idx)
                 continue;
             if (pl->size ? s == pl->size : s >= S2R_CLKGEN_MIN)
                 *blk = (struct s2r_blk){a, s};
         }
-        if (!blk->base)
+        if (blk->base)
+            continue;
+        *missing = pl->what;
+        if (pl->required)
             return -1;
+        if (out->n_skipped < (int)ARRAY_SIZE(out->skipped))
+            out->skipped[out->n_skipped++] = pl->what;
     }
 
-    *missing = "PMS";
-    for (u32 i = 0; i < n_reg; i++) {
+    /* The PMS's PMC pages: in the PMGR's only 16 MiB entry. */
+    for (u32 i = 0, n = 0; i < n_reg; i++) {
         u64 a, s;
         if (adt_get_reg(adt, path, "reg", i, &a, &s) < 0 || s != S2R_PMS_SIZE)
             continue;
-        if (out->pms_pmc[0])
-            return -1; /* not the only one */
-        out->pms_pmc[0] = a + S2R_PMC_PAGE0;
-        out->pms_pmc[1] = a + S2R_PMC_PAGE1;
+        out->pms_pmc[0] = n++ ? 0 : a + S2R_PMC_PAGE0;
+        out->pms_pmc[1] = out->pms_pmc[0] ? a + S2R_PMC_PAGE1 : 0;
     }
-    if (!out->pms_pmc[0])
-        return -1;
-    out->nub_wake_status = out->nub_ap.base + S2R_NUB_WAKE;
+    if (!out->pms_pmc[0] && out->n_skipped < (int)ARRAY_SIZE(out->skipped))
+        out->skipped[out->n_skipped++] = "PMS";
+    if (out->nub_ap.base)
+        out->nub_wake_status = out->nub_ap.base + S2R_NUB_WAKE;
 
     /* No amcc-reg-idx: the AMCC quiesce is not available, nothing else needs it. */
     node = adt_path_offset_trace(adt, "/arm-io/mcc", path);

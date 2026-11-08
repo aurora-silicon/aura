@@ -107,6 +107,8 @@ int main(int argc, char **argv)
     printf("amcc 0x%llx %u\n", (unsigned long long)s.amcc, s.amcc_planes);
     for (int i = 0; i < s.n_link; i++)
         printf("link %s\n", s.link_paths[i]);
+    for (int i = 0; i < s.n_skipped; i++)
+        printf("skipped %s\n", s.skipped[i]);
 
     if (rc == 0 && pmgr_init() == 0) {
         for (int i = 0; i < s.n_link; i++) {

@@ -20,6 +20,8 @@ struct s2r_soc {
     u32 amcc_planes;
     int n_link;
     char link_paths[S2R_LINK_NODES][40];
+    int n_skipped;
+    const char *skipped[10]; /* traced blocks the ADT has no entry for */
 };
 
 /*

@@ -588,7 +588,8 @@ static void s2r_hook_adt(const char *path, int idx, const char *what, u64 off, u
 
 static void s2r_hook_blk(const struct s2r_blk *blk, const char *what, u64 off, u64 size)
 {
-    s2r_hook_range(what, blk->base + off, size ? size : blk->size);
+    if (blk->base)
+        s2r_hook_range(what, blk->base + off, size ? size : blk->size);
 }
 
 static void s2r_keep_setup(void)
@@ -629,8 +630,8 @@ static void s2r_keep_setup(void)
 /* The rest of the PMGR, SPMI and mailbox blocks: the full entry trace. */
 static void s2r_hook_full(void)
 {
-    s2r_hook_range("pms-pmc", s2r_soc->pms_pmc[0], 0x4000);
-    s2r_hook_range("pms-pmc", s2r_soc->pms_pmc[1], 0x4000);
+    for (int i = 0; i < 2 && s2r_soc->pms_pmc[0]; i++)
+        s2r_hook_range("pms-pmc", s2r_soc->pms_pmc[i], 0x4000);
     s2r_hook_blk(&s2r_soc->soc_ps, "pmgr-soc-ps", 0, 0);
     s2r_hook_blk(&s2r_soc->cluster_ctl, "pmgr-cluster-ctl", 0, 0);
     s2r_hook_blk(&s2r_soc->pwrgate, "pmgr-pwrgate", 0, 0);
@@ -663,6 +664,8 @@ void sptm_virt_s2r_setup(bool cdc)
         return;
     }
     s2r_soc = &s2r_soc_adt;
+    for (int i = 0; i < s2r_soc->n_skipped; i++)
+        printf("SPTM-virt[s2r]: the ADT gives no %s; not traced\n", s2r_soc->skipped[i]);
     s2r_keep_always = cdc;
     if (!(flags & SPTM_VIRT_S2R)) {
         if (cdc)
@@ -803,10 +806,13 @@ void sptm_virt_s2r_wake_trap(u64 esr, u64 elr, bool in_gl)
                "reset on cpu%d\n",
                s2r_wake_count, smp_id(), frq ? (now - s2r_wake_t) * 1000000 / frq : 0,
                s2r_wake_cpu);
-        printf("SPTM-virt[s2r]: AON wake-source status 0x%lx..+0x1c:", s2r_soc->nub_wake_status);
-        for (int i = 0; i < S2R_NUB_WAKE_WORDS; i++)
-            printf(" %08x", read32(s2r_soc->nub_wake_status + 4 * i));
-        printf("\n");
+        if (s2r_soc->nub_wake_status) {
+            printf("SPTM-virt[s2r]: AON wake-source status 0x%lx..+0x1c:",
+                   s2r_soc->nub_wake_status);
+            for (int i = 0; i < S2R_NUB_WAKE_WORDS; i++)
+                printf(" %08x", read32(s2r_soc->nub_wake_status + 4 * i));
+            printf("\n");
+        }
         s2r_aic_dump("wake");
         s2r_marker("WAKE", s2r_wake_cpu);
     }
