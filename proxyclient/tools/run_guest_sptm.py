@@ -143,7 +143,15 @@ XNU_QUIRKS = (
                "/arm-io/apciec0", "/arm-io/dart-apciec0", "/arm-io/apciec0-piodma",
                "/arm-io/centauri", "/arm-io/bluetooth", "/arm-io/aop-spmi0/spmi-wifibt"),
          ro_relax=(("zalloc_ro_mut RO-zone check", "BootKC-rx", 0x3b27e4c, 0x540002a9,
-                    0x14000015),)),
+                    0x14000015),),
+         # XNU takes its read-only region from CTRR_D_LWR/UPR_EL2 (rorgn_begin = LWR,
+         # rorgn_end = UPR | 0xfff), which iBoot locks over the kernelcache natively. Nothing in
+         # the guest programs them, and a non-guarded EL1 read does not reach the bank aura can
+         # write, so XNU would see an empty region and reject every zalloc_ro_mut whose source is
+         # a kernel static. Skip its register read (the flag byte's branch, taken unconditionally)
+         # and fill the two globals it would have written, with the BootKC's text and const span.
+         rorgn=(("rorgn register read", "BootKC-rx", 0x336f1c8, 0x370001a8, 0x1400000d),),
+         rorgn_globals=(0xefc020, 0xefc028)),
 )
 
 
@@ -365,6 +373,20 @@ def patch_xnu(p, sym, plan, patches):
         p.write32(pa, new)
         p.call(sym["sptm_virt_flush"], pa & ~0x3f, 0x80)
         print(f"XNU {what}: [0x{pa:x}] 0x{before:08x} -> 0x{p.read32(pa):08x}")
+
+
+def set_xnu_rorgn(p, sym, plan, quirks):
+    """Hand XNU the read-only region iBoot would have locked: the BootKC's text and const."""
+    lo = plan.regions["BootKC-rx"][0]
+    hi = plan.regions["BootKC-ro"][0] + plan.regions["BootKC-ro"][1] - 1
+    p.write64(sym["sptm_virt_xnu_rorgn"], lo)
+    p.write64(sym["sptm_virt_xnu_rorgn"] + 8, hi & ~0xfff)
+    print(f"XNU read-only region 0x{lo:x}-0x{hi:x}")
+    patch_xnu(p, sym, plan, quirks["rorgn"])
+    base = plan.regions["BootKC-ro"][0]
+    for off, value in zip(quirks["rorgn_globals"], (lo, hi)):
+        p.write64(base + off, value)
+        p.call(sym["sptm_virt_flush"], (base + off) & ~0x3f, 0x80)
 
 
 def patch_sptm(p, sym, entry, sp):
@@ -668,6 +690,8 @@ def main():
         if not quirks["ro_relax"]:
             raise SystemExit("AURA_XNU_RO_RELAX: no RO-zone patch matches this kernelcache")
         patch_xnu(p, sym, plan, quirks["ro_relax"])
+    if quirks.get("rorgn"):
+        set_xnu_rorgn(p, sym, plan, quirks)
     configure(p, sym, plan, live_adt)
     if p.call(sym["sptm_virt_load"], entry, handoff) != 0:
         raise SystemExit("sptm_virt_load rejected the entry/handoff (see aura's console)")

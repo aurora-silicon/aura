@@ -462,6 +462,11 @@ void sptm_virt_cpu_arm(void)
     sptm_virt_sample_arm_here();
 }
 
+bool sptm_virt_cpu_in_xnu(void)
+{
+    return sptm_cpu_in_xnu[smp_id()];
+}
+
 /* A GEXIT into XNU's normal world: this core runs XNU from now on. */
 void sptm_virt_cpu_enters_xnu(int cpu)
 {
@@ -470,6 +475,7 @@ void sptm_virt_cpu_enters_xnu(int cpu)
     sptm_cpu_in_xnu[cpu] = true;
     sptm_virt_sample_disarm_here();
     nv2_hcr_update(0, HCR_TWE);
+    sptm_virt_ctrr_publish_rorgn();
     sptm_virt_s2_enter_xnu(cpu);
 }
 

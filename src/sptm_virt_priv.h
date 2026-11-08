@@ -68,6 +68,8 @@ bool sptm_virt_cl4_reflect(u64 *regs, u64 esr);
 extern volatile bool sptm_virt_rg_passthrough;
 void sptm_virt_s2_setup(void);
 void sptm_virt_s2_enter_xnu(int cpu);
+void sptm_virt_ctrr_publish_rorgn(void);
+bool sptm_virt_cpu_in_xnu(void);
 bool sptm_virt_s2_dabort_gl(u64 *regs);
 bool sptm_virt_rg_owns(u64 page);
 void sptm_virt_rg_stop_wd2(void);

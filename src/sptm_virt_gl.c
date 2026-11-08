@@ -13,6 +13,7 @@
 #include "sptm_virt.h"
 #include "arm_cpu_regs.h"
 #include "cpu_regs.h"
+#include "exception.h"
 #include "malloc.h"
 #include "memory.h"
 #include "nv2.h"
@@ -277,6 +278,77 @@ static const u64 sptm_ctxr_ctl[4] = {
 };
 static u64 sptm_ctrr_stash;
 
+/*
+ * The guest's own view of the CTRR/CTXR range registers.
+ *
+ * Stage 1 locked the hardware ranges over aura's image, so a guest write cannot reach them and is
+ * dropped -- but the guest reads its own values back and acts on them. XNU takes its read-only
+ * region from CTRR_D_LWR/UPR_EL2 (26A428: rorgn_begin = LWR, rorgn_end = UPR | 0xfff) and rejects
+ * a zalloc_ro_mut whose source lies outside it, which panics a second into userspace. So a write
+ * lands in this shadow and the matching read answers from it; registers the guest never wrote
+ * still read the hardware.
+ */
+static struct {
+    u16 key;
+    u64 val;
+} sptm_ctrr_shadow[64];
+
+/*
+ * The read-only region XNU is to see, {lwr, upr} as CTRR_D_LWR/UPR_EL2 hold it (upr is the last
+ * page's base; XNU ORs in 0xfff). The host sets it to the guest kernelcache's read-only span,
+ * because the ranges stage 1 locked in the hardware are aura's own image. Zero: answer from the
+ * hardware, as before.
+ */
+u64 sptm_virt_xnu_rorgn[2];
+static bool rorgn_logged;
+
+static u64 *sptm_ctrr_shadow_slot(u16 key, bool create)
+{
+    for (unsigned i = 0; i < ARRAY_SIZE(sptm_ctrr_shadow); i++) {
+        if (sptm_ctrr_shadow[i].key == key)
+            return &sptm_ctrr_shadow[i].val;
+        if (!sptm_ctrr_shadow[i].key) {
+            if (!create)
+                return NULL;
+            sptm_ctrr_shadow[i].key = key;
+            return &sptm_ctrr_shadow[i].val;
+        }
+    }
+    return NULL;
+}
+
+/*
+ * Hand XNU its read-only region in the register it reads it from.
+ *
+ * XNU's rorgn setup is a plain MRS of CTRR_D_LWR/UPR_EL2 from its own non-guarded EL1, which
+ * reaches the hardware without passing through aura's GL2 (only the guest's guarded accesses trap
+ * there). Natively iBoot leaves the kernelcache's span in those two registers; stage 1 left aura's
+ * own image in the EL1 bank and the EL2 bank at zero, which XNU reads as an empty region. So write
+ * the span the host computed into the EL2 bank on the core that is entering XNU, before it runs.
+ * The write is guarded: if these are locked, the boot continues as before.
+ */
+void sptm_virt_ctrr_publish_rorgn(void)
+{
+    if (!sptm_virt_xnu_rorgn[0])
+        return;
+
+    int exc_before = exc_count;
+    exc_guard = GUARD_MARK | GUARD_SILENT;
+    msr(SYS_IMP_APL_CTRR_D_LWR_EL2, sptm_virt_xnu_rorgn[0]);
+    msr(SYS_IMP_APL_CTRR_D_UPR_EL2, sptm_virt_xnu_rorgn[1]);
+    sysop("isb");
+    u64 lwr = mrs(SYS_IMP_APL_CTRR_D_LWR_EL2), upr = mrs(SYS_IMP_APL_CTRR_D_UPR_EL2);
+    exc_guard = GUARD_OFF;
+
+    if (!rorgn_logged) {
+        rorgn_logged = true;
+        printf("SPTM-virt[ctrr]: XNU's read-only region 0x%lx-0x%lx -> CTRR_D_*_EL2 reads "
+               "0x%lx-0x%lx%s\n",
+               sptm_virt_xnu_rorgn[0], sptm_virt_xnu_rorgn[1] | 0xfff, lwr, upr | 0xfff,
+               exc_count != exc_before ? " (the write faulted)" : "");
+    }
+}
+
 static bool sptm_virt_ctrr_rw(u64 *regs, u64 esr)
 {
     unsigned op0 = (esr >> 20) & 3, op1 = (esr >> 14) & 7, crn = (esr >> 10) & 15;
@@ -317,7 +389,9 @@ static bool sptm_virt_ctrr_rw(u64 *regs, u64 esr)
         }
     }
 
-    switch (GL2KEY(op0, op1, crn, crm, op2)) {
+    u16 key = (u16)GL2KEY(op0, op1, crn, crm, op2);
+
+    switch (key) {
 #define X(o1, cn, cm, o2)                                                                          \
     case GL2KEY(3, o1, cn, cm, o2):                                                                \
         if (read)                                                                                  \
@@ -328,7 +402,38 @@ static bool sptm_virt_ctrr_rw(u64 *regs, u64 esr)
         default:
             return false;
     }
-    if (read && rt != 31)
+    if (!read) {
+        static u32 writes;
+        u64 wv = (rt == 31) ? 0 : regs[rt];
+        u64 *shadow = sptm_ctrr_shadow_slot(key, true);
+
+        if (shadow)
+            *shadow = wv;
+        if (writes++ < 48)
+            printf("SPTM-virt[ctrr]: s3_%u_c%u_c%u_%u <- 0x%lx (the guest's own; the hardware "
+                   "keeps stage 1's)\n",
+                   op1, crn, crm, op2, wv);
+        return true;
+    }
+    static u32 reads;
+    if (reads++ < 48)
+        printf("SPTM-virt[ctrr]: s3_%u_c%u_c%u_%u read by %s c%d\n", op1, crn, crm, op2,
+               sptm_virt_cpu_in_xnu() ? "XNU" : "SPTM", smp_id());
+    u64 *shadow = sptm_ctrr_shadow_slot(key, false);
+    if (shadow) {
+        rv = *shadow;
+    } else if (sptm_virt_xnu_rorgn[0] &&
+               (key == GL2KEY(3, 0, 11, 1, 2) || key == GL2KEY(3, 0, 11, 1, 3))) {
+        /* XNU's read-only region. Nothing in the guest programs these: on a native boot iBoot
+         * locked them over the kernelcache, and stage 1 locked aura's own image instead. */
+        rv = sptm_virt_xnu_rorgn[key == GL2KEY(3, 0, 11, 1, 3)];
+        if (!rorgn_logged) {
+            rorgn_logged = true;
+            printf("SPTM-virt[ctrr]: the guest's read-only region is 0x%lx-0x%lx\n",
+                   sptm_virt_xnu_rorgn[0], sptm_virt_xnu_rorgn[1] | 0xfff);
+        }
+    }
+    if (rt != 31)
         regs[rt] = rv;
     return true;
 }
