@@ -96,7 +96,8 @@ typedef uint64_t u64;
 #define ALIGN_UP(x, a) (((x) + (a) - 1) & ~((a) - 1))
 ''' + between(header, "struct kernel_header {", "void kboot_set_initrd(") + r'''
 enum { V26_6_2 = 1 };
-static struct { int version; } os_firmware = {V26_6_2};
+/* The release whose coprocessor firmware the OS iBoot loads (firmware.c) */
+static int firmware_os_components(void) { return V26_6_2; }
 #include "payload_profile.h"
 static int XzDecode(void *in, uint32_t *in_len, void *out, uint32_t *out_len) { return 0; }
 
