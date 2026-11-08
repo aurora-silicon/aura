@@ -125,6 +125,12 @@ static void gpu_park(struct exc_info *ctx, const char *why)
  * would never hand the ring back. Any other trapped access can offer the check instead; the
  * reset guard's watchdog writes arrive regularly.
  */
+/* Cheap enough to ask on every trap, before building a context to park with. */
+bool sptm_virt_gpu_deadline_due(void)
+{
+    return !gpu_parked && gpu_boot_stop_t && mrs(CNTPCT_EL0) >= gpu_boot_stop_t;
+}
+
 void sptm_virt_gpu_deadline(struct exc_info *ctx)
 {
     if (gpu_parked || !gpu_boot_stop_t || mrs(CNTPCT_EL0) < gpu_boot_stop_t)

@@ -555,7 +555,13 @@ static bool sptm_virt_guarded_eret(void)
                 printf("SPTM-virt[world]: cL4 -> host by SPTM's own ERET to GL2\n");
         }
     } else if (el == 1 || el == 3) {
-        /* Into cL4, SPTM's guarded child. */
+        /*
+         * Into cL4, SPTM's guarded child. An ERET to EL0 is left alone deliberately: once cL4 has
+         * started a task, SPTM erets straight to it (high VAs in cL4's own map, PSTATE EL0t)
+         * having just programmed the EL1 regime for it through the _EL1 names, which land on the
+         * live bank. Switching worlds there loads cL4's shadowed bank over exactly that regime,
+         * and the task's first instruction fetch then takes a level-0 translation fault.
+         */
         if (!sptm_virt_in_cl4())
             sptm_virt_cl4_world_enter(target);
     }
@@ -772,6 +778,17 @@ bool sptm_virt_gl_sync(u64 *regs, u64 esr, u64 elr, u64 spsr)
 
     if (elsp != SPSR_M_EL1H && elsp != SPSR_M_EL1T)
         return false;
+    /*
+     * The deadline the host asked for, offered from the busiest path there is: SPTM's guarded
+     * ERETs and GEXITs arrive all the while the guest runs, so a guest that leaves the GPU and
+     * the watchdog alone -- every boot that has not reached WindowServer -- still hands the
+     * proxy back instead of running on with aura's console gone.
+     */
+    if (sptm_virt_gpu_deadline_due()) {
+        struct exc_info pctx;
+        sptm_virt_fill_ctx(&pctx, regs, true);
+        sptm_virt_gpu_deadline(&pctx);
+    }
     /* cL4 took an exception to the level above, SPTM's GL2: deliver it there. Its TLB
      * maintenance (op0 1) is performed here instead, as SPTM would. */
     if (sptm_virt_in_cl4() && !(ec == ESR_EC_MSR && ((iss >> 20) & 3) == 1) &&

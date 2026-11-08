@@ -344,7 +344,7 @@ static void sptm_virt_aura_guard_setup(void)
     }
 }
 
-static void sptm_virt_fill_ctx(struct exc_info *ctx, u64 *regs, bool gl)
+void sptm_virt_fill_ctx(struct exc_info *ctx, u64 *regs, bool gl)
 {
     memset(ctx, 0, sizeof(*ctx));
     memcpy(ctx->regs, regs, 31 * sizeof(u64));
