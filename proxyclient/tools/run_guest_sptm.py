@@ -114,6 +114,12 @@ PORT_FWD = ("atc-phy-parent", "atc-phy", "dpxbar-parent", "acio-parent", "acio-c
 PORT_REV = ("atc-phy-parent", "atc-phy", "acio-parent", "usb-port", "dpxbar-parent")
 # Nothing drives the ANE yet, and the platform error handler panics on an AMCC DSID timeout.
 STRIP_NODES = ("/arm-io/ane", "/arm-io/dart-ane")
+# The guest has the real NVRAM, and macOS writes it: a boot that fails in launchd leaves
+# recovery-boot-mode behind, after which iBoot ignores the enrolled boot object and the machine
+# comes up in recovery until someone clears it by hand -- so one failed guest boot costs a trip
+# through 1TR. Nothing here needs NVRAM (the boot arguments come through boot_args), so the device
+# is hidden: macOS reports "platform does not support NVRAM" and its writes go nowhere.
+HOST_STATE_NODES = ("/arm-io/qspi/spinor/anvram",)
 ERROR_HANDLER = "/arm-io/error-handler"
 # Without cL4 the exclaves stay NOT_SUPPORTED, so their nodes and the RTBuddy routes that resolve
 # through them would wait forever in IOKit. With cL4 they must stay: hidden, DCP never completes
@@ -640,7 +646,7 @@ def main():
         raise SystemExit("no debug-link USB port found in the ADT")
     print("debug-link port" + ("s" if len(phys) > 1 else "") + " hidden:", " ".join(port_nodes))
     keep_exclaves = env_on("AURA_KEEP_EXCLAVES")
-    hide = port_nodes + STRIP_NODES + tuple(quirks["hide"])
+    hide = port_nodes + STRIP_NODES + HOST_STATE_NODES + tuple(quirks["hide"])
     if not env_on("AURA_KEEP_ERRH"):
         hide += (ERROR_HANDLER,)
     if env_on("AURA_HIDE_DOCKCHANNEL"):
