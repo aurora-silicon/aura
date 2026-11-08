@@ -11,6 +11,7 @@ int pcie_shutdown(void);
 int pcie_t6050_init(void);
 /* Disable an untrained optional port's root port and DART in the handed-over tree */
 int pcie_t6050_handoff_fdt(void *dt);
+int pcie_ans_power_off(void);
 
 /* Disable optional J713 PCIe admission after rail/controller/DART failure. */
 int pcie_disable_j713_fdt(void *dt);

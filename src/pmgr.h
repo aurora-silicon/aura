@@ -27,6 +27,7 @@ int pmgr_adt_is_powered(const char *path);
 int pmgr_adt_power_enable(const char *path);
 int pmgr_adt_power_disable(const char *path);
 int pmgr_adt_power_disable_recursive(const char *path);
+int pmgr_adt_power_disable_under(const char *path, const char *name);
 /* 1: all real devices in this path's parent closure are power-gated; 0: active; -1: unknown. */
 int pmgr_adt_power_is_off(const char *path);
 int pmgr_adt_power_enable_traced(const char *path);
