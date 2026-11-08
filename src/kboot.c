@@ -4083,7 +4083,7 @@ static int dt_reserve_j713_dcpext_one(unsigned int n)
     char path[48];
     u32 len = 0;
 
-    /* The kernel checks the firmware it adopts by UUID, as for the internal DCP. */
+    /* Published like the internal DCP's; the firmware version gates the adoption. */
     snprintf(path, sizeof(path), "/arm-io/%s/iop-%s-nub", alias, alias);
     int nub = adt_path_offset(adt, path);
     const char *uuid = nub < 0 ? NULL : adt_getprop(adt, nub, "uuid", &len);
@@ -6569,7 +6569,7 @@ static int dt_set_j713_display_maps(const struct adt_segment_ranges *segments, u
     };
     u32 phandles[2];
 
-    /* Exact J713 register block; reading tables must not enable/reset streams. */
+    /* The T8132 disp0 DART (every M4 ADT); reading tables must not enable/reset streams. */
     for (u32 n = 0; n < 2; n++) {
         if (dart_walk_locked_t8110(0x30a300000, 0xc000, streams[n], dram_start, dram_size,
                                    j713_display_page, &maps[n]))
@@ -6627,7 +6627,7 @@ static int dt_set_j713_display_maps(const struct adt_segment_ranges *segments, u
         return -1;
     if (fdt_setprop_string(dt, piodma, "status", "okay"))
         return -1;
-    printf("FDT: J713 DISP0 SID0/SID16 mappings preserved; PIODMA enabled\n");
+    printf("FDT: M4 DISP0 SID0/SID16 mappings preserved; PIODMA enabled\n");
     int dcp = fdt_path_offset(dt, "dcp");
     if (dcp >= 0 && fdt_getprop(dt, dcp, "apple,j713-native-scanout", NULL)) {
         int display = fdt_path_offset(dt, "disp0");
@@ -6638,29 +6638,39 @@ static int dt_set_j713_display_maps(const struct adt_segment_ranges *segments, u
         if (fdt_setprop_empty(dt, display, "apple,j713-inherited-mappings") ||
             fdt_setprop_string(dt, display, "status", "okay"))
             return -1;
-        printf("FDT: J713 native scanout diagnostic enabled with preserved SID0 mappings\n");
+        printf("FDT: M4 native scanout diagnostic enabled with preserved SID0 mappings\n");
     }
     return 0;
 }
 
-/* Publish the inherited J713 firmware mapping without starting a display driver. */
-static int dt_set_j713_dcp_handoff(void)
+/*
+ * Publish the inherited DCP firmware mapping without starting a display driver: on the J713
+ * on any firmware as before, and on any other M4 Mac with a panel on 26.6.2.
+ */
+static int dt_set_m4_dcp_handoff(void)
 {
     int dcp_node = fdt_path_offset(dt, "dcp");
     if (dcp_node < 0)
         return 0; /* Older DT with simple-framebuffer only. */
-    if (chip_id != T8132 || fdt_node_check_compatible(dt, 0, "apple,j713") ||
+    bool j713 = !fdt_node_check_compatible(dt, 0, "apple,j713");
+    if (chip_id != T8132 || (!j713 && os_firmware.version != V26_6_2) ||
         fdt_node_check_compatible(dt, dcp_node, "apple,t8132-dcp"))
         bail("FDT: unsupported native DCP handoff target\n");
+    /* The Mac mini's disp0 is external: its DCP drives a port, not a panel. */
+    if (!j713) {
+        int disp0 = adt_path_offset(adt, "/arm-io/disp0");
+        if (disp0 < 0 || adt_getprop(adt, disp0, "external", NULL))
+            bail("FDT: no internal panel, no native DCP handoff\n");
+    }
 
     int nub = adt_path_offset(adt, "/arm-io/dcp/iop-dcp-nub");
     if (nub < 0)
-        bail("ADT: missing J713 DCP firmware metadata\n");
+        bail("ADT: missing M4 DCP firmware metadata\n");
 
     u32 len;
     const struct adt_segment_ranges *segments = adt_getprop(adt, nub, "segment-ranges", &len);
     if (!segments || !len || len % sizeof(*segments) || len / sizeof(*segments) > 32)
-        bail("ADT: invalid J713 DCP firmware segment list\n");
+        bail("ADT: invalid M4 DCP firmware segment list\n");
     u32 count = len / sizeof(*segments);
 
     /* Firmware carveouts are outside the OS-usable boot-args interval. */
@@ -6668,10 +6678,10 @@ static int dt_set_j713_dcp_handoff(void)
     u64 dram_start, dram_size;
     if (chosen < 0 || ADT_GETPROP(adt, chosen, "dram-base", &dram_start) < 0 ||
         ADT_GETPROP(adt, chosen, "dram-size", &dram_size) < 0)
-        bail("ADT: missing J713 physical DRAM bounds\n");
+        bail("ADT: missing M4 physical DRAM bounds\n");
     u64 dram_end = dram_start + dram_size;
     if (!dram_size || dram_end <= dram_start)
-        bail("ADT: invalid J713 DRAM bounds\n");
+        bail("ADT: invalid M4 DRAM bounds\n");
 
     /* Validate the entire list before mutating the FDT. Use remap addresses:
      * CPU-image offsets are not the addresses in the inherited DCP DART.
@@ -6681,14 +6691,14 @@ static int dt_set_j713_dcp_handoff(void)
         if (!size || (segments[i].phys | segments[i].remap) & (SZ_16K - 1) ||
             segments[i].phys < dram_start || segments[i].phys + size < segments[i].phys ||
             segments[i].phys + size > dram_end || segments[i].remap + size < segments[i].remap)
-            bail("ADT: invalid J713 DCP firmware segment %u\n", i);
+            bail("ADT: invalid M4 DCP firmware segment %u\n", i);
     }
 
     const char *uuid = adt_getprop(adt, nub, "uuid", &len);
     if (!uuid || len != 37 || uuid[len - 1])
-        bail("ADT: invalid J713 DCP firmware UUID\n");
+        bail("ADT: invalid M4 DCP firmware UUID\n");
     if (fdt_setprop_string(dt, dcp_node, "apple,firmware-uuid", uuid))
-        bail("FDT: cannot publish J713 DCP firmware UUID\n");
+        bail("FDT: cannot publish M4 DCP firmware UUID\n");
 
     int ret = dt_set_dcp_firmware("dcp");
     if (ret)
@@ -6699,12 +6709,13 @@ static int dt_set_j713_dcp_handoff(void)
 
     dcp_node = fdt_path_offset(dt, "dcp");
     if (fdt_getprop(dt, dcp_node, "apple,j713-native-piodma", NULL)) {
-        if (strcmp(uuid, "81BAF476-679D-3CC0-8C6A-E6B6FA659D5E") ||
+        /* The DCP image is per firmware, the same on every M4 Mac. */
+        if (os_firmware.version != V26_6_2 ||
             dt_set_j713_display_maps(segments, count, dram_start, dram_size))
-            printf("FDT: J713 PIODMA handoff unqualified; retaining disabled device\n");
+            printf("FDT: M4 PIODMA handoff unqualified; retaining disabled device\n");
     }
 
-    printf("FDT: J713 DCP firmware mappings published; display device status unchanged\n");
+    printf("FDT: M4 DCP firmware mappings published; display device status unchanged\n");
     return 0;
 }
 
@@ -6733,8 +6744,8 @@ static int dt_set_display(void)
         disp0_piodma_alias = compat_piodma_alias;
 
     if (chip_id == T8132) {
-        if (dt_set_j713_dcp_handoff())
-            printf("FDT: J713 DCP handoff refused; keeping the boot framebuffer\n");
+        if (dt_set_m4_dcp_handoff())
+            printf("FDT: M4 DCP handoff refused; keeping the boot framebuffer\n");
         else
             dt_reserve_j713_dcpext();
         return 0;
@@ -8943,8 +8954,7 @@ int kboot_prepare_dt(void *fdt)
      * Linux's allocator (J616C: ANS syslog lines in page-cache pages at the SART-allowed heap
      * addresses).
      */
-    if (chip_id == T8140 || chip_id == T6041 || chip_id == T8152 ||
-        (chip_id == T8132 && !fdt_node_check_compatible(dt, 0, "apple,j713"))) {
+    if (chip_id == T8140 || chip_id == T6041 || chip_id == T8152 || chip_id == T8132) {
         u64 ram_end, inherited = cur_boot_args.top_of_kernel_data;
         u64 high_water = heapblock_high_water();
 
@@ -9043,13 +9053,13 @@ int kboot_prepare_dt(void *fdt)
     if (dt_reserve_secondary_ro())
         return -1;
 
-    if (chip_id == T8132 && !fdt_node_check_compatible(dt, 0, "apple,j713")) {
+    if (chip_id == T8132) {
         if (dt_reserve_bootloader_handoff())
             return -1;
         u64 start = min(ALIGN_UP((u64)adt + cur_boot_args.devtree_size, SZ_16K), (u64)_base);
         u64 end = cur_boot_args.top_of_kernel_data;
         if (end > start && dt_reserve_outside_exec_window(start, end - start))
-            bail("FDT: couldn't reserve the J713 chainload high-water interval\n");
+            bail("FDT: couldn't reserve the T8132 chainload high-water interval\n");
     }
 
     /* setup console log buffer early to capture as much log as possible */
@@ -9135,8 +9145,7 @@ int kboot_prepare_dt(void *fdt)
     dt_set_j713_isp();
     if (dt_set_pmgr())
         return -1;
-    if (chip_id == T8132 && !fdt_node_check_compatible(dt, 0, "apple,j713") &&
-        (dt_set_ans_nvme(false) || dt_set_t8132_lifecycle()))
+    if (chip_id == T8132 && (dt_set_ans_nvme(false) || dt_set_t8132_lifecycle()))
         return -1;
 #ifndef RELEASE
     if (dt_transfer_virtios())
