@@ -322,7 +322,8 @@ def plan_boot(sptm, txm, xnu, adt, *, dram_base, phys_base, mem_size, mem_size_a
               cmdline="serial=3 -v", trustcache=b"", boot_flags=0, ramdisk_size=0,
               placement_shift=None, blob_base=None, hide_nodes=(), xnu_serial=None,
               drop_props=(), cl4_regions=None, cl4_entry=0, cl4_virt=0,
-              exclave_integrity=b"", exclave_trustcache=b"", iboot_copies=()):
+              exclave_integrity=b"", exclave_trustcache=b"", iboot_copies=(),
+              diag_record=False):
     """Compute the whole iBoot->SPTM handoff.
 
     sptm/txm/xnu are the raw Mach-O files, ``adt`` the live device tree,
@@ -336,6 +337,8 @@ def plan_boot(sptm, txm, xnu, adt, *, dram_base, phys_base, mem_size, mem_size_a
     physBase and TXM to its VM (arm_vm_prot_finalize), so nothing live may be in it. The
     coprocessors' __OS_LOG segments, which live in iBoot's RTBuddySeg, are pointed into the
     copy, as natively they lie inside RTBuddySeg in managed RAM.
+
+    ``diag_record``: give SPTM a diagnostic record (boot_args revision 3, an SPTMDebug region).
     """
     notes = []
     si, ti, xi = macho_info(sptm), macho_info(txm), macho_info(xnu)
@@ -550,9 +553,11 @@ def plan_boot(sptm, txm, xnu, adt, *, dram_base, phys_base, mem_size, mem_size_a
     boot_args_pa = head[0]
     head[0] += round_page(BOOT_ARGS_SIZE + 8)
     end_entry("BootArgs")
-    diag_pa = head[0]
-    head[0] += round_page(BOOT_ARGS_DIAG_SIZE)
-    end_entry("SPTMDebug")
+    diag_pa = 0
+    if diag_record:
+        diag_pa = head[0]
+        head[0] += round_page(BOOT_ARGS_DIAG_SIZE)
+        end_entry("SPTMDebug")
     rd_pa = head[0]
     head[0] += round_page(ramdisk_size)
     end_entry("RAMDisk")
@@ -775,8 +780,9 @@ def plan_boot(sptm, txm, xnu, adt, *, dram_base, phys_base, mem_size, mem_size_a
             f"[0x{phys_base:x}, 0x{phys_base + mem_size:x})")
     ba = build_boot_args(virt_base, phys_base, mem_size, top, adt_va, len(new_adt), cmdline,
                          mem_size_actual, boot_flags, diag_pa=diag_pa)
-    notes.append("boot_args revision 3: SPTM diagnostic record at %#x, %#x bytes"
-                 % (diag_pa, BOOT_ARGS_DIAG_SIZE))
+    if diag_pa:
+        notes.append("boot_args revision 3: SPTM diagnostic record at %#x, %#x bytes"
+                     % (diag_pa, BOOT_ARGS_DIAG_SIZE))
 
     return Plan(regions=regions, loads=loads, boot_args=ba, boot_args_pa=boot_args_pa,
                 diag_pa=diag_pa, adt=new_adt, adt_pa=adt_pa, adt_grew=adt_grew, sptm_pa=sptm_pa,

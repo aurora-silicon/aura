@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 """The iBoot->SPTM handoff planner (proxyclient/aura/sptm_virt_plan.py).
 
-Synthetic images always run; the real 25G83 images run when they are present
+Synthetic images always run; real ones (25G83, 26A428) run when they are present
 (set SPTM_VIRT_IMAGES=<dir with sptm.bin txm.bin kernelcache dtree>).
 """
 
@@ -94,9 +94,10 @@ def images():
     return sptm, txm, xnu
 
 
-def run(sptm, txm, xnu, adt, phys=PHYS):
+def run(sptm, txm, xnu, adt, phys=PHYS, diag_record=True):
     return plan_mod.plan_boot(sptm, txm, xnu, adt, dram_base=DRAM, phys_base=phys,
-                              mem_size=END - phys, mem_size_actual=0x200000000)
+                              mem_size=END - phys, mem_size_actual=0x200000000,
+                              diag_record=diag_record)
 
 
 def check(plan, sptm, adt, phys=PHYS):
@@ -120,7 +121,7 @@ def check(plan, sptm, adt, phys=PHYS):
 
     # boot_args: what SPTM's __start loads from x0.
     rev, ver = struct.unpack_from("<HH", plan.boot_args, 0)
-    assert (rev, ver) == (3, 2)
+    assert (rev, ver) == ((3, 2) if plan.diag_pa else (2, 2))
     virt, phys, size, top = struct.unpack_from("<QQQQ", plan.boot_args, 8)
     assert phys == PHYS and size == END - PHYS and top == plan.blob_end
     assert virt == plan.virt_base
@@ -128,10 +129,14 @@ def check(plan, sptm, adt, phys=PHYS):
     assert adt_va - virt == plan.adt_pa - PHYS and adt_len == len(plan.adt)
     assert plan.boot_args[0x6C:0x6C + 11] == b"serial=3 -v"
     # Revision 3: the diagnostic-record VA at +0x480, in the window, its own blob region.
+    # Without a record, __start still reads +0x480 and must find zero.
     (diag,) = struct.unpack_from("<Q", plan.boot_args, 0x480)
     assert len(plan.boot_args) == 0x488
     assert diag == plan.diag_pa  # a PA: SPTM zeroes the record with its MMU off
-    assert plan.regions["SPTMDebug"] == (plan.diag_pa, 0x4000)
+    if plan.diag_pa:
+        assert plan.regions["SPTMDebug"] == (plan.diag_pa, 0x4000)
+    else:
+        assert "SPTMDebug" not in plan.regions
     # SPTM runs at sptm_pa + virtBase - physBase: that VA must be page aligned.
     assert (plan.sptm_pa - PHYS + virt) % PAGE == 0
 
@@ -191,13 +196,14 @@ def test_window_raised_above_aura(phys):
     assert low >= phys, "nothing may be written below the SPTM window"
 
 
-@pytest.mark.skipif(not os.environ.get("SPTM_VIRT_IMAGES"), reason="real 25G83 images not given")
-def test_real_images():
+@pytest.mark.skipif(not os.environ.get("SPTM_VIRT_IMAGES"), reason="real images not given")
+@pytest.mark.parametrize("diag_record", (False, True))
+def test_real_images(diag_record):
     d = Path(os.environ["SPTM_VIRT_IMAGES"])
     sptm, txm = (d / "sptm.bin").read_bytes(), (d / "txm.bin").read_bytes()
     xnu = next(d.glob("kernelcache*")).read_bytes()
     adt = (d / "dtree").read_bytes()
-    plan = run(sptm, txm, xnu, adt)
+    plan = run(sptm, txm, xnu, adt, diag_record=diag_record)
     check(plan, sptm, adt)
     assert plan.sptm_entry_pa - plan.sptm_pa == 0xA8388  # __start in __TEXT_EXEC
 

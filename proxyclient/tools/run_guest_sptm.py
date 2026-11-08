@@ -47,6 +47,7 @@ Example:
 """
 
 import argparse
+import collections
 import os
 import pathlib
 import struct
@@ -124,10 +125,10 @@ KIS_PORT_NODES_T8142 = (
 KIS_PORT_NODES_BY_CHIP = {0x8132: KIS_PORT_NODES_T8132, 0x8142: KIS_PORT_NODES_T8142}
 # Nothing drives the ANE yet, and the platform error handler panics on an AMCC DSID timeout.
 STRIP_NODES = ("/arm-io/ane", "/arm-io/dart-ane")
-# T8142: AppleConvergedPCI panics XNU in zalloc_ro_mut on one of its own statics
+# 26A428 (T8142): AppleConvergedPCI panics XNU in zalloc_ro_mut on one of its own statics
 # (kernelcache+0x42e1e0) about a second into IOKit. Nothing here needs PCIe or Wi-Fi, so its nodes
 # are hidden; the Thunderbolt/CIO PCIe paths go with them.
-STRIP_NODES_T8142 = ("/arm-io/apcie", "/arm-io/dart-apcie0", "/arm-io/apcie0-piodma",
+STRIP_NODES_26A428_T8142 = ("/arm-io/apcie", "/arm-io/dart-apcie0", "/arm-io/apcie0-piodma",
                      "/arm-io/apciec0", "/arm-io/dart-apciec0", "/arm-io/apciec0-piodma",
                      "/arm-io/centauri", "/arm-io/bluetooth", "/arm-io/aop-spmi0/spmi-wifibt")
 ERROR_HANDLER = "/arm-io/error-handler"
@@ -211,12 +212,16 @@ MTE_SEQ_26A428_T8142 = (
 )
 
 # Per SPTM build: its patches, the page offset of its GEXIT into XNU, the offset of its CTRR
-# stash (aura's sptm_virt_xnu_gexit_po and sptm_virt_ctrr_stash_off) and an optional sequence
-# rewrite (offset, expected words, replacement words).
+# stash (aura's sptm_virt_xnu_gexit_po and sptm_virt_ctrr_stash_off), an optional sequence
+# rewrite (offset, expected words, replacement words), whether SPTM gets a diagnostic record
+# (boot_args revision 3) and the nodes this release's XNU must not see.
+SptmBuild = collections.namedtuple("SptmBuild",
+                                   "name patches gexit_po stash_off mte_seq diag_record hide")
 SPTM_BUILDS = (
-    ("25G83", SPTM_PATCHES, 0x2d8, 0xa50, None),
-    ("25G83 t8132", SPTM_PATCHES_T8132, 0x2d8, 0xa50, None),
-    ("26A428 t8142", SPTM_PATCHES_26A428_T8142, 0xfb0, 0x5f0, MTE_SEQ_26A428_T8142),
+    SptmBuild("25G83", SPTM_PATCHES, 0x2d8, 0xa50, None, False, ()),
+    SptmBuild("25G83 t8132", SPTM_PATCHES_T8132, 0x2d8, 0xa50, None, False, ()),
+    SptmBuild("26A428 t8142", SPTM_PATCHES_26A428_T8142, 0xfb0, 0x5f0, MTE_SEQ_26A428_T8142, True,
+              STRIP_NODES_26A428_T8142),
 )
 
 # Optional patches to the loaded kernelcache, for tracing only (AURA_XNU_RO_RELAX): region name,
@@ -398,7 +403,7 @@ def sptm_build(sptm, entry_off):
     """The SPTM_BUILDS entry whose every patch site matches the image, or None."""
     for build in SPTM_BUILDS:
         if all(struct.unpack_from("<I", sptm, entry_off + off)[0] & mask == expected
-               for _w, off, mask, expected, _n in build[1]):
+               for _w, off, mask, expected, _n in build.patches):
             return build
     return None
 
@@ -432,8 +437,7 @@ def patch_xnu(p, sym, plan, patches):
 
 
 def patch_sptm(p, sym, entry, build):
-    name, patches, gexit_po, stash_off, mte_seq = build
-    for what, off, mask, expected, new in patches:
+    for what, off, mask, expected, new in build.patches:
         pa = entry + off
         before = p.read32(pa)
         if before & mask != expected:
@@ -442,11 +446,12 @@ def patch_sptm(p, sym, entry, build):
         p.write32(pa, new)
         p.call(sym["sptm_virt_flush"], pa & ~0x3f, 0x80)
         print(f"{what}: [0x{pa:x}] 0x{before:08x} -> 0x{p.read32(pa):08x}")
-    if mte_seq:
-        rewrite_sptm_seq(p, sym, entry, name, mte_seq)
-    p.write32(sym["sptm_virt_xnu_gexit_po"], gexit_po)
-    p.write32(sym["sptm_virt_ctrr_stash_off"], stash_off)
-    print(f"SPTM {name}: XNU-entry GEXIT page offset 0x{gexit_po:x}, CTRR stash +0x{stash_off:x}")
+    if build.mte_seq:
+        rewrite_sptm_seq(p, sym, entry, build.name, build.mte_seq)
+    p.write32(sym["sptm_virt_xnu_gexit_po"], build.gexit_po)
+    p.write32(sym["sptm_virt_ctrr_stash_off"], build.stash_off)
+    print(f"SPTM {build.name}: XNU-entry GEXIT page offset 0x{build.gexit_po:x}, CTRR stash "
+          f"+0x{build.stash_off:x}")
 
 
 def report_amcc(p, clear):
@@ -464,7 +469,8 @@ def report_amcc(p, clear):
 
 def configure(p, sym, plan):
     p.write64(sym["sptm_virt_diag_pa"], plan.diag_pa)
-    print(f"SPTM diagnostic record at 0x{plan.diag_pa:x}")
+    if plan.diag_pa:
+        print(f"SPTM diagnostic record at 0x{plan.diag_pa:x}")
     flags = sum(bit for name, bit in CONFIG_FLAGS.items() if env_on(name))
     p.call(sym["sptm_virt_config"], flags)
     for env, symbol in (("AURA_SAMPLE_HZ", "sptm_virt_sample_hz"),
@@ -577,13 +583,11 @@ def main():
     build = sptm_build(images["sptm"], entry_off)
     if build is None:
         raise SystemExit("unknown SPTM build: no SPTM_BUILDS patch set matches it")
-    print(f"SPTM build {build[0]}")
+    print(f"SPTM build {build.name}")
 
     chip = u.adt["/chosen"].chip_id
     keep_exclaves = env_on("AURA_KEEP_EXCLAVES")
-    hide = KIS_PORT_NODES_BY_CHIP.get(chip, KIS_PORT_NODES) + STRIP_NODES
-    if chip == 0x8142:
-        hide += STRIP_NODES_T8142
+    hide = KIS_PORT_NODES_BY_CHIP.get(chip, KIS_PORT_NODES) + STRIP_NODES + build.hide
     if not env_on("AURA_KEEP_ERRH"):
         hide += (ERROR_HANDLER,)
     if env_on("AURA_HIDE_DOCKCHANNEL"):
@@ -602,7 +606,7 @@ def main():
         dram_base=dram_base, phys_base=phys_base, mem_size=managed_end - phys_base,
         mem_size_actual=ba.mem_size_actual, cmdline=args.bootargs, blob_base=phys_base,
         trustcache=args.trustcache.read_bytes() if args.trustcache else b"",
-        iboot_copies=copies, hide_nodes=hide,
+        iboot_copies=copies, hide_nodes=hide, diag_record=build.diag_record,
         drop_props=() if keep_exclaves else ROUTES_PROPS,
         xnu_serial=f"/arm-io/{serial}" if serial else None, **cl4)
 
