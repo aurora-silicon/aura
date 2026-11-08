@@ -9216,9 +9216,10 @@ int kboot_prepare_dt(void *fdt)
     }
     /*
      * The first core of a cluster has a power-gate slot here, and iBoot leaves the boot core's
-     * clear, so that core and its cluster never power off. macOS sets it at every boot.
+     * clear, so that core and its cluster never power off. macOS sets it at every boot. T6040
+     * has the same slots at the same address.
      */
-    if (chip_id == T6041)
+    if (chip_id == T6040 || chip_id == T6041)
         set32(0x50282c040, BIT(31));
 
     if (dt_set_gpu(dt))
