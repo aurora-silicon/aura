@@ -102,6 +102,7 @@ KNOWN_ENV = {
     "AURA_SAMPLE_HZ",
     "AURA_SAMPLE_MAX",
     "AURA_XNU_RO_RELAX",
+    "AURA_SHARE_NVRAM",
     "AURA_DEBUG_PORT",
     "AURA_SPTM_DIAG",
 } | set(CONFIG_FLAGS)
@@ -157,7 +158,17 @@ XNU_QUIRKS = (
          # a kernel static. Skip its register read (the flag byte's branch, taken unconditionally)
          # and fill the two globals it would have written, with the BootKC's text and const span.
          rorgn=(("rorgn register read", "BootKC-rx", 0x336f1c8, 0x370001a8, 0x1400000d),),
-         rorgn_globals=(0xefc020, 0xefc028)),
+         rorgn_globals=(0xefc020, 0xefc028),
+         # AppleImage4's storageInit asks the registered expert whether mix-and-match is
+         # allowed; the slot it calls through is zero here (and in the image), so it decides
+         # "platform requires immutable NVRAM [Deconflicting]", which leaves its nonce
+         # magazines without a slot. No cryptex1 boot nonce means TXM refuses the cryptex
+         # trust cache and launchd's graft ends the boot. Skip the question (cbz w0 -> b) and
+         # let the ordinary /chosen/boot-command decide, as it does on a native boot.
+         # With the device hidden the guest still reads iBoot's /chosen/nvram-proxy-data, so the
+         # question is worth skipping either way.
+         nvram_mutable=(("Image4 storageInit mix-and-match question", "BootKC-rx",
+                         0x2bc0a04, 0x34000080, 0x14000022),)),
 )
 
 
@@ -646,7 +657,10 @@ def main():
         raise SystemExit("no debug-link USB port found in the ADT")
     print("debug-link port" + ("s" if len(phys) > 1 else "") + " hidden:", " ".join(port_nodes))
     keep_exclaves = env_on("AURA_KEEP_EXCLAVES")
-    hide = port_nodes + STRIP_NODES + HOST_STATE_NODES + tuple(quirks["hide"])
+    # AURA_SHARE_NVRAM lets the guest reach the real NVRAM, which its Image4 nonce storage
+    # needs -- at the price of a failed boot leaving recovery-boot-mode behind.
+    host_state = () if env_on("AURA_SHARE_NVRAM") else HOST_STATE_NODES
+    hide = port_nodes + STRIP_NODES + host_state + tuple(quirks["hide"])
     if not env_on("AURA_KEEP_ERRH"):
         hide += (ERROR_HANDLER,)
     if env_on("AURA_HIDE_DOCKCHANNEL"):
@@ -698,6 +712,8 @@ def main():
         patch_xnu(p, sym, plan, quirks["ro_relax"])
     if quirks.get("rorgn"):
         set_xnu_rorgn(p, sym, plan, quirks)
+    if quirks.get("nvram_mutable"):
+        patch_xnu(p, sym, plan, quirks["nvram_mutable"])
     configure(p, sym, plan, live_adt)
     if p.call(sym["sptm_virt_load"], entry, handoff) != 0:
         raise SystemExit("sptm_virt_load rejected the entry/handoff (see aura's console)")
