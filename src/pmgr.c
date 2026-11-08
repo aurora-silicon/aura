@@ -371,10 +371,11 @@ static int pmgr_adt_find_devices(const char *path, const u32 **devices, u32 *n_d
 }
 
 /*
- * PS register addresses (die 0) of a node's clock-gates and all their ancestors, for a caller that
- * must keep a device powered (the virtualized SPTM keeps its debug link up under macOS).
+ * PS register addresses (die 0) of a node's clock-gates and all their ancestors, with their ADT
+ * flags if asked, for a caller that must keep a device powered (the virtualized SPTM keeps its
+ * debug link up under macOS).
  */
-int pmgr_adt_collect_psregs(const char *path, u64 *out, int max)
+int pmgr_adt_collect_psregs(const char *path, u64 *out, u8 *flags, int max)
 {
     const u32 *devices;
     u32 n_devices;
@@ -399,8 +400,11 @@ int pmgr_adt_collect_psregs(const char *path, u64 *out, int max)
                 dup |= out[i] == addr;
             if (dup)
                 continue;
-            if (cnt < max)
+            if (cnt < max) {
+                if (flags)
+                    flags[cnt] = device->flags;
                 out[cnt++] = addr;
+            }
         }
         pmgr_adt_get_parents(device, parents);
         for (int i = 0; i < 2 && sp < (int)ARRAY_SIZE(stack); i++)

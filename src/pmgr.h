@@ -25,7 +25,7 @@ int pmgr_adt_path_offset_trace(const void *adt_ptr, int *path);
 
 int pmgr_adt_is_powered(const char *path);
 int pmgr_adt_power_enable(const char *path);
-int pmgr_adt_collect_psregs(const char *path, u64 *out, int max);
+int pmgr_adt_collect_psregs(const char *path, u64 *out, u8 *flags, int max);
 extern bool pmgr_keep_configured;
 int pmgr_adt_power_disable(const char *path);
 int pmgr_adt_power_disable_recursive(const char *path);

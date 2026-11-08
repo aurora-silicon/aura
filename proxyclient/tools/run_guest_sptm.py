@@ -469,6 +469,21 @@ def report_amcc(p, clear):
                     print("  cleared, now 0x%08x" % p.read32(addr))
 
 
+def link_phys(adt, hide):
+    """Phandles of the USB PHYs among the hidden nodes: the ports aura's debug link uses."""
+    from aura import sptm_virt_plan as plan_mod
+
+    root, _ = plan_mod.adt_parse(adt)
+    io = plan_mod.adt_find(root, "arm-io")
+    leaves = {h.rstrip("/").rpartition("/")[2] for h in hide}
+    out = []
+    for kid in io.kids:
+        props = {k: v for k, v, _f in kid.props}
+        if kid.name() in leaves and props.get("device_type", b"").rstrip(b"\0") == b"atc-phy":
+            out.append(struct.unpack_from("<I", props["AAPL,phandle"])[0])
+    return out
+
+
 def configure(p, sym, plan):
     p.write64(sym["sptm_virt_diag_pa"], plan.diag_pa)
     if plan.diag_pa:
@@ -604,8 +619,9 @@ def main():
                                                chip)
     serial = os.environ.get("AURA_XNU_SERIAL")
 
+    live_adt = u.get_adt()
     plan = plan_mod.plan_boot(
-        images["sptm"], images["txm"], images["xnu"], u.get_adt(),
+        images["sptm"], images["txm"], images["xnu"], live_adt,
         dram_base=dram_base, phys_base=phys_base, mem_size=managed_end - phys_base,
         mem_size_actual=ba.mem_size_actual, cmdline=args.bootargs, blob_base=phys_base,
         trustcache=args.trustcache.read_bytes() if args.trustcache else b"",
@@ -627,6 +643,10 @@ def main():
 
     write_plan(p, u, iface, sym, plan, images)
     patch_sptm(p, sym, entry, build)
+    phys = link_phys(live_adt, hide)[:2]
+    for i, ph in enumerate(phys + [0] * (2 - len(phys))):
+        p.write32(sym["sptm_virt_link_phys"] + 4 * i, ph)
+    print("debug-link USB PHYs (phandles):", " ".join(f"0x{ph:x}" for ph in phys) or "none")
     if env_on("AURA_XNU_RO_RELAX"):
         patch_xnu(p, sym, plan, XNU_RO_RELAX_26A428)
     configure(p, sym, plan)

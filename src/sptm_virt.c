@@ -338,12 +338,6 @@ __attribute__((used, retain)) int sptm_virt_load(u64 sptm_entry, u64 handoff)
 
 __attribute__((used, retain)) void sptm_virt_config(u64 flags)
 {
-    /* The sleep path knows the SoC blocks of T8140 and T8132 (sptm_virt_s2r.c). */
-    if (!sptm_virt_s2r_supported() && (flags & SPTM_VIRT_S2R)) {
-        printf("SPTM-virt: no sleep-path hooks for this SoC; ignoring the S2R flags\n");
-        flags &= ~(SPTM_VIRT_S2R | SPTM_VIRT_S2R_GO | SPTM_VIRT_S2R_FULL | SPTM_VIRT_S2R_COPROC |
-                   SPTM_VIRT_S2R_DROP_USB);
-    }
     sptm_virt_flags = flags;
     printf("SPTM-virt: flags 0x%lx\n", flags);
 }

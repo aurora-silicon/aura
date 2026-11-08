@@ -16,8 +16,8 @@
  * the states XNU asked for and can tear its USB gadget down; the first reset after the commit is
  * the wake, and the link can be taken again on a running macOS.
  *
- * The SoC-specific blocks (PMGR reg indices, PMS, the AON wake status, the debug link) are in
- * s2r_socs: T8140 and T8132.
+ * The SoC's blocks (PMGR, PMS, the AON wake status, the AMCC, the debug link) come from the ADT
+ * (sptm_virt_s2r_soc.c); a SoC whose ADT lacks one gets no sleep path.
  */
 
 #include "sptm_virt.h"
@@ -34,6 +34,7 @@
 #include "pmgr.h"
 #include "smp.h"
 #include "sptm_virt_priv.h"
+#include "sptm_virt_s2r_soc.h"
 #include "string.h"
 #include "types.h"
 #include "uartproxy.h"
@@ -55,74 +56,16 @@
 /* The always-on NUB's AP wake-source status words. */
 #define S2R_NUB_WAKE_WORDS 8
 
-/*
- * Per-SoC: indices into /arm-io/pmgr's reg, the PMS PMC pages, the AON wake status, the AMCC
- * (0 when its error-enable quiesce is not known), and the debug link's USB nodes. T8132's blocks
- * are T8140's at the same offsets from a SoC base 0x80000000 higher; only the indices differ.
- */
-struct s2r_soc {
-    u32 chip;
-    int soc_ps, cluster_ctl, pwrgate, cllt, nub_ap, aon, clkgen, soc_misc, aon_pst;
-    u64 pms_pmc[2];
-    u64 nub_wake_status;
-    u64 amcc;
-    const char *link_paths[3];
-    /*
-     * Link ancestors XNU requires off at quiesce. They stay on because the link's hidden devices
-     * are never powered down, so once the sleep has begun reads report them off.
-     */
-    u64 report_off[2];
-};
-
-static const struct s2r_soc s2r_socs[] = {
-    {
-        .chip = T8140,
-        .soc_ps = 21,
-        .cluster_ctl = 28,
-        .pwrgate = 22,
-        .cllt = 27,
-        .nub_ap = 4,
-        .aon = 1,
-        .clkgen = 2,
-        .soc_misc = 24,
-        .aon_pst = 31,
-        .pms_pmc = {0x302800000UL, 0x3028a8000UL},
-        .nub_wake_status = 0x308004028UL,
-        .amcc = 0x220025000UL,
-        .link_paths = {"/arm-io/usb-drd", "/arm-io/dart-usb", "/arm-io/atc-phy0"},
-    },
-    {
-        .chip = T8132,
-        .soc_ps = 32,
-        .cluster_ctl = 36,
-        .pwrgate = 34,
-        .cllt = 45,
-        .nub_ap = 4,
-        .aon = 1,
-        .clkgen = 2,
-        .soc_misc = 42,
-        .aon_pst = 40,
-        .pms_pmc = {0x382800000UL, 0x3828a8000UL},
-        .nub_wake_status = 0x388004028UL,
-        .link_paths = {"/arm-io/usb-drd0", "/arm-io/dart-usb0", "/arm-io/atc-phy0"},
-        /* AppleT8132PMGR::_quiesceAxi2afWorkaround panics if this one is still on at sleep. */
-        .report_off = {0x380700378UL},
-    },
-};
+static struct s2r_soc s2r_soc_adt;
 static const struct s2r_soc *s2r_soc;
+/* Phandles of the USB PHYs whose ports the host hid from the guest for aura's link. */
+u32 sptm_virt_link_phys[2];
 
-static const struct s2r_soc *s2r_soc_find(void)
-{
-    for (unsigned i = 0; i < ARRAY_SIZE(s2r_socs); i++)
-        if (s2r_socs[i].chip == chip_id)
-            return &s2r_socs[i];
-    return NULL;
-}
-
-bool sptm_virt_s2r_supported(void)
-{
-    return s2r_soc_find() != NULL;
-}
+/* Link domains XNU requires off at quiesce (ADT device flag 0x2). They stay on because the link's
+ * hidden devices are never powered down, so once the sleep has begun reads report them off. */
+#define S2R_PMGR_OFF_AT_SLEEP 0x2
+static u64 s2r_report_off_regs[4];
+static int s2r_n_report_off;
 
 /*
  * The AMCC error-enable writes macOS's error handler makes at quiesce, for when that handler is
@@ -130,7 +73,6 @@ bool sptm_virt_s2r_supported(void)
  * wakes the SoC within 20 ms. Word 0 bit 25 is DSID_AGE_OUT, word 1 bit 8 UNEXP_RT_HIT_DIR.
  */
 #define S2R_AMCC_ERR_EN(plane, word) (s2r_soc->amcc + ((u64)(plane) << 18) + (word) * 8)
-#define S2R_AMCC_PLANES              4
 #define S2R_QUIESCE_DSID_AGE_OUT     BIT(3)
 #define S2R_QUIESCE_RT_HIT_DIR       BIT(4)
 
@@ -330,8 +272,8 @@ static int s2r_keep_idx(u64 addr)
 
 static bool s2r_report_off(u64 addr)
 {
-    for (unsigned i = 0; i < ARRAY_SIZE(s2r_soc->report_off); i++)
-        if (s2r_soc->report_off[i] && s2r_soc->report_off[i] == (addr & ~3UL))
+    for (int i = 0; i < s2r_n_report_off; i++)
+        if (s2r_report_off_regs[i] == (addr & ~3UL))
             return true;
     return false;
 }
@@ -388,7 +330,7 @@ static void s2r_release_kept(void)
     }
     s2r_keep_released = true;
     int failed = 0;
-    for (unsigned i = 0; i < ARRAY_SIZE(s2r_soc->link_paths); i++)
+    for (int i = 0; i < s2r_soc->n_link; i++)
         failed += pmgr_adt_power_disable(s2r_soc->link_paths[i]) < 0;
     if (!sptm_virt_s2r_quiet)
         printf("SPTM-virt[s2r]: released %d debug-link domains; powered the ATC0 link down%s\n", n,
@@ -400,10 +342,10 @@ static void s2r_quiesce(void)
     if (!s2r_soc->amcc)
         return;
     if (sptm_virt_s2r_quiesce & S2R_QUIESCE_DSID_AGE_OUT)
-        for (int p = 0; p < S2R_AMCC_PLANES; p++)
+        for (u32 p = 0; p < s2r_soc->amcc_planes; p++)
             clear32(S2R_AMCC_ERR_EN(p, 0), BIT(25));
     if (sptm_virt_s2r_quiesce & S2R_QUIESCE_RT_HIT_DIR)
-        for (int p = 0; p < S2R_AMCC_PLANES; p++)
+        for (u32 p = 0; p < s2r_soc->amcc_planes; p++)
             clear32(S2R_AMCC_ERR_EN(p, 1), BIT(8));
     sysop("dsb sy");
 }
@@ -644,17 +586,25 @@ static void s2r_hook_adt(const char *path, int idx, const char *what, u64 off, u
     s2r_hook_range(what, pa + off, size ? size : sz);
 }
 
+static void s2r_hook_blk(const struct s2r_blk *blk, const char *what, u64 off, u64 size)
+{
+    s2r_hook_range(what, blk->base + off, size ? size : blk->size);
+}
+
 static void s2r_keep_setup(void)
 {
-    for (unsigned i = 0; i < ARRAY_SIZE(s2r_soc->link_paths); i++) {
+    for (int i = 0; i < s2r_soc->n_link; i++) {
         u64 regs[S2R_KEEP_MAX];
-        int n = pmgr_adt_collect_psregs(s2r_soc->link_paths[i], regs, S2R_KEEP_MAX);
+        u8 flags[S2R_KEEP_MAX];
+        int n = pmgr_adt_collect_psregs(s2r_soc->link_paths[i], regs, flags, S2R_KEEP_MAX);
         if (n < 0)
             printf("SPTM-virt[s2r]: cannot list the power domains of %s\n", s2r_soc->link_paths[i]);
         for (int j = 0; j < n; j++) {
-            if (s2r_keep_idx(regs[j]) >= 0)
+            if (s2r_keep_idx(regs[j]) >= 0 || s2r_report_off(regs[j]))
                 continue;
-            if (s2r_report_off(regs[j])) {
+            if ((flags[j] & S2R_PMGR_OFF_AT_SLEEP) &&
+                s2r_n_report_off < (int)ARRAY_SIZE(s2r_report_off_regs)) {
+                s2r_report_off_regs[s2r_n_report_off++] = regs[j];
                 s2r_hook_range("pmgr-debugpath", regs[j], 4);
                 printf("SPTM-virt[s2r]: not keeping 0x%lx; reads report it off once the sleep "
                        "begins\n",
@@ -681,14 +631,14 @@ static void s2r_hook_full(void)
 {
     s2r_hook_range("pms-pmc", s2r_soc->pms_pmc[0], 0x4000);
     s2r_hook_range("pms-pmc", s2r_soc->pms_pmc[1], 0x4000);
-    s2r_hook_adt("/arm-io/pmgr", s2r_soc->soc_ps, "pmgr-soc-ps", 0, 0);
-    s2r_hook_adt("/arm-io/pmgr", s2r_soc->cluster_ctl, "pmgr-cluster-ctl", 0, 0);
-    s2r_hook_adt("/arm-io/pmgr", s2r_soc->pwrgate, "pmgr-pwrgate", 0, 0);
-    s2r_hook_adt("/arm-io/pmgr", s2r_soc->cllt, "pmgr-cllt", 0, 0);
-    s2r_hook_adt("/arm-io/pmgr", s2r_soc->nub_ap, "nub-ap-ctrl", 0, 0x4000);
-    s2r_hook_adt("/arm-io/pmgr", s2r_soc->aon, "pmgr-aon", 0, 0);
-    s2r_hook_adt("/arm-io/pmgr", s2r_soc->clkgen, "clkgen-dcs", 0x5c000, 0x4000);
-    s2r_hook_adt("/arm-io/pmgr", s2r_soc->clkgen, "clkgen-mux", 0x40000, 0x4000);
+    s2r_hook_blk(&s2r_soc->soc_ps, "pmgr-soc-ps", 0, 0);
+    s2r_hook_blk(&s2r_soc->cluster_ctl, "pmgr-cluster-ctl", 0, 0);
+    s2r_hook_blk(&s2r_soc->pwrgate, "pmgr-pwrgate", 0, 0);
+    s2r_hook_blk(&s2r_soc->cllt, "pmgr-cllt", 0, 0);
+    s2r_hook_blk(&s2r_soc->nub_ap, "nub-ap-ctrl", 0, 0x4000);
+    s2r_hook_blk(&s2r_soc->aon, "pmgr-aon", 0, 0);
+    s2r_hook_blk(&s2r_soc->clkgen, "clkgen-dcs", 0x5c000, 0x4000);
+    s2r_hook_blk(&s2r_soc->clkgen, "clkgen-mux", 0x40000, 0x4000);
     for (int i = 0; i < 3; i++)
         s2r_hook_adt("/arm-io/nub-spmi0", i, "spmi0", 0, 0x4000);
     for (int i = 0; i < 3; i++)
@@ -703,12 +653,16 @@ void sptm_virt_s2r_setup(bool cdc)
 {
     u64 flags = sptm_virt_flags;
 
-    s2r_soc = s2r_soc_find();
-    if (!s2r_soc) {
-        /* Nothing below knows this SoC's blocks. */
-        printf("SPTM-virt[s2r]: no sleep-path table for this SoC; debug-link domains not kept\n");
+    const char *missing;
+    if (s2r_soc_from_adt(adt, sptm_virt_link_phys, ARRAY_SIZE(sptm_virt_link_phys), &s2r_soc_adt,
+                         &missing) < 0) {
+        printf("SPTM-virt[s2r]: no sleep path, the ADT gives no %s; debug-link domains not kept\n",
+               missing);
+        sptm_virt_flags &= ~(SPTM_VIRT_S2R | SPTM_VIRT_S2R_GO | SPTM_VIRT_S2R_FULL |
+                             SPTM_VIRT_S2R_COPROC | SPTM_VIRT_S2R_DROP_USB);
         return;
     }
+    s2r_soc = &s2r_soc_adt;
     s2r_keep_always = cdc;
     if (!(flags & SPTM_VIRT_S2R)) {
         if (cdc)
@@ -735,8 +689,8 @@ void sptm_virt_s2r_setup(bool cdc)
     s2r_usb_setup();
 
     /* Each core's self-disable and the commit: a handful of accesses. */
-    s2r_hook_adt("/arm-io/pmgr", s2r_soc->soc_misc, "pmgr-soc-misc", 0, 0);
-    s2r_hook_adt("/arm-io/pmgr", s2r_soc->aon_pst, "pmgr-aon-pst", 0, 0);
+    s2r_hook_blk(&s2r_soc->soc_misc, "pmgr-soc-misc", 0, 0);
+    s2r_hook_blk(&s2r_soc->aon_pst, "pmgr-aon-pst", 0, 0);
     if (s2r_coproc) {
         static const struct {
             const char *path, *what;
