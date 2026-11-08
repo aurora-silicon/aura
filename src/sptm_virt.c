@@ -48,14 +48,19 @@ bool sptm_virt_requested(void)
     return chip_id == T8140 || chip_id == T8132 || chip_id == T8142;
 }
 
+/* FEAT_MTE2: the SoC has allocation-tag storage. */
+bool sptm_virt_mte(void)
+{
+    return FIELD_GET(ID_AA64PFR1_MTE, mrs(SYS_ID_AA64PFR1_EL1)) >= 2;
+}
+
 /*
- * On T8142 iBoot programs MTE tag storage (TagOffset_EL2) as the top 512 MiB of the managed RAM it
- * would hand SPTM, and SPTM checks it there (sptm_init_mte_boundaries), so SPTM's window keeps
- * iBoot's end and aura's carve-out comes off its bottom instead.
+ * With MTE, iBoot puts the tag storage at the top of the managed RAM it would hand SPTM, and SPTM
+ * checks it there, so SPTM's window keeps iBoot's end and aura's carve-out comes off its bottom.
  */
 static bool sptm_virt_carveout_low(void)
 {
-    return chip_id == T8142;
+    return sptm_virt_mte();
 }
 
 int sptm_virt_compute_layout(u64 phys_base, u64 mem_size, u64 ram_base, u64 ram_top, u64 fw_high,
@@ -164,7 +169,7 @@ static u64 sptm_virt_low_floor(u64 limit)
 }
 
 /*
- * The T8142 layout. Two constraints decide it:
+ * The layout with MTE. Two constraints decide it:
  *  - SPTM's window must end where iBoot's does, because the MTE tag storage is its top 512 MiB and
  *    SPTM derives the tag base from the window's end.
  *  - its physBase must lie in the first 512 MiB of DRAM; SPTM checks that (t8110dart's DAPF

@@ -1698,8 +1698,8 @@ void nv2_enter_os(u64 entry, u64 a0, u64 a1, u64 a2)
      * rewrite the Linux guest needs. The NV|NV2 redirection and ERET gate stay. */
     u64 hcr = (mrs(HCR_EL2) & ~(HCR_TGE | HCR_NV1 | HCR_TTLB)) | HCR_NV | HCR_NV2 | HCR_AT |
               (nv2_guarded ? 0 : HCR_TID3);
-    /* A guarded guest on an MTE SoC (T8142) tags its memory: let EL1 reach the allocation tags. */
-    if (nv2_guarded && FIELD_GET(ID_AA64PFR1_MTE, mrs(SYS_ID_AA64PFR1_EL1)) >= 2)
+    /* A guarded guest on an MTE SoC tags its memory: let EL1 reach the allocation tags. */
+    if (nv2_guarded && sptm_virt_mte())
         hcr |= HCR_ATA;
     nv2_cpu_arm(&nv2_cpus[cpu], vncr, avncr, hcr);
     nv2_cpus[cpu].scratch = (u64 *)(vncr + 2 * SZ_4K);

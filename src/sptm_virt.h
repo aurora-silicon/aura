@@ -56,6 +56,7 @@ struct sptm_virt_placement {
 extern volatile bool sptm_virt_guest_live;
 
 bool sptm_virt_requested(void);
+bool sptm_virt_mte(void);
 bool sptm_virt_heap_window(u64 *base, u64 *limit);
 
 /* Host entry points, called over the proxy. */
