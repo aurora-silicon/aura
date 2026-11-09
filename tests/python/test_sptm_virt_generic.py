@@ -174,6 +174,8 @@ def s2r(host, tmp, d, port=None):
             res["nub_wake_status"] = int(f[1], 16)
         elif f[0] == "amcc":
             res["amcc"], res["amcc_planes"] = int(f[1], 16), int(f[2])
+        elif f[0] == "timer_only":
+            res["timer_only"] = (int(f[1]), int(f[2], 16), int(f[3]), int(f[4]))
         elif f[0] == "link":
             res["link"].append(f[1])
         elif f[0] == "skipped":
@@ -199,6 +201,9 @@ def test_s2r_soc_per_image_set(tmp_path):
     for d in image_sets():
         res = s2r(host, tmp_path, d, S2R_OLD.get(d.name, {}).get("port"))
         state = "on" if res["rc"] == 0 else f"off (no {res['missing']})"
+        only, timer, blocks, pages = res.get("timer_only", (0, 0, 0, 0))
+        if res["rc"] == 0 and only:
+            state += f", timer-only: S2R timer 0x{timer:x}, {blocks} blocks, {pages} pages"
         skipped = f", not traced: {', '.join(res['skipped'])}" if res["skipped"] else ""
         rows.append(f"{d.name}: S2R {state}{skipped}")
         old = S2R_OLD.get(d.name)

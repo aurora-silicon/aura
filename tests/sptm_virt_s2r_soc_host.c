@@ -76,8 +76,9 @@ static void *load(const char *path, u32 *size)
     return buf;
 }
 
-#define BLK(name) printf(#name " 0x%llx 0x%llx\n", (unsigned long long)s.name.base, \
-                         (unsigned long long)s.name.size)
+#define BLK(name)                                                                                  \
+    printf(#name " 0x%llx 0x%llx\n", (unsigned long long)s.name.base,                              \
+           (unsigned long long)s.name.size)
 
 int main(int argc, char **argv)
 {
@@ -105,6 +106,8 @@ int main(int argc, char **argv)
            (unsigned long long)s.pms_pmc[1]);
     printf("nub_wake_status 0x%llx\n", (unsigned long long)s.nub_wake_status);
     printf("amcc 0x%llx %u\n", (unsigned long long)s.amcc, s.amcc_planes);
+    printf("timer_only %d 0x%llx %d %u\n", s.timer_only, (unsigned long long)s.stop_timer,
+           s.n_trace, s.trace_pages);
     for (int i = 0; i < s.n_link; i++)
         printf("link %s\n", s.link_paths[i]);
     for (int i = 0; i < s.n_skipped; i++)

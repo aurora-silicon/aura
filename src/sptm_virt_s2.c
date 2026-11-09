@@ -262,6 +262,16 @@ void sptm_virt_rg_stop_wd2(void)
         write32(rg_wdt + WDT2_CTL, 0);
 }
 
+/* A stop after native-watchdog (go) sleeps: neither SoC watchdog may reset the held machine. */
+void sptm_virt_rg_disarm(void)
+{
+    sptm_virt_rg_passthrough = false;
+    if (rg_wdt) {
+        write32(rg_wdt + WDT_CTL, read32(rg_wdt + WDT_CTL) & ~WDT_CTL_RESET);
+        write32(rg_wdt + WDT2_CTL, 0);
+    }
+}
+
 bool sptm_virt_rg_owns(u64 page)
 {
     for (int i = 0; i < rg_n; i++)

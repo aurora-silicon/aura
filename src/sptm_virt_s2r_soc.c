@@ -117,6 +117,97 @@ static int s2r_link_from_adt(const void *adt, const u32 *phys, int n_phys, struc
     return out->n_link ? 0 : -1;
 }
 
+/* A traced range, exactly as the ADT gives it (a partial last page is hooked to its end). */
+static int s2r_trace_add(u64 a, u64 declared, const char *what, bool shared, struct s2r_soc *out)
+{
+    u64 size = declared;
+    if (!a || size < 0x4000 || (a & 0x3fff) || (size & 3) || size > ~0UL - a)
+        return -1;
+    for (int i = 0; i < out->n_trace; i++) {
+        const struct s2r_trace_blk *b = &out->trace[i];
+        if (shared && a == b->base && declared == b->declared_size && !strcmp(what, b->what))
+            return 0;
+        if (a < b->base + b->declared_size && b->base < a + declared)
+            return -1;
+    }
+    u64 pages = size / 0x4000 + !!(size & 0x3fff);
+    if (out->n_trace >= S2R_TRACE_BANKS || pages > S2R_TRACE_MAX_PAGES - out->trace_pages)
+        return -1;
+    out->trace[out->n_trace++] = (struct s2r_trace_blk){a, size, declared, what};
+    out->trace_pages += pages;
+    return 0;
+}
+
+static int s2r_trace_bank(const void *adt, int *path, u32 idx, u32 n_reg, struct s2r_soc *out)
+{
+    u64 a, s;
+    if (idx >= n_reg || adt_get_reg(adt, path, "reg", idx, &a, &s) < 0 || (s & 0x3fff))
+        return -1;
+    return s2r_trace_add(a, s, "pmgr-ps", false, out);
+}
+
+/* Each core's cpu-impl-reg window and its cluster's ACC and CPM windows (absolute ranges, as in
+ * smp.c), traced as the guest uses them: aura reads none of them itself. */
+static int s2r_trace_cpus(const void *adt, struct s2r_soc *out)
+{
+    int node = adt_path_offset(adt, "/cpus");
+    if (node < 0)
+        return -1;
+    u64 seen = 0;
+    ADT_FOREACH_CHILD(adt, node)
+    {
+        u32 id;
+        u64 reg[2];
+        if (ADT_GETPROP(adt, node, "cpu-id", &id) != sizeof(id) || id >= 32 || (seen & BIT(id)) ||
+            ADT_GETPROP_ARRAY(adt, node, "cpu-impl-reg", reg) != sizeof(reg) ||
+            s2r_trace_add(reg[0], reg[1], "cpu-impl", false, out) < 0)
+            return -1;
+        seen |= BIT(id);
+        if (ADT_GETPROP_ARRAY(adt, node, "acc-impl-reg", reg) != sizeof(reg) ||
+            s2r_trace_add(reg[0], reg[1], "acc-impl", true, out) < 0 ||
+            ADT_GETPROP_ARRAY(adt, node, "cpm-impl-reg", reg) != sizeof(reg) ||
+            s2r_trace_add(reg[0], reg[1], "cpm-impl", true, out) < 0)
+            return -1;
+    }
+    return seen ? 0 : -1;
+}
+
+/*
+ * A PMGR whose sleep is the S2R timer's start alone, with no per-core self-disable block: the
+ * timer's reg entry and offset. Measured on J714s (26A428): the sleep commit is one core's 32-bit
+ * write of 1 there. Its PS groups and the cores' windows come from the ADT.
+ */
+static const struct {
+    const char *compatible;
+    u32 reg, off;
+} s2r_timer_only[] = {
+    {"pmgr1,t6050", 11, 0x4000},
+};
+
+static int s2r_timer_only_trace(const void *adt, int *path, const u32 *ps, u32 n_ps, u32 n_reg,
+                                u32 timer_reg, u32 timer_off, struct s2r_soc *out,
+                                const char **missing)
+{
+    *missing = "PMGR PS groups and S2R timer";
+    for (u32 i = 0; i < n_ps; i++) {
+        if (s2r_trace_bank(adt, path, ps[3 * i], n_reg, out) < 0 ||
+            ps[3 * i + 1] >= out->trace[out->n_trace - 1].size)
+            return -1;
+    }
+    if (s2r_trace_bank(adt, path, timer_reg, n_reg, out) < 0)
+        return -1;
+    const struct s2r_trace_blk *timer = &out->trace[out->n_trace - 1];
+    if (timer->size < timer_off + 4)
+        return -1;
+    out->stop_timer = timer->base + timer_off;
+    *missing = "CPU, ACC and CPM windows";
+    if (s2r_trace_cpus(adt, out) < 0)
+        return -1;
+    out->timer_only = true;
+    *missing = NULL;
+    return 0;
+}
+
 int s2r_soc_from_adt(const void *adt, const u32 *link_phys, int n_phys, struct s2r_soc *out,
                      const char **missing)
 {
@@ -132,9 +223,14 @@ int s2r_soc_from_adt(const void *adt, const u32 *link_phys, int n_phys, struct s
     if (!ps || !len)
         ps = adt_getprop(adt, node, "ps-groups", &len);
     u32 n_ps = ps ? len / 12 : 0, n_reg = 0;
-    if (!n_ps || !adt_getprop(adt, node, "reg", &n_reg))
+    if (!n_ps || len % 12 || !adt_getprop(adt, node, "reg", &n_reg) || n_reg % 16)
         return -1;
     n_reg /= 16;
+
+    for (size_t i = 0; i < ARRAY_SIZE(s2r_timer_only); i++)
+        if (adt_is_compatible(adt, node, s2r_timer_only[i].compatible))
+            return s2r_timer_only_trace(adt, path, ps, n_ps, n_reg, s2r_timer_only[i].reg,
+                                        s2r_timer_only[i].off, out, missing);
 
     /* The first group is the PS area, the first other one the always-on area. */
     u64 area[2] = {0, 0}, sz;

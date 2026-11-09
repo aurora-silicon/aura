@@ -125,6 +125,11 @@ spmi_dev_t *spmi_init(const char *adt_node)
     return dev;
 }
 
+u64 spmi_cmd_reg(spmi_dev_t *dev)
+{
+    return dev->base + dev->regs->cmd_offset;
+}
+
 void spmi_shutdown(spmi_dev_t *dev)
 {
     free(dev);

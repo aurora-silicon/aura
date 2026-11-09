@@ -71,6 +71,7 @@ void sptm_virt_s2_enter_xnu(int cpu);
 bool sptm_virt_s2_dabort_gl(u64 *regs);
 bool sptm_virt_rg_owns(u64 page);
 void sptm_virt_rg_stop_wd2(void);
+void sptm_virt_rg_disarm(void);
 void sptm_virt_mmio_rw(u64 addr, u64 *val, bool write, int width);
 
 /* sptm_virt_s2r.c */

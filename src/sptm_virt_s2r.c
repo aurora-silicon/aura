@@ -17,7 +17,9 @@
  * the wake, and the link can be taken again on a running macOS.
  *
  * The SoC's blocks (PMGR, PMS, the AON wake status, the AMCC, the debug link) come from the ADT
- * (sptm_virt_s2r_soc.c); a SoC whose ADT lacks one gets no sleep path.
+ * (sptm_virt_s2r_soc.c); a SoC whose ADT lacks one gets no sleep path. On a PMGR whose sleep is the
+ * S2R timer's start alone (no per-core self-disable block), the trace records the PMGR's PS groups
+ * and the cores' windows, the commit is that start, and none of the per-core or domain rules run.
  */
 
 #include "sptm_virt.h"
@@ -33,6 +35,7 @@
 #include "nv2.h"
 #include "pmgr.h"
 #include "smp.h"
+#include "spmi.h"
 #include "sptm_virt_priv.h"
 #include "sptm_virt_s2r_soc.h"
 #include "string.h"
@@ -42,7 +45,8 @@
 #include "usb_cdc_atc.h"
 #include "utils.h"
 
-#define S2R_RING_BYTES (8UL << 20)
+#define S2R_RING_BYTES     (8UL << 20)
+#define S2R_RING_BYTES_BIG (64UL << 20) /* a whole sleep entry; 8 MiB if the heap is short */
 
 /* The sleep rules start a while after setup: XNU's PMGR driver writes the same registers while
  * it boots, and a sleep comes minutes after the desktop. After a wake with the link re-taken they
@@ -83,9 +87,10 @@ struct s2r_rec {
     u64 pc;   /* guest PC, or the marker's tag (8 chars) */
 };
 
+/* cpu bits 5:4 go in [57:56], for up to 64 cores. */
 #define S2R_META(pa, width, write, cpu, marker)                                                    \
     (((pa) & GENMASK(47, 0)) | ((u64)((width) & 3) << 48) | ((u64) !!(write) << 50) |              \
-     ((u64)((cpu) & 15) << 51) | ((u64) !!(marker) << 55))
+     ((u64)((cpu) & 15) << 51) | ((u64) !!(marker) << 55) | ((u64)(((cpu) >> 4) & 3) << 56))
 #define S2R_MARKER BIT(55)
 #define S2R_WRITE  BIT(50)
 
@@ -96,15 +101,17 @@ volatile u64 sptm_virt_s2r_head; /* records ever appended */
 u32 sptm_virt_s2r_pages;         /* pages hooked */
 
 /* Set by the host before entry (run_guest_sptm.py). */
-u32 sptm_virt_s2r_quiesce;      /* S2R_QUIESCE_* */
-u32 sptm_virt_s2r_usb_retake;   /* 1: re-take the link after a wake; n > 1: also drop it n s in */
+u32 sptm_virt_s2r_quiesce;    /* S2R_QUIESCE_* */
+u32 sptm_virt_s2r_wake_s;     /* GO, timer-only sleep: PMU RTC alarm this many s after the commit */
+u32 sptm_virt_s2r_go_count;   /* GO, timer-only sleep: stop at the commit after this many wakes */
+u32 sptm_virt_s2r_usb_retake; /* 1: re-take the link after a wake; n > 1: also drop it n s in */
 u32 sptm_virt_s2r_usb_delay_ms; /* delay from XNU's return to the re-take, 0 = default */
 
 static struct {
     u64 page;
     const char *what;
     bool seen;
-} s2r_pages[160];
+} s2r_pages[S2R_TRACE_MAX_PAGES];
 
 static bool s2r_go, s2r_fulltrace, s2r_coproc, s2r_drop_usb;
 static u64 s2r_arm_at;
@@ -383,6 +390,159 @@ static void s2r_core_sleeps(void)
     s2r_marker("SLEEPS", cpu);
 }
 
+/* ---- Timed wake: the PMU's RTC alarm ---------------------------------------------------------
+ *
+ * The PMU and its RTC registers come from the ADT: the first child of an SPMI bus with info-rtc*
+ * properties (control with its enable, event and monitor bits, the counter in 1/65536 s, the
+ * compare in counter seconds, the IRQ mask). At the GO commit aura arms the alarm wake_s seconds
+ * out. XNU's own later writes to it go through the bus's command register, where the hook follows
+ * each command and its data words and keeps them on aura's time.
+ */
+#define S2R_SPMI_EXT_WRITEL 0x30
+
+static struct {
+    spmi_dev_t *dev;
+    u64 cmd; /* PA of the controller's command register */
+    u32 slave;
+    u32 ctrl, counter, compare, mask, arm_bit, irq_bit, event_bit, monitor_bit;
+    u32 wake_at;    /* PMU counter seconds; 0 until armed */
+    u32 data_reg;   /* register the next data word of XNU's write covers */
+    int data_words; /* data words still to come for that write */
+    bool data_pmu;  /* the write is to the PMU */
+} s2r_rtc;
+
+static u32 s2r_rtc_patch(u32 reg, u32 v)
+{
+    for (u32 b = 0; b < 4; b++) {
+        u32 r = reg + b, sh = 8 * b;
+        if (r >= s2r_rtc.compare && r < s2r_rtc.compare + 4)
+            v = (v & ~(0xffU << sh)) |
+                (((s2r_rtc.wake_at >> (8 * (r - s2r_rtc.compare))) & 0xff) << sh);
+        else if (r == s2r_rtc.mask)
+            v &= ~(s2r_rtc.irq_bit << sh);
+        else if (r == s2r_rtc.ctrl)
+            v |= (s2r_rtc.arm_bit | s2r_rtc.monitor_bit) << sh;
+    }
+    return v;
+}
+
+static bool s2r_spmi_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int width)
+{
+    if (write && width == 2 && addr == s2r_rtc.cmd) {
+        u32 v = *val;
+        if (s2r_rtc.data_words > 0) {
+            s2r_rtc.data_words--;
+            if (s2r_rtc.data_pmu && s2r_rtc.wake_at)
+                v = s2r_rtc_patch(s2r_rtc.data_reg, v);
+            s2r_rtc.data_reg += 4;
+        } else {
+            u32 opc = v & 0xff, len = 0, reg = v >> 16;
+            if ((opc & 0xf8) == S2R_SPMI_EXT_WRITEL) {
+                len = (opc & 7) + 1;
+            } else if (opc < 0x10) { /* extended write, 8-bit register */
+                len = (opc & 0xf) + 1;
+                reg &= 0xff;
+            }
+            s2r_rtc.data_words = (len + 3) / 4;
+            s2r_rtc.data_reg = reg;
+            s2r_rtc.data_pmu = ((v >> 8) & 0x7f) == s2r_rtc.slave;
+        }
+        *val = v;
+    }
+    sptm_virt_mmio_rw(addr, val, write, width);
+    sptm_virt_s2r_note(ctx, addr, *val, write, width);
+    return true;
+}
+
+static u32 s2r_adt_u32(int node, const char *name)
+{
+    u32 v = 0;
+    return ADT_GETPROP(adt, node, name, &v) == sizeof(v) ? v : 0;
+}
+
+static bool s2r_rtc_from(const char *bus, int pmu)
+{
+    u32 len;
+    const u32 *reg = adt_getprop(adt, pmu, "reg", &len);
+    if (!reg || len < 4 || !(s2r_rtc.ctrl = s2r_adt_u32(pmu, "info-rtc_alarm_ctrl")) ||
+        !(s2r_rtc.counter = s2r_adt_u32(pmu, "info-rtc")) ||
+        !(s2r_rtc.compare = s2r_adt_u32(pmu, "info-rtc_alarm_offset")) ||
+        !(s2r_rtc.mask = s2r_adt_u32(pmu, "info-rtc_irq_mask_offset")) ||
+        !(s2r_rtc.arm_bit = s2r_adt_u32(pmu, "info-rtc_alarm_ctrl_en_mask")) ||
+        !(s2r_rtc.irq_bit = s2r_adt_u32(pmu, "info-rtc_alarm_mask")))
+        return false;
+    char path[48];
+    snprintf(path, sizeof(path), "/arm-io/%s", bus);
+    s2r_rtc.slave = reg[0];
+    s2r_rtc.event_bit = s2r_adt_u32(pmu, "info-rtc_alarm_event_mask");
+    s2r_rtc.monitor_bit = s2r_adt_u32(pmu, "info-rtc_alarm_monitor_mask");
+    s2r_rtc.dev = spmi_init(path);
+    if (!s2r_rtc.dev)
+        return false;
+    s2r_rtc.cmd = spmi_cmd_reg(s2r_rtc.dev);
+    if (hv_map_hook(s2r_rtc.cmd & ~0x3fffUL, s2r_spmi_hook, 0x4000) < 0)
+        return false;
+    printf("SPTM-virt[s2r]: timed wake %u s after the commit: %s/%s (SPMI 0x%x, cmd 0x%lx), RTC "
+           "ctrl 0x%x compare 0x%x mask 0x%x\n",
+           sptm_virt_s2r_wake_s, bus, adt_get_name(adt, pmu), s2r_rtc.slave, s2r_rtc.cmd,
+           s2r_rtc.ctrl, s2r_rtc.compare, s2r_rtc.mask);
+    return true;
+}
+
+static void s2r_rtc_setup(void)
+{
+    int bus = adt_path_offset(adt, "/arm-io");
+    if (bus >= 0)
+        ADT_FOREACH_CHILD(adt, bus)
+        {
+            const char *name = adt_get_name(adt, bus);
+            int pmu = bus;
+            if (strncmp(name, "nub-spmi", 8))
+                continue;
+            ADT_FOREACH_CHILD(adt, pmu)
+            {
+                if (s2r_rtc_from(name, pmu))
+                    return;
+            }
+        }
+    printf("SPTM-virt[s2r]: no PMU RTC on an SPMI bus; no timed wake\n");
+    sptm_virt_s2r_wake_s = 0;
+}
+
+/* At the GO commit, on the committing core: XNU's PMU accesses are quiesced behind it. */
+static void s2r_rtc_arm(void)
+{
+    u8 c[6], b;
+    if (!s2r_rtc.dev || spmi_ext_read_long(s2r_rtc.dev, s2r_rtc.slave, s2r_rtc.counter, c, 6) < 0)
+        goto fail;
+    u64 cnt = 0;
+    for (int i = 0; i < 6; i++)
+        cnt |= (u64)c[i] << (8 * i);
+    u32 at = (cnt >> 16) + sptm_virt_s2r_wake_s;
+    u8 cmp[4] = {at, at >> 8, at >> 16, at >> 24};
+    if (spmi_ext_read_long(s2r_rtc.dev, s2r_rtc.slave, s2r_rtc.ctrl, &b, 1) < 0)
+        goto fail;
+    u8 ack = b | s2r_rtc.event_bit;
+    if (spmi_ext_write_long(s2r_rtc.dev, s2r_rtc.slave, s2r_rtc.ctrl, &ack, 1) < 0 ||
+        spmi_ext_write_long(s2r_rtc.dev, s2r_rtc.slave, s2r_rtc.compare, cmp, 4) < 0 ||
+        spmi_ext_read_long(s2r_rtc.dev, s2r_rtc.slave, s2r_rtc.mask, &b, 1) < 0)
+        goto fail;
+    b &= ~s2r_rtc.irq_bit;
+    if (spmi_ext_write_long(s2r_rtc.dev, s2r_rtc.slave, s2r_rtc.mask, &b, 1) < 0 ||
+        spmi_ext_read_long(s2r_rtc.dev, s2r_rtc.slave, s2r_rtc.ctrl, &b, 1) < 0)
+        goto fail;
+    b = (b & ~s2r_rtc.event_bit) | s2r_rtc.arm_bit | s2r_rtc.monitor_bit;
+    if (spmi_ext_write_long(s2r_rtc.dev, s2r_rtc.slave, s2r_rtc.ctrl, &b, 1) < 0)
+        goto fail;
+    s2r_rtc.wake_at = at;
+    s2r_marker("RTCWAKE", at);
+    printf("SPTM-virt[s2r]: PMU RTC alarm armed for counter second %u (now %lu, +%u s)\n", at,
+           (unsigned long)(cnt >> 16), sptm_virt_s2r_wake_s);
+    return;
+fail:
+    printf("SPTM-virt[s2r]: PMU RTC alarm not armed (SPMI error); no timed wake\n");
+}
+
 /* The commit in go mode, before the S2R timer write goes through. */
 static void s2r_commit(void)
 {
@@ -449,7 +609,8 @@ bool sptm_virt_s2r_wfi(u64 *regs, u64 esr)
            cpu, s2r_parked_mask, sptm_virt_s2r_head);
     sptm_virt_s2r_dump_tail(4096);
     struct uartproxy_msg_start start = {
-        .reason = START_HV, .code = 0x53325221, /* 'S2R!' */
+        .reason = START_HV,
+        .code = 0x53325221, /* 'S2R!' */
     };
     uartproxy_run(&start);
     while (1)
@@ -462,6 +623,43 @@ static bool s2r_wakerec_printed;
 
 static bool s2r_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int width)
 {
+    /* Timer-only sleep: the S2R timer's start is the commit; everything else is recorded. */
+    if (s2r_soc->timer_only) {
+        if (write && width == 2 && addr == s2r_soc->stop_timer && *val == 1 && s2r_armed()) {
+            sptm_virt_s2r_note(ctx, addr, *val, true, width);
+            if (!s2r_go || (sptm_virt_s2r_go_count && s2r_wake_count >= sptm_virt_s2r_go_count)) {
+                sptm_virt_rg_disarm();
+                s2r_stop_before_timer(ctx, addr, *val);
+            }
+            s2r_marker("S2RGO", addr);
+            printf("SPTM-virt[s2r]: cpu%d starts the S2R timer (pc 0x%lx), %lu records; aura "
+                   "silent until the wake\n",
+                   smp_id(), ctx->elr, sptm_virt_s2r_head);
+            if (sptm_virt_s2r_wake_s)
+                s2r_rtc_arm();
+            iodev_console_flush();
+            s2r_commit();
+            msr(CNTP_CTL_EL0, 0); /* aura's EL2 timers (E2H: CNTHP, CNTHV) on this core */
+            msr(CNTV_CTL_EL0, 0);
+            sysop("isb");
+            write32(addr, *val);
+            return true;
+        }
+        if (width == 4) {
+            s2r_rw128(addr, val, write);
+            sptm_virt_s2r_note(ctx, addr, val[0], write, 3);
+            sptm_virt_s2r_note(ctx, addr + 8, val[1], write, 3);
+        } else if (width >= 0 && width <= 3) {
+            sptm_virt_mmio_rw(addr, val, write, width);
+            /* XNU polls the cores' counters there all the time; their writes still go in. */
+            bool first;
+            if (write || strcmp(s2r_page_name(addr & ~0x3fffUL, &first), "cpu-impl"))
+                sptm_virt_s2r_note(ctx, addr, *val, write, width);
+        } else {
+            return false;
+        }
+        return true;
+    }
     int k = width == 2 && !s2r_keep_released && (s2r_keep_always || s2r_armed())
                 ? s2r_keep_idx(addr)
                 : -1;
@@ -574,6 +772,26 @@ static void s2r_hook_range(const char *what, u64 base, u64 size)
     }
 }
 
+/* Validated, aligned discovery apertures only. Unlike the legacy block mapper, this preserves
+ * a partial last page using hv_map_hook's 4-byte L4 granularity. No access outside the ADT range
+ * is routed to our hook, and mapping a range does not read its registers. */
+static bool s2r_hook_capture(const struct s2r_trace_blk *b)
+{
+    for (u64 page = b->base; page < b->base + b->size; page += 0x4000) {
+        if (sptm_virt_rg_owns(page))
+            continue;
+        u64 size = min(0x4000UL, b->base + b->size - page);
+        if (sptm_virt_s2r_pages >= ARRAY_SIZE(s2r_pages) || hv_map_hook(page, s2r_hook, size) < 0) {
+            printf("SPTM-virt[s2r]: cannot hook capture %s 0x%lx + 0x%lx\n", b->what, page, size);
+            return false;
+        }
+        s2r_pages[sptm_virt_s2r_pages].page = page;
+        s2r_pages[sptm_virt_s2r_pages].what = b->what;
+        sptm_virt_s2r_pages++;
+    }
+    return true;
+}
+
 static void s2r_hook_adt(const char *path, int idx, const char *what, u64 off, u64 size)
 {
     int p[8];
@@ -664,6 +882,16 @@ void sptm_virt_s2r_setup(bool cdc)
         return;
     }
     s2r_soc = &s2r_soc_adt;
+    u64 sleep_flags = SPTM_VIRT_S2R | SPTM_VIRT_S2R_GO | SPTM_VIRT_S2R_FULL | SPTM_VIRT_S2R_COPROC |
+                      SPTM_VIRT_S2R_DROP_USB;
+    if (s2r_soc->timer_only &&
+        ((flags & sleep_flags & ~(SPTM_VIRT_S2R_FULL | SPTM_VIRT_S2R_GO)) != SPTM_VIRT_S2R ||
+         sptm_virt_s2r_quiesce || sptm_virt_s2r_usb_retake)) {
+        printf("SPTM-virt[s2r]: a timer-only sleep takes TRACE (0x1) with FULL (0x4) and GO (0x2) "
+               "only, quiesce=0, usb_retake=0; debug-link domains not kept\n");
+        sptm_virt_flags &= ~sleep_flags;
+        return;
+    }
     for (int i = 0; i < s2r_soc->n_skipped; i++)
         printf("SPTM-virt[s2r]: the ADT gives no %s; not traced\n", s2r_soc->skipped[i]);
     s2r_keep_always = cdc;
@@ -672,17 +900,55 @@ void sptm_virt_s2r_setup(bool cdc)
             s2r_keep_setup();
         return;
     }
-    sptm_virt_s2r_ring = memalign(0x4000, S2R_RING_BYTES);
+    /* A timer-only sleep has no stop before the commit to read a ring from: keep it all. */
+    u64 ring_bytes = s2r_soc->timer_only ? S2R_RING_BYTES_BIG : S2R_RING_BYTES;
+    sptm_virt_s2r_ring = memalign(0x4000, ring_bytes);
+    if (!sptm_virt_s2r_ring && ring_bytes != S2R_RING_BYTES) {
+        ring_bytes = S2R_RING_BYTES;
+        sptm_virt_s2r_ring = memalign(0x4000, ring_bytes);
+    }
     if (!sptm_virt_s2r_ring) {
         printf("SPTM-virt[s2r]: no memory for the ring; sleep path off\n");
         sptm_virt_flags &= ~SPTM_VIRT_S2R;
-        if (cdc)
+        if (cdc && !s2r_soc->timer_only)
             s2r_keep_setup();
         return;
     }
-    memset(sptm_virt_s2r_ring, 0, S2R_RING_BYTES);
-    sptm_virt_s2r_nrec = S2R_RING_BYTES / sizeof(struct s2r_rec);
+    memset(sptm_virt_s2r_ring, 0, ring_bytes);
+    sptm_virt_s2r_nrec = ring_bytes / sizeof(struct s2r_rec);
     sptm_virt_s2r_head = 0;
+    if (s2r_soc->timer_only) {
+        /* No link keeping, USB, per-core or WFI rules: the timer's start is the sleep. */
+        s2r_go = flags & SPTM_VIRT_S2R_GO;
+        sptm_virt_rg_passthrough = s2r_go;
+        if (s2r_go && sptm_virt_s2r_wake_s)
+            s2r_rtc_setup();
+        s2r_arm_at = mrs(CNTPCT_EL0) + S2R_ARM_AFTER_S * mrs(CNTFRQ_EL0);
+        for (int i = 0; i < s2r_soc->n_trace; i++) {
+            const struct s2r_trace_blk *b = &s2r_soc->trace[i];
+            if (!(flags & SPTM_VIRT_S2R_FULL) && strcmp(b->what, "cpu-impl"))
+                continue;
+            /* With the cluster ACC/CPM windows trapped, XNU's ACC rail-gating callback timed out
+             * after 30 s (J714s, GO). Their accesses aren't needed to let the sleep happen. */
+            if (s2r_go && (!strcmp(b->what, "acc-impl") || !strcmp(b->what, "cpm-impl")))
+                continue;
+            printf("SPTM-virt[s2r]: capture %s 0x%lx + 0x%lx (ADT size 0x%lx)\n", b->what, b->base,
+                   b->size, b->declared_size);
+            if (!s2r_hook_capture(b)) {
+                s2r_arm_at = 0; /* partially installed hooks must never claim a complete stop */
+                sptm_virt_flags &= ~sleep_flags;
+                return;
+            }
+        }
+        s2r_hook_range("s2r-timer", s2r_soc->stop_timer & ~0x3fffUL, 0x4000);
+        s2r_marker("TIMERSLP", sptm_virt_s2r_pages);
+        printf("SPTM-virt[s2r]: timer-only sleep, %s: %u pages, %lu-record ring at 0x%lx; "
+               "32-bit [0x%lx]=1 %s after %u s\n",
+               s2r_go ? "GO" : "PRECOMMIT STOP", sptm_virt_s2r_pages, sptm_virt_s2r_nrec,
+               (u64)sptm_virt_s2r_ring, s2r_soc->stop_timer,
+               s2r_go ? "commits the sleep" : "withheld", S2R_ARM_AFTER_S);
+        return;
+    }
     s2r_go = flags & SPTM_VIRT_S2R_GO;
     s2r_fulltrace = flags & SPTM_VIRT_S2R_FULL;
     s2r_coproc = flags & SPTM_VIRT_S2R_COPROC;
