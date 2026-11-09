@@ -1158,6 +1158,26 @@ int smp_park_for_kernel(void)
 }
 
 /*
+ * ADT reg omits MPIDR Aff2, the core class. Above cluster 0 it is 1 (the performance cluster of
+ * an E/P chip, as on T8142). A boot core with a non-zero Aff2 gives it to every core of its own
+ * cluster-type (T6050's M cores: 4).
+ */
+static u64 smp_guest_mpidr(int i)
+{
+    const struct cpu_info *cpu = &cpu_info[i];
+    u64 aff2 = cpu->cluster ? 1 : 0, boot_aff2 = (boot_cpu_mpidr >> 16) & 0xff;
+    u32 len = 0, boot_len = 0;
+
+    if (boot_aff2 && boot_cpu_idx >= 0) {
+        const char *type = adt_getprop(adt, cpu_nodes[i], "cluster-type", &len);
+        const char *boot = adt_getprop(adt, cpu_nodes[boot_cpu_idx], "cluster-type", &boot_len);
+        if (type && boot && len && boot_len && type[0] == boot[0])
+            aff2 = boot_aff2;
+    }
+    return ((u64)cpu->cluster << 8) | cpu->core | (aff2 << 16);
+}
+
+/*
  * Under the virtualized SPTM every core enters the guest through a hardware reset, as natively:
  * XNU starts a core with PMGR CPUSTART, and a core that power-gates in idle or sleep comes back
  * the same way, at its iBoot-locked RVBAR, which must reach aura (sptm_virt_cpu_reset). So nothing
@@ -1175,8 +1195,7 @@ int smp_prepare_guest_resets(void)
         struct cpu_info *cpu = &cpu_info[i];
         if (!cpu->valid)
             continue;
-        /* ADT reg omits Aff2, which is 1 on the performance cluster (as on T8142). */
-        u64 mpidr = ((u64)cpu->cluster << 8) | cpu->core | (cpu->cluster ? BIT(16) : 0);
+        u64 mpidr = smp_guest_mpidr(i);
         u64 rvbar = read64(cpu->impl_reg);
         int rc = 0;
 
