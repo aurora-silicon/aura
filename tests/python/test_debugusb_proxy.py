@@ -351,6 +351,7 @@ static size_t seen_count;
 static bool nvme_init(void) { return true; }
 static bool nvme_has_live_post_m4_session(void) { return false; }
 static bool nvme_shutdown(void) { return true; }
+static bool nvme_io_failed(void) { return false; }
 #define CMDLINE_LENGTH_RV1 256
 #define CMDLINE_LENGTH_RV2 608
 #define CMDLINE_LENGTH_RV3 1024

@@ -38,6 +38,8 @@ static void write32(u64 reg, u32 val) { assert(!"unexpected MMIO write"); }
 static u32 read32(u64 reg) { assert(!"unexpected MMIO read"); return 0; }
 static void dma_wmb(void) { assert(!"unexpected queue publication"); }
 static void dma_rmb(void) { assert(!"unexpected queue access"); }
+static u64 get_ticks(void) { return 0; }
+static u64 ticks_to_usecs(u64 ticks) { return ticks; }
 static void *memalign(size_t align, size_t size) { assert(!"unexpected DMA allocation"); return NULL; }
 ''' + execute + read + r'''
 int main(void)
