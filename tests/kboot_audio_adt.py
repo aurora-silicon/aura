@@ -60,14 +60,36 @@ def amp(name, addr, phandle, extra=None):
     return Node(name, props)
 
 
-def adt(buses):
-    return Node("device-tree", {"compatible": cstr("J000AP\0Apple")},
-                [Node("arm-io", {"compatible": cstr("arm-io")}, buses)])
+# A made-up AP GPIO controller: /arm-io maps its child address 0 to GPIO_MMIO
+GPIO_PHANDLE = 0x80
+GPIO_MMIO = 0x200000000
+GPIO_REG = 0x1000000
+GPIO_NPINS = 0xC8
+GPIO_BASE = GPIO_MMIO + GPIO_REG
 
 
-def dts(amps, stale=None):
+def gpio_controller(phandle=GPIO_PHANDLE, compat="gpio,t8101"):
+    return Node("gpio0", {
+        "compatible": cstr(compat),
+        "reg": struct.pack("<QQ", GPIO_REG, 0x4000),
+        "#gpio-pins": u32(GPIO_NPINS),
+        "AAPL,phandle": u32(phandle),
+        "role": cstr("AP"),
+    })
+
+
+def adt(buses, extra=None):
+    arm_io = {"compatible": cstr("arm-io"), "#address-cells": u32(2), "#size-cells": u32(2),
+              "ranges": struct.pack("<QQQ", 0, GPIO_MMIO, 0x100000000)}
+    return Node("device-tree", {"compatible": cstr("J000AP\0Apple"), "#address-cells": u32(2),
+                                "#size-cells": u32(2)},
+                [Node("arm-io", arm_io, [gpio_controller()] + (extra or []) + buses)])
+
+
+def dts(amps, stale=None, chosen=""):
     """A device tree with one ti,sn012776 node per (bus, addr); stale: {(bus, addr): props}"""
-    out = ["/dts-v1/;", "/ {", "\t#address-cells = <2>;", "\t#size-cells = <2>;"]
+    out = ["/dts-v1/;", "/ {", "\t#address-cells = <2>;", "\t#size-cells = <2>;",
+           "\tchosen { %s};" % chosen]
     buses = sorted({b for b, _ in amps})
     for b in buses:
         out += ["\ti2c@%x {" % (0x100000 * (b + 1)), "\t\treg = <0x0 0x%x 0x0 0x4000>;" %
@@ -95,8 +117,56 @@ ROWS6 = bytes(b for i in range(6) for b in (0x60 + i, 0x70 + i, 0x80 + i, 0x90 +
 ZD6 = bytes(range(0x30, 0x30 + 48))
 
 
+def strap(pin, flags=0x100, phandle=GPIO_PHANDLE, fourcc=b"GPIO"):
+    return u32(phandle) + struct.pack(">I", struct.unpack(">I", fourcc)[0])[::-1] + u32(pin) + \
+        u32(flags)
+
+
+def speaker_group(straps, valid=(0, 3), find=1):
+    g = dict(GROUP3)
+    if find is not None:
+        g["find-speaker-id"] = u32(find)
+    if valid is not None:
+        g["valid-speaker-ids"] = b"".join(u32(v) for v in valid)
+    for i, st in enumerate(straps):
+        if st is not None:
+            g["function-speaker-id%d" % i] = st
+    return [Node("i2c0", {}, [amp("audio-speaker", 0x40, 0x10, g),
+                              amp("audio-speaker-b", 0x42, 0x12)]),
+            Node("i2c1", {}, [amp("audio-speaker-a", 0x41, 0x11)])]
+
+
+THREE = [(0, 0x40), (1, 0x41), (0, 0x42)]
+SPEAKER_ID_SCENARIOS = {
+    # name: (straps, valid-speaker-ids, find-speaker-id, other ADT nodes, stale chosen)
+    "speaker-id-3": ([strap(0x34), strap(0x35)], (0, 3), 1, None, ""),
+    "speaker-id-0": ([strap(0x34), strap(0x35)], (0, 3), 1, None, ""),
+    "speaker-id-not-valid": ([strap(0x34), strap(0x35)], (0, 3), 1, None, ""),
+    "speaker-id-no-input-stage": ([strap(0x34), strap(0x35)], (0, 3), 1, None, ""),
+    "speaker-id-output-pin": ([strap(0x34), strap(0x35)], (0, 3), 1, None, ""),
+    "speaker-id-peripheral-pin": ([strap(0x34), strap(0x35)], (0, 3), 1, None, ""),
+    "speaker-id-inverted": ([strap(0x34, 0x0), strap(0x35)], (0, 3), 1, None, ""),
+    "speaker-id-upper-control-bytes": ([strap(0x34, 0x10100), strap(0x35)], (0, 3), 1, None, ""),
+    "speaker-id-not-gpio": ([strap(0x34, fourcc=b"pKW4"), strap(0x35)], (0, 3), 1, None, ""),
+    "speaker-id-bad-phandle": ([strap(0x34, phandle=0x99), strap(0x35)], (0, 3), 1, None, ""),
+    "speaker-id-pin-out-of-range": ([strap(GPIO_NPINS), strap(0x35)], (0, 3), 1, None, ""),
+    "speaker-id-one-strap": ([None, strap(0x35)], (0, 2), 1, None, ""),
+    "speaker-id-no-strap-resolves": ([strap(0x34, phandle=0x99), strap(0x35, phandle=0x99)], (0, 3),
+                                     1, None, ""),
+    "speaker-id-no-valid-ids": ([strap(0x34), strap(0x35)], None, 1, None, ""),
+    "speaker-id-find-off": ([strap(0x34), strap(0x35)], (0, 3), 0, None, ""),
+    "speaker-id-find-2": ([strap(0x34), strap(0x35)], (0, 3), 2, None, ""),
+    "speaker-id-stale": ([], None, None, None, "asahi,speaker-id = <7>; "),
+    "speaker-id-third-strap-ignored": ([strap(0x30), strap(0x31), strap(0x32)], (0, 1, 5), 1, None,
+                                       ""),
+}
+
+
 def scenario(name):
     """(ADT, DTS) for one scenario"""
+    if name in SPEAKER_ID_SCENARIOS:
+        straps, valid, find, extra, chosen = SPEAKER_ID_SCENARIOS[name]
+        return adt(speaker_group(straps, valid, find), extra), dts(THREE, chosen=chosen)
     three = [(0, 0x40), (1, 0x41), (0, 0x42)]
     group = [Node("i2c0", {}, [amp("audio-speaker", 0x40, 0x10, GROUP3),
                                 amp("audio-speaker-b", 0x42, 0x12)]),
@@ -151,7 +221,7 @@ def scenario(name):
 
 
 SCENARIOS = ["group", "no-dcblocker", "six-amps", "short-speaker-config", "single-amp", "amp-missing-in-dt", "amp-not-unique-in-dt",
-             "dangling-phandle", "no-amps"]
+             "dangling-phandle", "no-amps"] + list(SPEAKER_ID_SCENARIOS)
 
 
 def from_ioreg(path):

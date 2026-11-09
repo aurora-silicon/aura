@@ -59,6 +59,13 @@ kmutil inspect -z -B "$PWD/aura-boot.macho" --show-mach-boot-properties
 
 It must report `kcbz : 0`.
 
+Enrolling a Mach-O object turns Kernel CTRR back on in the volume's LocalPolicy
+(`bputil -d`: `Kernel CTRR Status: Enabled`, `sip2` absent), even when the volume
+was set up with it off. A raw Stage 1 enrolled after that boots with `CTXR_D`
+armed from the device tree to its load base, so no secondary can run aura and
+Linux comes up on one CPU (seen on a J616s). To go back to a raw object, run
+`bputil -nc` first, then enroll it.
+
 An object wrapped this way arms only about 5 MiB of `CTXR_D`, which suits a
 proxy-only Stage 1. To boot an OS it has to be padded, as the installer does when
 it enrolls one (see [Running the OS](#running-the-os)). A Stage 2 from this tree
@@ -223,9 +230,9 @@ These worked under the monitor, or were reachable through it, except power-off:
   `CYC_OVRD` write is undefined on that chip. This comes from reading the driver and
   trees, and no boot has confirmed it.
 - **NV2 and PV-KVM.** Both are gone, and with them the only `/dev/kvm` measured on a
-  confined Mac. KVM at EL2 in the window hasn't been tried. NV2 is left only in
-  `SPTM_VIRT=1` development builds, for [the virtualized SPTM](sptm-nv2-virt.md), and
-  never runs Linux.
+  confined Mac. KVM at EL2 in the window has only been tried on a J616s (see [Status](#status)).
+  NV2 is left only in `SPTM_VIRT=1` development builds, for
+  [the virtualized SPTM](sptm-nv2-virt.md), and never runs Linux.
 
 Idle power in this mode hasn't been measured, and the J700 is fanless, so it needs
 measuring on a Neo.
@@ -246,8 +253,8 @@ Every running secondary needs `cpu-release-addr` in the kernel's tree, or
 | T605x | none                                   | no tree, so no Linux to boot      |
 
 T6040 only works if iBoot really boots it on `cpu@10100`, which the tree's comment
-says but nothing here has checked. None of this says those chips boot. It only
-means the tree doesn't rule them out.
+says. On a J616s it does (see [Status](#status)). For the other chips, none of this
+says they boot. It only means the tree doesn't rule them out.
 
 ## Status
 
@@ -259,6 +266,16 @@ at EL2 on all six CPUs from NVMe through U-Boot's `booti`, on one boot. A J616s
 (T6040) started its secondaries through the Mach-O header branch in
 aurora-silicon/aura#66, with Linux under the monitor this tree no longer has.
 
-Not tested: this code on any hardware, a 128 MiB window on hardware, the refusal
-path, idle power in this mode, restart and power-off without PSCI, and any chip
-other than T8140.
+On a J616s (T6040, system iBoot 20457.1.29, OS iBoot 18000.161.10), a 1.0.0b7
+Stage 1 padded for the 128 MiB window (kmutil: `kcbz : 0`, `kcrz : 153157632`) and
+enrolled with `--compress` starts on `cpu@10100`. Linux reaches a login at EL2 on
+all 14 CPUs through U-Boot's `booti`, and through U-Boot's EFI path to GRUB and to
+systemd-boot, the last as a daily install. execmem-confine enforces the 128 MiB
+window, and its boot verifier finds no violations. KVM runs guests on P and E
+cores, Apple TSO works (prctl from userspace and `ACTLR_EL1` in a guest), and
+restart works. The kernel also needs aurora-silicon/linux#1184. Without it,
+the boot CPU's trip through EL1 inside the window kills the boot before earlycon.
+
+Not tested: the refusal path, idle power in this mode, power-off without PSCI,
+restart without PSCI on any chip but T6040, and any chip other than T8140 and
+T6040.
