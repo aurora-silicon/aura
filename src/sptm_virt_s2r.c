@@ -106,6 +106,7 @@ u32 sptm_virt_s2r_wake_s;     /* GO, timer-only sleep: PMU RTC alarm this many s
 u32 sptm_virt_s2r_go_count;   /* GO, timer-only sleep: stop at the commit after this many wakes */
 u32 sptm_virt_s2r_usb_retake; /* 1: re-take the link after a wake; n > 1: also drop it n s in */
 u32 sptm_virt_s2r_usb_delay_ms; /* delay from XNU's return to the re-take, 0 = default */
+u32 sptm_virt_s2r_cp_skip_ans;  /* T6050 COPROC: leave ANS's own pages unhooked */
 
 static struct {
     u64 page;
@@ -1011,6 +1012,8 @@ static void s2r_t6050_coproc(bool mem)
     ADT_FOREACH_CHILD(adt, node)
     {
         const char *name = adt_get_name(adt, node);
+        if (sptm_virt_s2r_cp_skip_ans && !strcmp(name, "ans"))
+            continue;
         if (s2r_cp_compat(node, "iop,ascwrap") || s2r_cp_compat(node, "iop-sep,ascwrap")) {
             s2r_cp_reg(name, 0, "asc", 0, 0x4000);
             u64 mb = s2r_cp_reg(name, 0, "mbox", 0x8000, 0x4000);

@@ -25,6 +25,7 @@ Environment (all optional; 1 enables a switch):
   AURA_S2R_FULLTRACE       also hook the high-volume blocks
   AURA_S2R_COPROC          also hook the coprocessor and exclave mailboxes
   AURA_S2R_MEM             T6050: also hook the MCC, AMCC, DCS and coprocessor DARTs
+  AURA_S2R_CP_NO_ANS       T6050 COPROC: leave ANS's own pages unhooked
   AURA_S2R_DROP_USB        tear down aura's USB gadget at the sleep commit
   AURA_S2R_WAKE_S=<s>      GO, timer-only sleep: arm the PMU RTC alarm s seconds after the commit
   AURA_S2R_GO_COUNT=<n>    GO, timer-only sleep: after n wakes, stop in the proxy at the next commit
@@ -97,6 +98,7 @@ KNOWN_ENV = {
     "AURA_S2R_QUIESCE",
     "AURA_S2R_WAKE_S",
     "AURA_S2R_GO_COUNT",
+    "AURA_S2R_CP_NO_ANS",
     "AURA_S2R_USB_RETAKE",
     "AURA_S2R_USB_RETAKE_MS",
     "AURA_TAIL_SECS",
@@ -501,6 +503,9 @@ def configure(p, sym, plan, adt):
         p.write32(sym["sptm_virt_gpu_stop_secs"], env_int("AURA_GPU_STOP_SECS"))
     if os.environ.get("AURA_GPU_PRINT_MAX"):
         p.write32(sym["sptm_virt_gpu_print_max"], env_int("AURA_GPU_PRINT_MAX"))
+    if env_on("AURA_S2R_CP_NO_ANS"):
+        p.write32(sym["sptm_virt_s2r_cp_skip_ans"], 1)
+        print("coprocessor trace: ANS's pages left unhooked")
     if os.environ.get("AURA_S2R_GO_COUNT"):
         p.write32(sym["sptm_virt_s2r_go_count"], env_int("AURA_S2R_GO_COUNT"))
         print("stop at the commit after", os.environ["AURA_S2R_GO_COUNT"], "GO wakes")
