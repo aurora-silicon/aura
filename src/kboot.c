@@ -9543,12 +9543,13 @@ int kboot_prepare_dt(void *fdt)
             image_end = max(image_end, inherited);
     }
     /*
-     * Both post-M4 storage paths retain firmware buffers in this stage's heap. T6041 hands the
-     * live ANS over the same way (nvme.adopt=live-rtkit-v1): its RTKit buffers must stay out of
-     * Linux's allocator (J616C: ANS syslog lines in page-cache pages at the SART-allowed heap
-     * addresses).
+     * Both post-M4 storage paths retain firmware buffers in this stage's heap. T6041 and T6050
+     * hand the live ANS over the same way (nvme.adopt=live-rtkit-v1): its RTKit buffers must stay
+     * out of Linux's allocator (J616C: ANS syslog lines in page-cache pages at the SART-allowed
+     * heap addresses).
      */
-    if (chip_id == T8140 || chip_id == T6041 || chip_id == T8152 || chip_id == T8132) {
+    if (chip_id == T8140 || chip_id == T6041 || chip_id == T8152 || chip_id == T8132 ||
+        chip_id == T6050) {
         u64 ram_end, inherited = cur_boot_args.top_of_kernel_data;
         u64 high_water = heapblock_high_water();
 

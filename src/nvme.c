@@ -485,9 +485,9 @@ bool nvme_init(void)
          * On T6040/T6041 the "nvme" block really ends at 0x10000: LINEAR_SQ_CTRL and the
          * linear submission queue doorbells sit at the same offsets in the NVMMU block,
          * and the firmware enables the linear queues itself (as the Linux driver's
-         * apple,t6041-nvme-ans2 entry does).
+         * apple,t6041-nvme-ans2 entry does). T6050 has the same layout (apple,t6050-nvme-ans2).
          */
-        nvme_lsq_in_nvmmu = chip_id == T6040 || chip_id == T6041;
+        nvme_lsq_in_nvmmu = chip_id == T6040 || chip_id == T6041 || chip_id == T6050;
         u64 lsq_size = nvme_lsq_in_nvmmu ? nvmmu_size : nvme_size;
         u64 nvme_need =
             nvme_lsq_in_nvmmu ? NVME_BOOT_STATUS + sizeof(u32) : NVME_DB_LINEAR_IOSQ + sizeof(u32);
