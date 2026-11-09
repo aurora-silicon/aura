@@ -109,6 +109,7 @@ u32 sptm_virt_s2r_go_count;   /* GO, timer-only sleep: stop at the commit after 
 u32 sptm_virt_s2r_usb_retake; /* 1: re-take the link after a wake; n > 1: also drop it n s in */
 u32 sptm_virt_s2r_usb_delay_ms; /* delay from XNU's return to the re-take, 0 = default */
 u32 sptm_virt_s2r_cp_skip_ans;  /* T6050 COPROC: leave ANS's own pages unhooked */
+u32 sptm_virt_s2r_cp_ansx;      /* T6050 COPROC: S2R_CP_ANSX_* pages around ANS too */
 
 static struct {
     u64 page;
@@ -1000,6 +1001,18 @@ static u64 s2r_cp_reg(const char *name, int idx, const char *what, u64 off, u64 
     return pa + off;
 }
 
+/* The page holding reg[idx] of /arm-io/<name>, for windows that don't start on one. */
+static void s2r_cp_reg_page(const char *name, int idx, const char *what)
+{
+    char path[64];
+    int p[8];
+    u64 pa, sz;
+
+    snprintf(path, sizeof(path), "/arm-io/%s", name);
+    if (adt_path_offset_trace(adt, path, p) >= 0 && adt_get_reg(adt, p, "reg", idx, &pa, &sz) >= 0)
+        s2r_cp_range(s2r_cp_name(name, what), ALIGN_DOWN(pa, 0x4000), 0x4000);
+}
+
 static bool s2r_cp_compat(int node, const char *prefix)
 {
     u32 len;
@@ -1052,6 +1065,15 @@ static void s2r_t6050_coproc(bool mem)
     for (unsigned i = 0; i < ARRAY_SIZE(spmi); i++)
         for (int r = 0; r < 3; r++)
             s2r_cp_reg(spmi[i], r, "regs", 0, 0x4000);
+    /* ANS's storage side: its SART, the NVMe BAR's registers, the AUS5 PHY windows. */
+    if (sptm_virt_s2r_cp_ansx & S2R_CP_ANSX_SART)
+        for (int r = 0; r < 3; r++)
+            s2r_cp_reg("sart-ans", r, "regs", 0, 0x4000);
+    if (sptm_virt_s2r_cp_ansx & S2R_CP_ANSX_NVME)
+        s2r_cp_reg("ans", 9, "nvme", 0, 0x4000);
+    if (sptm_virt_s2r_cp_ansx & S2R_CP_ANSX_AUS5)
+        for (int r = 10; r < 14; r++)
+            s2r_cp_reg_page("apcie0", r, "aus5");
     if (mem) {
         /* The MCC's own pages, then each AMCC and its DCSs (amcc-reg-idx on). */
         for (int r = 0; r < 64; r++)
