@@ -39,9 +39,10 @@ u64 sptm_virt_gpu_nrec;
 volatile u64 sptm_virt_gpu_head;
 
 /* Set by the host before entry (run_guest_sptm.py). */
-u32 sptm_virt_gpu_stop_secs; /* park this long after the first GPU access; 0 = never */
-u32 sptm_virt_gpu_stop_boot_secs; /* park this long after the guest's entry, GPU or not; 0 = never */
-u64 sptm_virt_gpu_stop_msg;  /* park after a write of this value (a mailbox message); 0 = never */
+u32 sptm_virt_gpu_stop_secs;      /* park this long after the first GPU access; 0 = never */
+u32 sptm_virt_gpu_stop_boot_secs; /* park this long after the guest's entry, GPU or not; 0 = never
+                                   */
+u64 sptm_virt_gpu_stop_msg; /* park after a write of this value (a mailbox message); 0 = never */
 u32 sptm_virt_gpu_print_max = 20000;
 
 static struct {

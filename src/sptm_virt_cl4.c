@@ -150,7 +150,8 @@ static u8 sptm_world_flag(int cpu)
         if (losses++ < 16)
             printf("SPTM-virt[world LOST c%d]: memory says %u (seq %u) at %p, the register %lu "
                    "(seq %lu): %ld writes gone\n",
-                   cpu, w->world, w->seq & 0xffffff, w, r & 0xff, r >> 8, (long)(r >> 8) - (long)(w->seq & 0xffffff));
+                   cpu, w->world, w->seq & 0xffffff, w, r & 0xff, r >> 8,
+                   (long)(r >> 8) - (long)(w->seq & 0xffffff));
         if (losses == 1)
             sptm_virt_world_dump();
         w->world = r & 0xff;
@@ -222,8 +223,9 @@ void sptm_virt_world_dump(void)
     done[cpu] = true;
     printf("SPTM-virt[world dump c%d]: flag %c seq %u (register 0x%lx) HCR_EL2 0x%lx VBAR_GL12 "
            "0x%lx (host 0x%lx) SP_GL12 0x%lx VBAR_EL12 0x%lx TTBR1_EL12 0x%lx; %u events\n",
-           cpu, wn[w->world], w->seq, mrs(CTXIDR_EL2), mrs(HCR_EL2), mrs(SYS_IMP_APL_VBAR_GL12), w->host_vbar_gl12,
-           mrs(SYS_IMP_APL_SP_GL12), mrs(SYS_VBAR_EL12), mrs(SYS_TTBR1_EL12), world_hist_n[cpu]);
+           cpu, wn[w->world], w->seq, mrs(CTXIDR_EL2), mrs(HCR_EL2), mrs(SYS_IMP_APL_VBAR_GL12),
+           w->host_vbar_gl12, mrs(SYS_IMP_APL_SP_GL12), mrs(SYS_VBAR_EL12), mrs(SYS_TTBR1_EL12),
+           world_hist_n[cpu]);
     sptm_virt_world_ring(cpu, 64, debug_printf);
 }
 
@@ -324,15 +326,15 @@ void sptm_virt_pac_note(const char *where)
     int cpu = smp_id();
     /* The kernel's own returns depend on more than the IB key: APCTL carries Apple's key
      * diversification and KERNKEY is the kernel's own diversifier. */
-    u64 v[4] = {SAFE_MRS(CL4_ENC(6, 7, 2)), SAFE_MRS(CL4_ENC(6, 15, 0)),
-                SAFE_MRS(CL4_ENC(6, 2, 3)), SAFE_MRS(CL4_ENC(6, 2, 4))};
+    u64 v[4] = {SAFE_MRS(CL4_ENC(6, 7, 2)), SAFE_MRS(CL4_ENC(6, 15, 0)), SAFE_MRS(CL4_ENC(6, 2, 3)),
+                SAFE_MRS(CL4_ENC(6, 2, 4))};
 
     if (!memcmp(v, pac_last[cpu], sizeof(v)))
         return;
     memcpy(pac_last[cpu], v, sizeof(v));
     if (pac_logs++ < 64)
-        printf("SPTM-virt[pac]: cpu%d IB 0x%lx APCTL 0x%lx KERNKEY 0x%lx:0x%lx at %s\n", cpu,
-               v[0], v[1], v[2], v[3], where);
+        printf("SPTM-virt[pac]: cpu%d IB 0x%lx APCTL 0x%lx KERNKEY 0x%lx:0x%lx at %s\n", cpu, v[0],
+               v[1], v[2], v[3], where);
 }
 
 void sptm_virt_world_child_pre_enter(void)
@@ -470,7 +472,6 @@ void sptm_virt_cl4_world_exit(void)
     glx_load(w->host_glx);
     sptm_virt_world_child_post_exit();
     sysop("isb");
-
 }
 
 /*

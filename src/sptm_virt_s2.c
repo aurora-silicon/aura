@@ -526,7 +526,9 @@ void sptm_virt_s2_setup(void)
     bool link_on_usb = uartproxy_iodev >= IODEV_USB0 && uartproxy_iodev < IODEV_MAX;
     bool link_on_dockchannel = uartproxy_iodev == IODEV_DOCKCHANNEL_UART;
     printf("SPTM-virt[s2]: proxy link on iodev %d (%s); its domains are %s\n", uartproxy_iodev,
-           link_on_usb ? "USB CDC" : link_on_dockchannel ? "DockChannel" : "other",
+           link_on_usb           ? "USB CDC"
+           : link_on_dockchannel ? "DockChannel"
+                                 : "other",
            link_on_usb || link_on_dockchannel ? "kept on" : "NOT kept on");
     sptm_virt_s2r_setup(link_on_usb || link_on_dockchannel);
     sptm_virt_gpu_setup();

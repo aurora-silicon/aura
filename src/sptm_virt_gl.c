@@ -14,12 +14,12 @@
 #include "arm_cpu_regs.h"
 #include "cpu_regs.h"
 #include "exception.h"
+#include "gxf.h"
+#include "heapblock.h"
 #include "malloc.h"
 #include "memory.h"
 #include "nv2.h"
 #include "smp.h"
-#include "gxf.h"
-#include "heapblock.h"
 #include "sptm_virt_priv.h"
 #include "string.h"
 #include "utils.h"
@@ -546,8 +546,10 @@ static bool sptm_virt_gl2_sysreg(u64 *regs, u64 esr)
             if (!known && nseen[r] < 8) {
                 seen[r][nseen[r]++] = v;
                 printf("SPTM-virt[el2ctl]: SPTM writes %s = 0x%lx (in %s) at pc 0x%lx\n",
-                       r == 0 ? "CPTR_EL2" : r == 1 ? "MDCR_EL2" : "HACR_EL2", v,
-                       sptm_virt_in_cl4() ? "cL4" : "host", mrs(ELR_EL1));
+                       r == 0   ? "CPTR_EL2"
+                       : r == 1 ? "MDCR_EL2"
+                                : "HACR_EL2",
+                       v, sptm_virt_in_cl4() ? "cL4" : "host", mrs(ELR_EL1));
             }
         }
     }
@@ -723,8 +725,8 @@ static bool sptm_virt_guarded_gexit(u64 *regs)
     sptm_virt_world_ev(SPTM_WEV_GEXIT, pc, target);
     static u32 n_other;
     if (n++ < 16 || (el != 2 && n_other++ < 32))
-        printf("SPTM-virt[gexit#%u c%d]: pc=0x%lx -> 0x%lx el%u%c ps=0x%lx (%s) from spsr 0x%lx\n", n,
-               smp_id(), pc, target, el, (m & 1) ? 'h' : 't', pstate,
+        printf("SPTM-virt[gexit#%u c%d]: pc=0x%lx -> 0x%lx el%u%c ps=0x%lx (%s) from spsr 0x%lx\n",
+               n, smp_id(), pc, target, el, (m & 1) ? 'h' : 't', pstate,
                guarded ? "guarded" : "normal", mrs(SPSR_EL1));
     if (m & 0x10 || el == 3)
         return false;
@@ -756,7 +758,6 @@ static bool sptm_virt_guarded_gexit(u64 *regs)
                        "in_xnu %d)%s\n",
                        cpu, (void *)&sptm_virt_xnu_live, (int)sptm_virt_xnu_live,
                        sptm_virt_bss_canary, (int)again, again ? " -- REVERTED" : "");
-
         }
         sptm_virt_cpu_enters_xnu(cpu);
         if (sptm_virt_flags & SPTM_VIRT_S2R)
@@ -889,9 +890,9 @@ bool sptm_virt_gl_sync(u64 *regs, u64 esr, u64 elr, u64 spsr)
         static u32 n_el0, n_impdef;
         bool from_el0 = elsp == SPSR_M_EL0;
         if ((from_el0 && n_el0++ < 32) || (ec == ESR_EC_IMPDEF && iss != 0x22 && n_impdef++ < 32))
-            printf("SPTM-virt[gltrap c%d]: from %s ec 0x%x iss 0x%x pc 0x%lx spsr 0x%lx aspsr 0x%lx\n",
-                   smp_id(), from_el0 ? "GL0" : "GL1", ec, iss, elr, spsr,
-                   mrs(SYS_IMP_APL_ASPSR_GL1));
+            printf(
+                "SPTM-virt[gltrap c%d]: from %s ec 0x%x iss 0x%x pc 0x%lx spsr 0x%lx aspsr 0x%lx\n",
+                smp_id(), from_el0 ? "GL0" : "GL1", ec, iss, elr, spsr, mrs(SYS_IMP_APL_ASPSR_GL1));
     }
 
     if (elsp != SPSR_M_EL1H && elsp != SPSR_M_EL1T)
@@ -908,8 +909,8 @@ bool sptm_virt_gl_sync(u64 *regs, u64 esr, u64 elr, u64 spsr)
         bool pc_cl4 = (elr >> 40) == 0xfffffcUL;
         bool pc_sptm = (elr >> 40) == 0xfffffeUL;
         if (((pc_cl4 && !sptm_virt_in_cl4()) || (pc_sptm && sptm_virt_in_cl4())) && n_mis++ < 16) {
-            printf("SPTM-virt[world?]: trap ec 0x%x from %s pc 0x%lx, but aura's world is %s\n",
-                   ec, pc_cl4 ? "cL4" : "SPTM", elr, sptm_virt_in_cl4() ? "cL4" : "host");
+            printf("SPTM-virt[world?]: trap ec 0x%x from %s pc 0x%lx, but aura's world is %s\n", ec,
+                   pc_cl4 ? "cL4" : "SPTM", elr, sptm_virt_in_cl4() ? "cL4" : "host");
             sptm_virt_world_dump();
         }
     }
@@ -994,9 +995,10 @@ static void sptm_virt_el2_timer_check(void)
     if (!p_on && !v_on)
         return;
     if (reports++ < 16)
-        printf("SPTM-virt[timer c%d]: aura's EL2 %s timer armed in the host world (ctl 0x%lx/0x%lx); "
-               "disarmed\n",
-               smp_id(), p_on ? "physical" : "virtual", p, v);
+        printf(
+            "SPTM-virt[timer c%d]: aura's EL2 %s timer armed in the host world (ctl 0x%lx/0x%lx); "
+            "disarmed\n",
+            smp_id(), p_on ? "physical" : "virtual", p, v);
     if (p_on)
         msr(CNTP_CTL_EL0, 0);
     if (v_on)
@@ -1035,10 +1037,10 @@ static void sptm_virt_trap_delay(u32 ec, u32 iss)
     if (!sptm_virt_trap_delay_ns)
         return;
     u32 cls = ec == ESR_EC_IMPDEF ? (iss == 0x22 ? 0 : 2)
-              : ec == 0x1a       ? 1
-              : ec == ESR_EC_MSR ? ((iss & 0x3ffc1e) == 0x33bc16 ? 3 : 6) /* s3_6_c15_c11_1 */
-              : ec == ESR_EC_HVC ? 4
-                                 : 5;
+              : ec == 0x1a        ? 1
+              : ec == ESR_EC_MSR  ? ((iss & 0x3ffc1e) == 0x33bc16 ? 3 : 6) /* s3_6_c15_c11_1 */
+              : ec == ESR_EC_HVC  ? 4
+                                  : 5;
     if (!(sptm_virt_trap_delay_mask & BIT(cls)))
         return;
     u64 end = mrs(CNTPCT_EL0) + mrs(CNTFRQ_EL0) / 1000000 * sptm_virt_trap_delay_ns / 1000;
@@ -1099,7 +1101,8 @@ static bool sptm_virt_wfe_watched(u64 *regs, u64 esr)
     if (!t_last)
         t_last = now;
     if (now - t_last >= 10 * f) {
-        printf("SPTM-virt[wfe c%d]: %lu WFEs in the last %lu s (%lu in all), pc 0x%lx lr 0x%lx x0 0x%lx\n",
+        printf("SPTM-virt[wfe c%d]: %lu WFEs in the last %lu s (%lu in all), pc 0x%lx lr 0x%lx x0 "
+               "0x%lx\n",
                smp_id(), n - n_last, (now - t_last) / f, n, pc, regs[30], regs[0]);
         u64 fp = regs[29];
         for (int i = 0; i < 10 && fp; i++) {
