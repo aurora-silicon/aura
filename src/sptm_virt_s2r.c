@@ -38,12 +38,14 @@
 #include "spmi.h"
 #include "sptm_virt_priv.h"
 #include "sptm_virt_s2r_soc.h"
+#include "s2r_dcp_pkt.h"
 #include "string.h"
 #include "types.h"
 #include "uartproxy.h"
 #include "usb.h"
 #include "usb_cdc_atc.h"
 #include "utils.h"
+#include "xnuboot.h"
 
 #define S2R_RING_BYTES     (8UL << 20)
 #define S2R_RING_BYTES_BIG (64UL << 20) /* a whole sleep entry; 8 MiB if the heap is short */
@@ -909,6 +911,18 @@ static u64 s2r_cp_cut(u64 addr, u64 v, int width)
     return v;
 }
 
+/* T6050 COPROC: a raw record for s2r_dcp_pkt.c, whose packet bytes go in the ring as they pass. */
+void sptm_virt_s2r_rec_raw(u64 pa, u64 val, u64 tag, bool write)
+{
+    struct s2r_rec *r = s2r_slot();
+    if (!r)
+        return;
+    r->t = mrs(CNTPCT_EL0);
+    r->meta = S2R_META(pa, 3, write, smp_id(), 0);
+    r->val = val;
+    r->pc = tag;
+}
+
 static bool s2r_cp_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int width)
 {
     if (width == 4 || width == 5) {
@@ -918,12 +932,14 @@ static bool s2r_cp_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, in
             sptm_virt_s2r_note(ctx, a, s2r_cp_cut(a, val[2 * h], 3), write, 3);
             sptm_virt_s2r_note(ctx, a + 8, s2r_cp_cut(a + 8, val[2 * h + 1], 3), write, 3);
         }
+        s2r_dcp_watch(addr, val, 4);
         return true;
     }
     if (width < 0 || width > 3)
         return false;
     sptm_virt_mmio_rw(addr, val, write, width);
     sptm_virt_s2r_note(ctx, addr, s2r_cp_cut(addr, *val, width), write, width);
+    s2r_dcp_watch(addr, val, width);
     return true;
 }
 
@@ -1018,6 +1034,8 @@ static void s2r_t6050_coproc(bool mem)
             s2r_cp_reg(name, 0, "asc", 0, 0x4000);
             u64 mb = s2r_cp_reg(name, 0, "mbox", 0x8000, 0x4000);
             s2r_cp_reg(name, 1, "wrap", 0, 0x4000);
+            if (!strncmp(name, "dcp", 3) && mb)
+                s2r_dcp_add(name, mb);
             if (!strcmp(name, "sep"))
                 s2r_sep_mbox = mb;
             if (!strcmp(name, "smc"))
