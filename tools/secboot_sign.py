@@ -10,6 +10,8 @@
   secboot_sign.py sign-image --key K [--secver V] <in> <out>
         append an aura_sig record and the AURSIGT1 footer that cover the whole image, for the
         stage that chainloads it
+  secboot_sign.py fill-keys --pub P [--pub P2 ...] [--min-secver V] <stage1-in> <stage1-out>
+        fill the AURORA-S1-KEY01 block of a Stage 1 image (up to 4 keys) before kmutil enrols it
   secboot_sign.py verify --pub P <file> [--head-len N]
         check either form and print the verdict, the key id and the SHA-256
 
@@ -21,6 +23,7 @@ import hashlib
 import os
 import struct
 import sys
+import zlib
 
 # --- RFC 8032 Ed25519 (reference) ---------------------------------------------------------------
 p = 2**255 - 19
@@ -186,6 +189,11 @@ def main():
             s.add_argument("--head-len", type=lambda x: int(x, 0), required=True)
         s.add_argument("inp")
         s.add_argument("out")
+    f = sub.add_parser("fill-keys")
+    f.add_argument("--pub", action="append", required=True)
+    f.add_argument("--min-secver", type=int, default=0)
+    f.add_argument("inp")
+    f.add_argument("out")
     v = sub.add_parser("verify")
     v.add_argument("--pub")
     v.add_argument("--head-len", type=lambda x: int(x, 0))
@@ -223,6 +231,22 @@ def main():
         rec, digest = make_record(read_seed(a.key), data, a.secver)
         open(a.out, "wb").write(data + rec + struct.pack("<Q", len(data)) + FOOTER)
         print(f"image 0x{len(data):x} bytes sha256 {digest.hex()} key {key_id(pubkey(read_seed(a.key))).hex()} secver {a.secver}")
+    elif a.cmd == "fill-keys":
+        img = open(a.inp, "rb").read()
+        magic = b"AURORA-S1-KEY01\0"
+        if img.count(magic) != 1:
+            sys.exit("the Stage 1 key block magic must occur exactly once (SECBOOT=audit/enforce Stage 1)")
+        keys = [open(k, "rb").read() for k in a.pub]
+        if not 1 <= len(keys) <= 4 or any(len(k) != 32 for k in keys):
+            sys.exit("want 1..4 raw 32-byte Ed25519 public keys")
+        off = img.index(magic) + 16
+        if struct.unpack_from("<I", img, off)[0] != 1:
+            sys.exit("unsupported key block version")
+        body = struct.pack("<IIII", 1, len(keys), a.min_secver, 0) + b"".join(keys).ljust(128, b"\0")
+        out = img[:off] + body + struct.pack("<I", zlib.crc32(body)) + img[off + len(body) + 4:]
+        assert len(out) == len(img)
+        open(a.out, "wb").write(out)
+        print("keys " + " ".join(key_id(k).hex() for k in keys) + f" min-secver {a.min_secver} sha256 {hashlib.sha256(out).hexdigest()}")
     elif a.cmd == "verify":
         data = open(a.file, "rb").read()
         pub = open(a.pub, "rb").read() if a.pub else None

@@ -22,6 +22,7 @@
 #include "utils.h"
 
 #include "libfdt/libfdt.h"
+#include "tinf/tinf.h"
 
 #if defined(SECBOOT_ENFORCE) || defined(SECBOOT_AUDIT)
 #include "../build/secboot_key.h" /* secboot_pubkey[32], from SECBOOT_PUBKEY */
@@ -138,14 +139,76 @@ void secboot_measure(const char *component, const void *data, size_t size,
 }
 
 #ifdef SECBOOT_CHECKS
+#if defined(CHAINLOADING) && !defined(ESP_STAGE2)
+/*
+ * Keys an installer fills into a Stage 1 image before it is enrolled, so they are covered by the
+ * LocalPolicy's coih like the rest of the image (tools/secboot_sign.py fill-keys). An unfilled
+ * block leaves the built-in key in charge.
+ */
+#define KEY_BLOCK_KEYS 4
+struct secboot_key_block {
+    char magic[16];
+    u32 version;
+    u32 count;
+    u32 min_security_version;
+    u32 flags;
+    u8 keys[KEY_BLOCK_KEYS][32];
+    u32 crc32;
+};
+_Static_assert(sizeof(struct secboot_key_block) == 164, "secboot key block layout changed");
+
+static struct secboot_key_block key_block __attribute__((section(".data.stage1_config"), used)) = {
+    .magic = "AURORA-S1-KEY01",
+    .version = 1,
+};
+
+static bool key_block_valid(void)
+{
+    static int valid = -1;
+    if (valid < 0) {
+        u32 crc = tinf_crc32(&key_block.version, offsetof(struct secboot_key_block, crc32) -
+                                                     offsetof(struct secboot_key_block, version));
+        valid = key_block.version == 1 && key_block.count >= 1 &&
+                key_block.count <= KEY_BLOCK_KEYS && crc == key_block.crc32;
+        if (key_block.count && !valid)
+            printf("secboot: the Stage 1 key block is damaged; using the built-in key\n");
+    }
+    return valid;
+}
+#endif
+
+/* The trusted key whose id the record names, and the floor for its security version. */
+static const u8 *trusted_key(const u8 *record, u32 *min_secver)
+{
+    *min_secver = SECBOOT_MIN_SECURITY_VERSION;
+#if defined(CHAINLOADING) && !defined(ESP_STAGE2)
+    if (key_block_valid()) {
+        if (key_block.min_security_version > *min_secver)
+            *min_secver = key_block.min_security_version;
+        for (u32 i = 0; i < key_block.count; i++) {
+            u8 id[32];
+            aura_sha256(key_block.keys[i], 32, id);
+            if (!memcmp(id, record + SIG_TAG_LEN + 4 + 32, 8))
+                return key_block.keys[i];
+        }
+        return key_block.keys[0]; /* reported as unknown-key */
+    }
+#else
+    UNUSED(record);
+#endif
+    return secboot_pubkey;
+}
+
 static enum secboot_verdict check_record(const u8 *record, size_t record_size, const u8 *covered,
                                          size_t covered_len, struct measurement *m)
 {
     if (record_size < SIG_TAG_LEN + 4 + SIG_BODY)
         return SECBOOT_BAD_FORMAT;
+    u32 min_secver;
+    const u8 *key = trusted_key(record, &min_secver);
     u32 v = aura_secboot_verify(record + SIG_TAG_LEN + 4, record_size - SIG_TAG_LEN - 4, covered,
-                                covered_len, secboot_pubkey, SECBOOT_MIN_SECURITY_VERSION,
-                                m->sha256, &m->security_version, m->key_id);
+                                covered_len, key, min_secver, m->sha256, &m->security_version,
+                                m->key_id);
     m->signed_record = true;
     return v <= SECBOOT_ROLLBACK ? (enum secboot_verdict)v : SECBOOT_BAD_FORMAT;
 }

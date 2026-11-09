@@ -42,3 +42,23 @@ def test_refuses_forged_measurement_lines(tmp_path):
     src = tmp_path / "s.bin"
     src.write_bytes(b"\0" * 0x4000 + b"chosen.aurora,measure-0=stage1;enforce;x;verified\n")
     assert run("sign-image", "--key", KEY, src, tmp_path / "o.bin").returncode != 0
+
+
+def test_fill_keys(tmp_path):
+    import struct
+    import zlib
+    block = b"AURORA-S1-KEY01\0" + struct.pack("<IIII", 1, 0, 0, 0) + bytes(128) + bytes(4)
+    src = tmp_path / "s1.bin"
+    src.write_bytes(b"head" + block + b"STACKBOT")
+    out = tmp_path / "s1-filled.bin"
+    r = run("fill-keys", "--pub", PUB, "--pub", PUB, "--min-secver", 7, src, out)
+    assert r.returncode == 0, r.stderr
+    d = out.read_bytes()
+    assert len(d) == src.stat().st_size and d.endswith(b"STACKBOT")
+    body = d[4 + 16:4 + 16 + 144]
+    assert struct.unpack_from("<IIII", body) == (1, 2, 7, 0)
+    assert body[16:48] == PUB.read_bytes()
+    assert struct.unpack_from("<I", d, 4 + 160)[0] == zlib.crc32(body)
+    assert run("fill-keys", "--pub", PUB, out, tmp_path / "x").returncode == 0  # refill is fine
+    src.write_bytes(b"no block here")
+    assert run("fill-keys", "--pub", PUB, src, tmp_path / "y").returncode != 0

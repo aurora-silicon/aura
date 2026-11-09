@@ -16,6 +16,21 @@ Both are build options; a default build only writes the record.
 - `SECBOOT_MIN_SECURITY_VERSION` (a `-D` define): the lowest security version
   a signature may carry. Signatures below it are refused as rollbacks.
 
+## Keys in a Stage 1 image
+
+A Stage 1 built with `SECBOOT=audit` or `enforce` also carries an
+`AURORA-S1-KEY01` block: up to four Ed25519 public keys and a minimum
+security version, filled before `kmutil` enrols the image, so the
+LocalPolicy's `coih` covers them like the rest of Stage 1:
+`secboot_sign.py fill-keys --pub owner.pub [--pub aurora.pub] --min-secver N in out`.
+A record is checked with the key whose id it names. An unfilled block leaves
+the built-in key in charge; a damaged one is reported and ignored.
+
+Under `enforce` no aura stage gives a USB host the proxy: not the configured
+or `aura-proxy` window, not the recovery window after a failed boot, not the
+DebugUSB window, and not the fallback when no payload starts (it leaves a
+message on the panel instead).
+
 ## Signature forms
 
 Both are made and checked with `tools/secboot_sign.py`.
