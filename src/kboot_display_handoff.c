@@ -3544,18 +3544,22 @@ static T6050_TEXT int t6050_ext_one(void *dt, int n)
     if (!mreg || len < 16 || fdt64_ld(&mreg[0]) != coproc + T6050_MBOX)
         bail("dcpext%d: mboxes is not the ASC mailbox\n", n);
 
-    /* Offsets move as properties grow: each target by its phandle again */
-    u32 ph[4] = {fdt_get_phandle(dt, node), fdt_get_phandle(dt, mbox), fdt_get_phandle(dt, dart[0]),
-                 fdt_get_phandle(dt, dart[1])};
-    if (firmware_set_fdt(dt, node, "apple,firmware-version", &os_firmware) ||
-        firmware_set_fdt(dt, fdt_node_offset_by_phandle(dt, ph[0]), "apple,firmware-compat",
+    /* Offsets move as properties grow: each target by its exact path again */
+    char path[4][T6050_PATH];
+    int targets[4] = {node, mbox, dart[0], dart[1]};
+    for (int i = 0; i < 4; i++)
+        if (fdt_get_path(dt, targets[i], path[i], T6050_PATH))
+            return -1;
+    if (firmware_set_fdt(dt, kboot_fdt_path_exact(dt, path[0]), "apple,firmware-version",
                          &os_firmware) ||
-        fdt_setprop(dt, fdt_node_offset_by_phandle(dt, ph[0]), "apple,firmware-uuid",
-                    T6050_DCP_UUID, sizeof(T6050_DCP_UUID)) ||
-        fdt_setprop(dt, fdt_node_offset_by_phandle(dt, ph[0]), "apple,bw-scratch", v, sizeof(v)))
+        firmware_set_fdt(dt, kboot_fdt_path_exact(dt, path[0]), "apple,firmware-compat",
+                         &os_firmware) ||
+        fdt_setprop(dt, kboot_fdt_path_exact(dt, path[0]), "apple,firmware-uuid", T6050_DCP_UUID,
+                    sizeof(T6050_DCP_UUID)) ||
+        fdt_setprop(dt, kboot_fdt_path_exact(dt, path[0]), "apple,bw-scratch", v, sizeof(v)))
         return -1;
     for (int i = 0; i < 4; i++)
-        if (!ph[i] || fdt_setprop_string(dt, fdt_node_offset_by_phandle(dt, ph[i]), "status", "okay"))
+        if (fdt_setprop_string(dt, kboot_fdt_path_exact(dt, path[i]), "status", "okay"))
             return -1;
     dlog("dcpext%d handed off: bw-scratch 0x%x\n", n, bw);
     return 0;
