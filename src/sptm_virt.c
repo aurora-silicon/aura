@@ -189,9 +189,14 @@ u64 sptm_virt_iboot_end(void)
 {
     int node = adt_path_offset(adt, "/chosen/carveout-memory-map");
     u32 len = 0;
-    const u64 *r = node >= 0 ? adt_getprop(adt, node, "region-id-24", &len) : NULL;
+    const void *p = node >= 0 ? adt_getprop(adt, node, "region-id-24", &len) : NULL;
+    u64 r[2];
 
-    return r && len == 16 ? r[0] + r[1] : 0;
+    /* ADT values are only 4-byte aligned, and this runs with the MMU off (heapblock_init) */
+    if (!p || len != sizeof(r))
+        return 0;
+    memcpy(r, p, sizeof(r));
+    return r[0] + r[1];
 }
 
 static int sptm_virt_layout_low(u64 ram_base, struct sptm_virt_layout *out)
