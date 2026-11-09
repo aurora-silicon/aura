@@ -51,9 +51,10 @@ struct sptm_virt_placement {
 #define SPTM_VIRT_SAMPLE       BIT(7) /* sample the guest's PC until its XNU entry */
 #define SPTM_VIRT_S2R_MEM      BIT(8) /* T6050: also hook the MCC and the coprocessor DARTs */
 /* sptm_virt_s2r_cp_ansx, with COPROC on T6050 */
-#define S2R_CP_ANSX_SART BIT(0) /* sart-ans reg[0-2], first page each */
-#define S2R_CP_ANSX_NVME BIT(1) /* the NVMe BAR's first page (reg[9]) */
-#define S2R_CP_ANSX_AUS5 BIT(2) /* apcie0 reg[10-13], the AUS5 TOP/AON windows */
+#define S2R_CP_ANSX_SART  BIT(0) /* sart-ans reg[0-2], first page each */
+#define S2R_CP_ANSX_NVME  BIT(1) /* the NVMe BAR's first page (reg[9]) */
+#define S2R_CP_ANSX_AUS5  BIT(2) /* apcie0 reg[10-13], the AUS5 TOP/AON windows */
+#define S2R_CP_ANSX_QUIET BIT(3) /* with SART: don't record the NVMe per-I/O writes */
 
 /*
  * Code with no room left in .text or .init (each sits just under its next 64 KiB step). aura maps

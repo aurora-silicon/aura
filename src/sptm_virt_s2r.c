@@ -110,6 +110,8 @@ u32 sptm_virt_s2r_usb_retake; /* 1: re-take the link after a wake; n > 1: also d
 u32 sptm_virt_s2r_usb_delay_ms; /* delay from XNU's return to the re-take, 0 = default */
 u32 sptm_virt_s2r_cp_skip_ans;  /* T6050 COPROC: leave ANS's own pages unhooked */
 u32 sptm_virt_s2r_cp_ansx;      /* T6050 COPROC: S2R_CP_ANSX_* pages around ANS too */
+/* S2R_CP_ANSX_QUIET: XNU's NVMe registers (sart-ans reg[2]); per-I/O writes are only counted */
+static u64 s2r_nvme_quiet_page, s2r_nvme_quiet_n;
 
 static struct {
     u64 page;
@@ -571,6 +573,8 @@ static void __attribute__((noreturn)) s2r_stop_before_timer(struct exc_info *ctx
            "performed (stop mode). TWI armed 0x%x, parked 0x%x, %lu records. Stopping in the "
            "proxy.\n",
            smp_id(), addr, val, ctx->elr, s2r_twi_mask, s2r_parked_mask, sptm_virt_s2r_head);
+    if (s2r_nvme_quiet_page)
+        printf("SPTM-virt[s2r]: %lu NVMe per-I/O writes not recorded\n", s2r_nvme_quiet_n);
     sptm_virt_s2r_dump_tail(4096);
     struct uartproxy_msg_start start = {
         .reason = START_HV,
@@ -924,6 +928,15 @@ void sptm_virt_s2r_rec_raw(u64 pa, u64 val, u64 tag, bool write)
     r->pc = tag;
 }
 
+/* INTMS, INTMC and the doorbells: written for every I/O, they would fill the ring */
+static bool s2r_nvme_quiet(u64 addr, bool write)
+{
+    u64 off = addr - s2r_nvme_quiet_page;
+
+    return write && s2r_nvme_quiet_page && off < 0x2000 &&
+           (off == 0xc || off == 0x10 || off >= 0x1000);
+}
+
 static bool s2r_cp_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int width)
 {
     if (width == 4 || width == 5) {
@@ -939,6 +952,10 @@ static bool s2r_cp_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, in
     if (width < 0 || width > 3)
         return false;
     sptm_virt_mmio_rw(addr, val, write, width);
+    if (s2r_nvme_quiet(addr, write)) {
+        __atomic_fetch_add(&s2r_nvme_quiet_n, 1, __ATOMIC_RELAXED);
+        return true;
+    }
     sptm_virt_s2r_note(ctx, addr, s2r_cp_cut(addr, *val, width), write, width);
     s2r_dcp_watch(addr, val, width);
     return true;
@@ -1067,8 +1084,11 @@ static void s2r_t6050_coproc(bool mem)
             s2r_cp_reg(spmi[i], r, "regs", 0, 0x4000);
     /* ANS's storage side: its SART, the NVMe BAR's registers, the AUS5 PHY windows. */
     if (sptm_virt_s2r_cp_ansx & S2R_CP_ANSX_SART)
-        for (int r = 0; r < 3; r++)
-            s2r_cp_reg("sart-ans", r, "regs", 0, 0x4000);
+        for (int r = 0; r < 3; r++) {
+            u64 pa = s2r_cp_reg("sart-ans", r, "regs", 0, 0x4000);
+            if (r == 2 && (sptm_virt_s2r_cp_ansx & S2R_CP_ANSX_QUIET))
+                s2r_nvme_quiet_page = pa;
+        }
     if (sptm_virt_s2r_cp_ansx & S2R_CP_ANSX_NVME)
         s2r_cp_reg("ans", 9, "nvme", 0, 0x4000);
     if (sptm_virt_s2r_cp_ansx & S2R_CP_ANSX_AUS5)
