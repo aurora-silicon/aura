@@ -306,9 +306,10 @@ AURA_XTEXT int sptm_virt_esp_boot(const char *spec)
     printf("macOS ESP: manifest for %s, %u patches, trace 0x%lx\n", m->build, m->npatch, m->trace);
 
     /* Everything is read and checked before the first write to RAM SPTM will own. */
-    /* Staged downward from the window's top; the blob, laid out from its bottom, must stay below
-     * (checked once the plan is known). A slot never reaches below the window's first 4 GiB. */
-    ef.stage = place.managed_end;
+    /* Staged downward from the window's top, below the MTE tag storage, its top 512 MiB (file bytes
+     * there are read as tags: "Kernel tag check fault", runs k2, k3); the blob, laid out from the
+     * window's bottom, must stay below them. A slot never reaches below the first 4 GiB. */
+    ef.stage = place.managed_end - (sptm_virt_mte() ? 512UL << 20 : 0);
     for (int i = 0; i < ESP_NIMG; i++)
         if (m->file[i].present &&
             esp_load_file(uuid, dir, &m->file[i], i, place.managed_base + (4UL << 30)))
