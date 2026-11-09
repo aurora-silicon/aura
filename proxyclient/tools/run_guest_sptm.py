@@ -415,8 +415,10 @@ def debug_port(adt, proxy_phy=0, port=None):
         walk(kid, "", None)
     by_ph = {_u32(pr["AAPL,phandle"]): h for h, pr in nodes.items() if "AAPL,phandle" in pr}
 
-    def device(h):  # the /arm-io device (or I2C device) a node belongs to
-        while h.count("/") > (3 if h.startswith("/arm-io/i2c") else 2):
+    def device(h):  # the /arm-io device, or the device on an I2C or SPMI bus, a node belongs to
+        # A port controller can sit on an SPMI bus with the PMU; the bus itself stays.
+        bus_child = h.startswith(("/arm-io/i2c", "/arm-io/nub-spmi", "/arm-io/aop-spmi"))
+        while h.count("/") > (3 if bus_child else 2):
             h = parent[h]
         return h
 
