@@ -23,4 +23,12 @@ typedef int64_t s64;
 #define HAVE_UINTPTR_T 1
 #define UPTRDIFF_T     uintptr_t
 
+#define PACKED __attribute__((packed))
+
+#define BIT(x)                 (1UL << (x))
+#define GENMASK(msb, lsb)      ((BIT((msb + 1) - (lsb)) - 1) << (lsb))
+#define _FIELD_LSB(field)      ((field) & ~(field - 1))
+#define FIELD_PREP(field, val) (((val) * (_FIELD_LSB(field))) & (field))
+#define FIELD_GET(field, val)  (((val) & (field)) / _FIELD_LSB(field))
+
 #endif
