@@ -124,31 +124,52 @@ pin() { # pin <pin> <register> <pad level>: one KBOOT_AUDIO_GPIO entry
 gpio_env() { # gpio_env <scenario>: the pins that scenario models
     case $1 in
     speaker-id-3|speaker-id-not-gpio|speaker-id-bad-phandle|speaker-id-pin-out-of-range|\
-    speaker-id-no-valid-ids|speaker-id-find-off|speaker-id-unknown-flags)
+    speaker-id-no-valid-ids|speaker-id-find-off|speaker-id-find-2|speaker-id-upper-control-bytes|\
+    speaker-id-no-strap-resolves)
         echo "$(pin 0x34 $IN 1),$(pin 0x35 $IN 1)" ;;
     speaker-id-0) echo "$(pin 0x34 $IN 0),$(pin 0x35 $IN 0)" ;;
     speaker-id-not-valid) echo "$(pin 0x34 $IN 1),$(pin 0x35 $IN 0)" ;;
-    speaker-id-no-input-stage) echo "$(pin 0x34 0 1),$(pin 0x35 0 1)" ;;
+    speaker-id-no-input-stage) echo "$(pin 0x34 0 1),$(pin 0x35 0x00000180 1)" ;;
     speaker-id-output-pin) echo "$(pin 0x34 0x2 1),$(pin 0x35 $IN 1)" ;;
-    speaker-id-active-low) echo "$(pin 0x34 $IN 0),$(pin 0x35 $IN 1)" ;;
-    speaker-id-three-straps) echo "$(pin 0x30 $IN 1),$(pin 0x31 $IN 0),$(pin 0x32 $IN 1)" ;;
+    speaker-id-peripheral-pin) echo "$(pin 0x34 0x0000022e 1),$(pin 0x35 $IN 1)" ;;
+    speaker-id-inverted) echo "$(pin 0x34 $IN 0),$(pin 0x35 $IN 1)" ;;
+    speaker-id-one-strap) echo "$(pin 0x34 $IN 1),$(pin 0x35 $IN 1)" ;;
+    speaker-id-third-strap-ignored) echo "$(pin 0x30 $IN 1),$(pin 0x31 $IN 0),$(pin 0x32 $IN 1)" ;;
     *) echo "" ;;
     esac
 }
+left() { # left <pin> <register>: a modelled pin as the code must leave it
+    printf 'gpio 0x%x 0x%08x\n' $((GPIO + 4 * $1)) $(($2))
+}
 expect_id() { # expect_id <scenario>: the speaker-id line, then every modelled pin as left
     case $1 in
-    speaker-id-3|speaker-id-active-low) echo "speaker-id 3" ;;
+    speaker-id-3|speaker-id-inverted|speaker-id-upper-control-bytes) echo "speaker-id 3" ;;
     speaker-id-0) echo "speaker-id 0" ;;
-    speaker-id-no-input-stage) echo "speaker-id 3" ;; # switched to an input for the read only
-    speaker-id-three-straps) echo "speaker-id 5" ;;
+    # Read as plain GPIO inputs, like macOS, and left that way
+    speaker-id-no-input-stage|speaker-id-output-pin|speaker-id-peripheral-pin) echo "speaker-id 3" ;;
+    speaker-id-one-strap) echo "speaker-id 2" ;; # the missing strap reads as 0
+    speaker-id-third-strap-ignored) echo "speaker-id 1" ;; # only straps 0 and 1 count
+    # Unlisted ID, or no valid-speaker-ids: macOS publishes 65535
+    speaker-id-not-valid|speaker-id-no-valid-ids|speaker-id-not-gpio|speaker-id-bad-phandle|\
+    speaker-id-pin-out-of-range) echo "speaker-id 65535" ;;
     *) echo "speaker-id -" ;;
     esac
-    # No scenario may leave a pin changed
-    for e in $(gpio_env "$1" | tr ',' ' '); do
-        a=${e%%:*}
-        r=${e#*:}
-        printf 'gpio %s 0x%08x\n' "$a" $((${r%%:*}))
-    done
+    case $1 in
+    speaker-id-no-input-stage)
+        left 0x34 $IN
+        left 0x35 0x0000038e ;; # pull kept
+    speaker-id-output-pin)
+        left 0x34 $IN
+        left 0x35 $IN ;;
+    speaker-id-peripheral-pin) # the data bit it read back is written with the input setup
+        left 0x34 0x0000020f
+        left 0x35 $IN ;;
+    *) # pins already inputs, or never read, stay as they were
+        for e in $(gpio_env "$1" | tr ',' ' '); do
+            r=${e#*:}
+            printf 'gpio %s 0x%08x\n' "${e%%:*}" $((${r%%:*}))
+        done ;;
+    esac
 }
 
 n=0

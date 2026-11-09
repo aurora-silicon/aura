@@ -129,7 +129,8 @@ def speaker_group(straps, valid=(0, 3), find=1):
     if valid is not None:
         g["valid-speaker-ids"] = b"".join(u32(v) for v in valid)
     for i, st in enumerate(straps):
-        g["function-speaker-id%d" % i] = st
+        if st is not None:
+            g["function-speaker-id%d" % i] = st
     return [Node("i2c0", {}, [amp("audio-speaker", 0x40, 0x10, g),
                               amp("audio-speaker-b", 0x42, 0x12)]),
             Node("i2c1", {}, [amp("audio-speaker-a", 0x41, 0x11)])]
@@ -143,15 +144,21 @@ SPEAKER_ID_SCENARIOS = {
     "speaker-id-not-valid": ([strap(0x34), strap(0x35)], (0, 3), 1, None, ""),
     "speaker-id-no-input-stage": ([strap(0x34), strap(0x35)], (0, 3), 1, None, ""),
     "speaker-id-output-pin": ([strap(0x34), strap(0x35)], (0, 3), 1, None, ""),
-    "speaker-id-active-low": ([strap(0x34, 0x101), strap(0x35)], (0, 3), 1, None, ""),
-    "speaker-id-unknown-flags": ([strap(0x34, 0x10100), strap(0x35)], (0, 3), 1, None, ""),
+    "speaker-id-peripheral-pin": ([strap(0x34), strap(0x35)], (0, 3), 1, None, ""),
+    "speaker-id-inverted": ([strap(0x34, 0x0), strap(0x35)], (0, 3), 1, None, ""),
+    "speaker-id-upper-control-bytes": ([strap(0x34, 0x10100), strap(0x35)], (0, 3), 1, None, ""),
     "speaker-id-not-gpio": ([strap(0x34, fourcc=b"pKW4"), strap(0x35)], (0, 3), 1, None, ""),
     "speaker-id-bad-phandle": ([strap(0x34, phandle=0x99), strap(0x35)], (0, 3), 1, None, ""),
     "speaker-id-pin-out-of-range": ([strap(GPIO_NPINS), strap(0x35)], (0, 3), 1, None, ""),
+    "speaker-id-one-strap": ([None, strap(0x35)], (0, 2), 1, None, ""),
+    "speaker-id-no-strap-resolves": ([strap(0x34, phandle=0x99), strap(0x35, phandle=0x99)], (0, 3),
+                                     1, None, ""),
     "speaker-id-no-valid-ids": ([strap(0x34), strap(0x35)], None, 1, None, ""),
     "speaker-id-find-off": ([strap(0x34), strap(0x35)], (0, 3), 0, None, ""),
+    "speaker-id-find-2": ([strap(0x34), strap(0x35)], (0, 3), 2, None, ""),
     "speaker-id-stale": ([], None, None, None, "asahi,speaker-id = <7>; "),
-    "speaker-id-three-straps": ([strap(0x30), strap(0x31), strap(0x32)], (0, 5), 1, None, ""),
+    "speaker-id-third-strap-ignored": ([strap(0x30), strap(0x31), strap(0x32)], (0, 1, 5), 1, None,
+                                       ""),
 }
 
 

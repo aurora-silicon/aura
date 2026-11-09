@@ -10,6 +10,7 @@
 #include "types.h"
 
 #define ARRAY_SIZE(s) (sizeof(s) / sizeof((s)[0]))
+#define min(a, b)     (((a) < (b)) ? (a) : (b))
 
 /* MMIO stand-ins: tests/kboot_audio_host.c models the GPIO pins a scenario names */
 u32 read32(u64 addr);
