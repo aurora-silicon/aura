@@ -16,14 +16,16 @@
 #define NVME_TIMEOUT          1000000
 #define NVME_ENABLE_TIMEOUT   5000000
 #define NVME_SHUTDOWN_TIMEOUT 5000000
+#define NVME_SUSPEND_TIMEOUT  35000 /* macOS's, from its console */
 #define NVME_QUEUE_SIZE       64
 
-#define NVME_CC            0x14
-#define NVME_CC_SHN        GENMASK(15, 14)
-#define NVME_CC_SHN_NONE   0
-#define NVME_CC_SHN_NORMAL 1
-#define NVME_CC_SHN_ABRUPT 2
-#define NVME_CC_EN         BIT(0)
+#define NVME_CC             0x14
+#define NVME_CC_SHN         GENMASK(15, 14)
+#define NVME_CC_SHN_NONE    0
+#define NVME_CC_SHN_NORMAL  1
+#define NVME_CC_SHN_ABRUPT  2
+#define NVME_CC_SHN_SUSPEND 3 /* Apple: what macOS writes before a sleep */
+#define NVME_CC_EN          BIT(0)
 
 #define NVME_CSTS             0x1c
 #define NVME_CSTS_SHST        GENMASK(3, 2)
@@ -284,6 +286,19 @@ static bool nvme_ctrl_shutdown(void)
     return FIELD_GET(NVME_CSTS_SHST, read32(nvme_base + NVME_CSTS)) == NVME_CSTS_SHST_DONE;
 }
 
+/* As macOS before a sleep: the suspend shutdown, EN kept, until CSTS reports it done. */
+static bool nvme_ctrl_suspend(void)
+{
+    u64 timeout = timeout_calculate(NVME_SUSPEND_TIMEOUT);
+
+    mask32(nvme_base + NVME_CC, NVME_CC_SHN, FIELD_PREP(NVME_CC_SHN, NVME_CC_SHN_SUSPEND));
+    while (FIELD_GET(NVME_CSTS_SHST, read32(nvme_base + NVME_CSTS)) != NVME_CSTS_SHST_DONE &&
+           !timeout_expired(timeout))
+        nvme_poll_syslog();
+
+    return FIELD_GET(NVME_CSTS_SHST, read32(nvme_base + NVME_CSTS)) == NVME_CSTS_SHST_DONE;
+}
+
 /*
  * Put an M1-M3 ANS to sleep and reset it, leaving it for the next owner to boot afresh: CPU
  * stopped, mailbox empty, block reset. The next stage (U-Boot, Linux) sets RUN and expects the
@@ -415,14 +430,18 @@ bool nvme_post_m4(void)
 }
 
 /*
- * Post-M4, done with ANS: disable the controller as M1-M3 do, idle the firmware as macOS does
- * before a sleep, keep the SART entries, then power ANS and the PCIe block it runs on off. Every
- * later stage that needs it starts it again with nvme_ans_power_on(). The firmware resumes from
- * what it saves at the idle, so the controller is disabled first, as earlier stages hand it over.
+ * Post-M4, done with ANS: stop the controller, idle the firmware as macOS does before a sleep,
+ * keep the SART entries, then power ANS and the PCIe block it runs on off. Every later stage that
+ * needs it starts it again with nvme_ans_power_on(). The firmware resumes from what it saves at
+ * the idle. On T6050 the controller step is macOS's suspend shutdown (traced); elsewhere it is
+ * disabled, as M1-M3 do.
  */
 static bool nvme_ans_power_off(void)
 {
-    if (read32(nvme_base + NVME_CC) & NVME_CC_EN) {
+    if (chip_id == T6050) {
+        if ((read32(nvme_base + NVME_CC) & NVME_CC_EN) && !nvme_ctrl_suspend())
+            printf("nvme: controller suspend timed out\n");
+    } else if (read32(nvme_base + NVME_CC) & NVME_CC_EN) {
         if (nvme_wrote && !nvme_ctrl_shutdown())
             printf("nvme: controller shutdown timed out\n");
         if (!nvme_ctrl_disable())
