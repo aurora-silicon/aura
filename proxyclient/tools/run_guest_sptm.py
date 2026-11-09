@@ -51,6 +51,9 @@ Environment (all optional; 1 enables a switch):
   AURA_WFI_WATCH=1|2       trap XNU's WFIs (2: and WFEs) and report every 10 s (idle vs. dead)
   AURA_HIDE_NODES=<a,b>    further ADT nodes to hide from the guest (comma-separated paths)
   AURA_RG_XWDT=0           leave the exclave watchdog's page unhooked (the reset guard skips it)
+  AURA_KEEP_ANE            keep /arm-io/ane and dart-ane (the exclaves' manifests name its mappers)
+  AURA_KEEP_WIFI           keep the kernelcache workaround's PCIe/Wi-Fi/Bluetooth nodes (not the
+                           debug port's): WindowServer waits on TimeSync, which needs a network port
   AURA_TRAP_DELAY_NS=<n>   spin n ns in every GL trap (workaround: holds off the ~20 s stall)
   AURA_TRAP_DELAY_MASK=<m> which GL traps spin: 1 GEXIT, 2 g-ERET, 4 IMPDEF, 8 SPTM's entry
                            sysreg read, 16 HVC, 32 rest, 64 other sysregs
@@ -125,6 +128,8 @@ KNOWN_ENV = {
     "AURA_WFI_WATCH",
     "AURA_HIDE_NODES",
     "AURA_RG_XWDT",
+    "AURA_KEEP_ANE",
+    "AURA_KEEP_WIFI",
     "AURA_TRAP_DELAY_NS",
     "AURA_TRAP_DELAY_MASK",
     "AURA_CPTR_LIVE",
@@ -726,7 +731,10 @@ def main():
     # The NVRAM device stays visible (the guest's IOKit stalls without it and its Image4 nonce
     # slots live there); its writes are patched out instead, unless AURA_SHARE_NVRAM lets them
     # through at the price of a failed boot leaving recovery-boot-mode behind.
-    hide = port_nodes + STRIP_NODES + tuple(quirks["hide"])
+    quirk_hide = tuple(quirks["hide"])
+    if env_on("AURA_KEEP_WIFI"):
+        quirk_hide = tuple(n for n in quirk_hide if n in port_nodes)
+    hide = port_nodes + (() if env_on("AURA_KEEP_ANE") else STRIP_NODES) + quirk_hide
     if not env_on("AURA_KEEP_ERRH"):
         hide += (ERROR_HANDLER,)
     if env_on("AURA_HIDE_DOCKCHANNEL"):
