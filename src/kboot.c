@@ -9063,6 +9063,7 @@ int kboot_prepare_dt(void *fdt)
     if (dt_set_speaker_safety())
         return -1;
     kboot_audio_amp_config(dt, adt);
+    kboot_audio_speaker_id(dt, adt);
     if (dt_set_uboot_config())
         return -1;
     if (dt_set_serial_number())
