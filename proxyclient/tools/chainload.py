@@ -16,9 +16,12 @@ parser.add_argument('--vector-only', action="store_true", help="Return after vec
 parser.add_argument('--capture', type=pathlib.Path, help="Write raw post-vector console bytes to this file")
 parser.add_argument('--capture-seconds', type=float, default=0, help="Seconds of raw console capture after vector")
 parser.add_argument('--relocate', action='store_true', help='Allocate a new raw-image span while retaining the live stage-1 heap')
+parser.add_argument('--reclaim-stage1-heap', action='store_true', help='After raw image replacement, reclaim the discarded Stage 1 heap; preserve native boot data and firmware')
 parser.add_argument('payload', type=pathlib.Path)
 parser.add_argument('boot_args', default=[], nargs="*")
 args = parser.parse_args()
+if args.reclaim_stage1_heap and (not args.raw or args.call or args.relocate or args.xnu):
+    parser.error('--reclaim-stage1-heap requires in-place raw replacement, not call, relocation or XNU mode')
 if args.vector_only and args.call:
     parser.error('--vector-only cannot be combined with --call')
 if args.capture and not args.vector_only:
@@ -166,7 +169,16 @@ u.push_adt()
 print("Setting up bootargs...")
 tba = u.ba.copy()
 
-tba.top_of_kernel_data = max(image_end, fw_dest + fw_size, live_heap, inherited_top, ro_end)
+retained_top = max(image_end, fw_dest + fw_size, inherited_top, ro_end)
+if args.reclaim_stage1_heap:
+    # After an in-place raw replacement Stage 1's heap is dead; the image, the firmware, the
+    # inherited boot data and the ADT stay below the new top.
+    retained_top = max(retained_top,
+                       u.ba.devtree - u.ba.virt_base + u.ba.phys_base + u.ba.devtree_size)
+tba.top_of_kernel_data = max(retained_top, 0 if args.reclaim_stage1_heap else live_heap)
+if args.reclaim_stage1_heap:
+    print(f"Reclaiming Stage 1 temporary heap after vector: inherited top 0x{inherited_top:x}, "
+          f"new top 0x{tba.top_of_kernel_data:x}, old heap high-water 0x{live_heap:x}")
 
 if len(args.boot_args) > 0:
     boot_args = " ".join(args.boot_args)
