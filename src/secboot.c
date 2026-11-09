@@ -270,7 +270,7 @@ int secboot_check_payloads(u8 *p, u8 **next)
 #endif
 }
 
-bool secboot_payload_allowed(const u8 *p)
+u8 *secboot_payload_next(u8 *p)
 {
 #ifdef SECBOOT_ENFORCE
     static const char *const loader_lines[] = {
@@ -281,19 +281,33 @@ bool secboot_payload_allowed(const u8 *p)
          */
         "chosen.", "nvme.adopt=", "aura.host-window=", "m1n1.config-lost=", NULL,
     };
-    if (!covered_end || p < covered_end)
-        return true;
-    for (const char *const *l = loader_lines; *l; l++)
-        if (!strncmp((const char *)p, *l, strlen(*l)))
-            return true;
-    /* The end of the payloads (zeros, or the SEPFW image) needs no check. */
-    if (!p[0] || !memcmp(p + 5, "\x16\x04IMG4", 6))
-        return true;
-    printf("secboot: ignoring unsigned data after the signed payloads at %p\n", p);
-    return false;
+    /*
+     * Skip what is refused instead of stopping: a stop would also drop the allowed lines after
+     * it (nvme.adopt above all, without which a T8140 never reaches its disk again).
+     */
+    while (covered_end && p >= covered_end && p[0] && memcmp(p + 5, "\x16\x04IMG4", 6)) {
+        bool ok = false;
+        for (const char *const *l = loader_lines; *l; l++)
+            if (!strncmp((const char *)p, *l, strlen(*l)))
+                ok = true;
+        if (ok)
+            return p;
+        u8 *nl = memchr(p, '\n', 2048);
+        bool text = nl && memchr(p, '=', nl - p);
+        for (u8 *c = p; text && c < nl; c++)
+            if (*c < 0x20 || *c >= 0x7f)
+                text = false;
+        if (!text) {
+            printf("secboot: ignoring unsigned data after the signed payloads at %p\n", p);
+            return NULL;
+        }
+        printf("secboot: ignoring unsigned line after the signed payloads: %.*s\n",
+               (int)min((size_t)(nl - p), (size_t)64), p);
+        p = nl + 1;
+    }
+    return p;
 #else
-    UNUSED(p);
-    return true;
+    return p;
 #endif
 }
 

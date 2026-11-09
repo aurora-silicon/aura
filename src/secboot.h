@@ -27,10 +27,11 @@ void secboot_measure(const char *component, const void *data, size_t size,
 int secboot_check_payloads(u8 *p, u8 **next);
 
 /*
- * Whether the payload scan may go on at p. After the bytes a verified record covers, an enforcing
- * stage reads only the lines an earlier aura stage appends (measurements, trial, NVMe hand-over).
+ * Where the payload scan goes on from p (p itself, or past refused lines), or NULL to stop. After
+ * the bytes a verified record covers, an enforcing stage reads only the lines an earlier aura
+ * stage appends (/chosen strings, NVMe hand-over) and skips other text lines.
  */
-bool secboot_payload_allowed(const u8 *p);
+u8 *secboot_payload_next(u8 *p);
 
 /* Whether a payload kind this stage cannot verify (ESP boot= files) may still run. */
 bool secboot_allow_unverified(const char *what);
@@ -42,7 +43,8 @@ bool secboot_allow_unverified(const char *what);
 int secboot_check_chainload(void *image, size_t *size, char **vars, size_t *var_cnt,
                             size_t var_capacity);
 
-/* Whether a USB host may get the proxy (any window, or the no-payload fallback): not under enforce. */
+/* Whether a USB host may get the proxy (any window, or the no-payload fallback): not under enforce.
+ */
 bool secboot_host_proxy_allowed(void);
 
 /* Build /chosen/aurora,boot-security in the FDT handed to the next stage. */

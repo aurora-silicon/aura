@@ -450,7 +450,7 @@ int payload_run(void)
             return -1;
         }
         cpufreq_payload_boost(true);
-        while (p && secboot_payload_allowed(p))
+        while (p && (p = secboot_payload_next(p)))
             p = load_one_payload(p, 0);
         cpufreq_payload_boost(false);
         payload_scanned = true;

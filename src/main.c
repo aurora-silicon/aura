@@ -279,11 +279,16 @@ void run_actions(void)
 
     if (!secboot_host_proxy_allowed()) {
         /* Shown on the panel. No proxy: a host could run anything through it. */
+        /*
+         * Shown on the panel. Never stop here: nobody may be at the Mac. A Stage 1 reboots into
+         * the same check (the owner can choose another system at startup); a Stage 2 reboots to
+         * Stage 1, which boots its configured image.
+         */
         printf("\nSecure boot: no verified next stage could be started, and this build gives\n"
-               "  no USB host a proxy. Hold the power button to shut down, then hold it again\n"
-               "  to choose another system, and reinstall a signed Stage 2.\n");
-        while (1)
-            mdelay(1000);
+               "  no USB host a proxy. Rebooting in 10 s. To stop, hold the power button and\n"
+               "  choose another system; then reinstall a signed Stage 2.\n");
+        mdelay(10000);
+        flush_and_reboot();
     }
 
 #ifndef BRINGUP
