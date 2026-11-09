@@ -10278,6 +10278,170 @@ undo:
     return 0;
 }
 
+/*
+ * The two external display coprocessors (DCPEXT) of the J616s across a T6040
+ * S2R: HDMI (dcp@3a2e00000 -> DISPEXT0) and USB-C DisplayPort (dcp@602e00000 ->
+ * DISPEXT1). Like the internal panel, each lowers its display power domains
+ * after the firmware stop and raises them on wake, through an
+ * "apple,display-power" phandle (dcp_t6041_display_power(), drm/apple/dcp.c),
+ * but their power-state words live in the WEST SOC-PS block, not the internal
+ * panel's SOC-East one:
+ *
+ *   ps       the west SOC-PS power block: /arm-io/pmgr reg[0] (0x502800000,
+ *            pmgr_aux). The driver reaches each DISPEXT's SYS/FE/CPU words at
+ *            their own offsets within it -- DISPEXT0 (HDMI) +0x340/0x348/0x350,
+ *            DISPEXT1 (USB-C DP) +0x490/0x498/0x4a0, from the g19/run12 ADT
+ *            /arm-io/pmgr power-state devices (group 0) and this tree's
+ *            t6040-pmgr.dtsi ps_dispext{0,1}_* nodes.
+ *   pmc-dcp  the SAME shared PMS DCP-power voter as the internal panel,
+ *            /arm-io/disp0 reg[4] + 0xa9c14 = 0x5048a9c14 (the driver counts
+ *            every powered DCP in it, 0..n).
+ *
+ * One node is published over the SOC-PS block + the shared voter and BOTH
+ * external DCPs point at it, mirroring aurora #1208's t8140, where the single
+ * dcp_power node is shared between the internal DCP and its DISPEXT0; the
+ * driver picks each DISPEXT's own offsets by the coprocessor's reg base.
+ *
+ * Refusal-safe: if a window is absent or does not validate, publish nothing and
+ * leave apple,display-power unset, so dcp_t6041_display_power() returns -ENODEV,
+ * each external output is left off until reboot (as today) and the sleep is
+ * unaffected. Windows are RE'd in G30-DCPEXT-S2R.md.
+ */
+#define T6040_DCPEXT_PS_ADT_IDX 0 /* /arm-io/pmgr reg index (SOC-PS west) */
+#define T6040_DCPEXT_PS_BASE    0x502800000UL
+#define T6040_DCPEXT_PS_SIZE    0x14000UL /* covers DISPEXT0/1 SYS/FE/CPU (<= 0x4a4) */
+/* pmc-dcp reuses the internal voter: disp0 reg[4] + 0xa9c14 = 0x5048a9c14. */
+
+static int dt_set_t6040_sleep_dcpext(void)
+{
+    /* Self-gating: only the external DCPs (HDMI + USB-C DP) need this. */
+    int dcp = fdt_node_offset_by_compatible(dt, -1, "apple,t6041-dcpext");
+    if (dcp < 0)
+        return 0;
+
+    /* ---- validate pass: read both windows from the ADT, touch no DT yet ---- */
+    int pmgr_path[8];
+    int pmgr = adt_path_offset_trace(adt, "/arm-io/pmgr", pmgr_path);
+    if (pmgr < 0)
+        return 0;
+    u64 ps_addr, ps_size;
+    if (adt_get_reg(adt, pmgr_path, "reg", T6040_DCPEXT_PS_ADT_IDX, &ps_addr, &ps_size) < 0) {
+        printf("FDT: DCPEXT display-power: /arm-io/pmgr reg[%d] (ps) missing; skipping\n",
+               T6040_DCPEXT_PS_ADT_IDX);
+        return 0;
+    }
+    if (ps_addr != T6040_DCPEXT_PS_BASE || ps_size < T6040_DCPEXT_PS_SIZE) {
+        printf("FDT: DCPEXT display-power: ps window 0x%lx/0x%lx unexpected; skipping\n", ps_addr,
+               ps_size);
+        return 0;
+    }
+
+    int disp_path[8];
+    int disp = adt_path_offset_trace(adt, "/arm-io/disp0", disp_path);
+    if (disp < 0)
+        return 0;
+    u64 pmp_addr, pmp_size;
+    if (adt_get_reg(adt, disp_path, "reg", T6040_DISP_PMP_ADT_IDX, &pmp_addr, &pmp_size) < 0) {
+        printf("FDT: DCPEXT display-power: /arm-io/disp0 reg[%d] (pmc-dcp) missing; skipping\n",
+               T6040_DISP_PMP_ADT_IDX);
+        return 0;
+    }
+    if (pmp_size < T6040_DISP_PMC_OFF + T6040_DISP_PMC_SIZE) {
+        printf("FDT: DCPEXT display-power: disp0 reg[%d] too small (0x%lx); skipping\n",
+               T6040_DISP_PMP_ADT_IDX, pmp_size);
+        return 0;
+    }
+    u64 pmc_addr = pmp_addr + T6040_DISP_PMC_OFF;
+
+    /* ---- write pass: validated, so a failure here is FDT space only -------- */
+    int soc = fdt_parent_offset(dt, dcp);
+    if (soc < 0)
+        return 0;
+
+    /* One shared node over the west SOC-PS block + the internal panel's pmc-dcp
+     * voter; both external DCPs point at it, as t8140 shares dcp_power. Reuse an
+     * existing node (idempotent) or build it under the DCPs' parent, whose cells
+     * match the DCP reg (physical, #address/#size-cells = 2). */
+    bool created = false;
+    int node = fdt_subnode_offset(dt, soc, "display-power@502800000");
+    if (node < 0) {
+        node = fdt_add_subnode(dt, soc, "display-power@502800000");
+        if (node < 0) {
+            printf("FDT: DCPEXT display-power: no room for the node; leaving S2R external off\n");
+            return 0;
+        }
+        created = true;
+        /* reg = <ps>, <pmc-dcp>; reg-names in the same order. The driver looks
+         * each up by name so the order is cosmetic; ps first matches the unit
+         * address. */
+        fdt64_t reg[4];
+        fdt64_st(&reg[0], ps_addr);
+        fdt64_st(&reg[1], T6040_DCPEXT_PS_SIZE);
+        fdt64_st(&reg[2], pmc_addr);
+        fdt64_st(&reg[3], T6040_DISP_PMC_SIZE);
+        if (fdt_setprop(dt, node, "reg", reg, sizeof(reg)) < 0 ||
+            fdt_setprop_string(dt, node, "reg-names", "ps") < 0 ||
+            fdt_appendprop_string(dt, node, "reg-names", "pmc-dcp") < 0 ||
+            fdt_setprop_string(dt, node, "compatible", "apple,t6041-display-power") < 0)
+            goto undo;
+
+        uint32_t ph;
+        if (fdt_generate_phandle(dt, &ph) || fdt_setprop_u32(dt, node, "phandle", ph))
+            goto undo;
+    }
+
+    uint32_t phandle = fdt_get_phandle(dt, node);
+    if (!phandle)
+        goto undo;
+
+    /* Point every external DCP that lacks it at the shared node. Each setprop
+     * can move nodes, so re-scan from the top until all are wired (only two
+     * exist; bound the loop regardless). */
+    for (int guard = 0; guard < 8; guard++) {
+        int target = -1, d = -1;
+        while ((d = fdt_node_offset_by_compatible(dt, d, "apple,t6041-dcpext")) >= 0) {
+            if (!fdt_getprop(dt, d, "apple,display-power", NULL)) {
+                target = d;
+                break;
+            }
+        }
+        if (target < 0)
+            break;
+        if (fdt_setprop_u32(dt, target, "apple,display-power", phandle))
+            goto undo;
+    }
+
+    printf("FDT: Published DCPEXT apple,display-power (ps 0x%lx/0x%lx, pmc-dcp 0x%lx) from ADT\n",
+           ps_addr, (u64)T6040_DCPEXT_PS_SIZE, pmc_addr);
+    return 0;
+
+undo:
+    /* Refusal-safe: strip the phandle from every external DCP and drop the node
+     * if we created it. An unreferenced node binds no driver, and a DCPEXT with
+     * no phandle gets -ENODEV in dcp_t6041_display_power() and stays off across
+     * the sleep -- the output dark, but the sleep unaffected. */
+    for (int guard = 0; guard < 8; guard++) {
+        int target = -1, d = -1;
+        while ((d = fdt_node_offset_by_compatible(dt, d, "apple,t6041-dcpext")) >= 0) {
+            if (fdt_getprop(dt, d, "apple,display-power", NULL)) {
+                target = d;
+                break;
+            }
+        }
+        if (target < 0)
+            break;
+        fdt_delprop(dt, target, "apple,display-power");
+    }
+    if (created) {
+        dcp = fdt_node_offset_by_compatible(dt, -1, "apple,t6041-dcpext");
+        soc = dcp < 0 ? -1 : fdt_parent_offset(dt, dcp);
+        node = soc < 0 ? -1 : fdt_subnode_offset(dt, soc, "display-power@502800000");
+        if (node >= 0)
+            fdt_del_node(dt, node);
+    }
+    return 0;
+}
+
 void kboot_set_initrd(void *start, size_t size)
 {
     initrd_start = start;
@@ -11001,6 +11165,8 @@ int kboot_prepare_dt(void *fdt)
     if (dt_set_t6040_sleep_apcie())
         return -1;
     if (dt_set_t6040_sleep_display())
+        return -1;
+    if (dt_set_t6040_sleep_dcpext())
         return -1;
 #ifndef RELEASE
     if (dt_transfer_virtios())
