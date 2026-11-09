@@ -3828,6 +3828,90 @@ static const char *const ave_compatibles[] = {
     "apple,t6041-ave",
 };
 
+/*
+ * AVE's DART setup is selected by the machine's ADT. Convert its register
+ * tunables to the normal Linux triples without logging their contents.
+ */
+static int dt_copy_ave_tunables(const char *ave_path)
+{
+    const char *dart_path = "/arm-io/dart-ave";
+    int adt_dart = adt_path_offset(adt, dart_path);
+    u32 phandles[2];
+    bool wrote_dart[2] = {false, false};
+    bool wrote_axi = false;
+    int ave = fdt_path_offset(dt, ave_path);
+    int len;
+
+    if (ave < 0)
+        return -1;
+    if (fdt_node_check_compatible(dt, ave, "apple,t6000-ave") &&
+        fdt_node_check_compatible(dt, ave, "apple,t8112-ave"))
+        return 0;
+    if (adt_dart < 0) {
+        dart_path = "/arm-io/dart-ave0";
+        adt_dart = adt_path_offset(adt, dart_path);
+    }
+    if (adt_dart < 0)
+        return -1;
+
+    const fdt32_t *iommus = fdt_getprop(dt, ave, "iommus", &len);
+    if (!iommus || len != 4 * (int)sizeof(*iommus)) {
+        printf("FDT: AVE needs exactly two one-cell IOMMU specifiers\n");
+        return -1;
+    }
+    phandles[0] = fdt32_to_cpu(iommus[0]);
+    phandles[1] = fdt32_to_cpu(iommus[2]);
+
+    for (size_t i = 0; i < ARRAY_SIZE(phandles); i++) {
+        char dart_name[40];
+        int dart = fdt_node_offset_by_phandle(dt, phandles[i]);
+
+        if (dart < 0 || (fdt_node_check_compatible(dt, dart, "apple,t6000-dart") &&
+                         fdt_node_check_compatible(dt, dart, "apple,t8110-dart")))
+            goto err;
+        /* A board-specific DART table remains authoritative. */
+        if (fdt_getprop(dt, dart, "apple,tunable", NULL))
+            continue;
+        snprintf(dart_name, sizeof(dart_name), "dart-tunables-instance-%zu", i);
+        const struct adt_tunable_info tunable = {
+            .adt_name = dart_name,
+            .fdt_name = "apple,tunable",
+            .reg_size = 0x4000,
+            .required = true,
+        };
+
+        wrote_dart[i] = true;
+        if (dt_append_acio_tunable(adt_dart, dart, &tunable))
+            goto err;
+    }
+
+    ave = fdt_path_offset(dt, ave_path);
+    if (ave < 0)
+        goto err;
+
+    /* The qualified T8112 AVE AXI2AF list is explicitly empty. */
+    if (!fdt_node_check_compatible(dt, ave, "apple,t8112-ave") &&
+        !fdt_getprop(dt, ave, "apple,tunable-axi2af", NULL)) {
+        if (fdt_setprop_empty(dt, ave, "apple,tunable-axi2af") < 0)
+            goto err;
+        wrote_axi = true;
+    }
+    return 0;
+
+err:
+    for (size_t i = 0; i < ARRAY_SIZE(phandles); i++) {
+        int dart = fdt_node_offset_by_phandle(dt, phandles[i]);
+
+        if (wrote_dart[i] && dart >= 0)
+            fdt_delprop(dt, dart, "apple,tunable");
+    }
+    ave = fdt_path_offset(dt, ave_path);
+    if (wrote_axi && ave >= 0)
+        fdt_delprop(dt, ave, "apple,tunable-axi2af");
+    printf("FDT: unable to hand AVE its ADT tunables\n");
+    return -1;
+}
+
 static int dt_set_ave_node(int node)
 {
     char path[64];
@@ -3908,7 +3992,7 @@ static int dt_set_ave_node(int node)
     for (size_t i = 0; i < count; i++)
         crcs[i] = tinf_crc32((void *)seg[i].phys, seg[i].size);
 
-    if (dt_reserve_asc_firmware(adt_path, NULL, path, true, 0)) {
+    if (dt_reserve_asc_firmware(adt_path, NULL, path, false, 0)) {
         reason = "firmware reservation failed";
         goto disable;
     }
@@ -3921,6 +4005,10 @@ static int dt_set_ave_node(int node)
             reason = "CRC export failed";
             goto disable;
         }
+    }
+    if (dt_copy_ave_tunables(path)) {
+        reason = "ADT tunable handoff failed";
+        goto disable;
     }
     return 0;
 
