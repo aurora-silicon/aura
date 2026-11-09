@@ -50,6 +50,10 @@ Environment (all optional; 1 enables a switch):
   AURA_WFI_WATCH           trap XNU's WFIs and report every 10 s how many (idle vs. dead)
   AURA_HIDE_NODES=<a,b>    further ADT nodes to hide from the guest (comma-separated paths)
   AURA_TRAP_DELAY_NS=<n>   spin n ns in every GL trap (workaround: holds off the ~20 s stall)
+  AURA_TRAP_DELAY_MASK=<m> which GL traps spin: 1 GEXIT, 2 g-ERET, 4 IMPDEF, 8 SPTM's entry
+                           sysreg read, 16 HVC, 32 rest, 64 other sysregs
+  AURA_SYSREG_CENSUS       print which sysregs the guarded world traps on, every 20 s
+  AURA_CPTR_LIVE=0         keep SPTM's CPTR_EL2 writes a shadow (default: XNU's CPACR_EL1)
   XNU_BOOTARGS             XNU's command line
 
 Example:
@@ -118,6 +122,9 @@ KNOWN_ENV = {
     "AURA_WFI_WATCH",
     "AURA_HIDE_NODES",
     "AURA_TRAP_DELAY_NS",
+    "AURA_TRAP_DELAY_MASK",
+    "AURA_CPTR_LIVE",
+    "AURA_SYSREG_CENSUS",
 } | set(CONFIG_FLAGS)
 
 # The debug link's USB-C port: XNU must never drive it (it resets the port about 3 s into IOKit
@@ -788,6 +795,12 @@ def main():
         p.iodev_set_usage(IODEV.FB, 0)  # the framebuffer is XNU's now
     if os.environ.get("AURA_TRAP_DELAY_NS"):
         p.write32(sym["sptm_virt_trap_delay_ns"], env_int("AURA_TRAP_DELAY_NS"))
+    if env_on("AURA_SYSREG_CENSUS"):
+        p.write32(sym["sptm_virt_census"], 1)
+    if os.environ.get("AURA_CPTR_LIVE"):
+        p.write32(sym["sptm_virt_cptr_live"], env_int("AURA_CPTR_LIVE"))
+    if os.environ.get("AURA_TRAP_DELAY_MASK"):
+        p.write32(sym["sptm_virt_trap_delay_mask"], env_int("AURA_TRAP_DELAY_MASK"))
     if env_on("AURA_WFI_WATCH"):
         p.write32(sym["sptm_virt_wfi_watch"], 1)
     if os.environ.get("AURA_AMCC_NOLOCK"):

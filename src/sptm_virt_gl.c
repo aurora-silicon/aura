@@ -485,6 +485,8 @@ u64 sptm_virt_amx_ctl_el2_read(void)
 
 /* ---- trapped GL2 accesses ------------------------------------------------------------------- */
 
+u32 sptm_virt_cptr_live = 1; /* AURA_CPTR_LIVE=0 keeps SPTM's CPTR_EL2 a shadow, as before */
+
 static bool sptm_virt_gl2_sysreg(u64 *regs, u64 esr)
 {
     unsigned op0 = (esr >> 20) & 3, op1 = (esr >> 14) & 7, crn = (esr >> 10) & 15;
@@ -506,6 +508,49 @@ static bool sptm_virt_gl2_sysreg(u64 *regs, u64 esr)
 
     if (sptm_virt_ctrr_rw(regs, esr))
         return true;
+
+    /*
+     * CPTR_EL2, in the host world. SPTM switches the FP/SIMD/SME state lazily around its calls into
+     * cL4: FP on (0x3300000) before cL4 runs, then 0x0 on the way back, so that XNU's next FP
+     * access traps and gets its own registers back. Natively that is the one CPTR_EL2 XNU runs
+     * under; here XNU's CPTR_EL2 (E2H) is the physical CPACR_EL1, so that is where SPTM's write
+     * must land -- shadowed, XNU ran on with cL4's SIMD registers. Same layout under E2H: ZEN,
+     * FPEN, SMEN and TTA are taken over, the EL2-only bits stay in the shadow.
+     */
+    if (op0 == 3 && op1 == 4 && crn == 1 && crm == 1 && op2 == 2 && sptm_virt_cptr_live &&
+        !sptm_virt_in_cl4()) {
+        const u64 m = (3UL << 16) | (3UL << 20) | (3UL << 24) | BIT(28);
+        u64 *slot = sptm_virt_gl2_slot(smp_id(), (u16)GL2KEY(op0, op1, crn, crm, op2));
+        if (read) {
+            if (rt != 31)
+                regs[rt] = (*slot & ~m) | (mrs(s3_5_c1_c0_2) & m);
+        } else {
+            u64 wv = (rt == 31) ? 0 : regs[rt];
+            *slot = wv;
+            msr(s3_5_c1_c0_2, (mrs(s3_5_c1_c0_2) & ~m) | (wv & m));
+            sysop("isb");
+        }
+        return true;
+    }
+
+    /* Which values SPTM writes to the EL2 controls it cannot reach (CPTR/MDCR/HACR_EL2). */
+    if (!read && op0 == 3 && op1 == 4 && crn == 1 && crm == 1) {
+        static u64 seen[3][8];
+        static u32 nseen[3];
+        unsigned r = op2 == 2 ? 0 : op2 == 1 ? 1 : op2 == 7 ? 2 : 3;
+        u64 v = (rt == 31) ? 0 : regs[rt];
+        if (r < 3) {
+            bool known = false;
+            for (unsigned i = 0; i < nseen[r]; i++)
+                known |= seen[r][i] == v;
+            if (!known && nseen[r] < 8) {
+                seen[r][nseen[r]++] = v;
+                printf("SPTM-virt[el2ctl]: SPTM writes %s = 0x%lx (in %s) at pc 0x%lx\n",
+                       r == 0 ? "CPTR_EL2" : r == 1 ? "MDCR_EL2" : "HACR_EL2", v,
+                       sptm_virt_in_cl4() ? "cL4" : "host", mrs(ELR_EL1));
+            }
+        }
+    }
 
     /* Anything else: the guest's GL2 register file, so reads see its earlier writes. */
     u16 key = (u16)GL2KEY(op0, op1, crn, crm, op2);
@@ -819,6 +864,10 @@ static void sptm_virt_park_report(u64 *regs, u64 pc)
 }
 
 /* A synchronous exception into aura's GL2 from SPTM (or cL4) at GL1. */
+static void sptm_virt_trap_delay(u32 ec, u32 iss);
+static void sptm_virt_sysreg_census(u32 iss, u64 elr);
+extern u32 sptm_virt_census;
+
 bool sptm_virt_gl_sync(u64 *regs, u64 esr, u64 elr, u64 spsr)
 {
     u32 elsp = spsr & SPSR_M_EL;
@@ -826,6 +875,9 @@ bool sptm_virt_gl_sync(u64 *regs, u64 esr, u64 elr, u64 spsr)
     u32 iss = esr & ESR_ISS;
 
     sptm_virt_canary_tick();
+    sptm_virt_trap_delay(ec, iss);
+    if (ec == ESR_EC_MSR && sptm_virt_census)
+        sptm_virt_sysreg_census(iss, elr);
 
     /*
      * Which guarded-world traps reach aura, and from where. TXM runs at GL0 and yields back to
@@ -966,16 +1018,66 @@ void sptm_virt_canary_tick(void)
     canary_a = now;
     canary_b = now;
     __asm__ volatile("dc cvac, %0" ::"r"(&canary_b) : "memory");
-    /*
-     * AURA_TRAP_DELAY_NS: a workaround knob, not a fix. The guest stops (no trap, no WFI, no
-     * panic) ~20-25 s into XNU when aura's GL traps are fast; slowing each one moves that out --
-     * 2.5 us to ~95 s (t102), 10 us to ~6 min (t105) -- so something races with aura's speed.
-     */
-    if (sptm_virt_trap_delay_ns) {
-        u64 end = now + mrs(CNTFRQ_EL0) / 1000000 * sptm_virt_trap_delay_ns / 1000;
-        while (mrs(CNTPCT_EL0) < end)
-            ;
+}
+
+/*
+ * AURA_TRAP_DELAY_NS: a workaround knob, not a fix. The guest stops (no trap, no WFI, no panic)
+ * ~20-25 s into XNU when aura's GL traps are fast; slowing each one moves that out -- 2.5 us to
+ * ~95 s (t102), 10 us to ~6 min (t105) -- so something races with aura's speed.
+ * AURA_TRAP_DELAY_MASK picks the traps that wait (default all): bit 0 GEXIT, 1 guarded ERET,
+ * 2 other IMPDEF ops, 3 s3_6_c15_c11_1 (SPTM's entry read), 4 HVC, 5 the rest, 6 other sysregs.
+ * Only the sysreg traps matter (t110).
+ */
+u32 sptm_virt_trap_delay_mask = ~0u;
+
+static void sptm_virt_trap_delay(u32 ec, u32 iss)
+{
+    if (!sptm_virt_trap_delay_ns)
+        return;
+    u32 cls = ec == ESR_EC_IMPDEF ? (iss == 0x22 ? 0 : 2)
+              : ec == 0x1a       ? 1
+              : ec == ESR_EC_MSR ? ((iss & 0x3ffc1e) == 0x33bc16 ? 3 : 6) /* s3_6_c15_c11_1 */
+              : ec == ESR_EC_HVC ? 4
+                                 : 5;
+    if (!(sptm_virt_trap_delay_mask & BIT(cls)))
+        return;
+    u64 end = mrs(CNTPCT_EL0) + mrs(CNTFRQ_EL0) / 1000000 * sptm_virt_trap_delay_ns / 1000;
+    while (mrs(CNTPCT_EL0) < end)
+        ;
+}
+
+/*
+ * Which system registers the guarded world traps on, and how often: printed every 20 s
+ * (AURA_SYSREG_CENSUS). t112: SPTM's entry read of s3_6_c15_c11_1 traps ~1.2 million times a
+ * second; the EL2 controls SPTM sets around each cL4 call a few thousand times in 20 s.
+ */
+u32 sptm_virt_census;
+static void sptm_virt_sysreg_census(u32 iss, u64 elr)
+{
+    static struct {
+        u32 key, n;
+        u64 pc;
+    } tab[24];
+    static u64 next;
+    u32 key = iss & 0x3ffc1e; /* op0 op2 op1 crn crm, direction */
+    key |= iss & 1;
+    for (unsigned i = 0; i < ARRAY_SIZE(tab); i++) {
+        if (tab[i].key == key || !tab[i].n) {
+            tab[i].key = key;
+            tab[i].n++;
+            tab[i].pc = elr;
+            break;
+        }
     }
+    u64 now = mrs(CNTPCT_EL0);
+    if (now < next)
+        return;
+    next = now + 20 * mrs(CNTFRQ_EL0);
+    for (unsigned i = 0; i < ARRAY_SIZE(tab) && tab[i].n; i++)
+        printf("SPTM-virt[census]: S%u_%u_C%u_C%u_%u %s x%u (last pc 0x%lx)\n",
+               (tab[i].key >> 20) & 3, (tab[i].key >> 14) & 7, (tab[i].key >> 10) & 15,
+               (tab[i].key >> 1) & 15, (tab[i].key >> 17) & 7, (tab[i].key & 1) ? "read" : "write",
+               tab[i].n, tab[i].pc);
 }
 
 /*
