@@ -38,6 +38,7 @@ fixture that boots the real 25G83 SPTM with a synthetic iBoot; this is an
 independent implementation of that observable contract.
 """
 
+import re
 import struct
 from dataclasses import dataclass, field
 
@@ -243,6 +244,25 @@ def build_boot_args(virt_base, phys_base, mem_size, top_of_kernel_data, adt_va, 
     return bytes(b)
 
 
+def set_os_long_version(root, version, notes):
+    """TXM checks a cryptex against the manifest's OS long version, which a tree a non-macOS
+    stage booted lacks."""
+    if not re.fullmatch(r"[0-9]+(\.[0-9]+){4},[0-9]+", version):
+        raise ValueError(f"not an OS long version: {version!r}")
+    try:
+        manifest = adt_find(root, "chosen/manifest-properties")
+    except KeyError:
+        raise ValueError("the device tree has no /chosen/manifest-properties") from None
+    value = version.encode() + b"\0"
+    for prop in manifest.props:
+        if prop[0] == "love":
+            if prop[1].rstrip(b"\0") != value.rstrip(b"\0"):
+                raise ValueError("the live OS long version differs from the guest's")
+            return
+    manifest.props.append(["love", value, 0])
+    notes.append(f"manifest love = {version}")
+
+
 def adt_hide_nodes(root, hide_nodes, notes):
     """Remove ``hide_nodes`` (ADT paths) from the guest tree, and drop a hidden ATC's
     display-crossbar endpoint, the way aura hv's setup_adt hides a USB proxy port.
@@ -323,7 +343,7 @@ def plan_boot(sptm, txm, xnu, adt, *, dram_base, phys_base, mem_size, mem_size_a
               placement_shift=None, blob_base=None, hide_nodes=(), xnu_serial=None,
               drop_props=(), cl4_regions=None, cl4_entry=0, cl4_virt=0,
               exclave_integrity=b"", exclave_trustcache=b"", iboot_copies=(),
-              diag_record=False):
+              diag_record=False, os_long_version=None):
     """Compute the whole iBoot->SPTM handoff.
 
     sptm/txm/xnu are the raw Mach-O files, ``adt`` the live device tree,
@@ -339,10 +359,15 @@ def plan_boot(sptm, txm, xnu, adt, *, dram_base, phys_base, mem_size, mem_size_a
     copy, as natively they lie inside RTBuddySeg in managed RAM.
 
     ``diag_record``: give SPTM a diagnostic record (boot_args revision 3, an SPTMDebug region).
+
+    ``os_long_version``: the guest's Ap,OSLongVersion (its BuildIdentity), given to TXM as the
+    manifest's ``love`` when the live tree has none; a different live value is refused.
     """
     notes = []
     si, ti, xi = macho_info(sptm), macho_info(txm), macho_info(xnu)
     root, _ = adt_parse(adt)
+    if os_long_version is not None:
+        set_os_long_version(root, os_long_version, notes)
 
     adt_hide_nodes(root, hide_nodes, notes)
     adt_drop_props(root, drop_props, notes)

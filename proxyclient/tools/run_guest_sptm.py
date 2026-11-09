@@ -39,6 +39,7 @@ Environment (all optional; 1 enables a switch):
   AURA_XNU_RO_RELAX        patch XNU's zalloc_ro_mut RO-zone panic out (tracing only; XNU_QUIRKS)
   AURA_DEBUG_PORT=<n>      with the proxy on KIS, hide only USB-C port n (port-number), not all
   AURA_SPTM_DIAG           give SPTM a diagnostic record (boot_args revision 3, SPTMDebug)
+  AURA_OS_LONG_VERSION     the guest's Ap,OSLongVersion (--os-long-version)
   AURA_TAIL_SECS, AURA_TAIL_IDLE   keep reading the console after entry, until idle
   XNU_BOOTARGS             XNU's command line
 
@@ -78,6 +79,7 @@ CONFIG_FLAGS = {
 }
 KNOWN_ENV = {
     "AURA_KEEP_EXCLAVES",
+    "AURA_OS_LONG_VERSION",
     "AURA_EXCLAVE_FW",
     "AURA_EXCLAVE_BUNDLE",
     "AURA_EXCLAVE_INTEGRITY",
@@ -165,6 +167,9 @@ def parse_args():
     ap.add_argument("--sptm", type=pathlib.Path, required=True, help="sptm.bin (flat Mach-O)")
     ap.add_argument("--txm", type=pathlib.Path, required=True, help="txm.bin (flat Mach-O)")
     ap.add_argument("--xnu", type=pathlib.Path, required=True, help="decompressed kernelcache")
+    ap.add_argument("--os-long-version", default=os.environ.get("AURA_OS_LONG_VERSION"),
+                    help="the guest's Ap,OSLongVersion from its BuildIdentity, for TXM's cryptex "
+                         "check when the live tree has none (AURA_OS_LONG_VERSION)")
     ap.add_argument("--trustcache", type=pathlib.Path, default=None,
                     help="iBoot's trust cache container, or one raw trust cache (default: empty)")
     ap.add_argument("--bootargs", default=os.environ.get("XNU_BOOTARGS", DEFAULT_BOOTARGS),
@@ -613,7 +618,8 @@ def main():
         trustcache=args.trustcache.read_bytes() if args.trustcache else b"",
         iboot_copies=copies, hide_nodes=hide, diag_record=env_on("AURA_SPTM_DIAG"),
         drop_props=() if keep_exclaves else ROUTES_PROPS,
-        xnu_serial=f"/arm-io/{serial}" if serial else None, **cl4)
+        xnu_serial=f"/arm-io/{serial}" if serial else None,
+        os_long_version=args.os_long_version, **cl4)
 
     entry, handoff = plan.sptm_entry_pa, plan.boot_args_pa
     print(f"bootargs: {args.bootargs}")
