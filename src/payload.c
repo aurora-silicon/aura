@@ -295,6 +295,9 @@ static bool check_var(u8 **p)
         /* Started by an earlier aura stage, which has had its host window already. */
         if (nvme_set_sart_var(val))
             stage1_chained = true;
+    } else if (IS_VAR("nvme.adopt=")) {
+        /* An older Stage 1 hands its session on running; nvme_init() finds it by itself. */
+        stage1_chained = true;
 #ifdef DEBUGUSB_PROXY
     } else if (IS_VAR("aura.host-window=")) {
         stage1_window_passed = true;
