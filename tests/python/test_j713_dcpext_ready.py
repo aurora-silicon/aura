@@ -60,6 +60,7 @@ static void *dt, *adt;
 static u32 chip_id = T8132;
 /* fault applies to the controllers in victims (bit n = dcpextn). */
 static int fault, victims, reservations, attempts[2];
+static const char *expected_status[2];
 static unsigned char blob[32768];
 ''' + layout + r'''
 static struct adt_segment_ranges segments[2][2];
@@ -190,6 +191,7 @@ __attribute__((unused)) static u32 clear32(uintptr_t addr, u32 clear) { return p
 static void world(void)
 {
     fault = victims = reservations = attempts[0] = attempts[1] = 0;
+    expected_status[0] = expected_status[1] = "disabled";
     pmgr_reads = pmgr_writes = 0;
     chip_id = T8132; pmgr_devices_len = ARRAY_SIZE(devices);
     dram_base = 0x10000000000ULL; dram_size = 0x1000000;
@@ -233,10 +235,14 @@ static int reserved(int n, int segment)
     snprintf(name, sizeof(name), "asc-firmware@%lx", segments[n][segment].phys);
     return fdt_subnode_offset(dt, fdt_path_offset(dt, "/reserved-memory"), name);
 }
-static void still_disabled(int n)
+static void status_preserved(int n)
 {
-    const char *status = fdt_getprop(dt, ext(n), "status", NULL);
-    assert(status && !strcmp(status, "disabled"));
+    int len = 0;
+    const char *status = fdt_getprop(dt, ext(n), "status", &len);
+    if (expected_status[n])
+        assert(status && !strcmp(status, expected_status[n]));
+    else
+        assert(!status && len == -FDT_ERR_NOTFOUND);
 }
 static void published(int n)
 {
@@ -251,7 +257,7 @@ static void published(int n)
     assert(!fdt_getprop(dt, reserved(n, 0), "apple,dcp-os-log", NULL));
     assert(fdt_getprop(dt, reserved(n, 1), "apple,dcp-os-log", NULL));
     assert(!fdt_getprop(dt, reserved(n, 1), "iommu-addresses", NULL));
-    still_disabled(n);
+    status_preserved(n);
 }
 static void untouched(int n)
 {
@@ -260,7 +266,7 @@ static void untouched(int n)
     assert(!fdt_getprop(dt, node, "apple,firmware-uuid", NULL));
     assert(!fdt_getprop(dt, node, "memory-region", NULL));
     assert(reserved(n, 0) < 0 && reserved(n, 1) < 0);
-    still_disabled(n);
+    status_preserved(n);
 }
 static void stale_markers(void)
 {
@@ -349,12 +355,50 @@ int main(void)
         assert(!pmgr_writes);
     }
 
-    /* Only a disabled apple,t8132-dcpext node; a stale marker on any other is withdrawn. */
-    world(); stale_markers();
-    assert(!fdt_setprop_string(dt, ext(1), "status", "okay"));
-    dt_reserve_j713_dcpext();
-    published(0);
-    assert(!fdt_getprop(dt, ext(1), T8132_DCPEXT_READY, NULL) && reserved(1, 0) < 0);
+    /* Current kernel DTs leave dcpext available; older embedded DTs disabled it.
+     * Reserve either shape without changing status, routes or suppliers. */
+    const char *accepted[] = {NULL, "okay", "ok", "disabled"};
+    for (unsigned a = 0; a < ARRAY_SIZE(accepted); a++) {
+        for (unsigned b = 0; b < ARRAY_SIZE(accepted); b++) {
+            for (unsigned mode = 0; mode < 3; mode++) {
+                world(); stale_markers();
+                expected_status[0] = accepted[a]; expected_status[1] = accepted[b];
+                for (int n = 0; n < 2; n++) {
+                    if (expected_status[n])
+                        assert(!fdt_setprop_string(dt, ext(n), "status", expected_status[n]));
+                    else
+                        assert(!fdt_delprop(dt, ext(n), "status"));
+                }
+                if (mode == 1) { fault = 9; victims = 2; }
+                if (mode == 2) {
+                    assert(!fdt_delprop(dt, fdt_path_offset(dt, "/chosen"), "asahi,j713-dcpext"));
+                    unarmed();
+                    continue;
+                }
+                dt_reserve_j713_dcpext();
+                published(0);
+                if (mode == 1) untouched(1); else published(1);
+                assert(pmgr_reads == 6 && !pmgr_writes);
+            }
+        }
+    }
+    /* Other statuses, including truncated strings and trailing bytes, stay closed. */
+    const struct { const char *data; int size; } rejected[] = {
+        {"reserved", 9}, {"fail", 5}, {"", 1}, {"okay", 4},
+        {"okay\0extra", 11}, {"disabledjunk", 13}, {"ok", 0},
+    };
+    for (unsigned i = 0; i < ARRAY_SIZE(rejected); i++) {
+        world(); stale_markers();
+        assert(!fdt_setprop(dt, ext(1), "status", rejected[i].data, rejected[i].size));
+        dt_reserve_j713_dcpext();
+        published(0);
+        assert(!fdt_getprop(dt, ext(1), T8132_DCPEXT_READY, NULL) && reserved(1, 0) < 0);
+        int len = 0;
+        const void *status = fdt_getprop(dt, ext(1), "status", &len);
+        assert(status && len == rejected[i].size && !memcmp(status, rejected[i].data, len));
+        assert(pmgr_reads == 3 && !pmgr_writes);
+    }
+    /* Other SoCs never acquire the J713 handoff. */
     world(); stale_markers();
     assert(!fdt_setprop_string(dt, ext(1), "compatible", "apple,t8122-dcpext"));
     dt_reserve_j713_dcpext();
