@@ -132,6 +132,15 @@ endif
 endif
 
 
+# Trace builds only: an ESP Stage 2 that boots macOS under SPTM-virt from files on the ESP (the
+# macos= line, src/sptm_virt_esp.c, tools/esp-macos) instead of a Linux boot= or chainload=.
+ifeq ($(SPTM_VIRT_ESP),1)
+ifneq ($(ESP_STAGE2)$(SPTM_VIRT),11)
+$(error SPTM_VIRT_ESP requires ESP_STAGE2=1 and SPTM_VIRT=1)
+endif
+CFG += SPTM_VIRT_ESP
+endif
+
 LDFLAGS := -EL -maarch64elf --no-undefined -X -Bsymbolic \
 	-z notext --no-apply-dynamic-relocs --orphan-handling=warn \
 	-z nocopyreloc --gc-sections -pie
@@ -250,6 +259,9 @@ OBJECTS := \
 
 ifeq ($(SPTM_VIRT),1)
 OBJECTS += nv2.o nv2_asm.o sptm_virt.o sptm_virt_cl4.o sptm_virt_gl.o sptm_virt_s2.o sptm_virt_s2r.o sptm_virt_s2r_soc.o sptm_virt_gpu.o s2r_dcp_pkt.o
+endif
+ifeq ($(SPTM_VIRT_ESP),1)
+OBJECTS += sptm_virt_esp.o sptm_virt_esp_plan.o sha256.o
 endif
 
 FP_OBJECTS := \

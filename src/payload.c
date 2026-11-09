@@ -18,6 +18,9 @@
 #include "nvme.h"
 #include "payload_profile.h"
 #include "smp.h"
+#ifdef SPTM_VIRT_ESP
+#include "sptm_virt.h"
+#endif
 #include "stage1_config.h"
 #include "utils.h"
 
@@ -57,6 +60,9 @@ static void *fdt = NULL;
 static int fdt_rank;
 static char *chainload_spec = NULL;
 static char *boot_spec = NULL;
+#ifdef SPTM_VIRT_ESP
+static char *macos_spec = NULL; /* macos=: boot macOS under SPTM-virt from the ESP */
+#endif
 static bool payload_scanned = false;
 #ifndef ESP_STAGE2
 static bool stage1_config_applied = false;
@@ -232,7 +238,11 @@ static bool config_lost_passed = false;
 
 static const char *const config_names[] = {
     "chosen.",  "chainload=",   "boot=", "nvme.adopt=",
-    "display=", "mitigations=", "tso=",  "m1n1.config-lost="};
+    "display=", "mitigations=", "tso=",  "m1n1.config-lost=",
+#ifdef SPTM_VIRT_ESP
+    "macos=",
+#endif
+};
 
 /* The start of a line of a variable m1n1 knows */
 static bool config_line(const char *s)
@@ -286,6 +296,11 @@ static bool check_var(u8 **p)
     } else if (IS_VAR("boot=")) {
         if (!boot_spec)
             boot_spec = val;
+#ifdef SPTM_VIRT_ESP
+    } else if (IS_VAR("macos=")) {
+        if (!macos_spec)
+            macos_spec = val;
+#endif
     } else if (IS_VAR("nvme.adopt=")) {
         if (!strcmp(val, "live-rtkit-v1")) {
             nvme_adopt_live_session = true;
@@ -474,6 +489,18 @@ int payload_run(void)
         next_stage.entry = NULL;
         return -1;
     }
+
+#ifdef SPTM_VIRT_ESP
+    if (macos_spec) {
+        /* An explicit line in this image only, never a default: returns only on failure. */
+        next_stage.entry = NULL;
+        if (chainload_spec || boot_spec)
+            printf("Payload: macos= takes this boot; ignoring boot= and chainload=\n");
+        sptm_virt_esp_boot(macos_spec);
+        nvme_shutdown();
+        return -1;
+    }
+#endif
 
     if (chainload_spec) {
         next_stage.entry = NULL;
