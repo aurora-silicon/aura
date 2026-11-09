@@ -57,7 +57,8 @@ macOS:
 kmutil inspect -z -B "$PWD/aura-boot.macho" --show-mach-boot-properties
 ```
 
-It must report `kcbz : 0`.
+It must report `kcbz : 0`. [recovery-enroll.md](recovery-enroll.md) describes a
+script that makes these checks in Recovery before it enrolls, and logs them.
 
 Enrolling a Mach-O object turns Kernel CTRR back on in the volume's LocalPolicy
 (`bputil -d`: `Kernel CTRR Status: Enabled`, `sip2` absent), even when the volume
