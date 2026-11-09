@@ -42,6 +42,9 @@ bool secboot_allow_unverified(const char *what);
 int secboot_check_chainload(void *image, size_t *size, char **vars, size_t *var_cnt,
                             size_t var_capacity);
 
+/* Whether a USB host may get the proxy (any window, or the no-payload fallback): not under enforce. */
+bool secboot_host_proxy_allowed(void);
+
 /* Build /chosen/aurora,boot-security in the FDT handed to the next stage. */
 void secboot_export_fdt(void *dt);
 

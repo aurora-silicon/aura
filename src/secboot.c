@@ -231,6 +231,15 @@ bool secboot_payload_allowed(const u8 *p)
 #endif
 }
 
+bool secboot_host_proxy_allowed(void)
+{
+#ifdef SECBOOT_ENFORCE
+    return false;
+#else
+    return true;
+#endif
+}
+
 bool secboot_allow_unverified(const char *what)
 {
 #ifdef SECBOOT_ENFORCE
