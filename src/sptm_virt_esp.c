@@ -417,6 +417,10 @@ AURA_XTEXT int sptm_virt_esp_boot(const char *spec)
     for (int i = 0; i < ESP_S2R_N; i++)
         if (m->s2r_set[i])
             *sw[i] = m->s2r[i];
+#ifdef SPTM_VIRT_ESP_CP_ANSX
+    /* A capture build's own ANS pages (S2R_CP_ANSX_*) replace the manifest's */
+    sptm_virt_s2r_cp_ansx = SPTM_VIRT_ESP_CP_ANSX;
+#endif
 
     if (sptm_virt_esp_ans_handoff())
         ESP_FAIL("ANS hand-off failed\n");
