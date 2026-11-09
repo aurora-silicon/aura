@@ -35,6 +35,7 @@
 
 volatile bool sptm_virt_peek_active_cpu[MAX_CPUS];
 volatile bool sptm_virt_peek_faulted_cpu[MAX_CPUS];
+static u64 sptm_peek_esr[MAX_CPUS];
 
 /*
  * exc_sync: while a probe is in flight the only code running is its one load or mrs, so a fault is
@@ -49,6 +50,7 @@ bool sptm_virt_peek_fault(bool in_gl)
         return false;
     sptm_virt_peek_active_cpu[cpu] = false;
     sptm_virt_peek_faulted_cpu[cpu] = true;
+    sptm_peek_esr[cpu] = in_gl ? mrs(SYS_IMP_APL_ESR_GL1) : mrs(ESR_EL2);
     if (in_gl)
         msr(ELR_EL1, mrs(ELR_EL1) + 4);
     else
@@ -490,6 +492,49 @@ static void sptm_virt_xnu_bt(u64 *regs, u64 target)
 }
 
 /*
+ * An Apple context instruction, 0x00201340 | Rt, that SPTM issues at GL2 on a context switch.
+ * At physical GL1 it traps up (EC 0x3f, ISS 0x20000 | Rt); it runs at aura's GL2 and at GL1
+ * outside the guest. Issue it here, at the level SPTM would have, with the guest's register.
+ */
+#define ESR_ISS_CTX_OP 0x20000
+#define CTX_OP_INSN    0x00201340
+
+static bool sptm_virt_ctx_op(u64 *regs, u64 elr, u64 spsr, u32 iss)
+{
+    static bool seen[MAX_CPUS];
+    int cpu = smp_id();
+    unsigned rt = iss & 0x1f;
+    u64 word;
+
+    if (rt == 31 || !sptm_virt_guest_rd64(elr & ~7UL, &word) ||
+        ((word >> ((elr & 4) * 8)) & 0xffffffff) != (CTX_OP_INSN | rt))
+        return false;
+
+    register u64 arg __asm__("x13") = regs[rt];
+    sptm_virt_peek_faulted_cpu[cpu] = false;
+    sptm_virt_peek_active_cpu[cpu] = true;
+    sysop("isb");
+    __asm__ volatile(".inst 0x0020134d" : "+r"(arg)::"memory");
+    sysop("isb");
+    sptm_virt_peek_active_cpu[cpu] = false;
+    if (sptm_virt_peek_faulted_cpu[cpu]) {
+        printf("SPTM-virt[ctxop c%d]: x%u=0x%lx faults at GL2 too (esr 0x%lx)\n", cpu, rt, regs[rt],
+               sptm_peek_esr[cpu]);
+        return false;
+    }
+    if (!seen[cpu]) {
+        seen[cpu] = true;
+        printf("SPTM-virt[ctxop c%d]: pc=0x%lx x%u=0x%lx -> 0x%lx at GL2\n", cpu, elr, rt, regs[rt],
+               arg);
+    }
+    regs[rt] = arg;
+    /* _gxf_exc_return copies the mirrored ELR_EL1/SPSR_EL1 back to the GL1 bank. */
+    msr(SPSR_EL1, spsr);
+    msr(ELR_EL1, elr + 4);
+    return true;
+}
+
+/*
  * SPTM's GEXIT out of its guarded world to its own normal world (virtual EL2), which physical GL1
  * cannot reach, so it traps up. It consumes the guest's GL bank: return to ELR/SPSR_GL12 in the
  * world ASPSR_GL12 names, virtual EL2 at physical EL1, copying the guest's ASPSR exactly.
@@ -641,6 +686,8 @@ bool sptm_virt_gl_sync(u64 *regs, u64 esr, u64 elr, u64 spsr)
             break;
         case ESR_EC_IMPDEF:
             if (iss == ESR_ISS_GEXIT_UP && sptm_virt_guarded_gexit(regs))
+                goto done;
+            if ((iss & ~0x1fU) == ESR_ISS_CTX_OP && sptm_virt_ctx_op(regs, elr, spsr, iss))
                 goto done;
             break;
         case ESR_EC_DABORT_LOWER:
