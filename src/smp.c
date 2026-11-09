@@ -552,7 +552,8 @@ static u32 cpu_start_bit(int index, const struct cpu_info *cpu)
     if (chip_id == T8142)
         return BIT(index);
 
-    return BIT(4 * cpu->cluster + cpu->core);
+    /* T6050 has three six-core clusters; XNU's stop bits are 6 * cluster + core (MEAS). */
+    return BIT((chip_id == T6050 ? 6 : 4) * cpu->cluster + cpu->core);
 }
 
 static bool t8142_prepare_reset_vector(u64 rvbar)
