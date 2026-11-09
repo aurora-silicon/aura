@@ -6954,8 +6954,8 @@ static int dt_set_display(void)
         return dt_set_display_handoff(dt);
     } else if (!fdt_node_check_compatible(dt, 0, "apple,t6041")) {
         /*
-         * The same fail-soft handoff on the M4 Max: nothing unless the board is a J616C whose
-         * device tree describes the display block; the display nodes stay disabled.
+         * The same fail-soft handoff on the M4 Max: nothing unless the board is a J616C or
+         * J614C whose device tree describes the display block; the display nodes stay disabled.
          */
         return dt_set_display_handoff(dt);
     } else if (!fdt_node_check_compatible(dt, 0, "apple,t6032")) {
