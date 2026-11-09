@@ -3803,7 +3803,16 @@ static int dt_set_ave_node(int node)
     for (size_t i = 0; i < count; i++)
         crcs[i] = tinf_crc32((void *)seg[i].phys, seg[i].size);
 
-    if (dt_reserve_asc_firmware(adt_path, NULL, path, true, 0)) {
+    /*
+     * The pre-M4 (6070) encoder firmware runs from DART address zero: TEXT at
+     * 0, DATA right after it, as the ADT's iova-offset field gives them. Its
+     * remap field is the alias the firmware sees for itself, which the M1
+     * Pro's 32-bit AVE DART cannot even take. The M4-generation encoders
+     * run at their remap addresses.
+     */
+    bool use_remap = !fdt_node_check_compatible(dt, node, "apple,t8140-ave") ||
+                     !fdt_node_check_compatible(dt, node, "apple,t6041-ave");
+    if (dt_reserve_asc_firmware(adt_path, NULL, path, use_remap, 0)) {
         reason = "firmware reservation failed";
         goto disable;
     }
