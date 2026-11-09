@@ -5,6 +5,7 @@
 #include "aic.h"
 #include "aic_regs.h"
 #include "cpu_regs.h"
+#include "dockchannel_uart.h"
 #include "malloc.h"
 #include "memory.h"
 #include "pmgr.h"
@@ -457,7 +458,11 @@ void smp_s2r_return_to_os(void)
     msr(DAIF, 0xf << 6);
 
     /* A reset the OS didn't arm: reboot rather than guess what state it's in. */
-    if (!entry || (mrs(MPIDR_EL1) & 0xFFFFFF) != s2r_mailbox.boot_mpidr)
+    bool armed = entry && (mrs(MPIDR_EL1) & 0xFFFFFF) == s2r_mailbox.boot_mpidr;
+    /* One line on the always-on DockChannel only: USB and the display are the OS's. */
+    dockchannel_uart_puts(armed ? "aura: S2R wake, resuming the OS"
+                                : "aura: S2R reset not armed, rebooting");
+    if (!armed)
         reboot();
 
     s2r_mailbox.resume_pa = 0;
