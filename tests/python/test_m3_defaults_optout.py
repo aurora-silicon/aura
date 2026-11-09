@@ -99,6 +99,12 @@ static struct { int version; } os_firmware = {V26_6_2};
 #include "payload_profile.h"
 static int XzDecode(void *in, uint32_t *in_len, void *out, uint32_t *out_len) { return 0; }
 
+/* secboot.c: an unsigned image, nothing enforced (SECBOOT=off) */
+enum secboot_verdict { SECBOOT_MEASURED = 6 };
+static void secboot_measure(const char *c, const void *d, size_t s, enum secboot_verdict v) {}
+static int secboot_check_payloads(u8 *p, u8 **next) { *next = p; return 0; }
+static u8 *secboot_payload_next(u8 *p) { return p; }
+
 /* heapblock: one bump allocator */
 /* Aligned at run time: the macOS linker caps a section's alignment at 16 KiB, and the kernel
    loader copies an Image that is not at a 2 MiB boundary */

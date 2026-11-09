@@ -41,6 +41,13 @@ static int rust_load_image(const char *spec, void **data, size_t *size, bool *pr
     return 0;
 }
 static void rust_free_image(void *data, size_t size) { (void)data; (void)size; }
+/* secboot.c: not enforcing, ESP files only measured */
+enum secboot_verdict { SECBOOT_UNSIGNED = 5 };
+static bool secboot_allow_unverified(const char *what) { (void)what; return true; }
+static void secboot_measure(const char *c, const void *d, size_t s, enum secboot_verdict v)
+{
+    (void)c; (void)d; (void)s; (void)v;
+}
 static int boot_check_dtb(const void *data, size_t size)
 { return data == &tree && size == 1 ? 0 : -1; }
 static struct kernel_header *boot_prepare_image(const void *data, size_t size)
