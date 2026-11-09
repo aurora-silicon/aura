@@ -242,6 +242,41 @@ static int dt_set_rng_seed_adt(int node)
     return 0;
 }
 
+/*
+ * libfdt lets a path component without a unit address match the first node of that base name,
+ * so "/soc/dcp@..." can resolve "soc" to "soc@200000000" and miss the node. This matches the
+ * full name of every component, as the OS does.
+ */
+int kboot_fdt_path_exact(const void *fdt, const char *path)
+{
+    if (path && path[0] != '/')
+        path = fdt_get_alias(fdt, path);
+    if (!path || path[0] != '/')
+        return -FDT_ERR_NOTFOUND;
+
+    int node = 0;
+    while (node >= 0 && *path) {
+        while (*path == '/')
+            path++;
+        const char *end = strchr(path, '/');
+        int len = end ? end - path : (int)strlen(path), child, nlen;
+        if (!len)
+            break;
+        int found = -FDT_ERR_NOTFOUND;
+        fdt_for_each_subnode(child, fdt, node)
+        {
+            const char *name = fdt_get_name(fdt, child, &nlen);
+            if (name && nlen == len && !memcmp(name, path, len)) {
+                found = child;
+                break;
+            }
+        }
+        node = found;
+        path += len;
+    }
+    return node;
+}
+
 static int dt_set_fb(void)
 {
     if (!cur_boot_args.video.base) {
@@ -317,6 +352,8 @@ static int dt_set_fb(void)
     // so that a display driver hiding the notch still can)
     if (notch_height) {
         int dcp = fdt_path_offset(dt, "dcp");
+        if (dcp < 0)
+            dcp = kboot_fdt_path_exact(dt, "dcp");
         if (dcp >= 0)
             if (fdt_appendprop_u32(dt, dcp, "apple,notch-height", notch_height))
                 printf("FDT: couldn't set apple,notch-height\n");
