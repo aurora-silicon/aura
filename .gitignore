@@ -9,3 +9,4 @@ __pycache__
 /rust/target
 .idea
 stage1-size-*.log
+/tests/hv_xfer/out*/

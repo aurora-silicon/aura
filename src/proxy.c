@@ -36,6 +36,7 @@
 #include "tinf/tinf.h"
 
 #ifdef AURA_WINDOWS
+#include "hv/windows/hv_xfer.h"
 #include "hv/windows/windows_n1.h"
 #endif
 
@@ -626,7 +627,8 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
         case P_HV_WINDOWS_CAPS:
             /* Read-only personality/ABI probe; never initializes hardware. */
 #ifdef AURA_WINDOWS
-            reply->retval = 0x4157494e00011fffULL;
+            /* Bit 13 (0x2000): HvXfer bulk channel, P_HV_MAP_XFER. */
+            reply->retval = 0x4157494e00013fffULL;
 #else
             reply->retval = 0;
 #endif
@@ -781,6 +783,15 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
             rust_free_gigalocker((void *)cmd_buf[0], cmd_buf[1]);
             break;
         }
+
+#ifdef AURA_WINDOWS
+        case P_HV_MAP_XFER:
+            /* Doorbell base, Aura-owned window base and size. The window comes
+             * from the proxy heap, which the guest's memory map never covers;
+             * hv_map_xfer() refuses anything it would have to replace. */
+            reply->retval = hv_map_xfer(request->args[0], request->args[1], request->args[2]);
+            break;
+#endif
 
         default:
             reply->status = S_BADCMD;

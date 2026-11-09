@@ -194,6 +194,10 @@ typedef enum {
 
     P_READ_GIGALOCKER = 0x1400,
     P_FREE_GIGALOCKER,
+
+    /* Windows-only bulk host<->guest channel (src/hv/windows/hv_xfer.c); same
+     * opcode as m1n1's j813 tree. Keep in sync with proxyclient/aura/proxy.py. */
+    P_HV_MAP_XFER = 0x1700,
 } ProxyOp;
 
 #define S_OK     0

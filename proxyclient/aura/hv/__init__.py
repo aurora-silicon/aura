@@ -114,6 +114,10 @@ class HV(Reloadable):
         self.windows_memory_guard = None
         self.windows_serial = "disabled"
         self.windows_serial_recorder = None
+        self.windows_xfer = False
+        self.xfer_dev = None
+        self.xfer_transport = None
+        self.xfer_info = None
         self.pac_mask = self.PAC_MASK
         self.user_pac_mask = self.PAC_MASK
         self.vbar_el1 = None
@@ -1134,6 +1138,123 @@ class HV(Reloadable):
 
         self.p.exit(EXC_RET.HANDLED)
 
+    # ------------------------------------------------------------------
+    # HvXfer bulk host<->guest channel (src/hv/windows/hv_xfer.c, .xfer)
+    # ------------------------------------------------------------------
+
+    def _xfer_dram(self):
+        """DRAM as hv_xfer.c sees it: ram_base is boot_args phys_base rounded
+        down to 4 GiB, and mem_size_actual is all of physical memory."""
+        ram_base = self.u.ba.phys_base & ~0xffffffff
+        return ram_base, ram_base + self.u.ba.mem_size_actual
+
+    def xfer_doorbell_conflicts(self, base):
+        """Reasons `base` cannot host the doorbell (empty list = usable).
+
+        The /arm-io "HW" passthrough is the one mapping the doorbell may sit
+        inside: its RESERVED tracer outranks it, exactly as the vUART's does.
+        Anything else -- DRAM, an ADT register range, another tracer or hook --
+        is a conflict. hv_map_xfer() separately refuses IPAs that already have
+        a stage-2 entry, which also covers hooks only the C side knows about.
+        """
+        from ..windows import doorbell_conflicts
+        from .xfer import HV_XFER_REGS_SIZE
+        zone = irange(base, HV_XFER_REGS_SIZE)
+        devices = [(name, r.start, r.stop)
+                   for _, values in self.adt.build_addr_lookup().overlaps(zone)
+                   for name, r in values]
+        hooks = [(ident, mzone.start, mzone.stop)
+                 for mzone, maps in self.mmio_maps.overlaps(zone)
+                 for ident, entry in maps.items()
+                 if not (ident == "HW" and entry[0] == TraceMode.OFF)]
+        return doorbell_conflicts(base, dram=self._xfer_dram(), devices=devices, hooks=hooks)
+
+    def xfer_pick_doorbell(self):
+        """First conflict-free 16 KiB page in an unclaimed /arm-io gap."""
+        from .xfer import HV_XFER_REGS_SIZE
+        lookup = self.adt.build_addr_lookup()
+        for zone, devs in lookup.populate(usable_mmio_range(self.adt)):
+            if devs:
+                continue
+            base = align_up(zone.start, HV_XFER_REGS_SIZE)
+            for _ in range(64):
+                if base + HV_XFER_REGS_SIZE > zone.stop:
+                    break
+                if not self.xfer_doorbell_conflicts(base):
+                    return base
+                base += HV_XFER_REGS_SIZE
+        return None
+
+    def attach_xfer(self, base, size, engine, compress=True):
+        """Map the HvXfer channel: a hooked doorbell page plus an Aura window.
+
+        Must run before start(): the RESERVED tracers added here are what keep
+        pt_update() from replacing the doorbell hook with the /arm-io HW
+        passthrough and from unmapping the window. The window comes from the
+        proxy heap, which lies below the guest's RAM and is absent from its
+        memory map; hv_map_xfer() maps it identity, HW. Raises on any refusal,
+        leaving nothing mapped.
+        """
+        from ..windows import XFER
+        from .xfer import HV_XFER_MAX_WINDOW, HV_XFER_PAGE_SIZE, HV_XFER_REGS_SIZE, ProxyTransport
+        if not self.windows:
+            raise ValueError("HvXfer is implemented only by the Windows personality")
+        if self.xfer_info is not None:
+            raise RuntimeError("an HvXfer channel is already attached")
+        if not isinstance(size, int) or not (0 < size <= HV_XFER_MAX_WINDOW) or size % HV_XFER_PAGE_SIZE:
+            raise ValueError(f"xfer window size {size!r} must be a 16 KiB multiple up to 64 MiB")
+        if not self.p.hv_windows_capabilities() & XFER:
+            raise RuntimeError("resident lacks the HvXfer capability")
+        if base == "auto":
+            base = self.xfer_pick_doorbell()
+            if base is None:
+                raise RuntimeError("no conflict-free /arm-io gap for the HvXfer doorbell")
+        conflicts = self.xfer_doorbell_conflicts(base)
+        if conflicts:
+            raise ValueError("HvXfer doorbell refused: " + "; ".join(conflicts))
+
+        win = self.u.heap.memalign(HV_XFER_PAGE_SIZE, size)
+        rc = self.p.hv_map_xfer(base, win, size)
+        if rc != 0:
+            self.u.heap.free(win)
+            raise RuntimeError(f"resident refused hv_map_xfer({base:#x}, {win:#x}, {size:#x}): {rc}")
+
+        # RESERVED, not a tracer: the EL2 hook owns every doorbell access and
+        # the window keeps the HW mapping hv_map_xfer() just made.
+        self.add_tracer(irange(base, HV_XFER_REGS_SIZE), "HVXFER", TraceMode.RESERVED)
+        self.add_tracer(irange(win, size), "HVXFER-WIN", TraceMode.RESERVED)
+
+        self.xfer_dev = engine
+        self.xfer_transport = ProxyTransport(self.iface, self.p, self.u.heap, compress=compress)
+        self.xfer_info = {"doorbell": base, "window": win, "window_bytes": size,
+                          "compress": bool(compress)}
+        print(f"HvXfer: doorbell {base:#x} (pass this to IOCTL_APPLE_HVXFER_ATTACH), "
+              f"Aura window {win:#x}+{size:#x} ({size >> 10} KiB)", flush=True)
+        return dict(self.xfer_info)
+
+    def handle_xfer(self, reason, code, info):
+        """One HV_XFER event per doorbell command (the handle_virtio pattern).
+
+        The guest vCPU -- and, with time stealing, every other vCPU -- is held
+        in EL2 until this returns. Every path writes an explicit status back;
+        EL2 poisons it with NODEV, so a missing engine reads as a refusal.
+        """
+        from .xfer import ST_NODEV, XferExcInfo
+        ctx = self.iface.readstruct(info, ExcInfo)
+        xinfo = self.iface.readstruct(ctx.data, XferExcInfo)
+
+        if self.xfer_dev is None:
+            status, result = ST_NODEV, 0
+        else:
+            status, result = self.xfer_dev.dispatch(
+                self.xfer_transport, xinfo.cmd, xinfo.tag, xinfo.off, xinfo.length,
+                xinfo.win_phys, xinfo.win_size, xinfo.name_phys)
+
+        xinfo.status = status
+        xinfo.result = result
+        self.iface.writemem(ctx.data, XferExcInfo.build(xinfo))
+        self.p.exit(EXC_RET.HANDLED)
+
     def skip(self):
         self.ctx.elr += 4
         self.cont()
@@ -1430,7 +1551,8 @@ class HV(Reloadable):
             caps = validate_capabilities(self.p.hv_windows_capabilities(), self.windows_framebuffer,
                                          self.windows_guest_compatibility, self.windows_n1,
                                          self.windows_memory_guard is not None, self.windows_serial,
-                                         self.windows_mtp, self.windows_cpufreq)
+                                         self.windows_mtp, self.windows_cpufreq,
+                                         xfer=self.windows_xfer)
             if self.windows_mtp != "disabled":
                 guard = self.windows_memory_guard
                 if not guard or not any(r["base"] == MTP_RESERVED_BASE and
@@ -1508,6 +1630,9 @@ class HV(Reloadable):
         self.iface.set_handler(START.HV, HV_EVENT.CPU_SWITCH, self.handle_exception)
         self.iface.set_handler(START.HV, HV_EVENT.VIRTIO, self.handle_virtio)
         self.iface.set_handler(START.HV, HV_EVENT.PANIC, self.handle_bark)
+        # Always registered: an HV_XFER event with no handler would leave the
+        # resident inside uartproxy_run() waiting for an exit that never comes.
+        self.iface.set_handler(START.HV, HV_EVENT.XFER, self.handle_xfer)
         self.iface.set_event_handler(EVENT.MMIOTRACE, self.handle_mmiotrace)
         self.iface.set_event_handler(EVENT.IRQTRACE, self.handle_irqtrace)
         if self.windows and self.windows_serial == "capture":

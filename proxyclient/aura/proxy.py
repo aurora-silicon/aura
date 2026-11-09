@@ -795,6 +795,8 @@ class AuraProxy(Reloadable):
     P_HV_WINDOWS_N1_PREPARE = 0xc82
     P_HV_WINDOWS_HEAP_HIGH_WATER = 0xc83
     P_HV_WINDOWS_N1_ACQUIRE = 0xc84
+    # Windows-only HvXfer bulk channel (src/hv/windows/hv_xfer.c); same opcode as m1n1 j813.
+    P_HV_MAP_XFER = 0x1700
 
     P_FB_INIT = 0xd00
     P_FB_SHUTDOWN = 0xd01
@@ -1316,6 +1318,12 @@ class AuraProxy(Reloadable):
 
     def hv_windows_heap_high_water(self):
         return self.request(self.P_HV_WINDOWS_HEAP_HIGH_WATER)
+
+    def hv_map_xfer(self, base, win, win_size):
+        """Map the HvXfer doorbell at `base` and the Aura-owned window
+        `win`/`win_size` (16 KiB aligned, from the proxy heap). Returns 0 or a
+        negative refusal; nothing is mapped on refusal."""
+        return self.request(self.P_HV_MAP_XFER, base, win, win_size, signed=True)
 
     def fb_init(self):
         return self.request(self.P_FB_INIT)

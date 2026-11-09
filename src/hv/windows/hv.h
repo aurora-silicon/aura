@@ -188,6 +188,7 @@ void hv_scan_t8142_guest_modules(void);
 void hv_report_t8142_process(struct exc_info *ctx);
 void hv_report_t8142_gic_activity(void);
 void hv_check_t8142_bugcheck(void);
+void hv_dump_t8142_bugcheck_stack(struct exc_info *ctx);
 
 //
 // PSCI init

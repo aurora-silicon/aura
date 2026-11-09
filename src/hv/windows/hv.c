@@ -1413,6 +1413,7 @@ void hv_tick(struct exc_info *ctx)
     hv_windows_mtp_poll();
     hv_windows_mtp_report();
     hv_check_t8142_bugcheck();
+    hv_dump_t8142_bugcheck_stack(ctx);
     hv_recover_t8142_sysreg_undef(ctx);
     iodev_handle_events(uartproxy_iodev);
     if (iodev_can_read(uartproxy_iodev)) {

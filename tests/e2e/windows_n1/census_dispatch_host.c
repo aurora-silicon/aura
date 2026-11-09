@@ -222,6 +222,16 @@ static u16 read16(u64 address)
     return (u16)read32(address);
 }
 
+/* The relink handler has its own producer model (windows_n1_e2e.py); here it
+ * only has to leave non-relink HVCs to the census handler untouched. */
+static unsigned relink_calls;
+bool hv_windows_n1_relink_hvc(u64 regs[4])
+{
+    if (regs[0] != HV_WINDOWS_N1_RELINK_CALL)
+        return false;
+    relink_calls++;
+    return true;
+}
 #include "dispatch-production.h"
 
 int main(int argc, char **argv)
@@ -239,7 +249,8 @@ int main(int argc, char **argv)
     hardware.esr = (u64)(fast_msr || slow_msr ? ESR_EC_MSR : ESR_EC_HVC) << 26;
     if (nonzero || fast_msr)
         hardware.esr |= 1;
-    ctx.regs[0] = unrelated ? 0x1111 : HV_WINDOWS_N1_READ_CALL;
+    bool relink = !strcmp(name, "relink-routed");
+    ctx.regs[0] = unrelated ? 0x1111 : relink ? HV_WINDOWS_N1_RELINK_CALL : HV_WINDOWS_N1_READ_CALL;
     ctx.regs[1] = PORT + 0x208;
     ctx.regs[2] = 1;
     daif = 0x3c0; /* AArch64 exception entry masks SError. */
@@ -272,6 +283,12 @@ int main(int argc, char **argv)
         return 0;
     }
     assert(locks == 1);
+    /* N1-10: the fast path sent the relink magic to the SMC service handler. */
+    if (relink) {
+        assert(relink_calls == 1 && !reads && !smc_calls && !proxies);
+        return 0;
+    }
+    assert(!relink_calls);
     if (nonzero) {
         assert(!reads && proxies == 1);
         return 0;

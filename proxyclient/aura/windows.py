@@ -25,6 +25,7 @@ SERIAL_CAPTURE = 0x0100
 SERIAL_CDC_ISOLATED = 0x0200
 MTP_HANDOFF = 0x0400
 CPUFREQ_OWNERSHIP = 0x0800
+XFER = 0x2000  # HvXfer bulk channel: P_HV_MAP_XFER + HV_XFER events (src/hv/windows/hv_xfer.c)
 CONFIG_T8142_EXPERIMENTAL = 0x0001
 CONFIG_FRAMEBUFFER_SHADOW = 0x0002
 CONFIG_SERIAL_CAPTURE = 0x0004
@@ -59,7 +60,8 @@ def number(value, label):
 
 
 def validate_capabilities(value, framebuffer="native", guest_compatibility="none", n1="disabled",
-                          reserved_memory=False, serial="disabled", mtp="disabled", cpufreq="disabled"):
+                          reserved_memory=False, serial="disabled", mtp="disabled", cpufreq="disabled",
+                          xfer=False):
     require(isinstance(value, int) and value >> 32 == CAPS_MAGIC >> 32,
             "resident is not an explicit Windows Aura personality")
     require((value >> 16) & 0xffff == CAPS_ABI, "unsupported Windows Aura capability ABI")
@@ -85,6 +87,8 @@ def validate_capabilities(value, framebuffer="native", guest_compatibility="none
     if cpufreq != "disabled":
         require(value & CPUFREQ_OWNERSHIP and value & CONFIGURATION,
                 "resident lacks exclusive Windows CPU frequency ownership")
+    if xfer:
+        require(value & XFER, "resident lacks the HvXfer bulk channel")
     return value & 0xffff
 
 
@@ -108,6 +112,117 @@ class LaunchPlan:
     serial: str = "disabled"
     mtp: str = "disabled"
     cpufreq: str = "disabled"
+    xfer: object = None
+
+
+XFER_FIELDS = {"doorbell", "window_bytes", "serve_dir", "inbox", "compress"}
+XFER_DEFAULT_WINDOW = 1 << 20
+# Mirrors of HV_XFER_REGS_SIZE/PAGE_SIZE and HV_XFER_MAX_WINDOW (src/hv/windows/hv_xfer.[ch]);
+# kept here so profile validation never imports the aura.hv package.
+XFER_PAGE = 0x4000
+XFER_MAX_WINDOW = 64 << 20
+XFER_IPA_LIMIT = 1 << 44  # hv_pt_init(): vaddr_bits = min(44, PARange)
+# Guest-physical windows the Windows C personality hooks with no ADT node
+# (vGIC distributor/redistributor/ITS, 36- and 42-bit layouts, hv_vgic.c).
+# hv_map_xfer() also refuses any IPA with a stage-2 entry; this fails earlier.
+WINDOWS_SYNTHETIC_MMIO = (
+    ("vgic-36bit", 0xF00000000, 0xF30000000),
+    ("vgic-42bit", 0x5000000000, 0x5300000000),
+)
+
+
+def doorbell_conflicts(base, size=XFER_PAGE, *, dram=None, devices=(), hooks=(),
+                       synthetic=WINDOWS_SYNTHETIC_MMIO, ipa_limit=XFER_IPA_LIMIT):
+    """Every reason `base` cannot host the HvXfer doorbell (empty = usable).
+
+    ``dram`` is (start, stop); ``devices`` and ``hooks`` are (name, start, stop)
+    triples: ADT register ranges, and host tracer zones other than the /arm-io
+    HW passthrough the doorbell is meant to sit inside.
+    """
+    reasons = []
+    stop = base + size
+    if base <= 0 or base % XFER_PAGE:
+        reasons.append(f"doorbell {base:#x} is not a nonzero 16 KiB-aligned address")
+    if stop > ipa_limit:
+        reasons.append(f"doorbell {base:#x} is beyond the {ipa_limit:#x} IPA limit")
+    if dram is not None and base < dram[1] and dram[0] < stop:
+        reasons.append(f"doorbell {base:#x} is inside DRAM {dram[0]:#x}..{dram[1]:#x}")
+    for kind, ranges in (("ADT device", devices), ("hook", hooks), ("synthetic MMIO", synthetic)):
+        for name, lo, hi in ranges:
+            if base < hi and lo < stop:
+                reasons.append(f"doorbell {base:#x} overlaps {kind} {name} {lo:#x}..{hi:#x}")
+    return reasons
+
+
+def _xfer_directory(value, label):
+    require(isinstance(value, str) and os.path.isabs(value), f"xfer {label} must be an absolute path")
+    path = Path(value)
+    require(not path.is_symlink() and path.is_dir(), f"xfer {label} must be an existing, non-symlink directory")
+    return os.path.realpath(path)
+
+
+def plan_xfer(value):
+    """Validate the optional "xfer" profile object; None means disabled.
+
+    {"doorbell": "0x..." | "auto", "window_bytes": 1048576, "serve_dir": "/abs",
+     "inbox": "/abs" (optional; PUT disabled without it), "compress": true}
+    Hardware-dependent checks (DRAM, ADT devices, live hooks) run again at
+    attach time; these are the ones that can be decided from the file alone.
+    """
+    if value is None:
+        return None
+    require(isinstance(value, dict) and set(value) <= XFER_FIELDS and {"doorbell", "serve_dir"} <= set(value),
+            "xfer must bind doorbell and serve_dir (optional: window_bytes, inbox, compress)")
+    doorbell = value["doorbell"]
+    if doorbell != "auto":
+        doorbell = number(doorbell, "xfer doorbell")
+        problems = doorbell_conflicts(doorbell)
+        require(not problems, "; ".join(problems))
+    window = number(value.get("window_bytes", XFER_DEFAULT_WINDOW), "xfer window_bytes")
+    require(0 < window <= XFER_MAX_WINDOW and window % XFER_PAGE == 0,
+            "xfer window_bytes must be a nonzero 16 KiB multiple up to 64 MiB")
+    serve_dir = _xfer_directory(value["serve_dir"], "serve_dir")
+    inbox = value.get("inbox")
+    if inbox is not None:
+        inbox = _xfer_directory(inbox, "inbox")
+        require(os.path.commonpath([serve_dir, inbox]) not in (serve_dir, inbox),
+                "xfer inbox must be separate from serve_dir (neither inside the other)")
+    compress = value.get("compress", True)
+    require(isinstance(compress, bool), "xfer compress must be a boolean")
+    return {"doorbell": doorbell, "window_bytes": window, "serve_dir": serve_dir, "inbox": inbox,
+            "compress": compress}
+
+
+def xfer_plan_summary(xfer):
+    if xfer is None:
+        return {"enabled": False}
+    doorbell = xfer["doorbell"]
+    return {"enabled": True, "doorbell": doorbell if doorbell == "auto" else hex(doorbell),
+            "window_bytes": xfer["window_bytes"], "serve_dir": xfer["serve_dir"],
+            "inbox": xfer["inbox"], "put_enabled": xfer["inbox"] is not None,
+            "compress": xfer["compress"]}
+
+
+def attach_windows_xfer(hv, xfer, log_dir):
+    """Attach HvXfer before guest entry; returns the receipt for launch.json."""
+    from .hv.xfer import XferHostDevice
+    engine = XferHostDevice(xfer["serve_dir"], xfer["inbox"],
+                            log_path=Path(log_dir) / "xfer-commands.jsonl")
+    try:
+        info = hv.attach_xfer(xfer["doorbell"], xfer["window_bytes"], engine,
+                              compress=xfer["compress"])
+    except BaseException:
+        engine.close()
+        raise
+    receipt = xfer_plan_summary(xfer)
+    receipt.update(doorbell=hex(info["doorbell"]), aura_window=hex(info["window"]),
+                   aura_window_bytes=info["window_bytes"], log=str(engine.log_path),
+                   guest_attach={"DoorbellBase": hex(info["doorbell"]),
+                                 "note": "IOCTL_APPLE_HVXFER_ATTACH; guest-owned window "
+                                         "(SET_WINDOW) is the driver default"})
+    print(f"HvXfer: serving {xfer['serve_dir']} (GET), "
+          f"inbox {xfer['inbox'] or 'disabled (PUT refused)'}; log {engine.log_path}", flush=True)
+    return receipt
 
 
 def plan_profile(filename):
@@ -119,7 +234,8 @@ def plan_profile(filename):
     require(isinstance(profile, dict), "profile must be an object")
     require(profile.get("schema") == "aura.windows.boot.v1", "unsupported Windows boot profile")
     require(set(profile) <= {"schema", "name", "target", "mu", "append", "framebuffer", "boot_args",
-                             "guest_compatibility", "usb", "n1", "reserved_memory", "serial", "mtp", "cpufreq"},
+                             "guest_compatibility", "usb", "n1", "reserved_memory", "serial", "mtp", "cpufreq",
+                             "xfer"},
             "unknown Windows profile field")
     require(isinstance(profile.get("name"), str) and 0 < len(profile["name"]) <= 80, "profile name is required")
     target = profile.get("target")
@@ -209,6 +325,7 @@ def plan_profile(filename):
     boot_args = profile.get("boot_args", "")
     require(isinstance(boot_args, str) and len(boot_args.encode("ascii")) <= 255 and "\0" not in boot_args,
             "boot_args must be at most 255 ASCII bytes without NUL")
+    xfer = plan_xfer(profile.get("xfer"))
     # Hash every source file before introducing any padding. Offsets and the
     # final digest bind the zero-filled layout separately from source hashes.
     composed, cursor = [], 0
@@ -219,7 +336,7 @@ def plan_profile(filename):
         cursor = offset + len(content)
     return LaunchPlan(filename, profile, raw, hashlib.sha256(raw).hexdigest(), b"".join(composed),
                       tuple(images), entry, chip, model, framebuffer, compatibility, usb, n1,
-                      tuple(reserved), boot_args, serial, mtp, cpufreq)
+                      tuple(reserved), boot_args, serial, mtp, cpufreq, xfer)
 
 
 def _aligned(value, alignment):
@@ -367,7 +484,7 @@ def prepare_n1_handoff(hv):
 def source_manifest():
     root = Path(__file__).resolve().parents[1]
     names = ("aura/windows.py", "aura/windows_serial.py", "aura/windows_cdc.py",
-             "aura/hv/__init__.py", "aura/proxy.py", "tools/boot_windows.py")
+             "aura/hv/__init__.py", "aura/hv/xfer.py", "aura/proxy.py", "tools/boot_windows.py")
     return {name: hashlib.sha256((root / name).read_bytes()).hexdigest() for name in names}
 
 
@@ -413,6 +530,7 @@ class HardwareSession:
         self.proxy = AuraProxy(self.iface, debug=False)
         self.hv = None
         self.serial_capture = None
+        self.xfer_receipt = None
 
     def capabilities(self):
         return self.proxy.hv_windows_capabilities()
@@ -452,7 +570,8 @@ class HardwareSession:
 
     def prepare(self, plan):
         validate_capabilities(self.capabilities(), plan.framebuffer, plan.guest_compatibility, plan.n1,
-                              bool(plan.reserved_memory), plan.serial, plan.mtp, plan.cpufreq)
+                              bool(plan.reserved_memory), plan.serial, plan.mtp, plan.cpufreq,
+                              xfer=plan.xfer is not None)
         self.validate_serial_transport(plan)
         if plan.serial == "capture":
             from .windows_serial import WindowsSerialRecorder
@@ -497,9 +616,23 @@ class HardwareSession:
         self.hv.windows_cpufreq = plan.cpufreq
         self.hv.windows_serial = plan.serial
         self.hv.windows_serial_recorder = self.serial_capture
+        self.hv.windows_xfer = plan.xfer is not None
         self.hv.init()
         self.hv.set_logfile(self.iface.tty_log)
         prepare_n1_handoff(self.hv)
+        if plan.xfer is not None:
+            # Before load/start: start()'s pt_update() must see the RESERVED tracers.
+            self.xfer_receipt = attach_windows_xfer(self.hv, plan.xfer,
+                                                    Path(self.iface.tty_log.name).parent)
+
+    def xfer_summary(self):
+        """The attached channel's receipt plus engine statistics, or None."""
+        if self.xfer_receipt is None:
+            return None
+        summary = dict(self.xfer_receipt)
+        if self.hv is not None and self.hv.xfer_dev is not None:
+            summary["engine"] = self.hv.xfer_dev.summary()
+        return summary
 
     def load(self, plan):
         if plan.boot_args:
@@ -520,11 +653,22 @@ class HardwareSession:
         try:
             if self.serial_capture is not None:
                 self.serial_capture.close()
+            if self.hv is not None and self.hv.xfer_dev is not None:
+                self.hv.xfer_dev.close()  # abandons open PUTs (their .part files stay)
         finally:
             self.iface.dev.close()
 
     def serial_summary(self):
         return self.serial_capture.summary() if self.serial_capture is not None else {"mode": "disabled"}
+
+
+def _record_xfer(report, session, plan):
+    """Keep the planned xfer config in the receipt; overlay the live channel once attached."""
+    summary = session.xfer_summary() if hasattr(session, "xfer_summary") else None
+    if summary is not None:
+        report["xfer"] = dict(summary, attached=True)
+    elif plan.xfer is not None:
+        report["xfer"] = dict(xfer_plan_summary(plan.xfer), attached=False)
 
 
 def launch_profile(filename, device, output, session_factory=HardwareSession, guest_serial_device=None):
@@ -545,7 +689,8 @@ def launch_profile(filename, device, output, session_factory=HardwareSession, gu
               "host_sources": source_manifest(), "device": device,
               "combined_sha256": hashlib.sha256(plan.image).hexdigest(),
               "hardware_qualified": False, "target_mutated": False, "windows_ready": False,
-              "serial": {"mode": plan.serial, "device": guest_serial_device}}
+              "serial": {"mode": plan.serial, "device": guest_serial_device},
+              "xfer": xfer_plan_summary(plan.xfer)}
     session = None
     cdc_recorder = None
     try:
@@ -553,7 +698,8 @@ def launch_profile(filename, device, output, session_factory=HardwareSession, gu
             session = session_factory(device, log)
             caps = session.capabilities()
             validate_capabilities(caps, plan.framebuffer, plan.guest_compatibility, plan.n1,
-                                  bool(plan.reserved_memory), plan.serial, plan.mtp, plan.cpufreq)
+                                  bool(plan.reserved_memory), plan.serial, plan.mtp, plan.cpufreq,
+                                  xfer=plan.xfer is not None)
             identity = session.identity()
             require(identity["chip_id"] == plan.chip_id and identity["model"] == plan.model,
                     "target identity does not match the Windows profile")
@@ -565,6 +711,7 @@ def launch_profile(filename, device, output, session_factory=HardwareSession, gu
                 cdc_recorder.wait_ready()
             report["target_mutated"] = True
             session.prepare(plan)
+            _record_xfer(report, session, plan)
             report["loaded"] = session.load(plan)
             if cdc_recorder is not None:
                 cdc_recorder.check()
@@ -588,6 +735,11 @@ def launch_profile(filename, device, output, session_factory=HardwareSession, gu
             session.serial_capture.incomplete("launch-or-transport-error")
         raise
     finally:
+        if session is not None:
+            try:
+                _record_xfer(report, session, plan)  # final per-stream bytes and SHA-256
+            except Exception as error:  # noqa: BLE001 - the receipt must still be written
+                report["xfer_summary_error"] = repr(error)
         try:
             try:
                 if cdc_recorder is not None:

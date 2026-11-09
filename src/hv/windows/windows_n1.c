@@ -159,6 +159,11 @@ bool hv_windows_n1_census_hvc(u64 regs[4])
         (mrs(DAIF) & BIT(8)) || (mrs(ISR_EL1) & BIT(8)))
         goto out;
     status = HV_WINDOWS_N1_READ_INVALID;
+    if (regs[1] == HV_WINDOWS_N1_CAPS_ADDRESS && regs[2] == HV_WINDOWS_N1_READ_VERSION && !regs[3]) {
+        status = HV_WINDOWS_N1_READ_OK;
+        value = HV_WINDOWS_N1_CAP_RELINK;
+        goto out;
+    }
     if (regs[2] != HV_WINDOWS_N1_READ_VERSION || regs[3] || !n1_census_address(regs[1]))
         goto out;
     status = n1_read(regs[1], 4, &value) ? HV_WINDOWS_N1_READ_FAULT : HV_WINDOWS_N1_READ_OK;
@@ -522,4 +527,73 @@ int hv_windows_n1_prepare(void *descriptor, size_t size)
 int hv_windows_n1_acquire(void *descriptor, size_t size)
 {
     return n1_prepare(descriptor, size, true);
+}
+
+/* Guest-requested re-link (N1-09: by the time Windows starts its bus driver
+ * the endpoint is silent, the root port's buses/windows are cleared and the
+ * link no longer trains from PERST alone). Re-run the handoff's proven
+ * Linux reset/port sequence, which includes the SMC N1 reset, then the same
+ * endpoint, DART and BAR checks as the initial handoff. The port/PHY prefix
+ * is not repeated: the N1-09 snapshot shows it retained. */
+static unsigned n1_relinks;
+
+static int n1_relink(u32 *detail)
+{
+    u32 value;
+    bool port_ready = false;
+    if (n1_relinks >= 8) {
+        *detail = n1_relinks;
+        return HV_WINDOWS_N1_RELINK_EXHAUSTED;
+    }
+    n1_relinks++;
+    printf("Windows N1: guest relink %u requested; clamping GPIO PERST\n", n1_relinks);
+    *detail = 1;
+    if (n1_gpio_hold())
+        goto fail;
+    *detail = 2;
+    if (j813_n1_relink_windows(&port_ready) || n1_poll(PORT + 0x208, 1, 1, 1000000))
+        goto fail;
+    *detail = 3;
+    if (n1_endpoints_clean() || n1_dart_clean())
+        goto fail;
+    *detail = 4;
+    if (n1_assign_control())
+        goto fail;
+    *detail = 5;
+    if (n1_dart_clean() || n1_endpoints_clean())
+        goto fail;
+    *detail = 6;
+    if (n1_read(BAR + 0x8000, 4, &value) || value != 0)
+        goto fail;
+    *detail = n1_relinks;
+    printf("Windows N1: guest relink %u complete; cold ROM, SID0 disabled, BME off\n", n1_relinks);
+    return HV_WINDOWS_N1_RELINK_OK;
+fail:
+    printf("Windows N1: guest relink %u failed at phase %u (port_ready=%d); holding PERST\n",
+           n1_relinks, *detail, port_ready);
+    (void)n1_gpio_hold();
+    return HV_WINDOWS_N1_RELINK_FAILED;
+}
+
+bool hv_windows_n1_relink_hvc(u64 regs[4])
+{
+    if (regs[0] != HV_WINDOWS_N1_RELINK_CALL)
+        return false;
+    int status = HV_WINDOWS_N1_RELINK_UNAVAILABLE;
+    u32 detail = 0;
+    /* Same rules as the census: under the HV lock, BSP only, guard free and
+     * no pending or masked SError that could be misattributed. */
+    if (!n1_prepared || smp_id() != boot_cpu_idx || exc_guard != GUARD_OFF ||
+        (mrs(DAIF) & BIT(8)) || (mrs(ISR_EL1) & BIT(8)))
+        goto out;
+    status = HV_WINDOWS_N1_RELINK_INVALID;
+    if (regs[1] || regs[2] != HV_WINDOWS_N1_RELINK_VERSION || regs[3])
+        goto out;
+    status = n1_relink(&detail);
+out:
+    regs[0] = HV_WINDOWS_N1_RELINK_ACK;
+    regs[1] = (u64)(long long)status;
+    regs[2] = detail;
+    regs[3] = HV_WINDOWS_N1_RELINK_VERSION;
+    return true;
 }

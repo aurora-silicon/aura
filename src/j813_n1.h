@@ -14,5 +14,6 @@ int j813_n1_prepare_fabric_windows(void);
 int j813_n1_prepare_fabric_acquired_windows(void);
 /* port_ready permits full drain only after known port/root setup completed. */
 int j813_n1_finish_windows(bool *port_ready);
+int j813_n1_relink_windows(bool *port_ready);
 
 #endif

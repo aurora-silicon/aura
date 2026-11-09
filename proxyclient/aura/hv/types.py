@@ -39,6 +39,10 @@ class HV_EVENT(IntEnum):
     CPU_SWITCH = 5
     VIRTIO = 6
     PANIC = 7
+    # Windows personality (src/hv/windows/hv.h); keep the numbers in step.
+    TPM = 8
+    XFER = 9  # one event per HvXfer doorbell command (src/hv/windows/hv_xfer.c)
+    SYSREG_ASSIST_READY = 10
 
 VMProxyHookData = Struct(
     "flags" / RegAdapter(MMIOTraceFlags),

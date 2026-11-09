@@ -696,6 +696,23 @@ int j813_n1_finish_windows(bool *ready)
     put(0xb80008000ULL, is("rom") ? 1 : 0);
     return is("train") || is("clamp-fail") ? -1 : 0;
 }
+static unsigned relinks;
+/* Guest relink re-runs the port sequence: PERST must be clamped first. */
+int j813_n1_relink_windows(bool *ready)
+{
+    relinks++;
+    assert(trained && held);
+    if (is("relink-train"))
+        return -1;
+    *ready = true;
+    held = false;
+    put(0x488028208ULL, 0x1001);
+    put(0x1cb0100000ULL, 0x1900106b);
+    put(0x1cb0100004ULL, 0);
+    put(0x1cb0100010ULL, 4);
+    put(0xb80008000ULL, 0);
+    return 0;
+}
 #include "../../../src/hv/windows/windows_n1.c"
 static void census_request(u64 address, u64 version, u64 reserved, bool success,
                            unsigned expected_reads)
@@ -780,6 +797,66 @@ static void census_scenario(void)
     printf("%s reads=%u writes=%u trains=%u PASS\n", scenario, reads, writes, trains);
 }
 
+static void relink_request(u64 a1, u64 version, u64 reserved, long long status, u64 detail)
+{
+    u64 regs[4] = {0x4e31524c4e4bULL, a1, version, reserved};
+    enum exc_guard_t before_guard = exc_guard;
+    assert(hv_windows_n1_relink_hvc(regs));
+    assert(regs[0] == 0x4e31524c414bULL && regs[3] == 1 && exc_guard == before_guard);
+    assert((long long)regs[1] == status && regs[2] == detail);
+}
+
+/* N1-09: the endpoint is silent and the root port's buses are cleared by the
+ * time Windows starts its bus driver; the guest asks EL2 to re-link. */
+static void relink_scenario(void)
+{
+    unsigned char result[128];
+    if (!is("relink-unprepared"))
+        assert(!hv_windows_n1_prepare(result, sizeof(result)));
+    put(0x1cb0100000ULL, 0xffffffff);
+    put(0x1cb0000018ULL, 0);
+    put(0x488028208ULL, 0x1000);
+    if (is("relink-unprepared")) {
+        relink_request(0, 1, 0, -1, 0);
+        assert(!relinks);
+    } else if (is("relink-args")) {
+        relink_request(1, 1, 0, -2, 0);
+        relink_request(0, 2, 0, -2, 0);
+        relink_request(0, 1, 1, -2, 0);
+        assert(!relinks);
+    } else if (is("relink-magic")) {
+        u64 regs[4] = {0x1234, 0, 1, 0}, copy[4];
+        memcpy(copy, regs, sizeof(regs));
+        assert(!hv_windows_n1_relink_hvc(regs) && !memcmp(copy, regs, sizeof(regs)));
+    } else if (is("relink-caps")) {
+        u64 regs[4] = {0x4e3152443332ULL, 0x4e3143415053ULL, 1, 0};
+        unsigned before = reads;
+        assert(hv_windows_n1_census_hvc(regs) && regs[0] == 0x4e3141434b31ULL);
+        assert(regs[1] == 0 && regs[2] == 1 && regs[3] == 1 && reads == before && !relinks);
+        census_request(0x1cb0100000ULL, 1, 0, true, 1);
+    } else if (is("relink-bsp")) {
+        model_cpu = boot_cpu_idx + 1;
+        relink_request(0, 1, 0, -1, 0);
+        assert(!relinks);
+    } else if (is("relink-train")) {
+        relink_request(0, 1, 0, -5, 2);
+        assert(relinks == 1 && held && (get(0x39a000300ULL) & 15) == 2);
+    } else if (is("relink-exhausted")) {
+        for (u64 i = 1; i <= 8; i++)
+            relink_request(0, 1, 0, 0, i);
+        relink_request(0, 1, 0, -4, 8);
+        assert(relinks == 8);
+    } else {
+        assert(is("relink-valid"));
+        relink_request(0, 1, 0, 0, 1);
+        assert(relinks == 1 && !held && get(0x1cb0000018ULL) == 0x10100);
+        assert(get(0x1cb0100000ULL) == 0x1900106b && (get(0x1cb0100010ULL) & ~15U) == 0x80000000U);
+        assert(!(get(0x1cb0100004ULL) & 4) && !get(0xb80008000ULL));
+        census_request(0x1cb0100000ULL, 1, 0, true, 1);
+    }
+    printf("%s relinks=%u held=%d PASS\n", scenario, relinks, held);
+}
+
 int main(int argc, char **argv)
 {
     setbuf(stdout, NULL);
@@ -840,6 +917,10 @@ int main(int argc, char **argv)
     }
     if (!strncmp(scenario, "census-", 7)) {
         census_scenario();
+        return 0;
+    }
+    if (!strncmp(scenario, "relink-", 7)) {
+        relink_scenario();
         return 0;
     }
     unsigned char result[128];

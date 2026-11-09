@@ -300,6 +300,27 @@ int j813_n1_prepare_fabric_acquired_windows(void)
     return j813_n1_prepare_fabric_windows_mode(true);
 }
 
+/* Guest-requested re-link under Windows (hv_windows_n1_relink_hvc). Only after
+ * the one-shot handoff ran: repeats the port sequence, including the SMC N1
+ * reset, on a port/PHY whose prefix is already programmed. */
+int j813_n1_relink_windows(bool *port_ready)
+{
+    struct j813_n1_regs r;
+    if (!port_ready)
+        return -1;
+    *port_ready = false;
+    if (!windows_fabric_ready || !windows_finish_attempted || j813_n1_regs(&r))
+        return -1;
+    enum exc_guard_t saved = exc_guard;
+    int before = exc_count;
+    exc_guard = GUARD_MARK | GUARD_SILENT;
+    int result = j813_n1_finish(&r, port_ready);
+    sysop("dsb sy");
+    sysop("isb");
+    exc_guard = saved;
+    return result || exc_count != before ? -1 : 0;
+}
+
 int j813_n1_finish_windows(bool *port_ready)
 {
     struct j813_n1_regs r;

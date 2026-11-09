@@ -17,7 +17,7 @@ SOURCES = ['src/hv/windows/hv_exc.c', 'src/hv/windows/hv_asm.S',
            'src/exception.h', 'src/types.h', 'src/arm_cpu_regs.h', 'src/cpu_regs.h',
            'tests/e2e/windows_n1/census_dispatch_host.c',
            'tests/e2e/windows_n1/failure-model.md', 'tools/windows_n1_dispatch_e2e.py']
-CASES = ['success', 'pending', 'wrong-cpu', 'unprepared', 'guard-busy',
+CASES = ['relink-routed', 'success', 'pending', 'wrong-cpu', 'unprepared', 'guard-busy',
          'invalid-address', 'invalid-version', 'reserved-argument', 'read-fault',
          'unrelated-hvc', 'nonzero-immediate', 'fast-msr', 'slow-msr']
 

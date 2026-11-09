@@ -37,6 +37,8 @@ CASES = (
     "census-bsp", "census-version", "census-reserved", "census-address",
     "census-guard", "census-masked", "census-pending", "census-load-fault",
     "census-barrier-fault",
+    "relink-unprepared", "relink-args", "relink-magic", "relink-caps", "relink-bsp",
+    "relink-train", "relink-exhausted", "relink-valid",
 )
 SOURCES = (
     "src/hv/windows/windows_n1_scope.h", "src/hv/windows/windows_n1_dart.h",

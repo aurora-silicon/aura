@@ -20,4 +20,26 @@ int hv_windows_n1_acquire(void *descriptor, size_t size);
  * Return x0=ACK, x1=status, x2=u32 value (zero on failure), x3=version.
  * Caller holds the HV lock. Unknown magic leaves all registers unchanged. */
 bool hv_windows_n1_census_hvc(u64 regs[4]);
+/* Capability probe through the census call: x1=CAPS_ADDRESS returns OK with
+ * x2=capability bits. Images without relink answer INVALID, so a guest can
+ * probe safely before issuing the relink call. */
+#define HV_WINDOWS_N1_CAPS_ADDRESS    0x4e3143415053ULL /* "N1CAPS" */
+#define HV_WINDOWS_N1_CAP_RELINK      1u
+/* HVC #0: x0=RELINK_CALL, x1=0, x2=version, x3=0. Re-runs the handoff's
+ * Linux reset/port sequence (SMC N1 reset, port reset, PERST release, root
+ * tunables, LTSSM, buses), then the endpoint/DART/BAR checks, and leaves a
+ * cold-ROM endpoint with BME off. On failure PERST is held. Bounded count.
+ * Return x0=RELINK_ACK, x1=status (0 ok, enum below), x2=failed phase or
+ * attempt number, x3=version. Same caller rules as the census. */
+#define HV_WINDOWS_N1_RELINK_CALL     0x4e31524c4e4bULL /* "N1RLNK" */
+#define HV_WINDOWS_N1_RELINK_ACK      0x4e31524c414bULL /* "N1RLAK" */
+#define HV_WINDOWS_N1_RELINK_VERSION  1
+enum hv_windows_n1_relink_status {
+    HV_WINDOWS_N1_RELINK_OK = 0,
+    HV_WINDOWS_N1_RELINK_UNAVAILABLE = -1,
+    HV_WINDOWS_N1_RELINK_INVALID = -2,
+    HV_WINDOWS_N1_RELINK_EXHAUSTED = -4,
+    HV_WINDOWS_N1_RELINK_FAILED = -5,
+};
+bool hv_windows_n1_relink_hvc(u64 regs[4]);
 #endif

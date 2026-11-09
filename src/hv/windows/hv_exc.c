@@ -4356,6 +4356,8 @@ static void hv_scan_guest_modules(void)
  * 1kHz, a bugcheck on any of the other seven never satisfies it.  KiBugCheckData
  * is global, so read it directly instead.
  */
+static bool t8142_bugcheck_seen;
+
 void hv_check_t8142_bugcheck(void)
 {
     static bool reported;
@@ -4398,6 +4400,144 @@ void hv_check_t8142_bugcheck(void)
     hv_report_t8142_dead_process(code, read64(pa + 8));
     hv_report_t8142_wfi_traps();
     hv_report_t8142_el0_vector();
+    __atomic_store_n(&t8142_bugcheck_seen, true, __ATOMIC_RELEASE);
+}
+
+/*
+ * Name who called into a bugcheck.
+ *
+ * Windows writes no crash dump on this platform, so once KiBugCheckData is set
+ * this is the only record of the call chain. Each CPU, on its first host tick
+ * in EL1 after the bugcheck was seen, prints its PC and LR and every value on
+ * its kernel stack that falls inside a loaded kernel image, as module+offset.
+ * The bugchecking CPU's dump includes the exception trap frame (faulting PC
+ * and LR) and its callers; the other CPUs show where they were frozen. Reads
+ * only guest memory; the module table is built once from PsLoadedModuleList
+ * under the same kernel-base check as the image scanner.
+ */
+#define HV_NT_LDR_SIZEOFIMAGE 0x40
+#define HV_NT_LDR_BASEDLLNAME 0x58 /* UNICODE_STRING: Length u16, Buffer at +8 */
+#define HV_BUGSTACK_MODULES   192
+#define HV_BUGSTACK_BYTES     0x4000
+#define HV_BUGSTACK_HITS      80
+
+static struct {
+    u64 base;
+    u32 size;
+    char name[24];
+} bugstack_mod[HV_BUGSTACK_MODULES];
+static u32 bugstack_mod_count;
+static u32 bugstack_mod_state; /* 0 not built, 1 building, 2 ready */
+static u64 bugstack_done_mask;
+
+static void hv_bugstack_build_modules(void)
+{
+    u64 head = t8142_kernel_base + HV_NT_PSLOADEDMODULELIST_RVA;
+    u64 entry, first_base;
+    u32 n = 0;
+
+    if (!hv_read_guest64(head, &entry) || !entry || entry == head ||
+        !hv_read_guest64(entry + HV_NT_LDR_DLLBASE, &first_base) ||
+        first_base != t8142_kernel_base)
+        return; /* not the list we think it is: no names, raw values only */
+
+    for (u32 i = 0; i < HV_NT_MAX_MODULES && n < HV_BUGSTACK_MODULES && entry && entry != head;
+         i++) {
+        u64 base, buffer;
+        u32 size, name_len;
+
+        hv_wdt_pet();
+        if (!hv_read_guest64(entry + HV_NT_LDR_DLLBASE, &base) ||
+            !hv_read_guest32(entry + HV_NT_LDR_SIZEOFIMAGE, &size) ||
+            !hv_read_guest32(entry + HV_NT_LDR_BASEDLLNAME, &name_len) ||
+            !hv_read_guest64(entry + HV_NT_LDR_BASEDLLNAME + 8, &buffer))
+            break;
+        if (base >= 0xffff000000000000UL && size) {
+            u32 chars = (name_len & 0xffff) / 2;
+
+            bugstack_mod[n].base = base;
+            bugstack_mod[n].size = size;
+            memset(bugstack_mod[n].name, 0, sizeof(bugstack_mod[n].name));
+            for (u32 c = 0; c < chars && c < sizeof(bugstack_mod[n].name) - 1; c++) {
+                u32 pair;
+
+                if (!hv_read_guest32((buffer + 2 * c) & ~3UL, &pair))
+                    break;
+                u16 wc = (u16)(((buffer + 2 * c) & 2) ? (pair >> 16) : pair);
+                bugstack_mod[n].name[c] = (wc >= 0x20 && wc < 0x7f) ? (char)wc : '?';
+            }
+            n++;
+        }
+        if (!hv_read_guest64(entry, &entry)) /* InLoadOrderLinks.Flink */
+            break;
+    }
+    bugstack_mod_count = n;
+}
+
+static const char *hv_bugstack_lookup(u64 value, u64 *offset)
+{
+    for (u32 i = 0; i < bugstack_mod_count; i++) {
+        if (value >= bugstack_mod[i].base && value - bugstack_mod[i].base < bugstack_mod[i].size) {
+            *offset = value - bugstack_mod[i].base;
+            return bugstack_mod[i].name;
+        }
+    }
+    return NULL;
+}
+
+void hv_dump_t8142_bugcheck_stack(struct exc_info *ctx)
+{
+    u32 cpu = smp_id(), state, hits = 0;
+    u32 mode = ctx->spsr & 0xf;
+    u64 off, sp, x18;
+    const char *name;
+
+    if (chip_id != T8142 || !__atomic_load_n(&t8142_bugcheck_seen, __ATOMIC_ACQUIRE) ||
+        cpu >= 64 || (__atomic_load_n(&bugstack_done_mask, __ATOMIC_ACQUIRE) & BIT(cpu)))
+        return;
+    if (mode != 4 && mode != 5) /* EL1t / EL1h only: user stacks name nothing */
+        return;
+
+    state = 0;
+    if (__atomic_compare_exchange_n(&bugstack_mod_state, &state, 1, false, __ATOMIC_ACQ_REL,
+                                    __ATOMIC_ACQUIRE)) {
+        hv_bugstack_build_modules();
+        __atomic_store_n(&bugstack_mod_state, 2, __ATOMIC_RELEASE);
+        printf("HV: bugstack: %u kernel modules named\n", bugstack_mod_count);
+    } else if (state != 2) {
+        return; /* another CPU is still building the table; dump on a later tick */
+    }
+    if (__atomic_fetch_or(&bugstack_done_mask, BIT(cpu), __ATOMIC_ACQ_REL) & BIT(cpu))
+        return;
+
+    sp = mode == 5 ? ctx->sp[1] : ctx->sp[0];
+    x18 = ctx->regs[18];
+    name = hv_bugstack_lookup(ctx->elr, &off);
+    printf("HV: bugstack cpu=%u pc=0x%lx %s+0x%lx sp=0x%lx x18=0x%lx\n", cpu, ctx->elr,
+           name ? name : "?", name ? off : 0, sp, x18);
+    name = hv_bugstack_lookup(ctx->regs[30], &off);
+    printf("HV: bugstack cpu=%u lr=0x%lx %s+0x%lx\n", cpu, ctx->regs[30], name ? name : "?",
+           name ? off : 0);
+
+    for (u64 at = sp & ~7UL; at < sp + HV_BUGSTACK_BYTES && hits < HV_BUGSTACK_HITS;) {
+        u64 pa = hv_translate(at, false, false, NULL);
+        u64 page_end = (at | 0xfffUL) + 1;
+
+        hv_wdt_pet();
+        if (!pa)
+            break; /* end of the mapped stack */
+        for (; at < page_end && at < sp + HV_BUGSTACK_BYTES && hits < HV_BUGSTACK_HITS;
+             at += 8, pa += 8) {
+            u64 value = read64(pa);
+
+            name = hv_bugstack_lookup(value, &off);
+            if (!name)
+                continue;
+            printf("HV: bugstack cpu=%u sp+0x%04lx %s+0x%lx\n", cpu, at - sp, name, off);
+            hits++;
+        }
+    }
+    printf("HV: bugstack cpu=%u end (%u hits)\n", cpu, hits);
 }
 
 void hv_report_t8142_gic_activity(void)
@@ -6000,7 +6140,8 @@ void hv_exc_sync(struct exc_info *ctx)
              */
             /* The guarded N1 read shares exc_guard and requires the HV lock
              * and pending-aware SError unmask performed by hv_exc_entry(). */
-            if (FIELD_GET(ESR_ISS, ctx->esr) == 0 && ctx->regs[0] == HV_WINDOWS_N1_READ_CALL)
+            if (FIELD_GET(ESR_ISS, ctx->esr) == 0 && (ctx->regs[0] == HV_WINDOWS_N1_READ_CALL ||
+                                                      ctx->regs[0] == HV_WINDOWS_N1_RELINK_CALL))
                 break;
             handled = hv_handle_t8142_undef_trampoline(ctx) || hv_handle_smc(ctx);
             break;
@@ -6099,7 +6240,8 @@ void hv_exc_sync(struct exc_info *ctx)
 
     switch (ec) {
         case ESR_EC_HVC:
-            handled = FIELD_GET(ESR_ISS, ctx->esr) == 0 && hv_windows_n1_census_hvc(ctx->regs);
+            handled = FIELD_GET(ESR_ISS, ctx->esr) == 0 &&
+                      (hv_windows_n1_census_hvc(ctx->regs) || hv_windows_n1_relink_hvc(ctx->regs));
             break;
         case ESR_EC_DABORT_LOWER:
             hv_wdt_breadcrumb('D');

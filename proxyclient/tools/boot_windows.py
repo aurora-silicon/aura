@@ -8,7 +8,7 @@ from pathlib import Path
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from aura.windows import launch_profile, plan_profile
+from aura.windows import launch_profile, plan_profile, xfer_plan_summary
 
 
 def main():
@@ -29,7 +29,8 @@ def main():
         result = {"result": "profile-valid", "hardware_accessed": False,
                   "target": plan.profile["target"], "images": plan.images,
                   "entry_offset": plan.entry_offset, "alignment": 0x10000,
-                  "combined_sha256": hashlib.sha256(plan.image).hexdigest()}
+                  "combined_sha256": hashlib.sha256(plan.image).hexdigest(),
+                  "xfer": xfer_plan_summary(plan.xfer)}
     print(json.dumps(result, indent=2))
 
 
