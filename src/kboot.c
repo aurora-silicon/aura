@@ -8320,6 +8320,138 @@ static int dt_set_isp_fwdata(void)
     return 0;
 }
 
+static bool t6050_isp_segments_valid(const struct adt_segment_ranges *seg, u32 len,
+                                     u64 ram, u64 ram_size)
+{
+    if (!seg || !len || len % sizeof(*seg) || len / sizeof(*seg) > 8 ||
+        !ram_size || ram > UINT64_MAX - ram_size)
+        return false;
+    u64 total = 0;
+    for (u32 i = 0; i < len / sizeof(*seg); i++) {
+        u64 size = ALIGN_UP((u64)seg[i].size, SZ_16K);
+        if (!size || (seg[i].phys & (SZ_16K - 1)) || seg[i].phys < ram ||
+            seg[i].phys - ram >= ram_size || size > ram_size - (seg[i].phys - ram) ||
+            seg[i].iova > UINT64_MAX - size || seg[i].remap > UINT64_MAX - size)
+            return false;
+        total += size;
+        if (total > 64 * SZ_1M)
+            return false;
+        for (u32 j = 0; j < i; j++) {
+            u64 prev_size = ALIGN_UP((u64)seg[j].size, SZ_16K);
+            if (seg[i].phys < seg[j].phys + prev_size &&
+                seg[j].phys < seg[i].phys + size)
+                return false;
+        }
+    }
+    return true;
+}
+
+/*
+ * T6050 firmware lives below Linux RAM. Publish its current ADT ranges, not
+ * snapshot physical addresses. The kernel allocates the small main-memory
+ * tail and owns all power, DART and firmware-start operations. J716c's camera
+ * is sensor type 0x75, J714s's 0x74; both have the same two segments.
+ */
+static int dt_set_t6050_isp(void)
+{
+    int node = fdt_path_offset(dt, "isp");
+    if (node < 0)
+        return 0;
+    u32 want;
+    if (!fdt_node_check_compatible(dt, 0, "apple,j716c"))
+        want = 0x75;
+    else if (!fdt_node_check_compatible(dt, 0, "apple,j714s"))
+        want = 0x74;
+    else
+        return -1;
+    if (os_firmware.version != V27_0)
+        return -1;
+
+    int chosen = adt_path_offset(adt, "/chosen");
+    int isp = adt_path_offset(adt, "/arm-io/isp0");
+    u64 ram, ram_size;
+    u32 len, platform, scheme = 0;
+    if (chosen < 0 || isp < 0)
+        return -1;
+    const struct adt_segment_ranges *seg = adt_getprop(adt, isp, "segment-ranges", &len);
+    if (ADT_GETPROP(adt, chosen, "dram-base", &ram) != sizeof(ram) ||
+        ADT_GETPROP(adt, chosen, "dram-size", &ram_size) != sizeof(ram_size) ||
+        ADT_GETPROP(adt, isp, "sensor-type", &platform) != sizeof(platform) ||
+        platform != want || !t6050_isp_segments_valid(seg, len, ram, ram_size) ||
+        len != 2 * sizeof(*seg) ||
+        seg[0].iova != 0 || seg[0].size != 0xc1c000 ||
+        seg[1].iova != 0xc1c000 || seg[1].size != 0x13d0000 ||
+        seg[0].remap != 0x10000000000 || seg[1].remap != 0x10000c1c000)
+        return -1;
+    ADT_GETPROP(adt, isp, "cam-connections-scheme", &scheme);
+
+    uint32_t owner = fdt_get_phandle(dt, node);
+    if (!owner && (fdt_generate_phandle(dt, &owner) ||
+                   fdt_setprop_u32(dt, node, "phandle", owner)))
+        return -1;
+    if (fdt_getprop(dt, node, "memory-region", NULL))
+        return -1;
+    const char *names[] = {"text", "data"};
+    for (unsigned int i = 0; i < 2; i++) {
+        char name[64];
+        snprintf(name, sizeof(name), "isp-firmware-%s@%lx", names[i], seg[i].phys);
+        int mem = dt_get_or_add_reserved_mem(name, "apple,asc-mem", true,
+                                             seg[i].phys, seg[i].size);
+        if (mem < 0 ||
+            dt_device_set_reserved_mem(mem, name, owner, seg[i].remap, seg[i].size))
+            return -1;
+        uint32_t phandle = fdt_get_phandle(dt, mem);
+        if (!phandle || dt_device_add_mem_region("isp", phandle, names[i]))
+            return -1;
+    }
+
+    int reserved = fdt_path_offset(dt, "/reserved-memory");
+    int mem = fdt_add_subnode(dt, reserved, "isp-main-memory");
+    uint32_t phandle;
+    if (mem < 0 || fdt_generate_phandle(dt, &phandle) ||
+        fdt_setprop_u32(dt, mem, "phandle", phandle) ||
+        dt_device_set_reserved_mem(mem, "isp-main-memory", owner,
+                                   0x10000000000, 0x2000000) ||
+        dt_device_add_mem_region("isp", phandle, "heap"))
+        return -1;
+
+    node = fdt_path_offset(dt, "isp");
+    if (firmware_set_fdt(dt, node, "apple,firmware-version", &os_firmware) ||
+        fdt_setprop_u32(dt, node, "apple,platform-id", platform) ||
+        fdt_setprop_u32(dt, node, "apple,cam-connections-scheme", scheme))
+        return -1;
+
+    const char *aliases[] = {"isp-dart0", "isp-dart1", "isp-dart2", "isp"};
+    for (unsigned int i = 0; i < ARRAY_SIZE(aliases); i++) {
+        node = fdt_path_offset(dt, aliases[i]);
+        if (node < 0 || fdt_setprop_string(dt, node, "status", "okay"))
+            return -1;
+    }
+    printf("FDT: T6050 ISP: reserved text/data, main memory 32 MiB; platform 0x%x\n",
+           platform);
+    return 0;
+}
+
+static int dt_t6050_isp_transaction(void)
+{
+    void *original = dt;
+    size_t capacity = fdt_totalsize(original);
+    void *scratch = malloc(capacity);
+    if (!scratch) {
+        printf("FDT: no space for camera handoff; leaving it disabled\n");
+        return 0;
+    }
+    memcpy(scratch, original, capacity);
+    dt = scratch;
+    if (!dt_set_t6050_isp())
+        memcpy(original, scratch, capacity);
+    else
+        printf("FDT: rejected T6050 ISP handoff; leaving it disabled\n");
+    dt = original;
+    free(scratch);
+    return 0;
+}
+
 /*
  * The camera is optional. Without a valid ADT firmware description, or if its firmware or heap
  * reservation fails, disable the ISP and boot on without it instead of failing the whole handoff.
@@ -8327,6 +8459,10 @@ static int dt_set_isp_fwdata(void)
 static int dt_set_isp(void)
 {
     u64 heap_phys, heap_iova, heap_size;
+
+    if (chip_id == T6050)
+        return dt_t6050_isp_transaction();
+
 
     /* J614s consumes the boot firmware's segments after DAPF setup. */
     if (chip_id == T6040 && board_id == 4 && adt_is_compatible(adt, 0, "J614sAP") &&

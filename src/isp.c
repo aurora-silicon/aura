@@ -95,6 +95,10 @@ static int isp_firmware_end(const struct adt_segment_ranges *segments, u32 lengt
 
 int isp_init(void)
 {
+    /* The T6050 kernel owns power-up. Its handoff only reserves memory. */
+    if (chip_id == T6050)
+        return 0;
+
     int err = -1;
     /* T8142 takes the T8140 (ISP17a) path throughout. */
     bool t8142 = chip_id == T8142;
