@@ -284,6 +284,10 @@ $(BUILD_FP_OBJS): build/%.o: src/%.c
 	$(QUIET)mkdir -p "$(dir $@)"
 	$(QUIET)$(CC) -c $(BASE_CFLAGS) -MMD -MF $(DEPDIR)/$(*F).d -MQ "$@" -MP -o $@ $<
 
+# Guest-only code in .init (aura.ld): its cL4 register switches are 5 KiB smaller at -Oz, which
+# leaves room in .init for more of the guest-only objects.
+build/sptm_virt_cl4.o: CFLAGS += -Oz
+
 build/%.o: src/%.c build-tag build-cfg
 	$(QUIET)echo "  CC    $@"
 	$(QUIET)mkdir -p $(DEPDIR)
