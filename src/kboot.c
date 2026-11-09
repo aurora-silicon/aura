@@ -3971,7 +3971,33 @@ static int dt_set_ave_node(int node)
      */
     bool use_remap = !fdt_node_check_compatible(dt, node, "apple,t8140-ave") ||
                      !fdt_node_check_compatible(dt, node, "apple,t6041-ave");
-    if (dt_reserve_asc_firmware(adt_path, NULL, path, use_remap, 0)) {
+    /*
+     * On T8112 the encoder's DART window starts at the DART's vm-base: iBoot points the
+     * coprocessor code base there, and the firmware addresses DATA at vm-base plus its
+     * offset. Hand both segments over at vm-base + iova-offset.
+     */
+    u64 dva_base = 0;
+    if (!fdt_node_check_compatible(dt, node, "apple,t8112-ave")) {
+        int dnode = adt_path_offset(adt, "/arm-io/dart-ave");
+        u32 vlen = 0;
+        const void *vprop = dnode < 0 ? NULL : adt_getprop(adt, dnode, "vm-base", &vlen);
+
+        if (vprop && vlen == sizeof(u64)) {
+            memcpy(&dva_base, vprop, sizeof(dva_base));
+        } else if (vprop && vlen == sizeof(u32)) {
+            u32 v;
+            memcpy(&v, vprop, sizeof(v));
+            dva_base = v;
+        } else {
+            reason = "AVE DART vm-base missing";
+            goto disable;
+        }
+        if (dva_base & (SZ_16K - 1)) {
+            reason = "AVE DART vm-base not 16K aligned";
+            goto disable;
+        }
+    }
+    if (dt_reserve_asc_firmware(adt_path, NULL, path, use_remap, dva_base)) {
         reason = "firmware reservation failed";
         goto disable;
     }
