@@ -535,8 +535,35 @@ static bool s2r_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int w
      * that leaves nothing to read back. */
     if (write && sptm_virt_s2r_live) {
         static u32 n;
-        if (n++ < 1500)
+        if (n++ < 600)
             printf("SPTM-virt[pmgr wr] %s 0x%lx <- 0x%lx pc 0x%lx\n", what, addr, *val, ctx->elr);
+        /* And every 10 s, how many writes each hooked block took (a display that swaps shows
+         * up as steady DCP mailbox traffic). */
+        static struct {
+            const char *what;
+            u32 n;
+        } cnt[16];
+        static u64 next;
+        for (unsigned i = 0; i < ARRAY_SIZE(cnt); i++) {
+            if (cnt[i].what == what || !cnt[i].what) {
+                cnt[i].what = what;
+                cnt[i].n++;
+                break;
+            }
+        }
+        u64 now = mrs(CNTPCT_EL0);
+        if (now >= next) {
+            next = now + 10 * mrs(CNTFRQ_EL0);
+            char line[400];
+            int len = 0;
+            for (unsigned i = 0; i < ARRAY_SIZE(cnt) && cnt[i].what; i++) {
+                len += snprintf(line + len, sizeof(line) - len, " %s=%u", cnt[i].what, cnt[i].n);
+                cnt[i].n = 0;
+                if (len >= (int)sizeof(line) - 1)
+                    break;
+            }
+            printf("SPTM-virt[hook writes/10s]%s\n", line);
+        }
     }
     s2r_wakerec_fallback();
     if (s2r_wakerec_printed)

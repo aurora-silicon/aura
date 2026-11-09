@@ -171,6 +171,12 @@ static bool sptm_virt_rg_hook(struct exc_info *ctx, u64 addr, u64 *val, bool wri
         rg_alarm_shadow[1] = read32(rg_xwdt + WDT_ALARM);
         rg_xwdt_seeded = true;
     }
+    /* Who touches the exclave watchdog page at all (the exclave's own driver, or XNU)? */
+    static u32 xlog;
+    if (rg_xwdt && (a & ~0x3fffUL) == rg_xwdt && xlog++ < 24)
+        printf("SPTM-virt[rst c%d]: xwdt %s +0x%lx%s0x%lx pc 0x%lx%s\n", smp_id(),
+               write ? "wr" : "rd", a - rg_xwdt, write ? " <- " : " ", write ? *val : 0, ctx->elr,
+               sptm_virt_in_cl4() ? " (cL4)" : "");
     sptm_virt_s2r_note(ctx, addr, write ? *val : 0, write, width);
     if (sptm_virt_rg_passthrough) {
         for (int w = 0; write && width == 2 && w < 2; w++) {
@@ -284,6 +290,10 @@ static void sptm_virt_rg_page(u64 pa, const char *what)
     hv_map_hook(page, sptm_virt_rg_hook, 0x4000);
 }
 
+/* AURA_RG_XWDT=0: leave the exclave watchdog's page (hib-exclave-watchdog, also eic's
+ * mmio-wd-e) unhooked, to the exclaves that own it. */
+u32 sptm_virt_rg_xwdt = 1;
+
 static void sptm_virt_reset_guard_setup(void)
 {
     int path[8];
@@ -309,7 +319,7 @@ static void sptm_virt_reset_guard_setup(void)
         rg_alarm_shadow[0] = rg_wdt ? read32(rg_wdt + WDT_ALARM) : 0;
     }
     node = adt_path_offset_trace(adt, "/arm-io/hib-exclave-watchdog", path);
-    if (node >= 0 && adt_get_reg(adt, path, "reg", 0, &pa, &sz) >= 0) {
+    if (sptm_virt_rg_xwdt && node >= 0 && adt_get_reg(adt, path, "reg", 0, &pa, &sz) >= 0) {
         rg_xwdt = pa;
         sptm_virt_rg_page(pa, "hib-exclave-watchdog");
     }
@@ -335,10 +345,15 @@ static void sptm_virt_reset_guard_setup(void)
 u32 sptm_virt_amcc_nolock = 1;
 static u64 amcc_lock_shadow[16][2]; /* {pa, value} */
 
+/* sptm_virt_amcc_nolock is a mask over the three locks: bit 0 +0xacc, bit 1 +0xadc, bit 2 +0xaec.
+ * Only +0xacc covers aura (t124: shadowing it alone keeps aura's memory; the other two -- the
+ * CTRR span low in DRAM, where the GPU firmware's text lives, and the range after stage 1 --
+ * are locked by SPTM as on real hardware). */
 static bool amcc_is_lock(u64 addr)
 {
     u32 off = addr & 0x3ffff;
-    return off == 0xacc || off == 0xadc || off == 0xaec;
+    int bit = off == 0xacc ? 0 : off == 0xadc ? 1 : off == 0xaec ? 2 : -1;
+    return bit >= 0 && (sptm_virt_amcc_nolock & BIT(bit));
 }
 
 static bool amcc_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int width)

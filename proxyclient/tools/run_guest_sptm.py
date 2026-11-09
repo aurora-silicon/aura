@@ -46,9 +46,11 @@ Environment (all optional; 1 enables a switch):
   AURA_OS_LONG_VERSION     the guest's Ap,OSLongVersion (--os-long-version)
   AURA_KEEP_BOOT_VIDEO     hand iBoot's boot framebuffer to XNU, aura's console off it
   AURA_TAIL_SECS, AURA_TAIL_IDLE   keep reading the console after entry, until idle
-  AURA_AMCC_NOLOCK=0       let SPTM lock iBoot's AMCC ranges (they cover stage 1's image = aura)
+  AURA_AMCC_NOLOCK=<mask>  which of SPTM's AMCC range locks aura shadows (bit 0 +0xacc, 1 +0xadc,
+                           2 +0xaec; default 1, the one over aura's image; 0 lets SPTM lock all)
   AURA_WFI_WATCH=1|2       trap XNU's WFIs (2: and WFEs) and report every 10 s (idle vs. dead)
   AURA_HIDE_NODES=<a,b>    further ADT nodes to hide from the guest (comma-separated paths)
+  AURA_RG_XWDT=0           leave the exclave watchdog's page unhooked (the reset guard skips it)
   AURA_TRAP_DELAY_NS=<n>   spin n ns in every GL trap (workaround: holds off the ~20 s stall)
   AURA_TRAP_DELAY_MASK=<m> which GL traps spin: 1 GEXIT, 2 g-ERET, 4 IMPDEF, 8 SPTM's entry
                            sysreg read, 16 HVC, 32 rest, 64 other sysregs
@@ -122,6 +124,7 @@ KNOWN_ENV = {
     "AURA_AMCC_NOLOCK",
     "AURA_WFI_WATCH",
     "AURA_HIDE_NODES",
+    "AURA_RG_XWDT",
     "AURA_TRAP_DELAY_NS",
     "AURA_TRAP_DELAY_MASK",
     "AURA_CPTR_LIVE",
@@ -809,7 +812,9 @@ def main():
         p.write32(sym["sptm_virt_wfi_watch"], env_int("AURA_WFI_WATCH"))
     if os.environ.get("AURA_AMCC_NOLOCK"):
         p.write32(sym["sptm_virt_amcc_nolock"], env_int("AURA_AMCC_NOLOCK"))
-        print("AMCC range locks:", "shadowed" if env_int("AURA_AMCC_NOLOCK") else "SPTM's (locked)")
+        print(f"AMCC range locks shadowed: mask {env_int('AURA_AMCC_NOLOCK'):#x}")
+    if os.environ.get("AURA_RG_XWDT"):
+        p.write32(sym["sptm_virt_rg_xwdt"], env_int("AURA_RG_XWDT"))
     print("entering SPTM at virtual EL2 (the result is on aura's console)")
     # sptm_virt_enter does not return. Waiting for a reply or a boot banner would eat the guest's
     # first console output and reopen the link.
