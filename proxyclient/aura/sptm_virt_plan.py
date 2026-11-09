@@ -244,6 +244,17 @@ def build_boot_args(virt_base, phys_base, mem_size, top_of_kernel_data, adt_va, 
     return bytes(b)
 
 
+def check_video(video, dram_base, mem_size_actual):
+    if len(video) != 6 or any(not isinstance(v, int) or not 0 <= v < 1 << 64 for v in video):
+        raise ValueError("invalid boot video words")
+    fb, _display, stride, width, height, depth = video
+    bpp = depth & 0xff
+    if (not 0 < width <= 16384 or not 0 < height <= 16384 or bpp not in (16, 24, 30, 32) or
+            stride < width * ((bpp + 7) // 8) or fb < dram_base or
+            fb + stride * height > dram_base + mem_size_actual):
+        raise ValueError("the boot framebuffer is outside DRAM or has an invalid geometry")
+
+
 def set_os_long_version(root, version, notes):
     """TXM checks a cryptex against the manifest's OS long version, which a tree a non-macOS
     stage booted lacks."""
@@ -343,7 +354,7 @@ def plan_boot(sptm, txm, xnu, adt, *, dram_base, phys_base, mem_size, mem_size_a
               placement_shift=None, blob_base=None, hide_nodes=(), xnu_serial=None,
               drop_props=(), cl4_regions=None, cl4_entry=0, cl4_virt=0,
               exclave_integrity=b"", exclave_trustcache=b"", iboot_copies=(),
-              diag_record=False, os_long_version=None):
+              diag_record=False, os_long_version=None, video=None):
     """Compute the whole iBoot->SPTM handoff.
 
     sptm/txm/xnu are the raw Mach-O files, ``adt`` the live device tree,
@@ -362,12 +373,17 @@ def plan_boot(sptm, txm, xnu, adt, *, dram_base, phys_base, mem_size, mem_size_a
 
     ``os_long_version``: the guest's Ap,OSLongVersion (its BuildIdentity), given to TXM as the
     manifest's ``love`` when the live tree has none; a different live value is refused.
+
+    ``video``: iBoot's boot framebuffer (base, display, stride, width, height, depth) to hand on,
+    refused unless it lies in DRAM with a sane geometry; None hands over none.
     """
     notes = []
     si, ti, xi = macho_info(sptm), macho_info(txm), macho_info(xnu)
     root, _ = adt_parse(adt)
     if os_long_version is not None:
         set_os_long_version(root, os_long_version, notes)
+    if video is not None:
+        check_video(video, dram_base, mem_size_actual)
 
     adt_hide_nodes(root, hide_nodes, notes)
     adt_drop_props(root, drop_props, notes)
@@ -804,7 +820,7 @@ def plan_boot(sptm, txm, xnu, adt, *, dram_base, phys_base, mem_size, mem_size_a
             f"blob [0x{txm_pa:x}, 0x{blob_end:x}) does not fit managed RAM "
             f"[0x{phys_base:x}, 0x{phys_base + mem_size:x})")
     ba = build_boot_args(virt_base, phys_base, mem_size, top, adt_va, len(new_adt), cmdline,
-                         mem_size_actual, boot_flags, diag_pa=diag_pa)
+                         mem_size_actual, boot_flags, video=video, diag_pa=diag_pa)
     if diag_pa:
         notes.append("boot_args revision 3: SPTM diagnostic record at %#x, %#x bytes"
                      % (diag_pa, BOOT_ARGS_DIAG_SIZE))

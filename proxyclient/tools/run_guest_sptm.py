@@ -40,6 +40,7 @@ Environment (all optional; 1 enables a switch):
   AURA_DEBUG_PORT=<n>      with the proxy on KIS, hide only USB-C port n (port-number), not all
   AURA_SPTM_DIAG           give SPTM a diagnostic record (boot_args revision 3, SPTMDebug)
   AURA_OS_LONG_VERSION     the guest's Ap,OSLongVersion (--os-long-version)
+  AURA_KEEP_BOOT_VIDEO     hand iBoot's boot framebuffer to XNU, aura's console off it
   AURA_TAIL_SECS, AURA_TAIL_IDLE   keep reading the console after entry, until idle
   XNU_BOOTARGS             XNU's command line
 
@@ -80,6 +81,7 @@ CONFIG_FLAGS = {
 KNOWN_ENV = {
     "AURA_KEEP_EXCLAVES",
     "AURA_OS_LONG_VERSION",
+    "AURA_KEEP_BOOT_VIDEO",
     "AURA_EXCLAVE_FW",
     "AURA_EXCLAVE_BUNDLE",
     "AURA_EXCLAVE_INTEGRITY",
@@ -635,7 +637,10 @@ def main():
         iboot_copies=copies, hide_nodes=hide, diag_record=env_on("AURA_SPTM_DIAG"),
         drop_props=() if keep_exclaves else ROUTES_PROPS,
         xnu_serial=f"/arm-io/{serial}" if serial else None,
-        os_long_version=args.os_long_version, **cl4)
+        os_long_version=args.os_long_version,
+        video=tuple(int(getattr(ba.video, f)) for f in
+                    ("base", "display", "stride", "width", "height", "depth"))
+        if env_on("AURA_KEEP_BOOT_VIDEO") else None, **cl4)
 
     entry, handoff = plan.sptm_entry_pa, plan.boot_args_pa
     print(f"bootargs: {args.bootargs}")
@@ -666,6 +671,9 @@ def main():
         print("loaded and recorded; not entering (--no-enter)")
         return
 
+    if env_on("AURA_KEEP_BOOT_VIDEO"):
+        from aura.proxy import IODEV
+        p.iodev_set_usage(IODEV.FB, 0)  # the framebuffer is XNU's now
     print("entering SPTM at virtual EL2 (the result is on aura's console)")
     # sptm_virt_enter does not return. Waiting for a reply or a boot banner would eat the guest's
     # first console output and reopen the link.
