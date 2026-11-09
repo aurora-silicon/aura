@@ -7440,31 +7440,6 @@ static int dt_set_sio_fwdata(const char *adt_path, const char *fdt_alias)
             return ret;
     }
 
-    struct sio_mapping native[MAX_SIO_NATIVE_MMIO];
-    int nnative = sio_native_mmio(adt_path, native, ARRAY_SIZE(native));
-    if (nnative < 0) {
-        printf("FDT: SIO(%s) native MMIO cannot be mapped, leaving it off\n", adt_path);
-        free(siodata);
-        return -1;
-    }
-
-    /* Mapped 1:1 in the SIO's DART before the OS starts the firmware (sio_native_mmio()). */
-    for (int i = 0; i < nnative; i++) {
-        char node_name[64];
-        snprintf(node_name, sizeof(node_name), "sio-mmio@%lx", native[i].phys);
-
-        int mem_node = dt_get_or_add_reserved_mem(node_name, "apple,asc-mmio", true,
-                                                  native[i].phys, native[i].size);
-        if (mem_node < 0 || dt_device_set_reserved_mem(mem_node, node_name, phandle,
-                                                       native[i].iova, native[i].size) < 0 ||
-            dt_device_add_mem_region(fdt_alias, fdt_get_phandle(dt, mem_node), NULL) < 0) {
-            printf("FDT: SIO(%s) native MMIO %lx not reserved, leaving it off\n", adt_path,
-                   native[i].phys);
-            free(siodata);
-            return -1;
-        }
-    }
-
     node = fdt_path_offset(dt, fdt_alias);
     if (node < 0)
         bail_cleanup("FDT: '%s' not found\n", fdt_alias);

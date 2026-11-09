@@ -29,8 +29,4 @@ struct sio_data {
 
 struct sio_data *sio_setup_fwdata(const char *adt_path);
 
-#define MAX_SIO_NATIVE_MMIO 4
-
-int sio_native_mmio(const char *adt_path, struct sio_mapping *ranges, int max);
-
 #endif
