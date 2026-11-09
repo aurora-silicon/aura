@@ -119,12 +119,18 @@ bool stage1_window_offered(void)
 
 /*
  * A boot started by a VDM `reboot debugusb` with a host reading the DockChannel console gets the
- * aura-proxy window, once per chain: not after an earlier aura stage offered one.
+ * aura-proxy window, once per chain: not after an earlier aura stage offered one. An ESP Stage 2
+ * goes by aura.host-window alone: a Stage 1 without this window chains it with nvme.adopt too,
+ * and the host would otherwise have no window at all.
  */
 bool debugusb_proxy_window(void)
 {
-    if (stage1_window_done || stage1_chained || stage1_window_passed ||
-        !dockchannel_uart_host_seen())
+#ifdef ESP_STAGE2
+    bool offered = stage1_window_passed;
+#else
+    bool offered = stage1_chained || stage1_window_passed;
+#endif
+    if (stage1_window_done || offered || !dockchannel_uart_host_seen())
         return false;
     stage1_window_done = true;
     printf("aura: debugusb boot, opening proxy window\n");
