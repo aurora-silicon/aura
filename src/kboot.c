@@ -10144,6 +10144,140 @@ undo:
     return 0;
 }
 
+/*
+ * T6040 display (DCP) across a real suspend-to-RAM that loses power (U5). On that
+ * path the in-tree apple-dcp driver lowers the internal panel's display power
+ * domains after it stops the firmware, and raises them again on wake, itself. It
+ * reaches those registers through an "apple,display-power" phandle on the DCP
+ * node (dcp_t6041_display_power(), drm/apple/dcp.c), consuming two windows by
+ * reg-name, mirroring aurora #1208's t8140 "dcp_power" node
+ * (t8140-j700-dcpext.dtsi):
+ *
+ *   ps       the display power-state block. On T6040 this is SOC-East
+ *            (/arm-io/pmgr reg[2], 0x502280000): the internal panel's
+ *            DISP_SYS at +0x258, DISP_FE at +0x368, DISP_CPU at +0x10000
+ *            (the pmgr_disp sub-block 0x502290000).
+ *   pmc-dcp  the shared PMS DCP-power voter counter: /arm-io/disp0 reg[4]
+ *            (0x504800000) + 0xa9c14 = 0x5048a9c14, as the g19/run12 macOS
+ *            entry trace recorded (pms-pmc 0x5048a9c14/c18).
+ *
+ * Our static T6040 DT ships no such node (and must NOT ship a static one, or it
+ * would block this publish), so build it here from the ADT and point the
+ * internal DCP (apple,t6041-dcp = dcp@402e00000, the eDP panel) at it. The two
+ * apple,t6041-dcpext controllers (HDMI 3a2e00000, USB-C DP 602e00000) use the
+ * west SOC-PS block instead and are deferred, so they get no node here.
+ *
+ * Refusal-safe: if a window is absent or does not validate, publish nothing and
+ * leave apple,display-power unset, so dcp_t6041_display_power() returns -ENODEV
+ * and the S2R display lower/raise is skipped (the panel stays off until reboot,
+ * exactly as today) rather than driving a bogus block. Windows are RE'd in
+ * G29-AURA-DISPLAY-POWER.md.
+ */
+#define T6040_DISP_PS_ADT_IDX  2 /* /arm-io/pmgr reg index (SOC-East) */
+#define T6040_DISP_PS_BASE     0x502280000UL
+#define T6040_DISP_PS_SIZE     0x14000UL /* covers DISP_SYS/FE + DISP_CPU @ +0x10000 */
+#define T6040_DISP_PMP_ADT_IDX 4         /* /arm-io/disp0 reg index (shared PMP block) */
+#define T6040_DISP_PMC_OFF     0xa9c14UL /* + disp0 reg[4] base = the pmc-dcp voter */
+#define T6040_DISP_PMC_SIZE    0x8UL     /* the c14/c18 voter pair */
+
+static int dt_set_t6040_sleep_display(void)
+{
+    /* Self-gating: only the T6041 internal DCP (eDP panel) needs this. */
+    int dcp = fdt_node_offset_by_compatible(dt, -1, "apple,t6041-dcp");
+    if (dcp < 0)
+        return 0;
+    /* Idempotent: do nothing if the contract is already wired. A static DT node
+     * here would stop at this check and block the publish, so the DT ships none. */
+    if (fdt_getprop(dt, dcp, "apple,display-power", NULL))
+        return 0;
+
+    /* ---- validate pass: read both windows from the ADT, touch no DT yet ---- */
+    int pmgr_path[8];
+    int pmgr = adt_path_offset_trace(adt, "/arm-io/pmgr", pmgr_path);
+    if (pmgr < 0)
+        return 0;
+    u64 ps_addr, ps_size;
+    if (adt_get_reg(adt, pmgr_path, "reg", T6040_DISP_PS_ADT_IDX, &ps_addr, &ps_size) < 0) {
+        printf("FDT: DCP display-power: /arm-io/pmgr reg[%d] (ps) missing; skipping\n",
+               T6040_DISP_PS_ADT_IDX);
+        return 0;
+    }
+    if (ps_addr != T6040_DISP_PS_BASE || ps_size < T6040_DISP_PS_SIZE) {
+        printf("FDT: DCP display-power: ps window 0x%lx/0x%lx unexpected; skipping\n", ps_addr,
+               ps_size);
+        return 0;
+    }
+
+    int disp_path[8];
+    int disp = adt_path_offset_trace(adt, "/arm-io/disp0", disp_path);
+    if (disp < 0)
+        return 0;
+    u64 pmp_addr, pmp_size;
+    if (adt_get_reg(adt, disp_path, "reg", T6040_DISP_PMP_ADT_IDX, &pmp_addr, &pmp_size) < 0) {
+        printf("FDT: DCP display-power: /arm-io/disp0 reg[%d] (pmc-dcp) missing; skipping\n",
+               T6040_DISP_PMP_ADT_IDX);
+        return 0;
+    }
+    if (pmp_size < T6040_DISP_PMC_OFF + T6040_DISP_PMC_SIZE) {
+        printf("FDT: DCP display-power: disp0 reg[%d] too small (0x%lx); skipping\n",
+               T6040_DISP_PMP_ADT_IDX, pmp_size);
+        return 0;
+    }
+    u64 pmc_addr = pmp_addr + T6040_DISP_PMC_OFF;
+
+    /* ---- write pass: validated, so a failure here is FDT space only -------- */
+    int soc = fdt_parent_offset(dt, dcp);
+    if (soc < 0)
+        return 0;
+
+    int node = fdt_add_subnode(dt, soc, "display-power@5048a9c14");
+    if (node < 0) {
+        printf("FDT: DCP display-power: no room for the node; leaving S2R display off\n");
+        return 0;
+    }
+
+    /* reg = <pmc-dcp>, <ps> under /soc (#address/#size-cells = 2). reg-names in
+     * the same order; the driver looks each up by name so the order is cosmetic. */
+    fdt64_t reg[4];
+    fdt64_st(&reg[0], pmc_addr);
+    fdt64_st(&reg[1], T6040_DISP_PMC_SIZE);
+    fdt64_st(&reg[2], ps_addr);
+    fdt64_st(&reg[3], T6040_DISP_PS_SIZE);
+    if (fdt_setprop(dt, node, "reg", reg, sizeof(reg)) < 0 ||
+        fdt_setprop_string(dt, node, "reg-names", "pmc-dcp") < 0 ||
+        fdt_appendprop_string(dt, node, "reg-names", "ps") < 0 ||
+        fdt_setprop_string(dt, node, "compatible", "apple,t6041-display-power") < 0)
+        goto undo;
+
+    uint32_t phandle;
+    if (fdt_generate_phandle(dt, &phandle) || fdt_setprop_u32(dt, node, "phandle", phandle))
+        goto undo;
+
+    /* Adding the subnode above can grow the blob and move the DCP node, so
+     * re-resolve it before writing into it. */
+    dcp = fdt_node_offset_by_compatible(dt, -1, "apple,t6041-dcp");
+    if (dcp < 0)
+        goto undo;
+    if (fdt_setprop_u32(dt, dcp, "apple,display-power", phandle))
+        goto undo;
+
+    printf("FDT: Published DCP apple,display-power (ps 0x%lx/0x%lx, pmc-dcp 0x%lx) from ADT\n",
+           ps_addr, (u64)T6040_DISP_PS_SIZE, pmc_addr);
+    return 0;
+
+undo:
+    /* Refusal-safe: drop the orphan node and leave apple,display-power unset. An
+     * "apple,t6041-display-power" node nothing points at binds no driver, and the
+     * DCP, finding no phandle, skips the S2R display path. Re-resolve by name,
+     * since the writes above may have moved offsets. */
+    dcp = fdt_node_offset_by_compatible(dt, -1, "apple,t6041-dcp");
+    soc = dcp < 0 ? -1 : fdt_parent_offset(dt, dcp);
+    node = soc < 0 ? -1 : fdt_subnode_offset(dt, soc, "display-power@5048a9c14");
+    if (node >= 0)
+        fdt_del_node(dt, node);
+    return 0;
+}
+
 void kboot_set_initrd(void *start, size_t size)
 {
     initrd_start = start;
@@ -10865,6 +10999,8 @@ int kboot_prepare_dt(void *fdt)
     if (chip_id == T8132 && (dt_set_ans_nvme(false) || dt_set_t8132_lifecycle()))
         return -1;
     if (dt_set_t6040_sleep_apcie())
+        return -1;
+    if (dt_set_t6040_sleep_display())
         return -1;
 #ifndef RELEASE
     if (dt_transfer_virtios())
