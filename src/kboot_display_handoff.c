@@ -3156,7 +3156,7 @@ enum { T6050_DCP, T6050_DISP, T6050_MBOXN, T6050_DART_DCP, T6050_DART_DISP, T605
 static struct {
     char path[T6050_N][T6050_PATH];
     u64 coproc, pmc, pmc_size, vram, vram_size;
-    u32 bw_offset, nits, nclk, clk_id[T6050_CLOCKS], clk_hz[T6050_CLOCKS];
+    u32 bw_offset, nits, nclk, clk_id[T6050_CLOCKS], clk_hz[T6050_CLOCKS], pmc_ph;
     const char *gamut;
 } t6050;
 
@@ -3398,6 +3398,7 @@ static T6050_TEXT int t6050_publish(void *dt)
     *strrchr(node, '/') = 0;
     snprintf(name, sizeof(name), "pmc-metadata@%lx", t6050.pmc);
     u32 ph = t6050_add_node(dt, node[0] ? node : "/", name);
+    t6050.pmc_ph = ph;
     snprintf(node + strlen(node), sizeof(node) - strlen(node), "/%s", name);
     fdt64_t reg[2] = {cpu_to_fdt64(t6050.pmc), cpu_to_fdt64(t6050.pmc_size)};
     v[0] = cpu_to_fdt32(ph);
@@ -3450,6 +3451,129 @@ static T6050_TEXT int t6050_publish(void *dt)
     return t6050_setprop(dt, -1, T6050_STATUS, "published", sizeof("published"));
 }
 
+/*
+ * The external display engines iBoot leaves running beside the internal display (J714s:
+ * dcpext0..3), so that a driver can take each over and stop it for a sleep. A disabled
+ * apple,t6050-dcpext node whose coprocessor is ADT dcpextN, running the internal display's
+ * image, powered, with its DCP and PIODMA streams (SID 23 on dart-dcpextN, 16 on dart-dispextN)
+ * locked on the ADT's roots, gets the firmware version, uuid and its bandwidth scratch, and its
+ * node, mailbox and both DARTs are enabled. One that fails a check is left disabled.
+ */
+static T6050_TEXT int t6050_ext_one(void *dt, int n)
+{
+    char a[40], b[40];
+    u64 coproc, base[2], l1, cnt, vm_base, vm_size;
+    u32 len = 0, val = 0, fn[3];
+    int node = -1, dart[2];
+
+    snprintf(a, sizeof(a), "/arm-io/dcpext%d/iop-dcpext%d-nub", n, n);
+    int nub = adt_path_offset(adt, a);
+    const char *uuid = nub < 0 ? NULL : adt_getprop(adt, nub, "uuid", &len);
+    if (!dcp6_is_uuid(uuid, len) || strcmp(uuid, T6050_DCP_UUID) ||
+        dcp6_adt_u32(nub, "running", &val) || val != 1)
+        bail("dcpext%d: not running the pinned image\n", n);
+    snprintf(a, sizeof(a), "/arm-io/dcpext%d", n);
+    if (t6050_adt_reg(a, 0, &coproc, NULL))
+        bail("dcpext%d: no ADT reg\n", n);
+    for (int o = fdt_node_offset_by_compatible(dt, -1, "apple,t6050-dcpext"); o >= 0 && node < 0;
+         o = fdt_node_offset_by_compatible(dt, o, "apple,t6050-dcpext")) {
+        const fdt64_t *reg = fdt_getprop(dt, o, "reg", (int *)&len);
+        if (reg && len >= 16 && fdt64_ld(&reg[0]) == coproc)
+            node = o;
+    }
+    if (node < 0 || dcp6_status_disabled(dt, node, a))
+        bail("dcpext%d: no disabled node at 0x%lx\n", n, coproc);
+
+    /* dart-dcpextN SID 23 maps the engine, dart-dispextN SID 16 its piodma child */
+    for (int i = 0; i < 2; i++) {
+        snprintf(b, sizeof(b), i ? "/arm-io/dart-dispext%d" : "/arm-io/dart-dcpext%d", n);
+        int dn = adt_path_offset(adt, b);
+        if (dn < 0 || t6050_adt_reg(b, 0, &base[i], NULL) || dcp6_adt_u64(dn, "vm-base", &vm_base) ||
+            dcp6_adt_u64(dn, "vm-size", &vm_size))
+            bail("dcpext%d: no %s\n", n, b);
+        int user = i ? fdt_subnode_offset(dt, node, "piodma") : node;
+        dart[i] = user < 0 ? user : dcp6_check_iommu(dt, user, a, i ? 16 : 23, base[i], vm_base, vm_size);
+        if (dart[i] < 0)
+            return -1;
+    }
+
+    snprintf(b, sizeof(b), "/arm-io/dispext%d", n);
+    if (pmgr_adt_is_powered(a) != 1 || pmgr_adt_is_powered(b) != 1)
+        bail("dcpext%d: not powered\n", n);
+    int before = dcp6_guard_begin();
+    u32 bad = read32(coproc + ASC_CPU_CONTROL) & ASC_CPU_CONTROL_RUN ? 0 : BIT(2);
+    for (int i = 0; i < 2; i++) {
+        u32 sid = i ? 16 : 23;
+        char d[32], t[16];
+        snprintf(d, sizeof(d), i ? "/arm-io/dart-dispext%d" : "/arm-io/dart-dcpext%d", n);
+        snprintf(t, sizeof(t), "l1-tt-%u", sid);
+        if (dcp6_adt_u64_pair(adt_path_offset(adt, d), t, &l1, &cnt) || !l1) {
+            bad |= BIT(i);
+            continue;
+        }
+        u32 tcr = read32(base[i] + DART_T8110_TCR(sid)), ttbr = read32(base[i] + DART_T8110_TTBR(sid));
+        if (!(read32(base[i] + DART_T8110_PROTECT) & DART_T8110_PROTECT_TTBR_TCR) ||
+            (tcr & T6050_TCR_MASK) != T6050_TCR_WANT || !(ttbr & DART_T8110_TTBR_VALID) ||
+            ((u64)FIELD_GET(DART_T8110_TTBR_ADDR, ttbr) << DART_T8110_TTBR_SHIFT) != l1)
+            bad |= BIT(i);
+    }
+    if (dcp6_guard_end(before) || bad)
+        bail("dcpext%d: not live (mask 0x%x: bit 2 stopped, 0-1 a stream not locked)\n", n, bad);
+
+    /* Its bandwidth agent: the one dispextN's bw_req interrupt names */
+    snprintf(b, sizeof(b), "/arm-io/dispext%d", n);
+    int disp = adt_path_offset(adt, b), pmgr = adt_path_offset(adt, "/arm-io/pmgr");
+    const u8 *agents = pmgr < 0 ? NULL : adt_getprop(adt, pmgr, "bwr-agent", &len);
+    u32 bw = 0;
+    if (!agents || disp < 0 ||
+        adt_getprop_copy(adt, disp, "function-bw_req_interrupt0", fn, sizeof(fn)) != sizeof(fn))
+        bail("dcpext%d: no bandwidth interrupt\n", n);
+    for (u32 off = 0; off + 24 <= len && !bw; off += 24) {
+        u32 birq;
+        memcpy(&birq, agents + off + 4, sizeof(birq));
+        if (agents[off] == 1 && birq == fn[2])
+            bw = T6050_BW_BASE + agents[off + 2] * T6050_BW_STRIDE;
+    }
+    fdt32_t v[4] = {cpu_to_fdt32(t6050.pmc_ph), 0, cpu_to_fdt32(T6050_NDISP), cpu_to_fdt32(bw)};
+    if (!bw || bw > t6050.pmc_size - 4 || !t6050.pmc_ph)
+        bail("dcpext%d: no bandwidth agent scratch\n", n);
+
+    const fdt32_t *mb = fdt_getprop(dt, node, "mboxes", (int *)&len);
+    int mbox = mb && len == 4 ? fdt_node_offset_by_phandle(dt, fdt32_ld(mb)) : -1;
+    const fdt64_t *mreg = mbox < 0 ? NULL : fdt_getprop(dt, mbox, "reg", (int *)&len);
+    if (!mreg || len < 16 || fdt64_ld(&mreg[0]) != coproc + T6050_MBOX)
+        bail("dcpext%d: mboxes is not the ASC mailbox\n", n);
+
+    /* Offsets move as properties grow: each target by its phandle again */
+    u32 ph[4] = {fdt_get_phandle(dt, node), fdt_get_phandle(dt, mbox), fdt_get_phandle(dt, dart[0]),
+                 fdt_get_phandle(dt, dart[1])};
+    if (firmware_set_fdt(dt, node, "apple,firmware-version", &os_firmware) ||
+        firmware_set_fdt(dt, fdt_node_offset_by_phandle(dt, ph[0]), "apple,firmware-compat",
+                         &os_firmware) ||
+        fdt_setprop(dt, fdt_node_offset_by_phandle(dt, ph[0]), "apple,firmware-uuid",
+                    T6050_DCP_UUID, sizeof(T6050_DCP_UUID)) ||
+        fdt_setprop(dt, fdt_node_offset_by_phandle(dt, ph[0]), "apple,bw-scratch", v, sizeof(v)))
+        return -1;
+    for (int i = 0; i < 4; i++)
+        if (!ph[i] || fdt_setprop_string(dt, fdt_node_offset_by_phandle(dt, ph[i]), "status", "okay"))
+            return -1;
+    dlog("dcpext%d handed off: bw-scratch 0x%x\n", n, bw);
+    return 0;
+}
+
+/* Each engine in its own transaction, after the internal display's */
+static T6050_TEXT void t6050_ext_handoff(void *dt)
+{
+    for (int n = 0; n < 4; n++) {
+        void *scratch = dcp6_scratch(dt);
+        if (!scratch || t6050_ext_one(scratch, n) || dcp6_commit(dt, scratch)) {
+            if (scratch)
+                free(scratch);
+            dlog("dcpext%d stays with iBoot: no handoff\n", n);
+        }
+    }
+}
+
 /* Any failure leaves the display nodes disabled: the boot framebuffer keeps the panel */
 static T6050_TEXT void t6050_handoff(void *dt)
 {
@@ -3463,6 +3587,7 @@ static T6050_TEXT void t6050_handoff(void *dt)
             dlog("internal display handed off: firmware %s, bw-scratch 0x%lx+0x%x, %u clock(s), "
                  "%u nits\n",
                  os_firmware.string, t6050.pmc, t6050.bw_offset, t6050.nclk, t6050.nits);
+            t6050_ext_handoff(dt);
             return;
         }
     }
