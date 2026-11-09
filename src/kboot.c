@@ -753,6 +753,31 @@ static int dt_reserve_secondary_ro(void)
     return 0;
 }
 
+/*
+ * On an aura-try trial each aura stage arms the trial watchdog (wdt.c) so a hang anywhere before
+ * Linux feeds it resets into the configured Stage 2. U-Boot with WATCHDOG_AUTOSTART takes the
+ * watchdog over and services it from its own loops, so a U-Boot that waits forever (on a disk it
+ * cannot reach, say) would never be reset. Tell it to leave the watchdog alone on a trial boot.
+ */
+static void dt_set_trial_watchdog(void)
+{
+    if (!aura_trial_enabled())
+        return;
+    /* The compatibles U-Boot's apple_wdt driver binds to */
+    static const char *const compat[] = {"apple,t8103-wdt", "apple,wdt"};
+    for (size_t i = 0; i < ARRAY_SIZE(compat); i++) {
+        int node = -1;
+        while ((node = fdt_node_offset_by_compatible(dt, node, compat[i])) >= 0) {
+            if (fdt_getprop(dt, node, "u-boot,noautostart", NULL))
+                continue;
+            if (fdt_setprop(dt, node, "u-boot,noautostart", NULL, 0))
+                printf("FDT: couldn't mark the watchdog for the trial\n");
+            else
+                printf("FDT: trial boot: U-Boot leaves the watchdog to the trial budget\n");
+        }
+    }
+}
+
 static int dt_set_chosen(void)
 {
 
@@ -9224,6 +9249,7 @@ int kboot_prepare_dt(void *fdt)
         return -1;
     if (dt_set_chosen())
         return -1;
+    dt_set_trial_watchdog();
     if (chip_id == T8152)
         return dt_prepare_t8152();
     if (dt_set_speaker_safety())
