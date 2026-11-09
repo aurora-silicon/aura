@@ -77,6 +77,8 @@ bool sptm_virt_heap_window(u64 *base, u64 *limit);
 
 /* Host entry points, called over the proxy. */
 int sptm_virt_place(struct sptm_virt_placement *out);
+/* iBoot's end of managed RAM (the carve-out map's region-id-24), or 0 */
+u64 sptm_virt_iboot_end(void);
 int sptm_virt_load(u64 sptm_entry, u64 handoff);
 void sptm_virt_flush(u64 pa, u64 size);
 void sptm_virt_config(u64 flags);

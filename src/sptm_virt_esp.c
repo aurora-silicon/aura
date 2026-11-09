@@ -274,8 +274,10 @@ AURA_XTEXT int sptm_virt_esp_boot(const char *spec)
     struct sptm_virt_placement place;
     if (sptm_virt_place(&place))
         ESP_FAIL("no valid SPTM layout\n");
-    /* SPTM leaves a partial last 2 MiB block untyped and panics: the window ends on one. */
-    place.managed_end &= ~((2UL << 20) - 1);
+    /* SPTM leaves a partial last 2 MiB block untyped and panics, so a window that doesn't end at
+     * iBoot's end of RAM ends on one. iBoot's own end stays: the MTE tag storage is at its top. */
+    if (!sptm_virt_mte() || place.managed_end != sptm_virt_iboot_end())
+        place.managed_end &= ~((2UL << 20) - 1);
     if (esp_oslog_overlap())
         ESP_FAIL("aura overlaps a DCP log buffer\n");
 

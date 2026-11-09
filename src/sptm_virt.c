@@ -184,9 +184,24 @@ static u64 sptm_virt_low_floor(u64 limit)
 #define SPTM_VIRT_LOW_HEAP (128UL << 20) /* the 64 MiB ring, page tables, per-CPU pages */
 #endif
 
+/* iBoot's end of managed RAM, from the carve-out map (region-id-24), or 0. */
+u64 sptm_virt_iboot_end(void)
+{
+    int node = adt_path_offset(adt, "/chosen/carveout-memory-map");
+    u32 len = 0;
+    const u64 *r = node >= 0 ? adt_getprop(adt, node, "region-id-24", &len) : NULL;
+
+    return r && len == 16 ? r[0] + r[1] : 0;
+}
+
 static int sptm_virt_layout_low(u64 ram_base, struct sptm_virt_layout *out)
 {
     u64 end = cur_boot_args.phys_base + cur_boot_args.mem_size;
+    /* The tag storage is at the top of iBoot's RAM: behind a stage that kept a page off that top
+     * for itself (Stage 1's log), the window still ends at iBoot's end. */
+    u64 iboot_end = sptm_virt_iboot_end();
+    if (iboot_end > end && iboot_end - end <= (2UL << 20))
+        end = iboot_end;
     u64 fw_high = sptm_virt_fw_high();
 
     memset(out, 0, sizeof(*out));
