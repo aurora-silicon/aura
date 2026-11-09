@@ -7380,7 +7380,7 @@ static int dt_set_display(void)
                os_firmware.string);
         return 0;
     } else if (!fdt_node_check_compatible(dt, 0, "apple,t6050")) {
-        /* Fail-soft (kboot_display_handoff.c): the display coprocessors' __OS_LOG reservations. */
+        /* Fail-soft (kboot_display_handoff.c): __OS_LOG reservations and the internal panel. */
         return dt_set_display_handoff(dt);
     } else if (!fdt_node_check_compatible(dt, 0, "apple,t8142")) {
         ret = dt_carveout_reserved_regions("dcp", "disp0", "disp0_piodma",
