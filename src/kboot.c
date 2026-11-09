@@ -4985,7 +4985,14 @@ static int dt_t8140_disable_typec_routes(const char *dcp_path)
     return 0;
 }
 
-/* Follow the bounded, zero-cell power-domain chain described by the DT. */
+/*
+ * Follow the bounded, zero-cell power-domain chain described by the DT.
+ *
+ * The chain ends at the first ancestor (after the controller's own state)
+ * that is marked apple,always-on: such a state is shared SoC fabric that
+ * Linux never switches, so it is neither published nor withdrawn with the
+ * display, and its own parents (which may be several) are not walked.
+ */
 static int dt_t8140_power_paths(int node, char (*paths)[128], size_t capacity)
 {
     if (!capacity || capacity > 3)
@@ -4996,10 +5003,17 @@ static int dt_t8140_power_paths(int node, char (*paths)[128], size_t capacity)
         const fdt32_t *ref = fdt_getprop(dt, node, "power-domains", &length);
         if (!ref)
             return length == -FDT_ERR_NOTFOUND ? count : -1;
-        if (length != sizeof(*ref) || (size_t)count == capacity)
+        if (length != sizeof(*ref))
             return -1;
-        node = fdt_node_offset_by_phandle(dt, fdt32_to_cpu(*ref));
-        if (node < 0 || fdt_get_path(dt, node, paths[count], sizeof(paths[0])))
+        int next = fdt_node_offset_by_phandle(dt, fdt32_to_cpu(*ref));
+        if (next < 0)
+            return -1;
+        if (count && fdt_getprop(dt, next, "apple,always-on", NULL))
+            return count;
+        if ((size_t)count == capacity)
+            return -1;
+        node = next;
+        if (fdt_get_path(dt, node, paths[count], sizeof(paths[0])))
             return -1;
         for (int i = 0; i < count; i++)
             if (!strcmp(paths[i], paths[count]))
