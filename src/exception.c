@@ -561,6 +561,7 @@ void exc_fiq(u64 *regs)
         if (storm == 64) {
             struct exc_info pctx;
             sptm_virt_fill_ctx(&pctx, regs, in_gl12());
+            sptm_virt_report_guest(regs, pctx.elr);
             sptm_virt_gpu_park_now(&pctx, "an FIQ no source claims, over and over");
         }
     }

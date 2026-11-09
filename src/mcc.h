@@ -16,5 +16,6 @@ extern struct mcc_carveout mcc_carveouts[];
 int mcc_init(void);
 int mcc_unmap_carveouts(void);
 int mcc_enable_cache(void);
+int mcc_plane_info(int mcc, u64 *base, u64 *stride, int *count);
 
 #endif

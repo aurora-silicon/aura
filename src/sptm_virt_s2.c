@@ -15,6 +15,7 @@
 #include "exception.h"
 #include "hv.h"
 #include "iodev.h"
+#include "mcc.h"
 #include "memory.h"
 #include "nv2.h"
 #include "smp.h"
@@ -317,6 +318,82 @@ static void sptm_virt_reset_guard_setup(void)
            rg_n, rg_wdt, rg_wdt2, rg_extra[0], rg_extra[1], rg_extra[2], rg_xwdt);
 }
 
+/* ---- the memory controller's planes, watched -----------------------------------------------
+ * aura's image loses its writes once the guest runs: data goes back to what DRAM held at one
+ * moment and stays there, as if the memory controller stopped taking writes to it. The AMCC's
+ * range registers (TZ carveouts, read-only regions) are where that would be set. Print what the
+ * planes hold before the guest runs, and every write the guest makes to them.
+ */
+/*
+ * The three range locks SPTM sets ~1 s into XNU (plane +0xacc/+0xadc/+0xaec, 0x1 on every plane).
+ * iBoot left the ranges behind them (+0xaa8..+0xabc, 16 KiB pages) programmed for the image it
+ * booted -- stage 1, where aura now runs -- and once they are locked the memory controller stops
+ * taking aura's writes: its data falls back to what DRAM held at the lock and stays there. With
+ * sptm_virt_amcc_nolock (AURA_AMCC_NOLOCK) the locks are shadowed: the guest reads back what it
+ * wrote, the hardware keeps them open. On by default; AURA_AMCC_NOLOCK=0 lets SPTM lock them.
+ */
+u32 sptm_virt_amcc_nolock = 1;
+static u64 amcc_lock_shadow[16][2]; /* {pa, value} */
+
+static bool amcc_is_lock(u64 addr)
+{
+    u32 off = addr & 0x3ffff;
+    return off == 0xacc || off == 0xadc || off == 0xaec;
+}
+
+static bool amcc_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int width)
+{
+    static u32 logs;
+    if (write && logs++ < 256)
+        printf("SPTM-virt[amcc]: guest wrote 0x%lx -> 0x%lx (w%d) at pc 0x%lx%s\n", *val, addr,
+               width, ctx->elr,
+               sptm_virt_amcc_nolock && amcc_is_lock(addr) ? " -- range lock shadowed" : "");
+    if (sptm_virt_amcc_nolock && amcc_is_lock(addr) && width == 2) {
+        for (unsigned i = 0; i < ARRAY_SIZE(amcc_lock_shadow); i++) {
+            if (amcc_lock_shadow[i][0] == addr || !amcc_lock_shadow[i][0]) {
+                if (write) {
+                    amcc_lock_shadow[i][0] = addr;
+                    amcc_lock_shadow[i][1] = *val;
+                    return true;
+                }
+                if (amcc_lock_shadow[i][0] == addr) {
+                    *val = amcc_lock_shadow[i][1];
+                    return true;
+                }
+                break;
+            }
+        }
+    }
+    sptm_virt_mmio_rw(addr, val, write, width);
+    return true;
+}
+
+static void sptm_virt_amcc_watch(void)
+{
+    u64 base, stride;
+    int count;
+    if (mcc_plane_info(0, &base, &stride, &count) < 0) {
+        printf("SPTM-virt[amcc]: no AMCC planes; not watched\n");
+        return;
+    }
+    for (u32 off = 0xaa0; off < 0xaf0; off += 0x10) {
+        u32 v[4];
+        for (int k = 0; k < 4; k++)
+            v[k] = read32(base + off + 4 * k);
+        if (v[0] | v[1] | v[2] | v[3])
+            printf("SPTM-virt[amcc]: plane0+0x%03x: %08x %08x %08x %08x\n", off, v[0], v[1], v[2],
+                   v[3]);
+    }
+    for (int p = 0; p < count; p++) {
+        u64 pb = (base + p * stride) & ~0x3fffUL;
+        if (hv_map_hook(pb, amcc_hook, 0x4000) < 0)
+            printf("SPTM-virt[amcc]: cannot hook plane %d at 0x%lx\n", p, pb);
+    }
+    printf("SPTM-virt[amcc]: %d planes at 0x%lx (stride 0x%lx) watched; aura's image is "
+           "[%p, %p)\n",
+           count, base, stride, _base, _end);
+}
+
 /* ---- aura's own memory is never the guest's ----------------------------------------------
  * The guest's stage 2 identity-maps all RAM, including aura's image (at stage 1's base, inside
  * SPTM's window as an SPTM-reserved region) and its carve-out. Unmap both, so a guest access stops
@@ -420,6 +497,7 @@ void sptm_virt_s2_setup(void)
     }
     hv_map_vuart(base, irqs[0], uartproxy_iodev);
     sptm_virt_aura_guard_setup();
+    sptm_virt_amcc_watch();
     sptm_virt_s2_split_ctrr_blocks();
     sptm_virt_reset_guard_setup();
     /* After the guard, whose pages the sleep path leaves alone. */

@@ -18,6 +18,8 @@
 #include "memory.h"
 #include "nv2.h"
 #include "smp.h"
+#include "gxf.h"
+#include "heapblock.h"
 #include "sptm_virt_priv.h"
 #include "string.h"
 #include "utils.h"
@@ -541,6 +543,7 @@ static bool sptm_virt_guarded_eret(void)
     u64 aspsr = mrs(SYS_IMP_APL_ASPSR_GL1);
     unsigned m = pstate & 0x1f, el = (m >> 2) & 3;
 
+    sptm_virt_world_ev(SPTM_WEV_GERET, target, pstate);
     if (n++ < 16)
         printf("SPTM-virt[geret#%u c%d]: -> 0x%lx el%u%c ps=0x%lx\n", n, smp_id(), target, el,
                (pstate & 1) ? 'h' : 't', pstate);
@@ -550,6 +553,7 @@ static bool sptm_virt_guarded_eret(void)
         /* SPTM's own virtual EL2 runs at physical EL1, leaving cL4 if it was there. */
         pstate -= 4;
         if (sptm_virt_in_cl4()) {
+            sptm_virt_world_ev(SPTM_WEV_CL4_ERET2, target, 0);
             sptm_virt_cl4_world_exit();
             if (world_logs++ < 8)
                 printf("SPTM-virt[world]: cL4 -> host by SPTM's own ERET to GL2\n");
@@ -633,6 +637,17 @@ static bool sptm_virt_ctx_op(u64 *regs, u64 elr, u64 spsr, u32 iss)
                sptm_peek_esr[cpu]);
         return false;
     }
+    /*
+     * And invalidate the guest's EL1&0 translations. SPTM issues this in its address-space switch,
+     * right after programming TTBR0, whenever the context id changes: per-context maintenance of
+     * the user regime. Natively that regime is EL2&0 (XNU runs at EL2), which is what the
+     * instruction reaches from GL2 -- but under aura XNU's userspace runs in EL1&0, and issued
+     * here it maintains aura's own EL2&0 instead. The guest's entries for a recycled context then
+     * survive, and a fresh address space translates through an old one's mappings: about a
+     * hundred seconds into userspace SPTM found font data where its records should be and
+     * returned into its own code in XNU's context. Over-invalidating only costs time.
+     */
+    __asm__ volatile("dsb ishst\n\ttlbi vmalle1is\n\tdsb ish" ::: "memory");
     if (!seen[cpu]) {
         seen[cpu] = true;
         printf("SPTM-virt[ctxop c%d]: pc=0x%lx x%u=0x%lx -> 0x%lx at GL2\n", cpu, elr, rt, regs[rt],
@@ -660,9 +675,12 @@ static bool sptm_virt_guarded_gexit(u64 *regs)
     unsigned m = pstate & 0x1f, el = (m >> 2) & 3;
     bool guarded = gaspsr & ASPSR_GUARDED;
 
-    if (n++ < 16)
-        printf("SPTM-virt[gexit#%u c%d]: pc=0x%lx -> 0x%lx el%u%c ps=0x%lx (%s)\n", n, smp_id(), pc,
-               target, el, (m & 1) ? 'h' : 't', pstate, guarded ? "guarded" : "normal");
+    sptm_virt_world_ev(SPTM_WEV_GEXIT, pc, target);
+    static u32 n_other;
+    if (n++ < 16 || (el != 2 && n_other++ < 32))
+        printf("SPTM-virt[gexit#%u c%d]: pc=0x%lx -> 0x%lx el%u%c ps=0x%lx (%s) from spsr 0x%lx\n", n,
+               smp_id(), pc, target, el, (m & 1) ? 'h' : 't', pstate,
+               guarded ? "guarded" : "normal", mrs(SPSR_EL1));
     if (m & 0x10 || el == 3)
         return false;
     if (el == 2) {
@@ -711,6 +729,7 @@ static bool sptm_virt_guarded_gexit(u64 *regs)
 /* ---- SPTM's park ---------------------------------------------------------------------------- */
 
 /* Any register that points at text in SPTM's memory: its panic message is among them. */
+static void sptm_virt_park_report(u64 *regs, u64 pc);
 static void sptm_virt_park_strings(u64 *regs)
 {
     for (int r = 0; r < 30; r++) {
@@ -766,6 +785,22 @@ static void sptm_virt_park_diag(void)
            sptm_virt_diag_pa, magic, esr, (esr >> 26) & 0x3f, elr, far);
 }
 
+/*
+ * The same report for a guest that is dead rather than parked by a WFE: SPTM's fatal path ends in
+ * "mov x0, #code; mov x1, ...; b .", which takes no exception, so the only way aura sees it is the
+ * interrupts that then pile up unanswered. Called from the FIQ storm guard before it parks.
+ */
+void sptm_virt_report_guest(u64 *regs, u64 pc)
+{
+    u64 insn = 0;
+    bool spin = sptm_virt_el1_va_read64(pc & ~7UL, &insn) &&
+                (u32)((pc & 4) ? insn >> 32 : insn) == 0x14000000; /* b . */
+    printf("SPTM-virt[dead c%d]: guest pc 0x%lx%s; x0 0x%lx x1 0x%lx (SPTM's halt carries its "
+           "code in x0)\n",
+           smp_id(), pc, spin ? " spins on itself" : "", regs[0], regs[1]);
+    sptm_virt_park_report(regs, pc);
+}
+
 static void sptm_virt_park_report(u64 *regs, u64 pc)
 {
     static bool done[MAX_CPUS];
@@ -790,8 +825,42 @@ bool sptm_virt_gl_sync(u64 *regs, u64 esr, u64 elr, u64 spsr)
     u32 ec = (esr & ESR_EC) >> ESR_EC_SHIFT;
     u32 iss = esr & ESR_ISS;
 
+    sptm_virt_canary_tick();
+
+    /*
+     * Which guarded-world traps reach aura, and from where. TXM runs at GL0 and yields back to
+     * SPTM with an IMPDEF instruction (op 34, 0x00201440); a GEXIT up from SPTM is ISS 0x22. If
+     * TXM's yield arrives here and is taken for SPTM's GEXIT, it returns at the level SPTM set
+     * for the call -- GL0 -- which is how SPTM's code ends up running on XNU's SP_EL0.
+     */
+    {
+        static u32 n_el0, n_impdef;
+        bool from_el0 = elsp == SPSR_M_EL0;
+        if ((from_el0 && n_el0++ < 32) || (ec == ESR_EC_IMPDEF && iss != 0x22 && n_impdef++ < 32))
+            printf("SPTM-virt[gltrap c%d]: from %s ec 0x%x iss 0x%x pc 0x%lx spsr 0x%lx aspsr 0x%lx\n",
+                   smp_id(), from_el0 ? "GL0" : "GL1", ec, iss, elr, spsr,
+                   mrs(SYS_IMP_APL_ASPSR_GL1));
+    }
+
     if (elsp != SPSR_M_EL1H && elsp != SPSR_M_EL1T)
         return false;
+    /*
+     * Which world is this trap from, by its pc, against aura's flag for it. cL4 runs at
+     * 0xfffffc..., SPTM at 0xfffffe...; aura switches the per-level state (GXF and SPRR config,
+     * VBAR/SP_GL1, the PAC keys) on the flag, which lives in .bss -- memory seen to lose writes
+     * while this guest runs. A cL4 trap with the flag on "host" means cL4's exit was never
+     * switched back, and SPTM and XNU then run under cL4's permissions and stack.
+     */
+    {
+        static u32 n_mis;
+        bool pc_cl4 = (elr >> 40) == 0xfffffcUL;
+        bool pc_sptm = (elr >> 40) == 0xfffffeUL;
+        if (((pc_cl4 && !sptm_virt_in_cl4()) || (pc_sptm && sptm_virt_in_cl4())) && n_mis++ < 16) {
+            printf("SPTM-virt[world?]: trap ec 0x%x from %s pc 0x%lx, but aura's world is %s\n",
+                   ec, pc_cl4 ? "cL4" : "SPTM", elr, sptm_virt_in_cl4() ? "cL4" : "host");
+            sptm_virt_world_dump();
+        }
+    }
     /*
      * The deadline the host asked for, offered from the busiest path there is: SPTM's guarded
      * ERETs and GEXITs arrive all the while the guest runs, so a guest that leaves the GPU and
@@ -848,10 +917,34 @@ done:
 }
 
 /* A WFI or WFE from the guest at virtual EL2 (physical EL1), trapped by TWE or TWI. */
+/*
+ * Does aura's memory keep its writes while the guest runs? Two copies of one value at every trap:
+ * canary_a stays dirty in the cache, canary_b is cleaned to the PoC each time. When the memory
+ * controller stops taking aura's writes (SPTM locking iBoot's AMCC ranges over stage 1's image,
+ * see amcc_hook), the two disagree at the next trap once a line has been evicted.
+ */
+static u64 canary_a __attribute__((aligned(128)));
+static u64 canary_b __attribute__((aligned(128)));
+
+void sptm_virt_canary_tick(void)
+{
+    static u32 losses;
+    u64 a = canary_a, b = canary_b, now = mrs(CNTPCT_EL0);
+
+    if (a != b && losses++ < 16)
+        printf("SPTM-virt[cache LOST c%d]: a dirty line went back to 0x%lx, its cleaned twin says "
+               "0x%lx (%lu us ago): aura's memory is not keeping its writes\n",
+               smp_id(), a, b, (now - b) / (mrs(CNTFRQ_EL0) / 1000000));
+    canary_a = now;
+    canary_b = now;
+    __asm__ volatile("dc cvac, %0" ::"r"(&canary_b) : "memory");
+}
+
 bool sptm_virt_el1_wfx(u64 *regs, u64 esr)
 {
     if (sptm_virt_s2r_wfi(regs, esr))
         return true;
+
     u64 pc = mrs(ELR_EL2);
     sptm_virt_park_report(regs, pc);
     msr(ELR_EL2, pc + 4);

@@ -239,6 +239,12 @@ static void gpu_hook_adt(const char *path, int idx, const char *what, u64 off, u
 
 void sptm_virt_gpu_setup(void)
 {
+    /* The deadline park is offered from every GL trap (sptm_virt_gl_sync), GPU trace or not. */
+    if (sptm_virt_gpu_stop_boot_secs) {
+        gpu_boot_stop_t = mrs(CNTPCT_EL0) + (u64)sptm_virt_gpu_stop_boot_secs * mrs(CNTFRQ_EL0);
+        printf("SPTM-virt[park]: the guest parks in the proxy at its first GL trap after %u s\n",
+               sptm_virt_gpu_stop_boot_secs);
+    }
     if (!(sptm_virt_flags & SPTM_VIRT_GPU))
         return;
     sptm_virt_gpu_ring = memalign(0x4000, GPU_RING_BYTES);
@@ -249,9 +255,6 @@ void sptm_virt_gpu_setup(void)
     memset(sptm_virt_gpu_ring, 0, GPU_RING_BYTES);
     sptm_virt_bss_canary = 0xa5a5c0ffee5a5a5aUL; /* read back while the guest runs */
     dc_cvac_range((void *)&sptm_virt_bss_canary, sizeof(sptm_virt_bss_canary));
-    if (sptm_virt_gpu_stop_boot_secs)
-        gpu_boot_stop_t = mrs(CNTPCT_EL0) +
-                          (u64)sptm_virt_gpu_stop_boot_secs * mrs(CNTFRQ_EL0);
     sptm_virt_gpu_nrec = GPU_RING_BYTES / sizeof(struct gpu_rec);
     sptm_virt_gpu_head = 0;
 
