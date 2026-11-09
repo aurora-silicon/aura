@@ -557,6 +557,27 @@ int pmgr_adt_power_disable_under(const char *path, const char *name)
     return 0;
 }
 
+/* macOS's steps both ways (T6050 run 28): auto off with the domain on, then off, or auto on. */
+int pmgr_power_steps(int die, const char *name, bool on)
+{
+    uintptr_t a = 0;
+    u32 v;
+
+    for (size_t i = 0; i < pmgr_devices_len && !a; i++)
+        if (!(pmgr_devices[i].flags & PMGR_FLAG_VIRTUAL) &&
+            !strncmp(pmgr_devices[i].name, name, sizeof(pmgr_devices[i].name)))
+            a = pmgr_device_get_addr(die, &pmgr_devices[i]);
+    if (!a)
+        return -1;
+    v = read32(a) & ~(PMGR_AUTO_ENABLE | PMGR_WAS_CLKGATED | PMGR_WAS_PWRGATED | PMGR_PS_TARGET);
+    write32(a, v | PMGR_PS_ACTIVE);
+    if (poll32(a, PMGR_PS_ACTUAL, FIELD_PREP(PMGR_PS_ACTUAL, PMGR_PS_ACTIVE), PMGR_POLL_TIMEOUT) <
+        0)
+        return -1;
+    write32(a, on ? v | PMGR_AUTO_ENABLE | PMGR_PS_ACTIVE : v | PMGR_PS_PWRGATE);
+    return on ? 0 : poll32(a, PMGR_PS_ACTUAL, 0, PMGR_POLL_TIMEOUT);
+}
+
 int pmgr_adt_power_is_off(const char *path)
 {
     const u32 *devices;

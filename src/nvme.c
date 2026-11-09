@@ -444,7 +444,7 @@ static bool nvme_ans_power_off(void)
 /* Post-M4, ANS off: power, the SART entries back, then the firmware's start after a power loss. */
 static bool nvme_ans_power_on(void)
 {
-    if (pcie_init() || !sart_set_entries(nvme_sart, nvme_sart_saved, nvme_sart_saved_cnt) ||
+    if (pcie_ans_power_on() || !sart_set_entries(nvme_sart, nvme_sart_saved, nvme_sart_saved_cnt) ||
         !rtkit_boot_warm(nvme_rtkit, BIT(0)) ||
         poll32(nvme_base + NVME_BOOT_STATUS, 0xffffffff, NVME_BOOT_STATUS_OK, USEC_PER_SEC) < 0) {
         printf("nvme: ANS didn't start from off; it stays down until a reboot\n");
@@ -586,7 +586,7 @@ bool nvme_init(void)
 
     if (nvme_type == NVME_T8132 && !nvme_secure_regs) {
         /* ANS that an earlier owner powered off has nothing to read until its power is back. */
-        if (nvme_sart_saved_cnt && pcie_init()) {
+        if (nvme_sart_saved_cnt && pcie_ans_power_on()) {
             printf("nvme: couldn't power ANS back on\n");
             goto out_asc;
         }

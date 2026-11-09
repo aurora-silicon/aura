@@ -1126,13 +1126,55 @@ int pcie_init(void)
 }
 
 /* For a stage done with a post-M4 ANS, which runs on the APCIe PHY: the PHY and ANS powered off. */
+static const char *pcie_ans_path(void)
+{
+    return adt_path_offset(adt, "/arm-io/apcie") >= 0 ? "/arm-io/apcie" : "/arm-io/apcie0";
+}
+
+/*
+ * T6050, as macOS around a sleep (run 28). Off: the storage PHYs, children first, then the gates
+ * that depend on ANS and ANS itself (the SoC's sleep takes those). On: macOS's wake order. PHY_SW
+ * and the GP side stay up for the GP ports.
+ */
+static const char *const t6050_ans_ps[] = {"APHY_ST0_AUS5",
+                                           "APHY_ST0_AUS5_A",
+                                           "APHY_ST1_AUS5",
+                                           "APHY_ST1_AUS5_A",
+                                           "APCIE_SYS_ST1",
+                                           "APCIE_SYS_ST0",
+                                           "ANS"};
+static const u8 t6050_ans_ps_on[] = {6, 5, 4, 1, 3, 0, 2};
+
+static int pcie_t6050_ps(const char *name, bool on)
+{
+    if (!pmgr_power_steps(0, name, on))
+        return 0;
+    printf("pcie: %s didn't go %s\n", name, on ? "on" : "off");
+    return -1;
+}
+
 int pcie_ans_power_off(void)
 {
-    const char *path =
-        adt_path_offset(adt, "/arm-io/apcie") >= 0 ? "/arm-io/apcie" : "/arm-io/apcie0";
-
+    if (chip_id == T6050) {
+        for (size_t i = 0; i < ARRAY_SIZE(t6050_ans_ps); i++)
+            if (pcie_t6050_ps(t6050_ans_ps[i], false))
+                return -1;
+        /* Longer than the 21.5 ms S2R cycles after which macOS restarted ANS (run 28). */
+        udelay(100000);
+        return 0;
+    }
     pcie_initialized = false;
-    return pcie_init_controller(APCIE, path, true);
+    return pcie_init_controller(APCIE, pcie_ans_path(), true);
+}
+
+int pcie_ans_power_on(void)
+{
+    if (chip_id != T6050)
+        return pcie_init();
+    for (size_t i = 0; i < ARRAY_SIZE(t6050_ans_ps_on); i++)
+        if (pcie_t6050_ps(t6050_ans_ps[t6050_ans_ps_on[i]], true))
+            return -1;
+    return 0;
 }
 
 int pcie_shutdown(void)
