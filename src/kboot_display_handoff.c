@@ -3497,9 +3497,17 @@ static T6050_TEXT int t6050_ext_one(void *dt, int n)
             return -1;
     }
 
-    snprintf(b, sizeof(b), "/arm-io/dispext%d", n);
-    if (pmgr_adt_is_powered(a) != 1 || pmgr_adt_is_powered(b) != 1)
-        bail("dcpext%d: not powered\n", n);
+    /*
+     * The engine's power words and their parents' (its DARTs' domains). dispextN has no ADT
+     * gates, and iBoot leaves the CPU idling under AUTO_ENABLE (DISPEXTn_CPU 0x1404024f).
+     */
+    u64 ps[12];
+    int nps = pmgr_adt_collect_psregs(a, ps, NULL, ARRAY_SIZE(ps));
+    if (nps <= 0)
+        bail("dcpext%d: no power words\n", n);
+    for (int i = 0; i < nps; i++)
+        if (!dcp6_ps_on(read32(ps[i])))
+            bail("dcpext%d: not powered: 0x%lx = 0x%x\n", n, ps[i], read32(ps[i]));
     int before = dcp6_guard_begin();
     u32 bad = read32(coproc + ASC_CPU_CONTROL) & ASC_CPU_CONTROL_RUN ? 0 : BIT(2);
     for (int i = 0; i < 2; i++) {
