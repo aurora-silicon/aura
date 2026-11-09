@@ -696,6 +696,13 @@ static int dt_set_s2r_mailbox(int node)
     if (!in_el2() || !smp_resets_return_here())
         return 0;
 
+    /* A core leaving reset is confined to CTXR_D: an OS outside its window can't resume. */
+    u64 lower, upper;
+    if (ctxr_range(CTXR_RANGE_D, &lower, &upper) && !ctxr_exec_window(NULL, NULL)) {
+        printf("FDT: no S2R mailbox: CTXR_D is armed and the OS is outside its window\n");
+        return 0;
+    }
+
     u64 mailbox = smp_s2r_publish();
     if (fdt_setprop_u64(dt, node, "aurora,s2r-mailbox", mailbox))
         bail("FDT: couldn't set aurora,s2r-mailbox\n");
