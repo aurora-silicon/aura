@@ -7649,8 +7649,38 @@ static void dt_set_aop_motion_cal(const char *path)
  * addresses), so that the OS maps them in the AOP's DART before it starts the
  * firmware.
  */
+/*
+ * M1 Pro (T6000) and M2 (T8112): iBoot starts the AOP firmware itself and the
+ * OS needs no firmware segments, but the accelerometer and gyroscope services
+ * wait for the same calibration as on the M4 Pro. The ADT carries it in the
+ * same properties and container format.
+ */
+static int dt_set_aop_motion_cal_only(void)
+{
+    const char *compat = chip_id == T8112 ? "apple,t8112-aop" : "apple,t6000-aop";
+    int node = fdt_node_offset_by_compatible(dt, -1, compat);
+    if (node < 0)
+        return 0;
+
+    const char *status = fdt_getprop(dt, node, "status", NULL);
+    if (status && strcmp(status, "okay") && strcmp(status, "ok"))
+        return 0;
+
+    char path[64];
+    if (fdt_get_path(dt, node, path, sizeof(path))) {
+        printf("FDT: AOP node path too long\n");
+        return 0;
+    }
+
+    dt_set_aop_motion_cal(path);
+    return 0;
+}
+
 static int dt_set_aop_firmware(void)
 {
+    if (chip_id == T6000 || chip_id == T8112)
+        return dt_set_aop_motion_cal_only();
+
     if (chip_id != T6040 && chip_id != T6041 && chip_id != T8132)
         return 0;
 
