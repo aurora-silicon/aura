@@ -109,6 +109,14 @@ endif
 CFG += ESP_STAGE2
 endif
 
+# Signed payloads (docs/secure-boot.md): SECBOOT=audit checks and records, SECBOOT=enforce also
+# refuses anything unverified. SECBOOT_PUBKEY is the raw 32-byte Ed25519 key built in; the
+# default is the published TEST key, which proves nothing.
+ifneq ($(filter audit enforce,$(SECBOOT)),)
+CFG += SECBOOT_$(shell echo $(SECBOOT) | tr a-z A-Z)
+endif
+SECBOOT_PUBKEY ?= data/secboot/test-ed25519.pub
+
 # Development builds only: a boot started by a VDM `reboot debugusb` with a host reading the
 # DockChannel console opens the same 15 s proxy window as an aura-proxy request.
 ifeq ($(DEBUGUSB_PROXY),1)
@@ -208,6 +216,7 @@ OBJECTS := \
 	ringbuffer.o \
 	rtkit.o \
 	sart.o \
+	secboot.o \
 	sep.o \
 	stage1_config.o \
 	stage1_proxy.o \
@@ -335,6 +344,9 @@ build-tag src/../build/build_tag.h &:
 
 build-cfg src/../build/build_cfg.h &:
 	$(QUIET)mkdir -p build
+	$(QUIET)python3 tools/secboot_sign.py c-header $(SECBOOT_PUBKEY) > build/secboot_key.tmp
+	$(QUIET)cmp -s build/secboot_key.h build/secboot_key.tmp 2>/dev/null || \
+	( mv -f build/secboot_key.tmp build/secboot_key.h && echo "  KEY   build/secboot_key.h" )
 	$(QUIET)for i in $(CFG); do echo "#define $$i"; done > build/build_cfg.tmp
 	$(QUIET)echo "#define BUILTIN_LOGO $(BUILTIN_LOGO)" >> build/build_cfg.tmp
 	$(QUIET)cmp -s build/build_cfg.h build/build_cfg.tmp 2>/dev/null || \

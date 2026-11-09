@@ -27,6 +27,9 @@ SECTIONS {
          */
         *hv/hv_vm.o(.text .text.*)
         *hv/hv_sprr.o(.text .text.*)
+        /* Signature checks (secboot.c, the Ed25519 verifier): run once per boot. */
+        *secboot.o(.text .text.*)
+        *librust.a:*ed25519_compact*(.text .text.*)
     } :text
     .text : ALIGN(0x10000) {
         *(.text)

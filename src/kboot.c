@@ -34,6 +34,7 @@
 #include "pmgr.h"
 #include "rtkit.h"
 #include "sart.h"
+#include "secboot.h"
 #include "sep.h"
 #include "sio.h"
 #include "smp.h"
@@ -9224,6 +9225,7 @@ int kboot_prepare_dt(void *fdt)
         return -1;
     if (dt_set_chosen())
         return -1;
+    secboot_export_fdt(dt);
     if (chip_id == T8152)
         return dt_prepare_t8152();
     if (dt_set_speaker_safety())

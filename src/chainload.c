@@ -10,6 +10,7 @@
 #include "malloc.h"
 #include "memory.h"
 #include "nvme.h"
+#include "secboot.h"
 #include "stage1_config.h"
 #include "string.h"
 #include "types.h"
@@ -458,7 +459,10 @@ int chainload_load(const char *spec, char **vars, size_t *var_cnt, size_t var_ca
         }
     }
     if (ret == 0) {
-        ret = chainload_image(image, size, vars, *var_cnt);
+        size_t run_size = size;
+        ret = secboot_check_chainload(image, &run_size, vars, var_cnt, var_capacity);
+        if (ret == 0)
+            ret = chainload_image(image, run_size, vars, *var_cnt);
         rust_free_image(image, size);
     }
     if (ret && trial) {
@@ -469,7 +473,10 @@ int chainload_load(const char *spec, char **vars, size_t *var_cnt, size_t var_ca
         printf("chainload: trial image failed, loading the configured one\n");
         ret = rust_load_image(spec, &image, &size, NULL, NULL, 0);
         if (ret == 0) {
-            ret = chainload_image(image, size, vars, *var_cnt);
+            size_t run_size = size;
+            ret = secboot_check_chainload(image, &run_size, vars, var_cnt, var_capacity);
+            if (ret == 0)
+                ret = chainload_image(image, run_size, vars, *var_cnt);
             rust_free_image(image, size);
         }
     }

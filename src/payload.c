@@ -9,6 +9,7 @@
 #include "boot_options.h"
 #include "boot_storage.h"
 #include "chainload.h"
+#include "secboot.h"
 #include "cpufreq.h"
 #include "display.h"
 #include "firmware.h"
@@ -168,9 +169,12 @@ static void *load_cpio(void *p, size_t size)
     return ((u8 *)p) + size;
 }
 
+static size_t kernel_payload_size;
+
 static void *load_kernel(void *p, size_t size)
 {
     kernel = p;
+    kernel_payload_size = size ? size : kernel->image_size;
 
     assert(size <= kernel->image_size);
 
@@ -340,6 +344,9 @@ static void *load_one_payload(void *start, size_t size)
         memcpy(&size, p + hdr, 4);
 
         printf("Found a signature at %p, skipping 0x%x bytes\n", p, size);
+        /* An image trailer (secboot.c) ends the image: nothing after it is a payload. */
+        if (!memcmp(p + size + 8, "AURSIGT1", 8))
+            return NULL;
         return p + size;
     } else if ((hdr = payload_record(p, initramfs_magic, sizeof initramfs_magic))) {
         u32 size;
@@ -436,9 +443,14 @@ int payload_run(void)
     }
 
     if (!payload_scanned) {
-        void *p = payload_start();
+        u8 *p = payload_start();
+        /* Before anything in the payloads is parsed: an enforcing stage runs only signed ones. */
+        if (secboot_check_payloads(p, &p)) {
+            next_stage.entry = NULL;
+            return -1;
+        }
         cpufreq_payload_boost(true);
-        while (p)
+        while (p && secboot_payload_allowed(p))
             p = load_one_payload(p, 0);
         cpufreq_payload_boost(false);
         payload_scanned = true;
@@ -555,6 +567,10 @@ int payload_run(void)
 
         if (config_lost)
             kboot_set_config_lost();
+        if (!boot_spec) {
+            secboot_measure("dtb", fdt, fdt_totalsize(fdt), SECBOOT_MEASURED);
+            secboot_measure("kernel", kernel, kernel_payload_size, SECBOOT_MEASURED);
+        }
         if (kboot_prepare_dt(fdt)) {
             printf("Failed to prepare FDT!\n");
             goto boot_failed;

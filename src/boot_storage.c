@@ -3,6 +3,7 @@
 #include "../build/build_cfg.h"
 
 #include "boot_storage.h"
+#include "secboot.h"
 #include "adt.h"
 #include "heapblock.h"
 #include "kboot.h"
@@ -168,6 +169,13 @@ int boot_storage_load(const char *spec, struct kernel_header **kernel, void **fd
 
     if (boot_check_dtb(files[1], sizes[1]))
         goto fail;
+    /* ESP files carry no signature: an enforcing stage does not boot them. */
+    if (!secboot_allow_unverified("an ESP boot= kernel"))
+        goto fail;
+    secboot_measure("esp-kernel", files[0], sizes[0], SECBOOT_UNSIGNED);
+    secboot_measure("esp-dtb", files[1], sizes[1], SECBOOT_UNSIGNED);
+    if (have_initrd)
+        secboot_measure("esp-initramfs", files[2], sizes[2], SECBOOT_UNSIGNED);
     if (have_initrd &&
         !((sizes[2] >= 18 && ((u8 *)files[2])[0] == 0x1f && ((u8 *)files[2])[1] == 0x8b) ||
           (sizes[2] >= 6 && (!memcmp(files[2], "070701", 6) || !memcmp(files[2], "070702", 6)))))
