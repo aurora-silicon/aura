@@ -1087,6 +1087,37 @@ static void sptm_virt_sysreg_census(u32 iss, u64 elr)
  */
 u32 sptm_virt_wfi_watch;
 
+/* With AURA_WFI_WATCH=2 XNU's WFEs trap too (TWE): a spin-wait that never ends shows its pc and
+ * frame chain every 10 s. A WFE may always return early, so it is simply skipped. */
+static bool sptm_virt_wfe_watched(u64 *regs, u64 esr)
+{
+    static u64 n, n_last, t_last;
+    if (sptm_virt_wfi_watch < 2 || !(esr & 1))
+        return false;
+    u64 now = mrs(CNTPCT_EL0), f = mrs(CNTFRQ_EL0), pc = mrs(ELR_EL2);
+    n++;
+    if (!t_last)
+        t_last = now;
+    if (now - t_last >= 10 * f) {
+        printf("SPTM-virt[wfe c%d]: %lu WFEs in the last %lu s (%lu in all), pc 0x%lx lr 0x%lx x0 0x%lx\n",
+               smp_id(), n - n_last, (now - t_last) / f, n, pc, regs[30], regs[0]);
+        u64 fp = regs[29];
+        for (int i = 0; i < 10 && fp; i++) {
+            u64 nfp, lr;
+            if (!sptm_virt_el1_va_read64(fp, &nfp) || !sptm_virt_el1_va_read64(fp + 8, &lr))
+                break;
+            printf("SPTM-virt[wfe c%d]:   frame %d lr 0x%lx\n", smp_id(), i, lr);
+            if (nfp <= fp)
+                break;
+            fp = nfp;
+        }
+        n_last = n;
+        t_last = now;
+    }
+    msr(ELR_EL2, pc + 4);
+    return true;
+}
+
 static bool sptm_virt_wfi_watched(u64 esr)
 {
     static u64 n, n_last, t_last;
@@ -1112,7 +1143,7 @@ bool sptm_virt_el1_wfx(u64 *regs, u64 esr)
 {
     if (sptm_virt_s2r_wfi(regs, esr))
         return true;
-    if (sptm_virt_wfi_watched(esr))
+    if (sptm_virt_wfi_watched(esr) || sptm_virt_wfe_watched(regs, esr))
         return true;
 
     u64 pc = mrs(ELR_EL2);

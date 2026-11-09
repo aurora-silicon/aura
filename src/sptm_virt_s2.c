@@ -566,6 +566,26 @@ bool sptm_virt_s2_dabort_gl(u64 *regs)
     return true;
 }
 
+/*
+ * A guest that stops calling SPTM may still be busy on a trapped page (polling a register aura
+ * hooks). Every 10 s of trapped accesses, one line: how many, and the last one.
+ */
+static void sptm_virt_s2_activity(struct exc_info *ctx)
+{
+    static u64 n, n_last, t_last;
+    u64 now = mrs(CNTPCT_EL0), f = mrs(CNTFRQ_EL0);
+    n++;
+    if (!t_last)
+        t_last = now;
+    if (now - t_last < 10 * f)
+        return;
+    printf("SPTM-virt[s2 traps]: %lu in the last %lu s (%lu in all), the last far 0x%lx esr 0x%lx "
+           "pc 0x%lx\n",
+           n - n_last, (now - t_last) / f, n, ctx->far, ctx->esr, ctx->elr);
+    n_last = n;
+    t_last = now;
+}
+
 /* A stage-2 abort from the OS at virtual EL2: a trapped page, emulated by the HV's MMIO code. */
 bool sptm_virt_s2_dabort(u64 *regs)
 {
@@ -574,6 +594,7 @@ bool sptm_virt_s2_dabort(u64 *regs)
     if (sptm_virt_aura_guard_fault(regs, false))
         return true;
     sptm_virt_fill_ctx(&ctx, regs, false);
+    sptm_virt_s2_activity(&ctx);
     if (hv_handle_dabort(&ctx)) {
         memcpy(regs, ctx.regs, 31 * sizeof(u64));
         msr(ELR_EL2, ctx.elr + 4);

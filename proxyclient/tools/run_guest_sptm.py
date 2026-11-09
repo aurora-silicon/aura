@@ -47,12 +47,13 @@ Environment (all optional; 1 enables a switch):
   AURA_KEEP_BOOT_VIDEO     hand iBoot's boot framebuffer to XNU, aura's console off it
   AURA_TAIL_SECS, AURA_TAIL_IDLE   keep reading the console after entry, until idle
   AURA_AMCC_NOLOCK=0       let SPTM lock iBoot's AMCC ranges (they cover stage 1's image = aura)
-  AURA_WFI_WATCH           trap XNU's WFIs and report every 10 s how many (idle vs. dead)
+  AURA_WFI_WATCH=1|2       trap XNU's WFIs (2: and WFEs) and report every 10 s (idle vs. dead)
   AURA_HIDE_NODES=<a,b>    further ADT nodes to hide from the guest (comma-separated paths)
   AURA_TRAP_DELAY_NS=<n>   spin n ns in every GL trap (workaround: holds off the ~20 s stall)
   AURA_TRAP_DELAY_MASK=<m> which GL traps spin: 1 GEXIT, 2 g-ERET, 4 IMPDEF, 8 SPTM's entry
                            sysreg read, 16 HVC, 32 rest, 64 other sysregs
   AURA_SYSREG_CENSUS       print which sysregs the guarded world traps on, every 20 s
+  AURA_S2R_LIVE            print the guest's writes to the hooked power blocks as they happen
   AURA_CPTR_LIVE=0         keep SPTM's CPTR_EL2 writes a shadow (default: XNU's CPACR_EL1)
   XNU_BOOTARGS             XNU's command line
 
@@ -125,6 +126,7 @@ KNOWN_ENV = {
     "AURA_TRAP_DELAY_MASK",
     "AURA_CPTR_LIVE",
     "AURA_SYSREG_CENSUS",
+    "AURA_S2R_LIVE",
 } | set(CONFIG_FLAGS)
 
 # The debug link's USB-C port: XNU must never drive it (it resets the port about 3 s into IOKit
@@ -795,14 +797,16 @@ def main():
         p.iodev_set_usage(IODEV.FB, 0)  # the framebuffer is XNU's now
     if os.environ.get("AURA_TRAP_DELAY_NS"):
         p.write32(sym["sptm_virt_trap_delay_ns"], env_int("AURA_TRAP_DELAY_NS"))
+    if env_on("AURA_S2R_LIVE"):
+        p.write32(sym["sptm_virt_s2r_live"], 1)
     if env_on("AURA_SYSREG_CENSUS"):
         p.write32(sym["sptm_virt_census"], 1)
     if os.environ.get("AURA_CPTR_LIVE"):
         p.write32(sym["sptm_virt_cptr_live"], env_int("AURA_CPTR_LIVE"))
     if os.environ.get("AURA_TRAP_DELAY_MASK"):
         p.write32(sym["sptm_virt_trap_delay_mask"], env_int("AURA_TRAP_DELAY_MASK"))
-    if env_on("AURA_WFI_WATCH"):
-        p.write32(sym["sptm_virt_wfi_watch"], 1)
+    if os.environ.get("AURA_WFI_WATCH"):
+        p.write32(sym["sptm_virt_wfi_watch"], env_int("AURA_WFI_WATCH"))
     if os.environ.get("AURA_AMCC_NOLOCK"):
         p.write32(sym["sptm_virt_amcc_nolock"], env_int("AURA_AMCC_NOLOCK"))
         print("AMCC range locks:", "shadowed" if env_int("AURA_AMCC_NOLOCK") else "SPTM's (locked)")

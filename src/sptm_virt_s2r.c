@@ -130,6 +130,7 @@ static int s2r_nkeep;
 /* With the proxy on CDC the rule holds from setup: XNU lowers three of these domains about a
  * second into its boot. */
 static bool s2r_keep_always;
+u32 sptm_virt_s2r_live;
 static volatile bool s2r_keep_released;
 
 /*
@@ -530,6 +531,13 @@ static bool s2r_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int w
     }
     sptm_virt_mmio_rw(addr, val, write, width);
     sptm_virt_s2r_note(ctx, addr, *val, write, width);
+    /* AURA_S2R_LIVE: the guest's writes to the hooked power blocks, as they happen, for a stall
+     * that leaves nothing to read back. */
+    if (write && sptm_virt_s2r_live) {
+        static u32 n;
+        if (n++ < 1500)
+            printf("SPTM-virt[pmgr wr] %s 0x%lx <- 0x%lx pc 0x%lx\n", what, addr, *val, ctx->elr);
+    }
     s2r_wakerec_fallback();
     if (s2r_wakerec_printed)
         s2r_wakerec_pump();
@@ -603,7 +611,10 @@ static void s2r_keep_setup(void)
         for (int j = 0; j < n; j++) {
             if (s2r_keep_idx(regs[j]) >= 0 || s2r_report_off(regs[j]))
                 continue;
-            if ((flags[j] & S2R_PMGR_OFF_AT_SLEEP) &&
+            /* From boot (the proxy on the link for the whole run) there is no sleep to report
+             * them off for: keep them on like the rest, or the guest's power manager switches
+             * them off under the link. */
+            if ((flags[j] & S2R_PMGR_OFF_AT_SLEEP) && !s2r_keep_always &&
                 s2r_n_report_off < (int)ARRAY_SIZE(s2r_report_off_regs)) {
                 s2r_report_off_regs[s2r_n_report_off++] = regs[j];
                 s2r_hook_range("pmgr-debugpath", regs[j], 4);

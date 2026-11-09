@@ -481,7 +481,7 @@ void sptm_virt_cpu_enters_xnu(int cpu)
     sptm_virt_ctrr_publish_rorgn();
     sptm_virt_s2_enter_xnu(cpu);
     if (sptm_virt_wfi_watch)
-        nv2_hcr_update(HCR_TWI, 0);
+        nv2_hcr_update(HCR_TWI | (sptm_virt_wfi_watch > 1 ? HCR_TWE : 0), 0);
 }
 
 __attribute__((used, retain)) void sptm_virt_enter(void)
