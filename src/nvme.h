@@ -8,6 +8,8 @@
 bool nvme_init(void);
 extern bool nvme_adopt_live_session;
 extern bool nvme_keep_running_for_linux;
+/* nvme_shutdown(): quiesce RTKit for an OS that wakes ANS as iBoot hands it over */
+extern bool nvme_quiesce_for_next;
 bool nvme_shutdown(void);
 bool nvme_has_live_post_m4_session(void);
 

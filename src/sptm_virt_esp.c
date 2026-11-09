@@ -235,11 +235,13 @@ extern u32 sptm_virt_s2r_dcp_pkt, sptm_virt_s2r_cp_skip_ans, sptm_virt_s2r_cp_an
 extern u64 sptm_virt_diag_pa;
 
 /*
- * ANS's hand-off to XNU, after the last read from the ESP and before SPTM is entered. Its state is
- * the ANS power-off work's (aura#107 on T6050); this is the one place that decides it.
+ * ANS's hand-off to XNU, after the last read from the ESP and before SPTM is entered: the state XNU
+ * started ANS from in runs 24-28 and cp9b, which Stage 1's own proxy left ("controller off, RTKit
+ * quiesced"). A live session (cp4, cp5, cp8) or AP power quiesced alone (cp6, cp7) it can't take.
  */
 AURA_XTEXT int sptm_virt_esp_ans_handoff(void)
 {
+    nvme_quiesce_for_next = true;
     return nvme_shutdown() ? 0 : -1;
 }
 

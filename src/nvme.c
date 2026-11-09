@@ -146,6 +146,7 @@ bool nvme_adopt_live_session = false;
 /* aura only reads the drive; only a proxy-issued flush means the drive has data to settle. */
 static bool nvme_wrote;
 bool nvme_keep_running_for_linux = false;
+bool nvme_quiesce_for_next = false;
 static u8 nvme_die;
 /* When this stage started the ANS firmware, for the shutdown timing line. */
 static u64 nvme_boot_ticks;
@@ -829,11 +830,14 @@ bool nvme_shutdown(void)
                 printf("nvme: could not quiesce ANS AP power; later stages may stall\n");
         }
 #endif
-        if (nvme_secure_regs) {
+        if (nvme_secure_regs || nvme_quiesce_for_next) {
             /* Linux wakes the T8152 ANS with a fresh RTKit handshake and
              * cannot adopt a live session; it neither restarts a stopped
-             * ANS. Quiesce RTKit and leave the ASC running, as iBoot does. */
-            if (!rtkit_quiesce(nvme_rtkit))
+             * ANS. Quiesce RTKit and leave the ASC running, as iBoot does.
+             * XNU takes a T6050 ANS only that way (an adopted session too). */
+            if (!nvme_rtkit)
+                nvme_rtkit = rtkit_init("nvme", nvme_asc, NULL, NULL, NULL, false);
+            if (!nvme_rtkit || !rtkit_quiesce(nvme_rtkit))
                 goto out_preserve;
             nvme_initialized = false;
             printf("nvme: controller disabled, RTKit quiesced\n");
