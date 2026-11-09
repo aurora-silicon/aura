@@ -668,6 +668,9 @@ static bool rtkit_boot_internal(rtkit_dev_t *rtk, u32 timeout_usec, bool warm, u
 
     rtk->no_hello = false;
 
+    /* After a power loss macOS turns the receive side on before the run bit (T6050 cp9d). */
+    if (warm)
+        asc_i2a_enable(rtk->asc, true);
     /* boot the IOP if it isn't already */
     asc_cpu_start(rtk->asc);
     /* can be sent unconditionally to wake up a possibly sleeping IOP */
@@ -994,6 +997,8 @@ bool rtkit_idle(rtkit_dev_t *rtk)
 {
     if (!rtkit_switch_power_state(rtk, RTKIT_POWER_IDLE, RTKIT_POWER_IDLE))
         return false;
+    /* macOS turns the receive side off once the IOP acknowledged (T6050 cp9d). */
+    asc_i2a_enable(rtk->asc, false);
 
     u64 timeout = timeout_calculate(5000);
     while (!asc_cpu_idle(rtk->asc))

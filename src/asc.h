@@ -22,6 +22,7 @@ void asc_cpu_start(asc_dev_t *asc);
 void asc_cpu_stop(asc_dev_t *asc);
 bool asc_cpu_running(asc_dev_t *asc);
 bool asc_cpu_idle(asc_dev_t *asc);
+void asc_i2a_enable(asc_dev_t *asc, bool on);
 /* Inherited display coprocessor states accepted for a handoff. */
 enum asc_inherited_state {
     ASC_INHERITED_RUNNING, /* started and not stopped */

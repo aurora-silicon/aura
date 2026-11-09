@@ -1174,6 +1174,8 @@ int pcie_ans_power_on(void)
     for (size_t i = 0; i < ARRAY_SIZE(t6050_ans_ps_on); i++)
         if (pcie_t6050_ps(t6050_ans_ps[t6050_ans_ps_on[i]], true))
             return -1;
+    /* macOS sets ANS's run bit 70 ms after the storage PHYs are back (cp9d W1). */
+    udelay(70000);
     return 0;
 }
 
