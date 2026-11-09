@@ -667,8 +667,10 @@ def main():
         return
 
     print("entering SPTM at virtual EL2 (the result is on aura's console)")
-    # sptm_virt_enter does not return: the call's reply never comes.
-    p.call(sym["sptm_virt_enter"], reboot=True)
+    # sptm_virt_enter does not return. Waiting for a reply or a boot banner would eat the guest's
+    # first console output and reopen the link.
+    p.request(p.P_CALL, sym["sptm_virt_enter"], no_reply=True)
+    iface.dev.flush()
     secs = env_int("AURA_TAIL_SECS")
     if secs > 0:
         tail_console(iface, secs, float(os.environ.get("AURA_TAIL_IDLE") or 10))
