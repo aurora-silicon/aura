@@ -274,9 +274,12 @@ bool secboot_payload_allowed(const u8 *p)
 {
 #ifdef SECBOOT_ENFORCE
     static const char *const loader_lines[] = {
-        "chosen.aurora,",    "chosen.asahi,efi-system-partition=",
-        "nvme.adopt=",       "aura.host-window=",
-        "m1n1.config-lost=", NULL,
+        /*
+         * What an earlier aura stage appends: /chosen strings (its version, the ESP, the trial,
+         * its log, measurements) and the NVMe hand-over. Never a payload, chainload=, boot=,
+         * display=, mitigations= or tso=: those must come from the signed bytes.
+         */
+        "chosen.", "nvme.adopt=", "aura.host-window=", "m1n1.config-lost=", NULL,
     };
     if (!covered_end || p < covered_end)
         return true;
