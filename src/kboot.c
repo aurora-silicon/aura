@@ -4156,8 +4156,7 @@ static void dt_reserve_j713_dcpext(void)
             (status && ((len == sizeof("disabled") && !memcmp(status, "disabled", len)) ||
                         (len == sizeof("okay") && !memcmp(status, "okay", len)) ||
                         (len == sizeof("ok") && !memcmp(status, "ok", len))));
-        if (!supported_status ||
-            fdt_node_check_compatible(dt, node, "apple,t8132-dcpext"))
+        if (!supported_status || fdt_node_check_compatible(dt, node, "apple,t8132-dcpext"))
             continue;
         if (!dt_j713_dcpext_powered(alias)) {
             printf("FDT: '%s' is not powered; kernel gate remains closed\n", alias);
