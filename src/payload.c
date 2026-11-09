@@ -35,6 +35,11 @@ static const u8 kernel_magic[] = {'A', 'R', 'M', 0x64};          // at 0x38
 static const u8 cpio_magic[] = {'0', '7', '0', '7', '0'};        // '1' or '2' next
 static const u8 img4_magic[] = {0x16, 0x04, 'I', 'M', 'G', '4'}; // IA5String 'IMG4'
 /*
+ * A Mach-O boot object (tools/macho_boot_object.py) has its __PRELINK_INFO plist right after the
+ * raw image, where iBoot loads it. No payload or config line starts this way.
+ */
+static const u8 prelink_info_magic[] = {'<', '?', 'x', 'm', 'l', ' '};
+/*
  * aura's own payload records start "aura_". Payloads made for the bootloader aura replaced
  * start "m1n1_" instead; both are accepted so existing installs and payload builders keep
  * working. The two prefixes are the same length, so the record layout is unchanged.
@@ -352,7 +357,8 @@ static void *load_one_payload(void *start, size_t size)
                hdr + CUSTOM_LOGO_SIZE);
         return p + hdr + CUSTOM_LOGO_SIZE;
     } else if (!memcmp(p, empty, sizeof empty) ||
-               !memcmp(p + 0x05, img4_magic, sizeof img4_magic)) { // SEPFW after aura
+               !memcmp(p + 0x05, img4_magic, sizeof img4_magic) || // SEPFW after aura
+               !memcmp(p, prelink_info_magic, sizeof prelink_info_magic)) {
         /* Before check_var(): an end whose bytes also read as a line is still the end */
         printf("No more payloads at %p\n", p);
         return NULL;
