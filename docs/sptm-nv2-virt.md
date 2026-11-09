@@ -90,8 +90,9 @@ same code. XNU's entry is SPTM's first exit to its normal world at EL2h.
 Nothing else is per chip or per board. The debug port is the USB-C port aura's proxy runs on, or with
 the proxy on KIS every port with an ATC PHY (`AURA_DEBUG_PORT` narrows it); its nodes follow from the
 PHY through the ADT's phandles. The reset guard takes its watchdog behaviour from the ADT's
-`wdt-version`, and the sleep trace its blocks from the ADT. Workarounds for one firmware release are
-keyed on the kernelcache's XNU release (`XNU_QUIRKS`). `tests/python/test_sptm_virt_generic.py` runs
+`wdt-version`, and the sleep trace its blocks from the ADT. Workarounds for one kernelcache are
+keyed on its XNU release and an instruction in its text (`XNU_QUIRKS`): one release ships a
+kernelcache per SoC, and the J813's 26A428 workaround must not reach the J714s's. `tests/python/test_sptm_virt_generic.py` runs
 the host's plan and the sleep path's discovery on real image sets (`SPTM_VIRT_IMAGE_SETS`).
 
 ## Memory

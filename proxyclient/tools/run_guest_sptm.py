@@ -124,26 +124,42 @@ IBOOT_COPIES = ("RTBuddySeg", "SEPFW", "SEPPatches", "uStuff", "preoslog")
 
 NOP = 0xd503201f
 
-# Workarounds for one firmware release, keyed on the kernelcache's XNU release string: what a
-# guest of that release must not see, and optional patches for tracing (AURA_XNU_RO_RELAX).
-# xnu-13432.1.9 (macOS 27.0, 26A428) panics in zalloc_ro_mut on AppleConvergedPCI's statics about
-# a second into IOKit, and again in pid 1 a second into userspace. Nothing here needs PCIe or
-# Wi-Fi, so their nodes are hidden. The RO-relax patch takes the branch that skips the second
-# panic; it changes what the guest does, so it is never on by default.
-XNU_QUIRKS = {
-    b"xnu-13432.1.9~": dict(
-        hide=("/arm-io/apcie", "/arm-io/dart-apcie0", "/arm-io/apcie0-piodma",
-              "/arm-io/apciec0", "/arm-io/dart-apciec0", "/arm-io/apciec0-piodma",
-              "/arm-io/centauri", "/arm-io/bluetooth", "/arm-io/aop-spmi0/spmi-wifibt"),
-        ro_relax=(("zalloc_ro_mut RO-zone check", "BootKC-rx", 0x3b27e4c, 0x540002a9,
-                   0x14000015),)),
-}
+# Workarounds for one kernelcache, each keyed on its XNU release string and a fingerprint: an
+# instruction at a place in its text. One release ships different kernelcaches per SoC, and only
+# the one that matches gets the entry: what its guest must not see, and optional patches for
+# tracing (AURA_XNU_RO_RELAX).
+# J813's xnu-13432.1.9 (macOS 27.0, 26A428) panics in zalloc_ro_mut on AppleConvergedPCI's statics
+# about a second into IOKit, and again in pid 1 a second into userspace. Nothing here needs PCIe
+# or Wi-Fi, so their nodes are hidden. The RO-relax patch takes the branch that skips the second
+# panic; it changes what the guest does, so it is never on by default. Its branch is the
+# fingerprint. J714s's kernelcache of the same release has none of this and keeps Wi-Fi.
+XNU_QUIRKS = (
+    dict(release=b"xnu-13432.1.9~", fingerprint=("__TEXT_EXEC", 0x3b27e4c, 0x540002a9),
+         hide=("/arm-io/apcie", "/arm-io/dart-apcie0", "/arm-io/apcie0-piodma",
+               "/arm-io/apciec0", "/arm-io/dart-apciec0", "/arm-io/apciec0-piodma",
+               "/arm-io/centauri", "/arm-io/bluetooth", "/arm-io/aop-spmi0/spmi-wifibt"),
+         ro_relax=(("zalloc_ro_mut RO-zone check", "BootKC-rx", 0x3b27e4c, 0x540002a9,
+                    0x14000015),)),
+)
+
+
+def kernelcache_word(kernelcache, seg, off):
+    from aura.sptm_virt_plan import macho_info
+
+    try:
+        s = macho_info(kernelcache).segs[seg]
+    except (KeyError, ValueError, struct.error):
+        return None
+    if off + 4 > min(s.vmsize, s.filesize):
+        return None
+    return struct.unpack_from("<I", kernelcache, s.fileoff + off)[0]
 
 
 def xnu_quirks(kernelcache):
-    for key, quirks in XNU_QUIRKS.items():
-        if key in kernelcache:
-            return key.decode().rstrip("~"), quirks
+    for q in XNU_QUIRKS:
+        seg, off, word = q["fingerprint"]
+        if q["release"] in kernelcache and kernelcache_word(kernelcache, seg, off) == word:
+            return q["release"].decode().rstrip("~"), q
     return None, dict(hide=(), ro_relax=())
 
 
@@ -640,6 +656,8 @@ def main():
         p.write32(sym["sptm_virt_link_phys"] + 4 * i, ph)
     print("debug-link USB PHYs (phandles):", " ".join(f"0x{ph:x}" for ph in phys) or "none")
     if env_on("AURA_XNU_RO_RELAX"):
+        if not quirks["ro_relax"]:
+            raise SystemExit("AURA_XNU_RO_RELAX: no RO-zone patch matches this kernelcache")
         patch_xnu(p, sym, plan, quirks["ro_relax"])
     configure(p, sym, plan, live_adt)
     if p.call(sym["sptm_virt_load"], entry, handoff) != 0:
