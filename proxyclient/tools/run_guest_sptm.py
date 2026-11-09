@@ -24,6 +24,7 @@ Environment (all optional; 1 enables a switch):
   AURA_S2R_GO              let the sleep proceed (otherwise stop in the proxy before it)
   AURA_S2R_FULLTRACE       also hook the high-volume blocks
   AURA_S2R_COPROC          also hook the coprocessor and exclave mailboxes
+  AURA_S2R_MEM             T6050: also hook the MCC, AMCC, DCS and coprocessor DARTs
   AURA_S2R_DROP_USB        tear down aura's USB gadget at the sleep commit
   AURA_S2R_WAKE_S=<s>      GO, timer-only sleep: arm the PMU RTC alarm s seconds after the commit
   AURA_S2R_GO_COUNT=<n>    GO, timer-only sleep: after n wakes, stop in the proxy at the next commit
@@ -79,6 +80,7 @@ CONFIG_FLAGS = {
     "AURA_XNU_BT": 1 << 5,
     "AURA_GPU_TRACE": 1 << 6,
     "AURA_SAMPLE": 1 << 7,
+    "AURA_S2R_MEM": 1 << 8,
 }
 KNOWN_ENV = {
     "AURA_KEEP_EXCLAVES",

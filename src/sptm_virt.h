@@ -49,6 +49,7 @@ struct sptm_virt_placement {
 #define SPTM_VIRT_XNU_BT       BIT(5) /* sample XNU backtraces at GEXIT */
 #define SPTM_VIRT_GPU          BIT(6) /* hook and record the GPU and PMP registers */
 #define SPTM_VIRT_SAMPLE       BIT(7) /* sample the guest's PC until its XNU entry */
+#define SPTM_VIRT_S2R_MEM      BIT(8) /* T6050: also hook the MCC and the coprocessor DARTs */
 
 #ifdef SPTM_VIRT
 

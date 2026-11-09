@@ -866,6 +866,184 @@ static void s2r_hook_full(void)
     s2r_hook_adt("/arm-io/dcp", 0, "dcp-mbox", 0x8000, 0x4000);
 }
 
+/* ---- T6050: the coprocessors and the memory side ---------------------------------------------
+ *
+ * COPROC hooks each ASC's CPU-control page, mailbox page and wrapper window, the mxwrap
+ * coprocessors' mailbox and control pages, the exclave mailboxes, the SMC's small window and the
+ * other SPMI buses; MEM adds the MCC, AMCC and DCS apertures and the coprocessors' DARTs. Each
+ * guest access is performed as issued and recorded; aura itself reads none of these (on the M5 a
+ * read of the SMC ASC's status takes an external abort).
+ *
+ * The enclave's message words are cut to their headers before they reach the ring: a SEP
+ * message keeps its endpoint, tag, opcode and param, and its data only on the control and boot
+ * endpoints; an ESM word at or above 0x800 keeps bits 63:48 and 7:0.
+ */
+#define S2R_CP_PAGES_MAX 2048
+#define S2R_CP_NAMES     192
+#define S2R_SEP_EP_CTRL  0x00
+#define S2R_SEP_EP_BOOT  0xff
+
+static u64 *s2r_cp_pages;
+static u32 s2r_n_cp_pages;
+static char (*s2r_cp_names)[28];
+static int s2r_n_cp_names;
+static u64 s2r_sep_mbox, s2r_esm_mbox;
+
+static u64 s2r_cp_cut(u64 addr, u64 v, int width)
+{
+    u64 page = addr & ~0x3fffUL, off = addr & 0x3fff;
+
+    if (off < 0x800 || (page != s2r_sep_mbox && page != s2r_esm_mbox))
+        return v;
+    if (page == s2r_esm_mbox)
+        return v & (width == 3 ? GENMASK(63, 48) | GENMASK(7, 0) : GENMASK(7, 0));
+    /* SEP message word 0: A2I at 0x800, I2A at 0x830 */
+    if ((off & ~7UL) != 0x800 && (off & ~7UL) != 0x830)
+        return v;
+    if (off & 4)
+        return 0;
+    u8 ep = v & 0xff;
+    if (width == 3 && ep != S2R_SEP_EP_CTRL && ep != S2R_SEP_EP_BOOT)
+        v &= GENMASK(31, 0);
+    return v;
+}
+
+static bool s2r_cp_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int width)
+{
+    if (width == 4 || width == 5) {
+        for (int h = 0; h < width - 3; h++) {
+            u64 a = addr + 16 * h;
+            s2r_rw128(a, val + 2 * h, write);
+            sptm_virt_s2r_note(ctx, a, s2r_cp_cut(a, val[2 * h], 3), write, 3);
+            sptm_virt_s2r_note(ctx, a + 8, s2r_cp_cut(a + 8, val[2 * h + 1], 3), write, 3);
+        }
+        return true;
+    }
+    if (width < 0 || width > 3)
+        return false;
+    sptm_virt_mmio_rw(addr, val, write, width);
+    sptm_virt_s2r_note(ctx, addr, s2r_cp_cut(addr, *val, width), write, width);
+    return true;
+}
+
+static bool s2r_cp_hooked(u64 page)
+{
+    for (u32 i = 0; i < sptm_virt_s2r_pages; i++)
+        if (s2r_pages[i].page == page)
+            return true;
+    for (u32 i = 0; i < s2r_n_cp_pages; i++)
+        if (s2r_cp_pages[i] == page)
+            return true;
+    return false;
+}
+
+/* [base, base + size) exactly, a page at a time; pages hooked already keep their hook. */
+static void s2r_cp_range(const char *what, u64 base, u64 size)
+{
+    u32 n = 0;
+
+    if (!size || (base & 0x3fff))
+        return;
+    for (u64 page = base; page < base + size; page += 0x4000) {
+        if (sptm_virt_rg_owns(page) || s2r_cp_hooked(page))
+            continue;
+        u64 len = ALIGN_UP(min(0x4000UL, base + size - page), 4);
+        if (s2r_n_cp_pages >= S2R_CP_PAGES_MAX || hv_map_hook(page, s2r_cp_hook, len) < 0) {
+            printf("SPTM-virt[s2r]: cannot hook %s 0x%lx\n", what, page);
+            break;
+        }
+        s2r_cp_pages[s2r_n_cp_pages++] = page;
+        n++;
+    }
+    if (n)
+        printf("SPTM-virt[s2r]: capture %s 0x%lx + 0x%lx (%u pages)\n", what, base, size, n);
+}
+
+static const char *s2r_cp_name(const char *node, const char *what)
+{
+    if (s2r_n_cp_names >= S2R_CP_NAMES)
+        return what;
+    char *n = s2r_cp_names[s2r_n_cp_names++];
+    snprintf(n, sizeof(s2r_cp_names[0]), "%s-%s", node, what);
+    return n;
+}
+
+/* reg[idx] of /arm-io/<name>, hooked from off for size bytes (0: to its end). */
+static u64 s2r_cp_reg(const char *name, int idx, const char *what, u64 off, u64 size)
+{
+    char path[64];
+    int p[8];
+    u64 pa, sz;
+
+    snprintf(path, sizeof(path), "/arm-io/%s", name);
+    if (adt_path_offset_trace(adt, path, p) < 0 || adt_get_reg(adt, p, "reg", idx, &pa, &sz) < 0 ||
+        off >= sz)
+        return 0;
+    s2r_cp_range(s2r_cp_name(name, what), pa + off, size ? min(size, sz - off) : sz - off);
+    return pa + off;
+}
+
+static bool s2r_cp_compat(int node, const char *prefix)
+{
+    u32 len;
+    const char *c = adt_getprop(adt, node, "compatible", &len);
+    return c && len && !strncmp(c, prefix, strlen(prefix));
+}
+
+static void s2r_t6050_coproc(bool mem)
+{
+    static const char *const spmi[] = {"nub-spmi2", "nub-spmi3", "nub-spmi-a0", "nub-spmi-a1",
+                                       "aop-spmi0"};
+    static const char *const darts[] = {
+        "dart-mtp",     "dart-aop",      "dart-sio",      "dart-pmp0",     "sart-ans",
+        "dart-dcp",     "dart-disp0",    "dart-dcpext0",  "dart-dcpext1",  "dart-dcpext2",
+        "dart-dcpext3", "dart-dispext0", "dart-dispext1", "dart-dispext2", "dart-dispext3",
+    };
+    int io = adt_path_offset(adt, "/arm-io"), node = io;
+    u32 before = s2r_n_cp_pages;
+
+    s2r_cp_pages = malloc(S2R_CP_PAGES_MAX * sizeof(*s2r_cp_pages));
+    s2r_cp_names = malloc(S2R_CP_NAMES * sizeof(*s2r_cp_names));
+    if (io < 0 || !s2r_cp_pages || !s2r_cp_names) {
+        printf("SPTM-virt[s2r]: no coprocessor trace (no memory or no /arm-io)\n");
+        return;
+    }
+    ADT_FOREACH_CHILD(adt, node)
+    {
+        const char *name = adt_get_name(adt, node);
+        if (s2r_cp_compat(node, "iop,ascwrap") || s2r_cp_compat(node, "iop-sep,ascwrap")) {
+            s2r_cp_reg(name, 0, "asc", 0, 0x4000);
+            u64 mb = s2r_cp_reg(name, 0, "mbox", 0x8000, 0x4000);
+            s2r_cp_reg(name, 1, "wrap", 0, 0x4000);
+            if (!strcmp(name, "sep"))
+                s2r_sep_mbox = mb;
+            if (!strcmp(name, "smc"))
+                s2r_cp_reg(name, 2, "win", 0, 0x4000);
+        } else if (s2r_cp_compat(node, "iop,mxwrap")) {
+            s2r_cp_reg(name, 0, "mbox", 0, 0x4000);
+            s2r_cp_reg(name, 1, "asc", 0, 0x4000);
+        } else if (s2r_cp_compat(node, "iop,exclave-sep-manager")) {
+            s2r_esm_mbox = s2r_cp_reg(name, 0, "mbox", 0, 0x4000);
+        } else if (s2r_cp_compat(node, "iop,secure-rtbuddy-proxy")) {
+            s2r_cp_reg(name, 0, "mbox", 0, 0x4000);
+        }
+    }
+    for (unsigned i = 0; i < ARRAY_SIZE(spmi); i++)
+        for (int r = 0; r < 3; r++)
+            s2r_cp_reg(spmi[i], r, "regs", 0, 0x4000);
+    if (mem) {
+        /* The MCC's own pages, then each AMCC and its DCSs (amcc-reg-idx on). */
+        for (int r = 0; r < 64; r++)
+            if (!s2r_cp_reg("mcc", r, r < 14 ? "mcc" : r < 22 ? "amcc" : "dcs", 0, 0))
+                break;
+        for (unsigned i = 0; i < ARRAY_SIZE(darts); i++)
+            s2r_cp_reg(darts[i], 0, "regs", 0, 0);
+    }
+    printf("SPTM-virt[s2r]: coprocessor trace: %u pages (SEP mailbox 0x%lx, ESM 0x%lx cut to "
+           "headers)\n",
+           s2r_n_cp_pages - before, s2r_sep_mbox, s2r_esm_mbox);
+}
+
 /* cdc: the proxy runs over the DWC3 CDC link, whose domains are kept on even without the trace. */
 void sptm_virt_s2r_setup(bool cdc)
 {
@@ -881,13 +1059,16 @@ void sptm_virt_s2r_setup(bool cdc)
         return;
     }
     s2r_soc = &s2r_soc_adt;
-    u64 sleep_flags = SPTM_VIRT_S2R | SPTM_VIRT_S2R_GO | SPTM_VIRT_S2R_FULL | SPTM_VIRT_S2R_COPROC |
-                      SPTM_VIRT_S2R_DROP_USB;
+    u64 sleep_flags = SPTM_VIRT_S2R | SPTM_VIRT_S2R_GO | SPTM_VIRT_S2R_FULL |
+                      SPTM_VIRT_S2R_COPROC | SPTM_VIRT_S2R_DROP_USB | SPTM_VIRT_S2R_MEM;
+    u64 passive_ok = SPTM_VIRT_S2R_FULL | SPTM_VIRT_S2R_GO | SPTM_VIRT_S2R_COPROC |
+                     SPTM_VIRT_S2R_MEM;
     if (s2r_soc->timer_only &&
-        ((flags & sleep_flags & ~(SPTM_VIRT_S2R_FULL | SPTM_VIRT_S2R_GO)) != SPTM_VIRT_S2R ||
-         sptm_virt_s2r_quiesce || sptm_virt_s2r_usb_retake)) {
-        printf("SPTM-virt[s2r]: a timer-only sleep takes TRACE (0x1) with FULL (0x4) and GO (0x2) "
-               "only, quiesce=0, usb_retake=0; debug-link domains not kept\n");
+        ((flags & sleep_flags & ~passive_ok) != SPTM_VIRT_S2R || sptm_virt_s2r_quiesce ||
+         sptm_virt_s2r_usb_retake)) {
+        printf("SPTM-virt[s2r]: a timer-only sleep takes TRACE (0x1) with FULL (0x4), GO (0x2), COPROC "
+               "(0x8) and MEM (0x100) only, quiesce=0, usb_retake=0; debug-link domains not "
+               "kept\n");
         sptm_virt_flags &= ~sleep_flags;
         return;
     }
@@ -940,7 +1121,9 @@ void sptm_virt_s2r_setup(bool cdc)
             }
         }
         s2r_hook_range("s2r-timer", s2r_soc->stop_timer & ~0x3fffUL, 0x4000);
-        s2r_marker("TIMERSLP", sptm_virt_s2r_pages);
+        if (flags & (SPTM_VIRT_S2R_COPROC | SPTM_VIRT_S2R_MEM))
+            s2r_t6050_coproc(flags & SPTM_VIRT_S2R_MEM);
+        s2r_marker("TIMERSLP", sptm_virt_s2r_pages + s2r_n_cp_pages);
         printf("SPTM-virt[s2r]: timer-only sleep, %s: %u pages, %lu-record ring at 0x%lx; "
                "32-bit [0x%lx]=1 %s after %u s\n",
                s2r_go ? "GO" : "PRECOMMIT STOP", sptm_virt_s2r_pages, sptm_virt_s2r_nrec,
