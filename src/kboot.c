@@ -9978,6 +9978,172 @@ static int dt_set_t8132_lifecycle(void)
     return 0;
 }
 
+/*
+ * T6040 ANS (NVMe) rides the internal PCIe host's shared PHY block (domain
+ * APCIE_PHY_SW), which a real system sleep lowers and raises again through the
+ * sleep controller. The kernel's t6040-sleep driver, mirroring aurora #1208's
+ * single-lane t8140 path, reaches that block through an "apple,apcie" phandle
+ * to the PCIe host and consumes these reg-names + loader-published tunables:
+ *
+ *   axi2af    + apple,tunable-axi2af
+ *   cio3pll   + apple,tunable-cio3pll
+ *   clkgen    + apple,tunable-clkgen
+ *   phy-block + apple,tunable-phy
+ *   rc        (already present on the host node; no tunable)
+ *   phy-ip    + apple,tunable-phy-ip-pll AND apple,tunable-phy-ip-auspma
+ *
+ * The windows and tunables all live in the ADT under /arm-io/apcie0 (the GP
+ * host carries the shared PHY/PLL/clkgen/axi2af that ANS's storage lane uses).
+ * Our DT ships the host with config, rc, ports and phys only, so publish the five
+ * shared windows + six tunables here and point the sleep controller at the
+ * host. Refusal-safe: if any window or tunable is absent/malformed, publish
+ * nothing and leave apple,apcie unset, so the driver keeps s2idle the default
+ * and refuses a real sleep with ANS stopped rather than driving a bogus block.
+ */
+struct apcie_st_window {
+    int adt_reg_idx;      /* index into ADT /arm-io/apcie0 "reg" */
+    const char *reg_name; /* FDT reg-name to append to the PCIe host */
+    u64 size;             /* expected window size, a sanity check vs the ADT */
+};
+static const struct apcie_st_window t6040_apcie_st_windows[] = {
+    {4, "axi2af", 0x1000000},  {5, "cio3pll", 0x4000}, {6, "clkgen", 0x4000},
+    {2, "phy-block", 0x40000}, {3, "phy-ip", 0x28000},
+};
+static const struct adt_tunable_info t6040_apcie_st_tunables[] = {
+    {"apcie-axi2af-tunables", "apple,tunable-axi2af", 0, 0x1000000, true},
+    {"apcie-cio3pllcore-tunables", "apple,tunable-cio3pll", 0, 0x4000, true},
+    {"apcie-pcieclkgen-tunables", "apple,tunable-clkgen", 0, 0x4000, true},
+    {"apcie-phy-tunables", "apple,tunable-phy", 0, 0x40000, true},
+    {"apcie-phy-ip-pll-tunables", "apple,tunable-phy-ip-pll", 0, 0x28000, true},
+    {"apcie-phy-ip-auspma-tunables", "apple,tunable-phy-ip-auspma", 0, 0x28000, true},
+};
+
+/* Read-only pre-check, mirroring dt_append_acio_tunable's validation, so the
+ * write pass cannot append a partial property the kernel would then reject. */
+static bool t6040_apcie_st_tunable_ok(int adt_node, const struct adt_tunable_info *info)
+{
+    u32 len;
+    const struct acio_tunable *t = adt_getprop(adt, adt_node, info->adt_name, &len);
+
+    if (!t || !len || len % sizeof(*t))
+        return false;
+    for (u32 i = 0; i < len / sizeof(*t); i++) {
+        if (t[i].size != 4 || t[i].offset % 4)
+            return false;
+        if (info->reg_size < 4 || t[i].offset > info->reg_size - 4)
+            return false;
+        if (t[i].mask > UINT32_MAX || t[i].value > UINT32_MAX)
+            return false;
+    }
+    return true;
+}
+
+static int dt_set_t6040_sleep_apcie(void)
+{
+    /* Self-gating: only platforms with the t6040 sleep controller need this. */
+    int sleep_node = fdt_node_offset_by_compatible(dt, -1, "apple,t6040-sleep");
+    if (sleep_node < 0)
+        return 0;
+    /* Idempotent: do nothing if the contract is already wired. */
+    if (fdt_getprop(dt, sleep_node, "apple,apcie", NULL))
+        return 0;
+
+    int apcie_path[8];
+    int anode = adt_path_offset_trace(adt, "/arm-io/apcie0", apcie_path);
+    if (anode < 0)
+        return 0;
+    if (!adt_is_compatible(adt, anode, "apcie,t6040") &&
+        !adt_is_compatible(adt, anode, "apcie,t6041"))
+        return 0;
+
+    int pcie = fdt_node_offset_by_compatible(dt, -1, "apple,t6020-pcie");
+    if (pcie < 0)
+        return 0;
+    /* The shared block hangs off the host that owns "rc"; a stray match without
+     * it is not the internal host. */
+    if (fdt_stringlist_search(dt, pcie, "reg-names", "rc") < 0)
+        return 0;
+
+    /* ---- validate pass: touch no DT until everything is present ---------- */
+    u64 win_addr[ARRAY_SIZE(t6040_apcie_st_windows)];
+    for (size_t i = 0; i < ARRAY_SIZE(t6040_apcie_st_windows); i++) {
+        const struct apcie_st_window *w = &t6040_apcie_st_windows[i];
+        u64 addr, size;
+        if (adt_get_reg(adt, apcie_path, "reg", w->adt_reg_idx, &addr, &size) < 0) {
+            printf("FDT: ANS apcie: /arm-io/apcie0 reg[%d] (%s) missing; skipping\n",
+                   w->adt_reg_idx, w->reg_name);
+            return 0;
+        }
+        if (size != w->size) {
+            printf("FDT: ANS apcie: reg[%d] (%s) size 0x%lx != 0x%lx; skipping\n", w->adt_reg_idx,
+                   w->reg_name, size, w->size);
+            return 0;
+        }
+        /* Do not duplicate a window the DT already names. */
+        if (fdt_stringlist_search(dt, pcie, "reg-names", w->reg_name) >= 0) {
+            printf("FDT: ANS apcie: host already has reg-name %s; skipping\n", w->reg_name);
+            return 0;
+        }
+        win_addr[i] = addr;
+    }
+    for (size_t i = 0; i < ARRAY_SIZE(t6040_apcie_st_tunables); i++) {
+        if (!t6040_apcie_st_tunable_ok(anode, &t6040_apcie_st_tunables[i])) {
+            printf("FDT: ANS apcie: tunable %s absent/malformed; skipping\n",
+                   t6040_apcie_st_tunables[i].adt_name);
+            return 0;
+        }
+    }
+
+    /* ---- write pass: validated, so a failure here is FDT space only ------ */
+    /* Append the five shared windows to the host's reg + reg-names in lockstep. */
+    for (size_t i = 0; i < ARRAY_SIZE(t6040_apcie_st_windows); i++) {
+        const struct apcie_st_window *w = &t6040_apcie_st_windows[i];
+        fdt64_t cells[2];
+        fdt64_st(&cells[0], win_addr[i]);
+        fdt64_st(&cells[1], w->size);
+        if (fdt_appendprop(dt, pcie, "reg", cells, sizeof(cells)) < 0 ||
+            fdt_appendprop_string(dt, pcie, "reg-names", w->reg_name) < 0) {
+            printf("FDT: ANS apcie: no room to append window %s; leaving s2idle default\n",
+                   w->reg_name);
+            goto undo;
+        }
+    }
+    /* Append the six tunables onto the host node, bounded by each window size. */
+    for (size_t i = 0; i < ARRAY_SIZE(t6040_apcie_st_tunables); i++) {
+        if (dt_append_acio_tunable(anode, pcie, &t6040_apcie_st_tunables[i]) < 0) {
+            printf("FDT: ANS apcie: failed to publish %s; leaving s2idle default\n",
+                   t6040_apcie_st_tunables[i].adt_name);
+            goto undo;
+        }
+    }
+    /* Point the sleep controller at the host so the driver can find the block. */
+    uint32_t phandle = fdt_get_phandle(dt, pcie);
+    if (!phandle) {
+        if (fdt_generate_phandle(dt, &phandle) || fdt_setprop_u32(dt, pcie, "phandle", phandle))
+            goto undo;
+    }
+    /*
+     * Appending to the host above can grow the blob and move any node that
+     * follows it, so re-resolve the sleep controller before writing into it.
+     */
+    sleep_node = fdt_node_offset_by_compatible(dt, -1, "apple,t6040-sleep");
+    if (sleep_node < 0)
+        goto undo;
+    if (fdt_setprop_u32(dt, sleep_node, "apple,apcie", phandle))
+        goto undo;
+
+    printf("FDT: Published ANS apcie shared block (5 windows + 6 tunables) from ADT\n");
+    return 0;
+
+undo:
+    /* Refusal-safe: drop the tunables and leave apple,apcie unset. The extra
+     * reg/reg-names are looked up only by name, so an unmatched window is inert
+     * and the driver, finding no apple,apcie, keeps s2idle the default. */
+    for (size_t i = 0; i < ARRAY_SIZE(t6040_apcie_st_tunables); i++)
+        fdt_delprop(dt, pcie, t6040_apcie_st_tunables[i].fdt_name);
+    return 0;
+}
+
 void kboot_set_initrd(void *start, size_t size)
 {
     initrd_start = start;
@@ -10697,6 +10863,8 @@ int kboot_prepare_dt(void *fdt)
     if (dt_set_pmgr())
         return -1;
     if (chip_id == T8132 && (dt_set_ans_nvme(false) || dt_set_t8132_lifecycle()))
+        return -1;
+    if (dt_set_t6040_sleep_apcie())
         return -1;
 #ifndef RELEASE
     if (dt_transfer_virtios())
