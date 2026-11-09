@@ -1,5 +1,6 @@
 #!/bin/sh
-# Host test of the speaker amp configuration from the ADT (src/kboot_audio.c).
+# Host test of the speaker amp configuration and the speaker assembly ID from the ADT
+# (src/kboot_audio.c).
 #
 #   sh tests/run-kboot-audio.sh                          (the synthetic scenarios)
 #   sh tests/run-kboot-audio.sh <IODeviceTree.plist> <kernel.dtb>
@@ -108,24 +109,62 @@ expect() { # expect <scenario>: the amp lines that scenario must give (tree orde
         amp 40 - - - -
         amp 42 - - - -
         amp 41 $STALE_BOP $STALE_DCB $STALE_ROW $STALE_ZD ;;
+    speaker-id-*) expect group ;;
     *) fail "no expected result for $1" ;;
     esac
+}
+
+# The made-up AP GPIO controller of tests/kboot_audio_adt.py (pin registers at 0x201000000) and
+# a pin register with the input stage on (mode 7: input, interrupt off; bit 9: input enable)
+GPIO=0x201000000
+IN=0x0000020e
+pin() { # pin <pin> <register> <pad level>: one KBOOT_AUDIO_GPIO entry
+    printf '0x%x:%s:%s' $((GPIO + 4 * $1)) "$2" "$3"
+}
+gpio_env() { # gpio_env <scenario>: the pins that scenario models
+    case $1 in
+    speaker-id-3|speaker-id-not-gpio|speaker-id-bad-phandle|speaker-id-pin-out-of-range|\
+    speaker-id-no-valid-ids|speaker-id-find-off|speaker-id-unknown-flags)
+        echo "$(pin 0x34 $IN 1),$(pin 0x35 $IN 1)" ;;
+    speaker-id-0) echo "$(pin 0x34 $IN 0),$(pin 0x35 $IN 0)" ;;
+    speaker-id-not-valid) echo "$(pin 0x34 $IN 1),$(pin 0x35 $IN 0)" ;;
+    speaker-id-no-input-stage) echo "$(pin 0x34 0 1),$(pin 0x35 0 1)" ;;
+    speaker-id-output-pin) echo "$(pin 0x34 0x2 1),$(pin 0x35 $IN 1)" ;;
+    speaker-id-active-low) echo "$(pin 0x34 $IN 0),$(pin 0x35 $IN 1)" ;;
+    speaker-id-three-straps) echo "$(pin 0x30 $IN 1),$(pin 0x31 $IN 0),$(pin 0x32 $IN 1)" ;;
+    *) echo "" ;;
+    esac
+}
+expect_id() { # expect_id <scenario>: the speaker-id line, then every modelled pin as left
+    case $1 in
+    speaker-id-3|speaker-id-active-low) echo "speaker-id 3" ;;
+    speaker-id-0) echo "speaker-id 0" ;;
+    speaker-id-no-input-stage) echo "speaker-id 3" ;; # switched to an input for the read only
+    speaker-id-three-straps) echo "speaker-id 5" ;;
+    *) echo "speaker-id -" ;;
+    esac
+    # No scenario may leave a pin changed
+    for e in $(gpio_env "$1" | tr ',' ' '); do
+        a=${e%%:*}
+        r=${e#*:}
+        printf 'gpio %s 0x%08x\n' "$a" $((${r%%:*}))
+    done
 }
 
 n=0
 for s in $(python3 -I tests/kboot_audio_adt.py scenarios); do
     python3 -I tests/kboot_audio_adt.py scenario "$s" "$tmp/$s.adt" "$tmp/$s.dts"
     ${DTC:-dtc} -q -I dts -O dtb -o "$tmp/$s.dtb" "$tmp/$s.dts"
-    "$tmp/kboot-audio-host" "$tmp/$s.adt" "$tmp/$s.dtb" > "$tmp/$s.out" 2>&1 ||
-        { cat "$tmp/$s.out"; fail "$s: host run"; }
-    grep '^amp ' "$tmp/$s.out" > "$tmp/$s.got" || true
-    expect "$s" > "$tmp/$s.want"
+    KBOOT_AUDIO_GPIO=$(gpio_env "$s") "$tmp/kboot-audio-host" "$tmp/$s.adt" "$tmp/$s.dtb" \
+        > "$tmp/$s.out" 2>&1 || { cat "$tmp/$s.out"; fail "$s: host run"; }
+    grep -E '^(amp|speaker-id|gpio) ' "$tmp/$s.out" > "$tmp/$s.got" || true
+    { expect "$s"; expect_id "$s"; } > "$tmp/$s.want"
     if ! cmp -s "$tmp/$s.got" "$tmp/$s.want"; then
         cat "$tmp/$s.out"
         diff -u "$tmp/$s.want" "$tmp/$s.got" || true
         fail "$s"
     fi
-    echo "ok $s: $(grep -v '^amp ' "$tmp/$s.out" | tail -n 1)"
+    echo "ok $s: $(grep -v -E '^(amp|speaker-id|gpio) ' "$tmp/$s.out" | tail -n 1)"
     n=$((n + 1))
 done
 [ "$n" -gt 0 ] || fail "no scenarios ran"
