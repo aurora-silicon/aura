@@ -4266,7 +4266,7 @@ static bool dt_j713_dcpext_powered(const char *alias)
 
 /*
  * J713: iBoot starts both external DCPs and leaves them quiesced, as it does the internal one,
- * with their DARTs set up. Reserve their firmware memory and mark each disabled
+ * with their DARTs set up. Reserve their firmware memory and mark each
  * apple,t8132-dcpext node ready for the kernel to adopt the running controller. Only with the
  * boot.bin config line chosen.asahi,j713-dcpext=1, only after the internal DCP was handed over
  * (an external DCP must never cost the panel), and only for a controller iBoot left powered.
@@ -4300,8 +4300,14 @@ static void dt_reserve_j713_dcpext(void)
         }
         node = fdt_path_offset(dt, alias);
         const char *status = fdt_getprop(dt, node, "status", &len);
-        if (!status || len != sizeof("disabled") || strcmp(status, "disabled") ||
-            fdt_node_check_compatible(dt, node, "apple,t8132-dcpext"))
+        /* Older embedded trees disable the controller; current kernels keep it
+         * available and gate adoption on the ready marker. Preserve either form. */
+        bool supported_status =
+            (!status && len == -FDT_ERR_NOTFOUND) ||
+            (status && ((len == sizeof("disabled") && !memcmp(status, "disabled", len)) ||
+                        (len == sizeof("okay") && !memcmp(status, "okay", len)) ||
+                        (len == sizeof("ok") && !memcmp(status, "ok", len))));
+        if (!supported_status || fdt_node_check_compatible(dt, node, "apple,t8132-dcpext"))
             continue;
         if (!dt_j713_dcpext_powered(alias)) {
             printf("FDT: '%s' is not powered; kernel gate remains closed\n", alias);
@@ -5031,7 +5037,14 @@ static int dt_t8140_disable_typec_routes(const char *dcp_path)
     return 0;
 }
 
-/* Follow the bounded, zero-cell power-domain chain described by the DT. */
+/*
+ * Follow the bounded, zero-cell power-domain chain described by the DT.
+ *
+ * The chain ends at the first ancestor (after the controller's own state)
+ * that is marked apple,always-on: such a state is shared SoC fabric that
+ * Linux never switches, so it is neither published nor withdrawn with the
+ * display, and its own parents (which may be several) are not walked.
+ */
 static int dt_t8140_power_paths(int node, char (*paths)[128], size_t capacity)
 {
     if (!capacity || capacity > 3)
@@ -5042,10 +5055,17 @@ static int dt_t8140_power_paths(int node, char (*paths)[128], size_t capacity)
         const fdt32_t *ref = fdt_getprop(dt, node, "power-domains", &length);
         if (!ref)
             return length == -FDT_ERR_NOTFOUND ? count : -1;
-        if (length != sizeof(*ref) || (size_t)count == capacity)
+        if (length != sizeof(*ref))
             return -1;
-        node = fdt_node_offset_by_phandle(dt, fdt32_to_cpu(*ref));
-        if (node < 0 || fdt_get_path(dt, node, paths[count], sizeof(paths[0])))
+        int next = fdt_node_offset_by_phandle(dt, fdt32_to_cpu(*ref));
+        if (next < 0)
+            return -1;
+        if (count && fdt_getprop(dt, next, "apple,always-on", NULL))
+            return count;
+        if ((size_t)count == capacity)
+            return -1;
+        node = next;
+        if (fdt_get_path(dt, node, paths[count], sizeof(paths[0])))
             return -1;
         for (int i = 0; i < count; i++)
             if (!strcmp(paths[i], paths[count]))
@@ -6980,8 +7000,8 @@ static int dt_set_display(void)
         return dt_set_display_handoff(dt);
     } else if (!fdt_node_check_compatible(dt, 0, "apple,t6041")) {
         /*
-         * The same fail-soft handoff on the M4 Max: nothing unless the board is a J616C whose
-         * device tree describes the display block; the display nodes stay disabled.
+         * The same fail-soft handoff on the M4 Max: nothing unless the board is a J616C or
+         * J614C whose device tree describes the display block; the display nodes stay disabled.
          */
         return dt_set_display_handoff(dt);
     } else if (!fdt_node_check_compatible(dt, 0, "apple,t6032")) {
@@ -7681,8 +7701,38 @@ static void dt_set_aop_motion_cal(const char *path)
  * addresses), so that the OS maps them in the AOP's DART before it starts the
  * firmware.
  */
+/*
+ * M1 Pro (T6000) and M2 (T8112): iBoot starts the AOP firmware itself and the
+ * OS needs no firmware segments, but the accelerometer and gyroscope services
+ * wait for the same calibration as on the M4 Pro. The ADT carries it in the
+ * same properties and container format.
+ */
+static int dt_set_aop_motion_cal_only(void)
+{
+    const char *compat = chip_id == T8112 ? "apple,t8112-aop" : "apple,t6000-aop";
+    int node = fdt_node_offset_by_compatible(dt, -1, compat);
+    if (node < 0)
+        return 0;
+
+    const char *status = fdt_getprop(dt, node, "status", NULL);
+    if (status && strcmp(status, "okay") && strcmp(status, "ok"))
+        return 0;
+
+    char path[64];
+    if (fdt_get_path(dt, node, path, sizeof(path))) {
+        printf("FDT: AOP node path too long\n");
+        return 0;
+    }
+
+    dt_set_aop_motion_cal(path);
+    return 0;
+}
+
 static int dt_set_aop_firmware(void)
 {
+    if (chip_id == T6000 || chip_id == T8112)
+        return dt_set_aop_motion_cal_only();
+
     if (chip_id != T6040 && chip_id != T6041 && chip_id != T8132)
         return 0;
 

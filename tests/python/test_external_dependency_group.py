@@ -77,7 +77,28 @@ int main(void) {
   memcpy(before,dt,sizeof(storage));
   assert(dt_t8140_enable_external("/external")<0);assert(!memcmp(before,dt,sizeof(storage)));
  }
- puts("dependency group success, dangling mailbox, unreserved DART and mid-update FDT rollback PASS");
+ /* An always-on fabric ancestor ends the chain; its own parents are not walked. */
+ for(unsigned aon=0;aon<2;aon++){
+  fixture(0);add("fabric-a",20,0);add("fabric-b",21,0);add("fabric",13,0);
+  n=fdt_path_offset(dt,"/fabric");assert(!fdt_setprop_u32(dt,n,"#power-domain-cells",0));
+  fdt32_t two[]={cpu_to_fdt32(20),cpu_to_fdt32(21)};assert(!fdt_setprop(dt,n,"power-domains",two,sizeof(two)));
+  if(aon) assert(!fdt_setprop_empty(dt,n,"apple,always-on"));
+  n=fdt_path_offset(dt,"/power-root");assert(!fdt_setprop_u32(dt,n,"power-domains",13));
+  external=fdt_path_offset(dt,"/external");
+  if(aon){
+   assert(dt_t8140_power_paths(external,power,3)==3);
+   assert(!strcmp(power[2],"/power-root"));
+   assert(!dt_t8140_enable_external("/external"));
+   assert(!fdt_getprop(dt,fdt_path_offset(dt,"/fabric"),"status",NULL));
+  } else {
+   assert(dt_t8140_power_paths(external,power,3)<0);
+  }
+ }
+ /* The controller's own first state may itself be always-on. */
+ fixture(0);n=fdt_path_offset(dt,"/power-leaf");assert(!fdt_setprop_empty(dt,n,"apple,always-on"));
+ external=fdt_path_offset(dt,"/external");
+ assert(dt_t8140_power_paths(external,power,3)==3);
+ puts("dependency group success, dangling mailbox, unreserved DART, always-on fabric end and mid-update FDT rollback PASS");
 }
 '''
         with tempfile.TemporaryDirectory() as tmp:
