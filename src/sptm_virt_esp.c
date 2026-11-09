@@ -38,6 +38,7 @@
 int rust_load_image(const char *spec, void **image, size_t *size, bool *proxy_request, char *trial,
                     size_t trial_capacity);
 void rust_free_image(void *image, size_t size);
+int rust_read_into(const char *spec, void *dst, size_t cap, size_t *size);
 
 #define PAGE     0x4000UL
 #define MIN_RAM  (2UL << 30) /* run_guest_sptm.py: "not enough managed RAM" */
@@ -46,7 +47,8 @@ void rust_free_image(void *image, size_t size);
 static struct {
     void *data[ESP_NIMG];
     u64 len[ESP_NIMG];
-    bool rust[ESP_NIMG]; /* from rust_load_image, not malloc */
+    u64 stage; /* the files sit below this, high in the managed window: aura's heap can't hold
+                  them (the kernelcache alone is close to its size) */
 } ef;
 
 /* A failure message goes to the panel too: this is where a user with no USB host ends up. */
@@ -58,15 +60,8 @@ static struct {
 
 AURA_XTEXT static void esp_free_files(void)
 {
-    for (int i = 0; i < ESP_NIMG; i++) {
-        if (!ef.data[i])
-            continue;
-        if (ef.rust[i])
-            rust_free_image(ef.data[i], ef.len[i]);
-        else
-            free(ef.data[i]);
+    for (int i = 0; i < ESP_NIMG; i++)
         ef.data[i] = NULL;
-    }
 }
 
 AURA_XTEXT static bool esp_hex_eq(const u8 sha[32], const char *hex)
@@ -78,19 +73,23 @@ AURA_XTEXT static bool esp_hex_eq(const u8 sha[32], const char *hex)
     return true;
 }
 
-/* Read one file from the bundle directory, or refuse it. */
+/* Read one file from the bundle directory, or refuse it: into dst (cap bytes) if given, else
+ * into aura's heap. */
 AURA_XTEXT static int esp_read(const char *uuid, const char *dir, const struct esp_file *f,
-                               void **out, size_t *len, bool checked)
+                               void **out, size_t *len, void *dst, u64 cap)
 {
     char spec[ESP_SPEC];
     u8 sha[32];
     if (snprintf(spec, sizeof(spec), "%s;%s/%s", uuid, dir, f->name) >= (int)sizeof(spec))
         return -1;
-    if (rust_load_image(spec, out, len, NULL, NULL, 0) || !*out) {
+    if (dst ? rust_read_into(spec, dst, cap, len)
+            : rust_load_image(spec, out, len, NULL, NULL, 0)) {
         printf("macOS ESP: cannot read %s\n", spec);
         return -1;
     }
-    if (!checked)
+    if (dst)
+        *out = dst;
+    if (!dst)
         return 0;
     if (*len != f->size) {
         printf("macOS ESP: %s is 0x%lx bytes, the manifest says 0x%lx\n", f->name, (u64)*len,
@@ -105,46 +104,51 @@ AURA_XTEXT static int esp_read(const char *uuid, const char *dir, const struct e
     return 0;
 }
 
+/* The next staging slot of size bytes, or 0 below floor. */
+AURA_XTEXT static u64 esp_stage(u64 size, u64 floor)
+{
+    u64 at = ALIGN_DOWN(ef.stage - size, PAGE);
+    if (size > ef.stage || at < floor)
+        return 0;
+    ef.stage = at;
+    return at;
+}
+
 AURA_XTEXT static int esp_load_file(const char *uuid, const char *dir, const struct esp_file *f,
-                                    int id)
+                                    int id, u64 floor)
 {
     void *d = NULL;
     size_t n = 0;
-    if (esp_read(uuid, dir, f, &d, &n, true)) {
-        if (d)
-            rust_free_image(d, n);
+    u64 at = esp_stage(f->size, floor);
+    if (!at || esp_read(uuid, dir, f, &d, &n, (void *)at, f->size)) {
+        if (!at)
+            printf("macOS ESP: no room to stage %s\n", f->name);
         return -1;
     }
     if (!f->gzip) {
         ef.data[id] = d;
         ef.len[id] = n;
-        ef.rust[id] = true;
         return 0;
     }
     u8 sha[32];
     unsigned int out = f->raw_size, src_len = n;
-    void *raw = malloc(f->raw_size);
+    u64 raw = esp_stage(f->raw_size, floor);
     if (!raw) {
-        rust_free_image(d, n);
-        printf("macOS ESP: no memory to unpack %s\n", f->name);
+        printf("macOS ESP: no room to unpack %s\n", f->name);
         return -1;
     }
-    int r = tinf_gzip_uncompress(raw, &out, d, &src_len);
-    rust_free_image(d, n);
+    int r = tinf_gzip_uncompress((void *)raw, &out, d, &src_len);
     if (r != TINF_OK || out != f->raw_size) {
-        free(raw);
         printf("macOS ESP: %s does not unpack (%d, 0x%x bytes)\n", f->name, r, out);
         return -1;
     }
-    sha256(raw, out, sha);
+    sha256((void *)raw, out, sha);
     if (memcmp(sha, f->raw_sha, 32)) {
-        free(raw);
         printf("macOS ESP: %s unpacked fails its SHA-256\n", f->name);
         return -1;
     }
-    ef.data[id] = raw;
+    ef.data[id] = (void *)raw;
     ef.len[id] = out;
-    ef.rust[id] = false;
     return 0;
 }
 
@@ -287,7 +291,7 @@ AURA_XTEXT int sptm_virt_esp_boot(const char *spec)
     struct esp_file mf;
     memset(&mf, 0, sizeof(mf));
     strcpy(mf.name, "manifest.txt");
-    if (esp_read(uuid, dir, &mf, &mtext, &mlen, false))
+    if (esp_read(uuid, dir, &mf, &mtext, &mlen, NULL, 0))
         goto fail;
     u8 msha[32];
     sha256(mtext, mlen, msha);
@@ -295,11 +299,17 @@ AURA_XTEXT int sptm_virt_esp_boot(const char *spec)
         ESP_FAIL("manifest.txt does not match this Stage 2's macos= line\n");
     if (esp_manifest_parse(m, mtext, mlen, err, sizeof(err)))
         ESP_FAIL("%s\n", err);
+    rust_free_image(mtext, mlen);
+    mtext = NULL;
     printf("macOS ESP: manifest for %s, %u patches, trace 0x%lx\n", m->build, m->npatch, m->trace);
 
     /* Everything is read and checked before the first write to RAM SPTM will own. */
+    /* Staged downward from the window's top; the blob, laid out from its bottom, must stay below
+     * (checked once the plan is known). A slot never reaches below the window's first 4 GiB. */
+    ef.stage = place.managed_end;
     for (int i = 0; i < ESP_NIMG; i++)
-        if (m->file[i].present && esp_load_file(uuid, dir, &m->file[i], i))
+        if (m->file[i].present &&
+            esp_load_file(uuid, dir, &m->file[i], i, place.managed_base + (4UL << 30)))
             goto fail;
 
     /* The live values run_guest_sptm.py reads, in its native layout. */
@@ -344,8 +354,10 @@ AURA_XTEXT int sptm_virt_esp_boot(const char *spec)
     printf("macOS ESP: blob [0x%lx, 0x%lx) in [0x%lx, 0x%lx), SPTM entry 0x%lx\n", pl->txm_pa,
            pl->blob_end, in->phys_base, in->phys_base + in->mem_size, pl->sptm_entry_pa);
 
-    /* Nothing aura or iBoot's tree lives on may be written over. */
+    /* Nothing aura or iBoot's tree lives on may be written over, nor the staged files. */
     u64 lo = pl->txm_pa, hi = pl->blob_end;
+    if (hi > ef.stage)
+        ESP_FAIL("the blob reaches the staged files at 0x%lx\n", ef.stage);
     if (((u64)adt < hi && (u64)adt + in->adt_len > lo) || ((u64)_base < hi && (u64)_end > lo))
         ESP_FAIL("the blob overlaps aura or the device tree\n");
     /* iBoot's data regions first, as the runner does: refuse any source a load would overwrite. */
