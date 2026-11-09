@@ -228,6 +228,13 @@ class Symbols:
         return self.run_base + (self.syms[name] - self.link_base)
 
 
+def ans_drop_props():
+    """AURA_ANS_DROP=quiesced,running: ANS was powered off and back with its CPU stopped, so XNU
+    starts it as after a sleep instead of waking iBoot's quiesced session."""
+    names = [n for n in os.environ.get("AURA_ANS_DROP", "").split(",") if n]
+    return tuple(("/arm-io/ans/iop-ans-nub", n) for n in names)
+
+
 def iboot_copies(adt):
     mm = adt["/chosen/memory-map"]._properties
     copies = []
@@ -657,7 +664,7 @@ def main():
         mem_size_actual=ba.mem_size_actual, cmdline=args.bootargs, blob_base=phys_base,
         trustcache=args.trustcache.read_bytes() if args.trustcache else b"",
         iboot_copies=copies, hide_nodes=hide, diag_record=env_on("AURA_SPTM_DIAG"),
-        drop_props=() if keep_exclaves else ROUTES_PROPS,
+        drop_props=(() if keep_exclaves else ROUTES_PROPS) + ans_drop_props(),
         xnu_serial=f"/arm-io/{serial}" if serial else None,
         os_long_version=args.os_long_version,
         video=tuple(int(getattr(ba.video, f)) for f in
