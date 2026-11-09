@@ -240,45 +240,43 @@ int kboot_audio_amp_config(void *dt, const void *adt)
  * Speaker assembly ID.
  *
  * Some Macs are built with speakers from more than one vendor, and macOS picks the tuning for
- * the fitted assembly by its ID (the IORegistry speakerID of the built-in speaker). The board
- * encodes the ID in strap pins, which the ADT names on the speaker amp group's node:
+ * the fitted assembly by its ID (the IORegistry speakerID of the built-in speaker, the audio
+ * HAL's spid). The board encodes the ID in two strap pins, which the ADT names on the speaker
+ * amp group's node:
  *
- *   find-speaker-id       nonzero: the Mac has a speaker ID
- *   function-speaker-idN  strap N: <controller phandle> 'GPIO' <pin> <flags>
+ *   find-speaker-id       1: the Mac has a speaker ID (any other value: it does not)
+ *   function-speaker-id0  bit 0 of the ID: <controller phandle> 'GPIO' <pin> <control word>
+ *   function-speaker-id1  bit 1 of the ID
  *   valid-speaker-ids     the IDs this model is built with (u32 list)
  *
- * Bit N of the ID is the level of strap N, least significant first (the order of the kernel's
- * speaker-id-gpios); flags bit 0 inverts a strap. The pins are read once, as inputs; a pin
- * that iBoot left without its input stage is switched to a plain input for the read and put
- * back as it was. The ID goes to the kernel as /chosen/asahi,speaker-id (one u32), and only
- * when every strap could be read and the result is one of valid-speaker-ids: a Mac without
- * straps, or one whose straps say something unexpected, gets no property, never a guess.
+ * This reads them the way macOS does. Each strap that resolves to a pin of an /arm-io GPIO
+ * controller is switched to a plain GPIO input (pull left as it is) and sampled once, with no
+ * delay and no restore; a strap that does not resolve reads as 0. The control word's second
+ * byte gives the polarity: nonzero reads a high pin as 1, zero inverts it. The ID goes to the
+ * kernel as /chosen/asahi,speaker-id (one u32): the sampled value when valid-speaker-ids lists
+ * it, else 65535, which is what macOS publishes then. A Mac without find-speaker-id = 1, or
+ * with neither strap resolving, gets no property.
  */
 
-#define SPEAKER_ID_DT_PROP    "asahi,speaker-id"
-#define MAX_SPEAKER_ID_STRAPS 8
-#define MAX_VALID_SPEAKER_IDS 32
-
-#define GPIO_FOURCC 0x4750494f /* 'GPIO' */
-/* function-speaker-idN flags: bit 0 is the strap's polarity, bit 8 marks an input */
-#define STRAP_FLAG_ACTIVE_LOW BIT(0)
-#define STRAP_FLAG_INPUT      BIT(8)
-#define STRAP_FLAGS_KNOWN     (STRAP_FLAG_ACTIVE_LOW | STRAP_FLAG_INPUT)
+#define SPEAKER_ID_DT_PROP "asahi,speaker-id"
+#define SPEAKER_ID_STRAPS  2
+#define SPEAKER_ID_INVALID 0xffff
+#define MAX_VALID_SPEAKERS 32
+#define GPIO_FOURCC        0x4750494f /* 'GPIO' */
+#define GPIO_CTRL_POLARITY GENMASK(15, 8)
 
 /* Apple GPIO pin register (one u32 per pin) */
 #define GPIO_PIN_DATA     BIT(0)
 #define GPIO_PIN_MODE     GENMASK(3, 1)
-#define GPIO_PIN_MODE_OUT 1
 #define GPIO_PIN_MODE_IN  7 /* input, interrupt off */
 #define GPIO_PIN_PERIPH   GENMASK(6, 5)
 #define GPIO_PIN_INPUT_EN BIT(9)
-#define STRAP_SETTLE_US   100
 
 struct adt_function_gpio {
     u32 phandle;
     u32 fourcc;
     u32 pin;
-    u32 flags;
+    u32 control;
 } PACKED;
 
 /* The base of the /arm-io GPIO controller whose AAPL,phandle is @phandle, and its pin count */
@@ -314,22 +312,18 @@ static int adt_gpio_by_phandle(const void *adt, u32 phandle, u64 *base, u32 *npi
     return -1;
 }
 
-/* Read strap @idx of @node into *@level. */
+/* Sample strap @idx of @node into *@level. Returns -1 when the strap does not resolve. */
 static int read_speaker_id_strap(const void *adt, int node, int idx, u32 *level)
 {
     const char *name = adt_get_name(adt, node);
     struct adt_function_gpio fn;
     char prop[32];
     u64 base, reg;
-    u32 npins, cfg, val;
+    u32 npins, cfg, in, val;
 
     snprintf(prop, sizeof(prop), "function-speaker-id%d", idx);
     if (ADT_GETPROP(adt, node, prop, &fn) != sizeof(fn) || fn.fourcc != GPIO_FOURCC) {
-        printf("kboot: audio: %s: %s is not a GPIO\n", name, prop);
-        return -1;
-    }
-    if (fn.flags & ~STRAP_FLAGS_KNOWN || !(fn.flags & STRAP_FLAG_INPUT)) {
-        printf("kboot: audio: %s: %s has unknown flags 0x%x\n", name, prop, fn.flags);
+        printf("kboot: audio: %s: no GPIO %s\n", name, prop);
         return -1;
     }
     if (adt_gpio_by_phandle(adt, fn.phandle, &base, &npins) || fn.pin >= npins) {
@@ -338,24 +332,16 @@ static int read_speaker_id_strap(const void *adt, int node, int idx, u32 *level)
         return -1;
     }
 
+    /* A plain GPIO input with its pull as it is, sampled once */
     reg = base + 4 * fn.pin;
     cfg = read32(reg);
-    if (FIELD_GET(GPIO_PIN_PERIPH, cfg) || FIELD_GET(GPIO_PIN_MODE, cfg) == GPIO_PIN_MODE_OUT) {
-        printf("kboot: audio: %s: %s: pin %u is not an input (0x%08x)\n", name, prop, fn.pin, cfg);
-        return -1;
-    }
-    if (!(cfg & GPIO_PIN_INPUT_EN) || !FIELD_GET(GPIO_PIN_MODE, cfg)) {
-        u32 in = (cfg & ~GPIO_PIN_MODE) | FIELD_PREP(GPIO_PIN_MODE, GPIO_PIN_MODE_IN) |
-                 GPIO_PIN_INPUT_EN;
+    in = (cfg & ~(GPIO_PIN_MODE | GPIO_PIN_PERIPH)) | FIELD_PREP(GPIO_PIN_MODE, GPIO_PIN_MODE_IN) |
+         GPIO_PIN_INPUT_EN;
+    if (in != cfg)
         write32(reg, in);
-        udelay(STRAP_SETTLE_US);
-        val = read32(reg);
-        write32(reg, cfg);
-    } else {
-        val = cfg;
-    }
+    val = read32(reg);
 
-    *level = !!(val & GPIO_PIN_DATA) ^ !!(fn.flags & STRAP_FLAG_ACTIVE_LOW);
+    *level = !!(val & GPIO_PIN_DATA) ^ !FIELD_GET(GPIO_CTRL_POLARITY, fn.control);
     printf("kboot: audio: %s: %s = %u (pin %u: 0x%08x -> 0x%08x)\n", name, prop, *level, fn.pin,
            cfg, val);
     return 0;
@@ -364,43 +350,35 @@ static int read_speaker_id_strap(const void *adt, int node, int idx, u32 *level)
 static int setup_speaker_id(void *dt, const void *adt, int node)
 {
     const char *name = adt_get_name(adt, node);
-    u32 valid[MAX_VALID_SPEAKER_IDS];
-    u32 len, id = 0;
-    int nstraps = 0, chosen;
+    u32 valid[MAX_VALID_SPEAKERS];
+    u32 len = 0, id = 0, nvalid = 0;
+    int resolved = 0, chosen;
     bool listed = false;
 
-    for (;; nstraps++) {
-        char prop[32];
+    for (int i = 0; i < SPEAKER_ID_STRAPS; i++) {
+        u32 level;
 
-        snprintf(prop, sizeof(prop), "function-speaker-id%d", nstraps);
-        if (!adt_getprop(adt, node, prop, NULL))
-            break;
+        if (read_speaker_id_strap(adt, node, i, &level))
+            continue;
+        id |= level << i;
+        resolved++;
     }
-    if (!nstraps || nstraps > MAX_SPEAKER_ID_STRAPS) {
-        printf("kboot: audio: %s: %d speaker ID straps, no speaker ID\n", name, nstraps);
+    if (!resolved) {
+        printf("kboot: audio: %s: no speaker ID strap resolves, no speaker ID\n", name);
         return -1;
     }
 
     const void *v = adt_getprop(adt, node, "valid-speaker-ids", &len);
-    if (!v || !len || len % sizeof(u32) || len > sizeof(valid)) {
-        printf("kboot: audio: %s: no valid-speaker-ids, no speaker ID\n", name);
-        return -1;
+    if (v) {
+        nvalid = min(len / sizeof(u32), ARRAY_SIZE(valid));
+        memcpy(valid, v, nvalid * sizeof(u32));
     }
-    memcpy(valid, v, len);
-
-    for (int i = 0; i < nstraps; i++) {
-        u32 level;
-
-        if (read_speaker_id_strap(adt, node, i, &level))
-            return -1;
-        id |= level << i;
-    }
-
-    for (u32 i = 0; i < len / sizeof(u32); i++)
+    for (u32 i = 0; i < nvalid; i++)
         listed |= valid[i] == id;
     if (!listed) {
-        printf("kboot: audio: %s: speaker ID %u is not a valid one, not passed on\n", name, id);
-        return -1;
+        printf("kboot: audio: %s: speaker ID %u is not a valid one, passing %u\n", name, id,
+               SPEAKER_ID_INVALID);
+        id = SPEAKER_ID_INVALID;
     }
 
     chosen = fdt_path_offset(dt, "/chosen");
@@ -432,7 +410,8 @@ int kboot_audio_speaker_id(void *dt, const void *adt)
         {
             u32 find;
 
-            if (ADT_GETPROP(adt, dev, "find-speaker-id", &find) != sizeof(find) || !find)
+            /* The speaker amp group's first amp (audio-speaker) carries it */
+            if (ADT_GETPROP(adt, dev, "find-speaker-id", &find) != sizeof(find) || find != 1)
                 continue;
             /* One speaker ID per Mac; a refusal is logged and never stops the boot */
             setup_speaker_id(dt, adt, dev);
