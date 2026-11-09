@@ -8352,9 +8352,21 @@ static bool t6050_isp_segments_valid(const struct adt_segment_ranges *seg, u32 l
  * tail and owns all power, DART and firmware-start operations. J716c's camera
  * is sensor type 0x75, J714s's 0x74; both have the same two segments.
  */
+static int t6050_isp_add_mem_region(uint32_t phandle, const char *name)
+{
+    int node = kboot_fdt_path_exact(dt, "isp");
+    if (node < 0 || fdt_appendprop_u32(dt, node, "memory-region", phandle))
+        return -1;
+    node = kboot_fdt_path_exact(dt, "isp");
+    if (node < 0 || fdt_appendprop_string(dt, node, "memory-region-names", name))
+        return -1;
+    return 0;
+}
+
 static int dt_set_t6050_isp(void)
 {
-    int node = fdt_path_offset(dt, "isp");
+    /* Exact paths: "/soc/isp@..." must not resolve "soc" to "soc@200000000". */
+    int node = kboot_fdt_path_exact(dt, "isp");
     if (node < 0)
         return 0;
     u32 want;
@@ -8401,7 +8413,7 @@ static int dt_set_t6050_isp(void)
             dt_device_set_reserved_mem(mem, name, owner, seg[i].remap, seg[i].size))
             return -1;
         uint32_t phandle = fdt_get_phandle(dt, mem);
-        if (!phandle || dt_device_add_mem_region("isp", phandle, names[i]))
+        if (!phandle || t6050_isp_add_mem_region(phandle, names[i]))
             return -1;
     }
 
@@ -8412,18 +8424,18 @@ static int dt_set_t6050_isp(void)
         fdt_setprop_u32(dt, mem, "phandle", phandle) ||
         dt_device_set_reserved_mem(mem, "isp-main-memory", owner,
                                    0x10000000000, 0x2000000) ||
-        dt_device_add_mem_region("isp", phandle, "heap"))
+        t6050_isp_add_mem_region(phandle, "heap"))
         return -1;
 
-    node = fdt_path_offset(dt, "isp");
-    if (firmware_set_fdt(dt, node, "apple,firmware-version", &os_firmware) ||
+    node = kboot_fdt_path_exact(dt, "isp");
+    if (node < 0 || firmware_set_fdt(dt, node, "apple,firmware-version", &os_firmware) ||
         fdt_setprop_u32(dt, node, "apple,platform-id", platform) ||
         fdt_setprop_u32(dt, node, "apple,cam-connections-scheme", scheme))
         return -1;
 
     const char *aliases[] = {"isp-dart0", "isp-dart1", "isp-dart2", "isp"};
     for (unsigned int i = 0; i < ARRAY_SIZE(aliases); i++) {
-        node = fdt_path_offset(dt, aliases[i]);
+        node = kboot_fdt_path_exact(dt, aliases[i]);
         if (node < 0 || fdt_setprop_string(dt, node, "status", "okay"))
             return -1;
     }
