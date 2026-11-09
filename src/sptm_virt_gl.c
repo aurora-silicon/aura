@@ -923,11 +923,39 @@ done:
  * controller stops taking aura's writes (SPTM locking iBoot's AMCC ranges over stage 1's image,
  * see amcc_hook), the two disagree at the next trap once a line has been evicted.
  */
+u32 sptm_virt_trap_delay_ns;
 static u64 canary_a __attribute__((aligned(128)));
 static u64 canary_b __attribute__((aligned(128)));
 
+/*
+ * aura's EL2 timers deliver their FIQ to the guest's EL1 while HCR_EL2.FMO is clear (an EL2 tick
+ * armed in the host world took the guest down within seconds, CNTHV and CNTHP alike), where nothing
+ * can clear it. The cL4 world switch arms the EL2 physical timer as the host's deadline proxy and
+ * disarms it on the way out; if one ever survives into the host world, report and disarm it.
+ */
+static void sptm_virt_el2_timer_check(void)
+{
+    static u32 reports;
+    u64 p = mrs(CNTP_CTL_EL0), v = mrs(CNTV_CTL_EL0);
+    bool p_on = (p & (CNTx_CTL_ENABLE | CNTx_CTL_IMASK)) == CNTx_CTL_ENABLE;
+    bool v_on = (v & (CNTx_CTL_ENABLE | CNTx_CTL_IMASK)) == CNTx_CTL_ENABLE;
+    if (!p_on && !v_on)
+        return;
+    if (reports++ < 16)
+        printf("SPTM-virt[timer c%d]: aura's EL2 %s timer armed in the host world (ctl 0x%lx/0x%lx); "
+               "disarmed\n",
+               smp_id(), p_on ? "physical" : "virtual", p, v);
+    if (p_on)
+        msr(CNTP_CTL_EL0, 0);
+    if (v_on)
+        msr(CNTV_CTL_EL0, CNTx_CTL_ENABLE | CNTx_CTL_IMASK);
+    sysop("isb");
+}
+
 void sptm_virt_canary_tick(void)
 {
+    if (!sptm_virt_in_cl4() && sptm_virt_xnu_live)
+        sptm_virt_el2_timer_check();
     static u32 losses;
     u64 a = canary_a, b = canary_b, now = mrs(CNTPCT_EL0);
 
@@ -938,11 +966,51 @@ void sptm_virt_canary_tick(void)
     canary_a = now;
     canary_b = now;
     __asm__ volatile("dc cvac, %0" ::"r"(&canary_b) : "memory");
+    /*
+     * AURA_TRAP_DELAY_NS: a workaround knob, not a fix. The guest stops (no trap, no WFI, no
+     * panic) ~20-25 s into XNU when aura's GL traps are fast; slowing each one moves that out --
+     * 2.5 us to ~95 s (t102), 10 us to ~6 min (t105) -- so something races with aura's speed.
+     */
+    if (sptm_virt_trap_delay_ns) {
+        u64 end = now + mrs(CNTFRQ_EL0) / 1000000 * sptm_virt_trap_delay_ns / 1000;
+        while (mrs(CNTPCT_EL0) < end)
+            ;
+    }
+}
+
+/*
+ * Is a quiet guest idle or dead? An idle XNU barely calls into SPTM, so aura hears nothing either
+ * way. With sptm_virt_wfi_watch (AURA_WFI_WATCH) XNU's WFIs trap (TWI), run here as they would
+ * natively, and every 10 s one line says how many there were: a guest that idles keeps counting.
+ */
+u32 sptm_virt_wfi_watch;
+
+static bool sptm_virt_wfi_watched(u64 esr)
+{
+    static u64 n, n_last, t_last;
+    if (!sptm_virt_wfi_watch || (esr & 1))
+        return false;
+    u64 now = mrs(CNTPCT_EL0), f = mrs(CNTFRQ_EL0);
+    n++;
+    if (!t_last)
+        t_last = now;
+    if (now - t_last >= 10 * f) {
+        printf("SPTM-virt[idle c%d]: %lu WFIs in the last %lu s (%lu in all), pc 0x%lx\n", smp_id(),
+               n - n_last, (now - t_last) / f, n, mrs(ELR_EL2));
+        n_last = n;
+        t_last = now;
+    }
+    sysop("dsb sy");
+    sysop("wfi");
+    msr(ELR_EL2, mrs(ELR_EL2) + 4);
+    return true;
 }
 
 bool sptm_virt_el1_wfx(u64 *regs, u64 esr)
 {
     if (sptm_virt_s2r_wfi(regs, esr))
+        return true;
+    if (sptm_virt_wfi_watched(esr))
         return true;
 
     u64 pc = mrs(ELR_EL2);

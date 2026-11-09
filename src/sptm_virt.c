@@ -21,6 +21,7 @@
 #include "sptm_virt_priv.h"
 #include "string.h"
 #include "uartproxy.h"
+#include "usb.h"
 #include "utils.h"
 #include "xnuboot.h"
 
@@ -479,6 +480,8 @@ void sptm_virt_cpu_enters_xnu(int cpu)
     nv2_hcr_update(0, HCR_TWE);
     sptm_virt_ctrr_publish_rorgn();
     sptm_virt_s2_enter_xnu(cpu);
+    if (sptm_virt_wfi_watch)
+        nv2_hcr_update(HCR_TWI, 0);
 }
 
 __attribute__((used, retain)) void sptm_virt_enter(void)
@@ -494,6 +497,15 @@ __attribute__((used, retain)) void sptm_virt_enter(void)
     /* iBoot's entry contract: EL1&0 MMU and caches off, x0 = boot_args. */
     msr(SYS_SCTLR_EL12, mrs(SYS_SCTLR_EL12) & ~(SCTLR_M | SCTLR_C | SCTLR_I));
     sysop("isb");
+
+    /*
+     * aura's own USB gadgets (DWC3 + DART, set up at boot as proxy transports) would keep running
+     * under the guest with their interrupts and DMA into aura's heap. With the proxy on the
+     * DockChannel nothing uses them, and the guest, which has their nodes hidden, does not know
+     * them: shut them down.
+     */
+    if (uartproxy_iodev == IODEV_DOCKCHANNEL_UART)
+        usb_iodev_shutdown();
 
     /* The proxy flow never passes through kboot's nv2_prepare. */
     nv2_prepare();
