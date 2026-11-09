@@ -8320,7 +8320,8 @@ static int dt_set_isp_fwdata(void)
     return 0;
 }
 
-static bool t6050_isp_segments_valid(const struct adt_segment_ranges *seg, u32 len,
+/* Camera handoff checks run once per boot: keep them out of .text. */
+__attribute__((section(".init.t6050_isp"))) static bool t6050_isp_segments_valid(const struct adt_segment_ranges *seg, u32 len,
                                      u64 ram, u64 ram_size)
 {
     if (!seg || !len || len % sizeof(*seg) || len / sizeof(*seg) > 8 ||
@@ -8352,7 +8353,7 @@ static bool t6050_isp_segments_valid(const struct adt_segment_ranges *seg, u32 l
  * tail and owns all power, DART and firmware-start operations. J716c's camera
  * is sensor type 0x75, J714s's 0x74; both have the same two segments.
  */
-static int t6050_isp_add_mem_region(uint32_t phandle, const char *name)
+__attribute__((section(".init.t6050_isp"))) static int t6050_isp_add_mem_region(uint32_t phandle, const char *name)
 {
     int node = kboot_fdt_path_exact(dt, "isp");
     if (node < 0 || fdt_appendprop_u32(dt, node, "memory-region", phandle))
