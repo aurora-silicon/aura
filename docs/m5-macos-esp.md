@@ -12,11 +12,11 @@ when building the combined ESP path; do not replay duplicate shared helpers.
 ## Build
 
 ```sh
-make USE_CLANG=1 BUILDSTD=1 CHAINLOADING=1 ESP_STAGE2=1 DEBUGUSB_PROXY=1 SPTM_VIRT=1 SPTM_VIRT_ESP=1
+CARGO_PROFILE_RELEASE_OPT_LEVEL=z make USE_CLANG=1 BUILDSTD=1 CHAINLOADING=1 ESP_STAGE2=1 DEBUGUSB_PROXY=1 SPTM_VIRT=1 SPTM_VIRT_ESP=1 EXTRA_CFLAGS=-Oz
 ```
 
 For a plain boot using an existing trace manifest, set these build overrides:
-`EXTRA_CFLAGS="-DSPTM_VIRT_ESP_TRACE=0 -DSPTM_VIRT_ESP_WAKE_S=0 -DSPTM_VIRT_ESP_GO_COUNT=0"`.
+`EXTRA_CFLAGS="-Oz -DSPTM_VIRT_ESP_TRACE=0 -DSPTM_VIRT_ESP_WAKE_S=0 -DSPTM_VIRT_ESP_GO_COUNT=0"`.
 This suppresses instrumentation and aura's timed-wake/stop settings. It does not
 establish that full macOS sleep or wake works.
 
