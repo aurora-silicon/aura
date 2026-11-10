@@ -32,16 +32,36 @@ jobs:
         run: |
           rustup target install aarch64-unknown-none-softfloat
 
-      - name: Build
-        run: make -j2 ARCH=aarch64-linux-gnu- CHAINLOADING=1 EXTRA_CFLAGS='-Wstack-usage=2048 -Os'
+      # Each stage is uploaded under its own name. tools/compose_stage2.py accepts only the
+      # ESP_STAGE2=1 image; the Stage 1 aura.bin must not be composed into an ESP Stage 2.
+      - name: Build Stage 1
+        run: |
+          make -j2 ARCH=aarch64-linux-gnu- CHAINLOADING=1 EXTRA_CFLAGS='-Wstack-usage=2048 -Os'
+          mkdir -p out/stage1
+          cp build/aura.macho build/aura.bin out/stage1/
+
+      - name: Build the ESP Stage 2
+        run: |
+          make clean
+          make -j2 ARCH=aarch64-linux-gnu- CHAINLOADING=1 ESP_STAGE2=1 EXTRA_CFLAGS='-Wstack-usage=2048 -Os'
+          mkdir -p out/esp-stage2
+          cp build/aura.macho build/aura.bin out/esp-stage2/
 
       - uses: actions/upload-artifact@v7
         with:
-          name: aura
+          name: aura-stage1-chainloading
           if-no-files-found: error
           path: |
-            build/aura.macho
-            build/aura.bin
+            out/stage1/aura.macho
+            out/stage1/aura.bin
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: aura-esp-stage2
+          if-no-files-found: error
+          path: |
+            out/esp-stage2/aura.macho
+            out/esp-stage2/aura.bin
 
   stage1-clang:
     # Stage 1 has to end below the panel DCP's log buffer (aura-raw.ld). Releases build with
