@@ -1382,6 +1382,13 @@ static bool nv2_sysreg_do(struct nv2_cpu *c, u64 *regs, u64 esr)
         case KEY(3, 1, 15, 7, 4):
         case KEY(3, 5, 15, 1, 6):
         case KEY(3, 4, 15, 12, 6):
+            /* These reads and the additional registers have only been qualified on T6050.
+             * Other chips retain the existing C7_4 write-forwarding policy. */
+            if (chip_id != T6050 && (read || op1 != 1)) {
+                nv2_note_unknown(c, key, read);
+                value = 0;
+                break;
+            }
             /* Apple implementation-defined registers (unnamed) that XNU reads and writes from
              * virtual EL2: performed on the hardware, both ways, so a read-modify-write keeps
              * the bits the hardware holds. */
