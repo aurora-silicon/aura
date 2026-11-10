@@ -9602,16 +9602,16 @@ int kboot_boot(void *kernel)
     else
         usb_init();
     int described = chip_id == T8132 ? pcie_prepare_fdt(dt) : 0;
-    bool j713 = chip_id == T8132 && !fdt_node_check_compatible(dt, 0, "apple,j713");
+    bool radio = chip_id == T8132 && pcie_radio_board_fdt(dt);
     if (described < 0) {
-        if (!j713 || dt_disable_j713_pcie())
+        if (!radio || dt_disable_j713_pcie())
             return -1;
         /* Do not train an optional port whose rail could not be prepared. */
         ret = 0;
     } else {
         ret = pcie_init();
         if (chip_id == T8132 && ((ret && described) || pcie_handoff_fdt(dt) < 0)) {
-            if (!j713 || dt_disable_j713_pcie())
+            if (!radio || dt_disable_j713_pcie())
                 return -1;
         }
     }
