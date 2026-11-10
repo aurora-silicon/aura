@@ -55,6 +55,7 @@ static void tunables_apply_static(void) {}
 static void clk_init(void) { if (mode == 2) spin_table[1].target = 0x1234; }
 static void usb_init(void) {}
 static int pcie_init(void) { return 0; }
+static bool pcie_radio_board_fdt(void *p) { return false; }
 static int pcie_prepare_fdt(void *p) { return 0; }
 static int pcie_handoff_fdt(void *p) { return 0; }
 /* No modelled chip takes the T6050 PCIe handoff. */

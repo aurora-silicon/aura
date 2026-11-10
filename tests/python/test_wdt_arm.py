@@ -11,6 +11,7 @@ def test_wdt_arm_seconds(tmp_path):
 #include <assert.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 typedef uint32_t u32;
 typedef uint64_t u64;
@@ -20,6 +21,7 @@ typedef uint64_t u64;
 #define WDT_ALARM 0x14
 #define WDT_CTL 0x1c
 #define WDT_TRIAL_SECONDS 178
+#define WDT_BOOT_SECONDS 178
 #define ADT_GETPROP(a,n,k,v) (*(v)=adt_version,0)
 #define sysop(x) ((void)0)
 static u32 chip_id = T6040, adt_version = 2, regs[8], secondary_value;

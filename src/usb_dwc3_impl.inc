@@ -31,11 +31,8 @@
 #define MAX_ENDPOINTS     16
 #define CDC_BUFFER_SIZE   SZ_1M
 #define CDC_IO_TIMEOUT_MS 3000
-#if USB_DWC3_SUPERSPEED
+/* A closed or reset pipe ends every blocking CDC loop, in both engines. */
 #define CDC_LOOP_READY(dev, pipe) ((dev)->pipe[(pipe)].ready)
-#else
-#define CDC_LOOP_READY(dev, pipe) true
-#endif
 
 #define usb_debug_printf(fmt, ...) debug_printf("usb-dwc3@%lx: " fmt, dev->regs, ##__VA_ARGS__)
 
@@ -463,7 +460,6 @@ static int usb_dwc3_ep_command(dwc3_dev_t *dev, u8 ep, u32 command, u32 par0, u3
     return DWC3_DEPCMD_STATUS(read32(dev->regs + DWC3_DEPCMD(ep)));
 }
 
-#if USB_DWC3_SUPERSPEED
 static int usb_dwc3_end_transfer(dwc3_dev_t *dev, u8 ep)
 {
     /* An IOC wait recursively dispatches EP0 events while a SETUP request
@@ -483,7 +479,6 @@ static int usb_dwc3_end_transfer(dwc3_dev_t *dev, u8 ep)
         set32(dev->regs + DWC3_GUSB2PHYCFG(0), DWC3_GUSB2PHYCFG_SUSPHY);
     return 0;
 }
-#endif
 
 static int usb_dwc3_ep_configure(dwc3_dev_t *dev, u8 ep, u8 type, u32 max_packet_len)
 {
@@ -962,9 +957,7 @@ static void usb_dwc3_ep0_handle_standard_endpoint(dwc3_dev_t *dev,
                         break;
                     }
                     usb_dwc3_ep_set_stall(dev, ep_to_num(setup->feature.wEndpoint), 0);
-                    dev->ep0_state = usb_dwc3_start_status_phase(dev, USB_LEP_CTRL_IN)
-                                         ? USB_DWC3_EP0_STATE_IDLE
-                                         : USB_DWC3_EP0_STATE_DATA_SEND_STATUS_DONE;
+                    dev->ep0_state = USB_DWC3_EP0_STATE_DATA_SEND_STATUS;
                     break;
                 default:
                     usb_dwc3_ep_set_stall(dev, 0, 1);
@@ -1035,19 +1028,15 @@ static void usb_dwc3_ep0_handle_class(dwc3_dev_t *dev, const union usb_setup_pac
             } else {
                 usb_debug_printf("ACM device closed\n");
             }
-            if (chip_id == T8142 || chip_id == T8152 || chip_id == T6050) {
-                /* Wait for XferNotReady before the no-data status TRB on M5/M6,
-                 * for both DTR-open and DTR-close requests. */
-                dev->ep0_state = USB_DWC3_EP0_STATE_DATA_SEND_STATUS;
-            } else if (usb_dwc3_start_status_phase(dev, USB_LEP_CTRL_IN)) {
-                dev->pipe[pipe].ready = false;
-#if USB_DWC3_SUPERSPEED
-                dev->primary_dtr_pending = false;
-#endif
-                dev->ep0_state = USB_DWC3_EP0_STATE_IDLE;
-            } else {
-                dev->ep0_state = USB_DWC3_EP0_STATE_DATA_SEND_STATUS_DONE;
-            }
+            /*
+             * The status TRB of a request without a data stage may only be started once the
+             * controller reports XferNotReady for the status stage, like SET_ADDRESS and
+             * SET_CONFIGURATION above. Starting it from the SETUP completion races the host's
+             * status token. When the TRB wins on T8132, the host still sees the request
+             * complete, but the controller reports XferNotReady instead of XferComplete, keeps
+             * the TRB and raises no further event on any endpoint.
+             */
+            dev->ep0_state = USB_DWC3_EP0_STATE_DATA_SEND_STATUS;
             break;
 
         case USB_REQUEST_CDC_SET_LINE_CODING:
@@ -1526,16 +1515,51 @@ static void usb_dwc3_handle_event_usbrst(dwc3_dev_t *dev, bool rearm_setup)
     }
     dev->reset_in_progress = false;
 #else
-    (void)rearm_setup;
-    dev->endpoints[0].xfer_in_progress = false;
-    for (int i = 1; i < MAX_ENDPOINTS; i++) {
-        dev->endpoints[i].xfer_in_progress = false;
-        memset(dev->endpoints[i].xfer_buffer, 0, XFER_BUFFER_BYTES_PER_EP);
-        memset(dev->endpoints[i].trb, 0, TRBS_PER_EP * sizeof(struct dwc3_trb));
-        usb_dwc3_ep_set_stall(dev, i, 0);
-    }
+    /* The databook requires ENDTRANSFER for every active transfer on a bus
+     * reset. Clearing only the software flags left the controller owning the
+     * old EP0 TRB: the new SETUP could not be armed and its completion was
+     * then dropped, so EP0 never answered SET_ADDRESS again. This
+     * ENDTRANSFER does not poll events, so no nested request can run here. */
     mask32(dev->regs + DWC3_DCFG, DWC3_DCFG_DEVADDR_MASK, DWC3_DCFG_DEVADDR(0));
     write32(dev->regs + DWC3_DALEPENA, DWC3_DALEPENA_EP(0) | DWC3_DALEPENA_EP(1));
+    for (int i = 0; i < CDC_ACM_PIPE_MAX; i++) {
+        dev->pipe[i].ready = false;
+        dev->pipe[i].host2device->read = dev->pipe[i].host2device->write;
+        dev->pipe[i].device2host->read = dev->pipe[i].device2host->write;
+    }
+
+    for (int i = 2; i < MAX_ENDPOINTS; i++) {
+        if (dev->endpoints[i].xfer_in_progress)
+            usb_dwc3_end_transfer(dev, i);
+        dev->endpoints[i].xfer_in_progress = false;
+        dev->endpoints[i].resource_index = 0;
+        dev->endpoints[i].zlp_pending = false;
+        dev->endpoints[i].trb_count = 0;
+        dev->endpoints[i].completed_trbs = 0;
+        dev->endpoints[i].transfer_length = 0;
+        memset(dev->endpoints[i].xfer_buffer, 0, XFER_BUFFER_BYTES_PER_EP);
+        memset(dev->endpoints[i].trb, 0, TRBS_PER_EP * sizeof(struct dwc3_trb));
+        /* CLEARSTALL also restarts the data sequence at DATA0. */
+        usb_dwc3_ep_set_stall(dev, i, 0);
+    }
+
+    /* An armed SETUP TRB is already the post-reset EP0 state, as in Linux's
+     * dwc3. Any other control transfer belongs to the old session. */
+    bool setup_armed = dev->ep0_state == USB_DWC3_EP0_STATE_SETUP_HANDLE &&
+                       dev->endpoints[USB_LEP_CTRL_OUT].xfer_in_progress &&
+                       !dev->endpoints[USB_LEP_CTRL_IN].xfer_in_progress;
+    if (!setup_armed) {
+        for (int i = USB_LEP_CTRL_OUT; i <= USB_LEP_CTRL_IN; i++) {
+            if (dev->endpoints[i].xfer_in_progress)
+                usb_dwc3_end_transfer(dev, i);
+            dev->endpoints[i].xfer_in_progress = false;
+            dev->endpoints[i].resource_index = 0;
+        }
+        dev->ep0_state = USB_DWC3_EP0_STATE_IDLE;
+        if (rearm_setup && !usb_dwc3_start_setup_phase(dev))
+            dev->ep0_state = USB_DWC3_EP0_STATE_SETUP_HANDLE;
+    }
+    usb_dwc3_ep_set_stall(dev, USB_LEP_CTRL_IN, 0);
 #endif
 }
 
@@ -1574,13 +1598,13 @@ static void usb_dwc3_handle_event_dev(dwc3_dev_t *dev, const struct dwc3_event_d
         case DWC3_DEVT_USBRST:
             usb_dwc3_handle_event_usbrst(dev, true);
             break;
-#if USB_DWC3_SUPERSPEED
         case DWC3_DEVT_DISCONN:
             usb_dwc3_handle_event_usbrst(dev, true);
+#if USB_DWC3_SUPERSPEED
             if (dev->primary_was_open)
                 usb_cdc_recovery_arm(&dev->recovery, ticks_to_msecs(get_ticks()));
-            break;
 #endif
+            break;
         case DWC3_DEVT_CONNECTDONE:
             usb_dwc3_handle_event_connect_done(dev);
             break;
@@ -2151,6 +2175,11 @@ ssize_t usb_dwc3_can_read(dwc3_dev_t *dev, cdc_acm_pipe_id_t pipe)
     if (!host2device)
         return 0;
 
+#if !USB_DWC3_SUPERSPEED
+    /* High-speed OUT is otherwise re-armed only by XferNotReady or a read in
+     * progress; an idle proxy loop must not depend on that one event. */
+    usb_dwc3_cdc_start_bulk_out_xfer(dev, dev->pipe[pipe].ep_out);
+#endif
     return ringbuffer_get_used(host2device);
 }
 
@@ -2175,7 +2204,8 @@ void usb_dwc3_flush(dwc3_dev_t *dev, cdc_acm_pipe_id_t pipe)
     u8 ep = dev->pipe[pipe].ep_in;
     /* After the host restores KIS, USB2 may retain an open pipe with TX
      * pending. Console flushing must not block a guarded RAM handoff. */
-    bool bounded = USB_DWC3_SUPERSPEED || chip_id == T8142 || chip_id == T8152 || chip_id == T6050;
+    bool bounded = USB_DWC3_SUPERSPEED || chip_id == T8122 || chip_id == T8142 ||
+                   chip_id == T8152 || chip_id == T6050;
     u64 start = get_ticks();
 
     while (CDC_LOOP_READY(dev, pipe) &&
@@ -2183,5 +2213,8 @@ void usb_dwc3_flush(dwc3_dev_t *dev, cdc_acm_pipe_id_t pipe)
         if (bounded && ticks_to_msecs(get_ticks() - start) >= 3000)
             return;
         usb_dwc3_handle_events(dev);
+#if !USB_DWC3_SUPERSPEED
+        usb_dwc3_cdc_start_bulk_in_xfer(dev, ep);
+#endif
     }
 }

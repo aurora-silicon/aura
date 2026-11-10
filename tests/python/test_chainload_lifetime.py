@@ -35,7 +35,11 @@ static bool chainload_start_trial(char **vars, size_t *var_cnt, size_t var_capac
     in_trial = true;
     return true;
 }
-static bool nvme_init(void) { inits++; return true; }
+/* An NVMe command that timed out fails the queue: every later command of the session fails. */
+static bool io_failed, fail_first_io;
+static int failed_loads; /* a failed load hands back no image to free */
+static bool nvme_io_failed(void) { return io_failed; }
+static bool nvme_init(void) { inits++; io_failed = false; return true; }
 static char sart_var[] = "nvme.sart=0";
 static char *nvme_sart_var(void) { return sart_var; }
 static bool nvme_shutdown(void) { return shutdown_ok; }
@@ -43,6 +47,18 @@ static int rust_load_image(const char *spec, void **data, size_t *size, bool *pr
                            char *trial, size_t trial_capacity)
 {
     loads++;
+    if (fail_first_io && loads == 1) {
+        /* the marker was taken (or not) when its write timed out; nothing more can be read */
+        if (trial && !trial[0])
+            marker = false;
+        io_failed = true;
+        failed_loads++;
+        return -1;
+    }
+    if (io_failed) {
+        failed_loads++;
+        return -1;
+    }
     /* The ESP is read for the request only on the first load. */
     assert(loads == 1 || !proxy_request);
     if (proxy_request)
@@ -61,7 +77,7 @@ static int rust_load_image(const char *spec, void **data, size_t *size, bool *pr
 }
 static int chainload_image(void *data, size_t size, char **vars, size_t count)
 {
-    assert(data == image && size == sizeof(image) && freed == loads - 1);
+    assert(data == image && size == sizeof(image) && freed == loads - 1 - failed_loads);
     assert(count == 1 && vars[0] == sart_var);
     copied++;
     int error = copy_error;
@@ -72,7 +88,7 @@ static int chainload_image(void *data, size_t size, char **vars, size_t count)
 }
 static void rust_free_image(void *data, size_t size)
 {
-    assert(data == image && size == sizeof(image) && freed < loads);
+    assert(data == image && size == sizeof(image) && freed < loads - failed_loads);
     freed++;
 }
 /* The Stage 1 log handoff is out of scope here: it only adds a variable. */
@@ -186,6 +202,29 @@ int main(void)
     count = 0;
     assert(chainload_load("test", vars, &count, 1) == 0);
     assert(!trials_started && !in_trial && loads == 2 && copied == 1 && freed == 2);
+    trial_room = true;
+    /*
+     * Spending the marker timed out (11-08/11-09 M2): NVMe restarts once and the configured image
+     * boots in the same boot, with no trial taken and no second try at the marker.
+     */
+    marker = true;
+    fail_first_io = true;
+    shutdown_ok = true;
+    freed = copied = loads = trials_started = trial_loads = inits = failed_loads = 0;
+    next_stage.entry = NULL;
+    count = 0;
+    assert(chainload_load("test", vars, &count, 1) == 0);
+    assert(inits == 2 && loads == 2 && !trials_started && !trial_loads && !in_trial);
+    assert(copied == 1 && freed == 1 && next_stage.entry == (void *)1);
+    /* NVMe cannot be stopped (post-M4 queue with DMA): no retry, the boot fails as before */
+    marker = true;
+    shutdown_ok = false;
+    freed = copied = loads = trials_started = inits = failed_loads = 0;
+    next_stage.entry = NULL;
+    count = 0;
+    assert(chainload_load("test", vars, &count, 1) == -1);
+    assert(inits == 1 && loads == 1 && !copied && !next_stage.entry);
+    fail_first_io = io_failed = false;
     return 0;
 }
 '''

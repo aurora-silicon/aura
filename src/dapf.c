@@ -2,6 +2,7 @@
 
 #include "dapf.h"
 #include "adt.h"
+#include "asc.h"
 #include "assert.h"
 #include "malloc.h"
 #include "memory.h"
@@ -571,6 +572,30 @@ static int dapf_init_j713(void *dt)
             }
 
             int powered = pmgr_adt_is_powered(entry->consumer);
+            /* A consumer iBoot left off (the J604's MTP) that Linux cold-starts: the board's
+             * tree asks for its filter, programmed as for the halted J713 AOP. */
+            if (powered <= 0 &&
+                fdt_stringlist_search(dt, chosen, "linux-enablement-mac,dapf-halted-handoff",
+                                      entry->consumer) >= 0) {
+                /* Only a consumer whose CPU is seen stopped, as kboot checks the AOP's. */
+                asc_dev_t *asc = asc_init(entry->consumer);
+                bool running = !asc || asc_cpu_running(asc);
+
+                if (asc)
+                    asc_free(asc);
+                if (running) {
+                    printf("dapf: Skipping %s; %s is not seen halted\n", entry->path,
+                           entry->consumer);
+                    entry++;
+                    continue;
+                }
+                printf("dapf: Programming %s for the halted %s\n", entry->path, entry->consumer);
+                if (dapf_init_t8132_halted(entry->path, entry->index) < 0)
+                    ret = -1;
+                entry++;
+                count++;
+                continue;
+            }
             if (powered <= 0) {
                 printf("dapf: Skipping %s; consumer %s is inactive or its state is unknown\n",
                        entry->path, entry->consumer);
@@ -593,7 +618,13 @@ int dapf_init_fdt(const void *fdt)
     j614s_aop_ready = false;
     j614s_isp_ready = false;
     if (chip_id == T8132) {
-        if (!fdt || fdt_node_check_compatible(fdt, 0, "apple,j713"))
+        /* M4 laptops whose trees state the same DAPF handoff contract as the J713. */
+        static const char *const boards[] = {"apple,j713", "apple,j604", NULL};
+        bool known = false;
+
+        for (const char *const *board = boards; fdt && *board; board++)
+            known |= !fdt_node_check_compatible(fdt, 0, *board);
+        if (!known)
             return 0; /* No other M4 board's power/DAPF contract is qualified. */
         return dapf_init_j713((void *)fdt);
     }
