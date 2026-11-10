@@ -4549,6 +4549,16 @@ void hv_report_t8142_gic_activity(void)
     if (chip_id != T8142)
         return;
 
+    /*
+     * The sole caller is genuine periodic housekeeping, not wake-only FIQs.
+     * Report liveness on every call: a call-count throttle would stretch these
+     * samples beyond the health gate's ten-second progress buckets at 1 Hz.
+     * Keep the real counters visible even if IRQ counts did not change; WFI
+     * progress distinguishes a repeatedly waking idle core from a stuck wait.
+     */
+    hv_report_t8142_wfi_traps();
+    hv_report_t8142_el0_vector();
+
     for (u32 cpu = 0; cpu < MAX_CPUS; cpu++) {
         if (gic_cpuif_ack_count[cpu] != last_ack[cpu] ||
             gic_cpuif_eoi_count[cpu] != last_eoi[cpu]) {
@@ -4580,27 +4590,6 @@ void hv_report_t8142_gic_activity(void)
     }
     printf("\n");
 
-    /*
-     * Periodically, the counters that used to appear only on the bugcheck path.
-     *
-     * A guest that stalls without bugchecking reports nothing there -- which is
-     * exactly what WinPE does when it is waiting on something -- so the two
-     * questions that matter during a stall had no answer: is user mode still
-     * making progress, and are the quiet cores quiet by choice?
-     *
-     * The per-CPU WFI counts settle the second one on their own.  A core parked
-     * in the EL2 wait with a *frozen* count is stuck in a single WFI that
-     * nothing is waking; a core whose count keeps climbing is waking, finding
-     * no work, and idling again, which is Windows parking it and not a bug.
-     * Cores 0-5 going silent together while 6-9 stay busy is currently
-     * consistent with both.
-     */
-    static u32 periodic;
-
-    if ((periodic++ % 32) == 0) {
-        hv_report_t8142_wfi_traps();
-        hv_report_t8142_el0_vector();
-    }
 }
 
 void hv_scan_t8142_guest_modules(void)

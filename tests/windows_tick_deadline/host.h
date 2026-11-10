@@ -3,6 +3,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdarg.h>
 #include <string.h>
 #include "tick_deadline.h"
 typedef uint64_t u64;
@@ -48,7 +49,29 @@ static u64 hv_wfi_wake_interval = 1000000, clock_now;
 static struct hv_tick_deadline hv_periodic_deadlines[MAX_CPUS];
 static u64 registers[MAX_CPUS][REGISTER_COUNT], expires[MAX_CPUS][2];
 static unsigned full_ticks, serial_flushes, io_polls, vuart_polls, user_interrupts;
-static unsigned guest_updates, ipi_retries, doorbells, wfi_calls, wfi_trap_count[MAX_CPUS];
+static unsigned guest_updates, ipi_retries, doorbells, wfi_calls;
+static u64 wfi_trap_count[MAX_CPUS];
+static u64 el0_sync_pass, el0_sync_emul, el1_sync_pass, el1_sync_emul;
+static u32 gic_cpuif_ack_count[MAX_CPUS], gic_cpuif_eoi_count[MAX_CPUS];
+#define HV_GIC_INTID_WORDS 32
+static struct { u32 active[HV_GIC_INTID_WORDS]; } gic_cpuif[MAX_CPUS];
+static bool smp_is_alive(unsigned n) { return n < MAX_CPUS; }
+static FILE *health_log;
+static int report_printf(const char *format, ...) {
+    va_list args;
+    va_start(args, format);
+    if (health_log) {
+        if (!strncmp(format, "HV:", 3))
+            fprintf(health_log, "TTY> [%12.6f] ", (double)clock_now / 1000000000.0);
+        int result = vfprintf(health_log, format, args);
+        va_end(args);
+        return result;
+    }
+    int result = vprintf(format, args);
+    va_end(args);
+    return result;
+}
+#define printf report_printf
 static unsigned frame_idle, frame_tick, scans, vector_repairs, maybe_exits, rendezvous_entries;
 static bool wfi_trap_logged, mu_ready, windows_ready, host_input, guest_tag, rendezvous;
 static u64 scan_delay;
@@ -82,7 +105,7 @@ static void hv_track_t8142_undef_vector(struct exc_info *ctx) { (void)ctx; }
 static void hv_verify_t8142_undef_vectors(void) { ++vector_repairs; }
 static void hv_scan_t8142_guest_modules(void) { ++scans; clock_now += scan_delay; }
 static void hv_report_t8142_process(struct exc_info *ctx) { (void)ctx; }
-static void hv_report_t8142_gic_activity(void) {}
+void hv_report_t8142_gic_activity(void);
 static void hv_windows_mtp_poll(void) {}
 static void hv_windows_mtp_report(void) {}
 static void hv_check_t8142_bugcheck(void) {}

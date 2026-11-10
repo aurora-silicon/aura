@@ -18,7 +18,35 @@ static void wake(struct exc_info *ctx) {
       cpu,(unsigned long long)before,(unsigned long long)clock_now,
       (unsigned long long)hv_periodic_deadlines[cpu].next,full_ticks-ticks);
 }
-int main(void) {
+static int observability(const char *path, bool quiet_irq, bool frozen_wfi, bool frozen_el1) {
+    struct exc_info ctx={0}; reset(0); hv_arm_tick(false);
+    memset(gic_cpuif,0,sizeof(gic_cpuif));
+    gic_cpuif[2].active[0] = 1u << 5;
+    for(unsigned c=0;c<MAX_CPUS;c++) {
+        gic_cpuif_ack_count[c]=gic_cpuif_eoi_count[c]=100;
+        wfi_trap_count[c]=100;
+    }
+    el0_sync_pass=el1_sync_pass=100; el0_sync_emul=el1_sync_emul=0;
+    health_log=fopen(path,"wx"); assert(health_log);
+    hv_report_t8142_gic_activity(); /* Baseline sample, then actual periodic path. */
+    for(unsigned i=0;i<130000;i++) {
+        if (!quiet_irq) for(unsigned c=0;c<MAX_CPUS;c++) {
+            ++gic_cpuif_ack_count[c]; ++gic_cpuif_eoi_count[c];
+        }
+        if (!frozen_wfi) for(unsigned c=0;c<MAX_CPUS;c++) ++wfi_trap_count[c];
+        ++el0_sync_pass; if (!frozen_el1) ++el1_sync_pass;
+        u64 saved_wfi=wfi_trap_count[0];
+        assert(hv_handle_wfx(&ctx));
+        if (frozen_wfi) wfi_trap_count[0]=saved_wfi;
+        hv_exc_fiq(&ctx);
+    }
+    assert(full_ticks==130 && scans==130 && clock_now==130000000000ULL);
+    assert(fclose(health_log)==0);health_log=NULL;
+    return 0;
+}
+int main(int argc, char **argv) {
+    if (argc==3) return observability(argv[2],!strcmp(argv[1],"quiet-irq"),
+                                      !strcmp(argv[1],"frozen-wfi"),!strcmp(argv[1],"frozen-el1"));
     struct exc_info ctx={0}; reset(0); hv_arm_tick(false);
     for(unsigned i=0;i<2500;i++) wake(&ctx);
     check(full_ticks==2 && scans==2 && vector_repairs==2 && frame_tick==2,"2500 actual idle wakes run only two genuine housekeeping ticks");

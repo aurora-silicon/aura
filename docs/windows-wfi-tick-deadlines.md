@@ -83,3 +83,29 @@ Root reviews the exact candidate before any hardware activation. A later A/B
 must match boot policy/packages, readiness milestones and clock domains, retain
 all ten CPUs/health/shutdown evidence, and compare boot phases plus log/traffic
 volume. No speedup is claimed from the offline test.
+## Revision 2: health observability dependency, before implementation
+
+Revision 1's offline approval is superseded; it was never deployed. Its replay
+stubbed `hv_report_t8142_gic_activity` and missed a nested call-count throttle.
+The real reporter emits WFI/EL1 counters only every 32 calls. At one genuine
+housekeeping call per second, that violates the unchanged health gate's
+ten-second progress buckets and conceals useful stall evidence.
+
+Before changing production code, reproduce that failure using the verbatim GIC,
+bitmap, WFI and redirected-vector reporters in the real WFI/FIQ/tick replay.
+Then emit those lightweight counter reports on every genuine T8142 housekeeping
+call, including when IRQ counts have not changed. The reporter has only one
+production caller, inside full housekeeping; wake-only expiries still return
+before reaching it. Keep IRQ output change-only and preserve active-interrupt
+annotations. Do not alter the gate, counter values, CPU membership, or any
+interrupt/wake/deadline path.
+
+Failures to cover: the old modulo-32 throttle; missing either counter report;
+moving reports onto wake-only expiries; hiding WFI/EL1 progress behind unchanged
+IRQ counters; fabricating progress when a counter is frozen; losing active IRQ
+annotations; failing a ten-second bucket despite genuine counter progress; and
+misrepresenting a modeled time stream as hardware health. Run the unchanged gate
+on 130 seconds of timestamped production report output, explicitly as an offline
+counter-observability fixture. Healthy progress must pass all twelve buckets;
+the modulo-32 regression and frozen real-counter fixtures must fail. Preserve
+revision 1 commit, image, freeze and failed regression receipt.
