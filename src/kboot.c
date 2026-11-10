@@ -7444,75 +7444,6 @@ static int dt_set_display(void)
     return 0;
 }
 
-static const char *excluded_pmp_props[] = {
-    "compatible",    "AAPL,phandle",    "region-base", "region-size",
-    "segment-names", "segment-ranges",  "pre-loaded",  "firmware-name",
-    "dram-capacity", "coredump-enable", "name",        NULL,
-};
-
-static bool skip_pmp_prop(const char *prop_name)
-{
-    for (int i = 0; excluded_pmp_props[i]; i++)
-        if (!strcmp(prop_name, excluded_pmp_props[i]))
-            return true;
-    return false;
-}
-
-/* Reads a u32 ADT property only if it is exactly four bytes long. */
-static int adt_get_u32_exact(int node, const char *name, u32 *val)
-{
-    u32 len = 0;
-    const void *p = adt_getprop(adt, node, name, &len);
-
-    if (!p || len != sizeof(*val))
-        return -1;
-    memcpy(val, p, sizeof(*val));
-    return 0;
-}
-
-/*
- * Copies this Mac's PMP values from the ADT onto the FDT node @pmp_node. Used for
- * T6000/T8112 and by dt_pass_pmp() on T6030 and T8122. Scalar values must be
- * exactly a u32; calibration tables stay in their original byte order.
- */
-static int dt_fill_pmp(int pmp_node)
-{
-    int chosen_anode = adt_path_offset(adt, "/chosen");
-    if (chosen_anode < 0)
-        bail("ADT: /chosen not found \n");
-    int pmp_iop_anode = adt_path_offset(adt, "/arm-io/pmp/iop-pmp-nub");
-    if (pmp_iop_anode < 0)
-        bail("ADT: /arm-io/pmp/iop-pmp-nub not found \n");
-
-    u32 board_id, dram_vendor_id, dram_capacity = 0xFFFFFFFF;
-    if (adt_get_u32_exact(chosen_anode, "board-id", &board_id))
-        bail("ADT: failed to get board id\n");
-    if (adt_get_u32_exact(chosen_anode, "dram-vendor-id", &dram_vendor_id))
-        bail("ADT: failed to get dram vendor id\n");
-    if (adt_getprop(adt, pmp_iop_anode, "dram-capacity", NULL) &&
-        adt_get_u32_exact(pmp_iop_anode, "dram-capacity", &dram_capacity))
-        bail("ADT: dram-capacity is not a u32\n");
-
-    if (fdt_setprop_u32(dt, pmp_node, "apple,board-id", board_id))
-        bail("FDT: failed to set board id\n");
-    if (fdt_setprop_u32(dt, pmp_node, "apple,dram-vendor-id", dram_vendor_id))
-        bail("FDT: failed to set dram vendor id\n");
-    if (dram_capacity != 0xFFFFFFFF &&
-        fdt_setprop_u32(dt, pmp_node, "apple,dram-capacity", dram_capacity))
-        bail("FDT: failed to set dram capacity\n");
-
-    ADT_FOREACH_PROPERTY(adt, pmp_iop_anode, prop)
-    {
-        if (skip_pmp_prop(prop->name))
-            continue;
-        char prop_name[128];
-        snprintf(prop_name, sizeof(prop_name), "apple,tunable-%s", prop->name);
-        if (fdt_setprop(dt, pmp_node, prop_name, prop->value, prop->size))
-            bail("FDT: failed to transfer pmp tunable\n");
-    }
-    return 0;
-}
-
 /* PMP DEVICE DVFS START */
 
 /*
@@ -7528,38 +7459,39 @@ static int dt_fill_pmp(int pmp_node)
  * never interpreted as policy.
  */
 /* ptd-range record: {u32 id, u32 base, u32 count, u32 reserved, char name[16]} */
-#define ADT_PMP_PTD_RANGE_SIZE       32
-#define ADT_PMP_PTD_RANGE_ID         0
-#define ADT_PMP_PTD_RANGE_BASE       4
-#define ADT_PMP_PTD_RANGE_COUNT      8
-#define ADT_PMP_PTD_RANGE_NAME       16
-#define ADT_PMP_SOC_DEV_DVFS_ID      12
+#define ADT_PMP_PTD_RANGE_SIZE  32
+#define ADT_PMP_PTD_RANGE_ID    0
+#define ADT_PMP_PTD_RANGE_BASE  4
+#define ADT_PMP_PTD_RANGE_COUNT 8
+#define ADT_PMP_PTD_RANGE_NAME  16
+#define ADT_PMP_SOC_DEV_DVFS_ID 12
 /* soc-device record: u32 device ID at 0, u32 DVFS selector at 0x2c (nonzero: owns a slot) */
-#define ADT_PMP_SOC_DEVICE_SIZE      0x7c
-#define ADT_PMP_SOC_DEVICE_ID        0
-#define ADT_PMP_SOC_DEVICE_DVFS      0x2c
-/* pmgr devices record: u8 flags, u8 level, u8 perf domain, u8 device ID, ..., char name[16] at 32 */
-#define ADT_PMGR_DEVICE_SIZE         48
-#define ADT_PMGR_DEVICE_FLAGS        0
-#define ADT_PMGR_DEVICE_LEVEL        1
-#define ADT_PMGR_DEVICE_DOMAIN       2
-#define ADT_PMGR_DEVICE_TARGET       3
-#define ADT_PMGR_DEVICE_NAME         32
-#define ADT_PMGR_DEVICE_NAME_LEN     16
-#define ADT_PMGR_PERF_VIRTUAL        0x12
+#define ADT_PMP_SOC_DEVICE_SIZE 0x7c
+#define ADT_PMP_SOC_DEVICE_ID   0
+#define ADT_PMP_SOC_DEVICE_DVFS 0x2c
+/* pmgr devices record: u8 flags, u8 level, u8 perf domain, u8 device ID, ..., char name[16] at 32
+ */
+#define ADT_PMGR_DEVICE_SIZE     48
+#define ADT_PMGR_DEVICE_FLAGS    0
+#define ADT_PMGR_DEVICE_LEVEL    1
+#define ADT_PMGR_DEVICE_DOMAIN   2
+#define ADT_PMGR_DEVICE_TARGET   3
+#define ADT_PMGR_DEVICE_NAME     32
+#define ADT_PMGR_DEVICE_NAME_LEN 16
+#define ADT_PMGR_PERF_VIRTUAL    0x12
 /* Newer tables: request-class ordinal (1..5) in the flags' high nibble. */
 #define ADT_PMGR_CLASS_ORDINAL_SHIFT 4
 #define ADT_PMGR_CLASS_ORDINAL_MAX   5
 /* Older tables: PMP performance domains 0x20..0x24 name request classes 0x21..0x25. */
-#define ADT_PMGR_PERF_DOMAIN_FIRST   0x20
+#define ADT_PMGR_PERF_DOMAIN_FIRST 0x20
 /* Linux request classes 0x21..0x25 are four-bit lanes; the default lane holds 0..0x1f. */
-#define ADT_PMP_REQUEST_CLASS_FIRST  0x21
-#define ADT_PMP_REQUEST_CLASS_LAST   0x25
-#define PMP_DVFS_CLASS_LEVEL_MAX     0xf
-#define PMP_DVFS_MAIN_LEVEL_MAX      0x1f
-#define PMP_DVFS_CLASS_COUNT         (ADT_PMP_REQUEST_CLASS_LAST - ADT_PMP_REQUEST_CLASS_FIRST + 1)
+#define ADT_PMP_REQUEST_CLASS_FIRST 0x21
+#define ADT_PMP_REQUEST_CLASS_LAST  0x25
+#define PMP_DVFS_CLASS_LEVEL_MAX    0xf
+#define PMP_DVFS_MAIN_LEVEL_MAX     0x1f
+#define PMP_DVFS_CLASS_COUNT        (ADT_PMP_REQUEST_CLASS_LAST - ADT_PMP_REQUEST_CLASS_FIRST + 1)
 /* Linux report entry indices are 8-bit; the PMP soc-device ID is the index plus one. */
-#define PMP_REPORT_ENTRY_MAX         0xff
+#define PMP_REPORT_ENTRY_MAX 0xff
 
 struct pmp_device_dvfs_policy {
     const char *label;
@@ -7632,8 +7564,8 @@ static int adt_pmp_dvfs_entry(u32 device_id, struct pmp_device_dvfs *dvfs)
         return -1;
     ranges = adt_getprop(adt, nub, "ptd-range", &ranges_len);
     devices = adt_getprop(adt, nub, "soc-device", &devices_len);
-    if (!ranges || !ranges_len || ranges_len % ADT_PMP_PTD_RANGE_SIZE || !devices ||
-        !devices_len || devices_len % ADT_PMP_SOC_DEVICE_SIZE)
+    if (!ranges || !ranges_len || ranges_len % ADT_PMP_PTD_RANGE_SIZE || !devices || !devices_len ||
+        devices_len % ADT_PMP_SOC_DEVICE_SIZE)
         return -1;
 
     for (u32 off = 0; off < ranges_len; off += ADT_PMP_PTD_RANGE_SIZE) {
@@ -7695,7 +7627,8 @@ static int adt_pmp_dvfs_levels(u32 device_id, const struct pmp_device_dvfs_polic
              (!policy->alternate_source || !pmp_name_is(record, policy->alternate_source))))
             continue;
         level = record[ADT_PMGR_DEVICE_LEVEL];
-        if (!level || level > PMP_DVFS_CLASS_LEVEL_MAX || pmp_request_class(record, &request_class) ||
+        if (!level || level > PMP_DVFS_CLASS_LEVEL_MAX ||
+            pmp_request_class(record, &request_class) ||
             request_class < ADT_PMP_REQUEST_CLASS_FIRST ||
             request_class > ADT_PMP_REQUEST_CLASS_LAST)
             return -1;
@@ -7711,8 +7644,7 @@ static int adt_pmp_dvfs_levels(u32 device_id, const struct pmp_device_dvfs_polic
     return sources ? 0 : -1;
 }
 
-static int dt_set_pmp_device_dvfs_one(int node,
-                                      const struct pmp_device_dvfs_policy *policy)
+static int dt_set_pmp_device_dvfs_one(int node, const struct pmp_device_dvfs_policy *policy)
 {
     struct pmp_device_dvfs dvfs = {0};
     fdt32_t levels[2 * PMP_DVFS_CLASS_COUNT], value[2];
@@ -7730,8 +7662,7 @@ static int dt_set_pmp_device_dvfs_one(int node,
     if (!reg || len != sizeof(*reg) || fdt32_ld(reg) >= PMP_REPORT_ENTRY_MAX)
         return 0;
     device_id = fdt32_ld(reg) + 1;
-    if (adt_pmp_dvfs_entry(device_id, &dvfs) ||
-        adt_pmp_dvfs_levels(device_id, policy, &dvfs))
+    if (adt_pmp_dvfs_entry(device_id, &dvfs) || adt_pmp_dvfs_levels(device_id, policy, &dvfs))
         return 0;
 
     for (u32 i = 0; i < ARRAY_SIZE(dvfs.class_level); i++) {
@@ -7744,8 +7675,7 @@ static int dt_set_pmp_device_dvfs_one(int node,
         return 0;
     value[0] = cpu_to_fdt32(dvfs.entry);
     value[1] = cpu_to_fdt32(dvfs.main_level);
-    ret = fdt_setprop(dt, node, "apple,dvfs-request-levels", levels,
-                      cells * sizeof(*levels));
+    ret = fdt_setprop(dt, node, "apple,dvfs-request-levels", levels, cells * sizeof(*levels));
     if (!ret)
         ret = fdt_setprop(dt, node, "apple,dvfs", value, sizeof(value));
     if (!ret) {
@@ -7771,6 +7701,75 @@ static int dt_set_pmp_device_dvfs(void)
 }
 
 /* PMP DEVICE DVFS END */
+
+static const char *excluded_pmp_props[] = {
+    "compatible",    "AAPL,phandle",    "region-base", "region-size",
+    "segment-names", "segment-ranges",  "pre-loaded",  "firmware-name",
+    "dram-capacity", "coredump-enable", "name",        NULL,
+};
+
+static bool skip_pmp_prop(const char *prop_name)
+{
+    for (int i = 0; excluded_pmp_props[i]; i++)
+        if (!strcmp(prop_name, excluded_pmp_props[i]))
+            return true;
+    return false;
+}
+
+/* Reads a u32 ADT property only if it is exactly four bytes long. */
+static int adt_get_u32_exact(int node, const char *name, u32 *val)
+{
+    u32 len = 0;
+    const void *p = adt_getprop(adt, node, name, &len);
+
+    if (!p || len != sizeof(*val))
+        return -1;
+    memcpy(val, p, sizeof(*val));
+    return 0;
+}
+
+/*
+ * Copies this Mac's PMP values from the ADT onto the FDT node @pmp_node. Used for
+ * T6000/T8112 and by dt_pass_pmp() on T6030 and T8122. Scalar values must be
+ * exactly a u32; calibration tables stay in their original byte order.
+ */
+static int dt_fill_pmp(int pmp_node)
+{
+    int chosen_anode = adt_path_offset(adt, "/chosen");
+    if (chosen_anode < 0)
+        bail("ADT: /chosen not found \n");
+    int pmp_iop_anode = adt_path_offset(adt, "/arm-io/pmp/iop-pmp-nub");
+    if (pmp_iop_anode < 0)
+        bail("ADT: /arm-io/pmp/iop-pmp-nub not found \n");
+
+    u32 board_id, dram_vendor_id, dram_capacity = 0xFFFFFFFF;
+    if (adt_get_u32_exact(chosen_anode, "board-id", &board_id))
+        bail("ADT: failed to get board id\n");
+    if (adt_get_u32_exact(chosen_anode, "dram-vendor-id", &dram_vendor_id))
+        bail("ADT: failed to get dram vendor id\n");
+    if (adt_getprop(adt, pmp_iop_anode, "dram-capacity", NULL) &&
+        adt_get_u32_exact(pmp_iop_anode, "dram-capacity", &dram_capacity))
+        bail("ADT: dram-capacity is not a u32\n");
+
+    if (fdt_setprop_u32(dt, pmp_node, "apple,board-id", board_id))
+        bail("FDT: failed to set board id\n");
+    if (fdt_setprop_u32(dt, pmp_node, "apple,dram-vendor-id", dram_vendor_id))
+        bail("FDT: failed to set dram vendor id\n");
+    if (dram_capacity != 0xFFFFFFFF &&
+        fdt_setprop_u32(dt, pmp_node, "apple,dram-capacity", dram_capacity))
+        bail("FDT: failed to set dram capacity\n");
+
+    ADT_FOREACH_PROPERTY(adt, pmp_iop_anode, prop)
+    {
+        if (skip_pmp_prop(prop->name))
+            continue;
+        char prop_name[128];
+        snprintf(prop_name, sizeof(prop_name), "apple,tunable-%s", prop->name);
+        if (fdt_setprop(dt, pmp_node, prop_name, prop->value, prop->size))
+            bail("FDT: failed to transfer pmp tunable\n");
+    }
+    return 0;
+}
 
 /* The device tree's pmp node (M1 Pro/Max/Ultra, M2, M2 Pro/Max/Ultra): as upstream has it */
 static int dt_set_pmp(void)
