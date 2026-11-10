@@ -17,7 +17,11 @@ trap 'rm -rf "$tmp"' EXIT HUP INT TERM
 mkdir -p "$tmp/src"
 cp "$root/src/kboot_display_handoff.c" "$root/tests/t8122_display_host.c" \
     "$root"/tests/t8122_display_host/*.h "$tmp/src/"
-${CC:-cc} -std=gnu11 -D_GNU_SOURCE -O1 -g -Wall -Wextra -Wno-unused-function \
+cc=${CC:-cc}
+if [ -z "${CC:-}" ] && [ "${USE_CLANG:-0}" = 1 ]; then
+    cc=clang
+fi
+$cc -std=gnu11 -D_GNU_SOURCE -O1 -g -Wall -Wextra -Wno-unused-function \
     -Wno-unused-parameter -Wno-sign-compare -Wno-format-truncation \
     -fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=undefined \
     -I"$tmp/src" -I"$root/src" \

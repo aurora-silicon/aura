@@ -4,6 +4,8 @@
 from pathlib import Path
 import subprocess
 
+from host_compiler import host_cc
+
 
 HARNESS = r"""
 #include <assert.h>
@@ -27,6 +29,7 @@ typedef uint64_t u64;
 #define T6031 0x6031
 #define T6034 0x6034
 #define T6041 0x6041
+#define T6050 0x6050
 #define T8140 0x8140
 #define T8142 0x8142
 #define V12_3 1
@@ -288,7 +291,7 @@ def test_isp_init_synthetic_adt(tmp_path):
     harness = HARNESS + source + TESTS
     program = tmp_path / "isp-heap"
     subprocess.run(
-        ["cc", "-std=gnu11", "-Wall", "-Wextra", "-Werror", "-Wno-format",
+        [*host_cc(), "-std=gnu11", "-Wall", "-Wextra", "-Werror", "-Wno-format",
          "-fsanitize=address,undefined", "-x", "c", "-", "-o", str(program)],
         input=harness, text=True, check=True,
     )
@@ -307,7 +310,7 @@ def test_t8140_heap_top_must_exceed_aligned_end(tmp_path):
         assert variant != source
         program = tmp_path / f"isp-invalid-top-{top:x}"
         subprocess.run(
-            ["cc", "-std=gnu11", "-Wall", "-Wextra", "-Werror", "-Wno-format",
+            [*host_cc(), "-std=gnu11", "-Wall", "-Wextra", "-Werror", "-Wno-format",
              "-Wno-unused-function",
              "-fsanitize=address,undefined", "-x", "c", "-", "-o", str(program)],
             input=HARNESS + variant + helpers + "int main(void) { reset(); failure(); return 0; }",
@@ -396,7 +399,7 @@ int main(void)
 """
     program = tmp_path / "isp-fdt"
     subprocess.run(
-        ["cc", "-std=gnu11", "-Wall", "-Wextra", "-Werror", "-x", "c", "-",
+        [*host_cc(), "-std=gnu11", "-Wall", "-Wextra", "-Werror", "-x", "c", "-",
          "-o", str(program)], input=harness, text=True, check=True,
     )
     subprocess.run([str(program)], check=True)
@@ -450,7 +453,7 @@ int main(void)
 '''
     binary = tmp_path / "isp-firmware-admission"
     subprocess.run(
-        ["cc", "-std=gnu11", "-Wall", "-Wextra", "-Werror", "-Wno-format",
+        [*host_cc(), "-std=gnu11", "-Wall", "-Wextra", "-Werror", "-Wno-format",
          "-Wno-unused-function", "-fsanitize=address,undefined",
          "-x", "c", "-", "-o", str(binary)],
         input=HARNESS + source + helpers + matrix, text=True, check=True,

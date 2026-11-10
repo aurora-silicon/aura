@@ -13,6 +13,7 @@ import shutil
 import subprocess
 
 import pytest
+from host_compiler import host_cc
 
 ROOT = Path(__file__).resolve().parents[2]
 LIBFDT = ["fdt.c", "fdt_ro.c", "fdt_rw.c", "fdt_wip.c", "fdt_sw.c", "fdt_empty_tree.c",
@@ -25,8 +26,8 @@ def host(tmp_path_factory):
 
 
 def build_host(tmp, unknown_profile=False):
-    cc = shutil.which("cc")
-    if not cc:
+    cc = host_cc()
+    if not shutil.which(cc[0]):
         pytest.skip("no host C compiler")
     src = tmp / "src"
     src.mkdir()
@@ -45,7 +46,7 @@ def build_host(tmp, unknown_profile=False):
         shutil.copy(header, src)
     binary = tmp / "t6041-display-host"
     subprocess.run(
-        [cc, "-std=gnu11", "-D_GNU_SOURCE", "-O1", "-g", "-Wall", "-Wno-unused-function",
+        [*cc, "-std=gnu11", "-D_GNU_SOURCE", "-O1", "-g", "-Wall", "-Wno-unused-function",
          "-Wno-format", "-Wno-format-truncation", "-fsanitize=address,undefined",
          "-fno-omit-frame-pointer", "-fno-sanitize-recover=undefined",
          "-I", str(src), "-I", str(ROOT / "src"),
@@ -180,7 +181,7 @@ def test_other_socs_keep_their_optin():
 
 def test_t8122_handoff_unchanged():
     """The T8122 host suite, including its unarmed (no opt-in) scenario."""
-    if not shutil.which("cc") or not shutil.which("dtc"):
+    if not shutil.which(host_cc()[0]) or not shutil.which("dtc"):
         pytest.skip("needs a host C compiler and dtc")
     result = subprocess.run(["sh", str(ROOT / "tests/run-t8122-display-handoff.sh")],
                             capture_output=True, text=True)

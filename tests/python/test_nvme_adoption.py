@@ -5,10 +5,18 @@ from pathlib import Path
 import os
 import subprocess
 
+from host_compiler import host_cc
+
 
 def test_adopted_queue_lifetime(tmp_path):
     source = Path(os.environ.get("NVME_SOURCE", Path(__file__).resolve().parents[2] / "src/nvme.c")).read_text()
     declarations = source[source.index("#define NVME_TIMEOUT"):source.index("static u64 nvme_read64_lo_hi")]
+    # nvme_init resets this data-path state, but the read path is outside this lifetime fixture.
+    for declaration in ("static bool nvme_multi_enabled", "static bool nvme_multi_verified",
+                        "static u64 *nvme_prp_list", "static u8 *nvme_verify_bounce"):
+        assert declarations.count(declaration) == 1
+        declarations = declarations.replace(declaration, declaration.replace(
+            "static ", "static __attribute__((unused)) ", 1))
     # The queue register helpers, which place the registers for the secure layout too.
     qregs = source[source.index("static u64 nvme_qreg(u32 reg)"):source.index("static void nvme_log_entry_state")]
     # The post-M4 power off and power on around a stage's use of ANS.
@@ -46,6 +54,7 @@ struct sart_entry { u8 index, flags; u64 paddr, size; };
 #define T8132 0x8132
 #define T6040 0x6040
 #define T6041 0x6041
+#define T6050 0x6050
 #define T8142 0x8142
 static u32 chip_id = T8140;
 static void *adt;
@@ -123,6 +132,8 @@ static void nvme_log_entry_state(bool running) {}
 static u64 nvme_read64_lo_hi(u64 addr) { return 0; }
 static int adt_path_offset(void *a, const char *p) { return 1; }
 static int pcie_init(void) { return 0; }
+/* Non-T6050 power-on delegates to pcie_init() in production too. */
+static int pcie_ans_power_on(void) { assert(chip_id != T6050); return pcie_init(); }
 /* Shutdown faults 3 and 4: ANS doesn't power off. */
 static int pcie_ans_power_off(void) { return shutdown_fault == 3 || shutdown_fault == 4 ? -1 : 0; }
 static bool rtkit_idle(rtkit_dev_t *r) { return true; }
@@ -149,6 +160,8 @@ static bool nvme_ctrl_disable(void)
 { disable_calls++; return failure != 2 && !(shutdown_fault == 4 && disable_calls == 2); }
 static bool nvme_ctrl_enable(void) { return failure != 3; }
 static bool nvme_ctrl_shutdown(void) { shutdown_calls++; return shutdown_fault != 3; }
+/* The T6050 controller suspend protocol is outside this queue-lifetime model. */
+static bool nvme_ctrl_suspend(void) { abort(); }
 static void nvme_poll_syslog(void) {}
 static bool nvme_exec_command(struct nvme_queue *q, struct nvme_command *cmd, void *result)
 {
@@ -276,7 +289,7 @@ int main(int argc, char **argv)
 '''
     binary = tmp_path / "nvme-adoption"
     subprocess.run(
-        ["cc", "-std=gnu11", "-Wall", "-Wextra", "-Werror", "-Wno-unused-parameter",
+        [*host_cc(), "-std=gnu11", "-Wall", "-Wextra", "-Werror", "-Wno-unused-parameter",
          "-Wno-unused-variable", "-Wno-format", "-x", "c", "-", "-o", str(binary)],
         input=harness, text=True, check=True,
     )
