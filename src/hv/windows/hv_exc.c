@@ -2789,6 +2789,16 @@ static bool hv_t8142_sysreg_assist_impl(u32 instruction, u64 input, u64 *output,
 
 bool hv_handle_t8142_sysreg_assist(u32 instruction, u64 input, u64 *output)
 {
+    /* Preserve the software PMU's timer scale and epoch without constructing
+     * generic scratch for this exact read. GIC carrier paths still need the
+     * generic zeroed register array, including non-destination registers. */
+    if (chip_id == T8142 && !cpu_features->apple_sysregs_unlocked &&
+        (instruction & 0xffffffe0U) == 0xd53b9d00U) { /* MRS Xt, PMCCNTR_EL0 */
+        u64 value = hv_host_counter();
+        if (output)
+            *output = value;
+        return true;
+    }
     return hv_t8142_sysreg_assist_impl(instruction, input, output, false);
 }
 
