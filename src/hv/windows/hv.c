@@ -18,6 +18,7 @@
 #include "usb.h"
 #include "utils.h"
 #include "xnuboot.h"
+#include "tick_deadline.h"
 
 #define HV_TICK_RATE      5000
 #define HV_SLOW_TICK_RATE 1
@@ -53,6 +54,9 @@ extern char _hv_vectors_start[0];
 u64 hv_tick_interval;
 u64 hv_secondary_tick_interval;
 u64 hv_wfi_wake_interval;
+
+/* A WFI wake uses CNTHP too, but must not reset or impersonate its periodic deadline. */
+static struct hv_tick_deadline hv_periodic_deadlines[MAX_CPUS];
 
 int hv_pinned_cpu;
 int hv_want_cpu;
@@ -1231,14 +1235,20 @@ void hv_set_elr(u64 val)
 /*
  * Bound a guest-WFI wait held at EL2; see HV_WFI_WAKE_RATE.
  *
- * Uses the same timer the host tick does, so whichever fires is taken as an
- * ordinary tick and re-arms the normal schedule on its way out -- there is no
- * separate state to restore, and an early tick is harmless.
+ * Uses the same timer as the host tick. The per-CPU periodic deadline remains
+ * independent of this short wake: an early expiry services pending interrupts
+ * and fast host I/O, while full housekeeping waits for its genuine deadline.
+ * Arm the earlier deadline so repeated WFI wakes cannot postpone housekeeping.
  */
 void hv_arm_wfi_wake(void)
 {
     if (chip_id == T8142) {
-        msr(SYS_CNTHP_TVAL_EL2, hv_wfi_wake_interval);
+        int primary = hv_pinned_cpu == -1 ? boot_cpu_idx : hv_pinned_cpu;
+        u64 interval = smp_id() == primary ? hv_tick_interval : hv_secondary_tick_interval;
+        u64 now = hv_host_counter();
+        struct hv_tick_deadline *state = &hv_periodic_deadlines[smp_id()];
+        hv_tick_deadline_init(state, now, interval);
+        msr(SYS_CNTHP_TVAL_EL2, hv_tick_deadline_delay(state, now, hv_wfi_wake_interval));
         msr(SYS_CNTHP_CTL_EL2, CNTx_CTL_ENABLE);
     } else {
         msr(CNTP_TVAL_EL0, hv_wfi_wake_interval);
@@ -1256,7 +1266,16 @@ void hv_arm_tick(bool secondary)
      * timer for m1n1's own periodic tick on this generation.
      */
     if (chip_id == T8142) {
-        msr(SYS_CNTHP_TVAL_EL2, interval);
+        int primary = hv_pinned_cpu == -1 ? boot_cpu_idx : hv_pinned_cpu;
+        bool is_secondary = smp_id() != primary;
+        interval = is_secondary ? hv_secondary_tick_interval : hv_tick_interval;
+        u64 now = hv_host_counter();
+        struct hv_tick_deadline *state = &hv_periodic_deadlines[smp_id()];
+        hv_tick_deadline_init(state, now, interval);
+        /* Secondary ticks provide liveness only; primary completion is in hv_tick(). */
+        if (is_secondary)
+            hv_tick_deadline_complete(state, now);
+        msr(SYS_CNTHP_TVAL_EL2, hv_tick_deadline_delay(state, now, interval));
         msr(SYS_CNTHP_CTL_EL2, CNTx_CTL_ENABLE);
     } else {
         msr(CNTP_TVAL_EL0, interval);
@@ -1375,8 +1394,35 @@ static void hv_sample_guest_pc(struct exc_info *ctx)
 }
 #endif
 
+static void hv_tick_host_io(struct exc_info *ctx)
+{
+    iodev_handle_events(uartproxy_iodev);
+    if (iodev_can_read(uartproxy_iodev)) {
+        printf("HV: User interrupt\n");
+        iodev_console_flush();
+        if (hv_pinned_cpu == -1 || hv_pinned_cpu == smp_id())
+            hv_exc_proxy(ctx, START_HV, HV_USER_INTERRUPT, NULL);
+    }
+#ifdef ENABLE_NATIVE_AIC_PASSTHROUGH
+    /* Preserve the existing Mu/Windows readiness condition on every I/O service. */
+    if (chip_id != T8142 || hv_native_aic_mu_timer_active() || hv_native_aic_windows_active())
+#endif
+        hv_vuart_poll();
+}
+
 void hv_tick(struct exc_info *ctx)
 {
+    struct hv_tick_deadline *state = &hv_periodic_deadlines[smp_id()];
+    if (chip_id == T8142) {
+        u64 now = hv_host_counter();
+        hv_tick_deadline_init(state, now, hv_tick_interval);
+        if (!hv_tick_deadline_due(state, now)) {
+            /* A short WFI expiry still services host I/O, not the full scan/report path. */
+            hv_windows_serial_flush();
+            hv_tick_host_io(ctx);
+            return;
+        }
+    }
     hv_wdt_pet();
     hv_windows_serial_flush();
     /*
@@ -1415,21 +1461,7 @@ void hv_tick(struct exc_info *ctx)
     hv_check_t8142_bugcheck();
     hv_dump_t8142_bugcheck_stack(ctx);
     hv_recover_t8142_sysreg_undef(ctx);
-    iodev_handle_events(uartproxy_iodev);
-    if (iodev_can_read(uartproxy_iodev)) {
-        printf("HV: User interrupt\n");
-        iodev_console_flush();
-        if (hv_pinned_cpu == -1 || hv_pinned_cpu == smp_id())
-            hv_exc_proxy(ctx, START_HV, HV_USER_INTERRUPT, NULL);
-    }
-#ifdef ENABLE_NATIVE_AIC_PASSTHROUGH
-    /*
-     * J813 can enter the hypervisor with uart0 clock-gated and before Mu has
-     * configured AIC2. Keep the early T8142 host tick useful for watchdog and
-     * USB-proxy polling, but do not drive the virtual UART's AIC software line
-     * until TimerDxe proves that Mu's native interrupt handler is live.
-     */
-    if (chip_id != T8142 || hv_native_aic_mu_timer_active() || hv_native_aic_windows_active())
-#endif
-        hv_vuart_poll();
+    hv_tick_host_io(ctx);
+    if (chip_id == T8142)
+        hv_tick_deadline_complete(state, hv_host_counter());
 }
