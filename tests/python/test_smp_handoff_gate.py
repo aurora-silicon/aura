@@ -60,6 +60,7 @@ static int pcie_prepare_fdt(void *p) { return 0; }
 static int pcie_handoff_fdt(void *p) { return 0; }
 /* No modelled chip takes the T6050 PCIe handoff. */
 static int pcie_t6050_handoff_fdt(void *p) { abort(); }
+static int pcie_apcie_tables_fdt(void *p, int capacity) { return 0; }
 static int fdt_node_check_compatible(void *p, int node, const char *compatible) { return 1; }
 static int dt_disable_j713_pcie(void) { return 0; }
 static int dt_disable_t8140_pcie(void) { return 0; }

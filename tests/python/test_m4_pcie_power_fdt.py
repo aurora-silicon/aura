@@ -13,12 +13,24 @@ def test_j713_pcie_power_contract(tmp_path):
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "libfdt.h"
 typedef uint8_t u8;
 typedef uint32_t u32;
+typedef uint64_t u64;
 typedef int smc_dev_t;
 #define BIT(n) (1U << (n))
+#define PACKED __attribute__((packed))
+#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
+/* The T8140 APCIe tables aren't under test: no ADT. */
+static void *adt;
+static int adt_path_offset(const void *a, const char *path) { return -1; }
+static const void *adt_get_property(const void *a, int node, const char *name) { return NULL; }
+static int adt_path_offset_trace(const void *a, const char *path, int *offsets) { return -1; }
+static const void *adt_getprop(const void *a, int node, const char *name, u32 *len) { return NULL; }
+static int adt_get_reg(const void *a, int *path, const char *prop, int idx, u64 *addr, u64 *size)
+{ return -1; }
 static int writes, bypasses;
 static int smc_result;
 static u32 last_value, last_key;
