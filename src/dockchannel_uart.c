@@ -7,6 +7,7 @@
 #include "dockchannel_uart.h"
 #include "adt.h"
 #include "iodev.h"
+#include "string.h"
 #include "types.h"
 #include "utils.h"
 #include "vsprintf.h"
@@ -118,6 +119,26 @@ void dockchannel_uart_puts(const char *s)
         dockchannel_uart_putchar(*(s++));
 
     dockchannel_uart_putchar('\n');
+}
+
+/*
+ * The whole line or nothing, without waiting: for paths that must not stall on a FIFO
+ * nobody drains (the S2R wake of a T6040, whose OS keeps the DockChannel off).
+ */
+bool dockchannel_uart_try_puts(const char *s)
+{
+    size_t len = strlen(s);
+
+    if (!uart_base || read32(uart_base + DATA_TX_FREE) < len + 2)
+        return false;
+
+    for (size_t i = 0; i < len; i++)
+        write32(uart_base + DATA_TX8, s[i]);
+    write32(uart_base + DATA_TX8, '\r');
+    write32(uart_base + DATA_TX8, '\n');
+    TX_ACCEPTED(len + 2);
+
+    return true;
 }
 
 void dockchannel_uart_write(const void *buf, size_t count)
