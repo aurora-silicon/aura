@@ -7,6 +7,10 @@
 #include "adt.h"
 #include "kboot.h"
 #include "pmgr.h"
+#include "xnuboot.h"
+
+/* Link the full production source; reaching a T6050 helper below still aborts. */
+struct boot_args cur_boot_args;
 
 int kboot_fdt_path_exact(const void *fdt, const char *path)
 {

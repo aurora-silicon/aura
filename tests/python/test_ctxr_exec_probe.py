@@ -118,9 +118,9 @@ int main(void) {
     chip_id = T8112; alive_mask = 0x2; probe_faults = 0; calls = 0; printed = 0; call_fails = -1;
     assert(ctxr_exec_confined() == 0 && calls == 1 && printed == 1 && probe_stuck_cpu < 0);
     assert(exc_guard == GUARD_OFF);
-    /* No secondary to ask: not confined, and the log says what CTXR_D reads. */
+    /* No secondary: admission checks CTXR_D, then the warning reads it again. */
     SYS_IMP_APL_CTXR_D_LWR_EL1 = 0; SYS_IMP_APL_CTXR_D_UPR_EL1 = 0;
-    assert(run(T8112, 0x1, 0) == 0 && calls == 0 && printed == 1 && reads == 2);
+    assert(run(T8112, 0x1, 0) == 0 && calls == 0 && printed == 1 && reads == 4);
     assert(strstr(last_format, "not armed"));
     /* An M1 to M3 has no such registers: the read faults under the guard. */
     reads_fault = 1;
