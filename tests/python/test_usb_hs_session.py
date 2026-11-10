@@ -57,6 +57,7 @@ typedef uint8_t u8; typedef uint32_t u32; typedef uint64_t u64;
 #define T8122 0x8122
 #define T8142 0x8142
 #define T8152 0x8152
+#define T6050 0x6050
 enum {DWC3_DEVT_DISCONN, DWC3_DEVT_USBRST, DWC3_DEVT_CONNECTDONE, DWC3_DEVT_ULSTCHNG};
 static const char *devt_names[] = {"DisconnEvt", "USBRst", "ConnectDone", "ULStChng"};
 struct dwc3_event_devt {unsigned type;};
