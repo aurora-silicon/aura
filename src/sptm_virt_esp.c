@@ -421,6 +421,13 @@ AURA_XTEXT int sptm_virt_esp_boot(const char *spec)
     /* A capture build's own ANS pages (S2R_CP_ANSX_*) replace the manifest's */
     sptm_virt_s2r_cp_ansx = SPTM_VIRT_ESP_CP_ANSX;
 #endif
+#ifdef SPTM_VIRT_ESP_WAKE_S
+    /* A test build's timed wake (0: none, macOS's own alarm wakes it) replaces the manifest's */
+    sptm_virt_s2r_wake_s = SPTM_VIRT_ESP_WAKE_S;
+#endif
+#ifdef SPTM_VIRT_ESP_GO_COUNT
+    sptm_virt_s2r_go_count = SPTM_VIRT_ESP_GO_COUNT;
+#endif
 
     if (sptm_virt_esp_ans_handoff())
         ESP_FAIL("ANS hand-off failed\n");
