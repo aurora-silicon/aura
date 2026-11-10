@@ -33,8 +33,8 @@
 #define T6050_GP_PORTS 4
 
 /* The ports brought up, in order. Port 2 is required (the result of pcie_t6050_init); the rest are
- * optional: a stop there leaves that port down and the others as they are. A port whose bridge has an
- * SMC function-reset (port 0: the N1, gP13) has it released before its link comes up. */
+ * optional: a stop there leaves that port down and the others as they are. A port whose bridge has
+ * an SMC function-reset (port 0: the N1, gP13) has it released before its link comes up. */
 static const struct t6050_port {
     int port;
     u32 endpoint_id[2]; /* function 0's vendor/device; the second, if set, an alternative */

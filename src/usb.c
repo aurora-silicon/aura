@@ -225,16 +225,14 @@ static dwc3_dev_t *usb_t6050_init(void (*set_step)(unsigned step))
                            DWC3_GCTL_PRTCAPDIR(DWC3_GCTL_PRTCAP_DEVICE) &&
                        !(read32(regs.dwc + DWC3_DCTL) & DWC3_DCTL_RUN_STOP) &&
                        (read32(regs.dwc + DWC3_DSTS) & DWC3_DSTS_DEVCTRLHLT) &&
-                       !read32(regs.dwc + DWC3_DEVTEN) &&
-                       !read32(regs.dwc + DWC3_DALEPENA);
+                       !read32(regs.dwc + DWC3_DEVTEN) && !read32(regs.dwc + DWC3_DALEPENA);
         if (!retired) {
             printf("CDC USB2: T6050 PIPE consumer is not retired (aon=%x mux=%x)\n", aon, mux);
             return NULL;
         }
         set32(pipe + PIPEHANDLER_AON_GEN, PIPEHANDLER_AON_GEN_DWC3_FORCE_CLAMP_EN);
         clear32(pipe + PIPEHANDLER_AON_GEN, PIPEHANDLER_AON_GEN_DWC3_RESET_N);
-        if (poll32(pipe + PIPEHANDLER_AON_GEN,
-                           PIPEHANDLER_AON_GEN_DWC3_RESET_N, 0, 1000))
+        if (poll32(pipe + PIPEHANDLER_AON_GEN, PIPEHANDLER_AON_GEN_DWC3_RESET_N, 0, 1000))
             return NULL;
         udelay(10);
         printf("CDC USB2: retired Stage 1 gadget held in reset\n");
@@ -277,8 +275,8 @@ static dwc3_dev_t *usb_t6050_init(void (*set_step)(unsigned step))
     clear32(pipe + PIPEHANDLER_AON_GEN, PIPEHANDLER_AON_GEN_DWC3_FORCE_CLAMP_EN);
     set32(pipe + PIPEHANDLER_AON_GEN, PIPEHANDLER_AON_GEN_DWC3_RESET_N);
     if (poll32(pipe + PIPEHANDLER_AON_GEN,
-                       PIPEHANDLER_AON_GEN_DWC3_FORCE_CLAMP_EN | PIPEHANDLER_AON_GEN_DWC3_RESET_N,
-                       PIPEHANDLER_AON_GEN_DWC3_RESET_N, 1000) ||
+               PIPEHANDLER_AON_GEN_DWC3_FORCE_CLAMP_EN | PIPEHANDLER_AON_GEN_DWC3_RESET_N,
+               PIPEHANDLER_AON_GEN_DWC3_RESET_N, 1000) ||
         (read32(regs.phy + USB2PHY_USBCTL) & USB2PHY_USBCTL_USB_MODE) != USB2PHY_USBCTL_RUN ||
         (read32(regs.phy + USB2PHY_CTL) & 0xf) != USB2PHY_CTL_APB_RESET_N) {
         printf("CDC USB2: T6050 reset/clock setup did not latch\n");

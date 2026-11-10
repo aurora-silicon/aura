@@ -481,8 +481,8 @@ static const struct dcp_soc dcp_soc_t6050 = {
     .t6050 = true,
 };
 
-static const struct dcp_soc *const dcp_socs[] = {&dcp_soc_t6030,       &dcp_soc_t8122,
-                                                 &dcp_soc_t6031,       &dcp_soc_t6041,
+static const struct dcp_soc *const dcp_socs[] = {&dcp_soc_t6030,     &dcp_soc_t8122,
+                                                 &dcp_soc_t6031,     &dcp_soc_t6041,
                                                  &dcp_soc_t6041_max, &dcp_soc_t6050};
 
 struct dcp6_seg {
@@ -3183,7 +3183,8 @@ static const struct {
 static T6050_TEXT int t6050_adt_reg(const char *path, int idx, u64 *addr, u64 *size)
 {
     int p[8];
-    return adt_path_offset_trace(adt, path, p) < 0 ? -1 : adt_get_reg(adt, p, "reg", idx, addr, size);
+    return adt_path_offset_trace(adt, path, p) < 0 ? -1
+                                                   : adt_get_reg(adt, p, "reg", idx, addr, size);
 }
 
 static T6050_TEXT int t6050_setprop(void *dt, int which, const char *prop, const void *val, int len)
@@ -3221,7 +3222,8 @@ static T6050_INIT int t6050_check_adt(void)
 
     /* /vram holds the boot framebuffer; it and the firmware stay out of the OS's RAM */
     u64 ram = cur_boot_args.phys_base, ram_size = cur_boot_args.mem_size;
-    u64 fb = cur_boot_args.video.base, fb_size = cur_boot_args.video.stride * cur_boot_args.video.height;
+    u64 fb = cur_boot_args.video.base,
+        fb_size = cur_boot_args.video.stride * cur_boot_args.video.height;
     const struct adt_segment_ranges *seg = adt_getprop(adt, nub, "segment-ranges", &len);
     bool vram_seg = false;
     if (t6050_adt_reg("/vram", 0, &t6050.vram, &t6050.vram_size) || !t6050.vram_size ||
@@ -3304,13 +3306,14 @@ static T6050_INIT int t6050_check_dt(void *dt)
         fdt_get_path(dt, dcp, path[T6050_DCP], T6050_PATH) ||
         fdt_get_path(dt, disp, path[T6050_DISP], T6050_PATH))
         bail("aliases dcp and disp0 are not apple,t6050-dcp and apple,display-subsystem\n");
-    if (parent < 0 || dcp6_cells_2_2(dt, dcp, "dcp") ||
-        !fdt_getprop(dt, parent, "ranges", &len) || len || fdt_subnode_offset(dt, dcp, "panel") < 0)
+    if (parent < 0 || dcp6_cells_2_2(dt, dcp, "dcp") || !fdt_getprop(dt, parent, "ranges", &len) ||
+        len || fdt_subnode_offset(dt, dcp, "panel") < 0)
         bail("dcp is not on an identity-mapped bus, or has no panel child\n");
     if (dcp6_status_disabled(dt, dcp, "dcp") || dcp6_status_disabled(dt, disp, "disp0"))
         return -1;
-    if (fdt_getprop(dt, dcp, "memory-region", NULL) || fdt_getprop(dt, disp, "memory-region", NULL) ||
-        fdt_getprop(dt, dcp, "clocks", NULL) || fdt_getprop(dt, dcp, "apple,bw-scratch", NULL))
+    if (fdt_getprop(dt, dcp, "memory-region", NULL) ||
+        fdt_getprop(dt, disp, "memory-region", NULL) || fdt_getprop(dt, dcp, "clocks", NULL) ||
+        fdt_getprop(dt, dcp, "apple,bw-scratch", NULL))
         bail("the device tree already has a memory-region, clocks or apple,bw-scratch\n");
 
     for (size_t i = 0; i < ARRAY_SIZE(t6050_regs); i++) {
@@ -3318,8 +3321,8 @@ static T6050_INIT int t6050_check_dt(void *dt)
         int idx = fdt_stringlist_search(dt, dcp, "reg-names", t6050_regs[i].name);
         const fdt64_t *reg = fdt_getprop(dt, dcp, "reg", &len);
         if (idx < 0 || !reg || len < (idx + 1) * 16 ||
-            t6050_adt_reg(t6050_regs[i].disp0 ? "/arm-io/disp0" : "/arm-io/dcp",
-                          t6050_regs[i].idx, &a, &s) ||
+            t6050_adt_reg(t6050_regs[i].disp0 ? "/arm-io/disp0" : "/arm-io/dcp", t6050_regs[i].idx,
+                          &a, &s) ||
             fdt64_ld(&reg[2 * idx]) != a || fdt64_ld(&reg[2 * idx + 1]) > s ||
             (i && fdt64_ld(&reg[2 * idx + 1]) != s))
             bail("dcp %s differs from the ADT\n", t6050_regs[i].name);
@@ -3363,7 +3366,8 @@ static T6050_TEXT int t6050_check_darts(void *dt)
     u32 bad = read32(t6050.coproc + ASC_CPU_CONTROL) & ASC_CPU_CONTROL_RUN ? 0 : BIT(3);
     for (int i = 0; i < 3; i++) {
         u32 sid = t6050_streams[i].sid;
-        u32 tcr = read32(base[i] + DART_T8110_TCR(sid)), ttbr = read32(base[i] + DART_T8110_TTBR(sid));
+        u32 tcr = read32(base[i] + DART_T8110_TCR(sid)),
+            ttbr = read32(base[i] + DART_T8110_TTBR(sid));
         if (!(read32(base[i] + DART_T8110_PROTECT) & DART_T8110_PROTECT_TTBR_TCR) ||
             (tcr & T6050_TCR_MASK) != T6050_TCR_WANT || !(ttbr & DART_T8110_TTBR_VALID) ||
             ((u64)FIELD_GET(DART_T8110_TTBR_ADDR, ttbr) << DART_T8110_TTBR_SHIFT) != l1[i])
@@ -3385,12 +3389,11 @@ static T6050_TEXT int t6050_publish(void *dt)
     fdt32_t cells[T6050_CLOCKS], ids[T6050_CLOCKS], v[4];
     int nlen = 0;
 
-    if (firmware_set_fdt(dt, kboot_fdt_path_exact(dt, t6050.path[T6050_DCP]), "apple,firmware-version",
-                         &os_firmware) ||
-        firmware_set_fdt(dt, kboot_fdt_path_exact(dt, t6050.path[T6050_DCP]), "apple,firmware-compat",
-                         &os_firmware) ||
-        t6050_setprop(dt, T6050_DCP, "apple,firmware-uuid", T6050_DCP_UUID,
-                      sizeof(T6050_DCP_UUID)))
+    if (firmware_set_fdt(dt, kboot_fdt_path_exact(dt, t6050.path[T6050_DCP]),
+                         "apple,firmware-version", &os_firmware) ||
+        firmware_set_fdt(dt, kboot_fdt_path_exact(dt, t6050.path[T6050_DCP]),
+                         "apple,firmware-compat", &os_firmware) ||
+        t6050_setprop(dt, T6050_DCP, "apple,firmware-uuid", T6050_DCP_UUID, sizeof(T6050_DCP_UUID)))
         return -1;
 
     /* The bandwidth scratch, in the PMC metadata (disp0 reg[4]), as register window 5 */
@@ -3417,7 +3420,8 @@ static T6050_TEXT int t6050_publish(void *dt)
         cells[i] = cpu_to_fdt32(t6050_add_node(dt, "/", name));
         ids[i] = cpu_to_fdt32(t6050.clk_id[i]);
         nlen += snprintf(names + nlen, sizeof(names) - nlen, "firmware-%u", i) + 1;
-        if (!cells[i] || fdt_setprop_string(dt, kboot_fdt_path_exact(dt, node), "compatible", "fixed-clock") ||
+        if (!cells[i] ||
+            fdt_setprop_string(dt, kboot_fdt_path_exact(dt, node), "compatible", "fixed-clock") ||
             fdt_setprop_u32(dt, kboot_fdt_path_exact(dt, node), "#clock-cells", 0) ||
             fdt_setprop_u32(dt, kboot_fdt_path_exact(dt, node), "clock-frequency", t6050.clk_hz[i]))
             return -1;
@@ -3488,11 +3492,12 @@ static T6050_TEXT int t6050_ext_one(void *dt, int n)
     for (int i = 0; i < 2; i++) {
         snprintf(b, sizeof(b), i ? "/arm-io/dart-dispext%d" : "/arm-io/dart-dcpext%d", n);
         int dn = adt_path_offset(adt, b);
-        if (dn < 0 || t6050_adt_reg(b, 0, &base[i], NULL) || dcp6_adt_u64(dn, "vm-base", &vm_base) ||
-            dcp6_adt_u64(dn, "vm-size", &vm_size))
+        if (dn < 0 || t6050_adt_reg(b, 0, &base[i], NULL) ||
+            dcp6_adt_u64(dn, "vm-base", &vm_base) || dcp6_adt_u64(dn, "vm-size", &vm_size))
             bail("dcpext%d: no %s\n", n, b);
         int user = i ? fdt_subnode_offset(dt, node, "piodma") : node;
-        dart[i] = user < 0 ? user : dcp6_check_iommu(dt, user, a, i ? 16 : 23, base[i], vm_base, vm_size);
+        dart[i] =
+            user < 0 ? user : dcp6_check_iommu(dt, user, a, i ? 16 : 23, base[i], vm_base, vm_size);
         if (dart[i] < 0)
             return -1;
     }
@@ -3519,7 +3524,8 @@ static T6050_TEXT int t6050_ext_one(void *dt, int n)
             bad |= BIT(i);
             continue;
         }
-        u32 tcr = read32(base[i] + DART_T8110_TCR(sid)), ttbr = read32(base[i] + DART_T8110_TTBR(sid));
+        u32 tcr = read32(base[i] + DART_T8110_TCR(sid)),
+            ttbr = read32(base[i] + DART_T8110_TTBR(sid));
         if (!(read32(base[i] + DART_T8110_PROTECT) & DART_T8110_PROTECT_TTBR_TCR) ||
             (tcr & T6050_TCR_MASK) != T6050_TCR_WANT || !(ttbr & DART_T8110_TTBR_VALID) ||
             ((u64)FIELD_GET(DART_T8110_TTBR_ADDR, ttbr) << DART_T8110_TTBR_SHIFT) != l1)

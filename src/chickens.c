@@ -197,8 +197,7 @@ void init_cpu(void)
     int part = FIELD_GET(MIDR_PART, midr);
     int rev = (FIELD_GET(MIDR_REV_HIGH, midr) << 4) | FIELD_GET(MIDR_REV_LOW, midr);
 
-    bool quiet = ((chip_id == T8142 || chip_id == T8152) && !is_boot_cpu()) ||
-                 smp_s2r_published();
+    bool quiet = ((chip_id == T8142 || chip_id == T8152) && !is_boot_cpu()) || smp_s2r_published();
     if (!quiet)
         printf("  CPU part: 0x%x rev: 0x%x\n", part, rev);
 
