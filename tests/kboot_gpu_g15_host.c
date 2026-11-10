@@ -101,6 +101,15 @@ int pmgr_adt_power_enable(const char *path)
         pmgr_off = 0;
     return pmgr_enable_ret;
 }
+int pmgr_adt_power_enable_traced_saved(const char *path, struct pmgr_saved_modes *saved)
+{
+    (void)saved;
+    return pmgr_adt_power_enable(path);
+}
+void pmgr_restore_modes(struct pmgr_saved_modes *saved)
+{
+    (void)saved;
+}
 int pmgr_adt_power_disable(const char *path)
 {
     trace("pmgr disable %s\n", path);
@@ -1963,6 +1972,160 @@ static void t8122_25_identity_failure(void)
 }
 #endif
 
+#ifdef G15_NEW
+/* ---------- T8142 (M5, G17): the reserved regions of the firmware's data ---------- */
+
+/* The J813's sgx regions on macOS 27.0 (26A428), from its ADT. */
+#define T8142_GFX_DATA  0x10002444000UL
+#define T8142_GFX1_DATA 0x1000250c000UL
+#define T8142_DT_FW_DATA 0x10002444000UL /* the kernel DT's own default */
+
+static void t8142_setup(bool shared_ro, u64 ro0_base, bool fw_data_node)
+{
+    chip_id = 0x8142;
+    log_len = trace_len = 0;
+    log_buf[0] = trace_buf[0] = 0;
+    exc_guard = GUARD_OFF;
+    exc_count = 0;
+    n_hnodes = 0;
+    memset(hnodes, 0, sizeof(hnodes));
+
+    const char *sgx = "/arm-io/sgx";
+    struct perf_state states[13];
+    for (int i = 0; i < 13; i++)
+        states[i] = (struct perf_state){i ? 300000000u + 100000000u * i : 0, i ? 600 + 20 * i : 0};
+    hset_u32(sgx, "perf-state-count", 13);
+    hset_u32(sgx, "gpu-num-perf-states", 12);
+    hset_u32(sgx, "perf-state-table-count", 1);
+    hset(sgx, "perf-states", states, sizeof(states));
+    hset(sgx, "perf-states-sram", states, sizeof(states));
+    static const struct {
+        const char *name;
+        u64 base, size;
+    } regions[] = {
+        {"gfx-handoff", 0x103fff30000UL, 0x4000},
+        {"gfx-shared-l2-region", 0x103fff34000UL, 0x4000},
+        {"gfx-shared-region", 0x103fff38000UL, 0x80000},
+        {"gpu-region", 0x103fffb8000UL, 0x4000},
+        {"gfx-data", T8142_GFX_DATA, 0xc0000},
+        {"gfx1-data", T8142_GFX1_DATA, 0xb4000},
+    };
+    for (size_t i = 0; i < ARRAY_SIZE(regions); i++) {
+        char prop[64];
+        snprintf(prop, sizeof(prop), "%s-base", regions[i].name);
+        hset_u64(sgx, strdup(prop), regions[i].base);
+        snprintf(prop, sizeof(prop), "%s-size", regions[i].name);
+        hset_u64(sgx, strdup(prop), regions[i].size);
+    }
+    if (shared_ro) {
+        hset_u64(sgx, "gfx-data-shared-ro-base", ro0_base);
+        hset_u64(sgx, "gfx-data-shared-ro-size", 0x8000);
+        hset_u64(sgx, "gfx1-data-shared-ro-base", 0x100025c0000UL);
+        hset_u64(sgx, "gfx1-data-shared-ro-size", 0x8000);
+    }
+
+    void *dt = dtbuf;
+    CHK(fdt_create_empty_tree(dt, sizeof(dtbuf)));
+    CHK(fdt_setprop_u32(dt, 0, "#address-cells", 2));
+    CHK(fdt_setprop_u32(dt, 0, "#size-cells", 2));
+    int aliases = fdt_add_subnode(dt, 0, "aliases");
+    CHK(aliases);
+    CHK(fdt_setprop_string(dt, aliases, "gpu", "/soc/gpu@582600000"));
+    CHK(fdt_add_subnode(dt, 0, "chosen"));
+    int opps = fdt_add_subnode(dt, 0, "opp-table");
+    CHK(opps);
+    CHK(fdt_setprop_u32(dt, opps, "phandle", 0x40));
+    for (int i = 12; i >= 0; i--) {
+        char name[16];
+        snprintf(name, sizeof(name), "opp%02d", i);
+        int opp = fdt_add_subnode(dt, opps, name);
+        CHK(opp);
+        CHK(fdt_setprop_u64(dt, opp, "opp-hz", 0));
+        CHK(fdt_setprop_u32(dt, opp, "opp-microvolt", 0));
+    }
+    int resv = fdt_add_subnode(dt, 0, "reserved-memory");
+    CHK(resv);
+    static const char *const nodes[] = {"uat-handoff", "uat-l2-pagetables", "uat-pagetables",
+                                        "uat-ttbs", "gfx-data", "gfx1-data"};
+    for (size_t i = 0; i < ARRAY_SIZE(nodes); i++)
+        add_resv(dt, resv, nodes[i], 0x50 + i);
+    if (fw_data_node) {
+        int n = fdt_add_subnode(dt, resv, "fw-data");
+        CHK(n);
+        fdt64_t reg[2];
+        fdt64_st(&reg[0], T8142_DT_FW_DATA);
+        fdt64_st(&reg[1], 0x184000);
+        CHK(fdt_setprop(dt, n, "reg", reg, sizeof(reg)));
+    }
+    int soc = fdt_add_subnode(dt, 0, "soc");
+    CHK(soc);
+    int gpu = fdt_add_subnode(dt, soc, "gpu@582600000");
+    CHK(gpu);
+    CHK(fdt_setprop_string(dt, gpu, "compatible", "apple,agx-t8142"));
+    CHK(fdt_setprop_u32(dt, gpu, "operating-points-v2", 0x40));
+}
+
+static void t8142_reg(const char *path, u64 *base, u64 *size)
+{
+    int n = fdt_path_offset(dtbuf, path), len;
+    assert(n >= 0);
+    const fdt64_t *reg = fdt_getprop(dtbuf, n, "reg", &len);
+    assert(reg && len == 16);
+    *base = fdt64_ld(&reg[0]);
+    *size = fdt64_ld(&reg[1]);
+}
+
+static void t8142_expect_gpu_on(void)
+{
+    assert(strcmp(status_of(dtbuf, "/soc/gpu@582600000"), "disabled"));
+    u64 base, size;
+    t8142_reg("/reserved-memory/gfx-data", &base, &size);
+    assert(base == T8142_GFX_DATA && size == 0xc0000);
+    t8142_reg("/reserved-memory/gfx1-data", &base, &size);
+    assert(base == T8142_GFX1_DATA && size == 0xb4000);
+}
+
+/* macOS 27.0: both roles' __DATA and __DATA_SHARED_RO, contiguous, become fw-data. */
+static void t8142_fw_data(void)
+{
+    t8142_setup(true, T8142_GFX_DATA + 0xc0000, true);
+    CHK(dt_set_gpu_g17(dtbuf, &g17_soc_t8142));
+    t8142_expect_gpu_on();
+    u64 base, size;
+    t8142_reg("/reserved-memory/fw-data", &base, &size);
+    assert(base == T8142_GFX_DATA && size == 0x184000);
+    assert(!strcmp(status_of(dtbuf, "/reserved-memory/fw-data"), "okay"));
+}
+
+/* Firmware without __DATA_SHARED_RO leaves fw-data as the DT has it. */
+static void t8142_fw_data_no_shared_ro(void)
+{
+    t8142_setup(false, 0, true);
+    CHK(dt_set_gpu_g17(dtbuf, &g17_soc_t8142));
+    t8142_expect_gpu_on();
+    assert(prop_len(dtbuf, "/reserved-memory/fw-data", "status") < 0);
+}
+
+/* A __DATA_SHARED_RO placed apart from its __DATA is not covered by one region. */
+static void t8142_fw_data_apart(void)
+{
+    t8142_setup(true, T8142_GFX_DATA + 0xc4000, true);
+    CHK(dt_set_gpu_g17(dtbuf, &g17_soc_t8142));
+    t8142_expect_gpu_on();
+    assert(prop_len(dtbuf, "/reserved-memory/fw-data", "status") < 0);
+    assert(log_has("firmware data segments are not contiguous"));
+}
+
+/* A DT without the node is filled as before. */
+static void t8142_no_fw_data_node(void)
+{
+    t8142_setup(true, T8142_GFX_DATA + 0xc0000, false);
+    CHK(dt_set_gpu_g17(dtbuf, &g17_soc_t8142));
+    t8142_expect_gpu_on();
+    assert(fdt_path_offset(dtbuf, "/reserved-memory/fw-data") < 0);
+}
+#endif
+
 static const struct {
     const char *name;
     void (*fn)(void);
@@ -2047,6 +2210,10 @@ static const struct {
     {"t8122-j615-full14-unknown-image", t8122_j615_full14_unknown_image},
     {"t8122-j615-full14-missing-power", t8122_j615_full14_missing_power},
     {"t8122-j615-full14-fuse-fault", t8122_j615_full14_fuse_fault},
+    {"t8142-fw-data", t8142_fw_data},
+    {"t8142-fw-data-no-shared-ro", t8142_fw_data_no_shared_ro},
+    {"t8142-fw-data-apart", t8142_fw_data_apart},
+    {"t8142-no-fw-data-node", t8142_no_fw_data_node},
 #endif
 };
 
@@ -2067,6 +2234,13 @@ int main(int argc, char **argv)
         return 0;
     }
     return strcmp(argv[1], "list") ? 2 : 0;
+}
+
+/* No fixture here is a T8152. */
+int dt_set_gpu_t8152(void *dt)
+{
+    (void)dt;
+    return 0;
 }
 
 /* These fixtures exercise G15/M3 only. Fail if dispatch unexpectedly reaches M4. */
