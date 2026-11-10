@@ -66,8 +66,8 @@ static int s2r_dcp_resolve(struct s2r_dcp *d)
     d->lo = d->dva & ~0x3fffUL;
     for (u8 sid = 0; sid < 16; sid++) {
         struct s2r_dcp_walk w = {d, 0};
-        if (dart_walk_locked_t8110(d->dart, d->dart_size, sid, ram, mem_size_actual,
-                                   s2r_dcp_visit, &w) >= 0 &&
+        if (dart_walk_locked_t8110(d->dart, d->dart_size, sid, ram, mem_size_actual, s2r_dcp_visit,
+                                   &w) >= 0 &&
             w.found)
             return 1;
     }
@@ -83,9 +83,8 @@ static u64 s2r_dcp_pa(struct s2r_dcp *d, u64 off)
 
 static void s2r_pkt_rec(int idx, int kind, int word, u64 pa, u64 v, bool a2i)
 {
-    sptm_virt_s2r_rec_raw(pa, v,
-                          S2R_PKT_TAG | ((u64)idx << 32) | ((u64)kind << 36) | ((u64)word << 40),
-                          a2i);
+    sptm_virt_s2r_rec_raw(
+        pa, v, S2R_PKT_TAG | ((u64)idx << 32) | ((u64)kind << 36) | ((u64)word << 40), a2i);
 }
 
 /* kind 0: an AP call, 1: a DCP callback, 2: an AP call's output, 3: a callback's output */

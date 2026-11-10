@@ -34,11 +34,11 @@
 #include "memory.h"
 #include "nv2.h"
 #include "pmgr.h"
+#include "s2r_dcp_pkt.h"
 #include "smp.h"
 #include "spmi.h"
 #include "sptm_virt_priv.h"
 #include "sptm_virt_s2r_soc.h"
-#include "s2r_dcp_pkt.h"
 #include "string.h"
 #include "types.h"
 #include "uartproxy.h"
@@ -1122,14 +1122,14 @@ void sptm_virt_s2r_setup(bool cdc)
         return;
     }
     s2r_soc = &s2r_soc_adt;
-    u64 sleep_flags = SPTM_VIRT_S2R | SPTM_VIRT_S2R_GO | SPTM_VIRT_S2R_FULL |
-                      SPTM_VIRT_S2R_COPROC | SPTM_VIRT_S2R_DROP_USB | SPTM_VIRT_S2R_MEM;
-    u64 passive_ok = SPTM_VIRT_S2R_FULL | SPTM_VIRT_S2R_GO | SPTM_VIRT_S2R_COPROC |
-                     SPTM_VIRT_S2R_MEM;
-    if (s2r_soc->timer_only &&
-        ((flags & sleep_flags & ~passive_ok) != SPTM_VIRT_S2R || sptm_virt_s2r_quiesce ||
-         sptm_virt_s2r_usb_retake)) {
-        printf("SPTM-virt[s2r]: a timer-only sleep takes TRACE (0x1) with FULL (0x4), GO (0x2), COPROC "
+    u64 sleep_flags = SPTM_VIRT_S2R | SPTM_VIRT_S2R_GO | SPTM_VIRT_S2R_FULL | SPTM_VIRT_S2R_COPROC |
+                      SPTM_VIRT_S2R_DROP_USB | SPTM_VIRT_S2R_MEM;
+    u64 passive_ok =
+        SPTM_VIRT_S2R_FULL | SPTM_VIRT_S2R_GO | SPTM_VIRT_S2R_COPROC | SPTM_VIRT_S2R_MEM;
+    if (s2r_soc->timer_only && ((flags & sleep_flags & ~passive_ok) != SPTM_VIRT_S2R ||
+                                sptm_virt_s2r_quiesce || sptm_virt_s2r_usb_retake)) {
+        printf("SPTM-virt[s2r]: a timer-only sleep takes TRACE (0x1) with FULL (0x4), GO (0x2), "
+               "COPROC "
                "(0x8) and MEM (0x100) only, quiesce=0, usb_retake=0; debug-link domains not "
                "kept\n");
         sptm_virt_flags &= ~sleep_flags;

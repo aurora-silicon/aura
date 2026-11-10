@@ -179,7 +179,7 @@ static u64 sptm_virt_low_floor(u64 limit)
  * So aura's carve-out goes between what aura and iBoot left low and a cap inside that first
  * 512 MiB, and SPTM manages everything above it.
  */
-#define SPTM_VIRT_LOW_CAP  0x1e000000UL /* 480 MiB: physBase stays under the 512 MiB line */
+#define SPTM_VIRT_LOW_CAP 0x1e000000UL /* 480 MiB: physBase stays under the 512 MiB line */
 #ifndef SPTM_VIRT_LOW_HEAP
 #define SPTM_VIRT_LOW_HEAP (128UL << 20) /* the 64 MiB ring, page tables, per-CPU pages */
 #endif
