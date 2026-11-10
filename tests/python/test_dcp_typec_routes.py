@@ -182,6 +182,11 @@ static int dt_reserve_t8122_dcpext_one(unsigned int n) { assert(0); return -1; }
 static bool dt_t8122_dcpext_armed(void) { assert(0); return false; }
 static int dt_display_transaction(int (*apply)(unsigned int), unsigned int n)
 { assert(0); return -1; }
+/* Native26 receipts are only reached by the disabled-path branch. */
+#define V26_6_2 1
+static struct { int version; } os_firmware;
+static void dt_ext26_step(const char *step) { assert(0); }
+static void dt_ext26_result(int result) { assert(0); }
 static int enable(void *tree, int node, const char *name, const char *value)
 {
     if (inject && node == fdt_path_offset(tree, "dcpext0"))
