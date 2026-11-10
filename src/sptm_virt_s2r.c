@@ -609,8 +609,7 @@ bool sptm_virt_s2r_wfi(u64 *regs, u64 esr)
            cpu, s2r_parked_mask, sptm_virt_s2r_head);
     sptm_virt_s2r_dump_tail(4096);
     struct uartproxy_msg_start start = {
-        .reason = START_HV,
-        .code = 0x53325221, /* 'S2R!' */
+        .reason = START_HV, .code = 0x53325221, /* 'S2R!' */
     };
     uartproxy_run(&start);
     while (1)
