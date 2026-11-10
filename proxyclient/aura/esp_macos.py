@@ -31,7 +31,6 @@ from dataclasses import dataclass, field
 from . import sptm_patch
 from . import sptm_virt_plan as plan_mod
 
-M5_ESP_PARTUUID = "00000000-0000-0000-0000-000000000000"
 ESP_DIR = "aurora/macos"
 STAGE2_NAME = "m1n1/stage2-macos.bin"
 RUNNER = pathlib.Path(__file__).resolve().parents[1] / "tools" / "run_guest_sptm.py"
@@ -105,7 +104,7 @@ class Bundle:
     def manifest_sha(self):
         return hashlib.sha256(self.manifest.encode()).hexdigest()
 
-    def config_line(self, partuuid=M5_ESP_PARTUUID, esp_dir=ESP_DIR):
+    def config_line(self, partuuid, esp_dir=ESP_DIR):
         return f"macos={partuuid};{esp_dir};{self.manifest_sha}\n"
 
 
@@ -199,7 +198,7 @@ def sha256sums(files):
     return "".join(f"{_sha(data)}  {name}\n" for name, data in sorted(files.items()))
 
 
-def write_staging(bundle, stage2, out, *, partuuid=M5_ESP_PARTUUID):
+def write_staging(bundle, stage2, out, *, partuuid):
     """Lay the ESP tree out under out/ (nothing outside it is touched)."""
     out = pathlib.Path(out)
     d = out / ESP_DIR

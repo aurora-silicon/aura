@@ -6,7 +6,7 @@ Writes a staging tree on this machine and touches nothing else. With the inputs 
 runs use (/path/to/capture):
 
   FW=/path/to/macos-images; ST=$FW/stock/Firmware
-  python3 tools/esp-macos/make_bundle.py --stage2 build/aura.bin \\
+  python3 tools/esp-macos/make_bundle.py --stage2 build/aura.bin --esp-partuuid <ESP-PARTUUID> \\
       --sptm $FW/sptm.macho --txm $FW/txm.macho --xnu $FW/kernelcache.macho \\
       --trustcache native-TrustCache.bin --adt live.adt --build-identity $FW/BuildIdentity.plist \\
       --exclave-bundle $ST/image4/exclavecore_bundle.t6050.RELEASE.im4p \\
@@ -49,7 +49,7 @@ def main():
     ap.add_argument("--exclave-integrity", type=pathlib.Path, required=True)
     ap.add_argument("--exclave-trustcache", type=pathlib.Path, required=True)
     ap.add_argument("--out", type=pathlib.Path, required=True, help="staging directory")
-    ap.add_argument("--esp-partuuid", default=esp_macos.M5_ESP_PARTUUID)
+    ap.add_argument("--esp-partuuid", required=True)
     ap.add_argument("--bootargs", help="XNU boot-args (default: run_guest_sptm.py's)")
     ap.add_argument("--flag", action="append", help="a run_guest_sptm.py CONFIG_FLAGS name "
                     f"(default: {' '.join(esp_macos.DEFAULT_FLAGS)})")

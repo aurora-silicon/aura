@@ -1,69 +1,62 @@
-# Booting macOS under aura from the ESP (M5 Pro, J714sAP)
+# macOS under SPTM virtualization from the ESP
 
-An `SPTM_VIRT_ESP=1` Stage 2 boots macOS under SPTM-virt from files on the EFI system partition,
-with no USB host. It does what `proxyclient/tools/run_guest_sptm.py` does over the debug link for
-the M5 trace runs (`/path/to/capture`, `cp.env`), with a C port
-of `plan_boot` and a manifest written ahead of time. Ported from the Neo's version (aura
-`auractl-hw`, b6d05747), without auractl and ATC0-to-macOS.
+`SPTM_VIRT_ESP=1` adds an ESP loader for the M5 Pro (T6050). It reads stock
+firmware files supplied by the machine's owner, checks the manifest's sizes and
+SHA-256 hashes, lays them out using the same plan as `run_guest_sptm.py`, and
+enters the virtualized SPTM. No firmware binaries belong in this repository.
 
-Linux's boot does not change: the mode is its own image, `m1n1/stage2-macos.bin`, started for one
-boot by Stage 1's `aura-try` marker.
+This series depends on the public T6050 Linux/storage series for the shared
+ANS, RTKit, SART, PCIe and boot-window infrastructure. Apply that dependency
+when building the combined ESP path; do not replay duplicate shared helpers.
 
 ## Build
 
-    make clean
-    make USE_CLANG=1 BUILDSTD=1 CHAINLOADING=1 ESP_STAGE2=1 SPTM_VIRT=1 SPTM_VIRT_ESP=1 DEBUGUSB_PROXY=1
+```sh
+make USE_CLANG=1 BUILDSTD=1 CHAINLOADING=1 ESP_STAGE2=1 DEBUGUSB_PROXY=1 SPTM_VIRT=1 SPTM_VIRT_ESP=1
+```
 
-## Files on the ESP
+For a plain boot using an existing trace manifest, set these build overrides:
+`EXTRA_CFLAGS="-DSPTM_VIRT_ESP_TRACE=0 -DSPTM_VIRT_ESP_WAKE_S=0 -DSPTM_VIRT_ESP_GO_COUNT=0"`.
+This suppresses instrumentation and aura's timed-wake/stop settings. It does not
+establish that full macOS sleep or wake works.
 
-    m1n1/stage2-macos.bin          aura, then the line macos=<PARTUUID>;aurora/macos;<manifest SHA-256>
-    aurora/macos/manifest.txt      sizes, SHA-256s, segments, patches, hidden nodes, S2R settings
-    aurora/macos/sptm.bin txm.bin kernelcache trustcache.bin
-    aurora/macos/cl4-bundle.bin exclave-integrity.bin exclave-trustcache.bin
-    aurora/macos/SHA256SUMS        for the install script; aura does not read it
+## Bundle
 
-About 155 MiB for 26A428. These are Apple's binaries, stock, for this Mac's owner; nothing here
-puts them in git. aura applies its patches in RAM after it has checked the hashes.
+`tools/esp-macos/make_bundle.py` takes the stock images, their BuildIdentity,
+and a live ADT for the debug port's nodes and PHYs. Supply the target ESP's
+PARTUUID explicitly with `--esp-partuuid`; there is no machine-specific default.
+The tool writes a staging directory, leaving the disk untouched:
 
-## Make the bundle
+```text
+m1n1/stage2-macos.bin       aura + macos=<PARTUUID>;aurora/macos;<manifest SHA-256>
+aurora/macos/manifest.txt   sizes, hashes, segments, patches, hidden nodes, S2R settings
+aurora/macos/              stock SPTM, TXM, kernelcache, trustcache and exclave files
+```
 
-`tools/esp-macos/make_bundle.py` (its docstring has the full command for the trace lane's inputs)
-takes the images, a live device tree of this Mac (for the debug port's nodes and PHYs) and
-BuildIdentity.plist, and writes a staging tree. It uses the runner's own code for what the runner
-decides from files: hidden nodes, XNU quirks, SPTM patch sites and MTE sequence, cL4 regions,
-boot-args. `--flag`, `--s2r NAME=VALUE` and `--ans-drop` change the trace settings and the ANS
-nub; the defaults are cp.env's (TRACE, GO, FULLTRACE, COPROC; dcp_pkt 1, wake_s 30, go_count 1).
+The manifest's trace and S2R flags are explicit capture settings. Instrumentation
+can affect the guest; successful plain boots do not qualify every hook set.
+`tests/python/test_esp_macos.py` contains the C/Python planner comparison.
 
-`tests/python/test_esp_macos.py` checks the C planner against plan_boot on real inputs
-(`AURA_ESP_FW`, `AURA_ESP_TC`, `AURA_ESP_ADTS`).
+## Select and boot
 
-## Install and select
+Installation is separate from selection. On the target Linux system, the
+installer takes `--esp <mountpoint> --partuuid <uuid> [--dry-run] <staging>`.
+It checks the partition, manifest and copied files. It never writes APFS.
 
-On the M5's SSD Linux, as root, with the ESP at /boot:
+The enrolled M5 Stage 1 used during validation did **not** consume `aura-try`.
+Do not rely on `arm_trial.sh` for an unattended M5 boot. The validated entry
+route is a host chainload caught in the existing Stage 2's DebugUSB window,
+with `nvme.adopt=live-rtkit-v1` and `aura.host-window=done`. It leaves the ESP
+unchanged and returns to the recorded default Linux boot after the session.
+A different enrolled Stage 1 needs its own selection-path qualification.
 
-    sh install_esp.sh --esp /boot --dry-run <staging>
-    sh install_esp.sh --esp /boot <staging>
-    sh arm_trial.sh --esp /boot            # the next boot only; --disarm to undo
+The loader stages files below MTE tag storage, preserves iBoot's end of RAM
+from ADT region-id-24, and reads that value without assuming 8-byte alignment.
+After using NVMe it disables the controller and quiesces both sides of RTKit
+for XNU's ANS handoff. Failure before entry returns to the proxy. The tested
+T6050 watchdog layout does not support the trial watchdog, so a host-controlled
+reset is required for a stalled session.
 
-The install writes only `aurora/macos/*` and `m1n1/stage2-macos.bin`, checks the partition's
-PARTUUID, and verifies what it wrote. Stage 1 spends the marker (rewrites it to `spent`) before it
-loads the image, so every later boot is Linux again.
-
-## What happens at boot
-
-Stage 1 chainloads `m1n1/stage2-macos.bin` with its ANS session live. The image opens its debugusb
-window if a host reads the console, adopts the ANS session, reads the manifest, then every file
-straight into the top of the managed window (the kernelcache alone nearly fills aura's heap),
-checking each size and SHA-256. It lays the images out, edits the device tree, patches SPTM, hands
-ANS over quiesced (controller off, AP and IOP QUIESCED, as Stage 1's own proxy leaves it, the only
-state XNU was seen to take), disarms the trial watchdog and enters SPTM with the S2R tracer
-configured.
-
-Any refusal before entry prints the reason on the console and the panel and returns; the trial
-watchdog (178 s) then restarts the Mac into Linux.
-
-## Reading the trace
-
-At the S2R stop (go_count wakes, then the next commit withheld) aura waits in its proxy on the
-DockChannel console. A host re-arms DebugUSB, restarts kisd and reads the ring with the trace
-lane's `tools/dump.py <rundir>` (`M5_AURA_ELF` = this image's aura-raw.elf).
+macOS reaches loginwindow and SSH on qualified ESP images. A timer commit/wake
+capture is distinct from full macOS wake: sleep-entry ACC rail-gating timeouts
+and full wake remain under investigation. No full-wake claim is made here.

@@ -3,7 +3,7 @@
 #
 # Copy a make_bundle.py staging tree onto the EFI system partition, and nothing else.
 #
-#   install_esp.sh [--esp <mountpoint>] [--partuuid <uuid>] [--dry-run] <staging dir>
+#   install_esp.sh [--esp <mountpoint>] --partuuid <uuid> [--dry-run] <staging dir>
 #
 # It only ever writes aurora/macos/* and m1n1/stage2-macos.bin. It never touches
 # m1n1/hv_boot.bin (the Linux Stage 2), aurora-linux/, the Linux kernels, the boot loader, the aura-try marker or NVRAM, so how
@@ -15,7 +15,7 @@
 # finds it by PARTUUID and never mounts, formats or repartitions anything.
 set -eu
 
-PARTUUID=00000000-0000-0000-0000-000000000000
+PARTUUID=
 ESP=
 DRY=0
 while [ $# -gt 0 ]; do
@@ -27,12 +27,13 @@ while [ $# -gt 0 ]; do
         *) break ;;
     esac
 done
-[ $# -eq 1 ] || { echo "usage: $0 [--esp <mountpoint>] [--partuuid <uuid>] [--dry-run] <staging dir>" >&2; exit 2; }
+[ $# -eq 1 ] || { echo "usage: $0 [--esp <mountpoint>] --partuuid <uuid> [--dry-run] <staging dir>" >&2; exit 2; }
 SRC=$1
 BUNDLE=aurora/macos
 STAGE2=m1n1/stage2-macos.bin
 
 die() { echo "install_esp: $*" >&2; exit 1; }
+[ -n "$PARTUUID" ] || die "--partuuid is required"
 
 if command -v sha256sum >/dev/null 2>&1; then
     sha() { sha256sum "$1" | cut -d' ' -f1; }
