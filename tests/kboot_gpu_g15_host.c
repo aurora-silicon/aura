@@ -101,6 +101,15 @@ int pmgr_adt_power_enable(const char *path)
         pmgr_off = 0;
     return pmgr_enable_ret;
 }
+int pmgr_adt_power_enable_traced_saved(const char *path, struct pmgr_saved_modes *saved)
+{
+    (void)saved;
+    return pmgr_adt_power_enable(path);
+}
+void pmgr_restore_modes(struct pmgr_saved_modes *saved)
+{
+    (void)saved;
+}
 int pmgr_adt_power_disable(const char *path)
 {
     trace("pmgr disable %s\n", path);
@@ -2067,6 +2076,13 @@ int main(int argc, char **argv)
         return 0;
     }
     return strcmp(argv[1], "list") ? 2 : 0;
+}
+
+/* No fixture here is a T8152. */
+int dt_set_gpu_t8152(void *dt)
+{
+    (void)dt;
+    return 0;
 }
 
 /* These fixtures exercise G15/M3 only. Fail if dispatch unexpectedly reaches M4. */
