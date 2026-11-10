@@ -30,6 +30,8 @@ SECTIONS {
         *hv/hv_virtio.o(.text .text.*)
         *hv/hv_vuart.o(.text .text.*)
         *hv/hv_wdt.o(.text .text.*)
+        /* Run-once OS preparation also fits in this slot. */
+        *kboot.o(.text .text.*)
     } :text
     .text : ALIGN(0x10000) {
         *(.text)
