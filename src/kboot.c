@@ -10224,7 +10224,7 @@ int kboot_boot(void *kernel)
         return -1;
     }
     /* Linux's deep sleep needs them to bring ANS's APCIe block back. */
-    if (!ret && pcie_apcie_tables_fdt(dt) < 0)
+    if (!ret && pcie_apcie_tables_fdt(dt, dt_bufsize) < 0)
         printf("kboot: APCIe tables not published; deep sleep stays refused\n");
     if (chip_id == T8140) {
         if (ret < 0) {

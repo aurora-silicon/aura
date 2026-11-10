@@ -395,14 +395,8 @@ static int pcie_apcie_host(void *dt, int *path)
 }
 
 /* 0 on a Mac whose ANS doesn't run on the APCIe block: nothing to publish. */
-int pcie_apcie_tables_fdt(void *dt)
+static int pcie_apcie_tables_publish(void *dt, const char *apcie)
 {
-    int ans = adt_path_offset(adt, "/arm-io/ans");
-    if (ans < 0 || !adt_get_property(adt, ans, "nvme-secure-bar"))
-        return 0;
-
-    const char *apcie =
-        adt_path_offset(adt, "/arm-io/apcie") >= 0 ? "/arm-io/apcie" : "/arm-io/apcie0";
     char bridge[32];
     int path[8], bridge_path[8];
     snprintf(bridge, sizeof(bridge), "%s/pci-bridge0", apcie);
@@ -420,16 +414,44 @@ int pcie_apcie_tables_fdt(void *dt)
     for (size_t i = 0; i < ARRAY_SIZE(pcie_apcie_tables); i++) {
         int from = pcie_apcie_tables[i].port ? adt_bridge : adt_node;
         int n = pcie_apcie_table_fdt(dt, host, from, path, i);
-        if (n < 0) {
-            for (size_t j = 0; j < i; j++)
-                fdt_delprop(dt, pcie_apcie_table_node(dt, host, j), pcie_apcie_tables[j].fdt);
+        if (n < 0)
             return -1;
-        }
         records += n;
     }
 
-    printf("FDT: %s tables published, %d records\n", apcie, records);
     return records;
+}
+
+/* Use the already reserved buffer size, even if the caller packed the tree.
+ * Commit all ten properties together; an error preserves the original DT,
+ * including any properties that were present before this export attempt.
+ */
+int pcie_apcie_tables_fdt(void *dt, int capacity)
+{
+    int ans = adt_path_offset(adt, "/arm-io/ans");
+    if (ans < 0 || !adt_get_property(adt, ans, "nvme-secure-bar"))
+        return 0;
+    if (capacity <= 0 || (u32)capacity < fdt_totalsize(dt))
+        return -1;
+
+    void *staged = malloc(capacity);
+    if (!staged)
+        return -1;
+    const char *apcie =
+        adt_path_offset(adt, "/arm-io/apcie") >= 0 ? "/arm-io/apcie" : "/arm-io/apcie0";
+    int ret = fdt_open_into(dt, staged, capacity);
+    if (!ret)
+        ret = pcie_apcie_tables_publish(staged, apcie);
+    if (ret >= 0) {
+        if (fdt_pack(staged))
+            ret = -1;
+        else {
+            memcpy(dt, staged, fdt_totalsize(staged));
+            printf("FDT: %s tables published, %d records\n", apcie, ret);
+        }
+    }
+    free(staged);
+    return ret;
 }
 
 int pcie_disable_j713_fdt(void *dt)
