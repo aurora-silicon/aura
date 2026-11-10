@@ -233,10 +233,10 @@ static dwc3_dev_t *usb_t6050_init(void (*set_step)(unsigned step))
         }
         set32(pipe + PIPEHANDLER_AON_GEN, PIPEHANDLER_AON_GEN_DWC3_FORCE_CLAMP_EN);
         clear32(pipe + PIPEHANDLER_AON_GEN, PIPEHANDLER_AON_GEN_DWC3_RESET_N);
-        if (usb_cdc_poll32(pipe + PIPEHANDLER_AON_GEN,
+        if (poll32(pipe + PIPEHANDLER_AON_GEN,
                            PIPEHANDLER_AON_GEN_DWC3_RESET_N, 0, 1000))
             return NULL;
-        usb_cdc_wait_us(10);
+        udelay(10);
         printf("CDC USB2: retired Stage 1 gadget held in reset\n");
     } else if (mux != 0 && mux != 2 && mux != 0x42) {
         printf("CDC USB2: unknown T6050 PIPE producer (aon=%x mux=%x)\n", aon, mux);
@@ -244,11 +244,11 @@ static dwc3_dev_t *usb_t6050_init(void (*set_step)(unsigned step))
     }
     set32(pipe + PIPEHANDLER_AON_GEN, PIPEHANDLER_AON_GEN_DWC3_FORCE_CLAMP_EN);
     mask32(pipe + PIPEHANDLER_MUX_CTRL, 0x70, 0);
-    usb_cdc_wait_us(10);
+    udelay(10);
     mask32(pipe + PIPEHANDLER_MUX_CTRL, 3, 2);
-    usb_cdc_wait_us(10);
+    udelay(10);
     mask32(pipe + PIPEHANDLER_MUX_CTRL, 0x70, 0x40);
-    usb_cdc_wait_us(10);
+    udelay(10);
     if ((read32(pipe + PIPEHANDLER_MUX_CTRL) & 0x73) != 0x42)
         return NULL;
 
@@ -261,22 +261,22 @@ static dwc3_dev_t *usb_t6050_init(void (*set_step)(unsigned step))
     set32(regs.phy + USB2PHY_SIG, USB2PHY_SIG_VBUSDET_FORCE_VAL | USB2PHY_SIG_VBUSDET_FORCE_EN |
                                       USB2PHY_SIG_VBUSVLDEXT_FORCE_VAL |
                                       USB2PHY_SIG_VBUSVLDEXT_FORCE_EN);
-    usb_cdc_wait_us(10000);
+    udelay(10000);
     clear32(regs.phy + USB2PHY_CTL, USB2PHY_CTL_SIDDQ);
-    usb_cdc_wait_us(10);
+    udelay(10);
     clear32(regs.phy + USB2PHY_CTL, USB2PHY_CTL_RESET | USB2PHY_CTL_PORT_RESET);
     set32(regs.digital, BIT(0) | BIT(3)); /* USB2 event counter enable/load */
     set32(regs.phy + USB2PHY_CTL, USB2PHY_CTL_APB_RESET_N);
     clear32(regs.phy + USB2PHY_MISCTUNE,
             USB2PHY_MISCTUNE_APBCLK_GATE_OFF | USB2PHY_MISCTUNE_REFCLK_GATE_OFF);
-    usb_cdc_wait_us(30);
-    usb_cdc_wait_us(5000);
+    udelay(30);
+    udelay(5000);
     mask32(regs.phy + USB2PHY_USBCTL, USB2PHY_USBCTL_USB_MODE, USB2PHY_USBCTL_RUN);
 
     set32(pipe + PIPEHANDLER_NONSELECTED_OVERRIDE, PIPEHANDLER_DUMMY_PHY_EN);
     clear32(pipe + PIPEHANDLER_AON_GEN, PIPEHANDLER_AON_GEN_DWC3_FORCE_CLAMP_EN);
     set32(pipe + PIPEHANDLER_AON_GEN, PIPEHANDLER_AON_GEN_DWC3_RESET_N);
-    if (usb_cdc_poll32(pipe + PIPEHANDLER_AON_GEN,
+    if (poll32(pipe + PIPEHANDLER_AON_GEN,
                        PIPEHANDLER_AON_GEN_DWC3_FORCE_CLAMP_EN | PIPEHANDLER_AON_GEN_DWC3_RESET_N,
                        PIPEHANDLER_AON_GEN_DWC3_RESET_N, 1000) ||
         (read32(regs.phy + USB2PHY_USBCTL) & USB2PHY_USBCTL_USB_MODE) != USB2PHY_USBCTL_RUN ||
