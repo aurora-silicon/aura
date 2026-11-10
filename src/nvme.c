@@ -12,10 +12,17 @@
 #include "string.h"
 #include "utils.h"
 
-#define NVME_TIMEOUT          1000000
+#define NVME_TIMEOUT 1000000
+/*
+ * Writes and flushes (only the aura-try marker is ever written) may wait on the drive's write
+ * cache and background work after a warm reboot; Linux allows every I/O command 30 s.
+ */
+#define NVME_WRITE_TIMEOUT    30000000
 #define NVME_ENABLE_TIMEOUT   5000000
 #define NVME_SHUTDOWN_TIMEOUT 5000000
 #define NVME_QUEUE_SIZE       64
+
+static u32 nvme_cmd_timeout_us = NVME_TIMEOUT;
 
 #define NVME_CC            0x14
 #define NVME_CC_SHN        GENMASK(15, 14)
@@ -345,7 +352,7 @@ static bool nvme_exec_command(struct nvme_queue *q, struct nvme_command *cmd, u6
         write32(nvme_lsq_base + NVME_DB_LINEAR_IOSQ, tag);
     nvme_poll_syslog();
 
-    timeout = timeout_calculate(NVME_TIMEOUT);
+    timeout = timeout_calculate(nvme_cmd_timeout_us);
     struct nvme_completion cqe;
     while (!timeout_expired(timeout)) {
         nvme_poll_syslog();
@@ -397,6 +404,23 @@ static bool nvme_exec_command(struct nvme_queue *q, struct nvme_command *cmd, u6
     }
 
     return true;
+}
+
+/* A write or flush, timed: the Stage 1 log then shows how close a marker spend came. */
+static bool nvme_exec_io_write(struct nvme_command *cmd, const char *what)
+{
+    u64 start = get_ticks();
+    nvme_cmd_timeout_us = NVME_WRITE_TIMEOUT;
+    bool ok = nvme_exec_command(&ioq, cmd, NULL);
+    nvme_cmd_timeout_us = NVME_TIMEOUT;
+    printf("nvme: %s %s in %lu us\n", what, ok ? "done" : "FAILED",
+           (unsigned long)ticks_to_usecs(get_ticks() - start));
+    return ok;
+}
+
+bool nvme_io_failed(void)
+{
+    return nvme_reboot_required || ioq.failed || adminq.failed;
 }
 
 bool nvme_init(void)
@@ -887,7 +911,7 @@ bool nvme_flush(u32 nsid)
     cmd.nsid = nsid;
     nvme_wrote = true;
 
-    return nvme_exec_command(&ioq, &cmd, NULL);
+    return nvme_exec_io_write(&cmd, "flush");
 }
 
 static bool nvme_submit_read(u32 nsid, u64 lba, void *buffer, u32 count, u64 prp2)
@@ -985,5 +1009,5 @@ bool nvme_write(u32 nsid, u64 lba, const void *buffer)
     /* Shut the controller down normally so it writes back its cache. */
     nvme_wrote = true;
 
-    return nvme_exec_command(&ioq, &cmd, NULL);
+    return nvme_exec_io_write(&cmd, "write");
 }

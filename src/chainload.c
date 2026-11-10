@@ -400,6 +400,18 @@ int chainload_load(const char *spec, char **vars, size_t *var_cnt, size_t var_ca
     trial_path[0] = 0;
     ret = rust_load_image(spec, &image, &size, &proxy_request, may_trial ? trial_path : NULL,
                           sizeof(trial_path));
+    /*
+     * A command that timed out fails every later one of this NVMe session, so one failure
+     * (spending an aura-try marker writes and flushes the ESP) also lost the configured image.
+     * Start NVMe again once and read that image, leaving any marker alone, rather than stopping.
+     */
+    if (ret != 0 && nvme_io_failed()) {
+        printf("chainload: NVMe I/O failed; restarting NVMe for the configured image\n");
+        may_trial = false;
+        trial_path[0] = 0;
+        if (nvme_shutdown() && nvme_init())
+            ret = rust_load_image(spec, &image, &size, NULL, NULL, 0);
+    }
 #ifndef ESP_STAGE2
     /*
      * An aura-proxy file at the ESP root asks Stage 1 to wait for a host. Hand NVMe

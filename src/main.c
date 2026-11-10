@@ -268,6 +268,9 @@ void run_actions(void)
                "  Check that the file this Stage 1 names exists on its EFI partition.\n"
                "  Hold the power button to shut down, then hold it again to choose another "
                "system.\n");
+    if (stage1_config_target() && wdt_boot_watchdog_armed())
+        printf("  Without a host, this Mac restarts by itself within %u s to try again.\n",
+               WDT_BOOT_SECONDS);
 
     if (payload_action == STAGE1_PAYLOAD_HALT)
         panic("Stage 1: no safe proxy carrier after CDC failure\n");
@@ -361,6 +364,12 @@ void aura_main(void)
     wdt_disable();
     if (aura_trial_enabled() && wdt_arm_trial())
         printf("WDT: could not arm the trial watchdog\n");
+#if defined(CHAINLOADING) && !defined(ESP_STAGE2)
+    else if (!aura_trial_enabled() && wdt_arm_boot())
+        printf("WDT: could not arm the boot watchdog\n");
+    else if (!aura_trial_enabled())
+        printf("WDT: boot watchdog armed (%u s)\n", WDT_BOOT_SECONDS);
+#endif
 #ifndef BRINGUP
     if (pmgr_init() && chip_id == T8140)
         panic("T8140 PMGR initialization failed\n");
