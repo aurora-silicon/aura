@@ -173,12 +173,6 @@ _deep_wfi_helper:
 
     ret
 
-.globl _smp_reenter_park
-.type _smp_reenter_park, @function
-_smp_reenter_park:
-    mov sp, x1
-    b smp_park_loop
-
 /* T8152 Linux spin-table entry, entered on an existing secondary stack. */
 .globl smp_kernel_park
 .type smp_kernel_park, @function

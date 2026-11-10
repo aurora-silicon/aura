@@ -311,6 +311,95 @@ static dart_dev_t *dart_gen3_adopt_adt(int node, uintptr_t base, int device, boo
     return dart;
 }
 
+/*
+ * Give an unused Gen3 stream a fresh two-level translation root, as the
+ * T8152 USB controller driver does for its DART before the controller runs.
+ * This is only for a stream nobody owns yet: the DART must be unlocked, the
+ * stream disabled with no valid root, and its TCR set to plain translation.
+ * Anything else (a display stream iBoot set up, a locked DART) is refused;
+ * those are adopted with dart_init_adt(..., keep_pts=true) instead.
+ */
+dart_dev_t *dart_gen3_init_adt_cold(const char *path, int instance, int device)
+{
+    int dart_path[8];
+    int node = adt_path_offset_trace(adt, path, dart_path);
+    u64 base, register_size;
+    if (node < 0 || !adt_is_compatible(adt, node, "dart,gen3") ||
+        adt_get_reg(adt, dart_path, "reg", instance, &base, &register_size) < 0 ||
+        register_size < DART_GEN3_ROUTE + 4) {
+        printf("dart: %s is not a Gen3 DART\n", path);
+        return NULL;
+    }
+
+    int tlbi_path[8];
+    int tlbi_node = adt_path_offset_trace(adt, "/arm-io/dart-tlbi-aperture", tlbi_path);
+    u64 aperture, size, offset;
+    u32 sid_count;
+    if (tlbi_node < 0 || adt_get_reg(adt, tlbi_path, "reg", 0, &aperture, &size) < 0 ||
+        ADT_GETPROP(adt, node, "tlbi-aperture-offset", &offset) < 0 ||
+        ADT_GETPROP(adt, node, "sid-count", &sid_count) < 0 || sid_count > 256 || device < 0 ||
+        (u32)device >= sid_count || size < 16 || offset > size - 16 || (offset & 15)) {
+        printf("dart: invalid Gen3 SID/TLBI metadata for %s\n", path);
+        return NULL;
+    }
+
+    u32 config = read32(base);
+    u32 version = read32(base + 8) & 0xffff;
+    u32 protect = read32(base + DART_T8110_PROTECT) | read32(base + DART_T8110_PROTECT + 8);
+    u32 enabled = read32(base + DART_T8110_ENABLE_STREAMS + 4 * (device >> 5));
+    u32 tcr = read32(base + DART_T8110_TCR_OFF + 4 * device);
+    u32 ttbr = read32(base + DART_T8110_TTBR_OFF + 4 * device);
+    if (((config >> 24) & 15) != 14 || version != 0x300 || protect ||
+        (enabled & BIT(device & 31)) || (ttbr & DART_T8110_TTBR_VALID) ||
+        tcr != DART_T8110_TCR_TRANSLATE_ENABLE) {
+        printf("dart: %s stream %d is not an idle Gen3 stream (cfg %#x ver %#x prot %#x en %#x "
+               "tcr %#x ttbr %#x)\n",
+               path, device, config, version, protect, enabled, tcr, ttbr);
+        return NULL;
+    }
+
+    dart_dev_t *dart = calloc(1, sizeof(*dart));
+    if (!dart)
+        return NULL;
+    u64 *root = memalign(SZ_16K, SZ_16K);
+    if (!root) {
+        free(dart);
+        return NULL;
+    }
+    memset(root, 0, SZ_16K);
+    dc_cvac_range(root, SZ_16K);
+    u64 root_page = (uintptr_t)root >> DART_T8110_TTBR_SHIFT;
+    if (root_page > (DART_T8110_TTBR_ADDR >> 2)) {
+        free(root);
+        free(dart);
+        return NULL;
+    }
+
+    dart->regs = base;
+    dart->device = device;
+    dart->type = DART_GEN3;
+    dart->params = &dart_gen3;
+    dart->keep = false;
+    dart->locked = false;
+    dart->l1[0] = root;
+    dart->tlbi_aperture = aperture + offset;
+    dart->tlbi_route = read32(base + DART_GEN3_ROUTE) & 15;
+    char prop[24];
+    snprintf(prop, sizeof(prop), "vm-base-%d", device);
+    if (ADT_GETPROP(adt, node, prop, &dart->vm_base) < 0)
+        ADT_GETPROP(adt, node, "vm-base", &dart->vm_base);
+
+    write32(base + DART_T8110_TTBR_OFF + 4 * device,
+            DART_T8110_TTBR_VALID |
+                FIELD_PREP(DART_T8110_TTBR_ADDR, ((uintptr_t)root) >> DART_T8110_TTBR_SHIFT));
+    dart_gen3_tlb_invalidate(dart);
+    write32(base + DART_T8110_ENABLE_STREAMS + 4 * (device >> 5), enabled | BIT(device & 31));
+
+    printf("dart: new Gen3 SID %d root at 0x%lx, root %p, TLBI route %u\n", device, base, root,
+           dart->tlbi_route);
+    return dart;
+}
+
 dart_dev_t *dart_init(uintptr_t base, u8 device, bool keep_pts, enum dart_type_t type)
 {
     if (type == DART_GEN3) {

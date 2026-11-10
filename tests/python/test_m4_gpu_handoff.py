@@ -19,6 +19,8 @@ typedef uint64_t u64;
 typedef uint32_t u32;
 #define T8132 0x8132
 #define SZ_16K 0x4000
+enum { V26_6, V26_6_2 };
+static struct { int version; } os_firmware;
 struct adt_segment_ranges { u64 phys, iova, remap; u32 size, unk; };
 static void *adt;
 static unsigned chip_id = T8132;
@@ -55,9 +57,11 @@ int main(void)
 {
     char blob[32768];
     const char *regions[] = {"uat-ttbs", "uat-pagetables", "uat-handoff", "uat-shared-l2", "gpu-fw-text", "gpu-fw-data"};
-    for (fault = 0; fault <= 12; fault++) {
+    /* 13: another M4 Mac on 26.6.2 publishes; 14: the J713 on 26.6 still does. */
+    for (fault = 0; fault <= 14; fault++) {
+        os_firmware.version = fault == 14 ? V26_6 : V26_6_2;
         assert(!fdt_create_empty_tree(blob, sizeof(blob)));
-        assert(!fdt_setprop_string(blob, 0, "compatible", "apple,j713"));
+        assert(!fdt_setprop_string(blob, 0, "compatible", fault == 13 ? "apple,j604" : "apple,j713"));
         int gpu = fdt_add_subnode(blob, 0, "gpu"); assert(gpu >= 0);
         assert(!fdt_setprop_string(blob, gpu, "compatible", "apple,agx-t8132"));
         assert(!fdt_setprop_u32(blob, gpu, "apple,g16-handoff-version", 99));
@@ -82,7 +86,10 @@ int main(void)
         if (fault == 6) bases[0] = (1ULL << 42);
         if (fault == 9) sizes[0] = UINT64_MAX - 0x3fff;
         if (fault == 10) bases[0]++;
-        if (fault == 11) assert(!fdt_setprop_string(blob, 0, "compatible", "apple,j715"));
+        if (fault == 11) {
+            assert(!fdt_setprop_string(blob, 0, "compatible", "apple,j715"));
+            os_firmware.version = V26_6;
+        }
         if (fault == 12) {
             gpu = fdt_path_offset(blob, "/gpu");
             assert(!fdt_setprop_string(blob, gpu, "compatible", "apple,unsupported-gpu"));
@@ -94,7 +101,7 @@ int main(void)
         gpu = fdt_path_offset(blob, "/gpu");
         int len;
         const fdt32_t *version = fdt_getprop(blob, gpu, "apple,g16-handoff-version", &len);
-        if (fault) {
+        if (fault && fault < 13) {
             assert(!result && !version && !fdt_num_mem_rsv(blob));
             const char *status = fdt_getprop(blob, gpu, "status", NULL);
             assert(status && !strcmp(status, "disabled"));

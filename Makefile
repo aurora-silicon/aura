@@ -115,20 +115,6 @@ ifeq ($(DEBUGUSB_PROXY),1)
 CFG += DEBUGUSB_PROXY
 endif
 
-# Development builds only: run the OS at virtual EL2 under FEAT_NV2 without
-# the aura-nv2 boot argument (for test images whose boot arguments are fixed).
-ifeq ($(NV2_BOOT),1)
-CFG += NV2_BOOT
-endif
-
-# Development builds only: log the first FEAT_NV2 guest entries and exits.
-ifeq ($(NV2_TRACE),1)
-CFG += NV2_TRACE
-endif
-ifeq ($(NV2_TRACE_PRINT),1)
-CFG += NV2_TRACE_PRINT
-endif
-
 
 LDFLAGS := -EL -maarch64elf --no-undefined -X -Bsymbolic \
 	-z notext --no-apply-dynamic-relocs --orphan-handling=warn \
@@ -227,10 +213,7 @@ OBJECTS := \
 	stage1_proxy.o \
 	sio.o \
 	smc.o \
-	monitor.o \
-	nv2.o nv2_asm.o \
-	pv_kvm.o \
-	psci.o \
+	ctxr_exec.o \
 	smp.o \
 	spmi.o pmu_counter.o ace3.o \
 	start.o \
@@ -240,7 +223,7 @@ OBJECTS := \
 	tps6598x.o tps6598x_command_core.o \
 	uart.o \
 	uartproxy.o \
-	usb.o usb_dwc3.o usb_dwc3_hs.o usb_dwc3_ss.o usb_cdc.o usb_cdc_atc.o usb_cdc_bulk.o usb_cdc_ss_desc.o usb_cdc_state.o \
+	usb.o usb_t8152.o usb_dwc3.o usb_dwc3_hs.o usb_dwc3_ss.o usb_cdc.o usb_cdc_atc.o usb_cdc_bulk.o usb_cdc_ss_desc.o usb_cdc_state.o \
 	utils.o utils_asm.o \
 	vsprintf.o \
 	wdt.o \

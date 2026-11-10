@@ -10,6 +10,7 @@
 #include "assert.h"
 #include "boot_options.h"
 #include "clk.h"
+#include "ctxr_exec.h"
 #include "dapf.h"
 #include "devicetree.h"
 #include "display.h"
@@ -29,11 +30,8 @@
 #include "malloc.h"
 #include "mcc.h"
 #include "memory.h"
-#include "monitor.h"
-#include "nv2.h"
 #include "pcie.h"
 #include "pmgr.h"
-#include "pv_kvm.h"
 #include "rtkit.h"
 #include "sart.h"
 #include "sep.h"
@@ -628,6 +626,158 @@ static int dt_set_stdout_path(int chosen)
     return 0;
 }
 
+/*
+ * Publish the physical window the OS runs in at EL2. With CONFIG_ARM64_CTXR_EXECMEM
+ * the kernel confines all of its executable code (static text, modules, BPF,
+ * kprobes, ftrace) to it. U-Boot relocates its image there, which holds its EFI
+ * runtime code, and loads the kernel there. A kernel that finds EFI runtime code
+ * outside the window turns runtime services off.
+ */
+static int dt_set_ctxr_exec_window(int node)
+{
+    u64 base, size;
+
+    if (!ctxr_exec_window(&base, &size))
+        return 0;
+
+    fdt64_t win[2] = {cpu_to_fdt64(base), cpu_to_fdt64(size)};
+    if (fdt_setprop(dt, node, "aurora,ctxr-exec-window", win, sizeof(win)))
+        bail("FDT: couldn't set aurora,ctxr-exec-window\n");
+
+    printf("FDT: CTXR exec window base 0x%lx size 0x%lx\n", base, size);
+    return 0;
+}
+
+static bool in_exec_window(u64 start, u64 size)
+{
+    u64 window, window_size;
+
+    return ctxr_exec_window(&window, &window_size) && start < window + window_size &&
+           start + size > window;
+}
+
+/* fdt_add_mem_rsv(), leaving out the window the OS owns. */
+static int dt_reserve_outside_exec_window(u64 start, u64 size)
+{
+    u64 window, window_size;
+
+    if (!ctxr_exec_window(&window, &window_size))
+        return fdt_add_mem_rsv(dt, start, size);
+
+    u64 end = start + size, window_end = window + window_size;
+
+    if (start < window && fdt_add_mem_rsv(dt, start, min(end, window) - start))
+        return -1;
+    if (end > window_end) {
+        u64 above = max(start, window_end);
+        if (fdt_add_mem_rsv(dt, above, end - above))
+            return -1;
+    }
+    return 0;
+}
+
+/* Windows A to C. One inside the firmware RO range (T8140) is reserved with that range. */
+static int dt_reserve_ctxr_low_windows(void)
+{
+    static const enum ctxr_range windows[] = {CTXR_RANGE_A, CTXR_RANGE_B, CTXR_RANGE_C};
+    u64 ro_start, ro_end;
+
+    if (memory_fw_ro_range(&ro_start, &ro_end) != 1)
+        ro_start = ro_end = 0;
+
+    for (size_t i = 0; i < ARRAY_SIZE(windows); i++) {
+        u64 lower, upper;
+        if (!ctxr_range(windows[i], &lower, &upper) || (lower >= ro_start && upper <= ro_end))
+            continue;
+        u64 start = ALIGN_DOWN(lower, SZ_16K);
+        u64 end = ALIGN_UP(upper, SZ_16K);
+        if (fdt_add_mem_rsv(dt, start, end - start))
+            return -1;
+        printf("FDT: reserved CTXR window [0x%lx, 0x%lx)\n", start, end);
+    }
+    return 0;
+}
+
+/*
+ * What the secondaries can't write. T8140's firmware RO range is reserved, and kept out of
+ * the linear map, at either EL. On M4 and later the secondaries also enforce CTRR_C and
+ * CTRR_D, and Linux crashes writing there from one. Where aura knows the firmware RO range,
+ * CTRR_C is that range. CTRR_D: on J813 (M5) it covers the ~1 MiB below the iBoot-loaded image.
+ */
+static int dt_reserve_secondary_ro(void)
+{
+    static const enum ctxr_range ranges[] = {CTRR_RANGE_C, CTRR_RANGE_D};
+    u64 start, end;
+    int firmware_ro = memory_fw_ro_range(&start, &end);
+
+    if (firmware_ro < 0)
+        bail("FDT: invalid firmware RO range\n");
+    if (firmware_ro) {
+        if (fdt_add_mem_rsv(dt, start, end - start))
+            bail("FDT: couldn't reserve the firmware RO range\n");
+
+        int resv = fdt_path_offset(dt, "/reserved-memory");
+        if (resv < 0)
+            bail("FDT: missing /reserved-memory for firmware RO range\n");
+        char name[48];
+        snprintf(name, sizeof(name), "aura-secondary-ro@%lx", start);
+        int node = fdt_subnode_offset(dt, resv, name);
+        if (node < 0)
+            node = fdt_add_subnode(dt, resv, name);
+        if (node < 0)
+            bail("FDT: couldn't create firmware RO node\n");
+        fdt64_t reg[] = {cpu_to_fdt64(start), cpu_to_fdt64(end - start)};
+        if (fdt_setprop(dt, node, "reg", reg, sizeof(reg)) || fdt_setprop_empty(dt, node, "no-map"))
+            bail("FDT: couldn't describe firmware RO node\n");
+        printf("FDT: reserved firmware RO [0x%lx, 0x%lx)\n", start, end);
+    }
+    if (cpu_features->apple_sysregs_unlocked)
+        return 0;
+    if (!in_el2()) {
+        /*
+         * A guest under the aura hypervisor runs at EL1. The host keeps the
+         * SMP-RO range and starts the guest's CPUs itself, so the guest
+         * leaves it out. This is how the J616s guest boots.
+         */
+        printf("FDT: running at EL1, leaving %s to the host\n",
+               firmware_ro ? "CTRR_D" : "CTRR_C and CTRR_D");
+        return 0;
+    }
+    for (size_t i = 0; i < ARRAY_SIZE(ranges); i++) {
+        if ((!i && firmware_ro) || !ctxr_range(ranges[i], &start, &end))
+            continue;
+        if (fdt_add_mem_rsv(dt, start, end - start))
+            bail("FDT: couldn't add reservation for M4+ SMP-RO CTRR_%c\n", 'C' + (int)i);
+        printf("FDT: reserved M4+ SMP-RO CTRR_%c [0x%lx, 0x%lx)\n", 'C' + (int)i, start, end);
+    }
+    return 0;
+}
+
+/*
+ * On an aura-try trial each aura stage arms the trial watchdog (wdt.c) so a hang anywhere before
+ * Linux feeds it resets into the configured Stage 2. U-Boot with WATCHDOG_AUTOSTART takes the
+ * watchdog over and services it from its own loops, so a U-Boot that waits forever (on a disk it
+ * cannot reach, say) would never be reset. Tell it to leave the watchdog alone on a trial boot.
+ */
+static void dt_set_trial_watchdog(void)
+{
+    if (!aura_trial_enabled())
+        return;
+    /* The compatibles U-Boot's apple_wdt driver binds to */
+    static const char *const compat[] = {"apple,t8103-wdt", "apple,wdt"};
+    for (size_t i = 0; i < ARRAY_SIZE(compat); i++) {
+        int node = -1;
+        while ((node = fdt_node_offset_by_compatible(dt, node, compat[i])) >= 0) {
+            if (fdt_getprop(dt, node, "u-boot,noautostart", NULL))
+                continue;
+            if (fdt_setprop(dt, node, "u-boot,noautostart", NULL, 0))
+                printf("FDT: couldn't mark the watchdog for the trial\n");
+            else
+                printf("FDT: trial boot: U-Boot leaves the watchdog to the trial budget\n");
+        }
+    }
+}
+
 static int dt_set_chosen(void)
 {
 
@@ -647,6 +797,9 @@ static int dt_set_chosen(void)
     }
 
     if (dt_set_stdout_path(node))
+        return -1;
+
+    if (dt_set_ctxr_exec_window(node))
         return -1;
 
     if (chip_id == T8140 && dt_set_t8140_wfx_args(node))
@@ -1002,6 +1155,13 @@ static int dt_reserve_bootloader_handoff(void)
         if (!size || (start | size) & (SZ_16K - 1)) {
             printf("FDT: unaligned resident bootloader range on %s\n",
                    fdt_get_name(dt, node, NULL));
+            return -1;
+        }
+
+        /* Whatever lives in this range is in the way of the kernel the window has to hold. */
+        if (in_exec_window(start, size)) {
+            printf("FDT: bootloader handoff 0x%lx..0x%lx overlaps the CTXR exec window\n", start,
+                   start + size);
             return -1;
         }
 
@@ -1839,26 +1999,6 @@ static int dt_set_cpus(void)
     if (cpus < 0)
         bail("FDT: /cpus node not found in devtree\n");
 
-    /* When the monitor runs the OS at EL1 it owns the secondary pool and
-     * services PSCI over SMC; expose a /psci node and switch the cpus below
-     * from spin-table to it. Without the monitor the OS boots at EL2 and keeps
-     * spin-table. */
-    bool psci = monitor_required();
-    if (psci) {
-        int node = fdt_path_offset(dt, "/psci");
-        if (node < 0)
-            node = fdt_add_subnode(dt, 0, "psci");
-        if (node < 0 || fdt_setprop_string(dt, node, "compatible", "arm,psci-1.0") ||
-            fdt_appendprop_string(dt, node, "compatible", "arm,psci-0.2") ||
-            fdt_setprop_string(dt, node, "method", "smc") ||
-            fdt_setprop_string(dt, node, "status", "okay"))
-            bail("FDT: couldn't set up the /psci node\n");
-        /* The offset may have moved. */
-        cpus = fdt_path_offset(dt, "/cpus");
-        if (cpus < 0)
-            bail("FDT: /cpus node not found in devtree\n");
-    }
-
     uint32_t *pruned_phandles = calloc(MAX_CPUS, sizeof(uint32_t));
     size_t pruned = 0;
     u32 pruned_cooling_cells[MAX_CPUS];
@@ -1881,16 +2021,8 @@ static int dt_set_cpus(void)
 
         u64 dt_mpidr = fdt64_ld(prop);
 
-        if (dt_mpidr == (mrs(MPIDR_EL1) & 0xFFFFFF)) {
-            /* cpuidle-psci only binds when every CPU, the boot CPU included,
-             * uses PSCI. */
-            if (psci) {
-                fdt_delprop(dt, node, "cpu-release-addr");
-                if (fdt_setprop_string(dt, node, "enable-method", "psci"))
-                    bail_cleanup("FDT: couldn't set cpu enable-method to psci\n");
-            }
+        if (dt_mpidr == (mrs(MPIDR_EL1) & 0xFFFFFF))
             goto next_cpu;
-        }
 
         /*
          * DT and ADT CPU numbering can differ: J616s has no ADT cpu9, while
@@ -1925,19 +2057,12 @@ static int dt_set_cpus(void)
         }
 
         u64 mpidr = smp_get_mpidr(idx);
-        if (psci) {
-            fdt_delprop(dt, node, "cpu-release-addr");
-            if (fdt_setprop_string(dt, node, "enable-method", "psci"))
-                bail_cleanup("FDT: couldn't set cpu enable-method to psci\n");
-            printf("FDT: CPU %d MPIDR=0x%lx psci\n", cpu, mpidr);
-        } else {
-            u64 release_addr = chip_id == T8152 && fdt_getprop(dt, 0, "aurora,minimal-boot", NULL)
-                                   ? smp_get_kernel_release_addr(idx)
-                                   : smp_get_release_addr(idx);
-            if (fdt_setprop_inplace_u64(dt, node, "cpu-release-addr", release_addr))
-                bail_cleanup("FDT: couldn't set cpu-release-addr property\n");
-            printf("FDT: CPU %d MPIDR=0x%lx release-addr=0x%lx\n", cpu, mpidr, release_addr);
-        }
+        u64 release_addr = chip_id == T8152 && fdt_getprop(dt, 0, "aurora,minimal-boot", NULL)
+                               ? smp_get_kernel_release_addr(idx)
+                               : smp_get_release_addr(idx);
+        if (fdt_setprop_inplace_u64(dt, node, "cpu-release-addr", release_addr))
+            bail_cleanup("FDT: couldn't set cpu-release-addr property\n");
+        printf("FDT: CPU %d MPIDR=0x%lx release-addr=0x%lx\n", cpu, mpidr, release_addr);
 
     next_cpu:
         cpu++;
@@ -2476,8 +2601,11 @@ static const struct adt_tunable_info usb4_rc_tunables[] = {
     {"lbw_fabric_tunables", "apple,tunable-rc", 0x8000, 0x4000, true},
 };
 
-/* Type 7 firmware does not supply the four per-direction fabric tables. */
-static const struct adt_tunable_info usb4_t8142_nhi_tunables[] = {
+/*
+ * ACIO v2 routers (T8142, T6041, T6050) do not publish the four per-direction
+ * fabric tables, so they are optional here.
+ */
+static const struct adt_tunable_info usb4_v2_nhi_tunables[] = {
     {"hi_up_tx_desc_fabric_tunables", "apple,tunable-nhi", 0xe8000, 0x4000, false},
     {"hi_up_tx_data_fabric_tunables", "apple,tunable-nhi", 0xec000, 0x4000, false},
     {"hi_up_rx_desc_fabric_tunables", "apple,tunable-nhi", 0xf0000, 0x4000, false},
@@ -2639,24 +2767,101 @@ err:
     return -1;
 }
 
+/* The router generation is in the ADT: "acio" for v1, "acio,v2" for v2. */
+static bool adt_acio_is_v2(int adt_node)
+{
+    return adt_is_compatible(adt, adt_node, "acio,v2");
+}
+
+/*
+ * Which /arm-io/acioN register is the root complex block that the DT names
+ * its cio@ node after. v1 routers list a 0x30004 window ahead of it (reg 2),
+ * v2 routers drop that window (reg 1).
+ */
+static int adt_acio_rc_regnum(void)
+{
+    char adt_path[32];
+
+    for (int i = 0; i < MAX_CIO_DEVS; ++i) {
+        snprintf(adt_path, sizeof(adt_path), "/arm-io/acio%d", i);
+        int node = adt_path_offset(adt, adt_path);
+        if (node >= 0)
+            return adt_acio_is_v2(node) ? 1 : 2;
+    }
+
+    return 2;
+}
+
+/*
+ * A v2 router's own DART (ADT /arm-io/dart-acioN) is not set up by anything
+ * before the OS: its stream for the router's firmware is still translated and
+ * its table unapplied when the NHI starts its rings. Hand its table over like
+ * the PCIe-C DART's; the DART is the one the NHI's first iommus entry names.
+ * Calibration is copied from this machine's ADT at boot, never substituted.
+ */
+static int dt_copy_usb4_dart_tunables(int index, const char *nhi_alias)
+{
+    const struct adt_tunable_info tunable = {
+        .adt_name = "dart-tunables-instance-0",
+        .fdt_name = "apple,tunable",
+        .reg_size = 0x4000,
+        .required = true,
+    };
+    char adt_path[32];
+    int len;
+
+    snprintf(adt_path, sizeof(adt_path), "/arm-io/dart-acio%d", index);
+    int adt_node = adt_path_offset(adt, adt_path);
+    if (adt_node < 0 || !adt_getprop(adt, adt_node, tunable.adt_name, NULL))
+        return 0;
+
+    const char *fdt_path = fdt_get_alias(dt, nhi_alias);
+    if (!fdt_path)
+        return -1;
+    int nhi = fdt_path_offset(dt, fdt_path);
+    if (nhi < 0)
+        return -1;
+    const fdt32_t *iommus = fdt_getprop(dt, nhi, "iommus", &len);
+    if (!iommus || len < (int)sizeof(*iommus)) {
+        printf("USB4: %s has no iommus, router DART tunables not copied\n", nhi_alias);
+        return -1;
+    }
+    int dart = fdt_node_offset_by_phandle(dt, fdt32_to_cpu(iommus[0]));
+    if (dart < 0 || fdt_node_check_compatible(dt, dart, "apple,t8110-dart"))
+        return -1;
+    /* Keep a table the board already gives. */
+    if (fdt_getprop(dt, dart, tunable.fdt_name, NULL))
+        return 0;
+
+    if (dt_append_acio_tunable(adt_node, dart, &tunable)) {
+        printf("USB4: unable to convert %s/%s\n", adt_path, tunable.adt_name);
+        fdt_delprop(dt, dart, tunable.fdt_name);
+        return -1;
+    }
+    return 0;
+}
+
 static int dt_set_acio_tunables(void)
 {
     char adt_path[32];
     char fdt_alias[32];
     u64 router_uuid = rust_usb4_router_uuid();
-    const struct adt_tunable_info *nhi_tunables = usb4_nhi_tunables;
-    size_t n_nhi_tunables = ARRAY_SIZE(usb4_nhi_tunables);
-
-    if (chip_id == T8142) {
-        nhi_tunables = usb4_t8142_nhi_tunables;
-        n_nhi_tunables = ARRAY_SIZE(usb4_t8142_nhi_tunables);
-    }
 
     if (!router_uuid)
         bail("ADT: unable to generate USB4 router UUID\n");
 
     for (int i = 0; i < MAX_CIO_DEVS; ++i) {
+        const struct adt_tunable_info *nhi_tunables = usb4_nhi_tunables;
+        size_t n_nhi_tunables = ARRAY_SIZE(usb4_nhi_tunables);
+
         snprintf(adt_path, sizeof(adt_path), "/arm-io/acio%d", i);
+        int adt_node = adt_path_offset(adt, adt_path);
+        if (adt_node < 0)
+            continue;
+        if (adt_acio_is_v2(adt_node)) {
+            nhi_tunables = usb4_v2_nhi_tunables;
+            n_nhi_tunables = ARRAY_SIZE(usb4_v2_nhi_tunables);
+        }
 
         snprintf(fdt_alias, sizeof(fdt_alias), "usb4_%d_rc", i);
         if (!fdt_get_alias(dt, fdt_alias))
@@ -2676,6 +2881,8 @@ static int dt_set_acio_tunables(void)
             snprintf(fdt_alias, sizeof(fdt_alias), "usb4-%d-nhi", i);
         dt_copy_acio_tunables(adt_path, fdt_alias, nhi_tunables, n_nhi_tunables);
         dt_copy_usb4_drom(adt_path, fdt_alias, router_uuid | i);
+        if (adt_acio_is_v2(adt_node))
+            dt_copy_usb4_dart_tunables(i, fdt_alias);
     }
 
     return 0;
@@ -2753,20 +2960,43 @@ static int dt_copy_pciec_dart_tunables(const char *adt_path, const char *dt_alia
     int len;
     const fdt32_t *map = fdt_getprop(dt, host, "iommu-map", &len);
     /* PCIe-C describes one RID range and a one-cell stream specifier. */
-    if (!map || len != 4 * sizeof(*map))
+    if (!map || len != 4 * sizeof(*map)) {
+        printf("PCIEC: %s has no single-range iommu-map, DART tunables not copied\n", dt_alias);
         return -1;
+    }
     int dart = fdt_node_offset_by_phandle(dt, fdt32_to_cpu(map[1]));
-    if (dart < 0 || fdt_node_check_compatible(dt, dart, "apple,t8110-dart"))
+    if (dart < 0) {
+        printf("PCIEC: %s iommu-map names no DART node\n", dt_alias);
+        return -1;
+    }
+    /* Older (T8103) PCIe-C DARTs take no table. */
+    if (fdt_node_check_compatible(dt, dart, "apple,t8110-dart"))
         return -1;
 
     /* Keep existing board tables, including the qualified T600x values. */
     if (fdt_getprop(dt, dart, "apple,tunable", NULL))
         return 0;
     int adt_node = adt_path_offset(adt, adt_path);
-    if (adt_node < 0)
+    if (adt_node < 0) {
+        printf("PCIEC: %s not in the ADT, DART tunables not copied\n", adt_path);
         return -1;
+    }
+
+    /*
+     * Some SoCs (T8112) publish no table for this DART: iBoot asks for no
+     * tuning there. Say so with an empty list, so the kernel can tell it from
+     * a boot loader that did not look.
+     */
+    u32 table_len;
+    if (!adt_getprop(adt, adt_node, tunable.adt_name, &table_len)) {
+        printf("PCIEC: %s has no %s, handing over an empty table\n", adt_path, tunable.adt_name);
+        if (fdt_setprop_empty(dt, dart, "apple,tunable") < 0)
+            return -1;
+        return 0;
+    }
 
     if (dt_append_acio_tunable(adt_node, dart, &tunable)) {
+        printf("PCIEC: unable to convert %s/%s\n", adt_path, tunable.adt_name);
         /* The converter may have appended a prefix before rejecting input. */
         fdt_delprop(dt, dart, "apple,tunable");
         return -1;
@@ -3983,7 +4213,7 @@ static int dt_reserve_j713_dcpext_one(unsigned int n)
     char path[48];
     u32 len = 0;
 
-    /* The kernel checks the firmware it adopts by UUID, as for the internal DCP. */
+    /* Published like the internal DCP's; the firmware version gates the adoption. */
     snprintf(path, sizeof(path), "/arm-io/%s/iop-%s-nub", alias, alias);
     int nub = adt_path_offset(adt, path);
     const char *uuid = nub < 0 ? NULL : adt_getprop(adt, nub, "uuid", &len);
@@ -4015,7 +4245,7 @@ static bool dt_j713_dcpext_powered(const char *alias)
 
 /*
  * J713: iBoot starts both external DCPs and leaves them quiesced, as it does the internal one,
- * with their DARTs set up. Reserve their firmware memory and mark each disabled
+ * with their DARTs set up. Reserve their firmware memory and mark each
  * apple,t8132-dcpext node ready for the kernel to adopt the running controller. Only with the
  * boot.bin config line chosen.asahi,j713-dcpext=1, only after the internal DCP was handed over
  * (an external DCP must never cost the panel), and only for a controller iBoot left powered.
@@ -4049,8 +4279,14 @@ static void dt_reserve_j713_dcpext(void)
         }
         node = fdt_path_offset(dt, alias);
         const char *status = fdt_getprop(dt, node, "status", &len);
-        if (!status || len != sizeof("disabled") || strcmp(status, "disabled") ||
-            fdt_node_check_compatible(dt, node, "apple,t8132-dcpext"))
+        /* Older embedded trees disable the controller; current kernels keep it
+         * available and gate adoption on the ready marker. Preserve either form. */
+        bool supported_status =
+            (!status && len == -FDT_ERR_NOTFOUND) ||
+            (status && ((len == sizeof("disabled") && !memcmp(status, "disabled", len)) ||
+                        (len == sizeof("okay") && !memcmp(status, "okay", len)) ||
+                        (len == sizeof("ok") && !memcmp(status, "ok", len))));
+        if (!supported_status || fdt_node_check_compatible(dt, node, "apple,t8132-dcpext"))
             continue;
         if (!dt_j713_dcpext_powered(alias)) {
             printf("FDT: '%s' is not powered; kernel gate remains closed\n", alias);
@@ -4780,7 +5016,14 @@ static int dt_t8140_disable_typec_routes(const char *dcp_path)
     return 0;
 }
 
-/* Follow the bounded, zero-cell power-domain chain described by the DT. */
+/*
+ * Follow the bounded, zero-cell power-domain chain described by the DT.
+ *
+ * The chain ends at the first ancestor (after the controller's own state)
+ * that is marked apple,always-on: such a state is shared SoC fabric that
+ * Linux never switches, so it is neither published nor withdrawn with the
+ * display, and its own parents (which may be several) are not walked.
+ */
 static int dt_t8140_power_paths(int node, char (*paths)[128], size_t capacity)
 {
     if (!capacity || capacity > 3)
@@ -4791,10 +5034,17 @@ static int dt_t8140_power_paths(int node, char (*paths)[128], size_t capacity)
         const fdt32_t *ref = fdt_getprop(dt, node, "power-domains", &length);
         if (!ref)
             return length == -FDT_ERR_NOTFOUND ? count : -1;
-        if (length != sizeof(*ref) || (size_t)count == capacity)
+        if (length != sizeof(*ref))
             return -1;
-        node = fdt_node_offset_by_phandle(dt, fdt32_to_cpu(*ref));
-        if (node < 0 || fdt_get_path(dt, node, paths[count], sizeof(paths[0])))
+        int next = fdt_node_offset_by_phandle(dt, fdt32_to_cpu(*ref));
+        if (next < 0)
+            return -1;
+        if (count && fdt_getprop(dt, next, "apple,always-on", NULL))
+            return count;
+        if ((size_t)count == capacity)
+            return -1;
+        node = next;
+        if (fdt_get_path(dt, node, paths[count], sizeof(paths[0])))
             return -1;
         for (int i = 0; i < count; i++)
             if (!strcmp(paths[i], paths[count]))
@@ -6469,7 +6719,7 @@ static int dt_set_j713_display_maps(const struct adt_segment_ranges *segments, u
     };
     u32 phandles[2];
 
-    /* Exact J713 register block; reading tables must not enable/reset streams. */
+    /* The T8132 disp0 DART (every M4 ADT); reading tables must not enable/reset streams. */
     for (u32 n = 0; n < 2; n++) {
         if (dart_walk_locked_t8110(0x30a300000, 0xc000, streams[n], dram_start, dram_size,
                                    j713_display_page, &maps[n]))
@@ -6527,7 +6777,7 @@ static int dt_set_j713_display_maps(const struct adt_segment_ranges *segments, u
         return -1;
     if (fdt_setprop_string(dt, piodma, "status", "okay"))
         return -1;
-    printf("FDT: J713 DISP0 SID0/SID16 mappings preserved; PIODMA enabled\n");
+    printf("FDT: M4 DISP0 SID0/SID16 mappings preserved; PIODMA enabled\n");
     int dcp = fdt_path_offset(dt, "dcp");
     if (dcp >= 0 && fdt_getprop(dt, dcp, "apple,j713-native-scanout", NULL)) {
         int display = fdt_path_offset(dt, "disp0");
@@ -6538,29 +6788,39 @@ static int dt_set_j713_display_maps(const struct adt_segment_ranges *segments, u
         if (fdt_setprop_empty(dt, display, "apple,j713-inherited-mappings") ||
             fdt_setprop_string(dt, display, "status", "okay"))
             return -1;
-        printf("FDT: J713 native scanout diagnostic enabled with preserved SID0 mappings\n");
+        printf("FDT: M4 native scanout diagnostic enabled with preserved SID0 mappings\n");
     }
     return 0;
 }
 
-/* Publish the inherited J713 firmware mapping without starting a display driver. */
-static int dt_set_j713_dcp_handoff(void)
+/*
+ * Publish the inherited DCP firmware mapping without starting a display driver: on the J713
+ * on any firmware as before, and on any other M4 Mac with a panel on 26.6.2.
+ */
+static int dt_set_m4_dcp_handoff(void)
 {
     int dcp_node = fdt_path_offset(dt, "dcp");
     if (dcp_node < 0)
         return 0; /* Older DT with simple-framebuffer only. */
-    if (chip_id != T8132 || fdt_node_check_compatible(dt, 0, "apple,j713") ||
+    bool j713 = !fdt_node_check_compatible(dt, 0, "apple,j713");
+    if (chip_id != T8132 || (!j713 && os_firmware.version != V26_6_2) ||
         fdt_node_check_compatible(dt, dcp_node, "apple,t8132-dcp"))
         bail("FDT: unsupported native DCP handoff target\n");
+    /* The Mac mini's disp0 is external: its DCP drives a port, not a panel. */
+    if (!j713) {
+        int disp0 = adt_path_offset(adt, "/arm-io/disp0");
+        if (disp0 < 0 || adt_getprop(adt, disp0, "external", NULL))
+            bail("FDT: no internal panel, no native DCP handoff\n");
+    }
 
     int nub = adt_path_offset(adt, "/arm-io/dcp/iop-dcp-nub");
     if (nub < 0)
-        bail("ADT: missing J713 DCP firmware metadata\n");
+        bail("ADT: missing M4 DCP firmware metadata\n");
 
     u32 len;
     const struct adt_segment_ranges *segments = adt_getprop(adt, nub, "segment-ranges", &len);
     if (!segments || !len || len % sizeof(*segments) || len / sizeof(*segments) > 32)
-        bail("ADT: invalid J713 DCP firmware segment list\n");
+        bail("ADT: invalid M4 DCP firmware segment list\n");
     u32 count = len / sizeof(*segments);
 
     /* Firmware carveouts are outside the OS-usable boot-args interval. */
@@ -6568,10 +6828,10 @@ static int dt_set_j713_dcp_handoff(void)
     u64 dram_start, dram_size;
     if (chosen < 0 || ADT_GETPROP(adt, chosen, "dram-base", &dram_start) < 0 ||
         ADT_GETPROP(adt, chosen, "dram-size", &dram_size) < 0)
-        bail("ADT: missing J713 physical DRAM bounds\n");
+        bail("ADT: missing M4 physical DRAM bounds\n");
     u64 dram_end = dram_start + dram_size;
     if (!dram_size || dram_end <= dram_start)
-        bail("ADT: invalid J713 DRAM bounds\n");
+        bail("ADT: invalid M4 DRAM bounds\n");
 
     /* Validate the entire list before mutating the FDT. Use remap addresses:
      * CPU-image offsets are not the addresses in the inherited DCP DART.
@@ -6581,14 +6841,14 @@ static int dt_set_j713_dcp_handoff(void)
         if (!size || (segments[i].phys | segments[i].remap) & (SZ_16K - 1) ||
             segments[i].phys < dram_start || segments[i].phys + size < segments[i].phys ||
             segments[i].phys + size > dram_end || segments[i].remap + size < segments[i].remap)
-            bail("ADT: invalid J713 DCP firmware segment %u\n", i);
+            bail("ADT: invalid M4 DCP firmware segment %u\n", i);
     }
 
     const char *uuid = adt_getprop(adt, nub, "uuid", &len);
     if (!uuid || len != 37 || uuid[len - 1])
-        bail("ADT: invalid J713 DCP firmware UUID\n");
+        bail("ADT: invalid M4 DCP firmware UUID\n");
     if (fdt_setprop_string(dt, dcp_node, "apple,firmware-uuid", uuid))
-        bail("FDT: cannot publish J713 DCP firmware UUID\n");
+        bail("FDT: cannot publish M4 DCP firmware UUID\n");
 
     int ret = dt_set_dcp_firmware("dcp");
     if (ret)
@@ -6599,12 +6859,13 @@ static int dt_set_j713_dcp_handoff(void)
 
     dcp_node = fdt_path_offset(dt, "dcp");
     if (fdt_getprop(dt, dcp_node, "apple,j713-native-piodma", NULL)) {
-        if (strcmp(uuid, "81BAF476-679D-3CC0-8C6A-E6B6FA659D5E") ||
+        /* The DCP image is per firmware, the same on every M4 Mac. */
+        if (os_firmware.version != V26_6_2 ||
             dt_set_j713_display_maps(segments, count, dram_start, dram_size))
-            printf("FDT: J713 PIODMA handoff unqualified; retaining disabled device\n");
+            printf("FDT: M4 PIODMA handoff unqualified; retaining disabled device\n");
     }
 
-    printf("FDT: J713 DCP firmware mappings published; display device status unchanged\n");
+    printf("FDT: M4 DCP firmware mappings published; display device status unchanged\n");
     return 0;
 }
 
@@ -6633,8 +6894,8 @@ static int dt_set_display(void)
         disp0_piodma_alias = compat_piodma_alias;
 
     if (chip_id == T8132) {
-        if (dt_set_j713_dcp_handoff())
-            printf("FDT: J713 DCP handoff refused; keeping the boot framebuffer\n");
+        if (dt_set_m4_dcp_handoff())
+            printf("FDT: M4 DCP handoff refused; keeping the boot framebuffer\n");
         else
             dt_reserve_j713_dcpext();
         return 0;
@@ -6718,8 +6979,8 @@ static int dt_set_display(void)
         return dt_set_display_handoff(dt);
     } else if (!fdt_node_check_compatible(dt, 0, "apple,t6041")) {
         /*
-         * The same fail-soft handoff on the M4 Max: nothing unless the board is a J616C whose
-         * device tree describes the display block; the display nodes stay disabled.
+         * The same fail-soft handoff on the M4 Max: nothing unless the board is a J616C or
+         * J614C whose device tree describes the display block; the display nodes stay disabled.
          */
         return dt_set_display_handoff(dt);
     } else if (!fdt_node_check_compatible(dt, 0, "apple,t6032")) {
@@ -7434,8 +7695,38 @@ static void dt_set_aop_motion_cal(const char *path)
  * addresses), so that the OS maps them in the AOP's DART before it starts the
  * firmware.
  */
+/*
+ * M1 Pro (T6000) and M2 (T8112): iBoot starts the AOP firmware itself and the
+ * OS needs no firmware segments, but the accelerometer and gyroscope services
+ * wait for the same calibration as on the M4 Pro. The ADT carries it in the
+ * same properties and container format.
+ */
+static int dt_set_aop_motion_cal_only(void)
+{
+    const char *compat = chip_id == T8112 ? "apple,t8112-aop" : "apple,t6000-aop";
+    int node = fdt_node_offset_by_compatible(dt, -1, compat);
+    if (node < 0)
+        return 0;
+
+    const char *status = fdt_getprop(dt, node, "status", NULL);
+    if (status && strcmp(status, "okay") && strcmp(status, "ok"))
+        return 0;
+
+    char path[64];
+    if (fdt_get_path(dt, node, path, sizeof(path))) {
+        printf("FDT: AOP node path too long\n");
+        return 0;
+    }
+
+    dt_set_aop_motion_cal(path);
+    return 0;
+}
+
 static int dt_set_aop_firmware(void)
 {
+    if (chip_id == T6000 || chip_id == T8112)
+        return dt_set_aop_motion_cal_only();
+
     if (chip_id != T6040 && chip_id != T6041 && chip_id != T8132)
         return 0;
 
@@ -7643,8 +7934,9 @@ static int dt_set_isp(void)
         !fdt_node_check_compatible(dt, 0, "apple,j614s"))
         return 0;
 
-    /* A T8140 ISP that isp_init() did not bring up has no firmware to reserve. */
-    if (chip_id == T8140 && isp_get_heap(&heap_phys, &heap_iova, &heap_size)) {
+    /* A T8140/T8142 ISP that isp_init() did not bring up has no firmware to reserve. */
+    if ((chip_id == T8140 || chip_id == T8142) &&
+        isp_get_heap(&heap_phys, &heap_iova, &heap_size)) {
         if (!dt_set_isp_fwdata())
             return 0;
     } else if (!dt_reserve_asc_firmware("/arm-io/isp", "/arm-io/isp0", "isp", false,
@@ -8713,6 +9005,45 @@ static int dt_prepare_t8152(void)
     return 0;
 }
 
+/*
+ * On a confined machine a secondary executes only inside the armed window, and
+ * spin-table releases it into the kernel's own text. The kernel has to be there:
+ * move it from the heap, above the window. Where kboot_prepare_dt() keeps the heap
+ * reserved for firmware buffers, the copy left there stays reserved with it.
+ */
+static int kboot_move_to_exec_window(void **kernel)
+{
+    struct kernel_header *hdr = *kernel;
+    u64 base, size;
+
+    if (!ctxr_exec_window(&base, &size))
+        return 0;
+
+    if (hdr->magic != KERNEL_HEADER_MAGIC)
+        bail("kboot: the image at %p is not an arm64 kernel: can't place it in the window\n", hdr);
+
+    u64 image_size = hdr->image_size, text_offset = hdr->text_offset;
+    if (!image_size || image_size > size || text_offset > size - image_size)
+        bail("kboot: kernel (offset 0x%lx size 0x%lx) does not fit the CTXR exec window\n",
+             text_offset, image_size);
+
+    /* These stay where they are, and the kernel and its pool take the whole window. */
+    if (initrd_start && initrd_size && in_exec_window((u64)initrd_start, initrd_size))
+        bail("kboot: the initrd at %p overlaps the CTXR exec window\n", initrd_start);
+    if (in_exec_window((u64)dt, dt_bufsize))
+        bail("kboot: the device tree at %p overlaps the CTXR exec window\n", dt);
+
+    void *dest = (void *)(base + text_offset);
+    memmove(dest, hdr, image_size);
+    dc_cvac_range(dest, image_size);
+    sysop("dsb sy");
+    ic_ivau_range(dest, image_size);
+    sysop("dsb sy");
+    sysop("isb");
+    *kernel = dest;
+    return 0;
+}
+
 /* T8152 has no clock, USB, PCIe or DAPF setup here: j873g_run_proxy() did
  * what the device tree expects, and Linux owns the rest. */
 static int kboot_boot_t8152(void *kernel)
@@ -8730,6 +9061,8 @@ static int kboot_boot_t8152(void *kernel)
         dt_ready = false;
         bail("kboot: secondary kernel park failed\n");
     }
+    if (kboot_move_to_exec_window(&kernel))
+        return -1;
     printf("Preparing to boot kernel at %p with fdt at %p\n", kernel, dt);
     next_stage.entry = kernel;
     next_stage.args[0] = (u64)dt;
@@ -8754,20 +9087,18 @@ int kboot_prepare_dt(void *fdt)
 
     dt_ready = false;
 
+    if (!ctxr_exec_os_may_start())
+        return -1;
+
     /* Need to init ISP early to carve out heap */
     if (chip_id != T8152)
         isp_init();
-    /* Likewise the NV pages, before the retained heap extent is fixed. */
-    if (nv2_requested() && monitor_required())
-        nv2_prepare();
 
     dt_bufsize = fdt_totalsize(fdt);
     assert(dt_bufsize);
 
     dt_bufsize += 6 * SZ_16K; // Add 96K of buffer for modifications
     dt_bufsize += SZ_16K;     // and the SMBIOS description U-Boot builds its tables from (about 6K)
-    if (pv_kvm_requested())
-        dt_bufsize += SZ_16K;
     // A T6030 or T8122 also takes its PMP values
     if (chip_id == T6030 || chip_id == T8122)
         dt_bufsize += 2 * SZ_16K;
@@ -8818,8 +9149,7 @@ int kboot_prepare_dt(void *fdt)
      * Linux's allocator (J616C: ANS syslog lines in page-cache pages at the SART-allowed heap
      * addresses).
      */
-    if (chip_id == T8140 || chip_id == T6041 || chip_id == T8152 ||
-        (chip_id == T8132 && !fdt_node_check_compatible(dt, 0, "apple,j713"))) {
+    if (chip_id == T8140 || chip_id == T6041 || chip_id == T8152 || chip_id == T8132) {
         u64 ram_end, inherited = cur_boot_args.top_of_kernel_data;
         u64 high_water = heapblock_high_water();
 
@@ -8838,12 +9168,13 @@ int kboot_prepare_dt(void *fdt)
                 bail("FDT: retained heap extent overflows\n");
             u64 heap_start = ALIGN_DOWN((u64)_end, SZ_16K);
             u64 heap_end = ALIGN_UP(heap_top, SZ_16K);
-            if (heap_end > ram_end || fdt_add_mem_rsv(dt, heap_start, heap_end - heap_start))
+            if (heap_end > ram_end ||
+                dt_reserve_outside_exec_window(heap_start, heap_end - heap_start))
                 bail("FDT: couldn't reserve retained heap\n");
             printf("FDT: retained heap [0x%lx, 0x%lx)\n", heap_start, heap_end);
         }
     }
-    if (fdt_add_mem_rsv(dt, (u64)_base, image_end - (u64)_base))
+    if (dt_reserve_outside_exec_window((u64)_base, image_end - (u64)_base))
         bail("FDT: couldn't add reservation for aura and inherited high-water\n");
 
     /*
@@ -8897,88 +9228,33 @@ int kboot_prepare_dt(void *fdt)
         bail("FDT: couldn't add reservation for aura's old reset vector\n");
 
     /*
-     * CTXR_D starts below this image, and a secondary at EL1 that executes
-     * inside it takes an abort straight to EL2. The firmware RO range below
-     * covers windows A to C.
+     * The OS owns its window in CTXR_D. Keep the rest of the windows out of its
+     * allocator, because EL0 cannot execute in them on a confined core.
      */
-    if (monitor_required()) {
-        u64 start = ALIGN_DOWN(mrs(SYS_IMP_APL_CTXR_D_LWR_EL1), SZ_16K);
-        u64 end = ALIGN_UP(mrs(SYS_IMP_APL_CTXR_D_UPR_EL1) + SZ_4K, SZ_16K);
+    if (ctxr_exec_confined()) {
+        u64 start, end;
 
-        if (!start || end <= start || fdt_add_mem_rsv(dt, start, end - start))
+        if (!ctxr_range(CTXR_RANGE_D, &start, &end))
             bail("FDT: couldn't reserve CTXR_D\n");
-        printf("FDT: reserved CTXR_D [0x%lx, 0x%lx)\n", start, end);
-    }
-    if (nv2_requested() && monitor_required()) {
-        u64 base, size;
-        nv2_trace_region(&base, &size);
-        if (size) {
-            char name[40];
-            snprintf(name, sizeof(name), "nv2-trace@%lx", base);
-            if (dt_get_or_add_reserved_mem(name, "aura,nv2-trace", true, base, size) < 0)
-                bail("FDT: couldn't reserve the NV2 trace ring\n");
-            printf("FDT: NV2 trace ring at [0x%lx, 0x%lx)\n", base, base + size);
-        }
+        start = ALIGN_DOWN(start, SZ_16K);
+        end = ALIGN_UP(end, SZ_16K);
+        if (dt_reserve_outside_exec_window(start, end - start))
+            bail("FDT: couldn't reserve CTXR_D\n");
+        printf("FDT: reserved CTXR_D [0x%lx, 0x%lx) less the OS window\n", start, end);
+        if (dt_reserve_ctxr_low_windows())
+            bail("FDT: couldn't reserve CTXR windows A to C\n");
     }
 
-    if (chip_id == T8140) {
-        u64 ro_start, ro_end;
-        if (memory_fw_ro_range(&ro_start, &ro_end) != 1)
-            bail("FDT: invalid T8140 firmware RO range\n");
-        if (fdt_add_mem_rsv(dt, ro_start, ro_end - ro_start))
-            bail("FDT: couldn't reserve T8140 firmware RO range\n");
+    if (dt_reserve_secondary_ro())
+        return -1;
 
-        int resv = fdt_path_offset(dt, "/reserved-memory");
-        if (resv < 0)
-            bail("FDT: missing /reserved-memory for firmware RO range\n");
-        char name[48];
-        snprintf(name, sizeof(name), "aura-secondary-ro@%lx", ro_start);
-        int node = fdt_subnode_offset(dt, resv, name);
-        if (node < 0)
-            node = fdt_add_subnode(dt, resv, name);
-        if (node < 0)
-            bail("FDT: couldn't create firmware RO node\n");
-        fdt64_t reg[] = {cpu_to_fdt64(ro_start), cpu_to_fdt64(ro_end - ro_start)};
-        if (fdt_setprop(dt, node, "reg", reg, sizeof(reg)) || fdt_setprop_empty(dt, node, "no-map"))
-            bail("FDT: couldn't describe firmware RO node\n");
-        printf("FDT: reserved firmware RO [0x%lx, 0x%lx)\n", ro_start, ro_end);
-    } else if (!cpu_features->apple_sysregs_unlocked && !in_el2()) {
-        /*
-         * A guest under the aura hypervisor runs at EL1. The host keeps the
-         * SMP-RO range and starts the guest's CPUs itself, so the guest
-         * leaves it out. This is how the J616s guest boots.
-         */
-        printf("FDT: running at EL1, leaving the M4+ SMP-RO range to the host\n");
-    } else if (!cpu_features->apple_sysregs_unlocked) {
-        // On M4* / A18 Pro / M5*, there is a CTRR instance left enabled only
-        // on the secondary (non-boot) cores. Add a reserved-memory region to
-        // prevent Linux from crashing when allocating this memory and writing
-        // to it from a secondary core.
-        u64 ro_start = mrs(SYS_IMP_APL_CTRR_C_LWR_EL1);
-        u64 ro_end = ALIGN_UP(mrs(SYS_IMP_APL_CTRR_C_UPR_EL1), SZ_4K);
-        if (ro_end - ro_start > 12 * SZ_4K)
-            printf("WARNING: M4+ SMP-RO is large (48KB)");
-        if (fdt_add_mem_rsv(dt, ro_start, ro_end - ro_start))
-            bail("FDT: couldn't add reservation for M4+ SMP-RO CTRR area\n");
-
-        // The secondaries also enforce CTRR_D: on J813 (M5) it covers the
-        // ~1 MiB just below the iBoot-loaded image.
-        ro_start = mrs(SYS_IMP_APL_CTRR_D_LWR_EL1);
-        ro_end = ALIGN_UP(mrs(SYS_IMP_APL_CTRR_D_UPR_EL1), SZ_4K) + SZ_4K;
-        if (ro_start && ro_start < ro_end) {
-            if (fdt_add_mem_rsv(dt, ro_start, ro_end - ro_start))
-                bail("FDT: couldn't add reservation for M4+ SMP-RO CTRR_D area\n");
-            printf("FDT: reserved M4+ SMP-RO CTRR_D [0x%lx, 0x%lx)\n", ro_start, ro_end);
-        }
-    }
-
-    if (chip_id == T8132 && !fdt_node_check_compatible(dt, 0, "apple,j713")) {
+    if (chip_id == T8132) {
         if (dt_reserve_bootloader_handoff())
             return -1;
         u64 start = min(ALIGN_UP((u64)adt + cur_boot_args.devtree_size, SZ_16K), (u64)_base);
         u64 end = cur_boot_args.top_of_kernel_data;
-        if (end > start && fdt_add_mem_rsv(dt, start, end - start))
-            bail("FDT: couldn't reserve the J713 chainload high-water interval\n");
+        if (end > start && dt_reserve_outside_exec_window(start, end - start))
+            bail("FDT: couldn't reserve the T8132 chainload high-water interval\n");
     }
 
     /* setup console log buffer early to capture as much log as possible */
@@ -8988,11 +9264,13 @@ int kboot_prepare_dt(void *fdt)
         return -1;
     if (dt_set_chosen())
         return -1;
+    dt_set_trial_watchdog();
     if (chip_id == T8152)
         return dt_prepare_t8152();
     if (dt_set_speaker_safety())
         return -1;
     kboot_audio_amp_config(dt, adt);
+    kboot_audio_speaker_id(dt, adt);
     if (dt_set_uboot_config())
         return -1;
     if (dt_set_serial_number())
@@ -9030,9 +9308,10 @@ int kboot_prepare_dt(void *fdt)
     }
     /*
      * The first core of a cluster has a power-gate slot here, and iBoot leaves the boot core's
-     * clear, so that core and its cluster never power off. macOS sets it at every boot.
+     * clear, so that core and its cluster never power off. macOS sets it at every boot. T6040
+     * has the same slots at the same address.
      */
-    if (chip_id == T6041)
+    if (chip_id == T6040 || chip_id == T6041)
         set32(0x50282c040, BIT(31));
 
     if (dt_set_gpu(dt))
@@ -9049,7 +9328,7 @@ int kboot_prepare_dt(void *fdt)
         return -1;
     if (dt_disable_missing_devs("usb-drd", "usb@", 8, 0))
         return -1;
-    if (dt_disable_missing_devs("acio", "cio@", 8, 2))
+    if (dt_disable_missing_devs("acio", "cio@", 8, adt_acio_rc_regnum()))
         return -1;
     if (dt_disable_missing_devs("i2c", "i2c@", 8, 0))
         return -1;
@@ -9064,8 +9343,7 @@ int kboot_prepare_dt(void *fdt)
     dt_set_j713_isp();
     if (dt_set_pmgr())
         return -1;
-    if (chip_id == T8132 && !fdt_node_check_compatible(dt, 0, "apple,j713") &&
-        (dt_set_ans_nvme(false) || dt_set_t8132_lifecycle()))
+    if (chip_id == T8132 && (dt_set_ans_nvme(false) || dt_set_t8132_lifecycle()))
         return -1;
 #ifndef RELEASE
     if (dt_transfer_virtios())
@@ -9091,23 +9369,6 @@ int kboot_prepare_dt(void *fdt)
         return -1;
     if (dt_set_smbios_firmware())
         return -1;
-
-    if (pv_kvm_requested()) {
-        int hypervisor = fdt_path_offset(dt, "/hypervisor");
-        if (hypervisor < 0)
-            hypervisor = fdt_add_subnode(dt, 0, "hypervisor");
-        if (hypervisor < 0 ||
-            fdt_setprop_string(dt, hypervisor, "compatible", "aurora,aura-kvm-pv-0") ||
-            fdt_setprop_string(dt, hypervisor, "method", "hvc") ||
-            fdt_setprop_u32(dt, hypervisor, "abi-major", AURA_PV_ABI_MAJOR) ||
-            fdt_setprop_u32(dt, hypervisor, "abi-minor", AURA_PV_ABI_MINOR) ||
-            fdt_setprop_u32(dt, hypervisor, "uid-function", AURA_PV_FUNC_UID) ||
-            fdt_setprop_u32(dt, hypervisor, "version-function", AURA_PV_FUNC_VERSION) ||
-            fdt_setprop_u32(dt, hypervisor, "caps-function", AURA_PV_FUNC_GET_CAPS) ||
-            fdt_setprop_u32(dt, hypervisor, "run-function", AURA_PV_FUNC_RUN) ||
-            fdt_setprop_u32(dt, hypervisor, "el1-step-function", AURA_PV_FUNC_EL1_STEP))
-            bail("FDT: couldn't describe Aura PV-KVM\n");
-    }
 
     /* Last, so that its 15K never takes room the steps above need. */
     if (dt_set_pmp_t6030())
@@ -9332,6 +9593,10 @@ static int dt_finish_j614s_aop(void *tree, bool ready)
 
 int kboot_boot(void *kernel)
 {
+    if (!ctxr_exec_os_may_start()) {
+        next_stage.entry = NULL;
+        return -1;
+    }
     if (chip_id == T8152)
         return kboot_boot_t8152(kernel);
 
@@ -9436,6 +9701,8 @@ int kboot_boot(void *kernel)
     smp_set_wfe_mode(true);
     if (chip_id == T8140 && dt_t8140_recheck_display())
         return -1;
+    if (kboot_move_to_exec_window(&kernel))
+        return -1;
     printf("Preparing to boot kernel at %p with fdt at %p\n", kernel, dt);
 
     if (smp_has_pending_calls()) {
@@ -9449,7 +9716,6 @@ int kboot_boot(void *kernel)
     next_stage.args[3] = 0;
     next_stage.args[4] = 0;
     next_stage.restore_logo = false;
-    next_stage.monitor = monitor_required();
 
     return 0;
 }

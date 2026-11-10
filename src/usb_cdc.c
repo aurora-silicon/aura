@@ -16,6 +16,26 @@ static tps6598x_irq_state_t cdc_irq_state;
 static bool watchdog_armed;
 static bool carrier_owned;
 
+static bool usb2_target(void)
+{
+    return (chip_id == T8142 || chip_id == T8152) && board_id == 0x24;
+}
+
+static bool cdc_usb2_hpm(char *path, void *unused)
+{
+    (void)unused;
+    return !strcmp(path, "/arm-io/nub-spmi-a0/hpm0");
+}
+
+static int cdc_usb2_route(char *path, tps6598x_dev_t *hpm, void *unused)
+{
+    (void)path;
+    (void)unused;
+    /* The command may retire KIS even when its reply is lost. */
+    carrier_owned = true;
+    return tps6598x_route_ap_usb2(hpm) ? HPM_ACTION_ERROR : HPM_ACTION_STOP;
+}
+
 static bool cdc_dfu_hpm(char *path, void *unused)
 {
     (void)unused;
@@ -45,6 +65,14 @@ static void cdc_set_step(unsigned step)
 
 int usb_cdc_schedule(u32 delay_ms, u32 reserved, u32 flags)
 {
+    if (usb2_target()) {
+        /* Explicit USB2 transition only: no HPM reset, lane swap or watchdog. */
+        if (flags || reserved || cdc.state != USB_CDC_IDLE || delay_ms < 1000 || delay_ms > 15000)
+            return -1;
+        cdc.deadline_ms = ticks_to_msecs(get_ticks()) + delay_ms;
+        cdc.state = USB_CDC_SCHEDULED;
+        return 0;
+    }
     if (aura_debug_enabled())
         return -1;
     if (chip_id != T8140)
@@ -64,6 +92,24 @@ u32 usb_cdc_status(void)
 
 void usb_cdc_poll(void)
 {
+    if (usb2_target()) {
+        if (!usb_cdc_state_due(&cdc, ticks_to_msecs(get_ticks())))
+            return;
+        /* Consume once before touching hardware. Never retry failed setup. */
+        cdc.state = USB_CDC_FAILED;
+        cdc.step = 1;
+        if (usb_cdc_link_start(cdc_set_step, false))
+            goto usb2_failed;
+        cdc.step = 5;
+        if (tps6598x_foreach_hpm(cdc_usb2_hpm, cdc_usb2_route, NULL) != HPM_ACTION_STOP)
+            goto usb2_failed;
+        cdc.state = USB_CDC_DWC_READY;
+        printf("CDC USB2 ready; awaiting host, status=0x%x\n", usb_cdc_status());
+        return;
+    usb2_failed:
+        printf("CDC USB2 failed at step %u; allocations retained\n", cdc.step);
+        return;
+    }
     if (!usb_cdc_state_due(&cdc, ticks_to_msecs(get_ticks())))
         return;
 
@@ -112,7 +158,9 @@ bool usb_cdc_failed(void)
 
 bool usb_cdc_owns_carrier(void)
 {
-    return carrier_owned;
+    /* Keep polling DockChannel: the host can explicitly restore KIS without
+     * resetting the machine after the CDC upload. */
+    return !usb2_target() && carrier_owned;
 }
 
 int usb_cdc_cancel(void)

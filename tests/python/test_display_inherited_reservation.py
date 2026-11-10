@@ -25,7 +25,7 @@ def test_inherited_reservation(tmp_path):
     end = text.index("    if (chip_id == T8140", start)
     block = text[start:end]
     call = re.search(
-        r"    if \(fdt_add_mem_rsv\(dt, \(u64\)_base, image_end - \(u64\)_base\)\)\n"
+        r"    if \(dt_reserve_outside_exec_window\(\(u64\)_base, image_end - \(u64\)_base\)\)\n"
         r"        bail\([^\n]+\);", text[end:]
     )
     assert call, "missing real aura image reservation"
@@ -51,6 +51,8 @@ static u64 image_base, image_end_address;
 #define _end ((void *)(uintptr_t)image_end_address)
 static unsigned char tree[4096], before[4096];
 static void *dt = tree;
+/* Without a window this is the plain call (test_ctxr_exec_window.py). */
+#define dt_reserve_outside_exec_window(start, size) fdt_add_mem_rsv(dt, start, size)
 static int reserve(void)
 {
 ''' + block + call.group(0) + r'''

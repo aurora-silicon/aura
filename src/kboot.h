@@ -20,6 +20,8 @@ struct kernel_header {
     u32 res5;        /* reserved (used for PE COFF offset) */
 };
 
+#define KERNEL_HEADER_MAGIC 0x644d5241
+
 void kboot_set_initrd(void *start, size_t size);
 int kboot_set_chosen(const char *name, const char *value);
 void kboot_delete_chosen(const char *name);

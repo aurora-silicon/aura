@@ -1,0 +1,266 @@
+{
+  "scope": "single-CPU RAM boot and three-case GPU smoke; not CTS, suspend/resume or SMP qualification",
+  "runtime": {
+    "source_head": "d10758b1a9e0d69db5610f699ba1bb993df8a6d0",
+    "source_tree": "60625aeb670c5cd28111d0c7954f855adbf6ba50",
+    "artifacts": {
+      "aura.bin": "932e35ab41f284ff89e575112c285a6ad4938f09c762d88b428377f96b1ab20f",
+      "aura.macho": "0302ffcd8fc56c80195cc91d9014e7be279062af449321ef600529a1767ce559",
+      "aura.elf": "c8b23057460f6b261455352acf34fc7d30ea4224242f22dffdd2b9fb7fde2946",
+      "aura-raw.elf": "074210bc80200b2776061c7818a9d02cdc3395859e4b21505329fd7b9b2bf999"
+    },
+    "flags": [
+      "RELEASE=1",
+      "CHAINLOADING=1",
+      "ESP_STAGE2=1",
+      "BUILDSTD=1",
+      "EXTRA_CFLAGS=-Oz"
+    ],
+    "tracked_source_clean": true
+  },
+  "host_tools_commit": "e6d7a2a8b2cf59b0e98a022894b76c84875e7435",
+  "machines": {
+    "j813": {
+      "passed": true,
+      "checks": {
+        "kernel_release": true,
+        "firmware_profile": true,
+        "hardware_renderer": true,
+        "program_pass": true,
+        "sequence_complete": true,
+        "only_ram_mounts": true,
+        "config": true,
+        "pixels_0": true,
+        "pixels_1": true,
+        "pixels_2": true,
+        "uptime_advances": true,
+        "timer_interrupts_advance": true,
+        "no_irq_errors": true,
+        "no_kernel_crash_or_gpu_fault": true,
+        "zero_taint": true,
+        "runtime_file_hashes": true
+      },
+      "gpu_cases": 3,
+      "exact_pixels": 12288,
+      "uploads": [
+        {
+          "name": "Image",
+          "bytes": 11087880,
+          "sha256": "583755a2b1b18fd724c9e3aa9df643d2414b0f39276608938ba2475485a25358",
+          "write_and_full_readback_seconds": 1.3926808329997584,
+          "full_readback_verified": true
+        },
+        {
+          "name": "initramfs.cpio.gz",
+          "bytes": 56745277,
+          "sha256": "9289deed81d0e660d56c8d94e64186515b41125471e9ea0fb35c24ecba6362b8",
+          "write_and_full_readback_seconds": 8.75497500000347,
+          "full_readback_verified": true
+        },
+        {
+          "name": "t8142-j813.dtb",
+          "bytes": 59561,
+          "sha256": "fcac073d1b4e9ca2e58acba92ce315976e8e7048fd73359a593bd5d3b7462bf3",
+          "write_and_full_readback_seconds": 0.009812709002289921,
+          "full_readback_verified": true
+        }
+      ],
+      "roundtrip": {
+        "roundtrip_bytes": 1048576,
+        "roundtrip_sha256": "fbbab289f7f94b25736c58be46a994c441fd02552cc6022352e3d86d2fab7c83",
+        "roundtrip_seconds": 0.12676487500721123
+      },
+      "physical_pmu_guards": [
+        {
+          "passed": true,
+          "before_raw": 0,
+          "after_raw": 0
+        },
+        {
+          "passed": true,
+          "before_raw": 0,
+          "after_raw": 0
+        },
+        {
+          "passed": true,
+          "before_raw": 0,
+          "after_raw": 0
+        },
+        {
+          "passed": true,
+          "before_raw": 0,
+          "after_raw": 0
+        },
+        {
+          "passed": true,
+          "before_raw": 0,
+          "after_raw": 0
+        },
+        {
+          "passed": true,
+          "before_raw": 0,
+          "after_raw": 0
+        },
+        {
+          "passed": true,
+          "before_raw": 1,
+          "after_raw": 0
+        },
+        {
+          "passed": true,
+          "before_raw": 0,
+          "after_raw": 0
+        },
+        {
+          "passed": true,
+          "before_raw": 0,
+          "after_raw": 0
+        },
+        {
+          "passed": true,
+          "before_raw": 0,
+          "after_raw": 0
+        }
+      ],
+      "console_sha256": "1cbbb3eca7e9b23b44ce6c2d91481984f9760510c231f94552b424fb1cd88ae1",
+      "hardware_artifact_sha256": "ad5dcd980666e4f3ed578bcc6aa13b3d711159ce664306a4d030dc402ddcedd5",
+      "final_health_passed": true
+    },
+    "j873": {
+      "passed": true,
+      "checks": {
+        "kernel_release": true,
+        "firmware_profile": true,
+        "hardware_renderer": true,
+        "program_pass": true,
+        "sequence_complete": true,
+        "only_ram_mounts": true,
+        "config": true,
+        "pixels_0": true,
+        "pixels_1": true,
+        "pixels_2": true,
+        "uptime_advances": true,
+        "timer_interrupts_advance": true,
+        "no_irq_errors": true,
+        "no_kernel_crash_or_gpu_fault": true,
+        "zero_taint": true,
+        "thermal_before": true,
+        "thermal_after": true,
+        "g18_health": true,
+        "g18_retirement": true,
+        "power_stage_90": true,
+        "power_stage_92": true,
+        "power_stage_91": true,
+        "runtime_file_hashes": true
+      },
+      "gpu_cases": 3,
+      "exact_pixels": 12288,
+      "uploads": [
+        {
+          "name": "Image",
+          "bytes": 11087880,
+          "sha256": "583755a2b1b18fd724c9e3aa9df643d2414b0f39276608938ba2475485a25358",
+          "write_and_full_readback_seconds": 1.7896593750047032,
+          "full_readback_verified": true
+        },
+        {
+          "name": "initramfs.cpio.gz",
+          "bytes": 58543404,
+          "sha256": "cd57ca1e78768a1d0e44bb9b17adf64219d2358196cd9e2a2d9dd1ea99222465",
+          "write_and_full_readback_seconds": 10.926823082991177,
+          "full_readback_verified": true
+        },
+        {
+          "name": "t8152-j873g.dtb",
+          "bytes": 6838,
+          "sha256": "9cb6f7b117f59254439a95d37fd94c0a4ac45543fdbd31b5491f7b1c1eb9cbb1",
+          "write_and_full_readback_seconds": null,
+          "full_readback_verified": true
+        }
+      ],
+      "roundtrip": {
+        "roundtrip_bytes": 1048576,
+        "roundtrip_sha256": "fbbab289f7f94b25736c58be46a994c441fd02552cc6022352e3d86d2fab7c83",
+        "roundtrip_seconds": 0.12707133300136775
+      },
+      "physical_pmu_guards": [
+        {
+          "passed": true,
+          "before_raw": 0,
+          "after_raw": 0
+        },
+        {
+          "passed": true,
+          "before_raw": 0,
+          "after_raw": 0
+        },
+        {
+          "passed": true,
+          "before_raw": 1,
+          "after_raw": 0
+        },
+        {
+          "passed": true,
+          "before_raw": 0,
+          "after_raw": 0
+        },
+        {
+          "passed": true,
+          "before_raw": 0,
+          "after_raw": 0
+        }
+      ],
+      "console_sha256": "8e541c722e814af1069f2e49048178fc2c2bf183cf6c54b7512a08faf0969ab0",
+      "hardware_artifact_sha256": "814d36f5ee4e46557cf4e3b174eecf989f0cd5e5d69b933cfdb23278dc9a644d",
+      "final_health_passed": true,
+      "native_park": {
+        "passed": true,
+        "cpus": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          7,
+          8,
+          9,
+          10,
+          11
+        ],
+        "count": 11
+      },
+      "thermal_before": {
+        "channels": 125,
+        "max_mc": 40211,
+        "fan_rpm": 1000
+      },
+      "thermal_after": {
+        "channels": 125,
+        "max_mc": 39812,
+        "fan_rpm": 1000
+      },
+      "gpu_submission_counts": {
+        "kicks": 3,
+        "retirements": 3
+      }
+    }
+  },
+  "public_dependencies": {
+    "linux": {
+      "repository": "https://github.com/aurora-silicon/linux.git",
+      "branch": "aurora-wip",
+      "head": "80fab89e689da2c43c964f30a028d66f287e4ec1"
+    },
+    "mesa-j873": {
+      "repository": "https://github.com/aurora-silicon/mesa.git",
+      "branch": "aurora-wip",
+      "head": "3ffa865e6f611130745c6740adea9d6ad8cbd21c"
+    },
+    "mesa-j813": {
+      "repository": "https://github.com/aurora-silicon/mesa.git",
+      "branch": "agx3c",
+      "head": "6d484f13aa511a6540266a75862346c1135e57db"
+    }
+  }
+}

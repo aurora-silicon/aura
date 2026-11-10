@@ -31,6 +31,8 @@ _Static_assert(sizeof(u64) == 8, "production u64 ABI");
 #define PMGR_DIE_OFFSET 0x100000
 #define T8103 0x8103
 #define T8140 0x8140
+#define T6040 0x6040
+#define SZ_16K 0x4000UL
 #define T8142 0x8142
 #define T8152 0x8152
 #define MAIR_IDX_NORMAL 0
@@ -207,6 +209,8 @@ typedef unsigned long u64;
 typedef uint32_t u32;
 _Static_assert(sizeof(u64) == 8, "production u64 ABI");
 #define T8140 0x8140
+#define T6040 0x6040
+#define SZ_16K 0x4000UL
 #define RVBAR_LOCK 1
 #define RVBAR_ADDR 0x0000fffffffff000UL
 #define MAIR_IDX_NORMAL 0

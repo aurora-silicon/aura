@@ -30,6 +30,7 @@ typedef int(hpm_action_t)(char *hpm_path, tps6598x_dev_t *tps, void *data);
 int tps6598x_foreach_hpm(hpm_match_t *match, hpm_action_t *action, void *data);
 
 int tps6598x_enter_kis(tps6598x_dev_t *dev);
+int tps6598x_route_ap_usb2(tps6598x_dev_t *dev);
 int tps6598x_enable_debugusb(void);
 
 #define CD3218B12_IRQ_WIDTH 9

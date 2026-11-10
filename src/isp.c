@@ -36,6 +36,17 @@ static const struct {
 #define ISP_T8140_HEAP_TOP 0x2200000
 #define ISP_T8140_SEG_END  0x21ec000
 
+/*
+ * T8142 (M5, J813) has the Neo's ISP17a: the same global PMGR slot offsets
+ * and DART layout at another base. Its ADT segment-ranges end at 0x16ec000;
+ * the heap top is the next 2 MiB boundary, as the T8140 one is. Candidate,
+ * like T8140's.
+ */
+#define ISP_T8142_HEAP_TOP 0x1800000
+#define ISP_T8142_SEG_END  0x16ec000
+
+#define PMGR_PS_TARGET GENMASK(3, 0)
+
 // PMGR offset to enable to get the version info to work
 #define ISP_PMGR_T8103 0x4018
 #define ISP_PMGR_T6000 0x8
@@ -85,7 +96,9 @@ static int isp_firmware_end(const struct adt_segment_ranges *segments, u32 lengt
 int isp_init(void)
 {
     int err = -1;
-    bool t8140 = chip_id == T8140;
+    /* T8142 takes the T8140 (ISP17a) path throughout. */
+    bool t8142 = chip_id == T8142;
+    bool t8140 = chip_id == T8140 || t8142;
     bool powered = false;
     unsigned int local_powered = 0;
     unsigned int global_attempted = 0;
@@ -167,6 +180,16 @@ int isp_init(void)
             int ret = pmgr_set_mode(addr, PMGR_PS_ACTIVE);
             printf("isp: %s power on at 0x%lx: 0x%x%s\n", isp_t8140_domains[i].name, addr,
                    read32(addr), ret ? " failed" : "");
+            /*
+             * J813: the ISP_CPU_CORE1 slot ignores writes, its target reads
+             * back 0 whatever is written, also from the OS. Boot without it.
+             */
+            if (ret && t8142 && isp_t8140_domains[i].offset == 0x4010 &&
+                !(read32(addr) & PMGR_PS_TARGET)) {
+                printf("isp: %s ignores power requests on T8142, skipping it\n",
+                       isp_t8140_domains[i].name);
+                continue;
+            }
             if (ret)
                 goto out;
         }
@@ -195,6 +218,7 @@ int isp_init(void)
             pmgr_off = ISP_PMGR_T6031;
             break;
         case T8140:
+        case T8142:
             pmgr_off = 0;
             break;
         default:
@@ -211,9 +235,24 @@ int isp_init(void)
 
     ver_rev = read32(isp_base + ISP_ASC_VERSION);
     printf("isp: Version 0x%x\n", ver_rev);
-    if (t8140 && ver_rev != ISP_VER_T8140) {
+    if (t8140 && !t8142 && ver_rev != ISP_VER_T8140) {
         reason = "unexpected T8140 revision";
         goto out;
+    }
+
+    if (t8142) {
+        /* The J813 revision is not known yet; it is printed above. */
+        /*
+         * 27.0's ISP firmware moves the __TEXT/__DATA split but still ends at ISP_T8142_SEG_END
+         * (J813 ADTs of both), which the segment check below still verifies.
+         */
+        if (os_firmware.version != V26_6 && os_firmware.version != V26_6_2 &&
+            os_firmware.version != V27_0) {
+            reason = "unsupported T8142 firmware";
+            goto out;
+        }
+        selected_top = ISP_T8142_HEAP_TOP;
+        goto heap;
     }
 
     /* TODO: confirm versions */
@@ -288,6 +327,7 @@ int isp_init(void)
             goto out;
     }
 
+heap:;
     const struct adt_segment_ranges *seg;
     u32 segments_len = 0;
 
@@ -310,7 +350,7 @@ int isp_init(void)
         goto out;
     selected_iova = ALIGN_UP(end, SZ_16K);
     reason = "unmeasured T8140 segment end";
-    if (t8140 && selected_iova != ISP_T8140_SEG_END)
+    if (t8140 && selected_iova != (t8142 ? ISP_T8142_SEG_END : ISP_T8140_SEG_END))
         goto out;
     reason = "heap top at or below segment end";
     if (selected_iova >= selected_top)

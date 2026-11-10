@@ -28,16 +28,20 @@ typedef uint64_t u64;
 #define T6034 0x6034
 #define T6041 0x6041
 #define T8140 0x8140
+#define T8142 0x8142
 #define V12_3 1
 #define V12_4 2
 #define V13_5 3
 #define V13_6_1 4
 #define V14_7 5
+#define V26_6 7
 #define V26_6_2 6
+#define V27_0 8
 #define PMGR_PS_ACTIVE 15
 #define PMGR_PS_PWRGATE 0
 #define SZ_16K 0x4000
 #define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
+#define GENMASK(h, l) (((~0ULL) << (l)) & (~0ULL >> (63 - (h))))
 #define ALIGN_UP(x, a) (((x) + (a) - 1) & ~((a) - 1))
 /* Stub: the T6041 ISP handoff isn't exercised here. */
 __attribute__((unused)) static int dt_set_isp_t6041(int node) { (void)node; return 0; }
@@ -262,6 +266,16 @@ int main(void)
     assert(isp_get_heap(&phys, &iova, &size) == 0);
     assert(iova == 0xe94000 && size == 0x6c000);
     assert(disabled == 1 && gated == 1 && dapf_calls == 0);
+
+    /* 27.0 splits the T8142 firmware differently but ends where 26.6 does. */
+    reset(); chip_id = T8142;
+    os_firmware.version = V27_0; os_firmware.string = "27.0";
+    segments[0].size = 0xd68000;
+    segments[1].iova = 0xd68000; segments[1].size = 0x984000;
+    assert(isp_init() == 0);
+    assert(isp_get_heap(&phys, &iova, &size) == 0);
+    assert(iova == 0x16ec000 && size == 0x114000);
+    assert(dapf_calls == 1 && allocations == 1);
     return 0;
 }
 """

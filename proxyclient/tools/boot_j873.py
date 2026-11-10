@@ -28,6 +28,7 @@ from aura.tgtypes import BootArgs_r3
 from aura.adt import load_adt
 from aura.asm import ARMAsm
 from aura.utils import align
+from aura.boot_cdc import start_cdc, require_upload_transport
 
 
 def require(value, reason):
@@ -45,11 +46,14 @@ def save(path, value):
     temporary.replace(path)
 
 
-def image_pair(directory, expected):
-    raw = (directory / "aura.bin").read_bytes()
+def image_pair(directory, expected, *, macho=False):
+    raw = (directory / ("aura.macho" if macho else "aura.bin")).read_bytes()
     require(sha(raw) == expected, "aura image hash mismatch")
+    if macho:
+        from aura.macho import MachO
+        raw = MachO(raw).prepare_image()
     from elftools.elf.elffile import ELFFile
-    with (directory / "aura-raw.elf").open("rb") as stream:
+    with (directory / ("aura.elf" if macho else "aura-raw.elf")).open("rb") as stream:
         elf = ELFFile(stream)
         symbols = {s.name: s.entry.st_value for s in elf.get_section_by_name(".symtab").iter_symbols()}
         # Check every allocated, file-backed section against the payload.
@@ -61,25 +65,37 @@ def image_pair(directory, expected):
 
 
 class Session:
-    def __init__(self, device, raw, symbols):
+    def __init__(self, device, raw, symbols, *, target="j873", serial_number=None):
         self.f = UartInterface(device)
-        self.f.dev.timeout = 10
-        self.f.dev.write_timeout = 10
-        self.f.nop()
-        self.p = AuraProxy(self.f)
-        self.base = self.p.get_base()
-        self.raw, self.symbols = raw, symbols
-        require(self.read(self.base, 0x4000) == raw[:0x4000], "running image identity mismatch")
-        require(self.p.get_chipid() == 0x8152 and
-                self.p.read32(self.base + symbols["board_id"]) == 0x24, "not a J873g")
-        self.ba = BootArgs_r3.parse(self.read(self.base + symbols["cur_boot_args"], BootArgs_r3.sizeof()))
-        require(0 < self.ba.devtree_size < 0x400000, "bad ADT size")
-        self.adt_bytes = self.read(self.p.read64(self.base + symbols["adt"]), self.ba.devtree_size)
-        self.adt = load_adt(self.adt_bytes)
-        require(self.adt.model == "Mac18,5" and self.adt.target_type == "J873g", "wrong target/model")
-        serial = self.adt._properties["serial-number"]
-        self.serial = serial.rstrip(b"\0").decode() if isinstance(serial, bytes) else serial
-        require(self.serial == EXPECTED_SERIAL, "not the selected physical M6")
+        try:
+            self.f.dev.timeout = 10
+            self.f.dev.write_timeout = 10
+            self.f.nop()
+            self.p = AuraProxy(self.f)
+            self.base = self.p.get_base()
+            self.raw, self.symbols = raw, symbols
+            require(self.read(self.base, 0x4000) == raw[:0x4000], "running image identity mismatch")
+            version_offset = symbols["version_tag"]
+            version_end = raw.index(b"\0", version_offset, version_offset + 256) + 1
+            version = raw[version_offset:version_end]
+            require(self.read(self.base + version_offset, len(version)) == version,
+                    "running Aura build tag differs from the selected image")
+            chip, model, target_type = {"j873": (0x8152, "Mac18,5", "J873g"),
+                                        "j813": (0x8142, "Mac17,3", "J813")}[target]
+            require(self.p.get_chipid() == chip and
+                    self.p.read32(self.base + symbols["board_id"]) == 0x24, "wrong chip/board")
+            require(self.p.get_exc_count() == 0, "existing proxy exception state")
+            self.ba = BootArgs_r3.parse(self.read(self.base + symbols["cur_boot_args"], BootArgs_r3.sizeof()))
+            require(0 < self.ba.devtree_size < 0x400000, "bad ADT size")
+            self.adt_bytes = self.read(self.p.read64(self.base + symbols["adt"]), self.ba.devtree_size)
+            self.adt = load_adt(self.adt_bytes)
+            require(self.adt.model == model and self.adt.target_type == target_type, "wrong target/model")
+            serial = self.adt._properties["serial-number"]
+            self.serial = serial.rstrip(b"\0").decode() if isinstance(serial, bytes) else serial
+            require(self.serial == (serial_number or EXPECTED_SERIAL), "not the selected physical target")
+        except Exception:
+            self.close()
+            raise
 
     def read(self, address, size):
         return b"".join(self.f.readmem(address + i, min(16384, size - i)) for i in range(0, size, 16384))
@@ -106,9 +122,34 @@ class Session:
         self.f.dev.close()
 
 
-def guard(args, device):
-    directory = args.output / (args.action + "-pmu")
-    with (args.output / (args.action + "-pmu.log")).open("x") as log:
+def capture_consoles(args, session, seconds, end_marker):
+    """Keep the existing KIS descriptor open so early handoff logs survive."""
+    import serial
+    captured = bytearray()
+    proxy = session.f.dev
+    proxy.timeout = 0
+    with serial.Serial(args.console, timeout=0.2) as console, \
+            (args.output / "linux-console.bin").open("xb") as log, \
+            (args.output / "aura-handoff-console.bin").open("xb") as aura_log:
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            aura_log.write(proxy.read(65536))
+            aura_log.flush()
+            data = console.read(65536)
+            if data:
+                captured.extend(data)
+                log.write(data)
+                log.flush()
+                if end_marker in captured or b"Kernel panic" in captured:
+                    break
+        aura_log.write(proxy.read(65536))
+    return captured
+
+
+def guard(args, device, phase=None):
+    phase = phase or args.action
+    directory = args.output / (phase + "-pmu")
+    with (args.output / (phase + "-pmu.log")).open("x") as log:
         subprocess.run([sys.executable, str(args.pmu_guard), "--device", device, "--serial", args.serial, "--output", str(directory)],
                        stdout=log, stderr=subprocess.STDOUT, timeout=80, check=True)
     receipt = json.loads((directory / "receipt.json").read_text())
@@ -296,7 +337,7 @@ def boot_linux(args, raw, symbols, receipt):
             require(audit.get("passed") is True and audit.get("dt_sha256") == state["dt_sha256"] and
                     audit.get("base") == s.base and audit.get("image_sha256") == sha(raw),
                     "independent preparation audit missing or stale")
-            require(args.device == args.kis_device, "boot requires restored aura KIS ch-1")
+            require(p.iodev_whoami() == IODEV.DOCKCHANNEL_UART, "boot requires restored aura KIS ch-1")
             thermal = json.loads((args.output / "thermal.json").read_text())
             require(thermal["base"] == s.base and thermal["stage"] == "keys_ready" and thermal.get("preflight_passed") is True, "SMC state changed")
             require(s.call("rtkit_get_timeout", thermal["rtkit"]) == 2000000 and
@@ -311,20 +352,7 @@ def boot_linux(args, raw, symbols, receipt):
             state["stage"] = "handoff_sent"
             save(args.output / "linux.json", state)
             p.request(p.P_KBOOT_BOOT, state["kernel"], no_reply=True)
-            s.close()
-            import serial
-            with serial.Serial(args.console, timeout=0.2) as console:
-                captured = bytearray()
-                deadline = time.monotonic() + 150
-                with (args.output / "linux-console.bin").open("xb") as log:
-                    while time.monotonic() < deadline:
-                        data = console.read(65536)
-                        if data:
-                            captured.extend(data)
-                            log.write(data)
-                            log.flush()
-                            if b"J873_ARTIFACT_BASE64_END" in captured or b"Kernel panic" in captured:
-                                break
+            captured = capture_consoles(args, s, 150, b"J873_ARTIFACT_BASE64_END")
             state.update(console_has_thermal_marker=b"J873_LINUX_THERMAL_TELEMETRY_READY" in captured,
                          console_has_ready_marker=b"AURORA_J873_LINUX_INITRAMFS_READY" in captured,
                          console_sha256=sha(captured))
@@ -334,7 +362,7 @@ def boot_linux(args, raw, symbols, receipt):
             return
 
         require(args.artifacts and args.artifacts.is_dir(), "prepare requires the pinned artifact directory")
-        require(p.iodev_whoami() == 1, "prepare requires the identified KIS proxy")
+        require_upload_transport(args, s, sha(raw))
         hashes = {}
         for line in (args.artifacts / "SHA256SUMS").read_text().splitlines():
             digest, name = line.split()
@@ -506,7 +534,7 @@ def audit_prepared(args, raw, symbols):
 def main():
     require(__debug__ and not os.environ.get("PYTHONOPTIMIZE"), "run normal Python without -O")
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("action", choices=["chainload", "prepare", "audit", "boot"])
+    ap.add_argument("action", choices=["chainload", "cdc", "prepare", "audit", "boot"])
     ap.add_argument("--image", type=Path, required=True)
     ap.add_argument("--image-sha256", required=True)
     ap.add_argument("--output", type=Path, required=True)
@@ -514,6 +542,9 @@ def main():
     ap.add_argument("--serial", required=True)
     ap.add_argument("--console", required=True, help="Linux console port, separate from the Aura proxy")
     ap.add_argument("--device", required=True)
+    ap.add_argument("--transport", choices=["kis", "cdc"], default="kis",
+                    help="Payload preparation transport; CDC requires a successful cdc phase")
+    ap.add_argument("--cdc-device", help="Explicit CDC primary port for the cdc phase")
     ap.add_argument("--source-image", type=Path)
     ap.add_argument("--source-sha256")
     ap.add_argument("--artifacts", type=Path)
@@ -529,6 +560,8 @@ def main():
         args.lock_file = Path("/tmp/aura-j873-" + args.serial + ".lock")
     if args.action == "chainload" and (not args.source_image or not args.source_sha256):
         ap.error("chainload needs --source-image and --source-sha256")
+    if args.action == "cdc" and (not args.cdc_device or args.cdc_device in (args.device, args.console)):
+        ap.error("cdc requires a separate --cdc-device primary port")
     raw, symbols = image_pair(args.image, args.image_sha256)
     args.output.mkdir(parents=True, exist_ok=True)
     require(args.device != args.console, "Aura proxy and Linux console must be distinct")
@@ -541,6 +574,9 @@ def main():
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         if args.action == "chainload":
             chainload(args, raw, symbols)
+        elif args.action == "cdc":
+            start_cdc(args, sha(raw), lambda device: Session(device, raw, symbols),
+                      receipt)
         elif args.action == "audit":
             audit_prepared(args, raw, symbols)
         else:
