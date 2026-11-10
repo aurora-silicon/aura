@@ -410,7 +410,11 @@ AURA_XTEXT int sptm_virt_esp_boot(const char *spec)
     /* configure(): the flags, then the switches; the stop's proxy is the debug console. */
     uartproxy_iodev = IODEV_DOCKCHANNEL_UART;
     sptm_virt_diag_pa = 0;
+#ifdef SPTM_VIRT_ESP_TRACE
+    sptm_virt_config(SPTM_VIRT_ESP_TRACE); /* a test build's own trace mask (0: none) */
+#else
     sptm_virt_config(m->trace);
+#endif
     u32 *const sw[ESP_S2R_N] = {&sptm_virt_s2r_dcp_pkt, &sptm_virt_s2r_cp_skip_ans,
                                 &sptm_virt_s2r_cp_ansx, &sptm_virt_s2r_go_count,
                                 &sptm_virt_s2r_wake_s,  &sptm_virt_s2r_quiesce};
