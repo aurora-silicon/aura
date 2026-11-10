@@ -3985,6 +3985,40 @@ static T6050_GPU_INIT bool t6050_gpu_enable(void *dt)
     return true;
 }
 
+/*
+ * This part's leakage calibration fuses: three words at 0x74198 in the PMGR window that starts at
+ * 0x88300000 on the GPU's die (die 1 on J714s). Linux's driver applies its J714 controller
+ * configuration only when they match the part it was made for, so they come from the part.
+ */
+#define T6050_GPU_LEAK_WINDOW 0x88300000
+#define T6050_GPU_LEAK_OFFSET 0x74198
+
+static T6050_GPU_TEXT_FN int t6050_gpu_leakage(void *dt)
+{
+    int path[8];
+    u64 die, base, size;
+    if (adt_path_offset_trace(adt, "/arm-io/sgx", path) < 0 ||
+        adt_get_reg(adt, path, "reg", 0, &die, NULL) ||
+        adt_path_offset_trace(adt, "/arm-io/pmgr", path) < 0)
+        return -1;
+    for (int i = 0; !adt_get_reg(adt, path, "reg", i, &base, &size); i++) {
+        if ((u32)base != T6050_GPU_LEAK_WINDOW || base >> 32 != die >> 32 ||
+            size < T6050_GPU_LEAK_OFFSET + 12)
+            continue;
+        u32 w[3];
+        int before = g15_guard_begin();
+        for (int j = 0; j < 3; j++)
+            w[j] = read32(base + T6050_GPU_LEAK_OFFSET + 4 * j);
+        if (g15_guard_end(before))
+            return -1;
+        printf("FDT: GPU: leakage calibration words %08x %08x %08x\n", w[0], w[1], w[2]);
+        fdt32_t cells[3] = {cpu_to_fdt32(w[0]), cpu_to_fdt32(w[1]), cpu_to_fdt32(w[2])};
+        return fdt_setprop(dt, kboot_fdt_path_exact(dt, "gpu"), "apple,leakage-calibration-words",
+                           cells, sizeof(cells));
+    }
+    return -1;
+}
+
 static T6050_GPU_INIT int dt_set_gpu_t6050(void *dt)
 {
     if (chip_id != T6050) {
@@ -4005,6 +4039,8 @@ static T6050_GPU_INIT int dt_set_gpu_t6050(void *dt)
         return 0;
     }
     printf("FDT: GPU: T6050 G17S enabled, fw-text at %#lx\n", r[8]);
+    if (t6050_gpu_leakage(dt))
+        printf("FDT: GPU: no leakage calibration words; the driver's generic configuration\n");
     return 0;
 }
 
