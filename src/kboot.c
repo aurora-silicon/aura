@@ -9432,9 +9432,19 @@ int kboot_boot(void *kernel)
                 return -1;
         }
     }
-    /* Linux's deep sleep needs them to bring ANS's APCIe block back. */
-    if (!ret && pcie_apcie_tables_fdt(dt) < 0)
-        printf("kboot: APCIe tables not published; deep sleep stays refused\n");
+    /*
+     * Linux's deep sleep needs them to bring ANS's APCIe block back. prepare_dt() packed the
+     * tree on every chip but T8140: reopen its spare capacity first, as dt_disable_j713_pcie()
+     * does, and pack it again after.
+     */
+    if (!ret) {
+        bool packed = chip_id != T8140;
+
+        if ((packed && fdt_open_into(dt, dt, dt_bufsize)) || pcie_apcie_tables_fdt(dt) < 0)
+            printf("kboot: APCIe tables not published; deep sleep stays refused\n");
+        if (packed && fdt_pack(dt))
+            bail("FDT: fdt_pack() failed\n");
+    }
     if (chip_id == T8140) {
         if (ret < 0) {
             printf("kboot: refusing T8140 handoff after partial PCIe setup\n");
