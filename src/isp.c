@@ -242,7 +242,12 @@ int isp_init(void)
 
     if (t8142) {
         /* The J813 revision is not known yet; it is printed above. */
-        if (os_firmware.version != V26_6 && os_firmware.version != V26_6_2) {
+        /*
+         * 27.0's ISP firmware moves the __TEXT/__DATA split but still ends at ISP_T8142_SEG_END
+         * (J813 ADTs of both), which the segment check below still verifies.
+         */
+        if (os_firmware.version != V26_6 && os_firmware.version != V26_6_2 &&
+            os_firmware.version != V27_0) {
             reason = "unsupported T8142 firmware";
             goto out;
         }
