@@ -12,7 +12,7 @@
 #include "string.h"
 #include "utils.h"
 
-#define NVME_TIMEOUT          1000000
+#define NVME_TIMEOUT 1000000
 /*
  * Writes and flushes (only the aura-try marker is ever written) may wait on the drive's write
  * cache and background work after a warm reboot; Linux allows every I/O command 30 s.
