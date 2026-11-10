@@ -18,6 +18,8 @@ Environment (all optional; 1 enables a switch):
   AURA_EXCLAVE_INTEGRITY=<f>, AURA_EXCLAVE_TRUSTCACHE=<f>   the ExclaveOS catalogs beside it
   AURA_XNU_SERIAL=<node>   XNU's console device under /arm-io, e.g. uart0 (aura's vuart)
   AURA_HIDE_DOCKCHANNEL    hide the DockChannel that carries aura's console and proxy
+  AURA_HIDE_NODES=<paths>  also hide these ADT nodes from XNU, comma-separated (/arm-io/apcie,...):
+                           a kernelcache with no XNU_QUIRKS entry yet
   AURA_KEEP_ERRH           keep the platform error handler visible to XNU
   AURA_AMCC_CLEAR          clear the AMCC error latches stage 1 left, before entry
   AURA_S2R_TRACE           sleep path: hooks on the power blocks and the trace ring
@@ -95,6 +97,7 @@ KNOWN_ENV = {
     "AURA_EXCLAVE_TRUSTCACHE",
     "AURA_XNU_SERIAL",
     "AURA_HIDE_DOCKCHANNEL",
+    "AURA_HIDE_NODES",
     "AURA_KEEP_ERRH",
     "AURA_AMCC_CLEAR",
     "AURA_S2R_QUIESCE",
@@ -181,6 +184,15 @@ def xnu_quirks(kernelcache):
 # amcc-reg-idx names, a plane every 0x40000.
 AMCC_ERR_STATUS = 0x25004
 AMCC_PLANE_STRIDE = 0x40000
+
+
+def extra_hide_nodes():
+    """AURA_HIDE_NODES: more ADT paths to hide, for a kernelcache that has no XNU_QUIRKS entry yet."""
+    paths = tuple(n.strip() for n in os.environ.get("AURA_HIDE_NODES", "").split(",") if n.strip())
+    bad = [n for n in paths if not n.startswith("/")]
+    if bad:
+        raise SystemExit("AURA_HIDE_NODES takes absolute ADT paths: " + " ".join(bad))
+    return paths
 
 
 def env_on(name):
@@ -653,6 +665,10 @@ def main():
         hide += (ERROR_HANDLER,)
     if env_on("AURA_HIDE_DOCKCHANNEL"):
         hide += ("/arm-io/dockchannel-uart",)
+    extra_hide = extra_hide_nodes()
+    if extra_hide:
+        print("hiding (AURA_HIDE_NODES):", " ".join(extra_hide))
+        hide += extra_hide
     if not keep_exclaves:
         hide += EXCLAVE_NODES
     cl4 = {}

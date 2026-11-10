@@ -43,6 +43,27 @@ The sleep record follows it: from 512 records before the first core's self-disab
 On T8132 the commit is followed 3 ms later by four SPMI commands to the PMU (`nub-spmi0`, slave 0xe):
 read 0x2000, a 4-byte write at 0x2008, `0x200e <- 0`, and `0x2000 <- 0x41`, T8132's "go hib".
 
+### T6040 (J616s, MacBook Pro M4 Pro): prepared, not yet run
+
+The boot object for a J616s is this tree's Stage 1, unfilled (so it stays in the proxy), wrapped as a
+Mach-O boot object and padded for the 128 MiB CTXR window like the J616s Linux Stage 1, and
+enrolled with `--compress` on the macOS install's own volume group. It is built with the size profile
+in `docs/m5-macos-esp.md` (`CARGO_PROFILE_RELEASE_OPT_LEVEL=z`, `EXTRA_CFLAGS=-Oz`): without it the
+image passes the DCP log buffer limit. Nothing in the host or in aura names T6040; the image sets for
+`tests/python/test_sptm_virt_generic.py` are named like the others (`j616s-26A428`).
+
+What is known before the first run:
+
+- The sleep path's discovery finds no per-core self-disable block on `pmgr1,t6041` at the places
+  the generic table names, so `AURA_S2R_*` switches are dropped with "no sleep path". The same
+  return skips keeping the debug link's power domains, so with the proxy on CDC the link is
+  expected to drop when XNU lowers them. Run the proxy on KIS (DockChannel, always on) instead.
+- macOS 27.0 (26A428) ships one kernelcache for this SoC family. It has the J813's XNU release but
+  not its fingerprint, so no `XNU_QUIRKS` entry applies. If it stops on the same RO-zone panic, hide
+  the PCIe and Wi-Fi nodes with `AURA_HIDE_NODES` until it has an entry of its own.
+- `nv2.c`'s additional guest register accesses are qualified on T6050 only, so they stay
+  emulated here.
+
 The code:
 
 | File | What |
@@ -212,6 +233,7 @@ PYTHONPATH=proxyclient python3 proxyclient/tools/run_guest_sptm.py \
 
 `--dry-run` prints the plan and writes nothing. The desktop needs `AURA_KEEP_EXCLAVES=1` with
 `AURA_EXCLAVE_FW` pointing at the extracted exclave firmware, `AURA_XNU_SERIAL=uart0` and
-`AURA_HIDE_DOCKCHANNEL=1`. A sleep test adds `AURA_S2R_TRACE=1 AURA_S2R_GO=1 AURA_S2R_DROP_USB=1`,
+`AURA_HIDE_DOCKCHANNEL=1`. `AURA_HIDE_NODES` hides more ADT paths (comma-separated) for a
+kernelcache without an `XNU_QUIRKS` entry. A sleep test adds `AURA_S2R_TRACE=1 AURA_S2R_GO=1 AURA_S2R_DROP_USB=1`,
 and `AURA_KEEP_ERRH=1 AURA_AMCC_CLEAR=1` (or `AURA_S2R_QUIESCE=24` with the handler hidden). The
 script's docstring lists every switch.
