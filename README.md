@@ -22,7 +22,20 @@ make USE_CLANG=1 ARCH=aarch64-linux-gnu BUILDSTD=1
 ```
 
 The outputs are `build/aura.bin` and `build/aura.macho`. Use `make V=1` for
-verbose output. On macOS, install LLVM and LLD through Homebrew and run
+verbose output.
+
+That plain build is for development and RAM chainloading. The boot stages
+need their own flags, and each overwrites `build/`:
+
+| Image | Flags |
+|---|---|
+| Stage 1 | `RELEASE=1 CHAINLOADING=1` |
+| ESP Stage 2 | `RELEASE=1 CHAINLOADING=1 ESP_STAGE2=1` |
+
+Only an `ESP_STAGE2=1` image may be used as the ESP Stage 2;
+`tools/compose_stage2.py` rejects any other. See
+[boot options](docs/boot-options.md) and
+[Stage 2 device trees](docs/stage2-dtbs.md). On macOS, install LLVM and LLD through Homebrew and run
 `make`. A container build is also available through `podman-compose run
 aura make` or `docker-compose run aura make`.
 
