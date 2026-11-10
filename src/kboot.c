@@ -7444,6 +7444,264 @@ static int dt_set_display(void)
     return 0;
 }
 
+/* PMP DEVICE DVFS START */
+
+/*
+ * PMP performance requests are described twice in the ADT:
+ *
+ *  - /arm-io/pmp/iop-pmp-nub/ptd-range names the SOC-DEV-DVFS range;
+ *  - soc-device allocates one slot for each record whose selector at 0x2c
+ *    is nonzero;
+ *  - /arm-io/pmgr/devices names the virtual VNOM/VMAX sources and carries
+ *    their device ID, level and request-class selector.
+ *
+ * Keep these wire records local. Unknown fields stay byte arrays and are
+ * never interpreted as policy.
+ */
+/* ptd-range record: {u32 id, u32 base, u32 count, u32 reserved, char name[16]} */
+#define ADT_PMP_PTD_RANGE_SIZE  32
+#define ADT_PMP_PTD_RANGE_ID    0
+#define ADT_PMP_PTD_RANGE_BASE  4
+#define ADT_PMP_PTD_RANGE_COUNT 8
+#define ADT_PMP_PTD_RANGE_NAME  16
+#define ADT_PMP_SOC_DEV_DVFS_ID 12
+/* soc-device record: u32 device ID at 0, u32 DVFS selector at 0x2c (nonzero: owns a slot) */
+#define ADT_PMP_SOC_DEVICE_SIZE 0x7c
+#define ADT_PMP_SOC_DEVICE_ID   0
+#define ADT_PMP_SOC_DEVICE_DVFS 0x2c
+/* pmgr devices record: u8 flags, u8 level, u8 perf domain, u8 device ID, ..., char name[16] at 32
+ */
+#define ADT_PMGR_DEVICE_SIZE     48
+#define ADT_PMGR_DEVICE_FLAGS    0
+#define ADT_PMGR_DEVICE_LEVEL    1
+#define ADT_PMGR_DEVICE_DOMAIN   2
+#define ADT_PMGR_DEVICE_TARGET   3
+#define ADT_PMGR_DEVICE_NAME     32
+#define ADT_PMGR_DEVICE_NAME_LEN 16
+#define ADT_PMGR_PERF_VIRTUAL    0x12
+/* Newer tables: request-class ordinal (1..5) in the flags' high nibble. */
+#define ADT_PMGR_CLASS_ORDINAL_SHIFT 4
+#define ADT_PMGR_CLASS_ORDINAL_MAX   5
+/* Older tables: PMP performance domains 0x20..0x24 name request classes 0x21..0x25. */
+#define ADT_PMGR_PERF_DOMAIN_FIRST 0x20
+/* Linux request classes 0x21..0x25 are four-bit lanes; the default lane holds 0..0x1f. */
+#define ADT_PMP_REQUEST_CLASS_FIRST 0x21
+#define ADT_PMP_REQUEST_CLASS_LAST  0x25
+#define PMP_DVFS_CLASS_LEVEL_MAX    0xf
+#define PMP_DVFS_MAIN_LEVEL_MAX     0x1f
+#define PMP_DVFS_CLASS_COUNT        (ADT_PMP_REQUEST_CLASS_LAST - ADT_PMP_REQUEST_CLASS_FIRST + 1)
+/* Linux report entry indices are 8-bit; the PMP soc-device ID is the index plus one. */
+#define PMP_REPORT_ENTRY_MAX 0xff
+
+struct pmp_device_dvfs_policy {
+    const char *label;
+    const char *source;
+    const char *alternate_source;
+    /* A named source whose level is also required in the default lane. */
+    const char *main_source;
+};
+
+struct pmp_device_dvfs {
+    u32 entry;
+    u32 main_level;
+    u32 class_level[PMP_DVFS_CLASS_COUNT];
+    bool class_present[PMP_DVFS_CLASS_COUNT];
+};
+
+/* Policy names, never numeric levels: all numeric data below comes from this boot's ADT. */
+static const struct pmp_device_dvfs_policy pmp_device_dvfs_policies[] = {
+    {"pmp-venc-sys", "VENC-SOC-VMAX", "VENC-AVE-VMAX", "VENC-SOC-VMAX"},
+    {"pmp-avd-sys", "AVD-SOC-VMAX", NULL, NULL},
+    {"pmp-jpg", "JPG-SOC-VNOM", "JPG1-SOC-VNOM", NULL},
+};
+
+static u32 adt_pmp_u32(const u8 *p)
+{
+    u32 value;
+
+    memcpy(&value, p, sizeof(value));
+    return value;
+}
+
+static bool pmp_name_is(const u8 *record, const char *expected)
+{
+    char name[ADT_PMGR_DEVICE_NAME_LEN + 1];
+
+    memcpy(name, record + ADT_PMGR_DEVICE_NAME, sizeof(name) - 1);
+    name[sizeof(name) - 1] = 0;
+    return !strcmp(name, expected);
+}
+
+/*
+ * Older PMGR tables name the class by PMP performance domain. Newer tables
+ * carry the class ordinal in the high nibble of the virtual-device flags.
+ */
+static int pmp_request_class(const u8 *record, u32 *request_class)
+{
+    u8 domain = record[ADT_PMGR_DEVICE_DOMAIN];
+    u8 ordinal;
+
+    if (domain >= ADT_PMGR_PERF_DOMAIN_FIRST &&
+        domain < ADT_PMGR_PERF_DOMAIN_FIRST + PMP_DVFS_CLASS_COUNT) {
+        *request_class = ADT_PMP_REQUEST_CLASS_FIRST + domain - ADT_PMGR_PERF_DOMAIN_FIRST;
+        return 0;
+    }
+    ordinal = record[ADT_PMGR_DEVICE_FLAGS] >> ADT_PMGR_CLASS_ORDINAL_SHIFT;
+    if (!ordinal || ordinal > ADT_PMGR_CLASS_ORDINAL_MAX)
+        return -1;
+    *request_class = ADT_PMP_REQUEST_CLASS_FIRST + ordinal - 1;
+    return 0;
+}
+
+static int adt_pmp_dvfs_entry(u32 device_id, struct pmp_device_dvfs *dvfs)
+{
+    int nub = adt_path_offset(adt, "/arm-io/pmp/iop-pmp-nub");
+    const u8 *ranges, *devices;
+    u32 ranges_len = 0, devices_len = 0, base = 0, count = 0, ordinal = 0;
+    bool seen_range = false, found_range = false, found_device = false;
+
+    if (nub < 0)
+        return -1;
+    ranges = adt_getprop(adt, nub, "ptd-range", &ranges_len);
+    devices = adt_getprop(adt, nub, "soc-device", &devices_len);
+    if (!ranges || !ranges_len || ranges_len % ADT_PMP_PTD_RANGE_SIZE || !devices || !devices_len ||
+        devices_len % ADT_PMP_SOC_DEVICE_SIZE)
+        return -1;
+
+    for (u32 off = 0; off < ranges_len; off += ADT_PMP_PTD_RANGE_SIZE) {
+        const u8 *record = ranges + off;
+
+        if (adt_pmp_u32(record + ADT_PMP_PTD_RANGE_ID) != ADT_PMP_SOC_DEV_DVFS_ID)
+            continue;
+        if (seen_range ||
+            memcmp(record + ADT_PMP_PTD_RANGE_NAME, "SOC-DEV-DVFS", sizeof("SOC-DEV-DVFS")))
+            return -1;
+        seen_range = true;
+        base = adt_pmp_u32(record + ADT_PMP_PTD_RANGE_BASE);
+        count = adt_pmp_u32(record + ADT_PMP_PTD_RANGE_COUNT);
+        found_range = count != 0 && base + count >= base;
+    }
+    if (!found_range)
+        return -1;
+
+    for (u32 off = 0; off < devices_len; off += ADT_PMP_SOC_DEVICE_SIZE) {
+        const u8 *record = devices + off;
+        u32 id = adt_pmp_u32(record + ADT_PMP_SOC_DEVICE_ID);
+        bool has_dvfs = adt_pmp_u32(record + ADT_PMP_SOC_DEVICE_DVFS) != 0;
+
+        if (id == device_id) {
+            if (found_device || !has_dvfs)
+                return -1;
+            found_device = true;
+            dvfs->entry = base + ordinal;
+        }
+        if (has_dvfs)
+            ordinal++;
+    }
+    if (!found_device || dvfs->entry < base || dvfs->entry >= base + count)
+        return -1;
+    return 0;
+}
+
+static int adt_pmp_dvfs_levels(u32 device_id, const struct pmp_device_dvfs_policy *policy,
+                               struct pmp_device_dvfs *dvfs)
+{
+    int pmgr = adt_path_offset(adt, "/arm-io/pmgr");
+    const u8 *devices;
+    u32 len = 0, sources = 0;
+
+    if (pmgr < 0)
+        return -1;
+    devices = adt_getprop(adt, pmgr, "devices", &len);
+    if (!devices || !len || len % ADT_PMGR_DEVICE_SIZE)
+        return -1;
+
+    for (u32 off = 0; off < len; off += ADT_PMGR_DEVICE_SIZE) {
+        const u8 *record = devices + off;
+        u32 request_class, class_index;
+        u8 level;
+
+        if ((record[ADT_PMGR_DEVICE_FLAGS] & ADT_PMGR_PERF_VIRTUAL) != ADT_PMGR_PERF_VIRTUAL ||
+            record[ADT_PMGR_DEVICE_TARGET] != device_id ||
+            (!pmp_name_is(record, policy->source) &&
+             (!policy->alternate_source || !pmp_name_is(record, policy->alternate_source))))
+            continue;
+        level = record[ADT_PMGR_DEVICE_LEVEL];
+        if (!level || level > PMP_DVFS_CLASS_LEVEL_MAX ||
+            pmp_request_class(record, &request_class) ||
+            request_class < ADT_PMP_REQUEST_CLASS_FIRST ||
+            request_class > ADT_PMP_REQUEST_CLASS_LAST)
+            return -1;
+        class_index = request_class - ADT_PMP_REQUEST_CLASS_FIRST;
+        if (dvfs->class_present[class_index] && dvfs->class_level[class_index] != level)
+            return -1;
+        dvfs->class_present[class_index] = true;
+        dvfs->class_level[class_index] = level;
+        if (policy->main_source && pmp_name_is(record, policy->main_source))
+            dvfs->main_level = level;
+        sources++;
+    }
+    return sources ? 0 : -1;
+}
+
+static int dt_set_pmp_device_dvfs_one(int node, const struct pmp_device_dvfs_policy *policy)
+{
+    struct pmp_device_dvfs dvfs = {0};
+    fdt32_t levels[2 * PMP_DVFS_CLASS_COUNT], value[2];
+    const fdt32_t *reg;
+    u32 device_id, cells = 0;
+    int len, ret;
+
+    /*
+     * Only entries whose DT asks for ADT data are changed: an older kernel
+     * cannot parse these properties on every SoC, and its DT keeps its own.
+     */
+    if (!fdt_getprop(dt, node, "apple,adt-dvfs", NULL))
+        return 0;
+    reg = fdt_getprop(dt, node, "reg", &len);
+    if (!reg || len != sizeof(*reg) || fdt32_ld(reg) >= PMP_REPORT_ENTRY_MAX)
+        return 0;
+    device_id = fdt32_ld(reg) + 1;
+    if (adt_pmp_dvfs_entry(device_id, &dvfs) || adt_pmp_dvfs_levels(device_id, policy, &dvfs))
+        return 0;
+
+    for (u32 i = 0; i < ARRAY_SIZE(dvfs.class_level); i++) {
+        if (!dvfs.class_present[i])
+            continue;
+        levels[cells++] = cpu_to_fdt32(ADT_PMP_REQUEST_CLASS_FIRST + i);
+        levels[cells++] = cpu_to_fdt32(dvfs.class_level[i]);
+    }
+    if (!cells || dvfs.main_level > PMP_DVFS_MAIN_LEVEL_MAX)
+        return 0;
+    value[0] = cpu_to_fdt32(dvfs.entry);
+    value[1] = cpu_to_fdt32(dvfs.main_level);
+    ret = fdt_setprop(dt, node, "apple,dvfs-request-levels", levels, cells * sizeof(*levels));
+    if (!ret)
+        ret = fdt_setprop(dt, node, "apple,dvfs", value, sizeof(value));
+    if (!ret) {
+        ret = fdt_delprop(dt, node, "apple,dvfs-request-class");
+        if (ret == -FDT_ERR_NOTFOUND)
+            ret = 0;
+    }
+    return ret;
+}
+
+static int dt_set_pmp_device_dvfs(void)
+{
+    for (u32 i = 0; i < ARRAY_SIZE(pmp_device_dvfs_policies); i++) {
+        const struct pmp_device_dvfs_policy *policy = &pmp_device_dvfs_policies[i];
+        int node = -1;
+
+        while ((node = fdt_node_offset_by_prop_value(dt, node, "label", policy->label,
+                                                     strlen(policy->label) + 1)) >= 0)
+            if (dt_set_pmp_device_dvfs_one(node, policy))
+                bail("FDT: failed to publish ADT PMP DVFS data for %s\n", policy->label);
+    }
+    return 0;
+}
+
+/* PMP DEVICE DVFS END */
+
 static const char *excluded_pmp_props[] = {
     "compatible",    "AAPL,phandle",    "region-base", "region-size",
     "segment-names", "segment-ranges",  "pre-loaded",  "firmware-name",
@@ -9903,6 +10161,8 @@ int kboot_prepare_dt(void *fdt)
     if (dt_set_sep())
         return -1;
     if (dt_set_pmp())
+        return -1;
+    if (dt_set_pmp_device_dvfs())
         return -1;
     if (dt_set_nvram())
         return -1;
