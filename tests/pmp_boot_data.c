@@ -140,7 +140,8 @@ int main(void)
                 bdid += c + alias;
                 dvid -= c + s;
                 assert(!dt_set_pmp());
-                check_data(pmp, statuses[s]);
+                /* The alias opts the node in: dt_set_pmp() enables it, as before. */
+                check_data(pmp, alias ? "okay" : statuses[s]);
             }
         }
         int pmp = setup(tree, chips[c], false, "disabled");
@@ -154,7 +155,7 @@ int main(void)
         const u32 bad_lengths[] = {0, 1, 3, 8};
         for (unsigned field = 0; field < 3; field++) {
             for (unsigned n = 0; n < 4; n++) {
-                pmp = setup(tree, chips[c], true, "disabled");
+                pmp = setup(tree, chips[c], false, "disabled");
                 u32 *len = field == 0 ? &bdid_len : field == 1 ? &dvid_len : &capacity_len;
                 *len = bad_lengths[n];
                 assert(dt_set_pmp() < 0);
@@ -162,16 +163,16 @@ int main(void)
                 assert(!strcmp(fdt_getprop(dt, pmp, "status", NULL), "disabled"));
             }
         }
-        pmp = setup(tree, chips[c], true, "disabled");
+        pmp = setup(tree, chips[c], false, "disabled");
         chosen_present = false;
         assert(dt_set_pmp() < 0);
-        pmp = setup(tree, chips[c], true, "disabled");
+        pmp = setup(tree, chips[c], false, "disabled");
         bdid_present = false;
         assert(dt_set_pmp() < 0);
-        pmp = setup(tree, chips[c], true, "disabled");
+        pmp = setup(tree, chips[c], false, "disabled");
         dvid_present = false;
         assert(dt_set_pmp() < 0);
-        pmp = setup(tree, chips[c], true, "disabled");
+        pmp = setup(tree, chips[c], false, "disabled");
         nub_present = false;
         assert(dt_set_pmp() < 0);
         pmp = setup(tree, chips[c], false, "disabled");

@@ -7107,15 +7107,14 @@ static int dt_set_pmp(void)
     int pmp_node = fdt_path_offset(dt, "pmp");
     /*
      * T6000 and T8112 ship a disabled node without the optional pmp alias.
-     * Populate that node too: changing status alone must not leave Linux
-     * without BDID, DVID or this boot's calibration. Keep activation in the
-     * DT's hands, including when an alias is present. APPLE_USE_PMP also
-     * selects the consumer report-domain topology, not just the alias.
+     * Populate that node too, and leave its status to the DT: changing status
+     * alone must not leave Linux without BDID, DVID or this boot's
+     * calibration. A tree with the alias (APPLE_USE_PMP) takes the path below,
+     * which also enables the node, as before.
      */
-    if (chip_id == T6000 || chip_id == T8112) {
-        if (pmp_node < 0)
-            pmp_node = fdt_node_offset_by_compatible(
-                dt, -1, chip_id == T8112 ? "apple,t8112-pmp-v2" : "apple,t6000-pmp-v2");
+    if ((chip_id == T6000 || chip_id == T8112) && pmp_node < 0) {
+        pmp_node = fdt_node_offset_by_compatible(
+            dt, -1, chip_id == T8112 ? "apple,t8112-pmp-v2" : "apple,t6000-pmp-v2");
         if (pmp_node < 0)
             return 0;
         return dt_fill_pmp(pmp_node);
