@@ -2124,6 +2124,14 @@ static int g15_probed_hw(void *dt, int gpu, const struct g15_soc *soc, u32 *core
 /* 25G83 calibration on the scratch DT: this Mac's ADT and fuse, no unit tables.
  * The G15S-derived power model remains experimental. Release every power vote
  * after the bounded identity read; Linux owns firmware admission and startup.
+ *
+ * The kernel's T8122 admission requires the bounded powered-identity witness
+ * in /chosen/asahi,t8122-gpu-powered-identity. Reserve it (probe-result
+ * NOT_RUN) before power-on, retain g15_read_hw()'s genuine guarded read of
+ * this boot's ID/core-mask registers, and publish it only after the SGX
+ * power vote is confirmed released. The caller runs this on a scratch copy
+ * of the DT, so any failure here discards the reserved node together with
+ * the rest of the handoff and leaves the GPU disabled.
  */
 int dt_gpu_t8122_26_calibrate(void *dt)
 {
@@ -2131,6 +2139,7 @@ int dt_gpu_t8122_26_calibrate(void *dt)
     u32 count, tables, clusters, enabled, cores[G15_MAX_CLUSTERS], power[MAX_PSTATES];
     const struct perf_state *ps;
     struct g15_power_values pv;
+    struct t8122_powered_identity identity = {.result = T8122_ID_NOT_RUN};
     if (gpu < 0 || sgx < 0 || !t8122_fuse_valid ||
         g15_get_pstates(&g15_soc_t8122_standin, sgx, &count, &tables, &ps) ||
         g15_get_power_props(sgx, count, tables, ps, &pv))
@@ -2140,18 +2149,38 @@ int dt_gpu_t8122_26_calibrate(void *dt)
     if (!ref || len != 4)
         return -1;
     u32 opps = fdt32_ld(ref);
+    /* Reserve the witness before power-on; never replace an input witness. */
+    if (t8122_full_identity_prepare(dt) < 0) {
+        printf("FDT: GPU: T8122 25G83 powered identity node unavailable; GPU stays disabled\n");
+        return -1;
+    }
+    gpu = fdt_path_offset(dt, "gpu");
+    if (gpu < 0)
+        return -1;
     bool previous = t8122_fuse_use;
     t8122_fuse_use = true;
     g15_powered = false;
     float leak;
-    int ret = g15_read_hw(dt, gpu, &g15_soc_t8122_standin, cores, &clusters, &enabled, &leak, NULL);
+    int ret =
+        g15_read_hw(dt, gpu, &g15_soc_t8122_standin, cores, &clusters, &enabled, &leak, &identity);
     t8122_fuse_use = previous;
     if (g15_powered && (pmgr_adt_power_disable_recursive("/arm-io/sgx") ||
-                        pmgr_adt_power_is_off("/arm-io/sgx") != 1))
+                        pmgr_adt_power_is_off("/arm-io/sgx") != 1)) {
+        printf("FDT: GPU: T8122 25G83 failed to release SGX power vote; GPU stays disabled\n");
         ret = -1;
+    }
     g15_powered = false;
     if (ret || tables > clusters)
         return -1;
+    /* Power is confirmed off: publish the real read, PASS last. */
+    if (t8122_full_identity_publish(dt, &identity)) {
+        printf("FDT: GPU: T8122 25G83 powered identity publication failed; GPU stays disabled\n");
+        return -1;
+    }
+    printf("FDT: GPU: T8122 25G83 powered identity result %u: ID_VERSION 0x%08x ID_COUNTS_1 "
+           "0x%08x core masks 0x%x 0x%x 0x%x\n",
+           identity.result, identity.id_version, identity.id_counts_1, identity.core_mask[0],
+           identity.core_mask[1], identity.core_mask[2]);
     calc_power_t8122_standin(count, ps, leak, enabled, power);
     if (power[count - 1] < 1000 || g15_set_opps(dt, opps, count, tables, clusters, ps, power) ||
         g15_set_power_props(dt, &pv) ||
@@ -3034,6 +3063,42 @@ static const struct g17_soc g17_soc_t8142 = {
     .firmware_profile = T8142_GPU_FIRMWARE_PROFILE,
 };
 
+/*
+ * macOS 27.0's M5 GPU firmware gives each role a __DATA_SHARED_RO segment, where it keeps its
+ * crash log, and iBoot places it right after that role's __DATA (sgx gfx-data-shared-ro and
+ * gfx1-data-shared-ro). A DT with a /reserved-memory/fw-data node reserves both roles' __DATA
+ * and __DATA_SHARED_RO as one region; it gets the span iBoot used. Firmware without the
+ * segment, or segments placed apart, leave the node as the DT has it.
+ */
+static int g17_set_fw_data(void *dt, int sgx, const u64 data_base[2], const u64 data_size[2])
+{
+    static const char *const ro[2] = {"gfx-data-shared-ro", "gfx1-data-shared-ro"};
+    static const char path[] = "/reserved-memory/fw-data";
+    u64 ro_base[2], ro_size[2];
+
+    if (fdt_path_offset(dt, path) < 0)
+        return 0;
+    for (int i = 0; i < 2; i++) {
+        char prop[64];
+        snprintf(prop, sizeof(prop), "%s-base", ro[i]);
+        if (ADT_GETPROP(adt, sgx, prop, &ro_base[i]) != sizeof(u64) || !ro_base[i])
+            return 0;
+        snprintf(prop, sizeof(prop), "%s-size", ro[i]);
+        if (ADT_GETPROP(adt, sgx, prop, &ro_size[i]) != sizeof(u64) || !ro_size[i])
+            return 0;
+        if (ro_base[i] != data_base[i] + data_size[i] || ro_size[i] > UINT64_MAX - ro_base[i] ||
+            (ro_size[i] & (SZ_16K - 1)))
+            goto apart;
+    }
+    if (ro_base[0] + ro_size[0] != data_base[1])
+        goto apart;
+    return dt_set_resvmem(dt, path, data_base[0], ro_base[1] + ro_size[1] - data_base[0]);
+
+apart:
+    printf("FDT: GPU: firmware data segments are not contiguous, leaving %s\n", path);
+    return 0;
+}
+
 static int dt_set_gpu_g17(void *dt, const struct g17_soc *soc)
 {
     int gpu = fdt_path_offset(dt, "gpu");
@@ -3119,6 +3184,10 @@ static int dt_set_gpu_g17(void *dt, const struct g17_soc *soc)
     for (size_t i = 0; i < nregions; i++)
         if (dt_set_resvmem(dt, regions[i].path, base[i], size[i]))
             goto disable;
+    /* gfx-data and gfx1-data are the last two regions. */
+    if (soc->firmware_data &&
+        g17_set_fw_data(dt, sgx, &base[ARRAY_SIZE(regions) - 2], &size[ARRAY_SIZE(regions) - 2]))
+        goto disable;
 
     if (soc->firmware_known) {
         int chosen = fdt_path_offset(dt, "/chosen");

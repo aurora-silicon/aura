@@ -9,6 +9,12 @@
  * order, its I2C address and its apple,bop-config, apple,amp-dcblocker-config,
  * apple,speaker-config and apple,amp-tx-zd-config ("-" when absent), one line each ("amp ..."),
  * after aura's own log lines.
+ *
+ * Then runs kboot_audio_speaker_id() and prints "speaker-id <value>" (/chosen/asahi,speaker-id,
+ * "-" when absent) and, for every modelled GPIO pin, "gpio <address> <register>" with the
+ * register as the code left it. The pins come from KBOOT_AUDIO_GPIO, a comma-separated list of
+ * <address>:<register>:<pad level>. A pin's data bit reads as its pad level only while the pin
+ * is an input with its input stage on; any other address is a test failure.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -22,6 +28,70 @@
 
 void *adt;
 static u32 adt_size;
+
+#define MAX_PINS 16
+static struct {
+    u64 addr;
+    u32 reg;
+    u32 pad;
+} pins[MAX_PINS];
+static int npins;
+
+static void parse_pins(void)
+{
+    const char *s = getenv("KBOOT_AUDIO_GPIO");
+
+    while (s && *s) {
+        unsigned long long a;
+        unsigned int r, p;
+        int used;
+
+        if (npins >= MAX_PINS || sscanf(s, "%lli:%i:%i%n", &a, &r, &p, &used) != 3) {
+            fprintf(stderr, "bad KBOOT_AUDIO_GPIO at '%s'\n", s);
+            exit(2);
+        }
+        pins[npins].addr = a;
+        pins[npins].reg = r;
+        pins[npins].pad = !!p;
+        npins++;
+        s += used;
+        if (*s == ',')
+            s++;
+    }
+}
+
+static int pin_at(u64 addr)
+{
+    for (int i = 0; i < npins; i++)
+        if (pins[i].addr == addr)
+            return i;
+    printf("FAIL: access to unmodelled address 0x%llx\n", (unsigned long long)addr);
+    exit(1);
+}
+
+u32 read32(u64 addr)
+{
+    int i = pin_at(addr);
+    u32 reg = pins[i].reg & ~1u;
+    u32 mode = (pins[i].reg >> 1) & 7;
+
+    /* The pad level reaches the data bit through an enabled input stage only */
+    if ((pins[i].reg & BIT(9)) && mode && mode != 1)
+        reg |= pins[i].pad;
+    else
+        reg |= pins[i].reg & 1;
+    return reg;
+}
+
+void write32(u64 addr, u32 data)
+{
+    pins[pin_at(addr)].reg = data;
+}
+
+void udelay(u32 us)
+{
+    (void)us;
+}
 
 u32 adt_get_size(void)
 {
@@ -79,6 +149,7 @@ int main(int argc, char **argv)
         return 2;
     }
 
+    parse_pins();
     if (kboot_audio_amp_config(dt, adt)) {
         printf("kboot_audio_amp_config failed\n");
         return 1;
@@ -99,5 +170,25 @@ int main(int argc, char **argv)
         print_prop(dt, node, "apple,amp-tx-zd-config");
         printf("\n");
     }
+
+    if (kboot_audio_speaker_id(dt, adt)) {
+        printf("kboot_audio_speaker_id failed\n");
+        return 1;
+    }
+    if (fdt_check_full(dt, fdt_totalsize(dt))) {
+        printf("result is not a valid device tree\n");
+        return 1;
+    }
+    int chosen = fdt_path_offset(dt, "/chosen");
+    int len = 0;
+    const fdt32_t *id = chosen < 0 ? NULL : fdt_getprop(dt, chosen, "asahi,speaker-id", &len);
+    if (!id)
+        printf("speaker-id -\n");
+    else if (len != sizeof(*id))
+        printf("speaker-id bad-length-%d\n", len);
+    else
+        printf("speaker-id %u\n", fdt32_to_cpu(*id));
+    for (int i = 0; i < npins; i++)
+        printf("gpio 0x%llx 0x%08x\n", (unsigned long long)pins[i].addr, pins[i].reg);
     return 0;
 }

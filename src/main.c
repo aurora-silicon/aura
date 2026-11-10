@@ -250,6 +250,18 @@ void run_actions(void)
     fb_set_active(true);
 
     printf("No valid payload found\n");
+    /*
+     * An aura-try trial that cannot start its payload must not stop here: nobody may be at the
+     * Mac, and the proxy below is not guaranteed to keep the trial watchdog running. The trial
+     * marker was spent before this image was read, so a reboot lands on the configured Stage 2.
+     * Leave the error on the panel for a few seconds first.
+     */
+    if (aura_trial_enabled()) {
+        printf("\naura-try: the trial could not start its payload; rebooting to the configured "
+               "Stage 2 in 10 s\n");
+        mdelay(10000);
+        flush_and_reboot();
+    }
     if (stage1_config_target())
         /* Shown on the panel: this is where a user without a USB host ends up. */
         printf("\nStage 1: could not start the configured Stage 2 from the EFI partition.\n"
