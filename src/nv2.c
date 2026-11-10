@@ -1379,6 +1379,23 @@ static bool nv2_sysreg_do(struct nv2_cpu *c, u64 *regs, u64 esr)
             else if (nv2_guarded)
                 sptm_virt_amx_ctl_el2_write(value);
             break;
+        case KEY(3, 1, 15, 7, 4): {
+            /* An Apple implementation-defined register (unnamed; next to the PMU controls) that
+             * XNU writes from virtual EL2, e.g. right after a cluster's power-up: written to the
+             * hardware. Reads stay read-as-zero. */
+            static u32 n_fwd[MAX_CPUS];
+            if (read) {
+                nv2_note_unknown(c, key, read);
+                value = 0;
+                break;
+            }
+            msr(sys_reg(3, 1, 15, 7, 4), value);
+            u32 n = n_fwd[smp_id()]++;
+            if (n == 0 || (n & 0x3ff) == 0)
+                printf("NV2: cpu%d S3_1_C15_C7_4 <- 0x%lx forwarded (write #%u on this core)\n",
+                       smp_id(), value, n + 1);
+            break;
+        }
         case KEY(3, 6, 15, 12, 4):
             /* APSTS_EL1: PAC is up on the hardware; a guest hypervisor (SPTM's __start) polls
              * its bit 0 before it configures APCTL. */
