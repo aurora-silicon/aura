@@ -58,6 +58,13 @@ static struct node nodes[3];
 static unsigned requested, power_requested, consumer_enables, dart_enables, disables;
 static unsigned filter_writes, dart_gate_queries, instance_reads;
 static bool handoff, consumer_active, enable_error, dart_gates;
+/* Consumers the tree marks for a halted handoff, and what asc_init() finds for them. */
+static unsigned halted_requested, asc_inits, asc_frees;
+static bool asc_present, cpu_running;
+typedef struct asc_dev asc_dev_t;
+static asc_dev_t *asc_init(const char *p){(void)p;asc_inits++;return asc_present?(asc_dev_t *)1:NULL;}
+static void asc_free(asc_dev_t *asc){assert(asc);asc_frees++;}
+static bool asc_cpu_running(asc_dev_t *asc){assert(asc);return cpu_running;}
 static const u32 fake_gate = 126;
 static int find(const char *p) {
  for(int i=0;i<3;i++) {
@@ -110,6 +117,7 @@ static const void *fdt_getprop(const void *dt,int id,const char *key,void *len)
 {(void)dt;(void)id;(void)key;(void)len;return handoff?&fake_gate:NULL;}
 static int fdt_stringlist_search(const void *dt,int id,const char *key,const char *value) {
  (void)dt;(void)id;int n=find(value);if(n<4)return -1;
+ if(!strcmp(key,"linux-enablement-mac,dapf-halted-handoff"))return (halted_requested&(1U<<(n-4)))?0:-1;
  return ((!strcmp(key,"linux-enablement-mac,dapf-handoff")?requested:power_requested)&(1U<<(n-4)))?0:-1;
 }
 static int fdt_node_check_compatible(const void *dt,int node,const char *compat)
@@ -121,6 +129,7 @@ static void reset(void) {
  memcpy(nodes,original,sizeof(nodes));chip_id=T8132;requested=7;power_requested=4;
  consumer_enables=dart_enables=disables=filter_writes=dart_gate_queries=instance_reads=0;
  handoff=true;consumer_active=enable_error=dart_gates=false;
+ halted_requested=asc_inits=asc_frees=0;asc_present=cpu_running=false;
 }
 static void preserved(void) {assert(!dart_enables&&!disables&&!filter_writes&&!dart_gate_queries);}
 static void rejected(void) {assert(dapf_init("/arm-io/dart-pmp",1)<0);preserved();}
@@ -184,6 +193,13 @@ int main(void) {
  assert(consumer_enables==1&&consumer_active);preserved();
  reset();handoff=false;nodes[2].instance_len=31;assert(!dapf_init_j713((void *)1));
  assert(!consumer_enables&&!instance_reads);preserved();
+ /* An inactive consumer the tree marks for a halted handoff (the J604's MTP) reaches the
+  * halted writer only if its CPU is seen stopped: a running or missing ASC leaves it alone. */
+ reset();halted_requested=2;asc_present=true;cpu_running=true;assert(dapf_init_j713((void *)1)==1);
+ assert(asc_inits==1&&asc_frees==1);preserved();
+ reset();halted_requested=2;assert(dapf_init_j713((void *)1)==1);
+ assert(asc_inits==1&&!asc_frees);preserved();
+ reset();assert(dapf_init_j713((void *)1)==1);assert(!asc_inits);preserved();
  /* The central T8132 branch is the only change to the legacy flow. */
  reset();chip_id=0x8110;dart_gates=true;assert(!dapf_init("/arm-io/dart-aop",1));
  assert(filter_writes==5*(nodes[0].config_len/52)&&dart_enables==1&&disables==1);
@@ -235,6 +251,8 @@ def test_j713_instance_and_power_flow(tmp_path):
         ("consumer power", 'if (pmgr_adt_power_enable(entry->consumer) < 0)', 'if (false)'),
         ("caller count", 'count += 1;', 'count += 0;'),
         ("inactive consumer", 'if (powered <= 0)', 'if (powered <= 0 && false)'),
+        ("halted check", "bool running = !asc || asc_cpu_running(asc);",
+         "bool running = !asc || (asc_cpu_running(asc) && false);"),
     ]
     for title, old, new in controls:
         bad = harness.replace(old, new, 1)
