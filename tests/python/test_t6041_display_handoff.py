@@ -11,6 +11,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 
 import pytest
 from host_compiler import host_cc
@@ -33,6 +34,9 @@ def build_host(tmp, unknown_profile=False):
     src.mkdir()
     # The code under test next to the stand-ins, so that its #include "utils.h" finds them
     code = (ROOT / "src/kboot_display_handoff.c").read_text()
+    if sys.platform == "darwin":
+        # The host fixture has no aura ELF linker script; retain a dedicated Mach-O section.
+        code = code.replace('section(".init.t6050")', 'section("__TEXT,__t6050_init")')
     if unknown_profile:
         # An unqualified profile must never match even when the loaded firmware is unknown too.
         start = code.index("static const struct dcp_soc dcp_soc_t6041 = {")
