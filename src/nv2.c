@@ -1379,23 +1379,23 @@ static bool nv2_sysreg_do(struct nv2_cpu *c, u64 *regs, u64 esr)
             else if (nv2_guarded)
                 sptm_virt_amx_ctl_el2_write(value);
             break;
-        case KEY(3, 1, 15, 7, 4): {
-            /* An Apple implementation-defined register (unnamed; next to the PMU controls) that
-             * XNU writes from virtual EL2, e.g. right after a cluster's power-up: written to the
-             * hardware. Reads stay read-as-zero. */
-            static u32 n_fwd[MAX_CPUS];
-            if (read) {
-                nv2_note_unknown(c, key, read);
-                value = 0;
-                break;
-            }
-            msr(sys_reg(3, 1, 15, 7, 4), value);
-            u32 n = n_fwd[smp_id()]++;
-            if (n == 0 || (n & 0x3ff) == 0)
-                printf("NV2: cpu%d S3_1_C15_C7_4 <- 0x%lx forwarded (write #%u on this core)\n",
-                       smp_id(), value, n + 1);
+        case KEY(3, 1, 15, 7, 4):
+        case KEY(3, 5, 15, 1, 6):
+        case KEY(3, 4, 15, 12, 6):
+            /* Apple implementation-defined registers (unnamed) that XNU reads and writes from
+             * virtual EL2: performed on the hardware, both ways, so a read-modify-write keeps
+             * the bits the hardware holds. */
+            if (read)
+                value = op1 == 1   ? mrs(sys_reg(3, 1, 15, 7, 4))
+                        : op1 == 5 ? mrs(sys_reg(3, 5, 15, 1, 6))
+                                   : mrs(sys_reg(3, 4, 15, 12, 6));
+            else if (op1 == 1)
+                msr(sys_reg(3, 1, 15, 7, 4), value);
+            else if (op1 == 5)
+                msr(sys_reg(3, 5, 15, 1, 6), value);
+            else
+                msr(sys_reg(3, 4, 15, 12, 6), value);
             break;
-        }
         case KEY(3, 6, 15, 12, 4):
             /* APSTS_EL1: PAC is up on the hardware; a guest hypervisor (SPTM's __start) polls
              * its bit 0 before it configures APCTL. */
