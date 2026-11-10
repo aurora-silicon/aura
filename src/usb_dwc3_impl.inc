@@ -962,9 +962,7 @@ static void usb_dwc3_ep0_handle_standard_endpoint(dwc3_dev_t *dev,
                         break;
                     }
                     usb_dwc3_ep_set_stall(dev, ep_to_num(setup->feature.wEndpoint), 0);
-                    dev->ep0_state = usb_dwc3_start_status_phase(dev, USB_LEP_CTRL_IN)
-                                         ? USB_DWC3_EP0_STATE_IDLE
-                                         : USB_DWC3_EP0_STATE_DATA_SEND_STATUS_DONE;
+                    dev->ep0_state = USB_DWC3_EP0_STATE_DATA_SEND_STATUS;
                     break;
                 default:
                     usb_dwc3_ep_set_stall(dev, 0, 1);
@@ -1035,19 +1033,15 @@ static void usb_dwc3_ep0_handle_class(dwc3_dev_t *dev, const union usb_setup_pac
             } else {
                 usb_debug_printf("ACM device closed\n");
             }
-            if (chip_id == T8142 || chip_id == T8152) {
-                /* Wait for XferNotReady before the no-data status TRB on M5/M6,
-                 * for both DTR-open and DTR-close requests. */
-                dev->ep0_state = USB_DWC3_EP0_STATE_DATA_SEND_STATUS;
-            } else if (usb_dwc3_start_status_phase(dev, USB_LEP_CTRL_IN)) {
-                dev->pipe[pipe].ready = false;
-#if USB_DWC3_SUPERSPEED
-                dev->primary_dtr_pending = false;
-#endif
-                dev->ep0_state = USB_DWC3_EP0_STATE_IDLE;
-            } else {
-                dev->ep0_state = USB_DWC3_EP0_STATE_DATA_SEND_STATUS_DONE;
-            }
+            /*
+             * The status TRB of a request without a data stage may only be started once the
+             * controller reports XferNotReady for the status stage, like SET_ADDRESS and
+             * SET_CONFIGURATION above. Starting it from the SETUP completion races the host's
+             * status token. When the TRB wins on T8132, the host still sees the request
+             * complete, but the controller reports XferNotReady instead of XferComplete, keeps
+             * the TRB and raises no further event on any endpoint.
+             */
+            dev->ep0_state = USB_DWC3_EP0_STATE_DATA_SEND_STATUS;
             break;
 
         case USB_REQUEST_CDC_SET_LINE_CODING:
