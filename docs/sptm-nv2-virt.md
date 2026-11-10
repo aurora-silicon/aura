@@ -49,15 +49,19 @@ The boot object for a J616s is this tree's Stage 1, unfilled (so it stays in the
 Mach-O boot object and padded for the 128 MiB CTXR window like the J616s Linux Stage 1, and
 enrolled with `--compress` on the macOS install's own volume group. It is built with the size profile
 in `docs/m5-macos-esp.md` (`CARGO_PROFILE_RELEASE_OPT_LEVEL=z`, `EXTRA_CFLAGS=-Oz`): without it the
-image passes the DCP log buffer limit. Nothing in the host or in aura names T6040; the image sets for
-`tests/python/test_sptm_virt_generic.py` are named like the others (`j616s-26A428`).
+image passes the DCP log buffer limit. The host image set follows the same naming as the others
+(`j616s-26A428` in `tests/python/test_sptm_virt_generic.py`).
 
 What is known before the first run:
 
-- The sleep path's discovery finds no per-core self-disable block on `pmgr1,t6041` at the places
-  the generic table names, so `AURA_S2R_*` switches are dropped with "no sleep path". The same
-  return skips keeping the debug link's power domains, so with the proxy on CDC the link is
-  expected to drop when XNU lowers them. Run the proxy on KIS (DockChannel, always on) instead.
+- `pmgr1,t6041` uses the timer-only sleep path: the one compatible-keyed fact is that the master
+  mini-PMGR is ADT `reg[54]` and its S2R timer is at `+0x4000`. The traced PMGR banks come from
+  `ps-groups`, each core and cluster window from `cpu-impl-reg`, `acc-impl-reg` and `cpm-impl-reg`,
+  and the primary PMU and its SPMI controller from their ADT nodes. A write that starts that timer
+  is the commit and stop point; no per-core self-disable block is required.
+- CDC domain keeping is discovered separately from the sleep blocks. A CDC run keeps the debug
+  controller, DART and PHY domains when XNU lowers them even if sleep discovery or tracing is off;
+  KIS remains useful for a sleep run that deliberately drops USB at the commit.
 - macOS 27.0 (26A428) ships one kernelcache for this SoC family. It has the J813's XNU release but
   not its fingerprint, so no `XNU_QUIRKS` entry applies. If it stops on the same RO-zone panic, hide
   the PCIe and Wi-Fi nodes with `AURA_HIDE_NODES` until it has an entry of its own.

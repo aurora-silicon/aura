@@ -48,6 +48,7 @@ static const struct s2r_place s2r_places[] = {
 #define S2R_PMC_PAGE1  0x8a8000
 #define S2R_NUB_WAKE   0x28
 #define S2R_AMCC_ERR   0x25000
+#define S2R_PAGE_MASK  0x3fff
 
 static u32 s2r_u32(const void *adt, int node, const char *name, u32 dflt)
 {
@@ -76,23 +77,26 @@ static int s2r_by_phandle(const void *adt, int parent, u32 phandle, bool grandch
     return -1;
 }
 
-static void s2r_add_link(struct s2r_soc *out, const void *adt, int node)
+static void s2r_add_link(struct s2r_link *out, const void *adt, int node)
 {
     if (out->n_link >= S2R_LINK_NODES)
         return;
-    char *p = out->link_paths[out->n_link++];
+    char *p = out->paths[out->n_link++];
     const char *name = adt_get_name(adt, node);
     size_t n = strlen(name);
-    if (n > sizeof(out->link_paths[0]) - sizeof("/arm-io/"))
-        n = sizeof(out->link_paths[0]) - sizeof("/arm-io/");
+    if (n > sizeof(out->paths[0]) - sizeof("/arm-io/"))
+        n = sizeof(out->paths[0]) - sizeof("/arm-io/");
     memcpy(p, "/arm-io/", 8);
     memcpy(p + 8, name, n);
     p[8 + n] = 0;
 }
 
 /* The controller, DART and PHY of each hidden USB port, from its PHY's phandle. */
-static int s2r_link_from_adt(const void *adt, const u32 *phys, int n_phys, struct s2r_soc *out)
+int s2r_link_from_adt(const void *adt, const u32 *phys, int n_phys, struct s2r_link *out,
+                      const char **missing)
 {
+    memset(out, 0, sizeof(*out));
+    *missing = "debug-link USB port";
     int io = adt_path_offset(adt, "/arm-io");
     if (io < 0)
         return -1;
@@ -114,7 +118,10 @@ static int s2r_link_from_adt(const void *adt, const u32 *phys, int n_phys, struc
             s2r_add_link(out, adt, phy);
         }
     }
-    return out->n_link ? 0 : -1;
+    if (!out->n_link)
+        return -1;
+    *missing = NULL;
+    return 0;
 }
 
 /* A traced range, exactly as the ADT gives it (a partial last page is hooked to its end). */
@@ -172,15 +179,96 @@ static int s2r_trace_cpus(const void *adt, struct s2r_soc *out)
     return seen ? 0 : -1;
 }
 
+static int s2r_node_path(char *path, size_t size, const char *bus, const char *child)
+{
+    const char prefix[] = "/arm-io/";
+    size_t prefix_len = sizeof(prefix) - 1;
+    size_t bus_len = strlen(bus);
+    size_t child_len = child ? strlen(child) : 0;
+    size_t need = prefix_len + bus_len + (child ? 1 + child_len : 0) + 1;
+    if (need > size)
+        return -1;
+    memcpy(path, prefix, prefix_len);
+    memcpy(path + prefix_len, bus, bus_len);
+    size_t used = prefix_len + bus_len;
+    if (child) {
+        path[used++] = '/';
+        memcpy(path + used, child, child_len);
+        used += child_len;
+    }
+    path[used] = 0;
+    return 0;
+}
+
 /*
- * A PMGR whose sleep is the S2R timer's start alone, with no per-core self-disable block: the
- * timer's reg entry and offset. Measured on J714s (26A428): the sleep commit is one core's 32-bit
- * write of 1 there. Its PS groups and the cores' windows come from the ADT.
+ * Find the primary PMU from its `pmu,spmi` compatibility and `is-primary` property. Its parent
+ * SPMI controller's ADT reg[0] is the command/status/reply block used by spmi.c; hook it to time
+ * PMU traffic around the timer commit. The PMU's `reg` property supplies the SPMI slave ID.
+ */
+static int s2r_trace_pmu(const void *adt, struct s2r_soc *out)
+{
+    int io = adt_path_offset(adt, "/arm-io");
+    int found_bus = -1, found_pmu = -1;
+    if (io < 0)
+        return -1;
+    int bus = io;
+    ADT_FOREACH_CHILD(adt, bus)
+    {
+        int pmu = bus;
+        ADT_FOREACH_CHILD(adt, pmu)
+        {
+            u32 len;
+            const u32 *reg;
+            if (!adt_is_compatible(adt, pmu, "pmu,spmi") ||
+                !(reg = adt_getprop(adt, pmu, "reg", &len)) || len < sizeof(*reg))
+                continue;
+            if (found_pmu < 0) {
+                found_bus = bus;
+                found_pmu = pmu;
+            }
+            if (s2r_u32(adt, pmu, "is-primary", 0)) {
+                found_bus = bus;
+                found_pmu = pmu;
+                goto found;
+            }
+        }
+    }
+found:
+    if (found_pmu < 0)
+        return -1;
+
+    char bus_path[48];
+    const char *bus_name = adt_get_name(adt, found_bus);
+    const char *pmu_name = adt_get_name(adt, found_pmu);
+    if (s2r_node_path(bus_path, sizeof(bus_path), bus_name, NULL) < 0 ||
+        s2r_node_path(out->pmu_path, sizeof(out->pmu_path), bus_name, pmu_name) < 0)
+        return -1;
+    int path[8];
+    u64 a, s;
+    if (adt_path_offset_trace(adt, bus_path, path) < 0 ||
+        adt_get_reg(adt, path, "reg", 0, &a, &s) < 0 ||
+        s2r_trace_add(a, s, "spmi-pmu-reg0", false, out) < 0)
+        return -1;
+    u32 len;
+    const u32 *reg = adt_getprop(adt, found_pmu, "reg", &len);
+    if (!reg || len < sizeof(*reg))
+        return -1;
+    out->pmu_slave = reg[0];
+    return 0;
+}
+
+/*
+ * A PMGR whose sleep is the S2R timer's start alone, with no per-core self-disable block. The ADT
+ * gives every traced aperture; this table only names which PMGR reg entry contains the timer and
+ * its register-relative offset.
  */
 static const struct {
     const char *compatible;
     u32 reg, off;
 } s2r_timer_only[] = {
+    /* T6040/T6041 master mini-PMGR: ADT reg[54], whose +0x4000 write times the sleep commit. */
+    {"pmgr1,t6041", 54, 0x4000},
+    /* T6050 S2R timer bank: ADT reg[11], whose +0x4000 write times the sleep commit. */
     {"pmgr1,t6050", 11, 0x4000},
 };
 
@@ -194,22 +282,32 @@ static int s2r_timer_only_trace(const void *adt, int *path, const u32 *ps, u32 n
             ps[3 * i + 1] >= out->trace[out->n_trace - 1].size)
             return -1;
     }
-    if (s2r_trace_bank(adt, path, timer_reg, n_reg, out) < 0)
+    u64 timer_base, timer_size;
+    if (timer_reg >= n_reg ||
+        adt_get_reg(adt, path, "reg", timer_reg, &timer_base, &timer_size) < 0 ||
+        (timer_size & S2R_PAGE_MASK))
         return -1;
-    const struct s2r_trace_blk *timer = &out->trace[out->n_trace - 1];
-    if (timer->size < timer_off + 4)
+    bool timer_traced = false;
+    for (int i = 0; i < out->n_trace; i++)
+        timer_traced |=
+            out->trace[i].base == timer_base && out->trace[i].declared_size == timer_size;
+    if ((!timer_traced &&
+         s2r_trace_add(timer_base, timer_size, "pmgr-s2r-timer", false, out) < 0) ||
+        timer_size < timer_off + 4)
         return -1;
-    out->stop_timer = timer->base + timer_off;
+    out->stop_timer = timer_base + timer_off;
     *missing = "CPU, ACC and CPM windows";
     if (s2r_trace_cpus(adt, out) < 0)
+        return -1;
+    *missing = "primary SPMI PMU";
+    if (s2r_trace_pmu(adt, out) < 0)
         return -1;
     out->timer_only = true;
     *missing = NULL;
     return 0;
 }
 
-int s2r_soc_from_adt(const void *adt, const u32 *link_phys, int n_phys, struct s2r_soc *out,
-                     const char **missing)
+int s2r_soc_from_adt(const void *adt, struct s2r_soc *out, const char **missing)
 {
     int path[8];
     u32 len;
@@ -285,9 +383,6 @@ int s2r_soc_from_adt(const void *adt, const u32 *link_phys, int n_phys, struct s
             s2r_u32(adt, node, "amcc-count", 1) * s2r_u32(adt, node, "dcs-count-per-amcc", 1);
     }
 
-    *missing = "debug-link USB port";
-    if (s2r_link_from_adt(adt, link_phys, n_phys, out) < 0)
-        return -1;
     *missing = NULL;
     return 0;
 }

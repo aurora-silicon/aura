@@ -32,7 +32,8 @@ spec = importlib.util.spec_from_file_location("rgs", REPO / "proxyclient/tools/r
 rgs = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(rgs)
 
-pytestmark = pytest.mark.skipif(not SETS, reason="real image sets not given (SPTM_VIRT_IMAGE_SETS)")
+real_images = pytest.mark.skipif(not SETS,
+                                 reason="real image sets not given (SPTM_VIRT_IMAGE_SETS)")
 
 NOP = 0xD503201F
 # What the J700 (25G83) used before: its debug-port nodes and SPTM patches (offset from entry,
@@ -91,6 +92,7 @@ def same(a, b):
            (b.boot_args, b.adt, b.regions, [(x.what, x.pa, x.size, x.total) for x in b.loads])
 
 
+@real_images
 def test_plan_per_image_set():
     rows = []
     for d in image_sets():
@@ -147,6 +149,38 @@ def build(tmp):
     return out
 
 
+def parse_s2r(out):
+    res = {"link": [], "domains": [], "skipped": [], "trace": []}
+    for line in out.splitlines():
+        f = line.split()
+        if f[0] == "rc":
+            res["rc"], res["missing"] = int(f[1]), " ".join(f[3:])
+        elif f[0] == "link_rc":
+            res["link_rc"], res["link_missing"] = int(f[1]), " ".join(f[3:])
+        elif f[0] in BLOCKS:
+            res[f[0]] = (int(f[1], 16), int(f[2], 16))
+        elif f[0] == "pms_pmc":
+            res["pms_pmc"] = (int(f[1], 16), int(f[2], 16))
+        elif f[0] == "nub_wake_status":
+            res["nub_wake_status"] = int(f[1], 16)
+        elif f[0] == "amcc":
+            res["amcc"], res["amcc_planes"] = int(f[1], 16), int(f[2])
+        elif f[0] == "timer_only":
+            res["timer_only"] = (int(f[1]), int(f[2], 16), int(f[3]), int(f[4]))
+        elif f[0] == "trace":
+            res["trace"].append((f[1], int(f[2], 16), int(f[3], 16), int(f[4], 16)))
+        elif f[0] == "pmu":
+            res["pmu"] = (f[1], int(f[2], 16))
+        elif f[0] == "link":
+            res["link"].append(f[1])
+        elif f[0] == "skipped":
+            res["skipped"].append(" ".join(f[1:]))
+        elif f[0] == "domain":
+            res["domains"].append((int(f[2], 16), int(f[4], 16)))
+    res["report_off"] = sorted({a for a, fl in res["domains"] if fl & 2})
+    return res
+
+
 def s2r(host, tmp, d, port=None):
     # An IPSW DeviceTree flags the properties iBoot fills (size bit 31), which a live tree has
     # cleared; aura's reader reads the live layout.
@@ -161,29 +195,7 @@ def s2r(host, tmp, d, port=None):
     phys, _port = rgs.debug_port(adt, 0, port)
     out = subprocess.run([str(host), str(tmp / d.name)] + [hex(ph) for ph in phys[:2]],
                          check=True, capture_output=True, text=True).stdout
-    res = {"link": [], "domains": [], "skipped": []}
-    for line in out.splitlines():
-        f = line.split()
-        if f[0] == "rc":
-            res["rc"], res["missing"] = int(f[1]), " ".join(f[3:])
-        elif f[0] in BLOCKS:
-            res[f[0]] = (int(f[1], 16), int(f[2], 16))
-        elif f[0] == "pms_pmc":
-            res["pms_pmc"] = (int(f[1], 16), int(f[2], 16))
-        elif f[0] == "nub_wake_status":
-            res["nub_wake_status"] = int(f[1], 16)
-        elif f[0] == "amcc":
-            res["amcc"], res["amcc_planes"] = int(f[1], 16), int(f[2])
-        elif f[0] == "timer_only":
-            res["timer_only"] = (int(f[1]), int(f[2], 16), int(f[3]), int(f[4]))
-        elif f[0] == "link":
-            res["link"].append(f[1])
-        elif f[0] == "skipped":
-            res["skipped"].append(" ".join(f[1:]))
-        elif f[0] == "domain":
-            res["domains"].append((int(f[2], 16), int(f[4], 16)))
-    res["report_off"] = sorted({a for a, fl in res["domains"] if fl & 2})
-    return res
+    return parse_s2r(out)
 
 
 def pmgr_regs(adt):
@@ -195,6 +207,7 @@ def pmgr_regs(adt):
                                                  for i in range(len(reg) // 16))]
 
 
+@real_images
 def test_s2r_soc_per_image_set(tmp_path):
     host = build(tmp_path)
     rows = []
@@ -207,6 +220,16 @@ def test_s2r_soc_per_image_set(tmp_path):
         skipped = f", not traced: {', '.join(res['skipped'])}" if res["skipped"] else ""
         rows.append(f"{d.name}: S2R {state}{skipped}")
         old = S2R_OLD.get(d.name)
+        if d.name == "j616s-26A428":
+            regs = pmgr_regs((d / "dtree").read_bytes())
+            names = [t[0] for t in res["trace"]]
+            assert res["rc"] == 0 and only, res
+            # pmgr1,t6041's master mini-PMGR is reg[54]; its +0x4000 timer write commits sleep.
+            assert timer == regs[54][0] + 0x4000
+            assert {"pmgr-ps", "cpu-impl", "acc-impl", "cpm-impl",
+                    "spmi-pmu-reg0"}.issubset(names)
+            # The primary Abbey L1 PMU's ADT reg property gives SPMI USID 0xe.
+            assert res["pmu"][1] == 0xe
         if not old:
             continue
         regs = pmgr_regs((d / "dtree").read_bytes())
@@ -217,3 +240,33 @@ def test_s2r_soc_per_image_set(tmp_path):
             want = list(old[k]) if isinstance(old[k], list) else old[k]
             assert res[k] == want, k
     print("\n" + "\n".join(rows))
+
+
+def raw_node(name, props=None, kids=None):
+    node = plan_mod.RawNode()
+    node.props = [["name", name.encode() + b"\0", 0]]
+    node.props += [[key, val, 0] for key, val in (props or {}).items()]
+    node.kids = kids or []
+    return node
+
+
+def test_cdc_link_discovery_does_not_require_sleep_blocks(tmp_path):
+    """A CDC port remains discoverable when the synthetic ADT deliberately has no PMGR."""
+    phy_handle, mapper_handle = 1, 2
+    phy = raw_node("atc-phy0", {"AAPL,phandle": struct.pack("<I", phy_handle)})
+    drd = raw_node("usb-drd0", {"atc-phy-parent": struct.pack("<I", phy_handle),
+                                "iommu-parent": struct.pack("<I", mapper_handle)})
+    mapper = raw_node("mapper-usb0", {"AAPL,phandle": struct.pack("<I", mapper_handle)})
+    dart = raw_node("dart-usb0", kids=[mapper])
+    io = raw_node("arm-io", kids=[phy, drd, dart])
+    adt = plan_mod.adt_build(raw_node("device-tree", kids=[io]))
+    path = tmp_path / "cdc-only.adt"
+    path.write_bytes(adt)
+
+    host = build(tmp_path)
+    out = subprocess.run([str(host), str(path), hex(phy_handle)], check=True,
+                         capture_output=True, text=True).stdout
+    res = parse_s2r(out)
+    assert res["rc"] == -1 and res["missing"] == "PMGR ps-regs"
+    assert res["link_rc"] == 0
+    assert res["link"] == ["/arm-io/usb-drd0", "/arm-io/dart-usb0", "/arm-io/atc-phy0"]

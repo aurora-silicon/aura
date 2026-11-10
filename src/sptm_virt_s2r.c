@@ -16,10 +16,11 @@
  * the states XNU asked for and can tear its USB gadget down; the first reset after the commit is
  * the wake, and the link can be taken again on a running macOS.
  *
- * The SoC's blocks (PMGR, PMS, the AON wake status, the AMCC, the debug link) come from the ADT
- * (sptm_virt_s2r_soc.c); a SoC whose ADT lacks one gets no sleep path. On a PMGR whose sleep is the
- * S2R timer's start alone (no per-core self-disable block), the trace records the PMGR's PS groups
- * and the cores' windows, the commit is that start, and none of the per-core or domain rules run.
+ * The SoC's sleep blocks (PMGR, PMS, the AON wake status and the AMCC) and the debug link are two
+ * independent ADT discoveries (sptm_virt_s2r_soc.c), so CDC domain keeping still works without a
+ * sleep path. On a PMGR whose sleep is the S2R timer's start alone (no per-core self-disable
+ * block), the trace records the PMGR's PS groups, the cores' windows and the primary SPMI PMU; the
+ * commit is that start, and none of the per-core rules run.
  */
 
 #include "sptm_virt.h"
@@ -64,12 +65,16 @@
 
 static struct s2r_soc s2r_soc_adt;
 static const struct s2r_soc *s2r_soc;
+static struct s2r_link s2r_link_adt;
+static const struct s2r_link *s2r_link;
 /* Phandles of the USB PHYs whose ports the host hid from the guest for aura's link. */
 u32 sptm_virt_link_phys[2];
 
 /* Link domains XNU requires off at quiesce (ADT device flag 0x2). They stay on because the link's
  * hidden devices are never powered down, so once the sleep has begun reads report them off. */
 #define S2R_PMGR_OFF_AT_SLEEP 0x2
+#define S2R_PMGR_TARGET       GENMASK(3, 0)
+#define S2R_PMGR_ACTUAL       GENMASK(7, 4)
 static u64 s2r_report_off_regs[4];
 static int s2r_n_report_off;
 
@@ -343,8 +348,8 @@ static void s2r_release_kept(void)
     }
     s2r_keep_released = true;
     int failed = 0;
-    for (int i = 0; i < s2r_soc->n_link; i++)
-        failed += pmgr_adt_power_disable(s2r_soc->link_paths[i]) < 0;
+    for (int i = 0; s2r_link && i < s2r_link->n_link; i++)
+        failed += pmgr_adt_power_disable(s2r_link->paths[i]) < 0;
     if (!sptm_virt_s2r_quiet)
         printf("SPTM-virt[s2r]: released %d debug-link domains; powered the ATC0 link down%s\n", n,
                failed ? " (some domains refused)" : "");
@@ -617,7 +622,8 @@ bool sptm_virt_s2r_wfi(u64 *regs, u64 esr)
            cpu, s2r_parked_mask, sptm_virt_s2r_head);
     sptm_virt_s2r_dump_tail(4096);
     struct uartproxy_msg_start start = {
-        .reason = START_HV, .code = 0x53325221, /* 'S2R!' */
+        .reason = START_HV,
+        .code = 0x53325221, /* 'S2R!' */
     };
     uartproxy_run(&start);
     while (1)
@@ -630,8 +636,43 @@ static bool s2r_wakerec_printed;
 
 static bool s2r_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int width)
 {
+    int k = width == 2 && !s2r_keep_released && (s2r_keep_always || s2r_armed())
+                ? s2r_keep_idx(addr)
+                : -1;
+
+    /* The link's domains: XNU's lowering writes are shadowed, and reads then see them. This runs
+     * before either sleep-hook shape so CDC keeping does not depend on a sleep path. */
+    if (k >= 0 && write &&
+        FIELD_GET(S2R_PMGR_TARGET, *val) < FIELD_GET(S2R_PMGR_TARGET, read32(addr))) {
+        s2r_keep_shadow[k] = *val;
+        s2r_keep_low[k] = true;
+        sptm_virt_s2r_note(ctx, addr, *val, true, width);
+        if (!s2r_keep_told[k]) {
+            s2r_keep_told[k] = true;
+            s2r_marker("KEEPDBG", addr);
+            printf("SPTM-virt[s2r]: kept debug-link domain on: "
+                   "XNU wrote 0x%lx -> 0x%lx (pc 0x%lx)\n",
+                   *val, addr, ctx->elr);
+        }
+        return true;
+    }
+    if (k >= 0 && !write && s2r_keep_low[k]) {
+        u32 tgt = FIELD_GET(S2R_PMGR_TARGET, s2r_keep_shadow[k]);
+        *val = (read32(addr) & ~(S2R_PMGR_TARGET | S2R_PMGR_ACTUAL)) |
+               FIELD_PREP(S2R_PMGR_TARGET, tgt) | FIELD_PREP(S2R_PMGR_ACTUAL, tgt);
+        sptm_virt_s2r_note(ctx, addr, *val, false, width);
+        return true;
+    }
+    if (k >= 0 && write) {
+        /* Not lowering it. A low write only gets here with the domain already low, after a wake
+         * and before the re-take powers it: XNU still wants it low. */
+        s2r_keep_low[k] = !FIELD_GET(S2R_PMGR_TARGET, *val);
+        if (s2r_keep_low[k])
+            s2r_keep_shadow[k] = *val;
+    }
+
     /* Timer-only sleep: the S2R timer's start is the commit; everything else is recorded. */
-    if (s2r_soc->timer_only) {
+    if (s2r_soc && s2r_soc->timer_only) {
         if (write && width == 2 && addr == s2r_soc->stop_timer && *val == 1 && s2r_armed()) {
             sptm_virt_s2r_note(ctx, addr, *val, true, width);
             if (!s2r_go || (sptm_virt_s2r_go_count && s2r_wake_count >= sptm_virt_s2r_go_count)) {
@@ -667,43 +708,11 @@ static bool s2r_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int w
         }
         return true;
     }
-    int k = width == 2 && !s2r_keep_released && (s2r_keep_always || s2r_armed())
-                ? s2r_keep_idx(addr)
-                : -1;
-
     /* From the first core's self-disable, a domain XNU must find off at quiesce reads off. */
     if (!write && width == 2 && s2r_twi_mask && s2r_report_off(addr)) {
-        *val = read32(addr) & ~0xffUL;
+        *val = read32(addr) & ~(S2R_PMGR_TARGET | S2R_PMGR_ACTUAL);
         sptm_virt_s2r_note(ctx, addr, *val, false, width);
         return true;
-    }
-
-    /* The link's domains: XNU's lowering writes are shadowed, and reads then see them. */
-    if (k >= 0 && write && (*val & 0xf) < (read32(addr) & 0xf)) {
-        s2r_keep_shadow[k] = *val;
-        s2r_keep_low[k] = true;
-        sptm_virt_s2r_note(ctx, addr, *val, true, width);
-        if (!s2r_keep_told[k]) {
-            s2r_keep_told[k] = true;
-            s2r_marker("KEEPDBG", addr);
-            printf("SPTM-virt[s2r]: kept debug-link domain on: "
-                   "XNU wrote 0x%lx -> 0x%lx (pc 0x%lx)\n",
-                   *val, addr, ctx->elr);
-        }
-        return true;
-    }
-    if (k >= 0 && !write && s2r_keep_low[k]) {
-        u32 tgt = s2r_keep_shadow[k] & 0xf;
-        *val = (read32(addr) & ~0xffUL) | tgt | (tgt << 4);
-        sptm_virt_s2r_note(ctx, addr, *val, false, width);
-        return true;
-    }
-    if (k >= 0 && write) {
-        /* Not lowering it. A low write only gets here with the domain already low, after a wake
-         * and before the re-take powers it: XNU still wants it low. */
-        s2r_keep_low[k] = !(*val & 0xf);
-        if (s2r_keep_low[k])
-            s2r_keep_shadow[k] = *val;
     }
 
     bool first;
@@ -753,7 +762,7 @@ static bool s2r_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int w
     /* Each core disables itself in the PMGR CPU block on its way to its last WFI; a cluster armed
      * off is the same moment for the boot core. */
     if (write && (!strcmp(what, "pmgr-soc-misc") ||
-                  (!strcmp(what, "pmgr-cluster-ctl") && (*val & 0xf) == 0)))
+                  (!strcmp(what, "pmgr-cluster-ctl") && !FIELD_GET(S2R_PMGR_TARGET, *val))))
         s2r_core_sleeps();
     return true;
 }
@@ -787,6 +796,11 @@ static bool s2r_hook_capture(const struct s2r_trace_blk *b)
     for (u64 page = b->base; page < b->base + b->size; page += 0x4000) {
         if (sptm_virt_rg_owns(page))
             continue;
+        bool dup = false;
+        for (u32 i = 0; i < sptm_virt_s2r_pages; i++)
+            dup |= s2r_pages[i].page == page;
+        if (dup)
+            continue; /* the CDC keep rule may already own this PMGR page */
         u64 size = min(0x4000UL, b->base + b->size - page);
         if (sptm_virt_s2r_pages >= ARRAY_SIZE(s2r_pages) || hv_map_hook(page, s2r_hook, size) < 0) {
             printf("SPTM-virt[s2r]: cannot hook capture %s 0x%lx + 0x%lx\n", b->what, page, size);
@@ -817,14 +831,14 @@ static void s2r_hook_blk(const struct s2r_blk *blk, const char *what, u64 off, u
         s2r_hook_range(what, blk->base + off, size ? size : blk->size);
 }
 
-static void s2r_keep_setup(void)
+static void s2r_keep_setup(const struct s2r_link *link)
 {
-    for (int i = 0; i < s2r_soc->n_link; i++) {
+    for (int i = 0; i < link->n_link; i++) {
         u64 regs[S2R_KEEP_MAX];
         u8 flags[S2R_KEEP_MAX];
-        int n = pmgr_adt_collect_psregs(s2r_soc->link_paths[i], regs, flags, S2R_KEEP_MAX);
+        int n = pmgr_adt_collect_psregs(link->paths[i], regs, flags, S2R_KEEP_MAX);
         if (n < 0)
-            printf("SPTM-virt[s2r]: cannot list the power domains of %s\n", s2r_soc->link_paths[i]);
+            printf("SPTM-virt[s2r]: cannot list the power domains of %s\n", link->paths[i]);
         for (int j = 0; j < n; j++) {
             if (s2r_keep_idx(regs[j]) >= 0 || s2r_report_off(regs[j]))
                 continue;
@@ -1111,38 +1125,45 @@ static void s2r_t6050_coproc(bool mem)
 void sptm_virt_s2r_setup(bool cdc)
 {
     u64 flags = sptm_virt_flags;
+    u64 sleep_flags = SPTM_VIRT_S2R | SPTM_VIRT_S2R_GO | SPTM_VIRT_S2R_FULL | SPTM_VIRT_S2R_COPROC |
+                      SPTM_VIRT_S2R_DROP_USB | SPTM_VIRT_S2R_MEM;
+
+    const char *link_missing;
+    if (s2r_link_from_adt(adt, sptm_virt_link_phys, ARRAY_SIZE(sptm_virt_link_phys), &s2r_link_adt,
+                          &link_missing) == 0) {
+        s2r_link = &s2r_link_adt;
+    } else {
+        s2r_link = NULL;
+        if (cdc)
+            printf("SPTM-virt[s2r]: CDC domains not kept, the ADT gives no %s\n", link_missing);
+    }
+    s2r_keep_always = cdc;
+    if (cdc && s2r_link)
+        s2r_keep_setup(s2r_link);
 
     const char *missing;
-    if (s2r_soc_from_adt(adt, sptm_virt_link_phys, ARRAY_SIZE(sptm_virt_link_phys), &s2r_soc_adt,
-                         &missing) < 0) {
-        printf("SPTM-virt[s2r]: no sleep path, the ADT gives no %s; debug-link domains not kept\n",
-               missing);
-        sptm_virt_flags &= ~(SPTM_VIRT_S2R | SPTM_VIRT_S2R_GO | SPTM_VIRT_S2R_FULL |
-                             SPTM_VIRT_S2R_COPROC | SPTM_VIRT_S2R_DROP_USB);
+    if (s2r_soc_from_adt(adt, &s2r_soc_adt, &missing) < 0) {
+        s2r_soc = NULL;
+        printf("SPTM-virt[s2r]: no sleep path, the ADT gives no %s%s\n", missing,
+               cdc && s2r_link ? "; CDC domains remain kept" : "");
+        sptm_virt_flags &= ~sleep_flags;
         return;
     }
     s2r_soc = &s2r_soc_adt;
-    u64 sleep_flags = SPTM_VIRT_S2R | SPTM_VIRT_S2R_GO | SPTM_VIRT_S2R_FULL | SPTM_VIRT_S2R_COPROC |
-                      SPTM_VIRT_S2R_DROP_USB | SPTM_VIRT_S2R_MEM;
     u64 passive_ok =
         SPTM_VIRT_S2R_FULL | SPTM_VIRT_S2R_GO | SPTM_VIRT_S2R_COPROC | SPTM_VIRT_S2R_MEM;
     if (s2r_soc->timer_only && ((flags & sleep_flags & ~passive_ok) != SPTM_VIRT_S2R ||
                                 sptm_virt_s2r_quiesce || sptm_virt_s2r_usb_retake)) {
         printf("SPTM-virt[s2r]: a timer-only sleep takes TRACE (0x1) with FULL (0x4), GO (0x2), "
                "COPROC "
-               "(0x8) and MEM (0x100) only, quiesce=0, usb_retake=0; debug-link domains not "
-               "kept\n");
+               "(0x8) and MEM (0x100) only, quiesce=0, usb_retake=0; sleep trace off\n");
         sptm_virt_flags &= ~sleep_flags;
         return;
     }
     for (int i = 0; i < s2r_soc->n_skipped; i++)
         printf("SPTM-virt[s2r]: the ADT gives no %s; not traced\n", s2r_soc->skipped[i]);
-    s2r_keep_always = cdc;
-    if (!(flags & SPTM_VIRT_S2R)) {
-        if (cdc)
-            s2r_keep_setup();
+    if (!(flags & SPTM_VIRT_S2R))
         return;
-    }
     /* A timer-only sleep has no stop before the commit to read a ring from: keep it all. */
     u64 ring_bytes = s2r_soc->timer_only ? S2R_RING_BYTES_BIG : S2R_RING_BYTES;
     sptm_virt_s2r_ring = memalign(0x4000, ring_bytes);
@@ -1153,15 +1174,13 @@ void sptm_virt_s2r_setup(bool cdc)
     if (!sptm_virt_s2r_ring) {
         printf("SPTM-virt[s2r]: no memory for the ring; sleep path off\n");
         sptm_virt_flags &= ~SPTM_VIRT_S2R;
-        if (cdc && !s2r_soc->timer_only)
-            s2r_keep_setup();
         return;
     }
     memset(sptm_virt_s2r_ring, 0, ring_bytes);
     sptm_virt_s2r_nrec = ring_bytes / sizeof(struct s2r_rec);
     sptm_virt_s2r_head = 0;
     if (s2r_soc->timer_only) {
-        /* No link keeping, USB, per-core or WFI rules: the timer's start is the sleep. */
+        /* No USB, per-core or WFI rules: the timer's start is the sleep. */
         s2r_go = flags & SPTM_VIRT_S2R_GO;
         sptm_virt_rg_passthrough = s2r_go;
         if (s2r_go && sptm_virt_s2r_wake_s)
@@ -1232,7 +1251,8 @@ void sptm_virt_s2r_setup(bool cdc)
     if (!s2r_go || s2r_fulltrace)
         s2r_hook_full();
 
-    s2r_keep_setup();
+    if (!cdc && s2r_link)
+        s2r_keep_setup(s2r_link);
 
     s2r_arm_at = mrs(CNTPCT_EL0) + S2R_ARM_AFTER_S * mrs(CNTFRQ_EL0);
     s2r_marker("S2RSETUP", sptm_virt_s2r_pages);
@@ -1589,7 +1609,7 @@ static void s2r_usb_keep_rearm(void)
     for (int k = 0; k < s2r_nkeep; k++) {
         u32 v = read32(s2r_keep[k]);
         s2r_keep_shadow[k] = v;
-        s2r_keep_low[k] = !(v & 0xf);
+        s2r_keep_low[k] = !FIELD_GET(S2R_PMGR_TARGET, v);
         s2r_keep_told[k] = false;
     }
     sysop("dmb ish");

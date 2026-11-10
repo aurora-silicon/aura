@@ -89,10 +89,13 @@ int main(int argc, char **argv)
     for (int i = 2; i < argc && i < 4; i++)
         phys[i - 2] = strtoul(argv[i], NULL, 0);
     struct s2r_soc s;
-    const char *missing;
+    struct s2r_link link;
+    const char *missing, *link_missing;
 
-    int rc = s2r_soc_from_adt(adt, phys, 2, &s, &missing);
+    int link_rc = s2r_link_from_adt(adt, phys, 2, &link, &link_missing);
+    int rc = s2r_soc_from_adt(adt, &s, &missing);
     printf("rc %d missing %s\n", rc, missing ? missing : "-");
+    printf("link_rc %d missing %s\n", link_rc, link_missing ? link_missing : "-");
     BLK(soc_ps);
     BLK(cluster_ctl);
     BLK(pwrgate);
@@ -108,19 +111,24 @@ int main(int argc, char **argv)
     printf("amcc 0x%llx %u\n", (unsigned long long)s.amcc, s.amcc_planes);
     printf("timer_only %d 0x%llx %d %u\n", s.timer_only, (unsigned long long)s.stop_timer,
            s.n_trace, s.trace_pages);
-    for (int i = 0; i < s.n_link; i++)
-        printf("link %s\n", s.link_paths[i]);
+    for (int i = 0; i < s.n_trace; i++)
+        printf("trace %s 0x%llx 0x%llx 0x%llx\n", s.trace[i].what,
+               (unsigned long long)s.trace[i].base, (unsigned long long)s.trace[i].size,
+               (unsigned long long)s.trace[i].declared_size);
+    printf("pmu %s 0x%x\n", s.pmu_path[0] ? s.pmu_path : "-", s.pmu_slave);
+    for (int i = 0; i < link.n_link; i++)
+        printf("link %s\n", link.paths[i]);
     for (int i = 0; i < s.n_skipped; i++)
         printf("skipped %s\n", s.skipped[i]);
 
-    if (rc == 0 && pmgr_init() == 0) {
-        for (int i = 0; i < s.n_link; i++) {
+    if (link_rc == 0 && pmgr_init() == 0) {
+        for (int i = 0; i < link.n_link; i++) {
             u64 regs[32];
             u8 flags[32];
-            int n = pmgr_adt_collect_psregs(s.link_paths[i], regs, flags, 32);
+            int n = pmgr_adt_collect_psregs(link.paths[i], regs, flags, 32);
             for (int j = 0; j < n; j++)
-                printf("domain %s 0x%llx flags 0x%x\n", s.link_paths[i],
-                       (unsigned long long)regs[j], flags[j]);
+                printf("domain %s 0x%llx flags 0x%x\n", link.paths[i], (unsigned long long)regs[j],
+                       flags[j]);
         }
     }
     return 0;
