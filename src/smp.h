@@ -19,6 +19,8 @@ extern u8 secondary_stacks_el3[MAX_EL3_CPUS][SECONDARY_STACK_SIZE];
 #endif
 
 void smp_secondary_entry(void);
+u8 *smp_secondary_stack(int index);
+bool smp_secondary_block(u64 *base, u64 *size);
 int smp_secondary_prepare(void);
 void smp_secondary_prep_el3(void);
 

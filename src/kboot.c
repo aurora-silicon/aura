@@ -9579,6 +9579,14 @@ int kboot_prepare_dt(void *fdt)
     if (dt_reserve_secondary_ro())
         return -1;
 
+    /* The T8142 secondaries' stacks and spin table, in use until the OS takes them (smp.c) */
+    u64 smp_base, smp_size;
+    if (smp_secondary_block(&smp_base, &smp_size)) {
+        if (fdt_add_mem_rsv(dt, smp_base, smp_size))
+            bail("FDT: couldn't reserve the secondary CPU block\n");
+        printf("FDT: reserved secondary CPU block [0x%lx, 0x%lx)\n", smp_base, smp_base + smp_size);
+    }
+
     if (chip_id == T8132) {
         if (dt_reserve_bootloader_handoff())
             return -1;
