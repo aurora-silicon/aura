@@ -9022,6 +9022,11 @@ static int dt_disable_missing_devs(const char *adt_prefix, const char *dt_prefix
             if (strncmp(name, dt_prefix, dt_prefix_len))
                 continue;
 
+            /* Disabled descriptions may share live PHYs/DARTs with a DRD. */
+            const char *status = fdt_getprop(dt, node, "status", NULL);
+            if (status && !strcmp(status, "disabled"))
+                continue;
+
             const fdt64_t *reg = fdt_getprop(dt, node, "reg", NULL);
             if (!reg)
                 bail_cleanup("FDT: failed to get reg property of %s\n", name);
@@ -9057,7 +9062,7 @@ static int dt_disable_missing_devs(const char *adt_prefix, const char *dt_prefix
                 }
             }
 
-            const char *status = fdt_getprop(dt, node, "status", NULL);
+            status = fdt_getprop(dt, node, "status", NULL);
             if (!status || strcmp(status, "disabled")) {
                 printf("FDT: Disabling missing device %s/%s\n", path, name);
 
