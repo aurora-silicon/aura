@@ -20,7 +20,7 @@ def test_adopted_queue_lifetime(tmp_path):
     # The queue register helpers, which place the registers for the secure layout too.
     qregs = source[source.index("static u64 nvme_qreg(u32 reg)"):source.index("static void nvme_log_entry_state")]
     # The post-M4 power off and power on around a stage's use of ANS.
-    power = source[source.index("/* The ADT describes a post-M4 ANS"):source.index("bool nvme_init(void)")]
+    power = source[source.index("/* The ADT describes a post-M4 ANS"):source.index("/* A write or flush, timed:")]
     init = source[source.index("bool nvme_init(void)"):source.index("void nvme_ensure_shutdown(void)")]
     # The M1-M3 sleep-and-reset helper that every legacy power-down goes through.
     sleep_reset = source[source.index("static bool nvme_ans_sleep_and_reset(void)"):

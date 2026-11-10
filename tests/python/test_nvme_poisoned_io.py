@@ -10,8 +10,14 @@ def test_poisoned_session_refuses_io_before_buffer_changes(tmp_path):
     root = Path(__file__).resolve().parents[2]
     source = Path(os.environ.get("NVME_SOURCE", root / "src/nvme.c")).read_text()
     declarations = source[source.index("#define NVME_TIMEOUT"):source.index("static u64 nvme_read64_lo_hi")]
+    # Clang can diagnose the write-path flag when shutdown is outside this host fragment.
+    declarations = declarations.replace("static bool nvme_wrote;",
+                                        "static bool nvme_wrote __attribute__((unused));")
     execute = source[source.index("static bool nvme_exec_command("):
                      source.index("/* The ADT describes a post-M4 ANS")]
+    # The ANS power helpers between these fragments need physical firmware state.
+    execute += source[source.index("/* A write or flush, timed:"):
+                      source.index("bool nvme_init(void)")]
     read = source[source.index("bool nvme_flush("):]
     read_limit = next(line for line in (root / "src/nvme.h").read_text().splitlines()
                       if line.startswith("#define NVME_MAX_READ_BLOCKS "))
