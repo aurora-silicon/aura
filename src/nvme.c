@@ -474,6 +474,19 @@ static bool nvme_ans_power_on(void)
     return true;
 }
 
+/* Recover an adopted controller once, using this stage's own RTKit session. */
+static bool nvme_adopt_restart(void)
+{
+    nvme_sart = sart_init("/arm-io/sart-ans");
+    if (!nvme_sart)
+        return false;
+    nvme_rtkit = rtkit_init("nvme", nvme_asc, NULL, NULL, nvme_sart, false);
+    if (!nvme_rtkit || !nvme_ans_power_off() || !nvme_ans_power_on())
+        return false;
+    printf("nvme: ANS restarted from off; own RTKit session\n");
+    return true;
+}
+
 bool nvme_init(void)
 {
     if (nvme_reboot_required) {
@@ -665,8 +678,22 @@ bool nvme_init(void)
     write64_lo_hi(nvme_qreg(NVME_ASQ), (u64)adminq.cmds);
     write64_lo_hi(nvme_qreg(NVME_ACQ), (u64)adminq.cqes);
     write32(nvme_qreg(NVME_AQA), ((NVME_QUEUE_SIZE - 1) << 16) | (NVME_QUEUE_SIZE - 1));
-    if (!nvme_ctrl_enable()) {
-        printf("nvme: timeout while waiting for CSTS.RDY to be set\n");
+    bool ready = nvme_ctrl_enable();
+#ifdef NVME_TEST_ADOPT_RESTART
+    ready = ready && !(adopting && !restarted);
+#endif
+    if (!ready) {
+        printf("nvme: timeout while waiting for CSTS.RDY to be set: CC=0x%x CSTS=0x%x "
+               "BOOT_STATUS=0x%x\n",
+               read32(nvme_base + NVME_CC), read32(nvme_base + NVME_CSTS),
+               read32(nvme_base + NVME_BOOT_STATUS));
+        if (adopting && !restarted && chip_id == T6050) {
+            restarted = true;
+            if (!nvme_adopt_restart())
+                goto out_preserve;
+            adopting = false;
+            goto setup_controller;
+        }
         goto out_disable_ctrl;
     }
 
