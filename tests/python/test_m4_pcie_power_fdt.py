@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-2.0-only OR MIT
-"""PCIe handoff keeps OS ownership and requires the native J713 gP13 action."""
+"""PCIe handoff keeps OS ownership and requires the native J713/J715/J604 gP13 action."""
 from pathlib import Path
 import subprocess
 
@@ -23,6 +23,7 @@ static int writes, bypasses;
 static int smc_result;
 static u32 last_value, last_key;
 static u8 expected_sid = 16;
+static const char *radio_board = "apple,j713";
 static smc_dev_t smc;
 static smc_dev_t *smc_init(void) { return &smc; }
 static int smc_write_u32(smc_dev_t *s, u32 key, u32 value)
@@ -34,7 +35,7 @@ static int dart_set_bypass_fdt(void *dt, u32 phandle, u8 sid)
 static void setup(void *dt, bool j713, int fault)
 {
  assert(!fdt_create_empty_tree(dt, 8192));
- assert(!fdt_setprop_string(dt, 0, "compatible", j713 ? "apple,j713" : "apple,j715"));
+ assert(!fdt_setprop_string(dt, 0, "compatible", j713 ? radio_board : "apple,j773g"));
  int gpio = fdt_add_subnode(dt, 0, "gpio");
  assert(gpio >= 0 && !fdt_setprop_string(dt, gpio, "compatible",
                                       fault == 2 ? "apple,smc-low-gpio" : "apple,smc-gpio"));
@@ -202,6 +203,10 @@ static void test_smc_failure_admission(void *dt)
 int main(void)
 {
  char blob[8192];
+ /* The J715's and the J604's radio ports match the J713's. */
+ static const char *const boards[] = {"apple,j713", "apple,j715", "apple,j604"};
+ for (unsigned b = 0; b < sizeof(boards) / sizeof(*boards); b++) {
+ radio_board = boards[b];
  for (int j713 = 0; j713 <= 1; j713++)
  for (int fault = 0; fault < 5; fault++) {
   setup(blob, j713, fault); writes = bypasses = 0;
@@ -222,6 +227,7 @@ int main(void)
  test_iommu_admission(blob);
  test_managed_streams(blob);
  test_smc_failure_admission(blob);
+ }
  return 0;
 }
 '''
