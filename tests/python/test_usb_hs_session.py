@@ -57,6 +57,7 @@ typedef uint8_t u8; typedef uint32_t u32; typedef uint64_t u64;
 #define T8122 0x8122
 #define T8142 0x8142
 #define T8152 0x8152
+#define T6050 0x6050
 enum {DWC3_DEVT_DISCONN, DWC3_DEVT_USBRST, DWC3_DEVT_CONNECTDONE, DWC3_DEVT_ULSTCHNG};
 static const char *devt_names[] = {"DisconnEvt", "USBRst", "ConnectDone", "ULStChng"};
 struct dwc3_event_devt {unsigned type;};
@@ -75,7 +76,8 @@ typedef struct {unsigned regs; bool failed; int ep0_state; struct endpoint endpo
 /* Controller model. */
 static bool hw_owned[MAX_ENDPOINTS];
 static unsigned address, enabled;
-static int ends, setup_starts, setup_failures, out_arms, in_kicks, events_polled;
+static int ends __attribute__((unused));
+static int setup_starts, setup_failures, out_arms, in_kicks, events_polled;
 static u32 chip_id = T8122;
 static u64 now_ms;
 static void mask32(unsigned reg, unsigned mask, unsigned value) {(void)mask; if (reg == DWC3_DCFG) address = value;}

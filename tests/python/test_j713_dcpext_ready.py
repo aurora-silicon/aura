@@ -26,6 +26,7 @@ def test_j713_dcpext_ready_is_opt_in_complete_and_reads_pmgr_only(tmp_path):
     layout = header[start:header.index("} PACKED;", start) + len("} PACKED;")]
     pmgr_bits = (define(pmgr, "PMGR_AUTO_ENABLE") + define(pmgr, "PMGR_PS_ACTUAL") +
                  define(pmgr, "PMGR_PS_TARGET") +
+                 define(pmgr, "PMGR_FLAG_VIRTUAL") +
                  define((ROOT / "src/pmgr.h").read_text(), "PMGR_PS_ACTIVE"))
     run_c(tmp_path, "j713-dcpext-ready", r'''
 #include <assert.h>
@@ -149,10 +150,12 @@ static int set_u32(void *tree, int node, const char *name, uint32_t value)
  */
 struct pmgr_device {
     const char name[0x10];
+    u8 flags;
 };
 static const struct pmgr_device devices[] = {
-    {"DISPEXT0_SYS"}, {"DISPEXT0_FE"}, {"DISPEXT0_CPU"}, {"DISP0_SYS"},
-    {"DISPEXT1_SYS"}, {"DISPEXT1_FE"}, {"DISPEXT1_CPU"},
+    {.name = "DISPEXT0_SYS"}, {.name = "DISPEXT0_FE"}, {.name = "DISPEXT0_CPU"},
+    {.name = "DISP0_SYS"}, {.name = "DISPEXT1_SYS"}, {.name = "DISPEXT1_FE"},
+    {.name = "DISPEXT1_CPU"},
 };
 static const struct pmgr_device *pmgr_devices = devices;
 static u32 pmgr_devices_len = ARRAY_SIZE(devices);
@@ -176,7 +179,9 @@ __attribute__((unused)) static u32 mask32(uintptr_t addr, u32 clear, u32 set)
 }
 __attribute__((unused)) static u32 set32(uintptr_t addr, u32 set) { return pmgr_writes++; }
 __attribute__((unused)) static u32 clear32(uintptr_t addr, u32 clear) { return pmgr_writes++; }
-''' + function(pmgr, "pmgr_power_is_on", "int ") +
+''' + function(pmgr, "pmgr_find_device_by_name", "static const struct pmgr_device *") +
+        function(pmgr, "pmgr_psreg_by_name", "uintptr_t ") +
+        function(pmgr, "pmgr_power_is_on", "int ") +
         function(pmgr, "pmgr_power_is_requested", "int ") +
         function(kboot, "dt_device_set_reserved_mem") +
         function(kboot, "dt_device_add_mem_region") +

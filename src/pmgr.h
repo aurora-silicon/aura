@@ -23,10 +23,12 @@ int pmgr_power_disable(u32 id);
 
 int pmgr_adt_path_offset_trace(const void *adt_ptr, int *path);
 
+int pmgr_adt_collect_psregs(const char *path, u64 *out, u8 *flags, int max);
 int pmgr_adt_is_powered(const char *path);
 int pmgr_adt_power_enable(const char *path);
 int pmgr_adt_power_disable(const char *path);
 int pmgr_adt_power_disable_recursive(const char *path);
+int pmgr_adt_power_disable_under(const char *path, const char *name);
 /* 1: all real devices in this path's parent closure are power-gated; 0: active; -1: unknown. */
 int pmgr_adt_power_is_off(const char *path);
 int pmgr_adt_power_enable_traced(const char *path);
@@ -65,6 +67,9 @@ int pmgr_reset(int die, const char *name);
 int pmgr_power_on(int die, const char *name);
 int pmgr_power_is_on(int die, const char *name);
 int pmgr_power_is_requested(int die, const char *name);
+/* Power state register of the real (not virtual) device `name`, 0 if none */
+uintptr_t pmgr_psreg_by_name(int die, const char *name);
+int pmgr_power_steps(int die, const char *name, bool on);
 
 int pmgr_set_mode(uintptr_t addr, u8 target_mode);
 

@@ -341,3 +341,36 @@ bool sart_remove_allowed_region(sart_dev_t *sart, void *paddr, size_t sz)
     printf("sart: could not find entry to be removed\n");
     return false;
 }
+
+int sart_get_entries(sart_dev_t *sart, struct sart_entry *entries, int max)
+{
+    int count = 0;
+
+    for (int i = 0; i < APPLE_SART_MAX_ENTRIES && count < max; i++) {
+        struct sart_entry *e = &entries[count];
+        void *paddr;
+        size_t size;
+
+        sart->get_entry(sart, i, &e->flags, &paddr, &size);
+        if (!e->flags && !size)
+            continue;
+        e->index = i;
+        e->paddr = (u64)paddr;
+        e->size = size;
+        count++;
+    }
+    return count;
+}
+
+bool sart_set_entries(sart_dev_t *sart, const struct sart_entry *entries, int count)
+{
+    for (int i = 0; i < count; i++) {
+        const struct sart_entry *e = &entries[i];
+
+        if (e->index >= APPLE_SART_MAX_ENTRIES ||
+            !sart->set_entry(sart, e->index, e->flags, (void *)e->paddr, e->size))
+            return false;
+        sart->protected_entries |= BIT(e->index);
+    }
+    return true;
+}

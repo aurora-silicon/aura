@@ -50,6 +50,14 @@ void wdt_disable(void)
 
 void wdt_reboot(void)
 {
+    /* A fault before wdt_disable() (early init) must still reset the Mac, not spin */
+    if (!wdt_base && adt) {
+        int path[8];
+        u64 base = 0;
+        if (adt_path_offset_trace(adt, "/arm-io/wdt", path) >= 0 &&
+            !adt_get_reg(adt, path, "reg", 0, &base, NULL))
+            wdt_base = base;
+    }
     if (!wdt_base)
         return;
 

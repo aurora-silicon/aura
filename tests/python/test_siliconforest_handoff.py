@@ -5,6 +5,8 @@ from pathlib import Path
 import re
 import subprocess
 
+from host_compiler import host_cc
+
 ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -18,7 +20,7 @@ def run_c(tmp_path, name, source):
     binary = tmp_path / name
     lib = ROOT / "src/libfdt"
     subprocess.run(
-        ["cc", "-std=gnu11", "-D_GNU_SOURCE", "-Wall", "-Wextra", "-Werror",
+        [*host_cc(), "-std=gnu11", "-D_GNU_SOURCE", "-Wall", "-Wextra", "-Werror",
          "-Wno-unused-parameter", "-I", str(lib), "-x", "c", "-",
          *map(str, (lib / f for f in (
              "fdt.c", "fdt_ro.c", "fdt_rw.c", "fdt_sw.c", "fdt_wip.c",

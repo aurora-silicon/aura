@@ -5,6 +5,8 @@ from pathlib import Path
 import os
 import subprocess
 
+from host_compiler import host_cc
+
 
 REPO = Path(os.environ.get("AURA_SMP_SOURCE", Path(__file__).resolve().parents[2]))
 
@@ -12,7 +14,7 @@ REPO = Path(os.environ.get("AURA_SMP_SOURCE", Path(__file__).resolve().parents[2
 def compile_and_run(tmp_path, name, source):
     binary = tmp_path / name
     subprocess.run(
-        ["cc", "-std=gnu11", "-Wall", "-Wextra", "-Werror",
+        [*host_cc(), "-std=gnu11", "-Wall", "-Wextra", "-Werror",
          "-Wno-unused-parameter", "-Wno-unused-function", "-x", "c", "-", "-o", str(binary)],
         input=source, text=True, check=True,
     )

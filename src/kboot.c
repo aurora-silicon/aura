@@ -30,6 +30,7 @@
 #include "malloc.h"
 #include "mcc.h"
 #include "memory.h"
+#include "nvme.h"
 #include "pcie.h"
 #include "pmgr.h"
 #include "rtkit.h"
@@ -242,6 +243,41 @@ static int dt_set_rng_seed_adt(int node)
     return 0;
 }
 
+/*
+ * libfdt lets a path component without a unit address match the first node of that base name,
+ * so "/soc/dcp@..." can resolve "soc" to "soc@200000000" and miss the node. This matches the
+ * full name of every component, as the OS does.
+ */
+int kboot_fdt_path_exact(const void *fdt, const char *path)
+{
+    if (path && path[0] != '/')
+        path = fdt_get_alias(fdt, path);
+    if (!path || path[0] != '/')
+        return -FDT_ERR_NOTFOUND;
+
+    int node = 0;
+    while (node >= 0 && *path) {
+        while (*path == '/')
+            path++;
+        const char *end = strchr(path, '/');
+        int len = end ? end - path : (int)strlen(path), child, nlen;
+        if (!len)
+            break;
+        int found = -FDT_ERR_NOTFOUND;
+        fdt_for_each_subnode(child, fdt, node)
+        {
+            const char *name = fdt_get_name(fdt, child, &nlen);
+            if (name && nlen == len && !memcmp(name, path, len)) {
+                found = child;
+                break;
+            }
+        }
+        node = found;
+        path += len;
+    }
+    return node;
+}
+
 static int dt_set_fb(void)
 {
     if (!cur_boot_args.video.base) {
@@ -317,6 +353,8 @@ static int dt_set_fb(void)
     // so that a display driver hiding the notch still can)
     if (notch_height) {
         int dcp = fdt_path_offset(dt, "dcp");
+        if (dcp < 0)
+            dcp = kboot_fdt_path_exact(dt, "dcp");
         if (dcp >= 0)
             if (fdt_appendprop_u32(dt, dcp, "apple,notch-height", notch_height))
                 printf("FDT: couldn't set apple,notch-height\n");
@@ -648,6 +686,31 @@ static int dt_set_ctxr_exec_window(int node)
     return 0;
 }
 
+/*
+ * An OS at EL2 has no monitor below it, so it powers cores off and suspends the system
+ * itself, and where iBoot locked RVBAR a reset brings each core back through this image.
+ * The mailbox tells the OS so: a secondary returns through its spin-table release address,
+ * the boot core through the mailbox. The CPUs keep spin-table, which every kernel knows.
+ */
+static int dt_set_s2r_mailbox(int node)
+{
+    if (!in_el2() || !smp_resets_return_here())
+        return 0;
+
+    /* A core leaving reset is confined to CTXR_D: an OS outside its window can't resume. */
+    u64 lower, upper;
+    if (ctxr_range(CTXR_RANGE_D, &lower, &upper) && !ctxr_exec_window(NULL, NULL)) {
+        printf("FDT: no S2R mailbox: CTXR_D is armed and the OS is outside its window\n");
+        return 0;
+    }
+
+    u64 mailbox = smp_s2r_publish();
+    if (fdt_setprop_u64(dt, node, "aurora,s2r-mailbox", mailbox))
+        bail("FDT: couldn't set aurora,s2r-mailbox\n");
+    printf("FDT: S2R mailbox at 0x%lx\n", mailbox);
+    return 0;
+}
+
 static bool in_exec_window(u64 start, u64 size)
 {
     u64 window, window_size;
@@ -800,6 +863,9 @@ static int dt_set_chosen(void)
         return -1;
 
     if (dt_set_ctxr_exec_window(node))
+        return -1;
+
+    if (dt_set_s2r_mailbox(node))
         return -1;
 
     if (chip_id == T8140 && dt_set_t8140_wfx_args(node))
@@ -7342,6 +7408,9 @@ static int dt_set_display(void)
                "(displays are dcpext0..7)\n",
                os_firmware.string);
         return 0;
+    } else if (!fdt_node_check_compatible(dt, 0, "apple,t6050")) {
+        /* Fail-soft (kboot_display_handoff.c): __OS_LOG reservations and the internal panel. */
+        return dt_set_display_handoff(dt);
     } else if (!fdt_node_check_compatible(dt, 0, "apple,t8142")) {
         ret = dt_carveout_reserved_regions("dcp", "disp0", "disp0_piodma",
                                            disp_reserved_regions_t8142,
@@ -8266,6 +8335,144 @@ static int dt_set_isp_fwdata(void)
     return 0;
 }
 
+/* Camera handoff checks run once per boot: keep them out of .text. */
+__attribute__((section(".init.t6050_isp"))) static bool
+t6050_isp_segments_valid(const struct adt_segment_ranges *seg, u32 len, u64 ram, u64 ram_size)
+{
+    if (!seg || !len || len % sizeof(*seg) || len / sizeof(*seg) > 8 || !ram_size ||
+        ram > UINT64_MAX - ram_size)
+        return false;
+    u64 total = 0;
+    for (u32 i = 0; i < len / sizeof(*seg); i++) {
+        u64 size = ALIGN_UP((u64)seg[i].size, SZ_16K);
+        if (!size || (seg[i].phys & (SZ_16K - 1)) || seg[i].phys < ram ||
+            seg[i].phys - ram >= ram_size || size > ram_size - (seg[i].phys - ram) ||
+            seg[i].iova > UINT64_MAX - size || seg[i].remap > UINT64_MAX - size)
+            return false;
+        total += size;
+        if (total > 64 * SZ_1M)
+            return false;
+        for (u32 j = 0; j < i; j++) {
+            u64 prev_size = ALIGN_UP((u64)seg[j].size, SZ_16K);
+            if (seg[i].phys < seg[j].phys + prev_size && seg[j].phys < seg[i].phys + size)
+                return false;
+        }
+    }
+    return true;
+}
+
+/*
+ * T6050 firmware lives below Linux RAM. Publish its current ADT ranges, not
+ * snapshot physical addresses. The kernel allocates the small main-memory
+ * tail and owns all power, DART and firmware-start operations. J716c's camera
+ * is sensor type 0x75, J714s's 0x74; both have the same two segments.
+ */
+__attribute__((section(".init.t6050_isp"))) static int t6050_isp_add_mem_region(uint32_t phandle,
+                                                                                const char *name)
+{
+    int node = kboot_fdt_path_exact(dt, "isp");
+    if (node < 0 || fdt_appendprop_u32(dt, node, "memory-region", phandle))
+        return -1;
+    node = kboot_fdt_path_exact(dt, "isp");
+    if (node < 0 || fdt_appendprop_string(dt, node, "memory-region-names", name))
+        return -1;
+    return 0;
+}
+
+static int dt_set_t6050_isp(void)
+{
+    /* Exact paths: "/soc/isp@..." must not resolve "soc" to "soc@200000000". */
+    int node = kboot_fdt_path_exact(dt, "isp");
+    if (node < 0)
+        return 0;
+    u32 want;
+    if (!fdt_node_check_compatible(dt, 0, "apple,j716c"))
+        want = 0x75;
+    else if (!fdt_node_check_compatible(dt, 0, "apple,j714s"))
+        want = 0x74;
+    else
+        return -1;
+    if (os_firmware.version != V27_0)
+        return -1;
+
+    int chosen = adt_path_offset(adt, "/chosen");
+    int isp = adt_path_offset(adt, "/arm-io/isp0");
+    u64 ram, ram_size;
+    u32 len, platform, scheme = 0;
+    if (chosen < 0 || isp < 0)
+        return -1;
+    const struct adt_segment_ranges *seg = adt_getprop(adt, isp, "segment-ranges", &len);
+    if (ADT_GETPROP(adt, chosen, "dram-base", &ram) != sizeof(ram) ||
+        ADT_GETPROP(adt, chosen, "dram-size", &ram_size) != sizeof(ram_size) ||
+        ADT_GETPROP(adt, isp, "sensor-type", &platform) != sizeof(platform) || platform != want ||
+        !t6050_isp_segments_valid(seg, len, ram, ram_size) || len != 2 * sizeof(*seg) ||
+        seg[0].iova != 0 || seg[0].size != 0xc1c000 || seg[1].iova != 0xc1c000 ||
+        seg[1].size != 0x13d0000 || seg[0].remap != 0x10000000000 || seg[1].remap != 0x10000c1c000)
+        return -1;
+    ADT_GETPROP(adt, isp, "cam-connections-scheme", &scheme);
+
+    uint32_t owner = fdt_get_phandle(dt, node);
+    if (!owner && (fdt_generate_phandle(dt, &owner) || fdt_setprop_u32(dt, node, "phandle", owner)))
+        return -1;
+    if (fdt_getprop(dt, node, "memory-region", NULL))
+        return -1;
+    const char *names[] = {"text", "data"};
+    for (unsigned int i = 0; i < 2; i++) {
+        char name[64];
+        snprintf(name, sizeof(name), "isp-firmware-%s@%lx", names[i], seg[i].phys);
+        int mem = dt_get_or_add_reserved_mem(name, "apple,asc-mem", true, seg[i].phys, seg[i].size);
+        if (mem < 0 || dt_device_set_reserved_mem(mem, name, owner, seg[i].remap, seg[i].size))
+            return -1;
+        uint32_t phandle = fdt_get_phandle(dt, mem);
+        if (!phandle || t6050_isp_add_mem_region(phandle, names[i]))
+            return -1;
+    }
+
+    int reserved = fdt_path_offset(dt, "/reserved-memory");
+    int mem = fdt_add_subnode(dt, reserved, "isp-main-memory");
+    uint32_t phandle;
+    if (mem < 0 || fdt_generate_phandle(dt, &phandle) ||
+        fdt_setprop_u32(dt, mem, "phandle", phandle) ||
+        dt_device_set_reserved_mem(mem, "isp-main-memory", owner, 0x10000000000, 0x2000000) ||
+        t6050_isp_add_mem_region(phandle, "heap"))
+        return -1;
+
+    node = kboot_fdt_path_exact(dt, "isp");
+    if (node < 0 || firmware_set_fdt(dt, node, "apple,firmware-version", &os_firmware) ||
+        fdt_setprop_u32(dt, node, "apple,platform-id", platform) ||
+        fdt_setprop_u32(dt, node, "apple,cam-connections-scheme", scheme))
+        return -1;
+
+    const char *aliases[] = {"isp-dart0", "isp-dart1", "isp-dart2", "isp"};
+    for (unsigned int i = 0; i < ARRAY_SIZE(aliases); i++) {
+        node = kboot_fdt_path_exact(dt, aliases[i]);
+        if (node < 0 || fdt_setprop_string(dt, node, "status", "okay"))
+            return -1;
+    }
+    printf("FDT: T6050 ISP: reserved text/data, main memory 32 MiB; platform 0x%x\n", platform);
+    return 0;
+}
+
+static int dt_t6050_isp_transaction(void)
+{
+    void *original = dt;
+    size_t capacity = fdt_totalsize(original);
+    void *scratch = malloc(capacity);
+    if (!scratch) {
+        printf("FDT: no space for camera handoff; leaving it disabled\n");
+        return 0;
+    }
+    memcpy(scratch, original, capacity);
+    dt = scratch;
+    if (!dt_set_t6050_isp())
+        memcpy(original, scratch, capacity);
+    else
+        printf("FDT: rejected T6050 ISP handoff; leaving it disabled\n");
+    dt = original;
+    free(scratch);
+    return 0;
+}
+
 /*
  * The camera is optional. Without a valid ADT firmware description, or if its firmware or heap
  * reservation fails, disable the ISP and boot on without it instead of failing the whole handoff.
@@ -8273,6 +8480,9 @@ static int dt_set_isp_fwdata(void)
 static int dt_set_isp(void)
 {
     u64 heap_phys, heap_iova, heap_size;
+
+    if (chip_id == T6050)
+        return dt_t6050_isp_transaction();
 
     /* J614s consumes the boot firmware's segments after DAPF setup. */
     if (chip_id == T6040 && board_id == 4 && adt_is_compatible(adt, 0, "J614sAP") &&
@@ -9419,6 +9629,22 @@ static int kboot_boot_t8152(void *kernel)
     return 0;
 }
 
+/* The ANS NVMe node: an apple,sart phandle and an "...-nvme-ans2" compatible. */
+static int dt_ans_nvme_node(void)
+{
+    for (int node = fdt_next_node(dt, -1, NULL); node >= 0; node = fdt_next_node(dt, node, NULL)) {
+        int len;
+        const char *c = fdt_getprop(dt, node, "compatible", &len);
+
+        if (!c || !fdt_getprop(dt, node, "apple,sart", NULL))
+            continue;
+        for (const char *s = c; s < c + len; s += strlen(s) + 1)
+            if (strlen(s) >= 9 && !strcmp(s + strlen(s) - 9, "nvme-ans2"))
+                return node;
+    }
+    return -1;
+}
+
 int kboot_prepare_dt(void *fdt)
 {
     if (smp_has_pending_calls()) {
@@ -9489,12 +9715,11 @@ int kboot_prepare_dt(void *fdt)
             image_end = max(image_end, inherited);
     }
     /*
-     * Both post-M4 storage paths retain firmware buffers in this stage's heap. T6041 hands the
-     * live ANS over the same way (nvme.adopt=live-rtkit-v1): its RTKit buffers must stay out of
-     * Linux's allocator (J616C: ANS syslog lines in page-cache pages at the SART-allowed heap
-     * addresses).
+     * A post-M4 ANS keeps the firmware buffers an aura stage gave it in that stage's heap, running
+     * or powered off: they must stay out of Linux's allocator (J616C: ANS syslog lines in
+     * page-cache pages at the SART-allowed heap addresses).
      */
-    if (chip_id == T8140 || chip_id == T6041 || chip_id == T8152 || chip_id == T8132) {
+    if (nvme_post_m4()) {
         u64 ram_end, inherited = cur_boot_args.top_of_kernel_data;
         u64 high_water = heapblock_high_water();
 
@@ -9536,33 +9761,37 @@ int kboot_prepare_dt(void *fdt)
     }
 
     /*
-     * A live ANS handed to Linux keeps every buffer an earlier stage gave it (on a normal boot
-     * Stage 1 read the ESP, so the buffers are in Stage 1's heap, not this one's). Reserve each
-     * SART-allowed range inside RAM; the nvme-apple adoption requires them reserved anyway.
+     * A post-M4 ANS keeps every buffer an earlier stage gave it (on a normal boot Stage 1 read
+     * the ESP, so the buffers are in Stage 1's heap, not this one's), running or powered off.
+     * Reserve each SART-allowed range inside RAM. If ANS will be off when the payload starts,
+     * the SART has lost the entries, and its next start writes them back from the nvme node's
+     * apple,sart-entries: per entry, (index << 8 | flags), address and size, 64 bits each.
      */
-    if (chip_id == T6041 || chip_id == T8142 ||
-        (chip_id == T6040 && !fdt_node_check_compatible(dt, 0, "apple,j614s"))) {
-        sart_dev_t *sart = sart_init("/arm-io/sart-ans");
+    struct sart_entry sart[16];
+    bool ans_off;
+    int sart_cnt = nvme_sart_entries(sart, ARRAY_SIZE(sart), &ans_off);
+    fdt64_t sart_cells[3 * ARRAY_SIZE(sart)];
+    for (int i = 0; i < sart_cnt; i++) {
         u64 ram_start = cur_boot_args.phys_base;
         u64 ram_end = ram_start + cur_boot_args.mem_size;
 
-        if (!sart)
-            bail("FDT: cannot read the ANS SART\n");
-        for (int i = 0; i < 16; i++) {
-            u64 paddr;
-            size_t sz;
-
-            if (!sart_get_allowed(sart, i, &paddr, &sz) || paddr < ram_start || paddr >= ram_end)
-                continue;
-            u64 start = ALIGN_DOWN(paddr, SZ_16K);
-            u64 end = ALIGN_UP(min(paddr + sz, ram_end), SZ_16K);
-            if (fdt_add_mem_rsv(dt, start, end - start)) {
-                sart_release(sart);
-                bail("FDT: couldn't reserve ANS buffer\n");
-            }
-            printf("FDT: ANS buffer [0x%lx, 0x%lx) reserved\n", start, end);
-        }
-        sart_release(sart);
+        sart_cells[3 * i] = cpu_to_fdt64((u64)sart[i].index << 8 | sart[i].flags);
+        sart_cells[3 * i + 1] = cpu_to_fdt64(sart[i].paddr);
+        sart_cells[3 * i + 2] = cpu_to_fdt64(sart[i].size);
+        if (sart[i].paddr < ram_start || sart[i].paddr >= ram_end)
+            continue;
+        u64 start = ALIGN_DOWN(sart[i].paddr, SZ_16K);
+        u64 end = ALIGN_UP(min(sart[i].paddr + sart[i].size, ram_end), SZ_16K);
+        if (fdt_add_mem_rsv(dt, start, end - start))
+            bail("FDT: couldn't reserve ANS buffer\n");
+        printf("FDT: ANS buffer [0x%lx, 0x%lx) reserved\n", start, end);
+    }
+    if (sart_cnt && ans_off) {
+        int node = dt_ans_nvme_node();
+        if (node < 0 ||
+            fdt_setprop(dt, node, "apple,sart-entries", sart_cells, sart_cnt * 3 * sizeof(fdt64_t)))
+            bail("FDT: couldn't pass the ANS SART entries on\n");
+        printf("FDT: ANS will be off; %d SART entries passed on\n", sart_cnt);
     }
 
     // aura moved itself (start.S). On M3 it moved above the chainloaded image,
@@ -9683,7 +9912,7 @@ int kboot_prepare_dt(void *fdt)
         return -1;
     if (dt_disable_missing_devs("acio", "cio@", 8, adt_acio_rc_regnum()))
         return -1;
-    if (dt_disable_missing_devs("i2c", "i2c@", 8, 0))
+    if (dt_disable_missing_devs("i2c", "i2c@", 16, 0)) /* T6050 has nine */
         return -1;
     if (dt_disable_missing_j700_touch_id())
         return -1;
@@ -9982,6 +10211,17 @@ int kboot_boot(void *kernel)
             if (!radio || dt_disable_j713_pcie())
                 return -1;
         }
+    }
+    if (chip_id == T6050 && ret < 0) {
+        /* A stop may mean storage moved under nvme-apple; the port's state is unknown either way */
+        printf("kboot: refusing T6050 handoff after the apcie0 port 2 bring-up stopped\n");
+        return -1;
+    }
+    /* prepare_dt packed the tree: reopen it into its spare capacity for the status edits */
+    if (chip_id == T6050 &&
+        (fdt_open_into(dt, dt, dt_bufsize) || pcie_t6050_handoff_fdt(dt) || fdt_pack(dt))) {
+        printf("kboot: refusing T6050 handoff: could not mark the down PCIe ports\n");
+        return -1;
     }
     if (chip_id == T8140) {
         if (ret < 0) {
