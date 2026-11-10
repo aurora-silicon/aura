@@ -1199,22 +1199,41 @@ static T6050_ATC_INIT void t6050_setup_atc(void *dt)
     }
 }
 
+/*
+ * The M4 Max laptops (T6041 J614c and J616c) have the J614s's ATC: atc-phy,t6040
+ * PHYs with the same tunable names on usb-drd0..2 and atc-phy0..3. Export the
+ * USB ports' tunables the same way. Their HDMI PHY (port 3) keeps the tunables its
+ * device tree describes, so it is left alone.
+ */
+static bool t6041_max_atc(void *dt)
+{
+    return chip_id == T6041 &&
+           ((adt_is_compatible(adt, 0, "J614cAP") &&
+             !fdt_node_check_compatible(dt, 0, "apple,j614c")) ||
+            (adt_is_compatible(adt, 0, "J616cAP") &&
+             !fdt_node_check_compatible(dt, 0, "apple,j616c")));
+}
+
 int kboot_setup_atc(void *dt)
 {
     char adt_path[32];
     char fdt_alias[32];
+    bool t6041_max = t6041_max_atc(dt);
 
     if (chip_id == T6050) {
         t6050_setup_atc(dt);
         return 0;
     }
 
-    if (chip_id == T6040 && board_id == 4 && adt_is_compatible(adt, 0, "J614sAP") &&
-        !fdt_node_check_compatible(dt, 0, "apple,j614s")) {
+    if ((chip_id == T6040 && board_id == 4 && adt_is_compatible(adt, 0, "J614sAP") &&
+         !fdt_node_check_compatible(dt, 0, "apple,j614s")) ||
+        t6041_max) {
         int capacity = fdt_totalsize(dt);
         void *scratch = malloc(capacity);
         j614s_hdmi_ready = false;
         for (size_t i = 0; i < ARRAY_SIZE(j614s_phys); i++) {
+            if (t6041_max && i == 3)
+                break;
             int ret = scratch ? fdt_open_into(dt, scratch, capacity) : -1;
             if (!ret)
                 ret = j614s_export_atc(scratch, i);
@@ -1223,7 +1242,7 @@ int kboot_setup_atc(void *dt)
                 if (i == 3)
                     j614s_hdmi_ready = true;
             } else {
-                printf("FDT: J614s ATC%zu tuning unavailable\n", i);
+                printf("FDT: %s ATC%zu tuning unavailable\n", t6041_max ? "T6041" : "J614s", i);
                 int node = fdt_path_offset(dt, j614s_phys[i]);
                 if (node >= 0 && fdt_setprop_string(dt, node, "status", "disabled")) {
                     free(scratch);
