@@ -4249,7 +4249,11 @@ static int dt_ane_fill_region(int resv, uint32_t phandle, const char *kind, u64 
     return 0;
 }
 
-static int dt_set_ane_node(int node)
+/*
+ * The node is looked up again by its compatible after each edit, never by its path: "/soc" can
+ * resolve to a sibling soc@ node (libfdt matches a name without a unit address to the first one).
+ */
+static int dt_set_ane_node(int node, const char *compat)
 {
     static const char names_expected[] = "__TEXT;__DATA";
     static const char *const kinds[2] = {"text", "data"};
@@ -4311,7 +4315,7 @@ static int dt_set_ane_node(int node)
 
     reason = "firmware reservation failed";
     int len = 0;
-    node = fdt_path_offset(dt, path);
+    node = fdt_node_offset_by_compatible(dt, -1, compat);
     const fdt32_t *regions = node < 0 ? NULL : fdt_getprop(dt, node, "memory-region", &len);
     uint32_t phandles[2];
     if (regions) {
@@ -4341,14 +4345,14 @@ static int dt_set_ane_node(int node)
     fdt32_t region_cells[2] = {cpu_to_fdt32(phandles[0]), cpu_to_fdt32(phandles[1])};
     static const char region_names[] = "firmware-text\0firmware-data";
     fdt64_t iovas[2] = {cpu_to_fdt64(seg[0].remap), cpu_to_fdt64(seg[1].remap)};
-    node = fdt_path_offset(dt, path);
+    node = fdt_node_offset_by_compatible(dt, -1, compat);
     if (node < 0 || fdt_setprop(dt, node, "memory-region", region_cells, sizeof(region_cells)))
         goto disable;
-    node = fdt_path_offset(dt, path);
+    node = fdt_node_offset_by_compatible(dt, -1, compat);
     if (node < 0 ||
         fdt_setprop(dt, node, "memory-region-names", region_names, sizeof(region_names)))
         goto disable;
-    node = fdt_path_offset(dt, path);
+    node = fdt_node_offset_by_compatible(dt, -1, compat);
     if (node < 0 || fdt_setprop(dt, node, "apple,firmware-iovas", iovas, sizeof(iovas)))
         goto disable;
 
@@ -4365,7 +4369,7 @@ static int dt_set_ane_node(int node)
     return 0;
 
 disable:
-    node = fdt_path_offset(dt, path);
+    node = fdt_node_offset_by_compatible(dt, -1, compat);
     if (node < 0 || fdt_setprop_string(dt, node, "status", "disabled"))
         return -1;
     printf("FDT: ANE disabled: %s\n", reason);
@@ -4377,7 +4381,7 @@ static int dt_set_ane_firmware(void)
     for (size_t i = 0; i < ARRAY_SIZE(ane_compatibles); i++) {
         int node = fdt_node_offset_by_compatible(dt, -1, ane_compatibles[i]);
         if (node >= 0)
-            return dt_set_ane_node(node);
+            return dt_set_ane_node(node, ane_compatibles[i]);
     }
     return 0;
 }
