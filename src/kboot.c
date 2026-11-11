@@ -8943,7 +8943,7 @@ static int dt_set_isp(void)
 }
 
 /*
- * J713: iBoot loads the camera firmware, and the kernel starts it as iBoot left it. The
+ * J713 and J604: iBoot loads the camera firmware, and the kernel starts it as iBoot left it. The
  * segments move with the boot firmware, so the device tree describes the ISP disabled, with empty
  * placeholders isp-firmware-text and isp-firmware-data and an isp-heap window for the
  * firmware's main memory. Fill the placeholders from this boot's ADT isp segment-ranges: reg,
@@ -9073,8 +9073,9 @@ static int dt_set_j713_isp_one(unsigned int unused)
  */
 static void dt_set_j713_isp(void)
 {
-    if (chip_id != T8132 || fdt_node_check_compatible(dt, 0, "apple,j713"))
-        return;
+    if (chip_id != T8132 || (fdt_node_check_compatible(dt, 0, "apple,j713") &&
+                             fdt_node_check_compatible(dt, 0, "apple,j604")))
+        return; /* No other M4 board's camera handoff is qualified. */
     int isp = fdt_node_offset_by_compatible(dt, -1, "apple,t8132-isp");
     const char *status = isp < 0 ? NULL : fdt_getprop(dt, isp, "status", NULL);
     if (!status || strcmp(status, "disabled") ||
