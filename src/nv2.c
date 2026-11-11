@@ -125,6 +125,10 @@ bool nv2_probe_active = false;
 #define SYS_ICH_AP1R0    sys_reg(3, 4, 12, 9, 0)
 #define SYS_VMTMR_FIQENA sys_reg(3, 5, 15, 1, 3)
 #define SYS_PMCR1_EL12   sys_reg(3, 1, 15, 7, 2)
+/* EL1's Apple timer virtual control (CNTV_CTL layout: EN, IMASK, ISTATUS), XNU's kernel timer
+ * under aura, as aura's EL2 reaches it (measured on T6050). At EL2 with E2H, S3_1_C15_C0_5 is
+ * ACNTHV_CTL_EL2 (S3_1_C15_C7_4) instead. */
+#define SYS_AGT_CNTV_CTL_EL02 sys_reg(3, 4, 15, 2, 7)
 
 /* HFGITR_EL2 TLBI VMALLE1OS/IS/VMALLE1: the only EL1 TLBIs whose target L1
  * cannot express without a stage-2 context; L1's own TLBIs stay native. */
@@ -1038,6 +1042,24 @@ static void nv2_note_unknown(struct nv2_cpu *c, u64 key, bool read)
     nv2_trace(NV2_T_UNKNOWN, key, read, mrs(ELR_EL2), 0, 0, 0);
 }
 
+/* L1's ACNTHV_CTL_EL2 write, onto EL1's Apple timer. Prints each core's first one and counts
+ * those that turn off a timer whose FIQ is already asserting (EN, not IMASK, ISTATUS). */
+static void nv2_agt_ctl_write(u64 value)
+{
+    static u32 n_first[MAX_CPUS], n_firing;
+    u64 old = mrs(SYS_AGT_CNTV_CTL_EL02);
+    int cpu = smp_id();
+
+    msr(SYS_AGT_CNTV_CTL_EL02, value);
+    sysop("isb");
+    bool firing = (old & 7) == 5 && !(value & 1);
+    u32 n = firing ? ++n_firing : 0;
+    if (!n_first[cpu]++ || (firing && (n <= 16 || !(n & 0xff))))
+        printf("NV2: cpu%d ACNTHV_CTL_EL2 <- 0x%lx onto EL1's Apple timer (was 0x%lx, now 0x%lx; "
+               "%u masked while firing)\n",
+               cpu, value, old, mrs(SYS_AGT_CNTV_CTL_EL02), n_firing);
+}
+
 /*
  * Group 3 ID registers under HCR.TID3: the hardware's values, except that
  * ID_AA64MMFR4_EL1 tells L1 the truth about what it runs on here: VHE only
@@ -1380,11 +1402,27 @@ static bool nv2_sysreg_do(struct nv2_cpu *c, u64 *regs, u64 esr)
                 sptm_virt_amx_ctl_el2_write(value);
             break;
         case KEY(3, 1, 15, 7, 4):
+            /* ACNTHV_CTL_EL2: XNU's kernel timer runs at EL2 on bare metal, and L1's hyp timers
+             * are the real EL1 timers here, so its control is EL1's Apple timer control. XNU
+             * clears EN before a core's offline WFI; left on, that timer's FIQ wakes the WFI
+             * forever, the core never powers off and XNU's cluster power-down waits. Qualified
+             * on T6050 only; other chips keep the earlier write forward. */
+            if (chip_id == T6050) {
+                if (read)
+                    value = mrs(SYS_AGT_CNTV_CTL_EL02);
+                else
+                    nv2_agt_ctl_write(value);
+            } else if (read) {
+                nv2_note_unknown(c, key, read);
+                value = 0;
+            } else {
+                msr(sys_reg(3, 1, 15, 7, 4), value);
+            }
+            break;
         case KEY(3, 5, 15, 1, 6):
         case KEY(3, 4, 15, 12, 6):
-            /* These reads and the additional registers have only been qualified on T6050.
-             * Other chips retain the existing C7_4 write-forwarding policy. */
-            if (chip_id != T6050 && (read || op1 != 1)) {
+            /* These have only been qualified on T6050. */
+            if (chip_id != T6050) {
                 nv2_note_unknown(c, key, read);
                 value = 0;
                 break;
@@ -1393,11 +1431,7 @@ static bool nv2_sysreg_do(struct nv2_cpu *c, u64 *regs, u64 esr)
              * virtual EL2: performed on the hardware, both ways, so a read-modify-write keeps
              * the bits the hardware holds. */
             if (read)
-                value = op1 == 1   ? mrs(sys_reg(3, 1, 15, 7, 4))
-                        : op1 == 5 ? mrs(sys_reg(3, 5, 15, 1, 6))
-                                   : mrs(sys_reg(3, 4, 15, 12, 6));
-            else if (op1 == 1)
-                msr(sys_reg(3, 1, 15, 7, 4), value);
+                value = op1 == 5 ? mrs(sys_reg(3, 5, 15, 1, 6)) : mrs(sys_reg(3, 4, 15, 12, 6));
             else if (op1 == 5)
                 msr(sys_reg(3, 5, 15, 1, 6), value);
             else
