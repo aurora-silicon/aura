@@ -3558,6 +3558,10 @@ static T6050_TEXT int t6050_ext_one(void *dt, int n)
     if (!mreg || len < 16 || fdt64_ld(&mreg[0]) != coproc + T6050_MBOX)
         bail("dcpext%d: mboxes is not the ASC mailbox\n", n);
 
+    /* An engine with an output scans out through its display DART, after the internal one */
+    fdt32_t scanout[2] = {cpu_to_fdt32(fdt_get_phandle(dt, dart[1])), 0};
+    bool output = fdt_getprop(dt, node, "apple,connector-type", NULL);
+
     /* Offsets move as properties grow: each target by its exact path again */
     char path[4][T6050_PATH];
     int targets[4] = {node, mbox, dart[0], dart[1]};
@@ -3571,6 +3575,9 @@ static T6050_TEXT int t6050_ext_one(void *dt, int n)
         fdt_setprop(dt, kboot_fdt_path_exact(dt, path[0]), "apple,firmware-uuid", T6050_DCP_UUID,
                     sizeof(T6050_DCP_UUID)) ||
         fdt_setprop(dt, kboot_fdt_path_exact(dt, path[0]), "apple,bw-scratch", v, sizeof(v)))
+        return -1;
+    if (output && fdt_appendprop(dt, kboot_fdt_path_exact(dt, t6050.path[T6050_DISP]), "iommus",
+                                 scanout, sizeof(scanout)))
         return -1;
     for (int i = 0; i < 4; i++)
         if (fdt_setprop_string(dt, kboot_fdt_path_exact(dt, path[i]), "status", "okay"))
