@@ -32,6 +32,13 @@ SECTIONS {
         *hv/hv_wdt.o(.text .text.*)
         /* Run-once OS preparation also fits in this slot. */
         *kboot.o(.text .text.*)
+        /*
+         * The Ed25519 verifier's curve and field code (run once per boot). Its SHA-512 and
+         * secboot.c go to .text: neither slot has room for all of it.
+         */
+        *librust.a:*ed25519_compact*(.text.*15ed25519_compact12edwards25519*)
+        *librust.a:*ed25519_compact*(.text.*15ed25519_compact10field25519*)
+        *librust.a:*ed25519_compact*(.text.*15ed25519_compact7ed25519*)
     } :text
     .text : ALIGN(0x10000) {
         *(.text)

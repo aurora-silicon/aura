@@ -25,6 +25,7 @@
 #include "pcie.h"
 #include "pmgr.h"
 #include "pmu_counter.h"
+#include "secboot.h"
 #include "sep.h"
 #include "smp.h"
 #include "stage1_config.h"
@@ -103,7 +104,7 @@ static bool stage1_wait_request_window(void)
 
 bool stage1_proxy_request_window(void)
 {
-    if (stage1_window_done || stage1_chained)
+    if (stage1_window_done || stage1_chained || !secboot_host_proxy_allowed())
         return false;
     stage1_window_done = true;
     printf("Stage 1: aura-proxy on the ESP, waiting %u s for a host\n",
@@ -130,7 +131,8 @@ bool debugusb_proxy_window(void)
 #else
     bool offered = stage1_chained || stage1_window_passed;
 #endif
-    if (stage1_window_done || offered || !dockchannel_uart_host_seen())
+    if (stage1_window_done || offered || !secboot_host_proxy_allowed() ||
+        !dockchannel_uart_host_seen())
         return false;
     stage1_window_done = true;
     printf("aura: debugusb boot, opening proxy window\n");
@@ -157,6 +159,7 @@ static void stage1_read_boot_record(void)
 bool stage1_recovery_window(void)
 {
     if (stage1_window_done || stage1_chained || !stage1_boot_record_valid ||
+        !secboot_host_proxy_allowed() ||
         !stage1_previous_boot_stopped_early(stage1_boot_counts, stage1_boot_error_stage))
         return false;
     stage1_window_done = true;
@@ -184,9 +187,11 @@ void run_actions(void)
     enum stage1_proxy_result window_result = STAGE1_PROXY_TIMEOUT;
     enum stage1_payload_action payload_action;
 
-    u32 window_ms = stage1_config_window_ms();
+    /* An enforcing build never gives a USB host the proxy: it would run unsigned code. */
+    u32 window_ms = secboot_host_proxy_allowed() ? stage1_config_window_ms() : 0;
     /* aura-proxy: wait for a host, then boot as normal if none came. */
-    if (aura_proxy_enabled() && window_ms < STAGE1_PROXY_REQUEST_MS) {
+    if (aura_proxy_enabled() && secboot_host_proxy_allowed() &&
+        window_ms < STAGE1_PROXY_REQUEST_MS) {
         printf("aura-proxy: waiting %u s for a host\n", STAGE1_PROXY_REQUEST_MS / 1000);
         window_ms = STAGE1_PROXY_REQUEST_MS;
     }
@@ -210,7 +215,8 @@ void run_actions(void)
         printf("Boot policy: sip0 = %ld\n", lp_sip0);
     }
 
-    if (chip_id != T8140 && !cur_boot_args.video.display && lp_sip0 == 127) {
+    if (chip_id != T8140 && !cur_boot_args.video.display && lp_sip0 == 127 &&
+        secboot_host_proxy_allowed()) {
         if (!usb_up) {
             printf("Bringing up USB for early debug...\n");
             usb_init();
@@ -280,6 +286,20 @@ void run_actions(void)
 
     if (payload_action == STAGE1_PAYLOAD_HALT)
         panic("Stage 1: no safe proxy carrier after CDC failure\n");
+
+    if (!secboot_host_proxy_allowed()) {
+        /* Shown on the panel. No proxy: a host could run anything through it. */
+        /*
+         * Shown on the panel. Never stop here: nobody may be at the Mac. A Stage 1 reboots into
+         * the same check (the owner can choose another system at startup); a Stage 2 reboots to
+         * Stage 1, which boots its configured image.
+         */
+        printf("\nSecure boot: no verified next stage could be started, and this build gives\n"
+               "  no USB host a proxy. Rebooting in 10 s. To stop, hold the power button and\n"
+               "  choose another system; then reinstall a signed Stage 2.\n");
+        mdelay(10000);
+        flush_and_reboot();
+    }
 
 #ifndef BRINGUP
     /* A proxy window brought USB up already; a second bring-up would register its ports twice. */
@@ -427,6 +447,8 @@ next_stage:
 
     if (!nvme_shutdown()) {
         printf("NVMe handoff failed; returning to proxy\n");
+        if (!secboot_host_proxy_allowed())
+            flush_and_reboot();
         uartproxy_run(NULL);
         panic("NVMe handoff failed\n");
     }
@@ -438,6 +460,8 @@ next_stage:
         /* Its firmware may still use memory the next stage will reuse. */
         if (display_shutdown(DCP_SLEEP_IF_EXTERNAL) < 0) {
             printf("Display handoff failed; returning to proxy\n");
+            if (!secboot_host_proxy_allowed())
+                flush_and_reboot();
             uartproxy_run(NULL);
             panic("Display handoff failed\n");
         }

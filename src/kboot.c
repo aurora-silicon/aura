@@ -35,6 +35,7 @@
 #include "pmgr.h"
 #include "rtkit.h"
 #include "sart.h"
+#include "secboot.h"
 #include "sep.h"
 #include "sio.h"
 #include "smp.h"
@@ -839,6 +840,24 @@ static void dt_set_trial_watchdog(void)
                 printf("FDT: trial boot: U-Boot leaves the watchdog to the trial budget\n");
         }
     }
+}
+
+/*
+ * An aura-try trial must boot the install its Stage 1 names. U-Boot picks the ESP from
+ * /chosen/asahi,efi-system-partition; without it, it takes the first ESP with an EFI loader, which
+ * on a disk with several installs is another system. A trial without the name refuses its payload,
+ * and the trial path reboots into the configured Stage 2.
+ */
+static int dt_check_trial_esp(void)
+{
+    if (!aura_trial_enabled() || chip_id == T8152)
+        return 0;
+    int chosen = fdt_path_offset(dt, "/chosen");
+    if (chosen >= 0 && fdt_getprop(dt, chosen, "asahi,efi-system-partition", NULL))
+        return 0;
+    printf("FDT: trial boot without asahi,efi-system-partition from Stage 1: not starting the "
+           "next stage on a guessed ESP\n");
+    return -1;
 }
 
 static int dt_set_chosen(void)
@@ -10107,6 +10126,9 @@ int kboot_prepare_dt(void *fdt)
     if (dt_set_chosen())
         return -1;
     dt_set_trial_watchdog();
+    if (dt_check_trial_esp())
+        return -1;
+    secboot_export_fdt(dt);
     if (chip_id == T8152)
         return dt_prepare_t8152();
     if (dt_set_speaker_safety())

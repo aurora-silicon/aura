@@ -9,6 +9,7 @@
 #include "kboot.h"
 #include "malloc.h"
 #include "nvme.h"
+#include "secboot.h"
 #include "string.h"
 #include "utils.h"
 #include "xnuboot.h"
@@ -143,6 +144,13 @@ static int boot_storage_files(const char *uuid, char *const names[3], struct ker
 
     if (boot_check_dtb(files[1], sizes[1]))
         goto out;
+    /* ESP files carry no signature: an enforcing stage does not boot them. */
+    if (!secboot_allow_unverified("an ESP boot= kernel"))
+        goto out;
+    secboot_measure("esp-kernel", files[0], sizes[0], SECBOOT_UNSIGNED);
+    secboot_measure("esp-dtb", files[1], sizes[1], SECBOOT_UNSIGNED);
+    if (have_initrd)
+        secboot_measure("esp-initramfs", files[2], sizes[2], SECBOOT_UNSIGNED);
     if (have_initrd &&
         !((sizes[2] >= 18 && ((u8 *)files[2])[0] == 0x1f && ((u8 *)files[2])[1] == 0x8b) ||
           (sizes[2] >= 6 && (!memcmp(files[2], "070701", 6) || !memcmp(files[2], "070702", 6)))))

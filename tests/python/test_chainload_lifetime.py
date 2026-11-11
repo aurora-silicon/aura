@@ -93,6 +93,12 @@ static void rust_free_image(void *data, size_t size)
 }
 /* The Stage 1 log handoff is out of scope here: it only adds a variable. */
 static void stage1_log_handoff(char **vars, size_t *var_cnt, size_t var_capacity) {}
+/* secboot.c: no image trailer, nothing enforced */
+static int secboot_check_chainload(void *data, size_t *size, char **vars, size_t *var_cnt,
+                                   size_t var_capacity)
+{
+    return 0;
+}
 /* A recovery window opens before NVMe is touched; a host that takes it supplies the next stage. */
 static bool stage1_recovery_window(void)
 {
