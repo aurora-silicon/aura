@@ -447,6 +447,8 @@ next_stage:
 
     if (!nvme_shutdown()) {
         printf("NVMe handoff failed; returning to proxy\n");
+        if (!secboot_host_proxy_allowed())
+            flush_and_reboot();
         uartproxy_run(NULL);
         panic("NVMe handoff failed\n");
     }
@@ -458,6 +460,8 @@ next_stage:
         /* Its firmware may still use memory the next stage will reuse. */
         if (display_shutdown(DCP_SLEEP_IF_EXTERNAL) < 0) {
             printf("Display handoff failed; returning to proxy\n");
+            if (!secboot_host_proxy_allowed())
+                flush_and_reboot();
             uartproxy_run(NULL);
             panic("Display handoff failed\n");
         }

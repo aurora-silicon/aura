@@ -43,9 +43,20 @@ bool secboot_allow_unverified(const char *what);
 int secboot_check_chainload(void *image, size_t *size, char **vars, size_t *var_cnt,
                             size_t var_capacity);
 
-/* Whether a USB host may get the proxy (any window, or the no-payload fallback): not under enforce.
+/*
+ * Whether this stage refuses what it cannot verify: an enforce build, or a Stage 1 whose filled
+ * key block asks for enforce (secboot_sign.py fill-keys --enforce).
+ */
+bool secboot_enforcing(void);
+
+/*
+ * Whether a USB host may get the proxy (any window, or the no-payload / failed hand-off
+ * fallbacks): never in the secure flavour, and not while enforcing.
  */
 bool secboot_host_proxy_allowed(void);
+
+/* "dev" or "secure" (SECBOOT_FLAVOUR). */
+const char *secboot_flavour(void);
 
 /* Build /chosen/aurora,boot-security in the FDT handed to the next stage. */
 void secboot_export_fdt(void *dt);

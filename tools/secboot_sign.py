@@ -10,8 +10,9 @@
   secboot_sign.py sign-image --key K [--secver V] <in> <out>
         append an aura_sig record and the AURSIGT1 footer that cover the whole image, for the
         stage that chainloads it
-  secboot_sign.py fill-keys --pub P [--pub P2 ...] [--min-secver V] <stage1-in> <stage1-out>
-        fill the AURORA-S1-KEY01 block of a Stage 1 image (up to 4 keys) before kmutil enrols it
+  secboot_sign.py fill-keys --pub P [--pub P2 ...] [--min-secver V] [--enforce] <stage1-in> <stage1-out>
+        fill the AURORA-S1-KEY01 block of a Stage 1 image (up to 4 keys) before kmutil enrols it;
+        --enforce makes an audit build refuse what it cannot verify (the floor applies either way)
   secboot_sign.py verify --pub P <file> [--head-len N]
         check either form and print the verdict, the key id and the SHA-256
 
@@ -192,6 +193,7 @@ def main():
     f = sub.add_parser("fill-keys")
     f.add_argument("--pub", action="append", required=True)
     f.add_argument("--min-secver", type=int, default=0)
+    f.add_argument("--enforce", action="store_true")
     f.add_argument("inp")
     f.add_argument("out")
     v = sub.add_parser("verify")
@@ -242,11 +244,12 @@ def main():
         off = img.index(magic) + 16
         if struct.unpack_from("<I", img, off)[0] != 1:
             sys.exit("unsupported key block version")
-        body = struct.pack("<IIII", 1, len(keys), a.min_secver, 0) + b"".join(keys).ljust(128, b"\0")
+        flags = 1 if a.enforce else 0  # KEY_FLAG_ENFORCE
+        body = struct.pack("<IIII", 1, len(keys), a.min_secver, flags) + b"".join(keys).ljust(128, b"\0")
         out = img[:off] + body + struct.pack("<I", zlib.crc32(body)) + img[off + len(body) + 4:]
         assert len(out) == len(img)
         open(a.out, "wb").write(out)
-        print("keys " + " ".join(key_id(k).hex() for k in keys) + f" min-secver {a.min_secver} sha256 {hashlib.sha256(out).hexdigest()}")
+        print("keys " + " ".join(key_id(k).hex() for k in keys) + f" min-secver {a.min_secver} policy {'enforce' if a.enforce else 'audit'} sha256 {hashlib.sha256(out).hexdigest()}")
     elif a.cmd == "verify":
         data = open(a.file, "rb").read()
         pub = open(a.pub, "rb").read() if a.pub else None

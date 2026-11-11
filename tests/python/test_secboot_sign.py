@@ -60,5 +60,9 @@ def test_fill_keys(tmp_path):
     assert body[16:48] == PUB.read_bytes()
     assert struct.unpack_from("<I", d, 4 + 160)[0] == zlib.crc32(body)
     assert run("fill-keys", "--pub", PUB, out, tmp_path / "x").returncode == 0  # refill is fine
+    enf = tmp_path / "s1-enforce.bin"
+    assert run("fill-keys", "--pub", PUB, "--enforce", src, enf).returncode == 0
+    body = enf.read_bytes()[4 + 16:4 + 16 + 144]
+    assert struct.unpack_from("<IIII", body) == (1, 1, 0, 1)
     src.write_bytes(b"no block here")
     assert run("fill-keys", "--pub", PUB, src, tmp_path / "y").returncode != 0

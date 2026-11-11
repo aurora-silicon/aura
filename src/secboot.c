@@ -29,13 +29,16 @@
 #define SECBOOT_CHECKS 1
 #endif
 
-#ifdef SECBOOT_ENFORCE
-static const char policy_name[] = "enforce";
-#elif defined(SECBOOT_AUDIT)
-static const char policy_name[] = "audit";
+/*
+ * Two flavours (SECBOOT_FLAVOUR): "dev" keeps the USB host windows a lab needs (recovery window,
+ * aura-proxy, DebugUSB) unless the stage enforces; "secure" never opens one.
+ */
+#ifdef SECBOOT_SECURE_FLAVOUR
+#define FLAVOUR_STR "secure"
 #else
-static const char policy_name[] = "off";
+#define FLAVOUR_STR "dev"
 #endif
+static const char flavour_name[] = FLAVOUR_STR;
 
 #ifdef ESP_STAGE2
 static const char stage_name[] = "stage2";
@@ -48,6 +51,8 @@ static const char stage_name[] = "aura";
 #ifndef SECBOOT_MIN_SECURITY_VERSION
 #define SECBOOT_MIN_SECURITY_VERSION 0
 #endif
+
+#define KEY_FLAG_ENFORCE 1u /* key block flags: the installer chose enforce for this Stage 1 */
 
 u32 aura_secboot_verify(const u8 *body, size_t body_len, const u8 *covered, size_t covered_len,
                         const u8 *pubkey, u32 min_security_version, u8 *digest,
@@ -169,14 +174,50 @@ static bool key_block_valid(void)
         u32 crc = tinf_crc32(&key_block.version, offsetof(struct secboot_key_block, crc32) -
                                                      offsetof(struct secboot_key_block, version));
         valid = key_block.version == 1 && key_block.count >= 1 &&
-                key_block.count <= KEY_BLOCK_KEYS && crc == key_block.crc32;
+                key_block.count <= KEY_BLOCK_KEYS && !(key_block.flags & ~KEY_FLAG_ENFORCE) &&
+                crc == key_block.crc32;
         if (key_block.count && !valid)
             printf("secboot: the Stage 1 key block is damaged; using the built-in key\n");
     }
     return valid;
 }
+
+static bool block_enforces(void)
+{
+    return key_block_valid() && (key_block.flags & KEY_FLAG_ENFORCE);
+}
+#else
+static bool block_enforces(void)
+{
+    return false;
+}
+#endif
+#else
+static bool block_enforces(void)
+{
+    return false;
+}
 #endif
 
+bool secboot_enforcing(void)
+{
+#ifdef SECBOOT_ENFORCE
+    return true;
+#else
+    return block_enforces();
+#endif
+}
+
+static const char *policy_name(void)
+{
+#ifdef SECBOOT_CHECKS
+    return secboot_enforcing() ? "enforce" : "audit";
+#else
+    return "off";
+#endif
+}
+
+#ifdef SECBOOT_CHECKS
 /* The trusted key whose id the record names, and the floor for its security version. */
 static const u8 *trusted_key(const u8 *record, u32 *min_secver)
 {
@@ -220,18 +261,17 @@ static int settle(struct measurement *m, const char *what)
     hex(h, m->sha256, 8);
     hex(k, m->key_id, 8);
     printf("secboot: %s: %s (key %s, security version %u, sha256 %s...), policy %s\n", what,
-           verdict_name(m->verdict), k, m->security_version, h, policy_name);
+           verdict_name(m->verdict), k, m->security_version, h, policy_name());
     if (m->verdict == SECBOOT_VERIFIED) {
         any_verified = true;
         return 0;
     }
     all_verified = false;
-#ifdef SECBOOT_ENFORCE
-    printf("secboot: refusing %s\n", what);
-    return -1;
-#else
+    if (secboot_enforcing()) {
+        printf("secboot: refusing %s\n", what);
+        return -1;
+    }
     return 0;
-#endif
 }
 
 int secboot_check_payloads(u8 *p, u8 **next)
@@ -272,7 +312,9 @@ int secboot_check_payloads(u8 *p, u8 **next)
 
 u8 *secboot_payload_next(u8 *p)
 {
-#ifdef SECBOOT_ENFORCE
+#ifdef SECBOOT_CHECKS
+    if (!secboot_enforcing())
+        return p;
     static const char *const loader_lines[] = {
         /*
          * What an earlier aura stage appends: /chosen strings (its version, the ESP, the trial,
@@ -313,24 +355,27 @@ u8 *secboot_payload_next(u8 *p)
 
 bool secboot_host_proxy_allowed(void)
 {
-#ifdef SECBOOT_ENFORCE
+#ifdef SECBOOT_SECURE_FLAVOUR
     return false;
 #else
-    return true;
+    return !secboot_enforcing();
 #endif
+}
+
+const char *secboot_flavour(void)
+{
+    return flavour_name;
 }
 
 bool secboot_allow_unverified(const char *what)
 {
-#ifdef SECBOOT_ENFORCE
-    printf("secboot: %s cannot be verified; refusing it under policy enforce\n", what);
     all_verified = false;
-    return false;
-#else
+    if (secboot_enforcing()) {
+        printf("secboot: %s cannot be verified; refusing it under policy enforce\n", what);
+        return false;
+    }
     UNUSED(what);
-    all_verified = false;
     return true;
-#endif
 }
 
 /*
@@ -341,6 +386,7 @@ int secboot_check_chainload(void *image, size_t *size, char **vars, size_t *var_
                             size_t var_capacity)
 {
     static char var[sizeof("chosen.aurora,measure-0=") + 160];
+    static char flavour_var[] = "chosen.aurora,stage1-flavour=" FLAVOUR_STR;
     u8 *img = image;
     size_t covered = *size;
     struct measurement *m = add("next-stage", SECBOOT_UNSIGNED);
@@ -381,8 +427,15 @@ int secboot_check_chainload(void *image, size_t *size, char **vars, size_t *var_
     hex(h, m->sha256, 32);
     hex(k, m->key_id, 8);
     snprintf(var, sizeof(var), "chosen.aurora,measure-%d=%s;%s;%s;%s;%s;%u;%s", n, stage_name,
-             policy_name, "next-stage", verdict_name(m->verdict), k, m->security_version, h);
+             policy_name(), "next-stage", verdict_name(m->verdict), k, m->security_version, h);
     vars[(*var_cnt)++] = var;
+#if defined(CHAINLOADING) && !defined(ESP_STAGE2)
+    /* Which Stage 1 flavour started the chain; the next stage copies it into the record. */
+    if (*var_cnt < var_capacity)
+        vars[(*var_cnt)++] = flavour_var;
+#else
+    UNUSED(flavour_var);
+#endif
     return 0;
 }
 
@@ -534,7 +587,7 @@ void secboot_export_fdt(void *dt)
     chosen = fdt_path_offset(dt, "/chosen");
     node = fdt_subnode_offset(dt, chosen, "aurora,boot-security");
     for (size_t i = 0; i < log_cnt; i++) {
-        if (add_entry(dt, node, idx++, stage_name, policy_name, &mlog[i]) < 0)
+        if (add_entry(dt, node, idx++, stage_name, policy_name(), &mlog[i]) < 0)
             break;
         chosen = fdt_path_offset(dt, "/chosen");
         node = fdt_subnode_offset(dt, chosen, "aurora,boot-security");
@@ -545,14 +598,27 @@ void secboot_export_fdt(void *dt)
      * verified everything it hands over. partial: this stage verified what it hands over, but an
      * earlier link was not verified. unverified: anything else.
      */
-    bool mine = all_verified && any_verified;
-#ifndef SECBOOT_ENFORCE
-    mine = false;
-#endif
+    bool mine = all_verified && any_verified && secboot_enforcing();
     const char *state = mine && prev_verified ? "verified" : mine ? "partial" : "unverified";
     fdt_setprop_string(dt, node, "state", state);
-    fdt_setprop_string(dt, node, "policy", policy_name);
+    fdt_setprop_string(dt, node, "policy", policy_name());
     fdt_setprop_string(dt, node, "stage", stage_name);
-    printf("secboot: hand-off record: %d measurements, state %s, policy %s\n", idx, state,
-           policy_name);
+
+    /* The Stage 1 flavour: from the Stage 1 that chained this stage, or this stage's own. */
+    int flen = 0;
+    const char *fl = fdt_getprop(dt, chosen, "aurora,stage1-flavour", &flen);
+    char fbuf[8] = {0};
+    if (fl && flen > 0 && flen <= (int)sizeof(fbuf) &&
+        (!strcmp(fl, "dev") || !strcmp(fl, "secure"))) {
+        memcpy(fbuf, fl, flen);
+        fdt_delprop(dt, chosen, "aurora,stage1-flavour");
+        chosen = fdt_path_offset(dt, "/chosen");
+        node = fdt_subnode_offset(dt, chosen, "aurora,boot-security");
+        fdt_setprop_string(dt, node, "stage1-flavour", fbuf);
+    } else if (!strcmp(stage_name, "stage1") || !strcmp(stage_name, "aura")) {
+        fdt_setprop_string(dt, node, "stage1-flavour", flavour_name);
+    }
+    fdt_setprop_string(dt, node, "flavour", flavour_name);
+    printf("secboot: hand-off record: %d measurements, state %s, policy %s, flavour %s\n", idx,
+           state, policy_name(), flavour_name);
 }

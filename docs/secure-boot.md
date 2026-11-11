@@ -15,6 +15,16 @@ Both are build options; a default build only writes the record.
   nothing about who signed an image.
 - `SECBOOT_MIN_SECURITY_VERSION` (a `-D` define): the lowest security version
   a signature may carry. Signatures below it are refused as rollbacks.
+- `SECBOOT_FLAVOUR=dev|secure` (default `dev`): `dev` keeps the USB host
+  windows a lab needs (the recovery window after a failed boot, `aura-proxy`,
+  DebugUSB) while the stage does not enforce. `secure` never gives a USB host
+  the proxy, whatever the policy: no window, and a failed hand-off or a boot
+  with no payload reboots instead of falling back to the proxy. `secure` needs
+  `SECBOOT=audit` or `enforce` and refuses `DEBUGUSB_PROXY=1`.
+
+The usual pair is a `secure` Stage 1 built with `SECBOOT=audit` for users and a
+`dev` one for development Macs. Both report and boot by default; enforcing is
+chosen when the key block is filled (below), so one build serves both.
 
 ## Keys in a Stage 1 image
 
@@ -22,14 +32,28 @@ A Stage 1 built with `SECBOOT=audit` or `enforce` also carries an
 `AURORA-S1-KEY01` block: up to four Ed25519 public keys and a minimum
 security version, filled before `kmutil` enrols the image, so the
 LocalPolicy's `coih` covers them like the rest of Stage 1:
-`secboot_sign.py fill-keys --pub owner.pub [--pub aurora.pub] --min-secver N in out`.
+`secboot_sign.py fill-keys --pub aurora.pub [--pub owner.pub] --min-secver N [--enforce] in out`.
 A record is checked with the key whose id it names. An unfilled block leaves
-the built-in key in charge; a damaged one is reported and ignored.
+the built-in key in charge; a damaged one (bad CRC, unknown flags) is reported
+and ignored.
 
-Under `enforce` no aura stage gives a USB host the proxy: not the configured
-or `aura-proxy` window, not the recovery window after a failed boot, not the
-DebugUSB window, and not the fallback when no payload starts (it leaves a
-message on the panel instead).
+- Keys: the distribution's release key by default; an owner who wants to sign
+  their own images puts their key in instead of, or next to, it.
+- `--min-secver`: the rollback floor. It lives only here, so it moves only when
+  a new Stage 1 is enrolled; signatures below it are refused as rollbacks in
+  every policy.
+- `--enforce`: an `audit` Stage 1 then refuses what it cannot verify, as an
+  `enforce` build does. Without it the Stage 1 checks, records and boots.
+
+The record carries the policy that was in force (`policy`), the Stage 1
+flavour (`stage1-flavour`, passed on as `chosen.aurora,stage1-flavour`) and
+this stage's own (`flavour`).
+
+While a stage enforces, or in the `secure` flavour, no aura stage gives a USB
+host the proxy: not the configured or `aura-proxy` window, not the recovery
+window after a failed boot, not the DebugUSB window, and not the fallbacks when
+no payload starts or a hand-off fails (it leaves a message on the panel and
+reboots).
 
 ## Signature forms
 
