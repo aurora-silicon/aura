@@ -131,7 +131,6 @@ SECTIONS {
          * it pushes .text past its next 64 KiB step, and .data past _file_limit.
          */
         *hv/hv_vm.o(.text .text.*)
-        *hv/hv_sprr.o(.text .text.*)
         *hv/hv_virtio.o(.text .text.*)
         *hv/hv_vuart.o(.text .text.*)
         *hv/hv_wdt.o(.text .text.*)
