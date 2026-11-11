@@ -445,6 +445,9 @@ bool nvme_post_m4(void)
  */
 static bool nvme_ans_power_off(void)
 {
+    /* An adopted session has no RTKit instance of this stage's until it is powered off. */
+    if (!nvme_rtkit && !(nvme_rtkit = rtkit_init("nvme", nvme_asc, NULL, NULL, nvme_sart, false)))
+        return false;
     if (chip_id == T6050) {
         if ((read32(nvme_base + NVME_CC) & NVME_CC_EN) && !nvme_ctrl_suspend())
             printf("nvme: controller suspend timed out\n");
@@ -526,7 +529,7 @@ bool nvme_init(void)
     nvme_verify_bounce = NULL;
     nvme_boot_ticks = 0;
 
-    bool from_off = false, earlier = false, restarted = false;
+    bool from_off = false, earlier = false, adopted = false, restarted = false;
     int adt_path[8];
     int node = adt_path_offset_trace(adt, "/arm-io/ans", adt_path);
     if (node < 0) {
@@ -641,7 +644,14 @@ bool nvme_init(void)
          */
         earlier = running && (nvme_read64_lo_hi(nvmmu_base + NVMMU_ASQ_BASE) ||
                               read32(nvme_qreg(NVME_MAX_PEND_CMDS_CTRL)));
-        from_off = !running || earlier;
+        /*
+         * T6050: adopt a healthy session as it is. Left 16 s (an ESP Stage 2 behind its host
+         * window), its firmware no longer acknowledged the idle, and ANS didn't start from off.
+         */
+        adopted = earlier && chip_id == T6050 &&
+                  read32(nvme_base + NVME_BOOT_STATUS) == NVME_BOOT_STATUS_OK &&
+                  !(read32(nvme_base + NVME_CSTS) & NVME_CSTS_CFS);
+        from_off = !running || (earlier && !adopted);
         if (from_off && !earlier && !nvme_sart_saved_cnt) {
             printf("nvme: ANS is off and no earlier stage passed its SART entries\n");
             goto out_asc;
@@ -651,6 +661,11 @@ bool nvme_init(void)
     nvme_sart = sart_init("/arm-io/sart-ans");
     if (!nvme_sart)
         goto out_asc;
+
+    if (adopted) {
+        printf("nvme: adopting the live post-M4 ANS session\n");
+        goto setup_controller;
+    }
 
     nvme_rtkit = rtkit_init("nvme", nvme_asc, NULL, NULL, nvme_sart, false);
     if (!nvme_rtkit)
@@ -703,7 +718,8 @@ setup_controller:
             restarted = true;
             if (!nvme_ans_power_off() || !nvme_ans_power_on())
                 goto out_preserve;
-            earlier = false;
+            earlier = adopted = false;
+            from_off = true;
             goto setup_controller;
         }
         goto out_disable_ctrl;
@@ -758,7 +774,7 @@ out_disable_ctrl:
     nvme_ctrl_disable();
     nvme_poll_syslog();
 out_shutdown:
-    if (from_off) {
+    if (from_off || adopted) {
         /* ANS may still reference the queues if controller shutdown failed. */
         printf("nvme: preserving ANS queues after setup failure; reboot required\n");
         goto out_preserve;
