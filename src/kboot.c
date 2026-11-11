@@ -11009,6 +11009,21 @@ static int dt_setup_mtd_phram(void)
     if (!logbuf.buffer)
         bail("FDT: failed to allocate aura log buffer\n");
 
+#ifdef J613_HV_MONITOR
+    /* The log device is allocated late, while the Linux FDT is prepared.  Seed
+     * it with the console ring so the earlier J613 monitor/probe receipt is
+     * recoverable from Linux as aura_stage2.log, not only over a live cable. */
+    extern char con_buf[];
+    extern size_t con_wp;
+    const size_t console_buffer_size = 8192;
+    size_t con_len = min(con_wp, console_buffer_size);
+    memset(logbuf.buffer, 0, LOGBUF_SIZE);
+    for (size_t i = 0; i < con_len; i++)
+        ((char *)logbuf.buffer)[i] =
+            con_buf[(con_wp - con_len + i) % console_buffer_size];
+    logbuf.wp = con_len;
+#endif
+
     snprintf(node_name, sizeof(node_name), "flash@%lx", (u64)logbuf.buffer);
     node = dt_get_or_add_reserved_mem(node_name, "phram", false, (u64)logbuf.buffer, SZ_16K);
 

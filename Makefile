@@ -155,6 +155,17 @@ ifeq ($(SPTM_VIRT),1)
 ifneq ($(CHAINLOADING),1)
 $(error SPTM_VIRT requires CHAINLOADING=1)
 endif
+
+# Owner-attended J613 stock-SPTM bring-up stages.  The monitor stage only
+# records the exact host decision inputs.  The synthetic stage additionally
+# exercises Aura's existing VNCR/EL1 return path and a guarded GL1 round trip;
+# neither stage reads or enters an Apple image.
+ifeq ($(J613_HV_MONITOR),1)
+CFG += J613_HV_MONITOR
+endif
+ifeq ($(J613_HV_SYNTHETIC),1)
+CFG += J613_HV_MONITOR J613_HV_SYNTHETIC
+endif
 CFG += SPTM_VIRT
 # Log the first FEAT_NV2 guest entries and exits.
 ifeq ($(NV2_TRACE),1)
@@ -305,6 +316,7 @@ OBJECTS := \
 
 ifeq ($(SPTM_VIRT),1)
 OBJECTS += nv2.o nv2_asm.o sptm_virt.o sptm_virt_cl4.o sptm_virt_gl.o sptm_virt_s2.o sptm_virt_s2r.o sptm_virt_s2r_soc.o sptm_virt_gpu.o s2r_dcp_pkt.o
+OBJECTS += sptm_j613_probe.o
 endif
 ifeq ($(AURACTL),1)
 OBJECTS += sptm_virt_ctl.o

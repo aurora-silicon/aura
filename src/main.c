@@ -30,6 +30,7 @@
 #include "secboot.h"
 #include "sep.h"
 #include "smp.h"
+#include "sptm_j613_probe.h"
 #include "stage1_config.h"
 #include "stage1_proxy.h"
 #include "string.h"
@@ -431,6 +432,10 @@ void aura_main(void)
 #ifndef BRINGUP
     if (pmgr_init() && chip_id == T8140)
         panic("T8140 PMGR initialization failed\n");
+
+#ifdef J613_HV_MONITOR
+    sptm_j613_probe_run();
+#endif
 #ifdef USE_DEBUG_USB
     tps6598x_enable_debugusb();
 #else
