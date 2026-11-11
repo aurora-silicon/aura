@@ -2986,6 +2986,7 @@ struct g17_soc {
     const char *name;             /* for the log */
     u32 count;                    /* perf-state-count, also the number of OPP entries */
     u32 num_states;               /* gpu-num-perf-states */
+    u32 tables;                   /* perf-state-table-count, 0 for 1; OPPs from the first */
     bool firmware_data;           /* also hand over gfx-data/gfx1-data (the firmware __DATA) */
     bool (*firmware_known)(void); /* when true, /chosen gets firmware_profile_prop */
     const char *firmware_profile_prop;
@@ -3063,6 +3064,16 @@ static const struct g17_soc g17_soc_t8142 = {
     .firmware_profile = T8142_GPU_FIRMWARE_PROFILE,
 };
 
+/* M5 Max (G17C): four perf-state tables, the OPPs from the first, as m1n1 hands it over. */
+static const struct g17_soc g17_soc_t6050 = {
+    .compat = "apple,agx-t6050",
+    .adt_compat = "gpu,t6050",
+    .name = "T6050",
+    .count = 14,
+    .num_states = 13,
+    .tables = 4,
+};
+
 /*
  * macOS 27.0's M5 GPU firmware gives each role a __DATA_SHARED_RO segment, where it keeps its
  * crash log, and iBoot places it right after that role's __DATA (sgx gfx-data-shared-ro and
@@ -3114,13 +3125,14 @@ static int dt_set_gpu_g17(void *dt, const struct g17_soc *soc)
     if (sgx < 0 || ADT_GETPROP(adt, sgx, "perf-state-count", &count) != sizeof(count) ||
         ADT_GETPROP(adt, sgx, "gpu-num-perf-states", &num_states) != sizeof(num_states) ||
         ADT_GETPROP(adt, sgx, "perf-state-table-count", &tables) != sizeof(tables) ||
-        count != soc->count || num_states != soc->num_states || tables != 1)
+        count != soc->count || num_states != soc->num_states ||
+        tables != (soc->tables ? soc->tables : 1))
         goto disable;
     states = adt_getprop(adt, sgx, "perf-states", &len);
-    if (!states || len != count * sizeof(*states))
+    if (!states || len != tables * count * sizeof(*states))
         goto disable;
     sram = adt_getprop(adt, sgx, "perf-states-sram", &len);
-    if (!sram || len != count * sizeof(*sram))
+    if (!sram || len != tables * count * sizeof(*sram))
         goto disable;
     for (u32 i = 0; i < count; i++)
         if (states[i].volt > UINT32_MAX / 1000)
@@ -4065,6 +4077,10 @@ int dt_set_gpu(void *dt)
         return dt_set_gpu_g17(dt, &g17_soc_t8140);
     if (chip_id == T8142)
         return dt_set_gpu_g17(dt, &g17_soc_t8142);
+
+    if (chip_id == T6050 &&
+        !fdt_node_check_compatible(dt, fdt_path_offset(dt, "gpu"), "apple,agx-g17c"))
+        return dt_set_gpu_g17(dt, &g17_soc_t6050);
 
     if (chip_id == T6040)
         return dt_set_gpu_t6040(dt);
