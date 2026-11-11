@@ -978,7 +978,10 @@ int display_init(void)
         printf("display: Display is internal\n");
 
     if (chip_id == T8140 || chip_id == T8132 ||
-        (chip_id == T6040 && board_id == 4 && adt_is_compatible(adt, 0, "J614sAP"))) {
+        (chip_id == T6040 && board_id == 4 && adt_is_compatible(adt, 0, "J614sAP")) ||
+        /* J575c: iBoot leaves the internal DCP running with no panel and a dummy framebuffer;
+         * the T6041 display handoff gives it to the kernel as iBoot left it. */
+        (chip_id == T6041 && adt_is_compatible(adt, 0, "J575cAP"))) {
         printf("display: preserving inherited display (%ldx%ld)\n", cur_boot_args.video.width,
                cur_boot_args.video.height);
         return 0;

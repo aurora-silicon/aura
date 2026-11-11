@@ -435,14 +435,15 @@ static const struct dcp_soc dcp_soc_t6041 = {
  * through dart-disp0 SIDs 0 and 16, of 32 streams each; the iop-dcp-nub segments come from the ADT
  * as on the J616s. Same 26.6.2 firmware gate and no opt-in.
  */
-static const char *const dcp_boards_t6041_max[] = {"apple,j616c", "apple,j614c", NULL};
+static const char *const dcp_boards_t6041_max[] = {"apple,j616c", "apple,j614c", "apple,j575c",
+                                                   NULL};
 
 static const struct dcp_soc dcp_soc_t6041_max = {
     .name = "T6041",
     .chip = T6041,
     .compat = "apple,t6041",
     .boards = dcp_boards_t6041_max,
-    .boards_desc = "J616C/J614C",
+    .boards_desc = "J616C/J614C/J575C",
     .dcp_compat = "apple,t6041-dcp",
     .disp_compat = "apple,display-subsystem",
     .marker = "apple,t6041-handoff",
@@ -2447,6 +2448,8 @@ static int dcp6_check_resv(void *dt)
     return 0;
 }
 
+static bool t6041_headless(void *dt);
+
 static __attribute__((noinline)) void dcp6_handoff(void *dt)
 {
     struct dcp6_dt n;
@@ -2937,6 +2940,20 @@ static const struct t6041_ext t6041_exts[] = {
      "/arm-io/dart-dcpext1", 0x602e00000UL, 0x602340000UL},
 };
 
+/*
+ * J575c (Mac Studio): no panel. The internal DCP is never handed over: an older Stage 1 starts it,
+ * finds nothing connected and puts it to sleep, and a kernel has no panel to drive with it anyway.
+ * The external processors are left as iBoot started them, so they are handed over on their own:
+ * the first one's ADT __TEXT stands in for the panel's, and its reservation is made here instead
+ * of by the internal handoff.
+ */
+static bool t6041_headless(void *dt)
+{
+    return dcp6.soc == &dcp_soc_t6041_max && !fdt_node_check_compatible(dt, 0, "apple,j575c");
+}
+
+static struct dcp6_seg t6041_headless_text;
+
 static int t6041_ext_fill(void *dt, const struct t6041_ext *ext)
 {
     static const u32 flags[DCPEXT6_SEGS] = {SEG_FLAGS_TEXT, SEG_FLAGS_DATA, SEG_FLAGS_OSLOG,
@@ -3035,8 +3052,13 @@ static int t6041_ext_fill(void *dt, const struct t6041_ext *ext)
                 return -1;
     }
     /* The two external processors and the panel share immutable TEXT. */
-    if (segs[SEG_TEXT].phys != dcp6.segs[SEG_TEXT].phys ||
-        segs[SEG_TEXT].size != dcp6.segs[SEG_TEXT].size)
+    const struct dcp6_seg *shared_text = &dcp6.segs[SEG_TEXT];
+    if (t6041_headless(dt)) {
+        if (!t6041_headless_text.phys)
+            t6041_headless_text = segs[SEG_TEXT];
+        shared_text = &t6041_headless_text;
+    }
+    if (segs[SEG_TEXT].phys != shared_text->phys || segs[SEG_TEXT].size != shared_text->size)
         return -1;
 
     u32 owner = dcp6_phandle(dt, ext->dt_path);
@@ -3051,6 +3073,12 @@ static int t6041_ext_fill(void *dt, const struct t6041_ext *ext)
     const struct dcp6_seg *text = &segs[SEG_TEXT];
     snprintf(text_name, sizeof(text_name), "dcp-text@%lx", text->phys);
     int shared = dcp6_find_resv(dt, text_name, text->phys, text->size);
+    if (shared < 0 && t6041_headless(dt)) {
+        if (dcp6_resv_conflict(dt, text->phys, text->size, text_name) ||
+            !dcp6_add_resv(dt, text_name, text->phys, text->size, "apple,asc-mem"))
+            return -1;
+        shared = dcp6_find_resv(dt, text_name, text->phys, text->size);
+    }
     if (shared < 0 || fdt_node_check_compatible(dt, shared, "apple,asc-mem") ||
         dcp6_append_iommu_addr(dt, shared, owner, DCP6_DART_VM_BASE,
                                text->remap - DCP6_DART_VM_BASE, text->size))
@@ -3090,11 +3118,54 @@ static int t6041_ext_fill(void *dt, const struct t6041_ext *ext)
     return 0;
 }
 
+/*
+ * Headless: with no internal handoff, nothing else enables the display subsystem the external
+ * chains join, nor its own DART (disp0's, which iBoot leaves locked). Enable both once an external
+ * processor has its firmware memory; the kernel's gate then enables that processor's chain.
+ */
+static int t6041_headless_display(void *dt)
+{
+    int display = fdt_path_offset(dt, "disp0");
+    int len;
+    const fdt32_t *iommu = display < 0 ? NULL : fdt_getprop(dt, display, "iommus", &len);
+    if (display < 0 || fdt_node_check_compatible(dt, display, dcp6.soc->disp_compat) || !iommu ||
+        len != 2 * (int)sizeof(fdt32_t) || dcp6_status_disabled(dt, display, "display subsystem"))
+        return -1;
+    int dart = fdt_node_offset_by_phandle(dt, fdt32_ld(iommu));
+    if (dart < 0 || fdt_node_check_compatible(dt, dart, "apple,t8110-dart") ||
+        dcp6_status_disabled(dt, dart, "display subsystem DART") ||
+        fdt_setprop_string(dt, dart, "status", "okay"))
+        return -1;
+
+    /*
+     * The DRM aperture: iBoot's dummy boot framebuffer, as the other handoffs give /vram. There
+     * is no /vram here (the ADT has no internal panel to scan out).
+     */
+    u64 fb = kboot_fb_base();
+    u64 fb_size = ALIGN_UP(cur_boot_args.video.stride * cur_boot_args.video.height, SZ_16K);
+    char name[48];
+    snprintf(name, sizeof(name), "framebuffer@%lx", fb);
+    if (!fb || !fb_size || dcp6_resv_conflict(dt, fb, fb_size, name))
+        return -1;
+    fdt32_t region = cpu_to_fdt32(dcp6_add_resv(dt, name, fb, fb_size, "framebuffer"));
+    display = fdt_path_offset(dt, "disp0");
+    if (!region || display < 0 || fdt_setprop(dt, display, "memory-region", &region, 4) ||
+        fdt_setprop(dt, display, "memory-region-names", "framebuffer", sizeof("framebuffer")))
+        return -1;
+    display = fdt_path_offset(dt, "disp0");
+    return display < 0 ? -1 : fdt_setprop_string(dt, display, "status", "okay");
+}
+
 static void t6041_ext_handoffs(void *dt)
 {
     int panel = fdt_path_offset(dt, "dcp");
-    if (panel < 0 || !fdt_getprop(dt, panel, dcp6.soc->marker, NULL))
-        return;
+    bool panel_handoff = panel >= 0 && fdt_getprop(dt, panel, dcp6.soc->marker, NULL);
+    bool published = false;
+    if (!panel_handoff) {
+        if (!t6041_headless(dt))
+            return;
+        dlog("no internal display handoff (no panel): external processors only\n");
+    }
     for (size_t i = 0; i < ARRAY_SIZE(t6041_exts); i++) {
         void *scratch = dcp6_scratch(dt);
         if (!scratch)
@@ -3107,8 +3178,21 @@ static void t6041_ext_handoffs(void *dt)
             free(scratch);
             continue;
         }
-        if (!dcp6_commit(dt, scratch))
+        if (!dcp6_commit(dt, scratch)) {
             dlog("%s firmware memory published; processor remains disabled\n", t6041_exts[i].name);
+            published = true;
+        }
+    }
+    if (!published || !t6041_headless(dt) || panel_handoff)
+        return;
+    void *scratch = dcp6_scratch(dt);
+    if (!scratch)
+        return;
+    if (t6041_headless_display(scratch)) {
+        dlog("display subsystem not enabled; the external processors stay disabled\n");
+        free(scratch);
+    } else if (!dcp6_commit(dt, scratch)) {
+        dlog("display subsystem and its DART enabled for the external processors\n");
     }
 }
 
@@ -3683,7 +3767,9 @@ int dt_set_display_handoff(void *dt)
     dcp6_check_hw();
     dcp6_dry_run();
 
-    if (armed)
+    if (armed && t6041_headless(dt))
+        dlog("no panel: the internal DCP is not handed over\n");
+    else if (armed)
         dcp6_handoff(dt);
     else
         dlog("not armed (no chosen.%s=1): no display handoff\n", dcp6.soc->optin);
