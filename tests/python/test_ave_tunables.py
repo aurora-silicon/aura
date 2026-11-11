@@ -18,7 +18,7 @@ def extract(source, signature):
 def test_ave_tunable_handoff(tmp_path):
     repo = Path(__file__).resolve().parents[2]
     source = (repo / "src/kboot.c").read_text()
-    assert "dt_reserve_asc_firmware(adt_path, NULL, path, use_remap, dva_base)" in source
+    assert "dt_reserve_asc_segments_at(node, adt_path, NULL, path, use_remap, dva_base, false)" in source
     structs = source[
         source.index("struct adt_tunable_info {"):
         source.index("static const struct adt_tunable_info usb4_nhi_tunables")
@@ -129,7 +129,7 @@ int main(void)
 {
     int len;
     reset();
-    assert(!dt_copy_ave_tunables("/ave"));
+    assert(!dt_copy_ave_tunables("apple,t8112-ave"));
     /* Joined by register window: DT dart0 is ADT reg[1], dart1 is reg[0]. */
     const fdt32_t *out = fdt_getprop(dt, node("/dart1"), "apple,tunable", &len);
     assert(out && len == 12);
@@ -143,7 +143,7 @@ int main(void)
     reset();
     const fdt32_t board[] = {cpu_to_fdt32(4), cpu_to_fdt32(1), cpu_to_fdt32(1)};
     assert(!fdt_setprop(dt, node("/dart0"), "apple,tunable", board, sizeof(board)));
-    assert(!dt_copy_ave_tunables("/ave"));
+    assert(!dt_copy_ave_tunables("apple,t8112-ave"));
     out = fdt_getprop(dt, node("/dart0"), "apple,tunable", &len);
     assert(out && len == (int)sizeof(board) && fdt32_to_cpu(out[0]) == 4);
 
@@ -151,20 +151,20 @@ int main(void)
     reset();
     fdt32_t stray[] = { cpu_to_fdt32(2), cpu_to_fdt32(0x50000), cpu_to_fdt32(0), cpu_to_fdt32(0x4000) };
     assert(!fdt_setprop(dt, node("/dart1"), "reg", stray, sizeof(stray)));
-    assert(dt_copy_ave_tunables("/ave") < 0);
+    assert(dt_copy_ave_tunables("apple,t8112-ave") < 0);
     assert(!fdt_getprop(dt, node("/dart0"), "apple,tunable", NULL));
     assert(!fdt_getprop(dt, node("/dart1"), "apple,tunable", NULL));
 
     /* No T6000 AXI2AF rows are inferred from the unrelated PMGR array. */
     reset();
     assert(!fdt_setprop_string(dt, node("/ave"), "compatible", "apple,t6000-ave"));
-    assert(!dt_copy_ave_tunables("/ave"));
+    assert(!dt_copy_ave_tunables("apple,t6000-ave"));
     assert(!fdt_getprop(dt, node("/ave"), "apple,tunable-axi2af", NULL));
 
     /* A malformed later list rolls back every property this call wrote. */
     reset();
     dart1[1].size = 8;
-    assert(dt_copy_ave_tunables("/ave") < 0);
+    assert(dt_copy_ave_tunables("apple,t8112-ave") < 0);
     assert(!fdt_getprop(dt, node("/dart0"), "apple,tunable", NULL));
     assert(!fdt_getprop(dt, node("/dart1"), "apple,tunable", NULL));
     assert(!fdt_getprop(dt, node("/ave"), "apple,tunable-axi2af", NULL));

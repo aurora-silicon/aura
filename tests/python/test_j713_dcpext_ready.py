@@ -184,8 +184,7 @@ __attribute__((unused)) static u32 clear32(uintptr_t addr, u32 clear) { return p
         function(pmgr, "pmgr_power_is_on", "int ") +
         function(pmgr, "pmgr_power_is_requested", "int ") +
         function(kboot, "dt_device_set_reserved_mem") +
-        function(kboot, "dt_device_add_mem_region") +
-        function(kboot, "dt_reserve_asc_segments") + function(kboot, "dt_reserve_asc_firmware") +
+        function(kboot, "dt_reserve_asc_segments_at") + function(kboot, "dt_reserve_asc_segments") + function(kboot, "dt_reserve_asc_firmware") +
         aliases + "\n" + function(kboot, "dt_display_transaction") +
         # The native26 path is T8122-only; J713 must never reach it.
         "static int dt_ext26_snapshot(const char *alias) { assert(0); return -1; }\n"
