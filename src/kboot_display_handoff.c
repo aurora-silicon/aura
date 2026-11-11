@@ -2938,6 +2938,12 @@ static const struct t6041_ext t6041_exts[] = {
      "/arm-io/dart-dcpext0", 0x3a2e00000UL, 0x3a2340000UL},
     {"dcpext1", "/dcp@602e00000", "/arm-io/dcpext1", "/arm-io/dcpext1/iop-dcpext1-nub",
      "/arm-io/dart-dcpext1", 0x602e00000UL, 0x602340000UL},
+    /*
+     * J614s: no dcpext0 in the ADT; its HDMI processor is dcpext2. Only a
+     * device tree that describes /dcp@606e00000 gets it (t6040-j614s.dts).
+     */
+    {"dcpext2", "/dcp@606e00000", "/arm-io/dcpext2", "/arm-io/dcpext2/iop-dcpext2-nub",
+     "/arm-io/dart-dcpext2", 0x606e00000UL, 0x606340000UL},
 };
 
 /*
