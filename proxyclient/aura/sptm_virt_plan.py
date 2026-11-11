@@ -700,13 +700,90 @@ def plan_boot(sptm, txm, xnu, adt, *, dram_base, phys_base, mem_size, mem_size_a
                 notes.append("aura HIGH carve-out declared as region-id-%d %#x+%#x "
                              "(SPTM-reserved, must not manage)"
                              % (rid, aura_base, aura_end - aura_base))
+    # /chosen/mix-n-match-prevention-status: image4's "allow mix-n-match" knob, which Darwin
+    # reads straight out of /chosen (_darwinAllowsMixAndMatch: allowed iff the property is
+    # present and zero). iBoot sets it on a native boot and aura's tree has no such property,
+    # so every image4 evaluation that waives a policy for a mixed environment -- TXM's 'vnum'
+    # among them, which is what refuses the cryptex trust cache when the environment carries no
+    # OS version -- refuses instead. Declare an environment that allows it.
+    chosen = adt_find(root, "chosen")
+    for prop in chosen.props:
+        if prop[0] == "mix-n-match-prevention-status":
+            had = int.from_bytes(prop[1][:4], "little")
+            prop[1] = struct.pack("<I", 0) + prop[1][4:]
+            notes.append(f"/chosen/mix-n-match-prevention-status {had} -> 0 "
+                         "(mix-and-match allowed)")
+            break
+    else:
+        chosen.props.append(["mix-n-match-prevention-status", struct.pack("<I", 0), 0])
+        notes.append("injected /chosen/mix-n-match-prevention-status = 0 (mix-and-match allowed)")
+
+    # /arm-io/dcp/clock-ids: the DCP firmware's IOMFB asks the AP for its clock through
+    # IOMFB::ServiceRelay::getClockFrequency, which ends in AppleARMIODevice::getClockFrequency(0)
+    # and AppleARMIO's clock table -- /arm-io/clock-frequencies, entry i answering id 0x100 + i
+    # (174 entries on T8142, every device's ids resolving to a sane rate that way: uart 24 MHz,
+    # qspi 200, ANS 600, AVD 1068, GPU 300). /arm-io/dcp lists no clock at all, and disp0's two
+    # (0x249, 0x1af) both fall past the end of that table, so the answer is 0 either way: the
+    # firmware logs "getClockFrequency(0) (0) < videoClock 138521008! Giving up on frequencies",
+    # WindowServer never gets a display and the boot stays on its progress bar. 0x249's low byte
+    # names entry 0x49 -- 712 MHz, a rate no other device uses -- so give the DCP that entry's
+    # in-table id. (A minimum-frequency property, which the firmware reads first, is not taken
+    # from disp0, dcp or dcp0-expert: it was tried on all three.)
+    try:
+        aio = adt_find(root, "arm-io")
+        dcp, disp0 = adt_find(root, "arm-io/dcp"), adt_find(root, "arm-io/disp0")
+    except KeyError:
+        dcp = disp0 = None
+    # The query does not go to /arm-io/dcp (given that id, it still read 0); the IOMFB instance
+    # asking is the pipe, UPPipeDCP, so disp0's own first clock gets the in-table id as well --
+    # its second, 0x1af, is left as it is -- and dcp0-expert, which lists none, gets it too.
+    if dcp is not None:
+        src = next((p[1] for p in disp0.props if p[0] == "clock-ids"), b"")
+        table = next((p[1] for p in aio.props if p[0] == "clock-frequencies"), b"")
+        clk0 = int.from_bytes(src[:4], "little") if len(src) >= 4 else 0
+        entry = clk0 & 0xff
+        if clk0 >= 0x100 + len(table) // 4 and 4 * entry + 4 <= len(table):
+            rate = int.from_bytes(table[4 * entry:4 * entry + 4], "little")
+            fixed = 0x100 + entry
+            for name in ("disp0", "dcp", "dcp0-expert"):
+                try:
+                    node = adt_find(root, f"arm-io/{name}")
+                except KeyError:
+                    continue
+                ids = next((p for p in node.props if p[0] == "clock-ids"), None)
+                if ids is None:
+                    node.props.append(["clock-ids", struct.pack("<I", fixed), 0])
+                elif len(ids[1]) >= 4 and int.from_bytes(ids[1][:4], "little") == clk0:
+                    ids[1] = struct.pack("<I", fixed) + bytes(ids[1][4:])
+                elif not ids[1]:
+                    ids[1] = struct.pack("<I", fixed)
+                else:
+                    continue
+                notes.append(f"/arm-io/{name}/clock-ids[0] -> {fixed:#x} (clock-frequencies entry "
+                             f"{entry:#x}, {rate} Hz: disp0's {clk0:#x} lies past AppleARMIO's table)")
+
+    # /chosen/boot-command is iBoot's boot mode, and AppleImage4 switches on it: only the
+    # ordinary values (1, 2, 9, 10, 11) leave NVRAM mutable, while 4 makes it decide "platform
+    # requires immutable NVRAM [Deconflicting]". aura's own boot carries an ordinary value, so
+    # this only says in the notes what the guest will see.
+    for prop in chosen.props:
+        if prop[0] == "boot-command":
+            had = int.from_bytes(prop[1][:4], "little")
+            if had not in (1, 2, 9, 10, 11):
+                prop[1] = struct.pack("<I", 1) + prop[1][4:]
+                notes.append(f"/chosen/boot-command {had} -> 1 (Image4 keeps NVRAM mutable)")
+            else:
+                notes.append(f"/chosen/boot-command {had} (Image4 keeps NVRAM mutable)")
+            break
+    else:
+        notes.append("WARNING: no /chosen/boot-command in the tree")
+
     # /chosen/hibernation: SPTM sptm_hibentry (hib_get_key) REQUIRES this node at cold boot.
     # key-sptm-ctrr(48) + key-xnu-ctrr(48) are required present+non-zero (SPTM/XNU CTRR-image HMAC
     # keys); key-exclave(32)/key-exclave-entropy(32) are optional (exclaves skipped) but included
     # non-zero. SPTM only checks presence+exact-size+not-all-zero then copies+scrubs the DT source -
     # no boot-time crypto validation - so dummy non-zero material passes. aura's chainload ADT lacks
     # this node (iBoot populates it on a full/slid boot). The capture's keys are zeroed post-scrub.
-    chosen = adt_find(root, "chosen")
     if not any(k.name() == "hibernation" for k in chosen.kids):
         hib = RawNode()
         hib.props.append(["name", b"hibernation\0", 0])

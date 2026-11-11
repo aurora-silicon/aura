@@ -14,10 +14,12 @@ struct exc_info;
 
 /* sptm_virt.c */
 extern volatile bool sptm_virt_xnu_live;
+extern volatile u64 sptm_virt_bss_canary;
 extern u64 sptm_virt_flags;
 extern u32 sptm_virt_cpu_entries[MAX_CPUS];
 int sptm_virt_layout(struct sptm_virt_layout *out);
 void sptm_virt_cpu_enters_xnu(int cpu);
+extern u32 sptm_virt_wfi_watch;
 
 /* sptm_virt_gl.c */
 extern volatile bool sptm_virt_peek_active_cpu[MAX_CPUS];
@@ -59,6 +61,20 @@ void sptm_virt_amx_child(void);
 
 /* sptm_virt_cl4.c */
 bool sptm_virt_in_cl4(void);
+enum {
+    SPTM_WEV_GERET,
+    SPTM_WEV_GEXIT,
+    SPTM_WEV_CL4_ENTER,
+    SPTM_WEV_CL4_SYNC,
+    SPTM_WEV_CL4_FIQ,
+    SPTM_WEV_CL4_ERET2,
+    SPTM_WEV_CHILD_ENTER,
+    SPTM_WEV_CHILD_EXIT,
+};
+void sptm_virt_world_ev(unsigned kind, u64 a, u64 b);
+void sptm_virt_world_dump(void);
+void sptm_virt_world_ring(int cpu, unsigned last, int (*pf)(const char *, ...));
+void sptm_virt_world_arm(int cpu);
 void sptm_virt_cl4_seed(int cpu);
 void sptm_virt_cl4_world_enter(u64 target);
 void sptm_virt_cl4_world_exit(void);
@@ -68,6 +84,15 @@ bool sptm_virt_cl4_reflect(u64 *regs, u64 esr);
 extern volatile bool sptm_virt_rg_passthrough;
 void sptm_virt_s2_setup(void);
 void sptm_virt_s2_enter_xnu(int cpu);
+void sptm_virt_ctrr_publish_rorgn(void);
+void sptm_virt_gpu_deadline(struct exc_info *ctx);
+bool sptm_virt_gpu_deadline_due(void);
+void sptm_virt_gpu_park_now(struct exc_info *ctx, const char *why);
+void sptm_virt_report_guest(u64 *regs, u64 pc);
+void sptm_virt_canary_tick(void);
+void sptm_virt_fill_ctx(struct exc_info *ctx, u64 *regs, bool gl);
+void sptm_virt_pac_note(const char *where);
+bool sptm_virt_cpu_in_xnu(void);
 bool sptm_virt_s2_dabort_gl(u64 *regs);
 bool sptm_virt_rg_owns(u64 page);
 void sptm_virt_rg_stop_wd2(void);

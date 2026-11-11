@@ -27,6 +27,7 @@
 #include "nv2.h"
 #include "smp.h"
 #include "sptm_virt_priv.h"
+#include "string.h"
 #include "utils.h"
 
 enum { SPTM_WORLD_HOST, SPTM_WORLD_CL4, SPTM_WORLD_GUEST };
@@ -86,6 +87,7 @@ static const struct cl4_gcfg_reg cl4_gcfg_regs[] = {
 
 struct sptm_world_cpu {
     u8 world;
+    u32 seq; /* world writes, mirrored with the flag in CONTEXTIDR_EL2 (sptm_world_flag) */
     bool applied[CL4_GCFG_N]; /* register loaded from the shadow for this child */
     u64 host_lvl[CL4_GCFG_N]; /* the host's live values while a child runs */
     u64 host_vbar_gl12;       /* SPTM's guarded vector and stack (physical GL1 bank) */
@@ -118,9 +120,134 @@ static void glx_load(const u64 *b)
     msr(SYS_IMP_APL_AFSR1_GL12, b[5]);
 }
 
+/*
+ * The world flag, mirrored in a register only aura uses (CONTEXTIDR_EL2: the guest's EL2 copy is
+ * its VNCR page under NV2, its EL1 one is CONTEXTIDR_EL12). aura's .bss has been seen to lose
+ * writes while this guest runs: the flag read "cL4" with SPTM's HCR, vectors and XNU's EL1 bank
+ * all live and no cL4 entry in the last 64 transitions, and aura then delivered SPTM's own trap
+ * to SPTM as a cL4 exception -- the "[TXM] Unhandled synchronous exception taken from GL0" halt.
+ * The register cannot lose a write: every read compares the two, reports a loss once with how
+ * stale the memory is, and continues from the register.
+ */
+#define CTXIDR_EL2 s3_4_c13_c0_1
+void sptm_virt_world_dump(void);
+
+static void world_set(struct sptm_world_cpu *w, u8 world)
+{
+    w->world = world;
+    w->seq++;
+    msr(CTXIDR_EL2, ((u64)(w->seq & 0xffffff) << 8) | world);
+}
+
+static u8 sptm_world_flag(int cpu)
+{
+    static u32 losses;
+    struct sptm_world_cpu *w = &sptm_world[cpu];
+    u64 r = mrs(CTXIDR_EL2) & 0xffffffff;
+    u64 m = ((u64)(w->seq & 0xffffff) << 8) | w->world;
+
+    if (r != m) {
+        if (losses++ < 16)
+            printf("SPTM-virt[world LOST c%d]: memory says %u (seq %u) at %p, the register %lu "
+                   "(seq %lu): %ld writes gone\n",
+                   cpu, w->world, w->seq & 0xffffff, w, r & 0xff, r >> 8,
+                   (long)(r >> 8) - (long)(w->seq & 0xffffff));
+        if (losses == 1)
+            sptm_virt_world_dump();
+        w->world = r & 0xff;
+        w->seq = r >> 8;
+    }
+    return w->world;
+}
+
+/* At every guest entry on a core (warm resets included): the register starts UNKNOWN. */
+void sptm_virt_world_arm(int cpu)
+{
+    struct sptm_world_cpu *w = &sptm_world[cpu];
+    msr(CTXIDR_EL2, ((u64)(w->seq & 0xffffff) << 8) | w->world);
+}
+
 bool sptm_virt_in_cl4(void)
 {
-    return sptm_world[smp_id()].world == SPTM_WORLD_CL4;
+    return sptm_world_flag(smp_id()) == SPTM_WORLD_CL4;
+}
+
+/*
+ * The last world transitions per core, for when aura's flag and the code that runs disagree: the
+ * console drops lines under load, so a ring printed once at the mismatch is the record.
+ */
+#define WORLD_HIST      64
+#define WORLD_HIST_CPUS 12 /* aura's image must end below iBoot's SEPFW: keep .bss small */
+struct world_ev {
+    u64 a, b;
+    u32 t; /* CNTPCT, low half: deltas within ~178 s */
+    u8 kind, world;
+};
+static struct world_ev world_hist[WORLD_HIST_CPUS][WORLD_HIST];
+static u32 world_hist_n[WORLD_HIST_CPUS];
+
+static const char *const world_ev_names[] = {
+    [SPTM_WEV_GERET] = "geret (target, pstate)",
+    [SPTM_WEV_GEXIT] = "gexit (pc, target)",
+    [SPTM_WEV_CL4_ENTER] = "cl4 enter (target)",
+    [SPTM_WEV_CL4_SYNC] = "cl4 -> sptm sync (esr, elr)",
+    [SPTM_WEV_CL4_FIQ] = "cl4 -> sptm fiq (-, elr)",
+    [SPTM_WEV_CL4_ERET2] = "cl4 -> host by eret to GL2 (target)",
+    [SPTM_WEV_CHILD_ENTER] = "nv2 child enter",
+    [SPTM_WEV_CHILD_EXIT] = "nv2 child exit",
+};
+
+void sptm_virt_world_ev(unsigned kind, u64 a, u64 b)
+{
+    int cpu = smp_id();
+    if (cpu >= WORLD_HIST_CPUS)
+        return;
+    struct world_ev *e = &world_hist[cpu][world_hist_n[cpu]++ % WORLD_HIST];
+
+    e->t = mrs(CNTPCT_EL0);
+    e->a = a;
+    e->b = b;
+    e->kind = kind;
+    e->world = sptm_world_flag(cpu);
+}
+
+void sptm_virt_world_dump(void)
+{
+    static bool done[MAX_CPUS];
+    static const char wn[] = "HCG";
+    int cpu = smp_id();
+    struct sptm_world_cpu *w = &sptm_world[cpu];
+
+    if (cpu >= WORLD_HIST_CPUS || done[cpu])
+        return;
+    done[cpu] = true;
+    printf("SPTM-virt[world dump c%d]: flag %c seq %u (register 0x%lx) HCR_EL2 0x%lx VBAR_GL12 "
+           "0x%lx (host 0x%lx) SP_GL12 0x%lx VBAR_EL12 0x%lx TTBR1_EL12 0x%lx; %u events\n",
+           cpu, wn[w->world], w->seq, mrs(CTXIDR_EL2), mrs(HCR_EL2), mrs(SYS_IMP_APL_VBAR_GL12),
+           w->host_vbar_gl12, mrs(SYS_IMP_APL_SP_GL12), mrs(SYS_VBAR_EL12), mrs(SYS_TTBR1_EL12),
+           world_hist_n[cpu]);
+    sptm_virt_world_ring(cpu, 64, debug_printf);
+}
+
+/* The last n events of a core's ring, through pf (another core's watchdog passes a lock-free
+ * printer: the dead core may hold the console lock). */
+void sptm_virt_world_ring(int cpu, unsigned last, int (*pf)(const char *, ...))
+{
+    static const char wn[] = "HCG?";
+    if (cpu < 0 || cpu >= WORLD_HIST_CPUS)
+        return;
+    u32 now = mrs(CNTPCT_EL0);
+    u64 us = mrs(CNTFRQ_EL0) / 1000000;
+    u32 n = world_hist_n[cpu];
+    if (last > WORLD_HIST)
+        last = WORLD_HIST;
+    u32 first = n > last ? n - last : 0;
+    for (u32 i = first; i < n; i++) {
+        struct world_ev *e = &world_hist[cpu][i % WORLD_HIST];
+        pf("SPTM-virt[world ring c%d]: #%u -%lu us [%c] %s 0x%lx 0x%lx\n", cpu, i,
+           (u64)(u32)(now - e->t) / (us ? us : 1), wn[e->world & 3],
+           e->kind < ARRAY_SIZE(world_ev_names) ? world_ev_names[e->kind] : "?", e->a, e->b);
+    }
 }
 
 #define CL4_STR2(x)         #x
@@ -182,10 +309,39 @@ void sptm_virt_cl4_seed(int cpu)
  * The per-level half of a host <-> EL1-child switch, in two steps around the EL1 bank swap: the
  * VMSA lock is dropped before the bank changes hands and applied last.
  */
+/*
+ * Who changes the EL1 world's pointer-authentication keys, and when.
+ *
+ * XNU runs with HCR_EL2.APK set, so its own key writes reach the hardware; aura's per-level
+ * bank applies the shadow of SPTM's _EL12 writes at every world entry. If one transition
+ * saves the live keys and another does not, the hardware key stops matching what the kernel
+ * signed with, and the kernel panics authenticating a return address ("PAC failure from kernel
+ * with IB key while returning"). This reports every change with the transition that saw it.
+ */
+static u64 pac_last[MAX_CPUS][4];
+static u32 pac_logs;
+
+void sptm_virt_pac_note(const char *where)
+{
+    int cpu = smp_id();
+    /* The kernel's own returns depend on more than the IB key: APCTL carries Apple's key
+     * diversification and KERNKEY is the kernel's own diversifier. */
+    u64 v[4] = {SAFE_MRS(CL4_ENC(6, 7, 2)), SAFE_MRS(CL4_ENC(6, 15, 0)), SAFE_MRS(CL4_ENC(6, 2, 3)),
+                SAFE_MRS(CL4_ENC(6, 2, 4))};
+
+    if (!memcmp(v, pac_last[cpu], sizeof(v)))
+        return;
+    memcpy(pac_last[cpu], v, sizeof(v));
+    if (pac_logs++ < 64)
+        printf("SPTM-virt[pac]: cpu%d IB 0x%lx APCTL 0x%lx KERNKEY 0x%lx:0x%lx at %s\n", cpu, v[0],
+               v[1], v[2], v[3], where);
+}
+
 void sptm_virt_world_child_pre_enter(void)
 {
     struct sptm_world_cpu *w = &sptm_world[smp_id()];
 
+    sptm_virt_pac_note("child pre-enter (the host's own)");
     for (unsigned i = 0; i < CL4_GCFG_N; i++)
         w->host_lvl[i] = cl4_gcfg_rd(i);
     SAFE_MSR(CL4_VMSA_LOCK, 0);
@@ -205,15 +361,25 @@ static void sptm_virt_world_post_enter(u8 world)
         SAFE_MSR(CL4_VMSA_LOCK, w->host_lvl[CL4_GCFG_VMSA]);
     sptm_virt_amx_child();
     sysop("isb");
-    w->world = world;
+    world_set(w, world);
+    sptm_virt_pac_note(world == SPTM_WORLD_CL4 ? "cL4 entered" : "child entered");
 }
 
 void sptm_virt_world_child_post_enter(void)
 {
+    sptm_virt_world_ev(SPTM_WEV_CHILD_ENTER, mrs(SYS_ELR_EL12), 0);
     sptm_virt_world_post_enter(SPTM_WORLD_GUEST);
 }
 
+static void sptm_virt_world_child_pre_exit_cl4(void);
+
 void sptm_virt_world_child_pre_exit(void)
+{
+    sptm_virt_world_ev(SPTM_WEV_CHILD_EXIT, 0, 0);
+    sptm_virt_world_child_pre_exit_cl4();
+}
+
+static void sptm_virt_world_child_pre_exit_cl4(void)
 {
     int cpu = smp_id();
     struct sptm_world_cpu *w = &sptm_world[cpu];
@@ -225,6 +391,7 @@ void sptm_virt_world_child_pre_exit(void)
         if (v != SAFE_MRS_FAILED)
             *cl4_slot(cpu, i) = v;
     }
+    sptm_virt_pac_note("child pre-exit (the child's own)");
     SAFE_MSR(CL4_VMSA_LOCK, 0);
 }
 
@@ -243,7 +410,8 @@ void sptm_virt_world_child_post_exit(void)
     }
     sptm_virt_amx_host();
     sysop("isb");
-    w->world = SPTM_WORLD_HOST;
+    world_set(w, SPTM_WORLD_HOST);
+    sptm_virt_pac_note("host restored");
 }
 
 /* XNU's trapped _EL12 accesses to a per-level register belong in the same store. */
@@ -266,6 +434,7 @@ void sptm_virt_cl4_world_enter(u64 target)
     int cpu = smp_id();
     struct sptm_world_cpu *w = &sptm_world[cpu];
 
+    sptm_virt_world_ev(SPTM_WEV_CL4_ENTER, target, 0);
     w->host_vbar_gl12 = mrs(SYS_IMP_APL_VBAR_GL12);
     w->host_sp_gl12 = mrs(SYS_IMP_APL_SP_GL12);
     glx_save(w->host_glx);
@@ -296,7 +465,7 @@ void sptm_virt_cl4_world_exit(void)
     *sptm_virt_gl2_slot(cpu, CL4_KEY_SP_GL12) = mrs(SYS_IMP_APL_SP_GL12);
     glx_save(w->cl4_glx);
     w->cl4_glx_valid = true;
-    sptm_virt_world_child_pre_exit();
+    sptm_virt_world_child_pre_exit_cl4();
     nv2_guarded_child_exit();
     msr(SYS_IMP_APL_VBAR_GL12, w->host_vbar_gl12);
     msr(SYS_IMP_APL_SP_GL12, w->host_sp_gl12);
@@ -316,7 +485,7 @@ static bool cl4_deliver(u64 *regs, u64 esr, bool fiq)
     static u32 n;
     struct sptm_world_cpu *w = &sptm_world[smp_id()];
 
-    if (w->world != SPTM_WORLD_CL4)
+    if (sptm_world_flag(smp_id()) != SPTM_WORLD_CL4)
         return false;
     u64 elr = mrs(ELR_EL1); /* cL4's return PC, mirrored from GL2's bank */
     u64 spsr = mrs(SYS_IMP_APL_SPSR_GL1);
@@ -327,6 +496,7 @@ static bool cl4_deliver(u64 *regs, u64 esr, bool fiq)
     if (!fiq && ((esr >> 26) & 0x3f) == ESR_EC_HVC && ((regs[16] >> 32) & 0xff) == 0xfe)
         printf("SPTM-virt[cl4.panic]: no-return call x16=0x%lx x0=0x%lx\n", regs[16], regs[0]);
 
+    sptm_virt_world_ev(fiq ? SPTM_WEV_CL4_FIQ : SPTM_WEV_CL4_SYNC, esr, elr);
     sptm_virt_cl4_world_exit();
 
     if (!fiq) {

@@ -15,6 +15,7 @@
 #include "exception.h"
 #include "hv.h"
 #include "iodev.h"
+#include "mcc.h"
 #include "memory.h"
 #include "nv2.h"
 #include "smp.h"
@@ -170,6 +171,12 @@ static bool sptm_virt_rg_hook(struct exc_info *ctx, u64 addr, u64 *val, bool wri
         rg_alarm_shadow[1] = read32(rg_xwdt + WDT_ALARM);
         rg_xwdt_seeded = true;
     }
+    /* Who touches the exclave watchdog page at all (the exclave's own driver, or XNU)? */
+    static u32 xlog;
+    if (rg_xwdt && (a & ~0x3fffUL) == rg_xwdt && xlog++ < 24)
+        printf("SPTM-virt[rst c%d]: xwdt %s +0x%lx%s0x%lx pc 0x%lx%s\n", smp_id(),
+               write ? "wr" : "rd", a - rg_xwdt, write ? " <- " : " ", write ? *val : 0, ctx->elr,
+               sptm_virt_in_cl4() ? " (cL4)" : "");
     sptm_virt_s2r_note(ctx, addr, write ? *val : 0, write, width);
     if (sptm_virt_rg_passthrough) {
         for (int w = 0; write && width == 2 && w < 2; w++) {
@@ -198,6 +205,7 @@ static bool sptm_virt_rg_hook(struct exc_info *ctx, u64 addr, u64 *val, bool wri
     }
     u64 v = *val;
     bool log = rg_events++ < 64;
+    sptm_virt_gpu_deadline(ctx);
     for (int w = 0; w < 2; w++) {
         u64 base = w ? rg_xwdt : rg_wdt;
         if (!base || a < base || a >= base + 0x4000)
@@ -292,6 +300,10 @@ static void sptm_virt_rg_page(u64 pa, const char *what)
     hv_map_hook(page, sptm_virt_rg_hook, 0x4000);
 }
 
+/* AURA_RG_XWDT=0: leave the exclave watchdog's page (hib-exclave-watchdog, also eic's
+ * mmio-wd-e) unhooked, to the exclaves that own it. */
+u32 sptm_virt_rg_xwdt = 1;
+
 static void sptm_virt_reset_guard_setup(void)
 {
     int path[8];
@@ -317,13 +329,97 @@ static void sptm_virt_reset_guard_setup(void)
         rg_alarm_shadow[0] = rg_wdt ? read32(rg_wdt + WDT_ALARM) : 0;
     }
     node = adt_path_offset_trace(adt, "/arm-io/hib-exclave-watchdog", path);
-    if (node >= 0 && adt_get_reg(adt, path, "reg", 0, &pa, &sz) >= 0) {
+    if (sptm_virt_rg_xwdt && node >= 0 && adt_get_reg(adt, path, "reg", 0, &pa, &sz) >= 0) {
         rg_xwdt = pa;
         sptm_virt_rg_page(pa, "hib-exclave-watchdog");
     }
     printf("SPTM-virt[rst]: reset guard on %d pages (wdt 0x%lx, 2nd 0x%lx, "
            "extra 0x%lx/0x%lx/0x%lx, exclave wdt 0x%lx); XNU cannot reset the SoC through them\n",
            rg_n, rg_wdt, rg_wdt2, rg_extra[0], rg_extra[1], rg_extra[2], rg_xwdt);
+}
+
+/* ---- the memory controller's planes, watched -----------------------------------------------
+ * aura's image loses its writes once the guest runs: data goes back to what DRAM held at one
+ * moment and stays there, as if the memory controller stopped taking writes to it. The AMCC's
+ * range registers (TZ carveouts, read-only regions) are where that would be set. Print what the
+ * planes hold before the guest runs, and every write the guest makes to them.
+ */
+/*
+ * The three range locks SPTM sets ~1 s into XNU (plane +0xacc/+0xadc/+0xaec, 0x1 on every plane).
+ * iBoot left the ranges behind them (+0xaa8..+0xabc, 16 KiB pages) programmed for the image it
+ * booted -- stage 1, where aura now runs -- and once they are locked the memory controller stops
+ * taking aura's writes: its data falls back to what DRAM held at the lock and stays there. With
+ * sptm_virt_amcc_nolock (AURA_AMCC_NOLOCK) the locks are shadowed: the guest reads back what it
+ * wrote, the hardware keeps them open. On by default; AURA_AMCC_NOLOCK=0 lets SPTM lock them.
+ */
+u32 sptm_virt_amcc_nolock = 1;
+static u64 amcc_lock_shadow[16][2]; /* {pa, value} */
+
+/* sptm_virt_amcc_nolock is a mask over the three locks: bit 0 +0xacc, bit 1 +0xadc, bit 2 +0xaec.
+ * Only +0xacc covers aura (t124: shadowing it alone keeps aura's memory; the other two -- the
+ * CTRR span low in DRAM, where the GPU firmware's text lives, and the range after stage 1 --
+ * are locked by SPTM as on real hardware). */
+static bool amcc_is_lock(u64 addr)
+{
+    u32 off = addr & 0x3ffff;
+    int bit = off == 0xacc ? 0 : off == 0xadc ? 1 : off == 0xaec ? 2 : -1;
+    return bit >= 0 && (sptm_virt_amcc_nolock & BIT(bit));
+}
+
+static bool amcc_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int width)
+{
+    static u32 logs;
+    if (write && logs++ < 256)
+        printf("SPTM-virt[amcc]: guest wrote 0x%lx -> 0x%lx (w%d) at pc 0x%lx%s\n", *val, addr,
+               width, ctx->elr,
+               sptm_virt_amcc_nolock && amcc_is_lock(addr) ? " -- range lock shadowed" : "");
+    if (sptm_virt_amcc_nolock && amcc_is_lock(addr) && width == 2) {
+        for (unsigned i = 0; i < ARRAY_SIZE(amcc_lock_shadow); i++) {
+            if (amcc_lock_shadow[i][0] == addr || !amcc_lock_shadow[i][0]) {
+                if (write) {
+                    amcc_lock_shadow[i][0] = addr;
+                    amcc_lock_shadow[i][1] = *val;
+                    return true;
+                }
+                if (amcc_lock_shadow[i][0] == addr) {
+                    *val = amcc_lock_shadow[i][1];
+                    return true;
+                }
+                break;
+            }
+        }
+    }
+    sptm_virt_mmio_rw(addr, val, write, width);
+    return true;
+}
+
+static void sptm_virt_amcc_watch(void)
+{
+    u64 base, stride;
+    int count;
+    /* The plane offsets above are T8142's; other chips keep their AMCC unhooked. */
+    if (chip_id != T8142)
+        return;
+    if (mcc_plane_info(0, &base, &stride, &count) < 0) {
+        printf("SPTM-virt[amcc]: no AMCC planes; not watched\n");
+        return;
+    }
+    for (u32 off = 0xaa0; off < 0xaf0; off += 0x10) {
+        u32 v[4];
+        for (int k = 0; k < 4; k++)
+            v[k] = read32(base + off + 4 * k);
+        if (v[0] | v[1] | v[2] | v[3])
+            printf("SPTM-virt[amcc]: plane0+0x%03x: %08x %08x %08x %08x\n", off, v[0], v[1], v[2],
+                   v[3]);
+    }
+    for (int p = 0; p < count; p++) {
+        u64 pb = (base + p * stride) & ~0x3fffUL;
+        if (hv_map_hook(pb, amcc_hook, 0x4000) < 0)
+            printf("SPTM-virt[amcc]: cannot hook plane %d at 0x%lx\n", p, pb);
+    }
+    printf("SPTM-virt[amcc]: %d planes at 0x%lx (stride 0x%lx) watched; aura's image is "
+           "[%p, %p)\n",
+           count, base, stride, _base, _end);
 }
 
 /* ---- aura's own memory is never the guest's ----------------------------------------------
@@ -353,7 +449,7 @@ static void sptm_virt_aura_guard_setup(void)
     }
 }
 
-static void sptm_virt_fill_ctx(struct exc_info *ctx, u64 *regs, bool gl)
+void sptm_virt_fill_ctx(struct exc_info *ctx, u64 *regs, bool gl)
 {
     memset(ctx, 0, sizeof(*ctx));
     memcpy(ctx->regs, regs, 31 * sizeof(u64));
@@ -429,10 +525,25 @@ void sptm_virt_s2_setup(void)
     }
     hv_map_vuart(base, irqs[0], uartproxy_iodev);
     sptm_virt_aura_guard_setup();
+    sptm_virt_amcc_watch();
     sptm_virt_s2_split_ctrr_blocks();
     sptm_virt_reset_guard_setup();
     /* After the guard, whose pages the sleep path leaves alone. */
-    sptm_virt_s2r_setup(uartproxy_iodev >= IODEV_USB0 && uartproxy_iodev < IODEV_MAX);
+    /*
+     * Keep the proxy link's power domains whichever transport carries it. Only the DWC3 CDC
+     * gadget asked for this before, so a proxy on the DockChannel the debug tether carries went
+     * unprotected: the guest's power manager switches that port off as it brings its own drivers
+     * up, around 95 s into the boot, and takes aura's console, the proxy and the park with it --
+     * which is why a trial could only be recovered by a VDM reset.
+     */
+    bool link_on_usb = uartproxy_iodev >= IODEV_USB0 && uartproxy_iodev < IODEV_MAX;
+    bool link_on_dockchannel = uartproxy_iodev == IODEV_DOCKCHANNEL_UART;
+    printf("SPTM-virt[s2]: proxy link on iodev %d (%s); its domains are %s\n", uartproxy_iodev,
+           link_on_usb           ? "USB CDC"
+           : link_on_dockchannel ? "DockChannel"
+                                 : "other",
+           link_on_usb || link_on_dockchannel ? "kept on" : "NOT kept on");
+    sptm_virt_s2r_setup(link_on_usb || link_on_dockchannel);
     sptm_virt_gpu_setup();
 
     /* SPTM's own bring-up runs without it; each core arms it at its GEXIT into XNU, after
@@ -485,6 +596,26 @@ bool sptm_virt_s2_dabort_gl(u64 *regs)
     return true;
 }
 
+/*
+ * A guest that stops calling SPTM may still be busy on a trapped page (polling a register aura
+ * hooks). Every 10 s of trapped accesses, one line: how many, and the last one.
+ */
+static void sptm_virt_s2_activity(struct exc_info *ctx)
+{
+    static u64 n, n_last, t_last;
+    u64 now = mrs(CNTPCT_EL0), f = mrs(CNTFRQ_EL0);
+    n++;
+    if (!t_last)
+        t_last = now;
+    if (now - t_last < 10 * f)
+        return;
+    printf("SPTM-virt[s2 traps]: %lu in the last %lu s (%lu in all), the last far 0x%lx esr 0x%lx "
+           "pc 0x%lx\n",
+           n - n_last, (now - t_last) / f, n, ctx->far, ctx->esr, ctx->elr);
+    n_last = n;
+    t_last = now;
+}
+
 /* A stage-2 abort from the OS at virtual EL2: a trapped page, emulated by the HV's MMIO code. */
 bool sptm_virt_s2_dabort(u64 *regs)
 {
@@ -493,6 +624,7 @@ bool sptm_virt_s2_dabort(u64 *regs)
     if (sptm_virt_aura_guard_fault(regs, false))
         return true;
     sptm_virt_fill_ctx(&ctx, regs, false);
+    sptm_virt_s2_activity(&ctx);
     if (hv_handle_dabort(&ctx)) {
         memcpy(regs, ctx.regs, 31 * sizeof(u64));
         msr(ELR_EL2, ctx.elr + 4);

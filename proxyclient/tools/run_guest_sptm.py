@@ -38,16 +38,34 @@ Environment (all optional; 1 enables a switch):
   AURA_XNU_BT              sample XNU backtraces every few seconds per core
   AURA_GPU_TRACE           hook the GPU (sgx reg 0) and PMP registers, record every access
   AURA_GPU_STOP_SECS=<n>   park in the proxy n s after the first GPU access (read the ring)
+  AURA_GPU_STOP_MSG=<v>    park right after the guest writes v to the GPU (a mailbox message)
   AURA_GPU_PRINT_MAX=<n>   print at most n GPU accesses on aura's console (default 20000)
   AURA_SAMPLE              sample the guest's PC until each core's XNU entry (pre-XNU hangs)
   AURA_SAMPLE_HZ=<n>       samples per second (default 4)
   AURA_SAMPLE_MAX=<n>      stop printing after n samples (default 64)
   AURA_XNU_RO_RELAX        patch XNU's zalloc_ro_mut RO-zone panic out (tracing only; XNU_QUIRKS)
+  AURA_XNU_TC_FORCE        accept a trust cache TXM refused, so the cryptex graft proceeds
+  AURA_SHARE_NVRAM         let the guest reach the real NVRAM (a failed boot pollutes it)
+  AURA_XNU_TASK_KEYS       keep XNU's per-task PAC keys (its kernel frames then fail, XNU_QUIRKS)
   AURA_DEBUG_PORT=<n>      with the proxy on KIS, hide only USB-C port n (port-number), not all
   AURA_SPTM_DIAG           give SPTM a diagnostic record (boot_args revision 3, SPTMDebug)
   AURA_OS_LONG_VERSION     the guest's Ap,OSLongVersion (--os-long-version)
   AURA_KEEP_BOOT_VIDEO     hand iBoot's boot framebuffer to XNU, aura's console off it
   AURA_TAIL_SECS, AURA_TAIL_IDLE   keep reading the console after entry, until idle
+  AURA_AMCC_NOLOCK=<mask>  which of SPTM's AMCC range locks aura shadows (bit 0 +0xacc, 1 +0xadc,
+                           2 +0xaec; default 1, the one over aura's image; 0 lets SPTM lock all)
+  AURA_WFI_WATCH=1|2       trap XNU's WFIs (2: and WFEs) and report every 10 s (idle vs. dead)
+  AURA_HIDE_NODES=<a,b>    further ADT nodes to hide from the guest (comma-separated paths)
+  AURA_RG_XWDT=0           leave the exclave watchdog's page unhooked (the reset guard skips it)
+  AURA_KEEP_ANE            keep /arm-io/ane and dart-ane (the exclaves' manifests name its mappers)
+  AURA_KEEP_WIFI           keep the kernelcache workaround's PCIe/Wi-Fi/Bluetooth nodes (not the
+                           debug port's): WindowServer waits on TimeSync, which needs a network port
+  AURA_TRAP_DELAY_NS=<n>   spin n ns in every GL trap (workaround: holds off the ~20 s stall)
+  AURA_TRAP_DELAY_MASK=<m> which GL traps spin: 1 GEXIT, 2 g-ERET, 4 IMPDEF, 8 SPTM's entry
+                           sysreg read, 16 HVC, 32 rest, 64 other sysregs
+  AURA_SYSREG_CENSUS       print which sysregs the guarded world traps on, every 20 s
+  AURA_S2R_LIVE            print the guest's writes to the hooked power blocks as they happen
+  AURA_CPTR_LIVE=0         keep SPTM's CPTR_EL2 writes a shadow (default: XNU's CPACR_EL1)
   XNU_BOOTARGS             XNU's command line
 
 Example:
@@ -108,12 +126,27 @@ KNOWN_ENV = {
     "AURA_TAIL_SECS",
     "AURA_TAIL_IDLE",
     "AURA_GPU_STOP_SECS",
+    "AURA_GPU_STOP_BOOT_SECS",
+    "AURA_GPU_STOP_MSG",
     "AURA_GPU_PRINT_MAX",
     "AURA_SAMPLE_HZ",
     "AURA_SAMPLE_MAX",
     "AURA_XNU_RO_RELAX",
+    "AURA_SHARE_NVRAM",
+    "AURA_XNU_TC_FORCE",
     "AURA_DEBUG_PORT",
     "AURA_SPTM_DIAG",
+    "AURA_AMCC_NOLOCK",
+    "AURA_WFI_WATCH",
+    "AURA_HIDE_NODES",
+    "AURA_RG_XWDT",
+    "AURA_KEEP_ANE",
+    "AURA_KEEP_WIFI",
+    "AURA_TRAP_DELAY_NS",
+    "AURA_TRAP_DELAY_MASK",
+    "AURA_CPTR_LIVE",
+    "AURA_SYSREG_CENSUS",
+    "AURA_S2R_LIVE",
 } | set(CONFIG_FLAGS)
 
 # The debug link's USB-C port: XNU must never drive it (it resets the port about 3 s into IOKit
@@ -124,6 +157,14 @@ PORT_FWD = ("atc-phy-parent", "atc-phy", "dpxbar-parent", "acio-parent", "acio-c
 PORT_REV = ("atc-phy-parent", "atc-phy", "acio-parent", "usb-port", "dpxbar-parent")
 # Nothing drives the ANE yet, and the platform error handler panics on an AMCC DSID timeout.
 STRIP_NODES = ("/arm-io/ane", "/arm-io/dart-ane")
+# The guest has the real NVRAM, and macOS writes it: a boot that fails in launchd leaves
+# recovery-boot-mode behind, after which iBoot ignores the enrolled boot object and the machine
+# comes up in recovery until someone clears it by hand -- so one failed guest boot costs a trip
+# through 1TR. Nothing here needs NVRAM (the boot arguments come through boot_args), so the device
+# is hidden: macOS reports "platform does not support NVRAM" and its writes go nowhere.
+# Hiding the device outright stalls the guest's IOKit at the display DART, so the writes are
+# patched out in XNU instead (the nvram_ro quirk); this is kept for reference.
+HOST_STATE_NODES = ("/arm-io/qspi/spinor/anvram",)
 ERROR_HANDLER = "/arm-io/error-handler"
 # Without cL4 the exclaves stay NOT_SUPPORTED, so their nodes and the RTBuddy routes that resolve
 # through them would wait forever in IOKit. With cL4 they must stay: hidden, DCP never completes
@@ -153,7 +194,62 @@ XNU_QUIRKS = (
                "/arm-io/apciec0", "/arm-io/dart-apciec0", "/arm-io/apciec0-piodma",
                "/arm-io/centauri", "/arm-io/bluetooth", "/arm-io/aop-spmi0/spmi-wifibt"),
          ro_relax=(("zalloc_ro_mut RO-zone check", "BootKC-rx", 0x3b27e4c, 0x540002a9,
-                    0x14000015),)),
+                    0x14000015),),
+         # XNU takes its read-only region from CTRR_D_LWR/UPR_EL2 (rorgn_begin = LWR,
+         # rorgn_end = UPR | 0xfff), which iBoot locks over the kernelcache natively. Nothing in
+         # the guest programs them, and a non-guarded EL1 read does not reach the bank aura can
+         # write, so XNU would see an empty region and reject every zalloc_ro_mut whose source is
+         # a kernel static. Skip its register read (the flag byte's branch, taken unconditionally)
+         # and fill the two globals it would have written, with the BootKC's text and const span.
+         rorgn=(("rorgn register read", "BootKC-rx", 0x336f1c8, 0x370001a8, 0x1400000d),),
+         rorgn_globals=(0xefc020, 0xefc028),
+         # AppleImage4's storageInit asks the registered expert whether mix-and-match is
+         # allowed; the slot it calls through is zero here (and in the image), so it decides
+         # "platform requires immutable NVRAM [Deconflicting]", which leaves its nonce
+         # magazines without a slot. No cryptex1 boot nonce means TXM refuses the cryptex
+         # trust cache and launchd's graft ends the boot. Skip the question (cbz w0 -> b) and
+         # let the ordinary /chosen/boot-command decide, as it does on a native boot.
+         # With the device hidden the guest still reads iBoot's /chosen/nvram-proxy-data, so the
+         # question is worth skipping either way.
+         nvram_mutable=(("Image4 storageInit mix-and-match question", "BootKC-rx",
+                         0x2bc0a04, 0x34000080, 0x14000022),),
+         # AURA_XNU_TC_FORCE. The cryptex graft loads cryptex1/current/os.dmg.trustcache through
+         # TXM, which refuses it: the manifest is the reduced-security one and its chip's nonce
+         # slot does not exist here (CHIP_CRYPTEX1_BOOT_AP_REDUCED, tag c1br), so launchd gives
+         # up and the boot ends in recovery. The static trust cache this host passes is that same
+         # cryptex's, so its binaries are trusted either way -- take the success path (cbz w0 -> b)
+         # and let the graft proceed. The guest then accepts a trust cache its supervisor refused:
+         # a tracing switch, never on by default.
+         tc_force=(("trust-cache load result", "BootKC-rx",
+                    0x37e1fd8, 0x340000e0, 0x14000007),),
+         # The guest needs a working NVRAM -- hiding the device stalls its IOKit, and Image4's
+         # nonce slots live there -- but nothing it writes should reach the flash, or a failed
+         # boot leaves recovery-boot-mode behind and the machine stops booting aura. Make
+         # AppleARMNORNVRAM::write return success without writing (keeping its BTI landing pad),
+         # so the guest keeps its in-memory NVRAM and the host's copy is untouched.
+         nvram_ro=(("AppleARMNORNVRAM::write", "BootKC-rx", 0x1c1bec, 0xaa0003e8, 0x52800000),
+                   ("AppleARMNORNVRAM::write return", "BootKC-rx", 0x1c1bf0, 0x52805840,
+                    0xd65f03c0)),
+         # XNU reprogrammes APIBKey/APDBKey_EL1 (plus s3_4_c15_c13_6/7) at every context switch
+         # to the incoming task's diversifier. On real hardware that is harmless to the kernel:
+         # it runs at EL2, whose pointer-authentication keys are a different bank from the EL1
+         # one those writes land in. Here the kernel runs at physical EL1, so the register it
+         # rewrites for userspace is the one its own pacibsp/retab use, and any kernel frame
+         # whose signing and authentication straddle a context switch fails -- which is what
+         # "PAC failure from kernel with IB key while returning" in the SPTM call stub is: the
+         # key, not the stack pointer or the return address, is what changed.
+         # Each of the four sites guards the key block with "b.eq past it" for a task whose key
+         # is already current; make that branch unconditional, so every task keeps the key the
+         # kernel signs with. All of the guest's tasks then share one key: a weaker guest than
+         # hardware gives, which is the price of the collapsed level.
+         pac_keys=(("task PAC key reprogramming (switch)", "BootKC-rx", 0x314834c, 0x540001e0,
+                    0x1400000f),
+                   ("task PAC key reprogramming (2)", "BootKC-rx", 0x3148414, 0x540001e0,
+                    0x1400000f),
+                   ("task PAC key reprogramming (3)", "BootKC-rx", 0x3148614, 0x540001e0,
+                    0x1400000f),
+                   ("task PAC key reprogramming (4)", "BootKC-rx", 0x31488c4, 0x540001e0,
+                    0x1400000f))),
 )
 
 
@@ -384,6 +480,20 @@ def patch_xnu(p, sym, plan, patches):
         print(f"XNU {what}: [0x{pa:x}] 0x{before:08x} -> 0x{p.read32(pa):08x}")
 
 
+def set_xnu_rorgn(p, sym, plan, quirks):
+    """Hand XNU the read-only region iBoot would have locked: the BootKC's text and const."""
+    lo = plan.regions["BootKC-rx"][0]
+    hi = plan.regions["BootKC-ro"][0] + plan.regions["BootKC-ro"][1] - 1
+    p.write64(sym["sptm_virt_xnu_rorgn"], lo)
+    p.write64(sym["sptm_virt_xnu_rorgn"] + 8, hi & ~0xfff)
+    print(f"XNU read-only region 0x{lo:x}-0x{hi:x}")
+    patch_xnu(p, sym, plan, quirks["rorgn"])
+    base = plan.regions["BootKC-ro"][0]
+    for off, value in zip(quirks["rorgn_globals"], (lo, hi)):
+        p.write64(base + off, value)
+        p.call(sym["sptm_virt_flush"], (base + off) & ~0x3f, 0x80)
+
+
 def patch_sptm(p, sym, entry, sp):
     for what, off, mask, expected, new in sp["patches"]:
         pa = entry + off
@@ -512,6 +622,10 @@ def configure(p, sym, plan, adt):
             p.write32(sym[symbol], env_int(env))
     if os.environ.get("AURA_GPU_STOP_SECS"):
         p.write32(sym["sptm_virt_gpu_stop_secs"], env_int("AURA_GPU_STOP_SECS"))
+    if os.environ.get("AURA_GPU_STOP_BOOT_SECS"):
+        p.write32(sym["sptm_virt_gpu_stop_boot_secs"], env_int("AURA_GPU_STOP_BOOT_SECS"))
+    if os.environ.get("AURA_GPU_STOP_MSG"):
+        p.write64(sym["sptm_virt_gpu_stop_msg"], env_int("AURA_GPU_STOP_MSG"))
     if os.environ.get("AURA_GPU_PRINT_MAX"):
         p.write32(sym["sptm_virt_gpu_print_max"], env_int("AURA_GPU_PRINT_MAX"))
     if env_on("AURA_S2R_DCP_PKT"):
@@ -648,11 +762,19 @@ def main():
         raise SystemExit("no debug-link USB port found in the ADT")
     print("debug-link port" + ("s" if len(phys) > 1 else "") + " hidden:", " ".join(port_nodes))
     keep_exclaves = env_on("AURA_KEEP_EXCLAVES")
-    hide = port_nodes + STRIP_NODES + tuple(quirks["hide"])
+    # The NVRAM device stays visible (the guest's IOKit stalls without it and its Image4 nonce
+    # slots live there); its writes are patched out instead, unless AURA_SHARE_NVRAM lets them
+    # through at the price of a failed boot leaving recovery-boot-mode behind.
+    quirk_hide = tuple(quirks["hide"])
+    if env_on("AURA_KEEP_WIFI"):
+        quirk_hide = tuple(n for n in quirk_hide if n in port_nodes)
+    hide = port_nodes + (() if env_on("AURA_KEEP_ANE") else STRIP_NODES) + quirk_hide
     if not env_on("AURA_KEEP_ERRH"):
         hide += (ERROR_HANDLER,)
     if env_on("AURA_HIDE_DOCKCHANNEL"):
         hide += ("/arm-io/dockchannel-uart",)
+    if os.environ.get("AURA_HIDE_NODES"):
+        hide += tuple(n for n in os.environ["AURA_HIDE_NODES"].split(",") if n)
     if not keep_exclaves:
         hide += EXCLAVE_NODES
     cl4 = {}
@@ -698,6 +820,16 @@ def main():
         if not quirks["ro_relax"]:
             raise SystemExit("AURA_XNU_RO_RELAX: no RO-zone patch matches this kernelcache")
         patch_xnu(p, sym, plan, quirks["ro_relax"])
+    if quirks.get("rorgn"):
+        set_xnu_rorgn(p, sym, plan, quirks)
+    if quirks.get("nvram_mutable"):
+        patch_xnu(p, sym, plan, quirks["nvram_mutable"])
+    if quirks.get("pac_keys") and not env_on("AURA_XNU_TASK_KEYS"):
+        patch_xnu(p, sym, plan, quirks["pac_keys"])
+    if quirks.get("nvram_ro") and not env_on("AURA_SHARE_NVRAM"):
+        patch_xnu(p, sym, plan, quirks["nvram_ro"])
+    if env_on("AURA_XNU_TC_FORCE") and quirks.get("tc_force"):
+        patch_xnu(p, sym, plan, quirks["tc_force"])
     configure(p, sym, plan, live_adt)
     if p.call(sym["sptm_virt_load"], entry, handoff) != 0:
         raise SystemExit("sptm_virt_load rejected the entry/handoff (see aura's console)")
@@ -708,6 +840,23 @@ def main():
     if env_on("AURA_KEEP_BOOT_VIDEO"):
         from aura.proxy import IODEV
         p.iodev_set_usage(IODEV.FB, 0)  # the framebuffer is XNU's now
+    if os.environ.get("AURA_TRAP_DELAY_NS"):
+        p.write32(sym["sptm_virt_trap_delay_ns"], env_int("AURA_TRAP_DELAY_NS"))
+    if env_on("AURA_S2R_LIVE"):
+        p.write32(sym["sptm_virt_s2r_live"], 1)
+    if env_on("AURA_SYSREG_CENSUS"):
+        p.write32(sym["sptm_virt_census"], 1)
+    if os.environ.get("AURA_CPTR_LIVE"):
+        p.write32(sym["sptm_virt_cptr_live"], env_int("AURA_CPTR_LIVE"))
+    if os.environ.get("AURA_TRAP_DELAY_MASK"):
+        p.write32(sym["sptm_virt_trap_delay_mask"], env_int("AURA_TRAP_DELAY_MASK"))
+    if os.environ.get("AURA_WFI_WATCH"):
+        p.write32(sym["sptm_virt_wfi_watch"], env_int("AURA_WFI_WATCH"))
+    if os.environ.get("AURA_AMCC_NOLOCK"):
+        p.write32(sym["sptm_virt_amcc_nolock"], env_int("AURA_AMCC_NOLOCK"))
+        print(f"AMCC range locks shadowed: mask {env_int('AURA_AMCC_NOLOCK'):#x}")
+    if os.environ.get("AURA_RG_XWDT"):
+        p.write32(sym["sptm_virt_rg_xwdt"], env_int("AURA_RG_XWDT"))
     print("entering SPTM at virtual EL2 (the result is on aura's console)")
     # sptm_virt_enter does not return. Waiting for a reply or a boot banner would eat the guest's
     # first console output and reopen the link.
