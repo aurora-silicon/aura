@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-2.0-only OR MIT
-"""PCIe handoff keeps OS ownership and requires the native J713 gP13 action."""
+"""PCIe handoff keeps OS ownership and requires the native J713/J715/J604 gP13 action."""
 from pathlib import Path
 import subprocess
 
@@ -13,16 +13,29 @@ def test_j713_pcie_power_contract(tmp_path):
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "libfdt.h"
 typedef uint8_t u8;
 typedef uint32_t u32;
+typedef uint64_t u64;
 typedef int smc_dev_t;
 #define BIT(n) (1U << (n))
+#define PACKED __attribute__((packed))
+#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
+/* The T8140 APCIe tables aren't under test: no ADT. */
+static void *adt;
+static int adt_path_offset(const void *a, const char *path) { return -1; }
+static const void *adt_get_property(const void *a, int node, const char *name) { return NULL; }
+static int adt_path_offset_trace(const void *a, const char *path, int *offsets) { return -1; }
+static const void *adt_getprop(const void *a, int node, const char *name, u32 *len) { return NULL; }
+static int adt_get_reg(const void *a, int *path, const char *prop, int idx, u64 *addr, u64 *size)
+{ return -1; }
 static int writes, bypasses;
 static int smc_result;
 static u32 last_value, last_key;
 static u8 expected_sid = 16;
+static const char *radio_board = "apple,j713";
 static smc_dev_t smc;
 static smc_dev_t *smc_init(void) { return &smc; }
 static int smc_write_u32(smc_dev_t *s, u32 key, u32 value)
@@ -34,7 +47,7 @@ static int dart_set_bypass_fdt(void *dt, u32 phandle, u8 sid)
 static void setup(void *dt, bool j713, int fault)
 {
  assert(!fdt_create_empty_tree(dt, 8192));
- assert(!fdt_setprop_string(dt, 0, "compatible", j713 ? "apple,j713" : "apple,j715"));
+ assert(!fdt_setprop_string(dt, 0, "compatible", j713 ? radio_board : "apple,j773g"));
  int gpio = fdt_add_subnode(dt, 0, "gpio");
  assert(gpio >= 0 && !fdt_setprop_string(dt, gpio, "compatible",
                                       fault == 2 ? "apple,smc-low-gpio" : "apple,smc-gpio"));
@@ -202,6 +215,10 @@ static void test_smc_failure_admission(void *dt)
 int main(void)
 {
  char blob[8192];
+ /* The J715's and the J604's radio ports match the J713's. */
+ static const char *const boards[] = {"apple,j713", "apple,j715", "apple,j604"};
+ for (unsigned b = 0; b < sizeof(boards) / sizeof(*boards); b++) {
+ radio_board = boards[b];
  for (int j713 = 0; j713 <= 1; j713++)
  for (int fault = 0; fault < 5; fault++) {
   setup(blob, j713, fault); writes = bypasses = 0;
@@ -222,6 +239,7 @@ int main(void)
  test_iommu_admission(blob);
  test_managed_streams(blob);
  test_smc_failure_admission(blob);
+ }
  return 0;
 }
 '''

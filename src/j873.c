@@ -263,15 +263,6 @@ int j873_pcie_prep(void)
     return 0;
 }
 
-/* ADT pKW8("key", lo, hi): an eight-byte SMC write of (hi << 32) | lo | level. */
-struct j873_smc_pw8 {
-    u32 phandle;
-    char four_cc[4];
-    u32 key;
-    u32 lo;
-    u32 hi;
-};
-
 /*
  * The SMC holds the N1 (Wi-Fi/Bluetooth on apcie port 0) in reset: ADT
  * pci-bridge0 function-reset = pKW8('pcIO', 0x800000, 0x130000). Write
@@ -279,28 +270,11 @@ struct j873_smc_pw8 {
  */
 int j873_n1_power(void)
 {
-    u32 len;
-
     if (chip_id != T8152 || board_id != 0x24)
         return -1;
 
-    int node = adt_path_offset(adt, "/arm-io/apcie/pci-bridge0");
-    const struct j873_smc_pw8 *fn =
-        node < 0 ? NULL : adt_getprop(adt, node, "function-reset", &len);
-    if (!fn || len != sizeof(*fn) || memcmp(fn->four_cc, "8WKp", 4)) {
-        printf("j873: N1: no pKW8 function-reset in the ADT\n");
-        return -1;
-    }
-
-    smc_dev_t *smc = smc_init();
-    if (!smc)
-        return -1;
-    int ret = 0;
-    for (u32 level = 0; level < 2 && !ret; level++) {
-        ret = smc_write_u64(smc, fn->key, ((u64)fn->hi << 32) | fn->lo | level);
-        mdelay(10);
-    }
-    smc_shutdown(smc);
-    printf("j873: N1 reset released: %d\n", ret);
-    return ret;
+    int ret = smc_adt_function_reset("/arm-io/apcie/pci-bridge0", 10);
+    if (ret > 0)
+        printf("j873: N1: no SMC function-reset in the ADT\n");
+    return ret ? -1 : 0;
 }

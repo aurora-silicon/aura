@@ -95,6 +95,10 @@ static int isp_firmware_end(const struct adt_segment_ranges *segments, u32 lengt
 
 int isp_init(void)
 {
+    /* The T6050 kernel owns power-up. Its handoff only reserves memory. */
+    if (chip_id == T6050)
+        return 0;
+
     int err = -1;
     /* T8142 takes the T8140 (ISP17a) path throughout. */
     bool t8142 = chip_id == T8142;
@@ -242,7 +246,12 @@ int isp_init(void)
 
     if (t8142) {
         /* The J813 revision is not known yet; it is printed above. */
-        if (os_firmware.version != V26_6 && os_firmware.version != V26_6_2) {
+        /*
+         * 27.0's ISP firmware moves the __TEXT/__DATA split but still ends at ISP_T8142_SEG_END
+         * (J813 ADTs of both), which the segment check below still verifies.
+         */
+        if (os_firmware.version != V26_6 && os_firmware.version != V26_6_2 &&
+            os_firmware.version != V27_0) {
             reason = "unsupported T8142 firmware";
             goto out;
         }

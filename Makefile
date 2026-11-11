@@ -210,7 +210,7 @@ OBJECTS := \
 	memory.o memory_asm.o \
 	nvme.o \
 	payload.o \
-	j813_n1.o pcie.o pcie_fdt.o \
+	j813_n1.o pcie.o pcie_fdt.o pcie_t6050.o \
 	pmgr.o \
 	proxy.o \
 	ringbuffer.o \
@@ -292,6 +292,12 @@ $(BUILD_FP_OBJS): build/%.o: src/%.c
 	$(QUIET)mkdir -p $(DEPDIR)
 	$(QUIET)mkdir -p "$(dir $@)"
 	$(QUIET)$(CC) -c $(BASE_CFLAGS) -MMD -MF $(DEPDIR)/$(*F).d -MQ "$@" -MP -o $@ $<
+
+# Guest-only code in .init (aura.ld): its cL4 register switches are 5 KiB smaller at -Oz, which
+# leaves room in .init for more of the guest-only objects.
+build/sptm_virt_cl4.o: CFLAGS += -Oz
+# Run-once OS handoff code: -Oz keeps .text within its 64 KiB steps (see _file_limit).
+build/kboot.o: CFLAGS += -Oz
 
 build/%.o: src/%.c build-tag build-cfg
 	$(QUIET)echo "  CC    $@"

@@ -12,6 +12,7 @@ update-m1n1 is available (M1N1_TEST_UPDATE_M1N1, or one on PATH), boot.bin comes
 with only its two fixed system paths moved into the test directory.
 """
 import gzip
+import importlib.util
 import os
 import shutil
 import subprocess
@@ -238,11 +239,10 @@ static int smp_call_sync0(int cpu, void (*fn)(void)) { return 0; }
 static void do_enable_tso(void) {}
 static bool nvme_shutdown(void) { return true; }
 static bool nvme_keep_running_for_linux;
-static bool nvme_adopt_live_session;
+static bool nvme_set_sart_var(const char *v) { return true; }
 static int display_configure(const char *s) { printf("DISPLAY %s\n", s); return 0; }
 static int display_configure_second(const char *s) { printf("DISPLAY2 %s\n", s); return 0; }
 #define T8132 0x8132
-static bool nvme_init(void) { printf("NVME init\n"); return true; }
 static void mitigations_configure(const char *s) {}
 static int boot_storage_load(const char *spec, struct kernel_header **k, void **f) { return -1; }
 /* A stage 1 configured with its target (stage1_config.c), or not (NULL) */
@@ -726,6 +726,69 @@ def test_fourteen_owner_lines_overflow_stage_2_after_a_configured_stage_1(tools,
         assert b.chosen["test,switch"] == "1" and "asahi,efi-system-partition" not in b.chosen
     else:
         graphics_off(b, board)
+
+
+# ---- a Mach-O Stage 1 enrolled without --raw ----
+#
+# tools/macho_boot_object.py puts __PRELINK_INFO, an XML plist, right after the raw image, and the
+# raw image ends at _payload_start (its last word is the stack canary). iBoot loads the pages at
+# their offsets, so Stage 1's payload scan starts on "<?xml version=". The ways this can fail:
+# - the scan reads the plist as config and hands stage 2 a loss for a complete config, so the
+#   M3 default boards drop all graphics (seen on a J613 under 1.0.0b5);
+# - the scan stops before config Stage 1 really has, so its lines never reach stage 2;
+# - a loss Stage 1 saw before the plist is no longer handed on.
+
+def boot_object_tail():
+    """What follows the raw image in the boot object macho_boot_object.wrap() makes"""
+    spec = importlib.util.spec_from_file_location("macho_boot_object",
+                                                  ROOT / "tools/macho_boot_object.py")
+    tool = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(tool)
+    raw = bytearray(4 * tool.PAGE)
+    raw[tool.LOAD_HEADER_OFFSET:tool.LOAD_HEADER_OFFSET + 8] = tool.LOAD_HEADER_MAGIC
+    raw[-8:] = b"STACKBOT"
+    tail = tool.wrap(bytes(raw))[tool.IMAGE_OFFSET + len(raw):]
+    assert tail.startswith(b"<?xml version=")
+    return tail
+
+
+def test_a_mach_o_stage_1_hands_over_a_complete_config_as_complete(tools):
+    forwarded = stage1(tools, boot_object_tail(), configured=True)
+    assert forwarded.splitlines(keepends=True)[1:] == [
+        b"chosen.asahi,efi-system-partition=ESP-UUID\n"]
+    b = boot(tools, "stage2", b"", trailer=forwarded)
+    booted(b)
+    assert set(AIR) <= b.armed and b.select == "g15-standin"
+
+
+def page_of_lines(config):
+    """config, then lines m1n1 does not know, up to the end of a 16 KiB page"""
+    pad = -len(config) % 0x4000
+    if pad and pad < 11:                     # the shortest line, "test.pad=x\n"
+        pad += 0x4000
+    while pad:
+        n = pad if pad <= 1000 else 1000 if pad - 1000 >= 11 else pad - 11
+        config += b"test.pad=" + b"x" * (n - 10) + b"\n"
+        pad -= n
+    return config
+
+
+@pytest.mark.parametrize("config,lost", [(GPU_ON + GPU_OFF, False),
+                                         (GPU_ON + b"junk\n" + GPU_OFF, True)],
+                         ids=["complete", "swallowed-line"])
+def test_a_mach_o_stage_1_reads_its_own_lines_up_to_the_plist(tools, config, lost):
+    """A raw Stage 1 can carry lines after its image. Ending on a page, the plist follows them."""
+    lines = page_of_lines(config)
+    assert len(lines) % 0x4000 == 0
+    forwarded = stage1(tools, lines + boot_object_tail(), configured=True)
+    assert forwarded.startswith(b"chosen.asahi,m1n1-stage1-version=host-test\n" + GPU_ON)
+    assert forwarded.count(LOST) == lost and forwarded.endswith(LOST) == lost
+    b = boot(tools, "stage2", b"", trailer=forwarded)
+    if lost:
+        graphics_off(b)
+    else:
+        booted(b)
+        assert b.chosen["asahi,t8122-gpu"] == "0" and b.select == "reservation-only"
 
 
 # ---- from /etc/m1n1.conf through update-m1n1 ----

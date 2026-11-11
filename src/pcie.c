@@ -361,7 +361,18 @@ static int pcie_t8140_preflight(const char *path, int *adt_path, u32 ports, u32 
     return 0;
 }
 
-static int pcie_init_controller(int controller, const char *path)
+/* What PHY control gets once the PHY is ready. */
+static u32 pcie_phy_up(const struct state *state)
+{
+    if (state->pcie_regs->type == APCIE_T602X)
+        return 0x300;
+    if (state->pcie_regs->compat == APCIE_T8122)
+        return 0x200;
+    return BIT(27);
+}
+
+/* With ans_off, only read the windows, stop the shared PHY and power ANS's gates off. */
+static int pcie_init_controller(int controller, const char *path, bool ans_off)
 {
     struct state *state = &controllers[controller];
     int adt_path[8];
@@ -546,6 +557,26 @@ static int pcie_init_controller(int controller, const char *path)
         return -1;
     }
 
+    if (ans_off) {
+        for (int phy = 0; phy < state->num_phys; phy++) {
+            u64 ctrl = state->phy_base[phy] + APCIE_PHY_CTRL;
+            set32(ctrl, state->pcie_regs->phy_ctrl_reset);
+            clear32(ctrl, APCIE_PHY_CTRL_CLK1REQ);
+            poll32(ctrl, APCIE_PHY_CTRL_CLK1ACK, 0, 50000);
+            clear32(ctrl, APCIE_PHY_CTRL_CLK0REQ);
+            poll32(ctrl, APCIE_PHY_CTRL_CLK0ACK, 0, 50000);
+            /* PHY control keeps its value through the power cycle: take the PHY down whole. */
+            clear32(ctrl, pcie_phy_up(state));
+            clear32(state->phy_base[phy] + 4, 0x10);
+            clear32(state->phy_base[phy] + 4, 0x01);
+        }
+        if (pmgr_adt_power_disable_under(path, "ANS"))
+            return -1;
+        /* Off at least as long as in the power cycle measured on the J700. */
+        udelay(100000);
+        return 0;
+    }
+
     state->dirty = true;
     if (state->pcie_regs->type == APCIE_T8140)
         printf("pcie: T8140 enabling controller power\n");
@@ -612,6 +643,8 @@ static int pcie_init_controller(int controller, const char *path)
         }
     }
 
+    /* T8140's ANS runs on this PHY, so it is left as it is unless ANS was powered off. */
+    bool cold = state->pcie_regs->type == APCIE_T8140 && !(read32(state->phy_base[0] + 4) & 0x10);
     for (int phy = 0; phy < state->num_phys; phy++) {
         if (state->pcie_regs->type == APCIE_T8140)
             printf("pcie: T8140 PHY %d requesting CLK0\n", phy);
@@ -665,7 +698,7 @@ static int pcie_init_controller(int controller, const char *path)
                    fuse << fuse_bits[i].tgt_bit);
         }
 
-        if (state->pcie_regs->type == APCIE_T8140) {
+        if (state->pcie_regs->type == APCIE_T8140 && !cold) {
             printf("pcie: T8140 PHY %d up; skipping PHY IP PLL and AUSPMA tunables\n", phy);
         } else {
             char pll_prop[64];
@@ -689,7 +722,10 @@ static int pcie_init_controller(int controller, const char *path)
             }
         }
 
-        if (state->pcie_regs->type == APCIE_T602X || state->pcie_regs->compat == APCIE_T8122) {
+        if (cold)
+            clear32(state->phy_ip_base[phy] + 0x90, BIT(16));
+        if (state->pcie_regs->type == APCIE_T602X || state->pcie_regs->compat == APCIE_T8122 ||
+            cold) {
             set32(state->phy_base[phy] + 4, 0x10);
         }
     }
@@ -702,20 +738,15 @@ static int pcie_init_controller(int controller, const char *path)
                FIELD_PREP(APCIE_PHYCMN_CLK_MODE, 1));
     }
 
-    if (state->pcie_regs->type == APCIE_T602X || state->pcie_regs->compat == APCIE_T8122) {
+    if (state->pcie_regs->type == APCIE_T602X || state->pcie_regs->compat == APCIE_T8122 || cold) {
         // Why always PHY 1 in this case?
         u32 off = state->num_phys > 1 ? PHY_STRIDE : 0;
         if (poll32(state->phy_base[0] + off + 0x8, 1, 1, 250000)) {
             printf("pcie: PHY clock enable timed out\n");
             return -1;
         }
-        for (int phy = 0; phy < state->num_phys; phy++) {
-            if (state->pcie_regs->type == APCIE_T602X) {
-                set32(state->phy_base[phy] + APCIE_PHY_CTRL, 0x300);
-            } else if (state->pcie_regs->compat == APCIE_T8122) {
-                set32(state->phy_base[phy] + APCIE_PHY_CTRL, 0x200);
-            }
-        }
+        for (int phy = 0; phy < state->num_phys; phy++)
+            set32(state->phy_base[phy] + APCIE_PHY_CTRL, pcie_phy_up(state));
     }
 
     if (state->pcie_regs->type == APCIE_T602X || state->pcie_regs->compat == APCIE_T8122 ||
@@ -1064,7 +1095,7 @@ int pcie_init(void)
             printf("pcie: T8140 controller absent\n");
             return 1;
         }
-        int ret = pcie_init_controller(APCIE, path);
+        int ret = pcie_init_controller(APCIE, path, false);
         if (!ret) {
             pcie_initialized = true;
             return 0;
@@ -1077,15 +1108,75 @@ int pcie_init(void)
         return 1;
     }
 
-    success |= pcie_init_controller(APCIE, "/arm-io/apcie") == 0;
-    success |= pcie_init_controller(APCIE, "/arm-io/apcie0") == 0;
-    success |= pcie_init_controller(APCIE_GE0, "/arm-io/apcie-ge0") == 0;
-    success |= pcie_init_controller(APCIE_GE1, "/arm-io/apcie-ge1") == 0;
+    if (chip_id == T6050) {
+        int ret = pcie_t6050_init();
+        pcie_initialized = !ret;
+        return ret;
+    }
+
+    success |= pcie_init_controller(APCIE, "/arm-io/apcie", false) == 0;
+    success |= pcie_init_controller(APCIE, "/arm-io/apcie0", false) == 0;
+    success |= pcie_init_controller(APCIE_GE0, "/arm-io/apcie-ge0", false) == 0;
+    success |= pcie_init_controller(APCIE_GE1, "/arm-io/apcie-ge1", false) == 0;
 
     if (success)
         pcie_initialized = true;
 
     return success ? 0 : -1;
+}
+
+/* For a stage done with a post-M4 ANS, which runs on the APCIe PHY: the PHY and ANS powered off. */
+static const char *pcie_ans_path(void)
+{
+    return adt_path_offset(adt, "/arm-io/apcie") >= 0 ? "/arm-io/apcie" : "/arm-io/apcie0";
+}
+
+/*
+ * T6050, as macOS around a sleep (run 28). Off: the storage PHYs, children first, then the gates
+ * that depend on ANS and ANS itself (the SoC's sleep takes those). On: macOS's wake order. PHY_SW
+ * and the GP side stay up for the GP ports.
+ */
+static const char *const t6050_ans_ps[] = {"APHY_ST0_AUS5",
+                                           "APHY_ST0_AUS5_A",
+                                           "APHY_ST1_AUS5",
+                                           "APHY_ST1_AUS5_A",
+                                           "APCIE_SYS_ST1",
+                                           "APCIE_SYS_ST0",
+                                           "ANS"};
+static const u8 t6050_ans_ps_on[] = {6, 5, 4, 1, 3, 0, 2};
+
+static int pcie_t6050_ps(const char *name, bool on)
+{
+    if (!pmgr_power_steps(0, name, on))
+        return 0;
+    printf("pcie: %s didn't go %s\n", name, on ? "on" : "off");
+    return -1;
+}
+
+int pcie_ans_power_off(void)
+{
+    if (chip_id == T6050) {
+        for (size_t i = 0; i < ARRAY_SIZE(t6050_ans_ps); i++)
+            if (pcie_t6050_ps(t6050_ans_ps[i], false))
+                return -1;
+        /* Longer than the 21.5 ms S2R cycles after which macOS restarted ANS (run 28). */
+        udelay(100000);
+        return 0;
+    }
+    pcie_initialized = false;
+    return pcie_init_controller(APCIE, pcie_ans_path(), true);
+}
+
+int pcie_ans_power_on(void)
+{
+    if (chip_id != T6050)
+        return pcie_init();
+    for (size_t i = 0; i < ARRAY_SIZE(t6050_ans_ps_on); i++)
+        if (pcie_t6050_ps(t6050_ans_ps[t6050_ans_ps_on[i]], true))
+            return -1;
+    /* macOS sets ANS's run bit 70 ms after the storage PHYs are back (cp9d W1). */
+    udelay(70000);
+    return 0;
 }
 
 int pcie_shutdown(void)

@@ -5,13 +5,20 @@
 
 #include "types.h"
 
+struct sart_entry;
+
 bool nvme_init(void);
-extern bool nvme_adopt_live_session;
 extern bool nvme_keep_running_for_linux;
 bool nvme_shutdown(void);
-bool nvme_has_live_post_m4_session(void);
+/* Post-M4: how a stage that powered ANS off tells the next one to start it again. */
+bool nvme_post_m4(void);
+int nvme_sart_entries(struct sart_entry *entries, int max, bool *off);
+char *nvme_sart_var(void);
+bool nvme_set_sart_var(const char *val);
 
 bool nvme_flush(u32 nsid);
+/* A command of this session failed or timed out: later ones fail until a restart. */
+bool nvme_io_failed(void);
 bool nvme_read(u32 nsid, u64 lba, void *buffer);
 #define NVME_MAX_READ_BLOCKS 256
 bool nvme_read_blocks(u32 nsid, u64 lba, void *buffer, u32 count);

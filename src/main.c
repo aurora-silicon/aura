@@ -120,12 +120,19 @@ bool stage1_window_offered(void)
 
 /*
  * A boot started by a VDM `reboot debugusb` with a host reading the DockChannel console gets the
- * aura-proxy window, once per chain: not after an earlier aura stage offered one.
+ * aura-proxy window, once per chain: not after an earlier aura stage offered one. An ESP Stage 2
+ * goes by aura.host-window alone: a Stage 1 without this window chains it with nvme.adopt too,
+ * and the host would otherwise have no window at all.
  */
 bool debugusb_proxy_window(void)
 {
-    if (stage1_window_done || stage1_chained || stage1_window_passed ||
-        !secboot_host_proxy_allowed() || !dockchannel_uart_host_seen())
+#ifdef ESP_STAGE2
+    bool offered = stage1_window_passed;
+#else
+    bool offered = stage1_chained || stage1_window_passed;
+#endif
+    if (stage1_window_done || offered || !secboot_host_proxy_allowed() ||
+        !dockchannel_uart_host_seen())
         return false;
     stage1_window_done = true;
     printf("aura: debugusb boot, opening proxy window\n");
@@ -273,6 +280,9 @@ void run_actions(void)
                "  Check that the file this Stage 1 names exists on its EFI partition.\n"
                "  Hold the power button to shut down, then hold it again to choose another "
                "system.\n");
+    if (stage1_config_target() && wdt_boot_watchdog_armed())
+        printf("  Without a host, this Mac restarts by itself within %u s to try again.\n",
+               WDT_BOOT_SECONDS);
 
     if (payload_action == STAGE1_PAYLOAD_HALT)
         panic("Stage 1: no safe proxy carrier after CDC failure\n");
@@ -380,6 +390,12 @@ void aura_main(void)
     wdt_disable();
     if (aura_trial_enabled() && wdt_arm_trial())
         printf("WDT: could not arm the trial watchdog\n");
+#if defined(CHAINLOADING) && !defined(ESP_STAGE2)
+    else if (!aura_trial_enabled() && wdt_arm_boot())
+        printf("WDT: could not arm the boot watchdog\n");
+    else if (!aura_trial_enabled())
+        printf("WDT: boot watchdog armed (%u s)\n", WDT_BOOT_SECONDS);
+#endif
 #ifndef BRINGUP
     if (pmgr_init() && chip_id == T8140)
         panic("T8140 PMGR initialization failed\n");

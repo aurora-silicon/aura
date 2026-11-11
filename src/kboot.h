@@ -43,6 +43,9 @@ u64 kboot_fb_base(void);
  */
 void kboot_loaded_file_part(u64 *base, u64 *size);
 
+/* The node at an absolute path or alias, matching each node name exactly (see kboot.c) */
+int kboot_fdt_path_exact(const void *fdt, const char *path);
+
 // from rust/usb4.rs
 u64 rust_usb4_router_uuid(void);
 int rust_platform_uuid(u8 *out);

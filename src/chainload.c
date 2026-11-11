@@ -361,7 +361,6 @@ static bool chainload_start_trial(char **vars, size_t *var_cnt, size_t var_capac
 
 int chainload_load(const char *spec, char **vars, size_t *var_cnt, size_t var_capacity)
 {
-    static char adopt_var[] = "nvme.adopt=live-rtkit-v1";
 #if defined(DEBUGUSB_PROXY) && !defined(ESP_STAGE2)
     static char host_window_var[] = "aura.host-window=done";
 #endif
@@ -379,19 +378,19 @@ int chainload_load(const char *spec, char **vars, size_t *var_cnt, size_t var_ca
         return -1;
     }
 
-    if (nvme_has_live_post_m4_session()) {
+    /* Post-M4: the SART entries the next stage starts ANS again with, after nvme_shutdown(). */
+    char *sart_var = nvme_sart_var();
+    if (sart_var) {
         bool present = false;
-        for (size_t i = 0; i < *var_cnt; i++) {
-            if (!strcmp(vars[i], adopt_var))
-                present = true;
-        }
+        for (size_t i = 0; i < *var_cnt; i++)
+            present |= vars[i] == sart_var;
         if (!present) {
             if (*var_cnt >= var_capacity) {
-                printf("chainload: no room for ANS adoption variable\n");
+                printf("chainload: no room for nvme.sart\n");
                 nvme_shutdown();
                 return -1;
             }
-            vars[(*var_cnt)++] = adopt_var;
+            vars[(*var_cnt)++] = sart_var;
         }
     }
 
@@ -401,6 +400,18 @@ int chainload_load(const char *spec, char **vars, size_t *var_cnt, size_t var_ca
     trial_path[0] = 0;
     ret = rust_load_image(spec, &image, &size, &proxy_request, may_trial ? trial_path : NULL,
                           sizeof(trial_path));
+    /*
+     * A command that timed out fails every later one of this NVMe session, so one failure
+     * (spending an aura-try marker writes and flushes the ESP) also lost the configured image.
+     * Start NVMe again once and read that image, leaving any marker alone, rather than stopping.
+     */
+    if (ret != 0 && nvme_io_failed()) {
+        printf("chainload: NVMe I/O failed; restarting NVMe for the configured image\n");
+        may_trial = false;
+        trial_path[0] = 0;
+        if (nvme_shutdown() && nvme_init())
+            ret = rust_load_image(spec, &image, &size, NULL, NULL, 0);
+    }
 #ifndef ESP_STAGE2
     /*
      * An aura-proxy file at the ESP root asks Stage 1 to wait for a host. Hand NVMe

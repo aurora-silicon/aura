@@ -3,6 +3,7 @@
 #include "chickens.h"
 #include "cpu_regs.h"
 #include "midr.h"
+#include "smp.h"
 #include "uart.h"
 #include "utils.h"
 
@@ -196,7 +197,7 @@ void init_cpu(void)
     int part = FIELD_GET(MIDR_PART, midr);
     int rev = (FIELD_GET(MIDR_REV_HIGH, midr) << 4) | FIELD_GET(MIDR_REV_LOW, midr);
 
-    bool quiet = (chip_id == T8142 || chip_id == T8152) && !is_boot_cpu();
+    bool quiet = ((chip_id == T8142 || chip_id == T8152) && !is_boot_cpu()) || smp_s2r_published();
     if (!quiet)
         printf("  CPU part: 0x%x rev: 0x%x\n", part, rev);
 
@@ -213,7 +214,9 @@ void init_cpu(void)
     if (!quiet)
         printf("  CPU: %s\n", midr_part_info->name);
 
-    cpu_features = midr_part_info->features;
+    /* A T8142 secondary cannot write aura's data under macOS 27.0 (CTRR_D, smp.c). */
+    if (cpu_features != midr_part_info->features)
+        cpu_features = midr_part_info->features;
 
     if (cpu_features->disable_dc_mva) {
         /* This is performed unconditionally on all cores (necessary?) */

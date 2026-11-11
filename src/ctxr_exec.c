@@ -106,6 +106,8 @@ static void ctxr_exec_warn_unprobed(const char *why)
  * leave the windows armed, and one that did not (M1 to M3, or a raw boot
  * object) runs the probe and is not confined.
  */
+static const char *ctxr_exec_problem(void);
+
 bool ctxr_exec_confined(void)
 {
     static int confined = -1;
@@ -118,6 +120,18 @@ bool ctxr_exec_confined(void)
         if (cpu != boot_cpu_idx && smp_is_alive(cpu))
             break;
     if (cpu == MAX_CPUS) {
+        u64 lower, upper;
+
+        /*
+         * The boot core runs outside CTXR_D now, but a reset brings it back like a secondary
+         * (an S2R wake). It can't run the OS there unless the OS is in the window.
+         */
+        if (ctxr_range(CTXR_RANGE_D, &lower, &upper) && !ctxr_exec_problem()) {
+            printf("CTXR exec: no secondary is running; CTXR_D is armed, so a core leaving reset, "
+                   "the boot core's too, is taken as confined\n");
+            confined = 1;
+            return true;
+        }
         ctxr_exec_warn_unprobed("no secondary is running to probe");
         return false;
     }

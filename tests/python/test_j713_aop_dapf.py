@@ -97,9 +97,16 @@ static void write64(u64 addr,u64 value) {
 static int fdt_path_offset(const void *dt,const char *p){(void)dt;(void)p;return 1;}
 static const void *fdt_getprop(const void *dt,int id,const char *key,void *len)
 {(void)dt;(void)id;(void)key;(void)len;return &bank;}
-/* The J713 DT requests the AOP, MTP and PMP and powers the PMP; the MTP stays inactive here. */
-static int fdt_stringlist_search(const void *dt,int id,const char *key,const char *value)
-{(void)dt;(void)id;(void)key;return !strcmp(value,"/arm-io/aop")||!strcmp(value,"/arm-io/pmp")?0:-1;}
+/* The J713 DT requests the AOP, MTP and PMP and powers the PMP; the MTP stays inactive here.
+ * It asks for no halted handoff, so the J713 caller never looks at a consumer's CPU. */
+static int fdt_stringlist_search(const void *dt,int id,const char *key,const char *value) {
+ (void)dt;(void)id;if(!strcmp(key,"linux-enablement-mac,dapf-halted-handoff"))return -1;
+ return !strcmp(value,"/arm-io/aop")||!strcmp(value,"/arm-io/pmp")?0:-1;
+}
+typedef struct asc_dev asc_dev_t;
+static asc_dev_t *asc_init(const char *p){(void)p;assert(!"asc_init");return NULL;}
+static void asc_free(asc_dev_t *asc){(void)asc;assert(!"asc_free");}
+static bool asc_cpu_running(asc_dev_t *asc){(void)asc;assert(!"asc_cpu_running");return true;}
 static int fdt_node_check_compatible(const void *dt,int node,const char *compat)
 {(void)dt;(void)node;(void)compat;return 0;}
 '''

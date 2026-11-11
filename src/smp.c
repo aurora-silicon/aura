@@ -5,6 +5,7 @@
 #include "aic.h"
 #include "aic_regs.h"
 #include "cpu_regs.h"
+#include "dockchannel_uart.h"
 #include "malloc.h"
 #include "memory.h"
 #include "pmgr.h"
@@ -86,7 +87,9 @@ static bool wfe_mode SMP_SHARED = false;
 
 static int target_cpu SMP_SHARED;
 static int cpu_nodes[MAX_CPUS];
-static struct spin_table spin_table[MAX_CPUS] SMP_SHARED;
+static struct spin_table spin_table_image[MAX_CPUS] SMP_SHARED;
+/* T8142 moves it out of the boot object (smp_t8142_block_init) */
+static struct spin_table *spin_table SMP_SHARED = spin_table_image;
 
 struct cpu_info {
     bool valid;
@@ -140,6 +143,56 @@ struct smp_reset_stack smp_reset_stacks[MAX_CPUS] SMP_SHARED = {
 };
 
 extern u8 _vectors_start[0];
+
+/*
+ * macOS 27.0 iBoot locks CTRR_D over the whole boot object for the T8142 secondaries: they may
+ * run aura's code there, but every store of theirs into it faults, with the MMU on or off. Their
+ * stacks and the spin table live in one heap block above it instead, uncached like
+ * .data.smp_shared, and kboot keeps that block from the OS (smp_secondary_block()).
+ */
+static u8 *t8142_block SMP_SHARED;
+static size_t t8142_block_size;
+
+static u64 secondary_stack_top(int index)
+{
+    if (t8142_block)
+        return (u64)t8142_block + (u64)(index + 1) * SECONDARY_STACK_SIZE;
+    return (u64)secondary_stacks[index] + SECONDARY_STACK_SIZE;
+}
+
+u8 *smp_secondary_stack(int index)
+{
+    return (u8 *)(secondary_stack_top(index) - SECONDARY_STACK_SIZE);
+}
+
+bool smp_secondary_block(u64 *base, u64 *size)
+{
+    if (!t8142_block)
+        return false;
+    *base = (u64)t8142_block;
+    *size = t8142_block_size;
+    return true;
+}
+
+static int smp_t8142_block_init(int cpus)
+{
+    size_t stacks = (size_t)cpus * SECONDARY_STACK_SIZE;
+    size_t size = ALIGN_UP(stacks + sizeof(spin_table_image), SZ_16K);
+    u8 *block = memalign(SZ_16K, size);
+
+    if (!block)
+        return -1;
+    memset(block, 0, size);
+    memcpy(block + stacks, spin_table_image, sizeof(spin_table_image));
+    dc_civac_range(block, size);
+    mmu_map_uncached((u64)block, size);
+    t8142_block_size = size;
+    t8142_block = block;
+    spin_table = (struct spin_table *)(block + stacks);
+    sysop("dsb sy");
+    printf("SMP: T8142 secondary stacks and spin table at [%p, %p)\n", block, block + size);
+    return 0;
+}
 
 extern u8 _stack_bot[0];
 int boot_cpu_idx SMP_SHARED = -1;
@@ -317,6 +370,109 @@ static int smp_prepare_rvbar_t8152(const struct cpu_info *cpu)
     return 0;
 }
 
+/* Whether a core whose RVBAR iBoot locked at @locked resets into this image. */
+static bool smp_rvbar_reaches_here(u64 locked)
+{
+    u64 target = (u64)_vectors_start;
+    int64_t distance = (int64_t)target - (int64_t)locked;
+
+    if (locked == target || locked == installed_relay)
+        return true;
+    if (relocated_from && locked == old_vectors_start())
+        return true;
+    /* A branch here an earlier stage left, or smp_prepare_rvbar() accepted. */
+    return !(distance & 3) && distance >= -0x8000000 && distance <= 0x7fffffc &&
+           read32(locked) == (0x14000000 | ((distance / 4) & 0x03ffffff));
+}
+
+/*
+ * Whether a reset brings the cores back into this image. From M4 on (A18 Pro too), iBoot locks
+ * every core's RVBAR to the same address, the boot core's too, and smp_prepare_rvbar() checked a
+ * running secondary's before starting it. An OS started on the boot core alone suspends with that
+ * core only, so it gets the same check and relay. On A7 to M3 RVBAR isn't locked: the OS can point
+ * it anywhere.
+ */
+bool smp_resets_return_here(void)
+{
+    if (cpu_features->apple_sysregs_unlocked || boot_cpu_idx < 0)
+        return false;
+    int i;
+    for (i = 0; i < MAX_CPUS; i++)
+        if (i != boot_cpu_idx && cpu_info[i].valid && smp_is_alive(i))
+            break;
+    /* With no secondary running, the boot core's own RVBAR, through the relay it would get. */
+    const struct cpu_info *cpu = &cpu_info[i < MAX_CPUS ? i : boot_cpu_idx];
+    if (i == MAX_CPUS &&
+        (!cpu->valid || chip_id == T8142 || chip_id == T8152 || smp_prepare_rvbar(cpu)))
+        return false;
+    u64 rvbar = read64(cpu->impl_reg);
+    return (rvbar & RVBAR_LOCK) && smp_rvbar_reaches_here(rvbar & RVBAR_ADDR);
+}
+
+/*
+ * An OS at EL2 powers cores off and suspends itself, and the locked RVBAR brings every
+ * core back here. A secondary needs only its spin table entry, which still holds the
+ * OS's release target. The boot core takes resume_pa. Linux reads this layout in
+ * drivers/soc/apple/t8140-sleep.c.
+ */
+#define AURA_S2R_MAGIC 0x3152325341525541ULL /* "AURAS2R1" */
+
+struct aura_s2r_mailbox {
+    u64 magic;      /* aura, before the OS starts */
+    u64 boot_mpidr; /* aura: the only core that may take resume_pa */
+    u64 resume_pa;  /* OS, cleaned to PoC before it sleeps; aura clears it */
+    u64 resumes;    /* aura: resume_pa taken this many times */
+};
+
+static struct aura_s2r_mailbox s2r_mailbox SMP_SHARED ALIGNED(64);
+
+/* Returns the mailbox's physical address: aura's mapping is the identity. */
+u64 smp_s2r_publish(void)
+{
+    s2r_mailbox.magic = AURA_S2R_MAGIC;
+    s2r_mailbox.boot_mpidr = mrs(MPIDR_EL1) & 0xFFFFFF;
+    s2r_mailbox.resume_pa = 0;
+    s2r_mailbox.resumes = 0;
+    dc_cvac_range(&s2r_mailbox, sizeof(s2r_mailbox));
+    sysop("dsb sy");
+    return (u64)&s2r_mailbox;
+}
+
+/* Once it is, the OS owns the UART and the display: reset paths must not print. */
+bool smp_s2r_published(void)
+{
+    return s2r_mailbox.magic == AURA_S2R_MAGIC;
+}
+
+/*
+ * The boot core back from a sleep, with the OS live: nothing here may rerun the boot
+ * flow. The OS gets EL2h with the MMU and caches off and interrupts masked, as at
+ * first entry, and init_cpu() has redone the per-core setup. The watchdog is the
+ * OS's: it armed it, and it stops it.
+ */
+void smp_s2r_return_to_os(void)
+{
+    u64 entry = s2r_mailbox.resume_pa;
+
+    /* exception_initialize() unmasked everything. */
+    msr(DAIF, 0xf << 6);
+
+    /* A reset the OS didn't arm: reboot rather than guess what state it's in. */
+    bool armed = entry && (mrs(MPIDR_EL1) & 0xFFFFFF) == s2r_mailbox.boot_mpidr;
+    /* One line on the always-on DockChannel only: USB and the display are the OS's. */
+    dockchannel_uart_puts(armed ? "aura: S2R wake, resuming the OS"
+                                : "aura: S2R reset not armed, rebooting");
+    if (!armed)
+        reboot();
+
+    s2r_mailbox.resume_pa = 0;
+    s2r_mailbox.resumes++;
+    sysop("dsb sy");
+
+    ((void (*)(void))entry)();
+    reboot();
+}
+
 void smp_secondary_entry(void)
 {
     u64 mpidr = mrs(MPIDR_EL1) & 0xFFFFFF;
@@ -334,8 +490,12 @@ void smp_secondary_entry(void)
         }
     }
 
-    smp_reset_stacks[index].stack = (u64)secondary_stacks[index] + SECONDARY_STACK_SIZE;
-    smp_reset_stacks[index].mpidr = mpidr;
+    /* On T8142 the table is read-only here (CTRR_D); smp_init() published this entry. */
+    u64 stack = secondary_stack_top(index);
+    if (smp_reset_stacks[index].stack != stack || smp_reset_stacks[index].mpidr != mpidr) {
+        smp_reset_stacks[index].stack = stack;
+        smp_reset_stacks[index].mpidr = mpidr;
+    }
     sysop("dsb sy");
 
     struct spin_table *me = &spin_table[index];
@@ -345,7 +505,7 @@ void smp_secondary_entry(void)
     else
         msr(TPIDR_EL1, index);
 
-    if (chip_id != T8142 && chip_id != T8152)
+    if (chip_id != T8142 && chip_id != T8152 && !smp_s2r_published())
         printf("  Index: %d (table: %p)\n\n", index, me);
 
     me->mpidr = mpidr;
@@ -397,7 +557,8 @@ static u32 cpu_start_bit(int index, const struct cpu_info *cpu)
     if (chip_id == T8142)
         return BIT(index);
 
-    return BIT(4 * cpu->cluster + cpu->core);
+    /* T6050 has three six-core clusters; XNU's stop bits are 6 * cluster + core (MEAS). */
+    return BIT((chip_id == T6050 ? 6 : 4) * cpu->cluster + cpu->core);
 }
 
 static bool t8142_prepare_reset_vector(u64 rvbar)
@@ -462,9 +623,9 @@ static int smp_start_cpu(int index, const struct cpu_info *cpu)
     target_cpu = index;
     if (has_el3()) {
         _reset_stack = secondary_stacks_el3[index] + SECONDARY_STACK_SIZE; // EL3
-        _reset_stack_el1 = secondary_stacks[index] + SECONDARY_STACK_SIZE; // EL1
+        _reset_stack_el1 = (void *)secondary_stack_top(index);             // EL1
     } else
-        _reset_stack = secondary_stacks[index] + SECONDARY_STACK_SIZE;
+        _reset_stack = (void *)secondary_stack_top(index);
 
     sysop("dsb sy");
 
@@ -774,6 +935,17 @@ int smp_init(void)
             msr(TPIDR_EL1, boot_cpu_idx);
     }
 
+    if (chip_id == T8142 && !t8142_block) {
+        int cpus = 0;
+        for (int i = 0; i < MAX_CPUS; i++)
+            if (cpu_nodes[i])
+                cpus = i + 1;
+        if (smp_t8142_block_init(cpus) < 0) {
+            printf("SMP: could not allocate the T8142 secondary block\n");
+            return -1;
+        }
+    }
+
     spin_table[boot_cpu_idx].mpidr = mrs(MPIDR_EL1) & 0xFFFFFF;
     smp_reset_stacks[boot_cpu_idx].stack = (u64)_stack_bot;
     smp_reset_stacks[boot_cpu_idx].mpidr = spin_table[boot_cpu_idx].mpidr;
@@ -810,7 +982,7 @@ int smp_init(void)
         if (chip_id == T8142 && i != boot_cpu_idx) {
             /* ADT reg omits Aff2, which is 1 on the M5 performance cluster. */
             smp_reset_stacks[i].mpidr = (reg & 0xFFFFFF) | (cpu_info[i].cluster ? BIT(16) : 0);
-            smp_reset_stacks[i].stack = (u64)secondary_stacks[i] + SECONDARY_STACK_SIZE;
+            smp_reset_stacks[i].stack = secondary_stack_top(i);
         }
     }
 
@@ -846,7 +1018,7 @@ static void smp_start_t8152(void)
             smp_start_fail_mask |= BIT(i);
             break;
         }
-        dc_civac_range(secondary_stacks[i], SECONDARY_STACK_SIZE);
+        dc_civac_range(smp_secondary_stack(i), SECONDARY_STACK_SIZE);
         if (!(rvbar & RVBAR_LOCK))
             write64(cpu->impl_reg, (u64)_vectors_start);
         sysop("dsb sy");

@@ -4,6 +4,8 @@
 from pathlib import Path
 import subprocess
 
+from host_compiler import host_cc
+
 
 HARNESS = r"""
 #include <assert.h>
@@ -27,6 +29,7 @@ typedef uint64_t u64;
 #define T6031 0x6031
 #define T6034 0x6034
 #define T6041 0x6041
+#define T6050 0x6050
 #define T8140 0x8140
 #define T8142 0x8142
 #define V12_3 1
@@ -36,6 +39,7 @@ typedef uint64_t u64;
 #define V14_7 5
 #define V26_6 7
 #define V26_6_2 6
+#define V27_0 8
 #define PMGR_PS_ACTIVE 15
 #define PMGR_PS_PWRGATE 0
 #define SZ_16K 0x4000
@@ -265,6 +269,16 @@ int main(void)
     assert(isp_get_heap(&phys, &iova, &size) == 0);
     assert(iova == 0xe94000 && size == 0x6c000);
     assert(disabled == 1 && gated == 1 && dapf_calls == 0);
+
+    /* 27.0 splits the T8142 firmware differently but ends where 26.6 does. */
+    reset(); chip_id = T8142;
+    os_firmware.version = V27_0; os_firmware.string = "27.0";
+    segments[0].size = 0xd68000;
+    segments[1].iova = 0xd68000; segments[1].size = 0x984000;
+    assert(isp_init() == 0);
+    assert(isp_get_heap(&phys, &iova, &size) == 0);
+    assert(iova == 0x16ec000 && size == 0x114000);
+    assert(dapf_calls == 1 && allocations == 1);
     return 0;
 }
 """
@@ -277,7 +291,7 @@ def test_isp_init_synthetic_adt(tmp_path):
     harness = HARNESS + source + TESTS
     program = tmp_path / "isp-heap"
     subprocess.run(
-        ["cc", "-std=gnu11", "-Wall", "-Wextra", "-Werror", "-Wno-format",
+        [*host_cc(), "-std=gnu11", "-Wall", "-Wextra", "-Werror", "-Wno-format",
          "-fsanitize=address,undefined", "-x", "c", "-", "-o", str(program)],
         input=harness, text=True, check=True,
     )
@@ -296,7 +310,7 @@ def test_t8140_heap_top_must_exceed_aligned_end(tmp_path):
         assert variant != source
         program = tmp_path / f"isp-invalid-top-{top:x}"
         subprocess.run(
-            ["cc", "-std=gnu11", "-Wall", "-Wextra", "-Werror", "-Wno-format",
+            [*host_cc(), "-std=gnu11", "-Wall", "-Wextra", "-Werror", "-Wno-format",
              "-Wno-unused-function",
              "-fsanitize=address,undefined", "-x", "c", "-", "-o", str(program)],
             input=HARNESS + variant + helpers + "int main(void) { reset(); failure(); return 0; }",
@@ -385,7 +399,7 @@ int main(void)
 """
     program = tmp_path / "isp-fdt"
     subprocess.run(
-        ["cc", "-std=gnu11", "-Wall", "-Wextra", "-Werror", "-x", "c", "-",
+        [*host_cc(), "-std=gnu11", "-Wall", "-Wextra", "-Werror", "-x", "c", "-",
          "-o", str(program)], input=harness, text=True, check=True,
     )
     subprocess.run([str(program)], check=True)
@@ -439,7 +453,7 @@ int main(void)
 '''
     binary = tmp_path / "isp-firmware-admission"
     subprocess.run(
-        ["cc", "-std=gnu11", "-Wall", "-Wextra", "-Werror", "-Wno-format",
+        [*host_cc(), "-std=gnu11", "-Wall", "-Wextra", "-Werror", "-Wno-format",
          "-Wno-unused-function", "-fsanitize=address,undefined",
          "-x", "c", "-", "-o", str(binary)],
         input=HARNESS + source + helpers + matrix, text=True, check=True,

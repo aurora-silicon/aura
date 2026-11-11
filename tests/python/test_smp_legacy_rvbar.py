@@ -120,6 +120,9 @@ static u32 cpu_start_bit(int i, const struct cpu_info *cpu) {
 static void udelay(int t) { (void)t; }
 static void smp_start_t8152(void) {}
 static void smp_set_wfe_mode(bool a) { (void)a; }
+static u64 secondary_stack_top(int index) {
+  return (u64)secondary_stacks[index] + SECONDARY_STACK_SIZE;
+}
 ''' + bodies + r'''
 static void setup(int chip, bool unlocked) {
   chip_id = chip;

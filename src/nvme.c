@@ -6,23 +6,33 @@
 #include "assert.h"
 #include "malloc.h"
 #include "nvme.h"
+#include "pcie.h"
 #include "pmgr.h"
 #include "rtkit.h"
 #include "sart.h"
 #include "string.h"
 #include "utils.h"
 
-#define NVME_TIMEOUT          1000000
+#define NVME_TIMEOUT 1000000
+/*
+ * Writes and flushes (only the aura-try marker is ever written) may wait on the drive's write
+ * cache and background work after a warm reboot; Linux allows every I/O command 30 s.
+ */
+#define NVME_WRITE_TIMEOUT    30000000
 #define NVME_ENABLE_TIMEOUT   5000000
 #define NVME_SHUTDOWN_TIMEOUT 5000000
+#define NVME_SUSPEND_TIMEOUT  35000 /* macOS's, from its console */
 #define NVME_QUEUE_SIZE       64
 
-#define NVME_CC            0x14
-#define NVME_CC_SHN        GENMASK(15, 14)
-#define NVME_CC_SHN_NONE   0
-#define NVME_CC_SHN_NORMAL 1
-#define NVME_CC_SHN_ABRUPT 2
-#define NVME_CC_EN         BIT(0)
+static u32 nvme_cmd_timeout_us = NVME_TIMEOUT;
+
+#define NVME_CC             0x14
+#define NVME_CC_SHN         GENMASK(15, 14)
+#define NVME_CC_SHN_NONE    0
+#define NVME_CC_SHN_NORMAL  1
+#define NVME_CC_SHN_ABRUPT  2
+#define NVME_CC_SHN_SUSPEND 3 /* Apple: what macOS writes before a sleep */
+#define NVME_CC_EN          BIT(0)
 
 #define NVME_CSTS             0x1c
 #define NVME_CSTS_SHST        GENMASK(3, 2)
@@ -142,7 +152,12 @@ static enum {
 static bool nvme_initialized = false;
 static bool nvme_secure_regs;
 static bool nvme_reboot_required;
-bool nvme_adopt_live_session = false;
+/*
+ * Post-M4: the SART entries in use when the last owner powered ANS off. The SART loses them with
+ * ANS's power, and the firmware keeps the buffers they cover, so its next start writes them back.
+ */
+static struct sart_entry nvme_sart_saved[16];
+static int nvme_sart_saved_cnt;
 /* aura only reads the drive; only a proxy-issued flush means the drive has data to settle. */
 static bool nvme_wrote;
 bool nvme_keep_running_for_linux = false;
@@ -186,8 +201,8 @@ static u64 nvme_lsq_ctrl(void)
 
 static void nvme_log_entry_state(bool running)
 {
-    printf("nvme: entry RUN=%d BOOT_STATUS=0x%x handoff=%d\n", running,
-           read32(nvme_base + NVME_BOOT_STATUS), nvme_adopt_live_session);
+    printf("nvme: entry RUN=%d BOOT_STATUS=0x%x saved SART entries=%d\n", running,
+           read32(nvme_base + NVME_BOOT_STATUS), nvme_sart_saved_cnt);
     printf("nvme: entry CC=0x%x CSTS=0x%x AQA=0x%x IOSQ=0x%lx IOCQ=0x%lx IOQA=0x%x\n",
            read32(nvme_base + NVME_CC), read32(nvme_base + NVME_CSTS), read32(nvme_qreg(NVME_AQA)),
            nvme_read64_lo_hi(nvme_qreg(NVME_IOQ_CMDS)), nvme_read64_lo_hi(nvme_qreg(NVME_IOQ_CQES)),
@@ -278,6 +293,19 @@ static bool nvme_ctrl_shutdown(void)
     return FIELD_GET(NVME_CSTS_SHST, read32(nvme_base + NVME_CSTS)) == NVME_CSTS_SHST_DONE;
 }
 
+/* As macOS before a sleep: the suspend shutdown, EN kept, until CSTS reports it done. */
+static bool nvme_ctrl_suspend(void)
+{
+    u64 timeout = timeout_calculate(NVME_SUSPEND_TIMEOUT);
+
+    mask32(nvme_base + NVME_CC, NVME_CC_SHN, FIELD_PREP(NVME_CC_SHN, NVME_CC_SHN_SUSPEND));
+    while (FIELD_GET(NVME_CSTS_SHST, read32(nvme_base + NVME_CSTS)) != NVME_CSTS_SHST_DONE &&
+           !timeout_expired(timeout))
+        nvme_poll_syslog();
+
+    return FIELD_GET(NVME_CSTS_SHST, read32(nvme_base + NVME_CSTS)) == NVME_CSTS_SHST_DONE;
+}
+
 /*
  * Put an M1-M3 ANS to sleep and reset it, leaving it for the next owner to boot afresh: CPU
  * stopped, mailbox empty, block reset. The next stage (U-Boot, Linux) sets RUN and expects the
@@ -345,7 +373,7 @@ static bool nvme_exec_command(struct nvme_queue *q, struct nvme_command *cmd, u6
         write32(nvme_lsq_base + NVME_DB_LINEAR_IOSQ, tag);
     nvme_poll_syslog();
 
-    timeout = timeout_calculate(NVME_TIMEOUT);
+    timeout = timeout_calculate(nvme_cmd_timeout_us);
     struct nvme_completion cqe;
     while (!timeout_expired(timeout)) {
         nvme_poll_syslog();
@@ -399,6 +427,77 @@ static bool nvme_exec_command(struct nvme_queue *q, struct nvme_command *cmd, u6
     return true;
 }
 
+/* The ADT describes a post-M4 ANS: its firmware buffers outlive the stage that gave them. */
+bool nvme_post_m4(void)
+{
+    int node = adt_path_offset(adt, "/arm-io/ans");
+
+    return node >= 0 && (adt_get_property(adt, node, "nvme-secure-bar") ||
+                         adt_get_property(adt, node, "nvme-secure-reg-layout"));
+}
+
+/*
+ * Post-M4, done with ANS: stop the controller, idle the firmware as macOS does before a sleep,
+ * keep the SART entries, then power ANS and the PCIe block it runs on off. Every later stage that
+ * needs it starts it again with nvme_ans_power_on(). The firmware resumes from what it saves at
+ * the idle. On T6050 the controller step is macOS's suspend shutdown (traced); elsewhere it is
+ * disabled, as M1-M3 do.
+ */
+static bool nvme_ans_power_off(void)
+{
+    if (chip_id == T6050) {
+        if ((read32(nvme_base + NVME_CC) & NVME_CC_EN) && !nvme_ctrl_suspend())
+            printf("nvme: controller suspend timed out\n");
+    } else if (read32(nvme_base + NVME_CC) & NVME_CC_EN) {
+        if (nvme_wrote && !nvme_ctrl_shutdown())
+            printf("nvme: controller shutdown timed out\n");
+        if (!nvme_ctrl_disable())
+            printf("nvme: controller disable timed out\n");
+    }
+    nvme_sart_saved_cnt = sart_get_entries(nvme_sart, nvme_sart_saved, ARRAY_SIZE(nvme_sart_saved));
+    if (!rtkit_idle(nvme_rtkit)) {
+        printf("nvme: ANS didn't acknowledge idle, stopping it anyway\n");
+        asc_cpu_stop(nvme_asc);
+    }
+    if (pcie_ans_power_off()) {
+        printf("nvme: couldn't power ANS off; it stays down until a reboot\n");
+        return false;
+    }
+    printf("nvme: ANS powered off, %d SART entries kept\n", nvme_sart_saved_cnt);
+    return true;
+}
+
+/* Post-M4, ANS off: power, the SART entries back, then the firmware's start after a power loss. */
+static bool nvme_ans_power_on(void)
+{
+    if (pcie_ans_power_on() || !sart_set_entries(nvme_sart, nvme_sart_saved, nvme_sart_saved_cnt) ||
+        !rtkit_boot_warm(nvme_rtkit, BIT(0)) ||
+        poll32(nvme_base + NVME_BOOT_STATUS, 0xffffffff, NVME_BOOT_STATUS_OK, USEC_PER_SEC) < 0) {
+        printf("nvme: ANS didn't start from off; it stays down until a reboot\n");
+        return false;
+    }
+    nvme_boot_ticks = get_ticks();
+    printf("nvme: ANS started from off\n");
+    return true;
+}
+
+/* A write or flush, timed: the Stage 1 log then shows how close a marker spend came. */
+static bool nvme_exec_io_write(struct nvme_command *cmd, const char *what)
+{
+    u64 start = get_ticks();
+    nvme_cmd_timeout_us = NVME_WRITE_TIMEOUT;
+    bool ok = nvme_exec_command(&ioq, cmd, NULL);
+    nvme_cmd_timeout_us = NVME_TIMEOUT;
+    printf("nvme: %s %s in %lu us\n", what, ok ? "done" : "FAILED",
+           (unsigned long)ticks_to_usecs(get_ticks() - start));
+    return ok;
+}
+
+bool nvme_io_failed(void)
+{
+    return nvme_reboot_required || ioq.failed || adminq.failed;
+}
+
 bool nvme_init(void)
 {
     if (nvme_reboot_required) {
@@ -427,7 +526,7 @@ bool nvme_init(void)
     nvme_verify_bounce = NULL;
     nvme_boot_ticks = 0;
 
-    bool adopting = false;
+    bool from_off = false, earlier = false, restarted = false;
     int adt_path[8];
     int node = adt_path_offset_trace(adt, "/arm-io/ans", adt_path);
     if (node < 0) {
@@ -485,9 +584,9 @@ bool nvme_init(void)
          * On T6040/T6041 the "nvme" block really ends at 0x10000: LINEAR_SQ_CTRL and the
          * linear submission queue doorbells sit at the same offsets in the NVMMU block,
          * and the firmware enables the linear queues itself (as the Linux driver's
-         * apple,t6041-nvme-ans2 entry does).
+         * apple,t6041-nvme-ans2 entry does). T6050 has the same layout (apple,t6050-nvme-ans2).
          */
-        nvme_lsq_in_nvmmu = chip_id == T6040 || chip_id == T6041;
+        nvme_lsq_in_nvmmu = chip_id == T6040 || chip_id == T6041 || chip_id == T6050;
         u64 lsq_size = nvme_lsq_in_nvmmu ? nvmmu_size : nvme_size;
         u64 nvme_need =
             nvme_lsq_in_nvmmu ? NVME_BOOT_STATUS + sizeof(u32) : NVME_DB_LINEAR_IOSQ + sizeof(u32);
@@ -528,30 +627,24 @@ bool nvme_init(void)
     if (!nvme_asc)
         goto out_ioq;
 
-    if (nvme_type == NVME_T8132) {
+    if (nvme_type == NVME_T8132 && !nvme_secure_regs) {
+        /* ANS that an earlier owner powered off has nothing to read until its power is back. */
+        if (nvme_sart_saved_cnt && pcie_ans_power_on()) {
+            printf("nvme: couldn't power ANS back on\n");
+            goto out_asc;
+        }
         bool running = asc_cpu_running(nvme_asc);
         nvme_log_entry_state(running);
-#if defined(CHAINLOADING) && !defined(ESP_STAGE2)
-        /* Stage 1 runs straight after iBoot: a running ANS here is iBoot's
-         * session, which still needs the RTKit handshake. Only an earlier
-         * aura stage (nvme.adopt) leaves a session that can be adopted. */
-        adopting = nvme_adopt_live_session;
-#else
-        /* Older stage 1 shuts ANS down; newer stage 1 leaves a live session.
-         * Never replay RTKit's one-time handshake on the latter. */
-        adopting = nvme_adopt_live_session || (chip_id == T8132 && running);
-#endif
-        if (adopting) {
-            u32 boot_status = read32(nvme_base + NVME_BOOT_STATUS);
-            u32 csts = read32(nvme_base + NVME_CSTS);
-            if (!running || boot_status != NVME_BOOT_STATUS_OK || (csts & NVME_CSTS_CFS)) {
-                printf("nvme: cannot adopt ANS: RUN=%d BOOT_STATUS=0x%x CSTS=0x%x\n", running,
-                       boot_status, csts);
-                goto out_asc;
-            }
-            nvme_adopt_live_session = true;
-            printf("nvme: adopting the live post-M4 ANS session\n");
-            goto setup_controller;
+        /*
+         * iBoot leaves its session running before the one-time RTKit handshake, with none of the
+         * queue setup an aura stage leaves. An older aura stage passed its session on running.
+         */
+        earlier = running && (nvme_read64_lo_hi(nvmmu_base + NVMMU_ASQ_BASE) ||
+                              read32(nvme_qreg(NVME_MAX_PEND_CMDS_CTRL)));
+        from_off = !running || earlier;
+        if (from_off && !earlier && !nvme_sart_saved_cnt) {
+            printf("nvme: ANS is off and no earlier stage passed its SART entries\n");
+            goto out_asc;
         }
     }
 
@@ -563,13 +656,20 @@ bool nvme_init(void)
     if (!nvme_rtkit)
         goto out_sart;
 
-    if (!rtkit_boot(nvme_rtkit))
-        goto out_rtkit;
-    nvme_boot_ticks = get_ticks();
+    if (from_off) {
+        /* An older stage's running session is shut down first, as that stage should have. */
+        if ((earlier && !nvme_ans_power_off()) || !nvme_ans_power_on())
+            goto out_preserve;
+    } else {
+        if (!rtkit_boot(nvme_rtkit))
+            goto out_rtkit;
+        nvme_boot_ticks = get_ticks();
 
-    if (poll32(nvme_base + NVME_BOOT_STATUS, 0xffffffff, NVME_BOOT_STATUS_OK, USEC_PER_SEC) < 0) {
-        printf("nvme: ANS did not boot correctly.\n");
-        goto out_shutdown;
+        if (poll32(nvme_base + NVME_BOOT_STATUS, 0xffffffff, NVME_BOOT_STATUS_OK, USEC_PER_SEC) <
+            0) {
+            printf("nvme: ANS did not boot correctly.\n");
+            goto out_shutdown;
+        }
     }
 
 setup_controller:
@@ -590,8 +690,22 @@ setup_controller:
     write64_lo_hi(nvme_qreg(NVME_ASQ), (u64)adminq.cmds);
     write64_lo_hi(nvme_qreg(NVME_ACQ), (u64)adminq.cqes);
     write32(nvme_qreg(NVME_AQA), ((NVME_QUEUE_SIZE - 1) << 16) | (NVME_QUEUE_SIZE - 1));
-    if (!nvme_ctrl_enable()) {
-        printf("nvme: timeout while waiting for CSTS.RDY to be set\n");
+    bool ready = nvme_ctrl_enable();
+#ifdef NVME_TEST_ADOPT_RESTART
+    ready = ready && !(earlier && !restarted);
+#endif
+    if (!ready) {
+        printf("nvme: timeout while waiting for CSTS.RDY to be set: CC=0x%x CSTS=0x%x "
+               "BOOT_STATUS=0x%x\n",
+               read32(nvme_base + NVME_CC), read32(nvme_base + NVME_CSTS),
+               read32(nvme_base + NVME_BOOT_STATUS));
+        if (earlier && !restarted && chip_id == T6050) {
+            restarted = true;
+            if (!nvme_ans_power_off() || !nvme_ans_power_on())
+                goto out_preserve;
+            earlier = false;
+            goto setup_controller;
+        }
         goto out_disable_ctrl;
     }
 
@@ -644,9 +758,9 @@ out_disable_ctrl:
     nvme_ctrl_disable();
     nvme_poll_syslog();
 out_shutdown:
-    if (adopting) {
+    if (from_off) {
         /* ANS may still reference the queues if controller shutdown failed. */
-        printf("nvme: preserving adopted ANS queues after setup failure; reboot required\n");
+        printf("nvme: preserving ANS queues after setup failure; reboot required\n");
         goto out_preserve;
     }
     if (nvme_type != NVME_T8132)
@@ -686,9 +800,7 @@ out_preserve:
 
 void nvme_ensure_shutdown(void)
 {
-    int node = adt_path_offset(adt, "/arm-io/ans");
-    if (node >= 0 && (adt_get_property(adt, node, "nvme-secure-bar") ||
-                      adt_get_property(adt, node, "nvme-secure-reg-layout"))) {
+    if (nvme_post_m4()) {
         printf("nvme: refusing post-M4 ANS power-down\n");
         return;
     }
@@ -733,11 +845,6 @@ fail:
     nvme_asc = NULL;
 }
 
-bool nvme_has_live_post_m4_session(void)
-{
-    return nvme_initialized && nvme_type == NVME_T8132;
-}
-
 bool nvme_shutdown(void)
 {
     if (nvme_reboot_required) {
@@ -763,7 +870,6 @@ bool nvme_shutdown(void)
                    boot_status);
             return false;
         }
-        nvme_adopt_live_session = true;
         nvme_initialized = false;
         printf("nvme: leaving controller and RTKit running for Linux adoption\n");
         return true;
@@ -790,17 +896,24 @@ bool nvme_shutdown(void)
             goto out_preserve;
     }
 
-    /*
-     * A normal shutdown makes the drive flush its write cache, which takes about half a second
-     * on post-M4 ANS. With nothing written by this stage there is nothing to flush, and the
-     * controller disable below still stops it cleanly.
-     */
+    if (nvme_type == NVME_T8132 && !nvme_secure_regs) {
+        write64_lo_hi(nvme_qreg(NVME_IOQ_CMDS), 0);
+        write64_lo_hi(nvme_qreg(NVME_IOQ_CQES), 0);
+        if (!nvme_ans_power_off())
+            goto out_preserve;
+        /* The firmware keeps the RTKit buffers through the power loss: they stay allocated. */
+        free_queue(&ioq);
+        free_queue(&adminq);
+        nvme_initialized = false;
+        return true;
+    }
+
     u64 t_queues = get_ticks();
     /*
      * The M1-M3 firmware finishes its GC bitmap rebuild and saves its context before it stops,
      * for a normal shutdown or, without one, inside the RTKit sleep below. Skipping the shutdown
      * saves nothing there; it only moves that work (0.15 to 0.55 s, varying by boot) under the
-     * sleep handshake. Post-M4 keeps its session running, so only a stage that wrote pays there.
+     * sleep handshake. T8152 keeps its session running, so only a stage that wrote pays there.
      */
     bool normal_shutdown = nvme_wrote || nvme_type != NVME_T8132;
     if (normal_shutdown && !nvme_ctrl_shutdown()) {
@@ -815,33 +928,14 @@ bool nvme_shutdown(void)
     }
 
     if (nvme_type == NVME_T8132) {
+        /* T8152: Linux wakes ANS with a fresh RTKit handshake and neither adopts a live session
+         * nor restarts a stopped ANS. Quiesce RTKit and leave the ASC running, as iBoot does. */
         write64_lo_hi(nvme_qreg(NVME_IOQ_CMDS), 0);
         write64_lo_hi(nvme_qreg(NVME_IOQ_CQES), 0);
-#if defined(CHAINLOADING) && !defined(ESP_STAGE2)
-        /* Stage 2 and U-Boot adopt this session without servicing its mailbox
-         * (only Linux takes RTKit ownership again), so stop the IOP pushing
-         * log traffic at the AP before handing it on. Only T8132 has run
-         * this; the other M4-generation chips keep their stage 1 hand-off. */
-        if (chip_id == T8132) {
-            if (nvme_rtkit && rtkit_quiesce_ap(nvme_rtkit))
-                printf("nvme: ANS AP power quiesced for the next stage\n");
-            else
-                printf("nvme: could not quiesce ANS AP power; later stages may stall\n");
-        }
-#endif
-        if (nvme_secure_regs) {
-            /* Linux wakes the T8152 ANS with a fresh RTKit handshake and
-             * cannot adopt a live session; it neither restarts a stopped
-             * ANS. Quiesce RTKit and leave the ASC running, as iBoot does. */
-            if (!rtkit_quiesce(nvme_rtkit))
-                goto out_preserve;
-            nvme_initialized = false;
-            printf("nvme: controller disabled, RTKit quiesced\n");
-            return true;
-        }
-        nvme_adopt_live_session = true;
+        if (!rtkit_quiesce(nvme_rtkit))
+            goto out_preserve;
         nvme_initialized = false;
-        printf("nvme: controller disabled; preserving live RTKit session\n");
+        printf("nvme: controller disabled, RTKit quiesced\n");
         return true;
     }
 
@@ -870,9 +964,76 @@ bool nvme_shutdown(void)
 out_preserve:
     /* Leave every queue allocation and the live RTKit session owned. */
     nvme_reboot_required = true;
-    nvme_adopt_live_session = false;
     printf("nvme: unsafe post-M4 queue handoff; retaining DMA resources until reboot\n");
     return false;
+}
+
+/*
+ * ANS's SART entries for the next stage, and whether ANS will be off when it starts: this
+ * stage's own session unless Linux adopts it, else what an earlier stage powered off with, else
+ * a running session an older stage passed on, which the next stage receives as it is.
+ */
+int nvme_sart_entries(struct sart_entry *entries, int max, bool *off)
+{
+    *off = false;
+    if (nvme_initialized) {
+        if (nvme_type != NVME_T8132)
+            return 0;
+        *off = !nvme_secure_regs && !nvme_keep_running_for_linux;
+        return sart_get_entries(nvme_sart, entries, max);
+    }
+    if (nvme_sart_saved_cnt) {
+        *off = true;
+        memcpy(entries, nvme_sart_saved, min(max, nvme_sart_saved_cnt) * sizeof(*entries));
+        return min(max, nvme_sart_saved_cnt);
+    }
+    if (!nvme_post_m4())
+        return 0;
+    sart_dev_t *sart = sart_init("/arm-io/sart-ans");
+    int count = sart ? sart_get_entries(sart, entries, max) : 0;
+    if (sart)
+        sart_release(sart);
+    return count;
+}
+
+/* "nvme.sart=" and, per entry, (index << 8 | flags), address and size as 16 hex digits each */
+char *nvme_sart_var(void)
+{
+    static char var[sizeof("nvme.sart=") + 16 * 48];
+    struct sart_entry e[16];
+    bool off;
+    int n = nvme_sart_entries(e, ARRAY_SIZE(e), &off);
+    char *p = var + snprintf(var, sizeof(var), "nvme.sart=");
+
+    if (!off || !n)
+        return NULL;
+    for (int i = 0; i < n; i++)
+        p += snprintf(p, var + sizeof(var) - p, "%016lx%016lx%016lx",
+                      (u64)e[i].index << 8 | e[i].flags, e[i].paddr, e[i].size);
+    return var;
+}
+
+bool nvme_set_sart_var(const char *val)
+{
+    size_t len = strlen(val);
+    u64 word[3];
+
+    nvme_sart_saved_cnt = 0;
+    if (len % 48 || len / 48 > ARRAY_SIZE(nvme_sart_saved)) {
+        printf("nvme: malformed nvme.sart\n");
+        return false;
+    }
+    for (size_t i = 0; i < len / 16; i++) {
+        word[i % 3] = 0;
+        for (int d = 0; d < 16; d++) {
+            char c = val[16 * i + d];
+            word[i % 3] = word[i % 3] << 4 | (c <= '9' ? c - '0' : (c | 0x20) - 'a' + 10);
+        }
+        if (i % 3 == 2)
+            nvme_sart_saved[nvme_sart_saved_cnt++] = (struct sart_entry){
+                .index = word[0] >> 8, .flags = word[0], .paddr = word[1], .size = word[2]};
+    }
+    return true;
 }
 
 bool nvme_flush(u32 nsid)
@@ -887,7 +1048,7 @@ bool nvme_flush(u32 nsid)
     cmd.nsid = nsid;
     nvme_wrote = true;
 
-    return nvme_exec_command(&ioq, &cmd, NULL);
+    return nvme_exec_io_write(&cmd, "flush");
 }
 
 static bool nvme_submit_read(u32 nsid, u64 lba, void *buffer, u32 count, u64 prp2)
@@ -985,5 +1146,5 @@ bool nvme_write(u32 nsid, u64 lba, const void *buffer)
     /* Shut the controller down normally so it writes back its cache. */
     nvme_wrote = true;
 
-    return nvme_exec_command(&ioq, &cmd, NULL);
+    return nvme_exec_io_write(&cmd, "write");
 }

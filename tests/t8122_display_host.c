@@ -45,6 +45,7 @@
 #include "mcc.h"
 #include "pmgr.h"
 #include "soc.h"
+#include "t6050_unmodelled.h"
 #include "types.h"
 #include "utils.h"
 

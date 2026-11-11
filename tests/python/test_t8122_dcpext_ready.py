@@ -45,6 +45,12 @@ typedef uint32_t u32;
 #define bail(...) do { return -1; } while (0)
 static void *dt, *adt;
 static u32 chip_id = T8122;
+#define V26_6_2 2662
+static const struct { int version; } os_firmware = {147};
+static int dt_ext26_retain_cpu(const char *alias) { (void)alias; assert(0 && "native CPU lease on classic path"); return -1; }
+static void dt_ext26_step(const char *step) { (void)step; }
+static void dt_ext26_result(int error) { (void)error; assert(0 && "native receipt on classic path"); }
+
 static int fault, reservations;
 static unsigned char blob[32768];
 ''' + layout + r'''
@@ -106,8 +112,10 @@ static int set_u32(void *tree, int node, const char *name, uint32_t value)
 ''' + function("dt_enable_dcp_with_typec_routes") +
         function("dt_device_set_reserved_mem") + function("dt_device_add_mem_region") +
         function("dt_reserve_asc_segments") + function("dt_reserve_asc_firmware") + aliases + "\n" +
-        function("dt_display_transaction") + function("dt_reserve_dcpext_ready") +
-        function("dt_reserve_t8122_dcpext_one") +
+        function("dt_display_transaction") +
+        "static int dt_ext26_reserve(const char *alias) { return -1; }\n"
+        "static int dt_ext26_snapshot(const char *alias) { return 0; }\n" +
+        function("dt_reserve_dcpext_ready") + function("dt_reserve_t8122_dcpext_one") +
         function("dt_t8122_dcpext_armed", "static bool ") +
         function("dt_reserve_dcpext_firmware") + r'''
 static void world(void)

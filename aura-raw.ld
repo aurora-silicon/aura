@@ -27,6 +27,11 @@ SECTIONS {
          */
         *hv/hv_vm.o(.text .text.*)
         *hv/hv_sprr.o(.text .text.*)
+        *hv/hv_virtio.o(.text .text.*)
+        *hv/hv_vuart.o(.text .text.*)
+        *hv/hv_wdt.o(.text .text.*)
+        /* Run-once OS preparation also fits in this slot. */
+        *kboot.o(.text .text.*)
         /* Signature checks (secboot.c, the Ed25519 verifier): run once per boot. */
         *secboot.o(.text .text.*)
         *librust.a:*ed25519_compact*(.text .text.*)
