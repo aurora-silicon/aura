@@ -4216,8 +4216,8 @@ static int dt_set_ave(void)
 }
 
 /*
- * The M4 Pro and A18 Pro Neural Engines run firmware that iBoot preloads into
- * DRAM below the OS: /arm-io/ane0 (M4 Pro) or /arm-io/ane (A18 Pro) is
+ * The M4 Pro, M5 Pro and A18 Pro Neural Engines run firmware that iBoot preloads into
+ * DRAM below the OS: /arm-io/ane0 (M4 Pro, M5 Pro) or /arm-io/ane (A18 Pro) is
  * pre-loaded, with exactly a __TEXT and a __DATA segment range. Reserve both segments no-map and
  * give them to the ANE node as its "firmware-text" and "firmware-data" memory regions, with the
  * device addresses the firmware runs them at (their remap addresses) as apple,firmware-iovas. A DT
@@ -4233,29 +4233,40 @@ static int dt_set_ave(void)
  */
 static const char *const ane_compatibles[] = {
     "apple,t6041-ane",
+    "apple,t6050-ane",
     "apple,t8140-ane",
 };
 
 static int dt_ane_fill_region(int resv, uint32_t phandle, const char *kind, u64 phys, u64 size)
 {
     int node = fdt_node_offset_by_phandle(dt, phandle);
-    if (node < 0 || fdt_parent_offset(dt, node) != resv)
+    if (node < 0 || fdt_parent_offset(dt, node) != resv) {
+        printf("FDT: ANE %s reservation: phandle %u at %d, parent %d, not /reserved-memory %d\n",
+               kind, phandle, node, node < 0 ? node : fdt_parent_offset(dt, node), resv);
         return -1;
+    }
 
     char name[48];
     snprintf(name, sizeof(name), "ane-firmware-%s@%lx", kind, phys);
     int other = fdt_subnode_offset(dt, resv, name);
-    if (other >= 0 && other != node)
+    if (other >= 0 && other != node) {
+        printf("FDT: ANE %s reservation: %s exists\n", kind, name);
         return -1;
+    }
 
     u64 reg[2] = {cpu_to_fdt64(phys), cpu_to_fdt64(size)};
-    if (fdt_setprop(dt, node, "reg", reg, sizeof(reg)) || fdt_setprop_empty(dt, node, "no-map") ||
-        fdt_setprop_string(dt, node, "status", "okay"))
-        return -1;
-    node = fdt_node_offset_by_phandle(dt, phandle);
-    if (node < 0 || fdt_set_name(dt, node, name))
-        return -1;
-    return 0;
+    int ret = fdt_setprop(dt, node, "reg", reg, sizeof(reg));
+    if (!ret)
+        ret = fdt_setprop_empty(dt, node, "no-map");
+    if (!ret)
+        ret = fdt_setprop_string(dt, node, "status", "okay");
+    if (!ret) {
+        node = fdt_node_offset_by_phandle(dt, phandle);
+        ret = node < 0 ? node : fdt_set_name(dt, node, name);
+    }
+    if (ret)
+        printf("FDT: ANE %s reservation: %s\n", kind, fdt_strerror(ret));
+    return ret ? -1 : 0;
 }
 
 /*
@@ -4378,10 +4389,13 @@ static int dt_set_ane_node(int node, const char *compat)
     return 0;
 
 disable:
-    node = fdt_node_offset_by_compatible(dt, -1, compat);
-    if (node < 0 || fdt_setprop_string(dt, node, "status", "disabled"))
-        return -1;
     printf("FDT: ANE disabled: %s\n", reason);
+    node = fdt_node_offset_by_compatible(dt, -1, compat);
+    int ret = node < 0 ? node : fdt_setprop_string(dt, node, "status", "disabled");
+    if (ret) {
+        printf("FDT: ANE: %s: status not set: %s\n", path, fdt_strerror(ret));
+        return -1;
+    }
     return 0;
 }
 
