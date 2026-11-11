@@ -1207,11 +1207,10 @@ static T6050_ATC_INIT void t6050_setup_atc(void *dt)
  */
 static bool t6041_max_atc(void *dt)
 {
-    return chip_id == T6041 &&
-           ((adt_is_compatible(adt, 0, "J614cAP") &&
-             !fdt_node_check_compatible(dt, 0, "apple,j614c")) ||
-            (adt_is_compatible(adt, 0, "J616cAP") &&
-             !fdt_node_check_compatible(dt, 0, "apple,j616c")));
+    return chip_id == T6041 && ((adt_is_compatible(adt, 0, "J614cAP") &&
+                                 !fdt_node_check_compatible(dt, 0, "apple,j614c")) ||
+                                (adt_is_compatible(adt, 0, "J616cAP") &&
+                                 !fdt_node_check_compatible(dt, 0, "apple,j616c")));
 }
 
 int kboot_setup_atc(void *dt)
