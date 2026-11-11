@@ -4018,19 +4018,25 @@ disable:
  * the GPU, the GPU last. On any mismatch they all stay disabled and the rest of the boot
  * (simpledrm, DCP) is unaffected. Built for size, in .init's and .text's last free bytes; there
  * is no room for apple,firmware-version, which Linux only takes as a hint here.
+ *
+ * T6050 G17D (M5 Ultra, J775D, 27.0) is the same handoff with its own build: GFX1's __TEXT is
+ * 0x4000 longer, so its fw-text is 0xa8000 and GFX1's boot-filled ranges move with it. The G17S
+ * builds are tried as before. The G17D build is tried only when the ADT puts GFX1's __TEXT right
+ * after GFX's and the two reach 0xa8000, so its check reads no further than the loaded TEXT.
  */
 #define T6050_GPU_INIT    __attribute__((minsize, noinline, section(".init.t6050gpu")))
 #define T6050_GPU_TEXT_FN __attribute__((minsize, noinline))
-#define T6050_GPU_TEXT    0xa4000
+#define T6050_GPU_TEXT    0xa4000 /* G17S */
+#define T6050_GPU_TEXT_D  0xa8000 /* G17D, the largest */
 #define T6050_GPU_DATA    0x184000
 
 static const struct {
     const char *props[11], *resv[6], *on[7];
     struct {
-        u32 fill[8][2];
+        u32 text, fill[8][2]; /* fw-text's size, its boot-filled ranges */
         u8 sha[32];
-        char name[8];
-    } build[2];
+        char name[8], gpu; /* G17<gpu> for the log */
+    } build[3];
 } t6050_gpu = {
     /* The UAT ranges (base, size), then the bounds of both roles' __DATA and SRO */
     {"gpu-region-base", "gpu-region-size", "gfx-shared-region-base", "gfx-shared-region-size",
@@ -4046,7 +4052,8 @@ static const struct {
      "/soc/mailbox@2302e00000", "gpu"},
     /* Each build's boot-filled ranges and digest, both roles: Linux's hw/t6050.rs CONFIG */
     {/* 26A428 (27.0) G17S, J714s */
-     {{{0x224, 4},
+     {T6050_GPU_TEXT,
+      {{0x224, 4},
        {0x23c, 8},
        {0x49720, 0x740},
        {0x49e60, 0x231},
@@ -4057,12 +4064,14 @@ static const struct {
       {0x85, 0xd0, 0xfd, 0x82, 0x80, 0xf7, 0x24, 0x65, 0x5c, 0xa9, 0xa9,
        0x71, 0x7b, 0xc9, 0x1a, 0x8a, 0x5e, 0xf6, 0x09, 0x28, 0xd7, 0x72,
        0x00, 0xf6, 0xd5, 0x3b, 0xd0, 0x99, 0xb9, 0x47, 0x39, 0xc6},
-      "26A428"},
+      "26A428",
+      'S'},
      /*
       * 26B8125 (27.2) G17S, the K114/K116 restore image, which iBoot loads on the K116s: the
       * same sizes and records as 26A428, its entropy records 0x44 and 0x14 bytes further in
       */
-     {{{0x224, 4},
+     {T6050_GPU_TEXT,
+      {{0x224, 4},
        {0x23c, 8},
        {0x49764, 0x740},
        {0x49ea4, 0x231},
@@ -4073,7 +4082,23 @@ static const struct {
       {0xaf, 0x68, 0xd0, 0x34, 0xa3, 0xf0, 0x06, 0xb4, 0x3d, 0xab, 0x66,
        0x1b, 0x82, 0x5f, 0x12, 0x59, 0x8c, 0xb8, 0x6e, 0x4d, 0x2a, 0x0e,
        0x38, 0x44, 0xf1, 0x4f, 0xa5, 0x05, 0x9f, 0x38, 0xf6, 0xcb},
-      "26B8125"}},
+      "26B8125",
+      'S'},
+     /* 26A428 (27.0) G17D, J775D: Linux's hw/t6050.rs CONFIG_ULTRA */
+     {T6050_GPU_TEXT_D,
+      {{0x224, 4},
+       {0x23c, 8},
+       {0x49720, 0x740},
+       {0x49e60, 0x231},
+       {0x50224, 4},
+       {0x5023c, 8},
+       {0xa11d8, 0x740},
+       {0xa1918, 0x231}},
+      {0xc3, 0x53, 0x54, 0x40, 0x76, 0x02, 0x48, 0x44, 0x04, 0xaa, 0x6f,
+       0xc9, 0x46, 0xcd, 0xd2, 0x4c, 0xb8, 0x2c, 0x64, 0xa8, 0xbb, 0xd1,
+       0x07, 0xa4, 0x94, 0x79, 0xa0, 0x8c, 0xe9, 0xcc, 0x82, 0x51},
+      "26A428",
+      'D'}},
 };
 extern void aura_sha256(const void *data, size_t size, u8 digest[32]);
 
@@ -4099,22 +4124,34 @@ static T6050_GPU_TEXT_FN int t6050_gpu_check(void *dt, u64 r[12])
                          sizeof(seg)) != sizeof(seg) ||
         seg[4] != r[8] || r[9] + r[10] != r[8] + T6050_GPU_DATA)
         return 0;
+    u64 seg1[12]; /* GFX1's, the same layout; [3]'s low half is a __TEXT's size */
+    /* The G17D build only if GFX1's __TEXT follows GFX's and the two reach its size */
+    u32 limit = T6050_GPU_TEXT;
+    if (adt_getprop_copy(adt, adt_path_offset(adt, "/arm-io/gfx1-asc"), "segment-ranges", seg1,
+                         sizeof(seg1)) == sizeof(seg1) &&
+        seg1[0] > seg[0] && seg1[0] - seg[0] == (u32)seg[3] &&
+        seg1[0] - seg[0] + (u32)seg1[3] >= T6050_GPU_TEXT_D)
+        limit = T6050_GPU_TEXT_D;
     r[10] = r[8];
     r[11] = T6050_GPU_DATA;
     r[8] = seg[0];
-    r[9] = T6050_GPU_TEXT;
 
-    u8 *copy = malloc(T6050_GPU_TEXT), digest[32];
+    u8 *copy = malloc(limit), digest[32];
     if (!copy)
         return 1;
     int ret = 1;
     for (size_t b = 0; ret == 1 && b < ARRAY_SIZE(t6050_gpu.build); b++) {
-        memcpy(copy, (const void *)seg[0], T6050_GPU_TEXT);
+        u32 text = t6050_gpu.build[b].text;
+        if (text > limit)
+            continue;
+        memcpy(copy, (const void *)seg[0], text);
         for (int i = 0; i < 8; i++)
             memset(copy + t6050_gpu.build[b].fill[i][0], 0, t6050_gpu.build[b].fill[i][1]);
-        aura_sha256(copy, T6050_GPU_TEXT, digest);
-        if (!memcmp(digest, t6050_gpu.build[b].sha, sizeof(digest)))
+        aura_sha256(copy, text, digest);
+        if (!memcmp(digest, t6050_gpu.build[b].sha, sizeof(digest))) {
+            r[9] = text;
             ret = 2 + b;
+        }
     }
     free(copy);
     return ret;
@@ -4186,8 +4223,8 @@ static T6050_GPU_INIT int dt_set_gpu_t6050(void *dt)
                min(step, 2));
         return 0;
     }
-    printf("FDT: GPU: T6050 G17S %s enabled, fw-text at %#lx\n", t6050_gpu.build[step - 2].name,
-           r[8]);
+    printf("FDT: GPU: T6050 G17%c %s enabled, fw-text at %#lx\n", t6050_gpu.build[step - 2].gpu,
+           t6050_gpu.build[step - 2].name, r[8]);
     /*
      * The driver tries the build of the reported release first. Without the hint it walks its
      * table in order and logs each earlier build as not admitted before it finds this one.
