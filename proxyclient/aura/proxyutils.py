@@ -562,9 +562,14 @@ class GuardedHeap:
             self._free(ptr)
         self.ptrs = set()
 
+# How long bootstrap_port() waits for the first reply. Links that bridge the
+# console through USB (KIS/DockChannel via kisd) can take well over 150 ms to
+# answer the first request. Override with AURA_BOOTSTRAP_TIMEOUT (seconds).
+BOOTSTRAP_TIMEOUT = 3.0
+
 def bootstrap_port(iface, proxy):
     to = iface.dev.timeout
-    iface.dev.timeout = 0.15
+    iface.dev.timeout = float(os.environ.get("AURA_BOOTSTRAP_TIMEOUT", BOOTSTRAP_TIMEOUT))
     try:
         do_baud = proxy.iodev_whoami() == IODEV.UART
     except ProxyCommandError:
