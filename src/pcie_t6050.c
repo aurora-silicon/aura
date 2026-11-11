@@ -650,8 +650,8 @@ static int sdreader_power(const struct port_regs *pp)
         ADT_GETPROP(adt, smc_node, "AAPL,phandle", &phandle) < 0)
         FAIL("SD reader power function missing\n");
     memcpy(fn, prop, sizeof(fn));
-    if (fn[0] != phandle || memcmp(&fn[1], "8WKp", 4) ||
-        fn[2] != 0x7063494f || fn[3] != 0 || fn[4] != 0x190000)
+    if (fn[0] != phandle || memcmp(&fn[1], "8WKp", 4) || fn[2] != 0x7063494f || fn[3] != 0 ||
+        fn[4] != 0x190000)
         FAIL("SD reader power function differs\n");
     smc_dev_t *smc = smc_init();
     if (!smc)
