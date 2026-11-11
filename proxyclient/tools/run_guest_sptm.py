@@ -112,6 +112,7 @@ CONFIG_FLAGS = {
     "AURA_S2R_DROP_USB": 1 << 4,
     "AURA_XNU_BT": 1 << 5,
     "AURA_GPU_TRACE": 1 << 6,
+    "AURA_J613_TRACE": 1 << 11,
     "AURA_SAMPLE": 1 << 7,
     "AURA_S2R_MEM": 1 << 8,
     # bit 9 is reserved for AURA_AURACTL in the feat/auractl runner
@@ -830,6 +831,21 @@ def main():
 
     # SPTM's managed window, as aura computed it: above aura and everything iBoot left low,
     # below aura's carve-out.
+    chip = u.adt["/chosen"].chip_id
+    if chip == 0x8122:
+        from aura import sptm_j613
+        sptm_j613.validate_resources(lambda path, idx: u.adt[path].get_reg(idx))
+        if not env_on("AURA_J613_TRACE"):
+            raise SystemExit("T8122 requires experimental AURA_J613_TRACE=1")
+        if any(env_on(k) for k in CONFIG_FLAGS if k != "AURA_J613_TRACE"):
+            raise SystemExit("J613: other trace/sleep modes are not qualified")
+        # Deliberately before reading images or placing anything on the target.
+        try:
+            sptm_j613.patch_plan(None, None)
+        except ValueError as e:
+            raise SystemExit(str(e))
+    elif env_on("AURA_J613_TRACE"):
+        raise SystemExit("AURA_J613_TRACE requires T8122")
     scratch = u.malloc(0x40)
     if p.call(sym["sptm_virt_place"], scratch) != 0:
         raise SystemExit("sptm_virt_place failed: not an SPTM_VIRT build, no FEAT_NV2 or GXF, or "
@@ -904,7 +920,8 @@ def main():
     quirk_hide = tuple(quirks["hide"])
     if env_on("AURA_KEEP_WIFI"):
         quirk_hide = tuple(n for n in quirk_hide if n in port_nodes)
-    hide = port_nodes + (() if env_on("AURA_KEEP_ANE") else STRIP_NODES) + quirk_hide
+    keep_ane = env_on("AURA_KEEP_ANE") or (chip == 0x8122 and env_on("AURA_J613_TRACE"))
+    hide = port_nodes + (() if keep_ane else STRIP_NODES) + quirk_hide
     if not env_on("AURA_KEEP_ERRH"):
         hide += (ERROR_HANDLER,)
     if env_on("AURA_HIDE_DOCKCHANNEL"):
