@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: MIT
-"""The M4 Pro and A18 Pro ANE preload handoff: reservations, memory regions and firmware IOVAs.
+"""The M4 Pro, M5 Pro and A18 Pro ANE preload handoff: reservations, memory regions and firmware
+IOVAs.
 
 Runs kboot.c's dt_set_ane_firmware(), dt_set_ane_node(), dt_ane_fill_region() and
 dt_get_or_add_reserved_mem() as they are, on real FDTs built with aura's libfdt, against a
-fake ADT. Segment values are the J616s 26.6.2 /arm-io/ane0 and the Neo (J700) 26.6.2
-/arm-io/ane segment-ranges.
+fake ADT. Segment values are the J616s 26.6.2 /arm-io/ane0, the Neo (J700) 26.6.2 /arm-io/ane
+and the J714s 27.0 /arm-io/ane0 segment-ranges. The J714s DT also has a soc@200000000 ahead of
+the /soc that holds the ANE, which libfdt resolves "/soc" to.
 """
 
 from pathlib import Path
@@ -17,9 +19,12 @@ ROOT = Path(__file__).resolve().parents[2]
 
 BOARDS = {
     "j616s": dict(compat="apple,t6041-ane", node="ane@484000000", adt="/arm-io/ane0",
-                  text=0x100009D8000, data=0x1000196C000),
+                  text=0x100009D8000, data=0x1000196C000, phys_base=0x10002000000, sibling=0),
     "j700": dict(compat="apple,t8140-ane", node="ane@400000000", adt="/arm-io/ane",
-                 text=0x10000768000, data=0x100019A0000),
+                 text=0x10000768000, data=0x100019A0000, phys_base=0x10002000000, sibling=0),
+    "j714s": dict(compat="apple,t6050-ane", node="neural-processor@508000000",
+                  adt="/arm-io/ane0", text=0x10000DC0000, data=0x10002114000,
+                  phys_base=0x10003B40000, sibling=1),
 }
 
 
@@ -32,7 +37,7 @@ def test_ane_preload_handoff(tmp_path, board):
         start = source.index("static int " + name + "(")
         return source[start:source.index("\n}", start) + 2] + "\n"
 
-    start = source.index("/*\n * The M4 Pro and A18 Pro Neural Engines")
+    start = source.rindex("/*\n", 0, source.index("Neural Engines run firmware that iBoot preloads"))
     end = source.index("\n}", source.index("static int dt_set_ane_firmware(void)")) + 2
     production = function("dt_get_or_add_reserved_mem") + source[start:end] + "\n"
     header = (ROOT / "src/adt.h").read_text()
@@ -56,7 +61,7 @@ typedef uint32_t u32;
 static void *dt, *adt;
 static bool el2 = true;
 static bool in_el2(void) { return el2; }
-static struct { u64 phys_base; } cur_boot_args = { 0x10002000000UL };
+static struct { u64 phys_base; } cur_boot_args = { @PHYS_BASE@UL };
 ''' + layout + r'''
 static struct adt_segment_ranges segments[2];
 static const char *segment_names;
@@ -156,11 +161,20 @@ static void build(bool placeholders, const char *status, bool ane)
         assert(!fdt_setprop(dt, n, "memory-region", regions, sizeof(regions)));
         assert(!fdt_setprop(dt, n, "memory-region-names", "firmware-text\0firmware-data", 28));
     }
+    /* Added last, so it comes first: "/soc" now resolves to it, as on T6050. */
+    if (@SIBLING@)
+        assert(fdt_add_subnode(dt, 0, "soc@200000000") >= 0);
+}
+
+/* By compatible: with a soc@ sibling, "/soc/..." is not the ANE's path. */
+static int ane_node(void)
+{
+    return fdt_node_offset_by_compatible(dt, -1, "@COMPAT@");
 }
 
 static const char *status(void)
 {
-    return fdt_getprop(dt, fdt_path_offset(dt, "/soc/@NODE@"), "status", NULL);
+    return fdt_getprop(dt, ane_node(), "status", NULL);
 }
 
 static void check_region(const fdt32_t *regions, int i, const char *name, u64 phys, u64 size)
@@ -184,7 +198,7 @@ static const char *marker(void)
 
 static void check_handoff(const char *want_status)
 {
-    int ane = fdt_path_offset(dt, "/soc/@NODE@");
+    int ane = ane_node();
     int len;
     const char *m = fdt_getprop(dt, fdt_path_offset(dt, "/chosen"), "apple,ane-cold-boot", &len);
     assert(m && len == 28 && !strcmp(m, "raw-no-xnu-ane-untouched-v1"));
@@ -217,8 +231,7 @@ static void check_refused(void (*fault)(void), const char *what)
             count++;
         }
         assert(count == (form ? 2 : 0));
-        assert(!fdt_getprop(dt, fdt_path_offset(dt, "/soc/@NODE@"),
-                            "apple,firmware-iovas", NULL));
+        assert(!fdt_getprop(dt, ane_node(), "apple,firmware-iovas", NULL));
         assert(!marker());
         printf("refused (%s, %s DT): ok\n", what, form ? "placeholder" : "older");
     }
@@ -282,7 +295,7 @@ int main(void)
     build(true, "okay", true);
     assert(dt_set_ane_firmware() == 0);
     assert(!marker());
-    assert(fdt_getprop(dt, fdt_path_offset(dt, "/soc/@NODE@"), "apple,firmware-iovas", NULL));
+    assert(fdt_getprop(dt, ane_node(), "apple,firmware-iovas", NULL));
     printf("EL1 guest: regions handed over, no cold-boot marker: ok\n");
 
     check_refused(no_ane0, "no ADT node");
@@ -301,12 +314,11 @@ int main(void)
     /* A placeholder phandle outside /reserved-memory is refused. */
     reset_adt();
     build(true, "okay", true);
-    int soc = fdt_path_offset(dt, "/soc");
+    int soc = fdt_parent_offset(dt, ane_node());
     int stray = fdt_add_subnode(dt, soc, "stray");
     assert(stray >= 0 && !fdt_setprop_u32(dt, stray, "phandle", 0x20));
     fdt32_t regions[2] = {cpu_to_fdt32(0x10), cpu_to_fdt32(0x20)};
-    assert(!fdt_setprop(dt, fdt_path_offset(dt, "/soc/@NODE@"), "memory-region", regions,
-                        sizeof(regions)));
+    assert(!fdt_setprop(dt, ane_node(), "memory-region", regions, sizeof(regions)));
     assert(dt_set_ane_firmware() == 0);
     assert(!strcmp(status(), "disabled"));
     printf("stray placeholder refused: ok\n");
@@ -315,6 +327,7 @@ int main(void)
 '''
     for key, value in (("@ADT@", b["adt"]), ("@COMPAT@", b["compat"]), ("@NODE@", b["node"]),
                        ("@TEXTN@", "%x" % b["text"]), ("@DATAN@", "%x" % b["data"]),
-                       ("@TEXT@", "0x%x" % b["text"]), ("@DATA@", "0x%x" % b["data"])):
+                       ("@TEXT@", "0x%x" % b["text"]), ("@DATA@", "0x%x" % b["data"]),
+                       ("@PHYS_BASE@", "0x%x" % b["phys_base"]), ("@SIBLING@", str(b["sibling"]))):
         program = program.replace(key, value)
     run_c(tmp_path, "ane-preload-" + board, program)
