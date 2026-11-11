@@ -7513,6 +7513,8 @@ static const struct pmp_device_dvfs_policy pmp_device_dvfs_policies[] = {
     {"pmp-venc-sys", "VENC-SOC-VMAX", "VENC-AVE-VMAX", "VENC-SOC-VMAX"},
     {"pmp-avd-sys", "AVD-SOC-VMAX", NULL, NULL},
     {"pmp-jpg", "JPG-SOC-VNOM", "JPG1-SOC-VNOM", NULL},
+    {"pmp-msr0", "MSR0-AVMSR-VMAX", NULL, NULL},
+    {"pmp-scodec", "SCODEC-SOC-VMAX", NULL, NULL},
 };
 
 static u32 adt_pmp_u32(const u8 *p)

@@ -32,7 +32,7 @@ typedef uint32_t u32;
 
 static unsigned char tree[16384];
 static void *dt = tree, *adt;
-static u8 ptd[32 * 3], soc[0x7c * 40], devices[48 * 8];
+static u8 ptd[32 * 3], soc[0x7c * 40], devices[48 * 12];
 static u32 ptd_len, soc_len, devices_len;
 static bool have_nub = true, have_pmgr = true;
 
@@ -122,6 +122,10 @@ static void world(void)
     add_perf(3, 0x12, 6, 0x20, 0x20, "JPG-SOC-VNOM");
     add_perf(4, 0x12, 7, 0x20, 0x20, "JPG-SOC-VMAX");
     add_perf(5, 0x12, 6, 0x20, 0x20, "JPG1-SOC-VNOM");
+    add_perf(6, 0x12, 2, 0x20, 0x1b, "MSR0-AVMSR-VMD2");
+    add_perf(7, 0x12, 3, 0x20, 0x1b, "MSR0-AVMSR-VMAX");
+    add_perf(8, 0x12, 1, 0x20, 0x1c, "SCODEC-SOC-VNOM");
+    add_perf(9, 0x12, 2, 0x20, 0x1c, "SCODEC-SOC-VMAX");
 }
 
 static void cells(int node, const char *name, const u32 *expected, unsigned int count)
@@ -139,6 +143,8 @@ int main(void)
     int venc = add_report("report@1c", 0x1c, "pmp-venc-sys");
     int avd = add_report("report@1d", 0x1d, "pmp-avd-sys");
     int jpg = add_report("report@1f", 0x1f, "pmp-jpg");
+    int msr = add_report("report@1a", 0x1a, "pmp-msr0");
+    int scodec = add_report("report@1b", 0x1b, "pmp-scodec");
     /* An entry that does not ask for ADT data keeps its own properties. */
     int other = add_report("report@1e", 0x1d, "pmp-avd-sys");
     assert(!fdt_delprop(dt, other, "apple,adt-dvfs"));
@@ -146,9 +152,14 @@ int main(void)
     const u32 venc_dvfs[] = {0x51, 5}, venc_levels[] = {0x21, 5};
     const u32 avd_dvfs[] = {0x52, 0}, avd_levels[] = {0x21, 4};
     const u32 jpg_dvfs[] = {0x54, 0}, jpg_levels[] = {0x21, 6};
+    /* Only the named VMAX sources: the scaler's VMD2 and the codec's VNOM are ignored. */
+    const u32 msr_dvfs[] = {0x4f, 0}, msr_levels[] = {0x21, 3};
+    const u32 scodec_dvfs[] = {0x50, 0}, scodec_levels[] = {0x21, 2};
     venc = fdt_path_offset(dt, "/report/report@1c");
     avd = fdt_path_offset(dt, "/report/report@1d");
     jpg = fdt_path_offset(dt, "/report/report@1f");
+    msr = fdt_path_offset(dt, "/report/report@1a");
+    scodec = fdt_path_offset(dt, "/report/report@1b");
     other = fdt_path_offset(dt, "/report/report@1e");
     assert(!fdt_getprop(dt, other, "apple,dvfs", NULL));
     assert(!fdt_getprop(dt, other, "apple,dvfs-request-levels", NULL));
@@ -159,6 +170,10 @@ int main(void)
     cells(avd, "apple,dvfs-request-levels", avd_levels, ARRAY_SIZE(avd_levels));
     cells(jpg, "apple,dvfs", jpg_dvfs, ARRAY_SIZE(jpg_dvfs));
     cells(jpg, "apple,dvfs-request-levels", jpg_levels, ARRAY_SIZE(jpg_levels));
+    cells(msr, "apple,dvfs", msr_dvfs, ARRAY_SIZE(msr_dvfs));
+    cells(msr, "apple,dvfs-request-levels", msr_levels, ARRAY_SIZE(msr_levels));
+    cells(scodec, "apple,dvfs", scodec_dvfs, ARRAY_SIZE(scodec_dvfs));
+    cells(scodec, "apple,dvfs-request-levels", scodec_levels, ARRAY_SIZE(scodec_levels));
     assert(!fdt_getprop(dt, venc, "apple,dvfs-request-class", NULL));
 
     /* The compact PMGR class encoding used by T8112 maps 0x52 to class 0x25. */
