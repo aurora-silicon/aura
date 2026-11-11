@@ -3823,18 +3823,13 @@ static int dt_vram_reserved_region(const char *dcp_alias, const char *disp_alias
  * Reserve the firmware segments of an ASC coprocessor from its ADT
  * segment-ranges and attach them to its FDT node. With dram_only, segments
  * outside DRAM (such as the coprocessor's own SRAM, which the OS maps as MMIO)
- * are left out.
+ * are left out. The device node is found again by its phandle after each edit, so a caller can
+ * pass a node whose path does not resolve back to it (on T6050 "/soc" resolves to /soc@200000000).
  */
-static int dt_reserve_asc_segments(const char *adt_path, const char *adt_path_alt,
-                                   const char *fdt_path, bool remap, u64 base, bool dram_only)
+static int dt_reserve_asc_segments_at(int fdt_node, const char *adt_path, const char *adt_path_alt,
+                                      const char *fdt_path, bool remap, u64 base, bool dram_only)
 {
     int ret = 0;
-
-    int fdt_node = fdt_path_offset(dt, fdt_path);
-    if (fdt_node < 0) {
-        printf("FDT: '%s' not found\n", fdt_path);
-        return 0;
-    }
 
     int node = adt_path_offset(adt, adt_path);
     if (node < 0 && adt_path_alt)
@@ -3911,12 +3906,24 @@ static int dt_reserve_asc_segments(const char *adt_path, const char *adt_path_al
         if (ret < 0)
             return ret;
 
-        ret = dt_device_add_mem_region(fdt_path, mem_phandle, NULL);
-        if (ret < 0)
-            return ret;
+        int dev_node = fdt_node_offset_by_phandle(dt, dev_phandle);
+        if (dev_node < 0 || fdt_appendprop_u32(dt, dev_node, "memory-region", mem_phandle))
+            bail("FDT: failed to append to '%s' memory-region\n", fdt_path);
     }
 
     return 0;
+}
+
+static int dt_reserve_asc_segments(const char *adt_path, const char *adt_path_alt,
+                                   const char *fdt_path, bool remap, u64 base, bool dram_only)
+{
+    int fdt_node = fdt_path_offset(dt, fdt_path);
+    if (fdt_node < 0) {
+        printf("FDT: '%s' not found\n", fdt_path);
+        return 0;
+    }
+    return dt_reserve_asc_segments_at(fdt_node, adt_path, adt_path_alt, fdt_path, remap, base,
+                                      dram_only);
 }
 
 static int dt_reserve_asc_firmware(const char *adt_path, const char *adt_path_alt,
@@ -3932,10 +3939,7 @@ static int dt_reserve_asc_firmware(const char *adt_path, const char *adt_path_al
  * it takes.
  */
 static const char *const ave_compatibles[] = {
-    "apple,t6000-ave",
-    "apple,t8112-ave",
-    "apple,t8140-ave",
-    "apple,t6041-ave",
+    "apple,t6000-ave", "apple,t8112-ave", "apple,t8140-ave", "apple,t6041-ave", "apple,t6050-ave",
 };
 
 /*
@@ -3969,7 +3973,7 @@ static int dt_ave_dart_instance(int *adt_dart_path, int dart)
  * AVE's DART setup is selected by the machine's ADT. Convert its register
  * tunables to the normal Linux triples without logging their contents.
  */
-static int dt_copy_ave_tunables(const char *ave_path)
+static int dt_copy_ave_tunables(const char *compat)
 {
     const char *dart_path = "/arm-io/dart-ave";
     int adt_dart_path[8] = {0};
@@ -3977,7 +3981,7 @@ static int dt_copy_ave_tunables(const char *ave_path)
     u32 phandles[2];
     bool wrote_dart[2] = {false, false};
     bool wrote_axi = false;
-    int ave = fdt_path_offset(dt, ave_path);
+    int ave = fdt_node_offset_by_compatible(dt, -1, compat);
     int len;
 
     if (ave < 0)
@@ -4029,7 +4033,7 @@ static int dt_copy_ave_tunables(const char *ave_path)
             goto err;
     }
 
-    ave = fdt_path_offset(dt, ave_path);
+    ave = fdt_node_offset_by_compatible(dt, -1, compat);
     if (ave < 0)
         goto err;
 
@@ -4049,14 +4053,18 @@ err:
         if (wrote_dart[i] && dart >= 0)
             fdt_delprop(dt, dart, "apple,tunable");
     }
-    ave = fdt_path_offset(dt, ave_path);
+    ave = fdt_node_offset_by_compatible(dt, -1, compat);
     if (wrote_axi && ave >= 0)
         fdt_delprop(dt, ave, "apple,tunable-axi2af");
     printf("FDT: unable to hand AVE its ADT tunables\n");
     return -1;
 }
 
-static int dt_set_ave_node(int node)
+/*
+ * The node is found again by its compatible after each edit, never by its path: on T6050 "/soc"
+ * resolves to /soc@200000000, a sibling of the /soc that holds the encoder.
+ */
+static int dt_set_ave_node(int node, const char *compat)
 {
     char path[64];
     if (fdt_get_path(dt, node, path, sizeof(path)))
@@ -4141,7 +4149,8 @@ static int dt_set_ave_node(int node)
      * M4-generation encoders keep running at their remap addresses.
      */
     bool use_remap = !fdt_node_check_compatible(dt, node, "apple,t8140-ave") ||
-                     !fdt_node_check_compatible(dt, node, "apple,t6041-ave");
+                     !fdt_node_check_compatible(dt, node, "apple,t6041-ave") ||
+                     !fdt_node_check_compatible(dt, node, "apple,t6050-ave");
     /*
      * On T8112 the encoder's DART window starts at the DART's vm-base: iBoot points the
      * coprocessor code base there, and the firmware addresses DATA at vm-base plus its
@@ -4168,7 +4177,7 @@ static int dt_set_ave_node(int node)
             goto disable;
         }
     }
-    if (dt_reserve_asc_firmware(adt_path, NULL, path, use_remap, dva_base)) {
+    if (dt_reserve_asc_segments_at(node, adt_path, NULL, path, use_remap, dva_base, false)) {
         reason = "firmware reservation failed";
         goto disable;
     }
@@ -4182,14 +4191,14 @@ static int dt_set_ave_node(int node)
             goto disable;
         }
     }
-    if (dt_copy_ave_tunables(path)) {
+    if (dt_copy_ave_tunables(compat)) {
         reason = "ADT tunable handoff failed";
         goto disable;
     }
     return 0;
 
 disable:
-    node = fdt_path_offset(dt, path);
+    node = fdt_node_offset_by_compatible(dt, -1, compat);
     if (node >= 0 && fdt_setprop_string(dt, node, "status", "disabled"))
         return -1;
     printf("FDT: AVE disabled: %s\n", reason);
@@ -4201,7 +4210,7 @@ static int dt_set_ave(void)
     for (size_t i = 0; i < ARRAY_SIZE(ave_compatibles); i++) {
         int node = fdt_node_offset_by_compatible(dt, -1, ave_compatibles[i]);
         if (node >= 0)
-            return dt_set_ave_node(node);
+            return dt_set_ave_node(node, ave_compatibles[i]);
     }
     return 0;
 }
