@@ -387,6 +387,9 @@ static void sptm_virt_amcc_watch(void)
 {
     u64 base, stride;
     int count;
+    /* The plane offsets above are T8142's; other chips keep their AMCC unhooked. */
+    if (chip_id != T8142)
+        return;
     if (mcc_plane_info(0, &base, &stride, &count) < 0) {
         printf("SPTM-virt[amcc]: no AMCC planes; not watched\n");
         return;
