@@ -436,7 +436,7 @@ static const struct dcp_soc dcp_soc_t6041 = {
  * as on the J616s. Same 26.6.2 firmware gate and no opt-in.
  */
 static const char *const dcp_boards_t6041_max[] = {"apple,j616c", "apple,j614c", "apple,j575c",
-                                                    NULL};
+                                                   NULL};
 
 static const struct dcp_soc dcp_soc_t6041_max = {
     .name = "T6041",
