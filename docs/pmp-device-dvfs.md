@@ -5,14 +5,16 @@ used to boot the machine. It does not carry a SoC/model table of request entry
 numbers or levels.
 
 For each Linux PMP report entry that carries the boolean `apple,adt-dvfs` and
-whose `label` identifies VENC, AVD or JPEG, Stage 2 uses the report `reg` as the PMP soc-device ID minus one. It then:
+whose `label` identifies VENC, AVD, JPEG, the scaler (MSR0) or the ProRes codec
+(SCODEC), Stage 2 uses the report `reg` as the PMP soc-device ID minus one. It then:
 
 1. reads the `SOC-DEV-DVFS` base and count from
    `/arm-io/pmp/iop-pmp-nub/ptd-range`;
 2. counts the DVFS-present selectors in
    `/arm-io/pmp/iop-pmp-nub/soc-device` up to that device;
 3. selects the named PMGR virtual performance sources in
-   `/arm-io/pmgr/devices` (`VMAX` for VENC and AVD, `VNOM` for JPEG); and
+   `/arm-io/pmgr/devices` (`VMAX` for VENC, AVD, MSR0 and SCODEC, `VNOM` for
+   JPEG); and
 4. writes the derived entry, main level and all derived request-class levels
    as `apple,dvfs` and `apple,dvfs-request-levels` on the report entry.
 
