@@ -1,0 +1,122 @@
+{
+  "mode": "A",
+  "board": "J613",
+  "soc": "T8122",
+  "build": "25G83",
+  "source_adt_sha256": "e2c8cb7f1ebbe3849ce14d0c6d83838cae6c1dc17d8df2c4cffe616508b1f0f1",
+  "max_events": 250000,
+  "read": true,
+  "write": true,
+  "values": true,
+  "trace_mode": "SYNC",
+  "commit_allowed": false,
+  "resources": [
+    {
+      "path": "/arm-io/ane",
+      "index": 0,
+      "base": "0x311400000",
+      "size": "0x6c000"
+    },
+    {
+      "path": "/arm-io/ane",
+      "index": 1,
+      "base": "0x311050000",
+      "size": "0x4000"
+    },
+    {
+      "path": "/arm-io/ane",
+      "index": 2,
+      "base": "0x310000000",
+      "size": "0x2000000"
+    },
+    {
+      "path": "/arm-io/ane",
+      "index": 3,
+      "base": "0x2d0700000",
+      "size": "0x18000"
+    },
+    {
+      "path": "/arm-io/ane",
+      "index": 4,
+      "base": "0x2d0724000",
+      "size": "0x4000"
+    },
+    {
+      "path": "/arm-io/dart-ane",
+      "index": 0,
+      "base": "0x311800000",
+      "size": "0x4000"
+    },
+    {
+      "path": "/arm-io/dart-ane",
+      "index": 1,
+      "base": "0x311810000",
+      "size": "0x4000"
+    },
+    {
+      "path": "/arm-io/dart-ane",
+      "index": 2,
+      "base": "0x311820000",
+      "size": "0x4000"
+    },
+    {
+      "path": "/arm-io/dart-ane",
+      "index": 3,
+      "base": "0x311804000",
+      "size": "0x4000"
+    },
+    {
+      "path": "/arm-io/aic",
+      "index": 0,
+      "base": "0x2d1000000",
+      "size": "0x184000"
+    }
+  ],
+  "windows": [
+    {
+      "base": "0x292468000",
+      "size": "0x4",
+      "end_exclusive": "0x292468004"
+    },
+    {
+      "base": "0x2a5468000",
+      "size": "0x4",
+      "end_exclusive": "0x2a5468004"
+    },
+    {
+      "base": "0x2d0700000",
+      "size": "0x18000",
+      "end_exclusive": "0x2d0718000"
+    },
+    {
+      "base": "0x2d0724000",
+      "size": "0x4000",
+      "end_exclusive": "0x2d0728000"
+    },
+    {
+      "base": "0x2d1000000",
+      "size": "0x184000",
+      "end_exclusive": "0x2d1184000"
+    },
+    {
+      "base": "0x310000000",
+      "size": "0x2000000",
+      "end_exclusive": "0x312000000"
+    }
+  ],
+  "patch_export": {
+    "image_sha256": null,
+    "uuid": null,
+    "groups": {
+      "APSTS poll": null,
+      "CTRR check": null,
+      "CTRR reset-path check": null,
+      "ctXr lock check": null,
+      "AMCC CTRR match": null
+    },
+    "ctrr_stash_off": null,
+    "ctxr_ctl": null,
+    "sptm_va_maps": null,
+    "reviewed": false
+  }
+}
