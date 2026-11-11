@@ -861,6 +861,15 @@ fail:
     nvme_asc = NULL;
 }
 
+/*
+ * Post-M4: this stage hasn't used NVMe and no earlier stage passed SART entries, so ANS is as an
+ * earlier stage left it. An older Stage 1 (nvme.adopt) leaves it running.
+ */
+bool nvme_post_m4_untouched(void)
+{
+    return !nvme_initialized && !nvme_sart_saved_cnt && nvme_post_m4();
+}
+
 bool nvme_shutdown(void)
 {
     if (nvme_reboot_required) {

@@ -527,6 +527,14 @@ int payload_run(void)
          * link back up, and kboot_prepare_dt() passes the SART entries on.
          */
         nvme_keep_running_for_linux = boot_spec != NULL;
+        /*
+         * T8132: an older Stage 1 (nvme.adopt) passes ANS on running, with no SART entries. If
+         * this stage hasn't used NVMe, nvme_shutdown() has nothing to power off and the payload
+         * would get that live session. Take it over first, so nvme_shutdown() powers ANS off and
+         * kboot_prepare_dt() passes the entries the payload needs to start it.
+         */
+        if (!boot_spec && chip_id == T8132 && nvme_post_m4_untouched() && !nvme_init())
+            goto boot_failed;
         if (!boot_spec && !nvme_shutdown())
             goto boot_failed;
         cpufreq_init();
