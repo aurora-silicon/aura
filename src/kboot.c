@@ -2509,12 +2509,21 @@ static int dt_set_ipd(void)
 #define NVRAM_START    0x700000
 #define NVRAM_MAX_SIZE SZ_1M
 
+/*
+ * The boot NOR's NVRAM partition: on the SPI controller (spi1) on most chips, on the QSPI
+ * controller (qspi) on those that moved the boot NOR there, T6050 among them.
+ */
+static const char *const nvram_adt_paths[] = {"/arm-io/spi1/spinor/anvram",
+                                              "/arm-io/qspi/spinor/anvram"};
+
 static int dt_set_nvram(void)
 {
     int adt_path[8];
     u64 start, size;
 
-    int anode = adt_path_offset_trace(adt, "/arm-io/spi1/spinor/anvram", adt_path);
+    int anode = -1;
+    for (size_t i = 0; anode < 0 && i < ARRAY_SIZE(nvram_adt_paths); i++)
+        anode = adt_path_offset_trace(adt, nvram_adt_paths[i], adt_path);
     if (anode < 0) {
         printf("ADT: nvram partition not found\n");
         return 0;
