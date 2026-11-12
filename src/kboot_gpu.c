@@ -2987,6 +2987,7 @@ struct g17_soc {
     u32 count;                    /* perf-state-count, also the number of OPP entries */
     u32 num_states;               /* gpu-num-perf-states */
     bool firmware_data;           /* also hand over gfx-data/gfx1-data (the firmware __DATA) */
+    bool data_span;               /* gfx-data..gfx1-data end as /reserved-memory/gpu-fw-data */
     bool (*firmware_known)(void); /* when true, /chosen gets firmware_profile_prop */
     const char *firmware_profile_prop;
     const char *firmware_profile;
@@ -2998,6 +2999,7 @@ static const struct g17_soc g17_soc_t8140 = {
     .name = "T8140",
     .count = 16,
     .num_states = 15,
+    .data_span = true,
 };
 
 /*
@@ -3097,6 +3099,65 @@ static int g17_set_fw_data(void *dt, int sgx, const u64 data_base[2], const u64 
 apart:
     printf("FDT: GPU: firmware data segments are not contiguous, leaving %s\n", path);
     return 0;
+}
+
+/*
+ * On T8140, iBoot loads both roles' __DATA back to back (sgx gfx-data, then gfx1-data), and each
+ * role's firmware keeps its RTKit crash log in its own __DATA: the crash log requests name a
+ * physical address there. A DT with a /reserved-memory/gpu-fw-data node gets the span of both as
+ * that node's reg, which the DT keeps no-map, so the kernel can map the log the firmware asks for.
+ * The region is not needed to run the GPU: ADT data that is missing, unaligned, apart, or on
+ * another enabled reserved-memory node leaves the node as the DT has it (disabled), and the GPU
+ * setup goes on. Only an FDT write error fails.
+ */
+static int g17_set_data_span(void *dt, int sgx)
+{
+    static const char *const data[2] = {"gfx-data", "gfx1-data"};
+    static const char path[] = "/reserved-memory/gpu-fw-data";
+    u64 base[2], size[2];
+
+    int node = fdt_path_offset(dt, path);
+    if (node < 0)
+        return 0;
+    for (int i = 0; i < 2; i++) {
+        char prop[64];
+        snprintf(prop, sizeof(prop), "%s-base", data[i]);
+        bool ok = ADT_GETPROP(adt, sgx, prop, &base[i]) == sizeof(u64);
+        snprintf(prop, sizeof(prop), "%s-size", data[i]);
+        ok = ok && ADT_GETPROP(adt, sgx, prop, &size[i]) == sizeof(u64);
+        if (!ok || !base[i] || !size[i] || ((base[i] | size[i]) & (SZ_16K - 1)) ||
+            base[i] > UINT64_MAX - size[i]) {
+            printf("FDT: GPU: no valid %s in the ADT, leaving %s disabled\n", data[i], path);
+            return 0;
+        }
+    }
+    if (base[1] != base[0] + size[0]) {
+        printf("FDT: GPU: firmware data segments are not contiguous, leaving %s disabled\n", path);
+        return 0;
+    }
+    u64 start = base[0], end = base[1] + size[1];
+
+    int resv = fdt_parent_offset(dt, node), other;
+    fdt_for_each_subnode(other, dt, resv)
+    {
+        const char *status = fdt_getprop(dt, other, "status", NULL);
+        if (other == node || (status && strcmp(status, "okay") && strcmp(status, "ok")))
+            continue;
+        int len;
+        const fdt64_t *reg = fdt_getprop(dt, other, "reg", &len);
+        for (int k = 0; reg && (k + 2) * (int)sizeof(*reg) <= len; k += 2) {
+            u64 b = fdt64_ld(&reg[k]), sz = fdt64_ld(&reg[k + 1]);
+            if (sz && b < end && start < b + sz) {
+                printf("FDT: GPU: firmware data 0x%lx..0x%lx overlaps /reserved-memory/%s, "
+                       "leaving %s disabled\n",
+                       start, end, fdt_get_name(dt, other, NULL), path);
+                return 0;
+            }
+        }
+    }
+
+    printf("FDT: GPU: firmware data (gfx-data, gfx1-data) 0x%lx..0x%lx\n", start, end);
+    return dt_set_resvmem(dt, path, start, end - start);
 }
 
 /*
@@ -3225,6 +3286,9 @@ static int dt_set_gpu_g17(void *dt, const struct g17_soc *soc)
     if (soc->firmware_data &&
         (g17_set_fw_data(dt, sgx, &base[ARRAY_SIZE(regions) - 2], &size[ARRAY_SIZE(regions) - 2]) ||
          g17_set_fw_text(dt)))
+        goto disable;
+    /* After the UAT regions, which it must not overlap */
+    if (soc->data_span && g17_set_data_span(dt, sgx))
         goto disable;
 
     if (soc->firmware_known) {
