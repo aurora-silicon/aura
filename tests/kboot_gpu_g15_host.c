@@ -75,6 +75,17 @@ u64 kboot_fb_base(void)
 {
     return 0;
 }
+/* The T6050 setup links against these; no fixture here is a T6050. */
+int kboot_fdt_path_exact(const void *fdt, const char *path)
+{
+    return fdt_path_offset(fdt, path);
+}
+void aura_sha256(const void *data, size_t size, u8 digest[32])
+{
+    (void)data;
+    (void)size;
+    memset(digest, 0, 32);
+}
 u64 top_of_memory_alloc(size_t size)
 {
     (void)size;
