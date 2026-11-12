@@ -1,0 +1,107 @@
+name: maint-identity
+
+# A maintenance branch carries tools and the secure flavour on top of a release; the Stage 1
+# and ESP Stage 2 that Macs boot by default must stay the release's, byte for byte. Build both
+# trees with each toolchain that ships aura and compare (tools/image_identity.sh).
+
+on:
+  push:
+    branches: [ 'maint/**' ]
+  pull_request:
+    branches: [ 'maint/**' ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # The release this branch maintains.
+  BASE: v1.0.0b12
+
+jobs:
+  gcc:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Install the aarch64-linux-gnu- toolchain and Rust target
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y gcc-aarch64-linux-gnu
+          rustup target install aarch64-unknown-none-softfloat
+      - name: Default images against the release
+        run: |
+          git worktree add ../base "$BASE"
+          sh tools/image_identity.sh gcc ../base ARCH=aarch64-linux-gnu- BUILTIN_LOGO=aurora \
+            EXTRA_CFLAGS='-Wstack-usage=2048 -Os'
+
+  fedora:
+    # As fedora-aurora's aura.spec builds it: Fedora clang and Rust, core built from rust-src.
+    runs-on: ubuntu-24.04-arm
+    container: fedora:44
+    steps:
+      - name: Install Fedora's toolchain
+        run: dnf install -y --setopt=install_weak_deps=False clang llvm lld rust rust-src cargo make python3 git
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Default images against the release
+        run: |
+          git config --global --add safe.directory "$PWD"
+          git worktree add ../base "$BASE"
+          RUSTC_BOOTSTRAP=1 sh tools/image_identity.sh fedora ../base USE_CLANG=1 BUILTIN_LOGO=aurora BUILDSTD=1
+
+  alarm:
+    # As alarm-aurora's PKGBUILD builds it: Arch Linux ARM clang, rustup's prebuilt core.
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Arch Linux ARM root filesystem
+        run: |
+          curl -fsSL -o alarm.tar.gz http://os.archlinuxarm.org/os/ArchLinuxARM-aarch64-latest.tar.gz
+          docker import alarm.tar.gz alarm-build
+          git worktree add base "$BASE"
+      - name: Default images against the release
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src alarm-build /bin/bash -euc '
+            sed -i -e "s/^CheckSpace/#CheckSpace/" -e "/^\[options\]/a DisableSandbox" /etc/pacman.conf
+            pacman-key --init >/dev/null
+            pacman-key --populate archlinuxarm >/dev/null
+            pacman -Syu --noconfirm --needed clang lld llvm rustup make python >/dev/null
+            rustup toolchain install 1.99.0 --profile minimal --target aarch64-unknown-none-softfloat >/dev/null
+            export RUSTUP_TOOLCHAIN=1.99.0
+            clang --version | head -1
+            sh tools/image_identity.sh alarm base USE_CLANG=1 BUILTIN_LOGO=aurora'
+
+  nix:
+    # nixos-aurora's aura package (nixpkgs clang and Rust), built from both trees.
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31
+      - name: Default images against the release
+        run: |
+          git worktree add ../base "$BASE"
+          for t in this:. base:../base; do
+            name=${t%%:*} tree=$(cd "${t#*:}" && pwd)
+            nix build --impure -L --out-link "nix-$name" --expr "
+              let
+                flake = builtins.getFlake \"github:aurora-silicon/nixos-aurora\";
+                aura = flake.packages.aarch64-linux.aura;
+              in aura.overrideAttrs (old: {
+                src = builtins.path { path = $tree; name = \"source\";
+                  filter = p: t: baseNameOf p != \".git\" && baseNameOf p != \"build\"; };
+                env = (old.env or { }) // { AURA_VERSION_TAG = \"identity\"; };
+              })"
+          done
+          status=0
+          for f in share/aura/stage1/aura-raw.bin share/aura/stage1/aura.macho share/aura/stage1/aura-boot.macho lib/m1n1/m1n1.bin; do
+            a=$(sha256sum "nix-this/$f" | cut -d' ' -f1) b=$(sha256sum "nix-base/$f" | cut -d' ' -f1)
+            if [ "$a" = "$b" ]; then echo "nix $f: identical $a"; else echo "nix $f: DIFFERS this $a base $b"; status=1; fi
+          done
+          exit $status
