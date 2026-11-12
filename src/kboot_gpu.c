@@ -3099,6 +3099,43 @@ apart:
     return 0;
 }
 
+/*
+ * iBoot loads the primary's and the secondary's __TEXT back to back (gfx-asc and gfx1-asc
+ * segment-ranges, __TEXT first), at an address that depends on the macOS release (27.0 and 27.2
+ * differ by 64 KiB on T8142). A DT with a /reserved-memory/fw-text node, which Linux uses to
+ * identify the firmware build before it starts it, gets the span iBoot used. TEXT placed apart
+ * leaves the node as the DT has it.
+ */
+static int g17_set_fw_text(void *dt)
+{
+    static const char *const asc[2] = {"/arm-io/gfx-asc", "/arm-io/gfx1-asc"};
+    static const char path[] = "/reserved-memory/fw-text";
+    u64 text_base[2], text_size[2];
+
+    if (fdt_path_offset(dt, path) < 0)
+        return 0;
+    for (int i = 0; i < 2; i++) {
+        int node = adt_path_offset(adt, asc[i]);
+        if (node < 0)
+            return 0;
+        u32 len = 0;
+        const struct adt_segment_ranges *seg = adt_getprop(adt, node, "segment-ranges", &len);
+        const char *names = adt_getprop(adt, node, "segment-names", NULL);
+        if (!seg || len < sizeof(*seg) || !names || strncmp(names, "__TEXT;", 7))
+            return 0;
+        text_base[i] = seg[0].phys;
+        text_size[i] = seg[0].size;
+        if (!text_base[i] || !text_size[i] || (text_base[i] & (SZ_16K - 1)) ||
+            (text_size[i] & (SZ_16K - 1)))
+            return 0;
+    }
+    if (text_base[0] + text_size[0] != text_base[1]) {
+        printf("FDT: GPU: firmware text segments are not contiguous, leaving %s\n", path);
+        return 0;
+    }
+    return dt_set_resvmem(dt, path, text_base[0], text_size[0] + text_size[1]);
+}
+
 static int dt_set_gpu_g17(void *dt, const struct g17_soc *soc)
 {
     int gpu = fdt_path_offset(dt, "gpu");
@@ -3186,7 +3223,8 @@ static int dt_set_gpu_g17(void *dt, const struct g17_soc *soc)
             goto disable;
     /* gfx-data and gfx1-data are the last two regions. */
     if (soc->firmware_data &&
-        g17_set_fw_data(dt, sgx, &base[ARRAY_SIZE(regions) - 2], &size[ARRAY_SIZE(regions) - 2]))
+        (g17_set_fw_data(dt, sgx, &base[ARRAY_SIZE(regions) - 2], &size[ARRAY_SIZE(regions) - 2]) ||
+         g17_set_fw_text(dt)))
         goto disable;
 
     if (soc->firmware_known) {
