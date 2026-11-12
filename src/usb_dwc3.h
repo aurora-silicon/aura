@@ -16,7 +16,22 @@ typedef enum _cdc_acm_pipe_id_t {
 
 dwc3_dev_t *usb_dwc3_init(uintptr_t regs, dart_dev_t *dart);
 dwc3_dev_t *usb_dwc3_init_mode(uintptr_t regs, dart_dev_t *dart, bool superspeed);
-void usb_dwc3_shutdown(dwc3_dev_t *dev);
+/* False when the controller may still reach its DMA buffers; they are then retained. */
+bool usb_dwc3_shutdown(dwc3_dev_t *dev);
+
+/*
+ * Memory a DWC3 that could not be stopped may still reach (its buffers and
+ * its DART's tables). It stays allocated, and the handoff reserves it.
+ */
+struct usb_dwc3_dma_range {
+    u64 base;
+    u64 size;
+};
+#define USB_DWC3_RETAINED_MAX 32
+bool usb_dwc3_retain_dma(u64 base, u64 size);
+bool usb_dwc3_retain_dart(dart_dev_t *dart);
+/* The retained ranges; *overflow is set when some could not be recorded. */
+size_t usb_dwc3_retained(const struct usb_dwc3_dma_range **ranges, bool *overflow);
 
 void usb_dwc3_handle_events(dwc3_dev_t *dev);
 

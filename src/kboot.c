@@ -43,6 +43,7 @@
 #include "tunables.h"
 #include "types.h"
 #include "usb.h"
+#include "usb_dwc3.h"
 #include "utils.h"
 #include "vsprintf.h"
 #include "xnuboot.h"
@@ -1122,6 +1123,12 @@ static void *kboot_hibernate_handoff_dt(void)
            "0x%lx..0x%lx\n",
            hib_dt_base, size, high_water, hib_heap_base, hib_heap_end);
     return (void *)hib_dt_base;
+}
+
+/* The hibernation slot's capacity when fdt is the tree copied there, else 0. */
+static int kboot_hibernate_handoff_size(const void *fdt)
+{
+    return hib_dt_base && fdt == (const void *)hib_dt_base ? HIB_DT_SLOT : 0;
 }
 
 static int dt_set_chosen(void)
@@ -11808,5 +11815,72 @@ int kboot_boot(void *kernel)
     next_stage.args[4] = 0;
     next_stage.restore_logo = false;
 
+    return 0;
+}
+
+/*
+ * Reserve, no-map, memory a DWC3 that could not be stopped may still write
+ * (usb_dwc3_shutdown()): its buffers and its DART's tables, rounded out to
+ * pages. The handoff tree is final by then: reopen it into its buffer, add
+ * the nodes and pack it again.
+ */
+static int dt_reserve_retained_dma(void *fdt, int bufsize, const struct usb_dwc3_dma_range *ranges,
+                                   size_t count)
+{
+    if (fdt_open_into(fdt, fdt, bufsize))
+        return -1;
+
+    int resv = fdt_path_offset(fdt, "/reserved-memory");
+    if (resv < 0) {
+        resv = fdt_add_subnode(fdt, 0, "reserved-memory");
+        if (resv < 0 || fdt_setprop_u32(fdt, resv, "#address-cells", 2) ||
+            fdt_setprop_u32(fdt, resv, "#size-cells", 2) || fdt_setprop_empty(fdt, resv, "ranges"))
+            return -1;
+    }
+    for (size_t i = 0; i < count; i++) {
+        u64 start = ALIGN_DOWN(ranges[i].base, SZ_16K);
+        u64 end = ALIGN_UP(ranges[i].base + ranges[i].size, SZ_16K);
+        char name[40];
+
+        snprintf(name, sizeof(name), "aura-usb-dma@%lx", start);
+        if (fdt_subnode_offset(fdt, resv, name) >= 0)
+            continue;
+        int node = fdt_add_subnode(fdt, resv, name);
+        fdt64_t reg[] = {cpu_to_fdt64(start), cpu_to_fdt64(end - start)};
+        if (node < 0 || fdt_setprop(fdt, node, "reg", reg, sizeof(reg)) ||
+            fdt_setprop_empty(fdt, node, "no-map"))
+            return -1;
+    }
+    return fdt_pack(fdt);
+}
+
+int kboot_reserve_usb_dma(void)
+{
+    const struct usb_dwc3_dma_range *ranges;
+    bool overflow;
+    size_t count = usb_dwc3_retained(&ranges, &overflow);
+
+    if (!count && !overflow)
+        return 0;
+    /* kboot_boot() handed the kernel dt, or its copy in the hibernation slot. */
+    void *fdt = (void *)next_stage.args[0];
+    int size = dt && fdt == dt ? dt_bufsize : kboot_hibernate_handoff_size(fdt);
+    if (!next_stage.entry || !size) {
+        printf("USB: DMA retained, but the next stage is no kernel handoff to reserve it in\n");
+        return -1;
+    }
+    if (dt_reserve_retained_dma(fdt, size, ranges, count)) {
+        printf("USB: DMA retained, but the handoff tree could not reserve it\n");
+        return -1;
+    }
+    dc_cvac_range(fdt, fdt_totalsize(fdt));
+    sysop("dsb sy");
+    printf("kboot: USB DMA retained: %zu range(s) reserved no-map in the handoff tree\n", count);
+    for (size_t i = 0; i < count; i++)
+        printf("kboot:   0x%lx + 0x%lx\n", ranges[i].base, ranges[i].size);
+    if (overflow) {
+        printf("kboot: USB DMA retained: more ranges than could be recorded\n");
+        return -1;
+    }
     return 0;
 }

@@ -32,6 +32,8 @@ int dt_gpu_t8122_26_calibrate(void *dt);
 int dt_set_gpu_t8122_26(void *dt);
 int kboot_prepare_dt(void *fdt);
 int kboot_boot(void *kernel);
+/* Reserve the DMA a USB controller that could not be stopped keeps (main.c, after USB shutdown). */
+int kboot_reserve_usb_dma(void);
 
 /* Boot-args RAM range and boot framebuffer base, for the kboot_* SoC helpers */
 u64 kboot_ram_base(void);

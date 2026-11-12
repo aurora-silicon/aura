@@ -252,7 +252,7 @@ OBJECTS := \
 	tps6598x.o tps6598x_command_core.o \
 	uart.o \
 	uartproxy.o \
-	usb.o usb_t8152.o usb_dwc3.o usb_dwc3_hs.o usb_dwc3_ss.o usb_cdc.o usb_cdc_atc.o usb_cdc_bulk.o usb_cdc_ss_desc.o usb_cdc_state.o \
+	usb.o usb_t8152.o usb_dwc3.o usb_dwc3_hs.o usb_dwc3_ss.o usb_dwc3_retain.o usb_cdc.o usb_cdc_atc.o usb_cdc_bulk.o usb_cdc_ss_desc.o usb_cdc_state.o \
 	utils.o utils_asm.o \
 	vsprintf.o \
 	wdt.o \

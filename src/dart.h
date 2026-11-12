@@ -44,6 +44,8 @@ u64 dart_find_iova(dart_dev_t *dart, s64 start, size_t len);
 u64 dart_search_range(dart_dev_t *dart, u64 paddr, size_t len);
 void dart_shutdown(dart_dev_t *dart);
 bool dart_shutdown_checked(dart_dev_t *dart);
+/* The heap tables of a DART aura owns (roots, then L2), for a reservation. */
+int dart_collect_tables(dart_dev_t *dart, u64 *pages, size_t capacity, size_t *count);
 /* True after a timed-out TLB invalidation (or for no DART): keep reachable memory. */
 bool dart_has_failed(dart_dev_t *dart);
 int dart_reserve_legacy_tables(void *dt, u64 dram_base, u64 dram_size);
