@@ -96,7 +96,8 @@ typedef uint64_t u64;
 #define ALIGN_UP(x, a) (((x) + (a) - 1) & ~((a) - 1))
 ''' + between(header, "struct kernel_header {", "void kboot_set_initrd(") + r'''
 enum { V26_6_2 = 1 };
-static struct { int version; } os_firmware = {V26_6_2};
+/* The release whose coprocessor firmware the OS iBoot loads (firmware.c) */
+static int firmware_os_components(void) { return V26_6_2; }
 #include "payload_profile.h"
 static int XzDecode(void *in, uint32_t *in_len, void *out, uint32_t *out_len) { return 0; }
 
@@ -186,6 +187,7 @@ static void t6031_gpu_probe(void *d)
         function(gpu, "static int dt_set_gpu_t6031(void *dt)\n{") + r'''
 /* kboot's handoff: /chosen as dt_set_chosen() writes it, then what the GPU code would see */
 static void kboot_set_initrd(void *start, size_t size) {}
+static void kboot_request_hibernate_layout(bool on) { printf("HIB %d\n", on); }
 static int kboot_prepare_dt(void *fdt)
 {
     assert(!fdt_open_into(fdt, dt, sizeof(blob)));
@@ -899,3 +901,30 @@ def test_updater_read_loop_fix_keeps_a_last_line_without_newline(tools):
     b = run(tools, "stage2", image + forwarded)
     booted(b)
     assert b.chosen["asahi,t8122-gpu"] == "0"
+
+
+# ---- hib=: a line of stage 2's own asks kboot for the fixed hibernation layout ----
+
+def hib_requests(r):
+    return [line[4:] for line in r.stdout.splitlines() if line.startswith("HIB ")]
+
+
+@pytest.mark.parametrize("build", STAGE2)
+def test_hib_line_asks_for_the_layout_and_is_no_loss(tools, build):
+    b = boot(tools, build, b"hib=1\n")
+    booted(b)
+    assert hib_requests(b) == ["1"] and set(AIR) <= b.armed
+    b = boot(tools, build, b"hib=1\nhib=0\n")
+    booted(b)
+    assert hib_requests(b) == ["1", "0"]
+
+
+@pytest.mark.parametrize("build", STAGE2)
+def test_a_swallowed_hib_line_is_a_lost_line(tools, build):
+    b = boot(tools, build, GPU_ON + b"junk\nhib=1\n")
+    graphics_off(b)
+    assert not hib_requests(b)
+
+
+def test_stage1_does_not_hand_hib_on(tools):
+    assert b"hib=" not in stage1(tools, b"hib=1\n")

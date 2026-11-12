@@ -10,7 +10,8 @@ enum fw_version {
     V14_7 = 100,
     V14_8_3 = 101,
     V26_6_2 = 102,
-    V27_0 = 103,
+    V26_7 = 103,
+    V27_0 = 104,
 };
 struct fw_version_info {
     enum fw_version version;
@@ -20,5 +21,7 @@ struct fw_version_info {
     const char *iboot;
 };
 extern struct fw_version_info os_firmware;
+extern const struct fw_version_info fw_versions[];
+enum fw_version firmware_os_components(void);
 int firmware_set_fdt(void *fdt, int node, const char *prop, const struct fw_version_info *ver);
 #endif

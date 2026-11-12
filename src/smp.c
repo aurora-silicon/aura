@@ -459,9 +459,13 @@ void smp_s2r_return_to_os(void)
 
     /* A reset the OS didn't arm: reboot rather than guess what state it's in. */
     bool armed = entry && (mrs(MPIDR_EL1) & 0xFFFFFF) == s2r_mailbox.boot_mpidr;
-    /* One line on the always-on DockChannel only: USB and the display are the OS's. */
-    dockchannel_uart_puts(armed ? "aura: S2R wake, resuming the OS"
-                                : "aura: S2R reset not armed, rebooting");
+    /*
+     * One line on the always-on DockChannel only: USB and the display are the OS's. Only
+     * if it fits: with nobody draining the FIFO (a T6040, whose OS keeps the DockChannel
+     * off), a waiting write held the boot core here until the SMC watchdog reset the SoC.
+     */
+    dockchannel_uart_try_puts(armed ? "aura: S2R wake, resuming the OS"
+                                    : "aura: S2R reset not armed, rebooting");
     if (!armed)
         reboot();
 

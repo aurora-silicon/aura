@@ -1347,6 +1347,17 @@ static void dcp6_describe_segs(const char *path)
  * The ADT values a device tree and a handoff for this SoC need, for the serial console. Read
  * only, ADT memory only: no device is accessed here.
  */
+/*
+ * The release of the handed-over firmware: the one whose coprocessor images the OS iBoot loaded
+ * (firmware_os_components()), which is what the handoff was checked against. A J616s on 26.7.1
+ * runs the 26.6.2 DCP images, and the kernel's desktop IOMFB admits that release only, as both
+ * apple,firmware-version and apple,firmware-compat.
+ */
+static const struct fw_version_info *dcp6_fw_release(void)
+{
+    return &fw_versions[firmware_os_components()];
+}
+
 static __attribute__((noinline)) void dcp6_describe(void)
 {
     static const char *const nodes[] = {
@@ -2227,7 +2238,7 @@ static int dcp6_check_adt(void)
 
     if (chip_id != soc->chip)
         bail("chip 0x%x is not %s\n", chip_id, soc->name);
-    if (os_firmware.version != soc->os_fw)
+    if (firmware_os_components() != soc->os_fw)
         bail("OS firmware %s is not %s\n", os_firmware.string, soc->os_fw_name);
 
     int nub = adt_path_offset(adt, DCP6_NUB);
@@ -2408,10 +2419,10 @@ static int dcp6_publish(void *dt, const struct dcp6_dt *n)
     if (dcp < 0 || fdt_setprop_string(dt, dcp, "apple,firmware-uuid", dcp6.uuid))
         return -1;
     dcp = fdt_path_offset(dt, n->dcp);
-    if (dcp < 0 || firmware_set_fdt(dt, dcp, "apple,firmware-version", &os_firmware))
+    if (dcp < 0 || firmware_set_fdt(dt, dcp, "apple,firmware-version", dcp6_fw_release()))
         return -1;
     dcp = fdt_path_offset(dt, n->dcp);
-    if (dcp < 0 || firmware_set_fdt(dt, dcp, "apple,firmware-compat", &os_firmware))
+    if (dcp < 0 || firmware_set_fdt(dt, dcp, "apple,firmware-compat", dcp6_fw_release()))
         return -1;
     return 0;
 }
@@ -2693,8 +2704,8 @@ static int dcpext6_publish(void *dt, const struct dcpext6_inst *inst)
     if (node < 0 || fdt_setprop(dt, node, "memory-region", mr, sizeof(mr)) ||
         fdt_setprop(dt, node, "memory-region-names", mr_names, sizeof(mr_names)) ||
         fdt_setprop_string(dt, node, "apple,firmware-uuid", DCP6_UUID) ||
-        firmware_set_fdt(dt, node, "apple,firmware-version", &os_firmware) ||
-        firmware_set_fdt(dt, node, "apple,firmware-compat", &os_firmware) ||
+        firmware_set_fdt(dt, node, "apple,firmware-version", dcp6_fw_release()) ||
+        firmware_set_fdt(dt, node, "apple,firmware-compat", dcp6_fw_release()) ||
         fdt_setprop_u32(dt, node, DCPEXT6_MARKER, 1))
         return -1;
     return 0;
@@ -3112,8 +3123,8 @@ static int t6041_ext_fill(void *dt, const struct t6041_ext *ext)
     if (placeholder < 0 || fdt_del_node(dt, placeholder))
         return -1;
     node = fdt_path_offset(dt, ext->dt_path);
-    if (node < 0 || firmware_set_fdt(dt, node, "apple,firmware-version", &os_firmware) ||
-        firmware_set_fdt(dt, node, "apple,firmware-compat", &os_firmware))
+    if (node < 0 || firmware_set_fdt(dt, node, "apple,firmware-version", dcp6_fw_release()) ||
+        firmware_set_fdt(dt, node, "apple,firmware-compat", dcp6_fw_release()))
         return -1;
     return 0;
 }
@@ -3738,7 +3749,7 @@ int dt_set_display_handoff(void *dt)
 
     /* Reject unsupported firmware before reserving __OS_LOG or touching registers. */
     if (!dcp6.soc->optin &&
-        (dcp6.soc->os_fw == V_UNKNOWN || os_firmware.version != dcp6.soc->os_fw)) {
+        (dcp6.soc->os_fw == V_UNKNOWN || firmware_os_components() != dcp6.soc->os_fw)) {
         dlog("no qualified OS firmware for %s: nothing done\n", dcp6.soc->dcp_compat);
         return 0;
     }
