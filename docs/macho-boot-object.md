@@ -125,8 +125,12 @@ itself, so the device tree says nothing about them.
 
 A kernel whose executable pages all sit inside `CTXR_D` can run at EL2, so on a
 confined machine that is where it runs, on every CPU, with nothing of aura's left
-under it. This takes a boot object padded by aurora-installer and a kernel built
-with `CONFIG_ARM64_CTXR_EXECMEM`.
+under it. This takes a padded boot object and a kernel built with
+`CONFIG_ARM64_CTXR_EXECMEM`. aurora-installer pads the object when it enrolls
+it. `tools/macho_boot_object.py --execute-window RAW OUT` does the same padding
+(a raw image is wrapped first; an existing boot object is padded as it is) and
+writes the padding as a hole, so the file is sparse. Enroll it with
+`kmutil configure-boot --compress`.
 
 `ctxr_exec_window()` in `src/ctxr_exec.c` finds the window. It starts at the first
 2 MiB boundary past aura's 16 MiB slot and is 128 MiB long, which holds the kernel
