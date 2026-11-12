@@ -20,7 +20,11 @@ Both are build options; a default build only writes the record.
   DebugUSB) while the stage does not enforce. `secure` never gives a USB host
   the proxy, whatever the policy: no window, and a failed hand-off or a boot
   with no payload reboots instead of falling back to the proxy. `secure` needs
-  `SECBOOT=audit` or `enforce` and refuses `DEBUGUSB_PROXY=1`.
+  `SECBOOT=audit` or `enforce` and refuses `DEBUGUSB_PROXY=1`. Its image
+  leaves out the proxy and what only the proxy reaches (the hypervisor), which
+  keeps a `secure` Stage 1 well below the DCP log buffer (`aura-raw.ld`) on
+  every distribution's toolchain. `tools/stage1_room.py` reports how much room
+  a Stage 1 build has left; CI checks it for each flavour (`stage1-size.yml`).
 
 The usual pair is a `secure` Stage 1 built with `SECBOOT=audit` for users and a
 `dev` one for development Macs. Both report and boot by default; enforcing is

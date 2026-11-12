@@ -353,14 +353,12 @@ u8 *secboot_payload_next(u8 *p)
 #endif
 }
 
+#ifndef SECBOOT_SECURE_FLAVOUR
 bool secboot_host_proxy_allowed(void)
 {
-#ifdef SECBOOT_SECURE_FLAVOUR
-    return false;
-#else
     return !secboot_enforcing();
-#endif
 }
+#endif
 
 const char *secboot_flavour(void)
 {

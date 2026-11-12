@@ -3,6 +3,8 @@
 #ifndef SECBOOT_H
 #define SECBOOT_H
 
+#include "../build/build_cfg.h"
+
 #include "types.h"
 
 /* Verdicts, as aura_secboot_verify() returns them */
@@ -51,9 +53,18 @@ bool secboot_enforcing(void);
 
 /*
  * Whether a USB host may get the proxy (any window, or the no-payload / failed hand-off
- * fallbacks): never in the secure flavour, and not while enforcing.
+ * fallbacks): never in the secure flavour, and not while enforcing. The secure flavour answers
+ * at compile time, so the windows, the proxy and what only the proxy reaches (the hypervisor)
+ * are left out of its image.
  */
+#ifdef SECBOOT_SECURE_FLAVOUR
+static inline bool secboot_host_proxy_allowed(void)
+{
+    return false;
+}
+#else
 bool secboot_host_proxy_allowed(void);
+#endif
 
 /* "dev" or "secure" (SECBOOT_FLAVOUR). */
 const char *secboot_flavour(void);
