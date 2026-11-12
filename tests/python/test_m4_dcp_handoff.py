@@ -25,12 +25,21 @@ def test_m4_dcp_handoff_follows_the_firmware_and_the_panel(tmp_path):
     layout = header[start:header.index("} PACKED;", start) + len("} PACKED;")]
     start = kboot.index("struct j713_display_maps {")
     maps = kboot[start:kboot.index("\n};", start) + 3] + "\n"
+    segment_kind = re.search(r"^#define ADT_SEGMENT_DCP_OS_LOG .+$", kboot, re.MULTILINE).group(0) + "\n"
     production = (
         function(kboot, "dt_get_iommu_node") + function(kboot, "dt_device_set_reserved_mem") +
         function(kboot, "dt_get_or_add_reserved_mem") +
         function(kboot, "dt_device_add_mem_region") + function(kboot, "dt_set_dcp_firmware") +
         function(kboot, "dt_reserve_asc_segments_at") + function(kboot, "dt_reserve_asc_segments") + function(kboot, "dt_reserve_asc_firmware") +
         maps + function(kboot, "j713_display_page") + function(kboot, "dt_set_j713_display_maps") +
+        function(kboot, "dt_display_transaction") +
+        function(kboot, "dt_is_j773g_main_hdmi", "static bool ") +
+        "static const struct adt_segment_ranges *j773g_dcp_segments;\n"
+        "static const char *j773g_dcp_uuid;\n"
+        "static u32 j773g_dcp_count;\n" + segment_kind +
+        function(kboot, "dt_cells64", "static u64 ") +
+        function(kboot, "dt_set_j773g_dcp_regions") +
+        function(kboot, "dt_set_j773g_dcp_handoff") +
         function(kboot, "dt_set_m4_dcp_handoff"))
     production = function(firmware, "firmware_set_fdt", "int ") + production
     assert not re.search(r"\bdt_set_j713_dcp_handoff\b", kboot)
@@ -53,6 +62,8 @@ typedef uint8_t u8;
 #define T8132 0x8132
 #define T8122 0x8122
 #define SZ_16K 0x4000
+#define BIT(x) (1UL << (x))
+#define UNUSED(x) (void)(x)
 #define ALIGN_UP(x, a) (((x) + (a) - 1) & ~((u64)(a) - 1))
 #define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
 #define bail(...) do { printf(__VA_ARGS__); return -1; } while (0)
@@ -179,6 +190,10 @@ static int dart_walk_locked_t8110(uintptr_t base, u64 size, u8 sid, u64 dram_sta
     }
     return 0;
 }
+static bool kboot_is_j773g(const void *tree)
+{
+    return tree && !strcmp(b.name, "j773g") && os_firmware.version == V26_6_2;
+}
 ''' + production + r'''
 static unsigned char blob[1 << 16];
 static const char *outdir;
@@ -207,6 +222,8 @@ static void world(const struct board *board, enum fw_version fw)
     assert(!fdt_setprop_string(dt, dcp, "compatible", "apple,t8132-dcp"));
     assert(!fdt_setprop(dt, dcp, "iommus", iommus, sizeof(iommus)));
     assert(!fdt_setprop_string(dt, dcp, "status", "disabled"));
+    if (!strcmp(b.name, "j773g"))
+        assert(!fdt_setprop_string(dt, dcp, "apple,connector-type", "HDMI-A"));
     if (b.native) {
         assert(!fdt_setprop_empty(dt, dcp, "apple,j713-native-piodma"));
         assert(!fdt_setprop_empty(dt, dcp, "apple,j713-native-scanout"));
@@ -272,8 +289,15 @@ static void published(bool piodma)
             assert(fdt_getprop(dt, node, "apple,dcp-os-log", NULL) && !iova);
             continue;
         }
-        assert(iova && len >= 20 && fdt32_ld(&iova[0]) == (u32)phandle_of("/soc/dcp@30ae00000"));
-        assert(((u64)fdt32_ld(&iova[1]) << 32 | fdt32_ld(&iova[2])) == b.segs[i].remap);
+        assert(iova && len >= 20 && len % 20 == 0);
+        unsigned matches = 0;
+        for (int j = 0; j < len / 4; j += 5)
+            if (fdt32_ld(&iova[j]) == (u32)phandle_of("/soc/dcp@30ae00000")) {
+                assert(((u64)fdt32_ld(&iova[j + 1]) << 32 | fdt32_ld(&iova[j + 2])) ==
+                       b.segs[i].remap);
+                matches++;
+            }
+        assert(matches == 1);
     }
     assert(status_is("/soc/dcp@30ae00000", "disabled")); /* the kernel DT enables it */
     bool inherited = fdt_getprop(dt, fdt_path_offset(dt, "disp0_piodma"),
@@ -295,6 +319,44 @@ static void handed_over(const struct board *board, enum fw_version fw, bool piod
     char name[64];
     snprintf(name, sizeof(name), "%s-%s", board->name, fw_versions[fw].string);
     save(name);
+}
+static void handed_over_with_existing_regions(void)
+{
+    world(&j773g, V26_6_2);
+    int dcp = fdt_path_offset(dt, "dcp");
+    assert(!fdt_setprop_u32(dt, dcp, "phandle", 77));
+    for (unsigned i = 0; i < 3; i++) {
+        char name[64];
+        snprintf(name, sizeof(name), "asc-firmware@%lx", b.segs[i].phys);
+        u64 size = ALIGN_UP((u64)b.segs[i].size, SZ_16K);
+        int mem = dt_get_or_add_reserved_mem(name, "apple,asc-mem", true, b.segs[i].phys, size);
+        assert(mem >= 0);
+        if (b.segs[i].unk == ADT_SEGMENT_DCP_OS_LOG) {
+            assert(!fdt_setprop_empty(dt, mem, "apple,dcp-os-log"));
+        } else {
+            if (!i)
+                assert(!dt_device_set_reserved_mem(mem, name, 2, 0x4000, size));
+            assert(!dt_device_set_reserved_mem(mem, name, 77, b.segs[i].remap, size));
+            if (!i) {
+                int len;
+                assert(fdt_getprop(dt, mem, "iommu-addresses", &len) && len == 40);
+            }
+        }
+        assert(!dt_device_add_mem_region("dcp", fdt_get_phandle(dt, mem), NULL));
+    }
+    assert(!dt_set_m4_dcp_handoff());
+    published(false);
+}
+static void refused(void);
+static void reservation_refused_without_partial_edits(void)
+{
+    world(&j773g, V26_6_2);
+    int conflict = fdt_add_subnode(dt, fdt_path_offset(dt, "/reserved-memory"), "other-asc");
+    assert(conflict >= 0);
+    fdt64_t reg[2] = {cpu_to_fdt64(b.segs[1].phys),
+                      cpu_to_fdt64(ALIGN_UP((u64)b.segs[1].size, SZ_16K))};
+    assert(!fdt_setprop(dt, conflict, "reg", reg, sizeof(reg)));
+    refused();
 }
 /* A refusal leaves the tree byte for byte as it was. */
 static void refused(void)
@@ -341,8 +403,13 @@ int main(int argc, char **argv)
             refused();
         }
 
-    /* No internal panel: the Mac mini, or no disp0 at all. */
-    world(&j773g, V26_6_2); refused(); save("j773g-26.6.2");
+    /* The Mac mini's main DCP is an external HDMI pipeline; other panel-less boards refuse. */
+    handed_over(&j773g, V26_6_2, false);
+    handed_over_with_existing_regions();
+    reservation_refused_without_partial_edits();
+    world(&j773g, V26_6_2);
+    assert(!fdt_delprop(dt, fdt_path_offset(dt, "dcp"), "apple,connector-type"));
+    refused();
     world(&j773g, V26_6); refused();
     struct board bare = j604;
     bare.external = -1;
