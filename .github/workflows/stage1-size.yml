@@ -7,9 +7,9 @@ name: stage1-size
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, 'maint/**' ]
   pull_request:
-    branches: [ main ]
+    branches: [ main, 'maint/**' ]
   workflow_dispatch:
 
 permissions:
