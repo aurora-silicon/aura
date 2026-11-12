@@ -121,6 +121,16 @@ const char *fdt_get_name(const void *fdt, int nodeoffset, int *len);
 int fdt_node_check_compatible(const void *fdt, int nodeoffset, const char *compatible);
 u64 dt_get_address(void *dt, int node);
 int fdt_add_mem_rsv(void *fdt, uint64_t address, uint64_t size);
+typedef uint32_t fdt32_t;
+static inline uint32_t fdt32_ld(const fdt32_t *p)
+{
+    const uint8_t *b = (const uint8_t *)p;
+    return (uint32_t)b[0] << 24 | (uint32_t)b[1] << 16 | (uint32_t)b[2] << 8 | b[3];
+}
+int fdt_parent_offset(const void *fdt, int nodeoffset);
+const void *fdt_getprop(const void *fdt, int nodeoffset, const char *name, int *lenp);
+int fdt_address_cells(const void *fdt, int nodeoffset);
+int fdt_size_cells(const void *fdt, int nodeoffset);
 '''
 
 HARNESS = r'''
@@ -301,6 +311,24 @@ int fdt_node_check_compatible(const void *fdt, int nodeoffset, const char *compa
     return strcmp(fdt_compat, compatible) ? 1 : 0;
 }
 u64 dt_get_address(void *dt, int node) { (void)dt; assert(node == 7); return REGS; }
+/* Its parent is a bus with two address and two size cells; reg is REGS + 0x20000. */
+static const uint8_t fdt_reg[16] = {0, 0, 0, 0x02, 0x3b, 0, 0, 0, 0, 0, 0, 0, 0, 0x02, 0, 0};
+int fdt_parent_offset(const void *fdt, int nodeoffset) { (void)fdt; assert(nodeoffset == 7); return 0; }
+int fdt_address_cells(const void *fdt, int nodeoffset) { (void)fdt; (void)nodeoffset; return 2; }
+int fdt_size_cells(const void *fdt, int nodeoffset) { (void)fdt; (void)nodeoffset; return 2; }
+const void *fdt_getprop(const void *fdt, int nodeoffset, const char *name, int *lenp)
+{
+    (void)fdt;
+    assert(nodeoffset == 7);
+    if (strcmp(name, "reg")) {
+        if (lenp)
+            *lenp = -1;
+        return NULL;
+    }
+    if (lenp)
+        *lenp = sizeof(fdt_reg);
+    return fdt_reg;
+}
 int fdt_add_mem_rsv(void *fdt, uint64_t address, uint64_t size)
 {
     (void)fdt; (void)address; (void)size;
