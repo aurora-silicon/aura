@@ -26,7 +26,6 @@ SECTIONS {
          * it pushes .text past its next 64 KiB step, and .data past _file_limit.
          */
         *hv/hv_vm.o(.text .text.*)
-        *hv/hv_sprr.o(.text .text.*)
         *hv/hv_virtio.o(.text .text.*)
         *hv/hv_vuart.o(.text .text.*)
         *hv/hv_wdt.o(.text .text.*)
@@ -39,12 +38,14 @@ SECTIONS {
         *librust.a:*ed25519_compact*(.text.*15ed25519_compact12edwards25519*)
         *librust.a:*ed25519_compact*(.text.*15ed25519_compact10field25519*)
         *librust.a:*ed25519_compact*(.text.*15ed25519_compact7ed25519*)
+        _init_content_end = .; /* tools/stage1_room.py */
     } :text
     .text : ALIGN(0x10000) {
         *(.text)
         *(.text.*)
         . = ALIGN(8);
         *(.got.plt)
+        _text_content_end = .;
         . = ALIGN(0x10000);
     } :text
     _text_size = . - _text_start;
@@ -71,6 +72,7 @@ SECTIONS {
         /* The load header's footprint (start.S) leaves an R_AARCH64_NONE here; keep it inside the
          * padding and out of the range apply_rela() walks, which only accepts relative entries. */
         *(.rela.init)
+        _rodata_content_end = .;
         . = ALIGN(0x10000);
     } :rodata
     _rodata_end = .;

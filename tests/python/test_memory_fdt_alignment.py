@@ -40,6 +40,15 @@ static int get_property(const char *name, u64 *value)
 }
 #define ADT_GETPROP(a, n, k, v) get_property(k, v)
 static size_t get_page_size(void) { return 16384; }
+/* The MTE tag-storage step is checked on hardware; here it leaves the RAM window alone. */
+static int dt_set_mte_tag_storage(u64 dram_base, u64 dram_size, u64 ram_start, u64 *ram_end)
+{
+    (void)dram_base;
+    (void)dram_size;
+    (void)ram_start;
+    (void)ram_end;
+    return 0;
+}
 ''' + function + r'''
 int main(void)
 {

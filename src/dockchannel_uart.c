@@ -7,6 +7,7 @@
 #include "dockchannel_uart.h"
 #include "adt.h"
 #include "iodev.h"
+#include "string.h"
 #include "types.h"
 #include "utils.h"
 #include "vsprintf.h"
@@ -21,6 +22,8 @@
 #define DATA_RX_COUNT 0x402c
 
 static u64 uart_base = 0;
+static u32 tx_timeout_ms = 1000;
+static bool tx_stalled;
 
 #ifdef DEBUGUSB_PROXY
 /* TX FIFO accounting for dockchannel_uart_host_seen(). */
@@ -68,6 +71,12 @@ int dockchannel_uart_init(void)
     return 0;
 }
 
+/* For a caller that prints from a running OS's traps, where a long wait freezes the OS. */
+void dockchannel_uart_set_tx_timeout(u32 ms)
+{
+    tx_timeout_ms = ms;
+}
+
 void dockchannel_uart_putbyte(u8 c)
 {
     if (!uart_base)
@@ -75,14 +84,23 @@ void dockchannel_uart_putbyte(u8 c)
 
     /*
      * A stalled or undrained FIFO must not block every printf. Wait up to
-     * 1 s, which is long enough for a host that drains in bursts not to
-     * lose proxy replies, then drop the byte.
+     * tx_timeout_ms (1 s by default, long enough for a host that drains in
+     * bursts not to lose proxy replies), then drop the byte, and drop the
+     * following ones at once while the FIFO stays full, so a stall costs
+     * one timeout instead of one per byte.
      */
-    u64 deadline = mrs(CNTPCT_EL0) + mrs(CNTFRQ_EL0);
-    while (read32(uart_base + DATA_TX_FREE) == 0) {
-        if ((s64)(mrs(CNTPCT_EL0) - deadline) >= 0)
+    if (read32(uart_base + DATA_TX_FREE) == 0) {
+        if (tx_stalled)
             return;
+        u64 deadline = mrs(CNTPCT_EL0) + mrs(CNTFRQ_EL0) * tx_timeout_ms / 1000;
+        while (read32(uart_base + DATA_TX_FREE) == 0) {
+            if ((s64)(mrs(CNTPCT_EL0) - deadline) >= 0) {
+                tx_stalled = true;
+                return;
+            }
+        }
     }
+    tx_stalled = false;
 
     write32(uart_base + DATA_TX8, c);
     TX_ACCEPTED(1);
@@ -118,6 +136,26 @@ void dockchannel_uart_puts(const char *s)
         dockchannel_uart_putchar(*(s++));
 
     dockchannel_uart_putchar('\n');
+}
+
+/*
+ * The whole line or nothing, without waiting: for paths that must not stall on a FIFO
+ * nobody drains (the S2R wake of a T6040, whose OS keeps the DockChannel off).
+ */
+bool dockchannel_uart_try_puts(const char *s)
+{
+    size_t len = strlen(s);
+
+    if (!uart_base || read32(uart_base + DATA_TX_FREE) < len + 2)
+        return false;
+
+    for (size_t i = 0; i < len; i++)
+        write32(uart_base + DATA_TX8, s[i]);
+    write32(uart_base + DATA_TX8, '\r');
+    write32(uart_base + DATA_TX8, '\n');
+    TX_ACCEPTED(len + 2);
+
+    return true;
 }
 
 void dockchannel_uart_write(const void *buf, size_t count)

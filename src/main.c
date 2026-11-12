@@ -19,6 +19,7 @@
 #include "gxf.h"
 #include "heapblock.h"
 #include "j873.h"
+#include "kboot.h"
 #include "mcc.h"
 #include "memory.h"
 #include "nvme.h"
@@ -195,6 +196,9 @@ void run_actions(void)
         window_ms < STAGE1_PROXY_REQUEST_MS) {
         printf("aura-proxy: waiting %u s for a host\n", STAGE1_PROXY_REQUEST_MS / 1000);
         window_ms = STAGE1_PROXY_REQUEST_MS;
+    } else if (window_ms) {
+        /* Announced as aura-proxy's window is: host tools claim the window on this line */
+        printf("Stage 1: waiting %u s for a host\n", window_ms / 1000);
     }
     if (window_ms) {
         window_result = stage1_window_result = uartproxy_wait_stage1(window_ms);
@@ -362,7 +366,13 @@ static void j873g_run_proxy(void)
     printf("Initialization complete.\n");
 
     /* An appended payload (or boot= from storage) boots directly. */
-    if (!aura_proxy_enabled()) {
+#ifdef SECBOOT_SECURE_FLAVOUR
+    /* The secure flavour has no proxy (secboot_host_proxy_allowed()): always boot the payload. */
+    const bool check_payloads = true;
+#else
+    const bool check_payloads = !aura_proxy_enabled();
+#endif
+    if (check_payloads) {
         printf("Checking for payloads...\n");
         if (payload_run() == 0) {
             printf("Valid payload found\n");
@@ -371,9 +381,16 @@ static void j873g_run_proxy(void)
         }
         printf("No valid payload found\n");
     }
+#ifdef SECBOOT_SECURE_FLAVOUR
+    printf("\nSecure boot: no verified next stage could be started, and this build gives\n"
+           "  no USB host a proxy. Rebooting in 10 s.\n");
+    mdelay(10000);
+    flush_and_reboot();
+#else
     j873g_debugport_check();
     printf("Running proxy...\n");
     uartproxy_run(NULL);
+#endif
 }
 
 void aura_main(void)
@@ -441,8 +458,8 @@ void aura_main(void)
 #if defined(CHAINLOADING) && !defined(ESP_STAGE2)
     stage1_read_boot_record();
 #endif
-    /* T6040, T8140: nothing else in an aura tether chain clears iBoot's failed-boot count. */
-    if (chip_id == T6040 || chip_id == T8140)
+    /* T6040, T8140, T6050: nothing else in an aura chain clears iBoot's failed-boot count. */
+    if (chip_id == T6040 || chip_id == T8140 || chip_id == T6050)
         pmu_clear_panic_counter();
 
     printf("Initialization complete.\n");
@@ -472,6 +489,12 @@ next_stage:
 #ifndef BRINGUP
     if (chip_id != T8152) {
         usb_iodev_shutdown();
+        /*
+         * A controller that could not be stopped keeps its buffers: boot on with
+         * them reserved, so the kernel never hands out memory it may still write.
+         */
+        if (kboot_reserve_usb_dma())
+            printf("USB: retained DMA not fully reserved; booting on\n");
         /* Its firmware may still use memory the next stage will reuse. */
         if (display_shutdown(DCP_SLEEP_IF_EXTERNAL) < 0) {
             printf("Display handoff failed; returning to proxy\n");

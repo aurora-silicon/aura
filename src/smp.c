@@ -459,9 +459,13 @@ void smp_s2r_return_to_os(void)
 
     /* A reset the OS didn't arm: reboot rather than guess what state it's in. */
     bool armed = entry && (mrs(MPIDR_EL1) & 0xFFFFFF) == s2r_mailbox.boot_mpidr;
-    /* One line on the always-on DockChannel only: USB and the display are the OS's. */
-    dockchannel_uart_puts(armed ? "aura: S2R wake, resuming the OS"
-                                : "aura: S2R reset not armed, rebooting");
+    /*
+     * One line on the always-on DockChannel only: USB and the display are the OS's. Only
+     * if it fits: with nobody draining the FIFO (a T6040, whose OS keeps the DockChannel
+     * off), a waiting write held the boot core here until the SMC watchdog reset the SoC.
+     */
+    dockchannel_uart_try_puts(armed ? "aura: S2R wake, resuming the OS"
+                                    : "aura: S2R reset not armed, rebooting");
     if (!armed)
         reboot();
 
@@ -634,7 +638,7 @@ static int smp_start_cpu(int index, const struct cpu_info *cpu)
         write64(cpu->impl_reg, (u64)_vectors_start);
     }
 
-    u64 start_base = cpu_start_base + cpu->die * PMGR_DIE_OFFSET;
+    u64 start_base = cpu_start_base + cpu->die * pmgr_die_stride();
 
     // Some kind of system level startup/status bit
     // Without this, IRQs don't work
@@ -680,7 +684,7 @@ static int smp_stop_cpu(int index, const struct cpu_info *cpu, bool deep_sleep)
         }
 
         printf("Stopping CPU %d (%d:%d:%d)... ", index, cpu->die, cpu->cluster, cpu->core);
-        u64 start_base = cpu_start_base + cpu->die * PMGR_DIE_OFFSET;
+        u64 start_base = cpu_start_base + cpu->die * pmgr_die_stride();
         cpu_stop_state[index].flag = spin_table[index].flag;
         cpu_stop_state[index].deep_sleep = deep_sleep;
         cpu_stop_state[index].pending = true;
@@ -975,7 +979,12 @@ int smp_init(void)
         cpu_info[i].valid = true;
         cpu_info[i].core = FIELD_GET(CPU_REG_CORE, reg);
         cpu_info[i].cluster = FIELD_GET(CPU_REG_CLUSTER, reg);
-        cpu_info[i].die = FIELD_GET(CPU_REG_DIE, reg);
+        /* T6050 Ultra's reg puts the die at bit 12 (die 1 = 0x1000); use die-id where given. */
+        u32 die_id;
+        if (ADT_GETPROP(adt, cpu_node, "die-id", &die_id) == sizeof(die_id))
+            cpu_info[i].die = die_id;
+        else
+            cpu_info[i].die = FIELD_GET(CPU_REG_DIE, reg);
         cpu_info[i].impl_reg = cpu_impl_reg[0];
 
         /* Publish a permanent stack before the first reset, including late entries. */
@@ -1022,7 +1031,7 @@ static void smp_start_t8152(void)
         if (!(rvbar & RVBAR_LOCK))
             write64(cpu->impl_reg, (u64)_vectors_start);
         sysop("dsb sy");
-        /* T8152ACC setCoreOnline/wakeCore preserve other released cores. */
+        /* Setting the start bits leaves the cores already released running. */
         set32(cpu_start_base + 4, BIT(i));
         set32(cpu_start_base + 8 + 4 * cpu->cluster, BIT(cpu->core));
         sysop("dsb sy");

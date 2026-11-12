@@ -94,6 +94,12 @@ else
 CARGO_FLAGS :=
 endif
 
+# Bring-up: skip MMU, MCC, AIC, SMP, PMGR, display and USB init and go
+# straight to the proxy on the boot console.
+ifeq ($(BRINGUP),1)
+CFG += BRINGUP
+endif
+
 ifeq ($(CHAINLOADING),1)
 CFG += CHAINLOADING
 CARGO_FLAGS += --features chainload
@@ -216,7 +222,7 @@ OBJECTS := \
 	iova.o \
 	isp.o \
 	j873.o \
-	kboot.o kboot_atc.o kboot_audio.o kboot_gpu_t8122.o kboot_gpu_t8122_power.o kboot_pmp_t8122.o \
+	kboot.o kboot_atc.o kboot_audio.o kboot_mte.o kboot_gpu_t8122.o kboot_gpu_t8122_power.o kboot_pmp_t8122.o \
 	kboot_t6020_compat.o \
 	kboot_display_handoff.o kboot_display_facts.o kboot_gpu26.o kboot_gpu_t6031.o kboot_t6031.o \
 	main.o boot_options.o \
@@ -247,7 +253,7 @@ OBJECTS := \
 	tps6598x.o tps6598x_command_core.o \
 	uart.o \
 	uartproxy.o \
-	usb.o usb_t8152.o usb_dwc3.o usb_dwc3_hs.o usb_dwc3_ss.o usb_cdc.o usb_cdc_atc.o usb_cdc_bulk.o usb_cdc_ss_desc.o usb_cdc_state.o \
+	usb.o usb_t8152.o usb_dwc3.o usb_dwc3_hs.o usb_dwc3_ss.o usb_dwc3_retain.o usb_cdc.o usb_cdc_atc.o usb_cdc_bulk.o usb_cdc_ss_desc.o usb_cdc_state.o \
 	utils.o utils_asm.o \
 	vsprintf.o \
 	wdt.o \

@@ -125,8 +125,12 @@ itself, so the device tree says nothing about them.
 
 A kernel whose executable pages all sit inside `CTXR_D` can run at EL2, so on a
 confined machine that is where it runs, on every CPU, with nothing of aura's left
-under it. This takes a boot object padded by aurora-installer and a kernel built
-with `CONFIG_ARM64_CTXR_EXECMEM`.
+under it. This takes a padded boot object and a kernel built with
+`CONFIG_ARM64_CTXR_EXECMEM`. aurora-installer pads the object when it enrolls
+it. `tools/macho_boot_object.py --execute-window RAW OUT` does the same padding
+(a raw image is wrapped first; an existing boot object is padded as it is) and
+writes the padding as a hole, so the file is sparse. Enroll it with
+`kmutil configure-boot --compress`.
 
 `ctxr_exec_window()` in `src/ctxr_exec.c` finds the window. It starts at the first
 2 MiB boundary past aura's 16 MiB slot and is 128 MiB long, which holds the kernel
@@ -150,7 +154,10 @@ stays reserved too. That is the size of the image: about 1 MiB for U-Boot, and a
 
 An object can arm more than the window, as one padded for 256 MiB does. The OS
 still gets 128 MiB at the same address, so a Mac enrolled at a larger size runs
-the same memory layout as a release. Everything else armed stays reserved:
+the same memory layout as a release. That address moves with the object, which iBoot
+loads somewhere else on every boot. With `hib=1` the OS instead gets the part of
+`CTXR_D` that every placement arms, at one address on every boot: 96 MiB for a release
+padding, 128 MiB for one padded for 256 MiB ([boot options](boot-options.md#hibernation-layout-hib1-t6040)). Everything else armed stays reserved:
 `CTXR_D` outside the window and the windows `CTXR_A` to `CTXR_C`. A window inside
 T8140's firmware RO range is left to that range's reservation. The monitor's Neo
 boots of 2026-10-31 relied on the range covering all three, so the J700 tree gains

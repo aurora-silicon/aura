@@ -76,7 +76,7 @@ const struct midr_part_features features_m1 = {
     .nex_powergating = true,
     .fast_ipi = true,
     .mmu_sprr = true,
-    .siq_cfg = true,
+    .siq_cfg = SIQ_CFG_ROUTE_2,
     .amx = true,
 };
 
@@ -89,7 +89,7 @@ const struct midr_part_features features_m2 = {
     .nex_powergating = true,
     .fast_ipi = true,
     .mmu_sprr = true,
-    .siq_cfg = true,
+    .siq_cfg = SIQ_CFG_ROUTE_2,
     .amx = true,
     .actlr_el2 = true,
 };
@@ -103,7 +103,7 @@ const struct midr_part_features features_m3 = {
     .nex_powergating = true,
     .fast_ipi = true,
     .mmu_sprr = true,
-    .siq_cfg = true,
+    .siq_cfg = SIQ_CFG_ROUTE_2,
     .amx = true,
     .actlr_el2 = true,
     .counter_redirect = true,
@@ -113,6 +113,19 @@ const struct midr_part_features features_m3 = {
 const struct midr_part_features features_m4 = {
     .sleep_mode = SLEEP_NONE, // XXX probably new mode required
     .fast_ipi = true,
+    .actlr_el2 = true,
+    .unsafe_wfi = true,
+};
+
+/*
+ * M5 Pro/Max/Ultra (Sotra cores): as M4, and every core accepts AIC IRQs. Without a SIQ_CFG_EL1
+ * write only the boot CPU takes them. The native OS's kernel writes 0 to SIQ_CFG_EL1 on every CPU
+ * as it starts, so each running CPU accepts device interrupts and the AIC picks one; 0 matches it.
+ */
+const struct midr_part_features features_m5_sotra = {
+    .sleep_mode = SLEEP_NONE,
+    .fast_ipi = true,
+    .siq_cfg = SIQ_CFG_ROUTE_0,
     .actlr_el2 = true,
     .unsafe_wfi = true,
 };
@@ -169,10 +182,12 @@ const struct midr_part_info midr_parts[] = {
     {MIDR_PART_T8140_TAHITI_PCORE, "A18 Pro Tahiti (P core)", NULL, &features_m4},
     {MIDR_PART_T8142_HIDRA_ECORE, "M5 Hidra (E core)", NULL, &features_m4},
     {MIDR_PART_T8142_HIDRA_PCORE, "M5 Hidra (P core)", NULL, &features_m4},
-    {MIDR_PART_T6050_SOTRA_MCORE, "M5 Pro Sotra (M core)", NULL, &features_m4},
-    {MIDR_PART_T6050_SOTRA_PCORE, "M5 Pro Sotra (P core)", NULL, &features_m4},
-    {MIDR_PART_T6051_SOTRAC_MCORE, "M5 Max Sotra C (M core)", NULL, &features_m4},
-    {MIDR_PART_T6051_SOTRAC_PCORE, "M5 Max Sotra C (P core)", NULL, &features_m4},
+    {MIDR_PART_T6050_SOTRA_MCORE, "M5 Pro Sotra (M core)", NULL, &features_m5_sotra},
+    {MIDR_PART_T6050_SOTRA_PCORE, "M5 Pro Sotra (P core)", NULL, &features_m5_sotra},
+    {MIDR_PART_T6051_SOTRAC_MCORE, "M5 Max Sotra C (M core)", NULL, &features_m5_sotra},
+    {MIDR_PART_T6051_SOTRAC_PCORE, "M5 Max Sotra C (P core)", NULL, &features_m5_sotra},
+    {MIDR_PART_T6050_ULTRA_MCORE, "M5 Ultra (M core)", NULL, &features_m5_sotra},
+    {MIDR_PART_T6050_ULTRA_PCORE, "M5 Ultra (P core)", NULL, &features_m5_sotra},
     {MIDR_PART_T8152_KOMODO_ECORE, "M6 (E/M core)", NULL, &features_m6},
     {MIDR_PART_T8152_KOMODO_PCORE, "M6 (P core)", NULL, &features_m6},
 };
@@ -240,8 +255,8 @@ void init_cpu(void)
 
     if (cpu_features->siq_cfg) {
         // Enable IRQs (at least necessary on t600x)
-        // XXX 0 causes pathological behavior in EL1, 2 works.
-        msr(SYS_IMP_APL_SIQ_CFG_EL1, 2);
+        // XXX 0 causes pathological behavior in EL1 on M1, 2 works there.
+        msr(SYS_IMP_APL_SIQ_CFG_EL1, cpu_features->siq_cfg == SIQ_CFG_ROUTE_0 ? 0 : 2);
         sysop("isb");
     }
 

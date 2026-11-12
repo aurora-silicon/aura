@@ -58,6 +58,22 @@ u32 chip_id;
 volatile enum exc_guard_t exc_guard;
 volatile int exc_count;
 struct fw_version_info os_firmware = {V14_7, "14.7", {14, 7, 0}, 3, "iBoot-10151.140.19.700.2"};
+const struct fw_version_info fw_versions[V26_6_2 + 1] = {
+    [V14_7] = {V14_7, "14.7", {14, 7, 0}, 3, "iBoot"},
+    [V26_6_2] = {V26_6_2, "26.6.2", {26, 6, 2}, 3, "mBoot-18000.161.10"},
+};
+
+/* As src/firmware.c: an iBoot of the 18000.161.10 train loads the 26.6.2 images. */
+enum fw_version firmware_os_components(void)
+{
+    static const char train[] = "mBoot-18000.161.10.";
+
+    if (os_firmware.version == V26_6_2)
+        return V26_6_2;
+    if (os_firmware.iboot && !strncmp(os_firmware.iboot, train, sizeof(train) - 1))
+        return V26_6_2;
+    return os_firmware.version;
+}
 size_t mcc_carveout_count;
 struct mcc_carveout mcc_carveouts[8];
 static u64 ram_base, ram_size, fb_base;

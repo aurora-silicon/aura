@@ -208,9 +208,35 @@ bool ctxr_exec_confined(void)
 #define CTXR_EXEC_ALIGN       ((u64)2 * SZ_1M)
 #define CTXR_EXEC_WINDOW_SIZE ((u64)128 * SZ_1M)
 
+/*
+ * A fixed window, for an OS that hibernates (kboot's hib=1).
+ *
+ * iBoot loads the boot object somewhere else on every boot. It draws a slide in 16 KiB steps and
+ * keeps the object's physical address congruent to its virtual one modulo 32 MiB. The object's
+ * first virtual address, 0xfffffe0007004000 in tools/macho_boot_object.py, is 0x1004000 into its
+ * 32 MiB block, so what iBoot places for the object (device tree, trust cache, then the object)
+ * starts at least 0x1004000 above the 32 MiB aligned start of RAM, and the object itself at most
+ * 0x1ffc000 above that. The window above aura's slot moves with the object, and with the window
+ * the kernel a loader places in it: an image saved on one boot would then not be where the next
+ * boot's secondaries can execute.
+ *
+ * The fixed window is the part of CTXR_D every placement arms above aura's slot: from past the
+ * slot of the highest placement to where CTXR_D ends in the lowest one. How far CTXR_D reaches
+ * above aura's base is the object's own size, the same on every boot of one object, so the fixed
+ * window is the same on every boot of it. Each boot checks the fixed window as the window above
+ * aura's slot is checked. One that doesn't fit gets that window instead, and kboot then refuses
+ * the hibernation layout.
+ */
+#define CTXR_EXEC_SLIDE_ALIGN   ((u64)SZ_32M)
+#define CTXR_EXEC_OBJECT_VA_OFF ((u64)0x1004000) /* 0xfffffe0007004000 modulo 32 MiB */
+#define CTXR_EXEC_OBJECT_IMAGE  ((u64)0x10000)   /* the raw image, 64 KiB into the object */
+#define CTXR_EXEC_SLIDE_SPAN    ((u64)SZ_32M - SZ_16K)
+#define CTXR_EXEC_FIXED_MIN     ((u64)64 * SZ_1M)
+
 static bool window_checked;
 static const char *window_problem;
 static u64 window_base, window_size;
+static bool fixed_requested, window_fixed;
 
 static bool ranges_overlap(u64 start_a, u64 end_a, u64 start_b, u64 end_b)
 {
@@ -239,19 +265,10 @@ static bool ctxr_exec_holds_ro_range(u64 start, u64 end)
     return false;
 }
 
-/* Returns why there is no window to use, or NULL having set it. */
-static const char *ctxr_exec_find_window(u64 *base, u64 *size)
+/* Why [start, end) can't be the OS window under CTXR_D [lower, armed_end), or NULL. */
+static const char *ctxr_exec_window_unusable(u64 lower, u64 armed_end, u64 start, u64 end)
 {
-    u64 lower = 0, armed_end = 0;
-    u64 start = ALIGN_UP((u64)_base + CTXR_EXEC_AURA_SLOT, CTXR_EXEC_ALIGN);
-    u64 end = start + CTXR_EXEC_WINDOW_SIZE;
-
-    if (ctxr_range(CTXR_RANGE_D, &lower, &armed_end))
-        armed_end = ALIGN_DOWN(armed_end, SZ_16K);
-    printf("CTXR exec: armed [0x%lx, 0x%lx)\n", lower, armed_end);
-    if (armed_end <= lower)
-        return "CTXR_D reads as empty";
-    if ((u64)_base < lower || (u64)_end > start)
+    if ((u64)_base < lower || (u64)_end > start || (u64)_base + CTXR_EXEC_AURA_SLOT > start)
         return "aura is not inside CTXR_D and its slot";
     if (armed_end < end)
         return "this Stage 1 did not arm a large enough window";
@@ -263,9 +280,72 @@ static const char *ctxr_exec_find_window(u64 *base, u64 *size)
     /* The heap holds the device tree and the initrd the OS is about to read. */
     if (cur_boot_args.top_of_kernel_data < end)
         return "the heap starts inside it";
+    return NULL;
+}
 
-    printf("CTXR exec: OS window [0x%lx, 0x%lx); 0x%lx armed bytes above it stay reserved\n", start,
-           end, armed_end - end);
+/* This object's fixed window, or why it has none. Changes nothing. */
+static const char *ctxr_exec_fixed_window(u64 armed_end, u64 *start, u64 *end)
+{
+    u64 ram = cur_boot_args.phys_base;
+    u64 lo = ALIGN_UP(ram, CTXR_EXEC_SLIDE_ALIGN);
+    u64 lowest = lo + CTXR_EXEC_OBJECT_VA_OFF + CTXR_EXEC_OBJECT_IMAGE;
+    u64 highest = lowest + CTXR_EXEC_SLIDE_SPAN;
+    u64 base = (u64)_base;
+
+    if (!ram || lo < ram || highest < lo)
+        return "the start of RAM is not known";
+    if (armed_end <= base)
+        return "CTXR_D ends below aura";
+    /* Where iBoot put the object this boot, which the fixed window has to allow for: say it. */
+    printf("CTXR exec: aura at 0x%lx = 0x%lx + 0x%lx, iBoot places it at +0x%lx to +0x%lx%s\n",
+           base, lo, base - lo, lowest - lo, highest - lo,
+           base < lowest || base > highest ? " (this boot is outside that)" : "");
+
+    u64 s = ALIGN_UP(highest + CTXR_EXEC_AURA_SLOT, CTXR_EXEC_ALIGN);
+    u64 e = ALIGN_DOWN(lowest + (armed_end - base), CTXR_EXEC_ALIGN);
+
+    if (e > s + CTXR_EXEC_WINDOW_SIZE)
+        e = s + CTXR_EXEC_WINDOW_SIZE;
+    if (e < s + CTXR_EXEC_FIXED_MIN)
+        return "the object is too small for a window every placement arms";
+    *start = s;
+    *end = e;
+    return NULL;
+}
+
+/* Returns why there is no window to use, or NULL having set it. */
+static const char *ctxr_exec_find_window(u64 *base, u64 *size)
+{
+    u64 lower = 0, armed_end = 0;
+    u64 start = ALIGN_UP((u64)_base + CTXR_EXEC_AURA_SLOT, CTXR_EXEC_ALIGN);
+    u64 end = start + CTXR_EXEC_WINDOW_SIZE;
+    const char *why;
+
+    if (ctxr_range(CTXR_RANGE_D, &lower, &armed_end))
+        armed_end = ALIGN_DOWN(armed_end, SZ_16K);
+    printf("CTXR exec: armed [0x%lx, 0x%lx)\n", lower, armed_end);
+    if (armed_end <= lower)
+        return "CTXR_D reads as empty";
+    if (fixed_requested) {
+        u64 fixed_start = 0, fixed_end = 0;
+
+        why = ctxr_exec_fixed_window(armed_end, &fixed_start, &fixed_end);
+        if (!why)
+            why = ctxr_exec_window_unusable(lower, armed_end, fixed_start, fixed_end);
+        if (why) {
+            printf("CTXR exec: no fixed window (%s): the OS gets the one above aura\n", why);
+        } else {
+            window_fixed = true;
+            start = fixed_start;
+            end = fixed_end;
+        }
+    }
+    why = ctxr_exec_window_unusable(lower, armed_end, start, end);
+    if (why)
+        return why;
+
+    printf("CTXR exec: %s [0x%lx, 0x%lx); 0x%lx armed bytes above it stay reserved\n",
+           window_fixed ? "fixed OS window" : "OS window", start, end, armed_end - end);
     *base = start;
     *size = end - start;
     return NULL;
@@ -290,6 +370,19 @@ bool ctxr_exec_window(u64 *base, u64 *size)
     if (size)
         *size = window_size;
     return true;
+}
+
+bool ctxr_exec_request_fixed_window(bool on)
+{
+    if (window_checked)
+        return false;
+    fixed_requested = on;
+    return true;
+}
+
+bool ctxr_exec_window_is_fixed(void)
+{
+    return ctxr_exec_window(NULL, NULL) && window_fixed;
 }
 
 bool ctxr_exec_os_may_start(void)

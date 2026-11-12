@@ -94,6 +94,7 @@ REASONS = {
     "stale-optin-zero": PUBLISHED,
     "repeat": "handoff already published",
     "oslog-in-memreserve": "lies inside /memreserve/",
+    "os-26-7-train": PUBLISHED,
     "wrong-chip": "not a J616s/J614s (chip 0x6041): nothing done",
     "wrong-board": "not a J616s/J614s (chip 0x6040): nothing done",
     "j614-no-optin": PUBLISHED,

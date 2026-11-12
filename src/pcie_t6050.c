@@ -313,7 +313,7 @@ static int storage_find(void)
 
     if (adt_path_offset_trace(adt, "/arm-io/ans", path_nodes) < 0 ||
         adt_get_reg(adt, path_nodes, "reg", 0, &ans, &span) || span < 0x8118 ||
-        adt_get_reg(adt, path_nodes, "reg", 3, &nvme, &span) || span < 0x1304)
+        adt_get_reg(adt, path_nodes, "reg", 9, &nvme, &span) || span < 0x1304)
         FAIL("no /arm-io/ans\n");
     if (adt_path_offset_trace(adt, "/arm-io/sart-ans", path_nodes) < 0 ||
         adt_get_reg(adt, path_nodes, "reg", 0, &sart, &span) || span < 0xc0 + 4 * SART_SLOTS)
@@ -322,6 +322,7 @@ static int storage_find(void)
     storage_addr[ST_ANS_STATUS] = ans + 0x48;
     storage_addr[ST_A2I] = ans + 0x8110;
     storage_addr[ST_I2A] = ans + 0x8114;
+    /* reg 9 is the NVMe block, as Aura's nvme.c and Linux's DT use it; reg 3 is the NVMMU */
     storage_addr[ST_BOOT_STATUS] = nvme + 0x1300;
     storage_addr[ST_CC] = nvme + 0x14;
     storage_addr[ST_CSTS] = nvme + 0x1c;
