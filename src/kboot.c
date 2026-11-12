@@ -9018,7 +9018,8 @@ static int dt_reserve_t8132_aop_windows(const char *path)
  * DAPF, then reserve both segments at the IOVAs the firmware uses (their remap
  * addresses: EC0p for __ETEXT, the physical address for __OS_LOG) and the
  * DAPF windows. Without all of it the firmware cannot run, so on any failure
- * the AOP is disabled.
+ * the AOP is disabled. No other M4 board's AOP handoff is qualified: there the
+ * AOP is disabled too, without touching it or its DART.
  */
 static int dt_set_t8132_aop(const char *path)
 {
@@ -9026,8 +9027,10 @@ static int dt_set_t8132_aop(const char *path)
     int node;
 
     if (fdt_node_check_compatible(dt, 0, "apple,j713") &&
-        fdt_node_check_compatible(dt, 0, "apple,j604"))
-        return 0; /* No other M4 board's AOP handoff is qualified. */
+        fdt_node_check_compatible(dt, 0, "apple,j604")) {
+        why = "no handoff is qualified for this board";
+        goto disable;
+    }
 
     int chosen = fdt_path_offset(dt, "/chosen");
     if (chosen < 0 ||
