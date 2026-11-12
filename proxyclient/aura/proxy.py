@@ -431,7 +431,28 @@ class UartInterface(Reloadable):
         result = bytearray()
         for offset in range(0, size, 16 * 1024):
             count = min(16 * 1024, size - offset)
-            result.extend(self._readmem_one(addr + offset, count))
+            if not self.is_kis:
+                result.extend(self._readmem_one(addr + offset, count))
+                continue
+            # KIS: a read is idempotent, so a chunk whose reply was cut short (USB error mid-transfer, or the
+            # bridge dropping the device) is resynced, the device reopened if it went away, and read again.
+            for attempt in range(6):
+                try:
+                    result.extend(self._readmem_one(addr + offset, count))
+                    break
+                except (UartTimeout, UartChecksumError, UartRemoteError, SerialException) as e:
+                    if attempt == 5:
+                        raise
+                    print("readmem 0x%x: %s; resync and retry %d" % (addr + offset, e, attempt + 1), flush=True)
+                    time.sleep(1)
+                    if isinstance(e, SerialException) and not self._kis_reopen():
+                        raise
+                    try:
+                        self._kis_resync()
+                    except SerialException:
+                        if not self._kis_reopen():
+                            raise
+                        self._kis_resync()
         return bytes(result)
 
     def _readmem_one(self, addr, size):
