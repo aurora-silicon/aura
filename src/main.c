@@ -519,6 +519,11 @@ next_stage:
     if (aura_trial_enabled() && wdt_arm_trial())
         printf("WDT: could not arm the trial watchdog\n");
     printf("Vectoring to next stage...\n");
+#ifdef J613_HV_MONITOR
+    /* Replay after FDT preparation and shutdown chatter, while IODEV_LOG still
+     * writes the reserved aura_stage2.log ring exposed to Linux. */
+    sptm_j613_probe_replay();
+#endif
 #if defined(CHAINLOADING) && !defined(ESP_STAGE2)
     stage1_log_flush();
 #endif
