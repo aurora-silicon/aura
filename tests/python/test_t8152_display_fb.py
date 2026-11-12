@@ -8,7 +8,7 @@ display_configure, display_swap_state and display_configure_second. The iBoot
 types come from dcp_iboot.h.
 
 Host models:
-- Each DCP has two DARTs (disp, dcp) that record every mapping. dart_unmap()
+- Each DCP has two DARTs (disp, dcp) that record every mapping. dart_unmap_checked()
   must match a live mapping exactly; dart_find_iova() returns the first gap.
 - iova_alloc()/iova_free() track live allocations; a free must match one.
 - The iBoot calls are scripted: one connected sink with a mode list and one
@@ -64,6 +64,7 @@ def unit():
         function(disp, "static void display_choose_timing_mode("),
         function(disp, "static void display_choose_color_mode("),
         function(disp, "static bool display_t6030_hands_off("),
+        function(disp, "static bool display_unmap_fb("),
         function(disp, "static uintptr_t display_map_fb("),
         function(disp, "int display_start_dcp("),
         block(disp, disp.index("struct display_options {")) + ";\n",
@@ -159,12 +160,14 @@ static int dart_map(dart_dev_t *d, u64 iova, void *pa, size_t size)
     add_map(d, iova, (u64)pa, size);
     return 0;
 }
-static void dart_unmap(dart_dev_t *d, u64 iova, size_t size)
+static bool dart_unmap_checked(dart_dev_t *d, u64 iova, size_t size)
 {
     struct mapping *m = find_map(d, iova);
     assert(m && m->size == size && "unmap of a range that is not mapped");
     m->live = false;
+    return true;
 }
+static bool dart_has_failed(dart_dev_t *d) { return !d; }
 static u64 dart_vm_base(dart_dev_t *d) { (void)d; return 0x10000000; }
 static u64 dart_find_iova(dart_dev_t *d, s64 start, size_t size)
 {

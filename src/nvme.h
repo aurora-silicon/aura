@@ -19,6 +19,8 @@ bool nvme_set_sart_var(const char *val);
 bool nvme_flush(u32 nsid);
 /* A command of this session failed or timed out: later ones fail until a restart. */
 bool nvme_io_failed(void);
+/* True once an I/O queue command was lost: callers keep their read buffers. */
+bool nvme_dma_uncertain(void);
 bool nvme_read(u32 nsid, u64 lba, void *buffer);
 #define NVME_MAX_READ_BLOCKS 256
 bool nvme_read_blocks(u32 nsid, u64 lba, void *buffer, u32 count);

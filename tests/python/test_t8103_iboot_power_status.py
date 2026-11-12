@@ -180,7 +180,7 @@ static int display_swap(u64 iova, u32 stride, u32 w, u32 h) { (void)iova; (void)
 static u64 top_of_memory_alloc(size_t s) { (void)s; assert(0); return 0; }
 static u64 iova_alloc(void *d, size_t s) { (void)d; (void)s; assert(0); return 0; }
 static void iova_free(void *d, u64 a, size_t s) { (void)d; (void)a; (void)s; assert(0); }
-static void dart_unmap(void *d, u64 a, size_t s) { (void)d; (void)a; (void)s; assert(0); }
+static bool display_unmap_fb(uintptr_t iova, size_t s) { (void)iova; (void)s; assert(0); return false; }
 static void mmu_map_framebuffer(u64 a, u64 s) { (void)a; (void)s; assert(0); }
 static int adt_path_offset(void *a, const char *p) { (void)a; (void)p; assert(0); return -1; }
 static int adt_setprop(void *a, int n, const char *p, void *v, size_t s) { (void)a; (void)n; (void)p; (void)v; (void)s; assert(0); return -1; }

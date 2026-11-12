@@ -3,7 +3,7 @@
 use crate::{
     c_size_t,
     gpt::GPT,
-    nvme::{alloc_sector_buf, nvme_read, NVMEStorage, SectorBuffer},
+    nvme::{alloc_sector_buf, nvme_dma_uncertain, nvme_read, NVMEStorage, SectorBuffer},
     println,
 };
 use alloc::{boxed::Box, slice, string::String, vec::Vec};
@@ -167,20 +167,27 @@ const ROOT_DIR_INO_NUM: u64 = 2;
 
 struct Partition {
     offset: u64,
-    buf: Box<SectorBuffer>,
+    buf: Option<Box<SectorBuffer>>,
 }
 
 fn pread(disk: &mut Partition, pos: u64, target: &mut [u8]) -> Result<(), ()> {
     unsafe {
         for i in 0..target.len().next_multiple_of(4096) / 4096 {
             let lba = disk.offset + i as u64 + pos;
-            if !nvme_read(1, lba, disk.buf.0.as_mut_ptr() as *mut _) {
+            let buf = disk.buf.as_mut().ok_or(())?;
+            if !nvme_read(1, lba, buf.0.as_mut_ptr() as *mut _) {
+                if nvme_dma_uncertain() {
+                    // The timed-out controller may still DMA into this exact allocation.
+                    if let Some(buf) = disk.buf.take() {
+                        mem::forget(buf);
+                    }
+                }
                 println!("nvme_read({}, {}) failed", 1, lba);
                 return Err(());
             }
             let off = i * 4096;
             let copy_len = cmp::min(4096, target.len() - off);
-            target[off..off + copy_len].copy_from_slice(&disk.buf.0[..copy_len])
+            target[off..off + copy_len].copy_from_slice(&buf.0[..copy_len])
         }
     }
     Ok(())
@@ -367,7 +374,7 @@ fn scan_disks() -> Result<Vec<u8>, ()> {
         }
         let mut part = Partition {
             offset: v.get_starting_lba(),
-            buf: alloc_sector_buf(),
+            buf: Some(alloc_sector_buf()),
         };
         return scan_volume(&mut part);
     }
@@ -398,4 +405,13 @@ pub unsafe extern "C" fn rust_free_gigalocker(data: *mut c_void, size: c_size_t)
             size,
         )));
     }
+}
+
+#[cfg(test)]
+pub(crate) fn test_scan_volume(offset: u64) -> Result<Vec<u8>, ()> {
+    let mut part = Partition {
+        offset,
+        buf: Some(alloc_sector_buf()),
+    };
+    scan_volume(&mut part)
 }

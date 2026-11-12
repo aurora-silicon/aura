@@ -2005,8 +2005,11 @@ void usb_dwc3_shutdown(dwc3_dev_t *dev)
     clear32(dev->regs + DWC3_DCTL, DWC3_DCTL_RUN_STOP);
 
     /* wait until the controller is shut down */
-    if (poll32(dev->regs + DWC3_DSTS, DWC3_DSTS_DEVCTRLHLT, DWC3_DSTS_DEVCTRLHLT, 1000))
+    if (poll32(dev->regs + DWC3_DSTS, DWC3_DSTS_DEVCTRLHLT, DWC3_DSTS_DEVCTRLHLT, 1000)) {
+        /* A controller that did not halt may still be moving data. */
+        dev->dma_unsafe = true;
         usb_debug_printf("timeout while waiting for DWC3_DSTS_DEVCTRLHLT during shutdown.\n");
+    }
 
     /* reset the device side of the controller just to be safe */
     set32(dev->regs + DWC3_DCTL, DWC3_DCTL_CSFTRST);
@@ -2017,11 +2020,16 @@ void usb_dwc3_shutdown(dwc3_dev_t *dev)
     if (dev->dma_unsafe)
         return;
 
-    /* unmap and free dma buffers */
-    dart_unmap(dev->dart, TRB_BUFFER_IOVA, TRB_BUFFER_SIZE);
-    dart_unmap(dev->dart, XFER_BUFFER_IOVA, XFER_BUFFER_SIZE);
-    dart_unmap(dev->dart, SCRATCHPAD_IOVA, max(DWC3_SCRATCHPAD_SIZE, SZ_16K));
-    dart_unmap(dev->dart, EVENT_BUFFER_IOVA, max(DWC3_EVENT_BUFFERS_SIZE, SZ_16K));
+    /* Free the buffers only once the DART confirmed it no longer maps them. */
+    if (!dart_unmap_checked(dev->dart, TRB_BUFFER_IOVA, TRB_BUFFER_SIZE) ||
+        !dart_unmap_checked(dev->dart, XFER_BUFFER_IOVA, XFER_BUFFER_SIZE) ||
+        !dart_unmap_checked(dev->dart, SCRATCHPAD_IOVA, max(DWC3_SCRATCHPAD_SIZE, SZ_16K)) ||
+        !dart_unmap_checked(dev->dart, EVENT_BUFFER_IOVA, max(DWC3_EVENT_BUFFERS_SIZE, SZ_16K)) ||
+        !dart_shutdown_checked(dev->dart)) {
+        dev->dma_unsafe = true;
+        usb_debug_printf("DART unmap failed during shutdown; preserving DMA buffers\n");
+        return;
+    }
 
     free(dev->evtbuffer);
     free(dev->scratchpad);
@@ -2032,8 +2040,6 @@ void usb_dwc3_shutdown(dwc3_dev_t *dev)
         ringbuffer_free(dev->pipe[i].host2device);
     }
 
-    if (dev->dart)
-        dart_shutdown(dev->dart);
     free(dev);
 }
 
