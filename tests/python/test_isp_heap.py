@@ -40,6 +40,7 @@ typedef uint64_t u64;
 #define V26_6 7
 #define V26_6_2 6
 #define V27_0 8
+#define V27_2 9
 #define PMGR_PS_ACTIVE 15
 #define PMGR_PS_PWRGATE 0
 #define SZ_16K 0x4000
@@ -279,6 +280,15 @@ int main(void)
     assert(isp_get_heap(&phys, &iova, &size) == 0);
     assert(iova == 0x16ec000 && size == 0x114000);
     assert(dapf_calls == 1 && allocations == 1);
+
+    /* 27.2's firmware ends there too; the segment check is what admits it. */
+    reset(); chip_id = T8142;
+    os_firmware.version = V27_2; os_firmware.string = "27.2";
+    segments[0].size = 0xd68000;
+    segments[1].iova = 0xd68000; segments[1].size = 0x984000;
+    assert(isp_init() == 0);
+    assert(isp_get_heap(&phys, &iova, &size) == 0);
+    assert(iova == 0x16ec000 && size == 0x114000);
     return 0;
 }
 """
