@@ -10,6 +10,7 @@
 #include "boot_options.h"
 #include "chainload.h"
 #include "cpufreq.h"
+#include "debugport.h"
 #include "display.h"
 #include "dockchannel_uart.h"
 #include "exception.h"
@@ -318,6 +319,16 @@ void run_actions(void)
     uartproxy_run(NULL);
 }
 
+/*
+ * Late, on the way out: loading a payload covers the port controllers' settle time. The check
+ * leaves every port controller asleep, so wake the USB hosts' ones again, as j873_usb_prep() did.
+ */
+static void j873g_debugport_check(void)
+{
+    debugport_check();
+    j873_usb_wake_hpms();
+}
+
 static void j873g_run_proxy(void)
 {
     u32 model_len = 0, target_len = 0;
@@ -336,6 +347,8 @@ static void j873g_run_proxy(void)
     wdt_disable();
     if (smp_init() < 0)
         panic("Unsupported T8152 CPU topology\n");
+    /* Its SPMI port controllers need time in S0 before j873g_debugport_check() reads them. */
+    debugport_powerup();
     /* The DCPEXT0/DPTX_PHY power gates are PMGR2 devices; without this the
      * HDMI phy stays gated and the first register access aborts. */
     pmgr_init();
@@ -363,6 +376,7 @@ static void j873g_run_proxy(void)
         printf("Checking for payloads...\n");
         if (payload_run() == 0) {
             printf("Valid payload found\n");
+            j873g_debugport_check();
             return;
         }
         printf("No valid payload found\n");
@@ -373,6 +387,7 @@ static void j873g_run_proxy(void)
     mdelay(10000);
     flush_and_reboot();
 #else
+    j873g_debugport_check();
     printf("Running proxy...\n");
     uartproxy_run(NULL);
 #endif
