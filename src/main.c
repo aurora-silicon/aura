@@ -34,6 +34,7 @@
 #include "tps6598x.h"
 #include "uart.h"
 #include "uartproxy.h"
+#include "kboot.h"
 #include "usb.h"
 #include "usb_cdc.h"
 #include "utils.h"
@@ -460,6 +461,12 @@ next_stage:
 #ifndef BRINGUP
     if (chip_id != T8152) {
         usb_iodev_shutdown();
+        /*
+         * A controller that could not be stopped keeps its buffers: boot on with
+         * them reserved, so the kernel never hands out memory it may still write.
+         */
+        if (kboot_reserve_usb_dma())
+            printf("USB: retained DMA not fully reserved; booting on\n");
         /* Its firmware may still use memory the next stage will reuse. */
         if (display_shutdown(DCP_SLEEP_IF_EXTERNAL) < 0) {
             printf("Display handoff failed; returning to proxy\n");

@@ -55,7 +55,7 @@ typedef struct ringbuffer ringbuffer_t;
 typedef struct {
     uintptr_t regs;
     dart_dev_t *dart;
-    bool failed, dma_unsafe;
+    bool failed, dma_unsafe, shutting_down;
     void *evtbuffer, *scratchpad, *xferbuffer, *trbs;
     struct { bool ready; ringbuffer_t *device2host, *host2device; } pipe[CDC_ACM_PIPE_MAX];
     struct { bool xfer_in_progress; } endpoints[MAX_ENDPOINTS];
@@ -72,10 +72,11 @@ static int poll32(u64 a, u32 m, u32 v, unsigned us)
     if (a == DWC3_DCTL) return fail_reset ? -1 : 0;
     return 0;
 }
-static int usb_dwc3_ep_command(dwc3_dev_t *d, u8 ep, u32 c, u32 a, u32 b, u32 e)
-{ (void)d; (void)ep; (void)c; (void)a; (void)b; (void)e; return 0; }
-static int usb_dwc3_end_transfer(dwc3_dev_t *d, u8 ep) { (void)d; (void)ep; return 0; }
-static void usb_dwc3_fail_session(dwc3_dev_t *d) { d->failed = true; }
+static int retires, retained;
+static int usb_dwc3_retire_transfer(dwc3_dev_t *d, u8 ep)
+{ d->endpoints[ep].xfer_in_progress = false; retires++; return 0; }
+static bool usb_dwc3_retain_dma(uintptr_t base, size_t size) { (void)base; (void)size; retained++; return true; }
+static bool usb_dwc3_retain_dart(dart_dev_t *d) { (void)d; retained++; return true; }
 static bool dart_unmap_checked(dart_dev_t *d, uintptr_t iova, size_t len)
 {
     (void)d; (void)iova; (void)len;
@@ -86,7 +87,8 @@ static void ringbuffer_free(ringbuffer_t *r) { (void)r; ring_frees++; }
 static void mock_free(void *p) { (void)p; frees++; }
 #define free mock_free
 '''
-    harness += function(source, "void usb_dwc3_shutdown(")
+    harness += function(source, "static void usb_dwc3_retain(")
+    harness += function(source, "bool usb_dwc3_shutdown(")
     harness += r'''
 #undef free
 static dwc3_dev_t *make(void)
@@ -97,36 +99,38 @@ static dwc3_dev_t *make(void)
     dev.dart = (dart_dev_t *)&dev;
     dev.endpoints[1].xfer_in_progress = true;
     fail_halt = fail_reset = fail_unmap = fail_dart_shutdown = 0;
-    unmaps = dart_shutdowns = frees = ring_frees = 0;
+    unmaps = dart_shutdowns = frees = ring_frees = retires = retained = 0;
     return &dev;
 }
 int main(void)
 {
     dwc3_dev_t *dev = make();
-    usb_dwc3_shutdown(dev);
-    assert(unmaps == 4 && dart_shutdowns == 1 && frees == 5 && ring_frees == 4);
+    assert(usb_dwc3_shutdown(dev));
+    assert(retires == 1 && unmaps == 4 && dart_shutdowns == 1 && frees == 5 && ring_frees == 4);
+    assert(!retained);
 
     for (int i = 1; i <= 4; i++) {
         dev = make();
         fail_unmap = i;
-        usb_dwc3_shutdown(dev);
+        assert(!usb_dwc3_shutdown(dev));
         assert(dev->dma_unsafe && unmaps == i && !dart_shutdowns && !frees && !ring_frees);
+        assert(retained == 5);
     }
 
     dev = make();
     fail_dart_shutdown = 1;
-    usb_dwc3_shutdown(dev);
-    assert(dev->dma_unsafe && !frees && !ring_frees);
+    assert(!usb_dwc3_shutdown(dev));
+    assert(dev->dma_unsafe && !frees && !ring_frees && retained == 5);
 
     dev = make();
     fail_halt = 1;
-    usb_dwc3_shutdown(dev);
-    assert(dev->dma_unsafe && !unmaps && !frees);
+    assert(!usb_dwc3_shutdown(dev));
+    assert(dev->dma_unsafe && !unmaps && !frees && retained == 5);
 
     dev = make();
     fail_reset = 1;
-    usb_dwc3_shutdown(dev);
-    assert(dev->dma_unsafe && !unmaps && !frees);
+    assert(!usb_dwc3_shutdown(dev));
+    assert(dev->dma_unsafe && !unmaps && !frees && retained == 5);
     return 0;
 }
 '''

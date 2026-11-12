@@ -636,17 +636,24 @@ void usb_iodev_init(void)
     }
 }
 
-void usb_iodev_shutdown(void)
+/* False when a controller may still reach its DMA buffers (they are retained, see usb_dwc3.h). */
+bool usb_iodev_shutdown(void)
 {
+    bool stopped = true;
+
     for (int i = FIRST_USB_IODEV; i < USB_IODEV_COUNT; i++) {
         struct iodev *usb_iodev = iodev_unregister_device(IODEV_USB0 + i);
         if (!usb_iodev)
             continue;
 
         printf("USB%d: shutdown\n", i);
-        usb_dwc3_shutdown(usb_iodev->opaque);
+        if (!usb_dwc3_shutdown(usb_iodev->opaque)) {
+            printf("USB%d: controller not stopped, its DMA buffers are retained\n", i);
+            stopped = false;
+        }
         free(usb_iodev);
     }
+    return stopped;
 }
 
 void usb_iodev_vuart_setup(iodev_id_t iodev)

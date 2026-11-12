@@ -5,7 +5,7 @@
 
 typedef struct dwc3_hs_dev dwc3_hs_dev_t;
 dwc3_hs_dev_t *usb_dwc3_hs_init(uintptr_t regs, dart_dev_t *dart);
-void usb_dwc3_hs_shutdown(dwc3_hs_dev_t *dev);
+bool usb_dwc3_hs_shutdown(dwc3_hs_dev_t *dev);
 void usb_dwc3_hs_handle_events(dwc3_hs_dev_t *dev);
 ssize_t usb_dwc3_hs_can_read(dwc3_hs_dev_t *dev, cdc_acm_pipe_id_t pipe);
 bool usb_dwc3_hs_can_write(dwc3_hs_dev_t *dev, cdc_acm_pipe_id_t pipe);
@@ -17,7 +17,7 @@ size_t usb_dwc3_hs_queue(dwc3_hs_dev_t *dev, cdc_acm_pipe_id_t pipe, const void 
 void usb_dwc3_hs_flush(dwc3_hs_dev_t *dev, cdc_acm_pipe_id_t pipe);
 typedef struct dwc3_ss_dev dwc3_ss_dev_t;
 dwc3_ss_dev_t *usb_dwc3_ss_init(uintptr_t regs, dart_dev_t *dart);
-void usb_dwc3_ss_shutdown(dwc3_ss_dev_t *dev);
+bool usb_dwc3_ss_shutdown(dwc3_ss_dev_t *dev);
 void usb_dwc3_ss_handle_events(dwc3_ss_dev_t *dev);
 ssize_t usb_dwc3_ss_can_read(dwc3_ss_dev_t *dev, cdc_acm_pipe_id_t pipe);
 bool usb_dwc3_ss_can_write(dwc3_ss_dev_t *dev, cdc_acm_pipe_id_t pipe);
@@ -60,15 +60,15 @@ dwc3_dev_t *usb_dwc3_init(uintptr_t regs, dart_dev_t *dart)
     return usb_dwc3_init_mode(regs, dart, false);
 }
 
-void usb_dwc3_shutdown(dwc3_dev_t *dev)
+bool usb_dwc3_shutdown(dwc3_dev_t *dev)
 {
     if (!dev)
-        return;
-    if (dev->superspeed)
-        usb_dwc3_ss_shutdown(dev->engine.ss);
-    else
-        usb_dwc3_hs_shutdown(dev->engine.hs);
+        return true;
+    bool stopped = dev->superspeed ? usb_dwc3_ss_shutdown(dev->engine.ss)
+                                   : usb_dwc3_hs_shutdown(dev->engine.hs);
+    /* Only the engine's memory is DMA; the wrapper goes either way. */
     free(dev);
+    return stopped;
 }
 
 void usb_dwc3_handle_events(dwc3_dev_t *dev)
