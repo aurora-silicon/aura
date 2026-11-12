@@ -1125,6 +1125,12 @@ static void *kboot_hibernate_handoff_dt(void)
     return (void *)hib_dt_base;
 }
 
+/* The hibernation slot's capacity when fdt is the tree copied there, else 0. */
+static int kboot_hibernate_handoff_size(const void *fdt)
+{
+    return hib_dt_base && fdt == (const void *)hib_dt_base ? HIB_DT_SLOT : 0;
+}
+
 static int dt_set_chosen(void)
 {
 
@@ -11828,8 +11834,7 @@ static int dt_reserve_retained_dma(void *fdt, int bufsize, const struct usb_dwc3
     if (resv < 0) {
         resv = fdt_add_subnode(fdt, 0, "reserved-memory");
         if (resv < 0 || fdt_setprop_u32(fdt, resv, "#address-cells", 2) ||
-            fdt_setprop_u32(fdt, resv, "#size-cells", 2) ||
-            fdt_setprop_empty(fdt, resv, "ranges"))
+            fdt_setprop_u32(fdt, resv, "#size-cells", 2) || fdt_setprop_empty(fdt, resv, "ranges"))
             return -1;
     }
     for (size_t i = 0; i < count; i++) {
@@ -11859,11 +11864,7 @@ int kboot_reserve_usb_dma(void)
         return 0;
     /* kboot_boot() handed the kernel dt, or its copy in the hibernation slot. */
     void *fdt = (void *)next_stage.args[0];
-    int size = 0;
-    if (dt && fdt == dt)
-        size = dt_bufsize;
-    else if (hib_dt_base && fdt == (void *)hib_dt_base)
-        size = HIB_DT_SLOT;
+    int size = dt && fdt == dt ? dt_bufsize : kboot_hibernate_handoff_size(fdt);
     if (!next_stage.entry || !size) {
         printf("USB: DMA retained, but the next stage is no kernel handoff to reserve it in\n");
         return -1;

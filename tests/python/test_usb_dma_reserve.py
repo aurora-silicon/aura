@@ -202,5 +202,5 @@ def test_handoff_reserves_and_boots_on():
     assert "flush_and_reboot" not in step and "panic(" not in step and "uartproxy_run" not in step
     reserve = function((ROOT / "src/kboot.c").read_text(), "kboot_reserve_usb_dma")
     # Only the tree kboot_boot() handed over (dt, or its hibernation-slot copy) is edited.
-    assert "fdt == dt" in reserve and "fdt == (void *)hib_dt_base" in reserve
+    assert "fdt == dt ? dt_bufsize : kboot_hibernate_handoff_size(fdt)" in reserve
     assert "dt_reserve_retained_dma(fdt, size" in reserve
