@@ -40,6 +40,7 @@
 #include "sep.h"
 #include "sio.h"
 #include "smp.h"
+#include "sptm_j613_probe.h"
 #include "tunables.h"
 #include "types.h"
 #include "usb.h"
@@ -11022,6 +11023,7 @@ static int dt_setup_mtd_phram(void)
         ((char *)logbuf.buffer)[i] =
             con_buf[(con_wp - con_len + i) % console_buffer_size];
     logbuf.wp = con_len;
+    sptm_j613_probe_replay();
 #endif
 
     snprintf(node_name, sizeof(node_name), "flash@%lx", (u64)logbuf.buffer);

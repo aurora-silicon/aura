@@ -14,12 +14,22 @@
 #include "memory.h"
 #include "soc.h"
 #include "sptm_virt.h"
+#include "sptm_j613_probe.h"
 #include "string.h"
 #include "utils.h"
 
 #define ID_AA64MMFR1_VH GENMASK(11, 8)
 
 extern const char *const aura_version;
+
+static struct {
+    bool valid, nv2, vh, fgt, gxf, admission;
+    u64 mmfr0, mmfr1, mmfr2, aidr, currentel, midr, mpidr;
+#ifdef J613_HV_SYNTHETIC
+    bool attempted, nv_roundtrip, guarded_roundtrip;
+    u64 gl, want;
+#endif
+} receipt;
 
 struct nv2_probe_ctx {
     u64 entry, sp_el1, vncr, avncr;
@@ -66,14 +76,40 @@ static bool j613_nv2_roundtrip(void)
 
 void sptm_j613_probe_run(void)
 {
-    u64 mmfr0 = mrs(SYS_ID_AA64MMFR0_EL1);
-    u64 mmfr1 = mrs(SYS_ID_AA64MMFR1_EL1);
-    u64 mmfr2 = mrs(SYS_ID_AA64MMFR2_EL1);
-    u64 aidr = mrs(AIDR_EL1);
-    bool nv2 = FIELD_GET(ID_AA64MMFR2_NV, mmfr2) >= 2;
-    bool vh = FIELD_GET(ID_AA64MMFR1_VH, mmfr1) != 0;
-    bool fgt = FIELD_GET(ID_AA64MMFR0_FGT, mmfr0) != 0;
-    bool gxf = supports_gxf();
+    receipt.mmfr0 = mrs(SYS_ID_AA64MMFR0_EL1);
+    receipt.mmfr1 = mrs(SYS_ID_AA64MMFR1_EL1);
+    receipt.mmfr2 = mrs(SYS_ID_AA64MMFR2_EL1);
+    receipt.aidr = mrs(AIDR_EL1);
+    receipt.currentel = mrs(CurrentEL);
+    receipt.midr = mrs(MIDR_EL1);
+    receipt.mpidr = mrs(MPIDR_EL1);
+    receipt.nv2 = FIELD_GET(ID_AA64MMFR2_NV, receipt.mmfr2) >= 2;
+    receipt.vh = FIELD_GET(ID_AA64MMFR1_VH, receipt.mmfr1) != 0;
+    receipt.fgt = FIELD_GET(ID_AA64MMFR0_FGT, receipt.mmfr0) != 0;
+    receipt.gxf = supports_gxf();
+    receipt.admission = sptm_virt_requested();
+    receipt.valid = true;
+
+#ifdef J613_HV_SYNTHETIC
+    if (chip_id == T8122 && receipt.currentel == 8 && receipt.nv2 && receipt.vh && receipt.fgt &&
+        receipt.gxf) {
+        receipt.attempted = true;
+        receipt.nv_roundtrip = j613_nv2_roundtrip();
+        u64 saved_hcr = mrs(HCR_EL2);
+        receipt.gl = gl1_call(j613_gl_roundtrip, 0x1111, 0x2222, 0x3333, 0x4444);
+        receipt.want = 0x1111 ^ 0x2222 ^ 0x3333 ^ 0x4444 ^ 0x613;
+        receipt.guarded_roundtrip = receipt.gl == receipt.want;
+        msr(HCR_EL2, saved_hcr);
+        sysop("isb");
+    }
+#endif
+    sptm_j613_probe_replay();
+}
+
+void sptm_j613_probe_replay(void)
+{
+    if (!receipt.valid)
+        return;
 
     printf("J613-HV BEGIN stage=%s profile=J613/25G83 soc=T8122 build=%s\n",
 #ifdef J613_HV_SYNTHETIC
@@ -84,26 +120,25 @@ void sptm_j613_probe_run(void)
            aura_version);
     printf("J613-HV IDS currentel=0x%lx midr=0x%lx mpidr=0x%lx aidr=0x%lx "
            "mmfr0=0x%lx mmfr1=0x%lx mmfr2=0x%lx\n",
-           mrs(CurrentEL), mrs(MIDR_EL1), mrs(MPIDR_EL1), aidr, mmfr0, mmfr1, mmfr2);
+           receipt.currentel, receipt.midr, receipt.mpidr, receipt.aidr, receipt.mmfr0,
+           receipt.mmfr1, receipt.mmfr2);
     printf("J613-HV DECISION chip=%s el2=%s nv2=%s vhe=%s fgt=%s aidr_gxf=%s "
            "mmu_sprr=%s aura_gxf=%s admission=%s\n",
-           chip_id == T8122 ? "pass" : "fail", mrs(CurrentEL) == 8 ? "pass" : "fail",
-           nv2 ? "pass" : "fail", vh ? "pass" : "fail", fgt ? "pass" : "fail",
-           (aidr & AIDR_EL1_GXF) ? "pass" : "fail", cpu_features->mmu_sprr ? "pass" : "fail",
-           gxf ? "pass" : "fail", sptm_virt_requested() ? "pass" : "fail");
+           chip_id == T8122 ? "pass" : "fail", receipt.currentel == 8 ? "pass" : "fail",
+           receipt.nv2 ? "pass" : "fail", receipt.vh ? "pass" : "fail",
+           receipt.fgt ? "pass" : "fail", (receipt.aidr & AIDR_EL1_GXF) ? "pass" : "fail",
+           cpu_features->mmu_sprr ? "pass" : "fail", receipt.gxf ? "pass" : "fail",
+           receipt.admission ? "pass" : "fail");
 
 #ifdef J613_HV_SYNTHETIC
-    if (chip_id != T8122 || mrs(CurrentEL) != 8 || !nv2 || !vh || !fgt || !gxf) {
+    if (!receipt.attempted) {
         printf("J613-HV SYNTHETIC result=SKIP reason=feature-admission\n");
     } else {
-        bool nv = j613_nv2_roundtrip();
-        u64 gl = gl1_call(j613_gl_roundtrip, 0x1111, 0x2222, 0x3333, 0x4444);
-        u64 want = 0x1111 ^ 0x2222 ^ 0x3333 ^ 0x4444 ^ 0x613;
-        bool guarded = gl == want;
         printf("J613-HV SYNTHETIC vncr_eret=%s gl1_gl2=%s gl_ret=0x%lx expected=0x%lx "
                "result=%s\n",
-               nv ? "pass" : "fail", guarded ? "pass" : "fail", gl, want,
-               nv && guarded ? "PASS" : "FAIL");
+               receipt.nv_roundtrip ? "pass" : "fail",
+               receipt.guarded_roundtrip ? "pass" : "fail", receipt.gl, receipt.want,
+               receipt.nv_roundtrip && receipt.guarded_roundtrip ? "PASS" : "FAIL");
     }
 #endif
     printf("J613-HV END action=continue-default-linux\n");
