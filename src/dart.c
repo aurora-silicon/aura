@@ -818,6 +818,29 @@ static bool dart_table_in_dram(u64 page, u64 base, u64 size)
            page >= base && page - base <= size - SZ_16K;
 }
 
+/*
+ * A T8110 stream's state, read from its registers before any DART view is made:
+ * 1 if the DART is locked and the stream translates through a valid root, 0 if
+ * it is not locked or the stream has no root, -1 if the node cannot be read.
+ */
+int dart_fdt_t8110_translating(void *dt, u32 phandle, u32 sid)
+{
+    int node = fdt_node_offset_by_phandle(dt, phandle);
+    if (node < 0 || sid >= 16 || fdt_node_check_compatible(dt, node, "apple,t8110-dart"))
+        return -1;
+    u64 base = dt_get_address(dt, node);
+    if (!base)
+        return -1;
+    u32 protect = read32(base + DART_T8110_PROTECT);
+    u32 tcr = read32(base + DART_T8110_TCR_OFF + 4 * sid);
+    u32 ttbr = read32(base + DART_T8110_TTBR_OFF + 4 * sid);
+    printf("dart: %s at 0x%lx sid %u: protect %x tcr %x ttbr %x\n", fdt_get_name(dt, node, NULL),
+           base, sid, protect, tcr, ttbr);
+    if (!(protect & DART_T8110_PROTECT_TTBR_TCR))
+        return 0;
+    return (tcr & DART_T8110_TCR_TRANSLATE_ENABLE) && (ttbr & DART_T8110_TTBR_VALID);
+}
+
 int dart_collect_locked_tables(dart_dev_t *dart, u64 dram_base, u64 dram_size, u64 *pages,
                                size_t capacity, size_t *count)
 {
