@@ -174,6 +174,9 @@ EXCLAVE_NODES = ("/arm-io/exdisplaypipe", "/arm-io/exdisplaypipe-s-proxy",
                  "/arm-io/aop-exclave-mailbox", "/arm-io/aop2-exclave-mailbox")
 ROUTES_PROPS = (("/arm-io/dcp/iop-dcp-nub", "routes"), ("/arm-io/aop/iop-aop-nub", "routes"),
                 ("/arm-io/aop2/iop-aop2-nub", "routes"))
+# Without it XNU powers ANS on, maps its firmware and sets RUN itself, instead of waking a
+# running session.
+ANS_QUIESCED = (("/arm-io/ans/iop-ans-nub", "quiesced"),)
 # iBoot's data regions copied to the blob tail, in iBoot's order (the native layout).
 IBOOT_COPIES = ("RTBuddySeg", "SEPFW", "SEPPatches", "uStuff", "preoslog")
 
@@ -752,6 +755,26 @@ def main():
     if xnu_release:
         print(f"XNU {xnu_release}: hiding " + " ".join(quirks["hide"]))
 
+    # Any stage that used NVMe left ANS in a session XNU can't take over: end it, stop and reset
+    # ANS, and XNU starts it cold. AURA_ANS_COLD=idle (IDLE instead of SLEEP) is a diagnostic,
+    # =off keeps the old handoff; AURA_ANS_PROBE=0 skips the HELLO check before XNU.
+    # Measured on T8140 only: elsewhere it's opt-in, and XNU wakes iBoot's quiesced session.
+    t8140 = u.adt["/chosen"].chip_id == 0x8140
+    ans_cold = os.environ.get("AURA_ANS_COLD", "sleep" if t8140 else "off")
+    if ans_cold not in ("sleep", "idle", "off"):
+        raise SystemExit(f"AURA_ANS_COLD={ans_cold}: sleep, idle or off")
+    if ans_cold != "off":
+        # An unanswered RTKit or controller step takes seconds, more than a read's timeout.
+        to, iface.dev.timeout = iface.dev.timeout, 30
+        try:
+            rc = p.call(sym["sptm_virt_ans_cold"], (ans_cold == "idle") |
+                        (2 if os.environ.get("AURA_ANS_PROBE", "1") == "0" else 0))
+        finally:
+            iface.dev.timeout = to
+        if rc != 0:
+            raise SystemExit("ANS didn't stop for XNU's cold start (see aura's console)")
+        print(f"ANS stopped ({ans_cold.upper()}) and reset: XNU starts it cold")
+
     live_adt = u.get_adt()
     chip = u.adt["/chosen"].chip_id
     proxy_phy = p.call(sym["sptm_virt_proxy_phy"])
@@ -791,7 +814,8 @@ def main():
         mem_size_actual=ba.mem_size_actual, cmdline=args.bootargs, blob_base=phys_base,
         trustcache=args.trustcache.read_bytes() if args.trustcache else b"",
         iboot_copies=copies, hide_nodes=hide, diag_record=env_on("AURA_SPTM_DIAG"),
-        drop_props=(() if keep_exclaves else ROUTES_PROPS) + ans_drop_props(),
+        drop_props=(() if keep_exclaves else ROUTES_PROPS) + ans_drop_props() +
+        (ANS_QUIESCED if ans_cold != "off" else ()),
         xnu_serial=f"/arm-io/{serial}" if serial else None,
         os_long_version=args.os_long_version,
         video=tuple(int(getattr(ba.video, f)) for f in

@@ -65,6 +65,7 @@ int pmgr_device_gate(u8 die, u16 id, struct pmgr_gate *gate);
 
 int pmgr_reset(int die, const char *name);
 int pmgr_power_on(int die, const char *name);
+int pmgr_reset_held(int die, const char *name);
 int pmgr_power_is_on(int die, const char *name);
 int pmgr_power_is_requested(int die, const char *name);
 

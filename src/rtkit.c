@@ -1,5 +1,7 @@
 /* SPDX-License-Identifier: MIT AND GPL-2.0-only */
 
+#include "../build/build_cfg.h"
+
 #include "../config.h"
 
 #include "rtkit.h"
@@ -85,6 +87,7 @@ enum rtkit_power_state {
     RTKIT_POWER_OFF = 0x00,
     RTKIT_POWER_SLEEP = 0x01,
     RTKIT_POWER_QUIESCED = 0x10,
+    RTKIT_POWER_IDLE = 0x201,
     RTKIT_POWER_ON = 0x20,
     RTKIT_POWER_INIT = 0x220,
 };
@@ -981,6 +984,57 @@ bool rtkit_sleep(rtkit_dev_t *rtk)
     asc_cpu_stop(rtk->asc);
     return true;
 }
+
+#ifdef SPTM_VIRT
+/*
+ * Start a stopped IOP and wait for its HELLO without answering it: unprompted first, as after a
+ * power-on, then after the INIT that a quiesced IOP waits for. The caller stops it again.
+ * Returns 1 for an unprompted HELLO, 2 for one after INIT, 0 for none.
+ */
+int rtkit_probe_hello(asc_dev_t *asc)
+{
+    struct asc_message msg;
+    u64 timeout;
+
+    asc_i2a_enable(asc, true);
+    asc_cpu_start(asc);
+    for (int round = 1; round <= 2; round++) {
+        if (round == 2) {
+            msg.msg0 = FIELD_PREP(MGMT_TYPE, MGMT_MSG_IOP_PWR_STATE) |
+                       FIELD_PREP(MGMT_PWR_STATE, RTKIT_POWER_INIT);
+            msg.msg1 = RTKIT_EP_MGMT;
+            if (!asc_send(asc, &msg))
+                return 0;
+        }
+        timeout = timeout_calculate(round == 1 ? 50000 : 1000000);
+        while (!timeout_expired(timeout)) {
+            if (!asc_recv(asc, &msg))
+                continue;
+            if (msg.msg1 == RTKIT_EP_MGMT && FIELD_GET(MGMT_TYPE, msg.msg0) == MGMT_MSG_HELLO)
+                return round;
+            printf("rtkit: probe: message 0x%lx for EP 0x%x before HELLO\n", msg.msg0, msg.msg1);
+        }
+    }
+    return 0;
+}
+
+/* As macOS before a sleep: the firmware saves its state, then the CPU stops once idle. */
+bool rtkit_idle(rtkit_dev_t *rtk)
+{
+    if (!rtkit_switch_power_state(rtk, RTKIT_POWER_IDLE))
+        return false;
+    asc_i2a_enable(rtk->asc, false);
+
+    u64 timeout = timeout_calculate(5000);
+    while (!asc_cpu_idle(rtk->asc))
+        if (timeout_expired(timeout))
+            return false;
+    /* Twice, each from what it reads back, as macOS does. */
+    asc_cpu_stop(rtk->asc);
+    asc_cpu_stop(rtk->asc);
+    return true;
+}
+#endif /* SPTM_VIRT */
 
 static void rtkit_drain(rtkit_dev_t *rtk)
 {
