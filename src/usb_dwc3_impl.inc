@@ -2054,15 +2054,19 @@ bool usb_dwc3_shutdown(dwc3_dev_t *dev)
      * Retire every active transfer, EP0 included. A failed session already
      * reset the controller, which retired its DMA.
      */
+    int retired = 0;
     for (int i = 0; i < MAX_ENDPOINTS && !dev->failed && !dev->dma_unsafe; ++i) {
         if (!dev->endpoints[i].xfer_in_progress)
             continue;
         if (usb_dwc3_retire_transfer(dev, i)) {
             dev->dma_unsafe = true;
-            usb_debug_printf("EP %d transfer not retired during shutdown; preserving DMA buffers\n",
-                             i);
+            printf("usb-dwc3@%lx: EP %d transfer not retired at shutdown\n", dev->regs, i);
+        } else {
+            retired++;
         }
     }
+    if (retired)
+        printf("usb-dwc3@%lx: %d transfer(s) retired at shutdown\n", dev->regs, retired);
 
     /* disable events and all endpoints and stop the device controller */
     write32(dev->regs + DWC3_DEVTEN, 0);

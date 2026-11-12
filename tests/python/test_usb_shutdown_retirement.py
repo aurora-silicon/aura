@@ -55,6 +55,7 @@ typedef uint64_t u64;
 #define SZ_16K 0x4000
 #define max(a, b) ((a) > (b) ? (a) : (b))
 #define usb_debug_printf(...) ((void)0)
+#define printf(...) ((void)0)
 #define CDC_ACM_PIPE_MAX 2
 #define MAX_ENDPOINTS 6
 #define DWC3_DEVTEN 0x1
