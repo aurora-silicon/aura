@@ -11370,10 +11370,14 @@ int kboot_prepare_dt(void *fdt)
         return -1;
     if (chip_id == T6040 && board_id == 4 && adt_is_compatible(adt, 0, "J614sAP") &&
         !fdt_node_check_compatible(dt, 0, "apple,j614s") && !kboot_j614s_hdmi_ready()) {
-        int node = fdt_path_offset(dt, "/dcp@3a2e00000");
-        int ret = node < 0 ? -FDT_ERR_NOTFOUND : fdt_delprop(dt, node, "memory-region");
-        if (ret && ret != -FDT_ERR_NOTFOUND)
-            return -1;
+        /* Without ATC3 tuning neither HDMI processor (dcpext0 or J614s's dcpext2) is usable. */
+        static const char *const hdmi_dcps[] = {"/dcp@3a2e00000", "/dcp@606e00000"};
+        for (size_t i = 0; i < ARRAY_SIZE(hdmi_dcps); i++) {
+            int node = fdt_path_offset(dt, hdmi_dcps[i]);
+            int ret = node < 0 ? -FDT_ERR_NOTFOUND : fdt_delprop(dt, node, "memory-region");
+            if (ret && ret != -FDT_ERR_NOTFOUND)
+                return -1;
+        }
     }
     /*
      * The first core of a cluster has a power-gate slot here, and iBoot leaves the boot core's
