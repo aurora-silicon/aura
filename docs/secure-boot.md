@@ -77,7 +77,9 @@ version, flags, covered length and an 8-byte key id (SHA-256 of the public
 key), then an Ed25519 signature over `AURA-SIG-V1` (padded to 16 bytes), the
 header, and SHA-256 of the covered bytes. The tool refuses to sign an image
 that carries `chosen.aurora,measure-` lines, which only a loading stage may
-add.
+add. In an aura image it searches only what follows the image (from the load
+header's footprint, where `_payload_start` is), since aura's own code holds
+the line's format string.
 
 ## The record
 
