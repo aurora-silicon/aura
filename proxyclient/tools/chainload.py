@@ -17,6 +17,7 @@ parser.add_argument('--capture', type=pathlib.Path, help="Write raw post-vector 
 parser.add_argument('--capture-seconds', type=float, default=0, help="Seconds of raw console capture after vector")
 parser.add_argument('--relocate', action='store_true', help='Allocate a new raw-image span while retaining the live stage-1 heap')
 parser.add_argument('--capture-until', help="Stop the capture early once the console shows this regex")
+parser.add_argument('--stub', type=pathlib.Path, help="Prebuilt copy stub (8-byte LE entry, then code) for a host without a toolchain")
 parser.add_argument('payload', type=pathlib.Path)
 parser.add_argument('boot_args', default=[], nargs="*")
 args = parser.parse_args()
@@ -194,7 +195,27 @@ p.dc_cvac(fw_stage, fw_size)
 
 print(f"Copying stub...")
 
-stub = asm.ARMAsm(f"""
+class PrebuiltStub:
+    """
+    A stub assembled elsewhere, with the entry address it was built for in its
+    first 8 bytes. The code is position independent and takes the entry from a
+    literal, so that literal is rewritten with this boot's entry.
+    """
+    def __init__(self, path, addr, entry):
+        blob = path.read_bytes()
+        baked = blob[:8]
+        code = blob[8:]
+        if code.count(baked) != 1:
+            raise ValueError(f"{path}: expected exactly one copy of the entry literal in the stub")
+        self.addr = addr
+        self.data = code.replace(baked, entry.to_bytes(8, "little"))
+        self.len = len(self.data)
+        print(f"Prebuilt stub: entry literal set to 0x{entry:x}")
+
+if args.stub:
+    stub = PrebuiltStub(args.stub, image_addr + copy_size, entry)
+else:
+    stub = asm.ARMAsm(f"""
         mov x7, x2
         mov x8, x3
 1:
