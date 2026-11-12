@@ -94,6 +94,12 @@ else
 CARGO_FLAGS :=
 endif
 
+# Bring-up: skip MMU, MCC, AIC, SMP, PMGR, display and USB init and go
+# straight to the proxy on the boot console.
+ifeq ($(BRINGUP),1)
+CFG += BRINGUP
+endif
+
 ifeq ($(CHAINLOADING),1)
 CFG += CHAINLOADING
 CARGO_FLAGS += --features chainload
