@@ -634,7 +634,7 @@ static int smp_start_cpu(int index, const struct cpu_info *cpu)
         write64(cpu->impl_reg, (u64)_vectors_start);
     }
 
-    u64 start_base = cpu_start_base + cpu->die * PMGR_DIE_OFFSET;
+    u64 start_base = cpu_start_base + cpu->die * pmgr_die_stride();
 
     // Some kind of system level startup/status bit
     // Without this, IRQs don't work
@@ -680,7 +680,7 @@ static int smp_stop_cpu(int index, const struct cpu_info *cpu, bool deep_sleep)
         }
 
         printf("Stopping CPU %d (%d:%d:%d)... ", index, cpu->die, cpu->cluster, cpu->core);
-        u64 start_base = cpu_start_base + cpu->die * PMGR_DIE_OFFSET;
+        u64 start_base = cpu_start_base + cpu->die * pmgr_die_stride();
         cpu_stop_state[index].flag = spin_table[index].flag;
         cpu_stop_state[index].deep_sleep = deep_sleep;
         cpu_stop_state[index].pending = true;
@@ -975,7 +975,12 @@ int smp_init(void)
         cpu_info[i].valid = true;
         cpu_info[i].core = FIELD_GET(CPU_REG_CORE, reg);
         cpu_info[i].cluster = FIELD_GET(CPU_REG_CLUSTER, reg);
-        cpu_info[i].die = FIELD_GET(CPU_REG_DIE, reg);
+        /* T6050 Ultra's reg puts the die at bit 12 (die 1 = 0x1000); use die-id where given. */
+        u32 die_id;
+        if (ADT_GETPROP(adt, cpu_node, "die-id", &die_id) == sizeof(die_id))
+            cpu_info[i].die = die_id;
+        else
+            cpu_info[i].die = FIELD_GET(CPU_REG_DIE, reg);
         cpu_info[i].impl_reg = cpu_impl_reg[0];
 
         /* Publish a permanent stack before the first reset, including late entries. */
