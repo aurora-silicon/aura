@@ -150,7 +150,10 @@ stays reserved too. That is the size of the image: about 1 MiB for U-Boot, and a
 
 An object can arm more than the window, as one padded for 256 MiB does. The OS
 still gets 128 MiB at the same address, so a Mac enrolled at a larger size runs
-the same memory layout as a release. Everything else armed stays reserved:
+the same memory layout as a release. That address moves with the object, which iBoot
+loads somewhere else on every boot. With `hib=1` the OS instead gets the part of
+`CTXR_D` that every placement arms, at one address on every boot: 96 MiB for a release
+padding, 128 MiB for one padded for 256 MiB ([boot options](boot-options.md#hibernation-layout-hib1-t6040)). Everything else armed stays reserved:
 `CTXR_D` outside the window and the windows `CTXR_A` to `CTXR_C`. A window inside
 T8140's firmware RO range is left to that range's reservation. The monitor's Neo
 boots of 2026-10-31 relied on the range covering all three, so the J700 tree gains

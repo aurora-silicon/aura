@@ -246,6 +246,28 @@ void firmware_parse_version(const char *s, u32 *out)
     }
 }
 
+/*
+ * The release whose coprocessor firmware (DCP, GPU, ISP images) the OS iBoot loads. Apple's later
+ * iBoots of a train keep its version and add a suffix. A J616s (T6040) installed from Recovery runs
+ * macOS 26.7.1 25G241 (SystemVersion and Preboot cryptex1 read from its disk) with the OS iBoot
+ * "mBoot-18000.161.10.701.1", which the table above lists as 26.7: the 26.6.2 iBoot
+ * "mBoot-18000.161.10" plus ".701.1". Booted by it, the GPU driver admits the loaded GPU firmware
+ * only by its text SHA-256, and it matched 25G83, the 26.6.2 image; our earlier aura ran its DCP
+ * and ISP handoffs there as 26.6.2. So for the handoffs, an iBoot of the 18000.161.10 train counts
+ * as 26.6.2. The OS version published in the device tree stays the detected one, and the kernel
+ * still checks each image it takes over.
+ */
+enum fw_version firmware_os_components(void)
+{
+    static const char train[] = "mBoot-18000.161.10.";
+
+    if (os_firmware.version == V26_6_2)
+        return V26_6_2;
+    if (os_firmware.iboot && !strncmp(os_firmware.iboot, train, sizeof(train) - 1))
+        return V26_6_2;
+    return os_firmware.version;
+}
+
 static void detect_firmware(struct fw_version_info *info, const char *ver)
 {
     for (size_t i = 0; i < ARRAY_SIZE(fw_versions); i++) {

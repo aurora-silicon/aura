@@ -152,7 +152,7 @@ static void *decompress_xz(void *p, size_t size)
 
 static void *load_fdt(void *p, size_t size)
 {
-    int rank = payload_profile_rank(p, os_firmware.version == V26_6_2);
+    int rank = payload_profile_rank(p, firmware_os_components() == V26_6_2);
     if (rank && rank >= fdt_rank && fdt_node_check_compatible(p, 0, expect_compatible) == 0) {
         printf("Found a devicetree for %s at %p\n", expect_compatible, p);
         fdt = p;
@@ -240,8 +240,8 @@ static bool config_seen = false;
 static bool config_lost_passed = false;
 
 static const char *const config_names[] = {
-    "chosen.",  "chainload=",   "boot=", "nvme.sart=",
-    "display=", "mitigations=", "tso=",  "m1n1.config-lost="};
+    "chosen.", "chainload=",        "boot=", "nvme.sart=", "display=", "mitigations=",
+    "tso=",    "m1n1.config-lost=", "hib="};
 
 /* The start of a line of a variable m1n1 knows */
 static bool config_line(const char *s)
@@ -314,6 +314,8 @@ static bool check_var(u8 **p)
         mitigations_configure(val);
     } else if (IS_VAR("tso=")) {
         enable_tso = val[0] == '1';
+    } else if (IS_VAR("hib=")) {
+        kboot_request_hibernate_layout(val[0] == '1');
     } else {
         printf("Unknown variable %.*s\n", (int)(val - (char *)*p - 1), (char *)*p);
     }
