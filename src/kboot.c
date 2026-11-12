@@ -4070,21 +4070,133 @@ err:
 }
 
 /*
- * The node is found again by its compatible after each edit, never by its path: on T6050 "/soc"
- * resolves to /soc@200000000, a sibling of the /soc that holds the encoder.
+ * An A18 Pro has one of two encoders, and the ADT describes the one this part has: ave
+ * (encoder 0, 0x285100000) or ave1 (encoder 1, 0x289100000, on the J700 measured). The
+ * DT describes both, disabled. Match the DT node to the ADT node at its address.
  */
-static int dt_set_ave_node(int node, const char *compat)
+static const char *dt_t8140_ave_adt_path(int node)
+{
+    static const char *const paths[] = {"/arm-io/ave", "/arm-io/ave0", "/arm-io/ave1"};
+    const fdt32_t *reg;
+    int len;
+
+    reg = fdt_getprop(dt, node, "reg", &len);
+    /* The SoC bus maps one-to-one ("ranges;"), with two address cells. */
+    if (!reg || len < 2 * (int)sizeof(*reg))
+        return NULL;
+    u64 dt_address = ((u64)fdt32_to_cpu(reg[0]) << 32) | fdt32_to_cpu(reg[1]);
+
+    for (size_t i = 0; i < ARRAY_SIZE(paths); i++) {
+        int adt_path[8] = {0};
+        u64 adt_address;
+
+        if (adt_path_offset_trace(adt, paths[i], adt_path) < 0)
+            continue;
+        if (adt_get_reg(adt, adt_path, "reg", 0, &adt_address, NULL) < 0)
+            continue;
+        if (adt_address == dt_address)
+            return paths[i];
+    }
+    return NULL;
+}
+
+static bool dt_ave_node_disabled(int node)
+{
+    int len;
+    const char *status = fdt_getprop(dt, node, "status", &len);
+
+    return status &&
+           !((len == 5 && !memcmp(status, "okay", 5)) || (len == 3 && !memcmp(status, "ok", 3)));
+}
+
+/* Enable a node and, first, the power-domain providers it names, a few levels up. */
+static int dt_ave_enable_phandle(u32 phandle, int depth)
+{
+    u32 providers[8];
+    size_t count = 0;
+    int node, len;
+
+    node = fdt_node_offset_by_phandle(dt, phandle);
+    if (node < 0 || depth > 6)
+        return -1;
+
+    const fdt32_t *pd = fdt_getprop(dt, node, "power-domains", &len);
+    for (int i = 0; pd && i < len / (int)sizeof(*pd);) {
+        u32 ph = fdt32_to_cpu(pd[i]);
+        int provider = fdt_node_offset_by_phandle(dt, ph);
+        if (provider < 0 || count == ARRAY_SIZE(providers))
+            return -1;
+        const fdt32_t *cells = fdt_getprop(dt, provider, "#power-domain-cells", NULL);
+        providers[count++] = ph;
+        i += 1 + (cells ? fdt32_to_cpu(*cells) : 0);
+    }
+    for (size_t i = 0; i < count; i++)
+        if (dt_ave_enable_phandle(providers[i], depth + 1))
+            return -1;
+
+    node = fdt_node_offset_by_phandle(dt, phandle);
+    if (node < 0)
+        return -1;
+    if (dt_ave_node_disabled(node) && fdt_setprop_string(dt, node, "status", "okay"))
+        return -1;
+    return 0;
+}
+
+/* The encoder, its DARTs and the power states of both. */
+static int dt_t8140_ave_enable(u32 self)
+{
+    u32 refs[8];
+    size_t count = 0;
+    int node, len;
+
+    node = fdt_node_offset_by_phandle(dt, self);
+    if (node < 0)
+        return -1;
+    const fdt32_t *iommus = fdt_getprop(dt, node, "iommus", &len);
+    for (int i = 0; iommus && i < len / (int)sizeof(*iommus);) {
+        u32 ph = fdt32_to_cpu(iommus[i]);
+        int dart = fdt_node_offset_by_phandle(dt, ph);
+        bool seen = false;
+
+        if (dart < 0)
+            return -1;
+        const fdt32_t *cells = fdt_getprop(dt, dart, "#iommu-cells", NULL);
+        i += 1 + (cells ? fdt32_to_cpu(*cells) : 0);
+        for (size_t j = 0; j < count; j++)
+            seen |= refs[j] == ph;
+        if (!seen && count < ARRAY_SIZE(refs))
+            refs[count++] = ph;
+    }
+    for (size_t i = 0; i < count; i++)
+        if (dt_ave_enable_phandle(refs[i], 0))
+            return -1;
+    return dt_ave_enable_phandle(self, 0);
+}
+
+/*
+ * The node is found again by its compatible after each edit, never by its path: on T6050 "/soc"
+ * resolves to /soc@200000000, a sibling of the /soc that holds the encoder. On T8140, whose two
+ * encoders share a compatible, it is found by @phandle instead; elsewhere @phandle is 0.
+ */
+static int dt_set_ave_node(int node, const char *compat, u32 phandle)
 {
     char path[64];
     if (fdt_get_path(dt, node, path, sizeof(path)))
         bail("FDT: AVE node path too long\n");
 
     const char *reason = "invalid ADT firmware segments";
+    bool t8140 = !fdt_node_check_compatible(dt, node, "apple,t8140-ave");
     const char *adt_path = "/arm-io/ave";
-    int anode = adt_path_offset(adt, adt_path);
-    if (anode < 0) {
-        adt_path = "/arm-io/ave0";
+    int anode;
+    if (t8140) {
+        adt_path = dt_t8140_ave_adt_path(node);
+        anode = adt_path ? adt_path_offset(adt, adt_path) : -1;
+    } else {
         anode = adt_path_offset(adt, adt_path);
+        if (anode < 0) {
+            adt_path = "/arm-io/ave0";
+            anode = adt_path_offset(adt, adt_path);
+        }
     }
     if (anode < 0) {
         reason = "ADT node absent";
@@ -4204,22 +4316,71 @@ static int dt_set_ave_node(int node, const char *compat)
         reason = "ADT tunable handoff failed";
         goto disable;
     }
+    /* The DT leaves both T8140 encoders off: this part has the one just handed over. */
+    if (t8140) {
+        if (dt_t8140_ave_enable(phandle)) {
+            reason = "cannot enable it, its DARTs or its power states";
+            goto disable;
+        }
+        printf("FDT: AVE %s enabled from ADT %s\n", path, adt_path);
+    }
     return 0;
 
 disable:
-    node = fdt_node_offset_by_compatible(dt, -1, compat);
+    node = phandle ? fdt_node_offset_by_phandle(dt, phandle)
+                   : fdt_node_offset_by_compatible(dt, -1, compat);
     if (node >= 0 && fdt_setprop_string(dt, node, "status", "disabled"))
         return -1;
-    printf("FDT: AVE disabled: %s\n", reason);
+    if (t8140)
+        printf("FDT: AVE %s disabled: %s\n", path, reason);
+    else
+        printf("FDT: AVE disabled: %s\n", reason);
     return 0;
+}
+
+/* Every T8140 encoder node, each found by its phandle: handing one over moves the others. */
+static int dt_set_t8140_aves(void)
+{
+    u32 phandles[2];
+    size_t count;
+    bool edited;
+    int ret = 0;
+
+    /* A node without a phandle gets one; that moves the nodes, so look again from the start. */
+    do {
+        edited = false;
+        count = 0;
+        for (int node = fdt_node_offset_by_compatible(dt, -1, "apple,t8140-ave"); node >= 0;
+             node = fdt_node_offset_by_compatible(dt, node, "apple,t8140-ave")) {
+            u32 ph = fdt_get_phandle(dt, node);
+            if (!ph) {
+                if (fdt_generate_phandle(dt, &ph) || fdt_setprop_u32(dt, node, "phandle", ph))
+                    bail("FDT: couldn't give an AVE node a phandle\n");
+                edited = true;
+                break;
+            }
+            if (count < ARRAY_SIZE(phandles))
+                phandles[count++] = ph;
+        }
+    } while (edited);
+
+    for (size_t i = 0; i < count && !ret; i++) {
+        int node = fdt_node_offset_by_phandle(dt, phandles[i]);
+        if (node >= 0)
+            ret = dt_set_ave_node(node, "apple,t8140-ave", phandles[i]);
+    }
+    return ret;
 }
 
 static int dt_set_ave(void)
 {
     for (size_t i = 0; i < ARRAY_SIZE(ave_compatibles); i++) {
         int node = fdt_node_offset_by_compatible(dt, -1, ave_compatibles[i]);
-        if (node >= 0)
-            return dt_set_ave_node(node, ave_compatibles[i]);
+        if (node < 0)
+            continue;
+        if (!strcmp(ave_compatibles[i], "apple,t8140-ave"))
+            return dt_set_t8140_aves();
+        return dt_set_ave_node(node, ave_compatibles[i], 0);
     }
     return 0;
 }
