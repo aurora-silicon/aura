@@ -7937,8 +7937,175 @@ static int dt_set_j713_display_maps(const struct adt_segment_ranges *segments, u
 }
 
 /*
+ * J773g (Mac mini): no panel; the main DCP drives the fixed HDMI port, which the DT says with
+ * apple,connector-type = "HDMI-A". The kernel adopts that DCP as an external pipeline.
+ */
+static bool dt_is_j773g_main_hdmi(int dcp_node)
+{
+    int len;
+    const char *type = fdt_getprop(dt, dcp_node, "apple,connector-type", &len);
+    return kboot_is_j773g(dt) && type && len == sizeof("HDMI-A") && !memcmp(type, "HDMI-A", len);
+}
+
+/* dt_display_transaction has an integer-only callback; the handoff is single-threaded. */
+static const struct adt_segment_ranges *j773g_dcp_segments;
+static const char *j773g_dcp_uuid;
+static u32 j773g_dcp_count;
+
+/* The ADT marks the DCP OS-log segment with this firmware-private kind. */
+#define ADT_SEGMENT_DCP_OS_LOG 0xa
+
+static u64 dt_cells64(const fdt32_t *cells)
+{
+    return ((u64)fdt32_ld(&cells[0]) << 32) | fdt32_ld(&cells[1]);
+}
+
+/*
+ * The J773g main DCP's firmware reservations, one per ADT segment: the OS log at its physical
+ * address (apple,dcp-os-log, no DART mapping), every other segment mapped through this DCP at
+ * its remap address. The DT may carry some already; keep each that is exactly one segment and
+ * add the rest. Anything else in dcp's memory-region refuses: the kernel would reject a stale
+ * or doubled segment. Run as a transaction: a refusal leaves the tree as it was.
+ */
+static int dt_set_j773g_dcp_regions(unsigned int unused)
+{
+    UNUSED(unused);
+    const struct adt_segment_ranges *seg = j773g_dcp_segments;
+    u32 count = j773g_dcp_count, have = 0;
+    int dcp = fdt_path_offset(dt, "dcp");
+    if (dcp < 0 || !count)
+        bail("FDT: J773g DCP node or segment list missing\n");
+    if (count > 32)
+        bail("FDT: J773g DCP has too many ADT segments (%u)\n", count);
+    u32 dcp_phandle = fdt_get_phandle(dt, dcp);
+    if (!dcp_phandle && (fdt_generate_phandle(dt, &dcp_phandle) ||
+                         fdt_setprop_u32(dt, dcp, "phandle", dcp_phandle)))
+        bail("FDT: cannot give the J773g DCP a phandle\n");
+
+    dcp = fdt_path_offset(dt, "dcp");
+    int len;
+    const fdt32_t *regions = fdt_getprop(dt, dcp, "memory-region", &len);
+    if ((!regions && len != -FDT_ERR_NOTFOUND) || (regions && len % sizeof(*regions)))
+        bail("FDT: invalid J773g DCP memory-region\n");
+    int nregions = regions ? len / (int)sizeof(*regions) : 0;
+    int name_count = fdt_stringlist_count(dt, dcp, "memory-region-names");
+    if (name_count != -FDT_ERR_NOTFOUND && (name_count < 0 || name_count != nregions))
+        bail("FDT: J773g DCP memory-region-names is out of step\n");
+    bool named = name_count >= 0;
+    for (int r = 0; r < nregions; r++) {
+        int mem = fdt_node_offset_by_phandle(dt, fdt32_ld(&regions[r]));
+        int reg_len, map_len;
+        const fdt32_t *reg = mem < 0 ? NULL : fdt_getprop(dt, mem, "reg", &reg_len);
+        if (!reg || reg_len != 4 * sizeof(*reg) ||
+            fdt_node_check_compatible(dt, mem, "apple,asc-mem") ||
+            !fdt_getprop(dt, mem, "no-map", NULL))
+            bail("FDT: J773g DCP region %d is not a firmware reservation\n", r);
+        u64 phys = dt_cells64(&reg[0]), size = dt_cells64(&reg[2]);
+        u32 i = 0;
+        while (i < count && (seg[i].phys != phys || ALIGN_UP((u64)seg[i].size, SZ_16K) != size))
+            i++;
+        if (i == count || (have & BIT(i)))
+            bail("FDT: J773g DCP region [0x%lx, +0x%lx) is not one ADT segment\n", phys, size);
+
+        const fdt32_t *maps = fdt_getprop(dt, mem, "iommu-addresses", &map_len);
+        bool oslog = !!fdt_getprop(dt, mem, "apple,dcp-os-log", NULL);
+        if (seg[i].unk == ADT_SEGMENT_DCP_OS_LOG) {
+            if (!oslog || maps)
+                bail("FDT: J773g DCP OS log region 0x%lx is not physical-only\n", phys);
+        } else {
+            u32 matches = 0;
+            if (oslog || !maps || map_len <= 0 || map_len % (5 * sizeof(*maps)))
+                bail("FDT: J773g DCP region 0x%lx has no DART mapping\n", phys);
+            for (int j = 0; j < map_len / (int)sizeof(*maps); j += 5) {
+                if (fdt32_ld(&maps[j]) != dcp_phandle)
+                    continue; /* A display frontend's own mapping of a shared segment. */
+                if (++matches != 1 || dt_cells64(&maps[j + 1]) != seg[i].remap ||
+                    dt_cells64(&maps[j + 3]) != size)
+                    bail("FDT: J773g DCP region 0x%lx maps differently from the ADT\n", phys);
+            }
+            if (matches != 1)
+                bail("FDT: J773g DCP region 0x%lx is not mapped through the DCP\n", phys);
+        }
+        if (named) {
+            int name_len;
+            const char *label = fdt_stringlist_get(dt, dcp, "memory-region-names", r, &name_len);
+            const char *expected =
+                seg[i].unk == ADT_SEGMENT_DCP_OS_LOG ? "dcp-os-log" : fdt_get_name(dt, mem, NULL);
+            if (!label || !expected || name_len != (int)strlen(expected) ||
+                memcmp(label, expected, name_len))
+                bail("FDT: J773g DCP region %d has the wrong name\n", r);
+        }
+        have |= BIT(i);
+    }
+
+    for (u32 i = 0; i < count; i++) {
+        if (have & BIT(i))
+            continue;
+        u64 size = ALIGN_UP((u64)seg[i].size, SZ_16K);
+        char name[64];
+        snprintf(name, sizeof(name), "asc-firmware@%lx", seg[i].phys);
+        /* Never append to a node that something else already describes. */
+        int resv = fdt_path_offset(dt, "/reserved-memory");
+        if (resv < 0)
+            bail("FDT: J773g DT has no /reserved-memory node\n");
+        /* A frontend may share a DCP segment by referencing the same reservation, as accepted
+         * above. A separate overlapping reservation is ambiguous and must not be created. */
+        int existing;
+        fdt_for_each_subnode(existing, dt, resv)
+        {
+            int reg_len;
+            const fdt32_t *reg = fdt_getprop(dt, existing, "reg", &reg_len);
+            if (!reg)
+                continue;
+            if (reg_len != 4 * sizeof(*reg))
+                bail("FDT: J773g DT has a malformed existing reservation\n");
+            u64 start = dt_cells64(&reg[0]), span = dt_cells64(&reg[2]), end = start + span;
+            if (!span || end < start)
+                bail("FDT: J773g DT has an invalid existing reservation\n");
+            if (start < seg[i].phys + size && seg[i].phys < end)
+                bail("FDT: J773g DCP reservation %s overlaps an existing reservation\n", name);
+        }
+        if (fdt_subnode_offset(dt, resv, name) >= 0)
+            bail("FDT: J773g DCP reservation %s already exists outside dcp\n", name);
+        int mem = dt_get_or_add_reserved_mem(name, "apple,asc-mem", true, seg[i].phys, size);
+        if (mem < 0)
+            bail("FDT: cannot add J773g DCP reservation %s\n", name);
+        u32 phandle = fdt_get_phandle(dt, mem);
+        if (!phandle)
+            bail("FDT: J773g DCP reservation %s has no phandle\n", name);
+        if (seg[i].unk == ADT_SEGMENT_DCP_OS_LOG
+                ? fdt_setprop_empty(dt, mem, "apple,dcp-os-log")
+                : dt_device_set_reserved_mem(mem, name, dcp_phandle, seg[i].remap, size))
+            bail("FDT: cannot describe J773g DCP reservation %s\n", name);
+        /* Keep memory-region-names in step when the DT names its regions. */
+        const char *label = seg[i].unk == ADT_SEGMENT_DCP_OS_LOG ? "dcp-os-log" : name;
+        if (dt_device_add_mem_region("dcp", phandle, named ? label : NULL))
+            bail("FDT: cannot link J773g DCP reservation %s\n", name);
+        printf("FDT: J773g DCP %s [0x%lx, 0x%lx) published\n",
+               seg[i].unk == ADT_SEGMENT_DCP_OS_LOG ? "OS log" : "firmware segment", seg[i].phys,
+               seg[i].phys + size);
+    }
+    printf("FDT: J773g DCP: %u ADT segments, %u already in the DT\n", count,
+           __builtin_popcount(have));
+    return 0;
+}
+
+static int dt_set_j773g_dcp_handoff(unsigned int unused)
+{
+    UNUSED(unused);
+    int dcp = fdt_path_offset(dt, "dcp");
+    if (dcp < 0 || !j773g_dcp_uuid ||
+        fdt_setprop_string(dt, dcp, "apple,firmware-uuid", j773g_dcp_uuid))
+        bail("FDT: cannot publish J773g DCP firmware UUID\n");
+    int ret = dt_set_dcp_firmware("dcp");
+    return ret ? ret : dt_set_j773g_dcp_regions(0);
+}
+
+/*
  * Publish the inherited DCP firmware mapping without starting a display driver: on the J713
- * on any firmware as before, and on any other M4 Mac with a panel on 26.6.2.
+ * on any firmware as before, on any other M4 Mac with a panel on 26.6.2, and on the J773g
+ * whose main DCP drives the HDMI port. Only the DT changes: J713 and panel paths read the live
+ * DART tables, the J773g path does not touch them, and none of the paths write them.
  */
 static int dt_set_m4_dcp_handoff(void)
 {
@@ -7949,11 +8116,20 @@ static int dt_set_m4_dcp_handoff(void)
     if (chip_id != T8132 || (!j713 && os_firmware.version != V26_6_2) ||
         fdt_node_check_compatible(dt, dcp_node, "apple,t8132-dcp"))
         bail("FDT: unsupported native DCP handoff target\n");
-    /* The Mac mini's disp0 is external: its DCP drives a port, not a panel. */
+    /*
+     * The Mac mini's disp0 is external: its DCP drives a port, not a panel. Only the J773g DT
+     * that declares that port HDMI is handed the firmware mappings.
+     */
+    bool j773g_hdmi = false;
     if (!j713) {
         int disp0 = adt_path_offset(adt, "/arm-io/disp0");
-        if (disp0 < 0 || adt_getprop(adt, disp0, "external", NULL))
+        if (disp0 < 0)
             bail("FDT: no internal panel, no native DCP handoff\n");
+        if (adt_getprop(adt, disp0, "external", NULL)) {
+            j773g_hdmi = dt_is_j773g_main_hdmi(dcp_node);
+            if (!j773g_hdmi)
+                bail("FDT: no internal panel, no native DCP handoff\n");
+        }
     }
 
     int nub = adt_path_offset(adt, "/arm-io/dcp/iop-dcp-nub");
@@ -7990,6 +8166,20 @@ static int dt_set_m4_dcp_handoff(void)
     const char *uuid = adt_getprop(adt, nub, "uuid", &len);
     if (!uuid || len != 37 || uuid[len - 1])
         bail("ADT: invalid M4 DCP firmware UUID\n");
+    if (j773g_hdmi) {
+        j773g_dcp_segments = segments;
+        j773g_dcp_uuid = uuid;
+        j773g_dcp_count = count;
+        int transaction = dt_display_transaction(dt_set_j773g_dcp_handoff, 0);
+        j773g_dcp_segments = NULL;
+        j773g_dcp_uuid = NULL;
+        j773g_dcp_count = 0;
+        if (transaction)
+            bail("FDT: J773g HDMI DCP firmware reservations refused\n");
+        printf("FDT: M4 DCP firmware mappings published (J773g HDMI, DART tables untouched); "
+               "display device status unchanged\n");
+        return 0;
+    }
     if (fdt_setprop_string(dt, dcp_node, "apple,firmware-uuid", uuid))
         bail("FDT: cannot publish M4 DCP firmware UUID\n");
 
