@@ -4380,9 +4380,9 @@ static bool dt_ave_node_disabled(int node)
  * providers below it on DTs that describe the fabric power states. The bound is only a sanity
  * stop for a broken DT; a cycle is refused as soon as it is seen.
  */
-#define DT_POWER_CHAIN_MAX_DEPTH 32
+#define DT_POWER_CHAIN_MAX_DEPTH     32
 #define DT_POWER_CHAIN_MAX_PROVIDERS 16
-#define DT_POWER_CHAIN_MAX_DONE 128
+#define DT_POWER_CHAIN_MAX_DONE      128
 
 struct dt_power_chain {
     u32 path[DT_POWER_CHAIN_MAX_DEPTH]; /* the nodes being walked, the consumer first */
