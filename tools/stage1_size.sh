@@ -17,7 +17,7 @@ shift
 MAKE=${MAKE:-make}
 PYTHON=${PYTHON:-python3}
 JOBS=${JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)}
-WARN=${WARN:-4096}
+WARN=${WARN:-8192}
 status=0
 
 check() {
@@ -41,9 +41,9 @@ check() {
 	fi
 }
 
-# The Stage 1 that ships (dev flavour, no signature checks). Its layout is what Macs boot, so
-# it only has to link here; a warning says when it is close.
-check stage1 0 yes "$@"
+# The Stage 1 that ships (dev flavour, no signature checks): fails below 4 KiB of headroom, and
+# warns below WARN.
+check stage1 4096 yes "$@"
 # The secure flavour that aurora-secboot fills with the owner's key.
 check stage1-secure-audit 8192 yes "$@" SECBOOT=audit SECBOOT_FLAVOUR=secure
 check stage1-secure-enforce 8192 yes "$@" SECBOOT=enforce SECBOOT_FLAVOUR=secure
