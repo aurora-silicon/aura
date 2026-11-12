@@ -124,26 +124,29 @@ int kboot_mte_reserve(void *dt, u64 os_end, u64 dram_base, u64 dram_size, u64 ra
     if (FIELD_GET(MTE_PFR1_FIELD, mrs(SYS_ID_AA64PFR1_EL1)) < MTE_PFR1_MTE2)
         return 0;
 
-    int chosen = fdt_path_offset(dt, "/chosen");
-    if (chosen < 0)
-        bail("FDT: /chosen not found\n");
-
     u64 base = 0;
     const char *why =
         mte_check_tag_storage(dt, os_end, dram_base, dram_size, ram_start, *ram_end, &base);
     if (!why) {
-        char name[40];
+        char path[64];
         fdt64_t reg[2] = {cpu_to_fdt64(base), cpu_to_fdt64(*ram_end - base)};
         fdt64_t whole[2] = {cpu_to_fdt64(base), cpu_to_fdt64(dram_size / 32)};
-        int resv = fdt_path_offset(dt, "/reserved-memory");
 
-        snprintf(name, sizeof(name), "mte-tag-storage@%lx", base);
-        int node = fdt_add_subnode(dt, resv, name);
+        /* Adding a node moves the offsets after it: look each one up right before its use. */
+        snprintf(path, sizeof(path), "/reserved-memory/mte-tag-storage@%lx", base);
+        int node = fdt_add_subnode(dt, fdt_path_offset(dt, "/reserved-memory"),
+                                   path + sizeof("/reserved-memory/") - 1);
         if (node < 0 || fdt_setprop_string(dt, node, "compatible", "apple,mte-tag-storage") ||
             fdt_setprop(dt, node, "reg", reg, sizeof(reg)) ||
             fdt_setprop_empty(dt, node, "no-map") ||
-            fdt_setprop(dt, chosen, "aurora,mte-tag-storage", whole, sizeof(whole)))
+            fdt_setprop(dt, fdt_path_offset(dt, "/chosen"), "aurora,mte-tag-storage", whole,
+                        sizeof(whole))) {
             why = "could not add the reservation";
+            /* Leave no half-made reservation behind. */
+            node = fdt_path_offset(dt, path);
+            if (node >= 0 && fdt_del_node(dt, node))
+                bail("FDT: couldn't remove the partial %s\n", path);
+        }
     }
     if (!why) {
         printf("kboot: MTE tag storage 0x%lx..0x%lx reserved; RAM ends at 0x%lx\n", base,
@@ -153,6 +156,9 @@ int kboot_mte_reserve(void *dt, u64 os_end, u64 dram_base, u64 dram_size, u64 ra
     }
 
     printf("kboot: MTE off: %s\n", why);
+    int chosen = fdt_path_offset(dt, "/chosen");
+    if (chosen < 0)
+        bail("FDT: /chosen not found\n");
     int len = 0;
     const char *args = fdt_getprop(dt, chosen, "bootargs", &len);
     if (!args || len < 1 || !strstr(args, "arm64.nomte")) {
