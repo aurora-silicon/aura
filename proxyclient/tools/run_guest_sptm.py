@@ -250,6 +250,15 @@ XNU_QUIRKS = (
                     0x1400000f),
                    ("task PAC key reprogramming (4)", "BootKC-rx", 0x31488c4, 0x540001e0,
                     0x1400000f))),
+    # T6041's xnu-13432.41.4 (macOS 27.2.1, 26B131, kernelcache.release.mac16j). Its guest needs
+    # only nvram_ro: about 27 s in, while APFS mounts the volumes, AppleARMNORNVRAM sends the NOR a
+    # write enable. The same two words as the J813's, at this kernelcache's offsets; the first is
+    # the fingerprint. Without exclaves its single-user boot reaches the shell with no other patch.
+    dict(release=b"xnu-13432.41.4~", fingerprint=("__TEXT_EXEC", 0x1bdf0c, 0xaa0003e8),
+         hide=(), ro_relax=(),
+         nvram_ro=(("AppleARMNORNVRAM::write", "BootKC-rx", 0x1bdf0c, 0xaa0003e8, 0x52800000),
+                   ("AppleARMNORNVRAM::write return", "BootKC-rx", 0x1bdf10, 0x52805840,
+                    0xd65f03c0))),
 )
 
 
