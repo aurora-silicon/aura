@@ -10341,8 +10341,7 @@ undo:
  * Refusal-safe: if a window is absent or does not validate, publish nothing and
  * leave apple,display-power unset, so dcp_t6041_display_power() returns -ENODEV
  * and the S2R display lower/raise is skipped (the panel stays off until reboot,
- * exactly as today) rather than driving a bogus block. Windows are RE'd in
- * G29-AURA-DISPLAY-POWER.md.
+ * exactly as today) rather than driving a bogus block.
  */
 #define T6040_DISP_PS_ADT_IDX  2 /* /arm-io/pmgr reg index (SOC-East) */
 #define T6040_DISP_PS_BASE     0x502280000UL
