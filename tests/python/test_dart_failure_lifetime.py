@@ -7,6 +7,7 @@ Page tables live in a static pool so their addresses fit the PTE format.
 """
 from pathlib import Path
 import subprocess
+import sys
 
 import pytest
 
@@ -24,6 +25,15 @@ def test_failed_invalidation_retains_domain(tmp_path, t8110):
     # Register layout, domain state and invalidation bodies, through the T8110 parameters.
     definitions = source[source.index("#define DART_T8020_CONFIG "):
                          source.index("/* The two-level Gen3")]
+    # dart_gen3_tlb_invalidate() is aarch64 inline asm, and the T8020/T8110 cases never reach it:
+    # replace only its body with a stub that aborts, as test_display_dart_view.py does.
+    signature = "static void dart_gen3_tlb_invalidate(dart_dev_t *dart)"
+    assert definitions.count(signature) == 1
+    start = definitions.index(signature)
+    end = definitions.index("\n}\n", start) + 3
+    definitions = (definitions[:start] + signature +
+                   "\n{\n    (void)dart;\n    abort(); /* host stub: Gen3 invalidation is not modelled */\n}\n" +
+                   definitions[end:])
     harness = r'''
 #include <assert.h>
 #include <stdbool.h>
@@ -175,6 +185,9 @@ int main(void)
     binary = tmp_path / "dart-failure"
     subprocess.run(["cc", "-std=gnu11", "-Wall", "-Wextra", "-Werror", "-Wno-unused-parameter",
                     "-Wno-unused-function", "-Wno-unused-variable",
-                    *(["-DTEST_T8110"] if t8110 else []), "-x", "c", "-", "-o", str(binary)],
+                    *(["-DTEST_T8110"] if t8110 else []),
+                    # The PTE address field ends at bit 39: a Linux PIE puts the pool near 2^47.
+                    *(["-no-pie"] if sys.platform.startswith("linux") else []),
+                    "-x", "c", "-", "-o", str(binary)],
                    input=harness, text=True, check=True)
     subprocess.run([str(binary)], check=True)
