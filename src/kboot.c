@@ -4233,7 +4233,8 @@ static int dt_reserve_asc_firmware(const char *adt_path, const char *adt_path_al
  * it takes.
  */
 static const char *const ave_compatibles[] = {
-    "apple,t6000-ave", "apple,t8112-ave", "apple,t8140-ave", "apple,t6041-ave", "apple,t6050-ave",
+    "apple,t6000-ave", "apple,t8112-ave", "apple,t8140-ave",
+    "apple,t6041-ave", "apple,t6050-ave", "apple,t8132-ave",
 };
 
 /*
@@ -4619,7 +4620,8 @@ static int dt_set_ave_node(int node, const char *compat, u32 phandle)
      */
     bool use_remap = !fdt_node_check_compatible(dt, node, "apple,t8140-ave") ||
                      !fdt_node_check_compatible(dt, node, "apple,t6041-ave") ||
-                     !fdt_node_check_compatible(dt, node, "apple,t6050-ave");
+                     !fdt_node_check_compatible(dt, node, "apple,t6050-ave") ||
+                     !fdt_node_check_compatible(dt, node, "apple,t8132-ave");
     /*
      * On T8112 the encoder's DART window starts at the DART's vm-base: iBoot points the
      * coprocessor code base there, and the firmware addresses DATA at vm-base plus its
