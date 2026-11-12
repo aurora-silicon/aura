@@ -92,6 +92,12 @@
 #define DART_GEN3_PTE_OFFSET GENMASK(37, 10)
 #define DART_GEN3_ROUTE      0x4604
 
+/* Low word of the 128-bit TLBI aperture payload. */
+#define DART_GEN3_TLBI_OP_SID     BIT(60)
+#define DART_GEN3_TLBI_ROUTE      GENMASK(59, 56)
+#define DART_GEN3_TLBI_SID        GENMASK(55, 48)
+#define DART_GEN3_TLBI_TIMEOUT_US 1000
+
 #define DART_TCR(dart) (dart->regs + dart->params->tcr_off + 4 * dart->device)
 #define DART_TTBR(dart, idx)                                                                       \
     (dart->regs + dart->params->ttbr_off + 4 * dart->params->ttbr_count * dart->device + 4 * idx)
@@ -186,18 +192,44 @@ static void dart_t8110_tlb_invalidate(dart_dev_t *dart)
  * invalidation. The old +0x80 command register is used for translation
  * queries, not this invalidation path. DCP SID 23 accepted this sequence on
  * J873g without an exception. */
-static void dart_gen3_tlb_invalidate(dart_dev_t *dart)
+static inline void dart_gen3_tlbi_broadcast(uintptr_t aperture, u64 lo, u64 hi)
 {
-    u64 lo = BIT(60) | ((u64)dart->tlbi_route << 56) | ((u64)dart->device << 48);
-    u64 hi = 0;
-    dma_wmb();
     asm volatile("stp %0, %1, [%2]\n"
                  "dsb ish\n"
                  ".inst 0xd50881bf\n" /* tlbi vale1os, xzr */
                  "dsb osh\n"
                  :
-                 : "r"(lo), "r"(hi), "r"(dart->tlbi_aperture)
+                 : "r"(lo), "r"(hi), "r"(aperture)
                  : "memory");
+}
+
+/* Gen3 has no busy bit to poll: the final DSB returns only once the broadcast
+ * invalidation has completed. Time it instead. One that takes longer than this
+ * means the DART or the fabric stalled, and the domain is marked failed just as
+ * a busy bit that does not clear marks a T8020/T8110 domain. The bound is ten
+ * times their 100 us poll, to leave room for the broadcast to reach every
+ * cluster. */
+static void dart_gen3_tlb_invalidate(dart_dev_t *dart)
+{
+    if (dart->failed)
+        return;
+    if (!dart->tlbi_aperture || (dart->tlbi_aperture & 15)) {
+        printf("dart: Gen3 SID %u has no usable TLBI aperture.\n", dart->device);
+        dart->failed = true;
+        return;
+    }
+
+    u64 lo = DART_GEN3_TLBI_OP_SID | FIELD_PREP(DART_GEN3_TLBI_ROUTE, dart->tlbi_route) |
+             FIELD_PREP(DART_GEN3_TLBI_SID, dart->device);
+    /* ensure that the DART can see the updated pagetables before invalidating */
+    dma_wmb();
+    u64 start = get_ticks();
+    dart_gen3_tlbi_broadcast(dart->tlbi_aperture, lo, 0);
+    u64 us = ticks_to_usecs(get_ticks() - start);
+    if (us > DART_GEN3_TLBI_TIMEOUT_US) {
+        printf("dart: Gen3 TLBI for SID %u took %lu us.\n", dart->device, (unsigned long)us);
+        dart->failed = true;
+    }
 }
 
 const struct dart_params dart_t8020 = {
@@ -1163,10 +1195,15 @@ void dart_free_l2(dart_dev_t *dart, uintptr_t iova)
     u32 ttbr = (iova >> 36) & 0x3;
     u32 l1_index = (iova >> 25) & 0x7ff;
 
-    if (!(dart->l1[ttbr][l1_index] & DART_PTE_VALID))
+    if (ttbr >= (u32)dart->params->ttbr_count || !dart->l1[ttbr])
+        return;
+    u64 entry = dart->l1[ttbr][l1_index];
+    if (!(entry & DART_PTE_VALID))
         return;
 
-    u64 *l2 = dart_get_l2(dart, l1_index);
+    /* The table behind this root's entry: never look one up (or allocate one)
+     * by the L1 index alone, which would land under root 0. */
+    u64 *l2 = (u64 *)(FIELD_GET(dart->params->offset_mask, entry) << DART_PTE_OFFSET_SHIFT);
 
     for (u32 idx = 0; idx < 2048; idx++) {
         if (l2[idx] & DART_PTE_VALID) {
