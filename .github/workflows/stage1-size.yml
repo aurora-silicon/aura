@@ -69,7 +69,8 @@ jobs:
       - name: Stage 1 room
         run: |
           docker run --rm -v "$PWD:/src" -w /src alarm-build /bin/bash -euc '
-            sed -i "s/^CheckSpace/#CheckSpace/" /etc/pacman.conf
+            # No Landlock or alpm user switch inside the container.
+            sed -i -e "s/^CheckSpace/#CheckSpace/" -e "/^\[options\]/a DisableSandbox" /etc/pacman.conf
             pacman-key --init >/dev/null
             pacman-key --populate archlinuxarm >/dev/null
             pacman -Syu --noconfirm --needed clang lld llvm rustup make python >/dev/null
