@@ -25,6 +25,7 @@
 #include "kboot_audio.h"
 #include "kboot_display_facts.h"
 #include "kboot_gpu_t8122.h"
+#include "kboot_mte.h"
 #include "kboot_pmp_t8122.h"
 #include "kboot_t6031.h"
 #include "malloc.h"
@@ -1384,6 +1385,14 @@ static int dt_set_uboot_config(void)
     return 0;
 }
 
+/* The MTE tag storage (kboot_mte.c): the initrd and the device tree must end below it. */
+static int dt_set_mte_tag_storage(u64 dram_base, u64 dram_size, u64 ram_start, u64 *ram_end)
+{
+    u64 os_end = max((u64)dt + dt_bufsize, initrd_start ? (u64)initrd_start + initrd_size : 0);
+
+    return kboot_mte_reserve(dt, os_end, dram_base, dram_size, ram_start, ram_end);
+}
+
 static int dt_set_memory(void)
 {
     int anode = adt_path_offset(adt, "/chosen");
@@ -1410,6 +1419,9 @@ static int dt_set_memory(void)
 
     u64 dram_min = cur_boot_args.phys_base;
     u64 dram_max = cur_boot_args.phys_base + cur_boot_args.mem_size;
+
+    if (dt_set_mte_tag_storage(dram_base, dram_size, dram_min, &dram_max))
+        return -1;
 
     printf("FDT: DRAM at 0x%lx size 0x%lx\n", dram_base, dram_size);
     printf("FDT: Usable memory is 0x%lx..0x%lx (0x%lx)\n", dram_min, dram_max, dram_max - dram_min);
