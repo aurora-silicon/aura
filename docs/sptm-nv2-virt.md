@@ -43,6 +43,28 @@ The sleep record follows it: from 512 records before the first core's self-disab
 On T8132 the commit is followed 3 ms later by four SPMI commands to the PMU (`nub-spmi0`, slave 0xe):
 read 0x2000, a 4-byte write at 0x2008, `0x200e <- 0`, and `0x2000 <- 0x41`, T8132's "go hib".
 
+### T6041 (J616c, MacBook Pro M4 Max)
+
+27.2.1 (26B131) boots to its single-user shell on all sixteen cores, with SPTM, TXM and XNU only (no
+`AURA_KEEP_EXCLAVES`); the kernel is `kernelcache.release.mac16j`. Its kernelcache entry patches only
+the NVRAM writes. What differs from the J700:
+
+- The ADT has no `soc_misc` block, so there is no sleep path. The debug link's domains are kept on
+  regardless: otherwise XNU lowers them a few seconds into IOKit and the link drops.
+- The NOR's NVRAM partition (`/arm-io/qspi/spinor/anvram`) has to stay visible, as it does by
+  default. 27.2.1's AppleImage4 does not finish starting until the IONVRAM resource is published,
+  which only a registered NVRAM controller does. Without it the Image4 kext never completes, and
+  libignition, right after printing its arguments, waits forever in the
+  `security.mac.img4.ignition_blob` sysctl. The guest does write NVRAM: about 27 s in, while APFS
+  mounts the volumes, AppleARMNORNVRAM sends the NOR a write enable, which `nvram_ro` turns into a
+  success that writes nothing.
+- The secondaries' window holds here too: each cluster's `ACC_CTXR_D` is locked over the boot
+  object, and a secondary started at code outside it powers up but never reports in, so aura stays at
+  stage 1's base.
+- TXM fails selector 45 with errno 78 on every boot (`AppleImage4: failed to set boot uuid in
+  supervisor: 78`): this TXM has no handler for that request type. AppleImage4 logs it and carries
+  on; it is not why a boot stops.
+
 The code:
 
 | File | What |
