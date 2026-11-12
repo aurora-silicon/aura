@@ -2135,6 +2135,194 @@ static void t8142_no_fw_data_node(void)
     t8142_expect_gpu_on();
     assert(fdt_path_offset(dtbuf, "/reserved-memory/fw-data") < 0);
 }
+
+/* ---------- T8140 (A18 Pro, G17P): both roles' __DATA as gpu-fw-data ---------- */
+
+/* The J700's sgx data regions, from its ADT: gfx-data, then gfx1-data right after it. */
+#define T8140_GFX_DATA       0x10001d7c000UL
+#define T8140_GFX_DATA_SIZE  0x134000UL
+#define T8140_GFX1_DATA      (T8140_GFX_DATA + T8140_GFX_DATA_SIZE)
+#define T8140_GFX1_DATA_SIZE 0x12c000UL
+#define T8140_GPU            "/soc/gpu@482600000"
+
+enum t8140_case {
+    T8140_CONTIGUOUS,
+    T8140_APART,        /* gfx1-data one page after the end of gfx-data */
+    T8140_NO_GFX1,      /* the ADT has no gfx1-data */
+    T8140_ON_RESERVED,  /* another enabled reserved-memory node covers part of the span */
+    T8140_UNALIGNED,    /* gfx-data-size not a multiple of 16 KiB */
+};
+
+static void t8140_setup(enum t8140_case c, bool fw_data_node)
+{
+    chip_id = 0x8140;
+    log_len = trace_len = 0;
+    log_buf[0] = trace_buf[0] = 0;
+    exc_guard = GUARD_OFF;
+    exc_count = 0;
+    n_hnodes = 0;
+    memset(hnodes, 0, sizeof(hnodes));
+
+    const char *sgx = "/arm-io/sgx";
+    struct perf_state states[16];
+    for (int i = 0; i < 16; i++)
+        states[i] = (struct perf_state){i ? 300000000u + 80000000u * i : 0, i ? 600 + 20 * i : 0};
+    hset_u32(sgx, "perf-state-count", 16);
+    hset_u32(sgx, "gpu-num-perf-states", 15);
+    hset_u32(sgx, "perf-state-table-count", 1);
+    hset(sgx, "perf-states", states, sizeof(states));
+    hset(sgx, "perf-states-sram", states, sizeof(states));
+    static const struct {
+        const char *name;
+        u64 base, size;
+    } regions[] = {
+        {"gfx-handoff", 0x10221b10000UL, 0x4000},
+        {"gfx-shared-l2-region", 0x10221b14000UL, 0x4000},
+        {"gfx-shared-region", 0x10221b18000UL, 0x80000},
+        {"gpu-region", 0x10221b98000UL, 0x4000},
+    };
+    for (size_t i = 0; i < ARRAY_SIZE(regions); i++) {
+        char prop[64];
+        snprintf(prop, sizeof(prop), "%s-base", regions[i].name);
+        hset_u64(sgx, strdup(prop), regions[i].base);
+        snprintf(prop, sizeof(prop), "%s-size", regions[i].name);
+        hset_u64(sgx, strdup(prop), regions[i].size);
+    }
+    hset_u64(sgx, "gfx-data-base", T8140_GFX_DATA);
+    hset_u64(sgx, "gfx-data-size", c == T8140_UNALIGNED ? T8140_GFX_DATA_SIZE + 0x1000
+                                                        : T8140_GFX_DATA_SIZE);
+    if (c != T8140_NO_GFX1) {
+        hset_u64(sgx, "gfx1-data-base", T8140_GFX1_DATA + (c == T8140_APART ? 0x4000 : 0));
+        hset_u64(sgx, "gfx1-data-size", T8140_GFX1_DATA_SIZE);
+    }
+    /* 26A428 has no __DATA_SHARED_RO on T8140: the ADT carries the properties as zero */
+    hset_u64(sgx, "gfx-data-shared-ro-base", 0);
+    hset_u64(sgx, "gfx-data-shared-ro-size", 0);
+    hset_u64(sgx, "gfx1-data-shared-ro-base", 0);
+    hset_u64(sgx, "gfx1-data-shared-ro-size", 0);
+
+    void *dt = dtbuf;
+    CHK(fdt_create_empty_tree(dt, sizeof(dtbuf)));
+    CHK(fdt_setprop_u32(dt, 0, "#address-cells", 2));
+    CHK(fdt_setprop_u32(dt, 0, "#size-cells", 2));
+    int aliases = fdt_add_subnode(dt, 0, "aliases");
+    CHK(aliases);
+    CHK(fdt_setprop_string(dt, aliases, "gpu", T8140_GPU));
+    CHK(fdt_add_subnode(dt, 0, "chosen"));
+    int opps = fdt_add_subnode(dt, 0, "opp-table");
+    CHK(opps);
+    CHK(fdt_setprop_u32(dt, opps, "phandle", 0x40));
+    for (int i = 15; i >= 0; i--) {
+        char name[16];
+        snprintf(name, sizeof(name), "opp%02d", i);
+        int opp = fdt_add_subnode(dt, opps, name);
+        CHK(opp);
+        CHK(fdt_setprop_u64(dt, opp, "opp-hz", 0));
+        CHK(fdt_setprop_u32(dt, opp, "opp-microvolt", 0));
+    }
+    int resv = fdt_add_subnode(dt, 0, "reserved-memory");
+    CHK(resv);
+    CHK(fdt_setprop_u32(dt, resv, "#address-cells", 2));
+    CHK(fdt_setprop_u32(dt, resv, "#size-cells", 2));
+    static const char *const nodes[] = {"uat-handoff", "uat-l2-pagetables", "uat-pagetables",
+                                        "uat-ttbs"};
+    for (size_t i = 0; i < ARRAY_SIZE(nodes); i++)
+        add_resv(dt, resv, nodes[i], 0x50 + i);
+    /* The video codec's firmware ends where gfx-data starts, the next region starts after gfx1 */
+    static const u64 neighbours[][2] = {
+        {0x10001c4c000UL, T8140_GFX_DATA - 0x10001c4c000UL},
+        {T8140_GFX1_DATA + T8140_GFX1_DATA_SIZE, 0x4000},
+    };
+    for (size_t i = 0; i < ARRAY_SIZE(neighbours); i++) {
+        char name[48];
+        snprintf(name, sizeof(name), "asc-firmware@%lx", (unsigned long)neighbours[i][0]);
+        int n = fdt_add_subnode(dt, resv, name);
+        CHK(n);
+        fdt64_t reg[2];
+        fdt64_st(&reg[0], neighbours[i][0] - (c == T8140_ON_RESERVED && i ? 0x4000 : 0));
+        fdt64_st(&reg[1], neighbours[i][1]);
+        CHK(fdt_setprop(dt, n, "reg", reg, sizeof(reg)));
+        CHK(fdt_setprop(dt, n, "no-map", NULL, 0));
+    }
+    if (fw_data_node) {
+        add_resv(dt, resv, "gpu-fw-data", 0x60);
+        CHK(fdt_setprop(dt, fdt_path_offset(dt, "/reserved-memory/gpu-fw-data"), "no-map", NULL,
+                        0));
+    }
+    int soc = fdt_add_subnode(dt, 0, "soc");
+    CHK(soc);
+    int gpu = fdt_add_subnode(dt, soc, "gpu@482600000");
+    CHK(gpu);
+    CHK(fdt_setprop_string(dt, gpu, "compatible", "apple,agx-t8140"));
+    CHK(fdt_setprop_u32(dt, gpu, "operating-points-v2", 0x40));
+}
+
+static void t8140_expect_gpu_on(void)
+{
+    assert(strcmp(status_of(dtbuf, T8140_GPU), "disabled"));
+    u64 base, size;
+    t8142_reg("/reserved-memory/uat-ttbs", &base, &size);
+    assert(base == 0x10221b98000UL && size == 0x4000);
+}
+
+/* Both roles' __DATA, back to back, become one no-map gpu-fw-data region. */
+static void t8140_fw_data(void)
+{
+    t8140_setup(T8140_CONTIGUOUS, true);
+    CHK(dt_set_gpu_g17(dtbuf, &g17_soc_t8140));
+    t8140_expect_gpu_on();
+    u64 base, size;
+    t8142_reg("/reserved-memory/gpu-fw-data", &base, &size);
+    assert(base == T8140_GFX_DATA && size == T8140_GFX_DATA_SIZE + T8140_GFX1_DATA_SIZE);
+    assert(!strcmp(status_of(dtbuf, "/reserved-memory/gpu-fw-data"), "okay"));
+    assert(prop_len(dtbuf, "/reserved-memory/gpu-fw-data", "no-map") == 0);
+}
+
+/* What one region cannot describe, or what is not the firmware's alone, stays disabled. */
+static void t8140_expect_no_fw_data(const char *why)
+{
+    CHK(dt_set_gpu_g17(dtbuf, &g17_soc_t8140));
+    t8140_expect_gpu_on();
+    u64 base, size;
+    t8142_reg("/reserved-memory/gpu-fw-data", &base, &size);
+    assert(!base && !size);
+    assert(!strcmp(status_of(dtbuf, "/reserved-memory/gpu-fw-data"), "disabled"));
+    assert(log_has(why));
+}
+
+static void t8140_fw_data_apart(void)
+{
+    t8140_setup(T8140_APART, true);
+    t8140_expect_no_fw_data("firmware data segments are not contiguous");
+}
+
+static void t8140_fw_data_no_gfx1(void)
+{
+    t8140_setup(T8140_NO_GFX1, true);
+    t8140_expect_no_fw_data("no valid gfx1-data");
+}
+
+static void t8140_fw_data_on_reserved(void)
+{
+    t8140_setup(T8140_ON_RESERVED, true);
+    t8140_expect_no_fw_data("overlaps /reserved-memory/asc-firmware@");
+}
+
+static void t8140_fw_data_unaligned(void)
+{
+    t8140_setup(T8140_UNALIGNED, true);
+    t8140_expect_no_fw_data("no valid gfx-data");
+}
+
+/* A DT without the node is filled as before. */
+static void t8140_no_fw_data_node(void)
+{
+    t8140_setup(T8140_CONTIGUOUS, false);
+    CHK(dt_set_gpu_g17(dtbuf, &g17_soc_t8140));
+    t8140_expect_gpu_on();
+    assert(fdt_path_offset(dtbuf, "/reserved-memory/gpu-fw-data") < 0);
+    assert(!log_has("gpu-fw-data"));
+}
 #endif
 
 static const struct {
@@ -2225,6 +2413,12 @@ static const struct {
     {"t8142-fw-data-no-shared-ro", t8142_fw_data_no_shared_ro},
     {"t8142-fw-data-apart", t8142_fw_data_apart},
     {"t8142-no-fw-data-node", t8142_no_fw_data_node},
+    {"t8140-fw-data", t8140_fw_data},
+    {"t8140-fw-data-apart", t8140_fw_data_apart},
+    {"t8140-fw-data-no-gfx1", t8140_fw_data_no_gfx1},
+    {"t8140-fw-data-on-reserved", t8140_fw_data_on_reserved},
+    {"t8140-fw-data-unaligned", t8140_fw_data_unaligned},
+    {"t8140-no-fw-data-node", t8140_no_fw_data_node},
 #endif
 };
 
