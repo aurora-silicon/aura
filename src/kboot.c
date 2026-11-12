@@ -4375,36 +4375,98 @@ static bool dt_ave_node_disabled(int node)
            !((len == 5 && !memcmp(status, "okay", 5)) || (len == 3 && !memcmp(status, "ok", 3)));
 }
 
-/* Enable a node and, first, the power-domain providers it names, a few levels up. */
-static int dt_ave_enable_phandle(u32 phandle, int depth)
+/*
+ * Power-domain chains are walked to their top: a T8140 encoder's me1 power state sits eight
+ * providers below it on DTs that describe the fabric power states. The bound is only a sanity
+ * stop for a broken DT; a cycle is refused as soon as it is seen.
+ */
+#define DT_POWER_CHAIN_MAX_DEPTH     32
+#define DT_POWER_CHAIN_MAX_PROVIDERS 16
+#define DT_POWER_CHAIN_MAX_DONE      128
+
+struct dt_power_chain {
+    u32 path[DT_POWER_CHAIN_MAX_DEPTH]; /* the nodes being walked, the consumer first */
+    int depth;
+    u32 done[DT_POWER_CHAIN_MAX_DONE]; /* nodes whose whole chain is already enabled */
+    size_t ndone;
+};
+
+static const char *dt_power_chain_name(u32 phandle)
 {
-    u32 providers[8];
+    int node = fdt_node_offset_by_phandle(dt, phandle);
+    const char *name = node >= 0 ? fdt_get_name(dt, node, NULL) : NULL;
+
+    return name ? name : "?";
+}
+
+/* Enable a node and, first, every power-domain provider above it, up to the top. */
+static int dt_power_chain_enable(struct dt_power_chain *walk, u32 phandle)
+{
+    u32 providers[DT_POWER_CHAIN_MAX_PROVIDERS];
     size_t count = 0;
     int node, len;
 
-    node = fdt_node_offset_by_phandle(dt, phandle);
-    if (node < 0 || depth > 6)
+    for (size_t i = 0; i < walk->ndone; i++)
+        if (walk->done[i] == phandle)
+            return 0;
+    for (int i = 0; i < walk->depth; i++) {
+        if (walk->path[i] == phandle) {
+            printf("FDT: power-domain cycle at %s (from %s)\n", dt_power_chain_name(phandle),
+                   dt_power_chain_name(walk->path[0]));
+            return -1;
+        }
+    }
+    if (walk->depth == DT_POWER_CHAIN_MAX_DEPTH) {
+        printf("FDT: power-domain chain of %s deeper than %d at %s\n",
+               dt_power_chain_name(walk->path[0]), DT_POWER_CHAIN_MAX_DEPTH,
+               dt_power_chain_name(phandle));
         return -1;
+    }
+
+    node = fdt_node_offset_by_phandle(dt, phandle);
+    if (node < 0) {
+        printf("FDT: power-domain provider 0x%x of %s not found\n", phandle,
+               walk->depth ? dt_power_chain_name(walk->path[walk->depth - 1]) : "?");
+        return -1;
+    }
 
     const fdt32_t *pd = fdt_getprop(dt, node, "power-domains", &len);
     for (int i = 0; pd && i < len / (int)sizeof(*pd);) {
         u32 ph = fdt32_to_cpu(pd[i]);
         int provider = fdt_node_offset_by_phandle(dt, ph);
-        if (provider < 0 || count == ARRAY_SIZE(providers))
+        if (provider < 0) {
+            printf("FDT: power-domain provider 0x%x of %s not found\n", ph,
+                   fdt_get_name(dt, node, NULL));
             return -1;
+        }
+        if (count == ARRAY_SIZE(providers)) {
+            printf("FDT: %s names more than %d power domains\n", fdt_get_name(dt, node, NULL),
+                   DT_POWER_CHAIN_MAX_PROVIDERS);
+            return -1;
+        }
         const fdt32_t *cells = fdt_getprop(dt, provider, "#power-domain-cells", NULL);
         providers[count++] = ph;
         i += 1 + (cells ? fdt32_to_cpu(*cells) : 0);
     }
-    for (size_t i = 0; i < count; i++)
-        if (dt_ave_enable_phandle(providers[i], depth + 1))
-            return -1;
 
+    walk->path[walk->depth++] = phandle;
+    for (size_t i = 0; i < count; i++) {
+        if (dt_power_chain_enable(walk, providers[i])) {
+            walk->depth--;
+            return -1;
+        }
+    }
+    walk->depth--;
+
+    /* Enabling a provider may have moved this node. */
     node = fdt_node_offset_by_phandle(dt, phandle);
     if (node < 0)
         return -1;
     if (dt_ave_node_disabled(node) && fdt_setprop_string(dt, node, "status", "okay"))
         return -1;
+    /* A full list only costs a second walk of a chain that is already enabled. */
+    if (walk->ndone < ARRAY_SIZE(walk->done))
+        walk->done[walk->ndone++] = phandle;
     return 0;
 }
 
@@ -4433,10 +4495,11 @@ static int dt_t8140_ave_enable(u32 self)
         if (!seen && count < ARRAY_SIZE(refs))
             refs[count++] = ph;
     }
+    struct dt_power_chain walk = {0};
     for (size_t i = 0; i < count; i++)
-        if (dt_ave_enable_phandle(refs[i], 0))
+        if (dt_power_chain_enable(&walk, refs[i]))
             return -1;
-    return dt_ave_enable_phandle(self, 0);
+    return dt_power_chain_enable(&walk, self);
 }
 
 /*
