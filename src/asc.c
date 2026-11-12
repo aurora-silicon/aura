@@ -158,6 +158,26 @@ bool asc_cpu_running(asc_dev_t *asc)
     return read32(asc->cpu_base + ASC_CPU_CONTROL) & ASC_CPU_CONTROL_START;
 }
 
+void asc_i2a_enable(asc_dev_t *asc, bool on)
+{
+    if (on)
+        set32(asc->base + ASC_MBOX_I2A_CONTROL, ASC_MBOX_CONTROL_ENABLE);
+    else
+        clear32(asc->base + ASC_MBOX_I2A_CONTROL, ASC_MBOX_CONTROL_ENABLE);
+}
+
+u32 asc_cpu_status(asc_dev_t *asc)
+{
+    return read32(asc->cpu_base + ASC_CPU_STATUS);
+}
+
+bool asc_cpu_idle(asc_dev_t *asc)
+{
+    u32 status = read32(asc->cpu_base + ASC_CPU_STATUS);
+
+    return (status & ASC_CPU_STATUS_STOPPED) && (status & ASC_CPU_STATUS_IDLE);
+}
+
 static bool asc_mailbox_empty(u32 control)
 {
     return (control & (ASC_MBOX_CONTROL_ENABLE | ASC_MBOX_CONTROL_EMPTY)) ==

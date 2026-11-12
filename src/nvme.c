@@ -11,6 +11,7 @@
 #include "sart.h"
 #include "string.h"
 #include "utils.h"
+#include "xnuboot.h"
 
 #define NVME_TIMEOUT          1000000
 #define NVME_ENABLE_TIMEOUT   5000000
@@ -991,3 +992,210 @@ bool nvme_write(u32 nsid, u64 lba, const void *buffer)
 
     return nvme_exec_command(&ioq, &cmd, NULL);
 }
+
+#ifdef SPTM_VIRT
+/*
+ * What an aura stage gave ANS: its RTKit buffers, in the OS's DRAM (cur_boot_args), outside the
+ * firmware's own segments. iBoot's entries (MMIO pages, its carve-outs) stay for XNU.
+ */
+static bool nvme_aura_memory(int nub, u64 pa, u64 size)
+{
+    u32 len = 0;
+    const u8 *seg = adt_getprop(adt, nub, "segment-ranges", &len);
+    struct adt_segment_ranges r;
+
+    if (pa < cur_boot_args.phys_base ||
+        pa + size > cur_boot_args.phys_base + cur_boot_args.mem_size)
+        return false;
+    for (u32 off = 0; seg && off + sizeof(r) <= len; off += sizeof(r)) {
+        memcpy(&r, seg + off, sizeof(r));
+        if (pa < r.phys + r.size && r.phys < pa + size)
+            return false;
+    }
+    return true;
+}
+
+#define NVME_SART_ENTRIES 16
+
+/* A reset of ANS's own gate (on T8140 its ADT gate is APCIE_SYS_ST-V); SART entries put back. */
+static int nvme_cold_reset(int die, asc_dev_t *asc, sart_dev_t *sart, const u64 *pa,
+                           const size_t *sz)
+{
+    u32 before = asc_cpu_status(asc);
+    int ret = pmgr_reset_held(die, "ANS");
+
+    /* 0x6a on the J700 right after a reset (bit 3 with the CPU stopped and idle). */
+    printf("nvme: cold handoff: CPU status 0x%x before the reset, 0x%x after\n", before,
+           asc_cpu_status(asc));
+
+    for (int i = 0; sart && i < NVME_SART_ENTRIES; i++) {
+        u64 now_pa;
+        size_t now_sz;
+        if (!sz[i] ||
+            (sart_get_allowed(sart, i, &now_pa, &now_sz) && now_pa == pa[i] && now_sz == sz[i]))
+            continue;
+        printf("nvme: cold handoff: SART entry %d lost in the reset: put back\n", i);
+        sart_set_allowed(sart, i, pa[i], sz[i]);
+    }
+    return ret;
+}
+
+/*
+ * For an OS that starts ANS itself, as XNU does from an iop-ans-nub without "quiesced": end the
+ * session an earlier stage left (iBoot's, or one an aura stage negotiated and kept), with the
+ * controller off first. The firmware goes to SLEEP (with idle, IDLE as before macOS's own sleep),
+ * its CPU stops, the aura stage's SART entries go, and ANS is reset with its power and iBoot's
+ * entries kept, so that XNU registers those as at a normal boot. Unless no_probe, ANS is started
+ * once to check that it says HELLO from cold, then stopped and reset again. XNU then maps the
+ * firmware and sets RUN, and the firmware boots with no earlier session. Returns 0 when ready.
+ */
+int nvme_cold_handoff(bool idle, bool no_probe)
+{
+    const char *path = "/arm-io/ans";
+    int node = adt_path_offset(adt, path);
+    int nub = adt_path_offset(adt, "/arm-io/ans/iop-ans-nub");
+    u64 pa[NVME_SART_ENTRIES] = {0};
+    size_t sz[NVME_SART_ENTRIES] = {0};
+    int ret = -1, die = 0;
+    u32 cg;
+
+    if (nvme_initialized && !nvme_shutdown())
+        return -1;
+    if (node < 0 || nub < 0) {
+        printf("nvme: cold handoff: no %s or its iop-ans-nub\n", path);
+        return -1;
+    }
+    if (ADT_GETPROP(adt, node, "clock-gates", &cg) >= 0)
+        die = FIELD_GET(PMGR_DIE_ID, cg);
+
+    int adt_path[8];
+    u64 base = 0;
+    bool split = adt_get_property(adt, node, "nvme-secure-bar");
+    if (adt_path_offset_trace(adt, path, adt_path) < 0 ||
+        adt_get_reg(adt, adt_path, "reg", split ? 9 : 3, &base, NULL) < 0 || !base) {
+        printf("nvme: cold handoff: no NVMe registers\n");
+        return -1;
+    }
+
+    asc_dev_t *asc = asc_init(path);
+    if (!asc)
+        return -1;
+    rtkit_dev_t *rtk = NULL;
+    u64 saved_base = nvme_base;
+    rtkit_dev_t *saved_rtkit = nvme_rtkit;
+    bool running = asc_cpu_running(asc);
+    u32 cc = read32(base + NVME_CC), csts = read32(base + NVME_CSTS);
+
+    printf("nvme: cold handoff: ANS %s, CC 0x%x CSTS 0x%x\n", running ? "running" : "stopped", cc,
+           csts);
+    if (running) {
+        /*
+         * A session whose controller an earlier stage shut down (CC.SHN set) was quiesced
+         * with it, and answers nothing until it's woken: wake it as XNU does (INIT, then
+         * the handshake, its buffers through the SART), then put it to sleep. A firmware
+         * stopped without an acknowledged sleep doesn't start again from the run bit.
+         */
+        bool wake = FIELD_GET(NVME_CC_SHN, cc) != NVME_CC_SHN_NONE;
+        bool done = false;
+        sart_dev_t *wsart = sart_init("/arm-io/sart-ans");
+
+        for (int attempt = 0; attempt < 2 && !done; attempt++) {
+            if (rtk)
+                rtkit_free(rtk);
+            rtk = rtkit_init("nvme-cold", asc, NULL, NULL, wake ? wsart : NULL, false);
+            if (!rtk)
+                break;
+            /* The controller helpers serve the firmware's log through nvme_rtkit meanwhile. */
+            nvme_base = base;
+            nvme_rtkit = rtk;
+            if (wake) {
+                bool up = rtkit_boot(rtk);
+                printf("nvme: cold handoff: woke the quiesced session: %s\n",
+                       up ? "HELLO, handshake done" : "no HELLO");
+                if (!up)
+                    break;
+            }
+            if (read32(base + NVME_CC) & NVME_CC_EN) {
+                if (!nvme_ctrl_shutdown())
+                    printf("nvme: cold handoff: controller shutdown timed out\n");
+                if (!nvme_ctrl_disable())
+                    printf("nvme: cold handoff: controller disable timed out\n");
+            }
+            done = idle ? rtkit_idle(rtk) : rtkit_sleep(rtk);
+            if (!done && !wake) {
+                printf("nvme: cold handoff: ANS didn't acknowledge %s; waking it first\n",
+                       idle ? "IDLE" : "SLEEP");
+                wake = true;
+            }
+        }
+        if (!done) {
+            printf("nvme: cold handoff: ANS didn't acknowledge %s; stopping it\n",
+                   idle ? "IDLE" : "SLEEP");
+            if (rtk)
+                rtkit_stop(rtk);
+            else
+                asc_cpu_stop(asc);
+        } else {
+            printf("nvme: cold handoff: ANS acknowledged %s\n", idle ? "IDLE" : "SLEEP");
+        }
+        nvme_base = saved_base;
+        nvme_rtkit = saved_rtkit;
+        /* Stopped: its buffers and their SART entries go now, before the entries are sorted. */
+        if (rtk) {
+            rtkit_free(rtk);
+            rtk = NULL;
+        }
+        if (wsart)
+            sart_release(wsart);
+    }
+
+    u64 timeout = timeout_calculate(100000);
+    while (!asc_cpu_idle(asc) && !timeout_expired(timeout))
+        ;
+    printf("nvme: cold handoff: CPU %s\n", asc_cpu_idle(asc) ? "idle" : "NOT idle");
+
+    sart_dev_t *sart = sart_init("/arm-io/sart-ans");
+    for (int i = 0; sart && i < NVME_SART_ENTRIES; i++) {
+        if (!sart_get_allowed(sart, i, &pa[i], &sz[i]))
+            continue;
+        if (!nvme_aura_memory(nub, pa[i], sz[i])) {
+            printf("nvme: cold handoff: SART entry %d 0x%lx+0x%lx kept\n", i, pa[i], sz[i]);
+            continue;
+        }
+        printf("nvme: cold handoff: SART entry %d 0x%lx+0x%lx is an aura stage's: cleared\n", i,
+               pa[i], sz[i]);
+        sart_clear_entry(sart, i);
+        sz[i] = 0;
+    }
+
+    if (nvme_cold_reset(die, asc, sart, pa, sz)) {
+        printf("nvme: cold handoff: ANS didn't reset\n");
+        goto out_sart;
+    }
+    if (!no_probe) {
+        int hello = rtkit_probe_hello(asc);
+        printf("nvme: cold handoff: probe: %s\n", hello == 1   ? "HELLO unprompted"
+                                                  : hello == 2 ? "HELLO after INIT"
+                                                               : "NO HELLO");
+        asc_cpu_stop(asc);
+        timeout = timeout_calculate(100000);
+        while (!asc_cpu_idle(asc) && !timeout_expired(timeout))
+            ;
+        if (nvme_cold_reset(die, asc, sart, pa, sz) || !hello) {
+            printf("nvme: cold handoff: ANS not ready for a cold start\n");
+            goto out_sart;
+        }
+    }
+    printf("nvme: cold handoff: ANS stopped (%s), reset, iBoot's SART entries kept\n",
+           idle ? "IDLE" : "SLEEP");
+    ret = 0;
+
+out_sart:
+    if (sart)
+        sart_release(sart);
+    if (rtk)
+        rtkit_free(rtk);
+    asc_free(asc);
+    return ret;
+}
+#endif /* SPTM_VIRT */

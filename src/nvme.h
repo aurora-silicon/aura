@@ -12,6 +12,7 @@ extern bool nvme_keep_running_for_linux;
 extern bool nvme_quiesce_for_next;
 bool nvme_shutdown(void);
 bool nvme_has_live_post_m4_session(void);
+int nvme_cold_handoff(bool idle, bool no_probe);
 
 bool nvme_flush(u32 nsid);
 bool nvme_read(u32 nsid, u64 lba, void *buffer);

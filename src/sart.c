@@ -290,6 +290,22 @@ bool sart_get_allowed(sart_dev_t *sart, int index, u64 *paddr, size_t *sz)
     return e_flags && *sz;
 }
 
+bool sart_set_allowed(sart_dev_t *sart, int index, u64 paddr, size_t sz)
+{
+    if (index < 0 || index >= APPLE_SART_MAX_ENTRIES)
+        return false;
+    return sart->set_entry(sart, index, sart->flags_allow, (void *)paddr, sz);
+}
+
+/* Unlike sart_remove_allowed_region(), also an entry that was set before sart_init(). */
+bool sart_clear_entry(sart_dev_t *sart, int index)
+{
+    if (index < 0 || index >= APPLE_SART_MAX_ENTRIES)
+        return false;
+    sart->protected_entries &= ~(1 << index);
+    return sart->set_entry(sart, index, 0, NULL, 0);
+}
+
 void sart_release(sart_dev_t *sart)
 {
     /* Unlike sart_free(), leave every entry as it is: a live owner still uses them. */

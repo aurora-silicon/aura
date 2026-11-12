@@ -16,6 +16,7 @@
 #include "iodev.h"
 #include "memory.h"
 #include "nv2.h"
+#include "nvme.h"
 #include "smp.h"
 #include "soc.h"
 #include "sptm_virt_priv.h"
@@ -331,6 +332,16 @@ __attribute__((used, retain)) void sptm_virt_flush(u64 pa, u64 size)
 {
     dc_civac_range((void *)pa, size);
     sysop("dsb sy");
+}
+
+/*
+ * ANS for XNU to start itself (see nvme_cold_handoff()): the host then drops "quiesced" from
+ * the guest's iop-ans-nub. flags bit 0: IDLE, as before macOS's sleep, instead of SLEEP (a
+ * diagnostic); bit 1: no HELLO probe.
+ */
+__attribute__((used, retain)) int sptm_virt_ans_cold(u64 flags)
+{
+    return nvme_cold_handoff(flags & 1, flags & 2);
 }
 
 __attribute__((used, retain)) int sptm_virt_load(u64 sptm_entry, u64 handoff)
