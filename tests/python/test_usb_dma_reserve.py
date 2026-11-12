@@ -45,7 +45,7 @@ def test_reserved_memory_nodes(tmp_path):
 #include <stdio.h>
 #include <string.h>
 #include "libfdt.h"
-typedef uint64_t u64;
+typedef unsigned long u64; /* as aura's types.h: kboot prints it with %lx */
 #define SZ_16K 0x4000
 #define ALIGN_UP(x, a) (((x) + ((a) - 1)) & ~((a) - 1))
 #define ALIGN_DOWN(x, a) ((x) & ~((a) - 1))
