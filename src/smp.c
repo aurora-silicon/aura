@@ -1022,7 +1022,7 @@ static void smp_start_t8152(void)
         if (!(rvbar & RVBAR_LOCK))
             write64(cpu->impl_reg, (u64)_vectors_start);
         sysop("dsb sy");
-        /* T8152ACC setCoreOnline/wakeCore preserve other released cores. */
+        /* Setting the start bits leaves the cores already released running. */
         set32(cpu_start_base + 4, BIT(i));
         set32(cpu_start_base + 8 + 4 * cpu->cluster, BIT(cpu->core));
         sysop("dsb sy");

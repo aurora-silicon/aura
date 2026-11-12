@@ -171,10 +171,10 @@ static void dart_t8110_tlb_invalidate(dart_dev_t *dart)
         printf("dart: DART_T8110_TLB_CMD_BUSY did not clear.\n");
 }
 
-/* 26A428 SPTM gen3dart_write_tlbi_cmd_payload: a 128-bit aperture write,
- * followed by VALE1OS, broadcasts a SID invalidation. The old +0x80 command
- * register is used for translation queries, not this invalidation path.
- * DCP SID 23 accepted this sequence on J873g without an exception. */
+/* A 128-bit aperture write, followed by VALE1OS, broadcasts a SID
+ * invalidation. The old +0x80 command register is used for translation
+ * queries, not this invalidation path. DCP SID 23 accepted this sequence on
+ * J873g without an exception. */
 static void dart_gen3_tlb_invalidate(dart_dev_t *dart)
 {
     u64 lo = BIT(60) | ((u64)dart->tlbi_route << 56) | ((u64)dart->device << 48);
