@@ -71,6 +71,11 @@ static int s2r_dcp_resolve(struct s2r_dcp *d)
         int rc = dart_walk_locked_t8110(d->dart, d->dart_size, sid, ram, mem_size_actual,
                                         s2r_dcp_visit, &w);
         s2r_pkt_rec(d - s2r_dcp, 7, sid, d->dva, ((u64)w.found << 32) | (u32)rc, false);
+        if (rc < 0 && sid < 4) /* why it was refused: PROTECT 0x200, TCR 0x1000, TTBR 0x1400 */
+            s2r_pkt_rec(d - s2r_dcp, 8, sid, d->dart + 0x200,
+                        ((u64)read32(d->dart + 0x1000 + 4 * sid) << 32) |
+                            read32(d->dart + 0x1400 + 4 * sid),
+                        false);
         if (rc >= 0 && w.found)
             return 1;
     }
