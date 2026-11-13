@@ -309,6 +309,10 @@ static uintptr_t display_map_fb(uintptr_t iova, u64 paddr, u64 size)
         iova = iova_dcp;
     }
 
+    /* Locked legacy DARTs index their inherited tables with the low 36 bits,
+     * but the DCP requires the ADT window bits in every DVA it receives. */
+    iova |= dart_dva_base(dcp->dart_dcp);
+
     int ret = dart_map(dcp->dart_disp, iova, (void *)paddr, size);
     if (ret < 0) {
         printf("display: failed to map fb to dart-disp0\n");
@@ -425,6 +429,8 @@ int display_start_dcp(void)
     // Find the framebuffer DVA
     fb_dva_allocated = false;
     fb_dva = dart_search(dcp->dart_disp, (void *)cur_boot_args.video.base);
+    if (!DART_IS_ERR(fb_dva) && fb_dva)
+        fb_dva |= dart_dva_base(dcp->dart_dcp);
     // framebuffer is not mapped on the M1 Ultra Mac Studio
     if (DART_IS_ERR(fb_dva) || !fb_dva)
         fb_dva = display_map_fb(0, pa, size);
