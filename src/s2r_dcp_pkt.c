@@ -28,12 +28,14 @@
 #define S2R_PKT_TAG   0x544b5043UL /* "CPKT" */
 #define S2R_PKT_MAX   128
 #define S2R_DCP_OPEN  4
+#define S2R_DCP_SIDS  64
 
 static struct s2r_dcp {
     u64 mbox, dart, dart_size;
     u64 dva, lo;
     u64 pa[S2R_DCP_PAGES];
-    int resolved; /* 0 not yet, 1 found, -1 not found */
+    int resolved; /* 0 not yet, 1 found, -1 not found: tried again after 256 more messages */
+    u32 miss;
     u64 m0[2];    /* message word 0 of a pair not yet complete: 0 A2I, 1 I2A */
     bool have_m0[2];
     u64 open[2][S2R_DCP_OPEN]; /* outstanding packets per direction, for their replies */
@@ -48,11 +50,15 @@ struct s2r_dcp_walk {
     int found;
 };
 
+/* The walk gives an IOVA below 2^36; the AP's DVA carries the stream's VM base above that. */
+#define S2R_DCP_VM_LOW BIT(36)
+
 static int s2r_dcp_visit(u64 iova, u64 pa, void *opaque)
 {
     struct s2r_dcp_walk *w = opaque;
-    if (iova >= w->d->lo && iova < w->d->lo + S2R_DCP_PAGES * 0x4000UL) {
-        w->d->pa[(iova - w->d->lo) / 0x4000] = pa;
+    u64 full = iova | (w->d->lo & ~(S2R_DCP_VM_LOW - 1));
+    if (full >= w->d->lo && full < w->d->lo + S2R_DCP_PAGES * 0x4000UL) {
+        w->d->pa[(full - w->d->lo) / 0x4000] = pa;
         if (++w->found == S2R_DCP_PAGES)
             return 1;
     }
@@ -61,25 +67,31 @@ static int s2r_dcp_visit(u64 iova, u64 pa, void *opaque)
 
 static void s2r_pkt_rec(int idx, int kind, int word, u64 pa, u64 v, bool a2i);
 
+/* The IOMFB shared memory is on whichever of the DART's streams (T6050: 23 and 24 carry it, not
+ * stream 0..15) maps most of its pages: walk every stream and keep the best. One ring record per
+ * attempt (kind 7): found pages, the stream, the streams the walk refused. */
 static int s2r_dcp_resolve(struct s2r_dcp *d)
 {
-    u64 ram = ALIGN_DOWN(cur_boot_args.phys_base, BIT(32));
-    memset(d->pa, 0, sizeof(d->pa));
+    u64 ram = ALIGN_DOWN(cur_boot_args.phys_base, BIT(32)), best[S2R_DCP_PAGES] = {0};
+    int best_found = 0, best_sid = -1, refused = 0;
+
     d->lo = d->dva & ~0x3fffUL;
-    for (u8 sid = 0; sid < 16; sid++) {
+    for (u8 sid = 0; sid < S2R_DCP_SIDS; sid++) {
         struct s2r_dcp_walk w = {d, 0};
+        memset(d->pa, 0, sizeof(d->pa));
         int rc = dart_walk_locked_t8110(d->dart, d->dart_size, sid, ram, mem_size_actual,
                                         s2r_dcp_visit, &w);
-        s2r_pkt_rec(d - s2r_dcp, 7, sid, d->dva, ((u64)w.found << 32) | (u32)rc, false);
-        if (rc < 0 && sid < 4) /* why it was refused: PROTECT 0x200, TCR 0x1000, TTBR 0x1400 */
-            s2r_pkt_rec(d - s2r_dcp, 8, sid, d->dart + 0x200,
-                        ((u64)read32(d->dart + 0x1000 + 4 * sid) << 32) |
-                            read32(d->dart + 0x1400 + 4 * sid),
-                        false);
-        if (rc >= 0 && w.found)
-            return 1;
+        refused += rc < 0;
+        if (rc >= 0 && w.found > best_found) {
+            best_found = w.found;
+            best_sid = sid;
+            memcpy(best, d->pa, sizeof(best));
+        }
     }
-    return -1;
+    memcpy(d->pa, best, sizeof(best));
+    s2r_pkt_rec(d - s2r_dcp, 7, best_sid < 0 ? 0 : best_sid, d->dva,
+                ((u64)best_found << 32) | (u32)refused, false);
+    return best_found ? 1 : -1;
 }
 
 static u64 s2r_dcp_pa(struct s2r_dcp *d, u64 off)
@@ -129,6 +141,8 @@ static void s2r_dcp_msg(int idx, u64 m0, u64 m1, int dir)
     }
     if ((ctl & 3) != 2 || !d->dva)
         return;
+    if (d->resolved < 0 && ++d->miss % 256 == 0)
+        d->resolved = 0;
     if (!d->resolved)
         d->resolved = s2r_dcp_resolve(d);
     if (d->resolved < 0)
