@@ -45,7 +45,7 @@ def pkt_key(rec):
     if marker or pc & 0xFFFFFFFF != PKT_TAG:
         return None
     kind, word = (pc >> 36) & 15, pc >> 40
-    if kind not in (6, 7) and word != 0:
+    if kind not in (4, 6, 7) and word != 0:
         return None
     return (pc >> 32) & 15, PKT_KINDS.get(kind, f"kind{kind}")
 
@@ -72,19 +72,22 @@ def fmt(i, rec, t0, freq, lookup=None):
     if pc & 0xFFFFFFFF == PKT_TAG:  # s2r_dcp_pkt.c: a DCP call's packet word, or a resolve attempt
         idx, kind, word = (pc >> 32) & 15, (pc >> 36) & 15, pc >> 40
         what = PKT_KINDS.get(kind, f"kind{kind}")
-        extra = ""
+        extra, slot = "", ""
         if kind < 4 and word == 0:  # packet head: 4 tag characters, then the input size
             tag4 = bytes((val >> (8 * k)) & 255 for k in range(4))
             extra = f" tag={tag4.decode('ascii', 'replace')!r} in={val >> 32}"
-        if kind == 4:  # an AP call with a large input: its changed words follow as big-word records
-            extra = f" in=0x{val >> 32:x}"
-        elif kind == 5:  # word w of the packet; the input starts at byte 12
+        if kind == 4:  # an AP call with a large input; word = its slot (15: none left), val = size << 32 | tag
+            tag4 = bytes((val >> (8 * k)) & 255 for k in range(4))
+            extra = f" tag={tag4.decode('ascii', 'replace')!r} in=0x{val >> 32:x} slot={word}"
+            word = 0
+        elif kind in (5, 6):  # word w of the packet in slot s; the input starts at byte 12
+            slot, word = f"s{word >> 12} ", word & 0xFFF
             extra = f" poff=0x{word * 8 - 12:x}"
-        elif kind == 6:
-            extra = f" poff=0x{word * 8 - 12:x} changed {val} times, not recorded again"
+            if kind == 6:
+                extra += f" changed {val} times, not recorded again"
         if kind == 7:
             extra = f" found={val >> 32} refused={val & 0xFFFFFFFF} stream={word}"
-        return f"S2R {i} t={t:x} +{secs:.6f}s c{cpu} PKT dcp{idx} {what} w{word} 0x{pa:x} = 0x{val:x}{extra}"
+        return f"S2R {i} t={t:x} +{secs:.6f}s c{cpu} PKT dcp{idx} {what} {slot}w{word} 0x{pa:x} = 0x{val:x}{extra}"
     tag = owner(lookup, pa)[0] if lookup else ""
     return f"S2R {i} t={t:x} +{secs:.6f}s c{cpu} {'W' if write else 'R'}{bits} 0x{pa:x} {tag} = 0x{val:x} pc=0x{pc:x}"
 

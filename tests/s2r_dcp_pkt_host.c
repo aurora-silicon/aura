@@ -288,7 +288,7 @@ int main(void)
     ap_call(DVA, 0x302);
     CHECK(count_kind(0) <= 2 + 16, "huge input size: %d records", count_kind(0));
     i2a(0x42, 0x37);
-    CHECK(count_kind(2) <= 2 + 8, "huge output size: %d records", count_kind(2));
+    CHECK(count_kind(2) <= 2 + 512, "huge output size: %d records", count_kind(2));
 
     /* A call with a large input (swap_submit, 0x1144 bytes): its changed words are traced. */
     *(u64 *)pg_pa(CALL_OFF) = (0x1144UL << 32) | 0x38353441; /* "A458" */
@@ -296,9 +296,11 @@ int main(void)
         *(u64 *)pg_pa(CALL_OFF + 8 * w) = 0x5000 + w;
     ap_call(DVA, 0x302);
     CHECK(count_kind(4) == 1, "big call: %d summary records", count_kind(4));
+    CHECK(find(4, 1) && find(4, 1)->val == ((0x1144UL << 32) | 0x38353441),
+          "big call summary: slot 1 (slot 0 is the huge-input tag) with size and tag");
     CHECK(count_kind(5) == 536, "big call: %d changed words, want 536 (words 18 to 553)", count_kind(5));
     for (int i = 0; i < nrec; i++)
-        if (((recs[i].tag >> 36) & 0xf) == 5 && (recs[i].tag >> 40) == 100)
+        if (((recs[i].tag >> 36) & 0xf) == 5 && (recs[i].tag >> 40) == (1 << 12 | 100))
             CHECK(recs[i].pa == pg_pa(CALL_OFF + 800) && recs[i].val == 0x5000 + 100, "word 100: pa 0x%lx val 0x%lx",
                   (unsigned long)recs[i].pa, (unsigned long)recs[i].val);
     CHECK(count_kind(0) == 18, "big call: %d raw records, want the head and 16 input words", count_kind(0));
@@ -314,14 +316,49 @@ int main(void)
         nrec = 0;
         a2i(((CALL_OFF & 0xffff) << 16) | 0x302, 0x37);
         if (i == 0)
-            CHECK(count_kind(5) == 1 && find(5, 100) && find(5, 100)->val == 0x9000, "one word moved: %d records",
-                  count_kind(5));
+            CHECK(count_kind(5) == 1 && find(5, 1 << 12 | 100) && find(5, 1 << 12 | 100)->val == 0x9000,
+                  "one word moved: %d records", count_kind(5));
         sent += count_kind(5);
         if (count_kind(6) && !volatile_at)
             volatile_at = i + 1;
     }
     CHECK(sent == 199, "word 100 recorded %d more times, want 199 (200 in all)", sent);
     CHECK(volatile_at == 199, "word 100 marked volatile at change %d, want 199", volatile_at);
+
+    /* A second large call (a color table) has its own baseline: neither call records the other's words. */
+    *(u64 *)pg_pa(CALL_OFF) = (0x600UL << 32) | 0x3054554c; /* "LUT0" */
+    for (int w = 2; w < 200; w++)
+        *(u64 *)pg_pa(CALL_OFF + 8 * w) = 0x7000 + w;
+    ap_call(DVA, 0x302);
+    CHECK(count_kind(4) == 1 && find(4, 2) && find(4, 2)->val == ((0x600UL << 32) | 0x3054554c),
+          "second tag: summary in slot 2");
+    CHECK(count_kind(5) == 176, "second tag: %d words, want 176 (words 18 to 193)", count_kind(5));
+    *(u64 *)pg_pa(CALL_OFF) = (0x1144UL << 32) | 0x38353441;
+    for (int w = 2; w < 200; w++)
+        *(u64 *)pg_pa(CALL_OFF + 8 * w) = 0x5000 + w;
+    *(u64 *)pg_pa(CALL_OFF + 800) = 0x9000 + 249;
+    nrec = 0;
+    a2i(((CALL_OFF & 0xffff) << 16) | 0x302, 0x37);
+    CHECK(find(4, 1) && count_kind(5) == 0, "first tag again after the second: %d changed words", count_kind(5));
+
+    /* A DCP that runs out of slots records the call's summary only. */
+    for (int n = 0; n < 4; n++) {
+        *(u64 *)pg_pa(CALL_OFF) = (0x300UL << 32) | (0x10000 + n);
+        ap_call(DVA, 0x302);
+    }
+    CHECK(find(4, 15) && count_kind(5) == 0, "no slot left: %d changed words", count_kind(5));
+
+    /* A call under the large-call size is copied raw, up to S2R_IN_MAX bytes. */
+    *(u64 *)pg_pa(CALL_OFF) = (400UL << 32) | 0x31313131;
+    ap_call(DVA, 0x302);
+    CHECK(count_kind(0) == 2 + 50 && count_kind(4) == 0, "400 byte input: %d raw records, want 52", count_kind(0));
+
+    /* A 3072 byte answer (a data property) is copied whole. */
+    *(u64 *)pg_pa(CALL_OFF) = (0x10UL << 32) | 0x31313131;
+    *(u64 *)pg_pa(CALL_OFF + 8) = 0xc00UL;
+    ap_call(DVA, 0x302);
+    i2a(0x42, 0x37);
+    CHECK(count_kind(2) == 2 + 385, "3072 byte output: %d records, want 387", count_kind(2));
 
     printf(failures ? "FAIL: %d checks\n" : "PASS: DCP packet copier\n", failures);
     return failures != 0;
