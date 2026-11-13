@@ -3997,9 +3997,9 @@ disable:
  * T6050 G17S (M5 Pro, J714s) on the 27.0 firmware. iBoot loads both roles' __TEXT back to back,
  * their __DATA and __DATA_SHARED_RO in one run, and leaves the UAT ranges empty: each role
  * publishes its kernel root while it boots. Linux's driver takes the four UAT ranges, fw-text and
- * fw-data as no-map reservations, and admits only the build whose TEXT normalizes to this digest
- * (its fwid rule: the boot-filled ranges, the entropy records among them, zeroed; Linux also
- * checks the records' tags).
+ * fw-data as no-map reservations, and admits only a build whose TEXT normalizes to one of these
+ * digests (its fwid rule: the boot-filled ranges, the entropy records among them, zeroed; Linux
+ * also checks the records' tags).
  *
  * When the device tree describes the GPU (alias "gpu", apple,agx-g17s, disabled), check the ADT
  * and this build, then fill the reservations and enable the GPU power states, both mailboxes and
@@ -4015,7 +4015,7 @@ disable:
 static const struct {
     const char *props[11], *resv[6], *on[7];
     u32 fill[8][2];
-    u8 sha[32];
+    u8 sha[2][32];
 } t6050_gpu = {
     /* The UAT ranges (base, size), then the bounds of both roles' __DATA and SRO */
     {"gpu-region-base", "gpu-region-size", "gfx-shared-region-base", "gfx-shared-region-size",
@@ -4037,10 +4037,13 @@ static const struct {
      {0x5023c, 8},
      {0x9d1d8, 0x740},
      {0x9d918, 0x231}},
-    /* 26A428 G17S, both roles: Linux's hw/t6050.rs CONFIG digest */
-    {0x85, 0xd0, 0xfd, 0x82, 0x80, 0xf7, 0x24, 0x65, 0x5c, 0xa9, 0xa9,
-     0x71, 0x7b, 0xc9, 0x1a, 0x8a, 0x5e, 0xf6, 0x09, 0x28, 0xd7, 0x72,
-     0x00, 0xf6, 0xd5, 0x3b, 0xd0, 0x99, 0xb9, 0x47, 0x39, 0xc6},
+    /* 26A428 G17S, both roles: Linux's hw/t6050.rs CONFIG digest; then 26C5035r (27.3, M5 Max) */
+    {{0x85, 0xd0, 0xfd, 0x82, 0x80, 0xf7, 0x24, 0x65, 0x5c, 0xa9, 0xa9,
+      0x71, 0x7b, 0xc9, 0x1a, 0x8a, 0x5e, 0xf6, 0x09, 0x28, 0xd7, 0x72,
+      0x00, 0xf6, 0xd5, 0x3b, 0xd0, 0x99, 0xb9, 0x47, 0x39, 0xc6},
+     {0xb7, 0x97, 0x17, 0x83, 0x72, 0xd1, 0xde, 0xb2, 0x8b, 0x56, 0xb5,
+      0xcc, 0x43, 0xe6, 0x45, 0xb1, 0x09, 0x88, 0x60, 0xc1, 0x6d, 0x69,
+      0x1f, 0x59, 0x91, 0xc1, 0xad, 0x8a, 0xfd, 0x5c, 0x07, 0xeb}},
 };
 extern void aura_sha256(const void *data, size_t size, u8 digest[32]);
 
@@ -4079,7 +4082,10 @@ static T6050_GPU_TEXT_FN int t6050_gpu_check(void *dt, u64 r[12])
         memset(copy + t6050_gpu.fill[i][0], 0, t6050_gpu.fill[i][1]);
     aura_sha256(copy, T6050_GPU_TEXT, digest);
     free(copy);
-    return memcmp(digest, t6050_gpu.sha, sizeof(digest)) ? 1 : 2;
+    return memcmp(digest, t6050_gpu.sha[0], sizeof(digest)) &&
+                   memcmp(digest, t6050_gpu.sha[1], sizeof(digest))
+               ? 1
+               : 2;
 }
 
 /* Enables every node of t6050_gpu.on, in order, if they all exist */
