@@ -112,7 +112,7 @@ static bool is_j873g = true;
 struct mapping { u64 dva, pa, size; bool live; };
 struct fake_dart { struct mapping maps[16]; };
 typedef struct fake_dart dart_dev_t;
-typedef struct { dart_dev_t *dart_disp, *dart_dcp; void *iovad_dcp, *dptx_ep; } dcp_dev_t;
+typedef struct { dart_dev_t *dart_disp, *dart_dcp; void *iovad_dcp, *dptx_ep; bool no_reset; } dcp_dev_t;
 typedef void afk_epic_ep_t;
 typedef struct { int id; } dcp_iboot_if_t;
 struct boot_video { u64 base, display, stride, width, height, depth; };

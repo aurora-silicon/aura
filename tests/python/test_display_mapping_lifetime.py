@@ -37,7 +37,7 @@ typedef struct dart_dev dart_dev_t;
 struct params { void (*tlb_invalidate)(dart_dev_t *); };
 struct dart_dev { bool failed, locked, legacy_mutable; int id; const struct params *params; };
 static dart_dev_t disp, domain;
-static struct { dart_dev_t *dart_disp, *dart_dcp; } device;
+static struct { dart_dev_t *dart_disp, *dart_dcp; bool no_reset; } device;
 static __typeof__(device) *dcp = &device;
 static unsigned page_ops[2], tlbis[2], maps[2];
 static int tlbi_failure, map_failure;
