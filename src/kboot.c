@@ -9377,8 +9377,9 @@ t6050_isp_segments_valid(const struct adt_segment_ranges *seg, u32 len, u64 ram,
 /*
  * T6050 firmware lives below Linux RAM. Publish current ADT ranges, not
  * snapshot physical addresses. The kernel allocates the small main-memory
- * tail and owns all power, DART and firmware-start operations. J716c (0x75),
- * J714s (0x74) and K114c (0xb9) use the same two segment names.
+ * tail and owns all power, DART and firmware-start operations. J716c (0x75)
+ * and J714s (0x74) on 27.0, K114c (0xb9) on 27.3 beta and K116s (0xbc) on
+ * 27.2 use the same two segment names.
  */
 __attribute__((section(".init.t6050_isp"))) static int t6050_isp_add_mem_region(uint32_t phandle,
                                                                                 const char *name)
@@ -9392,30 +9393,46 @@ __attribute__((section(".init.t6050_isp"))) static int t6050_isp_add_mem_region(
     return 0;
 }
 
-static int dt_set_t6050_isp(void)
+static const struct {
+    const char *compat;
+    u32 sensor_type;
+    enum fw_version fw;
+} t6050_isp_boards[] = {
+    {"apple,j716c", 0x75, V27_0},
+    {"apple,j714s", 0x74, V27_0},
+    {"apple,k114c", 0xb9, V27_3B},
+    /*
+     * K116s: ADT isp0 of 27.2 (26B8125). Firmware uuid 980F533B-34EA-3FBA-878C-809F6AF57345,
+     * the IPSW's isp_bni/adc-nyx-sck11pm; its K116 connection table has one FrontRGB IMX958.
+     */
+    {"apple,k116s", 0xbc, V27_2},
+};
+
+static int dt_set_t6050_isp(const char **why)
 {
     /* Exact paths: "/soc/isp@..." must not resolve "soc" to "soc@200000000". */
     int node = kboot_fdt_path_exact(dt, "isp");
+    *why = NULL;
     if (node < 0)
         return 0;
-    u32 want;
-    enum fw_version fw = V27_0;
-    if (!fdt_node_check_compatible(dt, 0, "apple,j716c"))
-        want = 0x75;
-    else if (!fdt_node_check_compatible(dt, 0, "apple,j714s"))
-        want = 0x74;
-    else if (!fdt_node_check_compatible(dt, 0, "apple,k114c")) {
-        want = 0xb9;
-        fw = V27_3B;
-    } else
-        return -1;
-    if (os_firmware.version != fw)
+
+    u32 want = 0;
+    *why = "board or firmware not in the table";
+    for (unsigned int i = 0; i < ARRAY_SIZE(t6050_isp_boards); i++) {
+        if (fdt_node_check_compatible(dt, 0, t6050_isp_boards[i].compat))
+            continue;
+        if (os_firmware.version != t6050_isp_boards[i].fw)
+            return -1;
+        want = t6050_isp_boards[i].sensor_type;
+    }
+    if (!want)
         return -1;
 
     int chosen = adt_path_offset(adt, "/chosen");
     int isp = adt_path_offset(adt, "/arm-io/isp0");
     u64 ram, ram_size;
     u32 len, platform, scheme = 0;
+    *why = "ADT isp0, sensor type or firmware segments";
     if (chosen < 0 || isp < 0)
         return -1;
     const struct adt_segment_ranges *seg = adt_getprop(adt, isp, "segment-ranges", &len);
@@ -9428,6 +9445,7 @@ static int dt_set_t6050_isp(void)
         return -1;
     ADT_GETPROP(adt, isp, "cam-connections-scheme", &scheme);
 
+    *why = "device tree update";
     uint32_t owner = fdt_get_phandle(dt, node);
     if (!owner && (fdt_generate_phandle(dt, &owner) || fdt_setprop_u32(dt, node, "phandle", owner)))
         return -1;
@@ -9467,26 +9485,28 @@ static int dt_set_t6050_isp(void)
             return -1;
     }
     printf("FDT: T6050 ISP: text at 0x%lx size 0x%x; data at 0x%lx size 0x%x; main memory 32 MiB; "
-           "platform 0x%x\n",
-           seg[0].phys, seg[0].size, seg[1].phys, seg[1].size, platform);
+           "platform 0x%x scheme 0x%x\n",
+           seg[0].phys, seg[0].size, seg[1].phys, seg[1].size, platform, scheme);
     return 0;
 }
 
+/* All or nothing: a refused or half-done hand-off leaves the device tree as it was. */
 static int dt_t6050_isp_transaction(void)
 {
     void *original = dt;
     size_t capacity = fdt_totalsize(original);
     void *scratch = malloc(capacity);
+    const char *why;
     if (!scratch) {
         printf("FDT: no space for camera handoff; leaving it disabled\n");
         return 0;
     }
     memcpy(scratch, original, capacity);
     dt = scratch;
-    if (!dt_set_t6050_isp())
+    if (!dt_set_t6050_isp(&why))
         memcpy(original, scratch, capacity);
     else
-        printf("FDT: rejected T6050 ISP handoff; leaving it disabled\n");
+        printf("FDT: rejected T6050 ISP handoff (%s); leaving it disabled\n", why);
     dt = original;
     free(scratch);
     return 0;
