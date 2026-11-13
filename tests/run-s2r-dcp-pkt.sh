@@ -6,6 +6,8 @@
 #   sh tests/run-s2r-dcp-pkt.sh
 set -eu
 cd "$(dirname "$0")/.."
+# smp.h includes build/build_cfg.h, which a fresh clone does not have yet
+make build-cfg > /dev/null
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT HUP INT TERM
 {
@@ -15,5 +17,5 @@ trap 'rm -rf "$tmp"' EXIT HUP INT TERM
 } > "$tmp/dartwalk.c"
 grep -q 'dart_walk_locked_t8110' "$tmp/dartwalk.c" || { echo "FAIL: walk not found in src/dart.c"; exit 1; }
 ${CC:-cc} -std=gnu11 -D_GNU_SOURCE -O1 -g -Wall -Wno-unused-function -Isrc \
-    tests/s2r_dcp_pkt_host.c src/s2r_dcp_pkt.c "$tmp/dartwalk.c" -o "$tmp/test" 
+    tests/s2r_dcp_pkt_host.c src/s2r_dcp_pkt.c "$tmp/dartwalk.c" -o "$tmp/test"
 "$tmp/test"

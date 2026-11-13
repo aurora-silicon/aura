@@ -52,7 +52,11 @@ void debug_printf(const char *f, ...)
 #define DRAM    0x10000200000UL
 #define L1      (DRAM)
 #define L2      (DRAM + 0x4000)
-#define DATA    (DRAM + 0x10000)
+#define L1B     (DRAM + 0x8000)
+#define L2B     (DRAM + 0xc000)
+#define L1C     (DRAM + 0x10000)
+#define L2C     (DRAM + 0x14000)
+#define DATA    (DRAM + 0x20000)
 #define NPG     49
 #define DVA     0x1000004c000UL
 #define SID     23
@@ -136,6 +140,31 @@ static void i2a(u64 m0, u64 m1)
     s2r_dcp_watch(MBOX + 0x830, v, 4);
 }
 
+/* A stream whose tables map DVA pages first..first+n-1 to the shared memory pages of the same index. */
+static void map_stream(int sid, u64 l1, u64 l2, int first, int n)
+{
+    u64 low = DVA & ((1UL << 36) - 1);
+    memset((void *)l1, 0, 0x4000);
+    memset((void *)l2, 0, 0x4000);
+    ((u64 *)l1)[low >> 25] = (l2 >> 4) | 1;
+    for (int k = first; k < first + n; k++)
+        ((u64 *)l2)[((low >> 14) & 0x7ff) + k] = ((DATA + k * 0x4000UL) >> 4) | 1;
+    *(volatile u32 *)(DART + 0x1000 + 4 * sid) = 0x9;
+    *(volatile u32 *)(DART + 0x1400 + 4 * sid) = ((l1 >> 14) << 2) | 1;
+}
+
+static void unmap_stream(int sid)
+{
+    *(volatile u32 *)(DART + 0x1000 + 4 * sid) = 0;
+}
+
+static void ap_call(u64 dva, u64 ctl)
+{
+    a2i((dva << 16) | 0x40, 0x37);
+    nrec = 0;
+    a2i(((CALL_OFF & 0xffff) << 16) | ctl, 0x37);
+}
+
 static int count_kind(int kind)
 {
     int n = 0;
@@ -186,7 +215,52 @@ int main(void)
           r ? (unsigned long)r->pa : 0);
     CHECK(count_kind(7) == 1, "the shared memory was found again: %d resolve records", count_kind(7));
 
-    printf(failures ? "FAIL: %d checks\n" : "PASS: %d records, %d resolve\n", failures ? failures : nrec,
-           count_kind(7));
+    /* A DVA no stream maps: one attempt at the first call, one more at call 257, nothing else. */
+    nrec = 0;
+    a2i((0x10080000000UL << 16) | 0x40, 0x37);
+    for (int i = 1; i <= 1000; i++) {
+        a2i(((CALL_OFF & 0xffff) << 16) | 0x302, 0x37);
+        if (i == 256)
+            CHECK(count_kind(7) == 1, "after 256 failing calls: %d attempts, want 1", count_kind(7));
+        if (i == 257)
+            CHECK(count_kind(7) == 2, "at failing call 257: %d attempts, want 2", count_kind(7));
+    }
+    CHECK(count_kind(7) == 4, "1000 failing calls: %d attempts, want 4 (calls 1, 257, 513, 769)", count_kind(7));
+    CHECK(nrec == 4, "failing resolves wrote %d records, want only the 4 attempts", nrec);
+    r = find(7, 0);
+    CHECK(r && r->val >> 32 == 0, "a failed attempt must report 0 pages found");
+
+    /* The next init word re-arms at once: the good DVA resolves on the next call. */
+    ap_call(DVA, 0x302);
+    CHECK(count_kind(7) == 1 && find(7, SID) && count_kind(0) == 6,
+          "re-arm: %d resolve records, %d AP-call records", count_kind(7), count_kind(0));
+
+    /* Two streams map every page: the lower stream wins the tie. */
+    map_stream(24, L1, L2, 0, NPG);
+    map_stream(5, L1, L2, 0, NPG);
+    ap_call(DVA, 0x302);
+    CHECK(find(7, 5) != NULL, "tie between streams 5, 23 and 24: want stream 5");
+    unmap_stream(24);
+    unmap_stream(5);
+
+    /* A smaller stream before the chosen one: its pages must not leak into the chosen stream's. */
+    map_stream(5, L1B, L2B, 0, 3);       /* maps DVA pages 0 to 2 only */
+    map_stream(SID, L1C, L2C, 3, NPG - 3); /* maps pages 3 to 48: the larger stream */
+    ap_call(DVA, 0x2);                   /* AP call at DVA offset 0x100: page 0 */
+    r = find(7, SID);
+    CHECK(r && r->val >> 32 == NPG - 3, "partial streams: want stream %d with %d pages", SID, NPG - 3);
+    CHECK(count_kind(0) == 0, "page 0 is not in the chosen stream: %d records from it", count_kind(0));
+    unmap_stream(5);
+    map_stream(SID, L1, L2, 0, NPG);
+
+    /* A packet head with 32-bit sizes of 0xffffffff copies a bounded number of words. */
+    *(u64 *)pg_pa(CALL_OFF) = (0xffffffffUL << 32) | 0x54534554;
+    *(u64 *)pg_pa(CALL_OFF + 8) = 0xffffffffUL;
+    ap_call(DVA, 0x302);
+    CHECK(count_kind(0) <= 2 + 16, "huge input size: %d records", count_kind(0));
+    i2a(0x42, 0x37);
+    CHECK(count_kind(2) <= 2 + 8, "huge output size: %d records", count_kind(2));
+
+    printf(failures ? "FAIL: %d checks\n" : "PASS: DCP packet copier\n", failures);
     return failures != 0;
 }
