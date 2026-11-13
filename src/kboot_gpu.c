@@ -3994,12 +3994,12 @@ disable:
 }
 
 /*
- * T6050 G17S (M5 Pro, J714s) on the 27.0 firmware. iBoot loads both roles' __TEXT back to back,
- * their __DATA and __DATA_SHARED_RO in one run, and leaves the UAT ranges empty: each role
- * publishes its kernel root while it boots. Linux's driver takes the four UAT ranges, fw-text and
- * fw-data as no-map reservations, and admits only the build whose TEXT normalizes to this digest
- * (its fwid rule: the boot-filled ranges, the entropy records among them, zeroed; Linux also
- * checks the records' tags).
+ * T6050 G17S (M5 Pro: J714s on the 27.0 firmware, K116s on 27.2). iBoot loads both roles' __TEXT
+ * back to back, their __DATA and __DATA_SHARED_RO in one run, and leaves the UAT ranges empty:
+ * each role publishes its kernel root while it boots. Linux's driver takes the four UAT ranges,
+ * fw-text and fw-data as no-map reservations, and admits only a build whose TEXT normalizes to
+ * that build's digest (its fwid rule: the build's boot-filled ranges, the entropy records among
+ * them, zeroed; Linux also checks the records' tags).
  *
  * When the device tree describes the GPU (alias "gpu", apple,agx-g17s, disabled), check the ADT
  * and this build, then fill the reservations and enable the GPU power states, both mailboxes and
@@ -4014,8 +4014,11 @@ disable:
 
 static const struct {
     const char *props[11], *resv[6], *on[7];
-    u32 fill[8][2];
-    u8 sha[32];
+    struct {
+        u32 fill[8][2];
+        u8 sha[32];
+        char name[8];
+    } build[2];
 } t6050_gpu = {
     /* The UAT ranges (base, size), then the bounds of both roles' __DATA and SRO */
     {"gpu-region-base", "gpu-region-size", "gfx-shared-region-base", "gfx-shared-region-size",
@@ -4029,26 +4032,44 @@ static const struct {
      "/soc/power-management@2300e80000/power-controller@100",
      "/soc/power-management@2300e80000/power-controller@110", "/soc/mailbox@2302600000",
      "/soc/mailbox@2302e00000", "gpu"},
-    {{0x224, 4},
-     {0x23c, 8},
-     {0x49720, 0x740},
-     {0x49e60, 0x231},
-     {0x50224, 4},
-     {0x5023c, 8},
-     {0x9d1d8, 0x740},
-     {0x9d918, 0x231}},
-    /* 26A428 G17S, both roles: Linux's hw/t6050.rs CONFIG digest */
-    {0x85, 0xd0, 0xfd, 0x82, 0x80, 0xf7, 0x24, 0x65, 0x5c, 0xa9, 0xa9,
-     0x71, 0x7b, 0xc9, 0x1a, 0x8a, 0x5e, 0xf6, 0x09, 0x28, 0xd7, 0x72,
-     0x00, 0xf6, 0xd5, 0x3b, 0xd0, 0x99, 0xb9, 0x47, 0x39, 0xc6},
+    /* Each build's boot-filled ranges and digest, both roles: Linux's hw/t6050.rs CONFIG */
+    {/* 26A428 (27.0) G17S, J714s */
+     {{{0x224, 4},
+       {0x23c, 8},
+       {0x49720, 0x740},
+       {0x49e60, 0x231},
+       {0x50224, 4},
+       {0x5023c, 8},
+       {0x9d1d8, 0x740},
+       {0x9d918, 0x231}},
+      {0x85, 0xd0, 0xfd, 0x82, 0x80, 0xf7, 0x24, 0x65, 0x5c, 0xa9, 0xa9,
+       0x71, 0x7b, 0xc9, 0x1a, 0x8a, 0x5e, 0xf6, 0x09, 0x28, 0xd7, 0x72,
+       0x00, 0xf6, 0xd5, 0x3b, 0xd0, 0x99, 0xb9, 0x47, 0x39, 0xc6},
+      "26A428"},
+     /*
+      * 26B8125 (27.2) G17S, the K114/K116 restore image, which iBoot loads on the K116s: the
+      * same sizes and records as 26A428, its entropy records 0x44 and 0x14 bytes further in
+      */
+     {{{0x224, 4},
+       {0x23c, 8},
+       {0x49764, 0x740},
+       {0x49ea4, 0x231},
+       {0x50224, 4},
+       {0x5023c, 8},
+       {0x9d1ec, 0x740},
+       {0x9d92c, 0x231}},
+      {0xaf, 0x68, 0xd0, 0x34, 0xa3, 0xf0, 0x06, 0xb4, 0x3d, 0xab, 0x66,
+       0x1b, 0x82, 0x5f, 0x12, 0x59, 0x8c, 0xb8, 0x6e, 0x4d, 0x2a, 0x0e,
+       0x38, 0x44, 0xf1, 0x4f, 0xa5, 0x05, 0x9f, 0x38, 0xf6, 0xcb},
+      "26B8125"}},
 };
 extern void aura_sha256(const void *data, size_t size, u8 digest[32]);
 
 /*
  * r: the four UAT ranges, fw-text (from GFX's __TEXT, GFX1's after it) and fw-data (GFX's __DATA
  * to GFX1's SRO end), base and size, from the ADT. Returns -1 if the device tree does not describe
- * this GPU, 0 if the ADT does not have the ranges, 1 if fw-text is not this build (normalized as
- * Linux's fwid does), 2 if it is.
+ * this GPU, 0 if the ADT does not have the ranges, 1 if fw-text is none of the builds (normalized
+ * as Linux's fwid does), and 2 plus the build's index if it is one of them.
  */
 static T6050_GPU_TEXT_FN int t6050_gpu_check(void *dt, u64 r[12])
 {
@@ -4074,12 +4095,17 @@ static T6050_GPU_TEXT_FN int t6050_gpu_check(void *dt, u64 r[12])
     u8 *copy = malloc(T6050_GPU_TEXT), digest[32];
     if (!copy)
         return 1;
-    memcpy(copy, (const void *)seg[0], T6050_GPU_TEXT);
-    for (int i = 0; i < 8; i++)
-        memset(copy + t6050_gpu.fill[i][0], 0, t6050_gpu.fill[i][1]);
-    aura_sha256(copy, T6050_GPU_TEXT, digest);
+    int ret = 1;
+    for (size_t b = 0; ret == 1 && b < ARRAY_SIZE(t6050_gpu.build); b++) {
+        memcpy(copy, (const void *)seg[0], T6050_GPU_TEXT);
+        for (int i = 0; i < 8; i++)
+            memset(copy + t6050_gpu.build[b].fill[i][0], 0, t6050_gpu.build[b].fill[i][1]);
+        aura_sha256(copy, T6050_GPU_TEXT, digest);
+        if (!memcmp(digest, t6050_gpu.build[b].sha, sizeof(digest)))
+            ret = 2 + b;
+    }
     free(copy);
-    return memcmp(digest, t6050_gpu.sha, sizeof(digest)) ? 1 : 2;
+    return ret;
 }
 
 /* Enables every node of t6050_gpu.on, in order, if they all exist */
@@ -4138,16 +4164,17 @@ static T6050_GPU_INIT int dt_set_gpu_t6050(void *dt)
     int step = t6050_gpu_check(dt, r);
     if (step < 0)
         return 0;
-    bool ok = step == 2;
+    bool ok = step >= 2;
     for (int i = 0; ok && i < 6; i++)
         ok = !dt_set_resvmem(dt, t6050_gpu.resv[i], r[2 * i], r[2 * i + 1]);
     if (!ok || !t6050_gpu_enable(dt)) {
         printf("FDT: GPU: T6050 G17S handoff refused at check %d (0 ADT, 1 firmware build, 2 DT); "
                "GPU left disabled\n",
-               step);
+               min(step, 2));
         return 0;
     }
-    printf("FDT: GPU: T6050 G17S enabled, fw-text at %#lx\n", r[8]);
+    printf("FDT: GPU: T6050 G17S %s enabled, fw-text at %#lx\n", t6050_gpu.build[step - 2].name,
+           r[8]);
     if (t6050_gpu_leakage(dt))
         printf("FDT: GPU: no leakage calibration words; the driver's generic configuration\n");
     return 0;
