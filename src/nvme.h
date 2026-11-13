@@ -12,6 +12,7 @@ extern bool nvme_keep_running_for_linux;
 bool nvme_shutdown(void);
 /* Post-M4: how a stage that powered ANS off tells the next one to start it again. */
 bool nvme_post_m4(void);
+bool nvme_post_m4_passed_off(void);
 int nvme_sart_entries(struct sart_entry *entries, int max, bool *off);
 char *nvme_sart_var(void);
 bool nvme_set_sart_var(const char *val);
