@@ -9366,10 +9366,10 @@ t6050_isp_segments_valid(const struct adt_segment_ranges *seg, u32 len, u64 ram,
 }
 
 /*
- * T6050 firmware lives below Linux RAM. Publish its current ADT ranges, not
+ * T6050 firmware lives below Linux RAM. Publish current ADT ranges, not
  * snapshot physical addresses. The kernel allocates the small main-memory
- * tail and owns all power, DART and firmware-start operations. J716c's camera
- * is sensor type 0x75, J714s's 0x74; both have the same two segments.
+ * tail and owns all power, DART and firmware-start operations. J716c (0x75),
+ * J714s (0x74) and K114c (0xb9) use the same two segment names.
  */
 __attribute__((section(".init.t6050_isp"))) static int t6050_isp_add_mem_region(uint32_t phandle,
                                                                                 const char *name)
@@ -9390,13 +9390,17 @@ static int dt_set_t6050_isp(void)
     if (node < 0)
         return 0;
     u32 want;
+    enum fw_version fw = V27_0;
     if (!fdt_node_check_compatible(dt, 0, "apple,j716c"))
         want = 0x75;
     else if (!fdt_node_check_compatible(dt, 0, "apple,j714s"))
         want = 0x74;
-    else
+    else if (!fdt_node_check_compatible(dt, 0, "apple,k114c")) {
+        want = 0xb9;
+        fw = V27_3B;
+    } else
         return -1;
-    if (os_firmware.version != V27_0)
+    if (os_firmware.version != fw)
         return -1;
 
     int chosen = adt_path_offset(adt, "/chosen");
@@ -9453,7 +9457,9 @@ static int dt_set_t6050_isp(void)
         if (node < 0 || fdt_setprop_string(dt, node, "status", "okay"))
             return -1;
     }
-    printf("FDT: T6050 ISP: reserved text/data, main memory 32 MiB; platform 0x%x\n", platform);
+    printf("FDT: T6050 ISP: text at 0x%lx size 0x%x; data at 0x%lx size 0x%x; main memory 32 MiB; "
+           "platform 0x%x\n",
+           seg[0].phys, seg[0].size, seg[1].phys, seg[1].size, platform);
     return 0;
 }
 
