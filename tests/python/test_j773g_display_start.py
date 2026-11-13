@@ -49,3 +49,12 @@ def test_j773g_rtkit_session_restores_dva_bit_and_echoes_oslog():
     oslog = rtkit[rtkit.index("case RTKIT_EP_OSLOG:"):]
     assert "rtkit_send(rtk, msg)" in oslog
     assert "firmware's own; not answered" in oslog
+
+
+def test_j773g_services_dcp_while_waiting_for_hpd():
+    source = (ROOT / "src/display.c").read_text()
+    configure = function(source, "int display_configure(")
+    assert "bool j773g = kboot_is_j773g_machine();" in configure
+    assert "int status_retries = j773g ? 150" in configure
+    assert "timeout_calculate(DISPLAY_STATUS_DELAY * 1000)" in configure
+    assert "while (!timeout_expired(timeout))\n                    dcp_work(dcp);" in configure

@@ -87,8 +87,7 @@ static int dcp_hdmi_dptx_init(dcp_dev_t *dcp, const display_config_t *cfg)
         adt_getprop(adt, node, "function-dp2hdmi_pwr_en", &pw8_size);
 
     if (cfg->no_reset) {
-        int r1 = adt_getprop_copy(adt, node, "function-hdmi_pwr_en", &hdmi_pwr,
-                                  sizeof(hdmi_pwr));
+        int r1 = adt_getprop_copy(adt, node, "function-hdmi_pwr_en", &hdmi_pwr, sizeof(hdmi_pwr));
         int r2 = adt_getprop_copy(adt, node, "function-dp2hdmi_pwr_en", &dp2hdmi_pwr,
                                   sizeof(dp2hdmi_pwr));
         smc_dev_t *smc = r1 || r2 ? NULL : smc_init();

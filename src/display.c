@@ -595,9 +595,11 @@ int display_configure(const char *config)
     int hpd = 0, retries = 0;
 
     /* After boot DCP does not immediately report a connected display. Retry getting display
-     * information for 2 seconds.
+     * information for the board-specific settling window.
      */
-    while (retries++ < (DISPLAY_STATUS_RETRIES(display_is_dptx))) {
+    bool j773g = kboot_is_j773g_machine();
+    int status_retries = j773g ? 150 : DISPLAY_STATUS_RETRIES(display_is_dptx);
+    while (retries++ < status_retries) {
         dcp_work(dcp);
         hpd = dcp_ib_get_hpd(iboot, &timing_cnt, &color_cnt);
         /* Only the latest status query decides; the power requests above are
@@ -605,8 +607,15 @@ int display_configure(const char *config)
         ret = hpd < 0 ? hpd : 0;
         if (hpd > 0 && timing_cnt && color_cnt)
             break;
-        if (retries < DISPLAY_STATUS_RETRIES(display_is_dptx))
-            mdelay(DISPLAY_STATUS_DELAY);
+        if (retries < status_retries) {
+            if (j773g) {
+                u64 timeout = timeout_calculate(DISPLAY_STATUS_DELAY * 1000);
+                while (!timeout_expired(timeout))
+                    dcp_work(dcp);
+            } else {
+                mdelay(DISPLAY_STATUS_DELAY);
+            }
+        }
     }
     printf("display: waited %d ms for display status\n", (retries - 1) * DISPLAY_STATUS_DELAY);
     if (ret < 0) {
@@ -1074,8 +1083,7 @@ int display_shutdown(dcp_shutdown_mode mode)
 {
     /* Linux owns the live J700/J713/J873 controllers. Keep the inherited ASC session
      * and scanout intact at both the Stage 1 and Linux boundaries. */
-    if (chip_id == T8140 || (chip_id == T8132 && !kboot_is_j773g_machine()) ||
-        chip_id == T8152)
+    if (chip_id == T8140 || (chip_id == T8132 && !kboot_is_j773g_machine()) || chip_id == T8152)
         return 0;
 
     /* We have no DCP, so just exit */

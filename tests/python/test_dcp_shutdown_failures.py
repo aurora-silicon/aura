@@ -125,6 +125,7 @@ typedef uint32_t u32;
 typedef struct {
     void *asc, *system_ep, *dptx_ep, *dpav_ep, *phy, *afk, *rtkit;
     void *dart_disp, *iovad_dcp, *dart_dcp;
+    bool no_reset;
 } dcp_dev_t;
 static char dcp_pmgr_dev[16] = "DISP0_CPU0";
 static u32 dcp_die;
@@ -248,6 +249,7 @@ struct dcp_dev {
     dcp_system_if_t *system_ep;
     dcp_dptx_if_t *dptx_ep;
     dcp_dpav_if_t *dpav_ep;
+    bool no_reset;
 };
 static const afk_epic_service_ops_t dcp_system_ops[1], dcp_dptx_ops[1], dcp_dpav_ops[1],
     iboot_service_ops[1];

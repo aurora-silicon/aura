@@ -45,6 +45,7 @@ struct t8122_pll_cfg {
     bool half;
 };
 
+/* Ported from Pavel Shago's public m1n1 T8122 PHY implementation (453f0161). */
 static const struct t8122_pll_cfg t8122_pll_cfgs[] = {
     {0x06, 0x21c, 0x0000000, 0x156600, true, false},
     {0x0a, 0x1c2, 0x7fffffe, 0x155200, true, true},
@@ -989,8 +990,7 @@ int dptx_phy_set_route(dptx_phy_t *phy, bool enable)
  * (macOS trains the PS190 at HBR3); everything else is qualified at HBR. */
 u32 dptx_phy_max_link_rate(dptx_phy_t *phy)
 {
-    return phy && (phy->type == DPTX_PHY_T8122 || phy->type == DPTX_PHY_T8152_HDMI) ? 8100
-                                                                                     : 2700;
+    return phy && (phy->type == DPTX_PHY_T8122 || phy->type == DPTX_PHY_T8152_HDMI) ? 8100 : 2700;
 }
 
 u32 dptx_phy_dcp_output(dptx_phy_t *phy)
