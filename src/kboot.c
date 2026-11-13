@@ -9399,7 +9399,7 @@ static int dt_set_t6050_isp(void)
     if (node < 0)
         return 0;
     u32 want;
-    enum fw_version fw = V27_0;
+    enum fw_version fw = V27_0, fw_alt = V27_0;
     if (!fdt_node_check_compatible(dt, 0, "apple,j716c"))
         want = 0x75;
     else if (!fdt_node_check_compatible(dt, 0, "apple,j714s"))
@@ -9407,9 +9407,10 @@ static int dt_set_t6050_isp(void)
     else if (!fdt_node_check_compatible(dt, 0, "apple,k114c")) {
         want = 0xb9;
         fw = V27_3B;
+        fw_alt = V27_2; /* the segment checks below still decide */
     } else
         return -1;
-    if (os_firmware.version != fw)
+    if (os_firmware.version != fw && os_firmware.version != fw_alt)
         return -1;
 
     int chosen = adt_path_offset(adt, "/chosen");
