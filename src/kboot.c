@@ -3264,21 +3264,10 @@ static int dt_copy_usb4_drom(const char *adt_path, const char *dt_alias, u64 rou
     return fdt_setprop(dt, fdt_node, "apple,thunderbolt-drom", drom, drom_len);
 }
 
-static int dt_copy_acio_tunables(const char *adt_path, const char *dt_alias,
-                                 const struct adt_tunable_info *tunables, size_t n_tunables)
+static int dt_copy_acio_tunables_to(int adt_node, int fdt_node,
+                                    const struct adt_tunable_info *tunables, size_t n_tunables)
 {
     int ret;
-    int adt_node = adt_path_offset(adt, adt_path);
-    if (adt_node < 0)
-        return -1;
-
-    const char *fdt_path = fdt_get_alias(dt, dt_alias);
-    if (fdt_path == NULL)
-        bail("FDT: Unable to find alias %s\n", dt_alias);
-
-    int fdt_node = fdt_path_offset(dt, fdt_path);
-    if (fdt_node < 0)
-        bail("FDT: Unable to find path %s for alias %s\n", fdt_path, dt_alias);
 
     for (size_t i = 0; i < n_tunables; ++i) {
         ret = dt_append_acio_tunable(adt_node, fdt_node, &tunables[i]);
@@ -3293,6 +3282,100 @@ err:
         fdt_delprop(dt, fdt_node, tunables[i].fdt_name);
 
     return -1;
+}
+
+static int dt_copy_acio_tunables(const char *adt_path, const char *dt_alias,
+                                 const struct adt_tunable_info *tunables, size_t n_tunables)
+{
+    int adt_node = adt_path_offset(adt, adt_path);
+    if (adt_node < 0)
+        return -1;
+
+    const char *fdt_path = fdt_get_alias(dt, dt_alias);
+    if (fdt_path == NULL)
+        bail("FDT: Unable to find alias %s\n", dt_alias);
+
+    int fdt_node = fdt_path_offset(dt, fdt_path);
+    if (fdt_node < 0)
+        bail("FDT: Unable to find path %s for alias %s\n", fdt_path, dt_alias);
+
+    return dt_copy_acio_tunables_to(adt_node, fdt_node, tunables, n_tunables);
+}
+
+/*
+ * The node an alias names, each path component matched exactly: libfdt's
+ * fdt_path_offset() also matches "soc" against "soc@200000000" and takes
+ * the first, and the T6050 trees have both a "soc@200000000" and a "soc".
+ */
+static int dt_alias_node_exact(const char *alias)
+{
+    const char *path = fdt_get_alias(dt, alias);
+    int node = 0;
+
+    if (!path || path[0] != '/')
+        return -FDT_ERR_NOTFOUND;
+    while (*path) {
+        const char *end;
+        size_t len;
+        int child, found = -FDT_ERR_NOTFOUND;
+
+        while (*path == '/')
+            path++;
+        if (!*path)
+            break;
+        end = strchr(path, '/');
+        len = end ? (size_t)(end - path) : strlen(path);
+        fdt_for_each_subnode(child, dt, node)
+        {
+            int name_len;
+            const char *name = fdt_get_name(dt, child, &name_len);
+
+            if (name && (size_t)name_len == len && !memcmp(name, path, len)) {
+                found = child;
+                break;
+            }
+        }
+        if (found < 0)
+            return found;
+        node = found;
+        path += len;
+    }
+    return node;
+}
+
+/*
+ * The LLT escalation detectors of the display engines' own ADMACs (T6050
+ * /arm-io/admac-<engine>-ced-ssw, the ADMAC that feeds the engine's
+ * DisplayPort audio): their ADT tunables, for each one the DT names by its
+ * admac-<engine>-control alias. apple-admac applies them before each stream
+ * and leaves the block as it is without them.
+ */
+static const struct adt_tunable_info admac_control_tunables[] = {
+    {"ced-tunables", "apple,tunable-ced", 0x0, 0x4000, true},
+    {"ssw-tunables", "apple,tunable-ssw", 0x0, 0x4000, true},
+};
+
+static void dt_set_admac_control_tunables(void)
+{
+    static const char *const engines[] = {"disp0", "dispext0", "dispext1", "dispext2", "dispext3"};
+    char adt_path[48];
+    char fdt_alias[40];
+
+    for (size_t i = 0; i < ARRAY_SIZE(engines); i++) {
+        snprintf(fdt_alias, sizeof(fdt_alias), "admac-%s-control", engines[i]);
+        if (!fdt_get_alias(dt, fdt_alias))
+            continue;
+        snprintf(adt_path, sizeof(adt_path), "/arm-io/admac-%s-ced-ssw", engines[i]);
+        int adt_node = adt_path_offset(adt, adt_path);
+        int fdt_node = dt_alias_node_exact(fdt_alias);
+        if (adt_node < 0 || fdt_node < 0 ||
+            dt_copy_acio_tunables_to(adt_node, fdt_node, admac_control_tunables,
+                                     ARRAY_SIZE(admac_control_tunables)))
+            printf("kboot: no ADT tunables for %s (%s: %d, DT: %d)\n", fdt_alias, adt_path,
+                   adt_node, fdt_node);
+        else
+            printf("kboot: %s: ADT tunables copied\n", fdt_alias);
+    }
 }
 
 /* The router generation is in the ADT: "acio" for v1, "acio,v2" for v2. */
@@ -11279,6 +11362,7 @@ int kboot_prepare_dt(void *fdt)
         return -1;
     if (dt_set_acio_tunables())
         return -1;
+    dt_set_admac_control_tunables();
     if (dt_set_pcie_tunables())
         return -1;
     if (dt_set_ave())
