@@ -58,9 +58,10 @@ u32 chip_id;
 volatile enum exc_guard_t exc_guard;
 volatile int exc_count;
 struct fw_version_info os_firmware = {V14_7, "14.7", {14, 7, 0}, 3, "iBoot-10151.140.19.700.2"};
-const struct fw_version_info fw_versions[V26_6_2 + 1] = {
+const struct fw_version_info fw_versions[V27_2 + 1] = {
     [V14_7] = {V14_7, "14.7", {14, 7, 0}, 3, "iBoot"},
     [V26_6_2] = {V26_6_2, "26.6.2", {26, 6, 2}, 3, "mBoot-18000.161.10"},
+    [V27_2] = {V27_2, "27.2", {27, 2, 0}, 3, "mBoot-20457.41.3"},
 };
 
 /* As src/firmware.c: an iBoot of the 18000.161.10 train loads the 26.6.2 images. */
@@ -417,7 +418,11 @@ static u32 ttbr_of(u64 l1)
 
 #define TB         0x10000000000ULL
 static bool fw25;
-#define J613_UUID (fw25 ? "C042E95C-B9D8-3F0E-94B3-582A08AA6FDD" : "90F849E1-B422-367E-B389-50246F8DEC47")
+static bool fw27; /* FW272: the generalised T8122 profile admitting the 27.2 image */
+#define J613_UUID                                                                                  \
+    (fw25   ? "C042E95C-B9D8-3F0E-94B3-582A08AA6FDD"                                                \
+     : fw27 ? "93FA4B31-BB97-3B2A-8673-49EA489EE9C1"                                                \
+            : "90F849E1-B422-367E-B389-50246F8DEC47")
 #define HANDOFF (fw25 ? "apple,j613-25g83-mapping-handoff" : "apple,t8122-handoff")
 #define DART_DCP   0x28d30c000ULL
 #define DART_DISP0 0x28d304000ULL
@@ -847,9 +852,12 @@ static int contract_check(const void *dt)
     check(uuid && !strcmp(uuid, J613_UUID), "drm: dcp apple,firmware-uuid is %s", J613_UUID);
     int len;
     const fdt32_t *compat = fdt_getprop(dt, dcp, "apple,firmware-compat", &len);
-    check(compat && len == 12 && fdt32_ld(compat) == (fw25 ? 26 : 14) && fdt32_ld(compat + 1) == (fw25 ? 6 : 7) &&
-              fdt32_ld(compat + 2) == (fw25 ? 2 : 0),
-          "drm: dcp apple,firmware-compat is 14.7.0");
+    u32 ev0 = fw25 ? 26 : fw27 ? 27 : 14;
+    u32 ev1 = fw25 ? 6 : fw27 ? 2 : 7;
+    u32 ev2 = fw25 ? 2 : 0;
+    check(compat && len == 12 && fdt32_ld(compat) == ev0 && fdt32_ld(compat + 1) == ev1 &&
+              fdt32_ld(compat + 2) == ev2,
+          "drm: dcp apple,firmware-compat is %u.%u.%u", ev0, ev1, ev2);
 
     int oslog = segment_region(dt, dcp, SEG_OSLOG);
     u64 dummy;
@@ -998,12 +1006,14 @@ int main(int argc, char **argv)
     bool t6030 = !strncmp(sc, "t6030-", 6);
     if (t6030)
         sc += 6;
-    fw25 = !t6030 && getenv("J613_25G83") != NULL;
+    fw27 = !t6030 && !strcmp(sc, "publish-27_2");
+    fw25 = !t6030 && !fw27 && getenv("J613_25G83") != NULL;
     struct opts o = {0};
     bool publish = true;
     if (!strcmp(sc, "unarmed")) {
         publish = false;
-    } else if (!strcmp(sc, "publish") || !strcmp(sc, "contract-selftest")) {
+    } else if (!strcmp(sc, "publish") || !strcmp(sc, "contract-selftest") ||
+               !strcmp(sc, "publish-27_2")) {
         o.armed = true;
     } else if (!strcmp(sc, "repeat")) {
         o.armed = o.twice = true;
@@ -1056,6 +1066,15 @@ int main(int argc, char **argv)
             os_firmware.version = V14_7;
         if (!strcmp(sc, "missing-profile"))
             fdt_delprop(dt, fdt_path_offset(dt, "dcp"), "apple,j613-25g83-profile");
+    }
+    if (fw27) {
+        /* FW272: a 27.2 boot of the generalised T8122 profile. iBoot leaves the 27.2 image
+         * running (J613_UUID above) and dt_set_dcp_firmware() has published <27 2 0>. */
+        os_firmware =
+            (struct fw_version_info){V27_2, "27.2", {27, 2, 0}, 3, "mBoot-20457.41.3"};
+        fdt32_t compat[] = {cpu_to_fdt32(27), cpu_to_fdt32(2), cpu_to_fdt32(0)};
+        fdt_setprop(dt, fdt_path_offset(dt, "dcp"), "apple,firmware-compat", compat,
+                    sizeof(compat));
     }
     if (o.armed)
         fdt_setprop_string(dt, fdt_path_offset(dt, "/chosen"),

@@ -225,6 +225,18 @@ static const struct dcp6_seg_def dcp6_seg_defs_t6030[DCP6_SEGS] = {
 /* Owners of the nubs whose __OS_LOG is reserved: /arm-io/<owner>/iop-<owner>-nub */
 static const char *const dcp6_nubs_t6030[] = {"dcp", "dcpext0", "dcpext1"};
 
+/*
+ * One OS firmware the handoff accepts for a SoC. A profile that serves more than one macOS firmware
+ * (e.g. the legacy 14.7 image and the 27.2 image for FW272) lists one of these per accepted build.
+ * Each build pins its own DCP image UUID: iBoot leaves a different image running per OS, so matching
+ * is exact per build. A NULL uuid means the running ADT image is published instead (any_uuid).
+ */
+struct dcp6_fw {
+    u32 os_fw; /* enum fw_version the kernel's DCP interface is written for */
+    const char *os_fw_name;
+    const char *uuid; /* DCP firmware image pinned for this build, or NULL with any_uuid */
+};
+
 /* One SoC's internal display handoff */
 struct dcp_soc {
     const char *name;          /* log prefix */
@@ -254,6 +266,10 @@ struct dcp_soc {
     const char *uuid; /* DCP firmware image; NULL: none pinned, dry run only (unless any_uuid) */
     u32 os_fw;        /* enum fw_version the kernel's DCP interface is written for */
     const char *os_fw_name;
+    /* Multi-build profiles list their accepted firmware here instead of the three scalars above;
+     * when set, fws[] is the accepted set and the matching record's uuid/os_fw_name are used. */
+    const struct dcp6_fw *fws;
+    int nfws;
     /* Nonzero: the ADT must say the same. Zero: taken from the ADT. */
     u64 coproc, dart_dcp, dart_disp;
     u64 vm_base, vm_size; /* both DARTs' DVA window (vm-base, vm-size, apple,dma-range) */
@@ -265,6 +281,12 @@ struct dcp_soc {
 };
 
 static const char *const dcp_boards_t6030[] = {"apple,j516s", "apple,j514s", NULL};
+
+/* T6030 (M3 Pro J514s/J516s) DCP images by OS: the 14.7 native image and the 27.2 (FW272) image. */
+static const struct dcp6_fw dcp6_fws_t6030[] = {
+    {V14_7, "14.7", DCP6_UUID},
+    {V27_2, "27.2", "94D7C96F-63F6-3D8A-B208-B3D8E2D3621E"},
+};
 
 static const struct dcp_soc dcp_soc_t6030 = {
     .name = "T6030",
@@ -278,9 +300,8 @@ static const struct dcp_soc dcp_soc_t6030 = {
     .optin = "asahi,t6030-dcp",
     .always = true,
     .ext = true,
-    .uuid = DCP6_UUID,
-    .os_fw = V14_7,
-    .os_fw_name = "14.7",
+    .fws = dcp6_fws_t6030,
+    .nfws = ARRAY_SIZE(dcp6_fws_t6030),
     .coproc = 0x28ec00000UL,
     .dart_dcp = 0x28d30c000UL,
     .dart_disp = 0x28d304000UL,
@@ -302,6 +323,16 @@ static const struct dcp_soc dcp_soc_t6030 = {
  */
 static const char *const dcp_boards_t8122[] = {"apple,j613", "apple,j615", NULL};
 
+/*
+ * T8122 (M3 MacBook Air J613/J615) DCP images by OS. The 14.7 native image stays pinned; 27.2
+ * (FW272) generalises J613/J615 off the 25G83-only special profile below and onto this profile with
+ * the 27.2 image UUID. The exact-UUID and segment validation are kept for both builds.
+ */
+static const struct dcp6_fw dcp6_fws_t8122[] = {
+    {V14_7, "14.7", DCP8_UUID},
+    {V27_2, "27.2", "93FA4B31-BB97-3B2A-8673-49EA489EE9C1"},
+};
+
 static const struct dcp_soc dcp_soc_t8122 = {
     .name = "T8122",
     .chip = T8122,
@@ -320,9 +351,8 @@ static const struct dcp_soc dcp_soc_t8122 = {
     .oslog_always = true,
     .describe = true,
     .adt_psreg = true,
-    .uuid = DCP8_UUID,
-    .os_fw = V14_7,
-    .os_fw_name = "14.7",
+    .fws = dcp6_fws_t8122,
+    .nfws = ARRAY_SIZE(dcp6_fws_t8122),
     .pmgr_disp_cpu = 0x2d0710000UL,
 };
 
@@ -366,6 +396,16 @@ static bool dcp25_selected(void *dt)
  */
 static const char *const dcp_boards_t6031[] = {"apple,j514c", "apple,j516c", NULL};
 
+/*
+ * T6031 (M3 Max J514C/J516C) DCP images by OS. The 14.7 arm keeps the long-standing unpinned
+ * behaviour (any_uuid: the running ADT image is published); 27.2 (FW272, T603x high-core) pins the
+ * exact 27.2 image UUID, the same exact-UUID whitelist the other refmac SoCs use.
+ */
+static const struct dcp6_fw dcp6_fws_t6031[] = {
+    {V14_7, "14.7", NULL},
+    {V27_2, "27.2", "0C885956-0484-36CA-97D6-0255FA2D4F9E"},
+};
+
 static const struct dcp_soc dcp_soc_t6031 = {
     .name = "T6031",
     .chip = T6031,
@@ -381,8 +421,8 @@ static const struct dcp_soc dcp_soc_t6031 = {
     .board_gate = true,
     .any_uuid = true,
     .log_streams = true,
-    .os_fw = V14_7,
-    .os_fw_name = "14.7",
+    .fws = dcp6_fws_t6031,
+    .nfws = ARRAY_SIZE(dcp6_fws_t6031),
     .coproc = 0x386c00000UL,
     .dart_dcp = 0x38530c000UL,
     .dart_disp = 0x385304000UL,
@@ -400,6 +440,16 @@ static const struct dcp_soc dcp_soc_t6031 = {
  * describes this display block (dcp6_dt_describes()), and the display nodes stay disabled.
  */
 static const char *const dcp_boards_t6041[] = {"apple,j616s", "apple,j614s", NULL};
+
+/*
+ * T6041 (M4 Pro/Max) accepts the 26.6.2 desktop image and the 27.2 (FW272) image. Both arms stay
+ * unpinned (any_uuid): the kernel's board record decides the image, and aura publishes the running
+ * ADT uuid. Every other topology, DART, segment and mailbox check is unchanged between builds.
+ */
+static const struct dcp6_fw dcp6_fws_t6041[] = {
+    {V26_6_2, "26.6.2", NULL},
+    {V27_2, "27.2", NULL},
+};
 
 static const struct dcp_soc dcp_soc_t6041 = {
     .name = "T6041",
@@ -420,8 +470,8 @@ static const struct dcp_soc dcp_soc_t6041 = {
     .sid_disp = 0,
     .sid_piodma = 16,
     .streams = 32,
-    .os_fw = V26_6_2,
-    .os_fw_name = "26.6.2",
+    .fws = dcp6_fws_t6041,
+    .nfws = ARRAY_SIZE(dcp6_fws_t6041),
     .coproc = 0x402e00000UL,
     .dart_dcp = 0x402340000UL,
     .dart_disp = 0x402300000UL,
@@ -457,8 +507,8 @@ static const struct dcp_soc dcp_soc_t6041_max = {
     .sid_disp = 0,
     .sid_piodma = 16,
     .streams = 32,
-    .os_fw = V26_6_2,
-    .os_fw_name = "26.6.2",
+    .fws = dcp6_fws_t6041,
+    .nfws = ARRAY_SIZE(dcp6_fws_t6041),
     .coproc = 0x402e00000UL,
     .dart_dcp = 0x402340000UL,
     .dart_disp = 0x402300000UL,
@@ -513,6 +563,7 @@ enum { VM_DCP, VM_DISP }; /* dart-dcp, dart-disp0 */
 /* Per-kboot state, used by the armed part. Reset on every call. */
 static struct {
     const struct dcp_soc *soc;
+    struct dcp6_fw fw;               /* the accepted OS firmware record resolved for this boot */
     u64 coproc, dart_dcp, dart_disp; /* as checked against the ADT */
     u64 vm_base[2], vm_size[2];      /* DVA windows of dart-dcp and dart-disp0 */
     bool vm_ok;
@@ -532,6 +583,18 @@ static struct {
     struct dcp6_sid sid[3]; /* dcp SID 5, display SID 0, piodma SID 4 */
     char uuid[40];          /* the DCP image the handoff publishes, once checked */
 } dcp6;
+
+/* True if the profile pins at least one DCP image (any build); false means any_uuid/dry-run only. */
+static bool dcp6_profile_pins_image(const struct dcp_soc *soc)
+{
+    if (soc->fws) {
+        for (int i = 0; i < soc->nfws; i++)
+            if (soc->fws[i].uuid)
+                return true;
+        return false;
+    }
+    return soc->uuid != NULL;
+}
 
 /* ---- small helpers ---- */
 
@@ -1601,7 +1664,7 @@ static void dcp6_check_hw(void)
         dlog("DCP not running, leaving dart-dcp unlocked\n");
         return;
     }
-    if (!soc->uuid && !soc->any_uuid) {
+    if (!dcp6_profile_pins_image(soc) && !soc->any_uuid) {
         dlog("dry run: no %s DCP firmware image is pinned, leaving dart-dcp unlocked\n", soc->name);
         return;
     }
@@ -2231,6 +2294,30 @@ static int dcp6_check_dt(void *dt, struct dcp6_dt *n)
     return 0;
 }
 
+/*
+ * Resolve the OS firmware the running build is admitted as. Multi-build profiles carry an fws[]
+ * set (one record per accepted macOS firmware); single-build profiles use the scalar fields. On a
+ * match *sel is filled with that build's version, name and pinned image UUID.
+ */
+static bool dcp6_accepts_fw(const struct dcp_soc *soc, struct dcp6_fw *sel)
+{
+    u32 cur = firmware_os_components();
+    if (soc->fws) {
+        for (int i = 0; i < soc->nfws; i++)
+            if (soc->fws[i].os_fw != V_UNKNOWN && soc->fws[i].os_fw == cur) {
+                *sel = soc->fws[i];
+                return true;
+            }
+        return false;
+    }
+    if (soc->os_fw == V_UNKNOWN || soc->os_fw != cur)
+        return false;
+    sel->os_fw = soc->os_fw;
+    sel->os_fw_name = soc->os_fw_name;
+    sel->uuid = soc->uuid;
+    return true;
+}
+
 /* The ADT and hardware side of the gates */
 static int dcp6_check_adt(void)
 {
@@ -2238,22 +2325,25 @@ static int dcp6_check_adt(void)
 
     if (chip_id != soc->chip)
         bail("chip 0x%x is not %s\n", chip_id, soc->name);
-    if (firmware_os_components() != soc->os_fw)
-        bail("OS firmware %s is not %s\n", os_firmware.string, soc->os_fw_name);
+    struct dcp6_fw fw;
+    if (!dcp6_accepts_fw(soc, &fw))
+        bail("OS firmware %s is not accepted by %s\n", os_firmware.string, soc->name);
+    dcp6.fw = fw;
 
     int nub = adt_path_offset(adt, DCP6_NUB);
     u32 len = 0, preloaded, running;
     const char *uuid = nub < 0 ? NULL : adt_getprop(adt, nub, "uuid", &len);
-    if (!soc->uuid && !soc->any_uuid)
+    if (!fw.uuid && !soc->any_uuid)
         bail("no %s DCP firmware image is pinned (the ADT names %.40s)\n", soc->name,
              uuid && len ? uuid : "none");
-    if (soc->any_uuid) {
+    if (fw.uuid) {
+        if (!uuid || len != strlen(fw.uuid) + 1 || memcmp(uuid, fw.uuid, len))
+            bail("dcp firmware is not image %s\n", fw.uuid);
+    } else {
         if (!dcp6_is_uuid(uuid, len))
             bail("the dcp firmware image has no well-formed ADT uuid\n");
         dlog_debug("dcp firmware image %s, not pinned here: the kernel's board record decides\n",
                    uuid);
-    } else if (!uuid || len != strlen(soc->uuid) + 1 || memcmp(uuid, soc->uuid, len)) {
-        bail("dcp firmware is not image %s\n", soc->uuid);
     }
     memcpy(dcp6.uuid, uuid, len);
     if (dcp6_adt_u32(nub, "pre-loaded", &preloaded) || preloaded != 1 ||
@@ -3754,8 +3844,8 @@ int dt_set_display_handoff(void *dt)
     }
 
     /* Reject unsupported firmware before reserving __OS_LOG or touching registers. */
-    if (!dcp6.soc->optin &&
-        (dcp6.soc->os_fw == V_UNKNOWN || firmware_os_components() != dcp6.soc->os_fw)) {
+    struct dcp6_fw gated_fw;
+    if (!dcp6.soc->optin && !dcp6_accepts_fw(dcp6.soc, &gated_fw)) {
         dlog("no qualified OS firmware for %s: nothing done\n", dcp6.soc->dcp_compat);
         return 0;
     }
