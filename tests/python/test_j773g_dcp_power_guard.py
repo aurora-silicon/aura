@@ -36,6 +36,7 @@ typedef uint64_t u64;
 
 static int chip_id = T8132;
 static bool j773g = true;
+static bool admitted_firmware = true;
 static void *adt = (void *)1;
 static const void *devices_prop;
 static u32 devices_len;
@@ -54,6 +55,7 @@ static bool adt_is_compatible(const void *a, int node, const char *compat)
 {
     return node == 0 && j773g && !strcmp(compat, "J773gAP");
 }
+static bool kboot_is_j773g_machine(void) { return j773g && admitted_firmware; }
 static const void *adt_getprop(const void *a, int node, const char *name, u32 *len)
 {
     if (!strcmp(name, "ps-regs")) {
@@ -110,9 +112,10 @@ static void device(int i, u16 id, u16 parent, const char *name)
     strncpy((char *)table[i].name, name, sizeof(table[i].name));
 }
 
-static void boot(bool mini)
+static void boot(bool mini, bool admitted)
 {
     j773g = mini;
+    admitted_firmware = admitted;
     device(0, 10, 0, "DISP_SYS");
     device(1, 11, 10, "DISP_CPU");
     devices_prop = table;
@@ -126,7 +129,7 @@ static void boot(bool mini)
 int main(void)
 {
     /* J773g: the cleanup reads DISP_CPU and enables its parent, as before, and never writes it. */
-    boot(true);
+    boot(true, true);
     assert(writes[0] == 1 && (regs[0] & 0xf) == 0xf);
     assert(writes[1] == 0 && regs[1] == 0x1000030f);
     assert(pmgr_power_on(0, "DISP_CPU") == -1);
@@ -139,7 +142,11 @@ int main(void)
     assert(pmgr_power_on(0, "DISP_SYS") == 0);
 
     /* J713, same SoC: DISP_CPU is not protected. */
-    boot(false);
+    boot(false, true);
+    assert(pmgr_power_on(0, "DISP_CPU") == 0 && writes[1] == 1);
+
+    /* A J773g on unqualified firmware uses the ordinary PMGR path too. */
+    boot(true, false);
     assert(pmgr_power_on(0, "DISP_CPU") == 0 && writes[1] == 1);
     puts("PASS J773g DISP_CPU guard");
     return 0;

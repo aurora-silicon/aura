@@ -49,8 +49,8 @@
 #define OSLOG_SIZE                GENMASK(55, 36)
 #define OSLOG_IOVA                GENMASK(35, 0)
 
-/* The notify type is only bits 59:56 (Pavel Shago, m1n1 cf2e8187 "rtkit: answer oslog notifies
- * so the 27.0 DCP quiesces"). */
+/* The notify type is only bits 59:56 (Pavel Shago, MIT-licensed m1n1 cf2e8187):
+ * https://github.com/shgpavel/m1n1/commit/cf2e8187 */
 #define OSLOG_NOTIFY_TYPE GENMASK(59, 56)
 #define OSLOG_TYPE_NOTIFY 2
 
@@ -242,7 +242,7 @@ void rtkit_set_dva_base(rtkit_dev_t *rtk, u64 dva_base)
  * Firmware that keeps its oslog channel open across AP sessions (the J773g DCP iBoot left
  * running) acks AP QUIESCED only after the AP has echoed each type 2 "data available" notify,
  * and must not be handed a second buffer for a channel it set up itself. Off by default.
- * Based on Pavel Shago's m1n1 cf2e8187.
+ * Based on Pavel Shago's MIT-licensed m1n1 cf2e8187 (URL above).
  */
 void rtkit_set_oslog_echo(rtkit_dev_t *rtk, bool echo)
 {

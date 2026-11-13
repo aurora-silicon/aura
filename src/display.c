@@ -283,6 +283,8 @@ int display_get_vram(u64 *paddr, u64 *size)
 /* True only when both DARTs dropped the range; otherwise keep its IOVA and memory. */
 static bool display_unmap_fb(uintptr_t iova, size_t size)
 {
+    if (dcp->no_reset)
+        iova &= (1ULL << 36) - 1;
     if (!dart_unmap_checked(dcp->dart_disp, iova, size))
         return false;
     return dart_unmap_checked(dcp->dart_dcp, iova, size);
@@ -330,10 +332,18 @@ static uintptr_t display_map_fb(uintptr_t iova, u64 paddr, u64 size)
         iova = iova_dcp;
     }
 
-    /* Locked legacy DARTs index their inherited tables with the low 36 bits,
-     * but the DCP requires the ADT window bits in every DVA it receives. */
-    if (dcp->no_reset)
-        iova |= dart_dva_base(dcp->dart_dcp);
+    /* Both locked display DARTs must expose the same window. Their table
+     * operations use the low 36-bit IOVA; only the DVA sent to DCP carries
+     * the window bits. */
+    u64 dva_base = 0;
+    if (dcp->no_reset) {
+        dva_base = dart_dva_base(dcp->dart_dcp);
+        if (dva_base != dart_dva_base(dcp->dart_disp)) {
+            printf("display: DCP and DISP DVA windows differ\n");
+            return DART_PTR_ERR;
+        }
+        iova &= (1ULL << 36) - 1;
+    }
 
     int ret = dart_map(dcp->dart_disp, iova, (void *)paddr, size);
     if (ret < 0) {
@@ -348,7 +358,7 @@ static uintptr_t display_map_fb(uintptr_t iova, u64 paddr, u64 size)
         return DART_PTR_ERR;
     }
 
-    return iova;
+    return iova | dva_base;
 }
 
 const display_config_t *display_get_config(void)
@@ -452,8 +462,16 @@ int display_start_dcp(void)
     // Find the framebuffer DVA
     fb_dva_allocated = false;
     fb_dva = dart_search(dcp->dart_disp, (void *)cur_boot_args.video.base);
-    if (dcp->no_reset && !DART_IS_ERR(fb_dva) && fb_dva)
-        fb_dva |= dart_dva_base(dcp->dart_dcp);
+    if (dcp->no_reset && !DART_IS_ERR(fb_dva) && fb_dva) {
+        u64 dcp_base = dart_dva_base(dcp->dart_dcp);
+        u64 disp_base = dart_dva_base(dcp->dart_disp);
+        if (dcp_base != disp_base) {
+            printf("display: DCP and DISP DVA windows differ\n");
+            fb_dva = DART_PTR_ERR;
+        } else {
+            fb_dva = (fb_dva & ((1ULL << 36) - 1)) | dcp_base;
+        }
+    }
     // framebuffer is not mapped on the M1 Ultra Mac Studio
     if (DART_IS_ERR(fb_dva) || !fb_dva)
         fb_dva = display_map_fb(0, pa, size);

@@ -2,6 +2,7 @@
 
 #include "pmgr.h"
 #include "adt.h"
+#include "kboot.h"
 #include "string.h"
 #include "types.h"
 #include "utils.h"
@@ -75,8 +76,8 @@ static bool pmgr_protected_addr(uintptr_t addr);
  */
 static bool pmgr_j773g_dcp_cpu(const struct pmgr_device *device)
 {
-    return chip_id == T8132 && !strncmp(device->name, "DISP_CPU", sizeof(device->name)) &&
-           adt_is_compatible(adt, 0, "J773gAP");
+    return kboot_is_j773g_machine() &&
+           !strncmp(device->name, "DISP_CPU", sizeof(device->name));
 }
 
 static bool pmgr_protected_device(const struct pmgr_device *device)

@@ -36,6 +36,7 @@ typedef uint64_t u64;
 #define ADT_GETPROP(a, n, p, v) (-1)
 
 static int chip_id = 0x8122;
+static bool kboot_is_j773g_machine(void) { return false; }
 static void *adt = (void *)1;
 static const void *devices_prop;
 static u32 devices_len;

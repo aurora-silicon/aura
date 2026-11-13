@@ -93,12 +93,6 @@ bool kboot_is_j773g_machine(void)
            os_firmware.version == V26_6_2;
 }
 
-bool kboot_is_j773g(const void *fdt)
-{
-    return fdt && kboot_is_j773g_machine() && !fdt_node_check_compatible(fdt, 0, "apple,j773g") &&
-           !fdt_node_check_compatible(fdt, 0, "apple,t8132");
-}
-
 u64 kboot_ram_base(void)
 {
     return cur_boot_args.phys_base;

@@ -35,11 +35,12 @@ typedef long s64;
 #define DART_IS_ERR(val) ((val) & DART_PTR_ERR)
 typedef struct dart_dev dart_dev_t;
 struct params { void (*tlb_invalidate)(dart_dev_t *); };
-struct dart_dev { bool failed, locked, legacy_mutable; int id; const struct params *params; };
+struct dart_dev { bool failed, locked, legacy_mutable; int id; u64 dva_base; const struct params *params; };
 static dart_dev_t disp, domain;
 static struct { dart_dev_t *dart_disp, *dart_dcp; bool no_reset; } device;
 static __typeof__(device) *dcp = &device;
 static unsigned page_ops[2], tlbis[2], maps[2];
+static u64 map_iova[2], unmap_iova[2];
 static int tlbi_failure, map_failure;
 static bool uncertain_map;
 static bool dart_locked_pt_writable(dart_dev_t *d) { (void)d; return false; }
@@ -51,11 +52,12 @@ static void invalidate(dart_dev_t *d)
 }
 static const struct params params = {.tlb_invalidate = invalidate};
 static bool dart_has_failed(dart_dev_t *d) { return !d || d->failed; }
-static void dart_unmap_page(dart_dev_t *d, unsigned long iova) { (void)iova; page_ops[d->id]++; }
+static void dart_unmap_page(dart_dev_t *d, unsigned long iova) { unmap_iova[d->id] = iova; page_ops[d->id]++; }
 static int dart_map(dart_dev_t *d, unsigned long iova, void *pa, size_t size)
 {
-    (void)iova; (void)pa; (void)size;
+    (void)pa; (void)size;
     assert(!d->failed);
+    map_iova[d->id] = iova;
     maps[d->id]++;
     if (map_failure == d->id + 1) {
         d->failed = uncertain_map;
@@ -65,16 +67,19 @@ static int dart_map(dart_dev_t *d, unsigned long iova, void *pa, size_t size)
 }
 static u64 dart_find_iova(dart_dev_t *d, s64 start, size_t size) { (void)d; (void)size; return start; }
 static u64 dart_vm_base(dart_dev_t *d) { (void)d; return 0; }
-static u64 dart_dva_base(dart_dev_t *d) { (void)d; return 0; }
+static u64 dart_dva_base(dart_dev_t *d) { return d->dva_base; }
 static void reset(void)
 {
     disp = (dart_dev_t){.id = 0, .params = &params};
     domain = (dart_dev_t){.id = 1, .params = &params};
     device.dart_disp = &disp;
     device.dart_dcp = &domain;
+    device.no_reset = false;
     memset(page_ops, 0, sizeof(page_ops));
     memset(tlbis, 0, sizeof(tlbis));
     memset(maps, 0, sizeof(maps));
+    memset(map_iova, 0, sizeof(map_iova));
+    memset(unmap_iova, 0, sizeof(unmap_iova));
     tlbi_failure = map_failure = 0;
     uncertain_map = false;
 }
@@ -89,6 +94,24 @@ int main(void)
     assert(display_map_fb(0x8000, 0x100000, SZ_16K) == 0x8000);
     assert(display_unmap_fb(0x8000, SZ_16K));
     assert(page_ops[0] == 1 && page_ops[1] == 1);
+
+    /* Locked DART table operations use low IOVAs, while DCP receives bit 40. */
+    reset();
+    device.no_reset = true;
+    disp.dva_base = domain.dva_base = 1UL << 40;
+    assert(display_map_fb(0x8000, 0x100000, SZ_16K) == ((1UL << 40) | 0x8000));
+    assert(map_iova[0] == 0x8000 && map_iova[1] == 0x8000);
+    assert(display_unmap_fb((1UL << 40) | 0x8000, SZ_16K));
+    assert(unmap_iova[0] == 0x8000 && unmap_iova[1] == 0x8000);
+
+    /* Cross-DART window disagreement fails before either table is touched. */
+    reset();
+    device.no_reset = true;
+    disp.dva_base = 2UL << 40;
+    domain.dva_base = 1UL << 40;
+    assert(DART_IS_ERR(display_map_fb(0x8000, 0x100000, SZ_16K)));
+    assert(!maps[0] && !maps[1]);
+    device.no_reset = false;
 
     /* The second DART refuses the map: the first one's mapping is withdrawn. */
     reset();
