@@ -100,15 +100,16 @@ int main(void)
 
 def test_dart_refuses_bad_streams_before_register_reads(tmp_path):
     source = (ROOT / "src/dart.c").read_text()
-    start = source.index("int dart_walk_locked_t8110(")
-    function = source[start:source.index("\n}", start) + 2]
-    names = set(re.findall(r"\bDART_[A-Z0-9_]+\b", function))
+    start = source.index("\nint dart_walk_locked_t8110(") + 1
+    walk = definition(source, "dart_walk_table") + "\n" + source[start:source.index("\n}", start) + 2]
+    names = set(re.findall(r"\bDART_[A-Z0-9_]+\b", walk))
     macros = "\n".join(re.search(r"^#define " + name + r"\s+[^\n]+", source, re.M)[0]
                        for name in sorted(names))
     run_c(tmp_path, "dart-bounds", r'''
 #include <assert.h>
 #include <stdint.h>
 #include <stddef.h>
+#include <sys/mman.h>
 typedef uint64_t u64;
 typedef uint32_t u32;
 typedef uint8_t u8;
@@ -116,23 +117,82 @@ typedef uint8_t u8;
 #define GENMASK(h, l) ((UINT64_MAX << (l)) & (UINT64_MAX >> (63 - (h))))
 #define FIELD_GET(mask, value) (((value) & (mask)) >> __builtin_ctzll(mask))
 #define SZ_16K 16384
-static int reads;
-static u32 read32(uintptr_t address) { reads++; return 0; }
-''' + macros + '\n' + function + r'''
+''' + macros + r'''
+static int reads, live;
+static u32 tcr, ttbr;
+static u32 read32(uintptr_t address)
+{
+    reads++;
+    if (!live)
+        return 0;
+    if (address == DART_T8110_PROTECT)
+        return DART_T8110_PROTECT_TTBR_TCR;
+    if (address == DART_T8110_TCR_OFF)
+        return tcr;
+    return address == DART_T8110_TTBR_OFF ? ttbr : 0;
+}
+''' + walk + r'''
 static int visit(u64 iova, u64 physical, void *context) { assert(0); return -1; }
+static struct { u64 iova, physical; } seen[4];
+static int nseen;
+static int record(u64 iova, u64 physical, void *context)
+{
+    seen[nseen].iova = iova;
+    seen[nseen++].physical = physical;
+    return 0;
+}
+/* The TTBR holds the root's address in 28 bits above bit 14, so the tables sit below 2^42. */
+static u64 (*mem)[SZ_16K / 8];
+static u64 pte(const void *next)
+{
+    return DART_PTE_VALID | (((u64)(uintptr_t)next >> DART_PTE_OFFSET_SHIFT)
+                             << __builtin_ctzll(DART_T6000_PTE_OFFSET));
+}
+static int walk_mem(u32 levels)
+{
+    u64 root = (u64)(uintptr_t)mem[0];
+    ttbr = DART_T8110_TTBR_VALID | ((root >> DART_T8110_TTBR_SHIFT) << __builtin_ctzll(DART_T8110_TTBR_ADDR));
+    tcr = DART_T8110_TCR_TRANSLATE_ENABLE;
+    nseen = 0;
+    return dart_walk_locked_t8110(0, 0xc000, 0, (u64)(uintptr_t)mem, 4 * SZ_16K, levels, record, NULL);
+}
 int main(void)
 {
     /* A 0x1440 window, as J514S validates, holds the TTBRs of streams 0 to 15. */
-    assert(dart_walk_locked_t8110(0, 0x1440, 16, 0, SZ_16K, visit, NULL) == -1 && !reads);
-    assert(dart_walk_locked_t8110(0, 0x1440, 255, 0, SZ_16K, visit, NULL) == -1 && !reads);
-    assert(dart_walk_locked_t8110(0, 0x1440, 0, 0, 1, visit, NULL) == -1 && !reads);
-    assert(dart_walk_locked_t8110(0, 0x1440, 0, UINT64_MAX - 1, SZ_16K, visit, NULL) == -1 && !reads);
-    assert(dart_walk_locked_t8110(0, 0x1440, 0, 0, SZ_16K, NULL, NULL) == -1 && !reads);
-    assert(dart_walk_locked_t8110(0, 0, 0, 0, SZ_16K, visit, NULL) == -1 && !reads);
-    assert(dart_walk_locked_t8110(0, 0x1440, 15, 0, SZ_16K, visit, NULL) == -1 && reads == 3);
+    assert(dart_walk_locked_t8110(0, 0x1440, 16, 0, SZ_16K, 2, visit, NULL) == -1 && !reads);
+    assert(dart_walk_locked_t8110(0, 0x1440, 255, 0, SZ_16K, 2, visit, NULL) == -1 && !reads);
+    assert(dart_walk_locked_t8110(0, 0x1440, 0, 0, 1, 2, visit, NULL) == -1 && !reads);
+    assert(dart_walk_locked_t8110(0, 0x1440, 0, UINT64_MAX - 1, SZ_16K, 2, visit, NULL) == -1 && !reads);
+    assert(dart_walk_locked_t8110(0, 0x1440, 0, 0, SZ_16K, 2, NULL, NULL) == -1 && !reads);
+    assert(dart_walk_locked_t8110(0, 0, 0, 0, SZ_16K, 2, visit, NULL) == -1 && !reads);
+    assert(dart_walk_locked_t8110(0, 0x1440, 0, 0, SZ_16K, 1, visit, NULL) == -1 && !reads);
+    assert(dart_walk_locked_t8110(0, 0x1440, 0, 0, SZ_16K, 4, visit, NULL) == -1 && !reads);
+    assert(dart_walk_locked_t8110(0, 0x1440, 15, 0, SZ_16K, 2, visit, NULL) == -1 && reads == 3);
     /* J713's 0xc000 window reaches stream 16, which its display handoff walks. */
-    assert(dart_walk_locked_t8110(0, 0xc000, 16, 0, SZ_16K, visit, NULL) == -1 && reads == 6);
-    assert(dart_walk_locked_t8110(0, 0xc000, 255, 0, SZ_16K, visit, NULL) == -1 && reads == 9);
+    assert(dart_walk_locked_t8110(0, 0xc000, 16, 0, SZ_16K, 2, visit, NULL) == -1 && reads == 6);
+    assert(dart_walk_locked_t8110(0, 0xc000, 255, 0, SZ_16K, 2, visit, NULL) == -1 && reads == 9);
+
+    /* Two levels: root[iova >> 25], then pages. */
+    live = 1;
+    mem = mmap((void *)0x200000000UL, 4 * SZ_16K, PROT_READ | PROT_WRITE,
+               MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+    assert(mem == (void *)0x200000000UL);
+    mem[0][2] = pte(mem[1]);
+    mem[1][9] = pte((void *)0x8000);
+    assert(walk_mem(2) == 0 && nseen == 1);
+    assert(seen[0].iova == ((2UL << 25) | (9UL << 14)) && seen[0].physical == 0x8000);
+
+    /* Three levels: root[iova >> 36], a mid table, then pages (the T6050 DCP stream). */
+    mem[0][2] = mem[1][9] = 0;
+    mem[0][3] = pte(mem[2]);
+    mem[2][5] = pte(mem[3]);
+    mem[3][7] = pte((void *)0x123458000UL);
+    assert(walk_mem(3) == 0 && nseen == 1);
+    assert(seen[0].iova == ((3UL << 36) | (5UL << 25) | (7UL << 14)) && seen[0].physical == 0x123458000UL);
+
+    /* A table pointer outside DRAM is refused rather than followed. */
+    mem[0][3] = DART_PTE_VALID | ((u64)0x40 << __builtin_ctzll(DART_T6000_PTE_OFFSET));
+    assert(walk_mem(3) == -1);
     return 0;
 }
 ''')

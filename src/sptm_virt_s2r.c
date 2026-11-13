@@ -129,14 +129,14 @@ static bool s2r_cp_wanted(const char *name)
 
     if (!*l)
         return true;
-    if (!strncmp(name, "dart-", 5))
-        name += 5;
-    size_t n = strlen(name);
+    const char *bare = !strncmp(name, "dart-", 5) ? name + 5 : name;
+    size_t n = strlen(name), nb = strlen(bare);
     while (*l) {
         const char *e = l;
         while (*e && *e != ',')
             e++;
-        if ((size_t)(e - l) == n && !strncmp(l, name, n))
+        if (((size_t)(e - l) == n && !strncmp(l, name, n)) ||
+            ((size_t)(e - l) == nb && !strncmp(l, bare, nb)))
             return true;
         l = *e ? e + 1 : e;
     }
@@ -216,7 +216,7 @@ static bool s2r_take(volatile u32 *budget)
 
 static struct s2r_rec *s2r_slot(void)
 {
-    if (!sptm_virt_s2r_ring)
+    if (!sptm_virt_s2r_ring || sptm_virt_gpu_is_parked())
         return NULL;
     u64 i = __atomic_fetch_add(&sptm_virt_s2r_head, 1, __ATOMIC_RELAXED);
     return &sptm_virt_s2r_ring[i % sptm_virt_s2r_nrec];

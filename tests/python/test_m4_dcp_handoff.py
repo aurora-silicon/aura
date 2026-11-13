@@ -164,9 +164,10 @@ static int get_value(int node, const char *name, void *out, size_t capacity)
  * the second, page by page at their remap addresses.
  */
 static int dart_walk_locked_t8110(uintptr_t base, u64 size, u8 sid, u64 dram_start,
-                                  u64 dram_len, int (*visit)(u64, u64, void *), void *opaque)
+                                  u64 dram_len, u32 levels, int (*visit)(u64, u64, void *),
+                                  void *opaque)
 {
-    assert(base == 0x30a300000 && size == 0xc000 && (sid == 0 || sid == 16));
+    assert(base == 0x30a300000 && size == 0xc000 && (sid == 0 || sid == 16) && levels == 2);
     walks++;
     for (unsigned i = 0, n = 0; i < b.count; i++) {
         if (b.segs[i].unk != 2) continue;

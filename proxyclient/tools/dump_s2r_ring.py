@@ -74,10 +74,10 @@ def fmt(i, rec, t0, freq, lookup=None):
         what = PKT_KINDS.get(kind, f"kind{kind}")
         extra, slot = "", ""
         if kind < 4 and word == 0:  # packet head: 4 tag characters, then the input size
-            tag4 = bytes((val >> (8 * k)) & 255 for k in range(4))
+            tag4 = bytes((val >> (8 * k)) & 255 for k in range(3, -1, -1))  # the wire holds the tag reversed
             extra = f" tag={tag4.decode('ascii', 'replace')!r} in={val >> 32}"
         if kind == 4:  # an AP call with a large input; word = its slot (15: none left), val = size << 32 | tag
-            tag4 = bytes((val >> (8 * k)) & 255 for k in range(4))
+            tag4 = bytes((val >> (8 * k)) & 255 for k in range(3, -1, -1))  # the wire holds the tag reversed
             extra = f" tag={tag4.decode('ascii', 'replace')!r} in=0x{val >> 32:x} slot={word}"
             word = 0
         elif kind in (5, 6):  # word w of the packet in slot s; the input starts at byte 12
