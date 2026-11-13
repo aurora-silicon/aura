@@ -29,6 +29,18 @@
 #define S2R_PKT_MAX   128
 #define S2R_DCP_OPEN  4
 #define S2R_DCP_SIDS  64
+/*
+ * An AP call with an input this large (swap_submit: 0x1144 bytes) is traced as the words that
+ * changed since that DCP's last such call, from the first word past the raw copy: kind 4 is one
+ * record per call (word 0: head, val = input size << 32), kind 5 a changed word (word = its index
+ * from the packet start, the input starts at byte 12), kind 6 a word that changed more than
+ * S2R_BIG_CHURN times and is not recorded again. A brightness field shows as a word that changes
+ * only when the brightness moves.
+ */
+#define S2R_BIG_MIN   0x1000UL
+#define S2R_BIG_WORDS 640
+#define S2R_BIG_FROM  ALIGN_UP(12 + S2R_PKT_MAX, 8)
+#define S2R_BIG_CHURN 200
 
 static struct s2r_dcp {
     u64 mbox, dart, dart_size;
@@ -42,6 +54,10 @@ static struct s2r_dcp {
     int nopen[2];
     u8 busy; /* one core at a time; a contended access is not followed */
 } s2r_dcp[S2R_DCP_N];
+static struct s2r_big {
+    u64 prev[S2R_BIG_WORDS]; /* the last value seen; 0 before the first call */
+    u8 churn[S2R_BIG_WORDS];
+} s2r_big[S2R_DCP_N];
 static int s2r_n_dcp;
 u32 sptm_virt_s2r_dcp_pkt; /* host: copy the DCPs' IOMFB packets into the ring */
 
@@ -107,6 +123,27 @@ static void s2r_pkt_rec(int idx, int kind, int word, u64 pa, u64 v, bool a2i)
         pa, v, S2R_PKT_TAG | ((u64)idx << 32) | ((u64)kind << 36) | ((u64)word << 40), a2i);
 }
 
+static void s2r_dcp_big(int idx, struct s2r_dcp *d, u64 off, u64 in, u64 pa0, bool a2i)
+{
+    struct s2r_big *b = &s2r_big[idx];
+    u64 end = min(off + 12 + in, off + S2R_BIG_WORDS * 8UL);
+
+    s2r_pkt_rec(idx, 4, 0, pa0, in << 32, a2i);
+    for (u64 o = off + S2R_BIG_FROM; o < end && o + 8 <= S2R_DCP_RPC; o += 8) {
+        u64 v, w = (o - off) / 8, pa = s2r_dcp_pa(d, o);
+        if (!pa || !sptm_virt_peek64(pa, &v))
+            return;
+        if (v == b->prev[w])
+            continue;
+        b->prev[w] = v;
+        if (b->churn[w] >= S2R_BIG_CHURN)
+            continue;
+        s2r_pkt_rec(idx, 5, w, pa, v, a2i);
+        if (++b->churn[w] == S2R_BIG_CHURN)
+            s2r_pkt_rec(idx, 6, w, pa, S2R_BIG_CHURN, a2i);
+    }
+}
+
 /* kind 0: an AP call, 1: a DCP callback, 2: an AP call's output, 3: a callback's output */
 static void s2r_dcp_copy(int idx, struct s2r_dcp *d, u64 off, int kind, bool a2i)
 {
@@ -116,6 +153,8 @@ static void s2r_dcp_copy(int idx, struct s2r_dcp *d, u64 off, int kind, bool a2i
     s2r_pkt_rec(idx, kind, 0, pa0, h0, a2i);
     s2r_pkt_rec(idx, kind, 1, pa1, h1, a2i);
     u64 in = h0 >> 32, out = h1 & 0xffffffff;
+    if (kind == 0 && in >= S2R_BIG_MIN)
+        s2r_dcp_big(idx, d, off, in, pa0, a2i);
     u64 from = kind < 2 ? off + 16 : ALIGN_DOWN(off + 12 + min(in, (u64)S2R_DCP_RPC), 8);
     u64 to = kind < 2 ? off + 12 + min(in, (u64)S2R_PKT_MAX) : from + min(out + 8, 64UL);
     for (u64 o = from, w = 2; o < to && o + 8 <= S2R_DCP_RPC; o += 8, w++) {

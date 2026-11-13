@@ -73,12 +73,12 @@ int sptm_virt_peek64(u64 p, u64 *o)
 struct rec {
     u64 pa, val, tag;
 };
-static struct rec recs[64];
+static struct rec recs[4096];
 static int nrec;
 void sptm_virt_s2r_rec_raw(u64 pa, u64 val, u64 tag, bool w)
 {
     (void)w;
-    if (nrec < 64)
+    if (nrec < 4096)
         recs[nrec++] = (struct rec){pa, val, tag};
 }
 
@@ -260,6 +260,39 @@ int main(void)
     CHECK(count_kind(0) <= 2 + 16, "huge input size: %d records", count_kind(0));
     i2a(0x42, 0x37);
     CHECK(count_kind(2) <= 2 + 8, "huge output size: %d records", count_kind(2));
+
+    /* A call with a large input (swap_submit, 0x1144 bytes): its changed words are traced. */
+    *(u64 *)pg_pa(CALL_OFF) = (0x1144UL << 32) | 0x38353441; /* "A458" */
+    for (int w = 2; w < 560; w++)
+        *(u64 *)pg_pa(CALL_OFF + 8 * w) = 0x5000 + w;
+    ap_call(DVA, 0x302);
+    CHECK(count_kind(4) == 1, "big call: %d summary records", count_kind(4));
+    CHECK(count_kind(5) == 536, "big call: %d changed words, want 536 (words 18 to 553)", count_kind(5));
+    for (int i = 0; i < nrec; i++)
+        if (((recs[i].tag >> 36) & 0xf) == 5 && (recs[i].tag >> 40) == 100)
+            CHECK(recs[i].pa == pg_pa(CALL_OFF + 800) && recs[i].val == 0x5000 + 100, "word 100: pa 0x%lx val 0x%lx",
+                  (unsigned long)recs[i].pa, (unsigned long)recs[i].val);
+    CHECK(count_kind(0) == 18, "big call: %d raw records, want the head and 16 input words", count_kind(0));
+
+    nrec = 0;
+    a2i(((CALL_OFF & 0xffff) << 16) | 0x302, 0x37);
+    CHECK(count_kind(4) == 1 && count_kind(5) == 0, "same call again: %d changed words", count_kind(5));
+
+    /* One word moves (the brightness): exactly that word is recorded, then it stops at the churn limit. */
+    int sent = 0, volatile_at = 0;
+    for (int i = 0; i < 250; i++) {
+        *(u64 *)pg_pa(CALL_OFF + 800) = 0x9000 + i;
+        nrec = 0;
+        a2i(((CALL_OFF & 0xffff) << 16) | 0x302, 0x37);
+        if (i == 0)
+            CHECK(count_kind(5) == 1 && find(5, 100) && find(5, 100)->val == 0x9000, "one word moved: %d records",
+                  count_kind(5));
+        sent += count_kind(5);
+        if (count_kind(6) && !volatile_at)
+            volatile_at = i + 1;
+    }
+    CHECK(sent == 199, "word 100 recorded %d more times, want 199 (200 in all)", sent);
+    CHECK(volatile_at == 199, "word 100 marked volatile at change %d, want 199", volatile_at);
 
     printf(failures ? "FAIL: %d checks\n" : "PASS: DCP packet copier\n", failures);
     return failures != 0;

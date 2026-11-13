@@ -26,7 +26,8 @@ sys.path.append(str(pathlib.Path(__file__).resolve().parent))
 REC = struct.Struct("<4Q")
 CHUNK = 1 << 20
 PKT_TAG = 0x544B5043  # "CPKT", the pc field of a DCP packet record
-PKT_KINDS = {0: "AP-call", 1: "DCP-callback", 2: "AP-call-out", 3: "callback-out", 7: "resolve"}
+PKT_KINDS = {0: "AP-call", 1: "DCP-callback", 2: "AP-call-out", 3: "callback-out", 4: "big-call", 5: "big-word",
+             6: "big-volatile", 7: "resolve"}
 MARKER = 1 << 55
 WRITE = 1 << 50
 
@@ -44,7 +45,7 @@ def pkt_key(rec):
     if marker or pc & 0xFFFFFFFF != PKT_TAG:
         return None
     kind, word = (pc >> 36) & 15, pc >> 40
-    if kind != 7 and word != 0:
+    if kind not in (6, 7) and word != 0:
         return None
     return (pc >> 32) & 15, PKT_KINDS.get(kind, f"kind{kind}")
 
@@ -75,6 +76,12 @@ def fmt(i, rec, t0, freq, lookup=None):
         if kind < 4 and word == 0:  # packet head: 4 tag characters, then the input size
             tag4 = bytes((val >> (8 * k)) & 255 for k in range(4))
             extra = f" tag={tag4.decode('ascii', 'replace')!r} in={val >> 32}"
+        if kind == 4:  # an AP call with a large input: its changed words follow as big-word records
+            extra = f" in=0x{val >> 32:x}"
+        elif kind == 5:  # word w of the packet; the input starts at byte 12
+            extra = f" poff=0x{word * 8 - 12:x}"
+        elif kind == 6:
+            extra = f" poff=0x{word * 8 - 12:x} changed {val} times, not recorded again"
         if kind == 7:
             extra = f" found={val >> 32} refused={val & 0xFFFFFFFF} stream={word}"
         return f"S2R {i} t={t:x} +{secs:.6f}s c{cpu} PKT dcp{idx} {what} w{word} 0x{pa:x} = 0x{val:x}{extra}"
