@@ -64,15 +64,17 @@ u32 sptm_virt_s2r_dcp_pkt; /* host: copy the DCPs' IOMFB packets into the ring *
 struct s2r_dcp_walk {
     struct s2r_dcp *d;
     int found;
+    u32 levels;
 };
 
-/* The walk gives an IOVA below 2^36; the AP's DVA carries the stream's VM base above that. */
+/* A two-level walk gives an IOVA below 2^36; the AP's DVA carries the stream's VM base above that.
+ * A three-level walk gives the whole IOVA (the T6050 DCP stream's VM base is bit 40). */
 #define S2R_DCP_VM_LOW BIT(36)
 
 static int s2r_dcp_visit(u64 iova, u64 pa, void *opaque)
 {
     struct s2r_dcp_walk *w = opaque;
-    u64 full = iova | (w->d->lo & ~(S2R_DCP_VM_LOW - 1));
+    u64 full = w->levels == 2 ? iova | (w->d->lo & ~(S2R_DCP_VM_LOW - 1)) : iova;
     if (full >= w->d->lo && full < w->d->lo + S2R_DCP_PAGES * 0x4000UL) {
         w->d->pa[(full - w->d->lo) / 0x4000] = pa;
         if (++w->found == S2R_DCP_PAGES)
@@ -83,9 +85,10 @@ static int s2r_dcp_visit(u64 iova, u64 pa, void *opaque)
 
 static void s2r_pkt_rec(int idx, int kind, int word, u64 pa, u64 v, bool a2i);
 
-/* The IOMFB shared memory is on whichever of the DART's streams (T6050: 23 and 24 carry it, not
- * stream 0..15) maps most of its pages: walk every stream and keep the best. One ring record per
- * attempt (kind 7): found pages, the stream, the streams the walk refused. */
+/* The IOMFB shared memory is on whichever of the DART's streams (T6050: 23 carries it; 24 has no
+ * tables) maps most of its pages, in three levels there and in two on older DARTs: walk every stream
+ * both ways and keep the best. One ring record per attempt (kind 7): found pages, the stream, the
+ * streams no walk accepted. */
 static int s2r_dcp_resolve(struct s2r_dcp *d)
 {
     u64 ram = ALIGN_DOWN(cur_boot_args.phys_base, BIT(32)), best[S2R_DCP_PAGES] = {0};
@@ -93,16 +96,20 @@ static int s2r_dcp_resolve(struct s2r_dcp *d)
 
     d->lo = d->dva & ~0x3fffUL;
     for (u8 sid = 0; sid < S2R_DCP_SIDS; sid++) {
-        struct s2r_dcp_walk w = {d, 0};
-        memset(d->pa, 0, sizeof(d->pa));
-        int rc = dart_walk_locked_t8110(d->dart, d->dart_size, sid, ram, mem_size_actual,
-                                        s2r_dcp_visit, &w);
-        refused += rc < 0;
-        if (rc >= 0 && w.found > best_found) {
-            best_found = w.found;
-            best_sid = sid;
-            memcpy(best, d->pa, sizeof(best));
+        bool accepted = false;
+        for (u32 levels = 3; levels >= 2; levels--) {
+            struct s2r_dcp_walk w = {d, 0, levels};
+            memset(d->pa, 0, sizeof(d->pa));
+            int rc = dart_walk_locked_t8110(d->dart, d->dart_size, sid, ram, mem_size_actual,
+                                            levels, s2r_dcp_visit, &w);
+            accepted |= rc >= 0;
+            if (rc >= 0 && w.found > best_found) {
+                best_found = w.found;
+                best_sid = sid;
+                memcpy(best, d->pa, sizeof(best));
+            }
         }
+        refused += !accepted;
     }
     memcpy(d->pa, best, sizeof(best));
     s2r_pkt_rec(d - s2r_dcp, 7, best_sid < 0 ? 0 : best_sid, d->dva,

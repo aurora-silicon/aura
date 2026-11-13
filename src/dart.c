@@ -1130,21 +1130,52 @@ void *dart_translate_silent(dart_dev_t *dart, uintptr_t iova)
     return dart_translate_internal(dart, iova, 1);
 }
 
+static int dart_walk_table(u64 table, u32 level, u64 iova, u64 dram_base, u64 dram_end,
+                           int (*visit)(u64 iova, u64 paddr, void *opaque), void *opaque)
+{
+    u32 shift = DART_PTE_OFFSET_SHIFT + 11 * (level - 1);
+
+    for (u32 i = 0; i < SZ_16K / sizeof(u64); i++) {
+        u64 pte = ((const volatile u64 *)table)[i];
+        if (!(pte & DART_PTE_VALID))
+            continue;
+
+        u64 next = FIELD_GET(DART_T6000_PTE_OFFSET, pte) << DART_PTE_OFFSET_SHIFT;
+        u64 at = iova | ((u64)i << shift);
+        int ret;
+        if (level == 1) {
+            ret = visit(at, next, opaque);
+        } else {
+            if (next < dram_base || next > dram_end - SZ_16K)
+                return -1;
+            ret = dart_walk_table(next, level - 1, at, dram_base, dram_end, visit, opaque);
+        }
+        if (ret)
+            return ret;
+    }
+
+    return 0;
+}
+
 /*
  * Walk the page tables of a locked T8110 DART stream without touching its
  * state: no stream is enabled, reset or invalidated. The stream must translate
  * through its tables (DAPF bypass and a remap selector without remap enable do
  * not change that); a bypassed or remapping stream, an invalid TTBR or tables
- * outside DRAM are refused. @visit is called for every valid L2 entry and stops
- * the walk by returning non-zero.
+ * outside DRAM are refused. @levels is 2 (root[iova >> 25], then pages: IOVAs
+ * below 2^36) or 3 (root[iova >> 36], a mid table, then pages: a stream whose VM
+ * base is above bit 36, such as the T6050 DCP's). @visit is called for every
+ * valid page entry and stops the walk by returning non-zero.
  */
 int dart_walk_locked_t8110(uintptr_t base, u64 size, u8 sid, u64 dram_base, u64 dram_size,
-                           int (*visit)(u64 iova, u64 paddr, void *opaque), void *opaque)
+                           u32 levels, int (*visit)(u64 iova, u64 paddr, void *opaque),
+                           void *opaque)
 {
     u64 dram_end = dram_base + dram_size;
 
     /* The stream's TTBR is the highest register read; the window must cover it. */
-    if (!visit || size < DART_T8110_TTBR_OFF + 4 * ((u64)sid + 1) || dram_size < SZ_16K ||
+    if (!visit || (levels != 2 && levels != 3) ||
+        size < DART_T8110_TTBR_OFF + 4 * ((u64)sid + 1) || dram_size < SZ_16K ||
         dram_end <= dram_base)
         return -1;
 
@@ -1157,32 +1188,11 @@ int dart_walk_locked_t8110(uintptr_t base, u64 size, u8 sid, u64 dram_base, u64 
         !(ttbr & DART_T8110_TTBR_VALID))
         return -1;
 
-    u64 l1 = (u64)FIELD_GET(DART_T8110_TTBR_ADDR, ttbr) << DART_T8110_TTBR_SHIFT;
-    if (l1 < dram_base || l1 > dram_end - SZ_16K)
+    u64 root = (u64)FIELD_GET(DART_T8110_TTBR_ADDR, ttbr) << DART_T8110_TTBR_SHIFT;
+    if (root < dram_base || root > dram_end - SZ_16K)
         return -1;
 
-    for (u32 i = 0; i < SZ_16K / sizeof(u64); i++) {
-        u64 pte = ((const volatile u64 *)l1)[i];
-        if (!(pte & DART_PTE_VALID))
-            continue;
-
-        u64 l2 = FIELD_GET(DART_T6000_PTE_OFFSET, pte) << DART_PTE_OFFSET_SHIFT;
-        if (l2 < dram_base || l2 > dram_end - SZ_16K)
-            return -1;
-
-        for (u32 j = 0; j < SZ_16K / sizeof(u64); j++) {
-            pte = ((const volatile u64 *)l2)[j];
-            if (!(pte & DART_PTE_VALID))
-                continue;
-
-            u64 paddr = FIELD_GET(DART_T6000_PTE_OFFSET, pte) << DART_PTE_OFFSET_SHIFT;
-            int ret = visit(((u64)i << 25) | ((u64)j << 14), paddr, opaque);
-            if (ret)
-                return ret;
-        }
-    }
-
-    return 0;
+    return dart_walk_table(root, levels, 0, dram_base, dram_end, visit, opaque);
 }
 
 u64 dart_search(dart_dev_t *dart, void *paddr)

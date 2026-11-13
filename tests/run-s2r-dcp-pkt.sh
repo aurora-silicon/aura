@@ -14,6 +14,7 @@ trap 'rm -rf "$tmp"' EXIT HUP INT TERM
 {
     printf '#include "types.h"\n#include "utils.h"\n#include "dart.h"\n'
     sed -n '/^#define DART_T8020_ENABLED_STREAMS/,/^#define DART_TCR(/p' src/dart.c
+    sed -n '/^static int dart_walk_table(/,/^}/p' src/dart.c
     sed -n '/^int dart_walk_locked_t8110(/,/^}/p' src/dart.c
 } > "$tmp/dartwalk.c"
 grep -q 'dart_walk_locked_t8110' "$tmp/dartwalk.c" || { echo "FAIL: walk not found in src/dart.c"; exit 1; }
