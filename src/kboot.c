@@ -9366,10 +9366,10 @@ t6050_isp_segments_valid(const struct adt_segment_ranges *seg, u32 len, u64 ram,
 }
 
 /*
- * T6050 firmware lives below Linux RAM. Publish its current ADT ranges, not
+ * T6050 firmware lives below Linux RAM. Publish current ADT ranges, not
  * snapshot physical addresses. The kernel allocates the small main-memory
- * tail and owns all power, DART and firmware-start operations. J716c's camera
- * is sensor type 0x75, J714s's 0x74; both have the same two segments.
+ * tail and owns all power, DART and firmware-start operations. J716c (0x75),
+ * J714s (0x74) and K114c (0xb9) use the same two segment names.
  */
 __attribute__((section(".init.t6050_isp"))) static int t6050_isp_add_mem_region(uint32_t phandle,
                                                                                 const char *name)
