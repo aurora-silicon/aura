@@ -25,6 +25,8 @@ sys.path.append(str(pathlib.Path(__file__).resolve().parent))
 
 REC = struct.Struct("<4Q")
 CHUNK = 1 << 20
+PKT_TAG = 0x544B5043  # "CPKT", the pc field of a DCP packet record
+PKT_KINDS = {0: "AP-call", 1: "DCP-callback", 2: "AP-call-out", 3: "callback-out", 7: "resolve"}
 MARKER = 1 << 55
 WRITE = 1 << 50
 
@@ -55,6 +57,11 @@ def fmt(i, rec, t0, freq, lookup=None):
     secs = (t - t0) / freq
     if marker:
         return f"S2R {i} t={t:x} +{secs:.6f}s c{cpu} MARK {pc.to_bytes(8, 'little').rstrip(bytes(1)).decode('latin1')} 0x{val:x}"
+    if pc & 0xFFFFFFFF == PKT_TAG:  # s2r_dcp_pkt.c: a DCP call's packet word, or a resolve attempt
+        idx, kind, word = (pc >> 32) & 15, (pc >> 36) & 15, pc >> 40
+        what = PKT_KINDS.get(kind, f"kind{kind}")
+        extra = f" found={val >> 32} refused={val & 0xFFFFFFFF} stream={word}" if kind == 7 else ""
+        return f"S2R {i} t={t:x} +{secs:.6f}s c{cpu} PKT dcp{idx} {what} w{word} 0x{pa:x} = 0x{val:x}{extra}"
     tag = owner(lookup, pa)[0] if lookup else ""
     return f"S2R {i} t={t:x} +{secs:.6f}s c{cpu} {'W' if write else 'R'}{bits} 0x{pa:x} {tag} = 0x{val:x} pc=0x{pc:x}"
 
