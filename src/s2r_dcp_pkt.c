@@ -59,6 +59,8 @@ static int s2r_dcp_visit(u64 iova, u64 pa, void *opaque)
     return 0;
 }
 
+static void s2r_pkt_rec(int idx, int kind, int word, u64 pa, u64 v, bool a2i);
+
 static int s2r_dcp_resolve(struct s2r_dcp *d)
 {
     u64 ram = ALIGN_DOWN(cur_boot_args.phys_base, BIT(32));
@@ -66,9 +68,10 @@ static int s2r_dcp_resolve(struct s2r_dcp *d)
     d->lo = d->dva & ~0x3fffUL;
     for (u8 sid = 0; sid < 16; sid++) {
         struct s2r_dcp_walk w = {d, 0};
-        if (dart_walk_locked_t8110(d->dart, d->dart_size, sid, ram, mem_size_actual, s2r_dcp_visit,
-                                   &w) >= 0 &&
-            w.found)
+        int rc = dart_walk_locked_t8110(d->dart, d->dart_size, sid, ram, mem_size_actual,
+                                        s2r_dcp_visit, &w);
+        s2r_pkt_rec(d - s2r_dcp, 7, sid, d->dva, ((u64)w.found << 32) | (u32)rc, false);
+        if (rc >= 0 && w.found)
             return 1;
     }
     return -1;
