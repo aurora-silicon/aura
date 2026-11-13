@@ -23,10 +23,15 @@ SECTIONS {
         *(.init.*)
         /*
          * Large code that only runs when aura hosts a guest, in this mostly empty slot. In .text
-         * it pushes .text past its next 64 KiB step, and .data past _file_limit.
+         * it pushes .text past its next 64 KiB step, and .data past _file_limit. With SPTM_VIRT,
+         * some of the guest-only code that .text and .rodata can't hold too; the rest of it
+         * (*sptm_virt*.o) goes in .rodata, below.
          */
         *hv/hv_vm.o(.text .text.*)
         *hv/hv_sprr.o(.text .text.*)
+        *nv2.o(.text .text.*)
+        *sptm_virt_s2r.o(.text .text.*)
+        *sptm_virt_gl.o(.text .text.*)
     } :text
     .text : ALIGN(0x10000) {
         *(EXCLUDE_FILE(*sptm_virt*.o) .text .text.*)
