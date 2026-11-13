@@ -56,5 +56,6 @@ def test_j773g_services_dcp_while_waiting_for_hpd():
     configure = function(source, "int display_configure(")
     assert "bool j773g = kboot_is_j773g_machine();" in configure
     assert "int status_retries = j773g ? 150" in configure
-    assert "timeout_calculate(DISPLAY_STATUS_DELAY * 1000)" in configure
-    assert "while (!timeout_expired(timeout))\n                    dcp_work(dcp);" in configure
+    assert "dcp_work(dcp);\n        hpd = dcp_ib_get_hpd" in configure
+    assert "if (retries < status_retries)\n            mdelay(DISPLAY_STATUS_DELAY);" in configure
+    assert "while (!timeout_expired" not in configure

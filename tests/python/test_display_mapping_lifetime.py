@@ -65,6 +65,7 @@ static int dart_map(dart_dev_t *d, unsigned long iova, void *pa, size_t size)
 }
 static u64 dart_find_iova(dart_dev_t *d, s64 start, size_t size) { (void)d; (void)size; return start; }
 static u64 dart_vm_base(dart_dev_t *d) { (void)d; return 0; }
+static u64 dart_dva_base(dart_dev_t *d) { (void)d; return 0; }
 static void reset(void)
 {
     disp = (dart_dev_t){.id = 0, .params = &params};
