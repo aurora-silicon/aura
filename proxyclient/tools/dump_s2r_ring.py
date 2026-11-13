@@ -60,7 +60,12 @@ def fmt(i, rec, t0, freq, lookup=None):
     if pc & 0xFFFFFFFF == PKT_TAG:  # s2r_dcp_pkt.c: a DCP call's packet word, or a resolve attempt
         idx, kind, word = (pc >> 32) & 15, (pc >> 36) & 15, pc >> 40
         what = PKT_KINDS.get(kind, f"kind{kind}")
-        extra = f" found={val >> 32} refused={val & 0xFFFFFFFF} stream={word}" if kind == 7 else ""
+        extra = ""
+        if kind < 4 and word == 0:  # packet head: 4 tag characters, then the input size
+            tag4 = bytes((val >> (8 * k)) & 255 for k in range(4))
+            extra = f" tag={tag4.decode('ascii', 'replace')!r} in={val >> 32}"
+        if kind == 7:
+            extra = f" found={val >> 32} refused={val & 0xFFFFFFFF} stream={word}"
         return f"S2R {i} t={t:x} +{secs:.6f}s c{cpu} PKT dcp{idx} {what} w{word} 0x{pa:x} = 0x{val:x}{extra}"
     tag = owner(lookup, pa)[0] if lookup else ""
     return f"S2R {i} t={t:x} +{secs:.6f}s c{cpu} {'W' if write else 'R'}{bits} 0x{pa:x} {tag} = 0x{val:x} pc=0x{pc:x}"
