@@ -113,6 +113,33 @@ u32 sptm_virt_s2r_cp_ansx;      /* T6050 COPROC: S2R_CP_ANSX_* pages around ANS 
 /* S2R_CP_ANSX_QUIET: XNU's NVMe registers (sart-ans reg[2]); per-I/O writes are only counted */
 static u64 s2r_nvme_quiet_page, s2r_nvme_quiet_n;
 
+/* From the host (AURA_S2R_CP_ONLY): a comma list of /arm-io node names for the T6050 COPROC trace
+ * to hook; empty hooks every coprocessor. A name also matches that node's "dart-" form. */
+char sptm_virt_s2r_cp_only[96];
+/* From the host (AURA_S2R_CP_RANGE): up to 4 { base, size } of extra pages to hook, such as the
+ * AOP's SRAM. */
+u64 sptm_virt_s2r_cp_range[8];
+
+static bool s2r_cp_wanted(const char *name)
+{
+    const char *l = sptm_virt_s2r_cp_only;
+
+    if (!*l)
+        return true;
+    if (!strncmp(name, "dart-", 5))
+        name += 5;
+    size_t n = strlen(name);
+    while (*l) {
+        const char *e = l;
+        while (*e && *e != ',')
+            e++;
+        if ((size_t)(e - l) == n && !strncmp(l, name, n))
+            return true;
+        l = *e ? e + 1 : e;
+    }
+    return false;
+}
+
 static struct {
     u64 page;
     const char *what;
@@ -975,7 +1002,7 @@ static bool s2r_nvme_quiet(u64 addr, bool write)
            (off == 0xc || off == 0x10 || off >= 0x1000);
 }
 
-static bool s2r_cp_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int width)
+static bool s2r_cp_access(struct exc_info *ctx, u64 addr, u64 *val, bool write, int width)
 {
     if (width == 4 || width == 5) {
         for (int h = 0; h < width - 3; h++) {
@@ -997,6 +1024,16 @@ static bool s2r_cp_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, in
     sptm_virt_s2r_note(ctx, addr, s2r_cp_cut(addr, *val, width), write, width);
     s2r_dcp_watch(addr, val, width);
     return true;
+}
+
+/* The host's boot deadline (AURA_GPU_STOP_BOOT_SECS) is offered after the access is recorded, so
+ * a trace without the GPU hooks still parks and leaves the ring for the host to read. */
+static bool s2r_cp_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int width)
+{
+    bool ok = s2r_cp_access(ctx, addr, val, write, width);
+    if (ok && sptm_virt_gpu_deadline_due())
+        sptm_virt_gpu_deadline(ctx);
+    return ok;
 }
 
 static bool s2r_cp_hooked(u64 page)
@@ -1096,7 +1133,7 @@ static void s2r_t6050_coproc(bool mem)
     ADT_FOREACH_CHILD(adt, node)
     {
         const char *name = adt_get_name(adt, node);
-        if (sptm_virt_s2r_cp_skip_ans && !strcmp(name, "ans"))
+        if ((sptm_virt_s2r_cp_skip_ans && !strcmp(name, "ans")) || !s2r_cp_wanted(name))
             continue;
         if (s2r_cp_compat(node, "iop,ascwrap") || s2r_cp_compat(node, "iop-sep,ascwrap")) {
             s2r_cp_reg(name, 0, "asc", 0, 0x4000);
@@ -1118,27 +1155,35 @@ static void s2r_t6050_coproc(bool mem)
         }
     }
     for (unsigned i = 0; i < ARRAY_SIZE(spmi); i++)
-        for (int r = 0; r < 3; r++)
+        for (int r = 0; r < 3 && s2r_cp_wanted(spmi[i]); r++)
             s2r_cp_reg(spmi[i], r, "regs", 0, 0x4000);
     /* ANS's storage side: its SART, the NVMe BAR's registers, the AUS5 PHY windows. */
-    if (sptm_virt_s2r_cp_ansx & S2R_CP_ANSX_SART)
+    bool ans = s2r_cp_wanted("ans");
+    if (ans && (sptm_virt_s2r_cp_ansx & S2R_CP_ANSX_SART))
         for (int r = 0; r < 3; r++) {
             u64 pa = s2r_cp_reg("sart-ans", r, "regs", 0, 0x4000);
             if (r == 2 && (sptm_virt_s2r_cp_ansx & S2R_CP_ANSX_QUIET))
                 s2r_nvme_quiet_page = pa;
         }
-    if (sptm_virt_s2r_cp_ansx & S2R_CP_ANSX_NVME)
+    if (ans && (sptm_virt_s2r_cp_ansx & S2R_CP_ANSX_NVME))
         s2r_cp_reg("ans", 9, "nvme", 0, 0x4000);
-    if (sptm_virt_s2r_cp_ansx & S2R_CP_ANSX_AUS5)
+    if (ans && (sptm_virt_s2r_cp_ansx & S2R_CP_ANSX_AUS5))
         for (int r = 10; r < 14; r++)
             s2r_cp_reg_page("apcie0", r, "aus5");
     if (mem) {
         /* The MCC's own pages, then each AMCC and its DCSs (amcc-reg-idx on). */
-        for (int r = 0; r < 64; r++)
+        for (int r = 0; r < 64 && s2r_cp_wanted("mcc"); r++)
             if (!s2r_cp_reg("mcc", r, r < 14 ? "mcc" : r < 22 ? "amcc" : "dcs", 0, 0))
                 break;
         for (unsigned i = 0; i < ARRAY_SIZE(darts); i++)
-            s2r_cp_reg(darts[i], 0, "regs", 0, 0);
+            if (s2r_cp_wanted(darts[i]))
+                s2r_cp_reg(darts[i], 0, "regs", 0, 0);
+    }
+    for (unsigned i = 0; i < ARRAY_SIZE(sptm_virt_s2r_cp_range); i += 2) {
+        u64 base = ALIGN_DOWN(sptm_virt_s2r_cp_range[i], 0x4000);
+        u64 end = ALIGN_UP(sptm_virt_s2r_cp_range[i] + sptm_virt_s2r_cp_range[i + 1], 0x4000);
+        if (sptm_virt_s2r_cp_range[i + 1])
+            s2r_cp_range("extra", base, end - base);
     }
     printf("SPTM-virt[s2r]: coprocessor trace: %u pages (SEP mailbox 0x%lx, ESM 0x%lx cut to "
            "headers)\n",

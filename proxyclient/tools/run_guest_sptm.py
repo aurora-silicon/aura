@@ -28,6 +28,10 @@ Environment (all optional; 1 enables a switch):
   AURA_S2R_CP_NO_ANS       T6050 COPROC: leave ANS's own pages unhooked
   AURA_S2R_DCP_PKT         T6050 COPROC: copy the DCPs' IOMFB packets into the ring
   AURA_S2R_CP_ANSX=<mask>  T6050 COPROC: also hook 1 the ANS SART, 2 the NVMe BAR page, 4 AUS5
+  AURA_S2R_CP_ONLY=<a,b>   T6050 COPROC: hook only these /arm-io nodes (aop,smc; a name also
+                           covers its dart-<name>); the default hooks every coprocessor
+  AURA_S2R_CP_RANGE=<b:s>  T6050 COPROC: also hook up to 4 comma-separated base:size ranges, such as
+                           the AOP's SRAM (aligned out to 16 KiB pages)
   AURA_S2R_DROP_USB        tear down aura's USB gadget at the sleep commit
   AURA_S2R_WAKE_S=<s>      GO, timer-only sleep: arm the PMU RTC alarm s seconds after the commit
   AURA_S2R_GO_COUNT=<n>    GO, timer-only sleep: after n wakes, stop in the proxy at the next commit
@@ -40,6 +44,8 @@ Environment (all optional; 1 enables a switch):
   AURA_GPU_STOP_SECS=<n>   park in the proxy n s after the first GPU access (read the ring)
   AURA_GPU_STOP_MSG=<v>    park right after the guest writes v to the GPU (a mailbox message)
   AURA_GPU_PRINT_MAX=<n>   print at most n GPU accesses on aura's console (default 20000)
+  AURA_GPU_STOP_BOOT_SECS=<n>  park in the proxy at the first SPTM trap or hooked S2R/GPU access n s
+                           after entry, GPU trace or not; read the S2R ring with dump_s2r_ring.py
   AURA_SAMPLE              sample the guest's PC until each core's XNU entry (pre-XNU hangs)
   AURA_SAMPLE_HZ=<n>       samples per second (default 4)
   AURA_SAMPLE_MAX=<n>      stop printing after n samples (default 64)
@@ -120,6 +126,8 @@ KNOWN_ENV = {
     "AURA_S2R_GO_COUNT",
     "AURA_S2R_CP_NO_ANS",
     "AURA_S2R_CP_ANSX",
+    "AURA_S2R_CP_ONLY",
+    "AURA_S2R_CP_RANGE",
     "AURA_S2R_DCP_PKT",
     "AURA_S2R_USB_RETAKE",
     "AURA_S2R_USB_RETAKE_MS",
@@ -640,6 +648,20 @@ def configure(p, sym, plan, adt):
     if os.environ.get("AURA_S2R_CP_ANSX"):
         p.write32(sym["sptm_virt_s2r_cp_ansx"], env_int("AURA_S2R_CP_ANSX"))
         print("coprocessor trace: ANS storage-side pages, mask", os.environ["AURA_S2R_CP_ANSX"])
+    if os.environ.get("AURA_S2R_CP_ONLY"):
+        only = os.environ["AURA_S2R_CP_ONLY"].encode()
+        if len(only) >= 96:
+            raise SystemExit("AURA_S2R_CP_ONLY: at most 95 bytes")
+        p.writemem(sym["sptm_virt_s2r_cp_only"], only + b"\0")
+        print("coprocessor trace: only", os.environ["AURA_S2R_CP_ONLY"])
+    if os.environ.get("AURA_S2R_CP_RANGE"):
+        ranges = [tuple(int(v, 0) for v in r.split(":")) for r in os.environ["AURA_S2R_CP_RANGE"].split(",")]
+        if len(ranges) > 4:
+            raise SystemExit("AURA_S2R_CP_RANGE: at most 4 base:size pairs")
+        for i, (base, size) in enumerate(ranges):
+            p.write64(sym["sptm_virt_s2r_cp_range"] + 16 * i, base)
+            p.write64(sym["sptm_virt_s2r_cp_range"] + 16 * i + 8, size)
+        print("coprocessor trace: extra ranges", os.environ["AURA_S2R_CP_RANGE"])
     if os.environ.get("AURA_S2R_GO_COUNT"):
         p.write32(sym["sptm_virt_s2r_go_count"], env_int("AURA_S2R_GO_COUNT"))
         print("stop at the commit after", os.environ["AURA_S2R_GO_COUNT"], "GO wakes")
