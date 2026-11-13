@@ -198,6 +198,35 @@ int main(void)
 ''')
 
 
+def test_cp_only_matches_exact_dart_name_and_bare_alias(tmp_path):
+    source = (ROOT / "src/sptm_virt_s2r.c").read_text()
+    start = source.index("static bool s2r_cp_wanted(")
+    function = source[start:source.index("\n}", start) + 2]
+    run_c(tmp_path, "cp-only", r'''
+#include <assert.h>
+#include <stdbool.h>
+#include <string.h>
+char sptm_virt_s2r_cp_only[256];
+''' + function + r'''
+static bool wanted(const char *only, const char *name)
+{
+    strcpy(sptm_virt_s2r_cp_only, only);
+    return s2r_cp_wanted(name);
+}
+int main(void)
+{
+    assert(wanted("", "ans") && wanted("", "dart-dcp"));
+    /* AURA_S2R_CP_ONLY=dart-dcp asks for that DART and nothing else. */
+    assert(wanted("dart-dcp", "dart-dcp"));
+    assert(!wanted("dart-dcp", "dcp") && !wanted("dart-dcp", "dart-aop") && !wanted("dart-dcp", "dcpext0"));
+    /* A node name also hooks that node's DART. */
+    assert(wanted("aop,dcp", "dart-dcp") && wanted("aop,dcp", "dcp") && wanted("aop,dcp", "aop"));
+    assert(!wanted("aop,dcp", "dcpext0") && !wanted("aop,dcp", "dart-dcpext0") && !wanted("aop,dcp", "dc"));
+    return 0;
+}
+''')
+
+
 def test_max_probe_requires_exact_opt_in(tmp_path):
     source = (ROOT / "src/kboot_gpu.c").read_text()
     function = definition(source, "dt_set_gpu_t6031")
