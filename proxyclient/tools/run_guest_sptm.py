@@ -657,7 +657,7 @@ def configure(p, sym, plan, adt):
             val = os.environ[var].encode()
             if len(val) >= size:
                 raise SystemExit(f"{var}: at most {size - 1} bytes")
-            p.writemem(sym[symname], val + b"\0")
+            p.iface.writemem(sym[symname], val + b"\0")
             print("coprocessor trace:", var, os.environ[var])
     if os.environ.get("AURA_S2R_CP_RANGE"):
         ranges = [tuple(int(v, 0) for v in r.split(":")) for r in os.environ["AURA_S2R_CP_RANGE"].split(",")]
