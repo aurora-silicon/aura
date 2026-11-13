@@ -221,7 +221,7 @@ int main(void)
               r ? (unsigned long)r->pa : 0, r ? (unsigned long)r->val : 0);
     }
 
-    i2a(0x42, 0x37); /* the reply closes the call: its output is copied */
+    i2a(0x342, 0x37); /* the reply closes the call: its output is copied */
     CHECK(count_kind(2) == 5, "reply: %d records, want 2 head words + 3 output words", count_kind(2));
     r = find(2, 2);
     CHECK(r && r->pa == pg_pa(CALL_OFF + 0x28) && r->val == 0xa0 + 3, "output word at 0x%lx",
@@ -287,7 +287,7 @@ int main(void)
     *(u64 *)pg_pa(CALL_OFF + 8) = 0xffffffffUL;
     ap_call(DVA, 0x302);
     CHECK(count_kind(0) == 2, "huge input size: %d records, want the 2 head words", count_kind(0));
-    i2a(0x42, 0x37);
+    i2a(0x342, 0x37);
     CHECK(count_kind(2) <= 2 + 512, "huge output size: %d records", count_kind(2));
 
     /* A call with a large input (swap_submit, 0x1144 bytes): its changed words are traced. */
@@ -357,14 +357,14 @@ int main(void)
     *(u64 *)pg_pa(CALL_OFF) = (0x10UL << 32) | 0x31313131;
     *(u64 *)pg_pa(CALL_OFF + 8) = 0xc00UL;
     ap_call(DVA, 0x302);
-    i2a(0x42, 0x37);
+    i2a(0x342, 0x37);
     CHECK(count_kind(2) == 2 + 385, "3072 byte output: %d records, want 387", count_kind(2));
 
     /* A large call's answer is cut to S2R_BIG_OUT bytes: 8 words, not the 0x1000 it claims. */
     *(u64 *)pg_pa(CALL_OFF) = (0x1144UL << 32) | 0x38353441;
     *(u64 *)pg_pa(CALL_OFF + 8) = 0x1000UL;
     ap_call(DVA, 0x302);
-    i2a(0x42, 0x37);
+    i2a(0x342, 0x37);
     CHECK(count_kind(2) == 2 + 8, "large call output: %d records, want 10", count_kind(2));
 
     /* A 4168 byte callback input (D413, D552) is copied whole. */
@@ -377,6 +377,26 @@ int main(void)
     CHECK(count_kind(1) == 2 + 521, "4168 byte callback: %d records, want 523", count_kind(1));
     a2i(0x42, 0x37); /* the AP's reply: a callback output is not cut, though its input is large */
     CHECK(count_kind(3) == 2 + 385, "callback with a large input, 3072 byte output: %d records", count_kind(3));
+
+    /* The DCP answers contexts in any order (A515 in context 0, A400 in context 2: A515's reply came
+     * first on the M5). Each reply copies the output of the call in its own context. */
+    u64 xoff = 0x100, yoff = 0x10100;
+    *(u64 *)pg_pa(xoff) = 0x58585858;
+    *(u64 *)pg_pa(xoff + 8) = 0x10;
+    *(u64 *)pg_pa(yoff) = 0x59595959;
+    *(u64 *)pg_pa(yoff + 8) = 0x10;
+    ap_call(DVA, 0x202);
+    a2i((yoff << 16) | 0xa02, 0x37);
+    nrec = 0;
+    i2a(0x242, 0x37);
+    CHECK(find(2, 0) && find(2, 0)->pa == pg_pa(xoff), "first reply (context 0) must copy call X, got 0x%lx",
+          find(2, 0) ? (unsigned long)find(2, 0)->pa : 0);
+    nrec = 0;
+    i2a(0xa42, 0x37);
+    CHECK(find(2, 0) && find(2, 0)->pa == pg_pa(yoff), "second reply (context 2) must copy call Y");
+    nrec = 0;
+    i2a(0x242, 0x37);
+    CHECK(nrec == 0, "a reply with no outstanding call in its context copied %d records", nrec);
 
     printf(failures ? "FAIL: %d checks\n" : "PASS: DCP packet copier\n", failures);
     return failures != 0;
