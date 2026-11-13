@@ -45,7 +45,8 @@ struct t8122_pll_cfg {
     bool half;
 };
 
-/* Ported from Pavel Shago's public m1n1 T8122 PHY implementation (453f0161). */
+/* MIT portion, ported from Pavel Shago's public m1n1 T8122 PHY implementation
+ * (453f0161). Copyright The Asahi Linux Contributors. */
 static const struct t8122_pll_cfg t8122_pll_cfgs[] = {
     {0x06, 0x21c, 0x0000000, 0x156600, true, false},
     {0x0a, 0x1c2, 0x7fffffe, 0x155200, true, true},
