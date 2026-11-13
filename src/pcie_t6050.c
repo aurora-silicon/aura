@@ -350,8 +350,16 @@ static int storage_check(const char *tag, bool reference)
         printf("pcie-t6050: storage %s: 0x%lx 0x%08x -> 0x%08x\n", tag, storage_addr[i],
                storage_ref[i], cur[i]);
         changed++;
-        /* PS actual state and was-gated flags may move; target and auto must not */
-        if (i >= ST_PS && i < ST_SART && !((cur[i] ^ storage_ref[i]) & ~0x3f0))
+        /*
+         * PS actual state and was-gated flags may move; target and auto-enable must not. A
+         * domain under auto power management (AUTO_ENABLE, bit 28, set before and after) also
+         * moves its auto state (bits 27:24) on its own: on a J714s APCIE_SYS_ST0 went 0x1f0003ff
+         * -> 0x1000030f while the N1's link came up (storage idle, gated by the hardware).
+         */
+        u32 may_move = 0x3f0;
+        if (storage_ref[i] & cur[i] & BIT(28))
+            may_move |= 0x0f000000;
+        if (i >= ST_PS && i < ST_SART && !((cur[i] ^ storage_ref[i]) & ~may_move))
             continue;
         if (i >= ST_PS || i == ST_BOOT_STATUS || i == ST_CC)
             FAIL("storage changed %s\n", tag);

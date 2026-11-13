@@ -524,12 +524,17 @@ int payload_run(void)
 
     if (kernel && fdt) {
         /*
-         * Linux adopts a running post-M4 ANS from boot=. Any other payload starts ANS itself:
-         * power it off before kboot's pcie_init(), which brings its PCIe block and the radio's
-         * link back up, and kboot_prepare_dt() passes the SART entries on.
+         * Linux adopts a running post-M4 ANS from boot=. The U-Boot we embed adopts a running
+         * post-M4 ANS too, and can't start one from off: if an earlier stage powered ANS off
+         * (nvme.sart=), start it here and hand it on running, as for boot=. Otherwise any other
+         * payload gets ANS as this stage found it, or powered off with the SART entries passed
+         * on if this stage used it.
          */
-        nvme_keep_running_for_linux = boot_spec != NULL;
-        if (!boot_spec && !nvme_shutdown())
+        bool nvme_started = !boot_spec && nvme_post_m4_passed_off();
+        if (nvme_started && !nvme_init())
+            goto boot_failed;
+        nvme_keep_running_for_linux = boot_spec || nvme_started;
+        if (!nvme_keep_running_for_linux && !nvme_shutdown())
             goto boot_failed;
         cpufreq_init();
         if (smp_start_secondaries() && chip_id == T8140) {
@@ -593,8 +598,9 @@ int payload_run(void)
 
     boot_failed:
         next_stage.entry = NULL;
-        if (boot_spec) {
+        if (boot_spec)
             kboot_set_initrd(NULL, 0);
+        if (nvme_keep_running_for_linux) {
             nvme_keep_running_for_linux = false;
             nvme_shutdown();
         }

@@ -1,0 +1,101 @@
+name: stage1-size
+
+# Stage 1 has to end below the panel DCP's log buffer (aura-raw.ld). How close a build comes
+# depends on the compiler and on how Rust's core is built, so link every Stage 1 flavour with
+# each toolchain that ships aura and check the room left (tools/stage1_size.sh,
+# tools/stage1_room.py). A change that eats the last few KiB fails here, not in a distribution.
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  gcc:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install the aarch64-linux-gnu- toolchain and Rust target
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y gcc-aarch64-linux-gnu
+          rustup target install aarch64-unknown-none-softfloat
+      - name: Stage 1 room
+        env:
+          NM: aarch64-linux-gnu-nm
+        run: >
+          sh tools/stage1_size.sh gcc ARCH=aarch64-linux-gnu- BUILTIN_LOGO=aurora
+          EXTRA_CFLAGS='-Wstack-usage=2048 -Os'
+
+  clang-macos:
+    # As a Mac builds aura.
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install LLVM, LLD, GNU make and the Rust target
+        run: |
+          brew install llvm lld make
+          rustup target install aarch64-unknown-none-softfloat
+      - name: Stage 1 room
+        run: |
+          export MAKE=gmake NM="$(brew --prefix llvm)/bin/llvm-nm"
+          sh tools/stage1_size.sh clang-macos BUILTIN_LOGO=aurora
+
+  fedora:
+    # As fedora-aurora's aura.spec builds it: Fedora clang and Rust, core built from rust-src.
+    runs-on: ubuntu-24.04-arm
+    container: fedora:44
+    steps:
+      - name: Install Fedora's toolchain
+        run: dnf install -y --setopt=install_weak_deps=False clang llvm lld rust rust-src cargo make python3 git
+      - uses: actions/checkout@v7
+      - name: Stage 1 room
+        run: sh tools/stage1_size.sh fedora USE_CLANG=1 BUILTIN_LOGO=aurora BUILDSTD=1
+
+  alarm:
+    # As alarm-aurora's PKGBUILD builds it: Arch Linux ARM clang, rustup's prebuilt core.
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v7
+      - name: Arch Linux ARM root filesystem
+        run: |
+          curl -fsSL -o alarm.tar.gz http://os.archlinuxarm.org/os/ArchLinuxARM-aarch64-latest.tar.gz
+          docker import alarm.tar.gz alarm-build
+      - name: Stage 1 room
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src alarm-build /bin/bash -euc '
+            # No Landlock or alpm user switch inside the container.
+            sed -i -e "s/^CheckSpace/#CheckSpace/" -e "/^\[options\]/a DisableSandbox" /etc/pacman.conf
+            pacman-key --init >/dev/null
+            pacman-key --populate archlinuxarm >/dev/null
+            pacman -Syu --noconfirm --needed clang lld llvm rustup make python >/dev/null
+            # The toolchain alarm-aurora packages/aura/PKGBUILD pins.
+            rustup toolchain install 1.99.0 --profile minimal --target aarch64-unknown-none-softfloat >/dev/null
+            export RUSTUP_TOOLCHAIN=1.99.0
+            clang --version | head -1
+            sh tools/stage1_size.sh alarm USE_CLANG=1 BUILTIN_LOGO=aurora'
+
+  nix:
+    # nixos-aurora's aura package (nixpkgs clang and Rust), built from this tree.
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v7
+      - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31
+      - name: Stage 1 room
+        run: |
+          nix build --impure -L --out-link stage1-size --expr '
+            let
+              flake = builtins.getFlake "github:aurora-silicon/nixos-aurora";
+              aura = flake.packages.aarch64-linux.aura;
+            in aura.overrideAttrs (old: {
+              src = builtins.path { path = ./.; name = "source"; filter = p: t: p != toString ./.git && p != toString ./build; };
+              buildPhase = "runHook preBuild; s=0; sh tools/stage1_size.sh nix $makeFlags > stage1-size.txt || s=1; cat stage1-size.txt; [ $s = 0 ]; runHook postBuild";
+              postBuild = "";
+              installPhase = "mkdir -p $out; cp stage1-size.txt stage1-size-*.log $out/";
+              dontFixup = true;
+            })'

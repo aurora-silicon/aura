@@ -23,9 +23,11 @@ For a Mach-O object, check it while still in macOS. It must report `kcbz : 0`:
 kmutil inspect -z -B "$PWD/aura-boot.macho" --show-mach-boot-properties
 ```
 
-This script doesn't pad an object. On T8140 and later an OS only starts from a
-padded object, which aurora-installer makes (see
-[Running the OS](macho-boot-object.md#running-the-os)). An unpadded object suits a
+This script doesn't pad an object. On M4-generation chips and later (T8132,
+T6040 and up) an OS only starts from a padded object, which aurora-installer
+makes, as does `tools/macho_boot_object.py --execute-window` (see
+[Running the OS](macho-boot-object.md#running-the-os)). Enroll a padded object
+with `--compress`. An unpadded object suits a
 proxy-only Stage 1 there, and M1 to M3.
 
 ## In Recovery

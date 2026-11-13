@@ -1,9 +1,14 @@
 # J873g RAM-only Linux boot
 
-The T8152/J873g minimal handoff supports the 26A428 firmware profile
-`G18G-RTKit-3514.0.15.release`. It validates both GPU firmware TEXT images and
-the boot-local memory layout before enabling their mailboxes. Other firmware
-profiles are refused. This is a bring-up path, not a general desktop installer.
+The T8152/J873g minimal handoff supports two GPU firmware builds: 26A428
+(macOS 27.0 and 27.0.1, `G18G-RTKit-3514.0.15.release`) and 26B123 (macOS 27.2,
+`G18G-RTKit-3514.41.1.release`). The stub's macOS decides which one iBoot
+loads; the iop nub uuids in the ADT select the matching pinned identities. It
+validates both GPU firmware TEXT images and the boot-local memory layout before
+enabling their mailboxes and publishes that build's receipt. Other firmware is
+refused. The 26B123 receipt needs a Linux driver that builds the 26B123 InitData
+graph. `tools/g18g_firmware_identity.py` prints the identities of a further
+build. This is a bring-up path, not a general desktop installer.
 
 Build Aura with `make RELEASE=1 CHAINLOADING=1 ESP_STAGE2=1 BUILDSTD=1` (GNU make;
 use `gmake` on macOS). Keep `build/aura.bin` and `build/aura-raw.elf` together.

@@ -1476,6 +1476,45 @@ bool dart_shutdown_checked(dart_dev_t *dart)
     return true;
 }
 
+/*
+ * The tables a DART aura set up may still walk when its shutdown failed:
+ * every heap root and every heap L2 table its roots point to. Locked and
+ * kept DARTs have none of aura's; their tables are reserved elsewhere.
+ */
+int dart_collect_tables(dart_dev_t *dart, u64 *pages, size_t capacity, size_t *count)
+{
+    size_t used = 0;
+
+    if (!count)
+        return -1;
+    *count = 0;
+    if (!dart || !pages)
+        return -1;
+    if (dart->locked || dart->keep)
+        return 0;
+    for (int ttbr = 0; ttbr < dart->params->ttbr_count; ++ttbr) {
+        if (!is_heap(dart->l1[ttbr]))
+            continue;
+        if (used == capacity)
+            return -1;
+        pages[used++] = (u64)dart->l1[ttbr];
+        for (int i = 0; i < SZ_16K / 8; ++i) {
+            u64 entry = dart->l1[ttbr][i];
+            if (!(entry & DART_PTE_VALID))
+                continue;
+            void *l2 =
+                (void *)(FIELD_GET(dart->params->offset_mask, entry) << DART_PTE_OFFSET_SHIFT);
+            if (!is_heap(l2))
+                continue;
+            if (used == capacity)
+                return -1;
+            pages[used++] = (u64)l2;
+        }
+    }
+    *count = used;
+    return 0;
+}
+
 void dart_shutdown(dart_dev_t *dart)
 {
     (void)dart_shutdown_checked(dart);

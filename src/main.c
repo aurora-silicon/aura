@@ -10,6 +10,7 @@
 #include "boot_options.h"
 #include "chainload.h"
 #include "cpufreq.h"
+#include "debugport.h"
 #include "display.h"
 #include "dockchannel_uart.h"
 #include "exception.h"
@@ -18,6 +19,7 @@
 #include "gxf.h"
 #include "heapblock.h"
 #include "j873.h"
+#include "kboot.h"
 #include "mcc.h"
 #include "memory.h"
 #include "nvme.h"
@@ -317,6 +319,16 @@ void run_actions(void)
     uartproxy_run(NULL);
 }
 
+/*
+ * Late, on the way out: loading a payload covers the port controllers' settle time. The check
+ * leaves every port controller asleep, so wake the USB hosts' ones again, as j873_usb_prep() did.
+ */
+static void j873g_debugport_check(void)
+{
+    debugport_check();
+    j873_usb_wake_hpms();
+}
+
 static void j873g_run_proxy(void)
 {
     u32 model_len = 0, target_len = 0;
@@ -335,6 +347,8 @@ static void j873g_run_proxy(void)
     wdt_disable();
     if (smp_init() < 0)
         panic("Unsupported T8152 CPU topology\n");
+    /* Its SPMI port controllers need time in S0 before j873g_debugport_check() reads them. */
+    debugport_powerup();
     /* The DCPEXT0/DPTX_PHY power gates are PMGR2 devices; without this the
      * HDMI phy stays gated and the first register access aborts. */
     pmgr_init();
@@ -352,16 +366,31 @@ static void j873g_run_proxy(void)
     printf("Initialization complete.\n");
 
     /* An appended payload (or boot= from storage) boots directly. */
-    if (!aura_proxy_enabled()) {
+#ifdef SECBOOT_SECURE_FLAVOUR
+    /* The secure flavour has no proxy (secboot_host_proxy_allowed()): always boot the payload. */
+    const bool check_payloads = true;
+#else
+    const bool check_payloads = !aura_proxy_enabled();
+#endif
+    if (check_payloads) {
         printf("Checking for payloads...\n");
         if (payload_run() == 0) {
             printf("Valid payload found\n");
+            j873g_debugport_check();
             return;
         }
         printf("No valid payload found\n");
     }
+#ifdef SECBOOT_SECURE_FLAVOUR
+    printf("\nSecure boot: no verified next stage could be started, and this build gives\n"
+           "  no USB host a proxy. Rebooting in 10 s.\n");
+    mdelay(10000);
+    flush_and_reboot();
+#else
+    j873g_debugport_check();
     printf("Running proxy...\n");
     uartproxy_run(NULL);
+#endif
 }
 
 void aura_main(void)
@@ -460,6 +489,12 @@ next_stage:
 #ifndef BRINGUP
     if (chip_id != T8152) {
         usb_iodev_shutdown();
+        /*
+         * A controller that could not be stopped keeps its buffers: boot on with
+         * them reserved, so the kernel never hands out memory it may still write.
+         */
+        if (kboot_reserve_usb_dma())
+            printf("USB: retained DMA not fully reserved; booting on\n");
         /* Its firmware may still use memory the next stage will reuse. */
         if (display_shutdown(DCP_SLEEP_IF_EXTERNAL) < 0) {
             printf("Display handoff failed; returning to proxy\n");
