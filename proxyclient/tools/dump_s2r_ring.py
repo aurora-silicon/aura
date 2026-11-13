@@ -122,7 +122,7 @@ def main():
         n = min(per, have - done)
         i0 = (first + done) % nrec
         n = min(n, nrec - i0)  # one contiguous run; the ring wraps at nrec
-        data = p.readmem(ring + i0 * REC.size, n * REC.size)
+        data = iface.readmem(ring + i0 * REC.size, n * REC.size)
         for k in range(n):
             rec = data[k * REC.size:(k + 1) * REC.size]
             if t0 is None:
