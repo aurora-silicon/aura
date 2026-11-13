@@ -26,19 +26,24 @@
 #define S2R_DCP_PAGES (S2R_DCP_RPC / 0x4000 + 1)
 #define S2R_DCP_EP    0x37
 #define S2R_PKT_TAG   0x544b5043UL /* "CPKT" */
-#define S2R_PKT_MAX   128
+#define S2R_PKT_MAX   128 /* raw bytes of a large call, which is traced by its changed words */
+#define S2R_IN_MAX    512 /* raw bytes of any other call or callback input */
+#define S2R_OUT_MAX   4096 /* raw bytes of an output (a data property answer is up to 3072) */
 #define S2R_DCP_OPEN  4
 #define S2R_DCP_SIDS  64
 /*
- * An AP call with an input this large (swap_submit: 0x1144 bytes) is traced as the words that
- * changed since that DCP's last such call, from the first word past the raw copy: kind 4 is one
- * record per call (word 0: head, val = input size << 32), kind 5 a changed word (word = its index
- * from the packet start, the input starts at byte 12), kind 6 a word that changed more than
- * S2R_BIG_CHURN times and is not recorded again. A brightness field shows as a word that changes
- * only when the brightness moves.
+ * An AP call with an input this large (swap_submit: 0x1144 bytes; color tables) is traced as the
+ * words that changed since the last call of the same tag on that DCP, from the first word past the
+ * raw copy. Kind 4 is one record per call (word: its slot, 15 when the DCP has no slot left;
+ * val = input size << 32 | the tag), kind 5 a changed word (word = slot << 12 | its index from the
+ * packet start; the input starts at byte 12), kind 6 a word that changed more than S2R_BIG_CHURN
+ * times and is not recorded again. A brightness field shows as a word that changes only when the
+ * brightness moves; the first call of a tag records every word that is not zero.
  */
-#define S2R_BIG_MIN   0x1000UL
-#define S2R_BIG_WORDS 640
+#define S2R_BIG_MIN   0x200UL
+#define S2R_BIG_WORDS 1536
+#define S2R_BIG_SLOTS 6
+#define S2R_BIG_NOSLOT 15
 #define S2R_BIG_FROM  ALIGN_UP(12 + S2R_PKT_MAX, 8)
 #define S2R_BIG_CHURN 200
 
@@ -55,9 +60,11 @@ static struct s2r_dcp {
     u8 busy; /* one core at a time; a contended access is not followed */
 } s2r_dcp[S2R_DCP_N];
 static struct s2r_big {
+    u32 tag;
     u64 prev[S2R_BIG_WORDS]; /* the last value seen; 0 before the first call */
     u8 churn[S2R_BIG_WORDS];
-} s2r_big[S2R_DCP_N];
+} s2r_big[S2R_DCP_N][S2R_BIG_SLOTS];
+static u8 s2r_nbig[S2R_DCP_N];
 static int s2r_n_dcp;
 u32 sptm_virt_s2r_dcp_pkt; /* host: copy the DCPs' IOMFB packets into the ring */
 
@@ -130,12 +137,26 @@ static void s2r_pkt_rec(int idx, int kind, int word, u64 pa, u64 v, bool a2i)
         pa, v, S2R_PKT_TAG | ((u64)idx << 32) | ((u64)kind << 36) | ((u64)word << 40), a2i);
 }
 
-static void s2r_dcp_big(int idx, struct s2r_dcp *d, u64 off, u64 in, u64 pa0, bool a2i)
+static int s2r_big_slot(int idx, u32 tag)
 {
-    struct s2r_big *b = &s2r_big[idx];
-    u64 end = min(off + 12 + in, off + S2R_BIG_WORDS * 8UL);
+    for (int s = 0; s < s2r_nbig[idx]; s++)
+        if (s2r_big[idx][s].tag == tag)
+            return s;
+    if (s2r_nbig[idx] == S2R_BIG_SLOTS)
+        return -1;
+    s2r_big[idx][s2r_nbig[idx]].tag = tag;
+    return s2r_nbig[idx]++;
+}
 
-    s2r_pkt_rec(idx, 4, 0, pa0, in << 32, a2i);
+static void s2r_dcp_big(int idx, struct s2r_dcp *d, u64 off, u64 h0, u64 pa0, bool a2i)
+{
+    u64 in = h0 >> 32, end = min(off + 12 + in, off + S2R_BIG_WORDS * 8UL);
+    int slot = s2r_big_slot(idx, (u32)h0);
+
+    s2r_pkt_rec(idx, 4, slot < 0 ? S2R_BIG_NOSLOT : slot, pa0, in << 32 | (u32)h0, a2i);
+    if (slot < 0)
+        return;
+    struct s2r_big *b = &s2r_big[idx][slot];
     for (u64 o = off + S2R_BIG_FROM; o < end && o + 8 <= S2R_DCP_RPC; o += 8) {
         u64 v, w = (o - off) / 8, pa = s2r_dcp_pa(d, o);
         if (!pa || !sptm_virt_peek64(pa, &v))
@@ -145,9 +166,9 @@ static void s2r_dcp_big(int idx, struct s2r_dcp *d, u64 off, u64 in, u64 pa0, bo
         b->prev[w] = v;
         if (b->churn[w] >= S2R_BIG_CHURN)
             continue;
-        s2r_pkt_rec(idx, 5, w, pa, v, a2i);
+        s2r_pkt_rec(idx, 5, slot << 12 | w, pa, v, a2i);
         if (++b->churn[w] == S2R_BIG_CHURN)
-            s2r_pkt_rec(idx, 6, w, pa, S2R_BIG_CHURN, a2i);
+            s2r_pkt_rec(idx, 6, slot << 12 | w, pa, S2R_BIG_CHURN, a2i);
     }
 }
 
@@ -160,10 +181,12 @@ static void s2r_dcp_copy(int idx, struct s2r_dcp *d, u64 off, int kind, bool a2i
     s2r_pkt_rec(idx, kind, 0, pa0, h0, a2i);
     s2r_pkt_rec(idx, kind, 1, pa1, h1, a2i);
     u64 in = h0 >> 32, out = h1 & 0xffffffff;
-    if (kind == 0 && in >= S2R_BIG_MIN)
-        s2r_dcp_big(idx, d, off, in, pa0, a2i);
+    bool big = kind == 0 && in >= S2R_BIG_MIN;
+    if (big)
+        s2r_dcp_big(idx, d, off, h0, pa0, a2i);
     u64 from = kind < 2 ? off + 16 : ALIGN_DOWN(off + 12 + min(in, (u64)S2R_DCP_RPC), 8);
-    u64 to = kind < 2 ? off + 12 + min(in, (u64)S2R_PKT_MAX) : from + min(out + 8, 64UL);
+    u64 to = kind < 2 ? off + 12 + min(in, big ? (u64)S2R_PKT_MAX : (u64)S2R_IN_MAX)
+                      : from + min(out + 8, (u64)S2R_OUT_MAX);
     for (u64 o = from, w = 2; o < to && o + 8 <= S2R_DCP_RPC; o += 8, w++) {
         u64 v, pa = s2r_dcp_pa(d, o);
         if (!pa || !sptm_virt_peek64(pa, &v))
