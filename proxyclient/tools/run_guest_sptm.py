@@ -30,6 +30,8 @@ Environment (all optional; 1 enables a switch):
   AURA_S2R_CP_ANSX=<mask>  T6050 COPROC: also hook 1 the ANS SART, 2 the NVMe BAR page, 4 AUS5
   AURA_S2R_CP_ONLY=<a,b>   T6050 COPROC: hook only these /arm-io nodes (aop,smc; a name also
                            covers its dart-<name>); the default hooks every coprocessor
+  AURA_S2R_CP_NODES=<a,b>  T6050 COPROC: also hook every reg window (up to 1 MiB) of these /arm-io
+                           nodes, such as atc-phy0,acio0; "name:N" hooks only reg N, any size
   AURA_S2R_CP_RANGE=<b:s>  T6050 COPROC: also hook up to 4 comma-separated base:size ranges, such as
                            the AOP's SRAM (aligned out to 16 KiB pages)
   AURA_S2R_DROP_USB        tear down aura's USB gadget at the sleep commit
@@ -127,6 +129,7 @@ KNOWN_ENV = {
     "AURA_S2R_CP_NO_ANS",
     "AURA_S2R_CP_ANSX",
     "AURA_S2R_CP_ONLY",
+    "AURA_S2R_CP_NODES",
     "AURA_S2R_CP_RANGE",
     "AURA_S2R_DCP_PKT",
     "AURA_S2R_USB_RETAKE",
@@ -648,12 +651,14 @@ def configure(p, sym, plan, adt):
     if os.environ.get("AURA_S2R_CP_ANSX"):
         p.write32(sym["sptm_virt_s2r_cp_ansx"], env_int("AURA_S2R_CP_ANSX"))
         print("coprocessor trace: ANS storage-side pages, mask", os.environ["AURA_S2R_CP_ANSX"])
-    if os.environ.get("AURA_S2R_CP_ONLY"):
-        only = os.environ["AURA_S2R_CP_ONLY"].encode()
-        if len(only) >= 96:
-            raise SystemExit("AURA_S2R_CP_ONLY: at most 95 bytes")
-        p.writemem(sym["sptm_virt_s2r_cp_only"], only + b"\0")
-        print("coprocessor trace: only", os.environ["AURA_S2R_CP_ONLY"])
+    for var, symname, size in (("AURA_S2R_CP_ONLY", "sptm_virt_s2r_cp_only", 256),
+                               ("AURA_S2R_CP_NODES", "sptm_virt_s2r_cp_nodes", 512)):
+        if os.environ.get(var):
+            val = os.environ[var].encode()
+            if len(val) >= size:
+                raise SystemExit(f"{var}: at most {size - 1} bytes")
+            p.writemem(sym[symname], val + b"\0")
+            print("coprocessor trace:", var, os.environ[var])
     if os.environ.get("AURA_S2R_CP_RANGE"):
         ranges = [tuple(int(v, 0) for v in r.split(":")) for r in os.environ["AURA_S2R_CP_RANGE"].split(",")]
         if len(ranges) > 4:

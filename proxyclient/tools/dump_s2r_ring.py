@@ -11,8 +11,11 @@ build/ holds the matching aura-raw.elf:
         [--val 0x28de94100] [--cpu 0] [--t0 TICKS]
 
 Time is printed as raw CNTPCT ticks and as seconds from --t0 (default: the first record).
+Every record is tagged with the ADT node and reg index that own its page, as <node[reg]+offset>
+(the narrowest window when several overlap), and a per-node count follows the records.
 """
 import argparse
+import collections
 import pathlib
 import struct
 import sys
@@ -38,12 +41,22 @@ def val_matches(val, wanted):
     return any(val in (w, w >> 12, w & 0xFFFFFFFF) for w in wanted)
 
 
-def fmt(i, rec, t0, freq):
+def owner(lookup, pa):
+    """(<node[reg]+offset>, node[reg]) of the narrowest ADT window holding pa."""
+    hits = lookup.lookup_all(pa) if lookup else []
+    if not hits:
+        return "<unmapped>", "unmapped"
+    name, zone = min(hits, key=lambda h: h[1].stop - h[1].start)
+    return f"<{name}+0x{pa - zone.start:x}>", name
+
+
+def fmt(i, rec, t0, freq, lookup=None):
     t, pa, bits, write, cpu, marker, val, pc = decode(rec)
     secs = (t - t0) / freq
     if marker:
         return f"S2R {i} t={t:x} +{secs:.6f}s c{cpu} MARK {pc.to_bytes(8, 'little').rstrip(bytes(1)).decode('latin1')} 0x{val:x}"
-    return f"S2R {i} t={t:x} +{secs:.6f}s c{cpu} {'W' if write else 'R'}{bits} 0x{pa:x} = 0x{val:x} pc=0x{pc:x}"
+    tag = owner(lookup, pa)[0] if lookup else ""
+    return f"S2R {i} t={t:x} +{secs:.6f}s c{cpu} {'W' if write else 'R'}{bits} 0x{pa:x} {tag} = 0x{val:x} pc=0x{pc:x}"
 
 
 def keep(rec, args):
@@ -74,17 +87,19 @@ def main():
     ap.add_argument("--cpu", type=int)
     ap.add_argument("--t0", type=lambda v: int(v, 0), help="CNTPCT ticks for +0 s (default: first record)")
     ap.add_argument("--freq", type=int, default=24_000_000, help="CNTFRQ_EL0 (default 24 MHz)")
+    ap.add_argument("--no-names", action="store_true", help="skip the ADT node lookup")
     ap.add_argument("--last", type=int, help="only the last N records in the ring")
     args = ap.parse_args()
 
     from run_guest_sptm import Symbols
     from aura.proxy import AuraProxy, UartInterface
-    from aura.proxyutils import bootstrap_port
+    from aura.proxyutils import ProxyUtils, bootstrap_port
 
     iface = UartInterface()
     p = AuraProxy(iface, debug=False)
     bootstrap_port(iface, p)
     sym = Symbols(args.nm, args.elf, p.get_base())
+    lookup = None if args.no_names else ProxyUtils(p).adt.build_addr_lookup()
 
     ring = p.read64(sym["sptm_virt_s2r_ring"])
     nrec = p.read64(sym["sptm_virt_s2r_nrec"])
@@ -102,6 +117,7 @@ def main():
     t0, freq = args.t0, args.freq
     per = CHUNK // REC.size
     done = 0
+    per_node = collections.Counter()
     while done < have:
         n = min(per, have - done)
         i0 = (first + done) % nrec
@@ -112,8 +128,12 @@ def main():
             if t0 is None:
                 t0 = decode(rec)[0]
             if keep(rec, args):
-                print(fmt(first + done + k, rec, t0, freq), file=out)
+                print(fmt(first + done + k, rec, t0, freq, lookup), file=out)
+                if lookup and not decode(rec)[5]:
+                    per_node[owner(lookup, decode(rec)[1])[1]] += 1
         done += n
+    for name, count in per_node.most_common():
+        print(f"NODE {name} {count}", file=out)
     if args.out:
         out.close()
         print(f"wrote {args.out}", file=sys.stderr)

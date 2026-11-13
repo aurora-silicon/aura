@@ -115,7 +115,10 @@ static u64 s2r_nvme_quiet_page, s2r_nvme_quiet_n;
 
 /* From the host (AURA_S2R_CP_ONLY): a comma list of /arm-io node names for the T6050 COPROC trace
  * to hook; empty hooks every coprocessor. A name also matches that node's "dart-" form. */
-char sptm_virt_s2r_cp_only[96];
+char sptm_virt_s2r_cp_only[256];
+/* From the host (AURA_S2R_CP_NODES): a comma list of /arm-io nodes whose every reg window (up to
+ * 1 MiB) is hooked, such as the ATC PHYs and ACIOs; "name:N" hooks only reg N, whatever its size. */
+char sptm_virt_s2r_cp_nodes[512];
 /* From the host (AURA_S2R_CP_RANGE): up to 4 { base, size } of extra pages to hook, such as the
  * AOP's SRAM. */
 u64 sptm_virt_s2r_cp_range[8];
@@ -952,7 +955,7 @@ static void s2r_hook_full(void)
  * endpoints; an ESM word at or above 0x800 keeps bits 63:48 and 7:0.
  */
 #define S2R_CP_PAGES_MAX 2048
-#define S2R_CP_NAMES     192
+#define S2R_CP_NAMES     384
 #define S2R_SEP_EP_CTRL  0x00
 #define S2R_SEP_EP_BOOT  0xff
 
@@ -1105,6 +1108,49 @@ static void s2r_cp_reg_page(const char *name, int idx, const char *what)
         s2r_cp_range(s2r_cp_name(name, what), ALIGN_DOWN(pa, 0x4000), 0x4000);
 }
 
+/* AURA_S2R_CP_NODES: every reg window of each listed /arm-io node, or only reg N for "name:N". */
+static void s2r_cp_nodes(void)
+{
+    const char *l = sptm_virt_s2r_cp_nodes;
+
+    while (*l) {
+        char name[40], path[64], what[8];
+        const char *e = l;
+        int p[8], only = -1;
+
+        while (*e && *e != ',')
+            e++;
+        size_t n = min((size_t)(e - l), sizeof(name) - 1);
+        memcpy(name, l, n);
+        name[n] = 0;
+        l = *e ? e + 1 : e;
+        char *c = strchr(name, ':');
+        if (c) {
+            *c = 0;
+            for (only = 0, c++; *c >= '0' && *c <= '9'; c++)
+                only = only * 10 + *c - '0';
+        }
+        snprintf(path, sizeof(path), "/arm-io/%s", name);
+        if (adt_path_offset_trace(adt, path, p) < 0) {
+            printf("SPTM-virt[s2r]: cp-nodes: no %s\n", path);
+            continue;
+        }
+        for (int r = 0; r < 32; r++) {
+            u64 pa, sz;
+            if (adt_get_reg(adt, p, "reg", r, &pa, &sz) < 0)
+                break;
+            if (only >= 0 ? r != only : sz > 0x100000) {
+                if (only < 0)
+                    printf("SPTM-virt[s2r]: cp-nodes: %s reg%d 0x%lx + 0x%lx too big\n", name, r, pa, sz);
+                continue;
+            }
+            snprintf(what, sizeof(what), "r%d", r);
+            u64 base = ALIGN_DOWN(pa, 0x4000);
+            s2r_cp_range(s2r_cp_name(name, what), base, ALIGN_UP(pa + sz, 0x4000) - base);
+        }
+    }
+}
+
 static bool s2r_cp_compat(int node, const char *prefix)
 {
     u32 len;
@@ -1179,6 +1225,7 @@ static void s2r_t6050_coproc(bool mem)
             if (s2r_cp_wanted(darts[i]))
                 s2r_cp_reg(darts[i], 0, "regs", 0, 0);
     }
+    s2r_cp_nodes();
     for (unsigned i = 0; i < ARRAY_SIZE(sptm_virt_s2r_cp_range); i += 2) {
         u64 base = ALIGN_DOWN(sptm_virt_s2r_cp_range[i], 0x4000);
         u64 end = ALIGN_UP(sptm_virt_s2r_cp_range[i] + sptm_virt_s2r_cp_range[i + 1], 0x4000);
