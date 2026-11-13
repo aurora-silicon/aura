@@ -82,6 +82,23 @@ extern u64 relocated_from;
 int dt_set_gpu(void *dt);
 int dt_set_display_handoff(void *dt);
 
+/*
+ * J773g (Mac mini, M4): the J773g admissions in this tree were checked against one ADT, that
+ * of 26.6.2 (target J773gAP, board-id 0x2a, iBoot mBoot-18000.161.10). Admit them only when
+ * the live machine, its firmware and the OS tree all say J773g.
+ */
+bool kboot_is_j773g_machine(void)
+{
+    return chip_id == T8132 && board_id == 0x2a && adt_is_compatible(adt, 0, "J773gAP") &&
+           os_firmware.version == V26_6_2;
+}
+
+bool kboot_is_j773g(const void *fdt)
+{
+    return fdt && kboot_is_j773g_machine() && !fdt_node_check_compatible(fdt, 0, "apple,j773g") &&
+           !fdt_node_check_compatible(fdt, 0, "apple,t8132");
+}
+
 u64 kboot_ram_base(void)
 {
     return cur_boot_args.phys_base;
