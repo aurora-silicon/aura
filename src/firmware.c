@@ -217,6 +217,10 @@ const struct fw_version_info fw_versions[NUM_FW_VERSIONS] = {
     [V27_0]      = {V27_0,      "27.0",        {27, 0, 0},     3, "mBoot-20457.1.29"},
     // macOS 27.2 (26B123), read from a J813 stub booted by it (system and OS iBoot alike).
     [V27_2]      = {V27_2,      "27.2",        {27, 2, 0},     3, "mBoot-20457.41.3"},
+    // macOS 27.3 beta (26C5035r), read from a K114c (M5 Max): system and OS iBoot alike. The numbers
+    // follow the beta rows above (N.M beta = {N, M-1, 98, k}, as 26.3 beta = {26, 2, 98, 1}); the
+    // beta index k = 1 is assumed, the iBoot string does not say which beta it is.
+    [V27_3B]     = {V27_3B,     "27.3 beta",   {27, 2, 98, 1}, 4, "mBoot-20457.60.65.0.1"},
     // clang-format on
 };
 
