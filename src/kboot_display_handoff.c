@@ -2955,6 +2955,9 @@ static const struct t6041_ext t6041_exts[] = {
      */
     {"dcpext2", "/dcp@606e00000", "/arm-io/dcpext2", "/arm-io/dcpext2/iop-dcpext2-nub",
      "/arm-io/dart-dcpext2", 0x606e00000UL, 0x606340000UL},
+    /* J614c/J616c: dcpext3, a third USB-C processor (linux t6041-j616c-usbc-dcpext3.dtsi). */
+    {"dcpext3", "/dcp@306e00000", "/arm-io/dcpext3", "/arm-io/dcpext3/iop-dcpext3-nub",
+     "/arm-io/dart-dcpext3", 0x306e00000UL, 0x306340000UL},
 };
 
 /*
