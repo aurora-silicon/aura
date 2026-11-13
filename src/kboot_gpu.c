@@ -4175,6 +4175,13 @@ static T6050_GPU_INIT int dt_set_gpu_t6050(void *dt)
     }
     printf("FDT: GPU: T6050 G17S %s enabled, fw-text at %#lx\n", t6050_gpu.build[step - 2].name,
            r[8]);
+    /*
+     * The driver tries the build of the reported release first. Without the hint it walks its
+     * table in order and logs each earlier build as not admitted before it finds this one.
+     */
+    int gpu = kboot_fdt_path_exact(dt, "gpu");
+    if (gpu < 0 || firmware_set_fdt(dt, gpu, "apple,firmware-version", &os_firmware))
+        printf("FDT: GPU: T6050: no apple,firmware-version for the driver\n");
     if (t6050_gpu_leakage(dt))
         printf("FDT: GPU: no leakage calibration words; the driver's generic configuration\n");
     return 0;
