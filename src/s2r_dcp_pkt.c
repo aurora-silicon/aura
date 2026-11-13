@@ -58,6 +58,7 @@ static struct s2r_dcp {
     u64 m0[2];    /* message word 0 of a pair not yet complete: 0 A2I, 1 I2A */
     bool have_m0[2];
     u64 open[2][S2R_DCP_OPEN]; /* outstanding packets per direction, for their replies */
+    u8 octx[2][S2R_DCP_OPEN];  /* the context of each, see s2r_dcp_ctx() */
     int nopen[2];
     u8 busy; /* one core at a time; a contended access is not followed */
 } s2r_dcp[S2R_DCP_N];
@@ -202,6 +203,12 @@ static void s2r_dcp_copy(int idx, struct s2r_dcp *d, u64 off, int kind, bool a2i
     }
 }
 
+/* The context a packet travels in: the slot bits and the 0x100 bit of its control word. A reply keeps them. */
+static u8 s2r_dcp_ctx(u16 ctl)
+{
+    return ((ctl >> 10) & 3) | ((ctl >> 6) & 4);
+}
+
 static void s2r_dcp_msg(int idx, u64 m0, u64 m1, int dir)
 {
     struct s2r_dcp *d = &s2r_dcp[idx];
@@ -224,10 +231,24 @@ static void s2r_dcp_msg(int idx, u64 m0, u64 m1, int dir)
     if (d->resolved < 0)
         return;
     if (ctl & 0x40) {
-        /* A reply closes the newest outstanding packet of the other side. */
-        int o = !dir;
-        if (d->nopen[o] > 0 && d->nopen[o] <= S2R_DCP_OPEN)
-            s2r_dcp_copy(idx, d, d->open[o][--d->nopen[o]], 2 + o, dir == 0);
+        /*
+         * A reply names the context of its call, not the call: the DCP answers contexts in any order
+         * (A515 in context 0, A400 in context 2: the reply of A515 came first). It closes the newest
+         * outstanding packet of the other side in that context.
+         */
+        int o = !dir, n = d->nopen[o];
+        if (n < 1 || n > S2R_DCP_OPEN)
+            return;
+        for (int i = n - 1; i >= 0; i--) {
+            if (d->octx[o][i] != s2r_dcp_ctx(ctl))
+                continue;
+            u64 off = d->open[o][i];
+            memmove(&d->open[o][i], &d->open[o][i + 1], (n - 1 - i) * sizeof(d->open[o][0]));
+            memmove(&d->octx[o][i], &d->octx[o][i + 1], n - 1 - i);
+            d->nopen[o]--;
+            s2r_dcp_copy(idx, d, off, 2 + o, dir == 0);
+            return;
+        }
         return;
     }
     u64 off = (dir == 0 ? ((ctl & 0x100) ? 0x20000 : 0) : ((ctl & 0x100) ? 0x40000 : 0x60000)) +
@@ -235,8 +256,10 @@ static void s2r_dcp_msg(int idx, u64 m0, u64 m1, int dir)
     if (off >= S2R_DCP_RPC)
         return;
     s2r_dcp_copy(idx, d, off, dir, dir == 0);
-    if (d->nopen[dir] >= 0 && d->nopen[dir] < S2R_DCP_OPEN)
+    if (d->nopen[dir] >= 0 && d->nopen[dir] < S2R_DCP_OPEN) {
+        d->octx[dir][d->nopen[dir]] = s2r_dcp_ctx(ctl);
         d->open[dir][d->nopen[dir]++] = off;
+    }
 }
 
 static void s2r_dcp_watch_one(int i, u64 off, const u64 *val, int width);
