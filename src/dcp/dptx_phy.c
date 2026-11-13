@@ -19,6 +19,7 @@
 enum dptx_type {
     DPTX_PHY_T8112,
     DPTX_PHY_T602X,
+    DPTX_PHY_T8122,
     DPTX_PHY_T8152_ATC,
     DPTX_PHY_T8152_HDMI,
 };
@@ -28,9 +29,222 @@ typedef struct dptx_phy {
     enum dptx_type type;
     u32 dcp_index;
     u32 active_lanes;
+    u32 dfp_endpoint;
+    u32 link_rate;
+    bool active;
     const char *path;
     atc_phy_t *atc;
 } dptx_phy_t;
+
+struct t8122_pll_cfg {
+    u32 code;
+    u32 f20b0;
+    u32 f20b4;
+    u32 f20b8;
+    bool bypass;
+    bool half;
+};
+
+static const struct t8122_pll_cfg t8122_pll_cfgs[] = {
+    {0x06, 0x21c, 0x0000000, 0x156600, true, false},
+    {0x0a, 0x1c2, 0x7fffffe, 0x155200, true, true},
+    {0x14, 0x1c2, 0x7fffffe, 0x554800, true, true},
+    {0x1e, 0x2a3, 0xbff7ffc, 0x564800, false, true},
+};
+
+static void t8122_field(dptx_phy_t *phy, u32 off, u32 field, u32 val)
+{
+    mask32(phy->regs[0] + off, field, FIELD_PREP(field, val));
+}
+
+static void t8122_bit(dptx_phy_t *phy, u32 off, u32 bit, bool val)
+{
+    mask32(phy->regs[0] + off, BIT(bit), val ? BIT(bit) : 0);
+}
+
+static void t8122_enable_device_power(dptx_phy_t *phy)
+{
+    static const u32 steps[][2] = {{0x10, 0x20}, {0x100, 0x200}, {0x1, 0x2}};
+
+    mask32(phy->regs[1] + 0x10, GENMASK(3, 0), FIELD_PREP(GENMASK(3, 0), phy->dcp_index));
+    for (size_t i = 0; i < ARRAY_SIZE(steps); i++) {
+        set32(phy->regs[1] + 0x48, steps[i][0]);
+        udelay(1);
+        set32(phy->regs[1] + 0x48, steps[i][1]);
+        udelay(1);
+        clear32(phy->regs[1] + 0x48, steps[i][1] << 1);
+        udelay(1);
+    }
+}
+
+static void t8122_impedance_calibration(dptx_phy_t *phy)
+{
+    t8122_bit(phy, 0x4224, 0, false);
+    mdelay(1);
+    t8122_bit(phy, 0x4224, 0, true);
+    udelay(1);
+    t8122_field(phy, 0x4200, GENMASK(9, 4), 0x3c);
+    udelay(1);
+    t8122_bit(phy, 0x4200, 0, true);
+    udelay(125);
+    u32 status = read32(phy->regs[0] + 0x4204);
+    udelay(10);
+    t8122_bit(phy, 0x4200, 0, false);
+
+    u32 code = FIELD_GET(GENMASK(24, 18), read32(phy->regs[0] + 0x4210));
+    t8122_field(phy, 0x4228, GENMASK(22, 16), code);
+    t8122_bit(phy, 0x4228, 15, true);
+    if (!(status & 1))
+        printf("DPTX-PHY: impedance calibration failed: status 0x%x code 0x%x\n", status, code);
+}
+
+static int t8122_set_active_lane_count(dptx_phy_t *phy, u32 num_lanes)
+{
+    if (num_lanes > DPTX_MAX_LANES)
+        return -1;
+    phy->active_lanes = num_lanes;
+    if (!phy->active)
+        return 0;
+
+    t8122_bit(phy, 0x4000, 26, true);
+    for (u32 lane = 0; lane < DPTX_MAX_LANES; lane++)
+        t8122_bit(phy, DPTX_LANE0_OFFSET + DPTX_LANE_STRIDE * lane, 9, lane >= num_lanes);
+    udelay(1);
+    for (u32 lane = 0; lane < DPTX_MAX_LANES; lane++)
+        t8122_bit(phy, DPTX_LANE0_OFFSET + DPTX_LANE_STRIDE * lane, 8, lane >= num_lanes);
+    if (num_lanes)
+        t8122_bit(phy, 0x4000, 26, false);
+    return 0;
+}
+
+static int t8122_activate(dptx_phy_t *phy)
+{
+    t8122_enable_device_power(phy);
+    t8122_field(phy, 0x2014, GENMASK(23, 16), 0x30);
+    t8122_field(phy, 0x20b8, GENMASK(19, 16), 5);
+    t8122_field(phy, 0x2220, GENMASK(2, 0), 0);
+    t8122_bit(phy, 0x222c, 11, true);
+    t8122_bit(phy, 0x222c, 8, true);
+    t8122_field(phy, 0x2230, GENMASK(21, 17), 0x10);
+    t8122_bit(phy, 0x2278, 27, false);
+    t8122_bit(phy, 0x22a4, 0, true);
+    for (u32 off = DPTX_LANE0_OFFSET; off < DPTX_LANE_END; off += DPTX_LANE_STRIDE) {
+        t8122_field(phy, off + 0x40, GENMASK(23, 20), 2);
+        t8122_bit(phy, off + 0x40, 19, true);
+        t8122_bit(phy, off + 0x244, 4, false);
+    }
+    t8122_bit(phy, 0x2218, 0, true);
+    t8122_field(phy, 0x2234, GENMASK(1, 0), 0);
+    t8122_bit(phy, 0x2200, 1, true);
+    t8122_bit(phy, 0x1000, 1, false);
+    t8122_bit(phy, 0x4004, 3, true);
+    udelay(1);
+
+    phy->active = true;
+    t8122_set_active_lane_count(phy, phy->active_lanes);
+    t8122_bit(phy, 0xd000, 0, false);
+    t8122_impedance_calibration(phy);
+    return 0;
+}
+
+static void t8122_phy_power_down(dptx_phy_t *phy)
+{
+    t8122_bit(phy, 0x4004, 0, true);
+    t8122_bit(phy, 0x4000, 6, false);
+    t8122_bit(phy, 0x4004, 3, false);
+    t8122_bit(phy, 0x4000, 25, false);
+    t8122_bit(phy, 0x4000, 24, false);
+}
+
+static void t8122_phy_power_up(dptx_phy_t *phy)
+{
+    for (u32 off = DPTX_LANE0_OFFSET; off < DPTX_LANE_END; off += DPTX_LANE_STRIDE)
+        t8122_field(phy, off + 0x10, GENMASK(29, 27), 3);
+    t8122_bit(phy, 0x4000, 24, true);
+    udelay(1);
+    t8122_bit(phy, 0x4000, 25, true);
+    udelay(1);
+    t8122_bit(phy, 0x4004, 3, true);
+    t8122_bit(phy, 0x4000, 6, true);
+    t8122_bit(phy, 0x4004, 0, false);
+}
+
+static void t8122_pll_power_down(dptx_phy_t *phy)
+{
+    if (!(read32(phy->regs[0] + 0x2200) & BIT(1)))
+        return;
+    t8122_bit(phy, 0x2200, 1, false);
+    t8122_field(phy, 0x100c, GENMASK(2, 0), 0);
+    t8122_bit(phy, 0x100c, 3, true);
+    udelay(100);
+    u32 ack = read32(phy->regs[0] + 0x1014) & 1;
+    t8122_bit(phy, 0x100c, 3, false);
+    if (!ack)
+        printf("DPTX-PHY: no ack to PLL power down: 0x1008 = 0x%x\n",
+               read32(phy->regs[0] + 0x1008));
+}
+
+static void t8122_pll_power_up(dptx_phy_t *phy)
+{
+    t8122_field(phy, 0x100c, GENMASK(2, 0), 7);
+    t8122_bit(phy, 0x100c, 3, true);
+    udelay(100);
+    u32 ack = read32(phy->regs[0] + 0x1014) & 1;
+    t8122_bit(phy, 0x100c, 3, false);
+    u32 lock = read32(phy->regs[0] + 0x1008) & BIT(3);
+    t8122_bit(phy, 0x2200, 1, true);
+    if (!ack)
+        printf("DPTX-PHY: no ack to PLL power up\n");
+    if (!lock)
+        printf("DPTX-PHY: PLL not locked\n");
+}
+
+static void t8122_shadow_update(dptx_phy_t *phy)
+{
+    set32(phy->regs[1] + 0xa0, 0x8);
+    set32(phy->regs[1] + 0xa0, 0x4);
+    set32(phy->regs[1] + 0xa0, 0x40000);
+    clear32(phy->regs[1] + 0xa0, 0x40000);
+    set32(phy->regs[1] + 0xa0, 0x80000);
+    clear32(phy->regs[1] + 0xa0, 0x80000);
+    clear32(phy->regs[1] + 0xa0, 0x4);
+    clear32(phy->regs[1] + 0xa0, 0x8);
+}
+
+static int t8122_set_link_rate(dptx_phy_t *phy, u32 link_rate)
+{
+    const struct t8122_pll_cfg *cfg = NULL;
+    u32 code = link_rate / 270;
+    if (link_rate % 270)
+        return -1;
+    if (code) {
+        for (size_t i = 0; i < ARRAY_SIZE(t8122_pll_cfgs); i++)
+            if (t8122_pll_cfgs[i].code == code)
+                cfg = &t8122_pll_cfgs[i];
+        if (!cfg) {
+            printf("DPTX-PHY: unsupported link rate %u\n", link_rate);
+            return -1;
+        }
+    }
+    if (code == phy->link_rate)
+        return 0;
+
+    t8122_phy_power_down(phy);
+    t8122_pll_power_down(phy);
+    if (cfg) {
+        t8122_field(phy, 0x20b0, GENMASK(9, 0), cfg->f20b0);
+        t8122_field(phy, 0x20b4, GENMASK(27, 0), cfg->f20b4);
+        mask32(phy->regs[0] + 0x20b8, 0x7ffe00, cfg->f20b8);
+        t8122_bit(phy, 0x222c, 1, cfg->bypass);
+        t8122_shadow_update(phy);
+        t8122_bit(phy, 0x2000, 29, !cfg->half);
+        t8122_bit(phy, 0x201c, 5, !cfg->half);
+        t8122_pll_power_up(phy);
+        t8122_phy_power_up(phy);
+    }
+    phy->link_rate = code;
+    return 0;
+}
 
 /* Read-modify-write of a field in the core register block (regs[0]). */
 static void dptx_t8152_set_bits(dptx_phy_t *phy, u32 offset, u32 shift, u32 mask, u32 value)
@@ -266,6 +480,8 @@ static int dptx_t8152_activate(dptx_phy_t *phy)
 
 int dptx_phy_activate(dptx_phy_t *phy)
 {
+    if (phy->type == DPTX_PHY_T8122)
+        return t8122_activate(phy);
     if (phy->type == DPTX_PHY_T8152_ATC) {
         if (atc_phy_activate(phy->atc) || atc_phy_set_link_rate(phy->atc, 0x0a))
             return -1;
@@ -456,6 +672,8 @@ int dptx_phy_activate(dptx_phy_t *phy)
 
 int dptx_phy_set_active_lane_count(dptx_phy_t *phy, u32 num_lanes)
 {
+    if (phy->type == DPTX_PHY_T8122)
+        return t8122_set_active_lane_count(phy, num_lanes);
     if (phy->type == DPTX_PHY_T8152_ATC) {
         if (num_lanes == 3 || num_lanes > 4)
             return -1;
@@ -529,7 +747,7 @@ int dptx_phy_set_drive_settings(dptx_phy_t *phy, const dptx_drive_settings_t *se
 {
     /* The HDMI phy is not reprogrammed for drive settings; the request is
      * only accepted. */
-    if (phy && phy->type == DPTX_PHY_T8152_HDMI)
+    if (phy && (phy->type == DPTX_PHY_T8122 || phy->type == DPTX_PHY_T8152_HDMI))
         return 0;
     if (!phy || phy->type != DPTX_PHY_T8152_ATC)
         return -1;
@@ -538,6 +756,8 @@ int dptx_phy_set_drive_settings(dptx_phy_t *phy, const dptx_drive_settings_t *se
 
 int dptx_phy_set_link_rate(dptx_phy_t *phy, u32 link_rate)
 {
+    if (phy->type == DPTX_PHY_T8122)
+        return t8122_set_link_rate(phy, link_rate);
     if (phy->type == DPTX_PHY_T8152_ATC)
         return link_rate % 270 ? -1 : atc_phy_set_link_rate(phy->atc, link_rate / 270);
     if (phy->type == DPTX_PHY_T8152_HDMI)
@@ -739,6 +959,14 @@ int dptx_phy_set_link_rate(dptx_phy_t *phy, u32 link_rate)
 
 int dptx_phy_deactivate(dptx_phy_t *phy)
 {
+    if (phy && phy->type == DPTX_PHY_T8122) {
+        int ret = t8122_set_active_lane_count(phy, 0);
+        if (!ret)
+            ret = t8122_set_link_rate(phy, 0);
+        if (!ret)
+            phy->active = false;
+        return ret;
+    }
     if (!phy || phy->type != DPTX_PHY_T8152_ATC)
         return -1;
     int ret = atc_phy_deactivate(phy->atc);
@@ -750,7 +978,7 @@ int dptx_phy_deactivate(dptx_phy_t *phy)
 int dptx_phy_set_route(dptx_phy_t *phy, bool enable)
 {
     /* The dedicated HDMI phy has no per-link route to switch. */
-    if (phy && phy->type == DPTX_PHY_T8152_HDMI)
+    if (phy && (phy->type == DPTX_PHY_T8122 || phy->type == DPTX_PHY_T8152_HDMI))
         return 0;
     if (!phy || phy->type != DPTX_PHY_T8152_ATC)
         return -1;
@@ -761,7 +989,8 @@ int dptx_phy_set_route(dptx_phy_t *phy, bool enable)
  * (macOS trains the PS190 at HBR3); everything else is qualified at HBR. */
 u32 dptx_phy_max_link_rate(dptx_phy_t *phy)
 {
-    return phy && phy->type == DPTX_PHY_T8152_HDMI ? 8100 : 2700;
+    return phy && (phy->type == DPTX_PHY_T8122 || phy->type == DPTX_PHY_T8152_HDMI) ? 8100
+                                                                                     : 2700;
 }
 
 u32 dptx_phy_dcp_output(dptx_phy_t *phy)
@@ -771,6 +1000,8 @@ u32 dptx_phy_dcp_output(dptx_phy_t *phy)
             return 5;
         case DPTX_PHY_T602X:
             return 4;
+        case DPTX_PHY_T8122:
+            return phy->dfp_endpoint;
         case DPTX_PHY_T8152_ATC:
             return 3;
         case DPTX_PHY_T8152_HDMI:
@@ -814,6 +1045,8 @@ dptx_phy_t *dptx_phy_init(const char *phy_node, u32 dcp_index)
         type = DPTX_PHY_T8112;
     else if (adt_is_compatible(adt, node, "dptx-phy,t602x"))
         type = DPTX_PHY_T602X;
+    else if (adt_is_compatible(adt, node, "dptx-phy,t8122"))
+        type = DPTX_PHY_T8122;
     else if (adt_is_compatible(adt, node, "atc-phy,t8152"))
         type = DPTX_PHY_T8152_ATC;
     else if (adt_is_compatible(adt, node, "dptx-phy,t8152"))
@@ -830,6 +1063,12 @@ dptx_phy_t *dptx_phy_init(const char *phy_node, u32 dcp_index)
     phy->type = type;
     phy->dcp_index = dcp_index;
     phy->path = phy_node;
+
+    if (type == DPTX_PHY_T8122) {
+        u32 len;
+        const u32 *dfp = adt_getprop(adt, node, "dp-switch-dfp-endpoint", &len);
+        phy->dfp_endpoint = dfp && len == sizeof(*dfp) ? *dfp : 4;
+    }
 
     if (type == DPTX_PHY_T8152_ATC) {
         if (dcp_index != 0)
