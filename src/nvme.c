@@ -861,6 +861,15 @@ fail:
     nvme_asc = NULL;
 }
 
+/*
+ * Post-M4: an earlier stage powered ANS off and passed its SART entries on (nvme.sart=), and this
+ * stage hasn't started it again.
+ */
+bool nvme_post_m4_passed_off(void)
+{
+    return !nvme_initialized && nvme_sart_saved_cnt && nvme_post_m4();
+}
+
 bool nvme_shutdown(void)
 {
     if (nvme_reboot_required) {
