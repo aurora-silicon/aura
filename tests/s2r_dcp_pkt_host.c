@@ -286,7 +286,7 @@ int main(void)
     *(u64 *)pg_pa(CALL_OFF) = (0xffffffffUL << 32) | 0x54534554;
     *(u64 *)pg_pa(CALL_OFF + 8) = 0xffffffffUL;
     ap_call(DVA, 0x302);
-    CHECK(count_kind(0) <= 2 + 16, "huge input size: %d records", count_kind(0));
+    CHECK(count_kind(0) == 2, "huge input size: %d records, want the 2 head words", count_kind(0));
     i2a(0x42, 0x37);
     CHECK(count_kind(2) <= 2 + 512, "huge output size: %d records", count_kind(2));
 
@@ -298,12 +298,12 @@ int main(void)
     CHECK(count_kind(4) == 1, "big call: %d summary records", count_kind(4));
     CHECK(find(4, 1) && find(4, 1)->val == ((0x1144UL << 32) | 0x38353441),
           "big call summary: slot 1 (slot 0 is the huge-input tag) with size and tag");
-    CHECK(count_kind(5) == 536, "big call: %d changed words, want 536 (words 18 to 553)", count_kind(5));
+    CHECK(count_kind(5) == 552, "big call: %d changed words, want 552 (words 2 to 553)", count_kind(5));
     for (int i = 0; i < nrec; i++)
         if (((recs[i].tag >> 36) & 0xf) == 5 && (recs[i].tag >> 40) == (1 << 12 | 100))
             CHECK(recs[i].pa == pg_pa(CALL_OFF + 800) && recs[i].val == 0x5000 + 100, "word 100: pa 0x%lx val 0x%lx",
                   (unsigned long)recs[i].pa, (unsigned long)recs[i].val);
-    CHECK(count_kind(0) == 18, "big call: %d raw records, want the head and 16 input words", count_kind(0));
+    CHECK(count_kind(0) == 2, "big call: %d raw records, want the 2 head words", count_kind(0));
 
     nrec = 0;
     a2i(((CALL_OFF & 0xffff) << 16) | 0x302, 0x37);
@@ -332,7 +332,7 @@ int main(void)
     ap_call(DVA, 0x302);
     CHECK(count_kind(4) == 1 && find(4, 2) && find(4, 2)->val == ((0x600UL << 32) | 0x3054554c),
           "second tag: summary in slot 2");
-    CHECK(count_kind(5) == 176, "second tag: %d words, want 176 (words 18 to 193)", count_kind(5));
+    CHECK(count_kind(5) == 192, "second tag: %d words, want 192 (words 2 to 193)", count_kind(5));
     *(u64 *)pg_pa(CALL_OFF) = (0x1144UL << 32) | 0x38353441;
     for (int w = 2; w < 200; w++)
         *(u64 *)pg_pa(CALL_OFF + 8 * w) = 0x5000 + w;
@@ -359,6 +359,24 @@ int main(void)
     ap_call(DVA, 0x302);
     i2a(0x42, 0x37);
     CHECK(count_kind(2) == 2 + 385, "3072 byte output: %d records, want 387", count_kind(2));
+
+    /* A large call's answer is cut to S2R_BIG_OUT bytes: 8 words, not the 0x1000 it claims. */
+    *(u64 *)pg_pa(CALL_OFF) = (0x1144UL << 32) | 0x38353441;
+    *(u64 *)pg_pa(CALL_OFF + 8) = 0x1000UL;
+    ap_call(DVA, 0x302);
+    i2a(0x42, 0x37);
+    CHECK(count_kind(2) == 2 + 8, "large call output: %d records, want 10", count_kind(2));
+
+    /* A 4168 byte callback input (D413, D552) is copied whole. */
+    *(u64 *)pg_pa(0x60000) = (4168UL << 32) | 0x32353544;
+    *(u64 *)pg_pa(0x60008) = 0xc00UL;
+    for (int w = 2; w < 530; w++)
+        *(u64 *)pg_pa(0x60000 + 8 * w) = 0x6000 + w;
+    nrec = 0;
+    i2a(0x2, 0x37);
+    CHECK(count_kind(1) == 2 + 521, "4168 byte callback: %d records, want 523", count_kind(1));
+    a2i(0x42, 0x37); /* the AP's reply: a callback output is not cut, though its input is large */
+    CHECK(count_kind(3) == 2 + 385, "callback with a large input, 3072 byte output: %d records", count_kind(3));
 
     printf(failures ? "FAIL: %d checks\n" : "PASS: DCP packet copier\n", failures);
     return failures != 0;
