@@ -711,7 +711,8 @@ static int dt_set_s2r_mailbox(int node)
     u64 lower, upper;
     if (ctxr_range(CTXR_RANGE_D, &lower, &upper) && !ctxr_exec_window(NULL, NULL)) {
         printf("FDT: no S2R mailbox: CTXR_D is armed and the OS is outside its window\n");
-        fdt_setprop_string(dt, node, "aurora,s2r-unavailable", "CTXR_D armed, OS outside its window");
+        fdt_setprop_string(dt, node, "aurora,s2r-unavailable",
+                           "CTXR_D armed, OS outside its window");
         return 0;
     }
 
