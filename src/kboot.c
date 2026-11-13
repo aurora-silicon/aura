@@ -9366,11 +9366,11 @@ t6050_isp_segments_valid(const struct adt_segment_ranges *seg, u32 len, u64 ram,
 }
 
 /*
- * T6050 firmware lives below Linux RAM. Publish its current ADT ranges, not
+ * T6050 firmware lives below Linux RAM. Publish current ADT ranges, not
  * snapshot physical addresses. The kernel allocates the small main-memory
- * tail and owns all power, DART and firmware-start operations. J716c's camera
- * is sensor type 0x75, J714s's 0x74 (both measured on 27.0), K116s's 0xbc
- * (27.2); all three have the same two segments.
+ * tail and owns all power, DART and firmware-start operations. J716c (0x75)
+ * and J714s (0x74) on 27.0, K114c (0xb9) on 27.3 beta and K116s (0xbc) on
+ * 27.2 use the same two segment names.
  */
 __attribute__((section(".init.t6050_isp"))) static int t6050_isp_add_mem_region(uint32_t phandle,
                                                                                 const char *name)
@@ -9391,6 +9391,7 @@ static const struct {
 } t6050_isp_boards[] = {
     {"apple,j716c", 0x75, V27_0},
     {"apple,j714s", 0x74, V27_0},
+    {"apple,k114c", 0xb9, V27_3B},
     /*
      * K116s: ADT isp0 of 27.2 (26B8125). Firmware uuid 980F533B-34EA-3FBA-878C-809F6AF57345,
      * the IPSW's isp_bni/adc-nyx-sck11pm; its K116 connection table has one FrontRGB IMX958.
@@ -9474,8 +9475,9 @@ static int dt_set_t6050_isp(const char **why)
         if (node < 0 || fdt_setprop_string(dt, node, "status", "okay"))
             return -1;
     }
-    printf("FDT: T6050 ISP: reserved text/data, main memory 32 MiB; platform 0x%x scheme 0x%x\n",
-           platform, scheme);
+    printf("FDT: T6050 ISP: text at 0x%lx size 0x%x; data at 0x%lx size 0x%x; main memory 32 MiB; "
+           "platform 0x%x scheme 0x%x\n",
+           seg[0].phys, seg[0].size, seg[1].phys, seg[1].size, platform, scheme);
     return 0;
 }
 
