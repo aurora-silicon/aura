@@ -27,15 +27,16 @@
 #define S2R_DCP_PAGES (S2R_DCP_RPC / 0x4000 + 1)
 #define S2R_DCP_EP    0x37
 #define S2R_PKT_TAG   0x544b5043UL /* "CPKT" */
-#define S2R_PKT_MAX   128 /* raw bytes of a large call, which is traced by its changed words */
-#define S2R_IN_MAX    512 /* raw bytes of any other call or callback input */
+#define S2R_PKT_MAX   0 /* raw bytes of a large call past its two head words: it is traced by its changed words */
+#define S2R_IN_MAX    0x1100 /* raw bytes of any other call or callback input (D552, D561: about 4.2 KB) */
 #define S2R_OUT_MAX   4096 /* raw bytes of an output (a data property answer is up to 3072) */
+#define S2R_BIG_OUT   64 /* raw bytes of a large call's output (swap_submit answers a status: 1.2 M words in 11 min) */
 #define S2R_DCP_OPEN  4
 #define S2R_DCP_SIDS  64
 /*
- * An AP call with an input this large (swap_submit: 0x1144 bytes; color tables) is traced as the
- * words that changed since the last call of the same tag on that DCP, from the first word past the
- * raw copy. Kind 4 is one record per call (word: its slot, 15 when the DCP has no slot left;
+ * An AP call with an input this large (swap_submit: 0x106c bytes on macOS 27.3; color tables) is
+ * traced as the words that changed since the last call of the same tag on that DCP, from the third
+ * word of the packet. Kind 4 is one record per call (word: its slot, 15 when the DCP has no slot left;
  * val = input size << 32 | the tag), kind 5 a changed word (word = slot << 12 | its index from the
  * packet start; the input starts at byte 12), kind 6 a word that changed more than S2R_BIG_CHURN
  * times and is not recorded again. A brightness field shows as a word that changes only when the
@@ -190,8 +191,9 @@ static void s2r_dcp_copy(int idx, struct s2r_dcp *d, u64 off, int kind, bool a2i
     if (big)
         s2r_dcp_big(idx, d, off, h0, pa0, a2i);
     u64 from = kind < 2 ? off + 16 : ALIGN_DOWN(off + 12 + min(in, (u64)S2R_DCP_RPC), 8);
+    u64 outmax = kind == 2 && in >= S2R_BIG_MIN ? (u64)S2R_BIG_OUT : (u64)S2R_OUT_MAX;
     u64 to = kind < 2 ? off + 12 + min(in, big ? (u64)S2R_PKT_MAX : (u64)S2R_IN_MAX)
-                      : from + min(out + 8, (u64)S2R_OUT_MAX);
+                      : from + min(out + 8, outmax);
     for (u64 o = from, w = 2; o < to && o + 8 <= S2R_DCP_RPC; o += 8, w++) {
         u64 v, pa = s2r_dcp_pa(d, o);
         if (!pa || !sptm_virt_peek64(pa, &v))
