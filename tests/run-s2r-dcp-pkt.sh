@@ -6,8 +6,9 @@
 #   sh tests/run-s2r-dcp-pkt.sh
 set -eu
 cd "$(dirname "$0")/.."
-# smp.h includes build/build_cfg.h, which a fresh clone does not have yet
-make build-cfg > /dev/null
+# smp.h includes build/build_cfg.h, which a fresh clone does not have yet; one that exists is a
+# configured build's and is left as it is
+[ -f build/build_cfg.h ] || make build-cfg > /dev/null
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT HUP INT TERM
 {
