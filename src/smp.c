@@ -386,16 +386,45 @@ static bool smp_rvbar_reaches_here(u64 locked)
 }
 
 /*
+ * A7 to M3: nothing locks RVBAR, and smp_start_cpu() already pointed each secondary's here.
+ * Point the boot core's here too, so that a reset after a system sleep comes back through
+ * this image on every core, as it does where iBoot locked RVBAR. Whether the value outlives
+ * a SoC sleep is the SoC's own matter: the OS only sleeps where that was tested.
+ */
+static bool smp_point_rvbar_here(void)
+{
+    u64 target = (u64)_vectors_start;
+
+    for (int i = 0; i < MAX_CPUS; i++) {
+        const struct cpu_info *cpu = &cpu_info[i];
+
+        if (!cpu->valid)
+            continue;
+        if (i != boot_cpu_idx && !smp_is_alive(i))
+            continue;
+        if ((read64(cpu->impl_reg) & RVBAR_ADDR) != target)
+            write64(cpu->impl_reg, target);
+        if ((read64(cpu->impl_reg) & RVBAR_ADDR) != target) {
+            printf("SMP: CPU %d RVBAR did not take 0x%lx\n", i, target);
+            return false;
+        }
+    }
+    return true;
+}
+
+/*
  * Whether a reset brings the cores back into this image. From M4 on (A18 Pro too), iBoot locks
  * every core's RVBAR to the same address, the boot core's too, and smp_prepare_rvbar() checked a
  * running secondary's before starting it. An OS started on the boot core alone suspends with that
  * core only, so it gets the same check and relay. On A7 to M3 RVBAR isn't locked: the OS can point
- * it anywhere.
+ * it anywhere, so it is pointed here.
  */
 bool smp_resets_return_here(void)
 {
-    if (cpu_features->apple_sysregs_unlocked || boot_cpu_idx < 0)
+    if (boot_cpu_idx < 0)
         return false;
+    if (cpu_features->apple_sysregs_unlocked)
+        return smp_point_rvbar_here();
     int i;
     for (i = 0; i < MAX_CPUS; i++)
         if (i != boot_cpu_idx && cpu_info[i].valid && smp_is_alive(i))
