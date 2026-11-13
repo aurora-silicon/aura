@@ -38,6 +38,17 @@ def decode(rec):
     return t, meta & ((1 << 48) - 1), 8 << ((meta >> 48) & 3), bool(meta & WRITE), cpu, bool(meta & MARKER), val, pc
 
 
+def pkt_key(rec):
+    """(dcp index, kind name) for the head of a packet record (word 0, or a resolve attempt); else None."""
+    t, pa, bits, write, cpu, marker, val, pc = decode(rec)
+    if marker or pc & 0xFFFFFFFF != PKT_TAG:
+        return None
+    kind, word = (pc >> 36) & 15, pc >> 40
+    if kind != 7 and word != 0:
+        return None
+    return (pc >> 32) & 15, PKT_KINDS.get(kind, f"kind{kind}")
+
+
 def val_matches(val, wanted):
     """A value, or an address as its page number (>> 12) or its low 32 bits."""
     return any(val in (w, w >> 12, w & 0xFFFFFFFF) for w in wanted)
@@ -130,6 +141,7 @@ def main():
     per = CHUNK // REC.size
     done = 0
     per_node = collections.Counter()
+    per_pkt = collections.Counter()
     while done < have:
         n = min(per, have - done)
         i0 = (first + done) % nrec
@@ -141,11 +153,15 @@ def main():
                 t0 = decode(rec)[0]
             if keep(rec, args):
                 print(fmt(first + done + k, rec, t0, freq, lookup), file=out)
-                if lookup and not decode(rec)[5]:
+                if pkt_key(rec):
+                    per_pkt[pkt_key(rec)] += 1
+                if lookup and not decode(rec)[5] and decode(rec)[7] & 0xFFFFFFFF != PKT_TAG:
                     per_node[owner(lookup, decode(rec)[1])[1]] += 1
         done += n
     for name, count in per_node.most_common():
         print(f"NODE {name} {count}", file=out)
+    for (idx, kind), count in sorted(per_pkt.items()):
+        print(f"PKT dcp{idx} {kind} {count}", file=out)
     if args.out:
         out.close()
         print(f"wrote {args.out}", file=sys.stderr)
