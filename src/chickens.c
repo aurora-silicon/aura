@@ -118,6 +118,19 @@ const struct midr_part_features features_m4 = {
 };
 
 /*
+ * M4 Pro/Max: as M4, and every core accepts AIC IRQs. With no SIQ_CFG_EL1 write only the boot
+ * CPU takes them, so every device interrupt wakes CPU0 and its cluster whichever core is waiting
+ * for it. Route 0 lets the AIC pick a running CPU, as on M5 Pro/Max below.
+ */
+const struct midr_part_features features_m4_pro = {
+    .sleep_mode = SLEEP_NONE,
+    .fast_ipi = true,
+    .siq_cfg = SIQ_CFG_ROUTE_0,
+    .actlr_el2 = true,
+    .unsafe_wfi = true,
+};
+
+/*
  * M5 Pro/Max/Ultra (Sotra cores): as M4, and every core accepts AIC IRQs. Without a SIQ_CFG_EL1
  * write only the boot CPU takes them. The native OS's kernel writes 0 to SIQ_CFG_EL1 on every CPU
  * as it starts, so each running CPU accepts device interrupts and the AIC picks one; 0 matches it.
@@ -174,10 +187,10 @@ const struct midr_part_info midr_parts[] = {
     {MIDR_PART_T8122_SAWTOOTH, "M3 Sawtooth", init_t8122_sawtooth, &features_m3},
     {MIDR_PART_T8132_DONAN_ECORE, "M4 Donan (E core)", NULL, &features_m4},
     {MIDR_PART_T8132_DONAN_PCORE, "M4 Donan (P core)", NULL, &features_m4},
-    {MIDR_PART_T6040_BRAVA_CHOP_ECORE, "M4 Pro Brava Chop (E core)", NULL, &features_m4},
-    {MIDR_PART_T6040_BRAVA_CHOP_PCORE, "M4 Pro Brava Chop (P core)", NULL, &features_m4},
-    {MIDR_PART_T6041_BRAVA_ECORE, "M4 Max Brava (E core)", NULL, &features_m4},
-    {MIDR_PART_T6041_BRAVA_PCORE, "M4 Max Brava (P core)", NULL, &features_m4},
+    {MIDR_PART_T6040_BRAVA_CHOP_ECORE, "M4 Pro Brava Chop (E core)", NULL, &features_m4_pro},
+    {MIDR_PART_T6040_BRAVA_CHOP_PCORE, "M4 Pro Brava Chop (P core)", NULL, &features_m4_pro},
+    {MIDR_PART_T6041_BRAVA_ECORE, "M4 Max Brava (E core)", NULL, &features_m4_pro},
+    {MIDR_PART_T6041_BRAVA_PCORE, "M4 Max Brava (P core)", NULL, &features_m4_pro},
     {MIDR_PART_T8140_TAHITI_ECORE, "A18 Pro Tahiti (E core)", NULL, &features_m4},
     {MIDR_PART_T8140_TAHITI_PCORE, "A18 Pro Tahiti (P core)", NULL, &features_m4},
     {MIDR_PART_T8142_HIDRA_ECORE, "M5 Hidra (E core)", NULL, &features_m4},
