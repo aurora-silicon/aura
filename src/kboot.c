@@ -9390,13 +9390,17 @@ static int dt_set_t6050_isp(void)
     if (node < 0)
         return 0;
     u32 want;
+    enum fw_version fw = V27_0;
     if (!fdt_node_check_compatible(dt, 0, "apple,j716c"))
         want = 0x75;
     else if (!fdt_node_check_compatible(dt, 0, "apple,j714s"))
         want = 0x74;
-    else
+    else if (!fdt_node_check_compatible(dt, 0, "apple,k114c")) {
+        want = 0xb9;
+        fw = V27_3B;
+    } else
         return -1;
-    if (os_firmware.version != V27_0)
+    if (os_firmware.version != fw)
         return -1;
 
     int chosen = adt_path_offset(adt, "/chosen");
@@ -9453,7 +9457,9 @@ static int dt_set_t6050_isp(void)
         if (node < 0 || fdt_setprop_string(dt, node, "status", "okay"))
             return -1;
     }
-    printf("FDT: T6050 ISP: reserved text/data, main memory 32 MiB; platform 0x%x\n", platform);
+    printf("FDT: T6050 ISP: text at 0x%lx size 0x%x; data at 0x%lx size 0x%x; main memory 32 MiB; "
+           "platform 0x%x\n",
+           seg[0].phys, seg[0].size, seg[1].phys, seg[1].size, platform);
     return 0;
 }
 
