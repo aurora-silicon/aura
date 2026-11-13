@@ -3,10 +3,12 @@
  * Host run of the sleep trace's DCP packet copier (src/s2r_dcp_pkt.c) over a fake T6050 DART.
  *
  * dart_walk_locked_t8110() is the real one, copied out of src/dart.c by run-s2r-dcp-pkt.sh. The
- * DART is built in memory at fixed addresses: its stream 23 maps the IOMFB shared memory at the
- * DVA 0x1000004c000 the AP sent in its init word (the stream's VM base is bit 40, above the 2^36
- * the walk can return); stream 3 has no TTBR and stream 27 is a remap stream. The tables are
- * identity maps of host memory, so this checks the logic, not the hardware's tables.
+ * DART is built in memory at fixed addresses. Its stream 23 is shaped like the tables read from
+ * the M5 guest (T6050) with the proxy: three levels, root[iova >> 36] to a mid table to a leaf
+ * table, the IOMFB shared memory at the DVA 0x1000004c000 the AP sent in its init word (root
+ * index 16), leaf entries with flag bits above bit 39. Streams 5 and 24 map it the same way,
+ * stream 9 with the older two levels; stream 3 has no TTBR and stream 27 is a remap stream. The
+ * tables are identity maps of host memory, so this checks the logic, not the hardware's tables.
  *
  * One IOMFB call and its reply go through the mailbox registers; the copier must put the packet's
  * head and its bytes in the ring from the right pages, and must say which stream it found.
@@ -56,6 +58,9 @@ void debug_printf(const char *f, ...)
 #define L2B     (DRAM + 0xc000)
 #define L1C     (DRAM + 0x10000)
 #define L2C     (DRAM + 0x14000)
+#define L3      (DRAM + 0x100000)
+#define L3B     (DRAM + 0x104000)
+#define L3C     (DRAM + 0x108000)
 #define DATA    (DRAM + 0x20000)
 #define NPG     49
 #define DVA     0x1000004c000UL
@@ -107,6 +112,8 @@ static void map(u64 addr, u64 len)
     }
 }
 
+static void map_stream(int sid, u64 root, u64 mid, u64 leaf, int first, int n, int levels);
+
 static void build(void)
 {
     map(DART, 0x10000);
@@ -115,12 +122,7 @@ static void build(void)
     *(volatile u32 *)(DART + 0x1000 + 4 * 3) = 0x1;
     *(volatile u32 *)(DART + 0x1000 + 4 * 27) = 0x1780;
     *(volatile u32 *)(DART + 0x1400 + 4 * 27) = ((L1 >> 14) << 2) | 1;
-    *(volatile u32 *)(DART + 0x1000 + 4 * SID) = 0x9;
-    *(volatile u32 *)(DART + 0x1400 + 4 * SID) = ((L1 >> 14) << 2) | 1;
-    u64 low = DVA & ((1UL << 36) - 1);
-    ((u64 *)L1)[low >> 25] = (L2 >> 4) | 1;
-    for (int k = 0; k < NPG; k++)
-        ((u64 *)L2)[((low >> 14) & 0x7ff) + k] = ((DATA + k * 0x4000UL) >> 4) | 1;
+    map_stream(SID, L1, L2, L3, 0, NPG, 3);
 
     /* the call's packet: head (tag, input size 0x20), head 2 (output size 0x10), 4 input words */
     *(u64 *)pg_pa(CALL_OFF) = (0x20UL << 32) | 0x54534554;
@@ -140,17 +142,28 @@ static void i2a(u64 m0, u64 m1)
     s2r_dcp_watch(MBOX + 0x830, v, 4);
 }
 
-/* A stream whose tables map DVA pages first..first+n-1 to the shared memory pages of the same index. */
-static void map_stream(int sid, u64 l1, u64 l2, int first, int n)
+/* A stream whose tables map DVA pages first..first+n-1 to the shared memory pages of the same index.
+ * levels 3: root[dva >> 36] -> mid[dva >> 25 & 0x7ff] -> leaf; levels 2: root[dva >> 25 & 0x7ff] -> mid
+ * (the leaf argument is unused). A leaf entry carries the flag bits the hardware sets above bit 39,
+ * and the page before the window is mapped to a decoy. */
+static void map_stream(int sid, u64 root, u64 mid, u64 leaf, int first, int n, int levels)
 {
-    u64 low = DVA & ((1UL << 36) - 1);
-    memset((void *)l1, 0, 0x4000);
-    memset((void *)l2, 0, 0x4000);
-    ((u64 *)l1)[low >> 25] = (l2 >> 4) | 1;
+    u64 low = DVA & ((1UL << 36) - 1), flags = 0xfffUL << 40;
+    u64 *pg = (u64 *)(levels == 3 ? leaf : mid);
+    memset((void *)root, 0, 0x4000);
+    memset((void *)mid, 0, 0x4000);
+    memset((void *)leaf, 0, 0x4000);
+    if (levels == 3) {
+        ((u64 *)root)[DVA >> 36] = (mid >> 4) | 1;
+        ((u64 *)mid)[(low >> 25) & 0x7ff] = (leaf >> 4) | 1;
+    } else {
+        ((u64 *)root)[low >> 25] = (mid >> 4) | 1;
+    }
+    pg[((low >> 14) & 0x7ff) - 2] = (DATA >> 4) | 1 | flags;
     for (int k = first; k < first + n; k++)
-        ((u64 *)l2)[((low >> 14) & 0x7ff) + k] = ((DATA + k * 0x4000UL) >> 4) | 1;
+        pg[((low >> 14) & 0x7ff) + k] = ((DATA + k * 0x4000UL) >> 4) | 1 | flags;
     *(volatile u32 *)(DART + 0x1000 + 4 * sid) = 0x9;
-    *(volatile u32 *)(DART + 0x1400 + 4 * sid) = ((l1 >> 14) << 2) | 1;
+    *(volatile u32 *)(DART + 0x1400 + 4 * sid) = ((root >> 14) << 2) | 1;
 }
 
 static void unmap_stream(int sid)
@@ -236,22 +249,38 @@ int main(void)
           "re-arm: %d resolve records, %d AP-call records", count_kind(7), count_kind(0));
 
     /* Two streams map every page: the lower stream wins the tie. */
-    map_stream(24, L1, L2, 0, NPG);
-    map_stream(5, L1, L2, 0, NPG);
+    map_stream(24, L1, L2, L3, 0, NPG, 3);
+    map_stream(5, L1, L2, L3, 0, NPG, 3);
     ap_call(DVA, 0x302);
     CHECK(find(7, 5) != NULL, "tie between streams 5, 23 and 24: want stream 5");
     unmap_stream(24);
     unmap_stream(5);
 
     /* A smaller stream before the chosen one: its pages must not leak into the chosen stream's. */
-    map_stream(5, L1B, L2B, 0, 3);       /* maps DVA pages 0 to 2 only */
-    map_stream(SID, L1C, L2C, 3, NPG - 3); /* maps pages 3 to 48: the larger stream */
+    map_stream(5, L1B, L2B, L3B, 0, 3, 3);         /* maps DVA pages 0 to 2 only */
+    map_stream(SID, L1C, L2C, L3C, 3, NPG - 3, 3); /* maps pages 3 to 48: the larger stream */
     ap_call(DVA, 0x2);                   /* AP call at DVA offset 0x100: page 0 */
     r = find(7, SID);
     CHECK(r && r->val >> 32 == NPG - 3, "partial streams: want stream %d with %d pages", SID, NPG - 3);
     CHECK(count_kind(0) == 0, "page 0 is not in the chosen stream: %d records from it", count_kind(0));
     unmap_stream(5);
-    map_stream(SID, L1, L2, 0, NPG);
+    map_stream(SID, L1, L2, L3, 0, NPG, 3);
+
+    /* An older two-level stream still resolves, and wins the tie against stream 23 as the lower one. */
+    map_stream(9, L1B, L2B, L3B, 0, NPG, 2);
+    ap_call(DVA, 0x302);
+    r = find(7, 9);
+    CHECK(r && r->val >> 32 == NPG && count_kind(0) == 6, "two-level stream 9: want %d pages", NPG);
+    unmap_stream(9);
+
+    /* A three-level stream that maps the same low bits under root[0], not the DVA's root[16], is a
+     * different address space: it must not match, though it is the lower stream. */
+    map_stream(11, L1B, L2B, L3B, 0, NPG, 3);
+    ((u64 *)L1B)[0] = ((u64 *)L1B)[DVA >> 36];
+    ((u64 *)L1B)[DVA >> 36] = 0;
+    ap_call(DVA, 0x302);
+    CHECK(!find(7, 11) && find(7, SID), "stream 11 maps the low bits only: it must not match");
+    unmap_stream(11);
 
     /* A packet head with 32-bit sizes of 0xffffffff copies a bounded number of words. */
     *(u64 *)pg_pa(CALL_OFF) = (0xffffffffUL << 32) | 0x54534554;
