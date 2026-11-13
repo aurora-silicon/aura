@@ -10698,6 +10698,86 @@ undo:
     return 0;
 }
 
+/*
+ * T6050 deep sleep: the sleep controller's (apple,t6050-sleep) wake sources and the pins it
+ * leaves alone, from the ADT. Each pmgr ap-wake-sources entry is an index and a 32-byte name;
+ * those inside the AP die's ten wake words go to apple,wake-enable, the GFX die's (after them)
+ * to apple,wake-enable-gfx. gpio0's no-restore-gpio-pins go to apple,pinctrl-skip-pins, sorted.
+ * A property that does not decode is left out whole: the driver then leaves the wake masks or
+ * the pins as they are.
+ */
+#define T6050_SLEEP_INIT      __attribute__((minsize, noinline, section(".init.t6050")))
+#define T6050_WAKE_AP_SOURCES (10 * 32)
+
+struct adt_wake_source {
+    u32 index;
+    char name[32];
+} PACKED;
+
+T6050_SLEEP_INIT static void dt_set_t6050_sleep_prop(int node, const char *name, u32 *v, int n)
+{
+    if (n <= 0)
+        return;
+    for (int i = 0; i < n; i++)
+        v[i] = cpu_to_fdt32(v[i]);
+    if (fdt_setprop(dt, node, name, v, n * sizeof(*v)))
+        printf("kboot: couldn't set %s\n", name);
+    else
+        printf("kboot: t6050 sleep: %s, %d from the ADT\n", name, n);
+}
+
+T6050_SLEEP_INIT static void dt_set_t6050_sleep(void)
+{
+    u32 ap[64], gfx[32], pins[32], len, npins_hw = 0;
+    int nap = 0, ngfx = 0, npins = 0;
+
+    int node = fdt_node_offset_by_compatible(dt, -1, "apple,t6050-sleep");
+    if (node < 0)
+        return;
+
+    int pmgr = adt_path_offset(adt, "/arm-io/pmgr");
+    const struct adt_wake_source *ws =
+        pmgr < 0 ? NULL : adt_getprop(adt, pmgr, "ap-wake-sources", &len);
+    if (!ws || !len || len % sizeof(*ws))
+        nap = ngfx = -1;
+    for (u32 i = 0; nap >= 0 && i < len / sizeof(*ws); i++) {
+        u32 id = ws[i].index;
+        if (id < T6050_WAKE_AP_SOURCES && nap < (int)ARRAY_SIZE(ap))
+            ap[nap++] = id;
+        else if (id >= T6050_WAKE_AP_SOURCES && id - T6050_WAKE_AP_SOURCES < 32 &&
+                 ngfx < (int)ARRAY_SIZE(gfx))
+            gfx[ngfx++] = id - T6050_WAKE_AP_SOURCES;
+        else
+            nap = ngfx = -1;
+    }
+    if (nap < 0)
+        printf("kboot: t6050 sleep: no usable ap-wake-sources\n");
+
+    int gpio = adt_path_offset(adt, "/arm-io/gpio0");
+    const u32 *np = gpio < 0 ? NULL : adt_getprop(adt, gpio, "no-restore-gpio-pins", &len);
+    if (gpio < 0 || ADT_GETPROP(adt, gpio, "#gpio-pins", &npins_hw) < 0 || !np || !len || len % 4 ||
+        len / 4 > ARRAY_SIZE(pins))
+        npins = -1;
+    for (u32 i = 0; npins >= 0 && i < len / 4; i++) {
+        u32 pin = np[i];
+        int j = npins++;
+
+        if (pin >= npins_hw) {
+            npins = -1;
+            break;
+        }
+        for (; j > 0 && pins[j - 1] > pin; j--)
+            pins[j] = pins[j - 1];
+        pins[j] = pin;
+    }
+    if (npins < 0)
+        printf("kboot: t6050 sleep: no usable no-restore-gpio-pins\n");
+
+    dt_set_t6050_sleep_prop(node, "apple,wake-enable", ap, nap);
+    dt_set_t6050_sleep_prop(node, "apple,wake-enable-gfx", gfx, ngfx);
+    dt_set_t6050_sleep_prop(node, "apple,pinctrl-skip-pins", pins, npins);
+}
+
 void kboot_set_initrd(void *start, size_t size)
 {
     initrd_start = start;
@@ -11429,6 +11509,7 @@ int kboot_prepare_dt(void *fdt)
         return -1;
     if (dt_set_t6040_sleep_dcpext())
         return -1;
+    dt_set_t6050_sleep();
 #ifndef RELEASE
     if (dt_transfer_virtios())
         return 1;
