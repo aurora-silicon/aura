@@ -332,7 +332,8 @@ static uintptr_t display_map_fb(uintptr_t iova, u64 paddr, u64 size)
 
     /* Locked legacy DARTs index their inherited tables with the low 36 bits,
      * but the DCP requires the ADT window bits in every DVA it receives. */
-    iova |= dart_dva_base(dcp->dart_dcp);
+    if (dcp->no_reset)
+        iova |= dart_dva_base(dcp->dart_dcp);
 
     int ret = dart_map(dcp->dart_disp, iova, (void *)paddr, size);
     if (ret < 0) {
@@ -451,7 +452,7 @@ int display_start_dcp(void)
     // Find the framebuffer DVA
     fb_dva_allocated = false;
     fb_dva = dart_search(dcp->dart_disp, (void *)cur_boot_args.video.base);
-    if (!DART_IS_ERR(fb_dva) && fb_dva)
+    if (dcp->no_reset && !DART_IS_ERR(fb_dva) && fb_dva)
         fb_dva |= dart_dva_base(dcp->dart_dcp);
     // framebuffer is not mapped on the M1 Ultra Mac Studio
     if (DART_IS_ERR(fb_dva) || !fb_dva)
@@ -575,16 +576,17 @@ int display_configure(const char *config)
          * Retained J773g firmware can consume the first assertion while its
          * display client is still opening, so replay high after 20 ms just as
          * the working Linux path does. */
-        if (chip_id == T8152 || kboot_is_j773g_machine()) {
+        if (chip_id == T8152) {
+            /* Preserve the established J873g best-effort HPD behavior. */
+            (void)dcp_dptx_hpd(dcp->dptx_ep, 0, true);
+        } else if (kboot_is_j773g_machine()) {
             ret = dcp_dptx_hpd(dcp->dptx_ep, 0, true);
             if (ret < 0)
                 return ret;
-            if (kboot_is_j773g_machine()) {
-                mdelay(20);
-                ret = dcp_dptx_hpd(dcp->dptx_ep, 0, true);
-                if (ret < 0)
-                    return ret;
-            }
+            mdelay(20);
+            ret = dcp_dptx_hpd(dcp->dptx_ep, 0, true);
+            if (ret < 0)
+                return ret;
         }
     }
 

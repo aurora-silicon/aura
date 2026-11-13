@@ -273,7 +273,8 @@ dcp_dev_t *dcp_init(const display_config_t *cfg)
         /* J873g reports mBoot-20457.1.29, which is not in the OS firmware
          * table, and the same dptx-port endpoint works on its USB-C route.
          * Keep the V13_5 restriction for the machines it was written for. */
-        if (cfg->fw_version && os_firmware.version != cfg->fw_version && chip_id != T8152) {
+        u32 fw_version = cfg->fw_version ? cfg->fw_version : V13_5;
+        if (os_firmware.version != fw_version && chip_id != T8152) {
             printf("dcp: dptx-port is not supported with OS firmware %s.\n", os_firmware.string);
             return NULL;
         }

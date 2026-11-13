@@ -350,7 +350,8 @@ static dart_dev_t *dart_gen3_adopt_adt(int node, uintptr_t base, int device, boo
     snprintf(prop, sizeof(prop), "vm-base-%d", device);
     if (ADT_GETPROP(adt, node, prop, &dart->vm_base) < 0)
         ADT_GETPROP(adt, node, "vm-base", &dart->vm_base);
-    dart->dva_base = dart->vm_base & ~GENMASK(35, 0);
+    if (dart->locked)
+        dart->dva_base = dart->vm_base & ~GENMASK(35, 0);
     printf("dart: adopted Gen3 SID %d at 0x%lx, root %p, TLBI route %u%s\n", device, base,
            dart->l1[0], dart->tlbi_route, dart->locked ? " (locked)" : "");
     return dart;
@@ -604,9 +605,10 @@ dart_dev_t *dart_init_adt(const char *path, int instance, int device, bool keep_
             printf("dart: unexpected length of vm-base property: %u\n", len);
         }
     }
-    dart->dva_base = dart->vm_base & ~GENMASK(35, 0);
-    if (dart->locked)
+    if (dart->locked) {
+        dart->dva_base = dart->vm_base & ~GENMASK(35, 0);
         dart->vm_base &= (1LLU << 36) - 1;
+    }
 
     return dart;
 }
