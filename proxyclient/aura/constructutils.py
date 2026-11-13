@@ -803,7 +803,7 @@ class Ver(Subconstruct):
     MATRIX = {
         "V": ["V12_1", "V12_3", "V12_4", "V13_0B4", "V13_0B5", "V13_0B6", "V13_2", "V13_3", "V13_5B4", "V13_5", "V14_7",
               "V27_3B"],
-        "G": ["G13", "G14", "G14X", "G15", "G15X"],
+        "G": ["G13", "G14", "G14X", "G15", "G15X", "G17"],
     }
 
     def __init__(self, version, subcon):

@@ -42,3 +42,34 @@ def test_dcp_ipc_imports_with_the_m5_version():
     )
     root = Path(__file__).resolve().parents[2] / "proxyclient"
     subprocess.run([sys.executable, "-c", code], cwd=root, check=True)
+
+
+class _FakeNode:
+    def __init__(self, **kw):
+        self.__dict__.update(kw)
+
+
+class _FakeADT:
+    def __init__(self, nodes):
+        self.nodes = nodes
+
+    def __getitem__(self, path):
+        return self.nodes[path]
+
+
+class _FakeProxyUtils:
+    """What Ver.set_version reads on the M5: firmware version and ADT /arm-io soc-generation H17."""
+
+    version = "V27_3B"
+    adt = _FakeADT({"/arm-io": _FakeNode(soc_generation="H17"), "/chosen": _FakeNode(chip_id=0x6050)})
+
+
+def test_set_version_on_the_m5_accepts_soc_generation_h17():
+    saved = dict(Ver._version)
+    try:
+        Ver.set_version(_FakeProxyUtils())
+        assert Ver._version == {"V": "V27_3B", "G": "G17"}
+        assert Ver.check("G >= G15X")
+        assert not Ver.check("G < G15X")
+    finally:
+        Ver._version.update(saved)
