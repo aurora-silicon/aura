@@ -571,11 +571,21 @@ int display_configure(const char *config)
         ret = dcp_connect_dptx(dcp);
         if (ret < 0)
             return ret;
-        /* The T8152 DCP only brings the port up once HPD is asserted. On the
-         * J873g HDMI path the sink's HPD reaches the AP gpio, so tell the
-         * firmware. */
-        if (chip_id == T8152)
-            dcp_dptx_hpd(dcp->dptx_ep, 0, true);
+        /* Fixed HDMI only trains after its AP-side HPD is forwarded to DCP.
+         * Retained J773g firmware can consume the first assertion while its
+         * display client is still opening, so replay high after 20 ms just as
+         * the working Linux path does. */
+        if (chip_id == T8152 || kboot_is_j773g_machine()) {
+            ret = dcp_dptx_hpd(dcp->dptx_ep, 0, true);
+            if (ret < 0)
+                return ret;
+            if (kboot_is_j773g_machine()) {
+                mdelay(20);
+                ret = dcp_dptx_hpd(dcp->dptx_ep, 0, true);
+                if (ret < 0)
+                    return ret;
+            }
+        }
     }
 
     if (!display_is_external) {

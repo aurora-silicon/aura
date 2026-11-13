@@ -90,7 +90,8 @@ static int dcp_hdmi_dptx_init(dcp_dev_t *dcp, const display_config_t *cfg)
         int r1 = adt_getprop_copy(adt, node, "function-hdmi_pwr_en", &hdmi_pwr, sizeof(hdmi_pwr));
         int r2 = adt_getprop_copy(adt, node, "function-dp2hdmi_pwr_en", &dp2hdmi_pwr,
                                   sizeof(dp2hdmi_pwr));
-        smc_dev_t *smc = r1 || r2 ? NULL : smc_init();
+        printf("dcp: J773g HDMI rail properties: hdmi=%d dp2hdmi=%d\n", r1, r2);
+        smc_dev_t *smc = r1 < 0 || r2 < 0 ? NULL : smc_init();
         if (!smc) {
             printf("dcp: failed to prepare J773g HDMI rails\n");
             return -1;
