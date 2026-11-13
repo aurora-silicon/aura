@@ -607,15 +607,11 @@ int display_configure(const char *config)
         ret = hpd < 0 ? hpd : 0;
         if (hpd > 0 && timing_cnt && color_cnt)
             break;
-        if (retries < status_retries) {
-            if (j773g) {
-                u64 timeout = timeout_calculate(DISPLAY_STATUS_DELAY * 1000);
-                while (!timeout_expired(timeout))
-                    dcp_work(dcp);
-            } else {
-                mdelay(DISPLAY_STATUS_DELAY);
-            }
-        }
+        /* Service DCP once per retry above, then yield for the fixed interval.
+         * Spinning in dcp_work() for the whole interval can keep J773g inside
+         * the DCP transport and prevent the bounded outer retry from advancing. */
+        if (retries < status_retries)
+            mdelay(DISPLAY_STATUS_DELAY);
     }
     printf("display: waited %d ms for display status\n", (retries - 1) * DISPLAY_STATUS_DELAY);
     if (ret < 0) {
