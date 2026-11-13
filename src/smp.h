@@ -51,6 +51,7 @@ u64 smp_get_kernel_release_addr(int cpu);
 int smp_park_for_kernel(void);
 /* Let an OS at EL2 that powers cores off come back through this image: the mailbox, in smp.c. */
 bool smp_resets_return_here(void);
+const char *smp_s2r_why(void);
 u64 smp_s2r_publish(void);
 bool smp_s2r_published(void);
 void smp_s2r_return_to_os(void) __attribute__((noreturn));

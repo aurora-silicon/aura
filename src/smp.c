@@ -391,6 +391,14 @@ static bool smp_rvbar_reaches_here(u64 locked)
  * this image on every core, as it does where iBoot locked RVBAR. Whether the value outlives
  * a SoC sleep is the SoC's own matter: the OS only sleeps where that was tested.
  */
+static char smp_s2r_why_buf[96];
+
+/* Why the last smp_resets_return_here() said no, for the OS's device tree. */
+const char *smp_s2r_why(void)
+{
+    return smp_s2r_why_buf[0] ? smp_s2r_why_buf : "RVBAR does not return here";
+}
+
 static bool smp_point_rvbar_here(void)
 {
     u64 target = (u64)_vectors_start;
@@ -404,8 +412,11 @@ static bool smp_point_rvbar_here(void)
             continue;
         if ((read64(cpu->impl_reg) & RVBAR_ADDR) != target)
             write64(cpu->impl_reg, target);
-        if ((read64(cpu->impl_reg) & RVBAR_ADDR) != target) {
-            printf("SMP: CPU %d RVBAR did not take 0x%lx\n", i, target);
+        u64 rvbar = read64(cpu->impl_reg);
+        if ((rvbar & RVBAR_ADDR) != target) {
+            snprintf(smp_s2r_why_buf, sizeof(smp_s2r_why_buf),
+                     "CPU %d RVBAR reads 0x%lx after writing 0x%lx", i, rvbar, target);
+            printf("SMP: %s\n", smp_s2r_why_buf);
             return false;
         }
     }

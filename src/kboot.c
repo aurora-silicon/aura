@@ -697,13 +697,21 @@ static int dt_set_ctxr_exec_window(int node)
  */
 static int dt_set_s2r_mailbox(int node)
 {
-    if (!in_el2() || !smp_resets_return_here())
+    if (!in_el2())
         return 0;
+    if (!smp_resets_return_here()) {
+        /* Say why, so that a missing deep sleep can be told from the OS side. */
+        const char *why = smp_s2r_why();
+        if (fdt_setprop_string(dt, node, "aurora,s2r-unavailable", why))
+            printf("FDT: couldn't set chosen.aurora,s2r-unavailable\n");
+        return 0;
+    }
 
     /* A core leaving reset is confined to CTXR_D: an OS outside its window can't resume. */
     u64 lower, upper;
     if (ctxr_range(CTXR_RANGE_D, &lower, &upper) && !ctxr_exec_window(NULL, NULL)) {
         printf("FDT: no S2R mailbox: CTXR_D is armed and the OS is outside its window\n");
+        fdt_setprop_string(dt, node, "aurora,s2r-unavailable", "CTXR_D armed, OS outside its window");
         return 0;
     }
 
