@@ -30,6 +30,11 @@
 
 #define RVBAR_LOCK BIT(0)
 #define RVBAR_ADDR GENMASK(47, 12)
+/*
+ * A7 to M3: the address a write leaves in a running core's register. Above it, that core
+ * reads back state bits (44, 48 and 52 on a running T8112 secondary), not address.
+ */
+#define RVBAR_ADDR_UNLOCKED GENMASK(43, 12)
 
 struct spin_table {
     u64 mpidr;
@@ -403,6 +408,13 @@ static bool smp_point_rvbar_here(void)
 {
     u64 target = (u64)_vectors_start;
 
+    if (target & ~RVBAR_ADDR_UNLOCKED) {
+        snprintf(smp_s2r_why_buf, sizeof(smp_s2r_why_buf),
+                 "vectors at 0x%lx are outside RVBAR's address field", target);
+        printf("SMP: %s\n", smp_s2r_why_buf);
+        return false;
+    }
+
     for (int i = 0; i < MAX_CPUS; i++) {
         const struct cpu_info *cpu = &cpu_info[i];
 
@@ -410,10 +422,10 @@ static bool smp_point_rvbar_here(void)
             continue;
         if (i != boot_cpu_idx && !smp_is_alive(i))
             continue;
-        if ((read64(cpu->impl_reg) & RVBAR_ADDR) != target)
+        if ((read64(cpu->impl_reg) & RVBAR_ADDR_UNLOCKED) != target)
             write64(cpu->impl_reg, target);
         u64 rvbar = read64(cpu->impl_reg);
-        if ((rvbar & RVBAR_ADDR) != target) {
+        if ((rvbar & RVBAR_ADDR_UNLOCKED) != target) {
             snprintf(smp_s2r_why_buf, sizeof(smp_s2r_why_buf),
                      "CPU %d RVBAR reads 0x%lx after writing 0x%lx", i, rvbar, target);
             printf("SMP: %s\n", smp_s2r_why_buf);
