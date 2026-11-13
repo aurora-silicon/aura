@@ -8,6 +8,7 @@
 #include "s2r_dcp_pkt.h"
 #include "adt.h"
 #include "dart.h"
+#include "malloc.h"
 #include "sptm_virt_priv.h"
 #include "string.h"
 #include "types.h"
@@ -59,11 +60,13 @@ static struct s2r_dcp {
     int nopen[2];
     u8 busy; /* one core at a time; a contended access is not followed */
 } s2r_dcp[S2R_DCP_N];
-static struct s2r_big {
+struct s2r_big {
     u32 tag;
     u64 prev[S2R_BIG_WORDS]; /* the last value seen; 0 before the first call */
     u8 churn[S2R_BIG_WORDS];
-} s2r_big[S2R_DCP_N][S2R_BIG_SLOTS];
+};
+/* From the heap: the image has no .bss room before the DCP __OS_LOG buffer that sits behind it. */
+static struct s2r_big *s2r_big[S2R_DCP_N];
 static u8 s2r_nbig[S2R_DCP_N];
 static int s2r_n_dcp;
 u32 sptm_virt_s2r_dcp_pkt; /* host: copy the DCPs' IOMFB packets into the ring */
@@ -139,6 +142,8 @@ static void s2r_pkt_rec(int idx, int kind, int word, u64 pa, u64 v, bool a2i)
 
 static int s2r_big_slot(int idx, u32 tag)
 {
+    if (!s2r_big[idx])
+        return -1;
     for (int s = 0; s < s2r_nbig[idx]; s++)
         if (s2r_big[idx][s].tag == tag)
             return s;
@@ -282,6 +287,7 @@ void s2r_dcp_add(const char *name, u64 mbox)
     if (adt_path_offset_trace(adt, path, p) < 0 || adt_get_reg(adt, p, "reg", 0, &base, &size) < 0)
         return;
     s2r_dcp[s2r_n_dcp] = (struct s2r_dcp){.mbox = mbox, .dart = base, .dart_size = size};
+    s2r_big[s2r_n_dcp] = calloc(S2R_BIG_SLOTS, sizeof(struct s2r_big));
     printf("SPTM-virt[s2r]: dcp-pkt %d %s mbox 0x%lx dart 0x%lx\n", s2r_n_dcp, name, mbox, base);
     s2r_n_dcp++;
 }
