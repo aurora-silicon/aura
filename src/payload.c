@@ -72,6 +72,8 @@ static char stage1_esp_chosen[96];
 static void *load_one_payload(void *start, size_t size);
 
 bool stage1_chained;
+/* An older stage passed a post-M4 ANS on running (nvme.adopt=) */
+static bool nvme_live_passed;
 #ifdef DEBUGUSB_PROXY
 bool stage1_window_passed;
 #endif
@@ -302,6 +304,10 @@ static bool check_var(u8 **p)
     } else if (IS_VAR("nvme.adopt=")) {
         /* An older Stage 1 hands its session on running; nvme_init() finds it by itself. */
         stage1_chained = true;
+        nvme_live_passed = true;
+    } else if (IS_VAR("nvme.handoff=")) {
+        /* "off": every payload gets a post-M4 ANS powered off, with its SART entries. */
+        nvme_handoff_off = !strcmp(val, "off");
 #ifdef DEBUGUSB_PROXY
     } else if (IS_VAR("aura.host-window=")) {
         stage1_window_passed = true;
@@ -528,12 +534,15 @@ int payload_run(void)
          * post-M4 ANS too, and can't start one from off: if an earlier stage powered ANS off
          * (nvme.sart=), start it here and hand it on running, as for boot=. Otherwise any other
          * payload gets ANS as this stage found it, or powered off with the SART entries passed
-         * on if this stage used it.
+         * on if this stage used it. With nvme.handoff=off every payload gets ANS powered off
+         * with its SART entries (apple,sart-entries), and starts it itself.
          */
-        bool nvme_started = !boot_spec && nvme_post_m4_passed_off();
-        if (nvme_started && !nvme_init())
+        bool nvme_started = !nvme_handoff_off && !boot_spec && nvme_post_m4_passed_off();
+        /* nvme.handoff=off: take an older stage's live session over, so it goes on powered off. */
+        bool nvme_taken = nvme_handoff_off && !boot_spec && nvme_live_passed && nvme_post_m4();
+        if ((nvme_started || nvme_taken) && !nvme_init())
             goto boot_failed;
-        nvme_keep_running_for_linux = boot_spec || nvme_started;
+        nvme_keep_running_for_linux = !nvme_handoff_off && (boot_spec || nvme_started);
         if (!nvme_keep_running_for_linux && !nvme_shutdown())
             goto boot_failed;
         cpufreq_init();

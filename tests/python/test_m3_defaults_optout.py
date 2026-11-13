@@ -224,6 +224,7 @@ static int kboot_prepare_dt(void *fdt)
     return 0;
 }
 static bool nvme_keep_running_for_linux;
+static bool nvme_handoff_off;
 static int kboot_boot(void *kernel)
 {
     printf("NVME handoff keep=%d\n", nvme_keep_running_for_linux);
@@ -262,6 +263,10 @@ static bool nvme_set_sart_var(const char *v)
 {
     nvme_sart_passed = true;
     return true;
+}
+static bool nvme_post_m4(void)
+{
+    return getenv("M1N1_TEST_POST_M4");
 }
 static bool nvme_post_m4_passed_off(void)
 {
@@ -994,3 +999,31 @@ def test_pre_m4_ignores_sart_entries(tools, build):
     b = boot(tools, build, b"", trailer=SART)
     booted(b)
     assert nvme_events(b) == ["shutdown keep=0", "handoff keep=0"], b.stdout
+
+
+# ---- nvme.handoff=off: every payload gets a post-M4 ANS powered off, with its SART entries ----
+
+OFF = b"nvme.handoff=off\n"
+
+
+@pytest.mark.parametrize("build", STAGE2)
+def test_handoff_off_passes_ans_off_to_the_payload(tools, build, monkeypatch):
+    monkeypatch.setenv("M1N1_TEST_POST_M4", "1")
+    b = boot(tools, build, b"", trailer=OFF + SART)
+    booted(b)
+    assert nvme_events(b) == ["shutdown keep=0", "handoff keep=0"], b.stdout
+
+
+@pytest.mark.parametrize("build", STAGE2)
+def test_handoff_off_takes_a_live_session_over_and_powers_it_off(tools, build, monkeypatch):
+    monkeypatch.setenv("M1N1_TEST_POST_M4", "1")
+    b = boot(tools, build, b"", trailer=OFF + b"nvme.adopt=1\n")
+    booted(b)
+    assert nvme_events(b) == ["init", "shutdown keep=0", "handoff keep=0"], b.stdout
+
+
+@pytest.mark.parametrize("build", STAGE2)
+def test_handoff_off_leaves_pre_m4_alone(tools, build):
+    b = boot(tools, build, b"", trailer=OFF + b"nvme.adopt=1\n")
+    booted(b)
+    assert "init" not in nvme_events(b), b.stdout

@@ -9,6 +9,7 @@ struct sart_entry;
 
 bool nvme_init(void);
 extern bool nvme_keep_running_for_linux;
+extern bool nvme_handoff_off;
 bool nvme_shutdown(void);
 /* Post-M4: how a stage that powered ANS off tells the next one to start it again. */
 bool nvme_post_m4(void);

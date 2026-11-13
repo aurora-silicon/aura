@@ -161,6 +161,8 @@ static int nvme_sart_saved_cnt;
 /* aura only reads the drive; only a proxy-issued flush means the drive has data to settle. */
 static bool nvme_wrote;
 bool nvme_keep_running_for_linux = false;
+/* nvme.handoff=off: no payload gets a post-M4 ANS running, and the payload passes it on off */
+bool nvme_handoff_off = false;
 static u8 nvme_die;
 /* When this stage started the ANS firmware, for the shutdown timing line. */
 static u64 nvme_boot_ticks;

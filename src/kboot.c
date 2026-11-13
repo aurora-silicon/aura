@@ -11279,6 +11279,12 @@ int kboot_prepare_dt(void *fdt)
             bail("FDT: couldn't pass the ANS SART entries on\n");
         printf("FDT: ANS will be off; %d SART entries passed on\n", sart_cnt);
     }
+    /* The payload (U-Boot) hands ANS on off too, and Linux starts it from apple,sart-entries. */
+    if (nvme_handoff_off && nvme_post_m4()) {
+        int chosen = fdt_path_offset(dt, "/chosen");
+        if (chosen < 0 || fdt_setprop_string(dt, chosen, "aurora,nvme-handoff", "off"))
+            bail("FDT: couldn't pass nvme.handoff=off on\n");
+    }
 
     // aura moved itself (start.S). On M3 it moved above the chainloaded image,
     // and cores with a locked RVBAR still reset into the forwarding vector at
