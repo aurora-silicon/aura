@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: MIT
-"""T8140 and T8132 never reach the display DART view.
+"""Inherited-only chips never reach the display DART view, except admitted J773g.
 
 display_init() is compiled verbatim from src/display.c with host stubs for
-everything it calls. On T8140 and T8132 it must return before the dummy
+everything it calls. On T8140 and a non-admitted T8132 it must return before the dummy
 framebuffer path, so neither display_configure() nor any DCP or DART work runs,
-even with the 640x1136 framebuffer that makes every other chip start the DCP.
+even with the 640x1136 framebuffer that makes every other chip start the DCP. The
+exact J773g machine predicate is the positive T8132 control.
 display_dart_tables_inherited() must then answer false without looking at a
 DART. A T6000 run is the positive control.
 """
@@ -48,6 +49,7 @@ static struct { enum fw_version version; } os_firmware = {V15_0B1};
 static int dummy_adt;
 static void *adt = &dummy_adt;
 static unsigned configures, t8152_inits, dart_queries, config_queries, adt_queries;
+static bool admitted_j773g;
 
 static bool adt_is_compatible(void *tree, int node, const char *compat)
 {
@@ -70,6 +72,7 @@ static const void *adt_getprop(void *tree, int node, const char *name, u32 *len)
 }
 static int display_configure(const char *config) { (void)config; configures++; return 0; }
 static int display_init_t8152(void) { t8152_inits++; return 0; }
+static bool kboot_is_j773g_machine(void) { return admitted_j773g; }
 static void fb_clear_direct(void) {}
 static bool firmware_sfw_in_range(enum fw_version lo, enum fw_version hi) { (void)lo; (void)hi; return false; }
 static const display_config_t m1 = {"/arm-io/dcp", "/arm-io/dart-dcp", "/arm-io/dart-disp0"};
@@ -89,6 +92,7 @@ static void boot(u32 chip)
     cur_boot_args.video.height = 1136;
     cur_boot_args.video.depth = 30;
     configures = t8152_inits = dart_queries = config_queries = adt_queries = 0;
+    admitted_j773g = false;
 }
 
 int main(void)
@@ -101,6 +105,10 @@ int main(void)
         assert(!display_dart_tables_inherited());
         assert(!dart_queries && !config_queries);
     }
+    boot(T8132);
+    admitted_j773g = true;
+    assert(display_init() == 0 && configures == 1);
+    assert(display_dart_tables_inherited() && dart_queries == 1 && config_queries == 1);
     /* Positive control: the same dummy framebuffer starts the DCP on T6000,
      * and the inherited-table question goes to its display DARTs. */
     boot(T6000);

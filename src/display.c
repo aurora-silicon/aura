@@ -9,6 +9,7 @@
 #include "dcp_iboot.h"
 #include "fb.h"
 #include "firmware.h"
+#include "kboot.h"
 #include "memory.h"
 #include "soc.h"
 #include "string.h"
@@ -74,6 +75,23 @@ static const display_config_t display_config_j873_hdmi_ext = {
     .num_dptxports = 2,
 };
 
+/* J773g has the same HDMI wiring as J873g, but iBoot leaves the main DCP
+ * running behind locked DARTs. The exact 26.6.2 board admission is checked
+ * before this configuration is selected. */
+static const display_config_t display_config_j773g = {
+    .dcp = "/arm-io/dcp",
+    .dcp_dart = "/arm-io/dart-dcp",
+    .disp_dart = "/arm-io/dart-disp0",
+    .dp2hdmi_gpio = "/arm-io/dp2hdmi-gpio0",
+    .dptx_phy = "/arm-io/dptx-phy",
+    .pmgr_dev = "DISP_CPU",
+    .dcp_alias = "dcp",
+    .dcp_index = 0,
+    .fw_version = V26_6_2,
+    .num_dptxports = 2,
+    .no_reset = true,
+};
+
 /* Config used by display_start_dcp(); the USB-C route keeps the base DCP. */
 static const display_config_t *t8152_config = &display_config_m1;
 
@@ -124,6 +142,7 @@ static const display_config_t display_config_m2 = {
     .dp2hdmi_gpio = "/arm-io/dp2hdmi-gpio",
     .dptx_phy = "/arm-io/dptx-phy",
     .num_dptxports = 2,
+    .fw_version = V13_5,
 };
 
 static const display_config_t display_config_m2_pro_max = {
@@ -146,6 +165,7 @@ static const display_config_t display_config_m2_pro_max = {
 #endif
     .dp2hdmi_gpio = "/arm-io/dp2hdmi-gpio0",
     .dptx_phy = "/arm-io/lpdptx-phy0",
+    .fw_version = V13_5,
 };
 
 static const display_config_t display_config_m2_ultra = {
@@ -159,6 +179,7 @@ static const display_config_t display_config_m2_ultra = {
     .dcp_index = 1,
     .num_dptxports = 2,
     .die = 1,
+    .fw_version = V13_5,
 };
 
 #define abs(x) ((x) >= 0 ? (x) : -(x))
@@ -339,6 +360,8 @@ const display_config_t *display_get_config(void)
         conf = &display_config_m2_pro_max;
     else if (adt_is_compatible(adt, 0, "J180dAP") || adt_is_compatible(adt, 0, "J475dAP"))
         conf = &display_config_m2_ultra;
+    else if (kboot_is_j773g_machine())
+        conf = &display_config_j773g;
     else if (chip_id == T8152)
         conf = t8152_config;
     else
@@ -354,13 +377,12 @@ const display_config_t *display_get_config(void)
 
 /*
  * Whether this stage or an earlier one may have mapped into the inherited tables
- * of a locked display DART (dart_init_adt_display()). T8140 and T8132 never get
- * that far: display_init() returns before any DCP or DART work on them, in every
- * stage, and kboot keeps their retained heap separately.
+ * of a locked display DART (dart_init_adt_display()). T8140 and non-admitted
+ * T8132 machines never get that far; J773g does and its tables must be kept.
  */
 bool display_dart_tables_inherited(void)
 {
-    if (chip_id == T8140 || chip_id == T8132)
+    if (chip_id == T8140 || (chip_id == T8132 && !kboot_is_j773g_machine()))
         return false;
 
     const display_config_t *conf = display_get_config();
@@ -971,6 +993,11 @@ int display_init(void)
         return display_init_t8152();
     }
 
+    if (kboot_is_j773g_machine()) {
+        display_is_external = true;
+        return display_configure(NULL);
+    }
+
     const char *disp_path;
     if (adt_is_compatible(adt, 0, "J180dAP") || adt_is_compatible(adt, 0, "J475dAP"))
         disp_path = "/arm-io/dispext4";
@@ -1047,7 +1074,8 @@ int display_shutdown(dcp_shutdown_mode mode)
 {
     /* Linux owns the live J700/J713/J873 controllers. Keep the inherited ASC session
      * and scanout intact at both the Stage 1 and Linux boundaries. */
-    if (chip_id == T8140 || chip_id == T8132 || chip_id == T8152)
+    if (chip_id == T8140 || (chip_id == T8132 && !kboot_is_j773g_machine()) ||
+        chip_id == T8152)
         return 0;
 
     /* We have no DCP, so just exit */
@@ -1066,9 +1094,11 @@ int display_shutdown(dcp_shutdown_mode mode)
             case DCP_SLEEP_IF_EXTERNAL:
                 if (!display_is_external)
                     printf("display: Quiescing DCP (internal)\n");
+                else if (dcp->no_reset)
+                    printf("display: Quiescing DCP (external, no reset)\n");
                 else
                     printf("display: Sleeping DCP (external)\n");
-                dcp_shutdown(dcp, display_is_external);
+                dcp_shutdown(dcp, display_is_external && !dcp->no_reset);
                 break;
             case DCP_SLEEP:
                 printf("display: Sleeping DCP (unconditional)\n");

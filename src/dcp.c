@@ -86,7 +86,26 @@ static int dcp_hdmi_dptx_init(dcp_dev_t *dcp, const display_config_t *cfg)
     const struct adt_function_smc_pw8 *pw8_dp2hdmi =
         adt_getprop(adt, node, "function-dp2hdmi_pwr_en", &pw8_size);
 
-    if (chip_id == T8152 && pw8_dp2hdmi && pw8_size == sizeof(*pw8_dp2hdmi)) {
+    if (cfg->no_reset) {
+        int r1 = adt_getprop_copy(adt, node, "function-hdmi_pwr_en", &hdmi_pwr,
+                                  sizeof(hdmi_pwr));
+        int r2 = adt_getprop_copy(adt, node, "function-dp2hdmi_pwr_en", &dp2hdmi_pwr,
+                                  sizeof(dp2hdmi_pwr));
+        smc_dev_t *smc = r1 || r2 ? NULL : smc_init();
+        if (!smc) {
+            printf("dcp: failed to prepare J773g HDMI rails\n");
+            return -1;
+        }
+        /* Linux enables the HDMI rail (gP0f) before the converter (gP1a). */
+        r1 = smc_write_u32(smc, hdmi_pwr.gpio, 0x1000001);
+        r2 = r1 ? -1 : smc_write_u32(smc, dp2hdmi_pwr.gpio, 0x1000001);
+        smc_shutdown(smc);
+        if (r1 || r2) {
+            printf("dcp: J773g HDMI rail power failed: hdmi=%d dp2hdmi=%d\n", r1, r2);
+            return -1;
+        }
+        mdelay(100);
+    } else if (chip_id == T8152 && pw8_dp2hdmi && pw8_size == sizeof(*pw8_dp2hdmi)) {
         u32 hdmi_size;
         const struct adt_function_smc_pw8 *pw8_hdmi =
             adt_getprop(adt, node, "function-hdmi_pwr_en", &hdmi_size);
@@ -254,14 +273,15 @@ dcp_dev_t *dcp_init(const display_config_t *cfg)
         /* J873g reports mBoot-20457.1.29, which is not in the OS firmware
          * table, and the same dptx-port endpoint works on its USB-C route.
          * Keep the V13_5 restriction for the machines it was written for. */
-        if (os_firmware.version != V13_5 && chip_id != T8152) {
-            printf("dcp: dtpx-port is only supported with V13_5 OS firmware.\n");
+        if (cfg->fw_version && os_firmware.version != cfg->fw_version && chip_id != T8152) {
+            printf("dcp: dptx-port is not supported with OS firmware %s.\n", os_firmware.string);
             return NULL;
         }
 
         strncpy(dcp_pmgr_dev, cfg->pmgr_dev, sizeof(dcp_pmgr_dev));
         dcp_die = cfg->die;
-        pmgr_adt_power_enable(cfg->dcp);
+        if (!cfg->no_reset)
+            pmgr_adt_power_enable(cfg->dcp);
         int phy_node = adt_path_offset(adt, cfg->dptx_phy);
         if (phy_node >= 0 && adt_is_compatible(adt, phy_node, "dptx-phy,t8152")) {
             /* The T8152 dptx-phy node lists gate 5 in power-gates, which is
@@ -300,6 +320,7 @@ dcp_dev_t *dcp_init(const display_config_t *cfg)
     dcp_dev_t *dcp = calloc(1, sizeof(dcp_dev_t));
     if (!dcp)
         return NULL;
+    dcp->no_reset = cfg->no_reset;
 
     dcp->dart_dcp = dart_init_adt_display(cfg->dcp_dart, 0, sid);
     if (!dcp->dart_dcp) {
@@ -324,7 +345,7 @@ dcp_dev_t *dcp_init(const display_config_t *cfg)
         printf("dcp: failed to create firmware mappings\n");
         goto out_iovad;
     }
-    if (ret > 0) {
+    if (ret > 0 && !cfg->no_reset) {
         pmgr_reset(dcp_die, dcp_pmgr_dev);
     }
 
@@ -338,6 +359,11 @@ dcp_dev_t *dcp_init(const display_config_t *cfg)
     if (!dcp->rtkit) {
         printf("dcp: failed to initialize RTKit\n");
         goto out_iovad;
+    }
+
+    if (cfg->no_reset) {
+        rtkit_set_dva_base(dcp->rtkit, dart_dva_base(dcp->dart_dcp));
+        rtkit_set_oslog_echo(dcp->rtkit, true);
     }
 
     /* Keep unqualified ASCWrap-v8 firmware from trapping startup in a wait. */
@@ -388,7 +414,7 @@ int dcp_shutdown(dcp_dev_t *dcp, bool sleep)
 {
     /* The ASCWrap-v8 sleep path needs a PMGR2 reset, which is not implemented
      * yet. Quiescing has a working RTKit wake/renegotiation path on T8152. */
-    if (sleep && asc_is_v8(dcp->asc)) {
+    if (sleep && (asc_is_v8(dcp->asc) || dcp->no_reset)) {
         printf("dcp: using quiesce instead of sleep without PMGR2 reset\n");
         sleep = false;
     }
@@ -423,7 +449,7 @@ int dcp_shutdown(dcp_dev_t *dcp, bool sleep)
         dcp_mark_running();
         return -1;
     }
-    if (sleep)
+    if (sleep && !dcp->no_reset)
         pmgr_reset(dcp_die, dcp_pmgr_dev);
     rtkit_free(dcp->rtkit);
     dart_shutdown(dcp->dart_disp);
