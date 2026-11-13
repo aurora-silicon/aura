@@ -50,6 +50,7 @@ struct sptm_virt_placement {
 #define SPTM_VIRT_GPU          BIT(6) /* hook and record the GPU and PMP registers */
 #define SPTM_VIRT_SAMPLE       BIT(7) /* sample the guest's PC until its XNU entry */
 #define SPTM_VIRT_S2R_MEM      BIT(8) /* T6050: also hook the MCC and the coprocessor DARTs */
+#define SPTM_VIRT_TRACE        BIT(9) /* hook and record the ADT windows the host names */
 /* sptm_virt_s2r_cp_ansx, with COPROC on T6050 */
 #define S2R_CP_ANSX_SART  BIT(0) /* sart-ans reg[0-2], first page each */
 #define S2R_CP_ANSX_NVME  BIT(1) /* the NVMe BAR's first page (reg[9]) */

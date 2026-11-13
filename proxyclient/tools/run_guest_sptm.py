@@ -37,6 +37,7 @@ Environment (all optional; 1 enables a switch):
   AURA_S2R_USB_RETAKE_MS   delay from XNU's return to the re-take (ms)
   AURA_XNU_BT              sample XNU backtraces every few seconds per core
   AURA_GPU_TRACE           hook the GPU (sgx reg 0) and PMP registers, record every access
+  AURA_TRACE_NODES=<p:i:n,..>  hook and record ADT windows (path:reg index or *:name), like the GPU trace
   AURA_GPU_STOP_SECS=<n>   park in the proxy n s after the first GPU access (read the ring)
   AURA_GPU_STOP_MSG=<v>    park right after the guest writes v to the GPU (a mailbox message)
   AURA_GPU_PRINT_MAX=<n>   print at most n GPU accesses on aura's console (default 20000)
@@ -103,7 +104,9 @@ CONFIG_FLAGS = {
     "AURA_SAMPLE": 1 << 7,
     "AURA_S2R_MEM": 1 << 8,
 }
+TRACE_FLAG = 1 << 9  # SPTM_VIRT_TRACE, set by AURA_TRACE_NODES
 KNOWN_ENV = {
+    "AURA_TRACE_NODES",
     "AURA_KEEP_EXCLAVES",
     "AURA_OS_LONG_VERSION",
     "AURA_KEEP_BOOT_VIDEO",
@@ -618,6 +621,14 @@ def configure(p, sym, plan, adt):
     if plan.diag_pa:
         print(f"SPTM diagnostic record at 0x{plan.diag_pa:x}")
     flags = sum(bit for name, bit in CONFIG_FLAGS.items() if env_on(name))
+    spec = os.environ.get("AURA_TRACE_NODES", "")
+    if spec:
+        raw = spec.encode() + b"\0"
+        if len(raw) > 512:
+            raise SystemExit("AURA_TRACE_NODES is longer than 511 bytes")
+        p.iface.writemem(sym["sptm_virt_trace_spec"], raw)
+        print("MMIO trace of:", spec)
+        flags |= TRACE_FLAG
     p.call(sym["sptm_virt_config"], flags)
     for env, symbol in (("AURA_SAMPLE_HZ", "sptm_virt_sample_hz"),
                         ("AURA_SAMPLE_MAX", "sptm_virt_sample_max")):

@@ -24,7 +24,7 @@
 
 #define GPU_RING_BYTES (16UL << 20)
 #define GPU_SEEN_MAX   2048
-#define GPU_MAX_RANGES 10
+#define GPU_MAX_RANGES 32
 
 struct gpu_rec {
     u64 t;    /* CNTPCT_EL0 */
@@ -44,6 +44,9 @@ u32 sptm_virt_gpu_stop_boot_secs; /* park this long after the guest's entry, GPU
                                    */
 u64 sptm_virt_gpu_stop_msg; /* park after a write of this value (a mailbox message); 0 = never */
 u32 sptm_virt_gpu_print_max = 20000;
+/* SPTM_VIRT_TRACE: "path:idx:name,..." (idx * = every reg entry), set by the host before entry. */
+char sptm_virt_trace_spec[512];
+static const char *trc_pfx = "GPU";
 
 static struct {
     u64 base, size;
@@ -185,11 +188,11 @@ static bool gpu_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int w
     bool ksm = gpu_sgx && addr >= gpu_sgx + 0x21000 && addr < gpu_sgx + 0x22000;
     if ((write || ksm || gpu_first_read(addr)) && gpu_printed < sptm_virt_gpu_print_max) {
         gpu_printed++;
-        printf("GPU %s c%d %s+0x%lx %s%u 0x%lx pc 0x%lx t %lu\n", write ? "W" : "R", smp_id(), what,
+        printf("%s %s c%d %s+0x%lx %s%u 0x%lx pc 0x%lx t %lu\n", trc_pfx, write ? "W" : "R", smp_id(), what,
                off, width == 4 ? "x" : "", width == 4 ? 128 : 8u << width,
                width == 4 ? val[0] : *val, ctx->elr, now - gpu_first_t);
         if (width == 4)
-            printf("GPU %s c%d %s+0x%lx hi 0x%lx\n", write ? "W" : "R", smp_id(), what, off + 8,
+            printf("%s %s c%d %s+0x%lx hi 0x%lx\n", trc_pfx, write ? "W" : "R", smp_id(), what, off + 8,
                    val[1]);
         if (gpu_printed == sptm_virt_gpu_print_max)
             printf("SPTM-virt[gpu]: print budget used up; the ring keeps recording\n");
@@ -229,6 +232,16 @@ static void gpu_hook_adt(const char *path, int idx, const char *what, u64 off, u
     int p[8];
     u64 pa, sz;
 
+    if (idx < 0) {
+        if (adt_path_offset_trace(adt, path, p) < 0) {
+            printf("SPTM-virt[trace]: no %s; %s not traced\n", path, what);
+            return;
+        }
+        for (int i = 0; adt_get_reg(adt, p, "reg", i, &pa, &sz) >= 0; i++)
+            gpu_hook_range(what, pa, sz);
+        return;
+    }
+
     if (adt_path_offset_trace(adt, path, p) < 0 || adt_get_reg(adt, p, "reg", idx, &pa, &sz) < 0) {
         printf("SPTM-virt[gpu]: no %s reg[%d]; %s not traced\n", path, idx, what);
         return;
@@ -246,7 +259,7 @@ void sptm_virt_gpu_setup(void)
         printf("SPTM-virt[park]: the guest parks in the proxy at its first GL trap after %u s\n",
                sptm_virt_gpu_stop_boot_secs);
     }
-    if (!(sptm_virt_flags & SPTM_VIRT_GPU))
+    if (!(sptm_virt_flags & (SPTM_VIRT_GPU | SPTM_VIRT_TRACE)))
         return;
     sptm_virt_gpu_ring = memalign(0x4000, GPU_RING_BYTES);
     if (!sptm_virt_gpu_ring) {
@@ -259,6 +272,31 @@ void sptm_virt_gpu_setup(void)
     sptm_virt_gpu_nrec = GPU_RING_BYTES / sizeof(struct gpu_rec);
     sptm_virt_gpu_head = 0;
 
+    if (sptm_virt_flags & SPTM_VIRT_TRACE) {
+        /* "path:idx:name,...": each entry's reg window(s), recorded like the GPU's. */
+        char *e = sptm_virt_trace_spec;
+        sptm_virt_trace_spec[sizeof(sptm_virt_trace_spec) - 1] = 0;
+        if (!(sptm_virt_flags & SPTM_VIRT_GPU))
+            trc_pfx = "MMIO";
+        while (e && *e) {
+            char *next = strchr(e, ',');
+            if (next)
+                *next++ = 0;
+            char *c1 = strchr(e, ':'), *c2 = c1 ? strchr(c1 + 1, ':') : NULL;
+            if (c1 && c2) {
+                *c1 = *c2 = 0;
+                int idx = c1[1] == '*' ? -1 : 0;
+                for (char *d = c1 + 1; idx >= 0 && *d >= '0' && *d <= '9'; d++)
+                    idx = idx * 10 + (*d - '0');
+                gpu_hook_adt(e, idx, c2 + 1, 0, 0);
+            } else {
+                printf("SPTM-virt[trace]: bad entry '%s' (want path:idx:name)\n", e);
+            }
+            e = next;
+        }
+    }
+    if (!(sptm_virt_flags & SPTM_VIRT_GPU))
+        goto done;
     /* sgx reg 0 holds the GPU's PMGR (+0xe80000), its start control and both ASCs. */
     gpu_hook_adt("/arm-io/sgx", 0, "sgx", 0, 0);
     /* Both GPU coprocessors' ASC windows: the mailboxes the driver and firmware talk over. */
@@ -268,6 +306,7 @@ void sptm_virt_gpu_setup(void)
     gpu_hook_adt("/arm-io/mcc", 8, "pmp-ptd", 0, 0);
     gpu_hook_adt("/arm-io/mcc", 9, "pmp-ptd-upd", 0, 0);
     gpu_hook_adt("/arm-io/pmp", 0, "pmp-asc", 0, 0);
+done:
     printf("SPTM-virt[gpu]: ring 0x%lx (%lu records, head at 0x%lx), stop after %u s or a write of "
            "0x%lx, print budget %u\n",
            (u64)sptm_virt_gpu_ring, sptm_virt_gpu_nrec, (u64)&sptm_virt_gpu_head,
