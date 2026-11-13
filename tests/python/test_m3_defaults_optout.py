@@ -223,7 +223,13 @@ static int kboot_prepare_dt(void *fdt)
     printf("SELECT %s\n", selected);
     return 0;
 }
-static int kboot_boot(void *kernel) { printf("RESULT booted=1\n"); return 0; }
+static bool nvme_keep_running_for_linux;
+static int kboot_boot(void *kernel)
+{
+    printf("NVME handoff keep=%d\n", nvme_keep_running_for_linux);
+    printf("RESULT booted=1\n");
+    return 0;
+}
 
 /* The rest of the machine payload_run() talks to */
 static const char *target_type;
@@ -239,9 +245,28 @@ static int mitigations_perform(void) { return 0; }
 static bool smp_is_alive(int cpu) { return false; }
 static int smp_call_sync0(int cpu, void (*fn)(void)) { return 0; }
 static void do_enable_tso(void) {}
-static bool nvme_shutdown(void) { return true; }
-static bool nvme_keep_running_for_linux;
-static bool nvme_set_sart_var(const char *v) { return true; }
+/* Post-M4 ANS (M1N1_TEST_POST_M4): powered off by an earlier stage once nvme.sart= arrives */
+static bool nvme_sart_passed, nvme_started;
+static bool nvme_init(void)
+{
+    printf("NVME init\n");
+    nvme_started = true;
+    return !getenv("M1N1_TEST_NVME_INIT_FAIL");
+}
+static bool nvme_shutdown(void)
+{
+    printf("NVME shutdown keep=%d\n", nvme_keep_running_for_linux);
+    return true;
+}
+static bool nvme_set_sart_var(const char *v)
+{
+    nvme_sart_passed = true;
+    return true;
+}
+static bool nvme_post_m4_passed_off(void)
+{
+    return getenv("M1N1_TEST_POST_M4") && nvme_sart_passed && !nvme_started;
+}
 static int display_configure(const char *s) { printf("DISPLAY %s\n", s); return 0; }
 static int display_configure_second(const char *s) { printf("DISPLAY2 %s\n", s); return 0; }
 #define T8132 0x8132
@@ -928,3 +953,44 @@ def test_a_swallowed_hib_line_is_a_lost_line(tools, build):
 
 def test_stage1_does_not_hand_hib_on(tools):
     assert b"hib=" not in stage1(tools, b"hib=1\n")
+
+
+# ---- post-M4 ANS: the embedded U-Boot adopts a running ANS and can't start one from off ----
+
+SART = b"nvme.sart=" + b"0" * 48 + b"\n"
+
+
+def nvme_events(r):
+    return [line[5:] for line in r.stdout.splitlines() if line.startswith("NVME ")]
+
+
+@pytest.mark.parametrize("build", STAGE2)
+def test_post_m4_ans_passed_off_is_started_for_the_payload(tools, build, monkeypatch):
+    monkeypatch.setenv("M1N1_TEST_POST_M4", "1")
+    b = boot(tools, build, b"", trailer=SART)
+    booted(b)
+    assert nvme_events(b) == ["init", "handoff keep=1"], b.stdout
+
+
+@pytest.mark.parametrize("build", STAGE2)
+def test_post_m4_ans_start_failure_stops_the_handoff(tools, build, monkeypatch):
+    monkeypatch.setenv("M1N1_TEST_POST_M4", "1")
+    monkeypatch.setenv("M1N1_TEST_NVME_INIT_FAIL", "1")
+    b = boot(tools, build, b"", trailer=SART)
+    assert b.rc == -1 and not b.booted, b.stdout
+    assert nvme_events(b)[0] == "init" and "handoff keep=1" not in nvme_events(b)
+
+
+@pytest.mark.parametrize("build", STAGE2)
+def test_ans_left_as_found_without_sart_entries(tools, build, monkeypatch):
+    monkeypatch.setenv("M1N1_TEST_POST_M4", "1")
+    b = boot(tools, build, b"")
+    booted(b)
+    assert nvme_events(b) == ["shutdown keep=0", "handoff keep=0"], b.stdout
+
+
+@pytest.mark.parametrize("build", STAGE2)
+def test_pre_m4_ignores_sart_entries(tools, build):
+    b = boot(tools, build, b"", trailer=SART)
+    booted(b)
+    assert nvme_events(b) == ["shutdown keep=0", "handoff keep=0"], b.stdout
