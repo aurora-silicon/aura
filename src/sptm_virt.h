@@ -72,6 +72,9 @@ int sptm_virt_esp_boot(const char *spec);
 #ifdef AURACTL
 /* nv2.c: an HVC from the guest's kernel; true if it was auractl's (src/sptm_virt_ctl.c). */
 bool sptm_virt_ctl_hvc(u64 *regs, u64 esr);
+/* nv2.c: an EC=0x18 sysreg trap from the guest's user space; true if it was a DCC access the
+ * second (kext-free) transport owns, which it consumes (src/sptm_virt_ctl.c). */
+bool sptm_virt_ctl_dcc(u64 *regs, u64 esr);
 #endif
 
 /* Set once the boot CPU has entered the guest; read with the MMU off by the reset path. */
