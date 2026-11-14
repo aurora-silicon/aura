@@ -75,7 +75,10 @@ A block this ADT lacks is listed as absent. Arming a name arms every range of th
 `auractl peek` reads up to 64 32-bit words from one `pmgr-*`, `clkgen` or `nub-ap-ctrl` range
 whose pages aura would hook. It never reads a mailbox, a FIFO, the PMS or the AMCC. Some words
 fault the SoC when read, so PEEK works only on a chip whose never-read list aura carries: T8140
-for now. On any other chip it returns `EACCES`. (TODO: the lists for the other SPTM-virt chips.)
+for now. On any other chip it returns `EACCES`. The T6040/T6041 (J616s) path is wired, but its
+list is still pending confirmation from our own measured J616s ADT (same as T8140's, no Apple
+firmware bytes), so PEEK is `EACCES` there until then. (TODO: the lists for the other SPTM-virt
+chips.)
 
 ## Build
 
