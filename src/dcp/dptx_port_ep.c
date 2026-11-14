@@ -195,8 +195,14 @@ int dptxport_connect(afk_epic_service_t *service, u8 core, u8 atc, u8 die)
 
     if (resp.target != target)
         return -1;
-    if (resp.unk != 0x100)
-        return -1;
+    /*
+     * The reply's unk field is not a success flag: it echoes the request.
+     * EPIC v1 firmware (T6021 / J475c, OS firmware 13.5) is sent unk 0 and
+     * answers 0, so requiring 0x100 aborted display setup after a connect
+     * that had succeeded. Linux only logs a mismatch; do the same.
+     */
+    if (resp.unk != cmd.unk && resp.unk != 0x100)
+        printf("DPTXPort: connect reply unk %#x (sent %#x), continuing\n", resp.unk, cmd.unk);
 
     return 0;
 }
