@@ -67,7 +67,10 @@ Pages the trace setup hooked are listed as hooked. auractl cannot release them.
 - on a chip whose sleep is the S2R timer's start alone, its PS groups, the cores' windows and the
   timer's page;
 - the coprocessors' mailboxes (`<name>-mbox`, the ASC's page at +0x8000), `gpio0`, `spmi0`,
-  `spmi-a0` and `dart-dcp`.
+  `spmi-a0` and `dart-dcp`;
+- the media blocks' main windows, `ane`, `isp`, `ave`, `avd`, `jpeg0`, `jpeg1`, `scaler0` and
+  `apr` (its engine, reg[1]), and their DARTs' own windows (`dart-<block>`, and
+  `dart-<block>-dapf` for a DAPF window), taken from each DART's `instance` table.
 
 A block this ADT lacks is listed as absent. Arming a name arms every range of that name.
 

@@ -56,6 +56,7 @@ extern struct {
 
 int adt_path_offset_trace(const void *dt, const char *path, int *offs);
 int adt_get_reg(const void *dt, const int *path, const char *prop, int idx, u64 *pa, u64 *sz);
+const void *adt_getprop(const void *dt, int node, const char *name, u32 *len);
 void hv_pt_split_block(u64 addr);
 void mmu_add_mapping(u64 from, u64 to, size_t size, u8 attr, u64 perms);
 void mmu_rm_mapping(u64 from, size_t size);
