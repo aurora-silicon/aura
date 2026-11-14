@@ -60,7 +60,7 @@
  * nodes stay "disabled": only a kernel that sees apple,t8122-handoff may enable them, and a T8122
  * kernel device tree without display nodes is normal. No T8122 PMP is handed off here.
  *
- * T6031 (M3 Max, J514C/J516C only; nothing at all on another board or chip, so not on a T6034):
+ * T6031 (M3 Max, J514C/J516C only; its profile never applies to T6034):
  * the T8122 handoff with T6031 values, armed by chosen.asahi,t6031-dcp=1, as on T6030 and T8122.
  * dt_set_m3_defaults() (kboot.c) sets it on J514C and J516C unless a config line set it.
  * The kernel decides whether to take the display over (a kernel
@@ -392,6 +392,34 @@ static const struct dcp_soc dcp_soc_t6031 = {
     .pmgr_disp_cpu = 0x2922802a0UL,
 };
 
+/* J514M/T6034: fresh ADT registers and image UUID match this checked layout. */
+static const char *const dcp_boards_t6034[] = {"apple,j514m", NULL};
+
+static const struct dcp_soc dcp_soc_t6034 = {
+    .name = "T6034",
+    .chip = T6034,
+    .compat = "apple,t6034",
+    .boards = dcp_boards_t6034,
+    .boards_desc = "J514M",
+    .dcp_compat = "apple,t6034-dcp",
+    .disp_compat = "apple,t6034-display-subsystem",
+    .marker = "apple,t6034-handoff",
+    .optin = "asahi,t6034-dcp",
+    .oslog_always = true,
+    .adt_psreg = true,
+    .board_gate = true,
+    .uuid = "F493F03E-CC40-3D89-9A08-5F259BA2B246",
+    .log_streams = true,
+    .os_fw = V14_7,
+    .os_fw_name = "14.7",
+    .coproc = 0x386c00000UL,
+    .dart_dcp = 0x38530c000UL,
+    .dart_disp = 0x385304000UL,
+    .vm_base = DCP6_DART_VM_BASE,
+    .vm_size = DCP6_DART_VM_SIZE,
+    .pmgr_disp_cpu = 0x2922802a0UL,
+};
+
 /*
  * T6041 display block of the M4 Pro (T6040, J616s), with the desktop 26.6.2 DCP firmware. The DCP
  * maps through dart-dcp SID 23 and the display and its piodma through dart-disp0 SIDs 0 and 16, of
@@ -483,10 +511,12 @@ static const struct dcp_soc dcp_soc_t6050 = {
     .t6050 = true,
 };
 
-static const struct dcp_soc *const dcp_socs[] = {&dcp_soc_t6030,     &dcp_soc_t8122,
-                                                 &dcp_soc_t6031,     &dcp_soc_t6041,
-                                                 &dcp_soc_t6041_max, &dcp_soc_t6050};
+static const struct dcp_soc *const dcp_socs[] = {
+    &dcp_soc_t6030, &dcp_soc_t8122,      &dcp_soc_t6031, &dcp_soc_t6034,
+    &dcp_soc_t6041, &dcp_soc_t6041_max, &dcp_soc_t6050};
 
+/* T6034 has its own exact J514M/profile/firmware checks above. It reuses only
+ * the measured register layout and the generic bounded handoff transaction. */
 struct dcp6_seg {
     u64 phys;
     u64 size; /* rounded up to 16K */

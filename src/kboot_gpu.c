@@ -1311,14 +1311,15 @@ static int g15_set_csafr(void *dt, const struct g15_aux aux[2], u32 sram_uv, u32
     return 0;
 }
 
-/* The gpu node properties that hold stand-ins, not this Mac's values (T6031) */
-static int g15_set_standins(void *dt)
+/* The G15C gpu-node properties that hold stand-ins, not measured power values. */
+static int g15_set_standins(void *dt, const struct g15_soc *soc)
 {
     static const char list[] = "apple,core-leak-coef\0apple,sram-leak-coef\0apple,cs-leak-coef\0"
                                "apple,afr-leak-coef\0opp-microwatt";
     int gpu = fdt_path_offset(dt, "gpu");
-    if (gpu < 0 || fdt_setprop(dt, gpu, "asahi,t6031-gpu-standin", list, sizeof(list)))
-        bail("FDT: GPU: failed to set asahi,t6031-gpu-standin\n");
+    const char *prop = soc->chip == T6034 ? "asahi,t6034-gpu-standin" : "asahi,t6031-gpu-standin";
+    if (gpu < 0 || fdt_setprop(dt, gpu, prop, list, sizeof(list)))
+        bail("FDT: GPU: failed to set %s\n", prop);
     return 0;
 }
 
@@ -2045,10 +2046,9 @@ static const struct g15_soc g15_soc_t8122_standin = {
 
 static int g15c_standin_read_leak(const struct g15_soc *soc, float *leak)
 {
-    UNUSED(soc);
-    printf("FDT: GPU: T6031 leakage: stand-in %u per cluster (no G15C leakage source); SRAM, CS "
+    printf("FDT: GPU: %s leakage: stand-in %u per cluster (no G15C leakage source); SRAM, CS "
            "and AFR 0\n",
-           (u32)G15C_STANDIN_LEAK);
+           soc->name, (u32)G15C_STANDIN_LEAK);
     *leak = G15C_STANDIN_LEAK;
     return 0;
 }
@@ -2056,7 +2056,7 @@ static int g15c_standin_read_leak(const struct g15_soc *soc, float *leak)
 static void calc_power_t6031_standin(u32 count, const struct perf_state *core, float leak,
                                      u32 enabled_cores, u32 *max_pwr)
 {
-    printf("FDT: GPU: T6031 power model: stand-in, the G15S model for %u cores (not measured; "
+    printf("FDT: GPU: G15C power model: stand-in, the G15S model for %u cores (not measured; "
            "does not limit clocks)\n",
            enabled_cores);
     calc_power_t6030(count, core, leak, enabled_cores, max_pwr);
@@ -2083,13 +2083,35 @@ static const struct g15_soc g15_soc_t6031 = {
     .calc_power = calc_power_t6031_standin,
 };
 
-/* This boot's T6031 firmware family (NULL: not admitted) and powered identity, set before the setup
+/* J514M: four physical G15C clusters, with enabled cores measured from its fuses. */
+static const struct g15_soc g15_soc_t6034 = {
+    .chip = T6034,
+    .name = "T6034",
+    .gpu_name = "G15C",
+    .compatible = "apple,agx-t6034",
+    .optin = "asahi,t6034-gpu",
+    .id_gen = 7,
+    .id_variant = 4, // drm/asahi hw/agx3.rs T6031: family 7, variant 4 = C
+    .cores_per_cluster = T6031_CORES_PER_CLUSTER,
+    .clusters = T6031_GPU_CLUSTERS,
+    .dies = 1,
+    .mask2_bits = 32,
+    .power_props = true,
+    .family_fw = true,
+    .probed = true,
+    .csafr = true,
+    .fw_nub = "/arm-io/gfx-asc/iop-gfx-nub0",
+    .read_leak = g15c_standin_read_leak,
+    .calc_power = calc_power_t6031_standin,
+};
+
+/* This boot's G15C firmware family (NULL: not admitted) and powered identity, set before the setup
  */
-static const struct fw_version_info *g15_t6031_fw;
-static struct t8122_powered_identity g15_t6031_id;
+static const struct fw_version_info *g15_g15c_fw;
+static struct t8122_powered_identity g15_g15c_id;
 
 /*
- * T6031: the identity of the bounded probe that ran before this setup, instead of g15_read_hw()'s
+ * G15C: the identity of the bounded probe that ran before this setup, instead of g15_read_hw()'s
  * power-on and reads. The device tree's GPU windows must still be the ADT's.
  */
 static int g15_probed_hw(void *dt, int gpu, const struct g15_soc *soc, u32 *core_count,
@@ -2108,12 +2130,12 @@ static int g15_probed_hw(void *dt, int gpu, const struct g15_soc *soc, u32 *core
     if (dt_sgx != sgx_base || dt_asc != asc_base)
         bail("FDT: GPU: DT sgx/asc 0x%lx/0x%lx do not match ADT 0x%lx/0x%lx\n", dt_sgx, dt_asc,
              sgx_base, asc_base);
-    if (g15_t6031_id.result != T8122_ID_PASS)
+    if (g15_g15c_id.result != T8122_ID_PASS)
         bail("FDT: GPU: %s powered identity result %u, not 1 (pass): GPU node not filled\n",
-             soc->name, g15_t6031_id.result);
+             soc->name, g15_g15c_id.result);
 
     *clusters_out = soc->clusters;
-    *enabled_cores = t6031_core_counts(&g15_t6031_id, core_count);
+    *enabled_cores = t6031_core_counts(&g15_g15c_id, core_count);
     printf("FDT: GPU: Core counts: ");
     for (u32 i = 0; i < soc->clusters; i++)
         printf("%d ", core_count[i]);
@@ -2247,7 +2269,7 @@ static int dt_set_gpu_g15_inner(void *dt, const struct g15_soc *soc, bool armed)
      * register) is touched unless it is positively the 14.8.3 G15 ABI drm/asahi supports.
      */
     const struct fw_version_info *gfx_fw =
-        soc->family_fw ? g15_t6031_fw : firmware_gfx_version_ex(soc->chip, soc->fw_experimental);
+        soc->family_fw ? g15_g15c_fw : firmware_gfx_version_ex(soc->chip, soc->fw_experimental);
     bool have_model = soc->read_leak && soc->calc_power;
     if (!have_model)
         printf("FDT: GPU: the %s leakage fuse and power model are not known yet\n", soc->gpu_name);
@@ -2386,7 +2408,7 @@ static int dt_set_gpu_g15_inner(void *dt, const struct g15_soc *soc, bool armed)
         return -1;
     if (soc->csafr && g15_set_csafr(dt, aux, csafr_sram_uv, soc->dies))
         return -1;
-    if (soc->probed && g15_set_standins(dt))
+    if (soc->probed && g15_set_standins(dt, soc))
         return -1;
 
     for (int i = 0; i < G15_NUM_REGIONS; i++) {
@@ -2656,7 +2678,7 @@ static void t6031_gpu_probe(void *dt)
     int sgx_path[8];
     u64 sgx_size;
 
-    g15_t6031_id = (struct t8122_powered_identity){.result = T8122_ID_NOT_RUN};
+    g15_g15c_id = (struct t8122_powered_identity){.result = T8122_ID_NOT_RUN};
     if (adt_path_offset_trace(adt, "/arm-io/sgx", sgx_path) < 0 ||
         adt_get_reg(adt, sgx_path, "reg", 0, &p.sgx_base, &sgx_size) < 0 ||
         p.sgx_base != T6031_SGX_BASE || sgx_size < G15_SGX_CORE_MASK + 12) {
@@ -2674,17 +2696,17 @@ static void t6031_gpu_probe(void *dt)
         return;
     }
     t6031_log_closure("before", &p.closure, false);
-    g15_t6031_id = t6031_probe_run(&ops, &p);
+    g15_g15c_id = t6031_probe_run(&ops, &p);
     t6031_log_closure("after", &p.closure, true);
-    if (g15_t6031_id.result == T8122_ID_POWER_OFF_FAILED)
+    if (g15_g15c_id.result == T8122_ID_POWER_OFF_FAILED)
         printf("FDT: GPU: T6031 WARNING: the power closure is not as iBoot left it\n");
-    if (t6031_identity_publish(dt, &g15_t6031_id, &p.closure))
+    if (t6031_identity_publish(dt, &g15_g15c_id, &p.closure))
         printf("FDT: GPU: T6031 could not publish the powered identity\n");
     printf("FDT: GPU: T6031 powered identity result %u: ID_VERSION 0x%08x ID_COUNTS_1 0x%08x "
            "ID_COUNTS_2 0x%08x core masks 0x%x 0x%x 0x%x\n",
-           g15_t6031_id.result, g15_t6031_id.id_version, g15_t6031_id.id_counts_1,
-           g15_t6031_id.id_counts_2, g15_t6031_id.core_mask[0], g15_t6031_id.core_mask[1],
-           g15_t6031_id.core_mask[2]);
+           g15_g15c_id.result, g15_g15c_id.id_version, g15_g15c_id.id_counts_1,
+           g15_g15c_id.id_counts_2, g15_g15c_id.core_mask[0], g15_g15c_id.core_mask[1],
+           g15_g15c_id.core_mask[2]);
 }
 
 /*
@@ -2696,8 +2718,8 @@ static void t6031_gpu_probe(void *dt)
  */
 static int dt_set_gpu_t6031(void *dt)
 {
-    g15_t6031_fw = NULL;
-    g15_t6031_id = (struct t8122_powered_identity){.result = T8122_ID_NOT_RUN};
+    g15_g15c_fw = NULL;
+    g15_g15c_id = (struct t8122_powered_identity){.result = T8122_ID_NOT_RUN};
     if (!t6031_board(dt)) {
         printf("FDT: GPU: T6031: not a J514C/J516C device tree, nothing done\n");
         return 0;
@@ -2708,9 +2730,90 @@ static int dt_set_gpu_t6031(void *dt)
                g15_soc_t6031.optin);
         return 0;
     }
-    g15_t6031_fw = dt_t6031_gpu_image(dt);
+    g15_g15c_fw = dt_t6031_gpu_image(dt);
     t6031_gpu_probe(dt);
     return dt_set_gpu_g15(dt, &g15_soc_t6031);
+}
+
+/*
+ * J514M/T6034 identity measurement: normal boot, no enable parameter. Reuse the
+ * bounded G15C identity probe and exact power restoration; never enable the GPU
+ * or mailbox, allocate GPU regions, or start firmware itself. The subsequent
+ * handoff uses this result; Linux separately admits the full firmware digest.
+ * Only normalized identity and firmware-header facts leave this measurement.
+ */
+static int dt_measure_gpu_t6034(void *dt)
+{
+    static const char *node_name = "asahi,t6034-gpu-powered-identity";
+    static const struct t6031_probe_ops ops = {
+        .enable = t6031_probe_enable,
+        .active = t6031_probe_active,
+        .read = t6031_probe_read,
+        .restore = t6031_probe_restore,
+    };
+    struct t6031_probe p;
+    int path[8], gpu;
+    u64 size;
+    if (!t6034_board(dt))
+        return 0;
+    gpu = fdt_path_offset(dt, "gpu");
+    if (gpu < 0 || fdt_node_check_compatible(dt, gpu, "apple,agx-t6034"))
+        return 0;
+    /*
+     * Only the GPU switch decides, as on T6031: chosen.asahi,m3-defaults=0 withholds the default
+     * but keeps an owner's own asahi,t6034-gpu=1. kboot.c handles a lost config line.
+     */
+    int chosen = fdt_path_offset(dt, "/chosen"), len;
+    const char *opt = chosen < 0 ? NULL : fdt_getprop(dt, chosen, "asahi,t6034-gpu", &len);
+    if (opt && (len != 2 || opt[0] != '1' || opt[1]))
+        return 0;
+    if (adt_path_offset_trace(adt, "/arm-io/sgx", path) < 0 ||
+        adt_get_reg(adt, path, "reg", 0, &p.sgx_base, &size) < 0 ||
+        p.sgx_base != T6031_SGX_BASE || size < G15_SGX_CORE_MASK + 12 ||
+        t6031_closure_get("/arm-io/sgx", &p.closure) ||
+        t6031_identity_node_named(dt, p.closure.n, node_name) < 0) {
+        printf("FDT: GPU: T6034 measurement prerequisites failed; no power-on\n");
+        return 0;
+    }
+    struct t8122_powered_identity id = t6031_probe_run(&ops, &p);
+    g15_g15c_id = id;
+    if (t6031_identity_publish_named(dt, &id, &p.closure, node_name))
+        printf("FDT: GPU: T6034 identity publication failed\n");
+    printf("FDT: GPU: T6034 identity result %u, version 0x%x counts 0x%x/0x%x "
+           "masks 0x%x/0x%x/0x%x\n", id.result, id.id_version, id.id_counts_1,
+           id.id_counts_2, id.core_mask[0], id.core_mask[1], id.core_mask[2]);
+    if (id.result == T8122_ID_POWER_OFF_FAILED) {
+        printf("FDT: GPU: T6034 WARNING: power closure restoration failed\n");
+        return 0;
+    }
+    g15_g15c_fw = dt_t6031_gpu_image_named(dt, "asahi,t6034-gpu-image");
+    int sgx = adt_path_offset(adt, "/arm-io/sgx");
+    const char *props[] = {"perf-state-count", "gpu-num-perf-states", "perf-state-table-count"};
+    for (size_t i = 0; i < ARRAY_SIZE(props); i++) {
+        u32 value;
+        if (!g15_adt_u32(sgx, props[i], &value)) {
+            chosen = fdt_path_offset(dt, "/chosen");
+            int node = chosen < 0 ? chosen : fdt_subnode_offset(dt, chosen, node_name);
+            if (node >= 0)
+                fdt_setprop_u32(dt, node, props[i], value);
+        }
+    }
+    return 0;
+}
+
+/* The normal J514M path: exact board and owner choice, then measured G15C handoff. */
+static int dt_set_gpu_t6034(void *dt)
+{
+    g15_g15c_fw = NULL;
+    g15_g15c_id = (struct t8122_powered_identity){.result = T8122_ID_NOT_RUN};
+    if (!t6034_board(dt))
+        return 0;
+    if (!g15_optin(dt, g15_soc_t6034.optin)) {
+        g15_disable(dt);
+        return 0;
+    }
+    dt_measure_gpu_t6034(dt);
+    return dt_set_gpu_g15(dt, &g15_soc_t6034);
 }
 
 /*
@@ -4268,6 +4371,8 @@ int dt_set_gpu(void *dt)
             return dt_set_gpu_g15(dt, &g15_soc_t6030);
         case T6031:
             return dt_set_gpu_t6031(dt);
+        case T6034:
+            return dt_set_gpu_t6034(dt);
         case T6032:
             /*
              * T6032 (J575D): refused until the firmware ABI exists. Missing pieces, each one a

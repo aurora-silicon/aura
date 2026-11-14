@@ -1013,8 +1013,8 @@ static void sc_t6034(void *dt)
     boot(dt);
     check(!memcmp(before, dt, fdt_totalsize(before)), "T6034: the device tree is unchanged");
     check(!nwrites && !gpu_reads, "T6034: no register written, no GPU register read");
-    check(log_has("ADT: GPU: unsupported chip!"),
-          "T6034: the GPU setup says unsupported, as before");
+    check(!log_has("ADT: GPU: unsupported chip!") && !log_has("FDT: GPU: T6034"),
+          "T6034: a J516M returns quietly from the J514M-only GPU path");
 }
 
 static void sc_other_board(void *dt)

@@ -154,8 +154,8 @@ def test_max_probe_requires_exact_opt_in(tmp_path):
 enum { T8122_ID_NOT_RUN };
 struct t8122_powered_identity { int result; };
 struct fw_version_info { int unused; };
-static const struct fw_version_info *g15_t6031_fw;
-static struct t8122_powered_identity g15_t6031_id;
+static const struct fw_version_info *g15_g15c_fw;
+static struct t8122_powered_identity g15_g15c_id;
 static const struct { const char *optin; } g15_soc_t6031 = {"asahi,t6031-gpu"};
 static int board = 1, reads, probes, setups, disabled;
 static bool t6031_board(void *dt) { return board; }
