@@ -170,6 +170,31 @@ AURA_XTEXT static void ctl_add_adt(const char *path, const char *name, u32 idx, 
     ctl_add(name, pa ? pa + off : 0, size ? size : sz);
 }
 
+/*
+ * A DART's own windows: the reg entries its "instance" table tags DART ("TRAD") or DAPF ("FPAD"),
+ * named <name>, <name>-dapf. Others (PS_PROT and the like) can be a page several DARTs share, so
+ * they are left out. With no table, reg[0] alone.
+ */
+AURA_XTEXT static void ctl_add_dart(const char *path, const char *name)
+{
+    int p[8];
+    u32 len = 0;
+    int node = adt_path_offset_trace(adt, path, p);
+    const char *inst = node < 0 ? NULL : adt_getprop(adt, node, "instance", &len);
+    if (!inst || len < 16 || len % 16) {
+        ctl_add_adt(path, name, 0, 0, 0);
+        return;
+    }
+    char dapf[sizeof(((struct auractl_range *)0)->name)];
+    snprintf(dapf, sizeof(dapf), "%s-dapf", name);
+    for (u32 i = 0; i < len / 16; i++) {
+        if (!memcmp(inst + i * 16, "TRAD", 4))
+            ctl_add_adt(path, name, i, 0, 0);
+        else if (!memcmp(inst + i * 16, "FPAD", 4))
+            ctl_add_adt(path, dapf, i, 0, 0);
+    }
+}
+
 AURA_XTEXT static void ctl_add_blk(const char *name, const struct s2r_blk *b)
 {
     ctl_add(name, b->base, b->size);
@@ -218,6 +243,28 @@ AURA_XTEXT static void ctl_catalogue(void)
     };
     for (u32 i = 0; i < ARRAY_SIZE(mbox); i++)
         ctl_add_adt(mbox[i].path, mbox[i].name, 0, 0x8000, PG);
+    /*
+     * The media blocks: each one's main window (reg[0]; ProRes's engine is apr reg[1]) and its
+     * DART's own windows, so a workload in the guest can be traced on the block and on the DART
+     * that maps its buffers. Names are the ADT's; a node this board lacks is listed as absent.
+     */
+    static const struct {
+        const char *node, *dart;
+        u32 idx;
+    } media[] = {
+        {"ane", "dart-ane", 0},        {"isp", "dart-isp", 0},    {"ave", "dart-ave", 0},
+        {"avd", "dart-avd", 0},        {"jpeg0", "dart-jpeg", 0}, {"jpeg1", NULL, 0},
+        {"scaler0", "dart-scaler", 0}, {"apr", "dart-apr", 1},
+    };
+    char path[40];
+    for (u32 i = 0; i < ARRAY_SIZE(media); i++) {
+        snprintf(path, sizeof(path), "/arm-io/%s", media[i].node);
+        ctl_add_adt(path, media[i].node, media[i].idx, 0, 0);
+        if (!media[i].dart)
+            continue;
+        snprintf(path, sizeof(path), "/arm-io/%s", media[i].dart);
+        ctl_add_dart(path, media[i].dart);
+    }
     ctl_add_adt("/arm-io/gpio0", "gpio0", 0, 0, PG);
     ctl_add_adt("/arm-io/nub-spmi0", "spmi0", 0, 0, PG);
     ctl_add_adt("/arm-io/nub-spmi-a0", "spmi-a0", 0, 0, PG);

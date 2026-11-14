@@ -118,9 +118,12 @@ void mmu_rm_mapping(u64 from, size_t size)
 
 /* ---- ADT, stage 2 and the tracer ---- */
 
+static const char *adt_last_path; /* adt_getprop's node: the last path looked up */
+
 int adt_path_offset_trace(const void *dt, const char *path, int *offs)
 {
     (void)dt;
+    adt_last_path = path;
     /* Everything but the GPU's ASCs exists; they show up as absent in the list. */
     if (!strcmp(path, "/arm-io/gfx-asc") || !strcmp(path, "/arm-io/gfx1-asc"))
         return -1;
@@ -141,6 +144,21 @@ int adt_get_reg(const void *dt, const int *path, const char *prop, int idx, u64 
     *pa = 0x300000000UL + (u64)path[0] * 0x100 * 0x4000 + (u64)idx * 0x100000;
     *sz = 0x10000;
     return 0;
+}
+
+/* The media DARTs' "instance" table: two DART windows, a PS_PROT page (left out) and a DAPF. */
+static const char dart_instance[4][16] = {"TRAD\0\0\0\0DART0", "FPAG\0\0\0\0PS_PROT",
+                                          "FPAD\0\0\0\0DAPF", "TRAD\1\0\0\0DART1"};
+
+const void *adt_getprop(const void *dt, int node, const char *name, u32 *len)
+{
+    (void)dt;
+    (void)node;
+    *len = 0;
+    if (strcmp(name, "instance") || !adt_last_path || strncmp(adt_last_path, "/arm-io/dart-", 13))
+        return NULL;
+    *len = sizeof(dart_instance);
+    return dart_instance;
 }
 
 /* The blocks the sleep path would have found: a synthetic PMGR, PMS and AMCC. pwrgate is absent;
@@ -590,9 +608,17 @@ static void test_hooks(void)
     /* List: everything comes back, the missing blocks marked */
     CHECK(call(AURACTL_LIST, 0, 0, 0, VA_BUF, BUF_PAGES * PG) == 0);
     u64 total = req_ptr()->ret0;
-    CHECK(total == 9 + 2 + 4 + 12 + 4); /* PMGR blocks, PMS pages, AMCC planes, mailboxes, rest */
+    /* PMGR blocks, PMS pages, AMCC planes, mailboxes, media blocks, their 7 DARTs (2 DART windows +
+     * 1 DAPF each, the PS_PROT page left out), rest */
+    CHECK(total == 9 + 2 + 4 + 12 + 8 + 7 * 3 + 4);
     CHECK(req_ptr()->buf_used == total * sizeof(struct auractl_range));
     const struct auractl_range *e = (void *)gptr(PA_BUF);
+    int ane_dart = 0, ane_dapf = 0;
+    for (u64 i = 0; i < total; i++) {
+        ane_dart += !strcmp(e[i].name, "dart-ane");
+        ane_dapf += !strcmp(e[i].name, "dart-ane-dapf");
+    }
+    CHECK(ane_dart == 2 && ane_dapf == 1);
     int absent = 0;
     for (u64 i = 0; i < total; i++)
         if (!strcmp(e[i].name, "gfx-mbox") || !strcmp(e[i].name, "gfx1-mbox") ||
