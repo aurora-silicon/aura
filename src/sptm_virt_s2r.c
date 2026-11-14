@@ -642,8 +642,9 @@ static bool s2r_wakerec_printed;
 
 static bool s2r_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int width)
 {
-    /* Timer-only sleep: the S2R timer's start is the commit; everything else is recorded. */
-    if (s2r_soc->timer_only) {
+    /* With no debug-link USB port (a KIS/DockChannel proxy) the ring is armed for live in-guest
+     * tracing with no s2r_soc and no sleep path, so take the plain record path below. */
+    if (s2r_soc && s2r_soc->timer_only) {
         if (write && width == 2 && addr == s2r_soc->stop_timer && *val == 1 && s2r_armed()) {
             sptm_virt_s2r_note(ctx, addr, *val, true, width);
             if (!s2r_go || (sptm_virt_s2r_go_count && s2r_wake_count >= sptm_virt_s2r_go_count)) {
@@ -1257,6 +1258,23 @@ static void s2r_t6050_coproc(bool mem)
            s2r_n_cp_pages - before, s2r_sep_mbox, s2r_esm_mbox);
 }
 
+/* Allocate and clear the record ring, setting its capacity and head. A big ring falls back to the
+ * small size if the heap is short. Returns false only if even the small ring will not fit. */
+static bool s2r_ring_alloc(u64 ring_bytes)
+{
+    sptm_virt_s2r_ring = memalign(0x4000, ring_bytes);
+    if (!sptm_virt_s2r_ring && ring_bytes != S2R_RING_BYTES) {
+        ring_bytes = S2R_RING_BYTES;
+        sptm_virt_s2r_ring = memalign(0x4000, ring_bytes);
+    }
+    if (!sptm_virt_s2r_ring)
+        return false;
+    memset(sptm_virt_s2r_ring, 0, ring_bytes);
+    sptm_virt_s2r_nrec = ring_bytes / sizeof(struct s2r_rec);
+    sptm_virt_s2r_head = 0;
+    return true;
+}
+
 /* cdc: the proxy runs over the DWC3 CDC link, whose domains are kept on even without the trace. */
 void sptm_virt_s2r_setup(bool cdc)
 {
@@ -1267,8 +1285,19 @@ void sptm_virt_s2r_setup(bool cdc)
                          &missing) < 0) {
         printf("SPTM-virt[s2r]: no sleep path, the ADT gives no %s; debug-link domains not kept\n",
                missing);
+        /* The sleep path -- keeping the debug-link domains alive across the sleep, the capture
+         * hooks and the sleep-commit rules -- needs that USB link, so drop every sleep flag. The
+         * record ring and the live in-guest catalogue (auractl arm/read on named MMIO over hvc) do
+         * not: on a KIS/DockChannel proxy there is no debug-link USB port, yet the guest still
+         * drives auractl. If a trace was asked for, allocate the ring alone so recording works; the
+         * sleep machinery stays gated (SPTM_VIRT_S2R stays clear), so nothing on the wake or sleep
+         * path runs without an s2r_soc. */
         sptm_virt_flags &= ~(SPTM_VIRT_S2R | SPTM_VIRT_S2R_GO | SPTM_VIRT_S2R_FULL |
                              SPTM_VIRT_S2R_COPROC | SPTM_VIRT_S2R_DROP_USB);
+        if ((flags & SPTM_VIRT_S2R) && s2r_ring_alloc(S2R_RING_BYTES))
+            printf("SPTM-virt[s2r]: no debug-link USB port; %lu-record ring at 0x%lx for live "
+                   "in-guest tracing, no sleep path\n",
+                   sptm_virt_s2r_nrec, (u64)sptm_virt_s2r_ring);
         return;
     }
     s2r_soc = &s2r_soc_adt;
@@ -1295,21 +1324,13 @@ void sptm_virt_s2r_setup(bool cdc)
     }
     /* A timer-only sleep has no stop before the commit to read a ring from: keep it all. */
     u64 ring_bytes = s2r_soc->timer_only ? S2R_RING_BYTES_BIG : S2R_RING_BYTES;
-    sptm_virt_s2r_ring = memalign(0x4000, ring_bytes);
-    if (!sptm_virt_s2r_ring && ring_bytes != S2R_RING_BYTES) {
-        ring_bytes = S2R_RING_BYTES;
-        sptm_virt_s2r_ring = memalign(0x4000, ring_bytes);
-    }
-    if (!sptm_virt_s2r_ring) {
+    if (!s2r_ring_alloc(ring_bytes)) {
         printf("SPTM-virt[s2r]: no memory for the ring; sleep path off\n");
         sptm_virt_flags &= ~SPTM_VIRT_S2R;
         if (cdc && !s2r_soc->timer_only)
             s2r_keep_setup();
         return;
     }
-    memset(sptm_virt_s2r_ring, 0, ring_bytes);
-    sptm_virt_s2r_nrec = ring_bytes / sizeof(struct s2r_rec);
-    sptm_virt_s2r_head = 0;
     if (s2r_soc->timer_only) {
         /* No link keeping, USB, per-core or WFI rules: the timer's start is the sleep. */
         s2r_go = flags & SPTM_VIRT_S2R_GO;
