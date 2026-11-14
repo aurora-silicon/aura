@@ -69,6 +69,11 @@ struct sptm_virt_placement {
 int sptm_virt_esp_boot(const char *spec);
 #endif
 
+#ifdef AURACTL
+/* nv2.c: an HVC from the guest's kernel; true if it was auractl's (src/sptm_virt_ctl.c). */
+bool sptm_virt_ctl_hvc(u64 *regs, u64 esr);
+#endif
+
 /* Set once the boot CPU has entered the guest; read with the MMU off by the reset path. */
 extern volatile bool sptm_virt_guest_live;
 

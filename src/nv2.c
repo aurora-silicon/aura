@@ -1604,6 +1604,10 @@ bool nv2_handle_sync(u64 *regs)
             /* 0x10..0x1f: aura's EL1 vector table forwarding an exception of the guest's own. */
             if (((esr & 0xffff) - 0x10) < 16)
                 return nv2_inject_forwarded(c, (esr & 0xffff) - 0x10);
+#ifdef AURACTL
+            if (sptm_virt_ctl_hvc(regs, esr)) /* auractl (src/sptm_virt_ctl.c) */
+                return true;
+#endif
             nv2_inject_self(esr);
             return true;
         default:

@@ -159,6 +159,15 @@ CFG += NV2_TRACE_PRINT
 endif
 endif
 
+# Development builds only: the SPTM-virt guest's kernel controls aura's stage-2 MMIO trace
+# through an HVC (src/sptm_virt_ctl.c, src/auractl_abi.h, docs/auractl.md). Never in Stage 1.
+ifeq ($(AURACTL),1)
+ifneq ($(SPTM_VIRT),1)
+$(error AURACTL requires SPTM_VIRT=1)
+endif
+CFG += AURACTL
+endif
+
 
 # Trace builds only: an ESP Stage 2 that boots macOS under SPTM-virt from files on the ESP (the
 # macos= line, src/sptm_virt_esp.c, tools/esp-macos) instead of a Linux boot= or chainload=.
@@ -290,6 +299,9 @@ OBJECTS := \
 
 ifeq ($(SPTM_VIRT),1)
 OBJECTS += nv2.o nv2_asm.o sptm_virt.o sptm_virt_cl4.o sptm_virt_gl.o sptm_virt_s2.o sptm_virt_s2r.o sptm_virt_s2r_soc.o sptm_virt_gpu.o s2r_dcp_pkt.o
+endif
+ifeq ($(AURACTL),1)
+OBJECTS += sptm_virt_ctl.o
 endif
 ifeq ($(SPTM_VIRT_ESP),1)
 OBJECTS += sptm_virt_esp.o sptm_virt_esp_plan.o sha256.o

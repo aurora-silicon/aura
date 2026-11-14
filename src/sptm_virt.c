@@ -373,6 +373,25 @@ __attribute__((used, retain)) int sptm_virt_load(u64 sptm_entry, u64 handoff)
     return 0;
 }
 
+#ifdef AURACTL
+/* The RAM SPTM manages (the handoff boot_args' physBase and memSize, which sptm_virt_load checked
+ * against SPTM's window): the only place an auractl caller's buffer may be. */
+AURA_XTEXT void sptm_virt_ctl_guest_ram(u64 *base, u64 *size)
+{
+    const volatile struct sptm_virt_boot_args *ba = (const void *)sptm_handoff_pa;
+    struct sptm_virt_layout l;
+
+    *base = *size = 0;
+    if (!ba || sptm_virt_layout(&l) < 0)
+        return;
+    u64 pbase = ba->phys_base, msize = ba->mem_size;
+    if (pbase < l.managed_base || pbase >= l.managed_end || msize > l.managed_end - pbase)
+        return;
+    *base = pbase;
+    *size = msize;
+}
+#endif
+
 /*
  * The phandle of the USB PHY whose port aura's proxy runs on, 0 on any other transport (KIS):
  * the host hides that port from the guest.
