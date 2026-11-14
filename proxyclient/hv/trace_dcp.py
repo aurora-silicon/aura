@@ -36,7 +36,8 @@ def get_dcp_device(dev_type, dcp):
     elif dev_type is DCPDevType.DART_DCP:
         return "/arm-io/dart-" + get_alias(dcp)
     elif dev_type is DCPDevType.DART_DISP:
-        return "/arm-io/dart-" + dcp.replace("dcp", "disp")
+        name = dcp.replace("dcp", "disp")
+        return "/arm-io/dart-" + ("disp0" if name == "disp" else name)
     else:
         raise KeyError(dev_type)
 
