@@ -131,8 +131,16 @@ static int usb_drd_adt_offset(u32 idx, char drd_path[sizeof(FMT_DRD_PATH)], int 
     return offset;
 }
 
-/* T6050 has a different PIPE clock field. Never run the older automatic
- * gadget initialization on it, including when the explicit setup is refused. */
+/* The J616s (T6040) Mac mini's ATC0 is the tether/debug port. Scope the explicit CDC handoff to
+ * this board so other T6040 (J614s) and T6041 (M4 Max J614c/J616c) machines keep the generic path.
+ */
+static bool usb_cdc_j616s(void)
+{
+    return chip_id == T6040 && board_id == 6 && adt && adt_is_compatible(adt, 0, "J616sAP");
+}
+
+/* T6050 and the J616s T6040 have a different PIPE clock field. Never run the older automatic
+ * gadget initialization on them, including when the explicit setup is refused. */
 bool usb_cdc_deferred_usb2(void)
 {
     static int deferred = -1;
@@ -145,8 +153,10 @@ bool usb_cdc_deferred_usb2(void)
          * The J714c (M5 Max) enumerates through the generic gadget path on every port, as the
          * omacom m1n1 Stage 1 does there; the explicit port-0 setup never comes up on it.
          */
-        deferred = node >= 0 && adt_is_compatible(adt, node, "atc-phy,t6050") &&
-                   !adt_is_compatible(adt, 0, "J714cAP");
+        deferred =
+            node >= 0 && ((adt_is_compatible(adt, node, "atc-phy,t6050") &&
+                           !adt_is_compatible(adt, 0, "J714cAP")) ||
+                          (adt_is_compatible(adt, node, "atc-phy,t6040") && usb_cdc_j616s()));
     }
     return deferred;
 }
@@ -297,6 +307,153 @@ static dwc3_dev_t *usb_t6050_init(void (*set_step)(unsigned step))
     if (!dwc)
         return NULL;
     printf("CDC USB2: T6050 controller initialized, PIPE=%x; link unverified\n",
+           read32(pipe + PIPEHANDLER_MUX_CTRL));
+    return dwc;
+}
+
+/* The J616s (T6040) tether/debug port. ATC0 USB-drd0/dart-usb0/atc-phy0 are the same roles as the
+ * M5's, so this mirrors usb_t6050_init: resolve the DWC3 core (usb-drd0 reg 0), the PIPEHANDLER
+ * (usb-drd0 reg 3), the USB2 PHY (atc-phy0 reg 0) and the T8110 DART (dart-usb0 reg 1, mapper SID)
+ * from the ADT, validate by compatible and size, then park the dummy PIPE and bring up the USB2
+ * device PHY from the ADT's own tunable_USB2PHY_DFLT/DEV. The qualified high-speed path
+ * (docs/j616s-bringup.md: 480 Mb/s + an exact 64 KiB transfer) leaves the ATC PHY in its initial
+ * state and needs neither the event-counter/"digital" bank the M5 writes (the generic bring-up that
+ * proved 480 Mb/s never touched atc-phy0 reg 1) nor the ACIO SuperSpeed PHY processor. SuperSpeed
+ * stays unqualified: it needs the CIO80 ACIOPHY processor (acio-phy-cpu0) brought to firmware
+ * tunables-done, which is not done yet; a USB2-only or forced-FS link runs at full speed. */
+static int usb_t6040_get_regs(struct usb_t6050_regs *regs)
+{
+    int phy_path[8], drd_path[8], dart_path[8];
+    int phy = adt_path_offset_trace(adt, "/arm-io/atc-phy0", phy_path);
+    int drd = adt_path_offset_trace(adt, "/arm-io/usb-drd0", drd_path);
+    int hpm = adt_path_offset(adt, "/arm-io/nub-spmi-a0/hpm0");
+    int dart = adt_path_offset_trace(adt, "/arm-io/dart-usb0", dart_path);
+    int mapper = adt_path_offset(adt, "/arm-io/dart-usb0/mapper-usb0");
+    u32 phy_port, drd_port, hpm_port, port_type, sid;
+    u64 dwc_size, dart_base, dart_size;
+
+    regs->digital = 0; /* T6040 high speed needs no event-counter bank; see usb_t6040_init. */
+    if (phy < 0 || drd < 0 || hpm < 0 || dart < 0 || mapper < 0 ||
+        !adt_is_compatible(adt, phy, "atc-phy,t6040") ||
+        !adt_is_compatible(adt, drd, "usb-drd,t6040") ||
+        !adt_is_compatible(adt, dart, "dart,t8110") ||
+        adt_get_property(adt, drd, "usb-device-disable") ||
+        ADT_GETPROP(adt, phy, "port-number", &phy_port) < 0 ||
+        ADT_GETPROP(adt, drd, "port-number", &drd_port) < 0 ||
+        ADT_GETPROP(adt, hpm, "port-number", &hpm_port) < 0 || !phy_port || phy_port != drd_port ||
+        phy_port != hpm_port || ADT_GETPROP(adt, phy, "port-type", &port_type) < 0 ||
+        port_type != 2 || ADT_GETPROP(adt, mapper, "reg", &sid) < 0 || sid >= 256 ||
+        adt_get_reg(adt, phy_path, "reg", 0, &regs->phy, &regs->phy_size) < 0 ||
+        adt_get_reg(adt, drd_path, "reg", 0, &regs->dwc, &dwc_size) < 0 ||
+        adt_get_reg(adt, drd_path, "reg", 3, &regs->pipe, &regs->pipe_size) < 0 ||
+        adt_get_reg(adt, dart_path, "reg", 1, &dart_base, &dart_size) < 0 ||
+        regs->phy_size < 0x20 || dwc_size < DWC3_DSTS + 4 || regs->pipe_size < 0x48 ||
+        dart_size < 0x1800 ||
+        tunables_validate_compact("/arm-io/atc-phy0", "tunable_USB2PHY_DFLT", regs->phy_size) ||
+        tunables_validate_compact("/arm-io/atc-phy0", "tunable_USB2PHY_DEV", regs->phy_size))
+        return -1;
+
+    return 0;
+}
+
+static dwc3_dev_t *usb_t6040_init(void (*set_step)(unsigned step))
+{
+    struct usb_t6050_regs regs;
+    if (usb_t6040_get_regs(&regs)) {
+        printf("CDC USB2: unsupported T6040 ADT layout\n");
+        return NULL;
+    }
+
+    set_step(2);
+    if (pmgr_adt_power_enable("/arm-io/atc-phy0") < 0 ||
+        pmgr_adt_power_enable("/arm-io/dart-usb0") < 0 ||
+        pmgr_adt_power_enable("/arm-io/usb-drd0") < 0)
+        return NULL;
+
+    u64 pipe = regs.pipe;
+    u32 aon = read32(pipe + PIPEHANDLER_AON_GEN);
+    u32 mux = read32(pipe + PIPEHANDLER_MUX_CTRL) & 0x73;
+    if (dart_adt_locked("/arm-io/dart-usb0", 1)) {
+        printf("CDC USB2: T6040 USB DART is locked; leaving it alone\n");
+        return NULL;
+    }
+    /* A chainload over the DockChannel/KIS proxy leaves usb-drd0 cold (mux 0, no DWC3 reset). An
+     * in-place raw chainload past a USB Stage 1 leaves its dummy PIPE released (0x22); accept only
+     * a fully stopped device, never a live or native PIPE producer. */
+    if ((aon & PIPEHANDLER_AON_GEN_DWC3_RESET_N) || mux == 0x22) {
+        u32 gctl = read32(regs.dwc + DWC3_GCTL);
+        bool retired = (mux == 0x22 || mux == 0x42) &&
+                       (gctl & DWC3_GCTL_PRTCAPDIR(DWC3_GCTL_PRTCAP_OTG)) ==
+                           DWC3_GCTL_PRTCAPDIR(DWC3_GCTL_PRTCAP_DEVICE) &&
+                       !(read32(regs.dwc + DWC3_DCTL) & DWC3_DCTL_RUN_STOP) &&
+                       (read32(regs.dwc + DWC3_DSTS) & DWC3_DSTS_DEVCTRLHLT) &&
+                       !read32(regs.dwc + DWC3_DEVTEN) && !read32(regs.dwc + DWC3_DALEPENA);
+        if (!retired) {
+            printf("CDC USB2: T6040 PIPE consumer is not retired (aon=%x mux=%x)\n", aon, mux);
+            return NULL;
+        }
+        set32(pipe + PIPEHANDLER_AON_GEN, PIPEHANDLER_AON_GEN_DWC3_FORCE_CLAMP_EN);
+        clear32(pipe + PIPEHANDLER_AON_GEN, PIPEHANDLER_AON_GEN_DWC3_RESET_N);
+        if (poll32(pipe + PIPEHANDLER_AON_GEN, PIPEHANDLER_AON_GEN_DWC3_RESET_N, 0, 1000))
+            return NULL;
+        udelay(10);
+        printf("CDC USB2: retired Stage 1 gadget held in reset\n");
+    } else if (mux != 0 && mux != 2 && mux != 0x42) {
+        printf("CDC USB2: unknown T6040 PIPE producer (aon=%x mux=%x)\n", aon, mux);
+        return NULL;
+    }
+    set32(pipe + PIPEHANDLER_AON_GEN, PIPEHANDLER_AON_GEN_DWC3_FORCE_CLAMP_EN);
+    mask32(pipe + PIPEHANDLER_MUX_CTRL, 0x70, 0);
+    udelay(10);
+    mask32(pipe + PIPEHANDLER_MUX_CTRL, 3, 2);
+    udelay(10);
+    mask32(pipe + PIPEHANDLER_MUX_CTRL, 0x70, 0x40);
+    udelay(10);
+    if ((read32(pipe + PIPEHANDLER_MUX_CTRL) & 0x73) != 0x42)
+        return NULL;
+
+    set_step(3);
+    if (tunables_apply_compact_addr("/arm-io/atc-phy0", "tunable_USB2PHY_DFLT", regs.phy,
+                                    regs.phy_size) ||
+        tunables_apply_compact_addr("/arm-io/atc-phy0", "tunable_USB2PHY_DEV", regs.phy,
+                                    regs.phy_size))
+        return NULL;
+    set32(regs.phy + USB2PHY_SIG, USB2PHY_SIG_VBUSDET_FORCE_VAL | USB2PHY_SIG_VBUSDET_FORCE_EN |
+                                      USB2PHY_SIG_VBUSVLDEXT_FORCE_VAL |
+                                      USB2PHY_SIG_VBUSVLDEXT_FORCE_EN);
+    udelay(10000);
+    clear32(regs.phy + USB2PHY_CTL, USB2PHY_CTL_SIDDQ);
+    udelay(10);
+    clear32(regs.phy + USB2PHY_CTL, USB2PHY_CTL_RESET | USB2PHY_CTL_PORT_RESET);
+    /* No USB2 event-counter/"digital" write: the generic bring-up that qualified 480 Mb/s on the
+     * J616s never touched atc-phy0 reg 1 (the M5 does this on its separate digital bank). */
+    set32(regs.phy + USB2PHY_CTL, USB2PHY_CTL_APB_RESET_N);
+    clear32(regs.phy + USB2PHY_MISCTUNE,
+            USB2PHY_MISCTUNE_APBCLK_GATE_OFF | USB2PHY_MISCTUNE_REFCLK_GATE_OFF);
+    udelay(30);
+    udelay(5000);
+    mask32(regs.phy + USB2PHY_USBCTL, USB2PHY_USBCTL_USB_MODE, USB2PHY_USBCTL_RUN);
+
+    set32(pipe + PIPEHANDLER_NONSELECTED_OVERRIDE, PIPEHANDLER_DUMMY_PHY_EN);
+    clear32(pipe + PIPEHANDLER_AON_GEN, PIPEHANDLER_AON_GEN_DWC3_FORCE_CLAMP_EN);
+    set32(pipe + PIPEHANDLER_AON_GEN, PIPEHANDLER_AON_GEN_DWC3_RESET_N);
+    if (poll32(pipe + PIPEHANDLER_AON_GEN,
+               PIPEHANDLER_AON_GEN_DWC3_FORCE_CLAMP_EN | PIPEHANDLER_AON_GEN_DWC3_RESET_N,
+               PIPEHANDLER_AON_GEN_DWC3_RESET_N, 1000) ||
+        (read32(regs.phy + USB2PHY_USBCTL) & USB2PHY_USBCTL_USB_MODE) != USB2PHY_USBCTL_RUN ||
+        (read32(regs.phy + USB2PHY_CTL) & 0xf) != USB2PHY_CTL_APB_RESET_N) {
+        printf("CDC USB2: T6040 reset/clock setup did not latch\n");
+        return NULL;
+    }
+
+    set_step(4);
+    dart_dev_t *dart = usb_dart_init(0); /* ADT mapper SID, t8110 on T6040 */
+    if (!dart)
+        return NULL;
+    dwc3_dev_t *dwc = usb_dwc3_init(regs.dwc, dart);
+    if (!dwc)
+        return NULL;
+    printf("CDC USB2: T6040 controller initialized, PIPE=%x; link unverified\n",
            read32(pipe + PIPEHANDLER_MUX_CTRL));
     return dwc;
 }
@@ -707,8 +864,13 @@ int usb_cdc_link_start(void (*set_step)(unsigned step), bool force_swapped)
         struct iodev *device = memalign(SPINLOCK_ALIGN, sizeof(*device));
         if (!device)
             return -1;
-        dwc3_dev_t *dwc =
-            usb_cdc_deferred_usb2() ? usb_t6050_init(set_step) : usb_t8152_init(set_step);
+        dwc3_dev_t *dwc;
+        if (!usb_cdc_deferred_usb2())
+            dwc = usb_t8152_init(set_step);
+        else if (chip_id == T6040)
+            dwc = usb_t6040_init(set_step);
+        else
+            dwc = usb_t6050_init(set_step);
         if (!dwc) {
             free(device);
             return -1;
