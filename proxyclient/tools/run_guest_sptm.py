@@ -102,6 +102,7 @@ CONFIG_FLAGS = {
     "AURA_GPU_TRACE": 1 << 6,
     "AURA_SAMPLE": 1 << 7,
     "AURA_S2R_MEM": 1 << 8,
+    "AURA_AURACTL": 1 << 9,
 }
 KNOWN_ENV = {
     "AURA_KEEP_EXCLAVES",
