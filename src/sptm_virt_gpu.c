@@ -135,6 +135,12 @@ void sptm_virt_gpu_park_now(struct exc_info *ctx, const char *why)
     gpu_park(ctx, why);
 }
 
+/* Once parked, the host reads the S2R ring; the other CPUs must stop appending to it. */
+bool sptm_virt_gpu_is_parked(void)
+{
+    return gpu_parked;
+}
+
 /* Cheap enough to ask on every trap, before building a context to park with. */
 bool sptm_virt_gpu_deadline_due(void)
 {

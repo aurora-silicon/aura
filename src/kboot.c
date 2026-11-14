@@ -7389,7 +7389,7 @@ static int dt_set_t6030_display_maps(const struct adt_segment_ranges *segments, 
 
     for (u32 n = 0; n < 2; n++) {
         if (dart_walk_locked_t8110(dart_base, min(adt_size, dart_size), streams[n], dram_base,
-                                   dram_size, t6030_display_page, &maps[n])) {
+                                   dram_size, 2, t6030_display_page, &maps[n])) {
             if (maps[n].rejected)
                 return t6030_display_handoff_fail("SID%u: no segment for iova 0x%lx -> 0x%lx",
                                                   streams[n], maps[n].rejected_iova,
@@ -7865,7 +7865,7 @@ static int dt_set_j713_display_maps(const struct adt_segment_ranges *segments, u
     /* The T8132 disp0 DART (every M4 ADT); reading tables must not enable/reset streams. */
     for (u32 n = 0; n < 2; n++) {
         if (dart_walk_locked_t8110(0x30a300000, 0xc000, streams[n], dram_start, dram_size,
-                                   j713_display_page, &maps[n]))
+                                   2, j713_display_page, &maps[n]))
             return -1;
         u32 regions = 0;
         for (u32 i = 0; i < count; i++) {
