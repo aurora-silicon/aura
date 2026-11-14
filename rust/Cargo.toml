@@ -32,3 +32,9 @@ codegen-units = 1
 # Signature checks run once per boot: size matters more than speed (aura-raw.ld file limit).
 [profile.release.package.ed25519-compact]
 opt-level = "z"
+
+# So is aura's own Rust: setup code (ADT lookups, GPU init data, the ESP and chainload paths),
+# none of it in an exception or I/O path. sha2 keeps the default: it hashes every kernel that
+# aura measures.
+[profile.release.package.rust]
+opt-level = "z"
