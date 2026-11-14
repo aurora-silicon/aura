@@ -273,7 +273,20 @@ void init_cpu(void)
     if (midr_part_info->init)
         midr_part_info->init(rev);
 
-    if (cpu_features->siq_cfg) {
+    if (cpu_features->siq_cfg
+#ifdef SPTM_VIRT
+        /*
+         * The M4 Pro/Max route-0 AIC-IRQ setting (features_m4_pro) is a bare-metal tuning.
+         * Writing SIQ_CFG_EL1 on a secondary just after its first guest SPTM entry stalls XNU
+         * on T6040/T6041 under the virtualized SPTM, so on a guest boot keep iBoot's value and
+         * let the native kernel choose its own routing. This is keyed on the live guest-boot
+         * path, not the build flag, so a mixed build still serves Linux bare metal unchanged;
+         * other SoCs (A18 Pro keeps features_m4, M5 Pro/Max keeps features_m5_sotra) are
+         * untouched.
+         */
+        && !(sptm_virt_guest_live && cpu_features == &features_m4_pro)
+#endif
+    ) {
         // Enable IRQs (at least necessary on t600x)
         // XXX 0 causes pathological behavior in EL1 on M1, 2 works there.
         msr(SYS_IMP_APL_SIQ_CFG_EL1, cpu_features->siq_cfg == SIQ_CFG_ROUTE_0 ? 0 : 2);
