@@ -1991,6 +1991,28 @@ static void t8122_25_identity_failure(void)
 #define T8142_GFX1_DATA 0x1000250c000UL
 #define T8142_DT_FW_DATA 0x10002444000UL /* the kernel DT's own default */
 
+/*
+ * The perf-state shape: the J813 has perf-state-count 13 and gpu-num-perf-states 12, the J704
+ * (MacBook Pro 14-inch, M5) 14 and 13 with its own states (338..1620 MHz). The DT's OPP count is
+ * set apart, so a scenario can give a DT that does not match its ADT.
+ */
+static u32 t8142_count = 13, t8142_num_states = 12, t8142_opps = 13;
+static bool t8142_j704_states;
+
+/* J704 ADT perf-states (MHz, mV): 0 first, as on the J813 */
+static const u32 t8142_j704_mhz[14] = {0,   338, 486,  636,  796,  888,  988,
+                                       1084, 1182, 1278, 1374, 1470, 1578, 1620};
+static const u32 t8142_j704_mv[14] = {0,   610, 625, 655, 700, 725, 745,
+                                      775, 805, 840, 885, 940, 1010, 1030};
+
+static void t8142_shape(u32 count, u32 num_states, u32 opps, bool j704_states)
+{
+    t8142_count = count;
+    t8142_num_states = num_states;
+    t8142_opps = opps;
+    t8142_j704_states = j704_states;
+}
+
 static void t8142_setup(bool shared_ro, u64 ro0_base, bool fw_data_node)
 {
     chip_id = 0x8142;
@@ -2002,14 +2024,17 @@ static void t8142_setup(bool shared_ro, u64 ro0_base, bool fw_data_node)
     memset(hnodes, 0, sizeof(hnodes));
 
     const char *sgx = "/arm-io/sgx";
-    struct perf_state states[13];
-    for (int i = 0; i < 13; i++)
-        states[i] = (struct perf_state){i ? 300000000u + 100000000u * i : 0, i ? 600 + 20 * i : 0};
-    hset_u32(sgx, "perf-state-count", 13);
-    hset_u32(sgx, "gpu-num-perf-states", 12);
+    struct perf_state states[16];
+    assert(t8142_count <= ARRAY_SIZE(states));
+    for (u32 i = 0; i < t8142_count; i++)
+        states[i] = t8142_j704_states ?
+            (struct perf_state){t8142_j704_mhz[i] * 1000000u, t8142_j704_mv[i]} :
+            (struct perf_state){i ? 300000000u + 100000000u * i : 0, i ? 600 + 20 * i : 0};
+    hset_u32(sgx, "perf-state-count", t8142_count);
+    hset_u32(sgx, "gpu-num-perf-states", t8142_num_states);
     hset_u32(sgx, "perf-state-table-count", 1);
-    hset(sgx, "perf-states", states, sizeof(states));
-    hset(sgx, "perf-states-sram", states, sizeof(states));
+    hset(sgx, "perf-states", states, t8142_count * sizeof(states[0]));
+    hset(sgx, "perf-states-sram", states, t8142_count * sizeof(states[0]));
     static const struct {
         const char *name;
         u64 base, size;
@@ -2046,7 +2071,7 @@ static void t8142_setup(bool shared_ro, u64 ro0_base, bool fw_data_node)
     int opps = fdt_add_subnode(dt, 0, "opp-table");
     CHK(opps);
     CHK(fdt_setprop_u32(dt, opps, "phandle", 0x40));
-    for (int i = 12; i >= 0; i--) {
+    for (int i = (int)t8142_opps - 1; i >= 0; i--) {
         char name[16];
         snprintf(name, sizeof(name), "opp%02d", i);
         int opp = fdt_add_subnode(dt, opps, name);
@@ -2134,6 +2159,59 @@ static void t8142_no_fw_data_node(void)
     CHK(dt_set_gpu_g17(dtbuf, &g17_soc_t8142));
     t8142_expect_gpu_on();
     assert(fdt_path_offset(dtbuf, "/reserved-memory/fw-data") < 0);
+}
+
+/* J704: 14 perf states and a 14-entry OPP table, filled from the ADT, top state 1620 MHz. */
+static void t8142_j704(void)
+{
+    t8142_shape(14, 13, 14, true);
+    t8142_setup(true, T8142_GFX_DATA + 0xc0000, true);
+    CHK(dt_set_gpu_g17(dtbuf, &g17_soc_t8142));
+    t8142_expect_gpu_on();
+    u64 base, size;
+    t8142_reg("/reserved-memory/fw-data", &base, &size);
+    assert(base == T8142_GFX_DATA && size == 0x184000);
+    int opps = fdt_path_offset(dtbuf, "/opp-table"), opp, i = 0;
+    assert(opps >= 0);
+    fdt_for_each_subnode(opp, dtbuf, opps)
+    {
+        int len;
+        const fdt64_t *hz = fdt_getprop(dtbuf, opp, "opp-hz", &len);
+        assert(hz && len == 8 && fdt64_ld(hz) == t8142_j704_mhz[i] * 1000000ull);
+        const fdt32_t *uv = fdt_getprop(dtbuf, opp, "opp-microvolt", &len);
+        assert(uv && len == 4 && fdt32_ld(uv) == t8142_j704_mv[i] * 1000u);
+        i++;
+    }
+    assert(i == 14);
+    assert(!log_has("disabling GPU"));
+}
+
+/* J704 ADT with a 13-entry (J813) OPP table: the GPU is disabled, and the log says why. */
+static void t8142_j704_dt13(void)
+{
+    t8142_shape(14, 13, 13, true);
+    t8142_setup(true, T8142_GFX_DATA + 0xc0000, true);
+    CHK(dt_set_gpu_g17(dtbuf, &g17_soc_t8142));
+    assert(!strcmp(status_of(dtbuf, "/soc/gpu@582600000"), "disabled"));
+    assert(log_has("ADT has 14 perf states, the DT 13 OPPs"));
+}
+
+/* J813 ADT with a 14-entry table: disabled, as a J704 table on a J813 must not be filled. */
+static void t8142_j813_dt14(void)
+{
+    t8142_shape(13, 12, 14, false);
+    t8142_setup(true, T8142_GFX_DATA + 0xc0000, true);
+    CHK(dt_set_gpu_g17(dtbuf, &g17_soc_t8142));
+    assert(!strcmp(status_of(dtbuf, "/soc/gpu@582600000"), "disabled"));
+}
+
+/* Only the two known shapes: 14 states with gpu-num-perf-states 12 is refused. */
+static void t8142_mixed_shape(void)
+{
+    t8142_shape(14, 12, 14, true);
+    t8142_setup(true, T8142_GFX_DATA + 0xc0000, true);
+    CHK(dt_set_gpu_g17(dtbuf, &g17_soc_t8142));
+    assert(!strcmp(status_of(dtbuf, "/soc/gpu@582600000"), "disabled"));
 }
 
 /* ---------- T8140 (A18 Pro, G17P): both roles' __DATA as gpu-fw-data ---------- */
@@ -2413,6 +2491,10 @@ static const struct {
     {"t8142-fw-data-no-shared-ro", t8142_fw_data_no_shared_ro},
     {"t8142-fw-data-apart", t8142_fw_data_apart},
     {"t8142-no-fw-data-node", t8142_no_fw_data_node},
+    {"t8142-j704", t8142_j704},
+    {"t8142-j704-dt13", t8142_j704_dt13},
+    {"t8142-j813-dt14", t8142_j813_dt14},
+    {"t8142-mixed-shape", t8142_mixed_shape},
     {"t8140-fw-data", t8140_fw_data},
     {"t8140-fw-data-apart", t8140_fw_data_apart},
     {"t8140-fw-data-no-gfx1", t8140_fw_data_no_gfx1},
