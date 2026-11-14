@@ -79,6 +79,8 @@ static void reset(const char *compat, int compat_len)
 #define N(a) ((int)(sizeof(a) / sizeof((a)[0])))
 #define J613 "apple,j613\0apple,t8122\0apple,arm-platform"
 #define J615 "apple,j615\0apple,t8122\0apple,arm-platform"
+#define J504 "apple,j504\0apple,t8122\0apple,arm-platform"
+#define J433 "apple,j433\0apple,t8122\0apple,arm-platform"
 #define J514S "apple,j514s\0apple,t6030\0apple,arm-platform"
 #define J516S "apple,j516s\0apple,t6030\0apple,arm-platform"
 #define J516C "apple,j516c\0apple,t6031\0apple,arm-platform"
@@ -154,6 +156,7 @@ int main(void)
     /* the five boards get their own recipe and nothing else */
     RESET(J613); assert(!run()); expect_only(air, 4);
     RESET(J615); assert(!run()); expect_only(air, 4);
+    RESET(J504); assert(!run()); expect_only(air, 4);
     RESET(J516S); assert(!run()); expect_only(pro, 2);
     RESET(J514S); assert(!run()); expect_only(pro, 2);
     RESET(J516C); assert(!run()); expect_only(max, 2);
@@ -164,6 +167,9 @@ int main(void)
        board without its SoC, M1/M2: untouched */
     UNTOUCHED(J514C);
     UNTOUCHED(J514M);
+    UNTOUCHED(J433);
+    UNTOUCHED("apple,j504\0apple,arm-platform");
+    UNTOUCHED("apple,j504\0apple,t6030\0apple,arm-platform");
     UNTOUCHED(J516M);
     UNTOUCHED("apple,j516c\0apple,t6034\0apple,arm-platform");
     UNTOUCHED("apple,j516c\0apple,arm-platform");

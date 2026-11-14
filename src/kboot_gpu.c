@@ -2495,7 +2495,7 @@ static int dt_set_gpu_g15(void *dt, const struct g15_soc *soc)
 static int dt_set_gpu_t8122(void *dt);
 
 /*
- * On a J613 or J615, read the same T8122 leakage fuse words under the
+ * On a J613, J615 or J504, read the same T8122 leakage fuse words under the
  * exception guard, before anything powers the GPU, then log and export the decoded values (see
  * t8122_leak_fuse_decode()). It changes nothing else: the GPU setup uses them only with
  * chosen.asahi,t8122-gpu-fuse-leakage=1. A fault or a full device tree is logged, and the boot
@@ -2506,7 +2506,8 @@ static void t8122_leak_fuse_export(void *dt)
     t8122_fuse_valid = false;
     t8122_fuse_use = g15_optin(dt, T8122_LEAK_FUSE_OPTIN);
     if (chip_id != T8122 || (fdt_node_check_compatible(dt, 0, "apple,j613") &&
-                             fdt_node_check_compatible(dt, 0, "apple,j615")))
+                             fdt_node_check_compatible(dt, 0, "apple,j615") &&
+                             fdt_node_check_compatible(dt, 0, "apple,j504")))
         return;
 
     int before = g15_guard_begin();

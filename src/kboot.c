@@ -427,9 +427,10 @@ static int dt_set_t8140_wfx_args(int node)
  * changes: every check behind it (board, firmware, identity, reservations, PMP values, resources)
  * still runs, and a failed check still leaves the boot framebuffer and a disabled GPU node.
  *
- * The Air switches are the recipe the boot package wrote on these Macs: the display handoff
- * (which also passes the PMP values), the GPU, and the stand-in power model with this Mac's
- * leakage fuse. It wrote the GPU lines only beside a display line of 1, so an owner's
+ * The Air switches, which the J504 (the 14" M3 MacBook Pro, the same T8122 and the same 14.x
+ * DCP and GPU images) shares, are the recipe the boot package wrote on these Macs: the display
+ * handoff (which also passes the PMP values), the GPU, and the stand-in power model with this
+ * Mac's leakage fuse. It wrote the GPU lines only beside a display line of 1, so an owner's
  * chosen.asahi,t8122-dcp=0 keeps the default GPU switches off as well; an owner's own GPU line
  * still counts. chosen.asahi,t8122-dcpext stays off. The Pro switches are its display handoff
  * and GPU; its external display handoffs (t6030-dcpext, t6030-dispext) keep their own lines.
@@ -451,7 +452,8 @@ struct m3_default_board {
     const char *const *graphics;
 };
 
-static const char *const m3_air_boards[] = {"apple,j613", "apple,j615", NULL};
+/* The M3 MacBook Airs (J613, J615) and the 14" M3 MacBook Pro (J504): one T8122 recipe. */
+static const char *const m3_air_boards[] = {"apple,j613", "apple,j615", "apple,j504", NULL};
 static const char *const m3_air_switches[] = {"asahi,t8122-dcp", "asahi,t8122-gpu",
                                               "asahi,t8122-gpu-power-standin",
                                               "asahi,t8122-gpu-fuse-leakage", NULL};
@@ -8690,7 +8692,8 @@ static int dt_set_pmp_t8122(void)
 
     if (!opt || len != 2 || opt[0] != '1' || opt[1] != '\0' ||
         (fdt_node_check_compatible(dt, 0, "apple,j613") &&
-         fdt_node_check_compatible(dt, 0, "apple,j615")))
+         fdt_node_check_compatible(dt, 0, "apple,j615") &&
+         fdt_node_check_compatible(dt, 0, "apple,j504")))
         return 0;
     dt_pass_pmp(&pmp_values_t8122);
     return 0;

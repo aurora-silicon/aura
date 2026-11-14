@@ -1690,6 +1690,23 @@ static void t8122_fuse_not_j613(void)
     assert(!trace_len && !mmio_reads && !log_has("leakage fuse"));
 }
 
+/* The J504 (14" M3 MacBook Pro) reads and exports the same fuse; a J433 (M3 iMac) root does not */
+static void t8122_j504_fuse_export(void)
+{
+    prepare_fuse(0, 0xa0000000, 0x000aaaaa, 0);
+    CHK(fdt_setprop_string(dtbuf, 0, "compatible", "apple,j504"));
+    run();
+    expect_fuse_prop(10924, 342);
+    assert(!strcmp(trace_buf, "read32 0x2e42c8128\nread32 0x2e42c812c\n"));
+    assert(mmio_reads == 2 && !pmgr_enables && !exc_count && !unguarded_faults);
+
+    prepare_fuse(0, 0xa0000000, 0x000aaaaa, 0);
+    CHK(fdt_setprop_string(dtbuf, 0, "compatible", "apple,j433"));
+    run();
+    assert(prop_len(dtbuf, "/chosen", "asahi,t8122-gpu-leak-fuse") < 0);
+    assert(!trace_len && !mmio_reads && !log_has("leakage fuse"));
+}
+
 static void t8122_j613_fuse_fault(void)
 {
     /* A faulting read is caught, logged, and the boot goes on without the property */
@@ -2399,6 +2416,7 @@ static const struct {
     {"t8122-fuse-decode", t8122_fuse_decode},
     {"t8122-j613-fuse-export", t8122_j613_fuse_export},
     {"t8122-fuse-not-j613", t8122_fuse_not_j613},
+    {"t8122-j504-fuse-export", t8122_j504_fuse_export},
     {"t8122-j613-fuse-fault", t8122_j613_fuse_fault},
     {"t8122-j613-standin-fuse-off", t8122_j613_standin_fuse_off},
     {"t8122-j613-standin-fuse-on", t8122_j613_standin_fuse_on},

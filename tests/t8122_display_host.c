@@ -841,8 +841,9 @@ static int contract_check(const void *dt)
               status_is(dt, mbox, "disabled"),
           "gate: dcp, display, both DARTs and the mailbox are still disabled");
 
-    /* drm/apple, 14.x IOMFB, J613 board */
-    check(!fdt_node_check_compatible(dt, 0, "apple,j613"), "drm: the root is apple,j613");
+    /* drm/apple, 14.x IOMFB, the fixture's board (J613 unless T8122_BOARD names another) */
+    const char *board = getenv("T8122_BOARD") ? getenv("T8122_BOARD") : "apple,j613";
+    check(!fdt_node_check_compatible(dt, 0, board), "drm: the root is %s", board);
     const char *uuid = fdt_getprop(dt, dcp, "apple,firmware-uuid", NULL);
     check(uuid && !strcmp(uuid, J613_UUID), "drm: dcp apple,firmware-uuid is %s", J613_UUID);
     int len;
@@ -1018,6 +1019,10 @@ int main(int argc, char **argv)
         publish = false;
     } else if (!strcmp(sc, "power-off")) {
         o.armed = o.power_off = true;
+        publish = false;
+    } else if (!strcmp(sc, "other-board")) {
+        /* armed on a T8122 board outside dcp_boards_t8122 (the fixture's root says which) */
+        o.armed = true;
         publish = false;
     } else if (!strcmp(sc, "missing-clock") || !strcmp(sc, "wrong-os") ||
                !strcmp(sc, "missing-profile")) {

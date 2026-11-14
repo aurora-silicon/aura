@@ -30,6 +30,8 @@ UBOOT = (bytes(16) + (0x10000).to_bytes(8, "little") + bytes(32) + b"ARM\x64" + 
 BOARDS = {
     "j613": ("J613", "apple,j613;apple,t8122;apple,arm-platform"),
     "j615": ("J615", "apple,j615;apple,t8122;apple,arm-platform"),
+    "j504": ("J504", "apple,j504;apple,t8122;apple,arm-platform"),
+    "j433": ("J433", "apple,j433;apple,t8122;apple,arm-platform"),
     "j514s": ("J514S", "apple,j514s;apple,t6030;apple,arm-platform"),
     "j516s": ("J516S", "apple,j516s;apple,t6030;apple,arm-platform"),
     "j516c": ("J516C", "apple,j516c;apple,t6031;apple,arm-platform"),
@@ -38,10 +40,11 @@ BOARDS = {
     "j516m": ("J516M", "apple,j516m;apple,t6034;apple,arm-platform"),
     "j293": ("J293", "apple,j293;apple,t8103;apple,arm-platform"),
 }
-CHIP = {"j613": "8122", "j615": "8122", "j514s": "6030", "j516s": "6030", "j516c": "6031",
+CHIP = {"j613": "8122", "j615": "8122", "j504": "8122", "j433": "8122", "j514s": "6030", "j516s": "6030", "j516c": "6031",
         "j514c": "6031", "j514m": "6034", "j516m": "6034", "j293": "8103"}
 FAMILY = {"j613": ("asahi,t8122-", "asahi,j613-", "asahi,j615-"),
           "j615": ("asahi,t8122-", "asahi,j613-", "asahi,j615-"),
+          "j504": ("asahi,t8122-", "asahi,j613-", "asahi,j615-"),
           "j514s": ("asahi,t6030-",),
           "j516s": ("asahi,t6030-",),
           "j516c": ("asahi,t6031-",)}
@@ -455,7 +458,7 @@ def graphics_off(r, board="j613"):
     assert r.rc == 0 and r.booted, r.stdout
     for name in r.chosen:
         assert not name.startswith(FAMILY[board]), (name, r.stdout)
-    if board in ("j613", "j615"):
+    if board in ("j613", "j615", "j504"):
         assert r.select == "reservation-only", r.stdout
     if board == "j516c":                      # no image read, no identity probe, GPU node disabled
         assert r.select == "t6031-disabled" and not r.probes, r.stdout
@@ -467,9 +470,10 @@ def booted(r):
 
 # ---- a complete config: unchanged ----
 
+@pytest.mark.parametrize("board", ["j613", "j615", "j504"])
 @pytest.mark.parametrize("build", STAGE2)
-def test_no_config_gets_the_whole_air_recipe(tools, build):
-    b = boot(tools, build, b"")
+def test_no_config_gets_the_whole_air_recipe(tools, build, board):
+    b = boot(tools, build, b"", board=board)
     booted(b)
     assert set(AIR) <= b.armed and b.select == "g15-standin"
 
@@ -535,7 +539,7 @@ def test_j516c_owner_lines_are_kept(tools, build, config, lines, select):
     assert b.armed & {MAX_DCP, MAX_GPU} == {k for k, v in lines.items() if v == "1"}
 
 
-@pytest.mark.parametrize("board", ["j514c", "j514m", "j516m", "j293"])
+@pytest.mark.parametrize("board", ["j514c", "j514m", "j516m", "j293", "j433"])
 @pytest.mark.parametrize("build", STAGE2)
 def test_other_maxes_and_macs_get_no_default(tools, build, board):
     b = boot(tools, build, b"", board=board)
@@ -543,7 +547,7 @@ def test_other_maxes_and_macs_get_no_default(tools, build, board):
     assert not any(n.startswith(M3_LINES) for n in b.chosen), b.stdout
     assert not b.probes
     # the J514C reaches the T6031 entry, which needs its line as before; T6034 has no GPU path
-    assert b.select == ("t6031-disabled" if board == "j514c" else "none")
+    assert b.select == {"j514c": "t6031-disabled", "j433": "reservation-only"}.get(board, "none")
 
 
 @pytest.mark.parametrize("config,lines", [
@@ -619,10 +623,11 @@ LOSSES = {
 }
 
 
+@pytest.mark.parametrize("board", ["j613", "j504"])
 @pytest.mark.parametrize("loss", sorted(LOSSES))
 @pytest.mark.parametrize("build", STAGE2)
-def test_a_lost_line_keeps_air_graphics_off_and_boots(tools, build, loss):
-    graphics_off(boot(tools, build, LOSSES[loss](build)))
+def test_a_lost_line_keeps_air_graphics_off_and_boots(tools, build, loss, board):
+    graphics_off(boot(tools, build, LOSSES[loss](build), board=board), board=board)
 
 
 @pytest.mark.parametrize("build", STAGE2)

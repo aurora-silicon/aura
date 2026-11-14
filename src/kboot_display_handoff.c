@@ -294,20 +294,21 @@ static const struct dcp_soc dcp_soc_t6030 = {
 };
 
 /*
- * T8122 (M3 MacBook Air J613/J615). Addresses, segments, DART windows and the display power state
+ * T8122 (M3 MacBook Air J613/J615, 14" M3 MacBook Pro J504; the J504 runs the same DCP image,
+ * DCP8_UUID). Addresses, segments, DART windows and the display power state
  * come from the ADT. pmgr_disp_cpu is ps_disp_cpu of the open T8122 PMGR device tree (pmgr
  * 0x2d0700000, state 0x10000); it is only compared with the ADT's, for the device tree. The DCP
  * image iBoot leaves running is pinned (DCP8_UUID), so the generalised handoff publishes when
  * armed and every check passes; otherwise it publishes nothing and the Mac keeps the framebuffer.
  */
-static const char *const dcp_boards_t8122[] = {"apple,j613", "apple,j615", NULL};
+static const char *const dcp_boards_t8122[] = {"apple,j613", "apple,j615", "apple,j504", NULL};
 
 static const struct dcp_soc dcp_soc_t8122 = {
     .name = "T8122",
     .chip = T8122,
     .compat = "apple,t8122",
     .boards = dcp_boards_t8122,
-    .boards_desc = "J613/J615",
+    .boards_desc = "J613/J615/J504",
     .dcp_compat = "apple,t8122-dcp",
     .disp_compat = "apple,t8122-display-subsystem",
     .marker = "apple,t8122-handoff",
