@@ -8111,6 +8111,213 @@ static int dt_set_j773g_dcp_handoff(unsigned int unused)
 }
 
 /*
+ * The J773g display frontend (disp0, SID0 of the display DART) and its PIODMA child (SID16) run
+ * on tables iBoot left behind. A kernel that adopts them needs every inherited page described:
+ * SID0 maps one DCP firmware segment and the retained scanout framebuffer (/vram), SID16 one DCP
+ * firmware segment. Read both tables (locked, read only), then give disp0 the segment's
+ * reservation with its own iommu-addresses tuple plus a no-map "framebuffer" reservation of
+ * /vram, and the PIODMA child its segment. A page that is neither refuses the whole step. A DT
+ * that already describes disp0's regions is left as it is.
+ */
+#ifndef STAGE1
+static u64 j773g_dram_start, j773g_dram_size;
+
+struct j773g_display_maps {
+    const struct adt_segment_ranges *segments;
+    u32 count;
+    u64 fb_base, fb_size, fb_bytes;
+    u64 bytes[32];
+    u64 bad_iova, bad_phys;
+};
+
+static int j773g_display_page(u64 iova, u64 physical, void *opaque)
+{
+    struct j773g_display_maps *maps = opaque;
+    for (u32 i = 0; i < maps->count; i++) {
+        const struct adt_segment_ranges *seg = &maps->segments[i];
+        u64 start = seg->remap & ((1ULL << 36) - 1);
+        u64 size = ALIGN_UP((u64)seg->size, SZ_16K);
+        if (seg->unk != 2 || iova < start || iova - start >= size)
+            continue;
+        if ((seg->remap >> 36) != 0x10 || physical != seg->phys + iova - start)
+            return -1;
+        maps->bytes[i] += SZ_16K;
+        return 0;
+    }
+    if (maps->fb_size && physical >= maps->fb_base && physical - maps->fb_base < maps->fb_size) {
+        maps->fb_bytes += SZ_16K;
+        return 0;
+    }
+    maps->bad_iova = iova;
+    maps->bad_phys = physical;
+    return -1; /* Never leave an inherited mapping undescribed. */
+}
+
+static void j773g_display_log(const char *what, const struct j773g_display_maps *maps)
+{
+    for (u32 i = 0; i < maps->count; i++)
+        if (maps->bytes[i])
+            printf("FDT: J773g %s: segment %u (kind %u) phys 0x%lx remap 0x%lx: 0x%lx of 0x%lx "
+                   "bytes mapped\n",
+                   what, i, maps->segments[i].unk, maps->segments[i].phys, maps->segments[i].remap,
+                   maps->bytes[i], ALIGN_UP((u64)maps->segments[i].size, SZ_16K));
+    printf("FDT: J773g %s: framebuffer [0x%lx, +0x%lx): 0x%lx bytes mapped\n", what, maps->fb_base,
+           maps->fb_size, maps->fb_bytes);
+    if (maps->bad_phys)
+        printf("FDT: J773g %s: undescribed page iova 0x%lx -> phys 0x%lx\n", what, maps->bad_iova,
+               maps->bad_phys);
+}
+
+/* The one whole segment a stream maps, or -1. */
+static int j773g_display_segment(const struct j773g_display_maps *maps)
+{
+    int found = -1;
+    for (u32 i = 0; i < maps->count; i++) {
+        if (!maps->bytes[i])
+            continue;
+        if (found >= 0 || maps->bytes[i] != ALIGN_UP((u64)maps->segments[i].size, SZ_16K))
+            return -1;
+        found = i;
+    }
+    return found;
+}
+
+/* The DCP's reservation of segment i (published by dt_set_j773g_dcp_regions), or -1. */
+static int j773g_segment_reservation(const struct adt_segment_ranges *seg, u32 *phandle)
+{
+    int dcp = fdt_path_offset(dt, "dcp"), len;
+    const fdt32_t *regions = dcp < 0 ? NULL : fdt_getprop(dt, dcp, "memory-region", &len);
+    u64 size = ALIGN_UP((u64)seg->size, SZ_16K);
+    for (int r = 0; regions && r < len / (int)sizeof(*regions); r++) {
+        int mem = fdt_node_offset_by_phandle(dt, fdt32_ld(&regions[r]));
+        int reg_len;
+        const fdt32_t *reg = mem < 0 ? NULL : fdt_getprop(dt, mem, "reg", &reg_len);
+        if (reg && reg_len == 4 * sizeof(*reg) && dt_cells64(&reg[0]) == seg->phys &&
+            dt_cells64(&reg[2]) == size) {
+            *phandle = fdt32_ld(&regions[r]);
+            return mem;
+        }
+    }
+    return -1;
+}
+
+static int j773g_alias_phandle(const char *alias, u32 *phandle)
+{
+    int node = fdt_path_offset(dt, alias);
+    if (node < 0)
+        return -1;
+    *phandle = fdt_get_phandle(dt, node);
+    if (!*phandle &&
+        (fdt_generate_phandle(dt, phandle) || fdt_setprop_u32(dt, node, "phandle", *phandle)))
+        return -1;
+    return 0;
+}
+
+/* Add the stream owner's tuple to segment i's reservation and link it to the owner. */
+static int j773g_link_segment(const char *alias, const struct adt_segment_ranges *seg)
+{
+    u32 owner, mem_phandle;
+    if (j773g_alias_phandle(alias, &owner))
+        bail("FDT: J773g %s has no node\n", alias);
+    int mem = j773g_segment_reservation(seg, &mem_phandle);
+    if (mem < 0)
+        bail("FDT: J773g %s segment 0x%lx is not a DCP reservation\n", alias, seg->phys);
+    const char *name = fdt_get_name(dt, mem, NULL);
+    char label[64];
+    snprintf(label, sizeof(label), "%s", name ? name : "dcp-segment");
+    if (dt_device_set_reserved_mem(mem, label, owner, seg->remap,
+                                   ALIGN_UP((u64)seg->size, SZ_16K)) ||
+        dt_device_add_mem_region(alias, mem_phandle, label))
+        bail("FDT: cannot link J773g %s to %s\n", alias, label);
+    return 0;
+}
+
+static int dt_set_j773g_display_maps(unsigned int unused)
+{
+    UNUSED(unused);
+    int disp0 = fdt_path_offset(dt, "disp0");
+    if (disp0 < 0)
+        bail("FDT: J773g DT has no disp0\n");
+    bool described = fdt_getprop(dt, disp0, "memory-region", NULL);
+
+    int vram_path[8];
+    int vram = adt_path_offset_trace(adt, "/vram", vram_path);
+    u64 fb_base, fb_size;
+    if (vram < 0 || adt_get_reg(adt, vram_path, "reg", 0, &fb_base, &fb_size) < 0 || !fb_size ||
+        (fb_base | fb_size) & (SZ_16K - 1))
+        bail("ADT: J773g /vram missing or unaligned\n");
+
+    struct j773g_display_maps sid0 = {
+        .segments = j773g_dcp_segments,
+        .count = j773g_dcp_count,
+        .fb_base = fb_base,
+        .fb_size = fb_size,
+    };
+    struct j773g_display_maps sid16 = {.segments = j773g_dcp_segments, .count = j773g_dcp_count};
+    bool piodma = fdt_path_offset(dt, "disp0_piodma") >= 0;
+
+    /* The T8132 display DART; reading tables must not enable or reset streams. */
+    int walk0 = dart_walk_locked_t8110(0x30a300000, 0xc000, 0, j773g_dram_start, j773g_dram_size,
+                                       j773g_display_page, &sid0);
+    j773g_display_log("disp0 SID0", &sid0);
+    if (walk0)
+        bail("FDT: J773g disp0 SID0 has a mapping outside its segment and framebuffer\n");
+    if (described) {
+        /* The walk above is read only and logged; a DT that describes disp0 is kept as it is. */
+        printf("FDT: J773g disp0 regions already described by the DT\n");
+        return 0;
+    }
+    int seg0 = j773g_display_segment(&sid0);
+    /* The retained framebuffer is a physical handoff: reserved whether or not SID0 maps it now. */
+    if (seg0 < 0)
+        bail("FDT: J773g disp0 SID0 does not map exactly one whole DCP segment\n");
+    int seg16 = -1;
+    if (piodma) {
+        int walk16 = dart_walk_locked_t8110(0x30a300000, 0xc000, 16, j773g_dram_start,
+                                            j773g_dram_size, j773g_display_page, &sid16);
+        j773g_display_log("PIODMA SID16", &sid16);
+        if (walk16 || sid16.fb_bytes || (seg16 = j773g_display_segment(&sid16)) < 0)
+            bail("FDT: J773g PIODMA SID16 does not map exactly one whole segment\n");
+    }
+
+    /* Overlapping a reservation other than the one being added is ambiguous. */
+    char fb_name[64];
+    snprintf(fb_name, sizeof(fb_name), "framebuffer@%lx", fb_base);
+    int resv = fdt_path_offset(dt, "/reserved-memory"), existing;
+    if (resv < 0)
+        bail("FDT: J773g DT has no /reserved-memory node\n");
+    fdt_for_each_subnode(existing, dt, resv)
+    {
+        int reg_len;
+        const fdt32_t *reg = fdt_getprop(dt, existing, "reg", &reg_len);
+        if (!reg || reg_len != 4 * sizeof(*reg))
+            continue;
+        u64 start = dt_cells64(&reg[0]), span = dt_cells64(&reg[2]);
+        if (span && start < fb_base + fb_size && fb_base < start + span)
+            bail("FDT: J773g framebuffer [0x%lx, +0x%lx) overlaps /reserved-memory/%s\n", fb_base,
+                 fb_size, fdt_get_name(dt, existing, NULL));
+    }
+
+    if (j773g_link_segment("disp0", &j773g_dcp_segments[seg0]))
+        return -1;
+    int fb = dt_get_or_add_reserved_mem(fb_name, "apple,asc-mem", true, fb_base, fb_size);
+    u32 fb_phandle = fb < 0 ? 0 : fdt_get_phandle(dt, fb);
+    if (!fb_phandle || dt_device_add_mem_region("disp0", fb_phandle, "framebuffer"))
+        bail("FDT: cannot reserve the J773g retained framebuffer\n");
+    if (seg16 >= 0 && j773g_link_segment("disp0_piodma", &j773g_dcp_segments[seg16]))
+        return -1;
+
+    printf("FDT: J773g disp0 SID0: segment %d + framebuffer [0x%lx, +0x%lx) published\n", seg0,
+           fb_base, fb_size);
+    if (seg16 >= 0)
+        printf("FDT: J773g PIODMA SID16: segment %d published\n", seg16);
+    else
+        printf("FDT: J773g DT has no disp0_piodma alias; PIODMA left undescribed\n");
+    return 0;
+}
+#endif
+
+/*
  * Publish the inherited DCP firmware mapping without starting a display driver: on the J713
  * on any firmware as before, on any other M4 Mac with a panel on 26.6.2, and on the J773g
  * whose main DCP drives the HDMI port. Only the DT changes: J713 and panel paths read the live
@@ -8179,7 +8386,16 @@ static int dt_set_m4_dcp_handoff(void)
         j773g_dcp_segments = segments;
         j773g_dcp_uuid = uuid;
         j773g_dcp_count = count;
+#ifndef STAGE1
+        j773g_dram_start = dram_start;
+        j773g_dram_size = dram_size;
+#endif
         int transaction = dt_display_transaction(dt_set_j773g_dcp_handoff, 0);
+#ifndef STAGE1
+        /* Fail-soft: without it the kernel only leaves the display frontend alone. */
+        if (!transaction && dt_display_transaction(dt_set_j773g_display_maps, 0))
+            printf("FDT: J773g display frontend regions refused; DCP mappings kept\n");
+#endif
         j773g_dcp_segments = NULL;
         j773g_dcp_uuid = NULL;
         j773g_dcp_count = 0;

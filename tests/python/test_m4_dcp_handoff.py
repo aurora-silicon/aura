@@ -25,6 +25,9 @@ def test_m4_dcp_handoff_follows_the_firmware_and_the_panel(tmp_path):
     layout = header[start:header.index("} PACKED;", start) + len("} PACKED;")]
     start = kboot.index("struct j713_display_maps {")
     maps = kboot[start:kboot.index("\n};", start) + 3] + "\n"
+    start = kboot.index("static u64 j773g_dram_start, j773g_dram_size;")
+    end = kboot.index("\n}", kboot.index("static int dt_set_j773g_display_maps(")) + 2
+    frontend = kboot[start:end] + "\n"
     segment_kind = re.search(r"^#define ADT_SEGMENT_DCP_OS_LOG .+$", kboot, re.MULTILINE).group(0) + "\n"
     production = (
         function(kboot, "dt_get_iommu_node") + function(kboot, "dt_device_set_reserved_mem") +
@@ -39,7 +42,7 @@ def test_m4_dcp_handoff_follows_the_firmware_and_the_panel(tmp_path):
         "static u32 j773g_dcp_count;\n" + segment_kind +
         function(kboot, "dt_cells64", "static u64 ") +
         function(kboot, "dt_set_j773g_dcp_regions") +
-        function(kboot, "dt_set_j773g_dcp_handoff") +
+        function(kboot, "dt_set_j773g_dcp_handoff") + frontend +
         function(kboot, "dt_set_m4_dcp_handoff"))
     production = function(firmware, "firmware_set_fdt", "int ") + production
     assert not re.search(r"\bdt_set_j713_dcp_handoff\b", kboot)
@@ -139,12 +142,27 @@ static struct board b;
 static u64 dram_base = 0x10000000000UL;
 static const u32 one = 1;
 static int walks;
+static bool j773g_scanout, j773g_stray;
 static int adt_path_offset(void *tree, const char *path)
 {
     if (!strcmp(path, "/chosen")) return 1;
     if (!strcmp(path, "/arm-io/dcp/iop-dcp-nub")) return 2;
     if (!strcmp(path, "/arm-io/disp0")) return b.external < 0 ? -1 : 3;
     return -1;
+}
+/* /vram: the retained scanout framebuffer the J773g's SID0 may still map. */
+static const u64 vram_base = 0x103e5300000UL, vram_size = 0x854000;
+static int adt_path_offset_trace(void *tree, const char *path, int *trace)
+{
+    if (strcmp(path, "/vram")) return -1;
+    trace[0] = 4; trace[1] = 0;
+    return 4;
+}
+static int adt_get_reg(void *tree, int *path, const char *prop, int index, u64 *base, u64 *size)
+{
+    if (path[0] != 4 || strcmp(prop, "reg") || index) return -1;
+    *base = vram_base; *size = vram_size;
+    return 0;
 }
 static const void *adt_getprop(void *tree, int node, const char *name, u32 *len)
 {
@@ -179,6 +197,20 @@ static int dart_walk_locked_t8110(uintptr_t base, u64 size, u8 sid, u64 dram_sta
 {
     assert(base == 0x30a300000 && size == 0xc000 && (sid == 0 || sid == 16));
     walks++;
+    if (!strcmp(b.name, "j773g")) {
+        /* SID0: segment 4 and, when still scanned out, framebuffer pages; SID16: segment 5. */
+        const struct adt_segment_ranges *s = &b.segs[sid == 0 ? 4 : 5];
+        for (u64 at = 0; at < ALIGN_UP((u64)s->size, SZ_16K); at += SZ_16K)
+            if (visit((s->remap & ((1UL << 36) - 1)) + at, s->phys + at, opaque))
+                return -1;
+        if (sid == 0 && j773g_scanout)
+            for (u64 at = 0; at < 0x2c4000; at += SZ_16K)
+                if (visit(0x80000000UL + at, vram_base + at, opaque))
+                    return -1;
+        if (sid == 0 && j773g_stray)
+            return visit(0x90000000UL, 0x103e0000000UL, opaque);
+        return 0;
+    }
     for (unsigned i = 0, n = 0; i < b.count; i++) {
         if (b.segs[i].unk != 2) continue;
         bool mapped = sid == 0 ? n == 0 || n == 2 : n == 1;
@@ -263,6 +295,41 @@ static void version_is(const char *name, const u32 *num, size_t count)
     assert(v && len == (int)(count * 4));
     for (size_t i = 0; i < count; i++) assert(fdt32_ld(&v[i]) == num[i]);
 }
+/* Reservation <phandle> is segment seg's, with exactly one tuple of owner at its remap address. */
+static void owns(int owner, u32 phandle, unsigned seg)
+{
+    int len, node = fdt_node_offset_by_phandle(dt, phandle);
+    const fdt64_t *reg = fdt_getprop(dt, node, "reg", &len);
+    assert(reg && fdt64_ld(&reg[0]) == b.segs[seg].phys);
+    const fdt32_t *iova = fdt_getprop(dt, node, "iommu-addresses", &len);
+    unsigned matches = 0;
+    for (int j = 0; iova && j < len / 4; j += 5)
+        if (fdt32_ld(&iova[j]) == fdt_get_phandle(dt, owner)) {
+            assert(((u64)fdt32_ld(&iova[j + 1]) << 32 | fdt32_ld(&iova[j + 2])) == b.segs[seg].remap);
+            matches++;
+        }
+    assert(matches == 1);
+}
+/* The J773g frontend as the kernel's apple_dart_frontend_validate() admits it. */
+static void frontend_published(void)
+{
+    int disp0 = fdt_path_offset(dt, "disp0"), len;
+    const fdt32_t *mr = fdt_getprop(dt, disp0, "memory-region", &len);
+    assert(mr && len == 8);
+    assert(fdt_stringlist_count(dt, disp0, "memory-region-names") == 2);
+    assert(!strcmp(fdt_stringlist_get(dt, disp0, "memory-region-names", 1, NULL), "framebuffer"));
+    owns(disp0, fdt32_ld(&mr[0]), 4);
+    int fb = fdt_node_offset_by_phandle(dt, fdt32_ld(&mr[1]));
+    const fdt64_t *reg = fdt_getprop(dt, fb, "reg", &len);
+    assert(reg && fdt64_ld(&reg[0]) == vram_base && fdt64_ld(&reg[1]) == vram_size);
+    assert(fdt_getprop(dt, fb, "no-map", NULL) && !fdt_getprop(dt, fb, "iommu-addresses", NULL));
+    assert(!fdt_node_check_compatible(dt, fb, "apple,asc-mem"));
+    int piodma = fdt_path_offset(dt, "disp0_piodma");
+    mr = fdt_getprop(dt, piodma, "memory-region", &len);
+    assert(mr && len == 4);
+    owns(piodma, fdt32_ld(&mr[0]), 5);
+    assert(status_is("/soc/display-subsystem", "disabled")); /* the kernel DT enables it */
+}
 /* What the kernel's iomfb_m4_init() and the reserved-memory code read. */
 static void published(bool piodma)
 {
@@ -308,8 +375,12 @@ static void published(bool piodma)
     assert(status_is("/soc/display-subsystem", piodma ? "okay" : "disabled"));
     assert(!!fdt_getprop(dt, fdt_path_offset(dt, "disp0"), "apple,j713-inherited-mappings",
                          NULL) == piodma);
-    assert(!!fdt_getprop(dt, fdt_path_offset(dt, "disp0"), "memory-region", NULL) == piodma);
-    assert(walks == (b.native && os_firmware.version == V26_6_2 ? 2 : 0));
+    bool j773g = !strcmp(b.name, "j773g");
+    assert(!!fdt_getprop(dt, fdt_path_offset(dt, "disp0"), "memory-region", NULL) ==
+           (piodma || j773g));
+    assert(walks == ((b.native && os_firmware.version == V26_6_2) || j773g ? 2 : 0));
+    if (j773g)
+        frontend_published();
 }
 static void handed_over(const struct board *board, enum fw_version fw, bool piodma)
 {
@@ -405,6 +476,18 @@ int main(int argc, char **argv)
 
     /* The Mac mini's main DCP is an external HDMI pipeline; other panel-less boards refuse. */
     handed_over(&j773g, V26_6_2, false);
+    /* Still scanning out of /vram: the same publication. */
+    j773g_scanout = true;
+    handed_over(&j773g, V26_6_2, false);
+    j773g_scanout = false;
+    /* A page outside the segment and /vram: the DCP mappings stay, the frontend is undescribed. */
+    world(&j773g, V26_6_2);
+    j773g_stray = true;
+    assert(!dt_set_m4_dcp_handoff());
+    j773g_stray = false;
+    assert(!fdt_getprop(dt, fdt_path_offset(dt, "disp0"), "memory-region", NULL));
+    assert(!fdt_getprop(dt, fdt_path_offset(dt, "disp0_piodma"), "memory-region", NULL));
+    assert(fdt_getprop(dt, fdt_path_offset(dt, "dcp"), "memory-region", NULL));
     handed_over_with_existing_regions();
     reservation_refused_without_partial_edits();
     world(&j773g, V26_6_2);

@@ -102,6 +102,11 @@ endif
 
 ifeq ($(CHAINLOADING),1)
 CFG += CHAINLOADING
+# CHAINLOADING without ESP_STAGE2 is the installed Stage 1. Keep code that can only run while
+# preparing an OS device tree out of that size-constrained image.
+ifneq ($(ESP_STAGE2),1)
+CFG += STAGE1
+endif
 CARGO_FLAGS += --features chainload
 endif
 
