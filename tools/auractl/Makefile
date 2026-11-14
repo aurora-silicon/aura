@@ -25,7 +25,9 @@ auractl: auractl.c entry.h entry_$(ENTRY).c ../../src/auractl_abi.h
 KEXT_NAME   = AuractlDevice
 KEXT_BUNDLE = $(KEXT_NAME).kext
 KEXT_DIR    = AuractlDevice
-KEXT_SRCS   = $(KEXT_DIR)/AuractlDevice.cpp $(KEXT_DIR)/AuractlUserClient.cpp
+# kmod_info.c carries the bundle's kmod_info (Xcode would generate it); see that file.
+KEXT_SRCS   = $(KEXT_DIR)/AuractlDevice.cpp $(KEXT_DIR)/AuractlUserClient.cpp \
+	$(KEXT_DIR)/kmod_info.c
 KEXT_PLIST  = $(KEXT_DIR)/Info.plist
 SDKROOT    ?= $(shell xcrun --sdk macosx --show-sdk-path 2>/dev/null)
 KARCH      ?= arm64e
