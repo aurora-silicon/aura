@@ -41,6 +41,14 @@ ${DTC:-dtc} -q -I dts -O dtb -o "$tmp/fixture.dtb" "$root/tests/t8122-j613-displ
 dtbs="$tmp/fixture.dtb"
 [ -n "${J613_DTB:-}" ] && dtbs="$dtbs $J613_DTB"
 
+# The J504 (14" M3 MacBook Pro) runs the same DCP image: the same scenarios on the fixture with
+# its root. The J433 (an M3 iMac, also T8122) is outside the board list: armed, nothing is published.
+sed '14s/"apple,j613"/"apple,j504"/' "$root/tests/t8122-j613-display.dts" > "$tmp/j504.dts"
+sed '14s/"apple,j613"/"apple,j433"/' "$root/tests/t8122-j613-display.dts" > "$tmp/j433.dts"
+grep -q '"apple,j504", "apple,t8122"' "$tmp/j504.dts" && grep -q '"apple,j433", "apple,t8122"' "$tmp/j433.dts"
+${DTC:-dtc} -q -I dts -O dtb -o "$tmp/j504.dtb" "$tmp/j504.dts"
+${DTC:-dtc} -q -I dts -O dtb -o "$tmp/j433.dtb" "$tmp/j433.dts"
+
 fail=0
 extra=""
 [ -n "${J613_25G83:-}" ] && extra="missing-clock wrong-os missing-profile"
@@ -57,5 +65,28 @@ for dtb in $dtbs; do
         fi
     done
 done
+if [ -z "${J613_25G83:-}" ]; then
+    echo "### j504.dtb"
+    for s in unarmed publish repeat wrong-image not-running outside-segment power-off \
+        contract-selftest; do
+        if ! T8122_BOARD=apple,j504 "$tmp/t8122-display-host" "$tmp/j504.dtb" "$s" \
+            > "$tmp/j504-$s.log" 2>&1; then
+            fail=1
+            cat "$tmp/j504-$s.log"
+        else
+            tail -n 1 "$tmp/j504-$s.log" | sed "s/^/j504 $s: /"
+        fi
+    done
+    echo "### j433.dtb"
+    for s in unarmed other-board; do
+        if ! T8122_BOARD=apple,j433 "$tmp/t8122-display-host" "$tmp/j433.dtb" "$s" \
+            > "$tmp/j433-$s.log" 2>&1; then
+            fail=1
+            cat "$tmp/j433-$s.log"
+        else
+            tail -n 1 "$tmp/j433-$s.log" | sed "s/^/j433 $s: /"
+        fi
+    done
+fi
 [ $fail = 0 ] && echo "T8122 display handoff: every scenario passes"
 exit $fail

@@ -45,9 +45,9 @@
  * Nothing is written to the hardware. SRAM is read with aligned 32-bit loads and the PTD with
  * aligned 64-bit loads, under an exception guard, and only after every PMGR power state of the
  * /arm-io/pmp clock-gates read as actually on. The PTD update page is never accessed. After a
- * guarded fault, or once the node cannot be published, nothing more is read. Only on a J613
- * with chosen.asahi,t8122-dcp=1; the caller selects T8122. Each node is built on a copy of the
- * FDT and published only if complete. Failure is non-fatal to kboot, and an existing node is
+ * guarded fault, or once the node cannot be published, nothing more is read. Only on a J613,
+ * J615 or J504 with chosen.asahi,t8122-dcp=1; the caller selects T8122. Each node is built on a
+ * copy of the FDT and published only if complete. Failure is non-fatal to kboot, and an existing node is
  * never replaced.
  */
 
@@ -304,7 +304,8 @@ static bool facts_wanted(void *dt)
     return opt && len == 2 && opt[0] == '1' && opt[1] == '\0' &&
            !fdt_node_check_compatible(dt, 0, "apple,t8122") &&
            (!fdt_node_check_compatible(dt, 0, "apple,j613") ||
-            !fdt_node_check_compatible(dt, 0, "apple,j615"));
+            !fdt_node_check_compatible(dt, 0, "apple,j615") ||
+            !fdt_node_check_compatible(dt, 0, "apple,j504"));
 }
 
 /* ---- asahi,t8122-pmp-facts ---- */

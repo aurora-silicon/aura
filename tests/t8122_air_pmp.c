@@ -48,8 +48,8 @@ static void setup(char *tree, const char *board, bool armed)
 }
 int main(void)
 {
-    char tree[4096]; const char *boards[] = {"apple,j613", "apple,j615"};
-    for (unsigned b = 0; b < 2; b++) {
+    char tree[4096]; const char *boards[] = {"apple,j613", "apple,j615", "apple,j504"};
+    for (unsigned b = 0; b < 3; b++) {
         setup(tree, boards[b], true); board_value = 0x40 + b;
         assert(facts_wanted(dt)); assert(!dt_set_pmp_t8122()); assert(fills == 1);
         int node = fdt_path_offset(dt, "/chosen/asahi,t8122-pmp"); assert(node >= 0);
@@ -62,10 +62,14 @@ int main(void)
         node = fdt_path_offset(dt, "/chosen/asahi,t8122-pmp"); assert(node >= 0);
         assert(!fdt_getprop(dt, node, "apple,board-id", NULL));
     }
-    setup(tree, "apple,j504", true); assert(!facts_wanted(dt));
+    /* Other base-M3 boards (the J433/J434 iMacs) stay refused. */
+    setup(tree, "apple,j433", true); assert(!facts_wanted(dt));
     assert(!dt_set_pmp_t8122() && !fills);
+    setup(tree, "apple,j504", true);
+    assert(!fdt_setprop_string(dt, 0, "compatible", "apple,j504"));
+    assert(!facts_wanted(dt)); assert(!dt_set_pmp_t8122() && !fills);
     setup(tree, "apple,j615", true);
     assert(!fdt_setprop_string(dt, 0, "compatible", "apple,j615"));
     assert(!facts_wanted(dt)); assert(!dt_set_pmp_t8122() && !fills);
-    puts("actual Air PMP admission/callers: both boards, explicit intent, own data and resource refusal PASS");
+    puts("actual Air PMP admission/callers: J613/J615/J504, explicit intent, own data and resource refusal PASS");
 }
