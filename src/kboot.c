@@ -8143,7 +8143,10 @@ static int dt_set_display(void)
         /* Fail-soft (kboot_display_handoff.c): __OS_LOG reservations and the internal panel. */
         return dt_set_display_handoff(dt);
     } else if (!fdt_node_check_compatible(dt, 0, "apple,t8142")) {
-        ret = dt_carveout_reserved_regions("dcp", "disp0", "disp0_piodma",
+        /* A present canonical alias must not fall back to a different legacy target. */
+        const char *t8142_piodma_alias =
+            fdt_get_alias(dt, piodma_alias) ? piodma_alias : compat_piodma_alias;
+        ret = dt_carveout_reserved_regions("dcp", "disp0", t8142_piodma_alias,
                                            disp_reserved_regions_t8142,
                                            ARRAY_SIZE(disp_reserved_regions_t8142));
         if (ret)
