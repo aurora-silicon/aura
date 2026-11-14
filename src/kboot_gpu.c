@@ -2083,7 +2083,7 @@ static const struct g15_soc g15_soc_t6031 = {
     .calc_power = calc_power_t6031_standin,
 };
 
-/* J514M: four physical G15C clusters, with enabled cores measured from its fuses. */
+/* J514M/J516M: four physical G15C clusters, with enabled cores read from the fuses. */
 static const struct g15_soc g15_soc_t6034 = {
     .chip = T6034,
     .name = "T6034",
@@ -2754,7 +2754,7 @@ static int dt_measure_gpu_t6034(void *dt)
     struct t6031_probe p;
     int path[8], gpu;
     u64 size;
-    if (!t6034_board(dt))
+    if (!t6034_board(dt) && !j516m_board(dt))
         return 0;
     gpu = fdt_path_offset(dt, "gpu");
     if (gpu < 0 || fdt_node_check_compatible(dt, gpu, "apple,agx-t6034"))
@@ -2801,12 +2801,12 @@ static int dt_measure_gpu_t6034(void *dt)
     return 0;
 }
 
-/* The normal J514M path: exact board and owner choice, then measured G15C handoff. */
+/* Exact T6034 board and owner choice, then the measured G15C handoff. */
 static int dt_set_gpu_t6034(void *dt)
 {
     g15_g15c_fw = NULL;
     g15_g15c_id = (struct t8122_powered_identity){.result = T8122_ID_NOT_RUN};
-    if (!t6034_board(dt))
+    if (!t6034_board(dt) && !j516m_board(dt))
         return 0;
     if (!g15_optin(dt, g15_soc_t6034.optin)) {
         g15_disable(dt);

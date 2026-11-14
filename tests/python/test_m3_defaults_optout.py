@@ -197,6 +197,7 @@ static int dt_measure_gpu_t6034(void *d)
 }
 ''' + function(t6031, "bool t6031_board(const void *dt)\n{") + \
         function(t6031, "bool t6034_board(const void *dt)\n{") + \
+        function(t6031, "bool j516m_board(const void *dt)\n{") + \
         function(gpu, "static bool g15_optin(") + \
         function(gpu, "static int dt_set_gpu_t8122_select(void *dt)\n{") + \
         function(gpu, "static int dt_set_gpu_t6031(void *dt)\n{") + \
@@ -613,7 +614,7 @@ def test_t6031_owner_lines_are_kept(tools, build, board, config, lines, select):
     assert b.armed & {MAX_DCP, MAX_GPU} == {k for k, v in lines.items() if v == "1"}
 
 
-@pytest.mark.parametrize("board", ["j516m", "j293", "j433"])
+@pytest.mark.parametrize("board", ["j293", "j433"])
 @pytest.mark.parametrize("build", STAGE2)
 def test_other_maxes_and_macs_get_no_default(tools, build, board):
     b = boot(tools, build, b"", board=board)
@@ -1081,8 +1082,9 @@ def test_pre_m4_ignores_sart_entries(tools, build):
     (b"chosen.asahi,m3-defaults=0\nchosen.asahi,t6034-dcp=1\n", False, True),
     (LOST, False, False),
 ])
-def test_j514m_defaults_and_owner_choices(tools, build, config, gpu, display):
-    b = boot(tools, build, config, board="j514m")
+@pytest.mark.parametrize("board", ["j514m", "j516m"])
+def test_t6034_defaults_and_owner_choices(tools, build, board, config, gpu, display):
+    b = boot(tools, build, config, board=board)
     booted(b)
     assert ("asahi,t6034-gpu" in b.armed) == gpu
     assert ("asahi,t6034-dcp" in b.armed) == display

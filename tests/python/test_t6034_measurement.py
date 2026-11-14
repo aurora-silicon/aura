@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 """Run the T6034 measurement and shared probe with real libfdt and injected power faults."""
 from pathlib import Path
+import pytest
 from test_siliconforest_handoff import definition, run_c
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -8,7 +9,8 @@ def pick(source, signature):
     a = source.index(signature)
     return source[a:source.index('\n}', a) + 2]
 
-def test_scoped_measurement_restores_power_and_never_enables_gpu(tmp_path):
+@pytest.mark.parametrize("board", ["apple,j514m", "apple,j516m"])
+def test_scoped_measurement_restores_power_and_never_enables_gpu(tmp_path, board):
     gpu = (ROOT / 'src/kboot_gpu.c').read_text()
     shared = (ROOT / 'src/kboot_gpu_t6031.c').read_text()
     helper = (ROOT / 'src/kboot_t6031.c').read_text()
@@ -40,7 +42,7 @@ static void *adt;
 static struct t8122_powered_identity g15_g15c_id;
 struct fw_version_info;
 static const struct fw_version_info *g15_g15c_fw;
-''' + pick(helper, 'bool t6034_board(') + r'''
+''' + pick(helper, 'bool t6034_board(') + pick(helper, 'bool j516m_board(') + r'''
 static int adt_path_offset_trace(void *a, const char *s, int *p) { return 0; }
 static int adt_get_reg(void *a, int *p, const char *s, int n, u64 *base, u64 *size)
 { *base=bad_window ? 1 : T6031_SGX_BASE; *size=0x3fdc000; return 0; }
@@ -93,7 +95,7 @@ int main(void)
   assert(result()==(fault==0 ? T8122_ID_POWER_FAILED : fault==1 ? T8122_ID_READ_FAULT : T8122_ID_POWER_OFF_FAILED));
   assert(reads==(fault==0 ? 0 : 6));stays_disabled();
  }
- const char *bad_board[]={"apple,j516m","apple,j514c","apple,j999"};
+ const char *bad_board[]={"apple,j293","apple,j514c","apple,j999"};
  for(unsigned i=0;i<ARRAY_SIZE(bad_board);i++) {
   reset(bad_board[i],"apple,t6034");assert(!dt_measure_gpu_t6034(dt));assert(!enabled && !reads && !images);
  }
@@ -114,11 +116,14 @@ int main(void)
  return 0;
 }
 '''
+    fixture, main = code.split('int main(void)', 1)
+    code = fixture + 'int main(void)' + main.replace('apple,j514m', board)
     run_c(tmp_path, 't6034-measurement', code)
     boot = (ROOT / 'src/kboot.c').read_text()
     assert 'if (!(chip_id == T6034 && chosen_lost) && dt_set_gpu(dt))' in boot
 
-def test_normal_t6034_selector_keeps_owner_optouts_before_any_probe(tmp_path):
+@pytest.mark.parametrize("board", ["apple,j514m", "apple,j516m"])
+def test_normal_t6034_selector_keeps_owner_optouts_before_any_probe(tmp_path, board):
     gpu = (ROOT / 'src/kboot_gpu.c').read_text()
     boards = (ROOT / 'src/kboot_t6031.c').read_text()
     code = r'''
@@ -138,7 +143,7 @@ static const struct { const char *optin; } g15_soc_t6034={"asahi,t6034-gpu"};
 static void g15_disable(void *d) { disables++; }
 static int dt_measure_gpu_t6034(void *d) { probes++; return 0; }
 static int dt_set_gpu_g15(void *d,const void *soc) { assert(soc==&g15_soc_t6034);setups++;return 0; }
-''' + pick(boards, 'bool t6034_board(') + pick(gpu, 'static bool g15_optin(') + definition(gpu, 'dt_set_gpu_t6034') + r'''
+''' + pick(boards, 'bool t6034_board(') + pick(boards, 'bool j516m_board(') + pick(gpu, 'static bool g15_optin(') + definition(gpu, 'dt_set_gpu_t6034') + r'''
 int main(void)
 {
  unsigned char d[2048];assert(!fdt_create_empty_tree(d,sizeof(d)));
@@ -154,10 +159,12 @@ int main(void)
  assert(!fdt_setprop_string(d,n,"asahi,t6034-gpu","1"));
  assert(!dt_set_gpu_t6034(d));assert(probes==1 && setups==1);
  chip_id=0x6031;assert(!dt_set_gpu_t6034(d));assert(probes==1 && setups==1);
- chip_id=T6034;const char wrong[]="apple,j516m\0apple,t6034";
+ chip_id=T6034;const char wrong[]="apple,j999\0apple,t6034";
  assert(!fdt_setprop(d,0,"compatible",wrong,sizeof(wrong)));
  assert(!dt_set_gpu_t6034(d));assert(probes==1 && setups==1);
  return 0;
 }
 '''
+    fixture, main = code.split('int main(void)', 1)
+    code = fixture + 'int main(void)' + main.replace('apple,j514m', board)
     run_c(tmp_path, 't6034-selector', code)

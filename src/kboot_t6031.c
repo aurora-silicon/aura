@@ -25,6 +25,13 @@ bool t6034_board(const void *dt)
            !fdt_node_check_compatible(dt, 0, "apple,j514m");
 }
 
+/* Keep J516M's tested display/PMP namespace separate from J514M's. */
+bool j516m_board(const void *dt)
+{
+    return chip_id == T6034 && !fdt_node_check_compatible(dt, 0, "apple,t6034") &&
+           !fdt_node_check_compatible(dt, 0, "apple,j516m");
+}
+
 /*
  * T6032 (M3 Ultra, Mac Studio J575D): only the firmware image UUID list runs here. The 27.0.1
  * (26A434) ADT has the same iop nubs as T6031's for every owner the list keeps, and the owners
@@ -71,9 +78,9 @@ void dt_t6031_fw_uuids(void *dt)
     bool t6031 = t6031_board(dt), t6034 = t6034_board(dt);
     const char *property = t6034 ? "asahi,t6034-fw-uuids" : FW_UUIDS_PROP;
 
-    if (!t6031 && !t6034 && !t6032_board(dt))
+    if (!t6031 && !t6034 && !j516m_board(dt) && !t6032_board(dt))
         return;
-    const char *tag = t6034 ? "T6034" : t6031 ? "T6031" : "T6032";
+    const char *tag = (t6034 || j516m_board(dt)) ? "T6034" : t6031 ? "T6031" : "T6032";
     int chosen = fdt_path_offset(dt, "/chosen");
     if (chosen < 0 || fdt_getprop(dt, chosen, property, NULL))
         return;
@@ -147,7 +154,7 @@ void dt_t6031_facts(void *dt)
 
     bool t6034 = t6034_board(dt);
     const char *node_name = t6034 ? "asahi,t6034-facts" : FACTS_NODE;
-    if (!t6031_board(dt) && !t6034)
+    if (!t6031_board(dt) && !t6034 && !j516m_board(dt))
         return;
     int nclk = facts_clocks(id, freq);
     for (int i = 0; i < nclk; i++) {
