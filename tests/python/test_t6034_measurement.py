@@ -39,9 +39,9 @@ static u32 chip_id;
 static int enabled, restored, reads, images, fail_enable, fail_restore, fail_read, bad_window;
 static void *adt;
 ''' + identity + ops + '''
-static struct t8122_powered_identity g15_g15c_id;
+static __attribute__((unused)) struct t8122_powered_identity g15_g15c_id;
 struct fw_version_info;
-static const struct fw_version_info *g15_g15c_fw;
+static __attribute__((unused)) const struct fw_version_info *g15_g15c_fw;
 ''' + pick(helper, 'bool t6034_board(') + pick(helper, 'bool j516m_board(') + r'''
 static int adt_path_offset_trace(void *a, const char *s, int *p) { return 0; }
 static int adt_get_reg(void *a, int *p, const char *s, int n, u64 *base, u64 *size)
@@ -137,8 +137,8 @@ static int probes, setups, disables;
 struct fw_version_info;
 enum { T8122_ID_NOT_RUN };
 struct t8122_powered_identity { int result; };
-static struct t8122_powered_identity g15_g15c_id;
-static const struct fw_version_info *g15_g15c_fw;
+static __attribute__((unused)) struct t8122_powered_identity g15_g15c_id;
+static __attribute__((unused)) const struct fw_version_info *g15_g15c_fw;
 static const struct { const char *optin; } g15_soc_t6034={"asahi,t6034-gpu"};
 static void g15_disable(void *d) { disables++; }
 static int dt_measure_gpu_t6034(void *d) { probes++; return 0; }
