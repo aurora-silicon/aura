@@ -7459,9 +7459,17 @@ static int dt_set_t8142_dcpext(unsigned int n)
     int node = fdt_path_offset(dt, alias);
     if (node < 0 || fdt_get_path(dt, node, path, sizeof(path)))
         return -1;
+    /*
+     * The power-domain walk below finds the node again by phandle, as the tree
+     * moves under it. dtc gives a node one only when something refers to it,
+     * and nothing refers to a dcpext node, so give it one here.
+     */
     u32 owner = fdt_get_phandle(dt, node);
-    const fdt32_t *prop = fdt_getprop(dt, node, "iommus", &len);
-    if (!owner || !prop || len != 8)
+    if (!owner && (fdt_generate_phandle(dt, &owner) || fdt_setprop_u32(dt, node, "phandle", owner)))
+        return -1;
+    node = fdt_path_offset(dt, path);
+    const fdt32_t *prop = node < 0 ? NULL : fdt_getprop(dt, node, "iommus", &len);
+    if (!prop || len != 8)
         return -1;
     u32 fw_dart = fdt32_ld(&prop[0]), fw_sid = fdt32_ld(&prop[1]);
 
@@ -7500,10 +7508,9 @@ static int dt_set_t8142_dcpext(unsigned int n)
 
     t8142_dcpext_result = "carveout reservation failed";
     bool second = alias[6] == '1';
-    if (dt_carveout_reserved_regions(alias, NULL, NULL,
-                                     second ? dcpext1_reserved_regions_t8142
-                                            : dcpext0_reserved_regions_t8142,
-                                     2))
+    if (dt_carveout_reserved_regions(
+            alias, NULL, NULL,
+            second ? dcpext1_reserved_regions_t8142 : dcpext0_reserved_regions_t8142, 2))
         return -1;
 
     t8142_dcpext_result = "firmware segment reservation failed";
