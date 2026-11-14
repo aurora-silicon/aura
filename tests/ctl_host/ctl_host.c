@@ -328,6 +328,23 @@ static int call(u16 cmd, u64 a0, u64 a1, u64 a2, u64 buf, u64 len)
     return hvc_at(VA_REQ);
 }
 
+/* The same request, but driven the way the kext-free DCC transport does with no cookie presented.
+ */
+static int call_unauth(u16 cmd, u64 a0, u64 a1, u64 a2, u64 buf, u64 len)
+{
+    struct auractl_req *r = req_ptr();
+    memset(r, 0x5a, sizeof(*r));
+    r->magic = AURACTL_REQ_MAGIC;
+    r->version = AURACTL_VERSION;
+    r->cmd = cmd;
+    r->arg0 = a0;
+    r->arg1 = a1;
+    r->arg2 = a2;
+    r->buf = buf;
+    r->buf_len = len;
+    return ctl_host_call_unauth(VA_REQ);
+}
+
 static void standard_map(void)
 {
     nvm = 0;
@@ -693,6 +710,21 @@ static void test_not_live(void)
     sptm_virt_xnu_live = true;
 }
 
+static void test_cookie_gate(void)
+{
+    standard_map();
+    /* Without the cookie the DCC transport refuses everything past the read-only status. */
+    CHECK(call_unauth(AURACTL_ARM, AURACTL_SEL_ALL, 0, 0, 0, 0) == AURACTL_EPERM);
+    CHECK(call_unauth(AURACTL_DISARM, AURACTL_SEL_ALL, 0, 0, 0, 0) == AURACTL_EPERM);
+    CHECK(call_unauth(AURACTL_READ, 0, 1, 0, VA_BUF, 32) == AURACTL_EPERM);
+    CHECK(call_unauth(AURACTL_CLEAR, 0, 0, 0, 0, 0) == AURACTL_EPERM);
+    CHECK(call_unauth(AURACTL_PEEK, 0, 1, 0, VA_BUF, 4) == AURACTL_EPERM);
+    /* The status command (INFO) is allowed without a cookie, and still runs. */
+    CHECK(call_unauth(AURACTL_INFO, 0, 0, 0, VA_BUF, sizeof(struct auractl_info)) == 0);
+    /* The authed path the hvc transports use still runs a gated command (not refused). */
+    CHECK(call(AURACTL_CLEAR, 0, 0, 0, 0, 0) != AURACTL_EPERM);
+}
+
 int main(void)
 {
     char path[] = "/tmp/ctl_host.XXXXXX";
@@ -717,6 +749,7 @@ int main(void)
     test_console();
     test_peek();
     test_hooks();
+    test_cookie_gate();
     test_not_live();
     printf("ok: %d checks, %d splits, %d window mappings\n", tests, splits, win_maps);
     return 0;

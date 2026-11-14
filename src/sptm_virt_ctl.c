@@ -17,6 +17,12 @@
  *    that check takes;
  *  - serializes calls with one lock and returns a Darwin errno in x0.
  *
+ * Two transports reach the same handler. The hvc one above needs a byte of guest kernel code (an
+ * entry) to make the call. The second (sptm_virt_ctl_dcc) needs none: an unprivileged process
+ * writes the request's own address to the debug-communications-channel register DBGDTR_EL0, which
+ * aura traps to EL2 (MDCR_EL2.TDCC, src/nv2.c). Same ABI, same handler; the request is read and
+ * run identically. This matters where no kext can load (SIP on, or a host-fed BootKC).
+ *
  * The catalogue of named ranges comes from this machine's ADT: the PMGR, PMS and AMCC blocks the
  * sleep path found (sptm_virt_s2r_soc.c), the coprocessor mailboxes, GPIO, SPMI and the DCP DART.
  */
@@ -30,6 +36,7 @@
 #include "arm_cpu_regs.h"
 #include "hv.h"
 #include "memory.h"
+#include "smp.h"
 #include "soc.h"
 #include "sptm_virt_priv.h"
 #include "sptm_virt_s2r_soc.h"
@@ -621,6 +628,50 @@ AURA_XTEXT static int ctl_run(struct auractl_req *r)
 }
 
 /*
+ * A command reachable without the per-boot cookie: only the read-only status (INFO). Everything
+ * else -- listing, arming, recording, reading records, peeking -- is gated. The hvc transports
+ * (iokit/xnu) are already behind the guest kernel's own root check and always pass authed; only
+ * the kext-free DCC transport, which any EL0 process can ring, presents a cookie
+ * (sptm_virt_ctl_dcc).
+ */
+AURA_XTEXT static bool ctl_cmd_public(u16 cmd)
+{
+    return cmd == AURACTL_INFO;
+}
+
+/*
+ * Run one request whose block is at the caller's own EL0 address req_va, read and written through
+ * that caller's translation (AT S1E0R/S1E0W). The transport-agnostic core: both the hvc transport
+ * (below) and the DCC transport call it with nothing but that address. authed is the transport's
+ * verdict on whether this caller may run a gated command. Returns a Darwin errno.
+ */
+AURA_XTEXT static int sptm_virt_ctl_call(u64 req_va, bool authed)
+{
+    struct auractl_req r = {0};
+    spin_lock(&ctl_lock);
+    int err = ctl_copy(req_va, &r, sizeof(r), false);
+    if (!err && (r.magic != AURACTL_REQ_MAGIC || r.version != AURACTL_VERSION))
+        err = AURACTL_EINVAL;
+    if (!err && !authed && !ctl_cmd_public(r.cmd))
+        err = AURACTL_EPERM;
+    if (!err && r.buf_len > AURACTL_MAX_BUF)
+        r.buf_len = AURACTL_MAX_BUF;
+    if (!err) {
+        r.ret0 = r.ret1 = r.ret2 = r.buf_used = 0;
+        err = ctl_run(&r);
+        r.version = AURACTL_VERSION;
+        int werr = ctl_copy(req_va, &r, sizeof(r), true);
+        if (!err)
+            err = werr;
+    }
+    ctl_unmap();
+    spin_unlock(&ctl_lock);
+    if (err && ctl_errs++ < 16)
+        ctl_log("auractl: cmd %u -> errno %d\n", r.cmd, err);
+    return err;
+}
+
+/*
  * nv2_handle_sync, for an HVC from the guest's kernel at virtual EL2 (not its user space, not a
  * nested guest). Ours only with the immediate and the magic; anything else goes back to the
  * guest as before.
@@ -629,32 +680,148 @@ AURA_XTEXT bool sptm_virt_ctl_hvc(u64 *regs, u64 esr)
 {
     if ((esr & 0xffff) != AURACTL_HVC_IMM || (u32)regs[0] != AURACTL_HVC_MAGIC)
         return false;
-    if (!ctl.ready || !sptm_virt_xnu_live) {
+    if (!ctl.ready || !sptm_virt_xnu_live)
         regs[0] = AURACTL_ENODEV;
-        return true;
-    }
-    struct auractl_req r = {0};
-    u64 ureq = regs[1];
-    spin_lock(&ctl_lock);
-    int err = ctl_copy(ureq, &r, sizeof(r), false);
-    if (!err && (r.magic != AURACTL_REQ_MAGIC || r.version != AURACTL_VERSION))
-        err = AURACTL_EINVAL;
-    if (!err && r.buf_len > AURACTL_MAX_BUF)
-        r.buf_len = AURACTL_MAX_BUF;
-    if (!err) {
-        r.ret0 = r.ret1 = r.ret2 = r.buf_used = 0;
-        err = ctl_run(&r);
-        r.version = AURACTL_VERSION;
-        int werr = ctl_copy(ureq, &r, sizeof(r), true);
-        if (!err)
-            err = werr;
-    }
-    ctl_unmap();
-    spin_unlock(&ctl_lock);
-    if (err && ctl_errs++ < 16)
-        ctl_log("auractl: cmd %u -> errno %d\n", r.cmd, err);
-    regs[0] = err;
+    else
+        regs[0] =
+            sptm_virt_ctl_call(regs[1], true); /* the guest kernel already vetted the caller */
     return true;
 }
+
+#ifdef CTL_HOST
+/* The host harness drives the cookie gate the DCC transport applies: a call with authed=false must
+ * refuse everything past the read-only status (tests/ctl_host/ctl_host.c). */
+int ctl_host_call_unauth(u64 req_va)
+{
+    return sptm_virt_ctl_call(req_va, false);
+}
+#endif
+
+#ifndef CTL_HOST
+/*
+ * The second transport: a guest process with no kernel help at all. With MDCR_EL2.TDCC set
+ * (src/nv2.c, only when the boot's flags include SPTM_VIRT_CTL_DCC) every EL0 access to a
+ * debug-communications-channel register traps here as EC 0x18. The doorbell is a write to
+ * DBGDTR_EL0 of the request's own EL0 address, tagged in the top 16 bits (a user VA is 47-bit) so
+ * stray DCC traffic is told from a doorbell; aura runs it exactly as the hvc transport does, then
+ * leaves the errno to be read back from DBGDTR_EL0. No kext, no entitlement: a plain MSR/MRS to an
+ * EL0-accessible debug register.
+ *
+ * Because any EL0 process can ring the doorbell, a gated command (anything past the read-only
+ * status) also needs the per-boot cookie: a random value the host or the ESP manifest put in the
+ * guest's boot-args, which only root can read (sysctl kern.bootargs). A caller presents it by
+ * first writing it to DBGDTRTX_EL0; aura latches it per core and the very next doorbell consumes
+ * it, so the authorisation is one request wide. A process that cannot read the cookie (anyone but
+ * root) is left with the status command alone. The gate (the boot flag) and the cookie are
+ * independent: the flag decides the transport exists at all; the cookie decides who may act.
+ *
+ * The errno is kept per core between the doorbell write and its read-back. A thread that migrates
+ * cores in that window reads a stale errno, but the command already ran and wrote its outputs
+ * into the request block, so only the summary errno, never the trace, is affected.
+ */
+#define CTL_DCC_TAG 0xAC71UL /* top 16 bits of a doorbell write, and of its errno read-back */
+
+static int ctl_dcc_errno[32]; /* per core, indexed by smp_id() */
+static u64 ctl_dcc_cookie;    /* the boot's cookie; 0 (unset) refuses every gated command */
+static u64
+    ctl_dcc_presented[32]; /* per core, the cookie last written to DBGDTRTX before a doorbell */
+
+/* The per-boot cookie, from the host (run_guest_sptm.py, over the proxy) or extracted from the
+ * ESP manifest's boot-args (src/sptm_virt_esp.c). used+retain: a host-called entry, like
+ * sptm_virt_config, so it is never dropped even when nothing in-tree references it. */
+__attribute__((used, retain)) void sptm_virt_ctl_set_cookie(u64 cookie)
+{
+    ctl_dcc_cookie = cookie;
+    ctl_log("auractl: DCC transport cookie set (%s)\n", cookie ? "gated" : "none; gated off");
+}
+
+/*
+ * The self-boot (ESP) path has no host to call sptm_virt_ctl_set_cookie: the cookie travels only in
+ * the guest's boot-args, which aura itself lays down from the manifest. Read it back from there, so
+ * the one source of truth -- what root sees in kern.bootargs -- is also what aura checks. The token
+ * is "aura-actl-ck=<hex>", ended by a space or the end of the line. An absent or malformed token
+ * leaves the cookie 0 (every gated command refused).
+ */
+AURA_XTEXT void sptm_virt_ctl_cookie_from_cmdline(const char *cmdline)
+{
+    const char *p = cmdline ? strstr(cmdline, "aura-actl-ck=") : NULL;
+    if (!p)
+        return;
+    p += sizeof("aura-actl-ck=") - 1;
+    u64 c = 0;
+    int n = 0;
+    for (; *p && *p != ' '; p++, n++) {
+        unsigned d;
+        if (*p >= '0' && *p <= '9')
+            d = *p - '0';
+        else if (*p >= 'a' && *p <= 'f')
+            d = *p - 'a' + 10;
+        else if (*p >= 'A' && *p <= 'F')
+            d = *p - 'A' + 10;
+        else {
+            n = 0; /* not a clean hex token: refuse rather than take a half-cookie */
+            break;
+        }
+        c = (c << 4) | d;
+    }
+    if (n >= 1 && n <= 16)
+        sptm_virt_ctl_set_cookie(c);
+}
+
+AURA_XTEXT bool sptm_virt_ctl_dcc(u64 *regs, u64 esr)
+{
+    /* Off unless enabled at boot: with the flag clear the trap is never armed (nv2.c), but guard
+     * here too so a stray EC 0x18 is left for L1 rather than consumed. */
+    if (!(sptm_virt_flags & SPTM_VIRT_CTL_DCC))
+        return false;
+
+    /* EC 0x18 ISS: op0[21:20] op2[19:17] op1[16:14] CRn[13:10] Rt[9:5] CRm[4:1] Dir[0]. */
+    unsigned op0 = (esr >> 20) & 3, op2 = (esr >> 17) & 7, op1 = (esr >> 14) & 7,
+             crn = (esr >> 10) & 15, crm = (esr >> 1) & 15, rt = (esr >> 5) & 31;
+    bool read = esr & 1;
+
+    /* The DCC registers (op0=2 op1=3 CRn=0 op2=0): CRm 1 = MDCCSR_EL0, 4 = DBGDTR_EL0,
+     * 5 = DBGDTRRX/TX_EL0. Anything else is not ours; let L1 take its own trap. */
+    if (op0 != 2 || op1 != 3 || crn != 0 || op2 != 0)
+        return false;
+
+    unsigned cpu = smp_id();
+    if (cpu >= ARRAY_SIZE(ctl_dcc_errno))
+        cpu = ARRAY_SIZE(ctl_dcc_errno) - 1;
+
+    if (crm == 4) { /* DBGDTR_EL0: the doorbell (write) and the errno read-back (read) */
+        if (read) {
+            if (rt != 31)
+                regs[rt] = (CTL_DCC_TAG << 48) | (u32)ctl_dcc_errno[cpu];
+        } else {
+            u64 v = rt == 31 ? 0 : regs[rt];
+            u64 presented = ctl_dcc_presented[cpu];
+            ctl_dcc_presented[cpu] = 0;     /* one doorbell wide: consume the presented cookie */
+            if ((v >> 48) == CTL_DCC_TAG) { /* a doorbell, not stray DCC traffic */
+                bool authed = ctl_dcc_cookie && presented == ctl_dcc_cookie;
+                ctl_dcc_errno[cpu] = (ctl.ready && sptm_virt_xnu_live)
+                                         ? sptm_virt_ctl_call(v & 0xffffffffffffUL, authed)
+                                         : AURACTL_ENODEV;
+            }
+        }
+    } else if (crm == 1) { /* MDCCSR_EL0 read: TXfull=1, RXfull=0, so a poller backs off cleanly */
+        if (read && rt != 31)
+            regs[rt] = 1u << 29;
+    } else if (crm == 5) { /* DBGDTRRX/TX_EL0: the cookie inbox (write) ahead of a doorbell */
+        if (read) {
+            if (rt != 31)
+                regs[rt] = 0;
+        } else {
+            ctl_dcc_presented[cpu] = rt == 31 ? 0 : regs[rt];
+        }
+    } else {
+        return false;
+    }
+
+    sysop("isb");
+    msr(ELR_EL2, mrs(ELR_EL2) + 4);
+    return true;
+}
+#endif /* !CTL_HOST */
 
 #endif

@@ -69,6 +69,7 @@ extern volatile bool sptm_virt_s2r_quiet;
 extern volatile bool sptm_virt_xnu_live;
 
 bool sptm_virt_ctl_hvc(u64 *regs, u64 esr);
+int ctl_host_call_unauth(u64 req_va); /* a request without the DCC transport's cookie */
 void sptm_virt_ctl_s2_setup(void);
 void sptm_virt_ctl_guest_ram(u64 *base, u64 *size);
 void sptm_virt_s2_ctl_begin(void);

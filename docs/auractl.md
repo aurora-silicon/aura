@@ -12,8 +12,9 @@ Stage 1. Hooks and the ring exist only when the boot's trace flags include `SPTM
 `auractl status` says whether this boot has a ring.
 
 auractl does not change the guest's kernel. A guest reaches the call through an *entry*: a small
-guest-side piece that hands a request to its kernel. This tree ships one for macOS, the
-`AuractlDevice` IOKit kext under `tools/auractl` (below).
+guest-side piece that carries a request to aura. This tree ships two for macOS: the `AuractlDevice`
+IOKit kext, which issues the hvc from the kernel, and a kext-free one that reaches aura through an
+EL0 debug register (`ENTRY=dcc`, below). Both drive the same ABI and the same handler.
 
 ## The call
 
@@ -34,8 +35,39 @@ the RAM SPTM manages, never aura's own image, through a private one-page window 
 and invalidates before it returns. A call moves at most 256 KiB, and one ARM or DISARM of a name
 or a range changes at most 64 hooks. Calls are serialized.
 
-Which of its processes may make the call is the guest's decision. The tool (below) also insists
-on root.
+Which of its processes may make the call is the guest's decision.
+
+## Transports
+
+The call reaches aura two ways, both into the same handler:
+
+- **hvc** (`ENTRY=iokit`): the `AuractlDevice` kext issues `hvc #0xac71` on the calling thread, so
+  the request is read in that process's EL0 context. It needs the kext loaded, which needs root
+  and SIP off — and a loadable kext, which under SPTM-virt is not a given (below).
+- **DCC** (`ENTRY=dcc`): a plain, unprivileged process writes its request's own address, tagged in
+  the top 16 bits (a macOS user VA is 47-bit), to the debug-communications-channel register
+  `DBGDTR_EL0`. aura traps every EL0/EL1 DCC access to EL2 with `MDCR_EL2.TDCC` (`src/nv2.c`), sees
+  the tag, and reads and runs the request exactly as the hvc path does; the errno is read back from
+  `DBGDTR_EL0`. No kext, no entitlement, no root: `DBGDTR_EL0` is an architectural EL0 register.
+  For the EL0 trap to reach aura rather than the guest's own EL1, aura also forces the hardware
+  `MDSCR_EL1.TDCC` clear (the guest's `MDSCR_EL1` is VNCR-banked, so what it reads back is
+  unchanged). This is the transport to use when no kext can load.
+
+  Because any process can ring the doorbell, the DCC transport is a developer gate with two
+  independent controls:
+
+  - **Off unless enabled at boot.** aura only arms `MDCR_EL2.TDCC` when the boot's flags include
+    `SPTM_VIRT_CTL_DCC` (`AURA_AURACTL_DCC=1` for `run_guest_sptm.py`, or `--flag AURA_AURACTL_DCC`
+    for the ESP bundle). With it clear the guest's DCC behaves as on the bare machine and the
+    transport is wholly absent.
+  - **A per-boot cookie for anything past status.** The read-only status (`auractl status`) needs
+    no cookie, but arming, recording, reading records and peeking do. The cookie is a random value
+    aura is given at boot (the host passes it over the proxy; a self-booting ESP bundle bakes it
+    into the boot-args) and which also lands in the guest's boot-args, where only root can read it
+    (`sysctl kern.bootargs`). The tool reads it there and presents it through `DBGDTRTX_EL0` just
+    before each doorbell; aura checks it and refuses a gated command with `EPERM` otherwise. So the
+    DCC status works for any user, while the acting commands need root — without any guest kernel
+    code and without aura ever learning who the caller is.
 
 ## Hooks
 
@@ -84,7 +116,8 @@ measured ADT (same way T8140's was built, no Apple firmware bytes) and adding it
 ## Build
 
     make CHAINLOADING=1 SPTM_VIRT=1 AURACTL=1      # aura
-    make -C tools/auractl ENTRY=iokit              # the tool, in the macOS guest
+    make -C tools/auractl ENTRY=dcc                # the tool, kext-free (no root, no SIP change)
+    make -C tools/auractl ENTRY=iokit              # the tool, through the kext
     make -C tools/auractl kext                     # AuractlDevice.kext (needs Xcode's macOS SDK)
 
 Run `make clean` between flag sets.
@@ -97,9 +130,9 @@ files with `auractl print`. See `tools/auractl/README.md` for signing and loadin
 
 Loading the kext needs SIP off and root. Note that under SPTM-virt `kmutil load` cannot build an
 AuxKC: the BootKC is fed by the host loader, not by the booted macOS, so `kmutil` has no writable
-boot kext collection to extend (measured on the J616s). Load the kext with the legacy
-`kextload AuractlDevice.kext` instead, or enrol it by other means; `tools/auractl/README.md` has
-the details.
+boot kext collection to extend (measured on the J616s). `kextload AuractlDevice.kext` fails the same
+way, and SIP may be on regardless. When the kext cannot load, use `ENTRY=dcc`: it needs none of
+this. `tools/auractl/README.md` has the details.
 
 ## Use
 

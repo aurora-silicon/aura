@@ -1,15 +1,17 @@
-# auractl guest entry (IOKit kext)
+# auractl guest entries
 
-`auractl` (docs/auractl.md) controls aura's stage-2 MMIO trace from inside the macOS guest through
-one HVC (`src/auractl_abi.h`). Userland cannot issue that HVC, so the guest supplies an *entry*
-(`entry.h`) that carries each request to the guest's kernel. This directory holds the IOKit entry:
+`auractl` (docs/auractl.md) controls aura's stage-2 MMIO trace from inside the macOS guest. A
+request reaches aura through an *entry* (`entry.h`). This directory holds two, both driving the one
+ABI (`src/auractl_abi.h`) and the one handler:
 
-- `AuractlDevice/` — `AuractlDevice.kext`, a minimal IOKit driver. Its user client runs one HVC on
-  the calling thread, so aura reads and writes the request through the caller's own EL0
-  translation. It maps no hardware and keeps no state.
-- `entry_iokit.c` — the `ENTRY=iokit` entry: it opens the kext and calls that one method.
+- `entry_dcc.c` — the `ENTRY=dcc` entry. An unprivileged process writes its request's address to
+  the EL0 debug register `DBGDTR_EL0`, which aura traps to EL2 (`MDCR_EL2.TDCC`). **No kext, no
+  root, no SIP change.** Use this where the kext cannot load (below) — the J616s, for one.
+- `AuractlDevice/` + `entry_iokit.c` — the `ENTRY=iokit` entry. `AuractlDevice.kext`, a minimal
+  IOKit driver, runs one `hvc #0xac71` on the calling thread. It maps no hardware and keeps no
+  state. It needs root, SIP off, and a kext that will load.
 
-There is no second ABI: the kext issues Dj's `hvc #0xac71` and nothing else.
+Neither adds a second ABI: both carry the same `struct auractl_req`.
 
 ## Build
 
@@ -17,16 +19,36 @@ aura, with the trace control compiled in (never in Stage 1):
 
     make CHAINLOADING=1 SPTM_VIRT=1 AURACTL=1
 
-The tool and the kext, in the guest (macOS, Apple silicon):
+The tool, in the guest (macOS, Apple silicon):
 
-    make -C tools/auractl ENTRY=iokit     # the tool, linked against IOKit
+    make -C tools/auractl ENTRY=dcc       # kext-free; no root, no SIP change, no kext to load
+    make -C tools/auractl ENTRY=iokit     # through the kext; links against IOKit
     make -C tools/auractl kext            # AuractlDevice.kext (needs Xcode's macOS SDK)
 
-`make ENTRY=none` (the default) builds a tool that can only `auractl print` a saved file.
+`make ENTRY=none` (the default) builds a tool that can only `auractl print` a saved file. The
+`dcc` tool is plain C with two inline-asm instructions: any clang in the guest builds it, and it
+needs no frameworks and no SDK beyond libc.
 
 The kext is arm64e (the kernel's ABI); the tool is arm64. If the guest macOS has no Xcode,
 cross-build the kext on a Mac that does (its SDK must match the guest macOS kernel version), then
 copy the bundle over.
+
+## Using the DCC entry (no kext)
+
+`ENTRY=dcc` needs nothing loaded. Build the tool and run it:
+
+    make -C tools/auractl ENTRY=dcc
+    ./auractl status        # reports `entry: dcc`, aura's version, and whether the ring is present
+
+`status` works for any user. The aura the guest runs under must be an **AURACTL** build booted with
+the DCC transport armed (`AURA_AURACTL_DCC=1`, or `--flag AURA_AURACTL_DCC` for an ESP bundle); that
+is what sets `MDCR_EL2.TDCC` so the `DBGDTR_EL0` access traps to aura. On an aura without it, or bare
+hardware, the access does not trap and the tool reports `ENODEV` (it checks the tag aura puts in the
+read-back), so it never acts on stray debug-channel state.
+
+Everything past `status` — `arm`, `start`/`stop`, `read`, `mark`, `peek` — needs **root**, because
+it needs the per-boot cookie aura put in the guest boot-args, which only root can read (`sysctl
+kern.bootargs`). The tool reads it and presents it automatically; a non-root caller gets `EPERM`.
 
 ## Load the kext (SIP off)
 
@@ -58,9 +80,10 @@ repeated here. Once macOS boots under such an aura, `auractl status` reports the
 
 ## End-to-end: trace a USB controller, tetherless
 
-With macOS booted under an AURACTL build of aura (no debug cable), as root in the guest:
+With macOS booted under an AURACTL build of aura (no debug cable), in the guest (the `dcc` entry
+needs no root; the `iokit` entry does):
 
-    auractl status                                  # entry: iokit; aura version; ring present
+    auractl status                                  # entry; aura version; ring present
     auractl list                                    # the catalogue aura built from this ADT
     # find the USB controller's MMIO base LIVE from the guest, do not hardcode it:
     ioreg -l -w0 | grep -i -A3 'usb.*reg'           # or the ATC/dwc3 node's `reg`

@@ -23,6 +23,7 @@
 #include "malloc.h"
 #include "memory.h"
 #include "nvme.h"
+#include "sptm_virt.h"
 #include "sptm_virt_esp_plan.h"
 #include "string.h"
 #include "uartproxy.h"
@@ -306,6 +307,11 @@ AURA_XTEXT int sptm_virt_esp_boot(const char *spec)
     rust_free_image(mtext, mlen);
     mtext = NULL;
     printf("macOS ESP: manifest for %s, %u patches, trace 0x%lx\n", m->build, m->npatch, m->trace);
+#ifdef AURACTL
+    /* With no host to call it, take the DCC transport's cookie from the boot-args we are about to
+     * hand the guest (the same string root reads back from kern.bootargs). */
+    sptm_virt_ctl_cookie_from_cmdline(m->bootargs);
+#endif
 
     /* Everything is read and checked before the first write to RAM SPTM will own. */
     /* Staged downward from the window's top, below the MTE tag storage, its top 512 MiB (file bytes
