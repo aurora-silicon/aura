@@ -9111,73 +9111,75 @@ static void dt_set_aop_motion_cal(const char *path)
             }
             copied++;
         }
-        printf("FDT: %s/%s: %d of %d calibration properties\n", path, services[i], copied,
-               (int)ARRAY_SIZE(props));
+        if (copied)
+            printf("FDT: %s/%s: %d of %d calibration properties\n", path, services[i], copied,
+                   (int)ARRAY_SIZE(props));
     }
 }
 
 /*
- * The T6040/T6041 AOP runs its __TEXT and __DATA from its own SRAM, but iBoot
- * leaves its external code (__ETEXT) and its log (__OS_LOG) in DRAM. Reserve
- * those segments with the IOVAs the firmware uses for them (their remap
- * addresses), so that the OS maps them in the AOP's DART before it starts the
- * firmware.
+ * The OS AOP node: the enabled node with an "apple,<soc>-aop" compatible.
+ * Every SoC has one AOP, so no table of SoCs is needed to find it.
  */
-/*
- * M1 Pro (T6000) and M2 (T8112): iBoot starts the AOP firmware itself and the
- * OS needs no firmware segments, but the accelerometer and gyroscope services
- * wait for the same calibration as on the M4 Pro. The ADT carries it in the
- * same properties and container format.
- */
-static int dt_set_aop_motion_cal_only(void)
+static int dt_find_aop(char *path, size_t size)
 {
-    const char *compat = chip_id == T8112 ? "apple,t8112-aop" : "apple,t6000-aop";
-    int node = fdt_node_offset_by_compatible(dt, -1, compat);
-    if (node < 0)
-        return 0;
+    for (int node = fdt_next_node(dt, -1, NULL); node >= 0; node = fdt_next_node(dt, node, NULL)) {
+        int count = fdt_stringlist_count(dt, node, "compatible");
+        bool aop = false;
 
-    const char *status = fdt_getprop(dt, node, "status", NULL);
-    if (status && strcmp(status, "okay") && strcmp(status, "ok"))
-        return 0;
+        for (int i = 0; i < count && !aop; i++) {
+            const char *compat = fdt_stringlist_get(dt, node, "compatible", i, NULL);
+            size_t len = compat ? strlen(compat) : 0;
 
-    char path[64];
-    if (fdt_get_path(dt, node, path, sizeof(path))) {
-        printf("FDT: AOP node path too long\n");
-        return 0;
+            aop = len > 10 && !strncmp(compat, "apple,", 6) && !strcmp(compat + len - 4, "-aop");
+        }
+        if (!aop)
+            continue;
+
+        const char *status = fdt_getprop(dt, node, "status", NULL);
+        if (status && strcmp(status, "okay") && strcmp(status, "ok"))
+            return -1;
+        if (fdt_get_path(dt, node, path, size)) {
+            printf("FDT: AOP node path too long\n");
+            return -1;
+        }
+        return node;
     }
-
-    dt_set_aop_motion_cal(path);
-    return 0;
+    return -1;
 }
 
 static int dt_set_aop_firmware(void)
 {
-    if (chip_id == T6000 || chip_id == T8112)
-        return dt_set_aop_motion_cal_only();
+    char path[64];
 
+    if (dt_find_aop(path, sizeof(path)) < 0)
+        return 0;
+
+    /*
+     * The accelerometer and gyroscope services wait for the machine's
+     * calibration wherever the ADT carries it (M1 Pro, M2, M4, M4 Pro, M5:
+     * range-intr-cal, nominal-extr-cal and range-extr-cal in one container
+     * format). Copy whatever this ADT has.
+     */
+    dt_set_aop_motion_cal(path);
+
+    /*
+     * On these SoCs iBoot leaves the AOP stopped and the OS starts it.
+     * Elsewhere iBoot starts it itself and the OS needs nothing more.
+     */
     if (chip_id != T6040 && chip_id != T6041 && chip_id != T8132)
         return 0;
-
-    int node = fdt_node_offset_by_compatible(
-        dt, -1, chip_id == T8132 ? "apple,t8132-aop" : "apple,t6041-aop");
-    if (node < 0)
-        return 0;
-
-    const char *status = fdt_getprop(dt, node, "status", NULL);
-    if (status && strcmp(status, "okay") && strcmp(status, "ok"))
-        return 0;
-
-    char path[64];
-    if (fdt_get_path(dt, node, path, sizeof(path))) {
-        printf("FDT: AOP node path too long\n");
-        return 0;
-    }
-
-    dt_set_aop_motion_cal(path);
 
     if (chip_id == T8132)
         return dt_set_t8132_aop(path);
 
+    /*
+     * The T6040/T6041 AOP runs its __TEXT and __DATA from its own SRAM, but
+     * iBoot leaves its external code (__ETEXT) and its log (__OS_LOG) in
+     * DRAM. Reserve those segments with the IOVAs the firmware uses for them
+     * (their remap addresses), so that the OS maps them in the AOP's DART
+     * before it starts the firmware.
+     */
     u32 len = 0;
     int anode = adt_path_offset(adt, "/arm-io/aop");
     if (anode < 0 || !adt_getprop(adt, anode, "segment-ranges", &len) || !len ||
