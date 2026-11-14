@@ -215,3 +215,26 @@ PYTHONPATH=proxyclient python3 proxyclient/tools/run_guest_sptm.py \
 `AURA_HIDE_DOCKCHANNEL=1`. A sleep test adds `AURA_S2R_TRACE=1 AURA_S2R_GO=1 AURA_S2R_DROP_USB=1`,
 and `AURA_KEEP_ERRH=1 AURA_AMCC_CLEAR=1` (or `AURA_S2R_QUIESCE=24` with the handler hidden). The
 script's docstring lists every switch.
+
+### The devices' memory of a parked guest
+
+The trace rings show the registers macOS writes; the work itself (command buffers, firmware rings,
+the GPU's InitData, DCP RPC buffers, ANE task descriptors) is in memory the devices reach through
+their DARTs and the GPU's UAT. Once the guest is parked in the proxy (a GPU stop, or any other):
+
+```
+python3 proxyclient/tools/dump_gpu_ring.py --elf build/aura-raw.elf --out dump
+python3 proxyclient/tools/dump_guest_mem.py --out dump --dart dart-ane --gpu --ring dump/gpu.txt
+python3 proxyclient/tools/guest_mem.py dump summary
+python3 proxyclient/tools/guest_mem.py dump x dart-ane 0x4000 0x100
+```
+
+`dump_guest_mem.py` walks each named DART's translating streams (T8110 tables, 3- or 4-level) and
+the GPU's context table and firmware kernel roots, and copies what they map, small mappings first
+within `--max-mib`. It reads DRAM only: MMIO leaves are listed, and streams in a DART's
+`exclave-sid` are recorded but never walked. A DART's registers are read only when PMGR says its
+real power domain is on (`aura/pmgr_power.py` follows a virtual `-V` gate to its real parents): on
+a J815 a read of a powered-off DART's registers makes the proxy fault in a loop. A DART that is off
+at the park (JPEG, or AVD between frames) is walked from its last TCR/TTBR writes in the GPU ring
+(`--ring`, when `AURA_TRACE_NODES` traced it), without touching it. `guest_mem.py` reads the dump
+offline: maps, hexdumps by IOVA or physical address, and where a value occurs.
