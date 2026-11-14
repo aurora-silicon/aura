@@ -147,6 +147,12 @@ aura_knows_flag() {  # arg: a CONFIG_FLAGS name
     grep -q "\"$1\"" "$AURA_ROOT/proxyclient/tools/run_guest_sptm.py" 2>/dev/null
 }
 
+# Does this aura build's make_bundle.py accept an option? (e.g. --no-exclave, which Macs
+# without an ExclaveOS need; it reaches the public tree via the ESPBOOT upstreaming.)
+make_bundle_has() {  # arg: an option string, e.g. --no-exclave
+    python3 "$ESP_TOOLS/make_bundle.py" --help 2>/dev/null | grep -q -- "$1"
+}
+
 do_fetch() {
     step "Fetch firmware from this Mac's installed macOS"
     require_tools python3
@@ -180,6 +186,13 @@ do_build() {
                --exclave-integrity "$FW/exclave_integrity.bin" \
                --exclave-trustcache "$FW/exclave_trustcache.bin"
     else
+        # A Mac with no ExclaveOS needs make_bundle's --no-exclave. That reaches the public
+        # tree through the ESPBOOT upstreaming; if this build's make_bundle lacks it, say so
+        # clearly instead of letting argparse fail cryptically.
+        if ! make_bundle_has --no-exclave; then
+            msg="this aura build's make_bundle.py has no --no-exclave yet (needed on $HVI_SOC, which has no ExclaveOS). Update aura to a build that carries it, or pass --exclave with the three --fw-arg exclave paths if this Mac does have an ExclaveOS."
+            [ "$DRY" = 1 ] && warn "$msg" || die "$msg"
+        fi
         set -- "$@" --no-exclave
     fi
     for f in $BUNDLE_FLAGS; do set -- "$@" --flag "$f"; done
