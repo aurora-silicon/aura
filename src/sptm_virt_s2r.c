@@ -1014,8 +1014,13 @@ static void s2r_hook_full(void)
     s2r_hook_blk(&s2r_soc->cllt, "pmgr-cllt", 0, 0);
     s2r_hook_blk(&s2r_soc->nub_ap, "nub-ap-ctrl", 0, 0x4000);
     s2r_hook_blk(&s2r_soc->aon, "pmgr-aon", 0, 0);
-    s2r_hook_blk(&s2r_soc->clkgen, "clkgen-dcs", 0x5c000, 0x4000);
-    s2r_hook_blk(&s2r_soc->clkgen, "clkgen-mux", 0x40000, 0x4000);
+    if (s2r_soc->clkgen.size >= 0x60000) {
+        s2r_hook_blk(&s2r_soc->clkgen, "clkgen-dcs", 0x5c000, 0x4000);
+        s2r_hook_blk(&s2r_soc->clkgen, "clkgen-mux", 0x40000, 0x4000);
+    } else {
+        /* A short clock block (T8142): the whole of it, as its pages are not known yet. */
+        s2r_hook_blk(&s2r_soc->clkgen, "clkgen", 0, 0);
+    }
     for (int i = 0; i < 3; i++)
         s2r_hook_adt("/arm-io/nub-spmi0", i, "spmi0", 0, 0x4000);
     for (int i = 0; i < 3; i++)
