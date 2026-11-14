@@ -8032,7 +8032,12 @@ static int dt_set_j773g_dcp_regions(unsigned int unused)
             const char *label = fdt_stringlist_get(dt, dcp, "memory-region-names", r, &name_len);
             const char *expected =
                 seg[i].unk == ADT_SEGMENT_DCP_OS_LOG ? "dcp-os-log" : fdt_get_name(dt, mem, NULL);
-            if (!label || !expected || name_len != (int)strlen(expected) ||
+            /* A DT names a region by its node name, with or without the unit address. */
+            const char *unit =
+                expected && seg[i].unk != ADT_SEGMENT_DCP_OS_LOG ? strchr(expected, '@') : NULL;
+            int full = expected ? (int)strlen(expected) : 0;
+            int base = unit ? (int)(unit - expected) : full;
+            if (!label || !expected || (name_len != full && name_len != base) ||
                 memcmp(label, expected, name_len))
                 bail("FDT: J773g DCP region %d has the wrong name\n", r);
         }
