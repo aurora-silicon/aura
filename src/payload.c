@@ -19,6 +19,9 @@
 #include "payload_profile.h"
 #include "secboot.h"
 #include "smp.h"
+#ifdef SPTM_VIRT_ESP
+#include "sptm_virt.h"
+#endif
 #include "stage1_config.h"
 #include "utils.h"
 
@@ -63,6 +66,9 @@ static void *fdt = NULL;
 static int fdt_rank;
 static char *chainload_spec = NULL;
 static char *boot_spec = NULL;
+#ifdef SPTM_VIRT_ESP
+static char *macos_spec = NULL; /* macos=: boot macOS under SPTM-virt from the ESP */
+#endif
 static bool payload_scanned = false;
 #ifndef ESP_STAGE2
 static bool stage1_config_applied = false;
@@ -241,7 +247,11 @@ static bool config_lost_passed = false;
 
 static const char *const config_names[] = {
     "chosen.", "chainload=",        "boot=", "nvme.sart=", "display=", "mitigations=",
-    "tso=",    "m1n1.config-lost=", "hib="};
+    "tso=",    "m1n1.config-lost=", "hib=",
+#ifdef SPTM_VIRT_ESP
+    "macos=",
+#endif
+};
 
 /* The start of a line of a variable m1n1 knows */
 static bool config_line(const char *s)
@@ -295,6 +305,11 @@ static bool check_var(u8 **p)
     } else if (IS_VAR("boot=")) {
         if (!boot_spec)
             boot_spec = val;
+#ifdef SPTM_VIRT_ESP
+    } else if (IS_VAR("macos=")) {
+        if (!macos_spec)
+            macos_spec = val;
+#endif
     } else if (IS_VAR("nvme.sart=")) {
         /* Started by an earlier aura stage, which has had its host window already. */
         if (nvme_set_sart_var(val))
@@ -496,6 +511,18 @@ int payload_run(void)
         return -1;
     }
 
+#ifdef SPTM_VIRT_ESP
+    if (macos_spec) {
+        /* An explicit line in this image only, never a default: returns only on failure. */
+        next_stage.entry = NULL;
+        if (chainload_spec || boot_spec)
+            printf("Payload: macos= takes this boot; ignoring boot= and chainload=\n");
+        sptm_virt_esp_boot(macos_spec);
+        nvme_shutdown();
+        return -1;
+    }
+#endif
+
     if (chainload_spec) {
         next_stage.entry = NULL;
         /* Last, after every owner line, in a slot of its own: the next stage cannot miss it */
@@ -587,6 +614,16 @@ int payload_run(void)
             secboot_measure("dtb", fdt, fdt_totalsize(fdt), SECBOOT_MEASURED);
             secboot_measure("kernel", kernel, kernel_payload_size, SECBOOT_MEASURED);
         }
+#ifdef SPTM_VIRT_ESP
+        /*
+         * A macOS-only ESP stage 2 (SPTM_VIRT_ESP) boots via the macos= line above and never
+         * prepares a Linux devicetree or hands off to a kernel. The whole kboot/DT/display/GPU-
+         * initdata/PCIe tree is gated out of this build so the vital region fits below the DCP
+         * __OS_LOG buffer (aura-raw.ld _file_limit). Reaching here means a boot=/chainload= path
+         * produced a kernel+fdt, which this image deliberately does not support: fail loudly.
+         */
+        panic("payload: Linux kboot path is gated out of SPTM_VIRT_ESP builds\n");
+#else
         if (kboot_prepare_dt(fdt)) {
             printf("Failed to prepare FDT!\n");
             goto boot_failed;
@@ -595,6 +632,7 @@ int payload_run(void)
         if (kboot_boot(kernel))
             goto boot_failed;
         return 0;
+#endif
 
     boot_failed:
         next_stage.entry = NULL;

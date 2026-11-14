@@ -21,6 +21,9 @@
 .extern _start_c
 .extern _stack_bot
 .extern _v_sp0_sync
+#ifdef SPTM_VIRT
+.extern _v_lower_sync
+#endif
 .extern _v_sp0_irq
 .extern _v_sp0_fiq
 .extern _v_sp0_serr
@@ -55,7 +58,11 @@ _vectors_start:
     .align 7
     b _v_sp0_serr
     .align 7
+#ifdef SPTM_VIRT
+    b _v_lower_sync /* nv2_asm.S: the NV2 guest's ERETs */
+#else
     b _v_sp0_sync
+#endif
     .align 7
     b _v_sp0_irq
     .align 7

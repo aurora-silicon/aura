@@ -1,5 +1,7 @@
 /* SPDX-License-Identifier: MIT AND GPL-2.0-only */
 
+#include "../build/build_cfg.h"
+
 #include "../config.h"
 
 #include "rtkit.h"
@@ -1030,6 +1032,40 @@ bool rtkit_sleep(rtkit_dev_t *rtk)
     asc_cpu_stop(rtk->asc);
     return true;
 }
+
+#ifdef SPTM_VIRT
+/*
+ * Start a stopped IOP and wait for its HELLO without answering it: unprompted first, as after a
+ * power-on, then after the INIT that a quiesced IOP waits for. The caller stops it again.
+ * Returns 1 for an unprompted HELLO, 2 for one after INIT, 0 for none.
+ */
+int rtkit_probe_hello(asc_dev_t *asc)
+{
+    struct asc_message msg;
+    u64 timeout;
+
+    asc_i2a_enable(asc, true);
+    asc_cpu_start(asc);
+    for (int round = 1; round <= 2; round++) {
+        if (round == 2) {
+            msg.msg0 = FIELD_PREP(MGMT_TYPE, MGMT_MSG_IOP_PWR_STATE) |
+                       FIELD_PREP(MGMT_PWR_STATE, RTKIT_POWER_INIT);
+            msg.msg1 = RTKIT_EP_MGMT;
+            if (!asc_send(asc, &msg))
+                return 0;
+        }
+        timeout = timeout_calculate(round == 1 ? 50000 : 1000000);
+        while (!timeout_expired(timeout)) {
+            if (!asc_recv(asc, &msg))
+                continue;
+            if (msg.msg1 == RTKIT_EP_MGMT && FIELD_GET(MGMT_TYPE, msg.msg0) == MGMT_MSG_HELLO)
+                return round;
+            printf("rtkit: probe: message 0x%lx for EP 0x%x before HELLO\n", msg.msg0, msg.msg1);
+        }
+    }
+    return 0;
+}
+#endif /* SPTM_VIRT */
 
 static void rtkit_drain(rtkit_dev_t *rtk)
 {

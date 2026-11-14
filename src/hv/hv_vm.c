@@ -142,6 +142,48 @@ void hv_pt_init(void)
     msr(VTTBR_EL2, hv_Ltop);
 }
 
+/* FNV-1a over the whole stage-2 tree (top, L2 and L3 tables): a cheap integrity check
+ * for tables that live in RAM another agent (the guest's SPTM) might write. */
+static u64 hv_pt_fnv(u64 h, const u64 *t, size_t n)
+{
+    for (size_t i = 0; i < n; i++) {
+        h ^= t[i];
+        h *= 0x100000001b3UL;
+    }
+    return h;
+}
+
+u64 hv_pt_checksum(u32 *ntables)
+{
+    u64 h = 0xcbf29ce484222325UL;
+    u32 n = 1;
+    if (!hv_Ltop)
+        return 0;
+    size_t ntop = vaddr_bits > 36 ? ENTRIES_PER_L1_TABLE : ENTRIES_PER_L2_TABLE;
+    h = hv_pt_fnv(h, hv_Ltop, ntop);
+    for (size_t i = 0; i < ntop; i++) {
+        u64 *l2 = hv_Ltop;
+        if (vaddr_bits > 36) {
+            if (!L1_IS_TABLE(hv_Ltop[i]))
+                continue;
+            l2 = (u64 *)(hv_Ltop[i] & PTE_TARGET_MASK);
+            h = hv_pt_fnv(h, l2, ENTRIES_PER_L2_TABLE);
+            n++;
+        } else if (i) {
+            break;
+        }
+        for (size_t j = 0; j < ENTRIES_PER_L2_TABLE; j++) {
+            if (!L2_IS_TABLE(l2[j]))
+                continue;
+            h = hv_pt_fnv(h, (u64 *)(l2[j] & PTE_TARGET_MASK), ENTRIES_PER_L3_TABLE);
+            n++;
+        }
+    }
+    if (ntables)
+        *ntables = n;
+    return h;
+}
+
 static u64 *hv_pt_get_l2(u64 from)
 {
     u64 l1idx = from >> VADDR_L1_OFFSET_BITS;
@@ -225,6 +267,12 @@ static u64 *hv_pt_get_l3(u64 from)
     l2d = ((u64)l3) | FIELD_PREP(PTE_TYPE, PTE_TABLE) | PTE_VALID;
     l2[l2idx] = l2d;
     return l3;
+}
+
+/* Replace the L2 block holding addr with an equivalent L3 table (no-op if already split). */
+void hv_pt_split_block(u64 addr)
+{
+    hv_pt_get_l3(addr & ~MASK(VADDR_L2_OFFSET_BITS));
 }
 
 static void hv_pt_map_l3(u64 from, u64 to, u64 size, u64 incr)
@@ -1292,8 +1340,25 @@ bool hv_handle_dabort(struct exc_info *ctx)
     }
 
     if (IS_HW(pte)) {
-        printf("HV: Data abort on mapped page (0x%lx -> 0x%lx)\n", far, pte);
-        // Try again, this is usually a race
+        // Usually a benign race on a concurrently-updated mapping: retry. A fault that persists
+        // on the same access would loop forever, so after a few retries report it to the caller.
+        static u64 last_far[MAX_CPUS], last_elr[MAX_CPUS];
+        static u32 reps[MAX_CPUS];
+        int cpu = smp_id();
+        if (far == last_far[cpu] && ctx->elr == last_elr[cpu]) {
+            if (++reps[cpu] > 8) {
+                printf("HV: PERSISTENT data abort on mapped page: far=0x%lx ipa->pte=0x%lx "
+                       "esr=0x%lx %s elr=0x%lx par=0x%lx\n",
+                       far, pte, esr, is_write ? "write" : "read", ctx->elr, par);
+                reps[cpu] = 0;
+                last_far[cpu] = last_elr[cpu] = 0;
+                return false;
+            }
+        } else {
+            last_far[cpu] = far;
+            last_elr[cpu] = ctx->elr;
+            reps[cpu] = 0;
+        }
         ctx->elr -= 4;
         return true;
     }

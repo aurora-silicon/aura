@@ -26,6 +26,10 @@ void smp_secondary_prep_el3(void);
 
 int smp_init(void);
 int smp_start_secondaries(void);
+int smp_prepare_guest_resets(void);
+int smp_index_for_mpidr(u64 mpidr);
+bool smp_cpu_valid(int cpu);
+void smp_reset_stack_range(int cpu, u64 *base, u64 *size);
 int smp_stop_secondaries(bool deep_sleep);
 
 #define smp_call0(i, f)          smp_call4(i, f, 0, 0, 0, 0)

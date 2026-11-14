@@ -431,8 +431,14 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
             break;
 
         case P_KBOOT_BOOT:
+#ifdef SPTM_VIRT_ESP
+            /* The Linux kboot/DT/GPU/PCIe tree is gated out of SPTM_VIRT_ESP builds (see
+             * payload.c); a macOS-only ESP stage 2 never services this proxy command. */
+            panic("proxy: P_KBOOT_BOOT is gated out of SPTM_VIRT_ESP builds\n");
+#else
             if (kboot_boot((void *)request->args[0]) == 0)
                 return 1;
+#endif
             break;
         case P_KBOOT_SET_CHOSEN:
             reply->retval = kboot_set_chosen((void *)request->args[0], (void *)request->args[1]);
@@ -441,7 +447,11 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
             kboot_set_initrd((void *)request->args[0], request->args[1]);
             break;
         case P_KBOOT_PREPARE_DT:
+#ifdef SPTM_VIRT_ESP
+            panic("proxy: P_KBOOT_PREPARE_DT is gated out of SPTM_VIRT_ESP builds\n");
+#else
             reply->retval = kboot_prepare_dt((void *)request->args[0]);
+#endif
             break;
         case P_KBOOT_SET_UBOOT:
             reply->retval = kboot_set_uboot((void *)request->args[0], (void *)request->args[1]);

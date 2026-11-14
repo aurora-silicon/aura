@@ -1,0 +1,219 @@
+# SPDX-License-Identifier: MIT
+"""Build the ESP bundle for booting macOS under aura's SPTM-virt from NVMe (SPTM_VIRT_ESP), M5 Pro.
+
+Over USB a host chainloads aura and runs proxyclient/tools/run_guest_sptm.py, which sends the macOS
+pieces and its decisions. This module writes the same pieces and decisions to files for the ESP:
+
+    m1n1/stage2-macos.bin        aura (ESP_STAGE2 SPTM_VIRT_ESP ...) + its macos= line
+    aurora/macos/manifest.txt    what to load and how, with sizes and SHA-256s
+    aurora/macos/sptm.bin txm.bin kernelcache[.gz] trustcache.bin
+    aurora/macos/cl4-bundle.bin exclave-integrity.bin exclave-trustcache.bin
+    aurora/macos/SHA256SUMS      every file above, for the install script
+
+The Stage 2's config line is `macos=<ESP PARTUUID>;aurora/macos;<manifest SHA-256>`.
+
+What the runner decides from files and from the device tree's structure is decided here with the
+runner's own code (imported, so the two can't drift): the hidden nodes (the debug link's port, the
+strip list, the error handler, the DockChannel, XNU's quirks), the SPTM patch sites and MTE
+sequence (aura.sptm_patch), the cL4 regions (aura.exclave_bundle), the boot-args. What only the
+running machine knows (the managed window, the live device tree, iBoot's data regions, the boot
+video) aura computes at boot with the C port of plan_boot (src/sptm_virt_esp_plan.c).
+"""
+
+import gzip
+import hashlib
+import importlib.util
+import os
+import pathlib
+import plistlib
+import secrets
+from dataclasses import dataclass, field
+
+from . import sptm_patch
+from . import sptm_virt_plan as plan_mod
+
+ESP_DIR = "aurora/macos"
+STAGE2_NAME = "m1n1/stage2-macos.bin"
+RUNNER = pathlib.Path(__file__).resolve().parents[1] / "tools" / "run_guest_sptm.py"
+
+# The trace lane's cp.env (/path/to/capture): TRACE, GO, FULLTRACE,
+# COPROC; MEM off; DROP_USB off.
+DEFAULT_FLAGS = ("AURA_S2R_TRACE", "AURA_S2R_GO", "AURA_S2R_FULLTRACE", "AURA_S2R_COPROC")
+# Its symbol switches (configure() in the runner): name -> value.
+DEFAULT_S2R = {"dcp_pkt": 1, "wake_s": 30, "go_count": 1}
+S2R_SWITCHES = ("dcp_pkt", "cp_skip_ans", "cp_ansx", "go_count", "wake_s", "quiesce")
+DEBUG_PORT = 1  # the KIS link's port (launch.sh AURA_DEBUG_PORT)
+
+
+class BundleError(Exception):
+    pass
+
+
+def runner():
+    spec = importlib.util.spec_from_file_location("run_guest_sptm_for_esp", RUNNER)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def is_tc_container(b):
+    """plan_boot's _is_tc_container (src/sptm_virt_esp.c has the same test)."""
+    if len(b) < 8:
+        return False
+    num = int.from_bytes(b[0:4], "little")
+    if not (1 <= num <= 15) or len(b) < 4 + 4 * num:
+        return False
+    return int.from_bytes(b[4:8], "little") == 4 + 4 * num
+
+
+def hide_nodes(adt, xnu, *, debug_port=DEBUG_PORT, keep_errh=False, hide_dockchannel=True):
+    """The runner's hide list for this configuration, and the debug link's PHY phandles."""
+    r = runner()
+    phys, port_nodes = r.debug_port(adt, 0, debug_port)
+    if not phys:
+        raise BundleError("no debug-link USB port in the ADT")
+    _release, quirks = r.xnu_quirks(xnu)
+    hide = tuple(port_nodes) + r.STRIP_NODES + tuple(quirks["hide"])
+    if not keep_errh:
+        hide += (r.ERROR_HANDLER,)
+    if hide_dockchannel:
+        hide += ("/arm-io/dockchannel-uart",)
+    return list(hide), list(phys[:2])
+
+
+def os_long_version(build_identity):
+    return plistlib.load(open(build_identity, "rb"))["Ap,OSLongVersion"]
+
+
+def exclaves(bundle_im4p, integrity_im4p, trustcache_im4p):
+    """The runner's exclave_files(): the cL4 bundle and the two ExclaveOS catalogs."""
+    from .exclave_bundle import im4p_payload, parse as parse_bundle
+    bundle = parse_bundle(pathlib.Path(bundle_im4p).read_bytes())
+    kernel = plan_mod.macho_info(bundle.payload[bundle.regions["CL4-ro"][0]:])
+    blobs = [im4p_payload(pathlib.Path(p).read_bytes()) if p else b""
+             for p in (integrity_im4p, trustcache_im4p)]
+    return bundle, kernel.entry, kernel.virtlo, blobs[0], blobs[1]
+
+
+@dataclass
+class Bundle:
+    manifest: str
+    files: dict = field(default_factory=dict)   # ESP name -> bytes as stored
+    notes: list = field(default_factory=list)
+
+    @property
+    def manifest_sha(self):
+        return hashlib.sha256(self.manifest.encode()).hexdigest()
+
+    def config_line(self, partuuid, esp_dir=ESP_DIR):
+        return f"macos={partuuid};{esp_dir};{self.manifest_sha}\n"
+
+
+def _sha(b):
+    return hashlib.sha256(b).hexdigest()
+
+
+def build(sptm, txm, xnu, trustcache, adt, *, exclave=None, love=None, bootargs=None,
+          flags=DEFAULT_FLAGS, s2r=None, ans_drop=(), keep_video=True, gzip_kc=False,
+          build_tag="26A428"):
+    """The manifest and the files. adt: a live device tree of this Mac (its structure only: the
+    port's nodes and PHYs). exclave: (bundle, integrity, trustcache) IM4P paths, or None."""
+    lines = ["aura-macos-esp 2",
+             "# generated by tools/esp-macos/make_bundle.py; aura checks every size and SHA-256",
+             f"build {build_tag}"]
+    b = Bundle("")
+    files = {"sptm": ("sptm.bin", sptm), "txm": ("txm.bin", txm), "tc": ("trustcache.bin", trustcache)}
+    cl4 = None
+    if exclave:
+        cl4, ce, cv, exic, extc = exclave
+        files["cl4"] = ("cl4-bundle.bin", cl4.payload)
+        files["exic"] = ("exclave-integrity.bin", exic)
+        files["extc"] = ("exclave-trustcache.bin", extc)
+    for key, (name, data) in files.items():
+        lines.append(f"file {key} {name} 0x{len(data):x} {_sha(data)}")
+        b.files[name] = data
+    if gzip_kc:
+        gz = gzip.compress(xnu, compresslevel=9, mtime=0)
+        lines.append(f"file xnu kernelcache.gz 0x{len(gz):x} {_sha(gz)} gzip 0x{len(xnu):x} {_sha(xnu)}")
+        b.files["kernelcache.gz"] = gz
+    else:
+        lines.append(f"file xnu kernelcache 0x{len(xnu):x} {_sha(xnu)}")
+        b.files["kernelcache"] = xnu
+
+    for key, data in (("sptm", sptm), ("txm", txm), ("xnu", xnu)):
+        mi = plan_mod.macho_info(data)
+        lines.append(f"image {key} 0x{mi.virtlo:x} 0x{mi.virthi:x} 0x{mi.entry:x}")
+        for s in mi.segs.values():
+            lines.append(f"seg {key} {s.name} 0x{s.vmaddr:x} 0x{s.vmsize:x} 0x{s.fileoff:x} 0x{s.filesize:x}")
+    if cl4 is not None:
+        lines.append(f"cl4 0x{ce:x} 0x{cv:x}")
+        for rn in ("CL4-rx", "CL4-ro", "CL4-rw", "CL4-le"):
+            off, size = cl4.regions[rn]
+            lines.append(f"cl4region {rn} 0x{off:x} 0x{size:x}")
+
+    # SPTM's patches, at file offsets: the runner writes them at entry + offset, and SPTM's file
+    # offsets are its offsets from virtlo.
+    si = plan_mod.macho_info(sptm)
+    entry_off = si.entry - si.virtlo
+    try:
+        sp = sptm_patch.plan(sptm, entry_off)
+    except sptm_patch.SptmPatchError as e:
+        raise BundleError(f"this SPTM can't be patched: {e}")
+    for what, off, mask, old, new in sp["patches"]:
+        if mask != 0xFFFFFFFF:
+            raise BundleError(f"{what}: a masked SPTM patch can't go in the manifest")
+        lines.append(f"patch sptm 0x{entry_off + off:x} 0x{old:08x} 0x{new:08x} {what.split()[0]}")
+    if sp["mte"]:
+        off, want, new = sp["mte"]
+        for i, (ow, nw) in enumerate(zip(want, new)):
+            lines.append(f"patch sptm 0x{entry_off + off + 4 * i:x} 0x{ow:08x} 0x{nw:08x} mte")
+    lines.append(f"ctrr-stash 0x{sp['ctrr_stash_off']:x}")
+
+    hide, phys = hide_nodes(adt, xnu)
+    for p in hide:
+        lines.append(f"hide {p}")
+    lines.append("link-phys " + " ".join(f"0x{ph:x}" for ph in phys))
+    for path, prop in ans_drop:
+        lines.append(f"drop {path} {prop}")
+    lines.append("serial /arm-io/uart0")
+    r = runner()
+    lines.append(f"trace 0x{sum(r.CONFIG_FLAGS[f] for f in flags):x}")
+    for k, v in sorted((DEFAULT_S2R if s2r is None else s2r).items()):
+        if k not in S2R_SWITCHES:
+            raise BundleError(f"unknown S2R switch {k}")
+        lines.append(f"s2r {k} 0x{v:x}")
+    if love:
+        lines.append(f"love {love}")
+    lines.append(f"video {1 if keep_video else 0}")
+    args = bootargs if bootargs is not None else r.DEFAULT_BOOTARGS
+    if "AURA_AURACTL_DCC" in flags:
+        # Self-boot has no host to hand aura the DCC transport's cookie, so bake a per-bundle random
+        # one into the boot-args; aura reads it back from there (src/sptm_virt_esp.c) and, in the
+        # guest, only root can (sysctl kern.bootargs).
+        args = f"{args} aura-actl-ck={secrets.randbits(64) or 1:016x}"
+    if "\n" in args or len(args) >= 1024:
+        raise BundleError("boot-args must be one line under 1024 bytes")
+    lines.append(f"bootargs {args}")
+    lines.append("end")
+    b.manifest = "\n".join(lines) + "\n"
+    b.files["manifest.txt"] = b.manifest.encode()
+    return b
+
+
+def sha256sums(files):
+    return "".join(f"{_sha(data)}  {name}\n" for name, data in sorted(files.items()))
+
+
+def write_staging(bundle, stage2, out, *, partuuid):
+    """Lay the ESP tree out under out/ (nothing outside it is touched)."""
+    out = pathlib.Path(out)
+    d = out / ESP_DIR
+    d.mkdir(parents=True, exist_ok=True)
+    for name, data in bundle.files.items():
+        (d / name).write_bytes(data)
+    s2 = stage2 + bundle.config_line(partuuid).encode()
+    (out / STAGE2_NAME).parent.mkdir(parents=True, exist_ok=True)
+    (out / STAGE2_NAME).write_bytes(s2)
+    (d / "SHA256SUMS").write_text(sha256sums(dict(bundle.files)) +
+                                  f"{_sha(s2)}  ../../{STAGE2_NAME}\n")
+    return out / STAGE2_NAME

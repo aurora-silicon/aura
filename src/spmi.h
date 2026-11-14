@@ -14,6 +14,8 @@ typedef struct spmi_dev spmi_dev_t;
 
 spmi_dev_t *spmi_init(const char *adt_node);
 void spmi_shutdown(spmi_dev_t *dev);
+/* Physical address of the controller's command register. */
+u64 spmi_cmd_reg(spmi_dev_t *dev);
 
 int spmi_reg0_write(spmi_dev_t *dev, u8 addr, u8 value);
 

@@ -10,6 +10,7 @@
 #include "iodev.h"
 #include "malloc.h"
 #include "pmgr.h"
+#include "sptm_virt.h"
 #include "string.h"
 #include "tps6598x.h"
 #include "tunables.h"
@@ -667,6 +668,30 @@ void usb_iodev_vuart_setup(iodev_id_t iodev)
         return;
 
     iodev_usb_vuart.opaque = iodev_get_opaque(iodev);
+}
+
+/*
+ * The waits of the CDC link's bring-up. Under the virtualized SPTM the link can come back on a
+ * running macOS, where the bring-up runs on a coroutine and these give the core back to the guest
+ * instead of spinning.
+ */
+void usb_cdc_wait_us(u32 us)
+{
+    if (!sptm_virt_s2r_usb_yield(us) && us)
+        udelay(us);
+}
+
+int usb_cdc_poll32(u64 addr, u32 mask, u32 target, u32 timeout_us)
+{
+    if (!sptm_virt_s2r_usb_yieldable())
+        return poll32(addr, mask, target, timeout_us);
+    u64 end = mrs(CNTPCT_EL0) + (u64)timeout_us * mrs(CNTFRQ_EL0) / 1000000;
+    while ((read32(addr) & mask) != target) {
+        if (mrs(CNTPCT_EL0) >= end)
+            return -1;
+        usb_cdc_wait_us(0);
+    }
+    return 0;
 }
 
 int usb_cdc_link_start(void (*set_step)(unsigned step), bool force_swapped)

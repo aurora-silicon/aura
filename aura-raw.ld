@@ -48,8 +48,7 @@ SECTIONS {
      */
     .text : {
         _text_content_start = .;
-        *(.text)
-        *(.text.*)
+        *(EXCLUDE_FILE(*sptm_virt*.o) .text .text.*)
         . = ALIGN(8);
         *(.got.plt)
         _text_content_end = .;
@@ -57,6 +56,8 @@ SECTIONS {
     } :text
     _text_size = . - _text_start;
     .rodata : ALIGN(0x10000) {
+        /* Guest-only code uses the existing executable read-only region. */
+        *sptm_virt*.o(.text .text.*)
         *(.rodata)
         *(.rodata.*)
         . = ALIGN(8);

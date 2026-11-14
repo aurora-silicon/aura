@@ -143,6 +143,41 @@ ifeq ($(DEBUGUSB_PROXY),1)
 CFG += DEBUGUSB_PROXY
 endif
 
+# Development builds only: run macOS's stock SPTM, secure kernel and XNU as a FEAT_NV2
+# guest on T8140 (docs/sptm-nv2-virt.md). The image must stay at stage 1's base.
+ifeq ($(SPTM_VIRT),1)
+ifneq ($(CHAINLOADING),1)
+$(error SPTM_VIRT requires CHAINLOADING=1)
+endif
+CFG += SPTM_VIRT
+# Log the first FEAT_NV2 guest entries and exits.
+ifeq ($(NV2_TRACE),1)
+CFG += NV2_TRACE
+endif
+ifeq ($(NV2_TRACE_PRINT),1)
+CFG += NV2_TRACE_PRINT
+endif
+endif
+
+# Development builds only: the SPTM-virt guest's kernel controls aura's stage-2 MMIO trace
+# through an HVC (src/sptm_virt_ctl.c, src/auractl_abi.h, docs/auractl.md). Never in Stage 1.
+ifeq ($(AURACTL),1)
+ifneq ($(SPTM_VIRT),1)
+$(error AURACTL requires SPTM_VIRT=1)
+endif
+CFG += AURACTL
+endif
+
+
+# Trace builds only: an ESP Stage 2 that boots macOS under SPTM-virt from files on the ESP (the
+# macos= line, src/sptm_virt_esp.c, tools/esp-macos) instead of a Linux boot= or chainload=.
+ifeq ($(SPTM_VIRT_ESP),1)
+ifneq ($(ESP_STAGE2)$(SPTM_VIRT),11)
+$(error SPTM_VIRT_ESP requires ESP_STAGE2=1 and SPTM_VIRT=1)
+endif
+CFG += SPTM_VIRT_ESP
+CARGO_FLAGS += --features sptm_virt_esp
+endif
 
 LDFLAGS := -EL -maarch64elf --no-undefined -X -Bsymbolic \
 	-z notext --no-apply-dynamic-relocs --orphan-handling=warn \
@@ -261,6 +296,16 @@ OBJECTS := \
 	$(DCP_OBJECTS) \
 	$(HV_OBJECTS) \
 	$(MINILZLIB_OBJECTS) $(TINF_OBJECTS) $(DLMALLOC_OBJECTS) $(LIBFDT_OBJECTS)
+
+ifeq ($(SPTM_VIRT),1)
+OBJECTS += nv2.o nv2_asm.o sptm_virt.o sptm_virt_cl4.o sptm_virt_gl.o sptm_virt_s2.o sptm_virt_s2r.o sptm_virt_s2r_soc.o sptm_virt_gpu.o s2r_dcp_pkt.o
+endif
+ifeq ($(AURACTL),1)
+OBJECTS += sptm_virt_ctl.o
+endif
+ifeq ($(SPTM_VIRT_ESP),1)
+OBJECTS += sptm_virt_esp.o sptm_virt_esp_plan.o sha256.o
+endif
 
 FP_OBJECTS := \
 	kboot_gpu.o kboot_gpu_t8152.o kboot_gpu_m4.o \

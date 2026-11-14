@@ -194,6 +194,15 @@ int dockchannel_uart_printf(const char *fmt, ...)
     return i;
 }
 
+u32 dockchannel_uart_tx_free(void)
+{
+#ifdef DEBUGUSB_PROXY
+    return uart_base ? read32(uart_base + DATA_TX_FREE) & tx_free_mask : 0;
+#else
+    return uart_base ? read32(uart_base + DATA_TX_FREE) : 0;
+#endif
+}
+
 static bool dockchannel_uart_iodev_can_write(void *opaque)
 {
     UNUSED(opaque);
