@@ -28,6 +28,7 @@ M1N1 = b"M" * 64                           # the stage 2 image itself; its paylo
 UBOOT = (bytes(16) + (0x10000).to_bytes(8, "little") + bytes(32) + b"ARM\x64" + bytes(4)
          + bytes(4096 - 64))               # an arm64 Image header, image_size 64 KiB
 BOARDS = {
+    "j773g": ("J773g", "apple,j773g;apple,t8132;apple,arm-platform"),
     "j613": ("J613", "apple,j613;apple,t8122;apple,arm-platform"),
     "j615": ("J615", "apple,j615;apple,t8122;apple,arm-platform"),
     "j514s": ("J514S", "apple,j514s;apple,t6030;apple,arm-platform"),
@@ -38,7 +39,7 @@ BOARDS = {
     "j516m": ("J516M", "apple,j516m;apple,t6034;apple,arm-platform"),
     "j293": ("J293", "apple,j293;apple,t8103;apple,arm-platform"),
 }
-CHIP = {"j613": "8122", "j615": "8122", "j514s": "6030", "j516s": "6030", "j516c": "6031",
+CHIP = {"j773g": "8132", "j613": "8122", "j615": "8122", "j514s": "6030", "j516s": "6030", "j516c": "6031",
         "j514c": "6031", "j514m": "6034", "j516m": "6034", "j293": "8103"}
 FAMILY = {"j613": ("asahi,t8122-", "asahi,j613-", "asahi,j615-"),
           "j615": ("asahi,t8122-", "asahi,j613-", "asahi,j615-"),
@@ -188,8 +189,10 @@ static void t6031_gpu_probe(void *d)
 /* kboot's handoff: /chosen as dt_set_chosen() writes it, then what the GPU code would see */
 static void kboot_set_initrd(void *start, size_t size) {}
 static void kboot_request_hibernate_layout(bool on) { printf("HIB %d\n", on); }
+static bool nvme_powered_off_with_entries;
 static int kboot_prepare_dt(void *fdt)
 {
+    printf("SARTDT entries=%d\n", nvme_powered_off_with_entries);
     assert(!fdt_open_into(fdt, dt, sizeof(blob)));
     int node = fdt_path_offset(dt, "/chosen");
     if (node < 0)
@@ -256,6 +259,9 @@ static bool nvme_init(void)
 static bool nvme_shutdown(void)
 {
     printf("NVME shutdown keep=%d\n", nvme_keep_running_for_linux);
+    /* nvme.c: a post-M4 stage that used ANS powers it off and keeps its SART entries */
+    if (getenv("M1N1_TEST_POST_M4") && nvme_started && !nvme_keep_running_for_linux)
+        nvme_powered_off_with_entries = true;
     return true;
 }
 static bool nvme_set_sart_var(const char *v)
@@ -267,11 +273,18 @@ static bool nvme_post_m4_passed_off(void)
 {
     return getenv("M1N1_TEST_POST_M4") && nvme_sart_passed && !nvme_started;
 }
+static bool nvme_post_m4_untouched(void)
+{
+    return getenv("M1N1_TEST_POST_M4") && !nvme_sart_passed && !nvme_started;
+}
 static int display_configure(const char *s) { printf("DISPLAY %s\n", s); return 0; }
 static int display_configure_second(const char *s) { printf("DISPLAY2 %s\n", s); return 0; }
 #define T8132 0x8132
 static void mitigations_configure(const char *s) {}
-static int boot_storage_load(const char *spec, struct kernel_header **k, void **f) { return -1; }
+static int boot_storage_load(const char *spec, struct kernel_header **k, void **f)
+{
+    return getenv("M1N1_TEST_BOOT_LOAD") ? 0 : -1;
+}
 /* A stage 1 configured with its target (stage1_config.c), or not (NULL) */
 static const char *stage1_target;
 static __attribute__((unused)) const char *stage1_config_target(void) { return stage1_target; }
@@ -403,14 +416,14 @@ class Run:
                 self.chainloaded = True
 
 
-def run(tools, build, image, board="j613", calloc_fail=-1, target=None):
+def run(tools, build, image, board="j613", calloc_fail=-1, target=None, chip=None):
     out, binaries, _ = tools
     path = out / "boot.bin"
     path.write_bytes(image)
     forwarded = out / "forwarded.txt"
     forwarded.write_bytes(b"")
     env = {k: v for k, v in os.environ.items() if k != "M1N1_TEST_STAGE1_TARGET"}
-    env["M1N1_TEST_CHIP"] = CHIP[board]
+    env["M1N1_TEST_CHIP"] = chip or CHIP[board]
     if target:
         env["M1N1_TEST_STAGE1_TARGET"] = target
     r = subprocess.run([str(binaries[build]), "run", str(path), str(len(M1N1)), BOARDS[board][0],
@@ -427,8 +440,9 @@ def boot_bin(tools, config, board="j613"):
             gzip.compress(UBOOT, mtime=0) + config)
 
 
-def boot(tools, build, config, board="j613", trailer=b"", calloc_fail=-1):
-    return run(tools, build, boot_bin(tools, config, board) + trailer, board, calloc_fail)
+def boot(tools, build, config, board="j613", trailer=b"", calloc_fail=-1, chip=None):
+    return run(tools, build, boot_bin(tools, config, board) + trailer, board, calloc_fail,
+               chip=chip)
 
 
 def stage1(tools, config, configured=False):
@@ -987,6 +1001,99 @@ def test_ans_left_as_found_without_sart_entries(tools, build, monkeypatch):
     b = boot(tools, build, b"")
     booted(b)
     assert nvme_events(b) == ["shutdown keep=0", "handoff keep=0"], b.stdout
+
+
+@pytest.mark.parametrize("build", STAGE2)
+def test_t8132_live_post_m4_ans_is_taken_over_for_the_payload(tools, build, monkeypatch):
+    monkeypatch.setenv("M1N1_TEST_POST_M4", "1")
+    b = boot(tools, build, b"", board="j773g")
+    booted(b)
+    assert nvme_events(b) == ["init", "shutdown keep=0", "handoff keep=0"], b.stdout
+
+
+@pytest.mark.parametrize("build", STAGE2)
+def test_t8132_live_post_m4_ans_takeover_failure_stops_handoff(tools, build, monkeypatch):
+    monkeypatch.setenv("M1N1_TEST_POST_M4", "1")
+    monkeypatch.setenv("M1N1_TEST_NVME_INIT_FAIL", "1")
+    b = boot(tools, build, b"", board="j773g")
+    assert b.rc == -1 and not b.booted, b.stdout
+    assert nvme_events(b) == ["init"], b.stdout
+
+
+def sart_dt(r):
+    return [line for line in r.stdout.splitlines() if line.startswith("SARTDT ")]
+
+
+@pytest.mark.parametrize("build", STAGE2)
+def test_t8132_live_post_m4_ans_reaches_the_payload_dt_off_with_entries(tools, build, monkeypatch):
+    monkeypatch.setenv("M1N1_TEST_POST_M4", "1")
+    b = boot(tools, build, b"", board="j773g")
+    booted(b)
+    assert sart_dt(b) == ["SARTDT entries=1"], b.stdout
+    # ANS is shut down before kboot_prepare_dt() builds the payload DT
+    lines = b.stdout.splitlines()
+    assert lines.index("NVME shutdown keep=0") < lines.index("SARTDT entries=1"), b.stdout
+
+
+@pytest.mark.parametrize("build", STAGE2)
+def test_t8132_boot_keeps_live_post_m4_ans_running(tools, build, monkeypatch):
+    monkeypatch.setenv("M1N1_TEST_POST_M4", "1")
+    monkeypatch.setenv("M1N1_TEST_BOOT_LOAD", "1")
+    b = boot(tools, build, b"boot=esp;vmlinuz\n", board="j773g")
+    booted(b)
+    assert nvme_events(b) == ["handoff keep=1"], b.stdout
+    assert sart_dt(b) == ["SARTDT entries=0"], b.stdout
+
+
+@pytest.mark.parametrize("build", STAGE2)
+@pytest.mark.parametrize("chip", ["6040", "6050", "8122"])
+def test_live_post_m4_ans_left_as_found_on_other_chips(tools, build, chip, monkeypatch):
+    monkeypatch.setenv("M1N1_TEST_POST_M4", "1")
+    b = boot(tools, build, b"", chip=chip)
+    booted(b)
+    assert nvme_events(b) == ["shutdown keep=0", "handoff keep=0"], b.stdout
+    assert sart_dt(b) == ["SARTDT entries=0"], b.stdout
+
+
+@pytest.mark.parametrize("build", STAGE2)
+@pytest.mark.parametrize("board", ["j773g", "j293"])
+def test_pre_m4_ans_is_not_taken_over(tools, build, board):
+    b = boot(tools, build, b"", board=board)
+    booted(b)
+    assert nvme_events(b) == ["shutdown keep=0", "handoff keep=0"], b.stdout
+    assert sart_dt(b) == ["SARTDT entries=0"], b.stdout
+
+
+def test_post_m4_predicates_from_nvme_c(tmp_path):
+    """The real nvme_post_m4_passed_off() and nvme_post_m4_untouched() that the harness above
+    mocks: for a post-M4 ANS this stage hasn't used, exactly one of them holds."""
+    src = (SRC / "nvme.c").read_text()
+    preds = src[src.index("bool nvme_post_m4_passed_off(void)"):src.index("bool nvme_shutdown(void)")]
+    c = tmp_path / "pred.c"
+    c.write_text(r'''#include <stdbool.h>
+#include <stdio.h>
+static bool nvme_initialized, post_m4;
+static int nvme_sart_saved_cnt;
+static bool nvme_post_m4(void) { return post_m4; }
+''' + preds + r'''
+int main(void)
+{
+    for (int m = 0; m < 2; m++)
+        for (int i = 0; i < 2; i++)
+            for (int s = 0; s < 2; s++) {
+                post_m4 = m, nvme_initialized = i, nvme_sart_saved_cnt = s;
+                printf("%d%d%d %d%d\n", m, i, s, nvme_post_m4_passed_off(), nvme_post_m4_untouched());
+            }
+    return 0;
+}
+''')
+    exe = tmp_path / "pred"
+    subprocess.run(["cc", "-std=gnu11", "-Wall", "-Wextra", "-Werror", "-Wno-missing-prototypes",
+                    str(c), "-o", str(exe)], check=True)
+    out = subprocess.run([str(exe)], capture_output=True, text=True, check=True).stdout.split("\n")
+    # post_m4 initialized sart_entries -> passed_off untouched
+    assert out[:8] == ["000 00", "001 00", "010 00", "011 00",
+                       "100 01", "101 10", "110 00", "111 00"], out
 
 
 @pytest.mark.parametrize("build", STAGE2)
