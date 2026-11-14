@@ -270,6 +270,11 @@ int isp_init(void)
                 case V13_5:
                     selected_top = 0x1000000;
                     break;
+                case V27_2:
+                    /* 27.2 ISP stays in the H9/H13 legacy lineage; its segment end
+                     * fits below the 13.5 ceiling. See FW272 t-6638. */
+                    selected_top = 0x1000000;
+                    break;
                 default:
                     reason = "unsupported firmware";
                     goto out;
@@ -284,6 +289,9 @@ int isp_init(void)
                 case V13_6_1:
                     selected_top = 0xf00000;
                     break;
+                case V27_2:
+                    selected_top = 0xf00000;
+                    break;
                 default:
                     reason = "unsupported firmware";
                     goto out;
@@ -293,6 +301,9 @@ int isp_init(void)
             switch (os_firmware.version) {
                 case V13_5:
                 case V13_6_1:
+                    selected_top = 0xf00000;
+                    break;
+                case V27_2:
                     selected_top = 0xf00000;
                     break;
                 default:
@@ -314,13 +325,18 @@ int isp_init(void)
                     }
                     selected_top = 0x1000000;
                     break;
+                case V27_2:
+                    /* 27.2 admits T8122 and the T6030/T603x H15 ISP alike; the
+                     * measured segment end fits the 14.7/26.6.2 ceiling. */
+                    selected_top = 0x1000000;
+                    break;
                 default:
                     reason = "unsupported firmware";
                     goto out;
             }
             break;
         case ISP_VER_T8140:
-            if (!t8140 || os_firmware.version != V26_6_2) {
+            if (!t8140 || (os_firmware.version != V26_6_2 && os_firmware.version != V27_2)) {
                 reason = "unsupported T8140 firmware or SoC";
                 goto out;
             }
