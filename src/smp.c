@@ -440,14 +440,25 @@ static bool smp_point_rvbar_here(void)
  * every core's RVBAR to the same address, the boot core's too, and smp_prepare_rvbar() checked a
  * running secondary's before starting it. An OS started on the boot core alone suspends with that
  * core only, so it gets the same check and relay. On A7 to M3 RVBAR isn't locked: the OS can point
- * it anywhere, so it is pointed here.
+ * it anywhere, so it is pointed here, except on the M3 family (see below).
  */
 bool smp_resets_return_here(void)
 {
     if (boot_cpu_idx < 0)
         return false;
-    if (cpu_features->apple_sysregs_unlocked)
+    if (cpu_features->apple_sysregs_unlocked) {
+        /*
+         * M3 family: the boot core's store to its own RVBAR takes an SError (seen on a J613,
+         * T8122, at EL2), and the Mac boot-loops. Leave RVBAR alone there, with no S2R mailbox.
+         * The M3 Pro and Max share the M3 cores and are left alone too, untested.
+         */
+        if (chip_id == T8122 || chip_id == T6030 || chip_id == T6031 || chip_id == T6034) {
+            snprintf(smp_s2r_why_buf, sizeof(smp_s2r_why_buf),
+                     "the boot core's RVBAR store faults on M3");
+            return false;
+        }
         return smp_point_rvbar_here();
+    }
     int i;
     for (i = 0; i < MAX_CPUS; i++)
         if (i != boot_cpu_idx && cpu_info[i].valid && smp_is_alive(i))
