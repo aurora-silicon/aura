@@ -25,7 +25,7 @@ int auractl_enter(struct auractl_req *req)
     kern_return_t kr = IOServiceOpen(svc, mach_task_self(), 0, &conn);
     IOObjectRelease(svc);
     if (kr != KERN_SUCCESS)
-        return AURACTL_EPERM; /* not permitted to open the user client (needs root, SIP off) */
+        return AURACTL_EPERM; /* the kext refuses non-admin openers (initWithTask); needs root + SIP off */
 
     uint64_t in = (uint64_t)(uintptr_t)req;
     uint64_t out = 0;

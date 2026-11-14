@@ -36,6 +36,15 @@ bool AuractlUserClient::initWithTask(task_t owningTask, void *securityID, UInt32
 {
     if (!super::initWithTask(owningTask, securityID, type))
         return false;
+    /*
+     * Refuse non-admin openers. Nothing stops a userland process from IOServiceOpen()ing us
+     * directly, which bypasses the auractl tool's own root check; from there it could arm hooks,
+     * drain the ring, read aura's console, and on a non-AURACTL aura panic the guest. Require the
+     * opening task to hold administrator privilege (root / admin group), so the kext is no weaker
+     * than the tool.
+     */
+    if (clientHasPrivilege(owningTask, kIOClientPrivilegeAdministrator) != kIOReturnSuccess)
+        return false;
     fTask = owningTask;
     return true;
 }
