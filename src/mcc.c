@@ -690,9 +690,10 @@ static int mcc_init_firmware_cache(int node, int *path)
     if (!planes || planes > INT32_MAX || !stride || (stride & 3))
         return -1;
 
-    /* Restrict this path to the observed J616s and J614s layouts. */
+    /* Restrict this path to the observed J616s, J614s and J773s layouts. */
     if (t6041 && (chip_id != T6040 ||
-                  !(board_id == 6 || (board_id == 4 && adt_is_compatible(adt, 0, "J614sAP"))) ||
+                  !(board_id == 6 || (board_id == 4 && adt_is_compatible(adt, 0, "J614sAP")) ||
+                    (board_id == 2 && adt_is_compatible(adt, 0, "J773sAP"))) ||
                   reg_idx != 12 || count != 4 || channels != 4 || planes != 4 || stride != 0x40000))
         return -1;
 
