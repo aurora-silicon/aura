@@ -1,0 +1,54 @@
+name: esp-stage2-size
+
+# Build the plain stage 2 (SPTM_VIRT_ESP unset) and the macOS ESP stage 2 (SPTM_VIRT_ESP set) and
+# report the ESP vital-region size. The ESP image is chainloaded to the base of stage 1, where the
+# panel DCP's __OS_LOG buffer sits _file_limit bytes in; everything up to _file_vital_end must end
+# below it. aura-raw.ld ASSERTs this at link time (so an over-limit image fails this job); the last
+# step prints the number and a margin so a regression is visible in review.
+
+on:
+  pull_request:
+  push:
+    branches: [ main, 'feat/sptm-hv' ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  esp-stage2-size:
+    name: ESP stage 2 vital size (both configs)
+    runs-on: ubuntu-latest
+    env:
+      CARGO_PROFILE_RELEASE_OPT_LEVEL: z
+      # Shared flags. BUILDSTD builds core/alloc from source (the Makefile exports RUSTC_BOOTSTRAP=1),
+      # so this does not depend on a prebuilt bare-metal rust std being published for the target.
+      COMMON: USE_CLANG=1 BUILDSTD=1 BUILTIN_LOGO=aurora RELEASE=1 CHAINLOADING=1 EXTRA_CFLAGS=-Oz
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+
+      - name: Install clang + lld and the bare-metal rust target
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y llvm lld
+          rustup target install aarch64-unknown-none-softfloat
+          rustup component add rust-src
+
+      - name: Build with SPTM_VIRT_ESP unset (plain stage 2) — the Linux kboot/DT path stays in
+        run: |
+          make clean
+          make -j2 $COMMON
+          test -f build/aura.bin
+
+      - name: Build with SPTM_VIRT_ESP set (macOS ESP stage 2) — the Linux kboot/DT path is compiled out
+        run: |
+          make clean
+          make -j2 $COMMON ESP_STAGE2=1 SPTM_VIRT=1 SPTM_VIRT_GUARDED=1 SPTM_VIRT_ESP=1 AURACTL=1
+
+      - name: Report the ESP vital-region size
+        run: |
+          python3 tools/esp-macos/esp_vital_size.py build/aura-raw.elf --nm llvm-nm
