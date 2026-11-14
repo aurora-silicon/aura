@@ -732,7 +732,18 @@ static u64
 __attribute__((used, retain)) void sptm_virt_ctl_set_cookie(u64 cookie)
 {
     ctl_dcc_cookie = cookie;
-    ctl_log("auractl: DCC transport cookie set (%s)\n", cookie ? "gated" : "none; gated off");
+    /* Log the value, not just "gated". The cookie gates every DCC command past status; the tool
+     * presents it before each doorbell (entry_dcc.c). macOS redacts kern.bootargs to userspace even
+     * for root under secure boot, so on a self-booted macOS guest the tool cannot read the
+     * "aura-actl-ck=" token from there. aura's serial console is an HV/hardware channel -- strictly
+     * more privileged than guest root -- so logging the value here lets an operator read it and
+     * pass it to the tool through AURACTL_COOKIE without weakening the gate: the value never
+     * reaches guest userspace. The transport exists only when armed at boot (SPTM_VIRT_CTL_DCC), so
+     * this never prints on a normal boot. */
+    if (cookie)
+        ctl_log("auractl: DCC transport cookie set: aura-actl-ck=%lx\n", cookie);
+    else
+        ctl_log("auractl: DCC transport cookie unset; every gated command refused\n");
 }
 
 /*
