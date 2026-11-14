@@ -8066,7 +8066,10 @@ static int dt_set_j773g_dcp_regions(unsigned int unused)
             if (reg_len != 4 * sizeof(*reg))
                 bail("FDT: J773g DT has a malformed existing reservation\n");
             u64 start = dt_cells64(&reg[0]), span = dt_cells64(&reg[2]), end = start + span;
-            if (!span || end < start)
+            /* An empty placeholder (gpu-fw-*, uat-*) is filled in later and reserves nothing. */
+            if (!span)
+                continue;
+            if (end < start)
                 bail("FDT: J773g DT has an invalid existing reservation\n");
             if (start < seg[i].phys + size && seg[i].phys < end)
                 bail("FDT: J773g DCP reservation %s overlaps an existing reservation\n", name);
