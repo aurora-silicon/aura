@@ -117,10 +117,10 @@ void sptm_virt_gpu_setup(void);
 struct s2r_rec;
 struct s2r_soc;
 void sptm_virt_ctl_s2_setup(void); /* before the stage-2 checksum: catalogue, pre-split blocks */
-void sptm_virt_ctl_guest_ram(u64 *base, u64 *size);     /* sptm_virt.c */
-void sptm_virt_s2_ctl_begin(void);                      /* sptm_virt_s2.c */
-void sptm_virt_s2_ctl_end(bool changed);                /* changed: the new tree is the reference */
-extern struct s2r_rec *sptm_virt_s2r_ring;              /* sptm_virt_s2r.c */
+void sptm_virt_ctl_guest_ram(u64 *base, u64 *size); /* sptm_virt.c */
+void sptm_virt_s2_ctl_begin(void);                  /* sptm_virt_s2.c */
+void sptm_virt_s2_ctl_end(bool changed);            /* changed: the new tree is the reference */
+extern struct s2r_rec *sptm_virt_s2r_ring;          /* sptm_virt_s2r.c */
 extern u64 sptm_virt_s2r_nrec;
 extern volatile u64 sptm_virt_s2r_head;
 extern volatile bool sptm_virt_s2r_ctl_paused;

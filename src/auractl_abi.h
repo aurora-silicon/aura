@@ -38,7 +38,8 @@ enum auractl_cmd {
     AURACTL_READ = 7,    /* arg0 = first sequence number, arg1 = max records; buf <- records */
     AURACTL_MARK = 8,    /* buf = text (tag = first 8 bytes), arg0 = value; ret0 = its seq */
     AURACTL_CONSOLE = 9, /* buf <- the tail of aura's console ring; ret0 = bytes ever written */
-    AURACTL_PEEK = 10,   /* arg0 = PA, arg1 = words (1..AURACTL_MAX_PEEK); buf <- u32s; ret0 = first */
+    AURACTL_PEEK =
+        10, /* arg0 = PA, arg1 = words (1..AURACTL_MAX_PEEK); buf <- u32s; ret0 = first */
     AURACTL_NCMDS
 };
 

@@ -216,12 +216,12 @@ AURA_XTEXT static void ctl_catalogue(void)
     static const struct {
         const char *path, *name;
     } mbox[] = {
-        {"/arm-io/pmp", "pmp-mbox"},       {"/arm-io/smc", "smc-mbox"},
-        {"/arm-io/aop", "aop-mbox"},       {"/arm-io/aop2", "aop2-mbox"},
-        {"/arm-io/sep", "sep-mbox"},       {"/arm-io/sio", "sio-mbox"},
-        {"/arm-io/mtp", "mtp-mbox"},       {"/arm-io/ans", "ans-mbox"},
-        {"/arm-io/dcp", "dcp-mbox"},       {"/arm-io/dcpext", "dcpext-mbox"},
-        {"/arm-io/gfx-asc", "gfx-mbox"},   {"/arm-io/gfx1-asc", "gfx1-mbox"},
+        {"/arm-io/pmp", "pmp-mbox"},     {"/arm-io/smc", "smc-mbox"},
+        {"/arm-io/aop", "aop-mbox"},     {"/arm-io/aop2", "aop2-mbox"},
+        {"/arm-io/sep", "sep-mbox"},     {"/arm-io/sio", "sio-mbox"},
+        {"/arm-io/mtp", "mtp-mbox"},     {"/arm-io/ans", "ans-mbox"},
+        {"/arm-io/dcp", "dcp-mbox"},     {"/arm-io/dcpext", "dcpext-mbox"},
+        {"/arm-io/gfx-asc", "gfx-mbox"}, {"/arm-io/gfx1-asc", "gfx1-mbox"},
     };
     for (u32 i = 0; i < ARRAY_SIZE(mbox); i++)
         ctl_add_adt(mbox[i].path, mbox[i].name, 0, 0x8000, PG);
