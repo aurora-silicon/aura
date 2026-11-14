@@ -1132,20 +1132,62 @@ static const char *pcie_ans_path(void)
 }
 
 /*
- * T6050, as macOS around a sleep (run 28). Off: the storage PHYs, children first, then the gates
- * that depend on ANS and ANS itself (the SoC's sleep takes those). On: macOS's wake order. PHY_SW
+ * SoCs where ANS drives its own storage PHYs (AUS5, ANS's msp-phy-fw-path) and the APCIe PHY
+ * serves the GP ports: ANS is cycled through its storage gates alone. Off: the storage PHYs,
+ * children first, then the gates that depend on ANS and ANS itself. On: the given order. PHY_SW
  * and the GP side stay up for the GP ports.
  */
-static const char *const t6050_ans_ps[] = {"APHY_ST0_AUS5",
-                                           "APHY_ST0_AUS5_A",
-                                           "APHY_ST1_AUS5",
-                                           "APHY_ST1_AUS5_A",
-                                           "APCIE_SYS_ST1",
-                                           "APCIE_SYS_ST0",
-                                           "ANS"};
-static const u8 t6050_ans_ps_on[] = {6, 5, 4, 1, 3, 0, 2};
+struct pcie_ans_ps {
+    const char *const *gates;
+    const u8 *on;
+    size_t count;
+    /* Off for longer than this, and the wait for the PHYs once on. */
+    u32 off_us, on_us;
+};
 
-static int pcie_t6050_ps(const char *name, bool on)
+/* T6050, as macOS around a sleep (run 28); the SoC's sleep takes the APCIE_SYS_ST0/1 and ANS. */
+static const char *const t6050_ans_gates[] = {"APHY_ST0_AUS5",
+                                              "APHY_ST0_AUS5_A",
+                                              "APHY_ST1_AUS5",
+                                              "APHY_ST1_AUS5_A",
+                                              "APCIE_SYS_ST1",
+                                              "APCIE_SYS_ST0",
+                                              "ANS"};
+static const u8 t6050_ans_on[] = {6, 5, 4, 1, 3, 0, 2};
+
+/*
+ * T8142 (J704/J813/J815: same gates, ids and parents in their 27.2.1 ADTs), the storage half of
+ * AppleT8142PCIe's power-down: ST0_AUS5 then ST0_AUS5_AON (its CLK0REQ-down step), then of its
+ * gate loop the ones on ANS's side, APCIE_SYS_ST, APCIE_ST and ANS. Its power-up raises the gates
+ * in ADT order, which is the reverse. APCIE_GP, APCIE_SYS_GP and APCIE_PHY_SW stay up for N1 (and
+ * J704's second port): macOS leaves PHY_SW on with APCIE_SYS_ST off too.
+ */
+static const char *const t8142_ans_gates[] = {"ST0_AUS5", "ST0_AUS5_AON", "APCIE_SYS_ST",
+                                              "APCIE_ST", "ANS"};
+static const u8 t8142_ans_on[] = {4, 3, 2, 1, 0};
+
+static const struct pcie_ans_ps *pcie_ans_ps(void)
+{
+    /* 100 ms: longer than the 21.5 ms S2R cycles after which macOS restarted ANS (run 28). */
+    static const struct pcie_ans_ps t6050 = {
+        t6050_ans_gates, t6050_ans_on, ARRAY_SIZE(t6050_ans_gates), 100000,
+        /* macOS sets ANS's run bit 70 ms after the storage PHYs are back (cp9d W1). */
+        70000};
+    /* Not measured on T8142: T6050's times. */
+    static const struct pcie_ans_ps t8142 = {t8142_ans_gates, t8142_ans_on,
+                                             ARRAY_SIZE(t8142_ans_gates), 100000, 70000};
+
+    switch (chip_id) {
+        case T6050:
+            return &t6050;
+        case T8142:
+            return &t8142;
+        default:
+            return NULL;
+    }
+}
+
+static int pcie_ans_ps_step(const char *name, bool on)
 {
     if (!pmgr_power_steps(0, name, on))
         return 0;
@@ -1155,12 +1197,13 @@ static int pcie_t6050_ps(const char *name, bool on)
 
 int pcie_ans_power_off(void)
 {
-    if (chip_id == T6050) {
-        for (size_t i = 0; i < ARRAY_SIZE(t6050_ans_ps); i++)
-            if (pcie_t6050_ps(t6050_ans_ps[i], false))
+    const struct pcie_ans_ps *ps = pcie_ans_ps();
+
+    if (ps) {
+        for (size_t i = 0; i < ps->count; i++)
+            if (pcie_ans_ps_step(ps->gates[i], false))
                 return -1;
-        /* Longer than the 21.5 ms S2R cycles after which macOS restarted ANS (run 28). */
-        udelay(100000);
+        udelay(ps->off_us);
         return 0;
     }
     pcie_initialized = false;
@@ -1169,13 +1212,14 @@ int pcie_ans_power_off(void)
 
 int pcie_ans_power_on(void)
 {
-    if (chip_id != T6050)
+    const struct pcie_ans_ps *ps = pcie_ans_ps();
+
+    if (!ps)
         return pcie_init();
-    for (size_t i = 0; i < ARRAY_SIZE(t6050_ans_ps_on); i++)
-        if (pcie_t6050_ps(t6050_ans_ps[t6050_ans_ps_on[i]], true))
+    for (size_t i = 0; i < ps->count; i++)
+        if (pcie_ans_ps_step(ps->gates[ps->on[i]], true))
             return -1;
-    /* macOS sets ANS's run bit 70 ms after the storage PHYs are back (cp9d W1). */
-    udelay(70000);
+    udelay(ps->on_us);
     return 0;
 }
 

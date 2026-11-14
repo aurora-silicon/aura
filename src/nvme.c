@@ -438,6 +438,19 @@ bool nvme_post_m4(void)
                          adt_get_property(adt, node, "nvme-secure-reg-layout"));
 }
 
+/* ANS is powered through its own storage gates (pcie_ans_power_off()), not the APCIe block. */
+static bool nvme_ans_storage_gated(void)
+{
+    return chip_id == T6050 || chip_id == T8142;
+}
+
+/* An adopted session has no RTKit instance of this stage's until it is powered off or quiesced. */
+static bool nvme_own_rtkit(void)
+{
+    return nvme_rtkit ||
+           (nvme_rtkit = rtkit_init("nvme", nvme_asc, NULL, NULL, nvme_sart, false)) != NULL;
+}
+
 /*
  * Post-M4, done with ANS: stop the controller, idle the firmware as macOS does before a sleep,
  * keep the SART entries, then power ANS and the PCIe block it runs on off. Every later stage that
@@ -447,14 +460,17 @@ bool nvme_post_m4(void)
  */
 static bool nvme_ans_power_off(void)
 {
-    /* An adopted session has no RTKit instance of this stage's until it is powered off. */
-    if (!nvme_rtkit && !(nvme_rtkit = rtkit_init("nvme", nvme_asc, NULL, NULL, nvme_sart, false)))
+    if (!nvme_own_rtkit())
         return false;
     if (chip_id == T6050) {
         if ((read32(nvme_base + NVME_CC) & NVME_CC_EN) && !nvme_ctrl_suspend())
             printf("nvme: controller suspend timed out\n");
     } else if (read32(nvme_base + NVME_CC) & NVME_CC_EN) {
-        if (nvme_wrote && !nvme_ctrl_shutdown())
+        /*
+         * T8142: the firmware's context is saved by the normal shutdown, which an adopted
+         * session's idle (its RTKit started elsewhere) may not acknowledge before the stop.
+         */
+        if ((nvme_wrote || chip_id == T8142) && !nvme_ctrl_shutdown())
             printf("nvme: controller shutdown timed out\n");
         if (!nvme_ctrl_disable())
             printf("nvme: controller disable timed out\n");
@@ -649,8 +665,9 @@ bool nvme_init(void)
         /*
          * T6050: adopt a healthy session as it is. Left 16 s (an ESP Stage 2 behind its host
          * window), its firmware no longer acknowledged the idle, and ANS didn't start from off.
+         * T8142 does the same with a session an older stage handed on running.
          */
-        adopted = earlier && chip_id == T6050 &&
+        adopted = earlier && nvme_ans_storage_gated() &&
                   read32(nvme_base + NVME_BOOT_STATUS) == NVME_BOOT_STATUS_OK &&
                   !(read32(nvme_base + NVME_CSTS) & NVME_CSTS_CFS);
         from_off = !running || (earlier && !adopted);
@@ -716,7 +733,7 @@ setup_controller:
                "BOOT_STATUS=0x%x\n",
                read32(nvme_base + NVME_CC), read32(nvme_base + NVME_CSTS),
                read32(nvme_base + NVME_BOOT_STATUS));
-        if (earlier && !restarted && chip_id == T6050) {
+        if (earlier && !restarted && nvme_ans_storage_gated()) {
             restarted = true;
             if (!nvme_ans_power_off() || !nvme_ans_power_on())
                 goto out_preserve;
@@ -959,7 +976,7 @@ bool nvme_shutdown(void)
          * nor restarts a stopped ANS. Quiesce RTKit and leave the ASC running, as iBoot does. */
         write64_lo_hi(nvme_qreg(NVME_IOQ_CMDS), 0);
         write64_lo_hi(nvme_qreg(NVME_IOQ_CQES), 0);
-        if (!rtkit_quiesce(nvme_rtkit))
+        if (!nvme_own_rtkit() || !rtkit_quiesce(nvme_rtkit))
             goto out_preserve;
         nvme_initialized = false;
         printf("nvme: controller disabled, RTKit quiesced\n");
