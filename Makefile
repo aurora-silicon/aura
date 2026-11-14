@@ -359,11 +359,14 @@ $(BUILD_FP_OBJS): build/%.o: src/%.c
 	$(QUIET)mkdir -p "$(dir $@)"
 	$(QUIET)$(CC) -c $(BASE_CFLAGS) -MMD -MF $(DEPDIR)/$(*F).d -MQ "$@" -MP -o $@ $<
 
-# Guest-only code in .init (aura.ld): its cL4 register switches are 5 KiB smaller at -Oz, which
-# leaves room in .init for more of the guest-only objects.
-build/sptm_virt_cl4.o: CFLAGS += -Oz
-# Run-once OS handoff code: -Oz keeps .text within its 64 KiB steps (see _file_limit).
+# Size matters more than speed in these, for the 64 KiB steps below _file_limit (aura-raw.ld).
+# The virtualized SPTM's objects, a development tool, share the read-only segment with .rodata.
+build/sptm_virt.o: CFLAGS += -Oz
+build/sptm_virt_%.o: CFLAGS += -Oz
+# Run-once OS handoff code. kboot_gpu.o, kboot_gpu_t8152.o and kboot_gpu_m4.o use BASE_CFLAGS.
 build/kboot.o: CFLAGS += -Oz
+build/kboot_%.o: CFLAGS += -Oz
+build/kboot_%.o: BASE_CFLAGS += -Oz
 
 build/%.o: src/%.c build-tag build-cfg
 	$(QUIET)echo "  CC    $@"
@@ -425,8 +428,9 @@ build-cfg src/../build/build_cfg.h &:
 	( mv -f build/build_cfg.tmp build/build_cfg.h && echo "  CFG   build/build_cfg.h" )
 
 # The built-in boot logos are linked gzip-compressed; fb.c inflates them on first use.
-# They are only read, so they go in .rodata: its 64 KiB alignment padding has room for them,
-# while .data counts towards the file part limit in aura-raw.ld.
+# They are only read, so they go in .rodata. aura-raw.ld links them with the fonts past
+# _file_vital_end instead, where the DCP log buffer may overwrite them: fb.c then finds a bad gzip
+# CRC and leaves the logo blank.
 LOGO_OBJCOPY_FLAGS := --rename-section .data=.rodata,alloc,load,readonly,data,contents
 build/$(BUILTIN_LOGO)_%.bin.gz: $(LOGO_DIR)/$(BUILTIN_LOGO)_%.bin
 	$(QUIET)echo "  GZIP  $@"
