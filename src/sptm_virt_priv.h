@@ -112,4 +112,7 @@ bool sptm_virt_s2r_wfi(u64 *regs, u64 esr);
 /* sptm_virt_gpu.c */
 void sptm_virt_gpu_setup(void);
 
+/* sptm_virt_auractl.c */
+void sptm_virt_auractl_setup(void);
+
 #endif
