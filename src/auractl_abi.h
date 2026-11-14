@@ -10,8 +10,8 @@
  * and gets 0 or an errno back in x0. aura reads the request block and every buffer it names
  * through that process's own EL0 translation, as the process itself would, runs the command and
  * writes the outputs back. The guest decides which of its processes may reach the call; aura
- * never trusts a guest address it has not translated that way. This tree carries no guest-side
- * code: the entry a guest provides is its own (docs/auractl.md).
+ * never trusts a guest address it has not translated that way. A guest reaches the call through
+ * an entry of its own; this tree ships one, the IOKit kext under tools/auractl (docs/auractl.md).
  *
  * Errno values are Darwin's, since the guest is macOS and its caller sees them as errno.
  * Shared by aura (src/sptm_virt_ctl.c) and tools/auractl/auractl.c.

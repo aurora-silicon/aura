@@ -11,8 +11,9 @@ It exists only in builds made with `AURACTL=1`, which requires `SPTM_VIRT=1`, so
 Stage 1. Hooks and the ring exist only when the boot's trace flags include `SPTM_VIRT_S2R`;
 `auractl status` says whether this boot has a ring.
 
-auractl does not change the guest's kernel, and this tree carries no guest-side code. The guest
-provides its own entry to the call (below).
+auractl does not change the guest's kernel. A guest reaches the call through an *entry*: a small
+guest-side piece that hands a request to its kernel. This tree ships one for macOS, the
+`AuractlDevice` IOKit kext under `tools/auractl` (below).
 
 ## The call
 
@@ -75,18 +76,30 @@ A block this ADT lacks is listed as absent. Arming a name arms every range of th
 `auractl peek` reads up to 64 32-bit words from one `pmgr-*`, `clkgen` or `nub-ap-ctrl` range
 whose pages aura would hook. It never reads a mailbox, a FIFO, the PMS or the AMCC. Some words
 fault the SoC when read, so PEEK works only on a chip whose never-read list aura carries: T8140
-for now. On any other chip it returns `EACCES`. (TODO: the lists for the other SPTM-virt chips.)
+for now. Any chip without one, the T6040/T6041 (J616s) included, returns `EACCES`: PEEK is not
+enabled yet there. Enabling it on a chip means confirming its never-read list from our own
+measured ADT (same way T8140's was built, no Apple firmware bytes) and adding it to
+`src/sptm_virt_ctl.c`. The other commands do not depend on PEEK and work everywhere.
 
 ## Build
 
     make CHAINLOADING=1 SPTM_VIRT=1 AURACTL=1      # aura
-    make -C tools/auractl                          # the tool, in the guest
+    make -C tools/auractl ENTRY=iokit              # the tool, in the macOS guest
+    make -C tools/auractl kext                     # AuractlDevice.kext (needs Xcode's macOS SDK)
 
 Run `make clean` between flag sets.
 
 The tool hands each request to the guest's kernel through the entry it is built with
-(`tools/auractl/entry.h`, `make ENTRY=<name>` for `entry_<name>.c`). The only entry in this tree
-is `none`, which refuses every call. A build with it can only decode files with `auractl print`.
+(`tools/auractl/entry.h`, `make ENTRY=<name>` for `entry_<name>.c`). `ENTRY=iokit` goes through
+the `AuractlDevice` kext this tree ships (`tools/auractl/AuractlDevice`, built by `make kext`).
+`ENTRY=none`, the default, refuses every call, so a tool built with it can only decode saved
+files with `auractl print`. See `tools/auractl/README.md` for signing and loading the kext.
+
+Loading the kext needs SIP off and root. Note that under SPTM-virt `kmutil load` cannot build an
+AuxKC: the BootKC is fed by the host loader, not by the booted macOS, so `kmutil` has no writable
+boot kext collection to extend (measured on the J616s). Load the kext with the legacy
+`kextload AuractlDevice.kext` instead, or enrol it by other means; `tools/auractl/README.md` has
+the details.
 
 ## Use
 

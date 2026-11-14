@@ -111,6 +111,14 @@ AURA_XTEXT static const u64 *ctl_never(u32 *n)
         *n = ARRAY_SIZE(ctl_never_t8140);
         return ctl_never_t8140;
     }
+    /*
+     * Every other chip, the T6040/T6041 (the J616s) included: PEEK is not enabled yet. There is no
+     * branch for them above, so they fall through here and get the same EACCES as any unlisted
+     * chip. Enabling PEEK on a chip means confirming its never-read list from our own measured ADT,
+     * the same way ctl_never_t8140[] was (no Apple firmware bytes), and adding a branch above.
+     * Returning NULL until then is fail-safe: an unconfirmed page could fault the SoC when read.
+     * The other commands (ARM/START/STOP/READ/MARK/CONSOLE) do not need it. See docs/auractl.md.
+     */
     *n = 0;
     return NULL;
 }
