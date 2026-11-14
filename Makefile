@@ -258,7 +258,7 @@ OBJECTS := \
 	isp.o \
 	j873.o \
 	kboot.o kboot_atc.o kboot_audio.o kboot_mte.o kboot_gpu_t8122.o kboot_gpu_t8122_power.o kboot_pmp_t8122.o \
-	kboot_t6020_compat.o \
+	kboot_t6020_compat.o kboot_t8132.o \
 	kboot_display_handoff.o kboot_display_facts.o kboot_gpu26.o kboot_gpu_t6031.o kboot_t6031.o \
 	main.o boot_options.o \
 	mitigations.o \
@@ -363,7 +363,7 @@ $(BUILD_FP_OBJS): build/%.o: src/%.c
 # leaves room in .init for more of the guest-only objects.
 build/sptm_virt_cl4.o: CFLAGS += -Oz
 # Run-once OS handoff code: -Oz keeps .text within its 64 KiB steps (see _file_limit).
-build/kboot.o: CFLAGS += -Oz
+build/kboot.o build/kboot_atc.o build/kboot_display_handoff.o build/kboot_t8132.o: CFLAGS += -Oz
 
 build/%.o: src/%.c build-tag build-cfg
 	$(QUIET)echo "  CC    $@"
