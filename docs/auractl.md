@@ -53,6 +53,22 @@ The call reaches aura two ways, both into the same handler:
   `MDSCR_EL1.TDCC` clear (the guest's `MDSCR_EL1` is VNCR-banked, so what it reads back is
   unchanged). This is the transport to use when no kext can load.
 
+  Because any process can ring the doorbell, the DCC transport is a developer gate with two
+  independent controls:
+
+  - **Off unless enabled at boot.** aura only arms `MDCR_EL2.TDCC` when the boot's flags include
+    `SPTM_VIRT_CTL_DCC` (`AURA_AURACTL_DCC=1` for `run_guest_sptm.py`, or `--flag AURA_AURACTL_DCC`
+    for the ESP bundle). With it clear the guest's DCC behaves as on the bare machine and the
+    transport is wholly absent.
+  - **A per-boot cookie for anything past status.** The read-only status (`auractl status`) needs
+    no cookie, but arming, recording, reading records and peeking do. The cookie is a random value
+    aura is given at boot (the host passes it over the proxy; a self-booting ESP bundle bakes it
+    into the boot-args) and which also lands in the guest's boot-args, where only root can read it
+    (`sysctl kern.bootargs`). The tool reads it there and presents it through `DBGDTRTX_EL0` just
+    before each doorbell; aura checks it and refuses a gated command with `EPERM` otherwise. So the
+    DCC status works for any user, while the acting commands need root — without any guest kernel
+    code and without aura ever learning who the caller is.
+
 ## Hooks
 
 A hook is a pass-through stage-2 trap, the same as the sleep-path trace's own

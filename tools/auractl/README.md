@@ -40,10 +40,15 @@ copy the bundle over.
     make -C tools/auractl ENTRY=dcc
     ./auractl status        # reports `entry: dcc`, aura's version, and whether the ring is present
 
-It works for any user (not only root). It only requires that the aura the guest runs under is an
-**AURACTL** build: that is what sets `MDCR_EL2.TDCC` so the `DBGDTR_EL0` access traps to aura. On a
-non-AURACTL aura, or bare hardware, the access does not trap and the tool reports `ENODEV` (it
-checks the tag aura puts in the read-back), so it never acts on stray debug-channel state.
+`status` works for any user. The aura the guest runs under must be an **AURACTL** build booted with
+the DCC transport armed (`AURA_AURACTL_DCC=1`, or `--flag AURA_AURACTL_DCC` for an ESP bundle); that
+is what sets `MDCR_EL2.TDCC` so the `DBGDTR_EL0` access traps to aura. On an aura without it, or bare
+hardware, the access does not trap and the tool reports `ENODEV` (it checks the tag aura puts in the
+read-back), so it never acts on stray debug-channel state.
+
+Everything past `status` — `arm`, `start`/`stop`, `read`, `mark`, `peek` — needs **root**, because
+it needs the per-boot cookie aura put in the guest boot-args, which only root can read (`sysctl
+kern.bootargs`). The tool reads it and presents it automatically; a non-root caller gets `EPERM`.
 
 ## Load the kext (SIP off)
 
