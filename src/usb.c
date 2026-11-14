@@ -140,7 +140,12 @@ bool usb_cdc_deferred_usb2(void)
     /* This is also queried on every proxy poll; the firmware ADT is fixed. */
     if (deferred < 0) {
         int node = adt_path_offset(adt, "/arm-io/atc-phy0");
-        deferred = node >= 0 && adt_is_compatible(adt, node, "atc-phy,t6050");
+        /*
+         * The J714c (M5 Max) enumerates through the generic gadget path on every port, as the
+         * omacom m1n1 Stage 1 does there; the explicit port-0 setup never comes up on it.
+         */
+        deferred = node >= 0 && adt_is_compatible(adt, node, "atc-phy,t6050") &&
+                   !adt_is_compatible(adt, 0, "J714cAP");
     }
     return deferred;
 }
