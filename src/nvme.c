@@ -870,6 +870,15 @@ bool nvme_post_m4_passed_off(void)
     return !nvme_initialized && nvme_sart_saved_cnt && nvme_post_m4();
 }
 
+/*
+ * Post-M4: this stage has not used NVMe and no earlier stage passed SART entries, so ANS is as an
+ * earlier stage left it. Stage 1 versions before the powered-off handoff leave it running.
+ */
+bool nvme_post_m4_untouched(void)
+{
+    return !nvme_initialized && !nvme_sart_saved_cnt && nvme_post_m4();
+}
+
 bool nvme_shutdown(void)
 {
     if (nvme_reboot_required) {
