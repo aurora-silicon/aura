@@ -614,6 +614,16 @@ int payload_run(void)
             secboot_measure("dtb", fdt, fdt_totalsize(fdt), SECBOOT_MEASURED);
             secboot_measure("kernel", kernel, kernel_payload_size, SECBOOT_MEASURED);
         }
+#ifdef SPTM_VIRT_ESP
+        /*
+         * A macOS-only ESP stage 2 (SPTM_VIRT_ESP) boots via the macos= line above and never
+         * prepares a Linux devicetree or hands off to a kernel. The whole kboot/DT/display/GPU-
+         * initdata/PCIe tree is gated out of this build so the vital region fits below the DCP
+         * __OS_LOG buffer (aura-raw.ld _file_limit). Reaching here means a boot=/chainload= path
+         * produced a kernel+fdt, which this image deliberately does not support: fail loudly.
+         */
+        panic("payload: Linux kboot path is gated out of SPTM_VIRT_ESP builds\n");
+#else
         if (kboot_prepare_dt(fdt)) {
             printf("Failed to prepare FDT!\n");
             goto boot_failed;
@@ -622,6 +632,7 @@ int payload_run(void)
         if (kboot_boot(kernel))
             goto boot_failed;
         return 0;
+#endif
 
     boot_failed:
         next_stage.entry = NULL;
