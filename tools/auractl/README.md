@@ -79,13 +79,18 @@ hypervisor's ring uses. The tool reports the record count.
 
 ## Decode the dump
 
-The dump file uses the record layout `ring-dump.py` reads (`AURACTL_REC_BYTES = 32`; `meta` =
-`pa[47:0] | width[50:48] | write[51] | cpu[55:52]`, decoded by the `AURACTL_META_*` macros). Run the
-decoder against the dump:
+The dump file is a flat array of 32-byte records (`AURACTL_REC_BYTES = 32`; `meta` =
+`pa[47:0] | width[50:48] | write[51] | cpu[55:52]`, decoded by the `AURACTL_META_*` macros) in the
+order auractl popped them, oldest first. `decode.py` (here) prints readable rows:
 
 ```
-ring-dump.py kbd.bin       # or whatever input flag your copy of ring-dump.py takes
+./decode.py kbd.bin                      # one row per access: t, cpu, R/W+bits, pa, value, pc
+./decode.py --base 0x<usb-reg-base> kbd.bin   # print offsets relative to the controller's reg
+./decode.py --writes-only kbd.bin
 ```
+
+The layout matches the SPTM-virt GPU tracer's record, so the same file also feeds the host-side
+`ring-dump.py` from the HV-session kit if you prefer that view.
 
 ## End-to-end hardware proof (J616s, tetherless)
 
