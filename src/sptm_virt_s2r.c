@@ -1153,10 +1153,22 @@ void sptm_virt_s2r_setup(bool cdc)
     const char *missing;
     if (s2r_soc_from_adt(adt, sptm_virt_link_phys, ARRAY_SIZE(sptm_virt_link_phys), &s2r_soc_adt,
                          &missing) < 0) {
-        printf("SPTM-virt[s2r]: no sleep path, the ADT gives no %s; debug-link domains not kept\n",
-               missing);
         sptm_virt_flags &= ~(SPTM_VIRT_S2R | SPTM_VIRT_S2R_GO | SPTM_VIRT_S2R_FULL |
                              SPTM_VIRT_S2R_COPROC | SPTM_VIRT_S2R_DROP_USB);
+        /* No sleep path, but the link still has to stay powered: XNU lowers its domains about
+         * three seconds into IOKit and the proxy's USB link drops. */
+        if (cdc && s2r_soc_link_only(adt, sptm_virt_link_phys, ARRAY_SIZE(sptm_virt_link_phys),
+                                     &s2r_soc_adt) == 0) {
+            printf("SPTM-virt[s2r]: no sleep path, the ADT gives no %s; keeping the debug-link "
+                   "domains only\n",
+                   missing);
+            s2r_soc = &s2r_soc_adt;
+            s2r_keep_always = true;
+            s2r_keep_setup();
+            return;
+        }
+        printf("SPTM-virt[s2r]: no sleep path, the ADT gives no %s; debug-link domains not kept\n",
+               missing);
         return;
     }
     s2r_soc = &s2r_soc_adt;
