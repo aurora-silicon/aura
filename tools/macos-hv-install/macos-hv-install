@@ -1,0 +1,300 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+#
+# macos-hv-install — install "macOS under the aura hypervisor + auractl" on an Apple
+# Silicon Mac, from that Mac's own installed macOS. As close to the Aurora Linux install
+# flow as the hardware allows: run it from macOS, it builds and stages everything, then
+# it tells you the one step that must happen in 1TR (enrolling the boot object).
+#
+# It never touches your Linux install's boot. It builds the ESP bundle from THIS Mac's
+# own firmware (no Apple binary is downloaded or redistributed). Everything it writes is:
+#   * a work directory you choose (--work),
+#   * the macOS bundle files on the ESP (aurora/macos/* and the macOS Stage 2), via the
+#     public tools/esp-macos/install_esp.sh, which never touches Linux's boot or NVRAM,
+#   * the auractl tool, copied into the running macOS,
+#   * and, only in the 'enroll' step and only from 1TR, the macOS volume's Stage 1 object.
+#
+# Undo everything with tools/macos-hv-install/macos-hv-uninstall.
+#
+# Usage:
+#   macos-hv-install [global options] <command>
+# Commands:
+#   preflight        check this Mac is supported; change nothing
+#   fetch-firmware   copy this Mac's firmware into the work dir
+#   build-bundle     assemble the ESP staging tree (make_bundle.py)
+#   stage-esp        write the bundle to the ESP (install_esp.sh)
+#   install-tool     install the auractl (DCC) tool into macOS
+#   stage            preflight + fetch-firmware + build-bundle + stage-esp + install-tool
+#   enroll           the 1TR step: enrol the macOS volume's Stage 1 (run from recoveryOS)
+#   all              alias for 'stage', then print the enrol instructions
+# Run 'macos-hv-install -h' for the global options.
+set -eu
+
+PROG=$(basename "$0")
+SELF=$(cd "$(dirname "$0")" && pwd)
+LIBDIR="$SELF/lib"
+AURA_ROOT=$(cd "$SELF/../.." && pwd)        # tools/macos-hv-install -> repo root
+ESP_TOOLS="$AURA_ROOT/tools/esp-macos"
+RECOVERY_TOOLS="$AURA_ROOT/tools/recovery"
+
+# shellcheck source=lib/common.sh
+. "$LIBDIR/common.sh"
+# shellcheck source=lib/preflight.sh
+. "$LIBDIR/preflight.sh"
+
+# ---- defaults ----------------------------------------------------------------------
+DRY=0
+WORK=${HVI_WORK:-./macos-hv-work}
+VOLUME=/
+ESP=
+PARTUUID=
+ASSUME_YES=0
+ALLOW_UNQUAL=0
+SUPPORTED_JSON="$LIBDIR/supported.json"
+SOC_OVERRIDE=
+STAGE2=${HVI_STAGE2:-}
+SELF_BOOT_OBJECT=${HVI_SELF_BOOT_OBJECT:-}
+AURACTL_TOOL=${HVI_AURACTL_TOOL:-}
+TOOL_DEST=${HVI_TOOL_DEST:-/usr/local/bin}
+NO_EXCLAVE=auto
+BUNDLE_FLAGS="AURA_S2R_TRACE"               # minimal: gives auractl its record ring
+FW_ARGS=""
+
+usage() {
+    cat >&2 <<'EOF'
+macos-hv-install — install "macOS under the aura hypervisor + auractl" on an Apple
+Silicon Mac, from that Mac's own installed macOS. Run it from macOS; it builds and
+stages everything, then prints the one step that must happen in 1TR (the enrol).
+It never touches your Linux install's boot.
+
+Usage: macos-hv-install [global options] <command>
+
+Commands:
+  preflight        check this Mac is supported; change nothing
+  fetch-firmware   copy this Mac's firmware into the work dir
+  build-bundle     assemble the ESP staging tree (make_bundle.py)
+  stage-esp        write the bundle to the ESP (install_esp.sh)
+  install-tool     install the auractl (DCC) tool into macOS
+  stage            preflight + fetch-firmware + build-bundle + stage-esp + install-tool
+  enroll           the 1TR step: enrol the macOS volume's Stage 1 (run from recoveryOS)
+  all              'stage', then print the enrol instructions
+
+Global options:
+  --dry-run                 check and show; write nothing
+  --work DIR                work directory (default ./macos-hv-work)
+  --volume VOL              target macOS System volume (default /)
+  --esp MP --partuuid UUID  the ESP to write the bundle to
+  --stage2 PATH             aura ESP Stage 2 image for this SoC (release artifact)
+  --self-boot-object PATH   the macOS-volume Stage 1 to enrol (release artifact)
+  --auractl-tool PATH       the auractl (ENTRY=dcc) tool to install
+  --no-exclave / --exclave  override exclave detection
+  --bundle-flag NAME        extra make_bundle.py --flag (repeatable)
+  --fw-arg ARG              extra fetch_firmware.py arg (repeatable, e.g. --fw-arg --xnu --fw-arg /path)
+  --allow-unqualified       proceed on an unsupported Mac/build (nothing promised)
+  -y, --assume-yes          do not prompt before writing the ESP
+  --supported JSON          supported-list path
+EOF
+}
+
+# ---- argument parsing --------------------------------------------------------------
+CMD=
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -h|--help) usage; exit 0 ;;
+        --dry-run) DRY=1 ;;
+        --work) WORK=$2; shift ;;
+        --volume) VOLUME=$2; shift ;;
+        --esp) ESP=$2; shift ;;
+        --partuuid) PARTUUID=$2; shift ;;
+        --assume-yes|-y) ASSUME_YES=1 ;;
+        --allow-unqualified) ALLOW_UNQUAL=1 ;;
+        --supported) SUPPORTED_JSON=$2; shift ;;
+        --soc) SOC_OVERRIDE=$2; shift ;;
+        --stage2) STAGE2=$2; shift ;;
+        --self-boot-object) SELF_BOOT_OBJECT=$2; shift ;;
+        --auractl-tool) AURACTL_TOOL=$2; shift ;;
+        --tool-dest) TOOL_DEST=$2; shift ;;
+        --no-exclave) NO_EXCLAVE=1 ;;
+        --exclave) NO_EXCLAVE=0 ;;
+        --bundle-flag) BUNDLE_FLAGS="$BUNDLE_FLAGS $2"; shift ;;
+        --fw-arg) FW_ARGS="$FW_ARGS $2"; shift ;;
+        --) shift; break ;;
+        -*) die "unknown option $1 (see $PROG -h)" ;;
+        *) CMD=$1; shift; break ;;
+    esac
+    shift
+done
+[ -n "$CMD" ] || { usage; exit 2; }
+export DRY LIBDIR SUPPORTED_JSON ALLOW_UNQUAL
+
+# ---- helpers tying the steps together ----------------------------------------------
+
+# Resolve whether exclaves are needed. 'auto' asks preflight's HVI_EXCLAVES.
+resolve_exclave_flag() {
+    case "$NO_EXCLAVE" in
+        1) EXCLAVE_ARG=--no-exclave ;;
+        0) EXCLAVE_ARG= ;;
+        auto)
+            if [ "${HVI_EXCLAVES:-1}" = 0 ]; then EXCLAVE_ARG=--no-exclave; else EXCLAVE_ARG=; fi ;;
+    esac
+}
+
+# Does this aura build's make_bundle.py know the DCC gate flag? (AURACTL-6 adds it.)
+make_bundle_has() {  # arg: option string e.g. --auractl-dcc
+    python3 "$ESP_TOOLS/make_bundle.py" --help 2>/dev/null | grep -q -- "$1"
+}
+
+do_fetch() {
+    step "Fetch firmware from this Mac's installed macOS"
+    require_tools python3
+    resolve_exclave_flag
+    # fetch_firmware.py is read-only in --dry-run (it reports where each piece is and copies
+    # nothing), so run it directly rather than through run(): under --dry-run we want its
+    # report, not a "would" placeholder.
+    set -- --work "$WORK/fw" --volume "$VOLUME"
+    [ "$DRY" = 1 ] && set -- "$@" --dry-run
+    [ -n "$EXCLAVE_ARG" ] && set -- "$@" "$EXCLAVE_ARG"
+    # shellcheck disable=SC2086
+    python3 "$LIBDIR/fetch_firmware.py" "$@" $FW_ARGS
+    ok "firmware step done"
+}
+
+do_build() {
+    step "Build the ESP staging tree (make_bundle.py)"
+    require_tools python3
+    [ -n "$STAGE2" ] || die "no ESP Stage 2 image. Pass --stage2 <aura.bin built ESP_STAGE2=1 for $HVI_SOC>."
+    [ -f "$STAGE2" ] || die "--stage2 $STAGE2 does not exist"
+    [ -n "$PARTUUID" ] || die "no ESP PARTUUID. Pass --partuuid <uuid> (diskutil info <ESP>)."
+    resolve_exclave_flag
+
+    FW="$WORK/fw"
+    set -- --stage2 "$STAGE2" --esp-partuuid "$PARTUUID" --out "$WORK/staging" \
+           --sptm "$FW/sptm.bin" --txm "$FW/txm.bin" --xnu "$FW/kernelcache.macho" \
+           --trustcache "$FW/trustcache.bin" --adt "$FW/live.adt"
+    if [ -z "$EXCLAVE_ARG" ]; then
+        set -- "$@" --build-identity "$FW/BuildIdentity.plist" \
+               --exclave-bundle "$FW/exclave_bundle.bin" \
+               --exclave-integrity "$FW/exclave_integrity.bin" \
+               --exclave-trustcache "$FW/exclave_trustcache.bin"
+    else
+        set -- "$@" --no-exclave
+    fi
+    for f in $BUNDLE_FLAGS; do set -- "$@" --flag "$f"; done
+
+    # The DCC auractl gate (Dj's boot-time gate + root cookie). Pass it only if this aura
+    # build's make_bundle supports it; otherwise the DCC entry is not enabled by the
+    # bundle and 'auractl' over DCC will report ENODEV until AURACTL-6's gate lands.
+    if make_bundle_has --auractl-dcc; then
+        set -- "$@" --auractl-dcc
+        ok "DCC auractl gate will be enabled in the bundle"
+    else
+        warn "this make_bundle.py has no --auractl-dcc gate yet (AURACTL-6 / PR #238)."
+        warn "the bundle will boot macOS under the HV, but auractl-over-DCC stays off until"
+        warn "the gate lands. Everything else installs normally."
+    fi
+
+    [ "$DRY" = 1 ] && warn "make_bundle.py has no dry run; skipping the real build under --dry-run"
+    if [ "$DRY" = 1 ]; then
+        info "would run: python3 $ESP_TOOLS/make_bundle.py $*"
+    else
+        rm -rf "$WORK/staging"
+        python3 "$ESP_TOOLS/make_bundle.py" "$@"
+    fi
+    ok "staging tree built under $WORK/staging"
+}
+
+do_stage_esp() {
+    step "Write the bundle to the ESP (install_esp.sh)"
+    [ -n "$PARTUUID" ] || die "no ESP PARTUUID. Pass --partuuid <uuid>."
+    [ -d "$WORK/staging" ] || die "no staging tree at $WORK/staging; run build-bundle first"
+    set -- --partuuid "$PARTUUID"
+    [ -n "$ESP" ] && set -- "$@" --esp "$ESP"
+    # Always do a dry run first so the user sees exactly what will change.
+    step "  install_esp.sh dry run"
+    sh "$ESP_TOOLS/install_esp.sh" "$@" --dry-run "$WORK/staging"
+    if [ "$DRY" = 1 ]; then
+        warn "--dry-run: not writing the ESP"
+        return 0
+    fi
+    confirm "Write these files to the ESP? Your Linux boot is not touched."
+    step "  install_esp.sh write"
+    sh "$ESP_TOOLS/install_esp.sh" "$@" "$WORK/staging"
+    ok "ESP bundle installed"
+}
+
+do_install_tool() {
+    step "Install the auractl (DCC) tool into macOS"
+    if [ -z "$AURACTL_TOOL" ]; then
+        warn "no --auractl-tool given; skipping (build it with 'make -C tools/auractl ENTRY=dcc')"
+        return 0
+    fi
+    [ -f "$AURACTL_TOOL" ] || die "--auractl-tool $AURACTL_TOOL does not exist"
+    run "install $AURACTL_TOOL -> $TOOL_DEST/auractl" sh -c \
+        "mkdir -p '$TOOL_DEST' && cp '$AURACTL_TOOL' '$TOOL_DEST/auractl' && chmod 755 '$TOOL_DEST/auractl'"
+    info "after the HV boots, run 'auractl status' (the DCC entry reads the per-boot cookie"
+    info "from kern.bootargs, which only root can read; run it with sudo)."
+    ok "auractl installed to $TOOL_DEST/auractl"
+}
+
+do_enroll() {
+    step "Enrol the macOS volume's Stage 1 (1TR step)"
+    [ "$(host_os)" = macos ] || die "the enrol step runs from macOS recoveryOS (1TR)"
+    [ -n "$SELF_BOOT_OBJECT" ] || die "no boot object. Pass --self-boot-object <path> (the aura self-boot Stage 1 from the release)."
+    [ -f "$SELF_BOOT_OBJECT" ] || die "--self-boot-object $SELF_BOOT_OBJECT does not exist"
+    md5=$(md5hex "$SELF_BOOT_OBJECT")
+    info "object: $SELF_BOOT_OBJECT"
+    info "md5:    $md5"
+    # Record the pre-enrol boot policy for reference; the uninstaller restores the stock
+    # boot with `kmutil configure-boot -v` (no object), so we enrol with --no-rollback, the
+    # same as the HV-trace enrols (k-hv.sh). enroll-stage1.sh wants options BEFORE the
+    # VOLUME/OBJECT/MD5 positionals (its parser stops at the first positional).
+    if [ "$DRY" != 1 ] && have bputil; then
+        grp=$(diskutil info "$VOLUME" 2>/dev/null | sed -n 's/^ *APFS Volume Group: *//p')
+        [ -n "$grp" ] && { mkdir -p "$WORK"; bputil -d -v "$grp" > "$WORK/policy-before-$grp.txt" 2>&1 || true; }
+    fi
+    set -- --compress --no-rollback
+    if [ "$DRY" = 1 ]; then
+        set -- "$@" --check
+        info "dry run: enroll-stage1.sh --check (every check, no enrol)"
+    fi
+    set -- "$@" "$VOLUME" "$SELF_BOOT_OBJECT" "$md5"
+    [ "$ASSUME_YES" = 1 ] && warn "enroll-stage1.sh still asks you to type 'yes' and for your password"
+    bash "$RECOVERY_TOOLS/enroll-stage1.sh" "$@"
+    [ "$DRY" = 1 ] || ok "enrolled. Restart and pick the macOS volume to boot it under the HV."
+}
+
+confirm() {
+    [ "$ASSUME_YES" = 1 ] && return 0
+    printf '%s [y/N] ' "$1" >&2
+    read -r ans
+    case "$ans" in y|Y|yes|YES) return 0 ;; *) die "cancelled" ;; esac
+}
+
+print_enroll_instructions() {
+    say ""
+    step "Last step — enrol the boot object from 1TR"
+    info "Everything is staged. The only step left changes the macOS volume's Stage 1, and"
+    info "Apple requires that from the volume's own recoveryOS (1TR):"
+    info ""
+    info "  1. Shut down. Hold the power button until 'Loading startup options'."
+    info "  2. Choose Options, then your macOS volume, and unlock with your password."
+    info "  3. Open Terminal (Utilities > Terminal) and run:"
+    cmd "$SELF/macos-hv-install --volume '$VOLUME' --self-boot-object '$SELF_BOOT_OBJECT' enroll"
+    info ""
+    info "  4. Restart. Pick the macOS volume: it boots under the aura HV."
+    info ""
+    info "To undo everything (also from 1TR for the un-enrol): $SELF/macos-hv-uninstall"
+}
+
+# ---- dispatch ----------------------------------------------------------------------
+case "$CMD" in
+    preflight)      preflight ;;
+    fetch-firmware) preflight; do_fetch ;;
+    build-bundle)   preflight; do_build ;;
+    stage-esp)      do_stage_esp ;;
+    install-tool)   do_install_tool ;;
+    stage)          preflight; do_fetch; do_build; do_stage_esp; do_install_tool ;;
+    all)            preflight; do_fetch; do_build; do_stage_esp; do_install_tool; print_enroll_instructions ;;
+    enroll)         do_enroll ;;   # runs in 1TR; must not need python3/diskutil/supported.json
+    *)              die "unknown command '$CMD' (see $PROG -h)" ;;
+esac

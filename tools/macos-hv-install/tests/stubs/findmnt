@@ -1,0 +1,14 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Stub findmnt. install_esp.sh only needs the FSTYPE answer to be a FAT type
+# (else it dies "not a FAT file system"). We always pass --esp and there is no
+# /dev/disk/by-partuuid device, so the SOURCE/TARGET matching paths are skipped.
+: "${STUBLOG:=/dev/null}"
+echo "findmnt $*" >> "$STUBLOG"
+case "$*" in
+    *"-o FSTYPE"*) echo vfat ;;
+    *"-o TARGET"*) echo "" ;;
+    *"-o SOURCE"*) echo "" ;;
+    *)             echo "" ;;
+esac
+exit 0
