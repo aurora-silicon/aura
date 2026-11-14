@@ -139,9 +139,12 @@ resolve_exclave_flag() {
     esac
 }
 
-# Does this aura build's make_bundle.py know the DCC gate flag? (AURACTL-6 adds it.)
-make_bundle_has() {  # arg: option string e.g. --auractl-dcc
-    python3 "$ESP_TOOLS/make_bundle.py" --help 2>/dev/null | grep -q -- "$1"
+# Does this aura build know a run_guest/esp_macos CONFIG_FLAGS name? make_bundle's --flag
+# sums these (esp_macos: sum(r.CONFIG_FLAGS[f] for f in flags)), so this is exactly what it
+# will accept. AURA_AURACTL_DCC (the DCC gate) arrives via PR #238; detect it so the installer
+# is correct both before and after that lands on the tip.
+aura_knows_flag() {  # arg: a CONFIG_FLAGS name
+    grep -q "\"$1\"" "$AURA_ROOT/proxyclient/tools/run_guest_sptm.py" 2>/dev/null
 }
 
 do_fetch() {
@@ -181,16 +184,18 @@ do_build() {
     fi
     for f in $BUNDLE_FLAGS; do set -- "$@" --flag "$f"; done
 
-    # The DCC auractl gate (Dj's boot-time gate + root cookie). Pass it only if this aura
-    # build's make_bundle supports it; otherwise the DCC entry is not enabled by the
-    # bundle and 'auractl' over DCC will report ENODEV until AURACTL-6's gate lands.
-    if make_bundle_has --auractl-dcc; then
-        set -- "$@" --auractl-dcc
-        ok "DCC auractl gate will be enabled in the bundle"
+    # auractl over DCC (Dj's boot-time gate + root-only per-boot cookie): it is the
+    # AURA_AURACTL_DCC boot flag. make_bundle takes it via --flag, and esp_macos bakes the
+    # per-boot cookie into the guest's boot-args (aura-actl-ck=<hex>), which only root reads
+    # (sysctl kern.bootargs). Enable it when this aura build knows the flag; if it does not
+    # yet (PR #238 not on this tip), auractl-over-DCC stays off and we say so.
+    if aura_knows_flag AURA_AURACTL_DCC; then
+        set -- "$@" --flag AURA_AURACTL_DCC
+        ok "auractl DCC transport gated on (per-boot cookie in boot-args; use 'sudo auractl')"
     else
-        warn "this make_bundle.py has no --auractl-dcc gate yet (AURACTL-6 / PR #238)."
+        warn "this aura build has no AURA_AURACTL_DCC gate yet (PR #238)."
         warn "the bundle will boot macOS under the HV, but auractl-over-DCC stays off until"
-        warn "the gate lands. Everything else installs normally."
+        warn "the gate lands on this tip. Everything else installs normally."
     fi
 
     [ "$DRY" = 1 ] && warn "make_bundle.py has no dry run; skipping the real build under --dry-run"

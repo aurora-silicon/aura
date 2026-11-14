@@ -190,16 +190,20 @@ options.
 
 ## auractl in the guest
 
-`auractl` drives aura over the kext-free DCC transport. The transport is gated:
-it needs a boot-time gate in the aura build plus a root-only per-boot cookie
-(Dj's conditions). The tool reads that cookie from `sysctl kern.bootargs`, which
-only root can read, so **run it with `sudo`**.
+`auractl` drives aura over the kext-free DCC transport. The transport is gated
+two ways: a boot flag decides it exists at all, and a per-boot cookie decides who
+may act (Dj's conditions). The installer turns on the boot flag by building the
+bundle with `make_bundle.py --flag AURA_AURACTL_DCC`; `esp_macos` then bakes a
+random per-boot cookie into the guest's boot-args as `aura-actl-ck=<hex>`. In the
+guest only root can read the boot-args (`sysctl kern.bootargs`), so **run
+`auractl` with `sudo`**. Without the cookie, every command past the read-only
+`status` returns an error.
 
-If the running aura build predates the DCC gate, `auractl` over DCC reports
-`ENODEV`. The installer detects this at build-bundle time: if this aura's
-`make_bundle.py` has no `--auractl-dcc` option (AURACTL-6 / PR #238), it warns
-that the bundle will boot macOS under the hypervisor but that auractl-over-DCC
-stays off until the gate lands. Everything else installs normally.
+If the running aura build predates the gate (PR #238 not yet on this tip), it has
+no `AURA_AURACTL_DCC` flag. The installer detects that at build-bundle time and
+warns that the bundle will boot macOS under the hypervisor but that
+auractl-over-DCC stays off until the gate lands; everything else installs
+normally.
 
 Commands: `status`, `list`, `arm`, `start`, `stop`, `read`, `print`, `mark`,
 `clear`, `disarm`. `peek` is available per-SoC.
