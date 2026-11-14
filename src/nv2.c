@@ -91,6 +91,32 @@ bool nv2_probe_active = false;
 #define VN(c, off) ((c)->vncr[(off) / 8])
 #define AV(c, off) ((c)->avncr[(off) / 8])
 
+#ifdef AURACTL
+/* auractl's second transport (src/sptm_virt_ctl.c): a guest process reaches aura through the
+ * debug communications channel instead of an hvc, so no guest kernel code is needed. MDCR_EL2.TDCC
+ * (FEAT_FGT; present on the M-series) traps every EL0/EL1 access to the DCC registers (DBGDTR_EL0,
+ * DBGDTRRX/TX_EL0, MDCCSR_EL0, MDCCINT_EL1) to EL2, reported as EC 0x18. For an EL0 access the
+ * EL1 control MDSCR_EL1.TDCC has priority over the EL2 controls, so to be sure the access reaches
+ * aura and not the guest's own EL1, the hardware MDSCR_EL1.TDCC is also forced clear (the guest's
+ * MDSCR_EL1 is VNCR-banked, so what it reads back is unchanged).
+ *
+ * The trap is armed only when the boot's flags include SPTM_VIRT_CTL_DCC (the DCC transport is a
+ * developer gate, off unless enabled at boot): with the flag clear aura leaves MDCR_EL2.TDCC and
+ * MDSCR_EL1.TDCC alone, so the guest's DCC behaves as on the bare machine and the transport is
+ * wholly absent. */
+#define MDCR_EL2_TDCC  (1UL << 27)
+#define MDSCR_EL1_TDCC (1UL << 12)
+static inline u64 nv2_l1_mdcr(void)
+{
+    return (sptm_virt_flags & SPTM_VIRT_CTL_DCC) ? MDCR_EL2_TDCC : 0UL;
+}
+#else
+static inline u64 nv2_l1_mdcr(void)
+{
+    return 0UL;
+}
+#endif
+
 #define VNCR_EL2  sys_reg(3, 4, 2, 2, 0)
 #define AVNCR_EL2 sys_reg(3, 4, 15, 10, 7)
 
@@ -772,7 +798,8 @@ static void nv2_child_exit(struct nv2_cpu *c, int kind, u64 esr)
         msr(HSTR_EL2, 0);
         if (!nv2_guarded)
             msr(HACR_EL2, 0);
-        msr(MDCR_EL2, 0);
+        msr(MDCR_EL2,
+            nv2_l1_mdcr()); /* keep auractl's DCC trap live back in L1 (see nv2_l1_mdcr) */
         msr(SYS_PMCR1_EL12, c->parent_pmcr1);
         msr(SYS_HFGRTR_EL2, c->l1_hfgrtr);
         msr(SYS_HFGWTR_EL2, c->l1_hfgwtr);
@@ -1574,6 +1601,12 @@ bool nv2_handle_sync(u64 *regs)
     /* From L1. Its userspace (EL0) runs with real TGE clear and reaches EL2
      * only through traps L1 itself never asked for. */
     if ((mrs(SPSR_EL2) & 0xc) == 0x0) {
+#ifdef AURACTL
+        /* auractl's DCC transport: a plain user process reached aura by touching DBGDTR_EL0
+         * (MDCR_EL2.TDCC, src/sptm_virt_ctl.c). Consume it before it is reflected to L1. */
+        if (ec == ESR_EC_MSR && sptm_virt_ctl_dcc(regs, esr))
+            return true;
+#endif
         /* From L1's userspace: what L1 would have taken at its EL1 with
          * its TGE set (e.g. an ID register read under TID3). */
         u64 elr = mrs(ELR_EL2), spsr = mrs(SPSR_EL2);
@@ -1604,6 +1637,10 @@ bool nv2_handle_sync(u64 *regs)
             /* 0x10..0x1f: aura's EL1 vector table forwarding an exception of the guest's own. */
             if (((esr & 0xffff) - 0x10) < 16)
                 return nv2_inject_forwarded(c, (esr & 0xffff) - 0x10);
+#ifdef AURACTL
+            if (sptm_virt_ctl_hvc(regs, esr)) /* auractl (src/sptm_virt_ctl.c) */
+                return true;
+#endif
             nv2_inject_self(esr);
             return true;
         default:
@@ -1692,7 +1729,13 @@ static void nv2_el2_setup(void)
     msr(VTTBR_EL2, 0);
     msr(HACR_EL2, 0);
     msr(HSTR_EL2, 0);
-    msr(MDCR_EL2, 0);
+    msr(MDCR_EL2, nv2_l1_mdcr());
+#ifdef AURACTL
+    /* Keep the EL0 DCC trap routed to aura, not the guest's own EL1 (see nv2_l1_mdcr), but only
+     * when the DCC transport is armed; otherwise the guest's MDSCR_EL1.TDCC is left untouched. */
+    if (sptm_virt_flags & SPTM_VIRT_CTL_DCC)
+        msr(SYS_MDSCR_EL1, mrs(SYS_MDSCR_EL1) & ~MDSCR_EL1_TDCC);
+#endif
 
     /* With TGE clear, EL1 reads these in place of MIDR_EL1 and MPIDR_EL1. */
     msr(VPIDR_EL2, mrs(MIDR_EL1));

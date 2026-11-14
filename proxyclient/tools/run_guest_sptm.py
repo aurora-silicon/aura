@@ -77,6 +77,7 @@ Example:
 import argparse
 import os
 import pathlib
+import secrets
 import struct
 import subprocess
 import sys
@@ -102,6 +103,8 @@ CONFIG_FLAGS = {
     "AURA_GPU_TRACE": 1 << 6,
     "AURA_SAMPLE": 1 << 7,
     "AURA_S2R_MEM": 1 << 8,
+    # bit 9 is reserved for AURA_AURACTL in the feat/auractl runner
+    "AURA_AURACTL_DCC": 1 << 10,  # arm auractl's kext-free DCC transport (off by default)
 }
 KNOWN_ENV = {
     "AURA_KEEP_EXCLAVES",
@@ -613,12 +616,16 @@ def debug_port(adt, proxy_phy=0, port=None):
     return [_u32(nodes[h]["AAPL,phandle"]) for h in phys], tuple(sorted(out))
 
 
-def configure(p, sym, plan, adt):
+def configure(p, sym, plan, adt, ctl_cookie=0):
     p.write64(sym["sptm_virt_diag_pa"], plan.diag_pa)
     if plan.diag_pa:
         print(f"SPTM diagnostic record at 0x{plan.diag_pa:x}")
     flags = sum(bit for name, bit in CONFIG_FLAGS.items() if env_on(name))
     p.call(sym["sptm_virt_config"], flags)
+    if ctl_cookie:
+        # The DCC transport's per-boot cookie; the same value is in the guest's boot-args, which
+        # only root can read. aura refuses every gated DCC command without it.
+        p.call(sym["sptm_virt_ctl_set_cookie"], ctl_cookie)
     for env, symbol in (("AURA_SAMPLE_HZ", "sptm_virt_sample_hz"),
                         ("AURA_SAMPLE_MAX", "sptm_virt_sample_max")):
         if os.environ.get(env):
@@ -808,6 +815,13 @@ def main():
                                                chip)
     serial = os.environ.get("AURA_XNU_SERIAL")
 
+    # auractl's DCC transport is gated behind a per-boot cookie: a random value that goes both into
+    # the guest's boot-args (only root can read kern.bootargs) and into aura (configure() below).
+    ctl_cookie = 0
+    if env_on("AURA_AURACTL_DCC"):
+        ctl_cookie = secrets.randbits(64) or 1
+        args.bootargs = f"{args.bootargs} aura-actl-ck={ctl_cookie:016x}"
+
     plan = plan_mod.plan_boot(
         images["sptm"], images["txm"], images["xnu"], live_adt,
         dram_base=dram_base, phys_base=phys_base, mem_size=managed_end - phys_base,
@@ -854,7 +868,7 @@ def main():
         patch_xnu(p, sym, plan, quirks["nvram_ro"])
     if env_on("AURA_XNU_TC_FORCE") and quirks.get("tc_force"):
         patch_xnu(p, sym, plan, quirks["tc_force"])
-    configure(p, sym, plan, live_adt)
+    configure(p, sym, plan, live_adt, ctl_cookie)
     if p.call(sym["sptm_virt_load"], entry, handoff) != 0:
         raise SystemExit("sptm_virt_load rejected the entry/handoff (see aura's console)")
     if args.no_enter:

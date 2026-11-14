@@ -50,6 +50,8 @@ struct sptm_virt_placement {
 #define SPTM_VIRT_GPU          BIT(6) /* hook and record the GPU and PMP registers */
 #define SPTM_VIRT_SAMPLE       BIT(7) /* sample the guest's PC until its XNU entry */
 #define SPTM_VIRT_S2R_MEM      BIT(8) /* T6050: also hook the MCC and the coprocessor DARTs */
+/* bit 9 is AURA_AURACTL in the feat/auractl runner; left free here so the two never clash */
+#define SPTM_VIRT_CTL_DCC BIT(10) /* arm auractl's DCC transport (MDCR_EL2.TDCC) at boot */
 /* sptm_virt_s2r_cp_ansx, with COPROC on T6050 */
 #define S2R_CP_ANSX_SART  BIT(0) /* sart-ans reg[0-2], first page each */
 #define S2R_CP_ANSX_NVME  BIT(1) /* the NVMe BAR's first page (reg[9]) */
@@ -67,6 +69,22 @@ struct sptm_virt_placement {
 #ifdef SPTM_VIRT_ESP
 /* macos=: boot macOS from the ESP (src/sptm_virt_esp.c). Returns only on failure. */
 int sptm_virt_esp_boot(const char *spec);
+#endif
+
+#ifdef AURACTL
+/* Boot flags (sptm_virt_config); nv2.c arms the DCC trap only under SPTM_VIRT_CTL_DCC. */
+extern u64 sptm_virt_flags;
+/* nv2.c: an HVC from the guest's kernel; true if it was auractl's (src/sptm_virt_ctl.c). */
+bool sptm_virt_ctl_hvc(u64 *regs, u64 esr);
+/* nv2.c: an EC=0x18 sysreg trap from the guest's user space; true if it was a DCC access the
+ * second (kext-free) transport owns, which it consumes (src/sptm_virt_ctl.c). */
+bool sptm_virt_ctl_dcc(u64 *regs, u64 esr);
+/* The per-boot cookie the DCC transport requires for anything past a read-only status: a random
+ * value the host (run_guest_sptm.py) or the ESP manifest put in the guest's boot-args, which
+ * only root can read (sysctl kern.bootargs). 0 (the default) leaves every gated command refused. */
+void sptm_virt_ctl_set_cookie(u64 cookie);
+/* Self-boot path: read the cookie from the boot-args aura laid down (sptm_virt_esp.c). */
+void sptm_virt_ctl_cookie_from_cmdline(const char *cmdline);
 #endif
 
 /* Set once the boot CPU has entered the guest; read with the MMU off by the reset path. */

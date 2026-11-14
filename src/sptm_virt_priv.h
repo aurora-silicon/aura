@@ -112,4 +112,24 @@ bool sptm_virt_s2r_wfi(u64 *regs, u64 esr);
 /* sptm_virt_gpu.c */
 void sptm_virt_gpu_setup(void);
 
+#ifdef AURACTL
+/* auractl (sptm_virt_ctl.c, src/auractl_abi.h) */
+struct s2r_rec;
+struct s2r_soc;
+void sptm_virt_ctl_s2_setup(void); /* before the stage-2 checksum: catalogue, pre-split blocks */
+void sptm_virt_ctl_guest_ram(u64 *base, u64 *size);     /* sptm_virt.c */
+void sptm_virt_s2_ctl_begin(void);                      /* sptm_virt_s2.c */
+void sptm_virt_s2_ctl_end(bool changed);                /* changed: the new tree is the reference */
+extern struct s2r_rec *sptm_virt_s2r_ring;              /* sptm_virt_s2r.c */
+extern u64 sptm_virt_s2r_nrec;
+extern volatile u64 sptm_virt_s2r_head;
+extern volatile bool sptm_virt_s2r_ctl_paused;
+const struct s2r_soc *sptm_virt_s2r_ctl_soc(void);
+int sptm_virt_s2r_ctl_page(const char *what, u64 page, bool arm);
+u32 sptm_virt_s2r_ctl_release_all(void);
+u32 sptm_virt_s2r_ctl_count(u64 base, u64 size, u32 *ctl_pages);
+const void *sptm_virt_s2r_ctl_rec(u64 seq);
+void sptm_virt_s2r_marker(const char *tag, u64 arg);
+#endif
+
 #endif
