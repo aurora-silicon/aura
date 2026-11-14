@@ -343,6 +343,7 @@ static const struct dcp_soc dcp_soc_j613_25g83 = {
     .describe = true,
     .adt_psreg = true,
     .fw25 = true,
+    .oslog_in_rsv = true,
     .uuid = "C042E95C-B9D8-3F0E-94B3-582A08AA6FDD",
     .os_fw = V26_6_2,
     .os_fw_name = "26.6.2",
@@ -719,7 +720,8 @@ static int dcp6_resv_conflict(void *dt, u64 base, u64 size, const char *what)
 /*
  * As dcp6_resv_conflict(), for an __OS_LOG buffer: with .oslog_in_rsv, a /memreserve/ that
  * contains it whole is no conflict (the buffer is already kept from the OS; the no-map node only
- * describes it). On the J616s the buffers sit inside the aura retained range on tether boots.
+ * describes it). On the J616s the buffers sit inside the aura retained range on tether boots;
+ * on the J613 under an Aura stage 1 they sit inside the range stage 2 keeps reserved.
  */
 static void *dcp6_scratch(void *dt);
 
@@ -727,13 +729,15 @@ static int dcp6_oslog_conflict(void *dt, u64 base, u64 size)
 {
     if (!dcp6.soc->oslog_in_rsv)
         return dcp6_resv_conflict(dt, base, size, "__OS_LOG");
+    if (!size || base + size < base)
+        bail("__OS_LOG 0x%lx+0x%lx has an invalid extent\n", base, size);
 
     int n = fdt_num_mem_rsv(dt);
     for (int i = 0; i < n; i++) {
         u64 a, s;
         if (fdt_get_mem_rsv(dt, i, &a, &s) || !dcp6_overlaps(base, size, a, s))
             continue;
-        if (base < a || base + size > a + s)
+        if (a + s < a || base < a || base + size > a + s)
             bail("__OS_LOG 0x%lx+0x%lx straddles /memreserve/ 0x%lx+0x%lx\n", base, size, a, s);
         dlog_debug("__OS_LOG 0x%lx+0x%lx lies inside /memreserve/ 0x%lx+0x%lx\n", base, size, a, s);
     }
