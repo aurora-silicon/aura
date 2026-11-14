@@ -16,6 +16,27 @@
 #define super IOService
 OSDefineMetaClassAndStructors(AuractlDevice, IOService)
 
+/*
+ * The register file is natural-width: the 64-bit registers sit at 8-byte-aligned offsets, the
+ * 32-bit registers at 4-byte-aligned offsets, and the hypervisor decode keys on the exact offset
+ * (there are no sub-word cases). So every access must use the register's own width, or the guest
+ * makes a misaligned device access (which faults) or lands on an undecoded offset.
+ */
+static bool auractlReg64(uint32_t off)
+{
+    switch (off) {
+        case AURACTL_REG_ARG0:
+        case AURACTL_REG_ARG1:
+        case AURACTL_REG_NREC:
+        case AURACTL_REG_DROPPED:
+        case AURACTL_REG_FIFO_DATA:
+        case AURACTL_REG_FIFO_AVAIL:
+            return true;
+        default:
+            return false;
+    }
+}
+
 bool AuractlDevice::start(IOService *provider)
 {
     if (!super::start(provider))
@@ -87,20 +108,22 @@ void AuractlDevice::stop(IOService *provider)
 
 bool AuractlDevice::offsetValid(uint32_t off) const
 {
-    /* Must be inside the register file and 8-byte aligned (MMIO is accessed as aligned words). */
-    if ((off & 0x7u) != 0)
-        return false;
+    /* Inside the register file, aligned to the register's own width (8-byte regs 8-aligned, else
+     * 4-aligned) so the device never sees a misaligned access. */
     if (off >= AURACTL_REG_MAX)
         return false;
-    return true;
+    return (off & (auractlReg64(off) ? 0x7u : 0x3u)) == 0;
 }
 
 bool AuractlDevice::readReg(uint32_t off, uint64_t *out)
 {
     if (!fRegs || !out || !offsetValid(off))
         return false;
-    /* DEVICE memory, uncached: read the register as a 64-bit word. 32-bit regs sit in the low word. */
-    *out = *(volatile uint64_t *)(fRegs + off);
+    /* DEVICE memory, uncached: read each register at its natural width. */
+    if (auractlReg64(off))
+        *out = *(volatile uint64_t *)(fRegs + off);
+    else
+        *out = *(volatile uint32_t *)(fRegs + off);
     return true;
 }
 
@@ -108,7 +131,10 @@ bool AuractlDevice::writeReg(uint32_t off, uint64_t val)
 {
     if (!fRegs || !offsetValid(off))
         return false;
-    *(volatile uint64_t *)(fRegs + off) = val; /* uncached MMIO write */
+    if (auractlReg64(off))
+        *(volatile uint64_t *)(fRegs + off) = val; /* uncached MMIO write */
+    else
+        *(volatile uint32_t *)(fRegs + off) = (uint32_t)val;
     return true;
 }
 
