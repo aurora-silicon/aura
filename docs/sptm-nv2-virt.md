@@ -43,6 +43,15 @@ The sleep record follows it: from 512 records before the first core's self-disab
 On T8132 the commit is followed 3 ms later by four SPMI commands to the PMU (`nub-spmi0`, slave 0xe):
 read 0x2000, a 4-byte write at 0x2008, `0x200e <- 0`, and `0x2000 <- 0x41`, T8132's "go hib".
 
+### T8142 (J815, MacBook Air 15" M5) with macOS 27.2.1
+
+27.2.1 (26B131) boots to the login window on a J815 with exclaves (`AURA_KEEP_EXCLAVES`), the kernel
+`kernelcache.release.mac17g`. Its `XNU_QUIRKS` entry carries every J813 26A428 workaround, ported:
+each site's 48-instruction window, PC-relative immediates masked, matches exactly once in this
+kernelcache; the two twin PAC-key guards match twice and are paired in order. The fingerprint is
+the RO-zone branch, which T6041's kernelcache of the same release does not have. The workarounds
+were not taken out one by one as on the J616c; all of them were applied on every boot.
+
 The code:
 
 | File | What |
