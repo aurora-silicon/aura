@@ -123,9 +123,17 @@ UUIDs and other machine-derived values outside git.
 
 This switch runs the same fail-soft G15 GPU setup that `chosen.asahi,t6030-gpu=1`
 runs on the M3 Pro (`dt_set_gpu_g15()` in `src/kboot_gpu.c`), with the T8122
-entry of its SoC table. It is off by default: without it a T8122 boot does not
-run the setup at all (there is no dry run), and only the diagnostic switches
-above apply. With it, `asahi,t8122-gpu-handoff-diag` is ignored.
+entry of its SoC table. On the M3 MacBook Airs (J613, J615) and the 14" M3
+MacBook Pro (J504), a normal build sets it by default, together with
+`asahi,t8122-dcp`, the stand-in power model (`asahi,t8122-gpu-power-standin`)
+and the leakage fuse (`asahi,t8122-gpu-fuse-leakage`), unless a config line set
+it (`dt_set_m3_defaults()` in `src/kboot.c`). `chosen.asahi,t8122-gpu=0` keeps
+the GPU off; `chosen.asahi,t8122-dcp=0` or `chosen.asahi,m3-defaults=0` keeps
+the default GPU switches off too, while an owner's own GPU line still counts.
+Other T8122 boards (the J433/J434 iMacs) get no default. Without the switch a
+T8122 boot does not run the setup at all (there is no dry run), and only the
+diagnostic switches above apply. With it, `asahi,t8122-gpu-handoff-diag` is
+ignored.
 
 The setup needs a `gpu` alias to an `apple,agx-t8122` node with the same inputs
 as the T6030 node (`reg`/`reg-names` for asc and sgx, `operating-points-v2`,
@@ -152,11 +160,13 @@ Any failure leaves the gpu node, the UAT regions and the mailbox disabled,
 zeroes `apple,firmware-compat`, releases the GPU power closure recursively
 and checks that it is off, and lets the boot continue.
 
-The T8122 table does not have a known G15G firmware image, a leakage fuse or a
-power model yet, so today step 2 stops the setup before any GPU register or
-power access. It logs the loaded image (`FW: GFX: image uuid ...`) and that
-the leakage fuse and power model are missing. The kernel also has no T8122 GPU
-node or driver path yet.
+The T8122 table knows the 14.8.3 G15G image the Airs and the J504 load. Its
+power model is a stand-in worked out on the J613, not measured: it sets power
+targets, not clocks. The leakage fuse decode was also worked out on the J613.
+A boot with an unknown image still stops at step 2, before any GPU register or
+power access, and logs the loaded image (`FW: GFX: image uuid ...`). linux-aurora
+starts the GPU only on the boards in its own T8122 list (J613, J615, J504), at
+a conservative cap.
 
 Host tests (synthetic ADT, simulated bus, real libfdt):
 
