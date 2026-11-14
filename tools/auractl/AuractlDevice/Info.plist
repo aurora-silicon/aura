@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- SPDX-License-Identifier: MIT -->
+<!--
+  AuractlDevice.kext Info.plist.
+
+  The guest-side entry for aura's auractl HVC (src/auractl_abi.h, docs/auractl.md). Load it in the
+  macOS guest under an AURACTL build of aura, with SIP off (dev-signed):
+    kmutil load -p AuractlDevice.kext        (or the legacy `kextload AuractlDevice.kext`)
+  See README.md.
+
+  It matches IOResources so it instantiates once with no ADT node and publishes the
+  AuractlUserClient the tool opens. It maps no hardware; its only work is to issue the one HVC a
+  userland process cannot.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>English</string>
+    <key>CFBundleExecutable</key>
+    <string>AuractlDevice</string>
+    <key>CFBundleIdentifier</key>
+    <string>org.aurorasilicon.AuractlDevice</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>AuractlDevice</string>
+    <key>CFBundlePackageType</key>
+    <string>KEXT</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.0</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>OSBundleRequired</key>
+    <string>Local-Root</string>
+    <key>IOKitPersonalities</key>
+    <dict>
+        <key>AuractlDevice</key>
+        <dict>
+            <key>CFBundleIdentifier</key>
+            <string>org.aurorasilicon.AuractlDevice</string>
+            <!-- IOService class that publishes the user client. -->
+            <key>IOClass</key>
+            <string>AuractlDevice</string>
+            <!-- Match IOResources so we instantiate without an ADT node. -->
+            <key>IOProviderClass</key>
+            <string>IOResources</string>
+            <key>IOMatchCategory</key>
+            <string>AuractlDevice</string>
+            <key>IOResourceMatch</key>
+            <string>IOKit</string>
+            <!-- The user client class IOKit instantiates on IOServiceOpen(). -->
+            <key>IOUserClientClass</key>
+            <string>AuractlUserClient</string>
+        </dict>
+    </dict>
+    <key>OSBundleLibraries</key>
+    <dict>
+        <key>com.apple.kpi.iokit</key>
+        <string>12.0.0</string>
+        <key>com.apple.kpi.libkern</key>
+        <string>12.0.0</string>
+        <key>com.apple.kpi.mach</key>
+        <string>12.0.0</string>
+    </dict>
+</dict>
+</plist>
