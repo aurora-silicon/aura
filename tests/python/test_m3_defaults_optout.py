@@ -29,6 +29,8 @@ UBOOT = (bytes(16) + (0x10000).to_bytes(8, "little") + bytes(32) + b"ARM\x64" + 
          + bytes(4096 - 64))               # an arm64 Image header, image_size 64 KiB
 BOARDS = {
     "j613": ("J613", "apple,j613;apple,t8122;apple,arm-platform"),
+    # a J613 device tree from a kernel before linux-aurora aurora15: no common scanout aperture
+    "j613-old": ("J613", "old;apple,j613;apple,t8122;apple,arm-platform"),
     "j615": ("J615", "apple,j615;apple,t8122;apple,arm-platform"),
     "j504": ("J504", "apple,j504;apple,t8122;apple,arm-platform"),
     "j433": ("J433", "apple,j433;apple,t8122;apple,arm-platform"),
@@ -40,9 +42,10 @@ BOARDS = {
     "j516m": ("J516M", "apple,j516m;apple,t6034;apple,arm-platform"),
     "j293": ("J293", "apple,j293;apple,t8103;apple,arm-platform"),
 }
-CHIP = {"j613": "8122", "j615": "8122", "j504": "8122", "j433": "8122", "j514s": "6030", "j516s": "6030", "j516c": "6031",
+CHIP = {"j613": "8122", "j613-old": "8122", "j615": "8122", "j504": "8122", "j433": "8122", "j514s": "6030", "j516s": "6030", "j516c": "6031",
         "j514c": "6031", "j514m": "6034", "j516m": "6034", "j293": "8103"}
 FAMILY = {"j613": ("asahi,t8122-", "asahi,j613-", "asahi,j615-"),
+          "j613-old": ("asahi,t8122-", "asahi,j613-", "asahi,j615-"),
           "j615": ("asahi,t8122-", "asahi,j613-", "asahi,j615-"),
           "j504": ("asahi,t8122-", "asahi,j613-", "asahi,j615-"),
           "j514s": ("asahi,t6030-",),
@@ -311,6 +314,10 @@ static int mkdtb(const char *compat_list, const char *path)
 {
     static unsigned char tree[4096];
     char compat[128];
+    /* "old;" first: a kernel before aurora15, whose display subsystem has no apple,dma-range */
+    int old = !strncmp(compat_list, "old;", 4);
+    if (old)
+        compat_list += 4;
     int len = snprintf(compat, sizeof(compat), "%s", compat_list) + 1;
     for (char *c = compat; *c; c++)
         if (*c == ';')
@@ -318,6 +325,12 @@ static int mkdtb(const char *compat_list, const char *path)
     assert(!fdt_create_empty_tree(tree, sizeof(tree)));
     assert(!fdt_setprop(tree, 0, "compatible", compat, len));
     assert(fdt_add_subnode(tree, 0, "chosen") >= 0);
+    int disp = fdt_add_subnode(tree, 0, "display-subsystem");
+    assert(disp >= 0);
+    assert(!fdt_setprop_string(tree, disp, "compatible", "apple,t8122-display-subsystem"));
+    if (!old)
+        assert(!fdt_setprop_u64(tree, disp, "apple,dma-range", 0x10000000000ull) &&
+               !fdt_appendprop_u64(tree, disp, "apple,dma-range", 0x1000000000ull));
     assert(!fdt_pack(tree));
     FILE *out = fopen(path, "wb");
     assert(out && fwrite(tree, 1, fdt_totalsize(tree), out) == fdt_totalsize(tree));
@@ -474,6 +487,53 @@ def booted(r):
 @pytest.mark.parametrize("build", STAGE2)
 def test_no_config_gets_the_whole_air_recipe(tools, build, board):
     b = boot(tools, build, b"", board=board)
+    booted(b)
+    assert set(AIR) <= b.armed and b.select == "g15-standin"
+
+
+DCPEXT = "asahi,t8122-dcpext"
+
+
+@pytest.mark.parametrize("build", STAGE2)
+def test_the_j613_gets_its_external_display_by_default(tools, build):
+    b = boot(tools, build, b"")
+    booted(b)
+    assert DCPEXT in b.armed and b.chosen[DCPEXT] == "1"
+
+
+@pytest.mark.parametrize("build", STAGE2)
+def test_a_j613_with_an_older_kernel_gets_no_external_display_default(tools, build):
+    """Before aurora15 the kernel crashes the internal DCP when dcpext is reserved: its device
+    tree has no common scanout aperture, so the J613 gets the plain Air recipe."""
+    b = boot(tools, build, b"", board="j613-old")
+    booted(b)
+    assert set(AIR) <= b.armed and DCPEXT not in b.chosen
+
+
+@pytest.mark.parametrize("build", STAGE2)
+def test_the_j615_gets_no_external_display_default(tools, build):
+    b = boot(tools, build, b"", board="j615")
+    booted(b)
+    assert set(AIR) <= b.armed and DCPEXT not in b.chosen
+
+
+@pytest.mark.parametrize("config,lines", [
+    (b"chosen.asahi,t8122-dcpext=0\n", {DCPEXT: "0"}),
+    (b"chosen.asahi,t8122-dcpext=1\nchosen.asahi,t8122-dcpext=0\n", {DCPEXT: "0"}),
+    (b"chosen.asahi,t8122-dcp=0\n", {}),
+    (b"chosen.asahi,m3-defaults=0\n", {}),
+], ids=["dcpext-off", "dcpext-on-then-off", "dcp-off", "master-off"])
+@pytest.mark.parametrize("build", STAGE2)
+def test_j613_owner_lines_keep_the_external_display_off(tools, build, config, lines):
+    b = boot(tools, build, config)
+    booted(b)
+    assert DCPEXT not in b.armed
+    assert {k: v for k, v in b.chosen.items() if k == DCPEXT} == lines
+
+
+@pytest.mark.parametrize("build", STAGE2)
+def test_j613_dcpext_zero_keeps_the_rest_of_the_air_recipe(tools, build):
+    b = boot(tools, build, b"chosen.asahi,t8122-dcpext=0\n")
     booted(b)
     assert set(AIR) <= b.armed and b.select == "g15-standin"
 

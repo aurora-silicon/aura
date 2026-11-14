@@ -56,12 +56,22 @@ static void write_chosen(void)
         assert(!fdt_setprop(dt, node, chosen_params[i][0], chosen_params[i][1],
                             (int)strlen(chosen_params[i][1]) + 1));
 }
+/* the kernel the device tree came from: 0 an aurora15 or newer one, with the common scanout
+   aperture (a display subsystem with apple,dma-range), 1 an older one */
+static int old_kernel;
 /* a fresh device tree, as each kboot_prepare_dt() opens one; chosen_params persist */
 static void tree(const char *compat, int compat_len)
 {
     assert(!fdt_create_empty_tree(dt, sizeof(blob)));
     assert(!fdt_setprop(dt, 0, "compatible", compat, compat_len));
     assert(fdt_add_subnode(dt, 0, "chosen") >= 0);
+    int node = fdt_add_subnode(dt, 0, "display-subsystem");
+    assert(node >= 0);
+    assert(!fdt_setprop_string(dt, node, "compatible", "apple,t8122-display-subsystem"));
+    if (!old_kernel) {
+        static const unsigned char range[16] = {0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0x10, 0, 0, 0, 0};
+        assert(!fdt_setprop(dt, node, "apple,dma-range", range, sizeof(range)));
+    }
 }
 static void reset(const char *compat, int compat_len)
 {
@@ -128,9 +138,11 @@ static void fill(int n)
 }
 static const char *air[] = {"asahi,t8122-dcp", "asahi,t8122-gpu", "asahi,t8122-gpu-power-standin",
                             "asahi,t8122-gpu-fuse-leakage"};
+static const char *j613[] = {"asahi,t8122-dcp", "asahi,t8122-gpu", "asahi,t8122-gpu-power-standin",
+                             "asahi,t8122-gpu-fuse-leakage", "asahi,t8122-dcpext"};
 static const char *pro[] = {"asahi,t6030-dcp", "asahi,t6030-gpu"};
 static const char *max[] = {"asahi,t6031-dcp", "asahi,t6031-gpu"};
-static const char *never[] = {"asahi,t8122-dcpext", "asahi,t6030-dcpext", "asahi,t6030-dispext",
+static const char *never[] = {"asahi,t6030-dcpext", "asahi,t6030-dispext",
                               "asahi,t8122-gpu-asc-preflight",
                               "asahi,t8122-gpu-handoff-diag", "asahi,m3-defaults"};
 static int listed(const char *name, const char **list, int n)
@@ -141,8 +153,8 @@ static int listed(const char *name, const char **list, int n)
 /* want armed; every other default switch of every board, and the never-defaults, absent */
 static void expect_only(const char **want, int n_want)
 {
-    const char **lists[] = {air, pro, max};
-    int sizes[] = {N(air), N(pro), N(max)};
+    const char **lists[] = {j613, pro, max};
+    int sizes[] = {N(j613), N(pro), N(max)};
     for (int i = 0; i < n_want; i++) assert(armed(want[i]));
     for (int l = 0; l < 3; l++)
         for (int i = 0; i < sizes[l]; i++)
@@ -154,9 +166,58 @@ static void expect_only(const char **want, int n_want)
 int main(void)
 {
     /* the five boards get their own recipe and nothing else */
-    RESET(J613); assert(!run()); expect_only(air, 4);
+    /* the 13-inch Air also gets its external display; the 15-inch Air and the J504 do not yet */
+    RESET(J613); assert(!run()); expect_only(j613, 5);
+    assert(entries() == 5 && defaults() == 5 && slot("asahi,t8122-dcpext") == 4);
     RESET(J615); assert(!run()); expect_only(air, 4);
+    assert(entries() == 4 && !present("asahi,t8122-dcpext"));
     RESET(J504); assert(!run()); expect_only(air, 4);
+    assert(entries() == 4 && !present("asahi,t8122-dcpext"));
+    /* an owner's chosen.asahi,t8122-dcpext=0 wins; the rest of the recipe still goes in */
+    RESET(J613);
+    assert(kboot_set_chosen("asahi,t8122-dcpext", "0") >= 0);
+    assert(!run());
+    for (int i = 0; i < 4; i++) assert(armed(air[i]));
+    assert(present("asahi,t8122-dcpext") && !armed("asahi,t8122-dcpext"));
+    assert(entries() == 5 && defaults() == 4 && !chosen_is_default[slot("asahi,t8122-dcpext")]);
+    /* the internal display off keeps the external one off too, as it does the GPU */
+    RESET(J613);
+    assert(kboot_set_chosen("asahi,t8122-dcp", "0") >= 0);
+    assert(!run());
+    assert(!present("asahi,t8122-dcpext") && !present("asahi,t8122-gpu") && entries() == 1);
+    /* master off: none of it, the external display included */
+    RESET(J613);
+    assert(kboot_set_chosen("asahi,m3-defaults", "0") >= 0);
+    assert(!run());
+    assert(!present("asahi,t8122-dcpext") && !present("asahi,t8122-dcp") && entries() == 1);
+    /* a lost config line: no graphics handoff, and an owner's dcpext=1 is dropped too */
+    RESET(J613);
+    assert(kboot_set_chosen("asahi,t8122-dcpext", "1") >= 0);
+    chosen_lost = true;
+    assert(!run());
+    assert(!present("asahi,t8122-dcpext") && entries() == 0);
+    /* a device tree from a kernel before aurora15 (no common scanout aperture): the plain Air
+       recipe, no dcpext; an owner's own dcpext line still stays as written */
+    old_kernel = 1;
+    RESET(J613); assert(!run()); expect_only(air, 4);
+    assert(entries() == 4 && !present("asahi,t8122-dcpext"));
+    RESET(J613);
+    assert(kboot_set_chosen("asahi,t8122-dcpext", "1") >= 0);
+    assert(!run());
+    assert(armed("asahi,t8122-dcpext") && !chosen_is_default[slot("asahi,t8122-dcpext")] && defaults() == 4);
+    /* the marker must be on the display subsystem itself: the same property elsewhere is not it */
+    RESET(J613);
+    {
+        int n = fdt_add_subnode(dt, 0, "other");
+        assert(n >= 0 && !fdt_setprop(dt, n, "apple,dma-range", "", 0));
+    }
+    assert(!run()); expect_only(air, 4);
+    old_kernel = 0;
+    /* a J615 owner's own dcpext line stays as written, with no default beside it */
+    RESET(J615);
+    assert(kboot_set_chosen("asahi,t8122-dcpext", "1") >= 0);
+    assert(!run());
+    assert(armed("asahi,t8122-dcpext") && !chosen_is_default[slot("asahi,t8122-dcpext")]);
     RESET(J516S); assert(!run()); expect_only(pro, 2);
     RESET(J514S); assert(!run()); expect_only(pro, 2);
     RESET(J516C); assert(!run()); expect_only(max, 2);
@@ -374,7 +435,7 @@ int main(void)
     TREE("apple,j613\0apple,t8122\0apple,arm-platform"); assert(!run());
     assert(present("asahi,t8122-gpu") && !armed("asahi,t8122-gpu"));
     assert(armed("asahi,t8122-dcp") && armed("asahi,t8122-gpu-power-standin") &&
-           armed("asahi,t8122-gpu-fuse-leakage") && entries() == 4);
+           armed("asahi,t8122-gpu-fuse-leakage") && armed("asahi,t8122-dcpext") && entries() == 5);
 
     /* generated-entry flags: a default deleted from the middle moves the owner's later line down
        without its flag, the owner's later value takes a default over, and switching boards in one
@@ -393,7 +454,7 @@ int main(void)
     assert(armed("asahi,t6030-dcp") && armed("asahi,t6030-gpu"));
     assert(entries() == 4 && !chosen_is_default[0] && !chosen_is_default[1] && defaults() == 2);
     TREE(J613); assert(!run());
-    expect_only(air, 4); assert(entries() == 6 && defaults() == 4);
+    expect_only(j613, 5); assert(entries() == 7 && defaults() == 5);
     TREE(J514C); assert(!run());
     expect_only(max, 2); assert(entries() == 4 && defaults() == 2);
     TREE(J516M); assert(!run());
@@ -411,15 +472,17 @@ int main(void)
     assert(entries() == 5 && defaults() == 2 && !chosen_is_default[slot("asahi,t6031-gpu")]);
     assert(!strcmp(chosen_params[0][0], "test,first") && !strcmp(chosen_params[1][0], "test,later"));
 
-    /* allocation failure part way through: no partial recipe, no crash */
-    for (int fail = 0; fail < 8; fail++) {
+    /* allocation failure part way through: no partial recipe, no crash. Each of the J613's five
+       switches takes two allocations, so failures 0..9 hit every one of them, the dcpext line's
+       included (8, 9: the four lines before it must come out again); 10 is no failure at all */
+    for (int fail = 0; fail <= 10; fail++) {
         RESET("apple,j613\0apple,t8122\0apple,arm-platform");
         calloc_fail_in = fail;
         assert(!run());
         calloc_fail_in = -1;
         int on = 0;
-        for (int i = 0; i < 4; i++) on += present(air[i]);
-        assert(on == 0 || on == 4);
+        for (int i = 0; i < 5; i++) on += present(j613[i]);
+        assert(on == (fail < 10 ? 0 : 5));
         assert(entries() == on);
         for (int i = 0; i < entries(); i++) assert(chosen_params[i][0] && chosen_params[i][1]);
     }
@@ -455,10 +518,10 @@ int main(void)
     assert(!run());
     calloc_fail_in = 0;
     assert(kboot_set_chosen("asahi,t8122-gpu", "0") < 0);
-    assert(entries() == 4 && !strcmp(chosen_params[0][0], "asahi,t8122-gpu") &&
+    assert(entries() == 5 && !strcmp(chosen_params[0][0], "asahi,t8122-gpu") &&
            !strcmp(chosen_params[0][1], "0") && !chosen_is_default[0]);
     TREE("apple,j613\0apple,t8122\0apple,arm-platform"); assert(!run());
-    for (int i = 0; i < 4; i++) assert(!present(air[i]));     /* fail closed: no graphics at all */
+    for (int i = 0; i < 5; i++) assert(!present(j613[i]));    /* fail closed: no graphics at all */
     assert(entries() == 0);
     RESET(J516C);
     assert(kboot_set_chosen("asahi,t6031-gpu", "0") >= 0);
@@ -501,7 +564,7 @@ int main(void)
         assert(kboot_set_chosen("asahi,t8122-dcp", "0") >= 0);
         assert(!run());
         assert(present("asahi,t8122-dcp") && !armed("asahi,t8122-dcp"));
-        for (int i = 1; i < 4; i++) assert(!present(air[i]));
+        for (int i = 1; i < 5; i++) assert(!present(j613[i]));
         assert(entries() == 1);
     }
     /* an owner's own GPU line beside it stays, with no default power switches added */
@@ -510,18 +573,18 @@ int main(void)
     assert(kboot_set_chosen("asahi,t8122-gpu", "1") >= 0);
     assert(!run());
     assert(armed("asahi,t8122-gpu") && !present("asahi,t8122-gpu-power-standin"));
-    assert(!present("asahi,t8122-gpu-fuse-leakage") && entries() == 2);
+    assert(!present("asahi,t8122-gpu-fuse-leakage") && !present("asahi,t8122-dcpext") && entries() == 2);
     /* the display line changed after a first preparation: =0 takes the GPU defaults away, =1 restores them */
     RESET("apple,j613\0apple,t8122\0apple,arm-platform");
-    assert(!run()); assert(entries() == 4);
+    assert(!run()); assert(entries() == 5);
     assert(kboot_set_chosen("asahi,t8122-dcp", "0") >= 0);
     TREE("apple,j613\0apple,t8122\0apple,arm-platform"); assert(!run());
-    for (int i = 1; i < 4; i++) assert(!present(air[i]));
+    for (int i = 1; i < 5; i++) assert(!present(j613[i]));
     assert(entries() == 1);
     assert(kboot_set_chosen("asahi,t8122-dcp", "1") >= 0);
     TREE("apple,j613\0apple,t8122\0apple,arm-platform"); assert(!run());
-    for (int i = 0; i < 4; i++) assert(armed(air[i]));
-    assert(entries() == 4);
+    for (int i = 0; i < 5; i++) assert(armed(j613[i]));
+    assert(entries() == 5);
     /* the Pro keeps its GPU default beside a display line at 0 (tested above): no such rule there */
 
     /* after a lost line an owner's earlier =1 no longer stands on the five boards: every graphics
@@ -626,7 +689,7 @@ def test_the_j516c_defaults_are_the_switches_the_t6031_entries_read():
     display = between(handoff, "static const struct dcp_soc dcp_soc_t6031 = {", "};")
     assert '.optin = "asahi,t6031-dcp",' in display and ".board_gate = true," in display
     assert 'dcp_boards_t6031[] = {"apple,j514c", "apple,j516c", NULL};' in handoff
-    assert '{"apple,t6031", m3_max_boards, m3_max_switches, false, m3_max_graphics},' in kboot
+    assert '{"apple,t6031", m3_max_boards, m3_max_switches, false, m3_max_graphics, NULL, NULL},' in kboot
     soc = between(gpu, "static const struct g15_soc g15_soc_t6031 = {", "};")
     assert '.optin = "asahi,t6031-gpu",' in soc
     entry = definition(gpu, "dt_set_gpu_t6031")
@@ -636,11 +699,12 @@ def test_the_j516c_defaults_are_the_switches_the_t6031_entries_read():
 
 
 def test_the_defaults_path_only_edits_the_chosen_table():
-    """No reboot, persistence or second-boot step: the helpers only read the device tree's root
-    compatible and edit the chosen table"""
+    """No reboot, persistence or second-boot step: the helpers only read the device tree (its root
+    compatible, and a node property that marks the kernel) and edit the chosen table"""
     source = (ROOT / "src/kboot.c").read_text()
     allowed = {"dt_drop_m3_defaults", "dt_drop_m3_graphics", "kboot_chosen_param",
                "kboot_set_chosen", "kboot_delete_chosen", "fdt_node_check_compatible", "printf",
+               "fdt_node_offset_by_compatible", "fdt_getprop",
                "strcmp", "strncmp", "strlen", "sizeof", "while", "for", "if"}
     for name, signature in (("dt_set_m3_defaults", "static int dt_set_m3_defaults(void)\n{"),
                             ("dt_drop_m3_defaults", "static void dt_drop_m3_defaults(void)\n{"),
