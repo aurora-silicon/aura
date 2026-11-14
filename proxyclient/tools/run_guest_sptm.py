@@ -43,8 +43,6 @@ Environment (all optional; 1 enables a switch):
   AURA_SAMPLE              sample the guest's PC until each core's XNU entry (pre-XNU hangs)
   AURA_SAMPLE_HZ=<n>       samples per second (default 4)
   AURA_SAMPLE_MAX=<n>      stop printing after n samples (default 64)
-  AURA_XNU_ENTRY           patch the guest kernelcache's acct(2) so a root process reaches aura's
-                           control hvc with no kext (the auractl "xnu" entry; aura/auractl_xnu.py)
   AURA_XNU_RO_RELAX        patch XNU's zalloc_ro_mut RO-zone panic out (tracing only; XNU_QUIRKS)
   AURA_XNU_TC_FORCE        accept a trust cache TXM refused, so the cryptex graft proceeds
   AURA_SHARE_NVRAM         let the guest reach the real NVRAM (a failed boot pollutes it)
@@ -133,7 +131,6 @@ KNOWN_ENV = {
     "AURA_GPU_PRINT_MAX",
     "AURA_SAMPLE_HZ",
     "AURA_SAMPLE_MAX",
-    "AURA_XNU_ENTRY",
     "AURA_XNU_RO_RELAX",
     "AURA_SHARE_NVRAM",
     "AURA_XNU_TC_FORCE",
@@ -484,31 +481,6 @@ def patch_xnu(p, sym, plan, patches):
         p.write32(pa, new)
         p.call(sym["sptm_virt_flush"], pa & ~0x3f, 0x80)
         print(f"XNU {what}: [0x{pa:x}] 0x{before:08x} -> 0x{p.read32(pa):08x}")
-
-
-def patch_xnu_entry(p, sym, plan, kernelcache):
-    """AURA_XNU_ENTRY: patch the guest kernelcache's acct(2) so a root process reaches aura's
-    control hvc with no kext (the auractl "xnu" entry, aura/auractl_xnu.py). The site is located in
-    the kernelcache file, build-independently and fail-closed; the words it overwrites are verified
-    against the loaded BootKC before the write, so a mismatched kernelcache stops the boot."""
-    from aura.auractl_xnu import AURACTL_HVC_IMM, XnuEntryError, find_acct_entry
-
-    try:
-        entry = find_acct_entry(kernelcache)
-    except XnuEntryError as e:
-        raise SystemExit(f"AURA_XNU_ENTRY: cannot place the acct() entry: {e}")
-    base = plan.regions["BootKC-rx"][0]
-    site = base + entry["text_off"]
-    for i, want in enumerate(entry["expected"]):
-        have = p.read32(site + 4 * i)
-        if have != want:
-            raise SystemExit(f"AURA_XNU_ENTRY: acct site [0x{site + 4 * i:x}] = 0x{have:08x}, the "
-                             f"finder read 0x{want:08x} from the file: wrong kernelcache loaded")
-    for i, new in enumerate(entry["replacement"]):
-        p.write32(site + 4 * i, new)
-    p.call(sym["sptm_virt_flush"], site & ~0x3f, 0x80 + len(entry["replacement"]) * 4)
-    print(f"XNU auractl entry: acct() 0x{entry['acct_va']:x}, 5 instructions at 0x{site:x} "
-          f"(uap in x{entry['uap_reg']}) -> hvc #0x{AURACTL_HVC_IMM:x}, b 0x{entry['epilogue_va']:x}")
 
 
 def set_xnu_rorgn(p, sym, plan, quirks):
@@ -882,8 +854,6 @@ def main():
         patch_xnu(p, sym, plan, quirks["nvram_ro"])
     if env_on("AURA_XNU_TC_FORCE") and quirks.get("tc_force"):
         patch_xnu(p, sym, plan, quirks["tc_force"])
-    if env_on("AURA_XNU_ENTRY"):
-        patch_xnu_entry(p, sym, plan, images["xnu"])
     configure(p, sym, plan, live_adt)
     if p.call(sym["sptm_virt_load"], entry, handoff) != 0:
         raise SystemExit("sptm_virt_load rejected the entry/handoff (see aura's console)")

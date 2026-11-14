@@ -2,8 +2,7 @@
 /*
  * The guest-side entry: how a process hands its request block to the guest's kernel, which
  * issues aura's hvc with it (src/auractl_abi.h). `make ENTRY=<name>` picks entry_<name>.c:
- * `iokit` (entry_iokit.c) goes through the AuractlDevice kext in this tree; `xnu`
- * (entry_xnu.c) calls an acct(2) the host patched into the hvc, with no kext; `none`
+ * `iokit` (entry_iokit.c) goes through the AuractlDevice kext in this tree; `none`
  * (entry_none.c) refuses every call, so only `auractl print` works. A guest with a different
  * kernel path can add its own entry_<name>.c.
  */
