@@ -35,6 +35,7 @@
 #include "mcc.h"
 #include "pmgr.h"
 #include "soc.h"
+#include "t6050_unmodelled.h"
 #include "types.h"
 #include "utils.h"
 
@@ -47,6 +48,22 @@ u32 chip_id;
 volatile enum exc_guard_t exc_guard;
 volatile int exc_count;
 struct fw_version_info os_firmware;
+const struct fw_version_info fw_versions[V26_6_2 + 1] = {
+    [V14_7] = {V14_7, "14.7", {14, 7, 0}, 3, "iBoot"},
+    [V26_6_2] = {V26_6_2, "26.6.2", {26, 6, 2}, 3, "mBoot-18000.161.10"},
+};
+
+/* As src/firmware.c: an iBoot of the 18000.161.10 train loads the 26.6.2 images. */
+enum fw_version firmware_os_components(void)
+{
+    static const char train[] = "mBoot-18000.161.10.";
+
+    if (os_firmware.version == V26_6_2)
+        return V26_6_2;
+    if (os_firmware.iboot && !strncmp(os_firmware.iboot, train, sizeof(train) - 1))
+        return V26_6_2;
+    return os_firmware.version;
+}
 size_t mcc_carveout_count;
 struct mcc_carveout mcc_carveouts[8];
 static u64 ram_base, ram_size, fb_base;
@@ -706,6 +723,7 @@ static const char J616S[] = "apple,j616s\0apple,t6040\0apple,arm-platform";
 static const char OTHER[] = "apple,j999s\0apple,t6040\0apple,arm-platform";
 static const char J614S[] = "apple,j614s\0apple,t6040\0apple,arm-platform";
 static const char J616C[] = "apple,j616c\0apple,t6041\0apple,arm-platform";
+static const char J614C[] = "apple,j614c\0apple,t6041\0apple,arm-platform";
 
 /* ---- checks ---- */
 
@@ -854,7 +872,7 @@ static void contract_check(const void *dt)
     const u32 v26[3] = {26, 6, 2};
     check(u32s_are(dt, dcp, "apple,firmware-version", v26, 3) &&
               u32s_are(dt, dcp, "apple,firmware-compat", v26, 3),
-          "published: dcp apple,firmware-version and -compat are 26.6.2");
+          "published: dcp apple,firmware-version and -compat are the 26.6.2 images");
 
     check(linked_segments(dt, dcp) == (1u << NSEGS) - 1 && region_count(dt, dcp) == NSEGS,
           "published: every iop-dcp-nub segment is one dcp memory-region");
@@ -983,6 +1001,7 @@ static const struct scenario scenarios[] = {
     {"stale-optin-zero", PUBLISH, "a left-over chosen.asahi,t6041-dcp=0 does not disable it"},
     {"repeat", PUBLISH, "a second call adds nothing"},
     {"oslog-in-memreserve", PUBLISH, "an __OS_LOG wholly inside a /memreserve/ is still described"},
+    {"os-26-7-train", PUBLISH, "26.7.1 booted by an 18000.161.10 train iBoot publishes the 26.6.2 images"},
     /* chip, board and device tree */
     {"wrong-chip", NOTHING, "chip T6041 with a T6040 device tree"},
     {"wrong-board", NOTHING, "an unsupported T6040 board"},
@@ -991,6 +1010,9 @@ static const struct scenario scenarios[] = {
     {"j616c", PUBLISH, "a J616C (chip T6041) boot publishes"},
     {"j616c-external", PUBLISH, "J616C external firmware memories come from the ADT"},
     {"j616c-on-t6040", NOTHING, "chip T6040 with a J616C device tree"},
+    {"j614c", PUBLISH, "a J614C (chip T6041) boot publishes"},
+    {"j614c-external", PUBLISH, "J614C external firmware memories come from the ADT"},
+    {"j614c-on-t6040", NOTHING, "chip T6040 with a J614C device tree"},
     {"no-display-dt", NOTHING, "a J616s device tree without the display block"},
     {"no-dcp-alias", NOTHING, "a J616s device tree without the dcp alias"},
     {"wrong-dcp-compat", NOTHING, "dcp is not apple,t6041-dcp"},
@@ -1020,6 +1042,7 @@ static const struct scenario scenarios[] = {
     {"wrong-dcp-reg", REFUSE, "the ADT dart-dcp is not at the T6041 address"},
     {"wrong-sid", REFUSE, "dcp iommus is not dart-dcp SID 23"},
     {"dcp-enabled", REFUSE, "the dcp node is not disabled"},
+    {"display-enabled", REFUSE, "the display subsystem is not disabled"},
     {"dart-enabled", REFUSE, "the dcp DART is not disabled"},
     {"mbox-enabled", REFUSE, "the dcp mailbox is not disabled"},
     {"no-piodma", REFUSE, "the device tree has no piodma"},
@@ -1063,14 +1086,17 @@ int main(int argc, char **argv)
     world_j616s(&o);
 
     static u8 dt[DT_SIZE], in[DT_SIZE];
-    bool j616c = !strncmp(s, "j616c", 5);
+    bool j616c = !strncmp(s, "j616c", 5), j614c = !strncmp(s, "j614c", 5);
     _Static_assert(sizeof(J616C) == sizeof(J616S), "root compatibles of equal length");
+    _Static_assert(sizeof(J614C) == sizeof(J616S), "root compatibles of equal length");
     const char *board = is(s, "wrong-board")                            ? OTHER
                         : (is(s, "j614-no-optin") || is(s, "j614-optin")) ? J614S
                         : j616c                                          ? J616C
+                        : j614c                                          ? J614C
                                                                          : J616S;
     build_dt(dt, board, sizeof(J616S));
-    if (is(s, "external") || is(s, "external-refuse") || is(s, "j616c-external")) {
+    if (is(s, "external") || is(s, "external-refuse") || is(s, "j616c-external") ||
+        is(s, "j614c-external")) {
         for (int i = 0; i < 2; i++) {
             build_ext(dt, i);
             world_ext(i);
@@ -1080,7 +1106,8 @@ int main(int argc, char **argv)
     }
 
     /* ADT side */
-    if (is(s, "wrong-chip") || (j616c && !is(s, "j616c-on-t6040")))
+    if (is(s, "wrong-chip") || (j616c && !is(s, "j616c-on-t6040")) ||
+        (j614c && !is(s, "j614c-on-t6040")))
         chip_id = T6041;
     if (is(s, "no-adt-nub"))
         node_drop("/arm-io/dcp/iop-dcp-nub");
@@ -1100,6 +1127,8 @@ int main(int argc, char **argv)
         prop_drop("/arm-io/dcp", "clock-gates");
     if (is(s, "wrong-os") || is(s, "stale-optin-wrong-os"))
         os_firmware = (struct fw_version_info){V14_7, "14.7", {14, 7, 0}, 3, "iBoot"};
+    if (is(s, "os-26-7-train"))
+        os_firmware = (struct fw_version_info){V26_7, "26.7", {26, 7, 0}, 3, "mBoot-18000.161.10.701.1"};
     if (is(s, "unknown-os"))
         os_firmware = (struct fw_version_info){V_UNKNOWN, "unknown", {0}, 0, "unknown"};
     if (is(s, "bad-uuid"))
@@ -1129,6 +1158,8 @@ int main(int argc, char **argv)
         iommus(dt, dcp, PH_DART_DCP, 5);
     if (is(s, "dcp-enabled"))
         OK(fdt_setprop_string(dt, dcp, "status", "okay"));
+    if (is(s, "display-enabled"))
+        OK(fdt_setprop_string(dt, alias_node(dt, "disp0"), "status", "okay"));
     if (is(s, "dart-enabled"))
         OK(fdt_setprop_string(dt, fdt_node_offset_by_phandle(dt, PH_DART_DCP), "status", "okay"));
     if (is(s, "mbox-enabled"))
@@ -1170,7 +1201,8 @@ int main(int argc, char **argv)
     check(ret == 0, "dt_set_display_handoff() returns 0");
     check(exc_count == 0, "no MMIO access faulted");
 
-    if (is(s, "external") || is(s, "external-refuse")) {
+    if (is(s, "external") || is(s, "external-refuse") || is(s, "j616c-external") ||
+        is(s, "j614c-external")) {
         for (int i = 0; i < 2; i++) {
             char path[40];
             snprintf(path, sizeof(path), "/dcp@%llx", (unsigned long long)(i ? EXT1 : EXT0));

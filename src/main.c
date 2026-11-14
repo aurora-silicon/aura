@@ -10,6 +10,7 @@
 #include "boot_options.h"
 #include "chainload.h"
 #include "cpufreq.h"
+#include "debugport.h"
 #include "display.h"
 #include "dockchannel_uart.h"
 #include "exception.h"
@@ -18,6 +19,7 @@
 #include "gxf.h"
 #include "heapblock.h"
 #include "j873.h"
+#include "kboot.h"
 #include "mcc.h"
 #include "memory.h"
 #include "nvme.h"
@@ -25,6 +27,7 @@
 #include "pcie.h"
 #include "pmgr.h"
 #include "pmu_counter.h"
+#include "secboot.h"
 #include "sep.h"
 #include "smp.h"
 #include "stage1_config.h"
@@ -103,7 +106,7 @@ static bool stage1_wait_request_window(void)
 
 bool stage1_proxy_request_window(void)
 {
-    if (stage1_window_done || stage1_chained)
+    if (stage1_window_done || stage1_chained || !secboot_host_proxy_allowed())
         return false;
     stage1_window_done = true;
     printf("Stage 1: aura-proxy on the ESP, waiting %u s for a host\n",
@@ -119,11 +122,18 @@ bool stage1_window_offered(void)
 
 /*
  * A boot started by a VDM `reboot debugusb` with a host reading the DockChannel console gets the
- * aura-proxy window, once per chain: not after an earlier aura stage offered one.
+ * aura-proxy window, once per chain: not after an earlier aura stage offered one. An ESP Stage 2
+ * goes by aura.host-window alone: a Stage 1 without this window chains it with nvme.adopt too,
+ * and the host would otherwise have no window at all.
  */
 bool debugusb_proxy_window(void)
 {
-    if (stage1_window_done || stage1_chained || stage1_window_passed ||
+#ifdef ESP_STAGE2
+    bool offered = stage1_window_passed;
+#else
+    bool offered = stage1_chained || stage1_window_passed;
+#endif
+    if (stage1_window_done || offered || !secboot_host_proxy_allowed() ||
         !dockchannel_uart_host_seen())
         return false;
     stage1_window_done = true;
@@ -151,6 +161,7 @@ static void stage1_read_boot_record(void)
 bool stage1_recovery_window(void)
 {
     if (stage1_window_done || stage1_chained || !stage1_boot_record_valid ||
+        !secboot_host_proxy_allowed() ||
         !stage1_previous_boot_stopped_early(stage1_boot_counts, stage1_boot_error_stage))
         return false;
     stage1_window_done = true;
@@ -178,11 +189,16 @@ void run_actions(void)
     enum stage1_proxy_result window_result = STAGE1_PROXY_TIMEOUT;
     enum stage1_payload_action payload_action;
 
-    u32 window_ms = stage1_config_window_ms();
+    /* An enforcing build never gives a USB host the proxy: it would run unsigned code. */
+    u32 window_ms = secboot_host_proxy_allowed() ? stage1_config_window_ms() : 0;
     /* aura-proxy: wait for a host, then boot as normal if none came. */
-    if (aura_proxy_enabled() && window_ms < STAGE1_PROXY_REQUEST_MS) {
+    if (aura_proxy_enabled() && secboot_host_proxy_allowed() &&
+        window_ms < STAGE1_PROXY_REQUEST_MS) {
         printf("aura-proxy: waiting %u s for a host\n", STAGE1_PROXY_REQUEST_MS / 1000);
         window_ms = STAGE1_PROXY_REQUEST_MS;
+    } else if (window_ms) {
+        /* Announced as aura-proxy's window is: host tools claim the window on this line */
+        printf("Stage 1: waiting %u s for a host\n", window_ms / 1000);
     }
     if (window_ms) {
         window_result = stage1_window_result = uartproxy_wait_stage1(window_ms);
@@ -204,7 +220,8 @@ void run_actions(void)
         printf("Boot policy: sip0 = %ld\n", lp_sip0);
     }
 
-    if (chip_id != T8140 && !cur_boot_args.video.display && lp_sip0 == 127) {
+    if (chip_id != T8140 && !cur_boot_args.video.display && lp_sip0 == 127 &&
+        secboot_host_proxy_allowed()) {
         if (!usb_up) {
             printf("Bringing up USB for early debug...\n");
             usb_init();
@@ -268,9 +285,26 @@ void run_actions(void)
                "  Check that the file this Stage 1 names exists on its EFI partition.\n"
                "  Hold the power button to shut down, then hold it again to choose another "
                "system.\n");
+    if (stage1_config_target() && wdt_boot_watchdog_armed())
+        printf("  Without a host, this Mac restarts by itself within %u s to try again.\n",
+               WDT_BOOT_SECONDS);
 
     if (payload_action == STAGE1_PAYLOAD_HALT)
         panic("Stage 1: no safe proxy carrier after CDC failure\n");
+
+    if (!secboot_host_proxy_allowed()) {
+        /* Shown on the panel. No proxy: a host could run anything through it. */
+        /*
+         * Shown on the panel. Never stop here: nobody may be at the Mac. A Stage 1 reboots into
+         * the same check (the owner can choose another system at startup); a Stage 2 reboots to
+         * Stage 1, which boots its configured image.
+         */
+        printf("\nSecure boot: no verified next stage could be started, and this build gives\n"
+               "  no USB host a proxy. Rebooting in 10 s. To stop, hold the power button and\n"
+               "  choose another system; then reinstall a signed Stage 2.\n");
+        mdelay(10000);
+        flush_and_reboot();
+    }
 
 #ifndef BRINGUP
     /* A proxy window brought USB up already; a second bring-up would register its ports twice. */
@@ -283,6 +317,16 @@ void run_actions(void)
     printf("Running proxy...\n");
 
     uartproxy_run(NULL);
+}
+
+/*
+ * Late, on the way out: loading a payload covers the port controllers' settle time. The check
+ * leaves every port controller asleep, so wake the USB hosts' ones again, as j873_usb_prep() did.
+ */
+static void j873g_debugport_check(void)
+{
+    debugport_check();
+    j873_usb_wake_hpms();
 }
 
 static void j873g_run_proxy(void)
@@ -303,6 +347,8 @@ static void j873g_run_proxy(void)
     wdt_disable();
     if (smp_init() < 0)
         panic("Unsupported T8152 CPU topology\n");
+    /* Its SPMI port controllers need time in S0 before j873g_debugport_check() reads them. */
+    debugport_powerup();
     /* The DCPEXT0/DPTX_PHY power gates are PMGR2 devices; without this the
      * HDMI phy stays gated and the first register access aborts. */
     pmgr_init();
@@ -320,16 +366,31 @@ static void j873g_run_proxy(void)
     printf("Initialization complete.\n");
 
     /* An appended payload (or boot= from storage) boots directly. */
-    if (!aura_proxy_enabled()) {
+#ifdef SECBOOT_SECURE_FLAVOUR
+    /* The secure flavour has no proxy (secboot_host_proxy_allowed()): always boot the payload. */
+    const bool check_payloads = true;
+#else
+    const bool check_payloads = !aura_proxy_enabled();
+#endif
+    if (check_payloads) {
         printf("Checking for payloads...\n");
         if (payload_run() == 0) {
             printf("Valid payload found\n");
+            j873g_debugport_check();
             return;
         }
         printf("No valid payload found\n");
     }
+#ifdef SECBOOT_SECURE_FLAVOUR
+    printf("\nSecure boot: no verified next stage could be started, and this build gives\n"
+           "  no USB host a proxy. Rebooting in 10 s.\n");
+    mdelay(10000);
+    flush_and_reboot();
+#else
+    j873g_debugport_check();
     printf("Running proxy...\n");
     uartproxy_run(NULL);
+#endif
 }
 
 void aura_main(void)
@@ -361,6 +422,12 @@ void aura_main(void)
     wdt_disable();
     if (aura_trial_enabled() && wdt_arm_trial())
         printf("WDT: could not arm the trial watchdog\n");
+#if defined(CHAINLOADING) && !defined(ESP_STAGE2)
+    else if (!aura_trial_enabled() && wdt_arm_boot())
+        printf("WDT: could not arm the boot watchdog\n");
+    else if (!aura_trial_enabled())
+        printf("WDT: boot watchdog armed (%u s)\n", WDT_BOOT_SECONDS);
+#endif
 #ifndef BRINGUP
     if (pmgr_init() && chip_id == T8140)
         panic("T8140 PMGR initialization failed\n");
@@ -391,8 +458,8 @@ void aura_main(void)
 #if defined(CHAINLOADING) && !defined(ESP_STAGE2)
     stage1_read_boot_record();
 #endif
-    /* T6040, T8140: nothing else in an aura tether chain clears iBoot's failed-boot count. */
-    if (chip_id == T6040 || chip_id == T8140)
+    /* T6040, T8140, T6050: nothing else in an aura chain clears iBoot's failed-boot count. */
+    if (chip_id == T6040 || chip_id == T8140 || chip_id == T6050)
         pmu_clear_panic_counter();
 
     printf("Initialization complete.\n");
@@ -412,6 +479,8 @@ next_stage:
 
     if (!nvme_shutdown()) {
         printf("NVMe handoff failed; returning to proxy\n");
+        if (!secboot_host_proxy_allowed())
+            flush_and_reboot();
         uartproxy_run(NULL);
         panic("NVMe handoff failed\n");
     }
@@ -420,9 +489,17 @@ next_stage:
 #ifndef BRINGUP
     if (chip_id != T8152) {
         usb_iodev_shutdown();
+        /*
+         * A controller that could not be stopped keeps its buffers: boot on with
+         * them reserved, so the kernel never hands out memory it may still write.
+         */
+        if (kboot_reserve_usb_dma())
+            printf("USB: retained DMA not fully reserved; booting on\n");
         /* Its firmware may still use memory the next stage will reuse. */
         if (display_shutdown(DCP_SLEEP_IF_EXTERNAL) < 0) {
             printf("Display handoff failed; returning to proxy\n");
+            if (!secboot_host_proxy_allowed())
+                flush_and_reboot();
             uartproxy_run(NULL);
             panic("Display handoff failed\n");
         }

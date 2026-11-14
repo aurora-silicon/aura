@@ -92,6 +92,12 @@
 #define DART_GEN3_PTE_OFFSET GENMASK(37, 10)
 #define DART_GEN3_ROUTE      0x4604
 
+/* Low word of the 128-bit TLBI aperture payload. */
+#define DART_GEN3_TLBI_OP_SID     BIT(60)
+#define DART_GEN3_TLBI_ROUTE      GENMASK(59, 56)
+#define DART_GEN3_TLBI_SID        GENMASK(55, 48)
+#define DART_GEN3_TLBI_TIMEOUT_US 1000
+
 #define DART_TCR(dart) (dart->regs + dart->params->tcr_off + 4 * dart->device)
 #define DART_TTBR(dart, idx)                                                                       \
     (dart->regs + dart->params->ttbr_off + 4 * dart->params->ttbr_count * dart->device + 4 * idx)
@@ -116,6 +122,9 @@ struct dart_params {
 };
 
 struct dart_dev {
+    /* A TLB invalidation timed out: the DART may still translate through
+     * entries software has changed, so nothing it can reach may be freed. */
+    bool failed;
     bool locked;
     bool keep;
     bool legacy_mutable;
@@ -149,44 +158,78 @@ static inline bool dart_locked_pt_writable(dart_dev_t *dart)
 
 static void dart_t8020_tlb_invalidate(dart_dev_t *dart)
 {
+    if (dart->failed)
+        return;
     write32(dart->regs + DART_T8020_STREAM_SELECT, BIT(dart->device));
 
     /* ensure that the DART can see the updated pagetables before invalidating */
     dma_wmb();
     write32(dart->regs + DART_T8020_STREAM_COMMAND, DART_T8020_STREAM_COMMAND_INVALIDATE);
 
-    if (poll32(dart->regs + DART_T8020_STREAM_COMMAND, DART_T8020_STREAM_COMMAND_BUSY, 0, 100))
+    if (poll32(dart->regs + DART_T8020_STREAM_COMMAND, DART_T8020_STREAM_COMMAND_BUSY, 0, 100)) {
         printf("dart: DART_T8020_STREAM_COMMAND_BUSY did not clear.\n");
+        dart->failed = true;
+    }
 }
 
 static void dart_t8110_tlb_invalidate(dart_dev_t *dart)
 {
+    if (dart->failed)
+        return;
     /* ensure that the DART can see the updated pagetables before invalidating */
     dma_wmb();
     write32(dart->regs + DART_T8110_TLB_CMD,
             FIELD_PREP(DART_T8110_TLB_CMD_OP, DART_T8110_TLB_CMD_OP_FLUSH_SID) |
                 FIELD_PREP(DART_T8110_TLB_CMD_STREAM, dart->device));
 
-    if (poll32(dart->regs + DART_T8110_TLB_CMD, DART_T8110_TLB_CMD_BUSY, 0, 100))
+    if (poll32(dart->regs + DART_T8110_TLB_CMD, DART_T8110_TLB_CMD_BUSY, 0, 100)) {
         printf("dart: DART_T8110_TLB_CMD_BUSY did not clear.\n");
+        dart->failed = true;
+    }
 }
 
-/* 26A428 SPTM gen3dart_write_tlbi_cmd_payload: a 128-bit aperture write,
- * followed by VALE1OS, broadcasts a SID invalidation. The old +0x80 command
- * register is used for translation queries, not this invalidation path.
- * DCP SID 23 accepted this sequence on J873g without an exception. */
-static void dart_gen3_tlb_invalidate(dart_dev_t *dart)
+/* A 128-bit aperture write, followed by VALE1OS, broadcasts a SID
+ * invalidation. The old +0x80 command register is used for translation
+ * queries, not this invalidation path. DCP SID 23 accepted this sequence on
+ * J873g without an exception. */
+static inline void dart_gen3_tlbi_broadcast(uintptr_t aperture, u64 lo, u64 hi)
 {
-    u64 lo = BIT(60) | ((u64)dart->tlbi_route << 56) | ((u64)dart->device << 48);
-    u64 hi = 0;
-    dma_wmb();
     asm volatile("stp %0, %1, [%2]\n"
                  "dsb ish\n"
                  ".inst 0xd50881bf\n" /* tlbi vale1os, xzr */
                  "dsb osh\n"
                  :
-                 : "r"(lo), "r"(hi), "r"(dart->tlbi_aperture)
+                 : "r"(lo), "r"(hi), "r"(aperture)
                  : "memory");
+}
+
+/* Gen3 has no busy bit to poll: the final DSB returns only once the broadcast
+ * invalidation has completed. Time it instead. One that takes longer than this
+ * means the DART or the fabric stalled, and the domain is marked failed just as
+ * a busy bit that does not clear marks a T8020/T8110 domain. The bound is ten
+ * times their 100 us poll, to leave room for the broadcast to reach every
+ * cluster. */
+static void dart_gen3_tlb_invalidate(dart_dev_t *dart)
+{
+    if (dart->failed)
+        return;
+    if (!dart->tlbi_aperture || (dart->tlbi_aperture & 15)) {
+        printf("dart: Gen3 SID %u has no usable TLBI aperture.\n", dart->device);
+        dart->failed = true;
+        return;
+    }
+
+    u64 lo = DART_GEN3_TLBI_OP_SID | FIELD_PREP(DART_GEN3_TLBI_ROUTE, dart->tlbi_route) |
+             FIELD_PREP(DART_GEN3_TLBI_SID, dart->device);
+    /* ensure that the DART can see the updated pagetables before invalidating */
+    dma_wmb();
+    u64 start = get_ticks();
+    dart_gen3_tlbi_broadcast(dart->tlbi_aperture, lo, 0);
+    u64 us = ticks_to_usecs(get_ticks() - start);
+    if (us > DART_GEN3_TLBI_TIMEOUT_US) {
+        printf("dart: Gen3 TLBI for SID %u took %lu us.\n", dart->device, (unsigned long)us);
+        dart->failed = true;
+    }
 }
 
 const struct dart_params dart_t8020 = {
@@ -491,8 +534,7 @@ dart_dev_t *dart_init(uintptr_t base, u8 device, bool keep_pts, enum dart_type_t
     return dart;
 
 error:
-    if (!dart->locked)
-        free(dart->l1);
+    /* Roots already written to a TTBR stay published, so they are not freed. */
     free(dart);
     return NULL;
 }
@@ -824,9 +866,95 @@ int dart_collect_locked_tables(dart_dev_t *dart, u64 dram_base, u64 dram_size, u
     return 0;
 }
 
+/* Collect ownership from the same two-level translation accepted by the native
+ * page walker. This does not construct a DART view or write stream state. */
+int dart_collect_native_t8110(uintptr_t base, u8 sid, u64 dram_base, u64 dram_size, u64 *pages,
+                              size_t capacity, size_t *count, char *detail, size_t detail_size)
+{
+    if (!count || !detail || !detail_size)
+        return -2;
+    snprintf(detail, detail_size, "substep=arguments sid=%u capacity=%zu dram=%lx+%lx", sid,
+             capacity, dram_base, dram_size);
+    *count = 0;
+    if (sid >= 16 || !pages || !capacity || dram_size < SZ_16K ||
+        dram_base + dram_size <= dram_base)
+        return -2;
+    snprintf(detail, detail_size, "substep=control-read sid=%u", sid);
+    u32 protect = read32(base + DART_T8110_PROTECT);
+    u32 tcr = read32(base + DART_T8110_TCR_OFF + 4 * sid);
+    u32 ttbr = read32(base + DART_T8110_TTBR_OFF + 4 * sid);
+    printf("dart: native table collection sid=%u protect=%x tcr=%x ttbr=%x\n", sid, protect, tcr,
+           ttbr);
+    if (!(protect & DART_T8110_PROTECT_TTBR_TCR) || !(tcr & DART_T8110_TCR_TRANSLATE_ENABLE) ||
+        (tcr & (DART_T8110_TCR_BYPASS_DART | DART_T8110_TCR_REMAP_EN)) ||
+        !(ttbr & DART_T8110_TTBR_VALID)) {
+        snprintf(detail, detail_size,
+                 "substep=controls protect=%x tcr=%x ttbr=%x "
+                 "expected=locked,translate,!bypass,!remap,valid-root",
+                 protect, tcr, ttbr);
+        printf("dart: native table collection refused: %s\n", detail);
+        return -3;
+    }
+    u64 root = FIELD_GET(DART_T8110_TTBR_ADDR, ttbr) << DART_T8110_TTBR_SHIFT;
+    if (!dart_table_in_dram(root, dram_base, dram_size)) {
+        snprintf(detail, detail_size, "substep=root-bounds root=%lx bytes=%lx dram=%lx+%lx", root,
+                 (u64)SZ_16K, dram_base, dram_size);
+        printf("dart: native table collection refused: %s\n", detail);
+        return -4;
+    }
+    u64 entries[SZ_16K / sizeof(u64)];
+    snprintf(detail, detail_size, "substep=root-read root=%lx expected-bytes=%lx", root,
+             (u64)sizeof(entries));
+    memcpy(entries, (void *)root, sizeof(entries));
+    size_t used = 1;
+    pages[0] = root;
+    for (size_t i = 0; i < ARRAY_SIZE(entries); i++) {
+        if (!(entries[i] & DART_PTE_VALID))
+            continue;
+        u64 page = FIELD_GET(DART_T6000_PTE_OFFSET, entries[i]) << DART_PTE_OFFSET_SHIFT;
+        if (!dart_table_in_dram(page, dram_base, dram_size) || page == root) {
+            snprintf(
+                detail, detail_size,
+                "substep=L1-target l1=%zu descriptor=%lx page=%lx bytes=%lx root=%lx dram=%lx+%lx",
+                i, entries[i], page, (u64)SZ_16K, root, dram_base, dram_size);
+            printf("dart: native table collection refused: %s\n", detail);
+            return -5;
+        }
+        size_t j;
+        for (j = 0; j < used && pages[j] != page; j++)
+            ;
+        if (j != used)
+            continue;
+        if (used == capacity) {
+            snprintf(detail, detail_size,
+                     "substep=capacity l1=%zu expected-pages=%zu actual-capacity=%zu", i, used + 1,
+                     capacity);
+            printf("dart: native table collection refused: %s\n", detail);
+            return -6;
+        }
+        pages[used++] = page;
+    }
+    u32 final_protect = read32(base + DART_T8110_PROTECT);
+    u32 final_tcr = read32(base + DART_T8110_TCR_OFF + 4 * sid);
+    u32 final_ttbr = read32(base + DART_T8110_TTBR_OFF + 4 * sid);
+    if (memcmp(entries, (void *)root, sizeof(entries)) || final_protect != protect ||
+        final_tcr != tcr || final_ttbr != ttbr) {
+        snprintf(detail, detail_size,
+                 "substep=snapshot-changed root=%lx expected=%x/%x/%x actual=%x/%x/%x "
+                 "(protect/tcr/ttbr)",
+                 root, protect, tcr, ttbr, final_protect, final_tcr, final_ttbr);
+        printf("dart: native table collection refused: %s\n", detail);
+        return -7;
+    }
+    *count = used;
+    snprintf(detail, detail_size, "substep=accepted root=%lx pages=%zu", root, used);
+    printf("dart: native table collection accepted root=%lx pages=%zu\n", root, used);
+    return 0;
+}
+
 int dart_setup_pt_region(dart_dev_t *dart, const char *path, int device, u64 vm_base)
 {
-    if (dart->locked && !dart_locked_pt_writable(dart))
+    if (dart->failed || (dart->locked && !dart_locked_pt_writable(dart)))
         return -1;
 
     int node = adt_path_offset(adt, path);
@@ -906,6 +1034,8 @@ int dart_setup_pt_region(dart_dev_t *dart, const char *path, int device, u64 vm_
         }
 
         dart->params->tlb_invalidate(dart);
+        if (dart->failed)
+            return -1;
     }
 
     return 0;
@@ -972,7 +1102,7 @@ static int dart_map_page(dart_dev_t *dart, uintptr_t iova, uintptr_t paddr, u32 
 
 int dart_map_flags(dart_dev_t *dart, uintptr_t iova, void *bfr, size_t len, u32 flags)
 {
-    if (dart->locked && !dart->legacy_mutable && !dart_locked_pt_writable(dart))
+    if (dart->failed || (dart->locked && !dart->legacy_mutable && !dart_locked_pt_writable(dart)))
         return -1;
 
     uintptr_t paddr = (uintptr_t)bfr;
@@ -997,7 +1127,8 @@ int dart_map_flags(dart_dev_t *dart, uintptr_t iova, void *bfr, size_t len, u32 
     }
 
     dart->params->tlb_invalidate(dart);
-    return 0;
+    /* The pages may already be visible to the device: the caller keeps them. */
+    return dart->failed ? -1 : 0;
 }
 
 int dart_map(dart_dev_t *dart, uintptr_t iova, void *bfr, size_t len)
@@ -1022,15 +1153,18 @@ static void dart_unmap_page(dart_dev_t *dart, uintptr_t iova)
     l2[l2_index] = 0;
 }
 
-void dart_unmap(dart_dev_t *dart, uintptr_t iova, size_t len)
+/* True only when the range is unmapped and the TLB invalidation completed, so the
+ * pages behind it can be reused. */
+bool dart_unmap_checked(dart_dev_t *dart, uintptr_t iova, size_t len)
 {
-    if (dart->locked && !dart->legacy_mutable && !dart_locked_pt_writable(dart))
-        return;
+    if (!dart || dart->failed ||
+        (dart->locked && !dart->legacy_mutable && !dart_locked_pt_writable(dart)))
+        return false;
 
     if (len % SZ_16K)
-        return;
+        return false;
     if (iova % SZ_16K)
-        return;
+        return false;
 
     while (len) {
         dart_unmap_page(dart, iova);
@@ -1040,11 +1174,17 @@ void dart_unmap(dart_dev_t *dart, uintptr_t iova, size_t len)
     }
 
     dart->params->tlb_invalidate(dart);
+    return !dart->failed;
+}
+
+void dart_unmap(dart_dev_t *dart, uintptr_t iova, size_t len)
+{
+    (void)dart_unmap_checked(dart, iova, len);
 }
 
 void dart_free_l2(dart_dev_t *dart, uintptr_t iova)
 {
-    if (dart->locked && !dart_locked_pt_writable(dart))
+    if (dart->failed || (dart->locked && !dart_locked_pt_writable(dart)))
         return;
 
     if (iova & ((1 << 25) - 1)) {
@@ -1055,10 +1195,15 @@ void dart_free_l2(dart_dev_t *dart, uintptr_t iova)
     u32 ttbr = (iova >> 36) & 0x3;
     u32 l1_index = (iova >> 25) & 0x7ff;
 
-    if (!(dart->l1[ttbr][l1_index] & DART_PTE_VALID))
+    if (ttbr >= (u32)dart->params->ttbr_count || !dart->l1[ttbr])
+        return;
+    u64 entry = dart->l1[ttbr][l1_index];
+    if (!(entry & DART_PTE_VALID))
         return;
 
-    u64 *l2 = dart_get_l2(dart, l1_index);
+    /* The table behind this root's entry: never look one up (or allocate one)
+     * by the L1 index alone, which would land under root 0. */
+    u64 *l2 = (u64 *)(FIELD_GET(dart->params->offset_mask, entry) << DART_PTE_OFFSET_SHIFT);
 
     for (u32 idx = 0; idx < 2048; idx++) {
         if (l2[idx] & DART_PTE_VALID) {
@@ -1284,11 +1429,18 @@ u64 dart_find_iova(dart_dev_t *dart, s64 start, size_t len)
     return DART_PTR_ERR;
 }
 
-void dart_shutdown(dart_dev_t *dart)
+/*
+ * Disable the stream, then free its tables only once the invalidation that
+ * retires them has completed. On failure the domain and every table stay
+ * allocated, because the DART may still walk them.
+ */
+bool dart_shutdown_checked(dart_dev_t *dart)
 {
+    if (!dart || dart->failed)
+        return false;
     if (dart->locked || dart->keep) {
         free(dart);
-        return;
+        return true;
     }
 
     write32(DART_TCR(dart), dart->params->tcr_disabled);
@@ -1297,24 +1449,80 @@ void dart_shutdown(dart_dev_t *dart)
         if (is_heap(dart->l1[i]))
             write32(DART_TTBR(dart, i), 0);
 
+    dart->params->tlb_invalidate(dart);
+    if (dart->failed)
+        return false;
+
     for (int ttbr = 0; ttbr < dart->params->ttbr_count; ++ttbr) {
+        if (!dart->l1[ttbr])
+            continue;
         for (int i = 0; i < SZ_16K / 8; ++i) {
-            if (dart->l1[ttbr][i] & DART_PTE_VALID) {
-                void *l2 = dart_get_l2(dart, i);
-                if (is_heap(l2)) {
-                    free(l2);
-                    dart->l1[ttbr][i] = 0;
-                }
+            u64 entry = dart->l1[ttbr][i];
+            if (!(entry & DART_PTE_VALID))
+                continue;
+            void *l2 =
+                (void *)(FIELD_GET(dart->params->offset_mask, entry) << DART_PTE_OFFSET_SHIFT);
+            if (is_heap(l2)) {
+                free(l2);
+                dart->l1[ttbr][i] = 0;
             }
         }
     }
-
-    dart->params->tlb_invalidate(dart);
 
     for (int i = 0; i < dart->params->ttbr_count; ++i)
         if (is_heap(dart->l1[i]))
             free(dart->l1[i]);
     free(dart);
+    return true;
+}
+
+/*
+ * The tables a DART aura set up may still walk when its shutdown failed:
+ * every heap root and every heap L2 table its roots point to. Locked and
+ * kept DARTs have none of aura's; their tables are reserved elsewhere.
+ */
+int dart_collect_tables(dart_dev_t *dart, u64 *pages, size_t capacity, size_t *count)
+{
+    size_t used = 0;
+
+    if (!count)
+        return -1;
+    *count = 0;
+    if (!dart || !pages)
+        return -1;
+    if (dart->locked || dart->keep)
+        return 0;
+    for (int ttbr = 0; ttbr < dart->params->ttbr_count; ++ttbr) {
+        if (!is_heap(dart->l1[ttbr]))
+            continue;
+        if (used == capacity)
+            return -1;
+        pages[used++] = (u64)dart->l1[ttbr];
+        for (int i = 0; i < SZ_16K / 8; ++i) {
+            u64 entry = dart->l1[ttbr][i];
+            if (!(entry & DART_PTE_VALID))
+                continue;
+            void *l2 =
+                (void *)(FIELD_GET(dart->params->offset_mask, entry) << DART_PTE_OFFSET_SHIFT);
+            if (!is_heap(l2))
+                continue;
+            if (used == capacity)
+                return -1;
+            pages[used++] = (u64)l2;
+        }
+    }
+    *count = used;
+    return 0;
+}
+
+void dart_shutdown(dart_dev_t *dart)
+{
+    (void)dart_shutdown_checked(dart);
+}
+
+bool dart_has_failed(dart_dev_t *dart)
+{
+    return !dart || dart->failed;
 }
 
 /* Reservation failure is fatal to handoff: firmware can still follow a table

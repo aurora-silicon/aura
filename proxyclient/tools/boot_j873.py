@@ -433,7 +433,9 @@ def finish_preparation(s, args, state, dtb_name):
     require(0 < total < 0x80000, "invalid final DT size")
     final = s.read(dt, total)
     require(b"apple,t8152-aic3\0apple,t8122-aic3\0" in final and
-            b"G18G-RTKit-3514.0.15.release\0" in final, "final DT lost AIC fallback or GPU receipt")
+            any(receipt in final for receipt in (b"G18G-RTKit-3514.0.15.release\0",
+                                                 b"G18G-RTKit-3514.41.1.release\0")),
+            "final DT lost AIC fallback or GPU receipt")
     (args.output / "prepared.dtb").write_bytes(final)
     (args.output / "live.adt").write_bytes(s.adt_bytes)
     state.update(stage="prepared", dt=dt, dt_size=total, dt_sha256=sha(final), release_slots=release_slots,

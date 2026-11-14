@@ -13,6 +13,7 @@
 #include "sptm_virt.h"
 #include "string.h"
 #include "tps6598x.h"
+#include "tunables.h"
 #include "types.h"
 #include "usb_cdc.h"
 #include "usb_cdc_atc.h"
@@ -130,6 +131,176 @@ static int usb_drd_adt_offset(u32 idx, char drd_path[sizeof(FMT_DRD_PATH)], int 
     return offset;
 }
 
+/* T6050 has a different PIPE clock field. Never run the older automatic
+ * gadget initialization on it, including when the explicit setup is refused. */
+bool usb_cdc_deferred_usb2(void)
+{
+    static int deferred = -1;
+    if (!adt)
+        return false;
+    /* This is also queried on every proxy poll; the firmware ADT is fixed. */
+    if (deferred < 0) {
+        int node = adt_path_offset(adt, "/arm-io/atc-phy0");
+        /*
+         * The J714c (M5 Max) enumerates through the generic gadget path on every port, as the
+         * omacom m1n1 Stage 1 does there; the explicit port-0 setup never comes up on it.
+         */
+        deferred = node >= 0 && adt_is_compatible(adt, node, "atc-phy,t6050") &&
+                   !adt_is_compatible(adt, 0, "J714cAP");
+    }
+    return deferred;
+}
+
+struct usb_t6050_regs {
+    u64 phy, phy_size;
+    u64 digital;
+    u64 pipe, pipe_size;
+    u64 dwc;
+};
+
+/* This API explicitly selects USB0/HPM0. Prove that the ADT associates all
+ * three with the same external port, rather than adding a board-ID table. */
+static int usb_t6050_get_regs(struct usb_t6050_regs *regs)
+{
+    int phy_path[8], drd_path[8], dart_path[8];
+    int phy = adt_path_offset_trace(adt, "/arm-io/atc-phy0", phy_path);
+    int drd = adt_path_offset_trace(adt, "/arm-io/usb-drd0", drd_path);
+    int hpm = adt_path_offset(adt, "/arm-io/nub-spmi-a0/hpm0");
+    int dart = adt_path_offset_trace(adt, "/arm-io/dart-usb0", dart_path);
+    int mapper = adt_path_offset(adt, "/arm-io/dart-usb0/mapper-usb0");
+    u32 phy_port, drd_port, hpm_port, port_type, sid;
+    u64 digital_size, dwc_size, dart_base, dart_size;
+
+    if (phy < 0 || drd < 0 || hpm < 0 || dart < 0 || mapper < 0 ||
+        !adt_is_compatible(adt, phy, "atc-phy,t6050") ||
+        !adt_is_compatible(adt, drd, "usb-drd,t6050") ||
+        !adt_is_compatible(adt, dart, "dart,t8110") ||
+        adt_get_property(adt, drd, "usb-device-disable") ||
+        ADT_GETPROP(adt, phy, "port-number", &phy_port) < 0 ||
+        ADT_GETPROP(adt, drd, "port-number", &drd_port) < 0 ||
+        ADT_GETPROP(adt, hpm, "port-number", &hpm_port) < 0 || !phy_port || phy_port != drd_port ||
+        phy_port != hpm_port || ADT_GETPROP(adt, phy, "port-type", &port_type) < 0 ||
+        port_type != 2 || ADT_GETPROP(adt, mapper, "reg", &sid) < 0 || sid >= 256 ||
+        adt_get_reg(adt, phy_path, "reg", 0, &regs->phy, &regs->phy_size) < 0 ||
+        adt_get_reg(adt, phy_path, "reg", 1, &regs->digital, &digital_size) < 0 ||
+        adt_get_reg(adt, drd_path, "reg", 0, &regs->dwc, &dwc_size) < 0 ||
+        adt_get_reg(adt, drd_path, "reg", 3, &regs->pipe, &regs->pipe_size) < 0 ||
+        adt_get_reg(adt, dart_path, "reg", 1, &dart_base, &dart_size) < 0 ||
+        regs->phy_size < 0x20 || digital_size < 0x24 || dwc_size < DWC3_DSTS + 4 ||
+        regs->pipe_size < 0x48 || dart_size < 0x1800 ||
+        tunables_validate_compact("/arm-io/atc-phy0", "tunable_USB2PHY_DFLT", regs->phy_size) ||
+        tunables_validate_compact("/arm-io/atc-phy0", "tunable_USB2PHY_DEV", regs->phy_size))
+        return -1;
+
+    return 0;
+}
+
+/* Public Aurora Linux c24e75ca9d99fd43d890daea8fae9e0e2eb2ae2a:
+ * drivers/phy/apple/usb-t6050/apple_t6050_usb_phy.h (USB2 sequence),
+ * apple_t6050_usb3_pipe.h (cold dummy), atc-t6050-combo.h (reset).
+ * Only USB2 is needed: no ACIO firmware, high-speed lanes or internal PHY3.
+ * Device-role values come from this machine's ADT, not the host-role table. */
+static dwc3_dev_t *usb_t6050_init(void (*set_step)(unsigned step))
+{
+    struct usb_t6050_regs regs;
+    if (usb_t6050_get_regs(&regs)) {
+        printf("CDC USB2: unsupported T6050 ADT layout\n");
+        return NULL;
+    }
+
+    set_step(2);
+    if (pmgr_adt_power_enable("/arm-io/atc-phy0") < 0 ||
+        pmgr_adt_power_enable("/arm-io/dart-usb0") < 0 ||
+        pmgr_adt_power_enable("/arm-io/usb-drd0") < 0)
+        return NULL;
+
+    u64 pipe = regs.pipe;
+    u32 aon = read32(pipe + PIPEHANDLER_AON_GEN);
+    u32 mux = read32(pipe + PIPEHANDLER_MUX_CTRL) & 0x73;
+    if (dart_adt_locked("/arm-io/dart-usb0", 1)) {
+        printf("CDC USB2: T6050 USB DART is locked; leaving it alone\n");
+        return NULL;
+    }
+    /* An in-place raw chainload retires Stage 1's gadget before this stage
+     * starts. Older loaders leave its dummy PIPE released (0x22). Accept
+     * only that fully stopped device, never a live or native PIPE producer. */
+    if ((aon & PIPEHANDLER_AON_GEN_DWC3_RESET_N) || mux == 0x22) {
+        u32 gctl = read32(regs.dwc + DWC3_GCTL);
+        bool retired = (mux == 0x22 || mux == 0x42) &&
+                       (gctl & DWC3_GCTL_PRTCAPDIR(DWC3_GCTL_PRTCAP_OTG)) ==
+                           DWC3_GCTL_PRTCAPDIR(DWC3_GCTL_PRTCAP_DEVICE) &&
+                       !(read32(regs.dwc + DWC3_DCTL) & DWC3_DCTL_RUN_STOP) &&
+                       (read32(regs.dwc + DWC3_DSTS) & DWC3_DSTS_DEVCTRLHLT) &&
+                       !read32(regs.dwc + DWC3_DEVTEN) && !read32(regs.dwc + DWC3_DALEPENA);
+        if (!retired) {
+            printf("CDC USB2: T6050 PIPE consumer is not retired (aon=%x mux=%x)\n", aon, mux);
+            return NULL;
+        }
+        set32(pipe + PIPEHANDLER_AON_GEN, PIPEHANDLER_AON_GEN_DWC3_FORCE_CLAMP_EN);
+        clear32(pipe + PIPEHANDLER_AON_GEN, PIPEHANDLER_AON_GEN_DWC3_RESET_N);
+        if (poll32(pipe + PIPEHANDLER_AON_GEN, PIPEHANDLER_AON_GEN_DWC3_RESET_N, 0, 1000))
+            return NULL;
+        udelay(10);
+        printf("CDC USB2: retired Stage 1 gadget held in reset\n");
+    } else if (mux != 0 && mux != 2 && mux != 0x42) {
+        printf("CDC USB2: unknown T6050 PIPE producer (aon=%x mux=%x)\n", aon, mux);
+        return NULL;
+    }
+    set32(pipe + PIPEHANDLER_AON_GEN, PIPEHANDLER_AON_GEN_DWC3_FORCE_CLAMP_EN);
+    mask32(pipe + PIPEHANDLER_MUX_CTRL, 0x70, 0);
+    udelay(10);
+    mask32(pipe + PIPEHANDLER_MUX_CTRL, 3, 2);
+    udelay(10);
+    mask32(pipe + PIPEHANDLER_MUX_CTRL, 0x70, 0x40);
+    udelay(10);
+    if ((read32(pipe + PIPEHANDLER_MUX_CTRL) & 0x73) != 0x42)
+        return NULL;
+
+    set_step(3);
+    if (tunables_apply_compact_addr("/arm-io/atc-phy0", "tunable_USB2PHY_DFLT", regs.phy,
+                                    regs.phy_size) ||
+        tunables_apply_compact_addr("/arm-io/atc-phy0", "tunable_USB2PHY_DEV", regs.phy,
+                                    regs.phy_size))
+        return NULL;
+    set32(regs.phy + USB2PHY_SIG, USB2PHY_SIG_VBUSDET_FORCE_VAL | USB2PHY_SIG_VBUSDET_FORCE_EN |
+                                      USB2PHY_SIG_VBUSVLDEXT_FORCE_VAL |
+                                      USB2PHY_SIG_VBUSVLDEXT_FORCE_EN);
+    udelay(10000);
+    clear32(regs.phy + USB2PHY_CTL, USB2PHY_CTL_SIDDQ);
+    udelay(10);
+    clear32(regs.phy + USB2PHY_CTL, USB2PHY_CTL_RESET | USB2PHY_CTL_PORT_RESET);
+    set32(regs.digital, BIT(0) | BIT(3)); /* USB2 event counter enable/load */
+    set32(regs.phy + USB2PHY_CTL, USB2PHY_CTL_APB_RESET_N);
+    clear32(regs.phy + USB2PHY_MISCTUNE,
+            USB2PHY_MISCTUNE_APBCLK_GATE_OFF | USB2PHY_MISCTUNE_REFCLK_GATE_OFF);
+    udelay(30);
+    udelay(5000);
+    mask32(regs.phy + USB2PHY_USBCTL, USB2PHY_USBCTL_USB_MODE, USB2PHY_USBCTL_RUN);
+
+    set32(pipe + PIPEHANDLER_NONSELECTED_OVERRIDE, PIPEHANDLER_DUMMY_PHY_EN);
+    clear32(pipe + PIPEHANDLER_AON_GEN, PIPEHANDLER_AON_GEN_DWC3_FORCE_CLAMP_EN);
+    set32(pipe + PIPEHANDLER_AON_GEN, PIPEHANDLER_AON_GEN_DWC3_RESET_N);
+    if (poll32(pipe + PIPEHANDLER_AON_GEN,
+               PIPEHANDLER_AON_GEN_DWC3_FORCE_CLAMP_EN | PIPEHANDLER_AON_GEN_DWC3_RESET_N,
+               PIPEHANDLER_AON_GEN_DWC3_RESET_N, 1000) ||
+        (read32(regs.phy + USB2PHY_USBCTL) & USB2PHY_USBCTL_USB_MODE) != USB2PHY_USBCTL_RUN ||
+        (read32(regs.phy + USB2PHY_CTL) & 0xf) != USB2PHY_CTL_APB_RESET_N) {
+        printf("CDC USB2: T6050 reset/clock setup did not latch\n");
+        return NULL;
+    }
+
+    set_step(4);
+    dart_dev_t *dart = usb_dart_init(0); /* ADT mapper SID, t8110 on T6050 */
+    if (!dart)
+        return NULL;
+    dwc3_dev_t *dwc = usb_dwc3_init(regs.dwc, dart);
+    if (!dwc)
+        return NULL;
+    printf("CDC USB2: T6050 controller initialized, PIPE=%x; link unverified\n",
+           read32(pipe + PIPEHANDLER_MUX_CTRL));
+    return dwc;
+}
+
 /*
  * The ADT marks ports that must never run as a USB device with usb-device-disable, for
  * example the J773 front ports, whose hub prohibits device mode. Leave those alone.
@@ -198,6 +369,9 @@ int usb_phy_bringup(u32 idx)
     if (idx >= USB_IODEV_COUNT)
         return -1;
 
+    if (usb_cdc_deferred_usb2())
+        return -1;
+
     if (usb_device_mode_disabled(idx)) {
         printf("usb: usb-drd%u has usb-device-disable, leaving it alone\n", idx);
         return -1;
@@ -242,6 +416,8 @@ int usb_phy_bringup(u32 idx)
 
 dwc3_dev_t *usb_iodev_bringup(u32 idx)
 {
+    if (usb_cdc_deferred_usb2())
+        return NULL;
     if (usb_device_mode_disabled(idx))
         return NULL;
 
@@ -364,6 +540,8 @@ void usb_init(void)
     /* Preserve the debug carrier; normal USB initialization can retire it. */
     if (aura_debug_enabled())
         return;
+    if (usb_cdc_deferred_usb2())
+        return;
     if (usb_is_initialized)
         return;
 
@@ -437,6 +615,8 @@ void usb_iodev_init(void)
     /* Preserve the debug carrier; normal USB initialization can retire it. */
     if (aura_debug_enabled())
         return;
+    if (usb_cdc_deferred_usb2())
+        return;
     if (chip_id == T8140)
         return;
 
@@ -462,17 +642,24 @@ void usb_iodev_init(void)
     }
 }
 
-void usb_iodev_shutdown(void)
+/* False when a controller may still reach its DMA buffers (they are retained, see usb_dwc3.h). */
+bool usb_iodev_shutdown(void)
 {
+    bool stopped = true;
+
     for (int i = FIRST_USB_IODEV; i < USB_IODEV_COUNT; i++) {
         struct iodev *usb_iodev = iodev_unregister_device(IODEV_USB0 + i);
         if (!usb_iodev)
             continue;
 
         printf("USB%d: shutdown\n", i);
-        usb_dwc3_shutdown(usb_iodev->opaque);
+        if (!usb_dwc3_shutdown(usb_iodev->opaque)) {
+            printf("USB%d: controller not stopped, its DMA buffers are retained\n", i);
+            stopped = false;
+        }
         free(usb_iodev);
     }
+    return stopped;
 }
 
 void usb_iodev_vuart_setup(iodev_id_t iodev)
@@ -514,13 +701,14 @@ int usb_cdc_link_start(void (*set_step)(unsigned step), bool force_swapped)
          * its live controller or DART during the carrier transition. */
         return !force_swapped && board_id == 0x24 && iodev_get_opaque(IODEV_USB0) ? 0 : -1;
     }
-    if (chip_id == T8152) {
+    if (chip_id == T8152 || usb_cdc_deferred_usb2()) {
         if (force_swapped || iodev_get_opaque(IODEV_USB0))
             return -1;
         struct iodev *device = memalign(SPINLOCK_ALIGN, sizeof(*device));
         if (!device)
             return -1;
-        dwc3_dev_t *dwc = usb_t8152_init(set_step);
+        dwc3_dev_t *dwc =
+            usb_cdc_deferred_usb2() ? usb_t6050_init(set_step) : usb_t8152_init(set_step);
         if (!dwc) {
             free(device);
             return -1;

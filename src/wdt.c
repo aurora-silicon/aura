@@ -50,6 +50,14 @@ void wdt_disable(void)
 
 void wdt_reboot(void)
 {
+    /* A fault before wdt_disable() (early init) must still reset the Mac, not spin */
+    if (!wdt_base && adt) {
+        int path[8];
+        u64 base = 0;
+        if (adt_path_offset_trace(adt, "/arm-io/wdt", path) >= 0 &&
+            !adt_get_reg(adt, path, "reg", 0, &base, NULL))
+            wdt_base = base;
+    }
     if (!wdt_base)
         return;
 
@@ -96,8 +104,43 @@ int wdt_arm_seconds(unsigned seconds)
  * layout, until Linux's driver finds it running and keeps it fed. The next boot takes the
  * normal path, as the trial marker is already spent.
  */
+static bool wdt_boot_armed;
+
 int wdt_arm_trial(void)
 {
+    wdt_boot_armed = false;
     wdt_disable();
     return wdt_arm(WDT_TRIAL_SECONDS);
+}
+
+/*
+ * A plain boot disarms iBoot's watchdog as soon as Stage 1 starts, and nothing re-arms one until
+ * Linux, so a Stage 1 or early Stage 2 that stops (an NVMe command that never completes, a failed
+ * read that drops it into the proxy with no host) stays on screen until someone holds the power
+ * button. Stage 1 arms the primary watchdog for its longest period instead. The first host it
+ * sees (a synced window or proxy request) disarms it, so a debugging session is never reset
+ * under it; Stage 2's own wdt_disable() at its start disarms it on the normal path. Its reads
+ * take well under a second, and its bounded host windows are 10-100 s.
+ */
+int wdt_arm_boot(void)
+{
+    if (wdt_arm(WDT_BOOT_SECONDS))
+        return -1;
+    wdt_boot_armed = true;
+    return 0;
+}
+
+bool wdt_boot_watchdog_armed(void)
+{
+    return wdt_boot_armed;
+}
+
+/* Only the boot watchdog: a trial's or a host-armed one is not ours to disarm. */
+void wdt_host_attached(void)
+{
+    if (!wdt_boot_armed)
+        return;
+    wdt_boot_armed = false;
+    wdt_disable();
+    printf("WDT: host attached, boot watchdog off\n");
 }

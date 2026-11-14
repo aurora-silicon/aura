@@ -144,6 +144,19 @@ static int pmgr_find_device(u16 id, const struct pmgr_device **device)
     return -1;
 }
 
+/* T6050 has die-stride 0x4000000000; at 0x2000000000 its die 1 lands in die 0's MMIO. */
+u64 pmgr_die_stride(void)
+{
+    static u64 stride;
+
+    if (!stride) {
+        int node = adt_path_offset(adt, "/arm-io/pmgr");
+        if (node < 0 || ADT_GETPROP(adt, node, "die-stride", &stride) < 0 || !stride)
+            stride = PMGR_DIE_OFFSET;
+    }
+    return stride;
+}
+
 static uintptr_t pmgr_device_get_addr(u8 die, const struct pmgr_device *device)
 {
     if (die >= pmgr_dies)
@@ -156,7 +169,7 @@ static uintptr_t pmgr_device_get_addr(u8 die, const struct pmgr_device *device)
     if (addr == 0)
         return 0;
 
-    addr += PMGR_DIE_OFFSET * die;
+    addr += pmgr_die_stride() * die;
 
     if (pmgr_use_group_and_offset)
         addr += device->group_and_offset.offset;
@@ -537,6 +550,99 @@ int pmgr_adt_power_disable_recursive(const char *path)
     return pmgr_adt_devices_set_mode(path, PMGR_PS_PWRGATE, true, false);
 }
 
+static bool pmgr_depends_on(u16 id, u16 root, size_t depth)
+{
+    const struct pmgr_device *device;
+    u16 parents[2];
+
+    if (id == root)
+        return true;
+    if (depth >= PMGR_MAX_PARENT_DEPTH || pmgr_find_device(id, &device))
+        return false;
+    pmgr_adt_get_parents(device, parents);
+    return (parents[0] && pmgr_depends_on(parents[0], root, depth + 1)) ||
+           (parents[1] && pmgr_depends_on(parents[1], root, depth + 1));
+}
+
+/*
+ * Power off the gates of the ADT node at path that are the device named name or depend on it,
+ * children first. A virtual gate stands for its parent. The node's other gates stay on.
+ */
+int pmgr_adt_power_disable_under(const char *path, const char *name)
+{
+    const struct pmgr_device *device;
+    const u32 *devices;
+    u32 n_devices;
+    u16 root = 0, ids[16], parents[2];
+    u8 dies[16];
+    size_t count = 0;
+    bool has_root = false;
+
+    for (size_t i = 0; i < pmgr_devices_len; i++)
+        if (!(pmgr_devices[i].flags & PMGR_FLAG_VIRTUAL) &&
+            !strncmp(pmgr_devices[i].name, name, sizeof(pmgr_devices[i].name)))
+            root = pmgr_adt_get_id(&pmgr_devices[i]);
+    if (!root || pmgr_adt_find_devices(path, &devices, &n_devices) < 0)
+        return -1;
+
+    for (u32 i = 0; i < n_devices; i++) {
+        u16 id = FIELD_GET(PMGR_DEVICE_ID, devices[i]);
+        while (id && !pmgr_find_device(id, &device) && (device->flags & PMGR_FLAG_VIRTUAL)) {
+            pmgr_adt_get_parents(device, parents);
+            id = parents[0];
+        }
+        bool seen = false;
+        for (size_t j = 0; j < count; j++)
+            seen |= ids[j] == id;
+        if (!id || seen || !pmgr_depends_on(id, root, 0))
+            continue;
+        if (count == ARRAY_SIZE(ids))
+            return -1;
+        has_root |= id == root;
+        dies[count] = FIELD_GET(PMGR_DIE_ID, devices[i]);
+        ids[count++] = id;
+    }
+    if (!has_root) {
+        printf("pmgr: %s has no %s gate\n", path, name);
+        return -1;
+    }
+
+    while (count) {
+        size_t i = 0;
+        /* A gate no other remaining one depends on. The topology is validated acyclic. */
+        for (size_t j = 0; j < count; j++)
+            if (j != i && pmgr_depends_on(ids[j], ids[i], 0))
+                i = j, j = (size_t)-1;
+        if (pmgr_find_device(ids[i], &device) ||
+            pmgr_set_mode(pmgr_device_get_addr(dies[i], device), PMGR_PS_PWRGATE))
+            return -1;
+        ids[i] = ids[--count];
+        dies[i] = dies[count];
+    }
+    return 0;
+}
+
+/* macOS's steps both ways (T6050 run 28): auto off with the domain on, then off, or auto on. */
+int pmgr_power_steps(int die, const char *name, bool on)
+{
+    uintptr_t a = 0;
+    u32 v;
+
+    for (size_t i = 0; i < pmgr_devices_len && !a; i++)
+        if (!(pmgr_devices[i].flags & PMGR_FLAG_VIRTUAL) &&
+            !strncmp(pmgr_devices[i].name, name, sizeof(pmgr_devices[i].name)))
+            a = pmgr_device_get_addr(die, &pmgr_devices[i]);
+    if (!a)
+        return -1;
+    v = read32(a) & ~(PMGR_AUTO_ENABLE | PMGR_WAS_CLKGATED | PMGR_WAS_PWRGATED | PMGR_PS_TARGET);
+    write32(a, v | PMGR_PS_ACTIVE);
+    if (poll32(a, PMGR_PS_ACTUAL, FIELD_PREP(PMGR_PS_ACTUAL, PMGR_PS_ACTIVE), PMGR_POLL_TIMEOUT) <
+        0)
+        return -1;
+    write32(a, on ? v | PMGR_AUTO_ENABLE | PMGR_PS_ACTIVE : v | PMGR_PS_PWRGATE);
+    return on ? 0 : poll32(a, PMGR_PS_ACTUAL, 0, PMGR_POLL_TIMEOUT);
+}
+
 int pmgr_adt_power_is_off(const char *path)
 {
     const u32 *devices;
@@ -713,16 +819,21 @@ int pmgr_adt_reset(const char *path)
     return ret;
 }
 
+/* The real device named `name`: a virtual (no_ps) child may share its parent's name (T6050
+ * APCIE_PHY_SW). */
+static const struct pmgr_device *pmgr_find_device_by_name(const char *name)
+{
+    for (size_t i = 0; i < pmgr_devices_len; i++) {
+        const struct pmgr_device *dev = &pmgr_devices[i];
+        if (!(dev->flags & PMGR_FLAG_VIRTUAL) && !strncmp(dev->name, name, sizeof(dev->name)))
+            return dev;
+    }
+    return NULL;
+}
+
 int pmgr_reset(int die, const char *name)
 {
-    const struct pmgr_device *dev = NULL;
-
-    for (unsigned int i = 0; i < pmgr_devices_len; ++i) {
-        if (strncmp(pmgr_devices[i].name, name, 0x10) == 0) {
-            dev = &pmgr_devices[i];
-            break;
-        }
-    }
+    const struct pmgr_device *dev = pmgr_find_device_by_name(name);
 
     if (!dev)
         return -1;
@@ -762,23 +873,18 @@ int pmgr_reset_held(int die, const char *name)
 }
 #endif /* SPTM_VIRT */
 
-int pmgr_power_on(int die, const char *name)
+uintptr_t pmgr_psreg_by_name(int die, const char *name)
 {
     if (die < 0 || die >= pmgr_dies)
-        return -1;
-    const struct pmgr_device *dev = NULL;
+        return 0;
+    const struct pmgr_device *dev = pmgr_find_device_by_name(name);
 
-    for (unsigned int i = 0; i < pmgr_devices_len; ++i) {
-        if (strncmp(pmgr_devices[i].name, name, 0x10) == 0) {
-            dev = &pmgr_devices[i];
-            break;
-        }
-    }
+    return dev ? pmgr_device_get_addr(die, dev) : 0;
+}
 
-    if (!dev)
-        return -1;
-
-    uintptr_t addr = pmgr_device_get_addr(die, dev);
+int pmgr_power_on(int die, const char *name)
+{
+    uintptr_t addr = pmgr_psreg_by_name(die, name);
 
     if (!addr)
         return -1;
@@ -788,18 +894,11 @@ int pmgr_power_on(int die, const char *name)
 
 int pmgr_power_is_on(int die, const char *name)
 {
-    if (die < 0 || die >= pmgr_dies)
+    uintptr_t addr = pmgr_psreg_by_name(die, name);
+
+    if (!addr)
         return -1;
-    for (size_t i = 0; i < pmgr_devices_len; i++) {
-        const struct pmgr_device *dev = &pmgr_devices[i];
-        if (strncmp(dev->name, name, sizeof(dev->name)))
-            continue;
-        uintptr_t addr = pmgr_device_get_addr(die, dev);
-        if (!addr)
-            return -1;
-        return FIELD_GET(PMGR_PS_ACTUAL, read32(addr)) == PMGR_PS_ACTIVE;
-    }
-    return -1;
+    return FIELD_GET(PMGR_PS_ACTUAL, read32(addr)) == PMGR_PS_ACTIVE;
 }
 
 /*

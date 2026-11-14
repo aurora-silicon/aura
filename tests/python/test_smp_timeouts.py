@@ -5,6 +5,8 @@ from pathlib import Path
 import os
 import subprocess
 
+from host_compiler import host_cc
+
 
 REPO = Path(os.environ.get("AURA_SMP_SOURCE", Path(__file__).resolve().parents[2]))
 
@@ -12,7 +14,7 @@ REPO = Path(os.environ.get("AURA_SMP_SOURCE", Path(__file__).resolve().parents[2
 def compile_and_run(tmp_path, name, source):
     binary = tmp_path / name
     subprocess.run(
-        ["cc", "-std=gnu11", "-Wall", "-Wextra", "-Werror",
+        [*host_cc(), "-std=gnu11", "-Wall", "-Wextra", "-Werror",
          "-Wno-unused-parameter", "-Wno-unused-function", "-x", "c", "-", "-o", str(binary)],
         input=source, text=True, check=True,
     )
@@ -336,6 +338,7 @@ typedef uint64_t u64;
 #define SMP_TIMEOUT -2
 #define T8152 0x8152
 #define PMGR_DIE_OFFSET 0x1000
+static u64 pmgr_die_stride(void) { return PMGR_DIE_OFFSET; }
 #define sysop(op) ((void)0)
 #define smp_call1(cpu, fn, a) smp_call4(cpu, fn, a, 0, 0, 0)
 struct spin_table { u64 flag, target; };

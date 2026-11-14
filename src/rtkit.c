@@ -119,6 +119,8 @@ struct rtkit_dev {
     bool crashed;
     /* The last boot attempt got no HELLO after the wakeup. */
     bool no_hello;
+    /* Started warm: the firmware keeps the buffers an earlier owner gave it. */
+    bool inherited;
 };
 
 struct syslog_log {
@@ -214,10 +216,10 @@ out_free_rtk:
 
 void rtkit_free(rtkit_dev_t *rtk)
 {
-    rtkit_free_buffer(rtk, &rtk->syslog_bfr);
-    rtkit_free_buffer(rtk, &rtk->crashlog_bfr);
-    rtkit_free_buffer(rtk, &rtk->ioreport_bfr);
-    rtkit_free_buffer(rtk, &rtk->oslog_bfr);
+    /* A buffer the IOMMU may still reach is kept, and so is its owner. */
+    if (!rtkit_free_buffer(rtk, &rtk->syslog_bfr) || !rtkit_free_buffer(rtk, &rtk->crashlog_bfr) ||
+        !rtkit_free_buffer(rtk, &rtk->ioreport_bfr) || !rtkit_free_buffer(rtk, &rtk->oslog_bfr))
+        return;
     free(rtk->name);
     free(rtk);
 }
@@ -251,6 +253,8 @@ bool rtkit_map(rtkit_dev_t *rtk, void *phys, size_t sz, u64 *dva)
         *dva = (u64)phys;
         return true;
     } else if (rtk->dart) {
+        if (dart_has_failed(rtk->dart))
+            return false;
         u64 iova = iova_alloc(rtk->dart_iovad, sz);
         if (!iova) {
             rtkit_printf("failed to alloc iova (size 0x%lx)\n", sz);
@@ -259,7 +263,11 @@ bool rtkit_map(rtkit_dev_t *rtk, void *phys, size_t sz, u64 *dva)
 
         if (dart_map(rtk->dart, iova, phys, sz) < 0) {
             rtkit_printf("failed to DART map (size 0x%lx)\n", sz);
-            iova_free(rtk->dart_iovad, iova, sz);
+            /* After a failed invalidation the pages may be live: keep the IOVA. */
+            if (dart_has_failed(rtk->dart))
+                *dva = iova | rtk->dva_base;
+            else
+                iova_free(rtk->dart_iovad, iova, sz);
             return false;
         }
 
@@ -281,7 +289,8 @@ bool rtkit_unmap(rtkit_dev_t *rtk, u64 dva, size_t sz)
         return true;
     } else if (rtk->dart) {
         dva &= ~rtk->dva_base;
-        dart_unmap(rtk->dart, dva & IOVA_MASK, sz);
+        if (!dart_unmap_checked(rtk->dart, dva & IOVA_MASK, sz))
+            return false;
         iova_free(rtk->dart_iovad, dva, sz);
         return true;
     } else {
@@ -292,6 +301,8 @@ bool rtkit_unmap(rtkit_dev_t *rtk, u64 dva, size_t sz)
 
 bool rtkit_alloc_buffer(rtkit_dev_t *rtk, struct rtkit_buffer *bfr, size_t sz)
 {
+    if (rtk->dart && dart_has_failed(rtk->dart))
+        return false;
     if (!sz || sz > (size_t)-1 - (SZ_16K - 1))
         return false;
 
@@ -304,13 +315,16 @@ bool rtkit_alloc_buffer(rtkit_dev_t *rtk, struct rtkit_buffer *bfr, size_t sz)
 
     memset(bfr->bfr, 0, alloc_sz);
     bfr->sz = alloc_sz;
+    bfr->owned = true;
     if (!rtkit_map(rtk, bfr->bfr, alloc_sz, &bfr->dva))
         goto error;
 
-    bfr->owned = true;
     return true;
 
 error:
+    /* A failed map can leave translations to this allocation published. */
+    if (rtk->dart && dart_has_failed(rtk->dart))
+        return false;
     free(bfr->bfr);
     memset(bfr, 0, sizeof(*bfr));
     return false;
@@ -470,6 +484,10 @@ static void rtkit_crashed(rtkit_dev_t *rtk)
 
     rtkit_printf("IOP crashed!\n");
 
+    /* A warm-started session's crash log is in a buffer an earlier owner gave. */
+    if (!hdr)
+        return;
+
     if (hdr->type != 'CLHE') {
         rtkit_printf("bad crashlog header 0x%x @ %p\n", hdr->type, hdr);
         return;
@@ -565,7 +583,7 @@ int rtkit_recv(rtkit_dev_t *rtk, struct rtkit_message *msg)
             case RTKIT_EP_CRASHLOG:
                 switch (msgtype) {
                     case MSG_BUFFER_REQUEST:
-                        if (!rtk->crashlog_bfr.bfr) {
+                        if (!rtk->crashlog_bfr.bfr && !rtk->inherited) {
                             ok = ok && rtkit_handle_buffer_request(rtk, msg, &rtk->crashlog_bfr);
                         } else {
                             rtkit_crashed(rtk);
@@ -653,19 +671,27 @@ static bool rtkit_wait_for_power(rtkit_dev_t *rtk, enum rtkit_power_state *state
     return true;
 }
 
-static bool rtkit_boot_internal(rtkit_dev_t *rtk, u32 timeout_usec)
+/*
+ * Warm: after a power cycle under kept firmware state. The firmware says HELLO by itself, the
+ * endpoint map is answered as macOS does after a wake (bit 1 added to every part but the last,
+ * the last masked by warm_last_mask) and no endpoint is started again.
+ */
+static bool rtkit_boot_internal(rtkit_dev_t *rtk, u32 timeout_usec, bool warm, u32 warm_last_mask)
 {
     struct asc_message msg;
 
     rtk->no_hello = false;
 
+    /* After a power loss macOS turns the receive side on before the run bit (T6050 cp9d). */
+    if (warm)
+        asc_i2a_enable(rtk->asc, true);
     /* boot the IOP if it isn't already */
     asc_cpu_start(rtk->asc);
     /* can be sent unconditionally to wake up a possibly sleeping IOP */
     msg.msg0 = FIELD_PREP(MGMT_TYPE, MGMT_MSG_IOP_PWR_STATE) |
                FIELD_PREP(MGMT_PWR_STATE, RTKIT_POWER_INIT);
     msg.msg1 = RTKIT_EP_MGMT;
-    if (!asc_send(rtk->asc, &msg)) {
+    if (!warm && !asc_send(rtk->asc, &msg)) {
         rtkit_printf("unable to send wakeup message\n");
         return false;
     }
@@ -776,6 +802,8 @@ static bool rtkit_boot_internal(rtkit_dev_t *rtk, u32 timeout_usec)
             msg.msg0 |= MGMT_MSG_EPMAP_REPLY_DONE;
         else
             msg.msg0 |= MGMT_MSG_EPMAP_REPLY_MORE;
+        if (warm)
+            msg.msg0 |= got_epmap ? bitmap & warm_last_mask : bitmap | BIT(1);
 
         msg.msg1 = RTKIT_EP_MGMT;
 
@@ -785,16 +813,12 @@ static bool rtkit_boot_internal(rtkit_dev_t *rtk, u32 timeout_usec)
         }
     }
 
-    /* start all required system endpoints */
-    if (has_debug && !rtkit_start_ep(rtk, RTKIT_EP_DEBUG))
-        return false;
-    if (has_crashlog && !rtkit_start_ep(rtk, RTKIT_EP_CRASHLOG))
-        return false;
-    if (has_syslog && !rtkit_start_ep(rtk, RTKIT_EP_SYSLOG))
-        return false;
-    if (has_ioreport && !rtkit_start_ep(rtk, RTKIT_EP_IOREPORT))
-        return false;
-    if (has_oslog && !rtkit_start_ep(rtk, RTKIT_EP_OSLOG))
+    /* start all required system endpoints, unless they still run from before */
+    if (!warm && ((has_debug && !rtkit_start_ep(rtk, RTKIT_EP_DEBUG)) ||
+                  (has_crashlog && !rtkit_start_ep(rtk, RTKIT_EP_CRASHLOG)) ||
+                  (has_syslog && !rtkit_start_ep(rtk, RTKIT_EP_SYSLOG)) ||
+                  (has_ioreport && !rtkit_start_ep(rtk, RTKIT_EP_IOREPORT)) ||
+                  (has_oslog && !rtkit_start_ep(rtk, RTKIT_EP_OSLOG))))
         return false;
 
     if (!rtkit_wait_for_power(rtk, &rtk->iop_power, RTKIT_POWER_ON, timeout_usec, "IOP"))
@@ -818,7 +842,13 @@ static bool rtkit_boot_internal(rtkit_dev_t *rtk, u32 timeout_usec)
 
 bool rtkit_boot(rtkit_dev_t *rtk)
 {
-    return rtkit_boot_internal(rtk, 0);
+    return rtkit_boot_internal(rtk, 0, false, 0);
+}
+
+bool rtkit_boot_warm(rtkit_dev_t *rtk, u32 last_mask)
+{
+    rtk->inherited = true;
+    return rtkit_boot_internal(rtk, 2 * USEC_PER_SEC, true, last_mask);
 }
 
 /* Boot the IOP, or adopt the session of one a previous stage left running. Such
@@ -849,7 +879,7 @@ bool rtkit_boot_timed(rtkit_dev_t *rtk, u32 timeout_usec)
     }
 
     rtk->timeout_usec = timeout_usec;
-    return rtkit_boot_internal(rtk, timeout_usec);
+    return rtkit_boot_internal(rtk, timeout_usec, false, 0);
 }
 
 u32 rtkit_get_timeout(rtkit_dev_t *rtk)
@@ -857,13 +887,12 @@ u32 rtkit_get_timeout(rtkit_dev_t *rtk)
     return rtk->timeout_usec;
 }
 
-static bool rtkit_quiesce_ap_power(rtkit_dev_t *rtk)
+static bool rtkit_quiesce_ap_power(rtkit_dev_t *rtk, enum rtkit_power_state state)
 {
     struct asc_message msg;
 
-    /* AP power should always go to QUIESCED, otherwise rebooting doesn't work */
-    msg.msg0 = FIELD_PREP(MGMT_TYPE, MGMT_MSG_AP_PWR_STATE) |
-               FIELD_PREP(MGMT_PWR_STATE, RTKIT_POWER_QUIESCED);
+    /* AP power should always go to QUIESCED (or IDLE), otherwise rebooting doesn't work */
+    msg.msg0 = FIELD_PREP(MGMT_TYPE, MGMT_MSG_AP_PWR_STATE) | FIELD_PREP(MGMT_PWR_STATE, state);
     msg.msg1 = RTKIT_EP_MGMT;
     if (!asc_send(rtk->asc, &msg)) {
         rtkit_printf("unable to send shutdown message\n");
@@ -871,7 +900,7 @@ static bool rtkit_quiesce_ap_power(rtkit_dev_t *rtk)
     }
 
     u64 timeout = timeout_calculate(rtk->timeout_usec ? rtk->timeout_usec : 1000000);
-    while (rtk->ap_power != RTKIT_POWER_QUIESCED) {
+    while (rtk->ap_power != state) {
         if (timeout_expired(timeout)) {
             rtkit_printf("AP power transition timed out\n");
             return false;
@@ -892,14 +921,15 @@ static bool rtkit_quiesce_ap_power(rtkit_dev_t *rtk)
     return true;
 }
 
-static bool rtkit_switch_power_state(rtkit_dev_t *rtk, enum rtkit_power_state target)
+static bool rtkit_switch_power_state(rtkit_dev_t *rtk, enum rtkit_power_state ap,
+                                     enum rtkit_power_state target)
 {
     struct asc_message msg;
 
     if (rtk->crashed)
         return false;
 
-    if (!rtkit_quiesce_ap_power(rtk))
+    if (!rtkit_quiesce_ap_power(rtk, ap))
         return false;
 
     msg.msg0 = FIELD_PREP(MGMT_TYPE, MGMT_MSG_IOP_PWR_STATE) | FIELD_PREP(MGMT_PWR_STATE, target);
@@ -954,7 +984,7 @@ bool rtkit_quiesce_ap(rtkit_dev_t *rtk)
     while ((ret = rtkit_recv(rtk, &msg)) > 0)
         rtkit_printf("dropping message to non-system endpoint 0x%02x before AP quiesce: %lx\n",
                      msg.ep, msg.msg);
-    if (ret < 0 || !rtkit_quiesce_ap_power(rtk))
+    if (ret < 0 || !rtkit_quiesce_ap_power(rtk, RTKIT_POWER_QUIESCED))
         return false;
 
     /* Acknowledge anything the IOP sent along with the transition. */
@@ -973,12 +1003,30 @@ bool rtkit_quiesce_ap(rtkit_dev_t *rtk)
 
 bool rtkit_quiesce(rtkit_dev_t *rtk)
 {
-    return rtkit_switch_power_state(rtk, RTKIT_POWER_QUIESCED);
+    return rtkit_switch_power_state(rtk, RTKIT_POWER_QUIESCED, RTKIT_POWER_QUIESCED);
+}
+
+/* As macOS before a sleep: AP and IOP power IDLE, then the CPU stopped in its idle loop. */
+bool rtkit_idle(rtkit_dev_t *rtk)
+{
+    if (!rtkit_switch_power_state(rtk, RTKIT_POWER_IDLE, RTKIT_POWER_IDLE))
+        return false;
+    /* macOS turns the receive side off once the IOP acknowledged (T6050 cp9d). */
+    asc_i2a_enable(rtk->asc, false);
+
+    u64 timeout = timeout_calculate(5000);
+    while (!asc_cpu_idle(rtk->asc))
+        if (timeout_expired(timeout))
+            return false;
+    /* Twice, each from what it reads back, as macOS does. */
+    asc_cpu_stop(rtk->asc);
+    asc_cpu_stop(rtk->asc);
+    return true;
 }
 
 bool rtkit_sleep(rtkit_dev_t *rtk)
 {
-    if (!rtkit_switch_power_state(rtk, RTKIT_POWER_SLEEP))
+    if (!rtkit_switch_power_state(rtk, RTKIT_POWER_QUIESCED, RTKIT_POWER_SLEEP))
         return false;
 
     asc_cpu_stop(rtk->asc);
@@ -1016,23 +1064,6 @@ int rtkit_probe_hello(asc_dev_t *asc)
         }
     }
     return 0;
-}
-
-/* As macOS before a sleep: the firmware saves its state, then the CPU stops once idle. */
-bool rtkit_idle(rtkit_dev_t *rtk)
-{
-    if (!rtkit_switch_power_state(rtk, RTKIT_POWER_IDLE))
-        return false;
-    asc_i2a_enable(rtk->asc, false);
-
-    u64 timeout = timeout_calculate(5000);
-    while (!asc_cpu_idle(rtk->asc))
-        if (timeout_expired(timeout))
-            return false;
-    /* Twice, each from what it reads back, as macOS does. */
-    asc_cpu_stop(rtk->asc);
-    asc_cpu_stop(rtk->asc);
-    return true;
 }
 #endif /* SPTM_VIRT */
 

@@ -32,6 +32,7 @@ int dart_setup_pt_region(dart_dev_t *dart, const char *path, int device, u64 vm_
 int dart_map(dart_dev_t *dart, uintptr_t iova, void *bfr, size_t len);
 int dart_map_flags(dart_dev_t *dart, uintptr_t iova, void *bfr, size_t len, u32 flags);
 void dart_unmap(dart_dev_t *dart, uintptr_t iova, size_t len);
+bool dart_unmap_checked(dart_dev_t *dart, uintptr_t iova, size_t len);
 void dart_free_l2(dart_dev_t *dart, uintptr_t iova);
 void *dart_translate(dart_dev_t *dart, uintptr_t iova);
 void *dart_translate_silent(dart_dev_t *dart, uintptr_t iova);
@@ -42,7 +43,15 @@ u64 dart_search(dart_dev_t *dart, void *paddr);
 u64 dart_find_iova(dart_dev_t *dart, s64 start, size_t len);
 u64 dart_search_range(dart_dev_t *dart, u64 paddr, size_t len);
 void dart_shutdown(dart_dev_t *dart);
+bool dart_shutdown_checked(dart_dev_t *dart);
+/* The heap tables of a DART aura owns (roots, then L2), for a reservation. */
+int dart_collect_tables(dart_dev_t *dart, u64 *pages, size_t capacity, size_t *count);
+/* True after a timed-out TLB invalidation (or for no DART): keep reachable memory. */
+bool dart_has_failed(dart_dev_t *dart);
 int dart_reserve_legacy_tables(void *dt, u64 dram_base, u64 dram_size);
 u64 dart_vm_base(dart_dev_t *dart);
+
+int dart_collect_native_t8110(uintptr_t base, u8 sid, u64 dram_base, u64 dram_size, u64 *pages,
+                              size_t capacity, size_t *count, char *detail, size_t detail_size);
 
 #endif

@@ -23,6 +23,7 @@ typedef unsigned long u64;
 #define SZ_4K 0x1000
 #define SZ_16K 0x4000
 #define SZ_1M (1 << 20)
+#define SZ_32M (1UL << 25)
 #define ALIGN_UP(x, a) (((x) + (a) - 1) & ~((a) - 1))
 #define ALIGN_DOWN(x, a) ((x) & ~((a) - 1))
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
@@ -46,7 +47,7 @@ static u64 SYS_IMP_APL_CTXR_A_LWR_EL1, SYS_IMP_APL_CTXR_A_UPR_EL1, SYS_IMP_APL_C
 static struct { bool apple_sysregs_unlocked; } features, *cpu_features = &features;
 static int confined, ro_status, fb_active;
 static u64 _base, _end, boot_args_addr, ro_start_v, ro_end_v;
-static struct { u64 top_of_kernel_data; } cur_boot_args;
+static struct { u64 phys_base, top_of_kernel_data; } cur_boot_args;
 static char console[1024];
 static bool ctxr_exec_confined(void) { return confined; }
 static int memory_fw_ro_range(u64 *start, u64 *end)

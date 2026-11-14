@@ -259,8 +259,18 @@ int display_get_vram(u64 *paddr, u64 *size)
     return 0;
 }
 
+/* True only when both DARTs dropped the range; otherwise keep its IOVA and memory. */
+static bool display_unmap_fb(uintptr_t iova, size_t size)
+{
+    if (!dart_unmap_checked(dcp->dart_disp, iova, size))
+        return false;
+    return dart_unmap_checked(dcp->dart_dcp, iova, size);
+}
+
 static uintptr_t display_map_fb(uintptr_t iova, u64 paddr, u64 size)
 {
+    if (dart_has_failed(dcp->dart_disp) || dart_has_failed(dcp->dart_dcp))
+        return DART_PTR_ERR;
     if (iova == 0) {
         u64 iova_disp0 = 0;
         u64 iova_dcp = 0;
@@ -308,7 +318,7 @@ static uintptr_t display_map_fb(uintptr_t iova, u64 paddr, u64 size)
     ret = dart_map(dcp->dart_dcp, iova, (void *)paddr, size);
     if (ret < 0) {
         printf("display: failed to map fb to dart-dcp\n");
-        dart_unmap(dcp->dart_disp, iova, size);
+        (void)dart_unmap_checked(dcp->dart_disp, iova, size);
         return DART_PTR_ERR;
     }
 
@@ -637,6 +647,10 @@ int display_configure(const char *config)
         memset((void *)fb_pa, 0, size);
 
         tmp_dva = iova_alloc(dcp->iovad_dcp, size);
+        if (!tmp_dva) {
+            printf("display: failed to allocate temporary framebuffer IOVA\n");
+            return -1;
+        }
 
         tmp_dva = display_map_fb(tmp_dva, fb_pa, size);
         if (DART_IS_ERR(tmp_dva)) {
@@ -653,8 +667,10 @@ int display_configure(const char *config)
         /* wait for swap durations + 1ms */
         u32 delay = (((1000 << 16) + tbest.fps - 1) / tbest.fps) + 1;
         mdelay(delay);
-        dart_unmap(dcp->dart_disp, fb_dva, fb_size);
-        dart_unmap(dcp->dart_dcp, fb_dva, fb_size);
+        if (!display_unmap_fb(fb_dva, fb_size)) {
+            printf("display: old framebuffer mapping could not be removed\n");
+            return -1;
+        }
 
         if (chip_id == T8152) {
             /* The DCP already scans out the new framebuffer at tmp_dva; a
@@ -739,11 +755,13 @@ int display_configure(const char *config)
     /* Update for python / subsequent stages */
     memcpy((void *)boot_args_addr, &cur_boot_args, sizeof(cur_boot_args));
 
+    /* The temporary IOVA aliases the live framebuffer. Free it only once both
+     * DARTs confirmed the unmap; otherwise keep it reserved. */
     if (tmp_dva) {
-        // unmap / free temporary dva
-        dart_unmap(dcp->dart_disp, tmp_dva, size);
-        dart_unmap(dcp->dart_dcp, tmp_dva, size);
-        iova_free(dcp->iovad_dcp, tmp_dva, size);
+        if (display_unmap_fb(tmp_dva, size))
+            iova_free(dcp->iovad_dcp, tmp_dva, size);
+        else
+            printf("display: keeping the temporary framebuffer IOVA mapped\n");
     }
 
     u64 msecs = ticks_to_msecs(get_ticks() - start_time);
@@ -978,7 +996,10 @@ int display_init(void)
         printf("display: Display is internal\n");
 
     if (chip_id == T8140 || chip_id == T8132 ||
-        (chip_id == T6040 && board_id == 4 && adt_is_compatible(adt, 0, "J614sAP"))) {
+        (chip_id == T6040 && board_id == 4 && adt_is_compatible(adt, 0, "J614sAP")) ||
+        /* J575c: iBoot leaves the internal DCP running with no panel and a dummy framebuffer;
+         * the T6041 display handoff gives it to the kernel as iBoot left it. */
+        (chip_id == T6041 && adt_is_compatible(adt, 0, "J575cAP"))) {
         printf("display: preserving inherited display (%ldx%ld)\n", cur_boot_args.video.width,
                cur_boot_args.video.height);
         return 0;

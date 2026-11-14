@@ -116,8 +116,9 @@ fn read_file(root: &Root, path: &str) -> Result<Vec<u8>, Error> {
     Ok(buf)
 }
 
-/// Spend an armed aura-try marker at the ESP root and return the path it names (trial.rs).
-fn take_trial(root: &Root, offset: u64, sectors: u64) -> Option<String> {
+/// Spend an armed aura-try marker at the ESP root and return the path it names (trial.rs), if
+/// `valid` accepts it.
+fn take_trial(root: &Root, offset: u64, sectors: u64, valid: fn(&str) -> bool) -> Option<String> {
     let entry = root
         .iter()
         .filter_map(|r| r.ok())
@@ -140,7 +141,7 @@ fn take_trial(root: &Root, offset: u64, sectors: u64) -> Option<String> {
         println!("aura-try: marker is spent");
         return None;
     };
-    if !valid_fat_path(path) {
+    if !valid(path) {
         println!("aura-try: ignoring an invalid path");
         return None;
     }
@@ -158,25 +159,8 @@ fn take_trial(root: &Root, offset: u64, sectors: u64) -> Option<String> {
     Some(String::from(path))
 }
 
-/*
- * trial: None to leave any aura-try marker alone. Otherwise a NUL-terminated buffer: empty to
- * take an armed marker (and receive the path it names), or the path of a trial already taken.
- */
-fn load_image(
-    spec: &str,
-    proxy_request: Option<&mut bool>,
-    trial: Option<&mut [u8]>,
-) -> Result<Vec<u8>, Error> {
-    println!("Chainloading from the ESP");
-
-    let mut args = spec.split(';');
-
-    let uuid = Uuid::parse_str(args.next().ok_or(Error::BadArgs)?).or(Err(Error::BadArgs))?;
-    let path = args.next().ok_or(Error::BadArgs)?;
-    if args.next().is_some() || !valid_fat_path(path) {
-        return Err(Error::BadArgs);
-    }
-
+/// Open the FAT file system of the partition `uuid`; also its first block and length.
+fn open_esp(uuid: Uuid) -> Result<(FileSystem<nvme::NVMEStorage>, u64, u64), Error> {
     let part = {
         let storage = nvme::NVMEStorage::new(1, 0);
         let mut pt = gpt::GPT::new(storage)?;
@@ -200,7 +184,38 @@ fn load_image(
         .with_read_budget(512 * 1024 * 1024 / 4096);
     let opts = FsOptions::new().update_accessed_date(false);
 
-    let fs = FileSystem::new(storage, opts)?;
+    Ok((FileSystem::new(storage, opts)?, offset, sectors))
+}
+
+/// A boot= trial names "<kernel>;<dtb>;<initramfs>", the initramfs `-` for none.
+fn valid_boot_trial(line: &str) -> bool {
+    let fields: Vec<&str> = line.split(';').collect();
+    fields.len() == 3
+        && valid_fat_path(fields[0])
+        && valid_fat_path(fields[1])
+        && (fields[2] == "-" || valid_fat_path(fields[2]))
+}
+
+/*
+ * trial: None to leave any aura-try marker alone. Otherwise a NUL-terminated buffer: empty to
+ * take an armed marker (and receive the path it names), or the path of a trial already taken.
+ */
+fn load_image(
+    spec: &str,
+    proxy_request: Option<&mut bool>,
+    trial: Option<&mut [u8]>,
+) -> Result<Vec<u8>, Error> {
+    println!("Chainloading from the ESP");
+
+    let mut args = spec.split(';');
+
+    let uuid = Uuid::parse_str(args.next().ok_or(Error::BadArgs)?).or(Err(Error::BadArgs))?;
+    let path = args.next().ok_or(Error::BadArgs)?;
+    if args.next().is_some() || !valid_fat_path(path) {
+        return Err(Error::BadArgs);
+    }
+
+    let (fs, offset, sectors) = open_esp(uuid)?;
     let root = fs.root_dir();
     // An "aura-proxy" file at the ESP root asks Stage 1 to wait for a host before booting.
     if let Some(marker) = proxy_request {
@@ -215,7 +230,7 @@ fn load_image(
 
     if let Some(buf) = trial {
         let taken = match buf.iter().position(|&b| b == 0) {
-            Some(0) => take_trial(&root, offset, sectors),
+            Some(0) => take_trial(&root, offset, sectors, valid_fat_path),
             Some(end) => core::str::from_utf8(&buf[..end]).ok().map(String::from),
             None => None,
         };
@@ -358,6 +373,42 @@ fn read_into(spec: &str, dst: &mut [u8]) -> Result<usize, Error> {
         slice = &mut slice[read..];
     }
     Ok(size)
+}
+
+/// boot= trials (boot_storage.c): spend an armed aura-try marker on the ESP `raw_uuid` and copy
+/// the "<kernel>;<dtb>;<initramfs>" line it names, NUL-terminated, into `buf`. 0 once one is taken.
+#[no_mangle]
+pub unsafe extern "C" fn rust_take_boot_trial(
+    raw_uuid: *const c_char,
+    buf: *mut c_char,
+    capacity: c_size_t,
+) -> c_int {
+    if raw_uuid.is_null() || buf.is_null() || capacity == 0 {
+        return -1;
+    }
+    let Some(uuid) = (unsafe { CStr::from_ptr(raw_uuid).to_str() })
+        .ok()
+        .and_then(|s| Uuid::parse_str(s).ok())
+    else {
+        return -1;
+    };
+    let (fs, offset, sectors) = match open_esp(uuid) {
+        Ok(esp) => esp,
+        Err(err) => {
+            println!("aura-try: {:?}", err);
+            return -1;
+        }
+    };
+    let Some(line) = take_trial(&fs.root_dir(), offset, sectors, valid_boot_trial) else {
+        return -1;
+    };
+    if line.len() >= capacity {
+        return -1;
+    }
+    let out = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, capacity) };
+    out[..line.len()].copy_from_slice(line.as_bytes());
+    out[line.len()] = 0;
+    0
 }
 
 #[no_mangle]

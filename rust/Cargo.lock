@@ -53,6 +53,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "ed25519-compact"
+version = "2.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9547879431a90e352a35863a54416d92898a787b9af09e6ae2e09a96bd78be80"
+
+[[package]]
 name = "fatfs"
 version = "0.4.0"
 source = "git+https://github.com/aurora-silicon/fatfs?rev=7d505fbfa37a945af5549517f47c1d2e87a8333e#7d505fbfa37a945af5549517f47c1d2e87a8333e"
@@ -87,6 +93,7 @@ checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 name = "rust"
 version = "0.1.0"
 dependencies = [
+ "ed25519-compact",
  "fatfs",
  "sha1_smol",
  "sha2",

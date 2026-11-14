@@ -14,6 +14,7 @@ crate-type = [ "staticlib" ]
 sha2 = { version = "0.10.9", default-features = false, features = ["force-soft"] }
 fatfs = { git = "https://github.com/aurora-silicon/fatfs", rev = "7d505fbfa37a945af5549517f47c1d2e87a8333e", default-features = false, features = ["lfn", "alloc", "explicit-fat32"], optional = true }
 sha1_smol = { version = "1.0.1" }
+ed25519-compact = { version = "2.1.1", default-features = false, features = ["opt_size"] }
 uuid = {  version = "1.23", default-features = false, optional = true }
 versions = { path = "./versions" }
 
@@ -24,3 +25,7 @@ chainload = ["dep:fatfs", "dep:uuid"]
 # build, and the same tree gives a different image.
 [profile.release]
 codegen-units = 1
+
+# Signature checks run once per boot: size matters more than speed (aura-raw.ld file limit).
+[profile.release.package.ed25519-compact]
+opt-level = "z"

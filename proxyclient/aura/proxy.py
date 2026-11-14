@@ -262,7 +262,10 @@ class UartInterface(Reloadable):
         dev.timeout = tout
         self.tty_enable = False
 
-    def reply(self, cmd):
+    def reply(self, cmd, drop_stale=False):
+        """Read the reply to cmd. With drop_stale, a complete, checksummed reply
+        to a different command (left over from an earlier request whose wait
+        timed out) is discarded instead of raising UartCMDError."""
         reply = b''
         while True:
             if not reply or reply[-1] != 255:
@@ -310,6 +313,10 @@ class UartInterface(Reloadable):
             if cmdin != cmd:
                 if cmdin == self.REQ_BOOT and status == self.ST_OK:
                     self.handle_boot(data)
+                    reply = b''
+                    continue
+                if drop_stale:
+                    print("Dropped stale reply: expected 0x%08x, got 0x%08x"%(cmd, cmdin), file=sys.stderr)
                     reply = b''
                     continue
                 raise UartCMDError("Reply command mismatch: Expected 0x%08x, got 0x%08x"%(cmd, cmdin))
@@ -376,7 +383,10 @@ class UartInterface(Reloadable):
         # Send the supported feature flags in the NOP message (has no effect
         # if the target does not support it)
         self.cmd(self.REQ_NOP, struct.pack("<Q", features.value))
-        result = self.reply(self.REQ_NOP)
+        # A NOP is the sync point: any late reply still queued from an earlier
+        # timed-out request arrives before ours and is dropped here, so it
+        # cannot be mistaken for the reply to the next command.
+        result = self.reply(self.REQ_NOP, drop_stale=True)
 
         # Get the enabled feature flags from the message response (returns
         # 0 if the target does not support it)
@@ -688,6 +698,7 @@ class AuraProxy(Reloadable):
 
     P_TUNABLES_APPLY_GLOBAL = 0xa00
     P_TUNABLES_APPLY_LOCAL = 0xa01
+    P_TUNABLES_APPLY_LOCAL_ADDR = 0xa02
 
     P_DART_INIT = 0xb00
     P_DART_SHUTDOWN = 0xb01
@@ -1169,7 +1180,7 @@ class AuraProxy(Reloadable):
     def tunables_apply_local(self, path, prop, reg_offset):
         return self.request(self.P_TUNABLES_APPLY_LOCAL, path, prop, reg_offset)
     def tunables_apply_local_addr(self, path, prop, base):
-        return self.request(self.P_TUNABLES_APPLY_LOCAL, path, prop, base)
+        return self.request(self.P_TUNABLES_APPLY_LOCAL_ADDR, path, prop, base)
 
     def dart_init(self, base, sid, dart_type=DART.T8020):
         return self.request(self.P_DART_INIT, base, sid, dart_type)

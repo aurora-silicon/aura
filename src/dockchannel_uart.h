@@ -20,6 +20,7 @@ void dockchannel_uart_write(const void *buf, size_t count);
 size_t dockchannel_uart_read(void *buf, size_t count);
 
 void dockchannel_uart_puts(const char *s);
+bool dockchannel_uart_try_puts(const char *s);
 int dockchannel_uart_printf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 
 /* DEBUGUSB_PROXY builds only. */

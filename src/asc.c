@@ -109,7 +109,7 @@ asc_dev_t *asc_init(const char *path)
             return NULL;
         }
 
-        /* 26A428 AppleMessageBoxMailbox: two 128-byte apertures per mailbox.
+        /* Two 128-byte apertures per mailbox.
          * The using-alias property selects the first 64 KiB register bank. */
         u64 offset = (2ULL * mailbox + !postoffice) * 0x80;
         if (!using_alias)
@@ -158,6 +158,7 @@ bool asc_cpu_running(asc_dev_t *asc)
     return read32(asc->cpu_base + ASC_CPU_CONTROL) & ASC_CPU_CONTROL_START;
 }
 
+/* The mailbox's receive side (I2A) on or off, as macOS sets it around an IOP's power loss. */
 void asc_i2a_enable(asc_dev_t *asc, bool on)
 {
     if (on)
@@ -171,6 +172,7 @@ u32 asc_cpu_status(asc_dev_t *asc)
     return read32(asc->cpu_base + ASC_CPU_STATUS);
 }
 
+/* Stopped in its idle loop, as an IOP that acknowledged an idle request reads. */
 bool asc_cpu_idle(asc_dev_t *asc)
 {
     u32 status = read32(asc->cpu_base + ASC_CPU_STATUS);

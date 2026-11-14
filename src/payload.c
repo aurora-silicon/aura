@@ -17,6 +17,7 @@
 #include "mitigations.h"
 #include "nvme.h"
 #include "payload_profile.h"
+#include "secboot.h"
 #include "smp.h"
 #ifdef SPTM_VIRT_ESP
 #include "sptm_virt.h"
@@ -37,6 +38,11 @@ static const u8 fdt_magic[] = {0xd0, 0x0d, 0xfe, 0xed};
 static const u8 kernel_magic[] = {'A', 'R', 'M', 0x64};          // at 0x38
 static const u8 cpio_magic[] = {'0', '7', '0', '7', '0'};        // '1' or '2' next
 static const u8 img4_magic[] = {0x16, 0x04, 'I', 'M', 'G', '4'}; // IA5String 'IMG4'
+/*
+ * A Mach-O boot object (tools/macho_boot_object.py) has its __PRELINK_INFO plist right after the
+ * raw image, where iBoot loads it. No payload or config line starts this way.
+ */
+static const u8 prelink_info_magic[] = {'<', '?', 'x', 'm', 'l', ' '};
 /*
  * aura's own payload records start "aura_". Payloads made for the bootloader aura replaced
  * start "m1n1_" instead; both are accepted so existing installs and payload builders keep
@@ -152,7 +158,7 @@ static void *decompress_xz(void *p, size_t size)
 
 static void *load_fdt(void *p, size_t size)
 {
-    int rank = payload_profile_rank(p, os_firmware.version == V26_6_2);
+    int rank = payload_profile_rank(p, firmware_os_components() == V26_6_2);
     if (rank && rank >= fdt_rank && fdt_node_check_compatible(p, 0, expect_compatible) == 0) {
         printf("Found a devicetree for %s at %p\n", expect_compatible, p);
         fdt = p;
@@ -174,9 +180,12 @@ static void *load_cpio(void *p, size_t size)
     return ((u8 *)p) + size;
 }
 
+static size_t kernel_payload_size;
+
 static void *load_kernel(void *p, size_t size)
 {
     kernel = p;
+    kernel_payload_size = size ? size : kernel->image_size;
 
     assert(size <= kernel->image_size);
 
@@ -210,7 +219,7 @@ static void *load_kernel(void *p, size_t size)
 /* Passed after every other line to a chainloaded stage when a config line was lost */
 #define CONFIG_LOST_VAR "m1n1.config-lost=1"
 
-/* The two extra slots carry CONFIG_LOST_VAR and nvme.adopt without reducing the chosen limit. */
+/* The two extra slots carry CONFIG_LOST_VAR and nvme.sart without reducing the chosen limit. */
 #ifdef CHAINLOADING
 static size_t chosen_cnt = 1;
 static char *chosen[MAX_CHOSEN_VARS + 2] = {
@@ -237,8 +246,8 @@ static bool config_seen = false;
 static bool config_lost_passed = false;
 
 static const char *const config_names[] = {
-    "chosen.",  "chainload=",   "boot=", "nvme.adopt=",
-    "display=", "mitigations=", "tso=",  "m1n1.config-lost=",
+    "chosen.", "chainload=",        "boot=", "nvme.sart=", "display=", "mitigations=",
+    "tso=",    "m1n1.config-lost=", "hib=",
 #ifdef SPTM_VIRT_ESP
     "macos=",
 #endif
@@ -301,12 +310,13 @@ static bool check_var(u8 **p)
         if (!macos_spec)
             macos_spec = val;
 #endif
-    } else if (IS_VAR("nvme.adopt=")) {
-        if (!strcmp(val, "live-rtkit-v1")) {
-            nvme_adopt_live_session = true;
-            /* Started by an earlier aura stage, which has had its host window already. */
+    } else if (IS_VAR("nvme.sart=")) {
+        /* Started by an earlier aura stage, which has had its host window already. */
+        if (nvme_set_sart_var(val))
             stage1_chained = true;
-        }
+    } else if (IS_VAR("nvme.adopt=")) {
+        /* An older Stage 1 hands its session on running; nvme_init() finds it by itself. */
+        stage1_chained = true;
 #ifdef DEBUGUSB_PROXY
     } else if (IS_VAR("aura.host-window=")) {
         stage1_window_passed = true;
@@ -319,6 +329,8 @@ static bool check_var(u8 **p)
         mitigations_configure(val);
     } else if (IS_VAR("tso=")) {
         enable_tso = val[0] == '1';
+    } else if (IS_VAR("hib=")) {
+        kboot_request_hibernate_layout(val[0] == '1');
     } else {
         printf("Unknown variable %.*s\n", (int)(val - (char *)*p - 1), (char *)*p);
     }
@@ -355,6 +367,9 @@ static void *load_one_payload(void *start, size_t size)
         memcpy(&size, p + hdr, 4);
 
         printf("Found a signature at %p, skipping 0x%x bytes\n", p, size);
+        /* An image trailer (secboot.c) ends the image: nothing after it is a payload. */
+        if (!memcmp(p + size + 8, "AURSIGT1", 8))
+            return NULL;
         return p + size;
     } else if ((hdr = payload_record(p, initramfs_magic, sizeof initramfs_magic))) {
         u32 size;
@@ -367,7 +382,8 @@ static void *load_one_payload(void *start, size_t size)
                hdr + CUSTOM_LOGO_SIZE);
         return p + hdr + CUSTOM_LOGO_SIZE;
     } else if (!memcmp(p, empty, sizeof empty) ||
-               !memcmp(p + 0x05, img4_magic, sizeof img4_magic)) { // SEPFW after aura
+               !memcmp(p + 0x05, img4_magic, sizeof img4_magic) || // SEPFW after aura
+               !memcmp(p, prelink_info_magic, sizeof prelink_info_magic)) {
         /* Before check_var(): an end whose bytes also read as a line is still the end */
         printf("No more payloads at %p\n", p);
         return NULL;
@@ -451,9 +467,14 @@ int payload_run(void)
     }
 
     if (!payload_scanned) {
-        void *p = payload_start();
+        u8 *p = payload_start();
+        /* Before anything in the payloads is parsed: an enforcing stage runs only signed ones. */
+        if (secboot_check_payloads(p, &p)) {
+            next_stage.entry = NULL;
+            return -1;
+        }
         cpufreq_payload_boost(true);
-        while (p)
+        while (p && (p = secboot_payload_next(p)))
             p = load_one_payload(p, 0);
         cpufreq_payload_boost(false);
         payload_scanned = true;
@@ -529,12 +550,19 @@ int payload_run(void)
     }
 
     if (kernel && fdt) {
-        /* The shared post-M4 U-Boot driver adopts ANS instead of starting it, on every
-         * T8132 board. An inline ESP payload has not gone through boot_storage_load(). */
-        if (chip_id == T8132 && !nvme_init()) {
-            printf("Payload: cannot prepare the M4 ANS session\n");
+        /*
+         * Linux adopts a running post-M4 ANS from boot=. The U-Boot we embed adopts a running
+         * post-M4 ANS too, and can't start one from off: if an earlier stage powered ANS off
+         * (nvme.sart=), start it here and hand it on running, as for boot=. Otherwise any other
+         * payload gets ANS as this stage found it, or powered off with the SART entries passed
+         * on if this stage used it.
+         */
+        bool nvme_started = !boot_spec && nvme_post_m4_passed_off();
+        if (nvme_started && !nvme_init())
             goto boot_failed;
-        }
+        nvme_keep_running_for_linux = boot_spec || nvme_started;
+        if (!nvme_keep_running_for_linux && !nvme_shutdown())
+            goto boot_failed;
         cpufreq_init();
         if (smp_start_secondaries() && chip_id == T8140) {
             printf("SMP: refusing payload handoff with missing T8140 CPUs\n");
@@ -582,6 +610,10 @@ int payload_run(void)
 
         if (config_lost)
             kboot_set_config_lost();
+        if (!boot_spec) {
+            secboot_measure("dtb", fdt, fdt_totalsize(fdt), SECBOOT_MEASURED);
+            secboot_measure("kernel", kernel, kernel_payload_size, SECBOOT_MEASURED);
+        }
         if (kboot_prepare_dt(fdt)) {
             printf("Failed to prepare FDT!\n");
             goto boot_failed;
@@ -589,14 +621,13 @@ int payload_run(void)
 
         if (kboot_boot(kernel))
             goto boot_failed;
-        if (boot_spec)
-            nvme_keep_running_for_linux = true;
         return 0;
 
     boot_failed:
         next_stage.entry = NULL;
-        if (boot_spec) {
+        if (boot_spec)
             kboot_set_initrd(NULL, 0);
+        if (nvme_keep_running_for_linux) {
             nvme_keep_running_for_linux = false;
             nvme_shutdown();
         }

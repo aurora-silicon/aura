@@ -578,9 +578,12 @@ static void mmu_remap_smp_shared(void)
     if (chip_id == T8152)
         return;
     extern u8 _smp_shared_start[], _smp_shared_end[];
-    u64 base = (u64)_smp_shared_start;
-    u64 size = _smp_shared_end - _smp_shared_start;
 
+    mmu_map_uncached((u64)_smp_shared_start, _smp_shared_end - _smp_shared_start);
+}
+
+void mmu_map_uncached(u64 base, u64 size)
+{
     /*
      * Make sure there is absolutely no mapping anywhere that tries to access this area
      * through caches to prevent mismatched views of memory between cores that run with
@@ -611,7 +614,7 @@ static void mmu_add_default_mappings(void)
     mmu_add_mapping(ram_base, ram_base, mem_size_actual, MAIR_IDX_NORMAL, PERM_RWX);
 
     /* Unmap carveout regions */
-    if (mcc_unmap_carveouts() && (chip_id == T8140 || chip_id == T6040))
+    if (mcc_unmap_carveouts() && (chip_id == T8140 || chip_id == T6040 || chip_id == T6050))
         panic("MMU: Firmware carveouts are unavailable\n");
 
     /*
@@ -769,7 +772,7 @@ void mmu_init_secondary_local(void)
      * both to be safe since this code only runs once after a core is started for the first time.
      */
     sysop("dsb sy"); // ensure all stores to RAM with Device-nGnRnE semantics are completed
-    dc_ivac_range(secondary_stacks[smp_id()], SECONDARY_STACK_SIZE);
+    dc_ivac_range(smp_secondary_stack(smp_id()), SECONDARY_STACK_SIZE);
     sysop("dsb sy"); // ensure cache invalidation is completed
 
     write_sctlr(sctlr);

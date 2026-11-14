@@ -18,3 +18,6 @@ that were initially stored alongside these scripts.
 
 Register now resides in the `proxyclient/aura` folder, so that `proxyclient`
 can load them while avoiding path traversal, using Python's resource loader.
+
+For opt-in J613 RTC alarm DTB preparation before Stage 2 composition, see
+[the RTC wiring procedure](../docs/j613-rtc-alarm.md).
