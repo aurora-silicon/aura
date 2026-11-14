@@ -294,6 +294,7 @@ pub unsafe extern "C" fn rust_load_image(
 
 /// Read the file spec names (PARTUUID;path) into dst, at most cap bytes, with nothing allocated:
 /// for files larger than aura's heap. In .rodata, which aura maps executable, as .text is full.
+#[cfg(feature = "sptm_virt_esp")]
 #[no_mangle]
 #[link_section = ".rodata.xtext"]
 pub unsafe extern "C" fn rust_read_into(
@@ -321,6 +322,7 @@ pub unsafe extern "C" fn rust_read_into(
     }
 }
 
+#[cfg(feature = "sptm_virt_esp")]
 #[link_section = ".rodata.xtext"]
 fn read_into(spec: &str, dst: &mut [u8]) -> Result<usize, Error> {
     let (uuid, path) = spec.split_once(';').ok_or(Error::BadArgs)?;

@@ -20,6 +20,9 @@ versions = { path = "./versions" }
 
 [features]
 chainload = ["dep:fatfs", "dep:uuid"]
+# rust_read_into() (the macos= bundle reader) is pulled in only by the SPTM-virt ESP Stage 2;
+# keep its fatfs/GPT monomorphisations out of every other Stage 1 (aura-raw.ld size).
+sptm_virt_esp = ["chainload"]
 
 # One codegen unit: with the default 16, functions are ordered differently from build to
 # build, and the same tree gives a different image.

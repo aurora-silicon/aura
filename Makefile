@@ -167,6 +167,7 @@ ifneq ($(ESP_STAGE2)$(SPTM_VIRT),11)
 $(error SPTM_VIRT_ESP requires ESP_STAGE2=1 and SPTM_VIRT=1)
 endif
 CFG += SPTM_VIRT_ESP
+CARGO_FLAGS += --features sptm_virt_esp
 endif
 
 LDFLAGS := -EL -maarch64elf --no-undefined -X -Bsymbolic \
