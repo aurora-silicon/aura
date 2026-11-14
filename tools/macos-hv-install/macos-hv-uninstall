@@ -1,0 +1,132 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+#
+# macos-hv-uninstall — undo macos-hv-install and put the plain macOS boot back.
+#
+# Three independent parts, each safe to run on its own. None needs the HV to have ever
+# booted, so you can always recover:
+#
+#   un-enrol    restore the macOS volume's stock Stage 1 (run from 1TR / recoveryOS).
+#               This is `kmutil configure-boot -v <vol>` with no custom object, which
+#               returns the volume to booting macOS the normal way.
+#   clean-esp   remove the bundle files from the ESP (aurora/macos/* and the macOS
+#               Stage 2 and the aura-try marker). Run from Linux, macOS or 1TR. It never
+#               touches Linux's own boot files or NVRAM.
+#   remove-tool remove the auractl tool from macOS.
+#   all         un-enrol (if in 1TR) + clean-esp + remove-tool, as the environment allows.
+#
+# Usage: macos-hv-uninstall [--dry-run] [--volume VOL] [--esp MP] [--partuuid UUID]
+#                           [--tool-dest DIR] <command>
+set -eu
+
+SELF=$(cd "$(dirname "$0")" && pwd)
+LIBDIR="$SELF/lib"
+AURA_ROOT=$(cd "$SELF/../.." && pwd)
+# shellcheck source=lib/common.sh
+. "$LIBDIR/common.sh"
+
+DRY=0
+VOLUME=/
+ESP=
+PARTUUID=
+TOOL_DEST=${HVI_TOOL_DEST:-/usr/local/bin}
+ASSUME_YES=0
+CMD=
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --dry-run) DRY=1 ;;
+        --volume) VOLUME=$2; shift ;;
+        --esp) ESP=$2; shift ;;
+        --partuuid) PARTUUID=$2; shift ;;
+        --tool-dest) TOOL_DEST=$2; shift ;;
+        -y|--assume-yes) ASSUME_YES=1 ;;
+        -h|--help) sed -n '3,25p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -*) die "unknown option $1" ;;
+        *) CMD=$1; shift; break ;;
+    esac
+    shift
+done
+[ -n "$CMD" ] || { sed -n '3,25p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+
+confirm() {
+    [ "$ASSUME_YES" = 1 ] && return 0
+    printf '%s [y/N] ' "$1" >&2
+    read -r a; case "$a" in y|Y|yes|YES) return 0 ;; *) die "cancelled" ;; esac
+}
+
+# --- resolve the ESP mount point, the way install_esp.sh does -----------------------
+resolve_esp() {
+    [ -n "$ESP" ] && { [ -d "$ESP" ] || die "$ESP is not a directory"; return; }
+    if have findmnt && [ -n "$PARTUUID" ]; then
+        dev=$(readlink -f "/dev/disk/by-partuuid/$PARTUUID" 2>/dev/null || true)
+        [ -n "$dev" ] && ESP=$(findmnt -n -o TARGET -S "$dev" | head -n1 || true)
+    fi
+    [ -n "$ESP" ] || die "the ESP is not mounted; pass --esp <mountpoint> (and --partuuid to be sure)"
+}
+
+do_un_enrol() {
+    step "Restore the macOS volume's stock Stage 1 (1TR)"
+    [ "$(host_os)" = macos ] || die "the un-enrol step runs from macOS recoveryOS (1TR)"
+    require_tools bputil kmutil diskutil
+    case "$VOLUME" in /*) SYS=$VOLUME ;; *) SYS="/Volumes/$VOLUME" ;; esac
+    [ -d "$SYS" ] || die "$SYS is not mounted"
+    grp=$(diskutil info "$SYS" | sed -n 's/^ *APFS Volume Group: *//p')
+    [ -n "$grp" ] || die "no APFS volume group for $SYS"
+    pol=$(bputil -d -v "$grp" 2>&1 || true)
+    echo "$pol" | sed -n '/one true recoveryOS/p' | grep -q . ||
+        die "not 1TR. Shut down, hold power until 'Loading startup options', choose Options."
+    echo "$pol" | sed -n '/: Paired/p' | grep -q . ||
+        die "this recoveryOS is not paired with $SYS"
+    ok "1TR, paired with $SYS"
+    info "this runs: kmutil configure-boot -v $SYS   (no custom object = stock macOS boot)"
+    confirm "Restore the stock Stage 1 for $SYS?"
+    run "restore stock boot for $SYS" kmutil configure-boot -v "$SYS"
+    [ "$DRY" = 1 ] || ok "stock Stage 1 restored. Restart to boot macOS normally."
+}
+
+do_clean_esp() {
+    step "Remove the bundle files from the ESP"
+    resolve_esp
+    echo "    ESP: $ESP"
+    # Exactly the set install_esp.sh writes, plus arm_trial.sh's marker. Nothing else.
+    for rel in "aurora/macos" "m1n1/stage2-macos.bin" "aurora/stage2-macos.bin" "aura-try"; do
+        t="$ESP/$rel"
+        [ -e "$t" ] || continue
+        # Guard: never let a bad --esp turn this into a Linux-boot wipe.
+        case "$rel" in
+            aurora/macos|m1n1/stage2-macos.bin|aurora/stage2-macos.bin|aura-try) ;;
+            *) die "refusing to remove $rel" ;;
+        esac
+        if [ -d "$t" ]; then run "remove directory $rel" rm -rf "$t"
+        else run "remove $rel" rm -f "$t"; fi
+    done
+    # Clean an empty m1n1/ only if we emptied it (never touch Linux's hv_boot.bin etc.).
+    [ -d "$ESP/m1n1" ] && [ -z "$(ls -A "$ESP/m1n1" 2>/dev/null)" ] && run "remove empty m1n1/" rmdir "$ESP/m1n1" || true
+    [ "$DRY" = 1 ] || sync
+    ok "ESP cleaned. Linux's boot is unchanged."
+}
+
+do_remove_tool() {
+    step "Remove the auractl tool"
+    t="$TOOL_DEST/auractl"
+    [ -e "$t" ] || { info "no $t to remove"; return 0; }
+    run "remove $t" rm -f "$t"
+    ok "auractl removed"
+}
+
+case "$CMD" in
+    un-enrol|un-enroll|unenroll) do_un_enrol ;;
+    clean-esp) do_clean_esp ;;
+    remove-tool) do_remove_tool ;;
+    all)
+        # Do what the current environment allows; print what it can't.
+        if [ "$(host_os)" = macos ] && have bputil && bputil -d 2>/dev/null | grep -qi 'one true recoveryOS'; then
+            do_un_enrol
+        else
+            warn "not in 1TR: skipping un-enrol. Run '$SELF/macos-hv-uninstall un-enrol' from recoveryOS to restore the stock boot."
+        fi
+        do_clean_esp
+        [ "$(host_os)" = macos ] && do_remove_tool || info "skipping tool removal (not macOS)"
+        ;;
+    *) die "unknown command '$CMD'" ;;
+esac

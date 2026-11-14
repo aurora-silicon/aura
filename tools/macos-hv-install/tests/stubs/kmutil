@@ -1,0 +1,19 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Stub kmutil.
+#   inspect -z -B <obj> --show-mach-boot-properties -> print "kcbz : 0" (object is OK,
+#       iBoot would NOT start SPTM) so enroll-stage1.sh proceeds.
+#   configure-boot ...  -> the MUTATING call. Log it and succeed. Tests assert this is
+#       NOT logged under --check/--dry-run and IS logged on a real enrol/un-enrol.
+: "${STUBLOG:=/dev/null}"
+echo "kmutil $*" >> "$STUBLOG"
+case "$1" in
+    inspect)
+        echo "  kcbz : 0"
+        ;;
+    configure-boot)
+        # mutating: already logged above.
+        ;;
+    *) ;;
+esac
+exit 0

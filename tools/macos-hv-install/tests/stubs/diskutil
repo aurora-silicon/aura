@@ -1,0 +1,19 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Stub diskutil. `info <target>` prints the lines the installer parses:
+#   APFS Volume Group:  (for enroll-stage1.sh / uninstall un-enrol / fetch_firmware)
+#   Partition UUID:     (lowercased, for install_esp.sh's partition check)
+# Group and partuuid come from env so tests can set them.
+: "${STUBLOG:=/dev/null}"
+echo "diskutil $*" >> "$STUBLOG"
+grp=${HVI_TEST_GROUP:-11111111-2222-3333-4444-555555555555}
+puuid=${HVI_TEST_PARTUUID:-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee}
+case "$1" in
+    info)
+        echo "   Device Identifier:         disk0s1"
+        echo "   APFS Volume Group:         $grp"
+        echo "   Partition UUID:            $puuid"
+        ;;
+    *) ;;
+esac
+exit 0

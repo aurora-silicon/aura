@@ -1,0 +1,11 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Stub sysctl for the macOS-path tests. Model is overridable via HVI_TEST_MODEL.
+model=${HVI_TEST_MODEL:-Mac16,7}
+case "$*" in
+    "-n hw.product")               echo "$model" ;;
+    "-n hw.model")                 echo "$model" ;;
+    "-n machdep.cpu.brand_string") echo "Apple M4 Pro" ;;
+    "-n kern.bootargs")            echo "-v hvi_cookie=deadbeef" ;;
+    *)                             echo "" ;;
+esac
