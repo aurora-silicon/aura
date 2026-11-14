@@ -109,7 +109,15 @@ static int adt_get_reg(void *a, int *path, const char *p, int i, u64 *base, u64 
     return 0;
 }
 static asc_dev_t *asc_init(const char *path) { return &asc; }
-static bool asc_cpu_running(asc_dev_t *a) { return started || (failure != 1 && failure != 27); }
+/* 30-32 (T8142) model ANS's power: its CPU is stopped from the power off to a warm boot. */
+static bool model_power, cpu_off, earlier_session, enable_fails_once;
+static int ans_offs, ans_ons, warm_boots, quiesces;
+static bool asc_cpu_running(asc_dev_t *a)
+{
+    if (model_power && cpu_off)
+        return false;
+    return started || (failure != 1 && failure != 27);
+}
 static void asc_free(asc_dev_t *a) { asc_frees++; }
 static u32 read32(u64 addr)
 {
@@ -128,16 +136,29 @@ static void write64_lo_hi(u64 addr, u64 value)
         cleared_ioq++;
 }
 static void nvme_log_entry_state(bool running) {}
-/* No earlier aura stage's queue setup: a running session is iBoot's. */
-static u64 nvme_read64_lo_hi(u64 addr) { return 0; }
+/* No earlier aura stage's queue setup, unless one is modelled: a running session is iBoot's. */
+static u64 nvme_read64_lo_hi(u64 addr) { return earlier_session && addr == nvmmu_base + NVMMU_ASQ_BASE; }
 static int adt_path_offset(void *a, const char *p) { return 1; }
 static int pcie_init(void) { return 0; }
-/* Non-T6050 power-on delegates to pcie_init() in production too. */
-static int pcie_ans_power_on(void) { assert(chip_id != T6050); return pcie_init(); }
+/* The power steps succeed; T6050's controller suspend isn't modelled (nvme_ctrl_suspend()). */
+static int pcie_ans_power_on(void) { assert(chip_id != T6050); ans_ons++; return pcie_init(); }
 /* Shutdown faults 3 and 4: ANS doesn't power off. */
-static int pcie_ans_power_off(void) { return shutdown_fault == 3 || shutdown_fault == 4 ? -1 : 0; }
+static int pcie_ans_power_off(void)
+{
+    if (shutdown_fault == 3 || shutdown_fault == 4)
+        return -1;
+    ans_offs++;
+    cpu_off = true;
+    return 0;
+}
 static bool rtkit_idle(rtkit_dev_t *r) { return true; }
-static bool rtkit_boot_warm(rtkit_dev_t *r, u32 mask) { return true; }
+static bool rtkit_boot_warm(rtkit_dev_t *r, u32 mask)
+{
+    assert(r);
+    warm_boots++;
+    cpu_off = false;
+    return true;
+}
 static int sart_get_entries(sart_dev_t *s, struct sart_entry *e, int max) { return 1; }
 static bool sart_set_entries(sart_dev_t *s, const struct sart_entry *e, int n) { return true; }
 static sart_dev_t *sart_init(const char *path) { return &sart; }
@@ -152,13 +173,20 @@ static void event(char c) { size_t n = strlen(events); if (n + 1 < sizeof(events
 static bool rtkit_sleep(rtkit_dev_t *r) { event(sleep_fails ? 'F' : 'S'); return !sleep_fails; }
 static void rtkit_stop(rtkit_dev_t *r) { event('X'); }
 static void asc_cpu_stop(asc_dev_t *a) { event('X'); }
-static bool rtkit_quiesce(rtkit_dev_t *r) { return true; }
+static bool rtkit_quiesce(rtkit_dev_t *r) { assert(r); quiesces++; return true; }
 static void rtkit_free(rtkit_dev_t *r) {}
 static void pmgr_reset(u8 die, const char *name) { resets++; event('R'); }
 static int poll32(u64 a, u32 mask, u32 value, unsigned timeout) { return 0; }
 static bool nvme_ctrl_disable(void)
 { disable_calls++; return failure != 2 && !(shutdown_fault == 4 && disable_calls == 2); }
-static bool nvme_ctrl_enable(void) { return failure != 3; }
+static bool nvme_ctrl_enable(void)
+{
+    if (enable_fails_once) {
+        enable_fails_once = false;
+        return false;
+    }
+    return failure != 3;
+}
 static bool nvme_ctrl_shutdown(void) { shutdown_calls++; return shutdown_fault != 3; }
 /* The T6050 controller suspend protocol is outside this queue-lifetime model. */
 static bool nvme_ctrl_suspend(void) { abort(); }
@@ -177,6 +205,45 @@ int main(int argc, char **argv)
 {
     assert(argc == 2);
     failure = atoi(argv[1]);
+    if (failure >= 30) {
+        /* T8142: ANS is cycled through its storage gates (pcie_ans_power_off()). */
+        chip_id = T8142;
+        model_power = true;
+        earlier_session = failure >= 31;
+        enable_fails_once = failure == 32;
+        failure = 0;
+        assert(nvme_init());
+        if (!earlier_session) {
+            /* iBoot's session: this stage's handshake. */
+            assert(boots == 1 && !warm_boots && !ans_offs);
+        } else if (!enable_fails_once && ans_offs) {
+            /* An adopted session that didn't come ready: off and started again, warm. */
+            assert(boots == 0 && ans_offs == 1 && ans_ons == 1 && warm_boots == 1);
+        } else {
+            /* A healthy adopted session, taken as it is, without an RTKit instance yet. */
+            assert(boots == 0 && !ans_offs && !nvme_rtkit);
+            nvme_quiesce_for_next = true;
+            /* A next stage that doesn't service the mailbox: quiesced through an own instance. */
+            assert(nvme_shutdown());
+            assert(quiesces == 1 && !ans_offs && !nvme_initialized && !nvme_reboot_required);
+            for (unsigned i = 0; i < allocated; i++)
+                free(allocations[i]);
+            return 0;
+        }
+        /* Done with ANS: a normal shutdown even after only reads, then the power off. */
+        int saved_shutdowns = shutdown_calls, saved_offs = ans_offs;
+        assert(nvme_shutdown());
+        assert(shutdown_calls == saved_shutdowns + 1 && ans_offs == saved_offs + 1);
+        assert(!nvme_initialized && !nvme_reboot_required && cpu_off);
+        /* The next owner starts it from off with the SART entries kept. */
+        int saved_boots = boots, saved_warm = warm_boots;
+        assert(nvme_init());
+        assert(boots == saved_boots && warm_boots == saved_warm + 1 && !cpu_off);
+        assert(nvme_shutdown());
+        for (unsigned i = 0; i < allocated; i++)
+            free(allocations[i]);
+        return 0;
+    }
     if (failure == 28 || failure == 29) {
         /*
          * M1-M3 handoff from a stage that only read. The firmware does its shutdown work
@@ -293,5 +360,5 @@ int main(int argc, char **argv)
          "-Wno-unused-variable", "-Wno-format", "-x", "c", "-", "-o", str(binary)],
         input=harness, text=True, check=True,
     )
-    for failure in range(30):
+    for failure in range(33):
         subprocess.run([str(binary), str(failure)], check=True)
