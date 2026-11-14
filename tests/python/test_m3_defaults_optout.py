@@ -504,12 +504,13 @@ def t6031_lines(r):
     return {k: v for k, v in r.chosen.items() if k.startswith("asahi,t6031-")}
 
 
+@pytest.mark.parametrize("board", ["j514c", "j516c"])
 @pytest.mark.parametrize("build", STAGE2)
-def test_the_j516c_gets_its_display_and_gpu_defaults_and_nothing_else(tools, build):
+def test_the_t6031_boards_get_display_and_gpu_without_config(tools, build, board):
     """A boot.bin with no config: both switches are armed, and the real T6031 GPU entry sees its
     switch and runs its image read, identity probe and setup, all on the first boot that loads
     this stage 2"""
-    b = boot(tools, build, b"", board="j516c")
+    b = boot(tools, build, b"", board=board)
     booted(b)
     assert t6031_lines(b) == MAX and {MAX_DCP, MAX_GPU} <= b.armed
     assert not any(n.startswith(("asahi,t8122-", "asahi,t6030-")) for n in b.chosen)
@@ -530,32 +531,33 @@ def test_the_j516c_gets_its_display_and_gpu_defaults_and_nothing_else(tools, bui
      "t6031-disabled"),
 ], ids=["gpu-off", "gpu-on-then-off", "gpu-on", "master-off", "master-off-gpu-on",
         "master-off-dcp-on", "dcp-on", "dcp-off", "both-off"])
+@pytest.mark.parametrize("board", ["j514c", "j516c"])
 @pytest.mark.parametrize("build", STAGE2)
-def test_j516c_owner_lines_are_kept(tools, build, config, lines, select):
-    b = boot(tools, build, config, board="j516c")
+def test_t6031_owner_lines_are_kept(tools, build, board, config, lines, select):
+    b = boot(tools, build, config, board=board)
     booted(b)
     assert t6031_lines(b) == lines and b.select == select
     assert bool(b.probes) == (select == "t6031-g15")
     assert b.armed & {MAX_DCP, MAX_GPU} == {k for k, v in lines.items() if v == "1"}
 
 
-@pytest.mark.parametrize("board", ["j514c", "j514m", "j516m", "j293", "j433"])
+@pytest.mark.parametrize("board", ["j514m", "j516m", "j293", "j433"])
 @pytest.mark.parametrize("build", STAGE2)
 def test_other_maxes_and_macs_get_no_default(tools, build, board):
     b = boot(tools, build, b"", board=board)
     booted(b)
     assert not any(n.startswith(M3_LINES) for n in b.chosen), b.stdout
     assert not b.probes
-    # the J514C reaches the T6031 entry, which needs its line as before; T6034 has no GPU path
-    assert b.select == {"j514c": "t6031-disabled", "j433": "reservation-only"}.get(board, "none")
+    # T6034 has no GPU path; the J433 (M3 iMac) reaches only the T8122 reservations
+    assert b.select == {"j433": "reservation-only"}.get(board, "none")
 
 
 @pytest.mark.parametrize("config,lines", [
-    (b"chosen.asahi,t6031-gpu=1\n", {MAX_GPU: "1"}),
+    (b"chosen.asahi,t6031-gpu=1\n", MAX),
     (b"chosen.asahi,t6031-gpu=1\nchosen.asahi,t6031-dcp=1\n", MAX),
 ], ids=["gpu", "gpu-dcp"])
 @pytest.mark.parametrize("build", STAGE2)
-def test_the_j514c_manual_line_works_as_before(tools, build, config, lines):
+def test_explicit_j514c_enable_lines_match_normal_defaults(tools, build, config, lines):
     b = boot(tools, build, config, board="j514c")
     booted(b)
     assert t6031_lines(b) == lines and b.select == "t6031-g15"
@@ -608,7 +610,7 @@ def test_literal_display_zero_is_the_framebuffer_setting(tools, build):
     assert set(AIR) <= b.armed
 
 
-# ---- a lost line: no graphics on the four boards, and the Mac still boots ----
+# ---- a lost line: no graphics on the supported boards, and the Mac still boots ----
 
 LOSSES = {
     "gpu-on-fillers-lost-gpu-off": lambda build: GPU_ON + fill(build, keep=1) + GPU_OFF,
@@ -668,16 +670,13 @@ def test_a_kboot_table_too_small_for_the_config(tools, build):
     graphics_off(boot(tools, build, b"tso=1\n" + GPU_ON + lines))
 
 
-@pytest.mark.parametrize("board,line", [("j514c", b"chosen.asahi,t6031-gpu="),
-                                        ("j516m", b"chosen.asahi,t6031-gpu="),
+@pytest.mark.parametrize("board,line", [("j516m", b"chosen.asahi,t6031-gpu="),
                                         ("j293", b"chosen.test,switch=")])
 @pytest.mark.parametrize("build", STAGE2)
 def test_other_boards_keep_their_lines_after_a_loss(tools, build, board, line):
     b = boot(tools, build, line + b"1\n" + fill(build, keep=1) + line + b"0\n", board=board)
     booted(b)
     assert b.chosen[line[7:-1].decode()] == "1"   # as before the M3 defaults: no rule there
-    if board == "j514c":
-        assert b.select == "t6031-g15"
 
 
 # ---- the chainload route ----
