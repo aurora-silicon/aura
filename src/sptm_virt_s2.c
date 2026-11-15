@@ -196,6 +196,11 @@ static bool sptm_virt_rg_hook(struct exc_info *ctx, u64 addr, u64 *val, bool wri
                write ? "wr" : "rd", a - rg_xwdt, write ? " <- " : " ", write ? *val : 0, ctx->elr,
                sptm_virt_in_cl4() ? " (cL4)" : "");
     sptm_virt_s2r_note(ctx, addr, write ? *val : 0, write, width);
+#ifdef AURACTL_WALK_DIAG
+    /* XNU's watchdog driver pets the WDT after the kernel is up, so this hook runs in XNU's own EL1
+     * regime with its stage-1 MMU live: the one context AT S12E1R needs. One-shot, self-guarded. */
+    sptm_virt_walk_diag();
+#endif
     if (sptm_virt_rg_passthrough) {
         for (int w = 0; write && width == 2 && w < 2; w++) {
             u64 base = w ? rg_xwdt : rg_wdt;
@@ -565,6 +570,9 @@ void sptm_virt_s2_setup(void)
     sptm_virt_gpu_setup();
 #ifdef AURACTL
     sptm_virt_ctl_s2_setup(); /* splits blocks: before the tree is summed */
+#endif
+#ifdef AURACTL_WALK_DIAG
+    sptm_virt_walk_diag_setup(); /* allocate the carve-out scratch page for the tetherless readout */
 #endif
 
     /* SPTM's own bring-up runs without it; each core arms it at its GEXIT into XNU, after

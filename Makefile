@@ -168,6 +168,16 @@ endif
 CFG += AURACTL
 endif
 
+# Dev diagnostic only (AURACTL-16, Dj seq 1259): translate the acct patch site's guest VA through
+# XNU's live stage 1 + aura's stage 2 and compare the runtime PA with the PA aura patched, to find
+# why the acct entry runs stock on the ESP self-boot. src/sptm_virt_walk_diag.c. Never in Stage 1.
+ifeq ($(AURACTL_WALK_DIAG),1)
+ifneq ($(AURACTL)$(SPTM_VIRT_ESP),11)
+$(error AURACTL_WALK_DIAG requires AURACTL=1 and SPTM_VIRT_ESP=1)
+endif
+CFG += AURACTL_WALK_DIAG
+endif
+
 
 # Trace builds only: an ESP Stage 2 that boots macOS under SPTM-virt from files on the ESP (the
 # macos= line, src/sptm_virt_esp.c, tools/esp-macos) instead of a Linux boot= or chainload=.
@@ -302,6 +312,9 @@ OBJECTS += nv2.o nv2_asm.o sptm_virt.o sptm_virt_cl4.o sptm_virt_gl.o sptm_virt_
 endif
 ifeq ($(AURACTL),1)
 OBJECTS += sptm_virt_ctl.o
+endif
+ifeq ($(AURACTL_WALK_DIAG),1)
+OBJECTS += sptm_virt_walk_diag.o
 endif
 ifeq ($(SPTM_VIRT_ESP),1)
 OBJECTS += sptm_virt_esp.o sptm_virt_esp_plan.o sha256.o

@@ -6,6 +6,7 @@ void stage1_proxy_window_init(struct stage1_proxy_window *window, u32 timeout_ms
 {
     window->timeout_ms = timeout_ms;
     window->kis_only = false;
+    window->kis_force = false;
 }
 
 enum stage1_proxy_result stage1_proxy_window_step(struct stage1_proxy_window *window,
@@ -13,7 +14,7 @@ enum stage1_proxy_result stage1_proxy_window_step(struct stage1_proxy_window *wi
                                                   bool carrier_taken, bool cdc_sync, bool kis_sync)
 {
     if (cdc_failed) {
-        if (carrier_taken)
+        if (carrier_taken && !window->kis_force)
             return STAGE1_PROXY_CDC_FAILED;
         window->kis_only = true;
     }
@@ -21,7 +22,7 @@ enum stage1_proxy_result stage1_proxy_window_step(struct stage1_proxy_window *wi
     if (!window->kis_only && cdc_ready && cdc_sync)
         return STAGE1_PROXY_CDC;
 
-    if (!carrier_taken && kis_sync)
+    if ((!carrier_taken || window->kis_force) && kis_sync)
         return STAGE1_PROXY_KIS;
 
     if (elapsed_ms >= window->timeout_ms)

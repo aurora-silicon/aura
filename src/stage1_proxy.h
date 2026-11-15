@@ -30,6 +30,13 @@ enum stage1_payload_action {
 struct stage1_proxy_window {
     u32 timeout_ms;
     bool kis_only;
+    /*
+     * Lab-only (ESP_STAGE2_HOSTWIN): when a loader hop already took the debug-USB CDC carrier, a
+     * CDC-less SoC (J616s) would otherwise bail immediately and exclude the DockChannel from KIS.
+     * Forcing KIS-only lets a host still VDM-catch the window over the DockChannel. Never set in a
+     * shipping build.
+     */
+    bool kis_force;
 };
 
 void stage1_proxy_window_init(struct stage1_proxy_window *window, u32 timeout_ms);

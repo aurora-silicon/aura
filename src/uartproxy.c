@@ -111,6 +111,11 @@ enum stage1_proxy_result uartproxy_wait_stage1(unsigned int timeout_ms)
 {
     struct stage1_proxy_window window;
     stage1_proxy_window_init(&window, timeout_ms);
+#ifdef ESP_STAGE2_HOSTWIN_MS
+    /* Lab-only: let a VDM host catch the loader->stage2 window over the DockChannel even when the
+     * loader already owns the CDC carrier (the J616s Macintosh HD path). Never in a shipping build. */
+    window.kis_force = true;
+#endif
     bool schedule_failed = false;
     if (chip_id == T8140) {
         schedule_failed = usb_cdc_schedule(1000, 0, BIT(1) | BIT(2));
@@ -137,7 +142,7 @@ enum stage1_proxy_result uartproxy_wait_stage1(unsigned int timeout_ms)
         for (iodev_id_t i = 0; i < IODEV_MAX; i++) {
             if (i >= IODEV_USB0 && i < IODEV_USB0 + USB_IODEV_COUNT)
                 continue;
-            if (carrier_owned && i == IODEV_DOCKCHANNEL_UART)
+            if (carrier_owned && i == IODEV_DOCKCHANNEL_UART && !window.kis_force)
                 continue;
             if (uartproxy_sync_iodev(i)) {
                 serial_port = i;

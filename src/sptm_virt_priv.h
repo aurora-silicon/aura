@@ -130,6 +130,10 @@ u32 sptm_virt_s2r_ctl_release_all(void);
 u32 sptm_virt_s2r_ctl_count(u64 base, u64 size, u32 *ctl_pages);
 const void *sptm_virt_s2r_ctl_rec(u64 seq);
 void sptm_virt_s2r_marker(const char *tag, u64 arg);
+#ifdef AURACTL_WALK_DIAG
+void sptm_virt_walk_diag_setup(void); /* sptm_virt_walk_diag.c: allocate the carve-out scratch page */
+void sptm_virt_walk_diag(void);       /* one-shot measure from an XNU-regime hook once the MMU is on */
+#endif
 #endif
 
 #endif

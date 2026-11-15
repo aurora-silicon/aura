@@ -233,6 +233,10 @@ extern u32 sptm_virt_s2r_dcp_pkt, sptm_virt_s2r_cp_skip_ans, sptm_virt_s2r_cp_an
     sptm_virt_s2r_go_count, sptm_virt_s2r_wake_s, sptm_virt_s2r_quiesce, sptm_virt_ctrr_stash_off,
     sptm_virt_link_phys[2];
 extern u64 sptm_virt_diag_pa;
+extern u64 sptm_virt_xnu_rorgn[2];
+#ifdef AURACTL_WALK_DIAG
+extern u64 sptm_virt_walk_site_va, sptm_virt_walk_text_off, sptm_virt_walk_patch_pa;
+#endif
 
 /*
  * ANS's hand-off to XNU, after the last read from the ESP and before SPTM is entered: the state XNU
@@ -396,6 +400,57 @@ AURA_XTEXT int sptm_virt_esp_boot(const char *spec)
     }
     if (m->ctrr_stash)
         sptm_virt_ctrr_stash_off = m->ctrr_stash;
+
+    /*
+     * XNU's read-only region. run_guest_sptm.py's set_xnu_rorgn() does this over the debug link on
+     * the host-chainload path; the ESP self-boot has no host, so do it here. Without it XNU's
+     * rorgn_lockdown reads an empty region (the host patches that reach BootKC-rx, e.g. the auractl
+     * acct entry, then do not take effect in the running kernel). The BootKC-rx/ro region PAs come
+     * from the plan, identical to the python layout; the globals (segLOWESTRO/HIGHESTRO) sit at
+     * BootKC-ro's base + the manifest offsets. The matching `patch xnu ... rorgn` line (skip XNU's
+     * own CTRR_D read) and sptm_virt_ctrr_publish_rorgn() on the entering core complete the hand-off.
+     */
+    if (m->rorgn) {
+        const struct esp_region *rx = NULL, *ro = NULL;
+        for (u32 i = 0; i < pl->nregion; i++) {
+            if (!strcmp(pl->region[i].name, "BootKC-rx"))
+                rx = &pl->region[i];
+            if (!strcmp(pl->region[i].name, "BootKC-ro"))
+                ro = &pl->region[i];
+        }
+        if (!rx || !ro)
+            ESP_FAIL("rorgn: BootKC-rx/BootKC-ro region missing\n");
+        u64 lo = rx->pa, hi = ro->pa + ro->size - 1;
+        sptm_virt_xnu_rorgn[0] = lo;
+        sptm_virt_xnu_rorgn[1] = hi & ~0xfffUL;
+        write64(ro->pa + m->rorgn_g[0], lo);
+        write64(ro->pa + m->rorgn_g[1], hi);
+        printf("macOS ESP: XNU read-only region 0x%lx-0x%lx, globals at 0x%lx/0x%lx\n", lo, hi,
+               ro->pa + m->rorgn_g[0], ro->pa + m->rorgn_g[1]);
+    }
+
+#ifdef AURACTL_WALK_DIAG
+    /*
+     * Dev diagnostic (Dj seq 1259): record the acct patch site's VA + the PA aura patched, so the
+     * WDT-hook walk can translate the VA through XNU's live stage 1 + aura's stage 2 and compare.
+     * patch_pa = BootKC-rx.pa + text_off, the same word esp_patch_pa writes for the acct entry.
+     */
+    if (m->walk) {
+        const struct esp_region *rx = NULL;
+        for (u32 i = 0; i < pl->nregion; i++)
+            if (!strcmp(pl->region[i].name, "BootKC-rx"))
+                rx = &pl->region[i];
+        if (!rx)
+            ESP_FAIL("walk: BootKC-rx region missing\n");
+        sptm_virt_walk_site_va = m->walk_site_va;
+        sptm_virt_walk_text_off = m->walk_text_off;
+        sptm_virt_walk_patch_pa = rx->pa + m->walk_text_off;
+        printf("macOS ESP: walk diag site_va 0x%lx text_off 0x%lx -> patch_pa 0x%lx (= 0x%08x)\n",
+               sptm_virt_walk_site_va, sptm_virt_walk_text_off, sptm_virt_walk_patch_pa,
+               read32(sptm_virt_walk_patch_pa));
+    }
+#endif
+
     for (int i = 0; i < 2; i++)
         sptm_virt_link_phys[i] = m->link_phys[i];
 
@@ -403,6 +458,16 @@ AURA_XTEXT int sptm_virt_esp_boot(const char *spec)
         sptm_virt_flush(pl->load[i].pa, pl->load[i].total);
     sptm_virt_flush(pl->adt_pa, pl->adt_space);
     sptm_virt_flush(pl->boot_args_pa, sizeof(pl->boot_args));
+
+    /* Pre-enter proof: the xnu patches (acct entry, rorgn) are live at the handoff PA. */
+    for (u32 i = 0; i < m->npatch; i++) {
+        const struct esp_patch *p = &m->patch[i];
+        if (p->img != ESP_XNU)
+            continue;
+        u64 pa = esp_patch_pa(pl, p->img, p->off);
+        printf("macOS ESP: xnu patch %s @0x%lx = 0x%08x (was 0x%08x)\n", p->label, pa,
+               pa ? read32(pa) : 0, p->old);
+    }
 
     esp_free_files();
     cpufreq_payload_boost(false);
@@ -437,6 +502,18 @@ AURA_XTEXT int sptm_virt_esp_boot(const char *spec)
         ESP_FAIL("ANS hand-off failed\n");
     if (sptm_virt_load(pl->sptm_entry_pa, pl->boot_args_pa))
         ESP_FAIL("sptm_virt_load refused the plan\n");
+
+    /*
+     * Our post-load code patches (the auractl acct entry) land in BootKC __TEXT_EXEC. sptm_virt_flush
+     * cleans the data side to PoC, but the long on-device self-boot (NVMe, decompress, esp_plan, SPTM
+     * setup) runs after the text is placed, so the instruction cache may hold stale (unpatched) lines
+     * that outlive the data flush -- the host-chainload path does far less between load and enter and
+     * does not hit this. Invalidate the whole I-cache (inner shareable) so XNU fetches the patched
+     * text. Harmless when no text patch is present.
+     */
+    ic_ialluis();
+    sysop("dsb ish");
+    sysop("isb");
 
     /* A trial boot's watchdog tops out at 178 s, less than macOS needs. From here a hang is held
      * by the power button; the marker is spent, so the next boot is the configured one. */

@@ -246,6 +246,19 @@ AURA_XTEXT int esp_manifest_parse(struct esp_manifest *m, char *text, u64 len, c
         } else if (!strcmp(k, "ctrr-stash") && nt == 2) {
             if (!esp_num(tok[1], &m->ctrr_stash))
                 FAIL("manifest: bad ctrr-stash line");
+        } else if (!strcmp(k, "rorgn") && nt == 3) {
+            if (!esp_num(tok[1], &v[0]) || !esp_num(tok[2], &v[1]) || (v[0] >> 32) || (v[1] >> 32))
+                FAIL("manifest: bad rorgn line");
+            m->rorgn = true;
+            m->rorgn_g[0] = v[0];
+            m->rorgn_g[1] = v[1];
+        } else if (!strcmp(k, "walk") && nt == 3) {
+            /* AURACTL_WALK_DIAG: <site_va> is a full kernel VA, <text_off> its __TEXT_EXEC offset. */
+            if (!esp_num(tok[1], &v[0]) || !esp_num(tok[2], &v[1]) || (v[1] >> 32))
+                FAIL("manifest: bad walk line");
+            m->walk = true;
+            m->walk_site_va = v[0];
+            m->walk_text_off = v[1];
         } else if (!strcmp(k, "link-phys") && nt >= 2 && nt <= 3) {
             for (int i = 1; i < nt; i++) {
                 if (!esp_num(tok[i], &v[0]) || v[0] >> 32)

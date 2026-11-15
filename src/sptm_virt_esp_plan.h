@@ -90,6 +90,11 @@ struct esp_manifest {
     u32 s2r[ESP_S2R_N]; /* the runner's symbol switches, by enum esp_s2r */
     bool s2r_set[ESP_S2R_N];
     u64 ctrr_stash;   /* sptm_virt_ctrr_stash_off */
+    bool rorgn;       /* hand XNU its read-only region on the ESP path (run_guest's set_xnu_rorgn) */
+    u32 rorgn_g[2];   /* segLOWESTRO/segHIGHESTRO offsets from BootKC-ro's base */
+    bool walk;        /* AURACTL_WALK_DIAG: measure XNU's runtime PA for the acct patch site */
+    u64 walk_site_va; /* guest VA of the first patched acct instruction */
+    u64 walk_text_off; /* its BootKC __TEXT_EXEC offset; patch_pa = BootKC-rx.pa + this */
     u32 link_phys[2]; /* sptm_virt_link_phys: the debug link's USB PHYs */
     char love[96];    /* /chosen/manifest-properties love, "" to leave it */
     bool video;       /* hand XNU the native boot video */
