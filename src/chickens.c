@@ -4,6 +4,7 @@
 #include "cpu_regs.h"
 #include "midr.h"
 #include "smp.h"
+#include "sptm_virt.h"
 #include "uart.h"
 #include "utils.h"
 
@@ -112,7 +113,25 @@ const struct midr_part_features features_m3 = {
 // XXX figure out what features are actually available on M4
 const struct midr_part_features features_m4 = {
     .sleep_mode = SLEEP_NONE, // XXX probably new mode required
+#ifdef SPTM_VIRT
+    /* The virtualized SPTM needs aura's own GL2 (SPRR and GXF), which iBoot leaves writable for a
+     * kcbz=0 boot object. apple_sysregs_unlocked stays false: CYC_OVRD is locked. */
+    .mmu_sprr = true,
+#endif
     .fast_ipi = true,
+    .actlr_el2 = true,
+    .unsafe_wfi = true,
+};
+
+/*
+ * M4 Pro/Max: as M4, and every core accepts AIC IRQs. With no SIQ_CFG_EL1 write only the boot
+ * CPU takes them, so every device interrupt wakes CPU0 and its cluster whichever core is waiting
+ * for it. Route 0 lets the AIC pick a running CPU, as on M5 Pro/Max below.
+ */
+const struct midr_part_features features_m4_pro = {
+    .sleep_mode = SLEEP_NONE,
+    .fast_ipi = true,
+    .siq_cfg = SIQ_CFG_ROUTE_0,
     .actlr_el2 = true,
     .unsafe_wfi = true,
 };
@@ -174,10 +193,10 @@ const struct midr_part_info midr_parts[] = {
     {MIDR_PART_T8122_SAWTOOTH, "M3 Sawtooth", init_t8122_sawtooth, &features_m3},
     {MIDR_PART_T8132_DONAN_ECORE, "M4 Donan (E core)", NULL, &features_m4},
     {MIDR_PART_T8132_DONAN_PCORE, "M4 Donan (P core)", NULL, &features_m4},
-    {MIDR_PART_T6040_BRAVA_CHOP_ECORE, "M4 Pro Brava Chop (E core)", NULL, &features_m4},
-    {MIDR_PART_T6040_BRAVA_CHOP_PCORE, "M4 Pro Brava Chop (P core)", NULL, &features_m4},
-    {MIDR_PART_T6041_BRAVA_ECORE, "M4 Max Brava (E core)", NULL, &features_m4},
-    {MIDR_PART_T6041_BRAVA_PCORE, "M4 Max Brava (P core)", NULL, &features_m4},
+    {MIDR_PART_T6040_BRAVA_CHOP_ECORE, "M4 Pro Brava Chop (E core)", NULL, &features_m4_pro},
+    {MIDR_PART_T6040_BRAVA_CHOP_PCORE, "M4 Pro Brava Chop (P core)", NULL, &features_m4_pro},
+    {MIDR_PART_T6041_BRAVA_ECORE, "M4 Max Brava (E core)", NULL, &features_m4_pro},
+    {MIDR_PART_T6041_BRAVA_PCORE, "M4 Max Brava (P core)", NULL, &features_m4_pro},
     {MIDR_PART_T8140_TAHITI_ECORE, "A18 Pro Tahiti (E core)", NULL, &features_m4},
     {MIDR_PART_T8140_TAHITI_PCORE, "A18 Pro Tahiti (P core)", NULL, &features_m4},
     {MIDR_PART_T8142_HIDRA_ECORE, "M5 Hidra (E core)", NULL, &features_m4},
@@ -212,7 +231,8 @@ void init_cpu(void)
     int part = FIELD_GET(MIDR_PART, midr);
     int rev = (FIELD_GET(MIDR_REV_HIGH, midr) << 4) | FIELD_GET(MIDR_REV_LOW, midr);
 
-    bool quiet = ((chip_id == T8142 || chip_id == T8152) && !is_boot_cpu()) || smp_s2r_published();
+    bool quiet = ((chip_id == T8142 || chip_id == T8152) && !is_boot_cpu()) ||
+                 sptm_virt_guest_live || smp_s2r_published();
     if (!quiet)
         printf("  CPU part: 0x%x rev: 0x%x\n", part, rev);
 
@@ -253,7 +273,20 @@ void init_cpu(void)
     if (midr_part_info->init)
         midr_part_info->init(rev);
 
-    if (cpu_features->siq_cfg) {
+    if (cpu_features->siq_cfg
+#ifdef SPTM_VIRT
+        /*
+         * The M4 Pro/Max route-0 AIC-IRQ setting (features_m4_pro) is a bare-metal tuning.
+         * Writing SIQ_CFG_EL1 on a secondary just after its first guest SPTM entry stalls XNU
+         * on T6040/T6041 under the virtualized SPTM, so on a guest boot keep iBoot's value and
+         * let the native kernel choose its own routing. This is keyed on the live guest-boot
+         * path, not the build flag, so a mixed build still serves Linux bare metal unchanged;
+         * other SoCs (A18 Pro keeps features_m4, M5 Pro/Max keeps features_m5_sotra) are
+         * untouched.
+         */
+        && !(sptm_virt_guest_live && cpu_features == &features_m4_pro)
+#endif
+    ) {
         // Enable IRQs (at least necessary on t600x)
         // XXX 0 causes pathological behavior in EL1 on M1, 2 works there.
         msr(SYS_IMP_APL_SIQ_CFG_EL1, cpu_features->siq_cfg == SIQ_CFG_ROUTE_0 ? 0 : 2);

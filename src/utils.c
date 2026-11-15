@@ -7,6 +7,7 @@
 #include "cpu_regs.h"
 #include "iodev.h"
 #include "smp.h"
+#include "sptm_virt.h"
 #include "types.h"
 #include "utils.h"
 #include "vsprintf.h"
@@ -138,6 +139,17 @@ bool timeout_expired(u64 timeout)
 
 void flush_and_reboot(void)
 {
+#ifdef SPTM_VIRT
+    /* With macOS running under aura a reset loses the evidence: park this CPU instead, and let
+     * the rest of the system keep going. */
+    if (sptm_virt_guest_live) {
+        printf("aura: guest live -- NOT rebooting; cpu%d parked (MPIDR 0x%lx)\n", smp_id(),
+               mrs(MPIDR_EL1));
+        iodev_console_flush();
+        while (1)
+            sysop("wfe");
+    }
+#endif
     iodev_console_flush();
     reboot();
 }

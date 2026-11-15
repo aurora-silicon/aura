@@ -461,7 +461,22 @@ static int pcie_init_controller(int controller, const char *path, bool ans_off)
                 return -1;
         }
     } else {
-        printf("pcie: Unsupported compatible\n");
+        u32 len = 0;
+        const char *compat = adt_getprop(adt, adt_offset, "compatible", &len);
+
+        printf("pcie: Unsupported compatible:");
+        if (!compat || !len)
+            printf(" (none)");
+        /* Bounded by len: the last entry may lack its NUL, and entries may be empty. */
+        for (u32 i = 0; compat && i < len; i++) {
+            if (i == 0 || !compat[i - 1])
+                printf(" \"");
+            if (compat[i])
+                printf("%c", compat[i]);
+            if (!compat[i] || i == len - 1)
+                printf("\"");
+        }
+        printf("\n");
         return -1;
     }
 

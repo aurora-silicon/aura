@@ -9,7 +9,10 @@ struct sart_entry;
 
 bool nvme_init(void);
 extern bool nvme_keep_running_for_linux;
+/* nvme_shutdown(): quiesce RTKit for an OS that wakes ANS as iBoot hands it over */
+extern bool nvme_quiesce_for_next;
 bool nvme_shutdown(void);
+int nvme_cold_handoff(bool idle, bool no_probe);
 /* Post-M4: how a stage that powered ANS off tells the next one to start it again. */
 bool nvme_post_m4(void);
 bool nvme_post_m4_passed_off(void);

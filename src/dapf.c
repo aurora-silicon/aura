@@ -566,6 +566,9 @@ struct entry dapf_entries[] = {
     {"/arm-io/dart-aop", 1, "aop"},
     {"/arm-io/dart-mtp", 1, "mtp"},
     {"/arm-io/dart-pmp", 1, "pmp"},
+    /* T6050: the PMP's DART is dart-pmp0 (dart,t8110; DAPF aperture reg[1], live-verified on the
+     * J714c). */
+    {"/arm-io/dart-pmp0", 1, "pmp0"},
     {"/arm-io/dart-isp", 5, "isp"},
     {"/arm-io/dart-isp0", 5, "isp"},
     {"/arm-io/dart-ave0", 3, "ave"},

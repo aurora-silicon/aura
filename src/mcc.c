@@ -600,6 +600,17 @@ int mcc_init_m4(int node, int *path)
     return 0;
 }
 
+/* The AMCC planes of one instance, for a caller that watches them (sptm_virt_s2.c). */
+int mcc_plane_info(int mcc, u64 *base, u64 *stride, int *count)
+{
+    if (!mcc_initialized || mcc < 0 || mcc >= mcc_count)
+        return -1;
+    *base = mcc_regs[mcc].plane_base;
+    *stride = mcc_regs[mcc].plane_stride;
+    *count = mcc_regs[mcc].plane_count;
+    return 0;
+}
+
 /* T8142 (M5): the T8122 plane layout with the DCS block at +16 MiB, four planes per AMCC and
  * the plane cache controls at 0x2800. */
 static int mcc_init_m5(int node, int *path)

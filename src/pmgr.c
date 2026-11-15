@@ -1,5 +1,7 @@
 /* SPDX-License-Identifier: MIT AND GPL-2.0-only */
 
+#include "../build/build_cfg.h"
+
 #include "pmgr.h"
 #include "adt.h"
 #include "string.h"
@@ -66,6 +68,9 @@ static u32 pmgr_devices_len = 0;
 static bool pmgr_u8id = false;
 static bool pmgr_use_group_and_offset = false;
 static bool pmgr_protected_addr(uintptr_t addr);
+/* While a running OS owns the PMGR (the debug link's re-take under the virtualized SPTM): a domain
+ * that is already on keeps its word, including the auto bits the OS configured. */
+bool pmgr_keep_configured;
 
 static bool pmgr_protected_device(const struct pmgr_device *device)
 {
@@ -102,6 +107,9 @@ int pmgr_set_mode(uintptr_t addr, u8 target_mode)
         printf("pmgr: refusing protected display CPU power transition at 0x%lx\n", addr);
         return -1;
     }
+    if (pmgr_keep_configured && target_mode && (read32(addr) & PMGR_PS_TARGET) &&
+        (read32(addr) & PMGR_PS_ACTUAL))
+        return 0;
     mask32(addr, PMGR_AUTO_ENABLE | PMGR_WAS_CLKGATED | PMGR_WAS_PWRGATED | PMGR_PS_TARGET,
            FIELD_PREP(PMGR_PS_TARGET, target_mode));
     if (poll32(addr, PMGR_PS_ACTUAL, FIELD_PREP(PMGR_PS_ACTUAL, target_mode), PMGR_POLL_TIMEOUT) <
@@ -832,6 +840,38 @@ int pmgr_reset(int die, const char *name)
 
     return pmgr_reset_device(die, dev);
 }
+
+#ifdef SPTM_VIRT
+/*
+ * A device's reset, with the device held on for it (an idle one won't take a reset), then its
+ * target and auto-enable as they were.
+ */
+int pmgr_reset_held(int die, const char *name)
+{
+    const struct pmgr_device *dev = NULL;
+
+    for (unsigned int i = 0; i < pmgr_devices_len; ++i) {
+        if (strncmp(pmgr_devices[i].name, name, 0x10) == 0) {
+            dev = &pmgr_devices[i];
+            break;
+        }
+    }
+    if (!dev || die < 0 || die >= pmgr_dies)
+        return -1;
+    uintptr_t addr = pmgr_device_get_addr(die, dev);
+    if (!addr)
+        return -1;
+
+    u32 was = read32(addr);
+    int ret = pmgr_set_mode(addr, PMGR_PS_ACTIVE);
+    if (!ret)
+        ret = pmgr_reset_device(die, dev);
+    mask32(addr, PMGR_AUTO_ENABLE | PMGR_PS_TARGET, was & (PMGR_AUTO_ENABLE | PMGR_PS_TARGET));
+    printf("pmgr: %d.%s 0x%x before, 0x%x after%s\n", die, dev->name, was, read32(addr),
+           ret ? ", NOT reset" : "");
+    return ret;
+}
+#endif /* SPTM_VIRT */
 
 uintptr_t pmgr_psreg_by_name(int die, const char *name)
 {

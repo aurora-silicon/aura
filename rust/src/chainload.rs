@@ -292,6 +292,91 @@ pub unsafe extern "C" fn rust_load_image(
     }
 }
 
+/// Read the file spec names (PARTUUID;path) into dst, at most cap bytes, with nothing allocated:
+/// for files larger than aura's heap. In .rodata, which aura maps executable, as .text is full.
+#[cfg(feature = "sptm_virt_esp")]
+#[no_mangle]
+#[link_section = ".rodata.xtext"]
+pub unsafe extern "C" fn rust_read_into(
+    raw_spec: *const c_char,
+    dst: *mut c_void,
+    cap: c_size_t,
+    size: *mut c_size_t,
+) -> c_int {
+    if raw_spec.is_null() || dst.is_null() || size.is_null() {
+        return -1;
+    }
+    let Ok(spec) = (unsafe { CStr::from_ptr(raw_spec).to_str() }) else {
+        return -1;
+    };
+    let dst = unsafe { core::slice::from_raw_parts_mut(dst as *mut u8, cap) };
+    match read_into(spec, dst) {
+        Ok(n) => {
+            unsafe { *size = n };
+            0
+        }
+        Err(err) => {
+            println!("Read failed: {:?}", err);
+            -1
+        }
+    }
+}
+
+#[cfg(feature = "sptm_virt_esp")]
+#[link_section = ".rodata.xtext"]
+fn read_into(spec: &str, dst: &mut [u8]) -> Result<usize, Error> {
+    let (uuid, path) = spec.split_once(';').ok_or(Error::BadArgs)?;
+    let uuid = Uuid::parse_str(uuid).or(Err(Error::BadArgs))?;
+    if !valid_fat_path(path) {
+        return Err(Error::BadArgs);
+    }
+    let part = {
+        let mut pt = gpt::GPT::new(nvme::NVMEStorage::new(1, 0))?;
+        pt.find_by_partuuid(uuid)?.ok_or(Error::PartitionNotFound)?
+    };
+    let offset = part.get_starting_lba();
+    let sectors = part
+        .get_ending_lba()
+        .checked_sub(offset)
+        .and_then(|n| n.checked_add(1))
+        .ok_or(Error::BadArgs)?;
+    let storage = nvme::NVMEStorage::new(1, offset)
+        .with_extent(sectors)
+        .map_err(|_| Error::BadArgs)?
+        .with_read_budget(512 * 1024 * 1024 / 4096);
+    let fs = FileSystem::new(storage, FsOptions::new().update_accessed_date(false))?;
+    let root = fs.root_dir();
+    let (parent, name) = path.rsplit_once('/').unwrap_or(("", path));
+    let dir = if parent.is_empty() {
+        root.clone()
+    } else {
+        root.open_dir(parent)?
+    };
+    let mut found = None;
+    for result in dir.iter() {
+        let entry = result?;
+        if entry.is_file() && entry.eq_name(name) {
+            found = Some(entry);
+            break;
+        }
+    }
+    let entry = found.ok_or(Error::FileNotFound)?;
+    let size = entry.len() as usize;
+    if size > dst.len() {
+        return Err(Error::OutOfMemory);
+    }
+    let mut file = entry.to_file();
+    let mut slice = &mut dst[..size];
+    while !slice.is_empty() {
+        let read = file.read(slice)?;
+        if read == 0 {
+            return Err(Error::UnexpectedEof);
+        }
+        slice = &mut slice[read..];
+    }
+    Ok(size)
+}
+
 /// boot= trials (boot_storage.c): spend an armed aura-try marker on the ESP `raw_uuid` and copy
 /// the "<kernel>;<dtb>;<initramfs>" line it names, NUL-terminated, into `buf`. 0 once one is taken.
 #[no_mangle]

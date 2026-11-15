@@ -2,6 +2,7 @@
 
 #include "heapblock.h"
 #include "assert.h"
+#include "sptm_virt.h"
 #include "types.h"
 #include "utils.h"
 #include "xnuboot.h"
@@ -20,9 +21,18 @@ static void *heap_limit;
 
 void heapblock_init(void)
 {
-    void *top_of_kernel_data = (void *)cur_boot_args.top_of_kernel_data;
+    u64 carveout_base, carveout_limit;
 
-    heap_base = top_of_kernel_data;
+    /* Under the virtualized SPTM, SPTM owns low RAM: aura's heap lives in its carve-out. */
+    if (sptm_virt_heap_window(&carveout_base, &carveout_limit)) {
+        heap_base = (void *)carveout_base;
+        heapblock_alloc(0); // align base
+        printf("Heap base (SPTM-virt carve-out): %p\n", heap_base);
+        heapblock_set_limit((void *)carveout_limit);
+        return;
+    }
+
+    heap_base = (void *)cur_boot_args.top_of_kernel_data;
     heapblock_alloc(0); // align base
 
     printf("Heap base: %p\n", heap_base);
@@ -32,6 +42,11 @@ void heapblock_set_limit(void *limit)
 {
     heap_limit = limit;
     printf("Heap limit: %p (%ld MiB)\n", limit, ((u8 *)limit - (u8 *)heap_base) >> 20);
+}
+
+uintptr_t heapblock_limit(void)
+{
+    return (uintptr_t)heap_limit;
 }
 
 /*

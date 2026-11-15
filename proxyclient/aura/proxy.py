@@ -3,6 +3,7 @@ import platform, os, sys, struct, serial, time
 from construct import *
 from enum import IntEnum, IntFlag
 from serial.tools.miniterm import Miniterm
+from serial.serialutil import SerialException
 
 from .utils import *
 from .constructutils import bool_
@@ -408,12 +409,75 @@ class UartInterface(Reloadable):
         else:
             return self.reply(self.REQ_PROXY)
 
-    def writemem(self, addr, data, progress=False):
-        if self.is_kis and len(data) > 1024:
-            for offset in range(0, len(data), 1024):
-                self.writemem(addr + offset, data[offset:offset + 1024])
-            return
+    def _kis_resync(self):
+        # Bring both ends back to a known state after a chunk's reply was cut short: drain any
+        # partial or stale reply the dropped transfer left in the pipe and re-establish the proxy
+        # sync point. A NOP is that sync point (it drops a late reply from an earlier request). A
+        # vanished device raises SerialException, which the caller turns into a reopen; a NOP that
+        # merely times out or mismatches is left for the next retry of the real transfer.
+        self.dev.flushOutput()
+        self.dev.flushInput()
+        try:
+            self.nop()
+        except (UartTimeout, UartChecksumError, UartRemoteError):
+            pass
 
+    def _kis_reopen(self):
+        # The KIS bridge dropped the USB device (SerialException): wait for its node to come back
+        # and reopen it, so an in-flight multi-MiB transfer survives a re-enumeration. Returns False
+        # if the device does not reappear or cannot be reopened (nothing to retry against).
+        if not self.devpath:
+            return False
+        try:
+            self.dev.close()
+        except Exception:
+            pass
+        for _ in range(100):  # up to 10 s
+            if os.path.exists(self.devpath):
+                break
+            time.sleep(0.1)
+        else:
+            return False
+        time.sleep(0.1)  # let udev settle (avoid a permissions race), as __init__ does
+        try:
+            self.dev = Serial(self.devpath, self.baudrate)
+        except SerialException:
+            return False
+        self.dev.timeout = int(os.environ.get("AURATIMEOUT", "3"))
+        self.dev.flushOutput()
+        self.dev.flushInput()
+        return True
+
+    def writemem(self, addr, data, progress=False):
+        if not self.is_kis:
+            return self._writemem_one(addr, data, progress)
+        # KIS: a memory write is idempotent, so a chunk whose reply was cut short (a dropped USB
+        # packet mid-transfer, or the bridge dropping the device) is resynced, the device reopened
+        # if it went away, and written again -- the same recovery readmem already does. Without this
+        # a single dropped packet anywhere in a multi-MiB image write (e.g. the BootKC) is fatal.
+        step = 1024
+        for offset in range(0, max(len(data), 1), step):
+            chunk = data[offset:offset + step]
+            for attempt in range(6):
+                try:
+                    self._writemem_one(addr + offset, chunk, progress)
+                    break
+                except (UartTimeout, UartChecksumError, UartRemoteError, SerialException) as e:
+                    if attempt == 5:
+                        raise
+                    print("writemem 0x%x: %s; resync and retry %d" % (addr + offset, e, attempt + 1),
+                          flush=True)
+                    time.sleep(1)
+                    if isinstance(e, SerialException) and not self._kis_reopen():
+                        raise
+                    try:
+                        self._kis_resync()
+                    except SerialException:
+                        if not self._kis_reopen():
+                            raise
+                        self._kis_resync()
+
+    def _writemem_one(self, addr, data, progress=False):
         checksum = self.data_checksum(data)
         size = len(data)
         req = struct.pack("<QQI", addr, size, checksum)
@@ -441,7 +505,28 @@ class UartInterface(Reloadable):
         result = bytearray()
         for offset in range(0, size, 16 * 1024):
             count = min(16 * 1024, size - offset)
-            result.extend(self._readmem_one(addr + offset, count))
+            if not self.is_kis:
+                result.extend(self._readmem_one(addr + offset, count))
+                continue
+            # KIS: a read is idempotent, so a chunk whose reply was cut short (USB error mid-transfer, or the
+            # bridge dropping the device) is resynced, the device reopened if it went away, and read again.
+            for attempt in range(6):
+                try:
+                    result.extend(self._readmem_one(addr + offset, count))
+                    break
+                except (UartTimeout, UartChecksumError, UartRemoteError, SerialException) as e:
+                    if attempt == 5:
+                        raise
+                    print("readmem 0x%x: %s; resync and retry %d" % (addr + offset, e, attempt + 1), flush=True)
+                    time.sleep(1)
+                    if isinstance(e, SerialException) and not self._kis_reopen():
+                        raise
+                    try:
+                        self._kis_resync()
+                    except SerialException:
+                        if not self._kis_reopen():
+                            raise
+                        self._kis_resync()
         return bytes(result)
 
     def _readmem_one(self, addr, size):
