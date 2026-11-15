@@ -25,8 +25,38 @@ SRC = ROOT / "src"
 MAX_CHOSEN_VARS = 16
 
 M1N1 = b"M" * 64                           # the stage 2 image itself; its payload follows it
-UBOOT = (bytes(16) + (0x10000).to_bytes(8, "little") + bytes(32) + b"ARM\x64" + bytes(4)
-         + bytes(4096 - 64))               # an arm64 Image header, image_size 64 KiB
+ARM64_IMAGE = (bytes(16) + (0x10000).to_bytes(8, "little") + bytes(32) + b"ARM\x64" + bytes(4)
+               + bytes(4096 - 64))         # an arm64 Image header, image_size 64 KiB
+UBOOT_BANNER = b"U-Boot 2026.07-gtest\0"
+SART_PROP = b"apple,sart-entries\0"
+OFF_CONSUMER = (SART_PROP +
+                # Exact string-table bytes in the deployed #38/#40 U-Boots, including newline.
+                b"%s %s: ANS is running, but the boot loader passed it on powered off\n\0")
+
+
+def image_with(*parts):
+    """Place (offset, bytes) pairs in a synthetic decompressed payload."""
+    image = bytearray(ARM64_IMAGE)
+    for offset, data in parts:
+        image[offset:offset + len(data)] = data
+    return bytes(image)
+
+
+# Stock is positively U-Boot but has no off-contract consumer. The deployed #38/#40 family has no
+# purpose-made marker, so its legacy affirmative signature is the exact adjacent property/consumer
+# diagnostic plus the U-Boot identity.
+UBOOT = image_with((512, UBOOT_BANNER))
+UBOOT_FROM_OFF = image_with((512, UBOOT_BANNER), (1024, OFF_CONSUMER))
+UBOOT_PREFIX_ONLY = image_with((512, UBOOT_BANNER), (1024, b"apple,sart-entries-x\0"))
+UBOOT_UNRELATED_PROP = image_with((512, UBOOT_BANNER), (2048, SART_PROP))
+NON_UBOOT_WITH_CONSUMER = image_with((1024, OFF_CONSUMER))
+UBOOT_TRUNCATED_CONSUMER = UBOOT_FROM_OFF[:1024 + len(OFF_CONSUMER) - 1]
+UBOOT_SHORT = ARM64_IMAGE[:64]
+# The first fragment is inside the decompressed payload; the remainder is supplied after its gzip
+# member as configuration/trailer bytes and must not be read across the payload-size boundary.
+SPLIT_AT = 9
+UBOOT_SPLIT_AT_END = UBOOT[:-(SPLIT_AT)] + OFF_CONSUMER[:SPLIT_AT]
+UBOOT_SPLIT_REMAINDER = OFF_CONSUMER[SPLIT_AT:]
 BOARDS = {
     "j773g": ("J773g", "apple,j773g;apple,t8132;apple,arm-platform"),
     "j613": ("J613", "apple,j613;apple,t8122;apple,arm-platform"),
@@ -189,10 +219,14 @@ static void t6031_gpu_probe(void *d)
 /* kboot's handoff: /chosen as dt_set_chosen() writes it, then what the GPU code would see */
 static void kboot_set_initrd(void *start, size_t size) {}
 static void kboot_request_hibernate_layout(bool on) { printf("HIB %d\n", on); }
-static bool nvme_powered_off_with_entries;
+static bool nvme_sart_passed, nvme_started, nvme_keep_running_for_linux;
 static int kboot_prepare_dt(void *fdt)
 {
-    printf("SARTDT entries=%d\n", nvme_powered_off_with_entries);
+    /* nvme_sart_entries(): off with entries if this stage used ANS and shut it down, or if it
+       never started the ANS an earlier stage powered off (nvme.sart=) */
+    bool off = getenv("M1N1_TEST_POST_M4") &&
+               (nvme_started ? !nvme_keep_running_for_linux : nvme_sart_passed);
+    printf("SARTDT entries=%d\n", off);
     assert(!fdt_open_into(fdt, dt, sizeof(blob)));
     int node = fdt_path_offset(dt, "/chosen");
     if (node < 0)
@@ -226,7 +260,6 @@ static int kboot_prepare_dt(void *fdt)
     printf("SELECT %s\n", selected);
     return 0;
 }
-static bool nvme_keep_running_for_linux;
 static int kboot_boot(void *kernel)
 {
     printf("NVME handoff keep=%d\n", nvme_keep_running_for_linux);
@@ -249,7 +282,6 @@ static bool smp_is_alive(int cpu) { return false; }
 static int smp_call_sync0(int cpu, void (*fn)(void)) { return 0; }
 static void do_enable_tso(void) {}
 /* Post-M4 ANS (M1N1_TEST_POST_M4): powered off by an earlier stage once nvme.sart= arrives */
-static bool nvme_sart_passed, nvme_started;
 static bool nvme_init(void)
 {
     printf("NVME init\n");
@@ -259,9 +291,6 @@ static bool nvme_init(void)
 static bool nvme_shutdown(void)
 {
     printf("NVME shutdown keep=%d\n", nvme_keep_running_for_linux);
-    /* nvme.c: a post-M4 stage that used ANS powers it off and keeps its SART entries */
-    if (getenv("M1N1_TEST_POST_M4") && nvme_started && !nvme_keep_running_for_linux)
-        nvme_powered_off_with_entries = true;
     return true;
 }
 static bool nvme_set_sart_var(const char *v)
@@ -432,16 +461,17 @@ def run(tools, build, image, board="j613", calloc_fail=-1, target=None, chip=Non
     return Run(r.stdout, forwarded.read_bytes())
 
 
-def boot_bin(tools, config, board="j613"):
+def boot_bin(tools, config, board="j613", uboot=UBOOT):
     """boot.bin laid out as update-m1n1 writes it: m1n1, device trees, gzipped U-Boot, config"""
     _, _, dtbs = tools
     other = "j516s" if board != "j516s" else "j613"
     return (M1N1 + dtbs[board].read_bytes() + dtbs[other].read_bytes() +
-            gzip.compress(UBOOT, mtime=0) + config)
+            gzip.compress(uboot, mtime=0) + config)
 
 
-def boot(tools, build, config, board="j613", trailer=b"", calloc_fail=-1, chip=None):
-    return run(tools, build, boot_bin(tools, config, board) + trailer, board, calloc_fail,
+def boot(tools, build, config, board="j613", trailer=b"", calloc_fail=-1, chip=None,
+         uboot=UBOOT):
+    return run(tools, build, boot_bin(tools, config, board, uboot) + trailer, board, calloc_fail,
                chip=chip)
 
 
@@ -969,7 +999,7 @@ def test_stage1_does_not_hand_hib_on(tools):
     assert b"hib=" not in stage1(tools, b"hib=1\n")
 
 
-# ---- post-M4 ANS: the embedded U-Boot adopts a running ANS and can't start one from off ----
+# ---- post-M4 ANS: the payload gets the state its U-Boot can take (running, or off with entries) ----
 
 SART = b"nvme.sart=" + b"0" * 48 + b"\n"
 
@@ -1003,65 +1033,219 @@ def test_ans_left_as_found_without_sart_entries(tools, build, monkeypatch):
     assert nvme_events(b) == ["shutdown keep=0", "handoff keep=0"], b.stdout
 
 
+def sart_dt(r):
+    return [line for line in r.stdout.splitlines() if line.startswith("SARTDT ")]
+
+
+def ans_contract(r):
+    return [line for line in r.stdout.splitlines() if line.startswith("Payload: post-M4 ANS")]
+
+
+# Stage 1 handoff x appended U-Boot on a T8132. b10 and older Stage 1 hand ANS on live without SART
+# entries, newer ones power it off and pass nvme.sart=. The stock U-Boot adopts a running ANS and
+# cannot start one from off; the deployed #38/#40 family has the affirmative legacy consumer
+# signature, starts it from off with apple,sart-entries, and refuses a running one. Each cell: NVMe
+# events, whether the payload DT says "off, with entries", and the contract Stage 2 logs.
+ANS_CELLS = {
+    ("b8-live", "stock"): (b"", UBOOT,
+                           ["shutdown keep=0", "handoff keep=0"], "SARTDT entries=0", "running"),
+    ("b8-live", "from-off"): (b"", UBOOT_FROM_OFF,
+                              ["init", "shutdown keep=0", "handoff keep=0"], "SARTDT entries=1",
+                              "off"),
+    ("sart-off", "stock"): (SART, UBOOT, ["init", "handoff keep=1"], "SARTDT entries=0", "running"),
+    ("sart-off", "from-off"): (SART, UBOOT_FROM_OFF,
+                               ["shutdown keep=0", "handoff keep=0"], "SARTDT entries=1", "off"),
+}
+
+
 @pytest.mark.parametrize("build", STAGE2)
-def test_t8132_live_post_m4_ans_is_taken_over_for_the_payload(tools, build, monkeypatch):
+@pytest.mark.parametrize("cell", sorted(ANS_CELLS), ids="-".join)
+def test_t8132_ans_contract_follows_the_payload(tools, build, cell, monkeypatch):
     monkeypatch.setenv("M1N1_TEST_POST_M4", "1")
-    b = boot(tools, build, b"", board="j773g")
+    trailer, uboot, events, dt, state = ANS_CELLS[cell]
+    b = boot(tools, build, b"", board="j773g", trailer=trailer, uboot=uboot)
     booted(b)
-    assert nvme_events(b) == ["init", "shutdown keep=0", "handoff keep=0"], b.stdout
+    assert nvme_events(b) == events, b.stdout
+    assert sart_dt(b) == [dt], b.stdout
+    assert len(ans_contract(b)) == 1 and ans_contract(b)[0].endswith(state), b.stdout
+    assert ("consumer signature found" in ans_contract(b)[0]) == (state == "off"), b.stdout
+    if "init" in events and state == "off":
+        # ANS is shut down before kboot_prepare_dt() builds the payload DT
+        lines = b.stdout.splitlines()
+        assert lines.index("NVME shutdown keep=0") < lines.index(dt), b.stdout
+
+
+@pytest.mark.parametrize("build", STAGE2)
+@pytest.mark.parametrize("handoff", [b"", SART], ids=["b8-live", "sart-off"])
+def test_t8132_property_name_prefix_is_not_the_capability(tools, build, handoff, monkeypatch):
+    monkeypatch.setenv("M1N1_TEST_POST_M4", "1")
+    b = boot(tools, build, b"", board="j773g", trailer=handoff, uboot=UBOOT_PREFIX_ONLY)
+    booted(b)
+    stock = ANS_CELLS[("b8-live" if not handoff else "sart-off", "stock")]
+    assert nvme_events(b) == stock[2], b.stdout
+    assert sart_dt(b) == [stock[3]], b.stdout
+    assert "consumer signature not found" in ans_contract(b)[0], b.stdout
+
+
+# Review-blocking negatives. All retain main's running contract: an exact property in unrelated
+# U-Boot data; a non-U-Boot AArch64 payload even with the consumer text; a truncated or short image;
+# and a consumer string whose first bytes are at the end of the decompressed payload while the rest
+# follows its gzip member (outside kernel_payload_size).
+NEGATIVE_CAPABILITY_PAYLOADS = {
+    "unrelated-exact-property": (UBOOT_UNRELATED_PROP, b""),
+    "non-uboot-payload": (NON_UBOOT_WITH_CONSUMER, b""),
+    "truncated-consumer": (UBOOT_TRUNCATED_CONSUMER, b""),
+    "short-payload": (UBOOT_SHORT, b""),
+    "split-at-payload-boundary": (UBOOT_SPLIT_AT_END, UBOOT_SPLIT_REMAINDER),
+}
+
+
+@pytest.mark.parametrize("build", STAGE2)
+@pytest.mark.parametrize("handoff", [b"", SART], ids=["b8-live", "sart-off"])
+@pytest.mark.parametrize("case", sorted(NEGATIVE_CAPABILITY_PAYLOADS))
+def test_t8132_negative_capability_probe_falls_back_to_main(
+        tools, build, handoff, case, monkeypatch):
+    monkeypatch.setenv("M1N1_TEST_POST_M4", "1")
+    uboot, outside_payload = NEGATIVE_CAPABILITY_PAYLOADS[case]
+    b = boot(tools, build, b"", board="j773g", trailer=handoff + outside_payload,
+             uboot=uboot)
+    booted(b)
+    stock = ANS_CELLS[("b8-live" if not handoff else "sart-off", "stock")]
+    assert nvme_events(b) == stock[2], b.stdout
+    assert sart_dt(b) == [stock[3]], b.stdout
+    assert len(ans_contract(b)) == 1, b.stdout
+    assert "consumer signature not found" in ans_contract(b)[0], b.stdout
+    assert ans_contract(b)[0].endswith("running"), b.stdout
+
+
+HANDOFF_OVERRIDES = {
+    "explicit-auto": (b"nvme.handoff=auto\n", UBOOT_FROM_OFF, "from-off",
+                      "auto: U-Boot off-consumer signature found"),
+    "force-running": (b"nvme.handoff=running\n", UBOOT_FROM_OFF, "stock",
+                      "nvme.handoff=running override"),
+    "force-off": (b"nvme.handoff=off\n", UBOOT, "from-off",
+                  "nvme.handoff=off override"),
+    "invalid-falls-running": (b"nvme.handoff=maybe\n", UBOOT_FROM_OFF, "stock",
+                              "invalid nvme.handoff value; running fallback"),
+}
+
+
+@pytest.mark.parametrize("build", STAGE2)
+@pytest.mark.parametrize("handoff", [b"", SART], ids=["b8-live", "sart-off"])
+@pytest.mark.parametrize("case", sorted(HANDOFF_OVERRIDES))
+def test_t8132_nvme_handoff_override(tools, build, handoff, case, monkeypatch):
+    monkeypatch.setenv("M1N1_TEST_POST_M4", "1")
+    config, uboot, contract, reason = HANDOFF_OVERRIDES[case]
+    b = boot(tools, build, config, board="j773g", trailer=handoff, uboot=uboot)
+    booted(b)
+    expected = ANS_CELLS[("b8-live" if not handoff else "sart-off", contract)]
+    assert nvme_events(b) == expected[2], b.stdout
+    assert sart_dt(b) == [expected[3]], b.stdout
+    assert len(ans_contract(b)) == 1 and reason in ans_contract(b)[0], b.stdout
+    assert ans_contract(b)[0].endswith(expected[4]), b.stdout
 
 
 @pytest.mark.parametrize("build", STAGE2)
 def test_t8132_live_post_m4_ans_takeover_failure_stops_handoff(tools, build, monkeypatch):
     monkeypatch.setenv("M1N1_TEST_POST_M4", "1")
     monkeypatch.setenv("M1N1_TEST_NVME_INIT_FAIL", "1")
-    b = boot(tools, build, b"", board="j773g")
+    b = boot(tools, build, b"", board="j773g", uboot=UBOOT_FROM_OFF)
     assert b.rc == -1 and not b.booted, b.stdout
     assert nvme_events(b) == ["init"], b.stdout
 
 
-def sart_dt(r):
-    return [line for line in r.stdout.splitlines() if line.startswith("SARTDT ")]
-
-
 @pytest.mark.parametrize("build", STAGE2)
-def test_t8132_live_post_m4_ans_reaches_the_payload_dt_off_with_entries(tools, build, monkeypatch):
-    monkeypatch.setenv("M1N1_TEST_POST_M4", "1")
-    b = boot(tools, build, b"", board="j773g")
-    booted(b)
-    assert sart_dt(b) == ["SARTDT entries=1"], b.stdout
-    # ANS is shut down before kboot_prepare_dt() builds the payload DT
-    lines = b.stdout.splitlines()
-    assert lines.index("NVME shutdown keep=0") < lines.index("SARTDT entries=1"), b.stdout
-
-
-@pytest.mark.parametrize("build", STAGE2)
-def test_t8132_boot_keeps_live_post_m4_ans_running(tools, build, monkeypatch):
+@pytest.mark.parametrize("uboot", [UBOOT, UBOOT_FROM_OFF], ids=["stock", "from-off"])
+def test_t8132_boot_keeps_live_post_m4_ans_running(tools, build, uboot, monkeypatch):
     monkeypatch.setenv("M1N1_TEST_POST_M4", "1")
     monkeypatch.setenv("M1N1_TEST_BOOT_LOAD", "1")
-    b = boot(tools, build, b"boot=esp;vmlinuz\n", board="j773g")
+    b = boot(tools, build, b"boot=esp;vmlinuz\n", board="j773g", uboot=uboot)
     booted(b)
     assert nvme_events(b) == ["handoff keep=1"], b.stdout
     assert sart_dt(b) == ["SARTDT entries=0"], b.stdout
+    assert not ans_contract(b), b.stdout
 
 
 @pytest.mark.parametrize("build", STAGE2)
 @pytest.mark.parametrize("chip", ["6040", "6050", "8122"])
-def test_live_post_m4_ans_left_as_found_on_other_chips(tools, build, chip, monkeypatch):
+@pytest.mark.parametrize("uboot", [UBOOT, UBOOT_FROM_OFF], ids=["stock", "from-off"])
+def test_post_m4_ans_contract_unchanged_on_other_chips(tools, build, chip, uboot, monkeypatch):
     monkeypatch.setenv("M1N1_TEST_POST_M4", "1")
-    b = boot(tools, build, b"", chip=chip)
-    booted(b)
-    assert nvme_events(b) == ["shutdown keep=0", "handoff keep=0"], b.stdout
-    assert sart_dt(b) == ["SARTDT entries=0"], b.stdout
+    live = boot(tools, build, b"", chip=chip, uboot=uboot)
+    booted(live)
+    assert nvme_events(live) == ["shutdown keep=0", "handoff keep=0"], live.stdout
+    assert sart_dt(live) == ["SARTDT entries=0"], live.stdout
+    off = boot(tools, build, b"", chip=chip, trailer=SART, uboot=uboot)
+    booted(off)
+    assert nvme_events(off) == ["init", "handoff keep=1"], off.stdout
+    assert sart_dt(off) == ["SARTDT entries=0"], off.stdout
+    assert not ans_contract(live) and not ans_contract(off)
 
 
 @pytest.mark.parametrize("build", STAGE2)
 @pytest.mark.parametrize("board", ["j773g", "j293"])
-def test_pre_m4_ans_is_not_taken_over(tools, build, board):
-    b = boot(tools, build, b"", board=board)
+@pytest.mark.parametrize("uboot", [UBOOT, UBOOT_FROM_OFF], ids=["stock", "from-off"])
+def test_pre_m4_ans_is_not_taken_over(tools, build, board, uboot):
+    b = boot(tools, build, b"", board=board, uboot=uboot)
     booted(b)
     assert nvme_events(b) == ["shutdown keep=0", "handoff keep=0"], b.stdout
     assert sart_dt(b) == ["SARTDT entries=0"], b.stdout
+
+
+def test_sart_entries_for_a_passed_off_ans_from_nvme_c(tmp_path):
+    """The real nvme_sart_entries() that kboot_prepare_dt() publishes from: an ANS an earlier stage
+    powered off and this stage never started reaches the payload off, with the entries passed in."""
+    src = (SRC / "nvme.c").read_text()
+    body = function(src, "int nvme_sart_entries(struct sart_entry *entries, int max, bool *off)\n{")
+    c = tmp_path / "entries.c"
+    c.write_text(r'''#include <stdbool.h>
+#include <stdio.h>
+#include <string.h>
+struct sart_entry { int index, flags; unsigned long paddr, size; };
+typedef struct { int n; } sart_dev_t;
+#define min(a, b) ((a) < (b) ? (a) : (b))
+enum { NVME_T8132 = 1, NVME_OTHER = 2 };
+static int nvme_type = NVME_T8132;
+static bool nvme_initialized, nvme_secure_regs, nvme_keep_running_for_linux, post_m4;
+static struct sart_entry nvme_sart_saved[16];
+static int nvme_sart_saved_cnt;
+static sart_dev_t live_sart = {3};
+static sart_dev_t *nvme_sart = &live_sart;
+static bool nvme_post_m4(void) { return post_m4; }
+static sart_dev_t *sart_init(const char *path) { return &live_sart; }
+static void sart_release(sart_dev_t *s) {}
+static int sart_get_entries(sart_dev_t *s, struct sart_entry *e, int max) { return s->n; }
+''' + body + r'''
+int main(void)
+{
+    struct sart_entry e[16];
+    bool off;
+    /* post_m4 initialized keep saved -> count off */
+    for (int m = 0; m < 2; m++)
+        for (int i = 0; i < 2; i++)
+            for (int k = 0; k < 2; k++)
+                for (int s = 0; s < 3; s += 2) {
+                    post_m4 = m, nvme_initialized = i, nvme_keep_running_for_linux = k;
+                    nvme_sart_saved_cnt = s;
+                    int n = nvme_sart_entries(e, 16, &off);
+                    printf("%d%d%d%d %d%d\n", m, i, k, s, n, off);
+                }
+    return 0;
+}
+''')
+    exe = tmp_path / "entries"
+    subprocess.run(["cc", "-std=gnu11", "-Wall", "-Wextra", "-Werror", "-Wno-unused-parameter",
+                    "-Wno-unused-function", "-Wno-missing-prototypes", str(c), "-o", str(exe)],
+                   check=True)
+    out = dict(line.split() for line in
+               subprocess.run([str(exe)], capture_output=True, text=True,
+                              check=True).stdout.splitlines())
+    # Not started, entries passed in (nvme.sart=): handed on off, with those entries
+    assert out["0002"] == "21" and out["1002"] == "21" and out["1012"] == "21", out
+    # Not started, none passed in: post-M4 ANS reaches the payload as found (running), no entries
+    assert out["1000"] == "30" and out["0000"] == "00", out
+    # Started here: off with entries unless left running for the payload
+    assert out["1100"] == "31" and out["1110"] == "30", out
 
 
 def test_post_m4_predicates_from_nvme_c(tmp_path):
