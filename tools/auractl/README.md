@@ -1,15 +1,17 @@
-# auractl guest entry + J616s runbook
+# auractl guest entries
 
-`auractl` (docs/auractl.md) controls aura's stage-2 MMIO trace from inside the macOS guest through
-one HVC (`src/auractl_abi.h`). Userland cannot issue that HVC, so the guest supplies an *entry*
-(`entry.h`) that carries each request to the guest's kernel. This directory holds the IOKit entry:
+`auractl` (docs/auractl.md) controls aura's stage-2 MMIO trace from inside the macOS guest. A
+request reaches aura through an *entry* (`entry.h`). This directory holds two, both driving the one
+ABI (`src/auractl_abi.h`) and the one handler:
 
-- `AuractlDevice/` — `AuractlDevice.kext`, a minimal IOKit driver. Its user client runs one HVC on
-  the calling thread, so aura reads and writes the request through the caller's own EL0
-  translation. It maps no hardware and keeps no state.
-- `entry_iokit.c` — the `ENTRY=iokit` entry: it opens the kext and calls that one method.
+- `entry_dcc.c` — the `ENTRY=dcc` entry. An unprivileged process writes its request's address to
+  the EL0 debug register `DBGDTR_EL0`, which aura traps to EL2 (`MDCR_EL2.TDCC`). **No kext, no
+  root, no SIP change.** Use this where the kext cannot load (below) — the J616s, for one.
+- `AuractlDevice/` + `entry_iokit.c` — the `ENTRY=iokit` entry. `AuractlDevice.kext`, a minimal
+  IOKit driver, runs one `hvc #0xac71` on the calling thread. It maps no hardware and keeps no
+  state. It needs root, SIP off, and a kext that will load.
 
-There is no second ABI: the kext issues Dj's `hvc #0xac71` and nothing else.
+Neither adds a second ABI: both carry the same `struct auractl_req`.
 
 ## Build
 
@@ -17,50 +19,71 @@ aura, with the trace control compiled in (never in Stage 1):
 
     make CHAINLOADING=1 SPTM_VIRT=1 AURACTL=1
 
-The tool and the kext, in the guest (macOS, Apple silicon):
+The tool, in the guest (macOS, Apple silicon):
 
-    make -C tools/auractl ENTRY=iokit     # the tool, linked against IOKit
+    make -C tools/auractl ENTRY=dcc       # kext-free; no root, no SIP change, no kext to load
+    make -C tools/auractl ENTRY=iokit     # through the kext; links against IOKit
     make -C tools/auractl kext            # AuractlDevice.kext (needs Xcode's macOS SDK)
 
-`make ENTRY=none` (the default) builds a tool that can only `auractl print` a saved file.
+`make ENTRY=none` (the default) builds a tool that can only `auractl print` a saved file. The
+`dcc` tool is plain C with two inline-asm instructions: any clang in the guest builds it, and it
+needs no frameworks and no SDK beyond libc.
 
-The kext is arm64e (the kernel's ABI); the tool is arm64. If the J616s macOS has no Xcode,
-cross-build the kext on a Mac that does (its SDK must match the J616s macOS kernel version), then
+The kext is arm64e (the kernel's ABI); the tool is arm64. If the guest macOS has no Xcode,
+cross-build the kext on a Mac that does (its SDK must match the guest macOS kernel version), then
 copy the bundle over.
+
+## Using the DCC entry (no kext)
+
+`ENTRY=dcc` needs nothing loaded. Build the tool and run it:
+
+    make -C tools/auractl ENTRY=dcc
+    ./auractl status        # reports `entry: dcc`, aura's version, and whether the ring is present
+
+`status` works for any user. The aura the guest runs under must be an **AURACTL** build booted with
+the DCC transport armed (`AURA_AURACTL_DCC=1`, or `--flag AURA_AURACTL_DCC` for an ESP bundle); that
+is what sets `MDCR_EL2.TDCC` so the `DBGDTR_EL0` access traps to aura. On an aura without it, or bare
+hardware, the access does not trap and the tool reports `ENODEV` (it checks the tag aura puts in the
+read-back), so it never acts on stray debug-channel state.
+
+Everything past `status` — `arm`, `start`/`stop`, `read`, `mark`, `peek` — needs **root**, because
+it needs the per-boot cookie aura put in the guest boot-args, which only root can read (`sysctl
+kern.bootargs`). The tool reads it and presents it automatically; a non-root caller gets `EPERM`.
 
 ## Load the kext (SIP off)
 
-The J616s macOS runs with SIP disabled, so a dev-signed kext loads:
+Loading a dev-signed kext needs SIP off and root; ad-hoc signing is enough:
 
     codesign --force --sign - AuractlDevice.kext      # ad-hoc; a real cert also works
-    sudo kmutil load -p AuractlDevice.kext            # or: sudo kextload AuractlDevice.kext
+    sudo kextload AuractlDevice.kext                  # see the kmutil note below
     kmutil showloaded | grep -i auractl               # confirm it is resident
 
 `sudo auractl status` then reports `entry: iokit` and aura's version.
 
+`make kext` stamps the bundle's `kmod_info` and an `LC_BUILD_VERSION`, so the Mach-O carries the
+bundle id, version and start/stop entry points `kextload`/`kmutil` need.
+
+Note on `kmutil load`: it does not work under SPTM-virt. `kmutil` builds an AuxKC and splices it
+into the boot kext collection, but here the BootKC is fed by the host loader, not written by the
+booted macOS, so there is no writable collection for it to extend (measured on the J616s). Use the
+legacy `kextload`, which loads the kext into the running kernel directly, instead.
+
 Hazard: load this only in the macOS guest under an **AURACTL** build of aura. On any other aura the
-HVC is reflected to the guest, which panics. The build enrolled for the proof carries `AURACTL=1`.
+HVC is reflected to the guest, which panics.
 
-## The AURACTL HV object for the J616s
+## Booting macOS under an AURACTL aura
 
-The enrolled Macintosh HD object must be built from this branch with the trace control in it and
-the manifest flag set, using the same build + padding recipe HV70OBJ used (the untouched
-`origin/feat/sptm-hv` tip does not link the ESP Stage 2 without the init-slot room fix, aura #210,
-under it — see the lane note):
+To trace tetherless, macOS must boot as the guest of an aura built with `AURACTL=1` and with the
+trace ring enabled in its manifest. Building that Stage 2 object and enrolling it as a boot object
+is the normal aura HV enrol flow (see the aura HV docs); it is not auractl-specific, so it is not
+repeated here. Once macOS boots under such an aura, `auractl status` reports the ring is present.
 
-1. Build the macOS-HV ESP Stage 2 from this branch (rebased onto a `feat/sptm-hv` that carries
-   #210) with `AURACTL=1` added to the HV70OBJ flags
-   (`kits/hv/20261111-j616s-macos-trace/build.sh`), in the CI-matching rustup toolchain.
-2. `make_bundle.py --flag AURA_AURACTL ...` so the manifest enables the trace ring, plus the
-   session's keep-USB flags.
-3. Pad and enrol it as the Macintosh HD HV object exactly as HV70OBJ/AURA70 enrol a padded object
-   (1TR, Ryan present).
+## End-to-end: trace a USB controller, tetherless
 
-## End-to-end: trace the Magic Keyboard's USB controller, tetherless
+With macOS booted under an AURACTL build of aura (no debug cable), in the guest (the `dcc` entry
+needs no root; the `iokit` entry does):
 
-With macOS booted under the AURACTL HV (no debug cable), as root in the guest:
-
-    auractl status                                  # entry: iokit; aura version; ring present
+    auractl status                                  # entry; aura version; ring present
     auractl list                                    # the catalogue aura built from this ADT
     # find the USB controller's MMIO base LIVE from the guest, do not hardcode it:
     ioreg -l -w0 | grep -i -A3 'usb.*reg'           # or the ATC/dwc3 node's `reg`
@@ -89,6 +112,7 @@ does, so a dump copied off the Mac decodes on the buildbox.
 ## PEEK and the chip's never-read list
 
 `auractl peek` reads a few plain PMGR registers, and only on a chip whose never-read page list aura
-carries, because some register reads fault the SoC. T8140's list ships in `src/sptm_virt_ctl.c`;
-the J616s (T6040/T6041) list is not confirmed yet, so PEEK returns `EACCES` there (fail-safe). ARM,
-START/STOP, READ, MARK and CONSOLE do not depend on it and work on the J616s.
+carries, because some register reads fault the SoC. T8140's list ships in `src/sptm_virt_ctl.c`.
+PEEK is not enabled yet on any other chip, the J616s (T6040/T6041) included: with no confirmed
+list aura returns `EACCES` there (fail-safe). ARM, START/STOP, READ, MARK and CONSOLE do not
+depend on it and work everywhere.

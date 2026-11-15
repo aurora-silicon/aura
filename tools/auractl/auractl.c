@@ -11,8 +11,9 @@
  *   auractl print <file>                     decode a file from read (no aura needed)
  *   auractl peek <0xpa> [words]              read plain PMGR registers
  *
- * Runs as root. It needs an AURACTL build of aura and a guest-side entry that carries the request
- * block to aura's hvc (entry.h); a build with ENTRY=none can only decode files.
+ * It needs an AURACTL build of aura and a guest-side entry that carries the request block to aura
+ * (entry.h): ENTRY=iokit through a kext (root, SIP off), ENTRY=dcc through an EL0 debug register
+ * (no kext, no root), or ENTRY=none, which can only decode files.
  */
 #include <errno.h>
 #include <fcntl.h>
@@ -409,7 +410,9 @@ int main(int argc, char **argv)
         return usage();
     if (!strcmp(auractl_entry_name(), "none"))
         return fail(c, AURACTL_ENTRY_NONE);
-    if (geteuid() != 0) {
+    /* The DCC entry is a plain EL0 debug-register access: it needs no privilege. Other entries
+     * (the kext's user client) do. */
+    if (geteuid() != 0 && strcmp(auractl_entry_name(), "dcc") != 0) {
         fprintf(stderr, "auractl: needs root\n");
         return 1;
     }

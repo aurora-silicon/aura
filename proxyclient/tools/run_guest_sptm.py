@@ -103,6 +103,7 @@ CONFIG_FLAGS = {
     "AURA_GPU_TRACE": 1 << 6,
     "AURA_SAMPLE": 1 << 7,
     "AURA_S2R_MEM": 1 << 8,
+    "AURA_CTL_DCC": 1 << 10,  # SPTM_VIRT_CTL_DCC: arm auractl's kext-free DCC transport at boot
 }
 TRACE_FLAG = 1 << 9  # SPTM_VIRT_TRACE, set by AURA_TRACE_NODES
 KNOWN_ENV = {
