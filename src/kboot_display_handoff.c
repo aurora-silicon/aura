@@ -3387,17 +3387,21 @@ static bool dcp6_dt_describes(void *dt)
  * iommu-addresses: only what the ADT says, checked against the device tree and the registers.
  * The image is pinned per OS firmware because 27.0 and 27.0.1 report the same iBoot version.
  */
+/* The 27.3 DCP keeps the 27.0 interface but numbers its IOMFB methods differently: the kernel
+ * selects the 27.3 method tags from "27.3.0" in apple,firmware-compat, so 27.0.0 crashes it. */
+static const struct fw_version_info t6050_fw_27_3 = {V27_0, "27.3", {27, 3, 0}, 3,
+                                                     "mBoot-20457.60.65.0.1"};
 static const struct {
     u32 os_fw;
-    u32 dt_fw; /* the firmware the kernel's DCP interface is written for: the version published */
+    const struct fw_version_info *dt_fw; /* what the device tree says: the kernel's interface */
     char uuid[37];
     bool ext; /* also hand off the external display engines running this image */
 } t6050_images[] = {
-    {V27_0, V27_0, "64863924-B56B-3E32-87FE-038677F52709", true},
+    {V27_0, &fw_versions[V27_0], "64863924-B56B-3E32-87FE-038677F52709", true},
     /* K116s (16" M5 Pro, OLED), 26B8125: the internal panel only */
-    {V27_2, V27_2, "3D6C8857-E6F1-3D2E-9DFF-587028AE0C6E", false},
-    /* K114c (M5 Max), 27.3 beta 26C5035r: another DCP image, the 27.0 interface */
-    {V27_3B, V27_0, "58CB3FFC-B2BA-352E-B20B-71A91B15FA9F", true},
+    {V27_2, &fw_versions[V27_2], "3D6C8857-E6F1-3D2E-9DFF-587028AE0C6E", false},
+    /* K114c (M5 Max), 27.3 beta 26C5035r: another DCP image */
+    {V27_3B, &t6050_fw_27_3, "58CB3FFC-B2BA-352E-B20B-71A91B15FA9F", true},
 };
 #define T6050_NDISP     5       /* disp0 reg[0..4] are the dcp's disp-0..disp-4 */
 #define T6050_BW_BASE   0x20000 /* bandwidth agent 0's scratch in the PMC metadata */
@@ -3480,7 +3484,7 @@ static T6050_INIT int t6050_check_adt(void)
     for (size_t i = 0; i < ARRAY_SIZE(t6050_images); i++)
         if (os_firmware.version == t6050_images[i].os_fw) {
             t6050.uuid = t6050_images[i].uuid;
-            t6050.fw = &fw_versions[t6050_images[i].dt_fw];
+            t6050.fw = t6050_images[i].dt_fw;
             t6050.ext = t6050_images[i].ext;
         }
     if (!t6050.uuid)
