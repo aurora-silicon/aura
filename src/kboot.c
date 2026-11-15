@@ -11307,7 +11307,7 @@ int kboot_prepare_dt(void *fdt)
     // A device tree with a pmp alias takes the PMP tunables (about 16K on a T6020)
     if (fdt_path_offset(fdt, "pmp") >= 0)
         dt_bufsize += ALIGN_UP(pmp_tunables_size(), SZ_16K) + SZ_16K;
-    dt_bufsize += SZ_16K;     // and the SMBIOS description U-Boot builds its tables from (about 6K)
+    dt_bufsize += SZ_16K; // and the SMBIOS description U-Boot builds its tables from (about 6K)
     // A T6030 or T8122 also takes its PMP values
     if (chip_id == T6030 || chip_id == T8122)
         dt_bufsize += 2 * SZ_16K;
