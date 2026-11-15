@@ -657,6 +657,8 @@ static bool nvme_ans_started(void)
 {
     nvme_boot_ticks = get_ticks();
     printf("nvme: ANS started from off%s\n", nvme_ans_cold_started ? ", cold after a reset" : "");
+    /* Before any write to CC: whether the controller reports a fault already. */
+    nvme_ans_log_state("started from off");
     return true;
 }
 
