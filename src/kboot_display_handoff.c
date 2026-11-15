@@ -3389,12 +3389,15 @@ static bool dcp6_dt_describes(void *dt)
  */
 static const struct {
     u32 os_fw;
+    u32 dt_fw; /* the firmware the kernel's DCP interface is written for: the version published */
     char uuid[37];
     bool ext; /* also hand off the external display engines running this image */
 } t6050_images[] = {
-    {V27_0, "64863924-B56B-3E32-87FE-038677F52709", true},
+    {V27_0, V27_0, "64863924-B56B-3E32-87FE-038677F52709", true},
     /* K116s (16" M5 Pro, OLED), 26B8125: the internal panel only */
-    {V27_2, "3D6C8857-E6F1-3D2E-9DFF-587028AE0C6E", false},
+    {V27_2, V27_2, "3D6C8857-E6F1-3D2E-9DFF-587028AE0C6E", false},
+    /* K114c (M5 Max), 27.3 beta 26C5035r: another DCP image, the 27.0 interface */
+    {V27_3B, V27_0, "58CB3FFC-B2BA-352E-B20B-71A91B15FA9F", true},
 };
 #define T6050_NDISP     5       /* disp0 reg[0..4] are the dcp's disp-0..disp-4 */
 #define T6050_BW_BASE   0x20000 /* bandwidth agent 0's scratch in the PMC metadata */
@@ -3418,6 +3421,7 @@ static struct {
     u32 bw_offset, nits, nclk, clk_id[T6050_CLOCKS], clk_hz[T6050_CLOCKS], pmc_ph;
     const char *gamut;
     const char *uuid; /* the pinned image of the running OS firmware */
+    const struct fw_version_info *fw; /* what the device tree says: the kernel's interface */
     bool ext;
 } t6050;
 
@@ -3476,10 +3480,11 @@ static T6050_INIT int t6050_check_adt(void)
     for (size_t i = 0; i < ARRAY_SIZE(t6050_images); i++)
         if (os_firmware.version == t6050_images[i].os_fw) {
             t6050.uuid = t6050_images[i].uuid;
+            t6050.fw = &fw_versions[t6050_images[i].dt_fw];
             t6050.ext = t6050_images[i].ext;
         }
     if (!t6050.uuid)
-        bail("OS firmware %s is not 27.0 or 27.2\n", os_firmware.string);
+        bail("OS firmware %s is not 27.0, 27.2 or 27.3 beta\n", os_firmware.string);
     if (!dcp6_is_uuid(uuid, len) || strcmp(uuid, t6050.uuid))
         bail("DCP image %s is not %s\n", dcp6_is_uuid(uuid, len) ? uuid : "(none)", t6050.uuid);
     if (dcp6_adt_u32(nub, "running", &val) || val != 1 || disp0 < 0 ||
@@ -3656,9 +3661,9 @@ static T6050_TEXT int t6050_publish(void *dt)
     int nlen = 0;
 
     if (firmware_set_fdt(dt, kboot_fdt_path_exact(dt, t6050.path[T6050_DCP]),
-                         "apple,firmware-version", &os_firmware) ||
+                         "apple,firmware-version", t6050.fw) ||
         firmware_set_fdt(dt, kboot_fdt_path_exact(dt, t6050.path[T6050_DCP]),
-                         "apple,firmware-compat", &os_firmware) ||
+                         "apple,firmware-compat", t6050.fw) ||
         t6050_setprop(dt, T6050_DCP, "apple,firmware-uuid", t6050.uuid, strlen(t6050.uuid) + 1))
         return -1;
 
@@ -3835,9 +3840,9 @@ static T6050_TEXT int t6050_ext_one(void *dt, int n)
         if (fdt_get_path(dt, targets[i], path[i], T6050_PATH))
             return -1;
     if (firmware_set_fdt(dt, kboot_fdt_path_exact(dt, path[0]), "apple,firmware-version",
-                         &os_firmware) ||
+                         t6050.fw) ||
         firmware_set_fdt(dt, kboot_fdt_path_exact(dt, path[0]), "apple,firmware-compat",
-                         &os_firmware) ||
+                         t6050.fw) ||
         fdt_setprop(dt, kboot_fdt_path_exact(dt, path[0]), "apple,firmware-uuid", t6050.uuid,
                     strlen(t6050.uuid) + 1) ||
         fdt_setprop(dt, kboot_fdt_path_exact(dt, path[0]), "apple,bw-scratch", v, sizeof(v)))
