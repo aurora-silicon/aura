@@ -228,8 +228,9 @@ static const char *const dcp6_nubs_t6030[] = {"dcp", "dcpext0", "dcpext1"};
 /*
  * One OS firmware the handoff accepts for a SoC. A profile that serves more than one macOS firmware
  * (e.g. the legacy 14.7 image and the 27.2 image for FW272) lists one of these per accepted build.
- * Each build pins its own DCP image UUID: iBoot leaves a different image running per OS, so matching
- * is exact per build. A NULL uuid means the running ADT image is published instead (any_uuid).
+ * Each build pins its own DCP image UUID: iBoot leaves a different image running per OS, so
+ * matching is exact per build. A NULL uuid means the running ADT image is published instead
+ * (any_uuid).
  */
 struct dcp6_fw {
     u32 os_fw; /* enum fw_version the kernel's DCP interface is written for */
@@ -584,7 +585,7 @@ static struct {
     char uuid[40];          /* the DCP image the handoff publishes, once checked */
 } dcp6;
 
-/* True if the profile pins at least one DCP image (any build); false means any_uuid/dry-run only. */
+/* True if the profile pins a DCP image for at least one build; false: any_uuid/dry-run only. */
 static bool dcp6_profile_pins_image(const struct dcp_soc *soc)
 {
     if (soc->fws) {
