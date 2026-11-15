@@ -96,7 +96,8 @@ if ro_end and image_end > ro_start and new_base < ro_end:
 if not args.relocate and live_heap > inherited_top and image_end > inherited_top and new_base < live_heap:
     raise ValueError("Image overlaps live Stage 1 heap")
 
-park_fw = not args.relocate and ((ro_end and packed_end > ro_start and image_end < ro_end) or
+park_fw = not args.relocate and (image_end < inherited_top or
+           (ro_end and packed_end > ro_start and image_end < ro_end) or
            (live_heap > inherited_top and packed_end > inherited_top and image_end < live_heap))
 fw_dest = new_base + image_only_size
 if park_fw:
