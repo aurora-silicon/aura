@@ -93,12 +93,31 @@ bool nv2_probe_active = false;
 
 #ifdef AURACTL
 /* auractl's second transport (src/sptm_virt_ctl.c): a guest process reaches aura through the
- * debug communications channel instead of an hvc, so no guest kernel code is needed. MDCR_EL2.TDCC
- * (FEAT_FGT; present on the M-series) traps every EL0/EL1 access to the DCC registers (DBGDTR_EL0,
- * DBGDTRRX/TX_EL0, MDCCSR_EL0, MDCCINT_EL1) to EL2, reported as EC 0x18. For an EL0 access the
- * EL1 control MDSCR_EL1.TDCC has priority over the EL2 controls, so to be sure the access reaches
- * aura and not the guest's own EL1, the hardware MDSCR_EL1.TDCC is also forced clear (the guest's
- * MDSCR_EL1 is VNCR-banked, so what it reads back is unchanged).
+ * debug communications channel instead of an hvc, so no guest kernel code is needed. An EL0 access
+ * to a DCC register (DBGDTR_EL0, DBGDTRRX/TX_EL0, MDCCSR_EL0) must reach aura at EL2 -- reported as
+ * EC 0x18 -- not the guest's own EL1. MDCR_EL2.TDCC (FEAT_FGT; present on the M-series) traps the
+ * EL0/EL1 DCC accesses to EL2, but for an EL0 access the EL1 control MDSCR_EL1.TDCC has priority
+ * over the EL2 controls: the hardware MDSCR_EL1.TDCC must ALSO be clear for the access to reach
+ * EL2 instead of trapping to the guest.
+ *
+ * On the self-booted (ESP) macOS the guest is XNU running as the nv2 "L1 host" at virtual EL2, and
+ * MDSCR_EL1 has an architected VNCR offset (0x158, V_MDSCR). aura installs the guest's MDSCR_EL1
+ * into the real register at two sites -- once at bring-up (nv2_el2_setup) and on every EL1-file
+ * swap around a nested child (nv2_bank_load) -- so it masks MDSCR_EL1.TDCC out of the value it
+ * installs there, while leaving the guest's banked value (what XNU reads back) untouched, and
+ * nv2_bank_save keeps the guest's TDCC bit so the masked hardware readback never erases it. This is
+ * the guest-debug hygiene the DCC transport needs: aura never leaks a set TDCC into the real
+ * register through its own bank.
+ *
+ * NOTE (hardware, self-boot L1 host): holding the REAL MDSCR_EL1.TDCC clear this way is necessary
+ * but NOT sufficient on the nv2 L1 host. With this masking live (SPTM_VIRT_CTL_DCC set) a guest
+ * EL0 DCC access still traps to XNU's own EL1 (observed as SIGILL at `msr DBGDTRTX_EL0` on the
+ * 26A428 self-boot), i.e. the TDCC that governs the EL0 trap is the one XNU last wrote to its
+ * NV2-banked MDSCR_EL1, not the real register aura masks. AURACTL-21's MDCR_EL2.TDA could not trap
+ * that write either (a FEAT_NV2-redirected write goes to memory, outside TDA's reach). Closing it
+ * needs a fine-grained write trap on MDSCR_EL1 (HDFGWTR_EL2, which fires ahead of NV2 redirection),
+ * routed to a per-core shadow that returns the guest's value on read and keeps both the real
+ * register and the banked copy's TDCC clear -- this masking is the install-site half of that.
  *
  * The trap is armed only when the boot's flags include SPTM_VIRT_CTL_DCC (the DCC transport is a
  * developer gate, off unless enabled at boot): with the flag clear aura leaves MDCR_EL2.TDCC and
@@ -387,10 +406,20 @@ void nv2_cpu_reset_invalidate(int cpu)
 
 static void nv2_bank_save(u64 *b)
 {
+#ifdef AURACTL
+    /* aura holds the hardware MDSCR_EL1.TDCC clear for the DCC transport (nv2_bank_load), so the
+     * readback below would otherwise erase the guest's own TDCC bit. The guest reads MDSCR_EL1 from
+     * this banked copy, so preserve the bit it last had here. Only while the transport is armed. */
+    u64 mdscr_tdcc = (sptm_virt_flags & SPTM_VIRT_CTL_DCC) ? (b[V_MDSCR / 8] & MDSCR_EL1_TDCC) : 0;
+#endif
 #define SAVE(reg, off) b[(off) / 8] = _mrs(sr_tkn(reg));
     NV2_BANK(SAVE)
 #undef SAVE
     b[V_SCTLR / 8] = mrs(SYS_SCTLR_EL12);
+#ifdef AURACTL
+    if (sptm_virt_flags & SPTM_VIRT_CTL_DCC)
+        b[V_MDSCR / 8] = (b[V_MDSCR / 8] & ~MDSCR_EL1_TDCC) | mdscr_tdcc;
+#endif
 }
 
 static void nv2_bank_load(const u64 *b)
@@ -401,6 +430,14 @@ static void nv2_bank_load(const u64 *b)
 #define LOAD(reg, off) _msr(sr_tkn(reg), b[(off) / 8]);
     NV2_BANK(LOAD)
 #undef LOAD
+#ifdef AURACTL
+    /* Hold the hardware MDSCR_EL1.TDCC clear for the guest so an EL0 DCC access reaches aura at EL2
+     * (MDCR_EL2.TDCC) and not the guest's own EL1. The banked value loaded above is left untouched,
+     * so what the guest reads back from its NV2-banked MDSCR_EL1 is unchanged. Only while the DCC
+     * transport is armed; otherwise the guest's MDSCR_EL1 is installed verbatim. */
+    if (sptm_virt_flags & SPTM_VIRT_CTL_DCC)
+        _msr(sr_tkn(SYS_MDSCR_EL1), b[V_MDSCR / 8] & ~MDSCR_EL1_TDCC);
+#endif
     msr(SYS_SCTLR_EL12, b[V_SCTLR / 8]);
     sysop("isb");
 }
