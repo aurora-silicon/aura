@@ -9151,6 +9151,41 @@ static bool skip_pmp_prop(const char *prop_name)
     return false;
 }
 
+/* The high bit of the ADT property size is a flag. */
+static u32 pmp_prop_size(const struct adt_property *prop)
+{
+    return prop->size & 0x7fffffff;
+}
+
+static const char *const pmp_bootargs[] = {"dram-channel-disable", "pmc-msg-disabled",
+                                           "soc-chip-variant"};
+
+/* Count each property as new, including its name in the string table. */
+static size_t pmp_fdt_prop_space(size_t name_len, size_t value_len)
+{
+    return sizeof(struct fdt_property) + ALIGN_UP(value_len, 4) + name_len + 1;
+}
+
+static size_t pmp_alias_space(int pmp_iop_anode)
+{
+    size_t need = pmp_fdt_prop_space(strlen("apple,board-id"), sizeof(u32)) +
+                  pmp_fdt_prop_space(strlen("apple,dram-vendor-id"), sizeof(u32)) +
+                  pmp_fdt_prop_space(strlen("apple,dram-capacity"), sizeof(u32)) +
+                  pmp_fdt_prop_space(strlen("status"), sizeof("okay"));
+
+    for (size_t i = 0; i < ARRAY_SIZE(pmp_bootargs); i++)
+        need += pmp_fdt_prop_space(strlen("apple,") + strlen(pmp_bootargs[i]), sizeof(u32));
+
+    ADT_FOREACH_PROPERTY(adt, pmp_iop_anode, prop)
+    {
+        if (skip_pmp_prop(prop->name))
+            continue;
+        need +=
+            pmp_fdt_prop_space(strlen("apple,tunable-") + strlen(prop->name), pmp_prop_size(prop));
+    }
+    return need;
+}
+
 /* Reads a u32 ADT property only if it is exactly four bytes long. */
 static int adt_get_u32_exact(int node, const char *name, u32 *val)
 {
@@ -9200,7 +9235,7 @@ static int dt_fill_pmp(int pmp_node)
             continue;
         char prop_name[128];
         snprintf(prop_name, sizeof(prop_name), "apple,tunable-%s", prop->name);
-        if (fdt_setprop(dt, pmp_node, prop_name, prop->value, prop->size))
+        if (fdt_setprop(dt, pmp_node, prop_name, prop->value, pmp_prop_size(prop)))
             bail("FDT: failed to transfer pmp tunable\n");
     }
     return 0;
@@ -9245,6 +9280,15 @@ static int dt_set_pmp(void)
         bail("ADT: failed to get dram vendor id\n");
     ADT_GETPROP(adt, pmp_iop_anode, "dram-capacity", &dram_capacity);
 
+    /* Check the whole alias handoff before writing any PMP data. */
+    size_t need = pmp_alias_space(pmp_iop_anode);
+    size_t free_space = fdt_totalsize(dt) - fdt_off_dt_strings(dt) - fdt_size_dt_strings(dt);
+    if (need > free_space) {
+        printf("FDT: pmp left disabled: handoff needs up to %zu bytes, %zu free\n", need,
+               free_space);
+        return 0;
+    }
+
     if (fdt_setprop_u32(dt, pmp_node, "apple,board-id", board_id))
         bail("FDT: failed to set board id\n");
     if (fdt_setprop_u32(dt, pmp_node, "apple,dram-vendor-id", dram_vendor_id))
@@ -9259,7 +9303,7 @@ static int dt_set_pmp(void)
             continue;
         char prop_name[128];
         snprintf(prop_name, sizeof(prop_name), "apple,tunable-%s", prop->name);
-        if (fdt_setprop(dt, pmp_node, prop_name, prop->value, prop->size))
+        if (fdt_setprop(dt, pmp_node, prop_name, prop->value, pmp_prop_size(prop)))
             bail("FDT: failed to transfer pmp tunable");
     }
 
@@ -9268,8 +9312,6 @@ static int dt_set_pmp(void)
      * apple,<name>; the firmware's default for each is 0. iBoot sets them where they
      * apply, e.g. a J616s has dram-channel-disable 0xffff0000.
      */
-    static const char *const pmp_bootargs[] = {"dram-channel-disable", "pmc-msg-disabled",
-                                               "soc-chip-variant"};
     for (size_t i = 0; i < ARRAY_SIZE(pmp_bootargs); i++) {
         u32 val;
         char arg_name[64];
