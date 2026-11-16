@@ -30,6 +30,7 @@ typedef uint32_t u32;
 #define ADT_GETPROP(a, n, p, v)       adt_get((n), (p), (v), sizeof(*(v)))
 #define ARRAY_SIZE(a)                 (sizeof(a) / sizeof((a)[0]))
 #define T8140                         0x8140
+#define T8152                         0x8152
 static unsigned char blob[16384];
 static void *dt = blob;
 static size_t dt_bufsize = sizeof(blob);

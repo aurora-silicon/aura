@@ -8821,8 +8821,10 @@ static int dt_set_sep(void)
         bail("FDT: invalid sep alias path\n");
     memcpy(path, alias, alias_len);
 
+    /* T8140 and T8152 keep both the carve-out and the manifests inside the ADT's DRAM. */
+    bool dram_bound = chip_id == T8140 || chip_id == T8152;
     u64 dram_base = 0, dram_size = 0;
-    if (chip_id == T8140) {
+    if (dram_bound) {
         int chosen = adt_path_offset(adt, "/chosen");
         if (chosen < 0 || ADT_GETPROP(adt, chosen, "dram-base", &dram_base) != sizeof(dram_base))
             bail("ADT: invalid DRAM base for SEP\n");
@@ -8840,8 +8842,8 @@ static int dt_set_sep(void)
     int ret = ADT_GETPROP_ARRAY(adt, anode_mmap, "SEPFW", phys_map);
     if (ret != (int)sizeof(phys_map) || !phys_map[0] || !phys_map[1] ||
         phys_map[0] > UINT64_MAX - phys_map[1] ||
-        (chip_id == T8140 && (phys_map[0] < dram_base || phys_map[0] > dram_base + dram_size ||
-                              phys_map[1] > dram_base + dram_size - phys_map[0])))
+        (dram_bound && (phys_map[0] < dram_base || phys_map[0] > dram_base + dram_size ||
+                        phys_map[1] > dram_base + dram_size - phys_map[0])))
         bail("ADT: could not get sepfw memory\n");
 
     const char *node_name = "sep-firmware";
@@ -8867,8 +8869,8 @@ static int dt_set_sep(void)
         ret = ADT_GETPROP_ARRAY(adt, anode_manifest, adt_names[i], phys_map);
         if (ret != (int)sizeof(phys_map) || !phys_map[0] || !phys_map[1] ||
             phys_map[1] > (u64)dt_bufsize || phys_map[0] > UINT64_MAX - phys_map[1] ||
-            (chip_id == T8140 && (phys_map[0] < dram_base || phys_map[0] > dram_base + dram_size ||
-                                  phys_map[1] > dram_base + dram_size - phys_map[0]))) {
+            (dram_bound && (phys_map[0] < dram_base || phys_map[0] > dram_base + dram_size ||
+                            phys_map[1] > dram_base + dram_size - phys_map[0]))) {
             printf("ADT: no usable SEP %s manifest\n", adt_names[i]);
             continue;
         }
@@ -11123,6 +11125,30 @@ static int dt_set_display_t8152(void)
     return 0;
 }
 
+/*
+ * Touch ID: the SEP reservation and boot manifests, as dt_set_sep() publishes them on every
+ * other chip. Only a tree that names the SEP (alias "sep") takes them; any other tree, a J804
+ * tree without the alias included, is left exactly as it was and logs nothing. Aura still sends
+ * nothing to the SEP here: iBoot booted sepOS, and Linux registers with it once.
+ *
+ * Never fatal, like the other optional J804 handoffs. dt_set_sep() publishes the manifests
+ * only after the carve-out is reserved and named on the node, so a refusal leaves at most an
+ * unused reservation and a SEP node without manifests, which the driver will not attach to.
+ */
+static void dt_set_sep_t8152(void)
+{
+    const char *path = fdt_get_alias(dt, "sep");
+
+    if (!path)
+        return;
+    if (fdt_path_offset(dt, path) < 0) {
+        printf("FDT: sep alias names no node, SEP not published\n");
+        return;
+    }
+    if (dt_set_sep())
+        printf("FDT: T8152 SEP not published\n");
+}
+
 static int dt_prepare_t8152(void)
 {
     if (fdt_getprop(dt, 0, "aurora,minimal-boot", NULL)) {
@@ -11139,6 +11165,8 @@ static int dt_prepare_t8152(void)
         return -1;
     if (dt_set_fb2_t8152())
         return -1;
+    /* The SEP carve-out and boot manifests, for a tree with a sep alias. Never fatal. */
+    dt_set_sep_t8152();
     if (dt_set_memory())
         return -1;
     if (fdt_pack(dt))
@@ -11280,6 +11308,9 @@ int kboot_prepare_dt(void *fdt)
     // A T6040 takes its PMP values (about 38K) and its firmware handoffs
     if (chip_id == T6040)
         dt_bufsize += 4 * SZ_16K;
+    // A T8152 tree that names the SEP takes its two boot manifests (about 13K on J804)
+    if (chip_id == T8152 && fdt_get_alias(fdt, "sep"))
+        dt_bufsize += SZ_16K;
     dt = memalign(DT_ALIGN, dt_bufsize);
 
     if (fdt_open_into(fdt, dt, dt_bufsize) < 0)
