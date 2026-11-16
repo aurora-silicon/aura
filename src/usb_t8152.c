@@ -139,20 +139,72 @@ static int phy_tuning(int node, const char *name, bool apply)
     return 0;
 }
 
+/*
+ * J804 handoff: leave USB0 powered with its PHY running for the next stage, but stop and reset
+ * the device controller and return its DART stream to idle (disabled, no root) for the next
+ * stage's DART driver. A chainloaded aura takes USB0 over warm (usb_t8152_init()).
+ */
+void usb_t8152_handoff(void)
+{
+    if (chip_id != T8152 || board_id != 0x22 || (read32(USB0_AON) & 0xff) != 0xff)
+        return;
+    /* Clear DCTL.RUN_STOP and wait for DSTS.DEVCTRLHLT */
+    clear32(USB0_DWC + 0xc704, BIT(31));
+    if (poll32(USB0_DWC + 0xc70c, BIT(22), BIT(22), USB0_WAIT))
+        printf("USB0: controller did not halt before handoff\n");
+    set32(USB0_DWC + 0xc704, BIT(30)); /* DCTL.CSFTRST */
+    if (poll32(USB0_DWC + 0xc704, BIT(30), 0, USB0_WAIT))
+        printf("USB0: core soft reset did not complete\n");
+    /* Bypass is not usable for Linux under SMP: bypassed DMA faulted (GSTS BUSERRADDRVLD,
+     * address 0) once secondaries were online. */
+    if (dart_gen3_quiesce_adt("/arm-io/dart-usb0", 1, 1))
+        printf("USB0: DART quiesce failed\n");
+    else
+        printf("USB0: stopped, DART SID 1 idle for the next stage's DART driver\n");
+}
+
 dwc3_dev_t *usb_t8152_init(void (*set_step)(unsigned step))
 {
     int phy = adt_path_offset(adt, "/arm-io/atc-phy0");
-    if (chip_id != T8152 || board_id != 0x24 ||
+    /* J804 (board 0x22) matches this layout except dart-usb0 reg[1]'s size, 0x20000 rather
+     * than 0xc000; its base is the same. */
+    bool j804 = board_id == 0x22;
+    if (chip_id != T8152 || (board_id != 0x24 && !j804) ||
         !reg_is("/arm-io/usb-drd0", "usb-drd,t8152", 0, USB0_DWC, 0x11800) ||
         !reg_is("/arm-io/usb-drd0", "usb-drd,t8152", 3, USB0_PIPE, 0x4000) ||
         !reg_is("/arm-io/atc-phy0", "atc-phy,t8152", 0, USB0_PHY, 0x4000) ||
         !reg_is("/arm-io/atc-phy0", "atc-phy,t8152", 1, USB0_EVT, 0x4000) ||
-        !reg_is("/arm-io/dart-usb0", "dart,gen3", 1, 0x403040000ULL, 0xc000) || !power_layout() ||
-        phy_tuning(phy, "tunable_USB2PHY_DFLT", false) ||
+        !reg_is("/arm-io/dart-usb0", "dart,gen3", 1, 0x403040000ULL, j804 ? 0x20000 : 0xc000) ||
+        !power_layout() || phy_tuning(phy, "tunable_USB2PHY_DFLT", false) ||
         phy_tuning(phy, "tunable_USB2PHY_DEV", false)) {
         printf("USB0: unsupported T8152 ADT layout\n");
         return NULL;
     }
+    /*
+     * A chainloaded J804 stage finds USB0 still powered and running from the previous stage,
+     * which leaves USB up on T8152. Stop the device controller, return its DART stream to idle
+     * and reinitialize both; power and PHY bring-up were already done.
+     */
+    if (j804 && (read32(USB0_AON) & 0xff) == 0xff && (read32(USB0_GATE) & 0xff) == 0xff &&
+        (read32(USB0_PSD + 0x80) & 7) == 0) {
+        printf("USB0: warm, taking over from the previous stage\n");
+        /* Clear DCTL.RUN_STOP and wait for DSTS.DEVCTRLHLT */
+        clear32(USB0_DWC + 0xc704, BIT(31));
+        if (poll32(USB0_DWC + 0xc70c, BIT(22), BIT(22), USB0_WAIT))
+            printf("USB0: controller did not halt; resetting anyway\n");
+        if (dart_gen3_quiesce_adt("/arm-io/dart-usb0", 1, 1))
+            return NULL;
+        if (!read32(USB0_EVT + 0x20)) {
+            printf("USB0: no UTMI clock on warm takeover\n");
+            return NULL;
+        }
+        set_step(4);
+        dart_dev_t *warm_dart = dart_gen3_init_adt_cold("/arm-io/dart-usb0", 1, 1);
+        if (!warm_dart)
+            return NULL;
+        return usb_dwc3_init(USB0_DWC, warm_dart);
+    }
+
     set_step(2);
     if (read32(USB0_AON) != 0x300 || read32(USB0_GATE) != 0x300 ||
         (read32(USB0_PSD + 0x80) & 7) != 6) {
