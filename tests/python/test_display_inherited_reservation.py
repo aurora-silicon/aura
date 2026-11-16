@@ -25,7 +25,7 @@ def test_inherited_reservation(tmp_path):
     end = text.index("    if (nvme_post_m4())", start)
     block = text[start:end]
     call = re.search(
-        r"    if \(dt_reserve_outside_exec_window\(\(u64\)_base, image_end - \(u64\)_base\)\)\n"
+        r"    if \(dt_reserve_(?:outside_exec_window|retained_extent)\(\(u64\)_base, image_end - \(u64\)_base\)\)\n"
         r"        bail\([^\n]+\);", text[end:]
     )
     assert call, "missing real aura image reservation"
@@ -53,6 +53,8 @@ static unsigned char tree[4096], before[4096];
 static void *dt = tree;
 /* Without a window this is the plain call (test_ctxr_exec_window.py). */
 #define dt_reserve_outside_exec_window(start, size) fdt_add_mem_rsv(dt, start, size)
+/* J716c's variant also records the entry; outside J716c it is the same call. */
+#define dt_reserve_retained_extent(start, size) fdt_add_mem_rsv(dt, start, size)
 static int reserve(void)
 {
 ''' + block + call.group(0) + r'''

@@ -81,6 +81,7 @@ extern u64 relocated_from;
 
 int dt_set_gpu(void *dt);
 int dt_set_display_handoff(void *dt);
+void dt_set_display_j716c(void *dt);
 
 u64 kboot_ram_base(void)
 {
@@ -747,6 +748,34 @@ static int dt_reserve_outside_exec_window(u64 start, u64 size)
         u64 above = max(start, window_end);
         if (fdt_add_mem_rsv(dt, above, end - above))
             return -1;
+    }
+    return 0;
+}
+
+/*
+ * The retained heap/high-water reservations cover gaps between boot objects too. Record only
+ * the exact entries produced for those envelopes, so firmware-owned RTBuddySeg log pages can
+ * acquire no-map names without weakening checks against other memory reservations.
+ */
+static struct {
+    u64 base, size;
+} j716c_retained[4];
+static unsigned j716c_retained_count;
+
+static int dt_reserve_retained_extent(u64 start, u64 size)
+{
+    int first = fdt_num_mem_rsv(dt);
+    if (dt_reserve_outside_exec_window(start, size))
+        return -1;
+    if (chip_id != T6050 || fdt_node_check_compatible(dt, 0, "apple,j716c"))
+        return 0;
+    for (int i = first; i < fdt_num_mem_rsv(dt); i++) {
+        if (j716c_retained_count == ARRAY_SIZE(j716c_retained))
+            return -1;
+        if (fdt_get_mem_rsv(dt, i, &j716c_retained[j716c_retained_count].base,
+                            &j716c_retained[j716c_retained_count].size))
+            return -1;
+        j716c_retained_count++;
     }
     return 0;
 }
@@ -8014,8 +8043,151 @@ static int dt_set_m4_dcp_handoff(void)
     return 0;
 }
 
+static bool j716c_ranges_overlap(u64 a, u64 size, u64 b, u64 bytes)
+{
+    return size && bytes && a < b + bytes && b < a + size;
+}
+
+/* Keep every existing reservation. Only the two recorded envelope reservations may contain a log.
+ */
+static int dt_j716c_oslog_conflict(u64 base, u64 size, int same_log)
+{
+    u64 high_water = heapblock_high_water();
+    if (high_water < cur_boot_args.top_of_kernel_data)
+        bail("FDT: J716c invalid heap high-water mark\n");
+    if (in_exec_window(base, size) ||
+        j716c_ranges_overlap(base, size, (u64)_base, (u64)_end - (u64)_base) ||
+        (relocated_from && cur_boot_args.top_of_kernel_data > relocated_from &&
+         j716c_ranges_overlap(base, size, relocated_from,
+                              cur_boot_args.top_of_kernel_data - relocated_from)) ||
+        j716c_ranges_overlap(base, size, cur_boot_args.top_of_kernel_data,
+                             high_water - cur_boot_args.top_of_kernel_data))
+        bail("FDT: J716c __OS_LOG overlaps a live boot allocation\n");
+
+    for (int i = 0; i < fdt_num_mem_rsv(dt); i++) {
+        u64 a, s;
+        if (fdt_get_mem_rsv(dt, i, &a, &s) || s > UINT64_MAX - a)
+            return -1;
+        if (!j716c_ranges_overlap(base, size, a, s))
+            continue;
+        bool envelope = false;
+        for (unsigned j = 0; j < j716c_retained_count; j++)
+            envelope |= a == j716c_retained[j].base && s == j716c_retained[j].size;
+        if (!envelope || base < a || size > a + s - base)
+            bail("FDT: J716c __OS_LOG overlaps an unrelated memory reservation\n");
+    }
+    int resv = fdt_path_offset(dt, "/reserved-memory"), node;
+    if (resv < 0)
+        return -1;
+    fdt_for_each_subnode(node, dt, resv)
+    {
+        if (node == same_log)
+            continue;
+        const char *status = fdt_getprop(dt, node, "status", NULL);
+        if (status && !strcmp(status, "disabled"))
+            continue;
+        int len;
+        const fdt64_t *reg = fdt_getprop(dt, node, "reg", &len);
+        if (!reg)
+            continue;
+        if (len <= 0 || len % (2 * sizeof(*reg)))
+            return -1;
+        for (int k = 0; k < len / (int)sizeof(*reg); k += 2) {
+            u64 a = fdt64_ld(&reg[k]), s = fdt64_ld(&reg[k + 1]);
+            if (s > UINT64_MAX - a || j716c_ranges_overlap(base, size, a, s))
+                bail("FDT: J716c __OS_LOG conflicts with reserved-memory/%s\n",
+                     fdt_get_name(dt, node, NULL));
+        }
+    }
+    return 0;
+}
+
+static int dt_reserve_j716c_oslogs_of(int at, u64 owner, u64 owner_size)
+{
+    u32 len = 0;
+    int count = 0;
+    const struct adt_segment_ranges *seg = adt_getprop(adt, at, "segment-ranges", &len);
+    if (!seg || !len)
+        return 0;
+    if (len % sizeof(*seg))
+        return -1;
+    for (u32 i = 0; i < len / sizeof(*seg); i++) {
+        struct adt_segment_ranges r;
+        memcpy(&r, &seg[i], sizeof(r));
+        if (r.unk != 0xa || !r.size)
+            continue;
+        if (r.phys > UINT64_MAX - r.size - (SZ_16K - 1))
+            return -1;
+        u64 base = ALIGN_DOWN(r.phys, SZ_16K);
+        u64 end = ALIGN_UP(r.phys + r.size, SZ_16K), size = end - base;
+        if (base < owner || end > owner + owner_size)
+            bail("FDT: J716c %s __OS_LOG is outside RTBuddySeg\n", adt_get_name(adt, at));
+        char name[32];
+        snprintf(name, sizeof(name), "os-log@%lx", base);
+        int resv = fdt_path_offset(dt, "/reserved-memory");
+        int node = resv < 0 ? -1 : fdt_subnode_offset(dt, resv, name);
+        if (node >= 0) {
+            int bytes;
+            const fdt64_t *reg = fdt_getprop(dt, node, "reg", &bytes);
+            if (!reg || bytes != 2 * sizeof(*reg) || fdt64_ld(reg) != base ||
+                fdt64_ld(reg + 1) != size || fdt_node_check_compatible(dt, node, "apple,os-log") ||
+                !fdt_getprop(dt, node, "no-map", NULL) || fdt_getprop(dt, node, "status", NULL))
+                bail("FDT: J716c existing %s differs from the firmware log\n", name);
+        }
+        if (dt_j716c_oslog_conflict(base, size, node))
+            return -1;
+        if (node >= 0)
+            continue; /* ADT owner and nub repeat the same segment. */
+        if (dt_get_or_add_reserved_mem(name, "apple,os-log", true, base, size) < 0)
+            return -1;
+        count++;
+    }
+    return count;
+}
+
+static int dt_reserve_j716c_oslogs(void)
+{
+    if (chip_id != T6050 || fdt_node_check_compatible(dt, 0, "apple,j716c"))
+        return 0;
+    u64 owner[2];
+    int map = adt_path_offset(adt, "/chosen/memory-map");
+    if (map < 0 || ADT_GETPROP_ARRAY(adt, map, "RTBuddySeg", owner) < 0 || !owner[1] ||
+        owner[0] > UINT64_MAX - owner[1] ||
+        cur_boot_args.phys_base > UINT64_MAX - cur_boot_args.mem_size ||
+        owner[0] < cur_boot_args.phys_base ||
+        owner[0] + owner[1] > cur_boot_args.phys_base + cur_boot_args.mem_size)
+        bail("FDT: J716c has no valid RTBuddySeg firmware-log extent\n");
+    int total = 0, dev = adt_path_offset(adt, "/arm-io");
+    if (dev < 0)
+        return -1;
+    ADT_FOREACH_CHILD(adt, dev)
+    {
+        int n = dt_reserve_j716c_oslogs_of(dev, owner[0], owner[1]);
+        if (n < 0)
+            return -1;
+        total += n;
+        int nub = adt_first_child_offset(adt, dev);
+        for (int k = adt_get_child_count(adt, dev); k--; nub = adt_next_sibling_offset(adt, nub)) {
+            n = dt_reserve_j716c_oslogs_of(nub, owner[0], owner[1]);
+            if (n < 0)
+                return -1;
+            total += n;
+        }
+    }
+    printf(
+        "FDT: J716c: named %d RTBuddySeg firmware logs no-map; retained reservations unchanged\n",
+        total);
+    return 0;
+}
+
 static int dt_set_display(void)
 {
+    /* J716c describes its inherited display by address, with clocks and scratch prewired. */
+    if (chip_id == T6050 && !fdt_node_check_compatible(dt, 0, "apple,j716c")) {
+        dt_set_display_j716c(dt);
+        return 0;
+    }
+
     if (chip_id == T8140)
         return dt_set_display_t8140();
 
@@ -11329,6 +11501,7 @@ int kboot_prepare_dt(void *fdt)
     }
 
     dt_ready = false;
+    j716c_retained_count = 0;
 
     if (!ctxr_exec_os_may_start())
         return -1;
@@ -11423,13 +11596,12 @@ int kboot_prepare_dt(void *fdt)
                 bail("FDT: retained heap extent overflows\n");
             u64 heap_start = ALIGN_DOWN((u64)_end, SZ_16K);
             u64 heap_end = ALIGN_UP(heap_top, SZ_16K);
-            if (heap_end > ram_end ||
-                dt_reserve_outside_exec_window(heap_start, heap_end - heap_start))
+            if (heap_end > ram_end || dt_reserve_retained_extent(heap_start, heap_end - heap_start))
                 bail("FDT: couldn't reserve retained heap\n");
             printf("FDT: retained heap [0x%lx, 0x%lx)\n", heap_start, heap_end);
         }
     }
-    if (dt_reserve_outside_exec_window((u64)_base, image_end - (u64)_base))
+    if (dt_reserve_retained_extent((u64)_base, image_end - (u64)_base))
         bail("FDT: couldn't add reservation for aura and inherited high-water\n");
 
     /*
@@ -11567,6 +11739,8 @@ int kboot_prepare_dt(void *fdt)
     if (dt_set_ave())
         return -1;
     if (dt_set_ane_firmware())
+        return -1;
+    if (dt_reserve_j716c_oslogs())
         return -1;
     if (dt_set_display())
         return -1;
