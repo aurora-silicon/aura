@@ -439,6 +439,21 @@ bool nvme_post_m4(void)
 }
 
 /*
+ * T6040/T6041 (M4 Pro/Max): a cold start of ANS after the generic power-off gets no RTKit HELLO
+ * (ASC CPU running, pmgr domains on), and an RTKit quiesce times out. Keep ANS live between
+ * stages and adopt it in the next stage, as T6050 does.
+ */
+static bool nvme_post_m4_keeps_live(void)
+{
+    return chip_id == T6040 || chip_id == T6041;
+}
+
+static bool nvme_post_m4_hands_on_live(void)
+{
+    return chip_id == T6050 || nvme_post_m4_keeps_live();
+}
+
+/*
  * Post-M4, done with ANS: stop the controller, idle the firmware as macOS does before a sleep,
  * keep the SART entries, then power ANS and the PCIe block it runs on off. Every later stage that
  * needs it starts it again with nvme_ans_power_on(). The firmware resumes from what it saves at
@@ -650,7 +665,7 @@ bool nvme_init(void)
          * T6050: adopt a healthy session as it is. Left 16 s (an ESP Stage 2 behind its host
          * window), its firmware no longer acknowledged the idle, and ANS didn't start from off.
          */
-        adopted = earlier && chip_id == T6050 &&
+        adopted = earlier && nvme_post_m4_hands_on_live() &&
                   read32(nvme_base + NVME_BOOT_STATUS) == NVME_BOOT_STATUS_OK &&
                   !(read32(nvme_base + NVME_CSTS) & NVME_CSTS_CFS);
         from_off = !running || (earlier && !adopted);
@@ -923,6 +938,21 @@ bool nvme_shutdown(void)
             goto out_preserve;
     }
 
+    /*
+     * T6040/T6041: the firmware acknowledges neither an RTKit power transition (quiesce times out)
+     * nor a start after power-off (no HELLO), but a session left fully running is adopted by the
+     * next nvme_init() and reads correctly (J614c, 3/3 cycles). Hand it on with the controller
+     * enabled and RTKit untouched; only the I/O queue registers are cleared.
+     */
+    if (nvme_type == NVME_T8132 && nvme_post_m4_keeps_live()) {
+        write64_lo_hi(nvme_qreg(NVME_IOQ_CMDS), 0);
+        write64_lo_hi(nvme_qreg(NVME_IOQ_CQES), 0);
+        nvme_initialized = false;
+        printf("nvme: handing the live ANS session on: CC=0x%x CSTS=0x%x BOOT_STATUS=0x%x\n",
+               read32(nvme_base + NVME_CC), read32(nvme_base + NVME_CSTS),
+               read32(nvme_base + NVME_BOOT_STATUS));
+        return true;
+    }
     if (nvme_type == NVME_T8132 && !nvme_secure_regs && !nvme_quiesce_for_next) {
         write64_lo_hi(nvme_qreg(NVME_IOQ_CMDS), 0);
         write64_lo_hi(nvme_qreg(NVME_IOQ_CQES), 0);
