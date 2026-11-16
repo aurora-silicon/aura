@@ -725,6 +725,20 @@ int dapf_init_fdt(const void *fdt)
             entry++;
             continue;
         }
+        /*
+         * J716s (T6050): programming dart-aop's DAPF raises an asynchronous SError on slice 6
+         * (L2C_ERR_ADR = base + 0x180), although the runtime ADT lists 18 slices and they fit
+         * the 0x4000 window; the on-disk ADT carries allow-dram-apf-slices-0 = 0 for this DART,
+         * so the hardware likely exposes fewer slices than the property says. The m1n1-based
+         * J716s stage 2 skips it too. AOP DMA is not needed to boot Linux. Other T6050 boards
+         * are unchanged.
+         */
+        if (chip_id == T6050 && adt_is_compatible(adt, 0, "J716sAP") &&
+            !strcmp(entry->path, "/arm-io/dart-aop")) {
+            printf("dapf: skipping %s on the J716s (asynchronous SError)\n", entry->path);
+            entry++;
+            continue;
+        }
         /* Only prepare DMA for devices handed to the next stage. In
          * particular, an initial J813 FDT has no AOP, MTP, PMP or ISP.
          * Their firmware-owned protection registers must remain intact.
