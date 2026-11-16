@@ -195,7 +195,9 @@ int main(void)
 
 def test_handoff_reserves_and_boots_on():
     main = (ROOT / "src/main.c").read_text()
-    shutdown = main.index("        usb_iodev_shutdown();\n")
+    shutdown_call = re.search(r"^\s*(?:usb_stopped\s*=\s*)?usb_iodev_shutdown\(\);", main, re.M)
+    assert shutdown_call
+    shutdown = shutdown_call.start()
     display = main.index("display_shutdown(", shutdown)
     step = main[shutdown:display]
     assert "kboot_reserve_usb_dma()" in step
