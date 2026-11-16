@@ -80,6 +80,30 @@ void get_device_info(void)
     printf("\n");
 }
 
+#ifndef CHAINLOADING
+/*
+ * T6050: a plain stage 2 brings the USB2 controller up before its payload, as a proxy window does
+ * (usb_cdc_schedule(), the same 1 s transition; main() stops it before vectoring), only with no
+ * host to wait for. Without it the kernel inherits the controller, its PHY and the PIPE mux as
+ * iBoot leaves them; the kernel's T6050 combo PHY accepts only some PIPE values at its first reset,
+ * and the transition parks the PIPE on the dummy producer (0x42), as an m1n1 stage 2's usb_init()
+ * does. On the J716s the kernel did not come up behind a plain stage 2 that skipped this, and does
+ * with it.
+ */
+static void t6050_usb_for_os(void)
+{
+    if (!usb_cdc_deferred_usb2() || usb_cdc_schedule(1000, 0, 0))
+        return;
+    u64 timeout = timeout_calculate(5000000);
+    while (!usb_cdc_ready() && !usb_cdc_failed() && !timeout_expired(timeout)) {
+        usb_cdc_poll();
+        mdelay(1);
+    }
+    printf("USB: T6050 USB2 controller %s before the hand-off\n",
+           usb_cdc_ready() ? "brought up" : "NOT brought up");
+}
+#endif
+
 /* Stage 1 runs at most one proxy window per boot: from its config or an aura-proxy request. */
 static bool stage1_window_done;
 static enum stage1_proxy_result stage1_window_result = STAGE1_PROXY_TIMEOUT;
@@ -200,6 +224,10 @@ void run_actions(void)
         /* Announced as aura-proxy's window is: host tools claim the window on this line */
         printf("Stage 1: waiting %u s for a host\n", window_ms / 1000);
     }
+#ifndef CHAINLOADING
+    if (!window_ms)
+        t6050_usb_for_os();
+#endif
     if (window_ms) {
         window_result = stage1_window_result = uartproxy_wait_stage1(window_ms);
         stage1_window_done = true;
