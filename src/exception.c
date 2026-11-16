@@ -400,6 +400,12 @@ void exc_sync(u64 *regs)
     exc_last_esr = esr;
     exc_last_afsr1 = (in_gl || el3) ? 0 : mrs(SYS_AFSR1_EL1);
 
+    /*
+     * GUARD_RETURN clears exc_guard below. Latch GUARD_SILENT first, or a silent probe that
+     * returns still prints "Recovering from exception".
+     */
+    bool silent = exc_guard & GUARD_SILENT;
+
     switch (exc_guard & GUARD_TYPE_MASK) {
         case GUARD_SKIP:
             elr += 4;
@@ -423,7 +429,7 @@ void exc_sync(u64 *regs)
 
     exc_count++;
 
-    if (!(exc_guard & GUARD_SILENT))
+    if (!silent)
         printf("Recovering from exception (ELR=0x%lx)\n", elr);
     if (in_gl)
         msr(SYS_IMP_APL_ELR_GL1, elr);
