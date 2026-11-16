@@ -30,7 +30,16 @@ Environment (all optional; 1 enables a switch):
   AURA_S2R_CP_ANSX=<mask>  T6050 COPROC: also hook 1 the ANS SART, 2 the NVMe BAR page, 4 AUS5
   AURA_S2R_DROP_USB        tear down aura's USB gadget at the sleep commit
   AURA_S2R_WAKE_S=<s>      GO, timer-only sleep: arm the PMU RTC alarm s seconds after the commit
-  AURA_S2R_GO_COUNT=<n>    GO, timer-only sleep: after n wakes, stop in the proxy at the next commit
+  AURA_S2R_GO_COUNT=<n>    GO: after n wakes, stop in the proxy at the next commit
+  AURA_S2R_CRUMBS=<mask>   T8142 GO: note steps in PMU scratch (0x830d..0x8311), which a reset
+                           keeps; bits as in sptm_virt_s2r.c (s2r_crumb)
+  AURA_S2R_WIN=<b>,<a>     after a wake, dump b records before the first commit and a after
+  AURA_S2R_ARM_S=<s>       arm the sleep rules s seconds after setup (default 45)
+  AURA_S2R_EXTRA=<mask>    stop mode: also hook 1 the MCC, 2 aon-ptd, 4 other coprocessor mailboxes
+  AURA_S2R_PROBE=<a,...>   read up to four registers at the wake (bit 63: 64-bit read)
+  AURA_S2R_PROBE_AT=<a>    take the AURA_S2R_PROBE reads after the guest's first write to a
+  AURA_S2R_PREWRITE=<a,v>  write v to a at the wake, before the probes
+  AURA_AURA_HEAP_MIB=<n>   aura's own heap under the guest (default 112)
   AURA_S2R_QUIESCE=<mask>  AMCC error-enable writes at the commit: 8 DSID_AGE_OUT,
                            16 UNEXP_RT_HIT_DIR
   AURA_S2R_USB_RETAKE=<n>  take the CDC link again after a wake; n > 1 also drops it n s in
