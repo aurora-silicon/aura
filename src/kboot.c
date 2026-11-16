@@ -4428,7 +4428,7 @@ static int dt_reserve_asc_firmware(const char *adt_path, const char *adt_path_al
  */
 static const char *const ave_compatibles[] = {
     "apple,t6000-ave", "apple,t8112-ave", "apple,t8140-ave", "apple,t6041-ave",
-    "apple,t6050-ave", "apple,t8132-ave", "apple,t8142-ave",
+    "apple,t6050-ave", "apple,t8132-ave", "apple,t8142-ave", "apple,t8152-ave",
 };
 
 /*
@@ -4698,7 +4698,8 @@ static int dt_set_ave_node(int node, const char *compat, u32 phandle)
                      !fdt_node_check_compatible(dt, node, "apple,t6041-ave") ||
                      !fdt_node_check_compatible(dt, node, "apple,t6050-ave") ||
                      !fdt_node_check_compatible(dt, node, "apple,t8132-ave") ||
-                     !fdt_node_check_compatible(dt, node, "apple,t8142-ave");
+                     !fdt_node_check_compatible(dt, node, "apple,t8142-ave") ||
+                     !fdt_node_check_compatible(dt, node, "apple,t8152-ave");
     /*
      * On T8112 the encoder's DART window starts at the DART's vm-base: iBoot points the
      * coprocessor code base there, and the firmware addresses DATA at vm-base plus its
@@ -12238,6 +12239,9 @@ static int dt_prepare_t8152(void)
             printf("FDT: J804 DCP handoff not published\n");
         /* The audio coprocessor: checked with reads and enabled by stage; never fatal. */
         dt_set_j804_aop();
+        /* The video encoder's preloaded firmware: reserve it and export its CRCs. */
+        if (dt_set_ave())
+            return -1;
     }
     if (dt_set_cpus())
         return -1;
