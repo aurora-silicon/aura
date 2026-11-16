@@ -333,6 +333,13 @@ void sptm_virt_ctrr_publish_rorgn(void)
 {
     if (!sptm_virt_xnu_rorgn[0])
         return;
+    /*
+     * A T8142 secondary whose CTRR_D iBoot locked: the write is undefined there and the guarded
+     * retry never ends (J813, cpus=2: the core spun here at its XNU entry). It keeps the locked
+     * pair; ten cores reached XNU and slept and woke with this skip in place.
+     */
+    if (chip_id == T8142 && !is_boot_cpu())
+        return;
 
     int exc_before = exc_count;
     exc_guard = GUARD_MARK | GUARD_SILENT;
@@ -1146,6 +1153,15 @@ bool sptm_virt_el1_wfx(u64 *regs, u64 esr)
 {
     if (sptm_virt_s2r_wfi(regs, esr))
         return true;
+    /*
+     * The deadline park, offered here too: a guest that only spins in WFE or idles in WFI makes
+     * no GL trap and touches no hooked page, so neither of the other two offers would ever come.
+     */
+    if (sptm_virt_gpu_deadline_due()) {
+        struct exc_info pctx;
+        sptm_virt_fill_ctx(&pctx, regs, false);
+        sptm_virt_gpu_deadline(&pctx);
+    }
     if (sptm_virt_wfi_watched(esr) || sptm_virt_wfe_watched(regs, esr))
         return true;
 

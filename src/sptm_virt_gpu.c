@@ -104,6 +104,8 @@ static void gpu_note(struct exc_info *ctx, u64 addr, u64 val, bool write, int wi
 
 static void gpu_park(struct exc_info *ctx, const char *why)
 {
+    /* First: of several cores that reach here at once, one owns the console and the proxy. */
+    sptm_virt_park_others();
     gpu_parked = true;
     printf("SPTM-virt[gpu]: %s: parking cpu%d in the proxy at XNU pc "
            "0x%lx; ring 0x%lx, %lu records of %lu written (head 0x%lx at 0x%lx)\n",
