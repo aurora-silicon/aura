@@ -35,6 +35,7 @@ typedef uint32_t u32;
 #define T8122 0x8122
 #define T6030 0x6030
 #define T8132 0x8132
+#define T8152 0x8152
 #define T6000 0x6000
 #define T6001 0x6001
 #define T6002 0x6002

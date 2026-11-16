@@ -51,6 +51,7 @@ typedef uint8_t u8;
 #define PACKED __attribute__((packed))
 #define T6030 0x6030
 #define T8132 0x8132
+#define T8152 0x8152
 #define T8122 0x8122
 #define SZ_16K 0x4000
 #define ALIGN_UP(x, a) (((x) + (a) - 1) & ~((u64)(a) - 1))
