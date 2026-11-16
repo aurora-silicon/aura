@@ -648,6 +648,17 @@ static const char *kboot_serial_console_reason(void)
     return NULL;
 }
 
+bool kboot_atc0_reserved(void)
+{
+    /* A console override must not hide an actual debug host or prior USB use. */
+    bool reserved = aura_debug_enabled() || aura_console_enabled() ||
+                    kboot_serial_console_reason() != NULL || usb_atc0_used();
+#ifdef DEBUGUSB_PROXY
+    reserved |= dockchannel_uart_host_seen();
+#endif
+    return reserved;
+}
+
 static int dt_set_stdout_path(int chosen)
 {
     static const char *const props[] = {"stdout-path", "linux,stdout-path"};
@@ -12011,5 +12022,24 @@ int kboot_reserve_usb_dma(void)
         printf("kboot: USB DMA retained: more ranges than could be recorded\n");
         return -1;
     }
+    return 0;
+}
+
+int kboot_finalize_atc0(bool usb_stopped, bool debug_reserved)
+{
+    void *fdt = (void *)next_stage.args[0];
+    int size = dt && fdt == dt ? dt_bufsize : kboot_hibernate_handoff_size(fdt);
+    if (!next_stage.entry || !size)
+        return 0;
+
+    const struct usb_dwc3_dma_range *ranges;
+    bool overflow;
+    size_t retained = usb_dwc3_retained(&ranges, &overflow);
+    bool safe = usb_stopped && !debug_reserved && !kboot_atc0_reserved() && !retained && !overflow;
+    int ret = kboot_handoff_atc0(fdt, size, safe);
+    if (ret < 0)
+        return ret;
+    dc_cvac_range(fdt, fdt_totalsize(fdt));
+    sysop("dsb sy");
     return 0;
 }

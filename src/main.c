@@ -484,16 +484,22 @@ next_stage:
         uartproxy_run(NULL);
         panic("NVMe handoff failed\n");
     }
+#ifndef BRINGUP
+    /* Cleanup itself can stop/unregister a gadget, losing its ownership evidence. */
+    bool atc0_debug_reserved = kboot_atc0_reserved();
+    bool usb_stopped = false, usb_dma_ok = false;
+#endif
     usb_cdc_cleanup();
     exception_shutdown();
 #ifndef BRINGUP
     if (chip_id != T8152) {
-        usb_iodev_shutdown();
+        usb_stopped = usb_iodev_shutdown();
         /*
          * A controller that could not be stopped keeps its buffers: boot on with
          * them reserved, so the kernel never hands out memory it may still write.
          */
-        if (kboot_reserve_usb_dma())
+        usb_dma_ok = !kboot_reserve_usb_dma();
+        if (!usb_dma_ok)
             printf("USB: retained DMA not fully reserved; booting on\n");
         /* Its firmware may still use memory the next stage will reuse. */
         if (display_shutdown(DCP_SLEEP_IF_EXTERNAL) < 0) {
@@ -507,6 +513,14 @@ next_stage:
 #ifdef USE_FB
     fb_shutdown(next_stage.restore_logo);
 #endif
+    /* No fallible display shutdown may return to proxy after publishing ownership. */
+    if (kboot_finalize_atc0(usb_stopped && usb_dma_ok, atc0_debug_reserved) < 0) {
+        printf("ATC0 ownership tree is invalid; returning to proxy\n");
+        if (!secboot_host_proxy_allowed())
+            flush_and_reboot();
+        uartproxy_run(NULL);
+        panic("ATC0 handoff failed\n");
+    }
     mmu_shutdown();
 #endif
 

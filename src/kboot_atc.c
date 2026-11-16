@@ -1202,6 +1202,121 @@ static T6050_ATC_INIT void t6050_setup_atc(void *dt)
 }
 
 /*
+ * Linux supplies a disabled ATC0 group, never an ownership assertion or fixed
+ * per-machine PHY calibration. Publish only a complete, late handoff. The
+ * shared AOP GPIO provider stays on; release just the router's LSTX pin.
+ */
+int kboot_handoff_atc0(void *dt, int capacity, bool safe)
+{
+    fdt32_t handles[32], gpio_ranges[34];
+    int len, count, phy = -1, router = -1, pinctrl, gpio_len = 0;
+    u32 phy_handle = 0, gpio_handle;
+    bool covered = false;
+
+    if (chip_id != T6050 || fdt_node_check_compatible(dt, 0, "apple,j714s"))
+        return 0;
+    int chosen = fdt_path_offset(dt, "/chosen");
+    const fdt32_t *group = fdt_getprop(dt, chosen, "apple,atc0-handoff", &len);
+    if (!group && len == -FDT_ERR_NOTFOUND)
+        return 0;
+    if (!group || len <= 0 || len % 4 || len > (int)sizeof(handles))
+        return -1;
+    count = len / 4;
+    memcpy(handles, group, len);
+    for (int i = 0; i < count; i++) {
+        u32 handle = fdt32_to_cpu(handles[i]);
+        int node = fdt_node_offset_by_phandle(dt, handle), slen;
+        const char *status = fdt_getprop(dt, node, "status", &slen);
+        if (node < 0 || !status || slen != 9 || memcmp(status, "disabled", 9))
+            return -1;
+        for (int j = 0; j < i; j++)
+            if (handles[j] == handles[i])
+                return -1;
+        if (!fdt_node_check_compatible(dt, node, "apple,t6050-combo-phy")) {
+            const fdt32_t *port = fdt_getprop(dt, node, "apple,port-index", &slen);
+            if (phy >= 0 || !port || slen != 4 || fdt32_to_cpu(*port))
+                return -1;
+            phy = node;
+            phy_handle = handle;
+        }
+        if (!fdt_node_check_compatible(dt, node, "apple,t6050-usb4-acio")) {
+            if (router >= 0)
+                return -1;
+            router = node;
+        }
+    }
+    if (phy < 0 || router < 0)
+        return -1;
+    const fdt32_t *gpio = fdt_getprop(dt, router, "lstx-gpios", &len);
+    if (!gpio || len != 12 || fdt32_to_cpu(gpio[1]) != 77)
+        return -1;
+    gpio_handle = fdt32_to_cpu(gpio[0]);
+    pinctrl = fdt_node_offset_by_phandle(dt, gpio_handle);
+    const fdt32_t *reserved = fdt_getprop(dt, pinctrl, "gpio-reserved-ranges", &len);
+    if (pinctrl < 0 || !reserved || len <= 0 || len % 8 || len > 16 * 8)
+        return -1;
+    for (int i = 0; i < len / 4; i += 2) {
+        u32 start = fdt32_to_cpu(reserved[i]), size = fdt32_to_cpu(reserved[i + 1]);
+        u64 end = (u64)start + size;
+        if (!size || end > 0x100000000ULL)
+            return -1;
+        if (start <= 77 && end > 77) {
+            if (covered)
+                return -1;
+            covered = true;
+            if (start < 77) {
+                gpio_ranges[gpio_len++] = cpu_to_fdt32(start);
+                gpio_ranges[gpio_len++] = cpu_to_fdt32(77 - start);
+            }
+            if (end > 78) {
+                gpio_ranges[gpio_len++] = cpu_to_fdt32(78);
+                gpio_ranges[gpio_len++] = cpu_to_fdt32(end - 78);
+            }
+        } else {
+            gpio_ranges[gpio_len++] = reserved[i];
+            gpio_ranges[gpio_len++] = reserved[i + 1];
+        }
+    }
+    if (!covered)
+        return -1;
+    if (!safe) {
+        printf("FDT: ATC0 reserved for producer/debug ownership\n");
+        return 0;
+    }
+    if (capacity <= 0 || fdt_totalsize(dt) > (u32)capacity)
+        return -1;
+    void *scratch = malloc(capacity);
+    if (!scratch)
+        return 1;
+    int ret = 1;
+    if (fdt_open_into(dt, scratch, capacity))
+        goto out;
+    phy = fdt_node_offset_by_phandle(scratch, phy_handle);
+    t6050_clear_atc(scratch, phy);
+    if (t6050_export_atc(scratch, phy, 0) ||
+        fdt_setprop(scratch, phy, "apple,guest-port-reserved", NULL, 0))
+        goto out;
+    pinctrl = fdt_node_offset_by_phandle(scratch, gpio_handle);
+    if (fdt_setprop(scratch, pinctrl, "gpio-reserved-ranges", gpio_ranges, gpio_len * 4))
+        goto out;
+    for (int i = 0; i < count; i++) {
+        int node = fdt_node_offset_by_phandle(scratch, fdt32_to_cpu(handles[i]));
+        if (node < 0 || fdt_setprop_string(scratch, node, "status", "okay"))
+            goto out;
+    }
+    if (fdt_pack(scratch))
+        goto out;
+    memcpy(dt, scratch, fdt_totalsize(scratch));
+    printf("FDT: ATC0 handed over with per-machine PHY tables (%d nodes)\n", count);
+    ret = 0;
+out:
+    free(scratch);
+    if (ret)
+        printf("FDT: ATC0 unavailable; disabled group retained\n");
+    return ret;
+}
+
+/*
  * The M4 Max laptops (T6041 J614c and J616c) have the J614s's ATC: atc-phy,t6040
  * PHYs with the same tunable names on usb-drd0..2 and atc-phy0..3. Export the
  * USB ports' tunables the same way. Their HDMI PHY (port 3) keeps the tunables its

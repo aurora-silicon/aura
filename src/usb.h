@@ -13,6 +13,7 @@ void usb_init(void);
 void usb_hpm_restore_irqs(bool force);
 void usb_iodev_init(void);
 bool usb_iodev_shutdown(void);
+bool usb_atc0_used(void);
 void usb_iodev_vuart_setup(iodev_id_t iodev);
 int usb_cdc_link_start(void (*set_step)(unsigned step), bool force_swapped);
 bool usb_cdc_deferred_usb2(void);

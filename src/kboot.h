@@ -34,6 +34,8 @@ int kboot_prepare_dt(void *fdt);
 int kboot_boot(void *kernel);
 /* Reserve the DMA a USB controller that could not be stopped keeps (main.c, after USB shutdown). */
 int kboot_reserve_usb_dma(void);
+bool kboot_atc0_reserved(void);
+int kboot_finalize_atc0(bool usb_stopped, bool debug_reserved);
 
 /* Boot-args RAM range and boot framebuffer base, for the kboot_* SoC helpers */
 u64 kboot_ram_base(void);

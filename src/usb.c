@@ -50,6 +50,13 @@ struct usb_drd_regs {
 
 static tps6598x_irq_state_t tps6598x_irq_state[USB_IODEV_COUNT];
 static bool usb_is_initialized = false;
+/* Sticky even when bring-up fails before an IODEV can be registered. */
+static bool atc0_controller_used;
+
+bool usb_atc0_used(void)
+{
+    return atc0_controller_used;
+}
 
 /* USB2 PHY regs */
 #define USB2PHY_USBCTL           0x00
@@ -202,6 +209,7 @@ static int usb_t6050_get_regs(struct usb_t6050_regs *regs)
  * Device-role values come from this machine's ADT, not the host-role table. */
 static dwc3_dev_t *usb_t6050_init(void (*set_step)(unsigned step))
 {
+    atc0_controller_used = true;
     struct usb_t6050_regs regs;
     if (usb_t6050_get_regs(&regs)) {
         printf("CDC USB2: unsupported T6050 ADT layout\n");
@@ -421,6 +429,8 @@ dwc3_dev_t *usb_iodev_bringup(u32 idx)
     if (usb_device_mode_disabled(idx))
         return NULL;
 
+    if (idx == 0)
+        atc0_controller_used = true;
     dart_dev_t *usb_dart = usb_dart_init(idx);
     if (!usb_dart)
         return NULL;
