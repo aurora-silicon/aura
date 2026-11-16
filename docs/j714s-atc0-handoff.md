@@ -1,8 +1,9 @@
 # J714s ATC0 ownership handoff
 
-The Linux left-back USB-C description starts disabled. Its
-`/chosen/apple,atc0-handoff` property lists the 27 ATC0 power, PHY, USB, HPM,
-router, tunnel and crossbar nodes that may be enabled together. Shared AUSS,
+The Linux left-back USB-C description starts disabled. The
+`apple,j714s-atc0-handoff` node at `/firmware/atc0-handoff` lists the 27
+ATC0 power, PHY, USB, HPM,
+router, tunnel and crossbar nodes in `apple,devices` that may be enabled together. Shared AUSS,
 CIO reset and AOP GPIO providers are not members. GPIO77 remains reserved.
 An older producer leaves this port disabled; the existing two ports still work.
 

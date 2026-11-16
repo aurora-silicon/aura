@@ -8,7 +8,8 @@ import subprocess
 import sys
 
 exe, adt, dtb, directory = map(Path, sys.argv[1:])
-prop = 'apple,atc0-handoff'
+interface = '/firmware/atc0-handoff'
+prop = 'apple,devices'
 phy = '/soc@200000000/phy@2a3000000'
 results = []
 
@@ -56,7 +57,7 @@ def cells(raw):
 def assert_activation(out, input_adt):
     before, after = tree(str(out) + '.before'), tree(out)
     assert before.keys() == after.keys()
-    handles = cells(before['/chosen'][prop])
+    handles = cells(before[interface][prop])
     paths = {p for p, n in before.items() if 'phandle' in n and cells(n['phandle'])[0] in handles}
     assert len(paths) == 27
     assert after[phy]['apple,guest-port-reserved'] == b''
@@ -137,7 +138,7 @@ def case(name, mode, expected=0, mutate=None, slack=65536, chip='6050', input_ad
     return out
 
 
-members = get(dtb, '/chosen', prop)
+members = get(dtb, interface, prop)
 assert len(members) == 27 and len(set(members)) == 27
 enabled = case('allow', 'allow')
 assert_activation(enabled, adt)
@@ -147,16 +148,19 @@ case('deny', 'deny')
 case('allocation-failure', 'alloc-fail', 1)
 case('no-space', 'allow', 1, slack=0)
 case('old-dt', 'allow', mutate=lambda f: subprocess.run(
-    ['fdtput', '-d', str(f), '/chosen', prop], check=True))
+    ['fdtput', '-r', str(f), interface], check=True))
+case('missing-devices', 'allow', -1, mutate=lambda f: subprocess.run(
+    ['fdtput', '-d', str(f), interface, prop], check=True))
+case('unknown-interface', 'allow', mutate=lambda f: put(f, interface, 'compatible', ['apple,unknown-handoff'], 's'))
 case('other-soc', 'allow', chip='8103')
 case('other-board', 'allow', mutate=lambda f: put(f, '/', 'compatible', ['apple,j716c'], 's'))
-case('empty-list', 'allow', -1, mutate=lambda f: put(f, '/chosen', prop, []))
-case('bad-phandle', 'allow', -1, mutate=lambda f: put(f, '/chosen', prop, ['0', *members[1:]]))
-case('duplicate-phandle', 'allow', -1, mutate=lambda f: put(f, '/chosen', prop, [members[1], *members[1:]]))
+case('empty-list', 'allow', -1, mutate=lambda f: put(f, interface, prop, []))
+case('bad-phandle', 'allow', -1, mutate=lambda f: put(f, interface, prop, ['0', *members[1:]]))
+case('duplicate-phandle', 'allow', -1, mutate=lambda f: put(f, interface, prop, [members[1], *members[1:]]))
 case('already-enabled', 'allow', -1, mutate=lambda f: put(f, phy, 'status', ['okay'], 's'))
 case('missing-phy', 'allow', -1, mutate=lambda f: put(f, phy, 'apple,port-index', ['1']))
-case('dangling-phandle', 'allow', -1, mutate=lambda f: put(f, '/chosen', prop, ['deadbeef', *members[1:]]))
-case('malformed-list', 'allow', -1, mutate=lambda f: put(f, '/chosen', prop, ['1'], 'bx'))
+case('dangling-phandle', 'allow', -1, mutate=lambda f: put(f, interface, prop, ['deadbeef', *members[1:]]))
+case('malformed-list', 'allow', -1, mutate=lambda f: put(f, interface, prop, ['1'], 'bx'))
 case('reused-tree', 'allow', -1, base=enabled)
 node = '/arm-io/usb-drd0'
 missing = mutate_adt('missing-final-table', node, 'tunable_PIPE_HANDLER_DEFAULT',

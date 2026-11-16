@@ -1215,10 +1215,10 @@ int kboot_handoff_atc0(void *dt, int capacity, bool safe)
 
     if (chip_id != T6050 || fdt_node_check_compatible(dt, 0, "apple,j714s"))
         return 0;
-    int chosen = fdt_path_offset(dt, "/chosen");
-    const fdt32_t *group = fdt_getprop(dt, chosen, "apple,atc0-handoff", &len);
-    if (!group && len == -FDT_ERR_NOTFOUND)
+    int handoff = fdt_path_offset(dt, "/firmware/atc0-handoff");
+    if (handoff < 0 || fdt_node_check_compatible(dt, handoff, "apple,j714s-atc0-handoff"))
         return 0;
+    const fdt32_t *group = fdt_getprop(dt, handoff, "apple,devices", &len);
     if (!group || len <= 0 || len % 4 || len > (int)sizeof(handles))
         return -1;
     count = len / 4;

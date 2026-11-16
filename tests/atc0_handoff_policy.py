@@ -37,7 +37,7 @@ prefix = r'''
 typedef unsigned long u64;
 struct usb_dwc3_dma_range { unsigned long base, size; };
 static bool debug, console, configured, used, host, overflow;
-static bool idle=true, contract=true, compatible=true;
+static bool idle=true, contract=true, compatible=true, interface=true, interface_compatible=true;
 static unsigned probes;
 static unsigned chip_id=0x6050;
 #define T6050 0x6050
@@ -62,8 +62,8 @@ static int kboot_handoff_atc0(void *p, int size, bool safe) {
 }
 static void dc_cvac_range(void *p, size_t len) { (void)p; assert(len > 0); }
 static int fdt_totalsize(const void *p) { (void)p; return 100; }
-static int fdt_node_check_compatible(const void *p, int n, const char *s) { (void)p; (void)n; (void)s; return !compatible; }
-static int fdt_path_offset(const void *p, const char *s) { (void)p; (void)s; return 0; }
+static int fdt_node_check_compatible(const void *p, int n, const char *s) { (void)p; (void)n; (void)s; return n ? !interface_compatible : !compatible; }
+static int fdt_path_offset(const void *p, const char *s) { (void)p; (void)s; return interface ? 1 : -1; }
 static const void *fdt_getprop(const void *p, int n, const char *s, int *len) { (void)p; (void)n; (void)s; (void)len; return contract ? &contract : NULL; }
 #define sysop(x) ((void)0)
 '''
@@ -92,8 +92,13 @@ int main(void) {
     next_stage.entry=false; calls=0;
     assert(!kboot_finalize_atc0(true, false) && calls == 0);
     next_stage.entry=true; next_stage.args[0]=(uintptr_t)dt;
-    contract=false; calls=probes=0;
+    interface=false; calls=probes=0;
     assert(!kboot_finalize_atc0(true, false) && !calls && !probes);
+    interface=true; contract=false;
+    assert(kboot_finalize_atc0(true, false) < 0 && !calls && !probes);
+    contract=true; interface_compatible=false;
+    assert(!kboot_finalize_atc0(true, false) && !calls && !probes);
+    interface_compatible=true;
     contract=true; compatible=false;
     assert(!kboot_finalize_atc0(true, false) && !calls && !probes);
     compatible=true; chip_id=0x8103;

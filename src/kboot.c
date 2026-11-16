@@ -12032,9 +12032,11 @@ int kboot_finalize_atc0(bool usb_stopped, bool debug_reserved)
     if (!next_stage.entry || !size || chip_id != T6050 ||
         fdt_node_check_compatible(fdt, 0, "apple,j714s"))
         return 0;
-    int chosen = fdt_path_offset(fdt, "/chosen");
-    if (chosen < 0 || !fdt_getprop(fdt, chosen, "apple,atc0-handoff", NULL))
+    int handoff = fdt_path_offset(fdt, "/firmware/atc0-handoff");
+    if (handoff < 0 || fdt_node_check_compatible(fdt, handoff, "apple,j714s-atc0-handoff"))
         return 0;
+    if (!fdt_getprop(fdt, handoff, "apple,devices", NULL))
+        return -1;
 
     const struct usb_dwc3_dma_range *ranges;
     bool overflow;

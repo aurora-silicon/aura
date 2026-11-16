@@ -22,7 +22,12 @@ prefix = r'''
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
-#include "usb_dwc3_regs.h"
+#define BIT(n) (1ULL << (n))
+#define GENMASK(msb,lsb) ((BIT((msb + 1) - (lsb)) - 1) << (lsb))
+#define PACKED __attribute__((packed))
+typedef uint32_t u32;
+typedef uint64_t u64;
+#include "usb_dwc3_regs_host.h"
 #define T6050 0x6050
 #define PIPEHANDLER_MUX_CTRL 0xc
 #define PIPEHANDLER_AON_GEN 0x1c
@@ -79,6 +84,10 @@ int main(void) {
 }
 '''
 c = out / 'probe.c'
+# Keep the production register definitions, but use the host C ABI's pointer
+# and size typedefs. Firmware types.h intentionally supplies its own ABI.
+(out / 'usb_dwc3_regs_host.h').write_text(
+    (root / 'src/usb_dwc3_regs.h').read_text().replace('#include "types.h"', ''))
 for name in ('PIPEHANDLER_MUX_CTRL', 'PIPEHANDLER_AON_GEN', 'PIPEHANDLER_AON_GEN_DWC3_RESET_N'):
     actual = re.search(r'^#define ' + name + r'\s+([^\n]+)', source, re.M)
     expected = re.search(r'^#define ' + name + r'\s+([^\n]+)', prefix, re.M)

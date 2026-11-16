@@ -297,9 +297,11 @@ int main(int argc, char **argv)
     int expected = argc > 7 ? strtol(argv[7], NULL, 0) : 0;
     printf("kboot_handoff_atc0: %d (expected %d)\n", ret, expected);
     CHECK(ret == expected);
+    int handoff = fdt_path_offset(dt, "/firmware/atc0-handoff");
     bool expected_activation =
-        chip_id == 0x6050 && !fdt_node_check_compatible(dt, 0, "apple,j714s") &&
-        fdt_getprop(dt, fdt_path_offset(dt, "/chosen"), "apple,atc0-handoff", NULL);
+        chip_id == 0x6050 && !fdt_node_check_compatible(dt, 0, "apple,j714s") && handoff >= 0 &&
+        !fdt_node_check_compatible(dt, handoff, "apple,j714s-atc0-handoff") &&
+        fdt_getprop(dt, handoff, "apple,devices", NULL);
     if (!allow || ret || !expected_activation)
         CHECK(!memcmp(before, dt, cap));
     free(before);
