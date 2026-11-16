@@ -2,6 +2,7 @@
 
 #include "wdt.h"
 #include "adt.h"
+#include "boot_options.h"
 #include "types.h"
 #include "utils.h"
 
@@ -10,8 +11,25 @@
 #define WDT_CTL   0x1c
 
 static u64 wdt_base = 0;
+static bool wdt_kept;
 
-void wdt_disable(void)
+/*
+ * Dead-man switch for a watchdog an earlier stage left armed (m1n1.wdt=keep): every proxy request
+ * resets its count, so only a host that opens the proxy and then goes quiet, or a wedged stage,
+ * lets it bite. Nothing else in this image feeds it; Linux's apple_wdt does once it probes.
+ */
+void wdt_kick(void)
+{
+    if (wdt_kept)
+        write32(wdt_base + WDT_COUNT, 0);
+}
+
+bool wdt_left_armed(void)
+{
+    return wdt_kept;
+}
+
+static void wdt_off(bool force)
 {
     int path[8];
     int node = adt_path_offset_trace(adt, "/arm-io/wdt", path);
@@ -27,6 +45,17 @@ void wdt_disable(void)
     }
 
     printf("Primary WDT register @ 0x%lx\n", wdt_base);
+    /*
+     * A chainloading stage that armed the watchdog for this one appends m1n1.wdt=keep to the boot
+     * arguments: leave the primary and the secondary as they are, so a hang before the OS takes
+     * the watchdog over still resets the machine into that stage's fallback. wdt_reboot() works as
+     * usual, as wdt_base is known.
+     */
+    if (!force && boot_wdt_keep_enabled()) {
+        printf("Primary WDT left armed (m1n1.wdt=keep)\n");
+        wdt_kept = true;
+        return;
+    }
     write32(wdt_base + WDT_CTL, 0);
     printf("Primary WDT disabled\n");
 
@@ -46,6 +75,19 @@ void wdt_disable(void)
         write32(wdt_2nd, 0);
         printf("Secondary WDT disabled\n");
     }
+}
+
+void wdt_disable(void)
+{
+    wdt_off(false);
+}
+
+/* A host's explicit request (P_WDT_DISABLE) wins over m1n1.wdt=keep: it is how a session ends the
+ * watchdog */
+void wdt_disable_forced(void)
+{
+    wdt_kept = false;
+    wdt_off(true);
 }
 
 void wdt_reboot(void)

@@ -46,6 +46,7 @@
 #include "usb_dwc3.h"
 #include "utils.h"
 #include "vsprintf.h"
+#include "wdt.h"
 #include "xnuboot.h"
 
 #include "libfdt/libfdt.h"
@@ -11443,6 +11444,9 @@ int kboot_prepare_dt(void *fdt)
 
     /* setup console log buffer early to capture as much log as possible */
     dt_setup_mtd_phram();
+    /* For the OS to read in the log: wdt_disable() said so long before the log buffer existed */
+    if (wdt_left_armed())
+        printf("kboot: watchdog left armed for the OS (m1n1.wdt=keep)\n");
 
     if (dt_set_m3_defaults())
         return -1;

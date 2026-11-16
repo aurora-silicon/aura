@@ -42,6 +42,7 @@ _Static_assert(sizeof(struct midr_part_features) == 20, "proxy CPU features ABI 
 
 int proxy_process(ProxyRequest *request, ProxyReply *reply)
 {
+    wdt_kick();
     enum exc_guard_t guard_save = exc_guard;
 
     reply->opcode = request->opcode;
@@ -134,7 +135,7 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
                                 : wdt_arm_seconds(request->args[0]);
             break;
         case P_WDT_DISABLE:
-            wdt_disable();
+            wdt_disable_forced();
             break;
         case P_REBOOT:
             reboot();
