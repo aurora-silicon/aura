@@ -25,6 +25,9 @@ _Static_assert(sizeof(u64) == 8, "production u64 ABI");
 #define PERM_RX 1
 #define ALIGN_DOWN(x, a) ((x) & ~((a) - 1))
 #define sysop(op) ((void)(op))
+#define T6050 0x6050
+static int chip_id;
+static int smp_prepare_rvbar_t6050(u64 l, u64 t) { (void)l; (void)t; return -1; }
 struct cpu_info { u64 impl_reg; };
 static struct { bool apple_sysregs_unlocked; } features, *cpu_features = &features;
 static unsigned char _vectors_start[4096] __attribute__((aligned(0x4000)));

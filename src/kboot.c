@@ -11404,6 +11404,13 @@ int kboot_prepare_dt(void *fdt)
     if (relocated_from && fdt_add_mem_rsv(dt, relocated_from, SZ_16K))
         bail("FDT: couldn't add reservation for aura's old reset vector\n");
 
+    // T6050: an m1n1 stage 1 placed this image away from the base the secondaries' RVBAR is locked
+    // to, and smp.c forwards them from the retired vectors there. A core that resets later still
+    // runs the veneer, so the OS must not take the page.
+    u64 rvbar_relay = chip_id == T6050 ? smp_rvbar_relay() : 0;
+    if (rvbar_relay && fdt_add_mem_rsv(dt, ALIGN_DOWN(rvbar_relay, SZ_16K), SZ_16K))
+        bail("FDT: couldn't add reservation for the RVBAR relay\n");
+
     /*
      * The OS owns its window in CTXR_D. Keep the rest of the windows out of its
      * allocator, because EL0 cannot execute in them on a confined core.
