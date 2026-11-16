@@ -443,6 +443,63 @@ dart_dev_t *dart_gen3_init_adt_cold(const char *path, int instance, int device)
     return dart;
 }
 
+/*
+ * Resolve an unprotected Gen3 DART stream into a minimal dart_dev_t that is enough for register
+ * writes and dart_gen3_tlb_invalidate().
+ */
+static int dart_gen3_stream_adt(const char *path, int instance, int device, dart_dev_t *out)
+{
+    int dart_path[8];
+    int node = adt_path_offset_trace(adt, path, dart_path);
+    u64 base, register_size;
+    if (node < 0 || !adt_is_compatible(adt, node, "dart,gen3") ||
+        adt_get_reg(adt, dart_path, "reg", instance, &base, &register_size) < 0 ||
+        register_size < DART_GEN3_ROUTE + 4 || device < 0 || device > 255)
+        return -1;
+
+    int tlbi_path[8];
+    int tlbi_node = adt_path_offset_trace(adt, "/arm-io/dart-tlbi-aperture", tlbi_path);
+    u64 aperture, size, offset;
+    if (tlbi_node < 0 || adt_get_reg(adt, tlbi_path, "reg", 0, &aperture, &size) < 0 ||
+        ADT_GETPROP(adt, node, "tlbi-aperture-offset", &offset) < 0 || size < 16 ||
+        offset > size - 16 || (offset & 15))
+        return -1;
+
+    if (read32(base + DART_T8110_PROTECT) | read32(base + DART_T8110_PROTECT + 8)) {
+        printf("dart: %s is protected; cannot change stream %d\n", path, device);
+        return -1;
+    }
+
+    memset(out, 0, sizeof(*out));
+    out->regs = base;
+    out->device = device;
+    out->type = DART_GEN3;
+    out->params = &dart_gen3;
+    out->tlbi_aperture = aperture + offset;
+    out->tlbi_route = read32(base + DART_GEN3_ROUTE) & 15;
+    return 0;
+}
+
+/*
+ * Return a Gen3 stream that a previous aura stage owned to the idle state
+ * dart_gen3_init_adt_cold() expects: disabled, no root, plain translation. Used when a
+ * chainloaded stage takes over a controller that is still live, and to hand one to the OS.
+ */
+int dart_gen3_quiesce_adt(const char *path, int instance, int device)
+{
+    dart_dev_t d;
+    if (dart_gen3_stream_adt(path, instance, device, &d))
+        return -1;
+
+    write32(d.regs + DART_T8110_DISABLE_STREAMS + 4 * (device >> 5), BIT(device & 31));
+    write32(d.regs + DART_T8110_TTBR_OFF + 4 * device, 0);
+    write32(d.regs + DART_T8110_TCR_OFF + 4 * device, DART_T8110_TCR_TRANSLATE_ENABLE);
+    dart_gen3_tlb_invalidate(&d);
+
+    printf("dart: quiesced Gen3 SID %d at 0x%lx\n", device, d.regs);
+    return 0;
+}
+
 dart_dev_t *dart_init(uintptr_t base, u8 device, bool keep_pts, enum dart_type_t type)
 {
     if (type == DART_GEN3) {
