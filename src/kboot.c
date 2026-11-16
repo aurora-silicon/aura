@@ -11315,6 +11315,91 @@ static void dt_set_j804_isp(void)
         printf("FDT: J804 ISP could not be disabled\n");
 }
 
+/* Length in bytes of a property of the node an alias names; 0 if either is absent. */
+static int dt_alias_prop_len(const char *alias, const char *prop)
+{
+    const char *path = fdt_get_alias(dt, alias);
+    int node = path ? fdt_path_offset(dt, path) : -1;
+    int len = 0;
+
+    if (node < 0 || !fdt_getprop(dt, node, prop, &len) || len < 0)
+        return 0;
+    return len;
+}
+
+/*
+ * T8152 (M6): hand the ACIO calibration and the host-router DROM to Linux, for
+ * the ports the device tree describes and only for those. A port is described
+ * when the tree has a usb4-<i>-acio alias (J804: usb4-3-acio, the right port,
+ * ADT /arm-io/acio3). A tree without such an alias is left exactly as it was,
+ * and dt_set_acio_tunables(), which the other chips use, is not involved.
+ *
+ * Table choice: as for the other ACIO v2 routers, the NHI's four per-direction
+ * hi_up_{tx_desc,tx_data,rx_desc,wr}_fabric tables are optional
+ * (usb4_v2_nhi_tunables); a v1 node gets the full list.
+ *
+ * This copies ADT properties into the FDT and does nothing else. No register
+ * is read or written: the block's power services and the ATC CIO power
+ * devices are off at this point and stay off, and an access inside an
+ * unpowered ACIO block can fault.
+ *
+ * Fail-soft: a port whose tables cannot be converted is reported and left
+ * without them, and the boot goes on. The kernel driver then refuses that
+ * node ("Missing bootloader RC tuning").
+ */
+static void dt_set_acio_tunables_t8152(void)
+{
+    char adt_path[32];
+    char acio_alias[32];
+    char adapter_alias[32];
+    char nhi_alias[32];
+    u64 router_uuid = 0;
+
+    for (int i = 0; i < MAX_CIO_DEVS; ++i) {
+        snprintf(acio_alias, sizeof(acio_alias), "usb4-%d-acio", i);
+        if (!fdt_get_alias(dt, acio_alias))
+            continue;
+
+        snprintf(adt_path, sizeof(adt_path), "/arm-io/acio%d", i);
+        int adt_node = adt_path_offset(adt, adt_path);
+        if (adt_node < 0) {
+            printf("FDT: T8152 ACIO%d handoff skipped: no ADT node %s\n", i, adt_path);
+            continue;
+        }
+
+        if (!router_uuid)
+            router_uuid = rust_usb4_router_uuid();
+        if (!router_uuid) {
+            printf("FDT: T8152 ACIO handoff skipped: no USB4 router UUID\n");
+            return;
+        }
+
+        snprintf(adapter_alias, sizeof(adapter_alias), "usb4-%d-pcie-adapter", i);
+        snprintf(nhi_alias, sizeof(nhi_alias), "usb4-%d-nhi", i);
+
+        int ret = dt_copy_acio_tunables(adt_path, acio_alias, usb4_rc_tunables,
+                                        ARRAY_SIZE(usb4_rc_tunables));
+        ret |= dt_copy_acio_tunables(adt_path, adapter_alias, usb4_pcie_adapter_tunables,
+                                     ARRAY_SIZE(usb4_pcie_adapter_tunables));
+        if (adt_acio_is_v2(adt_node))
+            ret |= dt_copy_acio_tunables(adt_path, nhi_alias, usb4_v2_nhi_tunables,
+                                         ARRAY_SIZE(usb4_v2_nhi_tunables));
+        else
+            ret |= dt_copy_acio_tunables(adt_path, nhi_alias, usb4_nhi_tunables,
+                                         ARRAY_SIZE(usb4_nhi_tunables));
+        /* The low four bits of the router UUID are free for the port index. */
+        ret |= dt_copy_usb4_drom(adt_path, nhi_alias, router_uuid | i);
+
+        /* Three 32-bit cells (offset, mask, value) per tunable entry. */
+        printf("FDT: T8152 ACIO%d handoff %s: rc %d, pcie-adapter %d, nhi %d entries, DROM %d\n", i,
+               ret ? "INCOMPLETE" : "published",
+               dt_alias_prop_len(acio_alias, "apple,tunable-rc") / 12,
+               dt_alias_prop_len(adapter_alias, "apple,tunable-pcie-adapter") / 12,
+               dt_alias_prop_len(nhi_alias, "apple,tunable-nhi") / 12,
+               dt_alias_prop_len(nhi_alias, "apple,thunderbolt-drom"));
+    }
+}
+
 static int dt_prepare_t8152(void)
 {
     if (fdt_getprop(dt, 0, "aurora,minimal-boot", NULL)) {
@@ -11330,6 +11415,8 @@ static int dt_prepare_t8152(void)
         if (dt_set_ave())
             return -1;
     }
+    /* ADT to FDT only; a no-op unless the tree has usb4-N-acio aliases. Never fatal. */
+    dt_set_acio_tunables_t8152();
     if (dt_set_cpus())
         return -1;
     if (dt_set_mac_addresses())
