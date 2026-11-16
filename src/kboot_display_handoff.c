@@ -3240,14 +3240,24 @@ static bool dcp6_dt_describes(void *dt)
  * iommu-addresses: only what the ADT says, checked against the device tree and the registers.
  * The image is pinned per OS firmware because 27.0 and 27.0.1 report the same iBoot version.
  */
+/*
+ * The 27.3 beta's DCP keeps the firmware-27 interface but numbers its IOMFB methods differently,
+ * and the driver picks the 27.3 table and swap layout from apple,firmware-compat 27.3.0. The
+ * beta's iBoot numbers itself 27.2.98.1, which is what apple,firmware-version keeps saying.
+ */
+static const struct fw_version_info t6050_compat_27_3 = {V27_3B, "27.3", {27, 3, 0}, 3, "compat"};
+
 static const struct {
     u32 os_fw;
     char uuid[37];
     bool ext; /* also hand off the external display engines running this image */
+    const struct fw_version_info *compat; /* apple,firmware-compat, if not the OS firmware's */
 } t6050_images[] = {
-    {V27_0, "64863924-B56B-3E32-87FE-038677F52709", true},
+    {V27_0, "64863924-B56B-3E32-87FE-038677F52709", true, NULL},
     /* K116s (16" M5 Pro, OLED), 26B8125: the internal panel only */
-    {V27_2, "3D6C8857-E6F1-3D2E-9DFF-587028AE0C6E", false},
+    {V27_2, "3D6C8857-E6F1-3D2E-9DFF-587028AE0C6E", false, NULL},
+    /* J716s (16" M5 Pro), 27.3 beta 1 stub 26C5035r: the internal panel only, as on 27.2 */
+    {V27_3B, "58CB3FFC-B2BA-352E-B20B-71A91B15FA9F", false, &t6050_compat_27_3},
 };
 #define T6050_NDISP     5       /* disp0 reg[0..4] are the dcp's disp-0..disp-4 */
 #define T6050_BW_BASE   0x20000 /* bandwidth agent 0's scratch in the PMC metadata */
@@ -3271,7 +3281,9 @@ static struct {
     u32 bw_offset, nits, nclk, clk_id[T6050_CLOCKS], clk_hz[T6050_CLOCKS], pmc_ph;
     const char *gamut;
     const char *uuid; /* the pinned image of the running OS firmware */
+    const struct fw_version_info *compat;
     bool ext;
+    bool described; /* the device tree has the firmware's clocks and bandwidth scratch itself */
 } t6050;
 
 /* The dcp's reg entries and the ADT reg each equals (coproc: a prefix of it) */
@@ -3330,9 +3342,10 @@ static T6050_INIT int t6050_check_adt(void)
         if (os_firmware.version == t6050_images[i].os_fw) {
             t6050.uuid = t6050_images[i].uuid;
             t6050.ext = t6050_images[i].ext;
+            t6050.compat = t6050_images[i].compat ? t6050_images[i].compat : &os_firmware;
         }
     if (!t6050.uuid)
-        bail("OS firmware %s is not 27.0 or 27.2\n", os_firmware.string);
+        bail("OS firmware %s is not 27.0, 27.2 or 27.3 beta\n", os_firmware.string);
     if (!dcp6_is_uuid(uuid, len) || strcmp(uuid, t6050.uuid))
         bail("DCP image %s is not %s\n", dcp6_is_uuid(uuid, len) ? uuid : "(none)", t6050.uuid);
     if (dcp6_adt_u32(nub, "running", &val) || val != 1 || disp0 < 0 ||
@@ -3411,6 +3424,40 @@ static T6050_INIT int t6050_check_adt(void)
     return 0;
 }
 
+/*
+ * A device tree that describes the firmware's clocks and its bandwidth scratch itself (the J716s'
+ * does: fixed-clock nodes, apple,clock-ids and a pmc-metadata node) is taken as it is when every
+ * value is the ADT's: the clock ids and frequencies, the PMC window (no larger than the ADT's, as
+ * for the dcp's own windows), the scratch's display count and its offset in the window. Returns 0
+ * then, and the handoff publishes none of them.
+ */
+static T6050_INIT int t6050_check_described(void *dt, int dcp)
+{
+    int len = 0, nlen = 0, blen = 0;
+    const fdt32_t *clocks = fdt_getprop(dt, dcp, "clocks", &len);
+    const fdt32_t *ids = fdt_getprop(dt, dcp, "apple,clock-ids", &nlen);
+    const fdt32_t *bw = fdt_getprop(dt, dcp, "apple,bw-scratch", &blen);
+
+    if (!clocks || !ids || !bw || !fdt_getprop(dt, dcp, "clock-names", NULL) ||
+        len != (int)(t6050.nclk * 4) || nlen != len || blen != 16)
+        return -1;
+    for (u32 i = 0; i < t6050.nclk; i++) {
+        int clk = fdt_node_offset_by_phandle(dt, fdt32_ld(&clocks[i]));
+        const fdt32_t *hz = clk < 0 ? NULL : fdt_getprop(dt, clk, "clock-frequency", &len);
+        if (!hz || len != 4 || fdt32_ld(hz) != t6050.clk_hz[i] ||
+            fdt32_ld(&ids[i]) != t6050.clk_id[i])
+            return -1;
+    }
+    int pmc = fdt_node_offset_by_phandle(dt, fdt32_ld(&bw[0]));
+    const fdt64_t *reg = pmc < 0 ? NULL : fdt_getprop(dt, pmc, "reg", &len);
+    if (!reg || len != 16 || fdt64_ld(&reg[0]) != t6050.pmc || fdt64_ld(&reg[1]) > t6050.pmc_size ||
+        fdt32_ld(&bw[1]) || fdt32_ld(&bw[2]) != T6050_NDISP || fdt32_ld(&bw[3]) != t6050.bw_offset)
+        return -1;
+    t6050.pmc_ph = fdt32_ld(&bw[0]);
+    t6050.described = true;
+    return 0;
+}
+
 /* The device tree side: the nodes it describes match the ADT, and nothing is published yet */
 static T6050_INIT int t6050_check_dt(void *dt)
 {
@@ -3430,10 +3477,12 @@ static T6050_INIT int t6050_check_dt(void *dt)
         bail("dcp is not on an identity-mapped bus, or has no panel child\n");
     if (dcp6_status_disabled(dt, dcp, "dcp") || dcp6_status_disabled(dt, disp, "disp0"))
         return -1;
-    if (fdt_getprop(dt, dcp, "memory-region", NULL) ||
-        fdt_getprop(dt, disp, "memory-region", NULL) || fdt_getprop(dt, dcp, "clocks", NULL) ||
-        fdt_getprop(dt, dcp, "apple,bw-scratch", NULL))
-        bail("the device tree already has a memory-region, clocks or apple,bw-scratch\n");
+    if (fdt_getprop(dt, dcp, "memory-region", NULL) || fdt_getprop(dt, disp, "memory-region", NULL))
+        bail("the device tree already has a memory-region\n");
+    /* Clocks and bandwidth scratch: published here, or already described by the board's tree */
+    if ((fdt_getprop(dt, dcp, "clocks", NULL) || fdt_getprop(dt, dcp, "apple,bw-scratch", NULL)) &&
+        t6050_check_described(dt, dcp))
+        bail("the device tree's dcp clocks or apple,bw-scratch differ from the ADT's\n");
 
     for (size_t i = 0; i < ARRAY_SIZE(t6050_regs); i++) {
         u64 a, s;
@@ -3501,19 +3550,12 @@ static T6050_TEXT int t6050_check_darts(void *dt)
     return 0;
 }
 
-/* Write the whole handoff into `dt` (a scratch copy) */
-static T6050_TEXT int t6050_publish(void *dt)
+/* The bandwidth scratch and the clocks, for a device tree that does not describe them */
+static T6050_TEXT int t6050_publish_scratch_clocks(void *dt)
 {
     char name[40], node[T6050_PATH + 40], names[T6050_CLOCKS * 12];
     fdt32_t cells[T6050_CLOCKS], ids[T6050_CLOCKS], v[4];
     int nlen = 0;
-
-    if (firmware_set_fdt(dt, kboot_fdt_path_exact(dt, t6050.path[T6050_DCP]),
-                         "apple,firmware-version", &os_firmware) ||
-        firmware_set_fdt(dt, kboot_fdt_path_exact(dt, t6050.path[T6050_DCP]),
-                         "apple,firmware-compat", &os_firmware) ||
-        t6050_setprop(dt, T6050_DCP, "apple,firmware-uuid", t6050.uuid, strlen(t6050.uuid) + 1))
-        return -1;
 
     /* The bandwidth scratch, in the PMC metadata (disp0 reg[4]), as register window 5 */
     strcpy(node, t6050.path[T6050_DCP]);
@@ -3548,6 +3590,25 @@ static T6050_TEXT int t6050_publish(void *dt)
     if (t6050_setprop(dt, T6050_DCP, "clocks", cells, t6050.nclk * 4) ||
         t6050_setprop(dt, T6050_DCP, "clock-names", names, nlen) ||
         t6050_setprop(dt, T6050_DCP, "apple,clock-ids", ids, t6050.nclk * 4))
+        return -1;
+
+    return 0;
+}
+
+/* Write the whole handoff into `dt` (a scratch copy) */
+static T6050_TEXT int t6050_publish(void *dt)
+{
+    char name[40], node[T6050_PATH + 40];
+    fdt32_t v[4];
+
+    if (firmware_set_fdt(dt, kboot_fdt_path_exact(dt, t6050.path[T6050_DCP]),
+                         "apple,firmware-version", &os_firmware) ||
+        firmware_set_fdt(dt, kboot_fdt_path_exact(dt, t6050.path[T6050_DCP]),
+                         "apple,firmware-compat", t6050.compat) ||
+        t6050_setprop(dt, T6050_DCP, "apple,firmware-uuid", t6050.uuid, strlen(t6050.uuid) + 1))
+        return -1;
+
+    if (!t6050.described && t6050_publish_scratch_clocks(dt))
         return -1;
 
     /* /vram: the firmware's default framebuffer and the DRM aperture */
