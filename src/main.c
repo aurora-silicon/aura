@@ -20,6 +20,7 @@
 #include "heapblock.h"
 #include "j873.h"
 #include "kboot.h"
+#include "malloc.h"
 #include "mcc.h"
 #include "memory.h"
 #include "nvme.h"
@@ -30,6 +31,7 @@
 #include "secboot.h"
 #include "sep.h"
 #include "smp.h"
+#include "spmi.h"
 #include "stage1_config.h"
 #include "stage1_proxy.h"
 #include "string.h"
@@ -393,6 +395,114 @@ static void j873g_run_proxy(void)
 #endif
 }
 
+/*
+ * J804 (14-inch MacBook Pro M6, Mac18,1, board 0x22) on the shared T8152 entry path. Unlike
+ * J873g it has no KIS console and no DCP bring-up here: the proxy runs on the USB0 CDC device,
+ * the panel keeps iBoot's framebuffer, and aura runs on the boot CPU only.
+ */
+static bool j804_is_target(void)
+{
+    u32 model_len = 0, target_len = 0;
+    const char *model = adt_getprop(adt, 0, "model", &model_len);
+    const char *target = adt_getprop(adt, 0, "target-type", &target_len);
+
+    return board_id == 0x22 && model && model_len == sizeof("Mac18,1") &&
+           !memcmp(model, "Mac18,1", sizeof("Mac18,1")) && target && target_len == sizeof("J804") &&
+           !memcmp(target, "J804", sizeof("J804"));
+}
+
+static void j804_usb_step(unsigned step)
+{
+    printf("J804: USB0 step %u\n", step);
+}
+
+/*
+ * Wake hpm0 (SSPS 0) and leave it awake, as j873_hpm_wake() does for the J873 ports:
+ * tps6598x_shutdown() would put the controller back to sleep, and a sleeping controller does not
+ * connect the port's USB2 path. J804's hpm0 refuses AP-side USB2 routing, so none is attempted.
+ */
+static int j804_hpm0_wake(void)
+{
+    spmi_dev_t *spmi = spmi_init("/arm-io/nub-spmi-a0");
+    if (!spmi) {
+        printf("J804: nub-spmi-a0 init failed\n");
+        return -1;
+    }
+    tps6598x_dev_t *tps = tps6598x_init_spmi("/arm-io/nub-spmi-a0/hpm0", spmi);
+    int ret = tps ? tps6598x_powerup(tps) : -1;
+    printf(ret ? "J804: hpm0 wake (SSPS 0) failed\n" : "J804: hpm0 awake (SSPS 0), left on\n");
+    free(tps);
+    spmi_shutdown(spmi);
+    return ret;
+}
+
+static void j804_run_proxy(void)
+{
+    printf("J804: USB CDC bring-up, single CPU\n");
+    mmu_init();
+    wdt_disable();
+    /* Registers the boot CPU (kboot prunes CPUs that are not alive) and validates the CPU map;
+     * no secondary is started here. */
+    if (smp_init() < 0)
+        printf("J804: SMP init failed; kboot will have no live CPU\n");
+#ifdef USE_FB
+    /* Draw over iBoot's scanout without touching DCP: the logo is the visible proof that this
+     * image is executing. */
+    fb_init(false);
+    fb_display_logo();
+    fb_set_active(true);
+#endif
+    /* KIS is unavailable on J804: its hpm0 refuses the AP's USB2 routing request and never
+     * routes USB2 after the host VDM. Use the T8152 USB0 CDC device instead (left-front port);
+     * the proxy polls it. */
+    j804_hpm0_wake();
+    if (usb_cdc_link_start(j804_usb_step, false))
+        printf("J804: USB0 CDC start failed\n");
+    else
+        printf("J804: USB0 CDC up, proxy on USB\n");
+    /* PMGR topology (only powers parents of active devices); lets the proxy power the MTP
+     * domains (MTP_CPU/SRAM/...), which iBoot leaves off. */
+    if (pmgr_init())
+        printf("J804: pmgr init failed\n");
+    /* Left-rear (usb-drd1) and right (usb-drd3) USB-C ports as USB2 hosts, as j873_usb_prep()
+     * does for J873; Linux describes them as DWC3 hosts. */
+    j804_usb_prep();
+    /* apcie as on J873g: port 0 is the N1 (Wi-Fi/BT, SMC-held reset), port 2 the SD reader.
+     * Same ADT layout; pcie-apple trains the ports. */
+    j873_n1_power();
+    j804_sdreader_power();
+    j873_pcie_prep();
+    printf("Initialization complete.\n");
+    /*
+     * An appended payload boots directly, as on J873g. Under CHAINLOADING a Stage 1 also
+     * chainloads its configured Stage 2 from the ESP (an aura-proxy file there opens a host
+     * window first), and a Stage 2 boots its appended kernel. USB0 CDC is up already, so a
+     * failure falls back to the same proxy.
+     */
+#if defined(CHAINLOADING) && !defined(ESP_STAGE2)
+    stage1_read_boot_record();
+#endif
+    printf("Checking for payloads...\n");
+    if (payload_run() == 0 && next_stage.entry) {
+        printf("Valid payload found\n");
+        return;
+    }
+#ifdef CHAINLOADING
+    if (stage1_config_target())
+        printf("\nStage 1: could not start the configured Stage 2 from the EFI partition.\n");
+#endif
+#ifdef SECBOOT_SECURE_FLAVOUR
+    /* As on J873g: the secure flavour has no proxy (secboot_host_proxy_allowed()). */
+    printf("\nSecure boot: no verified next stage could be started, and this build gives\n"
+           "  no USB host a proxy. Rebooting in 10 s.\n");
+    mdelay(10000);
+    flush_and_reboot();
+#else
+    printf("Running proxy...\n");
+    uartproxy_run(NULL);
+#endif
+}
+
 void aura_main(void)
 {
     printf("\n\naura %s\n", aura_version);
@@ -405,6 +515,10 @@ void aura_main(void)
 
     heapblock_init();
 
+    if (chip_id == T8152 && j804_is_target()) {
+        j804_run_proxy();
+        goto next_stage;
+    }
     if (chip_id == T8152) {
         j873g_run_proxy();
         goto next_stage;
@@ -485,6 +599,7 @@ next_stage:
         panic("NVMe handoff failed\n");
     }
     usb_cdc_cleanup();
+    usb_t8152_handoff(); /* J804 only: stop USB0 and idle its DART stream for the next stage */
     exception_shutdown();
 #ifndef BRINGUP
     if (chip_id != T8152) {
