@@ -142,8 +142,9 @@ int dt_set_gpu_t8152(void *dt)
     int defaults = adt_path_offset(adt, "/defaults");
     int reserved = fdt_path_offset(dt, "/reserved-memory");
     u64 dram, dram_size, width, mode, vm;
+    /* J873g (0x24) and J804 (0x22): builds[] still has to name the images iBoot loaded. */
     if (gpu < 0 || chosen < 0 || sgx < 0 || defaults < 0 || reserved < 0 || chip_id != T8152 ||
-        board_id != 0x24 || !string_is(sgx, "compatible", "gpu,t8152") ||
+        (board_id != 0x24 && board_id != 0x22) || !string_is(sgx, "compatible", "gpu,t8152") ||
         !number(chosen, "dram-base", &dram) || !number(chosen, "dram-size", &dram_size) ||
         !dram_size || dram > UINT64_MAX - dram_size ||
         !number(defaults, "uat-vaddr-size", &width) || width != 43 ||
