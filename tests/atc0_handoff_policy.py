@@ -35,6 +35,10 @@ prefix = r'''
 typedef unsigned long u64;
 struct usb_dwc3_dma_range { unsigned long base, size; };
 static bool debug, console, configured, used, host, overflow;
+static bool idle=true, contract=true, compatible=true;
+static unsigned probes;
+static unsigned chip_id=0x6050;
+#define T6050 0x6050
 static size_t retained;
 static void *dt = (void *)0x1000;
 static int dt_bufsize = 65536;
@@ -46,6 +50,7 @@ static const char *kboot_serial_console_reason(void) { return configured ? "conf
 static bool aura_debug_enabled(void) { return debug; }
 static bool aura_console_enabled(void) { return console; }
 static bool usb_atc0_used(void) { return used; }
+static bool usb_atc0_quiescent(void) { probes++; return idle; }
 static bool dockchannel_uart_host_seen(void) { return host; }
 static int kboot_hibernate_handoff_size(const void *p) { return p == (void *)0x3000 ? 32768 : 0; }
 static size_t usb_dwc3_retained(const struct usb_dwc3_dma_range **p, bool *o) { *p = NULL; *o = overflow; return retained; }
@@ -55,30 +60,43 @@ static int kboot_handoff_atc0(void *p, int size, bool safe) {
 }
 static void dc_cvac_range(void *p, size_t len) { (void)p; assert(len > 0); }
 static int fdt_totalsize(const void *p) { (void)p; return 100; }
+static int fdt_node_check_compatible(const void *p, int n, const char *s) { (void)p; (void)n; (void)s; return !compatible; }
+static int fdt_path_offset(const void *p, const char *s) { (void)p; (void)s; return 0; }
+static const void *fdt_getprop(const void *p, int n, const char *s, int *len) { (void)p; (void)n; (void)s; (void)len; return contract ? &contract : NULL; }
 #define sysop(x) ((void)0)
 '''
 cases = r'''
 int main(void) {
     unsigned count = 0;
     next_stage.entry = true; next_stage.args[0] = (uintptr_t)dt;
-    for (unsigned bits = 0; bits < 512; bits++) {
+    for (unsigned bits = 0; bits < 1024; bits++) {
         debug=bits&1; console=bits&2; configured=bits&4; used=bits&8; host=bits&16;
         bool stopped=bits&32, captured=bits&64;
         retained=!!(bits&128); overflow=bits&256;
+        idle=bits&512; probes=0;
         calls=0;
         assert(!kboot_finalize_atc0(stopped, captured));
         assert(calls == 1);
-        assert(allowed == (stopped && !captured && !debug && !console && !configured && !used && !host && !retained && !overflow));
+        bool cached_safe = stopped && !captured && !debug && !console && !configured && !used && !host && !retained && !overflow;
+        assert(allowed == (cached_safe && idle));
+        assert(probes == (unsigned)cached_safe);
         count++;
     }
-    debug=console=configured=used=host=overflow=false; retained=0;
+    debug=console=configured=used=host=overflow=false; retained=0; idle=true;
     calls=0; next_stage.args[0] = 0xdead;
     assert(!kboot_finalize_atc0(true, false) && calls == 0);
     next_stage.args[0] = 0x3000;
     assert(!kboot_finalize_atc0(true, false) && calls == 1 && allowed);
     next_stage.entry=false; calls=0;
     assert(!kboot_finalize_atc0(true, false) && calls == 0);
-    next_stage.entry=true; next_stage.args[0]=(uintptr_t)dt; helper_result=-1;
+    next_stage.entry=true; next_stage.args[0]=(uintptr_t)dt;
+    contract=false; calls=probes=0;
+    assert(!kboot_finalize_atc0(true, false) && !calls && !probes);
+    contract=true; compatible=false;
+    assert(!kboot_finalize_atc0(true, false) && !calls && !probes);
+    compatible=true; chip_id=0x8103;
+    assert(!kboot_finalize_atc0(true, false) && !calls && !probes);
+    chip_id=T6050; helper_result=-1;
     assert(kboot_finalize_atc0(true, false) < 0);
     printf("PASS: %u production policy combinations + kernel/hibernate identity and failure gates\n", count);
 }

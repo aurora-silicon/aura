@@ -15,6 +15,13 @@ A sticky USB0 bring-up marker includes failed or partially registered gadgets;
 a later empty shutdown cannot erase this evidence. Debug/proxy boots keep the
 port reserved for that boot even if their gadget stops successfully.
 
+Bookkeeping from this image cannot certify a controller inherited from an
+earlier stage. An eligible handoff also checks the existing PMGR powered-domain
+predicate before any device MMIO, then requires either held DWC3 reset or the
+same retired-device state the T6050 CDC path accepts. Unknown mux/owner, running
+device, missing halt acknowledgement, event DMA or enabled endpoints refuse
+activation. This probe is read-only and never powers, resets or stops a device.
+
 Only the known kernel DT buffer or registered hibernation copy is eligible.
 All group handles must be valid, unique and explicitly disabled. The group
 must contain the ATC0 PHY and router; its LSTX reference must identify pin77,
@@ -33,6 +40,7 @@ Run the production code against an external ADT and the matching Linux DTB:
 
 ```
 python3 tests/atc0_handoff_policy.py /tmp/atc0-policy
+python3 tests/atc0_idle_probe.py /tmp/atc0-probe
 sh tests/run-atc0-handoff.sh J714s.adt fixed-linux.dtb /tmp/atc0-evidence
 ```
 

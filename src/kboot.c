@@ -12029,13 +12029,18 @@ int kboot_finalize_atc0(bool usb_stopped, bool debug_reserved)
 {
     void *fdt = (void *)next_stage.args[0];
     int size = dt && fdt == dt ? dt_bufsize : kboot_hibernate_handoff_size(fdt);
-    if (!next_stage.entry || !size)
+    if (!next_stage.entry || !size || chip_id != T6050 ||
+        fdt_node_check_compatible(fdt, 0, "apple,j714s"))
+        return 0;
+    int chosen = fdt_path_offset(fdt, "/chosen");
+    if (chosen < 0 || !fdt_getprop(fdt, chosen, "apple,atc0-handoff", NULL))
         return 0;
 
     const struct usb_dwc3_dma_range *ranges;
     bool overflow;
     size_t retained = usb_dwc3_retained(&ranges, &overflow);
-    bool safe = usb_stopped && !debug_reserved && !kboot_atc0_reserved() && !retained && !overflow;
+    bool safe = usb_stopped && !debug_reserved && !kboot_atc0_reserved() && !retained &&
+                !overflow && usb_atc0_quiescent();
     int ret = kboot_handoff_atc0(fdt, size, safe);
     if (ret < 0)
         return ret;
