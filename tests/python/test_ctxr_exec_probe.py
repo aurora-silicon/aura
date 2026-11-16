@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-"""ctxr_exec_confined() decides by its probe alone, on every chip."""
+"""CTXR confinement: probe most chips; T6050 cannot safely run an outside-window probe."""
 
 from test_smp_timeouts import REPO, compile_and_run
 
@@ -23,6 +23,7 @@ HARNESS = r'''
 typedef uint64_t u64; typedef uint32_t u32;
 #define MAX_CPUS 4
 #define SZ_16K 16384
+#define T6050 0x6050
 #define T6040 0x6040
 #define T6041 0x6041
 #define T8112 0x8112
@@ -230,8 +231,6 @@ def build(tmp_path, cases_source):
     body = probe_source()
     # Each case is a fresh boot: drop the static cache so one binary can run them all.
     body = body.replace("static int confined = -1;", "int confined = -1;")
-    function = body[body.index("bool ctxr_exec_confined(void)"):]
-    assert "chip_id" not in function, "ctxr_exec_confined() must not filter by chip ID"
     compile_and_run(tmp_path, "ctxr_exec_probe", HARNESS % body + MAIN)
 
 
@@ -267,3 +266,25 @@ def test_callers_use_the_probe():
     assert "bool confined = ctxr_exec_confined();" in os_may_start
     assert os_may_start.index("probe_stuck_cpu >= 0") < os_may_start.index("if (!confined || !ctxr_exec_problem())")
     assert "if (ctxr_exec_confined()) {" in (REPO / "src/kboot.c").read_text()
+
+
+def test_t6050_never_probes_outside_its_window(tmp_path):
+    body = probe_source().replace("static int confined = -1;", "int confined = -1;")
+    main = r'''
+#undef printf
+int main(void) {
+    chip_id = T6050; alive_mask = 3;
+    SYS_IMP_APL_CTXR_D_LWR_EL1 = 0x10006238000;
+    SYS_IMP_APL_CTXR_D_UPR_EL1 = 0x10006577000;
+    assert(ctxr_exec_confined() && !calls);
+    alive_mask = 1;
+    assert(ctxr_exec_confined() && !calls);
+    SYS_IMP_APL_CTXR_D_LWR_EL1 = 0;
+    assert(!ctxr_exec_confined() && !calls);
+    at_el1 = 1; reads = 0;
+    assert(!ctxr_exec_confined() && !calls && !reads);
+    puts("T6050 CTXR direct check OK");
+    return 0;
+}
+'''
+    compile_and_run(tmp_path, "ctxr_t6050", HARNESS % body + main)
