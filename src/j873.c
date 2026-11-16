@@ -9,6 +9,10 @@
  * with both DARTs still disabled; Linux describes them as plain DWC3 hosts.
  * Every step checks its precondition first, so a controller is either left
  * as iBoot left it or fully set up.
+ *
+ * J804 (14-inch MacBook Pro M6) shares the SoC and this preparation: its
+ * left-rear and right USB-C ports, N1 and internal PCIe are set up the same
+ * way.
  */
 
 #include "j873.h"
@@ -27,7 +31,9 @@
 struct j873_usb {
     u64 aon, bank, gate, dart0, dart1, pipe, phy, evt, dwc;
     const char *hpm;
+    const char *spmi; /* the HPM's SPMI bus (default nub-spmi-a0) */
     u64 hub_reset;
+    const char *name;
 };
 
 static const struct j873_usb j873_usb[] = {
@@ -42,6 +48,7 @@ static const struct j873_usb j873_usb[] = {
         .evt = 0x40a448000,
         .dwc = 0x40a430000,
         .hpm = "/arm-io/nub-spmi-a0/hpm1",
+        .name = "usb-drd1",
     },
     {
         .aon = 0x308290180,
@@ -56,6 +63,44 @@ static const struct j873_usb j873_usb[] = {
         /* ADT usb3hub-fw function-usb3hub_rst = nub-gpio GPIO(0x27): iBoot
          * leaves the VL822 RESET# driven low. */
         .hub_reset = 0x3081f0000 + 0x27 * 4,
+        .name = "usb-drd2",
+    },
+};
+
+/*
+ * J804 (14-inch MacBook Pro M6): the left-rear port (usb-drd1, hpm1 on
+ * nub-spmi-a0) has J873's usb-drd1 registers (same SoC, ADT checked); the
+ * right port is usb-drd3 (hpm3 on nub-spmi-a1). ATC n power: AON 0x308290100
+ * + 0x40 n, gate AON + 0x20, PSD bank 0x303a14700 + 0x100 n (n = 0 is USB0,
+ * usb_t8152.c). USB0 stays the gadget console.
+ */
+static const struct j873_usb j804_usb[] = {
+    {
+        .aon = 0x308290140,
+        .bank = 0x303a14800,
+        .gate = 0x308290160,
+        .dart0 = 0x40b020000,
+        .dart1 = 0x40b040000,
+        .pipe = 0x40a414000,
+        .phy = 0x40a418000,
+        .evt = 0x40a448000,
+        .dwc = 0x40a430000,
+        .hpm = "/arm-io/nub-spmi-a0/hpm1",
+        .name = "usb-drd1",
+    },
+    {
+        .aon = 0x3082901c0,
+        .bank = 0x303a14a00,
+        .gate = 0x3082901e0,
+        .dart0 = 0x413020000,
+        .dart1 = 0x413040000,
+        .pipe = 0x412414000,
+        .phy = 0x412418000,
+        .evt = 0x412448000,
+        .dwc = 0x412430000,
+        .hpm = "/arm-io/nub-spmi-a1/hpm3",
+        .spmi = "/arm-io/nub-spmi-a1",
+        .name = "usb-drd3",
     },
 };
 
@@ -78,9 +123,9 @@ static int wait32(u64 addr, u32 mask, u32 want, const char *what)
 
 /* iBoot leaves the port controller in power state 7, where it does not
  * detect a plug; wake it the way usb_init() does on other machines. */
-static int j873_hpm_wake(const char *path)
+static int j873_hpm_wake(const char *path, const char *bus)
 {
-    spmi_dev_t *spmi = spmi_init("/arm-io/nub-spmi-a0");
+    spmi_dev_t *spmi = spmi_init(bus ? bus : "/arm-io/nub-spmi-a0");
     if (!spmi)
         return -1;
     tps6598x_dev_t *tps = tps6598x_init_spmi(path, spmi);
@@ -166,24 +211,21 @@ static bool j873_usb_is_up(const struct j873_usb *u)
            (read32(u->dwc + 0xc110) & 0x3000) == 0x1000;
 }
 
-int j873_usb_prep(void)
+static int t8152_usb_host_prep(const struct j873_usb *ports, size_t count)
 {
     int ret = 0;
 
-    if (chip_id != T8152 || board_id != 0x24)
-        return -1;
-
-    for (size_t i = 0; i < ARRAY_SIZE(j873_usb); i++) {
-        const struct j873_usb *u = &j873_usb[i];
+    for (size_t i = 0; i < count; i++) {
+        const struct j873_usb *u = &ports[i];
 
         if (j873_usb_is_up(u)) {
-            printf("j873: usb-drd%zu already in host mode\n", i + 1);
+            printf("j873: %s already in host mode\n", u->name);
             continue;
         }
-        if (u->hpm && j873_hpm_wake(u->hpm))
+        if (u->hpm && j873_hpm_wake(u->hpm, u->spmi))
             ret = -1;
         if (j873_usb_power(u) || j873_usb_phy_host(u)) {
-            printf("j873: usb-drd%zu setup failed\n", i + 1);
+            printf("j873: %s setup failed\n", u->name);
             ret = -1;
             continue;
         }
@@ -195,9 +237,23 @@ int j873_usb_prep(void)
             }
             set32(u->hub_reset, 1);
         }
-        printf("j873: usb-drd%zu in host mode\n", i + 1);
+        printf("j873: %s in host mode\n", u->name);
     }
     return ret;
+}
+
+int j873_usb_prep(void)
+{
+    if (chip_id != T8152 || board_id != 0x24)
+        return -1;
+    return t8152_usb_host_prep(j873_usb, ARRAY_SIZE(j873_usb));
+}
+
+int j804_usb_prep(void)
+{
+    if (chip_id != T8152 || board_id != 0x22)
+        return -1;
+    return t8152_usb_host_prep(j804_usb, ARRAY_SIZE(j804_usb));
 }
 
 /* Wake the USB hosts' port controllers again after something sent them back to sleep. */
@@ -207,7 +263,7 @@ void j873_usb_wake_hpms(void)
         return;
     for (size_t i = 0; i < ARRAY_SIZE(j873_usb); i++)
         if (j873_usb[i].hpm)
-            j873_hpm_wake(j873_usb[i].hpm);
+            j873_hpm_wake(j873_usb[i].hpm, j873_usb[i].spmi);
 }
 
 /*
@@ -224,7 +280,8 @@ int j873_pcie_prep(void)
     u64 rc, phy, phyphy, size;
     u32 lane_cfg;
 
-    if (chip_id != T8152 || board_id != 0x24)
+    /* J873g (0x24) and J804 (0x22) share this apcie/N1 layout (ADT checked). */
+    if (chip_id != T8152 || (board_id != 0x24 && board_id != 0x22))
         return -1;
 
     int node = adt_path_offset_trace(adt, "/arm-io/apcie", path);
@@ -280,11 +337,29 @@ int j873_pcie_prep(void)
  */
 int j873_n1_power(void)
 {
-    if (chip_id != T8152 || board_id != 0x24)
+    /* J873g (0x24) and J804 (0x22) share this apcie/N1 layout (ADT checked). */
+    if (chip_id != T8152 || (board_id != 0x24 && board_id != 0x22))
         return -1;
 
     int ret = smc_adt_function_reset("/arm-io/apcie/pci-bridge0", 10);
     if (ret > 0)
         printf("j873: N1: no SMC function-reset in the ADT\n");
+    return ret ? -1 : 0;
+}
+
+/*
+ * J804: the SD reader on apcie port 2 is powered by the SMC (ADT
+ * pci-bridge2/pcie-sdreader function-sd_pwr_en). Write level 1 so the port
+ * can train; without it the link stays in detect.
+ */
+int j804_sdreader_power(void)
+{
+    if (chip_id != T8152 || board_id != 0x22)
+        return -1;
+
+    int ret = smc_adt_function_set("/arm-io/apcie/pci-bridge2/pcie-sdreader", "function-sd_pwr_en",
+                                   1, 10);
+    if (ret > 0)
+        printf("j804: SD reader: no SMC function-sd_pwr_en in the ADT\n");
     return ret ? -1 : 0;
 }

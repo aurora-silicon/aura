@@ -212,18 +212,30 @@ struct smc_adt_function {
     u32 hi; /* pKW8 only */
 };
 
-int smc_adt_function_reset(const char *path, u32 settle_ms)
+/* 0: an SMC pKW4/pKW8 function in *fn; 1: no such property, or a GPIO or other function */
+static int smc_adt_function_get(const char *path, const char *name, struct smc_adt_function *fn,
+                                bool *wide)
 {
-    struct smc_adt_function fn = {0};
     u32 len;
     int node = adt_path_offset(adt, path);
-    const void *prop = node < 0 ? NULL : adt_getprop(adt, node, "function-reset", &len);
+    const void *prop = node < 0 ? NULL : adt_getprop(adt, node, name, &len);
 
     if (!prop || len < 12)
         return 1;
-    memcpy(&fn, prop, min(len, (u32)sizeof(fn)));
-    bool wide = !memcmp(fn.four_cc, "8WKp", 4);
-    if (!(wide && len == 20) && !(!memcmp(fn.four_cc, "4WKp", 4) && len == 16))
+    memset(fn, 0, sizeof(*fn));
+    memcpy(fn, prop, min(len, (u32)sizeof(*fn)));
+    *wide = !memcmp(fn->four_cc, "8WKp", 4);
+    if (!(*wide && len == 20) && !(!memcmp(fn->four_cc, "4WKp", 4) && len == 16))
+        return 1;
+    return 0;
+}
+
+int smc_adt_function_reset(const char *path, u32 settle_ms)
+{
+    struct smc_adt_function fn;
+    bool wide;
+
+    if (smc_adt_function_get(path, "function-reset", &fn, &wide))
         return 1; /* a GPIO or other non-SMC function */
 
     smc_dev_t *smc = smc_init();
@@ -238,5 +250,26 @@ int smc_adt_function_reset(const char *path, u32 settle_ms)
     smc_shutdown(smc);
     printf("SMC: %s function-reset %c%c%c%c released: %d\n", path, fn.key >> 24, fn.key >> 16,
            fn.key >> 8, fn.key, ret);
+    return ret ? -1 : 0;
+}
+
+/* Set an ADT SMC function (pKW4/pKW8) other than function-reset to one level. */
+int smc_adt_function_set(const char *path, const char *name, u32 level, u32 settle_ms)
+{
+    struct smc_adt_function fn;
+    bool wide;
+
+    if (smc_adt_function_get(path, name, &fn, &wide))
+        return 1;
+
+    smc_dev_t *smc = smc_init();
+    if (!smc)
+        return -1;
+    int ret = wide ? smc_write_u64(smc, fn.key, ((u64)fn.hi << 32) | fn.lo | level)
+                   : smc_write_u32(smc, fn.key, fn.lo | level);
+    smc_shutdown(smc);
+    mdelay(settle_ms);
+    printf("SMC: %s %s %c%c%c%c = %u: %d\n", path, name, fn.key >> 24, fn.key >> 16, fn.key >> 8,
+           fn.key, level, ret);
     return ret ? -1 : 0;
 }
