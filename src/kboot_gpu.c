@@ -4209,6 +4209,463 @@ static T6050_GPU_INIT int dt_set_gpu_g17c(void *dt)
     return ret;
 }
 
+/*
+ * T6050 (J775D: M5 Ultra, two dies) on the 27.0 firmware. iBoot preloads both roles (gfx-asc GFX,
+ * gfx1-asc GFX1) and leaves the UAT ranges empty; each role publishes its own kernel root while it
+ * boots, and asks for its crash log at the physical address of its __DATA_SHARED_RO (measured on
+ * J775D). This fills the six reservations from the ADT, and the hardware data the firmware's
+ * InitData takes from it: the OPP table (core and SRAM voltage per cluster), the AFR and CS tables
+ * (one voltage per die), the CS/AFR SRAM floor and the AON power-telemetry records. It names the
+ * boot firmware and enables the GPU node, its two mailboxes and the GPU power states. Everything is
+ * checked before anything is written; a mismatch leaves it all disabled.
+ */
+#define T6050_MAX_AUX_MAX      16
+#define T6050_MAX_AUX_MAX_DIES 2
+#define T6050_MAX_AUX_MIN_HZ   10000000u /* CS and AFR idle at 24 MHz */
+
+struct t6050_max_aux {
+    const char *adt; /* ADT property of the sgx node */
+    const char *dt;  /* gpu node property naming the OPP table */
+    u32 dies;
+    u32 count;
+    u32 phandle;
+    u64 uv[T6050_MAX_AUX_MAX_DIES][T6050_MAX_AUX_MAX];
+    u64 hz[T6050_MAX_AUX_MAX];
+    u64 sram_uv; /* the trailing value, 0 if the ADT has none */
+};
+
+static int t6050_max_get_aux(void *dt, int gpu, int sgx, u32 dies, struct t6050_max_aux *a)
+{
+    u64 hdr[2];
+    u32 len = 0;
+    const u8 *p = adt_getprop(adt, sgx, a->adt, &len);
+
+    if (!p || len < sizeof(hdr))
+        bail("ADT: GPU: missing or short %s\n", a->adt);
+    memcpy(hdr, p, sizeof(hdr));
+    if (!dies || dies > T6050_MAX_AUX_MAX_DIES || hdr[0] != dies || !hdr[1] ||
+        hdr[1] > T6050_MAX_AUX_MAX)
+        bail("ADT: GPU: %s has %lu die(s) and %lu states, not %u die(s) and 1 to %d\n", a->adt,
+             hdr[0], hdr[1], dies, T6050_MAX_AUX_MAX);
+    /* dies x count {uV, Hz} states, then optionally min_sram_volt, one floor per die */
+    u32 body = sizeof(hdr) + dies * hdr[1] * 2 * sizeof(u64), floors = dies * sizeof(u64);
+    if (len != body && len != body + floors)
+        bail("ADT: GPU: %s is %u bytes, not %u or %u\n", a->adt, len, body, body + floors);
+
+    a->dies = dies;
+    a->count = hdr[1];
+    a->sram_uv = 0;
+    for (u32 d = 0; d < dies; d++)
+        for (u32 i = 0; i < a->count; i++) {
+            const u8 *state = p + sizeof(hdr) + 16 * (d * a->count + i);
+            u64 hz;
+            memcpy(&a->uv[d][i], state, sizeof(u64));
+            memcpy(&hz, state + 8, sizeof(u64));
+            if (!d)
+                a->hz[i] = hz;
+            /* State 0 is the off state (125 mV on T6050), as in perf-states: no voltage floor */
+            if (hz != a->hz[i] || (i && a->uv[d][i] < G15_PS_MIN_MV * 1000) ||
+                a->uv[d][i] > G15_PS_MAX_MV * 1000 || hz < T6050_MAX_AUX_MIN_HZ ||
+                hz > G15_PS_MAX_HZ)
+                bail("ADT: GPU: %s die %u state %u has bad values (%lu Hz, %lu uV)\n", a->adt, d, i,
+                     hz, a->uv[d][i]);
+        }
+    for (u32 d = 0; len == body + floors && d < dies; d++) {
+        u64 uv;
+        memcpy(&uv, p + body + d * sizeof(u64), sizeof(u64));
+        if (uv < G15_PS_MIN_MV * 1000 || uv > G15_PS_MAX_MV * 1000 || (d && uv != a->sram_uv))
+            bail("ADT: GPU: %s die %u SRAM floor %lu uV is out of range or differs from die 0's\n",
+                 a->adt, d, uv);
+        a->sram_uv = uv;
+    }
+
+    int plen;
+    const fdt32_t *ph = fdt_getprop(dt, gpu, a->dt, &plen);
+    if (!ph || plen != sizeof(*ph) || fdt_node_offset_by_phandle(dt, fdt32_ld(ph)) < 0)
+        bail("FDT: GPU: %s missing or not an OPP table\n", a->dt);
+    a->phandle = fdt32_ld(ph);
+    return 0;
+}
+
+/* The CS and AFR SRAM floor: the one both ADT tables end with, else the GPU's SRAM floor */
+static int t6050_max_csafr_sram(const struct t6050_max_aux aux[2], u32 gpu_floor_uv, u32 *out)
+{
+    if (aux[0].sram_uv && aux[1].sram_uv) {
+        if (aux[0].sram_uv != aux[1].sram_uv)
+            bail("ADT: GPU: the CS and AFR SRAM floors disagree (%lu, %lu uV)\n", aux[0].sram_uv,
+                 aux[1].sram_uv);
+        *out = aux[0].sram_uv;
+    } else if (!aux[0].sram_uv && !aux[1].sram_uv) {
+        *out = gpu_floor_uv;
+    } else {
+        bail("ADT: GPU: only one of the CS and AFR tables has an SRAM floor\n");
+    }
+    printf("ADT: GPU: CS %u and AFR %u states, CS/AFR SRAM floor %u uV (%s)\n", aux[0].count,
+           aux[1].count, *out, aux[0].sram_uv ? "the tables' own" : "the GPU's");
+    return 0;
+}
+
+#define T6050_MAX_GPU_PATH "/soc@2300000000/gpu@2302600000"
+#define T6050_MAX_OPPS     14
+/* Array bounds, for the two-die part (J775D); a one-die part (J716c) uses the first half. */
+#define T6050_MAX_CLUSTERS         8
+#define T6050_MAX_DIES             2
+#define T6050_MAX_AON              6
+#define T6050_MAX_CLUSTERS_PER_DIE 4
+
+static const struct {
+    const char *name; /* /arm-io/sgx <name>-base and <name>-size */
+    const char *path;
+} t6050_max_uat[] = {
+    {"gfx-handoff", "/reserved-memory/uat-handoff"},
+    {"gfx-shared-l2-region", "/reserved-memory/uat-l2-pagetables"},
+    {"gfx-shared-region", "/reserved-memory/uat-pagetables"},
+    {"gpu-region", "/reserved-memory/uat-ttbs"},
+};
+
+/* Parents first, the GPU node last. */
+static const char *const t6050_max_enable[] = {
+    "/soc@2300000000/power-management@2300e80000/power-controller@0",
+    "/soc@2300000000/power-management@2300e80000/power-controller@100",
+    "/soc@2300000000/power-management@2300e80000/power-controller@110",
+    "/soc@6300000000/power-management@6300e80000/power-controller@0",
+    "/soc@6300000000/power-management@6300e80000/power-controller@100",
+    "/soc@6300000000/power-management@6300e80000/power-controller@110",
+    "/soc@2300000000/mailbox@2302600000",
+    "/soc@2300000000/mailbox@2302e00000",
+    T6050_MAX_GPU_PATH,
+};
+
+/* Die 1's GPU power states (under /soc@6300000000) exist only on a two-die part */
+static bool t6050_max_enable_on_die(const char *path, u32 dies)
+{
+    return dies > 1 || strncmp(path, "/soc@6300000000/", 16);
+}
+
+static int t6050_max_sgx_range(int sgx, const char *name, u64 *base, u64 *size)
+{
+    char prop[64];
+    snprintf(prop, sizeof(prop), "%s-base", name);
+    if (ADT_GETPROP(adt, sgx, prop, base) != sizeof(u64))
+        return -1;
+    snprintf(prop, sizeof(prop), "%s-size", name);
+    if (ADT_GETPROP(adt, sgx, prop, size) != sizeof(u64))
+        return -1;
+    if (!*base || !*size || (*base & (SZ_16K - 1)) || (*size & (SZ_16K - 1)) ||
+        *base > UINT64_MAX - *size)
+        return -1;
+    return 0;
+}
+
+/* A role's three segments (__TEXT, __DATA, __DATA_SHARED_RO), which must match its sgx data
+ * properties. */
+static const struct adt_segment_ranges *t6050_max_segments(const char *asc_path, int sgx,
+                                                           const char *role)
+{
+    u32 len;
+    int asc = adt_path_offset(adt, asc_path);
+    if (asc < 0)
+        return NULL;
+    const struct adt_segment_ranges *seg = adt_getprop(adt, asc, "segment-ranges", &len);
+    if (!seg || len != 3 * sizeof(*seg))
+        return NULL;
+    char name[48];
+    u64 base, size;
+    snprintf(name, sizeof(name), "%s-data", role);
+    if (t6050_max_sgx_range(sgx, name, &base, &size) || seg[1].phys != base || seg[1].size != size)
+        return NULL;
+    snprintf(name, sizeof(name), "%s-data-shared-ro", role);
+    if (t6050_max_sgx_range(sgx, name, &base, &size) || seg[2].phys != base || seg[2].size != size)
+        return NULL;
+    /* __DATA runs straight into __DATA_SHARED_RO; __TEXT sits elsewhere, with the other role's. */
+    if (seg[1].phys + seg[1].size != seg[2].phys || !seg[0].phys || (seg[0].phys & (SZ_16K - 1)) ||
+        (seg[0].size & (SZ_16K - 1)))
+        return NULL;
+    return seg;
+}
+
+/*
+ * The AON power-telemetry records the GPU firmware is given, two GPU and one AFR identifier per die
+ * (J716c: g0TR g1TR r0TR; J775D: g0TR-g3TR r0TR r1TR), looked up in /arm-io/aon-ptd's
+ * ptd_data_table: 12-byte records, a FourCC stored little-endian then two words. out[] gets FourCC,
+ * word 1, word 2 for each, in this order.
+ */
+static const char t6050_max_aon_names_2die[T6050_MAX_AON][5] = {"g0TR", "g1TR", "g2TR",
+                                                                "g3TR", "r0TR", "r1TR"};
+static const char t6050_max_aon_names_1die[T6050_MAX_AON / 2][5] = {"g0TR", "g1TR", "r0TR"};
+
+static int t6050_max_aon(u32 dies, u32 out[T6050_MAX_AON * 3])
+{
+    const u32 records = 3 * dies;
+    u32 len;
+    int node = adt_path_offset(adt, "/arm-io/aon-ptd");
+    const u8 *table = node < 0 ? NULL : adt_getprop(adt, node, "ptd_data_table", &len);
+    if (!table || !len || len % 12) {
+        printf("ADT: GPU: T6050 aon-ptd ptd_data_table missing or not 12-byte records\n");
+        return -1;
+    }
+    for (u32 n = 0; n < records; n++) {
+        const char *name = dies == 2 ? t6050_max_aon_names_2die[n] : t6050_max_aon_names_1die[n];
+        u32 fourcc = (u32)name[0] << 24 | (u32)name[1] << 16 | (u32)name[2] << 8 | (u32)name[3];
+        bool found = false;
+        for (u32 r = 0; r < len / 12; r++) {
+            u32 rec[3];
+            memcpy(rec, table + 12 * r, sizeof(rec));
+            if (rec[0] != fourcc)
+                continue;
+            if (found) {
+                printf("ADT: GPU: T6050 AON record %s appears twice\n", name);
+                return -1;
+            }
+            found = true;
+            out[3 * n] = rec[0];
+            out[3 * n + 1] = rec[1];
+            out[3 * n + 2] = rec[2];
+        }
+        if (!found) {
+            printf("ADT: GPU: T6050 AON record %s missing\n", name);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/* Every OPP of the table behind gpu's prop: opp-hz and an opp-microvolt of `cells` cells, `count`
+ * of them. */
+static int t6050_max_opp_shape(void *dt, int table, u32 count, u32 cells, bool sram)
+{
+    int opp, opps = 0, len;
+    fdt_for_each_subnode(opp, dt, table)
+    {
+        if (++opps > (int)count || !fdt_getprop(dt, opp, "opp-hz", &len) || len != sizeof(u64) ||
+            !fdt_getprop(dt, opp, "opp-microvolt", &len) || len != (int)(cells * sizeof(u32)))
+            return -1;
+        if (sram && (!fdt_getprop(dt, opp, "opp-microvolt-sram", &len) ||
+                     len != (int)(cells * sizeof(u32))))
+            return -1;
+    }
+    return opps == (int)count ? 0 : -1;
+}
+
+static int t6050_max_gpu_leakage(void *dt)
+{
+    int path[8];
+    u64 die, base, size;
+    if (adt_path_offset_trace(adt, "/arm-io/sgx", path) < 0 ||
+        adt_get_reg(adt, path, "reg", 0, &die, NULL) ||
+        adt_path_offset_trace(adt, "/arm-io/pmgr", path) < 0)
+        return -1;
+    for (int i = 0; !adt_get_reg(adt, path, "reg", i, &base, &size); i++) {
+        if ((u32)base != T6050_GPU_LEAK_WINDOW || base >> 32 != die >> 32 ||
+            size < T6050_GPU_LEAK_OFFSET + 12)
+            continue;
+        u32 w[3];
+        int before = g15_guard_begin();
+        for (int j = 0; j < 3; j++)
+            w[j] = read32(base + T6050_GPU_LEAK_OFFSET + 4 * j);
+        if (g15_guard_end(before))
+            return -1;
+        printf("FDT: GPU: leakage calibration words %08x %08x %08x\n", w[0], w[1], w[2]);
+        fdt32_t cells[3] = {cpu_to_fdt32(w[0]), cpu_to_fdt32(w[1]), cpu_to_fdt32(w[2])};
+        int gpu = fdt_path_offset(dt, T6050_MAX_GPU_PATH);
+        return gpu < 0
+                   ? -1
+                   : fdt_setprop(dt, gpu, "apple,leakage-calibration-words", cells, sizeof(cells));
+    }
+    return -1;
+}
+
+static T6050_GPU_INIT int dt_set_gpu_t6050_max(void *dt)
+{
+    int gpu = fdt_path_offset(dt, T6050_MAX_GPU_PATH);
+    /* "apple,agx-g17c" (Max) and "apple,agx-g17d" (Ultra); "apple,agx-t6050" in older trees */
+    if (gpu < 0 || (fdt_node_check_compatible(dt, gpu, "apple,agx-g17c") &&
+                    fdt_node_check_compatible(dt, gpu, "apple,agx-g17d") &&
+                    fdt_node_check_compatible(dt, gpu, "apple,agx-t6050")))
+        return 0;
+
+    int sgx = adt_path_offset(adt, "/arm-io/sgx");
+    int arm_io = adt_path_offset(adt, "/arm-io");
+    u32 count, tables, len, dies = 1;
+    /* One die (J716c, M5 Max) or two (J775D, M5 Ultra), four GPU clusters each */
+    if (arm_io >= 0 && ADT_GETPROP(adt, arm_io, "die-count", &dies) < 0)
+        dies = 1;
+    const u32 clusters = T6050_MAX_CLUSTERS_PER_DIE * dies, aon_records = 3 * dies;
+    if (dies < 1 || dies > T6050_MAX_DIES || sgx < 0 ||
+        ADT_GETPROP(adt, sgx, "perf-state-count", &count) != sizeof(count) ||
+        ADT_GETPROP(adt, sgx, "perf-state-table-count", &tables) != sizeof(tables) ||
+        count != T6050_MAX_OPPS || tables != clusters) {
+        printf("FDT: GPU: T6050 sgx perf-state shape is not %d x %u for %u die(s)\n",
+               T6050_MAX_OPPS, clusters, dies);
+        goto disable;
+    }
+    /* perf-states holds every cluster's table, one after another; their frequencies must agree. */
+    const struct perf_state *states = adt_getprop(adt, sgx, "perf-states", &len);
+    if (!states || len != count * tables * sizeof(*states))
+        goto disable;
+    for (u32 j = 0; j < tables; j++)
+        for (u32 i = 0; i < count; i++)
+            if (states[j * count + i].freq != states[i].freq ||
+                states[j * count + i].volt > UINT32_MAX / 1000)
+                goto disable;
+
+    int table;
+    {
+        int ph_len;
+        const fdt32_t *opp_ph = fdt_getprop(dt, gpu, "operating-points-v2", &ph_len);
+        if (!opp_ph || ph_len != sizeof(*opp_ph))
+            goto disable;
+        table = fdt_node_offset_by_phandle(dt, fdt32_ld(opp_ph));
+        if (table < 0 || t6050_max_opp_shape(dt, table, T6050_MAX_OPPS, clusters, true))
+            goto disable;
+    }
+
+    /* perf-states-sram has perf-states' shape, one table per cluster at the same frequencies (the
+     * kernel takes lane j's SRAM voltage from table j). perf-states-sram1..7 are separate 14-entry
+     * tables nothing consumes. The lowest voltage is the GPU's SRAM floor, the CS/AFR one unless
+     * those tables carry their own. */
+    const struct perf_state *sram = adt_getprop(adt, sgx, "perf-states-sram", &len);
+    if (!sram || len != count * tables * sizeof(*sram)) {
+        printf("FDT: GPU: T6050 sgx perf-states-sram missing or not %u x %u states\n", count,
+               tables);
+        goto disable;
+    }
+    u32 sram_floor_mv = UINT32_MAX;
+    for (u32 j = 0; j < count * tables; j++) {
+        if (sram[j].freq != states[j].freq || !sram[j].volt || sram[j].volt > UINT32_MAX / 1000)
+            goto disable;
+        sram_floor_mv = min(sram_floor_mv, sram[j].volt);
+    }
+    struct t6050_max_aux aux[2] = {{.adt = "cs-perf-states", .dt = "apple,cs-opp"},
+                                   {.adt = "afr-perf-states", .dt = "apple,afr-opp"}};
+    u32 csafr_sram_uv, aon[T6050_MAX_AON * 3];
+    if (t6050_max_get_aux(dt, gpu, sgx, dies, &aux[0]) ||
+        t6050_max_get_aux(dt, gpu, sgx, dies, &aux[1]) ||
+        t6050_max_csafr_sram(aux, sram_floor_mv * 1000, &csafr_sram_uv) || t6050_max_aon(dies, aon))
+        goto disable;
+    for (int a = 0; a < 2; a++)
+        if (aux[a].count != T6050_MAX_OPPS ||
+            t6050_max_opp_shape(dt, fdt_node_offset_by_phandle(dt, aux[a].phandle), T6050_MAX_OPPS,
+                                dies, false)) {
+            printf("FDT: GPU: T6050 %s is not %d states of %u die(s), or its table is not\n",
+                   aux[a].adt, T6050_MAX_OPPS, dies);
+            goto disable;
+        }
+    {
+        int plen;
+        const void *ph = fdt_getprop(dt, gpu, "apple,aon-ptd", &plen);
+        if (!ph || plen != (int)(aon_records * 3 * sizeof(u32)) ||
+            !fdt_getprop(dt, gpu, "apple,csafr-min-sram-microvolt", &plen) || plen != sizeof(u32))
+            goto disable;
+    }
+
+    u64 base[ARRAY_SIZE(t6050_max_uat) + 2], size[ARRAY_SIZE(t6050_max_uat) + 2];
+    for (size_t i = 0; i < ARRAY_SIZE(t6050_max_uat); i++)
+        if (t6050_max_sgx_range(sgx, t6050_max_uat[i].name, &base[i], &size[i]) ||
+            fdt_path_offset(dt, t6050_max_uat[i].path) < 0) {
+            printf("FDT: GPU: T6050 sgx %s missing or unaligned\n", t6050_max_uat[i].name);
+            goto disable;
+        }
+    if (fdt_path_offset(dt, "/reserved-memory/gpu-fw-text") < 0 ||
+        fdt_path_offset(dt, "/reserved-memory/gpu-fw-data") < 0) {
+        printf("FDT: GPU: T6050 gpu-fw-text or gpu-fw-data reservation missing\n");
+        goto disable;
+    }
+
+    /* fw-text: GFX's __TEXT then GFX1's; fw-data: both roles' __DATA and __DATA_SHARED_RO, in that
+     * order. */
+    const struct adt_segment_ranges *gfx = t6050_max_segments("/arm-io/gfx-asc", sgx, "gfx");
+    const struct adt_segment_ranges *gfx1 = t6050_max_segments("/arm-io/gfx1-asc", sgx, "gfx1");
+    if (!gfx || !gfx1 || gfx[0].phys + gfx[0].size != gfx1[0].phys ||
+        gfx[2].phys + gfx[2].size != gfx1[1].phys) {
+        printf("FDT: GPU: T6050 firmware segments are not where the reservations expect\n");
+        goto disable;
+    }
+    const size_t text = ARRAY_SIZE(t6050_max_uat), data = text + 1;
+    base[text] = gfx[0].phys;
+    size[text] = gfx1[0].phys + gfx1[0].size - gfx[0].phys;
+    base[data] = gfx[1].phys;
+    size[data] = gfx1[2].phys + gfx1[2].size - gfx[1].phys;
+    for (size_t i = 0; i < ARRAY_SIZE(base); i++)
+        for (size_t j = 0; j < i; j++)
+            if (base[i] < base[j] + size[j] && base[j] < base[i] + size[i])
+                goto disable;
+    for (size_t i = 0; i < ARRAY_SIZE(t6050_max_enable); i++)
+        if (t6050_max_enable_on_die(t6050_max_enable[i], dies) &&
+            fdt_path_offset(dt, t6050_max_enable[i]) < 0)
+            goto disable;
+
+    /* Checked; now write. In-place fills first (they keep every offset), then the resizing ones. */
+    int opp, i = 0;
+    fdt_for_each_subnode(opp, dt, table)
+    {
+        fdt32_t volts[T6050_MAX_CLUSTERS], sram_volts[T6050_MAX_CLUSTERS];
+        for (u32 j = 0; j < clusters; j++) {
+            volts[j] = cpu_to_fdt32(states[j * count + i].volt * 1000);
+            sram_volts[j] = cpu_to_fdt32(sram[j * count + i].volt * 1000);
+        }
+        if (fdt_setprop_inplace(dt, opp, "opp-microvolt", volts, clusters * sizeof(fdt32_t)) ||
+            fdt_setprop_inplace(dt, opp, "opp-microvolt-sram", sram_volts,
+                                clusters * sizeof(fdt32_t)) ||
+            fdt_setprop_inplace_u64(dt, opp, "opp-hz", states[i].freq))
+            bail("FDT: GPU: T6050 cannot fill the OPP table\n");
+        i++;
+    }
+    for (int a = 0; a < 2; a++) {
+        i = 0;
+        fdt_for_each_subnode(opp, dt, fdt_node_offset_by_phandle(dt, aux[a].phandle))
+        {
+            fdt32_t volts[T6050_MAX_DIES];
+            for (u32 d = 0; d < dies; d++)
+                volts[d] = cpu_to_fdt32(aux[a].uv[d][i]);
+            if (fdt_setprop_inplace(dt, opp, "opp-microvolt", volts, dies * sizeof(fdt32_t)) ||
+                fdt_setprop_inplace_u64(dt, opp, "opp-hz", aux[a].hz[i]))
+                bail("FDT: GPU: T6050 cannot fill %s\n", aux[a].dt);
+            i++;
+        }
+    }
+    {
+        fdt32_t cells[T6050_MAX_AON * 3];
+        for (u32 c = 0; c < aon_records * 3; c++)
+            cells[c] = cpu_to_fdt32(aon[c]);
+        gpu = fdt_path_offset(dt, T6050_MAX_GPU_PATH);
+        if (gpu < 0 ||
+            fdt_setprop_inplace(dt, gpu, "apple,aon-ptd", cells, aon_records * 3 * sizeof(u32)) ||
+            fdt_setprop_inplace_u32(dt, gpu, "apple,csafr-min-sram-microvolt", csafr_sram_uv))
+            bail("FDT: GPU: T6050 cannot fill the AON records or the CS/AFR SRAM floor\n");
+    }
+    for (size_t r = 0; r < ARRAY_SIZE(t6050_max_uat); r++)
+        if (dt_set_resvmem(dt, t6050_max_uat[r].path, base[r], size[r]))
+            return -1;
+    if (dt_set_resvmem(dt, "/reserved-memory/gpu-fw-text", base[text], size[text]) ||
+        dt_set_resvmem(dt, "/reserved-memory/gpu-fw-data", base[data], size[data]))
+        return -1;
+    gpu = fdt_path_offset(dt, T6050_MAX_GPU_PATH);
+    if (gpu < 0 || firmware_set_fdt(dt, gpu, "apple,firmware-version", &os_firmware))
+        return -1;
+    if (t6050_max_gpu_leakage(dt))
+        printf("FDT: GPU: no leakage calibration words; the driver's generic configuration\n");
+    for (size_t e = 0; e < ARRAY_SIZE(t6050_max_enable); e++) {
+        if (!t6050_max_enable_on_die(t6050_max_enable[e], dies))
+            continue;
+        int node = fdt_path_offset(dt, t6050_max_enable[e]);
+        if (node < 0 || fdt_setprop_string(dt, node, "status", "okay"))
+            bail("FDT: GPU: T6050 cannot enable %s\n", t6050_max_enable[e]);
+    }
+    printf("FDT: GPU: T6050 enabled: TTBAT %#lx, fw-text %#lx+%#lx, fw-data %#lx+%#lx, %d OPPs up "
+           "to %u MHz, "
+           "SRAM floor %u mV, CS/AFR SRAM %u uV, %d AON records\n",
+           base[3], base[text], size[text], base[data], size[data], T6050_MAX_OPPS,
+           states[T6050_MAX_OPPS - 1].freq / 1000000, sram_floor_mv, csafr_sram_uv, aon_records);
+    return 0;
+
+disable:
+    printf("FDT: GPU: invalid T6050 ADT or DT data, GPU left disabled\n");
+    return 0;
+}
+
+int dt_set_gpu_m4(void *dt);
+
 int dt_set_gpu(void *dt)
 {
     if (chip_id == T8152) {
@@ -4227,6 +4684,11 @@ int dt_set_gpu(void *dt)
     if (chip_id == T6050 &&
         !fdt_node_check_compatible(dt, fdt_path_offset(dt, "gpu"), "apple,agx-g17c"))
         return dt_set_gpu_g17c(dt);
+
+    /* A tree with no gpu alias that names its M5 Max GPU node by path (J716c) */
+    if (chip_id == T6050 &&
+        !fdt_node_check_compatible(dt, fdt_path_offset(dt, T6050_MAX_GPU_PATH), "apple,agx-g17c"))
+        return dt_set_gpu_t6050_max(dt);
 
     if (chip_id == T6040)
         return dt_set_gpu_t6040(dt);
