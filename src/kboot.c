@@ -4311,13 +4311,13 @@ static int dt_reserve_asc_segments_at(int fdt_node, const char *adt_path, const 
         uint32_t mem_phandle = fdt_get_phandle(dt, mem_node);
 
         /*
-         * The OS log segment (flags 0xa) of a T6030 or T8132 display coprocessor,
+         * The OS log segment (flags 0xa) of a T6030, T8132 or T8152 display coprocessor,
          * internal or external, runs at its physical address and is not reached
          * through the DART: reserve its RAM, marked as such, without an IOMMU
          * mapping.
          */
-        if ((chip_id == T6030 || chip_id == T8132) && !strncmp(fdt_path, "dcp", 3) &&
-            seg->unk == 0xa)
+        if ((chip_id == T6030 || chip_id == T8132 || chip_id == T8152) &&
+            !strncmp(fdt_path, "dcp", 3) && seg->unk == 0xa)
             ret = fdt_setprop_empty(dt, mem_node, "apple,dcp-os-log");
         else
             ret = dt_device_set_reserved_mem(mem_node, node_name, dev_phandle, iova, seg_size);
@@ -11123,6 +11123,173 @@ static int dt_set_display_t8152(void)
     return 0;
 }
 
+/*
+ * J804 (T8152) internal display handoff for Linux's DCP driver. Opt-in with the kernel argument
+ * j804.dcp=1; without it, or if any check or later step fails, nothing is published (the tree is
+ * edited in a dt_display_transaction()) and the display nodes stay disabled (the panel keeps the
+ * simple-framebuffer).
+ *
+ * iBoot leaves the DCP running with its firmware mapped through locked DART tables. The ADT
+ * iop-dcp-nub segment-ranges give each segment's physical address and, in "remap", its DVA in the
+ * DARTs' 1 TiB window, except __OS_LOG (flags 0xa), whose remap repeats the physical address. Every
+ * dart-dcp SID 23 page and every dart-disp0 SID 0 / SID 16 page is checked against those segments
+ * before anything is published: dcp gets one reserved region per segment, display (SID 0) and
+ * disp0_piodma (SID 16) get the flags-2 segments their tables map, with iommu-addresses.
+ */
+#define J804_DCP_COPROC 0x286e00000UL
+#define J804_DART_DCP   0x286340000UL
+#define J804_DART_DISP0 0x286300000UL
+#define J804_DCP_SID    23
+
+static int j804_dcp_page(u64 iova, u64 physical, void *opaque)
+{
+    struct j713_display_maps *maps = opaque;
+    for (u32 i = 0; i < maps->count; i++) {
+        const struct adt_segment_ranges *seg = &maps->segments[i];
+        u64 start = seg->remap & ((1ULL << 36) - 1);
+        u64 size = ALIGN_UP((u64)seg->size, SZ_16K);
+        if (seg->unk == 0xa || iova < start || iova - start >= size)
+            continue;
+        if ((seg->remap >> 36) != 0x10 || physical != seg->phys + iova - start)
+            return -1;
+        maps->bytes[i] += SZ_16K;
+        return 0;
+    }
+    return -1;
+}
+
+static bool dt_bootargs_have(const char *token)
+{
+    int node = fdt_path_offset(dt, "/chosen"), len = 0;
+    const char *args = node < 0 ? NULL : fdt_getprop(dt, node, "bootargs", &len);
+    size_t n = strlen(token);
+
+    if (!args || len <= 0)
+        return false;
+    for (const char *p = args; (p = strstr(p, token)); p += n)
+        if ((p == args || dt_bootarg_space(p[-1])) && (!p[n] || dt_bootarg_space(p[n])))
+            return true;
+    return false;
+}
+
+static int dt_set_status_okay_iommu(const char *alias)
+{
+    int node = fdt_path_offset(dt, alias);
+    int dart = node < 0 ? -1 : dt_get_iommu_node(node, 0);
+    if (dart < 0 || fdt_setprop_string(dt, dart, "status", "okay"))
+        return -1;
+    node = fdt_path_offset(dt, alias);
+    if (node < 0 || fdt_setprop_string(dt, node, "status", "okay"))
+        return -1;
+    return 0;
+}
+
+/* Runs in dt_display_transaction(): a failure at any step discards every edit it made. */
+static int dt_set_j804_dcp_handoff_one(unsigned int unused)
+{
+    (void)unused;
+    int nub = adt_path_offset(adt, "/arm-io/dcp/iop-dcp-nub");
+    int chosen = adt_path_offset(adt, "/chosen");
+    u64 dram_start, dram_size;
+    u32 len;
+    if (nub < 0 || chosen < 0 || ADT_GETPROP(adt, chosen, "dram-base", &dram_start) < 0 ||
+        ADT_GETPROP(adt, chosen, "dram-size", &dram_size) < 0 || !dram_size)
+        bail("FDT: J804 DCP: missing ADT nub or DRAM bounds\n");
+    const struct adt_segment_ranges *segments = adt_getprop(adt, nub, "segment-ranges", &len);
+    if (!segments || !len || len % sizeof(*segments) || len / sizeof(*segments) > 32)
+        bail("FDT: J804 DCP: invalid segment-ranges\n");
+    u32 count = len / sizeof(*segments);
+    for (u32 i = 0; i < count; i++) {
+        u64 size = ALIGN_UP((u64)segments[i].size, SZ_16K);
+        if (!size || (segments[i].phys | segments[i].remap) & (SZ_16K - 1) ||
+            segments[i].phys < dram_start || segments[i].phys + size > dram_start + dram_size)
+            bail("FDT: J804 DCP: invalid segment %u\n", i);
+    }
+
+    u32 cpu = read32(J804_DCP_COPROC + 0x44);
+    if (!(cpu & BIT(4)))
+        bail("FDT: J804 DCP: coprocessor is not running (CPU_CONTROL 0x%x)\n", cpu);
+
+    /* Every page the running firmware maps must belong to a segment. */
+    struct j713_display_maps dcpmap = {.segments = segments, .count = count};
+    if (dart_walk_locked_t8110(J804_DART_DCP, 0x20000, J804_DCP_SID, dram_start, dram_size,
+                               j804_dcp_page, &dcpmap))
+        bail("FDT: J804 DCP: dart-dcp SID %u maps outside the firmware segments\n", J804_DCP_SID);
+
+    const char *aliases[] = {"disp0", "disp0_piodma"};
+    const u8 streams[] = {0, 16};
+    struct j713_display_maps maps[2] = {
+        {.segments = segments, .count = count},
+        {.segments = segments, .count = count},
+    };
+    for (u32 n = 0; n < 2; n++) {
+        if (dart_walk_locked_t8110(J804_DART_DISP0, 0xc000, streams[n], dram_start, dram_size,
+                                   j713_display_page, &maps[n]))
+            bail("FDT: J804 DCP: dart-disp0 SID %u maps outside the firmware segments\n",
+                 streams[n]);
+        for (u32 i = 0; i < count; i++)
+            if (maps[n].bytes[i] && maps[n].bytes[i] != ALIGN_UP((u64)segments[i].size, SZ_16K))
+                bail("FDT: J804 DCP: SID %u maps segment %u partially\n", streams[n], i);
+    }
+
+    const char *uuid = adt_getprop(adt, nub, "uuid", &len);
+    if (!uuid || len != 37 || uuid[len - 1] ||
+        fdt_setprop_string(dt, fdt_path_offset(dt, "dcp"), "apple,firmware-uuid", uuid))
+        bail("FDT: J804 DCP: cannot publish the firmware UUID\n");
+
+    if (dt_reserve_asc_firmware("/arm-io/dcp/iop-dcp-nub", NULL, "dcp", true, 0))
+        bail("FDT: J804 DCP: firmware reservation failed\n");
+
+    u32 phandles[2];
+    for (u32 n = 0; n < 2; n++) {
+        int node = fdt_path_offset(dt, aliases[n]);
+        if (node < 0)
+            bail("FDT: J804 DCP: no %s alias\n", aliases[n]);
+        phandles[n] = fdt_get_phandle(dt, node);
+        if (!phandles[n] && (fdt_generate_phandle(dt, &phandles[n]) ||
+                             fdt_setprop_u32(dt, node, "phandle", phandles[n])))
+            bail("FDT: J804 DCP: no phandle for %s\n", aliases[n]);
+    }
+    for (u32 i = 0; i < count; i++) {
+        if (!maps[0].bytes[i] && !maps[1].bytes[i])
+            continue;
+        char name[64];
+        snprintf(name, sizeof(name), "asc-firmware@%lx", segments[i].phys);
+        u64 size = ALIGN_UP((u64)segments[i].size, SZ_16K);
+        int node = dt_get_or_add_reserved_mem(name, "apple,asc-mem", true, segments[i].phys, size);
+        if (node < 0)
+            return -1;
+        u32 phandle = fdt_get_phandle(dt, node);
+        for (u32 n = 0; n < 2; n++) {
+            if (!maps[n].bytes[i])
+                continue;
+            node = fdt_subnode_offset(dt, fdt_path_offset(dt, "/reserved-memory"), name);
+            if (node < 0 ||
+                dt_device_set_reserved_mem(node, name, phandles[n], segments[i].remap, size) ||
+                dt_device_add_mem_region(aliases[n], phandle, NULL))
+                return -1;
+        }
+    }
+
+    if (dt_set_status_okay_iommu("dcp") || dt_set_status_okay_iommu("disp0") ||
+        dt_set_status_okay_iommu("disp0_piodma"))
+        bail("FDT: J804 DCP: could not enable the display nodes\n");
+    printf("FDT: J804 DCP handoff published (%u segments, firmware %s)\n", count, uuid);
+    return 0;
+}
+
+static int dt_set_j804_dcp_handoff(void)
+{
+    int dcp = fdt_path_offset(dt, "dcp");
+    if (board_id != 0x22 || dcp < 0 || fdt_node_check_compatible(dt, dcp, "apple,t8152-dcp"))
+        return 0;
+    if (!dt_bootargs_have("j804.dcp=1")) {
+        printf("FDT: J804 DCP handoff not requested (j804.dcp=1)\n");
+        return 0;
+    }
+    return dt_display_transaction(dt_set_j804_dcp_handoff_one, 0);
+}
+
 static int dt_prepare_t8152(void)
 {
     if (fdt_getprop(dt, 0, "aurora,minimal-boot", NULL)) {
@@ -11132,6 +11299,9 @@ static int dt_prepare_t8152(void)
             bail("FDT: T8152 requires the t8122 AIC3 fallback\n");
         if (dt_set_serial_number() || dt_set_display_t8152() || dt_set_gpu(dt))
             return -1;
+        /* Fail-soft: a refused handoff leaves the display nodes disabled. */
+        if (dt_set_j804_dcp_handoff())
+            printf("FDT: J804 DCP handoff not published\n");
     }
     if (dt_set_cpus())
         return -1;

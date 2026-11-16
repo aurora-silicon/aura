@@ -40,6 +40,7 @@ typedef uint32_t u32;
 #define T8140 0x8140
 #define T8142 0x8142
 #define T8132 0x8132
+#define T8152 0x8152
 #define SZ_16K 16384
 #define ALIGN_UP(x, a) (((x) + (a) - 1) & ~((a) - 1))
 #define bail(...) do { printf(__VA_ARGS__); return -1; } while (0)
