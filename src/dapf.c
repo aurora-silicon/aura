@@ -125,9 +125,21 @@ struct dapf_t8110b_config {
     u32 pad;
 } PACKED;
 
-static int dapf_init_t8110a(u64 base, struct dapf_t8110_config *config, u32 length)
+static int dapf_init_t8110a(u64 base, u64 size, struct dapf_t8110_config *config, u32 length)
 {
     int count = length / sizeof(*config);
+
+    /*
+     * Each entry consumes 0x40 bytes of register space. The ADT property's length and the
+     * register window are independent, and a mis-sized property walks straight off the end of the
+     * window into unmapped MMIO: an external abort, reported as an asynchronous SError at
+     * whatever PC the CPU is at by then.
+     */
+    if (size && (u64)count * 0x40 > size) {
+        printf("dapf: clamping %d entries to %ld (window 0x%lx at 0x%lx)\n", count, size / 0x40,
+               size, base);
+        count = size / 0x40;
+    }
 
     for (int i = 0; i < count; i++) {
         write32(base + 0x04, config[i].r4);
@@ -140,9 +152,21 @@ static int dapf_init_t8110a(u64 base, struct dapf_t8110_config *config, u32 leng
     return 0;
 }
 
-static int dapf_init_t8110b(u64 base, struct dapf_t8110b_config *config, u32 length)
+static int dapf_init_t8110b(u64 base, u64 size, struct dapf_t8110b_config *config, u32 length)
 {
     int count = length / sizeof(*config);
+
+    /*
+     * Each entry consumes 0x40 bytes of register space. The ADT property's length and the
+     * register window are independent, and a mis-sized property walks straight off the end of the
+     * window into unmapped MMIO: an external abort, reported as an asynchronous SError at
+     * whatever PC the CPU is at by then.
+     */
+    if (size && (u64)count * 0x40 > size) {
+        printf("dapf: clamping %d entries to %ld (window 0x%lx at 0x%lx)\n", count, size / 0x40,
+               size, base);
+        count = size / 0x40;
+    }
 
     for (int i = 0; i < count; i++) {
         write32(base + 0x04, config[i].r4);
@@ -155,7 +179,7 @@ static int dapf_init_t8110b(u64 base, struct dapf_t8110b_config *config, u32 len
     return 0;
 }
 
-static int dapf_init_t8110(const char *path, u64 base, int node)
+static int dapf_init_t8110(const char *path, u64 base, u64 size, int node)
 {
     u32 length = 0;
     char prop[32];
@@ -179,9 +203,9 @@ static int dapf_init_t8110(const char *path, u64 base, int node)
     // the observed lengthe for "dapf-instance-0". The 52 byte variant is more
     // common and prefering that works so far.
     if (length % sizeof(struct dapf_t8110_config) == 0) {
-        return dapf_init_t8110a(base, (struct dapf_t8110_config *)config, length);
+        return dapf_init_t8110a(base, size, (struct dapf_t8110_config *)config, length);
     } else if (length % sizeof(struct dapf_t8110b_config) == 0) {
-        return dapf_init_t8110b(base, (struct dapf_t8110b_config *)config, length);
+        return dapf_init_t8110b(base, size, (struct dapf_t8110b_config *)config, length);
     } else {
         printf("dapf: Invalid length for %s property %s\n", path, prop);
         return -1;
@@ -519,8 +543,8 @@ int dapf_init(const char *path, int index)
         index = found;
     }
 
-    u64 base;
-    if (adt_get_reg(adt, dart_path, "reg", index, &base, NULL) < 0) {
+    u64 base, size = 0;
+    if (adt_get_reg(adt, dart_path, "reg", index, &base, &size) < 0) {
         printf("dapf: Error getting DAPF %s base address.\n", path);
         goto out;
     }
@@ -530,7 +554,7 @@ int dapf_init(const char *path, int index)
     } else if (adt_is_compatible(adt, node, "dart,t6000")) {
         ret = dapf_init_t8020(path, base, node);
     } else if (adt_is_compatible(adt, node, "dart,t8110")) {
-        ret = dapf_init_t8110(path, base, node);
+        ret = dapf_init_t8110(path, base, size, node);
     } else {
         printf("dapf: DAPF %s at 0x%lx is of an unknown type\n", path, base);
         goto out;
