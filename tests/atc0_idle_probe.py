@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Exercise the production read-only inherited-controller predicate."""
 from pathlib import Path
+import os
+import shlex
 import subprocess
 import re
 import sys
@@ -85,7 +87,7 @@ for name in ('PIPEHANDLER_MUX_CTRL', 'PIPEHANDLER_AON_GEN', 'PIPEHANDLER_AON_GEN
     assert int(a, 0) == int(b, 0) if a.startswith('0x') else a == b
 c.write_text(prefix + body + '\n' + cases)
 exe = out / 'probe'
-subprocess.run(['cc', '-std=c11', '-Wall', '-Wextra', '-Werror', '-I'+str(root/'src'), str(c), '-o', str(exe)], check=True)
+subprocess.run([*shlex.split(os.environ.get('CC', 'cc')), '-std=c11', '-Wall', '-Wextra', '-Werror', '-I'+str(root/'src'), str(c), '-o', str(exe)], check=True)
 run = subprocess.run([str(exe)], capture_output=True, text=True, check=True)
 (out / 'RESULT.log').write_text(run.stdout + run.stderr)
 print(run.stdout, end='')

@@ -62,6 +62,13 @@ jobs:
       - name: Test PMP boot data fixups
         run: sh tests/run-pmp-boot-data.sh
 
+      - name: Test ATC0 ownership admission
+        env:
+          CC: ${{ matrix.compiler == 'gcc' && 'gcc' || 'clang' }}
+        run: |
+          python3 tests/atc0_handoff_policy.py "$RUNNER_TEMP/atc0-policy"
+          python3 tests/atc0_idle_probe.py "$RUNNER_TEMP/atc0-probe"
+
       - name: Run pytest with clang
         if: matrix.os == 'ubuntu-latest' && matrix.compiler == 'llvm'
         env:

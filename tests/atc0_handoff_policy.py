@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Run the production admission policy against all debug/stop/DMA combinations."""
 from pathlib import Path
+import os
+import shlex
 import subprocess
 import sys
 
@@ -105,7 +107,7 @@ c = out / 'policy.c'
 c.write_text(prefix + function(kboot, 'kboot_atc0_reserved') + '\n' +
              function(kboot, 'kboot_finalize_atc0') + '\n' + cases)
 exe = out / 'policy'
-subprocess.run(['cc', '-std=c11', '-Wall', '-Wextra', '-Werror', str(c), '-o', str(exe)], check=True)
+subprocess.run([*shlex.split(os.environ.get('CC', 'cc')), '-std=c11', '-Wall', '-Wextra', '-Werror', str(c), '-o', str(exe)], check=True)
 run = subprocess.run([str(exe)], capture_output=True, text=True, check=True)
 (out / 'RESULT.log').write_text(run.stdout + run.stderr)
 print(run.stdout, end='')
