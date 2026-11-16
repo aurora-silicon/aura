@@ -284,3 +284,84 @@ refused:
     printf("FDT: refusing unrecognized G18G firmware or memory layout\n");
     return -1;
 }
+
+/*
+ * The GPU's performance states, from this Mac's ADT (/arm-io/sgx), on the agx node for the
+ * kernel, independent of the firmware admission above:
+ *
+ *   apple,perf-states       = <hz mV> for each state, from perf-states {u32 freq, u32 volt}
+ *   apple,perf-states-sram  = <mV> for each state, from perf-states-sram {u32 freq, u32 volt}
+ *
+ * Both tables must have exactly gpu-num-perf-states + 1 rows, state 0 at frequency 0, the other
+ * states at strictly increasing frequencies, and the SRAM table must list the same frequencies.
+ * Anything else publishes neither property (and removes any the tree had), logs why, and the
+ * boot goes on: never fatal. The values are passed on as they are; the kernel judges them.
+ */
+#define T8152_MAX_PERF_STATES 32
+
+struct t8152_perf_state {
+    u32 freq, volt;
+};
+
+int dt_set_gpu_perf_states_t8152(void *dt)
+{
+    struct t8152_perf_state core[T8152_MAX_PERF_STATES], sram[T8152_MAX_PERF_STATES];
+    fdt32_t out[2 * T8152_MAX_PERF_STATES], out_sram[T8152_MAX_PERF_STATES];
+    const char *why = "the ADT has no gpu,t8152 /arm-io/sgx";
+    const void *p, *q;
+    u32 len, sram_len;
+    u64 n;
+    int gpu = fdt_node_offset_by_compatible(dt, -1, "apple,agx-t8152");
+
+    /* Tested on J804 only; J873g trees keep what they have. */
+    if (gpu < 0 || chip_id != T8152 || board_id != 0x22)
+        return 0;
+    int sgx = adt_path_offset(adt, "/arm-io/sgx");
+    if (sgx < 0 || !string_is(sgx, "compatible", "gpu,t8152"))
+        goto refused;
+    why = "gpu-num-perf-states is missing or out of range";
+    if (!number(sgx, "gpu-num-perf-states", &n) || !n || n + 1 > T8152_MAX_PERF_STATES)
+        goto refused;
+    n++;
+    why = "perf-states or perf-states-sram does not have gpu-num-perf-states + 1 rows";
+    p = adt_getprop(adt, sgx, "perf-states", &len);
+    q = adt_getprop(adt, sgx, "perf-states-sram", &sram_len);
+    if (!p || !q || len != n * sizeof(*core) || sram_len != n * sizeof(*sram))
+        goto refused;
+    memcpy(core, p, len);
+    memcpy(sram, q, sram_len);
+    why = "state 0 is not at frequency 0";
+    if (core[0].freq || sram[0].freq)
+        goto refused;
+    for (u32 i = 0; i < n; i++) {
+        why = "the frequencies do not strictly increase";
+        if (i && core[i].freq <= core[i - 1].freq)
+            goto refused;
+        why = "perf-states-sram lists other frequencies than perf-states";
+        if (sram[i].freq != core[i].freq)
+            goto refused;
+        out[2 * i] = cpu_to_fdt32(core[i].freq);
+        out[2 * i + 1] = cpu_to_fdt32(core[i].volt);
+        out_sram[i] = cpu_to_fdt32(sram[i].volt);
+    }
+
+    why = "the device tree could not be updated";
+    if (fdt_setprop(dt, gpu, "apple,perf-states", out, n * 2 * sizeof(*out)))
+        goto refused;
+    gpu = fdt_node_offset_by_compatible(dt, -1, "apple,agx-t8152");
+    if (gpu < 0 || fdt_setprop(dt, gpu, "apple,perf-states-sram", out_sram, n * sizeof(*out_sram)))
+        goto refused;
+    printf("FDT: G18G %u performance states copied from the ADT\n", (u32)n);
+    return 0;
+
+refused:
+    /* Both or neither: never a table the ADT did not give whole. */
+    gpu = fdt_node_offset_by_compatible(dt, -1, "apple,agx-t8152");
+    if (gpu >= 0)
+        fdt_delprop(dt, gpu, "apple,perf-states");
+    gpu = fdt_node_offset_by_compatible(dt, -1, "apple,agx-t8152");
+    if (gpu >= 0)
+        fdt_delprop(dt, gpu, "apple,perf-states-sram");
+    printf("FDT: G18G performance states not published: %s\n", why);
+    return 0;
+}
