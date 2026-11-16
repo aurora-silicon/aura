@@ -317,6 +317,13 @@ static bool smp_old_vector_owned_t8152(u64 locked)
 {
     u64 low = cur_boot_args.phys_base, size = cur_boot_args.mem_size;
     u64 top = cur_boot_args.top_of_kernel_data;
+    /*
+     * J804's Mach-O boot object is loaded above top_of_kernel_data, so the vector iBoot locked
+     * RVBAR to lies there; bound it by this image instead. The vector and STACKBOT content
+     * checks below still apply.
+     */
+    if (board_id == 0x22 && locked >= top && locked < (u64)_base && (u64)_base <= low + size)
+        top = (u64)_base;
     if (!size || low > UINT64_MAX - size || top > low + size || locked < low || locked >= top ||
         locked >= (u64)_base)
         return false;
@@ -329,7 +336,8 @@ static bool smp_old_vector_owned_t8152(u64 locked)
             !(off == 0 && read32(locked) == SMP_VENEER_LDR && read32(locked + 4) == SMP_VENEER_BR))
             return false;
     }
-    for (u64 p = locked + 0x200; p <= limit - (sizeof("STACKBOT") - 1); p += 8)
+    /* The marker is not always 8-byte aligned (seen on J804): scan byte by byte. */
+    for (u64 p = locked + 0x200; p <= limit - (sizeof("STACKBOT") - 1); p++)
         if (!memcmp((const void *)p, "STACKBOT", sizeof("STACKBOT") - 1))
             return true;
     return false;
@@ -340,7 +348,7 @@ static int smp_prepare_rvbar_t8152(const struct cpu_info *cpu)
     u64 rvbar = read64(cpu->impl_reg);
     u64 locked = rvbar & RVBAR_ADDR;
     u64 target = (u64)_vectors_start;
-    if (chip_id != T8152 || board_id != 0x24 || !(rvbar & RVBAR_LOCK))
+    if (chip_id != T8152 || (board_id != 0x24 && board_id != 0x22) || !(rvbar & RVBAR_LOCK))
         return -1;
     if (locked == target)
         return 0;
@@ -804,8 +812,12 @@ static int smp_init_t8152(void)
     int path[8];
     int pmgr = adt_path_offset_trace(adt, "/arm-io/pmgr-child", path);
     int cpus = adt_path_offset(adt, "/cpus");
-    if (!in_el2() || board_id != 0x24 || !adt_is_compatible(adt, 0, "J873gAP") || pmgr < 0 ||
-        cpus < 0 || !adt_is_compatible(adt, pmgr, "pmgr2,t8152"))
+    /* J804 (MacBook Pro, board 0x22) has J873g's CPU map and PMGR2 layout; both are still
+     * checked against the ADT below. */
+    bool board_ok = (board_id == 0x24 && adt_is_compatible(adt, 0, "J873gAP")) ||
+                    (board_id == 0x22 && adt_is_compatible(adt, 0, "J804AP"));
+    if (!in_el2() || !board_ok || pmgr < 0 || cpus < 0 ||
+        !adt_is_compatible(adt, pmgr, "pmgr2,t8152"))
         return -1;
 
     u32 len;
@@ -1362,7 +1374,7 @@ u64 smp_get_kernel_release_addr(int cpu)
 int smp_park_for_kernel(void)
 {
     extern void smp_kernel_park(void);
-    if (chip_id != T8152 || board_id != 0x24 || smp_has_pending_calls())
+    if (chip_id != T8152 || (board_id != 0x24 && board_id != 0x22) || smp_has_pending_calls())
         return -1;
     for (int cpu = 0; cpu < MAX_CPUS; cpu++) {
         if (!smp_is_alive(cpu) || smp_get_mpidr(cpu) == (mrs(MPIDR_EL1) & 0xffffff))
