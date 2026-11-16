@@ -517,6 +517,10 @@ void sptm_virt_cpu_arm(void)
     sptm_virt_cl4_seed(cpu);
     sptm_virt_amx_host();
     sptm_virt_sample_arm_here();
+    if (sptm_virt_s2r_early_s2 == (u32)cpu + 1) {
+        sptm_virt_s2r_early_s2 = 0;
+        nv2_l1_stage2_enable_here();
+    }
 }
 
 bool sptm_virt_cpu_in_xnu(void)
@@ -695,6 +699,14 @@ void sptm_virt_cpu_reset(void)
     }
     msr(TPIDR_EL2, cpu);
     sptm_virt_crumb(4);
+    if ((sptm_virt_flags & SPTM_VIRT_S2R) && sptm_virt_s2r_restarted_in_sleep(cpu)) {
+        msr(s3_5_c15_c6_2, mrs(s3_5_c15_c6_2) | BIT(0) | BIT(63));
+        while (1) {
+            sysop("dsb sy");
+            sysop("isb");
+            sysop("wfi");
+        }
+    }
     if (sptm_virt_flags & SPTM_VIRT_S2R)
         sptm_virt_s2r_wake(cpu);
 

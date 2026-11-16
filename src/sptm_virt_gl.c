@@ -1105,6 +1105,25 @@ static bool sptm_virt_wfe_watched(u64 *regs, u64 esr)
         return false;
     u64 now = mrs(CNTPCT_EL0), f = mrs(CNTFRQ_EL0), pc = mrs(ELR_EL2);
     n++;
+    /*
+     * The same WFE eight million times in a row (about two seconds): the guest is stuck there, and
+     * whatever comes next may take the console with it. Print the trace ring's tail once, newest
+     * first, while the console still works.
+     */
+    {
+        static u64 same_pc[MAX_CPUS], same_n[MAX_CPUS];
+        static bool dumped;
+        int c = smp_id();
+        if (pc == same_pc[c]) {
+            if (++same_n[c] == 8000000 && !__atomic_exchange_n(&dumped, true, __ATOMIC_SEQ_CST)) {
+                printf("SPTM-virt[wfe c%d]: stuck at pc 0x%lx\n", smp_id(), pc);
+                sptm_virt_s2r_dump_prio(6000, 60000);
+            }
+        } else {
+            same_pc[c] = pc;
+            same_n[c] = 0;
+        }
+    }
     if (!t_last)
         t_last = now;
     if (now - t_last >= 10 * f) {

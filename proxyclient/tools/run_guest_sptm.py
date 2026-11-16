@@ -109,6 +109,13 @@ CONFIG_FLAGS = {
     "AURA_AURACTL_DCC": 1 << 10,  # arm auractl's kext-free DCC transport (off by default)
 }
 KNOWN_ENV = {
+    "AURA_S2R_ARM_S",
+    "AURA_S2R_WIN",
+    "AURA_S2R_PROBE",
+    "AURA_S2R_PREWRITE",
+    "AURA_S2R_PROBE_AT",
+    "AURA_S2R_CRUMBS",
+    "AURA_S2R_EXTRA",
     "AURA_KEEP_EXCLAVES",
     "AURA_OS_LONG_VERSION",
     "AURA_KEEP_BOOT_VIDEO",
@@ -715,6 +722,32 @@ def configure(p, sym, plan, adt, ctl_cookie=0):
     if os.environ.get("AURA_S2R_QUIESCE"):
         p.write32(sym["sptm_virt_s2r_quiesce"], env_int("AURA_S2R_QUIESCE"))
         print("AMCC quiesce writes at the commit:", os.environ["AURA_S2R_QUIESCE"])
+    if os.environ.get("AURA_S2R_CRUMBS"):
+        p.write32(sym["sptm_virt_s2r_crumbs"], env_int("AURA_S2R_CRUMBS"))
+        print("S2R crumbs in PMU scratch, level", os.environ["AURA_S2R_CRUMBS"])
+    if os.environ.get("AURA_S2R_PREWRITE"):
+        a, v = (int(x, 0) for x in os.environ["AURA_S2R_PREWRITE"].split(","))
+        p.write64(sym["sptm_virt_s2r_prewrite"], a)
+        p.write64(sym["sptm_virt_s2r_prewrite"] + 8, v)
+        print("wake-time pre-write: [0x%x] <- 0x%x" % (a, v))
+    if os.environ.get("AURA_S2R_PROBE_AT"):
+        p.write64(sym["sptm_virt_s2r_probe_at"], int(os.environ["AURA_S2R_PROBE_AT"], 0))
+        print("wake-time probes at the guest's write to %s" % os.environ["AURA_S2R_PROBE_AT"])
+    if os.environ.get("AURA_S2R_PROBE"):
+        for i, a in enumerate(os.environ["AURA_S2R_PROBE"].split(",")[:4]):
+            p.write64(sym["sptm_virt_s2r_probe"] + 8 * i, int(a, 0))
+        print("wake-time probes: %s" % os.environ["AURA_S2R_PROBE"])
+    if os.environ.get("AURA_S2R_WIN"):
+        b, a = (int(x, 0) for x in os.environ["AURA_S2R_WIN"].split(","))
+        p.write32(sym["sptm_virt_s2r_win"], b)
+        p.write32(sym["sptm_virt_s2r_win"] + 4, a)
+        print("after-wake dump window: %d records before the first commit, %d after" % (b, a))
+    if os.environ.get("AURA_S2R_ARM_S"):
+        p.write32(sym["sptm_virt_s2r_arm_s"], env_int("AURA_S2R_ARM_S"))
+        print("S2R sleep rules armed", os.environ["AURA_S2R_ARM_S"], "s after setup")
+    if os.environ.get("AURA_S2R_EXTRA"):
+        p.write32(sym["sptm_virt_s2r_extra"], env_int("AURA_S2R_EXTRA"))
+        print("extra stop-mode trace blocks, mask", os.environ["AURA_S2R_EXTRA"])
     if os.environ.get("AURA_S2R_USB_RETAKE"):
         p.write32(sym["sptm_virt_s2r_usb_retake"], env_int("AURA_S2R_USB_RETAKE"))
         p.write32(sym["sptm_virt_s2r_usb_delay_ms"], env_int("AURA_S2R_USB_RETAKE_MS"))
