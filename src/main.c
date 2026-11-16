@@ -306,6 +306,31 @@ void run_actions(void)
         flush_and_reboot();
     }
 
+#ifndef CHAINLOADING
+    /*
+     * A plain stage 2 whose stage armed the watchdog for it (m1n1.wdt=keep: the J716s' A/B stage
+     * 1) has a fallback behind it: a reset before the OS clears iBoot's boot stage counts as a
+     * failed boot, and that stage then starts its other slot. Do not wait in the proxy for a host
+     * that may never come: give one a bounded window, then reboot. This does not depend on the
+     * watchdog being armed (a disarmed one would leave the Mac here until the power button is
+     * held, and a power cycle does not count as a failed boot). A host that attaches keeps the
+     * proxy as before, and its requests feed the watchdog if it is armed.
+     */
+    if (boot_wdt_keep_enabled() && secboot_host_proxy_allowed()) {
+        printf("\nStage 2: no payload started. Rebooting in %u s, so that stage 1 starts its "
+               "fallback,\n  unless a host opens the proxy.\n",
+               STAGE2_FALLBACK_WINDOW_MS / 1000);
+        enum stage1_proxy_result result = uartproxy_wait_stage1(STAGE2_FALLBACK_WINDOW_MS);
+        if (result == STAGE1_PROXY_CDC || result == STAGE1_PROXY_KIS) {
+            printf("Stage 2: host connected, running proxy\n");
+            uartproxy_run_presynced();
+            return;
+        }
+        printf("Stage 2: no host; rebooting\n");
+        flush_and_reboot();
+    }
+#endif
+
 #ifndef BRINGUP
     /* A proxy window brought USB up already; a second bring-up would register its ports twice. */
     if (!usb_up && !aura_debug_enabled() && !(stage1_window_done && chip_id != T8140)) {
