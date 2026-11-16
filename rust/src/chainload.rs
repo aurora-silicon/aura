@@ -13,6 +13,17 @@ use core::ffi::{c_char, c_int, c_void, CStr};
 use fatfs::{FileSystem, FsOptions, Read};
 use uuid::Uuid;
 
+extern "C" {
+    static chip_id: u32;
+}
+
+/*
+ * T8152 never takes a trial: spending an aura-try marker is a write to the boot NVMe, and on
+ * J804 that write leaves NVMe unusable. chainload.c offers no trial buffer there; this keeps
+ * any other caller from doing so.
+ */
+const T8152: u32 = 0x8152;
+
 #[derive(Debug)]
 pub enum Error {
     FATError(fatfs::Error<nvme::Error>),
@@ -272,6 +283,9 @@ pub unsafe extern "C" fn rust_load_image(
 
     let marker = unsafe { proxy_request.as_mut() };
     let trial = if trial.is_null() || trial_capacity == 0 {
+        None
+    } else if unsafe { chip_id } == T8152 {
+        println!("aura-try: never taken on T8152");
         None
     } else {
         Some(unsafe { core::slice::from_raw_parts_mut(trial as *mut u8, trial_capacity) })

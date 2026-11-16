@@ -20,7 +20,9 @@ static char image[16];
 static int load_error, copy_error, freed, copied, loads, windows, recoveries, inits, trial_copy_error;
 static bool shutdown_ok, request, host, stage1_chained, recovery, recovery_host, marker, in_trial,
     trial_room = true;
-static int trials_started, trial_loads;
+static int trials_started, trial_loads, trial_offers;
+#define T8152 0x8152
+static unsigned int chip_id;
 #define CMDLINE_LENGTH_RV3 1024
 static struct { struct { char cmdline[CMDLINE_LENGTH_RV3]; } rv3; } cur_boot_args;
 static char trial_path[128];
@@ -63,6 +65,8 @@ static int rust_load_image(const char *spec, void **data, size_t *size, bool *pr
     assert(loads == 1 || !proxy_request);
     if (proxy_request)
         *proxy_request = request;
+    if (trial)
+        trial_offers++;
     /* A spent marker never comes back: only the first load may take it. */
     if (trial && !trial[0] && marker) {
         assert(trial_capacity > 4);
@@ -231,6 +235,29 @@ int main(void)
     assert(chainload_load("test", vars, &count, 1) == -1);
     assert(inits == 1 && loads == 1 && !copied && !next_stage.entry);
     fail_first_io = io_failed = false;
+    /* T8152 never takes a trial: no trial buffer is offered, so the marker is not even read */
+    chip_id = T8152;
+    marker = true;
+    shutdown_ok = true;
+    freed = copied = loads = trials_started = trial_loads = trial_offers = inits = failed_loads = 0;
+    next_stage.entry = NULL;
+    count = 0;
+    assert(chainload_load("test", vars, &count, 1) == 0);
+    assert(!trial_offers && !trials_started && !trial_loads && !in_trial && marker);
+    assert(loads == 1 && copied == 1 && next_stage.entry == (void *)1);
+    /* ... with aura-proxy and no host either */
+    request = true;
+    freed = copied = loads = windows = trial_offers = 0;
+    count = 0;
+    assert(chainload_load("test", vars, &count, 1) == 0);
+    assert(windows == 1 && loads == 2 && !trial_offers && !trials_started && marker);
+    request = false;
+    /* Other chips are unchanged: the same armed marker is taken */
+    chip_id = 0x8132;
+    freed = copied = loads = trials_started = trial_loads = trial_offers = 0;
+    count = 0;
+    assert(chainload_load("test", vars, &count, 1) == 0);
+    assert(trial_offers == 1 && trials_started == 1 && in_trial && !marker);
     return 0;
 }
 '''

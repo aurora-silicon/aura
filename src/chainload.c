@@ -395,8 +395,12 @@ int chainload_load(const char *spec, char **vars, size_t *var_cnt, size_t var_ca
     }
 
     bool proxy_request = false;
-    /* Only the first aura stage of a boot takes a trial: later ones already run in it. */
-    bool may_trial = !aura_trial_enabled();
+    /*
+     * Only the first aura stage of a boot takes a trial: later ones already run in it.
+     * T8152 never takes one: spending the marker is a write to the boot NVMe, and on J804
+     * that write leaves NVMe unusable. An aura-try file there is left alone and not read.
+     */
+    bool may_trial = !aura_trial_enabled() && chip_id != T8152;
     trial_path[0] = 0;
     ret = rust_load_image(spec, &image, &size, &proxy_request, may_trial ? trial_path : NULL,
                           sizeof(trial_path));

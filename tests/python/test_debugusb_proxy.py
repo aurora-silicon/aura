@@ -345,6 +345,8 @@ def test_stage1_tells_the_next_stage_about_its_window(tmp_path):
 #include <stdio.h>
 #include <string.h>
 #define DEBUGUSB_PROXY
+#define T8152 0x8152
+static unsigned int chip_id;
 static struct { void *entry; } next_stage;
 static char image[16];
 static bool offered, stage1_chained;
