@@ -4,6 +4,7 @@
 #define __KBOOT_AUDIO_H__
 
 int kboot_audio_amp_config(void *dt, const void *adt);
+int kboot_audio_amp_config_staged(void *dt, const void *adt);
 int kboot_audio_speaker_id(void *dt, const void *adt);
 
 #endif

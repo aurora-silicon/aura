@@ -11226,9 +11226,10 @@ static int dt_prepare_t8152(void)
      * This Mac's own values for what the kernel reads from the DT, ADT to FDT only, on every
      * T8152 boot path. Each one fails soft and is logged: a missing or odd ADT value leaves
      * the tree's property as it was (the amp copy, as on every other chip, removes one the ADT's
-     * amp group does not have). No node's status changes.
+     * amp group does not have). The amp copy is staged per group: all of a group's amps get
+     * their values or none does. No node's status changes.
      */
-    kboot_audio_amp_config(dt, adt);
+    kboot_audio_amp_config_staged(dt, adt);
     dt_set_pmp_t8152();
     dt_set_isp_adt_t8152();
     dt_set_gpu_perf_states_t8152(dt);

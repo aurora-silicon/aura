@@ -172,21 +172,35 @@ expect_id() { # expect_id <scenario>: the speaker-id line, then every modelled p
     esac
 }
 
+# Every scenario through both amp entry points: kboot_audio_amp_config() (every chip but T8152)
+# and kboot_audio_amp_config_staged() (T8152), which must give the same amps when the tree has
+# room.
 n=0
 for s in $(python3 -I tests/kboot_audio_adt.py scenarios); do
     python3 -I tests/kboot_audio_adt.py scenario "$s" "$tmp/$s.adt" "$tmp/$s.dts"
     ${DTC:-dtc} -q -I dts -O dtb -o "$tmp/$s.dtb" "$tmp/$s.dts"
-    KBOOT_AUDIO_GPIO=$(gpio_env "$s") "$tmp/kboot-audio-host" "$tmp/$s.adt" "$tmp/$s.dtb" \
-        > "$tmp/$s.out" 2>&1 || { cat "$tmp/$s.out"; fail "$s: host run"; }
-    grep -E '^(amp|speaker-id|gpio) ' "$tmp/$s.out" > "$tmp/$s.got" || true
     { expect "$s"; expect_id "$s"; } > "$tmp/$s.want"
-    if ! cmp -s "$tmp/$s.got" "$tmp/$s.want"; then
-        cat "$tmp/$s.out"
-        diff -u "$tmp/$s.want" "$tmp/$s.got" || true
-        fail "$s"
-    fi
-    echo "ok $s: $(grep -v -E '^(amp|speaker-id|gpio) ' "$tmp/$s.out" | tail -n 1)"
+    for mode in direct staged; do
+        arg=
+        [ "$mode" = staged ] && arg=staged
+        KBOOT_AUDIO_GPIO=$(gpio_env "$s") "$tmp/kboot-audio-host" "$tmp/$s.adt" "$tmp/$s.dtb" \
+            $arg > "$tmp/$s.$mode.out" 2>&1 ||
+            { cat "$tmp/$s.$mode.out"; fail "$s ($mode): host run"; }
+        grep -E '^(amp|speaker-id|gpio) ' "$tmp/$s.$mode.out" > "$tmp/$s.$mode.got" || true
+        if ! cmp -s "$tmp/$s.$mode.got" "$tmp/$s.want"; then
+            cat "$tmp/$s.$mode.out"
+            diff -u "$tmp/$s.want" "$tmp/$s.$mode.got" || true
+            fail "$s ($mode)"
+        fi
+        echo "ok $s ($mode): $(grep -v -E '^(amp|speaker-id|gpio) ' "$tmp/$s.$mode.out" | tail -n 1)"
+    done
     n=$((n + 1))
 done
 [ "$n" -gt 0 ] || fail "no scenarios ran"
-echo "kboot audio: $n scenarios pass"
+
+# A tree that runs out of room partway through the six-amp group: the staged copy must leave
+# every amp all written or all as it was
+"$tmp/kboot-audio-host" nospace "$tmp/six-amps.adt" "$tmp/six-amps.dtb" > "$tmp/nospace.out" 2>&1 ||
+    { tail -n 20 "$tmp/nospace.out"; fail "nospace"; }
+echo "ok $(grep '^nospace:' "$tmp/nospace.out")"
+echo "kboot audio: $n scenarios pass, both amp entry points; nospace passes"

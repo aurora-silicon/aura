@@ -14,9 +14,10 @@ device tree (every value made up):
 - the copy reaches a tree it is not for (another board, a node with another compatible);
 - the cells come out in the wrong order or byte order (fuse76, fuse532, fuse549; <hz mV>).
 
-The amp copy itself (kboot_audio_amp_config(), six amps matched by I2C address 0x38-0x3d in the
-ADT's group order) is covered by tests/run-kboot-audio.sh, scenario six-amps; here only its call
-site is checked.
+The amp copy itself (kboot_audio_amp_config_staged() on T8152, six amps matched by I2C address
+0x38-0x3d in the ADT's group order, all of a group's amps or none of them) is covered by
+tests/run-kboot-audio.sh, scenarios six-amps and nospace; here only its call sites are checked:
+T8152 takes the staged copy, every other chip keeps kboot_audio_amp_config().
 """
 
 from pathlib import Path
@@ -142,7 +143,7 @@ def test_t8152_call_sites_and_room():
     source = (ROOT / "src/kboot.c").read_text()
     body = extract(source, "static int dt_prepare_t8152(void)\n{", "\n}\n")
     minimal = extract(body, 'if (fdt_getprop(dt, 0, "aurora,minimal-boot", NULL)) {', "\n    }\n")
-    calls = ("kboot_audio_amp_config(dt, adt);", "dt_set_pmp_t8152();",
+    calls = ("kboot_audio_amp_config_staged(dt, adt);", "dt_set_pmp_t8152();",
              "dt_set_isp_adt_t8152();", "dt_set_gpu_perf_states_t8152(dt);")
     for call in calls:
         # Once, outside the minimal-boot branch, never as a condition that can end the boot,
@@ -151,6 +152,12 @@ def test_t8152_call_sites_and_room():
         assert body.count(call) == 1, call
         assert re.search(r"\n    " + re.escape(call) + r"\n", body), call
         assert body.index(call) < body.index("dt_set_memory()") < body.index("fdt_pack(dt)")
+    # The staged amp copy is T8152's alone; every other chip keeps the direct one, once.
+    assert "kboot_audio_amp_config(dt, adt);" not in body
+    assert source.count("kboot_audio_amp_config_staged(dt, adt);") == 1
+    assert source.count("kboot_audio_amp_config(dt, adt);") == 1
+    other = extract(source, "        return dt_prepare_t8152();", "if (dt_set_cpus())")
+    assert re.search(r"\n    kboot_audio_amp_config\(dt, adt\);\n", other)
     prepare = extract(source, "int kboot_prepare_dt(void *fdt)", "dt = memalign(")
     assert re.search(r"if \(chip_id == T8152\)\s*\n\s*dt_bufsize \+= 4 \* SZ_16K;", prepare)
     # The pmp copy writes values only.
