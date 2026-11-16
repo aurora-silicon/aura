@@ -11124,6 +11124,197 @@ static int dt_set_display_t8152(void)
     return 0;
 }
 
+/*
+ * J804 (T8152) camera, first half: keep the firmware iBoot preloaded and tell the kernel where it
+ * is. Nothing is powered, mapped or started here; the ISP node and its DARTs keep the status the
+ * device tree gave them (disabled until the kernel has an RTKit transport for this coprocessor).
+ *
+ * The ADT describes the ISP as an RTKit coprocessor (iop-isp,ascwrap-v8 with an iop-isp-nub
+ * child, pre-loaded = 1) whose segment-ranges name exactly __TEXT and __DATA, both in DRAM below
+ * the memory the OS is given, the way the video encoder's firmware is. The device tree comes with
+ * the J713-style contract: empty placeholders /reserved-memory/isp-firmware-text and
+ * isp-firmware-data and an isp-heap window (iommu-addresses only), referenced by the ISP node as
+ * its "text", "data" and "heap" memory regions. Fill the two placeholders from this boot's ADT:
+ * reg (no-map), and iommu-addresses where the firmware runs the segment (its remap address).
+ * Publish the CRC-32 of each reserved range in /chosen (aurora,isp-text-crc32 and
+ * aurora,isp-data-crc32, as the AVE ones) so the OS can prove nothing reused that RAM, the ADT
+ * sensor-type as apple,platform-id and the nub's firmware UUID as apple,firmware-uuid.
+ *
+ * Every check that fails leaves the device tree as it was (the placeholders stay empty) and the
+ * boot goes on without a camera.
+ */
+static const char *j804_isp_why;
+
+static int dt_set_j804_isp_one(unsigned int unused)
+{
+    static const char dt_names[] = "text\0data\0heap";
+    static const char adt_names[] = "__TEXT;__DATA";
+    static const char *const paths[] = {"/reserved-memory/isp-firmware-text",
+                                        "/reserved-memory/isp-firmware-data",
+                                        "/reserved-memory/isp-heap"};
+    static const char *const crc_props[] = {"aurora,isp-text-crc32", "aurora,isp-data-crc32"};
+    const struct adt_segment_ranges *segments, *nub_segments;
+    const fdt32_t *refs, *map;
+    const fdt64_t *reg;
+    u64 phys[2], iova[2], size[2], heap_base, heap_size, dram_base, dram_size, vm_base, vm_size;
+    u32 isp_phandle, sensor, preloaded, len, nub_len;
+    int isp, node, bytes;
+
+    UNUSED(unused);
+
+    /* The kernel's side of the contract: three named regions, two of them empty. */
+    j804_isp_why = "the ISP memory regions are not text, data and heap";
+    isp = fdt_node_offset_by_compatible(dt, -1, "apple,t8152-isp");
+    if (isp < 0)
+        return -1;
+    isp_phandle = fdt_get_phandle(dt, isp);
+    const char *names = fdt_getprop(dt, isp, "memory-region-names", &bytes);
+    if (!isp_phandle || !names || bytes != sizeof(dt_names) ||
+        memcmp(names, dt_names, sizeof(dt_names)))
+        return -1;
+    refs = fdt_getprop(dt, isp, "memory-region", &bytes);
+    if (!refs || bytes != 3 * sizeof(*refs))
+        return -1;
+    for (int i = 0; i < 3; i++) {
+        node = fdt_path_offset(dt, paths[i]);
+        if (node < 0 || fdt_node_offset_by_phandle(dt, fdt32_ld(refs + i)) != node)
+            return -1;
+        if (i < 2) {
+            j804_isp_why = "a firmware placeholder is already filled";
+            reg = fdt_getprop(dt, node, "reg", &bytes);
+            if (reg && (bytes != 2 * sizeof(*reg) || fdt64_ld(reg) || fdt64_ld(reg + 1)))
+                return -1;
+            j804_isp_why = "the ISP memory regions are not text, data and heap";
+        }
+    }
+
+    /* The firmware's window: it must start at the ISP DART's vm-base and fit its vm-size. */
+    j804_isp_why = "the isp-heap window does not match the ADT dart-isp window";
+    map = fdt_getprop(dt, fdt_path_offset(dt, paths[2]), "iommu-addresses", &bytes);
+    if (!map || bytes != 5 * sizeof(*map) || fdt32_ld(map) != isp_phandle)
+        return -1;
+    heap_base = ((u64)fdt32_ld(map + 1) << 32) | fdt32_ld(map + 2);
+    heap_size = ((u64)fdt32_ld(map + 3) << 32) | fdt32_ld(map + 4);
+    int adt_dart = adt_path_offset(adt, "/arm-io/dart-isp");
+    if (adt_dart < 0 || ADT_GETPROP(adt, adt_dart, "vm-base", &vm_base) != sizeof(vm_base) ||
+        ADT_GETPROP(adt, adt_dart, "vm-size", &vm_size) != sizeof(vm_size) ||
+        heap_base != vm_base || !heap_size || heap_size > vm_size || (heap_size & (SZ_16K - 1)))
+        return -1;
+
+    /* The boot firmware's side: a preloaded RTKit image of exactly __TEXT and __DATA. */
+    j804_isp_why = "the ADT does not describe a preloaded __TEXT;__DATA ISP firmware";
+    int chosen = adt_path_offset(adt, "/chosen");
+    int adt_isp = adt_path_offset(adt, "/arm-io/isp");
+    int adt_nub = adt_path_offset(adt, "/arm-io/isp/iop-isp-nub");
+    if (chosen < 0 || adt_isp < 0 || adt_nub < 0 ||
+        ADT_GETPROP(adt, chosen, "dram-base", &dram_base) != sizeof(dram_base) ||
+        ADT_GETPROP(adt, chosen, "dram-size", &dram_size) != sizeof(dram_size) || !dram_size ||
+        dram_base > UINT64_MAX - dram_size)
+        return -1;
+    if (ADT_GETPROP(adt, adt_nub, "pre-loaded", &preloaded) != sizeof(preloaded) || preloaded != 1)
+        return -1;
+    const char *segment_names = adt_getprop(adt, adt_isp, "segment-names", &len);
+    if (!segment_names || len != sizeof(adt_names) || memcmp(segment_names, adt_names, len))
+        return -1;
+    segments = adt_getprop(adt, adt_isp, "segment-ranges", &len);
+    nub_segments = adt_getprop(adt, adt_nub, "segment-ranges", &nub_len);
+    if (!segments || len != 2 * sizeof(*segments) || !nub_segments || nub_len != len ||
+        memcmp(segments, nub_segments, len))
+        return -1;
+    if (ADT_GETPROP(adt, adt_isp, "sensor-type", &sensor) != sizeof(sensor) || !sensor)
+        return -1;
+    /* The firmware's identity is published when the nub carries it; it is not required. */
+    const char *uuid = adt_getprop(adt, adt_nub, "uuid", &len);
+    if (uuid && (len != 37 || uuid[len - 1]))
+        uuid = NULL;
+
+    /*
+     * Both segments whole in DRAM and below the memory the OS is given (iBoot's own area: nothing
+     * this loader or the kernel allocates from), 16K-granular, not overlapping.
+     */
+    j804_isp_why = "a firmware segment is not in DRAM below the OS memory";
+    for (int i = 0; i < 2; i++) {
+        phys[i] = segments[i].phys;
+        iova[i] = segments[i].remap;
+        size[i] = ALIGN_UP((u64)segments[i].size, SZ_16K);
+        if (!segments[i].size || size[i] > heap_size || (phys[i] & (SZ_16K - 1)) ||
+            (iova[i] & (SZ_16K - 1)) || phys[i] < dram_base || size[i] > dram_size ||
+            phys[i] - dram_base > dram_size - size[i] ||
+            phys[i] + size[i] > cur_boot_args.phys_base)
+            return -1;
+    }
+    /* TEXT at the start of the firmware's window, DATA right above it, both below its top. */
+    j804_isp_why = "the firmware segments do not fit the isp-heap window";
+    if (iova[0] != heap_base || iova[1] != iova[0] + size[0] ||
+        size[1] > heap_base + heap_size - iova[1] ||
+        (phys[0] < phys[1] + size[1] && phys[1] < phys[0] + size[0]))
+        return -1;
+
+    j804_isp_why = "the device tree could not be updated";
+    for (int i = 0; i < 2; i++) {
+        fdt64_t range[2] = {cpu_to_fdt64(phys[i]), cpu_to_fdt64(size[i])};
+        char value[9];
+        int ret;
+
+        /* The CRC covers exactly the bytes of the node's reg. */
+        u32 crc = tinf_crc32((void *)phys[i], size[i]);
+
+        node = fdt_path_offset(dt, paths[i]);
+        if (node < 0 || fdt_setprop(dt, node, "reg", range, sizeof(range)))
+            return -1;
+        node = fdt_path_offset(dt, paths[i]);
+        if (node < 0 || fdt_setprop_empty(dt, node, "no-map"))
+            return -1;
+        node = fdt_path_offset(dt, paths[i]);
+        ret = node < 0 ? node : fdt_delprop(dt, node, "iommu-addresses");
+        if (ret && ret != -FDT_ERR_NOTFOUND)
+            return -1;
+        node = fdt_path_offset(dt, paths[i]);
+        if (node < 0 || dt_device_set_reserved_mem(node, paths[i], isp_phandle, iova[i], size[i]))
+            return -1;
+
+        snprintf(value, sizeof(value), "%08x", crc);
+        node = fdt_path_offset(dt, "/chosen");
+        if (node < 0 || fdt_setprop_string(dt, node, crc_props[i], value))
+            return -1;
+        printf("FDT: J804 ISP %s at 0x%lx (+0x%lx), runs at 0x%lx, CRC-32 %s\n",
+               i ? "DATA" : "TEXT", phys[i], size[i], iova[i], value);
+    }
+    isp = fdt_node_offset_by_phandle(dt, isp_phandle);
+    if (isp < 0 || fdt_setprop_u32(dt, isp, "apple,platform-id", sensor))
+        return -1;
+    isp = fdt_node_offset_by_phandle(dt, isp_phandle);
+    if (isp < 0 || (uuid && fdt_setprop_string(dt, isp, "apple,firmware-uuid", uuid)))
+        return -1;
+    printf("FDT: J804 ISP firmware %s kept, platform ID 0x%x, window 0x%lx (+0x%lx); "
+           "the ISP is not started\n",
+           uuid ? uuid : "(no UUID)", sensor, heap_base, heap_size);
+    return 0;
+}
+
+/*
+ * Only a J804 tree with the ISP node and the placeholders is a target; any other tree is left as
+ * it is. A refused handoff leaves the placeholders empty and makes sure the ISP node is disabled:
+ * a kernel must not start a camera coprocessor whose firmware was not kept.
+ */
+static void dt_set_j804_isp(void)
+{
+    if (fdt_node_check_compatible(dt, 0, "apple,j804"))
+        return;
+    if (fdt_node_offset_by_compatible(dt, -1, "apple,t8152-isp") < 0 ||
+        fdt_path_offset(dt, "/reserved-memory/isp-firmware-text") < 0)
+        return;
+    j804_isp_why = "out of memory";
+    if (!dt_display_transaction(dt_set_j804_isp_one, 0))
+        return;
+    printf("FDT: J804 ISP firmware not handed over: %s\n", j804_isp_why);
+    int isp = fdt_node_offset_by_compatible(dt, -1, "apple,t8152-isp");
+    const char *status = isp < 0 ? NULL : fdt_getprop(dt, isp, "status", NULL);
+    if (isp >= 0 && (!status || strcmp(status, "disabled")) &&
+        fdt_setprop_string(dt, isp, "status", "disabled"))
+        printf("FDT: J804 ISP could not be disabled\n");
+}
+
 static int dt_prepare_t8152(void)
 {
     if (fdt_getprop(dt, 0, "aurora,minimal-boot", NULL)) {
@@ -11133,6 +11324,8 @@ static int dt_prepare_t8152(void)
             bail("FDT: T8152 requires the t8122 AIC3 fallback\n");
         if (dt_set_serial_number() || dt_set_display_t8152() || dt_set_gpu(dt))
             return -1;
+        /* The camera's preloaded firmware: keep it and export its CRCs; never fatal. */
+        dt_set_j804_isp();
         /* The video encoder's preloaded firmware: reserve it and export its CRCs. */
         if (dt_set_ave())
             return -1;
