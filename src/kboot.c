@@ -11963,17 +11963,25 @@ int kboot_boot(void *kernel)
         }
     }
     if (chip_id == T6050 && ret < 0) {
-        /* A stop may mean storage moved under nvme-apple; the port's state is unknown either way */
+        /* A stop may mean storage moved under nvme-apple; the port's state is unknown either way.
+         * Only on a board with a required port: elsewhere a stop is a positive result (pcie.h). */
         printf("kboot: refusing T6050 handoff after the apcie0 port 2 bring-up stopped\n");
         return -1;
     }
+    if (chip_id == T6050 && ret > 0)
+        printf("kboot: T6050: GP ports %s; booting on\n",
+               ret == PCIE_T6050_LEFT ? "left for the OS" : "stopped, the down ones disabled");
     /* prepare_dt packed the tree: reopen it into its spare capacity for the status edits */
     if (chip_id == T6050 &&
         (fdt_open_into(dt, dt, dt_bufsize) || pcie_t6050_handoff_fdt(dt) || fdt_pack(dt))) {
         printf("kboot: refusing T6050 handoff: could not mark the down PCIe ports\n");
         return -1;
     }
-    /* Linux's deep sleep needs them to bring ANS's APCIe block back. */
+    /*
+     * Linux's deep sleep needs them to bring ANS's APCIe block back. Not with the T6050 GP side
+     * left for the OS (PCIE_T6050_LEFT): the host then carries the OS train's apple,tunable-*
+     * lists as (offset, 4, mask, value), which these (offset, mask, value) tables would replace.
+     */
     if (!ret && pcie_apcie_tables_fdt(dt, dt_bufsize) < 0)
         printf("kboot: APCIe tables not published; deep sleep stays refused\n");
     if (chip_id == T8140) {
