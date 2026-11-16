@@ -116,6 +116,7 @@ KNOWN_ENV = {
     "AURA_S2R_PROBE_AT",
     "AURA_S2R_CRUMBS",
     "AURA_S2R_EXTRA",
+    "AURA_AURA_HEAP_MIB",
     "AURA_KEEP_EXCLAVES",
     "AURA_OS_LONG_VERSION",
     "AURA_KEEP_BOOT_VIDEO",
@@ -811,7 +812,11 @@ def main():
     iface = UartInterface()
     p = AuraProxy(iface, debug=False)
     bootstrap_port(iface, p)
-    u = ProxyUtils(p, heap_size=128 * 1024 * 1024)
+    # J813 under the padded el2 objects: aura's carve-out is only 160 MiB (its floor is above
+    # the 128 MiB execute window), and aura has used ~33 MiB of it by now, so the default 128 MiB
+    # reservation for aura's own heap reached into SPTM's window and sptm_virt_load refused.
+    u = ProxyUtils(p, heap_size=128 * 1024 * 1024,
+                   aura_heap=int(os.environ.get("AURA_AURA_HEAP_MIB", "112")) * 1024 * 1024)
     sym = Symbols(args.nm, args.elf, p.get_base())
 
     # SPTM's managed window, as aura computed it: above aura and everything iBoot left low,

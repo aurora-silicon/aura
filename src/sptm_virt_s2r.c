@@ -985,6 +985,8 @@ static bool s2r_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int w
     const char *what = s2r_page_name(addr & ~0x3fffUL, &first);
     bool timer = write && width <= 3 && *val == 1 && !strcmp(what, "pmgr-aon-pst") &&
                  (addr & 0x7fff) == S2R_TIMER_OFF && s2r_armed();
+    /* AURA_S2R_GO_COUNT here too (J813): after n go-mode wakes, the next commit stops like stop
+     * mode, so the ring holds the sleep, the wake and the next entry for the proxy to read. */
     if (timer && (!s2r_go || (sptm_virt_s2r_go_count && s2r_wake_count >= sptm_virt_s2r_go_count))) {
         sptm_virt_rg_stop_wd2();
         sptm_virt_s2r_note(ctx, addr, *val, true, width);
@@ -1700,7 +1702,10 @@ void sptm_virt_s2r_setup(bool cdc)
         return;
     }
     /* A timer-only sleep has no stop before the commit to read a ring from: keep it all. */
-    u64 ring_bytes = s2r_soc->timer_only ? S2R_RING_BYTES_BIG : S2R_RING_BYTES;
+    /* With AURA_S2R_GO_COUNT the ring must hold a sleep, its wake and the next entry. */
+    u64 ring_bytes = s2r_soc->timer_only         ? S2R_RING_BYTES_BIG
+                     : sptm_virt_s2r_go_count ? (48UL << 20)
+                                              : S2R_RING_BYTES;
     if (!s2r_ring_alloc(ring_bytes)) {
         printf("SPTM-virt[s2r]: no memory for the ring; sleep path off\n");
         sptm_virt_flags &= ~SPTM_VIRT_S2R;
