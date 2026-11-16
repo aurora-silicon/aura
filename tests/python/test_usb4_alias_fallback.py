@@ -110,3 +110,92 @@ def test_usb4_pcie_adapter_alias_fallback(tmp_path):
     result = subprocess.run([str(binary)], capture_output=True, text=True)
     assert result.returncode == 0, result.stdout + result.stderr
     assert "PASS usb4 alias fallback" in result.stdout
+
+
+PCIEC_HARNESS = r'''
+#include <assert.h>
+#include <stdio.h>
+#include <string.h>
+#include "libfdt.h"
+#define MAX_CIO_DEVS 8
+static unsigned char blob[8192];
+static void *dt=blob;
+static char seen[MAX_CIO_DEVS][32];
+static int count;
+static int dt_copy_pciec_tunables(const char *adt_path, const char *alias)
+{
+    int port=-1;
+    assert(sscanf(adt_path,"/arm-io/apciec%d",&port)==1);
+    assert(port>=0 && port<MAX_CIO_DEVS);
+    const char *target=fdt_get_alias(dt,alias);
+    if (!target) return -1;
+    assert(fdt_path_offset(dt,target)>=0);
+    snprintf(seen[port],sizeof(seen[port]),"%s",target);
+    count++;
+    return 0;
+}
+static void tree(void)
+{
+    assert(!fdt_create_empty_tree(dt,sizeof(blob)));
+    assert(fdt_add_subnode(dt,0,"aliases")>=0);
+    assert(fdt_add_subnode(dt,0,"legacy")>=0);
+    assert(fdt_add_subnode(dt,0,"hyphen")>=0);
+    memset(seen,0,sizeof(seen));count=0;
+}
+static void alias(const char *name,const char *target)
+{
+    assert(!fdt_setprop_string(dt,fdt_path_offset(dt,"/aliases"),name,target));
+}
+static void execute(void);
+'''
+
+PCIEC_MAIN = r'''
+static void execute(void)
+{
+    unsigned char before[sizeof(blob)];memcpy(before,blob,sizeof(blob));
+    assert(dt_set_pcie_tunables()==0);
+    assert(!memcmp(before,blob,sizeof(blob)));
+}
+int main(void)
+{
+    tree();alias("usb4-0-pcie","/hyphen");execute();
+    assert(count==1 && !strcmp(seen[0],"/hyphen"));
+    tree();alias("usb4_0_pcie","/legacy");execute();
+    assert(count==1 && !strcmp(seen[0],"/legacy"));
+    tree();alias("usb4_0_pcie","/legacy");alias("usb4-0-pcie","/hyphen");execute();
+    assert(count==1 && !strcmp(seen[0],"/legacy"));
+    tree();execute();assert(count==0);
+    tree();alias("usb4_0_pcie","/legacy");alias("usb4-1-pcie","/hyphen");
+    alias("usb4-7-pcie","/hyphen");execute();
+    assert(count==3 && !strcmp(seen[0],"/legacy") && !strcmp(seen[1],"/hyphen"));
+    assert(!seen[2][0] && !seen[6][0] && !strcmp(seen[7],"/hyphen"));
+    puts("PASS PCIe-C legacy/hyphen priority, mixed ports and unchanged FDT");
+}
+'''
+
+
+def test_usb4_pcie_alias_fallback_and_old_lookup_control(tmp_path):
+    source = (ROOT / "src/kboot.c").read_text()
+    start = source.index("static int dt_set_pcie_tunables(void)")
+    function = source[start:source.index("\n}", start) + 2] + "\n"
+    libfdt = ROOT / "src/libfdt"
+    sources = [str(libfdt / name) for name in (
+        "fdt.c", "fdt_ro.c", "fdt_rw.c", "fdt_sw.c", "fdt_wip.c", "fdt_empty_tree.c", "fdt_strerror.c",
+    )]
+
+    def replay(name, code):
+        cfile = tmp_path / (name + ".c")
+        cfile.write_text(PCIEC_HARNESS + code + PCIEC_MAIN)
+        binary = tmp_path / name
+        subprocess.run(["cc", "-D_GNU_SOURCE", "-std=gnu11", "-Wall", "-Wextra", "-Werror",
+                        "-I", str(libfdt), str(cfile), *sources, "-o", str(binary)], check=True)
+        return subprocess.run([str(binary)], capture_output=True, text=True)
+
+    result = replay("pciec-alias", function)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "PASS PCIe-C" in result.stdout
+    fallback = ('        if (!fdt_get_alias(dt, fdt_alias))\n'
+                '            snprintf(fdt_alias, sizeof(fdt_alias), "usb4-%d-pcie", i);\n')
+    assert function.count(fallback) == 1
+    result = replay("old-lookup-control", function.replace(fallback, ""))
+    assert result.returncode != 0 and "Assertion" in result.stderr
