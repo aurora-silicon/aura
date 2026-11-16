@@ -11895,6 +11895,334 @@ static int dt_set_j804_dcp_handoff(void)
     return dt_display_transaction(dt_set_j804_dcp_handoff_one, 0);
 }
 
+/*
+ * J804 (T8152) audio coprocessor (AOP) hand-off for the apple,t8152-aop kernel driver. Opt-in with
+ * the kernel argument apple_aop.t8152_stage=N, N = 1, 2 or 3: the argument the kernel's driver
+ * reads as well. Without it nothing below is read and the AOP nodes keep the status the device
+ * tree gave them (disabled).
+ *
+ * Unlike T6040/T6041/T8132 (dt_set_aop_firmware) there is nothing to reserve or to fill in. As on
+ * T8140, the firmware is started with what iBoot left: its boot arguments are not patched, and the
+ * DRAM segments iBoot mapped for it (__EDATA, __SHARED, __EDATA_S) lie below the memory the OS is
+ * given. What the kernel needs from the loader is the proof that this boot is in the state its
+ * driver starts from. It is made with reads only:
+ *
+ *   - the device tree names the wrapper, the SRAM, both mailbox windows, the IOMMU and its
+ *     streams, and (stage 3) the microphone DMA controller where this boot's ADT has them;
+ *   - the AOP is halted (CPU control without the run bit): the kernel starts it, once per boot;
+ *   - both mailboxes are idle (nothing waiting, every send slot free);
+ *   - dart-sbr translates every stream the stage uses (0 AOP, 1 setup arena, and for stage 3
+ *     39, the microphone DMA) through a valid root in DRAM. Its lock word is reported, not
+ *     required: the kernel adopts this DART (apple,adopt-only) and never resets it.
+ *
+ * Then the nodes of the requested stage are enabled: the IOMMU, the two mailboxes and the AOP for
+ * stages 1 and 2 (the kernel argument alone decides whether the audio device is created), and for
+ * stage 3 also the DMA controller and the power-domain leaves the audio node names. Nothing is
+ * started, powered, mapped or written to hardware here. A check that fails leaves every node
+ * disabled and says why; the boot goes on without the microphones.
+ */
+#define J804_AOP_CPU_CONTROL 0x44
+#define J804_AOP_CPU_RUN     BIT(4)
+#define J804_MBOX_STATUS     0x20
+#define J804_MBOX_WAITING    GENMASK(3, 0)
+#define J804_MBOX_FREE       GENMASK(11, 8)
+#define J804_MBOX_SLOTS      8
+#define J804_DART_PROTECT    0x200
+#define J804_DART_ENABLE     0xc00
+#define J804_DART_TCR        0x1000
+#define J804_DART_TTBR       0x1400
+/* The secure-assigned image of an /arm-io block: its direct address + this (ADT pmap-io-ranges). */
+#define J804_SECURE_IMAGE 0x40000000UL
+
+static const char *j804_aop_why;
+static char j804_aop_paths[8][96];
+static unsigned int j804_aop_npaths;
+
+static int j804_aop_reg(int node, int idx, u64 *base, u64 *size)
+{
+    int len;
+    const fdt64_t *reg = node < 0 ? NULL : fdt_getprop(dt, node, "reg", &len);
+
+    if (!reg || len < (int)((idx + 1) * 2 * sizeof(*reg)))
+        return -1;
+    *base = fdt64_ld(reg + 2 * idx);
+    *size = fdt64_ld(reg + 2 * idx + 1);
+    return 0;
+}
+
+/* The node a one-cell-argument phandle list entry points at, and its argument. */
+static int j804_aop_ref(int node, const char *prop, int idx, int cells, u32 *arg)
+{
+    int len;
+    const fdt32_t *list = node < 0 ? NULL : fdt_getprop(dt, node, prop, &len);
+
+    if (!list || len < (int)((idx + 1) * cells * sizeof(*list)))
+        return -1;
+    if (arg)
+        *arg = cells > 1 ? fdt32_ld(list + idx * cells + 1) : 0;
+    return fdt_node_offset_by_phandle(dt, fdt32_ld(list + idx * cells));
+}
+
+static int j804_aop_enable(int node)
+{
+    if (node < 0 || j804_aop_npaths >= ARRAY_SIZE(j804_aop_paths) ||
+        fdt_get_path(dt, node, j804_aop_paths[j804_aop_npaths], sizeof(j804_aop_paths[0])))
+        return -1;
+    j804_aop_npaths++;
+    return 0;
+}
+
+/* Every mailbox interrupt the device tree names must be one of the ADT node's. */
+static int j804_aop_irqs(int node, int adt_node)
+{
+    u32 adt_irqs[3];
+    int len;
+    const fdt32_t *irqs = fdt_getprop(dt, node, "interrupts", &len);
+
+    if (!irqs || len <= 0 || len % (3 * sizeof(*irqs)) ||
+        ADT_GETPROP_ARRAY(adt, adt_node, "interrupts", adt_irqs) != sizeof(adt_irqs))
+        return -1;
+    for (int i = 0; i < len / (int)(3 * sizeof(*irqs)); i++) {
+        u32 irq = fdt32_ld(irqs + 3 * i + 1);
+
+        if (irq != adt_irqs[0] && irq != adt_irqs[1] && irq != adt_irqs[2])
+            return -1;
+    }
+    return 0;
+}
+
+static int j804_aop_commit(unsigned int unused)
+{
+    UNUSED(unused);
+    for (unsigned int i = 0; i < j804_aop_npaths; i++) {
+        int node = fdt_path_offset(dt, j804_aop_paths[i]);
+
+        if (node < 0 || fdt_setprop_string(dt, node, "status", "okay"))
+            return -1;
+    }
+    return 0;
+}
+
+static int dt_set_j804_aop_check(unsigned int stage)
+{
+    static const char *const mappers[] = {"/arm-io/dart-sbr/mapper-aop",
+                                          "/arm-io/dart-sbr/mapper-exclave-aop",
+                                          "/arm-io/dart-sbr/mapper-admac-leap-s"};
+    int trace[8];
+    u64 base, size, adt_base, adt_size, bank, bank_size, dram_base, dram_size, raw[2];
+    u32 sid[3], num, arg, postoffice, alias, words[9];
+    unsigned int nsid = stage >= 3 ? 3 : 2;
+
+    j804_aop_npaths = 0;
+
+    j804_aop_why = "the device tree does not have the AOP, its two mailboxes and its IOMMU";
+    int aop = fdt_node_offset_by_compatible(dt, -1, "apple,t8152-aop");
+    int mbox = j804_aop_ref(aop, "mboxes", 0, 1, NULL);
+    int setup = j804_aop_ref(aop, "mboxes", 1, 1, NULL);
+    int dart = j804_aop_ref(aop, "iommus", 0, 2, &sid[0]);
+    if (aop < 0 || mbox < 0 || setup < 0 || dart < 0 ||
+        fdt_node_check_compatible(dt, mbox, "apple,t8152-aop-mailbox") ||
+        fdt_node_check_compatible(dt, setup, "apple,t8152-aop-setup-mailbox") ||
+        fdt_node_check_compatible(dt, dart, "apple,t8152-dart") ||
+        !fdt_getprop(dt, dart, "apple,adopt-only", NULL) ||
+        j804_aop_ref(setup, "iommus", 0, 2, &sid[1]) != dart)
+        return -1;
+
+    j804_aop_why = "the ADT has no DRAM bounds";
+    int chosen = adt_path_offset(adt, "/chosen");
+    if (chosen < 0 || ADT_GETPROP(adt, chosen, "dram-base", &dram_base) != sizeof(dram_base) ||
+        ADT_GETPROP(adt, chosen, "dram-size", &dram_size) != sizeof(dram_size) ||
+        dram_size < SZ_16K || dram_base > UINT64_MAX - dram_size)
+        return -1;
+
+    /* The AOP: "mmio" is the SRAM (ADT reg[3]), "asc" the wrapper (ADT reg[0]). */
+    j804_aop_why = "the AOP node does not match the ADT /arm-io/aop windows";
+    int adt_aop = adt_path_offset_trace(adt, "/arm-io/aop", trace);
+    if (adt_aop < 0 || !adt_is_compatible(adt, adt_aop, "iop,ascwrap-v8") ||
+        adt_get_reg(adt, trace, "reg", 3, &adt_base, &adt_size) ||
+        j804_aop_reg(aop, 0, &base, &size) || base != adt_base || !size || size > adt_size)
+        return -1;
+    u64 wrapper;
+    if (adt_get_reg(adt, trace, "reg", 0, &adt_base, &adt_size) ||
+        j804_aop_reg(aop, 1, &wrapper, &size) || wrapper != adt_base ||
+        size < J804_AOP_CPU_CONTROL + 4 || size > adt_size)
+        return -1;
+
+    /*
+     * The ordinary mailbox: window (2 * msgbox-mailbox-num + 1) * 0x80 of the bank at ADT reg[2]
+     * (not on the post office, first register bank: the rule of asc.c).
+     */
+    j804_aop_why = "the AOP mailbox node does not match the ADT";
+    u64 mbox_base, setup_base;
+    if (adt_get_reg(adt, trace, "reg", 2, &bank, &bank_size) ||
+        ADT_GETPROP(adt, adt_aop, "msgbox-mailbox-num", &num) != sizeof(num) ||
+        ADT_GETPROP(adt, adt_aop, "msgbox-using-postoffice", &postoffice) != sizeof(postoffice) ||
+        ADT_GETPROP(adt, adt_aop, "msgbox-using-alias", &alias) != sizeof(alias) || !alias ||
+        j804_aop_reg(mbox, 0, &mbox_base, &size) || size != 0x80 ||
+        mbox_base != bank + (2 * (u64)num + !postoffice) * 0x80 ||
+        mbox_base + size > bank + bank_size || j804_aop_irqs(mbox, adt_aop))
+        return -1;
+
+    /*
+     * The second mailbox: the ADT gives its window as an absolute address (the secure-assigned
+     * image of the page after the ordinary bank), so its reg is used as it stands, without the
+     * /arm-io translation.
+     */
+    j804_aop_why = "the AOP setup mailbox node does not match the ADT aop-exclave-mailbox";
+    int adt_setup = adt_path_offset(adt, "/arm-io/aop-exclave-mailbox");
+    if (adt_setup < 0 || ADT_GETPROP_ARRAY(adt, adt_setup, "reg", raw) != sizeof(raw) ||
+        ADT_GETPROP(adt, adt_setup, "msgbox-mailbox-num", &num) != sizeof(num) ||
+        ADT_GETPROP(adt, adt_setup, "msgbox-using-postoffice", &postoffice) != sizeof(postoffice) ||
+        j804_aop_reg(setup, 0, &setup_base, &size) || size != 0x80 ||
+        setup_base != raw[0] + (2 * (u64)num + !postoffice) * 0x80 ||
+        setup_base + size > raw[0] + raw[1] || raw[0] != bank + bank_size + J804_SECURE_IMAGE ||
+        j804_aop_irqs(setup, adt_setup))
+        return -1;
+
+    /* The IOMMU and the streams, by the ADT's mapper nodes. */
+    j804_aop_why = "the IOMMU node or a stream number does not match the ADT dart-sbr";
+    u64 dart_base, dart_size;
+    if (adt_path_offset_trace(adt, "/arm-io/dart-sbr", trace) < 0 ||
+        adt_get_reg(adt, trace, "reg", 0, &adt_base, &adt_size) ||
+        j804_aop_reg(dart, 0, &dart_base, &dart_size) || dart_base != adt_base ||
+        dart_size > adt_size || dart_size < J804_DART_TTBR + 4 * 64)
+        return -1;
+
+    int admac = -1;
+    if (stage >= 3) {
+        /*
+         * The microphone DMA controller, through its secure-assigned image: the ADT's proxy node
+         * gives that window and the receive channel (Linux channel 2 * n + 1).
+         */
+        j804_aop_why = "the audio node's DMA controller does not match the ADT (admac-leap-s)";
+        int audio = fdt_subnode_offset(dt, aop, "audio");
+        int adt_proxy = adt_path_offset(adt, "/arm-io/admac-hp-mic-ec-proxy");
+        admac = j804_aop_ref(audio, "dmas", 0, 2, &arg);
+        if (audio < 0 || admac < 0 || adt_proxy < 0 ||
+            fdt_node_check_compatible(dt, admac, "apple,t8152-admac") ||
+            adt_path_offset_trace(adt, "/arm-io/admac-leap-s", trace) < 0 ||
+            adt_get_reg(adt, trace, "reg", 0, &adt_base, &adt_size) ||
+            ADT_GETPROP_ARRAY(adt, adt_proxy, "reg", raw) != sizeof(raw) ||
+            ADT_GETPROP(adt, adt_proxy, "dma-channel", &num) != sizeof(num) ||
+            j804_aop_reg(admac, 0, &base, &size) || base != raw[0] || size != raw[1] ||
+            raw[0] != adt_base + J804_SECURE_IMAGE || raw[1] != adt_size || arg != 2 * num + 1 ||
+            j804_aop_ref(admac, "iommus", 0, 2, &sid[2]) != dart)
+            return -1;
+    }
+    j804_aop_why = "the IOMMU node or a stream number does not match the ADT dart-sbr";
+    for (unsigned int i = 0; i < nsid; i++) {
+        int mapper = adt_path_offset(adt, mappers[i]);
+
+        if (mapper < 0 || ADT_GETPROP(adt, mapper, "reg", &num) != sizeof(num) || num != sid[i] ||
+            num >= 64)
+            return -1;
+    }
+
+    /*
+     * Reads only, with synchronous aborts and SErrors trapped: the CPU control word, the two
+     * mailbox status words, and the DART's lock, enable, control and root words of the streams.
+     */
+    j804_aop_why = "a register read faulted";
+    int exc_before = exc_count;
+    exc_guard = GUARD_MARK | GUARD_SILENT;
+    u32 cpu = read32(wrapper + J804_AOP_CPU_CONTROL);
+    u32 mbox_status = read32(mbox_base + J804_MBOX_STATUS);
+    u32 setup_status = read32(setup_base + J804_MBOX_STATUS);
+    u32 protect = read32(dart_base + J804_DART_PROTECT);
+    for (unsigned int i = 0; i < nsid; i++) {
+        words[3 * i] = read32(dart_base + J804_DART_ENABLE + 4 * (sid[i] >> 5));
+        words[3 * i + 1] = read32(dart_base + J804_DART_TCR + 4 * sid[i]);
+        words[3 * i + 2] = read32(dart_base + J804_DART_TTBR + 4 * sid[i]);
+    }
+    sysop("dsb sy");
+    sysop("isb");
+    exc_guard = GUARD_OFF;
+    if (exc_count != exc_before)
+        return -1;
+    printf("FDT: J804 AOP: CPU control 0x%x, mailbox status 0x%x / 0x%x, dart-sbr lock word 0x%x "
+           "(%s)\n",
+           cpu, mbox_status, setup_status, protect, protect & BIT(0) ? "locked" : "NOT locked");
+
+    j804_aop_why = "the AOP is not halted (it was started in this boot)";
+    if (cpu & J804_AOP_CPU_RUN)
+        return -1;
+    j804_aop_why = "a mailbox is not idle";
+    if ((mbox_status & J804_MBOX_WAITING) || (setup_status & J804_MBOX_WAITING) ||
+        FIELD_GET(J804_MBOX_FREE, mbox_status) != J804_MBOX_SLOTS ||
+        FIELD_GET(J804_MBOX_FREE, setup_status) != J804_MBOX_SLOTS)
+        return -1;
+    j804_aop_why = "a dart-sbr stream is not translating through a valid root in DRAM";
+    for (unsigned int i = 0; i < nsid; i++) {
+        /* TCR: translate (bit 0) without bypass (bit 1); TTBR: valid (bit 0), root page. */
+        u64 root = (u64)(words[3 * i + 2] & ~1U) << 12;
+
+        printf("FDT: J804 AOP: stream %u control 0x%x root 0x%lx\n", sid[i], words[3 * i + 1],
+               root);
+        if (!(words[3 * i] & BIT(sid[i] & 31)) || (words[3 * i + 1] & 3) != 1 ||
+            !(words[3 * i + 2] & 1) || root < dram_base || root - dram_base > dram_size - SZ_16K)
+            return -1;
+    }
+
+    /* Suppliers first; the list is committed as one transaction. */
+    j804_aop_why = "the device tree could not be updated";
+    if (j804_aop_enable(dart) || j804_aop_enable(mbox) || j804_aop_enable(setup))
+        return -1;
+    if (stage >= 3) {
+        int audio = fdt_subnode_offset(dt, aop, "audio");
+
+        /* The power-domain leaves the audio node names; their driver only reads at probe. */
+        for (int i = 0; i < 4; i++) {
+            int leaf = j804_aop_ref(audio, "power-domains", i, 1, NULL);
+
+            if (leaf < 0)
+                break;
+            if (j804_aop_enable(leaf))
+                return -1;
+        }
+        if (j804_aop_enable(admac))
+            return -1;
+    }
+    if (j804_aop_enable(aop))
+        return -1;
+    return 0;
+}
+
+static void dt_set_j804_aop(void)
+{
+    unsigned int stage = 0;
+
+    if (fdt_node_check_compatible(dt, 0, "apple,j804"))
+        return;
+    int aop = fdt_node_offset_by_compatible(dt, -1, "apple,t8152-aop");
+    if (aop < 0)
+        return;
+    if (dt_bootargs_have("apple_aop.t8152_stage=3"))
+        stage = 3;
+    else if (dt_bootargs_have("apple_aop.t8152_stage=2"))
+        stage = 2;
+    else if (dt_bootargs_have("apple_aop.t8152_stage=1"))
+        stage = 1;
+
+    if (!stage) {
+        j804_aop_why = "not requested (apple_aop.t8152_stage=1, 2 or 3)";
+    } else if (!dt_set_j804_aop_check(stage)) {
+        j804_aop_why = "the device tree could not be updated";
+        if (!dt_display_transaction(j804_aop_commit, 0)) {
+            printf("FDT: J804 AOP stage %u: %u nodes enabled; the AOP is left halted for the "
+                   "kernel to start\n",
+                   stage, j804_aop_npaths);
+            return;
+        }
+    }
+    printf("FDT: J804 AOP not handed over: %s\n", j804_aop_why);
+    /* A kernel must not start a coprocessor this loader did not check. */
+    aop = fdt_node_offset_by_compatible(dt, -1, "apple,t8152-aop");
+    const char *status = aop < 0 ? NULL : fdt_getprop(dt, aop, "status", NULL);
+    if (aop >= 0 && (!status || strcmp(status, "disabled")) &&
+        fdt_setprop_string(dt, aop, "status", "disabled"))
+        printf("FDT: J804 AOP could not be disabled\n");
+}
+
 static int dt_prepare_t8152(void)
 {
     if (fdt_getprop(dt, 0, "aurora,minimal-boot", NULL)) {
@@ -11908,6 +12236,8 @@ static int dt_prepare_t8152(void)
         /* Fail-soft: a refused handoff leaves the display nodes disabled. */
         if (dt_set_j804_dcp_handoff())
             printf("FDT: J804 DCP handoff not published\n");
+        /* The audio coprocessor: checked with reads and enabled by stage; never fatal. */
+        dt_set_j804_aop();
     }
     if (dt_set_cpus())
         return -1;
