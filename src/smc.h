@@ -21,6 +21,7 @@ smc_dev_t *smc_init(void);
  * negative on failure.
  */
 int smc_adt_function_reset(const char *path, u32 settle_ms);
+int smc_adt_function_set(const char *path, const char *name, u32 level, u32 settle_ms);
 void smc_shutdown(smc_dev_t *smc);
 
 #endif
