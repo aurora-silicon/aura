@@ -595,6 +595,39 @@ void mmu_map_uncached(u64 base, u64 size)
     mmu_add_mapping(base | REGION_RX_EL1, base, size, MAIR_IDX_DEVICE_nGnRnE, PERM_RW_EL0);
 }
 
+/*
+ * T8152 has no MCC description, so mcc_unmap_carveouts() unmaps nothing there. Its ADT still
+ * names the carve-outs, and region-id-4 begins exactly at the top of normal RAM
+ * (phys_base + mem_size) and cannot be accessed: a read faults. Mapped as normal memory, as the
+ * whole of real RAM is below, a store stream that runs up to that boundary takes an SError.
+ * Seen on J804: Stage 1's console page, the first top-of-memory allocation, reset the machine
+ * on every disk boot. Unmap that one carve-out. It must lie at or above the top of normal RAM,
+ * so usable memory is never unmapped; region-id-2 and the rest stay as they were.
+ */
+static void mmu_unmap_t8152_top_carveout(u64 ram_top)
+{
+    int node = adt_path_offset(adt, "/chosen/carveout-memory-map");
+    u32 len;
+    u64 start, size;
+
+    if (node < 0)
+        return;
+    const u64 *range = adt_getprop(adt, node, "region-id-4", &len);
+    if (!range || len != 2 * sizeof(u64))
+        return;
+    memcpy(&start, range, sizeof(start));
+    memcpy(&size, range + 1, sizeof(size));
+    if (!size || start < ram_top || start > UINT64_MAX - size ||
+        start + size > ram_base + mem_size_actual || ((start | size) & (PAGE_SIZE - 1))) {
+        printf("MMU: region-id-4 0x%lx+0x%lx is not a carve-out above RAM, left mapped\n", start,
+               size);
+        return;
+    }
+    printf("MMU: Unmapping region-id-4 at 0x%lx..0x%lx\n", start, start + size);
+    /* Only the identity map covers it: the RAM aliases are added later and end at ram_top. */
+    mmu_rm_mapping(start, size);
+}
+
 static void mmu_add_default_mappings(void)
 {
     ram_base = ALIGN_DOWN(cur_boot_args.phys_base, BIT(32));
@@ -616,6 +649,8 @@ static void mmu_add_default_mappings(void)
     /* Unmap carveout regions */
     if (mcc_unmap_carveouts() && (chip_id == T8140 || chip_id == T6040 || chip_id == T6050))
         panic("MMU: Firmware carveouts are unavailable\n");
+    if (chip_id == T8152)
+        mmu_unmap_t8152_top_carveout(ram_base + ram_size);
 
     /*
      * Remap aura executable code as RX.
