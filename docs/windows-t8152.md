@@ -161,8 +161,28 @@ FWB is clear, stage 2 and the SMC trap are on, `framebuffer=bgra-shadow` is sele
   compare value is. Counters are per CPU, written only by their owner, read without a lock.
   vUART TX-full and recovery edges are recorded in the trap path and printed from the same
   tick (`HV: vuart: TX full …`, `HV: vuart: TX has space again …`).
+- The guest's EL1 virtual timer is handed over disabled (`CNTV_CTL_EL0` = 0) on the boot CPU
+  and on every CPU the guest starts (console: `HV: T8152: guest CNTV_CTL 0x7 -> 0 at entry`).
+  aura's own startup leaves it ENABLE|IMASK and long expired; with no Apple VM timer FIQ
+  gate the carrier gates timers with the guest IMASK, so each NTAIC completion unmasked a
+  CNTV that Mu never programs and the next exit reflected it again. M3 run 1 measured that
+  loop at ~126k/s (EVENT abort + trapped `CNTP_CTL` read + SMC, ~380k exits/s, the core
+  saturated at the Mu shell). `CNTV_CTL.ENABLE` is UNKNOWN at reset, so no guest may rely on
+  the old value.
 - ECV is not used until measurement (e); the architectural PMU stays trapped to the
   synthetic EL2 backend.
+- There is no architectural PMUv3 bank, as on T8142: an EL1/EL0 PMU access UNDEFs at EL1
+  (`ESR_EL1` 0x02000000) before `MDCR_EL2.TPM` can trap it (M3 run 1: bootmgr's ungated
+  `mrs x9, PMCCNTR_EL0`). `hv_absent_pmuv3()` (T8142, T8152) opens the T8142 recovery:
+  - always: Mu's forwarded `hvc #0` with x0 = "NTSRG" is answered from the software PMU
+    (`PMCCNTR_EL0` = the 1 GHz counter, the control registers read 0 and drop writes);
+    console once: `HV: T8152: handled forwarded EL1 sysreg instruction 0x… at EL2`;
+  - with `guest_compatibility: t8152-pmu-undef` (`run_guest.py
+    --windows-guest-compatibility t8152-pmu-undef`, resident bit 0): the sync-vector
+    redirect (`HVC #0x4d31`), the access-site replacement in kernel images, the module walk
+    and the `b .` wedge recovery, as on T8142. On T8152 these read and write guest memory only
+    inside the guest RAM window. The NT build-specific diagnostics (process names,
+    `KiBugCheckData` on the tick) and the Mu SP_EL0 repair stay T8142-only.
 - `usb_hpm_restore_irqs()` is skipped: nothing writes to the USB-C port controllers.
 - The vGIC carrier answers at 0xF00000000 / 0xF10000000 (Mu J873 PCDs) for live CPUs. As on
   T8142, the guest's first SPI enable turns on the AIC master enable (`hv_vgic.c`).
@@ -179,7 +199,8 @@ FWB is clear, stage 2 and the SMC trap are on, `framebuffer=bgra-shadow` is sele
 
 - Profiles for chip 0x8152 must bind `guest_ram {base, top}` and use `bgra-shadow`; they
   take no `reserved_memory`, N1 or MTP. Optional: `ipi` (`poll`/`fast`), `gic_cpuif`
-  (`software` only, the default), `wfi` (`poll` only), `on_reset` (`stay`/`reboot`).
+  (`software` only, the default), `wfi` (`poll` only), `on_reset` (`stay`/`reboot`),
+  `guest_compatibility` (`none`, the default, or `t8152-pmu-undef`).
 - A resident must report capability bits 0x0800 (T8152 policy), 0x1000 (12-live-CPU
   refusal), 0x2000 (guest-WFE trap and code placement), 0x4000 (architectural
   `ACTLR_EL12` only) and 0x8000 (trapped software GIC CPU interface) for any of this.

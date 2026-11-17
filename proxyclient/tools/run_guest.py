@@ -45,6 +45,13 @@ parser.add_argument('--windows-wfi', choices=('poll', 'wfi'), default='poll',
                          'is refused: Phase 3 measurement (a) found WFI_WIPES.')
 parser.add_argument('--windows-serial', choices=('cdc', 'disabled'), default='cdc',
                     help='T8152: guest vUART on the dedicated CDC interface (default) or off.')
+parser.add_argument('--windows-guest-compatibility', choices=('none', 't8152-pmu-undef'),
+                    default='none',
+                    help='T8152: "t8152-pmu-undef" lets the resident recover EL1/EL0 PMUv3 '
+                         'accesses that UNDEF (bootmgr, winload, NT, drivers, smss) by '
+                         'redirecting the guest\'s sync vectors and replacing access sites '
+                         'with HVCs. Needed past bootmgr (M3 run 1). Mu\'s own forwarded '
+                         'accesses are serviced either way.')
 parser.add_argument('--windows-reset-on-exit', action='store_true',
                     help='T8152: when the guest asks for PSCI SYSTEM_RESET, shut NVMe down and '
                          'reset through WD1. Default: stay in the aura proxy.')
@@ -110,6 +117,7 @@ def run_windows_t8152(caps):
     hv.windows_ipi = args.windows_ipi
     hv.windows_gic_cpuif = args.windows_gic_cpuif or "software"
     hv.windows_wfi = args.windows_wfi
+    hv.windows_guest_compatibility = args.windows_guest_compatibility
     log = args.logfile.open("w") if args.logfile else None
     if log:
         iface.tty_log = log  # the resident's hv_init() refusals ("HV: T8152: ...") land here too
@@ -162,7 +170,8 @@ _windows_caps = windows_resident_caps()
 if _windows_caps and p.get_chipid() == 0x8152:
     run_windows_t8152(_windows_caps)
 elif (args.windows_guest_ram or args.windows_ipi != 'poll' or args.windows_reset_on_exit or
-      args.windows_gic_cpuif not in (None, 'carrier') or args.windows_wfi != 'poll'):
+      args.windows_gic_cpuif not in (None, 'carrier') or args.windows_wfi != 'poll' or
+      args.windows_guest_compatibility != 'none'):
     sys.exit("--windows-* options need the Windows personality (gmake WINDOWS=1) on T8152")
 
 if args.emulate_sprr or not p.get_cpu_features().apple_sysregs_unlocked:

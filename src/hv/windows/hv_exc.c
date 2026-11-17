@@ -3329,6 +3329,38 @@ static bool hv_handle_t8142_gic_cpuif(u64 reg, bool is_read, u64 rt, u64 regs[32
 }
 
 /*
+ * Chip tag for the absent-PMUv3 recovery's console lines.  The recovery started on T8142
+ * and keeps its "HV: T8142: ..." lines there byte for byte; on T8152 the same lines say
+ * T8152, so a J804 log never claims to come from J813.
+ */
+static const char *hv_absent_pmu_chip(void)
+{
+    return chip_id == T8152 ? "T8152" : "T8142";
+}
+
+/*
+ * Stage-1 + stage-2 translate for the absent-PMUv3 recovery, which reads and writes guest
+ * text through EL2's own mapping of the result.  On T8152 the result must also lie inside
+ * the guest RAM window with `len` bytes to spare: the only other things stage 2 maps there
+ * are device pages (the AIC, Device-nGnRnE), and an EL2 read of one of those is not a
+ * harmless probe -- reading AIC EVENT acknowledges an interrupt.  The image sweep and the
+ * module walk probe guest VAs they have only guessed at, so this is not hypothetical.
+ * Other chips keep the plain translation they had.
+ */
+static u64 hv_absent_pmu_translate(u64 va, bool w, u64 len)
+{
+    u64 pa = hv_translate(va, false, w, NULL);
+
+    if (pa && chip_id == T8152) {
+        u64 base, size;
+
+        if (!hv_t8152_guest_ram(&base, &size) || pa < base || len > size || pa - base > size - len)
+            return 0;
+    }
+    return pa;
+}
+
+/*
  * T8142 reports accesses to its absent architectural PMUv3 register bank as
  * an EL1 undefined instruction instead of producing an MDCR_EL2 sysreg trap.
  * Mu's exception vector therefore forwards the raw architectural system-
@@ -3526,7 +3558,7 @@ static bool hv_emulate_t8142_pending_undef(struct exc_info *ctx, u32 *insn_out, 
         return false;
 
     u64 fault_pc = mrs(ELR_EL12);
-    u64 insn_pa = hv_translate(fault_pc, false, false, NULL);
+    u64 insn_pa = hv_absent_pmu_translate(fault_pc, false, 4);
     if (!insn_pa)
         return false;
 
@@ -3743,7 +3775,7 @@ static bool hv_patch_t8142_undef_vector(u64 slot)
      * we resolve the address and store to the physical page through EL2's own,
      * where the guest's permissions do not apply.
      */
-    u64 pa = hv_translate(va, false, false, NULL);
+    u64 pa = hv_absent_pmu_translate(va, false, 4);
     if (!pa) {
         /*
          * Not necessarily an error: a guest may publish VBAR_EL1 before the
@@ -3753,8 +3785,8 @@ static bool hv_patch_t8142_undef_vector(u64 slot)
         static u64 untranslatable;
 
         if (untranslatable < 4 || (untranslatable % 4096) == 0)
-            printf("HV: T8142: guest undef vector 0x%lx not translatable (#%ld)\n", va,
-                   untranslatable);
+            printf("HV: %s: guest undef vector 0x%lx not translatable (#%ld)\n",
+                   hv_absent_pmu_chip(), va, untranslatable);
         untranslatable++;
         return false;
     }
@@ -3780,8 +3812,8 @@ static bool hv_patch_t8142_undef_vector(u64 slot)
          * reached.  Firmware needs no redirect anyway -- it services these
          * faults itself through the sysreg assist.
          */
-        printf("HV: T8142: leaving guest undef vector 0x%lx alone, cannot replay 0x%08x\n", va,
-               orig);
+        printf("HV: %s: leaving guest undef vector 0x%lx alone, cannot replay 0x%08x\n",
+               hv_absent_pmu_chip(), va, orig);
         t8142_undef_vec[t8142_undef_vec_count].va = va;
         t8142_undef_vec[t8142_undef_vec_count].refused = true;
         t8142_undef_vec_count++;
@@ -3799,9 +3831,9 @@ static bool hv_patch_t8142_undef_vector(u64 slot)
      */
     u32 back = read32(pa);
     if (back != HV_T8142_UNDEF_HVC_INSN) {
-        printf("HV: T8142: guest undef vector 0x%lx write did not stick at pa 0x%lx "
+        printf("HV: %s: guest undef vector 0x%lx write did not stick at pa 0x%lx "
                "(read back 0x%08x)\n",
-               va, pa, back);
+               hv_absent_pmu_chip(), va, pa, back);
         return false;
     }
 
@@ -3810,9 +3842,9 @@ static bool hv_patch_t8142_undef_vector(u64 slot)
     t8142_undef_vec[t8142_undef_vec_count].orig = orig;
     t8142_undef_vec_count++;
 
-    printf("HV: T8142: guest undef vector 0x%lx (+0x%lx) redirected to EL2 at pa 0x%lx "
+    printf("HV: %s: guest undef vector 0x%lx (+0x%lx) redirected to EL2 at pa 0x%lx "
            "(displaced 0x%08x)\n",
-           va, slot, pa, orig);
+           hv_absent_pmu_chip(), va, slot, pa, orig);
     return true;
 }
 
@@ -3835,7 +3867,7 @@ void hv_verify_t8142_undef_vectors(void)
     if (!hv_windows_guest_compat_enabled())
         return;
 
-    if (chip_id != T8142)
+    if (!hv_absent_pmuv3())
         return;
 
     for (u32 i = 0; i < t8142_undef_vec_count; i++) {
@@ -3843,7 +3875,7 @@ void hv_verify_t8142_undef_vectors(void)
             continue;
 
         u64 va = t8142_undef_vec[i].va;
-        u64 pa = hv_translate(va, false, false, NULL);
+        u64 pa = hv_absent_pmu_translate(va, false, 4);
         if (!pa)
             continue; /* not mapped right now; nothing useful to do */
 
@@ -3860,9 +3892,9 @@ void hv_verify_t8142_undef_vectors(void)
 
             if (read32(stale) == HV_T8142_UNDEF_HVC_INSN) {
                 hv_write_guest_insn(stale, t8142_undef_vec[i].orig);
-                printf("HV: T8142: redirect for 0x%lx moved pa 0x%lx -> 0x%lx, restored "
+                printf("HV: %s: redirect for 0x%lx moved pa 0x%lx -> 0x%lx, restored "
                        "0x%08x at the old page\n",
-                       va, stale, pa, t8142_undef_vec[i].orig);
+                       hv_absent_pmu_chip(), va, stale, pa, t8142_undef_vec[i].orig);
             }
             t8142_undef_vec[i].pa = 0;
         }
@@ -3892,9 +3924,9 @@ void hv_verify_t8142_undef_vectors(void)
          * has to be replayable and recorded.
          */
         if (!hv_can_displace_vector_insn(cur)) {
-            printf("HV: T8142: redirect at 0x%lx lost, and 0x%08x cannot be replayed; "
+            printf("HV: %s: redirect at 0x%lx lost, and 0x%08x cannot be replayed; "
                    "dropping it\n",
-                   va, cur);
+                   hv_absent_pmu_chip(), va, cur);
             t8142_undef_vec[i] = t8142_undef_vec[--t8142_undef_vec_count];
             i--;
             continue;
@@ -3906,8 +3938,8 @@ void hv_verify_t8142_undef_vectors(void)
 
         t8142_undef_vec[i].pa = pa;
         t8142_undef_vec[i].orig = cur;
-        printf("HV: T8142: redirect at 0x%lx reinstated at pa 0x%lx (displaced 0x%08x)\n", va, pa,
-               cur);
+        printf("HV: %s: redirect at 0x%lx reinstated at pa 0x%lx (displaced 0x%08x)\n",
+               hv_absent_pmu_chip(), va, pa, cur);
     }
 }
 
@@ -3927,7 +3959,7 @@ static bool hv_unpatch_t8142_undef_vector(u64 va)
         if (t8142_undef_vec[i].va != va || t8142_undef_vec[i].refused)
             continue;
 
-        u64 pa = hv_translate(va, false, true, NULL);
+        u64 pa = hv_absent_pmu_translate(va, true, 4);
         if (pa)
             hv_write_guest_insn(pa, t8142_undef_vec[i].orig);
 
@@ -3982,7 +4014,7 @@ static bool hv_patch_t8142_pmu_site_quiet(u64 va, u32 insn, bool verbose)
     if (t8142_pmu_site_count >= HV_T8142_MAX_PMU_SITES)
         return false;
 
-    u64 pa = hv_translate(va, false, false, NULL);
+    u64 pa = hv_absent_pmu_translate(va, false, 4);
     if (!pa)
         return false;
 
@@ -4003,8 +4035,8 @@ static bool hv_patch_t8142_pmu_site_quiet(u64 va, u32 insn, bool verbose)
     t8142_pmu_site_count++;
 
     if (verbose)
-        printf("HV: T8142: absent-register site 0x%lx (0x%08x) redirected to EL2 at pa 0x%lx\n", va,
-               insn, pa);
+        printf("HV: %s: absent-register site 0x%lx (0x%08x) redirected to EL2 at pa 0x%lx\n",
+               hv_absent_pmu_chip(), va, insn, pa);
     return true;
 }
 
@@ -4036,7 +4068,7 @@ static bool hv_patch_t8142_pmu_site(u64 va, u32 insn)
 
 static bool hv_read_guest32(u64 va, u32 *out)
 {
-    u64 pa = hv_translate(va, false, false, NULL);
+    u64 pa = hv_absent_pmu_translate(va, false, 4);
 
     if (!pa)
         return false;
@@ -4195,9 +4227,9 @@ static void hv_scan_guest_image_absent_regs(u64 va_in_image)
 
         if (!full_logged) {
             full_logged = true;
-            printf("HV: T8142: image scan table full at %d images; further images rely on the "
+            printf("HV: %s: image scan table full at %d images; further images rely on the "
                    "vector redirect\n",
-                   (int)scanned_count);
+                   hv_absent_pmu_chip(), (int)scanned_count);
         }
         return;
     }
@@ -4237,7 +4269,7 @@ static void hv_scan_guest_image_absent_regs(u64 va_in_image)
              * watchdog conclude the hypervisor has hung. */
             hv_wdt_pet();
 
-            u64 pa = hv_translate(v, false, false, NULL);
+            u64 pa = hv_absent_pmu_translate(v, false, page_end - v);
             if (!pa) {
                 v = page_end;
                 continue;
@@ -4278,7 +4310,7 @@ static void hv_scan_guest_image_absent_regs(u64 va_in_image)
 
             hv_wdt_pet();
 
-            u64 pa = hv_translate(v, false, false, NULL);
+            u64 pa = hv_absent_pmu_translate(v, false, page_end - v);
             if (!pa) {
                 v = page_end;
                 continue;
@@ -4312,13 +4344,13 @@ static void hv_scan_guest_image_absent_regs(u64 va_in_image)
     }
 
     if (literals || overflow)
-        printf("HV: T8142: image at 0x%lx: %ld candidate(s) left alone as literal data, "
+        printf("HV: %s: image at 0x%lx: %ld candidate(s) left alone as literal data, "
                "%ld unchecked past the cap\n",
-               base, (u64)literals, (u64)overflow);
+               hv_absent_pmu_chip(), base, (u64)literals, (u64)overflow);
 
-    printf("HV: T8142: image at 0x%lx: scanned %ld words, redirected %ld absent-register "
+    printf("HV: %s: image at 0x%lx: scanned %ld words, redirected %ld absent-register "
            "accesses (%ld sites total)\n",
-           base, (u64)words, (u64)patched, (u64)t8142_pmu_site_count);
+           hv_absent_pmu_chip(), base, (u64)words, (u64)patched, (u64)t8142_pmu_site_count);
 
     /*
      * How many rewritten sites can write a callee-saved register at all.  The
@@ -4333,8 +4365,8 @@ static void hv_scan_guest_image_absent_regs(u64 va_in_image)
         if (rt >= 19 && rt <= 28)
             rt_callee_saved++;
     }
-    printf("HV: T8142: absent-register sites writing x19-x28: %u of %ld\n", rt_callee_saved,
-           (u64)t8142_pmu_site_count);
+    printf("HV: %s: absent-register sites writing x19-x28: %u of %ld\n", hv_absent_pmu_chip(),
+           rt_callee_saved, (u64)t8142_pmu_site_count);
 }
 
 /*
@@ -4378,8 +4410,8 @@ static bool hv_handle_t8142_pmu_site(struct exc_info *ctx, u32 imm)
      */
     if (site != t8142_pmu_site[idx].va) {
         if (relocated < 8 || (relocated % 4096) == 0)
-            printf("HV: T8142: site %d (0x%lx) relocated to 0x%lx, emulated 0x%08x (#%ld)\n",
-                   (int)idx, t8142_pmu_site[idx].va, site, insn, relocated);
+            printf("HV: %s: site %d (0x%lx) relocated to 0x%lx, emulated 0x%08x (#%ld)\n",
+                   hv_absent_pmu_chip(), (int)idx, t8142_pmu_site[idx].va, site, insn, relocated);
         relocated++;
     }
 
@@ -4392,8 +4424,8 @@ static bool hv_handle_t8142_pmu_site(struct exc_info *ctx, u32 imm)
      */
     if (((insn & 0xffe00000U) == 0xd5200000U) && rt >= 19 && rt <= 28) {
         if (callee_saved_emulated < 64)
-            printf("HV: T8142: CALLEE-SAVED WRITE x%ld = 0x%lx at 0x%lx (insn 0x%08x)\n", rt, out,
-                   site, insn);
+            printf("HV: %s: CALLEE-SAVED WRITE x%ld = 0x%lx at 0x%lx (insn 0x%08x)\n",
+                   hv_absent_pmu_chip(), rt, out, site, insn);
         callee_saved_emulated++;
     } else if (__atomic_load_n(&site_emulated, __ATOMIC_RELAXED) < 8) {
         /*
@@ -4407,7 +4439,8 @@ static bool hv_handle_t8142_pmu_site(struct exc_info *ctx, u32 imm)
          */
         u64 n = __atomic_fetch_add(&site_emulated, 1, __ATOMIC_RELAXED);
         if (n < 8)
-            printf("HV: T8142: site emulated 0x%08x at 0x%lx (#%ld)\n", insn, site, n);
+            printf("HV: %s: site emulated 0x%08x at 0x%lx (#%ld)\n", hv_absent_pmu_chip(), insn,
+                   site, n);
     }
     return true;
 }
@@ -4436,7 +4469,7 @@ static bool hv_handle_t8142_undef_trampoline(struct exc_info *ctx)
     if (!hv_windows_guest_compat_enabled())
         return false;
 
-    if (chip_id != T8142)
+    if (!hv_absent_pmuv3())
         return false;
     u32 imm = ctx->esr & 0xffff;
 
@@ -4476,8 +4509,8 @@ static bool hv_handle_t8142_undef_trampoline(struct exc_info *ctx)
              * and the addresses say which image it came out of.
              */
             if (el0_sync_emul <= 8)
-                printf("HV: T8142: EL0 emulated 0x%08x at user pc 0x%lx (#%ld)\n", insn, fault_pc,
-                       el0_sync_emul);
+                printf("HV: %s: EL0 emulated 0x%08x at user pc 0x%lx (#%ld)\n",
+                       hv_absent_pmu_chip(), insn, fault_pc, el0_sync_emul);
         } else {
             el1_sync_emul++;
             /*
@@ -4487,13 +4520,13 @@ static bool hv_handle_t8142_undef_trampoline(struct exc_info *ctx)
              * absorbed silently by the vector.
              */
             if (el1_sync_emul <= 8)
-                printf("HV: T8142: EL1 emulated 0x%08x at unscanned pc 0x%lx (#%ld)\n", insn,
-                       fault_pc, el1_sync_emul);
+                printf("HV: %s: EL1 emulated 0x%08x at unscanned pc 0x%lx (#%ld)\n",
+                       hv_absent_pmu_chip(), insn, fault_pc, el1_sync_emul);
         }
 
         if (emulated < 8 || (emulated % 4096) == 0)
-            printf("HV: T8142: trampoline emulated 0x%08x at 0x%lx (#%ld)\n", insn, fault_pc,
-                   emulated);
+            printf("HV: %s: trampoline emulated 0x%08x at 0x%lx (#%ld)\n", hv_absent_pmu_chip(),
+                   insn, fault_pc, emulated);
         emulated++;
         return true;
     }
@@ -4540,8 +4573,8 @@ static bool hv_handle_t8142_undef_trampoline(struct exc_info *ctx)
     static u64 lost;
 
     if (lost < 8 || (lost % 4096) == 0)
-        printf("HV: T8142: trampoline lost vector 0x%lx (orig 0x%08x) (#%ld)\n", vec_va, orig,
-               lost);
+        printf("HV: %s: trampoline lost vector 0x%lx (orig 0x%08x) (#%ld)\n", hv_absent_pmu_chip(),
+               vec_va, orig, lost);
     lost++;
 
     if (hv_unpatch_t8142_undef_vector(vec_va))
@@ -4601,7 +4634,7 @@ static bool wfi_trap_logged;
 
 static void hv_report_t8142_wfi_traps(void)
 {
-    printf("HV: T8142: guest WFIs held at EL2:");
+    printf("HV: %s: guest WFIs held at EL2:", hv_absent_pmu_chip());
     for (int cpu = 0; cpu < MAX_CPUS; cpu++) {
         if (cpu > 0 && !smp_is_alive(cpu))
             continue;
@@ -4615,9 +4648,9 @@ static void hv_report_t8142_el0_vector(void)
     if (!el0_sync_pass && !el0_sync_emul && !el1_sync_pass && !el1_sync_emul)
         return;
 
-    printf("HV: T8142: redirected sync vectors: EL0 %ld emulated / %ld passed, "
+    printf("HV: %s: redirected sync vectors: EL0 %ld emulated / %ld passed, "
            "EL1 %ld emulated / %ld passed\n",
-           el0_sync_emul, el0_sync_pass, el1_sync_emul, el1_sync_pass);
+           hv_absent_pmu_chip(), el0_sync_emul, el0_sync_pass, el1_sync_emul, el1_sync_pass);
 }
 
 /*
@@ -4688,8 +4721,8 @@ static void hv_report_t8142_current_process(struct exc_info *ctx)
         seen[seen_count][j] = name[j];
     seen_count++;
 
-    printf("HV: T8142: guest process now running: \"%s\" (pid %ld, EPROCESS 0x%lx)\n", name,
-           read64(pa + HV_NT_EPROCESS_PID_OFF), process);
+    printf("HV: %s: guest process now running: \"%s\" (pid %ld, EPROCESS 0x%lx)\n",
+           hv_absent_pmu_chip(), name, read64(pa + HV_NT_EPROCESS_PID_OFF), process);
 }
 
 static void hv_report_t8142_dead_process(u64 code, u64 param1)
@@ -4697,7 +4730,7 @@ static void hv_report_t8142_dead_process(u64 code, u64 param1)
     if (code != 0xef || !param1)
         return;
 
-    u64 pa = hv_translate(param1, false, false, NULL);
+    u64 pa = hv_absent_pmu_translate(param1, false, HV_NT_EPROCESS_STATUS_OFF + 4);
     if (!pa)
         return;
 
@@ -4709,9 +4742,9 @@ static void hv_report_t8142_dead_process(u64 code, u64 param1)
         name[i] = c;
     }
 
-    printf("HV: T8142:   dead process: pid %ld \"%s\" exit status 0x%08x (EPROCESS 0x%lx)\n",
-           read64(pa + HV_NT_EPROCESS_PID_OFF), name, read32(pa + HV_NT_EPROCESS_STATUS_OFF),
-           param1);
+    printf("HV: %s:   dead process: pid %ld \"%s\" exit status 0x%08x (EPROCESS 0x%lx)\n",
+           hv_absent_pmu_chip(), read64(pa + HV_NT_EPROCESS_PID_OFF), name,
+           read32(pa + HV_NT_EPROCESS_STATUS_OFF), param1);
 }
 
 static void hv_report_t8142_bugcheck(struct exc_info *ctx)
@@ -4731,7 +4764,7 @@ static void hv_report_t8142_bugcheck(struct exc_info *ctx)
     if (++stuck < 3) /* a few ticks at the same PC, not a momentary sample */
         return;
 
-    u64 pa = hv_translate(t8142_kernel_base + HV_NT_KIBUGCHECKDATA_RVA, false, false, NULL);
+    u64 pa = hv_absent_pmu_translate(t8142_kernel_base + HV_NT_KIBUGCHECKDATA_RVA, false, 40);
     if (!pa)
         return;
 
@@ -4739,9 +4772,9 @@ static void hv_report_t8142_bugcheck(struct exc_info *ctx)
     if (!code) /* halted somewhere that is not a bugcheck */
         return;
 
-    printf("HV: T8142: guest bugcheck 0x%lx (%lx, %lx, %lx, %lx) at pc 0x%lx (rva 0x%lx)\n", code,
-           read64(pa + 8), read64(pa + 16), read64(pa + 24), read64(pa + 32), ctx->elr,
-           ctx->elr - t8142_kernel_base);
+    printf("HV: %s: guest bugcheck 0x%lx (%lx, %lx, %lx, %lx) at pc 0x%lx (rva 0x%lx)\n",
+           hv_absent_pmu_chip(), code, read64(pa + 8), read64(pa + 16), read64(pa + 24),
+           read64(pa + 32), ctx->elr, ctx->elr - t8142_kernel_base);
     hv_report_t8142_dead_process(code, read64(pa + 8));
     reported = true;
 }
@@ -4756,7 +4789,7 @@ bool hv_recover_t8142_sysreg_undef(struct exc_info *ctx)
     u32 insn = 0;
     u64 fault_pc = 0;
 
-    if (chip_id != T8142)
+    if (!hv_absent_pmuv3())
         return false;
 
     /*
@@ -4765,15 +4798,15 @@ bool hv_recover_t8142_sysreg_undef(struct exc_info *ctx)
      * handler has dealt with it, so acting on that alone would corrupt a
      * healthy guest.  A PC sitting on a branch-to-self is exact.
      */
-    u64 pc_pa = hv_translate(ctx->elr, false, false, NULL);
+    u64 pc_pa = hv_absent_pmu_translate(ctx->elr, false, 4);
     if (!pc_pa || read32(pc_pa) != 0x14000000) /* B .   (branch to self) */
         return false;
 
     if (!hv_emulate_t8142_pending_undef(ctx, &insn, &fault_pc))
         return false;
 
-    printf("HV: T8142: recovered guest from undefined sysreg access 0x%08x at 0x%lx\n", insn,
-           fault_pc);
+    printf("HV: %s: recovered guest from undefined sysreg access 0x%08x at 0x%lx\n",
+           hv_absent_pmu_chip(), insn, fault_pc);
 
     /*
      * Replace the access that faulted, so this site never reaches the guest's
@@ -4899,7 +4932,8 @@ static void hv_sweep_guest_images(u64 anchor)
         hv_scan_guest_image_absent_regs(page);
     }
 
-    printf("HV: T8142: swept 0x%lx..0x%lx for guest images, found %u\n", lo, hi, found);
+    printf("HV: %s: swept 0x%lx..0x%lx for guest images, found %u\n", hv_absent_pmu_chip(), lo, hi,
+           found);
 }
 
 static void hv_scan_guest_modules(void)
@@ -4907,7 +4941,7 @@ static void hv_scan_guest_modules(void)
     if (!hv_windows_guest_compat_enabled())
         return;
 
-    if (chip_id != T8142 || !t8142_kernel_base)
+    if (!hv_absent_pmuv3() || !t8142_kernel_base)
         return;
 
     u64 head = t8142_kernel_base + HV_NT_PSLOADEDMODULELIST_RVA;
@@ -4917,9 +4951,9 @@ static void hv_scan_guest_modules(void)
     if (!hv_read_guest64(head, &entry) || !entry || entry == head) {
         if (!reported) {
             reported = true;
-            printf("HV: T8142: module list head 0x%lx unreadable or empty "
+            printf("HV: %s: module list head 0x%lx unreadable or empty "
                    "(flink 0x%lx)\n",
-                   head, entry);
+                   hv_absent_pmu_chip(), head, entry);
         }
         return;
     }
@@ -4929,16 +4963,16 @@ static void hv_scan_guest_modules(void)
         first_base != t8142_kernel_base) {
         if (!reported) {
             reported = true;
-            printf("HV: T8142: module list at 0x%lx rejected: first entry 0x%lx "
+            printf("HV: %s: module list at 0x%lx rejected: first entry 0x%lx "
                    "DllBase 0x%lx != kernel 0x%lx\n",
-                   head, entry, first_base, t8142_kernel_base);
+                   hv_absent_pmu_chip(), head, entry, first_base, t8142_kernel_base);
         }
         return; /* not the list we think it is -- do nothing */
     }
 
     if (!reported) {
         reported = true;
-        printf("HV: T8142: walking guest module list at 0x%lx\n", head);
+        printf("HV: %s: walking guest module list at 0x%lx\n", hv_absent_pmu_chip(), head);
     }
 
     for (u32 i = 0; i < HV_NT_MAX_MODULES && entry && entry != head; i++) {
@@ -4986,7 +5020,7 @@ void hv_check_t8142_bugcheck(void)
     if (chip_id != T8142 || reported || !t8142_kernel_base)
         return;
 
-    u64 pa = hv_translate(t8142_kernel_base + HV_NT_KIBUGCHECKDATA_RVA, false, false, NULL);
+    u64 pa = hv_absent_pmu_translate(t8142_kernel_base + HV_NT_KIBUGCHECKDATA_RVA, false, 40);
     if (!pa)
         return;
 
@@ -4995,8 +5029,8 @@ void hv_check_t8142_bugcheck(void)
         return;
 
     reported = true;
-    printf("HV: T8142: guest bugcheck 0x%lx (%lx, %lx, %lx, %lx) seen on tick\n", code,
-           read64(pa + 8), read64(pa + 16), read64(pa + 24), read64(pa + 32));
+    printf("HV: %s: guest bugcheck 0x%lx (%lx, %lx, %lx, %lx) seen on tick\n", hv_absent_pmu_chip(),
+           code, read64(pa + 8), read64(pa + 16), read64(pa + 24), read64(pa + 32));
 #if defined(ENABLE_VGIC_MODULE) && defined(ENABLE_NATIVE_AIC_PASSTHROUGH)
     if (hv_native_aic_windows_active()) {
         u32 cpu = smp_id();
@@ -5230,7 +5264,7 @@ void hv_track_t8142_undef_vector(struct exc_info *ctx)
 
     UNUSED(ctx);
 
-    if (chip_id != T8142)
+    if (!hv_absent_pmuv3())
         return;
 
     /*
@@ -6387,13 +6421,13 @@ static bool hv_handle_msr_unlocked(struct exc_info *ctx, u64 iss)
 }
 
 static bool hv_handle_smc(struct exc_info *ctx) {
-    if (ctx->regs[0] == HV_SYSREG_ASSIST_CALL_MAGIC && chip_id == T8142) {
+    if (ctx->regs[0] == HV_SYSREG_ASSIST_CALL_MAGIC && hv_absent_pmuv3()) {
         u64 output = 0;
         bool handled = hv_handle_t8142_sysreg_assist((u32)ctx->regs[1], ctx->regs[2],
                                                      &output);
         if (handled && !t8142_sysreg_assist_logged) {
-            printf("HV: T8142: handled forwarded EL1 sysreg instruction 0x%08x at EL2\n",
-                   (u32)ctx->regs[1]);
+            printf("HV: %s: handled forwarded EL1 sysreg instruction 0x%08x at EL2\n",
+                   hv_absent_pmu_chip(), (u32)ctx->regs[1]);
             t8142_sysreg_assist_logged = true;
         }
         ctx->regs[0] = handled;

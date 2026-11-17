@@ -70,10 +70,22 @@ def test_t8152_profile_binds_window_and_policy(tmp_path):
     ({"wfi": "wfi"}, "WFI_WIPES"),
     ({"reserved_memory": [{"name": "x", "base": "0x10050000000", "size": "0x1000"}]},
      "no reserved_memory"),
+    ({"guest_compatibility": "t8142-experimental"}, "requires chip 0x8142"),
+    ({"guest_compatibility": "all"}, "unsupported guest compatibility"),
 ])
 def test_t8152_profile_refusals(tmp_path, fields, message):
     with pytest.raises(ValueError, match=message):
         windows.plan_profile(write_profile(tmp_path, **fields))
+
+
+def test_t8152_profile_takes_the_pmu_undef_recovery(tmp_path):
+    plan = windows.plan_profile(write_profile(tmp_path, guest_compatibility="t8152-pmu-undef"))
+    assert plan.guest_compatibility == "t8152-pmu-undef"
+    assert windows.plan_profile(write_profile(tmp_path)).guest_compatibility == "none"
+    with pytest.raises(ValueError, match="requires chip 0x8152"):
+        windows.plan_profile(write_profile(tmp_path, guest_ram=None,
+                                           guest_compatibility="t8152-pmu-undef",
+                                           target={"chip_id": "0x8142", "model": "Mac17,3"}))
 
 
 def test_t8152_fields_are_t8152_only(tmp_path):
@@ -217,3 +229,4 @@ def test_c_and_python_agree_on_abi():
     assert "HV_WINDOWS_T8152_FAST_IPI BIT(5)" in hv_h and windows.CONFIG_T8152_FAST_IPI == 1 << 5
     assert "HV_WINDOWS_T8152_SOFT_GIC BIT(6)" in hv_h and windows.CONFIG_T8152_SOFT_GIC == 1 << 6
     assert "HV_WINDOWS_T8152_WFI BIT(7)" in hv_h and windows.CONFIG_T8152_WFI == 1 << 7
+    assert "HV_WINDOWS_GUEST_COMPAT   BIT(0)" in hv_h and windows.CONFIG_GUEST_COMPAT == 1 << 0

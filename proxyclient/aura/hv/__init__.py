@@ -1554,11 +1554,12 @@ class HV(Reloadable):
         self.adt = load_adt(self.u.get_adt())
         if self.windows:
             from ..windows import (CONFIGURATION, CONFIG_FRAMEBUFFER_SHADOW,
-                                   CONFIG_T8142_EXPERIMENTAL, CONFIG_SERIAL_CAPTURE,
+                                   CONFIG_T8142_EXPERIMENTAL, CONFIG_GUEST_COMPAT, CONFIG_SERIAL_CAPTURE,
                                    CONFIG_SERIAL_CDC, CONFIG_MTP, CONFIG_CPUFREQ, MTP_DISABLED_PROPERTY,
                                    MTP_RESERVED_BASE, MTP_RESERVED_SIZE, ecpu_boot_state_khz,
                                    CONFIG_T8152_FAST_IPI, CONFIG_T8152_SOFT_GIC, CONFIG_T8152_WFI,
-                                   T8152_CHIP, T8152_CPUS, WindowsLaunchRefused,
+                                   T8152_CHIP, T8152_CPUS, T8152_PMU_UNDEF,
+                                   WindowsLaunchRefused,
                                    validate_capabilities)
             self.windows_t8152 = self.adt["/chosen"].chip_id == T8152_CHIP
             if self.windows_gic_cpuif is None:
@@ -1568,6 +1569,10 @@ class HV(Reloadable):
                     raise ValueError("T8152 needs an explicit guest RAM window")
                 if self.windows_framebuffer != "bgra-shadow":
                     raise ValueError("T8152 needs framebuffer bgra-shadow")
+                if self.windows_guest_compatibility not in ("none", T8152_PMU_UNDEF):
+                    raise ValueError("T8152 takes guest compatibility none or t8152-pmu-undef")
+            elif self.windows_guest_compatibility == T8152_PMU_UNDEF:
+                raise ValueError("t8152-pmu-undef is a T8152 guest compatibility")
             elif (self.windows_guest_ram is not None or self.windows_ipi != "poll" or
                   self.windows_gic_cpuif != "carrier" or self.windows_wfi != "poll"):
                 raise ValueError("guest RAM window, IPI mode and GIC cpuif are T8152 options")
@@ -1618,8 +1623,8 @@ class HV(Reloadable):
             self._windows_adt_blob()
             if caps & CONFIGURATION:
                 flags = (CONFIG_FRAMEBUFFER_SHADOW if self.windows_framebuffer == "bgra-shadow" else 0)
-                if self.windows_guest_compatibility == "t8142-experimental":
-                    flags |= CONFIG_T8142_EXPERIMENTAL
+                if self.windows_guest_compatibility in ("t8142-experimental", T8152_PMU_UNDEF):
+                    flags |= CONFIG_GUEST_COMPAT
                 if self.windows_serial == "capture":
                     flags |= CONFIG_SERIAL_CAPTURE
                 elif self.windows_serial == "cdc":

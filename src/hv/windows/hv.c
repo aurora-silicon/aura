@@ -297,7 +297,7 @@ int hv_windows_configure(u64 flags)
         ((flags & HV_WINDOWS_SERIAL_CAPTURE) || uartproxy_iodev < IODEV_USB0 ||
          uartproxy_iodev >= IODEV_USB0 + USB_IODEV_COUNT))
         return -1;
-    if ((flags & HV_WINDOWS_GUEST_COMPAT) && chip_id != T8142)
+    if ((flags & HV_WINDOWS_GUEST_COMPAT) && !hv_absent_pmuv3())
         return -1;
     if ((flags & (HV_WINDOWS_MTP | HV_WINDOWS_CPUFREQ)) && (chip_id != T8142 || board_id != 0x24))
         return -1;
@@ -318,6 +318,18 @@ int hv_windows_configure_ecpu(u64 state, u64 khz)
     hv_windows_ecpu_state = state;
     hv_windows_ecpu_khz = khz;
     return 0;
+}
+
+/*
+ * T8142 and T8152 both lack the architectural PMUv3 register bank.  An EL1 access is an
+ * undefined instruction taken straight to EL1 (ESR_EL1 0x02000000): MDCR_EL2.TPM never sees
+ * it.  Measured on T8152 in M3 run 1 (2026-11-16): bootmgr's ungated "mrs x9, PMCCNTR_EL0"
+ * faulted that way with MDCR_EL2 0x60 set.  Everything that recovers those accesses keys on
+ * this, so the two chips cannot drift apart.
+ */
+bool hv_absent_pmuv3(void)
+{
+    return chip_id == T8142 || chip_id == T8152;
 }
 
 bool hv_windows_guest_compat_enabled(void)
@@ -1274,6 +1286,31 @@ static bool hv_windows_apply_ecpu(void)
     return true;
 }
 
+/*
+ * T8152: hand the guest its EL1 virtual timer disabled (CNTV_CTL_EL0 = 0).
+ *
+ * exception_initialize() leaves it ENABLE|IMASK on every CPU, with CVAL long expired, so
+ * ISTATUS is set.  T8152 has no VM_TMR_FIQ_ENA, so the carrier gates timers with the guest's
+ * own IMASK (vm_tmr_fiq_set/clr), and hv_timer_firing() does not look at IMASK.  Mu never
+ * programs CNTV (its TimerDxe is the physical timer), so in M3 run 1 every NTAIC completion
+ * cleared IMASK and the next exit reflected the same expired CNTV again: ~126k loops a second
+ * of EVENT abort + trapped CNTP_CTL read + SMC, ~380k exits/s, the core saturated at the Mu
+ * shell.  With ENABLE clear the timer is never "firing" and nothing is reflected.  The
+ * architecture leaves CNTV_CTL.ENABLE UNKNOWN at reset, so no guest may rely on the old
+ * value; a guest that wants the virtual timer programs it.  PSCI CPU_OFF already parks a
+ * core with the same write (hv_psci.c).  T8142 keeps its old state.
+ */
+static void hv_t8152_quiesce_guest_vtimer(bool primary)
+{
+    if (chip_id != T8152)
+        return;
+    u64 was = mrs(SYS_CNTV_CTL_EL02);
+    msr(SYS_CNTV_CTL_EL02, 0);
+    sysop("isb");
+    if (primary)
+        printf("HV: T8152: guest CNTV_CTL 0x%lx -> 0 at entry (no stray virtual timer)\n", was);
+}
+
 int hv_start(void *entry, u64 regs[4])
 {
     if (boot_cpu_idx == -1) {
@@ -1479,6 +1516,7 @@ int hv_start(void *entry, u64 regs[4])
      * would remember to set.
      */
 
+    hv_t8152_quiesce_guest_vtimer(true);
     printf("HV: Entering guest at %p (x0=0x%lx)\n", entry, regs[0]);
     hv_enter_guest(regs[0], regs[1], regs[2], regs[3], entry);
 
@@ -1535,6 +1573,8 @@ static void hv_init_secondary(struct hv_secondary_info_t *info)
         if (info->sprr_config & SPRR_CONFIG_EN)
             msr(SYS_IMP_APL_GXF_CONFIG_EL1, info->gxf_config);
     }
+
+    hv_t8152_quiesce_guest_vtimer(false);
 
 #ifdef ENABLE_NATIVE_AIC_PASSTHROUGH
     /* T8152: a CPU started by the guest OS gets a CPU interface fresh from reset. */

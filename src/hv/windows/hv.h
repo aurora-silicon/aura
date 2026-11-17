@@ -20,12 +20,20 @@ void hv_windows_abort_guest(void);
 int hv_windows_configure(u64 flags);
 int hv_windows_configure_ecpu(u64 state, u64 khz);
 bool hv_windows_guest_compat_enabled(void);
+/* The SoC has no architectural PMUv3 bank: EL1 accesses UNDEF (T8142, T8152). */
+bool hv_absent_pmuv3(void);
 bool hv_windows_serial_capture_enabled(void);
 bool hv_windows_serial_cdc_enabled(void);
 bool hv_windows_mtp_enabled(void);
 bool hv_windows_cpufreq_owned(void);
 bool hv_windows_can_prepare_device(void);
 void hv_windows_quarantine(void);
+/*
+ * Guest compatibility: the absent-PMUv3 UNDEF recovery (vector redirect, access-site
+ * replacement, wedge recovery; hv_exc.c).  T8142 ("t8142-experimental") and, since M3
+ * run 1 on J804, T8152 ("t8152-pmu-undef"), where an EL1 PMUv3 access also UNDEFs
+ * before MDCR_EL2.TPM can trap it.  hv_windows_configure() refuses it on other chips.
+ */
 #define HV_WINDOWS_GUEST_COMPAT   BIT(0)
 #define HV_WINDOWS_FB_SHADOW      BIT(1)
 #define HV_WINDOWS_SERIAL_CAPTURE BIT(2)

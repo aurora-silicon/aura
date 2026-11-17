@@ -178,7 +178,8 @@ The launch receipt records each offset and both source and composed hashes.
 Optional `boot_args` is at most 255 ASCII bytes. Select `bgra-shadow`
 only when conversion is needed and supported. Select `t8142-experimental` only
 for a deliberately tested T8142 experiment; it is never inferred from the
-model and is rejected for other chips. The normal/default profile requests no
+model and is rejected for other chips. `t8152-pmu-undef` is the same resident
+bit on T8152 (the absent-PMUv3 UNDEF recovery) and is rejected for other chips. The normal/default profile requests no
 experimental guest rewrites.
 
 `usb` defaults to `disabled`, currently the only supported value. The host

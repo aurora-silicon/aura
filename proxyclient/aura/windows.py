@@ -45,6 +45,11 @@ T8152_ACTLR_ARCH = 0x4000
 T8152_GIC_TRAPALL = 0x8000
 T8152_CPUS = 12
 CONFIG_T8142_EXPERIMENTAL = 0x0001
+# The same resident bit on T8152: the absent-PMUv3 UNDEF recovery only (M3 run 1: bootmgr's
+# ungated "mrs x9, PMCCNTR_EL0" UNDEFs at EL1 there exactly as on T8142).
+CONFIG_GUEST_COMPAT = CONFIG_T8142_EXPERIMENTAL
+T8152_PMU_UNDEF = "t8152-pmu-undef"
+GUEST_COMPATIBILITY = ("none", "t8142-experimental", T8152_PMU_UNDEF)
 CONFIG_FRAMEBUFFER_SHADOW = 0x0002
 CONFIG_SERIAL_CAPTURE = 0x0004
 CONFIG_SERIAL_CDC = 0x0008
@@ -349,9 +354,11 @@ def plan_profile(filename):
     framebuffer = profile.get("framebuffer", "native")
     require(framebuffer in ("native", "bgra-shadow"), "unsupported framebuffer policy")
     compatibility = profile.get("guest_compatibility", "none")
-    require(compatibility in ("none", "t8142-experimental"), "unsupported guest compatibility policy")
-    require(compatibility == "none" or chip == 0x8142,
+    require(compatibility in GUEST_COMPATIBILITY, "unsupported guest compatibility policy")
+    require(compatibility != "t8142-experimental" or chip == 0x8142,
             "t8142-experimental compatibility requires chip 0x8142")
+    require(compatibility != T8152_PMU_UNDEF or chip == T8152_CHIP,
+            "t8152-pmu-undef compatibility requires chip 0x8152")
     usb = profile.get("usb", "disabled")
     require(usb == "disabled", "USB handoff is not implemented; usb must be disabled")
     serial = profile.get("serial", "disabled")
@@ -468,7 +475,8 @@ def t8152_profile_fields(profile, chip, framebuffer, compatibility, n1, mtp, res
     require(gic_cpuif == "software", "T8152 requires gic_cpuif software (measurement (f): "
             "GIC_CPUIF_UNDEF in the hardware CPU interface configuration)")
     require(framebuffer == "bgra-shadow", "T8152 requires framebuffer bgra-shadow")
-    require(compatibility == "none", "T8152 requires guest_compatibility none")
+    require(compatibility in ("none", T8152_PMU_UNDEF),
+            "T8152 takes guest_compatibility none or t8152-pmu-undef")
     require(n1 == "disabled" and mtp == "disabled", "T8152 has no N1 or MTP handoff")
     require(not reserved, "T8152 profiles take no reserved_memory; guest_ram is the whole guest")
     return (base, top), ipi, on_reset, gic_cpuif

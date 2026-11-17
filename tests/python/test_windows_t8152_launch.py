@@ -184,6 +184,10 @@ def run(case="success"):
         hv.windows_wfi = "wfi"
     if case == "carrier-cpuif":
         hv.windows_gic_cpuif = "carrier"
+    if case == "pmu-undef":
+        hv.windows_guest_compatibility = "t8152-pmu-undef"
+    if case == "t8142-compat":
+        hv.windows_guest_compatibility = "t8142-experimental"
     hv.init()
     payload = bytes(range(256)) * 64
     hv.load_raw(payload, 0)
@@ -242,6 +246,7 @@ def test_t8152_guest_placement_and_adt():
     ("cpu-missing", r"only 11 of 12 CPUs .*not live: \[9\]"),
     ("secondaries-not-started", "only 1 of 12 CPUs"),
     ("wfi", "WFI_WIPES"),
+    ("t8142-compat", "none or t8152-pmu-undef"),
 ])
 def test_t8152_launch_refusals(case, message):
     with pytest.raises((ValueError, RuntimeError), match=message):
@@ -287,3 +292,23 @@ def test_run_guest_does_not_call_a_link_failure_a_refusal():
     assert "except ProxyRemoteError" in init
     assert "except (UartError, ProxyReplyError)" in init and "raise" in init
     assert "RuntimeError" not in init
+
+
+def test_t8152_pmu_undef_sets_only_the_guest_compat_bit():
+    # M3 run 1: the absent-PMUv3 recovery is an explicit opt-in on the resident's bit 0.
+    flags = [t[1] for t in run().trace if isinstance(t, tuple) and t[0] == "config"]
+    assert len(flags) == 1 and not flags[0] & windows.CONFIG_GUEST_COMPAT
+    flags = [t[1] for t in run("pmu-undef").trace if isinstance(t, tuple) and t[0] == "config"]
+    assert len(flags) == 1 and flags[0] & windows.CONFIG_GUEST_COMPAT
+    assert flags[0] & ~windows.CONFIG_GUEST_COMPAT == windows.CONFIG_FRAMEBUFFER_SHADOW | \
+        windows.CONFIG_SERIAL_CDC | windows.CONFIG_T8152_SOFT_GIC
+
+
+def test_run_guest_passes_the_pmu_undef_opt_in():
+    source = (REPO / "proxyclient/tools/run_guest.py").read_text()
+    assert "'--windows-guest-compatibility', choices=('none', 't8152-pmu-undef')" in source
+    t8152 = source.split("def run_windows_t8152", 1)[1].split("hv.init()", 1)[0]
+    assert "hv.windows_guest_compatibility = args.windows_guest_compatibility" in t8152
+    # Off T8152 the option is refused with the other --windows-* options.
+    tail = source.split("_windows_caps = windows_resident_caps()", 1)[1]
+    assert "args.windows_guest_compatibility != 'none'" in tail
