@@ -40,7 +40,8 @@ typedef int64_t s64;
 
 CASES = ["reset_values", "group1_disabled", "pmr_mask", "ack_eoi", "active_and_pending",
          "preemption_nesting", "binary_point", "eoimode1", "special_and_group0",
-         "ties_and_range", "power_on", "sgi1r_targets", "concurrent_pending", "windows_like"]
+         "ties_and_range", "power_on", "sgi1r_targets", "concurrent_pending", "windows_like",
+         "timer_gate", "timer_level_windows"]
 
 
 def source(name):

@@ -401,3 +401,22 @@ bool gicv3_sgi1r_targets(u64 sgi1r, u64 mpidr, bool is_sender)
         return false;
     return (sgi1r & (1u << (aff0 & 0xf))) != 0;
 }
+
+struct gicv3_timer_gate gicv3_timer_gate(u64 ctl, bool held)
+{
+    struct gicv3_timer_gate g = {0};
+    bool imask = (ctl & GICV3_TIMER_CTL_IMASK) != 0;
+    bool fired = (ctl & (GICV3_TIMER_CTL_ENABLE | GICV3_TIMER_CTL_ISTATUS)) ==
+                 (GICV3_TIMER_CTL_ENABLE | GICV3_TIMER_CTL_ISTATUS);
+
+    held = held && imask; /* IMASK clear: the guest rewrote CTL, nothing is held */
+    g.asserted = fired && (!imask || held);
+    if (g.asserted) {
+        g.set_imask = !imask;
+        g.held = true;
+    } else {
+        g.clear_imask = held;
+        g.held = false;
+    }
+    return g;
+}

@@ -1521,6 +1521,9 @@ static void hv_gic_cpuif_set_pending(u32 intid);
 static void hv_gic_cpuif_timer_pend(bool physical);
 static void hv_gic_cpuif_send_sgi(u64 val);
 static void hv_gic_cpuif_sync_vi(void);
+static void hv_t8152_gic_timer_update(bool physical);
+static bool hv_t8152_gic_timer_guest_write(bool physical, bool control_write);
+static u64 hv_t8152_gic_timer_guest_read(bool physical, bool control, u64 value);
 
 static void hv_update_fiq(struct exc_info *ctx)
 {
@@ -1674,19 +1677,27 @@ static void hv_update_fiq(struct exc_info *ctx)
          * Mask the Apple FIQ source and mark the matching GTDT PPI pending;
          * hv_gic_cpuif_sync_vi() raises HCR.VI and the guest acknowledges
          * through ICC_IAR1_EL1 exactly as it would on real GICv3 hardware.
+         *
+         * T8152 has no VM_TMR_FIQ_ENA gate and shares IMASK with the guest, so
+         * it takes the level-sensitive route in hv_t8152_gic_timer_update().
          */
-        if (hv_timer_firing(mrs(CNTP_CTL_EL02))) {
-            vm_tmr_fiq_clr(VM_TMR_FIQ_ENA_ENA_P);
-            hv_gic_cpuif_timer_pend(true);
+        if (chip_id == T8152) {
+            hv_t8152_gic_timer_update(true);
+            hv_t8152_gic_timer_update(false);
         } else {
-            vm_tmr_fiq_set(VM_TMR_FIQ_ENA_ENA_P);
-        }
+            if (hv_timer_firing(mrs(CNTP_CTL_EL02))) {
+                vm_tmr_fiq_clr(VM_TMR_FIQ_ENA_ENA_P);
+                hv_gic_cpuif_timer_pend(true);
+            } else {
+                vm_tmr_fiq_set(VM_TMR_FIQ_ENA_ENA_P);
+            }
 
-        if (hv_timer_firing(mrs(CNTV_CTL_EL02))) {
-            vm_tmr_fiq_clr(VM_TMR_FIQ_ENA_ENA_V);
-            hv_gic_cpuif_timer_pend(false);
-        } else {
-            vm_tmr_fiq_set(VM_TMR_FIQ_ENA_ENA_V);
+            if (hv_timer_firing(mrs(CNTV_CTL_EL02))) {
+                vm_tmr_fiq_clr(VM_TMR_FIQ_ENA_ENA_V);
+                hv_gic_cpuif_timer_pend(false);
+            } else {
+                vm_tmr_fiq_set(VM_TMR_FIQ_ENA_ENA_V);
+            }
         }
     } else if (hv_native_aic_mu_timer_active()) {
         /*
@@ -1979,6 +1990,9 @@ static void hv_timer_reflect_guest_rearm(bool physical, bool control_write, u64 
 
     hv_timer_diag_note_rearm(physical);
 
+    if (hv_t8152_gic_timer_guest_write(physical, control_write))
+        return;
+
     if (!hv_native_aic_windows_active()) {
         /*
          * TimerDxe first writes CTL to disable/mask the timer, then registers
@@ -2177,8 +2191,13 @@ static bool hv_handle_software_pmu(u64 reg, bool is_read, u64 rt, u64 regs[32])
 
     switch (reg) {
         case SYSREG_ISS(SYS_PMCCNTR_EL0):
-            if (is_read)
+            if (is_read) {
+                struct hv_guest_diag *d = &hv_guest_diag[smp_id()];
+
                 regs[rt] = hv_host_counter();
+                d->pmc_reads++;
+                d->pmc_last = regs[rt];
+            }
             break;
 
         case SYSREG_ISS(SYS_PMCR_EL0):
@@ -2378,7 +2397,29 @@ static struct {
     bool stale_v;
     bool brought_up;
     bool unknown_logged;
+    /* Index 0 CNTP, 1 CNTV: the carrier, not the guest, set that timer's IMASK (gicv3_timer_gate). */
+    bool timer_held[2];
+    bool timer_disabled_logged[2];
 } t8152_cpuif_aux[MAX_CPUS];
+/*
+ * 1 Hz report counters (hv_t8152_gic_report).  Owner-written except the
+ * per-INTID arrays and raise counts, which an SGI sender updates for its
+ * target: those use relaxed atomics.  Read by the reporter without a lock.
+ */
+static u32 t8152_raise_by_intid[GICV3_CPUIF_NR_INTID];
+static u32 t8152_ack_by_intid[GICV3_CPUIF_NR_INTID];
+static u64 t8152_raise_count[MAX_CPUS];
+
+/* Lowest INTID set in a CPU-interface bitmap, or -1. */
+static int hv_t8152_first_set(const u32 *map)
+{
+    for (u32 word = 0; word < GICV3_CPUIF_WORDS; word++) {
+        u32 bits = __atomic_load_n(&map[word], __ATOMIC_RELAXED);
+        if (bits)
+            return (int)(word * 32 + __builtin_ctz(bits));
+    }
+    return -1;
+}
 static bool t8152_gic_claimed;
 static bool t8152_gic_owned;
 static bool t8152_mu_icc_logged[MAX_CPUS];
@@ -2480,6 +2521,8 @@ void hv_t8152_gic_cpu_start(void)
     t8152_cpuif_aux[cpu].brought_up = false;
     t8152_cpuif_aux[cpu].stale_p = false;
     t8152_cpuif_aux[cpu].stale_v = false;
+    t8152_cpuif_aux[cpu].timer_held[0] = false;
+    t8152_cpuif_aux[cpu].timer_held[1] = false;
 }
 
 static void hv_t8152_gic_sync_vi(void)
@@ -2506,13 +2549,25 @@ static void hv_t8152_gic_sync_vi(void)
     hv_write_hcr(want);
 }
 
+/* Mark INTID pending on CPU's interface; count a not-pending -> pending edge for the report. */
+static void hv_t8152_gic_raise(u64 cpu, u32 intid)
+{
+    if (intid >= GICV3_CPUIF_NR_INTID)
+        return;
+    if (!gicv3_cpuif_is_pending(&t8152_cpuif[cpu], intid)) {
+        __atomic_fetch_add(&t8152_raise_by_intid[intid], 1, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&t8152_raise_count[cpu], 1, __ATOMIC_RELAXED);
+    }
+    gicv3_cpuif_set_pending(&t8152_cpuif[cpu], intid);
+}
+
 static void hv_t8152_gic_set_pending(u32 intid)
 {
     u64 cpu = smp_id();
 
     if (!hv_t8152_gic_owned() || cpu >= MAX_CPUS)
         return;
-    gicv3_cpuif_set_pending(&t8152_cpuif[cpu], intid);
+    hv_t8152_gic_raise(cpu, intid);
     hv_t8152_gic_sync_vi();
 }
 
@@ -2536,6 +2591,107 @@ static void hv_t8152_gic_timer_pend(bool physical)
     hv_t8152_gic_set_pending(physical ? HV_VGIC_TIMER_P_INTID : HV_VGIC_TIMER_V_INTID);
 }
 
+/* The guest's GICR_ISENABLER0 bit for an SGI/PPI on this CPU's redistributor. */
+static bool hv_t8152_gic_ppi_enabled(u64 cpu, u32 intid)
+{
+#ifdef ENABLE_VGIC_MODULE
+    return intid < 32 && (hv_vgic3_redist_enabled0((int)cpu) & BIT(intid)) != 0;
+#else
+    (void)cpu;
+    (void)intid;
+    return true;
+#endif
+}
+
+/*
+ * T8152, guest OS phase: drive timer PPI 17 / 18 from the timer's real output, as a
+ * level-sensitive input.  Runs on every EL2 exit (hv_update_fiq()).
+ *
+ * M3 run 2 (2026-11-17): the guest wrote CNTV_CTL_EL0 = ENABLE | IMASK before it
+ * programmed CVAL, and the carrier had left the firmware's long-expired CVAL in place,
+ * so CNTV_CTL read 7 for 200 s.  The old route asked hv_timer_firing(), which ignores
+ * IMASK, so INTID 18 was pended on every exit from the moment the guest configured
+ * the PPI, re-pended after every EOI, and never cleared: ~8.4k interrupts/s on the
+ * boot CPU, ELR_EL1 the same in every sample, no forward progress.  On real hardware
+ * IMASK = 1 keeps the timer's interrupt deasserted.
+ *
+ * Here the level is ENABLE && ISTATUS && !guest-IMASK (gicv3_timer_gate(), which also
+ * tells the carrier's own silencing IMASK from the guest's), and the PPI is pending
+ * exactly while that level is high and the guest has enabled the PPI at its
+ * redistributor.  A low or disabled line clears the pending state, so a tick whose
+ * CVAL the ISR already moved forward is not delivered a second time after EOI.
+ * hv_update_fiq() ends with hv_gic_cpuif_sync_vi(), which drops HCR_EL2.VI when
+ * nothing is left to signal.
+ */
+static void hv_t8152_gic_timer_update(bool physical)
+{
+    u64 cpu = smp_id();
+
+    if (!hv_t8152_gic_owned() || cpu >= MAX_CPUS)
+        return;
+
+    u32 intid = physical ? HV_VGIC_TIMER_P_INTID : HV_VGIC_TIMER_V_INTID;
+    unsigned int t = physical ? 0 : 1;
+    bool *held = &t8152_cpuif_aux[cpu].timer_held[t];
+    u64 ctl = physical ? mrs(CNTP_CTL_EL02) : mrs(CNTV_CTL_EL02);
+    struct gicv3_timer_gate g = gicv3_timer_gate(ctl, *held);
+
+    if (g.set_imask) {
+        if (physical)
+            reg_set(SYS_CNTP_CTL_EL02, CNTx_CTL_IMASK);
+        else
+            reg_set(SYS_CNTV_CTL_EL02, CNTx_CTL_IMASK);
+    } else if (g.clear_imask) {
+        if (physical)
+            reg_clr(SYS_CNTP_CTL_EL02, CNTx_CTL_IMASK);
+        else
+            reg_clr(SYS_CNTV_CTL_EL02, CNTx_CTL_IMASK);
+    }
+    *held = g.held;
+
+    if (g.asserted) {
+        if (hv_t8152_gic_ppi_enabled(cpu, intid)) {
+            hv_t8152_gic_timer_pend(physical);
+            return;
+        }
+        if (!t8152_cpuif_aux[cpu].timer_disabled_logged[t]) {
+            t8152_cpuif_aux[cpu].timer_disabled_logged[t] = true;
+            printf("HV: T8152: timer INTID %u asserted on CPU %d while disabled at its "
+                   "redistributor; not signalled until the guest enables it\n",
+                   intid, (int)cpu);
+        }
+    }
+    gicv3_cpuif_clear_pending(&t8152_cpuif[cpu], intid);
+}
+
+/*
+ * A trapped guest CNTP access on T8152 once the OS owns the GIC (CNTV is not trapped
+ * there).  A control write replaces whatever IMASK the carrier held, and the next
+ * hv_update_fiq() re-evaluates the level, so nothing else is done here: the Mu-phase
+ * reflection handshake in hv_timer_reflect_guest_rearm() would clear the guest's
+ * own IMASK.  A control read does not show the carrier's hold.
+ */
+static bool hv_t8152_gic_timer_guest_write(bool physical, bool control_write)
+{
+    u64 cpu = smp_id();
+
+    if (!hv_t8152_gic_owned() || cpu >= MAX_CPUS)
+        return false;
+    if (control_write)
+        t8152_cpuif_aux[cpu].timer_held[physical ? 0 : 1] = false;
+    return true;
+}
+
+static u64 hv_t8152_gic_timer_guest_read(bool physical, bool control, u64 value)
+{
+    u64 cpu = smp_id();
+
+    if (control && hv_t8152_gic_owned() && cpu < MAX_CPUS &&
+        t8152_cpuif_aux[cpu].timer_held[physical ? 0 : 1])
+        value &= ~(u64)CNTx_CTL_IMASK;
+    return value;
+}
+
 /* ICC_SGI1R_EL1: mark the SGI pending on every target, kick the other CPUs. */
 static void hv_t8152_gic_send_sgi(u64 val)
 {
@@ -2551,7 +2707,7 @@ static void hv_t8152_gic_send_sgi(u64 val)
         /* The boot CPU never sets the spin-table alive flag (see hv_gic_cpuif_send_sgi). */
         if (cpu != self && cpu != boot_cpu_idx && !smp_is_alive(cpu))
             continue;
-        gicv3_cpuif_set_pending(&t8152_cpuif[cpu], intid);
+        hv_t8152_gic_raise(cpu, intid);
         if (cpu != self)
             hv_kick_cpu(cpu);
     }
@@ -2628,6 +2784,8 @@ static bool hv_handle_t8152_gic_cpuif(u64 reg, bool is_read, u64 rt, u64 regs[32
 
     if (fx.acknowledged >= 0) {
         gic_cpuif_ack_count[cpu]++;
+        if (fx.acknowledged < GICV3_CPUIF_NR_INTID)
+            __atomic_fetch_add(&t8152_ack_by_intid[fx.acknowledged], 1, __ATOMIC_RELAXED);
         if (!gic_cpuif_acked[cpu]) {
             gic_cpuif_acked[cpu] = true;
             printf("HV: T8152: guest acknowledged emulated INTID %d on CPU %d from pc 0x%lx\n",
@@ -5204,6 +5362,7 @@ void hv_report_t8142_gic_activity(void)
 {
     static u32 last_ack[MAX_CPUS];
     static u32 last_eoi[MAX_CPUS];
+    static u64 t8152_next;
     bool changed = false;
 
     if (!hv_soft_gic_cpuif())
@@ -5215,9 +5374,20 @@ void hv_report_t8142_gic_activity(void)
      * samples beyond the health gate's ten-second progress buckets at 1 Hz.
      * Keep the real counters visible even if IRQ counts did not change; WFI
      * progress distinguishes a repeatedly waking idle core from a stuck wait.
+     *
+     * T8152: at most once a second.  Printed on every host tick (~100 Hz) with EL2
+     * console output, it was part of the per-interrupt cost during M3 run 2's storm,
+     * and a healthy 12-CPU clock would change the counts on every tick.
      */
-    hv_report_t8142_wfi_traps();
-    hv_report_t8142_el0_vector();
+    if (chip_id == T8152) {
+        u64 now = get_ticks();
+        if (now < t8152_next)
+            return;
+        t8152_next = now + mrs(CNTFRQ_EL0);
+    } else {
+        hv_report_t8142_wfi_traps();
+        hv_report_t8142_el0_vector();
+    }
 
     for (u32 cpu = 0; cpu < MAX_CPUS; cpu++) {
         if (gic_cpuif_ack_count[cpu] != last_ack[cpu] ||
@@ -5230,7 +5400,7 @@ void hv_report_t8142_gic_activity(void)
     if (!changed)
         return;
 
-    printf("HV: T8142: emulated IRQ traffic (ack/eoi):");
+    printf("HV: %s: emulated IRQ traffic (ack/eoi):", chip_id == T8152 ? "T8152" : "T8142");
     for (u32 cpu = 0; cpu < MAX_CPUS; cpu++) {
         if (!gic_cpuif_ack_count[cpu] && !gic_cpuif_eoi_count[cpu])
             continue;
@@ -5242,7 +5412,8 @@ void hv_report_t8142_gic_activity(void)
          * which interrupt, because "stuck in the clock" and "stuck in an IPI"
          * point at completely different faults.
          */
-        int stuck = hv_gic_bitmap_first_set(gic_cpuif[cpu].active);
+        int stuck = chip_id == T8152 ? hv_t8152_first_set(t8152_cpuif[cpu].active)
+                                     : hv_gic_bitmap_first_set(gic_cpuif[cpu].active);
         if (stuck >= 0)
             printf("(act=%d)", stuck);
         last_ack[cpu] = gic_cpuif_ack_count[cpu];
@@ -5250,6 +5421,16 @@ void hv_report_t8142_gic_activity(void)
     }
     printf("\n");
 
+    /*
+     * T8152: the WFI and sync-vector counters every 32nd report that changed, as before the
+     * T8142 housekeeping split (one console line a second costs more on J804's USB console).
+     */
+    static u32 periodic;
+
+    if (chip_id == T8152 && (periodic++ % 32) == 0) {
+        hv_report_t8142_wfi_traps();
+        hv_report_t8142_el0_vector();
+    }
 }
 
 void hv_scan_t8142_guest_modules(void)
@@ -5415,7 +5596,7 @@ static bool hv_handle_msr_unlocked(struct exc_info *ctx, u64 iss)
 #define SYSREG_MAP_REFLECT(sr, to, physical, control)                                              \
     case SYSREG_ISS(sr):                                                                           \
         if (is_read) {                                                                             \
-            regs[rt] = _mrs(sr_tkn(to));                                                           \
+            regs[rt] = hv_t8152_gic_timer_guest_read(physical, control, _mrs(sr_tkn(to)));         \
         } else {                                                                                   \
             _msr(sr_tkn(to), regs[rt]);                                                            \
             hv_timer_reflect_guest_rearm(physical, control, regs[rt], regs[18] != 0);              \
@@ -6611,6 +6792,8 @@ static void hv_guest_diag_snapshot(struct exc_info *ctx)
     d->cntp_ctl = mrs(CNTP_CTL_EL02);
     d->cntp_cval = mrs(CNTP_CVAL_EL02);
     d->cntv_ctl = mrs(CNTV_CTL_EL02);
+    d->cntv_cval = mrs(CNTV_CVAL_EL02);
+    d->cntvoff = mrs(CNTVOFF_EL2);
     d->cntpct = mrs(CNTPCT_EL0);
 }
 
@@ -6701,6 +6884,147 @@ static const char *hv_guest_diag_mode(u64 spsr)
 
 #define HV_GDIAG_DELTA(f) (cur.f - last->f)
 
+/* "+1.250ms" (compare value ahead of the counter: due in), "-75000.000ms" (behind), "never". */
+static void hv_gdiag_due(char *buf, size_t n, u64 cval, u64 now, u64 freq_ms)
+{
+    if (cval == ~0UL) {
+        snprintf(buf, n, "never");
+        return;
+    }
+    s64 d = (s64)(cval - now);
+    u64 mag = d >= 0 ? (u64)d : (u64)-d;
+    snprintf(buf, n, "%c%lu.%03lums", d >= 0 ? '+' : '-', mag / freq_ms,
+             (mag % freq_ms) * 1000 / freq_ms);
+}
+
+/*
+ * T8152, second line per reported vCPU: the timers as the guest sees them, the
+ * carrier's IMASK holds, the emulated PMCCNTR, and (OS phase) the CPU interface.
+ *   v= / p=   CNTV / CNTP CTL, then CVAL minus the guest's counter (CNTPCT - CNTVOFF for
+ *             CNTV; CNTPCT for CNTP), as of this CPU's last exit
+ *   held=VP   1 where the carrier holds that timer's IMASK (gicv3_timer_gate())
+ *   pmc=N/Tus emulated PMCCNTR reads in the last second / advance of the value read
+ *   en=       GICR_ISENABLER0 of this CPU's redistributor
+ *   pmr= rpr= g1=  ICC_PMR_EL1, running priority, ICC_IGRPEN1_EL1
+ *   ack= raise=    acknowledges / not-pending->pending edges in the last second
+ *   pend= act=     lowest pending / active INTID now (-1: none)
+ */
+static void hv_t8152_gdiag_line(int cpu, const struct hv_guest_diag *cur,
+                                const struct hv_guest_diag *last, u64 freq_ms)
+{
+    static u32 last_ack[MAX_CPUS];
+    static u64 last_raise[MAX_CPUS];
+    char v[24], p[24];
+
+    hv_gdiag_due(v, sizeof(v), cur->cntv_cval, cur->cntpct - cur->cntvoff, freq_ms);
+    hv_gdiag_due(p, sizeof(p), cur->cntp_cval, cur->cntpct, freq_ms);
+    u64 pmc_us = (cur->pmc_last - last->pmc_last) * 1000 / freq_ms;
+
+    if (!hv_t8152_gic_owned()) {
+        printf("HV: g%d t: v=%lx %s p=%lx %s pmc=%lu/%luus\n", cpu, cur->cntv_ctl, v,
+               cur->cntp_ctl, p, cur->pmc_reads - last->pmc_reads, pmc_us);
+        return;
+    }
+
+    const struct gicv3_cpuif *c = &t8152_cpuif[cpu];
+    u32 ack = gic_cpuif_ack_count[cpu];
+    u64 raise = __atomic_load_n(&t8152_raise_count[cpu], __ATOMIC_RELAXED);
+#ifdef ENABLE_VGIC_MODULE
+    u32 en = hv_vgic3_redist_enabled0(cpu);
+#else
+    u32 en = 0;
+#endif
+
+    printf("HV: g%d t: v=%lx %s p=%lx %s held=%d%d pmc=%lu/%luus | en=0x%x pmr=0x%x rpr=0x%x "
+           "g1=%d ack=%u raise=%lu pend=%d act=%d\n",
+           cpu, cur->cntv_ctl, v, cur->cntp_ctl, p, t8152_cpuif_aux[cpu].timer_held[1],
+           t8152_cpuif_aux[cpu].timer_held[0], cur->pmc_reads - last->pmc_reads, pmc_us, en,
+           c->pmr, gicv3_cpuif_running_priority(c), c->igrpen1, ack - last_ack[cpu],
+           raise - last_raise[cpu], hv_t8152_first_set(c->pending),
+           hv_t8152_first_set(c->active));
+    last_ack[cpu] = ack;
+    last_raise[cpu] = raise;
+}
+
+/* The four INTIDs with the largest delta of `now` against `prev`, then prev := now. */
+static void hv_t8152_top4(const char *what, const u32 *now, u32 *prev)
+{
+    u32 id[4] = {0}, n[4] = {0};
+    u32 total = 0;
+
+    for (u32 intid = 0; intid < GICV3_CPUIF_NR_INTID; intid++) {
+        u32 cur = __atomic_load_n(&now[intid], __ATOMIC_RELAXED);
+        u32 d = cur - prev[intid];
+
+        prev[intid] = cur;
+        total += d;
+        for (int slot = 0; slot < 4 && d; slot++) {
+            if (d <= n[slot])
+                continue;
+            for (int k = 3; k > slot; k--) {
+                id[k] = id[k - 1];
+                n[k] = n[k - 1];
+            }
+            id[slot] = intid;
+            n[slot] = d;
+            break;
+        }
+    }
+    printf(" %s=%u", what, total);
+    for (int slot = 0; slot < 4 && n[slot]; slot++)
+        printf("%s%u:%u", slot ? "," : "[", id[slot], n[slot]);
+    if (n[0])
+        printf("]");
+}
+
+/*
+ * T8152, one global line a second: interrupts raised and acknowledged per INTID
+ * (all CPUs, top four), SPIs enabled at the emulated distributor, and PSCI calls by
+ * function number.  Silent when nothing changed.
+ */
+static void hv_t8152_gdiag_global(void)
+{
+    static u32 last_raise[GICV3_CPUIF_NR_INTID];
+    static u32 last_ack[GICV3_CPUIF_NR_INTID];
+    static u32 last_psci[HV_PSCI_CALL_SLOTS];
+    static u32 last_spis = ~0u;
+    bool psci_changed = false;
+
+    for (int i = 0; i < HV_PSCI_CALL_SLOTS; i++)
+        psci_changed |= __atomic_load_n(&hv_psci_calls[i], __ATOMIC_RELAXED) != last_psci[i];
+
+    u32 spi[4] = {0};
+#ifdef ENABLE_VGIC_MODULE
+    u32 spis = hv_vgic3_dist_enabled_spis(spi, 4);
+#else
+    u32 spis = 0;
+#endif
+    if (!hv_t8152_gic_owned() && !psci_changed)
+        return;
+
+    printf("HV: gic/s:");
+    if (hv_t8152_gic_owned()) {
+        hv_t8152_top4("raise", t8152_raise_by_intid, last_raise);
+        hv_t8152_top4("ack", t8152_ack_by_intid, last_ack);
+        printf(" spi-en=%u", spis);
+        for (u32 i = 0; i < spis && i < 4; i++)
+            printf("%s%u", i ? "," : "[", spi[i]);
+        if (spis)
+            printf("%s]", spis > 4 ? ",..." : "");
+        if (spis != last_spis)
+            printf("(changed)");
+        last_spis = spis;
+    }
+    printf(" psci:");
+    for (int i = 0; i < HV_PSCI_CALL_SLOTS; i++) {
+        u32 now = __atomic_load_n(&hv_psci_calls[i], __ATOMIC_RELAXED);
+        if (now != last_psci[i])
+            printf(" %x=%u", i, now - last_psci[i]);
+        last_psci[i] = now;
+    }
+    printf("\n");
+}
+
 void hv_guest_diag_report(void)
 {
     u64 freq_ms = mrs(CNTFRQ_EL0) / 1000;
@@ -6753,8 +7077,12 @@ void hv_guest_diag_report(void)
                HV_GDIAG_DELTA(timer_reflect), HV_GDIAG_DELTA(timer_unrouted_mask),
                HV_GDIAG_DELTA(virq_exit), cur.cntp_ctl, late >= 0 ? "late" : "due",
                (u64)(late >= 0 ? late : -late) / freq_ms, cur.cntv_ctl);
+        if (chip_id == T8152)
+            hv_t8152_gdiag_line(cpu, &cur, last, freq_ms);
         *last = cur;
     }
+    if (chip_id == T8152)
+        hv_t8152_gdiag_global();
 }
 
 #undef HV_GDIAG_DELTA

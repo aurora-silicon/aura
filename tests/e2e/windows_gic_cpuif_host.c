@@ -397,6 +397,134 @@ static void case_windows_like(void)
     pass("windows_like");
 }
 
+/*
+ * gicv3_timer_gate(): the generic timer's output (Arm DDI 0487: asserted while
+ * ENABLE = 1, ISTATUS = 1, IMASK = 0) with the carrier's own IMASK hold told apart
+ * from the guest's.
+ */
+#define T_EN GICV3_TIMER_CTL_ENABLE
+#define T_IM GICV3_TIMER_CTL_IMASK
+#define T_IS GICV3_TIMER_CTL_ISTATUS
+
+static void case_timer_gate(void)
+{
+    struct gicv3_timer_gate g;
+
+    /* Disabled, or enabled and not expired: nothing, whatever IMASK or the hold says. */
+    for (int held = 0; held < 2; held++) {
+        g = gicv3_timer_gate(0, held);
+        assert(!g.asserted && !g.set_imask && !g.held);
+        g = gicv3_timer_gate(T_EN, held);
+        assert(!g.asserted && !g.set_imask && !g.clear_imask && !g.held);
+        g = gicv3_timer_gate(T_IS, held); /* ISTATUS with ENABLE clear: not a timer event */
+        assert(!g.asserted && !g.held);
+    }
+    /* Fired and unmasked: asserted, the carrier masks the source and holds it. */
+    g = gicv3_timer_gate(T_EN | T_IS, false);
+    assert(g.asserted && g.set_imask && !g.clear_imask && g.held);
+    /* Next exit, still expired, IMASK is the carrier's: still asserted, no write. */
+    g = gicv3_timer_gate(T_EN | T_IM | T_IS, true);
+    assert(g.asserted && !g.set_imask && !g.clear_imask && g.held);
+    /* M3 run 2: the guest's own ENABLE | IMASK over an expired CVAL (CTL 7). Not asserted. */
+    g = gicv3_timer_gate(T_EN | T_IM | T_IS, false);
+    assert(!g.asserted && !g.set_imask && !g.clear_imask && !g.held);
+    /* Guest moved CVAL forward under the hold: level drops, the carrier unmasks again. */
+    g = gicv3_timer_gate(T_EN | T_IM, true);
+    assert(!g.asserted && !g.set_imask && g.clear_imask && !g.held);
+    /* Guest rewrote CTL (IMASK clear) under the hold: the hold is gone. */
+    g = gicv3_timer_gate(T_EN, true);
+    assert(!g.asserted && !g.clear_imask && !g.held);
+    g = gicv3_timer_gate(T_EN | T_IS, true);
+    assert(g.asserted && g.set_imask && g.held);
+    /* Guest stopped the timer (CTL 2) under the hold: not asserted, hold released. */
+    g = gicv3_timer_gate(T_IM, true);
+    assert(!g.asserted && g.clear_imask && !g.held);
+    pass("timer_gate");
+}
+
+/*
+ * The carrier loop of hv_t8152_gic_timer_update(), replayed against the model: on
+ * every "exit" the level is sampled and INTID 18 is pending exactly while it is high
+ * and enabled.  The guest sequence: CTL = ENABLE | IMASK before any CVAL; then CVAL
+ * and CTL = ENABLE; each tick moves CVAL forward before EOI.
+ */
+static u64 hw_ctl;
+static bool hw_held;
+static bool ppi_enabled;
+
+static void exit_sample(void)
+{
+    struct gicv3_timer_gate g = gicv3_timer_gate(hw_ctl, hw_held);
+
+    if (g.set_imask)
+        hw_ctl |= T_IM;
+    if (g.clear_imask)
+        hw_ctl &= ~(u64)T_IM;
+    hw_held = g.held;
+    if (g.asserted && ppi_enabled)
+        gicv3_cpuif_set_pending(&cpu, 18);
+    else
+        gicv3_cpuif_clear_pending(&cpu, 18);
+}
+
+/* The counter passing CVAL (ISTATUS follows ENABLE and the compare, not IMASK). */
+static void expire(bool expired)
+{
+    hw_ctl = expired ? (hw_ctl | T_IS) : (hw_ctl & ~(u64)T_IS);
+}
+
+static void case_timer_level_windows(void)
+{
+    fresh();
+    prio_table[18] = 0xd0;
+    hw_ctl = 0;
+    hw_held = false;
+    ppi_enabled = false;
+    enable(0xf0);
+
+    /* Run 2's trigger: CTL = ENABLE | IMASK over an expired CVAL. Never signalled. */
+    hw_ctl = T_EN | T_IM;
+    expire(true);
+    ppi_enabled = true;
+    for (int i = 0; i < 100; i++) {
+        exit_sample();
+        assert(gicv3_cpuif_deliverable(&cpu, prio, prio_table) == -1);
+    }
+    assert(hw_ctl == (T_EN | T_IM | T_IS) && !hw_held);
+
+    /* CVAL in the future, CTL = ENABLE. Quiet until it expires. */
+    expire(false);
+    hw_ctl = T_EN;
+    exit_sample();
+    assert(gicv3_cpuif_deliverable(&cpu, prio, prio_table) == -1);
+
+    for (int tick = 0; tick < 3; tick++) {
+        expire(true);
+        exit_sample(); /* the timer's EL2 FIQ */
+        assert(hw_ctl & T_IM);
+        assert(rd(GICV3_ICC_IAR1) == 18);
+        exit_sample(); /* an HVC inside the ISR before the acknowledge: active and pending */
+        assert(gicv3_cpuif_is_pending(&cpu, 18) && gicv3_cpuif_is_active(&cpu, 18));
+        expire(false); /* the tick moves CVAL forward, no CTL write */
+        exit_sample(); /* next exit: level low, carrier unmasks, pending cleared */
+        assert(!(hw_ctl & T_IM) && !gicv3_cpuif_is_pending(&cpu, 18));
+        wr(GICV3_ICC_EOIR1, 18);
+        exit_sample();
+        /* No stale duplicate after EOI. */
+        assert(gicv3_cpuif_deliverable(&cpu, prio, prio_table) == -1);
+    }
+
+    /* A disabled PPI is not signalled even while asserted, and is once enabled. */
+    ppi_enabled = false;
+    expire(true);
+    exit_sample();
+    assert(gicv3_cpuif_deliverable(&cpu, prio, prio_table) == -1);
+    ppi_enabled = true;
+    exit_sample();
+    assert(gicv3_cpuif_deliverable(&cpu, prio, prio_table) == 18);
+    pass("timer_level_windows");
+}
+
 int main(void)
 {
     case_reset_values();
@@ -413,5 +541,7 @@ int main(void)
     case_sgi1r_targets();
     case_concurrent_pending();
     case_windows_like();
+    case_timer_gate();
+    case_timer_level_windows();
     return 0;
 }

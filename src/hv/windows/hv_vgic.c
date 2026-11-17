@@ -998,6 +998,97 @@ static bool handle_vgic_dist_access(struct exc_info *ctx, u64 addr, u64 *val, bo
 //   true - access has been handled successfully, even if the access itself is either bad or not
 //   permitted. false - access was not handled successfully.
 //
+/*
+ * T8152 (J804) redistributor SGI-frame registers the Windows HAL relies on, modelled per
+ * Arm IHI 0069.  The shared code below them is kept for the other chips:
+ *  - GICR_ISENABLER0 / GICR_ICENABLER0 are one enable word: a write of 1 sets / clears
+ *    that INTID's enable, a write of 0 has no effect, both read the enable state.  The
+ *    shared path stored an ISENABLER0 write verbatim (dropping earlier enables), never
+ *    cleared on ICENABLER0, and edited the active state instead.  The T8152 carrier
+ *    signals a timer PPI only while it is enabled here (hv_t8152_gic_timer_update()).
+ *  - GICR_IPRIORITYR0-7 are a byte array (INTID N at byte N).  An access of 1 << width
+ *    bytes reads or writes exactly those bytes.  The shared read path for IPRIORITYR4-7
+ *    stored the (zeroed) read buffer into the register, and a byte write at a word-
+ *    aligned INTID zeroed its three neighbours.  Windows programs priorities with
+ *    single-byte stores.
+ */
+_Static_assert(offsetof(vgicv3_redistributor_sgi_region_t, gicr_ppi_ipriority_reg) ==
+                   offsetof(vgicv3_redistributor_sgi_region_t, gicr_sgi_ipriority_reg) + 16,
+               "GICR_IPRIORITYR0-7 must be contiguous");
+
+static bool hv_vgic_t8152_redist_sgi_access(int cpu, u64 relative_addr, u64 *val, bool write,
+                                            int width)
+{
+    vgicv3_redistributor_sgi_region_t *sgi = &redistributors[cpu].sgi_region;
+
+    if (chip_id != T8152)
+        return false;
+
+    switch (relative_addr) {
+        case GIC_REDIST_ISENABLER0:
+        case GIC_REDIST_ICENABLER0:
+            if (write) {
+                u32 enabled = __atomic_load_n(&sgi->gicr_isenabler0, __ATOMIC_RELAXED);
+                if (relative_addr == GIC_REDIST_ISENABLER0)
+                    enabled |= (u32)*val;
+                else
+                    enabled &= ~(u32)*val;
+                __atomic_store_n(&sgi->gicr_isenabler0, enabled, __ATOMIC_RELAXED);
+                sgi->gicr_icenabler0 = enabled;
+            } else {
+                *val = __atomic_load_n(&sgi->gicr_isenabler0, __ATOMIC_RELAXED);
+            }
+            return true;
+        default:
+            break;
+    }
+
+    if (relative_addr >= GIC_REDIST_IPRIORITYR0 && relative_addr <= GIC_REDIST_IPRIORITYR7 + 3) {
+        u32 first = (u32)(relative_addr - GIC_REDIST_IPRIORITYR0);
+        u32 nbytes = 1u << width;
+        u8 *prio = (u8 *)sgi->gicr_sgi_ipriority_reg;
+        u64 out = 0;
+
+        for (u32 i = 0; i < nbytes && first + i < 32; i++) {
+            if (write)
+                prio[first + i] = (u8)(*val >> (8 * i));
+            else
+                out |= (u64)prio[first + i] << (8 * i);
+        }
+        if (!write)
+            *val = out;
+        return true;
+    }
+    return false;
+}
+
+u32 hv_vgic3_redist_enabled0(int cpu)
+{
+    if (redistributors == NULL || cpu < 0 || cpu >= MAX_CPUS)
+        return 0;
+    return __atomic_load_n(&redistributors[cpu].sgi_region.gicr_isenabler0, __ATOMIC_RELAXED);
+}
+
+u32 hv_vgic3_dist_enabled_spis(u32 *first, u32 max)
+{
+    u32 count = 0;
+
+    if (distributor == NULL)
+        return 0;
+    for (u32 reg = 1; reg < 32; reg++) {
+        u32 word = __atomic_load_n(&distributor->gicd_interrupt_set_enable_regs[reg],
+                                   __ATOMIC_RELAXED);
+        while (word) {
+            u32 bit = (u32)__builtin_ctz(word);
+            word &= word - 1;
+            if (count < max)
+                first[count] = reg * 32 + bit;
+            count++;
+        }
+    }
+    return count;
+}
+
 static bool handle_vgic_redist_access(struct exc_info *ctx, u64 addr, u64 *val, bool write,
                                       int width)
 {
@@ -1032,7 +1123,9 @@ static bool handle_vgic_redist_access(struct exc_info *ctx, u64 addr, u64 *val, 
     /* T8152: as for the distributor (GICR_WAKER is written before a CPU interface is used). */
     if (write)
         hv_t8152_gic_claim("guest write to an emulated redistributor");
-    if (write) {
+    if (hv_vgic_t8152_redist_sgi_access(cpu_num, relative_addr, val, write, width)) {
+        register_handled = true;
+    } else if (write) {
         //
         // The guest attempted to write a register.
         // Handle it based on what they're trying to write, and preserve the value if

@@ -24,6 +24,7 @@
 #include "display.h"
 #include "exception.h"
 #include "heapblock.h"
+#include "guest_diag.h"
 #include "hv_psci.h"
 #include "malloc.h"
 #include "memory.h"
@@ -1395,9 +1396,17 @@ uint64_t hv_psci_mem_protect(unsigned int enable_mem_protect)
     return PSCI_STATUS_NOT_SUPPORTED;
 }
 
+u32 hv_psci_calls[HV_PSCI_CALL_SLOTS];
+
 bool hv_handle_psci_smc(struct exc_info *ctx)
 {
     uint64_t function_id = ctx->regs[0];
+    u32 slot = (u32)function_id & 0x1f;
+
+    if ((function_id & ~(uint64_t)0x1f) != 0x84000000 &&
+        (function_id & ~(uint64_t)0x1f) != 0xc4000000)
+        slot = HV_PSCI_CALL_SLOTS - 1;
+    __atomic_fetch_add(&hv_psci_calls[slot], 1, __ATOMIC_RELAXED);
     uint64_t a1 = ctx->regs[1], a2 = ctx->regs[2], a3 = ctx->regs[3];
     if (!(function_id & SMC_64_FUNCTION)) {
         a1 = (uint32_t)a1;

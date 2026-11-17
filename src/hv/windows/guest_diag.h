@@ -51,7 +51,12 @@ struct hv_guest_diag {
     u64 cntp_ctl;
     u64 cntp_cval;
     u64 cntv_ctl;
+    u64 cntv_cval;
+    u64 cntvoff;
     u64 cntpct;
+    /* Emulated PMCCNTR_EL0 reads (trapped, HVC-redirected or probed) and the last value. */
+    u64 pmc_reads;
+    u64 pmc_last;
 } __attribute__((aligned(64)));
 
 extern struct hv_guest_diag hv_guest_diag[MAX_CPUS];
@@ -68,6 +73,14 @@ struct hv_vuart_diag {
 };
 
 extern struct hv_vuart_diag hv_vuart_diag;
+
+/*
+ * PSCI calls by function number (function ID bits [4:0], SMC32 and SMC64 alike),
+ * counted by hv_handle_psci_smc() with relaxed atomics, any CPU.  Slot 31 also
+ * takes IDs outside the PSCI range (0x84000000 / 0xc4000000 + 0..0x1f).
+ */
+#define HV_PSCI_CALL_SLOTS 32
+extern u32 hv_psci_calls[HV_PSCI_CALL_SLOTS];
 
 void hv_guest_diag_report(void);
 

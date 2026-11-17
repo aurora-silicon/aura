@@ -167,4 +167,38 @@ bool gicv3_cpuif_access(struct gicv3_cpuif *c, gicv3_cpuif_priority_fn prio, voi
 bool gicv3_sgi1r_targets(u64 sgi1r, u64 mpidr, bool is_sender);
 u32 gicv3_sgi1r_intid(u64 sgi1r);
 
+/*
+ * The output of an architectural generic timer as a level input to its PPI.
+ *
+ * Arm DDI 0487 (generic timer, CNTx_CTL_EL0): the timer's interrupt is asserted
+ * while ENABLE = 1, ISTATUS = 1 and IMASK = 0.  A carrier without a separate
+ * hypervisor timer gate (T8152 has no VM_TMR_FIQ_ENA) silences an asserted
+ * timer at EL2 by setting the same IMASK the guest owns, so the two must be told
+ * apart: `held` says the carrier, not the guest, set the IMASK seen in `ctl`.
+ *
+ * In:  ctl, the CNTx_CTL value the hardware holds now; held, from the last call.
+ * Out: asserted, the level the guest's PPI sees (it must be pending exactly while
+ *      this is true and the PPI is enabled); set_imask / clear_imask, what the
+ *      carrier writes to IMASK; held, to pass to the next call.
+ *
+ * An IMASK that is clear means the guest rewrote CTL since the carrier set it,
+ * so the hold is gone.  A guest IMASK (held false) is a masked timer: not
+ * asserted, and left alone.  When the level drops while held (the guest moved
+ * CVAL forward or disabled the timer), the carrier clears its own IMASK again.
+ * The one case this cannot see is a guest writing IMASK = 1 over a held timer
+ * without an intervening exit; it is then treated as the carrier's hold.
+ */
+#define GICV3_TIMER_CTL_ENABLE  (1u << 0)
+#define GICV3_TIMER_CTL_IMASK   (1u << 1)
+#define GICV3_TIMER_CTL_ISTATUS (1u << 2)
+
+struct gicv3_timer_gate {
+    bool asserted;
+    bool set_imask;
+    bool clear_imask;
+    bool held;
+};
+
+struct gicv3_timer_gate gicv3_timer_gate(u64 ctl, bool held);
+
 #endif

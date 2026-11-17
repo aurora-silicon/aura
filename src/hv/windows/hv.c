@@ -1287,11 +1287,18 @@ static bool hv_windows_apply_ecpu(void)
 }
 
 /*
- * T8152: hand the guest its EL1 virtual timer disabled (CNTV_CTL_EL0 = 0).
+ * T8152: hand the guest its EL1 virtual timer disabled (CNTV_CTL_EL0 = 0) with a compare
+ * value that never matches (CNTV_CVAL_EL0 = ~0).
+ *
+ * The CVAL half is from M3 run 2: the guest wrote CNTV_CTL = ENABLE | IMASK before it
+ * programmed CVAL, so the firmware's expired CVAL made ISTATUS 1 at once (cntv=7 for 200 s; see hv_t8152_gic_timer_update() for the
+ * interrupt storm that followed).  CVAL is UNKNOWN at reset architecturally, so no guest may
+ * rely on the old value, and ~0 cannot be reached by the counter.
  *
  * exception_initialize() leaves it ENABLE|IMASK on every CPU, with CVAL long expired, so
  * ISTATUS is set.  T8152 has no VM_TMR_FIQ_ENA, so the carrier gates timers with the guest's
- * own IMASK (vm_tmr_fiq_set/clr), and hv_timer_firing() does not look at IMASK.  Mu never
+ * own IMASK (vm_tmr_fiq_set/clr); in the Mu phase hv_timer_firing() does not look at IMASK
+ * (the OS phase does: gicv3_timer_gate()).  Mu never
  * programs CNTV (its TimerDxe is the physical timer).  M3 run 1 measured at the Mu shell
  * ~126k/s each of SMC, data aborts, sysreg traps and timer reflections (~380k exits/s) with
  * cntv=7.  The inferred loop: every NTAIC completion cleared IMASK and the next exit reflected
@@ -1307,10 +1314,14 @@ static void hv_t8152_quiesce_guest_vtimer(bool primary)
     if (chip_id != T8152)
         return;
     u64 was = mrs(SYS_CNTV_CTL_EL02);
+    u64 was_cval = mrs(SYS_CNTV_CVAL_EL02);
     msr(SYS_CNTV_CTL_EL02, 0);
+    msr(SYS_CNTV_CVAL_EL02, ~0UL);
     sysop("isb");
     if (primary)
-        printf("HV: T8152: guest CNTV_CTL 0x%lx -> 0 at entry (no stray virtual timer)\n", was);
+        printf("HV: T8152: guest CNTV_CTL 0x%lx -> 0, CVAL 0x%lx -> ~0 at entry (no stray "
+               "virtual timer)\n",
+               was, was_cval);
 }
 
 int hv_start(void *entry, u64 regs[4])

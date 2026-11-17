@@ -593,6 +593,10 @@ int hv_vgicv3_enable_virtual_interrupts(void);
 
 u8 hv_vgic3_get_priority(u64 intd);
 u8 hv_vgic3_get_priority_cpu(int cpu, u64 intd);
+/* GICR_ISENABLER0 of that CPU's redistributor (SGI/PPI enables). */
+u32 hv_vgic3_redist_enabled0(int cpu);
+/* Number of SPIs enabled in GICD_ISENABLER<n>; the first `max` INTIDs go to first[]. */
+u32 hv_vgic3_dist_enabled_spis(u32 *first, u32 max);
 u16 hv_vgic3_num_cpus(void);
 int hv_vgic3_cpu_for_frame(u16 frame);
 
