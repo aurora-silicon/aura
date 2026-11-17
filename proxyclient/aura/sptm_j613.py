@@ -18,7 +18,8 @@ def validate_resources(get_reg):
 def inspect_patch_export(image, entry_off):
     """Validate and return the clean-room facts that are complete without admitting entry."""
     if image is None:
-        return {'reviewed': False, 'unresolved': unresolved_groups()}
+        return {'reviewed': bool(PATCH_EXPORT['reviewed']),
+                'unresolved': unresolved_groups()}
     if hashlib.sha256(image).hexdigest() != PATCH_EXPORT['image_sha256']:
         raise ValueError('J613 SPTM image identity does not match the 25G83 export')
     expected_entry = int(PATCH_EXPORT['entry_file_offset'], 0)
@@ -42,12 +43,17 @@ def inspect_patch_export(image, entry_off):
         patches.append(('APSTS poll', off, 0xffffffff, expected,
                         int(site['replacement'], 0)))
     return {'patches': patches, 'ctrr_stash_off': None, 'mte': None,
-            'reviewed': False, 'unresolved': unresolved_groups()}
+            'reviewed': bool(PATCH_EXPORT['reviewed']),
+            'unresolved': unresolved_groups()}
 
 def unresolved_groups():
     return [name for name, rows in PATCH_EXPORT['groups'].items() if rows is None]
 
 def patch_plan(image, entry_off):
     partial = inspect_patch_export(image, entry_off)
-    missing = ', '.join(partial['unresolved'])
-    raise ValueError(f'J613 dirty-room patch/GL export incomplete ({missing}); guest entry disabled')
+    if partial['unresolved']:
+        missing = ', '.join(partial['unresolved'])
+        raise ValueError(f'J613 dirty-room patch/GL export incomplete ({missing}); guest entry disabled')
+    if not partial['reviewed']:
+        raise ValueError('J613 dirty-room patch/GL export is not reviewed; guest entry disabled')
+    return partial
