@@ -801,6 +801,7 @@ class AuraProxy(Reloadable):
     P_HV_WINDOWS_GUEST_RAM = 0xc8c
     P_HV_WINDOWS_CAPS2 = 0xc8d
     P_HV_WINDOWS_AHCI = 0xc8e
+    P_HV_WINDOWS_USB = 0xc87
 
     P_FB_INIT = 0xd00
     P_FB_SHUTDOWN = 0xd01
@@ -1346,6 +1347,11 @@ class AuraProxy(Reloadable):
         # D1 AHCI store ops (src/hv/windows/hv_ahci.h): 0 QUERY, 1 ATTACH, 2 SEAL_UPLOAD,
         # 3 SEAL_EXIT, 4 STATUS.  2**64 - 1 is a refusal; the resident's console says why.
         return self.request(self.P_HV_WINDOWS_AHCI, op, a1, a2, a3, a4)
+
+    def hv_windows_usb(self, op, a1=0, a2=0):
+        """D4 USB passthrough (src/hv/windows/hv_usb.h): ATTACH(port mask), STATUS(port,
+        index), DETACH.  ATTACH returns 0 or a negative reason (signed)."""
+        return self.request(self.P_HV_WINDOWS_USB, op, a1, a2, signed=op == 1)
 
     def fb_init(self):
         return self.request(self.P_FB_INIT)

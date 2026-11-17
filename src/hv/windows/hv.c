@@ -274,14 +274,18 @@ int hv_windows_configure(u64 flags)
         flags & ~(HV_WINDOWS_GUEST_COMPAT | HV_WINDOWS_FB_SHADOW | HV_WINDOWS_SERIAL_CAPTURE |
                   HV_WINDOWS_SERIAL_CDC | HV_WINDOWS_MTP | HV_WINDOWS_CPUFREQ |
                   HV_WINDOWS_T8152_FAST_IPI | HV_WINDOWS_T8152_SOFT_GIC | HV_WINDOWS_T8152_WFI |
-                  HV_WINDOWS_T8152_AHCI))
+                  HV_WINDOWS_T8152_AHCI | HV_WINDOWS_T8152_USB))
         return -1;
     if ((flags & (HV_WINDOWS_T8152_FAST_IPI | HV_WINDOWS_T8152_SOFT_GIC | HV_WINDOWS_T8152_WFI |
-                  HV_WINDOWS_T8152_AHCI)) &&
+                  HV_WINDOWS_T8152_AHCI | HV_WINDOWS_T8152_USB)) &&
         chip_id != T8152)
         return -1;
     /* D1: the AHCI disk's SPI is delivered only by the software GIC CPU interface. */
     if ((flags & HV_WINDOWS_T8152_AHCI) && !(flags & HV_WINDOWS_T8152_SOFT_GIC))
+        return -1;
+    /* D4: the USB line too, and only on J804 (the port table is J804's). */
+    if ((flags & HV_WINDOWS_T8152_USB) &&
+        (!(flags & HV_WINDOWS_T8152_SOFT_GIC) || board_id != 0x22))
         return -1;
     if (chip_id == T8152 && !(flags & HV_WINDOWS_T8152_SOFT_GIC)) {
         printf("HV: T8152: the hardware GIC CPU interface path is refused (measurement (f): "
@@ -314,6 +318,8 @@ int hv_windows_configure(u64 flags)
     hv_t8152_wfi = flags & HV_WINDOWS_T8152_WFI;
     if (flags & HV_WINDOWS_T8152_AHCI)
         hv_ahci_enable();
+    if (flags & HV_WINDOWS_T8152_USB)
+        hv_usb_enable();
     return 0;
 }
 
@@ -366,6 +372,11 @@ bool hv_windows_cpufreq_owned(void)
     // through debug pauses and terminal drain; a fresh resident releases it.
     // An explicit E boot state closes host requests too, so nothing undoes it.
     return (hv_windows_flags & HV_WINDOWS_CPUFREQ) != 0 || hv_windows_ecpu_state != 0;
+}
+
+bool hv_windows_guest_entered(void)
+{
+    return hv_windows_entered;
 }
 
 bool hv_windows_can_prepare_device(void)
@@ -1272,6 +1283,8 @@ void hv_fb_report(void)
     hv_guest_diag_report();
     /* D1: AHCI disk counters, at most every 10 s and only when they moved. */
     hv_ahci_report();
+    /* D4: USB status and DART exceptions, one line per change. */
+    hv_usb_report();
 }
 
 bool hv_fb_shadow_contains(u64 pa)
@@ -1339,7 +1352,23 @@ static void hv_t8152_quiesce_guest_vtimer(bool primary)
                was, was_cval);
 }
 
+static int hv_start_session(void *entry, u64 regs[4]);
+
+/*
+ * D4: every way out of a guest session -- a PSCI SYSTEM_OFF/RESET return, a join failure, a
+ * refusal before entry -- passes here, so an attached USB controller is always halted and its
+ * DART streams taken down before the proxy (or the next owner) sees the machine.  The reset
+ * path (flush_and_reboot) has its own lock-free stop.
+ */
 int hv_start(void *entry, u64 regs[4])
+{
+    int ret = hv_start_session(entry, regs);
+    hv_usb_teardown(ret == 1 ? "guest SYSTEM_OFF" : ret == 2 ? "guest SYSTEM_RESET" :
+                                                               "guest session failed or refused");
+    return ret;
+}
+
+static int hv_start_session(void *entry, u64 regs[4])
 {
     if (boot_cpu_idx == -1) {
         printf("Boot CPU has not been found, can't start hypervisor\n");

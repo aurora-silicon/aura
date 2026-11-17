@@ -68,6 +68,12 @@ void hv_ahci_fatal_report(u64 now, u64 freq)
     printf("HV: fatal: AHCI stub report\n");
 }
 
+/* D4: the USB part of the report (hv_usb.c); recorded values only, nothing to model here. */
+void hv_usb_fatal_report(void)
+{
+    printf("HV: fatal: USB stub report\n");
+}
+
 u64 hv_wdt_breadcrumbs_read(int cpu)
 {
     return stub_crumbs[cpu];

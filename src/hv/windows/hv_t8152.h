@@ -22,7 +22,8 @@
  *
  * A denylist read from the live ADT (QSPI NOR/NVRAM controller, SEP, AOP,
  * ADMAC, i2c, audio, GPIO, WDT, PMGR, SPMI, DART, SART, ANS, SMC, MTP, SPI,
- * DCP, SIO, the proxy's usb-drd0) plus the MTE tag storage and the carve-out
+ * DCP, SIO, every usb-drd and atc-phy node; D4 lifts only a usb-drd1/3 xHCI
+ * window, and adds its USB DART tables) plus the MTE tag storage and the carve-out
  * above RAM is checked as well, at map time and again before entry, so that a
  * later allowlist edit cannot expose any of it.
  */
@@ -49,6 +50,21 @@ bool hv_t8152_guest_ram(u64 *base, u64 *size);
  * reach it (map filter and hv_t8152_verify).  Once per session.  0, or -1 with the reason.
  */
 int hv_t8152_reserve_store(u64 start, u64 end);
+
+/*
+ * D4: the usb-drd<port> (1 or 3) xHCI window [xhci, xhci + 0x8000) as an identity Device-nGnRnE
+ * passthrough.  Only the window build_denylist() split off that port's ADT reg 0; the rest of
+ * the controller, atc-phy*, dart-usb* and the TLBI aperture stay denied.  0, or -1 with the
+ * reason.  hv_t8152_usb_revoke() denies it again (after the caller unmapped it).
+ */
+int hv_t8152_usb_allow(int port, u64 xhci);
+void hv_t8152_usb_revoke(int port);
+
+/*
+ * D4: carrier memory (the USB DART tables) that must stay out of every stage-2 map: inside
+ * aura's heap span, clear of guest RAM and the store; denied for the rest of the session.
+ */
+int hv_t8152_reserve_carrier(u64 start, u64 end, const char *name);
 
 /* A carrier-owned exception to the RAM allowlist (never to the denylist). */
 int hv_t8152_allow(u64 ipa, u64 pa, u64 size, bool read_only, const char *name);

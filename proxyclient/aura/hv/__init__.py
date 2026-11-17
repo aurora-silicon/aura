@@ -1578,9 +1578,16 @@ class HV(Reloadable):
                 raise ValueError("t8152-pmu-undef is a T8152 guest compatibility")
             elif (self.windows_guest_ram is not None or self.windows_ipi != "poll" or
                   self.windows_gic_cpuif != "carrier" or self.windows_wfi != "poll" or
-                  self.windows_ahci is not None):
-                raise ValueError("guest RAM window, IPI mode, GIC cpuif and the AHCI disk are "
-                                 "T8152 options")
+                  self.windows_ahci is not None or self.windows_usb != "disabled"):
+                raise ValueError("guest RAM window, IPI mode, GIC cpuif, the AHCI disk and USB "
+                                 "passthrough are T8152 options")
+            if self.windows_usb != "disabled":
+                from ..windows import parse_windows_usb
+                if not parse_windows_usb(self.windows_usb):
+                    raise ValueError("windows_usb must be disabled or name drd1/drd3")
+                if self.windows_gic_cpuif != "software":
+                    raise ValueError("T8152 USB: the xHCI interrupt needs the software GIC CPU "
+                                     "interface")
             if self.windows_ahci is not None:
                 plan = self.windows_ahci["plan"]
                 if self.windows_guest_ram != (plan.window_base, plan.store_base):
@@ -1661,6 +1668,9 @@ class HV(Reloadable):
                 if self.windows_ahci is not None:
                     from ..windows import CONFIG_T8152_AHCI
                     flags |= CONFIG_T8152_AHCI
+                if self.windows_usb != "disabled":
+                    from ..windows import CONFIG_T8152_USB
+                    flags |= CONFIG_T8152_USB
                 if self.p.hv_windows_configure(flags) != 0:
                     raise WindowsLaunchRefused("Windows hypervisor configuration rejected")
                 # Applied once by hv_start() before guest entry; never retried on this resident.
@@ -1936,10 +1946,16 @@ class HV(Reloadable):
         self.started_cpus[index] = (die, cluster, cpu)
         self.p.hv_start_secondary(index, entry)
 
-    def _disable_windows_usb(self):
+    def _strip_windows_usb_nodes(self):
+        """Remove every usb-drd*/dart-usb* node from the guest ADT (Mu needs none; Windows sees
+        only ACPI).  /chosen says whether the carrier passes a port through (D4):
+        aura,windows-usb-disabled = 1 when off, aura,windows-usb = the port mask (diagnostic)
+        when on.  The handshake Mu acts on, aura,windows-usb-v1, is never written here: only
+        set_windows_usb_handshake() after ATTACH succeeded adds it."""
         import re
-        if self.windows_usb != "disabled":
-            raise ValueError("Windows USB handoff is not implemented")
+        from ..windows import (USB_DISABLED_PROPERTY, USB_HANDSHAKE_PROPERTY, USB_PROPERTY,
+                               parse_windows_usb, usb_port_mask)
+        mask = usb_port_mask(parse_windows_usb(self.windows_usb))
         removed = set()
         for node in list(self.adt["/arm-io"]):
             if re.fullmatch(r"(?:usb-drd|dart-usb)\d+", node.name):
@@ -1983,12 +1999,35 @@ class HV(Reloadable):
         for key in ("stdout-path", "stdin-path", "linux,stdout-path"):
             if key in chosen._properties and removed_reference(chosen._properties[key]):
                 del chosen._properties[key]
-        marker = "aura,windows-usb-disabled"
-        chosen._properties[marker] = 1
+        for marker in (USB_DISABLED_PROPERTY, USB_PROPERTY, USB_HANDSHAKE_PROPERTY):
+            chosen._properties.pop(marker, None)
+            chosen._types.pop(marker, None)
+        marker = USB_PROPERTY if mask else USB_DISABLED_PROPERTY
+        chosen._properties[marker] = mask if mask else 1
         chosen._types[marker] = (Int32ul, False)
         self.windows_usb_removed = sorted(removed) + ["/aliases/" + key for key in sorted(aliases_removed)]
         for path in self.windows_usb_removed:
-            print(f"Windows USB disabled: removed {path}")
+            print(f"Windows guest ADT: removed {path}" if mask else
+                  f"Windows USB disabled: removed {path}")
+
+    def set_windows_usb_handshake(self, value):
+        """D4: after the resident's ATTACH returned 0, add /chosen/aura,windows-usb-v1 (40
+        bytes, aura.windows.usb_handshake) so Mu publishes XHC1.  The guest sees it when
+        start() uploads the ADT; the capacity is re-checked here, before entry."""
+        from ..windows import USB_HANDSHAKE_PROPERTY, USB_HANDSHAKE_SIZE
+        if not self.windows or self.windows_usb == "disabled":
+            raise ValueError("the USB handshake needs a Windows launch with --windows-usb")
+        if not isinstance(value, bytes) or len(value) != USB_HANDSHAKE_SIZE:
+            raise ValueError("the USB handshake is 40 bytes")
+        chosen = self.adt["/chosen"]
+        chosen._properties[USB_HANDSHAKE_PROPERTY] = value
+        chosen._types[USB_HANDSHAKE_PROPERTY] = (Bytes(len(value)), False)
+        try:
+            self._windows_adt_blob()
+        except ValueError:
+            chosen._properties.pop(USB_HANDSHAKE_PROPERTY, None)
+            chosen._types.pop(USB_HANDSHAKE_PROPERTY, None)
+            raise
 
     def _hide_windows_t8152_nodes(self):
         from ..windows import t8152_hidden_nodes
@@ -2018,7 +2057,7 @@ class HV(Reloadable):
 
     def setup_adt(self):
         if self.windows:
-            self._disable_windows_usb()
+            self._strip_windows_usb_nodes()
             if self.adt["/chosen"].chip_id == 0x8152:
                 self._hide_windows_t8152_nodes()
                 self._windows_t8152_ahci_property()

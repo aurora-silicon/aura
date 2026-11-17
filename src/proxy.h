@@ -163,6 +163,7 @@ typedef enum {
     P_HV_WINDOWS_GUEST_RAM = 0xc8c,
     P_HV_WINDOWS_CAPS2 = 0xc8d,
     P_HV_WINDOWS_AHCI = 0xc8e,
+    P_HV_WINDOWS_USB = 0xc87,
 
     P_FB_INIT = 0xd00,
     P_FB_SHUTDOWN,

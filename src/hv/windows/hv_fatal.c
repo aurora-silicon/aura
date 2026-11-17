@@ -16,6 +16,7 @@
 
 #include "hv_fatal.h"
 #include "hv_ahci.h"
+#include "hv_usb.h"
 #include "soc.h"
 #include "utils.h"
 
@@ -281,6 +282,7 @@ void hv_windows_fatal_report(u64 *regs, const char *what, u64 par, const char *p
         report_cpu(cpu, self, now, freq);
 
     hv_ahci_fatal_report(now, freq);
+    hv_usb_fatal_report();
 
     if (regs) {
         /* The EL2 frame sits on this CPU's stack (64 KiB); the interrupted frames are above. */

@@ -32,7 +32,14 @@
 #define T8152_MAX_DENY      640
 #define T8152_MAX_NODE_REGS 1024 /* per node; J804 pmgr-child has 64, error-handler 120 */
 #define T8152_MAX_ALLOW     8
-#define T8152_MAX_MMIO      2
+/* AIC, usb-drd1 xHCI, usb-drd3 xHCI (D4), one spare */
+#define T8152_MAX_MMIO      4
+/*
+ * D4: the xHCI register file at the start of a usb-drd node's reg 0 (dwc3 core.h
+ * DWC3_XHCI_REGS_START/END 0x0..0x7fff; the dwc3 globals start at +0xc100).  Two 16 KiB pages.
+ */
+#define T8152_XHCI_SIZE     0x8000UL
+#define T8152_USB_PORTS     4 /* usb-drd0..3; port 0 (the proxy's) is never split */
 #define T8152_REPORT_LIMIT  16
 #define T8152_CPUS          12 /* E cpu0-5, P cpu6-7, M cpu8-11 (smp_init_t8152 checks the ADT) */
 /*
@@ -83,6 +90,14 @@ static struct t8152_range mmio_allow[T8152_MAX_MMIO];
 static unsigned int mmio_allow_count;
 static struct t8152_allow allow[T8152_MAX_ALLOW];
 static unsigned int allow_count;
+/*
+ * D4: per usb-drd port 1..3, the denylist entry that holds that port's xHCI window (the first
+ * 0x8000 bytes of its ADT reg 0), or -1.  hv_t8152_usb_allow() empties the entry while the
+ * carrier passes the window through; hv_t8152_usb_revoke() puts it back.
+ */
+static int usb_xhci_deny[T8152_USB_PORTS];
+static struct t8152_range usb_xhci_saved[T8152_USB_PORTS];
+static int usb_xhci_mmio[T8152_USB_PORTS];
 
 static bool overlaps(u64 a0, u64 a1, u64 b0, u64 b1)
 {
@@ -188,10 +203,21 @@ static const struct t8152_range *deny_hit(u64 start, u64 end)
  * reg properties are bus-local (NOR partitions, i2c addresses).
  */
 static const char *const deny_prefixes[] = {
-    "qspi", "sep",     "aop", "admac",    "i2c",  "iop-audio", "dp-audio", "gpio",
-    "nub-", "dp2hdmi", "wdt", "usb-drd0", "pmgr", "spmi",      "dart",     "sart",
-    "ans",  "smc",     "mtp", "spi",      "dcp",  "sio",
+    "qspi", "sep",     "aop", "admac",   "i2c",  "iop-audio", "dp-audio", "gpio",
+    "nub-", "dp2hdmi", "wdt", "usb-drd", "pmgr", "spmi",      "dart",     "sart",
+    "ans",  "smc",     "mtp", "spi",     "dcp",  "sio",       "atc-phy",
 };
+
+/*
+ * D4: "usb-drd1".."usb-drd3" -> 1..3; anything else (usb-drd0, the proxy's port, included)
+ * -> 0, which keeps the whole of every reg denied.
+ */
+static int usb_port_of(const char *name)
+{
+    if (strncmp(name, "usb-drd", 7) || name[7] < '1' || name[7] > '3' || name[8])
+        return 0;
+    return name[7] - '0';
+}
 
 static bool deny_name(const char *name)
 {
@@ -204,9 +230,14 @@ static bool deny_name(const char *name)
     return false;
 }
 
-/* Every reg entry of the node, however many: a silently dropped tail is a hole. */
+/*
+ * Every reg entry of the node, however many: a silently dropped tail is a hole.  usb-drd1..3
+ * reg 0 goes in as two entries, the xHCI window and the rest, both denied; only D4's attach
+ * ever lifts the first (hv_t8152_usb_allow).
+ */
 static int deny_node_regs(int *path, const char *name, bool *found)
 {
+    int port = usb_port_of(name);
     for (int idx = 0; idx < T8152_MAX_NODE_REGS; idx++) {
         u64 base, size;
         if (adt_get_reg(adt, path, "reg", idx, &base, &size) < 0)
@@ -214,6 +245,13 @@ static int deny_node_regs(int *path, const char *name, bool *found)
         if (!size)
             continue;
         *found = true;
+        if (idx == 0 && port && size > T8152_XHCI_SIZE && !(base & (T8152_PAGE - 1))) {
+            usb_xhci_deny[port] = deny_count;
+            if (deny_add(base, T8152_XHCI_SIZE, name))
+                return -1;
+            base += T8152_XHCI_SIZE;
+            size -= T8152_XHCI_SIZE;
+        }
         if (deny_add(base, size, name))
             return -1;
     }
@@ -241,6 +279,10 @@ static int build_denylist(void)
     int armio = adt_path_offset(adt, "/arm-io");
     bool qspi = false, sep = false, wdt = false;
     deny_count = 0;
+    for (int port = 0; port < T8152_USB_PORTS; port++) {
+        usb_xhci_deny[port] = -1;
+        usb_xhci_mmio[port] = -1;
+    }
 
     if (armio < 0) {
         printf("HV: T8152: /arm-io is missing from the ADT\n");
@@ -618,6 +660,102 @@ int hv_t8152_allow(u64 ipa, u64 pa, u64 size, bool read_only, const char *name)
     allow[allow_count++] = (struct t8152_allow){ipa, pa, end, read_only, name};
     printf("HV: T8152: exception %s IPA 0x%lx -> [0x%lx, 0x%lx)%s\n", name, ipa, pa, end,
            read_only ? " read-only" : "");
+    return 0;
+}
+
+/*
+ * D4: pass usb-drd<port>'s xHCI window [xhci, xhci + 0x8000) through to the guest.  It must
+ * be exactly the window build_denylist() split off that port's ADT reg 0; nothing else on the
+ * denylist may overlap it once that entry is lifted.  0, or -1 with the reason (and the
+ * denylist unchanged).
+ */
+int hv_t8152_usb_allow(int port, u64 xhci)
+{
+    if (!armed || !ram_set) {
+        printf("HV: T8152: USB xHCI refused: the policy is not armed or guest RAM is not set\n");
+        return -1;
+    }
+    if (port < 1 || port >= T8152_USB_PORTS || usb_xhci_deny[port] < 0 ||
+        usb_xhci_mmio[port] >= 0) {
+        printf("HV: T8152: USB xHCI of port %d refused: no split usb-drd%d reg 0 in the "
+               "denylist, or already passed through\n",
+               port, port);
+        return -1;
+    }
+    struct t8152_range *entry = &deny[usb_xhci_deny[port]];
+    if (entry->start != xhci || entry->end != xhci + T8152_XHCI_SIZE) {
+        printf("HV: T8152: USB xHCI 0x%lx is not usb-drd%d's ADT window [0x%lx, 0x%lx)\n", xhci,
+               port, entry->start, entry->end);
+        return -1;
+    }
+    if (mmio_allow_count >= T8152_MAX_MMIO) {
+        printf("HV: T8152: USB xHCI of port %d refused: the MMIO allowlist is full\n", port);
+        return -1;
+    }
+    usb_xhci_saved[port] = *entry;
+    entry->start = entry->end = 0; /* an empty range overlaps nothing */
+    const struct t8152_range *hit = deny_hit(xhci, xhci + T8152_XHCI_SIZE);
+    if (hit || overlaps(xhci, xhci + T8152_XHCI_SIZE, dram_start, dram_end)) {
+        printf("HV: T8152: USB xHCI [0x%lx, 0x%lx) also overlaps %s; refusing\n", xhci,
+               xhci + T8152_XHCI_SIZE, hit ? hit->name : "RAM");
+        *entry = usb_xhci_saved[port];
+        return -1;
+    }
+    usb_xhci_mmio[port] = mmio_allow_count;
+    mmio_allow[mmio_allow_count].start = xhci;
+    mmio_allow[mmio_allow_count].end = xhci + T8152_XHCI_SIZE;
+    mmio_allow[mmio_allow_count].name = port == 1 ? "usb-drd1 xHCI (D4)" : port == 2 ?
+                                        "usb-drd2 xHCI (D4)" : "usb-drd3 xHCI (D4)";
+    mmio_allow_count++;
+    printf("HV: T8152: usb-drd%d xHCI [0x%lx, 0x%lx) passed through (Device-nGnRnE); the rest "
+           "of the controller, its PHY and DARTs stay denied\n",
+           port, xhci, xhci + T8152_XHCI_SIZE);
+    return 0;
+}
+
+/* D4 teardown: deny usb-drd<port>'s xHCI window again.  The caller unmapped it first. */
+void hv_t8152_usb_revoke(int port)
+{
+    if (port < 1 || port >= T8152_USB_PORTS || usb_xhci_mmio[port] < 0)
+        return;
+    unsigned int slot = usb_xhci_mmio[port];
+    for (unsigned int i = slot; i + 1 < mmio_allow_count; i++)
+        mmio_allow[i] = mmio_allow[i + 1];
+    mmio_allow_count--;
+    for (int p = 1; p < T8152_USB_PORTS; p++)
+        if (usb_xhci_mmio[p] > (int)slot)
+            usb_xhci_mmio[p]--;
+    usb_xhci_mmio[port] = -1;
+    deny[usb_xhci_deny[port]] = usb_xhci_saved[port];
+    printf("HV: T8152: usb-drd%d xHCI denied again\n", port);
+}
+
+/*
+ * D4: carrier memory the guest must never reach (the USB DART tables).  It must lie in aura's
+ * own heap span [_base, max(heap high water, heap limit)), clear of guest RAM and the store, and
+ * it joins the denylist for the rest of the session (map filter and hv_t8152_verify), even
+ * after the carrier frees it.  0, or -1 with the reason.
+ */
+int hv_t8152_reserve_carrier(u64 start, u64 end, const char *name)
+{
+    if (!armed || !ram_set) {
+        printf("HV: T8152: %s refused: the policy is not armed or guest RAM is not set\n", name);
+        return -1;
+    }
+    u64 aura_top = heapblock_high_water();
+    if (heapblock_limit() > aura_top)
+        aura_top = heapblock_limit();
+    if (end <= start || (start | end) & (T8152_PAGE - 1) ||
+        !inside(start, end, (u64)_base, aura_top) || !inside(start, end, dram_start, dram_end) ||
+        overlaps(start, end, ram_start, ram_end) || deny_hit(start, end)) {
+        printf("HV: T8152: %s [0x%lx, 0x%lx) refused: it must be 16 KiB aligned carrier heap "
+               "[0x%lx, 0x%lx), clear of guest RAM [0x%lx, 0x%lx) and the denylist\n",
+               name, start, end, (u64)_base, aura_top, ram_start, ram_end);
+        return -1;
+    }
+    if (deny_add(start, end - start, name))
+        return -1;
+    printf("HV: T8152: %s [0x%lx, 0x%lx) denied to stage 2\n", name, start, end);
     return 0;
 }
 

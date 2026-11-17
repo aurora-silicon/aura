@@ -30,8 +30,10 @@ At `hv_init()` (`hv_t8152_preflight()`), before anything is mapped:
 - AIC3 initialized (the J804 proxy path does not do it; `hv_init()` calls `aic_init()`);
 - `HCR_EL2.FWB` clear, `CNTFRQ_EL0` non-zero, boot_args RAM non-empty;
 - a denylist read from the live ADT: every top-level `/arm-io` node named `qspi`, `sep`,
-  `aop*`, `admac*`, `i2c*`, `*audio*`, `gpio*`, `nub-*`, `dp2hdmi*`, `wdt`, `usb-drd0`,
-  `pmgr*`, `*spmi*`, `dart*`, `sart*`, `ans`, `smc`, `mtp*`, `spi*`, `dcp*`, `sio*`; a fixed
+  `aop*`, `admac*`, `i2c*`, `*audio*`, `gpio*`, `nub-*`, `dp2hdmi*`, `wdt`, `usb-drd*`,
+  `pmgr*`, `*spmi*`, `dart*`, `sart*`, `ans`, `smc`, `mtp*`, `spi*`, `dcp*`, `sio*`,
+  `atc-phy*` (usb-drd1..3 reg 0 goes in as two entries, the xHCI window and the rest, so that
+  D4 can lift only the first; both are denied unless a port is attached); a fixed
   second copy of the J804 QSPI controller pages (0x331118000, 32 KiB); the MTE tag storage
   `region-id-218` and `region-id-4` above RAM. Missing `qspi`, `sep` or `wdt` nodes refuse.
   Every `reg` entry of a denied node is taken (J804 `pmgr-child` has 64); a node with more
@@ -389,3 +391,127 @@ state report, DISR only with RAS); the AHCI trace is the `fatal_trace` case of
 The replay's register values are synthetic (a PA inside the synthetic window
 `0x10100000000:0x10561600000`, made-up kernel and user VAs, a FAR that keeps the PxCI offset
 0x138); none is copied from the run log.
+
+## D4: USB keyboard and mouse (usb-drd1 xHCI passthrough)
+
+Status: built and host-tested only (`tests/python/test_windows_t8152_usb.py`). Nothing of it
+has run on the M6. Contract and reasoning: `windows-m6/D4-USB-DESIGN.md` (owner notes, not in
+this tree); the Mu side is `J804_WINDOWS_USB` in Mu `j804-windows`: `\_SB.XHC1` (`_HID
+PNP0D10`, `_CCA 1`) lives in its own SSDT (OEM table ID `J804XHC1`) that `J804XhciAcpiDxe`
+installs only when the launcher's `/chosen/aura,windows-usb-v1` handshake is present and valid
+(the DSDT names no USB controller), and the FD carries the marker `J804USB1` at 0x120. Off
+unless `run_guest.py --windows-usb` asks for it.
+
+What the guest gets, and nothing more:
+
+- **MMIO**: `[0x40a430000, 0x40a438000)`, the dwc3 xHCI register file (two 16 KiB pages),
+  identity, Device-nGnRnE, mapped by the resident at ATTACH (`hv_t8152_usb_allow()` lifts
+  only the denylist entry split off usb-drd1's ADT reg 0 and refuses if anything else on the
+  denylist overlaps it). The rest of reg 0, every other usb-drd reg (dwc3 globals at
+  +0xc100, device/OTG, PIPE, evt), `atc-phy*`, `dart-usb*`, the TLBI aperture, hpm, SPMI,
+  pmgr and usb-drd0 stay denied. Teardown unmaps the window and denies it again.
+- **Interrupt**: AIC 1692 (usb-drd1 `interrupts[0]`, level) published as **SPI 995**;
+  usb-drd3 1834 as 997. The alias exists only while the port is attached
+  (`hv_aic_alias_t8152_usb()`), so with USB off a guest enable of 995 cannot unmask 1692.
+  On launches with USB configured (BIT(9)), the T8152 IRQ path pends a hardware line only
+  through an owned alias (`hv_aic_alias_lookup_physical()`); any other line is masked,
+  counted and logged once. Launches without USB keep the D3-validated path unchanged (the
+  line is pended under `hv_aic_alias_to_published()`, its own number when not aliased). The
+  DART's own line (read from the ADT) is masked and never aliased; DART faults are polled.
+- **DMA**: both dart-usb1 instances, streams (instance 0, SID 0), (0, 1) and (1, 1), TCR
+  **0x9** (TRANSLATE_ENABLE | FOUR_LEVEL, ias 42: what Linux runs on this port), ENABLE_STREAMS
+  0x3 / 0x2. One shared identity table set (`hv_usb_dart.c`) maps exactly guest RAM
+  `[ram_start, ram_end)`, DVA == IPA == PA; the AHCI store, the BGRA shadow, carrier memory,
+  the tables and all MMIO fault. 4.5 GiB of guest RAM (with the AHCI store) is 146 tables,
+  2.28 MiB; the whole 17.52 GiB window would be 563 (cap 640). The tables come from aura's
+  heap (refused unless it has room below its limit), are cleaned to the PoC and joined to the
+  stage-2 denylist (`hv_t8152_reserve_carrier()`), and are walked back before use (first and
+  last page, the first 32 MiB boundary, both neighbours outside, the tables themselves).
+  TLBI is aura's `dart_gen3_tlb_invalidate` (aperture slot + `tlbi vale1os`, route read from
+  +0x4604) through `dart_gen3_tlbi_adt()`, at attach and teardown only: the map is static
+  while the guest runs, and a Windows HCRST needs no DART action.
+- **Controller state**: as `j804_usb_prep()` left it (host mode, eUSB2 PHY, VBUS from hpm1),
+  verified, never re-initialised. The only write outside the DARTs and the AIC masks is
+  clearing GUSB2PHYCFG0/GUSB3PIPECTL0.SUSPHY if set. Windows cannot power the controller off:
+  every power lever is outside stage 2 and the XHC1 SSDT has no `_PSx`/`_PRx`/`_PRW`/`_DSW`/
+  `_S0W`.
+
+ATTACH (`P_HV_WINDOWS_USB` 0xc87, op 1, port mask bit 1 = drd1, bit 3 = drd3) runs after the
+guest RAM window and the AHCI store are set and before `hv_start()`. It refuses, writing
+nothing, unless: configure BIT(9) was given (T8152, soft GIC, board 0x22); the mask names only
+drd1/drd3 (drd0 is refused by mask and by address); `j804_usb_port_state()` says the port is
+up and the UTMI event counter runs; the ADT names the same controller, line 1692 and Gen3
+DARTs; both DART instances read PARAMS1 16 KiB pages, PARAMS3 PA/VA width 42 and version 3.0
+(field layout from Linux apple-dart.c), at least 2 SIDs,
+PROTECT/LOCK 0, ENABLE_STREAMS 0, and each used stream has no valid TTBR and TCR 0 or 0x1; the
+xHCI is halted (HCH 1, CNR 0, RS 0) and its operational, runtime and doorbell registers and
+every extended capability (no Debug Capability) lie below 0x8000; GCTL is in host mode; the
+tables fit and pass the walk-back. Results: 0, or -1 state, -2 ports, -3 port not up, -4 ADT,
+-5 DART, -6 xHCI, -7 tables, -8 commit (TCR 0x9 did not read back, TLBI, stage 2; torn down
+again). Each refusal prints its reason (`HV: USB ...`). ATTACH is also refused (-1) once the
+guest session has started (an in-session proxy request) and after an earlier ATTACH in the
+same carrier session reached the table build, even if teardown has since cleared it: one
+ATTACH per carrier load. STATUS (op 2, port, index) returns USBSTS, PORTSC1/2, the interrupt
+count, the DART exception bitmaps seen, GCTL, the unowned-line count and the storm flag
+(recorded at teardown, so they survive the session); indices 10 and 11 return the live DART
+identity window `[base, top)` (2**64 - 1 when nothing is attached), which the launcher puts in
+the Mu handshake. DETACH (op 3) is the teardown before entry; while a started guest session
+holds the port it is refused (`hv_start()`'s own exit tears down), and after the session it is
+an idempotent no-op. CAPS2 bit 1 advertises all of it.
+
+Teardown (`hv_usb_teardown()`) runs on every way out of `hv_start()` (it wraps the session:
+PSCI SYSTEM_OFF/RESET, a failed join, a refusal before entry): withdraw the alias, mask 1692,
+USBCMD.RS = 0 and wait up to 20 ms for HCH, then per stream DISABLE_STREAMS, TTBR 0, TCR 0x1,
+TLBI, then unmap and deny the window, and free the tables last. `flush_and_reboot()` (panic,
+assert, fatal EL2 exceptions, `hv_safe_reset()`) first runs `hv_usb_emergency_stop()`: the same
+hardware steps without locks, stage-2 or heap work. The EL2 fatal report prints the recorded
+USB state (no MMIO).
+
+While the guest runs, the 1 Hz host report reads USBSTS and PORTSC (read only), polls both
+DART exception bitmaps (+0x4000) and ERROR (+0x100); on a hit it logs the SIDs and the raw
+records at +0x8000 and acknowledges both, the bitmap then ERROR (W1C, as our linux-j804
+`apple-dart-t8152-gen3-irqdump.py` handler does), compares the dwc3 globals with the attach snapshot (logged, not applied),
+and logs one line per change (or every 10 s while interrupts arrive). More than 50,000
+interrupts per second on the line withdraws the alias and masks it for the rest of the session
+(the guest keeps running without USB).
+
+Launcher (`run_guest.py --windows-usb {off,drd1,drd1+drd3,drd3}`, default off), before
+anything is uploaded: refuses any spelling of drd0, a chip other than T8152, a board other than
+0x22, a resident without CAPS2 bit 1, and an FD/flag mismatch in either direction (a
+`J804USB1`/`J804USB3` marker with the port off: Windows would touch a denied page; the port on
+without its marker: no `XHC1` to bind). ATTACH follows the AHCI attach and precedes
+`hv.start()`; a refusal stops the launch (the session is used up). Only after ATTACH returned
+0 does the launcher read the DART window (STATUS 10/11), check it equals the guest RAM window
+it configured, is 16 KiB aligned, non-empty and clear of the xHCI window and the AHCI store,
+and add Mu's handshake `/chosen/aura,windows-usb-v1` to the guest ADT: 40 bytes little-endian,
+`<IIQQQQ>` = port mask 0x2, GSIV 995, xHCI base 0x40a430000, size 0x8000, DMA window base,
+DMA window top (exclusive). Any problem there detaches again and stops the launch. Without
+that property Mu installs no XHC1 SSDT and Windows never touches the xHCI window, so a USB FD
+under a launch with USB off is safe as well (the marker check still refuses it). The guest ADT
+still loses every `usb-drd*`/`dart-usb*` node; `/chosen` also gets `aura,windows-usb` (the
+port mask, diagnostic) instead of `aura,windows-usb-disabled`. STATUS is printed after the
+guest exits. The JSON profile path takes `usb` disabled/off only.
+
+Host tests: `tests/e2e/windows_usb_dart_host.c` replays `hv_usb_dart.c` unchanged under
+ASan/UBSan (counts, encoders, a full 4.5 GiB sweep, faults, refusals) and dumps three arenas
+that an independent Python model must match byte for byte; `tests/e2e/windows_usb_host.c`
+drives `hv_usb.c` unchanged over a fake register file (every refusal writes nothing; the exact
+success and teardown write sequences; F7 and refused stage-2 maps tear down; the storm guard;
+the reset-path stop; DART exception and ERROR acknowledgement; one ATTACH per session, none
+after entry, no DETACH under a running guest; the DMA window STATUS); the stage-2 rules run
+`hv_t8152.c` unchanged with a synthetic ADT; the alias table runs `hv_aic_alias.c` unchanged;
+the launcher's handshake bytes are packed and decoded and, with `AURA_MU_TREE` pointing at a
+Mu `j804-windows` tree, compared with `J804Windows.h` (name, size, port bit) and fed through
+Mu's own parser (`J804UsbHandshake.h`). `AURA_USB_TRANSCRIPT=<file>` saves the glue replay.
+All windows and MMIO addresses in the tests are synthetic or the repo's j873.c constants; the
+fake ADT's DART and secondary interrupt numbers are synthetic.
+
+Not verified (each needs a hardware run): TCR 0x9 accepted on dart-usb1 from a carrier-built
+table; delivery of a physical AIC line to a Windows guest on T8152 (which CPU takes it, after
+Mu cleared the AIC enable; GICD_IROUTER is not honoured for hardware lines); Windows usbxhci on
+aura-only dwc3 global state (GCTL, GUCTL and GUCTL1 differ from Linux's, logged at attach); its
+64-bit register write order; USB2 LPM; a bare keyboard with nothing servicing hpm1; Mu's check
+that every RAM range in its memory map lies inside the handshake's DMA window (if PrePi
+describes RAM outside it, Mu leaves USB off for that boot). The design document's worked leaf
+vector has a nibble slip in the SUBPAGE_END field ([51:40]); the tests check the format on a
+synthetic page (`0x10100000000` -> `0x000fff1010000001`).

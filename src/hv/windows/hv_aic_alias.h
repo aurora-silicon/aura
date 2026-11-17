@@ -62,4 +62,17 @@ u32 hv_aic_alias_to_published(u32 physical);
  */
 bool hv_aic_alias_is_owned(u32 published);
 
+/*
+ * Is this physical AIC line one of the aliased (owned) lines?  Unlike
+ * hv_aic_alias_to_published(), a miss is a miss: the T8152 IRQ path pends a
+ * hardware line only when this says yes, and masks every other line.
+ */
+bool hv_aic_alias_lookup_physical(u32 physical, u32 *published);
+
+/*
+ * T8152 D4: publish the USB aliases of the attached ports (bit 1 usb-drd1 -> 995,
+ * bit 3 usb-drd3 -> 997); 0 withdraws them.  hv_usb.c only.
+ */
+void hv_aic_alias_t8152_usb(u32 port_mask);
+
 #endif

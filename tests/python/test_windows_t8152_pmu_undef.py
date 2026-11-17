@@ -183,7 +183,7 @@ def test_t8152_guest_vtimer_starts_disabled_on_every_cpu():
     body = function_body(hv, "static void hv_t8152_quiesce_guest_vtimer(bool primary)")
     assert "if (chip_id != T8152)\n        return;" in body
     assert "msr(SYS_CNTV_CTL_EL02, 0);" in body
-    start = function_body(hv, "int hv_start(void *entry, u64 regs[4])")
+    start = function_body(hv, "static int hv_start_session(void *entry, u64 regs[4])\n{")
     entry = start.index('printf("HV: Entering guest at %p')
     assert start.rindex("hv_t8152_quiesce_guest_vtimer(true);", 0, entry) > \
         start.index("hv_t8152_verify(")

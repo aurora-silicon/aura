@@ -6,6 +6,7 @@ int smp_cpu_count(void);
 int smp_get_id(u64 mpidr);
 void aic_set_mask(int irq, bool active);
 void aic_set_affinity(int irq, int cpu);
+u32 aic_irq_config(int irq);
 void aic_set_enabled(bool enabled);
 bool aic_is_enabled(void);
 void cpu_wfi_stateless(void);

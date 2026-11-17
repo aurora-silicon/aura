@@ -361,7 +361,9 @@ def plan_profile(filename):
     require(compatibility != T8152_PMU_UNDEF or chip == T8152_CHIP,
             "t8152-pmu-undef compatibility requires chip 0x8152")
     usb = profile.get("usb", "disabled")
-    require(usb == "disabled", "USB handoff is not implemented; usb must be disabled")
+    require(usb in ("disabled", "off"), "USB passthrough (D4) is a run_guest.py option "
+            "(--windows-usb on T8152); a profile takes usb disabled or off")
+    usb = "disabled"
     serial = profile.get("serial", "disabled")
     require(serial in ("disabled", "capture", "cdc"), "unsupported serial capture policy")
     n1 = profile.get("n1", "disabled")
@@ -909,6 +911,153 @@ def upload_ahci_image(path, disk_bytes, write, chunk=AHCI_CHUNK, progress=None):
 def ahci_host_note(sha256, image_bytes, when):
     note = f"image sha256 {sha256} bytes {image_bytes} uploaded {when}".encode()
     return note[:AHCI_NOTE_SIZE - 1].ljust(AHCI_NOTE_SIZE, b"\0")
+
+
+# ---- D4: usb-drd1 (and drd3) xHCI passthrough (src/hv/windows/hv_usb.h) ---------------------
+#
+# The carrier passes only the xHCI registers through, publishes AIC 1692 as SPI 995 and gives
+# the controller a DART identity map of guest RAM.  These values must agree with the resident
+# (CAPS2 bit 1, P_HV_WINDOWS_USB) and with Mu's J804Windows.h: the FD marker at 0x120 and the
+# 40-byte /chosen/aura,windows-usb-v1 handshake, without which Mu's J804XhciAcpiDxe installs no
+# SSDT J804XHC1 (\_SB.XHC1) and Windows never sees the controller.
+CAPS2_USB = 0x0002                        # USB passthrough v1
+CONFIG_T8152_USB = 0x100000                 # hv_windows_configure BIT(20)
+USB_OP_ATTACH, USB_OP_STATUS, USB_OP_DETACH = 1, 2, 3
+USB_STATUS = {"attached": 0, "usbsts": 1, "portsc1": 2, "portsc2": 3, "irqs": 4,
+              "dart0_exc": 5, "dart1_exc": 6, "gctl": 7, "unowned": 8, "storm": 9}
+# Port-independent STATUS indices: the DART identity window of the live attach (2**64 - 1 when
+# nothing is attached).  Read once after ATTACH for the handshake, not at exit.
+USB_STATUS_DMA_BASE, USB_STATUS_DMA_TOP = 10, 11
+USB_ERRORS = {-1: "not configured, not J804, no guest RAM, the guest already started or an "
+                  "earlier ATTACH this session",
+              -2: "bad port mask (drd0 or an unknown port)",
+              -3: "the port is not in host mode as aura's j804_usb_prep leaves it",
+              -4: "the ADT does not describe the expected controller, line or DARTs",
+              -5: "the DART is protected, live or not the Gen3 USB DART",
+              -6: "the xHCI is running, not ready, or outside its 0x8000 window",
+              -7: "the DART tables do not fit or failed their self check",
+              -8: "programming the DART or stage 2 failed (torn down again)"}
+USB_PORTS = {"drd1": 1, "drd3": 3}
+USB_PORT_BIT = {1: 0x2, 3: 0x8}
+USB_XHCI = {1: 0x40A430000, 3: 0x412430000}
+USB_XHCI_SIZE = 0x8000
+USB_GSIV = {1: 995, 3: 997}
+USB_FD_MARKER = {1: (0x120, b"J804USB1"), 3: (0x130, b"J804USB3")}
+USB_CHOICES = ("off", "drd1", "drd1+drd3", "drd3")
+USB_PROPERTY = "aura,windows-usb"          # diagnostic: the port mask asked for
+USB_DISABLED_PROPERTY = "aura,windows-usb-disabled"
+# Mu J804Windows.h J804_USB_ADT_PROPERTY / _SIZE / J804_USB_PORT_DRD1 (layout below).
+USB_HANDSHAKE_PROPERTY = "aura,windows-usb-v1"
+USB_HANDSHAKE_SIZE = 40
+USB_HANDSHAKE_FORMAT = "<IIQQQQ"   # mask, GSIV, xHCI base, xHCI size, DMA base, DMA top
+USB_DMA_ALIGN = 0x4000
+J804_BOARD_ID = 0x22
+
+
+def parse_windows_usb(value):
+    """--windows-usb: "off" (or "disabled") -> (), else the sorted port numbers.  usb-drd0 is the
+    proxy's own link and is refused in every spelling."""
+    require(isinstance(value, str), "--windows-usb takes off, drd1, drd3 or drd1+drd3")
+    text = value.strip().lower()
+    if text in ("off", "disabled", "none", ""):
+        return ()
+    ports = []
+    for part in re.split(r"[+,\s]+", text):
+        name = re.sub(r"^usb-", "", part)
+        if re.fullmatch(r"(?:usb|drd|port)?-?(?:0x)?0+", name):
+            raise ValueError("usb-drd0 is the proxy's CDC link to this Mac: it is never passed "
+                             "through (--windows-usb takes drd1 and/or drd3)")
+        require(name in USB_PORTS, f"--windows-usb: unknown port {part!r} (off, drd1, drd3, "
+                "drd1+drd3)")
+        ports.append(USB_PORTS[name])
+    require(len(set(ports)) == len(ports), "--windows-usb names a port twice")
+    return tuple(sorted(ports))
+
+
+def usb_port_mask(ports):
+    mask = 0
+    for port in ports:
+        mask |= USB_PORT_BIT[port]
+    return mask
+
+
+def usb_spelling(ports):
+    return "+".join(f"drd{p}" for p in ports) if ports else "disabled"
+
+
+def fd_usb_markers(fd):
+    """{port: (xHCI base, GSIV)} for every D4 marker in the FD (16 bytes each: magic, u32
+    base >> 12, u32 GSIV); empty for an FD without USB."""
+    found = {}
+    for port, (offset, magic) in USB_FD_MARKER.items():
+        block = bytes(fd[offset:offset + 16])
+        if len(block) == 16 and block[:8] == magic:
+            base, gsiv = struct.unpack_from("<II", block, 8)
+            found[port] = (base << 12, gsiv)
+    return found
+
+
+def validate_usb_request(ports, chip, board, caps2, fd):
+    """Before anything is uploaded: the chip and board, the resident's CAPS2 bit and the FD's
+    XHC1/XHC2 markers must all agree with --windows-usb, in both directions."""
+    markers = fd_usb_markers(fd)
+    for port, (base, gsiv) in markers.items():
+        require(port in ports, f"this FD describes usb-drd{port} to Windows (marker "
+                f"{USB_FD_MARKER[port][1].decode()} at {USB_FD_MARKER[port][0]:#x}) but "
+                f"--windows-usb does not pass it through: Windows would touch a denied page. "
+                f"Pass --windows-usb {usb_spelling(tuple(sorted(markers)))} or use an FD built "
+                f"without J804_WINDOWS_USB")
+        require((base, gsiv) == (USB_XHCI[port], USB_GSIV[port]),
+                f"the FD's usb-drd{port} marker {base:#x}/{gsiv} differs from the carrier's "
+                f"{USB_XHCI[port]:#x}/{USB_GSIV[port]}")
+    if not ports:
+        return
+    require(chip == T8152_CHIP, "--windows-usb is a T8152 (J804) option")
+    require(board == J804_BOARD_ID, f"--windows-usb needs the J804 board (0x22), not {board:#x}")
+    require(isinstance(caps2, int) and caps2 >> 32 == CAPS2_MAGIC >> 32 and caps2 & CAPS2_USB,
+            "the resident has no USB passthrough (P_HV_WINDOWS_CAPS2 bit 1): rebuild the "
+            "carrier at or after the D4 commit")
+    for port in ports:
+        require(port in markers, f"--windows-usb drd{port}: the FD has no "
+                f"{USB_FD_MARKER[port][1].decode()} marker at {USB_FD_MARKER[port][0]:#x}, so "
+                f"Windows has no XHC{1 if port == 1 else 2} to bind: build Mu with "
+                f"J804_WINDOWS_USB=TRUE (out/j804-windows-usb)")
+
+
+def usb_handshake(ports, dma_base, dma_top, guest_ram, ahci_plan=None):
+    """/chosen/aura,windows-usb-v1 for Mu's J804XhciAcpiDxe, written only after ATTACH returned
+    0.  dma_base/dma_top are the window the resident's DART actually maps (STATUS 10/11); they
+    must equal the guest RAM window the launcher configured, be 16 KiB aligned, non-empty, clear
+    of the xHCI window and of the AHCI store.  Mu re-checks all of it and fails closed."""
+    require(tuple(ports) == (1,), "Mu's v1 USB handshake describes usb-drd1 only (mask 0x2); "
+            f"--windows-usb {usb_spelling(tuple(ports))} has no Mu build")
+    for name, value in (("base", dma_base), ("top", dma_top)):
+        require(isinstance(value, int) and 0 <= value < 1 << 64 and value != (1 << 64) - 1,
+                f"the resident reported no DART window {name} ({value!r}): nothing is attached")
+        require(value % USB_DMA_ALIGN == 0, f"the DART window {name} {value:#x} is not 16 KiB "
+                "aligned")
+    require(dma_base < dma_top, f"the DART window [{dma_base:#x}, {dma_top:#x}) is empty")
+    require((dma_base, dma_top) == tuple(guest_ram),
+            f"the resident's DART window [{dma_base:#x}, {dma_top:#x}) is not the guest RAM "
+            f"window [{guest_ram[0]:#x}, {guest_ram[1]:#x}) the launcher configured")
+    xhci, size = USB_XHCI[1], USB_XHCI_SIZE
+    require(dma_top <= xhci or xhci + size <= dma_base, "the DART window overlaps the xHCI "
+            "registers")
+    if ahci_plan is not None:
+        store = (ahci_plan.store_base, ahci_plan.window_top)
+        require(dma_top <= store[0] or store[1] <= dma_base,
+                f"the DART window [{dma_base:#x}, {dma_top:#x}) reaches the AHCI store "
+                f"[{store[0]:#x}, {store[1]:#x}): the store must never be DMA-reachable")
+    value = struct.pack(USB_HANDSHAKE_FORMAT, usb_port_mask(ports), USB_GSIV[1], xhci, size,
+                        dma_base, dma_top)
+    assert len(value) == USB_HANDSHAKE_SIZE
+    return value
+
+
+def describe_usb_attach(result):
+    """P_HV_WINDOWS_USB ATTACH's answer as text (0 is success)."""
+    value = result - (1 << 64) if result >= 1 << 63 else result
+    return "attached" if value == 0 else USB_ERRORS.get(value, f"error {value}")
 
 
 def _aligned(value, alignment):

@@ -13,6 +13,7 @@
 #include "vsprintf.h"
 #include "xnuboot.h"
 #ifdef AURA_WINDOWS
+#include "hv/windows/hv_usb.h"
 #include "nvme.h"
 #endif
 
@@ -247,6 +248,8 @@ void flush_and_reboot(void)
         printf("reset re-entered; parking this CPU\n");
         goto park;
     }
+    /* D4: an attached xHCI must not keep DMA-ing into guest RAM through a live DART. */
+    hv_usb_emergency_stop();
     if (!nvme_shutdown()) {
         printf("NVMe shutdown failed; not resetting. Parking (hold power to exit)\n");
         goto park;

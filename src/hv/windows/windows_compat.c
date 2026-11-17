@@ -60,6 +60,16 @@ void aic_set_affinity(int irq, int cpu)
         return;
     write32(aic->base + aic->regs.tgt_cpu + irq * 4, BIT(cpu));
 }
+/* AIC2/3 IRQ_CFG word of a line (die and target group), for logs; ~0 if there is none. */
+u32 aic_irq_config(int irq)
+{
+    if (!aic || aic->version < 2 || !aic->max_irq || irq < 0 ||
+        (u32)irq >= aic->max_irq * aic->nr_die)
+        return ~0u;
+    u32 die = irq / aic->max_irq;
+    u32 local = irq % aic->max_irq;
+    return read32(aic->base + aic->regs.config + die * aic->extintrcfg_stride + 4 * local);
+}
 void aic_set_enabled(bool enabled)
 {
     if (!aic || aic->version < 2)

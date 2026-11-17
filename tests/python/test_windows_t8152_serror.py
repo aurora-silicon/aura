@@ -64,6 +64,7 @@ static inline int smp_id(void) { return stub_cpu; }
 ''',
     "soc.h": '#pragma once\n#include "types.h"\n#define T8152 0x8152\nextern u32 chip_id;\n',
     "hv_ahci.h": '#pragma once\n#include "types.h"\nvoid hv_ahci_fatal_report(u64 now, u64 freq);\n',
+    "hv_usb.h": '#pragma once\nvoid hv_usb_fatal_report(void);\n',
     "utils.h": r'''
 #pragma once
 #include <stdio.h>
@@ -305,7 +306,8 @@ def test_t6_report_runs_before_every_el2_reboot_with_par_from_entry():
                                 "u64 par, const char *par_when)"))
     assert report.index("if (chip_id != T8152 || !hv_fatal_armed)") < \
         report.index("__atomic_exchange_n(&hv_fatal_reporting, 1")
-    start = function_body(source("src/hv/windows/hv.c"), "int hv_start(void *entry, u64 regs[4])")
+    start = function_body(source("src/hv/windows/hv.c"),
+                          "static int hv_start_session(void *entry, u64 regs[4])\n{")
     assert start.index("hv_fatal_armed = chip_id == T8152;") < \
         start.index('printf("HV: Entering guest at %p')
     assert start.index("hv_fatal_armed = false;") < start.index("hv_ahci_guest_exited(status);")

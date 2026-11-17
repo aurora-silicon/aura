@@ -12,6 +12,7 @@
 #include "hv_el2_acct.h"
 #include "hv_fatal.h"
 #include "hv_gic_cpuif.h"
+#include "hv_usb.h"
 #include "hv_vdev_spi.h"
 #include "hv_vgic.h"
 #include "mtp_handoff.h"
@@ -2351,6 +2352,32 @@ static bool gic_cpuif_eoi_logged[MAX_CPUS];
 static bool gic_cpuif_brought_up[MAX_CPUS];
 static bool gic_cpuif_vi_logged[MAX_CPUS];
 static bool gic_cpuif_aic_logged[MAX_CPUS];
+
+/*
+ * T8152: hardware lines that reached EL2 without an owned alias (hv_exc_irq).  Each is masked;
+ * the first occurrence of each line is logged, and the total is in the USB report.
+ */
+#define T8152_UNOWNED_LINES 4096
+static u32 t8152_unowned_seen[T8152_UNOWNED_LINES / 32];
+static u64 t8152_unowned_count;
+
+static void t8152_unowned_irq(u32 irq)
+{
+    __atomic_fetch_add(&t8152_unowned_count, 1, __ATOMIC_RELAXED);
+    if (irq >= T8152_UNOWNED_LINES)
+        return;
+    u32 bit = BIT(irq % 32);
+    if (__atomic_fetch_or(&t8152_unowned_seen[irq / 32], bit, __ATOMIC_RELAXED) & bit)
+        return;
+    printf("HV: T8152: AIC line %u reached EL2 on CPU %d with no owned alias; masked, not "
+           "delivered\n",
+           irq, (int)smp_id());
+}
+
+u64 hv_t8152_unowned_irqs(void)
+{
+    return __atomic_load_n(&t8152_unowned_count, __ATOMIC_RELAXED);
+}
 static u32 gic_cpuif_ack_count[MAX_CPUS];
 static u32 gic_cpuif_eoi_count[MAX_CPUS];
 
@@ -7789,7 +7816,26 @@ void hv_exc_irq(struct exc_info *ctx)
      */
     if (chip_id == T8152 && hv_t8152_gic_owned()) {
         if (type == AIC_EVENT_TYPE_HW) {
-            u32 guest_irq = hv_aic_alias_to_published(irq);
+            /*
+             * D4 (launches with --windows-usb only, hv_usb_enabled): only a line the carrier
+             * owns on the guest's behalf (an attached port's alias,
+             * hv_aic_alias_lookup_physical) becomes a guest INTID.  Any other hardware line
+             * stays masked (EVENT already auto-masked it; mask it again in case it was
+             * unmasked elsewhere), is counted and logged once: identity injection would hand
+             * the guest an unknown device's interrupt, or an INTID at or above 1020.
+             * Launches without USB keep the D3-validated path unchanged: the line is pended
+             * under hv_aic_alias_to_published() (its own number when not aliased).
+             */
+            u32 guest_irq;
+            if (!hv_usb_enabled()) {
+                guest_irq = hv_aic_alias_to_published(irq);
+            } else if (!hv_aic_alias_lookup_physical(irq, &guest_irq)) {
+                aic_set_mask(irq, true);
+                t8152_unowned_irq(irq);
+                return;
+            } else {
+                hv_usb_note_irq(irq);
+            }
             if (!gic_cpuif_aic_logged[smp_id()]) {
                 gic_cpuif_aic_logged[smp_id()] = true;
                 printf("HV: T8152: AIC line %u -> INTID %u at EL2 on CPU %d\n", irq, guest_irq,

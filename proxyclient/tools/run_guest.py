@@ -84,6 +84,12 @@ parser.add_argument('--windows-ahci-overwrite', action='store_true',
 parser.add_argument('--windows-ahci-boot', choices=('auto', 'disk', 'ramdisk'), default='auto',
                     help='T8152 D1: what Mu boots first: "auto" (default) is the appended RAM '
                          'disk when -a gives one, else the AHCI disk.')
+parser.add_argument('--windows-usb', default='off', metavar='{off,drd1,drd1+drd3,drd3}',
+                    help='T8152 D4: pass the usb-drd1 (left-rear USB-C) and/or usb-drd3 (right) '
+                         'xHCI through to Windows, with the carrier\'s DART identity map of '
+                         'guest RAM and AIC 1692 -> SPI 995 (1834 -> 997). Default off. Needs a '
+                         'USB FD (Mu J804_WINDOWS_USB, marker J804USB1 at 0x120). usb-drd0, the '
+                         'proxy\'s link, is refused in every spelling.')
 parser.add_argument('payload', type=pathlib.Path)
 parser.add_argument('boot_args', default=[], nargs="*")
 args = parser.parse_args()
@@ -198,6 +204,75 @@ def windows_t8152_ahci_plan(base, top, payload):
             "overwrite": args.windows_ahci_overwrite}
 
 
+def windows_t8152_usb_plan(payload, u):
+    """D4: check --windows-usb against the chip, the board, the resident and the FD before
+    anything is uploaded.  Returns the port tuple (empty when off)."""
+    from aura import windows as w
+    try:
+        ports = w.parse_windows_usb(args.windows_usb)
+        caps2 = 0
+        if ports:
+            try:
+                caps2 = p.hv_windows_capabilities2()
+            except ProxyRemoteError:
+                caps2 = 0  # an older resident: Bad Command
+        chosen = u.adt["/chosen"]
+        w.validate_usb_request(ports, chosen.chip_id, getattr(chosen, "board_id", -1), caps2,
+                               payload)
+    except ValueError as exc:
+        sys.exit(f"T8152 launch refused: {exc}. The aura proxy keeps running; no guest was "
+                 "started.")
+    if ports:
+        print(f"T8152 USB: passing {w.usb_spelling(ports)} through (CAPS2 {caps2:#x}, FD "
+              f"markers {sorted(w.fd_usb_markers(payload))})")
+    return ports
+
+
+def windows_t8152_usb_attach(hv, ports, ahci):
+    """After the AHCI store, before hv.start(): the resident checks the port, builds the DART
+    map of guest RAM and passes the xHCI through.  Only then does the guest ADT get Mu's
+    /chosen/aura,windows-usb-v1 handshake, with the DART window the resident reports.  A
+    refusal stops the launch."""
+    from aura import windows as w
+    if not ports:
+        return
+    result = p.hv_windows_usb(w.USB_OP_ATTACH, w.usb_port_mask(ports))
+    if result != 0:
+        p.hv_windows_usb(w.USB_OP_DETACH)
+        sys.exit(f"T8152: the resident refused USB passthrough: {w.describe_usb_attach(result)} "
+                 "(its console says why). hv_init() ran, so the carrier session is used up: "
+                 "reload the carrier. No guest was started.")
+    try:
+        dma = (p.hv_windows_usb(w.USB_OP_STATUS, 0, w.USB_STATUS_DMA_BASE),
+               p.hv_windows_usb(w.USB_OP_STATUS, 0, w.USB_STATUS_DMA_TOP))
+        value = w.usb_handshake(ports, *dma, hv.windows_guest_ram,
+                                ahci["plan"] if ahci else None)
+        hv.set_windows_usb_handshake(value)
+    except (ValueError, ProxyRemoteError) as exc:
+        p.hv_windows_usb(w.USB_OP_DETACH)
+        sys.exit(f"T8152: USB attached but the Mu handshake was refused: {exc}. USB was torn "
+                 "down again; the carrier session is used up: reload the carrier. No guest was "
+                 "started.")
+    print(f"T8152 USB: {w.usb_spelling(ports)} attached, DART window [{dma[0]:#x}, "
+          f"{dma[1]:#x}), /chosen/{w.USB_HANDSHAKE_PROPERTY} written; plug the keyboard and "
+          "mouse in before Windows boots")
+
+
+def windows_t8152_usb_status(ports):
+    from aura import windows as w
+    for port in ports:
+        try:
+            st = {name: p.hv_windows_usb(w.USB_OP_STATUS, port, index)
+                  for name, index in w.USB_STATUS.items()}
+        except ProxyRemoteError as exc:
+            print(f"T8152 USB: drd{port} status unavailable: {exc}")
+            continue
+        print(f"T8152 USB: drd{port} at exit: USBSTS {st['usbsts']:#x} PORTSC "
+              f"{st['portsc1']:#x}/{st['portsc2']:#x}, {st['irqs']} interrupts, DART exceptions "
+              f"{st['dart0_exc']:#x}/{st['dart1_exc']:#x}, GCTL {st['gctl']:#x}, unowned lines "
+              f"{st['unowned']}{', STORM' if st['storm'] else ''}")
+
+
 def windows_t8152_ahci_attach(hv, u, ahci):
     """After load_raw: attach the store (fresh: zero it, upload the image, seal the upload)."""
     from aura import windows as w
@@ -266,6 +341,7 @@ def run_windows_t8152(caps):
     enter it unless every T8152 safety precondition holds (src/hv/windows/hv_t8152.c)."""
     from aura.windows import (AURA_HEAP_RESERVE, PROXY_HEAP_SIZE, T8152_CHIP, WindowsLaunchRefused,
                               number, t8152_check_window, windows_system_reset)
+    from aura.windows import USB_OP_DETACH, usb_spelling
     if not args.raw:
         sys.exit("T8152 Windows guests are raw Mu FDs: pass -r")
     if args.symbols or args.debug_xnu or args.volume or args.emulate_sprr or args.cpus or \
@@ -287,6 +363,7 @@ def run_windows_t8152(caps):
     if ba.video.base and ba.video.stride and ba.video.height:
         occupied.append(("scanout", ba.video.base, ba.video.stride * ba.video.height))
     t8152_check_window(u.adt, ba, base, top, occupied)
+    usb_ports = windows_t8152_usb_plan(payload, u)
     print(f"T8152: guest RAM [{base:#x}, {top:#x}) passes the host check; NVRAM, QSPI and the "
           f"audio/AOP/ADMAC/i2c nodes are hidden, and the resident re-checks everything")
 
@@ -295,6 +372,7 @@ def run_windows_t8152(caps):
     hv.windows_serial = args.windows_serial
     hv.windows_guest_ram = (base, ahci["plan"].store_base) if ahci else (base, top)
     hv.windows_ahci = ahci
+    hv.windows_usb = usb_spelling(usb_ports)
     hv.windows_ipi = args.windows_ipi
     hv.windows_gic_cpuif = args.windows_gic_cpuif or "software"
     hv.windows_wfi = args.windows_wfi
@@ -335,12 +413,20 @@ def run_windows_t8152(caps):
           f"boot_args {hv.guest_base + hv.bootargs_off:#x}")
     if ahci:
         windows_t8152_ahci_attach(hv, u, ahci)
+    windows_t8152_usb_attach(hv, usb_ports, ahci)
     try:
         result = hv.start()
     except ProxyRemoteError as exc:
+        if usb_ports:
+            # hv_start() tears USB down on every exit itself; DETACH is idempotent.
+            try:
+                p.hv_windows_usb(USB_OP_DETACH)
+            except ProxyRemoteError:
+                pass
         sys.exit(f"Hypervisor refused or failed: {exc}. The aura proxy keeps running; "
                  "its console says why.")
     print(f"Guest exit status: {result} (1 SYSTEM_OFF, 2 SYSTEM_RESET)")
+    windows_t8152_usb_status(usb_ports)
     if ahci:
         windows_t8152_ahci_seal(result, ahci)
     if result == 2 and args.windows_reset_on_exit:
@@ -356,7 +442,8 @@ if _windows_caps and p.get_chipid() == 0x8152:
     run_windows_t8152(_windows_caps)
 elif (args.windows_guest_ram or args.windows_ipi != 'poll' or args.windows_reset_on_exit or
       args.windows_gic_cpuif not in (None, 'carrier') or args.windows_wfi != 'poll' or
-      args.windows_guest_compatibility != 'none' or ahci_requested()):
+      args.windows_guest_compatibility != 'none' or ahci_requested() or
+      args.windows_usb not in ('off', 'disabled')):
     sys.exit("--windows-* options need the Windows personality (gmake WINDOWS=1) on T8152")
 
 if args.emulate_sprr or not p.get_cpu_features().apple_sysregs_unlocked:

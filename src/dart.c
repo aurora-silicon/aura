@@ -480,6 +480,16 @@ static int dart_gen3_stream_adt(const char *path, int instance, int device, dart
     return 0;
 }
 
+/* Invalidate one Gen3 stream's TLB through the aperture (D4: the carrier's USB DART map). */
+int dart_gen3_tlbi_adt(const char *path, int instance, int device)
+{
+    dart_dev_t d;
+    if (dart_gen3_stream_adt(path, instance, device, &d))
+        return -1;
+    dart_gen3_tlb_invalidate(&d);
+    return 0;
+}
+
 /*
  * Return a Gen3 stream that a previous aura stage owned to the idle state
  * dart_gen3_init_adt_cold() expects: disabled, no root, plain translation. Used when a

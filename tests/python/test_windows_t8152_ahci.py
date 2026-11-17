@@ -413,7 +413,7 @@ def test_990_is_never_an_aic_alias():
 def test_hv_start_refuses_without_a_ready_store():
     # F12, F18: the pre-entry check, RUNNING only once entry is certain, exit recorded.
     hv_c = source("hv.c")
-    start = function_body(hv_c, "int hv_start(void *entry, u64 regs[4])")
+    start = function_body(hv_c, "static int hv_start_session(void *entry, u64 regs[4])\n{")
     assert "hv_ahci_verify() < 0" in start
     assert start.index("hv_ahci_verify() < 0") < start.index("hv_ahci_guest_entered();") < \
         start.index("hv_enter_guest(regs[0]")

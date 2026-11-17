@@ -254,7 +254,7 @@ HV_OBJECTS := $(patsubst %,hv/windows/%, \
 	hv.o hv_aic.o hv_asm.o hv_exc.o hv_vgic.o hv_psci.o \
 	hv_aic_alias.o hv_t8152.o hv_gic_cpuif.o fb_capture.o windows_compat.o windows_n1.o \
 	serial_capture.o mtp_handoff.o hv_xfer.o ahci_model.o hv_ahci.o hv_vdev_spi.o \
-	hv_fatal.o) \
+	hv_fatal.o hv_usb.o hv_usb_dart.o) \
 	hv/hv_vm.o hv/hv_virtio.o hv/hv_vuart.o hv/hv_wdt.o hv/hv_sprr.o
 endif
 

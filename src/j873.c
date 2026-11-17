@@ -267,6 +267,25 @@ void j873_usb_wake_hpms(void)
 }
 
 /*
+ * D4 (the Windows carrier's hv_usb.c): the fixed J804 bases of usb-drd1 (port 1) or usb-drd3
+ * (port 3) and whether j804_usb_prep() left that port in host mode.  Read only; usb-drd0, the
+ * proxy's port, is not in j804_usb[] and is refused.
+ */
+int j804_usb_port_state(int port, struct j804_usb_port *out)
+{
+    if (chip_id != T8152 || board_id != 0x22 || (port != 1 && port != 3) || !out)
+        return -1;
+    const struct j873_usb *u = &j804_usb[port == 1 ? 0 : 1];
+    out->dwc = u->dwc;
+    out->evt = u->evt;
+    out->dart0 = u->dart0;
+    out->dart1 = u->dart1;
+    out->name = u->name;
+    out->up = j873_usb_is_up(u);
+    return 0;
+}
+
+/*
  * Internal PCIe (apcie): iBoot leaves the root complex enabled, but the AUS5
  * PHY gated and RC reg 4 (lane configuration) at 0x103, which gives every
  * lane to port 0. Apply the PHY tunables, ungate the PHY, enable PHY common,
