@@ -29,7 +29,6 @@ typedef uint32_t u32;
 #define HCR_VI 128
 #define HCR_VF 64
 #define ESR_ISS 0
-#define HV_FB_SLICE_IDLE 160
 #define START_HV 1
 #define HV_VTIMER 3
 #define START_EXCEPTION_LOWER 4
@@ -68,7 +67,10 @@ static bool wfi_trap_logged = true, t8142_sp_el0_repair_logged[MAX_CPUS];
 static int bhl;
 
 /* Modeled costs, in counter ticks (ns at 1 GHz). */
-static u64 cost_context = 40, cost_update_fiq = 200, cost_fb_slice = 310000, cost_tick = 5000;
+static u64 cost_context = 40, cost_update_fiq = 200, cost_fb_line = 130000, cost_tick = 5000;
+static u64 pending_at[MAX_CPUS] = {[0 ... MAX_CPUS - 1] = ~0UL}; /* a physical interrupt arrives here */
+static u64 fb_lines_converted;
+static u32 hv_fb_shadow_model[1], *hv_fb_shadow = hv_fb_shadow_model;
 static u64 lock_contention;              /* next acquisition waits this long */
 static u64 truth_lock_wait[MAX_CPUS];    /* what the lock model made each CPU wait */
 static u64 truth_locks[MAX_CPUS], truth_lock_taken[MAX_CPUS], truth_held[MAX_CPUS];
@@ -83,6 +85,8 @@ static u64 read_reg(unsigned reg)
 {
     if (reg == CNTFRQ_EL0)
         return frequency;
+    if (reg == ISR_EL1 && clock_now[cpu] >= pending_at[cpu])
+        return registers[cpu][reg] | 0x80;
     u64 v = registers[cpu][reg];
     if (reg == SYS_CNTHP_CTL_EL2 && (v & CNTx_CTL_ENABLE) && (s64)(clock_now[cpu] - expires[cpu]) >= 0)
         v |= CNTx_CTL_ISTATUS;
@@ -160,11 +164,13 @@ static bool hv_native_aic_mu_timer_active(void) { return false; }
 static void hv_set_spsr(u64 v) { (void)v; }
 static void hv_set_elr(u64 v) { (void)v; }
 static void hv_windows_mtp_poll(void) {}
-static void hv_fb_convert_slice(unsigned lines) { assert(lines == HV_FB_SLICE_IDLE); clock_now[cpu] += cost_fb_slice; }
+static void hv_fb_convert_slice(unsigned lines) { clock_now[cpu] += lines * cost_fb_line; fb_lines_converted += lines; }
 static void cpu_wfi_stateless(void)
 {
     if (during_wfi)
         during_wfi();
+    if (clock_now[cpu] >= pending_at[cpu])
+        return; /* a pending interrupt ends WFI at once */
     assert((s64)(expires[cpu] - clock_now[cpu]) >= 0);
     clock_now[cpu] = expires[cpu];
 }

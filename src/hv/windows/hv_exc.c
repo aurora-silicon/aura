@@ -6251,7 +6251,7 @@ static bool hv_handle_wfx(struct exc_info *ctx)
          * a whole frame, under the lock -- cut guest interrupt throughput by
          * more than an order of magnitude.
          */
-        hv_fb_convert_slice(HV_FB_SLICE_IDLE);
+        hv_fb_convert_idle();
         /* Unlocked idle path, same as the slice above: this is where most of
          * the change detection actually happens, because an idle guest exits
          * here constantly and a busy one does not need watching as closely. */

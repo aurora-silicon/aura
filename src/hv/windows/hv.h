@@ -171,11 +171,18 @@ void hv_arm_wfi_wake(void);
  *
  * 160 lines puts the same nine cores at 9 * 80 * 160 = 115,200 lines/s, near
  * 70 fps, for 0.31 ms of work per wakeup on a core that was about to sleep.
+ *
+ * Boot 144 measured the run-time cost at about 130 us per scanline, not 1.95 us
+ * (four-byte loads from the Normal-NC shadow, each a DRAM round trip), so the
+ * idle slice is ~21 ms.  hv_fb_convert_idle() does it in HV_FB_SLICE_STEP steps
+ * and stops at the first pending interrupt; see docs/windows-wfi-fb-slice.md.
  */
 #define HV_FB_SLICE_IDLE 160
 #define HV_FB_SLICE_TICK 64
+#define HV_FB_SLICE_STEP 4
 
 void hv_fb_convert_slice(u32 lines);
+void hv_fb_convert_idle(void);
 void hv_fb_report(void);
 bool hv_mask_pending_tick(void);
 void hv_rearm(void);

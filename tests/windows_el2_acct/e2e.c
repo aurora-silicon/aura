@@ -170,7 +170,7 @@ static void busy_secondary(unsigned c, u64 until, u64 contention)
 static void idle_secondary(unsigned c, u64 until)
 {
     cpu = c;
-    while (clock_now[c] + 2000000 <= until) {
+    while (clock_now[c] + frequency / 20 <= until) { /* leaves room for the straddling WFI below */
         clock_now[c] += 50000;
         stay(c, HV_EL2_SYNC, HV_EL2_WFI, wfi_body);
         stay(c, HV_EL2_IRQ, HV_EL2_TICK, fiq_body);
@@ -191,6 +191,7 @@ static void report_during_wfi(void)
 static int run(u64 freq)
 {
     frequency = freq;
+    cost_fb_line = freq * 13 / 100000; /* boot 144: ~130 us per scanline from the NC shadow */
     u64 second = freq, t0 = 5 * freq;
     hv_tick_interval = second;
     hv_secondary_tick_interval = second / 5000; /* hv_init's T8142 secondary value before the fix */
@@ -217,7 +218,8 @@ static int run(u64 freq)
     busy_secondary(7, w1, freq / 50000); /* 20 us wait on each slow-path acquisition */
     idle_secondary(3, w1);
     cpu = 3;
-    clock_now[3] = w1 - cost_fb_slice - freq / 100000;
+    check(clock_now[3] <= w1 - HV_FB_SLICE_IDLE * cost_fb_line - freq / 100000, "straddle starts after the idle stream");
+    clock_now[3] = w1 - HV_FB_SLICE_IDLE * cost_fb_line - freq / 100000;
     hv_periodic_deadlines[3].next = w1 + freq / 6667; /* liveness deadline ~150 us after the report */
     straddle_report_at = w1;
     during_wfi = report_during_wfi;
@@ -261,6 +263,27 @@ static int run(u64 freq)
         site_insn = table[s].insn;
         stay(2, HV_EL2_SYNC, table[s].cause, site_body);
     }
+    /* Window 3b: an interrupt arrives mid-slice; the held WFI must end within one step. */
+    u64 before = fb_lines_converted;
+    clock_now[4] += freq / 1000;
+    u64 arrive = clock_now[4] + 7 * cost_fb_line + cost_fb_line / 3;
+    pending_at[4] = arrive;
+    stay(4, HV_EL2_SYNC, HV_EL2_WFI, wfi_body);
+    u64 lines = fb_lines_converted - before;
+    check(clock_now[4] >= arrive && clock_now[4] - arrive <= HV_FB_SLICE_STEP * cost_fb_line,
+          "an interrupt pending mid-slice ends the held WFI within one conversion step");
+    check(lines > 0 && lines < HV_FB_SLICE_IDLE && lines % HV_FB_SLICE_STEP == 0,
+          "conversion stops early, on a step boundary, with lines counted");
+    pending_at[4] = ~0UL;
+    before = fb_lines_converted;
+    stay(4, HV_EL2_SYNC, HV_EL2_WFI, wfi_body);
+    check(fb_lines_converted - before == HV_FB_SLICE_IDLE, "with nothing pending the whole idle slice is converted");
+    pending_at[4] = clock_now[4];
+    before = fb_lines_converted;
+    u64 at = clock_now[4];
+    stay(4, HV_EL2_SYNC, HV_EL2_WFI, wfi_body);
+    check(fb_lines_converted == before && clock_now[4] == at, "an interrupt pending before the WFI: no conversion, no wait");
+    pending_at[4] = ~0UL;
     boot_housekeeping(w3, "window 3");
 
     check(reports_checked == 3, "three full reports verified");

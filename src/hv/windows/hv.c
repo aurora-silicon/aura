@@ -653,6 +653,24 @@ void hv_fb_convert_slice(u32 lines)
 }
 
 /*
+ * The idle slice of a held guest WFI, in short steps that stop at the first pending physical
+ * interrupt.  One 160-line call measured ~21 ms on boot 144, during which the core did not look
+ * at its interrupts; now it notices one within a step and the WFI that follows returns at once.
+ * With nothing pending the whole slice is converted, as before.
+ */
+void hv_fb_convert_idle(void)
+{
+    if (!hv_fb_shadow)
+        return;
+
+    for (u32 done = 0; done < HV_FB_SLICE_IDLE; done += HV_FB_SLICE_STEP) {
+        if (mrs(ISR_EL1))
+            return;
+        hv_fb_convert_slice(HV_FB_SLICE_STEP);
+    }
+}
+
+/*
  * Refresh rate actually achieved, once a second.
  *
  * Worth carrying: what limits this is how often the engines run, not the memory

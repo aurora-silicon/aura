@@ -100,6 +100,8 @@ static void write_reg(unsigned reg, u64 value) {
 static void hv_wdt_pet(void) { ++full_ticks; }
 static void hv_windows_serial_flush(void) { ++serial_flushes; }
 static void hv_fb_convert_slice(unsigned slice) { if (slice == HV_FB_SLICE_IDLE) ++frame_idle; else ++frame_tick; }
+/* hv_fb_convert_idle() is exercised by tests/windows_el2_acct; here it is one idle slice. */
+static void hv_fb_convert_idle(void) { hv_fb_convert_slice(HV_FB_SLICE_IDLE); }
 static void hv_fb_report(void) {}
 static void hv_track_t8142_undef_vector(struct exc_info *ctx) { (void)ctx; }
 static void hv_verify_t8142_undef_vectors(void) { ++vector_repairs; }

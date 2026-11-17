@@ -8,7 +8,7 @@ ROOT = HERE.parents[1]
 HV = 'src/hv/windows/hv.c'
 EXC = 'src/hv/windows/hv_exc.c'
 FUNCTIONS = {
-    HV: ['hv_host_counter', 'hv_mask_pending_tick', 'hv_arm_wfi_wake', 'hv_arm_tick'],
+    HV: ['hv_host_counter', 'hv_mask_pending_tick', 'hv_arm_wfi_wake', 'hv_arm_tick', 'hv_fb_convert_idle'],
     EXC: ['hv_el2_add', 'hv_el2_enter', 'hv_el2_exit', 'hv_el2_cause', 'hv_el2_site_cause',
           'hv_el2_lock_acquired', 'hv_el2_lock_released', 'hv_el2_us', 'hv_report_t8142_el2_acct',
           'hv_exc_entry', 'hv_exc_exit', 'hv_handle_wfx', 'hv_exc_fiq'],
@@ -27,6 +27,8 @@ MUTATIONS = [
     ('hold-never-released', '    hv_el2_lock_released();\n    spin_unlock(&bhl);', '    spin_unlock(&bhl);'),
     ('no-flood-guard', 'if (!baseline && now - last_report < freq / 2)', 'if (false)'),
     ('boot-cpu-omitted', 'if (cpu != boot_cpu_idx && !smp_is_alive(cpu))', 'if (!smp_is_alive(cpu))'),
+    ('fb-idle-ignores-pending-interrupts', '        if (mrs(ISR_EL1))\n            return;\n', ''),
+    ('fb-idle-whole-slice-in-one-step', 'hv_fb_convert_slice(HV_FB_SLICE_STEP);', 'hv_fb_convert_slice(HV_FB_SLICE_IDLE);'),
     ('microseconds-assume-1ghz', 'return (ticks / freq) * 1000000 + ((ticks % freq) * 1000000) / freq;', 'return ticks / 1000 + 0 * freq;'),
 ]
 
@@ -95,7 +97,7 @@ def main():
     ap.add_argument('--output', required=True)
     out = pathlib.Path(ap.parse_args().output).resolve()
     out.mkdir(parents=True, exist_ok=False)
-    inputs = [ROOT / p for p in FUNCTIONS] + [ROOT / h for h in HEADERS] + \
+    inputs = [ROOT / p for p in FUNCTIONS] + [ROOT / h for h in HEADERS] + [ROOT / 'src/hv/windows/hv.h'] + \
              [HERE / 'host.h', HERE / 'e2e.c', pathlib.Path(__file__), ROOT / 'docs/windows-el2-accounting.md']
     receipt = {'hardware_accessed': False,
                'scope': 'verbatim production EL2 accounting, report, FIQ, WFI, bhl entry/exit and timer functions; '
@@ -107,6 +109,8 @@ def main():
         sdk = subprocess.check_output(['/usr/bin/xcrun', '--show-sdk-path'], text=True).strip()
         receipt['compiler'] = {'path': str(pathlib.Path(cc).resolve()), 'sha256': sha(pathlib.Path(cc).resolve()), 'sdk': sdk}
         code = (HERE / 'host.h').read_text() + '\n'
+        hv_h = (ROOT / 'src/hv/windows/hv.h').read_text()
+        code += ''.join(re.search(r'^#define ' + n + r' .*\n', hv_h, re.M).group(0) for n in ('HV_FB_SLICE_IDLE', 'HV_FB_SLICE_STEP')) + '\n'
         hv_text = (ROOT / HV).read_text()
         exc_text = (ROOT / EXC).read_text()
         code += '\n\n'.join(function(hv_text, n) for n in FUNCTIONS[HV]) + '\n\n'
