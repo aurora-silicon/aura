@@ -17,8 +17,7 @@ def test_capability_and_incomplete_export():
     assert capability(2 << 24, True)
     with pytest.raises(ValueError, match='dirty-room'):
         patch_plan(None, None)
-    assert unresolved_groups() == ['CTRR check', 'CTRR reset-path check',
-                                   'ctXr lock check', 'AMCC CTRR match']
+    assert unresolved_groups() == ['AMCC CTRR match']
     assert inspect_patch_export(None, None)['unresolved'] == unresolved_groups()
 
 @pytest.mark.skipif(not REAL_IMAGE, reason='exact private J613 SPTM image not given')

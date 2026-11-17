@@ -373,7 +373,57 @@ static void sptm_virt_reset_guard_setup(void)
  * wrote, the hardware keeps them open. On by default; AURA_AMCC_NOLOCK=0 lets SPTM lock them.
  */
 u32 sptm_virt_amcc_nolock = 1;
-static u64 amcc_lock_shadow[16][2]; /* {pa, value} */
+static u64 amcc_lock_shadow[32][2]; /* {pa, value} */
+
+/*
+ * T8122's stock SPTM describes its AMCC protection registers in
+ * /chosen/lock-regs/amcc.  Stage 1 has already protected its own image in the
+ * real AMCC when the volatile guest starts, while SPTM requires an unlocked
+ * register bank for the image it is booting.  Give the guest a zero-initialized
+ * shadow of only those described registers.  The host's bounds and locks stay
+ * intact.  The exact ADT contract is checked before any page is hooked.
+ */
+struct t8122_amcc_layout {
+    u32 lower;
+    u32 upper;
+    u32 enable;
+    u32 lock;
+    u32 write_disable;
+    u32 cache_status;
+    u32 cache_status_mask;
+    u32 cache_status_value;
+};
+static struct t8122_amcc_layout t8122_amcc;
+static bool t8122_amcc_ready;
+
+static bool amcc_shadow_rw(u64 addr, u64 *val, bool write)
+{
+    for (unsigned i = 0; i < ARRAY_SIZE(amcc_lock_shadow); i++) {
+        if (amcc_lock_shadow[i][0] == addr || !amcc_lock_shadow[i][0]) {
+            if (write) {
+                amcc_lock_shadow[i][0] = addr;
+                amcc_lock_shadow[i][1] = *val;
+                return true;
+            }
+            if (amcc_lock_shadow[i][0] == addr)
+                *val = amcc_lock_shadow[i][1];
+            else {
+                amcc_lock_shadow[i][0] = addr;
+                amcc_lock_shadow[i][1] = 0;
+                *val = 0;
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool t8122_amcc_is_shadow(u64 addr)
+{
+    u32 off = addr & 0x3fff;
+    return off == t8122_amcc.lower || off == t8122_amcc.upper || off == t8122_amcc.enable ||
+           off == t8122_amcc.lock || off == t8122_amcc.write_disable;
+}
 
 /* sptm_virt_amcc_nolock is a mask over the three locks: bit 0 +0xacc, bit 1 +0xadc, bit 2 +0xaec.
  * Only +0xacc covers aura (t124: shadowing it alone keeps aura's memory; the other two -- the
@@ -393,23 +443,100 @@ static bool amcc_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int 
         printf("SPTM-virt[amcc]: guest wrote 0x%lx -> 0x%lx (w%d) at pc 0x%lx%s\n", *val, addr,
                width, ctx->elr,
                sptm_virt_amcc_nolock && amcc_is_lock(addr) ? " -- range lock shadowed" : "");
-    if (sptm_virt_amcc_nolock && amcc_is_lock(addr) && width == 2) {
-        for (unsigned i = 0; i < ARRAY_SIZE(amcc_lock_shadow); i++) {
-            if (amcc_lock_shadow[i][0] == addr || !amcc_lock_shadow[i][0]) {
-                if (write) {
-                    amcc_lock_shadow[i][0] = addr;
-                    amcc_lock_shadow[i][1] = *val;
-                    return true;
-                }
-                if (amcc_lock_shadow[i][0] == addr) {
-                    *val = amcc_lock_shadow[i][1];
-                    return true;
-                }
-                break;
+    if (width == 2 && t8122_amcc_ready) {
+        if (t8122_amcc_is_shadow(addr))
+            return amcc_shadow_rw(addr, val, write);
+        if ((addr & 0x3fff) == t8122_amcc.cache_status) {
+            if (!write) {
+                sptm_virt_mmio_rw(addr, val, false, width);
+                *val = (*val & ~t8122_amcc.cache_status_mask) |
+                       t8122_amcc.cache_status_value;
+            }
+            return true;
+        }
+    }
+    if (sptm_virt_amcc_nolock && amcc_is_lock(addr) && width == 2)
+        return amcc_shadow_rw(addr, val, write);
+    sptm_virt_mmio_rw(addr, val, write, width);
+    return true;
+}
+
+static bool adt_u32_is(int node, const char *name, u32 expected)
+{
+    u32 value;
+    return ADT_GETPROP(adt, node, name, &value) >= 0 && value == expected;
+}
+
+static bool sptm_virt_amcc_watch_t8122(void)
+{
+    int node = adt_path_offset(adt, "/chosen/lock-regs/amcc");
+    int bank = node < 0 ? -1 : adt_subnode_offset(adt, node, "amcc-ctrr-a");
+    u32 len = 0;
+    const u64 *apertures = node < 0 ? NULL : adt_getprop(adt, node, "aperture-phys-addr", &len);
+    const u64 exact_apertures[2] = {0x220000000UL, 0x222000000UL};
+
+    if (bank < 0 || !apertures || len != sizeof(exact_apertures) ||
+        memcmp(apertures, exact_apertures, sizeof(exact_apertures)) ||
+        !adt_u32_is(node, "aperture-count", 2) || !adt_u32_is(node, "aperture-size", 0x200000) ||
+        !adt_u32_is(node, "plane-count", 2) || !adt_u32_is(node, "plane-stride", 0x40000) ||
+        !adt_u32_is(node, "cache-status-reg-offset", 0x1c00) ||
+        !adt_u32_is(node, "cache-status-reg-mask", 1) ||
+        !adt_u32_is(node, "cache-status-reg-value", 0) ||
+        !adt_u32_is(bank, "lower-limit-reg-offset", 0x690) ||
+        !adt_u32_is(bank, "lower-limit-reg-mask", 0xffffffff) ||
+        !adt_u32_is(bank, "upper-limit-reg-offset", 0x694) ||
+        !adt_u32_is(bank, "upper-limit-reg-mask", 0xffffffff) ||
+        !adt_u32_is(bank, "enable-reg-offset", 0x698) ||
+        !adt_u32_is(bank, "enable-reg-mask", 1) || !adt_u32_is(bank, "enable-reg-value", 1) ||
+        !adt_u32_is(bank, "lock-reg-offset", 0x69c) || !adt_u32_is(bank, "lock-reg-mask", 1) ||
+        !adt_u32_is(bank, "lock-reg-value", 1) ||
+        !adt_u32_is(bank, "write-disable-reg-offset", 0x6a0) ||
+        !adt_u32_is(bank, "write-disable-reg-mask", 1) ||
+        !adt_u32_is(bank, "write-disable-reg-value", 1) ||
+        !adt_u32_is(bank, "page-size-shift", 14)) {
+        printf("SPTM-virt[amcc]: T8122 lock-reg ADT does not match J613/25G83; not watched\n");
+        return false;
+    }
+
+    t8122_amcc = (struct t8122_amcc_layout){
+        .lower = 0x690,
+        .upper = 0x694,
+        .enable = 0x698,
+        .lock = 0x69c,
+        .write_disable = 0x6a0,
+        .cache_status = 0x1c00,
+        .cache_status_mask = 1,
+        .cache_status_value = 0,
+    };
+    memset(amcc_lock_shadow, 0, sizeof(amcc_lock_shadow));
+
+    for (int i = 0; i < 2; i++) {
+        u64 base, stride;
+        int count;
+        if (mcc_plane_info(i, &base, &stride, &count) < 0 || base != exact_apertures[i] ||
+            stride != 0x40000 || count != 2) {
+            printf("SPTM-virt[amcc]: T8122 MCC plane layout mismatch; not watched\n");
+            return false;
+        }
+    }
+
+    t8122_amcc_ready = true;
+    for (int i = 0; i < 2; i++) {
+        u64 base, stride;
+        int count;
+        mcc_plane_info(i, &base, &stride, &count);
+        for (int p = 0; p < count; p++) {
+            u64 page = base + p * stride;
+            if (hv_map_hook(page, amcc_hook, 0x4000) < 0) {
+                t8122_amcc_ready = false;
+                printf("SPTM-virt[amcc]: cannot hook T8122 MCC %d plane %d at 0x%lx\n", i, p,
+                       page);
+                return false;
             }
         }
     }
-    sptm_virt_mmio_rw(addr, val, write, width);
+    printf("SPTM-virt[amcc]: T8122 J613/25G83 exact lock-reg contract shadowed on 4 planes; "
+           "host protection unchanged\n");
     return true;
 }
 
@@ -417,6 +544,10 @@ static void sptm_virt_amcc_watch(void)
 {
     u64 base, stride;
     int count;
+    if (chip_id == T8122) {
+        sptm_virt_amcc_watch_t8122();
+        return;
+    }
     /* The plane offsets above are T8142's; other chips keep their AMCC unhooked. */
     if (chip_id != T8142)
         return;
