@@ -9,22 +9,28 @@
  * G1 (windows-m6/WINDOWS-GPU-PLAN.md, G0-CARRIER-CONTRACT.md section "G1"): GPU power-on for
  * the Windows carrier, and the boot-wide marker that keeps it to once per boot.
  *
- * Power-on is a PMGR PSD request per GPU service, in a fixed order, each from cold idle: write
- * the request, poll the acknowledge register, then read the state once (reading the state
- * consumes the acknowledge) and compare it with the service's active state.  Nothing here
- * powers anything off: a failure stops the sequence where it is.  Once the last service is on,
- * the GPU firmware is running (the ASCs come up with CPU_CONTROL RUN already set), so a second
- * power-on in the same boot would be a second firmware session, which the firmware does not
- * survive.
+ * Power-on is a PMGR PSD request per GPU service, walked from a recipe: for each step, in the
+ * recipe's order, write the request, poll the acknowledge register, then read the state and
+ * compare it with the step's target.  Which state each service must read before its request
+ * (cold_idle), the order, and the order in which a sample reads the acknowledge and state
+ * registers (read_order) are all recipe data; this code only refuses to write a service that is
+ * not in the recipe's precondition state.  Nothing here powers anything off: a failure stops the
+ * sequence where it is.  Once the last service is on, the GPU firmware is running (the ASCs come
+ * up with CPU_CONTROL RUN already set: our own observation, ledger B-03).  The plan forbids a
+ * second firmware start in one boot (WINDOWS-GPU-PLAN section 7), hence the boot marker below.
  *
- * The recipe (block address rule, register offsets, service ids, request and active values,
- * order) is not in this repository: gpu_t8152_power_recipe.c takes it from the builder's private
- * data at build time (J804_PRIVATE_DATA/aura/g18g-j804-gpu-power.h), and without that file the
- * carrier is built with power-on disabled.  Every block is checked against a pmgr* register range
- * of the live ADT before it is touched.
+ * The recipe (block address rule, register offsets, read order, service ids, precondition,
+ * request and target values, order) is not in this repository: gpu_t8152_power_recipe.c takes it
+ * from the builder's private data at build time (J804_PRIVATE_DATA/aura/g18g-j804-gpu-power.h),
+ * and without that file the carrier is built with power-on disabled.  Every block is checked
+ * against a pmgr* register range of the live ADT before it is touched.
  */
 
 #define GPU_PSD_MAX_STEPS 4
+
+/* gpu_psd_recipe.read_order: which register a sample reads first.  0 is a malformed recipe. */
+#define GPU_PSD_READ_ACK_FIRST   1
+#define GPU_PSD_READ_STATE_FIRST 2
 
 struct gpu_psd_step {
     u32 service; /* PSD service id */
@@ -39,7 +45,8 @@ struct gpu_psd_recipe {
     u64 base;  /* block of service n = base + n * stride */
     u32 stride, block_size;
     u32 state_off, state_mask, request_off, ack_off, ack_bit;
-    u32 cold_idle; /* every service reads this before power-on (cold boot) */
+    u32 read_order; /* GPU_PSD_READ_*: the recipe's sample order */
+    u32 cold_idle;  /* the state every service must read before its request */
     u32 poll_us, polls;
     u32 nsteps;
     struct gpu_psd_step step[GPU_PSD_MAX_STEPS];
@@ -71,17 +78,18 @@ struct gpu_psd_result {
  */
 int gpu_t8152_psd_check(const struct gpu_psd_recipe *r);
 
-/* Read every service of the recipe: acknowledge first, then state. */
+/* Read every service of the recipe: acknowledge and state, in the recipe's read_order. */
 void gpu_t8152_psd_sample(const struct gpu_psd_recipe *r, const struct gpu_psd_ops *ops,
                           struct gpu_psd_sample *out);
 
-/* Every service reads cold idle with no acknowledge pending. */
+/* Every service reads the recipe's precondition state (cold_idle) with no acknowledge pending. */
 bool gpu_t8152_psd_all_cold(const struct gpu_psd_recipe *r, const struct gpu_psd_sample *s);
 
 /*
  * The power-on, in recipe order.  Each step re-reads its service and refuses to write unless it
- * is still cold idle and every earlier step's service still reads its active state; then it
- * writes the request, polls the acknowledge (at most polls x poll_us) and reads the state once.
+ * still reads the recipe's precondition state and every earlier step's service still reads its
+ * target; then it writes the request, polls the acknowledge (at most polls x poll_us) and reads
+ * the state.
  * Stops at the first failure without touching anything else (no power-off, no retry).  0 when
  * every service reached its active state, else -1; *res says how far it got either way.
  */

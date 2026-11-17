@@ -648,6 +648,7 @@ def test_run_guest_input_order_and_refusals():
         t8152.index("windows_t8152_input_attach(hv, input_sources)") < \
         t8152.index("windows_t8152_gpu_admit(hv, gpu_mode, usb_ports, ahci)") < \
         t8152.index("windows_t8152_input_attach(hv, input_sources, usb_ports, input_mtp)") < \
+        t8152.index("windows_t8152_input_attach(hv, input_sources, usb_ports, gpu_mode)") < \
         t8152.index("result = hv.start()") < \
         t8152.index("windows_t8152_input_status(input_sources)")
     plan = src[src.index("def windows_t8152_input_plan"):

@@ -51,7 +51,9 @@ int gpu_t8152_psd_check(const struct gpu_psd_recipe *r)
     u32 regs[3] = {r->state_off, r->request_off, r->ack_off};
     bool ok = r->nsteps > 0 && r->nsteps <= GPU_PSD_MAX_STEPS && r->stride && r->block_size &&
               r->state_mask && r->ack_bit && r->polls && r->polls <= 100000 && r->poll_us &&
-              r->poll_us <= 10000 && (r->cold_idle & ~r->state_mask) == 0;
+              r->poll_us <= 10000 && (r->cold_idle & ~r->state_mask) == 0 &&
+              (r->read_order == GPU_PSD_READ_ACK_FIRST ||
+               r->read_order == GPU_PSD_READ_STATE_FIRST);
     for (u32 i = 0; ok && i < 3; i++)
         ok = !(regs[i] & 3) && regs[i] + 4 <= r->block_size;
     for (u32 i = 0; ok && i < r->nsteps; i++) {
@@ -81,8 +83,13 @@ static void sample_one(const struct gpu_psd_recipe *r, const struct gpu_psd_ops 
 {
     u64 b = block_of(r, service);
     s->service = service;
-    s->ack = ops->read32(b + r->ack_off);                       /* first: STATE consumes it */
-    s->state = ops->read32(b + r->state_off) & r->state_mask;
+    if (r->read_order == GPU_PSD_READ_ACK_FIRST) {
+        s->ack = ops->read32(b + r->ack_off);
+        s->state = ops->read32(b + r->state_off) & r->state_mask;
+    } else {
+        s->state = ops->read32(b + r->state_off) & r->state_mask;
+        s->ack = ops->read32(b + r->ack_off);
+    }
 }
 
 void gpu_t8152_psd_sample(const struct gpu_psd_recipe *r, const struct gpu_psd_ops *ops,
@@ -119,7 +126,7 @@ int gpu_t8152_psd_power_on(const struct gpu_psd_recipe *r, const struct gpu_psd_
         sample_one(r, ops, s->service, &now);
         if (now.state != r->cold_idle || (now.ack & r->ack_bit) || !earlier_on) {
             printf("HV: GPU: PSD %s (service %u) refused before its request: state %u ack 0x%x "
-                   "(cold idle %u wanted)%s\n",
+                   "(precondition state %u wanted)%s\n",
                    s->name, s->service, now.state, now.ack, r->cold_idle,
                    earlier_on ? "" : "; an earlier service is no longer on");
             res->failed_step = (int)i;

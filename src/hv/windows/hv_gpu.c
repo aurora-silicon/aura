@@ -588,7 +588,7 @@ static int power(void)
     if (marker_claim(before, r->nsteps, cold))
         return HV_GPU_E_BOOT;
     if (!cold) {
-        printf("HV: GPU: POWER refused: a GPU PSD service is not cold idle (%u) although no "
+        printf("HV: GPU: POWER refused: a GPU PSD service is not in the recipe's precondition state (%u) although no "
                "marker was set: something else powered it this boot; marked used, reboot\n",
                r->cold_idle);
         return HV_GPU_E_BOOT;

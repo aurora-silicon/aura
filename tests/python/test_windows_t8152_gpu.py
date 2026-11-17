@@ -1076,3 +1076,117 @@ def test_launcher_names_the_reserved_pool():
     assert len(problems) == 1 and "reboot the M6" in problems[0]
     assert w.t8152_window_conflicts(0x8_0000_0000, 0x9_2000_0000, 0x8_0000_0000, 0x2_0000_0000,
                                     {}, {w.GPU_POOL_SLOT: (0, 0)}, ()) == []
+
+
+# ---- G1 review fixes ---------------------------------------------------------------------------
+
+def _input_attach_under_test(query_fails=False, attach_result=0):
+    """windows_t8152_input_attach() from run_guest.py against a recording proxy stand-in."""
+    import ast
+    import types
+    from aura import windows as w
+    src = (REPO / "proxyclient/tools/run_guest.py").read_text()
+    fn = next(n for n in ast.parse(src).body
+              if isinstance(n, ast.FunctionDef) and n.name == "windows_t8152_input_attach")
+    calls = []
+
+    class RemoteError(Exception):
+        pass
+
+    class Proxy:
+        def hv_windows_input(self, op, *a):
+            calls.append(("input", op, *a))
+            if op == w.INPUT_OP_QUERY:
+                if query_fails:
+                    raise RemoteError("Bad Command")
+                return {w.INPUT_Q["version"]: w.INPUT_VERSION, w.INPUT_Q["base"]: w.INPUT_BASE,
+                        w.INPUT_Q["size"]: w.INPUT_SIZE, w.INPUT_Q["intid"]: w.INPUT_GSIV,
+                        w.INPUT_Q["features"]: w.INPUT_FEATURES_REPORTS}[a[0]]
+            if op == w.INPUT_OP_ATTACH:
+                return attach_result
+            return 0
+
+        def hv_windows_usb(self, op, *a):
+            calls.append(("usb", op, *a))
+            return 0
+
+        def hv_windows_gpu(self, op, *a):
+            calls.append(("gpu", op, *a))
+            return 0
+
+    def sys_exit(message):
+        calls.append(("exit", message))
+        raise _Exit(message)
+
+    env = {"p": Proxy(), "sys": types.SimpleNamespace(exit=sys_exit),
+           "ProxyRemoteError": RemoteError, "print": lambda *a: None}
+    exec(compile(ast.Module(body=[fn], type_ignores=[]), "run_guest.py", "exec"), env)
+    hv = types.SimpleNamespace(set_windows_input_handshake=lambda v: calls.append(("hs", v)))
+    return env["windows_t8152_input_attach"], hv, calls
+
+
+@pytest.mark.parametrize("gpu_mode", ["off", "admit", "probe"])
+@pytest.mark.parametrize("failing", ["query", "attach"])
+def test_launcher_input_refusal_detaches_usb(gpu_mode, failing):
+    """An input refusal after USB ATTACH detaches USB (and, with probe, runs GPU STOP first)
+    instead of dying on a NameError: the refuse() closure only uses names it was given."""
+    from aura import windows as w
+    attach, hv, calls = _input_attach_under_test(
+        query_fails=failing == "query", attach_result=0 if failing == "query" else 2)
+    with pytest.raises(_Exit):
+        attach(hv, ["host"], (1,), gpu_mode)
+    kinds = [c[0] for c in calls]
+    assert kinds[-1] == "exit" and "hs" not in kinds
+    detach = calls.index(("usb", w.USB_OP_DETACH))
+    stops = [i for i, c in enumerate(calls) if c[:2] == ("gpu", w.GPU_OP_STOP)]
+    if gpu_mode == "probe":
+        assert stops and stops[0] < detach
+    else:
+        assert not stops
+    # The default (no GPU) still detaches USB.
+    attach, hv, calls = _input_attach_under_test(query_fails=True)
+    with pytest.raises(_Exit):
+        attach(hv, ["host"], (1,))
+    assert ("usb", w.USB_OP_DETACH) in calls and not any(c[0] == "gpu" for c in calls)
+
+
+def test_launcher_reports_after_a_host_stop():
+    """Ctrl-C is the only way out of the M6 probe build: the abort RuntimeError is caught (only
+    when the guest was aborted) and the USB / GPU / input status, including the G1 access map,
+    is still read from the proxy."""
+    src = (REPO / "proxyclient/tools/run_guest.py").read_text()
+    t8152 = src[src.index("def run_windows_t8152"):src.index("_windows_caps = windows_resident_caps()")]
+    start = t8152.index("result = hv.start()")
+    caught = t8152.index("except RuntimeError as exc:", start)
+    assert t8152.index("if hv.windows_abort_reason is None:\n            raise", caught) < \
+        t8152.index("result = None", caught) < \
+        t8152.index("windows_t8152_usb_status(usb_ports)") < \
+        t8152.index("windows_t8152_gpu_status(gpu_mode)")
+    hv = (REPO / "proxyclient/aura/hv/__init__.py").read_text()
+    assert 'raise RuntimeError(f"Windows guest aborted: {self.windows_abort_reason}")' in hv
+
+
+def test_kboot_refuses_after_a_gpu_session():
+    """The boot marker and the pool slot also stop a same-boot kernel on T8152 (the Linux GPU
+    path would start the firmware a second time and could use the pool as RAM)."""
+    kboot = (REPO / "src/kboot.c").read_text()
+    body = kboot.split("static int dt_prepare_t8152(void)\n{", 1)[1]
+    assert body.index("kboot_t8152_gpu_session_check()") < body.index("aurora,minimal-boot")
+    gpu = (REPO / "src/kboot_gpu_t8152.c").read_text()
+    check = gpu.split("int kboot_t8152_gpu_session_check(void)\n{", 1)[1].split("\n}", 1)[0]
+    assert "HV_GPU_BOOT_MARKER" in check and "HV_GPU_POOL_SLOT" in check and "return -1" in check
+    assert '#include "hv/windows/hv_gpu.h"' in gpu
+
+
+def test_g1_read_order_is_recipe_data():
+    """The acknowledge/state read order (ledger B-01, upstream) comes from the private recipe; the
+    tree neither hard-codes it nor states it as fact."""
+    hdr = (WIN / "gpu_t8152_power.h").read_text()
+    assert "u32 read_order;" in hdr
+    code = (WIN / "gpu_t8152_power.c").read_text()
+    assert "r->read_order == GPU_PSD_READ_ACK_FIRST ||" in code
+    for name in ("gpu_t8152_power.c", "gpu_t8152_power.h", "hv_gpu.c", "hv_gpu.h"):
+        assert "consume" not in (WIN / name).read_text(), name
+    doc = (REPO / "docs/windows-t8152.md").read_text()
+    g1 = doc.split("## G1:", 1)[1].split("\n## ", 1)[0]
+    assert "consumes the acknowledge" not in g1 and "does not survive" not in g1

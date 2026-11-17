@@ -2,7 +2,7 @@
 /*
  * Host model of the hardware behind hv_gpu.c's G1 code (HV_GPU_HOST_TEST): a synthetic PSD
  * recipe and three PSD blocks that behave as the recipe describes (request, acknowledge after a
- * few polls, state read consumes the acknowledge), and the registers the G1 hooks may forward
+ * few polls, a state read clears the acknowledge, so the recipe reads the acknowledge first), and the registers the G1 hooks may forward
  * (synthetic ID words, CPU_CONTROL / CPU_STATUS, the two post-office windows with an RX queue).
  * Every hardware access is recorded so the tests can prove that nothing outside the forwarded set
  * is ever touched.  All numbers are synthetic and deliberately unlike any real machine's.
@@ -29,6 +29,7 @@ static struct gpu_psd_recipe test_recipe = {
     .request_off = 0x50,
     .ack_off = 0x60,
     .ack_bit = 0x2,
+    .read_order = GPU_PSD_READ_ACK_FIRST,
     .cold_idle = 7,
     .poll_us = 10,
     .polls = 50,
@@ -48,6 +49,7 @@ static struct psd_block {
     int ack_state; /* >= 0: the state the block reaches instead of the request */
 } psdm[3];
 static int psd_reads, psd_writes;
+static u32 psd_rlog[64]; /* the register of each PSD read, in order (first 64) */
 static struct {
     u32 service, value;
 } psd_wlog[16];
@@ -89,6 +91,8 @@ u32 hv_gpu_host_read32(u64 addr)
     u32 reg;
     int i = psd_index(addr, &reg);
     assert(i >= 0 && "PSD read outside the recipe's blocks");
+    if (psd_reads < 64)
+        psd_rlog[psd_reads] = reg;
     psd_reads++;
     struct psd_block *b = &psdm[i];
     if (reg == test_recipe.ack_off) {
@@ -100,7 +104,7 @@ u32 hv_gpu_host_read32(u64 addr)
         return b->ack;
     }
     assert(reg == test_recipe.state_off && "PSD read of an unknown register");
-    b->ack = 0; /* reading the state consumes the acknowledge */
+    b->ack = 0; /* this synthetic block clears the acknowledge on a state read */
     return b->state | 0xf0; /* bits outside the mask must be ignored */
 }
 

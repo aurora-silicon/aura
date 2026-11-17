@@ -12500,8 +12500,13 @@ static void dt_set_acio_tunables_t8152(void)
     }
 }
 
+int kboot_t8152_gpu_session_check(void); /* kboot_gpu_t8152.c */
+
 static int dt_prepare_t8152(void)
 {
+    /* After a Windows-carrier GPU session in this boot: no kernel until the M6 reboots. */
+    if (kboot_t8152_gpu_session_check())
+        return -1;
     if (fdt_getprop(dt, 0, "aurora,minimal-boot", NULL)) {
         int aic = fdt_path_offset(dt, "/soc/interrupt-controller@301000000");
         if (aic < 0 || fdt_node_check_compatible(dt, aic, "apple,t8152-aic3") ||

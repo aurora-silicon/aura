@@ -9,6 +9,7 @@
 #include "xnuboot.h"
 
 #include "hv/windows/gpu_t8152_admit.h"
+#include "hv/windows/hv_gpu.h"
 #include "libfdt/libfdt.h"
 
 extern void aura_sha256(const void *data, size_t size, u8 digest[32]);
@@ -139,6 +140,38 @@ static bool qualify_text(const struct gpu_profile *profile, unsigned role,
 out:
     free(copy);
     return valid;
+}
+
+/*
+ * The Windows carrier's G1 POWER claims two /chosen/memory-map slots of the live ADT for the rest
+ * of the boot (hv/windows/hv_gpu.h): the boot marker (the GPU firmware was started this boot) and
+ * the GPU-reachable pool its UAT context still points at.  iBoot leaves both zero, and only a
+ * reboot clears them.  A kernel booted from the same boot would start the GPU firmware a second
+ * time and could hand the pool out as normal RAM, so kboot refuses on T8152 while either is set,
+ * whether or not the device tree has a GPU node (dt_prepare_t8152() asks first).
+ */
+static bool gpu_session_slot_set(const char *name)
+{
+    int mm = adt_path_offset(adt, "/chosen/memory-map");
+    u32 len = 0;
+    const u64 *v = mm < 0 ? NULL : adt_getprop(adt, mm, name, &len);
+    if (!v || len != 16)
+        return false;
+    u64 w[2];
+    memcpy(w, v, sizeof(w));
+    return w[0] || w[1];
+}
+
+int kboot_t8152_gpu_session_check(void)
+{
+    if (gpu_session_slot_set(HV_GPU_BOOT_MARKER) || gpu_session_slot_set(HV_GPU_POOL_SLOT)) {
+        printf("FDT: the Windows carrier used this boot's GPU session (/chosen/memory-map/%s or "
+               "%s is set): the GPU firmware is running and its pool is reserved; reboot before "
+               "booting a kernel\n",
+               HV_GPU_BOOT_MARKER, HV_GPU_POOL_SLOT);
+        return -1;
+    }
+    return 0;
 }
 
 int dt_set_gpu_t8152(void *dt)

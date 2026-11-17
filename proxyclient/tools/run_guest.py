@@ -771,18 +771,20 @@ def windows_t8152_input_area(top):
 
 
 def windows_t8152_input_attach(hv, sources, usb_ports=(), mtp=None):
+def windows_t8152_input_attach(hv, sources, usb_ports=(), gpu_mode="off"):
     """After USB (and G0), before hv.start(): QUERY the contract, ATTACH, then (only then)
     write Mu's /chosen/aura,windows-input-v1.  A refusal stops the launch.  USB was attached
     first, so every refusal here detaches it again, as the GPU and hv.start() failure paths
     do: no xHCI passthrough or DART map of guest RAM outlives a launch with no guest.  With
     the internal keyboard/trackpad, the parameter page and the firmware go into the area first
     and ATTACH brings the MTP up (seconds, no link timeout)."""
+    --windows-gpu probe the GPU forwarding is already on, so a refusal also runs GPU STOP."""
     from aura import windows as w
     if not sources:
         return
 
     def refuse(message):
-        if mode == "probe":
+        if gpu_mode == "probe":
             try:
                 p.hv_windows_gpu(w.GPU_OP_STOP)   # idempotent; never touches the GPU itself
             except ProxyRemoteError:
@@ -1144,6 +1146,7 @@ def run_windows_t8152(caps):
                  f"{'The NVMe disk did NOT close CLEAN: do not hard-reset. ' if not clean else ''}"
                  "The MTP stays running and DMAing into its area: leave only by a reboot through "
                  "the carrier (P_REBOOT).")
+    windows_t8152_input_attach(hv, input_sources, usb_ports, gpu_mode)
     try:
         result = hv.start()
     except (ProxyRemoteError, WindowsGuestAborted, WindowsGuestExitTimeout) as exc:
@@ -1182,6 +1185,18 @@ def run_windows_t8152(caps):
                  "its console says why. USB and input (if any) were detached; a GPU "
                  "admission has no release and lasts until the carrier is reloaded.")
     print(f"Guest exit status: {result} (1 SYSTEM_OFF, 2 SYSTEM_RESET)")
+                 "its console says why.")
+    except RuntimeError as exc:
+        if hv.windows_abort_reason is None:
+            raise
+        # Ctrl-C (or a guest exception forwarded to Python): the resident left the guest
+        # through hv_start()'s normal exit, which already ran the USB and GPU teardown, and the
+        # proxy keeps running.  Read the device counters and the G1 access map anyway: on the
+        # M6 probe build Ctrl-C is the only way out.
+        print(f"Guest stopped from the host: {exc}")
+        result = None
+    else:
+        print(f"Guest exit status: {result} (1 SYSTEM_OFF, 2 SYSTEM_RESET)")
     windows_t8152_usb_status(usb_ports)
     windows_t8152_gpu_status(gpu_mode)
     windows_t8152_input_status(input_sources)

@@ -413,9 +413,28 @@ int main(int argc, char **argv)
     test_recipe.base = MODEL_PSD_BASE + 0x100000;
     assert(op(HV_GPU_OP_POWER, 0, 0) == HV_GPU_E_RECIPE);
     test_recipe.base = MODEL_PSD_BASE;
+    test_recipe.read_order = 0; /* the read order is recipe data: a recipe without it is malformed */
+    assert(op(HV_GPU_OP_POWER, 0, 0) == HV_GPU_E_RECIPE);
+    test_recipe.read_order = GPU_PSD_READ_ACK_FIRST;
     assert(psd_reads == 0 && psd_writes == 0);
     assert(op(HV_GPU_OP_STATUS, HV_GPU_S_BOOT, 0) == 0);
     assert(op(HV_GPU_OP_POWER, 0, 0) == 0); /* not spent: the fixed recipe goes through */
+    /* A sample reads the two registers in the recipe's order, whichever it is. */
+    {
+        static const struct gpu_psd_ops mops = {hv_gpu_host_read32, hv_gpu_host_write32,
+                                                hv_gpu_host_delay};
+        struct gpu_psd_sample smp[GPU_PSD_MAX_STEPS];
+        psd_model_reset();
+        gpu_t8152_psd_sample(&test_recipe, &mops, smp);
+        assert(psd_reads == 6 && psd_rlog[0] == test_recipe.ack_off &&
+               psd_rlog[1] == test_recipe.state_off);
+        psd_model_reset();
+        test_recipe.read_order = GPU_PSD_READ_STATE_FIRST;
+        gpu_t8152_psd_sample(&test_recipe, &mops, smp);
+        assert(psd_reads == 6 && psd_rlog[0] == test_recipe.state_off &&
+               psd_rlog[1] == test_recipe.ack_off && smp[0].state == test_recipe.cold_idle);
+        test_recipe.read_order = GPU_PSD_READ_ACK_FIRST;
+    }
     puts("G1 RECIPE OK");
 
     /* ---- G1-9: the reset path stops forwarding without touching the GPU ------------------ */

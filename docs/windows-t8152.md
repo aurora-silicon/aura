@@ -821,16 +821,20 @@ Status: built and host-tested only (`test_g1_*` and `test_launcher_probe_*` in
 private repo) that runs under Mu before Windows, or instead of it. CAPS2 bit 4.
 
 - **Power recipe** (`gpu_t8152_power.c`, `gpu_t8152_power_recipe.c`): PMGR PSD requests, one per
-  GPU service, in a fixed order, each from cold idle: write the request, poll the acknowledge,
-  then read the state once (the read consumes the acknowledge) and compare it with the active
-  state. A failure stops there; nothing is powered off or retried. The recipe's values are not in
-  this tree: the Makefile copies `$(J804_PRIVATE_DATA)/aura/g18g-j804-gpu-power.h` into
+  GPU service, walked from a recipe: for each step, in the recipe's order, write the request,
+  poll the acknowledge, then read the state and compare it with the step's target. The order, the
+  state each service must read before its request, and the order in which a sample reads the
+  acknowledge and state registers (`read_order`) are recipe data; the code refuses to write a
+  service that is not in the recipe's precondition state. A failure stops there; nothing is
+  powered off or retried. The recipe is not in this tree: the Makefile copies
+  `$(J804_PRIVATE_DATA)/aura/g18g-j804-gpu-power.h` into
   `build/j804_gpu_power.h`, and without that file the carrier builds with power-on disabled
   (`STATUS 13` reads 0, `POWER` returns -7). Every PSD block must lie inside a `pmgr*` register
   range of the live ADT before it is touched.
 - **Boot marker** (`HV_GPU_BOOT_MARKER`, `hv_gpu.h`): once the last service is on the GPU
-  firmware is running (RUN comes up set), and it does not survive a second start, so POWER is
-  once per boot, not per carrier session. Before its first PSD request it claims
+  firmware is running (RUN comes up set), and the plan forbids a second firmware start in one
+  boot (WINDOWS-GPU-PLAN section 7, a design rule, not something we tested), so POWER is once
+  per boot, not per carrier session. Before its first PSD request it claims
   `/chosen/memory-map/MemoryMapReserved-15` in the live ADT (a 16-byte slot iBoot leaves zero) for
   a 16 KiB carrier page holding a CRC-protected record (`struct gpu_boot_marker`: claimed /
   powered / failed / found-on / forwarding / ended, the PSD samples, the pool, counters), and
@@ -839,7 +843,10 @@ private repo) that runs under Mu before Windows, or instead of it. CAPS2 bit 4.
   POWER is refused when the marker slot is set (even if the page was overwritten), when the
   pool slot is taken, or when any service is already on (that also claims the marker). The
   guest-RAM checks of `hv_t8152.c` and `windows.py` already refuse memory-map ranges, so the
-  pool, which the GPU may still reach, stays out of every later guest this boot.
+  pool, which the GPU may still reach, stays out of every later guest this boot. kboot on
+  T8152 (`dt_prepare_t8152()`, `kboot_t8152_gpu_session_check()`) refuses to boot a kernel
+  while either slot is set: the Linux GPU path would start the firmware a second time, and the
+  pool would be ordinary RAM to Linux.
 - **POWER** (op 4): after ADMIT, not with the G0 hooks, once per session. After the sequence it
   reads the GPU ID words and both ASCs' CPU_CONTROL / CPU_STATUS (guarded reads) into the
   handoff page (offsets 0xc0, 0xdc, 0xe4; version stays 1) and logs them.
@@ -862,7 +869,8 @@ private repo) that runs under Mu before Windows, or instead of it. CAPS2 bit 4.
 
 The launcher (`--windows-gpu probe`) checks CAPS2 bit 4, the recipe and a free marker before the
 upload, then runs ADMIT, POWER, PROBE and writes `/chosen/aura,windows-gpu-v1`; a POWER or PROBE
-refusal runs STOP and detaches USB. At exit it prints the counters and the access map.
+refusal, or a later input refusal, runs STOP and detaches USB. At exit, a PSCI exit or a host
+stop (Ctrl-C, "Windows guest aborted"), it prints the counters and the access map.
 
 ## I0: Mac-fed keyboard and pointer (carrier input device)
 
