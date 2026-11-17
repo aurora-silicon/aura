@@ -17,6 +17,14 @@ REPO = Path(__file__).resolve().parents[2]
 TOOLS = ("run_guest_sptm.py", "console_tail.py")
 
 
+def load_runner():
+    spec = importlib.util.spec_from_file_location(
+        "run_guest_sptm", REPO / "proxyclient/tools/run_guest_sptm.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def aura_imports(path):
     """Every `from aura... import name` in a tool, including those inside functions."""
     for node in ast.walk(ast.parse(path.read_text())):
@@ -102,3 +110,30 @@ def test_same_release_selects_exact_kernel(offset, instruction, selected, hidden
     release, quirks = tool.xnu_quirks(b"xnu-13432.41.4~")
     assert (release == "xnu-13432.41.4") == selected
     assert ("/arm-io/centauri" in quirks["hide"]) == hidden_radio
+
+
+@pytest.mark.parametrize(("port", "is_kis", "expected"), (
+    ("/dev/ttyAMA10", False, True),
+    ("/dev/ttyACM0", False, False),
+    ("/dev/cu.usbmodemP_01", False, False),
+    ("/dev/tty.kis-1", True, False),
+))
+def test_post_entry_drain_needed(port, is_kis, expected):
+    runner = load_runner()
+    iface = type("Iface", (), {
+        "devpath": port,
+        "dev": type("Serial", (), {"port": port})(),
+        "is_kis": is_kis,
+    })()
+    assert runner.post_entry_drain_needed(iface) is expected
+
+
+def test_post_entry_drain_resolves_m1n1_symlink(monkeypatch):
+    runner = load_runner()
+    monkeypatch.setattr(runner.os.path, "realpath", lambda path: "/dev/ttyACM0")
+    iface = type("Iface", (), {
+        "devpath": "/dev/m1n1",
+        "dev": type("Serial", (), {"port": "/dev/m1n1"})(),
+        "is_kis": False,
+    })()
+    assert runner.post_entry_drain_needed(iface) is False
