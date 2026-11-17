@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: MIT
 """Host source rules for the T8152 (J804) Mu timer route and the 1 Hz guest report.
 
-First M2 run (2026-11-16): Mu stopped about 10 ms after TimerDxe armed CNTP, mid serial
-line, with "Mu AIC2 configured; waiting for timer handler" and never "Mu timer handler
+First M2 run (2026-11-16): Mu's serial stopped mid line after TimerDxe armed CNTP (10 ms
+period; an EL2 FIQ storm is the inferred cause, not observed), with "Mu AIC2 configured; waiting for timer handler" and never "Mu timer handler
 ready".  The carrier left EL1 CNTP untrapped on T8152 (CNTHCTL_EL2 0xc00), so TimerDxe's
 final ENABLE write never reached hv_timer_reflect_guest_rearm(), and hv_update_fiq() had
 no branch for an asserted guest timer before readiness.  These rules pin the fix:

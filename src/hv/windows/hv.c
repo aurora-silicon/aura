@@ -683,7 +683,8 @@ int hv_init(void)
              * (Arm ARM, CNTHCTL_EL2).  With it set, the first M2 run's TimerDxe
              * armed CNTP untrapped, mu_timer_ready never latched ("waiting for
              * timer handler on CPU 6" with no "Mu timer handler ready"), and the
-             * guest stopped mid serial line about 10 ms later.  The trapped
+             * guest's serial stopped mid line after that (10 ms timer period; an
+             * EL2 FIQ storm is the inferred cause, not observed).  The trapped
              * accesses go to the EL02 bank through SYSREG_MAP_REFLECT in
              * hv_handle_msr_unlocked().
              */

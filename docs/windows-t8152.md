@@ -145,8 +145,10 @@ FWB is clear, stage 2 and the SMC trap are on, `framebuffer=bgra-shadow` is sele
   Mu's `AIC_TIMER_REFLECT_CPU_SLOTS`. Before any route owns the guest timers,
   `hv_update_fiq()` masks an asserted one (the guest-visible IMASK on T8152, which has no
   Apple VM timer FIQ gate) instead of leaving it to re-enter EL2 forever. The first M2 run
-  (2026-11-16) had EL1PTEN set (`CNTHCTL_EL2=0xc00`): readiness never latched and the guest
-  stopped about 10 ms after TimerDxe armed CNTP. Not yet run with the trap.
+  (2026-11-16) had EL1PTEN set (`CNTHCTL_EL2=0xc00`): readiness never latched and the guest's
+  serial stopped mid line after TimerDxe armed CNTP (10 ms period). An EL2 FIQ storm from that
+  timer is the inferred cause, not observed; run 1 has no per-chunk serial timestamps, so the
+  stop time is not known. Not yet run with the trap.
 - Once a second, next to `HV: fb: … lines/s`, the host tick prints one `HV: g<cpu> …` line
   for each CPU that took a guest exit since the previous one: route
   (`wait-aic`/`wait-timer`/`mu`/`gic`/`win-carrier`/`win`), the guest PC at its last exit

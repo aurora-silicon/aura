@@ -98,10 +98,11 @@ static bool t8142_sysreg_assist_logged;
  * Slots per bank are a guest ABI, not this build's CPU count.  Mu's AppleAicDxe
  * reserves AIC_TIMER_REFLECT_CPU_SLOTS = 24 per bank (AppleAicLib.h): it unmasks
  * [N - 48, N - 24) for CNTP and [N - 24, N) for CNTV and classifies its EVENT reads
- * by the same ranges.  That number matched MAX_CPUS when the ABI was written;
- * MAX_CPUS later became 32 (M3 Ultra), which moved every line down by 8 per bank:
- * CPU 6's CNTP tick landed on N - 58, a line Mu never unmasks, and its CNTV tick on
- * N - 26, inside Mu's CNTP range.  Keep the two sides on one number.
+ * by the same ranges (its comment: keep in sync with MAX_CPUS).  This tree's
+ * MAX_CPUS is 32 (since 1a0e3685, M3 Ultra), so sizing the block by MAX_CPUS moved
+ * every line down by 8 per bank: CPU 6's CNTP tick landed on N - 58, a line Mu
+ * never unmasks, and its CNTV tick on N - 26, inside Mu's CNTP range.  Keep the two
+ * sides on one number.
  */
 #define HV_TIMER_REFLECT_SLOTS         24
 #define HV_TIMER_SWIRQ_BASE            (aic->nr_irq - (2 * HV_TIMER_REFLECT_SLOTS))
@@ -1730,8 +1731,9 @@ static void hv_update_fiq(struct exc_info *ctx)
          * an asserted timer to EL2 whatever the guest's PSTATE.F says, and
          * nothing here can deliver it, so leaving it unmasked re-takes the same
          * FIQ on every return: a permanent EL2 FIQ storm that freezes the guest
-         * mid-instruction-stream (the first T8152 M2 run stopped this way, mid
-         * serial line, about 10 ms after TimerDxe armed CNTP).  Hold it.  On
+         * mid-instruction-stream.  This is the inferred, not observed, cause of
+         * the first T8152 M2 run's stop: its serial ended mid line after
+         * TimerDxe armed CNTP (10 ms period).  Hold it.  On
          * T8152 the hold is the guest-visible IMASK (no Apple VM timer FIQ
          * gate); the guest's EL1 CNTP accesses trap (hv_init()), so its next
          * control write still reaches hv_timer_reflect_guest_rearm() and

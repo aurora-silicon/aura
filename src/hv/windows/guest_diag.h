@@ -14,8 +14,11 @@
  * reporting CPU without a lock.  Plain increments are enough for that: each field
  * is a naturally aligned u64, so the reader sees an old or a new value, never a
  * torn one, and a count that is off by one in either direction does not matter
- * for a once-a-second rate.  Nothing here blocks or takes a lock, so the guest
- * can never be held up by the instrumentation.
+ * for a once-a-second rate.  The per-exit counting never blocks, takes a lock or
+ * prints.  The report itself is not off the guest's path: hv_tick() calls it
+ * (through hv_fb_report()) during a guest FIQ exit on the interruptible CPU, with
+ * the big hypervisor lock held, so on a one-CPU guest each 1 Hz line costs that
+ * CPU the time of its printf, the same budget as the "HV: fb:" line.
  */
 struct hv_guest_diag {
     /* Exits from the guest, by class. */
