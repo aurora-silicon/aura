@@ -17,6 +17,9 @@
 #ifdef SPTM_VIRT
 #include "nv2.h"
 #endif
+#ifdef AURA_WINDOWS
+#include "hv/windows/hv_fatal.h"
+#endif
 
 #define EL0_STACK_SIZE 0x4000
 
@@ -264,6 +267,9 @@ void print_regs(u64 *regs, int el12)
 
 void exc_sync(u64 *regs)
 {
+#ifdef AURA_WINDOWS
+    u64 par_at_entry = mrs(PAR_EL1); /* for the T8152 fatal report, before anything runs AT */
+#endif
     u32 insn;
     int el12 = 0;
     bool in_gl = in_gl12();
@@ -427,6 +433,9 @@ void exc_sync(u64 *regs)
             break;
         case GUARD_OFF:
         default:
+#ifdef AURA_WINDOWS
+            hv_windows_fatal_report(regs, "EL2 synchronous exception", par_at_entry, "at entry");
+#endif
             printf("Unhandled exception, rebooting...\n");
             flush_and_reboot();
     }
@@ -597,6 +606,13 @@ void exc_serr(u64 *regs)
         return;
 #endif
 
+#ifdef AURA_WINDOWS
+    /*
+     * First, before anything can run AT: if the SError interrupted hv_translate() between its
+     * AT and the PAR read (D3 run 1), PAR_EL1 still holds that walk's result.
+     */
+    u64 par_at_entry = mrs(PAR_EL1);
+#endif
     if (!(exc_guard & GUARD_SILENT))
         printf("Exception: SError\n");
 
@@ -607,6 +623,9 @@ void exc_serr(u64 *regs)
         print_regs(regs, 0);
 
     if ((exc_guard & GUARD_TYPE_MASK) == GUARD_OFF) {
+#ifdef AURA_WINDOWS
+        hv_windows_fatal_report(regs, "SError at EL2", par_at_entry, "at entry");
+#endif
         printf("Unhandled exception, rebooting...\n");
         flush_and_reboot();
     }

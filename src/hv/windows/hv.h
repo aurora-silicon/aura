@@ -140,6 +140,7 @@ typedef bool(hv_pt_leaf_fn)(void *ctx, u64 ipa, u64 size, u64 pte, int level);
 void hv_pt_for_each_leaf(hv_pt_leaf_fn *fn, void *ctx);
 int hv_pt_set_writable(u64 ipa, bool writable);
 u64 hv_translate(u64 addr, bool s1only, bool w, u64 *par_out);
+u64 hv_translate_el(u64 addr, bool s1only, bool w, u64 el, u64 *par_out);
 u64 hv_pt_walk(u64 addr);
 bool hv_handle_dabort(struct exc_info *ctx);
 bool hv_pa_write(struct exc_info *ctx, u64 addr, u64 *val, int width);
@@ -169,6 +170,7 @@ void hv_wdt_init(void);
 int hv_wdt_start(int cpu);
 int hv_wdt_stop(void);
 void hv_wdt_breadcrumb(char c);
+u64 hv_wdt_breadcrumbs_read(int cpu);
 void hv_do_panic(void);
 
 #define hv_panic(fmt, ...)                                                                         \

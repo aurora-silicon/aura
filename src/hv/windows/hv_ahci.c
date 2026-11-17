@@ -9,6 +9,7 @@
 #include "hv_ahci.h"
 #include "ahci_model.h"
 #include "hv.h"
+#include "hv_fatal.h"
 #include "hv_t8152.h"
 #include "hv_vdev_spi.h"
 #include "soc.h"
@@ -40,6 +41,26 @@ static u64 longest_ticks;
 static u64 report_next;
 static u64 reported_commands;
 
+/*
+ * What the fatal report prints (hv_fatal.h): the access being handled now (or last), and the
+ * last access that ran a command -- its CPU, the command FIS, the disk range and the last
+ * TRACE_SPANS guest spans the model checked (command list, command table, PRDT entries, data
+ * buffers).  Written under ahci_lock, seqlocked for the reporting CPU, which takes no lock.
+ */
+#define TRACE_SPANS 8
+struct ahci_trace {
+    u64 seq;
+    u64 cpu, cntpct, off, val, write, width;
+    u64 commands, slot;
+    u8 fis[20];
+    u64 io_calls, io_lba, io_sectors, io_write;
+    u64 spans;
+    struct {
+        u64 ipa, len, write, ok;
+    } span[TRACE_SPANS];
+};
+static struct ahci_trace trace_access, trace_command;
+
 _Static_assert(sizeof(struct hv_ahci_store_desc) <= HV_AHCI_DESC_SIZE, "descriptor size");
 _Static_assert(HV_AHCI_INTID == HV_VDEV_SPI_AHCI, "one SPI number");
 _Static_assert(HV_AHCI_ABAR_SIZE == AHCI_MODEL_ABAR_SIZE, "one ABAR size");
@@ -61,12 +82,35 @@ bool hv_ahci_enabled(void)
  * cacheable memory, so after the range check the IPA is the pointer.  The span must lie
  * wholly inside [ram_lo, ram_hi): never the store, its descriptor, aura or MMIO.
  */
+static void trace_span(u64 ipa, u64 len, bool write, bool ok)
+{
+    struct ahci_trace *t = &trace_access;
+    u64 i = t->spans++ % TRACE_SPANS;
+    t->span[i].ipa = ipa;
+    t->span[i].len = len;
+    t->span[i].write = write;
+    t->span[i].ok = ok;
+}
+
+static void trace_io(u64 lba, u32 count, bool write)
+{
+    struct ahci_trace *t = &trace_access;
+    if (!t->io_calls++) {
+        t->io_lba = lba;
+        t->io_sectors = 0;
+        t->io_write = write;
+    }
+    t->io_sectors += count;
+}
+
 static void *env_span(void *opaque, u64 ipa, u64 len, bool write)
 {
     UNUSED(opaque);
-    UNUSED(write);
-    if (!len || ipa < ram_lo || ipa >= ram_hi || len > ram_hi - ipa)
+    if (!len || ipa < ram_lo || ipa >= ram_hi || len > ram_hi - ipa) {
+        trace_span(ipa, len, write, false);
         return NULL;
+    }
+    trace_span(ipa, len, write, true);
     return (void *)ipa;
 }
 
@@ -89,6 +133,7 @@ static bool env_read(void *opaque, u64 lba, u32 count, void *dst)
 {
     UNUSED(opaque);
     u64 bytes = (u64)count * AHCI_MODEL_SECTOR;
+    trace_io(lba, count, false);
     if (lba > disk_bytes / AHCI_MODEL_SECTOR || bytes > disk_bytes - lba * AHCI_MODEL_SECTOR)
         return false;
     copy(dst, (const void *)(store_base + lba * AHCI_MODEL_SECTOR), bytes);
@@ -99,6 +144,7 @@ static bool env_write(void *opaque, u64 lba, u32 count, const void *src)
 {
     UNUSED(opaque);
     u64 bytes = (u64)count * AHCI_MODEL_SECTOR;
+    trace_io(lba, count, true);
     if (lba > disk_bytes / AHCI_MODEL_SECTOR || bytes > disk_bytes - lba * AHCI_MODEL_SECTOR)
         return false;
     copy((void *)(store_base + lba * AHCI_MODEL_SECTOR), src, bytes);
@@ -117,6 +163,14 @@ static void env_irq(void *opaque, bool level)
 {
     UNUSED(opaque);
     hv_t8152_gic_spi_level(HV_AHCI_INTID, level);
+}
+
+static void env_command(void *opaque, u32 slot, const u8 *fis)
+{
+    UNUSED(opaque);
+    trace_access.commands++;
+    trace_access.slot = slot;
+    memcpy(trace_access.fis, fis, sizeof(trace_access.fis));
 }
 
 static void env_log(void *opaque, const char *event, u64 a, u64 b)
@@ -139,6 +193,15 @@ static bool hv_ahci_mmio(struct exc_info *ctx, u64 addr, u64 *val, bool write, i
     u64 start = mrs(CNTPCT_EL0);
 
     spin_lock(&ahci_lock);
+    struct ahci_trace *t = &trace_access;
+    hv_fatal_seq_begin(&t->seq);
+    t->cpu = smp_id();
+    t->cntpct = start;
+    t->off = off;
+    t->val = write ? val[0] : 0;
+    t->write = write;
+    t->width = width;
+    t->commands = t->io_calls = t->spans = 0;
     if (width == 4 && !(off & 15)) {
         /* LDP/STP of two X registers: two 64-bit accesses. */
         ok = ahci_model_mmio(&model, off, 3, &val[0], write) &&
@@ -154,6 +217,14 @@ static bool hv_ahci_mmio(struct exc_info *ctx, u64 addr, u64 *val, bool write, i
     u64 took = mrs(CNTPCT_EL0) - start;
     if (took > longest_ticks)
         longest_ticks = took;
+    if (t->commands || t->io_calls || t->spans) {
+        u64 seq = trace_command.seq;
+        hv_fatal_seq_begin(&trace_command.seq);
+        trace_command = *t;
+        trace_command.seq = seq + 1;
+        hv_fatal_seq_end(&trace_command.seq);
+    }
+    hv_fatal_seq_end(&t->seq);
     spin_unlock(&ahci_lock);
 
     if (!ok && !(logged & LOG_WIDTH)) {
@@ -378,8 +449,15 @@ static u64 attach(u64 base, u64 top, u64 bytes, u64 flags)
         desc_state(HV_AHCI_LOADING);
     }
 
-    env = (struct ahci_env){env_span, env_read, env_write, env_flush,
-                            env_irq,  env_log,  NULL,      bytes / AHCI_MODEL_SECTOR};
+    env = (struct ahci_env){.guest_span = env_span,
+                            .read = env_read,
+                            .write = env_write,
+                            .flush = env_flush,
+                            .irq_level = env_irq,
+                            .log = env_log,
+                            .opaque = NULL,
+                            .sectors = bytes / AHCI_MODEL_SECTOR,
+                            .command = env_command};
     ahci_model_init(&model, &env);
     if (hv_map_hook(HV_AHCI_ABAR, hv_ahci_mmio, HV_AHCI_ABAR_SIZE) < 0) {
         printf("HV: T8152: AHCI: attach refused: cannot hook the ABAR at 0x%lx\n", HV_AHCI_ABAR);
@@ -571,4 +649,52 @@ void hv_ahci_report(void)
            "%lu flushes; largest %u sectors; longest access %lu us\n",
            s.commands, s.errors, s.fatal, s.sectors_read >> 11, s.sectors_written >> 11, s.flushes,
            s.largest, us);
+}
+
+/* ---- the fatal report (hv_fatal.h) ------------------------------------------------------- */
+
+static u64 trace_age_us(u64 now, u64 then, u64 freq)
+{
+    return then && freq && then <= now ? (now - then) * 1000000 / freq : 0;
+}
+
+static const char *trace_state(u64 seq)
+{
+    return seq == ~0UL ? "changing" : (seq & 1) ? "IN PROGRESS" : "done";
+}
+
+void hv_ahci_fatal_report(u64 now, u64 freq)
+{
+    struct ahci_trace a, c;
+
+    if (!attached)
+        return;
+    u64 sa = hv_fatal_read(&trace_access.seq, &trace_access, &a, sizeof(a));
+    u64 sc = hv_fatal_read(&trace_command.seq, &trace_command, &c, sizeof(c));
+
+    printf("HV: fatal: AHCI guest RAM [0x%lx, 0x%lx), store [0x%lx, 0x%lx), %lu commands\n", ram_lo,
+           ram_hi, store_base, window_top, model.stats.commands);
+    if (a.cntpct)
+        printf("HV: fatal: AHCI last access: cpu %lu, %lu us ago, %s: %lu-byte %s ABAR+0x%lx "
+               "value 0x%lx\n",
+               a.cpu, trace_age_us(now, a.cntpct, freq), trace_state(sa), 1UL << (a.width & 7),
+               a.write ? "write" : "read", a.off, a.val);
+    if (!c.cntpct)
+        return;
+    u64 lba = (u64)c.fis[4] | (u64)c.fis[5] << 8 | (u64)c.fis[6] << 16 | (u64)c.fis[8] << 24 |
+              (u64)c.fis[9] << 32 | (u64)c.fis[10] << 40;
+    printf("HV: fatal: AHCI last command access: cpu %lu, %lu us ago, %s: ABAR+0x%lx = 0x%lx; "
+           "%lu command(s), last slot %lu ATA 0x%02x LBA 0x%lx count %u\n",
+           c.cpu, trace_age_us(now, c.cntpct, freq), trace_state(sc), c.off, c.val, c.commands,
+           c.slot, c.fis[2], lba, (u32)c.fis[12] | (u32)c.fis[13] << 8);
+    if (c.io_calls)
+        printf("HV: fatal: AHCI   disk %s LBA 0x%lx, %lu sectors in %lu call(s)\n",
+               c.io_write ? "write" : "read", c.io_lba, c.io_sectors, c.io_calls);
+    u64 first = c.spans > TRACE_SPANS ? c.spans - TRACE_SPANS : 0;
+    for (u64 i = first; i < c.spans; i++) {
+        u64 k = i % TRACE_SPANS;
+        printf("HV: fatal: AHCI   span %lu/%lu: IPA 0x%lx +0x%lx %s%s\n", i + 1, c.spans,
+               c.span[k].ipa, c.span[k].len, c.span[k].write ? "to guest" : "from guest",
+               c.span[k].ok ? "" : " REFUSED (outside guest RAM)");
+    }
 }

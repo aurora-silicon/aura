@@ -537,8 +537,32 @@ u64 hv_translate(u64 addr, bool s1, bool w, u64 *par_out)
     if (!(mrs(SCTLR_EL12) & SCTLR_M))
         return addr; // MMU off
 
-    u64 el = FIELD_GET(SPSR_M, hv_get_spsr()) >> 2;
+    return hv_translate_el(addr, s1, w, FIELD_GET(SPSR_M, hv_get_spsr()) >> 2, par_out);
+}
+
+/*
+ * hv_translate() with the translation regime named by the caller: el 0 walks with EL0
+ * permissions (AT S1E0* / S12E0*), anything else with EL1's.  hv_translate() takes it from
+ * the EL the guest trapped from, which is right for a guest-supplied address and wrong for a
+ * kernel VA read while the guest happened to be in EL0 (an EL0 walk of a TTBR1 VA fails).
+ */
+u64 hv_translate_el(u64 addr, bool s1, bool w, u64 el, u64 *par_out)
+{
+    if (!(mrs(SCTLR_EL12) & SCTLR_M))
+        return addr; // MMU off
+
     u64 save = mrs(PAR_EL1);
+
+#ifdef AURA_WINDOWS
+    /*
+     * T8152 SError fence (D3 run 1): an SError already pending from earlier EL2 work is taken
+     * here, before the walk, so one taken right after the AT below belongs to the walk.
+     */
+    if (chip_id == T8152) {
+        sysop("dsb sy");
+        sysop("isb");
+    }
+#endif
 
     if (w) {
         if (s1) {
@@ -566,6 +590,10 @@ u64 hv_translate(u64 addr, bool s1, bool w, u64 *par_out)
         }
     }
 
+#ifdef AURA_WINDOWS
+    if (chip_id == T8152)
+        sysop("isb");
+#endif
     u64 par = mrs(PAR_EL1);
     if (par_out)
         *par_out = par;

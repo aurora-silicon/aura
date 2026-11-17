@@ -10,6 +10,7 @@
 #include "fb_capture.h"
 #include "guest_diag.h"
 #include "gxf.h"
+#include "hv_fatal.h"
 #include "malloc.h"
 #include "memory.h"
 #include "mtp_handoff.h"
@@ -1160,6 +1161,10 @@ void hv_fb_convert_slice(u32 lines)
     }
     u64 t1 = hv_host_counter();
 
+    /* T8152: record the band, fencing before and after it (hv_fatal.h): an SError pending from
+     * earlier work is taken before the record opens, and one from these scanout stores while
+     * it still says "in progress". */
+    hv_fatal_fb_begin(start, end);
     for (u32 y = start; y < end; y++) {
         const u32 *src = hv_fb_source + (size_t)y * hv_fb_stride_px;
         u32 *dst = hv_fb_scanout + (size_t)y * hv_fb_stride_px;
@@ -1169,6 +1174,7 @@ void hv_fb_convert_slice(u32 lines)
             dst[x] = ((p & 0xff) << 2) | (((p >> 8) & 0xff) << 12) | (((p >> 16) & 0xff) << 22);
         }
     }
+    hv_fatal_fb_end();
 
     u64 t2 = hv_host_counter();
     __atomic_store_n(&cost->maint, cost->maint + (t1 - t0), __ATOMIC_RELAXED);
@@ -1542,6 +1548,8 @@ int hv_start(void *entry, u64 regs[4])
     hv_t8152_quiesce_guest_vtimer(true);
     /* D1: from here the disk store is RUNNING until a PSCI exit seals it. */
     hv_ahci_guest_entered();
+    /* The EL2 fatal report (hv_fatal.h) speaks only while a T8152 guest is entered. */
+    hv_fatal_armed = chip_id == T8152;
     printf("HV: Entering guest at %p (x0=0x%lx)\n", entry, regs[0]);
     hv_enter_guest(regs[0], regs[1], regs[2], regs[3], entry);
 
@@ -1560,6 +1568,7 @@ int hv_start(void *entry, u64 regs[4])
         printf("HV: All CPUs exited\n");
     }
     int status = result ? result : __atomic_load_n(&hv_windows_exit_reason, __ATOMIC_ACQUIRE);
+    hv_fatal_armed = false;
     hv_ahci_guest_exited(status);
     return status;
 }
@@ -2203,14 +2212,23 @@ void hv_tick(struct exc_info *ctx)
             return;
         }
     }
+    /*
+     * T8152: each stage below is announced with hv_fatal_stage(), which fences first
+     * (dsb sy; isb), so an SError a stage caused is taken at the next boundary with that
+     * stage still recorded for the fatal report.  D3 run 1's SError could not be placed
+     * between the converter and the translations that followed it; this is what tells them
+     * apart next time.  A no-op on other chips.
+     */
     hv_wdt_pet();
     hv_windows_serial_flush();
+    hv_fatal_stage(HV_FATAL_STAGE_FB);
     /*
      * A floor, not the main path: this runs with the big hypervisor lock held,
      * so it converts only a band. Idle cores parking in WFI do the bulk of the
      * work, unlocked. See hv_fb_convert_slice().
      */
     hv_fb_convert_slice(HV_FB_SLICE_TICK);
+    hv_fatal_stage(HV_FATAL_STAGE_REPORT);
     /* Same budget rationale as the slice above: bounded work on an exit that
      * was happening anyway. One tile row is 40 tiles of 64x64 on this panel. */
     hv_fb_report();
@@ -2222,6 +2240,7 @@ void hv_tick(struct exc_info *ctx)
      * has wedged itself, so it is where an absent-system-register hang has to
      * be unwedged.  Costs one guest-PC read per tick when nothing is stuck.
      */
+    hv_fatal_stage(HV_FATAL_STAGE_TRACK);
     hv_track_t8142_undef_vector(ctx);
     /*
      * A redirect can be invalidated without VBAR_EL1 ever changing -- a guest
@@ -2230,19 +2249,27 @@ void hv_tick(struct exc_info *ctx)
      * VBAR alone cannot see that.  Re-assert the redirects here, where the cost
      * is per tick rather than per trap.
      */
+    hv_fatal_stage(HV_FATAL_STAGE_VERIFY);
     hv_verify_t8142_undef_vectors();
+    hv_fatal_stage(HV_FATAL_STAGE_MODULES);
     hv_scan_t8142_guest_modules();
+    hv_fatal_stage(HV_FATAL_STAGE_PROCESS);
     hv_report_t8142_process(ctx);
     hv_report_t8142_gic_activity();
     hv_report_t8142_el2_acct();
     /* Bounded, non-allocating mailbox fallback for a guest that never idles.
      * The primary servicer runs in the unlocked WFI path. */
+    hv_fatal_stage(HV_FATAL_STAGE_MTP);
     hv_windows_mtp_poll();
     hv_windows_mtp_report();
+    hv_fatal_stage(HV_FATAL_STAGE_BUGCHECK);
     hv_check_t8142_bugcheck();
     hv_dump_t8142_bugcheck_stack(ctx);
+    hv_fatal_stage(HV_FATAL_STAGE_RECOVER);
     hv_recover_t8142_sysreg_undef(ctx);
+    hv_fatal_stage(HV_FATAL_STAGE_IO);
     hv_tick_host_io(ctx);
+    hv_fatal_stage(HV_FATAL_STAGE_DONE);
     if (chip_id == T8142)
         hv_tick_deadline_complete(state, hv_host_counter());
 }

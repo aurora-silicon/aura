@@ -157,6 +157,11 @@ struct ahci_env {
     void (*log)(void *opaque, const char *event, u64 a, u64 b);
     void *opaque;
     u64 sectors;
+    /*
+     * Optional, may be NULL: each command slot about to run, with its 20-byte H2D register FIS
+     * as fetched (before any check).  An observer only; it must not touch the model.
+     */
+    void (*command)(void *opaque, u32 slot, const u8 *fis);
 };
 
 struct ahci_model_stats {

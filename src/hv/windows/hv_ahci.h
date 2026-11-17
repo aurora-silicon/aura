@@ -130,4 +130,10 @@ void hv_ahci_guest_exited(int status);
  */
 void hv_ahci_report(void);
 
+/*
+ * The fatal report's AHCI part (hv_fatal.c): the access being handled now or last, and the
+ * last command with its guest spans.  Takes no lock; prints nothing before attach.
+ */
+void hv_ahci_fatal_report(u64 now, u64 freq);
+
 #endif

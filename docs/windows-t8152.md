@@ -336,3 +336,56 @@ Not known yet (D2 answers it on the M6): whether storahci accepts this HBA (ACPI
 NCQ, an immediate completion interrupt), how long a 32 MiB command holds the hypervisor lock
 under load (reported as "longest access" every 10 s while the disk is busy), and whether
 Windows ever uses non-cacheable DMA buffers (the carrier does no cache maintenance).
+
+## D3: EL2 SError context and the tick's guest-PC walk
+
+The first long Windows run on the AHCI disk (D3 run 1, NT on all 12 CPUs, storahci, ~42k
+commands) ended 388 s after entry with an SError taken at EL2 on the boot CPU, ESR 0xbe000000
+(EC 0x2f, ISS 0: no architectural classification), at the instruction after `at s12e0r` in
+`hv_translate()`. The call came from the host tick: `hv_recover_t8142_sysreg_undef()`
+translated the guest's interrupted EL0 PC through the current process's TTBR0. FAR held a
+stale AHCI PxCI abort and x12-x16 were the framebuffer converter's leftovers. SErrors are
+asynchronous on these cores, so the PC alone could not separate the walk from the earlier
+converter stores. The cause is not isolated. The walk is the weaker suspect: it used the same
+TTBR0/TCR/VTTBR the guest's own fetch of that PC had just used, so it could reach no PA the
+guest's walk had not (barring a concurrent page-table change), and an SError pending from
+earlier in the tick, such as one from the converter's Normal-NC scanout stores on the same
+CPU, is taken at the next context-synchronising point, which was that AT. Changes, all
+T8152-only:
+
+- The wedge recovery skips a tick that interrupted guest EL0 (the wedge is an EL1 handler
+  spinning on itself), so the tick no longer walks arbitrary user PCs. This is hygiene, not
+  the fix for run 1: it also stops a stale ESR_EL12 plus a user-mode branch-to-self from
+  looking like a wedge. A clean run 2 does not show the walk was the cause.
+- Kernel VAs (bit 55 set) read by the absent-PMU recovery are translated with the EL1 regime
+  (`hv_translate_el()`); before, a tick that interrupted EL0 walked them as EL0 and silently
+  skipped the vector re-verify and the module scan.
+- SError fences (`dsb sy; isb`): before every AT in `hv_translate_el()` (every translation on
+  every CPU, including the ELR/FAR translations of each guest data abort, so each AHCI MMIO
+  trap), before and after each converter band (tick and idle bands, every CPU), and at every
+  `hv_tick()` stage boundary (about 11 per tick on the boot CPU), so the next SError is taken
+  in the stage that caused it. These fences, not the converter band alone, are what makes a
+  converter-caused error show up as "fb rows ... IN PROGRESS"; no separate converter-off build
+  is needed to tell the converter from the walk.
+- `HCR_EL2.PTW` is set and checked before entry: a stage-1 walk that reaches the AIC Device
+  leaf (the only one) faults instead of reading AIC registers.
+- `hv_fatal.c`: every guest exit records kind, ESR, PC, SPSR, FAR and HPFAR per CPU (seqlocked,
+  one barrier); `hv_tick()` records its stage, the converter its band, `hv_ahci.c` its last
+  access and last command with the FIS, disk range and the last 8 guest spans. The EL2
+  "Unhandled exception" paths (SError, synchronous) and the unhandled-guest-exception reset
+  print all of it, then reboot as before: PAR_EL1 (decoded; read on entry by the EL2 handlers,
+  labelled "before the proxy's translations" on the guest-exception path), ESR, ISR_EL1, FAR
+  and HPFAR, then each CPU's records and breadcrumbs and the AHCI records, then a bounded EL2
+  frame-pointer walk (rel addresses for `llvm-symbolizer`), and last the reads most likely to
+  trap (DISR_EL1 when FEAT_RAS exists, the guest `_EL12` registers). IRQ exits are recorded at
+  the top of `hv_exc_irq()`, so the shipped `ENABLE_VGIC_MODULE` build records them. Nothing is contained: the syndrome carries no
+  classification and the Apple error registers are locked at this EL.
+
+Host tests: `tests/e2e/windows_fatal_host.c` replays `hv_fatal.c` unchanged under ASan/UBSan
+(gating, re-entry, the frame walk's bounds, a seqlock race against a writer thread, the D3
+state report, DISR only with RAS); the AHCI trace is the `fatal_trace` case of
+`windows_ahci_store_host.c`; PTW is in the policy harness; the source rules are in
+`test_windows_t8152_serror.py`. `AURA_FATAL_TRANSCRIPT=<file>` saves the replay transcript.
+The replay's register values are synthetic (a PA inside the synthetic window
+`0x10100000000:0x10561600000`, made-up kernel and user VAs, a FAR that keeps the PxCI offset
+0x138); none is copied from the run log.

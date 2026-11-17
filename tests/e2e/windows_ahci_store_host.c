@@ -14,7 +14,9 @@
  *  - a fresh attach over a READY/RUNNING/SEALED store is refused unless OVERWRITE;
  *  - keep-unsealed records the disk CRC, so a failed entry does not lock the store out;
  *  - keep-unsealed is refused when CNTPCT_EL0 is below the store's last-alive stamp;
- *  - the heartbeat while the guest runs; flag combinations; a changed disk is refused.
+ *  - the heartbeat while the guest runs; flag combinations; a changed disk is refused;
+ *  - the fatal-report trace (D3): the last access and the last command with its CPU, FIS, disk
+ *    range and guest spans, a span refused at the store, an access still in progress.
  * Usage: windows_ahci_store_host
  */
 
@@ -29,6 +31,7 @@
 u64 stub_cntpct = 1000;
 u64 stub_cntfrq = 24000000;
 u32 chip_id = T8152;
+int stub_cpu;
 
 static u64 stub_ram_lo, stub_ram_size;
 static int stub_reserved, stub_hooked;
@@ -120,6 +123,8 @@ static void session(void)
     desc = NULL;
     logged = events_logged = 0;
     longest_ticks = report_next = reported_commands = 0;
+    memset(&trace_access, 0, sizeof(trace_access));
+    memset(&trace_command, 0, sizeof(trace_command));
     stub_ram_lo = base;
     stub_ram_size = top - STORE - base; /* guest RAM ends where the store begins */
 }
@@ -341,6 +346,126 @@ static void case_unsealed_after_reset(void)
     end(before);
 }
 
+/* ---- the fatal-report trace (hv_fatal.h, D3) --------------------------------------------- */
+
+#define P(x) (AHCI_MODEL_PORT0 + (x))
+
+static u32 mmio_rd(u32 off)
+{
+    u64 v[2] = {0, 0};
+    hv_ahci_mmio(NULL, HV_AHCI_ABAR + off, v, false, 2);
+    return (u32)v[0];
+}
+
+static void mmio_wr(u32 off, u32 value)
+{
+    u64 v[2] = {value, 0};
+    hv_ahci_mmio(NULL, HV_AHCI_ABAR + off, v, true, 2);
+}
+
+static void put32(u8 *p, u32 v)
+{
+    memcpy(p, &v, 4);
+}
+
+/* One READ DMA EXT in slot `slot` with two PRD entries; guest RAM is identity mapped. */
+static void read_ext(u32 slot, u64 lba, u32 count, u64 buf0, u64 buf1)
+{
+    u64 clb = base + 0x1000, ctba = base + 0x3000 + slot * 0x100;
+    u8 *hdr = (u8 *)clb + slot * 32;
+    put32(hdr, 5 | 2u << 16);
+    put32(hdr + 4, 0);
+    put32(hdr + 8, (u32)ctba);
+    put32(hdr + 12, (u32)(ctba >> 32));
+    u8 *ct = (u8 *)ctba;
+    memset(ct, 0, 0xa0);
+    ct[0] = 0x27;
+    ct[1] = 0x80;
+    ct[2] = 0x25;
+    ct[4] = lba, ct[5] = lba >> 8, ct[6] = lba >> 16, ct[7] = 0x40;
+    ct[8] = lba >> 24, ct[9] = lba >> 32, ct[10] = lba >> 40;
+    ct[12] = count, ct[13] = count >> 8;
+    u32 half = count * AHCI_MODEL_SECTOR / 2;
+    put32(ct + 0x80, (u32)buf0);
+    put32(ct + 0x84, (u32)(buf0 >> 32));
+    put32(ct + 0x8c, half - 1);
+    put32(ct + 0x90, (u32)buf1);
+    put32(ct + 0x94, (u32)(buf1 >> 32));
+    put32(ct + 0x9c, half - 1);
+    mmio_wr(P(AHCI_PX_CI), 1u << slot);
+}
+
+static void case_fatal_trace(void)
+{
+    int before = failures;
+    begin("fatal_trace");
+    run_fresh(HV_AHCI_ATTACH_OVERWRITE, 5);
+    hv_ahci_guest_entered();
+    stub_cpu = 5;
+    u64 clb = base + 0x1000, fb = base + 0x2000, buf0 = base + 0x10000, buf1 = base + 0x20000;
+    mmio_wr(AHCI_GHC, AHCI_GHC_AE);
+    mmio_wr(P(AHCI_PX_CLB), (u32)clb);
+    mmio_wr(P(AHCI_PX_CLBU), (u32)(clb >> 32));
+    mmio_wr(P(AHCI_PX_FB), (u32)fb);
+    mmio_wr(P(AHCI_PX_FBU), (u32)(fb >> 32));
+    mmio_wr(P(AHCI_PX_SERR), 0xffffffff);
+    mmio_wr(P(AHCI_PX_IS), 0xffffffff);
+    mmio_wr(P(AHCI_PX_CMD), mmio_rd(P(AHCI_PX_CMD)) | AHCI_PX_CMD_FRE);
+    mmio_wr(P(AHCI_PX_CMD), mmio_rd(P(AHCI_PX_CMD)) | AHCI_PX_CMD_ST);
+
+    stub_cntpct += stub_cntfrq;
+    read_ext(0, 16, 8, buf0, buf1);
+    EQ(mmio_rd(P(AHCI_PX_CI)), 0);
+    CHECK(!memcmp((void *)buf0, disk() + 16 * 512, 2048));
+    CHECK(!memcmp((void *)buf1, disk() + 16 * 512 + 2048, 2048));
+    /* The command record: CPU, FIS, disk range, spans; stable. */
+    struct ahci_trace *c = &trace_command;
+    EQ(c->seq & 1, 0);
+    EQ(c->cpu, 5);
+    EQ(c->off, P(AHCI_PX_CI));
+    EQ(c->val, 1);
+    EQ(c->commands, 1);
+    EQ(c->slot, 0);
+    EQ(c->fis[2], 0x25);
+    EQ(c->io_lba, 16);
+    EQ(c->io_sectors, 8);
+    EQ(c->io_write, 0);
+    CHECK(c->spans >= 6);
+    int saw_cfis = 0, saw_buf1 = 0;
+    for (u64 i = 0; i < TRACE_SPANS && i < c->spans; i++) {
+        saw_cfis |= c->span[i].ipa == base + 0x3000 && c->span[i].len == 64 && c->span[i].ok;
+        saw_buf1 |= c->span[i].ipa == buf1 && c->span[i].len == 2048 && c->span[i].write &&
+                    c->span[i].ok;
+    }
+    CHECK(saw_cfis || c->spans > TRACE_SPANS);
+    CHECK(saw_buf1);
+    /* A register read afterwards is the last access, not the last command. */
+    mmio_rd(P(AHCI_PX_IS));
+    EQ(trace_access.off, P(AHCI_PX_IS));
+    EQ(trace_access.write, 0);
+    EQ(trace_access.seq & 1, 0);
+    EQ(trace_command.fis[2], 0x25);
+
+    /* A data buffer in the store (the first byte past guest RAM): refused, recorded. */
+    stub_cpu = 2;
+    read_ext(1, 24, 2, buf0, ram_hi);
+    EQ(trace_command.cpu, 2);
+    EQ(trace_command.slot, 1);
+    int refused = 0;
+    for (u64 i = 0; i < TRACE_SPANS && i < trace_command.spans; i++)
+        refused |= trace_command.span[i].ipa == ram_hi && !trace_command.span[i].ok;
+    CHECK(refused);
+    EQ(model.stats.fatal, 1);
+
+    /* An access still under way when another CPU reports. */
+    trace_access.seq |= 1;
+    printf("ahci-report-begin\n");
+    hv_ahci_fatal_report(stub_cntpct + stub_cntfrq / 1000, stub_cntfrq);
+    printf("ahci-report-end\n");
+    trace_access.seq++;
+    end(before);
+}
+
 int main(void)
 {
     /* 4 GiB of guest RAM (reserved, untouched) + the store, the store 32 MiB aligned. */
@@ -359,6 +484,7 @@ int main(void)
     case_overwrite_guard();
     case_unsealed_then_failed_entry();
     case_unsealed_after_reset();
+    case_fatal_trace();
 
     munmap(map, len);
     return failures ? 1 : 0;

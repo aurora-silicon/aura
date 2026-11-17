@@ -709,11 +709,18 @@ bool hv_t8152_map_filter(u64 from, u64 *to, u64 size)
     return true;
 }
 
+/*
+ * HCR_EL2.PTW (D3 run 1): the AIC passthrough is the one stage-2 Device leaf.  With PTW clear
+ * a stage-1 table walk -- the guest's own, or an AT the carrier runs on a guest VA -- that
+ * reaches it is performed as a Normal Non-cacheable read of AIC registers (Arm ARM, HCR_EL2.PTW);
+ * with PTW set it is a stage-2 Permission fault instead, reported in PAR_EL1 for an AT.  No
+ * guest keeps translation tables in the AIC, so this changes nothing for a working guest.
+ */
 u64 hv_t8152_hcr_filter(u64 hcr)
 {
     if (!armed)
         return hcr;
-    return (hcr | HCR_TWI | HCR_TWE) & ~HCR_FWB;
+    return (hcr | HCR_TWI | HCR_TWE | HCR_PTW) & ~HCR_FWB;
 }
 
 struct verify_ctx {
@@ -792,6 +799,11 @@ int hv_t8152_verify(u64 entry, u64 bootargs, u64 secondary_hcr, bool fb_shadow)
     }
     if ((hcr | secondary_hcr) & HCR_FWB) {
         printf("HV: T8152: HCR_EL2.FWB is set\n");
+        bad++;
+    }
+    if (!(hcr & HCR_PTW) || !(secondary_hcr & HCR_PTW)) {
+        printf("HV: T8152: HCR_EL2.PTW is not set (boot 0x%lx, secondaries 0x%lx)\n", hcr,
+               secondary_hcr);
         bad++;
     }
     if (!(hcr & HCR_VM) || !(hcr & HCR_TSC)) {

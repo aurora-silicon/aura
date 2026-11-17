@@ -798,6 +798,9 @@ static enum outcome run_slot(struct ahci_model *m, u32 slot)
         (u32)c.fis[4] | (u32)c.fis[5] << 8 | (u32)c.fis[6] << 16 | (u32)(c.fis[7] & 0xf) << 24;
     c.count16 = (u32)c.fis[12] | (u32)c.fis[13] << 8;
     c.count8 = c.fis[12];
+    /* Diagnostics only (the carrier's fatal report): the command FIS as fetched. */
+    if (m->env->command)
+        m->env->command(m->env->opaque, slot, c.fis);
 
     if (cfl < 5 || cfl > 16 || c.fis[0] != FIS_REG_H2D) {
         write_prdbc(hdr, 0);

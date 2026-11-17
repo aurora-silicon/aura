@@ -10,6 +10,7 @@
 #include "guest_diag.h"
 #include "hv_aic_alias.h"
 #include "hv_el2_acct.h"
+#include "hv_fatal.h"
 #include "hv_gic_cpuif.h"
 #include "hv_vdev_spi.h"
 #include "hv_vgic.h"
@@ -1176,6 +1177,10 @@ static void _hv_exc_proxy(struct exc_info *ctx, uartproxy_boot_reason_t reason, 
 
     u64 entry_time = hv_host_counter();
 
+    /* For the fatal report on the reset path below: the translations just after this, and
+     * anything uartproxy_run() translates, overwrite PAR_EL1. */
+    u64 par_before = mrs(PAR_EL1);
+
     ctx->elr_phys = hv_translate(ctx->elr, false, false, NULL);
     ctx->far_phys = hv_translate(ctx->far, false, false, NULL);
     ctx->sp_phys = hv_translate(from_el == 0 ? ctx->sp[0] : ctx->sp[1], false, false, NULL);
@@ -1207,6 +1212,9 @@ static void _hv_exc_proxy(struct exc_info *ctx, uartproxy_boot_reason_t reason, 
         default:
             printf("Guest exception not handled, resetting.\n");
             print_regs(ctx->regs, 0);
+            /* NULL frame: these are guest registers, there is no EL2 chain to walk. */
+            hv_windows_fatal_report(NULL, "unhandled guest exception", par_before,
+                                    "before the proxy's translations");
             hv_safe_reset("unhandled guest exception"); // does not return
     }
 }
@@ -3612,7 +3620,18 @@ static const char *hv_absent_pmu_chip(void)
  */
 static u64 hv_absent_pmu_translate(u64 va, bool w, u64 len)
 {
-    u64 pa = hv_translate(va, false, w, NULL);
+    u64 pa;
+
+    /*
+     * T8152: a TTBR1 (kernel) VA is walked with EL1 permissions whatever EL the guest was in.
+     * The tick reads kernel structures (vectors, module list) from whichever context it
+     * interrupted; when that was EL0, an EL0-regime walk of a kernel VA fails the permission
+     * check and the work was silently skipped.  User VAs keep the trapped EL's regime.
+     */
+    if (chip_id == T8152 && (va & BIT(55)))
+        pa = hv_translate_el(va, false, w, 1, NULL);
+    else
+        pa = hv_translate(va, false, w, NULL);
 
     if (pa && chip_id == T8152) {
         u64 base, size;
@@ -5058,6 +5077,19 @@ bool hv_recover_t8142_sysreg_undef(struct exc_info *ctx)
     u64 fault_pc = 0;
 
     if (!hv_absent_pmuv3())
+        return false;
+
+    /*
+     * T8152: the wedge this recovers is an EL1 handler spinning on itself; a tick that
+     * interrupted guest EL0 cannot be looking at one.  Skip before translating anything, so
+     * the tick never walks an arbitrary user PC through the current process's TTBR0.  This is
+     * hygiene, not a confirmed fix: D3 run 1's SError (cpu6, 388 s after entry) was taken
+     * right after such a walk ("at s12e0r" of the interrupted user PC, from this function),
+     * but that walk uses the regime the guest's own fetch had just used, and an SError pending
+     * from earlier in the tick (the converter's scanout stores) is taken at the same place.
+     * It also keeps a stale ESR_EL12 plus a user-mode branch-to-self from looking like a wedge.
+     */
+    if (chip_id == T8152 && !(FIELD_GET(SPSR_M, ctx->spsr) >> 2))
         return false;
 
     /*
@@ -7419,6 +7451,7 @@ void hv_exc_sync(struct exc_info *ctx)
 #endif
     hv_wdt_breadcrumb('S');
     hv_get_context(ctx);
+    hv_fatal_note_trap(HV_FATAL_TRAP_SYNC, ctx->esr, ctx->elr, ctx->spsr, ctx->far);
 
     /*
      * Keep the absent-register redirect current from here rather than only
@@ -7629,6 +7662,12 @@ void hv_exc_irq(struct exc_info *ctx)
      */
     hv_wdt_breadcrumb('I');
     HV_GUEST_DIAG_INC(irq);
+    /*
+     * Record the exit here, outside the #ifdef below, so the shipped ENABLE_VGIC_MODULE build
+     * records it too.  That path never calls hv_get_context(): read ELR/SPSR directly.  An IRQ
+     * has no syndrome and no fault address, so ESR and FAR are recorded as 0.
+     */
+    hv_fatal_note_trap(HV_FATAL_TRAP_IRQ, 0, mrs(ELR_EL2), mrs(SPSR_EL2), 0);
 
     /*
      * Answer an outstanding rendezvous before touching any AIC, carrier or HCR
@@ -7902,7 +7941,7 @@ void hv_exc_irq(struct exc_info *ctx)
     }
 #else
     /* The 'I' breadcrumb is now emitted at function entry, for every build. */
-    hv_get_context(ctx);
+    hv_get_context(ctx); /* the exit was recorded at entry, above */
     hv_exc_entry();
     hv_exc_proxy(ctx, START_EXCEPTION_LOWER, EXC_IRQ, NULL);
     hv_exc_exit(ctx);
@@ -7985,6 +8024,7 @@ void hv_exc_fiq(struct exc_info *ctx)
         !hv_rendezvous_requested()) {
         // Non-interruptible CPU and it was just a timer tick (or spurious), so just update FIQs
         hv_get_context(ctx);
+        hv_fatal_note_trap(HV_FATAL_TRAP_FIQ_FAST, ctx->esr, ctx->elr, ctx->spsr, ctx->far);
         hv_update_fiq(ctx);
         hv_arm_tick(true);
         return;
@@ -7993,6 +8033,7 @@ void hv_exc_fiq(struct exc_info *ctx)
     // Slow (single threaded) path
     hv_wdt_breadcrumb('F');
     hv_get_context(ctx);
+    hv_fatal_note_trap(HV_FATAL_TRAP_FIQ, ctx->esr, ctx->elr, ctx->spsr, ctx->far);
     hv_windows_update_carrier_readiness(ctx);
     hv_exc_entry();
 
@@ -8112,6 +8153,7 @@ void hv_exc_serr(struct exc_info *ctx)
     hv_wdt_breadcrumb('E');
     HV_GUEST_DIAG_INC(serror);
     hv_get_context(ctx);
+    hv_fatal_note_trap(HV_FATAL_TRAP_SERROR, ctx->esr, ctx->elr, ctx->spsr, ctx->far);
     hv_exc_entry();
     hv_exc_proxy(ctx, START_EXCEPTION_LOWER, EXC_SERROR, NULL);
     hv_exc_exit(ctx);

@@ -50,6 +50,10 @@ struct fake {
     int logs;
     char last_log[64];
     u64 last_log_a;
+    /* The diagnostics observer (env->command): slots run and the last FIS it was shown. */
+    int commands_seen;
+    u32 last_slot;
+    u8 last_fis[20];
 };
 
 static struct fake F;
@@ -141,6 +145,14 @@ static void env_log(void *opaque, const char *event, u64 a, u64 b)
     F.last_log_a = a;
 }
 
+static void env_command(void *opaque, u32 slot, const u8 *fis)
+{
+    (void)opaque;
+    F.commands_seen++;
+    F.last_slot = slot;
+    memcpy(F.last_fis, fis, sizeof(F.last_fis));
+}
+
 static void canaries_check(void)
 {
     for (u64 i = 0; i < GUARD; i++) {
@@ -167,7 +179,9 @@ static void fresh(void)
     F.fail_backend = F.out_of_range = false;
     F.logs = 0;
     F.last_log[0] = 0;
-    E = (struct ahci_env){env_span, env_read, env_write, env_flush, env_irq, env_log, &F, SECTORS};
+    F.commands_seen = 0;
+    E = (struct ahci_env){env_span, env_read, env_write, env_flush, env_irq,
+                          env_log,  &F,       SECTORS,   env_command};
     ahci_model_init(&M, &E);
 }
 
@@ -517,6 +531,10 @@ static void case_dma_ext(void)
     c.nprd = 3;
     EQ(issue(0, &c), 0);
     expect_d2h_ok(0, 8192);
+    /* The observer saw exactly this slot's FIS, once (D3 fatal report). */
+    EQ(F.commands_seen, 1);
+    EQ(F.last_slot, 0);
+    CHECK(!memcmp(F.last_fis, c.fis, sizeof(c.fis)));
     CHECK(rd(P(AHCI_PX_IS)) & AHCI_PX_IS_DPS);
     CHECK(!memcmp(F.disk + 100 * 512, src, 8192));
     CHECK(zero(F.disk + 99 * 512, 512) && zero(F.disk + 116 * 512, 512));

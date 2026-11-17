@@ -40,6 +40,7 @@ typedef long s64;
 #define ALIGN_UP(x, a) (((x) + (a) - 1) & ~((a) - 1))
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 #define HCR_VM BIT(0)
+#define HCR_PTW BIT(2)
 #define HCR_TWI BIT(13)
 #define HCR_TWE BIT(14)
 #define HCR_TSC BIT(19)
@@ -418,10 +419,10 @@ int main(void)
     assert(map(0x5300004000, 0x10007004000 | S2_RO, 0x4000) == 0xdead);  /* wrong IPA */
 
     /* HCR filter. */
-    assert(hv_t8152_hcr_filter(HCR_FWB) == (HCR_TWI | HCR_TWE));
+    assert(hv_t8152_hcr_filter(HCR_FWB) == (HCR_TWI | HCR_TWE | HCR_PTW));
 
     /* Pre-entry walk. */
-    u64 hcr_ok = HCR_VM | HCR_TSC | HCR_TWI | HCR_TWE;
+    u64 hcr_ok = HCR_VM | HCR_TSC | HCR_TWI | HCR_TWE | HCR_PTW;
     fake_hcr = hcr_ok;
     leaves[nleaves++] = (struct leaf){WIN_LO, 0x2000000, WIN_LO | S2_HW | 2, 2};
     leaves[nleaves++] = (struct leaf){AIC_BASE, 0x4000, AIC_BASE | (S2_HW & ~(0xfUL << 2)) | 2, 3};
@@ -437,6 +438,11 @@ int main(void)
     assert(hv_t8152_verify(WIN_LO + 0x800, WIN_LO, hcr_ok, true) < 0);
     fake_hcr = hcr_ok;
     fake_hcr = hcr_ok | HCR_FWB;
+    assert(hv_t8152_verify(WIN_LO + 0x800, WIN_LO, hcr_ok, true) < 0);
+    fake_hcr = hcr_ok;
+    /* D3: a stage-1 walk into the AIC Device leaf must fault, on every CPU (HCR_EL2.PTW). */
+    assert(hv_t8152_verify(WIN_LO + 0x800, WIN_LO, hcr_ok & ~HCR_PTW, true) < 0);
+    fake_hcr = hcr_ok & ~HCR_PTW;
     assert(hv_t8152_verify(WIN_LO + 0x800, WIN_LO, hcr_ok, true) < 0);
     fake_hcr = hcr_ok;
     leaves[nleaves++] = (struct leaf){AIC_BASE + 0x4000, 0x4000, (AIC_BASE + 0x4000) | S2_HW | 2, 3};

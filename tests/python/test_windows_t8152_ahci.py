@@ -64,7 +64,7 @@ CASES = ["reset_values", "identify", "dma_ext", "pio", "count_zero", "range_erro
          "abort_paths", "non_data", "device_settings", "access_widths", "spi_route", "spi_plan",
          "crc", "fuzz"]
 STORE_CASES = ["lifecycle", "flags", "overwrite_guard", "unsealed_failed_entry",
-               "unsealed_after_reset"]
+               "unsealed_after_reset", "fatal_trace"]
 
 # Stub headers for compiling hv_ahci.c on the host (windows_ahci_store_host.c).  u64 is
 # unsigned long, as on the AArch64 target, so the resident's printf formats stay valid.
@@ -84,6 +84,13 @@ typedef long s64;
 ''',
     "string.h": "#pragma once\n#include <string.h>\n",
     "soc.h": '#pragma once\n#include "types.h"\n#define T8152 0x8152\nextern u32 chip_id;\n',
+    "smp.h": r'''
+#pragma once
+#include "types.h"
+#define MAX_CPUS 16
+extern int stub_cpu;
+static inline int smp_id(void) { return stub_cpu; }
+''',
     "utils.h": r'''
 #pragma once
 #include <stdio.h>
@@ -168,7 +175,8 @@ def store_replay(tmp_path_factory):
     out = tmp_path_factory.mktemp("ahci-store")
     for name, text in STORE_STUBS.items():
         (out / name).write_text(text)
-    for name in ("hv_ahci.c", "hv_ahci.h", "ahci_model.c", "ahci_model.h", "hv_vdev_spi.h"):
+    for name in ("hv_ahci.c", "hv_ahci.h", "ahci_model.c", "ahci_model.h", "hv_vdev_spi.h",
+                 "hv_fatal.h"):
         shutil.copy2(WIN / name, out / name)
     binary = out / "ahci-store-host"
     build = subprocess.run([cc, "-std=gnu11", "-O1", "-g", "-Wall", "-Wextra", "-Werror",
@@ -193,6 +201,24 @@ def test_store_glue_replay_passes(store_replay):
     assert "store note: image sha256 " in result.stdout
     assert "the machine was reset since the store was written" in result.stdout
     assert "pass --windows-ahci-overwrite to replace it" in result.stdout
+
+
+def test_store_glue_fatal_trace(store_replay):
+    # D3: what the EL2 fatal report prints about the disk.  The last access is the one under
+    # way (IN PROGRESS), the last command is the refused one on cpu 2 with its spans.
+    result, _ = store_replay
+    text = result.stdout
+    text = text[text.index("ahci-report-begin\n"):text.index("ahci-report-end\n")]
+    assert re.search(r"HV: fatal: AHCI guest RAM \[0x[0-9a-f]+, 0x[0-9a-f]+\), store "
+                     r"\[0x[0-9a-f]+, 0x[0-9a-f]+\), 1 commands\n", text)
+    assert re.search(r"AHCI last access: cpu 2, 1000 us ago, IN PROGRESS: 4-byte write "
+                     r"ABAR\+0x138 value 0x2\n", text)
+    assert re.search(r"AHCI last command access: cpu 2, 1000 us ago, done: ABAR\+0x138 = 0x2; "
+                     r"1 command\(s\), last slot 1 ATA 0x25 LBA 0x18 count 2\n", text)
+    spans = re.findall(r"AHCI   span (\d+)/(\d+): IPA (0x[0-9a-f]+) \+(0x[0-9a-f]+) "
+                       r"(to guest|from guest)( REFUSED \(outside guest RAM\))?\n", text)
+    assert spans and spans[-1][5] and spans[-1][3] == "0x200" and spans[-1][4] == "to guest"
+    assert len(spans) == min(8, int(spans[-1][1]))
 
 
 def test_model_replay_passes(replay):
