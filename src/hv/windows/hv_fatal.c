@@ -43,7 +43,18 @@ void hv_fatal_note_trap(u64 kind, u64 esr, u64 elr, u64 spsr, u64 far)
     /* ESR_EC_IABORT_LOWER 0x20, ESR_EC_DABORT_LOWER 0x24: the only exits HPFAR describes. */
     t->hpfar = (kind == HV_FATAL_TRAP_SYNC && (ec == 0x20 || ec == 0x24)) ? mrs(HPFAR_EL2) : 0;
     t->cntpct = mrs(CNTPCT_EL0);
+    t->isr = mrs(ISR_EL1);
     hv_fatal_seq_end(&t->seq);
+}
+
+void hv_fatal_trap_snapshot(struct hv_fatal_trap *out)
+{
+    *out = (struct hv_fatal_trap){0};
+    if (chip_id != T8152)
+        return;
+    struct hv_fatal_trap *t = &hv_fatal_cpus[smp_id()].trap;
+    /* This CPU owns the record and is not inside it (it is in an exception vector). */
+    hv_fatal_read(&t->seq, t, out, sizeof(*out));
 }
 
 void hv_fatal_stage(u64 stage)
@@ -83,7 +94,9 @@ void hv_fatal_fb_end(void)
 
     sysop("dsb sy");
     sysop("isb");
-    hv_fatal_seq_end(&hv_fatal_cpus[smp_id()].fb.seq);
+    struct hv_fatal_fb *f = &hv_fatal_cpus[smp_id()].fb;
+    f->isr = mrs(ISR_EL1);
+    hv_fatal_seq_end(&f->seq);
 }
 
 /* ---- pure helpers (host-tested) ----------------------------------------------------------- */
@@ -162,6 +175,36 @@ const char *hv_fatal_serror_class(u64 esr)
     }
 }
 
+/*
+ * Where the guest SError was taken relative to the previous exit of the same CPU.  The return
+ * point of that exit: past the instruction for a handled synchronous trap (HVC already has
+ * ELR_EL2 past it), the interrupted instruction for an IRQ, FIQ or SError.
+ */
+const char *hv_fatal_serror_relation(const struct hv_fatal_trap *prev, u64 elr, u64 age_us)
+{
+    if (!prev || !prev->cntpct)
+        return "no earlier exit recorded on this CPU";
+    u64 ret = prev->elr;
+    if (prev->kind == HV_FATAL_TRAP_SYNC && ((prev->esr >> 26) & 0x3f) != 0x16)
+        ret += 4;
+    bool pending = prev->isr & BIT(8);
+    if (elr != ret) {
+        if (pending)
+            return "the guest ran on past that exit, and an SError was already pending at it: "
+                   "it was raised before that exit and only taken later";
+        return "the guest ran on past that exit: raised while the guest ran (its own access, "
+               "or a late completion of earlier work)";
+    }
+    if (pending)
+        return "taken at that exit's return point and already pending when it exited: raised "
+               "before that exit (guest access, or earlier EL2 work)";
+    if (age_us > 10000)
+        return "at that exit's return point but long after it: the guest may have re-run that "
+               "PC; not attributable";
+    return "taken at that exit's return point: pending when EL2 returned to the guest (EL2 "
+           "work in that exit with PSTATE.A masked, or a guest access just before the exit)";
+}
+
 /* ---- the report --------------------------------------------------------------------------- */
 
 static const char *mode_name(u64 spsr)
@@ -228,6 +271,8 @@ static void report_cpu(int cpu, int self, u64 now, u64 freq)
                (char)t.kind, age_us(now, t.cntpct, freq), state, t.esr, t.elr, mode_name(t.spsr));
         if (t.kind == HV_FATAL_TRAP_SYNC && t.hpfar)
             printf(" FAR 0x%lx IPA 0x%lx", t.far, hpfar_ipa(t.hpfar, t.far));
+        if (t.isr & BIT(8))
+            printf("; SError pending at that exit");
         printf("\n");
     }
     printf("HV: fatal: cpu%2d%s EL2", cpu, mark);
@@ -239,6 +284,8 @@ static void report_cpu(int cpu, int self, u64 now, u64 freq)
                : (fs & 1) ? "IN PROGRESS"
                           : "done",
                age_us(now, f.cntpct, freq));
+    if (f.cntpct && !(fs & 1) && (f.isr & BIT(8)))
+        printf(" SError pending after that band;");
     printf(" crumbs ");
     u64 crumbs = hv_wdt_breadcrumbs_read(cpu);
     for (int i = 56; i >= 0; i -= 8) {
@@ -303,4 +350,45 @@ void hv_windows_fatal_report(u64 *regs, const char *what, u64 par, const char *p
     printf("HV: fatal: guest EL1 ELR_EL12 0x%lx ESR_EL12 0x%lx FAR_EL12 0x%lx SPSR_EL12 0x%lx\n",
            mrs(ELR_EL12), mrs(ESR_EL12), mrs(FAR_EL12), mrs(SPSR_EL12));
     printf("HV: fatal: not contained: the carrier does not resume after this (%s)\n", what);
+}
+
+void hv_windows_guest_serror_report(const u64 *regs, u64 esr, u64 elr, u64 spsr, u64 far,
+                                    const struct hv_fatal_trap *prev, u64 par)
+{
+    if (chip_id != T8152 || !hv_fatal_armed)
+        return;
+    if (__atomic_load_n(&hv_fatal_reporting, __ATOMIC_ACQUIRE)) {
+        printf("HV: fatal: guest SError inside the fatal report; skipping it\n");
+        return;
+    }
+
+    int self = smp_id();
+    u64 now = mrs(CNTPCT_EL0), freq = mrs(CNTFRQ_EL0);
+    u64 age = prev && prev->cntpct ? age_us(now, prev->cntpct, freq) : 0;
+
+    /* What the vector read, before anything else: the record lines below can only add. */
+    printf("HV: fatal: guest SError on cpu %d: ESR_EL2 0x%lx (%s); guest PC 0x%lx %s SPSR "
+           "0x%lx; FAR_EL2 0x%lx (stale: an SError does not write it)\n",
+           self, esr, hv_fatal_serror_class(esr), elr, mode_name(spsr), spsr, far);
+    if (prev && prev->cntpct) {
+        printf("HV: fatal: cpu%2d previous exit %c %lu us before: ESR 0x%lx PC 0x%lx %s", self,
+               (char)prev->kind, age, prev->esr, prev->elr, mode_name(prev->spsr));
+        if (prev->kind == HV_FATAL_TRAP_SYNC && prev->hpfar)
+            printf(" FAR 0x%lx IPA 0x%lx", prev->far, hpfar_ipa(prev->hpfar, prev->far));
+        printf("; ISR_EL1 at it 0x%lx\n", prev->isr);
+    }
+    printf("HV: fatal: cpu%2d SError vs previous exit: %s\n", self,
+           hv_fatal_serror_relation(prev, elr, age));
+
+    hv_windows_fatal_report(NULL, "guest SError", par, "at the guest SError");
+
+    if (regs) {
+        for (int i = 0; i < 31; i += 4) {
+            printf("HV: fatal: guest x%d-x%d:", i, i + 3 < 30 ? i + 3 : 30);
+            for (int j = i; j < i + 4 && j < 31; j++)
+                printf(" %016lx", regs[j]);
+            printf("\n");
+        }
+    }
+    __atomic_store_n(&hv_fatal_reporting, 0, __ATOMIC_RELEASE);
 }

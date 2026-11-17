@@ -376,6 +376,86 @@ static void case_report(int ras)
     end(before);
 }
 
+/*
+ * R9 (i0 session 2): a guest SError.  The previous exit of the CPU is kept (the SError's own
+ * note overwrites it), set against the SError's PC, and every CPU's records follow; the report
+ * latch is released afterwards, so a later EL2 fatal still reports.  Synthetic values.
+ */
+static void case_guest(void)
+{
+    int before = failures;
+    begin("report_guest");
+    reset_state();
+    hv_fatal_armed = true;
+    stub_pfr0 = 0;
+    struct hv_fatal_trap prev;
+
+    /* Relation decoder: return points of each exit kind. */
+    struct hv_fatal_trap t = {.kind = HV_FATAL_TRAP_SYNC, .esr = 0x04000001UL /* WFI */,
+                              .elr = 0x1000, .cntpct = 1};
+    CHECK(strstr(hv_fatal_serror_relation(&t, 0x1004, 5), "taken at that exit's return point: "
+                                                          "pending when EL2 returned"));
+    CHECK(strstr(hv_fatal_serror_relation(&t, 0x1000, 5), "the guest ran on"));
+    CHECK(strstr(hv_fatal_serror_relation(&t, 0x1004, 20000), "not attributable"));
+    t.esr = 0x5a000000UL; /* HVC: ELR_EL2 is already past it */
+    CHECK(strstr(hv_fatal_serror_relation(&t, 0x1000, 5), "return point"));
+    CHECK(strstr(hv_fatal_serror_relation(&t, 0x1004, 5), "the guest ran on"));
+    t.kind = HV_FATAL_TRAP_IRQ;
+    t.esr = 0;
+    CHECK(strstr(hv_fatal_serror_relation(&t, 0x1000, 5), "return point"));
+    t.isr = BIT(8);
+    CHECK(strstr(hv_fatal_serror_relation(&t, 0x1000, 5), "already pending when it exited"));
+    CHECK(strstr(hv_fatal_serror_relation(&t, 0x2000, 5), "already pending at it"));
+    CHECK(strstr(hv_fatal_serror_relation(NULL, 0x1000, 5), "no earlier exit"));
+    t.cntpct = 0;
+    CHECK(strstr(hv_fatal_serror_relation(&t, 0x1000, 5), "no earlier exit"));
+
+    /* cpu 0: some other exit, so the all-CPU part has a second CPU. */
+    stub_cpu = 0;
+    stub_cntpct = 1000000;
+    stub_isr = 0;
+    hv_fatal_note_trap(HV_FATAL_TRAP_IRQ, 0, 0xfffff80000300000UL, 0x60000005, 0);
+
+    /* cpu 6: a WFI exit (the idle path) with an SError already pending, then the SError. */
+    stub_cpu = 6;
+    stub_isr = BIT(8);
+    hv_fatal_note_trap(HV_FATAL_TRAP_SYNC, 0x04000001UL, 0xfffff80000101000UL, 0x60000005, 0);
+    /* ...and an idle-path band after it that ended with the SError pending. */
+    hv_fatal_fb_begin(400, 464);
+    hv_fatal_fb_end();
+    EQ(hv_fatal_cpus[6].fb.isr, BIT(8));
+    stub_isr = 0;
+    hv_fatal_trap_snapshot(&prev);
+    EQ(prev.kind, HV_FATAL_TRAP_SYNC);
+    EQ(prev.elr, 0xfffff80000101000UL);
+    EQ(prev.isr, BIT(8));
+    stub_cntpct += 24 * 7; /* 7 us */
+    hv_fatal_note_trap(HV_FATAL_TRAP_SERROR, 0xbe000000UL, 0xfffff80000101004UL, 0x60000005,
+                       0xffffa50012400138UL);
+    stub_esr = 0xbe000000UL;
+    u64 regs[32];
+    for (int i = 0; i < 32; i++)
+        regs[i] = 0x1111111111111111UL * (u64)(i % 16);
+
+    printf("report-begin %s\n", current);
+    hv_windows_guest_serror_report(regs, 0xbe000000UL, 0xfffff80000101004UL, 0x60000005,
+                                   0xffffa50012400138UL, &prev, 0);
+    printf("report-end %s\n", current);
+    EQ(stub_ahci_reports, 1);
+    EQ(hv_fatal_reporting, 0);
+
+    /* Off T8152, or before entry: nothing; the snapshot is empty off T8152. */
+    chip_id = 0x8142;
+    hv_fatal_trap_snapshot(&prev);
+    EQ(prev.cntpct, 0);
+    hv_windows_guest_serror_report(regs, 0, 0, 0, 0, &prev, 0);
+    chip_id = T8152;
+    hv_fatal_armed = false;
+    hv_windows_guest_serror_report(regs, 0, 0, 0, 0, &prev, 0);
+    EQ(stub_ahci_reports, 1);
+    end(before);
+}
+
 int main(void)
 {
     case_gating();
@@ -384,5 +464,6 @@ int main(void)
     case_seqlock();
     case_report(0);
     case_report(1);
+    case_guest();
     return failures ? 1 : 0;
 }

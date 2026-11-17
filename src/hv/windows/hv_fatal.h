@@ -53,11 +53,15 @@ struct hv_fatal_trap {
     u64 kind;
     u64 esr, elr, spsr, far, hpfar;
     u64 cntpct;
+    u64 isr; /* ISR_EL1 at the exit, before EL2 did anything: A (bit 8) = SError pending */
 };
 
 struct hv_fatal_fb {
     u64 seq; /* odd while hv_fb_convert_slice() runs on this CPU */
     u64 start, end, cntpct;
+    /* ISR_EL1 after the closing fence: on the idle path PSTATE.A is masked, so an SError the
+     * band's stores raised is pending here instead of taken (i0 session 2). */
+    u64 isr;
 };
 
 struct hv_fatal_cpu {
@@ -150,6 +154,29 @@ const char *hv_fatal_serror_class(u64 esr);
  * report itself falls through to the caller's reboot).
  */
 void hv_windows_fatal_report(u64 *regs, const char *what, u64 par, const char *par_when);
+
+/*
+ * Lower-EL SErrors (i0 session 2).  hv_exc_serr() forwards an SError the guest took to the
+ * host, which ends the session; until this, nothing was printed and the per-CPU record of the
+ * exit before it was overwritten by the SError's own.  The SError is asynchronous: the guest
+ * PC says where it was taken, not what caused it, so the report sets it against the previous
+ * exit of the same CPU.  An SError taken at that exit's return point within microseconds was
+ * pending when EL2 returned (EL2 work done with PSTATE.A masked -- the fast trap paths and
+ * the idle converter never unmask it -- or a guest access issued just before that exit); one
+ * taken after the guest ran on was raised while the guest ran.
+ *
+ * hv_fatal_trap_snapshot(): copy this CPU's trap record; call it before the SError's own
+ * hv_fatal_note_trap() overwrites it.
+ * hv_fatal_serror_relation(): that comparison as text (pure; host-tested).
+ * hv_windows_guest_serror_report(): the report, then hv_windows_fatal_report() for every CPU's
+ * records; `regs` are the guest's x0-x30.  Unlike the EL2 paths it releases the report latch
+ * afterwards: the carrier keeps running (the host exits the guest), and a later EL2 fatal
+ * still needs its report.
+ */
+void hv_fatal_trap_snapshot(struct hv_fatal_trap *out);
+const char *hv_fatal_serror_relation(const struct hv_fatal_trap *prev, u64 elr, u64 age_us);
+void hv_windows_guest_serror_report(const u64 *regs, u64 esr, u64 elr, u64 spsr, u64 far,
+                                    const struct hv_fatal_trap *prev, u64 par);
 
 /* hv_wdt.c: this CPU's last eight breadcrumbs, oldest in the top byte. */
 u64 hv_wdt_breadcrumbs_read(int cpu);

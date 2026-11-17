@@ -42,7 +42,8 @@ import pytest
 REPO = Path(__file__).resolve().parents[2]
 WIN = REPO / "src/hv/windows"
 
-CASES = ["gating", "reentry", "unwind", "seqlock", "report_d3", "report_ras"]
+CASES = ["gating", "reentry", "unwind", "seqlock", "report_d3", "report_ras",
+         "report_guest"]
 
 STUBS = {
     "types.h": r'''
@@ -175,6 +176,94 @@ def test_report_on_the_d3_state(replay):
     # The records come out before the reads most likely to trap (DISR_EL1, the _EL12 set).
     assert text.index("cpu 6* EL2") < text.index("AHCI stub report") < text.index("EL2 lr rel") \
         < text.index("DISR_EL1") < text.index("guest EL1 ELR_EL12")
+
+
+def test_report_on_a_guest_serror(replay):
+    """i0 session 2: the guest SError is set against the previous exit of its CPU (kept from
+    before the SError's own note), then every CPU's records, then the guest registers."""
+    text = report(replay, "report_guest")
+    assert ("HV: fatal: guest SError on cpu 6: ESR_EL2 0xbe000000 (uncategorized (DFSC 0): no "
+            "architectural classification); guest PC 0xfffff80000101004 EL1h SPSR 0x60000005; "
+            "FAR_EL2 0xffffa50012400138 (stale: an SError does not write it)") in text
+    assert re.search(r"cpu 6 previous exit S 7 us before: ESR 0x4000001 PC 0xfffff80000101000 "
+                     r"EL1h; ISR_EL1 at it 0x100\n", text)
+    assert "cpu 6 SError vs previous exit: taken at that exit's return point and already " \
+           "pending when it exited" in text
+    assert "HV: fatal: guest SError on cpu 6; T8152 carrier context follows" in text
+    assert "PAR_EL1 0x0 at the guest SError" in text
+    # The all-CPU part shows the SError's own record on cpu 6 and the other CPU.
+    assert re.search(r"cpu 6\* last trap E \d+ us ago: ESR 0xbe000000 PC 0xfffff80000101004 "
+                     r"EL1h\n", text)
+    assert re.search(r"cpu 0  last trap I \d+ us ago: ESR 0x0 PC 0xfffff80000300000 EL1h\n", text)
+    assert re.search(r"cpu 6\* EL2 fb rows 400\.\.464 done \d+ us ago; SError pending after "
+                     r"that band; crumbs", text)
+    assert "HV: fatal: guest x0-x3: 0000000000000000 1111111111111111 2222222222222222 " \
+           "3333333333333333\n" in text
+    assert "HV: fatal: guest x28-x30: cccccccccccccccc dddddddddddddddd eeeeeeeeeeeeeeee\n" in text
+    assert text.index("previous exit") < text.index("carrier context follows") < \
+        text.index("AHCI stub report") < text.index("guest x0-x3")
+
+
+def test_a_pending_serror_is_flagged_on_the_exit_record(replay):
+    text = report(replay, "report_d3")
+    assert "SError pending at that exit" not in text  # stub ISR 0 at every D3 exit
+    assert "SError pending after that band" not in text
+
+
+def test_guest_serror_vector_keeps_the_previous_exit_and_reports_before_the_proxy():
+    body = code(function_body(source("src/hv/windows/hv_exc.c"),
+                              "void hv_exc_serr(struct exc_info *ctx)"))
+    snap = body.index("hv_fatal_trap_snapshot(&prev);")
+    assert snap < body.index("hv_get_context(ctx);") < body.index("hv_fatal_note_trap(")
+    rep = body.index("hv_windows_guest_serror_report(ctx->regs, ctx->esr, ctx->elr, "
+                     "ctx->spsr, ctx->far, &prev,")
+    assert body.index("hv_exc_entry();") < rep < \
+        body.index("hv_exc_proxy(ctx, START_EXCEPTION_LOWER, EXC_SERROR, NULL);")
+    note = code(function_body(source("src/hv/windows/hv_fatal.c"),
+                              "void hv_fatal_note_trap(u64 kind, u64 esr, u64 elr, u64 spsr, "
+                              "u64 far)"))
+    assert note.index("t->isr = mrs(ISR_EL1);") < note.index("hv_fatal_seq_end(&t->seq);")
+
+
+def test_host_logs_the_guest_exception_frame():
+    import struct as st
+    import sys
+    import types
+    sys.path.insert(0, str(REPO / "proxyclient"))
+    from aura.hv import HV
+    from aura.proxy import ExcInfo
+
+    regs = [0x100 + i for i in range(32)]
+    frame = st.pack("<32Q", *regs) + st.pack(
+        "<14Q", 0x60000005, 0xfffff80000101004, 0xbe000000, 0xffffa50012400138, 0, 0x7ff0,
+        0xfffff80000400000, 0x10008402fa0, 6, 0x80010100, 0x10100101004, 0, 0x10100400000, 0)
+    assert len(frame) == ExcInfo.sizeof()
+    code_words = st.pack("<5I", 1, 2, 3, 4, 5)
+    reads = []
+
+    def readmem(addr, size):
+        reads.append((addr, size))
+        return frame if addr == 0x10008402fa0 else code_words
+
+    lines = []
+    fake = types.SimpleNamespace(iface=types.SimpleNamespace(readmem=readmem), log=lines.append)
+    HV._log_windows_exc_info(fake, 0x10008402fa0)
+    text = "\n".join(lines)
+    assert "cpu 6 MPIDR 0x80010100 ESR_EL2 0xbe000000 (EC 0x2f ISS 0x0) ELR 0xfffff80000101004 " \
+           "(PA 0x10100101004) SPSR 0x60000005 (M 0x5)" in text
+    assert "x28-x30: 000000000000011c 000000000000011d 000000000000011e" in text
+    assert "code at PA 0x10100100ffc: 00000001 00000002 [00000003] 00000004 00000005" in text
+    assert reads[1] == (0x10100100ffc, 20)
+
+    # A failed read is logged, never raised: the guest exit must still go ahead.
+    lines.clear()
+
+    def broken(addr, size):
+        raise OSError("link down")
+
+    fake.iface.readmem = broken
+    HV._log_windows_exc_info(fake, 0x10008402fa0)
+    assert "could not read the frame at 0x10008402fa0" in lines[0]
 
 
 def test_report_with_ras_and_a_walk_fault(replay):

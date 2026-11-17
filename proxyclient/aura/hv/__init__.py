@@ -1085,7 +1085,35 @@ class HV(Reloadable):
         if self.windows_abort_reason is None:
             self.windows_abort_reason = event
         self.log(f"Windows guest forwarded an exception to Python: {event}")
+        if reason == START.EXCEPTION_LOWER:
+            self._log_windows_exc_info(info)
         self.p.exit(EXC_RET.EXIT_GUEST)
+
+    def _log_windows_exc_info(self, info):
+        """For a guest exception, `info` is the carrier's struct exc_info on the trapping CPU's
+        EL2 stack (proxy.ExcInfo).  i0 session 2 ended on a guest SError with only the pointer
+        printed; this reads the frame before the guest is exited.  Best effort: a failed read
+        is logged and the exit goes ahead."""
+        try:
+            ctx = ExcInfo.parse(self.iface.readmem(info, ExcInfo.sizeof()))
+            esr = int(ctx.esr.value) if hasattr(ctx.esr, "value") else int(ctx.esr)
+            spsr = int(ctx.spsr.value) if hasattr(ctx.spsr, "value") else int(ctx.spsr)
+            self.log(f"Guest exception context: cpu {ctx.cpu_id} MPIDR {ctx.mpidr:#x} "
+                     f"ESR_EL2 {esr:#x} (EC {(esr >> 26) & 0x3f:#x} ISS {esr & 0x1ffffff:#x}) "
+                     f"ELR {ctx.elr:#x} (PA {ctx.elr_phys:#x}) SPSR {spsr:#x} (M {spsr & 0xf:#x}) "
+                     f"FAR {ctx.far:#x} (PA {ctx.far_phys:#x}) AFSR1 {ctx.afsr1:#x} "
+                     f"SP_EL0 {ctx.sp[0]:#x} SP_EL1 {ctx.sp[1]:#x}")
+            for i in range(0, 31, 4):
+                regs = " ".join(f"{ctx.regs[j]:016x}" for j in range(i, min(i + 4, 31)))
+                self.log(f"Guest exception context: x{i}-x{min(i + 3, 30)}: {regs}")
+            if ctx.elr_phys:
+                base = (ctx.elr_phys & ~3) - 8
+                words = struct.unpack("<5I", self.iface.readmem(base, 20))
+                text = " ".join(("[%08x]" if base + 4 * i == ctx.elr_phys else "%08x") % w
+                                for i, w in enumerate(words))
+                self.log(f"Guest exception context: code at PA {base:#x}: {text}")
+        except Exception as e:
+            self.log(f"Guest exception context: could not read the frame at {info:#x}: {e!r}")
 
     def attach_virtio(self, dev, base=None, irq=None, verbose=False):
         if base is None:

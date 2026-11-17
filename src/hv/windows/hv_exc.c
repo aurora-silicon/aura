@@ -8209,9 +8209,18 @@ void hv_exc_serr(struct exc_info *ctx)
 #endif
     hv_wdt_breadcrumb('E');
     HV_GUEST_DIAG_INC(serror);
+    /*
+     * T8152 (i0 session 2): keep the exit before this one; the note below overwrites it, and
+     * it is what says whether the SError was pending when EL2 last returned to the guest.
+     */
+    struct hv_fatal_trap prev;
+    hv_fatal_trap_snapshot(&prev);
     hv_get_context(ctx);
     hv_fatal_note_trap(HV_FATAL_TRAP_SERROR, ctx->esr, ctx->elr, ctx->spsr, ctx->far);
     hv_exc_entry();
+    /* Before the proxy: the host ends the session on a guest SError and reads nothing else. */
+    hv_windows_guest_serror_report(ctx->regs, ctx->esr, ctx->elr, ctx->spsr, ctx->far, &prev,
+                                   mrs(PAR_EL1));
     hv_exc_proxy(ctx, START_EXCEPTION_LOWER, EXC_SERROR, NULL);
     hv_exc_exit(ctx);
     hv_wdt_breadcrumb('e');
