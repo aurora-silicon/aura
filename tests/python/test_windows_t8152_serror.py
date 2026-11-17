@@ -43,7 +43,7 @@ REPO = Path(__file__).resolve().parents[2]
 WIN = REPO / "src/hv/windows"
 
 CASES = ["gating", "reentry", "unwind", "seqlock", "report_d3", "report_ras",
-         "report_guest"]
+         "report_guest", "report_return"]
 
 STUBS = {
     "types.h": r'''
@@ -66,6 +66,11 @@ static inline int smp_id(void) { return stub_cpu; }
     "soc.h": '#pragma once\n#include "types.h"\n#define T8152 0x8152\nextern u32 chip_id;\n',
     "hv_ahci.h": '#pragma once\n#include "types.h"\nvoid hv_ahci_fatal_report(u64 now, u64 freq);\n',
     "hv_usb.h": '#pragma once\nvoid hv_usb_fatal_report(void);\n',
+    "hv_gpu.h": '#pragma once\nvoid hv_gpu_fatal_report(void);\n',
+    "hv_input.h": '#pragma once\nvoid hv_input_fatal_report(void);\n',
+    "hv_serror.h": '#pragma once\n#include "types.h"\n'
+                   'void hv_serror_attribute(const u64 *regs, const u64 *sp, u64 esr, u64 elr, '
+                   'u64 spsr);\n',
     "utils.h": r'''
 #pragma once
 #include <stdio.h>
@@ -74,6 +79,7 @@ static inline int smp_id(void) { return stub_cpu; }
 #define GENMASK(h, l) (((~0UL) << (l)) & (~0UL >> (63 - (h))))
 extern u64 stub_par, stub_hpfar, stub_cntpct, stub_cntfrq, stub_esr, stub_far, stub_isr;
 extern u64 stub_pfr0, stub_disr, stub_elr12, stub_esr12, stub_far12, stub_spsr12;
+extern u64 stub_elr2, stub_spsr2;
 u64 stub_read_disr(void);
 void stub_sysop(const char *op);
 #define mrs(r) stub_mrs_##r
@@ -90,6 +96,8 @@ void stub_sysop(const char *op);
 #define stub_mrs_ESR_EL12 stub_esr12
 #define stub_mrs_FAR_EL12 stub_far12
 #define stub_mrs_SPSR_EL12 stub_spsr12
+#define stub_mrs_ELR_EL2 stub_elr2
+#define stub_mrs_SPSR_EL2 stub_spsr2
 #define sysop(op) stub_sysop(op)
 extern char stub_base_storage[];
 #define _base stub_base_storage
@@ -184,11 +192,16 @@ def test_report_on_a_guest_serror(replay):
     text = report(replay, "report_guest")
     assert ("HV: fatal: guest SError on cpu 6: ESR_EL2 0xbe000000 (uncategorized (DFSC 0): no "
             "architectural classification); guest PC 0xfffff80000101004 EL1h SPSR 0x60000005; "
-            "FAR_EL2 0xffffa50012400138 (stale: an SError does not write it)") in text
+            "FAR_EL2 0xffffa50012400138 HPFAR_EL2 0xf400000 (both stale: an SError writes "
+            "neither)") in text
+    assert "AFSR1_EL2 0x5a5a (IMPLEMENTATION DEFINED, raw); ISR_EL1 now 0x0 (A=0: nothing " \
+           "else pending)" in text
+    # The WFI exit of the replay never returned through _hv_return (no return record).
+    assert "cpu 6 that exit has no return record" in text
     assert re.search(r"cpu 6 previous exit S 7 us before: ESR 0x4000001 PC 0xfffff80000101000 "
                      r"EL1h; ISR_EL1 at it 0x100\n", text)
-    assert "cpu 6 SError vs previous exit: taken at that exit's return point and already " \
-           "pending when it exited" in text
+    assert "cpu 6 SError vs previous exit: verdict 1: taken at that exit's return point and " \
+           "already pending when it exited" in text
     assert "HV: fatal: guest SError on cpu 6; T8152 carrier context follows" in text
     assert "PAR_EL1 0x0 at the guest SError" in text
     # The all-CPU part shows the SError's own record on cpu 6 and the other CPU.
@@ -200,8 +213,42 @@ def test_report_on_a_guest_serror(replay):
     assert "HV: fatal: guest x0-x3: 0000000000000000 1111111111111111 2222222222222222 " \
            "3333333333333333\n" in text
     assert "HV: fatal: guest x28-x30: cccccccccccccccc dddddddddddddddd eeeeeeeeeeeeeeee\n" in text
+    assert "HV: fatal: guest SP_EL0 0000000000007ff0 SP_EL1 fffff80000400000\n" in text
+    # The carrier goes on after a guest SError: the "not contained" line is for EL2 errors.
+    assert "not contained" not in text
+    assert "HV: fatal: guest SError: the host decides what follows (run_guest --windows-serror: " \
+           "abort exits the guest, continue resumes it)" in text
     assert text.index("previous exit") < text.index("carrier context follows") < \
-        text.index("AHCI stub report") < text.index("guest x0-x3")
+        text.index("AHCI stub report") < text.index("USB stub report") < \
+        text.index("GPU stub report") < text.index("input stub report") < \
+        text.index("guest x0-x3") < text.index("attribution stub (sp 7ff0 fffff80000400000)")
+
+
+def test_report_with_the_return_record(replay):
+    """R10: the return fence turned an error of the WFI exit's EL2 work into ISR.A at the
+    return; the SError was taken at that return point, so the verdict is EL2 work (code 2)."""
+    text = report(replay, "report_return")
+    assert re.search(r"cpu 6 that exit returned to PC 0xfffff80000101004 EL1h \(SPSR 0x60000005, "
+                     r"A unmasked\) \d+ us before the SError; ISR_EL1 after the return fence "
+                     r"0x100\n", text)
+    assert "cpu 6 SError vs previous exit: verdict 2: taken at that exit's return point; not " \
+           "pending when the guest exited, pending when EL2 returned: raised by the EL2 work " \
+           "of that exit" in text
+
+
+def test_every_return_to_the_guest_is_recorded_after_a_fence():
+    asm = source("src/hv/windows/hv_asm.S")
+    ret = asm[asm.index("_hv_return:"):asm.index("eret", asm.index("_hv_return:"))]
+    assert ret.index("bl hv_fatal_note_return") < ret.index("ldp x0, x1, [sp], #16")
+    # Every vector returns through _hv_return.
+    for vec in ("_v_hv_sync", "_v_hv_irq", "_v_hv_fiq", "_v_hv_serr"):
+        body = asm[asm.index(f"{vec}:"):]
+        body = body[:body.index("b _hv_return")]
+        assert "eret" not in body, vec
+    note = code(function_body(source("src/hv/windows/hv_fatal.c"),
+                              "void hv_fatal_note_return(void)"))
+    assert note.index("if (chip_id != T8152)") < note.index('sysop("dsb sy");') < \
+        note.index("t->ret_isr = mrs(ISR_EL1);")
 
 
 def test_a_pending_serror_is_flagged_on_the_exit_record(replay):
@@ -215,8 +262,8 @@ def test_guest_serror_vector_keeps_the_previous_exit_and_reports_before_the_prox
                               "void hv_exc_serr(struct exc_info *ctx)"))
     snap = body.index("hv_fatal_trap_snapshot(&prev);")
     assert snap < body.index("hv_get_context(ctx);") < body.index("hv_fatal_note_trap(")
-    rep = body.index("hv_windows_guest_serror_report(ctx->regs, ctx->esr, ctx->elr, "
-                     "ctx->spsr, ctx->far, &prev,")
+    rep = body.index("hv_windows_guest_serror_report(ctx->regs, ctx->sp, ctx->esr, ctx->elr, "
+                     "ctx->spsr, ctx->far,")
     assert body.index("hv_exc_entry();") < rep < \
         body.index("hv_exc_proxy(ctx, START_EXCEPTION_LOWER, EXC_SERROR, NULL);")
     note = code(function_body(source("src/hv/windows/hv_fatal.c"),
@@ -473,4 +520,6 @@ def test_every_guest_exit_is_recorded():
 
 
 def test_makefile_links_the_report():
-    assert "ahci_model.o hv_ahci.o hv_vdev_spi.o hv_fatal.o" in source("Makefile")
+    make = source("Makefile")
+    assert "ahci_model.o hv_ahci.o hv_vdev_spi.o hv_fatal.o" in make
+    assert "mtp_handoff.o hv_serror.o" in make

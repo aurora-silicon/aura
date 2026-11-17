@@ -54,6 +54,13 @@ struct hv_fatal_trap {
     u64 esr, elr, spsr, far, hpfar;
     u64 cntpct;
     u64 isr; /* ISR_EL1 at the exit, before EL2 did anything: A (bit 8) = SError pending */
+    /*
+     * The return to the guest that ended this exit (hv_fatal_note_return(), from _hv_return
+     * after a `dsb sy`): ELR_EL2 and SPSR_EL2 as the ERET uses them, ISR_EL1 then, and when.
+     * Zero until that return.  ISR.A clear at the exit but set here means the EL2 work of this
+     * exit raised an SError (i0 session 2: the guest SError taken at a return point).
+     */
+    u64 ret_elr, ret_spsr, ret_isr, ret_cntpct;
 };
 
 struct hv_fatal_fb {
@@ -124,6 +131,13 @@ static inline u64 hv_fatal_read(const u64 *seq, const void *src, void *dst, u64 
  * says "in progress".
  */
 void hv_fatal_note_trap(u64 kind, u64 esr, u64 elr, u64 spsr, u64 far);
+/*
+ * hv_fatal_note_return(): _hv_return, every return to the guest (all four vectors, fast paths
+ * included), after the C handler and before the guest registers are reloaded.  `dsb sy` first,
+ * so a device access EL2 made in this exit has completed and its error is pending in ISR_EL1
+ * (PSTATE.A is masked at EL2 here) before the record reads it.  T8152 only.
+ */
+void hv_fatal_note_return(void);
 void hv_fatal_stage(u64 stage);
 void hv_fatal_fb_begin(u64 start, u64 end);
 void hv_fatal_fb_end(void);
@@ -174,9 +188,28 @@ void hv_windows_fatal_report(u64 *regs, const char *what, u64 par, const char *p
  * still needs its report.
  */
 void hv_fatal_trap_snapshot(struct hv_fatal_trap *out);
-const char *hv_fatal_serror_relation(const struct hv_fatal_trap *prev, u64 elr, u64 age_us);
-void hv_windows_guest_serror_report(const u64 *regs, u64 esr, u64 elr, u64 spsr, u64 far,
-                                    const struct hv_fatal_trap *prev, u64 par);
+/*
+ * Verdict codes of hv_fatal_serror_relation(), also printed as "verdict <code>" so a log
+ * search does not depend on the wording.
+ */
+#define HV_SERR_REL_NONE         0 /* no earlier exit recorded */
+#define HV_SERR_REL_BEFORE_EXIT  1 /* pending already when the guest exited */
+#define HV_SERR_REL_EL2_WORK     2 /* not pending at the exit, pending at the return: EL2 */
+#define HV_SERR_REL_EL2_LATE     3 /* at the return point, guest ran nothing, after the fence */
+#define HV_SERR_REL_GUEST_RAN    4 /* the guest ran on: its own access or a late completion */
+#define HV_SERR_REL_MASKED_RAN   5 /* pending at the return, taken later (guest masked A) */
+#define HV_SERR_REL_STALE        6 /* at the return point but long after it */
+const char *hv_fatal_serror_relation(const struct hv_fatal_trap *prev, u64 elr, u64 age_us,
+                                     int *code);
+/*
+ * `sp` are the guest's SP_EL0 and SP_EL1, `afsr1` AFSR1_EL2 at the vector (IMPLEMENTATION
+ * DEFINED contents; printed raw).  After the records and registers it runs
+ * hv_serror_attribute() (hv_serror.h): which guest addresses near the SError reach a
+ * passthrough or identity region.
+ */
+void hv_windows_guest_serror_report(const u64 *regs, const u64 *sp, u64 esr, u64 elr, u64 spsr,
+                                    u64 far, u64 afsr1, const struct hv_fatal_trap *prev,
+                                    u64 par);
 
 /* hv_wdt.c: this CPU's last eight breadcrumbs, oldest in the top byte. */
 u64 hv_wdt_breadcrumbs_read(int cpu);

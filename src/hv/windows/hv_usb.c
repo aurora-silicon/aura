@@ -118,6 +118,8 @@ struct usb_port {
     /* report */
     u64 irqs, irqs_seen, irq_tick, report_tick;
     u32 usbsts, portsc[2], exc_seen[2];
+    /* fatal report: CNTPCT of the last tick read of the controller and of the last line */
+    u64 read_at, irq_at;
 };
 
 static struct usb_port ports[] = {
@@ -532,6 +534,7 @@ static void reset_port_state(struct usb_port *p)
     p->streams_on = p->allowed = p->mapped = p->owned = false;
     p->attached = p->storm = false;
     p->irqs = p->irqs_seen = p->irq_tick = p->report_tick = 0;
+    p->read_at = p->irq_at = 0;
     p->usbsts = 0;
     p->portsc[0] = p->portsc[1] = 0;
     p->exc_seen[0] = p->exc_seen[1] = 0;
@@ -657,8 +660,10 @@ void hv_usb_emergency_stop(void)
 void hv_usb_note_irq(u32 physical)
 {
     for (unsigned int i = 0; i < N_PORTS; i++)
-        if (ports[i].irq == physical)
+        if (ports[i].irq == physical) {
             __atomic_fetch_add(&ports[i].irqs, 1, __ATOMIC_RELAXED);
+            __atomic_store_n(&ports[i].irq_at, mrs(CNTPCT_EL0), __ATOMIC_RELAXED);
+        }
 }
 
 /* ---- report ------------------------------------------------------------------------------- */
@@ -738,6 +743,7 @@ void hv_usb_report(void)
             }
         }
         storm_guard(p, now, freq);
+        p->read_at = mrs(CNTPCT_EL0);
         bool changed = sts != p->usbsts || sc[0] != p->portsc[0] || sc[1] != p->portsc[1];
         bool periodic = freq && now - p->report_tick >= 10 * freq;
         p->usbsts = sts;
@@ -754,8 +760,16 @@ void hv_usb_report(void)
     }
 }
 
+static u64 fatal_age_ms(u64 now, u64 then, u64 freq)
+{
+    if (!then || then > now || freq < 1000)
+        return ~0UL;
+    return (now - then) / (freq / 1000);
+}
+
 void hv_usb_fatal_report(void)
 {
+    u64 now = mrs(CNTPCT_EL0), freq = mrs(CNTFRQ_EL0);
     for (unsigned int i = 0; i < N_PORTS; i++) {
         struct usb_port *p = &ports[i];
         if (!p->owned && !p->attached && !p->streams_on)
@@ -765,6 +779,21 @@ void hv_usb_fatal_report(void)
                p->name ? p->name : "?", (int)p->attached, p->usbsts, p->portsc[0], p->portsc[1],
                __atomic_load_n(&p->irqs, __ATOMIC_RELAXED), p->exc_seen[0], p->exc_seen[1],
                p->storm ? ", storm" : "");
+        u64 rd = fatal_age_ms(now, p->read_at, freq);
+        u64 irq = fatal_age_ms(now, __atomic_load_n(&p->irq_at, __ATOMIC_RELAXED), freq);
+        printf("HV: fatal: USB %s: xHCI [0x%lx, 0x%lx) %s; carrier last read the controller "
+               "(USBSTS, PORTSC, DART, dwc3) ",
+               p->name ? p->name : "?", p->xhci, p->xhci + HV_USB_XHCI_SIZE,
+               p->mapped ? "mapped to the guest (Device-nGnRnE passthrough)" : "not mapped");
+        if (rd == ~0UL)
+            printf("never");
+        else
+            printf("%lu ms ago", rd);
+        printf("; last line ");
+        if (irq == ~0UL)
+            printf("never\n");
+        else
+            printf("%lu ms ago\n", irq);
     }
 }
 

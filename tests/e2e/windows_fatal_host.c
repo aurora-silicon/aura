@@ -16,7 +16,11 @@
  *     blamed on the next one; the converter record is opened before its fence (an error
  *     pending from the idle path's trap handling blamed on the band) or closed before it;
  *  R7 HPFAR is recorded for exits it does not describe; the IPA is decoded wrongly;
- *  R8 the D3 run 1 syndrome (ESR 0xbe000000) is classified as containable.
+ *  R8 the D3 run 1 syndrome (ESR 0xbe000000) is classified as containable;
+ *  R9 (i0 session 2) a guest SError is not set against the previous exit of its CPU;
+ *  R10 the return record reads ISR_EL1 before its fence (an error from the exit's EL2 work
+ *      then reads as the guest's), or an exit's note leaves the previous return record in
+ *      place, or the verdict misreads the exit/return ISR pair.
  * The report text itself is printed on stdout between "report-begin"/"report-end" markers for
  * the Python side to check; every case ends with one JSON line.
  * Usage: windows_fatal_host
@@ -35,6 +39,10 @@ u32 chip_id = T8152;
 int stub_cpu;
 u64 stub_par, stub_hpfar, stub_cntpct = 1000000, stub_cntfrq = 24000000, stub_esr, stub_far;
 u64 stub_isr, stub_pfr0, stub_disr, stub_elr12, stub_esr12, stub_far12, stub_spsr12;
+u64 stub_elr2, stub_spsr2;
+/* A fence makes this pending (R10): stub_isr gets it at the next "dsb sy". */
+u64 stub_isr_on_fence;
+int stub_attributions, stub_gpu_reports, stub_input_reports;
 char stub_base_storage[16];
 int stub_ahci_reports;
 u64 stub_crumbs[MAX_CPUS];
@@ -46,6 +54,10 @@ static u64 fb_seq_at_fence[64];
 
 void stub_sysop(const char *op)
 {
+    if (!strcmp(op, "dsb sy") && stub_isr_on_fence) {
+        stub_isr |= stub_isr_on_fence;
+        stub_isr_on_fence = 0;
+    }
     if (!strcmp(op, "dsb sy") && fences < 64) {
         stage_at_fence[fences] = hv_fatal_cpus[stub_cpu].stage;
         fb_seq_at_fence[fences] = hv_fatal_cpus[stub_cpu].fb.seq;
@@ -72,6 +84,30 @@ void hv_ahci_fatal_report(u64 now, u64 freq)
 void hv_usb_fatal_report(void)
 {
     printf("HV: fatal: USB stub report\n");
+}
+
+/* G0 and I0 parts (hv_gpu.c, hv_input.c); recorded values only. */
+void hv_gpu_fatal_report(void)
+{
+    stub_gpu_reports++;
+    printf("HV: fatal: GPU stub report\n");
+}
+
+void hv_input_fatal_report(void)
+{
+    stub_input_reports++;
+    printf("HV: fatal: input stub report\n");
+}
+
+/* hv_serror.c: replayed by windows_serror_host.c; here only its place in the report. */
+void hv_serror_attribute(const u64 *regs, const u64 *sp, u64 esr, u64 elr, u64 spsr)
+{
+    (void)regs;
+    (void)esr;
+    (void)elr;
+    (void)spsr;
+    stub_attributions++;
+    printf("HV: fatal: attribution stub (sp %lx %lx)\n", sp ? sp[0] : 0, sp ? sp[1] : 0);
 }
 
 u64 hv_wdt_breadcrumbs_read(int cpu)
@@ -124,6 +160,8 @@ static void reset_state(void)
     stub_cpu = 0;
     fences = 0;
     stub_ahci_reports = 0;
+    stub_attributions = stub_gpu_reports = stub_input_reports = 0;
+    stub_isr_on_fence = 0;
 }
 
 /* ---- cases ----------------------------------------------------------------------------- */
@@ -393,22 +431,22 @@ static void case_guest(void)
     /* Relation decoder: return points of each exit kind. */
     struct hv_fatal_trap t = {.kind = HV_FATAL_TRAP_SYNC, .esr = 0x04000001UL /* WFI */,
                               .elr = 0x1000, .cntpct = 1};
-    CHECK(strstr(hv_fatal_serror_relation(&t, 0x1004, 5), "taken at that exit's return point: "
+    CHECK(strstr(hv_fatal_serror_relation(&t, 0x1004, 5, NULL), "taken at that exit's return point: "
                                                           "pending when EL2 returned"));
-    CHECK(strstr(hv_fatal_serror_relation(&t, 0x1000, 5), "the guest ran on"));
-    CHECK(strstr(hv_fatal_serror_relation(&t, 0x1004, 20000), "not attributable"));
+    CHECK(strstr(hv_fatal_serror_relation(&t, 0x1000, 5, NULL), "the guest ran on"));
+    CHECK(strstr(hv_fatal_serror_relation(&t, 0x1004, 20000, NULL), "not attributable"));
     t.esr = 0x5a000000UL; /* HVC: ELR_EL2 is already past it */
-    CHECK(strstr(hv_fatal_serror_relation(&t, 0x1000, 5), "return point"));
-    CHECK(strstr(hv_fatal_serror_relation(&t, 0x1004, 5), "the guest ran on"));
+    CHECK(strstr(hv_fatal_serror_relation(&t, 0x1000, 5, NULL), "return point"));
+    CHECK(strstr(hv_fatal_serror_relation(&t, 0x1004, 5, NULL), "the guest ran on"));
     t.kind = HV_FATAL_TRAP_IRQ;
     t.esr = 0;
-    CHECK(strstr(hv_fatal_serror_relation(&t, 0x1000, 5), "return point"));
+    CHECK(strstr(hv_fatal_serror_relation(&t, 0x1000, 5, NULL), "return point"));
     t.isr = BIT(8);
-    CHECK(strstr(hv_fatal_serror_relation(&t, 0x1000, 5), "already pending when it exited"));
-    CHECK(strstr(hv_fatal_serror_relation(&t, 0x2000, 5), "already pending at it"));
-    CHECK(strstr(hv_fatal_serror_relation(NULL, 0x1000, 5), "no earlier exit"));
+    CHECK(strstr(hv_fatal_serror_relation(&t, 0x1000, 5, NULL), "already pending when it exited"));
+    CHECK(strstr(hv_fatal_serror_relation(&t, 0x2000, 5, NULL), "already pending at it"));
+    CHECK(strstr(hv_fatal_serror_relation(NULL, 0x1000, 5, NULL), "no earlier exit"));
     t.cntpct = 0;
-    CHECK(strstr(hv_fatal_serror_relation(&t, 0x1000, 5), "no earlier exit"));
+    CHECK(strstr(hv_fatal_serror_relation(&t, 0x1000, 5, NULL), "no earlier exit"));
 
     /* cpu 0: some other exit, so the all-CPU part has a second CPU. */
     stub_cpu = 0;
@@ -437,22 +475,124 @@ static void case_guest(void)
     for (int i = 0; i < 32; i++)
         regs[i] = 0x1111111111111111UL * (u64)(i % 16);
 
+    u64 sp[2] = {0x7ff0, 0xfffff80000400000UL};
+    stub_hpfar = 0xf400000;
     printf("report-begin %s\n", current);
-    hv_windows_guest_serror_report(regs, 0xbe000000UL, 0xfffff80000101004UL, 0x60000005,
-                                   0xffffa50012400138UL, &prev, 0);
+    hv_windows_guest_serror_report(regs, sp, 0xbe000000UL, 0xfffff80000101004UL, 0x60000005,
+                                   0xffffa50012400138UL, 0x5a5a, &prev, 0);
     printf("report-end %s\n", current);
     EQ(stub_ahci_reports, 1);
+    EQ(stub_gpu_reports, 1);
+    EQ(stub_input_reports, 1);
+    EQ(stub_attributions, 1);
     EQ(hv_fatal_reporting, 0);
 
     /* Off T8152, or before entry: nothing; the snapshot is empty off T8152. */
     chip_id = 0x8142;
     hv_fatal_trap_snapshot(&prev);
     EQ(prev.cntpct, 0);
-    hv_windows_guest_serror_report(regs, 0, 0, 0, 0, &prev, 0);
+    hv_windows_guest_serror_report(regs, sp, 0, 0, 0, 0, 0, &prev, 0);
     chip_id = T8152;
     hv_fatal_armed = false;
-    hv_windows_guest_serror_report(regs, 0, 0, 0, 0, &prev, 0);
+    hv_windows_guest_serror_report(regs, sp, 0, 0, 0, 0, 0, &prev, 0);
     EQ(stub_ahci_reports, 1);
+    EQ(stub_attributions, 1);
+    end(before);
+}
+
+/*
+ * R10: the return record.  _hv_return calls hv_fatal_note_return() after every exit: the fence
+ * comes before the ISR read (an error the exit's EL2 accesses raised is pending by then), a new
+ * exit's note clears the previous return record, and the verdict reads the pair.  Synthetic.
+ */
+static void case_return(void)
+{
+    int before = failures;
+    begin("report_return");
+    reset_state();
+    hv_fatal_armed = true;
+    stub_pfr0 = 0;
+    stub_cpu = 6;
+    stub_cntpct = 2000000;
+    stub_isr = 0;
+    int code = -1;
+
+    /* A WFI exit (the idle path), not pending at the exit; its EL2 work raised an SError that
+     * the return fence makes pending. */
+    hv_fatal_note_trap(HV_FATAL_TRAP_SYNC, 0x04000001UL, 0xfffff80000101000UL, 0x60000005, 0);
+    EQ(hv_fatal_cpus[6].trap.isr, 0);
+    int f0 = fences;
+    stub_isr_on_fence = BIT(8);
+    stub_elr2 = 0xfffff80000101004UL;
+    stub_spsr2 = 0x60000005;
+    stub_cntpct += 24 * 3;
+    hv_fatal_note_return();
+    EQ(fences, f0 + 1);
+    EQ(hv_fatal_cpus[6].trap.ret_isr, BIT(8)); /* read after the fence */
+    EQ(hv_fatal_cpus[6].trap.ret_elr, 0xfffff80000101004UL);
+    EQ(hv_fatal_cpus[6].trap.ret_spsr, 0x60000005);
+    EQ(hv_fatal_cpus[6].trap.seq & 1, 0);
+
+    struct hv_fatal_trap prev;
+    hv_fatal_trap_snapshot(&prev);
+    CHECK(strstr(hv_fatal_serror_relation(&prev, 0xfffff80000101004UL, 5, &code),
+                 "raised by the EL2 work of that exit"));
+    EQ(code, HV_SERR_REL_EL2_WORK);
+    /* Taken later: the guest ran with A masked. */
+    CHECK(strstr(hv_fatal_serror_relation(&prev, 0xfffff80000101100UL, 5, &code),
+                 "raised by the EL2 work of that exit"));
+    EQ(code, HV_SERR_REL_MASKED_RAN);
+    /* Pending at the exit as well: raised before it, whichever PC. */
+    prev.isr = BIT(8);
+    hv_fatal_serror_relation(&prev, 0xfffff80000101004UL, 5, &code);
+    EQ(code, HV_SERR_REL_BEFORE_EXIT);
+    hv_fatal_serror_relation(&prev, 0xfffff80000101100UL, 5, &code);
+    EQ(code, HV_SERR_REL_MASKED_RAN);
+    /* Neither: at the return point (the guest ran nothing) -> late EL2; elsewhere -> guest. */
+    prev.isr = prev.ret_isr = 0;
+    CHECK(strstr(hv_fatal_serror_relation(&prev, 0xfffff80000101004UL, 5, &code),
+                 "arrived after the fence"));
+    EQ(code, HV_SERR_REL_EL2_LATE);
+    hv_fatal_serror_relation(&prev, 0xfffff80000101100UL, 5, &code);
+    EQ(code, HV_SERR_REL_GUEST_RAN);
+    hv_fatal_serror_relation(&prev, 0xfffff80000101004UL, 20000, &code);
+    EQ(code, HV_SERR_REL_STALE);
+    /* The recorded return point wins over the computed one (a handler that moved ELR). */
+    prev.ret_elr = 0xfffff80000200000UL;
+    hv_fatal_serror_relation(&prev, 0xfffff80000200000UL, 5, &code);
+    EQ(code, HV_SERR_REL_EL2_LATE);
+    hv_fatal_serror_relation(&prev, 0xfffff80000101004UL, 5, &code);
+    EQ(code, HV_SERR_REL_GUEST_RAN);
+    hv_fatal_serror_relation(NULL, 0, 5, &code);
+    EQ(code, HV_SERR_REL_NONE);
+
+    /* The next exit's note clears the return record. */
+    stub_isr = 0;
+    hv_fatal_note_trap(HV_FATAL_TRAP_FIQ_FAST, 0, 0xfffff80000101004UL, 0x60000005, 0);
+    EQ(hv_fatal_cpus[6].trap.ret_cntpct, 0);
+    EQ(hv_fatal_cpus[6].trap.ret_isr, 0);
+
+    /* The report: the return line and the verdict code; then the per-CPU summary. */
+    hv_fatal_note_trap(HV_FATAL_TRAP_SYNC, 0x04000001UL, 0xfffff80000101000UL, 0x60000005, 0);
+    stub_isr_on_fence = BIT(8);
+    hv_fatal_note_return();
+    hv_fatal_trap_snapshot(&prev);
+    stub_isr = 0;
+    stub_cntpct += 24 * 2;
+    hv_fatal_note_trap(HV_FATAL_TRAP_SERROR, 0xbe000000UL, 0xfffff80000101004UL, 0x60000005,
+                       0);
+    u64 regs[31] = {0};
+    u64 sp[2] = {0, 0};
+    printf("report-begin %s\n", current);
+    hv_windows_guest_serror_report(regs, sp, 0xbe000000UL, 0xfffff80000101004UL, 0x60000005, 0,
+                                   0, &prev, 0);
+    printf("report-end %s\n", current);
+
+    /* Off T8152 the return note is a no-op (other chips share _hv_return). */
+    chip_id = 0x8142;
+    f0 = fences;
+    hv_fatal_note_return();
+    EQ(fences, f0);
     end(before);
 }
 
@@ -465,5 +605,6 @@ int main(void)
     case_report(0);
     case_report(1);
     case_guest();
+    case_return();
     return failures ? 1 : 0;
 }

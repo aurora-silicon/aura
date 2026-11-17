@@ -132,6 +132,12 @@ parser.add_argument('--windows-input', default='off', metavar='{off,host}',
                          'J804_WINDOWS_INPUT, marker J804INP1 at 0x140), --windows-serial cdc '
                          'and the m6input driver in the Windows image. host+kbd/host+kbd+tp '
                          '(the internal keyboard and trackpad) are not in this carrier yet.')
+parser.add_argument('--windows-serror', choices=('abort', 'continue'), default='abort',
+                    help='What a guest (lower-EL) SError does after the carrier has printed its '
+                         'report: "abort" exits the guest (default, unchanged); "continue" logs '
+                         'the guest frame and resumes the guest, at most 8 times per session, '
+                         'to collect more reports. The SError is consumed; the access that '
+                         'raised it is lost, so a continued session is diagnostic only.')
 parser.add_argument('payload', type=pathlib.Path)
 parser.add_argument('boot_args', default=[], nargs="*")
 args = parser.parse_args()
@@ -718,6 +724,7 @@ def run_windows_t8152(caps):
     hv.windows_usb = usb_spelling(usb_ports)
     hv.windows_gpu = gpu_mode
     hv.windows_input = "+".join(input_sources) if input_sources else "off"
+    hv.windows_serror = args.windows_serror
     hv.windows_ipi = args.windows_ipi
     hv.windows_gic_cpuif = args.windows_gic_cpuif or "software"
     hv.windows_wfi = args.windows_wfi

@@ -866,6 +866,38 @@ static const struct t8152_range *mmio_hit(u64 start, u64 end)
     return NULL;
 }
 
+int hv_t8152_describe_ipa(u64 ipa, const char **name)
+{
+    *name = NULL;
+    if (!armed)
+        return HV_T8152_IPA_UNLISTED;
+    if (ram_set && ipa >= ram_start && ipa < ram_end) {
+        *name = "guest RAM";
+        return HV_T8152_IPA_RAM;
+    }
+    for (unsigned int i = 0; i < allow_count; i++) {
+        if (ipa >= allow[i].ipa && ipa - allow[i].ipa < allow[i].end - allow[i].start) {
+            *name = allow[i].name;
+            return HV_T8152_IPA_EXCEPTION;
+        }
+    }
+    const struct t8152_range *hit = mmio_hit(ipa, ipa + 1);
+    if (hit) {
+        *name = hit->name;
+        return HV_T8152_IPA_MMIO;
+    }
+    hit = deny_hit(ipa, ipa + 1);
+    if (hit) {
+        *name = hit->name;
+        return HV_T8152_IPA_DENIED;
+    }
+    if (ipa >= dram_start && ipa < dram_end) {
+        *name = "RAM outside the guest window";
+        return HV_T8152_IPA_HOST_RAM;
+    }
+    return HV_T8152_IPA_UNLISTED;
+}
+
 /*
  * The one rule for a mapping that reaches a physical address: either through
  * a hardware leaf (the guest touches it directly) or a software map leaf (the

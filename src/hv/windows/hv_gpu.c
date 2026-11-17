@@ -39,6 +39,8 @@ static u64 handoff_pa, pool_base, pool_size;
 static u32 state;
 static u64 class_hits[GPU_C_COUNT], total_hits, gfx_hits;
 static u32 logged;
+/* fatal report: the last logging-hook access (address, 1 = write) */
+static u64 last_hook_addr, last_hook_write;
 
 #ifdef HV_GPU_HOST_TEST
 #define gpu_read_text hv_gpu_host_read_text
@@ -233,6 +235,8 @@ static bool gpu_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int w
 
     __atomic_add_fetch(&class_hits[cls < GPU_C_COUNT ? cls : 0], 1, __ATOMIC_RELAXED);
     __atomic_add_fetch(&total_hits, 1, __ATOMIC_RELAXED);
+    __atomic_store_n(&last_hook_addr, addr, __ATOMIC_RELAXED);
+    __atomic_store_n(&last_hook_write, write ? 1 : 0, __ATOMIC_RELAXED);
     if (gfx)
         __atomic_add_fetch(&gfx_hits, 1, __ATOMIC_RELAXED);
     if (__atomic_fetch_add(&logged, 1, __ATOMIC_RELAXED) < HV_GPU_LOG_LIMIT)
@@ -247,6 +251,28 @@ static bool gpu_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int w
             val[1] = 0;
     }
     return true;
+}
+
+void hv_gpu_fatal_report(void)
+{
+    if (!session_used)
+        return;
+    u32 hooked_ranges = 0;
+    for (u32 i = 0; i < table_count; i++)
+        if (table[i].flags & GPU_RF_HOOKED)
+            hooked_ranges++;
+    printf("HV: fatal: GPU: state 0x%x, admitted %d, hooks %d; %u ranges, %u behind the logging "
+           "hooks, none passed through (firmware regions are registered identity exceptions "
+           "without a stage-2 leaf in G0); handoff page IPA 0x%lx read-only; pool [0x%lx, "
+           "0x%lx) in guest RAM\n",
+           state, (int)admitted, (int)hooked, table_count, hooked_ranges, handoff_pa, pool_base,
+           pool_base + pool_size);
+    u64 hits = __atomic_load_n(&total_hits, __ATOMIC_RELAXED);
+    if (hooked || hits)
+        printf("HV: fatal: GPU: logging hooks hit %lu times (GFX mailbox %lu); last %s 0x%lx\n",
+               hits, __atomic_load_n(&gfx_hits, __ATOMIC_RELAXED),
+               __atomic_load_n(&last_hook_write, __ATOMIC_RELAXED) ? "write" : "read",
+               __atomic_load_n(&last_hook_addr, __ATOMIC_RELAXED));
 }
 
 static int hook(void)
@@ -341,6 +367,7 @@ void hv_gpu_host_new_session(void)
     state = 0;
     memset(class_hits, 0, sizeof(class_hits));
     total_hits = gfx_hits = 0;
+    last_hook_addr = last_hook_write = 0;
     logged = 0;
 }
 

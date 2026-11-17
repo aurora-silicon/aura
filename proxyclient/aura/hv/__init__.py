@@ -100,6 +100,11 @@ class HV(Reloadable):
         self.windows_framebuffer = "native"
         self.windows_guest_compatibility = "none"
         self.windows_abort_reason = None
+        # Lower-EL SError policy (run_guest --windows-serror): "abort" exits the guest (the
+        # default, as before); "continue" logs the frame and resumes the guest, at most
+        # WINDOWS_SERROR_CONTINUE_MAX times per session, then aborts.
+        self.windows_serror = "abort"
+        self.windows_serrors_continued = 0
         self.windows_usb = "disabled"
         self.windows_gpu = "off"
         self.windows_usb_removed = []
@@ -991,8 +996,12 @@ class HV(Reloadable):
             self.iface.writemem(self.exc_info, new_info)
             self._info_data = new_info
 
+    WINDOWS_SERROR_CONTINUE_MAX = 8
+
     def handle_exception(self, reason, code, info):
         if self.windows:
+            if self._windows_serror_continue(reason, code, info):
+                return
             self._abort_windows_guest(reason, code, info)
             return
         self.exc_info = info
@@ -1088,6 +1097,27 @@ class HV(Reloadable):
         if reason == START.EXCEPTION_LOWER:
             self._log_windows_exc_info(info)
         self.p.exit(EXC_RET.EXIT_GUEST)
+
+    def _windows_serror_continue(self, reason, code, info):
+        """--windows-serror continue: a guest SError (the carrier has already printed its
+        report) is logged with its frame and the guest resumed where it was taken.  The SError
+        is consumed by being taken; what the failed access did is unknown, so this is for
+        collecting more reports, not for a usable session.  Bounded: after
+        WINDOWS_SERROR_CONTINUE_MAX the next one aborts as usual.  Any other exception aborts."""
+        if (self.windows_serror != "continue" or int(reason) != int(START.EXCEPTION_LOWER)
+                or int(code) != int(EXC.SERROR)):
+            return False
+        if self.windows_serrors_continued >= self.WINDOWS_SERROR_CONTINUE_MAX:
+            self.log(f"Guest SError: {self.windows_serrors_continued} already continued this "
+                     f"session (limit {self.WINDOWS_SERROR_CONTINUE_MAX}); aborting")
+            return False
+        self.windows_serrors_continued += 1
+        self.log(f"Guest SError {self.windows_serrors_continued}/"
+                 f"{self.WINDOWS_SERROR_CONTINUE_MAX} at {info:#x}: --windows-serror continue, "
+                 f"resuming the guest")
+        self._log_windows_exc_info(info)
+        self.p.exit(EXC_RET.HANDLED)
+        return True
 
     def _log_windows_exc_info(self, info):
         """For a guest exception, `info` is the carrier's struct exc_info on the trapping CPU's

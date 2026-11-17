@@ -107,4 +107,11 @@ bool hv_input_owns_vuart_rx(void);
 /* The 1 Hz HV report: one line when the counters moved. */
 void hv_input_report(void);
 
+/*
+ * The EL2 fatal report's input part (guest SError attribution): attach state, the counters
+ * (read without the lock: another CPU may hold it), the guest's page accesses with the last
+ * one, and the last host-feed poll (the boot CPU's read of the proxy's USB CDC link).
+ */
+void hv_input_fatal_report(void);
+
 #endif

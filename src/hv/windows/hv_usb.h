@@ -111,7 +111,11 @@ void hv_usb_note_irq(u32 physical);
 /* 1 Hz, from the host tick's report: USBSTS/PORTSC, DART exceptions, dwc3 drift, storms. */
 void hv_usb_report(void);
 
-/* The EL2 fatal report's USB part: recorded values only, no MMIO. */
+/*
+ * The EL2 fatal report's USB part: recorded values only, no MMIO.  With each port's xHCI
+ * passthrough window and when the carrier last read the controller (the host tick's 1 Hz
+ * report, from the boot CPU) and last saw its line, for the guest SError attribution.
+ */
 void hv_usb_fatal_report(void);
 
 /* hv_exc.c: hardware lines masked by the T8152 IRQ path for want of an owned alias. */

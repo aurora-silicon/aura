@@ -529,6 +529,74 @@ The replay's register values are synthetic (a PA inside the synthetic window
 `0x10100000000:0x10561600000`, made-up kernel and user VAs, a FAR that keeps the PxCI offset
 0x138); none is copied from the run log.
 
+## Guest (lower-EL) SErrors
+
+i0 session 2 (USB drd1 + GPU admit + input host, AHCI disk) ended about 500 s after entry, at
+the logon disk burst, on an SError the guest took on the boot CPU (cpu 6, the CPU that runs the
+host tick, the proxy link, the vUART and input polls). ESR ISS 0: no class, no address. Before
+this change the carrier printed nothing and the host exited the guest without reading the
+frame. The cause is not known. The carrier now prints a report before the host decides:
+
+- The SError line: ESR_EL2 with its class, guest PC, mode and SPSR, FAR_EL2 and HPFAR_EL2
+  (both marked stale: an SError writes neither), AFSR1_EL2 raw, ISR_EL1 now.
+- The previous exit of that CPU (saved before the SError's own record overwrites it): kind,
+  ESR, PC, IPA for a data abort, ISR_EL1 at the exit, and its return: every return to the
+  guest goes through `_hv_return`, which calls `hv_fatal_note_return()`. That function runs
+  `dsb sy` with PSTATE.A masked and then records ELR_EL2, SPSR_EL2 and ISR_EL1. An error
+  that the exit's own EL2 device accesses raised is therefore pending there and recorded.
+- A verdict line, `SError vs previous exit: verdict <n>: <text>`:
+  - 1: it was already pending when the guest exited. A guest access or earlier EL2 work raised
+    it.
+  - 2: it was not pending at the exit but was pending after the return fence, and it was taken
+    at the return point. The EL2 work of that exit raised it. The exit kind and ESR name the
+    path:
+    - EC 0x01: the WFI idle path. "SError pending after that band" means the converter.
+    - EC 0x18 or 0x3f: sysreg/PMU emulation.
+    - EC 0x16 or 0x17: HVC/SMC (PSCI).
+    - F: the tick, with its stage.
+    - EC 0x24: an emulated page, named by its IPA.
+  - 3: it was taken at the return point but was not pending at the fence, and the guest ran
+    nothing in between. This is most likely EL2 work whose error arrived late.
+  - 4: the guest ran on. Its own access raised it, or something completed late.
+  - 5: it was pending at the return and taken later, with the guest running with A masked.
+  - 6: it was taken at the return point but long after it, so it cannot be attributed.
+  - 0: no exit was recorded.
+- Every CPU's records and breadcrumbs, then the AHCI, USB, GPU and input records:
+  - USB: the xHCI window, whether it is mapped, and when the carrier last read the controller
+    and last saw its line.
+  - GPU: state, ranges, handoff page and pool, the logging-hook hits and the last access.
+  - Input: the counters, guest page accesses with the last one, and the last host-feed poll.
+- The guest x0-x30, SP_EL0 and SP_EL1.
+- Last, the attribution (`hv_serror.c`). It is circumstantial. It walks the guest's stage 1 in
+  software (TTBR0/1_EL12 and TCR_EL12, descriptors read only from the guest RAM window, never
+  AT). It lists:
+  - the loads and stores in the eight instructions before the PC and the one at it, with the
+    address each one names;
+  - every register whose value translates to a non-RAM IPA, or is itself the address of a
+    passthrough, identity or denied region.
+
+  Each entry gets what stage 2 and the policy lists say the IPA is. Only a passthrough (AIC,
+  xHCI) or a mapped identity exception reaches hardware, so only those are counted as
+  CANDIDATEs. An emulated page or an unmapped IPA traps synchronously first. The closing line
+  gives the count.
+
+The carrier then forwards the SError to the host as before. The host logs the frame (ESR, ELR
+and its PA, SPSR, FAR, SP, x0-x30, the code around ELR). `run_guest.py --windows-serror
+{abort,continue}` sets what happens next:
+- `abort` (the default, unchanged) exits the guest.
+- `continue` resumes the guest where the SError was taken, at most 8 times per session, and
+  then aborts.
+
+The SError is consumed by being taken, and the access that raised it is lost, so a continued
+session only collects more reports. The proxyclient must be from this branch for the host half.
+
+Host tests: the `report_guest` and `report_return` cases of `windows_fatal_host.c` (the return
+fence comes before the ISR read, an exit's note clears the old return record, each verdict),
+`tests/e2e/windows_serror_host.c` (the stage-1 walk for 4 and 16 KiB granules, blocks, faults
+and reads that leave RAM; the load/store decode against assembler encodings; the
+classification; the report on a synthetic xHCI load), and `test_windows_t8152_serror_attr.py`
+for the source rules and the launcher policy.
+
 ## D4: USB keyboard and mouse (usb-drd1 xHCI passthrough)
 
 Status: built and host-tested only (`tests/python/test_windows_t8152_usb.py`). Nothing of it

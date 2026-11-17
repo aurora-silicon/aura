@@ -67,6 +67,14 @@ enum hv_gpu_err {
 /* P_HV_WINDOWS_GPU. */
 u64 hv_gpu_proxy(u64 op, u64 a1, u64 a2);
 
+/*
+ * The EL2 fatal report's GPU part (guest SError attribution): the session state, the handoff
+ * page and pool, how many admitted firmware ranges there are (registered identity exceptions,
+ * never mapped in G0), and the logging hooks' hit count with the last access.  Recorded values
+ * only, no locks, no MMIO.
+ */
+void hv_gpu_fatal_report(void);
+
 #ifdef HV_GPU_HOST_TEST
 void hv_gpu_host_new_session(void);
 bool hv_gpu_host_read_text(u64 phys, void *buf, u64 size);

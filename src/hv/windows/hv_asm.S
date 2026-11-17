@@ -83,6 +83,12 @@ _hv_entry:
 .globl _hv_return
 .type _hv_return, @function
 _hv_return:
+    /*
+     * T8152: record ELR/SPSR/ISR_EL1 of this return after a fence (hv_fatal.h).  The guest
+     * registers are reloaded from the frame below, so the call may clobber them; sp is the
+     * 16-byte aligned frame.  Other chips return at once from the C side.
+     */
+    bl hv_fatal_note_return
     ldp x0, x1, [sp], #16
     ldp x2, x3, [sp], #16
     ldp x4, x5, [sp], #16

@@ -81,6 +81,20 @@ void hv_t8152_allow_rollback(unsigned int mark, const char *why);
 int hv_t8152_allow(u64 ipa, u64 pa, u64 size, bool read_only, const char *name);
 
 /*
+ * Guest SError attribution (hv_serror.c): what this session's policy lists say about `ipa`.
+ * Guest RAM, the MMIO allowlist and the denylist are identity, so the IPA is their PA; carrier
+ * exceptions are matched by their IPA.  Reads the lists only, never the address.  *name gets
+ * the range's name (static text), or NULL.  HV_T8152_IPA_UNLISTED before the policy is armed.
+ */
+#define HV_T8152_IPA_UNLISTED  0
+#define HV_T8152_IPA_RAM       1
+#define HV_T8152_IPA_EXCEPTION 2
+#define HV_T8152_IPA_MMIO      3
+#define HV_T8152_IPA_DENIED    4
+#define HV_T8152_IPA_HOST_RAM  5 /* DRAM outside the guest window: aura, carve-outs, firmware */
+int hv_t8152_describe_ipa(u64 ipa, const char **name);
+
+/*
  * hv_map(): may this mapping be made?  Forces Device-nGnRnE on hardware
  * mappings outside DRAM.  Unmapping is always allowed.
  */

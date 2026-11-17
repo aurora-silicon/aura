@@ -16,6 +16,9 @@
 
 #include "hv_fatal.h"
 #include "hv_ahci.h"
+#include "hv_gpu.h"
+#include "hv_input.h"
+#include "hv_serror.h"
 #include "hv_usb.h"
 #include "soc.h"
 #include "utils.h"
@@ -23,6 +26,8 @@
 struct hv_fatal_cpu hv_fatal_cpus[MAX_CPUS];
 bool hv_fatal_armed;
 static u32 hv_fatal_reporting;
+/* hv_windows_guest_serror_report() is the caller: the carrier goes on (the host decides). */
+static bool hv_fatal_guest_caller;
 
 /* ---- writers (hot paths: a few stores and one barrier, T8152 only) ------------------------ */
 
@@ -44,6 +49,23 @@ void hv_fatal_note_trap(u64 kind, u64 esr, u64 elr, u64 spsr, u64 far)
     t->hpfar = (kind == HV_FATAL_TRAP_SYNC && (ec == 0x20 || ec == 0x24)) ? mrs(HPFAR_EL2) : 0;
     t->cntpct = mrs(CNTPCT_EL0);
     t->isr = mrs(ISR_EL1);
+    t->ret_elr = t->ret_spsr = t->ret_isr = t->ret_cntpct = 0;
+    hv_fatal_seq_end(&t->seq);
+}
+
+void hv_fatal_note_return(void)
+{
+    if (chip_id != T8152)
+        return;
+    /* PSTATE.A is masked here: the fence makes an error from this exit's EL2 accesses pending
+     * (ISR_EL1.A) instead of letting it arrive after the ERET, where it reads as the guest's. */
+    sysop("dsb sy");
+    struct hv_fatal_trap *t = &hv_fatal_cpus[smp_id()].trap;
+    hv_fatal_seq_begin(&t->seq);
+    t->ret_elr = mrs(ELR_EL2);
+    t->ret_spsr = mrs(SPSR_EL2);
+    t->ret_isr = mrs(ISR_EL1);
+    t->ret_cntpct = mrs(CNTPCT_EL0);
     hv_fatal_seq_end(&t->seq);
 }
 
@@ -177,30 +199,69 @@ const char *hv_fatal_serror_class(u64 esr)
 
 /*
  * Where the guest SError was taken relative to the previous exit of the same CPU.  The return
- * point of that exit: past the instruction for a handled synchronous trap (HVC already has
- * ELR_EL2 past it), the interrupted instruction for an IRQ, FIQ or SError.
+ * point of that exit is ELR_EL2 as _hv_return recorded it; without that record (an exit that
+ * never returned through _hv_return), the instruction after a handled synchronous trap (HVC
+ * already has ELR_EL2 past it) or the interrupted instruction for an IRQ, FIQ or SError.
+ *
+ * Taken exactly at the return point means the guest executed nothing between the ERET and the
+ * SError: the error was pending when EL2 returned.  ISR_EL1.A at the exit and at the return
+ * then say whether it was raised before the exit (the guest's own access just before it, or
+ * earlier EL2 work) or by the EL2 work of that exit.
  */
-const char *hv_fatal_serror_relation(const struct hv_fatal_trap *prev, u64 elr, u64 age_us)
+const char *hv_fatal_serror_relation(const struct hv_fatal_trap *prev, u64 elr, u64 age_us,
+                                     int *code)
 {
-    if (!prev || !prev->cntpct)
+    int dummy;
+    if (!code)
+        code = &dummy;
+    if (!prev || !prev->cntpct) {
+        *code = HV_SERR_REL_NONE;
         return "no earlier exit recorded on this CPU";
+    }
     u64 ret = prev->elr;
-    if (prev->kind == HV_FATAL_TRAP_SYNC && ((prev->esr >> 26) & 0x3f) != 0x16)
+    if (prev->ret_cntpct)
+        ret = prev->ret_elr;
+    else if (prev->kind == HV_FATAL_TRAP_SYNC && ((prev->esr >> 26) & 0x3f) != 0x16)
         ret += 4;
-    bool pending = prev->isr & BIT(8);
+    bool at_exit = prev->isr & BIT(8);
+    bool at_return = prev->ret_cntpct && (prev->ret_isr & BIT(8));
     if (elr != ret) {
-        if (pending)
+        if (at_return) {
+            *code = HV_SERR_REL_MASKED_RAN;
+            return at_exit ? "already pending when the guest exited and still at the return; "
+                             "taken later, after the guest unmasked SErrors: raised before "
+                             "that exit"
+                           : "pending when EL2 returned but not at the exit, taken later after "
+                             "the guest unmasked SErrors: raised by the EL2 work of that exit";
+        }
+        *code = at_exit ? HV_SERR_REL_BEFORE_EXIT : HV_SERR_REL_GUEST_RAN;
+        if (at_exit)
             return "the guest ran on past that exit, and an SError was already pending at it: "
                    "it was raised before that exit and only taken later";
         return "the guest ran on past that exit: raised while the guest ran (its own access, "
                "or a late completion of earlier work)";
     }
-    if (pending)
+    if (at_exit) {
+        *code = HV_SERR_REL_BEFORE_EXIT;
         return "taken at that exit's return point and already pending when it exited: raised "
                "before that exit (guest access, or earlier EL2 work)";
-    if (age_us > 10000)
+    }
+    if (at_return) {
+        *code = HV_SERR_REL_EL2_WORK;
+        return "taken at that exit's return point; not pending when the guest exited, pending "
+               "when EL2 returned: raised by the EL2 work of that exit";
+    }
+    if (age_us > 10000) {
+        *code = HV_SERR_REL_STALE;
         return "at that exit's return point but long after it: the guest may have re-run that "
                "PC; not attributable";
+    }
+    if (prev->ret_cntpct) {
+        *code = HV_SERR_REL_EL2_LATE;
+        return "taken at that exit's return point (the guest ran nothing), not pending at the "
+               "return fence: an EL2 access of that exit whose error arrived after the fence";
+    }
+    *code = HV_SERR_REL_EL2_LATE;
     return "taken at that exit's return point: pending when EL2 returned to the guest (EL2 "
            "work in that exit with PSTATE.A masked, or a guest access just before the exit)";
 }
@@ -273,6 +334,10 @@ static void report_cpu(int cpu, int self, u64 now, u64 freq)
             printf(" FAR 0x%lx IPA 0x%lx", t.far, hpfar_ipa(t.hpfar, t.far));
         if (t.isr & BIT(8))
             printf("; SError pending at that exit");
+        if (t.ret_cntpct)
+            printf("; returned to PC 0x%lx %lu us later%s", t.ret_elr,
+                   t.ret_cntpct > t.cntpct ? age_us(t.ret_cntpct, t.cntpct, freq) : 0,
+                   (t.ret_isr & BIT(8)) ? ", SError pending at the return" : "");
         printf("\n");
     }
     printf("HV: fatal: cpu%2d%s EL2", cpu, mark);
@@ -330,6 +395,8 @@ void hv_windows_fatal_report(u64 *regs, const char *what, u64 par, const char *p
 
     hv_ahci_fatal_report(now, freq);
     hv_usb_fatal_report();
+    hv_gpu_fatal_report();
+    hv_input_fatal_report();
 
     if (regs) {
         /* The EL2 frame sits on this CPU's stack (64 KiB); the interrupted frames are above. */
@@ -349,11 +416,17 @@ void hv_windows_fatal_report(u64 *regs, const char *what, u64 par, const char *p
         printf("HV: fatal: DISR_EL1 absent (no FEAT_RAS)\n");
     printf("HV: fatal: guest EL1 ELR_EL12 0x%lx ESR_EL12 0x%lx FAR_EL12 0x%lx SPSR_EL12 0x%lx\n",
            mrs(ELR_EL12), mrs(ESR_EL12), mrs(FAR_EL12), mrs(SPSR_EL12));
-    printf("HV: fatal: not contained: the carrier does not resume after this (%s)\n", what);
+    if (hv_fatal_guest_caller)
+        printf("HV: fatal: %s: the host decides what follows (run_guest --windows-serror: abort "
+               "exits the guest, continue resumes it)\n",
+               what);
+    else
+        printf("HV: fatal: not contained: the carrier does not resume after this (%s)\n", what);
 }
 
-void hv_windows_guest_serror_report(const u64 *regs, u64 esr, u64 elr, u64 spsr, u64 far,
-                                    const struct hv_fatal_trap *prev, u64 par)
+void hv_windows_guest_serror_report(const u64 *regs, const u64 *sp, u64 esr, u64 elr, u64 spsr,
+                                    u64 far, u64 afsr1, const struct hv_fatal_trap *prev,
+                                    u64 par)
 {
     if (chip_id != T8152 || !hv_fatal_armed)
         return;
@@ -365,22 +438,39 @@ void hv_windows_guest_serror_report(const u64 *regs, u64 esr, u64 elr, u64 spsr,
     int self = smp_id();
     u64 now = mrs(CNTPCT_EL0), freq = mrs(CNTFRQ_EL0);
     u64 age = prev && prev->cntpct ? age_us(now, prev->cntpct, freq) : 0;
+    u64 isr = mrs(ISR_EL1);
 
     /* What the vector read, before anything else: the record lines below can only add. */
     printf("HV: fatal: guest SError on cpu %d: ESR_EL2 0x%lx (%s); guest PC 0x%lx %s SPSR "
-           "0x%lx; FAR_EL2 0x%lx (stale: an SError does not write it)\n",
-           self, esr, hv_fatal_serror_class(esr), elr, mode_name(spsr), spsr, far);
+           "0x%lx; FAR_EL2 0x%lx HPFAR_EL2 0x%lx (both stale: an SError writes neither)\n",
+           self, esr, hv_fatal_serror_class(esr), elr, mode_name(spsr), spsr, far,
+           mrs(HPFAR_EL2));
+    printf("HV: fatal: guest SError on cpu %d: AFSR1_EL2 0x%lx (IMPLEMENTATION DEFINED, raw); "
+           "ISR_EL1 now 0x%lx (A=%ld: %s)\n",
+           self, afsr1, isr, (long)((isr >> 8) & 1),
+           (isr & BIT(8)) ? "another SError is already pending" : "nothing else pending");
     if (prev && prev->cntpct) {
         printf("HV: fatal: cpu%2d previous exit %c %lu us before: ESR 0x%lx PC 0x%lx %s", self,
                (char)prev->kind, age, prev->esr, prev->elr, mode_name(prev->spsr));
         if (prev->kind == HV_FATAL_TRAP_SYNC && prev->hpfar)
             printf(" FAR 0x%lx IPA 0x%lx", prev->far, hpfar_ipa(prev->hpfar, prev->far));
         printf("; ISR_EL1 at it 0x%lx\n", prev->isr);
+        if (prev->ret_cntpct)
+            printf("HV: fatal: cpu%2d that exit returned to PC 0x%lx %s (SPSR 0x%lx, A %s) %lu us "
+                   "before the SError; ISR_EL1 after the return fence 0x%lx\n",
+                   self, prev->ret_elr, mode_name(prev->ret_spsr), prev->ret_spsr,
+                   (prev->ret_spsr & BIT(8)) ? "masked" : "unmasked",
+                   age_us(now, prev->ret_cntpct, freq), prev->ret_isr);
+        else
+            printf("HV: fatal: cpu%2d that exit has no return record\n", self);
     }
-    printf("HV: fatal: cpu%2d SError vs previous exit: %s\n", self,
-           hv_fatal_serror_relation(prev, elr, age));
+    int code;
+    const char *why = hv_fatal_serror_relation(prev, elr, age, &code);
+    printf("HV: fatal: cpu%2d SError vs previous exit: verdict %d: %s\n", self, code, why);
 
+    hv_fatal_guest_caller = true;
     hv_windows_fatal_report(NULL, "guest SError", par, "at the guest SError");
+    hv_fatal_guest_caller = false;
 
     if (regs) {
         for (int i = 0; i < 31; i += 4) {
@@ -389,6 +479,10 @@ void hv_windows_guest_serror_report(const u64 *regs, u64 esr, u64 elr, u64 spsr,
                 printf(" %016lx", regs[j]);
             printf("\n");
         }
+        if (sp)
+            printf("HV: fatal: guest SP_EL0 %016lx SP_EL1 %016lx\n", sp[0], sp[1]);
+        /* Last: it reads guest page tables and code (guest RAM only), the riskiest part. */
+        hv_serror_attribute(regs, sp, esr, elr, spsr);
     }
     __atomic_store_n(&hv_fatal_reporting, 0, __ATOMIC_RELEASE);
 }

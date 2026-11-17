@@ -32,6 +32,9 @@ static struct input_model model;
 static DECLARE_SPINLOCK(input_lock);
 static u64 report_next;
 static u32 reported_frames, reported_bad, reported_enabled = ~0u;
+/* fatal report: page accesses (count, last offset, 1 = write, when) and the last feed poll */
+static u64 act_accesses, act_off, act_write, act_at;
+static u64 poll_at, poll_bytes;
 
 _Static_assert(HV_INPUT_INTID == HV_VDEV_SPI_INPUT, "one SPI number");
 _Static_assert(HV_INPUT_SIZE == INPUT_PAGE_SIZE, "one page size");
@@ -80,6 +83,10 @@ static bool hv_input_mmio(struct exc_info *ctx, u64 addr, u64 *val, bool write, 
 {
     UNUSED(ctx);
     u64 off = addr - HV_INPUT_BASE;
+    __atomic_add_fetch(&act_accesses, 1, __ATOMIC_RELAXED);
+    __atomic_store_n(&act_off, off, __ATOMIC_RELAXED);
+    __atomic_store_n(&act_write, write ? 1 : 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&act_at, now_ticks(), __ATOMIC_RELAXED);
 
     spin_lock(&input_lock);
     bool ok = off < HV_INPUT_SIZE && input_model_mmio(&model, off, width, val, write);
@@ -125,6 +132,8 @@ void hv_input_poll(void)
             failed = got;
     }
 
+    poll_at = now;
+    poll_bytes += n;
     if (n)
         input_model_host_rx(&model, buf, n, now);
     input_model_poll(&model, now);
@@ -392,6 +401,37 @@ void hv_input_report(void)
            ok, bad, gaps, depth, dropped, wd, acc, enabled ? "yes" : "no");
 }
 
+static u64 fatal_age_ms(u64 now, u64 then)
+{
+    u64 freq = mrs(CNTFRQ_EL0);
+    if (!then || then > now || freq < 1000)
+        return ~0UL;
+    return (now - then) / (freq / 1000);
+}
+
+void hv_input_fatal_report(void)
+{
+    if (!session_used)
+        return;
+    u64 now = now_ticks();
+    u64 acc_age = fatal_age_ms(now, __atomic_load_n(&act_at, __ATOMIC_RELAXED));
+    u64 poll_age = fatal_age_ms(now, poll_at);
+    printf("HV: fatal: input: attached %d entered %d exited %d; host frames %u ok, %u bad CRC, "
+           "%u bad accesses; driver enabled %s; page 0x%lx is a carrier hook (never hardware)\n",
+           (int)attached, (int)entered, (int)exited, model.stats[INPUT_ST_FRAMES_OK],
+           model.stats[INPUT_ST_BAD_CRC], model.stats[INPUT_ST_BAD_ACCESS],
+           (model.ctrl & INPUT_CTRL_ENABLE) ? "yes" : "no", HV_INPUT_BASE);
+    printf("HV: fatal: input: %lu guest page accesses", act_accesses);
+    if (acc_age != ~0UL)
+        printf(", last %s at +0x%lx %lu ms ago", act_write ? "write" : "read", act_off, acc_age);
+    printf("; last host-feed poll (CDC link read) ");
+    if (poll_age == ~0UL)
+        printf("never");
+    else
+        printf("%lu ms ago", poll_age);
+    printf(", %lu bytes in all\n", poll_bytes);
+}
+
 #ifdef HV_INPUT_HOST_TEST
 /* tests/e2e/windows_input_glue_host.c: a fresh carrier session between scenarios. */
 void hv_input_host_new_session(void)
@@ -403,5 +443,7 @@ void hv_input_host_new_session(void)
     report_next = 0;
     reported_frames = reported_bad = 0;
     reported_enabled = ~0u;
+    act_accesses = act_off = act_write = act_at = 0;
+    poll_at = poll_bytes = 0;
 }
 #endif
