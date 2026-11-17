@@ -17,7 +17,6 @@ typedef uint32_t u32;
 typedef uint64_t u64;
 #define T8140 0x8140
 #define T6040 0x6040
-#define T8122 0x8122
 #define WDT_COUNT 0x10
 #define WDT_ALARM 0x14
 #define WDT_CTL 0x1c
@@ -67,9 +66,6 @@ int main(void)
     assert(regs[WDT_ALARM/4] == 720000000);
     assert(regs[WDT_CTL/4] == 4 && regs[WDT_COUNT/4] == 0);
     assert(writes == 4 && wdt_base == primary);
-    chip_id = T8122;
-    assert(wdt_arm_seconds(45) == 0);
-    assert(regs[WDT_ALARM/4] == 1080000000U);
     chip_id = T8140;
     assert(wdt_arm_seconds(178) == 0);
     assert(regs[WDT_ALARM/4] == 4272000000U);

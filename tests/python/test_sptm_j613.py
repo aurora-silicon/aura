@@ -47,5 +47,5 @@ def test_j613_entry_has_a_bounded_recovery_watchdog():
     enter = source[source.index('void sptm_virt_enter(void)'):]
     xnu = source[source.index('void sptm_virt_cpu_enters_xnu(int cpu)'):
                  source.index('void sptm_virt_enter(void)')]
-    assert 'chip_id == T8122 && wdt_arm_seconds(45)' in enter
+    assert 'chip_id == T8122 && wdt_boot_watchdog_armed()' in enter
     assert 'wdt_disable();' in xnu

@@ -14,6 +14,8 @@ int wdt_arm_trial(void);
 /* Stage 1 on a plain boot: the same longest period, until a host attaches or Stage 2 disarms it */
 #define WDT_BOOT_SECONDS 178
 int wdt_arm_boot(void);
+void wdt_retain_boot_watchdog(unsigned seconds);
+unsigned wdt_boot_watchdog_seconds(void);
 void wdt_host_attached(void);
 bool wdt_boot_watchdog_armed(void);
 

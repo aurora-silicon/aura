@@ -29,6 +29,7 @@ typedef uint32_t u32;
 typedef uint64_t u64;
 #define T8140 0x8140
 #define T6040 0x6040
+#define T8122 0x8122
 #define WDT_COUNT 0x10
 #define WDT_ALARM 0x14
 #define WDT_CTL 0x1c
@@ -106,6 +107,18 @@ def test_trial_watchdog_is_not_disarmed_by_a_host(tmp_path):
 ''')
 
 
+def test_retained_t8122_entry_watchdog_survives_host_attach(tmp_path):
+    run(tmp_path, r'''
+    chip_id = T8122;
+    wdt_retain_boot_watchdog(60);
+    assert(wdt_arm_boot() == 0);
+    assert(regs[WDT_ALARM/4] == 1440000000U && regs[WDT_CTL/4] == 4);
+    disables = 0;
+    wdt_host_attached();
+    assert(disables == 0 && regs[WDT_CTL/4] == 4);
+    ''')
+
+
 def test_boot_watchdog_refuses_layouts_it_cannot_drive(tmp_path):
     run(tmp_path, r'''
     adt_version = 3;
@@ -137,6 +150,8 @@ def test_stage1_arms_it_after_disarming_iboot_and_stage2_does_not():
     guard = body.rindex('#if', 0, arm)
     assert re.match(r'#if defined\(CHAINLOADING\) && !defined\(ESP_STAGE2\)', body[guard:])
     assert body.index('#endif', guard) > arm
+    retain = body.index('wdt_retain_boot_watchdog(60)')
+    assert retain < arm
 
 
 def test_a_host_disarms_it_as_soon_as_it_is_seen():

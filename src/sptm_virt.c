@@ -590,9 +590,9 @@ __attribute__((used, retain)) void sptm_virt_enter(void)
 
     printf("\nSPTM-virt: entering SPTM at 0x%lx, boot_args 0x%lx\n", sptm_entry_pa,
            sptm_handoff_pa);
-    if (chip_id == T8122 && wdt_arm_seconds(45) == 0) {
+    if (chip_id == T8122 && wdt_boot_watchdog_armed()) {
         sptm_entry_wdt_armed = true;
-        printf("SPTM-virt: 45 s entry recovery watchdog armed\n");
+        printf("SPTM-virt: retained entry recovery watchdog is armed\n");
     } else if (chip_id == T8122) {
         printf("SPTM-virt: entry recovery watchdog unavailable\n");
     }

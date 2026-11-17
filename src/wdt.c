@@ -93,7 +93,7 @@ static int wdt_arm(unsigned seconds)
 
 int wdt_arm_seconds(unsigned seconds)
 {
-    if (chip_id != T8140 && chip_id != T6040 && chip_id != T8122)
+    if (chip_id != T8140 && chip_id != T6040)
         return -1;
     return wdt_arm(seconds);
 }
@@ -105,6 +105,21 @@ int wdt_arm_seconds(unsigned seconds)
  * normal path, as the trial marker is already spent.
  */
 static bool wdt_boot_armed;
+static bool wdt_boot_retain;
+static unsigned wdt_boot_seconds = WDT_BOOT_SECONDS;
+
+void wdt_retain_boot_watchdog(unsigned seconds)
+{
+    if (seconds >= 1 && seconds <= 178) {
+        wdt_boot_retain = true;
+        wdt_boot_seconds = seconds;
+    }
+}
+
+unsigned wdt_boot_watchdog_seconds(void)
+{
+    return wdt_boot_seconds;
+}
 
 int wdt_arm_trial(void)
 {
@@ -124,7 +139,7 @@ int wdt_arm_trial(void)
  */
 int wdt_arm_boot(void)
 {
-    if (wdt_arm(WDT_BOOT_SECONDS))
+    if (wdt_arm(wdt_boot_seconds))
         return -1;
     wdt_boot_armed = true;
     return 0;
@@ -140,6 +155,11 @@ void wdt_host_attached(void)
 {
     if (!wdt_boot_armed)
         return;
+    if (wdt_boot_retain) {
+        printf("WDT: host attached, retained boot watchdog stays armed (%u s)\n",
+               wdt_boot_seconds);
+        return;
+    }
     wdt_boot_armed = false;
     wdt_disable();
     printf("WDT: host attached, boot watchdog off\n");
