@@ -589,6 +589,7 @@ __attribute__((used, retain)) void sptm_virt_enter(void)
     /* iBoot's entry contract: EL1&0 MMU and caches off, x0 = boot_args. */
     msr(SYS_SCTLR_EL12, mrs(SYS_SCTLR_EL12) & ~(SCTLR_M | SCTLR_C | SCTLR_I));
     sysop("isb");
+    printf("SPTM-virt: entry step 1: EL12 MMU and caches disabled\n");
 
     /*
      * aura's own USB gadgets (DWC3 + DART, set up at boot as proxy transports) would keep running
@@ -600,8 +601,11 @@ __attribute__((used, retain)) void sptm_virt_enter(void)
         usb_iodev_shutdown();
 
     /* The proxy flow never passes through kboot's nv2_prepare. */
+    printf("SPTM-virt: entry step 2: preparing NV2 state\n");
     nv2_prepare();
+    printf("SPTM-virt: entry step 3: preparing stage 2\n");
     sptm_virt_s2_setup();
+    printf("SPTM-virt: entry step 4: stage 2 ready\n");
 
     /*
      * Every other core reaches the guest through a hardware reset into aura
@@ -639,6 +643,7 @@ __attribute__((used, retain)) void sptm_virt_enter(void)
     }
     dc_cvac_range((void *)&sptm_smp_crumbs, sizeof(sptm_smp_crumbs));
 
+    printf("SPTM-virt: entry step 5: transferring to SPTM\n");
     nv2_enter_os(sptm_entry_pa, sptm_handoff_pa, 0, 0);
 }
 
