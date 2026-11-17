@@ -74,3 +74,9 @@ def test_post_entry_drain_resolves_m1n1_symlink(monkeypatch):
         "is_kis": False,
     })()
     assert runner.post_entry_drain_needed(iface) is False
+
+
+def test_no_enter_can_return_without_reopening_stage1():
+    source = (REPO / "proxyclient/tools/run_guest_sptm.py").read_text()
+    assert 'if env_on("AURA_RETURN_AFTER_NO_ENTER")' in source
+    assert 'p.reboot()' in source[source.index('if args.no_enter:'):]

@@ -63,6 +63,7 @@ Environment (all optional; 1 enables a switch):
   AURA_OS_LONG_VERSION     the guest's Ap,OSLongVersion (--os-long-version)
   AURA_KEEP_BOOT_VIDEO     hand iBoot's boot framebuffer to XNU, aura's console off it
   AURA_TAIL_SECS, AURA_TAIL_IDLE   keep reading the console after entry, until idle
+  AURA_RETURN_AFTER_NO_ENTER  send P_REBOOT on the same session after a --no-enter admission run
   AURA_AMCC_NOLOCK=<mask>  which of SPTM's AMCC range locks aura shadows (bit 0 +0xacc, 1 +0xadc,
                            2 +0xaec; default 1, the one over aura's image; 0 lets SPTM lock all)
   AURA_WFI_WATCH=1|2       trap XNU's WFIs (2: and WFEs) and report every 10 s (idle vs. dead)
@@ -148,6 +149,7 @@ KNOWN_ENV = {
     "AURA_S2R_USB_RETAKE_MS",
     "AURA_TAIL_SECS",
     "AURA_TAIL_IDLE",
+    "AURA_RETURN_AFTER_NO_ENTER",
     "AURA_GPU_STOP_SECS",
     "AURA_GPU_STOP_BOOT_SECS",
     "AURA_GPU_STOP_MSG",
@@ -1008,6 +1010,10 @@ def main():
         raise SystemExit("sptm_virt_load rejected the entry/handoff (see aura's console)")
     if args.no_enter:
         print("loaded and recorded; not entering (--no-enter)")
+        if env_on("AURA_RETURN_AFTER_NO_ENTER"):
+            p.reboot()
+            time.sleep(5)
+            print("same-session P_REBOOT sent after admission run")
         return
 
     if env_on("AURA_KEEP_BOOT_VIDEO"):
