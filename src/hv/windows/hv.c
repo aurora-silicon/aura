@@ -973,9 +973,61 @@ static void hv_init_secondary(struct hv_secondary_info_t *info)
         hv_arm_tick(true);
 }
 
+/*
+ * Cached EL2 stacks for T8142 secondaries; see docs/windows-secondary-el2-stack.md.
+ *
+ * Production keeps these cores' own stacks in the SMP block that smp_t8142_block_init() maps
+ * with mmu_map_uncached(), i.e. Device-nGnRnE, because a core with its MMU off shares it.
+ * hv_enter_guest() erets with SP_EL2 on whatever stack it runs on, so a secondary used to
+ * take every guest exception -- frame, C handlers, restore -- through device memory: 20-27 us
+ * per EL2 entry on boot 144 against 0.3-0.5 us on the boot CPU.  Give each one a cached stack
+ * for the guest's lifetime instead.  Heap, never .bss/.data: iBoot can lock CTRR over the boot
+ * object so that a secondary's stores into the image fault.
+ */
+#define HV_SECONDARY_STACK_SIZE SECONDARY_STACK_SIZE
+
+static u8 *hv_secondary_stacks[MAX_CPUS];
+
+void hv_enter_guest_on_stack(u64 x0, u64 x1, u64 x2, u64 x3, void *entry, void *stack_top);
+
+/* Boot CPU, before the secondary's first guest entry.  On failure the CPU keeps today's stack. */
+static void hv_prepare_secondary_stack(int cpu)
+{
+    u64 smp_base, smp_size;
+
+    if (hv_secondary_stacks[cpu] || !smp_secondary_block(&smp_base, &smp_size))
+        return;
+
+    u8 *stack = memalign(SZ_16K, HV_SECONDARY_STACK_SIZE);
+    u64 start = (u64)stack, end = start + HV_SECONDARY_STACK_SIZE;
+    if (!stack || (start < (u64)_end && end > (u64)_base) ||
+        (start < smp_base + smp_size && end > smp_base)) {
+        printf("HV: CPU %d keeps its uncached SMP stack (no usable heap stack)\n", cpu);
+        return;
+    }
+    memset(stack, 0, HV_SECONDARY_STACK_SIZE);
+    /* Nothing stale at the point of coherency for a core that has had its caches off. */
+    dc_civac_range(stack, HV_SECONDARY_STACK_SIZE);
+    sysop("dsb sy");
+    hv_secondary_stacks[cpu] = stack;
+}
+
 static void hv_enter_secondary(void *entry, u64 regs[4])
 {
-    hv_enter_guest(regs[0], regs[1], regs[2], regs[3], entry);
+    u8 *stack = hv_secondary_stacks[smp_id()];
+
+    if (stack) {
+        /*
+         * The trampoline moves SP with DAIF fully masked and restores DAIF before
+         * hv_enter_guest() reads it, so the guest's first PSTATE is unchanged.
+         * hv_exit_guest() comes back through it, and it puts SP back on this frame before
+         * we return to the SMP wait loop.
+         */
+        hv_enter_guest_on_stack(regs[0], regs[1], regs[2], regs[3], entry,
+                                stack + HV_SECONDARY_STACK_SIZE);
+    } else {
+        hv_enter_guest(regs[0], regs[1], regs[2], regs[3], entry);
+    }
 
     spin_lock(&bhl);
 
@@ -1008,7 +1060,10 @@ int hv_start_secondary(int cpu, void *entry, u64 regs[4])
     hv_setup_pending[cpu] = false;
     iodev_console_flush();
 
-    printf("HV: Entering guest secondary %d at %p\n", cpu, entry);
+    hv_prepare_secondary_stack(cpu);
+    printf("HV: Entering guest secondary %d at %p (EL2 stack %p)\n", cpu, entry,
+           hv_secondary_stacks[cpu] ? hv_secondary_stacks[cpu] + HV_SECONDARY_STACK_SIZE
+                                    : smp_secondary_stack(cpu) + SECONDARY_STACK_SIZE);
     memcpy(hv_secondary_regs[cpu], regs, sizeof(hv_secondary_regs[cpu]));
     hv_started_cpus[cpu] = true;
     __atomic_or_fetch(&hv_cpus_in_guest, BIT(cpu), __ATOMIC_ACQUIRE);

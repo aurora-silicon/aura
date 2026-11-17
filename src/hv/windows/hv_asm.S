@@ -204,6 +204,35 @@ hv_enter_guest:
 
     eret
 
+/*
+ * void hv_enter_guest_on_stack(u64 x0, u64 x1, u64 x2, u64 x3, void *entry, void *stack_top)
+ *
+ * hv_enter_guest() on another stack, which then also becomes SP_EL2 for every guest
+ * exception on this CPU.  T8142 secondaries use it to leave production's uncached SMP
+ * stack (docs/windows-secondary-el2-stack.md).  SP moves only with DAIF fully masked,
+ * and DAIF is restored before hv_enter_guest() reads it for the guest's PSTATE.  The old
+ * SP stays in x19: hv_enter_guest() saves x19 in the frame hv_exit_guest() reloads, so
+ * the return lands here with x19 intact and SP moves back the same way.
+ */
+.globl hv_enter_guest_on_stack
+.type hv_enter_guest_on_stack, @function
+hv_enter_guest_on_stack:
+    stp x29, x30, [sp, #-16]!
+    stp x19, x20, [sp, #-16]!
+    mov x19, sp
+    mrs x6, daif
+    msr daifset, #0xf
+    mov sp, x5
+    msr daif, x6
+    bl hv_enter_guest
+    mrs x6, daif
+    msr daifset, #0xf
+    mov sp, x19
+    msr daif, x6
+    ldp x19, x20, [sp], #16
+    ldp x29, x30, [sp], #16
+    ret
+
 .globl hv_exit_guest
 .type hv_exit_guest, @function
 hv_exit_guest:
