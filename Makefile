@@ -379,7 +379,7 @@ build/%.o: src/%.S src/../build/build_cfg.h
 	$(QUIET)mkdir -p "$(dir $@)"
 	$(QUIET)$(AS) -c $(BASE_CFLAGS) -MMD -MF $(DEPDIR)/$(*F).d -MQ "$@" -MP -o $@ $<
 
-$(BUILD_FP_OBJS): build/%.o: src/%.c
+$(BUILD_FP_OBJS): build/%.o: src/%.c build-tag build-cfg
 	$(QUIET)echo "  CC FP $@"
 	$(QUIET)mkdir -p $(DEPDIR)
 	$(QUIET)mkdir -p "$(dir $@)"
