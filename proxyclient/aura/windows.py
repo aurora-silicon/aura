@@ -40,6 +40,8 @@ MAX_IMAGE = 1024 * 1024 * 1024
 N1_PROPERTY = "aura,windows-n1-v1"
 N1_BYTES = 128
 CPUFREQ_PROPERTY = "aura,windows-cpufreq-v1"
+# Mu codex/j813-mu-quiet-unified Docs/j813-unified-display-marker.md: 4 bytes, LE 1 selects AURA8171.
+UNIFIED_DISPLAY_PROPERTY = "aura,windows-unified-display-v1"
 AURA_HEAP_RESERVE = 128 * 1024 * 1024
 PROXY_HEAP_SIZE = 128 * 1024 * 1024
 N1_RESOURCES = ((0x1cb0000000, 0x200000), (0x488000000, 0x20000),
@@ -129,6 +131,7 @@ class LaunchPlan:
     cpufreq: str = "disabled"
     xfer: object = None
     ecpu_boot_state: int = 0  # 0: keep the firmware handoff state (key absent)
+    unified_display: str = "disabled"  # key absent: Mu keeps the legacy GPU and display pair
 
 
 XFER_FIELDS = {"doorbell", "window_bytes", "serve_dir", "inbox", "compress"}
@@ -251,7 +254,7 @@ def plan_profile(filename):
     require(profile.get("schema") == "aura.windows.boot.v1", "unsupported Windows boot profile")
     require(set(profile) <= {"schema", "name", "target", "mu", "append", "framebuffer", "boot_args",
                              "guest_compatibility", "usb", "n1", "reserved_memory", "serial", "mtp", "cpufreq",
-                             "xfer", "ecpu_boot_state"},
+                             "xfer", "ecpu_boot_state", "unified_display"},
             "unknown Windows profile field")
     require(isinstance(profile.get("name"), str) and 0 < len(profile["name"]) <= 80, "profile name is required")
     target = profile.get("target")
@@ -327,6 +330,14 @@ def plan_profile(filename):
         # Either cpufreq policy may accompany it. Mu 45087b59 double-frees the CPUF
         # SSDT when the j813-manual-v1 marker is absent (boot 145), so keep the marker;
         # AppleCpuFreq 0.2.0.3 then fails D0 on a raised E state after reads alone.
+    unified_display = "disabled"
+    if "unified_display" in profile:
+        # One spelling for on, none for off: absent is the only way to keep the legacy pair.
+        require(profile["unified_display"] == "j813-v1" and type(profile["unified_display"]) is str,
+                "unsupported unified display selection")
+        require(chip == 0x8142 and model == "Mac17,3",
+                "j813-v1 unified display requires chip 0x8142 and model Mac17,3")
+        unified_display = "j813-v1"
     declarations = profile.get("reserved_memory", [])
     require(isinstance(declarations, list) and len(declarations) <= 16,
             "reserved_memory must be a list of at most 16 ranges")
@@ -365,7 +376,7 @@ def plan_profile(filename):
     return LaunchPlan(filename, profile, raw, hashlib.sha256(raw).hexdigest(), b"".join(composed),
                       tuple(images), entry, chip, model, framebuffer, compatibility, usb, n1,
                       tuple(reserved), boot_args, serial, mtp, cpufreq, xfer,
-                      ecpu_boot_state=ecpu_boot_state)
+                      ecpu_boot_state=ecpu_boot_state, unified_display=unified_display)
 
 
 def _aligned(value, alignment):
@@ -457,6 +468,16 @@ def cpufreq_handoff_marker(policy, chip, board, model, opp_tables=None):
             "CPU frequency handoff requires both firmware OPP tables")
     for table, expected in zip(opp_tables, J813_CPU_OPP_KHZ):
         _require_opp_table(table, expected)
+    return struct.pack("<I", 1)
+
+
+def unified_display_marker(selection, chip, board, model):
+    """The /chosen marker that makes Mu publish the unified GPU+panel device, or None."""
+    require(selection in ("disabled", "j813-v1"), "unsupported unified display selection")
+    if selection == "disabled":
+        return None
+    require((chip, board, model) == (0x8142, 0x24, "Mac17,3"),
+            "the unified display device requires the exact J813 target")
     return struct.pack("<I", 1)
 
 
@@ -628,6 +649,7 @@ class HardwareSession:
         preflight.windows_n1 = plan.n1
         preflight.windows_mtp = plan.mtp
         preflight.windows_cpufreq = plan.cpufreq
+        preflight.windows_unified_display = plan.unified_display
         preflight.setup_adt()
         preflight._windows_adt_blob()
         if plan.ecpu_boot_state:
@@ -658,6 +680,7 @@ class HardwareSession:
         self.hv.windows_mtp = plan.mtp
         self.hv.windows_cpufreq = plan.cpufreq
         self.hv.windows_ecpu_boot_state = plan.ecpu_boot_state
+        self.hv.windows_unified_display = plan.unified_display
         self.hv.windows_serial = plan.serial
         self.hv.windows_serial_recorder = self.serial_capture
         self.hv.windows_xfer = plan.xfer is not None
@@ -686,12 +709,15 @@ class HardwareSession:
         cpufreq = {"profile": plan.cpufreq, "automatic_policy": False}
         if plan.ecpu_boot_state:
             cpufreq["ecpu_boot_state"] = plan.ecpu_boot_state  # applied by hv_start, not yet
-        return {"guest_base": hex(self.hv.guest_base), "entry": hex(self.hv.entry),
-                "bootargs": hex(self.hv.guest_base + self.hv.bootargs_off),
-                "usb": plan.usb, "usb_removed": self.hv.windows_usb_removed,
-                "n1": self.hv.windows_n1_handoff, "memory_preflight": self.hv.windows_memory_guard,
-                "mtp": {"profile": plan.mtp, "prepared": self.hv.windows_mtp_ready},
-                "cpufreq": cpufreq}
+        record = {"guest_base": hex(self.hv.guest_base), "entry": hex(self.hv.entry),
+                  "bootargs": hex(self.hv.guest_base + self.hv.bootargs_off),
+                  "usb": plan.usb, "usb_removed": self.hv.windows_usb_removed,
+                  "n1": self.hv.windows_n1_handoff, "memory_preflight": self.hv.windows_memory_guard,
+                  "mtp": {"profile": plan.mtp, "prepared": self.hv.windows_mtp_ready},
+                  "cpufreq": cpufreq}
+        if plan.unified_display != "disabled":
+            record["unified_display"] = plan.unified_display
+        return record
 
     def start(self):
         return self.hv.start()

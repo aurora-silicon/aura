@@ -106,6 +106,7 @@ class HV(Reloadable):
         self.windows_mtp = "disabled"
         self.windows_cpufreq = "disabled"
         self.windows_ecpu_boot_state = 0
+        self.windows_unified_display = "disabled"
         self.windows_mtp_ready = False
         self.windows_mtp_attempted = False
         self.windows_initialized = False
@@ -1919,7 +1920,8 @@ class HV(Reloadable):
         if self.windows:
             self._disable_windows_usb()
             from ..windows import (N1_BYTES, N1_PROPERTY, MTP_DISABLED_PROPERTY,
-                                   CPUFREQ_PROPERTY, cpufreq_handoff_marker)
+                                   CPUFREQ_PROPERTY, cpufreq_handoff_marker,
+                                   UNIFIED_DISPLAY_PROPERTY, unified_display_marker)
             chosen = self.adt["/chosen"]
             opp_tables = None
             if self.windows_cpufreq != "disabled":
@@ -1937,6 +1939,14 @@ class HV(Reloadable):
             if marker is not None:
                 chosen._properties[CPUFREQ_PROPERTY] = marker
                 chosen._types[CPUFREQ_PROPERTY] = (Bytes(4), False)
+            unified = unified_display_marker(self.windows_unified_display, chosen.chip_id,
+                                             getattr(chosen, "board_id", None), self.adt.model)
+            # Never inherit a device selection from a previous boot policy.
+            chosen._properties.pop(UNIFIED_DISPLAY_PROPERTY, None)
+            chosen._types.pop(UNIFIED_DISPLAY_PROPERTY, None)
+            if unified is not None:
+                chosen._properties[UNIFIED_DISPLAY_PROPERTY] = unified
+                chosen._types[UNIFIED_DISPLAY_PROPERTY] = (Bytes(4), False)
             if self.windows_mtp not in ("disabled", "j813-v1") or (
                     self.windows_mtp == "j813-v1" and
                     (chosen.chip_id != 0x8142 or self.adt.model != "Mac17,3")):

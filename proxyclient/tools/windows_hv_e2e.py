@@ -181,7 +181,8 @@ def reservation_prepare_flow(case):
     trace, heap_queries = [], 0
     plan = SimpleNamespace(chip_id=0x8142, model="Mac17,3", framebuffer="native",
                            guest_compatibility="none", usb="disabled", n1="disabled", serial="disabled", mtp="disabled", cpufreq="disabled",
-                           image=bytes(range(256)) * 32, reserved_memory=tuple(ranges), xfer=None, ecpu_boot_state=0)
+                           image=bytes(range(256)) * 32, reserved_memory=tuple(ranges), xfer=None, ecpu_boot_state=0,
+                           unified_display="disabled")
     class Interface:
         dev = SimpleNamespace(timeout=3)
         tty_log = None
