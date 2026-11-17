@@ -184,6 +184,33 @@ bool hv_t8152_native_wfi(void)
 }
 
 /*
+ * The guest's ACTLR_EL1, read and written from EL2. T8152 uses only the architectural
+ * ACTLR_EL12 (hv_t8152_guest_actlr_*): there a write to the implementation-defined alias
+ * is UNDEFINED at EL2 on every core type (Phase 3 measurement (h)). Other chips keep the
+ * per-part choice they always had.
+ */
+u64 hv_guest_actlr_read(void)
+{
+    if (chip_id == T8152)
+        return hv_t8152_guest_actlr_read();
+    if (cpu_features->actlr_el2)
+        return mrs(SYS_ACTLR_EL12);
+    return mrs(SYS_IMP_APL_ACTLR_EL12);
+}
+
+void hv_guest_actlr_write(u64 value)
+{
+    if (chip_id == T8152) {
+        hv_t8152_guest_actlr_write(value);
+        return;
+    }
+    if (cpu_features->actlr_el2)
+        msr(SYS_ACTLR_EL12, value);
+    else
+        msr(SYS_IMP_APL_ACTLR_EL12, value);
+}
+
+/*
  * The software GIC CPU interface (trapped ICC_* accesses, no list registers)
  * is the delivery model proven on T8142.  T8152 joins it only when the
  * launcher opts in after Phase 3 measurement (f) showed that ICC_* accesses
@@ -1325,10 +1352,7 @@ int hv_start(void *entry, u64 regs[4])
         hv_secondary_info.apsts = mrs(SYS_IMP_APL_APSTS_EL12);
     }
     hv_secondary_info.actlr_el2 = mrs(ACTLR_EL2);
-    if (cpu_features->actlr_el2)
-        hv_secondary_info.actlr_el1 = mrs(SYS_ACTLR_EL12);
-    else
-        hv_secondary_info.actlr_el1 = mrs(SYS_IMP_APL_ACTLR_EL12);
+    hv_secondary_info.actlr_el1 = hv_guest_actlr_read();
     hv_secondary_info.cnthctl = mrs(CNTHCTL_EL2);
     if (!cpu_features->apple_sysregs_unlocked) {
         printf("HV: skipping unavailable SPRR/GXF state\n");
@@ -1471,10 +1495,7 @@ static void hv_init_secondary(struct hv_secondary_info_t *info)
         msr(SYS_IMP_APL_APSTS_EL12, info->apsts);
     }
     msr(ACTLR_EL2, info->actlr_el2);
-    if (cpu_features->actlr_el2)
-        msr(SYS_ACTLR_EL12, info->actlr_el1);
-    else
-        msr(SYS_IMP_APL_ACTLR_EL12, info->actlr_el1);
+    hv_guest_actlr_write(info->actlr_el1);
     if (cpu_features->apple_sysregs_unlocked) {
         msr(SYS_IMP_APL_SPRR_CONFIG_EL1, info->sprr_config);
         if (info->sprr_config & SPRR_CONFIG_EN)

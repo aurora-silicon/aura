@@ -77,6 +77,13 @@ FWB is clear, stage 2 and the SMC trap are on, `framebuffer=bgra-shadow` is sele
   registers are live in hardware. A measurement of a sleeping WFE (no SEVL) is needed before
   that is known to be safe. Capability bit 13 (0x2000) marks a resident with the WFE trap
   and the code-placement rule; the launcher requires it on T8152.
+- The guest's ACTLR_EL1 is saved, restored and emulated only through the architectural
+  `ACTLR_EL12` (`hv_t8152_guest_actlr_*`; the M6 CPU parts set `actlr_el2`). Phase 3
+  measurement (h) read the EL1 view there on E, P and M cores, and a write to the
+  implementation-defined alias UNDEFs at EL2 on all of them, so the carrier never accesses
+  that alias on T8152. A restore of the value the register already holds issues no write,
+  because an `ACTLR_EL12` write is not yet measured. Capability bit 14 (0x4000) marks such a
+  resident; the launcher requires it on T8152.
 - IPIs: polling by default (1 kHz secondary tick drains queued guest IPIs and vSGIs).
   Apple Fast IPIs only with the launcher's `ipi: fast`, after Phase 3 measurement (c).
 - The software GIC CPU interface (as T8142) only with `gic_cpuif: software`, after (f).
@@ -99,8 +106,9 @@ FWB is clear, stage 2 and the SMC trap are on, `framebuffer=bgra-shadow` is sele
 - Profiles for chip 0x8152 must bind `guest_ram {base, top}` and use `bgra-shadow`; they
   take no `reserved_memory`, N1 or MTP. Optional: `ipi` (`poll`/`fast`), `gic_cpuif`
   (`carrier`/`software`), `wfi` (`poll` only), `on_reset` (`stay`/`reboot`).
-- A resident must report capability bits 0x0800 (T8152 policy) and 0x1000 (12-live-CPU and
-  CTXR_D last-page refusal) for any of this.
+- A resident must report capability bits 0x0800 (T8152 policy), 0x1000 (12-live-CPU
+  refusal), 0x2000 (guest-WFE trap and code placement) and 0x4000 (architectural
+  `ACTLR_EL12` only) for any of this.
 - Before `hv_init`, the launcher reads `P_SMP_IS_ALIVE` for cpu0-11 (read-only) and stops
   with the list of CPUs that are not live; the resident checks the same again.
 - The guest ADT drops `qspi`, `i2c*`, `aop*`, `admac*`, `*audio*` and every `nvram,nor`

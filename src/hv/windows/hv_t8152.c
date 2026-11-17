@@ -777,3 +777,14 @@ int hv_t8152_verify(u64 entry, u64 bootargs, u64 secondary_hcr, bool fb_shadow)
            deny_count);
     return 0;
 }
+
+u64 hv_t8152_guest_actlr_read(void)
+{
+    return mrs(SYS_ACTLR_EL12);
+}
+
+void hv_t8152_guest_actlr_write(u64 value)
+{
+    if (mrs(SYS_ACTLR_EL12) != value)
+        msr(SYS_ACTLR_EL12, value);
+}

@@ -160,9 +160,14 @@ const struct midr_part_features features_m5_sotra = {
  * instead.
  */
 /* T8152's E and M cores share part 0x072; P cores use 0x073. Keep
- * implementation-defined tuning and fast IPIs off until separately qualified. */
+ * implementation-defined tuning and fast IPIs off until separately qualified.
+ * actlr_el2: EL2 reaches the guest's ACTLR_EL1 through the architectural ACTLR_EL12
+ * (S3_5_C1_C0_1, Arm ARM: ACTLR_EL1 accessed from EL2 when HCR_EL2.E2H is 1). Measured on
+ * E, P and M cores: it reads the EL1 view, and a write to the implementation-defined
+ * alias used before M2 is UNDEFINED at EL2. */
 const struct midr_part_features features_m6 = {
     .sleep_mode = SLEEP_NONE,
+    .actlr_el2 = true,
 };
 
 const struct midr_part_info midr_parts[] = {

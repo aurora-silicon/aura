@@ -44,11 +44,16 @@ typedef long s64;
 #define HCR_TWE BIT(14)
 #define HCR_TSC BIT(19)
 #define HCR_FWB BIT(46)
-extern u64 fake_mpidr, fake_hcr, fake_cntfrq;
+extern u64 fake_mpidr, fake_hcr, fake_cntfrq, fake_actlr12;
 #define mrs(r) fake_mrs_##r
+#define msr(r, v) fake_msr_##r(v)
 #define fake_mrs_MPIDR_EL1 fake_mpidr
 #define fake_mrs_HCR_EL2 fake_hcr
 #define fake_mrs_CNTFRQ_EL0 fake_cntfrq
+/* Only the architectural ACTLR_EL12 exists here: an access to any other ACTLR encoding
+ * (the implementation-defined alias that UNDEFs on T8152) fails to compile. */
+#define fake_mrs_SYS_ACTLR_EL12 fake_actlr12
+void fake_msr_SYS_ACTLR_EL12(u64 value);
 extern u32 board_id, chip_id;
 extern char *fake_base, *fake_rodata_end;
 #define _base fake_base
@@ -155,6 +160,9 @@ HARNESS = r"""
 #define S2_PROXY  (2UL << 50)
 
 u64 fake_mpidr = 0x10100, fake_hcr = 0x80001UL, fake_cntfrq = 1000000000;
+u64 fake_actlr12 = 0xc00; /* the EL1 view Part C (h) read on every core type */
+static int actlr12_writes;
+void fake_msr_SYS_ACTLR_EL12(u64 value) { fake_actlr12 = value; actlr12_writes++; }
 u32 board_id = 0x22, chip_id = 0x8152;
 char *fake_base = (char *)AURA, *fake_rodata_end = (char *)(AURA + 0x120000);
 int boot_cpu_idx = 6;
@@ -447,6 +455,21 @@ int main(void)
     assert(hv_t8152_verify(WIN_LO + 0x800, WIN_LO, hcr_ok, true) < 0);
     alive_mask = 0xfbf;
     assert(hv_t8152_verify(WIN_LO + 0x800, WIN_LO, hcr_ok, true) == 0);
+
+    /*
+     * B2, Part C (h): the guest's ACTLR_EL1 goes through ACTLR_EL12 only.  The write of
+     * that register is not yet measured on the M6, so restoring the value it already holds
+     * must issue no write at all; a different value must be written exactly once.
+     */
+    puts("ACTLR CHECK");
+    assert(hv_t8152_guest_actlr_read() == 0xc00);
+    hv_t8152_guest_actlr_write(0xc00);
+    assert(actlr12_writes == 0 && fake_actlr12 == 0xc00);
+    hv_t8152_guest_actlr_write(0xc80);
+    assert(actlr12_writes == 1 && fake_actlr12 == 0xc80);
+    assert(hv_t8152_guest_actlr_read() == 0xc80);
+    hv_t8152_guest_actlr_write(0xc80);
+    assert(actlr12_writes == 1);
     puts("T8152 POLICY OK");
     return 0;
 }
@@ -475,6 +498,7 @@ def test_t8152_carrier_policy(tmp_path):
     subprocess.run(cmd, check=True)
     result = subprocess.run([str(exe)], check=True, capture_output=True, text=True)
     assert "T8152 POLICY OK" in result.stdout
+    assert "ACTLR CHECK" in result.stdout
     # Every refusal says why.
     assert "CTXR_D is not armed" in result.stdout
     assert "is not J804" in result.stdout
@@ -520,3 +544,26 @@ def test_exec_window_constants_match_ctxr_exec():
     assert "#define T8152_EXEC_ALIGN (2UL << 20)" in policy
     assert "#define CTXR_EXEC_AURA_SLOT   ((u64)16 * SZ_1M)" in ctxr
     assert "#define CTXR_EXEC_ALIGN       ((u64)2 * SZ_1M)" in ctxr
+
+
+def test_t8152_guest_actlr_is_architectural_only():
+    """B2, Part C (h): on T8152 a write to the implementation-defined ACTLR_EL12 alias UNDEFs
+    at EL2 on every core type.  The M6 CPU parts select the architectural ACTLR_EL12, and the
+    carrier's only alias accesses sit behind a T8152 early return."""
+    chickens = (REPO / "src/chickens.c").read_text()
+    m6 = chickens.split("const struct midr_part_features features_m6 = {", 1)[1].split("};", 1)[0]
+    assert ".actlr_el2 = true," in m6
+    windows = REPO / "src/hv/windows"
+    for path in sorted(windows.glob("*.[ch]")):
+        text = path.read_text()
+        if path.name == "hv.c":
+            continue
+        assert "SYS_IMP_APL_ACTLR_EL12" not in text, path.name
+        assert "SYS_ACTLR_EL12" not in text or path.name == "hv_t8152.c", path.name
+    hv = (windows / "hv.c").read_text()
+    assert hv.count("SYS_IMP_APL_ACTLR_EL12") == 2
+    for name in ("u64 hv_guest_actlr_read(void)\n{", "void hv_guest_actlr_write(u64 value)\n{"):
+        body = hv.split(name, 1)[1].split("\n}\n", 1)[0]
+        assert body.lstrip().startswith("if (chip_id == T8152)"), name
+        assert "SYS_IMP_APL_ACTLR_EL12" in body
+    assert hv.count("hv_guest_actlr_read()") >= 1 and hv.count("hv_guest_actlr_write(") >= 2

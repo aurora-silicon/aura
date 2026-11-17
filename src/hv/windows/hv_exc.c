@@ -5788,19 +5788,13 @@ static bool hv_handle_msr_unlocked(struct exc_info *ctx, u64 iss)
             SYSREG_MAP(sys_reg(1, 0, 8, 5, 1), sys_reg(1, 0, 8, 2, 1)) // RVAE1OS -> RVAE1IS
 
         case SYSREG_ISS(SYS_ACTLR_EL1):
-            if (!cpu_features->actlr_el2 && !cpu_features->apple_sysregs_unlocked)
+            if (!cpu_features->actlr_el2 && !cpu_features->apple_sysregs_unlocked &&
+                chip_id != T8152)
                 return false;
-            if (is_read) {
-                if (cpu_features->actlr_el2)
-                    regs[rt] = mrs(SYS_ACTLR_EL12);
-                else
-                    regs[rt] = mrs(SYS_IMP_APL_ACTLR_EL12);
-            } else {
-                if (cpu_features->actlr_el2)
-                    msr(SYS_ACTLR_EL12, regs[rt]);
-                else
-                    msr(SYS_IMP_APL_ACTLR_EL12, regs[rt]);
-            }
+            if (is_read)
+                regs[rt] = hv_guest_actlr_read();
+            else
+                hv_guest_actlr_write(regs[rt]);
             return true;
 
         case SYSREG_ISS(SYS_IMP_APL_IPI_SR_EL1):

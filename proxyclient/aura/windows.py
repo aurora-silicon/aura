@@ -36,6 +36,9 @@ T8152_LIVE_CPUS = 0x1000
 # The resident traps and completes guest WFE on T8152 (HCR_EL2.TWE) and keeps its code below
 # the CTXR exec window and CTXR_D's last 32 MiB block. A resident without it must never run one.
 T8152_WFE_PLACEMENT = 0x2000
+# The resident reaches the guest's ACTLR_EL1 on T8152 only through the architectural ACTLR_EL12;
+# a resident without it writes the implementation-defined alias, which UNDEFs at EL2 there.
+T8152_ACTLR_ARCH = 0x4000
 T8152_CPUS = 12
 CONFIG_T8142_EXPERIMENTAL = 0x0001
 CONFIG_FRAMEBUFFER_SHADOW = 0x0002
@@ -133,6 +136,8 @@ def validate_capabilities(value, framebuffer="native", guest_compatibility="none
                 "never run a J804 guest on it")
         require(value & T8152_WFE_PLACEMENT, "resident lacks the T8152 guest-WFE trap and code "
                 "placement rule; never run a J804 guest on it")
+        require(value & T8152_ACTLR_ARCH, "resident lacks the T8152 architectural ACTLR_EL12 "
+                "rule; never run a J804 guest on it")
         require(value & CONFIGURATION, "resident lacks explicit Windows configuration")
     return value & 0xffff
 

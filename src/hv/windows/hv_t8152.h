@@ -57,4 +57,15 @@ u64 hv_t8152_hcr_filter(u64 hcr);
 /* hv_start(): walk the whole stage-2 table and the entry state. 0 or -1. */
 int hv_t8152_verify(u64 entry, u64 bootargs, u64 secondary_hcr, bool fb_shadow);
 
+/*
+ * The guest's ACTLR_EL1, as EL2 saves and restores it (hv_start, hv_init_secondary, the
+ * ACTLR_EL1 trap).  Only the architectural ACTLR_EL12 (S3_5_C1_C0_1; with HCR_EL2.E2H = 1
+ * it names the EL1 register, Arm ARM) is used: on T8152 a write to the implementation-
+ * defined alias is UNDEFINED at EL2 on every core type, so that alias is never accessed,
+ * not even read.  The write is skipped when the register already holds the value, since a
+ * write of ACTLR_EL12 itself has not been measured on T8152 yet.
+ */
+u64 hv_t8152_guest_actlr_read(void);
+void hv_t8152_guest_actlr_write(u64 value);
+
 #endif

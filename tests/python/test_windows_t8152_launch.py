@@ -31,7 +31,7 @@ QSPI = 0x2b0000000
 VALID = 1
 CAPS = (windows.CAPS_MAGIC | 1 << 16 | windows.REQUIRED_CAPS | windows.CONFIGURATION |
         windows.FRAMEBUFFER_SHADOW | windows.SERIAL_CDC_ISOLATED | windows.T8152_POLICY |
-        windows.T8152_LIVE_CPUS | windows.T8152_WFE_PLACEMENT)
+        windows.T8152_LIVE_CPUS | windows.T8152_WFE_PLACEMENT | windows.T8152_ACTLR_ARCH)
 
 
 def u64_pair(node, name, value):
@@ -106,7 +106,9 @@ def run(case="success"):
             if case == "no-live-cpu-refusal":
                 return CAPS & ~(windows.T8152_LIVE_CPUS | windows.T8152_WFE_PLACEMENT)
             if case == "no-wfe-trap":
-                return CAPS & ~windows.T8152_WFE_PLACEMENT
+                return CAPS & ~(windows.T8152_WFE_PLACEMENT | windows.T8152_ACTLR_ARCH)
+            if case == "apple-actlr":
+                return CAPS & ~windows.T8152_ACTLR_ARCH
             return CAPS
 
         def smp_is_alive(self, cpu):
@@ -227,6 +229,7 @@ def test_t8152_guest_placement_and_adt():
     ("resident-refuses", "refused the T8152 guest RAM window"),
     ("no-live-cpu-refusal", "12-live-CPU refusal"),
     ("no-wfe-trap", "guest-WFE trap and code placement"),
+    ("apple-actlr", "architectural ACTLR_EL12"),
     ("cpu-missing", r"only 11 of 12 CPUs .*not live: \[9\]"),
     ("secondaries-not-started", "only 1 of 12 CPUs"),
     ("wfi", "WFI_WIPES"),

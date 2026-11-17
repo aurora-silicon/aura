@@ -43,6 +43,9 @@ void hv_windows_quarantine(void);
  */
 #define HV_WINDOWS_T8152_WFI BIT(18)
 bool hv_t8152_native_wfi(void);
+/* The guest's ACTLR_EL1 from EL2. T8152 never touches the implementation-defined alias. */
+u64 hv_guest_actlr_read(void);
+void hv_guest_actlr_write(u64 value);
 bool hv_fast_ipi(void);
 bool hv_soft_gic_cpuif(void);
 void hv_kick_cpu(int cpu);
