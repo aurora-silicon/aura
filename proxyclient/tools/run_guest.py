@@ -29,6 +29,21 @@ parser.add_argument('-v', '--volume', type=volumespec, action='append',
                     help='Attach a 9P virtio device for file export to the guest. The argument is a host path to the '
                          'exported tree, joined by colon (\':\') with a tag under which the tree will be advertised '
                          'on the guest side.')
+parser.add_argument('--windows-guest-ram', metavar='BASE:TOP', default=None,
+                    help='Windows personality on T8152 (J804): the only guest RAM, [BASE, TOP). '
+                         'Required there; 64 KiB aligned, outside every carve-out, CTXR window '
+                         'and aura itself (the resident checks it again).')
+parser.add_argument('--windows-ipi', choices=('poll', 'fast'), default='poll',
+                    help='T8152: kick guest CPUs by polling (default) or, only after Phase 3 '
+                         'measurement (c) passed, with Apple Fast IPIs.')
+parser.add_argument('--windows-gic-cpuif', choices=('carrier', 'software'), default='carrier',
+                    help='T8152: the software GIC CPU interface (as T8142), only after Phase 3 '
+                         'measurement (f) showed ICC_* accesses trap to EL2.')
+parser.add_argument('--windows-serial', choices=('cdc', 'disabled'), default='cdc',
+                    help='T8152: guest vUART on the dedicated CDC interface (default) or off.')
+parser.add_argument('--windows-reset-on-exit', action='store_true',
+                    help='T8152: when the guest asks for PSCI SYSTEM_RESET, shut NVMe down and '
+                         'reset through WD1. Default: stay in the aura proxy.')
 parser.add_argument('payload', type=pathlib.Path)
 parser.add_argument('boot_args', default=[], nargs="*")
 args = parser.parse_args()
@@ -45,6 +60,84 @@ from aura.hw.pmu import PMU
 iface = UartInterface()
 p = AuraProxy(iface, debug=False)
 bootstrap_port(iface, p)
+
+
+def windows_resident_caps():
+    from aura.windows import CAPS_MAGIC
+    try:
+        caps = p.hv_windows_capabilities()
+    except ProxyRemoteError:
+        return 0
+    return caps if caps >> 32 == CAPS_MAGIC >> 32 else 0
+
+
+def run_windows_t8152(caps):
+    """The Windows personality (gmake WINDOWS=1) on T8152: the guest gets only its
+    RAM window, the AIC (Device-nGnRnE) and emulated MMIO; the resident refuses to
+    enter it unless every T8152 safety precondition holds (src/hv/windows/hv_t8152.c)."""
+    from aura.windows import (AURA_HEAP_RESERVE, PROXY_HEAP_SIZE, T8152_CHIP, number,
+                              t8152_check_window, windows_system_reset)
+    if not args.raw:
+        sys.exit("T8152 Windows guests are raw Mu FDs: pass -r")
+    if args.symbols or args.debug_xnu or args.volume or args.emulate_sprr or args.cpus or \
+            args.strip_node or args.shell or args.script or args.command:
+        sys.exit("T8152 Windows guests take only -r, -E, -a, -l and boot arguments")
+    if not args.windows_guest_ram or ":" not in args.windows_guest_ram:
+        sys.exit("T8152 needs --windows-guest-ram BASE:TOP (see docs/windows-t8152.md)")
+    base, top = (number(v, "guest RAM") for v in args.windows_guest_ram.split(":", 1))
+
+    u = ProxyUtils(p, heap_size=PROXY_HEAP_SIZE, aura_heap=AURA_HEAP_RESERVE)
+    if u.adt["/chosen"].chip_id != T8152_CHIP:
+        sys.exit("this Windows resident is not on T8152: use tools/boot_windows.py")
+    ba = u.ba
+    adt_pa = (ba.devtree - ba.virt_base + ba.phys_base) & ((1 << 64) - 1)
+    occupied = [("aura resident and heaps", u.base, u.heap_top - u.base),
+                ("live ADT", adt_pa, ba.devtree_size)]
+    if ba.video.base and ba.video.stride and ba.video.height:
+        occupied.append(("scanout", ba.video.base, ba.video.stride * ba.video.height))
+    t8152_check_window(u.adt, ba, base, top, occupied)
+    print(f"T8152: guest RAM [{base:#x}, {top:#x}) passes the host check; NVRAM, QSPI and the "
+          f"audio/AOP/ADMAC/i2c nodes are hidden, and the resident re-checks everything")
+
+    hv = HV(iface, p, u, windows=True)
+    hv.windows_framebuffer = "bgra-shadow"
+    hv.windows_serial = args.windows_serial
+    hv.windows_guest_ram = (base, top)
+    hv.windows_ipi = args.windows_ipi
+    hv.windows_gic_cpuif = args.windows_gic_cpuif
+    hv.init()
+    if args.logfile:
+        hv.set_logfile(args.logfile.open("w"))
+    if args.boot_args:
+        hv.set_bootargs(" ".join(args.boot_args))
+    data = args.payload.read_bytes()
+    for part in args.append_payload:
+        data += part.read_bytes()
+    hv.load_raw(data, args.entry_point)
+    if hv.guest_base % 0x10000:
+        sys.exit("Mu payload base is not 64 KiB aligned")
+    print(f"T8152: Mu at {hv.guest_base:#x}, entry {hv.entry:#x}, "
+          f"boot_args {hv.guest_base + hv.bootargs_off:#x}")
+    try:
+        result = hv.start()
+    except ProxyRemoteError as exc:
+        sys.exit(f"Hypervisor refused or failed: {exc}. The aura proxy keeps running; "
+                 "its console says why.")
+    print(f"Guest exit status: {result} (1 SYSTEM_OFF, 2 SYSTEM_RESET)")
+    if result == 2 and args.windows_reset_on_exit:
+        print("SYSTEM_RESET: shutting NVMe down, then resetting through WD1")
+        windows_system_reset(p)
+    else:
+        print("The aura proxy stays up. Nothing was written to disk or NVRAM by the guest.")
+    sys.exit(0)
+
+
+_windows_caps = windows_resident_caps()
+if _windows_caps and p.get_chipid() == 0x8152:
+    run_windows_t8152(_windows_caps)
+elif (args.windows_guest_ram or args.windows_ipi != 'poll' or args.windows_reset_on_exit or
+      args.windows_gic_cpuif != 'carrier'):
+    sys.exit("--windows-* options need the Windows personality (gmake WINDOWS=1) on T8152")
 
 if args.emulate_sprr or not p.get_cpu_features().apple_sysregs_unlocked:
     aura_heap_mb = 1024

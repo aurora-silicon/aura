@@ -798,6 +798,7 @@ class AuraProxy(Reloadable):
     P_HV_WINDOWS_ECPU_BOOT_STATE = 0xc86  # 0xc85: capture-kit EXIT_SNAPSHOT
     # Windows-only HvXfer bulk channel (src/hv/windows/hv_xfer.c); same opcode as m1n1 j813.
     P_HV_MAP_XFER = 0x1700
+    P_HV_WINDOWS_GUEST_RAM = 0xc8c
 
     P_FB_INIT = 0xd00
     P_FB_SHUTDOWN = 0xd01
@@ -1329,6 +1330,8 @@ class AuraProxy(Reloadable):
         `win`/`win_size` (16 KiB aligned, from the proxy heap). Returns 0 or a
         negative refusal; nothing is mapped on refusal."""
         return self.request(self.P_HV_MAP_XFER, base, win, win_size, signed=True)
+    def hv_windows_guest_ram(self, base, size):
+        return self.request(self.P_HV_WINDOWS_GUEST_RAM, base, size, signed=True)
 
     def fb_init(self):
         return self.request(self.P_FB_INIT)

@@ -120,6 +120,10 @@ class HV(Reloadable):
         self.xfer_dev = None
         self.xfer_transport = None
         self.xfer_info = None
+        self.windows_guest_ram = None    # T8152: (base, top) of the only guest RAM
+        self.windows_ipi = "poll"        # T8152: "fast" only after Phase 3 measurement (c)
+        self.windows_gic_cpuif = "carrier"  # T8152: "software" only after measurement (f)
+        self.windows_hidden = []
         self.pac_mask = self.PAC_MASK
         self.user_pac_mask = self.PAC_MASK
         self.vbar_el1 = None
@@ -1545,18 +1549,31 @@ class HV(Reloadable):
         self.windows_serial_recorder.receive(data)
 
     def init(self):
+        self.adt = load_adt(self.u.get_adt())
         if self.windows:
             from ..windows import (CONFIGURATION, CONFIG_FRAMEBUFFER_SHADOW,
                                    CONFIG_T8142_EXPERIMENTAL, CONFIG_SERIAL_CAPTURE,
                                    CONFIG_SERIAL_CDC, CONFIG_MTP, CONFIG_CPUFREQ, MTP_DISABLED_PROPERTY,
                                    MTP_RESERVED_BASE, MTP_RESERVED_SIZE, ecpu_boot_state_khz,
+                                   CONFIG_T8152_FAST_IPI, CONFIG_T8152_SOFT_GIC, T8152_CHIP,
                                    validate_capabilities)
+            self.windows_t8152 = self.adt["/chosen"].chip_id == T8152_CHIP
+            if self.windows_t8152:
+                if self.windows_guest_ram is None:
+                    raise ValueError("T8152 needs an explicit guest RAM window")
+                if self.windows_framebuffer != "bgra-shadow":
+                    raise ValueError("T8152 needs framebuffer bgra-shadow")
+            elif (self.windows_guest_ram is not None or self.windows_ipi != "poll" or
+                  self.windows_gic_cpuif != "carrier"):
+                raise ValueError("guest RAM window, IPI mode and GIC cpuif are T8152 options")
             caps = validate_capabilities(self.p.hv_windows_capabilities(), self.windows_framebuffer,
                                          self.windows_guest_compatibility, self.windows_n1,
                                          self.windows_memory_guard is not None, self.windows_serial,
                                          self.windows_mtp, self.windows_cpufreq,
                                          xfer=self.windows_xfer,
-                                         ecpu_boot_state=self.windows_ecpu_boot_state)
+                                         ecpu_boot_state=self.windows_ecpu_boot_state,
+                                         t8152=self.windows_t8152, ipi=self.windows_ipi,
+                                         gic_cpuif=self.windows_gic_cpuif)
             if self.windows_mtp != "disabled":
                 guard = self.windows_memory_guard
                 if not guard or not any(r["base"] == MTP_RESERVED_BASE and
@@ -1574,7 +1591,6 @@ class HV(Reloadable):
         if self.emulate_sprr:
             print("SPRR/GXF: emulating in EL2 (guest image will be patched)")
 
-        self.adt = load_adt(self.u.get_adt())
         self.iodev = self.p.iodev_whoami()
         self.tba = self.u.ba.copy()
         self.device_addr_tbl = self.adt.build_addr_lookup()
@@ -1601,6 +1617,10 @@ class HV(Reloadable):
                     khz = ecpu_boot_state_khz(self.windows_ecpu_boot_state, chosen.chip_id,
                                               getattr(chosen, "board_id", None), self.adt.model,
                                               self.adt["/arm-io/pmgr"].getprop("voltage-states1-sram"))
+                if self.windows_ipi == "fast":
+                    flags |= CONFIG_T8152_FAST_IPI
+                if self.windows_gic_cpuif == "software":
+                    flags |= CONFIG_T8152_SOFT_GIC
                 if self.p.hv_windows_configure(flags) != 0:
                     raise RuntimeError("Windows hypervisor configuration rejected")
                 # Applied once by hv_start() before guest entry; never retried on this resident.
@@ -1653,10 +1673,18 @@ class HV(Reloadable):
         if self.windows and self.windows_serial == "capture":
             self.iface.set_event_handler(EVENT.WINDOWS_SERIAL, self.handle_windows_serial)
 
-        # Map MMIO ranges as HW by default
-        for r in self.adt["/arm-io"].ranges:
-            print(f"Mapping MMIO range: {r.parent_addr:#x} .. {r.parent_addr + r.size:#x}")
-            self.add_tracer(irange(r.parent_addr, r.size), "HW", TraceMode.OFF)
+        if self.windows and self.windows_t8152:
+            # T8152 stage 2 is an allowlist: no /arm-io range is passed through,
+            # except the AIC for the native-AIC carrier.  The resident maps it
+            # Device-nGnRnE and refuses anything on its denylist (hv_t8152.c).
+            aic_base, aic_size = self.adt["/arm-io/aic"].get_reg(0)
+            print(f"T8152: passing through only the AIC {aic_base:#x} .. {aic_base + aic_size:#x}")
+            self.add_tracer(irange(aic_base, aic_size), "HW", TraceMode.OFF)
+        else:
+            # Map MMIO ranges as HW by default
+            for r in self.adt["/arm-io"].ranges:
+                print(f"Mapping MMIO range: {r.parent_addr:#x} .. {r.parent_addr + r.size:#x}")
+                self.add_tracer(irange(r.parent_addr, r.size), "HW", TraceMode.OFF)
 
         if self.windows:
             # Preserve C-owned HCR/HACR/MDCR and timer/PMU policy. The generic
@@ -1916,9 +1944,23 @@ class HV(Reloadable):
         for path in self.windows_usb_removed:
             print(f"Windows USB disabled: removed {path}")
 
+    def _hide_windows_t8152_nodes(self):
+        from ..windows import t8152_hidden_nodes
+        self.windows_hidden = t8152_hidden_nodes(self.adt)
+        for path in sorted(self.windows_hidden, key=len, reverse=True):
+            if path in self.adt:
+                del self.adt[path]
+                print(f"T8152: hidden from the guest: {path}")
+        chosen = self.adt["/chosen"]
+        marker = "aura,windows-nvram-hidden"
+        chosen._properties[marker] = 1
+        chosen._types[marker] = (Int32ul, False)
+
     def setup_adt(self):
         if self.windows:
             self._disable_windows_usb()
+            if self.adt["/chosen"].chip_id == 0x8152:
+                self._hide_windows_t8152_nodes()
             from ..windows import (N1_BYTES, N1_PROPERTY, MTP_DISABLED_PROPERTY,
                                    CPUFREQ_PROPERTY, cpufreq_handoff_marker,
                                    UNIFIED_DISPLAY_PROPERTY, unified_display_marker)
@@ -2079,7 +2121,15 @@ class HV(Reloadable):
 
         print(f"Total region size: 0x{image_size:x} bytes")
 
-        self.phys_base = phys_base = guest_base = self.u.heap_top
+        t8152 = self.windows and getattr(self, "windows_t8152", False)
+        if t8152:
+            # The guest owns exactly its window; nothing of aura's heap (region-id-353).
+            ram_lo, ram_hi = self.windows_guest_ram
+            if self.p.hv_windows_guest_ram(ram_lo, ram_hi - ram_lo) != 0:
+                raise RuntimeError("resident refused the T8152 guest RAM window (see its console)")
+            self.phys_base = phys_base = guest_base = ram_lo
+        else:
+            self.phys_base = phys_base = guest_base = self.u.heap_top
         self.ram_base = self.phys_base & ~0xffffffff
         self.ram_size = self.u.ba.mem_size_actual
         guest_base += 16 << 20 # ensure guest starts within a 16MB aligned region of mapped RAM
@@ -2091,7 +2141,7 @@ class HV(Reloadable):
             # Arm UEFI runtime regions require 64-KiB alignment.
             guest_base = align_up(guest_base, 0x10000)
         self.guest_base = guest_base
-        mem_top = self.u.ba.phys_base + self.u.ba.mem_size
+        mem_top = ram_hi if t8152 else self.u.ba.phys_base + self.u.ba.mem_size
         mem_size = mem_top - phys_base
         if self.windows and (entryoffset < 0 or entryoffset >= len(image) or entryoffset % 4 or
                              guest_base + image_size > mem_top or mem_size <= 0):
@@ -2140,9 +2190,13 @@ class HV(Reloadable):
             self._windows_adt_blob()
 
         print(f"Mapping guest physical memory...")
-        self.add_tracer(irange(self.ram_base, self.u.ba.phys_base - self.ram_base), "RAM-LOW", TraceMode.OFF)
-        self.add_tracer(irange(phys_base, self.u.ba.mem_size_actual - phys_base + self.ram_base), "RAM-HIGH", TraceMode.OFF)
-        self.unmap_carveouts()
+        if t8152:
+            # Exactly the window: no RAM-LOW, nothing above it, no carve-out to unmap.
+            self.add_tracer(irange(ram_lo, ram_hi - ram_lo), "RAM-HIGH", TraceMode.OFF)
+        else:
+            self.add_tracer(irange(self.ram_base, self.u.ba.phys_base - self.ram_base), "RAM-LOW", TraceMode.OFF)
+            self.add_tracer(irange(phys_base, self.u.ba.mem_size_actual - phys_base + self.ram_base), "RAM-HIGH", TraceMode.OFF)
+            self.unmap_carveouts()
 
         print(f"Loading kernel image (0x{len(image):x} bytes)...")
         if self.windows:

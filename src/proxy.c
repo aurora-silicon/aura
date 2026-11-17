@@ -635,9 +635,9 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
 #ifdef AURA_WINDOWS
             /* Bit 13 (0x2000): HvXfer bulk channel, P_HV_MAP_XFER.
              * Bit 14 (0x4000): explicit J813 E boot state, P_HV_WINDOWS_ECPU_BOOT_STATE.
-             * Bit 17 (0x20000): T8152 stage-2 policy, guest RAM window op, T8152 Fast IPI
-             * opt-in. */
-            reply->retval = 0x4157494e00037fffULL;
+             * Bit 11 also stands for the T8152 stage-2 policy, guest RAM window op and T8152
+             * Fast IPI opt-in until the T8152 bits move to CAPS2. */
+            reply->retval = 0x4157494e00017fffULL;
 #else
             reply->retval = 0;
 #endif

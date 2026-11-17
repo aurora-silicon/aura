@@ -27,12 +27,17 @@ MTP_HANDOFF = 0x0400
 CPUFREQ_OWNERSHIP = 0x0800
 XFER = 0x2000  # HvXfer bulk channel: P_HV_MAP_XFER + HV_XFER events (src/hv/windows/hv_xfer.c)
 ECPU_BOOT_STATE = 0x4000  # P_HV_WINDOWS_ECPU_BOOT_STATE (docs/t8142-ecpu-stepup.md)
+# T8152 stage-2 allowlist policy, the guest RAM window op and the T8152 Fast IPI
+# opt-in. A resident without it must never run a J804 guest.
+T8152_POLICY = 0x0800
 CONFIG_T8142_EXPERIMENTAL = 0x0001
 CONFIG_FRAMEBUFFER_SHADOW = 0x0002
 CONFIG_SERIAL_CAPTURE = 0x0004
 CONFIG_SERIAL_CDC = 0x0008
 CONFIG_MTP = 0x0010
 CONFIG_CPUFREQ = 0x0020
+CONFIG_T8152_FAST_IPI = 0x10000
+CONFIG_T8152_SOFT_GIC = 0x20000
 MTP_DISABLED_PROPERTY = "aura,windows-mtp-disabled"
 MTP_RESERVED_BASE = 0x10020000000
 MTP_RESERVED_SIZE = 0x200000
@@ -75,7 +80,8 @@ def number(value, label):
 
 def validate_capabilities(value, framebuffer="native", guest_compatibility="none", n1="disabled",
                           reserved_memory=False, serial="disabled", mtp="disabled", cpufreq="disabled",
-                          xfer=False, ecpu_boot_state=0):
+                          xfer=False, ecpu_boot_state=0, t8152=False, ipi="poll",
+                          gic_cpuif="carrier"):
     require(isinstance(value, int) and value >> 32 == CAPS_MAGIC >> 32,
             "resident is not an explicit Windows Aura personality")
     require((value >> 16) & 0xffff == CAPS_ABI, "unsupported Windows Aura capability ABI")
@@ -106,6 +112,10 @@ def validate_capabilities(value, framebuffer="native", guest_compatibility="none
     if ecpu_boot_state:
         require(value & ECPU_BOOT_STATE and value & CONFIGURATION,
                 "resident lacks the explicit E-cluster boot state")
+    if t8152 or ipi != "poll" or gic_cpuif != "carrier":
+        require(value & T8152_POLICY, "resident lacks the T8152 stage-2 policy; "
+                "never run a J804 guest on it")
+        require(value & CONFIGURATION, "resident lacks explicit Windows configuration")
     return value & 0xffff
 
 
@@ -132,6 +142,10 @@ class LaunchPlan:
     xfer: object = None
     ecpu_boot_state: int = 0  # 0: keep the firmware handoff state (key absent)
     unified_display: str = "disabled"  # key absent: Mu keeps the legacy GPU and display pair
+    guest_ram: tuple = None
+    ipi: str = "poll"
+    on_reset: str = "stay"
+    gic_cpuif: str = "carrier"
 
 
 XFER_FIELDS = {"doorbell", "window_bytes", "serve_dir", "inbox", "compress"}
@@ -254,7 +268,8 @@ def plan_profile(filename):
     require(profile.get("schema") == "aura.windows.boot.v1", "unsupported Windows boot profile")
     require(set(profile) <= {"schema", "name", "target", "mu", "append", "framebuffer", "boot_args",
                              "guest_compatibility", "usb", "n1", "reserved_memory", "serial", "mtp", "cpufreq",
-                             "xfer", "ecpu_boot_state", "unified_display"},
+                             "xfer", "ecpu_boot_state", "unified_display", "guest_ram", "ipi",
+                             "on_reset", "gic_cpuif"},
             "unknown Windows profile field")
     require(isinstance(profile.get("name"), str) and 0 < len(profile["name"]) <= 80, "profile name is required")
     target = profile.get("target")
@@ -361,6 +376,8 @@ def plan_profile(filename):
         require("aura-mtp-handoff" not in names, "aura-mtp-handoff is an automatic reservation")
         reserved.append({"name": "aura-mtp-handoff", "base": MTP_RESERVED_BASE,
                          "size": MTP_RESERVED_SIZE})
+    guest_ram, ipi, on_reset, gic_cpuif = t8152_profile_fields(
+        profile, chip, framebuffer, compatibility, n1, mtp, declarations)
     boot_args = profile.get("boot_args", "")
     require(isinstance(boot_args, str) and len(boot_args.encode("ascii")) <= 255 and "\0" not in boot_args,
             "boot_args must be at most 255 ASCII bytes without NUL")
@@ -376,7 +393,132 @@ def plan_profile(filename):
     return LaunchPlan(filename, profile, raw, hashlib.sha256(raw).hexdigest(), b"".join(composed),
                       tuple(images), entry, chip, model, framebuffer, compatibility, usb, n1,
                       tuple(reserved), boot_args, serial, mtp, cpufreq, xfer,
-                      ecpu_boot_state=ecpu_boot_state, unified_display=unified_display)
+                      ecpu_boot_state=ecpu_boot_state, unified_display=unified_display,
+                      guest_ram=guest_ram, ipi=ipi, on_reset=on_reset, gic_cpuif=gic_cpuif)
+
+
+T8152_CHIP = 0x8152
+T8152_GUEST_ALIGN = 0x10000
+T8152_MIN_GUEST = 256 << 20
+T8152_ENTRY_OFFSET = 16 << 20  # ADT and TrustCache copies sit below the image (HV.load_raw)
+# ADT nodes the Windows guest never sees on T8152 (on top of the stage-2 denylist):
+# the QSPI NOR with the NVRAM partition, the speaker amps and their i2c buses, audio,
+# the AOP and ADMAC.  Matched against /arm-io children: prefix, or "audio" anywhere.
+T8152_HIDE_PREFIXES = ("qspi", "aop", "admac", "i2c")
+
+
+def t8152_profile_fields(profile, chip, framebuffer, compatibility, n1, mtp, reserved):
+    """T8152 (J804) profile rules. Returns (guest_ram, ipi, on_reset, gic_cpuif).
+
+    ipi "fast" and gic_cpuif "software" are opt-ins for after Phase 3 measurements
+    (c) and (f); the defaults are the paths that need neither."""
+    ipi = profile.get("ipi", "poll")
+    require(ipi in ("poll", "fast"), "ipi must be poll or fast")
+    gic_cpuif = profile.get("gic_cpuif", "carrier")
+    require(gic_cpuif in ("carrier", "software"), "gic_cpuif must be carrier or software")
+    on_reset = profile.get("on_reset", "stay")
+    require(on_reset in ("stay", "reboot"), "on_reset must be stay or reboot")
+    if chip != T8152_CHIP:
+        require("guest_ram" not in profile and ipi == "poll" and gic_cpuif == "carrier",
+                "guest_ram, ipi and gic_cpuif are T8152 profile fields")
+        return None, ipi, on_reset, gic_cpuif
+    ram = profile.get("guest_ram")
+    require(isinstance(ram, dict) and set(ram) == {"base", "top"},
+            "T8152 profiles must bind guest_ram {base, top}")
+    base, top = number(ram["base"], "guest_ram base"), number(ram["top"], "guest_ram top")
+    validate_t8152_window(base, top)
+    require(framebuffer == "bgra-shadow", "T8152 requires framebuffer bgra-shadow")
+    require(compatibility == "none", "T8152 requires guest_compatibility none")
+    require(n1 == "disabled" and mtp == "disabled", "T8152 has no N1 or MTP handoff")
+    require(not reserved, "T8152 profiles take no reserved_memory; guest_ram is the whole guest")
+    return (base, top), ipi, on_reset, gic_cpuif
+
+
+def validate_t8152_window(base, top):
+    require(0 <= base < top <= 1 << 64, "guest_ram must be a non-empty range")
+    require(base % T8152_GUEST_ALIGN == 0, "guest_ram base must be 64 KiB aligned")
+    require((top - base) % 0x4000 == 0, "guest_ram size must be a multiple of 16 KiB")
+    require(top - base >= T8152_MIN_GUEST, "guest_ram must be at least 256 MiB")
+
+
+def _pairs(node):
+    """{name: (base, size)} of a /chosen map node's <u64 base, u64 size> properties."""
+    out = {}
+    for key, value in node._properties.items():
+        if key == "name":
+            continue
+        if isinstance(value, (bytes, bytearray)) and len(value) == 16:
+            value = struct.unpack("<QQ", value)
+        if isinstance(value, (tuple, list)) and len(value) == 2 and all(isinstance(v, int) for v in value):
+            out[key] = (value[0], value[1])
+    return out
+
+
+def t8152_window_conflicts(base, top, phys_base, mem_size, carveouts, memory_map, occupied=()):
+    """Host-side mirror of the resident's hv_t8152_set_guest_ram() checks.
+
+    carveouts and memory_map map names to (base, size); occupied is a list of
+    (name, base, size) spans the host knows about (aura and its heaps, the live
+    ADT, the scanout). Returns the list of conflicts; empty means acceptable.
+    The resident re-checks all of it, plus CTXR_A-D and CTRR_C/D, which only it
+    can read.
+    """
+    validate_t8152_window(base, top)
+    problems = []
+    if not (phys_base <= base and top <= phys_base + mem_size):
+        problems.append(f"[{base:#x}, {top:#x}) is not inside boot_args RAM "
+                        f"[{phys_base:#x}, {phys_base + mem_size:#x})")
+    for name, (start, size) in sorted(carveouts.items()):
+        if not size or (start == phys_base and size == mem_size):
+            continue  # the usable-RAM carve-out itself (region-id-24 on J804)
+        if start < top and base < start + size:
+            problems.append(f"overlaps carve-out {name} [{start:#x}, {start + size:#x})")
+    for name, (start, size) in sorted(memory_map.items()):
+        if size and start < top and base < start + size:
+            problems.append(f"overlaps memory-map {name} [{start:#x}, {start + size:#x})")
+    for name, start, size in occupied:
+        if size and start < top and base < start + size:
+            problems.append(f"overlaps {name} [{start:#x}, {start + size:#x})")
+    return problems
+
+
+def t8152_check_window(adt, args, base, top, occupied=()):
+    """Raise unless [base, top) is a usable T8152 guest RAM window for this ADT."""
+    problems = t8152_window_conflicts(
+        base, top, args.phys_base, args.mem_size,
+        _pairs(adt["/chosen/carveout-memory-map"]), _pairs(adt["/chosen/memory-map"]), occupied)
+    require(not problems, "guest_ram refused: " + "; ".join(problems))
+
+
+def t8152_hidden_nodes(adt):
+    """/arm-io children hidden from a T8152 guest, plus every NVRAM store node."""
+    paths = []
+    for node in adt["/arm-io"]:
+        name = node.name
+        if name.startswith(T8152_HIDE_PREFIXES) or "audio" in name:
+            paths.append("/arm-io/" + name)
+
+    def walk(node, path):
+        for child in node:
+            here = path + "/" + child.name
+            compatible = getattr(child, "compatible", None) or []
+            if isinstance(compatible, str):
+                compatible = [compatible]
+            if "nvram,nor" in compatible and not any(here.startswith(p + "/") or here == p
+                                                      for p in paths):
+                paths.append(here)
+            walk(child, here)
+    walk(adt, "")
+    return paths
+
+
+def windows_system_reset(proxy):
+    """Guest asked for SYSTEM_RESET (exit status 2): shut NVMe down, then reset by WD1.
+
+    nvme_shutdown is a no-op when aura owns no NVMe session; a failure raises and the
+    machine is not reset (hold power to exit; nothing was written in M2/M3)."""
+    proxy.nvme_shutdown()
+    proxy.reboot()
 
 
 def _aligned(value, alignment):
@@ -629,7 +771,9 @@ class HardwareSession:
     def prepare(self, plan):
         validate_capabilities(self.capabilities(), plan.framebuffer, plan.guest_compatibility, plan.n1,
                               bool(plan.reserved_memory), plan.serial, plan.mtp, plan.cpufreq,
-                              xfer=plan.xfer is not None, ecpu_boot_state=plan.ecpu_boot_state)
+                              xfer=plan.xfer is not None, ecpu_boot_state=plan.ecpu_boot_state,
+                              t8152=plan.chip_id == T8152_CHIP, ipi=getattr(plan, "ipi", "poll"),
+                              gic_cpuif=getattr(plan, "gic_cpuif", "carrier"))
         self.validate_serial_transport(plan)
         if plan.serial == "capture":
             from .windows_serial import WindowsSerialRecorder
@@ -650,7 +794,20 @@ class HardwareSession:
         preflight.windows_mtp = plan.mtp
         preflight.windows_cpufreq = plan.cpufreq
         preflight.windows_unified_display = plan.unified_display
+        guest_ram = getattr(plan, "guest_ram", None)
+        preflight.windows_guest_ram = guest_ram
+        preflight.windows_ipi = getattr(plan, "ipi", "poll")
+        preflight.windows_gic_cpuif = getattr(plan, "gic_cpuif", "carrier")
         preflight.setup_adt()
+        if guest_ram is not None:
+            args = self._identity_bootargs
+            occupied = [("aura resident and heaps", self._identity_resident_base,
+                         self.proxy.hv_windows_heap_high_water() + AURA_HEAP_RESERVE +
+                         PROXY_HEAP_SIZE - self._identity_resident_base),
+                        ("live ADT", self._identity_adt_physical, args.devtree_size)]
+            if args.video.base and args.video.stride and args.video.height:
+                occupied.append(("scanout", args.video.base, args.video.stride * args.video.height))
+            t8152_check_window(preflight.adt, args, *guest_ram, occupied)
         preflight._windows_adt_blob()
         if plan.ecpu_boot_state:
             # Bind the E ladder before any target mutation; HV.init() binds it again.
@@ -684,6 +841,9 @@ class HardwareSession:
         self.hv.windows_serial = plan.serial
         self.hv.windows_serial_recorder = self.serial_capture
         self.hv.windows_xfer = plan.xfer is not None
+        self.hv.windows_guest_ram = guest_ram
+        self.hv.windows_ipi = getattr(plan, "ipi", "poll")
+        self.hv.windows_gic_cpuif = getattr(plan, "gic_cpuif", "carrier")
         self.hv.init()
         self.hv.set_logfile(self.iface.tty_log)
         prepare_n1_handoff(self.hv)
@@ -721,6 +881,9 @@ class HardwareSession:
 
     def start(self):
         return self.hv.start()
+
+    def system_reset(self):
+        windows_system_reset(self.proxy)
 
     def close(self):
         try:
@@ -772,7 +935,11 @@ def launch_profile(filename, device, output, session_factory=HardwareSession, gu
             caps = session.capabilities()
             validate_capabilities(caps, plan.framebuffer, plan.guest_compatibility, plan.n1,
                                   bool(plan.reserved_memory), plan.serial, plan.mtp, plan.cpufreq,
-                                  xfer=plan.xfer is not None, ecpu_boot_state=plan.ecpu_boot_state)
+                                  xfer=plan.xfer is not None,
+                                  ecpu_boot_state=plan.ecpu_boot_state,
+                                  t8152=plan.chip_id == T8152_CHIP,
+                                  ipi=getattr(plan, "ipi", "poll"),
+                                  gic_cpuif=getattr(plan, "gic_cpuif", "carrier"))
             identity = session.identity()
             require(identity["chip_id"] == plan.chip_id and identity["model"] == plan.model,
                     "target identity does not match the Windows profile")
@@ -801,6 +968,12 @@ def launch_profile(filename, device, output, session_factory=HardwareSession, gu
             report["result"] = {1: "guest-powered-off-unqualified",
                                 2: "guest-reset-requested-unqualified"}.get(
                                     result, "guest-returned-unqualified")
+            if result == 2 and getattr(plan, "on_reset", "stay") == "reboot":
+                # The guest ran with no NVMe of its own (T8152 denylist), so this is
+                # aura's session only; the resident refuses the reset if shutdown fails.
+                report["result"] = "guest-reset-nvme-shutdown-then-reboot"
+                (output / "launch.json").write_text(json.dumps(report, indent=2) + "\n")
+                session.system_reset()
             return report
     except BaseException as error:
         report.update(result="failed", error=type(error).__name__ + ": " + str(error))
