@@ -94,9 +94,20 @@ static bool t8142_sysreg_assist_logged;
  * cleanup still need stable, implementation-private line numbers.
  */
 //
-#define HV_TIMER_SWIRQ_BASE            (aic->nr_irq - (2 * MAX_CPUS))
+/*
+ * Slots per bank are a guest ABI, not this build's CPU count.  Mu's AppleAicDxe
+ * reserves AIC_TIMER_REFLECT_CPU_SLOTS = 24 per bank (AppleAicLib.h): it unmasks
+ * [N - 48, N - 24) for CNTP and [N - 24, N) for CNTV and classifies its EVENT reads
+ * by the same ranges.  That number matched MAX_CPUS when the ABI was written;
+ * MAX_CPUS later became 32 (M3 Ultra), which moved every line down by 8 per bank:
+ * CPU 6's CNTP tick landed on N - 58, a line Mu never unmasks, and its CNTV tick on
+ * N - 26, inside Mu's CNTP range.  Keep the two sides on one number.
+ */
+#define HV_TIMER_REFLECT_SLOTS         24
+#define HV_TIMER_SWIRQ_BASE            (aic->nr_irq - (2 * HV_TIMER_REFLECT_SLOTS))
+#define HV_TIMER_SWIRQ_COUNT           (2 * HV_TIMER_REFLECT_SLOTS)
 #define HV_TIMER_P_SWIRQ(cpu)          (HV_TIMER_SWIRQ_BASE + (cpu))
-#define HV_TIMER_V_SWIRQ(cpu)          (HV_TIMER_SWIRQ_BASE + MAX_CPUS + (cpu))
+#define HV_TIMER_V_SWIRQ(cpu)          (HV_TIMER_SWIRQ_BASE + HV_TIMER_REFLECT_SLOTS + (cpu))
 #define HV_TIMER_REFLECT_CALL_MAGIC    0x4e54414943ULL /* "NTAIC" */
 #define HV_SYSREG_ASSIST_CALL_MAGIC    0x4e54535247ULL /* "NTSRG" */
 #define HV_TIMER_REFLECT_CALL_REPOST_P 0x100
@@ -706,6 +717,25 @@ static bool hv_sgi_queue_pop(virq_t *pending)
 #endif
 
 #ifdef ENABLE_NATIVE_AIC_PASSTHROUGH
+/*
+ * The reserved block has HV_TIMER_REFLECT_SLOTS lines per bank, fewer than
+ * MAX_CPUS: a CPU index past the block owns no line (none exists on a SoC this
+ * carrier runs a guest on), and must not reach into the other bank or past the
+ * top of the AIC.
+ */
+static void hv_timer_swirq_set(bool physical, int cpu, bool on)
+{
+    if (cpu < 0 || cpu >= HV_TIMER_REFLECT_SLOTS)
+        return;
+    aic_set_sw(physical ? HV_TIMER_P_SWIRQ(cpu) : HV_TIMER_V_SWIRQ(cpu), on);
+}
+
+static void hv_timer_swirq_clear(int cpu)
+{
+    hv_timer_swirq_set(true, cpu, false);
+    hv_timer_swirq_set(false, cpu, false);
+}
+
 //
 // windows-native-aic: initialize per-CPU timer reflection state and clear any
 // stale Mu-only AIC software events.  The reserved lines are not configured as
@@ -753,11 +783,15 @@ void hv_timer_reflect_init(void)
         native_irq_rearm_last_captured_event[cpu] = 0;
         native_irq_rearm_replay_valid[cpu] = false;
         native_irq_rearm_replay_event[cpu] = 0;
-        aic_set_sw(HV_TIMER_P_SWIRQ(cpu), false);
-        aic_set_sw(HV_TIMER_V_SWIRQ(cpu), false);
+        hv_timer_swirq_clear(cpu);
     }
     vm_tmr_fiq_clr(VM_TMR_FIQ_ENA_ENA_P | VM_TMR_FIQ_ENA_ENA_V);
     printf("HV: windows-native-aic: holding timer FIQ until Mu AIC is ready\n");
+    printf("HV: windows-native-aic: timer SW IRQs CNTP [%u, %u) CNTV [%u, %u), %u per bank "
+           "(Mu AIC_TIMER_REFLECT_CPU_SLOTS)\n",
+           HV_TIMER_SWIRQ_BASE, HV_TIMER_SWIRQ_BASE + HV_TIMER_REFLECT_SLOTS,
+           HV_TIMER_SWIRQ_BASE + HV_TIMER_REFLECT_SLOTS, HV_TIMER_SWIRQ_BASE + HV_TIMER_SWIRQ_COUNT,
+           HV_TIMER_REFLECT_SLOTS);
 }
 
 void hv_timer_native_enable(void)
@@ -773,8 +807,7 @@ void hv_timer_native_enable(void)
 void hv_timer_reflect_enable(void)
 {
     for (int cpu = 0; cpu < MAX_CPUS; cpu++) {
-        aic_set_sw(HV_TIMER_P_SWIRQ(cpu), false);
-        aic_set_sw(HV_TIMER_V_SWIRQ(cpu), false);
+        hv_timer_swirq_clear(cpu);
         PERCPU_N(cpu, carrier_timer_ready) = false;
         PERCPU_N(cpu, carrier_stack_ready) = false;
         PERCPU_N(cpu, carrier_delivery_proven) = false;
@@ -793,8 +826,7 @@ void hv_timer_reflect_enable(void)
 void hv_timer_reflect_hold(void)
 {
     for (int cpu = 0; cpu < MAX_CPUS; cpu++) {
-        aic_set_sw(HV_TIMER_P_SWIRQ(cpu), false);
-        aic_set_sw(HV_TIMER_V_SWIRQ(cpu), false);
+        hv_timer_swirq_clear(cpu);
         PERCPU_N(cpu, timer_p_reflection_pending) = false;
         PERCPU_N(cpu, timer_v_reflection_pending) = false;
         PERCPU_N(cpu, timer_p_event_unread) = false;
@@ -1028,7 +1060,7 @@ static void hv_native_aic_progress_deferred_irq(void)
         irq = FIELD_GET(AIC_EVENT_NUM, raw_event);
         flat_irq = die * aic->max_irq + irq;
         if (type == AIC_EVENT_TYPE_HW && flat_irq >= HV_TIMER_SWIRQ_BASE &&
-            flat_irq < HV_TIMER_SWIRQ_BASE + (2 * MAX_CPUS)) {
+            flat_irq < HV_TIMER_SWIRQ_BASE + HV_TIMER_SWIRQ_COUNT) {
             aic_set_sw(flat_irq, false);
             aic_set_mask(flat_irq, true);
             HV_NATIVE_AIC_HOT_TRACE(HV_NATIVE_AIC_TRACE_EVENT_RESERVED, flat_irq, raw_event);
@@ -1668,7 +1700,7 @@ static void hv_update_fiq(struct exc_info *ctx)
             if (!PERCPU(timer_p_reflection_pending)) {
                 PERCPU(timer_p_fiq_count)++;
                 PERCPU(timer_p_reflection_pending) = true;
-                aic_set_sw(HV_TIMER_P_SWIRQ(smp_id()), true);
+                hv_timer_swirq_set(true, smp_id(), true);
                 HV_GUEST_DIAG_INC(timer_reflect);
                 HV_NATIVE_AIC_HOT_TRACE(HV_NATIVE_AIC_TRACE_TIMER_FIQ, 0,
                                         PERCPU(timer_p_fiq_count));
@@ -1683,13 +1715,35 @@ static void hv_update_fiq(struct exc_info *ctx)
             if (!PERCPU(timer_v_reflection_pending)) {
                 PERCPU(timer_v_fiq_count)++;
                 PERCPU(timer_v_reflection_pending) = true;
-                aic_set_sw(HV_TIMER_V_SWIRQ(smp_id()), true);
+                hv_timer_swirq_set(false, smp_id(), true);
                 HV_GUEST_DIAG_INC(timer_reflect);
                 HV_NATIVE_AIC_HOT_TRACE(HV_NATIVE_AIC_TRACE_TIMER_FIQ, 1,
                                         PERCPU(timer_v_fiq_count));
             }
         } else if (!PERCPU(timer_v_reflection_pending)) {
             vm_tmr_fiq_set(VM_TMR_FIQ_ENA_ENA_V);
+        }
+    } else {
+        /*
+         * No route owns the guest timers yet: Mu has not configured AIC2, or
+         * TimerDxe's final ENABLE write has not been seen.  HCR_EL2.FMO sends
+         * an asserted timer to EL2 whatever the guest's PSTATE.F says, and
+         * nothing here can deliver it, so leaving it unmasked re-takes the same
+         * FIQ on every return: a permanent EL2 FIQ storm that freezes the guest
+         * mid-instruction-stream (the first T8152 M2 run stopped this way, mid
+         * serial line, about 10 ms after TimerDxe armed CNTP).  Hold it.  On
+         * T8152 the hold is the guest-visible IMASK (no Apple VM timer FIQ
+         * gate); the guest's EL1 CNTP accesses trap (hv_init()), so its next
+         * control write still reaches hv_timer_reflect_guest_rearm() and
+         * latches readiness.  Never unmask here: that is the guest's choice.
+         */
+        if (hv_timer_firing(mrs(CNTP_CTL_EL02)) && !(mrs(CNTP_CTL_EL02) & CNTx_CTL_IMASK)) {
+            vm_tmr_fiq_clr(VM_TMR_FIQ_ENA_ENA_P);
+            HV_GUEST_DIAG_INC(timer_unrouted_mask);
+        }
+        if (hv_timer_firing(mrs(CNTV_CTL_EL02)) && !(mrs(CNTV_CTL_EL02) & CNTx_CTL_IMASK)) {
+            vm_tmr_fiq_clr(VM_TMR_FIQ_ENA_ENA_V);
+            HV_GUEST_DIAG_INC(timer_unrouted_mask);
         }
     }
 #else
@@ -1833,7 +1887,7 @@ bool hv_native_aic_event_read(u64 raw_event, u64 *event)
     u32 flat_irq = die * aic->max_irq + irq;
     u32 ipi_event_token;
     bool reserved = type == AIC_EVENT_TYPE_HW && flat_irq >= HV_TIMER_SWIRQ_BASE &&
-                    flat_irq < HV_TIMER_SWIRQ_BASE + (2 * MAX_CPUS);
+                    flat_irq < HV_TIMER_SWIRQ_BASE + HV_TIMER_SWIRQ_COUNT;
 
     if (!hv_native_aic_windows_ready() || event == NULL)
         return false;
@@ -1936,13 +1990,13 @@ static void hv_timer_reflect_guest_rearm(bool physical, bool control_write, u64 
                 if (PERCPU(timer_p_reflection_pending))
                     HV_NATIVE_AIC_HOT_TRACE(HV_NATIVE_AIC_TRACE_TIMER_REARM, 0, value);
                 PERCPU(timer_p_reflection_pending) = false;
-                aic_set_sw(HV_TIMER_P_SWIRQ(smp_id()), false);
+                hv_timer_swirq_set(true, smp_id(), false);
                 vm_tmr_fiq_set(VM_TMR_FIQ_ENA_ENA_P);
             } else {
                 if (PERCPU(timer_v_reflection_pending))
                     HV_NATIVE_AIC_HOT_TRACE(HV_NATIVE_AIC_TRACE_TIMER_REARM, 1, value);
                 PERCPU(timer_v_reflection_pending) = false;
-                aic_set_sw(HV_TIMER_V_SWIRQ(smp_id()), false);
+                hv_timer_swirq_set(false, smp_id(), false);
                 vm_tmr_fiq_set(VM_TMR_FIQ_ENA_ENA_V);
             }
         }
@@ -7206,7 +7260,7 @@ void hv_exc_irq(struct exc_info *ctx)
      * be acknowledged and injected forever.
      */
     if ((!hv_native_aic_active() || hv_gic_cpuif_active()) && irq >= HV_TIMER_SWIRQ_BASE &&
-        irq < HV_TIMER_SWIRQ_BASE + (2 * MAX_CPUS)) {
+        irq < HV_TIMER_SWIRQ_BASE + HV_TIMER_SWIRQ_COUNT) {
         aic_set_mask(irq, true);
         aic_set_sw(irq, false);
         hv_native_aic_trace_record(HV_NATIVE_AIC_TRACE_EVENT_RESERVED, irq, reason);

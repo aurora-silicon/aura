@@ -674,6 +674,21 @@ int hv_init(void)
              */
             msr(CNTHCTL_EL2, 0);
             printf("HV: T8142: trapping EL1 CNTP timer and counter accesses for reflection\n");
+        } else if (chip_id == T8152) {
+            /*
+             * Same reason as T8142 above, without the counter half: the EL1
+             * counter view advances on T8152 (Mu's delay loops ran on it in the
+             * first M2 run), so EL1PCTEN stays set and only EL1PTEN is cleared.
+             * Under HCR_EL2.E2H=1 that bit traps EL0/EL1 CNTP_CTL/CVAL/TVAL
+             * (Arm ARM, CNTHCTL_EL2).  With it set, the first M2 run's TimerDxe
+             * armed CNTP untrapped, mu_timer_ready never latched ("waiting for
+             * timer handler on CPU 6" with no "Mu timer handler ready"), and the
+             * guest stopped mid serial line about 10 ms later.  The trapped
+             * accesses go to the EL02 bank through SYSREG_MAP_REFLECT in
+             * hv_handle_msr_unlocked().
+             */
+            msr(CNTHCTL_EL2, CNTHCTL_EL1PCTEN);
+            printf("HV: T8152: trapping EL1 CNTP timer accesses for reflection\n");
         } else {
             msr(CNTHCTL_EL2, CNTHCTL_EL1PTEN | CNTHCTL_EL1PCTEN);
         }

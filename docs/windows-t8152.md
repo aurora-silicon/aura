@@ -136,6 +136,17 @@ FWB is clear, stage 2 and the SMC trap are on, `framebuffer=bgra-shadow` is sele
   - Capability bit 15 (0x8000) marks such a resident; the launcher requires it on T8152 and
     refuses `gic_cpuif: carrier` there, and the resident's configure step refuses a T8152
     configuration without the software-interface bit.
+- Mu-phase timer: EL0/EL1 CNTP accesses trap (`CNTHCTL_EL2` = EL1PCTEN only, so
+  EL1PTEN is clear; under `HCR_EL2.E2H` that bit controls CNTP_CTL/CVAL/TVAL, Arm ARM
+  CNTHCTL_EL2), as on T8142 but with the direct counter kept. The trapped accesses use the
+  EL02 bank; TimerDxe's final `CNTP_CTL` write (ENABLE, IMASK clear) latches
+  `Mu timer handler ready`, and from then on an expired CNTP is masked and posted as AIC
+  software line `nr_irq - 48 + cpu` (CNTV: `nr_irq - 24 + cpu`), the 24-per-bank layout of
+  Mu's `AIC_TIMER_REFLECT_CPU_SLOTS`. Before any route owns the guest timers,
+  `hv_update_fiq()` masks an asserted one (the guest-visible IMASK on T8152, which has no
+  Apple VM timer FIQ gate) instead of leaving it to re-enter EL2 forever. The first M2 run
+  (2026-11-16) had EL1PTEN set (`CNTHCTL_EL2=0xc00`): readiness never latched and the guest
+  stopped about 10 ms after TimerDxe armed CNTP. Not yet run with the trap.
 - Once a second, next to `HV: fb: … lines/s`, the host tick prints one `HV: g<cpu> …` line
   for each CPU that took a guest exit since the previous one: route
   (`wait-aic`/`wait-timer`/`mu`/`gic`/`win-carrier`/`win`), the guest PC at its last exit

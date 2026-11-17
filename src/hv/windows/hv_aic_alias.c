@@ -24,7 +24,7 @@ struct hv_aic_alias {
  * guest under this device's INTID.  J414s publishes 37..46 for its aliases,
  * but 37 is taken on this SoC, so those numbers are not portable here.
  *
- * m1n1's own reserved timer software IRQs sit at aic->nr_irq - 2 * MAX_CPUS,
+ * m1n1's own reserved timer software IRQs sit at aic->nr_irq - 2 * 24 (the Mu ABI),
  * i.e. the very top of AIC space, so they cannot collide with a low published
  * number either.
  *
@@ -86,7 +86,7 @@ static const struct hv_aic_alias *hv_aic_alias_table(u32 *count)
      *
      * Re-run the free-line walk on the live ADT before each run.  A published
      * number must also never be one of aura's reserved timer software lines at
-     * aic->nr_irq - 2 * MAX_CPUS .. aic->nr_irq - 1 (2336..2399 with 0x960).
+     * aic->nr_irq - 2 * 24 .. aic->nr_irq - 1 (2352..2399 with 0x960).
      */
     if (chip_id == T8152) {
         *count = 0;
