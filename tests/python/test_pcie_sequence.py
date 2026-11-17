@@ -36,6 +36,7 @@ typedef uint64_t u64;
 #define FIELD_PREP(f, v) (((v) * ((f) & -(f))) & (f))
 #define T8140 0x8140
 #define T6050 0x6050
+#define T8142 0x8142
 #define ADT_GETPROP(a, n, p, v) adt_getprop_copy(a, n, p, v, sizeof(*(v)))
 static void *adt;
 static int chip_id = T8140;
@@ -109,7 +110,15 @@ static int tunables_validate_local(const char *path, const char *prop, u64 span)
 static int pmgr_adt_power_enable(const char *path) { powered++; return 0; }
 /* T6050 hardware is outside this T8140/T8132 MMIO model. */
 static int pcie_t6050_init(void) { abort(); }
-static int pmgr_power_steps(int die, const char *name, bool on) { abort(); }
+/* ANS's storage gates (T6050, T8142): each step recorded, "name+" on and "name-" off. */
+static char steps[512];
+static const char *fail_step;
+static int pmgr_power_steps(int die, const char *name, bool on)
+{
+    assert(die == 0 && (chip_id == T6050 || chip_id == T8142));
+    snprintf(steps + strlen(steps), sizeof(steps) - strlen(steps), "%s%c ", name, on ? '+' : '-');
+    return fail_step && !strcmp(name, fail_step) ? -1 : 0;
+}
 static int pmgr_adt_power_disable_index(const char *path, int i) { assert(0); return -1; }
 static int pmgr_adt_power_disable_under(const char *path, const char *name) { assert(0); return -1; }
 static void access_mmio(u64 addr)
@@ -259,6 +268,36 @@ int main(void)
     controller_compat = "apcie,t8132";
     fail_tunable = 1;
     assert(pcie_init() == -1 && pll == 1 && auspma == 0 && !port_run);
+
+    /*
+     * ANS through its storage gates alone: no APCIe block power or MMIO, so the GP ports (N1 on
+     * T8142) stay as they are. T8142: AppleT8142PCIe's storage half, on in ADT order.
+     */
+    reset_model();
+    chip_id = T8142;
+    assert(pcie_ans_power_off() == 0);
+    assert(!strcmp(steps, "ST0_AUS5- ST0_AUS5_AON- APCIE_SYS_ST- APCIE_ST- ANS- "));
+    steps[0] = 0;
+    assert(pcie_ans_power_on() == 0);
+    assert(!strcmp(steps, "ANS+ APCIE_ST+ APCIE_SYS_ST+ ST0_AUS5_AON+ ST0_AUS5+ "));
+    assert(powered == 0 && accesses == 0);
+    /* A gate that doesn't move stops the sequence there. */
+    steps[0] = 0;
+    fail_step = "APCIE_SYS_ST";
+    assert(pcie_ans_power_off() == -1);
+    assert(!strcmp(steps, "ST0_AUS5- ST0_AUS5_AON- APCIE_SYS_ST- "));
+    fail_step = NULL;
+    reset_model();
+    chip_id = T6050;
+    steps[0] = 0;
+    assert(pcie_ans_power_off() == 0);
+    assert(!strcmp(steps, "APHY_ST0_AUS5- APHY_ST0_AUS5_A- APHY_ST1_AUS5- APHY_ST1_AUS5_A- "
+                          "APCIE_SYS_ST1- APCIE_SYS_ST0- ANS- "));
+    steps[0] = 0;
+    assert(pcie_ans_power_on() == 0);
+    assert(!strcmp(steps, "ANS+ APCIE_SYS_ST0+ APCIE_SYS_ST1+ APHY_ST0_AUS5_A+ APHY_ST1_AUS5_A+ "
+                          "APHY_ST0_AUS5+ APHY_ST1_AUS5+ "));
+    assert(powered == 0 && accesses == 0);
     return 0;
 }
 '''

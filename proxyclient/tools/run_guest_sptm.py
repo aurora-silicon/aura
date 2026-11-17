@@ -39,7 +39,7 @@ Environment (all optional; 1 enables a switch):
   AURA_S2R_PROBE=<a,...>   read up to four registers at the wake (bit 63: 64-bit read)
   AURA_S2R_PROBE_AT=<a>    take the AURA_S2R_PROBE reads after the guest's first write to a
   AURA_S2R_PREWRITE=<a,v>  write v to a at the wake, before the probes
-  AURA_AURA_HEAP_MIB=<n>   aura's own heap under the guest (default 112)
+  AURA_AURA_HEAP_MIB=<n>   aura's own heap under the guest (112 MiB on J813, 128 elsewhere)
   AURA_S2R_QUIESCE=<mask>  AMCC error-enable writes at the commit: 8 DSID_AGE_OUT,
                            16 UNEXP_RT_HIT_DIR
   AURA_S2R_USB_RETAKE=<n>  take the CDC link again after a wake; n > 1 also drops it n s in
@@ -276,6 +276,15 @@ XNU_QUIRKS = (
                     0x1400000f),
                    ("task PAC key reprogramming (4)", "BootKC-rx", 0x31488c4, 0x540001e0,
                     0x1400000f))),
+    # T6041's xnu-13432.41.4 (macOS 27.2.1, 26B131, kernelcache.release.mac16j). Its guest needs
+    # only nvram_ro: about 27 s in, while APFS mounts the volumes, AppleARMNORNVRAM sends the NOR a
+    # write enable. The same two words as the J813's, at this kernelcache's offsets; the first is
+    # the fingerprint. Without exclaves its single-user boot reaches the shell with no other patch.
+    dict(release=b"xnu-13432.41.4~", fingerprint=("__TEXT_EXEC", 0x1bdf0c, 0xaa0003e8),
+         hide=(), ro_relax=(),
+         nvram_ro=(("AppleARMNORNVRAM::write", "BootKC-rx", 0x1bdf0c, 0xaa0003e8, 0x52800000),
+                   ("AppleARMNORNVRAM::write return", "BootKC-rx", 0x1bdf10, 0x52805840,
+                    0xd65f03c0))),
     # T8142's xnu-13432.41.4 (macOS 27.2.1 26B131, kernelcache.release.mac17g; 27.2's 26B123
     # ships the same XNU release but its kernelcache is not checked). Every site above, ported
     # from 26A428: each
@@ -343,6 +352,16 @@ def env_on(name):
 def env_int(name, default=0):
     value = os.environ.get(name)
     return int(value, 0) if value else default
+
+
+def aura_heap_size(adt):
+    override = os.environ.get("AURA_AURA_HEAP_MIB")
+    if override is not None:
+        return int(override) * 1024 * 1024
+    # The J813's padded EL2 boot object leaves a 160 MiB carve-out, with about
+    # 33 MiB already used before the host reserves space for aura's own heap.
+    j813 = adt["/chosen"].chip_id == 0x8142 and getattr(adt, "model", None) == "Mac17,3"
+    return (112 if j813 else 128) * 1024 * 1024
 
 
 def parse_args():
@@ -821,11 +840,7 @@ def main():
     iface = UartInterface()
     p = AuraProxy(iface, debug=False)
     bootstrap_port(iface, p)
-    # J813 under the padded el2 objects: aura's carve-out is only 160 MiB (its floor is above
-    # the 128 MiB execute window), and aura has used ~33 MiB of it by now, so the default 128 MiB
-    # reservation for aura's own heap reached into SPTM's window and sptm_virt_load refused.
-    u = ProxyUtils(p, heap_size=128 * 1024 * 1024,
-                   aura_heap=int(os.environ.get("AURA_AURA_HEAP_MIB", "112")) * 1024 * 1024)
+    u = ProxyUtils(p, heap_size=128 * 1024 * 1024, aura_heap=aura_heap_size)
     sym = Symbols(args.nm, args.elf, p.get_base())
 
     # SPTM's managed window, as aura computed it: above aura and everything iBoot left low,
