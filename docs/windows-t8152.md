@@ -561,6 +561,17 @@ sent and the guest sees no change.
   CRC-32 (zlib) over the used bytes. The launcher writes `/chosen/aura,windows-gpu-v1` (16
   bytes: handoff IPA, size) only after ADMIT returned 0; Mu's GPU0 node is built from the page.
 
-Not in G0 yet, each needing an owner-present session: PSD power-on (3, 82, 81), CPU_CONTROL
-RUN, iop-vbar pinned by value, mailbox forwarding, measured sgx passthrough, live GPU aliases,
+Not in G0 yet, each needing an owner-present session: PSD power-on (3, 82, 81), the
+CPU_CONTROL guard (our J804 Linux logs and the macOS traces show RUN already set once power-on
+completes, so G1 refuses writes that clear or toggle RUN instead of granting one RUN), iop-vbar pinned by value, mailbox forwarding, measured sgx passthrough, live GPU aliases,
 mapping the firmware classes, and a boot-wide (not per-carrier-session) admission marker.
+"Once per carrier session" is all G0 has: a carrier reload resets it. That is harmless while
+nothing powers or starts the firmware; the GPU host test fails as soon as `hv_gpu.c` sets
+`GPU_HS_POWERED` or `GPU_HS_ASC_RUN` without a `HV_GPU_BOOT_MARKER`.
+
+A failed ADMIT rolls back every stage-2 exception it added (`hv_t8152_allow_rollback()`); the
+`__TEXT` denylist entries stay, since they only forbid more. The handoff page is cleaned to the
+point of coherency after each build, because Mu's PrePi reads it with the MMU off. The
+launcher detaches USB before every GPU refusal, and refuses a pool that overlaps the loaded
+image (Mu FD, appended payloads, SEPFW, preoslog, boot_args) or, with an AHCI store, leaves
+less than 4 GiB of guest RAM below the pool.

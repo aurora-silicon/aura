@@ -1123,6 +1123,23 @@ def gpu_pool(ram_base, ram_top, mib):
     return ram_top - size, size
 
 
+def gpu_pool_check_layout(pool, ram_base, image_end, floor=None):
+    """The pool against what the launcher loaded: everything from guest RAM base to image_end
+    (ADT, trust cache, Mu FD, appended payloads, SEPFW, preoslog, boot_args) must end at or
+    below the pool base, or Mu refuses the pool and the GPU0 node silently disappears.  With
+    `floor` (bytes; the AHCI layout's 4 GiB), guest RAM below the pool must keep at least that."""
+    pool_base, _ = pool
+    require(isinstance(image_end, int) and ram_base <= image_end,
+            f"the loaded image end {image_end!r} is not in guest RAM")
+    require(image_end <= pool_base,
+            f"the loaded image ends at {image_end:#x}, inside the GPU pool from {pool_base:#x}: "
+            "use a smaller --windows-gpu-pool-mib or a smaller payload")
+    if floor is not None:
+        require(pool_base - ram_base >= floor,
+                f"guest RAM below the GPU pool is {(pool_base - ram_base) >> 20} MiB, under the "
+                f"{floor >> 20} MiB Windows floor of the AHCI layout")
+
+
 def gpu_handshake(ipa, size):
     """/chosen/aura,windows-gpu-v1 for Mu's GPU0 node: where the read-only handoff page is."""
     require(isinstance(ipa, int) and 0 < ipa < (1 << 64) - 1 and ipa % GPU_HANDOFF_SIZE == 0,

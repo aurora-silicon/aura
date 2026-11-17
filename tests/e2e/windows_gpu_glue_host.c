@@ -44,7 +44,11 @@ void aura_sha256(const void *data, size_t size, u8 digest[32])
 static bool armed = true, ram_set = true, entered;
 static u64 ram_base, ram_top;
 static int fw_allow_calls, fw_allow_fail_at = -1, deny_calls, allow_calls, map_ro_calls;
-static int hook_calls;
+static int hook_calls, unmap_calls, clean_calls, rollback_calls;
+static bool allow_fail, map_fail;
+static unsigned int live_exceptions; /* the stage-2 allow table as hv_t8152.c would hold it */
+static void *clean_addr;
+static size_t clean_len;
 static struct {
     u64 pa, size;
     bool ro;
@@ -84,6 +88,7 @@ int hv_t8152_gpu_fw_allow(u64 pa, u64 size, bool read_only, u64 dram_lo, u64 dra
     fw[fw_allow_calls].lo = dram_lo;
     fw[fw_allow_calls].hi = dram_hi;
     fw_allow_calls++;
+    live_exceptions++;
     return 0;
 }
 
@@ -100,11 +105,40 @@ int hv_t8152_allow(u64 ipa, u64 pa, u64 size, bool read_only, const char *name)
 {
     (void)name;
     allow_calls++;
+    if (allow_fail)
+        return -1;
+    live_exceptions++;
     allow_ipa = ipa;
     allow_pa = pa;
     allow_size = size;
     allow_ro = read_only;
     return 0;
+}
+
+unsigned int hv_t8152_allow_mark(void)
+{
+    return live_exceptions;
+}
+
+void hv_t8152_allow_rollback(unsigned int mark, const char *why)
+{
+    assert(why && mark <= live_exceptions);
+    rollback_calls++;
+    live_exceptions = mark;
+}
+
+int hv_unmap(u64 from, u64 size)
+{
+    assert(from == map_from && size == 0x4000);
+    unmap_calls++;
+    return 0;
+}
+
+void dc_civac_range(void *addr, size_t length)
+{
+    clean_calls++;
+    clean_addr = addr;
+    clean_len = length;
 }
 
 int hv_map_hw_ro(u64 from, u64 to, u64 size)
@@ -113,7 +147,7 @@ int hv_map_hw_ro(u64 from, u64 to, u64 size)
     map_from = from;
     map_to = to;
     map_size = size;
-    return 0;
+    return map_fail ? -1 : 0;
 }
 
 int hv_map_hook(u64 from, hv_hook_t *hook, u64 size)
@@ -195,7 +229,12 @@ static void reset_stubs(void)
     chip_id = 0x8152;
     board_id = 0x22;
     fw_allow_calls = deny_calls = allow_calls = map_ro_calls = hook_calls = 0;
+    unmap_calls = clean_calls = rollback_calls = 0;
     fw_allow_fail_at = -1;
+    allow_fail = map_fail = false;
+    live_exceptions = 0;
+    clean_addr = NULL;
+    clean_len = 0;
 }
 
 int main(int argc, char **argv)
@@ -252,6 +291,9 @@ int main(int argc, char **argv)
     assert(map_from == ipa && map_to == ipa && map_size == 0x4000);
     assert(op(HV_GPU_OP_STATUS, HV_GPU_S_HANDOFF_SIZE, 0) == 0x4000);
     handoff_ok(GPU_HS_ADMITTED);
+    /* Mu's PrePi reads the page with the MMU off: every build is cleaned to the PoC. */
+    assert(clean_calls == 2 && clean_addr == hv_gpu_host_handoff() && clean_len == 0x4000);
+    assert(live_exceptions == 9 && rollback_calls == 0 && unmap_calls == 0);
     u64 n = (u64)op(HV_GPU_OP_STATUS, HV_GPU_S_RANGES, 0);
     assert(n > 12 && n <= GPU_T8152_MAX_RANGES);
     u64 last_cls = (u64)op(HV_GPU_OP_STATUS, HV_GPU_S_RANGE + 4 * (n - 1) + 2, 0);
@@ -267,6 +309,7 @@ int main(int argc, char **argv)
     assert(hooks[1].from == mbox && hooks[1].size == 0x4000);
     assert(op(HV_GPU_OP_HOOK, 0, 0) == HV_GPU_E_STATE);
     handoff_ok(GPU_HS_ADMITTED | GPU_HS_HOOKS_LOG);
+    assert(clean_calls == 3); /* the refreshed page is cleaned too */
     assert(op(HV_GPU_OP_STATUS, HV_GPU_S_STATE, 0) == (GPU_HS_ADMITTED | GPU_HS_HOOKS_LOG));
 
     /* F34: read-as-zero, write-ignored, counted by class. */
@@ -285,11 +328,26 @@ int main(int argc, char **argv)
         hv_gpu_host_hook(sgx + 0x4000, val, false, 2); /* the log stops at the limit */
     assert(op(HV_GPU_OP_STATUS, HV_GPU_S_ACCESSES, 0) == 44);
 
-    /* A policy refusal fails ADMIT and spends the session. */
+    /* A policy refusal fails ADMIT, spends the session and takes back every exception. */
     reset_stubs();
     fw_allow_fail_at = 3;
     assert(op(HV_GPU_OP_ADMIT, pool, pool_size) == HV_GPU_E_POLICY);
+    assert(rollback_calls == 1 && live_exceptions == 0 && map_ro_calls == 0);
     assert(op(HV_GPU_OP_STATUS, HV_GPU_S_HANDOFF_IPA, 0) == 0);
+    assert(op(HV_GPU_OP_HOOK, 0, 0) == HV_GPU_E_STATE);
+    assert(op(HV_GPU_OP_ADMIT, pool, pool_size) == HV_GPU_E_STATE);
+
+    /* The handoff page refused, or its map failed: nothing of the admission stays allowed. */
+    reset_stubs();
+    allow_fail = true;
+    assert(op(HV_GPU_OP_ADMIT, pool, pool_size) == HV_GPU_E_POLICY);
+    assert(fw_allow_calls == 8 && rollback_calls == 1 && live_exceptions == 0);
+    assert(map_ro_calls == 0 && unmap_calls == 0);
+    assert(op(HV_GPU_OP_STATUS, HV_GPU_S_HANDOFF_IPA, 0) == 0);
+    reset_stubs();
+    map_fail = true;
+    assert(op(HV_GPU_OP_ADMIT, pool, pool_size) == HV_GPU_E_POLICY);
+    assert(map_ro_calls == 1 && unmap_calls == 1 && rollback_calls == 1 && live_exceptions == 0);
     assert(op(HV_GPU_OP_HOOK, 0, 0) == HV_GPU_E_STATE);
     assert(op(HV_GPU_OP_ADMIT, pool, pool_size) == HV_GPU_E_STATE);
 

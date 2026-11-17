@@ -716,6 +716,25 @@ int hv_t8152_gpu_fw_allow(u64 pa, u64 size, bool read_only, u64 dram_lo, u64 dra
 }
 
 /*
+ * G0: a failed GPU admission takes back every exception it added (hv_gpu.c admit()).  The mark is
+ * allow_count before the first one; the proxy runs one op at a time, so nothing else adds in
+ * between.  Exceptions are registered, never mapped, so dropping them is enough.
+ */
+unsigned int hv_t8152_allow_mark(void)
+{
+    return allow_count;
+}
+
+void hv_t8152_allow_rollback(unsigned int mark, const char *why)
+{
+    if (mark >= allow_count)
+        return;
+    printf("HV: T8152: %s: dropping %u exception(s) from %s on\n", why, allow_count - mark,
+           allow[mark].name);
+    allow_count = mark;
+}
+
+/*
  * G0: memory that must never reach stage 2 for the rest of the session (the GPU firmware
  * __TEXT segments).  Outside guest RAM; it joins the denylist (map filter and verify).
  */

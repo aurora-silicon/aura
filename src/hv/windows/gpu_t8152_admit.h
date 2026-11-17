@@ -37,9 +37,11 @@
 #define GPU_T8152_ASC_CPU_CONTROL 0x44
 #define GPU_T8152_ASC_CPU_STATUS  0x48
 /*
- * The two GFX windows of the shared post-office page: [num * 0x100, num * 0x100 + 0x80) for
- * msgbox-mailbox-num 1 (gfx-asc) and 2 (gfx1-asc).  The plan's G0 assumption, used only to
- * label logged accesses in G0; session S2 measures it before anything is forwarded.
+ * The two GFX windows of the shared post-office page: [num * 0x100, num * 0x100 + 0x80) for the
+ * ADT's msgbox-mailbox-num 1 (gfx-asc) and 2 (gfx1-asc).  Source: the ADT value, and our own
+ * macOS-under-hypervisor trace of 2026-11-10 (run 125300), where both roles' RTKit traffic used
+ * exactly bank + 0x100 and bank + 0x200 (RX +0x00, TX +0x10, status +0x20).  Used only to label
+ * logged accesses in G0; nothing is forwarded before S2 checks it under our own code.
  */
 #define GPU_T8152_MBOX_STRIDE 0x100UL
 #define GPU_T8152_MBOX_WINDOW 0x80UL
@@ -125,7 +127,7 @@ enum gpu_class {
     GPU_C_NONE = 0,
     GPU_C_SGX = 1,      /* sgx register window: G0 logging hook; passthrough after S2 */
     GPU_C_SGX_HOLE = 2, /* another node's registers inside the window: never passed through */
-    GPU_C_ASC_CTRL = 3, /* wrapper page with CPU_CONTROL/STATUS: carrier-owned (RUN once) */
+    GPU_C_ASC_CTRL = 3, /* wrapper page with CPU_CONTROL/STATUS: carrier-owned (RUN never cleared) */
     GPU_C_ASC = 4,      /* the rest of an ASC wrapper */
     GPU_C_IOP_VBAR = 5, /* page holding an iop-vbar word: carrier-pinned, guest read-only */
     GPU_C_MAILBOX = 6,  /* post-office page with both GFX windows (shared with other IOPs) */
@@ -199,7 +201,13 @@ bool gpu_t8152_mailbox_window(const struct gpu_t8152_admission *a, u64 addr, u32
 #define GPU_HS_HOOKS_LOG    BIT(1) /* logging hooks (RAZ/WI) on the sgx window and mailbox */
 #define GPU_HS_POWERED      BIT(2) /* PSD 3, 82, 81 acked (not in this commit) */
 #define GPU_HS_IRQ_LIVE     BIT(3) /* ASC lines published (not in this commit) */
-#define GPU_HS_ASC_RUN      BIT(4) /* CPU_CONTROL RUN allowed once (not in this commit) */
+/*
+ * CPU_CONTROL RUN state guarded (not in this commit).  Our J804 Linux logs and the macOS traces
+ * show RUN already set once PSD power-on completes, before any host write; macOS only rewrites
+ * the same value.  So G1's carrier refuses any write that clears or toggles RUN rather than
+ * granting one RUN, pending S1/S2 confirmation under the carrier.
+ */
+#define GPU_HS_ASC_RUN      BIT(4)
 #define GPU_HS_MMIO_PASS    BIT(5) /* measured sgx sub-ranges passed through (not yet) */
 #define GPU_HS_FW_MAPPED    BIT(6) /* firmware classes mapped into stage 2 (not yet) */
 

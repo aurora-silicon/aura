@@ -288,35 +288,51 @@ def windows_t8152_gpu_plan(u):
     return mode
 
 
-def windows_t8152_gpu_admit(hv, mode):
+def windows_t8152_gpu_admit(hv, mode, usb_ports=(), ahci=None):
     """After USB, before hv.start(): the resident admits the GPU firmware and builds the
     handoff page (and, for "log", hooks the sgx window).  Only then does the guest ADT get Mu's
-    /chosen/aura,windows-gpu-v1.  A refusal stops the launch: the session is used up."""
+    /chosen/aura,windows-gpu-v1.  A refusal stops the launch: the session is used up.  USB was
+    attached first, so every refusal here detaches it again, as the USB and hv.start() failure
+    paths do: no xHCI passthrough or DART map of guest RAM outlives a launch with no guest."""
     from aura import windows as w
     if mode == "off":
         return
+
+    def refuse(message):
+        if usb_ports:
+            try:
+                p.hv_windows_usb(w.USB_OP_DETACH)
+            except ProxyRemoteError:
+                pass
+            message += " USB was detached again."
+        sys.exit(message)
+
     base, top = hv.windows_guest_ram
     try:
         pool = w.gpu_pool(base, top, args.windows_gpu_pool_mib)
+        # The pool is the top of guest RAM: the loaded image (Mu FD, appended payloads, SEPFW,
+        # preoslog, boot_args) must end below it, and with an AHCI store Windows keeps its floor.
+        w.gpu_pool_check_layout(pool, base, hv.tba.top_of_kernel_data,
+                                w.AHCI_MIN_GUEST if ahci else None)
     except ValueError as exc:
-        sys.exit(f"T8152 launch refused: {exc}. hv_init() ran, so the carrier session is used "
-                 "up: reload the carrier. No guest was started.")
+        refuse(f"T8152 launch refused: {exc}. hv_init() ran, so the carrier session is used "
+               "up: reload the carrier. No guest was started.")
     result = p.hv_windows_gpu(w.GPU_OP_ADMIT, *pool)
     if result != 0:
-        sys.exit(f"T8152: the resident refused GPU admission: {w.describe_gpu(result)} (its "
-                 "console says why). Reload the carrier; no guest was started.")
+        refuse(f"T8152: the resident refused GPU admission: {w.describe_gpu(result)} (its "
+               "console says why). Reload the carrier; no guest was started.")
     if mode == "log":
         result = p.hv_windows_gpu(w.GPU_OP_HOOK)
         if result != 0:
-            sys.exit(f"T8152: the resident refused the GPU logging hooks: "
-                     f"{w.describe_gpu(result)}. Reload the carrier; no guest was started.")
+            refuse(f"T8152: the resident refused the GPU logging hooks: "
+                   f"{w.describe_gpu(result)}. Reload the carrier; no guest was started.")
     ipa = p.hv_windows_gpu(w.GPU_OP_STATUS, w.GPU_STATUS_HANDOFF_IPA)
     size = p.hv_windows_gpu(w.GPU_OP_STATUS, w.GPU_STATUS_HANDOFF_SIZE)
     try:
         hv.set_windows_gpu_handshake(w.gpu_handshake(ipa, size))
     except ValueError as exc:
-        sys.exit(f"T8152: GPU admitted but the Mu handshake was refused: {exc}. Reload the "
-                 "carrier; no guest was started.")
+        refuse(f"T8152: GPU admitted but the Mu handshake was refused: {exc}. Reload the "
+               "carrier; no guest was started.")
     ranges = p.hv_windows_gpu(w.GPU_OP_STATUS, w.GPU_STATUS_RANGES)
     print(f"T8152 GPU: admitted ({mode}), {ranges} ranges, pool [{pool[0]:#x}, "
           f"{pool[0] + pool[1]:#x}), handoff page {ipa:#x} read-only, "
@@ -498,7 +514,7 @@ def run_windows_t8152(caps):
     if ahci:
         windows_t8152_ahci_attach(hv, u, ahci)
     windows_t8152_usb_attach(hv, usb_ports, ahci)
-    windows_t8152_gpu_admit(hv, gpu_mode)
+    windows_t8152_gpu_admit(hv, gpu_mode, usb_ports, ahci)
     try:
         result = hv.start()
     except ProxyRemoteError as exc:

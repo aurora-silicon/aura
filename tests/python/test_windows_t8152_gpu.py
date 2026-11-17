@@ -685,14 +685,19 @@ def glue_exe(tmp_path_factory):
         "#pragma once\n#include \"types.h\"\nstruct exc_info;\n"
         "typedef bool(hv_hook_t)(struct exc_info *ctx, u64 addr, u64 *val, bool write, "
         "int width);\nint hv_map_hook(u64 from, hv_hook_t *hook, u64 size);\n"
-        "int hv_map_hw_ro(u64 from, u64 to, u64 size);\nbool hv_windows_guest_entered(void);\n"
+        "int hv_map_hw_ro(u64 from, u64 to, u64 size);\nint hv_unmap(u64 from, u64 size);\n"
+        "bool hv_windows_guest_entered(void);\n"
         "#include \"hv_t8152.h\"\n")
     (stubs / "hv_t8152.h").write_text(
         "#pragma once\n#include \"types.h\"\nbool hv_t8152_policy_armed(void);\n"
         "bool hv_t8152_guest_ram(u64 *base, u64 *size);\n"
         "int hv_t8152_allow(u64 ipa, u64 pa, u64 size, bool read_only, const char *name);\n"
         "int hv_t8152_gpu_fw_allow(u64 pa, u64 size, bool read_only, u64 dram_lo, u64 dram_hi,"
-        " const char *name);\nint hv_t8152_gpu_deny(u64 start, u64 end, const char *name);\n")
+        " const char *name);\nint hv_t8152_gpu_deny(u64 start, u64 end, const char *name);\n"
+        "unsigned int hv_t8152_allow_mark(void);\n"
+        "void hv_t8152_allow_rollback(unsigned int mark, const char *why);\n")
+    (stubs / "memory.h").write_text(
+        "#pragma once\n#include \"types.h\"\nvoid dc_civac_range(void *addr, size_t length);\n")
     (stubs / "glue_profile.inc").write_text(glue_profile_inc())
     shutil.copyfile(REPO / "src/adt.h", stubs / "adt.h")
     for name in ("gpu_t8152_admit.c", "gpu_t8152_admit.h", "hv_gpu.c", "hv_gpu.h"):
@@ -775,3 +780,112 @@ def test_launcher_gpu_option():
     attach = run_guest.split("def windows_t8152_gpu_admit(", 1)[1].split("\ndef ", 1)[0]
     assert attach.index("GPU_OP_ADMIT") < attach.index("set_windows_gpu_handshake")
     assert "if mode == \"off\":\n        return" in attach
+    assert "windows_t8152_gpu_admit(hv, gpu_mode, usb_ports, ahci)" in run_guest
+
+
+def test_launcher_pool_layout():
+    """The pool is the top of guest RAM: the loaded image must end below it, and with an AHCI
+    store the guest RAM under it keeps the 4 GiB floor."""
+    from aura import windows as w
+    base, top = 0x8_0000_0000, 0x9_2000_0000
+    pool = w.gpu_pool(base, top, 256)
+    w.gpu_pool_check_layout(pool, base, pool[0])                 # ends exactly at the pool
+    w.gpu_pool_check_layout(pool, base, base + 0x100_0000, w.AHCI_MIN_GUEST)
+    with pytest.raises(ValueError, match="inside the GPU pool"):
+        w.gpu_pool_check_layout(pool, base, pool[0] + 0x4000)
+    with pytest.raises(ValueError):
+        w.gpu_pool_check_layout(pool, base, base - 1)
+    small = w.gpu_pool(0x8_0000_0000, 0x9_0000_0000, 256)          # 4 GiB window, 3.75 below
+    with pytest.raises(ValueError, match="Windows floor"):
+        w.gpu_pool_check_layout(small, 0x8_0000_0000, 0x8_0100_0000, w.AHCI_MIN_GUEST)
+    w.gpu_pool_check_layout(small, 0x8_0000_0000, 0x8_0100_0000)   # no AHCI: no floor
+
+
+class _Exit(Exception):
+    pass
+
+
+def _gpu_admit_under_test(results, image_end=None):
+    """windows_t8152_gpu_admit() from run_guest.py, run against a recording proxy stand-in."""
+    import ast
+    import types
+    from aura import windows as w
+    src = (REPO / "proxyclient/tools/run_guest.py").read_text()
+    fn = next(n for n in ast.parse(src).body
+              if isinstance(n, ast.FunctionDef) and n.name == "windows_t8152_gpu_admit")
+    calls = []
+
+    class RemoteError(Exception):
+        pass
+
+    class Proxy:
+        def hv_windows_gpu(self, op, *a):
+            calls.append(("gpu", op, *a))
+            if op == w.GPU_OP_STATUS:
+                return {w.GPU_STATUS_HANDOFF_IPA: 0x8_0600_0000,
+                        w.GPU_STATUS_HANDOFF_SIZE: 0x4000, w.GPU_STATUS_RANGES: 40}[a[0]]
+            return results.get(op, 0)
+
+        def hv_windows_usb(self, op, *a):
+            calls.append(("usb", op, *a))
+            return 0
+
+    def sys_exit(message):
+        calls.append(("exit", message))
+        raise _Exit(message)
+
+    base, top = 0x8_0000_0000, 0x9_2000_0000
+    hv = types.SimpleNamespace(windows_guest_ram=(base, top),
+                               tba=types.SimpleNamespace(top_of_kernel_data=image_end or
+                                                         base + 0x200_0000),
+                               set_windows_gpu_handshake=lambda v: calls.append(("hs", v)))
+    env = {"p": Proxy(), "sys": types.SimpleNamespace(exit=sys_exit),
+           "ProxyRemoteError": RemoteError,
+           "args": types.SimpleNamespace(windows_gpu_pool_mib=256), "print": lambda *a: None}
+    exec(compile(ast.Module(body=[fn], type_ignores=[]), "run_guest.py", "exec"), env)
+    return env["windows_t8152_gpu_admit"], hv, calls
+
+
+@pytest.mark.parametrize("case", ["admit", "hook", "pool"])
+def test_launcher_gpu_refusal_detaches_usb(case):
+    """Every GPU refusal after USB ATTACH detaches USB before exiting, as the USB and hv.start()
+    failure paths do; without USB nothing is detached."""
+    from aura import windows as w
+    results = {w.GPU_OP_ADMIT: -3 & ((1 << 64) - 1)} if case == "admit" else \
+        {w.GPU_OP_HOOK: -5 & ((1 << 64) - 1)} if case == "hook" else {}
+    image_end = 0x9_1800_0000 if case == "pool" else None
+    for ports in ((1,), ()):
+        admit, hv, calls = _gpu_admit_under_test(results, image_end)
+        with pytest.raises(_Exit):
+            admit(hv, "log", ports, None)
+        kinds = [c[0] for c in calls]
+        assert kinds[-1] == "exit" and "hs" not in kinds
+        detach = [c for c in calls if c[:2] == ("usb", w.USB_OP_DETACH)]
+        if ports:
+            assert detach and kinds.index("usb") == len(kinds) - 2
+            assert "USB was detached again" in calls[-1][1]
+        else:
+            assert not detach
+        if case == "pool":
+            assert not any(c[0] == "gpu" for c in calls)   # refused before ADMIT
+
+
+def test_launcher_gpu_success_keeps_usb():
+    from aura import windows as w
+    admit, hv, calls = _gpu_admit_under_test({})
+    admit(hv, "log", (1,), None)
+    assert ("usb", w.USB_OP_DETACH) not in calls
+    assert ("hs", w.gpu_handshake(0x8_0600_0000, 0x4000)) in calls
+    assert not any(c[0] == "exit" for c in calls)
+
+
+def test_g1_needs_a_boot_wide_marker():
+    """'ADMIT once' lasts one carrier session.  G0 starts no firmware, so that is enough today;
+    the first change that powers the GPU or lets RUN through must also add a boot-wide marker
+    that survives a carrier reload (plan 2.1(1), 7 'Do not')."""
+    code = re.sub(r"/\*.*?\*/", "", (WIN / "hv_gpu.c").read_text(), flags=re.S)
+    code = re.sub(r"//[^\n]*", "", code)
+    starts_firmware = re.search(r"GPU_HS_(POWERED|ASC_RUN)|ASC_CPU_CONTROL", code)
+    if starts_firmware:
+        assert "HV_GPU_BOOT_MARKER" in code, \
+            "hv_gpu.c powers or starts the GPU without a boot-wide admission marker"

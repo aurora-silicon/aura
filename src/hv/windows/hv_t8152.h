@@ -74,6 +74,8 @@ int hv_t8152_reserve_carrier(u64 start, u64 end, const char *name);
 int hv_t8152_gpu_fw_allow(u64 pa, u64 size, bool read_only, u64 dram_lo, u64 dram_hi,
                           const char *name);
 int hv_t8152_gpu_deny(u64 start, u64 end, const char *name);
+unsigned int hv_t8152_allow_mark(void);
+void hv_t8152_allow_rollback(unsigned int mark, const char *why);
 
 /* A carrier-owned exception to the RAM allowlist (never to the denylist). */
 int hv_t8152_allow(u64 ipa, u64 pa, u64 size, bool read_only, const char *name);

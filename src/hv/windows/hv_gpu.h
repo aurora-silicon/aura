@@ -21,7 +21,8 @@
  *          reaches the hardware.
  *
  * Not in this file yet (each needs its own owner-present session): PSD power-on (3, 82, 81),
- * CPU_CONTROL RUN, iop-vbar pinning by value, mailbox forwarding, measured sgx passthrough,
+ * the CPU_CONTROL guard (RUN is already set after power-on; the carrier refuses writes that
+ * clear or toggle it), iop-vbar pinning by value, mailbox forwarding, measured sgx passthrough,
  * the GPU IRQ aliases (hv_aic_alias_t8152_gpu), and mapping the firmware classes.
  */
 

@@ -11,6 +11,7 @@
 #include "gpu_t8152_admit.h"
 #include "hv.h"
 #include "malloc.h"
+#include "memory.h"
 #include "soc.h"
 #include "string.h"
 #include "utils.h"
@@ -21,7 +22,14 @@ extern void aura_sha256(const void *data, size_t size, u8 digest[32]);
 /* The firmware the J804 profile pins (src/kboot_gpu_t8152.c publishes the same receipt). */
 #define J804_GPU_RECEIPT "G18G-RTKit-3514.41.1.release"
 
-static bool session_used; /* ADMIT ran this carrier session, whatever its result */
+/*
+ * ADMIT ran this carrier session, whatever its result.  This is per carrier session, not per
+ * boot: a carrier reload resets it.  G0 starts no firmware, so that is harmless today, but G1
+ * (anything that powers the GPU or lets CPU_CONTROL RUN through) must first add a boot-wide
+ * marker that survives a reload.  tests/python/test_windows_t8152_gpu.py refuses a hv_gpu.c that
+ * sets GPU_HS_POWERED or GPU_HS_ASC_RUN without HV_GPU_BOOT_MARKER.
+ */
+static bool session_used;
 static bool admitted, hooked;
 static struct gpu_t8152_admission adm;
 static struct gpu_range table[GPU_T8152_MAX_RANGES];
@@ -43,11 +51,18 @@ static bool gpu_read_text(u64 phys, void *buf, u64 size)
 }
 #endif
 
-static void handoff_refresh(void)
+/*
+ * Build the handoff page and clean it to the point of coherency: Mu's PrePi reads it with the MMU
+ * off (Normal non-cacheable), so what sits only in this cacheable EL2 mapping is invisible there.
+ */
+static bool handoff_publish(void)
 {
     struct gpu_t8152_handoff_in in = {state, handoff_pa, pool_base, pool_size};
-    if (handoff)
-        gpu_t8152_handoff_build(handoff, GPU_HANDOFF_SIZE, &adm, table, table_count, &in);
+    if (!handoff || !gpu_t8152_handoff_build(handoff, GPU_HANDOFF_SIZE, &adm, table, table_count,
+                                             &in))
+        return false;
+    dc_civac_range(handoff, GPU_HANDOFF_SIZE);
+    return true;
 }
 
 static u64 err(int e)
@@ -163,23 +178,36 @@ static int admit(u64 pbase, u64 psize)
     pool_base = pbase;
     pool_size = psize;
     state = GPU_HS_ADMITTED;
-    struct gpu_t8152_handoff_in in = {state, handoff_pa, pool_base, pool_size};
-    if (!gpu_t8152_handoff_build(handoff, GPU_HANDOFF_SIZE, &adm, table, table_count, &in)) {
+    if (!handoff_publish()) {
         printf("HV: GPU: the handoff page does not fit in 16 KiB\n");
         return HV_GPU_E_HANDOFF;
     }
 
-    if (register_classes())
+    /*
+     * Everything from here on either completes or is rolled back: a failed ADMIT must not leave
+     * firmware exceptions in the stage-2 allow table (pa_rule() would still accept a later map of
+     * them, RW for the UAT regions).  The TEXT denylist entries stay: they only forbid more.
+     */
+    unsigned int mark = hv_t8152_allow_mark();
+    if (register_classes()) {
+        hv_t8152_allow_rollback(mark, "GPU admission refused");
         return HV_GPU_E_POLICY;
+    }
     struct gpu_range *h = &table[table_count - 1];
-    if (hv_t8152_allow(handoff_pa, handoff_pa, GPU_HANDOFF_SIZE, true, "G0 GPU handoff page") ||
-        hv_map_hw_ro(handoff_pa, handoff_pa, GPU_HANDOFF_SIZE) < 0) {
+    if (hv_t8152_allow(handoff_pa, handoff_pa, GPU_HANDOFF_SIZE, true, "G0 GPU handoff page")) {
+        printf("HV: GPU: the handoff page could not be allowed read-only\n");
+        hv_t8152_allow_rollback(mark, "GPU admission refused");
+        return HV_GPU_E_POLICY;
+    }
+    if (hv_map_hw_ro(handoff_pa, handoff_pa, GPU_HANDOFF_SIZE) < 0) {
         printf("HV: GPU: the handoff page could not be mapped read-only\n");
+        hv_unmap(handoff_pa, GPU_HANDOFF_SIZE);
+        hv_t8152_allow_rollback(mark, "GPU admission refused");
         return HV_GPU_E_POLICY;
     }
     h->flags |= GPU_RF_MAPPED | GPU_RF_READ_ONLY;
     admitted = true;
-    handoff_refresh();
+    handoff_publish();
 
     u32 nhole = 0;
     for (u32 i = 0; i < table_count; i++)
@@ -249,7 +277,7 @@ static int hook(void)
         }
     }
     state |= GPU_HS_HOOKS_LOG;
-    handoff_refresh();
+    handoff_publish();
     printf("HV: GPU: logging hooks (read-as-zero, write-ignored) on sgx [0x%lx, 0x%lx) and the "
            "post-office page 0x%lx: %u ranges, range %u is the GFX page\n",
            adm.sgx.base, adm.sgx.base + adm.sgx.size, mbox->base, n, range_index(mbox));
