@@ -277,6 +277,18 @@ void spin_lock(spinlock_t *lock)
         return;
     }
 
+#ifdef AURA_WINDOWS
+    /*
+     * T8152 carrier: wait without WFE. The hypervisor lock is taken while a guest's
+     * SIMD/FP registers are live in hardware, a timer-woken WFI wipes them there
+     * (Phase 3 measurement (a)), and a WFE that really sleeps is not measured yet.
+     * Re-reading the lock is always a correct wait (Arm ARM: WFE is only a hint).
+     */
+    u64 no_wfe = chip_id == T8152;
+#else
+    u64 no_wfe = 0;
+#endif
+
     __asm__ volatile("1:\n"
                      "mov\t%0, -1\n"
                      "2:\n"
@@ -286,13 +298,14 @@ void spin_lock(spinlock_t *lock)
                      "\tldxr\t%0, %1\n"
                      "\tcmn\t%0, 1\n"
                      "\tbeq\t2b\n"
+                     "\tcbnz\t%3, 1b\n"
                      "\twfe\n"
                      "\tb\t1b\n"
                      "3:"
                      "\tstxr\t%w0, %2, %1\n"
                      "\tcbnz\t%w0, 2b\n"
                      : "=&r"(tmp), "+m"(lock->lock)
-                     : "r"(me)
+                     : "r"(me), "r"(no_wfe)
                      : "cc", "memory");
 
     assert(__atomic_load_n(&lock->lock, __ATOMIC_RELAXED) == me);

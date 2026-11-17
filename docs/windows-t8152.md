@@ -72,11 +72,12 @@ FWB is clear, stage 2 and the SMC trap are on, `framebuffer=bgra-shadow` is sele
 - Guest WFE is trapped too (`HCR_EL2.TWE`) and completes at once without sleeping
   (`hv_handle_wfx()`); WFE may complete at any time, so the guest just re-checks. Part A's
   WFE rows used SEVL first and never slept, so nothing shows yet that a WFE that sleeps keeps
-  GPRs, NZCV and SIMD. Still open: aura itself executes WFE at EL2, in its dispatch loop
-  (no guest state live) and in `spin_lock()` on the hypervisor lock while a guest's SIMD/FP
-  registers are live in hardware. A measurement of a sleeping WFE (no SEVL) is needed before
-  that is known to be safe. Capability bit 13 (0x2000) marks a resident with the WFE trap
-  and the code-placement rule; the launcher requires it on T8152.
+  GPRs, NZCV and SIMD. So `spin_lock()` (taken on the hypervisor lock while a guest's
+  SIMD/FP registers are live in hardware) waits without WFE on T8152 under `WINDOWS=1`: it
+  re-reads the lock instead. Aura's dispatch loop still uses WFE at EL2 (no guest state
+  live there); a measurement of a sleeping WFE (no SEVL) is still wanted before any WFE with
+  guest state live. Capability bit 13 (0x2000) marks a resident with the WFE trap and the
+  code-placement rule; the launcher requires it on T8152.
 - The guest's ACTLR_EL1 is saved, restored and emulated only through the architectural
   `ACTLR_EL12` (`hv_t8152_guest_actlr_*`; the M6 CPU parts set `actlr_el2`). Phase 3
   measurement (h) read the EL1 view there on E, P and M cores, and a write to the
