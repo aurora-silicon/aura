@@ -9,6 +9,7 @@
 #include "memory.h"
 #include "pcie.h"
 #include "smp.h"
+#include "soc.h"
 #include "string.h"
 #include "usb.h"
 #include "utils.h"
@@ -323,10 +324,19 @@ static void hv_init_secondary(struct hv_secondary_info_t *info)
         msr(SYS_IMP_APL_APSTS_EL12, info->apsts);
     }
     msr(ACTLR_EL2, info->actlr_el2);
-    if (cpu_features->actlr_el2)
-        msr(SYS_ACTLR_EL12, info->actlr_el1);
-    else
+    if (cpu_features->actlr_el2) {
+        /*
+         * T8152 (M6) sets actlr_el2 since the Windows carrier's B2 fix, so this
+         * path now uses the architectural ACTLR_EL12 there instead of the Apple
+         * alias, whose write UNDEFs on every M6 core (measurement (h)).  An
+         * ACTLR_EL12 write itself is unmeasured on T8152, so it is issued only
+         * when the value differs, as in the Windows carrier (hv_t8152.c).
+         */
+        if (chip_id != T8152 || mrs(SYS_ACTLR_EL12) != info->actlr_el1)
+            msr(SYS_ACTLR_EL12, info->actlr_el1);
+    } else {
         msr(SYS_IMP_APL_ACTLR_EL12, info->actlr_el1);
+    }
     if (cpu_features->apple_sysregs_unlocked) {
         msr(SYS_IMP_APL_SPRR_CONFIG_EL1, info->sprr_config);
         /* GXF_CONFIG is UNDEF unless SPRR is enabled */
