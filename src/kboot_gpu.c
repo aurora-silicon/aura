@@ -4019,8 +4019,8 @@ disable:
  * (simpledrm, DCP) is unaffected. Built for size, in .init's and .text's last free bytes; there
  * is no room for apple,firmware-version, which Linux only takes as a hint here.
  *
- * T6050 G17D (M5 Ultra, J775D, 27.0) is the same handoff with its own build: GFX1's __TEXT is
- * 0x4000 longer, so its fw-text is 0xa8000 and GFX1's boot-filled ranges move with it. The G17S
+ * T6050 G17D (M5 Ultra, J775D, 27.0 and 27.2) is the same handoff with its own build: GFX1's __TEXT
+ * is 0x4000 longer, so its fw-text is 0xa8000 and GFX1's boot-filled ranges move with it. The G17S
  * builds are tried as before. The G17D build is tried only when the ADT puts GFX1's __TEXT right
  * after GFX's and the two reach 0xa8000, so its check reads no further than the loaded TEXT.
  */
@@ -4036,7 +4036,7 @@ static const struct {
         u32 text, fill[8][2]; /* fw-text's size, its boot-filled ranges */
         u8 sha[32];
         char name[8], gpu; /* G17<gpu> for the log */
-    } build[3];
+    } build[4];
 } t6050_gpu = {
     /* The UAT ranges (base, size), then the bounds of both roles' __DATA and SRO */
     {"gpu-region-base", "gpu-region-size", "gfx-shared-region-base", "gfx-shared-region-size",
@@ -4098,6 +4098,24 @@ static const struct {
        0xc9, 0x46, 0xcd, 0xd2, 0x4c, 0xb8, 0x2c, 0x64, 0xa8, 0xbb, 0xd1,
        0x07, 0xa4, 0x94, 0x79, 0xa0, 0x8c, 0xe9, 0xcc, 0x82, 0x51},
       "26A428",
+      'D'},
+     /*
+      * 26B123 (27.2) G17D, J775D: the GFX and GFX1 images the 27.2 stub loads; the same sizes
+      * and records as 26A428's G17D, its entropy records 0x44 and 0x14 bytes further in
+      */
+     {T6050_GPU_TEXT_D,
+      {{0x224, 4},
+       {0x23c, 8},
+       {0x49764, 0x740},
+       {0x49ea4, 0x231},
+       {0x50224, 4},
+       {0x5023c, 8},
+       {0xa11ec, 0x740},
+       {0xa192c, 0x231}},
+      {0x54, 0xc5, 0x28, 0x19, 0x97, 0x10, 0x71, 0x1b, 0x27, 0x11, 0x9b,
+       0xd0, 0x6d, 0xb0, 0x16, 0xec, 0xee, 0x42, 0x32, 0xff, 0x1a, 0x0b,
+       0x6e, 0xd8, 0x02, 0x5a, 0x61, 0x46, 0x64, 0x6e, 0x3b, 0x03},
+      "26B123",
       'D'}},
 };
 extern void aura_sha256(const void *data, size_t size, u8 digest[32]);
