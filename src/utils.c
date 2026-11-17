@@ -13,6 +13,7 @@
 #include "vsprintf.h"
 #include "xnuboot.h"
 #ifdef AURA_WINDOWS
+#include "hv/windows/hv_ahci_nvme.h"
 #include "hv/windows/hv_usb.h"
 #include "nvme.h"
 #endif
@@ -250,8 +251,14 @@ void flush_and_reboot(void)
     }
     /* D4: an attached xHCI must not keep DMA-ing into guest RAM through a live DART. */
     hv_usb_emergency_stop();
-    if (!nvme_shutdown()) {
-        printf("NVMe shutdown failed; not resetting. Parking (hold power to exit)\n");
+    /*
+     * D5: with the AHCI disk on the internal NVMe, its backend closes here: a bounded wait for
+     * the controller lock, then the normal shutdown, or CC.SHN directly.  Without the backend
+     * this is nvme_shutdown() as before.  Reset only once the controller confirmed it.
+     */
+    if (!hv_ahci_nvme_reset_close()) {
+        printf("NVMe shutdown not confirmed: not resetting. Parking (hold power to exit; this "
+               "session's NVMe writes may be lost)\n");
         goto park;
     }
 #endif

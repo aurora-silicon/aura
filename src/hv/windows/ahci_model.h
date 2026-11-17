@@ -26,7 +26,8 @@
  *    switching, no CCC, no enclosure management, no hot plug, no cold presence detect;
  *  - commands complete synchronously inside the PxCI write that issues them, in ascending
  *    slot order;
- *  - 512-byte logical and physical sectors, LBA48, a non-rotating device, no SMART, no
+ *  - 512-byte logical sectors, 512-byte physical (or 4096-byte, "512e", when the backend is
+ *    the internal NVMe: ACS-3 §7.12.7.40/.67), LBA48, a non-rotating device, no SMART, no
  *    security, no TRIM, volatile write cache (FLUSH CACHE is the backend's flush);
  *  - the ACS-3 §4.2 General feature set: its mandatory commands (EXECUTE DEVICE DIAGNOSTIC,
  *    IDENTIFY DEVICE, SET FEATURES) and, of its optional ones, FLUSH CACHE, READ/WRITE DMA,
@@ -162,6 +163,23 @@ struct ahci_env {
      * as fetched (before any check).  An observer only; it must not touch the model.
      */
     void (*command)(void *opaque, u32 slot, const u8 *fis);
+    /*
+     * D5 (optional, all zero/NULL for the D1 RAM disk, whose behaviour is then unchanged).
+     * begin: once per disk transfer, after the PRDT was checked and before any data moves
+     * (`count` sectors from `lba`); false fails the command (UNC) with nothing moved.
+     * end: after the data moved (or failed to), before PRDBC, the status FIS, PxTFD and PxIS
+     * are written; `ok` says whether it all moved, `write_through` is true while the guest has
+     * the volatile write cache disabled.  false turns a successful transfer into UNC, so the
+     * guest never sees success for data the backend did not accept.
+     */
+    bool (*begin)(void *opaque, u64 lba, u32 count, bool write);
+    bool (*end)(void *opaque, bool ok, bool write_through);
+    /* log2 of logical sectors per physical sector: 0 (512n) or 3 (512e, 4 KiB physical). */
+    u8 phys_log2;
+    /* WRITE commands are aborted before they reach the backend; FLUSH still succeeds. */
+    bool read_only;
+    /* IDENTIFY strings; NULL keeps the D1 ones. */
+    const char *serial, *firmware, *model_name;
 };
 
 struct ahci_model_stats {

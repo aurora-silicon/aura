@@ -54,7 +54,9 @@ parser.add_argument('--windows-guest-compatibility', choices=('none', 't8152-pmu
                          'own forwarded accesses are serviced either way.')
 parser.add_argument('--windows-reset-on-exit', action='store_true',
                     help='T8152: when the guest asks for PSCI SYSTEM_RESET, shut NVMe down and '
-                         'reset through WD1. Default: stay in the aura proxy.')
+                         'reset through WD1. Default: stay in the aura proxy. Refused with the '
+                         'D1 RAM disk; with the D5 NVMe disk only on a resident with CAPS2 bit 5, '
+                         'and the reset happens only if the resident reports the close CLEAN.')
 parser.add_argument('--windows-ahci-image', type=pathlib.Path, default=None, metavar='PATH',
                     help='T8152 D1: a raw GPT disk image (sparse allowed) for the carrier-emulated '
                          'AHCI disk. The disk lives in DRAM at the top of --windows-guest-ram; '
@@ -84,6 +86,28 @@ parser.add_argument('--windows-ahci-overwrite', action='store_true',
 parser.add_argument('--windows-ahci-boot', choices=('auto', 'disk', 'ramdisk'), default='auto',
                     help='T8152 D1: what Mu boots first: "auto" (default) is the appended RAM '
                          'disk when -a gives one, else the AHCI disk.')
+parser.add_argument('--windows-ahci-backend', choices=('ram', 'nvme'), default='ram',
+                    help='T8152: the AHCI disk\'s backend. "ram" (default) is the D1 DRAM store '
+                         '(--windows-ahci-image / --windows-ahci-keep). "nvme" (D5) is a dedicated '
+                         'GPT partition of the internal NVMe, read and written by the carrier: '
+                         'persistent, no upload. Needs --windows-ahci-partition and '
+                         '--windows-ahci-nvme-access; none of the RAM-store options.')
+parser.add_argument('--windows-ahci-partition', default=None, metavar='GUID|NAME',
+                    help='T8152 D5: the Windows partition, by its GPT unique GUID or GPT name as '
+                         'the private config records them (never a partition number). The '
+                         'resident re-checks disk GUID, partition GUID, type, name and LBAs '
+                         'against the live GPT.')
+parser.add_argument('--windows-ahci-nvme-config', type=pathlib.Path, default=None, metavar='PATH',
+                    help='T8152 D5: the private partition config (default '
+                         '$J804_PRIVATE_DATA/d5/windows-partition.env).')
+parser.add_argument('--windows-ahci-nvme-access', choices=('ro', 'rw'), default=None,
+                    help='T8152 D5, required with --windows-ahci-backend nvme: "ro" aborts every '
+                         'write in the carrier (first sessions, WinPE); "rw" lets Windows write '
+                         'its partition.')
+parser.add_argument('--windows-ahci-nvme-flush', choices=('normal', 'every-write'),
+                    default='normal',
+                    help='T8152 D5: "every-write" adds an NVMe flush after every write command '
+                         '(experiments). FLUSH CACHE always maps to an NVMe flush.')
 parser.add_argument('--windows-usb', default='off', metavar='{off,drd1,drd1+drd3,drd3}',
                     help='T8152 D4: pass the usb-drd1 (left-rear USB-C) and/or usb-drd3 (right) '
                          'xHCI through to Windows, with the carrier\'s DART identity map of '
@@ -135,10 +159,20 @@ def windows_resident_caps():
     return caps if caps >> 32 == CAPS_MAGIC >> 32 else 0
 
 
-def ahci_requested():
+def ahci_ram_requested():
     return bool(args.windows_ahci_image or args.windows_ahci_store_size or args.windows_ahci_keep
-                or args.windows_ahci_keep_unsealed or args.windows_ahci_boot != 'auto'
-                or args.windows_ahci_keep_expect or args.windows_ahci_overwrite)
+                or args.windows_ahci_keep_unsealed or args.windows_ahci_keep_expect
+                or args.windows_ahci_overwrite)
+
+
+def ahci_nvme_requested():
+    return bool(args.windows_ahci_backend == 'nvme' or args.windows_ahci_partition
+                or args.windows_ahci_nvme_config or args.windows_ahci_nvme_access
+                or args.windows_ahci_nvme_flush != 'normal')
+
+
+def ahci_requested():
+    return bool(ahci_ram_requested() or ahci_nvme_requested() or args.windows_ahci_boot != 'auto')
 
 
 def no_timeout(call, *a):
@@ -159,9 +193,9 @@ def windows_t8152_ahci_plan(base, top, payload):
         if args.windows_ahci_image and (args.windows_ahci_keep or args.windows_ahci_keep_unsealed):
             raise ValueError("--windows-ahci-keep reuses the sealed disk: it takes no "
                              "--windows-ahci-image")
-        if args.windows_reset_on_exit and ahci_requested():
+        if args.windows_reset_on_exit and ahci_ram_requested():
             raise ValueError("--windows-reset-on-exit resets the machine through WD1, which "
-                             "loses the DRAM disk: not with an AHCI disk")
+                             "loses the DRAM disk: not with an AHCI RAM disk")
         marker = w.fd_ahci_marker(payload)
         if not ahci_requested():
             if marker is not None:
@@ -220,6 +254,124 @@ def windows_t8152_ahci_plan(base, top, payload):
     return {"plan": plan, "boot": boot, "keep": keep, "image": image,
             "unsealed": args.windows_ahci_keep_unsealed,
             "overwrite": args.windows_ahci_overwrite}
+
+
+def windows_t8152_ahci_nvme_plan(base, top, payload):
+    """D5: the AHCI disk on an internal NVMe partition.  Checks the options, the private config,
+    the resident (CAPS2 bit 5) and the FD; nothing on the machine changes here."""
+    from aura import windows as w
+    try:
+        if ahci_ram_requested():
+            raise ValueError("--windows-ahci-backend nvme has no DRAM store: not with "
+                             "--windows-ahci-image, -store-size, -keep, -keep-unsealed, "
+                             "-keep-expect or -overwrite")
+        if args.windows_ahci_backend != 'nvme':
+            raise ValueError("--windows-ahci-partition and --windows-ahci-nvme-* need "
+                             "--windows-ahci-backend nvme")
+        if not args.windows_ahci_nvme_access:
+            raise ValueError("--windows-ahci-backend nvme needs --windows-ahci-nvme-access ro|rw "
+                             "(no default: the first sessions are ro)")
+        if not args.windows_ahci_partition:
+            raise ValueError("--windows-ahci-backend nvme needs --windows-ahci-partition "
+                             "GUID|NAME")
+        config = args.windows_ahci_nvme_config or w.default_nvme_config_path()
+        if config is None:
+            raise ValueError("no partition config: pass --windows-ahci-nvme-config or set "
+                             "J804_PRIVATE_DATA")
+        part = w.resolve_nvme_partition(w.load_nvme_config(config), args.windows_ahci_partition)
+        rw = args.windows_ahci_nvme_access == 'rw'
+        boot = w.resolve_ahci_boot(args.windows_ahci_boot, bool(args.append_payload))
+        if rw and boot == 'ramdisk':
+            raise ValueError("a WinPE ramdisk boot with a writable internal disk is not a D5 "
+                             "session: use --windows-ahci-nvme-access ro with ramdisk")
+        try:
+            caps2 = p.hv_windows_capabilities2()
+        except ProxyRemoteError:
+            caps2 = 0  # an older resident: Bad Command
+        w.validate_nvme_contract(caps2)
+        query = lambda name: p.hv_windows_ahci(w.AHCI_OP_QUERY, w.AHCI_Q[name])
+        w.validate_ahci_contract(caps2, query, payload)
+    except ValueError as exc:
+        sys.exit(f"T8152 launch refused: {exc}. The aura proxy keeps running; no guest was "
+                 "started.")
+    flags = (w.NVME_RW if rw else 0) | \
+        (w.NVME_FLUSH_EVERY if args.windows_ahci_nvme_flush == 'every-write' else 0)
+    plan = w.nvme_ahci_plan(base, top)
+    print(f"T8152 AHCI NVMe: partition '{part.name}' (by GUID and name from {config}), NVMe "
+          f"LBAs [{part.first}, {part.last}] = {part.size / 2**30:.2f} GiB, "
+          f"{'READ-WRITE' if rw else 'read-only'}, boot {boot}; guest RAM is the whole window "
+          f"[{base:#x}, {top:#x}) {plan.guest_bytes / 2**30:.2f} GiB")
+    return {"backend": "nvme", "plan": plan, "boot": boot, "keep": False, "image": None,
+            "unsealed": False, "overwrite": False, "part": part, "flags": flags}
+
+
+def windows_t8152_ahci_nvme_attach(hv, u, ahci):
+    """After load_raw: the resident wakes the NVMe, checks the live GPT against the request,
+    sets its I/O fence and installs the disk.  A refusal shuts the NVMe down again."""
+    from aura import windows as w
+    try:
+        w.check_t8152_ahci_layout(ahci["plan"], hv.adt_base, hv.tba.top_of_kernel_data)
+    except ValueError as exc:
+        sys.exit(f"T8152 launch refused: {exc}. hv_init() ran, so the carrier session is used "
+                 "up: reload the carrier before another attempt. No guest was started.")
+    blob = w.nvme_request(ahci["part"], ahci["flags"])
+    addr = u.malloc(len(blob))
+    iface.writemem(addr, blob)
+    print("T8152 AHCI NVMe: attaching (NVMe wake, Identify, outer and inner GPT checks)")
+    result = no_timeout(p.hv_windows_ahci, w.AHCI_OP_ATTACH_NVME, addr)
+    u.free(addr)
+    if result != 0:
+        sys.exit("T8152: the resident refused the NVMe disk (its console says why; the NVMe was "
+                 "shut down again and nothing was written). The carrier session is used up: "
+                 "reload the carrier. No guest was started.")
+    status = lambda name: p.hv_windows_ahci(w.AHCI_OP_NVME_STATUS, w.NVME_STATUS[name])
+    found = (status("first"), status("last"))
+    if found != (ahci["part"].first, ahci["part"].last):
+        no_timeout(p.hv_windows_ahci, w.AHCI_OP_DETACH)
+        sys.exit(f"T8152: the resident attached LBAs {found}, not the configured "
+                 f"[{ahci['part'].first}, {ahci['part'].last}]; detached. No guest was started.")
+    print(f"T8152 AHCI NVMe: attached LBAs [{found[0]}, {found[1]}], inner disk "
+          f"{status('inner_bytes') >> 20} MiB; I/O fence set")
+
+
+def windows_t8152_ahci_nvme_detach():
+    """Any launcher exit between ATTACH and the guest: close (idempotent)."""
+    from aura import windows as w
+    try:
+        no_timeout(p.hv_windows_ahci, w.AHCI_OP_DETACH)
+    except ProxyRemoteError:
+        pass
+
+
+def windows_t8152_ahci_nvme_close(result, ahci):
+    """After hv.start(): the resident closed the disk on its way out (CLEAN or FAILED).  DETACH
+    is idempotent and retries the shutdown of a FAILED close once.  True if a reset is safe."""
+    from aura import windows as w
+    status = lambda name: p.hv_windows_ahci(w.AHCI_OP_NVME_STATUS, w.NVME_STATUS[name])
+    state = status("state")
+    if state != 3:
+        try:
+            no_timeout(p.hv_windows_ahci, w.AHCI_OP_DETACH)
+        except ProxyRemoteError:
+            pass
+        state = status("state")
+    print(f"T8152 AHCI NVMe: {status('commands')} commands, {status('failed_commands')} failed, "
+          f"{status('blocks_read') >> 8} MiB read, {status('blocks_written') >> 8} MiB written, "
+          f"{status('flushes')} flushes, {status('rmw')} RMW blocks; longest NVMe command "
+          f"{status('longest_us')} us, longest flush {status('longest_flush_us')} us; guard hits "
+          f"{status('guard_hits')}")
+    name = w.describe_nvme_state(state)
+    if state == 3:
+        print(f"T8152 AHCI NVMe: CLEAN: the controller confirmed its shutdown"
+              f"{' after this session wrote' if status('wrote') else ' (nothing written)'}. "
+              "A carrier reset (P_REBOOT, --windows-reset-on-exit, leave2.sh) is safe now.")
+        return True
+    print(f"\x1b[31mT8152 AHCI NVMe: {name}: the controller did NOT confirm its shutdown after "
+          "this session wrote. Do NOT hard reset (macvdmtool, power hold): retry "
+          "p.hv_windows_ahci(6) from the proxy shell. If it stays FAILED, a reset risks the "
+          "Windows partition; run the read-only checks of the D5 runbook from Linux "
+          "afterwards.\x1b[0m")
+    return False
 
 
 def windows_t8152_usb_plan(payload, u):
@@ -533,7 +685,11 @@ def run_windows_t8152(caps):
         sys.exit("T8152 needs --windows-guest-ram BASE:TOP (see docs/windows-t8152.md)")
     base, top = (number(v, "guest RAM") for v in args.windows_guest_ram.split(":", 1))
     payload = args.payload.read_bytes()
-    ahci = windows_t8152_ahci_plan(base, top, payload)
+    if ahci_nvme_requested():
+        ahci = windows_t8152_ahci_nvme_plan(base, top, payload)
+    else:
+        ahci = windows_t8152_ahci_plan(base, top, payload)
+    nvme = bool(ahci and ahci.get("backend") == "nvme")
 
     u = ProxyUtils(p, heap_size=PROXY_HEAP_SIZE, aura_heap=AURA_HEAP_RESERVE)
     if u.adt["/chosen"].chip_id != T8152_CHIP:
@@ -597,11 +753,22 @@ def run_windows_t8152(caps):
         sys.exit("Mu payload base is not 64 KiB aligned")
     print(f"T8152: Mu at {hv.guest_base:#x}, entry {hv.entry:#x}, "
           f"boot_args {hv.guest_base + hv.bootargs_off:#x}")
-    if ahci:
+    if nvme:
+        windows_t8152_ahci_nvme_attach(hv, u, ahci)
+    elif ahci:
         windows_t8152_ahci_attach(hv, u, ahci)
     windows_t8152_usb_attach(hv, usb_ports, ahci)
     windows_t8152_gpu_admit(hv, gpu_mode, usb_ports, ahci)
     windows_t8152_input_attach(hv, input_sources)
+    try:
+        windows_t8152_usb_attach(hv, usb_ports, ahci)
+        windows_t8152_gpu_admit(hv, gpu_mode, usb_ports, ahci)
+        windows_t8152_input_attach(hv, input_sources, usb_ports)
+    except BaseException:
+        if nvme:
+            # D5: the NVMe disk is attached; never leave it owning the controller.
+            windows_t8152_ahci_nvme_detach()
+        raise
     try:
         result = hv.start()
     except ProxyRemoteError as exc:
@@ -618,6 +785,9 @@ def run_windows_t8152(caps):
                 p.hv_windows_input(INPUT_OP_DETACH)
             except ProxyRemoteError:
                 pass
+        if nvme:
+            # hv_start() closes the NVMe disk on every return itself; DETACH is idempotent.
+            windows_t8152_ahci_nvme_detach()
         sys.exit(f"Hypervisor refused or failed: {exc}. The aura proxy keeps running; "
                  "its console says why. USB and input (if any) were detached; a GPU "
                  "admission has no release and lasts until the carrier is reloaded.")
@@ -625,11 +795,22 @@ def run_windows_t8152(caps):
     windows_t8152_usb_status(usb_ports)
     windows_t8152_gpu_status(gpu_mode)
     windows_t8152_input_status(input_sources)
-    if ahci:
+    clean = True
+    if nvme:
+        clean = windows_t8152_ahci_nvme_close(result, ahci)
+    elif ahci:
         windows_t8152_ahci_seal(result, ahci)
-    if result == 2 and args.windows_reset_on_exit:
-        print("SYSTEM_RESET: shutting NVMe down, then resetting through WD1")
+    if result == 2 and args.windows_reset_on_exit and not clean:
+        print("SYSTEM_RESET: NOT resetting: the NVMe disk did not close CLEAN (see above). The "
+              "aura proxy stays up.")
+    elif result == 2 and args.windows_reset_on_exit:
+        print("SYSTEM_RESET: NVMe closed CLEAN; resetting through WD1 (P_REBOOT goes through "
+              "flush_and_reboot)")
         windows_system_reset(p)
+    elif nvme and ahci["flags"] & 1:
+        print("The aura proxy stays up. The guest wrote only its NVMe partition (closed above); "
+              "leave the proxy through the carrier (leave2.sh / P_REBOOT), never a hard reset "
+              "unless CLEAN was printed.")
     else:
         print("The aura proxy stays up. Nothing was written to disk or NVRAM by the guest.")
     sys.exit(0)

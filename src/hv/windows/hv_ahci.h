@@ -31,6 +31,12 @@
 /* P_HV_WINDOWS_CAPS2: 'AWI2' in the top half, feature bits below. */
 #define HV_WINDOWS_CAPS2_MAGIC 0x4157493200000000ULL
 #define HV_WINDOWS_CAPS2_AHCI  BIT(0) /* AHCI RAM store v1 (this file) */
+/*
+ * D5: the AHCI disk on an internal NVMe partition (hv_ahci_nvme.c), v1: ops 5-8, the backend
+ * closes with a controller shutdown on every hv_start() return and in flush_and_reboot(), and
+ * P_REBOOT goes through flush_and_reboot().  Bit 4 belongs to GPU wave 2.
+ */
+#define HV_WINDOWS_CAPS2_AHCI_NVME BIT(5)
 
 /* P_HV_WINDOWS_AHCI args[0]. */
 enum hv_ahci_op {
@@ -39,6 +45,11 @@ enum hv_ahci_op {
     HV_AHCI_OP_SEAL_UPLOAD = 2,
     HV_AHCI_OP_SEAL_EXIT = 3,
     HV_AHCI_OP_STATUS = 4,
+    /* D5 (hv_ahci_nvme.h): a1 = the 192-byte request; DETACH; a1 = index; gate test. */
+    HV_AHCI_OP_ATTACH_NVME = 5,
+    HV_AHCI_OP_DETACH = 6,
+    HV_AHCI_OP_NVME_STATUS = 7,
+    HV_AHCI_OP_NVME_TEST = 8,
 };
 
 /* QUERY indices. */
@@ -123,6 +134,11 @@ int hv_ahci_verify(void);
 void hv_ahci_guest_entered(void);
 /* hv_start() returned: the exit status the launcher sees (1 OFF, 2 RESET, else failure). */
 void hv_ahci_guest_exited(int status);
+/*
+ * Every hv_start() return (exits, refusals, aborts): an NVMe backend closes with the controller
+ * shutdown here (D5).  Nothing for the RAM store.
+ */
+void hv_ahci_session_end(int status);
 
 /*
  * The periodic HV report: commands, errors and the longest command under the lock; while the

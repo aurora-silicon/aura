@@ -913,6 +913,223 @@ def ahci_host_note(sha256, image_bytes, when):
     return note[:AHCI_NOTE_SIZE - 1].ljust(AHCI_NOTE_SIZE, b"\0")
 
 
+# ---- D5: the AHCI disk on an internal NVMe partition (src/hv/windows/hv_ahci_nvme.h) --------
+#
+# Windows keeps seeing the same carrier-emulated AHCI disk; its backend is a dedicated GPT
+# partition of nvme0n1, read and written by aura's EL2 NVMe driver.  The partition is chosen by
+# the owner's private configuration (never by number): disk GUID, unique partition GUID, type
+# GUID, name and first/last LBA, all re-checked by the resident against the live GPT.  The
+# values below must agree with the resident (CAPS2 bit 5, P_HV_WINDOWS_AHCI ops 5-8).
+CAPS2_AHCI_NVME = 0x0020                  # D5 v1
+AHCI_OP_ATTACH_NVME, AHCI_OP_DETACH, AHCI_OP_NVME_STATUS, AHCI_OP_NVME_TEST = 5, 6, 7, 8
+NVME_REQ_MAGIC = b"AWNVME01"
+NVME_REQ_VERSION = 1
+NVME_REQ_SIZE = 0xC0
+NVME_REQ_FORMAT = "<8sII16s16s16sQQQQ72s24s"
+NVME_NAME_UNITS = 36
+NVME_RW, NVME_FLUSH_EVERY, NVME_GATE, NVME_SCRATCH = 0x1, 0x2, 0x4, 0x8
+NVME_STATES = ("DETACHED", "ATTACHED", "RUNNING", "CLEAN", "FAILED")
+NVME_STATUS = {"state": 0, "flags": 1, "commands": 2, "dev_commands": 3, "longest_us": 4,
+               "flushes": 5, "rmw": 6, "guard_hits": 7, "first": 8, "last": 9, "wrote": 10,
+               "failed_commands": 11, "blocks_read": 12, "blocks_written": 13,
+               "inner_bytes": 14, "longest_flush_us": 15}
+NVME_TEST = {"write": 1, "verify": 2, "flush": 3, "crc": 4}
+NVME_LBA_BYTES = 4096
+NVME_ALIGN = 1 << 20
+NVME_CONFIG_NAME = "d5/windows-partition.env"
+NVME_CONFIG_REQUIRED = ("J804_WIN_PART_TYPE", "J804_WIN_PART_UUID", "J804_WIN_PART_NAME",
+                        "J804_WIN_DISK_GUID", "J804_WIN_PART_FIRST_LBA", "J804_WIN_PART_LAST_LBA",
+                        "J804_WIN_LBA_BYTES", "J804_WIN_IMAGE_BYTES")
+# P_REBOOT args[0] that resets even after an unconfirmed close (src/proxy.h P_REBOOT_FORCE).
+REBOOT_FORCE = int.from_bytes(b"FORCE", "little")
+# Public type GUIDs another OS owns (gpt_check.c denied_types): never the Windows partition.
+NVME_DENIED_TYPES = frozenset(t.upper() for t in (
+    "C12A7328-F81F-11D2-BA4B-00A0C93EC93B", "024DEE41-33E7-11D3-9D69-0008C781F39F",
+    "7C3457EF-0000-11AA-AA11-00306543ECAC", "48465300-0000-11AA-AA11-00306543ECAC",
+    "426F6F74-0000-11AA-AA11-00306543ECAC", "69646961-6700-11AA-AA11-00306543ECAC",
+    "52637672-7900-11AA-AA11-00306543ECAC", "0FC63DAF-8483-4772-8E79-3D69D8477DE4",
+    "B921B045-1DF0-41C3-AF44-4C6F280D3FAE", "933AC7E1-2EB4-4F13-B844-0E14E2AEF915",
+    "0657FD6D-A4AB-43C4-84E5-0933C84B4F4F", "E6D6D379-F507-44C2-A23C-238F2A3DF928",
+    "A19D880F-05FC-4D3B-A006-743F0F84911E", "CA7D7CCB-63ED-4C53-861C-1742536059CC",
+    "BC13C2FF-59E6-4262-A352-B275FD6F7172", "EBD0A0A2-B9E5-4433-87C0-68B6B72699C7",
+    "E3C9E316-0B5C-4DB8-817D-F92DF00215AE", "DE94BBA4-06D1-4D40-A16A-BFD50179D6AC"))
+
+
+def parse_env_file(text):
+    """KEY=VALUE lines (shell style: comments, optional quotes, no expansion)."""
+    values = {}
+    for number_, raw in enumerate(text.splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[7:].lstrip()
+        key, sep, value = line.partition("=")
+        require(sep and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key),
+                f"line {number_} of the partition config is not KEY=VALUE")
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        values[key] = value
+    return values
+
+
+def _guid(text, label):
+    import uuid
+    try:
+        return uuid.UUID(text)
+    except (ValueError, AttributeError, TypeError):
+        raise ValueError(f"{label} {text!r} is not a GUID") from None
+
+
+def _lba(text, label):
+    require(isinstance(text, str) and re.fullmatch(r"[0-9]+", text.replace("_", "")),
+            f"{label} {text!r} is not a decimal LBA")
+    return int(text.replace("_", ""))
+
+
+@dataclass(frozen=True)
+class NvmePartition:
+    disk_guid: object
+    part_guid: object
+    type_guid: object
+    name: str
+    first: int
+    last: int
+    lba_bytes: int
+    image_bytes: int
+    image_sha256: str = ""
+
+    @property
+    def blocks(self):
+        return self.last - self.first + 1
+
+    @property
+    def size(self):
+        return self.blocks * self.lba_bytes
+
+    @property
+    def sectors(self):
+        return self.size // 512
+
+
+def nvme_partition_config(values):
+    """The private config's values -> NvmePartition, refusing anything incomplete or unsafe."""
+    missing = [k for k in NVME_CONFIG_REQUIRED if not values.get(k)]
+    require(not missing, f"the partition config lacks {', '.join(missing)} (written by "
+            "j804-private-data/d5/install-windows-partition.sh at install)")
+    name = values["J804_WIN_PART_NAME"]
+    require(0 < len(name.encode("utf-16-le")) // 2 <= NVME_NAME_UNITS,
+            f"the partition name must be 1-{NVME_NAME_UNITS} UTF-16 units")
+    part = NvmePartition(
+        disk_guid=_guid(values["J804_WIN_DISK_GUID"], "J804_WIN_DISK_GUID"),
+        part_guid=_guid(values["J804_WIN_PART_UUID"], "J804_WIN_PART_UUID"),
+        type_guid=_guid(values["J804_WIN_PART_TYPE"], "J804_WIN_PART_TYPE"),
+        name=name,
+        first=_lba(values["J804_WIN_PART_FIRST_LBA"], "J804_WIN_PART_FIRST_LBA"),
+        last=_lba(values["J804_WIN_PART_LAST_LBA"], "J804_WIN_PART_LAST_LBA"),
+        lba_bytes=_lba(values["J804_WIN_LBA_BYTES"], "J804_WIN_LBA_BYTES"),
+        image_bytes=_lba(values["J804_WIN_IMAGE_BYTES"], "J804_WIN_IMAGE_BYTES"),
+        image_sha256=values.get("J804_WIN_IMAGE_SHA256", ""))
+    require(part.lba_bytes == NVME_LBA_BYTES, "the internal NVMe has 4096-byte LBAs; the config "
+            f"says {part.lba_bytes}")
+    require(part.first <= part.last, "the partition's first LBA is after its last")
+    require(part.first * part.lba_bytes % NVME_ALIGN == 0,
+            "the partition does not start on a 1 MiB boundary")
+    require(str(part.type_guid).upper() not in NVME_DENIED_TYPES,
+            "the partition type is a well-known type (EFI, APFS, Linux, Microsoft basic data, "
+            "...): the Windows partition needs its own private type GUID")
+    require(part.image_bytes > 0 and part.image_bytes % 512 == 0,
+            "J804_WIN_IMAGE_BYTES must be a positive multiple of 512")
+    require(part.size >= part.image_bytes,
+            f"the partition ({part.size} bytes) is smaller than the image ({part.image_bytes})")
+    for spec in filter(None, values.get("J804_WIN_OTHER_PARTS", "").replace(" ", "").split(",")):
+        lo, sep, hi = spec.partition("-")
+        require(sep, f"J804_WIN_OTHER_PARTS entry {spec!r} is not FIRST-LAST")
+        lo, hi = _lba(lo, "J804_WIN_OTHER_PARTS"), _lba(hi, "J804_WIN_OTHER_PARTS")
+        require(hi < part.first or lo > part.last,
+                f"the Windows partition [{part.first}, {part.last}] overlaps another partition "
+                f"[{lo}, {hi}] recorded in the config")
+    return part
+
+
+def load_nvme_config(path):
+    path = Path(path)
+    require(path.is_file(), f"no partition config at {path} (pass --windows-ahci-nvme-config, "
+            "or set J804_PRIVATE_DATA)")
+    return nvme_partition_config(parse_env_file(path.read_text()))
+
+
+def default_nvme_config_path(environ=os.environ):
+    root = environ.get("J804_PRIVATE_DATA")
+    return Path(root) / NVME_CONFIG_NAME if root else None
+
+
+def resolve_nvme_partition(part, key):
+    """--windows-ahci-partition KEY: the partition's unique GUID or its GPT name, as the config
+    records them.  A number is refused: GPT numbers change (macOS 27.2 renumbered this disk)."""
+    require(isinstance(key, str) and key.strip(), "--windows-ahci-partition needs the partition's "
+            "GPT GUID or GPT name")
+    key = key.strip()
+    require(not re.fullmatch(r"(p|nvme0n1p|/dev/nvme0n1p)?[0-9]+", key),
+            f"--windows-ahci-partition {key!r} looks like a partition number: partitions are "
+            "chosen by GUID or name only")
+    try:
+        import uuid
+        if uuid.UUID(key) == part.part_guid:
+            return part
+    except ValueError:
+        pass
+    require(key == part.name, "--windows-ahci-partition matches neither the configured partition "
+            "GUID nor its name")
+    return part
+
+
+def nvme_request(part, flags):
+    """The 192-byte ATTACH_NVME request (hv_ahci_nvme.h struct hv_ahci_nvme_req)."""
+    require(flags & ~(NVME_RW | NVME_FLUSH_EVERY | NVME_GATE | NVME_SCRATCH) == 0,
+            "bad NVMe attach flags")
+    require(not (flags & NVME_SCRATCH) or flags & NVME_GATE, "scratch is a gate-test attach only")
+    name = part.name.encode("utf-16-le").ljust(2 * NVME_NAME_UNITS, b"\0")
+    blob = struct.pack(NVME_REQ_FORMAT, NVME_REQ_MAGIC, NVME_REQ_VERSION, flags,
+                       part.disk_guid.bytes_le, part.part_guid.bytes_le, part.type_guid.bytes_le,
+                       part.first, part.last, part.image_bytes, 0, name, b"\0" * 24)
+    assert len(blob) == NVME_REQ_SIZE
+    return blob
+
+
+def validate_nvme_contract(caps2):
+    require(isinstance(caps2, int) and caps2 >> 32 == CAPS2_MAGIC >> 32 and
+            caps2 & CAPS2_AHCI_NVME and caps2 & CAPS2_AHCI,
+            "the resident has no NVMe-backed AHCI disk (P_HV_WINDOWS_CAPS2 bit 5): rebuild the "
+            "carrier from j804-windows-nvme or later")
+
+
+def nvme_ahci_plan(base, top):
+    """With the NVMe backend there is no DRAM store: guest RAM is the whole window."""
+    return AhciPlan(window_base=base, window_top=top, store_base=top, disk_bytes=0)
+
+
+def ahci_nvme_handshake(boot):
+    """The 24-byte /chosen/aura,windows-ahci-v1 (no store range; Mu J804AhciDxe accepts it)."""
+    return struct.pack("<QQII", AHCI_ABAR, AHCI_ABAR_SIZE, AHCI_GSIV, AHCI_BOOT[boot])
+
+
+def describe_nvme_state(state):
+    return NVME_STATES[state] if 0 <= state < len(NVME_STATES) else f"unknown ({state})"
+
+
+def nvme_test_pattern(seed, rel_block, word):
+    """hv_ahci_nvme_pattern(): the W0 gate's 64-bit word `word` (0..511) of partition block
+    `rel_block`, to check blocks from Linux after the carrier-closed reset."""
+    m = (1 << 64) - 1
+    z = seed ^ (rel_block * 0x9E3779B97F4A7C15 & m) ^ (word << 32 | word)
+    z = (z + 0x9E3779B97F4A7C15) & m
+    z = ((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9) & m
+    z = ((z ^ (z >> 27)) * 0x94D049BB133111EB) & m
+    return z ^ (z >> 31)
+
+
 # ---- D4: usb-drd1 (and drd3) xHCI passthrough (src/hv/windows/hv_usb.h) ---------------------
 #
 # The carrier passes only the xHCI registers through, publishes AIC 1692 as SPI 995 and gives

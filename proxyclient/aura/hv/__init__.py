@@ -2104,7 +2104,12 @@ class HV(Reloadable):
             chosen._properties.pop(AHCI_PROPERTY, None)
             chosen._types.pop(AHCI_PROPERTY, None)
             return
-        value = ahci_handshake(self.windows_ahci["plan"], self.windows_ahci["boot"])
+        if self.windows_ahci.get("backend") == "nvme":
+            # D5: no DRAM store, so the 24-byte form (ABAR, size, GSIV, boot) Mu accepts.
+            from ..windows import ahci_nvme_handshake
+            value = ahci_nvme_handshake(self.windows_ahci["boot"])
+        else:
+            value = ahci_handshake(self.windows_ahci["plan"], self.windows_ahci["boot"])
         chosen._properties[AHCI_PROPERTY] = value
         chosen._types[AHCI_PROPERTY] = (Bytes(len(value)), False)
 

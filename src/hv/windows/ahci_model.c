@@ -268,13 +268,14 @@ void ahci_model_identify(const struct ahci_model *m, u16 w[256])
     w[2] = 0xc837; /* no SET FEATURES spin-up, IDENTIFY complete */
     w[3] = 16;
     w[6] = 63;
-    ata_string(&w[10], "AURA-AHCI-0000000001", 10);
-    ata_string(&w[23], "D1.0", 4);
-    ata_string(&w[27], "Aura carrier RAM disk", 20);
+    const struct ahci_env *e = m->env;
+    ata_string(&w[10], e->serial ? e->serial : "AURA-AHCI-0000000001", 10);
+    ata_string(&w[23], e->firmware ? e->firmware : "D1.0", 4);
+    ata_string(&w[27], e->model_name ? e->model_name : "Aura carrier RAM disk", 20);
     w[47] = 0x8010; /* at most 16 sectors per DRQ block (SATA: 16 or less, ACS-3 §7.12.7.15) */
     w[49] = 0x0300; /* LBA, DMA */
     w[50] = 0x4000;
-    w[53] = 0x0006; /* words 64-70 and 88 valid */
+    w[53] = 0x0006;                      /* words 64-70 and 88 valid */
     w[59] = (u16)(0x0100 | m->multiple); /* the current DRQ block setting is valid */
     w[60] = (u16)lba28;
     w[61] = (u16)(lba28 >> 16);
@@ -300,7 +301,14 @@ void ahci_model_identify(const struct ahci_model *m, u16 w[256])
     w[101] = (u16)(sectors >> 16);
     w[102] = (u16)(sectors >> 32);
     w[103] = (u16)(sectors >> 48);
-    w[106] = 0x4000; /* one 512-byte logical sector per 512-byte physical sector */
+    if (e->phys_log2) {
+        /* 512e: valid, multiple logical sectors per physical, 2^n of them (ACS-3 §7.12.7.40);
+           logical sector 0 at offset 0 of its physical sector, alignment valid (§7.12.7.67). */
+        w[106] = (u16)(0x6000 | (e->phys_log2 & 0xf));
+        w[209] = 0x4000;
+    } else {
+        w[106] = 0x4000; /* one 512-byte logical sector per 512-byte physical sector */
+    }
     w[217] = 0x0001; /* non-rotating medium */
     /* Integrity word: signature 0xA5, checksum making the 512-byte sum 0 (ACS-3 §7.12.7.91). */
     u8 sum = 0xa5;
@@ -506,9 +514,21 @@ static enum outcome data_command(struct ahci_model *m, const struct ata_cmd *c, 
 
     m->bounce_valid = false;
     enum walk w = walk_prdt(m, ctba, prdtl, bytes, to_guest, false, s, &irq);
+    /* D5: the backend sees the transfer only once the whole PRDT has been checked. */
+    bool backend = !s->buf && m->env->begin;
+    if (w == WALK_OK && backend &&
+        !m->env->begin(m->env->opaque, s->lba, (u32)(bytes / AHCI_MODEL_SECTOR), !to_guest)) {
+        write_prdbc(hdr, 0);
+        return ata_error(m, c, ATA_ERR_UNC);
+    }
     if (w == WALK_OK)
         w = walk_prdt(m, ctba, prdtl, bytes, to_guest, true, s, &irq);
+    else
+        backend = false;
     m->bounce_valid = false;
+    /* D5: nothing is reported complete before the backend has the data where it belongs. */
+    if (backend && !m->env->end(m->env->opaque, w == WALK_OK, !m->write_cache) && w == WALK_OK)
+        w = WALK_MEDIUM;
     write_prdbc(hdr, s->pos);
 
     switch (w) {
@@ -556,6 +576,11 @@ static enum outcome disk_command(struct ahci_model *m, const struct ata_cmd *c, 
 {
     if (!in_range(m, lba, count))
         return ata_error(m, c, ATA_ERR_IDNF);
+    if (m->env->read_only && (x == XFER_DMA_OUT || x == XFER_PIO_OUT)) {
+        /* D5 read-only sessions: no write reaches the backend. */
+        write_prdbc(hdr, 0);
+        return ata_error(m, c, ATA_ERR_ABRT);
+    }
     struct stream s = {lba, NULL, 0};
     return data_command(m, c, hdr, ctba, prdtl, x, count * AHCI_MODEL_SECTOR, &s);
 }

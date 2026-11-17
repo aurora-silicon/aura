@@ -32,6 +32,10 @@
 #include "wdt.h"
 #include "xnuboot.h"
 
+#ifdef AURA_WINDOWS
+#include "hv/windows/hv_ahci_nvme.h"
+#endif
+
 #include "minilzlib/minlzma.h"
 #include "tinf/tinf.h"
 
@@ -142,7 +146,21 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
             wdt_disable();
             break;
         case P_REBOOT:
+#ifdef AURA_WINDOWS
+            /*
+             * D5: the Windows personality resets only through flush_and_reboot(), which closes
+             * an NVMe-backed AHCI disk with the controller shutdown first.  Refused while a guest
+             * session owns the disk, or after a close that was not confirmed (FAILED) unless
+             * args[0] is P_REBOOT_FORCE.
+             */
+            if (!hv_ahci_nvme_reboot_allowed(request->args[0] == P_REBOOT_FORCE)) {
+                reply->status = S_ERROR;
+                break;
+            }
+            flush_and_reboot();
+#else
             reboot();
+#endif
             break;
         case P_SLEEP:
             cpu_sleep(request->args[0]);
@@ -681,10 +699,13 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
              * Bit 1: D4 USB passthrough v1 (hv_usb.c, P_HV_WINDOWS_USB, configure BIT(9)).
              * Bit 2: G0 GPU admission and logging hooks (hv_gpu.c, P_HV_WINDOWS_GPU).
              * Bit 3: I0 input v1 (hv_input.c, P_HV_WINDOWS_INPUT, configure BIT(10)).
+             * Bit 4: reserved for GPU wave 2.  Bit 5: D5 AHCI disk on an NVMe partition
+             * (hv_ahci_nvme.c; P_HV_WINDOWS_AHCI ops 5-8, NVMe closed on every exit).
              */
 #ifdef AURA_WINDOWS
             reply->retval = HV_WINDOWS_CAPS2_MAGIC | HV_WINDOWS_CAPS2_AHCI | HV_WINDOWS_CAPS2_USB |
-                            HV_WINDOWS_CAPS2_GPU | HV_WINDOWS_CAPS2_INPUT;
+                            HV_WINDOWS_CAPS2_GPU | HV_WINDOWS_CAPS2_INPUT |
+                            HV_WINDOWS_CAPS2_AHCI_NVME;
 #else
             reply->retval = 0;
 #endif
@@ -775,17 +796,29 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
             break;
 
         case P_NVME_INIT:
-            reply->retval = nvme_init();
-            break;
         case P_NVME_SHUTDOWN:
-            if (!nvme_shutdown())
-                reply->status = S_ERROR;
-            break;
         case P_NVME_READ:
-            reply->retval = nvme_read(request->args[0], request->args[1], (void *)request->args[2]);
-            break;
         case P_NVME_FLUSH:
-            reply->retval = nvme_flush(request->args[0]);
+#ifdef AURA_WINDOWS
+            /* D5: while the AHCI backend owns the controller, the proxy may not drive it. */
+            if (hv_ahci_nvme_owns_controller()) {
+                printf("NVMe proxy op refused: the Windows AHCI disk owns the controller (DETACH "
+                       "it first)\n");
+                reply->status = S_ERROR;
+                break;
+            }
+#endif
+            if (request->opcode == P_NVME_INIT) {
+                reply->retval = nvme_init();
+            } else if (request->opcode == P_NVME_SHUTDOWN) {
+                if (!nvme_shutdown())
+                    reply->status = S_ERROR;
+            } else if (request->opcode == P_NVME_READ) {
+                reply->retval =
+                    nvme_read(request->args[0], request->args[1], (void *)request->args[2]);
+            } else {
+                reply->retval = nvme_flush(request->args[0]);
+            }
             break;
 
         case P_MCC_GET_CARVEOUTS:

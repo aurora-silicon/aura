@@ -10,6 +10,7 @@
 #include "pmgr.h"
 #include "rtkit.h"
 #include "sart.h"
+#include "smp.h"
 #include "string.h"
 #include "utils.h"
 #include "xnuboot.h"
@@ -24,6 +25,13 @@
 #define NVME_SHUTDOWN_TIMEOUT 5000000
 #define NVME_SUSPEND_TIMEOUT  35000 /* macOS's, from its console */
 #define NVME_QUEUE_SIZE       64
+/*
+ * D5: the Windows carrier's own bounds for a write and a flush it issues through
+ * nvme_exec_command() (gate W0 measures); a longer nvme_cmd_timeout_us (nvme_exec_io_write())
+ * still wins.
+ */
+#define NVME_D5_WRITE_TIMEOUT 5000000
+#define NVME_FLUSH_TIMEOUT 10000000
 
 static u32 nvme_cmd_timeout_us = NVME_TIMEOUT;
 
@@ -87,6 +95,7 @@ static u32 nvme_cmd_timeout_us = NVME_TIMEOUT;
 #define NVME_ADMIN_CMD_CREATE_SQ 0x01
 #define NVME_ADMIN_CMD_DELETE_CQ 0x04
 #define NVME_ADMIN_CMD_CREATE_CQ 0x05
+#define NVME_ADMIN_CMD_IDENTIFY  0x06
 #define NVME_QUEUE_CONTIGUOUS    BIT(0)
 
 #define NVME_CMD_FLUSH 0x00
@@ -201,6 +210,34 @@ static u32 nvme_multi_fallback_reads;
 static u64 *nvme_prp_list;
 static u8 *nvme_verify_bounce;
 
+/* D5: the I/O fence (nvme.h), the forced normal shutdown and the poll hook. */
+static bool nvme_fence_on;
+static u32 nvme_fence_nsid;
+static u64 nvme_fence_first, nvme_fence_last, nvme_fence_hits;
+static bool nvme_force_normal_shutdown;
+/* This session's normal shutdown reached SHST done (whatever failed after it). */
+static bool nvme_shst_confirmed;
+void (*nvme_poll_hook)(void);
+
+/* unused: the host tests compile this block without the I/O paths */
+static inline __attribute__((unused)) bool nvme_fence_allows(u32 nsid, u64 lba, u32 count)
+{
+    if (!nvme_fence_on)
+        return true;
+    if (count && nsid == nvme_fence_nsid && lba >= nvme_fence_first && lba <= nvme_fence_last &&
+        count - 1 <= nvme_fence_last - lba)
+        return true;
+    nvme_fence_hits++;
+    return false;
+}
+
+/* How long one command may take before its queue is declared failed. */
+#define NVME_COMMAND_TIMEOUT(admin, opcode)                                                        \
+    ((admin)                      ? NVME_TIMEOUT                                                   \
+     : (opcode) == NVME_CMD_WRITE ? NVME_D5_WRITE_TIMEOUT                                          \
+     : (opcode) == NVME_CMD_FLUSH ? NVME_FLUSH_TIMEOUT                                             \
+                                  : NVME_TIMEOUT)
+
 static u64 nvme_read64_lo_hi(u64 addr)
 {
     u64 lo = read32(addr);
@@ -272,6 +309,8 @@ static void free_queue(struct nvme_queue *q)
 
 static void nvme_poll_syslog(void)
 {
+    if (nvme_poll_hook)
+        nvme_poll_hook();
     if (!nvme_rtkit)
         return;
     struct rtkit_message msg;
@@ -392,7 +431,8 @@ static bool nvme_exec_command(struct nvme_queue *q, struct nvme_command *cmd, u6
         write32(nvme_lsq_base + NVME_DB_LINEAR_IOSQ, tag);
     nvme_poll_syslog();
 
-    timeout = timeout_calculate(nvme_cmd_timeout_us);
+    u32 limit_us = NVME_COMMAND_TIMEOUT(q->adminq, queue_cmd->opcode);
+    timeout = timeout_calculate(nvme_cmd_timeout_us > limit_us ? nvme_cmd_timeout_us : limit_us);
     struct nvme_completion cqe;
     while (!timeout_expired(timeout)) {
         nvme_poll_syslog();
@@ -433,7 +473,8 @@ static bool nvme_exec_command(struct nvme_queue *q, struct nvme_command *cmd, u6
     if (!found) {
         nvme_cmd_timed_out = !completed;
         q->failed = true;
-        printf("nvme: could not find command completion in CQ\n");
+        printf("nvme: could not find command completion in CQ (opcode 0x%x, %s queue, CSTS 0x%x)\n",
+               queue_cmd->opcode, q->adminq ? "admin" : "I/O", read32(nvme_base + NVME_CSTS));
         return false;
     }
 
@@ -626,6 +667,7 @@ bool nvme_init(void)
     nvme_multi_enabled = true;
     nvme_multi_verified = false;
     nvme_multi_fallback_reads = 0;
+    nvme_shst_confirmed = false;
     nvme_prp_list = NULL;
     nvme_verify_bounce = NULL;
     nvme_boot_ticks = 0;
@@ -986,6 +1028,67 @@ fail:
 }
 
 /*
+ * D5: the controller lock (nvme.h).  An owner-tagged CPU lock rather than a spinlock_t, so the
+ * reset path can ask who holds it and wait a bounded time.
+ */
+static s64 nvme_lock_cpu = -1;
+static u32 nvme_lock_depth;
+
+bool nvme_lock_acquire(u32 usec)
+{
+    s64 me = smp_id();
+    if (__atomic_load_n(&nvme_lock_cpu, __ATOMIC_ACQUIRE) == me) {
+        nvme_lock_depth++;
+        return true;
+    }
+    u64 timeout = usec ? timeout_calculate(usec) : 0;
+    while (1) {
+        s64 free_ = -1;
+        if (__atomic_compare_exchange_n(&nvme_lock_cpu, &free_, me, false, __ATOMIC_ACQUIRE,
+                                        __ATOMIC_RELAXED)) {
+            nvme_lock_depth = 1;
+            return true;
+        }
+        if (usec && timeout_expired(timeout))
+            return false;
+    }
+}
+
+void nvme_lock_release(void)
+{
+    if (__atomic_load_n(&nvme_lock_cpu, __ATOMIC_RELAXED) != smp_id() || !nvme_lock_depth)
+        return;
+    if (!--nvme_lock_depth)
+        __atomic_store_n(&nvme_lock_cpu, -1, __ATOMIC_RELEASE);
+}
+
+int nvme_lock_owner(void)
+{
+    return (int)__atomic_load_n(&nvme_lock_cpu, __ATOMIC_ACQUIRE);
+}
+
+bool nvme_shutdown_for_reset(void)
+{
+    if (!nvme_base || (!nvme_initialized && !nvme_reboot_required))
+        return true; /* no session: nothing for the controller to commit */
+    if (nvme_shst_confirmed)
+        return true; /* the normal shutdown completed; a later step (disable, quiesce) failed */
+    u32 csts = read32(nvme_base + NVME_CSTS);
+    if (FIELD_GET(NVME_CSTS_SHST, csts) == NVME_CSTS_SHST_DONE)
+        return true;
+    if (!(read32(nvme_base + NVME_CC) & NVME_CC_EN) || !(csts & NVME_CSTS_RDY)) {
+        printf("nvme: reset shutdown: controller not enabled (CC 0x%x, CSTS 0x%x)\n",
+               read32(nvme_base + NVME_CC), csts);
+        return false;
+    }
+    bool done = nvme_ctrl_shutdown();
+    printf("nvme: reset shutdown: CC.SHN normal, SHST %s (CSTS 0x%x)\n", done ? "done" : "NOT done",
+           read32(nvme_base + NVME_CSTS));
+    return done;
+}
+
+
+/*
  * Post-M4: an earlier stage powered ANS off and passed its SART entries on (nvme.sart=), and this
  * stage hasn't started it again.
  */
@@ -1091,11 +1194,13 @@ bool nvme_shutdown(void)
      * saves nothing there; it only moves that work (0.15 to 0.55 s, varying by boot) under the
      * sleep handshake. T8152 keeps its session running, so only a stage that wrote pays there.
      */
-    bool normal_shutdown = nvme_wrote || nvme_type != NVME_T8132;
+    bool normal_shutdown = nvme_wrote || nvme_force_normal_shutdown || nvme_type != NVME_T8132;
     if (normal_shutdown && !nvme_ctrl_shutdown()) {
         printf("nvme: timeout while waiting for controller shutdown\n");
         if (nvme_type == NVME_T8132)
             goto out_preserve;
+    } else if (normal_shutdown) {
+        nvme_shst_confirmed = true;
     }
     if (!nvme_ctrl_disable()) {
         printf("nvme: timeout while waiting for CSTS.RDY to clear\n");
@@ -1110,8 +1215,11 @@ bool nvme_shutdown(void)
         write64_lo_hi(nvme_qreg(NVME_IOQ_CQES), 0);
         if (!nvme_own_rtkit() || !rtkit_quiesce(nvme_rtkit))
             goto out_preserve;
+        nvme_fence_on = false;
+        nvme_force_normal_shutdown = false;
         nvme_initialized = false;
-        printf("nvme: controller disabled, RTKit quiesced\n");
+        printf("nvme: controller disabled%s, RTKit quiesced\n",
+               normal_shutdown ? " after a normal shutdown" : "");
         return true;
     }
 
@@ -1253,7 +1361,7 @@ bool nvme_read_blocks(u32 nsid, u64 lba, void *buffer, u32 count)
 {
     if (nvme_reboot_required || !nvme_initialized || ioq.failed || !count ||
         count > NVME_MAX_READ_BLOCKS || ((u64)buffer & (SZ_4K - 1)) ||
-        lba > UINT64_MAX - (count - 1))
+        lba > UINT64_MAX - (count - 1) || !nvme_fence_allows(nsid, lba, count))
         return false;
 
     if (count > 1 && nvme_multi_enabled) {
@@ -1344,7 +1452,8 @@ bool nvme_write(u32 nsid, u64 lba, const void *buffer)
 {
     struct nvme_command cmd;
 
-    if (nvme_reboot_required || !nvme_initialized || ioq.failed || ((u64)buffer & (SZ_4K - 1)))
+    if (nvme_reboot_required || !nvme_initialized || ioq.failed || ((u64)buffer & (SZ_4K - 1)) ||
+        !nvme_fence_allows(nsid, lba, 1))
         return false;
 
     memset(&cmd, 0, sizeof(cmd));
@@ -1566,3 +1675,135 @@ out_sart:
     return ret;
 }
 #endif /* SPTM_VIRT */
+
+/* ---- D5: the Windows carrier's AHCI-on-NVMe backend (nvme.h) ---------------------------- */
+
+static bool nvme_submit_write(u32 nsid, u64 lba, const void *buffer, u32 count, u64 prp2)
+{
+    struct nvme_command cmd;
+
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.opcode = NVME_CMD_WRITE;
+    cmd.nsid = nsid;
+    cmd.prp1 = (u64)buffer;
+    cmd.prp2 = prp2;
+    cmd.cdw10 = lba;
+    cmd.cdw11 = lba >> 32;
+    cmd.cdw12 = count - 1;
+    /* Shut the controller down normally so it writes back its cache. */
+    nvme_wrote = true;
+
+    return nvme_exec_command(&ioq, &cmd, NULL);
+}
+
+bool nvme_write_blocks(u32 nsid, u64 lba, const void *buffer, u32 count)
+{
+    if (nvme_reboot_required || !nvme_initialized || ioq.failed || !count ||
+        count > NVME_MAX_WRITE_BLOCKS || ((u64)buffer & (SZ_4K - 1)) ||
+        lba > UINT64_MAX - (count - 1) || !nvme_fence_allows(nsid, lba, count))
+        return false;
+
+    u64 prp2 = 0;
+    if (count == 2) {
+        prp2 = (u64)buffer + SZ_4K;
+    } else if (count > 2) {
+        /* Allocated by nvme_prepare_io() before a guest session; never under one. */
+        if (!nvme_prp_list)
+            return false;
+        for (u32 i = 1; i < count; i++)
+            nvme_prp_list[i - 1] = (u64)buffer + (u64)i * SZ_4K;
+        prp2 = (u64)nvme_prp_list;
+    }
+    return nvme_submit_write(nsid, lba, buffer, count, prp2);
+}
+
+bool nvme_identify_ns(u32 nsid, void *buffer)
+{
+    struct nvme_command cmd;
+
+    if (nvme_reboot_required || !nvme_initialized || adminq.failed || ((u64)buffer & (SZ_4K - 1)))
+        return false;
+
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.opcode = NVME_ADMIN_CMD_IDENTIFY;
+    cmd.nsid = nsid;
+    cmd.prp1 = (u64)buffer;
+    cmd.cdw10 = 0; /* CNS 0: Identify Namespace */
+
+    return nvme_exec_command(&adminq, &cmd, NULL);
+}
+
+void nvme_set_fence(u32 nsid, u64 first, u64 last)
+{
+    nvme_fence_nsid = nsid;
+    nvme_fence_first = first;
+    nvme_fence_last = last;
+    nvme_fence_on = true;
+}
+
+void nvme_clear_fence(void)
+{
+    nvme_fence_on = false;
+}
+
+bool nvme_fence_active(void)
+{
+    return nvme_fence_on;
+}
+
+u64 nvme_fence_refusals(void)
+{
+    return nvme_fence_hits;
+}
+
+bool nvme_prepare_io(void)
+{
+    if (nvme_reboot_required || !nvme_initialized)
+        return false;
+    if (!nvme_prp_list)
+        nvme_prp_list = memalign(SZ_16K, SZ_4K);
+    if (!nvme_verify_bounce)
+        nvme_verify_bounce = memalign(SZ_16K, SZ_4K);
+    return nvme_prp_list && nvme_verify_bounce;
+}
+
+unsigned int nvme_dma_ranges(u64 (*ranges)[2], unsigned int max)
+{
+    const struct {
+        const void *p;
+        u64 size;
+    } all[] = {
+        {adminq.tcbs, NVME_QUEUE_SIZE * sizeof(*adminq.tcbs)},
+        {adminq.cmds, NVME_QUEUE_SIZE * sizeof(*adminq.cmds)},
+        {adminq.cqes, NVME_QUEUE_SIZE * sizeof(*adminq.cqes)},
+        {ioq.tcbs, NVME_QUEUE_SIZE * sizeof(*ioq.tcbs)},
+        {ioq.cmds, NVME_QUEUE_SIZE * sizeof(*ioq.cmds)},
+        {ioq.cqes, NVME_QUEUE_SIZE * sizeof(*ioq.cqes)},
+        {nvme_prp_list, SZ_4K},
+        {nvme_verify_bounce, SZ_4K},
+    };
+    unsigned int n = 0;
+    for (unsigned int i = 0; i < sizeof(all) / sizeof(all[0]) && n < max; i++) {
+        if (!all[i].p)
+            continue;
+        ranges[n][0] = (u64)all[i].p;
+        ranges[n][1] = (u64)all[i].p + all[i].size;
+        n++;
+    }
+    return n;
+}
+
+void nvme_request_normal_shutdown(void)
+{
+    nvme_force_normal_shutdown = true;
+}
+
+bool nvme_session_live(void)
+{
+    return nvme_initialized && !nvme_reboot_required;
+}
+
+bool nvme_needs_reboot(void)
+{
+    return nvme_reboot_required;
+}

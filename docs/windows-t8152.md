@@ -339,6 +339,116 @@ NCQ, an immediate completion interrupt), how long a 32 MiB command holds the hyp
 under load (reported as "longest access" every 10 s while the disk is busy), and whether
 Windows ever uses non-cacheable DMA buffers (the carrier does no cache maintenance).
 
+## D5: the AHCI disk on an internal NVMe partition
+
+Status: host-tested only; nothing of it has run on the M6 yet. Reasoning and the failure
+list: `windows-m6/D5-NVME-DESIGN.md` (owner notes, not in this tree). Windows keeps the D1
+AHCI disk (inbox storahci, no NVMe driver, the ANS never mapped to the guest); only its backend
+changes: a dedicated GPT partition of `nvme0n1`, read and written by aura's EL2 NVMe driver.
+Persistent, no upload, and guest RAM is the whole `--windows-guest-ram` window again.
+
+- **Guest view**: the D1 HBA, IDENTIFY 512e (512-byte logical, 4096-byte physical, word 106 =
+  0x6003, word 209 = 0x4000), strings `AURA-AHCI-NVME000001` / `D5.0` / `Aura carrier NVMe
+  disk`, sectors = partition bytes / 512. AHCI sector L is partition byte L x 512, i.e. NVMe
+  block `first + L / 8`. Mu gets the 24-byte `/chosen/aura,windows-ahci-v1` (no store).
+- **Choosing the partition**: never by number (macOS 27.2 renumbered this disk). The launcher
+  sends disk GUID, unique partition GUID, type GUID, name and first/last LBA from the private
+  config; the resident (`gpt_check.c`) reads the live primary and backup GPT through Identify's
+  namespace size, checks both headers and arrays (CRCs, positions, agreement), and accepts
+  exactly one entry matching all five values, inside the usable range, 1 MiB aligned, of no
+  well-known type (EFI, APFS, Apple boot/iSC/Recovery, HFS+, Linux types, Microsoft data/MSR/
+  recovery), overlapping no other entry (all pairs) and with no duplicate GUID or name. Then it
+  checks the inner disk: a protective MBR and a 512-byte-sector GPT that fits the partition.
+- **Guards**: the model's range check, the backend's (`ahci_nvme.c`), and an I/O fence in
+  `nvme.c` set at attach that refuses every read or write outside the partition until the
+  shutdown. Linux and macOS partitions are unreachable, for reads too.
+- **Data path**: the model calls the backend per PRD; it stages data in a 528 KiB bounce pool
+  (carrier heap, denied to stage 2) and issues whole 4 KiB-block commands of up to 64 blocks.
+  A write that covers a block in part reads it first (read-modify-write); RMW is atomic
+  against other AHCI commands because the model runs one command at a time under `ahci_lock`.
+  A command completes only after every NVMe write it caused completed: the carrier never holds
+  acknowledged data. FLUSH CACHE is an NVMe flush; with the write cache disabled (SET FEATURES
+  0x82) every write command is followed by one; `--windows-ahci-nvme-flush every-write` forces
+  that. No FUA.
+- **Which CPU**: the trapping CPU, synchronously, polled (the ANS interrupt stays unaliased),
+  under `bhl` and `ahci_lock`, then the owner-tagged NVMe lock (`nvme_lock_acquire`). The poll
+  loop pets the HV watchdog. Writes wait up to 5 s and flushes 10 s for their completion
+  (reads 1 s): the only earlier aura write on this SoC lost its completion within 1 s.
+- **Durability**: on the M6 only a controller shutdown (CC.SHN normal, SHST done) is trusted
+  (a flush is not, across a hard reset). Every exit the carrier controls closes the disk with
+  that shutdown before anything can reset:
+  - every `hv_start()` return (PSCI SYSTEM_OFF/RESET, ^C then `exit`, refusals before entry):
+    `hv_ahci_session_end()`;
+  - `flush_and_reboot()` (panic, assert, EL2 exceptions, SError, the HV watchdog, `P_REBOOT`):
+    `hv_ahci_nvme_reset_close()`, a bounded (3 s) wait for the NVMe lock, then the normal
+    shutdown, or CC.SHN written directly when another CPU holds the lock or a queue failed. It
+    resets only after SHST done (or if nothing was written); otherwise it parks.
+  - `P_REBOOT` in the Windows personality goes through `flush_and_reboot()`, and is refused
+    while a guest session owns the disk or after a FAILED close (args[0] = `"FORCE"`
+    overrides). `P_NVME_*` refuse while the disk owns the controller.
+  The state is `DETACHED -> ATTACHED -> RUNNING -> CLEAN | FAILED`; FAILED means written and
+  not confirmed.
+- **Not covered**: a hard reset (`macvdmtool reboot`), a power-button hold or power loss gives
+  the controller no shutdown. After any session that wrote, that risks the Windows partition.
+
+`P_HV_WINDOWS_CAPS2` bit 5. `P_HV_WINDOWS_AHCI` op 5 ATTACH_NVME (a1 = address of the 192-byte
+`hv_ahci_nvme_req`: "AWNVME01", version 1, flags RW/FLUSH_EVERY/GATE/SCRATCH, the three GUIDs
+in GPT byte order, first, last, image bytes, the UTF-16LE name), 6 DETACH (close, idempotent,
+refused while the guest runs), 7 NVME_STATUS (0 state, 1 flags, 2 commands, 3 NVMe commands, 4
+longest command us, 5 flushes, 6 RMW blocks, 7 guard hits, 8/9 first/last LBA, 10 wrote, 11
+failed commands, 12/13 blocks read/written, 14 inner disk bytes, 15 longest flush us), 8
+NVME_TEST (gate attaches only: write/verify/flush/CRC of seeded blocks; writes only with
+SCRATCH, i.e. on the empty partition before the install).
+
+Launcher (`run_guest.py`):
+
+| Option | Meaning |
+|---|---|
+| `--windows-ahci-backend {ram,nvme}` | `ram` is D1 (default); `nvme` is this |
+| `--windows-ahci-partition GUID\|NAME` | the Windows partition, resolved only through the private config; a number (`6`, `p6`, `nvme0n1p6`) is refused |
+| `--windows-ahci-nvme-config PATH` | default `$J804_PRIVATE_DATA/d5/windows-partition.env` |
+| `--windows-ahci-nvme-access {ro,rw}` | required, no default |
+| `--windows-ahci-nvme-flush {normal,every-write}` | default `normal` |
+
+Refused before `hv.init()`: any RAM-store option with `nvme`; a missing or incomplete config
+(`J804_WIN_PART_TYPE/_UUID/_NAME`, `J804_WIN_DISK_GUID`, `J804_WIN_PART_FIRST_LBA/_LAST_LBA`,
+`J804_WIN_LBA_BYTES` = 4096, `J804_WIN_IMAGE_BYTES`; optional `J804_WIN_OTHER_PARTS` =
+`first-last,...` for an overlap check), a well-known type, an unaligned start, a partition
+smaller than the image, a key matching neither GUID nor name; CAPS2 without bit 5, the D1
+contract and the AHCI FD marker; `rw` with a WinPE ramdisk boot. After ATTACH the launcher
+compares the resident's first/last LBA with the config. At exit it prints the counters and
+`CLEAN` or `FAILED`; `--windows-reset-on-exit` resets only after CLEAN.
+
+Runbook rules: end every session from Windows (Shut down / Restart) or with ^C then `exit`;
+leave the proxy only through the carrier (`P_REBOOT`, `leave2.sh`, `--windows-reset-on-exit`)
+after the launcher printed CLEAN; never `macvdmtool reboot` after a session that wrote unless
+CLEAN was printed; keep the image as the restore point. Gates before Windows writes:
+`tools/windows_nvme_gate.py r0` (two read-only attaches, no guest), `w0` (only on the empty
+partition, before the install), then the install from Linux
+(`j804-private-data/d5/install-windows-partition.sh`), then a read-only session, then rw.
+
+Host tests (`test_windows_t8152_ahci_nvme.py`): aura's real `nvme.c` and the carrier files are
+built unchanged with ASan/UBSan against `tests/e2e/windows_nvme_stubs/` and a simulated T8152
+controller (`tests/e2e/nvme_sim.c`) whose media has a volatile and a durable layer (only a
+normal shutdown commits). `windows_nvme_host.c` drives ATTACH, the guest's ABAR accesses, the
+exits and the reset path, cuts power and checks that everything Windows was told survived and
+nothing outside the partition changed: 512e IDENTIFY, RMW data against a reference, a 10^5
+command guard fuzz, the fence behind a corrupted backend, flush mapping, write-through, read
+only, PSCI OFF/RESET, abort, refusal, reset from another CPU mid-command, from inside the lock,
+after a lost completion, with SHST stuck (parks, never resets), a FAILED close retried, a
+failed quiesce after the commit (still CLEAN), a slow write completion, an error status, three
+wakes in one boot, the proxy and reboot rules and the W0 test. GPT fixtures come from the test's own writer with seeded GUIDs (the M6 shape, entries
+renumbered, 256-byte entries, 1024 entries) and 19 refusal variants, each leaving the media
+unchanged, the fence unset and the controller shut down. `AURA_NVME_TRANSCRIPT=<file>` saves
+the case transcript.
+
+Not known yet (gates on the M6): why aura's only earlier write on T8152 lost its completion
+(the longer write timeout is the first candidate, W0 decides); whether aura can wake the ANS a
+second time in one boot (R0); whether CC.SHN normal plus RTKit quiesce is enough for writes to
+survive a WD1 reset (W0); flush latency and the time `bhl` is held under a running Windows (R1,
+D5a; the launcher prints the longest command and flush); the RTKit syslog rate during I/O (its
+lines are printed from the poll loop, not rate limited yet).
+
 ## D3: EL2 SError context and the tick's guest-PC walk
 
 The first long Windows run on the AHCI disk (D3 run 1, NT on all 12 CPUs, storahci, ~42k

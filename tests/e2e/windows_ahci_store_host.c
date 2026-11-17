@@ -74,6 +74,105 @@ void hv_t8152_gic_spi_level(u32 intid, bool level)
     (void)level;
 }
 
+/* D5 (hv_ahci_nvme.c, ahci_nvme.c): not under test here; the RAM store never uses them. */
+int hv_ahci_nvme_attach(u64 req_addr, bool have_ram, u64 lo, u64 hi, u64 *sectors)
+{
+    (void)req_addr;
+    (void)have_ram;
+    (void)lo;
+    (void)hi;
+    (void)sectors;
+    return -1;
+}
+struct ahci_nvme *hv_ahci_nvme_backend(void)
+{
+    return NULL;
+}
+bool hv_ahci_nvme_attached(void)
+{
+    return false;
+}
+bool hv_ahci_nvme_gate(void)
+{
+    return false;
+}
+bool hv_ahci_nvme_read_only(void)
+{
+    return true;
+}
+enum hv_ahci_nvme_state hv_ahci_nvme_state(void)
+{
+    return HV_AHCI_NVME_DETACHED;
+}
+int hv_ahci_nvme_verify(void)
+{
+    return -1;
+}
+void hv_ahci_nvme_guest_entered(void)
+{
+}
+enum hv_ahci_nvme_state hv_ahci_nvme_close(const char *why)
+{
+    (void)why;
+    return HV_AHCI_NVME_DETACHED;
+}
+u64 hv_ahci_nvme_status(u64 index)
+{
+    (void)index;
+    return 0;
+}
+u64 hv_ahci_nvme_test(u64 a, u64 b, u64 c, u64 d)
+{
+    (void)a;
+    (void)b;
+    (void)c;
+    (void)d;
+    return (u64)-1;
+}
+void hv_ahci_nvme_report(bool final)
+{
+    (void)final;
+}
+void hv_ahci_nvme_fatal_report(void)
+{
+}
+bool ahci_nvme_begin(void *o, u64 lba, u32 count, bool write)
+{
+    (void)o;
+    (void)lba;
+    (void)count;
+    (void)write;
+    return false;
+}
+bool ahci_nvme_read(void *o, u64 lba, u32 count, void *dst)
+{
+    (void)o;
+    (void)lba;
+    (void)count;
+    (void)dst;
+    return false;
+}
+bool ahci_nvme_write(void *o, u64 lba, u32 count, const void *src)
+{
+    (void)o;
+    (void)lba;
+    (void)count;
+    (void)src;
+    return false;
+}
+bool ahci_nvme_end(void *o, bool ok, bool wt)
+{
+    (void)o;
+    (void)ok;
+    (void)wt;
+    return false;
+}
+bool ahci_nvme_flush(void *o)
+{
+    (void)o;
+    return false;
+}
+
 void memcpy128(void *dst, void *src, size_t size)
 {
     memcpy(dst, src, size);

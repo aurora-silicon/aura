@@ -1374,6 +1374,8 @@ int hv_start(void *entry, u64 regs[4])
     int ret = hv_start_session(entry, regs);
     hv_usb_teardown(ret == 1 ? "guest SYSTEM_OFF" : ret == 2 ? "guest SYSTEM_RESET" :
                                                                "guest session failed or refused");
+    /* D5: an NVMe-backed disk closes with the controller shutdown before the proxy runs again. */
+    hv_ahci_session_end(ret);
     return ret;
 }
 

@@ -208,6 +208,9 @@ typedef enum {
     P_HV_MAP_XFER = 0x1700,
 } ProxyOp;
 
+/* D5: P_REBOOT args[0] that resets even after an unconfirmed NVMe close ("FORCE"). */
+#define P_REBOOT_FORCE 0x4543524f46ULL
+
 #define S_OK     0
 #define S_BADCMD -1
 #define S_ERROR  -2

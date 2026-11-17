@@ -180,8 +180,16 @@ static void fresh(void)
     F.logs = 0;
     F.last_log[0] = 0;
     F.commands_seen = 0;
-    E = (struct ahci_env){env_span, env_read, env_write, env_flush, env_irq,
-                          env_log,  &F,       SECTORS,   env_command};
+    /* The D1 RAM disk: none of the D5 members (begin/end, 512e, read-only, strings). */
+    E = (struct ahci_env){.guest_span = env_span,
+                          .read = env_read,
+                          .write = env_write,
+                          .flush = env_flush,
+                          .irq_level = env_irq,
+                          .log = env_log,
+                          .opaque = &F,
+                          .sectors = SECTORS,
+                          .command = env_command};
     ahci_model_init(&M, &E);
 }
 

@@ -1,0 +1,3 @@
+Stub headers for tests/e2e/windows_nvme_host.c (D5).  The test copies src/nvme.c and the D5
+carrier sources unchanged next to these and builds them for the host: MMIO goes to the
+simulated controller in tests/e2e/nvme_sim.c, time is the simulation's clock.

@@ -176,7 +176,7 @@ def store_replay(tmp_path_factory):
     for name, text in STORE_STUBS.items():
         (out / name).write_text(text)
     for name in ("hv_ahci.c", "hv_ahci.h", "ahci_model.c", "ahci_model.h", "hv_vdev_spi.h",
-                 "hv_fatal.h"):
+                 "hv_fatal.h", "ahci_nvme.h", "hv_ahci_nvme.h"):
         shutil.copy2(WIN / name, out / name)
     binary = out / "ahci-store-host"
     build = subprocess.run([cc, "-std=gnu11", "-O1", "-g", "-Wall", "-Wextra", "-Werror",
@@ -449,7 +449,11 @@ def test_store_is_reserved_and_dma_is_bounded_to_guest_ram():
 
 def test_makefile_links_the_model():
     make = (REPO / "Makefile").read_text()
-    assert "ahci_model.o hv_ahci.o hv_vdev_spi.o" in make
+    objects = make[make.index("HV_OBJECTS := $(patsubst %,hv/windows/%"):]
+    objects = objects[:objects.index("\nendif")]
+    for obj in ("ahci_model.o", "hv_ahci.o", "hv_vdev_spi.o", "ahci_nvme.o", "gpt_check.o",
+                "hv_ahci_nvme.o"):
+        assert obj in objects, obj
 
 
 # ---- launcher ------------------------------------------------------------------------------
@@ -738,7 +742,7 @@ def test_run_guest_ahci_order_and_refusals():
     assert t8152.index("hv.load_raw(data") < t8152.index("windows_t8152_ahci_attach(hv, u, ahci)") \
         < t8152.index("result = hv.start()") < t8152.index("windows_t8152_ahci_seal(result, ahci)")
     plan = src[src.index("def windows_t8152_ahci_plan"):src.index("def windows_t8152_ahci_attach")]
-    assert "args.windows_reset_on_exit and ahci_requested()" in plan
+    assert "args.windows_reset_on_exit and ahci_ram_requested()" in plan
     assert "--windows-ahci-keep reuses the sealed disk" in plan
     assert "this is an AHCI FD" in plan
     assert plan.index("check_ahci_fresh_overwrite(blob, top, args.windows_ahci_overwrite)") > \

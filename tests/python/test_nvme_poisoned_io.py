@@ -19,8 +19,9 @@ def test_poisoned_session_refuses_io_before_buffer_changes(tmp_path):
     execute += source[source.index("/* A write or flush, timed:"):
                       source.index("bool nvme_init(void)")]
     read = source[source.index("bool nvme_flush("):]
-    read_limit = next(line for line in (root / "src/nvme.h").read_text().splitlines()
-                      if line.startswith("#define NVME_MAX_READ_BLOCKS "))
+    read_limit = "\n".join(line for line in (root / "src/nvme.h").read_text().splitlines()
+                           if line.startswith(("#define NVME_MAX_READ_BLOCKS ",
+                                               "#define NVME_MAX_WRITE_BLOCKS ")))
     harness = r'''
 #include <assert.h>
 #include <stdbool.h>
@@ -66,6 +67,11 @@ int main(void)
     assert(!nvme_flush(1));
     assert(!nvme_read_blocks(1, 0, buffer, 3));
     assert(!nvme_read(1, 0, buffer));
+    /* D5: the multi-block write and Identify refuse the same way, before any queue access. */
+    assert(!nvme_write_blocks(1, 0, buffer, 3));
+    assert(!nvme_write(1, 0, buffer));
+    assert(!nvme_identify_ns(1, buffer));
+    assert(!nvme_prepare_io());
     for (size_t i = 0; i < sizeof(buffer); i++)
         assert(buffer[i] == 0x3c);
     assert(!nvme_prp_list && !nvme_verify_bounce);

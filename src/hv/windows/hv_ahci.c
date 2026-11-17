@@ -8,7 +8,9 @@
 
 #include "hv_ahci.h"
 #include "ahci_model.h"
+#include "ahci_nvme.h"
 #include "hv.h"
+#include "hv_ahci_nvme.h"
 #include "hv_fatal.h"
 #include "hv_t8152.h"
 #include "hv_vdev_spi.h"
@@ -25,6 +27,8 @@ enum {
 
 static bool ahci_enabled;
 static bool attached;
+/* D5: the disk is an internal NVMe partition (hv_ahci_nvme.c), not the DRAM store. */
+static bool nvme_mode;
 static bool entered;
 static bool exited;
 static int exit_status;
@@ -157,6 +161,19 @@ static bool env_flush(void *opaque)
     UNUSED(opaque);
     sysop("dsb sy");
     return true;
+}
+
+/* D5: the NVMe backend, traced like the RAM store for the fatal report. */
+static bool env_nvme_read(void *opaque, u64 lba, u32 count, void *dst)
+{
+    trace_io(lba, count, false);
+    return ahci_nvme_read(opaque, lba, count, dst);
+}
+
+static bool env_nvme_write(void *opaque, u64 lba, u32 count, const void *src)
+{
+    trace_io(lba, count, true);
+    return ahci_nvme_write(opaque, lba, count, src);
 }
 
 static void env_irq(void *opaque, bool level)
@@ -359,7 +376,7 @@ static u64 attach(u64 base, u64 top, u64 bytes, u64 flags)
         printf("HV: T8152: AHCI: attach refused: the AHCI configure flag is not set\n");
         return HV_AHCI_ERROR;
     }
-    if (attached || entered) {
+    if (attached || entered || hv_ahci_nvme_attached()) {
         printf("HV: T8152: AHCI: attach refused: a store is already attached or the guest "
                "started\n");
         return HV_AHCI_ERROR;
@@ -473,7 +490,7 @@ static u64 attach(u64 base, u64 top, u64 bytes, u64 flags)
 
 static u64 seal_upload(u64 host_crc)
 {
-    if (!attached || entered || desc->state != HV_AHCI_LOADING) {
+    if (!attached || nvme_mode || entered || desc->state != HV_AHCI_LOADING) {
         printf("HV: T8152: AHCI: seal refused: no fresh store is loading\n");
         return HV_AHCI_ERROR;
     }
@@ -492,7 +509,7 @@ static u64 seal_upload(u64 host_crc)
 
 static u64 seal_exit(void)
 {
-    if (!attached || !entered || !exited || desc->state != HV_AHCI_RUNNING) {
+    if (!attached || nvme_mode || !entered || !exited || desc->state != HV_AHCI_RUNNING) {
         printf("HV: T8152: AHCI: seal refused: the guest has not run and exited\n");
         return HV_AHCI_ERROR;
     }
@@ -509,6 +526,86 @@ static u64 seal_exit(void)
     printf("HV: T8152: AHCI: store sealed: generation %u, disk CRC-32 0x%08x\n", desc->generation,
            crc);
     return crc | (u64)desc->generation << 32;
+}
+
+/*
+ * D5: the disk is a GPT partition of the internal NVMe.  Guest RAM is the whole window (no
+ * store).  A gate attach (R0/W0) needs no configure flag and installs no disk.
+ */
+static u64 attach_nvme(u64 req_addr)
+{
+    u64 lo = 0, size = 0, sectors = 0;
+    bool have_ram = hv_t8152_guest_ram(&lo, &size);
+    struct hv_ahci_nvme_req r;
+
+    if (!req_addr || (req_addr & 7)) {
+        printf("HV: T8152: AHCI NVMe: attach refused: bad request address 0x%lx\n", req_addr);
+        return HV_AHCI_ERROR;
+    }
+    /* One copy: what is checked here is what the backend gets. */
+    memcpy(&r, (const void *)req_addr, sizeof(r));
+    bool gate = r.flags & HV_AHCI_NVME_GATE;
+
+    if (chip_id != T8152 || (!gate && !ahci_enabled)) {
+        printf("HV: T8152: AHCI NVMe: attach refused: the AHCI configure flag is not set\n");
+        return HV_AHCI_ERROR;
+    }
+    if (attached || entered) {
+        printf("HV: T8152: AHCI NVMe: attach refused: a disk is already attached or the guest "
+               "started\n");
+        return HV_AHCI_ERROR;
+    }
+    if (!gate && (!have_ram || size < HV_AHCI_MIN_GUEST)) {
+        printf("HV: T8152: AHCI NVMe: attach refused: guest RAM is not set or below 4 GiB\n");
+        return HV_AHCI_ERROR;
+    }
+    if (hv_ahci_nvme_attach((u64)&r, have_ram, lo, lo + size, &sectors) < 0)
+        return HV_AHCI_ERROR;
+    if (gate)
+        return 0;
+    ram_lo = lo;
+    ram_hi = lo + size;
+    bool ro = hv_ahci_nvme_read_only();
+    env = (struct ahci_env){.guest_span = env_span,
+                            .read = env_nvme_read,
+                            .write = env_nvme_write,
+                            .flush = ahci_nvme_flush,
+                            .irq_level = env_irq,
+                            .log = env_log,
+                            .opaque = hv_ahci_nvme_backend(),
+                            .sectors = sectors,
+                            .command = env_command,
+                            .begin = ahci_nvme_begin,
+                            .end = ahci_nvme_end,
+                            .phys_log2 = 3,
+                            .read_only = ro,
+                            .serial = "AURA-AHCI-NVME000001",
+                            .firmware = "D5.0",
+                            .model_name = "Aura carrier NVMe disk"};
+    ahci_model_init(&model, &env);
+    if (hv_map_hook(HV_AHCI_ABAR, hv_ahci_mmio, HV_AHCI_ABAR_SIZE) < 0) {
+        printf("HV: T8152: AHCI NVMe: attach refused: cannot hook the ABAR at 0x%lx\n",
+               HV_AHCI_ABAR);
+        hv_ahci_nvme_close("ABAR hook refused");
+        return HV_AHCI_ERROR;
+    }
+    attached = true;
+    nvme_mode = true;
+    printf("HV: T8152: AHCI: NVMe disk %s, %lu sectors (512e); guest RAM [0x%lx, 0x%lx); ABAR "
+           "0x%lx hooked, SPI %u\n",
+           ro ? "read-only" : "read-write", sectors, ram_lo, ram_hi, HV_AHCI_ABAR, HV_AHCI_INTID);
+    return 0;
+}
+
+static u64 detach(void)
+{
+    if (hv_ahci_nvme_state() == HV_AHCI_NVME_RUNNING && !exited) {
+        printf("HV: T8152: AHCI NVMe: detach refused: the guest session is still running (exit "
+               "it; its exit closes the disk)\n");
+        return HV_AHCI_ERROR;
+    }
+    enum hv_ahci_nvme_state st = hv_ahci_nvme_close("launcher DETACH");
+    return st == HV_AHCI_NVME_FAILED ? HV_AHCI_ERROR : st;
 }
 
 static u64 query(u64 index)
@@ -547,9 +644,17 @@ u64 hv_ahci_proxy(u64 op, u64 a1, u64 a2, u64 a3, u64 a4)
         case HV_AHCI_OP_SEAL_EXIT:
             return seal_exit();
         case HV_AHCI_OP_STATUS:
-            if (!attached)
+            if (!attached || nvme_mode)
                 return 0;
             return desc->state | (u64)desc->generation << 8 | (u64)(u8)desc->last_exit << 40;
+        case HV_AHCI_OP_ATTACH_NVME:
+            return attach_nvme(a1);
+        case HV_AHCI_OP_DETACH:
+            return detach();
+        case HV_AHCI_OP_NVME_STATUS:
+            return hv_ahci_nvme_status(a1);
+        case HV_AHCI_OP_NVME_TEST:
+            return hv_ahci_nvme_test(a1, a2, a3, a4);
         default:
             return HV_AHCI_ERROR;
     }
@@ -579,6 +684,11 @@ static bool hook_leaf(void *opaque, u64 ipa, u64 size, u64 pte, int level)
 
 int hv_ahci_verify(void)
 {
+    if (hv_ahci_nvme_gate()) {
+        printf("HV: T8152: AHCI NVMe: a gate (test) attach is open: DETACH it before a guest "
+               "session; refusing guest entry\n");
+        return -1;
+    }
     if (!ahci_enabled)
         return 0;
     if (!attached) {
@@ -586,10 +696,11 @@ int hv_ahci_verify(void)
                "guest entry\n");
         return -1;
     }
-    if (desc->state != HV_AHCI_READY) {
-        printf("HV: T8152: AHCI: store state is %s, not READY (upload not sealed?); refusing "
-               "guest entry\n",
-               state_name(desc->state));
+    if (nvme_mode ? hv_ahci_nvme_verify() < 0 : desc->state != HV_AHCI_READY) {
+        if (!nvme_mode)
+            printf("HV: T8152: AHCI: store state is %s, not READY (upload not sealed?); "
+                   "refusing guest entry\n",
+                   state_name(desc->state));
         return -1;
     }
     struct hook_ctx ctx = {0, 0};
@@ -600,9 +711,14 @@ int hv_ahci_verify(void)
                HV_AHCI_ABAR, ctx.bad, ctx.covered);
         return -1;
     }
-    printf("HV: T8152: AHCI: verified: ABAR 0x%lx hooked, store [0x%lx, 0x%lx) READY and denied "
-           "to stage 2\n",
-           HV_AHCI_ABAR, store_base, window_top);
+    if (nvme_mode)
+        printf("HV: T8152: AHCI: verified: ABAR 0x%lx hooked, NVMe backend attached, I/O fence "
+               "set, bounce pool denied to stage 2, ANS denied by name\n",
+               HV_AHCI_ABAR);
+    else
+        printf("HV: T8152: AHCI: verified: ABAR 0x%lx hooked, store [0x%lx, 0x%lx) READY and "
+               "denied to stage 2\n",
+               HV_AHCI_ABAR, store_base, window_top);
     return 0;
 }
 
@@ -611,6 +727,10 @@ void hv_ahci_guest_entered(void)
     if (!ahci_enabled || !attached)
         return;
     entered = true;
+    if (nvme_mode) {
+        hv_ahci_nvme_guest_entered();
+        return;
+    }
     desc->last_exit = 0;
     desc_state(HV_AHCI_RUNNING);
 }
@@ -621,10 +741,23 @@ void hv_ahci_guest_exited(int status)
         return;
     exited = true;
     exit_status = status;
+    if (nvme_mode) {
+        hv_ahci_report();
+        return;
+    }
     desc->last_exit = status;
     desc->alive_cntpct = mrs(CNTPCT_EL0);
     desc_seal();
     hv_ahci_report();
+}
+
+void hv_ahci_session_end(int status)
+{
+    if (hv_ahci_nvme_state() == HV_AHCI_NVME_DETACHED || hv_ahci_nvme_state() == HV_AHCI_NVME_CLEAN)
+        return;
+    hv_ahci_nvme_close(status == 1   ? "guest SYSTEM_OFF"
+                       : status == 2 ? "guest SYSTEM_RESET"
+                                     : "guest session failed, aborted or refused");
 }
 
 void hv_ahci_report(void)
@@ -635,7 +768,9 @@ void hv_ahci_report(void)
     if (!exited && now < report_next)
         return;
     report_next = now + 10 * mrs(CNTFRQ_EL0);
-    if (entered && !exited) {
+    if (nvme_mode)
+        hv_ahci_nvme_report(exited);
+    if (entered && !exited && !nvme_mode) {
         /* The store's heartbeat (see alive_cntpct): this session still owns it. */
         desc->alive_cntpct = now;
         desc_seal();
@@ -674,6 +809,7 @@ void hv_ahci_fatal_report(u64 now, u64 freq)
 
     printf("HV: fatal: AHCI guest RAM [0x%lx, 0x%lx), store [0x%lx, 0x%lx), %lu commands\n", ram_lo,
            ram_hi, store_base, window_top, model.stats.commands);
+    hv_ahci_nvme_fatal_report();
     if (a.cntpct)
         printf("HV: fatal: AHCI last access: cpu %lu, %lu us ago, %s: %lu-byte %s ABAR+0x%lx "
                "value 0x%lx\n",
