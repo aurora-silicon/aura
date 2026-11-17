@@ -25,7 +25,6 @@
 #include "uartproxy.h"
 #include "usb.h"
 #include "utils.h"
-#include "wdt.h"
 #include "xnuboot.h"
 
 /*
@@ -46,7 +45,6 @@ static u64 sptm_entry_pa, sptm_handoff_pa;
 static bool sptm_images_loaded;
 static u64 sptm_reset_pa;
 static u32 sptm_cpu_resets[MAX_CPUS];
-static bool sptm_entry_wdt_armed;
 /* False while a core runs SPTM's own (re)entry path, true from its first GEXIT into XNU. */
 static volatile bool sptm_cpu_in_xnu[MAX_CPUS];
 
@@ -565,11 +563,6 @@ void sptm_virt_park_others(void)
 /* A GEXIT into XNU's normal world: this core runs XNU from now on. */
 void sptm_virt_cpu_enters_xnu(int cpu)
 {
-    if (sptm_entry_wdt_armed) {
-        sptm_entry_wdt_armed = false;
-        wdt_disable();
-        printf("SPTM-virt: entry recovery watchdog disabled at XNU handoff\n");
-    }
     if (sptm_cpu_in_xnu[cpu])
         return;
     sptm_cpu_in_xnu[cpu] = true;
@@ -590,12 +583,6 @@ __attribute__((used, retain)) void sptm_virt_enter(void)
 
     printf("\nSPTM-virt: entering SPTM at 0x%lx, boot_args 0x%lx\n", sptm_entry_pa,
            sptm_handoff_pa);
-    if (chip_id == T8122 && wdt_boot_watchdog_armed()) {
-        sptm_entry_wdt_armed = true;
-        printf("SPTM-virt: retained entry recovery watchdog is armed\n");
-    } else if (chip_id == T8122) {
-        printf("SPTM-virt: entry recovery watchdog unavailable\n");
-    }
     nv2_active = true;
     nv2_guarded = true;
 

@@ -421,17 +421,13 @@ void aura_main(void)
     smp_init();
 #endif
     wdt_disable();
-#if defined(CHAINLOADING) && defined(SPTM_VIRT) && !defined(ESP_STAGE2)
-    if (!aura_trial_enabled() && chip_id == T8122)
-        wdt_retain_boot_watchdog(60);
-#endif
     if (aura_trial_enabled() && wdt_arm_trial())
         printf("WDT: could not arm the trial watchdog\n");
 #if defined(CHAINLOADING) && !defined(ESP_STAGE2)
     else if (!aura_trial_enabled() && wdt_arm_boot())
         printf("WDT: could not arm the boot watchdog\n");
     else if (!aura_trial_enabled())
-        printf("WDT: boot watchdog armed (%u s)\n", wdt_boot_watchdog_seconds());
+        printf("WDT: boot watchdog armed (%u s)\n", WDT_BOOT_SECONDS);
 #endif
 #ifndef BRINGUP
     if (pmgr_init() && chip_id == T8140)

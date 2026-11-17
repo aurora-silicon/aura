@@ -42,10 +42,10 @@ def test_runner_uses_the_exact_j613_plan():
               'proxyclient/tools/run_guest_sptm.py').read_text()
     assert 'sptm_j613.patch_plan(images["sptm"], entry_off) if chip == 0x8122' in source
 
-def test_j613_entry_has_a_bounded_recovery_watchdog():
+def test_j613_entry_has_dispatch_breadcrumbs_and_no_late_watchdog_access():
     source = (Path(__file__).resolve().parents[2] / 'src/sptm_virt.c').read_text()
     enter = source[source.index('void sptm_virt_enter(void)'):]
-    xnu = source[source.index('void sptm_virt_cpu_enters_xnu(int cpu)'):
-                 source.index('void sptm_virt_enter(void)')]
-    assert 'chip_id == T8122 && wdt_boot_watchdog_armed()' in enter
-    assert 'wdt_disable();' in xnu
+    uart = (Path(__file__).resolve().parents[2] / 'src/uartproxy.c').read_text()
+    assert 'wdt_' not in enter[:enter.index('nv2_enter_os(')]
+    assert 'SPTM-virt: dispatching guest entry' in uart
+    assert 'SPTM-virt: guest entry returned unexpectedly' in uart

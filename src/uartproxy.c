@@ -5,6 +5,10 @@
 #include "exception.h"
 #include "iodev.h"
 #include "proxy.h"
+#include "sptm_virt.h"
+#ifdef SPTM_VIRT
+#include "sptm_virt.h"
+#endif
 #include "string.h"
 #include "types.h"
 #include "usb.h"
@@ -331,13 +335,24 @@ int uartproxy_run(struct uartproxy_msg_start *start)
                 disable_data_csums = enabled_features & PROXY_FEAT_DISABLE_DATA_CSUMS;
                 reply.features = enabled_features;
                 break;
-            case REQ_PROXY:
+            case REQ_PROXY: {
+#ifdef SPTM_VIRT
+                bool guest_entry = request.prequest.opcode == P_CALL &&
+                                   request.prequest.args[0] == (u64)sptm_virt_enter;
+                if (guest_entry)
+                    printf("SPTM-virt: dispatching guest entry P_CALL\n");
+#endif
                 ret = proxy_process(&request.prequest, &reply.preply);
+#ifdef SPTM_VIRT
+                if (guest_entry)
+                    printf("SPTM-virt: guest entry returned unexpectedly\n");
+#endif
                 if (ret != 0)
                     running = 0;
                 if (ret < 0)
                     printf("Proxy req error: %d\n", ret);
                 break;
+            }
             case REQ_MEMREAD:
                 if (request.mrequest.size == 0)
                     break;
