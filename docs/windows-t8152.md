@@ -13,12 +13,19 @@ At `hv_init()` (`hv_t8152_preflight()`), before anything is mapped:
 
 - board 0x22 (J804) and boot CPU MPIDR 0x10100;
 - CTXR_D is armed and aura runs inside it (chainloaded in place, never with `--relocate`),
-  with all of its code (`[_base, _rodata_end)`) clear of the last 16 KiB page of CTXR_D:
-  measured on J804, EL2 on the secondaries cannot execute that page;
+  with all of its code (`[_base, _rodata_end)`, rounded up to 16 KiB) ending at or below
+  the CTXR exec window base (`ALIGN_UP(_base + 16 MiB, 2 MiB)`) and below the 32 MiB block
+  that holds CTXR_D's last 16 KiB page. Measured on J804 (Phase 3 (b)): EL2 on the
+  secondaries ran aura's image and the window's first pages, but faulted on the last 16 KiB
+  page of the 128 MiB exec window (not the last page of CTXR_D) with ESR_EL2 0x86000002, an
+  address size fault at level 2 (Arm ARM ESR_ELx IFSC 0b000010). The cause is unknown and
+  one page was probed, so the rule keeps code out of everything not shown to execute;
 - all 12 CPUs (cpu0-11) are live in aura's dispatch loop (`smp_is_alive()`, the boot CPU
   counted as the vGIC counts it) and no spin-table entry past cpu11 is. The J804 Mu MADT is
   static (12 GICCs, all enabled) and has no live mask to patch, so a partial machine is
-  refused, not launched: start the secondaries (`p.smp_start_secondaries()`) first. The
+  refused, not launched. Start the secondaries once, in a fresh carrier session, before
+  launching. After a failed start (`SMP: T8152 started ... failed` nonzero) another
+  `smp_start_secondaries()` does nothing (`smp_start_fail_mask`): reload the carrier. The
   resident never starts them itself;
 - AIC3 initialized (the J804 proxy path does not do it; `hv_init()` calls `aic_init()`);
 - `HCR_EL2.FWB` clear, `CNTFRQ_EL0` non-zero, boot_args RAM non-empty;
@@ -45,10 +52,11 @@ or the AIC (identity, forced to Device-nGnRnE). Host proxy hooks are refused eve
 Python handler would access PA = IPA, and stage 2 covers exactly the PA space. Carrier (C)
 hooks (vUART, vGIC, AIC transitions) emulate and are allowed. The fixed Mu ADT alias at
 0x5300000000 is not mapped on T8152: it would be aura's unfiltered live ADT, and the J804 Mu
-reads its own copy of the filtered guest ADT. `hv_write_hcr()` keeps `HCR_EL2.TWI` set and `FWB` clear.
+reads its own copy of the filtered guest ADT. `hv_write_hcr()` keeps `HCR_EL2.TWI` and `TWE` set
+and `FWB` clear.
 
 Before entry, `hv_t8152_verify()` walks the whole stage-2 table again and checks the entry
-point and boot_args are in the window, TWI is set for the boot CPU and the secondaries,
+point and boot_args are in the window, TWI and TWE are set for the boot CPU and the secondaries,
 FWB is clear, stage 2 and the SMC trap are on, `framebuffer=bgra-shadow` is selected and all
 12 CPUs are still live.
 
@@ -60,8 +68,15 @@ FWB is clear, stage 2 and the SMC trap are on, `framebuffer=bgra-shadow` is sele
   measurement (a) found WFI_WIPES on T8152 (a timer-woken WFI clears GPRs, NZCV and SIMD on
   E, P and M cores), so carrier idle (trapped WFI, PSCI CPU_SUSPEND) runs no WFI: it spins on
   `ISR_EL1`, bounded at 1 ms. The real-WFI opt-in (config bit 7, `wfi: wfi`,
-  `--windows-wfi wfi`) is refused by the resident and the launcher. aura's own dispatch loop
-  is WFE-only on T8152.
+  `--windows-wfi wfi`) is refused by the resident and the launcher.
+- Guest WFE is trapped too (`HCR_EL2.TWE`) and completes at once without sleeping
+  (`hv_handle_wfx()`); WFE may complete at any time, so the guest just re-checks. Part A's
+  WFE rows used SEVL first and never slept, so nothing shows yet that a WFE that sleeps keeps
+  GPRs, NZCV and SIMD. Still open: aura itself executes WFE at EL2, in its dispatch loop
+  (no guest state live) and in `spin_lock()` on the hypervisor lock while a guest's SIMD/FP
+  registers are live in hardware. A measurement of a sleeping WFE (no SEVL) is needed before
+  that is known to be safe. Capability bit 13 (0x2000) marks a resident with the WFE trap
+  and the code-placement rule; the launcher requires it on T8152.
 - IPIs: polling by default (1 kHz secondary tick drains queued guest IPIs and vSGIs).
   Apple Fast IPIs only with the launcher's `ipi: fast`, after Phase 3 measurement (c).
 - The software GIC CPU interface (as T8142) only with `gic_cpuif: software`, after (f).

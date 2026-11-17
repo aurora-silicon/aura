@@ -78,8 +78,8 @@ def run_windows_t8152(caps):
     """The Windows personality (gmake WINDOWS=1) on T8152: the guest gets only its
     RAM window, the AIC (Device-nGnRnE) and emulated MMIO; the resident refuses to
     enter it unless every T8152 safety precondition holds (src/hv/windows/hv_t8152.c)."""
-    from aura.windows import (AURA_HEAP_RESERVE, PROXY_HEAP_SIZE, T8152_CHIP, number,
-                              t8152_check_window, windows_system_reset)
+    from aura.windows import (AURA_HEAP_RESERVE, PROXY_HEAP_SIZE, T8152_CHIP, WindowsLaunchRefused,
+                              number, t8152_check_window, windows_system_reset)
     if not args.raw:
         sys.exit("T8152 Windows guests are raw Mu FDs: pass -r")
     if args.symbols or args.debug_xnu or args.volume or args.emulate_sprr or args.cpus or \
@@ -114,9 +114,23 @@ def run_windows_t8152(caps):
         iface.tty_log = log  # the resident's hv_init() refusals ("HV: T8152: ...") land here too
     try:
         hv.init()
-    except (ValueError, RuntimeError) as exc:
+    except (ValueError, WindowsLaunchRefused) as exc:
+        # The launcher's own checks, or hv_windows_configure() refusing: nothing changed.
         sys.exit(f"T8152 launch refused: {exc}. The aura proxy keeps running; no guest was "
                  "started.")
+    except ProxyRemoteError as exc:
+        # The resident failed a request, most likely hv_init().  Its console says why.
+        sys.exit(f"T8152: the resident failed during hv.init(): {exc}. Read its last "
+                 "'TTY> HV: ...' lines (also in the -l log). If they end with a preflight "
+                 "refusal ('HV: T8152: ... refusing' and 'precondition(s) failed'), nothing was "
+                 "changed: fix the cause and run again. Otherwise hv_init() got past preflight "
+                 "and the session is used up: reload the carrier before another attempt. No "
+                 "guest was started.")
+    except (UartError, ProxyReplyError):
+        # A timeout or a broken link says nothing about where the resident stopped.
+        print("T8152: the link to the aura proxy failed during hv.init(); the proxy's state is "
+              "unknown. Check the M6 before doing anything else.", file=sys.stderr)
+        raise
     if log:
         hv.set_logfile(log)
     if args.boot_args:

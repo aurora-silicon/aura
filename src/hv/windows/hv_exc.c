@@ -6228,8 +6228,14 @@ static void hv_exc_exit(struct exc_info *ctx)
 static bool hv_handle_wfx(struct exc_info *ctx)
 {
     /* ISS[1:0] "TI": 0b00 WFI, 0b01 WFE, 0b10 WFIT, 0b11 WFET. */
-    if (FIELD_GET(ESR_ISS, ctx->esr) & 1)
-        return false; // WFE is not trapped (HCR_EL2.TWE is clear) and has no handler here
+    if (FIELD_GET(ESR_ISS, ctx->esr) & 1) {
+        /*
+         * Only T8152 sets HCR_EL2.TWE (see hv_init()).  WFE and WFET may complete at any
+         * time (Arm ARM, wait for event), so finish it at once without sleeping: the guest
+         * loops and re-checks.  Elsewhere TWE is clear and this is never reached.
+         */
+        return chip_id == T8152;
+    }
 
     wfi_trap_count[smp_id()]++;
     hv_el2_cause(HV_EL2_WFI);

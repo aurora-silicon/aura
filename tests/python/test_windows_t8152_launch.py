@@ -20,7 +20,7 @@ sys.path.insert(0, str(REPO / "proxyclient"))
 from construct import Array, Container, Int64ul  # noqa: E402
 from aura.adt import ADTNode, load_adt  # noqa: E402
 from aura.hv import HV  # noqa: E402
-from aura.proxy import IODEV  # noqa: E402
+from aura.proxy import IODEV, ProxyRemoteError, UartTimeout  # noqa: E402
 from aura.tgtypes import BootArgs_r2  # noqa: E402
 from aura import windows  # noqa: E402
 
@@ -31,7 +31,7 @@ QSPI = 0x2b0000000
 VALID = 1
 CAPS = (windows.CAPS_MAGIC | 1 << 16 | windows.REQUIRED_CAPS | windows.CONFIGURATION |
         windows.FRAMEBUFFER_SHADOW | windows.SERIAL_CDC_ISOLATED | windows.T8152_POLICY |
-        windows.T8152_LIVE_CPUS)
+        windows.T8152_LIVE_CPUS | windows.T8152_WFE_PLACEMENT)
 
 
 def u64_pair(node, name, value):
@@ -101,9 +101,12 @@ def run(case="success"):
         def hv_windows_capabilities(self):
             trace.append("caps")
             if case == "old-resident":
-                return CAPS & ~(windows.T8152_POLICY | windows.T8152_LIVE_CPUS)
+                return CAPS & ~(windows.T8152_POLICY | windows.T8152_LIVE_CPUS |
+                                windows.T8152_WFE_PLACEMENT)
             if case == "no-live-cpu-refusal":
-                return CAPS & ~windows.T8152_LIVE_CPUS
+                return CAPS & ~(windows.T8152_LIVE_CPUS | windows.T8152_WFE_PLACEMENT)
+            if case == "no-wfe-trap":
+                return CAPS & ~windows.T8152_WFE_PLACEMENT
             return CAPS
 
         def smp_is_alive(self, cpu):
@@ -114,11 +117,17 @@ def run(case="success"):
 
         def hv_windows_configure(self, flags):
             trace.append(("config", flags))
-            return 0
+            return -1 if case == "configure-refused" else 0
 
         def iodev_whoami(self): return IODEV.USB0
         def iodev_set_usage(self, *a): pass
-        def hv_init(self): trace.append("hv_init"); return 0
+        def hv_init(self):
+            trace.append("hv_init")
+            if case == "resident-hv-init-fails":
+                raise ProxyRemoteError("Reply error: Remote operation failed")
+            if case == "link-lost":
+                raise UartTimeout("timeout")
+            return 0
         def hv_map_vuart(self, *a): trace.append("vuart")
 
         def hv_windows_guest_ram(self, base, size, host_top):
@@ -217,6 +226,7 @@ def test_t8152_guest_placement_and_adt():
     ("no-window", "explicit guest RAM window"),
     ("resident-refuses", "refused the T8152 guest RAM window"),
     ("no-live-cpu-refusal", "12-live-CPU refusal"),
+    ("no-wfe-trap", "guest-WFE trap and code placement"),
     ("cpu-missing", r"only 11 of 12 CPUs .*not live: \[9\]"),
     ("secondaries-not-started", "only 1 of 12 CPUs"),
     ("wfi", "WFI_WIPES"),
@@ -233,3 +243,27 @@ def test_t8152_live_cpu_check_runs_before_the_resident_starts_anything():
     first_alive = next(i for i, t in enumerate(r.trace) if isinstance(t, tuple) and t[0] == "alive")
     config = next(i for i, t in enumerate(r.trace) if isinstance(t, tuple) and t[0] == "config")
     assert first_alive < config < r.trace.index("hv_init")
+
+
+@pytest.mark.parametrize("case", ["cpu-missing", "secondaries-not-started", "configure-refused"])
+def test_t8152_launcher_refusals_are_typed(case):
+    # run_guest.py reports only these (and ValueError) as "refused, proxy still up".
+    with pytest.raises(windows.WindowsLaunchRefused):
+        run(case)
+
+
+@pytest.mark.parametrize("case, error", [("resident-hv-init-fails", ProxyRemoteError),
+                                         ("link-lost", UartTimeout)])
+def test_t8152_resident_and_link_failures_are_not_refusals(case, error):
+    with pytest.raises(error) as info:
+        run(case)
+    assert not isinstance(info.value, windows.WindowsLaunchRefused)
+
+
+def test_run_guest_does_not_call_a_link_failure_a_refusal():
+    source = (REPO / "proxyclient/tools/run_guest.py").read_text()
+    init = source.split("hv.init()", 1)[1].split("hv.set_logfile", 1)[0]
+    assert "except (ValueError, WindowsLaunchRefused)" in init
+    assert "except ProxyRemoteError" in init
+    assert "except (UartError, ProxyReplyError)" in init and "raise" in init
+    assert "RuntimeError" not in init

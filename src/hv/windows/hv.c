@@ -517,6 +517,20 @@ int hv_init(void)
         printf("HV: T8152: HCR_EL2.TWI did not stick; refusing\n");
         return -1;
     }
+    /*
+     * T8152 also traps guest WFE (TWE).  Part A (wfi_regs) showed a sleeping WFI wipes the
+     * GPRs, NZCV and SIMD, but its WFE rows used SEVL first and never slept, so nothing yet
+     * shows that a WFE that really sleeps keeps the guest's state.  A trapped WFE completes
+     * at once (hv_handle_wfx()); the guest re-checks its condition, which the architecture
+     * already requires of any WFE loop.  Costs only trap time in guest spin-waits.
+     */
+    if (chip_id == T8152) {
+        hv_write_hcr(mrs(HCR_EL2) | HCR_TWE);
+        if (!(mrs(HCR_EL2) & HCR_TWE)) {
+            printf("HV: T8152: HCR_EL2.TWE did not stick; refusing\n");
+            return -1;
+        }
+    }
 
     if (chip_id == T8142 || chip_id == T8152) {
         /*
@@ -1442,8 +1456,8 @@ static void hv_init_secondary(struct hv_secondary_info_t *info)
     // this note.
     //
     hv_write_hcr(info->hcr);
-    if (chip_id == T8152 && !(mrs(HCR_EL2) & HCR_TWI))
-        hv_safe_reset("T8152 secondary without HCR_EL2.TWI");
+    if (chip_id == T8152 && (mrs(HCR_EL2) & (HCR_TWI | HCR_TWE)) != (HCR_TWI | HCR_TWE))
+        hv_safe_reset("T8152 secondary without HCR_EL2.TWI/TWE");
     if (cpu_features->apple_sysregs_unlocked)
         msr(HACR_EL2, info->hacr);
     msr(VTCR_EL2, info->vtcr);

@@ -1557,7 +1557,7 @@ class HV(Reloadable):
                                    CONFIG_SERIAL_CDC, CONFIG_MTP, CONFIG_CPUFREQ, MTP_DISABLED_PROPERTY,
                                    MTP_RESERVED_BASE, MTP_RESERVED_SIZE, ecpu_boot_state_khz,
                                    CONFIG_T8152_FAST_IPI, CONFIG_T8152_SOFT_GIC, CONFIG_T8152_WFI,
-                                   T8152_CHIP, T8152_CPUS,
+                                   T8152_CHIP, T8152_CPUS, WindowsLaunchRefused,
                                    validate_capabilities)
             self.windows_t8152 = self.adt["/chosen"].chip_id == T8152_CHIP
             if self.windows_t8152:
@@ -1584,10 +1584,11 @@ class HV(Reloadable):
                 # Read-only: P_SMP_IS_ALIVE reads the spin table and starts nothing.
                 dead = [cpu for cpu in range(T8152_CPUS) if not self.p.smp_is_alive(cpu)]
                 if dead:
-                    raise RuntimeError(
+                    raise WindowsLaunchRefused(
                         f"T8152: only {T8152_CPUS - len(dead)} of {T8152_CPUS} CPUs are live in "
-                        f"the resident's dispatch loop (not live: {dead}); start the "
-                        "secondaries first, the guest needs all 12")
+                        f"the resident's dispatch loop (not live: {dead}); the guest needs all "
+                        "12. Start the secondaries once in a fresh carrier session; after a "
+                        "failed start a second start does nothing, so reload the carrier")
             if self.windows_mtp != "disabled":
                 guard = self.windows_memory_guard
                 if not guard or not any(r["base"] == MTP_RESERVED_BASE and
@@ -1638,7 +1639,7 @@ class HV(Reloadable):
                 if self.windows_wfi == "wfi":
                     flags |= CONFIG_T8152_WFI
                 if self.p.hv_windows_configure(flags) != 0:
-                    raise RuntimeError("Windows hypervisor configuration rejected")
+                    raise WindowsLaunchRefused("Windows hypervisor configuration rejected")
                 # Applied once by hv_start() before guest entry; never retried on this resident.
                 if khz is not None and self.p.hv_windows_configure_ecpu(
                         self.windows_ecpu_boot_state, khz) != 0:
@@ -1661,9 +1662,10 @@ class HV(Reloadable):
                 self.iface.dev.timeout = previous_timeout
         else:
             result = self.p.hv_init()
+        # A failing hv_init() replies S_ERROR, which p.hv_init() raises as ProxyRemoteError;
+        # a nonzero value here would be an unexpected reply.
         if self.windows and result != 0:
-            raise RuntimeError(f"Windows hypervisor initialization failed: {result} (the "
-                               "resident printed the reason on its console, TTY> HV: ...)")
+            raise RuntimeError(f"Windows hypervisor initialization returned {result}")
         if self.windows and self.windows_mtp == "j813-v1":
             # The producer returns success only after preparation and initial
             # stage-2 mapping. Its final remap is also required before entry.

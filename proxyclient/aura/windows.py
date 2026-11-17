@@ -30,9 +30,12 @@ ECPU_BOOT_STATE = 0x4000  # P_HV_WINDOWS_ECPU_BOOT_STATE (docs/t8142-ecpu-stepup
 # T8152 stage-2 allowlist policy, the guest RAM window op and the T8152 Fast IPI
 # opt-in. A resident without it must never run a J804 guest.
 T8152_POLICY = 0x0800
-# The resident refuses a T8152 launch unless all 12 CPUs are live in its dispatch loop and
-# its code is clear of the last page of CTXR_D. A resident without it must never run one.
+# The resident refuses a T8152 launch unless all 12 CPUs are live in its dispatch loop.
+# A resident without it must never run one.
 T8152_LIVE_CPUS = 0x1000
+# The resident traps and completes guest WFE on T8152 (HCR_EL2.TWE) and keeps its code below
+# the CTXR exec window and CTXR_D's last 32 MiB block. A resident without it must never run one.
+T8152_WFE_PLACEMENT = 0x2000
 T8152_CPUS = 12
 CONFIG_T8142_EXPERIMENTAL = 0x0001
 CONFIG_FRAMEBUFFER_SHADOW = 0x0002
@@ -68,6 +71,12 @@ J813_CPU_OPP_KHZ = (
 )
 ECPU_HANDOFF_STATE = 2
 ECPU_LAST_STATE = ECPU_HANDOFF_STATE + len(J813_CPU_OPP_KHZ[0]) - 1
+
+
+class WindowsLaunchRefused(RuntimeError):
+    """The launcher or the resident's configure step refused before hv_init(): nothing on the
+    machine changed and the proxy keeps running.  Resident failures (ProxyRemoteError) and
+    link failures (UartError) are different and are not this."""
 
 
 def require(condition, message):
@@ -122,6 +131,8 @@ def validate_capabilities(value, framebuffer="native", guest_compatibility="none
                 "never run a J804 guest on it")
         require(value & T8152_LIVE_CPUS, "resident lacks the T8152 12-live-CPU refusal; "
                 "never run a J804 guest on it")
+        require(value & T8152_WFE_PLACEMENT, "resident lacks the T8152 guest-WFE trap and code "
+                "placement rule; never run a J804 guest on it")
         require(value & CONFIGURATION, "resident lacks explicit Windows configuration")
     return value & 0xffff
 

@@ -41,6 +41,7 @@ typedef long s64;
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 #define HCR_VM BIT(0)
 #define HCR_TWI BIT(13)
+#define HCR_TWE BIT(14)
 #define HCR_TSC BIT(19)
 #define HCR_FWB BIT(46)
 extern u64 fake_mpidr, fake_hcr, fake_cntfrq;
@@ -162,6 +163,7 @@ bool smp_is_alive(int cpu) { return cpu >= 0 && cpu < 32 && (alive_mask >> cpu) 
 struct aic fake_aic = {AIC_BASE, 3, 0x960}, *aic = &fake_aic;
 struct boot_args cur_boot_args;
 static bool ctxr_ok = true, qspi_present = true;
+static u64 ctxr_hi = CTXR_D_HI;
 static int pmgr_regs = 40;
 static u64 heap_lim = HEAP_LIM;
 
@@ -172,7 +174,7 @@ bool ctxr_range(enum ctxr_range range, u64 *start, u64 *end)
     if (range != CTXR_RANGE_D || !ctxr_ok)
         return false;
     *start = CTXR_D_LO;
-    *end = CTXR_D_HI;
+    *end = ctxr_hi;
     return true;
 }
 
@@ -330,14 +332,25 @@ int main(void)
     alive_mask = 0xfbf | BIT(12);   /* a spin-table entry past cpu11 */
     assert(hv_t8152_preflight() < 0);
     alive_mask = 0xfbf;
-    /* Part A: EL2 on the secondaries cannot execute the last 16 KiB page of CTXR_D. */
-    fake_rodata_end = (char *)(CTXR_D_HI - 0x4000 + 0x10);
+    /*
+     * Part A: EL2 on the secondaries faulted on the last page of the CTXR exec window
+     * (an address size fault at level 2, cause unknown).  Aura's code must end at or below
+     * the exec window base, ALIGN_UP(AURA + 16 MiB, 2 MiB) = 0x10009000000, and below the
+     * 32 MiB block holding CTXR_D's last page (0x1000e000000 here).
+     */
+    puts("CODE PLACEMENT CHECK");
+    fake_rodata_end = (char *)(0x10009000000UL + 0x10);  /* runs into the exec window */
     assert(hv_t8152_preflight() < 0);
-    fake_rodata_end = (char *)(CTXR_D_HI + 0x10000);   /* code runs past CTXR_D */
+    fake_rodata_end = (char *)(CTXR_D_HI + 0x10000);     /* runs past CTXR_D */
     assert(hv_t8152_preflight() < 0);
-    fake_rodata_end = (char *)(CTXR_D_HI - 0x4000);    /* ends exactly below it: fine */
+    fake_rodata_end = (char *)(CTXR_D_HI - 0x4000 + 0x10); /* the old rule's limit: refused now */
+    assert(hv_t8152_preflight() < 0);
+    fake_rodata_end = (char *)0x10009000000UL;           /* ends exactly at the window base */
     assert(hv_t8152_preflight() == 0);
     fake_rodata_end = (char *)(AURA + 0x120000);
+    ctxr_hi = 0x1000a001000UL; /* small CTXR_D, UPR + 4 KiB unaligned: last page 0x10009ffc000 */
+    assert(hv_t8152_preflight() < 0);  /* its 32 MiB block starts at aura's base */
+    ctxr_hi = CTXR_D_HI;
     assert(hv_t8152_preflight() == 0 && hv_t8152_policy_armed());
 
     /* Guest RAM window. */
@@ -397,10 +410,10 @@ int main(void)
     assert(map(0x5300004000, 0x10007004000 | S2_RO, 0x4000) == 0xdead);  /* wrong IPA */
 
     /* HCR filter. */
-    assert(hv_t8152_hcr_filter(HCR_FWB) == HCR_TWI);
+    assert(hv_t8152_hcr_filter(HCR_FWB) == (HCR_TWI | HCR_TWE));
 
     /* Pre-entry walk. */
-    u64 hcr_ok = HCR_VM | HCR_TSC | HCR_TWI;
+    u64 hcr_ok = HCR_VM | HCR_TSC | HCR_TWI | HCR_TWE;
     fake_hcr = hcr_ok;
     leaves[nleaves++] = (struct leaf){WIN_LO, 0x2000000, WIN_LO | S2_HW | 2, 2};
     leaves[nleaves++] = (struct leaf){AIC_BASE, 0x4000, AIC_BASE | (S2_HW & ~(0xfUL << 2)) | 2, 3};
@@ -411,6 +424,10 @@ int main(void)
     assert(hv_t8152_verify(AURA, WIN_LO + 0x2000000, hcr_ok, true) < 0);       /* entry */
     assert(hv_t8152_verify(WIN_LO + 0x800, WIN_LO, hcr_ok, false) < 0);        /* no shadow */
     assert(hv_t8152_verify(WIN_LO + 0x800, WIN_LO, hcr_ok & ~HCR_TWI, true) < 0); /* TWI */
+    assert(hv_t8152_verify(WIN_LO + 0x800, WIN_LO, hcr_ok & ~HCR_TWE, true) < 0); /* TWE */
+    fake_hcr = hcr_ok & ~HCR_TWE;
+    assert(hv_t8152_verify(WIN_LO + 0x800, WIN_LO, hcr_ok, true) < 0);
+    fake_hcr = hcr_ok;
     fake_hcr = hcr_ok | HCR_FWB;
     assert(hv_t8152_verify(WIN_LO + 0x800, WIN_LO, hcr_ok, true) < 0);
     fake_hcr = hcr_ok;
@@ -476,12 +493,30 @@ def test_t8152_carrier_policy(tmp_path):
     assert "did not report the top of its heap" in result.stdout
     assert "heap has no limit" in result.stdout
     assert "overlaps aura and its heaps" in result.stdout
-    # B3 and Part A: the 12-live-CPU refusal and the CTXR_D last page.
+    # B3 and Part A: the 12-live-CPU refusal and aura's code placement.
     live = result.stdout.split("LIVE CPU CHECK", 1)[1]
+    place = live.split("CODE PLACEMENT CHECK", 1)[1]
     assert "only 11 of 12 CPUs are live in aura's dispatch loop (not live: cpu9)" in live
     assert "only 1 of 12 CPUs are live" in live
     assert "(not live: cpu0 cpu1 cpu2 cpu3 cpu4 cpu5 cpu7 cpu8 cpu9 cpu10 cpu11)" in live
     assert "1 spin-table entries beyond cpu11 are live" in live
-    assert "clear of its last page 0x1000fffc000, which EL2 on the secondaries cannot" in live
+    assert "a second start does nothing, reload the carrier" in live
+    assert ("aura's code [0x10008000000, 0x10009004000) must lie inside CTXR_D "
+            "[0x10008000000, 0x10010000000) and end at or below 0x10009000000: the CTXR exec "
+            "window base 0x10009000000") in place
+    assert "the 32 MiB block 0x1000e000000 that holds CTXR_D's last page" in place
+    assert ("end at or below 0x10008000000: the CTXR exec window base 0x10009000000 "
+            "(EL2 on the secondaries faulted on the window's last page in Part A) and the "
+            "32 MiB block 0x10008000000") in place
+    assert "code ends 0x10009000000 at or below 0x10009000000" in place
     assert "all 12 CPUs live in aura's dispatch loop" in live
     assert "only 11 of 12 CPUs are live in aura's dispatch loop (not live: cpu0)" in live
+
+
+def test_exec_window_constants_match_ctxr_exec():
+    policy = (REPO / "src/hv/windows/hv_t8152.c").read_text()
+    ctxr = (REPO / "src/ctxr_exec.c").read_text()
+    assert "#define T8152_EXEC_SLOT  (16UL << 20)" in policy
+    assert "#define T8152_EXEC_ALIGN (2UL << 20)" in policy
+    assert "#define CTXR_EXEC_AURA_SLOT   ((u64)16 * SZ_1M)" in ctxr
+    assert "#define CTXR_EXEC_ALIGN       ((u64)2 * SZ_1M)" in ctxr

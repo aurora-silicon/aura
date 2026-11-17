@@ -36,11 +36,16 @@
 #define T8152_REPORT_LIMIT  16
 #define T8152_CPUS          12 /* E cpu0-5, P cpu6-7, M cpu8-11 (smp_init_t8152 checks the ADT) */
 /*
- * Measured on J804 (2026-11-16, ctxr_el1): EL2 on the secondaries cannot execute the last
- * 16 KiB page of CTXR_D (instruction abort, ESR_EL2 0x86000002).  No carrier code may
- * live there.
+ * One level-2 translation entry with the 16 KiB granule (Arm ARM, VMSAv8-64 translation
+ * granules): the unit of the code-placement limit in code_placement_check().
  */
-#define T8152_CTXR_D_NOEXEC T8152_PAGE
+#define T8152_L2_BLOCK (32UL << 20)
+/*
+ * The OS exec window inside CTXR_D starts at ALIGN_UP(_base + slot, align): the same values
+ * as CTXR_EXEC_AURA_SLOT and CTXR_EXEC_ALIGN in ctxr_exec.c (the host policy test checks).
+ */
+#define T8152_EXEC_SLOT  (16UL << 20)
+#define T8152_EXEC_ALIGN (2UL << 20)
 
 #define S2_MEMATTR       GENMASK(5, 2)
 #define S2_MEMATTR_NGNRE 0x0UL /* Device-nGnRnE */
@@ -127,10 +132,15 @@ static int live_cpus_check(void)
         printf("HV: T8152: all %d CPUs live in aura's dispatch loop\n", T8152_CPUS);
         return 0;
     }
+    /*
+     * smp_start_t8152() returns at once once any start has failed (smp_start_fail_mask),
+     * so after a failed start only a fresh carrier session brings the missing cores up.
+     */
     if (live != T8152_CPUS)
         printf("HV: T8152: only %u of %d CPUs are live in aura's dispatch loop (not live:%s); "
-               "start the secondaries (p.smp_start_secondaries()) and check all %d before "
-               "launching; refusing\n",
+               "refusing. All %d must be live: start the secondaries once in a fresh carrier "
+               "session; after a failed start (\"SMP: T8152 started ... failed\" nonzero) a "
+               "second start does nothing, reload the carrier\n",
                live, T8152_CPUS, missing, T8152_CPUS);
     if (extra)
         printf("HV: T8152: %u spin-table entries beyond cpu%d are live; refusing\n", extra,
@@ -299,6 +309,55 @@ static int build_mmio_allow(void)
     return 0;
 }
 
+/*
+ * Where aura's code [_base, _rodata_end) may sit, from what Part A (J804, 2026-11-16,
+ * ctxr_el1) showed EL2 on the secondaries executing.  That range holds the EL2 vectors,
+ * smp_secondary_entry, the hypervisor vectors and guest entry/exit; the guest itself never
+ * runs in CTXR_D (ram_conflicts refuses the overlap).
+ *
+ * Executed at EL2 on cpu0, cpu7 and cpu8: aura's own image (the dispatch loop) and the
+ * first pages of the CTXR exec window (window base + 2 MiB).  Faulted: the last 16 KiB page
+ * of that 128 MiB exec window, window base + 128 MiB - 16 KiB (0x100117fc000 there), which
+ * is NOT the last page of CTXR_D (CTXR_D ended at 0x10011898000).  ESR_EL2 was 0x86000002:
+ * EC 0x21 (instruction abort, same EL), IFSC 0b000010, an address size fault at level 2
+ * (Arm ARM, ESR_ELx ISS encoding for instruction aborts), not a permission fault.  The
+ * cause is unknown and only that one page was probed; with the 16 KiB granule a level-2
+ * entry covers 32 MiB, so the bad region may be larger than the page.
+ *
+ * So, conservatively: the code must lie inside CTXR_D (UPR + 4 KiB, aligned down to 16 KiB
+ * as the ctxr_el1 harness does) and end at or below both the exec window base (aura's image
+ * always does: ctxr_exec_find_window() requires _end below it) and the 32 MiB-aligned
+ * block that holds CTXR_D's last 16 KiB page, which was never probed.  With Part A's
+ * numbers the limit is the window base 0x10009800000 and the code ends near 0x1000878c000.
+ *
+ * Not covered: the RVBAR veneer smp_prepare_rvbar_t8152() may write at the locked RVBAR,
+ * below _base.  A secondary runs it only when it resets; every secondary ran it to reach
+ * the dispatch loop (live_cpus_check() requires all 12), and the carrier never resets or
+ * powers off a core afterwards (PSCI CPU_OFF parks in the spin table).
+ */
+static int code_placement_check(u64 start, u64 end)
+{
+    u64 code_end = ALIGN_UP((u64)_rodata_end, T8152_PAGE);
+    u64 top = ALIGN_DOWN(end, T8152_PAGE);
+    u64 window = ALIGN_UP((u64)_base + T8152_EXEC_SLOT, T8152_EXEC_ALIGN);
+    u64 last_block =
+        top > start + T8152_PAGE ? ALIGN_DOWN(top - T8152_PAGE, T8152_L2_BLOCK) : start;
+    u64 limit = window < last_block ? window : last_block;
+
+    if ((u64)_base < start || code_end > limit) {
+        printf("HV: T8152: aura's code [0x%lx, 0x%lx) must lie inside CTXR_D [0x%lx, 0x%lx) and "
+               "end at or below 0x%lx: the CTXR exec window base 0x%lx (EL2 on the secondaries "
+               "faulted on the window's last page in Part A) and the 32 MiB block 0x%lx that "
+               "holds CTXR_D's last page (never probed); refusing\n",
+               (u64)_base, code_end, start, top, limit, window, last_block);
+        return -1;
+    }
+    printf("HV: T8152: aura 0x%lx inside CTXR_D [0x%lx, 0x%lx), code ends 0x%lx at or below "
+           "0x%lx (below the exec window and CTXR_D's last 32 MiB block)\n",
+           (u64)_base, start, top, code_end, limit);
+    return 0;
+}
+
 int hv_t8152_preflight(void)
 {
     int bad = 0;
@@ -330,21 +389,8 @@ int hv_t8152_preflight(void)
                "never with --relocate\n",
                (u64)_base, start, end);
         bad++;
-    } else if (end - start <= T8152_CTXR_D_NOEXEC ||
-               !inside((u64)_base, (u64)_rodata_end, start, end - T8152_CTXR_D_NOEXEC)) {
-        /*
-         * [_base, _rodata_end) holds every instruction EL2 runs: the RVBAR and EL2
-         * vectors, smp_secondary_entry, the hypervisor vectors and guest entry/exit.
-         * The guest itself never runs in CTXR_D (ram_conflicts refuses the overlap).
-         */
-        printf("HV: T8152: aura's code [0x%lx, 0x%lx) is not inside CTXR_D [0x%lx, 0x%lx) "
-               "clear of its last page 0x%lx, which EL2 on the secondaries cannot execute; "
-               "refusing\n",
-               (u64)_base, (u64)_rodata_end, start, end, end - T8152_CTXR_D_NOEXEC);
+    } else if (code_placement_check(start, end)) {
         bad++;
-    } else {
-        printf("HV: T8152: aura 0x%lx inside CTXR_D [0x%lx, 0x%lx), code clear of its last page\n",
-               (u64)_base, start, end);
     }
     if (live_cpus_check())
         bad++;
@@ -628,7 +674,7 @@ u64 hv_t8152_hcr_filter(u64 hcr)
 {
     if (!armed)
         return hcr;
-    return (hcr | HCR_TWI) & ~HCR_FWB;
+    return (hcr | HCR_TWI | HCR_TWE) & ~HCR_FWB;
 }
 
 struct verify_ctx {
@@ -699,8 +745,9 @@ int hv_t8152_verify(u64 entry, u64 bootargs, u64 secondary_hcr, bool fb_shadow)
     if (live_cpus_check()) /* again: nothing may have left the spin table since hv_init() */
         bad++;
     u64 hcr = mrs(HCR_EL2);
-    if (!(hcr & HCR_TWI) || !(secondary_hcr & HCR_TWI)) {
-        printf("HV: T8152: HCR_EL2.TWI is not set (boot 0x%lx, secondaries 0x%lx)\n", hcr,
+    if (!(hcr & HCR_TWI) || !(secondary_hcr & HCR_TWI) || !(hcr & HCR_TWE) ||
+        !(secondary_hcr & HCR_TWE)) {
+        printf("HV: T8152: HCR_EL2.TWI/TWE are not both set (boot 0x%lx, secondaries 0x%lx)\n", hcr,
                secondary_hcr);
         bad++;
     }
