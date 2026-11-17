@@ -100,6 +100,12 @@ ifeq ($(BRINGUP),1)
 CFG += BRINGUP
 endif
 
+# Proxy-only Stage 1 images can run headless. This selects display.c's existing
+# NO_DISPLAY path without changing the default or any installed boot image.
+ifeq ($(NO_DISPLAY),1)
+CFG += NO_DISPLAY
+endif
+
 ifeq ($(CHAINLOADING),1)
 CFG += CHAINLOADING
 CARGO_FLAGS += --features chainload
