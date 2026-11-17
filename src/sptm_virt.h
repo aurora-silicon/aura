@@ -106,6 +106,7 @@ void sptm_virt_enter(void) __attribute__((noreturn));
 /* T8122 entry recovery: firmware-only watchdog plus a cache-cleaned high-RAM record. */
 u64 sptm_virt_j613_entry_recovery_arm(u32 seconds);
 void sptm_virt_j613_entry_mark(u32 stage);
+bool sptm_virt_j613_entry_recovery_active(void);
 
 /* A core coming out of reset while the guest is live (startup.c). */
 void sptm_virt_cpu_reset(void) __attribute__((noreturn));

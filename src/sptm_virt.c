@@ -21,6 +21,7 @@
 #include "smp.h"
 #include "soc.h"
 #include "sptm_virt_priv.h"
+#include "spmi.h"
 #include "string.h"
 #include "uartproxy.h"
 #include "usb.h"
@@ -60,7 +61,14 @@ struct j613_entry_record {
     u64 reserved[2];
 };
 static volatile struct j613_entry_record *j613_entry_record;
-static bool j613_entry_recovery_armed;
+static bool j613_entry_recovery_active;
+static spmi_dev_t *j613_entry_crumb_dev;
+#define J613_ENTRY_PMU_SCRATCH 0x8312
+
+bool sptm_virt_j613_entry_recovery_active(void)
+{
+    return j613_entry_recovery_active;
+}
 
 void sptm_virt_j613_entry_mark(u32 stage)
 {
@@ -75,6 +83,10 @@ void sptm_virt_j613_entry_mark(u32 stage)
     j613_entry_record->check = J613_ENTRY_RECORD_MAGIC ^ sequence ^ stage;
     dc_cvac_range((void *)j613_entry_record, sizeof(*j613_entry_record));
     sysop("dsb sy");
+    if (j613_entry_crumb_dev) {
+        u8 value = stage;
+        spmi_ext_write_long(j613_entry_crumb_dev, 0xe, J613_ENTRY_PMU_SCRATCH, &value, 1);
+    }
 }
 
 __attribute__((used, retain)) u64 sptm_virt_j613_entry_recovery_arm(u32 seconds)
@@ -87,10 +99,12 @@ __attribute__((used, retain)) u64 sptm_virt_j613_entry_recovery_arm(u32 seconds)
             return 0;
         memset((void *)j613_entry_record, 0, SZ_4K);
     }
+    if (!j613_entry_crumb_dev)
+        j613_entry_crumb_dev = spmi_init("/arm-io/nub-spmi0");
     sptm_virt_j613_entry_mark(0x01);
     if (wdt_arm_recovery(seconds))
         return 0;
-    j613_entry_recovery_armed = true;
+    j613_entry_recovery_active = true;
     sptm_virt_j613_entry_mark(0x02);
     return (u64)j613_entry_record;
 }
@@ -613,11 +627,9 @@ void sptm_virt_cpu_enters_xnu(int cpu)
     if (sptm_cpu_in_xnu[cpu])
         return;
     sptm_cpu_in_xnu[cpu] = true;
-    if (is_boot_cpu() && j613_entry_recovery_armed) {
+    if (is_boot_cpu() && j613_entry_recovery_active) {
         sptm_virt_j613_entry_mark(0x80);
-        wdt_disable();
-        j613_entry_recovery_armed = false;
-        sptm_virt_j613_entry_mark(0x81);
+        sptm_virt_j613_entry_mark(wdt_arm_recovery(178) ? 0x8f : 0x81);
     }
     if (!is_boot_cpu())
         printf("SPTM-virt[smp]: cpu%d enters XNU at 0x%lx\n", cpu, mrs(SYS_IMP_APL_ELR_GL12));

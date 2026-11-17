@@ -129,6 +129,7 @@ static void sptm_virt_s2_split_ctrr_blocks(void)
  * the core in aura's proxy instead, so a reset becomes a hypervisor event.
  */
 #define RG_MAX         8
+#define WDT_COUNT      0x10
 #define WDT_ALARM      0x14
 #define WDT_CTL        0x1c
 #define WDT_CTL_RESET  BIT(2)
@@ -144,6 +145,7 @@ static int rg_n;
 static u64 rg_wdt, rg_wdt2, rg_xwdt; /* primary, secondary register, exclave watchdog */
 static u64 rg_extra[4];              /* the wdt node's other single registers */
 static u32 rg_alarm_shadow[2];
+static u32 rg_count_shadow, rg_ctl_shadow;
 static bool rg_xwdt_seeded;  /* the exclave watchdog's ALARM is read at the guest's first access */
 static bool rg_extra_passed; /* the wdt node's single registers are written while XNU starts */
 static u32 rg_events;
@@ -196,6 +198,25 @@ static bool sptm_virt_rg_hook(struct exc_info *ctx, u64 addr, u64 *val, bool wri
                write ? "wr" : "rd", a - rg_xwdt, write ? " <- " : " ", write ? *val : 0, ctx->elr,
                sptm_virt_in_cl4() ? " (cL4)" : "");
     sptm_virt_s2r_note(ctx, addr, write ? *val : 0, write, width);
+    /* The J613 diagnostic watchdog is the only recovery path independent of the guest. While it
+     * is active, give the guest a private view of the primary COUNT/ALARM/CTL words and never let
+     * its boot-time watchdog setup clear, feed or shorten the real absolute timer. */
+    if (sptm_virt_j613_entry_recovery_active() && rg_wdt) {
+        u32 *shadow = NULL;
+        if (a == rg_wdt + WDT_COUNT)
+            shadow = &rg_count_shadow;
+        else if (a == rg_wdt + WDT_ALARM)
+            shadow = &rg_alarm_shadow[0];
+        else if (a == rg_wdt + WDT_CTL)
+            shadow = &rg_ctl_shadow;
+        if (shadow) {
+            if (write)
+                *shadow = *val;
+            else
+                *val = *shadow;
+            return true;
+        }
+    }
     if (write && rg_wdt && (a == rg_wdt || a == rg_wdt + 0x10))
         sptm_virt_s2r_early_release();
     if (sptm_virt_rg_passthrough) {
@@ -347,6 +368,8 @@ static void sptm_virt_reset_guard_setup(void)
             sptm_virt_rg_page(pa, "wdt");
         }
         rg_alarm_shadow[0] = rg_wdt ? read32(rg_wdt + WDT_ALARM) : 0;
+        rg_count_shadow = rg_wdt ? read32(rg_wdt + WDT_COUNT) : 0;
+        rg_ctl_shadow = rg_wdt ? read32(rg_wdt + WDT_CTL) : 0;
     }
     node = adt_path_offset_trace(adt, "/arm-io/hib-exclave-watchdog", path);
     if (sptm_virt_rg_xwdt && node >= 0 && adt_get_reg(adt, path, "reg", 0, &pa, &sz) >= 0) {
