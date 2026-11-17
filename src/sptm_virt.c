@@ -70,6 +70,19 @@ bool sptm_virt_j613_entry_recovery_active(void)
     return j613_entry_recovery_active;
 }
 
+__attribute__((used, retain)) u64 sptm_virt_j613_entry_pmu_stage(void)
+{
+    if (chip_id != T8122)
+        return ~0ULL;
+    if (!j613_entry_crumb_dev)
+        j613_entry_crumb_dev = spmi_init("/arm-io/nub-spmi0");
+    u8 value = 0;
+    if (!j613_entry_crumb_dev ||
+        spmi_ext_read_long(j613_entry_crumb_dev, 0xe, J613_ENTRY_PMU_SCRATCH, &value, 1) < 0)
+        return ~0ULL;
+    return value;
+}
+
 void sptm_virt_j613_entry_mark(u32 stage)
 {
     if (chip_id != T8122 || !j613_entry_record)
