@@ -117,6 +117,12 @@ static int s2r_link_from_adt(const void *adt, const u32 *phys, int n_phys, struc
     return out->n_link ? 0 : -1;
 }
 
+int s2r_soc_link_only(const void *adt, const u32 *link_phys, int n_phys, struct s2r_soc *out)
+{
+    memset(out, 0, sizeof(*out));
+    return s2r_link_from_adt(adt, link_phys, n_phys, out);
+}
+
 /* A traced range, exactly as the ADT gives it (a partial last page is hooked to its end). */
 static int s2r_trace_add(u64 a, u64 declared, const char *what, bool shared, struct s2r_soc *out)
 {

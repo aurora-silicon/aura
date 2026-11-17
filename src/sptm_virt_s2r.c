@@ -1275,6 +1275,29 @@ static bool s2r_ring_alloc(u64 ring_bytes)
     return true;
 }
 
+/* A missing sleep profile must not disable link keeping or passive live recording. */
+static void s2r_no_sleep_setup(bool cdc, u64 flags, const char *missing)
+{
+    sptm_virt_flags &= ~(SPTM_VIRT_S2R | SPTM_VIRT_S2R_GO | SPTM_VIRT_S2R_FULL |
+                         SPTM_VIRT_S2R_COPROC | SPTM_VIRT_S2R_DROP_USB | SPTM_VIRT_S2R_MEM);
+    if (cdc && s2r_soc_link_only(adt, sptm_virt_link_phys, ARRAY_SIZE(sptm_virt_link_phys),
+                                 &s2r_soc_adt) == 0) {
+        s2r_soc = &s2r_soc_adt;
+        s2r_keep_always = true;
+        s2r_keep_setup();
+        printf("SPTM-virt[s2r]: no sleep path, the ADT gives no %s; keeping the debug-link "
+               "domains only\n", missing);
+    } else {
+        printf("SPTM-virt[s2r]: no sleep path, the ADT gives no %s; debug-link domains not kept\n",
+               missing);
+    }
+    /* Keep main's passive ring/catalogue on KIS and link-only transports alike.
+     * The full sleep profile and its commit/wake machinery remain disabled. */
+    if ((flags & SPTM_VIRT_S2R) && s2r_ring_alloc(S2R_RING_BYTES))
+        printf("SPTM-virt[s2r]: %lu-record ring at 0x%lx for live in-guest tracing, no sleep path\n",
+               (unsigned long)sptm_virt_s2r_nrec, (unsigned long)sptm_virt_s2r_ring);
+}
+
 /* cdc: the proxy runs over the DWC3 CDC link, whose domains are kept on even without the trace. */
 void sptm_virt_s2r_setup(bool cdc)
 {
@@ -1283,21 +1306,7 @@ void sptm_virt_s2r_setup(bool cdc)
     const char *missing;
     if (s2r_soc_from_adt(adt, sptm_virt_link_phys, ARRAY_SIZE(sptm_virt_link_phys), &s2r_soc_adt,
                          &missing) < 0) {
-        printf("SPTM-virt[s2r]: no sleep path, the ADT gives no %s; debug-link domains not kept\n",
-               missing);
-        /* The sleep path -- keeping the debug-link domains alive across the sleep, the capture
-         * hooks and the sleep-commit rules -- needs that USB link, so drop every sleep flag. The
-         * record ring and the live in-guest catalogue (auractl arm/read on named MMIO over hvc) do
-         * not: on a KIS/DockChannel proxy there is no debug-link USB port, yet the guest still
-         * drives auractl. If a trace was asked for, allocate the ring alone so recording works; the
-         * sleep machinery stays gated (SPTM_VIRT_S2R stays clear), so nothing on the wake or sleep
-         * path runs without an s2r_soc. */
-        sptm_virt_flags &= ~(SPTM_VIRT_S2R | SPTM_VIRT_S2R_GO | SPTM_VIRT_S2R_FULL |
-                             SPTM_VIRT_S2R_COPROC | SPTM_VIRT_S2R_DROP_USB);
-        if ((flags & SPTM_VIRT_S2R) && s2r_ring_alloc(S2R_RING_BYTES))
-            printf("SPTM-virt[s2r]: no debug-link USB port; %lu-record ring at 0x%lx for live "
-                   "in-guest tracing, no sleep path\n",
-                   sptm_virt_s2r_nrec, (u64)sptm_virt_s2r_ring);
+        s2r_no_sleep_setup(cdc, flags, missing);
         return;
     }
     s2r_soc = &s2r_soc_adt;
