@@ -5,6 +5,7 @@
 #include "aic.h"
 #include "assert.h"
 #include "cpu_regs.h"
+#include "cpufreq.h"
 #include "display.h"
 #include "fb_capture.h"
 #include "gxf.h"
@@ -144,6 +145,10 @@ static bool hv_windows_entered;
 static int hv_windows_exit_reason;
 static bool hv_setup_pending[MAX_CPUS];
 static u64 hv_windows_flags;
+/* Explicit J813 E boot state; 0 keeps the firmware handoff state untouched. */
+static u32 hv_windows_ecpu_state;
+static u32 hv_windows_ecpu_khz;
+static bool hv_windows_ecpu_attempted;
 
 int hv_windows_configure(u64 flags)
 {
@@ -163,6 +168,17 @@ int hv_windows_configure(u64 flags)
     if ((flags & HV_WINDOWS_SERIAL_CAPTURE) && !hv_windows_serial_available())
         return -1;
     hv_windows_flags = flags;
+    return 0;
+}
+
+int hv_windows_configure_ecpu(u64 state, u64 khz)
+{
+    /* One request per resident, before initialization, bound to the ADT table entry. */
+    if (hv_windows_initialized || hv_windows_ecpu_state || chip_id != T8142 || board_id != 0x24 ||
+        state > 31 || !khz || khz != cpufreq_t8142_ecpu_khz(state))
+        return -1;
+    hv_windows_ecpu_state = state;
+    hv_windows_ecpu_khz = khz;
     return 0;
 }
 
@@ -190,7 +206,8 @@ bool hv_windows_cpufreq_owned(void)
 {
     // Configuration cannot be changed after initialization. Keep ownership
     // through debug pauses and terminal drain; a fresh resident releases it.
-    return (hv_windows_flags & HV_WINDOWS_CPUFREQ) != 0;
+    // An explicit E boot state closes host requests too, so nothing undoes it.
+    return (hv_windows_flags & HV_WINDOWS_CPUFREQ) != 0 || hv_windows_ecpu_state != 0;
 }
 
 bool hv_windows_can_prepare_device(void)
@@ -661,6 +678,25 @@ void hv_fb_report(void)
 #endif
 }
 
+/* Apply the explicit E boot state once, before any device handoff of guest entry. */
+static bool hv_windows_apply_ecpu(void)
+{
+    if (!hv_windows_ecpu_state)
+        return true;
+    if (hv_windows_ecpu_attempted)
+        return false;
+    hv_windows_ecpu_attempted = true;
+    if (cpufreq_t8142_ecpu_khz(hv_windows_ecpu_state) != hv_windows_ecpu_khz ||
+        cpufreq_t8142_raise_ecpu(hv_windows_ecpu_state)) {
+        printf("HV: E boot state %u not applied; reset before another session\n",
+               hv_windows_ecpu_state);
+        return false;
+    }
+    printf("HV: E cluster at command state %u (%u kHz table entry), P cluster unchanged\n",
+           hv_windows_ecpu_state, hv_windows_ecpu_khz);
+    return true;
+}
+
 int hv_start(void *entry, u64 regs[4])
 {
     if (boot_cpu_idx == -1) {
@@ -670,6 +706,11 @@ int hv_start(void *entry, u64 regs[4])
 
     if (hv_shutdown_failed || !hv_windows_ready || hv_windows_entered) {
         printf("HV: Windows session is not ready\n");
+        return -1;
+    }
+
+    if (!hv_windows_apply_ecpu()) {
+        hv_windows_quarantine();
         return -1;
     }
 

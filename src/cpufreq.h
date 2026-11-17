@@ -16,4 +16,8 @@ void cpufreq_payload_boost(bool enable);
 u64 cpufreq_get_cluster_hz(unsigned int cluster);
 int cpufreq_set_cluster_pstate(unsigned int cluster, unsigned int pstate);
 
+/* J813 Windows image only (AURA_WINDOWS): E boot state before guest entry. */
+u32 cpufreq_t8142_ecpu_khz(u32 state);
+int cpufreq_t8142_raise_ecpu(u32 state);
+
 #endif

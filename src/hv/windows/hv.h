@@ -17,6 +17,7 @@
 void hv_windows_system_exit(bool reset) __attribute__((noreturn));
 void hv_windows_abort_guest(void);
 int hv_windows_configure(u64 flags);
+int hv_windows_configure_ecpu(u64 state, u64 khz);
 bool hv_windows_guest_compat_enabled(void);
 bool hv_windows_serial_capture_enabled(void);
 bool hv_windows_serial_cdc_enabled(void);

@@ -795,6 +795,7 @@ class AuraProxy(Reloadable):
     P_HV_WINDOWS_N1_PREPARE = 0xc82
     P_HV_WINDOWS_HEAP_HIGH_WATER = 0xc83
     P_HV_WINDOWS_N1_ACQUIRE = 0xc84
+    P_HV_WINDOWS_ECPU_BOOT_STATE = 0xc86  # 0xc85: capture-kit EXIT_SNAPSHOT
     # Windows-only HvXfer bulk channel (src/hv/windows/hv_xfer.c); same opcode as m1n1 j813.
     P_HV_MAP_XFER = 0x1700
 
@@ -1309,6 +1310,10 @@ class AuraProxy(Reloadable):
 
     def hv_windows_configure(self, flags):
         return self.request(self.P_HV_WINDOWS_CONFIG, flags, signed=True)
+
+    def hv_windows_configure_ecpu(self, state, khz):
+        """Select the J813 E boot state applied once before guest entry (capability 0x4000)."""
+        return self.request(self.P_HV_WINDOWS_ECPU_BOOT_STATE, state, khz, signed=True)
 
     def hv_windows_prepare_n1(self, address, size):
         return self.request(self.P_HV_WINDOWS_N1_PREPARE, address, size, signed=True)

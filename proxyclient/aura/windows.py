@@ -26,6 +26,7 @@ SERIAL_CDC_ISOLATED = 0x0200
 MTP_HANDOFF = 0x0400
 CPUFREQ_OWNERSHIP = 0x0800
 XFER = 0x2000  # HvXfer bulk channel: P_HV_MAP_XFER + HV_XFER events (src/hv/windows/hv_xfer.c)
+ECPU_BOOT_STATE = 0x4000  # P_HV_WINDOWS_ECPU_BOOT_STATE (docs/t8142-ecpu-stepup.md)
 CONFIG_T8142_EXPERIMENTAL = 0x0001
 CONFIG_FRAMEBUFFER_SHADOW = 0x0002
 CONFIG_SERIAL_CAPTURE = 0x0004
@@ -44,6 +45,17 @@ PROXY_HEAP_SIZE = 128 * 1024 * 1024
 N1_RESOURCES = ((0x1cb0000000, 0x200000), (0x488000000, 0x20000),
                 (0x488028000, 0x4000), (0x48f010000, 0x1000),
                 (0x39a000300, 4), (0xb80000000, 0x600000))
+# Retained J813 PMGR ADT frequencies, independently decoded from hardware.
+# ADT records are {kHz, mV}; index 0 is command state 2 (state 1 is a 300 MHz floor).
+# Preserve the P17/P18 ordering: this firmware ladder is not monotonic.
+J813_CPU_OPP_KHZ = (
+    (972000, 1152000, 1584000, 1992000, 2352000, 2700000, 2964000, 3048000),
+    (1308000, 1608000, 1932000, 2220000, 2508000, 2820000, 3072000,
+     3300000, 3516000, 3720000, 3876000, 4020000, 4176000, 4248000,
+     4272000, 4332000, 4428000, 4416000, 4464000),
+)
+ECPU_HANDOFF_STATE = 2
+ECPU_LAST_STATE = ECPU_HANDOFF_STATE + len(J813_CPU_OPP_KHZ[0]) - 1
 
 
 def require(condition, message):
@@ -61,7 +73,7 @@ def number(value, label):
 
 def validate_capabilities(value, framebuffer="native", guest_compatibility="none", n1="disabled",
                           reserved_memory=False, serial="disabled", mtp="disabled", cpufreq="disabled",
-                          xfer=False):
+                          xfer=False, ecpu_boot_state=0):
     require(isinstance(value, int) and value >> 32 == CAPS_MAGIC >> 32,
             "resident is not an explicit Windows Aura personality")
     require((value >> 16) & 0xffff == CAPS_ABI, "unsupported Windows Aura capability ABI")
@@ -89,6 +101,9 @@ def validate_capabilities(value, framebuffer="native", guest_compatibility="none
                 "resident lacks exclusive Windows CPU frequency ownership")
     if xfer:
         require(value & XFER, "resident lacks the HvXfer bulk channel")
+    if ecpu_boot_state:
+        require(value & ECPU_BOOT_STATE and value & CONFIGURATION,
+                "resident lacks the explicit E-cluster boot state")
     return value & 0xffff
 
 
@@ -113,6 +128,7 @@ class LaunchPlan:
     mtp: str = "disabled"
     cpufreq: str = "disabled"
     xfer: object = None
+    ecpu_boot_state: int = 0  # 0: keep the firmware handoff state (key absent)
 
 
 XFER_FIELDS = {"doorbell", "window_bytes", "serve_dir", "inbox", "compress"}
@@ -235,7 +251,7 @@ def plan_profile(filename):
     require(profile.get("schema") == "aura.windows.boot.v1", "unsupported Windows boot profile")
     require(set(profile) <= {"schema", "name", "target", "mu", "append", "framebuffer", "boot_args",
                              "guest_compatibility", "usb", "n1", "reserved_memory", "serial", "mtp", "cpufreq",
-                             "xfer"},
+                             "xfer", "ecpu_boot_state"},
             "unknown Windows profile field")
     require(isinstance(profile.get("name"), str) and 0 < len(profile["name"]) <= 80, "profile name is required")
     target = profile.get("target")
@@ -299,6 +315,18 @@ def plan_profile(filename):
     require(cpufreq in ("disabled", "j813-manual-v1"), "unsupported CPU frequency policy")
     require(cpufreq == "disabled" or (chip == 0x8142 and model == "Mac17,3"),
             "j813-manual-v1 CPU frequency handoff requires chip 0x8142 and model Mac17,3")
+    ecpu_boot_state = 0
+    if "ecpu_boot_state" in profile:
+        ecpu_boot_state = profile["ecpu_boot_state"]
+        require(type(ecpu_boot_state) is int and
+                ECPU_HANDOFF_STATE <= ecpu_boot_state <= ECPU_LAST_STATE,
+                f"ecpu_boot_state must be an integer E command state "
+                f"{ECPU_HANDOFF_STATE}..{ECPU_LAST_STATE}")
+        require(chip == 0x8142 and model == "Mac17,3",
+                "ecpu_boot_state requires chip 0x8142 and model Mac17,3")
+        # AppleCpuFreq 0.2.0.3 admits only E1..E2 and would fail D0 on a raised boot.
+        require(cpufreq == "disabled",
+                "ecpu_boot_state requires cpufreq disabled: no Windows driver may own the controllers")
     declarations = profile.get("reserved_memory", [])
     require(isinstance(declarations, list) and len(declarations) <= 16,
             "reserved_memory must be a list of at most 16 ranges")
@@ -336,7 +364,8 @@ def plan_profile(filename):
         cursor = offset + len(content)
     return LaunchPlan(filename, profile, raw, hashlib.sha256(raw).hexdigest(), b"".join(composed),
                       tuple(images), entry, chip, model, framebuffer, compatibility, usb, n1,
-                      tuple(reserved), boot_args, serial, mtp, cpufreq, xfer)
+                      tuple(reserved), boot_args, serial, mtp, cpufreq, xfer,
+                      ecpu_boot_state=ecpu_boot_state)
 
 
 def _aligned(value, alignment):
@@ -424,23 +453,31 @@ def cpufreq_handoff_marker(policy, chip, board, model, opp_tables=None):
         return None
     require((chip, board, model) == (0x8142, 0x24, "Mac17,3"),
             "CPU frequency ownership requires the exact J813 target")
-    # Retained J813 PMGR ADT frequencies, independently decoded from hardware.
-    # ADT records are {kHz, mV}; index 0 is firmware level 1.
-    # Preserve the P17/P18 ordering: this firmware ladder is not monotonic.
-    frequencies = (
-        (972000, 1152000, 1584000, 1992000, 2352000, 2700000, 2964000, 3048000),
-        (1308000, 1608000, 1932000, 2220000, 2508000, 2820000, 3072000,
-         3300000, 3516000, 3720000, 3876000, 4020000, 4176000, 4248000,
-         4272000, 4332000, 4428000, 4416000, 4464000),
-    )
     require(isinstance(opp_tables, (list, tuple)) and len(opp_tables) == 2,
             "CPU frequency handoff requires both firmware OPP tables")
-    for table, expected in zip(opp_tables, frequencies):
-        require(isinstance(table, (list, tuple)) and len(table) == 2 * len(expected)
-                and all(type(word) is int and 0 <= word <= 0xffffffff for word in table),
-                "malformed CPU frequency OPP table")
-        require(tuple(table[::2]) == expected, "firmware CPU OPP mapping differs from J813-v1")
+    for table, expected in zip(opp_tables, J813_CPU_OPP_KHZ):
+        _require_opp_table(table, expected)
     return struct.pack("<I", 1)
+
+
+def _require_opp_table(table, expected):
+    require(isinstance(table, (list, tuple)) and len(table) == 2 * len(expected)
+            and all(type(word) is int and 0 <= word <= 0xffffffff for word in table),
+            "malformed CPU frequency OPP table")
+    require(tuple(table[::2]) == expected, "firmware CPU OPP mapping differs from J813-v1")
+
+
+def ecpu_boot_state_khz(state, chip, board, model, e_table):
+    """kHz the hypervisor must find for the explicit E boot state, from the J813 E ladder.
+
+    The C side re-reads the same ADT entry and refuses on any mismatch.
+    """
+    require(type(state) is int and ECPU_HANDOFF_STATE <= state <= ECPU_LAST_STATE,
+            "unsupported E boot state")
+    require((chip, board, model) == (0x8142, 0x24, "Mac17,3"),
+            "the E boot state requires the exact J813 target")
+    _require_opp_table(e_table, J813_CPU_OPP_KHZ[0])
+    return J813_CPU_OPP_KHZ[0][state - ECPU_HANDOFF_STATE]
 
 
 def validate_n1_descriptor(descriptor):
@@ -571,7 +608,7 @@ class HardwareSession:
     def prepare(self, plan):
         validate_capabilities(self.capabilities(), plan.framebuffer, plan.guest_compatibility, plan.n1,
                               bool(plan.reserved_memory), plan.serial, plan.mtp, plan.cpufreq,
-                              xfer=plan.xfer is not None)
+                              xfer=plan.xfer is not None, ecpu_boot_state=plan.ecpu_boot_state)
         self.validate_serial_transport(plan)
         if plan.serial == "capture":
             from .windows_serial import WindowsSerialRecorder
@@ -593,6 +630,12 @@ class HardwareSession:
         preflight.windows_cpufreq = plan.cpufreq
         preflight.setup_adt()
         preflight._windows_adt_blob()
+        if plan.ecpu_boot_state:
+            # Bind the E ladder before any target mutation; HV.init() binds it again.
+            chosen = preflight.adt["/chosen"]
+            ecpu_boot_state_khz(plan.ecpu_boot_state, chosen.chip_id, getattr(chosen, "board_id", None),
+                                preflight.adt.model,
+                                preflight.adt["/arm-io/pmgr"].getprop("voltage-states1-sram"))
         guard = None
         if plan.reserved_memory:
             guard = memory_reservation_preflight(
@@ -614,6 +657,7 @@ class HardwareSession:
         self.hv.windows_n1 = plan.n1
         self.hv.windows_mtp = plan.mtp
         self.hv.windows_cpufreq = plan.cpufreq
+        self.hv.windows_ecpu_boot_state = plan.ecpu_boot_state
         self.hv.windows_serial = plan.serial
         self.hv.windows_serial_recorder = self.serial_capture
         self.hv.windows_xfer = plan.xfer is not None
@@ -639,12 +683,15 @@ class HardwareSession:
             self.hv.set_bootargs(plan.boot_args)
         self.hv.load_raw(plan.image, plan.entry_offset)
         require(self.hv.guest_base % 0x10000 == 0, "Mu payload base is not 64-KiB aligned")
+        cpufreq = {"profile": plan.cpufreq, "automatic_policy": False}
+        if plan.ecpu_boot_state:
+            cpufreq["ecpu_boot_state"] = plan.ecpu_boot_state  # applied by hv_start, not yet
         return {"guest_base": hex(self.hv.guest_base), "entry": hex(self.hv.entry),
                 "bootargs": hex(self.hv.guest_base + self.hv.bootargs_off),
                 "usb": plan.usb, "usb_removed": self.hv.windows_usb_removed,
                 "n1": self.hv.windows_n1_handoff, "memory_preflight": self.hv.windows_memory_guard,
                 "mtp": {"profile": plan.mtp, "prepared": self.hv.windows_mtp_ready},
-                "cpufreq": {"profile": plan.cpufreq, "automatic_policy": False}}
+                "cpufreq": cpufreq}
 
     def start(self):
         return self.hv.start()
@@ -699,7 +746,7 @@ def launch_profile(filename, device, output, session_factory=HardwareSession, gu
             caps = session.capabilities()
             validate_capabilities(caps, plan.framebuffer, plan.guest_compatibility, plan.n1,
                                   bool(plan.reserved_memory), plan.serial, plan.mtp, plan.cpufreq,
-                                  xfer=plan.xfer is not None)
+                                  xfer=plan.xfer is not None, ecpu_boot_state=plan.ecpu_boot_state)
             identity = session.identity()
             require(identity["chip_id"] == plan.chip_id and identity["model"] == plan.model,
                     "target identity does not match the Windows profile")

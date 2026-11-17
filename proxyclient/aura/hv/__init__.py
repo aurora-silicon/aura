@@ -105,6 +105,7 @@ class HV(Reloadable):
         self.windows_n1 = "disabled"
         self.windows_mtp = "disabled"
         self.windows_cpufreq = "disabled"
+        self.windows_ecpu_boot_state = 0
         self.windows_mtp_ready = False
         self.windows_mtp_attempted = False
         self.windows_initialized = False
@@ -1547,12 +1548,16 @@ class HV(Reloadable):
             from ..windows import (CONFIGURATION, CONFIG_FRAMEBUFFER_SHADOW,
                                    CONFIG_T8142_EXPERIMENTAL, CONFIG_SERIAL_CAPTURE,
                                    CONFIG_SERIAL_CDC, CONFIG_MTP, CONFIG_CPUFREQ, MTP_DISABLED_PROPERTY,
-                                   MTP_RESERVED_BASE, MTP_RESERVED_SIZE, validate_capabilities)
+                                   MTP_RESERVED_BASE, MTP_RESERVED_SIZE, ecpu_boot_state_khz,
+                                   validate_capabilities)
             caps = validate_capabilities(self.p.hv_windows_capabilities(), self.windows_framebuffer,
                                          self.windows_guest_compatibility, self.windows_n1,
                                          self.windows_memory_guard is not None, self.windows_serial,
                                          self.windows_mtp, self.windows_cpufreq,
-                                         xfer=self.windows_xfer)
+                                         xfer=self.windows_xfer,
+                                         ecpu_boot_state=self.windows_ecpu_boot_state)
+            if self.windows_ecpu_boot_state and self.windows_cpufreq != "disabled":
+                raise ValueError("an E boot state requires the Windows CPU frequency owner disabled")
             if self.windows_mtp != "disabled":
                 guard = self.windows_memory_guard
                 if not guard or not any(r["base"] == MTP_RESERVED_BASE and
@@ -1590,8 +1595,19 @@ class HV(Reloadable):
                     flags |= CONFIG_MTP
                 if self.windows_cpufreq == "j813-manual-v1":
                     flags |= CONFIG_CPUFREQ
+                khz = None
+                if self.windows_ecpu_boot_state:
+                    # Before any mutation: the C side re-checks this ADT entry.
+                    chosen = self.adt["/chosen"]
+                    khz = ecpu_boot_state_khz(self.windows_ecpu_boot_state, chosen.chip_id,
+                                              getattr(chosen, "board_id", None), self.adt.model,
+                                              self.adt["/arm-io/pmgr"].getprop("voltage-states1-sram"))
                 if self.p.hv_windows_configure(flags) != 0:
                     raise RuntimeError("Windows hypervisor configuration rejected")
+                # Applied once by hv_start() before guest entry; never retried on this resident.
+                if khz is not None and self.p.hv_windows_configure_ecpu(
+                        self.windows_ecpu_boot_state, khz) != 0:
+                    raise RuntimeError("Windows E boot state rejected")
 
         # disable unused USB iodev early so interrupts can be reenabled in hv_init()
         for iodev in IODEV:

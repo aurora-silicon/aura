@@ -17,6 +17,7 @@ typedef uint64_t u64;
 #define T8142 0x8142
 static bool hv_windows_initialized;
 static u64 hv_windows_flags;
+static unsigned hv_windows_ecpu_state;
 static unsigned chip_id=0x8142,board_id=0x24,uartproxy_iodev=4,writes;
 static bool hv_windows_serial_available(void){return true;}
 #include "cpufreq-native.inc"
@@ -36,4 +37,8 @@ int main(void){struct req q={P_CPUFREQ_INIT,{0,0}};struct rep r={0};
  hv_windows_initialized=true;assert(hv_windows_configure(0)<0);assert(hv_windows_cpufreq_owned());dispatch(&q,&r);assert(writes==1);
  q.opcode=P_CPUFREQ_GET_CLUSTER_HZ;dispatch(&q,&r);assert(r.retval==9&&writes==1);
  hv_windows_initialized=false;hv_windows_flags=0;dispatch(&q,&r);q.opcode=P_CPUFREQ_SET_CLUSTER_PSTATE;dispatch(&q,&r);assert(r.retval==8&&writes==2);
- chip_id=0x8152;assert(hv_windows_configure(HV_WINDOWS_CPUFREQ)<0);puts("native configuration and proxy ownership cases passed");return 0;}
+ chip_id=0x8152;assert(hv_windows_configure(HV_WINDOWS_CPUFREQ)<0);
+ /* An explicit E boot state closes host INIT/SET without Windows ownership. */
+ hv_windows_ecpu_state=5;assert(hv_windows_cpufreq_owned());q.opcode=P_CPUFREQ_INIT;dispatch(&q,&r);assert(r.retval==(u64)-1&&writes==2);
+ q.opcode=P_CPUFREQ_SET_CLUSTER_PSTATE;dispatch(&q,&r);assert(r.retval==(u64)-1&&writes==2);
+ puts("native configuration and proxy ownership cases passed");return 0;}

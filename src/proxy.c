@@ -627,8 +627,9 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
         case P_HV_WINDOWS_CAPS:
             /* Read-only personality/ABI probe; never initializes hardware. */
 #ifdef AURA_WINDOWS
-            /* Bit 13 (0x2000): HvXfer bulk channel, P_HV_MAP_XFER. */
-            reply->retval = 0x4157494e00013fffULL;
+            /* Bit 13 (0x2000): HvXfer bulk channel, P_HV_MAP_XFER.
+             * Bit 14 (0x4000): explicit J813 E boot state, P_HV_WINDOWS_ECPU_BOOT_STATE. */
+            reply->retval = 0x4157494e00017fffULL;
 #else
             reply->retval = 0;
 #endif
@@ -640,6 +641,12 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
             reply->retval = -1;
 #endif
             break;
+#ifdef AURA_WINDOWS
+        /* Not handled by the default image: hosts only send it after capability bit 14. */
+        case P_HV_WINDOWS_ECPU_BOOT_STATE:
+            reply->retval = hv_windows_configure_ecpu(request->args[0], request->args[1]);
+            break;
+#endif
         case P_HV_WINDOWS_HEAP_HIGH_WATER:
 #ifdef AURA_WINDOWS
             /* Unlike heapblock_alloc(0), this query does not align or advance the heap. */

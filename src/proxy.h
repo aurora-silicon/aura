@@ -158,6 +158,8 @@ typedef enum {
     P_HV_WINDOWS_N1_PREPARE = 0xc82,
     P_HV_WINDOWS_HEAP_HIGH_WATER = 0xc83,
     P_HV_WINDOWS_N1_ACQUIRE = 0xc84,
+    /* 0xc85 is P_HV_WINDOWS_EXIT_SNAPSHOT on the capture-kit branch. */
+    P_HV_WINDOWS_ECPU_BOOT_STATE = 0xc86,
 
     P_FB_INIT = 0xd00,
     P_FB_SHUTDOWN,

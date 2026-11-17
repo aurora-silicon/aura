@@ -800,6 +800,67 @@ __attribute__((used, retain, noinline)) int cpufreq_set_cluster_pstate(unsigned 
     return 0;
 }
 
+#ifdef AURA_WINDOWS
+/* J813 firmware handoff commands (docs/t8142-cpufreq.md): E state 2, P state 10. */
+#define T8142_ECPU_HANDOFF 0x400102
+#define T8142_PCPU_HANDOFF 0x40010a
+
+/*
+ * kHz of E command state `state` in the J813 firmware table, or 0. The SRAM
+ * table starts at state 2; state 1 is the 300 MHz floor and is not offered.
+ */
+u32 cpufreq_t8142_ecpu_khz(u32 state)
+{
+    int node = adt_path_offset(adt, "/arm-io/pmgr");
+    u32 len = 0;
+    const u32 *opps = node < 0 ? NULL : adt_getprop(adt, node, "voltage-states1-sram", &len);
+
+    if (chip_id != T8142 || !opps || !len || len % 8 || len / 8 > 30 || state < 2 ||
+        state - 2 >= len / 8)
+        return 0;
+    for (u32 i = 0; i < len / 8; i++) {
+        if (!opps[2 * i] || opps[2 * i] > 5000000 || (i && opps[2 * i] <= opps[2 * (i - 1)]))
+            return 0;
+    }
+    return opps[2 * (state - 2)];
+}
+
+/*
+ * Before Windows entry, raise the E cluster from its handoff state to `state`
+ * one state at a time with the bounded setter above. Nothing is written unless
+ * both clusters still hold their exact handoff commands; the P cluster is only
+ * read. A failure is final for this resident: callers must not retry.
+ */
+int cpufreq_t8142_raise_ecpu(u32 state)
+{
+    const struct cluster_t *ecpu = &t8142_clusters[0], *pcpu = &t8142_clusters[1];
+
+    if (chip_id != T8142 || !cpufreq_t8142_ecpu_khz(state))
+        return -1;
+    u64 e_before = read64(ecpu->base + CLUSTER_PSTATE);
+    u64 p_before = read64(pcpu->base + CLUSTER_PSTATE);
+    if (e_before != T8142_ECPU_HANDOFF || p_before != T8142_PCPU_HANDOFF) {
+        printf("cpufreq: E/P commands 0x%lx/0x%lx are not the J813 handoff; nothing written\n",
+               e_before, p_before);
+        return -1;
+    }
+    for (u32 pstate = ecpu->default_pstate + 1; pstate <= state; pstate++) {
+        if (set_pstate(ecpu, pstate))
+            return -1;
+    }
+    u64 e_after = read64(ecpu->base + CLUSTER_PSTATE);
+    u64 p_after = read64(pcpu->base + CLUSTER_PSTATE);
+    if (pstate_reg_to_pstate(e_after) != state || (e_after & CLUSTER_PSTATE_BUSY) ||
+        ((e_after ^ e_before) & ~(CLUSTER_PSTATE_DESIRED1 | CLUSTER_PSTATE_SET)) ||
+        p_after != p_before) {
+        printf("cpufreq: E/P commands 0x%lx/0x%lx after raising E to state %u\n", e_after, p_after,
+               state);
+        return -1;
+    }
+    return 0;
+}
+#endif
+
 /*
  * Loading payloads (inflating a kernel Image, reading boot= storage) is CPU bound on one core. A
  * P cluster that firmware left below the state cpufreq_init() will hold is raised to that state
