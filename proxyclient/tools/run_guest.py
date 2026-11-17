@@ -427,6 +427,13 @@ def windows_t8152_input_attach(hv, sources):
         p.hv_windows_input(w.INPUT_OP_DETACH)
         sys.exit(f"T8152: input attached but the Mu handshake was refused: {exc}. The resident "
                  "now refuses guest entry; reload the carrier. No guest was started.")
+        # Best effort: a failed DETACH must not skip the USB detach below.
+        try:
+            p.hv_windows_input(w.INPUT_OP_DETACH)
+        except ProxyRemoteError:
+            pass
+        refuse(f"T8152: input attached but the Mu handshake was refused: {exc}. The resident "
+               "now refuses guest entry; reload the carrier. No guest was started.")
     print(f"T8152 input: attached; /chosen/{w.INPUT_HANDSHAKE_PROPERTY} written. Feed it from "
           "this Mac on the guest CDC port (never the proxy port)")
 
@@ -516,7 +523,7 @@ def run_windows_t8152(caps):
     enter it unless every T8152 safety precondition holds (src/hv/windows/hv_t8152.c)."""
     from aura.windows import (AURA_HEAP_RESERVE, PROXY_HEAP_SIZE, T8152_CHIP, WindowsLaunchRefused,
                               number, t8152_check_window, windows_system_reset)
-    from aura.windows import USB_OP_DETACH, usb_spelling
+    from aura.windows import INPUT_OP_DETACH, USB_OP_DETACH, usb_spelling
     if not args.raw:
         sys.exit("T8152 Windows guests are raw Mu FDs: pass -r")
     if args.symbols or args.debug_xnu or args.volume or args.emulate_sprr or args.cpus or \
@@ -604,8 +611,16 @@ def run_windows_t8152(caps):
                 p.hv_windows_usb(USB_OP_DETACH)
             except ProxyRemoteError:
                 pass
+        if input_sources:
+            # A pre-entry refusal (hv_t8152_verify, hv_ahci_verify, hv_input_verify) leaves the
+            # input device attached and owning the vUART RX; DETACH works until guest entry.
+            try:
+                p.hv_windows_input(INPUT_OP_DETACH)
+            except ProxyRemoteError:
+                pass
         sys.exit(f"Hypervisor refused or failed: {exc}. The aura proxy keeps running; "
-                 "its console says why.")
+                 "its console says why. USB and input (if any) were detached; a GPU "
+                 "admission has no release and lasts until the carrier is reloaded.")
     print(f"Guest exit status: {result} (1 SYSTEM_OFF, 2 SYSTEM_RESET)")
     windows_t8152_usb_status(usb_ports)
     windows_t8152_gpu_status(gpu_mode)

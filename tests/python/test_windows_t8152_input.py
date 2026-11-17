@@ -628,6 +628,22 @@ def test_run_guest_input_order_and_refusals():
         attach.index("hv.set_windows_input_handshake(w.input_handshake(sources, features))")
     failed = attach[attach.index("except ValueError as exc:\n        p.hv_windows_input"):]
     assert failed.index("w.INPUT_OP_DETACH") < failed.index("sys.exit(")
+    failed = attach[attach.index("except ValueError as exc:\n"):]
+    assert failed.index("w.INPUT_OP_DETACH") < failed.index("refuse(")
+    # Merged with G0: every input refusal after USB ATTACH detaches USB before exiting.
+    helper = attach[attach.index("def refuse(message):"):attach.index("features = ")]
+    assert helper.index("w.USB_OP_DETACH") < helper.index("sys.exit(message)")
+    assert "sys.exit(" not in attach.replace("sys.exit(message)", "")
+    # A failed DETACH after a refused handshake still reaches refuse() (USB detach).
+    detach = failed[:failed.index("refuse(")]
+    assert "try:" in detach and "except ProxyRemoteError:" in detach
+    # hv.start() refused before entry: input is detached as USB is (RX back to the console).
+    start_fail = t8152[t8152.index("result = hv.start()"):]
+    start_fail = start_fail[:start_fail.index("sys.exit(f\"Hypervisor refused")]
+    assert "if input_sources:" in start_fail
+    assert start_fail.index("p.hv_windows_input(INPUT_OP_DETACH)") < \
+        start_fail.index("except ProxyRemoteError:", start_fail.index("INPUT_OP_DETACH"))
+    assert "INPUT_OP_DETACH" in t8152[:t8152.index("hv.init()")]
     tail = src.split("_windows_caps = windows_resident_caps()", 1)[1]
     assert "args.windows_input not in ('off', 'disabled')" in tail
 

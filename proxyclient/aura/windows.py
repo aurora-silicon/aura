@@ -1256,8 +1256,9 @@ def validate_input_request(sources, chip, board, caps2, fd, serial):
             "the resident has no input device (P_HV_WINDOWS_CAPS2 bit 3): rebuild the carrier "
             "at or after the I0 commit")
     require(marker is not None, "--windows-input: the FD has no J804INP1 marker at 0x140, so "
-            "Windows has no INP0 to bind: build Mu with J804_WINDOWS_INPUT=TRUE "
-            "(out/j804-windows-input)")
+            "Windows has no INP0 to bind: use a Mu FD built with J804_WINDOWS_INPUT=TRUE "
+            "(WM6_J804_INPUT=TRUE Tools/build-j804-windows.sh in Mu j804-windows-next; "
+            "out/j804-windows-next/artifacts/J804WIN_EFI.fd)")
     if "host" in sources:
         require(serial == "cdc", "--windows-input host feeds input over the vUART CDC pipe: "
                 "it needs --windows-serial cdc (the default)")

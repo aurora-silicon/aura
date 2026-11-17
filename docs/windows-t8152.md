@@ -578,8 +578,13 @@ less than 4 GiB of guest RAM below the pool.
 ## I0: Mac-fed keyboard and pointer (carrier input device)
 
 Status: built and host-tested only (`tests/python/test_windows_t8152_input.py`). Nothing of it
-has run on the M6, and no Windows driver binds it yet (the `m6input` HID minidriver and the Mu
-tables are separate pieces; the Mu contract is below). Contract and reasoning:
+has run on the M6. All three pieces now exist but have never run together: this carrier
+(`j804-windows-next`), Mu `j804-windows-next` (`J804_WINDOWS_INPUT`: SSDT `J804INP0`,
+`J804InputAcpiDxe`, the `J804INP1` marker at 0x140; FD in `out/j804-windows-next`), and the
+`m6input` HID minidriver staged in a test-signed image (`out/d5/win11-m6-input.img`; the D3
+image has no driver, so with it INP0 stays unbound). The driver has run only in QEMU on its
+self-test source, under an SSDT without `_CRS`; its hardware mode (Mu's page and GSIV 991) is
+untested. Contract and reasoning:
 `windows-m6/INPUT-DESIGN.md` (owner notes, not in this tree). Off unless `run_guest.py
 --windows-input host` asks for it; a launch without it runs exactly the D1/D4 code (the vSPI
 gate is per INTID, `vdev_spi_live()`).
@@ -689,9 +694,22 @@ handshake `/chosen/aura,windows-input-v1`: 24 bytes `<QIIII>` = page base 0xF500
 host), version 1. STATUS is printed after the guest exits.
 
 ### The Mu side (contract; not in Mu yet)
+With G0 in the same launch (`j804-windows-next`), the order is AHCI attach -> USB attach ->
+GPU ADMIT (and HOOK) -> input ATTACH -> `hv.start()`, and every input refusal detaches USB
+first, as the GPU refusals do (a failed input DETACH after a refused handshake does not skip
+that). If `hv.start()` itself refuses before entry, the launcher detaches USB and input (the
+vUART RX goes back to the console); a GPU admission has no release and lasts until the
+carrier is reloaded. The four features do not share a number: proxy ops 0xc8e AHCI,
+0xc87 USB, 0xc88 GPU, 0xc89 input; CAPS2 bits 0-3 in that order; configure BIT(8) AHCI, BIT(9)
+USB, BIT(10) input (G0 has no configure flag); FD markers 0x110 `J804AHC1`, 0x120 `J804USB1`,
+0x130 `J804USB3`, 0x140 `J804INP1` (G0 has none: Mu's GPU0 comes from the handoff page); SPIs
+990 AHCI and 991 input (emulated), 995/997 USB (aliases), and the GPU alias slots refuse the
+whole 980..999 carrier block.
 
-Mu `j804-windows` needs, following the D4 `J804_WINDOWS_USB` pattern
-(`J804XhciAcpiDxe`, SSDT `J804XHC1`):
+### The Mu side (contract; built in Mu `j804-windows-next` b2287c9, not run on the M6)
+
+Mu implements it following the D4 `J804_WINDOWS_USB` pattern (`J804XhciAcpiDxe`, SSDT
+`J804XHC1`):
 
 - `J804Windows.h`: `J804_INPUT_BASE 0xF50000000`, `J804_INPUT_SIZE 0x4000`,
   `J804_GSIV_INPUT 991`, `J804_INPUT_FD_MARKER_OFFSET 0x140`, `J804_INPUT_ADT_PROPERTY
