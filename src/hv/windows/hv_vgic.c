@@ -241,6 +241,13 @@ static bool handle_vgic_dist_access(struct exc_info *ctx, u64 addr, u64 *val, bo
     relative_addr = addr - dist_base;
     register_handled = false;
     unimplemented_reg_accessed = false;
+    /*
+     * T8152: Mu (an AIC build) never touches the emulated GIC, so a guest write
+     * here is an OS initialising it.  The guest OS then owns the GIC: trap-all
+     * and the software CPU interface (hv_t8152_gic_claim; no-op elsewhere).
+     */
+    if (write)
+        hv_t8152_gic_claim("guest write to the emulated distributor");
     if (write) {
         //
         // The guest attempted to write a register.
@@ -1022,6 +1029,9 @@ static bool handle_vgic_redist_access(struct exc_info *ctx, u64 addr, u64 *val, 
     cpu_num = redist_cpu_ids[frame];
     if (cpu_num >= MAX_CPUS)
         return false;
+    /* T8152: as for the distributor (GICR_WAKER is written before a CPU interface is used). */
+    if (write)
+        hv_t8152_gic_claim("guest write to an emulated redistributor");
     if (write) {
         //
         // The guest attempted to write a register.

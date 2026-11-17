@@ -21,7 +21,8 @@ CAPS_OLD = 0x4157494E000107FF  # every capability before the T8152 policy bit
 CAPS_T8152_V1 = CAPS_OLD | windows.T8152_POLICY  # 6bdac9ee: no 12-live-CPU refusal
 CAPS_T8152_V2 = CAPS_T8152_V1 | windows.T8152_LIVE_CPUS  # cd5b10f1: no guest-WFE trap
 CAPS_T8152_V3 = CAPS_T8152_V2 | windows.T8152_WFE_PLACEMENT  # 618d6d40: Apple ACTLR alias
-CAPS_T8152 = CAPS_T8152_V3 | windows.T8152_ACTLR_ARCH
+CAPS_T8152_V4 = CAPS_T8152_V3 | windows.T8152_ACTLR_ARCH  # 32555bf9: hardware GIC cpuif
+CAPS_T8152 = CAPS_T8152_V4 | windows.T8152_GIC_TRAPALL
 GIB = 1 << 30
 
 
@@ -50,6 +51,8 @@ def test_t8152_profile_binds_window_and_policy(tmp_path):
     assert plan.ipi == "fast" and plan.on_reset == "reboot"
     plan = windows.plan_profile(write_profile(tmp_path, gic_cpuif="software"))
     assert plan.gic_cpuif == "software"
+    # The software CPU interface is the T8152 default (measurement (f)).
+    assert windows.plan_profile(write_profile(tmp_path)).gic_cpuif == "software"
     assert plan.wfi == "poll"  # no WFI at EL2: measurement (a) found WFI_WIPES
 
 
@@ -62,6 +65,7 @@ def test_t8152_profile_binds_window_and_policy(tmp_path):
     ({"ipi": "sev"}, "ipi must be"),
     ({"on_reset": "now"}, "on_reset must be"),
     ({"gic_cpuif": "hardware"}, "gic_cpuif must be"),
+    ({"gic_cpuif": "carrier"}, "GIC_CPUIF_UNDEF"),
     ({"wfi": "wfe"}, "wfi must be"),
     ({"wfi": "wfi"}, "WFI_WIPES"),
     ({"reserved_memory": [{"name": "x", "base": "0x10050000000", "size": "0x1000"}]},
@@ -99,6 +103,16 @@ def test_older_resident_never_runs_a_t8152_guest():
     # Nor one that still writes the implementation-defined ACTLR alias (618d6d40).
     with pytest.raises(ValueError, match="architectural ACTLR_EL12"):
         windows.validate_capabilities(CAPS_T8152_V3, "bgra-shadow", t8152=True)
+    # Nor one without the trapped software GIC CPU interface (32555bf9 and older).
+    with pytest.raises(ValueError, match="trapped software GIC CPU interface"):
+        windows.validate_capabilities(CAPS_T8152_V4, "bgra-shadow", t8152=True)
+    with pytest.raises(ValueError, match="trapped software GIC CPU interface"):
+        windows.validate_capabilities(CAPS_T8152_V4, gic_cpuif="software")
+    # A T8152 launch never takes the hardware CPU interface path, whatever the resident.
+    with pytest.raises(ValueError, match="GIC_CPUIF_UNDEF"):
+        windows.validate_capabilities(CAPS_T8152, "bgra-shadow", t8152=True, gic_cpuif="carrier")
+    assert windows.validate_capabilities(CAPS_T8152, "bgra-shadow", t8152=True,
+                                         gic_cpuif="software") & windows.T8152_GIC_TRAPALL
     # Not a T8152 launch: the older resident stays valid.
     windows.validate_capabilities(CAPS_OLD, "bgra-shadow")
 
@@ -197,8 +211,8 @@ def test_c_and_python_agree_on_abi():
     proxy_h = (REPO / "src/proxy.h").read_text()
     hv_h = (REPO / "src/hv/windows/hv.h").read_text()
     # This branch builds no N1 producer: the resident clears N1_HANDOFF (bit 5).
-    assert "0x4157494e00017fdfULL" in proxy_c
-    assert CAPS_T8152 & ~windows.N1_HANDOFF == 0x4157494E00017FDF
+    assert "0x4157494e0001ffdfULL" in proxy_c
+    assert CAPS_T8152 & ~windows.N1_HANDOFF == 0x4157494E0001FFDF
     assert "P_HV_WINDOWS_GUEST_RAM = 0xc8c" in proxy_h
     assert "HV_WINDOWS_T8152_FAST_IPI BIT(5)" in hv_h and windows.CONFIG_T8152_FAST_IPI == 1 << 5
     assert "HV_WINDOWS_T8152_SOFT_GIC BIT(6)" in hv_h and windows.CONFIG_T8152_SOFT_GIC == 1 << 6

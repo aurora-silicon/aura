@@ -36,9 +36,10 @@ parser.add_argument('--windows-guest-ram', metavar='BASE:TOP', default=None,
 parser.add_argument('--windows-ipi', choices=('poll', 'fast'), default='poll',
                     help='T8152: kick guest CPUs by polling (default) or, only after Phase 3 '
                          'measurement (c) passed, with Apple Fast IPIs.')
-parser.add_argument('--windows-gic-cpuif', choices=('carrier', 'software'), default='carrier',
-                    help='T8152: the software GIC CPU interface (as T8142), only after Phase 3 '
-                         'measurement (f) showed ICC_* accesses trap to EL2.')
+parser.add_argument('--windows-gic-cpuif', choices=('carrier', 'software'), default=None,
+                    help='T8152: the software GIC CPU interface with every ICC_* access trapped '
+                         '(default and required there: Phase 3 measurement (f) found the '
+                         'hardware CPU interface path UNDEF). Off T8152 only "carrier" exists.')
 parser.add_argument('--windows-wfi', choices=('poll', 'wfi'), default='poll',
                     help='T8152: carrier idle busy-polls (default). "wfi" (a real WFI at EL2) '
                          'is refused: Phase 3 measurement (a) found WFI_WIPES.')
@@ -107,7 +108,7 @@ def run_windows_t8152(caps):
     hv.windows_serial = args.windows_serial
     hv.windows_guest_ram = (base, top)
     hv.windows_ipi = args.windows_ipi
-    hv.windows_gic_cpuif = args.windows_gic_cpuif
+    hv.windows_gic_cpuif = args.windows_gic_cpuif or "software"
     hv.windows_wfi = args.windows_wfi
     log = args.logfile.open("w") if args.logfile else None
     if log:
@@ -161,7 +162,7 @@ _windows_caps = windows_resident_caps()
 if _windows_caps and p.get_chipid() == 0x8152:
     run_windows_t8152(_windows_caps)
 elif (args.windows_guest_ram or args.windows_ipi != 'poll' or args.windows_reset_on_exit or
-      args.windows_gic_cpuif != 'carrier' or args.windows_wfi != 'poll'):
+      args.windows_gic_cpuif not in (None, 'carrier') or args.windows_wfi != 'poll'):
     sys.exit("--windows-* options need the Windows personality (gmake WINDOWS=1) on T8152")
 
 if args.emulate_sprr or not p.get_cpu_features().apple_sysregs_unlocked:

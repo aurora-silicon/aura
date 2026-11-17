@@ -166,7 +166,6 @@ static bool hv_windows_ecpu_attempted;
  *    alone, so aura's own exception.c PMCR0 paths do not change.
  */
 static bool hv_t8152_fast_ipi;
-static bool hv_t8152_soft_gic;
 static bool hv_t8152_wfi;
 
 /*
@@ -211,14 +210,19 @@ void hv_guest_actlr_write(u64 value)
 }
 
 /*
- * The software GIC CPU interface (trapped ICC_* accesses, no list registers)
- * is the delivery model proven on T8142.  T8152 joins it only when the
- * launcher opts in after Phase 3 measurement (f) showed that ICC_* accesses
- * trap to EL2 there; until then those paths stay T8142-only.
+ * The software GIC CPU interface (trapped ICC_* accesses, no list registers).
+ * T8142 uses its own model (hv_handle_t8142_gic_cpuif).  T8152 always uses
+ * one: Phase 3 measurement (f) found ICC_IAR1_EL1 and ICC_IGRPEN1_EL1 UNDEFINED
+ * at EL1 in the carrier's own configuration and every ICC_* access but
+ * ICC_SRE_EL1 trapping to EL2 under trap-all, on every core type, so the
+ * hardware CPU interface path ("carrier") is not an option there
+ * (hv_t8152_gic_claim in hv_exc.c).  hv_windows_configure() refuses a T8152
+ * configuration that does not ask for it, so an older launcher cannot believe
+ * it chose otherwise.
  */
 bool hv_soft_gic_cpuif(void)
 {
-    return chip_id == T8142 || (chip_id == T8152 && hv_t8152_soft_gic);
+    return chip_id == T8142 || chip_id == T8152;
 }
 
 bool hv_fast_ipi(void)
@@ -272,6 +276,11 @@ int hv_windows_configure(u64 flags)
     if ((flags & (HV_WINDOWS_T8152_FAST_IPI | HV_WINDOWS_T8152_SOFT_GIC | HV_WINDOWS_T8152_WFI)) &&
         chip_id != T8152)
         return -1;
+    if (chip_id == T8152 && !(flags & HV_WINDOWS_T8152_SOFT_GIC)) {
+        printf("HV: T8152: the hardware GIC CPU interface path is refused (measurement (f): "
+               "GIC_CPUIF_UNDEF); use --windows-gic-cpuif software\n");
+        return -1;
+    }
     if (flags & HV_WINDOWS_T8152_WFI) {
         /*
          * Measurement (a) on J804: a timer-woken WFI clears the GPRs, NZCV and the SIMD
@@ -295,7 +304,6 @@ int hv_windows_configure(u64 flags)
         return -1;
     hv_windows_flags = flags;
     hv_t8152_fast_ipi = flags & HV_WINDOWS_T8152_FAST_IPI;
-    hv_t8152_soft_gic = flags & HV_WINDOWS_T8152_SOFT_GIC;
     hv_t8152_wfi = flags & HV_WINDOWS_T8152_WFI;
     return 0;
 }
@@ -1503,6 +1511,8 @@ static void hv_init_secondary(struct hv_secondary_info_t *info)
     }
 
 #ifdef ENABLE_NATIVE_AIC_PASSTHROUGH
+    /* T8152: a CPU started by the guest OS gets a CPU interface fresh from reset. */
+    hv_t8152_gic_cpu_start();
     /* APs started by Windows inherit the post-EBS FIQ bridge policy. */
     hv_native_aic_enter_cpu();
 #elif defined(ENABLE_VGIC_MODULE)

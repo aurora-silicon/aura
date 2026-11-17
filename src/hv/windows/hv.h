@@ -34,7 +34,11 @@ void hv_windows_quarantine(void);
 #define HV_WINDOWS_CPUFREQ        BIT(5)
 /* T8152 only, after Phase 3 measurement (c): kick guest CPUs with Apple Fast IPIs. */
 #define HV_WINDOWS_T8152_FAST_IPI BIT(16)
-/* T8152 only, after Phase 3 measurement (f): the software GIC CPU interface (as T8142). */
+/*
+ * T8152: the software GIC CPU interface with every ICC_* access trapped.  Required on
+ * T8152 since Phase 3 measurement (f) (GIC_CPUIF_UNDEF in the carrier configuration,
+ * trap-all clean on every core): hv_windows_configure() refuses T8152 without it.
+ */
 #define HV_WINDOWS_T8152_SOFT_GIC BIT(17)
 /*
  * T8152: idle with a real WFI at EL2.  Refused by hv_windows_configure(): measurement (a)
@@ -48,6 +52,16 @@ u64 hv_guest_actlr_read(void);
 void hv_guest_actlr_write(u64 value);
 bool hv_fast_ipi(void);
 bool hv_soft_gic_cpuif(void);
+/*
+ * T8152 software GICv3 CPU interface (hv_exc.c): the guest OS takes the emulated GIC
+ * (claim), after which every CPU runs ICH_HCR_EL2 = En | TC | TALL0 | TALL1 with
+ * HCR_EL2.IMO/FMO set and EL2 answers every ICC_* access.  enter_cpu returns true when
+ * it programmed this CPU (owned GIC); false leaves the caller's Mu-phase routing.
+ */
+bool hv_t8152_gic_owned(void);
+void hv_t8152_gic_claim(const char *why);
+bool hv_t8152_gic_enter_cpu(bool os_phase);
+void hv_t8152_gic_cpu_start(void);
 void hv_kick_cpu(int cpu);
 /* Reset the machine only after NVMe is shut down; otherwise park (see hv.c). */
 void hv_safe_reset(const char *why) __attribute__((noreturn));

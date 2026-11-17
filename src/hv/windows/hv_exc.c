@@ -9,6 +9,7 @@
 #include "exception.h"
 #include "hv_aic_alias.h"
 #include "hv_el2_acct.h"
+#include "hv_gic_cpuif.h"
 #include "hv_vgic.h"
 #include "mtp_handoff.h"
 #include "smp.h"
@@ -2265,6 +2266,313 @@ static u32 gic_cpuif_eoi_count[MAX_CPUS];
 
 #define GIC_SPURIOUS_INTID 1023
 
+/*
+ * T8152 (J804): the software GICv3 CPU interface of hv_gic_cpuif.c, fed by
+ * direct ICC_* traps.
+ *
+ * Phase 3 measurement (f) on the M6, every core type and the boot CPU:
+ *  - with ICH_HCR_EL2 = 0 and HCR_EL2.IMO clear, ICC_IAR1_EL1 and
+ *    ICC_IGRPEN1_EL1 are UNDEFINED at EL1 (ESR_EL1 0x2000000): with IMO clear
+ *    the Group 1 registers are the physical CPU interface, and this SoC has
+ *    none (ID_AA64PFR0_EL1.GIC = 0);
+ *  - with ICH_HCR_EL2 = En | TC | TALL0 | TALL1 (0x1c01), ICH_VMCR_EL2.VENG1 and
+ *    HCR_EL2.IMO/FMO set, every ICC_* access except ICC_SRE_EL1 traps to EL2
+ *    with EC 0x18.
+ * So once the guest OS owns the emulated GIC, every vCPU runs in exactly that
+ * second configuration and EL2 answers every ICC_* register from
+ * struct gicv3_cpuif.  Per IHI 0069 the trap set is TALL1: IAR1, EOIR1,
+ * HPPIR1, BPR1, AP1Rn, IGRPEN1; TALL0: their Group 0 twins and IGRPEN0; TC:
+ * CTLR, PMR, RPR, DIR; and with IMO and FMO set the SGI generation registers
+ * (SGI1R, ASGI1R, SGI0R) trap as well.  Only PMR, CTLR, IAR1 and IGRPEN1 of
+ * those were in the measurement; the rest are trapped by the same bits.
+ *
+ * Delivery is HCR_EL2.VI, not list registers.  With TALL1 every acknowledge
+ * and EOI traps, so the hardware virtual CPU interface never sees one: a list
+ * register would hold state only this model can retire, and an LR left pending
+ * with En = 1 would keep a virtual IRQ asserted that no guest read can clear.
+ * The configuration in which the hardware would retire LRs by itself (IMO set,
+ * no TALL1) was never measured on T8152 -- the only measured untrapped Group 1
+ * access UNDEFs -- and LR delivery was already unreliable on the Apple cores of
+ * J414s (hv_aic.c).  HCR_EL2.VI is architectural (Arm ARM, HCR_EL2.VI: a
+ * virtual IRQ is pending while VI = 1 and IMO = 1) and needs nothing from the
+ * GIC.  The list registers stay zero, so ICH_HCR_EL2.En = 1 signals nothing on
+ * its own (no maintenance interrupt is enabled either).
+ *
+ * The Mu phase keeps the measured "mu" configuration (ICH_HCR_EL2 0, IMO
+ * clear) because Mu takes its own AIC interrupts natively: the J804 FD is an
+ * AIC build (AIC_BUILD = TRUE, AppleAicDxe, no ArmGicDxe) and never executes an
+ * ICC_* instruction.  The guest OS takes the GIC at Mu's ExitBootServices
+ * (AppleAicDxe clears AIC CONFIG, observed by hv_aic.c) or, if that write is
+ * not seen, at the first guest write to the emulated distributor or a
+ * redistributor (an OS initialising the GIC: IHI 0069 requires the
+ * redistributor to be woken through GICR_WAKER before its CPU interface is
+ * used).  From then on traps stay on for the rest of the guest's life.
+ */
+static struct gicv3_cpuif t8152_cpuif[MAX_CPUS];
+static struct {
+    u64 stale_cval_p;
+    u64 stale_cval_v;
+    bool stale_p;
+    bool stale_v;
+    bool brought_up;
+    bool unknown_logged;
+} t8152_cpuif_aux[MAX_CPUS];
+static bool t8152_gic_claimed;
+static bool t8152_gic_owned;
+
+#define HV_T8152_ICH_HCR_TRAPALL 0x1c01 /* ICH_HCR_EL2 En | TC | TALL0 | TALL1 (IHI 0069) */
+#define HV_T8152_ICH_VMCR_VENG1  BIT(1)
+
+static bool hv_t8152_gic(void)
+{
+    return chip_id == T8152 && hv_soft_gic_cpuif();
+}
+
+bool hv_t8152_gic_owned(void)
+{
+    return hv_t8152_gic() && __atomic_load_n(&t8152_gic_owned, __ATOMIC_ACQUIRE);
+}
+
+static u8 hv_t8152_gic_priority(void *opaque, u32 intid)
+{
+#ifdef ENABLE_VGIC_MODULE
+    /* The guest's own GICR/GICD_IPRIORITYR value for that PE's bank. */
+    return hv_vgic3_get_priority_cpu((int)(uintptr_t)opaque, intid);
+#else
+    (void)opaque;
+    (void)intid;
+    return 0;
+#endif
+}
+
+/* The measured trap-all configuration on this CPU (see above). */
+static void hv_t8152_gic_route_cpu(void)
+{
+    msr(ICH_VMCR_EL2, HV_T8152_ICH_VMCR_VENG1);
+    msr(ICH_HCR_EL2, HV_T8152_ICH_HCR_TRAPALL);
+    sysop("isb");
+    u64 hcr = mrs(HCR_EL2);
+    if ((hcr & (HCR_IMO | HCR_FMO)) != (HCR_IMO | HCR_FMO))
+        hv_write_hcr(hcr | HCR_IMO | HCR_FMO);
+}
+
+void hv_t8152_gic_claim(const char *why)
+{
+    bool expected = false;
+
+    if (!hv_t8152_gic() || __atomic_load_n(&t8152_gic_owned, __ATOMIC_ACQUIRE))
+        return;
+    if (!__atomic_compare_exchange_n(&t8152_gic_claimed, &expected, true, false, __ATOMIC_ACQ_REL,
+                                     __ATOMIC_ACQUIRE))
+        return;
+
+    /* Only the boot vCPU runs the guest before this point; the others are parked. */
+    for (u32 cpu = 0; cpu < MAX_CPUS; cpu++)
+        gicv3_cpuif_reset(&t8152_cpuif[cpu]);
+    memset(t8152_cpuif_aux, 0, sizeof(t8152_cpuif_aux));
+    __atomic_store_n(&t8152_gic_owned, true, __ATOMIC_RELEASE);
+    hv_t8152_gic_route_cpu();
+    printf("HV: T8152: guest OS owns the emulated GICv3 (%s) on CPU %d; ICC_* trapped "
+           "(ICH_HCR_EL2 0x%x), delivery by HCR_EL2.VI\n",
+           why, (int)smp_id(), HV_T8152_ICH_HCR_TRAPALL);
+}
+
+bool hv_t8152_gic_enter_cpu(bool os_phase)
+{
+    if (!hv_t8152_gic())
+        return false;
+    if (os_phase)
+        hv_t8152_gic_claim("Mu ExitBootServices");
+    if (!hv_t8152_gic_owned())
+        return false;
+    hv_t8152_gic_route_cpu();
+    return true;
+}
+
+/* PSCI CPU_ON of a guest CPU: its CPU interface starts from reset, its pending SGIs stay. */
+void hv_t8152_gic_cpu_start(void)
+{
+    u64 cpu = smp_id();
+
+    if (!hv_t8152_gic_owned() || cpu >= MAX_CPUS)
+        return;
+    gicv3_cpuif_power_on(&t8152_cpuif[cpu]);
+    t8152_cpuif_aux[cpu].brought_up = false;
+    t8152_cpuif_aux[cpu].stale_p = false;
+    t8152_cpuif_aux[cpu].stale_v = false;
+}
+
+static void hv_t8152_gic_sync_vi(void)
+{
+    u64 cpu = smp_id();
+
+    if (!hv_t8152_gic_owned() || cpu >= MAX_CPUS)
+        return;
+
+    u64 hcr = mrs(HCR_EL2);
+    int selected = gicv3_cpuif_deliverable(&t8152_cpuif[cpu], hv_t8152_gic_priority,
+                                           (void *)(uintptr_t)cpu);
+    u64 want = hcr | HCR_IMO | HCR_FMO;
+    want = selected >= 0 ? (want | HCR_VI) : (want & ~HCR_VI);
+    if (want == hcr)
+        return;
+
+    if ((want & HCR_VI) && !gic_cpuif_vi_logged[cpu]) {
+        gic_cpuif_vi_logged[cpu] = true;
+        printf("HV: T8152: raising virtual IRQ %d on CPU %d at guest pc 0x%lx spsr 0x%lx "
+               "pmr 0x%x\n",
+               selected, (int)cpu, mrs(ELR_EL2), mrs(SPSR_EL2), t8152_cpuif[cpu].pmr);
+    }
+    hv_write_hcr(want);
+}
+
+static void hv_t8152_gic_set_pending(u32 intid)
+{
+    u64 cpu = smp_id();
+
+    if (!hv_t8152_gic_owned() || cpu >= MAX_CPUS)
+        return;
+    gicv3_cpuif_set_pending(&t8152_cpuif[cpu], intid);
+    hv_t8152_gic_sync_vi();
+}
+
+/* Pend a timer PPI unless the deadline is the one inherited from firmware (as T8142). */
+static void hv_t8152_gic_timer_pend(bool physical)
+{
+    u64 cpu = smp_id();
+
+    if (!hv_t8152_gic_owned() || cpu >= MAX_CPUS)
+        return;
+
+    bool *stale = physical ? &t8152_cpuif_aux[cpu].stale_p : &t8152_cpuif_aux[cpu].stale_v;
+    if (*stale) {
+        u64 armed = physical ? mrs(CNTP_CVAL_EL02) : mrs(CNTV_CVAL_EL02);
+        u64 residue = physical ? t8152_cpuif_aux[cpu].stale_cval_p
+                               : t8152_cpuif_aux[cpu].stale_cval_v;
+        if (armed == residue)
+            return;
+        *stale = false;
+    }
+    hv_t8152_gic_set_pending(physical ? HV_VGIC_TIMER_P_INTID : HV_VGIC_TIMER_V_INTID);
+}
+
+/* ICC_SGI1R_EL1: mark the SGI pending on every target, kick the other CPUs. */
+static void hv_t8152_gic_send_sgi(u64 val)
+{
+    u32 intid = gicv3_sgi1r_intid(val);
+    int self = smp_id();
+
+    for (u16 frame = 0; frame < hv_vgic3_num_cpus(); frame++) {
+        int cpu = hv_vgic3_cpu_for_frame(frame);
+        if (cpu < 0 || cpu >= MAX_CPUS)
+            continue;
+        if (!gicv3_sgi1r_targets(val, smp_get_mpidr(cpu), cpu == self))
+            continue;
+        /* The boot CPU never sets the spin-table alive flag (see hv_gic_cpuif_send_sgi). */
+        if (cpu != self && cpu != boot_cpu_idx && !smp_is_alive(cpu))
+            continue;
+        gicv3_cpuif_set_pending(&t8152_cpuif[cpu], intid);
+        if (cpu != self)
+            hv_kick_cpu(cpu);
+    }
+}
+
+/*
+ * One trapped ICC_* access on T8152.  Every op0 3, op1 0 encoding in CRn 12,
+ * and ICC_PMR_EL1, is answered here and never reaches the proxy.
+ */
+static bool hv_handle_t8152_gic_cpuif(u64 reg, bool is_read, u64 rt, u64 regs[32])
+{
+    if (!hv_t8152_gic())
+        return false;
+
+    u32 op0 = FIELD_GET(ESR_ISS_MSR_OP0, reg);
+    u32 op1 = FIELD_GET(ESR_ISS_MSR_OP1, reg);
+    u32 crn = FIELD_GET(ESR_ISS_MSR_CRn, reg);
+    u32 crm = FIELD_GET(ESR_ISS_MSR_CRm, reg);
+    u32 op2 = FIELD_GET(ESR_ISS_MSR_OP2, reg);
+    u32 key = GICV3_CPUIF_REG(crn, crm, op2);
+    u64 cpu = smp_id();
+
+    if (op0 != 3 || op1 != 0 || (crn != 12 && key != GICV3_ICC_PMR) || cpu >= MAX_CPUS)
+        return false;
+
+    /* A trap means trap-all is on, which only an owned GIC sets; claim defensively. */
+    hv_t8152_gic_claim("trapped ICC_* access");
+
+    struct gicv3_cpuif *c = &t8152_cpuif[cpu];
+    struct gicv3_cpuif_effect fx;
+    u64 value = is_read ? 0 : regs[rt];
+
+    if (!gicv3_cpuif_access(c, hv_t8152_gic_priority, (void *)(uintptr_t)cpu, key, is_read, &value,
+                            &fx)) {
+        /* An ICC_* encoding outside the model (for example NMI acknowledge): RAZ/WI. */
+        if (!t8152_cpuif_aux[cpu].unknown_logged) {
+            t8152_cpuif_aux[cpu].unknown_logged = true;
+            printf("HV: T8152: ICC_* S3_0_C%u_C%u_%u %s on CPU %d is RAZ/WI\n", crn, crm, op2,
+                   is_read ? "read" : "write", (int)cpu);
+        }
+        value = 0;
+        fx.acknowledged = fx.deactivated = -1;
+        fx.sgi1r = fx.igrpen1_enabled = false;
+    }
+    if (is_read)
+        regs[rt] = value;
+
+    if (fx.acknowledged >= 0) {
+        gic_cpuif_ack_count[cpu]++;
+        if (!gic_cpuif_acked[cpu]) {
+            gic_cpuif_acked[cpu] = true;
+            printf("HV: T8152: guest acknowledged emulated INTID %d on CPU %d from pc 0x%lx\n",
+                   fx.acknowledged, (int)cpu, mrs(ELR_EL2));
+        }
+    }
+
+    if (fx.deactivated >= 0) {
+        u32 intid = (u32)fx.deactivated;
+
+        gic_cpuif_eoi_count[cpu]++;
+        /*
+         * As on T8142: a PPI's level comes from the timer and is re-asserted by
+         * hv_update_fiq() while CNTx_CTL.ISTATUS holds; an SPI's level lives in
+         * the AIC, whose EVENT read auto-masked the line, so completing it
+         * clears the software pending state and unmasks the line again (only a
+         * line aura owns: hv_aic_alias_is_owned()).
+         */
+        if (intid >= 32) {
+            gicv3_cpuif_clear_pending(c, intid);
+            if (hv_aic_alias_is_owned(intid))
+                aic_set_mask(hv_aic_alias_to_physical(intid), false);
+        }
+    }
+
+    if (fx.igrpen1_enabled && !t8152_cpuif_aux[cpu].brought_up) {
+        t8152_cpuif_aux[cpu].brought_up = true;
+        /*
+         * Firmware residue: an expired Mu timer deadline must not become the
+         * OS's first tick (see stale_cval_* in struct hv_gic_cpuif).  Device
+         * SPIs already pending stay pending: their AIC lines are masked until
+         * the guest completes them.
+         */
+        gicv3_cpuif_clear_pending(c, HV_VGIC_TIMER_P_INTID);
+        gicv3_cpuif_clear_pending(c, HV_VGIC_TIMER_V_INTID);
+        t8152_cpuif_aux[cpu].stale_p = hv_timer_firing(mrs(CNTP_CTL_EL02));
+        t8152_cpuif_aux[cpu].stale_v = hv_timer_firing(mrs(CNTV_CTL_EL02));
+        t8152_cpuif_aux[cpu].stale_cval_p = mrs(CNTP_CVAL_EL02);
+        t8152_cpuif_aux[cpu].stale_cval_v = mrs(CNTV_CVAL_EL02);
+        printf("HV: T8152: guest enabled emulated GIC group 1 on CPU %d (inherited timer "
+               "expiry p=%d v=%d)\n",
+               (int)cpu, t8152_cpuif_aux[cpu].stale_p, t8152_cpuif_aux[cpu].stale_v);
+    }
+
+    if (fx.sgi1r)
+        hv_t8152_gic_send_sgi(fx.sgi1r_value);
+
+    /* PMR, EOI, IGRPEN1 and ack all change what may be signalled. */
+    hv_t8152_gic_sync_vi();
+    return true;
+}
+
 static struct hv_gic_cpuif *hv_gic_cpuif_this(void)
 {
     if (!hv_soft_gic_cpuif())
@@ -2285,6 +2593,10 @@ static struct hv_gic_cpuif *hv_gic_cpuif_this(void)
  */
 static bool hv_gic_cpuif_active(void)
 {
+    /* T8152: live from the moment the guest OS owns the GIC (hv_t8152_gic_claim). */
+    if (chip_id == T8152)
+        return hv_t8152_gic_owned();
+
     struct hv_gic_cpuif *s = hv_gic_cpuif_this();
 
     return s != NULL && s->valid && s->igrpen1 != 0;
@@ -2368,6 +2680,11 @@ static int hv_gic_cpuif_select(struct hv_gic_cpuif *s)
 
 static void hv_gic_cpuif_sync_vi(void)
 {
+    if (chip_id == T8152) {
+        hv_t8152_gic_sync_vi();
+        return;
+    }
+
     struct hv_gic_cpuif *s = hv_gic_cpuif_this();
     if (s == NULL || !s->valid)
         return;
@@ -2418,6 +2735,11 @@ static void hv_gic_cpuif_sync_vi(void)
 
 static void hv_gic_cpuif_set_pending(u32 intid)
 {
+    if (chip_id == T8152) {
+        hv_t8152_gic_set_pending(intid);
+        return;
+    }
+
     struct hv_gic_cpuif *s = hv_gic_cpuif_this();
     if (s == NULL || !s->valid || intid >= HV_GIC_MAX_INTID)
         return;
@@ -2512,6 +2834,11 @@ static void hv_gic_cpuif_send_sgi(u64 val)
  */
 static void hv_gic_cpuif_timer_pend(bool physical)
 {
+    if (chip_id == T8152) {
+        hv_t8152_gic_timer_pend(physical);
+        return;
+    }
+
     struct hv_gic_cpuif *s = hv_gic_cpuif_this();
     if (s == NULL || !s->valid)
         return;
@@ -2637,7 +2964,8 @@ static bool hv_handle_native_aic_carrier_cpuif(u64 reg, bool is_read, u64 rt, u6
 
 static bool hv_handle_t8142_gic_cpuif(u64 reg, bool is_read, u64 rt, u64 regs[32], bool probe)
 {
-    if (!hv_soft_gic_cpuif())
+    /* T8152 has its own model (hv_handle_t8152_gic_cpuif). */
+    if (!hv_soft_gic_cpuif() || chip_id == T8152)
         return false;
 
     u64 cpu = smp_id();
@@ -4903,6 +5231,10 @@ static bool hv_handle_msr_unlocked(struct exc_info *ctx, u64 iss)
     if (hv_handle_software_pmu(reg, is_read, rt, regs))
         return true;
 
+    /* T8152: every ICC_* access traps (trap-all) and is answered by its own model. */
+    if (hv_handle_t8152_gic_cpuif(reg, is_read, rt, regs))
+        return true;
+
     /*
      * Direct TALL1 traps and pre-rewritten HVC sites must reach the same
      * T8142 CPU-interface owner. Otherwise a direct EOIR can complete a
@@ -5904,6 +6236,25 @@ static bool hv_handle_msr_unlocked(struct exc_info *ctx, u64 iss)
                 regs[rt] = 0;
             return true;
     }
+
+    /*
+     * T8152: the rest of the ID group 3 space.  HCR_EL2.TID3 traps reads of
+     * every op0 3, op1 0, CRn 0, CRm 1-7 encoding (Arm ARM, HCR_EL2.TID3).  The
+     * AArch64 ID registers are answered above (ID_AA64PFR0_EL1 with GIC = 1, the
+     * system-register CPU interface hv_handle_t8152_gic_cpuif() emulates; the
+     * hardware reads 0 there, measurement (f)).  What is left is the AArch32 ID
+     * block (CRm 1-3), whose values are UNKNOWN or RAZ on a core without AArch32
+     * at EL1, and unallocated encodings, which read as zero; ID_AA64FPFR0_EL1
+     * (CRm 4, op2 7) reads 0 too (no FP8 features advertised).  So all of it is
+     * RAZ, answered here rather than by the proxy, and EL2 never executes one of
+     * these encodings itself.
+     */
+    if (chip_id == T8152 && is_read && FIELD_GET(ESR_ISS_MSR_OP0, reg) == 3 &&
+        FIELD_GET(ESR_ISS_MSR_OP1, reg) == 0 && FIELD_GET(ESR_ISS_MSR_CRn, reg) == 0 &&
+        FIELD_GET(ESR_ISS_MSR_CRm, reg) >= 1 && FIELD_GET(ESR_ISS_MSR_CRm, reg) <= 7) {
+        regs[rt] = 0;
+        return true;
+    }
     return false;
 }
 
@@ -6614,6 +6965,25 @@ void hv_exc_irq(struct exc_info *ctx)
         return;
     }
 #endif
+
+    /*
+     * T8152: a device line the AIC routed to this CPU becomes pending on this
+     * CPU's software interface; EVENT already acknowledged and auto-masked it,
+     * and the guest's completion unmasks it (hv_handle_t8152_gic_cpuif).  No
+     * list register and no ICH_MISR/EISR access: nothing on T8152 uses them.
+     */
+    if (chip_id == T8152 && hv_t8152_gic_owned()) {
+        if (type == AIC_EVENT_TYPE_HW) {
+            u32 guest_irq = hv_aic_alias_to_published(irq);
+            if (!gic_cpuif_aic_logged[smp_id()]) {
+                gic_cpuif_aic_logged[smp_id()] = true;
+                printf("HV: T8152: AIC line %u -> INTID %u at EL2 on CPU %d\n", irq, guest_irq,
+                       (int)smp_id());
+            }
+            hv_gic_cpuif_set_pending(guest_irq);
+        }
+        return;
+    }
 
     u64 misr = mrs(ICH_MISR_EL2);
     u64 eisr = mrs(ICH_EISR_EL2);

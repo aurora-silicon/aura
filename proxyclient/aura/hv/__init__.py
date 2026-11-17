@@ -122,7 +122,8 @@ class HV(Reloadable):
         self.xfer_info = None
         self.windows_guest_ram = None    # T8152: (base, top) of the only guest RAM
         self.windows_ipi = "poll"        # T8152: "fast" only after Phase 3 measurement (c)
-        self.windows_gic_cpuif = "carrier"  # T8152: "software" only after measurement (f)
+        # T8152: "software" (required since measurement (f)); None picks it there, "carrier" elsewhere
+        self.windows_gic_cpuif = None
         self.windows_wfi = "poll"        # T8152: "wfi" refused (measurement (a): WFI_WIPES)
         self.windows_hidden = []
         self.pac_mask = self.PAC_MASK
@@ -1560,6 +1561,8 @@ class HV(Reloadable):
                                    T8152_CHIP, T8152_CPUS, WindowsLaunchRefused,
                                    validate_capabilities)
             self.windows_t8152 = self.adt["/chosen"].chip_id == T8152_CHIP
+            if self.windows_gic_cpuif is None:
+                self.windows_gic_cpuif = "software" if self.windows_t8152 else "carrier"
             if self.windows_t8152:
                 if self.windows_guest_ram is None:
                     raise ValueError("T8152 needs an explicit guest RAM window")

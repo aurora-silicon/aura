@@ -39,6 +39,10 @@ T8152_WFE_PLACEMENT = 0x2000
 # The resident reaches the guest's ACTLR_EL1 on T8152 only through the architectural ACTLR_EL12;
 # a resident without it writes the implementation-defined alias, which UNDEFs at EL2 there.
 T8152_ACTLR_ARCH = 0x4000
+# The resident runs a T8152 guest OS with every ICC_* access trapped to EL2 (ICH_HCR_EL2
+# En|TC|TALL0|TALL1) and a software GICv3 CPU interface (Phase 3 measurement (f):
+# GIC_CPUIF_UNDEF in the hardware-interface configuration). Without it, never run one.
+T8152_GIC_TRAPALL = 0x8000
 T8152_CPUS = 12
 CONFIG_T8142_EXPERIMENTAL = 0x0001
 CONFIG_FRAMEBUFFER_SHADOW = 0x0002
@@ -98,7 +102,7 @@ def number(value, label):
 def validate_capabilities(value, framebuffer="native", guest_compatibility="none", n1="disabled",
                           reserved_memory=False, serial="disabled", mtp="disabled", cpufreq="disabled",
                           xfer=False, ecpu_boot_state=0, t8152=False, ipi="poll",
-                          gic_cpuif="carrier"):
+                          gic_cpuif=None):
     require(isinstance(value, int) and value >> 32 == CAPS_MAGIC >> 32,
             "resident is not an explicit Windows Aura personality")
     require((value >> 16) & 0xffff == CAPS_ABI, "unsupported Windows Aura capability ABI")
@@ -129,6 +133,11 @@ def validate_capabilities(value, framebuffer="native", guest_compatibility="none
     if ecpu_boot_state:
         require(value & ECPU_BOOT_STATE and value & CONFIGURATION,
                 "resident lacks the explicit E-cluster boot state")
+    if gic_cpuif is None:
+        gic_cpuif = "software" if t8152 else "carrier"
+    if t8152:
+        require(gic_cpuif == "software", "T8152: gic_cpuif carrier is refused (measurement (f): "
+                "GIC_CPUIF_UNDEF); the software CPU interface is required")
     if t8152 or ipi != "poll" or gic_cpuif != "carrier":
         require(value & T8152_POLICY, "resident lacks the T8152 stage-2 policy; "
                 "never run a J804 guest on it")
@@ -138,6 +147,8 @@ def validate_capabilities(value, framebuffer="native", guest_compatibility="none
                 "placement rule; never run a J804 guest on it")
         require(value & T8152_ACTLR_ARCH, "resident lacks the T8152 architectural ACTLR_EL12 "
                 "rule; never run a J804 guest on it")
+        require(value & T8152_GIC_TRAPALL, "resident lacks the T8152 trapped software GIC CPU "
+                "interface; never run a J804 guest on it")
         require(value & CONFIGURATION, "resident lacks explicit Windows configuration")
     return value & 0xffff
 
@@ -436,11 +447,12 @@ T8152_HIDE_PREFIXES = ("qspi", "aop", "admac", "i2c")
 def t8152_profile_fields(profile, chip, framebuffer, compatibility, n1, mtp, reserved):
     """T8152 (J804) profile rules. Returns (guest_ram, ipi, on_reset, gic_cpuif).
 
-    ipi "fast" and gic_cpuif "software" are opt-ins for after Phase 3 measurements
-    (c) and (f); the defaults are the paths that need neither."""
+    ipi "fast" is an opt-in for after Phase 3 measurement (c). gic_cpuif is "software" on
+    T8152 (the default there; "carrier" is refused since measurement (f) found the hardware
+    CPU interface path UNDEF) and "carrier" everywhere else."""
     ipi = profile.get("ipi", "poll")
     require(ipi in ("poll", "fast"), "ipi must be poll or fast")
-    gic_cpuif = profile.get("gic_cpuif", "carrier")
+    gic_cpuif = profile.get("gic_cpuif", "software" if chip == T8152_CHIP else "carrier")
     require(gic_cpuif in ("carrier", "software"), "gic_cpuif must be carrier or software")
     on_reset = profile.get("on_reset", "stay")
     require(on_reset in ("stay", "reboot"), "on_reset must be stay or reboot")
@@ -453,6 +465,8 @@ def t8152_profile_fields(profile, chip, framebuffer, compatibility, n1, mtp, res
             "T8152 profiles must bind guest_ram {base, top}")
     base, top = number(ram["base"], "guest_ram base"), number(ram["top"], "guest_ram top")
     validate_t8152_window(base, top)
+    require(gic_cpuif == "software", "T8152 requires gic_cpuif software (measurement (f): "
+            "GIC_CPUIF_UNDEF in the hardware CPU interface configuration)")
     require(framebuffer == "bgra-shadow", "T8152 requires framebuffer bgra-shadow")
     require(compatibility == "none", "T8152 requires guest_compatibility none")
     require(n1 == "disabled" and mtp == "disabled", "T8152 has no N1 or MTP handoff")

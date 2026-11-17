@@ -31,7 +31,8 @@ QSPI = 0x2b0000000
 VALID = 1
 CAPS = (windows.CAPS_MAGIC | 1 << 16 | windows.REQUIRED_CAPS | windows.CONFIGURATION |
         windows.FRAMEBUFFER_SHADOW | windows.SERIAL_CDC_ISOLATED | windows.T8152_POLICY |
-        windows.T8152_LIVE_CPUS | windows.T8152_WFE_PLACEMENT | windows.T8152_ACTLR_ARCH)
+        windows.T8152_LIVE_CPUS | windows.T8152_WFE_PLACEMENT | windows.T8152_ACTLR_ARCH |
+        windows.T8152_GIC_TRAPALL)
 
 
 def u64_pair(node, name, value):
@@ -106,9 +107,12 @@ def run(case="success"):
             if case == "no-live-cpu-refusal":
                 return CAPS & ~(windows.T8152_LIVE_CPUS | windows.T8152_WFE_PLACEMENT)
             if case == "no-wfe-trap":
-                return CAPS & ~(windows.T8152_WFE_PLACEMENT | windows.T8152_ACTLR_ARCH)
+                return CAPS & ~(windows.T8152_WFE_PLACEMENT | windows.T8152_ACTLR_ARCH |
+                                windows.T8152_GIC_TRAPALL)
             if case == "apple-actlr":
-                return CAPS & ~windows.T8152_ACTLR_ARCH
+                return CAPS & ~(windows.T8152_ACTLR_ARCH | windows.T8152_GIC_TRAPALL)
+            if case == "hardware-gic-cpuif":
+                return CAPS & ~windows.T8152_GIC_TRAPALL
             return CAPS
 
         def smp_is_alive(self, cpu):
@@ -178,6 +182,8 @@ def run(case="success"):
         hv.windows_guest_ram = None
     if case == "wfi":
         hv.windows_wfi = "wfi"
+    if case == "carrier-cpuif":
+        hv.windows_gic_cpuif = "carrier"
     hv.init()
     payload = bytes(range(256)) * 64
     hv.load_raw(payload, 0)
@@ -200,8 +206,9 @@ def test_t8152_host_maps_only_the_window_and_the_aic():
     assert not any(pa <= QSPI < pa + size for ipa, pa, size in hw)
     config = next(t for t in r.trace if isinstance(t, tuple) and t[0] == "config")
     assert config[1] & windows.CONFIG_FRAMEBUFFER_SHADOW
-    assert not config[1] & (windows.CONFIG_T8152_FAST_IPI | windows.CONFIG_T8152_SOFT_GIC |
-                            windows.CONFIG_T8152_WFI)
+    # B1: the software GIC CPU interface is always requested on T8152 (measurement (f)).
+    assert config[1] & windows.CONFIG_T8152_SOFT_GIC
+    assert not config[1] & (windows.CONFIG_T8152_FAST_IPI | windows.CONFIG_T8152_WFI)
 
 
 def test_t8152_guest_placement_and_adt():
@@ -230,6 +237,8 @@ def test_t8152_guest_placement_and_adt():
     ("no-live-cpu-refusal", "12-live-CPU refusal"),
     ("no-wfe-trap", "guest-WFE trap and code placement"),
     ("apple-actlr", "architectural ACTLR_EL12"),
+    ("hardware-gic-cpuif", "trapped software GIC CPU interface"),
+    ("carrier-cpuif", "GIC_CPUIF_UNDEF"),
     ("cpu-missing", r"only 11 of 12 CPUs .*not live: \[9\]"),
     ("secondaries-not-started", "only 1 of 12 CPUs"),
     ("wfi", "WFI_WIPES"),

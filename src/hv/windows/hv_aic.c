@@ -185,6 +185,16 @@ void hv_native_aic_enter_cpu(void)
     for (u32 lr = 0; lr < hv_vgic3_num_lrs(); ++lr)
         hv_vgic3_write_lr(lr, 0);
 
+    /*
+     * T8152: once the guest OS owns the emulated GIC (from Mu's
+     * ExitBootServices on), every CPU runs the measured trap-all configuration
+     * and the software CPU interface instead of the startup carrier below
+     * (hv_exc.c, hv_t8152_gic_claim).  Before that, the Mu phase takes the
+     * unchanged path: ICH_HCR_EL2 0, HCR_EL2.IMO clear.
+     */
+    if (hv_t8152_gic_enter_cpu(startup_carrier))
+        return;
+
     if (startup_carrier) {
         /*
          * Apple implements the EL2 list registers, but carrier LR behavior is
@@ -335,6 +345,23 @@ bool hv_native_aic_windows_controller_ready(const char *source)
 
     if (!__atomic_load_n(&native_aic_active, __ATOMIC_ACQUIRE) || !hv_native_aic_windows_active())
         return false;
+
+    /*
+     * T8152 publishes no AIC CSRT, so no native AIC HAL extension exists there:
+     * the guest drives the emulated GICv3, and handing it the AIC would clear
+     * HCR_EL2.IMO under an OS that expects GIC delivery.  Keep the software
+     * CPU interface.
+     */
+    if (hv_t8152_gic_owned()) {
+        static bool refused_logged;
+        if (!refused_logged) {
+            refused_logged = true;
+            printf("HV: T8152: native AIC handoff (%s) ignored; the guest drives the emulated "
+                   "GICv3\n",
+                   source);
+        }
+        return false;
+    }
 
     /*
      * Claim separately from publishing.  The ordering below is the CONFIG

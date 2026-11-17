@@ -94,7 +94,34 @@ FWB is clear, stage 2 and the SMC trap are on, `framebuffer=bgra-shadow` is sele
   UTRSTAT/UFSTAT. A resident from before this rule still gets no interrupt from the launcher.
 - IPIs: polling by default (1 kHz secondary tick drains queued guest IPIs and vSGIs).
   Apple Fast IPIs only with the launcher's `ipi: fast`, after Phase 3 measurement (c).
-- The software GIC CPU interface (as T8142) only with `gic_cpuif: software`, after (f).
+- GIC CPU interface: always the software one, with every `ICC_*` access trapped
+  (`hv_gic_cpuif.c`, glue `hv_handle_t8152_gic_cpuif()` in `hv_exc.c`). Phase 3
+  measurement (f) found `ICC_IAR1_EL1` and `ICC_IGRPEN1_EL1` UNDEFINED at EL1 in the
+  hardware-interface configuration (`ICH_HCR_EL2` 0, `HCR_EL2.IMO` clear) and every access
+  but `ICC_SRE_EL1` trapping to EL2 (EC 0x18) with `ICH_HCR_EL2` = En | TC | TALL0 | TALL1
+  (0x1c01), `ICH_VMCR_EL2.VENG1` and IMO/FMO set, on E, P and M cores and the boot CPU.
+  - Mu keeps the measured Mu configuration (`ICH_HCR_EL2` 0, IMO clear): the J804 FD is an
+    AIC build (AppleAicDxe, no ArmGicDxe) and executes no `ICC_*` instruction.
+  - The guest OS owns the GIC from Mu's ExitBootServices (AIC CONFIG cleared) or, failing
+    that, from its first write to the emulated distributor or a redistributor. From then on
+    every CPU (and every CPU the guest starts later) runs the trap-all configuration above.
+  - EL2 emulates PMR, CTLR (EOImode, CBPR), BPR0/1, IGRPEN0/1, IAR1, EOIR1, DIR, HPPIR1, RPR,
+    AP0R0/AP1R0 (5 priority and preemption bits, as `ICH_VTR_EL2` reports), SGI1R; Group 0
+    reads spurious and SGI0R/ASGI1R generate nothing (Group 0 would be FIQ). Running
+    priority and nested preemption follow IHI 0069.
+  - Delivery is `HCR_EL2.VI` from the model; no list register is written (they stay zero),
+    and no `ICH_MISR_EL2`/`ICH_EISR_EL2` read happens on T8152. Device SPIs: the AIC EVENT
+    read marks the INTID pending on the target CPU's interface; the guest's EOI unmasks the
+    line. Timers: the Apple timer FIQ is masked and GTDT PPI 17/18 pended, as on T8142.
+    SGIs: `ICC_SGI1R_EL1` pends on each target and kicks it.
+  - `ID_AA64PFR0_EL1.GIC` reads 1 to the guest (TID3; the hardware reads 0). On T8152 the
+    rest of the TID3 space (AArch32 ID block, unallocated encodings, `ID_AA64FPFR0_EL1`)
+    reads 0 at EL2 instead of going to the proxy.
+  - The native AIC handoff (an AIC HAL extension's ready call) is ignored once the guest
+    owns the GIC: J804 publishes no AIC CSRT.
+  - Capability bit 15 (0x8000) marks such a resident; the launcher requires it on T8152 and
+    refuses `gic_cpuif: carrier` there, and the resident's configure step refuses a T8152
+    configuration without the software-interface bit.
 - ECV is not used until measurement (e); the architectural PMU stays trapped to the
   synthetic EL2 backend.
 - `usb_hpm_restore_irqs()` is skipped: nothing writes to the USB-C port controllers.
@@ -113,10 +140,10 @@ FWB is clear, stage 2 and the SMC trap are on, `framebuffer=bgra-shadow` is sele
 
 - Profiles for chip 0x8152 must bind `guest_ram {base, top}` and use `bgra-shadow`; they
   take no `reserved_memory`, N1 or MTP. Optional: `ipi` (`poll`/`fast`), `gic_cpuif`
-  (`carrier`/`software`), `wfi` (`poll` only), `on_reset` (`stay`/`reboot`).
+  (`software` only, the default), `wfi` (`poll` only), `on_reset` (`stay`/`reboot`).
 - A resident must report capability bits 0x0800 (T8152 policy), 0x1000 (12-live-CPU
-  refusal), 0x2000 (guest-WFE trap and code placement) and 0x4000 (architectural
-  `ACTLR_EL12` only) for any of this.
+  refusal), 0x2000 (guest-WFE trap and code placement), 0x4000 (architectural
+  `ACTLR_EL12` only) and 0x8000 (trapped software GIC CPU interface) for any of this.
 - Before `hv_init`, the launcher reads `P_SMP_IS_ALIVE` for cpu0-11 (read-only) and stops
   with the list of CPUs that are not live; the resident checks the same again.
 - The guest ADT drops `qspi`, `i2c*`, `aop*`, `admac*`, `*audio*` and every `nvram,nor`

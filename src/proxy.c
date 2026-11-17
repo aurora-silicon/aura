@@ -636,8 +636,10 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
             /* Bit 13 (0x2000): HvXfer bulk channel, P_HV_MAP_XFER.
              * Bit 14 (0x4000): explicit J813 E boot state, P_HV_WINDOWS_ECPU_BOOT_STATE.
              * Bit 11 also stands for the T8152 stage-2 policy, guest RAM window op and T8152
-             * Fast IPI opt-in until the T8152 bits move to CAPS2. */
-            reply->retval = 0x4157494e00017fffULL;
+             * Fast IPI opt-in, bits 12-14 for the other T8152 rules, until the T8152 bits
+             * move to CAPS2.
+             * Bit 15: T8152 runs the guest OS with every ICC_* access trapped. */
+            reply->retval = 0x4157494e0001ffffULL;
 #else
             reply->retval = 0;
 #endif
