@@ -101,6 +101,7 @@ class HV(Reloadable):
         self.windows_guest_compatibility = "none"
         self.windows_abort_reason = None
         self.windows_usb = "disabled"
+        self.windows_gpu = "off"
         self.windows_usb_removed = []
         self.windows_n1 = "disabled"
         self.windows_mtp = "disabled"
@@ -2027,6 +2028,24 @@ class HV(Reloadable):
         except ValueError:
             chosen._properties.pop(USB_HANDSHAKE_PROPERTY, None)
             chosen._types.pop(USB_HANDSHAKE_PROPERTY, None)
+            raise
+
+    def set_windows_gpu_handshake(self, value):
+        """G0: after the resident's ADMIT returned 0, add /chosen/aura,windows-gpu-v1 (16 bytes,
+        aura.windows.gpu_handshake: handoff page IPA and size) so Mu publishes GPU0."""
+        from ..windows import GPU_HANDSHAKE_PROPERTY, GPU_HANDSHAKE_SIZE
+        if not self.windows or self.windows_gpu == "off":
+            raise ValueError("the GPU handshake needs a Windows launch with --windows-gpu")
+        if not isinstance(value, bytes) or len(value) != GPU_HANDSHAKE_SIZE:
+            raise ValueError("the GPU handshake is 16 bytes")
+        chosen = self.adt["/chosen"]
+        chosen._properties[GPU_HANDSHAKE_PROPERTY] = value
+        chosen._types[GPU_HANDSHAKE_PROPERTY] = (Bytes(len(value)), False)
+        try:
+            self._windows_adt_blob()
+        except ValueError:
+            chosen._properties.pop(GPU_HANDSHAKE_PROPERTY, None)
+            chosen._types.pop(GPU_HANDSHAKE_PROPERTY, None)
             raise
 
     def _hide_windows_t8152_nodes(self):

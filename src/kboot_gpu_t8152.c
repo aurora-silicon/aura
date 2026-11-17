@@ -8,26 +8,35 @@
 #include "utils.h"
 #include "xnuboot.h"
 
+#include "hv/windows/gpu_t8152_admit.h"
 #include "libfdt/libfdt.h"
 
 extern void aura_sha256(const void *data, size_t size, u8 digest[32]);
 
-struct gpu_profile {
-    const char *role, *uuid;
-    u32 text_size, patchbay;
-    u8 digest[32];
-};
+/* struct gpu_profile and struct gpu_tlv are shared with the carrier's admission port. */
 struct gpu_build {
     /* /chosen receipt the Linux driver maps to this build's InitData layout. */
     const char *receipt;
     struct gpu_profile profiles[2];
 };
-struct gpu_tlv {
-    char tag[5];
-    u32 size;
-    bool exclude;
-};
 #include "kboot_gpu_t8152_profile.h"
+
+/* The carrier's G0 admission (hv/windows/hv_gpu.c) checks the same J804 identities. */
+const struct gpu_profile *gpu_t8152_j804_profiles(void)
+{
+#if J804_GPU_PROFILES_AVAILABLE
+    static const struct gpu_profile profiles_j804[2] = {J804_GPU_PROFILES};
+    return profiles_j804;
+#else
+    return NULL; /* no private J804 profile in this build: the carrier's ADMIT refuses */
+#endif
+}
+
+const struct gpu_tlv *gpu_t8152_tlvs(u32 *count)
+{
+    *count = ARRAY_SIZE(tlvs);
+    return tlvs;
+}
 
 static const struct {
     const char *adt, *fdt, *name;

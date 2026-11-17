@@ -1060,6 +1060,85 @@ def describe_usb_attach(result):
     return "attached" if value == 0 else USB_ERRORS.get(value, f"error {value}")
 
 
+# ---- G0: GPU admission and logging hooks (src/hv/windows/hv_gpu.h) ----------------------------
+#
+# Off by default.  "admit" runs the resident's admission port once (both firmware identities
+# against the live ADT, the range table, the firmware classes, the read-only handoff page);
+# "log" also puts read-as-zero / write-ignored logging hooks on the sgx window and the
+# post-office page.  Neither powers the GPU, starts its firmware, passes a register through or
+# publishes an interrupt.  Mu's GPU0 node is described by the handoff page, which the 16-byte
+# /chosen/aura,windows-gpu-v1 handshake points at; it is written only after ADMIT returned 0.
+# Contract: windows-m6/G0-CARRIER-CONTRACT.md.
+CAPS2_GPU = 0x0004                        # G0 GPU admission v1
+GPU_MODES = ("off", "admit", "log")
+GPU_OP_ADMIT, GPU_OP_HOOK, GPU_OP_STATUS = 1, 2, 3
+GPU_STATUS_STATE, GPU_STATUS_HANDOFF_IPA, GPU_STATUS_HANDOFF_SIZE = 0, 1, 2
+GPU_STATUS_RANGES, GPU_STATUS_ACCESSES, GPU_STATUS_MAILBOX_GFX = 3, 4, 5
+GPU_STATUS_CLASS = 0x100
+GPU_CLASSES = ("none", "sgx", "sgx-hole", "asc-ctrl", "asc", "iop-vbar", "mailbox", "fw-rw",
+               "fw-ro", "fw-text", "pool", "handoff")
+GPU_ERRORS = {-1: "not T8152, the policy is not armed, no guest RAM, the guest already entered, "
+                  "ADMIT already ran this carrier session, or HOOK before ADMIT",
+              -2: "the pool is not 32 MiB aligned inside guest RAM (nothing was spent)",
+              -3: "the admission refused (firmware identity, ADT shape or layout)",
+              -4: "the range table does not fit or breaks a rule",
+              -5: "the stage-2 policy refused a firmware class, or a map or hook failed",
+              -6: "no memory for the handoff page"}
+GPU_HANDSHAKE_PROPERTY = "aura,windows-gpu-v1"
+GPU_HANDSHAKE_SIZE = 16
+GPU_HANDSHAKE_FORMAT = "<QQ"     # handoff page IPA, handoff page size
+GPU_HANDOFF_SIZE = 0x4000
+GPU_POOL_ALIGN = 32 << 20
+
+
+def parse_windows_gpu(value):
+    """--windows-gpu: off (or disabled), admit or log."""
+    require(isinstance(value, str), "--windows-gpu takes off, admit or log")
+    text = value.strip().lower()
+    if text in ("off", "disabled"):
+        return "off"
+    require(text in GPU_MODES, f"--windows-gpu: unknown mode {value!r} (off, admit, log)")
+    return text
+
+
+def validate_gpu_request(mode, chip, board, caps2):
+    """Before anything is uploaded: the chip, the board and the resident's CAPS2 bit 2."""
+    if mode == "off":
+        return
+    require(chip == T8152_CHIP, "--windows-gpu is a T8152 (J804) option")
+    require(board == J804_BOARD_ID, f"--windows-gpu needs the J804 board (0x22), not {board:#x}")
+    require(isinstance(caps2, int) and caps2 >> 32 == CAPS2_MAGIC >> 32 and caps2 & CAPS2_GPU,
+            "the resident has no G0 GPU admission (P_HV_WINDOWS_CAPS2 bit 2): rebuild the "
+            "carrier at or after the G0 commit")
+
+
+def gpu_pool(ram_base, ram_top, mib):
+    """The GPU pool: the top `mib` MiB of guest RAM, 32 MiB aligned, at most half of it."""
+    require(isinstance(mib, int) and mib > 0 and mib % 32 == 0,
+            f"--windows-gpu-pool-mib {mib!r} must be a positive multiple of 32")
+    size = mib << 20
+    require(ram_top % GPU_POOL_ALIGN == 0, f"guest RAM top {ram_top:#x} is not 32 MiB aligned")
+    require(size <= (ram_top - ram_base) // 2, f"a {mib} MiB pool is more than half of guest RAM "
+            f"[{ram_base:#x}, {ram_top:#x})")
+    return ram_top - size, size
+
+
+def gpu_handshake(ipa, size):
+    """/chosen/aura,windows-gpu-v1 for Mu's GPU0 node: where the read-only handoff page is."""
+    require(isinstance(ipa, int) and 0 < ipa < (1 << 64) - 1 and ipa % GPU_HANDOFF_SIZE == 0,
+            f"the resident reported no 16 KiB-aligned handoff page ({ipa!r})")
+    require(size == GPU_HANDOFF_SIZE, f"the handoff page is {size!r} bytes, not 16 KiB")
+    value = struct.pack(GPU_HANDSHAKE_FORMAT, ipa, size)
+    assert len(value) == GPU_HANDSHAKE_SIZE
+    return value
+
+
+def describe_gpu(result):
+    """P_HV_WINDOWS_GPU ADMIT/HOOK answer as text (0 is success)."""
+    value = result - (1 << 64) if result >= 1 << 63 else result
+    return "ok" if value == 0 else GPU_ERRORS.get(value, f"error {value}")
+
+
 def _aligned(value, alignment):
     return (value + alignment - 1) & -alignment
 

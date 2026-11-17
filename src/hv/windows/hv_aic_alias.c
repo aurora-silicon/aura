@@ -74,34 +74,94 @@ static const struct hv_aic_alias hv_aic_aliases_t8152_usb[] = {
     {997, 1834}, /* usb-drd3: right USB-C, dwc3 xHCI */
 };
 /*
- * The live table: one fixed slot per port, a withdrawn slot holds ~0 in both fields (never an
- * INTID or an AIC line).  Slots are rewritten in place, published number last on the way in
- * and first on the way out, so a CPU reading the table while the storm guard in hv_usb.c
- * withdraws one port never sees an entry move or a half-built one claim ownership.
+ * G0 (WINDOWS-GPU-PLAN.md): four slots for the GPU ASC lines, the two ADT `interrupts` of
+ * gfx-asc and of gfx1-asc, lifted at run time by the admission (gpu_t8152_admit.c), never
+ * compiled in.  They are below 1020, so each is published under its own number; a slot still
+ * makes the line owned, which identity-on-miss never does.  Nothing in G0 makes them live:
+ * completion is polled until a later milestone publishes them (hv_aic_alias_t8152_gpu).
+ */
+#define T8152_GPU_SLOTS 4
+#define T8152_GPU_SLOT0 ARRAY_SIZE(hv_aic_aliases_t8152_usb)
+
+/*
+ * The live table: one fixed slot per USB port, then the GPU slots; a withdrawn slot holds ~0
+ * in both fields (never an INTID or an AIC line).  Slots are rewritten in place, published
+ * number last on the way in and first on the way out, so a CPU reading the table while the
+ * storm guard in hv_usb.c withdraws one port never sees an entry move or a half-built one
+ * claim ownership.
  */
 #define T8152_ALIAS_NONE 0xffffffffu
-static struct hv_aic_alias hv_aic_aliases_t8152[ARRAY_SIZE(hv_aic_aliases_t8152_usb)] = {
-    {T8152_ALIAS_NONE, T8152_ALIAS_NONE},
-    {T8152_ALIAS_NONE, T8152_ALIAS_NONE},
+static struct hv_aic_alias
+    hv_aic_aliases_t8152[ARRAY_SIZE(hv_aic_aliases_t8152_usb) + T8152_GPU_SLOTS] = {
+        {T8152_ALIAS_NONE, T8152_ALIAS_NONE}, {T8152_ALIAS_NONE, T8152_ALIAS_NONE},
+        {T8152_ALIAS_NONE, T8152_ALIAS_NONE}, {T8152_ALIAS_NONE, T8152_ALIAS_NONE},
+        {T8152_ALIAS_NONE, T8152_ALIAS_NONE}, {T8152_ALIAS_NONE, T8152_ALIAS_NONE},
 };
 
-static void t8152_alias_slot(u32 slot, bool live)
+static void t8152_alias_set(u32 slot, u32 published, u32 physical, bool live)
 {
     struct hv_aic_alias *e = &hv_aic_aliases_t8152[slot];
     if (live) {
-        __atomic_store_n(&e->physical, hv_aic_aliases_t8152_usb[slot].physical, __ATOMIC_RELEASE);
-        __atomic_store_n(&e->published, hv_aic_aliases_t8152_usb[slot].published,
-                         __ATOMIC_RELEASE);
+        __atomic_store_n(&e->physical, physical, __ATOMIC_RELEASE);
+        __atomic_store_n(&e->published, published, __ATOMIC_RELEASE);
     } else {
         __atomic_store_n(&e->published, T8152_ALIAS_NONE, __ATOMIC_RELEASE);
         __atomic_store_n(&e->physical, T8152_ALIAS_NONE, __ATOMIC_RELEASE);
     }
 }
 
+static void t8152_alias_slot(u32 slot, bool live)
+{
+    t8152_alias_set(slot, hv_aic_aliases_t8152_usb[slot].published,
+                    hv_aic_aliases_t8152_usb[slot].physical, live);
+}
+
 void hv_aic_alias_t8152_usb(u32 port_mask)
 {
     t8152_alias_slot(0, port_mask & BIT(1));
     t8152_alias_slot(1, port_mask & BIT(3));
+}
+
+/*
+ * The block the carrier keeps for its own published numbers: the virtual AHCI SPI and the
+ * USB/ANS aliases all sit in it (see above), and nothing physical may be published there.
+ */
+#define T8152_CARRIER_SPI_LO 980
+#define T8152_CARRIER_SPI_HI 1000
+
+/*
+ * A GPU line may be published under its own number only if Windows' arbiter accepts it
+ * ([32, 1020)), it is outside the carrier's block and none of the USB alias lines, and the
+ * four are distinct.
+ */
+static bool t8152_gpu_line_ok(const u32 lines[T8152_GPU_SLOTS], u32 i)
+{
+    u32 l = lines[i];
+    if (l < 32 || l >= 1020 || (l >= T8152_CARRIER_SPI_LO && l < T8152_CARRIER_SPI_HI))
+        return false;
+    for (u32 k = 0; k < ARRAY_SIZE(hv_aic_aliases_t8152_usb); k++)
+        if (l == hv_aic_aliases_t8152_usb[k].physical)
+            return false;
+    for (u32 k = 0; k < i; k++)
+        if (l == lines[k])
+            return false;
+    return true;
+}
+
+int hv_aic_alias_t8152_gpu(const u32 lines[4], bool live)
+{
+    for (u32 i = 0; i < T8152_GPU_SLOTS; i++)
+        t8152_alias_set(T8152_GPU_SLOT0 + i, 0, 0, false);
+    if (!live)
+        return 0;
+    if (chip_id != T8152)
+        return -1;
+    for (u32 i = 0; i < T8152_GPU_SLOTS; i++)
+        if (!t8152_gpu_line_ok(lines, i))
+            return -1;
+    for (u32 i = 0; i < T8152_GPU_SLOTS; i++)
+        t8152_alias_set(T8152_GPU_SLOT0 + i, lines[i], lines[i], true);
+    return 0;
 }
 
 static const struct hv_aic_alias *hv_aic_alias_table(u32 *count)
@@ -122,6 +182,7 @@ static const struct hv_aic_alias *hv_aic_alias_table(u32 *count)
      *
      *   M4  996 -> 1349  ans (NVMe), the line the J804 DTS uses
      *   D4  995 -> 1692  usb-drd1, 997 -> 1834  usb-drd3 (live now, attach-gated)
+     *   G0  the four GPU ASC lines under their own numbers (slots only; not live in G0)
      *   M7  MTP 1500/1501
      *
      * Re-run the free-line walk on the live ADT before each run.  A published

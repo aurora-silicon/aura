@@ -9,6 +9,7 @@
 
 #include "exception.h"
 #include "hv_ahci.h"
+#include "hv_gpu.h"
 #include "hv_t8152.h"
 #include "hv_usb.h"
 #include "iodev.h"

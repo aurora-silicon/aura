@@ -951,7 +951,7 @@ def test_configure_proxy_and_build_agree():
     assert (w.USB_GSIV[1], w.USB_GSIV[3]) == (995, 997)
     assert "#define HV_USB_GSIV_DRD1 995u" in hdr and "#define HV_USB_GSIV_DRD3 997u" in hdr
     makefile = (REPO / "Makefile").read_text()
-    assert "hv_fatal.o hv_usb.o hv_usb_dart.o)" in makefile
+    assert "hv_fatal.o hv_usb.o hv_usb_dart.o" in makefile
 
 
 def test_clean_room_headers():

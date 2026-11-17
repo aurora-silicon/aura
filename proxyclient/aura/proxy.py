@@ -802,6 +802,7 @@ class AuraProxy(Reloadable):
     P_HV_WINDOWS_CAPS2 = 0xc8d
     P_HV_WINDOWS_AHCI = 0xc8e
     P_HV_WINDOWS_USB = 0xc87
+    P_HV_WINDOWS_GPU = 0xc88
 
     P_FB_INIT = 0xd00
     P_FB_SHUTDOWN = 0xd01
@@ -1352,6 +1353,11 @@ class AuraProxy(Reloadable):
         """D4 USB passthrough (src/hv/windows/hv_usb.h): ATTACH(port mask), STATUS(port,
         index), DETACH.  ATTACH returns 0 or a negative reason (signed)."""
         return self.request(self.P_HV_WINDOWS_USB, op, a1, a2, signed=op == 1)
+
+    def hv_windows_gpu(self, op, a1=0, a2=0):
+        """G0 GPU (src/hv/windows/hv_gpu.h): ADMIT(pool base, pool size), HOOK, STATUS(index).
+        ADMIT and HOOK return 0 or a negative reason (signed)."""
+        return self.request(self.P_HV_WINDOWS_GPU, op, a1, a2, signed=op in (1, 2))
 
     def fb_init(self):
         return self.request(self.P_FB_INIT)

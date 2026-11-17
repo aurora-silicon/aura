@@ -75,4 +75,11 @@ bool hv_aic_alias_lookup_physical(u32 physical, u32 *published);
  */
 void hv_aic_alias_t8152_usb(u32 port_mask);
 
+/*
+ * T8152 G0: the GPU ASC lines (gfx-asc, gfx1-asc ADT interrupts, in that order) published
+ * under their own numbers while live; false withdraws them.  -1 (all four withdrawn) for a
+ * line outside [32, 1020), a carrier virtual SPI, a USB line or a repeat.  Not called in G0.
+ */
+int hv_aic_alias_t8152_gpu(const u32 lines[4], bool live);
+
 #endif

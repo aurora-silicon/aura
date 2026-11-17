@@ -31,9 +31,17 @@
 #define T8152_MIN_GUEST     (256UL << 20)
 #define T8152_MAX_DENY      640
 #define T8152_MAX_NODE_REGS 1024 /* per node; J804 pmgr-child has 64, error-handler 120 */
-#define T8152_MAX_ALLOW     8
-/* AIC, usb-drd1 xHCI, usb-drd3 xHCI (D4), one spare */
-#define T8152_MAX_MMIO      4
+/*
+ * Carrier exceptions: the BGRA shadow, the ADT, and G0's GPU entries (eight admitted firmware
+ * regions, the handoff page), with room for what G1/G2 add.
+ */
+#define T8152_MAX_ALLOW     24
+/*
+ * AIC, usb-drd1 xHCI, usb-drd3 xHCI (D4), and room for G1's measured sgx sub-ranges and ASC
+ * wrapper pages (16 KiB granular, so each nested hole splits a window; WINDOWS-GPU-PLAN.md
+ * critic correction 1).
+ */
+#define T8152_MAX_MMIO      32
 /*
  * D4: the xHCI register file at the start of a usb-drd node's reg 0 (dwc3 core.h
  * DWC3_XHCI_REGS_START/END 0x0..0x7fff; the dwc3 globals start at +0xc100).  Two 16 KiB pages.
@@ -474,6 +482,27 @@ int hv_t8152_preflight(void)
     return 0;
 }
 
+/* CTXR_A-D and CTRR_C-D: the ranges the boot chain locked; nothing of the guest's may touch them. */
+static int ctxr_conflicts(u64 base, u64 top, const char *what)
+{
+    static const struct {
+        enum ctxr_range id;
+        const char *name;
+    } ctxr[] = {
+        {CTXR_RANGE_A, "CTXR_A"}, {CTXR_RANGE_B, "CTXR_B"}, {CTXR_RANGE_C, "CTXR_C"},
+        {CTXR_RANGE_D, "CTXR_D"}, {CTRR_RANGE_C, "CTRR_C"}, {CTRR_RANGE_D, "CTRR_D"},
+    };
+    int bad = 0;
+    for (unsigned int i = 0; i < ARRAY_SIZE(ctxr); i++) {
+        u64 s, e;
+        if (ctxr_range(ctxr[i].id, &s, &e) && overlaps(base, top, s, e)) {
+            printf("HV: T8152: %s overlaps %s [0x%lx, 0x%lx)\n", what, ctxr[i].name, s, e);
+            bad++;
+        }
+    }
+    return bad;
+}
+
 static int ram_conflicts(u64 base, u64 top, u64 host_top)
 {
     int bad = 0;
@@ -516,20 +545,7 @@ static int ram_conflicts(u64 base, u64 top, u64 host_top)
         }
     }
 
-    static const struct {
-        enum ctxr_range id;
-        const char *name;
-    } ctxr[] = {
-        {CTXR_RANGE_A, "CTXR_A"}, {CTXR_RANGE_B, "CTXR_B"}, {CTXR_RANGE_C, "CTXR_C"},
-        {CTXR_RANGE_D, "CTXR_D"}, {CTRR_RANGE_C, "CTRR_C"}, {CTRR_RANGE_D, "CTRR_D"},
-    };
-    for (unsigned int i = 0; i < ARRAY_SIZE(ctxr); i++) {
-        u64 s, e;
-        if (ctxr_range(ctxr[i].id, &s, &e) && overlaps(base, top, s, e)) {
-            printf("HV: T8152: guest RAM overlaps %s [0x%lx, 0x%lx)\n", ctxr[i].name, s, e);
-            bad++;
-        }
-    }
+    bad += ctxr_conflicts(base, top, "guest RAM");
 
     /*
      * aura's heap may still grow up to its limit, and the launcher's own heap
@@ -660,6 +676,70 @@ int hv_t8152_allow(u64 ipa, u64 pa, u64 size, bool read_only, const char *name)
     allow[allow_count++] = (struct t8152_allow){ipa, pa, end, read_only, name};
     printf("HV: T8152: exception %s IPA 0x%lx -> [0x%lx, 0x%lx)%s\n", name, ipa, pa, end,
            read_only ? " read-only" : "");
+    return 0;
+}
+
+/*
+ * G0: one region of the admitted GPU firmware carve-out (gpu_t8152_admit.c), the only kind of
+ * exception that lies outside boot_args RAM: iBoot placed the UAT regions above it and the ASC
+ * __DATA segments below it.  Identity only (IPA = PA), registered, never mapped here.  The
+ * region must be 16 KiB aligned, inside DRAM [dram_lo, dram_hi) as /chosen gives it, entirely
+ * outside boot_args RAM, and clear of CTXR_A-D, CTRR_C-D, the denylist and guest RAM.
+ */
+int hv_t8152_gpu_fw_allow(u64 pa, u64 size, bool read_only, u64 dram_lo, u64 dram_hi,
+                          const char *name)
+{
+    if (!armed || !ram_set) {
+        printf("HV: T8152: GPU firmware %s refused: the policy is not armed or guest RAM is not "
+               "set\n",
+               name);
+        return -1;
+    }
+    u64 end = pa + size;
+    const struct t8152_range *hit = NULL;
+    if (!size || pa > UINT64_MAX - size || (pa | size) & (T8152_PAGE - 1) ||
+        !inside(pa, end, dram_lo, dram_hi) || overlaps(pa, end, dram_start, dram_end) ||
+        overlaps(pa, end, ram_start, ram_end) || (hit = deny_hit(pa, end)) ||
+        ctxr_conflicts(pa, end, name) || allow_count >= T8152_MAX_ALLOW) {
+        printf("HV: T8152: GPU firmware %s [0x%lx, 0x%lx) refused: it must be 16 KiB aligned "
+               "DRAM [0x%lx, 0x%lx) outside boot_args RAM [0x%lx, 0x%lx), clear of CTXR/CTRR "
+               "and the denylist%s%s (%u of %d exceptions used)\n",
+               name, pa, end, dram_lo, dram_hi, dram_start, dram_end, hit ? "; hits " : "",
+               hit ? hit->name : "", allow_count, T8152_MAX_ALLOW);
+        return -1;
+    }
+    allow[allow_count++] = (struct t8152_allow){pa, pa, end, read_only, name};
+    printf("HV: T8152: GPU firmware %s [0x%lx, 0x%lx) admitted as an identity exception%s (not "
+           "mapped)\n",
+           name, pa, end, read_only ? ", read-only" : "");
+    return 0;
+}
+
+/*
+ * G0: memory that must never reach stage 2 for the rest of the session (the GPU firmware
+ * __TEXT segments).  Outside guest RAM; it joins the denylist (map filter and verify).
+ */
+int hv_t8152_gpu_deny(u64 start, u64 end, const char *name)
+{
+    if (!armed || !ram_set) {
+        printf("HV: T8152: %s refused: the policy is not armed or guest RAM is not set\n", name);
+        return -1;
+    }
+    if (end <= start || (start | end) & (T8152_PAGE - 1) || overlaps(start, end, ram_start, ram_end)) {
+        printf("HV: T8152: %s [0x%lx, 0x%lx) refused: it must be 16 KiB aligned and outside guest "
+               "RAM [0x%lx, 0x%lx)\n",
+               name, start, end, ram_start, ram_end);
+        return -1;
+    }
+    for (unsigned int i = 0; i < allow_count; i++)
+        if (overlaps(start, end, allow[i].start, allow[i].end)) {
+            printf("HV: T8152: %s [0x%lx, 0x%lx) refused: it overlaps exception %s\n", name, start,
+                   end, allow[i].name);
+            return -1;
+        }
+    if (deny_add(start, end - start, name))
+        return -1;
+    printf("HV: T8152: %s [0x%lx, 0x%lx) denied to stage 2\n", name, start, end);
     return 0;
 }
 

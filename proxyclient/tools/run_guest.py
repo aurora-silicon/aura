@@ -90,6 +90,16 @@ parser.add_argument('--windows-usb', default='off', metavar='{off,drd1,drd1+drd3
                          'guest RAM and AIC 1692 -> SPI 995 (1834 -> 997). Default off. Needs a '
                          'USB FD (Mu J804_WINDOWS_USB, marker J804USB1 at 0x120). usb-drd0, the '
                          'proxy\'s link, is refused in every spelling.')
+parser.add_argument('--windows-gpu', default='off', metavar='{off,admit,log}',
+                    help='T8152 G0: "admit" runs the resident\'s GPU admission once (firmware '
+                         'identities against the live ADT, range table, firmware classes, the '
+                         'read-only handoff page Mu\'s GPU0 reads); "log" also puts read-as-zero '
+                         'logging hooks on the sgx window and the post-office page. Neither '
+                         'powers the GPU, starts its firmware or passes anything through. '
+                         'Default off.')
+parser.add_argument('--windows-gpu-pool-mib', type=int, default=256,
+                    help='T8152 G0: the GPU pool, carved from the top of guest RAM (multiple of '
+                         '32, at most half of guest RAM). Default 256.')
 parser.add_argument('payload', type=pathlib.Path)
 parser.add_argument('boot_args', default=[], nargs="*")
 args = parser.parse_args()
@@ -258,6 +268,78 @@ def windows_t8152_usb_attach(hv, ports, ahci):
           "mouse in before Windows boots")
 
 
+def windows_t8152_gpu_plan(u):
+    """G0: check --windows-gpu against the chip, the board and the resident before anything is
+    uploaded.  Returns the mode ("off" asks nothing of the resident)."""
+    from aura import windows as w
+    try:
+        mode = w.parse_windows_gpu(args.windows_gpu)
+        caps2 = 0
+        if mode != "off":
+            try:
+                caps2 = p.hv_windows_capabilities2()
+            except ProxyRemoteError:
+                caps2 = 0  # an older resident: Bad Command
+        chosen = u.adt["/chosen"]
+        w.validate_gpu_request(mode, chosen.chip_id, getattr(chosen, "board_id", -1), caps2)
+    except ValueError as exc:
+        sys.exit(f"T8152 launch refused: {exc}. The aura proxy keeps running; no guest was "
+                 "started.")
+    return mode
+
+
+def windows_t8152_gpu_admit(hv, mode):
+    """After USB, before hv.start(): the resident admits the GPU firmware and builds the
+    handoff page (and, for "log", hooks the sgx window).  Only then does the guest ADT get Mu's
+    /chosen/aura,windows-gpu-v1.  A refusal stops the launch: the session is used up."""
+    from aura import windows as w
+    if mode == "off":
+        return
+    base, top = hv.windows_guest_ram
+    try:
+        pool = w.gpu_pool(base, top, args.windows_gpu_pool_mib)
+    except ValueError as exc:
+        sys.exit(f"T8152 launch refused: {exc}. hv_init() ran, so the carrier session is used "
+                 "up: reload the carrier. No guest was started.")
+    result = p.hv_windows_gpu(w.GPU_OP_ADMIT, *pool)
+    if result != 0:
+        sys.exit(f"T8152: the resident refused GPU admission: {w.describe_gpu(result)} (its "
+                 "console says why). Reload the carrier; no guest was started.")
+    if mode == "log":
+        result = p.hv_windows_gpu(w.GPU_OP_HOOK)
+        if result != 0:
+            sys.exit(f"T8152: the resident refused the GPU logging hooks: "
+                     f"{w.describe_gpu(result)}. Reload the carrier; no guest was started.")
+    ipa = p.hv_windows_gpu(w.GPU_OP_STATUS, w.GPU_STATUS_HANDOFF_IPA)
+    size = p.hv_windows_gpu(w.GPU_OP_STATUS, w.GPU_STATUS_HANDOFF_SIZE)
+    try:
+        hv.set_windows_gpu_handshake(w.gpu_handshake(ipa, size))
+    except ValueError as exc:
+        sys.exit(f"T8152: GPU admitted but the Mu handshake was refused: {exc}. Reload the "
+                 "carrier; no guest was started.")
+    ranges = p.hv_windows_gpu(w.GPU_OP_STATUS, w.GPU_STATUS_RANGES)
+    print(f"T8152 GPU: admitted ({mode}), {ranges} ranges, pool [{pool[0]:#x}, "
+          f"{pool[0] + pool[1]:#x}), handoff page {ipa:#x} read-only, "
+          f"/chosen/{w.GPU_HANDSHAKE_PROPERTY} written; not powered, nothing passed through")
+
+
+def windows_t8152_gpu_status(mode):
+    from aura import windows as w
+    if mode == "off":
+        return
+    try:
+        total = p.hv_windows_gpu(w.GPU_OP_STATUS, w.GPU_STATUS_ACCESSES)
+        gfx = p.hv_windows_gpu(w.GPU_OP_STATUS, w.GPU_STATUS_MAILBOX_GFX)
+        per = {name: p.hv_windows_gpu(w.GPU_OP_STATUS, w.GPU_STATUS_CLASS + i)
+               for i, name in enumerate(w.GPU_CLASSES)}
+    except ProxyRemoteError as exc:
+        print(f"T8152 GPU: status unavailable: {exc}")
+        return
+    busy = ", ".join(f"{k} {v}" for k, v in per.items() if v)
+    print(f"T8152 GPU: {total} guest GPU accesses hooked ({gfx} in the GFX mailbox windows)"
+          f"{': ' + busy if busy else ''}")
+
+
 def windows_t8152_usb_status(ports):
     from aura import windows as w
     for port in ports:
@@ -364,6 +446,7 @@ def run_windows_t8152(caps):
         occupied.append(("scanout", ba.video.base, ba.video.stride * ba.video.height))
     t8152_check_window(u.adt, ba, base, top, occupied)
     usb_ports = windows_t8152_usb_plan(payload, u)
+    gpu_mode = windows_t8152_gpu_plan(u)
     print(f"T8152: guest RAM [{base:#x}, {top:#x}) passes the host check; NVRAM, QSPI and the "
           f"audio/AOP/ADMAC/i2c nodes are hidden, and the resident re-checks everything")
 
@@ -373,6 +456,7 @@ def run_windows_t8152(caps):
     hv.windows_guest_ram = (base, ahci["plan"].store_base) if ahci else (base, top)
     hv.windows_ahci = ahci
     hv.windows_usb = usb_spelling(usb_ports)
+    hv.windows_gpu = gpu_mode
     hv.windows_ipi = args.windows_ipi
     hv.windows_gic_cpuif = args.windows_gic_cpuif or "software"
     hv.windows_wfi = args.windows_wfi
@@ -414,6 +498,7 @@ def run_windows_t8152(caps):
     if ahci:
         windows_t8152_ahci_attach(hv, u, ahci)
     windows_t8152_usb_attach(hv, usb_ports, ahci)
+    windows_t8152_gpu_admit(hv, gpu_mode)
     try:
         result = hv.start()
     except ProxyRemoteError as exc:
@@ -427,6 +512,7 @@ def run_windows_t8152(caps):
                  "its console says why.")
     print(f"Guest exit status: {result} (1 SYSTEM_OFF, 2 SYSTEM_RESET)")
     windows_t8152_usb_status(usb_ports)
+    windows_t8152_gpu_status(gpu_mode)
     if ahci:
         windows_t8152_ahci_seal(result, ahci)
     if result == 2 and args.windows_reset_on_exit:
@@ -443,7 +529,8 @@ if _windows_caps and p.get_chipid() == 0x8152:
 elif (args.windows_guest_ram or args.windows_ipi != 'poll' or args.windows_reset_on_exit or
       args.windows_gic_cpuif not in (None, 'carrier') or args.windows_wfi != 'poll' or
       args.windows_guest_compatibility != 'none' or ahci_requested() or
-      args.windows_usb not in ('off', 'disabled')):
+      args.windows_usb not in ('off', 'disabled') or
+      args.windows_gpu not in ('off', 'disabled')):
     sys.exit("--windows-* options need the Windows personality (gmake WINDOWS=1) on T8152")
 
 if args.emulate_sprr or not p.get_cpu_features().apple_sysregs_unlocked:

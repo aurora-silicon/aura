@@ -515,3 +515,52 @@ that every RAM range in its memory map lies inside the handshake's DMA window (i
 describes RAM outside it, Mu leaves USB off for that boot). The design document's worked leaf
 vector has a nibble slip in the SUBPAGE_END field ([51:40]); the tests check the format on a
 synthetic page (`0x10100000000` -> `0x000fff1010000001`).
+
+## G0: GPU admission and logging hooks (WINDOWS-GPU-PLAN H2/H3)
+
+Status: built and host-tested only (`tests/python/test_windows_t8152_gpu.py`, plus a G0 block
+in `test_windows_t8152_policy.py`). Nothing of it has run on the M6. Contract:
+`windows-m6/G0-CARRIER-CONTRACT.md` (owner notes, not in this tree; it holds this machine's
+addresses). Off unless `run_guest.py --windows-gpu admit|log` asks for it; with it off no op is
+sent and the guest sees no change.
+
+- **Admission port** (`src/hv/windows/gpu_t8152_admit.c`): the checks of
+  `src/kboot_gpu_t8152.c` against the live ADT only (no FDT): chip and board, the sgx node, the
+  eight firmware regions, the gfx-asc/gfx1-asc ascwrap-v8 shape, both firmware UUIDs, the
+  patchbay TLVs against this boot's ADT and the TEXT SHA-256 against the J804 profile (the
+  same private build header kboot uses, through `gpu_t8152_j804_profiles()`). On top of kboot:
+  both wrappers and iop-vbar words inside the sgx window, one post-office bank for both roles
+  outside it, the UAT regions above boot_args RAM, the firmware segments below it, two ASC
+  interrupt lines each in `[32, 1020)` and outside the carrier's `[980, 1000)` block, and the
+  perf-state table. A refusal zeroes the result. Every address is lifted from the ADT; the
+  carrier and the admission carry none.
+- **Range table**: the sgx window page by page (16 KiB), where any other `/arm-io` node's
+  register (pmgr-child, error-handler, ...) makes the page a hole, rounded outward and clipped
+  to the window; the page with CPU_CONTROL/STATUS (+0x44/+0x48 of each wrapper) and the pages
+  with the iop-vbar words get their own classes ahead of holes. Then the post-office page, the
+  four UAT regions (class fw-rw), the four DATA regions (fw-ro), both `__TEXT` (fw-text), the
+  pool and the handoff page. Classes are `enum gpu_class` in `gpu_t8152_admit.h`.
+- **Stage-2 policy** (`hv_t8152.c`): `T8152_MAX_ALLOW` 8 -> 24 and `T8152_MAX_MMIO` 4 -> 32
+  (room for the eight firmware entries, the handoff page and G1's measured sgx sub-ranges).
+  New class `hv_t8152_gpu_fw_allow()`: the only identity exception outside boot_args RAM,
+  inside `/chosen` DRAM, clear of CTXR_A-D, CTRR_C-D, the denylist and guest RAM, RW or RO;
+  registered, never mapped in G0. `hv_t8152_gpu_deny()` puts both `__TEXT` on the denylist.
+- **ADMIT** (`hv_gpu.c`, `P_HV_WINDOWS_GPU` op 1, CAPS2 bit 2): once per carrier session,
+  after guest RAM, before entry. Validates the pool first (32 MiB aligned, inside guest RAM, at
+  most half of it; a bad pool spends nothing), then admits, builds the table, denies TEXT,
+  registers the firmware classes, builds the handoff page in carrier memory and maps it
+  read-only at IPA = PA. Logs `HV: GPU: admitted J804 <receipt>`.
+- **HOOK** (op 2, `--windows-gpu log`): carrier C hooks over the whole sgx window and the
+  post-office page, read-as-zero and write-ignored, counted per class (STATUS op 3), the first
+  32 accesses printed with class, range and whether they fall in a GFX mailbox window. No
+  access reaches hardware; no host (proxy) hook is involved.
+- **Alias slots** (`hv_aic_alias.c`): four GPU slots after the two USB ones, published under
+  the lines' own numbers by `hv_aic_alias_t8152_gpu()`, refusing lines outside `[32, 1020)`, in
+  the carrier block, on a USB line or repeated. Nothing calls it with `live` in G0.
+- **Handoff page and Mu**: 16 KiB, magic `AGH1`, version 1, layout in `gpu_t8152_admit.h`,
+  CRC-32 (zlib) over the used bytes. The launcher writes `/chosen/aura,windows-gpu-v1` (16
+  bytes: handoff IPA, size) only after ADMIT returned 0; Mu's GPU0 node is built from the page.
+
+Not in G0 yet, each needing an owner-present session: PSD power-on (3, 82, 81), CPU_CONTROL
+RUN, iop-vbar pinned by value, mailbox forwarding, measured sgx passthrough, live GPU aliases,
+mapping the firmware classes, and a boot-wide (not per-carrier-session) admission marker.

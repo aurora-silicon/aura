@@ -178,8 +178,14 @@ static u64 heap_lim = HEAP_LIM;
 
 uintptr_t heapblock_high_water(void) { return HEAP_TOP; }
 uintptr_t heapblock_limit(void) { return heap_lim; }
+static u64 ctrr_c_lo, ctrr_c_hi; /* G0: a CTRR_C range below RAM, when set */
 bool ctxr_range(enum ctxr_range range, u64 *start, u64 *end)
 {
+    if (range == CTRR_RANGE_C && ctrr_c_hi) {
+        *start = ctrr_c_lo;
+        *end = ctrr_c_hi;
+        return true;
+    }
     if (range != CTXR_RANGE_D || !ctxr_ok)
         return false;
     *start = CTXR_D_LO;
@@ -493,6 +499,50 @@ int main(void)
     assert(hv_t8152_verify(WIN_LO + 0x800, WIN_LO, hcr_ok, true) == 0);
 
     /*
+     * G0: the admitted GPU firmware class, the one exception outside boot_args RAM (here DRAM
+     * reaches 256 MiB below and 1 GiB above it), and the firmware TEXT on the denylist.
+     */
+    puts("GPU FIRMWARE CLASS CHECK");
+    {
+        u64 dlo = DRAM - 0x10000000UL, dhi = DRAM + DRAM_SIZE + 0x40000000UL;
+        u64 uat = DRAM + DRAM_SIZE + 0x10000000UL, data = DRAM - 0x1000000UL;
+        u64 text = DRAM - 0x2000000UL, handoff = 0x10011100000UL;
+        assert(hv_t8152_gpu_fw_allow(WIN_LO, 0x4000, false, dlo, dhi, "fw inside RAM") < 0);
+        assert(hv_t8152_gpu_fw_allow(DRAM + DRAM_SIZE, 0x4000, false, dlo, dhi, "fw on 4") < 0);
+        assert(hv_t8152_gpu_fw_allow(dhi, 0x4000, false, dlo, dhi, "fw past DRAM") < 0);
+        assert(hv_t8152_gpu_fw_allow(uat + 0x1000, 0x4000, false, dlo, dhi, "fw unaligned") < 0);
+        ctrr_c_lo = data;
+        ctrr_c_hi = data + 0x4000;
+        assert(hv_t8152_gpu_fw_allow(data, 0x8000, true, dlo, dhi, "fw under CTRR") < 0);
+        ctrr_c_hi = 0;
+        for (int i = 0; i < 4; i++)                       /* F21: eight on top of two */
+            assert(hv_t8152_gpu_fw_allow(uat + i * 0x80000UL, 0x80000, false, dlo, dhi,
+                                         "uat") == 0);
+        for (int i = 0; i < 4; i++)
+            assert(hv_t8152_gpu_fw_allow(data + i * 0x40000UL, 0x40000, true, dlo, dhi,
+                                         "data") == 0);
+        assert(hv_t8152_allow(handoff, handoff, 0x4000, true, "handoff") == 0);
+        assert(map(uat, uat | S2_HW, 0x80000) != 0xdead);
+        assert(map(uat, (uat + 0x4000) | S2_HW, 0x4000) == 0xdead);   /* not identity */
+        assert(map(data, data | S2_HW, 0x40000) == 0xdead);            /* RO mapped RW */
+        assert(map(data, data | S2_RO, 0x40000) != 0xdead);
+        assert(map(handoff, handoff | S2_RO, 0x4000) != 0xdead);
+        assert(hv_t8152_gpu_deny(WIN_LO, WIN_LO + 0x4000, "text in RAM") < 0);
+        assert(hv_t8152_gpu_deny(uat, uat + 0x4000, "text on uat") < 0);
+        assert(hv_t8152_gpu_deny(text + 0x1000, text + 0x50000, "text unaligned") < 0);
+        assert(hv_t8152_gpu_deny(text, text + 0x50000, "gfx-asc __TEXT") == 0);  /* F20 */
+        assert(map(text, text | S2_HW, 0x4000) == 0xdead);
+        assert(map(text + 0x4c000, (text + 0x4c000) | S2_RO, 0x4000) == 0xdead);
+        assert(hv_t8152_gpu_fw_allow(text, 0x4000, true, dlo, dhi, "fw on text") < 0);
+        leaves[nleaves++] = (struct leaf){uat, 0x4000, uat | S2_HW | 2, 3};
+        leaves[nleaves++] = (struct leaf){data, 0x4000, data | S2_RO | 2, 3};
+        assert(hv_t8152_verify(WIN_LO + 0x800, WIN_LO, hcr_ok, true) == 0);
+        leaves[nleaves++] = (struct leaf){text, 0x4000, text | S2_RO | 2, 3};
+        assert(hv_t8152_verify(WIN_LO + 0x800, WIN_LO, hcr_ok, true) < 0);
+        nleaves -= 3;
+    }
+
+    /*
      * B2, Part C (h): the guest's ACTLR_EL1 goes through ACTLR_EL12 only.  The write of
      * that register is not yet measured on the M6, so restoring the value it already holds
      * must issue no write at all; a different value must be written exactly once.
@@ -570,7 +620,18 @@ def test_t8152_carrier_policy(tmp_path):
             "32 MiB block 0x10008000000") in place
     assert "code ends 0x10009000000 at or below 0x10009000000" in place
     assert "all 12 CPUs live in aura's dispatch loop" in live
-    store = result.stdout.split("AHCI STORE CHECK", 1)[1].split("ACTLR CHECK", 1)[0]
+    gpu = result.stdout.split("GPU FIRMWARE CLASS CHECK", 1)[1].split("ACTLR CHECK", 1)[0]
+    assert "GPU firmware fw inside RAM [0x10040000000, 0x10040004000) refused" in gpu
+    assert "hits region-id-4 (above RAM)" in gpu
+    assert "fw under CTRR overlaps CTRR_C" in gpu
+    assert "GPU firmware uat [0x10110180000, 0x10110200000) admitted as an identity exception" in gpu
+    assert ", read-only (not mapped)" in gpu
+    assert "gfx-asc __TEXT [0xfffe000000, 0xfffe050000) denied to stage 2" in gpu
+    assert "text on uat [0x10110000000, 0x10110004000) refused: it overlaps exception uat" in gpu
+    assert "exception mapped at the wrong IPA" in gpu
+    assert "read-only exception mapped writable" in gpu
+    assert gpu.count("stage 2 verified") == 1 and ": gfx-asc __TEXT" in gpu
+    store = result.stdout.split("AHCI STORE CHECK", 1)[1].split("GPU FIRMWARE CLASS CHECK", 1)[0]
     assert "AHCI store refused: the policy is not armed or guest RAM is not set" in store
     assert "must be a 16 KiB aligned range above guest RAM" in store
     assert "region-id-218" in store
