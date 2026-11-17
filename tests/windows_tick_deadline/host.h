@@ -137,3 +137,9 @@ static void hv_windows_update_carrier_readiness(struct exc_info *ctx) { (void)ct
 static void hv_exc_entry(void) { ++rendezvous_entries; }
 static void hv_maybe_switch_cpu(struct exc_info *ctx,int a,int b,void *p) { (void)ctx;(void)a;(void)b;(void)p; }
 static void hv_exc_exit(struct exc_info *ctx) { hv_update_fiq(ctx); }
+/* EL2 accounting is exercised by tests/windows_el2_acct; values match hv_el2_acct.h. */
+#define HV_EL2_TICK 0
+#define HV_EL2_WFI 5
+static unsigned el2_causes[8], el2_reports;
+static void hv_el2_cause(unsigned cause) { ++el2_causes[cause]; }
+static void hv_report_t8142_el2_acct(void) { ++el2_reports; }

@@ -40,6 +40,11 @@ static bool hv_replay_vector_insn(struct exc_info *ctx,u64 va,u32 orig,bool cons
 static bool hv_unpatch_t8142_undef_vector(u64 va){(void)va;return false;}
 static int production_printf(const char *fmt,...){(void)fmt;diagnostics++;return 0;}
 #define printf production_printf
+/* EL2 accounting classification is exercised by tests/windows_el2_acct. */
+#define HV_EL2_VEC 3
+static unsigned el2_classified;
+static void hv_el2_cause(u32 cause){(void)cause;el2_classified++;}
+static void hv_el2_site_cause(u32 insn){(void)insn;el2_classified++;}
 /* Unchanged production GIC body is source-bound separately. This boundary
  * models observable acknowledgement/completion and the real carrier x18 read. */
 static bool hv_handle_t8142_gic_cpuif(u64 reg,bool is_read,u64 rt,u64 regs[32],bool probe){

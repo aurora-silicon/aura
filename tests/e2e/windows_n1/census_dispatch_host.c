@@ -116,6 +116,15 @@ static u64 hv_host_counter(void)
 {
     return 100;
 }
+/* EL2 accounting brackets every bhl hold; tests/windows_el2_acct checks the values. */
+static void hv_el2_lock_acquired(u64 started)
+{
+    assert(lock_held && started == 100);
+}
+static void hv_el2_lock_released(void)
+{
+    assert(lock_held);
+}
 static void hv_windows_update_carrier_readiness(struct exc_info *ctx)
 {
     (void)ctx;

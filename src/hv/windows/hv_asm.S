@@ -1,6 +1,7 @@
 /* spDx-License-Identifier: MIT */
 
 #include "exception.h"
+#include "hv_el2_acct.h"
 
 .align 11
 .globl _hv_vectors_start
@@ -103,6 +104,12 @@ _hv_return:
 
     eret
 
+/*
+ * Every lower-EL vector brackets its C handler with hv_el2_enter(<default
+ * cause>) and hv_el2_exit() for the per-CPU EL2 time accounting in hv_exc.c.
+ * x19 carries the frame pointer across hv_el2_enter(): it is callee-saved,
+ * and the guest's x19 is already in the frame, reloaded by _hv_return.
+ */
 .globl _v_hv_sync
 .type _v_hv_sync, @function
 _v_hv_sync:
@@ -110,7 +117,12 @@ _v_hv_sync:
     sub sp, sp, #(SIZEOF_EXC_INFO - 32 * 8)
     str x30, [sp, #-16]!
     bl _hv_entry
+    mov x19, x0
+    mov x0, #HV_EL2_SYNC
+    bl hv_el2_enter
+    mov x0, x19
     bl hv_exc_sync
+    bl hv_el2_exit
 
     b _hv_return
 
@@ -121,7 +133,12 @@ _v_hv_irq:
     sub sp, sp, #(SIZEOF_EXC_INFO - 32 * 8)
     str x30, [sp, #-16]!
     bl _hv_entry
+    mov x19, x0
+    mov x0, #HV_EL2_IRQ
+    bl hv_el2_enter
+    mov x0, x19
     bl hv_exc_irq
+    bl hv_el2_exit
 
     b _hv_return
 
@@ -132,7 +149,12 @@ _v_hv_fiq:
     sub sp, sp, #(SIZEOF_EXC_INFO - 32 * 8)
     str x30, [sp, #-16]!
     bl _hv_entry
+    mov x19, x0
+    mov x0, #HV_EL2_IRQ
+    bl hv_el2_enter
+    mov x0, x19
     bl hv_exc_fiq
+    bl hv_el2_exit
 
     b _hv_return
 
@@ -143,7 +165,12 @@ _v_hv_serr:
     sub sp, sp, #(SIZEOF_EXC_INFO - 32 * 8)
     str x30, [sp, #-16]!
     bl _hv_entry
+    mov x19, x0
+    mov x0, #HV_EL2_SYNC
+    bl hv_el2_enter
+    mov x0, x19
     bl hv_exc_serr
+    bl hv_el2_exit
 
     b _hv_return
 

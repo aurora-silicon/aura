@@ -8,6 +8,7 @@
 #include "cpu_regs.h"
 #include "exception.h"
 #include "hv_aic_alias.h"
+#include "hv_el2_acct.h"
 #include "hv_vgic.h"
 #include "mtp_handoff.h"
 #include "smp.h"
@@ -239,6 +240,168 @@ static_assert(sizeof(struct hv_pcpu_data) == 0x800, "native-AIC pcpu debug ABI c
 #endif
 
 struct hv_pcpu_data pcpu[MAX_CPUS];
+
+/*
+ * Per-CPU EL2 time accounting; see docs/windows-el2-accounting.md.
+ *
+ * Every lower-EL vector in hv_asm.S brackets its handler with hv_el2_enter()
+ * and hv_el2_exit(), so one "stay" is everything between the register spill
+ * and the reload.  The handler may re-classify the stay with hv_el2_cause();
+ * the last cause recorded before the return gets the whole stay, minus any
+ * time spent waiting for bhl, which goes to HV_EL2_LOCK.
+ *
+ * Hot-path cost is two hv_host_counter() reads per stay (two more around a bhl
+ * acquisition) and plain stores into this CPU's own cache-line-aligned record.
+ * Each record has one writer, its CPU; the boot CPU only reads it, once a
+ * second, in hv_report_t8142_el2_acct().  Nothing here prints or takes a lock.
+ */
+struct hv_el2_acct {
+    u64 ticks[HV_EL2_CAUSES]; /* exclusive stay time per cause, host counter units */
+    u64 count[HV_EL2_CAUSES]; /* stays per cause; HV_EL2_LOCK counts bhl acquisitions */
+    u64 held;                 /* time this CPU held bhl */
+    u64 longest;              /* longest stay since the last report; the reporter zeroes it */
+    u64 entered;
+    u64 lock_wait;
+    u64 lock_taken;
+    u32 cause;
+} ALIGNED(64);
+
+static struct hv_el2_acct hv_el2_acct[MAX_CPUS];
+
+/* Single writer: a relaxed store is enough to keep the reporter's load untorn. */
+static inline void hv_el2_add(u64 *field, u64 delta)
+{
+    __atomic_store_n(field, *field + delta, __ATOMIC_RELAXED);
+}
+
+void hv_el2_enter(u64 cause)
+{
+    struct hv_el2_acct *a = &hv_el2_acct[smp_id()];
+
+    a->entered = hv_host_counter();
+    a->lock_wait = 0;
+    a->cause = cause;
+}
+
+void hv_el2_exit(void)
+{
+    struct hv_el2_acct *a = &hv_el2_acct[smp_id()];
+    u64 stay = hv_host_counter() - a->entered;
+    u32 cause = a->cause < HV_EL2_LOCK ? a->cause : HV_EL2_SYNC;
+
+    if ((s64)stay < 0)
+        stay = 0;
+    u64 wait = a->lock_wait < stay ? a->lock_wait : stay;
+
+    hv_el2_add(&a->ticks[HV_EL2_LOCK], wait);
+    hv_el2_add(&a->ticks[cause], stay - wait);
+    hv_el2_add(&a->count[cause], 1);
+    if (stay > __atomic_load_n(&a->longest, __ATOMIC_RELAXED))
+        __atomic_store_n(&a->longest, stay, __ATOMIC_RELAXED);
+}
+
+static void hv_el2_cause(u32 cause)
+{
+    if (cause < HV_EL2_LOCK)
+        hv_el2_acct[smp_id()].cause = cause;
+}
+
+/*
+ * An emulated system-register instruction is interrupt reflection when it is
+ * part of the GICv3 CPU interface the guest drives its interrupts through:
+ * op0=3, op1=0, CRn=12 with CRm 8/9/11/12 (IAR, EOIR, HPPIR, BPR, AP*R, DIR,
+ * RPR, SGI*R, CTLR, SRE, IGRPEN), or ICC_PMR_EL1 (S3_0_C4_C6_0).  Anything else
+ * is absent-register emulation.
+ */
+static void hv_el2_site_cause(u32 insn)
+{
+    u32 key = (insn >> 5) & 0x7fff; /* o0:op1:CRn:CRm:op2 */
+    u32 crm = (key >> 3) & 0xf;
+    bool icc = (key & 0x7f80) == 0x4600 && (crm == 8 || crm == 9 || crm == 11 || crm == 12);
+
+    hv_el2_cause(icc || key == 0x4230 ? HV_EL2_IRQ : HV_EL2_ABS);
+}
+
+static void hv_el2_lock_acquired(u64 started)
+{
+    struct hv_el2_acct *a = &hv_el2_acct[smp_id()];
+    u64 now = hv_host_counter();
+
+    a->lock_wait += now - started;
+    a->lock_taken = now;
+    hv_el2_add(&a->count[HV_EL2_LOCK], 1);
+}
+
+static void hv_el2_lock_released(void)
+{
+    struct hv_el2_acct *a = &hv_el2_acct[smp_id()];
+
+    hv_el2_add(&a->held, hv_host_counter() - a->lock_taken);
+}
+
+static u64 hv_el2_us(u64 ticks, u64 freq)
+{
+    return (ticks / freq) * 1000000 + ((ticks % freq) * 1000000) / freq;
+}
+
+/*
+ * One line per live CPU, boot CPU included, from the 1 Hz T8142 housekeeping
+ * tick.  The first call only takes the baseline.  A stay still in progress
+ * (an idle CPU in WFI) is reported in the window in which it ends.
+ */
+void hv_report_t8142_el2_acct(void)
+{
+    static u64 last_ticks[MAX_CPUS][HV_EL2_CAUSES];
+    static u64 last_count[MAX_CPUS][HV_EL2_CAUSES];
+    static u64 last_held[MAX_CPUS];
+    static u64 last_report;
+    static bool have_baseline;
+
+    u64 freq = mrs(CNTFRQ_EL0);
+    u64 now = hv_host_counter();
+
+    if (chip_id != T8142 || !freq)
+        return;
+    /* Housekeeping is 1 Hz on T8142; never let a faster caller flood the console. */
+    bool baseline = !have_baseline;
+    if (!baseline && now - last_report < freq / 2)
+        return;
+    u64 window = now - last_report;
+    last_report = now;
+    have_baseline = true;
+
+    for (int cpu = 0; cpu < MAX_CPUS; cpu++) {
+        if (cpu != boot_cpu_idx && !smp_is_alive(cpu))
+            continue;
+
+        struct hv_el2_acct *a = &hv_el2_acct[cpu];
+        u64 us[HV_EL2_CAUSES], n[HV_EL2_CAUSES], total = 0;
+
+        for (int c = 0; c < HV_EL2_CAUSES; c++) {
+            u64 ticks = __atomic_load_n(&a->ticks[c], __ATOMIC_RELAXED);
+            u64 count = __atomic_load_n(&a->count[c], __ATOMIC_RELAXED);
+
+            total += ticks - last_ticks[cpu][c];
+            us[c] = hv_el2_us(ticks - last_ticks[cpu][c], freq);
+            n[c] = count - last_count[cpu][c];
+            last_ticks[cpu][c] = ticks;
+            last_count[cpu][c] = count;
+        }
+        u64 held = __atomic_load_n(&a->held, __ATOMIC_RELAXED);
+        u64 held_us = hv_el2_us(held - last_held[cpu], freq);
+        u64 longest = __atomic_exchange_n(&a->longest, 0, __ATOMIC_RELAXED);
+        last_held[cpu] = held;
+
+        if (baseline)
+            continue;
+        printf("HV: el2 cpu%d win=%lu el2=%lu max=%lu tick=%lu:%lu irq=%lu:%lu abs=%lu:%lu "
+               "vec=%lu:%lu sync=%lu:%lu wfi=%lu:%lu lock=%lu:%lu hold=%lu\n",
+               cpu, hv_el2_us(window, freq), hv_el2_us(total, freq), hv_el2_us(longest, freq),
+               n[HV_EL2_TICK], us[HV_EL2_TICK], n[HV_EL2_IRQ], us[HV_EL2_IRQ], n[HV_EL2_ABS],
+               us[HV_EL2_ABS], n[HV_EL2_VEC], us[HV_EL2_VEC], n[HV_EL2_SYNC], us[HV_EL2_SYNC],
+               n[HV_EL2_WFI], us[HV_EL2_WFI], n[HV_EL2_LOCK], us[HV_EL2_LOCK], held_us);
+    }
+}
 
 #ifdef ENABLE_NATIVE_AIC_PASSTHROUGH
 /*
@@ -3767,6 +3930,7 @@ static bool hv_handle_t8142_pmu_site(struct exc_info *ctx, u32 imm)
 
     if (((insn & 0xffe00000U) == 0xd5200000U) && rt < 31) /* MRS Xt, sysreg */
         ctx->regs[rt] = out;
+    hv_el2_site_cause(insn);
 
     static u64 site_emulated;
     static u32 callee_saved_emulated;
@@ -3858,6 +4022,7 @@ static bool hv_handle_t8142_undef_trampoline(struct exc_info *ctx)
          */
         static u64 emulated;
 
+        hv_el2_site_cause(insn);
         if (from_el0) {
             el0_sync_emul++;
             /*
@@ -3905,6 +4070,7 @@ static bool hv_handle_t8142_undef_trampoline(struct exc_info *ctx)
             orig = t8142_undef_vec[i].orig;
 
     if (orig && hv_replay_vector_insn(ctx, vec_va, orig, true)) {
+        hv_el2_cause(HV_EL2_VEC);
         if (from_el0)
             el0_sync_pass++;
         else
@@ -5959,7 +6125,10 @@ static inline bool hv_rendezvous_requested(void)
 static void hv_rendezvous_quiesce(void)
 {
     __atomic_and_fetch(&hv_cpus_in_guest, ~BIT(smp_id()), __ATOMIC_ACQUIRE);
+    u64 lock_started = hv_host_counter();
     spin_lock(&bhl);
+    hv_el2_lock_acquired(lock_started);
+    hv_el2_lock_released();
     spin_unlock(&bhl);
     hv_maybe_exit();
     __atomic_or_fetch(&hv_cpus_in_guest, BIT(smp_id()), __ATOMIC_ACQUIRE);
@@ -5972,7 +6141,9 @@ static void hv_exc_entry(void)
         sysop("msr daifclr, 4");
 
     __atomic_and_fetch(&hv_cpus_in_guest, ~BIT(smp_id()), __ATOMIC_ACQUIRE);
+    u64 lock_started = hv_host_counter();
     spin_lock(&bhl);
+    hv_el2_lock_acquired(lock_started);
     hv_wdt_breadcrumb('X');
     exc_entry_time = hv_host_counter();
     /* disable PMU counters in the hypervisor */
@@ -5992,6 +6163,7 @@ static void hv_exc_exit(struct exc_info *ctx)
     if (cpu_features->apple_sysregs_unlocked)
         reg_set(SYS_IMP_APL_PMCR0, PERCPU(exc_entry_pmcr0_cnt));
     msr(CNTVOFF_EL2, stolen_time);
+    hv_el2_lock_released();
     spin_unlock(&bhl);
     hv_maybe_exit();
     __atomic_or_fetch(&hv_cpus_in_guest, BIT(smp_id()), __ATOMIC_ACQUIRE);
@@ -6030,6 +6202,7 @@ static bool hv_handle_wfx(struct exc_info *ctx)
         return false; // WFE is not trapped (HCR_EL2.TWE is clear) and has no handler here
 
     wfi_trap_count[smp_id()]++;
+    hv_el2_cause(HV_EL2_WFI);
     if (!wfi_trap_logged) {
         wfi_trap_logged = true;
         printf("HV: first guest WFI held at EL2 on CPU %u, guest pc 0x%lx\n", smp_id(), ctx->elr);
@@ -6584,6 +6757,7 @@ void hv_exc_fiq(struct exc_info *ctx)
 
     if (hv_mask_pending_tick()) {
         tick = true;
+        hv_el2_cause(HV_EL2_TICK);
     }
 
     int interruptible_cpu = hv_pinned_cpu;

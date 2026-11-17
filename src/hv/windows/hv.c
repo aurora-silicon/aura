@@ -1454,6 +1454,7 @@ void hv_tick(struct exc_info *ctx)
     hv_scan_t8142_guest_modules();
     hv_report_t8142_process(ctx);
     hv_report_t8142_gic_activity();
+    hv_report_t8142_el2_acct();
     /* Bounded, non-allocating mailbox fallback for a guest that never idles.
      * The primary servicer runs in the unlocked WFI path. */
     hv_windows_mtp_poll();
