@@ -884,8 +884,9 @@ def main():
 
     entry_off = plan_mod.macho_info(images["sptm"]).entry - plan_mod.macho_info(images["sptm"]).virtlo
     try:
-        sp = sptm_patch.plan(images["sptm"], entry_off)
-    except sptm_patch.SptmPatchError as e:
+        sp = (sptm_j613.patch_plan(images["sptm"], entry_off) if chip == 0x8122
+              else sptm_patch.plan(images["sptm"], entry_off))
+    except (sptm_patch.SptmPatchError, ValueError) as e:
         raise SystemExit(f"this SPTM can't be patched: {e}")
     print(f"SPTM: {len(sp['patches'])} patch sites found"
           + (", MTE tag-storage sequence found" if sp["mte"] else ""))

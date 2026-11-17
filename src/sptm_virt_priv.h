@@ -83,6 +83,7 @@ bool sptm_virt_cl4_reflect(u64 *regs, u64 esr);
 /* sptm_virt_s2.c */
 extern volatile bool sptm_virt_rg_passthrough;
 void sptm_virt_s2_setup(void);
+bool sptm_virt_s2_admit(void);
 void sptm_virt_s2_enter_xnu(int cpu);
 void sptm_virt_ctrr_publish_rorgn(void);
 void sptm_virt_gpu_deadline(struct exc_info *ctx);
