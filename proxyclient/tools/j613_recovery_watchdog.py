@@ -10,8 +10,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--seconds", type=int, default=30)
     args = parser.parse_args()
-    if platform.node() != "robur":
-        raise RuntimeError("robur only")
+    if platform.node() not in ("alba", "robur"):
+        raise RuntimeError("alba or robur only")
     if not 1 <= args.seconds <= 178:
         raise ValueError("seconds must be in [1, 178]")
 

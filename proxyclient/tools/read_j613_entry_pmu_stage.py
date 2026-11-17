@@ -24,8 +24,8 @@ def main():
     parser.add_argument("--nm", default="llvm-nm")
     parser.add_argument("--reboot", action="store_true")
     args = parser.parse_args()
-    if platform.node() != "robur":
-        raise RuntimeError("robur only")
+    if platform.node() not in ("alba", "robur"):
+        raise RuntimeError("alba or robur only")
 
     sym = symbols(args.elf, args.nm)
     needed = {"_base", "sptm_virt_j613_entry_pmu_stage"}
