@@ -14,9 +14,11 @@
  *
  *   - its RAM window (hv_t8152_set_guest_ram), identity mapped, normal memory;
  *   - pages the carrier itself registers with hv_t8152_allow() (the BGRA
- *     framebuffer shadow, the read-only Mu ADT alias);
+ *     framebuffer shadow; no ADT alias is mapped on T8152);
  *   - the AIC, identity mapped as Device-nGnRnE (native AIC passthrough);
- *   - emulated MMIO hooks (vUART, vGIC, AIC transition hooks), never mapped.
+ *   - emulated MMIO hooks in the carrier (vUART, vGIC, AIC transition hooks),
+ *     never mapped.  Host (proxy) hooks are refused: the host would perform
+ *     the access at PA = IPA.
  *
  * A denylist read from the live ADT (QSPI NOR/NVRAM controller, SEP, AOP,
  * ADMAC, i2c, audio, GPIO, WDT, PMGR, SPMI, DART, SART, ANS, SMC, MTP, SPI,
@@ -31,8 +33,13 @@ bool hv_t8152_policy_armed(void);
 /* hv_init(): every T8152 precondition; prints each failing reason. 0 or -1. */
 int hv_t8152_preflight(void);
 
-/* Proxy: the guest RAM window [base, base + size). 0, or -1 with the reason printed. */
-int hv_t8152_set_guest_ram(u64 base, u64 size);
+/*
+ * Proxy: the guest RAM window [base, base + size).  host_top is the top of the
+ * launcher's own heap, which sits above aura's heap limit; the window must
+ * miss [_base, max(heap high water, heap limit, host_top)).  0, or -1 with the
+ * reason printed.
+ */
+int hv_t8152_set_guest_ram(u64 base, u64 size, u64 host_top);
 bool hv_t8152_guest_ram(u64 *base, u64 *size);
 
 /* A carrier-owned exception to the RAM allowlist (never to the denylist). */

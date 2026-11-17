@@ -38,6 +38,7 @@ CONFIG_MTP = 0x0010
 CONFIG_CPUFREQ = 0x0020
 CONFIG_T8152_FAST_IPI = 0x10000
 CONFIG_T8152_SOFT_GIC = 0x20000
+CONFIG_T8152_WFI = 0x40000  # real WFI at EL2, only after Phase 3 measurement (a)
 MTP_DISABLED_PROPERTY = "aura,windows-mtp-disabled"
 MTP_RESERVED_BASE = 0x10020000000
 MTP_RESERVED_SIZE = 0x200000
@@ -146,6 +147,7 @@ class LaunchPlan:
     ipi: str = "poll"
     on_reset: str = "stay"
     gic_cpuif: str = "carrier"
+    wfi: str = "poll"
 
 
 XFER_FIELDS = {"doorbell", "window_bytes", "serve_dir", "inbox", "compress"}
@@ -269,7 +271,7 @@ def plan_profile(filename):
     require(set(profile) <= {"schema", "name", "target", "mu", "append", "framebuffer", "boot_args",
                              "guest_compatibility", "usb", "n1", "reserved_memory", "serial", "mtp", "cpufreq",
                              "xfer", "ecpu_boot_state", "unified_display", "guest_ram", "ipi",
-                             "on_reset", "gic_cpuif"},
+                             "on_reset", "gic_cpuif", "wfi"},
             "unknown Windows profile field")
     require(isinstance(profile.get("name"), str) and 0 < len(profile["name"]) <= 80, "profile name is required")
     target = profile.get("target")
@@ -378,6 +380,7 @@ def plan_profile(filename):
                          "size": MTP_RESERVED_SIZE})
     guest_ram, ipi, on_reset, gic_cpuif = t8152_profile_fields(
         profile, chip, framebuffer, compatibility, n1, mtp, declarations)
+    wfi = t8152_wfi_field(profile, chip)
     boot_args = profile.get("boot_args", "")
     require(isinstance(boot_args, str) and len(boot_args.encode("ascii")) <= 255 and "\0" not in boot_args,
             "boot_args must be at most 255 ASCII bytes without NUL")
@@ -394,7 +397,8 @@ def plan_profile(filename):
                       tuple(images), entry, chip, model, framebuffer, compatibility, usb, n1,
                       tuple(reserved), boot_args, serial, mtp, cpufreq, xfer,
                       ecpu_boot_state=ecpu_boot_state, unified_display=unified_display,
-                      guest_ram=guest_ram, ipi=ipi, on_reset=on_reset, gic_cpuif=gic_cpuif)
+                      guest_ram=guest_ram, ipi=ipi, on_reset=on_reset, gic_cpuif=gic_cpuif,
+                      wfi=wfi)
 
 
 T8152_CHIP = 0x8152
@@ -432,6 +436,15 @@ def t8152_profile_fields(profile, chip, framebuffer, compatibility, n1, mtp, res
     require(n1 == "disabled" and mtp == "disabled", "T8152 has no N1 or MTP handoff")
     require(not reserved, "T8152 profiles take no reserved_memory; guest_ram is the whole guest")
     return (base, top), ipi, on_reset, gic_cpuif
+
+
+def t8152_wfi_field(profile, chip):
+    """T8152 carrier idle: "poll" (default, no WFI at EL2) or "wfi", only after Phase 3
+    measurement (a) showed that WFI preserves state on T8152."""
+    wfi = profile.get("wfi", "poll")
+    require(wfi in ("poll", "wfi"), "wfi must be poll or wfi")
+    require(chip == T8152_CHIP or wfi == "poll", "wfi is a T8152 profile field")
+    return wfi
 
 
 def validate_t8152_window(base, top):
@@ -798,6 +811,7 @@ class HardwareSession:
         preflight.windows_guest_ram = guest_ram
         preflight.windows_ipi = getattr(plan, "ipi", "poll")
         preflight.windows_gic_cpuif = getattr(plan, "gic_cpuif", "carrier")
+        preflight.windows_wfi = getattr(plan, "wfi", "poll")
         preflight.setup_adt()
         if guest_ram is not None:
             args = self._identity_bootargs
@@ -844,6 +858,7 @@ class HardwareSession:
         self.hv.windows_guest_ram = guest_ram
         self.hv.windows_ipi = getattr(plan, "ipi", "poll")
         self.hv.windows_gic_cpuif = getattr(plan, "gic_cpuif", "carrier")
+        self.hv.windows_wfi = getattr(plan, "wfi", "poll")
         self.hv.init()
         self.hv.set_logfile(self.iface.tty_log)
         prepare_n1_handoff(self.hv)

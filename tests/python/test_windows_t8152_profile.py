@@ -47,6 +47,9 @@ def test_t8152_profile_binds_window_and_policy(tmp_path):
     assert plan.ipi == "fast" and plan.on_reset == "reboot"
     plan = windows.plan_profile(write_profile(tmp_path, gic_cpuif="software"))
     assert plan.gic_cpuif == "software"
+    assert plan.wfi == "poll"  # no WFI at EL2 until Phase 3 measurement (a)
+    plan = windows.plan_profile(write_profile(tmp_path, wfi="wfi"))
+    assert plan.wfi == "wfi"
 
 
 @pytest.mark.parametrize("fields, message", [
@@ -58,6 +61,7 @@ def test_t8152_profile_binds_window_and_policy(tmp_path):
     ({"ipi": "sev"}, "ipi must be"),
     ({"on_reset": "now"}, "on_reset must be"),
     ({"gic_cpuif": "hardware"}, "gic_cpuif must be"),
+    ({"wfi": "wfe"}, "wfi must be"),
     ({"reserved_memory": [{"name": "x", "base": "0x10050000000", "size": "0x1000"}]},
      "no reserved_memory"),
 ])
@@ -181,8 +185,10 @@ def test_c_and_python_agree_on_abi():
     proxy_c = (REPO / "src/proxy.c").read_text()
     proxy_h = (REPO / "src/proxy.h").read_text()
     hv_h = (REPO / "src/hv/windows/hv.h").read_text()
-    assert "0x4157494e00010fffULL" in proxy_c
-    assert CAPS_T8152 == 0x4157494E00010FFF
+    # This branch builds no N1 producer: the resident clears N1_HANDOFF (bit 5).
+    assert "0x4157494e00010fdfULL" in proxy_c
+    assert CAPS_T8152 & ~windows.N1_HANDOFF == 0x4157494E00010FDF
     assert "P_HV_WINDOWS_GUEST_RAM = 0xc8c" in proxy_h
     assert "HV_WINDOWS_T8152_FAST_IPI BIT(5)" in hv_h and windows.CONFIG_T8152_FAST_IPI == 1 << 5
     assert "HV_WINDOWS_T8152_SOFT_GIC BIT(6)" in hv_h and windows.CONFIG_T8152_SOFT_GIC == 1 << 6
+    assert "HV_WINDOWS_T8152_WFI BIT(7)" in hv_h and windows.CONFIG_T8152_WFI == 1 << 7

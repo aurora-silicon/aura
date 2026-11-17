@@ -167,6 +167,18 @@ static bool hv_windows_ecpu_attempted;
  */
 static bool hv_t8152_fast_ipi;
 static bool hv_t8152_soft_gic;
+static bool hv_t8152_wfi;
+
+/*
+ * Carrier idle (trapped guest WFI, PSCI CPU_SUSPEND) runs a real WFI at EL2
+ * on T8152 only with HV_WINDOWS_T8152_WFI, which the launcher sets only after
+ * Phase 3 measurement (a) showed that WFI preserves state there.  Until then
+ * cpu_wfi_stateless() busy-polls for a pending interrupt instead (as M1 did).
+ */
+bool hv_t8152_native_wfi(void)
+{
+    return hv_t8152_wfi;
+}
 
 /*
  * The software GIC CPU interface (trapped ICC_* accesses, no list registers)
@@ -196,14 +208,17 @@ void hv_kick_cpu(int cpu)
 }
 
 /*
- * The only way the Windows personality resets the machine.  A watchdog (WD1)
- * reset must never follow writes that NVMe has not committed, so:
+ * Carrier resets (HV panic, unhandled guest exception, watchdog bark) name
+ * their reason here and end in flush_and_reboot(), which under AURA_WINDOWS
+ * is the personality's single reset path: the generic panic(), assert and
+ * unhandled-EL2-exception paths reach it too.  A watchdog (WD1) reset must
+ * never follow writes that NVMe has not committed, so:
  *
  *  - the guest never owns ANS here: on T8152 the stage-2 denylist keeps ANS
  *    and SART out of the guest (a future milestone that passes them through
- *    must make this function shut the guest's controller down first);
- *  - aura's own NVMe session, if any, is shut down first;
- *  - if that fails, or this is re-entered, the CPU parks instead.  A park
+ *    must make flush_and_reboot() shut the guest's controller down first);
+ *  - flush_and_reboot() shuts aura's own NVMe session, if any, down first;
+ *  - if that fails, or it is re-entered, the CPU parks instead.  A park
  *    loses nothing that a reset would not; it needs a power-button hold.
  *
  * PSCI SYSTEM_RESET does not come here: it returns 2 to the host proxy
@@ -212,24 +227,8 @@ void hv_kick_cpu(int cpu)
  */
 void hv_safe_reset(const char *why)
 {
-    static int entered;
-
-    printf("HV: reset requested: %s\n", why);
-    if (__atomic_fetch_add(&entered, 1, __ATOMIC_ACQ_REL)) {
-        printf("HV: reset re-entered; parking this CPU\n");
-        goto park;
-    }
-    if (!nvme_shutdown()) {
-        printf("HV: NVMe shutdown failed; not resetting. Parking (hold power to exit)\n");
-        goto park;
-    }
-    printf("HV: NVMe is shut down; resetting through WD1\n");
+    printf("HV: reset requested: %s (NVMe shutdown first, else park)\n", why);
     flush_and_reboot();
-
-park:
-    iodev_console_flush();
-    while (1)
-        sysop("wfe");
 }
 
 int hv_windows_configure(u64 flags)
@@ -238,9 +237,10 @@ int hv_windows_configure(u64 flags)
         ((hv_windows_flags & HV_WINDOWS_CPUFREQ) && !(flags & HV_WINDOWS_CPUFREQ)) ||
         flags & ~(HV_WINDOWS_GUEST_COMPAT | HV_WINDOWS_FB_SHADOW | HV_WINDOWS_SERIAL_CAPTURE |
                   HV_WINDOWS_SERIAL_CDC | HV_WINDOWS_MTP | HV_WINDOWS_CPUFREQ |
-                  HV_WINDOWS_T8152_FAST_IPI | HV_WINDOWS_T8152_SOFT_GIC))
+                  HV_WINDOWS_T8152_FAST_IPI | HV_WINDOWS_T8152_SOFT_GIC | HV_WINDOWS_T8152_WFI))
         return -1;
-    if ((flags & (HV_WINDOWS_T8152_FAST_IPI | HV_WINDOWS_T8152_SOFT_GIC)) && chip_id != T8152)
+    if ((flags & (HV_WINDOWS_T8152_FAST_IPI | HV_WINDOWS_T8152_SOFT_GIC | HV_WINDOWS_T8152_WFI)) &&
+        chip_id != T8152)
         return -1;
     if ((flags & HV_WINDOWS_SERIAL_CDC) &&
         ((flags & HV_WINDOWS_SERIAL_CAPTURE) || uartproxy_iodev < IODEV_USB0 ||
@@ -255,6 +255,7 @@ int hv_windows_configure(u64 flags)
     hv_windows_flags = flags;
     hv_t8152_fast_ipi = flags & HV_WINDOWS_T8152_FAST_IPI;
     hv_t8152_soft_gic = flags & HV_WINDOWS_T8152_SOFT_GIC;
+    hv_t8152_wfi = flags & HV_WINDOWS_T8152_WFI;
     return 0;
 }
 
@@ -1361,14 +1362,12 @@ int hv_start(void *entry, u64 regs[4])
         adt_base = ADT_EL2_42_BIT;
 
     // map the address of the (EL2) ADT to a fixed location so EL1 can patch it.
-    // On T8152 it is aura's live ADT, so the guest only gets to read it.
+    // Not on T8152: that would be aura's unfiltered live ADT (QSPI, NVRAM, i2c,
+    // audio, AOP, ADMAC nodes included).  The J804 Mu reads only its own copy of
+    // the filtered guest ADT (PcdAdtPointer, from boot_args), never this alias.
     u64 adt_size = ALIGN_UP(cur_boot_args.devtree_size, SZ_16K);
-    int adt_mapped;
-    if (chip_id == T8152)
-        adt_mapped = hv_t8152_allow(adt_base, (u64)adt, adt_size, true, "Mu ADT alias") < 0
-                         ? -1
-                         : hv_map_hw_ro(adt_base, (u64)adt, adt_size);
-    else
+    int adt_mapped = 0;
+    if (chip_id != T8152)
         adt_mapped = hv_map_hw(adt_base, (u64)adt, adt_size);
     if (adt_mapped < 0) {
         printf("HV: cannot map the Mu ADT alias\n");

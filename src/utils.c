@@ -12,6 +12,9 @@
 #include "utils.h"
 #include "vsprintf.h"
 #include "xnuboot.h"
+#ifdef AURA_WINDOWS
+#include "nvme.h"
+#endif
 
 bool is_mac;
 
@@ -231,8 +234,32 @@ void flush_and_reboot(void)
             sysop("wfe");
     }
 #endif
+#ifdef AURA_WINDOWS
+    /*
+     * The Windows personality's one reset path (PLAN 0.5): panic(), assert,
+     * unhandled EL2 exceptions and hv_safe_reset() all end here.  A WD1 reset
+     * must never follow writes NVMe has not committed, so shut aura's NVMe
+     * session down first (a no-op without one); if that fails, or this is
+     * re-entered (a panic inside the shutdown, a second CPU), park instead.
+     */
+    static int entered;
+    if (__atomic_fetch_add(&entered, 1, __ATOMIC_ACQ_REL)) {
+        printf("reset re-entered; parking this CPU\n");
+        goto park;
+    }
+    if (!nvme_shutdown()) {
+        printf("NVMe shutdown failed; not resetting. Parking (hold power to exit)\n");
+        goto park;
+    }
+#endif
     iodev_console_flush();
     reboot();
+#ifdef AURA_WINDOWS
+park:
+    iodev_console_flush();
+    while (1)
+        sysop("wfe");
+#endif
 }
 
 void spin_init(spinlock_t *lock)

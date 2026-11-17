@@ -36,6 +36,9 @@ void hv_windows_quarantine(void);
 #define HV_WINDOWS_T8152_FAST_IPI BIT(16)
 /* T8152 only, after Phase 3 measurement (f): the software GIC CPU interface (as T8142). */
 #define HV_WINDOWS_T8152_SOFT_GIC BIT(17)
+/* T8152 only, after Phase 3 measurement (a) (WFI_PRESERVES): idle with a real WFI at EL2. */
+#define HV_WINDOWS_T8152_WFI BIT(18)
+bool hv_t8152_native_wfi(void);
 bool hv_fast_ipi(void);
 bool hv_soft_gic_cpuif(void);
 void hv_kick_cpu(int cpu);

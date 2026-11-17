@@ -54,12 +54,17 @@
  * owns its own interrupts and must not have them redirected to EL2.
  *
  * SGIs and PPIs deliberately do not arm it.  They are not AIC lines.
+ *
+ * T8152 (J804) takes the same path: its Mu profile derives from the J873 one,
+ * whose ExitBootServices clears the enable, and aura never sets it there.
+ * Whether delivery then works on J804 is an M2 hardware check.
  */
 static bool hv_vgic_aic_armed = false;
 
 static void hv_vgic_arm_device_delivery(u32 irq_num)
 {
-    if (hv_vgic_aic_armed || irq_num < 32 || chip_id != T8142)
+    /* Twin-bug rule: every chip this carrier runs a native-AIC guest on. */
+    if (hv_vgic_aic_armed || irq_num < 32 || (chip_id != T8142 && chip_id != T8152))
         return;
 
     hv_vgic_aic_armed = true;

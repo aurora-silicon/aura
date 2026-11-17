@@ -110,8 +110,8 @@ def run(case="success"):
         def hv_init(self): trace.append("hv_init"); return 0
         def hv_map_vuart(self, *a): trace.append("vuart")
 
-        def hv_windows_guest_ram(self, base, size):
-            trace.append(("guest_ram", base, size))
+        def hv_windows_guest_ram(self, base, size, host_top):
+            trace.append(("guest_ram", base, size, host_top))
             return -1 if case == "resident-refuses" else 0
 
         def hv_map(self, ipa, to, size, incr):
@@ -164,7 +164,7 @@ def run(case="success"):
 def test_t8152_host_maps_only_the_window_and_the_aic():
     r = run()
     assert r.result == 2
-    ram = ("guest_ram", WINDOW[0], WINDOW[1] - WINDOW[0])
+    ram = ("guest_ram", WINDOW[0], WINDOW[1] - WINDOW[0], 0x10024000000)  # + the launcher heap top
     assert ram in r.trace and r.trace.index("hv_init") < r.trace.index(ram)
     hw = [(ipa, to & ~0x3fff, size) for ipa, to, size, incr in r.maps if to & VALID]
     assert hw, "nothing mapped"
@@ -176,7 +176,8 @@ def test_t8152_host_maps_only_the_window_and_the_aic():
     assert not any(pa <= QSPI < pa + size for ipa, pa, size in hw)
     config = next(t for t in r.trace if isinstance(t, tuple) and t[0] == "config")
     assert config[1] & windows.CONFIG_FRAMEBUFFER_SHADOW
-    assert not config[1] & (windows.CONFIG_T8152_FAST_IPI | windows.CONFIG_T8152_SOFT_GIC)
+    assert not config[1] & (windows.CONFIG_T8152_FAST_IPI | windows.CONFIG_T8152_SOFT_GIC |
+                            windows.CONFIG_T8152_WFI)
 
 
 def test_t8152_guest_placement_and_adt():

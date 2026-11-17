@@ -39,6 +39,9 @@ parser.add_argument('--windows-ipi', choices=('poll', 'fast'), default='poll',
 parser.add_argument('--windows-gic-cpuif', choices=('carrier', 'software'), default='carrier',
                     help='T8152: the software GIC CPU interface (as T8142), only after Phase 3 '
                          'measurement (f) showed ICC_* accesses trap to EL2.')
+parser.add_argument('--windows-wfi', choices=('poll', 'wfi'), default='poll',
+                    help='T8152: carrier idle busy-polls (default) or, only after Phase 3 '
+                         'measurement (a) showed WFI_PRESERVES, runs a real WFI at EL2.')
 parser.add_argument('--windows-serial', choices=('cdc', 'disabled'), default='cdc',
                     help='T8152: guest vUART on the dedicated CDC interface (default) or off.')
 parser.add_argument('--windows-reset-on-exit', action='store_true',
@@ -105,6 +108,7 @@ def run_windows_t8152(caps):
     hv.windows_guest_ram = (base, top)
     hv.windows_ipi = args.windows_ipi
     hv.windows_gic_cpuif = args.windows_gic_cpuif
+    hv.windows_wfi = args.windows_wfi
     hv.init()
     if args.logfile:
         hv.set_logfile(args.logfile.open("w"))
@@ -136,7 +140,7 @@ _windows_caps = windows_resident_caps()
 if _windows_caps and p.get_chipid() == 0x8152:
     run_windows_t8152(_windows_caps)
 elif (args.windows_guest_ram or args.windows_ipi != 'poll' or args.windows_reset_on_exit or
-      args.windows_gic_cpuif != 'carrier'):
+      args.windows_gic_cpuif != 'carrier' or args.windows_wfi != 'poll'):
     sys.exit("--windows-* options need the Windows personality (gmake WINDOWS=1) on T8152")
 
 if args.emulate_sprr or not p.get_cpu_features().apple_sysregs_unlocked:

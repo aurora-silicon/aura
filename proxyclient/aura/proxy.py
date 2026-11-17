@@ -1330,8 +1330,10 @@ class AuraProxy(Reloadable):
         `win`/`win_size` (16 KiB aligned, from the proxy heap). Returns 0 or a
         negative refusal; nothing is mapped on refusal."""
         return self.request(self.P_HV_MAP_XFER, base, win, win_size, signed=True)
-    def hv_windows_guest_ram(self, base, size):
-        return self.request(self.P_HV_WINDOWS_GUEST_RAM, base, size, signed=True)
+
+    def hv_windows_guest_ram(self, base, size, host_top):
+        # host_top: top of this launcher's heap (ProxyUtils.heap_top), above aura's heap limit.
+        return self.request(self.P_HV_WINDOWS_GUEST_RAM, base, size, host_top, signed=True)
 
     def fb_init(self):
         return self.request(self.P_FB_INIT)

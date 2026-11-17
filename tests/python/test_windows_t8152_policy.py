@@ -56,7 +56,8 @@ extern char *fake_base;
     "string.h": "#pragma once\n#include <string.h>\n",
     "memory.h": "#pragma once\n",
     "smp.h": "#pragma once\n",
-    "heapblock.h": "#pragma once\n#include \"types.h\"\nuintptr_t heapblock_high_water(void);\n",
+    "heapblock.h": "#pragma once\n#include \"types.h\"\nuintptr_t heapblock_high_water(void);\n"
+                   "uintptr_t heapblock_limit(void);\n",
     "ctxr_exec.h": r"""
 #pragma once
 #include "types.h"
@@ -134,6 +135,8 @@ HARNESS = r"""
 #define CTXR_D_LO 0x10008000000UL
 #define CTXR_D_HI 0x10010000000UL
 #define HEAP_TOP  0x10012000000UL
+#define HEAP_LIM  0x10018000000UL /* aura's heap may grow to here */
+#define HOST_TOP  0x10020000000UL /* the launcher's heap, above the limit */
 #define MTE       0x100f0000000UL
 #define WIN_LO    0x10040000000UL
 #define WIN_HI    0x100f0000000UL
@@ -142,6 +145,7 @@ HARNESS = r"""
 #define QSPI_ADT  0x2b0000000UL
 #define UART0     0x2c0000000UL
 #define J804_QSPI 0x331118000UL
+#define PMGR      0x2d0000000UL /* a node with more than 32 regs, like J804 pmgr-child */
 #define S2_HW     (1UL | (1UL << 10) | (3UL << 8) | (3UL << 6) | (0xfUL << 2))
 #define S2_RO     (1UL | (1UL << 10) | (3UL << 8) | (1UL << 6) | (0xfUL << 2))
 #define S2_HOOK   (1UL << 50)
@@ -153,8 +157,11 @@ char *fake_base = (char *)AURA;
 struct aic fake_aic = {AIC_BASE, 3, 0x960}, *aic = &fake_aic;
 struct boot_args cur_boot_args;
 static bool ctxr_ok = true, qspi_present = true;
+static int pmgr_regs = 40;
+static u64 heap_lim = HEAP_LIM;
 
 uintptr_t heapblock_high_water(void) { return HEAP_TOP; }
+uintptr_t heapblock_limit(void) { return heap_lim; }
 bool ctxr_range(enum ctxr_range range, u64 *start, u64 *end)
 {
     if (range != CTXR_RANGE_D || !ctxr_ok)
@@ -165,9 +172,10 @@ bool ctxr_range(enum ctxr_range range, u64 *start, u64 *end)
 }
 
 /* Fake ADT: node ids are small integers; properties live in a byte buffer. */
-enum { N_ROOT = 1, N_ARMIO, N_QSPI, N_SEP, N_WDT, N_AIC, N_I2C3, N_UART0, N_ADMAC, N_CO, N_MM };
+enum { N_ROOT = 1, N_ARMIO, N_QSPI, N_SEP, N_WDT, N_AIC, N_I2C3, N_UART0, N_ADMAC, N_PMGR, N_CO,
+       N_MM };
 static const char *names[] = {"", "", "arm-io", "qspi", "sep", "wdt", "aic", "i2c3", "uart0",
-                              "admac-base-ns", "carveout-memory-map", "memory-map"};
+                              "admac-base-ns", "pmgr-child", "carveout-memory-map", "memory-map"};
 static const u64 regs[][2] = {
     [N_QSPI] = {QSPI_ADT, 0x8000},   [N_SEP] = {0x2a8000000, 0x74000},
     [N_WDT] = {0x2b8000000, 0x4000}, [N_AIC] = {AIC_BASE, AIC_SIZE},
@@ -207,11 +215,18 @@ const char *adt_get_name(const void *a, int n) { (void)a; return names[n]; }
 int adt_get_reg(const void *a, int *path, const char *prop, int idx, u64 *addr, u64 *size)
 {
     (void)a; (void)prop;
-    if (idx || path[2]) return -1;
+    if (path[2]) return -1;
+    if (path[1] == N_PMGR) {
+        if (idx >= pmgr_regs) return -1;
+        /* Past 40, empty entries: a long node must hit the walk's cap, not the denylist's. */
+        *addr = PMGR + (u64)idx * 0x10000; *size = idx < 40 ? 0x4000 : 0;
+        return 0;
+    }
+    if (idx) return -1;
     *addr = regs[path[1]][0]; *size = regs[path[1]][1];
     return 0;
 }
-int adt_get_child_count(const void *a, int n) { (void)a; return n == N_ARMIO ? (qspi_present ? 7 : 6) : 0; }
+int adt_get_child_count(const void *a, int n) { (void)a; return n == N_ARMIO ? (qspi_present ? 8 : 7) : 0; }
 int adt_first_child_offset(const void *a, int n) { (void)a; (void)n; return qspi_present ? N_QSPI : N_SEP; }
 int adt_next_sibling_offset(const void *a, int n) { (void)a; return n + 1; }
 int adt_get_property_count(const void *a, int n) { (void)a; return n == N_CO ? co_count : n == N_MM ? mm_count : 0; }
@@ -277,7 +292,7 @@ int main(void)
     boot();
     /* Not armed: the filter is transparent and every entry is refused. */
     assert(map(J804_QSPI, J804_QSPI | S2_HW, 0x4000) == (J804_QSPI | S2_HW));
-    assert(hv_t8152_set_guest_ram(WIN_LO, WIN_HI - WIN_LO) < 0);
+    assert(hv_t8152_set_guest_ram(WIN_LO, WIN_HI - WIN_LO, HOST_TOP) < 0);
 
     /* Preflight refusals, one at a time. */
     ctxr_ok = false;
@@ -298,21 +313,31 @@ int main(void)
     aic = NULL;
     assert(hv_t8152_preflight() < 0);
     aic = &fake_aic;
+    pmgr_regs = 1025; /* more reg entries than the walk takes: refuse, never truncate */
+    assert(hv_t8152_preflight() < 0);
+    pmgr_regs = 40;
     assert(hv_t8152_preflight() == 0 && hv_t8152_policy_armed());
 
     /* Guest RAM window. */
-    assert(hv_t8152_set_guest_ram(WIN_LO + 0x4000, 0x40000000) < 0);  /* not 64 KiB aligned */
-    assert(hv_t8152_set_guest_ram(WIN_LO, 0x1000000) < 0);             /* below 256 MiB */
-    assert(hv_t8152_set_guest_ram(0x10020000000, 0x20000000) < 0);     /* region-id-353 */
-    assert(hv_t8152_set_guest_ram(0x10028000000, 0x10000000) < 0);     /* region-id-60 */
-    assert(hv_t8152_set_guest_ram(WIN_LO, MTE - WIN_LO + 0x10000) < 0);/* MTE tag storage */
-    assert(hv_t8152_set_guest_ram(0x10008000000, 0x10000000) < 0);     /* aura / CTXR_D */
-    assert(hv_t8152_set_guest_ram(WIN_LO, DRAM + DRAM_SIZE + 0x10000 - WIN_LO) < 0); /* past RAM */
+    assert(hv_t8152_set_guest_ram(WIN_LO + 0x4000, 0x40000000, HOST_TOP) < 0);  /* not 64 KiB aligned */
+    assert(hv_t8152_set_guest_ram(WIN_LO, 0x1000000, HOST_TOP) < 0);             /* below 256 MiB */
+    assert(hv_t8152_set_guest_ram(0x10020000000, 0x20000000, HOST_TOP) < 0);     /* region-id-353 */
+    assert(hv_t8152_set_guest_ram(0x10028000000, 0x10000000, HOST_TOP) < 0);     /* region-id-60 */
+    assert(hv_t8152_set_guest_ram(WIN_LO, MTE - WIN_LO + 0x10000, HOST_TOP) < 0);/* MTE tag storage */
+    assert(hv_t8152_set_guest_ram(0x10008000000, 0x10000000, HOST_TOP) < 0);     /* aura / CTXR_D */
+    assert(hv_t8152_set_guest_ram(WIN_LO, DRAM + DRAM_SIZE + 0x10000 - WIN_LO, HOST_TOP) < 0); /* past RAM */
+    assert(hv_t8152_set_guest_ram(WIN_LO, WIN_HI - WIN_LO, 0) < 0);          /* no host heap top */
+    assert(hv_t8152_set_guest_ram(WIN_LO, WIN_HI - WIN_LO, WIN_LO + 0x10000) < 0); /* host heap */
+    heap_lim = 0;
+    assert(hv_t8152_set_guest_ram(WIN_LO, WIN_HI - WIN_LO, HOST_TOP) < 0);   /* unbounded heap */
+    heap_lim = WIN_LO + 0x4000;
+    assert(hv_t8152_set_guest_ram(WIN_LO, WIN_HI - WIN_LO, HOST_TOP) < 0);   /* heap limit */
+    heap_lim = HEAP_LIM;
     u64 b, s;
     assert(!hv_t8152_guest_ram(&b, &s));
-    assert(hv_t8152_set_guest_ram(WIN_LO, WIN_HI - WIN_LO) == 0);
+    assert(hv_t8152_set_guest_ram(WIN_LO, WIN_HI - WIN_LO, HOST_TOP) == 0);
     assert(hv_t8152_guest_ram(&b, &s) && b == WIN_LO && s == WIN_HI - WIN_LO);
-    assert(hv_t8152_set_guest_ram(WIN_LO, WIN_HI - WIN_LO) < 0);       /* once per session */
+    assert(hv_t8152_set_guest_ram(WIN_LO, WIN_HI - WIN_LO, HOST_TOP) < 0);       /* once per session */
 
     /* Map-time filter. */
     assert(map(J804_QSPI, J804_QSPI | S2_HW, 0x4000) == 0xdead);        /* fixed NVRAM copy */
@@ -331,7 +356,11 @@ int main(void)
     assert(aic_pte != 0xdead && ((aic_pte >> 2) & 0xf) == 0);            /* Device-nGnRnE */
     assert(map(0x2c0001000, (u64)0x1234 | S2_HOOK, 0x1000) == ((u64)0x1234 | S2_HOOK));
     assert(map(J804_QSPI, (7UL << 2) | S2_PROXY, 0x4000) == 0xdead);              /* host hook on NVRAM */
-    assert(map(UART0, (7UL << 2) | S2_PROXY, 0x4000) != 0xdead);
+    assert(map(UART0, (7UL << 2) | S2_PROXY, 0x4000) == 0xdead);   /* any host hook: PA = IPA */
+    assert(map(0x3f0000000, (7UL << 2) | S2_PROXY, 0x4000) == 0xdead);
+    /* Reg entries past the 32nd still reach the denylist (J804 pmgr-child has 64). */
+    puts("PMGR TAIL CHECK");
+    assert(map(PMGR + 34 * 0x10000, (PMGR + 34 * 0x10000) | S2_HW, 0x4000) == 0xdead);
     assert(map(J804_QSPI, 0, 0x4000) == 0);                               /* unmap always ok */
     assert(map(J804_QSPI, J804_QSPI, 0x4000) == 0xdead);                 /* sw map onto NVRAM */
 
@@ -369,6 +398,8 @@ int main(void)
     assert(hv_t8152_verify(WIN_LO + 0x800, WIN_LO, hcr_ok, true) < 0);         /* NVRAM */
     leaves[nleaves - 1] = (struct leaf){J804_QSPI, 4, (9UL << 2) | S2_PROXY, 4};
     assert(hv_t8152_verify(WIN_LO + 0x800, WIN_LO, hcr_ok, true) < 0);         /* host hook */
+    leaves[nleaves - 1] = (struct leaf){UART0, 4, (9UL << 2) | S2_PROXY, 4};
+    assert(hv_t8152_verify(WIN_LO + 0x800, WIN_LO, hcr_ok, true) < 0);         /* any host hook */
     leaves[nleaves - 1] = (struct leaf){0x2000000000, 0x2000000, 0x10006000000 | S2_HW | 2, 2};
     assert(hv_t8152_verify(WIN_LO + 0x800, WIN_LO, hcr_ok, true) < 0);         /* aura RAM */
     nleaves--;
@@ -410,3 +441,12 @@ def test_t8152_carrier_policy(tmp_path):
     assert "qspi NOR/NVRAM (J804 fixed)" in result.stdout
     assert "MMIO passthrough must be Device-nGnRnE" in result.stdout
     assert "stage 2 verified" in result.stdout
+    # Findings from review: no truncated reg walk, no host hooks, the whole heap span.
+    assert "pmgr-child has more than 1024 reg entries" in result.stdout
+    tail = result.stdout.split("PMGR TAIL CHECK", 1)[1].splitlines()[1]
+    assert tail.endswith(": pmgr-child"), tail
+    assert "refusing a host hook at IPA 0x2c0000000" in result.stdout
+    assert "host (proxy) hook: the host would access PA = IPA" in result.stdout
+    assert "did not report the top of its heap" in result.stdout
+    assert "heap has no limit" in result.stdout
+    assert "overlaps aura and its heaps" in result.stdout

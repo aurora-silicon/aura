@@ -665,7 +665,8 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
             break;
         case P_HV_WINDOWS_GUEST_RAM:
 #ifdef AURA_WINDOWS
-            reply->retval = hv_t8152_set_guest_ram(request->args[0], request->args[1]);
+            reply->retval =
+                hv_t8152_set_guest_ram(request->args[0], request->args[1], request->args[2]);
 #else
             reply->retval = -1;
 #endif
@@ -684,7 +685,7 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
 #else
             reply->retval = -1;
 #endif
-        break;
+            break;
 
         case P_FB_INIT:
             fb_init(request->args[0]);

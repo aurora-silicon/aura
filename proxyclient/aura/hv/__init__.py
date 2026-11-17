@@ -123,6 +123,7 @@ class HV(Reloadable):
         self.windows_guest_ram = None    # T8152: (base, top) of the only guest RAM
         self.windows_ipi = "poll"        # T8152: "fast" only after Phase 3 measurement (c)
         self.windows_gic_cpuif = "carrier"  # T8152: "software" only after measurement (f)
+        self.windows_wfi = "poll"        # T8152: "wfi" only after Phase 3 measurement (a)
         self.windows_hidden = []
         self.pac_mask = self.PAC_MASK
         self.user_pac_mask = self.PAC_MASK
@@ -1555,7 +1556,8 @@ class HV(Reloadable):
                                    CONFIG_T8142_EXPERIMENTAL, CONFIG_SERIAL_CAPTURE,
                                    CONFIG_SERIAL_CDC, CONFIG_MTP, CONFIG_CPUFREQ, MTP_DISABLED_PROPERTY,
                                    MTP_RESERVED_BASE, MTP_RESERVED_SIZE, ecpu_boot_state_khz,
-                                   CONFIG_T8152_FAST_IPI, CONFIG_T8152_SOFT_GIC, T8152_CHIP,
+                                   CONFIG_T8152_FAST_IPI, CONFIG_T8152_SOFT_GIC, CONFIG_T8152_WFI,
+                                   T8152_CHIP,
                                    validate_capabilities)
             self.windows_t8152 = self.adt["/chosen"].chip_id == T8152_CHIP
             if self.windows_t8152:
@@ -1564,7 +1566,7 @@ class HV(Reloadable):
                 if self.windows_framebuffer != "bgra-shadow":
                     raise ValueError("T8152 needs framebuffer bgra-shadow")
             elif (self.windows_guest_ram is not None or self.windows_ipi != "poll" or
-                  self.windows_gic_cpuif != "carrier"):
+                  self.windows_gic_cpuif != "carrier" or self.windows_wfi != "poll"):
                 raise ValueError("guest RAM window, IPI mode and GIC cpuif are T8152 options")
             caps = validate_capabilities(self.p.hv_windows_capabilities(), self.windows_framebuffer,
                                          self.windows_guest_compatibility, self.windows_n1,
@@ -1621,6 +1623,8 @@ class HV(Reloadable):
                     flags |= CONFIG_T8152_FAST_IPI
                 if self.windows_gic_cpuif == "software":
                     flags |= CONFIG_T8152_SOFT_GIC
+                if self.windows_wfi == "wfi":
+                    flags |= CONFIG_T8152_WFI
                 if self.p.hv_windows_configure(flags) != 0:
                     raise RuntimeError("Windows hypervisor configuration rejected")
                 # Applied once by hv_start() before guest entry; never retried on this resident.
@@ -2125,7 +2129,7 @@ class HV(Reloadable):
         if t8152:
             # The guest owns exactly its window; nothing of aura's heap (region-id-353).
             ram_lo, ram_hi = self.windows_guest_ram
-            if self.p.hv_windows_guest_ram(ram_lo, ram_hi - ram_lo) != 0:
+            if self.p.hv_windows_guest_ram(ram_lo, ram_hi - ram_lo, self.u.heap_top) != 0:
                 raise RuntimeError("resident refused the T8152 guest RAM window (see its console)")
             self.phys_base = phys_base = guest_base = ram_lo
         else:

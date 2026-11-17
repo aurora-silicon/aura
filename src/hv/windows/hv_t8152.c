@@ -22,17 +22,18 @@
 #include "utils.h"
 #include "xnuboot.h"
 
-#define J804_BOARD_ID      0x22
-#define J804_BOOT_MPIDR    0x10100
-#define J804_QSPI_BASE     0x331118000UL
-#define J804_QSPI_SIZE     0x8000UL /* the two 16 KiB controller pages */
-#define T8152_PAGE         0x4000UL
-#define T8152_GUEST_ALIGN  0x10000UL /* Arm UEFI runtime regions: 64 KiB */
-#define T8152_MIN_GUEST    (256UL << 20)
-#define T8152_MAX_DENY     640
-#define T8152_MAX_ALLOW    8
-#define T8152_MAX_MMIO     2
-#define T8152_REPORT_LIMIT 16
+#define J804_BOARD_ID       0x22
+#define J804_BOOT_MPIDR     0x10100
+#define J804_QSPI_BASE      0x331118000UL
+#define J804_QSPI_SIZE      0x8000UL /* the two 16 KiB controller pages */
+#define T8152_PAGE          0x4000UL
+#define T8152_GUEST_ALIGN   0x10000UL /* Arm UEFI runtime regions: 64 KiB */
+#define T8152_MIN_GUEST     (256UL << 20)
+#define T8152_MAX_DENY      640
+#define T8152_MAX_NODE_REGS 1024 /* per node; J804 pmgr-child has 64, error-handler 120 */
+#define T8152_MAX_ALLOW     8
+#define T8152_MAX_MMIO      2
+#define T8152_REPORT_LIMIT  16
 
 #define S2_MEMATTR       GENMASK(5, 2)
 #define S2_MEMATTR_NGNRE 0x0UL /* Device-nGnRnE */
@@ -138,19 +139,22 @@ static bool deny_name(const char *name)
     return false;
 }
 
+/* Every reg entry of the node, however many: a silently dropped tail is a hole. */
 static int deny_node_regs(int *path, const char *name, bool *found)
 {
-    for (int idx = 0; idx < 32; idx++) {
+    for (int idx = 0; idx < T8152_MAX_NODE_REGS; idx++) {
         u64 base, size;
         if (adt_get_reg(adt, path, "reg", idx, &base, &size) < 0)
-            break;
+            return 0;
         if (!size)
             continue;
         *found = true;
         if (deny_add(base, size, name))
             return -1;
     }
-    return 0;
+    printf("HV: T8152: /arm-io/%s has more than %d reg entries; refusing an incomplete denylist\n",
+           name, T8152_MAX_NODE_REGS);
+    return -1;
 }
 
 static int carveout(const char *id, u64 *start, u64 *size)
@@ -311,7 +315,7 @@ int hv_t8152_preflight(void)
     return 0;
 }
 
-static int ram_conflicts(u64 base, u64 top)
+static int ram_conflicts(u64 base, u64 top, u64 host_top)
 {
     int bad = 0;
     int node = adt_path_offset(adt, "/chosen/carveout-memory-map");
@@ -368,7 +372,20 @@ static int ram_conflicts(u64 base, u64 top)
         }
     }
 
+    /*
+     * aura's heap may still grow up to its limit, and the launcher's own heap
+     * sits above that limit (ProxyUtils): the whole span is occupied.
+     */
+    u64 heap_limit = heapblock_limit();
+    if (!heap_limit) {
+        printf("HV: T8152: aura's heap has no limit, so its top is unbounded; refusing\n");
+        bad++;
+    }
     u64 aura_top = heapblock_high_water();
+    if (heap_limit > aura_top)
+        aura_top = heap_limit;
+    if (host_top > aura_top)
+        aura_top = host_top;
     if (overlaps(base, top, (u64)_base, aura_top)) {
         printf("HV: T8152: guest RAM overlaps aura and its heaps [0x%lx, 0x%lx)\n", (u64)_base,
                aura_top);
@@ -395,7 +412,7 @@ static int ram_conflicts(u64 base, u64 top)
     return bad;
 }
 
-int hv_t8152_set_guest_ram(u64 base, u64 size)
+int hv_t8152_set_guest_ram(u64 base, u64 size, u64 host_top)
 {
     if (!armed) {
         printf("HV: T8152: guest RAM refused: the policy is not armed (hv_init first)\n");
@@ -418,7 +435,11 @@ int hv_t8152_set_guest_ram(u64 base, u64 size)
                base, top, dram_start, dram_end);
         return -1;
     }
-    int bad = ram_conflicts(base, top);
+    if (host_top <= (u64)_base) {
+        printf("HV: T8152: the launcher did not report the top of its heap (0x%lx)\n", host_top);
+        return -1;
+    }
+    int bad = ram_conflicts(base, top, host_top);
     if (bad) {
         printf("HV: T8152: guest RAM [0x%lx, 0x%lx) refused (%d conflict(s))\n", base, top, bad);
         return -1;
@@ -507,13 +528,15 @@ bool hv_t8152_map_filter(u64 from, u64 *to, u64 size)
         return true; /* C hooks: emulated by the carrier */
 
     if (!hw && type != SPTE_MAP) {
-        /* Host (proxy) hooks: the host could forward accesses; keep them off denied IPAs. */
+        /*
+         * Host (proxy) hooks: the Python handler performs the access at PA = IPA, and
+         * stage 2 here covers exactly the PA space, so every such hook would be an
+         * MMIO or RAM passthrough the allowlist never saw.  None is allowed.
+         */
         const struct t8152_range *hit = deny_hit(from, from + size);
-        if (hit) {
-            printf("HV: T8152: refusing a host hook on %s at IPA 0x%lx\n", hit->name, from);
-            return false;
-        }
-        return true;
+        printf("HV: T8152: refusing a host hook at IPA 0x%lx +0x%lx%s%s\n", from, size,
+               hit ? ": " : "", hit ? hit->name : "");
+        return false;
     }
 
     u64 pa = hw ? (v & S2_TARGET) : (v & S2_TARGET_L4);
@@ -568,9 +591,7 @@ static bool verify_leaf(void *opaque, u64 ipa, u64 size, u64 pte, int level)
         ctx->hooks++;
     } else {
         ctx->hooks++;
-        const struct t8152_range *hit = deny_hit(ipa, ipa + size);
-        if (hit)
-            why = hit->name;
+        why = "host (proxy) hook: the host would access PA = IPA";
     }
 
     if (why) {
