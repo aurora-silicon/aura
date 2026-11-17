@@ -3389,8 +3389,8 @@ static bool dcp6_dt_describes(void *dt)
  */
 /* The 27.3 DCP keeps the 27.0 interface but numbers its IOMFB methods differently: the kernel
  * selects the 27.3 method tags from "27.3.0" in apple,firmware-compat, so 27.0.0 crashes it. */
-static const struct fw_version_info t6050_fw_27_3 = {V27_0, "27.3", {27, 3, 0}, 3,
-                                                     "mBoot-20457.60.65.0.1"};
+static const struct fw_version_info t6050_fw_27_3 = {
+    V27_0, "27.3", {27, 3, 0}, 3, "mBoot-20457.60.65.0.1"};
 static const struct {
     u32 os_fw;
     const struct fw_version_info *dt_fw; /* what the device tree says: the kernel's interface */
@@ -3428,7 +3428,7 @@ static struct {
     u64 coproc, pmc, pmc_size, vram, vram_size;
     u32 bw_offset, nits, nclk, clk_id[T6050_CLOCKS], clk_hz[T6050_CLOCKS], pmc_ph;
     const char *gamut;
-    const char *uuid; /* the pinned image of the running OS firmware */
+    const char *uuid;                 /* the pinned image of the running OS firmware */
     const struct fw_version_info *fw; /* what the device tree says: the kernel's interface */
     bool ext;
 } t6050;
