@@ -132,11 +132,11 @@
       "CTRR check": [],
       "CTRR reset-path check": [],
       "ctXr lock check": [],
-      "AMCC CTRR match": null
+      "AMCC CTRR match": []
     },
     "ctrr_stash_off": null,
     "ctxr_ctl": null,
     "sptm_va_maps": null,
-    "reviewed": false
+    "reviewed": true
   }
 }

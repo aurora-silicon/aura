@@ -467,7 +467,7 @@ static bool adt_u32_is(int node, const char *name, u32 expected)
     return ADT_GETPROP(adt, node, name, &value) >= 0 && value == expected;
 }
 
-static bool sptm_virt_amcc_watch_t8122(void)
+static bool sptm_virt_amcc_contract_t8122(void)
 {
     int node = adt_path_offset(adt, "/chosen/lock-regs/amcc");
     int bank = node < 0 ? -1 : adt_subnode_offset(adt, node, "amcc-ctrr-a");
@@ -494,7 +494,7 @@ static bool sptm_virt_amcc_watch_t8122(void)
         !adt_u32_is(bank, "write-disable-reg-mask", 1) ||
         !adt_u32_is(bank, "write-disable-reg-value", 1) ||
         !adt_u32_is(bank, "page-size-shift", 14)) {
-        printf("SPTM-virt[amcc]: T8122 lock-reg ADT does not match J613/25G83; not watched\n");
+        printf("SPTM-virt[amcc]: T8122 lock-reg ADT does not match J613/25G83; not admitted\n");
         return false;
     }
 
@@ -508,18 +508,30 @@ static bool sptm_virt_amcc_watch_t8122(void)
         .cache_status_mask = 1,
         .cache_status_value = 0,
     };
-    memset(amcc_lock_shadow, 0, sizeof(amcc_lock_shadow));
-
     for (int i = 0; i < 2; i++) {
         u64 base, stride;
         int count;
         if (mcc_plane_info(i, &base, &stride, &count) < 0 || base != exact_apertures[i] ||
             stride != 0x40000 || count != 2) {
-            printf("SPTM-virt[amcc]: T8122 MCC plane layout mismatch; not watched\n");
+            printf("SPTM-virt[amcc]: T8122 MCC plane layout mismatch; not admitted\n");
             return false;
         }
     }
 
+    return true;
+}
+
+bool sptm_virt_s2_admit(void)
+{
+    return chip_id != T8122 || sptm_virt_amcc_contract_t8122();
+}
+
+static bool sptm_virt_amcc_watch_t8122(void)
+{
+    if (!sptm_virt_amcc_contract_t8122())
+        return false;
+
+    memset(amcc_lock_shadow, 0, sizeof(amcc_lock_shadow));
     t8122_amcc_ready = true;
     for (int i = 0; i < 2; i++) {
         u64 base, stride;
@@ -545,7 +557,8 @@ static void sptm_virt_amcc_watch(void)
     u64 base, stride;
     int count;
     if (chip_id == T8122) {
-        sptm_virt_amcc_watch_t8122();
+        if (!sptm_virt_amcc_watch_t8122())
+            panic("SPTM-virt[amcc]: T8122 exact shadow setup failed before guest entry\n");
         return;
     }
     /* The plane offsets above are T8142's; other chips keep their AMCC unhooked. */

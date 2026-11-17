@@ -11,24 +11,22 @@ from aura.sptm_j613 import (PROFILE, capability, inspect_patch_export, patch_pla
 
 REAL_IMAGE = os.environ.get('J613_SPTM_IMAGE')
 
-def test_capability_and_incomplete_export():
+def test_capability_and_reviewed_export():
     assert not capability(1 << 24, True)
     assert not capability(2 << 24, False)
     assert capability(2 << 24, True)
-    with pytest.raises(ValueError, match='dirty-room'):
-        patch_plan(None, None)
-    assert unresolved_groups() == ['AMCC CTRR match']
+    assert patch_plan(None, None)['reviewed']
+    assert unresolved_groups() == []
     assert inspect_patch_export(None, None)['unresolved'] == unresolved_groups()
 
 @pytest.mark.skipif(not REAL_IMAGE, reason='exact private J613 SPTM image not given')
-def test_exact_image_partial_export_is_bound_but_not_admitted():
+def test_exact_image_export_is_bound_and_admitted():
     image = Path(REAL_IMAGE).read_bytes()
     partial = inspect_patch_export(image, int(PROFILE['patch_export']['entry_file_offset'], 0))
     assert len(partial['patches']) == 2
     assert {p[1] for p in partial['patches']} == {0x3438, -0xc2c4}
-    assert not partial['reviewed']
-    with pytest.raises(ValueError, match='AMCC CTRR match'):
-        patch_plan(image, int(PROFILE['patch_export']['entry_file_offset'], 0))
+    assert partial['reviewed']
+    assert patch_plan(image, int(PROFILE['patch_export']['entry_file_offset'], 0)) == partial
 
 def test_adt_validation_before_hooks():
     regs = {(r['path'], r['index']): (int(r['base'], 0), int(r['size'], 0))
@@ -38,3 +36,8 @@ def test_adt_validation_before_hooks():
     regs[key] = (0, 0)
     with pytest.raises(ValueError, match='ADT drift'):
         validate_resources(lambda p, i: regs[p, i])
+
+def test_runner_uses_the_exact_j613_plan():
+    source = (Path(__file__).resolve().parents[2] /
+              'proxyclient/tools/run_guest_sptm.py').read_text()
+    assert 'sptm_j613.patch_plan(images["sptm"], entry_off) if chip == 0x8122' in source

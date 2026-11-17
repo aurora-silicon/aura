@@ -79,3 +79,6 @@ def test_t8122_amcc_exact_adt_gate_is_complete():
                   '"lock-reg-offset", 0x69c', '"write-disable-reg-offset", 0x6a0',
                   '"cache-status-reg-offset", 0x1c00', '"page-size-shift", 14'):
         assert token in source
+    assert "bool sptm_virt_s2_admit(void)" in source
+    assert "chip_id != T8122 || sptm_virt_amcc_contract_t8122()" in source
+    assert 'panic("SPTM-virt[amcc]: T8122 exact shadow setup failed' in source

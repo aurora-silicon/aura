@@ -349,9 +349,8 @@ __attribute__((used, retain)) int sptm_virt_load(u64 sptm_entry, u64 handoff)
 {
     struct sptm_virt_layout l;
 
-    /* T8122 register/patch export has not been reviewed. Even a direct proxy call
-     * must not bypass the host profile's refusal. Remove only with that port. */
-    if (!sptm_virt_requested() || chip_id == T8122)
+    /* Direct proxy callers must pass the same exact SoC/ADT contract as the host profile. */
+    if (!sptm_virt_requested() || !sptm_virt_s2_admit())
         return -1;
     if (sptm_virt_layout(&l) < 0) {
         printf("SPTM-virt: load refused, no valid carve-out layout\n");
