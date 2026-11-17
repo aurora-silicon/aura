@@ -30,6 +30,8 @@
 #define HV_INPUT_INTID     991u
 #define HV_INPUT_VERSION   1
 #define HV_INPUT_RX_BUDGET 256u
+/* hv_input_guest_entered(): at most this many pre-entry bytes are discarded (the CDC ring). */
+#define HV_INPUT_ENTRY_DRAIN_MAX 0x100000u
 #define HV_INPUT_WATCHDOG_MS 2000u
 #define HV_INPUT_ERROR     ((u64) - 1)
 
@@ -91,8 +93,9 @@ u64 hv_input_proxy(u64 op, u64 a1, u64 a2, u64 a3);
  * succeeded and the page is wholly this file's hook.  0, or -1 with the reason.
  */
 int hv_input_verify(void);
+/* Just before entry: discard host bytes buffered since ATTACH, start the parser clean. */
 void hv_input_guest_entered(void);
-/* hv_start() returned: every host key and button up, counters printed. */
+/* hv_start() returned: every host key and button up (state only, the vSPI is not driven). */
 void hv_input_guest_exited(int status);
 
 /* The boot CPU's host tick: drain the host feed (bounded), run the watchdog. */

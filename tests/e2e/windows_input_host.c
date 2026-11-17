@@ -1104,6 +1104,152 @@ static void case_overflow(void)
     end();
 }
 
+/*
+ * F11b: the O(n) victim choice and the slot-order ring drop exactly what the original
+ * quadratic scan-and-shift queue dropped.  A second model R sees the same frames and is popped
+ * after every step, which gives the stream of pushed reports (pushes do not depend on the
+ * queue); a reference queue in this file applies the original rule to that stream.  M is
+ * popped rarely, so it overflows nearly all the time.
+ */
+static struct input_model R;
+
+struct ref_entry {
+    u32 seq;
+    u8 id, len;
+    u8 data[INPUT_REPORT_MAX];
+};
+static struct ref_entry refq[INPUT_QUEUE_LEN];
+static u32 ref_n;
+
+static int ref_victim(u8 incoming)
+{
+    int fallback = -1;
+    for (u32 i = 1; i < ref_n; i++) {
+        u8 id = refq[i].id;
+        bool superseded = id == incoming;
+        for (u32 k = i + 1; !superseded && k < ref_n; k++)
+            superseded = refq[k].id == id;
+        if (!superseded)
+            continue;
+        if (id == INPUT_RID_ABSOLUTE || id == INPUT_RID_RELATIVE)
+            return (int)i;
+        if (fallback < 0)
+            fallback = (int)i;
+    }
+    return fallback;
+}
+
+static void ref_push(const struct ref_entry *e)
+{
+    if (ref_n == INPUT_QUEUE_LEN) {
+        int v = ref_victim(e->id);
+        if (v < 0)
+            return;
+        memmove(&refq[v], &refq[v + 1], (ref_n - (u32)v - 1) * sizeof(refq[0]));
+        ref_n--;
+    }
+    refq[ref_n++] = *e;
+}
+
+static int model_pop(struct input_model *m, struct ref_entry *e)
+{
+    u64 v = 0;
+    CHECK(input_model_mmio(m, INPUT_REG_REPORT_LEN, 2, &v, false));
+    u32 len = (u32)v & 0xff;
+    if (!len)
+        return 0;
+    e->len = (u8)len;
+    e->id = (u8)(v >> 8);
+    CHECK(input_model_mmio(m, INPUT_REG_SEQ, 2, &v, false));
+    e->seq = (u32)v;
+    for (u32 i = 0; i < INPUT_REPORT_MAX; i += 8) {
+        CHECK(input_model_mmio(m, INPUT_REG_REPORT + i, 3, &v, false));
+        for (u32 b = 0; b < 8; b++)
+            e->data[i + b] = (u8)(v >> (8 * b));
+    }
+    v = 1;
+    CHECK(input_model_mmio(m, INPUT_REG_POP, 2, &v, true));
+    return 1;
+}
+
+static void both_rx(const u8 *buf, u32 n)
+{
+    input_model_host_rx(&M, buf, n, now);
+    input_model_host_rx(&R, buf, n, now);
+}
+
+static void case_overflow_reference(void)
+{
+    begin("overflow_reference");
+    input_model_init(&R, INPUT_FEAT_SRC_HOST, WATCHDOG);
+    ref_n = 0;
+    rng_state = 0x0f10;
+    u64 en = INPUT_CTRL_ENABLE | INPUT_CTRL_IRQ_EN;
+    CHECK(input_model_mmio(&M, INPUT_REG_CTRL, 2, &en, true));
+    CHECK(input_model_mmio(&R, INPUT_REG_CTRL, 2, &en, true));
+    u32 mismatches = 0, pops = 0;
+    u8 buf[INPUT_HOST_MAX_FRAME + 8];
+    for (int i = 0; i < 40000 && mismatches < 5; i++) {
+        unsigned int r = rng();
+        u32 n;
+        switch (r % 6) {
+            case 0:
+            case 1: {
+                u8 p[4] = {(u8)(rng() & 3), 1, (u8)(4 + rng() % 8)};
+                n = frame(buf, INPUT_HOST_KEYS, p, 3);
+                break;
+            }
+            case 2: {
+                u16 x = (u16)(rng() % 32768), y = (u16)(rng() % 32768);
+                u8 p[7] = {(u8)(rng() & 1), (u8)x, (u8)(x >> 8), (u8)y, (u8)(y >> 8), 0, 0};
+                n = frame(buf, INPUT_HOST_ABS, p, 7);
+                break;
+            }
+            case 3: {
+                s16 dx = (s16)(rng() % 200 - 100);
+                u8 p[7] = {(u8)(rng() & 1), (u8)dx, (u8)((u16)dx >> 8), 1, 0, 0, 0};
+                n = frame(buf, INPUT_HOST_REL, p, 7);
+                break;
+            }
+            case 4: {
+                u16 u = (u16)(rng() % 3 ? 0xe9 + rng() % 2 : 0);
+                u8 p[2] = {(u8)u, (u8)(u >> 8)};
+                n = frame(buf, INPUT_HOST_CONSUMER, p, 2);
+                break;
+            }
+            default:
+                n = frame(buf, INPUT_HOST_RELEASE_ALL, NULL, 0);
+                break;
+        }
+        both_rx(buf, n);
+        struct ref_entry e;
+        while (model_pop(&R, &e))
+            ref_push(&e);
+        if (rng() % 64 == 0 && ref_n) {
+            struct ref_entry got;
+            CHECK(model_pop(&M, &got));
+            if (got.seq != refq[0].seq || memcmp(got.data, refq[0].data, refq[0].len))
+                mismatches++;
+            memmove(&refq[0], &refq[1], (ref_n - 1) * sizeof(refq[0]));
+            ref_n--;
+            pops++;
+        }
+    }
+    u32 n = 0;
+    struct ref_entry got;
+    while (model_pop(&M, &got)) {
+        if (n >= ref_n || got.seq != refq[n].seq || got.len != refq[n].len ||
+            memcmp(got.data, refq[n].data, got.len))
+            mismatches++;
+        n++;
+    }
+    EQ(n, ref_n);
+    EQ(mismatches, 0);
+    CHECK(stat(INPUT_ST_DROPPED) > 10000);
+    add_extra(",\"pops\":%u,\"dropped\":%u", pops, stat(INPUT_ST_DROPPED));
+    end();
+}
+
 /* F14: widths and alignment. */
 static void case_access_widths(void)
 {
@@ -1341,6 +1487,7 @@ int main(int argc, char **argv)
     case_release_all();
     case_merge();
     case_overflow();
+    case_overflow_reference();
     case_access_widths();
     case_out_reports();
     case_spi_gate();

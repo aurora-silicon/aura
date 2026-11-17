@@ -175,8 +175,13 @@ struct input_model {
     u8 out_data[INPUT_REPORT_MAX];
     u8 leds;
 
-    /* Queue: a ring, the head is the latched report. */
+    /*
+     * Queue: a ring of slot numbers (q_order, a permutation of 0..255) over the report slots,
+     * so dropping a report from the middle moves at most 255 bytes, never the reports.  The
+     * head is the latched report.
+     */
     struct input_report q[INPUT_QUEUE_LEN];
+    u8 q_order[INPUT_QUEUE_LEN];
     u32 q_head, q_count;
     u32 next_seq;
 
@@ -231,6 +236,12 @@ void input_model_set_keyboard(struct input_model *m, u32 src, u8 mods,
 
 /* All of one source's keys and buttons up (watchdog, RELEASE_ALL, carrier exit). */
 void input_model_release(struct input_model *m, u32 src);
+
+/*
+ * Guest entry: the host parser forgets any partial frame and the last sequence number, and the
+ * host source is released (state only before ENABLE).  The glue discards pre-entry bytes first.
+ */
+void input_model_host_restart(struct input_model *m);
 
 /* Queue depth and the counters, for the glue's report and STATUS op. */
 u32 input_model_depth(const struct input_model *m);

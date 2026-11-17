@@ -19,7 +19,8 @@ Device model (input_model.c, replayed unchanged by tests/e2e/windows_input_host.
       consumer usage; KEEPALIVE refreshes it; invalid frames do not
   F9  frames before the driver's ENABLE only update state; ENABLE emits the current state
   F10 ENABLE 1->0 flushes; RESET flushes, re-emits, clears OVERFLOW; ENABLE+RESET emit once
-  F11 overflow keeps every collection's final state; pointer reports are dropped first
+  F11 overflow keeps every collection's final state; pointer reports are dropped first;
+      F11b the O(n) victim choice drops exactly what the original quadratic rule dropped
   F12 POP on an empty queue or with the wrong value does nothing
   F13 the line is exactly ENABLE && IRQ_EN && a report latched
   F14 8/16-bit, unaligned, LDP-style and out-of-page accesses: RAZ/WI, counted
@@ -43,7 +44,10 @@ Glue (hv_input.c, replayed unchanged by tests/e2e/windows_input_glue_host.c agai
   G6  bad widths through the hook are RAZ/WI, never a guest abort
   G7  the watchdog runs on the tick with the system counter
   G8  hv_start refuses with the flag set and nothing (or a foreign leaf) on the page
-  G9  guest exit releases every host key; DETACH after entry is refused
+  G9  guest exit releases every host key, state only (the vSPI is not driven after exit);
+      DETACH after entry is refused
+  G11 host bytes sent between ATTACH and entry are discarded at entry; the parser and the
+      sequence restart clean
   G10 STATUS indices
 
 Launcher (windows.py, hv/__init__.py, run_guest.py):
@@ -78,10 +82,10 @@ from aura import windows as w  # noqa: E402
 MODEL_CASES = ["crc", "reset_values", "report_layout", "before_enable", "pop_and_line",
                "enable_reset", "no_duplicate", "garbage_resync", "bad_crc_rescan", "bad_header",
                "stalled_header", "bad_payload", "split_feed", "seq_gaps", "watchdog",
-               "release_all", "merge", "overflow", "access_widths", "out_reports", "spi_gate",
-               "fuzz"]
+               "release_all", "merge", "overflow", "overflow_reference", "access_widths",
+               "out_reports", "spi_gate", "fuzz"]
 GLUE_CASES = ["attach_refusals", "attach_once", "poll_budget", "line_sync", "bad_width",
-              "watchdog", "exit", "status"]
+              "watchdog", "exit", "pre_entry", "status"]
 
 TYPES_H = r"""
 #pragma once

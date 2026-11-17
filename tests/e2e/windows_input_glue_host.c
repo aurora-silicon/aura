@@ -312,11 +312,13 @@ static void case_poll_budget(void)
     begin("poll_budget");
     hv_input_enable();
     EQ(attach(HV_INPUT_SRC_HOST, 0, 0), 0);
-    for (int i = 0; i < 100; i++)
-        push_keys(0, (u8)(0x04 + (i % 20))); /* 13 bytes each: 1300 bytes */
+    push_keys(0, 0x04);
     hv_input_poll(); /* before entry: nothing read */
     EQ(rx_reads, 0);
-    enter();
+    enter(); /* discards the pre-entry frame (G11) */
+    EQ(rx_head, rx_tail);
+    for (int i = 0; i < 100; i++)
+        push_keys(0, (u8)(0x04 + (i % 20))); /* 13 bytes each: 1300 bytes */
     int polls = 0;
     while (rx_head != rx_tail && polls < 100) {
         u32 before = rx_head;
@@ -326,7 +328,7 @@ static void case_poll_budget(void)
     }
     EQ(polls, (1300 + 255) / 256);
     EQ(st(INPUT_ST_FRAMES_OK), 100);
-    EQ(st(INPUT_ST_RX_BYTES), 1300);
+    EQ(st(INPUT_ST_RX_BYTES), 1300); /* the 13 discarded bytes never reached the parser */
     /* Nothing buffered: no read at all. */
     int reads = rx_reads;
     hv_input_poll();
@@ -451,11 +453,57 @@ static void case_exit(void)
     hv_input_poll();
     g_wr(INPUT_REG_POP, 1, 2);
     EQ(hv_input_proxy(HV_INPUT_OP_DETACH, 0, 0, 0), HV_INPUT_ERROR);
+    /* ENABLE|IRQ_EN with an empty queue: the release's report would raise the line. */
+    EQ(st(HV_INPUT_S_LINE), 0);
+    int calls = spi_calls;
     hv_input_guest_exited(2);
+    EQ(spi_calls, calls); /* state only: the vSPI is never driven after exit */
     EQ(st(HV_INPUT_S_DEPTH), 1);
     EQ(g_rd(INPUT_REG_REPORT, 3) & 0xffff, 0x0001);
+    g_wr(INPUT_REG_POP, 1, 2);
+    EQ(spi_calls, calls);
     CHECK(hv_input_owns_vuart_rx()); /* until the carrier is reloaded: no guest reads it */
     EQ(st(INPUT_ST_FRAMES_OK), 1);
+    end();
+}
+
+/*
+ * G11: host bytes sent between ATTACH and entry are discarded at entry, so no key, button or
+ * position from before the guest's session reaches the model; a partial frame is forgotten.
+ */
+static void case_pre_entry(void)
+{
+    begin("pre_entry");
+    hv_input_enable();
+    EQ(attach(HV_INPUT_SRC_HOST, 0, 0), 0);
+    CHECK(hv_input_owns_vuart_rx());
+    for (int i = 0; i < 40; i++)
+        push_keys(0x01, 0x06); /* Ctrl+C held, 40 times: 520 bytes, more than one budget */
+    u8 abs[32], p[7] = {0x01, 0x00, 0x40, 0x00, 0x40, 0, 0};
+    rx_push(abs, frame(abs, INPUT_HOST_ABS, p, 7));
+    u8 half[32];
+    u32 n = frame(half, INPUT_HOST_KEYS, (const u8[]){0x02, 1, 0x04}, 3);
+    rx_push(half, n / 2); /* a frame cut short before entry */
+    hv_input_poll();
+    EQ(rx_reads, 0);
+    enter();
+    EQ(rx_head, rx_tail);
+    EQ(st(INPUT_ST_RX_BYTES), 0);
+    EQ(st(INPUT_ST_FRAMES_OK), 0);
+    /* The rest of the cut frame arrives after entry: resynchronised, not applied. */
+    rx_push(half + n / 2, n - n / 2);
+    push_keys(0, 0x05);
+    hv_input_poll();
+    EQ(st(INPUT_ST_FRAMES_OK), 1);
+    EQ(st(INPUT_ST_SEQ_GAPS), 0); /* the sequence restarted at entry */
+    g_wr(INPUT_REG_CTRL, INPUT_CTRL_ENABLE | INPUT_CTRL_IRQ_EN, 2);
+    /* ENABLE emits the current state: only the post-entry key, no Ctrl, no ABS position. */
+    EQ(st(HV_INPUT_S_DEPTH), 2);
+    u64 r = g_rd(INPUT_REG_REPORT, 3);
+    EQ(r & 0xffff, 0x0001);     /* id 1, no modifiers */
+    EQ((r >> 16) & 0xff, 0x20);     /* usage 0x05 only (bit 5 of bitmap byte 0) */
+    g_wr(INPUT_REG_POP, 1, 2);
+    EQ(g_rd(INPUT_REG_REPORT_LEN, 2) >> 8 & 0xff, 4); /* consumer; no absolute report */
     end();
 }
 
@@ -497,6 +545,7 @@ int main(void)
     case_bad_width();
     case_watchdog();
     case_exit();
+    case_pre_entry();
     case_status();
     return total_failures ? 1 : 0;
 }

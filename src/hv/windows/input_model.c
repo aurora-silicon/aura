@@ -54,9 +54,16 @@ u32 input_model_crc32(u32 crc, const void *data, u32 len)
 
 /* ---- the queue ----------------------------------------------------------------------------- */
 
+_Static_assert(INPUT_QUEUE_LEN <= 256, "slot numbers are u8");
+
+static u32 q_pos(const struct input_model *m, u32 i)
+{
+    return (m->q_head + i) % INPUT_QUEUE_LEN;
+}
+
 static struct input_report *q_at(struct input_model *m, u32 i)
 {
-    return &m->q[(m->q_head + i) % INPUT_QUEUE_LEN];
+    return &m->q[m->q_order[q_pos(m, i)]];
 }
 
 static void q_flush(struct input_model *m)
@@ -76,29 +83,34 @@ static bool is_pointer(u8 id)
  * (a later queued entry with the same report ID, or the incoming report) is dropped, so every
  * collection's last state survives; pointer reports go first, oldest first.  257 reports of at
  * most four IDs always contain such an entry among the 255 that are not the head.
+ *
+ * One pass from the newest entry back, remembering which IDs were seen later: O(n), so a full
+ * queue under a stream of host frames costs a bounded few hundred steps per report.
  */
 static int q_victim(struct input_model *m, u8 incoming)
 {
-    int fallback = -1;
-    for (u32 i = 1; i < m->q_count; i++) {
+    int pointer = -1, any = -1;
+    u32 seen = BIT(incoming & 31);
+    for (u32 i = m->q_count; i-- > 1;) {
         u8 id = q_at(m, i)->id;
-        bool superseded = id == incoming;
-        for (u32 k = i + 1; !superseded && k < m->q_count; k++)
-            superseded = q_at(m, k)->id == id;
-        if (!superseded)
-            continue;
-        if (is_pointer(id))
-            return (int)i;
-        if (fallback < 0)
-            fallback = (int)i;
+        u32 bit = BIT(id & 31);
+        if (seen & bit) {
+            if (is_pointer(id))
+                pointer = (int)i;
+            any = (int)i;
+        }
+        seen |= bit;
     }
-    return fallback;
+    return pointer >= 0 ? pointer : any;
 }
 
+/* Drop entry i (not the head): its slot moves to the free end of the ring, the reports stay. */
 static void q_remove(struct input_model *m, u32 i)
 {
+    u8 slot = m->q_order[q_pos(m, i)];
     for (u32 k = i; k + 1 < m->q_count; k++)
-        *q_at(m, k) = *q_at(m, k + 1);
+        m->q_order[q_pos(m, k)] = m->q_order[q_pos(m, k + 1)];
+    m->q_order[q_pos(m, m->q_count - 1)] = slot;
     m->q_count--;
 }
 
@@ -273,6 +285,13 @@ void input_model_release(struct input_model *m, u32 src)
     s->rel_buttons = 0;
     s->consumer = 0;
     emit_changes(m);
+}
+
+void input_model_host_restart(struct input_model *m)
+{
+    m->rx_len = 0;
+    m->host_seq_valid = false;
+    input_model_release(m, INPUT_SRC_HOST);
 }
 
 /* ---- the host feed ----------------------------------------------------------------------- */
@@ -604,6 +623,8 @@ u32 input_model_depth(const struct input_model *m)
 void input_model_init(struct input_model *m, u32 sources, u64 watchdog_ticks)
 {
     MEMSET(m, 0, sizeof(*m));
+    for (u32 i = 0; i < INPUT_QUEUE_LEN; i++)
+        m->q_order[i] = (u8)i;
     m->features = INPUT_FEAT_REPORTS |
                   (sources & (INPUT_FEAT_SRC_HOST | INPUT_FEAT_SRC_KBD | INPUT_FEAT_SRC_TP));
     m->watchdog_ticks = watchdog_ticks;

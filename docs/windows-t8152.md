@@ -625,8 +625,10 @@ Host feed: from ATTACH on, the RX direction of the vUART CDC pipe (`IODEV_USB_VU
 `/dev/cu.usbmodemP_03` on macOS) belongs to the input device. The guest's UART then reads an
 empty receiver (no RXD, no RX count, URXH 0); its TX (COM0 output) is unchanged. The boot
 CPU's 5 kHz tick, right after `hv_vuart_poll()`, reads at most 256 buffered bytes (never more
-than are buffered: the CDC read would wait) and parses them under the input lock. Frames
-before guest entry stay buffered; frames during Mu only update state. Wire protocol v1,
+than are buffered: the CDC read would wait) and parses them under the input lock. Bytes the
+Mac sends between ATTACH and guest entry are discarded at entry (at most the 1 MiB CDC ring;
+the count is logged), and the parser and sequence start clean, so nothing sent before the
+guest's session reaches it; frames during Mu only update state. Wire protocol v1,
 little-endian:
 
     +0 'M' (0x4D)  +1 '6' (0x36)  +2 type  +3 len (0..64)  +4 seq u16  +6 payload[len]
@@ -649,9 +651,21 @@ partial frame that has waited 50 ms since the last byte is given up the same way
 damaged length cannot hold the frames behind it. `seq` gaps are counted, not enforced. If any
 host key, button or consumer usage is held and no valid frame arrived for 2 s, the carrier
 releases them (a feeder holding keys sends KEEPALIVE every 0.5 s). At guest exit every host
-key is released. `proxyclient/aura/windows.py` has the encoder (`input_frame`, `input_keys`,
+key is released, state only: the vSPI is not driven once the guest has left. `proxyclient/aura/windows.py` has the encoder (`input_frame`, `input_keys`,
 `input_abs`, `input_rel`, `input_consumer`, `input_hello`); a feeder must open only the guest
 CDC port, never the proxy port (any byte there stops the guest).
+
+The feed is not authenticated. The CRC only catches damage; it says nothing about who wrote
+the bytes. The guest's COM0 output (TX) and the input feed (RX) share one Mac tty, so if that
+tty echoes (a `cu` device left in its default cooked mode: ECHO, ICANON, IXON), every byte the
+guest writes comes back as host input, and a guest that writes valid frames to COM0 injects
+input. A feeder must put the port in raw mode before it writes (`m6type` does), and nothing
+that echoes may hold the port while input is attached.
+
+When the queue is full, each new report costs one pass over the queue (the drop choice) and
+a move of at most 255 one-byte slot numbers; the reports themselves never move. So a Mac
+stream into a driver that stopped popping costs at most a few hundred steps per report under
+the input lock.
 
 Resident ABI: configure **BIT(10)** (`HV_WINDOWS_T8152_INPUT`; T8152, software GIC, board
 0x22), **CAPS2 bit 3**, **`P_HV_WINDOWS_INPUT` 0xc89** (0xc88 and CAPS2 bit 2 are

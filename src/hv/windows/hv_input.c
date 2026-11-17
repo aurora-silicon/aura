@@ -57,9 +57,16 @@ static u64 now_ticks(void)
     return mrs(CNTPCT_EL0);
 }
 
-/* The model's line to the virtual SPI: on changes only (the level is remembered there). */
+/*
+ * The model's line to the virtual SPI: on changes only (the level is remembered there).  Never
+ * after the guest exited: the software GIC is still marked owned then, and driving it would
+ * pend the SPI, kick CPUs that have left the guest and rewrite the boot CPU's HCR_EL2 while it
+ * is back in the proxy.  The exit release is state only.
+ */
 static void sync_line(void)
 {
+    if (exited)
+        return;
     bool level = input_model_line(&model);
     if (level == line)
         return;
@@ -310,11 +317,36 @@ void hv_input_guest_entered(void)
 {
     if (!input_enabled || !attached)
         return;
+    /*
+     * Bytes that arrived between ATTACH and entry are not the guest session's: the vUART left
+     * them in the CDC ring (RX is ours from ATTACH, and the tick reads nothing before entry).
+     * Discard them, bounded by the ring's size, and start the parser and the host source clean,
+     * so no key, button or position sent before entry reaches the model.  A frame cut by the
+     * drain is resynchronised by the parser like any other damage.
+     */
+    u8 scratch[HV_INPUT_RX_BUDGET];
+    u64 dropped = 0;
+    bool failed = false;
     spin_lock(&input_lock);
-    entered = true;
-    /* Bytes that arrived before entry are not the guest session's: start clean. */
+    while (dropped < HV_INPUT_ENTRY_DRAIN_MAX) {
+        ssize_t avail = iodev_can_read(IODEV_USB_VUART);
+        if (avail <= 0)
+            break;
+        u32 want = avail > (ssize_t)sizeof(scratch) ? (u32)sizeof(scratch) : (u32)avail;
+        ssize_t got = iodev_read(IODEV_USB_VUART, scratch, want);
+        if (got <= 0) {
+            failed = got < 0;
+            break;
+        }
+        dropped += (u64)got;
+    }
+    input_model_host_restart(&model);
     model.host_last = now_ticks();
+    entered = true;
     spin_unlock(&input_lock);
+    if (dropped || failed)
+        printf("HV: T8152: input: discarded %lu host byte(s) sent before guest entry%s\n",
+               (unsigned long)dropped, failed ? " (a read failed; the rest is parsed)" : "");
 }
 
 void hv_input_guest_exited(int status_code)
@@ -322,10 +354,12 @@ void hv_input_guest_exited(int status_code)
     if (!attached || !entered)
         return;
     spin_lock(&input_lock);
+    /*
+     * All up, state only: a later session (or the queue's reader, if any) never sees a key
+     * held.  `exited` first, so sync_line() leaves the vSPI alone (see there).
+     */
     exited = true;
-    /* All up: a later session (or the queue's reader, if any) never sees a key held. */
     input_model_release(&model, INPUT_SRC_HOST);
-    sync_line();
     spin_unlock(&input_lock);
     printf("HV: T8152: input: guest exit %d: host keys and buttons released\n", status_code);
     hv_input_report();
