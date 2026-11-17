@@ -269,8 +269,11 @@ void _cpu_reset_c(void *stack)
     /* Under the virtualized SPTM a reset of any core (XNU's CPUSTART, idle power-down, sleep),
      * the boot core included, re-enters the guest through SPTM's reset vector. */
     if (sptm_virt_guest_live) {
+        sptm_virt_crumb(1);
         init_cpu();
+        sptm_virt_crumb(2);
         exception_initialize();
+        sptm_virt_crumb(3);
         sptm_virt_cpu_reset();
     }
 #endif

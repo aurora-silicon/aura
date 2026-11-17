@@ -61,7 +61,13 @@ class ProxyUtils(Reloadable):
         elif  self.ba_rev == 3:
             self.ba = self.iface.readstruct(self.ba_addr, BootArgs_r3)
 
-        # We allocate a 128MB heap, 128MB after the aura heap, without telling it about it.
+        self.adt_data = None
+        self.adt = LazyADT(self)
+        # Resolve platform-specific reservations before changing the target heap limit.
+        if callable(aura_heap):
+            aura_heap = aura_heap(self.adt)
+
+        # We put the Python heap after the reservation for aura's own heap.
         # This frees up from having to coordinate memory management or free stuff after a Python
         # script runs, at the expense that if aura ever uses more than 128MB of heap it will
         # clash with Python (aura will normally not use *any* heap when running proxy ops though,
@@ -92,9 +98,6 @@ class ProxyUtils(Reloadable):
         self.free = self.heap.free
 
         self.code_buffer = self.malloc(self.CODE_BUFFER_SIZE)
-
-        self.adt_data = None
-        self.adt = LazyADT(self)
 
         self.simd_buf = self.malloc(32 * 16)
         self.simd_type = None

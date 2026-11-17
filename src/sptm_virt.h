@@ -105,6 +105,13 @@ void sptm_virt_enter(void) __attribute__((noreturn));
 
 /* A core coming out of reset while the guest is live (startup.c). */
 void sptm_virt_cpu_reset(void) __attribute__((noreturn));
+/* T8142 SMP bring-up: a reset core's progress marks, and the park before the proxy. */
+extern volatile u8 *sptm_smp_crumbs;
+void sptm_virt_crumb(u8 stage);
+void sptm_virt_crumb_fault(void);
+extern volatile int sptm_virt_parking_cpu;
+void sptm_virt_park_others(void);
+void sptm_virt_park_check(void);
 
 /* nv2.c: the last step of every guest entry on a core. */
 void sptm_virt_cpu_arm(void);
