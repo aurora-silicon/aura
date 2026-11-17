@@ -195,6 +195,14 @@ int main(void)
     for (u32 state = 2; state <= 9; state++)
         raise_ok(state);
 
+    /* Windows ownership (j813-manual-v1) selected too: the apply is unchanged. */
+    reset();
+    hv_windows_flags = HV_WINDOWS_CPUFREQ;
+    CHECK(hv_windows_cpufreq_owned() && !hv_windows_configure_ecpu(6, 2352000));
+    CHECK(start() == 0 && hv_windows_entered && writes == 4 && !quarantines);
+    CHECK(cmd[0] == ((E_HANDOFF & ~31ul) | 6) && cmd[1] == P_HANDOFF);
+    printf("{\"case\":\"ownership-and-E6\",\"writes\":%u}\n", writes);
+
     /* The proxy request reaches the real configuration; host INIT/SET are then closed. */
     reset();
     q.opcode = P_HV_WINDOWS_ECPU_BOOT_STATE;

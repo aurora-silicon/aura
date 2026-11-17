@@ -49,9 +49,8 @@ The P cluster is never written by either piece.
 
 ### Hypervisor boot state
 
-1. Profile: the key has the wrong type (bool, string, float), is out of range,
-   targets another machine, or is combined with `"cpufreq": "j813-manual-v1"`
-   so that a Windows driver also owns the controllers.
+1. Profile: the key has the wrong type (bool, string, float), is out of range
+   or targets another machine.
 2. The chainloaded image lacks the feature and silently ignores the request.
 3. The ADT E ladder differs from the J813 ladder the host expects.
 4. Configuration after initialization, twice, on the wrong chip or board, for
@@ -67,8 +66,11 @@ The P cluster is never written by either piece.
 8. With the key absent there must be no new proxy request, register access or
    ADT change; the default (non-Windows) image must be unaffected.
 9. `AppleCpuFreq` 0.2.0.3 admits only E1..E2; on a higher boot state its D0
-   entry fails.
+   entry fails. With the ownership flag also set, the hypervisor must still
+   apply the state exactly as without it.
 10. A Mu or ACPI change must not be needed.
+11. Found on boot 145: Mu 45087b59 asserts when the ownership marker is
+    absent, so the key must not require `"cpufreq"` disabled.
 
 ## Qualification tool
 
@@ -108,8 +110,8 @@ above against that model.
 
 ## Hypervisor boot state
 
-The profile key `"ecpu_boot_state": N` (integer 2..9, J813 only, requires
-`"cpufreq"` disabled) selects the E command state Windows starts at. Absent, the
+The profile key `"ecpu_boot_state": N` (integer 2..9, J813 only, with either
+`"cpufreq"` policy) selects the E command state Windows starts at. Absent, the
 host sends nothing new and the hypervisor touches no register. The host checks
 the ADT E ladder against the J813 table before any target mutation, requires
 capability bit 14, then sends `P_HV_WINDOWS_ECPU_BOOT_STATE` (0xc86) with the
@@ -126,11 +128,18 @@ P must be unchanged. Any failure refuses guest entry, quarantines the session
 and is never retried on that resident. State 2 performs the checks and writes
 nothing.
 
+With `"cpufreq": "j813-manual-v1"` both flags are set: the ownership latch is
+the same, and `hv_start()` still finds the handoff values because nothing else
+writes the controllers before it. Boots keep that policy. Mu 45087b59 must see the
+ownership marker: without it, `AcpiPlatform.c:4220-4223` frees the rejected CPUF
+SSDT and re-reads the same section without clearing the pointer, the second
+rejection frees it again and DxeCore asserts in `Pool.c(730)` before Windows
+(boot 145). With the marker, Mu's gate reads only `/chosen` properties and the
+SSDT is a constant `_STA`/`_CRS`; nothing in Mu reads the E state.
 `AppleCpuFreq` 0.2.0.3 exposes E levels 1..2 only; its D0 entry fails with
-`STATUS_DEVICE_DATA_ERROR` on a higher boot level after reads alone, and its
-only register write is in the SET IOCTL, which requires a successful D0. These
-boots therefore omit `"cpufreq"`: Mu publishes `AURA8142` only with the
-ownership marker, so no driver binds and neither Mu nor ACPI changes.
+`STATUS_DEVICE_DATA_ERROR` on a higher boot level after reads alone, so
+`AURA8142` shows a start failure. Its only register write is in the SET IOCTL,
+which requires a successful D0.
 
 `tools/windows_ecpu_boot_e2e.py` compiles the actual setter, table, apply,
 latch, `hv_start()` prologue and proxy cases against a register and ADT model.

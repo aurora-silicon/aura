@@ -324,9 +324,9 @@ def plan_profile(filename):
                 f"{ECPU_HANDOFF_STATE}..{ECPU_LAST_STATE}")
         require(chip == 0x8142 and model == "Mac17,3",
                 "ecpu_boot_state requires chip 0x8142 and model Mac17,3")
-        # AppleCpuFreq 0.2.0.3 admits only E1..E2 and would fail D0 on a raised boot.
-        require(cpufreq == "disabled",
-                "ecpu_boot_state requires cpufreq disabled: no Windows driver may own the controllers")
+        # Either cpufreq policy may accompany it. Mu 45087b59 double-frees the CPUF
+        # SSDT when the j813-manual-v1 marker is absent (boot 145), so keep the marker;
+        # AppleCpuFreq 0.2.0.3 then fails D0 on a raised E state after reads alone.
     declarations = profile.get("reserved_memory", [])
     require(isinstance(declarations, list) and len(declarations) <= 16,
             "reserved_memory must be a list of at most 16 ranges")

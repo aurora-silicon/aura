@@ -1556,8 +1556,6 @@ class HV(Reloadable):
                                          self.windows_mtp, self.windows_cpufreq,
                                          xfer=self.windows_xfer,
                                          ecpu_boot_state=self.windows_ecpu_boot_state)
-            if self.windows_ecpu_boot_state and self.windows_cpufreq != "disabled":
-                raise ValueError("an E boot state requires the Windows CPU frequency owner disabled")
             if self.windows_mtp != "disabled":
                 guard = self.windows_memory_guard
                 if not guard or not any(r["base"] == MTP_RESERVED_BASE and

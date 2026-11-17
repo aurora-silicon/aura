@@ -9,7 +9,7 @@ import subprocess
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from aura.windows import CAPS_MAGIC, REQUIRED_CAPS, CONFIGURATION, MEMORY_PREFLIGHT, MTP_HANDOFF, N1_HANDOFF, N1_ACQUIRE, MTP_RESERVED_BASE, MTP_RESERVED_SIZE, ECPU_BOOT_STATE, launch_profile, source_manifest
+from aura.windows import CAPS_MAGIC, REQUIRED_CAPS, CONFIGURATION, MEMORY_PREFLIGHT, MTP_HANDOFF, N1_HANDOFF, N1_ACQUIRE, MTP_RESERVED_BASE, MTP_RESERVED_SIZE, ECPU_BOOT_STATE, CPUFREQ_OWNERSHIP, launch_profile, source_manifest
 
 
 def main():
@@ -38,7 +38,8 @@ def main():
                  "serial-capability-missing", "serial-invalid", "mtp-success", "mtp-capability-missing",
                  "mtp-wrong-model", "mtp-invalid", "mtp-reservation-name",
                  "n1-acquire-success", "n1-acquire-cpu-only", "n1-acquire-capability-missing", "n1-acquire-wrong-model",
-                 "ecpu-success", "ecpu-handoff", "ecpu-capability-missing", "ecpu-with-cpufreq", "ecpu-bool",
+                 "ecpu-success", "ecpu-handoff", "ecpu-capability-missing", "ecpu-with-cpufreq",
+                 "ecpu-with-cpufreq-no-ownership", "ecpu-bool",
                  "ecpu-string", "ecpu-float", "ecpu-floor", "ecpu-out-of-range", "ecpu-wrong-model"):
         profile = json.loads(json.dumps(baseline))
         expected_image = firmware_bytes
@@ -82,7 +83,7 @@ def main():
             profile["ecpu_boot_state"] = {"ecpu-handoff": 2, "ecpu-bool": True, "ecpu-string": "5",
                                           "ecpu-float": 5.0, "ecpu-floor": 1,
                                           "ecpu-out-of-range": 10}.get(case, 5)
-        if case == "ecpu-with-cpufreq": profile["cpufreq"] = "j813-manual-v1"
+        if case.startswith("ecpu-with-cpufreq"): profile["cpufreq"] = "j813-manual-v1"
         if case == "ecpu-wrong-model": profile["target"]["model"] = "Mac17,1"
         filename = out / (case + ".json")
         filename.write_text(json.dumps(profile))
@@ -100,6 +101,8 @@ def main():
                     extra |= N1_HANDOFF | (0x0800 if case == "n1-acquire-cpu-only" else 0 if case == "n1-acquire-capability-missing" else N1_ACQUIRE)
                 if case.startswith("ecpu-"):
                     extra |= CONFIGURATION | (0 if case == "ecpu-capability-missing" else ECPU_BOOT_STATE)
+                    # The Windows ownership marker may accompany the E boot state (boot 145).
+                    extra |= CPUFREQ_OWNERSHIP if case == "ecpu-with-cpufreq" else 0
                 return CAPS_MAGIC | ((2 if case == "wrong-abi" else 1) << 16) | REQUIRED_CAPS | extra
             def identity(self):
                 trace.append("read-identity")
@@ -113,7 +116,9 @@ def main():
                     assert plan.reserved_memory == ({"name": "aura-mtp-handoff", "base": MTP_RESERVED_BASE, "size": MTP_RESERVED_SIZE},)
                 if case == "init-failure":
                     raise RuntimeError("injected hv_init failure")
-                assert plan.ecpu_boot_state == {"ecpu-success": 5, "ecpu-handoff": 2}.get(case, 0)
+                assert plan.ecpu_boot_state == {"ecpu-success": 5, "ecpu-handoff": 2,
+                                                "ecpu-with-cpufreq": 5}.get(case, 0)
+                assert plan.cpufreq == ("j813-manual-v1" if case == "ecpu-with-cpufreq" else "disabled")
             def load(self, plan):
                 trace.append("mutate-load")
                 assert plan.image == expected_image
@@ -129,7 +134,7 @@ def main():
 
         passed = False
         expected_success = case in ("success", "poweroff", "reset", "append-offset", "append-contiguous", "mtp-success", "n1-acquire-success",
-                                    "ecpu-success", "ecpu-handoff")
+                                    "ecpu-success", "ecpu-handoff", "ecpu-with-cpufreq")
         try:
             result = launch_profile(filename, "model-device", out / (case + "-evidence"), session_factory=Endpoint)
             passed = expected_success

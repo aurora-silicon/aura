@@ -354,8 +354,10 @@ def lifecycle(case, output):
             assert marker["value"] == b"\x01\x00\x00\x00"
             assert raw_property(guest_adt["/chosen"], MTP_DISABLED_PROPERTY) == (
                 b"\x00\x00\x00\x00" if case in ("mtp-success", "combined-success") else b"\x01\x00\x00\x00")
-            if combined:
+            if combined or case == "ecpu-cpufreq-success":
                 assert raw_property(guest_adt["/chosen"], CPUFREQ_PROPERTY) == b"\x01\x00\x00\x00"
+            elif ecpu:
+                assert CPUFREQ_PROPERTY not in guest_adt["/chosen"]._properties
             if case in ("n1-success", "n1-acquire-success", "combined-success"):
                 assert guest_adt["/chosen"].getprop(N1_PROPERTY) == n1_descriptor
             else:
@@ -412,6 +414,7 @@ def lifecycle(case, output):
         hv.windows_serial = "cdc"
     if case == "watchdog-failure": hv.wdt_cpu = 1
     if ecpu: hv.windows_ecpu_boot_state = 5
+    if case == "ecpu-cpufreq-success": hv.windows_cpufreq = "j813-manual-v1"
     payload = bytes(range(256)) * 32
     if case == "chunked-upload": payload = bytes(range(256)) * ((16 * 1024 * 1024 + 8192) // 256)
     if case.startswith("reservation-"):
@@ -438,13 +441,13 @@ def lifecycle(case, output):
         if case == "adt-overflow-start": hv.adt.overflow = "x" * 0x20000
         start_trace_index = len(trace)
         hv.start()
-        assert case in ("success", "n1-success", "n1-acquire-success", "combined-success", "chunked-upload", "reservation-success", "serial-success", "cdc-success", "mtp-success", "ecpu-success")
-        config = 59 if combined else 19 if case == "mtp-success" else 11 if case == "cdc-success" else 7 if case.startswith("serial-") else 3
+        assert case in ("success", "n1-success", "n1-acquire-success", "combined-success", "chunked-upload", "reservation-success", "serial-success", "cdc-success", "mtp-success", "ecpu-success", "ecpu-cpufreq-success")
+        config = 59 if combined else 35 if case == "ecpu-cpufreq-success" else 19 if case == "mtp-success" else 11 if case == "cdc-success" else 7 if case.startswith("serial-") else 3
         assert trace.index(["config", config]) < trace.index("hv_init") < trace.index("upload-image") < trace.index("start")
         if case == "serial-success": assert trace.index("serial-handler") < trace.index("start")
         # The E boot state is selected after configuration and before hv_init; absent, never.
-        if case == "ecpu-success":
-            assert trace.index(["config", 3]) < trace.index(["ecpu", 5, 1992000]) < trace.index("hv_init")
+        if ecpu:
+            assert trace.index(["config", config]) < trace.index(["ecpu", 5, 1992000]) < trace.index("hv_init")
         else:
             assert not any(isinstance(t, list) and t[0] == "ecpu" for t in trace), trace
     except (RuntimeError, ValueError, OSError):
@@ -463,7 +466,7 @@ def lifecycle(case, output):
                 except RuntimeError: pass
                 else: raise AssertionError("combined failure bypassed N1 admission")
             if case == "combined-cpu-opp-failure": assert "hv_init" not in trace and "n1-acquire" not in trace
-        assert case not in ("success", "n1-success", "n1-acquire-success", "combined-success", "chunked-upload", "reservation-success", "serial-success", "cdc-success", "mtp-success", "ecpu-success")
+        assert case not in ("success", "n1-success", "n1-acquire-success", "combined-success", "chunked-upload", "reservation-success", "serial-success", "cdc-success", "mtp-success", "ecpu-success", "ecpu-cpufreq-success")
         if case.startswith("mtp-"):
             assert "upload-image" not in trace and "start" not in trace
             assert not hv.windows_mtp_ready
@@ -530,7 +533,8 @@ def main():
             "n1-unprepared", "reservation-success", "reservation-layout-drift",
             "mtp-success", "mtp-missing-capability", "mtp-missing-reservation",
             "mtp-producer-failure", "mtp-producer-transport-error",
-            "ecpu-success", "ecpu-opp-failure", "ecpu-rejected", "ecpu-missing-capability")]
+            "ecpu-success", "ecpu-cpufreq-success", "ecpu-opp-failure", "ecpu-rejected",
+            "ecpu-missing-capability")]
         cases += [reservation_prepare_flow(case) for case in (
             "reservation-prepare-success", "reservation-prepare-default", "reservation-prepare-payload",
             "reservation-prepare-heap", "reservation-prepare-outside", "reservation-prepare-overlap",
