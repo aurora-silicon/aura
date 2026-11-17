@@ -30,6 +30,10 @@ ECPU_BOOT_STATE = 0x4000  # P_HV_WINDOWS_ECPU_BOOT_STATE (docs/t8142-ecpu-stepup
 # T8152 stage-2 allowlist policy, the guest RAM window op and the T8152 Fast IPI
 # opt-in. A resident without it must never run a J804 guest.
 T8152_POLICY = 0x0800
+# The resident refuses a T8152 launch unless all 12 CPUs are live in its dispatch loop and
+# its code is clear of the last page of CTXR_D. A resident without it must never run one.
+T8152_LIVE_CPUS = 0x1000
+T8152_CPUS = 12
 CONFIG_T8142_EXPERIMENTAL = 0x0001
 CONFIG_FRAMEBUFFER_SHADOW = 0x0002
 CONFIG_SERIAL_CAPTURE = 0x0004
@@ -115,6 +119,8 @@ def validate_capabilities(value, framebuffer="native", guest_compatibility="none
                 "resident lacks the explicit E-cluster boot state")
     if t8152 or ipi != "poll" or gic_cpuif != "carrier":
         require(value & T8152_POLICY, "resident lacks the T8152 stage-2 policy; "
+                "never run a J804 guest on it")
+        require(value & T8152_LIVE_CPUS, "resident lacks the T8152 12-live-CPU refusal; "
                 "never run a J804 guest on it")
         require(value & CONFIGURATION, "resident lacks explicit Windows configuration")
     return value & 0xffff
@@ -439,11 +445,12 @@ def t8152_profile_fields(profile, chip, framebuffer, compatibility, n1, mtp, res
 
 
 def t8152_wfi_field(profile, chip):
-    """T8152 carrier idle: "poll" (default, no WFI at EL2) or "wfi", only after Phase 3
-    measurement (a) showed that WFI preserves state on T8152."""
+    """T8152 carrier idle: "poll" only (no WFI at EL2). Phase 3 measurement (a) found
+    WFI_WIPES on T8152, so "wfi" is refused here and by the resident."""
     wfi = profile.get("wfi", "poll")
     require(wfi in ("poll", "wfi"), "wfi must be poll or wfi")
     require(chip == T8152_CHIP or wfi == "poll", "wfi is a T8152 profile field")
+    require(wfi == "poll", "wfi: WFI does not preserve state on T8152 (WFI_WIPES); use poll")
     return wfi
 
 

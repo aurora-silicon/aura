@@ -40,8 +40,8 @@ parser.add_argument('--windows-gic-cpuif', choices=('carrier', 'software'), defa
                     help='T8152: the software GIC CPU interface (as T8142), only after Phase 3 '
                          'measurement (f) showed ICC_* accesses trap to EL2.')
 parser.add_argument('--windows-wfi', choices=('poll', 'wfi'), default='poll',
-                    help='T8152: carrier idle busy-polls (default) or, only after Phase 3 '
-                         'measurement (a) showed WFI_PRESERVES, runs a real WFI at EL2.')
+                    help='T8152: carrier idle busy-polls (default). "wfi" (a real WFI at EL2) '
+                         'is refused: Phase 3 measurement (a) found WFI_WIPES.')
 parser.add_argument('--windows-serial', choices=('cdc', 'disabled'), default='cdc',
                     help='T8152: guest vUART on the dedicated CDC interface (default) or off.')
 parser.add_argument('--windows-reset-on-exit', action='store_true',
@@ -109,9 +109,16 @@ def run_windows_t8152(caps):
     hv.windows_ipi = args.windows_ipi
     hv.windows_gic_cpuif = args.windows_gic_cpuif
     hv.windows_wfi = args.windows_wfi
-    hv.init()
-    if args.logfile:
-        hv.set_logfile(args.logfile.open("w"))
+    log = args.logfile.open("w") if args.logfile else None
+    if log:
+        iface.tty_log = log  # the resident's hv_init() refusals ("HV: T8152: ...") land here too
+    try:
+        hv.init()
+    except (ValueError, RuntimeError) as exc:
+        sys.exit(f"T8152 launch refused: {exc}. The aura proxy keeps running; no guest was "
+                 "started.")
+    if log:
+        hv.set_logfile(log)
     if args.boot_args:
         hv.set_bootargs(" ".join(args.boot_args))
     data = args.payload.read_bytes()

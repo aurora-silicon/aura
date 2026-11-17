@@ -170,10 +170,13 @@ static bool hv_t8152_soft_gic;
 static bool hv_t8152_wfi;
 
 /*
- * Carrier idle (trapped guest WFI, PSCI CPU_SUSPEND) runs a real WFI at EL2
- * on T8152 only with HV_WINDOWS_T8152_WFI, which the launcher sets only after
- * Phase 3 measurement (a) showed that WFI preserves state there.  Until then
- * cpu_wfi_stateless() busy-polls for a pending interrupt instead (as M1 did).
+ * Carrier idle (trapped guest WFI, PSCI CPU_SUSPEND) never runs a real WFI at
+ * EL2 on T8152: cpu_wfi_stateless() busy-polls for a pending interrupt instead
+ * (as M1 did).  Phase 3 measurement (a) found WFI_WIPES (a timer-woken WFI
+ * clears GPRs, NZCV and SIMD on every core type), so hv_windows_configure()
+ * refuses HV_WINDOWS_T8152_WFI and this stays false.  The other WFI sites do
+ * not apply on T8152: aura's dispatch loop is WFE-only there (smp.c wfe_mode,
+ * smp_set_wfe_mode() cannot clear it), and a guest WFI always traps (TWI).
  */
 bool hv_t8152_native_wfi(void)
 {
@@ -242,6 +245,17 @@ int hv_windows_configure(u64 flags)
     if ((flags & (HV_WINDOWS_T8152_FAST_IPI | HV_WINDOWS_T8152_SOFT_GIC | HV_WINDOWS_T8152_WFI)) &&
         chip_id != T8152)
         return -1;
+    if (flags & HV_WINDOWS_T8152_WFI) {
+        /*
+         * Measurement (a) on J804: a timer-woken WFI clears the GPRs, NZCV and the SIMD
+         * registers on E, P and M cores (WFI_WIPES).  cpu_wfi_stateless() saves only
+         * x18-x30 around it, and the guest's SIMD/FP registers are live in hardware while
+         * the carrier waits, so this mode would corrupt the guest.  Idle polls instead.
+         */
+        printf("HV: T8152: real WFI at EL2 refused: WFI does not preserve state on T8152 "
+               "(measurement (a): WFI_WIPES); use --windows-wfi poll\n");
+        return -1;
+    }
     if ((flags & HV_WINDOWS_SERIAL_CDC) &&
         ((flags & HV_WINDOWS_SERIAL_CAPTURE) || uartproxy_iodev < IODEV_USB0 ||
          uartproxy_iodev >= IODEV_USB0 + USB_IODEV_COUNT))

@@ -14,9 +14,10 @@ void cpu_wfi_stateless(void)
     sysop("isb");
     if (chip_id == T8152 && !hv_t8152_native_wfi()) {
         /*
-         * Phase 3 measurement (a) has not shown that WFI keeps state on T8152:
-         * no WFI.  Spin until an interrupt is pending (what would end a WFI),
-         * bounded at 1 ms so a missing wake source cannot hang the core.
+         * Phase 3 measurement (a) found WFI_WIPES on T8152 (a timer-woken WFI
+         * clears GPRs, NZCV and SIMD): no WFI.  Spin until an interrupt is
+         * pending (what would end a WFI), bounded at 1 ms so a missing wake
+         * source cannot hang the core.
          */
         u64 freq = mrs(CNTFRQ_EL0); /* nonzero: hv_t8152_preflight() */
         u64 deadline = mrs(CNTPCT_EL0) + (freq ? freq / 1000 : 24000);

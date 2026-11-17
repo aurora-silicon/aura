@@ -30,7 +30,8 @@ AIC = (0x2a0000000, 0x100000)
 QSPI = 0x2b0000000
 VALID = 1
 CAPS = (windows.CAPS_MAGIC | 1 << 16 | windows.REQUIRED_CAPS | windows.CONFIGURATION |
-        windows.FRAMEBUFFER_SHADOW | windows.SERIAL_CDC_ISOLATED | windows.T8152_POLICY)
+        windows.FRAMEBUFFER_SHADOW | windows.SERIAL_CDC_ISOLATED | windows.T8152_POLICY |
+        windows.T8152_LIVE_CPUS)
 
 
 def u64_pair(node, name, value):
@@ -99,7 +100,17 @@ def run(case="success"):
     class Proxy:
         def hv_windows_capabilities(self):
             trace.append("caps")
-            return CAPS & ~windows.T8152_POLICY if case == "old-resident" else CAPS
+            if case == "old-resident":
+                return CAPS & ~(windows.T8152_POLICY | windows.T8152_LIVE_CPUS)
+            if case == "no-live-cpu-refusal":
+                return CAPS & ~windows.T8152_LIVE_CPUS
+            return CAPS
+
+        def smp_is_alive(self, cpu):
+            trace.append(("alive", cpu))
+            if case == "secondaries-not-started":
+                return cpu == 6
+            return not (case == "cpu-missing" and cpu == 9)
 
         def hv_windows_configure(self, flags):
             trace.append(("config", flags))
@@ -154,6 +165,8 @@ def run(case="success"):
     hv.windows_guest_ram = WINDOW
     if case == "no-window":
         hv.windows_guest_ram = None
+    if case == "wfi":
+        hv.windows_wfi = "wfi"
     hv.init()
     payload = bytes(range(256)) * 64
     hv.load_raw(payload, 0)
@@ -203,7 +216,20 @@ def test_t8152_guest_placement_and_adt():
     ("old-resident", "T8152 stage-2 policy"),
     ("no-window", "explicit guest RAM window"),
     ("resident-refuses", "refused the T8152 guest RAM window"),
+    ("no-live-cpu-refusal", "12-live-CPU refusal"),
+    ("cpu-missing", r"only 11 of 12 CPUs .*not live: \[9\]"),
+    ("secondaries-not-started", "only 1 of 12 CPUs"),
+    ("wfi", "WFI_WIPES"),
 ])
 def test_t8152_launch_refusals(case, message):
     with pytest.raises((ValueError, RuntimeError), match=message):
         run(case)
+
+
+def test_t8152_live_cpu_check_runs_before_the_resident_starts_anything():
+    r = run()
+    alive = [t[1] for t in r.trace if isinstance(t, tuple) and t[0] == "alive"]
+    assert alive == list(range(12))
+    first_alive = next(i for i, t in enumerate(r.trace) if isinstance(t, tuple) and t[0] == "alive")
+    config = next(i for i, t in enumerate(r.trace) if isinstance(t, tuple) and t[0] == "config")
+    assert first_alive < config < r.trace.index("hv_init")

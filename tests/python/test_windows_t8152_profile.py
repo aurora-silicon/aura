@@ -18,7 +18,8 @@ sys.path.insert(0, str(REPO / "proxyclient"))
 from aura import windows  # noqa: E402
 
 CAPS_OLD = 0x4157494E000107FF  # every capability before the T8152 policy bit
-CAPS_T8152 = CAPS_OLD | windows.T8152_POLICY
+CAPS_T8152_V1 = CAPS_OLD | windows.T8152_POLICY  # 6bdac9ee: no 12-live-CPU refusal
+CAPS_T8152 = CAPS_T8152_V1 | windows.T8152_LIVE_CPUS
 GIB = 1 << 30
 
 
@@ -47,9 +48,7 @@ def test_t8152_profile_binds_window_and_policy(tmp_path):
     assert plan.ipi == "fast" and plan.on_reset == "reboot"
     plan = windows.plan_profile(write_profile(tmp_path, gic_cpuif="software"))
     assert plan.gic_cpuif == "software"
-    assert plan.wfi == "poll"  # no WFI at EL2 until Phase 3 measurement (a)
-    plan = windows.plan_profile(write_profile(tmp_path, wfi="wfi"))
-    assert plan.wfi == "wfi"
+    assert plan.wfi == "poll"  # no WFI at EL2: measurement (a) found WFI_WIPES
 
 
 @pytest.mark.parametrize("fields, message", [
@@ -62,6 +61,7 @@ def test_t8152_profile_binds_window_and_policy(tmp_path):
     ({"on_reset": "now"}, "on_reset must be"),
     ({"gic_cpuif": "hardware"}, "gic_cpuif must be"),
     ({"wfi": "wfe"}, "wfi must be"),
+    ({"wfi": "wfi"}, "WFI_WIPES"),
     ({"reserved_memory": [{"name": "x", "base": "0x10050000000", "size": "0x1000"}]},
      "no reserved_memory"),
 ])
@@ -88,6 +88,9 @@ def test_older_resident_never_runs_a_t8152_guest():
         windows.validate_capabilities(CAPS_OLD, gic_cpuif="software")
     assert windows.validate_capabilities(CAPS_T8152, "bgra-shadow", t8152=True, ipi="fast") & \
         windows.T8152_POLICY
+    # A T8152-policy resident without the 12-live-CPU refusal (6bdac9ee) is refused too.
+    with pytest.raises(ValueError, match="12-live-CPU refusal"):
+        windows.validate_capabilities(CAPS_T8152_V1, "bgra-shadow", t8152=True)
     # Not a T8152 launch: the older resident stays valid.
     windows.validate_capabilities(CAPS_OLD, "bgra-shadow")
 
@@ -186,8 +189,8 @@ def test_c_and_python_agree_on_abi():
     proxy_h = (REPO / "src/proxy.h").read_text()
     hv_h = (REPO / "src/hv/windows/hv.h").read_text()
     # This branch builds no N1 producer: the resident clears N1_HANDOFF (bit 5).
-    assert "0x4157494e00010fdfULL" in proxy_c
-    assert CAPS_T8152 & ~windows.N1_HANDOFF == 0x4157494E00010FDF
+    assert "0x4157494e00011fdfULL" in proxy_c
+    assert CAPS_T8152 & ~windows.N1_HANDOFF == 0x4157494E00011FDF
     assert "P_HV_WINDOWS_GUEST_RAM = 0xc8c" in proxy_h
     assert "HV_WINDOWS_T8152_FAST_IPI BIT(5)" in hv_h and windows.CONFIG_T8152_FAST_IPI == 1 << 5
     assert "HV_WINDOWS_T8152_SOFT_GIC BIT(6)" in hv_h and windows.CONFIG_T8152_SOFT_GIC == 1 << 6

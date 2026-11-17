@@ -49,13 +49,15 @@ extern u64 fake_mpidr, fake_hcr, fake_cntfrq;
 #define fake_mrs_HCR_EL2 fake_hcr
 #define fake_mrs_CNTFRQ_EL0 fake_cntfrq
 extern u32 board_id, chip_id;
-extern char *fake_base;
+extern char *fake_base, *fake_rodata_end;
 #define _base fake_base
+#define _rodata_end fake_rodata_end
 """,
     "soc.h": "#pragma once\n#define T8142 0x8142\n#define T8152 0x8152\n",
     "string.h": "#pragma once\n#include <string.h>\n",
     "memory.h": "#pragma once\n",
-    "smp.h": "#pragma once\n",
+    "smp.h": "#pragma once\n#include \"types.h\"\n#define MAX_CPUS 32\n"
+             "extern int boot_cpu_idx;\nbool smp_is_alive(int cpu);\n",
     "heapblock.h": "#pragma once\n#include \"types.h\"\nuintptr_t heapblock_high_water(void);\n"
                    "uintptr_t heapblock_limit(void);\n",
     "ctxr_exec.h": r"""
@@ -153,7 +155,10 @@ HARNESS = r"""
 
 u64 fake_mpidr = 0x10100, fake_hcr = 0x80001UL, fake_cntfrq = 1000000000;
 u32 board_id = 0x22, chip_id = 0x8152;
-char *fake_base = (char *)AURA;
+char *fake_base = (char *)AURA, *fake_rodata_end = (char *)(AURA + 0x120000);
+int boot_cpu_idx = 6;
+static unsigned long alive_mask = 0xfbf; /* the 11 secondaries; cpu6 boots */
+bool smp_is_alive(int cpu) { return cpu >= 0 && cpu < 32 && (alive_mask >> cpu) & 1; }
 struct aic fake_aic = {AIC_BASE, 3, 0x960}, *aic = &fake_aic;
 struct boot_args cur_boot_args;
 static bool ctxr_ok = true, qspi_present = true;
@@ -316,6 +321,23 @@ int main(void)
     pmgr_regs = 1025; /* more reg entries than the walk takes: refuse, never truncate */
     assert(hv_t8152_preflight() < 0);
     pmgr_regs = 40;
+    /* B3: all 12 CPUs live in aura's dispatch loop, nothing else. */
+    puts("LIVE CPU CHECK");
+    alive_mask = 0xfbf & ~BIT(9);   /* one M core missing */
+    assert(hv_t8152_preflight() < 0 && !hv_t8152_policy_armed());
+    alive_mask = 0;                 /* secondaries never started: only the boot CPU */
+    assert(hv_t8152_preflight() < 0);
+    alive_mask = 0xfbf | BIT(12);   /* a spin-table entry past cpu11 */
+    assert(hv_t8152_preflight() < 0);
+    alive_mask = 0xfbf;
+    /* Part A: EL2 on the secondaries cannot execute the last 16 KiB page of CTXR_D. */
+    fake_rodata_end = (char *)(CTXR_D_HI - 0x4000 + 0x10);
+    assert(hv_t8152_preflight() < 0);
+    fake_rodata_end = (char *)(CTXR_D_HI + 0x10000);   /* code runs past CTXR_D */
+    assert(hv_t8152_preflight() < 0);
+    fake_rodata_end = (char *)(CTXR_D_HI - 0x4000);    /* ends exactly below it: fine */
+    assert(hv_t8152_preflight() == 0);
+    fake_rodata_end = (char *)(AURA + 0x120000);
     assert(hv_t8152_preflight() == 0 && hv_t8152_policy_armed());
 
     /* Guest RAM window. */
@@ -404,6 +426,10 @@ int main(void)
     assert(hv_t8152_verify(WIN_LO + 0x800, WIN_LO, hcr_ok, true) < 0);         /* aura RAM */
     nleaves--;
     assert(hv_t8152_verify(WIN_LO + 0x800, WIN_LO, hcr_ok, true) == 0);
+    alive_mask = 0xfbf & ~BIT(0);   /* a CPU left the spin table after hv_init() */
+    assert(hv_t8152_verify(WIN_LO + 0x800, WIN_LO, hcr_ok, true) < 0);
+    alive_mask = 0xfbf;
+    assert(hv_t8152_verify(WIN_LO + 0x800, WIN_LO, hcr_ok, true) == 0);
     puts("T8152 POLICY OK");
     return 0;
 }
@@ -450,3 +476,12 @@ def test_t8152_carrier_policy(tmp_path):
     assert "did not report the top of its heap" in result.stdout
     assert "heap has no limit" in result.stdout
     assert "overlaps aura and its heaps" in result.stdout
+    # B3 and Part A: the 12-live-CPU refusal and the CTXR_D last page.
+    live = result.stdout.split("LIVE CPU CHECK", 1)[1]
+    assert "only 11 of 12 CPUs are live in aura's dispatch loop (not live: cpu9)" in live
+    assert "only 1 of 12 CPUs are live" in live
+    assert "(not live: cpu0 cpu1 cpu2 cpu3 cpu4 cpu5 cpu7 cpu8 cpu9 cpu10 cpu11)" in live
+    assert "1 spin-table entries beyond cpu11 are live" in live
+    assert "clear of its last page 0x1000fffc000, which EL2 on the secondaries cannot" in live
+    assert "all 12 CPUs live in aura's dispatch loop" in live
+    assert "only 11 of 12 CPUs are live in aura's dispatch loop (not live: cpu0)" in live

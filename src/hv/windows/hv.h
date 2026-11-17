@@ -36,7 +36,11 @@ void hv_windows_quarantine(void);
 #define HV_WINDOWS_T8152_FAST_IPI BIT(16)
 /* T8152 only, after Phase 3 measurement (f): the software GIC CPU interface (as T8142). */
 #define HV_WINDOWS_T8152_SOFT_GIC BIT(17)
-/* T8152 only, after Phase 3 measurement (a) (WFI_PRESERVES): idle with a real WFI at EL2. */
+/*
+ * T8152: idle with a real WFI at EL2.  Refused by hv_windows_configure(): measurement (a)
+ * returned WFI_WIPES on all three core types (2026-11-16), and the guest's SIMD/FP state
+ * is live in the registers across the carrier's idle wait.  Kept as an ABI bit only.
+ */
 #define HV_WINDOWS_T8152_WFI BIT(18)
 bool hv_t8152_native_wfi(void);
 bool hv_fast_ipi(void);

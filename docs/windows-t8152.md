@@ -12,7 +12,14 @@ safety precondition below holds, and prints which one failed. The policy lives i
 At `hv_init()` (`hv_t8152_preflight()`), before anything is mapped:
 
 - board 0x22 (J804) and boot CPU MPIDR 0x10100;
-- CTXR_D is armed and aura runs inside it (chainloaded in place, never with `--relocate`);
+- CTXR_D is armed and aura runs inside it (chainloaded in place, never with `--relocate`),
+  with all of its code (`[_base, _rodata_end)`) clear of the last 16 KiB page of CTXR_D:
+  measured on J804, EL2 on the secondaries cannot execute that page;
+- all 12 CPUs (cpu0-11) are live in aura's dispatch loop (`smp_is_alive()`, the boot CPU
+  counted as the vGIC counts it) and no spin-table entry past cpu11 is. The J804 Mu MADT is
+  static (12 GICCs, all enabled) and has no live mask to patch, so a partial machine is
+  refused, not launched: start the secondaries (`p.smp_start_secondaries()`) first. The
+  resident never starts them itself;
 - AIC3 initialized (the J804 proxy path does not do it; `hv_init()` calls `aic_init()`);
 - `HCR_EL2.FWB` clear, `CNTFRQ_EL0` non-zero, boot_args RAM non-empty;
 - a denylist read from the live ADT: every top-level `/arm-io` node named `qspi`, `sep`,
@@ -42,16 +49,19 @@ reads its own copy of the filtered guest ADT. `hv_write_hcr()` keeps `HCR_EL2.TW
 
 Before entry, `hv_t8152_verify()` walks the whole stage-2 table again and checks the entry
 point and boot_args are in the window, TWI is set for the boot CPU and the secondaries,
-FWB is clear, stage 2 and the SMC trap are on and `framebuffer=bgra-shadow` is selected.
+FWB is clear, stage 2 and the SMC trap are on, `framebuffer=bgra-shadow` is selected and all
+12 CPUs are still live.
 
 ## Other T8152 behaviour
 
 - PSCI CPU_ON is a spin-table release (`hv_start_secondary()`); CPU_OFF parks the core back
   in aura's spin table and is never a power-off. The boot CPU's CPU_OFF is DENIED.
-- Guest WFI is always trapped (`HCR_EL2.TWI`); the EL2 wait wakes at 1 kHz. Until Phase 3
-  measurement (a) shows WFI preserves state on T8152, carrier idle (trapped WFI, PSCI
-  CPU_SUSPEND) runs no WFI: it spins on `ISR_EL1`, bounded at 1 ms. A real WFI at EL2 needs
-  the launcher's `wfi: wfi` / `--windows-wfi wfi` (config bit 7).
+- Guest WFI is always trapped (`HCR_EL2.TWI`); the EL2 wait wakes at 1 kHz. Phase 3
+  measurement (a) found WFI_WIPES on T8152 (a timer-woken WFI clears GPRs, NZCV and SIMD on
+  E, P and M cores), so carrier idle (trapped WFI, PSCI CPU_SUSPEND) runs no WFI: it spins on
+  `ISR_EL1`, bounded at 1 ms. The real-WFI opt-in (config bit 7, `wfi: wfi`,
+  `--windows-wfi wfi`) is refused by the resident and the launcher. aura's own dispatch loop
+  is WFE-only on T8152.
 - IPIs: polling by default (1 kHz secondary tick drains queued guest IPIs and vSGIs).
   Apple Fast IPIs only with the launcher's `ipi: fast`, after Phase 3 measurement (c).
 - The software GIC CPU interface (as T8142) only with `gic_cpuif: software`, after (f).
@@ -73,8 +83,11 @@ FWB is clear, stage 2 and the SMC trap are on and `framebuffer=bgra-shadow` is s
 
 - Profiles for chip 0x8152 must bind `guest_ram {base, top}` and use `bgra-shadow`; they
   take no `reserved_memory`, N1 or MTP. Optional: `ipi` (`poll`/`fast`), `gic_cpuif`
-  (`carrier`/`software`), `wfi` (`poll`/`wfi`), `on_reset` (`stay`/`reboot`).
-- A resident must report capability bit 0x0800 (T8152 policy) for any of this.
+  (`carrier`/`software`), `wfi` (`poll` only), `on_reset` (`stay`/`reboot`).
+- A resident must report capability bits 0x0800 (T8152 policy) and 0x1000 (12-live-CPU and
+  CTXR_D last-page refusal) for any of this.
+- Before `hv_init`, the launcher reads `P_SMP_IS_ALIVE` for cpu0-11 (read-only) and stops
+  with the list of CPUs that are not live; the resident checks the same again.
 - The guest ADT drops `qspi`, `i2c*`, `aop*`, `admac*`, `*audio*` and every `nvram,nor`
   node, and gets `aura,windows-nvram-hidden`.
 - `run_guest.py -r -E 0 --windows-guest-ram BASE:TOP MU.fd` drives the same path on a

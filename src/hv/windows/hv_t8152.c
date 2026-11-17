@@ -34,6 +34,13 @@
 #define T8152_MAX_ALLOW     8
 #define T8152_MAX_MMIO      2
 #define T8152_REPORT_LIMIT  16
+#define T8152_CPUS          12 /* E cpu0-5, P cpu6-7, M cpu8-11 (smp_init_t8152 checks the ADT) */
+/*
+ * Measured on J804 (2026-11-16, ctxr_el1): EL2 on the secondaries cannot execute the last
+ * 16 KiB page of CTXR_D (instruction abort, ESR_EL2 0x86000002).  No carrier code may
+ * live there.
+ */
+#define T8152_CTXR_D_NOEXEC T8152_PAGE
 
 #define S2_MEMATTR       GENMASK(5, 2)
 #define S2_MEMATTR_NGNRE 0x0UL /* Device-nGnRnE */
@@ -83,6 +90,52 @@ static bool inside(u64 a0, u64 a1, u64 b0, u64 b1)
 bool hv_t8152_policy_armed(void)
 {
     return armed;
+}
+
+/*
+ * All 12 CPUs must be in aura's dispatch loop (spin table, smp_is_alive) before a guest
+ * starts.  The J804 Mu profile's MADT is static (12 GICCs, all enabled) and there is no
+ * live mask Mu could patch it from, while the vGIC builds one redistributor per live CPU
+ * (hv_vgic_live_cpu_count) and PSCI CPU_ON can only release a core that is already in
+ * the spin table.  A partial machine would give Windows GICC entries with no
+ * redistributor and CPU_ON targets with no core behind them, so refuse instead.
+ * smp_init_t8152() publishes the boot CPU's spin-table flag itself; it is counted
+ * explicitly anyway, the way the vGIC counts it.  Read-only: nothing is started here.
+ */
+static int live_cpus_check(void)
+{
+    char missing[T8152_CPUS * 6 + 1];
+    unsigned int live = 0, extra = 0, pos = 0;
+
+    missing[0] = 0;
+    for (int cpu = 0; cpu < MAX_CPUS; cpu++) {
+        bool alive = cpu == boot_cpu_idx || smp_is_alive(cpu);
+        if (cpu >= T8152_CPUS) {
+            extra += alive;
+            continue;
+        }
+        if (alive) {
+            live++;
+        } else {
+            int n = snprintf(missing + pos, sizeof(missing) - pos, " cpu%d", cpu);
+            if (n > 0 && (unsigned int)n < sizeof(missing) - pos)
+                pos += n;
+        }
+    }
+
+    if (live == T8152_CPUS && !extra) {
+        printf("HV: T8152: all %d CPUs live in aura's dispatch loop\n", T8152_CPUS);
+        return 0;
+    }
+    if (live != T8152_CPUS)
+        printf("HV: T8152: only %u of %d CPUs are live in aura's dispatch loop (not live:%s); "
+               "start the secondaries (p.smp_start_secondaries()) and check all %d before "
+               "launching; refusing\n",
+               live, T8152_CPUS, missing, T8152_CPUS);
+    if (extra)
+        printf("HV: T8152: %u spin-table entries beyond cpu%d are live; refusing\n", extra,
+               T8152_CPUS - 1);
+    return -1;
 }
 
 bool hv_t8152_guest_ram(u64 *base, u64 *size)
@@ -277,9 +330,24 @@ int hv_t8152_preflight(void)
                "never with --relocate\n",
                (u64)_base, start, end);
         bad++;
+    } else if (end - start <= T8152_CTXR_D_NOEXEC ||
+               !inside((u64)_base, (u64)_rodata_end, start, end - T8152_CTXR_D_NOEXEC)) {
+        /*
+         * [_base, _rodata_end) holds every instruction EL2 runs: the RVBAR and EL2
+         * vectors, smp_secondary_entry, the hypervisor vectors and guest entry/exit.
+         * The guest itself never runs in CTXR_D (ram_conflicts refuses the overlap).
+         */
+        printf("HV: T8152: aura's code [0x%lx, 0x%lx) is not inside CTXR_D [0x%lx, 0x%lx) "
+               "clear of its last page 0x%lx, which EL2 on the secondaries cannot execute; "
+               "refusing\n",
+               (u64)_base, (u64)_rodata_end, start, end, end - T8152_CTXR_D_NOEXEC);
+        bad++;
     } else {
-        printf("HV: T8152: aura 0x%lx inside CTXR_D [0x%lx, 0x%lx)\n", (u64)_base, start, end);
+        printf("HV: T8152: aura 0x%lx inside CTXR_D [0x%lx, 0x%lx), code clear of its last page\n",
+               (u64)_base, start, end);
     }
+    if (live_cpus_check())
+        bad++;
     if (!aic || aic->version != 3) {
         printf("HV: T8152: AIC3 is not initialized\n");
         bad++;
@@ -628,6 +696,8 @@ int hv_t8152_verify(u64 entry, u64 bootargs, u64 secondary_hcr, bool fb_shadow)
         printf("HV: T8152: framebuffer=bgra-shadow is required (the scanout is never mapped)\n");
         bad++;
     }
+    if (live_cpus_check()) /* again: nothing may have left the spin table since hv_init() */
+        bad++;
     u64 hcr = mrs(HCR_EL2);
     if (!(hcr & HCR_TWI) || !(secondary_hcr & HCR_TWI)) {
         printf("HV: T8152: HCR_EL2.TWI is not set (boot 0x%lx, secondaries 0x%lx)\n", hcr,
