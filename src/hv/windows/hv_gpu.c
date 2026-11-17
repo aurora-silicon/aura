@@ -1,14 +1,17 @@
 /* SPDX-License-Identifier: MIT */
 
 /*
- * G0 GPU passthrough, carrier side, logging only.  See hv_gpu.h and
- * windows-m6/G0-CARRIER-CONTRACT.md.  Every address comes from the admission (the live ADT);
- * the only fixed values are the J804 firmware receipt and the pool rules.
+ * G0 + G1 GPU passthrough, carrier side.  See hv_gpu.h and windows-m6/G0-CARRIER-CONTRACT.md.
+ * Every address comes from the admission (the live ADT); the only fixed values are the J804
+ * firmware receipt, the pool rules and the forwarded register offsets of gpu_t8152_probe.c (our
+ * own observation).  The PSD power recipe comes from private data at build time.
  */
 
 #include "hv_gpu.h"
 #include "adt.h"
 #include "gpu_t8152_admit.h"
+#include "gpu_t8152_power.h"
+#include "gpu_t8152_probe.h"
 #include "hv.h"
 #include "malloc.h"
 #include "memory.h"
@@ -22,15 +25,17 @@ extern void aura_sha256(const void *data, size_t size, u8 digest[32]);
 /* The firmware the J804 profile pins (src/kboot_gpu_t8152.c publishes the same receipt). */
 #define J804_GPU_RECEIPT "G18G-RTKit-3514.41.1.release"
 
+/* Lines the G1 hooks print: one per new access-map entry, and the first mailbox messages. */
+#define HV_GPU_MSG_LOG_LIMIT 128
+
 /*
- * ADMIT ran this carrier session, whatever its result.  This is per carrier session, not per
- * boot: a carrier reload resets it.  G0 starts no firmware, so that is harmless today, but G1
- * (anything that powers the GPU or lets CPU_CONTROL RUN through) must first add a boot-wide
- * marker that survives a reload.  tests/python/test_windows_t8152_gpu.py refuses a hv_gpu.c that
- * sets GPU_HS_POWERED or GPU_HS_ASC_RUN without HV_GPU_BOOT_MARKER.
+ * ADMIT ran this carrier session, whatever its result.  This is per carrier session: a carrier
+ * reload resets it.  Anything that can start the GPU firmware (POWER) is additionally once per
+ * boot, through the boot marker HV_GPU_BOOT_MARKER in the live ADT, which a reload keeps.
  */
 static bool session_used;
-static bool admitted, hooked;
+static bool admitted, hooked, power_tried, probing, torn_down;
+static bool forwarding; /* G1 hooks perform the measured accesses (atomic) */
 static struct gpu_t8152_admission adm;
 static struct gpu_range table[GPU_T8152_MAX_RANGES];
 static u32 table_count;
@@ -41,10 +46,60 @@ static u64 class_hits[GPU_C_COUNT], total_hits, gfx_hits;
 static u32 logged;
 /* fatal report: the last logging-hook access (address, 1 = write) */
 static u64 last_hook_addr, last_hook_write;
+/* G1 */
+static struct gpu_boot_marker *marker; /* this session's claimed record (a 16 KiB page) */
+static struct gpu_psd_result psd;
+static u32 gpu_id[GPU_HANDOFF_ID_WORDS], cpu_control[GPU_T8152_ROLES], cpu_status[GPU_T8152_ROLES];
+static struct gpu_access_map amap;
+static u32 amap_lock;
+static u64 forwarded, denied, run_refused, faults;
+static u32 msgs_logged;
 
 #ifdef HV_GPU_HOST_TEST
 #define gpu_read_text hv_gpu_host_read_text
+#define hw_rw(ctx, addr, val, write, width) hv_gpu_host_mmio(addr, val, write, width)
+#define psd_read32  hv_gpu_host_read32
+#define psd_write32 hv_gpu_host_write32
+#define psd_delay   hv_gpu_host_delay
+#define marker_read hv_gpu_host_marker_read
 #else
+/*
+ * A forwarded access, with aura's guarded MMIO (a fault returns false instead of taking the
+ * carrier down).  Outside a hook (POWER's verification reads) there is no guest context.
+ */
+static bool hw_rw(struct exc_info *ctx, u64 addr, u64 *val, bool write, int width)
+{
+    static struct exc_info scratch;
+    return hv_pa_rw(ctx ? ctx : &scratch, addr, val, write, width);
+}
+
+/* The PSD blocks: plain MMIO, as every PSD user in aura does (dcp.c, usb_t8152.c). */
+static u32 psd_read32(u64 addr)
+{
+    return read32(addr);
+}
+
+static void psd_write32(u64 addr, u32 value)
+{
+    write32(addr, value);
+}
+
+static void psd_delay(u32 us)
+{
+    udelay(us);
+}
+
+/* A marker page named by the live ADT: only a 16 KiB-aligned page of boot_args RAM is read. */
+static bool marker_read(u64 pa, void *out, u64 size)
+{
+    u64 lo = cur_boot_args.phys_base, hi = lo + cur_boot_args.mem_size;
+    if (pa & (GPU_BOOT_MARKER_SIZE - 1) || pa < lo || hi < GPU_BOOT_MARKER_SIZE ||
+        pa > hi - GPU_BOOT_MARKER_SIZE || size > GPU_BOOT_MARKER_SIZE)
+        return false;
+    memcpy(out, (const void *)pa, size);
+    return true;
+}
+
 /* iBoot left the TEXT in RAM below boot_args RAM; aura maps all of DRAM identity. */
 static bool gpu_read_text(u64 phys, void *buf, u64 size)
 {
@@ -59,7 +114,12 @@ static bool gpu_read_text(u64 phys, void *buf, u64 size)
  */
 static bool handoff_publish(void)
 {
-    struct gpu_t8152_handoff_in in = {state, handoff_pa, pool_base, pool_size};
+    struct gpu_t8152_handoff_in in = {state, handoff_pa, pool_base, pool_size, {0}, {0}, {0}};
+    if (state & GPU_HS_POWERED) {
+        memcpy(in.gpu_id, gpu_id, sizeof(gpu_id));
+        memcpy(in.cpu_control, cpu_control, sizeof(cpu_control));
+        memcpy(in.cpu_status, cpu_status, sizeof(cpu_status));
+    }
     if (!handoff || !gpu_t8152_handoff_build(handoff, GPU_HANDOFF_SIZE, &adm, table, table_count,
                                              &in))
         return false;
@@ -279,9 +339,9 @@ static int hook(void)
 {
     if (!state_ok("HOOK"))
         return HV_GPU_E_STATE;
-    if (!admitted || hooked) {
-        printf("HV: GPU: HOOK refused: %s\n", hooked ? "the hooks are already in place" :
-                                                       "the GPU is not admitted");
+    if (!admitted || hooked || probing) {
+        printf("HV: GPU: HOOK refused: %s\n", hooked || probing ? "the hooks are already in place" :
+                                                                  "the GPU is not admitted");
         return HV_GPU_E_STATE;
     }
     hooked = true;
@@ -310,6 +370,477 @@ static int hook(void)
     return 0;
 }
 
+
+/* ---- G1: the boot-wide marker ------------------------------------------------------------- */
+
+enum marker_found { MARK_NONE, MARK_OURS, MARK_FOREIGN, MARK_NO_SLOT };
+
+static void *slot_value(const char *name)
+{
+    int mm = adt_path_offset(adt, "/chosen/memory-map");
+    u32 len = 0;
+    const void *p = mm < 0 ? NULL : adt_getprop(adt, mm, name, &len);
+    return p && len == 16 ? (void *)p : NULL;
+}
+
+static bool slot_read(const char *name, u64 v[2])
+{
+    const void *p = slot_value(name);
+    if (!p)
+        return false;
+    memcpy(v, p, 16);
+    return true;
+}
+
+/* In place (same size), then cleaned to the PoC: the next carrier reads the ADT MMU-off. */
+static int slot_write(const char *name, u64 a, u64 b)
+{
+    int mm = adt_path_offset(adt, "/chosen/memory-map");
+    u64 v[2] = {a, b};
+    if (mm < 0 || adt_setprop(adt, mm, name, v, sizeof(v)) != (int)sizeof(v))
+        return -1;
+    void *p = slot_value(name);
+    if (!p || memcmp(p, v, sizeof(v)))
+        return -1;
+    dc_civac_range(p, sizeof(v));
+    return 0;
+}
+
+static int marker_find(struct gpu_boot_marker *out)
+{
+    u64 v[2];
+    memset(out, 0, sizeof(*out));
+    if (!slot_read(HV_GPU_BOOT_MARKER, v))
+        return MARK_NO_SLOT;
+    if (!v[0] && !v[1])
+        return MARK_NONE;
+    if (v[1] != GPU_BOOT_MARKER_SIZE || !marker_read(v[0], out, sizeof(*out)) ||
+        !gpu_t8152_marker_valid(out))
+        return MARK_FOREIGN;
+    return MARK_OURS;
+}
+
+static u64 boot_status(void)
+{
+    struct gpu_boot_marker m;
+    switch (marker_find(&m)) {
+        case MARK_NONE:
+            return 0;
+        case MARK_OURS:
+            return m.state;
+        case MARK_FOREIGN:
+            return HV_GPU_BOOT_FOREIGN;
+        default:
+            return HV_GPU_BOOT_NO_SLOT;
+    }
+}
+
+static void marker_update(u32 set)
+{
+    if (!marker)
+        return;
+    marker->state |= set;
+    marker->forwarded = (u32)__atomic_load_n(&forwarded, __ATOMIC_RELAXED);
+    marker->denied = (u32)__atomic_load_n(&denied, __ATOMIC_RELAXED);
+    marker->run_refused = (u32)__atomic_load_n(&run_refused, __ATOMIC_RELAXED);
+    marker->faults = (u32)__atomic_load_n(&faults, __ATOMIC_RELAXED);
+    gpu_t8152_marker_seal(marker);
+    dc_civac_range(marker, sizeof(*marker));
+}
+
+static const char *marker_says(u32 st)
+{
+    if (st & GPU_BM_POWER_FAILED)
+        return "a power-on failed";
+    if (st & GPU_BM_FOREIGN)
+        return "the GPU was found already on";
+    if (st & GPU_BM_ENDED)
+        return "a session ran and ended with the firmware left running";
+    if (st & GPU_BM_PROBE)
+        return "a session is (or was) forwarding to it";
+    if (st & GPU_BM_POWERED)
+        return "it was powered on";
+    return "a power-on was claimed";
+}
+
+/*
+ * Claim this boot's GPU session: the record first (so the slot never names an empty page), then
+ * the marker slot, then the pool slot.  Any failure after the marker slot is set leaves the boot
+ * claimed: that only forbids, so it is the safe direction.
+ */
+static int marker_claim(const struct gpu_psd_sample *before, u32 nsteps, bool cold)
+{
+    u64 pv[2];
+    if (!slot_read(HV_GPU_POOL_SLOT, pv) || pv[0] || pv[1]) {
+        printf("HV: GPU: POWER refused: /chosen/memory-map/%s is %s; the pool cannot be "
+               "reserved for the rest of the boot\n",
+               HV_GPU_POOL_SLOT, slot_value(HV_GPU_POOL_SLOT) ? "in use" : "missing");
+        return -1;
+    }
+    marker = memalign(GPU_BOOT_MARKER_SIZE, GPU_BOOT_MARKER_SIZE);
+    if (!marker) {
+        printf("HV: GPU: POWER refused: no memory for the boot marker page\n");
+        return -1;
+    }
+    memset(marker, 0, GPU_BOOT_MARKER_SIZE);
+    u64 pa = (u64)marker;
+    if (hv_t8152_reserve_carrier(pa, pa + GPU_BOOT_MARKER_SIZE, "GPU boot marker (G1)")) {
+        free(marker);
+        marker = NULL;
+        return -1;
+    }
+    marker->state = GPU_BM_CLAIMED | (cold ? 0 : GPU_BM_FOREIGN);
+    marker->pool_base = pool_base;
+    marker->pool_size = pool_size;
+    for (u32 i = 0; i < nsteps && i < GPU_PSD_MAX_STEPS; i++)
+        marker->psd_before[i] = gpu_psd_pack(&before[i]);
+    marker_update(0);
+    if (slot_write(HV_GPU_BOOT_MARKER, pa, GPU_BOOT_MARKER_SIZE)) {
+        printf("HV: GPU: POWER refused: /chosen/memory-map/%s could not be written\n",
+               HV_GPU_BOOT_MARKER);
+        marker = NULL; /* the page stays reserved (denied); nothing was claimed */
+        return -1;
+    }
+    if (slot_write(HV_GPU_POOL_SLOT, pool_base, pool_size)) {
+        printf("HV: GPU: POWER refused: the pool slot could not be written; this boot's GPU "
+               "session is claimed anyway (reboot)\n");
+        return -1;
+    }
+    printf("HV: GPU: boot marker claimed: /chosen/memory-map/%s -> [0x%lx, +0x%lx), %s -> pool "
+           "[0x%lx, 0x%lx) (reserved for the rest of the boot)\n",
+           HV_GPU_BOOT_MARKER, pa, GPU_BOOT_MARKER_SIZE, HV_GPU_POOL_SLOT, pool_base,
+           pool_base + pool_size);
+    return 0;
+}
+
+/* ---- G1: POWER ------------------------------------------------------------------------------ */
+
+static u32 hw_read32(u64 addr)
+{
+    u64 v[2] = {0, 0};
+    if (!hw_rw(NULL, addr, v, false, 2)) {
+        __atomic_add_fetch(&faults, 1, __ATOMIC_RELAXED);
+        printf("HV: GPU: read of 0x%lx faulted\n", addr);
+        return 0;
+    }
+    return (u32)v[0];
+}
+
+/* After power-on: the ID words the probe may read, and how power-on left each ASC. */
+static void read_identity(void)
+{
+    u32 n;
+    const struct gpu_probe_reg *regs = gpu_t8152_probe_sgx_reads(&n);
+    for (u32 i = 0; i < n && i < GPU_HANDOFF_ID_WORDS; i++)
+        gpu_id[i] = hw_read32(adm.sgx.base + regs[i].offset);
+    printf("HV: GPU: GPU ID 0x%x 0x%x 0x%x 0x%x 0x%x 0x%x, core mask 0x%x\n", gpu_id[0], gpu_id[1],
+           gpu_id[2], gpu_id[3], gpu_id[4], gpu_id[5], gpu_id[6]);
+    for (u32 r = 0; r < GPU_T8152_ROLES; r++) {
+        cpu_control[r] = hw_read32(adm.wrapper[r].base + GPU_T8152_ASC_CPU_CONTROL);
+        cpu_status[r] = hw_read32(adm.wrapper[r].base + GPU_T8152_ASC_CPU_STATUS);
+        bool run = cpu_control[r] & GPU_ASC_CPU_RUN;
+        printf("HV: GPU: %s CPU_CONTROL 0x%x (RUN %s) CPU_STATUS 0x%x%s\n",
+               r ? "gfx1-asc" : "gfx-asc", cpu_control[r], run ? "set" : "CLEAR", cpu_status[r],
+               run ? ": the firmware is running; the guest adopts it" :
+                     ": the carrier never sets RUN, so the probe cannot adopt this ASC");
+    }
+}
+
+static int power(void)
+{
+    if (!state_ok("POWER"))
+        return HV_GPU_E_STATE;
+    if (!admitted || power_tried || hooked) {
+        printf("HV: GPU: POWER refused: %s\n",
+               !admitted ? "the GPU is not admitted" :
+               hooked    ? "this session has the G0 logging hooks (use --windows-gpu probe)" :
+                           "POWER runs once per carrier session");
+        return HV_GPU_E_STATE;
+    }
+    const struct gpu_psd_recipe *r = gpu_t8152_psd_recipe();
+    if (gpu_t8152_psd_check(r))
+        return HV_GPU_E_RECIPE; /* nothing touched, nothing spent */
+    power_tried = true;
+
+    struct gpu_boot_marker found;
+    int m = marker_find(&found);
+    if (m != MARK_NONE) {
+        if (m == MARK_OURS)
+            printf("HV: GPU: POWER refused: the boot marker says %s earlier this boot (state 0x%x, "
+                   "pool [0x%lx, 0x%lx)); one GPU firmware session per boot: reboot the M6\n",
+                   marker_says(found.state), found.state, found.pool_base,
+                   found.pool_base + found.pool_size);
+        else
+            printf("HV: GPU: POWER refused: /chosen/memory-map/%s is %s; not powering the GPU "
+                   "(reboot the M6)\n",
+                   HV_GPU_BOOT_MARKER,
+                   m == MARK_NO_SLOT ? "missing" : "set but holds no valid GPU marker");
+        return HV_GPU_E_BOOT;
+    }
+
+    static const struct gpu_psd_ops ops = {psd_read32, psd_write32, psd_delay};
+    struct gpu_psd_sample before[GPU_PSD_MAX_STEPS];
+    gpu_t8152_psd_sample(r, &ops, before);
+    bool cold = gpu_t8152_psd_all_cold(r, before);
+    for (u32 i = 0; i < r->nsteps; i++)
+        printf("HV: GPU: PSD %s (service %u) before: state %u ack 0x%x\n", r->step[i].name,
+               before[i].service, before[i].state, before[i].ack);
+    if (marker_claim(before, r->nsteps, cold))
+        return HV_GPU_E_BOOT;
+    if (!cold) {
+        printf("HV: GPU: POWER refused: a GPU PSD service is not cold idle (%u) although no "
+               "marker was set: something else powered it this boot; marked used, reboot\n",
+               r->cold_idle);
+        return HV_GPU_E_BOOT;
+    }
+
+    printf("HV: GPU: powering on (%s): %u PSD services in order\n", r->source, r->nsteps);
+    int rc = gpu_t8152_psd_power_on(r, &ops, &psd);
+    for (u32 i = 0; i < r->nsteps; i++)
+        marker->psd_after[i] = gpu_psd_pack(&psd.after[i]);
+    if (rc) {
+        marker_update(GPU_BM_POWER_FAILED);
+        printf("HV: GPU: power-on FAILED at step %d; nothing was powered off or retried; the GPU "
+               "state is unknown: reboot the M6\n",
+               psd.failed_step);
+        return HV_GPU_E_POWER;
+    }
+    marker_update(GPU_BM_POWERED);
+    state |= GPU_HS_POWERED;
+    for (u32 i = 0; i < r->nsteps; i++)
+        printf("HV: GPU: PSD %s (service %u) after: state %u ack 0x%x (%u polls)\n",
+               r->step[i].name, psd.after[i].service, psd.after[i].state, psd.after[i].ack,
+               psd.polls[i]);
+    read_identity();
+    handoff_publish();
+    printf("HV: GPU: powered: every PSD service on; the GPU firmware session of this boot is "
+           "now in use (boot marker)\n");
+    return 0;
+}
+
+/* ---- G1: PROBE (mediated forwarding) ------------------------------------------------------- */
+
+static void amap_acquire(void)
+{
+    while (__atomic_exchange_n(&amap_lock, 1, __ATOMIC_ACQUIRE))
+        ;
+}
+
+static void amap_release(void)
+{
+    __atomic_store_n(&amap_lock, 0, __ATOMIC_RELEASE);
+}
+
+static const char *where(u32 cls, u64 addr, u64 *off)
+{
+    if (cls == GPU_C_MAILBOX) {
+        *off = addr - ALIGN_DOWN(addr, GPU_T8152_PAGE);
+        return "post-office";
+    }
+    *off = addr - adm.sgx.base;
+    return "sgx";
+}
+
+static void log_message(u64 addr, const u64 *val, bool write, int width)
+{
+    u32 role;
+    if (!gpu_t8152_mailbox_window(&adm, addr, &role))
+        return;
+    u64 off = (addr - adm.mailbox.base) & (GPU_T8152_MBOX_STRIDE - 1);
+    /* Status polls are counted in the map, not logged. */
+    if (off >= 0x20 ||
+        __atomic_fetch_add(&msgs_logged, 1, __ATOMIC_RELAXED) >= HV_GPU_MSG_LOG_LIMIT)
+        return;
+    if (width == 4)
+        printf("HV: GPU: %s %s msg 0x%016lx ep 0x%lx\n", role ? "GFX1" : "GFX",
+               write ? "TX" : "RX", val[0], val[1]);
+    else
+        printf("HV: GPU: %s %s %s half 0x%016lx\n", role ? "GFX1" : "GFX", write ? "TX" : "RX",
+               off & 8 ? "high" : "low", val[0]);
+}
+
+static bool probe_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int width)
+{
+    u32 cls = GPU_C_NONE, disp = GPU_A_DENIED;
+    u32 act = GPU_P_DENY;
+    if (__atomic_load_n(&forwarding, __ATOMIC_ACQUIRE))
+        act = gpu_t8152_probe_decide(&adm, table, table_count, addr, width, write, &cls);
+    else
+        gpu_t8152_probe_decide(&adm, table, table_count, addr, width, write, &cls);
+    u64 wrote = write ? val[0] : 0;
+
+    if (act == GPU_P_PASS) {
+        if (hw_rw(ctx, addr, val, write, width)) {
+            disp = GPU_A_PASSED;
+        } else {
+            disp = GPU_A_FAULT;
+            if (!write)
+                val[0] = val[1] = 0;
+        }
+    } else if (act == GPU_P_CPU_CONTROL) {
+        u64 cur[2] = {0, 0};
+        if (!hw_rw(ctx, addr, cur, false, 2))
+            disp = GPU_A_FAULT;
+        else if ((u32)val[0] == (u32)cur[0] && (cur[0] & GPU_ASC_CPU_RUN))
+            disp = GPU_A_MEDIATED; /* the value it holds, RUN set: nothing to do */
+        else
+            disp = GPU_A_REFUSED;
+    } else if (!write) {
+        val[0] = 0;
+        if (width > 3)
+            val[1] = 0;
+    }
+
+    u64 *counter = disp == GPU_A_PASSED || disp == GPU_A_MEDIATED ? &forwarded :
+                   disp == GPU_A_FAULT                            ? &faults :
+                                                                    &denied;
+    __atomic_add_fetch(counter, 1, __ATOMIC_RELAXED);
+    if (disp == GPU_A_REFUSED)
+        __atomic_add_fetch(&run_refused, 1, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&class_hits[cls < GPU_C_COUNT ? cls : 0], 1, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&total_hits, 1, __ATOMIC_RELAXED);
+
+    u32 role;
+    if (cls == GPU_C_MAILBOX && gpu_t8152_mailbox_window(&adm, addr, &role))
+        __atomic_add_fetch(&gfx_hits, 1, __ATOMIC_RELAXED);
+
+    bool first;
+    u64 value = write ? wrote : val[0];
+    amap_acquire();
+    gpu_access_note(&amap, addr, width, write, disp, cls, value, &first);
+    amap_release();
+    if (first) {
+        u64 off;
+        const char *base = where(cls, addr, &off);
+        printf("HV: GPU: probe %s %s+0x%lx (%s, %d bytes) %s0x%lx: %s\n", write ? "write" : "read",
+               base, off, gpu_class_name(cls), 1 << width, write ? "value " : "-> ", value,
+               gpu_access_disp_name(disp));
+    }
+    if (disp == GPU_A_PASSED && cls == GPU_C_MAILBOX)
+        log_message(addr, val, write, width);
+    if (disp == GPU_A_REFUSED)
+        printf("HV: GPU: CPU_CONTROL write 0x%lx refused (RUN is never cleared or toggled)\n",
+               wrote);
+    return true;
+}
+
+static void unmap_firmware(void)
+{
+    for (u32 i = 0; i < table_count; i++) {
+        struct gpu_range *r = &table[i];
+        if ((r->cls == GPU_C_FW_RW || r->cls == GPU_C_FW_RO) && (r->flags & GPU_RF_MAPPED)) {
+            hv_unmap(r->base, r->size);
+            r->flags &= ~GPU_RF_MAPPED;
+        }
+    }
+}
+
+static int probe(void)
+{
+    if (!state_ok("PROBE"))
+        return HV_GPU_E_STATE;
+    if (!admitted || hooked || probing || !(state & GPU_HS_POWERED)) {
+        printf("HV: GPU: PROBE refused: %s\n",
+               !admitted                  ? "the GPU is not admitted" :
+               !(state & GPU_HS_POWERED)  ? "the GPU is not powered (POWER first)" :
+                                            "the hooks are already in place");
+        return HV_GPU_E_STATE;
+    }
+    probing = true;
+    const struct gpu_range *mbox = NULL;
+    for (u32 i = 0; i < table_count; i++)
+        if (table[i].cls == GPU_C_MAILBOX)
+            mbox = &table[i];
+    u32 n;
+    const struct gpu_probe_reg *regs = gpu_t8152_probe_sgx_reads(&n);
+    for (u32 i = 0; i < n; i++) {
+        const struct gpu_range *r =
+            gpu_t8152_find(table, table_count, adm.sgx.base + regs[i].offset);
+        if (!r || r->cls != GPU_C_SGX) {
+            printf("HV: GPU: PROBE refused: forwarded register sgx+0x%x (%s) is not in an sgx "
+                   "range of this table\n",
+                   regs[i].offset, regs[i].what);
+            return HV_GPU_E_RANGES;
+        }
+    }
+    if (!mbox || hv_map_hook(adm.sgx.base, probe_hook, adm.sgx.size) < 0 ||
+        hv_map_hook(mbox->base, probe_hook, mbox->size) < 0) {
+        printf("HV: GPU: the probe hooks could not be installed\n");
+        return HV_GPU_E_POLICY;
+    }
+    for (u32 i = 0; i < table_count; i++) {
+        struct gpu_range *r = &table[i];
+        if ((r->base >= adm.sgx.base && r->base - adm.sgx.base < adm.sgx.size) || r == mbox)
+            r->flags |= GPU_RF_HOOKED;
+        if (r->cls != GPU_C_FW_RW && r->cls != GPU_C_FW_RO)
+            continue;
+        int rc = r->cls == GPU_C_FW_RW ? hv_map_hw(r->base, r->base, r->size) :
+                                         hv_map_hw_ro(r->base, r->base, r->size);
+        if (rc < 0) {
+            printf("HV: GPU: PROBE: %s [0x%lx, 0x%lx) could not be mapped\n", r->name, r->base,
+                   r->base + r->size);
+            hv_unmap(r->base, r->size);
+            unmap_firmware();
+            return HV_GPU_E_POLICY;
+        }
+        r->flags |= GPU_RF_MAPPED;
+    }
+    state |= GPU_HS_ASC_RUN | GPU_HS_MMIO_PASS | GPU_HS_FW_MAPPED;
+    handoff_publish();
+    __atomic_store_n(&forwarding, true, __ATOMIC_RELEASE);
+    marker_update(GPU_BM_PROBE);
+    printf("HV: GPU: probe forwarding on sgx [0x%lx, 0x%lx) and post-office page 0x%lx: %u sgx "
+           "ID reads, CPU_CONTROL (RUN guarded) / CPU_STATUS of both ASCs, the GFX and GFX1 "
+           "windows (RX, TX, status); everything else read-as-zero; UAT regions mapped RW, DATA "
+           "regions RO; IRQs not published (poll)\n",
+           adm.sgx.base, adm.sgx.base + adm.sgx.size, mbox->base, n);
+    return 0;
+}
+
+/* ---- teardown -------------------------------------------------------------------------------- */
+
+static void print_map(void)
+{
+    amap_acquire();
+    u32 n = amap.n, dropped = amap.dropped;
+    amap_release();
+    printf("HV: GPU: access map: %u entries (%u accesses not recorded), %lu forwarded, %lu denied, "
+           "%lu CPU_CONTROL writes refused, %lu faults\n",
+           n, dropped, forwarded, denied, run_refused, faults);
+    for (u32 i = 0; i < n; i++) {
+        const struct gpu_access *e = &amap.e[i];
+        u64 off;
+        const char *base = where(e->cls, e->addr, &off);
+        printf("HV: GPU: map %s+0x%lx %c%d %s %s n=%u first 0x%lx last 0x%lx\n", base, off,
+               e->write ? 'W' : 'R', 8 << e->width, gpu_class_name(e->cls),
+               gpu_access_disp_name(e->disp), e->count, e->first, e->last);
+    }
+}
+
+void hv_gpu_teardown(const char *why)
+{
+    __atomic_store_n(&forwarding, false, __ATOMIC_RELEASE);
+    if (!admitted || torn_down || !(probing || (state & GPU_HS_POWERED) || marker))
+        return;
+    torn_down = true;
+    unmap_firmware();
+    state &= ~(GPU_HS_MMIO_PASS | GPU_HS_FW_MAPPED);
+    handoff_publish();
+    if (probing)
+        print_map();
+    marker_update(GPU_BM_ENDED);
+    printf("HV: GPU: session ended (%s): forwarding off, firmware regions unmapped; the GPU stays "
+           "powered and its firmware running for the rest of this boot (never stopped, powered "
+           "off or restarted by the carrier); pool [0x%lx, 0x%lx) stays reserved (%s)\n",
+           why, pool_base, pool_base + pool_size, HV_GPU_POOL_SLOT);
+}
+
+void hv_gpu_emergency_stop(void)
+{
+    if (__atomic_exchange_n(&forwarding, false, __ATOMIC_ACQ_REL))
+        printf("HV: GPU: forwarding stopped before the reset (the GPU is not touched)\n");
+}
+
 static u64 status(u64 index)
 {
     if (index == HV_GPU_S_STATE)
@@ -324,6 +855,56 @@ static u64 status(u64 index)
         return __atomic_load_n(&total_hits, __ATOMIC_RELAXED);
     if (index == HV_GPU_S_MAILBOX_GFX)
         return __atomic_load_n(&gfx_hits, __ATOMIC_RELAXED);
+    if (index == HV_GPU_S_BOOT)
+        return boot_status();
+    if (index == HV_GPU_S_FORWARDED)
+        return __atomic_load_n(&forwarded, __ATOMIC_RELAXED);
+    if (index == HV_GPU_S_DENIED)
+        return __atomic_load_n(&denied, __ATOMIC_RELAXED);
+    if (index == HV_GPU_S_RUN_REFUSED)
+        return __atomic_load_n(&run_refused, __ATOMIC_RELAXED);
+    if (index == HV_GPU_S_FAULTS)
+        return __atomic_load_n(&faults, __ATOMIC_RELAXED);
+    if (index == HV_GPU_S_MAP_COUNT || index == HV_GPU_S_MAP_DROPPED) {
+        amap_acquire();
+        u64 v = index == HV_GPU_S_MAP_COUNT ? amap.n : amap.dropped;
+        amap_release();
+        return v;
+    }
+    if (index == HV_GPU_S_POWER_RECIPE)
+        return gpu_t8152_psd_recipe()->available ? 1 : 0;
+    if (index >= HV_GPU_S_PSD_BEFORE && index < HV_GPU_S_PSD_BEFORE + GPU_PSD_MAX_STEPS)
+        return marker ? marker->psd_before[index - HV_GPU_S_PSD_BEFORE] : 0;
+    if (index >= HV_GPU_S_PSD_AFTER && index < HV_GPU_S_PSD_AFTER + GPU_PSD_MAX_STEPS)
+        return marker ? marker->psd_after[index - HV_GPU_S_PSD_AFTER] : 0;
+    if (index >= HV_GPU_S_GPU_ID && index < HV_GPU_S_GPU_ID + GPU_HANDOFF_ID_WORDS)
+        return gpu_id[index - HV_GPU_S_GPU_ID];
+    if (index >= HV_GPU_S_CPU && index < HV_GPU_S_CPU + 2 * GPU_T8152_ROLES)
+        return index - HV_GPU_S_CPU < GPU_T8152_ROLES ?
+                   cpu_control[index - HV_GPU_S_CPU] :
+                   cpu_status[index - HV_GPU_S_CPU - GPU_T8152_ROLES];
+    if (index >= HV_GPU_S_MAP && index < HV_GPU_S_MAP + 4 * (u64)GPU_ACCESS_MAP_MAX) {
+        u64 i = (index - HV_GPU_S_MAP) / 4, v = HV_GPU_ERROR;
+        amap_acquire();
+        if (i < amap.n) {
+            const struct gpu_access *e = &amap.e[i];
+            switch ((index - HV_GPU_S_MAP) % 4) {
+                case 0:
+                    v = e->addr;
+                    break;
+                case 1:
+                    v = e->count;
+                    break;
+                case 2:
+                    v = e->width | (u64)e->write << 8 | (u64)e->disp << 16 | (u64)e->cls << 24;
+                    break;
+                default:
+                    v = e->first;
+            }
+        }
+        amap_release();
+        return v;
+    }
     if (index >= HV_GPU_S_CLASS && index < HV_GPU_S_CLASS + GPU_C_COUNT)
         return __atomic_load_n(&class_hits[index - HV_GPU_S_CLASS], __ATOMIC_RELAXED);
     if (admitted && index >= HV_GPU_S_RANGE && index < HV_GPU_S_RANGE + 4 * (u64)table_count) {
@@ -351,6 +932,13 @@ u64 hv_gpu_proxy(u64 op, u64 a1, u64 a2)
             return err(hook());
         case HV_GPU_OP_STATUS:
             return status(a1);
+        case HV_GPU_OP_POWER:
+            return err(power());
+        case HV_GPU_OP_PROBE:
+            return err(probe());
+        case HV_GPU_OP_STOP:
+            hv_gpu_teardown("launcher STOP");
+            return 0;
         default:
             return HV_GPU_ERROR;
     }
@@ -359,7 +947,15 @@ u64 hv_gpu_proxy(u64 op, u64 a1, u64 a2)
 #ifdef HV_GPU_HOST_TEST
 void hv_gpu_host_new_session(void)
 {
-    session_used = admitted = hooked = false;
+    session_used = admitted = hooked = power_tried = probing = torn_down = forwarding = false;
+    marker = NULL;
+    memset(&psd, 0, sizeof(psd));
+    memset(gpu_id, 0, sizeof(gpu_id));
+    memset(cpu_control, 0, sizeof(cpu_control));
+    memset(cpu_status, 0, sizeof(cpu_status));
+    memset(&amap, 0, sizeof(amap));
+    forwarded = denied = run_refused = faults = 0;
+    msgs_logged = 0;
     memset(&adm, 0, sizeof(adm));
     table_count = 0;
     handoff = NULL;
@@ -376,8 +972,18 @@ bool hv_gpu_host_hook(u64 addr, u64 *val, bool write, int width)
     return gpu_hook(NULL, addr, val, write, width);
 }
 
+bool hv_gpu_host_probe_hook(u64 addr, u64 *val, bool write, int width)
+{
+    return probe_hook(NULL, addr, val, write, width);
+}
+
 const void *hv_gpu_host_handoff(void)
 {
     return handoff;
+}
+
+const void *hv_gpu_host_marker(void)
+{
+    return marker;
 }
 #endif

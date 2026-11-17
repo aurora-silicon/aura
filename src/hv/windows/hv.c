@@ -1379,14 +1379,18 @@ static int hv_start_session(void *entry, u64 regs[4]);
 /*
  * D4: every way out of a guest session -- a PSCI SYSTEM_OFF/RESET return, a join failure, a
  * refusal before entry -- passes here, so an attached USB controller is always halted and its
- * DART streams taken down before the proxy (or the next owner) sees the machine.  The reset
- * path (flush_and_reboot) has its own lock-free stop.
+ * DART streams taken down before the proxy (or the next owner) sees the machine.  G1 likewise
+ * turns GPU forwarding off.  The reset path (flush_and_reboot) has its own lock-free stops.
  */
 int hv_start(void *entry, u64 regs[4])
 {
     int ret = hv_start_session(entry, regs);
-    hv_usb_teardown(ret == 1 ? "guest SYSTEM_OFF" : ret == 2 ? "guest SYSTEM_RESET" :
-                                                               "guest session failed or refused");
+    const char *why = ret == 1 ? "guest SYSTEM_OFF" :
+                      ret == 2 ? "guest SYSTEM_RESET" :
+                                 "guest session failed or refused";
+    hv_usb_teardown(why);
+    /* G1: GPU forwarding off and firmware regions unmapped; the GPU itself is left running. */
+    hv_gpu_teardown(why);
     /* D5: an NVMe-backed disk closes with the controller shutdown before the proxy runs again. */
     hv_ahci_session_end(ret);
     return ret;

@@ -120,6 +120,10 @@ HOLES = {
 }
 POOL = (0x9_0000_0000, 0x1000_0000)
 HANDOFF_IPA = 0x8_0600_0000
+# G1: the synthetic PSD blocks (tests/e2e/windows_gpu_hw_model.h MODEL_PSD_BASE) sit inside the
+# reg of an /arm-io node named "pmgr"; /chosen/memory-map carries the two zero slots iBoot leaves.
+PSD_BASE = 0x3_0700_0000
+MARKER_SLOT, POOL_SLOT = "MemoryMapReserved-15", "MemoryMapReserved-14"
 
 # Classes (gpu_t8152_admit.h)
 C_SGX, C_HOLE, C_CTRL, C_ASC, C_VBAR, C_MBOX, C_FW_RW, C_FW_RO, C_TEXT, C_POOL, C_HANDOFF = \
@@ -206,9 +210,12 @@ def machine():
     holes = [Node(name, {"reg": reg(*regs)}) for name, regs in HOLES.items()]
     armio = Node("arm-io", {"#address-cells": u32(2), "#size-cells": u32(2),
                             "ranges": u64(0, BUS, 0x4_0000_0000)},
-                 [Node("aic", {"reg": reg((0x2_8000_0000, 0x100000))}), sgx, *ascs, *holes])
+                 [Node("aic", {"reg": reg((0x2_8000_0000, 0x100000))}), sgx, *ascs, *holes,
+                  Node("pmgr", {"reg": reg((PSD_BASE, 0x4000))})])
+    memory_map = Node("memory-map", {"MemoryMapReserved-13": u64(0, 0), POOL_SLOT: u64(0, 0),
+                                     MARKER_SLOT: u64(0, 0)})
     root = Node("device-tree", {"#address-cells": u32(2), "#size-cells": u32(2)}, [
-        Node("chosen", {"dram-base": u64(DRAM), "dram-size": u64(DRAM_SIZE)}),
+        Node("chosen", {"dram-base": u64(DRAM), "dram-size": u64(DRAM_SIZE)}, [memory_map]),
         Node("defaults", {"uat-vaddr-size": u32(43)}),
         armio,
     ])
@@ -686,6 +693,7 @@ def glue_exe(tmp_path_factory):
         "typedef bool(hv_hook_t)(struct exc_info *ctx, u64 addr, u64 *val, bool write, "
         "int width);\nint hv_map_hook(u64 from, hv_hook_t *hook, u64 size);\n"
         "int hv_map_hw_ro(u64 from, u64 to, u64 size);\nint hv_unmap(u64 from, u64 size);\n"
+        "int hv_map_hw(u64 from, u64 to, u64 size);\n"
         "bool hv_windows_guest_entered(void);\n"
         "#include \"hv_t8152.h\"\n")
     (stubs / "hv_t8152.h").write_text(
@@ -695,18 +703,25 @@ def glue_exe(tmp_path_factory):
         "int hv_t8152_gpu_fw_allow(u64 pa, u64 size, bool read_only, u64 dram_lo, u64 dram_hi,"
         " const char *name);\nint hv_t8152_gpu_deny(u64 start, u64 end, const char *name);\n"
         "unsigned int hv_t8152_allow_mark(void);\n"
-        "void hv_t8152_allow_rollback(unsigned int mark, const char *why);\n")
+        "void hv_t8152_allow_rollback(unsigned int mark, const char *why);\n"
+        "int hv_t8152_reserve_carrier(u64 start, u64 end, const char *name);\n")
     (stubs / "memory.h").write_text(
         "#pragma once\n#include \"types.h\"\nvoid dc_civac_range(void *addr, size_t length);\n")
     (stubs / "glue_profile.inc").write_text(glue_profile_inc())
     shutil.copyfile(REPO / "src/adt.h", stubs / "adt.h")
-    for name in ("gpu_t8152_admit.c", "gpu_t8152_admit.h", "hv_gpu.c", "hv_gpu.h"):
+    for name in GLUE_SOURCES:
         shutil.copyfile(WIN / name, stubs / name)
-    exe = d / "glue"
-    subprocess.run([cc, *CFLAGS, "-DHV_GPU_HOST_TEST", "-iquote", str(stubs), "-I", str(E2E),
-                    str(stubs / "gpu_t8152_admit.c"), str(stubs / "hv_gpu.c"),
-                    str(E2E / "windows_gpu_glue_host.c"), "-o", str(exe)], check=True)
-    return exe
+    exes = {}
+    for kind, driver in (("glue", "windows_gpu_glue_host.c"), ("probe", "windows_gpu_probe_host.c")):
+        exes[kind] = d / kind
+        subprocess.run([cc, *CFLAGS, "-DHV_GPU_HOST_TEST", "-iquote", str(stubs), "-I", str(E2E),
+                        *(str(stubs / n) for n in GLUE_SOURCES if n.endswith(".c")),
+                        str(E2E / driver), "-o", str(exes[kind])], check=True)
+    return exes
+
+
+GLUE_SOURCES = ("gpu_t8152_admit.c", "gpu_t8152_admit.h", "gpu_t8152_power.c", "gpu_t8152_power.h",
+                "gpu_t8152_probe.c", "gpu_t8152_probe.h", "hv_gpu.c", "hv_gpu.h")
 
 
 def test_glue(glue_exe, tmp_path):
@@ -714,7 +729,7 @@ def test_glue(glue_exe, tmp_path):
     (tmp_path / "adt.bin").write_bytes(machine().encode())
     for r in range(2):
         (tmp_path / f"text{r}.bin").write_bytes(make_text(r))
-    args = [str(glue_exe), str(tmp_path / "adt.bin"), f"{TEXT[0][0]:#x}",
+    args = [str(glue_exe["glue"]), str(tmp_path / "adt.bin"), f"{TEXT[0][0]:#x}",
             str(tmp_path / "text0.bin"), f"{TEXT[1][0]:#x}", str(tmp_path / "text1.bin"),
             f"{SGX:#x}", f"{SGX_SIZE:#x}", f"{MBOX:#x}", f"{POOL[0]:#x}", f"{POOL[1]:#x}",
             f"{RAM_BASE:#x}", f"{RAM_TOP:#x}"]
@@ -723,6 +738,110 @@ def test_glue(glue_exe, tmp_path):
     assert "HV: GPU: admitted J804 G18G-RTKit-3514.41.1.release" in out
     assert "refused: ADMIT runs once per carrier session" in out
     assert "pool [" in out and "must be 32 MiB aligned" in out
+
+
+# ---- G1: power-on, boot marker, mediated forwarding (hv_gpu.c POWER / PROBE / STOP) ------------
+#
+# Failure modes written down before the code (windows_gpu_probe_host.c covers each):
+#   G1-1 POWER before ADMIT, after guest entry or in a G0 "log" session; PROBE before POWER.
+#   G1-2 the PSD requests go out once per service, in recipe order, with the recipe's values, each
+#        only from cold idle; the marker is claimed in the live ADT before the first request; the
+#        ID words land in the handoff page; PROBE forwards exactly the measured set (ID words,
+#        CPU_CONTROL/CPU_STATUS, the GFX windows' RX/TX/status) and nothing else reaches the
+#        hardware; CPU_CONTROL writes are never performed (RUN is never cleared or toggled); the
+#        firmware regions are mapped identity (UAT RW, DATA RO); every access is in the map.
+#   G1-3 a carrier reload in the same boot (same ADT, same heap) refuses POWER before any PMGR
+#        access, even when the marker page itself was overwritten.
+#   G1-4 a reboot (fresh ADT) frees it again.
+#   G1-5 a set slot that is not a GPU marker, or a taken pool slot, refuses POWER.
+#   G1-6 a service already on without a marker: claimed as used, nothing requested.
+#   G1-7 no acknowledge or the wrong state: the sequence stops there, nothing is powered off, the
+#        marker says POWER_FAILED and a reload cannot retry.
+#   G1-8 no recipe, or a PSD block outside every ADT pmgr range: nothing touched, nothing spent.
+#   G1-9 STOP / teardown / the reset path turn forwarding off without touching the GPU; a failed
+#        firmware map leaves nothing mapped.
+
+
+def test_g1_probe(glue_exe, tmp_path):
+    (tmp_path / "adt.bin").write_bytes(machine().encode())
+    for r in range(2):
+        (tmp_path / f"text{r}.bin").write_bytes(make_text(r))
+    hole = SGX + 0xe8_0000
+    args = [str(glue_exe["probe"]), str(tmp_path / "adt.bin"), f"{TEXT[0][0]:#x}",
+            str(tmp_path / "text0.bin"), f"{TEXT[1][0]:#x}", str(tmp_path / "text1.bin"),
+            f"{SGX:#x}", f"{SGX_SIZE:#x}", f"{MBOX:#x}", f"{POOL[0]:#x}", f"{POOL[1]:#x}",
+            f"{RAM_BASE:#x}", f"{RAM_TOP:#x}", f"{WRAP[0]:#x}", f"{WRAP[1]:#x}", f"{VBAR[0]:#x}",
+            f"{hole:#x}"]
+    out = subprocess.run(args, check=True, capture_output=True, text=True).stdout
+    for tag in ("ORDER", "PROBE", "RELOAD", "REBOOT", "SLOT", "FOREIGN", "FAIL", "RECIPE", "STOP"):
+        assert f"G1 {tag} OK" in out, out
+    assert "GPU PROBE OK" in out
+    assert "HV: GPU: boot marker claimed: /chosen/memory-map/MemoryMapReserved-15" in out
+    assert "the boot marker says a session ran and ended with the firmware left running" in out
+    assert "set but holds no valid GPU marker" in out
+    assert "probe read sgx+0xd04000 (sgx, 4 bytes) -> 0x5100: passed" in out
+    assert "probe read sgx+0xe80000 (sgx-hole, 4 bytes) -> 0x0: denied" in out
+    assert "GFX1 RX msg 0x0010000000000c0c ep 0x0" in out
+    assert "GFX1 TX msg 0x0020000000000c0c ep 0x0" in out
+    assert "CPU_CONTROL write 0x0 refused" in out
+    assert re.search(r"map sgx\+0xd04000 R32 sgx passed n=1 first 0x5100", out), out
+    assert "never stopped, powered off or restarted by the carrier" in out
+    assert "PSD core (service 5): request 1 acknowledged after" in out
+
+
+def test_g1_marker_layout():
+    """The record the next carrier reads: 96 bytes, CRC-32 (zlib) over everything before it."""
+    hdr = (WIN / "gpu_t8152_power.h").read_text()
+    assert "_Static_assert(sizeof(struct gpu_boot_marker) == 96" in hdr
+    assert '#define GPU_BOOT_MARKER_MAGIC   0x314b4d4255504741ULL /* "AGPUBMK1" */' in hdr
+    assert struct.pack("<Q", 0x314b4d4255504741) == b"AGPUBMK1"
+    glue = (WIN / "hv_gpu.h").read_text()
+    assert '#define HV_GPU_BOOT_MARKER "MemoryMapReserved-15"' in glue
+    assert '#define HV_GPU_POOL_SLOT   "MemoryMapReserved-14"' in glue
+
+
+def test_g1_wired():
+    hv = (WIN / "hv.c").read_text()
+    start = hv.split("int hv_start(void *entry, u64 regs[4])\n{", 1)[1].split("\n}", 1)[0]
+    assert "hv_usb_teardown(why);" in start and "hv_gpu_teardown(why);" in start
+    utils = (REPO / "src/utils.c").read_text()
+    reset = utils.split("void flush_and_reboot(void)", 1)[1].split("reboot();", 1)[0]
+    assert reset.index("hv_usb_emergency_stop();") < reset.index("hv_gpu_emergency_stop();") < \
+        reset.index("nvme_shutdown()")
+    proxy_c = (REPO / "src/proxy.c").read_text()
+    assert "HV_WINDOWS_CAPS2_GPU_PROBE;" in proxy_c
+    makefile = (REPO / "Makefile").read_text()
+    objs = makefile.split("ifeq ($(WINDOWS),1)\nHV_OBJECTS", 1)[1].split("endif", 1)[0]
+    for o in ("gpu_t8152_power.o", "gpu_t8152_power_recipe.o", "gpu_t8152_probe.o"):
+        assert o in objs
+    assert "build/hv/windows/gpu_t8152_power_recipe.o: build/j804_gpu_power.h" in makefile
+    assert "$(J804_PRIVATE_DATA)/aura/g18g-j804-gpu-power.h" in makefile
+    assert "#define J804_GPU_PSD_RECIPE {.available = false}" in makefile
+
+
+def test_g1_recipe_is_not_in_the_repository():
+    """D1(a): the PSD recipe (upstream values) only comes from private data at build time."""
+    recipe = (WIN / "gpu_t8152_power_recipe.c").read_text()
+    assert '#include "../build/j804_gpu_power.h"' in recipe
+    assert "#define J804_GPU_PSD_RECIPE" not in recipe
+    for name in ("gpu_t8152_power.c", "gpu_t8152_power_recipe.c", "gpu_t8152_power.h",
+                 "hv_gpu.c", "gpu_t8152_probe.c"):
+        code = re.sub(r"/\*.*?\*/", "", (WIN / name).read_text(), flags=re.S)
+        code = code.replace("0x314b4d4255504741ULL", "MAGIC")   # "AGPUBMK1", not an address
+        assert not re.search(r"0x3[0-9a-f]{2}a1", code, re.I), name
+        assert not re.search(r"\b(81|82)\b", code), name   # no PSD service ids
+        assert not re.search(r"0x[0-9a-fA-F]{9,}", code), name
+    tracked = subprocess.run(["git", "ls-files"], cwd=REPO, capture_output=True, text=True).stdout
+    assert "j804_gpu_power.h" not in tracked and "g18g-j804-gpu-power.h" not in tracked
+
+
+def test_g1_forwarded_set_is_the_measured_one():
+    """gpu_t8152_probe.c forwards exactly the sgx words macOS read at bring-up (ledger G-10/B-09)
+    and nothing from pmgr-child, the KSM block or the rest of B-09."""
+    code = (WIN / "gpu_t8152_probe.c").read_text()
+    body = code.split("static const struct gpu_probe_reg sgx_reads[] = {", 1)[1].split("};", 1)[0]
+    offsets = [int(o, 16) for o in re.findall(r"\{(0x[0-9a-f]+),", body)]
+    assert offsets == [0xd04000, 0xd04008, 0xd04010, 0xd04014, 0xd04018, 0xd0401c, 0xe01500]
 
 
 # ---- source rules ------------------------------------------------------------------------------
@@ -742,7 +861,8 @@ def test_sources_wired():
     assert "struct gpu_profile {" not in kboot
     assert "const struct gpu_profile *gpu_t8152_j804_profiles(void)" in kboot
     # The carrier never hard-codes a GPU address: everything comes from the admission.
-    glue = (WIN / "hv_gpu.c").read_text() + (WIN / "gpu_t8152_admit.c").read_text()
+    glue = "".join((WIN / n).read_text() for n in ("hv_gpu.c", "gpu_t8152_admit.c",
+                                                    "gpu_t8152_power.c", "gpu_t8152_probe.c"))
     code = re.sub(r"/\*.*?\*/", "", glue, flags=re.S)
     assert not re.search(r"0x[0-9a-fA-F]{9,}", code), "hard-coded physical address"
 
@@ -754,7 +874,8 @@ def test_launcher_gpu_option():
     from aura import windows as w
     assert w.parse_windows_gpu("off") == "off" and w.parse_windows_gpu("disabled") == "off"
     assert w.parse_windows_gpu("admit") == "admit" and w.parse_windows_gpu("LOG") == "log"
-    for bad in ("on", "pass", "run", ""):
+    assert w.parse_windows_gpu("probe") == "probe"
+    for bad in ("on", "pass", "run", "", "power"):
         with pytest.raises(ValueError):
             w.parse_windows_gpu(bad)
     caps2 = w.CAPS2_MAGIC | w.CAPS2_GPU
@@ -823,7 +944,7 @@ def _gpu_admit_under_test(results, image_end=None):
             calls.append(("gpu", op, *a))
             if op == w.GPU_OP_STATUS:
                 return {w.GPU_STATUS_HANDOFF_IPA: 0x8_0600_0000,
-                        w.GPU_STATUS_HANDOFF_SIZE: 0x4000, w.GPU_STATUS_RANGES: 40}[a[0]]
+                        w.GPU_STATUS_HANDOFF_SIZE: 0x4000, w.GPU_STATUS_RANGES: 40}.get(a[0], 0)
             return results.get(op, 0)
 
         def hv_windows_usb(self, op, *a):
@@ -889,3 +1010,69 @@ def test_g1_needs_a_boot_wide_marker():
     if starts_firmware:
         assert "HV_GPU_BOOT_MARKER" in code, \
             "hv_gpu.c powers or starts the GPU without a boot-wide admission marker"
+
+
+def test_launcher_probe_request():
+    """G1: probe needs CAPS2 bit 4, the resident's recipe and a free boot marker, all checked
+    before anything is uploaded."""
+    from aura import windows as w
+    caps2 = w.CAPS2_MAGIC | w.CAPS2_GPU | w.CAPS2_GPU_PROBE
+    w.validate_gpu_request("probe", w.T8152_CHIP, w.J804_BOARD_ID, caps2, 1, 0)
+    w.validate_gpu_request("log", w.T8152_CHIP, w.J804_BOARD_ID, w.CAPS2_MAGIC | w.CAPS2_GPU)
+    for c2, recipe, boot, why in (
+            (w.CAPS2_MAGIC | w.CAPS2_GPU, 1, 0, "bit 4"),
+            (caps2, 0, 0, "without the private GPU power recipe"),
+            (caps2, 1, 0x3, "already used: marker claimed, powered"),
+            (caps2, 1, w.GPU_BOOT_FOREIGN, "holds no GPU marker"),
+            (caps2, 1, w.GPU_BOOT_NO_SLOT, "has no /chosen/memory-map/MemoryMapReserved-15"),
+            (caps2, 1, None, "unknown")):
+        with pytest.raises(ValueError, match=why):
+            w.validate_gpu_request("probe", w.T8152_CHIP, w.J804_BOARD_ID, c2, recipe, boot)
+    assert w.describe_gpu_boot(0x33) == "marker claimed, powered, forwarding, ended"
+    e = w.gpu_map_entry(SGX + 0xd04000, 3, 2 | 0 << 8 | 1 << 16 | 1 << 24, 0x5100)
+    assert e == {"addr": SGX + 0xd04000, "count": 3, "bits": 32, "write": False,
+                 "disposition": "passed", "class": "sgx", "first": 0x5100}
+    assert w.describe_gpu(-8 & ((1 << 64) - 1)).startswith("this boot's GPU firmware session")
+    run_guest = (REPO / "proxyclient/tools/run_guest.py").read_text()
+    plan = run_guest.split("def windows_t8152_gpu_plan(", 1)[1].split("\ndef ", 1)[0]
+    assert "GPU_STATUS_POWER_RECIPE" in plan and "GPU_STATUS_BOOT" in plan
+
+
+def test_launcher_probe_order():
+    """ADMIT, then POWER, then PROBE, then the Mu handshake; nothing else."""
+    from aura import windows as w
+    admit, hv, calls = _gpu_admit_under_test({})
+    admit(hv, "probe", (1,), None)
+    gpu_ops = [c[1] for c in calls if c[0] == "gpu" and c[1] != w.GPU_OP_STATUS]
+    assert gpu_ops == [w.GPU_OP_ADMIT, w.GPU_OP_POWER, w.GPU_OP_PROBE]
+    kinds = [c[0] for c in calls]
+    assert kinds.index("hs") > max(i for i, c in enumerate(calls)
+                                   if c[0] == "gpu" and c[1] == w.GPU_OP_PROBE)
+    assert ("usb", w.USB_OP_DETACH) not in calls and not any(c[0] == "exit" for c in calls)
+
+
+@pytest.mark.parametrize("failing", ["power", "probe"])
+def test_launcher_probe_refusal_stops_and_detaches(failing):
+    """A POWER or PROBE refusal runs STOP (which never touches the GPU) and detaches USB; no
+    handshake is written."""
+    from aura import windows as w
+    op = w.GPU_OP_POWER if failing == "power" else w.GPU_OP_PROBE
+    admit, hv, calls = _gpu_admit_under_test({op: -8 & ((1 << 64) - 1)})
+    with pytest.raises(_Exit):
+        admit(hv, "probe", (1,), None)
+    kinds = [c[0] for c in calls]
+    assert "hs" not in kinds and kinds[-1] == "exit"
+    stop = calls.index(("gpu", w.GPU_OP_STOP))
+    assert stop < calls.index(("usb", w.USB_OP_DETACH))
+    assert "reboot the M6" in calls[-1][1] or "boot marker" in calls[-1][1]
+
+
+def test_launcher_names_the_reserved_pool():
+    """After a probe session the pool slot keeps later guest RAM off the GPU-reachable pool, and
+    the host check says why."""
+    from aura import windows as w
+    problems = w.t8152_window_conflicts(0x8_0000_0000, 0x9_2000_0000, 0x8_0000_0000,
+                                        0x2_0000_0000, {}, {w.GPU_POOL_SLOT: POOL}, ())
+    assert len(problems) == 1 and "reboot the M6" in problems[0]
+    assert w.t8152_window_conflicts(0x8_0000_0000, 0x9_2000_0000, 0x8_0000_0000, 0x2_0000_0000,
+                                    {}, {w.GPU_POOL_SLOT: (0, 0)}, ()) == []

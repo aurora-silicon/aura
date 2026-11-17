@@ -646,6 +646,12 @@ u32 gpu_t8152_handoff_build(void *dst, u64 page_size, const struct gpu_t8152_adm
     put64(page, GPU_HO_DRAM_SIZE, a->dram_size);
     if (a->receipt)
         strncpy((char *)page + GPU_HO_RECEIPT, a->receipt, 63);
+    for (u32 i = 0; i < GPU_HANDOFF_ID_WORDS; i++)
+        put32(page, GPU_HO_GPU_ID + 4 * i, in->gpu_id[i]);
+    for (u32 r = 0; r < GPU_T8152_ROLES; r++) {
+        put32(page, GPU_HO_CPU_CONTROL + 4 * r, in->cpu_control[r]);
+        put32(page, GPU_HO_CPU_STATUS + 4 * r, in->cpu_status[r]);
+    }
     for (u32 i = 0; i < count; i++) {
         u32 o = roff + i * GPU_HANDOFF_RANGE;
         put64(page, o, table[i].base);

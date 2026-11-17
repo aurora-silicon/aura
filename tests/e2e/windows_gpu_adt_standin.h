@@ -109,6 +109,19 @@ const void *adt_getprop(const void *a, int node, const char *name, u32 *lenp)
     return NULL;
 }
 
+/* As rust/src/adt.rs adt_setprop(): in place, only to the property's existing length. */
+int adt_setprop(void *a, int node, const char *name, void *value, size_t len)
+{
+    u32 have;
+    void *p = (void *)adt_getprop(a, node, name, &have);
+    if (!p)
+        return -1;
+    if (have != len)
+        return -2;
+    memcpy(p, value, len);
+    return (int)len;
+}
+
 const char *adt_get_name(const void *a, int node)
 {
     return adt_getprop(a, node, "name", NULL);

@@ -803,13 +803,8 @@ sent and the guest sees no change.
   CRC-32 (zlib) over the used bytes. The launcher writes `/chosen/aura,windows-gpu-v1` (16
   bytes: handoff IPA, size) only after ADMIT returned 0; Mu's GPU0 node is built from the page.
 
-Not in G0 yet, each needing an owner-present session: PSD power-on (3, 82, 81), the
-CPU_CONTROL guard (our J804 Linux logs and the macOS traces show RUN already set once power-on
-completes, so G1 refuses writes that clear or toggle RUN instead of granting one RUN), iop-vbar pinned by value, mailbox forwarding, measured sgx passthrough, live GPU aliases,
-mapping the firmware classes, and a boot-wide (not per-carrier-session) admission marker.
-"Once per carrier session" is all G0 has: a carrier reload resets it. That is harmless while
-nothing powers or starts the firmware; the GPU host test fails as soon as `hv_gpu.c` sets
-`GPU_HS_POWERED` or `GPU_HS_ASC_RUN` without a `HV_GPU_BOOT_MARKER`.
+G0 itself never powers or starts anything; "once per carrier session" was enough for it. G1
+(below) adds what powers the GPU, and with it the boot-wide marker.
 
 A failed ADMIT rolls back every stage-2 exception it added (`hv_t8152_allow_rollback()`); the
 `__TEXT` denylist entries stay, since they only forbid more. The handoff page is cleaned to the
@@ -817,6 +812,58 @@ point of coherency after each build, because Mu's PrePi reads it with the MMU of
 launcher detaches USB before every GPU refusal, and refuses a pool that overlaps the loaded
 image (Mu FD, appended payloads, SEPFW, preoslog, boot_args) or, with an AHCI store, leaves
 less than 4 GiB of guest RAM below the pool.
+
+## G1: GPU power-on, boot marker and mediated forwarding (`--windows-gpu probe`)
+
+Status: built and host-tested only (`test_g1_*` and `test_launcher_probe_*` in
+`tests/python/test_windows_t8152_gpu.py`, drivers `tests/e2e/windows_gpu_probe_host.c` and
+`windows_gpu_hw_model.h`). Nothing of it has run on the M6. For a UEFI probe (`g18probe.efi`,
+private repo) that runs under Mu before Windows, or instead of it. CAPS2 bit 4.
+
+- **Power recipe** (`gpu_t8152_power.c`, `gpu_t8152_power_recipe.c`): PMGR PSD requests, one per
+  GPU service, in a fixed order, each from cold idle: write the request, poll the acknowledge,
+  then read the state once (the read consumes the acknowledge) and compare it with the active
+  state. A failure stops there; nothing is powered off or retried. The recipe's values are not in
+  this tree: the Makefile copies `$(J804_PRIVATE_DATA)/aura/g18g-j804-gpu-power.h` into
+  `build/j804_gpu_power.h`, and without that file the carrier builds with power-on disabled
+  (`STATUS 13` reads 0, `POWER` returns -7). Every PSD block must lie inside a `pmgr*` register
+  range of the live ADT before it is touched.
+- **Boot marker** (`HV_GPU_BOOT_MARKER`, `hv_gpu.h`): once the last service is on the GPU
+  firmware is running (RUN comes up set), and it does not survive a second start, so POWER is
+  once per boot, not per carrier session. Before its first PSD request it claims
+  `/chosen/memory-map/MemoryMapReserved-15` in the live ADT (a 16-byte slot iBoot leaves zero) for
+  a 16 KiB carrier page holding a CRC-protected record (`struct gpu_boot_marker`: claimed /
+  powered / failed / found-on / forwarding / ended, the PSD samples, the pool, counters), and
+  `MemoryMapReserved-14` for the pool. A carrier reloaded in place sees both (chainload keeps
+  the live ADT and never reuses the old heap); a reboot clears them (iBoot builds a new ADT).
+  POWER is refused when the marker slot is set (even if the page was overwritten), when the
+  pool slot is taken, or when any service is already on (that also claims the marker). The
+  guest-RAM checks of `hv_t8152.c` and `windows.py` already refuse memory-map ranges, so the
+  pool, which the GPU may still reach, stays out of every later guest this boot.
+- **POWER** (op 4): after ADMIT, not with the G0 hooks, once per session. After the sequence it
+  reads the GPU ID words and both ASCs' CPU_CONTROL / CPU_STATUS (guarded reads) into the
+  handoff page (offsets 0xc0, 0xdc, 0xe4; version stays 1) and logs them.
+- **PROBE** (op 5, `gpu_t8152_probe.c`): C hooks over the sgx window and the post-office page,
+  as in G0, but each access is decided: the six GPU ID words and the core-mask word that macOS
+  reads at bring-up (32-bit reads), CPU_STATUS reads, CPU_CONTROL reads, and the RX / TX /
+  status registers of the two GFX post-office windows are performed on the hardware; a
+  CPU_CONTROL write is never performed (a rewrite of the held value with RUN set is accepted as a
+  no-op, anything else is refused and counted); everything else, the pmgr-child and
+  error-handler holes, the iop-vbar pages, the rest of the wrappers and the other coprocessors'
+  windows, reads as zero, ignores writes and never reaches the hardware. The four UAT regions are
+  mapped RW and the four DATA regions RO at IPA = PA. Every access goes into an access map (one
+  entry per address, width, direction and outcome; STATUS 0x1000 + 4 i), the first sight of each
+  is printed with its offset, and the first 128 GFX messages are printed. The GPU interrupts are
+  not published: G1 polls.
+- **STOP / teardown** (op 6; `hv_start()` runs it on every exit, `flush_and_reboot()` turns
+  forwarding off first): forwarding off, firmware regions unmapped, the access map printed, the
+  marker marked ended. The GPU stays powered and its firmware running for the rest of the boot;
+  nothing ever stops, powers off or restarts it.
+
+The launcher (`--windows-gpu probe`) checks CAPS2 bit 4, the recipe and a free marker before the
+upload, then runs ADMIT, POWER, PROBE and writes `/chosen/aura,windows-gpu-v1`; a POWER or PROBE
+refusal runs STOP and detaches USB. At exit it prints the counters and the access map.
+
 ## I0: Mac-fed keyboard and pointer (carrier input device)
 
 Status: built and host-tested only (`tests/python/test_windows_t8152_input.py`). Nothing of it

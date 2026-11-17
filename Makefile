@@ -256,7 +256,8 @@ HV_OBJECTS := $(patsubst %,hv/windows/%, \
 	serial_capture.o mtp_handoff.o hv_xfer.o ahci_model.o hv_ahci.o hv_vdev_spi.o \
 	hv_fatal.o hv_usb.o hv_usb_dart.o gpu_t8152_admit.o hv_gpu.o input_model.o hv_input.o \
 	ahci_nvme.o gpt_check.o hv_ahci_nvme.o hv_serror.o \
-	mtp_scm.o mtp_dart_t8152.o hid_desc.o input_kbd.o mtp_bringup.o hv_mtp_t8152.o input_tp.o) \
+	mtp_scm.o mtp_dart_t8152.o hid_desc.o input_kbd.o mtp_bringup.o hv_mtp_t8152.o input_tp.o \
+	gpu_t8152_power.o gpu_t8152_power_recipe.o gpu_t8152_probe.o) \
 	hv/hv_vm.o hv/hv_virtio.o hv/hv_vuart.o hv/hv_wdt.o hv/hv_sprr.o
 endif
 
@@ -488,6 +489,25 @@ build/j804_gpu_profile.h: always_rebuild
 	  msg=" (no $(J804_GPU_PROFILE): no J804 G18G entry)"; \
 	fi; \
 	if cmp -s $@.tmp $@; then rm -f $@.tmp; else mv -f $@.tmp $@ && echo "  J804  $@$$msg"; fi
+
+# G1: J804's GPU PSD power-on recipe (src/hv/windows/gpu_t8152_power_recipe.c) comes from the
+# upstream driver (owner decision D1(a): private bring-up only) and is not kept in this
+# repository either. Without $(J804_PRIVATE_DATA)/aura/g18g-j804-gpu-power.h the carrier builds
+# with GPU power-on disabled: --windows-gpu probe is then refused, nothing else changes.
+J804_GPU_POWER = $(J804_PRIVATE_DATA)/aura/g18g-j804-gpu-power.h
+
+build/hv/windows/gpu_t8152_power_recipe.o: build/j804_gpu_power.h
+build/j804_gpu_power.h: always_rebuild
+	$(QUIET)mkdir -p build
+	$(QUIET)if [ -f "$(J804_GPU_POWER)" ]; then \
+	  cmp -s "$(J804_GPU_POWER)" $@ 2>/dev/null || \
+	  ( cp "$(J804_GPU_POWER)" $@ && echo "  J804  $@" ); \
+	else \
+	  printf '%s\n' '/* No private GPU PSD recipe: power-on disabled. */' \
+	    '#define J804_GPU_PSD_RECIPE {.available = false}' > $@.tmp; \
+	  cmp -s $@.tmp $@ 2>/dev/null && rm -f $@.tmp || \
+	  ( mv -f $@.tmp $@ && echo "  J804  $@ (no $(J804_GPU_POWER): GPU power-on disabled)" ); \
+	fi
 
 # The built-in boot logos are linked gzip-compressed; fb.c inflates them on first use.
 # They are only read, so they go in .rodata. aura-raw.ld links them with the fonts past

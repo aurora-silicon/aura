@@ -536,7 +536,9 @@ def t8152_window_conflicts(base, top, phys_base, mem_size, carveouts, memory_map
             problems.append(f"overlaps carve-out {name} [{start:#x}, {start + size:#x})")
     for name, (start, size) in sorted(memory_map.items()):
         if size and start < top and base < start + size:
-            problems.append(f"overlaps memory-map {name} [{start:#x}, {start + size:#x})")
+            why = (" (the GPU pool of a --windows-gpu probe session earlier this boot: the GPU "
+                   "firmware may still reach it; reboot the M6)") if name == GPU_POOL_SLOT else ""
+            problems.append(f"overlaps memory-map {name} [{start:#x}, {start + size:#x}){why}")
     for name, start, size in occupied:
         if size and start < top and base < start + size:
             problems.append(f"overlaps {name} [{start:#x}, {start + size:#x})")
@@ -1286,12 +1288,32 @@ def describe_usb_attach(result):
 # publishes an interrupt.  Mu's GPU0 node is described by the handoff page, which the 16-byte
 # /chosen/aura,windows-gpu-v1 handshake points at; it is written only after ADMIT returned 0.
 # Contract: windows-m6/G0-CARRIER-CONTRACT.md.
+#
+# G1 adds "probe": after ADMIT the resident powers the GPU on (PSD, its private recipe), once per
+# boot (the boot marker /chosen/memory-map/MemoryMapReserved-15 in the live ADT, which an in-place
+# carrier reload keeps and a reboot clears), then forwards exactly the measured registers through
+# its hooks (GPU ID words, CPU_CONTROL with RUN guarded, CPU_STATUS, the GFX post-office windows),
+# maps the UAT regions RW and the DATA regions RO, and logs every guest access by offset.  The
+# firmware then runs for the rest of the boot; the pool stays reserved (MemoryMapReserved-14).
 CAPS2_GPU = 0x0004                        # G0 GPU admission v1
-GPU_MODES = ("off", "admit", "log")
+CAPS2_GPU_PROBE = 0x0010                  # G1 power-on, boot marker, mediated forwarding
+GPU_MODES = ("off", "admit", "log", "probe")
 GPU_OP_ADMIT, GPU_OP_HOOK, GPU_OP_STATUS = 1, 2, 3
+GPU_OP_POWER, GPU_OP_PROBE, GPU_OP_STOP = 4, 5, 6
 GPU_STATUS_STATE, GPU_STATUS_HANDOFF_IPA, GPU_STATUS_HANDOFF_SIZE = 0, 1, 2
 GPU_STATUS_RANGES, GPU_STATUS_ACCESSES, GPU_STATUS_MAILBOX_GFX = 3, 4, 5
+GPU_STATUS_BOOT, GPU_STATUS_FORWARDED, GPU_STATUS_DENIED = 6, 7, 8
+GPU_STATUS_RUN_REFUSED, GPU_STATUS_FAULTS, GPU_STATUS_MAP_COUNT = 9, 10, 11
+GPU_STATUS_MAP_DROPPED, GPU_STATUS_POWER_RECIPE = 12, 13
+GPU_STATUS_PSD_BEFORE, GPU_STATUS_PSD_AFTER, GPU_STATUS_GPU_ID, GPU_STATUS_CPU = \
+    0x20, 0x28, 0x30, 0x40
 GPU_STATUS_CLASS = 0x100
+GPU_STATUS_MAP = 0x1000
+GPU_BOOT_FOREIGN, GPU_BOOT_NO_SLOT = 1 << 31, 1 << 30
+GPU_BOOT_BITS = ("claimed", "powered", "power failed", "found on", "forwarding", "ended")
+GPU_DISPOSITIONS = ("denied", "passed", "mediated", "refused", "fault")
+GPU_BOOT_MARKER_SLOT = "MemoryMapReserved-15"
+GPU_POOL_SLOT = "MemoryMapReserved-14"
 GPU_CLASSES = ("none", "sgx", "sgx-hole", "asc-ctrl", "asc", "iop-vbar", "mailbox", "fw-rw",
                "fw-ro", "fw-text", "pool", "handoff")
 GPU_ERRORS = {-1: "not T8152, the policy is not armed, no guest RAM, the guest already entered, "
@@ -1300,7 +1322,12 @@ GPU_ERRORS = {-1: "not T8152, the policy is not armed, no guest RAM, the guest a
               -3: "the admission refused (firmware identity, ADT shape or layout)",
               -4: "the range table does not fit or breaks a rule",
               -5: "the stage-2 policy refused a firmware class, or a map or hook failed",
-              -6: "no memory for the handoff page"}
+              -6: "no memory for the handoff page",
+              -7: "this carrier has no GPU power recipe (built without the private file), or a "
+                  "PSD block is not inside an ADT pmgr range (nothing was touched)",
+              -8: "this boot's GPU firmware session is already used (boot marker), cannot be "
+                  "claimed, or the GPU was found on: reboot the M6",
+              -9: "a PSD power-on step failed; the GPU state is unknown: reboot the M6"}
 GPU_HANDSHAKE_PROPERTY = "aura,windows-gpu-v1"
 GPU_HANDSHAKE_SIZE = 16
 GPU_HANDSHAKE_FORMAT = "<QQ"     # handoff page IPA, handoff page size
@@ -1309,17 +1336,19 @@ GPU_POOL_ALIGN = 32 << 20
 
 
 def parse_windows_gpu(value):
-    """--windows-gpu: off (or disabled), admit or log."""
-    require(isinstance(value, str), "--windows-gpu takes off, admit or log")
+    """--windows-gpu: off (or disabled), admit, log or probe."""
+    require(isinstance(value, str), "--windows-gpu takes off, admit, log or probe")
     text = value.strip().lower()
     if text in ("off", "disabled"):
         return "off"
-    require(text in GPU_MODES, f"--windows-gpu: unknown mode {value!r} (off, admit, log)")
+    require(text in GPU_MODES, f"--windows-gpu: unknown mode {value!r} (off, admit, log, probe)")
     return text
 
 
-def validate_gpu_request(mode, chip, board, caps2):
-    """Before anything is uploaded: the chip, the board and the resident's CAPS2 bit 2."""
+def validate_gpu_request(mode, chip, board, caps2, recipe=None, boot=None):
+    """Before anything is uploaded: the chip, the board and the resident's CAPS2 bit 2; for
+    "probe" also CAPS2 bit 4, the resident's power recipe (STATUS 13) and a free boot marker
+    (STATUS 6), so a used boot is refused before the upload, not after hv_init()."""
     if mode == "off":
         return
     require(chip == T8152_CHIP, "--windows-gpu is a T8152 (J804) option")
@@ -1327,6 +1356,37 @@ def validate_gpu_request(mode, chip, board, caps2):
     require(isinstance(caps2, int) and caps2 >> 32 == CAPS2_MAGIC >> 32 and caps2 & CAPS2_GPU,
             "the resident has no G0 GPU admission (P_HV_WINDOWS_CAPS2 bit 2): rebuild the "
             "carrier at or after the G0 commit")
+    if mode != "probe":
+        return
+    require(caps2 & CAPS2_GPU_PROBE, "the resident has no G1 GPU power-on (P_HV_WINDOWS_CAPS2 "
+            "bit 4): rebuild the carrier at or after the G1 commit")
+    require(recipe == 1, "the resident was built without the private GPU power recipe "
+            "(J804_PRIVATE_DATA/aura/g18g-j804-gpu-power.h): --windows-gpu probe cannot power "
+            "the GPU")
+    require(boot == 0, f"this boot's GPU firmware session is already used: "
+            f"{describe_gpu_boot(boot)}. Reboot the M6 before another --windows-gpu probe")
+
+
+def describe_gpu_boot(value):
+    """STATUS 6 (the boot marker) as text."""
+    if not isinstance(value, int):
+        return f"unknown ({value!r})"
+    if value == 0:
+        return "free"
+    if value & GPU_BOOT_FOREIGN:
+        return f"/chosen/memory-map/{GPU_BOOT_MARKER_SLOT} is set but holds no GPU marker"
+    if value & GPU_BOOT_NO_SLOT:
+        return f"this ADT has no /chosen/memory-map/{GPU_BOOT_MARKER_SLOT}"
+    bits = [name for i, name in enumerate(GPU_BOOT_BITS) if value & (1 << i)]
+    return "marker " + (", ".join(bits) if bits else f"{value:#x}")
+
+
+def gpu_map_entry(addr, count, kind, first):
+    """One access-map entry from STATUS 0x1000 + 4 i (+0 address, +1 count, +2 kind, +3 first)."""
+    width, write, disp, cls = kind & 0xff, (kind >> 8) & 1, (kind >> 16) & 0xff, kind >> 24
+    return {"addr": addr, "count": count, "bits": 8 << width, "write": bool(write),
+            "disposition": GPU_DISPOSITIONS[disp] if disp < len(GPU_DISPOSITIONS) else str(disp),
+            "class": GPU_CLASSES[cls] if cls < len(GPU_CLASSES) else str(cls), "first": first}
 
 
 def gpu_pool(ram_base, ram_top, mib):

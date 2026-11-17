@@ -36,6 +36,8 @@
 /* ASC CPU_CONTROL / CPU_STATUS, as src/asc.c names them: in the wrapper's first page. */
 #define GPU_T8152_ASC_CPU_CONTROL 0x44
 #define GPU_T8152_ASC_CPU_STATUS  0x48
+/* CPU_CONTROL RUN (m1n1 hw/asc.py; our traces: power-on leaves 0x10, ledger B-03/B-04). */
+#define GPU_ASC_CPU_RUN BIT(4)
 /*
  * The two GFX windows of the shared post-office page: [num * 0x100, num * 0x100 + 0x80) for the
  * ADT's msgbox-mailbox-num 1 (gfx-asc) and 2 (gfx1-asc).  Source: the ADT value, and our own
@@ -195,26 +197,35 @@ bool gpu_t8152_mailbox_window(const struct gpu_t8152_admission *a, u64 addr, u32
 #define GPU_HANDOFF_HEADER  0x100
 #define GPU_HANDOFF_RANGE   32 /* u64 base, u64 size, u32 class, u32 tag, u32 flags, u32 0 */
 #define GPU_HANDOFF_PERF    16 /* u32 freq (Hz), u32 core mV, u32 SRAM mV, u32 0 */
+/* G1: the ID words read after power-on (the six GPU ID words and the core mask). */
+#define GPU_HANDOFF_ID_WORDS 7
 
 /* Handoff state bits (offset 0x10): what the carrier has done, not what it may do later. */
 #define GPU_HS_ADMITTED     BIT(0)
 #define GPU_HS_HOOKS_LOG    BIT(1) /* logging hooks (RAZ/WI) on the sgx window and mailbox */
-#define GPU_HS_POWERED      BIT(2) /* PSD 3, 82, 81 acked (not in this commit) */
-#define GPU_HS_IRQ_LIVE     BIT(3) /* ASC lines published (not in this commit) */
+#define GPU_HS_POWERED      BIT(2) /* G1: every GPU PSD service acked and on (hv_gpu.c POWER) */
+#define GPU_HS_IRQ_LIVE     BIT(3) /* ASC lines published (not yet: G1 polls) */
 /*
- * CPU_CONTROL RUN state guarded (not in this commit).  Our J804 Linux logs and the macOS traces
- * show RUN already set once PSD power-on completes, before any host write; macOS only rewrites
- * the same value.  So G1's carrier refuses any write that clears or toggles RUN rather than
- * granting one RUN, pending S1/S2 confirmation under the carrier.
+ * CPU_CONTROL RUN state guarded (G1 PROBE).  Our J804 Linux logs and the macOS traces show RUN
+ * already set once PSD power-on completes, before any host write; macOS only rewrites the same
+ * value.  So the carrier refuses any write that clears or toggles RUN rather than granting one
+ * RUN, pending S2 confirmation under the carrier.
  */
 #define GPU_HS_ASC_RUN      BIT(4)
-#define GPU_HS_MMIO_PASS    BIT(5) /* measured sgx sub-ranges passed through (not yet) */
-#define GPU_HS_FW_MAPPED    BIT(6) /* firmware classes mapped into stage 2 (not yet) */
+/*
+ * G1 PROBE: the measured registers are forwarded by the carrier's hooks (gpu_t8152_probe.h);
+ * nothing in the sgx window or the post-office page is mapped to the guest directly yet.
+ */
+#define GPU_HS_MMIO_PASS    BIT(5)
+#define GPU_HS_FW_MAPPED    BIT(6) /* G1 PROBE: UAT regions mapped RW, DATA regions RO (IPA = PA) */
 
 struct gpu_t8152_handoff_in {
     u32 state;
     u64 handoff_ipa;
     u64 pool_base, pool_size;
+    /* G1, valid once GPU_HS_POWERED is set (zero before): what the carrier read after power-on. */
+    u32 gpu_id[GPU_HANDOFF_ID_WORDS]; /* forwarded ID words, gpu_t8152_probe_sgx_reads() order */
+    u32 cpu_control[GPU_T8152_ROLES], cpu_status[GPU_T8152_ROLES];
 };
 
 /* Header field offsets (also checked by the host test against a model written from this). */
@@ -242,6 +253,15 @@ enum gpu_handoff_field {
     GPU_HO_DRAM_BASE = 0x70,
     GPU_HO_DRAM_SIZE = 0x78,
     GPU_HO_RECEIPT = 0x80, /* char[64], NUL padded */
+    /*
+     * G1 fields in the header's spare tail (zero until GPU_HS_POWERED; version stays 1, Mu's
+     * GPU0 reads none of them): the raw ID words the carrier read after power-on, so the probe
+     * and the driver compare against the admitted values instead of decoding them (ledger G-10),
+     * and each ASC's CPU_CONTROL / CPU_STATUS as power-on left them (RUN expected set, B-03).
+     */
+    GPU_HO_GPU_ID = 0xc0,      /* u32[7] */
+    GPU_HO_CPU_CONTROL = 0xdc, /* u32[2]: gfx-asc, gfx1-asc */
+    GPU_HO_CPU_STATUS = 0xe4,  /* u32[2] */
 };
 
 /* Build the page; bytes used, or 0 if it does not fit. */

@@ -198,8 +198,10 @@ int main(int argc, char **argv)
     }
 
     if (outpath[0]) {
-        struct gpu_t8152_handoff_in in = {GPU_HS_ADMITTED | GPU_HS_HOOKS_LOG, handoff_ipa,
-                                          pool_base, pool_size};
+        struct gpu_t8152_handoff_in in = {.state = GPU_HS_ADMITTED | GPU_HS_HOOKS_LOG,
+                                          .handoff_ipa = handoff_ipa,
+                                          .pool_base = pool_base,
+                                          .pool_size = pool_size};
         u8 *page = calloc(1, GPU_HANDOFF_SIZE);
         u32 used = gpu_t8152_handoff_build(page, GPU_HANDOFF_SIZE, &adm, table, count, &in);
         printf("P used %u\n", used);
