@@ -3960,10 +3960,20 @@ static bool hv_handle_t8142_pmu_site(struct exc_info *ctx, u32 imm)
             printf("HV: T8142: CALLEE-SAVED WRITE x%ld = 0x%lx at 0x%lx (insn 0x%08x)\n", rt, out,
                    site, insn);
         callee_saved_emulated++;
-    } else if (site_emulated < 8 || (site_emulated % 4096) == 0) {
-        printf("HV: T8142: site emulated 0x%08x at 0x%lx (#%ld)\n", insn, site, site_emulated);
+    } else if (__atomic_load_n(&site_emulated, __ATOMIC_RELAXED) < 8) {
+        /*
+         * The first few only.  The old every-4096th line was a console write
+         * (console_lock, then USB) from this unlocked path on whichever guest
+         * CPU crossed the multiple, ~35 lines a second on boot 143 and up to
+         * ~110, some inside an ICC_IAR1 acknowledge.  Its counter was a plain
+         * global written by all ten CPUs on every emulation, so it also
+         * bounced a cache line per site and printed 10,708 duplicate numbers.
+         * The per-CPU rate is in the 1 Hz "HV: el2" line (abs, irq).
+         */
+        u64 n = __atomic_fetch_add(&site_emulated, 1, __ATOMIC_RELAXED);
+        if (n < 8)
+            printf("HV: T8142: site emulated 0x%08x at 0x%lx (#%ld)\n", insn, site, n);
     }
-    site_emulated++;
     return true;
 }
 
