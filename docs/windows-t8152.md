@@ -575,3 +575,142 @@ point of coherency after each build, because Mu's PrePi reads it with the MMU of
 launcher detaches USB before every GPU refusal, and refuses a pool that overlaps the loaded
 image (Mu FD, appended payloads, SEPFW, preoslog, boot_args) or, with an AHCI store, leaves
 less than 4 GiB of guest RAM below the pool.
+## I0: Mac-fed keyboard and pointer (carrier input device)
+
+Status: built and host-tested only (`tests/python/test_windows_t8152_input.py`). Nothing of it
+has run on the M6, and no Windows driver binds it yet (the `m6input` HID minidriver and the Mu
+tables are separate pieces; the Mu contract is below). Contract and reasoning:
+`windows-m6/INPUT-DESIGN.md` (owner notes, not in this tree). Off unless `run_guest.py
+--windows-input host` asks for it; a launch without it runs exactly the D1/D4 code (the vSPI
+gate is per INTID, `vdev_spi_live()`).
+
+What the guest gets:
+
+- **Page**: IPA `0xF50000000`, 16 KiB, a C hook (`hv_input.c`), never mapped. Only aligned
+  32- and 64-bit accesses act (a 64-bit access is two 32-bit ones, low word first); 8/16-bit,
+  unaligned and LDP/STP-pair accesses read 0 and write nothing (logged once, counted).
+
+  | Off | Name | Access | Meaning |
+  |---|---|---|---|
+  | 0x000 | ID | RO | 0x4E49364D ("M6IN") |
+  | 0x004 | VERSION | RO | 0x00010000 |
+  | 0x008 | FEATURES | RO | bits 0-3 keyboard / absolute / relative / consumer reports; bit 16 host source |
+  | 0x00C | CTRL | RW | bit 0 ENABLE, bit 1 IRQ_EN, bit 2 PTP_MODE (stored only); bit 31 RESET (write: flush, clear OVERFLOW, re-emit state) |
+  | 0x010 | STATUS | RO | bit 0 PENDING, bit 1 OVERFLOW (sticky until RESET or ENABLE 0->1), bits 16-31 depth |
+  | 0x014 | IRQ_STATUS | RO | bit 0 = the line (ENABLE && IRQ_EN && PENDING) |
+  | 0x018 | SEQ | RO | sequence number of the latched report |
+  | 0x01C | DROPPED | RO | reports dropped since ENABLE |
+  | 0x020 | POP | WO | write 1: retire the latched report |
+  | 0x024 | REPORT_LEN | RO | bits 7:0 length (0 = none), bits 15:8 report ID |
+  | 0x040 | OUT_LEN | WO | bits 7:0 length, 15:8 ID, bit 31 feature; submits OUT_DATA |
+  | 0x080 | OUT_DATA | WO | 64 bytes, byte 0 = report ID (v1 takes the keyboard LED report: ID 1, 2 bytes) |
+  | 0x100 | REPORT | RO | 64 bytes, the latched report, byte 0 = report ID |
+  | 0x180 | STATS | RO | 16 counters (`enum input_stat`) |
+
+  Reports (the driver's own descriptor, INPUT-DESIGN.md 1.5): ID 1 keyboard, 22 bytes (id,
+  modifier bits, a 160-bit bitmap of usages 0x00-0x9F); ID 2 absolute pointer, 8 bytes
+  (buttons 1-5, X/Y 0..32767, wheel, AC pan); ID 3 relative pointer, 8 bytes (dX/dY
+  -32767..32767); ID 4 consumer, 3 bytes (one usage 0..0x3FF). Every report carries its
+  collection's full state; motion and wheel are deltas. Nothing is queued before ENABLE;
+  ENABLE 0->1 and RESET emit the current state once (keyboard and consumer always, absolute
+  once a position was given, relative while a button is held). Identical states are not
+  re-queued. The queue holds 256 reports; when full, the oldest report whose collection has a
+  later state queued (pointer reports first) is dropped, never the latched one, so every
+  collection's last state survives (a press and release inside one dropped stretch is lost;
+  relative motion in a dropped report is lost; both counted).
+- **Interrupt**: SPI **991**, level, active-high, purely virtual (no AIC line, never an
+  alias), driven through the software GIC CPU interface like AHCI's 990, on line changes only.
+
+Host feed: from ATTACH on, the RX direction of the vUART CDC pipe (`IODEV_USB_VUART`,
+`/dev/cu.usbmodemP_03` on macOS) belongs to the input device. The guest's UART then reads an
+empty receiver (no RXD, no RX count, URXH 0); its TX (COM0 output) is unchanged. The boot
+CPU's 5 kHz tick, right after `hv_vuart_poll()`, reads at most 256 buffered bytes (never more
+than are buffered: the CDC read would wait) and parses them under the input lock. Frames
+before guest entry stay buffered; frames during Mu only update state. Wire protocol v1,
+little-endian:
+
+    +0 'M' (0x4D)  +1 '6' (0x36)  +2 type  +3 len (0..64)  +4 seq u16  +6 payload[len]
+    +6+len  CRC-32 (zlib) of bytes +2 .. +6+len-1
+
+| type | name | payload |
+|---|---|---|
+| 0x01 | HELLO | u16 version 1, u16 flags 0: host state all up, the sequence restarts |
+| 0x02 | KEYS | u8 modifiers, u8 n <= 16, u8 usage[n] in 0x04..0x9F: the full host keyboard state |
+| 0x03 | ABS | u8 buttons (<= 0x1F), u16 x, u16 y (<= 32767), s8 wheel, s8 pan (>= -127) |
+| 0x04 | REL | u8 buttons, s16 dx, s16 dy (>= -32767), s8 wheel, s8 pan |
+| 0x05 | CONSUMER | u16 usage (<= 0x3FF, 0 = released) |
+| 0x06 | KEEPALIVE | none: refreshes the held-key watchdog |
+| 0x07 | RELEASE_ALL | none: every host key, button and consumer usage up |
+
+The parser scans for the sync pair; a bad type or a length above 64 is refused at the header,
+a bad CRC drops the frame, and either way the scan resumes at the byte after the failed sync
+(a frame inside it is found). A good CRC with a payload invalid for its type is ignored. A
+partial frame that has waited 50 ms since the last byte is given up the same way, so a
+damaged length cannot hold the frames behind it. `seq` gaps are counted, not enforced. If any
+host key, button or consumer usage is held and no valid frame arrived for 2 s, the carrier
+releases them (a feeder holding keys sends KEEPALIVE every 0.5 s). At guest exit every host
+key is released. `proxyclient/aura/windows.py` has the encoder (`input_frame`, `input_keys`,
+`input_abs`, `input_rel`, `input_consumer`, `input_hello`); a feeder must open only the guest
+CDC port, never the proxy port (any byte there stops the guest).
+
+Resident ABI: configure **BIT(10)** (`HV_WINDOWS_T8152_INPUT`; T8152, software GIC, board
+0x22), **CAPS2 bit 3**, **`P_HV_WINDOWS_INPUT` 0xc89** (0xc88 and CAPS2 bit 2 are
+`j804-windows-gpu`'s; re-check both at merge): op 0 QUERY (0 version 1, 1 base, 2 size, 3
+INTID, 4 features 0x1000F, 5 accepted sources 0x1), op 1 ATTACH (a1 sources: bit 0 host; bits
+1/2, the internal keyboard and trackpad, are refused by this carrier; a2/a3 must be 0), op 2
+STATUS (0-15 the counters, 16 attached sources, 17 CTRL, 18 depth, 19 DROPPED, 20 LEDs, 21
+line, 22 RX owned), op 3 DETACH (before entry only; `hv_start()` then refuses). ATTACH
+results: 0, -1 state (flag, chip, board, after entry, or a second ATTACH this carrier load),
+-2 sources, -3 area, -4 hook. `hv_start()` refuses with BIT(10) set unless ATTACH succeeded
+and the page is wholly this hook.
+
+Launcher (`run_guest.py --windows-input {off,host}`, default off), before anything is
+uploaded: refuses a chip other than T8152, a board other than 0x22, a resident without CAPS2
+bit 3, `--windows-serial disabled`, `host+kbd`/`host+kbd+tp` (not in this carrier), and an
+FD/flag mismatch in either direction (a `J804INP1` marker with input off, input on without the
+marker, a marker with another page or GSIV). After the USB attach and before `hv.start()` it
+checks QUERY against its contract, ATTACHes, and only after ATTACH returned 0 adds Mu's
+handshake `/chosen/aura,windows-input-v1`: 24 bytes `<QIIII>` = page base 0xF50000000, size
+0x4000, GSIV 991, feature mask (report bits 0-3, attached sources in bits 16-23; 0x1000F for
+host), version 1. STATUS is printed after the guest exits.
+
+### The Mu side (contract; not in Mu yet)
+
+Mu `j804-windows` needs, following the D4 `J804_WINDOWS_USB` pattern
+(`J804XhciAcpiDxe`, SSDT `J804XHC1`):
+
+- `J804Windows.h`: `J804_INPUT_BASE 0xF50000000`, `J804_INPUT_SIZE 0x4000`,
+  `J804_GSIV_INPUT 991`, `J804_INPUT_FD_MARKER_OFFSET 0x140`, `J804_INPUT_ADT_PROPERTY
+  "aura,windows-input-v1"`, `J804_INPUT_ADT_PROPERTY_SIZE 24`, version 1.
+- Build flag `J804_WINDOWS_INPUT` (default FALSE). With it, the FD carries 16 bytes at 0x140:
+  `"J804INP1"`, u32 `0x00F50000` (base >> 12), u32 991. With it off, the default, AHCI and USB
+  FDs rebuild byte-identical.
+- An SSDT (OEM table ID `J804INP0`), not a DSDT change: `Device (INP0)` with `_HID
+  "NTAS2040"`, `_UID 0`, `_CCA 1`, `_STA 0x0F`, `_CRS` = `QWordMemory (ResourceConsumer,
+  PosDecode, MinFixed, MaxFixed, NonCacheable, ReadWrite, 0, 0xF50000000, 0xF50003FFF, 0,
+  0x4000)` + `Interrupt (ResourceConsumer, Level, ActiveHigh, Exclusive) { 991 }`; no
+  `_PSx`/`_PRW`/`_S0W`.
+- `J804InputAcpiDxe` installs that SSDT only when the property is present, exactly 24 bytes,
+  base/size/GSIV equal the header, version 1, feature bits 0-3 all set, bits 4-15 and 24-31
+  clear, at least one source bit in 16-23, and the page is NonExistent in the GCD; otherwise
+  nothing is installed (fail closed) and the reason is logged. Mu never touches the page and
+  has no input driver: host frames during Mu only update carrier state.
+- The `APPL8900` COM0 device stays as it is (its RX direction is now the input feed while
+  `--windows-input host` is on; Windows binds no driver to it).
+- `tests/python/test_windows_t8152_input.py::test_contract_matches_mu_header` compares the
+  header with this launcher when `AURA_MU_TREE` names a Mu tree that has it.
+
+Host tests: `tests/e2e/windows_input_host.c` replays `input_model.c` and `hv_vdev_spi.c`
+unchanged under ASan/UBSan (21 cases plus a 10^6-step seeded fuzz: reset values, report
+layout, ENABLE/RESET/POP and the line, overflow ordering and the latched report, every
+malformed frame class, any split of the stream, the stall expiry, the watchdog, merging, bad
+widths, output reports, the per-device SPI gate) and parses a corpus written by the
+launcher's encoder; `tests/e2e/windows_input_glue_host.c` drives `hv_input.c` unchanged over a
+fake vUART RX and hook (refusals attach nothing, one ATTACH per session, RX ownership, the
+256-byte budget and no blocking read, SPI 991 on changes only, the watchdog on the system
+counter, exit, verify). `AURA_INPUT_TRANSCRIPT=<file>` saves the model replay.
+
+Not verified (each needs Windows or the M6): kbdhid with a bitmap keyboard on ARM64 26100;
+SPI 991 free on the live machine (980..999 were free except 984 in the last ADT walk); the
+CDC RX path under sustained host traffic while the guest runs; the cost of the trapped
+accesses (about ten per report).

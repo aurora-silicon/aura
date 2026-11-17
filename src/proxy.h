@@ -165,6 +165,7 @@ typedef enum {
     P_HV_WINDOWS_AHCI = 0xc8e,
     P_HV_WINDOWS_USB = 0xc87,
     P_HV_WINDOWS_GPU = 0xc88,
+    P_HV_WINDOWS_INPUT = 0xc89,
 
     P_FB_INIT = 0xd00,
     P_FB_SHUTDOWN,

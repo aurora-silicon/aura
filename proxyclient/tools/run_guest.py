@@ -100,6 +100,14 @@ parser.add_argument('--windows-gpu', default='off', metavar='{off,admit,log}',
 parser.add_argument('--windows-gpu-pool-mib', type=int, default=256,
                     help='T8152 G0: the GPU pool, carved from the top of guest RAM (multiple of '
                          '32, at most half of guest RAM). Default 256.')
+parser.add_argument('--windows-input', default='off', metavar='{off,host}',
+                    help='T8152 I0: the carrier\'s input device (page 0xF50000000, SPI 991) '
+                         'fed from this Mac: "host" lets proxyclient/aura/windows.py input '
+                         'frames on the vUART CDC port (/dev/cu.usbmodemP_03 RX) type and '
+                         'point in Windows. Default off. Needs an input FD (Mu '
+                         'J804_WINDOWS_INPUT, marker J804INP1 at 0x140), --windows-serial cdc '
+                         'and the m6input driver in the Windows image. host+kbd/host+kbd+tp '
+                         '(the internal keyboard and trackpad) are not in this carrier yet.')
 parser.add_argument('payload', type=pathlib.Path)
 parser.add_argument('boot_args', default=[], nargs="*")
 args = parser.parse_args()
@@ -371,6 +379,75 @@ def windows_t8152_usb_status(ports):
               f"{st['unowned']}{', STORM' if st['storm'] else ''}")
 
 
+def windows_t8152_input_plan(payload, u):
+    """I0: check --windows-input against the chip, the board, the resident, the serial mode
+    and the FD (both directions) before anything is uploaded.  Returns the source tuple (empty
+    when off)."""
+    from aura import windows as w
+    try:
+        sources = w.parse_windows_input(args.windows_input)
+        caps2 = 0
+        if sources or w.fd_input_marker(payload) is not None:
+            try:
+                caps2 = p.hv_windows_capabilities2()
+            except ProxyRemoteError:
+                caps2 = 0  # an older resident: Bad Command
+        chosen = u.adt["/chosen"]
+        w.validate_input_request(sources, chosen.chip_id, getattr(chosen, "board_id", -1), caps2,
+                                 payload, args.windows_serial)
+    except ValueError as exc:
+        sys.exit(f"T8152 launch refused: {exc}. The aura proxy keeps running; no guest was "
+                 "started.")
+    if sources:
+        print(f"T8152 input: {'+'.join(sources)} (CAPS2 {caps2:#x}, FD marker "
+              f"{w.fd_input_marker(payload)[0]:#x}/{w.fd_input_marker(payload)[1]})")
+    return sources
+
+
+def windows_t8152_input_attach(hv, sources):
+    """After USB, before hv.start(): QUERY the contract, ATTACH, then (only then) write Mu's
+    /chosen/aura,windows-input-v1.  A refusal stops the launch."""
+    from aura import windows as w
+    if not sources:
+        return
+    try:
+        features = w.validate_input_contract(
+            lambda name: p.hv_windows_input(w.INPUT_OP_QUERY, w.INPUT_Q[name]))
+    except (ValueError, ProxyRemoteError) as exc:
+        sys.exit(f"T8152: the resident's input device is not this launcher's contract: {exc}. "
+                 "No guest was started; the carrier session is used up: reload the carrier.")
+    result = p.hv_windows_input(w.INPUT_OP_ATTACH, w.input_source_mask(sources))
+    if result != 0:
+        sys.exit(f"T8152: the resident refused the input device: "
+                 f"{w.describe_input_attach(result)} (its console says why). The carrier "
+                 "session is used up: reload the carrier. No guest was started.")
+    try:
+        hv.set_windows_input_handshake(w.input_handshake(sources, features))
+    except ValueError as exc:
+        p.hv_windows_input(w.INPUT_OP_DETACH)
+        sys.exit(f"T8152: input attached but the Mu handshake was refused: {exc}. The resident "
+                 "now refuses guest entry; reload the carrier. No guest was started.")
+    print(f"T8152 input: attached; /chosen/{w.INPUT_HANDSHAKE_PROPERTY} written. Feed it from "
+          "this Mac on the guest CDC port (never the proxy port)")
+
+
+def windows_t8152_input_status(sources):
+    from aura import windows as w
+    if not sources:
+        return
+    try:
+        st = {name: p.hv_windows_input(w.INPUT_OP_STATUS, index)
+              for name, index in w.INPUT_STATUS.items()}
+    except ProxyRemoteError as exc:
+        print(f"T8152 input: status unavailable: {exc}")
+        return
+    print(f"T8152 input at exit: {st['frames_ok']} host frames ok, {st['bad_crc']} bad CRC, "
+          f"{st['bad_header']} bad header, {st['bad_payload']} bad payload, {st['seq_gaps']} seq "
+          f"gaps, {st['watchdog']} watchdog releases; {st['reports']} reports queued, "
+          f"{st['dropped']} dropped, high water {st['high_water']}; driver CTRL "
+          f"{st['ctrl']:#x}, LEDs {st['leds']:#x}, {st['bad_access']} bad accesses")
+
+
 def windows_t8152_ahci_attach(hv, u, ahci):
     """After load_raw: attach the store (fresh: zero it, upload the image, seal the upload)."""
     from aura import windows as w
@@ -463,6 +540,7 @@ def run_windows_t8152(caps):
     t8152_check_window(u.adt, ba, base, top, occupied)
     usb_ports = windows_t8152_usb_plan(payload, u)
     gpu_mode = windows_t8152_gpu_plan(u)
+    input_sources = windows_t8152_input_plan(payload, u)
     print(f"T8152: guest RAM [{base:#x}, {top:#x}) passes the host check; NVRAM, QSPI and the "
           f"audio/AOP/ADMAC/i2c nodes are hidden, and the resident re-checks everything")
 
@@ -473,6 +551,7 @@ def run_windows_t8152(caps):
     hv.windows_ahci = ahci
     hv.windows_usb = usb_spelling(usb_ports)
     hv.windows_gpu = gpu_mode
+    hv.windows_input = "+".join(input_sources) if input_sources else "off"
     hv.windows_ipi = args.windows_ipi
     hv.windows_gic_cpuif = args.windows_gic_cpuif or "software"
     hv.windows_wfi = args.windows_wfi
@@ -515,6 +594,7 @@ def run_windows_t8152(caps):
         windows_t8152_ahci_attach(hv, u, ahci)
     windows_t8152_usb_attach(hv, usb_ports, ahci)
     windows_t8152_gpu_admit(hv, gpu_mode, usb_ports, ahci)
+    windows_t8152_input_attach(hv, input_sources)
     try:
         result = hv.start()
     except ProxyRemoteError as exc:
@@ -529,6 +609,7 @@ def run_windows_t8152(caps):
     print(f"Guest exit status: {result} (1 SYSTEM_OFF, 2 SYSTEM_RESET)")
     windows_t8152_usb_status(usb_ports)
     windows_t8152_gpu_status(gpu_mode)
+    windows_t8152_input_status(input_sources)
     if ahci:
         windows_t8152_ahci_seal(result, ahci)
     if result == 2 and args.windows_reset_on_exit:
@@ -546,7 +627,8 @@ elif (args.windows_guest_ram or args.windows_ipi != 'poll' or args.windows_reset
       args.windows_gic_cpuif not in (None, 'carrier') or args.windows_wfi != 'poll' or
       args.windows_guest_compatibility != 'none' or ahci_requested() or
       args.windows_usb not in ('off', 'disabled') or
-      args.windows_gpu not in ('off', 'disabled')):
+      args.windows_gpu not in ('off', 'disabled') or
+      args.windows_input not in ('off', 'disabled')):
     sys.exit("--windows-* options need the Windows personality (gmake WINDOWS=1) on T8152")
 
 if args.emulate_sprr or not p.get_cpu_features().apple_sysregs_unlocked:

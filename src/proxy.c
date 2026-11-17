@@ -680,10 +680,11 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
              * AHCI RAM-store disk (hv_ahci.c, P_HV_WINDOWS_AHCI, configure flag BIT(8)).
              * Bit 1: D4 USB passthrough v1 (hv_usb.c, P_HV_WINDOWS_USB, configure BIT(9)).
              * Bit 2: G0 GPU admission and logging hooks (hv_gpu.c, P_HV_WINDOWS_GPU).
+             * Bit 3: I0 input v1 (hv_input.c, P_HV_WINDOWS_INPUT, configure BIT(10)).
              */
 #ifdef AURA_WINDOWS
             reply->retval = HV_WINDOWS_CAPS2_MAGIC | HV_WINDOWS_CAPS2_AHCI | HV_WINDOWS_CAPS2_USB |
-                            HV_WINDOWS_CAPS2_GPU;
+                            HV_WINDOWS_CAPS2_GPU | HV_WINDOWS_CAPS2_INPUT;
 #else
             reply->retval = 0;
 #endif
@@ -706,6 +707,14 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
         case P_HV_WINDOWS_GPU:
 #ifdef AURA_WINDOWS
             reply->retval = hv_gpu_proxy(request->args[0], request->args[1], request->args[2]);
+#else
+            reply->retval = -1;
+#endif
+            break;
+        case P_HV_WINDOWS_INPUT:
+#ifdef AURA_WINDOWS
+            reply->retval = hv_input_proxy(request->args[0], request->args[1], request->args[2],
+                                           request->args[3]);
 #else
             reply->retval = -1;
 #endif

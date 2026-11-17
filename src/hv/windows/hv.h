@@ -10,6 +10,7 @@
 #include "exception.h"
 #include "hv_ahci.h"
 #include "hv_gpu.h"
+#include "hv_input.h"
 #include "hv_t8152.h"
 #include "hv_usb.h"
 #include "iodev.h"
@@ -63,6 +64,8 @@ void hv_windows_quarantine(void);
 #define HV_WINDOWS_T8152_AHCI BIT(19)
 /* D4: usb-drd1/3 xHCI passthrough with the carrier's DART map (hv_usb.c); T8152, soft GIC. */
 #define HV_WINDOWS_T8152_USB BIT(20)
+/* I0: the input device fed from the host over the vUART RX (hv_input.c); T8152 J804, soft GIC. */
+#define HV_WINDOWS_T8152_INPUT BIT(21)
 bool hv_t8152_native_wfi(void);
 /* The guest's ACTLR_EL1 from EL2. T8152 never touches the implementation-defined alias. */
 u64 hv_guest_actlr_read(void);

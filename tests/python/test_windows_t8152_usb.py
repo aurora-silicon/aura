@@ -928,7 +928,9 @@ def test_configure_proxy_and_build_agree():
     hv_h, hv_c = source("hv.h"), source("hv.c")
     assert re.search(r"#define HV_WINDOWS_T8152_USB BIT\(9\)", hv_h)
     conf = function_body(hv_c, "int hv_windows_configure(u64 flags)")
-    assert "HV_WINDOWS_T8152_USB))\n        return -1;" in conf
+    # The accepted-flags mask ends with USB (I0 appends its own flag after it).
+    assert re.search(r"HV_WINDOWS_T8152_USB(?: \| HV_WINDOWS_T8152_INPUT)?\)\)\n        return -1;",
+                     conf)
     assert "(!(flags & HV_WINDOWS_T8152_SOFT_GIC) || board_id != 0x22)" in conf
     assert "if (flags & HV_WINDOWS_T8152_USB)\n        hv_usb_enable();" in conf
     proxy_c = (REPO / "src/proxy.c").read_text()
@@ -951,7 +953,7 @@ def test_configure_proxy_and_build_agree():
     assert (w.USB_GSIV[1], w.USB_GSIV[3]) == (995, 997)
     assert "#define HV_USB_GSIV_DRD1 995u" in hdr and "#define HV_USB_GSIV_DRD3 997u" in hdr
     makefile = (REPO / "Makefile").read_text()
-    assert "hv_fatal.o hv_usb.o hv_usb_dart.o" in makefile
+    assert re.search(r"hv_fatal\.o hv_usb\.o hv_usb_dart\.o[) ]", makefile)
 
 
 def test_clean_room_headers():

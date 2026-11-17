@@ -803,6 +803,7 @@ class AuraProxy(Reloadable):
     P_HV_WINDOWS_AHCI = 0xc8e
     P_HV_WINDOWS_USB = 0xc87
     P_HV_WINDOWS_GPU = 0xc88
+    P_HV_WINDOWS_INPUT = 0xc89
 
     P_FB_INIT = 0xd00
     P_FB_SHUTDOWN = 0xd01
@@ -1358,6 +1359,8 @@ class AuraProxy(Reloadable):
         """G0 GPU (src/hv/windows/hv_gpu.h): ADMIT(pool base, pool size), HOOK, STATUS(index).
         ADMIT and HOOK return 0 or a negative reason (signed)."""
         return self.request(self.P_HV_WINDOWS_GPU, op, a1, a2, signed=op in (1, 2))
+    def hv_windows_input(self, op, a1=0, a2=0, a3=0):
+        return self.request(self.P_HV_WINDOWS_INPUT, op, a1, a2, a3, signed=op == 1)
 
     def fb_init(self):
         return self.request(self.P_FB_INIT)

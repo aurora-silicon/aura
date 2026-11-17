@@ -7,9 +7,9 @@
 
 /*
  * Shared peripheral interrupts of devices the carrier emulates in software (the D1 AHCI disk
- * today), on the T8152 software GICv3 CPU interface.  Such an SPI has no AIC line behind it:
- * its level is whatever the device model says, and the carrier makes it pending on one CPU
- * interface exactly while that level is high and the guest has enabled it.
+ * and the I0 input device), on the T8152 software GICv3 CPU interface.  Such an SPI has no AIC
+ * line behind it: its level is whatever the device model says, and the carrier makes it
+ * pending on one CPU interface exactly while that level is high and the guest has enabled it.
  *
  * Pure decisions only (no system registers, no locks, no AIC); the carrier glue that marks
  * the interrupt pending and kicks the CPU is hv_t8152_gic_spi_level() in hv_exc.c.
@@ -21,6 +21,16 @@
 
 /* The AHCI disk's SPI: GSIV 990, level, active-high.  No AIC line; never an AIC alias. */
 #define HV_VDEV_SPI_AHCI 990u
+/* I0: the input device's SPI: GSIV 991, level, active-high.  No AIC line; never an alias. */
+#define HV_VDEV_SPI_INPUT 991u
+
+/*
+ * The devices behind them, as a mask of the configure flags that are set.  An emulated SPI is
+ * live only while its own device is configured, so a launch without the input device runs
+ * exactly the D1 code for 990 and never touches 991 (and the reverse).
+ */
+#define VDEV_SPI_DEV_AHCI  BIT(0)
+#define VDEV_SPI_DEV_INPUT BIT(1)
 
 /* GICD_IROUTER<n> fields (IHI 0069). */
 #define VDEV_SPI_IROUTER_IRM BIT(31)
@@ -59,5 +69,15 @@ struct vdev_spi_plan vdev_spi_plan(bool pend, int target, u64 pending, u64 activ
 
 /* Is INTID a carrier-emulated SPI (as opposed to an AIC alias or a PPI/SGI)? */
 bool vdev_spi_is_virtual(u32 intid);
+
+/* The VDEV_SPI_DEV_* device that owns a carrier-emulated SPI; 0 for any other INTID. */
+u32 vdev_spi_device(u32 intid);
+
+/* Is INTID a carrier-emulated SPI whose device is in `devices` (VDEV_SPI_DEV_* mask)? */
+bool vdev_spi_live(u32 intid, u32 devices);
+
+/* The carrier-emulated SPIs, for the re-evaluation loops (claim, distributor writes). */
+#define VDEV_SPI_COUNT 2
+extern const u32 vdev_spi_intids[VDEV_SPI_COUNT];
 
 #endif

@@ -1154,6 +1154,186 @@ def describe_gpu(result):
     """P_HV_WINDOWS_GPU ADMIT/HOOK answer as text (0 is success)."""
     value = result - (1 << 64) if result >= 1 << 63 else result
     return "ok" if value == 0 else GPU_ERRORS.get(value, f"error {value}")
+# ---- I0: Mac-fed keyboard and pointer (src/hv/windows/hv_input.h, input_model.h) -----------
+#
+# The carrier emulates one register page (0xF50000000, 16 KiB) and SPI 991 and parses host
+# frames from the RX direction of the vUART CDC pipe.  These values must agree with the
+# resident (CAPS2 bit 3, P_HV_WINDOWS_INPUT QUERY) and with Mu's J804Windows.h: the FD marker
+# "J804INP1" at 0x140 and the 24-byte /chosen/aura,windows-input-v1 handshake, without which
+# Mu installs no SSDT J804INP0 (\_SB.INP0, _HID NTAS2040) and Windows never sees the device.
+CAPS2_INPUT = 0x0008                      # input v1
+CONFIG_T8152_INPUT = 0x200000               # hv_windows_configure BIT(21)
+INPUT_OP_QUERY, INPUT_OP_ATTACH, INPUT_OP_STATUS, INPUT_OP_DETACH = 0, 1, 2, 3
+INPUT_Q = {"version": 0, "base": 1, "size": 2, "intid": 3, "features": 4, "sources": 5}
+INPUT_VERSION = 1
+INPUT_BASE = 0xF50000000
+INPUT_SIZE = 0x4000
+INPUT_GSIV = 991
+INPUT_FEATURES_REPORTS = 0x000F           # keyboard, absolute, relative, consumer
+INPUT_SRC = {"host": 0x1, "kbd": 0x2, "tp": 0x4}
+INPUT_SRC_FEATURE_SHIFT = 16              # FEATURES bits 16-23 are the live sources
+INPUT_CHOICES = ("off", "host", "host+kbd", "host+kbd+tp")
+INPUT_CARRIER_SOURCES = ("host",)         # what this carrier runs (I1/I2 are later)
+INPUT_FD_MARKER_OFFSET = 0x140
+INPUT_FD_MARKER = b"J804INP1"
+# Mu J804Windows.h J804_INPUT_ADT_PROPERTY / _SIZE (layout below).
+INPUT_HANDSHAKE_PROPERTY = "aura,windows-input-v1"
+INPUT_HANDSHAKE_FORMAT = "<QIIII"         # base, size, GSIV, feature mask, version
+INPUT_HANDSHAKE_SIZE = 24
+INPUT_STATUS = {"frames_ok": 0, "bad_crc": 1, "bad_header": 2, "bad_payload": 3, "skipped": 4,
+                "seq_gaps": 5, "watchdog": 6, "reports": 7, "high_water": 8, "mtp": 9,
+                "out_ok": 10, "out_bad": 11, "hellos": 12, "bad_access": 13, "rx_bytes": 14,
+                "dropped": 15, "attached": 16, "ctrl": 17, "depth": 18, "dropped_now": 19,
+                "leds": 20, "line": 21, "owns_rx": 22}
+INPUT_ERRORS = {-1: "not configured, not J804, the guest already started or an earlier ATTACH "
+                    "this session",
+                -2: "bad source mask, or a source this carrier does not run",
+                -3: "a reserved area was given for the host source",
+                -4: "the register page could not be hooked"}
+
+# The host feed's wire protocol v1 (input_model.h): little-endian frames
+#   'M' '6' type len seq:u16 payload[len] crc32:u32 (zlib, over type .. payload)
+INPUT_SYNC = b"M6"
+INPUT_MAX_PAYLOAD = 64
+INPUT_PROTO = 1
+INPUT_HELLO, INPUT_KEYS, INPUT_ABS, INPUT_REL, INPUT_CONSUMER, INPUT_KEEPALIVE, \
+    INPUT_RELEASE_ALL = range(1, 8)
+INPUT_MAX_KEYS = 16
+INPUT_ABS_MAX = 32767
+INPUT_WATCHDOG_S = 2.0                    # the carrier releases held host keys after this
+INPUT_KEEPALIVE_S = 0.5                   # a feeder holding keys sends KEEPALIVE this often
+
+
+def parse_windows_input(value):
+    """--windows-input: "off" -> (), else the source names in order.  Only the sources this
+    carrier runs are accepted; host+kbd and host+kbd+tp are refused by name."""
+    require(isinstance(value, str), "--windows-input takes off or host")
+    text = value.strip().lower()
+    if text in ("off", "disabled", "none", ""):
+        return ()
+    require(text in INPUT_CHOICES, f"--windows-input: unknown choice {value!r} "
+            f"({', '.join(INPUT_CHOICES)})")
+    sources = tuple(text.split("+"))
+    missing = [s for s in sources if s not in INPUT_CARRIER_SOURCES]
+    require(not missing, f"--windows-input {text}: the internal keyboard/trackpad "
+            f"({'+'.join(missing)}) is not in this carrier yet; use --windows-input host")
+    return sources
+
+
+def input_source_mask(sources):
+    mask = 0
+    for name in sources:
+        mask |= INPUT_SRC[name]
+    return mask
+
+
+def fd_input_marker(fd):
+    """(page base, GSIV) from an input FD's raw marker at 0x140 (magic, u32 base >> 12, u32
+    GSIV), or None for any other FD."""
+    block = bytes(fd[INPUT_FD_MARKER_OFFSET:INPUT_FD_MARKER_OFFSET + 16])
+    if len(block) != 16 or block[:8] != INPUT_FD_MARKER:
+        return None
+    page, gsiv = struct.unpack("<II", block[8:])
+    return page << 12, gsiv
+
+
+def validate_input_request(sources, chip, board, caps2, fd, serial):
+    """Before anything is uploaded: --windows-input against the chip, the board, the
+    resident's CAPS2 bit, the FD's INP0 marker (both directions) and the serial mode."""
+    marker = fd_input_marker(fd)
+    if marker is not None:
+        require(sources, "this FD describes the input device to Windows (marker J804INP1 at "
+                "0x140) but --windows-input is off: Windows would touch an unhooked page. Pass "
+                "--windows-input host or use an FD built without J804_WINDOWS_INPUT")
+        require(marker == (INPUT_BASE, INPUT_GSIV), f"the FD's input marker {marker[0]:#x}/"
+                f"{marker[1]} differs from the carrier's {INPUT_BASE:#x}/{INPUT_GSIV}")
+    if not sources:
+        return
+    require(chip == T8152_CHIP, "--windows-input is a T8152 (J804) option")
+    require(board == J804_BOARD_ID, f"--windows-input needs the J804 board (0x22), not "
+            f"{board:#x}")
+    require(isinstance(caps2, int) and caps2 >> 32 == CAPS2_MAGIC >> 32 and caps2 & CAPS2_INPUT,
+            "the resident has no input device (P_HV_WINDOWS_CAPS2 bit 3): rebuild the carrier "
+            "at or after the I0 commit")
+    require(marker is not None, "--windows-input: the FD has no J804INP1 marker at 0x140, so "
+            "Windows has no INP0 to bind: build Mu with J804_WINDOWS_INPUT=TRUE "
+            "(out/j804-windows-input)")
+    if "host" in sources:
+        require(serial == "cdc", "--windows-input host feeds input over the vUART CDC pipe: "
+                "it needs --windows-serial cdc (the default)")
+
+
+def validate_input_contract(query):
+    """The resident's QUERY answers must be this launcher's contract.  query(name) returns
+    the value; raises ValueError with the reason."""
+    expect = {"version": INPUT_VERSION, "base": INPUT_BASE, "size": INPUT_SIZE,
+              "intid": INPUT_GSIV}
+    for name, value in expect.items():
+        got = query(name)
+        require(got == value, f"resident input {name} is {got:#x}, this launcher expects "
+                f"{value:#x}")
+    features = query("features")
+    require(features & INPUT_FEATURES_REPORTS == INPUT_FEATURES_REPORTS,
+            f"resident input features {features:#x} lack the v1 reports")
+    return features
+
+
+def input_handshake(sources, features):
+    """/chosen/aura,windows-input-v1 for Mu's J804InputAcpiDxe, written only after ATTACH
+    returned 0: page base, size, GSIV, the feature mask the guest will read (report bits and
+    the attached sources in bits 16-23), version 1."""
+    require(sources, "no input handshake without a source")
+    mask = (features & INPUT_FEATURES_REPORTS) | \
+        input_source_mask(sources) << INPUT_SRC_FEATURE_SHIFT
+    value = struct.pack(INPUT_HANDSHAKE_FORMAT, INPUT_BASE, INPUT_SIZE, INPUT_GSIV, mask,
+                        INPUT_VERSION)
+    assert len(value) == INPUT_HANDSHAKE_SIZE
+    return value
+
+
+def describe_input_attach(result):
+    """P_HV_WINDOWS_INPUT ATTACH's answer as text (0 is success)."""
+    value = result - (1 << 64) if result >= 1 << 63 else result
+    return "attached" if value == 0 else INPUT_ERRORS.get(value, f"error {value}")
+
+
+def input_frame(kind, payload=b"", seq=0):
+    """One host-feed frame (wire protocol v1)."""
+    require(isinstance(payload, (bytes, bytearray)) and len(payload) <= INPUT_MAX_PAYLOAD,
+            "an input frame carries at most 64 payload bytes")
+    body = struct.pack("<BBH", kind, len(payload), seq & 0xFFFF) + bytes(payload)
+    return INPUT_SYNC + body + struct.pack("<I", zlib.crc32(body) & 0xFFFFFFFF)
+
+
+def input_keys(modifiers, usages, seq=0):
+    """KEYS: the full host keyboard state (modifier bits for usages 0xE0-0xE7, up to 16
+    Keyboard-page usages 0x04-0x9F)."""
+    usages = list(usages)
+    require(0 <= modifiers <= 0xFF, "modifiers are one byte")
+    require(len(usages) <= INPUT_MAX_KEYS, "at most 16 keys at once")
+    require(all(0x04 <= u <= 0x9F for u in usages), "key usages are 0x04..0x9F")
+    return input_frame(INPUT_KEYS, bytes([modifiers, len(usages), *usages]), seq)
+
+
+def input_abs(buttons, x, y, wheel=0, pan=0, seq=0):
+    require(0 <= buttons <= 0x1F and 0 <= x <= INPUT_ABS_MAX and 0 <= y <= INPUT_ABS_MAX and
+            -127 <= wheel <= 127 and -127 <= pan <= 127, "ABS out of range")
+    return input_frame(INPUT_ABS, struct.pack("<BHHbb", buttons, x, y, wheel, pan), seq)
+
+
+def input_rel(buttons, dx, dy, wheel=0, pan=0, seq=0):
+    require(0 <= buttons <= 0x1F and -32767 <= dx <= 32767 and -32767 <= dy <= 32767 and
+            -127 <= wheel <= 127 and -127 <= pan <= 127, "REL out of range")
+    return input_frame(INPUT_REL, struct.pack("<Bhhbb", buttons, dx, dy, wheel, pan), seq)
+
+
+def input_consumer(usage, seq=0):
+    require(0 <= usage <= 0x3FF, "consumer usages are 0..0x3FF")
+    return input_frame(INPUT_CONSUMER, struct.pack("<H", usage), seq)
+
+
+def input_hello(seq=0):
+    return input_frame(INPUT_HELLO, struct.pack("<HH", INPUT_PROTO, 0), seq)
 
 
 def _aligned(value, alignment):

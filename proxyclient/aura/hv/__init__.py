@@ -129,6 +129,8 @@ class HV(Reloadable):
         # T8152 D1: {"plan": windows.AhciPlan, "boot": "disk"|"ramdisk"} when the carrier
         # emulates the AHCI disk; windows_guest_ram must then end at plan.store_base.
         self.windows_ahci = None
+        # T8152 I0: "off" or the --windows-input sources ("host"); the carrier's input device.
+        self.windows_input = "off"
         self.windows_hidden = []
         self.pac_mask = self.PAC_MASK
         self.user_pac_mask = self.PAC_MASK
@@ -1579,9 +1581,19 @@ class HV(Reloadable):
                 raise ValueError("t8152-pmu-undef is a T8152 guest compatibility")
             elif (self.windows_guest_ram is not None or self.windows_ipi != "poll" or
                   self.windows_gic_cpuif != "carrier" or self.windows_wfi != "poll" or
-                  self.windows_ahci is not None or self.windows_usb != "disabled"):
-                raise ValueError("guest RAM window, IPI mode, GIC cpuif, the AHCI disk and USB "
-                                 "passthrough are T8152 options")
+                  self.windows_ahci is not None or self.windows_usb != "disabled" or
+                  self.windows_input != "off"):
+                raise ValueError("guest RAM window, IPI mode, GIC cpuif, the AHCI disk, USB "
+                                 "passthrough and the input device are T8152 options")
+            if self.windows_input != "off":
+                from ..windows import parse_windows_input
+                if not parse_windows_input(self.windows_input):
+                    raise ValueError("windows_input must be off or host")
+                if self.windows_gic_cpuif != "software":
+                    raise ValueError("T8152 input: the input interrupt needs the software GIC "
+                                     "CPU interface")
+                if self.windows_serial != "cdc":
+                    raise ValueError("T8152 input: the host feed needs --windows-serial cdc")
             if self.windows_usb != "disabled":
                 from ..windows import parse_windows_usb
                 if not parse_windows_usb(self.windows_usb):
@@ -1672,6 +1684,9 @@ class HV(Reloadable):
                 if self.windows_usb != "disabled":
                     from ..windows import CONFIG_T8152_USB
                     flags |= CONFIG_T8152_USB
+                if self.windows_input != "off":
+                    from ..windows import CONFIG_T8152_INPUT
+                    flags |= CONFIG_T8152_INPUT
                 if self.p.hv_windows_configure(flags) != 0:
                     raise WindowsLaunchRefused("Windows hypervisor configuration rejected")
                 # Applied once by hv_start() before guest entry; never retried on this resident.
@@ -2046,6 +2061,25 @@ class HV(Reloadable):
         except ValueError:
             chosen._properties.pop(GPU_HANDSHAKE_PROPERTY, None)
             chosen._types.pop(GPU_HANDSHAKE_PROPERTY, None)
+            raise
+
+    def set_windows_input_handshake(self, value):
+        """I0: after the resident's ATTACH returned 0, add /chosen/aura,windows-input-v1 (24
+        bytes, aura.windows.input_handshake) so Mu publishes INP0.  The guest sees it when
+        start() uploads the ADT; the capacity is re-checked here, before entry."""
+        from ..windows import INPUT_HANDSHAKE_PROPERTY, INPUT_HANDSHAKE_SIZE
+        if not self.windows or self.windows_input == "off":
+            raise ValueError("the input handshake needs a Windows launch with --windows-input")
+        if not isinstance(value, bytes) or len(value) != INPUT_HANDSHAKE_SIZE:
+            raise ValueError("the input handshake is 24 bytes")
+        chosen = self.adt["/chosen"]
+        chosen._properties[INPUT_HANDSHAKE_PROPERTY] = value
+        chosen._types[INPUT_HANDSHAKE_PROPERTY] = (Bytes(len(value)), False)
+        try:
+            self._windows_adt_blob()
+        except ValueError:
+            chosen._properties.pop(INPUT_HANDSHAKE_PROPERTY, None)
+            chosen._types.pop(INPUT_HANDSHAKE_PROPERTY, None)
             raise
 
     def _hide_windows_t8152_nodes(self):

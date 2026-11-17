@@ -14,6 +14,7 @@
 #include "hv_gic_cpuif.h"
 #include "hv_usb.h"
 #include "hv_vdev_spi.h"
+#include "hv_input.h"
 #include "hv_vgic.h"
 #include "mtp_handoff.h"
 #include "smp.h"
@@ -2753,9 +2754,10 @@ static void hv_t8152_gic_send_sgi(u64 val)
 
 /*
  * D1: shared peripheral interrupts of devices the carrier emulates (hv_vdev_spi.h; the AHCI
- * disk's 990 today).  No AIC line is behind them: the device model reports its line level
- * and the interrupt is pending on exactly one CPU interface while that level is high and the
- * guest has enabled it at the distributor (Arm IHI 0069, level-sensitive interrupts).
+ * disk's 990 and, I0, the input device's 991).  No AIC line is behind them: the device model
+ * reports its line level and the interrupt is pending on exactly one CPU interface while that
+ * level is high and the guest has enabled it at the distributor (Arm IHI 0069,
+ * level-sensitive interrupts).
  *  - routing: GICD_IROUTER<n> (vdev_spi_route: IRM 1 = the CPU whose access changed the
  *    level, else the CPU with that affinity, else the boot CPU);
  *  - one state machine (vdev_spi_plan): raising it on the routing target clears any pending
@@ -2768,11 +2770,20 @@ static void hv_t8152_gic_send_sgi(u64 val)
  *    driver polls.  hv_t8152_gic_claim() and every distributor write re-apply it.
  * The model's MMIO hook runs under bhl, the EOI path does not: t8152_vspi_lock orders
  * both.  It is a leaf lock (nothing here takes another).
- * Every entry point returns at once unless the AHCI configure flag is set (hv_ahci_enabled),
- * so a T8152 launch without D1 runs exactly the pre-D1 GIC code.
+ * Every entry point returns at once unless the INTID's own device is configured
+ * (hv_t8152_vspi_live: 990 needs the AHCI flag, 991 the input flag), so a T8152 launch
+ * without either runs exactly the pre-D1 GIC code, and an AHCI-only launch runs exactly the
+ * D1 code (991 never becomes live).
  */
 static DECLARE_SPINLOCK(t8152_vspi_lock);
 static u32 t8152_vspi_level[GICV3_CPUIF_WORDS];
+
+static bool hv_t8152_vspi_live(u32 intid)
+{
+    u32 devices = (hv_ahci_enabled() ? VDEV_SPI_DEV_AHCI : 0) |
+                  (hv_input_enabled() ? VDEV_SPI_DEV_INPUT : 0);
+    return vdev_spi_live(intid, devices);
+}
 
 static void hv_t8152_vspi_apply(u32 intid)
 {
@@ -2821,8 +2832,7 @@ static void hv_t8152_vspi_apply(u32 intid)
 
 void hv_t8152_gic_spi_level(u32 intid, bool level)
 {
-    if (!hv_ahci_enabled() || !hv_t8152_gic() || !vdev_spi_is_virtual(intid) ||
-        intid >= GICV3_CPUIF_NR_INTID)
+    if (!hv_t8152_vspi_live(intid) || !hv_t8152_gic() || intid >= GICV3_CPUIF_NR_INTID)
         return;
     spin_lock(&t8152_vspi_lock);
     if (level)
@@ -2837,8 +2847,8 @@ void hv_t8152_gic_spi_level(u32 intid, bool level)
 /* Re-apply every carrier-emulated SPI's level: a GICD write, the claim, or its deactivation. */
 static void hv_t8152_vspi_reapply(u32 intid)
 {
-    /* Without the D1 configure flag no emulated SPI exists: the pre-D1 path, untouched. */
-    if (!hv_ahci_enabled() || !hv_t8152_gic_owned() || smp_id() >= MAX_CPUS)
+    /* Without its device's configure flag the SPI does not exist: the pre-D1 path, untouched. */
+    if (!hv_t8152_vspi_live(intid) || !hv_t8152_gic_owned() || smp_id() >= MAX_CPUS)
         return;
     spin_lock(&t8152_vspi_lock);
     hv_t8152_vspi_apply(intid);
@@ -2847,7 +2857,8 @@ static void hv_t8152_vspi_reapply(u32 intid)
 
 void hv_t8152_vspi_refresh(void)
 {
-    hv_t8152_vspi_reapply(HV_VDEV_SPI_AHCI);
+    for (int i = 0; i < VDEV_SPI_COUNT; i++)
+        hv_t8152_vspi_reapply(vdev_spi_intids[i]);
 }
 
 /*

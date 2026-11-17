@@ -10,6 +10,7 @@
 #include "usb.h"
 #ifdef AURA_WINDOWS
 #include "windows/guest_diag.h"
+#include "windows/hv_input.h"
 #include "windows/serial_capture.h"
 #endif
 
@@ -50,6 +51,22 @@ static bool vuart_hw_off = false;
 /* With the proxy on CDC, XNU's TX is also copied to DockChannel (always-on, bounded writes): if
  * the CDC link goes away, `macvdmtool debugusb` brings XNU's console back on KIS. */
 static iodev_id_t vuart_tx_mirror = IODEV_MAX;
+
+/*
+ * Bytes the guest may read from the vUART.  I0 (hv_input.h): once the input device is
+ * attached with the host source, the RX direction is the host feed's (parsed on the tick), so
+ * the guest's UART sees an empty receiver: no RXD, no RX count, URXH reads 0.
+ */
+static ssize_t vuart_rx_queued(void)
+{
+    if (vuart_tx_only)
+        return 0;
+#ifdef AURA_WINDOWS
+    if (hv_input_owns_vuart_rx())
+        return 0;
+#endif
+    return iodev_can_read(IODEV_USB_VUART);
+}
 
 static void update_irq(void)
 {
@@ -93,7 +110,7 @@ static void update_irq(void)
 
     u32 tx_status = tx_ready ? 0 : UFSTAT_TXFULL | FIELD_PREP(UFSTAT_TXCNT, 15);
     ufstat = tx_status;
-    if (!vuart_tx_only && (rx_queued = iodev_can_read(IODEV_USB_VUART))) {
+    if ((rx_queued = vuart_rx_queued())) {
         utrstat |= UTRSTAT_RXD;
         if (rx_queued > 15)
             ufstat = tx_status | FIELD_PREP(UFSTAT_RXCNT, 15) | UFSTAT_RXFULL;
@@ -207,7 +224,7 @@ static bool handle_vuart(struct exc_info *ctx, u64 addr, u64 *val, bool write, i
                 *val = ucon;
                 break;
             case URXH:
-                if (!vuart_tx_only && iodev_can_read(IODEV_USB_VUART)) {
+                if (vuart_rx_queued()) {
                     uint8_t c;
                     iodev_read(IODEV_USB_VUART, &c, 1);
                     *val = c;

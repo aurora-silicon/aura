@@ -274,10 +274,11 @@ int hv_windows_configure(u64 flags)
         flags & ~(HV_WINDOWS_GUEST_COMPAT | HV_WINDOWS_FB_SHADOW | HV_WINDOWS_SERIAL_CAPTURE |
                   HV_WINDOWS_SERIAL_CDC | HV_WINDOWS_MTP | HV_WINDOWS_CPUFREQ |
                   HV_WINDOWS_T8152_FAST_IPI | HV_WINDOWS_T8152_SOFT_GIC | HV_WINDOWS_T8152_WFI |
-                  HV_WINDOWS_T8152_AHCI | HV_WINDOWS_T8152_USB))
+                  HV_WINDOWS_T8152_AHCI | HV_WINDOWS_T8152_USB |
+                  HV_WINDOWS_T8152_INPUT))
         return -1;
     if ((flags & (HV_WINDOWS_T8152_FAST_IPI | HV_WINDOWS_T8152_SOFT_GIC | HV_WINDOWS_T8152_WFI |
-                  HV_WINDOWS_T8152_AHCI | HV_WINDOWS_T8152_USB)) &&
+                  HV_WINDOWS_T8152_AHCI | HV_WINDOWS_T8152_USB | HV_WINDOWS_T8152_INPUT)) &&
         chip_id != T8152)
         return -1;
     /* D1: the AHCI disk's SPI is delivered only by the software GIC CPU interface. */
@@ -285,6 +286,10 @@ int hv_windows_configure(u64 flags)
         return -1;
     /* D4: the USB line too, and only on J804 (the port table is J804's). */
     if ((flags & HV_WINDOWS_T8152_USB) &&
+        (!(flags & HV_WINDOWS_T8152_SOFT_GIC) || board_id != 0x22))
+        return -1;
+    /* I0: the input SPI too, J804 only (Mu's INP0 is a J804 table). */
+    if ((flags & HV_WINDOWS_T8152_INPUT) &&
         (!(flags & HV_WINDOWS_T8152_SOFT_GIC) || board_id != 0x22))
         return -1;
     if (chip_id == T8152 && !(flags & HV_WINDOWS_T8152_SOFT_GIC)) {
@@ -320,6 +325,8 @@ int hv_windows_configure(u64 flags)
         hv_ahci_enable();
     if (flags & HV_WINDOWS_T8152_USB)
         hv_usb_enable();
+    if (flags & HV_WINDOWS_T8152_INPUT)
+        hv_input_enable();
     return 0;
 }
 
@@ -1285,6 +1292,8 @@ void hv_fb_report(void)
     hv_ahci_report();
     /* D4: USB status and DART exceptions, one line per change. */
     hv_usb_report();
+    /* I0: host-feed counters, one line when they moved. */
+    hv_input_report();
 }
 
 bool hv_fb_shadow_contains(u64 pa)
@@ -1559,7 +1568,7 @@ static int hv_start_session(void *entry, u64 regs[4])
     /* T8152: last check of everything the guest can reach, then enter. */
     if (chip_id == T8152 && (hv_t8152_verify((u64)entry, regs[0], hv_secondary_info.hcr,
                                              hv_windows_flags & HV_WINDOWS_FB_SHADOW) < 0 ||
-                             hv_ahci_verify() < 0)) {
+                             hv_ahci_verify() < 0 || hv_input_verify() < 0)) {
         msr(CNTP_CTL_EL0, 0); /* the primary host tick armed above */
         hv_cpus_in_guest = 0;
         hv_windows_mtp_stop();
@@ -1577,6 +1586,8 @@ static int hv_start_session(void *entry, u64 regs[4])
     hv_t8152_quiesce_guest_vtimer(true);
     /* D1: from here the disk store is RUNNING until a PSCI exit seals it. */
     hv_ahci_guest_entered();
+    /* I0: from here the host feed is parsed on the tick (state only until the driver enables). */
+    hv_input_guest_entered();
     /* The EL2 fatal report (hv_fatal.h) speaks only while a T8152 guest is entered. */
     hv_fatal_armed = chip_id == T8152;
     printf("HV: Entering guest at %p (x0=0x%lx)\n", entry, regs[0]);
@@ -1599,6 +1610,7 @@ static int hv_start_session(void *entry, u64 regs[4])
     int status = result ? result : __atomic_load_n(&hv_windows_exit_reason, __ATOMIC_ACQUIRE);
     hv_fatal_armed = false;
     hv_ahci_guest_exited(status);
+    hv_input_guest_exited(status);
     return status;
 }
 
@@ -2298,6 +2310,11 @@ void hv_tick(struct exc_info *ctx)
     hv_recover_t8142_sysreg_undef(ctx);
     hv_fatal_stage(HV_FATAL_STAGE_IO);
     hv_tick_host_io(ctx);
+    /*
+     * I0: the host feed, right after the vUART poll has taken the CDC events: at most
+     * HV_INPUT_RX_BUDGET bytes per tick, then the held-key watchdog.  No-op unless attached.
+     */
+    hv_input_poll();
     hv_fatal_stage(HV_FATAL_STAGE_DONE);
     if (chip_id == T8142)
         hv_tick_deadline_complete(state, hv_host_counter());

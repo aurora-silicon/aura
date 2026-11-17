@@ -393,10 +393,13 @@ def test_eoi_and_distributor_writes_reapply_the_level():
     assert "gicv3_cpuif_is_active(&t8152_cpuif[cpu], intid)" in apply
     level = function_body(exc, "void hv_t8152_gic_spi_level(u32 intid, bool level)")
     assert "spin_lock(&t8152_vspi_lock);" in level and "hv_t8152_gic_owned()" in level
-    # Without the AHCI configure flag the M3 path is untouched: every entry returns at once.
-    assert level.split("{", 1)[1].lstrip().startswith("if (!hv_ahci_enabled() ||")
+    # Without the AHCI configure flag the M3 path is untouched: every entry returns at once
+    # (I0: the gate is per INTID, and 990's device is the AHCI flag).
+    assert level.split("{", 1)[1].lstrip().startswith("if (!hv_t8152_vspi_live(intid) ||")
     reapply = function_body(exc, "static void hv_t8152_vspi_reapply(u32 intid)")
-    assert "if (!hv_ahci_enabled() || !hv_t8152_gic_owned()" in reapply
+    assert "if (!hv_t8152_vspi_live(intid) || !hv_t8152_gic_owned()" in reapply
+    live = function_body(exc, "static bool hv_t8152_vspi_live(u32 intid)")
+    assert "hv_ahci_enabled() ? VDEV_SPI_DEV_AHCI : 0" in live
     vgic = source("hv_vgic.c")
     dist = function_body(vgic, "static bool handle_vgic_dist_access(")
     assert dist.rstrip().endswith("hv_t8152_vspi_refresh();\n    return register_handled;") or \

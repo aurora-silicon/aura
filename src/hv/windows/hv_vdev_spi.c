@@ -50,7 +50,26 @@ struct vdev_spi_plan vdev_spi_plan(bool pend, int target, u64 pending, u64 activ
     return plan;
 }
 
+const u32 vdev_spi_intids[VDEV_SPI_COUNT] = {HV_VDEV_SPI_AHCI, HV_VDEV_SPI_INPUT};
+
+u32 vdev_spi_device(u32 intid)
+{
+    switch (intid) {
+        case HV_VDEV_SPI_AHCI:
+            return VDEV_SPI_DEV_AHCI;
+        case HV_VDEV_SPI_INPUT:
+            return VDEV_SPI_DEV_INPUT;
+        default:
+            return 0;
+    }
+}
+
 bool vdev_spi_is_virtual(u32 intid)
 {
-    return intid == HV_VDEV_SPI_AHCI;
+    return vdev_spi_device(intid) != 0;
+}
+
+bool vdev_spi_live(u32 intid, u32 devices)
+{
+    return (vdev_spi_device(intid) & devices) != 0;
 }

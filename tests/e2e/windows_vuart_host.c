@@ -247,6 +247,11 @@ static int hv_map_hook(u64 base, bool (*fn)(struct exc_info *, u64, u64 *, bool,
     (void)size;
     return 0;
 }
+/* I0 (hv_input.h): no input device in this replay, so the guest owns the vUART RX. */
+bool hv_input_owns_vuart_rx(void)
+{
+    return false;
+}
 /* The passthrough's console printf reaches the physical uart0 console on hardware. */
 static int count_printf(const char *fmt, ...)
 {
