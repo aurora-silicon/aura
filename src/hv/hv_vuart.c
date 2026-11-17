@@ -9,6 +9,7 @@
 #include "uart_regs.h"
 #include "usb.h"
 #ifdef AURA_WINDOWS
+#include "windows/guest_diag.h"
 #include "windows/serial_capture.h"
 #endif
 
@@ -70,6 +71,19 @@ static void update_irq(void)
 #ifdef AURA_WINDOWS
     if (!vuart_tx_only)
         tx_ready = iodev_can_write(IODEV_USB_VUART);
+#endif
+#ifdef AURA_WINDOWS
+    /* Edges only; the 1 Hz report prints them (never print from here). */
+    if (tx_ready == hv_vuart_diag.full) {
+        if (tx_ready) {
+            hv_vuart_diag.recover_at = mrs(CNTPCT_EL0);
+            hv_vuart_diag.recover_edges++;
+        } else {
+            hv_vuart_diag.full_at = mrs(CNTPCT_EL0);
+            hv_vuart_diag.full_edges++;
+        }
+        hv_vuart_diag.full = !tx_ready;
+    }
 #endif
     if (tx_ready)
         utrstat |= UTRSTAT_TXBE | UTRSTAT_TXE;
@@ -142,6 +156,13 @@ static bool handle_vuart(struct exc_info *ctx, u64 addr, u64 *val, bool write, i
 
     update_irq();
 
+#ifdef AURA_WINDOWS
+    if (write)
+        HV_GUEST_DIAG_INC(vuart_wr);
+    else
+        HV_GUEST_DIAG_INC(vuart_rd);
+#endif
+
     if (write) {
         //         printf("HV: vuart W 0x%lx <- 0x%lx (%d)\n", addr, *val, width);
         switch (addr) {
@@ -151,6 +172,7 @@ static bool handle_vuart(struct exc_info *ctx, u64 addr, u64 *val, bool write, i
             case UTXH: {
                 uint8_t b = *val;
 #ifdef AURA_WINDOWS
+                HV_GUEST_DIAG_INC(vuart_tx);
                 hv_windows_serial_putc(b);
                 /* The Windows secondary CDC callback only enqueues once.
                  * Unbound/closed consoles consume and discard, as before.
@@ -195,9 +217,17 @@ static bool handle_vuart(struct exc_info *ctx, u64 addr, u64 *val, bool write, i
                 break;
             case UTRSTAT:
                 *val = utrstat;
+#ifdef AURA_WINDOWS
+                if (!(utrstat & UTRSTAT_TXBE))
+                    HV_GUEST_DIAG_INC(vuart_txfull);
+#endif
                 break;
             case UFSTAT:
                 *val = ufstat;
+#ifdef AURA_WINDOWS
+                if (ufstat & UFSTAT_TXFULL)
+                    HV_GUEST_DIAG_INC(vuart_txfull);
+#endif
                 break;
             default:
                 *val = 0;

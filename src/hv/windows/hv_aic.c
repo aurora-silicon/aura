@@ -142,6 +142,11 @@ bool hv_native_aic_windows_ready(void)
     return __atomic_load_n(&windows_aic_enabled, __ATOMIC_ACQUIRE);
 }
 
+bool hv_native_aic_mu_aic_ready(void)
+{
+    return __atomic_load_n(&mu_aic_ready, __ATOMIC_ACQUIRE);
+}
+
 bool hv_native_aic_mu_timer_active(void)
 {
     return __atomic_load_n(&mu_timer_ready, __ATOMIC_ACQUIRE) && !hv_native_aic_windows_active();

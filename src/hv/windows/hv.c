@@ -8,6 +8,7 @@
 #include "cpufreq.h"
 #include "display.h"
 #include "fb_capture.h"
+#include "guest_diag.h"
 #include "gxf.h"
 #include "malloc.h"
 #include "memory.h"
@@ -1193,40 +1194,49 @@ void hv_fb_convert_idle(void)
  */
 void hv_fb_report(void)
 {
-    if (!hv_fb_shadow)
-        return;
-
     u64 now = get_ticks();
     if (now < hv_fb_report_next)
         return;
     hv_fb_report_next = now + mrs(CNTFRQ_EL0);
 
-    u32 lines = __atomic_exchange_n(&hv_fb_lines, 0, __ATOMIC_RELAXED);
-    printf("HV: fb: %u lines/s = %u.%02u fps\n", lines, lines / hv_fb_height,
-           (lines * 100 / hv_fb_height) % 100);
+    if (hv_fb_shadow) {
+        u32 lines = __atomic_exchange_n(&hv_fb_lines, 0, __ATOMIC_RELAXED);
+        printf("HV: fb: %u lines/s = %u.%02u fps\n", lines, lines / hv_fb_height,
+               (lines * 100 / hv_fb_height) % 100);
 
-    /* Where a converted line's time went, summed over CPUs, since the previous report. */
-    static u64 last_maint, last_copy, last_lines, last_paced;
-    u64 maint = 0, copy = 0, done = 0, paced = 0;
-    for (int cpu = 0; cpu < MAX_CPUS; cpu++) {
-        maint += __atomic_load_n(&hv_fb_cost[cpu].maint, __ATOMIC_RELAXED);
-        copy += __atomic_load_n(&hv_fb_cost[cpu].copy, __ATOMIC_RELAXED);
-        done += __atomic_load_n(&hv_fb_cost[cpu].lines, __ATOMIC_RELAXED);
-        paced += __atomic_load_n(&hv_fb_cost[cpu].paced, __ATOMIC_RELAXED);
-    }
-    u64 dm = maint - last_maint, dc = copy - last_copy, dl = done - last_lines;
-    u64 freq = mrs(CNTFRQ_EL0) ? mrs(CNTFRQ_EL0) : 1;
-    printf("HV: fb cost: read=%s lines=%lu maint_us=%lu copy_us=%lu ns_per_line=%lu paced=%lu\n",
-           hv_fb_source_cached ? "wb" : "nc", dl, dm * 1000000 / freq, dc * 1000000 / freq,
-           dl ? (dm + dc) / dl * 1000000000 / freq : 0, paced - last_paced);
-    last_maint = maint;
-    last_copy = copy;
-    last_lines = done;
-    last_paced = paced;
+        /* Where a converted line's time went, summed over CPUs, since the previous report. */
+        static u64 last_maint, last_copy, last_lines, last_paced;
+        u64 maint = 0, copy = 0, done = 0, paced = 0;
+        for (int cpu = 0; cpu < MAX_CPUS; cpu++) {
+            maint += __atomic_load_n(&hv_fb_cost[cpu].maint, __ATOMIC_RELAXED);
+            copy += __atomic_load_n(&hv_fb_cost[cpu].copy, __ATOMIC_RELAXED);
+            done += __atomic_load_n(&hv_fb_cost[cpu].lines, __ATOMIC_RELAXED);
+            paced += __atomic_load_n(&hv_fb_cost[cpu].paced, __ATOMIC_RELAXED);
+        }
+        u64 dm = maint - last_maint, dc = copy - last_copy, dl = done - last_lines;
+        u64 freq = mrs(CNTFRQ_EL0) ? mrs(CNTFRQ_EL0) : 1;
+        printf("HV: fb cost: read=%s lines=%lu maint_us=%lu copy_us=%lu ns_per_line=%lu paced=%lu\n",
+               hv_fb_source_cached ? "wb" : "nc", dl, dm * 1000000 / freq, dc * 1000000 / freq,
+               dl ? (dm + dc) / dl * 1000000000 / freq : 0, paced - last_paced);
+        last_maint = maint;
+        last_copy = copy;
+        last_lines = done;
+        last_paced = paced;
 #ifdef ENABLE_NATIVE_AIC_PASSTHROUGH
-    /* Same 1 Hz budget; silent until Windows owns the AIC. */
-    hv_native_aic_delivery_report();
+        /* Same 1 Hz budget; silent until Windows owns the AIC. */
+        hv_native_aic_delivery_report();
 #endif
+    }
+    /* One line per guest CPU that ran since the last report (guest_diag.h). */
+    hv_guest_diag_report();
+}
+
+bool hv_fb_shadow_contains(u64 pa)
+{
+    if (!hv_fb_shadow)
+        return false;
+    u64 base = (u64)hv_fb_shadow;
+    return pa >= base && pa - base < (u64)hv_fb_stride_px * 4 * hv_fb_height;
 }
 
 /* Apply the explicit E boot state once, before any device handoff of guest entry. */

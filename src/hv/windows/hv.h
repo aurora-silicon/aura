@@ -222,6 +222,7 @@ void hv_arm_wfi_wake(void);
 void hv_fb_convert_slice(u32 lines);
 void hv_fb_convert_idle(void);
 void hv_fb_report(void);
+bool hv_fb_shadow_contains(u64 pa);
 bool hv_mask_pending_tick(void);
 void hv_rearm(void);
 void hv_maybe_exit(void);
@@ -280,6 +281,7 @@ bool hv_native_aic_active(void);
 bool hv_native_aic_windows_active(void);
 bool hv_native_aic_windows_ready(void);
 bool hv_native_aic_mu_timer_active(void);
+bool hv_native_aic_mu_aic_ready(void);
 void hv_native_aic_timer_ready(void);
 void hv_native_aic_enter_cpu(void);
 /*

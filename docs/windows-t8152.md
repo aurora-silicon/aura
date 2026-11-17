@@ -136,6 +136,18 @@ FWB is clear, stage 2 and the SMC trap are on, `framebuffer=bgra-shadow` is sele
   - Capability bit 15 (0x8000) marks such a resident; the launcher requires it on T8152 and
     refuses `gic_cpuif: carrier` there, and the resident's configure step refuses a T8152
     configuration without the software-interface bit.
+- Once a second, next to `HV: fb: … lines/s`, the host tick prints one `HV: g<cpu> …` line
+  for each CPU that took a guest exit since the previous one: route
+  (`wait-aic`/`wait-timer`/`mu`/`gic`/`win-carrier`/`win`), the guest PC at its last exit
+  (`(same)` if unchanged), mode and DAIF from `SPSR_EL2`, `ELR_EL1`/`ESR_EL1` (EL12 views),
+  exit counts since the last line (`ex` all, `sr` sysreg, `da` data aborts, `fb` aborts on
+  the BGRA shadow, `vu` vUART reads/writes, `tx` bytes, `full` TX-full answers, `wfx`,
+  `hvc`, `smc`, `o` other, `fiq`, `gt` FIQs with a guest timer asserted and unmasked, `irq`,
+  `refl` timer reflections, `hold` unrouted-timer masks, `vi` exits with a virtual
+  interrupt asserted) and the guest `CNTP_CTL`/`CNTV_CTL` with how late (or early) CNTP's
+  compare value is. Counters are per CPU, written only by their owner, read without a lock.
+  vUART TX-full and recovery edges are recorded in the trap path and printed from the same
+  tick (`HV: vuart: TX full …`, `HV: vuart: TX has space again …`).
 - ECV is not used until measurement (e); the architectural PMU stays trapped to the
   synthetic EL2 backend.
 - `usb_hpm_restore_irqs()` is skipped: nothing writes to the USB-C port controllers.

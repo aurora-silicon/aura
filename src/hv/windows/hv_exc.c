@@ -7,6 +7,7 @@
 #include "assert.h"
 #include "cpu_regs.h"
 #include "exception.h"
+#include "guest_diag.h"
 #include "hv_aic_alias.h"
 #include "hv_el2_acct.h"
 #include "hv_gic_cpuif.h"
@@ -1668,6 +1669,7 @@ static void hv_update_fiq(struct exc_info *ctx)
                 PERCPU(timer_p_fiq_count)++;
                 PERCPU(timer_p_reflection_pending) = true;
                 aic_set_sw(HV_TIMER_P_SWIRQ(smp_id()), true);
+                HV_GUEST_DIAG_INC(timer_reflect);
                 HV_NATIVE_AIC_HOT_TRACE(HV_NATIVE_AIC_TRACE_TIMER_FIQ, 0,
                                         PERCPU(timer_p_fiq_count));
             }
@@ -1682,6 +1684,7 @@ static void hv_update_fiq(struct exc_info *ctx)
                 PERCPU(timer_v_fiq_count)++;
                 PERCPU(timer_v_reflection_pending) = true;
                 aic_set_sw(HV_TIMER_V_SWIRQ(smp_id()), true);
+                HV_GUEST_DIAG_INC(timer_reflect);
                 HV_NATIVE_AIC_HOT_TRACE(HV_NATIVE_AIC_TRACE_TIMER_FIQ, 1,
                                         PERCPU(timer_v_fiq_count));
             }
@@ -1794,6 +1797,9 @@ static void hv_update_fiq(struct exc_info *ctx)
         hv_write_hcr(hcr | HCR_VF);
     }
 #endif
+    /* Returning with a virtual IRQ/FIQ asserted: an injection the guest will take. */
+    if (mrs(HCR_EL2) & (HCR_VI | HCR_VF))
+        HV_GUEST_DIAG_INC(virq_exit);
 }
 
 #ifdef ENABLE_NATIVE_AIC_PASSTHROUGH
@@ -6486,6 +6492,178 @@ static bool hv_handle_msr(struct exc_info *ctx, u64 iss)
     return false;
 }
 
+/*
+ * Where each guest CPU is, once a second (see guest_diag.h).  The counters are
+ * owner-written and read here without a lock; the snapshot is refreshed on every
+ * exit by hv_get_context(), so it is at most one exit old when printed.
+ */
+struct hv_guest_diag hv_guest_diag[MAX_CPUS];
+struct hv_vuart_diag hv_vuart_diag;
+static struct hv_guest_diag hv_guest_diag_last[MAX_CPUS];
+static u64 hv_vuart_diag_full_printed;
+static u64 hv_vuart_diag_recover_printed;
+
+static void hv_guest_diag_snapshot(struct exc_info *ctx)
+{
+    struct hv_guest_diag *d = &hv_guest_diag[ctx->cpu_id];
+
+    d->exits++;
+    d->elr = ctx->elr;
+    d->spsr = ctx->spsr;
+    /* _EL12: under E2H the plain _EL1 names reach this EL2's own registers. */
+    d->elr_el1 = mrs(ELR_EL12);
+    d->esr_el1 = mrs(ESR_EL12);
+    d->cntp_ctl = mrs(CNTP_CTL_EL02);
+    d->cntp_cval = mrs(CNTP_CVAL_EL02);
+    d->cntv_ctl = mrs(CNTV_CTL_EL02);
+    d->cntpct = mrs(CNTPCT_EL0);
+}
+
+static void hv_guest_diag_note_sync(struct exc_info *ctx, u32 ec)
+{
+    struct hv_guest_diag *d = &hv_guest_diag[ctx->cpu_id];
+
+    switch (ec) {
+        case ESR_EC_MSR:
+            d->sysreg++;
+            break;
+        case ESR_EC_IMPDEF:
+            if (ctx->afsr1 == 0x1c00000)
+                d->smc++;
+            else
+                d->sysreg++;
+            break;
+        case ESR_EC_WFI:
+            d->wfx++;
+            break;
+        case ESR_EC_HVC:
+            d->hvc++;
+            break;
+        case ESR_EC_SMC:
+            d->smc++;
+            break;
+        case ESR_EC_DABORT_LOWER: {
+            /* HPFAR_EL2.FIPA, bits [47:4], holds IPA[55:12] of a stage-2 fault. */
+            u64 ipa = (((mrs(HPFAR_EL2) >> 4) & GENMASK(43, 0)) << 12) | (ctx->far & 0xfff);
+
+            d->dabort++;
+            if (hv_fb_shadow_contains(ipa))
+                d->dabort_fb++;
+            break;
+        }
+        default:
+            d->other_sync++;
+            break;
+    }
+}
+
+/* A FIQ taken while a guest timer is asserted and unmasked: the storm signature. */
+static void hv_guest_diag_note_fiq(void)
+{
+    struct hv_guest_diag *d = &hv_guest_diag[smp_id()];
+    u64 p = mrs(CNTP_CTL_EL02) & 7, v = mrs(CNTV_CTL_EL02) & 7;
+    const u64 asserted = CNTx_CTL_ISTATUS | CNTx_CTL_ENABLE;
+
+    d->fiq++;
+    if (p == asserted || v == asserted)
+        d->fiq_guest_timer++;
+}
+
+static const char *hv_guest_diag_route(void)
+{
+#ifdef ENABLE_NATIVE_AIC_PASSTHROUGH
+    if (!hv_native_aic_active())
+        return "none";
+    if (hv_native_aic_windows_ready())
+        return "win";
+    if (hv_gic_cpuif_active())
+        return "gic";
+    if (hv_native_aic_windows_active())
+        return "win-carrier";
+    if (hv_native_aic_mu_timer_active())
+        return "mu";
+    if (hv_native_aic_mu_aic_ready())
+        return "wait-timer";
+    return "wait-aic";
+#else
+    return "vgic";
+#endif
+}
+
+static const char *hv_guest_diag_mode(u64 spsr)
+{
+    switch (spsr & 0xf) {
+        case 0x0:
+            return "EL0t";
+        case 0x4:
+            return "EL1t";
+        case 0x5:
+            return "EL1h";
+        default:
+            return "EL?";
+    }
+}
+
+#define HV_GDIAG_DELTA(f) (cur.f - last->f)
+
+void hv_guest_diag_report(void)
+{
+    u64 freq_ms = mrs(CNTFRQ_EL0) / 1000;
+    const char *route = hv_guest_diag_route();
+
+    if (!freq_ms)
+        freq_ms = 1;
+
+    u64 full_edges = __atomic_load_n(&hv_vuart_diag.full_edges, __ATOMIC_RELAXED);
+    if (full_edges != hv_vuart_diag_full_printed) {
+        hv_vuart_diag_full_printed = full_edges;
+        printf("HV: vuart: TX full (guest reads TXBE=0) for %lu ms now; %lu full edge(s) so far\n",
+               (mrs(CNTPCT_EL0) - hv_vuart_diag.full_at) / freq_ms, full_edges);
+    }
+    u64 recover_edges = __atomic_load_n(&hv_vuart_diag.recover_edges, __ATOMIC_RELAXED);
+    if (recover_edges != hv_vuart_diag_recover_printed) {
+        hv_vuart_diag_recover_printed = recover_edges;
+        printf("HV: vuart: TX has space again %lu ms ago, after %lu ms full\n",
+               (mrs(CNTPCT_EL0) - hv_vuart_diag.recover_at) / freq_ms,
+               (hv_vuart_diag.recover_at - hv_vuart_diag.full_at) / freq_ms);
+    }
+
+    for (int cpu = 0; cpu < MAX_CPUS; cpu++) {
+        struct hv_guest_diag cur = hv_guest_diag[cpu];
+        struct hv_guest_diag *last = &hv_guest_diag_last[cpu];
+
+        /* Only a CPU that took an exit since the last report has been in the guest. */
+        if (cur.exits == last->exits && cur.irq == last->irq)
+            continue;
+
+        char daif[5] = {
+            (cur.spsr & BIT(9)) ? 'D' : '-',
+            (cur.spsr & BIT(8)) ? 'A' : '-',
+            (cur.spsr & BIT(7)) ? 'I' : '-',
+            (cur.spsr & BIT(6)) ? 'F' : '-',
+            0,
+        };
+        s64 late = (s64)(cur.cntpct - cur.cntp_cval);
+
+        printf("HV: g%d %s pc=0x%lx%s %s %s elr1=0x%lx esr1=0x%lx | ex=%lu sr=%lu da=%lu fb=%lu "
+               "vu=%lu/%lu tx=%lu full=%lu wfx=%lu hvc=%lu smc=%lu o=%lu fiq=%lu gt=%lu irq=%lu "
+               "refl=%lu hold=%lu vi=%lu | cntp=%lx %s=%lums cntv=%lx\n",
+               cpu, route, cur.elr, cur.elr == last->elr ? "(same)" : "",
+               hv_guest_diag_mode(cur.spsr), daif, cur.elr_el1, cur.esr_el1, HV_GDIAG_DELTA(exits),
+               HV_GDIAG_DELTA(sysreg), HV_GDIAG_DELTA(dabort), HV_GDIAG_DELTA(dabort_fb),
+               HV_GDIAG_DELTA(vuart_rd), HV_GDIAG_DELTA(vuart_wr), HV_GDIAG_DELTA(vuart_tx),
+               HV_GDIAG_DELTA(vuart_txfull), HV_GDIAG_DELTA(wfx), HV_GDIAG_DELTA(hvc),
+               HV_GDIAG_DELTA(smc), HV_GDIAG_DELTA(other_sync) + HV_GDIAG_DELTA(serror),
+               HV_GDIAG_DELTA(fiq), HV_GDIAG_DELTA(fiq_guest_timer), HV_GDIAG_DELTA(irq),
+               HV_GDIAG_DELTA(timer_reflect), HV_GDIAG_DELTA(timer_unrouted_mask),
+               HV_GDIAG_DELTA(virq_exit), cur.cntp_ctl, late >= 0 ? "late" : "due",
+               (u64)(late >= 0 ? late : -late) / freq_ms, cur.cntv_ctl);
+        *last = cur;
+    }
+}
+
+#undef HV_GDIAG_DELTA
+
 static void hv_get_context(struct exc_info *ctx)
 {
     ctx->spsr = hv_get_spsr();
@@ -6500,6 +6678,7 @@ static void hv_get_context(struct exc_info *ctx)
     ctx->mpidr = mrs(MPIDR_EL1);
 
     sysop("isb");
+    hv_guest_diag_snapshot(ctx);
 }
 
 /*
@@ -6728,6 +6907,8 @@ void hv_exc_sync(struct exc_info *ctx)
     bool handled = false;
     u32 ec = FIELD_GET(ESR_EC, ctx->esr);
 
+    hv_guest_diag_note_sync(ctx, ec);
+
     switch (ec) {
         case ESR_EC_MSR:
             hv_wdt_breadcrumb('m');
@@ -6919,6 +7100,7 @@ void hv_exc_irq(struct exc_info *ctx)
      * with 'I', means the CPU was in this vector rather than out in the guest.
      */
     hv_wdt_breadcrumb('I');
+    HV_GUEST_DIAG_INC(irq);
 
     /*
      * Answer an outstanding rendezvous before touching any AIC, carrier or HCR
@@ -7207,6 +7389,7 @@ void hv_exc_fiq(struct exc_info *ctx)
 #endif
     bool tick = false;
 
+    hv_guest_diag_note_fiq();
     hv_maybe_exit();
 
     //
@@ -7399,6 +7582,7 @@ void hv_exc_serr(struct exc_info *ctx)
     hv_native_aic_exception_entry();
 #endif
     hv_wdt_breadcrumb('E');
+    HV_GUEST_DIAG_INC(serror);
     hv_get_context(ctx);
     hv_exc_entry();
     hv_exc_proxy(ctx, START_EXCEPTION_LOWER, EXC_SERROR, NULL);
