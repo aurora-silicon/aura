@@ -13,8 +13,12 @@
  * it whether the virtual IRQ line (HCR_EL2.VI) must be asserted.
  *
  * Used on T8152 (J804), where the guest runs with ICH_HCR_EL2 = En | TC | TALL0
- * | TALL1, so every ICC_* access except ICC_SRE_EL1 traps to EL2 with EC 0x18
- * (Phase 3 measurement (f), "trapall", on E, P and M cores and the boot CPU).
+ * | TALL1 and HCR_EL2.IMO/FMO set.  Phase 3 measurement (f), "trapall", on E, P
+ * and M cores and the boot CPU, showed ICC_PMR_EL1, ICC_CTLR_EL1, ICC_IAR1_EL1
+ * and ICC_IGRPEN1_EL1 trapping to EL2 with EC 0x18 and ICC_SRE_EL1 not
+ * trapping.  That the other ICC_* registers (EOIR1, DIR, HPPIR1, BPR0/1, RPR,
+ * AP0Rn/AP1Rn, IGRPEN0, the Group 0 twins and the SGI generation registers)
+ * trap as well follows from IHI 0069 for those trap bits; it was not measured.
  *
  * Architecture references (public): Arm IHI 0069 (GIC architecture
  * specification, GICv3/v4), the ICC_*_EL1 register descriptions and the
@@ -35,6 +39,8 @@
  *    and every interrupt is delivered as Group 1.  Group 0 would be signalled
  *    as FIQ, which Windows must never receive, so IAR0/HPPIR0 read 1023 and
  *    ICC_SGI0R_EL1 / ICC_ASGI1R_EL1 generate nothing;
+ *  - no NMIs (FEAT_GICv3_NMI): ICC_NMIAR1_EL1 reads the spurious INTID 1023,
+ *    never INTID 0, should a guest read it anyway;
  *  - INTIDs 0..1019 (SGIs, PPIs, SPIs).  No LPIs.
  */
 
@@ -65,6 +71,7 @@
 #define GICV3_ICC_BPR0     GICV3_CPUIF_REG(12, 8, 3)
 #define GICV3_ICC_AP0R(n)  GICV3_CPUIF_REG(12, 8, 4 + (n))
 #define GICV3_ICC_AP1R(n)  GICV3_CPUIF_REG(12, 9, (n))
+#define GICV3_ICC_NMIAR1   GICV3_CPUIF_REG(12, 9, 5)
 #define GICV3_ICC_DIR      GICV3_CPUIF_REG(12, 11, 1)
 #define GICV3_ICC_RPR      GICV3_CPUIF_REG(12, 11, 3)
 #define GICV3_ICC_SGI1R    GICV3_CPUIF_REG(12, 11, 5)

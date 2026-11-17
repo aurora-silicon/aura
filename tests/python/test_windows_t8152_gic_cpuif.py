@@ -171,3 +171,52 @@ def test_capability_bit_15():
 def test_model_built_into_the_windows_resident():
     makefile = (REPO / "Makefile").read_text()
     assert re.search(r"hv_t8152\.o hv_gic_cpuif\.o", makefile)
+
+
+def test_mu_phase_icc_trap_never_claims_the_gic():
+    exc = source("hv_exc.c")
+    handler = function_body(exc, "static bool hv_handle_t8152_gic_cpuif(")
+    # Only the OS-phase hooks claim (ExitBootServices, guest distributor/redistributor write).
+    # An SGI-register write that traps through HCR_EL2.FMO in the Mu phase is ignored instead.
+    assert "hv_t8152_gic_claim(" not in handler
+    unowned = handler.index("if (!hv_t8152_gic_owned()) {")
+    model = handler.index("gicv3_cpuif_access(")
+    assert unowned < model
+    early = handler[unowned:model]
+    assert "return true;" in early and "GIC_SPURIOUS_INTID" in early
+    assert exc.count("hv_t8152_gic_claim(\"") == 1  # only enter_cpu's ExitBootServices claim
+
+
+def test_only_icc_encodings_are_taken():
+    handler = function_body(source("hv_exc.c"), "static bool hv_handle_t8152_gic_cpuif(")
+    # ICC_* live at CRn 12, CRm 8..12 (plus PMR at C4_C6_0); VBAR/RMR/ISR/DISR_EL1 do not.
+    assert "key == GICV3_ICC_PMR || (crn == 12 && crm >= 8 && crm <= 12)" in handler
+    assert "crn != 12" not in handler
+
+
+def test_lost_claim_waits_for_ownership():
+    exc = source("hv_exc.c")
+    wait = function_body(exc, "static void hv_t8152_gic_wait_owned(void)")
+    assert "t8152_gic_claimed" in wait and "t8152_gic_owned" in wait and "wfe" not in wait
+    claim = function_body(exc, "void hv_t8152_gic_claim(const char *why)")
+    lost = claim[claim.index("__atomic_compare_exchange_n"):]
+    assert lost.index("hv_t8152_gic_wait_owned();") < lost.index("return;")
+    enter_cpu = function_body(exc, "bool hv_t8152_gic_enter_cpu(bool os_phase)")
+    assert enter_cpu.index("hv_t8152_gic_wait_owned();") < enter_cpu.index(
+        "if (!hv_t8152_gic_owned())")
+
+
+def test_aarch32_id_block_raz_only_on_an_aarch64_only_core():
+    exc = source("hv_exc.c")
+    helper = function_body(exc, "static bool hv_t8152_aarch64_only(void)")
+    # ID_AA64PFR0_EL1.EL0 [3:0] and .EL1 [7:4] == 0b0001: AArch64 only (Arm ARM).
+    assert "(pfr0 & 0xf) == 1 && ((pfr0 >> 4) & 0xf) == 1" in helper
+    unlocked = function_body(exc, "static bool hv_handle_msr_unlocked(")
+    tail = unlocked[unlocked.rindex("chip_id == T8152 && is_read"):]
+    assert tail.index("hv_t8152_aarch64_only()") < tail.index("regs[rt] = 0;")
+
+
+def test_non_windows_hv_t8152_actlr_el12_write_only_if_different():
+    hv_c = (REPO / "src/hv/hv.c").read_text()
+    assert "SYS_IMP_APL_ACTLR_EL12, info->actlr_el1" in hv_c  # other chips unchanged
+    assert "if (chip_id != T8152 || mrs(SYS_ACTLR_EL12) != info->actlr_el1)" in hv_c

@@ -279,9 +279,12 @@ static void case_special_and_group0(void)
     assert(!fx.sgi1r);
     wr(GICV3_ICC_SGI1R, (3ull << 24) | 1);
     assert(fx.sgi1r && fx.sgi1r_value == ((3ull << 24) | 1));
+    /* ICC_NMIAR1_EL1: no NMI, so the spurious INTID, never INTID 0; nothing is acknowledged. */
+    assert(rd(GICV3_ICC_NMIAR1) == GICV3_SPURIOUS_INTID && fx.acknowledged == -1);
+    assert(gicv3_cpuif_is_pending(&cpu, 34));
     /* An encoding the model does not implement is the caller's decision. */
     u64 v = 0;
-    assert(!gicv3_cpuif_access(&cpu, prio, prio_table, GICV3_CPUIF_REG(12, 9, 5), true, &v, &fx));
+    assert(!gicv3_cpuif_access(&cpu, prio, prio_table, GICV3_CPUIF_REG(12, 10, 0), true, &v, &fx));
     assert(!gicv3_cpuif_access(&cpu, prio, prio_table, GICV3_CPUIF_REG(4, 6, 1), false, &v, &fx));
     pass("special_and_group0");
 }

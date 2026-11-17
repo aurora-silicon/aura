@@ -97,26 +97,40 @@ FWB is clear, stage 2 and the SMC trap are on, `framebuffer=bgra-shadow` is sele
 - GIC CPU interface: always the software one, with every `ICC_*` access trapped
   (`hv_gic_cpuif.c`, glue `hv_handle_t8152_gic_cpuif()` in `hv_exc.c`). Phase 3
   measurement (f) found `ICC_IAR1_EL1` and `ICC_IGRPEN1_EL1` UNDEFINED at EL1 in the
-  hardware-interface configuration (`ICH_HCR_EL2` 0, `HCR_EL2.IMO` clear) and every access
-  but `ICC_SRE_EL1` trapping to EL2 (EC 0x18) with `ICH_HCR_EL2` = En | TC | TALL0 | TALL1
-  (0x1c01), `ICH_VMCR_EL2.VENG1` and IMO/FMO set, on E, P and M cores and the boot CPU.
+  hardware-interface configuration (`ICH_HCR_EL2` 0, `HCR_EL2.IMO` clear), and the measured
+  accesses (`ICC_PMR_EL1`, `ICC_CTLR_EL1`, `ICC_IAR1_EL1`, `ICC_IGRPEN1_EL1`) trapping to EL2
+  (EC 0x18), with `ICC_SRE_EL1` not trapping, under `ICH_HCR_EL2` = En | TC | TALL0 | TALL1
+  (0x1c01), `ICH_VMCR_EL2.VENG1` and IMO/FMO set, on E, P and M cores and the boot CPU. That
+  the other `ICC_*` registers trap under the same bits follows from IHI 0069; it is not
+  measured.
   - Mu keeps the measured Mu configuration (`ICH_HCR_EL2` 0, IMO clear): the J804 FD is an
     AIC build (AppleAicDxe, no ArmGicDxe) and executes no `ICC_*` instruction.
   - The guest OS owns the GIC from Mu's ExitBootServices (AIC CONFIG cleared) or, failing
     that, from its first write to the emulated distributor or a redistributor. From then on
     every CPU (and every CPU the guest starts later) runs the trap-all configuration above.
+    A trapped `ICC_*` access never claims the GIC: before the claim only the SGI generation
+    registers can trap (`HCR_EL2.FMO` is set in the Mu phase, IHI 0069), and such a write is
+    ignored so Mu keeps its AIC interrupts. A CPU that loses the claim race waits until the
+    winner has published ownership, so no CPU falls back to a Mu-phase or T8142 setup.
   - EL2 emulates PMR, CTLR (EOImode, CBPR), BPR0/1, IGRPEN0/1, IAR1, EOIR1, DIR, HPPIR1, RPR,
     AP0R0/AP1R0 (5 priority and preemption bits, as `ICH_VTR_EL2` reports), SGI1R; Group 0
-    reads spurious and SGI0R/ASGI1R generate nothing (Group 0 would be FIQ). Running
+    reads spurious, `ICC_NMIAR1_EL1` reads spurious (no NMIs) and SGI0R/ASGI1R generate
+    nothing (Group 0 would be FIQ). Only CRn 12, CRm 8-12 encodings and PMR are taken. Running
     priority and nested preemption follow IHI 0069.
   - Delivery is `HCR_EL2.VI` from the model; no list register is written (they stay zero),
     and no `ICH_MISR_EL2`/`ICH_EISR_EL2` read happens on T8152. Device SPIs: the AIC EVENT
     read marks the INTID pending on the target CPU's interface; the guest's EOI unmasks the
     line. Timers: the Apple timer FIQ is masked and GTDT PPI 17/18 pended, as on T8142.
     SGIs: `ICC_SGI1R_EL1` pends on each target and kicks it.
-  - `ID_AA64PFR0_EL1.GIC` reads 1 to the guest (TID3; the hardware reads 0). On T8152 the
-    rest of the TID3 space (AArch32 ID block, unallocated encodings, `ID_AA64FPFR0_EL1`)
-    reads 0 at EL2 instead of going to the proxy.
+  - `ID_AA64PFR0_EL1.GIC` reads 1 to the guest (TID3; the hardware reads 0), from the first
+    read, Mu phase included. Assumed, not verified: no client before ExitBootServices (Mu,
+    the Windows boot applications) executes a Group 1 `ICC_*` instruction, which would UNDEF
+    at EL1 there. On T8152 the rest of the TID3 space (AArch32 ID block, unallocated
+    encodings, `ID_AA64FPFR0_EL1`) reads 0 at EL2 instead of going to the proxy, but only if
+    `ID_AA64PFR0_EL1.EL0` and `.EL1` both read 0b0001 (AArch64 only), where the AArch32 ID
+    registers are UNKNOWN; otherwise those reads keep the proxy path.
+  - Not modelled: the redistributor/distributor enable bits. A pending PPI or SGI is
+    delivered even if the guest disabled it (as on T8142).
   - The native AIC handoff (an AIC HAL extension's ready call) is ignored once the guest
     owns the GIC: J804 publishes no AIC CSRT.
   - Capability bit 15 (0x8000) marks such a resident; the launcher requires it on T8152 and

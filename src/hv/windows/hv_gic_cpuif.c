@@ -330,7 +330,8 @@ bool gicv3_cpuif_access(struct gicv3_cpuif *c, gicv3_cpuif_priority_fn prio, voi
 
         case GICV3_ICC_IAR0:
         case GICV3_ICC_HPPIR0:
-            /* No Group 0 interrupt is ever pending here. */
+        case GICV3_ICC_NMIAR1:
+            /* No Group 0 interrupt and no NMI is ever pending here. */
             if (is_read)
                 v = GICV3_SPURIOUS_INTID;
             break;

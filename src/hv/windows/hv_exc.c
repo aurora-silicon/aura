@@ -2276,8 +2276,8 @@ static u32 gic_cpuif_eoi_count[MAX_CPUS];
  *    the Group 1 registers are the physical CPU interface, and this SoC has
  *    none (ID_AA64PFR0_EL1.GIC = 0);
  *  - with ICH_HCR_EL2 = En | TC | TALL0 | TALL1 (0x1c01), ICH_VMCR_EL2.VENG1 and
- *    HCR_EL2.IMO/FMO set, every ICC_* access except ICC_SRE_EL1 traps to EL2
- *    with EC 0x18.
+ *    HCR_EL2.IMO/FMO set, every measured ICC_* access (PMR, CTLR, IAR1,
+ *    IGRPEN1) traps to EL2 with EC 0x18 and ICC_SRE_EL1 does not.
  * So once the guest OS owns the emulated GIC, every vCPU runs in exactly that
  * second configuration and EL2 answers every ICC_* register from
  * struct gicv3_cpuif.  Per IHI 0069 the trap set is TALL1: IAR1, EOIR1,
@@ -2319,6 +2319,7 @@ static struct {
 } t8152_cpuif_aux[MAX_CPUS];
 static bool t8152_gic_claimed;
 static bool t8152_gic_owned;
+static bool t8152_mu_icc_logged[MAX_CPUS];
 
 #define HV_T8152_ICH_HCR_TRAPALL 0x1c01 /* ICH_HCR_EL2 En | TC | TALL0 | TALL1 (IHI 0069) */
 #define HV_T8152_ICH_VMCR_VENG1  BIT(1)
@@ -2326,6 +2327,20 @@ static bool t8152_gic_owned;
 static bool hv_t8152_gic(void)
 {
     return chip_id == T8152 && hv_soft_gic_cpuif();
+}
+
+/*
+ * Another CPU won the claim but has not published t8152_gic_owned yet: wait
+ * for it, so that no CPU ever falls back to a Mu-phase (ICH_HCR_EL2 0) or
+ * T8142 startup-carrier (0x1001) setup once the GIC is claimed.  The window is
+ * a few instructions long; no WFE (B6).
+ */
+static void hv_t8152_gic_wait_owned(void)
+{
+    if (!__atomic_load_n(&t8152_gic_claimed, __ATOMIC_ACQUIRE))
+        return;
+    while (!__atomic_load_n(&t8152_gic_owned, __ATOMIC_ACQUIRE))
+        ;
 }
 
 bool hv_t8152_gic_owned(void)
@@ -2363,8 +2378,10 @@ void hv_t8152_gic_claim(const char *why)
     if (!hv_t8152_gic() || __atomic_load_n(&t8152_gic_owned, __ATOMIC_ACQUIRE))
         return;
     if (!__atomic_compare_exchange_n(&t8152_gic_claimed, &expected, true, false, __ATOMIC_ACQ_REL,
-                                     __ATOMIC_ACQUIRE))
+                                     __ATOMIC_ACQUIRE)) {
+        hv_t8152_gic_wait_owned();
         return;
+    }
 
     /* Only the boot vCPU runs the guest before this point; the others are parked. */
     for (u32 cpu = 0; cpu < MAX_CPUS; cpu++)
@@ -2383,6 +2400,7 @@ bool hv_t8152_gic_enter_cpu(bool os_phase)
         return false;
     if (os_phase)
         hv_t8152_gic_claim("Mu ExitBootServices");
+    hv_t8152_gic_wait_owned();
     if (!hv_t8152_gic_owned())
         return false;
     hv_t8152_gic_route_cpu();
@@ -2478,8 +2496,11 @@ static void hv_t8152_gic_send_sgi(u64 val)
 }
 
 /*
- * One trapped ICC_* access on T8152.  Every op0 3, op1 0 encoding in CRn 12,
- * and ICC_PMR_EL1, is answered here and never reaches the proxy.
+ * One trapped ICC_* access on T8152.  Every ICC_* encoding (op0 3, op1 0, CRn
+ * 12, CRm 8-12, and ICC_PMR_EL1; Arm DDI 0487 system-register encodings) is
+ * answered here and never reaches the proxy.  Other CRn 12 registers (VBAR_EL1,
+ * RVBAR/RMR_EL1, ISR_EL1, DISR_EL1) are not GIC registers and are left to the
+ * normal paths.
  */
 static bool hv_handle_t8152_gic_cpuif(u64 reg, bool is_read, u64 rt, u64 regs[32])
 {
@@ -2494,11 +2515,35 @@ static bool hv_handle_t8152_gic_cpuif(u64 reg, bool is_read, u64 rt, u64 regs[32
     u32 key = GICV3_CPUIF_REG(crn, crm, op2);
     u64 cpu = smp_id();
 
-    if (op0 != 3 || op1 != 0 || (crn != 12 && key != GICV3_ICC_PMR) || cpu >= MAX_CPUS)
+    bool icc = key == GICV3_ICC_PMR || (crn == 12 && crm >= 8 && crm <= 12);
+    if (op0 != 3 || op1 != 0 || !icc || cpu >= MAX_CPUS)
         return false;
 
-    /* A trap means trap-all is on, which only an owned GIC sets; claim defensively. */
-    hv_t8152_gic_claim("trapped ICC_* access");
+    /*
+     * Not owned yet: the Mu phase (ICH_HCR_EL2 0, HCR_EL2.IMO clear, FMO set).
+     * There the Group 1 registers UNDEF at EL1 (measurement (f)) and only the
+     * SGI generation registers can trap, because IHI 0069 traps EL1 writes to
+     * ICC_SGI0R/SGI1R/ASGI1R_EL1 whenever HCR_EL2.IMO or FMO is 1.  Such a
+     * write from firmware or a boot application must not hand the GIC to the
+     * OS model: that would set IMO and take Mu's AIC interrupts away from it.
+     * So it is ignored (no SGI is generated; Mu is an AIC build and has no GIC
+     * SGIs to send), reads return 0 or the spurious INTID, and the GIC is
+     * claimed only by the OS-phase hooks (ExitBootServices, a guest write to
+     * the emulated distributor or a redistributor).
+     */
+    if (!hv_t8152_gic_owned()) {
+        bool ack = key == GICV3_ICC_IAR0 || key == GICV3_ICC_IAR1 || key == GICV3_ICC_NMIAR1 ||
+                   key == GICV3_ICC_HPPIR0 || key == GICV3_ICC_HPPIR1;
+        if (is_read)
+            regs[rt] = ack ? GIC_SPURIOUS_INTID : 0;
+        if (!t8152_mu_icc_logged[cpu]) {
+            t8152_mu_icc_logged[cpu] = true;
+            printf("HV: T8152: ICC_* S3_0_C%u_C%u_%u %s on CPU %d before the OS owns the GIC; "
+                   "ignored\n",
+                   crn, crm, op2, is_read ? "read" : "write", (int)cpu);
+        }
+        return true;
+    }
 
     struct gicv3_cpuif *c = &t8152_cpuif[cpu];
     struct gicv3_cpuif_effect fx;
@@ -2506,7 +2551,7 @@ static bool hv_handle_t8152_gic_cpuif(u64 reg, bool is_read, u64 rt, u64 regs[32
 
     if (!gicv3_cpuif_access(c, hv_t8152_gic_priority, (void *)(uintptr_t)cpu, key, is_read, &value,
                             &fx)) {
-        /* An ICC_* encoding outside the model (for example NMI acknowledge): RAZ/WI. */
+        /* An ICC_* encoding outside the model (none is allocated in CRm 8-12 today): RAZ/WI. */
         if (!t8152_cpuif_aux[cpu].unknown_logged) {
             t8152_cpuif_aux[cpu].unknown_logged = true;
             printf("HV: T8152: ICC_* S3_0_C%u_C%u_%u %s on CPU %d is RAZ/WI\n", crn, crm, op2,
@@ -5217,6 +5262,14 @@ void hv_track_t8142_undef_vector(struct exc_info *ctx)
     hv_patch_t8142_undef_vector(HV_VECTOR_SYNC_CURRENT_SPX);
 }
 
+/* ID_AA64PFR0_EL1.EL0 and .EL1 both 0b0001: no AArch32 at EL0 or EL1 (Arm ARM). */
+static bool hv_t8152_aarch64_only(void)
+{
+    u64 pfr0 = _mrs(sr_tkn(ID_AA64PFR0_EL1));
+
+    return (pfr0 & 0xf) == 1 && ((pfr0 >> 4) & 0xf) == 1;
+}
+
 static bool hv_handle_msr_unlocked(struct exc_info *ctx, u64 iss)
 {
     u64 reg = iss & (ESR_ISS_MSR_OP0 | ESR_ISS_MSR_OP2 | ESR_ISS_MSR_OP1 | ESR_ISS_MSR_CRn |
@@ -6053,6 +6106,13 @@ static bool hv_handle_msr_unlocked(struct exc_info *ctx, u64 iss)
                 // the (1 << 24) here makes the guest see that the MSR is reporting the GICv3 sysreg
                 // interface
                 //
+                // T8152: this is reported from the first read, also during the Mu phase, when
+                // the guest runs ICH_HCR_EL2 0 with HCR_EL2.IMO clear and ICC_IAR1_EL1 /
+                // ICC_IGRPEN1_EL1 UNDEF at EL1 (measurement (f)) without EL2 seeing it.  The value
+                // is not switched at the OS-phase claim because an ID register must not change
+                // under a running guest.  Assumed, not verified: no pre-ExitBootServices client
+                // (Mu's AIC FD, bootmgfw.efi, winload.efi) executes a Group 1 ICC_* instruction.
+                //
                 regs[rt] = _mrs(sr_tkn(ID_AA64PFR0_EL1)) | (1 << 24);
             } else {
                 //
@@ -6243,13 +6303,19 @@ static bool hv_handle_msr_unlocked(struct exc_info *ctx, u64 iss)
      * AArch64 ID registers are answered above (ID_AA64PFR0_EL1 with GIC = 1, the
      * system-register CPU interface hv_handle_t8152_gic_cpuif() emulates; the
      * hardware reads 0 there, measurement (f)).  What is left is the AArch32 ID
-     * block (CRm 1-3), whose values are UNKNOWN or RAZ on a core without AArch32
-     * at EL1, and unallocated encodings, which read as zero; ID_AA64FPFR0_EL1
-     * (CRm 4, op2 7) reads 0 too (no FP8 features advertised).  So all of it is
-     * RAZ, answered here rather than by the proxy, and EL2 never executes one of
-     * these encodings itself.
+     * block (CRm 1-3) and unallocated encodings, which read as zero;
+     * ID_AA64FPFR0_EL1 (CRm 4, op2 7) reads 0 too (no FP8 features advertised).
+     * The AArch32 ID registers are UNKNOWN on an implementation without AArch32
+     * at any Exception level (Arm ARM, ID_PFR0_EL1 and the other AArch32 ID
+     * registers), so 0 is a permitted value -- but only on such a core.  That
+     * T8152 has no AArch32 was not measured (measurement (f) recorded only the
+     * GIC field), so it is checked here at run time: ID_AA64PFR0_EL1.EL0 [3:0]
+     * and .EL1 [7:4] must both read 0b0001, "AArch64 only" (Arm ARM,
+     * ID_AA64PFR0_EL1).  Otherwise these reads keep the old path (the proxy).
+     * EL2 never executes one of these encodings itself.
      */
-    if (chip_id == T8152 && is_read && FIELD_GET(ESR_ISS_MSR_OP0, reg) == 3 &&
+    if (chip_id == T8152 && is_read && hv_t8152_aarch64_only() &&
+        FIELD_GET(ESR_ISS_MSR_OP0, reg) == 3 &&
         FIELD_GET(ESR_ISS_MSR_OP1, reg) == 0 && FIELD_GET(ESR_ISS_MSR_CRn, reg) == 0 &&
         FIELD_GET(ESR_ISS_MSR_CRm, reg) >= 1 && FIELD_GET(ESR_ISS_MSR_CRm, reg) <= 7) {
         regs[rt] = 0;
