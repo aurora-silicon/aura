@@ -165,6 +165,8 @@ static void hv_set_spsr(u64 v) { (void)v; }
 static void hv_set_elr(u64 v) { (void)v; }
 static void hv_windows_mtp_poll(void) {}
 static void hv_fb_convert_slice(unsigned lines) { clock_now[cpu] += lines * cost_fb_line; fb_lines_converted += lines; }
+/* Pacing is exercised by tests/windows_fb_path; here every idle step is due. */
+static bool hv_fb_idle_due(void) { return true; }
 static void cpu_wfi_stateless(void)
 {
     if (during_wfi)

@@ -559,12 +559,43 @@ static void hv_set_gxf_vbar(void)
  * hv_map_hw() can hand it at its own address.
  */
 static u32 *hv_fb_shadow;
+/*
+ * Where the converter reads the shadow: its write-back alias when there is one (see
+ * hv_fb_convert_slice() and docs/windows-fb-cached-read.md), else the Normal-NC identity mapping.
+ */
+static const u32 *hv_fb_source;
+static bool hv_fb_source_cached;
 static u32 *hv_fb_scanout;
 static u32 hv_fb_stride_px;
 static u32 hv_fb_height;
-static u32 hv_fb_cursor;
+static u64 hv_fb_cursor; /* lines converted since start; the line is cursor % height */
 static u32 hv_fb_lines;
 static u64 hv_fb_report_next;
+static u64 hv_fb_epoch; /* when pass 0 of the paced idle conversion was due */
+
+/* Per-CPU cost of the conversion, one writer each, summed once a second by hv_fb_report(). */
+struct hv_fb_cost {
+    u64 maint; /* clean+invalidate of the band, host counter units */
+    u64 copy;  /* reading, converting and writing it */
+    u64 lines;
+    u64 paced; /* idle steps declined because the next pass was not due */
+} ALIGNED(64);
+static struct hv_fb_cost hv_fb_cost[MAX_CPUS];
+
+/*
+ * The heap's write-back alias of a heap address. memory.c maps all of RAM a second time at
+ * PA | REGION_RW_EL0 (Normal, write-back; m1n1 writes its page tables through it), and
+ * hv_fb_init() remaps only the identity range of the shadow to Normal-NC, so this alias exists
+ * already. NULL if the address cannot carry the alias bit.
+ */
+static const u32 *hv_fb_cached_alias(const u32 *p)
+{
+    u64 a = (u64)p;
+
+    if (a & (REGION_RWX_EL0 | REGION_RW_EL0 | REGION_RX_EL1))
+        return NULL;
+    return (const u32 *)(a | REGION_RW_EL0);
+}
 
 static bool hv_fb_init(struct boot_args *gba)
 {
@@ -604,12 +635,18 @@ static bool hv_fb_init(struct boot_args *gba)
     hv_fb_scanout = (u32 *)gba->video.base;
     hv_fb_stride_px = gba->video.stride / 4;
     hv_fb_height = gba->video.height;
+    hv_fb_source = hv_fb_cached_alias(hv_fb_shadow);
+    hv_fb_source_cached = hv_fb_source != NULL;
+    if (!hv_fb_source_cached)
+        hv_fb_source = hv_fb_shadow;
+    hv_fb_epoch = hv_host_counter();
     gba->video.base = (u64)hv_fb_shadow;
     gba->video.depth = (gba->video.depth & ~0xffUL) | 32;
     fb_capture_set_shadow((u64)hv_fb_shadow, gba->video.width, gba->video.height,
                           gba->video.stride);
-    printf("HV: BGRA shadow %p -> X2R10G10B10 scanout %p (%ux%u)\n", hv_fb_shadow, hv_fb_scanout,
-           hv_fb_stride_px, hv_fb_height);
+    printf("HV: BGRA shadow %p -> X2R10G10B10 scanout %p (%ux%u), read %s\n", hv_fb_shadow,
+           hv_fb_scanout, hv_fb_stride_px, hv_fb_height,
+           hv_fb_source_cached ? "write-back alias" : "non-cacheable");
     return true;
 }
 
@@ -634,13 +671,30 @@ void hv_fb_convert_slice(u32 lines)
     if (!hv_fb_shadow)
         return;
 
+    struct hv_fb_cost *cost = &hv_fb_cost[smp_id()];
+    u64 t0 = hv_host_counter();
     u32 start = __atomic_fetch_add(&hv_fb_cursor, lines, __ATOMIC_RELAXED) % hv_fb_height;
     u32 end = start + lines;
     if (end > hv_fb_height)
         end = hv_fb_height;
 
+    /*
+     * Read through the write-back alias, but never from a line cached before the guest's latest
+     * writes: an earlier pass, or a speculative fill through any write-back alias, can hold one.
+     * Clean+invalidate the band to the point of coherency first -- clean, not just invalidate,
+     * because a guest that maps the buffer write-back may hold dirty lines of it -- and let the
+     * maintenance complete before the first load. EL2 never writes the shadow, so this changes
+     * nothing the guest can see. Boot 146 paid ~130 us per scanline reading the NC mapping.
+     */
+    if (hv_fb_source_cached) {
+        dc_civac_range((void *)(hv_fb_source + (size_t)start * hv_fb_stride_px),
+                       (size_t)(end - start) * hv_fb_stride_px * sizeof(u32));
+        sysop("dsb sy");
+    }
+    u64 t1 = hv_host_counter();
+
     for (u32 y = start; y < end; y++) {
-        const u32 *src = hv_fb_shadow + (size_t)y * hv_fb_stride_px;
+        const u32 *src = hv_fb_source + (size_t)y * hv_fb_stride_px;
         u32 *dst = hv_fb_scanout + (size_t)y * hv_fb_stride_px;
 
         for (u32 x = 0; x < hv_fb_stride_px; x++) {
@@ -649,7 +703,36 @@ void hv_fb_convert_slice(u32 lines)
         }
     }
 
+    u64 t2 = hv_host_counter();
+    __atomic_store_n(&cost->maint, cost->maint + (t1 - t0), __ATOMIC_RELAXED);
+    __atomic_store_n(&cost->copy, cost->copy + (t2 - t1), __ATOMIC_RELAXED);
+    __atomic_store_n(&cost->lines, cost->lines + (end - start), __ATOMIC_RELAXED);
     __atomic_fetch_add(&hv_fb_lines, end - start, __ATOMIC_RELAXED);
+}
+
+/*
+ * Pace the idle conversion at HV_FB_IDLE_FPS full passes a second. Pass N may start once
+ * hv_fb_epoch + N periods has come; a schedule more than a period late is moved to now, so a busy
+ * stretch is never made up by a burst of back-to-back passes. Cheap reads made a slice short
+ * enough that, unpaced, idle cores would convert hundreds of frames a second for nothing.
+ */
+static bool hv_fb_idle_due(void)
+{
+    u64 period = mrs(CNTFRQ_EL0) / HV_FB_IDLE_FPS;
+    u64 now = hv_host_counter();
+    u64 pass = __atomic_load_n(&hv_fb_cursor, __ATOMIC_RELAXED) / hv_fb_height;
+    u64 due = __atomic_load_n(&hv_fb_epoch, __ATOMIC_RELAXED) + pass * period;
+
+    if (!period)
+        return true;
+    if ((s64)(now - due) < 0) {
+        struct hv_fb_cost *cost = &hv_fb_cost[smp_id()];
+        __atomic_store_n(&cost->paced, cost->paced + 1, __ATOMIC_RELAXED);
+        return false;
+    }
+    if (now - due > period)
+        __atomic_store_n(&hv_fb_epoch, now - pass * period, __ATOMIC_RELAXED);
+    return true;
 }
 
 /*
@@ -664,7 +747,7 @@ void hv_fb_convert_idle(void)
         return;
 
     for (u32 done = 0; done < HV_FB_SLICE_IDLE; done += HV_FB_SLICE_STEP) {
-        if (mrs(ISR_EL1))
+        if (mrs(ISR_EL1) || !hv_fb_idle_due())
             return;
         hv_fb_convert_slice(HV_FB_SLICE_STEP);
     }
@@ -690,6 +773,25 @@ void hv_fb_report(void)
     u32 lines = __atomic_exchange_n(&hv_fb_lines, 0, __ATOMIC_RELAXED);
     printf("HV: fb: %u lines/s = %u.%02u fps\n", lines, lines / hv_fb_height,
            (lines * 100 / hv_fb_height) % 100);
+
+    /* Where a converted line's time went, summed over CPUs, since the previous report. */
+    static u64 last_maint, last_copy, last_lines, last_paced;
+    u64 maint = 0, copy = 0, done = 0, paced = 0;
+    for (int cpu = 0; cpu < MAX_CPUS; cpu++) {
+        maint += __atomic_load_n(&hv_fb_cost[cpu].maint, __ATOMIC_RELAXED);
+        copy += __atomic_load_n(&hv_fb_cost[cpu].copy, __ATOMIC_RELAXED);
+        done += __atomic_load_n(&hv_fb_cost[cpu].lines, __ATOMIC_RELAXED);
+        paced += __atomic_load_n(&hv_fb_cost[cpu].paced, __ATOMIC_RELAXED);
+    }
+    u64 dm = maint - last_maint, dc = copy - last_copy, dl = done - last_lines;
+    u64 freq = mrs(CNTFRQ_EL0) ? mrs(CNTFRQ_EL0) : 1;
+    printf("HV: fb cost: read=%s lines=%lu maint_us=%lu copy_us=%lu ns_per_line=%lu paced=%lu\n",
+           hv_fb_source_cached ? "wb" : "nc", dl, dm * 1000000 / freq, dc * 1000000 / freq,
+           dl ? (dm + dc) / dl * 1000000000 / freq : 0, paced - last_paced);
+    last_maint = maint;
+    last_copy = copy;
+    last_lines = done;
+    last_paced = paced;
 #ifdef ENABLE_NATIVE_AIC_PASSTHROUGH
     /* Same 1 Hz budget; silent until Windows owns the AIC. */
     hv_native_aic_delivery_report();

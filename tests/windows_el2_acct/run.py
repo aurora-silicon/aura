@@ -27,7 +27,7 @@ MUTATIONS = [
     ('hold-never-released', '    hv_el2_lock_released();\n    spin_unlock(&bhl);', '    spin_unlock(&bhl);'),
     ('no-flood-guard', 'if (!baseline && now - last_report < freq / 2)', 'if (false)'),
     ('boot-cpu-omitted', 'if (cpu != boot_cpu_idx && !smp_is_alive(cpu))', 'if (!smp_is_alive(cpu))'),
-    ('fb-idle-ignores-pending-interrupts', '        if (mrs(ISR_EL1))\n            return;\n', ''),
+    ('fb-idle-ignores-pending-interrupts', 'if (mrs(ISR_EL1) || !hv_fb_idle_due())', 'if (!hv_fb_idle_due())'),
     ('fb-idle-whole-slice-in-one-step', 'hv_fb_convert_slice(HV_FB_SLICE_STEP);', 'hv_fb_convert_slice(HV_FB_SLICE_IDLE);'),
     ('microseconds-assume-1ghz', 'return (ticks / freq) * 1000000 + ((ticks % freq) * 1000000) / freq;', 'return ticks / 1000 + 0 * freq;'),
 ]

@@ -180,6 +180,8 @@ void hv_arm_wfi_wake(void);
 #define HV_FB_SLICE_IDLE 160
 #define HV_FB_SLICE_TICK 64
 #define HV_FB_SLICE_STEP 4
+/* Full passes a second the idle conversion is paced to; docs/windows-fb-cached-read.md. */
+#define HV_FB_IDLE_FPS   60
 
 void hv_fb_convert_slice(u32 lines);
 void hv_fb_convert_idle(void);
