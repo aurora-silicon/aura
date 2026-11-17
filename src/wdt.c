@@ -93,7 +93,7 @@ static int wdt_arm(unsigned seconds)
 
 int wdt_arm_seconds(unsigned seconds)
 {
-    if (chip_id != T8140 && chip_id != T6040)
+    if (chip_id != T8140 && chip_id != T6040 && chip_id != T8122)
         return -1;
     return wdt_arm(seconds);
 }
