@@ -346,6 +346,15 @@ def env_int(name, default=0):
     return int(value, 0) if value else default
 
 
+def post_entry_drain_needed(iface):
+    """A device-side USB serial endpoint can stop accepting OUT as the guest enters."""
+    if iface.is_kis:
+        return False
+    port = iface.devpath or getattr(iface.dev, "port", "") or ""
+    device = os.path.basename(os.path.realpath(port))
+    return not device.startswith(("ttyACM", "cu.usbmodem", "tty.usbmodem"))
+
+
 def parse_args():
     ap = argparse.ArgumentParser(description="Boot the stock SPTM as an NV2 guest under aura")
     ap.add_argument("--sptm", type=pathlib.Path, required=True, help="sptm.bin (flat Mach-O)")
@@ -1024,10 +1033,10 @@ def main():
     # sptm_virt_enter does not return. Waiting for a reply or a boot banner would eat the guest's
     # first console output and reopen the link.
     p.request(p.P_CALL, sym["sptm_virt_enter"], no_reply=True)
-    # Once a KIS target enters the guest it can stop consuming host OUT immediately.  The enter
+    # Once a USB target enters the guest it can stop consuming host OUT immediately.  The enter
     # request is already queued by write(); tcdrain here can then block forever and prevent the
-    # console tail from reading the guest's first output.  Other UART transports retain the drain.
-    if not iface.is_kis:
+    # console tail from reading the guest's first output.  Real UARTs retain the drain.
+    if post_entry_drain_needed(iface):
         iface.dev.flush()
     secs = env_int("AURA_TAIL_SECS")
     if secs > 0:
