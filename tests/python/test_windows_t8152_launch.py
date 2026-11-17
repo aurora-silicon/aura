@@ -130,7 +130,7 @@ def run(case="success"):
             if case == "link-lost":
                 raise UartTimeout("timeout")
             return 0
-        def hv_map_vuart(self, *a): trace.append("vuart")
+        def hv_map_vuart(self, *a): trace.append(("vuart", *a))
 
         def hv_windows_guest_ram(self, base, size, host_top):
             trace.append(("guest_ram", base, size, host_top))
@@ -237,6 +237,14 @@ def test_t8152_guest_placement_and_adt():
 def test_t8152_launch_refusals(case, message):
     with pytest.raises((ValueError, RuntimeError), match=message):
         run(case)
+
+
+def test_t8152_vuart_gets_no_physical_interrupt():
+    # B8: uart0's ADT interrupt (10 in the fixture) is not passed on T8152, so even an older
+    # resident never clears uart0's UTRSTAT or drives an AIC line for the guest's serial.
+    r = run()
+    vuart = [t for t in r.trace if isinstance(t, tuple) and t[0] == "vuart"]
+    assert vuart == [("vuart", 0x2c0000000, 0, IODEV.USB0)]
 
 
 def test_t8152_live_cpu_check_runs_before_the_resident_starts_anything():

@@ -77,9 +77,10 @@ static u8 host_bytes[4096], capture_bytes[4096];
 static size_t host_count, capture_count;
 static unsigned polls, kicks;
 static bool draining;
+static bool capture_on = true;
 static bool hv_windows_serial_capture_enabled(void)
 {
-    return true;
+    return capture_on;
 }
 static bool hv_windows_serial_cdc_enabled(void)
 {
@@ -221,14 +222,19 @@ struct iodev iodev_uart = {.ops = &other_ops}, iodev_fb = {.ops = &other_ops},
              iodev_usb_vuart = {.ops = &secondary_ops};
 #include "../../src/iodev.c"
 struct exc_info;
+#include "../../src/soc.h"
+/* T8152 (J804) identity for the vUART's physical-UART/AIC rule; the replay above runs as T8152. */
+u32 chip_id = T8152;
+static unsigned physical_uart_writes, aic_writes, passthrough_prints;
+static int aic_line = -1;
 static void uart_clear_irqs(void)
 {
-    assert(!"physical IRQ touched");
+    ++physical_uart_writes;
 }
 static void aic_set_sw(int irq, bool on)
 {
-    (void)irq;
-    (void)on;
+    ++aic_writes;
+    aic_line = on ? irq : -1;
 }
 static void usb_iodev_vuart_setup(iodev_id_t id)
 {
@@ -241,7 +247,16 @@ static int hv_map_hook(u64 base, bool (*fn)(struct exc_info *, u64, u64 *, bool,
     (void)size;
     return 0;
 }
+/* The passthrough's console printf reaches the physical uart0 console on hardware. */
+static int count_printf(const char *fmt, ...)
+{
+    (void)fmt;
+    ++passthrough_prints;
+    return 0;
+}
+#define printf count_printf
 #include "../../src/hv/hv_vuart.c"
+#undef printf
 static void put_byte(u8 b)
 {
     u64 v = b;
@@ -326,6 +341,55 @@ static bool check_receive_rearm(dwc3_dev_t *dev)
     return true;
 #endif
 }
+/*
+ * B8: map the vUART with uart0's ADT interrupt, as the launcher of 618d6d40 and older did.
+ * On T8152 nothing may reach the physical uart0 (UTRSTAT clears, the passthrough's console
+ * printf) or the AIC software line; the guest's bytes still reach the CDC.  Any other chip
+ * keeps the interrupt.  The replay's own counters are restored afterwards.
+ */
+static bool check_physical_policy(dwc3_dev_t *dev)
+{
+    const u64 uart0 = 0x2c0000000; /* synthetic */
+    const int irq = 1397;
+    u64 ucon_irq = FIELD_PREP(UCON_TXMODE, UCON_MODE_IRQ) | UCON_TXTHRESH_ENA |
+                   FIELD_PREP(UCON_RXMODE, UCON_MODE_IRQ) | UCON_RXTO_ENA;
+    const size_t sent = host_count, captured = capture_count;
+    const u64 overruns = vuart_tx_overruns;
+    assert(physical_uart_writes == 0 && aic_writes == 0 && passthrough_prints == 0);
+
+    chip_id = T8152;
+    hv_map_vuart(uart0, irq, IODEV_USB_VUART);
+    assert(vuart_irq == 0);
+    assert(handle_vuart(NULL, UCON, &ucon_irq, true, 4));
+    capture_on = false; /* with capture and CDC mode off, ordinary aura would echo HVLOG lines */
+    draining = true;
+    for (const char *p = "HVLOG: j804\n"; *p; ++p)
+        put_byte((u8)*p);
+    for (int i = 0; i < 4; i++)
+        hv_vuart_poll();
+    usb_dwc3_vuart_poll(dev);
+    assert(read_reg(UTRSTAT) & UTRSTAT_TXTHRESH); /* the guest still sees its IRQ status */
+    assert(physical_uart_writes == 0 && aic_writes == 0 && passthrough_prints == 0);
+    assert(host_count == sent + 12 && !memcmp(host_bytes + sent, "HVLOG: j804\n", 12));
+
+    chip_id = T8142;
+    hv_map_vuart(uart0, irq, IODEV_USB_VUART);
+    assert(vuart_irq == irq);
+    hv_vuart_poll();
+    assert(physical_uart_writes == 1 && aic_writes == 1 && aic_line == irq);
+    for (const char *p = "HVLOG: \n"; *p; ++p)
+        put_byte((u8)*p);
+    assert(passthrough_prints == 2); /* the prefix, then the newline */
+
+    draining = false;
+    capture_on = true;
+    chip_id = T8152;
+    hv_map_vuart(uart0, 0, IODEV_USB_VUART);
+    host_count = sent;
+    capture_count = captured;
+    vuart_tx_overruns = overruns;
+    return true;
+}
 int main(int argc, char **argv)
 {
     assert(argc == 2);
@@ -388,6 +452,7 @@ int main(int argc, char **argv)
     usb_dwc3_vuart_poll(&dev);
     assert(host_count == 15 && host_bytes[14] == 'z');
     bool rx_rearmed = check_receive_rearm(&dev);
+    bool physical_ok = check_physical_policy(&dev);
     dev.failed = true;
     check_ready(true);
     put_byte('F');
@@ -401,7 +466,9 @@ int main(int argc, char **argv)
     ringbuffer_free(dev.pipe[1].host2device);
     printf(
         "{\"passed\":true,\"host_bytes\":%zu,\"capture_bytes\":%zu,\"overruns\":%llu,\"polls\":%u,"
-        "\"rx_rearmed\":%s,\"rx_starts\":%u,\"received_bytes\":%u,\"not_ready_events\":%u}\n",
+        "\"rx_rearmed\":%s,\"rx_starts\":%u,\"received_bytes\":%u,\"not_ready_events\":%u,"
+        "\"t8152_no_physical_uart_or_aic\":%s}\n",
         host_count, capture_count, (unsigned long long)vuart_tx_overruns, polls,
-        rx_rearmed ? "true" : "false", out_starts, received_bytes, not_ready_events);
+        rx_rearmed ? "true" : "false", out_starts, received_bytes, not_ready_events,
+        physical_ok ? "true" : "false");
 }

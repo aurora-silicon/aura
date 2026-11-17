@@ -1778,6 +1778,10 @@ class HV(Reloadable):
 
         zone = irange(base, 0x4000)
         irq = node.interrupts[0]
+        if self.windows and getattr(self, "windows_t8152", False):
+            # T8152: the guest's serial goes only to the USB CDC vUART; the resident must not
+            # clear uart0's interrupt status or drive its AIC line, so pass no interrupt.
+            irq = 0
         self.p.hv_map_vuart(base, irq, self.iodev)
         self.add_tracer(zone, "VUART", TraceMode.RESERVED)
 

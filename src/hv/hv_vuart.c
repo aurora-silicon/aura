@@ -3,6 +3,7 @@
 #include "hv.h"
 #include "aic.h"
 #include "iodev.h"
+#include "soc.h"
 #include "sptm_virt.h"
 #include "uart.h"
 #include "uart_regs.h"
@@ -19,6 +20,20 @@ u32 ufstat = 0;
 
 int vuart_irq = 0;
 #ifdef AURA_WINDOWS
+/*
+ * T8152 (J804) carrier: guest serial goes only to the USB CDC vUART interface
+ * (IODEV_USB_VUART) and, when enabled, the framed capture. The emulation never
+ * writes the physical uart0 or the AIC there: no uart0 interrupt line is kept
+ * (hv_map_vuart), so update_irq(), which runs on every trapped access and every
+ * poll tick, neither clears UTRSTAT on uart0 nor drives an AIC software line,
+ * and the HVLOG passthrough (a console printf, which reaches uart0) is off. Nothing
+ * shows uart0 is clocked when a guest runs on this route. The guest still reads
+ * the emulated UTRSTAT/UFSTAT and polls them.
+ */
+static bool vuart_physical_uart(void)
+{
+    return chip_id != T8152;
+}
 /* Rejected raw-CDC TX bytes when a guest ignores an attached full FIFO.
  * Independent from framed-capture loss accounting; inspect via the ELF symbol. */
 u64 vuart_tx_overruns;
@@ -154,7 +169,8 @@ static bool handle_vuart(struct exc_info *ctx, u64 addr, u64 *val, bool write, i
                     iodev_write(vuart_tx_mirror, &b, 1);
 #endif
 #ifdef AURA_WINDOWS
-                if (!hv_windows_serial_capture_enabled() && !hv_windows_serial_cdc_enabled())
+                if (!hv_windows_serial_capture_enabled() && !hv_windows_serial_cdc_enabled() &&
+                    vuart_physical_uart())
 #endif
                     handle_vuart_passthrough(b);
                 break;
@@ -218,6 +234,10 @@ void hv_map_vuart(u64 base, int irq, iodev_id_t iodev)
         printf("HV: VUART TX mirrored to iodev %d (RX reserved for proxy)\n", iodev);
     }
     vuart_irq = irq;
+#ifdef AURA_WINDOWS
+    if (!vuart_physical_uart())
+        vuart_irq = 0;
+#endif
     active = true;
 }
 

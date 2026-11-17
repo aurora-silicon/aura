@@ -84,6 +84,13 @@ FWB is clear, stage 2 and the SMC trap are on, `framebuffer=bgra-shadow` is sele
   that alias on T8152. A restore of the value the register already holds issues no write,
   because an `ACTLR_EL12` write is not yet measured. Capability bit 14 (0x4000) marks such a
   resident; the launcher requires it on T8152.
+- Guest serial (the vUART hook on uart0's first page) goes only to the USB CDC vUART
+  interface and, when enabled, the framed capture. On T8152 the emulation never writes the
+  physical uart0 or the AIC: the launcher passes no interrupt to `P_HV_MAP_VUART` and the
+  resident drops one if it is passed anyway, so no UTRSTAT clear on uart0 and no AIC software
+  line on any trapped access or poll tick, and the HVLOG console passthrough is off. Nothing
+  shows uart0 is clocked while a guest runs on the J804 route. The guest polls the emulated
+  UTRSTAT/UFSTAT. A resident from before this rule still gets no interrupt from the launcher.
 - IPIs: polling by default (1 kHz secondary tick drains queued guest IPIs and vSGIs).
   Apple Fast IPIs only with the launcher's `ipi: fast`, after Phase 3 measurement (c).
 - The software GIC CPU interface (as T8142) only with `gic_cpuif: software`, after (f).

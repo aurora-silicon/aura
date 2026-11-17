@@ -149,6 +149,7 @@ def main():
             result = run([binary, stream], snapshot, "replay-" + mode + ".log")
             observation = json.loads(result)
             assert observation["rx_rearmed"] is (not args.expect_unfixed)
+            assert observation["t8152_no_physical_uart_or_aic"] is True
             assert stream.read_bytes() == b"abcdefghijklmnz"
             report["engines"][mode] = {
                 "observations": observation,
