@@ -126,17 +126,20 @@ has ': Paired' "$BP" ||
     fail "this recoveryOS is not paired with $SYS. Make it the startup disk, then enter 1TR again."
 say "  ok  1TR, paired with $SYS"
 
+# With Kernel CTRR on, iBoot locks the CTRR ranges over the boot object on the
+# secondaries: a raw Stage 1 gets no usable secondary CPUs, and a secondary's
+# first store into aura's image faults under the SPTM-virt hypervisor
+# (docs/macho-boot-object.md). Both object types need it off.
+if has 'Kernel CTRR Status: *Enabled' "$BP"; then
+    fail "Kernel CTRR is enabled for this volume. Run 'bputil -nc -v $GROUP' first, then run this again."
+fi
+if has 'Kernel CTRR Status: *Disabled' "$BP"; then
+    say "  ok  Kernel CTRR is disabled"
+else
+    say "  note: bputil printed no Kernel CTRR status; check it in the log"
+fi
+
 if [ $RAW -eq 1 ]; then
-    # Enrolling a Mach-O object turns Kernel CTRR back on, and a raw Stage 1
-    # then boots with no usable secondary CPUs (docs/macho-boot-object.md).
-    if has 'Kernel CTRR Status: *Enabled' "$BP"; then
-        fail "Kernel CTRR is enabled for this volume. Run 'bputil -nc -v $GROUP' first, then run this again."
-    fi
-    if has 'Kernel CTRR Status: *Disabled' "$BP"; then
-        say "  ok  Kernel CTRR is disabled"
-    else
-        say "  note: bputil printed no Kernel CTRR status; check it in the log"
-    fi
     set -- kmutil configure-boot -c "$OBJ" --raw --entry-point 2048 --lowest-virtual-address 0 -v "$SYS"
 else
     props=$(kmutil inspect -z -B "$OBJ" --show-mach-boot-properties 2>&1)
