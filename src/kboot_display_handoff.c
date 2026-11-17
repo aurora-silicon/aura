@@ -3251,7 +3251,7 @@ static const struct {
     {V27_2, "3D6C8857-E6F1-3D2E-9DFF-587028AE0C6E", false},
     /* J775c (Mac Studio M5 Max) on 27.2 (26B123): its own DCP image, measured on that
      * machine; the image id is not shared across T6050 boards, so the rows pair with the
-     * image the ADT reports below */
+     * image the ADT reports below. The J775D's (M5 Ultra) dcpext engines run it too */
     {V27_2, "C51FB0C8-C45D-39B0-85BC-520E600FC950", true},
 };
 #define T6050_NDISP     5       /* disp0 reg[0..4] are the dcp's disp-0..disp-4 */
@@ -3324,6 +3324,23 @@ static T6050_TEXT u32 t6050_add_node(void *dt, const char *parent, const char *n
     return ph;
 }
 
+/*
+ * Picks the row of the running OS firmware and the image a nub reports: the internal DCP's, or on
+ * a board without a panel the engine the display subsystem scans out through. False if no row
+ * pairs the two.
+ */
+static T6050_TEXT bool t6050_pick_image(const char *uuid, u32 len)
+{
+    for (size_t i = 0; i < ARRAY_SIZE(t6050_images); i++)
+        if (os_firmware.version == t6050_images[i].os_fw && dcp6_is_uuid(uuid, len) &&
+            !strcmp(uuid, t6050_images[i].uuid)) {
+            t6050.uuid = t6050_images[i].uuid;
+            t6050.ext = t6050_images[i].ext;
+            return true;
+        }
+    return false;
+}
+
 /* The ADT side: firmware, VRAM and segments, bandwidth agent, clocks, panel */
 static T6050_INIT int t6050_check_adt(void)
 {
@@ -3332,14 +3349,7 @@ static T6050_INIT int t6050_check_adt(void)
     int disp0 = adt_path_offset(adt, "/arm-io/disp0");
     const char *uuid = nub < 0 ? NULL : adt_getprop(adt, nub, "uuid", &len);
 
-    for (size_t i = 0; i < ARRAY_SIZE(t6050_images); i++)
-        if (os_firmware.version == t6050_images[i].os_fw && len > 0 && uuid &&
-            dcp6_is_uuid(uuid, len) && !strcmp(uuid, t6050_images[i].uuid)) {
-            t6050.uuid = t6050_images[i].uuid;
-            t6050.ext = t6050_images[i].ext;
-            break;
-        }
-    if (!t6050.uuid)
+    if (!t6050_pick_image(uuid, len))
         bail("OS firmware %s with DCP image %s is not a known pair\n", os_firmware.string,
              dcp6_is_uuid(uuid, len) ? uuid : "(none)");
     if (dcp6_adt_u32(nub, "running", &val) || val != 1 || disp0 < 0 ||
@@ -3901,7 +3911,8 @@ static T6050_TEXT void t6050_handoff(void *dt)
  * transaction with the subsystem, and /vram, which holds the boot framebuffer, becomes their
  * "framebuffer". Only then is each other engine the device tree describes handed off, on its own
  * (die 1's dcpext4: the HDMI port). Each keeps the bandwidth scratch its node names, in its own
- * die's PMC metadata.
+ * die's PMC metadata. The table row is the one of this OS firmware and the image the scanout
+ * engine runs; every other engine handed off must run that image too.
  */
 static T6050_TEXT bool t6050_headless(void *dt)
 {
@@ -3910,18 +3921,12 @@ static T6050_TEXT bool t6050_headless(void *dt)
 
 #define T6050_ENGINES 8 /* dcpext0..7 */
 
-/* The image, the display subsystem and the engine it scans out through, /vram: that engine */
+/* The display subsystem, the engine it scans out through, that engine's image, /vram: the engine */
 static T6050_TEXT int t6050_headless_check(void *dt, u64 *vram, u64 *vram_size)
 {
     u32 len = 0;
     int engine = -1;
     char a[40];
-
-    for (size_t i = 0; i < ARRAY_SIZE(t6050_images); i++)
-        if (os_firmware.version == t6050_images[i].os_fw && t6050_images[i].ext)
-            t6050.uuid = t6050_images[i].uuid;
-    if (!t6050.uuid)
-        bail("OS firmware %s has no external engine image\n", os_firmware.string);
 
     int disp = fdt_node_offset_by_compatible(dt, -1, "apple,display-subsystem");
     const fdt32_t *io = disp < 0 ? NULL : fdt_getprop(dt, disp, "iommus", (int *)&len);
@@ -3945,9 +3950,9 @@ static T6050_TEXT int t6050_headless_check(void *dt, u64 *vram, u64 *vram_size)
     snprintf(a, sizeof(a), "/arm-io/dcpext%d/iop-dcpext%d-nub", engine, engine);
     int nub = adt_path_offset(adt, a);
     const char *uuid = nub < 0 ? NULL : adt_getprop(adt, nub, "uuid", &len);
-    if (!dcp6_is_uuid(uuid, len) || strcmp(uuid, t6050.uuid))
-        bail("dcpext%d image %s is not %s\n", engine, dcp6_is_uuid(uuid, len) ? uuid : "(none)",
-             t6050.uuid);
+    if (!t6050_pick_image(uuid, len) || !t6050.ext)
+        bail("OS firmware %s with dcpext%d image %s is not a known pair for external engines\n",
+             os_firmware.string, engine, dcp6_is_uuid(uuid, len) ? uuid : "(none)");
 
     u64 fb = cur_boot_args.video.base,
         fb_size = cur_boot_args.video.stride * cur_boot_args.video.height;
