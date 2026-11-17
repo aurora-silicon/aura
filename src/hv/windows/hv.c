@@ -483,7 +483,20 @@ int hv_init(void)
             msr(CNTHCTL_EL2, CNTHCTL_EL1PTEN | CNTHCTL_EL1PCTEN);
         }
 
-        hv_secondary_tick_interval = hv_tick_interval;
+        /*
+         * T8142 secondaries get the one-second liveness tick that every user
+         * of this interval assumes (HV_WFI_WAKE_RATE, the Fast-IPI retry and
+         * rendezvous comments, the tick-deadline design and its replay).
+         *
+         * Copying hv_tick_interval here captured HV_TICK_RATE, because
+         * hv_start() lowers only the primary to HV_SLOW_TICK_RATE afterwards.
+         * The first held guest WFI arms CNTHP on a secondary and every expiry
+         * re-arms it, so each non-boot CPU took a host FIQ every 200 us, busy
+         * or idle -- 5000 EL2 entries a second where the boot CPU took one.
+         * A held WFI still wakes within HV_WFI_WAKE_RATE.
+         */
+        hv_secondary_tick_interval =
+            chip_id == T8142 ? mrs(CNTFRQ_EL0) / HV_SLOW_TICK_RATE : hv_tick_interval;
     }
 
     hv_configure_guest_wfi_mode();
