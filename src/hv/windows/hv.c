@@ -323,8 +323,8 @@ int hv_windows_configure_ecpu(u64 state, u64 khz)
 /*
  * T8142 and T8152 both lack the architectural PMUv3 register bank.  An EL1 access is an
  * undefined instruction taken straight to EL1 (ESR_EL1 0x02000000): MDCR_EL2.TPM never sees
- * it.  Measured on T8152 in M3 run 1 (2026-11-16): bootmgr's ungated "mrs x9, PMCCNTR_EL0"
- * faulted that way with MDCR_EL2 0x60 set.  Everything that recovers those accesses keys on
+ * it.  Measured on T8152 in M3 run 1 (2026-11-16): bootmgr's "mrs x9, PMCCNTR_EL0" (0xd53b9d09)
+ * faulted that way (ESR_EL1 0x02000000) with MDCR_EL2 0x60 set.  Everything that recovers those accesses keys on
  * this, so the two chips cannot drift apart.
  */
 bool hv_absent_pmuv3(void)
@@ -1292,10 +1292,12 @@ static bool hv_windows_apply_ecpu(void)
  * exception_initialize() leaves it ENABLE|IMASK on every CPU, with CVAL long expired, so
  * ISTATUS is set.  T8152 has no VM_TMR_FIQ_ENA, so the carrier gates timers with the guest's
  * own IMASK (vm_tmr_fiq_set/clr), and hv_timer_firing() does not look at IMASK.  Mu never
- * programs CNTV (its TimerDxe is the physical timer), so in M3 run 1 every NTAIC completion
- * cleared IMASK and the next exit reflected the same expired CNTV again: ~126k loops a second
- * of EVENT abort + trapped CNTP_CTL read + SMC, ~380k exits/s, the core saturated at the Mu
- * shell.  With ENABLE clear the timer is never "firing" and nothing is reflected.  The
+ * programs CNTV (its TimerDxe is the physical timer).  M3 run 1 measured at the Mu shell
+ * ~126k/s each of SMC, data aborts, sysreg traps and timer reflections (~380k exits/s) with
+ * cntv=7.  The inferred loop: every NTAIC completion cleared IMASK and the next exit reflected
+ * the same expired CNTV again (EVENT abort + trapped CNTP_CTL read + SMC).  With ENABLE clear
+ * the timer is never "firing" and nothing is reflected; that this removes the loop is
+ * confirmed only when run 2's g6 samples show it.  The
  * architecture leaves CNTV_CTL.ENABLE UNKNOWN at reset, so no guest may rely on the old
  * value; a guest that wants the virtual timer programs it.  PSCI CPU_OFF already parks a
  * core with the same write (hv_psci.c).  T8142 keeps its old state.

@@ -4753,7 +4753,12 @@ static void hv_report_t8142_bugcheck(struct exc_info *ctx)
     static u32 stuck;
     static bool reported;
 
-    if (reported || !t8142_kernel_base)
+    /*
+     * KiBugCheckData's RVA and the EPROCESS offsets come from the one ntoskrnl
+     * build measured on T8142; nothing here checks the build, so on any other
+     * chip a nonzero word at that RVA would print a fabricated bugcheck.
+     */
+    if (chip_id != T8142 || reported || !t8142_kernel_base)
         return;
 
     if (ctx->elr != prev_pc) {

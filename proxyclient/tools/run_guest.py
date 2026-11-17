@@ -47,11 +47,11 @@ parser.add_argument('--windows-serial', choices=('cdc', 'disabled'), default='cd
                     help='T8152: guest vUART on the dedicated CDC interface (default) or off.')
 parser.add_argument('--windows-guest-compatibility', choices=('none', 't8152-pmu-undef'),
                     default='none',
-                    help='T8152: "t8152-pmu-undef" lets the resident recover EL1/EL0 PMUv3 '
-                         'accesses that UNDEF (bootmgr, winload, NT, drivers, smss) by '
-                         'redirecting the guest\'s sync vectors and replacing access sites '
-                         'with HVCs. Needed past bootmgr (M3 run 1). Mu\'s own forwarded '
-                         'accesses are serviced either way.')
+                    help='T8152: "t8152-pmu-undef" enables the T8142 recovery for EL1/EL0 '
+                         'PMUv3 accesses that UNDEF after Mu (redirecting the guest\'s sync '
+                         'vectors and replacing access sites with HVCs). Not yet run on '
+                         'T8152; coverage is not assured (see docs/windows-t8152.md). Mu\'s '
+                         'own forwarded accesses are serviced either way.')
 parser.add_argument('--windows-reset-on-exit', action='store_true',
                     help='T8152: when the guest asks for PSCI SYSTEM_RESET, shut NVMe down and '
                          'reset through WD1. Default: stay in the aura proxy.')

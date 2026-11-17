@@ -81,6 +81,10 @@ def test_build_specific_diagnostics_and_sp_el0_repair_stay_t8142():
         exc, "static void hv_report_t8142_current_process(struct exc_info *ctx)")
     assert "if (chip_id != T8142 || reported || !t8142_kernel_base)" in function_body(
         exc, "void hv_check_t8142_bugcheck(void)")
+    # The stuck-PC reporter in the wedge recovery reads the same build-specific RVA and
+    # EPROCESS offsets; the recovery itself runs on T8152, so the reporter needs its own gate.
+    assert "if (chip_id != T8142 || reported || !t8142_kernel_base)" in function_body(
+        exc, "static void hv_report_t8142_bugcheck(struct exc_info *ctx)")
     assert "hv_windows_guest_compat_enabled() && chip_id == T8142 && " \
            "hv_native_aic_mu_timer_active()" in exc
 

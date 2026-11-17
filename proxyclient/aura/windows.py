@@ -46,7 +46,7 @@ T8152_GIC_TRAPALL = 0x8000
 T8152_CPUS = 12
 CONFIG_T8142_EXPERIMENTAL = 0x0001
 # The same resident bit on T8152: the absent-PMUv3 UNDEF recovery only (M3 run 1: bootmgr's
-# ungated "mrs x9, PMCCNTR_EL0" UNDEFs at EL1 there exactly as on T8142).
+# "mrs x9, PMCCNTR_EL0" (0xd53b9d09) UNDEFed at EL1 there, ESR_EL1 0x02000000, as on T8142).
 CONFIG_GUEST_COMPAT = CONFIG_T8142_EXPERIMENTAL
 T8152_PMU_UNDEF = "t8152-pmu-undef"
 GUEST_COMPATIBILITY = ("none", "t8142-experimental", T8152_PMU_UNDEF)

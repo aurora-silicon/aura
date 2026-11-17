@@ -163,17 +163,18 @@ FWB is clear, stage 2 and the SMC trap are on, `framebuffer=bgra-shadow` is sele
   tick (`HV: vuart: TX full …`, `HV: vuart: TX has space again …`).
 - The guest's EL1 virtual timer is handed over disabled (`CNTV_CTL_EL0` = 0) on the boot CPU
   and on every CPU the guest starts (console: `HV: T8152: guest CNTV_CTL 0x7 -> 0 at entry`).
-  aura's own startup leaves it ENABLE|IMASK and long expired; with no Apple VM timer FIQ
-  gate the carrier gates timers with the guest IMASK, so each NTAIC completion unmasked a
-  CNTV that Mu never programs and the next exit reflected it again. M3 run 1 measured that
-  loop at ~126k/s (EVENT abort + trapped `CNTP_CTL` read + SMC, ~380k exits/s, the core
-  saturated at the Mu shell). `CNTV_CTL.ENABLE` is UNKNOWN at reset, so no guest may rely on
-  the old value.
+  aura's own startup leaves it ENABLE|IMASK and long expired. M3 run 1 measured, at the Mu
+  shell, ~126k/s each of `smc`, `da`, `sr` and `refl` (~380k exits/s) with `cntv=7`. The
+  inferred cause: with no Apple VM timer FIQ gate the carrier gates timers with the guest
+  IMASK, so each NTAIC completion unmasked a CNTV that Mu never programs and the next exit
+  reflected it again (EVENT abort + trapped `CNTP_CTL` read + SMC). That the quiesce removes
+  the loop is confirmed only when run 2's g6 samples show it. `CNTV_CTL.ENABLE` is UNKNOWN at
+  reset, so no guest may rely on the old value.
 - ECV is not used until measurement (e); the architectural PMU stays trapped to the
   synthetic EL2 backend.
 - There is no architectural PMUv3 bank, as on T8142: an EL1/EL0 PMU access UNDEFs at EL1
-  (`ESR_EL1` 0x02000000) before `MDCR_EL2.TPM` can trap it (M3 run 1: bootmgr's ungated
-  `mrs x9, PMCCNTR_EL0`). `hv_absent_pmuv3()` (T8142, T8152) opens the T8142 recovery:
+  (`ESR_EL1` 0x02000000) before `MDCR_EL2.TPM` can trap it (M3 run 1: bootmgr's
+  `mrs x9, PMCCNTR_EL0`, 0xd53b9d09, faulted with `ESR_EL1` 0x02000000 and `MDCR_EL2` 0x60). `hv_absent_pmuv3()` (T8142, T8152) opens the T8142 recovery:
   - always: Mu's forwarded `hvc #0` with x0 = "NTSRG" is answered from the software PMU
     (`PMCCNTR_EL0` = the 1 GHz counter, the control registers read 0 and drop writes);
     console once: `HV: T8152: handled forwarded EL1 sysreg instruction 0x… at EL2`;
@@ -181,8 +182,10 @@ FWB is clear, stage 2 and the SMC trap are on, `framebuffer=bgra-shadow` is sele
     --windows-guest-compatibility t8152-pmu-undef`, resident bit 0): the sync-vector
     redirect (`HVC #0x4d31`), the access-site replacement in kernel images, the module walk
     and the `b .` wedge recovery, as on T8142. On T8152 these read and write guest memory only
-    inside the guest RAM window. The NT build-specific diagnostics (process names,
-    `KiBugCheckData` on the tick) and the Mu SP_EL0 repair stay T8142-only.
+    inside the guest RAM window. The NT build-specific diagnostics (process names, the
+    `KiBugCheckData` bugcheck and dead-process reports, both on the tick and in the stuck-PC
+    path of the wedge recovery) and the Mu SP_EL0 repair stay T8142-only: their RVA and
+    `EPROCESS` offsets come from one T8142 ntoskrnl build and are not checked.
 - `usb_hpm_restore_irqs()` is skipped: nothing writes to the USB-C port controllers.
 - The vGIC carrier answers at 0xF00000000 / 0xF10000000 (Mu J873 PCDs) for live CPUs. As on
   T8142, the guest's first SPI enable turns on the AIC master enable (`hv_vgic.c`).
