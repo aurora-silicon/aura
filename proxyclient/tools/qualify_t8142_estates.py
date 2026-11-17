@@ -691,7 +691,9 @@ def plan_lines(report):
     accepts = [i for i, e in enumerate(events) if e["kind"] == "accept"]
     if not steps:
         return
-    first = steps[0] - 3  # read64 E, clear_result, then the step
+    # A step begins with its read of the E register, just before the step routine.
+    first = max(i for i in range(steps[0]) if events[i]["kind"] == "read64" and
+                events[i]["args"][0] == hex(E_CMD))
     yield "PLAN preflight/start/baseline (no frequency writes): " + compress(events[:first])
     if accepts:
         yield (f"PLAN per step (E{events[steps[0]]['state']}; every step identical): "
