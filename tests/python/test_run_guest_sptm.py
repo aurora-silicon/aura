@@ -80,3 +80,21 @@ def test_no_enter_can_return_without_reopening_stage1():
     source = (REPO / "proxyclient/tools/run_guest_sptm.py").read_text()
     assert 'if env_on("AURA_RETURN_AFTER_NO_ENTER")' in source
     assert 'p.reboot()' in source[source.index('if args.no_enter:'):]
+
+
+def test_j613_has_no_ctrr_stash_write():
+    runner = load_runner()
+    class Proxy:
+        def __init__(self):
+            self.writes = []
+        def read32(self, _pa):
+            return 0x11111111
+        def write32(self, pa, value):
+            self.writes.append((pa, value))
+        def call(self, *_args):
+            return 0
+    proxy = Proxy()
+    runner.patch_sptm(proxy, {"sptm_virt_flush": 0x10,
+                              "sptm_virt_ctrr_stash_off": 0x20}, 0x1000,
+                      {"patches": [], "mte": None, "ctrr_stash_off": None})
+    assert proxy.writes == []

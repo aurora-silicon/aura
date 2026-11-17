@@ -600,8 +600,11 @@ def patch_sptm(p, sym, entry, sp):
         print(f"{what}: [0x{pa:x}] 0x{before:08x} -> 0x{p.read32(pa):08x}")
     if sp["mte"]:
         rewrite_sptm_seq(p, sym, entry, sp["mte"])
-    p.write32(sym["sptm_virt_ctrr_stash_off"], sp["ctrr_stash_off"])
-    print(f"SPTM: CTRR stash +0x{sp['ctrr_stash_off']:x}")
+    if sp["ctrr_stash_off"] is not None:
+        p.write32(sym["sptm_virt_ctrr_stash_off"], sp["ctrr_stash_off"])
+        print(f"SPTM: CTRR stash +0x{sp['ctrr_stash_off']:x}")
+    else:
+        print("SPTM: native CTRR contract; no stash offset")
 
 
 def amcc_status(adt):
