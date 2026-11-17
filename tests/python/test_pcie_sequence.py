@@ -11,6 +11,8 @@ qualify the T8140 reset bit on hardware.
 from pathlib import Path
 import subprocess
 
+from host_compiler import host_cc
+
 
 def test_t8140_sequence(tmp_path):
     repo = Path(__file__).resolve().parents[2]
@@ -22,6 +24,7 @@ def test_t8140_sequence(tmp_path):
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 typedef uint8_t u8;
 typedef uint16_t u16;
@@ -32,6 +35,7 @@ typedef uint64_t u64;
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 #define FIELD_PREP(f, v) (((v) * ((f) & -(f))) & (f))
 #define T8140 0x8140
+#define T6050 0x6050
 #define ADT_GETPROP(a, n, p, v) adt_getprop_copy(a, n, p, v, sizeof(*(v)))
 static void *adt;
 static int chip_id = T8140;
@@ -103,7 +107,11 @@ static int tunables_validate_local(const char *path, const char *prop, u64 span)
     return 0;
 }
 static int pmgr_adt_power_enable(const char *path) { powered++; return 0; }
+/* T6050 hardware is outside this T8140/T8132 MMIO model. */
+static int pcie_t6050_init(void) { abort(); }
+static int pmgr_power_steps(int die, const char *name, bool on) { abort(); }
 static int pmgr_adt_power_disable_index(const char *path, int i) { assert(0); return -1; }
+static int pmgr_adt_power_disable_under(const char *path, const char *name) { assert(0); return -1; }
 static void access_mmio(u64 addr)
 {
     assert(powered);
@@ -116,6 +124,8 @@ static u32 read32(u64 addr)
 {
     access_mmio(addr);
     if (addr == PHY) return phy_ctrl;
+    /* RUN_EN and RUN_EN2: ANS runs on the PHY, as on every boot this models. */
+    if (addr == PHY + 4) return 0x11;
     if (addr == PORT_PHY) return port_ctrl;
     if (addr == PORT + 0x800) return appclk;
     return 0;
@@ -254,7 +264,7 @@ int main(void)
 '''
     binary = tmp_path / "pcie-sequence"
     subprocess.run(
-        ["cc", "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wno-unused-parameter",
+        [*host_cc(), "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wno-unused-parameter",
          "-x", "c", "-", "-o", str(binary)],
         input=harness, text=True, check=True,
     )

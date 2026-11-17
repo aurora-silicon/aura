@@ -36,7 +36,8 @@ VERSION_MAP = {
     "iBoot-8422.100.650": "V13_3",
     "iBoot-8422.140.50.0.2": "V13_5B4",
     "iBoot-8422.141.2": "V13_5",
-    "iBoot-10151.140.19.700.2": "V14_7"
+    "iBoot-10151.140.19.700.2": "V14_7",
+    "mBoot-20457.60.65.0.1": "V27_3B"
 }
 
 class ProxyUtils(Reloadable):
@@ -562,9 +563,14 @@ class GuardedHeap:
             self._free(ptr)
         self.ptrs = set()
 
+# How long bootstrap_port() waits for the first reply. Links that bridge the
+# console through USB (KIS/DockChannel via kisd) can take well over 150 ms to
+# answer the first request. Override with AURA_BOOTSTRAP_TIMEOUT (seconds).
+BOOTSTRAP_TIMEOUT = 3.0
+
 def bootstrap_port(iface, proxy):
     to = iface.dev.timeout
-    iface.dev.timeout = 0.15
+    iface.dev.timeout = float(os.environ.get("AURA_BOOTSTRAP_TIMEOUT", BOOTSTRAP_TIMEOUT))
     try:
         do_baud = proxy.iodev_whoami() == IODEV.UART
     except ProxyCommandError:

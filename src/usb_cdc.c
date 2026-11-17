@@ -18,7 +18,7 @@ static bool carrier_owned;
 
 static bool usb2_target(void)
 {
-    return (chip_id == T8142 || chip_id == T8152) && board_id == 0x24;
+    return ((chip_id == T8142 || chip_id == T8152) && board_id == 0x24) || usb_cdc_deferred_usb2();
 }
 
 static bool cdc_usb2_hpm(char *path, void *unused)
@@ -104,7 +104,8 @@ void usb_cdc_poll(void)
         if (tps6598x_foreach_hpm(cdc_usb2_hpm, cdc_usb2_route, NULL) != HPM_ACTION_STOP)
             goto usb2_failed;
         cdc.state = USB_CDC_DWC_READY;
-        printf("CDC USB2 ready; awaiting host, status=0x%x\n", usb_cdc_status());
+        printf("CDC USB2 controller ready; awaiting host enumeration, status=0x%x\n",
+               usb_cdc_status());
         return;
     usb2_failed:
         printf("CDC USB2 failed at step %u; allocations retained\n", cdc.step);

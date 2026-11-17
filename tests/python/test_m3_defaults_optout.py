@@ -12,6 +12,7 @@ update-m1n1 is available (M1N1_TEST_UPDATE_M1N1, or one on PATH), boot.bin comes
 with only its two fixed system paths moved into the test directory.
 """
 import gzip
+import importlib.util
 import os
 import shutil
 import subprocess
@@ -95,9 +96,16 @@ typedef uint64_t u64;
 #define ALIGN_UP(x, a) (((x) + (a) - 1) & ~((a) - 1))
 ''' + between(header, "struct kernel_header {", "void kboot_set_initrd(") + r'''
 enum { V26_6_2 = 1 };
-static struct { int version; } os_firmware = {V26_6_2};
+/* The release whose coprocessor firmware the OS iBoot loads (firmware.c) */
+static int firmware_os_components(void) { return V26_6_2; }
 #include "payload_profile.h"
 static int XzDecode(void *in, uint32_t *in_len, void *out, uint32_t *out_len) { return 0; }
+
+/* secboot.c: an unsigned image, nothing enforced (SECBOOT=off) */
+enum secboot_verdict { SECBOOT_MEASURED = 6 };
+static void secboot_measure(const char *c, const void *d, size_t s, enum secboot_verdict v) {}
+static int secboot_check_payloads(u8 *p, u8 **next) { *next = p; return 0; }
+static u8 *secboot_payload_next(u8 *p) { return p; }
 
 /* heapblock: one bump allocator */
 /* Aligned at run time: the macOS linker caps a section's alignment at 16 KiB, and the kernel
@@ -179,6 +187,7 @@ static void t6031_gpu_probe(void *d)
         function(gpu, "static int dt_set_gpu_t6031(void *dt)\n{") + r'''
 /* kboot's handoff: /chosen as dt_set_chosen() writes it, then what the GPU code would see */
 static void kboot_set_initrd(void *start, size_t size) {}
+static void kboot_request_hibernate_layout(bool on) { printf("HIB %d\n", on); }
 static int kboot_prepare_dt(void *fdt)
 {
     assert(!fdt_open_into(fdt, dt, sizeof(blob)));
@@ -214,7 +223,13 @@ static int kboot_prepare_dt(void *fdt)
     printf("SELECT %s\n", selected);
     return 0;
 }
-static int kboot_boot(void *kernel) { printf("RESULT booted=1\n"); return 0; }
+static bool nvme_keep_running_for_linux;
+static int kboot_boot(void *kernel)
+{
+    printf("NVME handoff keep=%d\n", nvme_keep_running_for_linux);
+    printf("RESULT booted=1\n");
+    return 0;
+}
 
 /* The rest of the machine payload_run() talks to */
 static const char *target_type;
@@ -230,13 +245,31 @@ static int mitigations_perform(void) { return 0; }
 static bool smp_is_alive(int cpu) { return false; }
 static int smp_call_sync0(int cpu, void (*fn)(void)) { return 0; }
 static void do_enable_tso(void) {}
-static bool nvme_shutdown(void) { return true; }
-static bool nvme_keep_running_for_linux;
-static bool nvme_adopt_live_session;
+/* Post-M4 ANS (M1N1_TEST_POST_M4): powered off by an earlier stage once nvme.sart= arrives */
+static bool nvme_sart_passed, nvme_started;
+static bool nvme_init(void)
+{
+    printf("NVME init\n");
+    nvme_started = true;
+    return !getenv("M1N1_TEST_NVME_INIT_FAIL");
+}
+static bool nvme_shutdown(void)
+{
+    printf("NVME shutdown keep=%d\n", nvme_keep_running_for_linux);
+    return true;
+}
+static bool nvme_set_sart_var(const char *v)
+{
+    nvme_sart_passed = true;
+    return true;
+}
+static bool nvme_post_m4_passed_off(void)
+{
+    return getenv("M1N1_TEST_POST_M4") && nvme_sart_passed && !nvme_started;
+}
 static int display_configure(const char *s) { printf("DISPLAY %s\n", s); return 0; }
 static int display_configure_second(const char *s) { printf("DISPLAY2 %s\n", s); return 0; }
 #define T8132 0x8132
-static bool nvme_init(void) { printf("NVME init\n"); return true; }
 static void mitigations_configure(const char *s) {}
 static int boot_storage_load(const char *spec, struct kernel_header **k, void **f) { return -1; }
 /* A stage 1 configured with its target (stage1_config.c), or not (NULL) */
@@ -722,6 +755,69 @@ def test_fourteen_owner_lines_overflow_stage_2_after_a_configured_stage_1(tools,
         graphics_off(b, board)
 
 
+# ---- a Mach-O Stage 1 enrolled without --raw ----
+#
+# tools/macho_boot_object.py puts __PRELINK_INFO, an XML plist, right after the raw image, and the
+# raw image ends at _payload_start (its last word is the stack canary). iBoot loads the pages at
+# their offsets, so Stage 1's payload scan starts on "<?xml version=". The ways this can fail:
+# - the scan reads the plist as config and hands stage 2 a loss for a complete config, so the
+#   M3 default boards drop all graphics (seen on a J613 under 1.0.0b5);
+# - the scan stops before config Stage 1 really has, so its lines never reach stage 2;
+# - a loss Stage 1 saw before the plist is no longer handed on.
+
+def boot_object_tail():
+    """What follows the raw image in the boot object macho_boot_object.wrap() makes"""
+    spec = importlib.util.spec_from_file_location("macho_boot_object",
+                                                  ROOT / "tools/macho_boot_object.py")
+    tool = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(tool)
+    raw = bytearray(4 * tool.PAGE)
+    raw[tool.LOAD_HEADER_OFFSET:tool.LOAD_HEADER_OFFSET + 8] = tool.LOAD_HEADER_MAGIC
+    raw[-8:] = b"STACKBOT"
+    tail = tool.wrap(bytes(raw))[tool.IMAGE_OFFSET + len(raw):]
+    assert tail.startswith(b"<?xml version=")
+    return tail
+
+
+def test_a_mach_o_stage_1_hands_over_a_complete_config_as_complete(tools):
+    forwarded = stage1(tools, boot_object_tail(), configured=True)
+    assert forwarded.splitlines(keepends=True)[1:] == [
+        b"chosen.asahi,efi-system-partition=ESP-UUID\n"]
+    b = boot(tools, "stage2", b"", trailer=forwarded)
+    booted(b)
+    assert set(AIR) <= b.armed and b.select == "g15-standin"
+
+
+def page_of_lines(config):
+    """config, then lines m1n1 does not know, up to the end of a 16 KiB page"""
+    pad = -len(config) % 0x4000
+    if pad and pad < 11:                     # the shortest line, "test.pad=x\n"
+        pad += 0x4000
+    while pad:
+        n = pad if pad <= 1000 else 1000 if pad - 1000 >= 11 else pad - 11
+        config += b"test.pad=" + b"x" * (n - 10) + b"\n"
+        pad -= n
+    return config
+
+
+@pytest.mark.parametrize("config,lost", [(GPU_ON + GPU_OFF, False),
+                                         (GPU_ON + b"junk\n" + GPU_OFF, True)],
+                         ids=["complete", "swallowed-line"])
+def test_a_mach_o_stage_1_reads_its_own_lines_up_to_the_plist(tools, config, lost):
+    """A raw Stage 1 can carry lines after its image. Ending on a page, the plist follows them."""
+    lines = page_of_lines(config)
+    assert len(lines) % 0x4000 == 0
+    forwarded = stage1(tools, lines + boot_object_tail(), configured=True)
+    assert forwarded.startswith(b"chosen.asahi,m1n1-stage1-version=host-test\n" + GPU_ON)
+    assert forwarded.count(LOST) == lost and forwarded.endswith(LOST) == lost
+    b = boot(tools, "stage2", b"", trailer=forwarded)
+    if lost:
+        graphics_off(b)
+    else:
+        booted(b)
+        assert b.chosen["asahi,t8122-gpu"] == "0" and b.select == "reservation-only"
+
+
 # ---- from /etc/m1n1.conf through update-m1n1 ----
 
 def updater():
@@ -830,3 +926,71 @@ def test_updater_read_loop_fix_keeps_a_last_line_without_newline(tools):
     b = run(tools, "stage2", image + forwarded)
     booted(b)
     assert b.chosen["asahi,t8122-gpu"] == "0"
+
+
+# ---- hib=: a line of stage 2's own asks kboot for the fixed hibernation layout ----
+
+def hib_requests(r):
+    return [line[4:] for line in r.stdout.splitlines() if line.startswith("HIB ")]
+
+
+@pytest.mark.parametrize("build", STAGE2)
+def test_hib_line_asks_for_the_layout_and_is_no_loss(tools, build):
+    b = boot(tools, build, b"hib=1\n")
+    booted(b)
+    assert hib_requests(b) == ["1"] and set(AIR) <= b.armed
+    b = boot(tools, build, b"hib=1\nhib=0\n")
+    booted(b)
+    assert hib_requests(b) == ["1", "0"]
+
+
+@pytest.mark.parametrize("build", STAGE2)
+def test_a_swallowed_hib_line_is_a_lost_line(tools, build):
+    b = boot(tools, build, GPU_ON + b"junk\nhib=1\n")
+    graphics_off(b)
+    assert not hib_requests(b)
+
+
+def test_stage1_does_not_hand_hib_on(tools):
+    assert b"hib=" not in stage1(tools, b"hib=1\n")
+
+
+# ---- post-M4 ANS: the embedded U-Boot adopts a running ANS and can't start one from off ----
+
+SART = b"nvme.sart=" + b"0" * 48 + b"\n"
+
+
+def nvme_events(r):
+    return [line[5:] for line in r.stdout.splitlines() if line.startswith("NVME ")]
+
+
+@pytest.mark.parametrize("build", STAGE2)
+def test_post_m4_ans_passed_off_is_started_for_the_payload(tools, build, monkeypatch):
+    monkeypatch.setenv("M1N1_TEST_POST_M4", "1")
+    b = boot(tools, build, b"", trailer=SART)
+    booted(b)
+    assert nvme_events(b) == ["init", "handoff keep=1"], b.stdout
+
+
+@pytest.mark.parametrize("build", STAGE2)
+def test_post_m4_ans_start_failure_stops_the_handoff(tools, build, monkeypatch):
+    monkeypatch.setenv("M1N1_TEST_POST_M4", "1")
+    monkeypatch.setenv("M1N1_TEST_NVME_INIT_FAIL", "1")
+    b = boot(tools, build, b"", trailer=SART)
+    assert b.rc == -1 and not b.booted, b.stdout
+    assert nvme_events(b)[0] == "init" and "handoff keep=1" not in nvme_events(b)
+
+
+@pytest.mark.parametrize("build", STAGE2)
+def test_ans_left_as_found_without_sart_entries(tools, build, monkeypatch):
+    monkeypatch.setenv("M1N1_TEST_POST_M4", "1")
+    b = boot(tools, build, b"")
+    booted(b)
+    assert nvme_events(b) == ["shutdown keep=0", "handoff keep=0"], b.stdout
+
+
+@pytest.mark.parametrize("build", STAGE2)
+def test_pre_m4_ignores_sart_entries(tools, build):
+    b = boot(tools, build, b"", trailer=SART)
+    booted(b)
+    assert nvme_events(b) == ["shutdown keep=0", "handoff keep=0"], b.stdout

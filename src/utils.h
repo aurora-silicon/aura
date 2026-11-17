@@ -500,6 +500,17 @@ enum cpufeat_uncore_version {
     UNCORE_V2,
 };
 
+/*
+ * What init_cpu writes to SIQ_CFG_EL1, whose route field says whether the AIC delivers IRQs to this
+ * CPU (3: none). One byte, where the proxy CPU features ABI has a bool: nonzero still means "writes
+ * SIQ_CFG".
+ */
+enum cpufeat_siq_cfg {
+    SIQ_CFG_KEEP = 0,    // no write
+    SIQ_CFG_ROUTE_2 = 1, // route 2 (M1-M3)
+    SIQ_CFG_ROUTE_0 = 2, // route 0, as the native OS's kernel writes on M5
+};
+
 /* The proxy reads this layout (proxyclient/aura/proxy.py CPUFeatures). */
 struct midr_part_features {
     enum cpufeat_sleep_mode sleep_mode;
@@ -518,7 +529,7 @@ struct midr_part_features {
     bool nex_powergating;
     bool fast_ipi;
     bool mmu_sprr;
-    bool siq_cfg;
+    u8 siq_cfg; // enum cpufeat_siq_cfg
     bool amx;
     bool actlr_el2;
     bool counter_redirect;

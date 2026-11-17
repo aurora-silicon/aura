@@ -899,7 +899,7 @@ pub unsafe extern "C" fn adt_setprop(
     offset: c_int,
     name: *const c_char,
     val: *const c_void,
-    len: *const c_size_t,
+    len: c_size_t,
 ) -> c_int {
     let buf: &[u8];
     let strname: &str;

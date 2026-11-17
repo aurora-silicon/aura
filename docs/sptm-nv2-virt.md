@@ -58,6 +58,8 @@ the NVRAM writes. What differs from the J700:
   `security.mac.img4.ignition_blob` sysctl. The guest does write NVRAM: about 27 s in, while APFS
   mounts the volumes, AppleARMNORNVRAM sends the NOR a write enable, which `nvram_ro` turns into a
   success that writes nothing.
+  This quirk patches that write routine only; it does not patch `eraseBank`, which the tested
+  configuration did not reach. It does not establish read-only NOR behavior for other paths.
 - The secondaries' window holds here too: each cluster's `ACC_CTXR_D` is locked over the boot
   object, and a secondary started at code outside it powers up but never reports in, so aura stays at
   stage 1's base.

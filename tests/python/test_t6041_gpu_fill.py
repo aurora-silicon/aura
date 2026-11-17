@@ -9,6 +9,8 @@ published when it refuses. The fill never touches the GPU, so no register access
 from pathlib import Path
 import subprocess
 
+from host_compiler import host_cc
+
 ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -330,8 +332,9 @@ def test_t6041_gpu_fill(tmp_path):
     opps = t6040[t6040.index("#define T6040_OPPS"):].split("\n", 1)[0] + "\n"
     regions = t6040[t6040.index("static const struct {\n    const char *name;"):]
     regions = regions[:regions.index("};\n") + 3]
-    start = source.index("/*\n * T6041 (M4 Max).")
-    t6041 = source[start:source.index("int dt_set_gpu(void *dt)", start)]
+    clusters = next(line for line in source.splitlines()
+                    if line.startswith("#define T6041_CLUSTERS ")) + "\n"
+    t6041 = clusters + function(source, "static int dt_set_gpu_t6041(")
     bail = '#define bail(...) do { printf(__VA_ARGS__); return -1; } while (0)\n'
     code = (HARNESS + bail + defs + ADT + opps + function(source, "static int dt_set_resvmem(") +
             function(source, "static int fdt_set_aux_opp(") +
@@ -344,7 +347,7 @@ def test_t6041_gpu_fill(tmp_path):
         "fdt_strerror.c",
     )]
     binary = tmp_path / "t6041-gpu-fill"
-    subprocess.run(["cc", "-D_GNU_SOURCE", "-std=gnu11", "-Wall", "-Wextra", "-Werror",
+    subprocess.run([*host_cc(), "-D_GNU_SOURCE", "-std=gnu11", "-Wall", "-Wextra", "-Werror",
                     "-Wno-unused-function", "-Wno-unused-parameter", "-I", str(libfdt),
                     str(cfile), *sources, "-o", str(binary)], check=True)
     result = subprocess.run([str(binary)], capture_output=True, text=True)

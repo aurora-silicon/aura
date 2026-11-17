@@ -10,7 +10,14 @@ def test_poisoned_session_refuses_io_before_buffer_changes(tmp_path):
     root = Path(__file__).resolve().parents[2]
     source = Path(os.environ.get("NVME_SOURCE", root / "src/nvme.c")).read_text()
     declarations = source[source.index("#define NVME_TIMEOUT"):source.index("static u64 nvme_read64_lo_hi")]
-    execute = source[source.index("static bool nvme_exec_command("):source.index("bool nvme_init(void)")]
+    # Clang can diagnose the write-path flag when shutdown is outside this host fragment.
+    declarations = declarations.replace("static bool nvme_wrote;",
+                                        "static bool nvme_wrote __attribute__((unused));")
+    execute = source[source.index("static bool nvme_exec_command("):
+                     source.index("/* The ADT describes a post-M4 ANS")]
+    # The ANS power helpers between these fragments need physical firmware state.
+    execute += source[source.index("/* A write or flush, timed:"):
+                      source.index("bool nvme_init(void)")]
     read = source[source.index("bool nvme_flush("):]
     read_limit = next(line for line in (root / "src/nvme.h").read_text().splitlines()
                       if line.startswith("#define NVME_MAX_READ_BLOCKS "))
@@ -24,6 +31,7 @@ def test_poisoned_session_refuses_io_before_buffer_changes(tmp_path):
 #include <string.h>
 typedef uint8_t u8; typedef uint16_t u16; typedef uint32_t u32; typedef uint64_t u64;
 typedef int asc_dev_t; typedef int rtkit_dev_t; typedef int sart_dev_t;
+struct sart_entry { u8 index, flags; u64 paddr, size; };
 #define static_assert _Static_assert
 #define BIT(n) (1ULL << (n))
 #define GENMASK(h,l) (((~0ULL) >> (63-(h))) & ((~0ULL) << (l)))
@@ -38,6 +46,8 @@ static void write32(u64 reg, u32 val) { assert(!"unexpected MMIO write"); }
 static u32 read32(u64 reg) { assert(!"unexpected MMIO read"); return 0; }
 static void dma_wmb(void) { assert(!"unexpected queue publication"); }
 static void dma_rmb(void) { assert(!"unexpected queue access"); }
+static u64 get_ticks(void) { return 0; }
+static u64 ticks_to_usecs(u64 ticks) { return ticks; }
 static void *memalign(size_t align, size_t size) { assert(!"unexpected DMA allocation"); return NULL; }
 ''' + execute + read + r'''
 int main(void)

@@ -21,8 +21,8 @@ SOURCE = Path(os.environ.get("DART_DISPLAY_SOURCE", Path(__file__).resolve().par
 def test_inherited_reservation(tmp_path):
     text = (SOURCE / "src/kboot.c").read_text()
     start = text.index("    u64 image_end = (u64)_end;", text.index("int kboot_prepare_dt("))
-    # The T8140 block may also cover other chips ("if (chip_id == T8140 ||").
-    end = text.index("    if (chip_id == T8140", start)
+    # Followed by the post-M4 retained-heap block.
+    end = text.index("    if (nvme_post_m4())", start)
     block = text[start:end]
     call = re.search(
         r"    if \(dt_reserve_outside_exec_window\(\(u64\)_base, image_end - \(u64\)_base\)\)\n"

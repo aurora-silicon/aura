@@ -252,9 +252,6 @@ int mcc_enable_cache(void)
 
 int mcc_unmap_carveouts(void)
 {
-    if (!mcc_initialized)
-        return -1;
-
     mcc_carveout_count = 0;
     memset(mcc_carveouts, 0, sizeof mcc_carveouts);
 
@@ -263,7 +260,10 @@ int mcc_unmap_carveouts(void)
     // region-id-2 and region-id-4 on a booted macos, in the /chosen/carveout-memory-map DT node.
     // This can be used along with dumping the mcc reg space to find the correct start/end/enable
     // above.
-    if (!mcc_regs[0].tz || !mcc_regs[0].tz->count) {
+    // The ADT list does not need the MCC driver, so use it whenever the TZ registers are unknown,
+    // including when the MCC is unsupported (T6050): returning early there left the TZ carveouts
+    // mapped as normal memory.
+    if (!mcc_initialized || !mcc_regs[0].tz || !mcc_regs[0].tz->count) {
         static const char *const names[] = {"region-id-4", "region-id-2"};
         int node = adt_path_offset(adt, "/chosen/carveout-memory-map");
 

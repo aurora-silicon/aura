@@ -7,7 +7,7 @@
  * AUS5 PHY power-up, root complex, N1 reset, port reset, refclk buffer,
  * PERST, root complex init and LTSSM.
  *
- * ADT /arm-io/apcie reg map (AppleT8142PCIe::start): 0 config (ECAM),
+ * ADT /arm-io/apcie reg map: 0 config (ECAM),
  * 1 APCIe common (RC), 2 PHY (common block at +0x4000), 3 PHY-PHY, 4 PHY IP,
  * 5 AXI2AF, 8.. port 0 (8 config, 10 PHY glue).
  */
@@ -105,7 +105,7 @@ static int j813_n1_link(void)
         j813_wait(phycommon, BIT(31), BIT(31), 1000000, "refpll_clk_good"))
         return -1;
 
-    /* AppleT8142PCIe::_initializeGen4Phy */
+    /* Gen4 PHY: power the PHY-PHY block up and wait for it to leave sleep */
     set32(phyphy, BIT(0));
     if (j813_wait(phyphy, BIT(2), BIT(2), 1000000, "sleep_b_sml_out"))
         return -1;

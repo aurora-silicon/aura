@@ -34,9 +34,14 @@ static volatile int exc_guard, exc_count;
 static volatile u64 exc_last_esr;
 /* Set per case to model each chip; the probe must not read it. */
 static int chip_id __attribute__((unused));
-static int boot_cpu_idx, alive_mask, probe_faults, call_fails, calls, printed, reads, reads_fault;
+static int boot_cpu_idx, alive_mask, probe_faults, call_fails, reads_fault;
+/* Shared observations: each scenario uses only the counters relevant to its path. */
+static int calls __attribute__((unused)), printed __attribute__((unused)), reads __attribute__((unused));
 static int at_el1;
 static bool in_el2(void) { return !at_el1; }
+/* Window layout validation has its own production-code fixture in test_ctxr_exec_window.py. */
+static const char *window_problem = "no executable window in this probe fixture";
+static const char *ctxr_exec_problem(void) { return window_problem; }
 static const char *last_format;
 #define SZ_4K 4096
 static u64 SYS_IMP_APL_CTXR_D_LWR_EL1, SYS_IMP_APL_CTXR_D_UPR_EL1, SYS_IMP_APL_CTXR_A_LWR_EL1,
@@ -56,13 +61,13 @@ static void sysop_stub(void) {}
 static bool smp_is_alive(int cpu) { return alive_mask & (1 << cpu); }
 static void *memalign(size_t a, size_t s) { return aligned_alloc(a, s); }
 static void dc_cvau_range(void *p, size_t s) {}
-static int panel;
+static int panel __attribute__((unused));
 static void fb_set_active(bool active) { panel = active; }
 static void ic_ivau_range(void *p, size_t s) {}
 #define SMP_TIMEOUT -2
 static u64 result;
 /* call_fails: -1 the call was never sent, SMP_TIMEOUT it was not acknowledged. */
-static int wait_times_out, last_timeout_ms;
+static int wait_times_out, last_timeout_ms __attribute__((unused));
 static int smp_call1(int cpu, void *fn, u64 arg) {
     calls++;
     assert(cpu != boot_cpu_idx && smp_is_alive(cpu));
@@ -113,9 +118,9 @@ int main(void) {
     chip_id = T8112; alive_mask = 0x2; probe_faults = 0; calls = 0; printed = 0; call_fails = -1;
     assert(ctxr_exec_confined() == 0 && calls == 1 && printed == 1 && probe_stuck_cpu < 0);
     assert(exc_guard == GUARD_OFF);
-    /* No secondary to ask: not confined, and the log says what CTXR_D reads. */
+    /* No secondary: admission checks CTXR_D, then the warning reads it again. */
     SYS_IMP_APL_CTXR_D_LWR_EL1 = 0; SYS_IMP_APL_CTXR_D_UPR_EL1 = 0;
-    assert(run(T8112, 0x1, 0) == 0 && calls == 0 && printed == 1 && reads == 2);
+    assert(run(T8112, 0x1, 0) == 0 && calls == 0 && printed == 1 && reads == 4);
     assert(strstr(last_format, "not armed"));
     /* An M1 to M3 has no such registers: the read faults under the guard. */
     reads_fault = 1;
@@ -127,6 +132,11 @@ int main(void) {
     assert(run(T6040, 0x1, 1) == 0 && calls == 0 && printed == 1);
     assert(strstr(last_format, "WARNING") && strstr(last_format, "armed"));
     assert(exc_guard == GUARD_OFF);
+    /* With an admitted executable window, an armed reset core is confined without a probe. */
+    window_problem = NULL;
+    assert(run(T6040, 0x1, 1) == 1 && calls == 0 && printed == 1);
+    assert(exc_guard == GUARD_OFF);
+    window_problem = "no executable window in this probe fixture";
     /* A guest under the hypervisor does not touch them, and has nothing armed to report. */
     at_el1 = 1;
     assert(run(T6040, 0x1, 1) == 0 && calls == 0 && printed == 1 && !reads);
@@ -150,6 +160,7 @@ int main(void) {
     assert(calls == 1 && printed == 2);
     alive_mask = 0x1; probe_faults = 0;
     assert(ctxr_exec_confined() && calls == 1);
+    assert(probe_stuck_cpu < 0);
     puts("ctxr exec probe cache OK");
     return 0;
 }
@@ -208,6 +219,7 @@ int main(void) {
     /* At EL1 nothing is read. */
     at_el1 = 1; reads = 0;
     assert(!ctxr_range(CTXR_RANGE_A, &s, &e) && !reads);
+    assert(probe_stuck_cpu < 0);
     puts("ctxr range OK");
     return 0;
 }

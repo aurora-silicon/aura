@@ -59,6 +59,9 @@ jobs:
         run: |
           brew install llvm lld
 
+      - name: Test PMP boot data fixups
+        run: sh tests/run-pmp-boot-data.sh
+
       - name: Run pytest with clang
         if: matrix.os == 'ubuntu-latest' && matrix.compiler == 'llvm'
         env:
@@ -68,6 +71,12 @@ jobs:
       - name: Run pytest without clang
         if: matrix.compiler != 'llvm'
         run: pytest tests/python tests/test_t8122_gpu_reader.py tests/test_t8122_gpu_resources.py
+
+      - name: Run T8122 GPU26 powered identity host test
+        if: matrix.os == 'ubuntu-latest'
+        env:
+          CC: ${{ matrix.compiler == 'llvm' && 'clang' || 'gcc' }}
+        run: tests/run-t8122-gpu26-identity.sh
 
   arm64-native:
     name: Pytest (ubuntu-24.04-arm, native start.S)

@@ -22,23 +22,46 @@ SECTIONS {
         *(.init)
         *(.init.*)
         /*
-         * Large code that only runs when aura hosts a guest, in this mostly empty slot. In .text
-         * it pushes .text past its next 64 KiB step, and .data past _file_limit.
+         * Code that only runs when aura hosts a guest, or once per boot. .text follows .init
+         * directly, so where an object goes no longer changes the room left; these stay here to
+         * keep the order of the code.
          */
         *hv/hv_vm.o(.text .text.*)
-        *hv/hv_sprr.o(.text .text.*)
+        *hv/hv_virtio.o(.text .text.*)
+        *hv/hv_vuart.o(.text .text.*)
+        *hv/hv_wdt.o(.text .text.*)
+        /* Run-once OS preparation. */
+        *kboot.o(.text .text.*)
+        /*
+         * The Ed25519 verifier's curve and field code (run once per boot). Its SHA-512 and
+         * secboot.c are in .text.
+         */
+        *librust.a:*ed25519_compact*(.text.*15ed25519_compact12edwards25519*)
+        *librust.a:*ed25519_compact*(.text.*15ed25519_compact10field25519*)
+        *librust.a:*ed25519_compact*(.text.*15ed25519_compact7ed25519*)
+        _init_content_end = .; /* tools/stage1_room.py */
     } :text
-    .text : ALIGN(0x10000) {
+    /*
+     * No 64 KiB step between .init and .text: both are in the one read-execute segment, which
+     * still starts and ends on 64 KiB (_text_size). A step here left up to 64 KiB of .init
+     * unused, and code had to be moved between the two slots by hand to fit.
+     */
+    .text : {
+        _text_content_start = .;
         *(EXCLUDE_FILE(*sptm_virt*.o) .text .text.*)
+        /* The largest guest-only object; the others are in .rodata, so both fill their steps. */
+        *sptm_virt_s2r.o(.text .text.*)
         . = ALIGN(8);
         *(.got.plt)
+        _text_content_end = .;
         . = ALIGN(0x10000);
     } :text
     _text_size = . - _text_start;
     .rodata : ALIGN(0x10000) {
         /* Guest-only code uses the existing executable read-only region. */
         *sptm_virt*.o(.text .text.*)
-        *(.rodata)
+        /* The compressed logos are .rodata (Makefile), but they go with the pixel data below. */
+        *(EXCLUDE_FILE(*_48.o *_128.o *_256.o) .rodata)
         *(.rodata.*)
         . = ALIGN(8);
     } :rodata
@@ -60,6 +83,7 @@ SECTIONS {
         /* The load header's footprint (start.S) leaves an R_AARCH64_NONE here; keep it inside the
          * padding and out of the range apply_rela() walks, which only accepts relative entries. */
         *(.rela.init)
+        _rodata_content_end = .;
         . = ALIGN(0x10000);
     } :rodata
     _rodata_end = .;
@@ -83,9 +107,9 @@ SECTIONS {
         _file_vital_end = .;
         *font.o(.data)
         *font_retina.o(.data)
-        *_48.o(.data)
-        *_128.o(.data)
-        *_256.o(.data)
+        *_48.o(.data .rodata)
+        *_128.o(.data .rodata)
+        *_256.o(.data .rodata)
         . = ALIGN(0x10000);
         _file_end = .;
     } :data

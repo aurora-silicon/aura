@@ -94,6 +94,12 @@ else
 CARGO_FLAGS :=
 endif
 
+# Bring-up: skip MMU, MCC, AIC, SMP, PMGR, display and USB init and go
+# straight to the proxy on the boot console.
+ifeq ($(BRINGUP),1)
+CFG += BRINGUP
+endif
+
 ifeq ($(CHAINLOADING),1)
 CFG += CHAINLOADING
 CARGO_FLAGS += --features chainload
@@ -107,6 +113,28 @@ ifneq ($(CHAINLOADING),1)
 $(error ESP_STAGE2 requires CHAINLOADING=1 for boot=)
 endif
 CFG += ESP_STAGE2
+endif
+
+# Signed payloads (docs/secure-boot.md): SECBOOT=audit checks and records, SECBOOT=enforce also
+# refuses anything unverified. SECBOOT_PUBKEY is the raw 32-byte Ed25519 key built in; the
+# default is the published TEST key, which proves nothing.
+ifneq ($(filter audit enforce,$(SECBOOT)),)
+CFG += SECBOOT_$(shell echo $(SECBOOT) | tr a-z A-Z)
+endif
+SECBOOT_PUBKEY ?= data/secboot/test-ed25519.pub
+# SECBOOT_FLAVOUR=dev (default) keeps the USB host windows a lab needs (recovery window, aura-proxy,
+# DebugUSB) unless the stage enforces; SECBOOT_FLAVOUR=secure never opens one and needs SECBOOT.
+SECBOOT_FLAVOUR ?= dev
+ifeq ($(SECBOOT_FLAVOUR),secure)
+ifeq ($(filter audit enforce,$(SECBOOT)),)
+$(error SECBOOT_FLAVOUR=secure needs SECBOOT=audit or SECBOOT=enforce)
+endif
+ifeq ($(DEBUGUSB_PROXY),1)
+$(error SECBOOT_FLAVOUR=secure cannot have DEBUGUSB_PROXY=1)
+endif
+CFG += SECBOOT_SECURE_FLAVOUR
+else ifneq ($(SECBOOT_FLAVOUR),dev)
+$(error SECBOOT_FLAVOUR must be dev or secure)
 endif
 
 # Development builds only: a boot started by a VDM `reboot debugusb` with a host reading the
@@ -131,6 +159,15 @@ CFG += NV2_TRACE_PRINT
 endif
 endif
 
+# Development builds only: the SPTM-virt guest's kernel controls aura's stage-2 MMIO trace
+# through an HVC (src/sptm_virt_ctl.c, src/auractl_abi.h, docs/auractl.md). Never in Stage 1.
+ifeq ($(AURACTL),1)
+ifneq ($(SPTM_VIRT),1)
+$(error AURACTL requires SPTM_VIRT=1)
+endif
+CFG += AURACTL
+endif
+
 
 # Trace builds only: an ESP Stage 2 that boots macOS under SPTM-virt from files on the ESP (the
 # macos= line, src/sptm_virt_esp.c, tools/esp-macos) instead of a Linux boot= or chainload=.
@@ -139,6 +176,7 @@ ifneq ($(ESP_STAGE2)$(SPTM_VIRT),11)
 $(error SPTM_VIRT_ESP requires ESP_STAGE2=1 and SPTM_VIRT=1)
 endif
 CFG += SPTM_VIRT_ESP
+CARGO_FLAGS += --features sptm_virt_esp
 endif
 
 LDFLAGS := -EL -maarch64elf --no-undefined -X -Bsymbolic \
@@ -205,6 +243,7 @@ OBJECTS := \
 	dart.o \
 	dcp.o \
 	dcp_iboot.o \
+	debugport.o \
 	devicetree.o \
 	display.o \
 	dockchannel_uart.o \
@@ -218,7 +257,7 @@ OBJECTS := \
 	iova.o \
 	isp.o \
 	j873.o \
-	kboot.o kboot_atc.o kboot_audio.o kboot_gpu_t8122.o kboot_gpu_t8122_power.o kboot_pmp_t8122.o \
+	kboot.o kboot_atc.o kboot_audio.o kboot_mte.o kboot_gpu_t8122.o kboot_gpu_t8122_power.o kboot_pmp_t8122.o \
 	kboot_t6020_compat.o \
 	kboot_display_handoff.o kboot_display_facts.o kboot_gpu26.o kboot_gpu_t6031.o kboot_t6031.o \
 	main.o boot_options.o \
@@ -227,12 +266,13 @@ OBJECTS := \
 	memory.o memory_asm.o \
 	nvme.o \
 	payload.o \
-	j813_n1.o pcie.o pcie_fdt.o \
+	j813_n1.o pcie.o pcie_fdt.o pcie_t6050.o \
 	pmgr.o \
 	proxy.o \
 	ringbuffer.o \
 	rtkit.o \
 	sart.o \
+	secboot.o \
 	sep.o \
 	stage1_config.o \
 	stage1_proxy.o \
@@ -248,7 +288,7 @@ OBJECTS := \
 	tps6598x.o tps6598x_command_core.o \
 	uart.o \
 	uartproxy.o \
-	usb.o usb_t8152.o usb_dwc3.o usb_dwc3_hs.o usb_dwc3_ss.o usb_cdc.o usb_cdc_atc.o usb_cdc_bulk.o usb_cdc_ss_desc.o usb_cdc_state.o \
+	usb.o usb_t8152.o usb_dwc3.o usb_dwc3_hs.o usb_dwc3_ss.o usb_dwc3_retain.o usb_cdc.o usb_cdc_atc.o usb_cdc_bulk.o usb_cdc_ss_desc.o usb_cdc_state.o \
 	utils.o utils_asm.o \
 	vsprintf.o \
 	wdt.o \
@@ -259,6 +299,9 @@ OBJECTS := \
 
 ifeq ($(SPTM_VIRT),1)
 OBJECTS += nv2.o nv2_asm.o sptm_virt.o sptm_virt_cl4.o sptm_virt_gl.o sptm_virt_s2.o sptm_virt_s2r.o sptm_virt_s2r_soc.o sptm_virt_gpu.o s2r_dcp_pkt.o
+endif
+ifeq ($(AURACTL),1)
+OBJECTS += sptm_virt_ctl.o
 endif
 ifeq ($(SPTM_VIRT_ESP),1)
 OBJECTS += sptm_virt_esp.o sptm_virt_esp_plan.o sha256.o
@@ -316,6 +359,15 @@ $(BUILD_FP_OBJS): build/%.o: src/%.c
 	$(QUIET)mkdir -p "$(dir $@)"
 	$(QUIET)$(CC) -c $(BASE_CFLAGS) -MMD -MF $(DEPDIR)/$(*F).d -MQ "$@" -MP -o $@ $<
 
+# Size matters more than speed in these, for the 64 KiB steps below _file_limit (aura-raw.ld).
+# The virtualized SPTM's objects, a development tool, share the read-only segment with .rodata.
+build/sptm_virt.o: CFLAGS += -Oz
+build/sptm_virt_%.o: CFLAGS += -Oz
+# Run-once OS handoff code. kboot_gpu.o, kboot_gpu_t8152.o and kboot_gpu_m4.o use BASE_CFLAGS.
+build/kboot.o: CFLAGS += -Oz
+build/kboot_%.o: CFLAGS += -Oz
+build/kboot_%.o: BASE_CFLAGS += -Oz
+
 build/%.o: src/%.c build-tag build-cfg
 	$(QUIET)echo "  CC    $@"
 	$(QUIET)mkdir -p $(DEPDIR)
@@ -367,14 +419,18 @@ build-tag src/../build/build_tag.h &:
 
 build-cfg src/../build/build_cfg.h &:
 	$(QUIET)mkdir -p build
+	$(QUIET)python3 tools/secboot_sign.py c-header $(SECBOOT_PUBKEY) > build/secboot_key.tmp
+	$(QUIET)cmp -s build/secboot_key.h build/secboot_key.tmp 2>/dev/null || \
+	( mv -f build/secboot_key.tmp build/secboot_key.h && echo "  KEY   build/secboot_key.h" )
 	$(QUIET)for i in $(CFG); do echo "#define $$i"; done > build/build_cfg.tmp
 	$(QUIET)echo "#define BUILTIN_LOGO $(BUILTIN_LOGO)" >> build/build_cfg.tmp
 	$(QUIET)cmp -s build/build_cfg.h build/build_cfg.tmp 2>/dev/null || \
 	( mv -f build/build_cfg.tmp build/build_cfg.h && echo "  CFG   build/build_cfg.h" )
 
 # The built-in boot logos are linked gzip-compressed; fb.c inflates them on first use.
-# They are only read, so they go in .rodata: its 64 KiB alignment padding has room for them,
-# while .data counts towards the file part limit in aura-raw.ld.
+# They are only read, so they go in .rodata. aura-raw.ld links them with the fonts past
+# _file_vital_end instead, where the DCP log buffer may overwrite them: fb.c then finds a bad gzip
+# CRC and leaves the logo blank.
 LOGO_OBJCOPY_FLAGS := --rename-section .data=.rodata,alloc,load,readonly,data,contents
 build/$(BUILTIN_LOGO)_%.bin.gz: $(LOGO_DIR)/$(BUILTIN_LOGO)_%.bin
 	$(QUIET)echo "  GZIP  $@"

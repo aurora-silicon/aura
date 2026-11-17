@@ -54,8 +54,11 @@ Upload and read back every byte, comparing SHA-256 hashes before handoff.
 Set `/chosen/bootargs` to:
 
 ```
-earlycon=dockchannel,0x38812c000 console=tty0 console=ttyDC0 keep_bootcon maxcpus=1 nokaslr rdinit=/init panic=0
+earlycon=dockchannel,0x38812c000 console=tty0 console=ttyDC0 keep_bootcon maxcpus=1 nokaslr rdinit=/init panic=0 arm64.nomte
 ```
+
+`arm64.nomte` keeps MTE off: the tag store at the top of RAM is not yet reserved
+from Linux.
 
 Set the initrd range, `/chosen/stdout-path=serial0:1500000n8`, and the U-Boot
 configuration `bootcmd=booti <Image-address> <initrd-address>:<size> $fdtcontroladdr`,

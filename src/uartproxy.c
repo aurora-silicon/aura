@@ -10,6 +10,7 @@
 #include "usb.h"
 #include "usb_cdc.h"
 #include "utils.h"
+#include "wdt.h"
 
 #define REQ_SIZE 64
 
@@ -98,6 +99,7 @@ bool uartproxy_wait_dockchannel(unsigned int timeout_ms)
     for (unsigned int ms = 0; ms < timeout_ms; ms++) {
         if (uartproxy_sync_iodev(iodev)) {
             presynced_iodev = iodev;
+            wdt_host_attached();
             return true;
         }
         mdelay(1);
@@ -150,12 +152,14 @@ enum stage1_proxy_result uartproxy_wait_stage1(unsigned int timeout_ms)
 
         if (result == STAGE1_PROXY_CDC) {
             presynced_iodev = usb_port;
+            wdt_host_attached();
             return result;
         }
         if (result == STAGE1_PROXY_KIS) {
             if (chip_id == T8140 && !schedule_failed && usb_cdc_cancel())
                 return STAGE1_PROXY_CDC_FAILED;
             presynced_iodev = serial_port;
+            wdt_host_attached();
             return result;
         }
         if (result != STAGE1_PROXY_WAIT)
@@ -312,6 +316,7 @@ int uartproxy_run(struct uartproxy_msg_start *start)
         memset(&reply, 0, sizeof(reply));
         reply.type = request.type;
         reply.status = ST_OK;
+        wdt_host_attached();
 
         uartproxy_iodev = iodev;
 

@@ -32,6 +32,61 @@ runs the OS inside the armed window and emits `/chosen/aurora,ctxr-exec-window`.
 With no usable window it does not start the OS. Elsewhere nothing changes.
 [The boot object notes](macho-boot-object.md#running-the-os) say what it needs.
 
+## Sleep and CPU power-off for an OS at EL2
+
+There is no option for this. An OS that aura starts at EL2 has no monitor below
+it, so it powers cores off and suspends the system itself. From M4 on, the Neo's
+A18 Pro included, iBoot locks every core's reset vector to the boot object, so each
+core then restarts inside aura. On those chips kboot publishes
+`/chosen/aurora,s2r-mailbox`, the physical address of a 32-byte mailbox in aura's
+image:
+
+- a secondary comes back through its spin-table release address, which still holds
+  the OS's;
+- the boot core jumps to the resume address the OS left in the mailbox, at EL2 with
+  the MMU and caches off and interrupts masked, or reboots if the OS left none.
+
+The CPUs keep `spin-table`. The property says they can power off and come back:
+Linux with the T8140 sleep series gives them its parking spin table then, and an OS
+that doesn't know the property ignores it. Whether to deep-sleep is the OS's choice.
+Once the mailbox is published, reset paths don't print, since the OS owns the UART
+and the display. The mailbox sits in aura's image, which kboot reserves anyway, so it
+takes no memory of its own. On A7 to M3 RVBAR isn't locked, so nothing is published,
+and a guest at EL1 gets nothing.
+
+## Hibernation layout (`hib=1`, T6040)
+
+A hibernation image restores every page the OS saved to the frame it came from, so the
+boot that resumes it must give the OS the same RAM and keep the same ranges from it.
+The payload line `hib=1`, in Stage 2's own lines (Stage 1 does not hand it on), asks
+kboot for a fixed layout on T6040:
+
+- the CTXR exec window is the part of CTXR_D that every placement of the boot object
+  arms above aura's slot, at the same address on every boot (on the J616s with the
+  installer's padding: 96 MiB at 0x10008200000);
+- everything from the start of RAM up to a fixed end is kept from the OS, except that
+  window;
+- the device tree the OS is started with is copied, last, into a 2 MiB slot 320 MiB
+  above the 32 MiB aligned start of RAM, and the heap restarts right above the slot;
+- `/chosen/aura,hibernate-layout` holds the start of RAM and the fixed end,
+  `/chosen/aura,hibernate-dt` the slot.
+
+iBoot loads the boot object at a different address on every boot, anywhere from 16 to
+48 MiB above the 32 MiB aligned start of RAM, and the window above aura's slot moves
+with it. The fixed window does not: a kernel that a loader places at its lowest free
+2 MiB lands at the same address on every boot. Each boot checks the fixed window
+against what CTXR_D arms; when it does not fit, the OS gets the window above aura's
+slot and kboot gives no layout. aura's own image, with its spin tables and its S2R
+mailbox, still moves with the object, inside the kept range: Linux uses the release
+addresses only when it starts, and a restored kernel reads this boot's mailbox from the
+tree in the slot.
+
+kboot refuses the layout, says why, and boots without it when the window is not the
+fixed one or is not below the slot, or when aura, the boot arguments, what iBoot and
+Stage 1 placed, or the heap reach the slot, or when the fixed range meets a carveout or
+a firmware range. Without the properties Linux refuses to hibernate. Without `hib=1`
+nothing changes, the window included.
+
 ## DebugUSB interception (development builds)
 
 A build made with `DEBUGUSB_PROXY=1` also opens the 15 second `aura-proxy`

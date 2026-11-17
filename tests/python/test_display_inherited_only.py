@@ -118,7 +118,7 @@ int main(void)
 def test_t8140_t8132_return_before_the_dart_path(tmp_path):
     display = (SOURCE / "src/display.c").read_text()
     soc = (SOURCE / "src/soc.h").read_text()
-    chips = "\n".join(re.findall(r"^#define (?:T8140|T8132|T8152|T6000|T6040|S5L8960X)\s+0x[0-9a-fA-F]+\s*$",
+    chips = "\n".join(re.findall(r"^#define (?:T8140|T8132|T8152|T6000|T6040|T6041|S5L8960X)\s+0x[0-9a-fA-F]+\s*$",
                                  soc, re.M))
     panel = function(display, "static bool display_internal_panel_absent(")
     init = function(display, "int display_init(void)")

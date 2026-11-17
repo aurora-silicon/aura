@@ -17,6 +17,7 @@
 #define TPS_REG_INT_EVENT1  0x14
 #define TPS_REG_INT_MASK1   0x16
 #define TPS_REG_INT_CLEAR1  0x18
+#define TPS_REG_STATUS      0x1a
 #define TPS_REG_POWER_STATE 0x20
 #define TPS_MODE_DBMA       ((u32)'D' | ((u32)'B' << 8) | ((u32)'M' << 16) | ((u32)'a' << 24))
 
@@ -290,6 +291,19 @@ int tps6598x_restore_irqs(tps6598x_dev_t *dev, tps6598x_irq_state_t *state)
     }
 #endif
 
+    return 0;
+}
+
+int tps6598x_read_status(tps6598x_dev_t *dev, u32 *status, u32 *data_status)
+{
+    u8 buf[4];
+
+    if (tps6598x_read_reg(dev, TPS_REG_STATUS, buf, sizeof(buf)) != sizeof(buf))
+        return -1;
+    memcpy(status, buf, sizeof(buf));
+    if (tps6598x_read_reg(dev, TPS6598X_REG_DATA_STATUS, buf, sizeof(buf)) != sizeof(buf))
+        return -1;
+    memcpy(data_status, buf, sizeof(buf));
     return 0;
 }
 

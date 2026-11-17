@@ -43,6 +43,8 @@ Environment (all optional; 1 enables a switch):
   AURA_SAMPLE              sample the guest's PC until each core's XNU entry (pre-XNU hangs)
   AURA_SAMPLE_HZ=<n>       samples per second (default 4)
   AURA_SAMPLE_MAX=<n>      stop printing after n samples (default 64)
+  AURA_XNU_ENTRY           patch the guest kernelcache's acct(2) so a root process reaches aura's
+                           control hvc with no kext (the auractl "xnu" entry; aura/auractl_xnu.py)
   AURA_XNU_RO_RELAX        patch XNU's zalloc_ro_mut RO-zone panic out (tracing only; XNU_QUIRKS)
   AURA_XNU_TC_FORCE        accept a trust cache TXM refused, so the cryptex graft proceeds
   AURA_SHARE_NVRAM         let the guest reach the real NVRAM (a failed boot pollutes it)
@@ -77,6 +79,7 @@ Example:
 import argparse
 import os
 import pathlib
+import secrets
 import struct
 import subprocess
 import sys
@@ -102,6 +105,8 @@ CONFIG_FLAGS = {
     "AURA_GPU_TRACE": 1 << 6,
     "AURA_SAMPLE": 1 << 7,
     "AURA_S2R_MEM": 1 << 8,
+    # bit 9 is reserved for AURA_AURACTL in the feat/auractl runner
+    "AURA_AURACTL_DCC": 1 << 10,  # arm auractl's kext-free DCC transport (off by default)
 }
 KNOWN_ENV = {
     "AURA_KEEP_EXCLAVES",
@@ -131,6 +136,7 @@ KNOWN_ENV = {
     "AURA_GPU_PRINT_MAX",
     "AURA_SAMPLE_HZ",
     "AURA_SAMPLE_MAX",
+    "AURA_XNU_ENTRY",
     "AURA_XNU_RO_RELAX",
     "AURA_SHARE_NVRAM",
     "AURA_XNU_TC_FORCE",
@@ -174,6 +180,9 @@ EXCLAVE_NODES = ("/arm-io/exdisplaypipe", "/arm-io/exdisplaypipe-s-proxy",
                  "/arm-io/aop-exclave-mailbox", "/arm-io/aop2-exclave-mailbox")
 ROUTES_PROPS = (("/arm-io/dcp/iop-dcp-nub", "routes"), ("/arm-io/aop/iop-aop-nub", "routes"),
                 ("/arm-io/aop2/iop-aop2-nub", "routes"))
+# Without it XNU powers ANS on, maps its firmware and sets RUN itself, instead of waking a
+# running session.
+ANS_QUIESCED = (("/arm-io/ans/iop-ans-nub", "quiesced"),)
 # iBoot's data regions copied to the blob tail, in iBoot's order (the native layout).
 IBOOT_COPIES = ("RTBuddySeg", "SEPFW", "SEPPatches", "uStuff", "preoslog")
 
@@ -489,6 +498,31 @@ def patch_xnu(p, sym, plan, patches):
         print(f"XNU {what}: [0x{pa:x}] 0x{before:08x} -> 0x{p.read32(pa):08x}")
 
 
+def patch_xnu_entry(p, sym, plan, kernelcache):
+    """AURA_XNU_ENTRY: patch the guest kernelcache's acct(2) so a root process reaches aura's
+    control hvc with no kext (the auractl "xnu" entry, aura/auractl_xnu.py). The site is located in
+    the kernelcache file, build-independently and fail-closed; the words it overwrites are verified
+    against the loaded BootKC before the write, so a mismatched kernelcache stops the boot."""
+    from aura.auractl_xnu import AURACTL_HVC_IMM, XnuEntryError, find_acct_entry
+
+    try:
+        entry = find_acct_entry(kernelcache)
+    except XnuEntryError as e:
+        raise SystemExit(f"AURA_XNU_ENTRY: cannot place the acct() entry: {e}")
+    base = plan.regions["BootKC-rx"][0]
+    site = base + entry["text_off"]
+    for i, want in enumerate(entry["expected"]):
+        have = p.read32(site + 4 * i)
+        if have != want:
+            raise SystemExit(f"AURA_XNU_ENTRY: acct site [0x{site + 4 * i:x}] = 0x{have:08x}, the "
+                             f"finder read 0x{want:08x} from the file: wrong kernelcache loaded")
+    for i, new in enumerate(entry["replacement"]):
+        p.write32(site + 4 * i, new)
+    p.call(sym["sptm_virt_flush"], site & ~0x3f, 0x80 + len(entry["replacement"]) * 4)
+    print(f"XNU auractl entry: acct() 0x{entry['acct_va']:x}, 5 instructions at 0x{site:x} "
+          f"(uap in x{entry['uap_reg']}) -> hvc #0x{AURACTL_HVC_IMM:x}, b 0x{entry['epilogue_va']:x}")
+
+
 def set_xnu_rorgn(p, sym, plan, quirks):
     """Hand XNU the read-only region iBoot would have locked: the BootKC's text and const."""
     lo = plan.regions["BootKC-rx"][0]
@@ -619,12 +653,16 @@ def debug_port(adt, proxy_phy=0, port=None):
     return [_u32(nodes[h]["AAPL,phandle"]) for h in phys], tuple(sorted(out))
 
 
-def configure(p, sym, plan, adt):
+def configure(p, sym, plan, adt, ctl_cookie=0):
     p.write64(sym["sptm_virt_diag_pa"], plan.diag_pa)
     if plan.diag_pa:
         print(f"SPTM diagnostic record at 0x{plan.diag_pa:x}")
     flags = sum(bit for name, bit in CONFIG_FLAGS.items() if env_on(name))
     p.call(sym["sptm_virt_config"], flags)
+    if ctl_cookie:
+        # The DCC transport's per-boot cookie; the same value is in the guest's boot-args, which
+        # only root can read. aura refuses every gated DCC command without it.
+        p.call(sym["sptm_virt_ctl_set_cookie"], ctl_cookie)
     for env, symbol in (("AURA_SAMPLE_HZ", "sptm_virt_sample_hz"),
                         ("AURA_SAMPLE_MAX", "sptm_virt_sample_max")):
         if os.environ.get(env):
@@ -761,6 +799,26 @@ def main():
     if xnu_release:
         print(f"XNU {xnu_release}: hiding " + " ".join(quirks["hide"]))
 
+    # Any stage that used NVMe left ANS in a session XNU can't take over: end it, stop and reset
+    # ANS, and XNU starts it cold. AURA_ANS_COLD=idle (IDLE instead of SLEEP) is a diagnostic,
+    # =off keeps the old handoff; AURA_ANS_PROBE=0 skips the HELLO check before XNU.
+    # Measured on T8140 only: elsewhere it's opt-in, and XNU wakes iBoot's quiesced session.
+    t8140 = u.adt["/chosen"].chip_id == 0x8140
+    ans_cold = os.environ.get("AURA_ANS_COLD", "sleep" if t8140 else "off")
+    if ans_cold not in ("sleep", "idle", "off"):
+        raise SystemExit(f"AURA_ANS_COLD={ans_cold}: sleep, idle or off")
+    if ans_cold != "off":
+        # An unanswered RTKit or controller step takes seconds, more than a read's timeout.
+        to, iface.dev.timeout = iface.dev.timeout, 30
+        try:
+            rc = p.call(sym["sptm_virt_ans_cold"], (ans_cold == "idle") |
+                        (2 if os.environ.get("AURA_ANS_PROBE", "1") == "0" else 0))
+        finally:
+            iface.dev.timeout = to
+        if rc != 0:
+            raise SystemExit("ANS didn't stop for XNU's cold start (see aura's console)")
+        print(f"ANS stopped ({ans_cold.upper()}) and reset: XNU starts it cold")
+
     live_adt = u.get_adt()
     chip = u.adt["/chosen"].chip_id
     proxy_phy = p.call(sym["sptm_virt_proxy_phy"])
@@ -794,13 +852,21 @@ def main():
                                                chip)
     serial = os.environ.get("AURA_XNU_SERIAL")
 
+    # auractl's DCC transport is gated behind a per-boot cookie: a random value that goes both into
+    # the guest's boot-args (only root can read kern.bootargs) and into aura (configure() below).
+    ctl_cookie = 0
+    if env_on("AURA_AURACTL_DCC"):
+        ctl_cookie = secrets.randbits(64) or 1
+        args.bootargs = f"{args.bootargs} aura-actl-ck={ctl_cookie:016x}"
+
     plan = plan_mod.plan_boot(
         images["sptm"], images["txm"], images["xnu"], live_adt,
         dram_base=dram_base, phys_base=phys_base, mem_size=managed_end - phys_base,
         mem_size_actual=ba.mem_size_actual, cmdline=args.bootargs, blob_base=phys_base,
         trustcache=args.trustcache.read_bytes() if args.trustcache else b"",
         iboot_copies=copies, hide_nodes=hide, diag_record=env_on("AURA_SPTM_DIAG"),
-        drop_props=(() if keep_exclaves else ROUTES_PROPS) + ans_drop_props(),
+        drop_props=(() if keep_exclaves else ROUTES_PROPS) + ans_drop_props() +
+        (ANS_QUIESCED if ans_cold != "off" else ()),
         xnu_serial=f"/arm-io/{serial}" if serial else None,
         os_long_version=args.os_long_version,
         video=tuple(int(getattr(ba.video, f)) for f in
@@ -839,7 +905,9 @@ def main():
         patch_xnu(p, sym, plan, quirks["nvram_ro"])
     if env_on("AURA_XNU_TC_FORCE") and quirks.get("tc_force"):
         patch_xnu(p, sym, plan, quirks["tc_force"])
-    configure(p, sym, plan, live_adt)
+    if env_on("AURA_XNU_ENTRY"):
+        patch_xnu_entry(p, sym, plan, images["xnu"])
+    configure(p, sym, plan, live_adt, ctl_cookie)
     if p.call(sym["sptm_virt_load"], entry, handoff) != 0:
         raise SystemExit("sptm_virt_load rejected the entry/handoff (see aura's console)")
     if args.no_enter:

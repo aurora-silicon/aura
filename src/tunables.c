@@ -130,6 +130,44 @@ int tunables_apply_local_addr(const char *path, const char *prop, uintptr_t base
     return 0;
 }
 
+int tunables_check_local_addr(const char *path, const char *prop, uintptr_t base,
+                              const struct tunable_excuse *excuses)
+{
+    struct tunable_info info;
+    int bad = 0;
+
+    if (tunables_adt_find(path, prop, &info, sizeof(struct tunable_local)) < 0)
+        return -1;
+
+    const struct tunable_local *tunables = (const struct tunable_local *)info.tunable_raw;
+    for (u32 i = 0; i < info.tunable_len; ++i) {
+        const struct tunable_local *tunable = &tunables[i];
+        u64 excused = 0, value;
+
+        for (const struct tunable_excuse *e = excuses; e && e->bits; e++)
+            if (e->offset == tunable->offset)
+                excused = e->bits;
+        switch (tunable->size) {
+            case 4:
+                value = read32(base + tunable->offset);
+                break;
+            case 8:
+                value = read64(base + tunable->offset);
+                break;
+            default:
+                printf("tunable: %s +0x%x: cannot check size %u\n", prop, tunable->offset,
+                       tunable->size);
+                return -1;
+        }
+        if ((value & tunable->mask) != (tunable->value & tunable->mask & ~excused)) {
+            printf("tunable: %s +0x%x reads 0x%lx under mask 0x%lx, wrote 0x%lx\n", prop,
+                   tunable->offset, value & tunable->mask, tunable->mask, tunable->value);
+            bad++;
+        }
+    }
+    return bad;
+}
+
 int tunables_validate_compact(const char *path, const char *prop, u64 span)
 {
     struct tunable_info info;

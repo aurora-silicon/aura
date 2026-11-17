@@ -2,6 +2,7 @@
 
 #include "dapf.h"
 #include "adt.h"
+#include "asc.h"
 #include "assert.h"
 #include "malloc.h"
 #include "memory.h"
@@ -21,6 +22,39 @@ struct dapf_t8020_config {
     u32 r4;
 } PACKED;
 
+/* One ADT "segment-ranges" entry (adt.h's struct adt_segment_ranges). */
+struct dapf_segment {
+    u64 phys;
+    u64 iova;
+    u64 remap;
+    u32 size;
+    u32 flags;
+} PACKED;
+static_assert(sizeof(struct dapf_segment) == 32, "Invalid segment-ranges entry size");
+
+/*
+ * A coprocessor whose firmware iBoot preloads fetches its __TEXT physically at the
+ * address iBoot latched in its reset vector, through its CPU DART's filter. The
+ * filter must admit that range. Return the preloaded __TEXT range of the ADT node
+ * that owns the DART at @path, or false when there is none.
+ */
+static bool dapf_preload_text(const char *path, u64 *start, u64 *end)
+{
+    if (strcmp(path, "/arm-io/dart-ave0"))
+        return false;
+
+    u32 len;
+    int node = adt_path_offset(adt, "/arm-io/ave0");
+    if (node < 0 || !adt_getprop(adt, node, "pre-loaded", &len))
+        return false;
+    const struct dapf_segment *seg = adt_getprop(adt, node, "segment-ranges", &len);
+    if (!seg || len < sizeof(*seg) || seg[0].size < 4 || (seg[0].phys & 3))
+        return false;
+    *start = seg[0].phys;
+    *end = seg[0].phys + ALIGN_DOWN(seg[0].size, 4) - 4;
+    return true;
+}
+
 static int dapf_init_t8020(const char *path, u64 base, int node)
 {
     u32 length;
@@ -33,6 +67,8 @@ static int dapf_init_t8020(const char *path, u64 base, int node)
     }
 
     int count = length / sizeof(*config);
+    u64 text_start, text_end;
+    bool text = dapf_preload_text(path, &text_start, &text_end);
 
     for (int i = 0; i < count; i++) {
         write32(base + 0x04, config[i].r4);
@@ -40,6 +76,24 @@ static int dapf_init_t8020(const char *path, u64 base, int node)
         write64(base + 0x10, config[i].end);
         write32(base + 0x00, (config[i].r0_hi << 4) | config[i].r0_lo);
         base += 0x40;
+        if (text && config[i].start <= text_start && config[i].end >= text_end)
+            text = false;
+    }
+
+    /*
+     * The preloaded __TEXT is admitted read-only (r0 0x11, as iBoot's own entry
+     * for ISP's preloaded firmware). Only when no ADT entry covers it already.
+     */
+    if (text) {
+        if (count >= 16) {
+            printf("dapf: %s: no free entry for the preloaded TEXT\n", path);
+            return -1;
+        }
+        write32(base + 0x04, 1);
+        write64(base + 0x08, text_start);
+        write64(base + 0x10, text_end);
+        write32(base + 0x00, 0x11);
+        printf("dapf: %s: admitted preloaded TEXT 0x%lx-0x%lx\n", path, text_start, text_end);
     }
     return 0;
 }
@@ -509,8 +563,16 @@ struct entry {
 
 struct entry dapf_entries[] = {
     /* Keep dart-ane out: its Linux driver owns that DAPF on T8140. */
-    {"/arm-io/dart-aop", 1, "aop"}, {"/arm-io/dart-mtp", 1, "mtp"},  {"/arm-io/dart-pmp", 1, "pmp"},
-    {"/arm-io/dart-isp", 5, "isp"}, {"/arm-io/dart-isp0", 5, "isp"}, {NULL, -1, NULL},
+    {"/arm-io/dart-aop", 1, "aop"},
+    {"/arm-io/dart-mtp", 1, "mtp"},
+    {"/arm-io/dart-pmp", 1, "pmp"},
+    /* T6050: the PMP's DART is dart-pmp0 (dart,t8110; DAPF aperture reg[1], live-verified on the
+     * J714c). */
+    {"/arm-io/dart-pmp0", 1, "pmp0"},
+    {"/arm-io/dart-isp", 5, "isp"},
+    {"/arm-io/dart-isp0", 5, "isp"},
+    {"/arm-io/dart-ave0", 3, "ave"},
+    {NULL, -1, NULL},
 };
 
 static int dapf_init_j713(void *dt)
@@ -571,6 +633,30 @@ static int dapf_init_j713(void *dt)
             }
 
             int powered = pmgr_adt_is_powered(entry->consumer);
+            /* A consumer iBoot left off (the J604's MTP) that Linux cold-starts: the board's
+             * tree asks for its filter, programmed as for the halted J713 AOP. */
+            if (powered <= 0 &&
+                fdt_stringlist_search(dt, chosen, "linux-enablement-mac,dapf-halted-handoff",
+                                      entry->consumer) >= 0) {
+                /* Only a consumer whose CPU is seen stopped, as kboot checks the AOP's. */
+                asc_dev_t *asc = asc_init(entry->consumer);
+                bool running = !asc || asc_cpu_running(asc);
+
+                if (asc)
+                    asc_free(asc);
+                if (running) {
+                    printf("dapf: Skipping %s; %s is not seen halted\n", entry->path,
+                           entry->consumer);
+                    entry++;
+                    continue;
+                }
+                printf("dapf: Programming %s for the halted %s\n", entry->path, entry->consumer);
+                if (dapf_init_t8132_halted(entry->path, entry->index) < 0)
+                    ret = -1;
+                entry++;
+                count++;
+                continue;
+            }
             if (powered <= 0) {
                 printf("dapf: Skipping %s; consumer %s is inactive or its state is unknown\n",
                        entry->path, entry->consumer);
@@ -593,7 +679,13 @@ int dapf_init_fdt(const void *fdt)
     j614s_aop_ready = false;
     j614s_isp_ready = false;
     if (chip_id == T8132) {
-        if (!fdt || fdt_node_check_compatible(fdt, 0, "apple,j713"))
+        /* M4 laptops whose trees state the same DAPF handoff contract as the J713. */
+        static const char *const boards[] = {"apple,j713", "apple,j604", NULL};
+        bool known = false;
+
+        for (const char *const *board = boards; fdt && *board; board++)
+            known |= !fdt_node_check_compatible(fdt, 0, *board);
+        if (!known)
             return 0; /* No other M4 board's power/DAPF contract is qualified. */
         return dapf_init_j713((void *)fdt);
     }

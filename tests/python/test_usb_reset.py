@@ -80,11 +80,26 @@ int main(void){
  assert(d.endpoints[0].xfer_in_progress && !setups && d.endpoints[0].xfer_buffer[0]==0x55);
  setup();d.endpoints[2].stalled=true;usb_dwc3_handle_event_usbrst(&d,false);assert(!d.endpoints[2].stalled && !stalls && !setups);
 #else
+ /* Every active transfer is ended, EP0 included, and SETUP is re-armed. */
  setup();for(int i=0;i<6;i++)d.endpoints[i].xfer_in_progress=true;usb_dwc3_handle_event_usbrst(&d,true);
- assert(address==0 && enabled==3 && !ends && !setups && stalls==5);
- for(int i=0;i<6;i++)assert(!d.endpoints[i].xfer_in_progress);
- for(int i=1;i<6;i++)assert(!d.endpoints[i].xfer_buffer[0]);
+ assert(address==0 && enabled==3 && ends==6 && setups==1 && stalls==5);
+ assert(d.endpoints[0].xfer_in_progress && d.ep0_state==USB_DWC3_EP0_STATE_SETUP_HANDLE);
+ for(int i=1;i<6;i++)assert(!d.endpoints[i].xfer_in_progress && !d.endpoints[i].resource_index);
+ for(int i=2;i<6;i++)assert(!d.endpoints[i].xfer_buffer[0]);
  assert(d.endpoints[0].xfer_buffer[0]==0x55);
+ for(int i=0;i<2;i++)assert(!d.pipe[i].ready && d.pipe[i].host2device->read==9 && d.pipe[i].device2host->read==8);
+ /* A live SETUP TRB is kept: ending it would leave no TRB for SET_ADDRESS. */
+ setup();d.ep0_state=USB_DWC3_EP0_STATE_SETUP_HANDLE;d.endpoints[0].xfer_in_progress=true;
+ d.endpoints[3].xfer_in_progress=true;usb_dwc3_handle_event_usbrst(&d,true);
+ assert(ends==1 && !setups && d.endpoints[0].xfer_in_progress && d.endpoints[0].resource_index==17);
+ assert(d.ep0_state==USB_DWC3_EP0_STATE_SETUP_HANDLE && !d.endpoints[3].xfer_in_progress);
+ /* A data or status phase in flight belongs to the old session. */
+ setup();d.ep0_state=USB_DWC3_EP0_STATE_DATA_SEND_DONE;d.endpoints[1].xfer_in_progress=true;
+ usb_dwc3_handle_event_usbrst(&d,true);
+ assert(ends==1 && setups==1 && d.endpoints[0].xfer_in_progress && !d.endpoints[1].xfer_in_progress);
+ /* Nothing armed: no ENDTRANSFER, SETUP armed afresh. */
+ setup();usb_dwc3_handle_event_usbrst(&d,true);
+ assert(!ends && setups==1 && d.ep0_state==USB_DWC3_EP0_STATE_SETUP_HANDLE);
 #endif
  puts("USB reset: transfer retirement and nested state PASS");return 0;
 }

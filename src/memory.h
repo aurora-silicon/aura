@@ -81,6 +81,7 @@ void mmu_init_secondary_local(void);
 void mmu_publish_secondary(void);
 void mmu_shutdown(void);
 void mmu_add_mapping(u64 from, u64 to, size_t size, u8 attribute_index, u64 perms);
+void mmu_map_uncached(u64 base, u64 size);
 void mmu_rm_mapping(u64 from, size_t size);
 void mmu_map_framebuffer(u64 addr, size_t size);
 

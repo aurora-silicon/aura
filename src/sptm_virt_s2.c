@@ -29,6 +29,24 @@ static u64 sptm_s2_sum;
 static u32 sptm_s2_tables;
 static bool sptm_s2_ready;
 
+#ifdef AURACTL
+/* auractl changes the tree with the guest running (sptm_virt_ctl.c). That change, with the new
+ * reference taken, and each core's check at its XNU entry run one at a time. */
+static spinlock_t sptm_s2_ref_lock = SPINLOCK_INIT;
+
+AURA_XTEXT void sptm_virt_s2_ctl_begin(void)
+{
+    spin_lock(&sptm_s2_ref_lock);
+}
+
+AURA_XTEXT void sptm_virt_s2_ctl_end(bool changed)
+{
+    if (changed && sptm_s2_ready)
+        sptm_s2_sum = hv_pt_checksum(&sptm_s2_tables);
+    spin_unlock(&sptm_s2_ref_lock);
+}
+#endif
+
 /* A guest MMIO access, performed for real at its width. */
 void sptm_virt_mmio_rw(u64 addr, u64 *val, bool write, int width)
 {
@@ -545,6 +563,9 @@ void sptm_virt_s2_setup(void)
            link_on_usb || link_on_dockchannel ? "kept on" : "NOT kept on");
     sptm_virt_s2r_setup(link_on_usb || link_on_dockchannel);
     sptm_virt_gpu_setup();
+#ifdef AURACTL
+    sptm_virt_ctl_s2_setup(); /* splits blocks: before the tree is summed */
+#endif
 
     /* SPTM's own bring-up runs without it; each core arms it at its GEXIT into XNU, after
      * checking that nothing changed the tree in between. */
@@ -566,8 +587,14 @@ void sptm_virt_s2_enter_xnu(int cpu)
         return;
     bool verbose = checks++ < 8;
     u32 nt = 0;
+#ifdef AURACTL
+    spin_lock(&sptm_s2_ref_lock);
+#endif
     u64 sum = hv_pt_checksum(&nt);
     bool ok = sum == sptm_s2_sum && nt == sptm_s2_tables;
+#ifdef AURACTL
+    spin_unlock(&sptm_s2_ref_lock);
+#endif
     if (verbose || !ok)
         printf("SPTM-virt[s2]: cpu%d XNU entry: stage-2 tree %s (%u tables, 0x%lx vs 0x%lx)%s\n",
                cpu, ok ? "intact" : "CHANGED", nt, sum, sptm_s2_sum,

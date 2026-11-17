@@ -7,4 +7,5 @@
 #define T6031 0x6031
 #define T6040 0x6040
 #define T6041 0x6041
+#define T6050 0x6050
 #endif

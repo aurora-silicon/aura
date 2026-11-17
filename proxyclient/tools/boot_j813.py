@@ -74,8 +74,9 @@ def prepare(args, s, raw):
         print("RAM_UPLOAD_VERIFIED", name, len(data), hashes[name], time.monotonic() - start, flush=True)
     payloads = state["payloads"]
     p = s.p
+    # arm64.nomte: the MTE tag store is not yet reserved from Linux.
     bootargs = ("earlycon=dockchannel,0x38812c000 console=tty0 console=ttyDC0 keep_bootcon "
-                "maxcpus=1 nokaslr rdinit=/init panic=0")
+                "maxcpus=1 nokaslr rdinit=/init panic=0 arm64.nomte")
     # Success is the chosen-table slot index, not necessarily zero.
     common.require(0 <= s.call("kboot_set_chosen", s.cstring("bootargs"), s.cstring(bootargs)) < 16,
                    "bootargs failed")

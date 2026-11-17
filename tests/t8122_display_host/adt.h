@@ -19,6 +19,7 @@ struct adt_segment_ranges {
 int adt_path_offset(const void *adt, const char *path);
 int adt_path_offset_trace(const void *adt, const char *path, int *offsets);
 const void *adt_getprop(const void *adt, int nodeoffset, const char *name, u32 *lenp);
+int adt_getprop_copy(const void *adt, int nodeoffset, const char *name, void *out, size_t len);
 int adt_get_reg(const void *adt, int *path, const char *prop, int idx, u64 *addr, u64 *size);
 bool adt_is_compatible(const void *adt, int nodeoffset, const char *compat);
 int adt_get_property_count(const void *adt, int offset);

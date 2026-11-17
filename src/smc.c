@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: MIT AND GPL-2.0-only */
 
+#include "adt.h"
 #include "assert.h"
 #include "malloc.h"
 #include "smc.h"
@@ -200,4 +201,42 @@ int smc_write_u64(smc_dev_t *smc, u32 key, u64 value)
     msg |= FIELD_PREP(SMC_WRITE_KEY_KEY, key);
 
     return smc_cmd(smc, msg);
+}
+
+/* ADT function-reset = pKW4/pKW8: the SMC node's phandle, the function name, then its arguments */
+struct smc_adt_function {
+    u32 phandle;
+    char four_cc[4];
+    u32 key;
+    u32 lo;
+    u32 hi; /* pKW8 only */
+};
+
+int smc_adt_function_reset(const char *path, u32 settle_ms)
+{
+    struct smc_adt_function fn = {0};
+    u32 len;
+    int node = adt_path_offset(adt, path);
+    const void *prop = node < 0 ? NULL : adt_getprop(adt, node, "function-reset", &len);
+
+    if (!prop || len < 12)
+        return 1;
+    memcpy(&fn, prop, min(len, (u32)sizeof(fn)));
+    bool wide = !memcmp(fn.four_cc, "8WKp", 4);
+    if (!(wide && len == 20) && !(!memcmp(fn.four_cc, "4WKp", 4) && len == 16))
+        return 1; /* a GPIO or other non-SMC function */
+
+    smc_dev_t *smc = smc_init();
+    if (!smc)
+        return -1;
+    int ret = 0;
+    for (u32 level = 0; level < 2 && !ret; level++) {
+        ret = wide ? smc_write_u64(smc, fn.key, ((u64)fn.hi << 32) | fn.lo | level)
+                   : smc_write_u32(smc, fn.key, fn.lo | level);
+        mdelay(settle_ms);
+    }
+    smc_shutdown(smc);
+    printf("SMC: %s function-reset %c%c%c%c released: %d\n", path, fn.key >> 24, fn.key >> 16,
+           fn.key >> 8, fn.key, ret);
+    return ret ? -1 : 0;
 }
