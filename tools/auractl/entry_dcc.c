@@ -15,9 +15,10 @@
  *
  * Anyone may ring the doorbell, so aura gates everything past the read-only status behind a
  * per-boot cookie it only honours when presented through DBGDTRTX_EL0 just before the doorbell.
- * The cookie is in the guest's boot-args, which only root can read (sysctl kern.bootargs): so
- * `auractl status` works for any user, but arming, recording and reading records need root. A
- * non-root caller presents 0 and aura refuses the gated command with EPERM.
+ * The operator supplies the cookie through AURACTL_COOKIE (read from aura's serial log), or it is
+ * taken from the guest boot-args where kern.bootargs exposes them (see dcc_cookie): so
+ * `auractl status` works for any user, but arming, recording and reading records need the cookie.
+ * A caller without it presents 0 and aura refuses the gated command with EPERM.
  */
 #include <stdlib.h>
 #include <string.h>
@@ -27,14 +28,27 @@
 
 #define AURACTL_DCC_TAG 0xAC71ULL /* top 16 bits of the doorbell and of aura's errno read-back */
 
-/* The per-boot cookie from the guest boot-args ("aura-actl-ck=<hex>" in kern.bootargs), cached.
- * 0 if we cannot read it (not root) or it is absent, which leaves only the status command. */
+/* The per-boot cookie, cached. 0 if we cannot obtain it, which leaves only the status command.
+ *
+ * Two sources, in order:
+ *   1. AURACTL_COOKIE=<hex> in the environment. macOS redacts kern.bootargs to userspace even for
+ *      root under secure boot, so on a self-booted macOS guest the "aura-actl-ck=" token aura baked
+ *      into boot-args is not readable there. aura logs the per-boot value to its serial console (an
+ *      HV/hardware channel, strictly more privileged than guest root; src/sptm_virt_ctl.c); the
+ *      operator reads it there and passes it here.
+ *   2. kern.bootargs, where it is readable (the tethered / Linux-guest path): the token aura put in
+ *      the guest boot-args, which only root can read. */
 static uint64_t dcc_cookie(void)
 {
     static uint64_t cookie;
     static int tried;
     if (!tried) {
         tried = 1;
+        const char *env = getenv("AURACTL_COOKIE");
+        if (env && *env) {
+            cookie = strtoull(env, NULL, 16);
+            return cookie;
+        }
         char buf[4096];
         size_t len = sizeof(buf) - 1;
         if (sysctlbyname("kern.bootargs", buf, &len, NULL, 0) == 0) {

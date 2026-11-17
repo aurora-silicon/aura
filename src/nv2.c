@@ -401,6 +401,18 @@ static void nv2_bank_load(const u64 *b)
 #define LOAD(reg, off) _msr(sr_tkn(reg), b[(off) / 8]);
     NV2_BANK(LOAD)
 #undef LOAD
+#ifdef AURACTL
+    /* With auractl's DCC transport armed, a guest EL0 access to the DCC registers must trap to aura
+     * (EL2), not to the guest's own EL1. The guest (XNU) sets MDSCR_EL1.TDCC=1, which for an EL0
+     * access has priority over MDCR_EL2.TDCC; and MDSCR_EL1 is in this bank, so the restore above
+     * puts that TDCC=1 back into the live register on every entry -- undoing the one-time clear in
+     * nv2_el2_setup(). Re-clear it here so the EL0 DCC trap stays routed to aura. The guest still
+     * reads its own MDSCR_EL1 back from the bank (unchanged); any DCC access that is not an auractl
+     * doorbell is reflected to L1 as its own trap (sptm_virt_ctl_dcc), so the guest sees the same
+     * behaviour it would with its TDCC set. */
+    if (sptm_virt_flags & SPTM_VIRT_CTL_DCC)
+        msr(SYS_MDSCR_EL1, b[V_MDSCR / 8] & ~MDSCR_EL1_TDCC);
+#endif
     msr(SYS_SCTLR_EL12, b[V_SCTLR / 8]);
     sysop("isb");
 }
