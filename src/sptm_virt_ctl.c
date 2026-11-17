@@ -222,6 +222,14 @@ AURA_XTEXT static void ctl_catalogue(void)
     ctl_add_adt("/arm-io/nub-spmi0", "spmi0", 0, 0, PG);
     ctl_add_adt("/arm-io/nub-spmi-a0", "spmi-a0", 0, 0, PG);
     ctl_add_adt("/arm-io/dart-dcp", "dart-dcp", 0, 0, 0);
+    /* The ATC/USB-C controllers, so auractl can trace a cable attach on the controller itself
+     * (not only the PMU/SPMI and power-gate path a plug also drives). reg[0] is each node's xHCI/
+     * DWC core window; size 0 takes the node's whole reg and splits its block like dart-dcp. A node
+     * absent on a given board resolves to a non-hookable entry (pa=sz=0), so this is safe on any
+     * SoC. Nodes macOS owns under keep-USB stay unhooked until an explicit auractl arm. */
+    ctl_add_adt("/arm-io/usb-drd0", "usb-drd0", 0, 0, 0);
+    ctl_add_adt("/arm-io/usb-drd1", "usb-drd1", 0, 0, 0);
+    ctl_add_adt("/arm-io/usb-drd2", "usb-drd2", 0, 0, 0);
 }
 
 AURA_XTEXT static void ctl_deny_adt(const char *path)
