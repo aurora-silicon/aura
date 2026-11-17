@@ -129,9 +129,9 @@
           "replacement": "0xd503201f"
         }
       ],
-      "CTRR check": null,
-      "CTRR reset-path check": null,
-      "ctXr lock check": null,
+      "CTRR check": [],
+      "CTRR reset-path check": [],
+      "ctXr lock check": [],
       "AMCC CTRR match": null
     },
     "ctrr_stash_off": null,
