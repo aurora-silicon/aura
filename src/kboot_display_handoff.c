@@ -3253,6 +3253,10 @@ static const struct {
     {V27_0, &fw_versions[V27_0], "64863924-B56B-3E32-87FE-038677F52709", true},
     /* K116s (16" M5 Pro, OLED), 26B8125: the internal panel only */
     {V27_2, &fw_versions[V27_2], "3D6C8857-E6F1-3D2E-9DFF-587028AE0C6E", false},
+    /* J775c (Mac Studio M5 Max) on 27.2 (26B123): its own DCP image, measured on that
+     * machine; the image id is not shared across T6050 boards, so the rows pair with the
+     * image the ADT reports below */
+    {V27_2, &fw_versions[V27_2], "C51FB0C8-C45D-39B0-85BC-520E600FC950", true},
     /* K114c (M5 Max), 27.3 beta 26C5035r: another DCP image */
     {V27_3B, &t6050_fw_27_3, "58CB3FFC-B2BA-352E-B20B-71A91B15FA9F", true},
 };
@@ -3335,15 +3339,16 @@ static T6050_INIT int t6050_check_adt(void)
     const char *uuid = nub < 0 ? NULL : adt_getprop(adt, nub, "uuid", &len);
 
     for (size_t i = 0; i < ARRAY_SIZE(t6050_images); i++)
-        if (os_firmware.version == t6050_images[i].os_fw) {
+        if (os_firmware.version == t6050_images[i].os_fw && len > 0 && uuid &&
+            dcp6_is_uuid(uuid, len) && !strcmp(uuid, t6050_images[i].uuid)) {
             t6050.uuid = t6050_images[i].uuid;
             t6050.fw = t6050_images[i].dt_fw;
             t6050.ext = t6050_images[i].ext;
+            break;
         }
     if (!t6050.uuid)
-        bail("OS firmware %s is not 27.0, 27.2 or 27.3 beta\n", os_firmware.string);
-    if (!dcp6_is_uuid(uuid, len) || strcmp(uuid, t6050.uuid))
-        bail("DCP image %s is not %s\n", dcp6_is_uuid(uuid, len) ? uuid : "(none)", t6050.uuid);
+        bail("OS firmware %s with DCP image %s is not a known pair\n", os_firmware.string,
+             dcp6_is_uuid(uuid, len) ? uuid : "(none)");
     if (dcp6_adt_u32(nub, "running", &val) || val != 1 || disp0 < 0 ||
         adt_getprop(adt, disp0, "external", NULL))
         bail("the DCP is not running an internal panel\n");
