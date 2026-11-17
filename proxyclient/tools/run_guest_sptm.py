@@ -1039,7 +1039,11 @@ def main():
     # sptm_virt_enter does not return. Waiting for a reply or a boot banner would eat the guest's
     # first console output and reopen the link.
     p.request(p.P_CALL, sym["sptm_virt_enter"], no_reply=True)
-    iface.dev.flush()
+    # Once a KIS target enters the guest it can stop consuming host OUT immediately.  The enter
+    # request is already queued by write(); tcdrain here can then block forever and prevent the
+    # console tail from reading the guest's first output.  Other UART transports retain the drain.
+    if not iface.is_kis:
+        iface.dev.flush()
     secs = env_int("AURA_TAIL_SECS")
     if secs > 0:
         tail_console(iface, secs, float(os.environ.get("AURA_TAIL_IDLE") or 10))
