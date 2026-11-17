@@ -1665,7 +1665,8 @@ static void s2r_no_sleep_setup(bool cdc, u64 flags, const char *missing)
         s2r_keep_always = true;
         s2r_keep_setup();
         printf("SPTM-virt[s2r]: no sleep path, the ADT gives no %s; keeping the debug-link "
-               "domains only\n", missing);
+               "domains only\n",
+               missing);
     } else {
         printf("SPTM-virt[s2r]: no sleep path, the ADT gives no %s; debug-link domains not kept\n",
                missing);
@@ -1673,8 +1674,9 @@ static void s2r_no_sleep_setup(bool cdc, u64 flags, const char *missing)
     /* Keep main's passive ring/catalogue on KIS and link-only transports alike.
      * The full sleep profile and its commit/wake machinery remain disabled. */
     if ((flags & SPTM_VIRT_S2R) && s2r_ring_alloc(S2R_RING_BYTES))
-        printf("SPTM-virt[s2r]: %lu-record ring at 0x%lx for live in-guest tracing, no sleep path\n",
-               (unsigned long)sptm_virt_s2r_nrec, (unsigned long)sptm_virt_s2r_ring);
+        printf(
+            "SPTM-virt[s2r]: %lu-record ring at 0x%lx for live in-guest tracing, no sleep path\n",
+            (unsigned long)sptm_virt_s2r_nrec, (unsigned long)sptm_virt_s2r_ring);
 }
 
 /* cdc: the proxy runs over the DWC3 CDC link, whose domains are kept on even without the trace. */
