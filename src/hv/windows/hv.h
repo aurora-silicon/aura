@@ -8,6 +8,7 @@
 #include "../../../config.h"
 
 #include "exception.h"
+#include "hv_ahci.h"
 #include "hv_t8152.h"
 #include "iodev.h"
 #include "types.h"
@@ -54,6 +55,8 @@ void hv_windows_quarantine(void);
  * is live in the registers across the carrier's idle wait.  Kept as an ABI bit only.
  */
 #define HV_WINDOWS_T8152_WFI BIT(18)
+/* D1: the carrier-emulated AHCI disk (hv_ahci.c); T8152 with the software GIC only. */
+#define HV_WINDOWS_T8152_AHCI BIT(19)
 bool hv_t8152_native_wfi(void);
 /* The guest's ACTLR_EL1 from EL2. T8152 never touches the implementation-defined alias. */
 u64 hv_guest_actlr_read(void);
@@ -70,6 +73,9 @@ bool hv_t8152_gic_owned(void);
 void hv_t8152_gic_claim(const char *why);
 bool hv_t8152_gic_enter_cpu(bool os_phase);
 void hv_t8152_gic_cpu_start(void);
+/* D1: level of a carrier-emulated SPI (hv_vdev_spi.h); re-evaluate them after GICD writes. */
+void hv_t8152_gic_spi_level(u32 intid, bool level);
+void hv_t8152_vspi_refresh(void);
 void hv_kick_cpu(int cpu);
 /* Reset the machine only after NVMe is shut down; otherwise park (see hv.c). */
 void hv_safe_reset(const char *why) __attribute__((noreturn));

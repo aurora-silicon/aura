@@ -12,6 +12,7 @@ from pathlib import Path
 import re
 import struct
 from types import SimpleNamespace
+import zlib
 
 CAPS_MAGIC = 0x4157494E00000000
 CAPS_ABI = 1
@@ -577,6 +578,337 @@ def windows_system_reset(proxy):
     machine is not reset (hold power to exit; nothing was written in M2/M3)."""
     proxy.nvme_shutdown()
     proxy.reboot()
+
+
+
+# ---- D1: the carrier-emulated AHCI disk (src/hv/windows/hv_ahci.h) -------------------------
+#
+# The carrier emulates one AHCI 1.3.1 HBA at a fixed guest IPA and keeps the disk in DRAM at
+# the top of the --windows-guest-ram window.  The guest RAM becomes [BASE, store_base); the
+# store, its slack and a 64 KiB descriptor fill [store_base, TOP).  Contract values must match
+# the resident (P_HV_WINDOWS_AHCI QUERY), Mu's J804Windows.h and the FD marker at 0x110.
+CAPS2_MAGIC = 0x4157493200000000          # 'AWI2'
+CAPS2_AHCI = 0x0001                       # AHCI RAM store v1
+CONFIG_T8152_AHCI = 0x80000                # hv_windows_configure BIT(19)
+AHCI_VERSION = 1
+AHCI_ABAR = 0xF40000000
+AHCI_ABAR_SIZE = 0x4000
+AHCI_GSIV = 990
+AHCI_CAP = 0x81341F00
+AHCI_PROPERTY = "aura,windows-ahci-v1"
+AHCI_BOOT = {"disk": 0, "ramdisk": 1}
+AHCI_DESC_SIZE = 0x10000
+AHCI_STORE_ALIGN = 32 << 20
+AHCI_MIN_GUEST = 4 << 30
+AHCI_MIN_DISK = 1 << 20
+AHCI_SIZE_ROUND = 256 << 20
+AHCI_UEFI_TOP = 128 << 20                 # PrePi's UEFI region at the guest RAM top
+J804_HANDOFF = (0x10220000000, 0x10220204000)   # Mu J804Windows.h J804_HANDOFF_BASE/TOP
+AHCI_FD_MARKER_OFFSET = 0x110
+AHCI_FD_MARKER = b"J804AHC1"
+AHCI_CHUNK = 16 << 20
+AHCI_OP_QUERY, AHCI_OP_ATTACH, AHCI_OP_SEAL_UPLOAD, AHCI_OP_SEAL_EXIT, AHCI_OP_STATUS = range(5)
+AHCI_Q = {"version": 0, "abar": 1, "abar_size": 2, "intid": 3, "cap": 4, "min_guest": 5,
+          "store_align": 6, "desc_size": 7}
+AHCI_ATTACH_KEEP = 0x1
+AHCI_ATTACH_ACCEPT_UNSEALED = 0x2
+AHCI_ATTACH_OVERWRITE = 0x4
+AHCI_LIVE_STATES = ("READY", "RUNNING", "SEALED")   # a fresh attach refuses these by default
+AHCI_ERROR = (1 << 64) - 1
+AHCI_STATES = ("EMPTY", "LOADING", "READY", "RUNNING", "SEALED")
+AHCI_DESC_MAGIC = b"AWAHCI01"
+AHCI_DESC_FORMAT = "<8sIIQQQIIIiQ"        # up to desc_crc32 (0x40 bytes), then <I crc
+AHCI_DESC_CRC_OFF = 0x40
+AHCI_NOTE_OFF = 0x200
+AHCI_NOTE_SIZE = 256
+
+
+@dataclass(frozen=True)
+class AhciPlan:
+    window_base: int
+    window_top: int
+    store_base: int
+    disk_bytes: int
+
+    @property
+    def desc_base(self):
+        return self.window_top - AHCI_DESC_SIZE
+
+    @property
+    def guest_top(self):
+        return self.store_base
+
+    @property
+    def guest_bytes(self):
+        return self.store_base - self.window_base
+
+
+def parse_size(text):
+    """'12G', '12GiB', '512M', '0x300000000' or a byte count."""
+    if isinstance(text, int):
+        return text
+    m = re.fullmatch(r"\s*(0x[0-9a-fA-F]+|\d+)\s*([KMGT]?)(?:i?B)?\s*", str(text))
+    require(m is not None, f"cannot read the size {text!r} (examples: 12G, 13000M, 0x300000000)")
+    value = int(m.group(1), 0)
+    return value << {"": 0, "K": 10, "M": 20, "G": 30, "T": 40}[m.group(2)]
+
+
+def ahci_default_disk_bytes(image_bytes):
+    """The image size rounded up to 256 MiB."""
+    return max(AHCI_SIZE_ROUND, _aligned(image_bytes, AHCI_SIZE_ROUND))
+
+
+def ahci_max_disk_bytes(base, top):
+    """The largest disk the window [base, top) can hold with 4 GiB of guest RAM left."""
+    floor = _aligned(base + AHCI_MIN_GUEST, AHCI_STORE_ALIGN)
+    desc = top - AHCI_DESC_SIZE
+    return max(0, (desc - floor) & ~511)
+
+
+def plan_t8152_ahci(base, top, disk_bytes, image_bytes=None):
+    """Split the T8152 guest RAM window into guest RAM and the AHCI store (D1-AHCI-DESIGN 4.1).
+
+    Raises ValueError with the reason.  The resident re-checks the store against every
+    carve-out, CTXR range, aura, its heaps, the ADT and the scanout (hv_t8152_reserve_store)."""
+    validate_t8152_window(base, top)
+    require(top % AHCI_DESC_SIZE == 0, "guest_ram top must be 64 KiB aligned for the AHCI "
+            "store descriptor")
+    require(isinstance(disk_bytes, int) and disk_bytes % 512 == 0 and disk_bytes >= AHCI_MIN_DISK,
+            f"AHCI disk size {disk_bytes} must be a multiple of 512 bytes and at least 1 MiB")
+    if image_bytes is not None:
+        require(image_bytes <= disk_bytes, f"the disk image ({image_bytes} bytes) is larger "
+                f"than the AHCI store ({disk_bytes} bytes)")
+    cap = ahci_max_disk_bytes(base, top)
+    require(disk_bytes <= cap, f"an AHCI disk of {disk_bytes / 2**30:.2f} GiB leaves less than "
+            f"4 GiB of guest RAM in [{base:#x}, {top:#x}); the largest is {cap} bytes "
+            f"({cap / 2**30:.2f} GiB)")
+    store_base = (top - AHCI_DESC_SIZE - disk_bytes) & ~(AHCI_STORE_ALIGN - 1)
+    plan = AhciPlan(base, top, store_base, disk_bytes)
+    require(plan.guest_bytes >= AHCI_MIN_GUEST, "guest RAM below 4 GiB")
+    lo, hi = J804_HANDOFF
+    require(base <= lo and hi <= store_base - AHCI_UEFI_TOP,
+            f"the PrePi hand-off copies [{lo:#x}, {hi:#x}) must lie in guest RAM below the "
+            f"128 MiB UEFI region at its top ({store_base - AHCI_UEFI_TOP:#x})")
+    return plan
+
+
+def check_t8152_ahci_layout(plan, adt_base, image_end):
+    """After load_raw: the ADT/TrustCache/FD/blobs/boot_args span [adt_base, image_end) must lie
+    in guest RAM, clear of the hand-off copies and below the UEFI region at the RAM top."""
+    lo, hi = J804_HANDOFF
+    uefi = plan.guest_top - AHCI_UEFI_TOP
+    require(plan.window_base <= adt_base < image_end <= uefi,
+            f"the loaded payload [{adt_base:#x}, {image_end:#x}) must end below the UEFI region "
+            f"at {uefi:#x}")
+    require(image_end <= lo or hi <= adt_base,
+            f"the loaded payload [{adt_base:#x}, {image_end:#x}) overlaps the PrePi hand-off "
+            f"copies [{lo:#x}, {hi:#x})")
+
+
+def ahci_handshake(plan, boot):
+    """The /chosen/aura,windows-ahci-v1 property (Mu J804Windows.h, 40-byte form)."""
+    return struct.pack("<QQIIQQ", AHCI_ABAR, AHCI_ABAR_SIZE, AHCI_GSIV, AHCI_BOOT[boot],
+                       plan.store_base, plan.window_top)
+
+
+def resolve_ahci_boot(boot, appended_ramdisk):
+    """--windows-ahci-boot auto: the appended RAM disk if there is one, else the AHCI disk."""
+    require(boot in ("auto", "disk", "ramdisk"), "AHCI boot must be auto, disk or ramdisk")
+    if boot == "auto":
+        return "ramdisk" if appended_ramdisk else "disk"
+    if boot == "ramdisk":
+        require(appended_ramdisk, "--windows-ahci-boot ramdisk needs an appended RAM disk (-a)")
+    return boot
+
+
+def fd_ahci_marker(fd):
+    """(ABAR, GSIV) from an AHCI FD's raw marker at 0x110, or None for any other FD."""
+    block = bytes(fd[AHCI_FD_MARKER_OFFSET:AHCI_FD_MARKER_OFFSET + 16])
+    if len(block) != 16 or block[:8] != AHCI_FD_MARKER:
+        return None
+    page, gsiv = struct.unpack("<II", block[8:])
+    return page << 12, gsiv
+
+
+def validate_ahci_contract(caps2, query, fd):
+    """The resident's CAPS2 and QUERY answers and the FD marker must all be the D1 contract.
+
+    query(name) returns the resident's QUERY value.  Raises ValueError with the reason."""
+    require(isinstance(caps2, int) and caps2 >> 32 == CAPS2_MAGIC >> 32 and caps2 & CAPS2_AHCI,
+            "the resident has no AHCI disk (P_HV_WINDOWS_CAPS2 bit 0): rebuild the carrier "
+            "from j804-windows with D1")
+    expect = {"version": AHCI_VERSION, "abar": AHCI_ABAR, "abar_size": AHCI_ABAR_SIZE,
+              "intid": AHCI_GSIV, "cap": AHCI_CAP, "min_guest": AHCI_MIN_GUEST,
+              "store_align": AHCI_STORE_ALIGN, "desc_size": AHCI_DESC_SIZE}
+    for name, value in expect.items():
+        got = query(name)
+        require(got == value, f"resident AHCI {name} is {got:#x}, this launcher expects "
+                f"{value:#x}")
+    marker = fd_ahci_marker(fd)
+    require(marker is not None, "the payload is not an AHCI FD (no J804AHC1 marker at 0x110): "
+            "build Mu with J804_WINDOWS_AHCI=TRUE (out/j804-windows-ahci)")
+    require(marker == (AHCI_ABAR, AHCI_GSIV), f"the FD's AHCI marker {marker[0]:#x}/{marker[1]} "
+            f"differs from the carrier's {AHCI_ABAR:#x}/{AHCI_GSIV}")
+
+
+def pack_ahci_desc(window_top, store_base, disk_bytes, state, generation=0, disk_crc=0,
+                   last_exit=0, alive_cntpct=0):
+    head = struct.pack(AHCI_DESC_FORMAT, AHCI_DESC_MAGIC, AHCI_VERSION, AHCI_DESC_CRC_OFF,
+                       window_top, store_base, disk_bytes, state, generation, disk_crc,
+                       last_exit, alive_cntpct)
+    return head + struct.pack("<I", zlib.crc32(head))
+
+
+def parse_ahci_desc(blob):
+    """The store descriptor's header (see hv_ahci.h); ValueError if it is not a valid one."""
+    blob = bytes(blob)
+    require(len(blob) >= AHCI_DESC_CRC_OFF + 4, "AHCI store descriptor is truncated")
+    fields = struct.unpack(AHCI_DESC_FORMAT, blob[:AHCI_DESC_CRC_OFF])
+    (crc,) = struct.unpack("<I", blob[AHCI_DESC_CRC_OFF:AHCI_DESC_CRC_OFF + 4])
+    require(fields[0] == AHCI_DESC_MAGIC and fields[1] == AHCI_VERSION and
+            fields[2] == AHCI_DESC_CRC_OFF, "no AHCI store descriptor here (magic/version): "
+            "nothing to keep")
+    require(zlib.crc32(blob[:AHCI_DESC_CRC_OFF]) == crc, "AHCI store descriptor CRC mismatch")
+    names = ("magic", "version", "header_size", "window_top", "store_base", "disk_bytes",
+             "state", "generation", "disk_crc32", "last_exit", "alive_cntpct")
+    desc = dict(zip(names, fields))
+    desc["desc_crc32"] = crc
+    desc["state_name"] = AHCI_STATES[desc["state"]] if desc["state"] < len(AHCI_STATES) else "?"
+    return desc
+
+
+def ahci_keep_plan(base, top, desc, accept_unsealed=False):
+    """The plan of a kept store, from its descriptor (the resident re-verifies the disk CRC)."""
+    require(desc["window_top"] == top, f"the kept store belongs to a window ending at "
+            f"{desc['window_top']:#x}, not {top:#x}")
+    ok = ("READY", "SEALED") + (("RUNNING",) if accept_unsealed else ())
+    require(desc["state_name"] in ok, f"the kept store is {desc['state_name']}"
+            + ("" if accept_unsealed else "; only a sealed store is kept "
+               "(--windows-ahci-keep-unsealed accepts a RUNNING one)"))
+    plan = plan_t8152_ahci(base, top, desc["disk_bytes"])
+    require(plan.store_base == desc["store_base"], "the kept store's base does not match this "
+            "window's plan")
+    return plan
+
+
+def parse_ahci_note(blob):
+    """The host note at +0x200 of a descriptor blob: {"sha256", "bytes", "uploaded"} or None
+    when there is none or it is not one this launcher wrote."""
+    raw = bytes(blob[AHCI_NOTE_OFF:AHCI_NOTE_OFF + AHCI_NOTE_SIZE]).split(b"\0", 1)[0]
+    m = re.fullmatch(rb"image sha256 ([0-9a-f]{64}) bytes (\d+) uploaded (\S+)", raw)
+    if not m:
+        return None
+    return {"sha256": m.group(1).decode(), "bytes": int(m.group(2)),
+            "uploaded": m.group(3).decode()}
+
+
+def describe_ahci_note(note):
+    if note is None:
+        return "none (the store records no image)"
+    return f"image sha256 {note['sha256']}, {note['bytes']} bytes, uploaded {note['uploaded']}"
+
+
+def check_ahci_keep_expect(note, expect):
+    """--windows-ahci-keep-expect: the kept store must come from the image with this SHA-256."""
+    if not expect:
+        return
+    expect = expect.strip().lower()
+    require(re.fullmatch(r"[0-9a-f]{64}", expect) is not None,
+            "--windows-ahci-keep-expect takes a 64-digit SHA-256")
+    require(note is not None, "the kept store has no host note, so its image cannot be "
+            "checked against --windows-ahci-keep-expect")
+    require(note["sha256"] == expect, f"the kept store holds image sha256 {note['sha256']}, "
+            f"not {expect}")
+
+
+def check_ahci_fresh_overwrite(blob, top, overwrite):
+    """A fresh upload zeroes [store_base, top): refuse it over a live store at this window's
+    top unless --windows-ahci-overwrite.  Returns the descriptor found (or None)."""
+    try:
+        desc = parse_ahci_desc(blob)
+    except ValueError:
+        return None
+    if desc["window_top"] != top or desc["state_name"] not in AHCI_LIVE_STATES:
+        return None
+    what = (f"a {desc['state_name']} store, generation {desc['generation']}, "
+            f"{desc['disk_bytes'] / 2**30:.2f} GiB; {describe_ahci_note(parse_ahci_note(blob))}")
+    require(overwrite, f"the window top already holds {what}. Keep it with "
+            "--windows-ahci-keep, or pass --windows-ahci-overwrite to zero it")
+    print(f"T8152 AHCI: overwriting {what}")
+    return desc
+
+
+def ahci_image_info(path):
+    """(size, warnings) of a raw GPT disk image; ValueError if it is not one."""
+    path = Path(path)
+    size = path.stat().st_size
+    require(size >= 34 * 512 and size % 512 == 0, f"{path} is not a raw disk image (size "
+            f"{size} is not a multiple of 512 bytes of at least 34 sectors)")
+    warnings = []
+    with path.open("rb") as f:
+        mbr = f.read(512)
+        gpt = f.read(512)
+        f.seek(size - 512)
+        backup = f.read(512)
+    require(mbr[510:512] == b"\x55\xaa" and any(mbr[446 + 16 * i + 4] == 0xEE for i in range(4)),
+            f"{path} has no protective MBR: pass a raw GPT disk (qemu-img convert -O raw)")
+    require(gpt[:8] == b"EFI PART", f"{path} has no GPT header at LBA 1")
+    if backup[:8] != b"EFI PART":
+        warnings.append("no backup GPT header at the last LBA")
+    return size, warnings
+
+
+def ahci_image_chunks(f, size, disk_bytes, chunk=AHCI_CHUNK):
+    """(offset, data or None) for every chunk of the disk; None for a chunk that is a hole or
+    all zero in the image (or beyond it).  Holes are found with SEEK_DATA where the host has
+    it, so a sparse image is never read in full."""
+    zero = bytes(chunk)
+    seek_data = getattr(os, "SEEK_DATA", None)
+    fd = f.fileno()
+    for off in range(0, disk_bytes, chunk):
+        n = min(chunk, disk_bytes - off)
+        if off >= size:
+            yield off, n, None
+            continue
+        if seek_data is not None:
+            try:
+                data_at = os.lseek(fd, off, seek_data)
+            except OSError:
+                data_at = size  # ENXIO: only a hole follows
+            if data_at >= off + n:
+                yield off, n, None
+                continue
+        f.seek(off)
+        data = f.read(min(n, size - off))
+        if len(data) < n:
+            data += bytes(n - len(data))
+        yield off, n, (None if data == zero[:n] else data)
+
+
+def upload_ahci_image(path, disk_bytes, write, chunk=AHCI_CHUNK, progress=None):
+    """Stream the image into the store with write(offset, data), skipping zero chunks (the
+    resident zero-filled the store).  Returns (crc32 over all disk_bytes, image sha256,
+    uploaded bytes)."""
+    crc, sha, sent = 0, hashlib.sha256(), 0
+    zero = bytes(chunk)
+    size = Path(path).stat().st_size
+    with open(path, "rb") as f:
+        for off, n, data in ahci_image_chunks(f, size, disk_bytes, chunk):
+            block = data if data is not None else zero[:n]
+            crc = zlib.crc32(block, crc)
+            if off < size:
+                sha.update(block[:min(n, size - off)])
+            if data is not None:
+                write(off, data)
+                sent += n
+            if progress:
+                progress(off + n, disk_bytes, sent)
+    return crc, sha.hexdigest(), sent
+
+
+def ahci_host_note(sha256, image_bytes, when):
+    note = f"image sha256 {sha256} bytes {image_bytes} uploaded {when}".encode()
+    return note[:AHCI_NOTE_SIZE - 1].ljust(AHCI_NOTE_SIZE, b"\0")
 
 
 def _aligned(value, alignment):

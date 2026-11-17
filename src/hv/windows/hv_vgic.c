@@ -987,6 +987,9 @@ static bool handle_vgic_dist_access(struct exc_info *ctx, u64 addr, u64 *val, bo
     } else {
         vgic_log("\n");
     }
+    /* D1: an enable or routing change re-evaluates the carrier-emulated SPIs (hv_exc.c). */
+    if (write)
+        hv_t8152_vspi_refresh();
     return register_handled;
 }
 
@@ -1087,6 +1090,22 @@ u32 hv_vgic3_dist_enabled_spis(u32 *first, u32 max)
         }
     }
     return count;
+}
+
+bool hv_vgic3_spi_enabled(u32 intid)
+{
+    if (distributor == NULL || intid < 32 || intid >= 1020)
+        return false;
+    u32 word =
+        __atomic_load_n(&distributor->gicd_interrupt_set_enable_regs[intid / 32], __ATOMIC_RELAXED);
+    return (word & BIT(intid % 32)) != 0;
+}
+
+u64 hv_vgic3_spi_route(u32 intid)
+{
+    if (distributor == NULL || intid < 32 || intid >= 1020)
+        return 0;
+    return __atomic_load_n(&distributor->gicd_interrupt_router_regs[intid - 32], __ATOMIC_RELAXED);
 }
 
 static bool handle_vgic_redist_access(struct exc_info *ctx, u64 addr, u64 *val, bool write,

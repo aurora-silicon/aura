@@ -3,7 +3,7 @@
 import sys, pathlib, traceback
 sys.path.append(str(pathlib.Path(__file__).resolve().parents[1]))
 
-import argparse, pathlib
+import argparse, pathlib, time
 from io import BytesIO
 
 def volumespec(s):
@@ -55,6 +55,35 @@ parser.add_argument('--windows-guest-compatibility', choices=('none', 't8152-pmu
 parser.add_argument('--windows-reset-on-exit', action='store_true',
                     help='T8152: when the guest asks for PSCI SYSTEM_RESET, shut NVMe down and '
                          'reset through WD1. Default: stay in the aura proxy.')
+parser.add_argument('--windows-ahci-image', type=pathlib.Path, default=None, metavar='PATH',
+                    help='T8152 D1: a raw GPT disk image (sparse allowed) for the carrier-emulated '
+                         'AHCI disk. The disk lives in DRAM at the top of --windows-guest-ram; '
+                         'guest RAM shrinks to what is left (at least 4 GiB). Needs an AHCI FD '
+                         '(Mu J804_WINDOWS_AHCI, marker J804AHC1 at 0x110).')
+parser.add_argument('--windows-ahci-store-size', default=None, metavar='SIZE',
+                    help='T8152 D1: the disk size (e.g. 12G); default: the image size rounded up '
+                         'to 256 MiB. At most what leaves 4 GiB of guest RAM.')
+parser.add_argument('--windows-ahci-keep', action='store_true',
+                    help='T8152 D1: reuse the disk a previous run sealed (after a PSCI '
+                         'SYSTEM_OFF/RESET and an in-place carrier reload). The resident checks '
+                         'the sealed CRC-32 before attaching it. Not with --windows-ahci-image.')
+parser.add_argument('--windows-ahci-keep-unsealed', action='store_true',
+                    help='T8152 D1: like --windows-ahci-keep, but also accept a store whose last '
+                         'run did not end with a PSCI exit (no integrity check is possible). '
+                         'UNSAFE after a hard reset, panic reboot or power cycle: DRAM is not '
+                         'preserved then. The resident refuses when the system counter shows a '
+                         'reset since the store was last alive, but cannot catch every reset.')
+parser.add_argument('--windows-ahci-keep-expect', default=None, metavar='SHA256',
+                    help='T8152 D1, with --windows-ahci-keep(-unsealed): refuse unless the kept '
+                         'store was uploaded from the image with this SHA-256 (from its host '
+                         'note; the note is printed either way).')
+parser.add_argument('--windows-ahci-overwrite', action='store_true',
+                    help='T8152 D1, with --windows-ahci-image: replace a READY, RUNNING or '
+                         'SEALED store found at the window top. Without it a fresh upload over '
+                         'such a store is refused, so a Windows install is not lost by mistake.')
+parser.add_argument('--windows-ahci-boot', choices=('auto', 'disk', 'ramdisk'), default='auto',
+                    help='T8152 D1: what Mu boots first: "auto" (default) is the appended RAM '
+                         'disk when -a gives one, else the AHCI disk.')
 parser.add_argument('payload', type=pathlib.Path)
 parser.add_argument('boot_args', default=[], nargs="*")
 args = parser.parse_args()
@@ -82,6 +111,155 @@ def windows_resident_caps():
     return caps if caps >> 32 == CAPS_MAGIC >> 32 else 0
 
 
+def ahci_requested():
+    return bool(args.windows_ahci_image or args.windows_ahci_store_size or args.windows_ahci_keep
+                or args.windows_ahci_keep_unsealed or args.windows_ahci_boot != 'auto'
+                or args.windows_ahci_keep_expect or args.windows_ahci_overwrite)
+
+
+def no_timeout(call, *a):
+    """A resident op that walks the whole store (zero-fill, CRC-32): no link timeout."""
+    timeout = iface.dev.timeout
+    iface.dev.timeout = None
+    try:
+        return call(*a)
+    finally:
+        iface.dev.timeout = timeout
+
+
+def windows_t8152_ahci_plan(base, top, payload):
+    """D1: check the resident, the FD and the options, and split the window.  Nothing on the
+    machine changes here; a refusal leaves the proxy as it was."""
+    from aura import windows as w
+    try:
+        if args.windows_ahci_image and (args.windows_ahci_keep or args.windows_ahci_keep_unsealed):
+            raise ValueError("--windows-ahci-keep reuses the sealed disk: it takes no "
+                             "--windows-ahci-image")
+        if args.windows_reset_on_exit and ahci_requested():
+            raise ValueError("--windows-reset-on-exit resets the machine through WD1, which "
+                             "loses the DRAM disk: not with an AHCI disk")
+        marker = w.fd_ahci_marker(payload)
+        if not ahci_requested():
+            if marker is not None:
+                raise ValueError("this is an AHCI FD (J804AHC1 marker): pass "
+                                 "--windows-ahci-image or --windows-ahci-keep, or use the "
+                                 "non-AHCI FD")
+            return None
+        keep = args.windows_ahci_keep or args.windows_ahci_keep_unsealed
+        if not args.windows_ahci_image and not keep:
+            raise ValueError("an AHCI option needs --windows-ahci-image or --windows-ahci-keep")
+        if keep and args.windows_ahci_store_size:
+            raise ValueError("--windows-ahci-keep takes the size from the sealed store")
+        if keep and args.windows_ahci_overwrite:
+            raise ValueError("--windows-ahci-overwrite replaces a store: not with "
+                             "--windows-ahci-keep")
+        if args.windows_ahci_keep_expect and not keep:
+            raise ValueError("--windows-ahci-keep-expect checks a kept store: it needs "
+                             "--windows-ahci-keep")
+        try:
+            caps2 = p.hv_windows_capabilities2()
+        except ProxyRemoteError:
+            caps2 = 0  # an older resident: Bad Command
+        query = lambda name: p.hv_windows_ahci(w.AHCI_OP_QUERY, w.AHCI_Q[name])
+        w.validate_ahci_contract(caps2, query if caps2 else (lambda name: None), payload)
+        boot = w.resolve_ahci_boot(args.windows_ahci_boot, bool(args.append_payload))
+        blob = iface.readmem(top - w.AHCI_DESC_SIZE, w.AHCI_NOTE_OFF + w.AHCI_NOTE_SIZE)
+        if keep:
+            desc = w.parse_ahci_desc(blob)
+            note = w.parse_ahci_note(blob)
+            print(f"T8152 AHCI: the store's host note: {w.describe_ahci_note(note)}")
+            plan = w.ahci_keep_plan(base, top, desc, args.windows_ahci_keep_unsealed)
+            w.check_ahci_keep_expect(note, args.windows_ahci_keep_expect)
+            print(f"T8152 AHCI: keeping the {desc['state_name']} store, generation "
+                  f"{desc['generation']}, disk CRC-32 {desc['disk_crc32']:#010x}")
+            image = None
+        else:
+            w.check_ahci_fresh_overwrite(blob, top, args.windows_ahci_overwrite)
+            image = args.windows_ahci_image
+            size, warnings = w.ahci_image_info(image)
+            for warning in warnings:
+                print(f"T8152 AHCI: warning: {image}: {warning}")
+            disk = (w.parse_size(args.windows_ahci_store_size) if args.windows_ahci_store_size
+                    else w.ahci_default_disk_bytes(size))
+            plan = w.plan_t8152_ahci(base, top, disk, size)
+            if disk > size:
+                print(f"T8152 AHCI: the disk ({disk} bytes) is larger than the image ({size}); "
+                      "the GPT backup header is not at the disk's last LBA until the guest "
+                      "repairs it")
+    except ValueError as exc:
+        sys.exit(f"T8152 launch refused: {exc}. The aura proxy keeps running; no guest was "
+                 "started.")
+    print(f"T8152 AHCI: disk [{plan.store_base:#x}, {plan.store_base + plan.disk_bytes:#x}) "
+          f"{plan.disk_bytes / 2**30:.2f} GiB, descriptor {plan.desc_base:#x}, guest RAM "
+          f"[{plan.window_base:#x}, {plan.guest_top:#x}) {plan.guest_bytes / 2**30:.2f} GiB, "
+          f"boot {boot}")
+    return {"plan": plan, "boot": boot, "keep": keep, "image": image,
+            "unsealed": args.windows_ahci_keep_unsealed,
+            "overwrite": args.windows_ahci_overwrite}
+
+
+def windows_t8152_ahci_attach(hv, u, ahci):
+    """After load_raw: attach the store (fresh: zero it, upload the image, seal the upload)."""
+    from aura import windows as w
+    plan = ahci["plan"]
+    try:
+        w.check_t8152_ahci_layout(plan, hv.adt_base, hv.tba.top_of_kernel_data)
+    except ValueError as exc:
+        sys.exit(f"T8152 launch refused: {exc}. hv_init() ran, so the carrier session is used "
+                 "up: reload the carrier before another attempt. No guest was started.")
+    flags = 0
+    if ahci["keep"]:
+        flags |= w.AHCI_ATTACH_KEEP
+    if ahci["unsealed"]:
+        flags |= w.AHCI_ATTACH_ACCEPT_UNSEALED
+    if ahci["overwrite"]:
+        flags |= w.AHCI_ATTACH_OVERWRITE
+    print("T8152 AHCI: attaching the store (a fresh one is zeroed; a kept one is CRC-checked)")
+    if no_timeout(p.hv_windows_ahci, w.AHCI_OP_ATTACH, plan.store_base, plan.window_top,
+                  plan.disk_bytes, flags) != 0:
+        sys.exit("T8152: the resident refused the AHCI store (its console says why). The carrier "
+                 "session is used up: reload the carrier. No guest was started.")
+    if ahci["keep"]:
+        return
+    start = time.time()
+
+    def write(offset, data):
+        u.compressed_writemem(plan.store_base + offset, data, True)
+
+    def progress(done, total, sent):
+        if done % (1 << 30) < w.AHCI_CHUNK or done == total:
+            print(f"T8152 AHCI: {done >> 20} / {total >> 20} MiB scanned, {sent >> 20} MiB "
+                  f"uploaded, {time.time() - start:.0f} s")
+
+    crc, sha, sent = w.upload_ahci_image(ahci["image"], plan.disk_bytes, write, progress=progress)
+    size = ahci["image"].stat().st_size
+    iface.writemem(plan.desc_base + w.AHCI_NOTE_OFF,
+                   w.ahci_host_note(sha, size, time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())))
+    sealed = no_timeout(p.hv_windows_ahci, w.AHCI_OP_SEAL_UPLOAD, crc)
+    if sealed != crc:
+        sys.exit(f"T8152: the resident's CRC-32 of the store does not match the host's "
+                 f"{crc:#010x}: the upload is damaged. Reload the carrier. No guest was started.")
+    print(f"T8152 AHCI: {sent >> 20} MiB uploaded in {time.time() - start:.0f} s, image sha256 "
+          f"{sha}, disk CRC-32 {crc:#010x} verified by the resident")
+
+
+def windows_t8152_ahci_seal(result, ahci):
+    from aura import windows as w
+    if result not in (1, 2):
+        print("T8152 AHCI: the guest did not end with a PSCI exit: the store is NOT sealed "
+              "(--windows-ahci-keep-unsealed can still reuse it, unverified, after an in-place "
+              "carrier reload; not after a hard reset or power cycle)")
+        return
+    sealed = no_timeout(p.hv_windows_ahci, w.AHCI_OP_SEAL_EXIT)
+    if sealed == w.AHCI_ERROR:
+        print("T8152 AHCI: the resident refused to seal the store (its console says why)")
+        return
+    print(f"T8152 AHCI: store sealed, generation {sealed >> 32}, disk CRC-32 "
+          f"{sealed & 0xffffffff:#010x}. To keep it: reload the carrier in place (no hard reset, "
+          f"no power cycle) and run again with --windows-ahci-keep and the same "
+          f"--windows-guest-ram")
+
+
 def run_windows_t8152(caps):
     """The Windows personality (gmake WINDOWS=1) on T8152: the guest gets only its
     RAM window, the AIC (Device-nGnRnE) and emulated MMIO; the resident refuses to
@@ -96,6 +274,8 @@ def run_windows_t8152(caps):
     if not args.windows_guest_ram or ":" not in args.windows_guest_ram:
         sys.exit("T8152 needs --windows-guest-ram BASE:TOP (see docs/windows-t8152.md)")
     base, top = (number(v, "guest RAM") for v in args.windows_guest_ram.split(":", 1))
+    payload = args.payload.read_bytes()
+    ahci = windows_t8152_ahci_plan(base, top, payload)
 
     u = ProxyUtils(p, heap_size=PROXY_HEAP_SIZE, aura_heap=AURA_HEAP_RESERVE)
     if u.adt["/chosen"].chip_id != T8152_CHIP:
@@ -113,7 +293,8 @@ def run_windows_t8152(caps):
     hv = HV(iface, p, u, windows=True)
     hv.windows_framebuffer = "bgra-shadow"
     hv.windows_serial = args.windows_serial
-    hv.windows_guest_ram = (base, top)
+    hv.windows_guest_ram = (base, ahci["plan"].store_base) if ahci else (base, top)
+    hv.windows_ahci = ahci
     hv.windows_ipi = args.windows_ipi
     hv.windows_gic_cpuif = args.windows_gic_cpuif or "software"
     hv.windows_wfi = args.windows_wfi
@@ -144,7 +325,7 @@ def run_windows_t8152(caps):
         hv.set_logfile(log)
     if args.boot_args:
         hv.set_bootargs(" ".join(args.boot_args))
-    data = args.payload.read_bytes()
+    data = payload
     for part in args.append_payload:
         data += part.read_bytes()
     hv.load_raw(data, args.entry_point)
@@ -152,12 +333,16 @@ def run_windows_t8152(caps):
         sys.exit("Mu payload base is not 64 KiB aligned")
     print(f"T8152: Mu at {hv.guest_base:#x}, entry {hv.entry:#x}, "
           f"boot_args {hv.guest_base + hv.bootargs_off:#x}")
+    if ahci:
+        windows_t8152_ahci_attach(hv, u, ahci)
     try:
         result = hv.start()
     except ProxyRemoteError as exc:
         sys.exit(f"Hypervisor refused or failed: {exc}. The aura proxy keeps running; "
                  "its console says why.")
     print(f"Guest exit status: {result} (1 SYSTEM_OFF, 2 SYSTEM_RESET)")
+    if ahci:
+        windows_t8152_ahci_seal(result, ahci)
     if result == 2 and args.windows_reset_on_exit:
         print("SYSTEM_RESET: shutting NVMe down, then resetting through WD1")
         windows_system_reset(p)
@@ -171,7 +356,7 @@ if _windows_caps and p.get_chipid() == 0x8152:
     run_windows_t8152(_windows_caps)
 elif (args.windows_guest_ram or args.windows_ipi != 'poll' or args.windows_reset_on_exit or
       args.windows_gic_cpuif not in (None, 'carrier') or args.windows_wfi != 'poll' or
-      args.windows_guest_compatibility != 'none'):
+      args.windows_guest_compatibility != 'none' or ahci_requested()):
     sys.exit("--windows-* options need the Windows personality (gmake WINDOWS=1) on T8152")
 
 if args.emulate_sprr or not p.get_cpu_features().apple_sysregs_unlocked:

@@ -213,3 +213,126 @@ FWB is clear, stage 2 and the SMC trap are on, `framebuffer=bgra-shadow` is sele
   node, and gets `aura,windows-nvram-hidden`.
 - `run_guest.py -r -E 0 --windows-guest-ram BASE:TOP MU.fd` drives the same path on a
   Windows resident on T8152; it never stops secondaries or sleeps the machine afterwards.
+
+## D1: the carrier-emulated AHCI disk
+
+Status: built and host-tested only (`tests/python/test_windows_t8152_ahci.py`). Nothing of it
+has run on the M6. Contract and reasoning: `windows-m6/D1-AHCI-DESIGN.md` (owner notes, not in
+this tree); the Mu side is `J804_WINDOWS_AHCI` in Mu `j804-windows`.
+
+What the guest sees:
+
+- one AHCI 1.3.1 HBA at IPA **0xF40000000** (16 KiB, hooked, never mapped), CAP 0x81341F00:
+  64-bit addressing, CLO, Gen3, 32 slots, one port, **no NCQ**, no ALPM, no hot plug;
+- one ATA disk: 512-byte sectors, LBA48, non-rotating, volatile write cache, no SMART, no
+  security, no TRIM; IDENTIFY strings `AURA-AHCI-0000000001` / `D1.0` /
+  `Aura carrier RAM disk`;
+- one interrupt, **SPI/GSIV 990**, level, active-high, with no AIC line behind it. It is
+  routed by the guest's GICD_IROUTER<990> (IRM 1: the CPU whose register access completed
+  the command; otherwise the CPU with that affinity, else the boot CPU), gated by
+  GICD_ISENABLER only (as the AIC-backed SPIs), cleared when the line drops and re-pended
+  at deactivation while still high. It is pending on at most one CPU interface, and on none
+  while it is active anywhere (one GICv3 state machine, `vdev_spi_plan`). Before the guest
+  OS owns the GIC (Mu) the level is only remembered; Mu's driver polls. Without the AHCI
+  configure flag none of this runs: a T8152 launch without D1 takes the pre-D1 GIC path.
+
+Device model (`src/hv/windows/ahci_model.c`, pure, clean room from AHCI 1.3.1 and ACS-3):
+
+- commands run synchronously inside the trapped PxCI write, lowest slot first;
+- supported: IDENTIFY DEVICE, EXECUTE DEVICE DIAGNOSTIC, READ/WRITE DMA (EXT), READ/WRITE
+  SECTORS (EXT), READ/WRITE MULTIPLE (EXT) with SET MULTIPLE MODE (1-16 sectors per DRQ
+  block, default 16), READ VERIFY (EXT), FLUSH CACHE (EXT), SET FEATURES 02/82/03/55/AA/66/CC
+  (03 records the selected DMA mode, shown in IDENTIFY words 63/88), READ LOG (DMA) EXT of
+  the log directory, STANDBY/IDLE (IMMEDIATE), CHECK POWER MODE, RECALIBRATE; everything
+  else (NOP, SMART, NCQ, DSM, security, ATAPI, the BUFFER and FUA commands) is aborted
+  (ERR 0x04), logged once per opcode. COMRESET and GHC.HR restore the device defaults
+  (UDMA 6, write cache on, 16 sectors per DRQ block);
+- every guest span (command list, FIS area, command table, PRDT, data) is checked against
+  the guest RAM window, wrap-safe, before it is touched. A span outside it is a host bus
+  fatal error (PxIS.HBFS); a data-in PRDT shorter than the transfer is PxIS.OFS (fatal);
+  both are checked for the whole PRDT before any data moves. LBA past the disk is IDNF;
+  a misaligned PRD or a malformed FIS is ABRT;
+- COMRESET (PxSCTL.DET), the AHCI software reset (two device-control FISes) and GHC.HR
+  are modelled; none of them touches the disk contents. GHC.HR keeps PxCLB/PxCLBU/PxFB/PxFBU
+  (AHCI 1.3.1 §10.4.3) and resets the other port fields.
+
+The store (`src/hv/windows/hv_ahci.c`, `hv_t8152_reserve_store()`):
+
+```
+--windows-guest-ram BASE:TOP    (unchanged; region-id-218 starts at TOP)
+desc        = [TOP - 64 KiB, TOP)                carrier-owned descriptor "AWAHCI01"
+store_base  = align_down(desc - disk, 32 MiB)
+disk        = [store_base, store_base + disk)
+guest RAM   = [BASE, store_base)                 what Mu, boot_args and Windows see
+```
+
+Worked example with a synthetic window `0x10100000000:0x10561600000` (17.52 GiB; the real
+one comes from `--windows-guest-ram` and is not recorded in this tree): a 12 GiB disk gives
+store_base 0x10260000000 and exactly 5.5 GiB of guest RAM; the largest disk that leaves the
+4 GiB minimum is 0x3615f0000 bytes (13.52 GiB). The resident refuses a store that does not start
+at the guest RAM top, is not 32 MiB aligned, or meets a carve-out, a CTXR range, aura or its
+heaps, the ADT or the scanout, and adds the whole `[store_base, TOP)` to the stage-2
+denylist, so no later map and no leaf at entry (`hv_t8152_verify`) can reach it.
+`hv_start()` additionally refuses unless the store is READY and every leaf of the ABAR page
+is this hook (`hv_ahci_verify`).
+
+Resident ABI: `P_HV_WINDOWS_CAPS` is unchanged (0x4157494e0001ffdf, ABI 1).
+`P_HV_WINDOWS_CAPS2` (0xc8d) returns `'AWI2' << 32 | 1` (bit 0: AHCI RAM store v1).
+`P_HV_WINDOWS_AHCI` (0xc8e): op 0 QUERY (0 version, 1 ABAR, 2 ABAR size, 3 INTID, 4 CAP,
+5 minimum guest RAM, 6 store alignment, 7 descriptor size), 1 ATTACH(store_base, TOP,
+disk_bytes, flags: 1 keep, 2 accept unsealed (with keep), 4 overwrite (fresh only)),
+2 SEAL_UPLOAD(host CRC-32), 3 SEAL_EXIT, 4 STATUS. Configure flag BIT(8) (`CONFIG_T8152_AHCI`), only with the software GIC.
+Descriptor states: EMPTY, LOADING (fresh, zeroed), READY (upload or kept store verified),
+RUNNING (written just before guest entry), SEALED (after a PSCI exit, with the disk CRC-32
+and generation + 1). `alive_cntpct` (+0x38) is the CNTPCT_EL0 at the last state change and,
+while the guest runs, every 10 s; the counter restarts at a SoC reset, so a value above the
+current counter shows the machine was reset since. A kept RUNNING store accepted unsealed is
+recorded as READY with its CRC-32 at that moment, so a failed entry does not lock it out. A
+fresh ATTACH refuses to zero a READY, RUNNING or SEALED store at the same TOP unless flag 4
+is given. The launcher's host note at +0x200 (image SHA-256, size, upload time) is printed
+on every keep and on a refused overwrite.
+
+Launcher (`run_guest.py`, T8152 Windows path):
+
+| Option | Meaning |
+|---|---|
+| `--windows-ahci-image PATH` | raw GPT image (sparse is fine): protective MBR and `EFI PART` at LBA 1 required, a missing backup header is a warning |
+| `--windows-ahci-store-size SIZE` | disk size (`12G`, `13000M`, hex); default the image size rounded up to 256 MiB |
+| `--windows-ahci-keep` | reuse the store a previous run sealed; the resident re-checks its CRC-32 |
+| `--windows-ahci-keep-unsealed` | also accept a RUNNING store (no integrity check possible); unsafe after a hard reset or power cycle, refused when the system counter shows a reset since the store was last alive |
+| `--windows-ahci-keep-expect SHA256` | with keep: refuse unless the store's host note names this image SHA-256 |
+| `--windows-ahci-overwrite` | with `--windows-ahci-image`: allow zeroing a READY/RUNNING/SEALED store at the window top (refused otherwise) |
+| `--windows-ahci-boot {auto,disk,ramdisk}` | Mu's first boot option; `auto` = the appended RAM disk if `-a` gives one, else the AHCI disk |
+
+Order: CAPS2/QUERY and the FD marker (`J804AHC1` at 0x110) are checked before `hv.init()`,
+together with the window split; `hv.init()` sets the configure flag and the guest ADT gets
+`/chosen/aura,windows-ahci-v1` (40 bytes: ABAR, size, GSIV, boot, store base, TOP);
+`load_raw` sets guest RAM to `[BASE, store_base)`; the payload must end below the 128 MiB
+UEFI region at the guest RAM top and miss the PrePi hand-off copies; ATTACH; for a fresh
+store the image is streamed in 16 MiB gzip chunks, holes and all-zero chunks skipped (the
+store was zeroed), the host's zlib CRC-32 of the whole disk is sent with SEAL_UPLOAD and the
+resident compares it with its own (Armv8 CRC32X); `hv.start()`; after a PSCI exit SEAL_EXIT.
+`--windows-reset-on-exit` is refused with any AHCI option (a WD1 reset loses DRAM), so is an
+AHCI FD without one, and `--windows-ahci-keep` with `--windows-ahci-image`.
+
+Keeping the disk across a Windows restart: the guest's SYSTEM_RESET returns 2, the launcher
+seals the store and prints its generation and CRC. Reload the carrier in place (no hard
+reset, no power cycle) and launch again with `--windows-ahci-keep` and the same
+`--windows-guest-ram`. Whether the in-place reload leaves the store untouched is not yet
+measured; the CRC check refuses the disk if anything changed.
+
+Host tests: the model and the routing are compiled unchanged with ASan/UBSan and replayed by
+`tests/e2e/windows_ahci_host.c` (20 cases including a seeded 10^6-step fuzz with canaries
+around guest RAM and the store); the carrier glue `hv_ahci.c` (attach, keep, seal, the
+unsealed and reset rules, the overwrite guard) is compiled unchanged against stub headers
+and driven by `tests/e2e/windows_ahci_store_host.c`; IDENTIFY is compared byte for byte with an independent
+encoder, the CRC with zlib; the store reservation is in `test_windows_t8152_policy.py`; the
+launcher planner, descriptor, FD marker, sparse upload and the HV lifecycle are in
+`test_windows_t8152_ahci.py`. `AURA_AHCI_TRANSCRIPT=<file>` saves the replay transcript;
+`AURA_MU_TREE` and `AURA_J804_AHCI_FD` enable the cross-checks against Mu's header and a
+built AHCI FD.
+
+Not known yet (D2 answers it on the M6): whether storahci accepts this HBA (ACPI-only, no
+NCQ, an immediate completion interrupt), how long a 32 MiB command holds the hypervisor lock
+under load (reported as "longest access" every 10 s while the disk is busy), and whether
+Windows ever uses non-cacheable DMA buffers (the carrier does no cache maintenance).

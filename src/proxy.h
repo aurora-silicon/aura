@@ -161,6 +161,8 @@ typedef enum {
     /* 0xc85 is P_HV_WINDOWS_EXIT_SNAPSHOT on the capture-kit branch. */
     P_HV_WINDOWS_ECPU_BOOT_STATE = 0xc86,
     P_HV_WINDOWS_GUEST_RAM = 0xc8c,
+    P_HV_WINDOWS_CAPS2 = 0xc8d,
+    P_HV_WINDOWS_AHCI = 0xc8e,
 
     P_FB_INIT = 0xd00,
     P_FB_SHUTDOWN,

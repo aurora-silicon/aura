@@ -457,6 +457,36 @@ int main(void)
     assert(hv_t8152_verify(WIN_LO + 0x800, WIN_LO, hcr_ok, true) == 0);
 
     /*
+     * D1: the AHCI disk store directly above a (smaller) guest RAM window, in a fresh
+     * session.  It must miss guest RAM, carve-outs (region-id-218 starts at WIN_HI) and
+     * aura, and once reserved no stage-2 map may reach it.
+     */
+    puts("AHCI STORE CHECK");
+    assert(hv_t8152_preflight() == 0);
+    u64 store = WIN_HI - 0x20000000;
+    assert(hv_t8152_reserve_store(store, WIN_HI) < 0);                 /* no guest RAM yet */
+    assert(hv_t8152_set_guest_ram(WIN_LO, store - WIN_LO, HOST_TOP) == 0);
+    assert(hv_t8152_allow(0x10011000000, 0x10011000000, 0x8000, false, "shadow") == 0);
+    assert(hv_t8152_allow(0x5300000000, 0x10007004000, 0x80000, true, "adt") == 0);
+    assert(hv_t8152_reserve_store(store - 0x4000, WIN_HI) < 0);        /* overlaps guest RAM */
+    assert(hv_t8152_reserve_store(store, WIN_HI + 0x4000) < 0);        /* MTE tag storage */
+    assert(hv_t8152_reserve_store(store + 0x1000, WIN_HI) < 0);        /* unaligned */
+    assert(hv_t8152_reserve_store(store, store) < 0);                  /* empty */
+    assert(hv_t8152_reserve_store(AURA, AURA + 0x4000) < 0);           /* below guest RAM */
+    assert(hv_t8152_reserve_store(store, WIN_HI) == 0);
+    assert(hv_t8152_reserve_store(store, WIN_HI) < 0);                 /* once per session */
+    assert(map(store, store | S2_HW, 0x4000) == 0xdead);              /* denied to stage 2 */
+    assert(map(WIN_HI - 0x4000, (WIN_HI - 0x4000) | S2_HW, 0x4000) == 0xdead);
+    assert(map(WIN_LO, WIN_LO | S2_HW, store - WIN_LO) != 0xdead);     /* guest RAM still is */
+    assert(hv_t8152_verify(WIN_LO + 0x800, WIN_LO, hcr_ok, true) == 0);
+    leaves[nleaves++] = (struct leaf){store, 0x4000, store | S2_HW | 2, 3};
+    assert(hv_t8152_verify(WIN_LO + 0x800, WIN_LO, hcr_ok, true) < 0); /* a leaf on the store */
+    leaves[nleaves - 1] = (struct leaf){0x1000000000, 0x4000, (store + 0x8000) | S2_HW | 2, 3};
+    assert(hv_t8152_verify(WIN_LO + 0x800, WIN_LO, hcr_ok, true) < 0); /* aliased elsewhere */
+    nleaves--;
+    assert(hv_t8152_verify(WIN_LO + 0x800, WIN_LO, hcr_ok, true) == 0);
+
+    /*
      * B2, Part C (h): the guest's ACTLR_EL1 goes through ACTLR_EL12 only.  The write of
      * that register is not yet measured on the M6, so restoring the value it already holds
      * must issue no write at all; a different value must be written exactly once.
@@ -534,6 +564,13 @@ def test_t8152_carrier_policy(tmp_path):
             "32 MiB block 0x10008000000") in place
     assert "code ends 0x10009000000 at or below 0x10009000000" in place
     assert "all 12 CPUs live in aura's dispatch loop" in live
+    store = result.stdout.split("AHCI STORE CHECK", 1)[1].split("ACTLR CHECK", 1)[0]
+    assert "AHCI store refused: the policy is not armed or guest RAM is not set" in store
+    assert "must be a 16 KiB aligned range above guest RAM" in store
+    assert "region-id-218" in store
+    assert "AHCI store [0x100d0000000, 0x100f0000000) reserved and denied to stage 2" in store
+    assert "a store is already reserved this session" in store
+    assert "AHCI disk store (D1)" in store
     assert "only 11 of 12 CPUs are live in aura's dispatch loop (not live: cpu0)" in live
 
 

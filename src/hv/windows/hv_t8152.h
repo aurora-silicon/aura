@@ -42,6 +42,14 @@ int hv_t8152_preflight(void);
 int hv_t8152_set_guest_ram(u64 base, u64 size, u64 host_top);
 bool hv_t8152_guest_ram(u64 *base, u64 *size);
 
+/*
+ * D1: the AHCI disk store [start, end), directly above the guest RAM window.  It must be
+ * inside boot_args RAM, clear of every carve-out, CTXR range, aura, its heaps, the live ADT
+ * and the scanout (the guest RAM rules), and it joins the denylist so that no stage-2 map can
+ * reach it (map filter and hv_t8152_verify).  Once per session.  0, or -1 with the reason.
+ */
+int hv_t8152_reserve_store(u64 start, u64 end);
+
 /* A carrier-owned exception to the RAM allowlist (never to the denylist). */
 int hv_t8152_allow(u64 ipa, u64 pa, u64 size, bool read_only, const char *name);
 

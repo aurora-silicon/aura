@@ -272,10 +272,15 @@ int hv_windows_configure(u64 flags)
         ((hv_windows_flags & HV_WINDOWS_CPUFREQ) && !(flags & HV_WINDOWS_CPUFREQ)) ||
         flags & ~(HV_WINDOWS_GUEST_COMPAT | HV_WINDOWS_FB_SHADOW | HV_WINDOWS_SERIAL_CAPTURE |
                   HV_WINDOWS_SERIAL_CDC | HV_WINDOWS_MTP | HV_WINDOWS_CPUFREQ |
-                  HV_WINDOWS_T8152_FAST_IPI | HV_WINDOWS_T8152_SOFT_GIC | HV_WINDOWS_T8152_WFI))
+                  HV_WINDOWS_T8152_FAST_IPI | HV_WINDOWS_T8152_SOFT_GIC | HV_WINDOWS_T8152_WFI |
+                  HV_WINDOWS_T8152_AHCI))
         return -1;
-    if ((flags & (HV_WINDOWS_T8152_FAST_IPI | HV_WINDOWS_T8152_SOFT_GIC | HV_WINDOWS_T8152_WFI)) &&
+    if ((flags & (HV_WINDOWS_T8152_FAST_IPI | HV_WINDOWS_T8152_SOFT_GIC | HV_WINDOWS_T8152_WFI |
+                  HV_WINDOWS_T8152_AHCI)) &&
         chip_id != T8152)
+        return -1;
+    /* D1: the AHCI disk's SPI is delivered only by the software GIC CPU interface. */
+    if ((flags & HV_WINDOWS_T8152_AHCI) && !(flags & HV_WINDOWS_T8152_SOFT_GIC))
         return -1;
     if (chip_id == T8152 && !(flags & HV_WINDOWS_T8152_SOFT_GIC)) {
         printf("HV: T8152: the hardware GIC CPU interface path is refused (measurement (f): "
@@ -306,6 +311,8 @@ int hv_windows_configure(u64 flags)
     hv_windows_flags = flags;
     hv_t8152_fast_ipi = flags & HV_WINDOWS_T8152_FAST_IPI;
     hv_t8152_wfi = flags & HV_WINDOWS_T8152_WFI;
+    if (flags & HV_WINDOWS_T8152_AHCI)
+        hv_ahci_enable();
     return 0;
 }
 
@@ -1257,6 +1264,8 @@ void hv_fb_report(void)
     }
     /* One line per guest CPU that ran since the last report (guest_diag.h). */
     hv_guest_diag_report();
+    /* D1: AHCI disk counters, at most every 10 s and only when they moved. */
+    hv_ahci_report();
 }
 
 bool hv_fb_shadow_contains(u64 pa)
@@ -1513,8 +1522,9 @@ int hv_start(void *entry, u64 regs[4])
     }
 
     /* T8152: last check of everything the guest can reach, then enter. */
-    if (chip_id == T8152 && hv_t8152_verify((u64)entry, regs[0], hv_secondary_info.hcr,
-                                            hv_windows_flags & HV_WINDOWS_FB_SHADOW) < 0) {
+    if (chip_id == T8152 && (hv_t8152_verify((u64)entry, regs[0], hv_secondary_info.hcr,
+                                             hv_windows_flags & HV_WINDOWS_FB_SHADOW) < 0 ||
+                             hv_ahci_verify() < 0)) {
         msr(CNTP_CTL_EL0, 0); /* the primary host tick armed above */
         hv_cpus_in_guest = 0;
         hv_windows_mtp_stop();
@@ -1530,6 +1540,8 @@ int hv_start(void *entry, u64 regs[4])
      */
 
     hv_t8152_quiesce_guest_vtimer(true);
+    /* D1: from here the disk store is RUNNING until a PSCI exit seals it. */
+    hv_ahci_guest_entered();
     printf("HV: Entering guest at %p (x0=0x%lx)\n", entry, regs[0]);
     hv_enter_guest(regs[0], regs[1], regs[2], regs[3], entry);
 
@@ -1547,7 +1559,9 @@ int hv_start(void *entry, u64 regs[4])
         hv_windows_serial_finish();
         printf("HV: All CPUs exited\n");
     }
-    return result ? result : __atomic_load_n(&hv_windows_exit_reason, __ATOMIC_ACQUIRE);
+    int status = result ? result : __atomic_load_n(&hv_windows_exit_reason, __ATOMIC_ACQUIRE);
+    hv_ahci_guest_exited(status);
+    return status;
 }
 
 static void hv_init_secondary(struct hv_secondary_info_t *info)

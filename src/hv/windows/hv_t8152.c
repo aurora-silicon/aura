@@ -72,7 +72,9 @@ struct t8152_allow {
 
 static bool armed;
 static bool ram_set;
+static bool store_set;
 static u64 ram_start, ram_end;   /* guest RAM window */
+static u64 ram_host_top;         /* the launcher's heap top, from hv_t8152_set_guest_ram() */
 static u64 dram_start, dram_end; /* boot_args normal RAM */
 
 static struct t8152_range deny[T8152_MAX_DENY];
@@ -365,6 +367,7 @@ int hv_t8152_preflight(void)
 
     armed = false;
     ram_set = false;
+    store_set = false;
     allow_count = 0;
 
     if (chip_id != T8152) {
@@ -560,8 +563,44 @@ int hv_t8152_set_guest_ram(u64 base, u64 size, u64 host_top)
     }
     ram_start = base;
     ram_end = top;
+    ram_host_top = host_top;
     ram_set = true;
     printf("HV: T8152: guest RAM [0x%lx, 0x%lx) accepted\n", base, top);
+    return 0;
+}
+
+int hv_t8152_reserve_store(u64 start, u64 end)
+{
+    if (!armed || !ram_set) {
+        printf("HV: T8152: AHCI store refused: the policy is not armed or guest RAM is not set\n");
+        return -1;
+    }
+    if (store_set) {
+        printf("HV: T8152: AHCI store refused: a store is already reserved this session\n");
+        return -1;
+    }
+    if (end <= start || (start | end) & (T8152_PAGE - 1) || start < ram_end) {
+        printf("HV: T8152: AHCI store [0x%lx, 0x%lx) refused: it must be a 16 KiB aligned range "
+               "above guest RAM [0x%lx, 0x%lx)\n",
+               start, end, ram_start, ram_end);
+        return -1;
+    }
+    if (!inside(start, end, dram_start, dram_end)) {
+        printf("HV: T8152: AHCI store [0x%lx, 0x%lx) is not inside boot_args RAM [0x%lx, 0x%lx)\n",
+               start, end, dram_start, dram_end);
+        return -1;
+    }
+    int bad = ram_conflicts(start, end, ram_host_top);
+    if (bad) {
+        printf("HV: T8152: AHCI store [0x%lx, 0x%lx) refused (%d conflict(s); the lines above say "
+               "\"guest RAM\" for the store)\n",
+               start, end, bad);
+        return -1;
+    }
+    if (deny_add(start, end - start, "AHCI disk store (D1)"))
+        return -1;
+    store_set = true;
+    printf("HV: T8152: AHCI store [0x%lx, 0x%lx) reserved and denied to stage 2\n", start, end);
     return 0;
 }
 

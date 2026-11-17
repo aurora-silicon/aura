@@ -11,6 +11,7 @@
 #include "hv_aic_alias.h"
 #include "hv_el2_acct.h"
 #include "hv_gic_cpuif.h"
+#include "hv_vdev_spi.h"
 #include "hv_vgic.h"
 #include "mtp_handoff.h"
 #include "smp.h"
@@ -2495,6 +2496,8 @@ void hv_t8152_gic_claim(const char *why)
     printf("HV: T8152: guest OS owns the emulated GICv3 (%s) on CPU %d; ICC_* trapped "
            "(ICH_HCR_EL2 0x%x), delivery by HCR_EL2.VI\n",
            why, (int)smp_id(), HV_T8152_ICH_HCR_TRAPALL);
+    /* D1: a carrier-emulated SPI asserted during the Mu phase is delivered now if enabled. */
+    hv_t8152_vspi_refresh();
 }
 
 bool hv_t8152_gic_enter_cpu(bool os_phase)
@@ -2714,6 +2717,105 @@ static void hv_t8152_gic_send_sgi(u64 val)
 }
 
 /*
+ * D1: shared peripheral interrupts of devices the carrier emulates (hv_vdev_spi.h; the AHCI
+ * disk's 990 today).  No AIC line is behind them: the device model reports its line level
+ * and the interrupt is pending on exactly one CPU interface while that level is high and the
+ * guest has enabled it at the distributor (Arm IHI 0069, level-sensitive interrupts).
+ *  - routing: GICD_IROUTER<n> (vdev_spi_route: IRM 1 = the CPU whose access changed the
+ *    level, else the CPU with that affinity, else the boot CPU);
+ *  - one state machine (vdev_spi_plan): raising it on the routing target clears any pending
+ *    copy on the other interfaces, and while it is active on one CPU it is pending nowhere
+ *    else, so an IRM = 1 re-apply from another CPU cannot run the ISR twice;
+ *  - level low: the pending state is cleared on every CPU interface (active state stays);
+ *  - deactivation (the EOI path below) clears the pending bit as for every SPI and then
+ *    re-applies the level, so a line still high is delivered again;
+ *  - before the guest OS owns the GIC (Mu phase) the level is only remembered: Mu's AHCI
+ *    driver polls.  hv_t8152_gic_claim() and every distributor write re-apply it.
+ * The model's MMIO hook runs under bhl, the EOI path does not: t8152_vspi_lock orders
+ * both.  It is a leaf lock (nothing here takes another).
+ * Every entry point returns at once unless the AHCI configure flag is set (hv_ahci_enabled),
+ * so a T8152 launch without D1 runs exactly the pre-D1 GIC code.
+ */
+static DECLARE_SPINLOCK(t8152_vspi_lock);
+static u32 t8152_vspi_level[GICV3_CPUIF_WORDS];
+
+static void hv_t8152_vspi_apply(u32 intid)
+{
+    u64 self = smp_id();
+    bool level = t8152_vspi_level[intid / 32] & BIT(intid % 32);
+    bool pend = vdev_spi_should_pend(level, hv_vgic3_spi_enabled(intid));
+    u64 pending = 0, active = 0;
+    int target = -1;
+
+    for (int cpu = 0; cpu < MAX_CPUS; cpu++) {
+        if (gicv3_cpuif_is_pending(&t8152_cpuif[cpu], intid))
+            pending |= BIT(cpu);
+        if (gicv3_cpuif_is_active(&t8152_cpuif[cpu], intid))
+            active |= BIT(cpu);
+    }
+    if (pend && !active) {
+        u64 mpidr[MAX_CPUS] = {0};
+        u64 candidates = 0;
+        for (u16 frame = 0; frame < hv_vgic3_num_cpus(); frame++) {
+            int cpu = hv_vgic3_cpu_for_frame(frame);
+            if (cpu < 0 || cpu >= MAX_CPUS)
+                continue;
+            mpidr[cpu] = smp_get_mpidr(cpu);
+            candidates |= BIT(cpu);
+        }
+        target = vdev_spi_route(hv_vgic3_spi_route(intid), (int)self, boot_cpu_idx, mpidr,
+                                candidates, MAX_CPUS);
+    }
+
+    /* One pending copy at most, none while active anywhere (hv_vdev_spi.h). */
+    struct vdev_spi_plan plan = vdev_spi_plan(pend, target, pending, active);
+    for (int cpu = 0; cpu < MAX_CPUS; cpu++) {
+        if (!(plan.clear & BIT(cpu)))
+            continue;
+        gicv3_cpuif_clear_pending(&t8152_cpuif[cpu], intid);
+        if ((u64)cpu != self)
+            hv_kick_cpu(cpu);
+    }
+    if (plan.raise >= 0) {
+        hv_t8152_gic_raise((u64)plan.raise, intid);
+        if ((u64)plan.raise != self)
+            hv_kick_cpu(plan.raise);
+    }
+    hv_t8152_gic_sync_vi();
+}
+
+void hv_t8152_gic_spi_level(u32 intid, bool level)
+{
+    if (!hv_ahci_enabled() || !hv_t8152_gic() || !vdev_spi_is_virtual(intid) ||
+        intid >= GICV3_CPUIF_NR_INTID)
+        return;
+    spin_lock(&t8152_vspi_lock);
+    if (level)
+        t8152_vspi_level[intid / 32] |= BIT(intid % 32);
+    else
+        t8152_vspi_level[intid / 32] &= ~(u32)BIT(intid % 32);
+    if (hv_t8152_gic_owned() && smp_id() < MAX_CPUS)
+        hv_t8152_vspi_apply(intid);
+    spin_unlock(&t8152_vspi_lock);
+}
+
+/* Re-apply every carrier-emulated SPI's level: a GICD write, the claim, or its deactivation. */
+static void hv_t8152_vspi_reapply(u32 intid)
+{
+    /* Without the D1 configure flag no emulated SPI exists: the pre-D1 path, untouched. */
+    if (!hv_ahci_enabled() || !hv_t8152_gic_owned() || smp_id() >= MAX_CPUS)
+        return;
+    spin_lock(&t8152_vspi_lock);
+    hv_t8152_vspi_apply(intid);
+    spin_unlock(&t8152_vspi_lock);
+}
+
+void hv_t8152_vspi_refresh(void)
+{
+    hv_t8152_vspi_reapply(HV_VDEV_SPI_AHCI);
+}
+
+/*
  * One trapped ICC_* access on T8152.  Every ICC_* encoding (op0 3, op1 0, CRn
  * 12, CRm 8-12, and ICC_PMR_EL1; Arm DDI 0487 system-register encodings) is
  * answered here and never reaches the proxy.  Other CRn 12 registers (VBAR_EL1,
@@ -2808,6 +2910,9 @@ static bool hv_handle_t8152_gic_cpuif(u64 reg, bool is_read, u64 rt, u64 regs[32
             gicv3_cpuif_clear_pending(c, intid);
             if (hv_aic_alias_is_owned(intid))
                 aic_set_mask(hv_aic_alias_to_physical(intid), false);
+            /* D1: a carrier-emulated SPI still asserted is pending again (level-sensitive). */
+            if (vdev_spi_is_virtual(intid))
+                hv_t8152_vspi_reapply(intid);
         }
     }
 

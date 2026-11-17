@@ -597,6 +597,9 @@ u8 hv_vgic3_get_priority_cpu(int cpu, u64 intd);
 u32 hv_vgic3_redist_enabled0(int cpu);
 /* Number of SPIs enabled in GICD_ISENABLER<n>; the first `max` INTIDs go to first[]. */
 u32 hv_vgic3_dist_enabled_spis(u32 *first, u32 max);
+/* D1: a carrier-emulated SPI's GICD_ISENABLER bit and GICD_IROUTER value (hv_vdev_spi.h). */
+bool hv_vgic3_spi_enabled(u32 intid);
+u64 hv_vgic3_spi_route(u32 intid);
 u16 hv_vgic3_num_cpus(void);
 int hv_vgic3_cpu_for_frame(u16 frame);
 

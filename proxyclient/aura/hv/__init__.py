@@ -125,6 +125,9 @@ class HV(Reloadable):
         # T8152: "software" (required since measurement (f)); None picks it there, "carrier" elsewhere
         self.windows_gic_cpuif = None
         self.windows_wfi = "poll"        # T8152: "wfi" refused (measurement (a): WFI_WIPES)
+        # T8152 D1: {"plan": windows.AhciPlan, "boot": "disk"|"ramdisk"} when the carrier
+        # emulates the AHCI disk; windows_guest_ram must then end at plan.store_base.
+        self.windows_ahci = None
         self.windows_hidden = []
         self.pac_mask = self.PAC_MASK
         self.user_pac_mask = self.PAC_MASK
@@ -1574,8 +1577,17 @@ class HV(Reloadable):
             elif self.windows_guest_compatibility == T8152_PMU_UNDEF:
                 raise ValueError("t8152-pmu-undef is a T8152 guest compatibility")
             elif (self.windows_guest_ram is not None or self.windows_ipi != "poll" or
-                  self.windows_gic_cpuif != "carrier" or self.windows_wfi != "poll"):
-                raise ValueError("guest RAM window, IPI mode and GIC cpuif are T8152 options")
+                  self.windows_gic_cpuif != "carrier" or self.windows_wfi != "poll" or
+                  self.windows_ahci is not None):
+                raise ValueError("guest RAM window, IPI mode, GIC cpuif and the AHCI disk are "
+                                 "T8152 options")
+            if self.windows_ahci is not None:
+                plan = self.windows_ahci["plan"]
+                if self.windows_guest_ram != (plan.window_base, plan.store_base):
+                    raise ValueError("T8152 AHCI: guest RAM must be [window base, store base)")
+                if self.windows_gic_cpuif != "software":
+                    raise ValueError("T8152 AHCI: the disk interrupt needs the software GIC "
+                                     "CPU interface")
             caps = validate_capabilities(self.p.hv_windows_capabilities(), self.windows_framebuffer,
                                          self.windows_guest_compatibility, self.windows_n1,
                                          self.windows_memory_guard is not None, self.windows_serial,
@@ -1646,6 +1658,9 @@ class HV(Reloadable):
                     flags |= CONFIG_T8152_SOFT_GIC
                 if self.windows_wfi == "wfi":
                     flags |= CONFIG_T8152_WFI
+                if self.windows_ahci is not None:
+                    from ..windows import CONFIG_T8152_AHCI
+                    flags |= CONFIG_T8152_AHCI
                 if self.p.hv_windows_configure(flags) != 0:
                     raise WindowsLaunchRefused("Windows hypervisor configuration rejected")
                 # Applied once by hv_start() before guest entry; never retried on this resident.
@@ -1987,11 +2002,26 @@ class HV(Reloadable):
         chosen._properties[marker] = 1
         chosen._types[marker] = (Int32ul, False)
 
+    def _windows_t8152_ahci_property(self):
+        """D1: /chosen/aura,windows-ahci-v1 tells Mu's J804AhciDxe that the carrier emulates the
+        AHCI disk (ABAR, GSIV, boot preference, store range).  Without it Mu never touches the
+        ABAR.  The guest sees this ADT only after the store is attached (HV.start)."""
+        from ..windows import AHCI_PROPERTY, ahci_handshake
+        chosen = self.adt["/chosen"]
+        if self.windows_ahci is None:
+            chosen._properties.pop(AHCI_PROPERTY, None)
+            chosen._types.pop(AHCI_PROPERTY, None)
+            return
+        value = ahci_handshake(self.windows_ahci["plan"], self.windows_ahci["boot"])
+        chosen._properties[AHCI_PROPERTY] = value
+        chosen._types[AHCI_PROPERTY] = (Bytes(len(value)), False)
+
     def setup_adt(self):
         if self.windows:
             self._disable_windows_usb()
             if self.adt["/chosen"].chip_id == 0x8152:
                 self._hide_windows_t8152_nodes()
+                self._windows_t8152_ahci_property()
             from ..windows import (N1_BYTES, N1_PROPERTY, MTP_DISABLED_PROPERTY,
                                    CPUFREQ_PROPERTY, cpufreq_handoff_marker,
                                    UNIFIED_DISPLAY_PROPERTY, unified_display_marker)

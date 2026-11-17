@@ -673,6 +673,26 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
             reply->retval = -1;
 #endif
             break;
+        case P_HV_WINDOWS_CAPS2:
+            /*
+             * Read-only.  'AWI2' and feature bits, so P_HV_WINDOWS_CAPS keeps its ABI 1 value
+             * (its free bit 5 means the N1 handoff to every older launcher).  Bit 0: the D1
+             * AHCI RAM-store disk (hv_ahci.c, P_HV_WINDOWS_AHCI, configure flag BIT(8)).
+             */
+#ifdef AURA_WINDOWS
+            reply->retval = HV_WINDOWS_CAPS2_MAGIC | HV_WINDOWS_CAPS2_AHCI;
+#else
+            reply->retval = 0;
+#endif
+            break;
+        case P_HV_WINDOWS_AHCI:
+#ifdef AURA_WINDOWS
+            reply->retval = hv_ahci_proxy(request->args[0], request->args[1], request->args[2],
+                                          request->args[3], request->args[4]);
+#else
+            reply->retval = -1;
+#endif
+            break;
         case P_HV_WINDOWS_N1_ACQUIRE:
         case P_HV_WINDOWS_N1_PREPARE:
 #ifdef AURA_WINDOWS

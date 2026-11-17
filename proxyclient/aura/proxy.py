@@ -799,6 +799,8 @@ class AuraProxy(Reloadable):
     # Windows-only HvXfer bulk channel (src/hv/windows/hv_xfer.c); same opcode as m1n1 j813.
     P_HV_MAP_XFER = 0x1700
     P_HV_WINDOWS_GUEST_RAM = 0xc8c
+    P_HV_WINDOWS_CAPS2 = 0xc8d
+    P_HV_WINDOWS_AHCI = 0xc8e
 
     P_FB_INIT = 0xd00
     P_FB_SHUTDOWN = 0xd01
@@ -1334,6 +1336,16 @@ class AuraProxy(Reloadable):
     def hv_windows_guest_ram(self, base, size, host_top):
         # host_top: top of this launcher's heap (ProxyUtils.heap_top), above aura's heap limit.
         return self.request(self.P_HV_WINDOWS_GUEST_RAM, base, size, host_top, signed=True)
+
+    def hv_windows_capabilities2(self):
+        # Read-only: 'AWI2' magic and feature bits (bit 0: D1 AHCI RAM store).  An older
+        # resident answers Bad Command (ProxyCommandError).
+        return self.request(self.P_HV_WINDOWS_CAPS2)
+
+    def hv_windows_ahci(self, op, a1=0, a2=0, a3=0, a4=0):
+        # D1 AHCI store ops (src/hv/windows/hv_ahci.h): 0 QUERY, 1 ATTACH, 2 SEAL_UPLOAD,
+        # 3 SEAL_EXIT, 4 STATUS.  2**64 - 1 is a refusal; the resident's console says why.
+        return self.request(self.P_HV_WINDOWS_AHCI, op, a1, a2, a3, a4)
 
     def fb_init(self):
         return self.request(self.P_FB_INIT)
