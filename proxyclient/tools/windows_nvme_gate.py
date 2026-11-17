@@ -5,8 +5,11 @@
   r0      attach the Windows partition READ-ONLY twice (NVMe wake, Identify, outer and inner GPT,
           fence), print the status, detach (controller shutdown) after each: the second RTKit
           wake in one boot and the GPT match on the real disk.  Writes nothing.
-  w0      ONLY on the empty partition, BEFORE the install: write seeded patterns at the
-          partition's start, middle and end (1, 8 and 64 blocks), flush, verify, detach.  Then
+  w0      the write path: seeded patterns (1, 8 and 64 blocks), flush, verify, detach (CC.SHN).
+          With the image installed (the default) the blocks lie PAST the inner disk's end (its
+          backup GPT header), in the tail that stays free until `sgdisk -e` or Windows extends C:;
+          the resident refuses any test write inside the image.  With --partition-is-empty (an
+          empty partition, before an install) at the partition's start, middle and end.  Then
           leave through the carrier and check the same blocks from Linux (see `expect`).
   expect  host only: the bytes W0 wrote at partition block B (count N, seed S), to compare
           with `dd if=/dev/disk/by-partuuid/... bs=4096 skip=B count=N iflag=direct` on Linux.
@@ -29,7 +32,7 @@ parser.add_argument('--seed', type=lambda v: int(v, 0), default=0xD5)
 parser.add_argument('--block', type=int, default=0, help='expect: partition-relative block')
 parser.add_argument('--count', type=int, default=1, help='expect: blocks')
 parser.add_argument('--partition-is-empty', action='store_true',
-                    help='w0: required; confirms the install has not written the image yet')
+                    help='w0: the partition holds no image yet (scratch attach, whole partition)')
 args = parser.parse_args()
 
 from aura import windows as w
@@ -50,10 +53,6 @@ if args.gate == 'expect':
         out.write(b"".join(struct.pack("<Q", w.nvme_test_pattern(args.seed, b, k))
                            for k in range(512)))
     sys.exit(0)
-
-if args.gate == 'w0' and not args.partition_is_empty:
-    sys.exit("w0 writes test patterns into the partition: only before the install, on an "
-             "empty partition; pass --partition-is-empty to confirm")
 
 from aura.proxy import *
 from aura.proxyutils import ProxyUtils
@@ -116,8 +115,19 @@ if args.gate == 'r0':
           "through the carrier (P_REBOOT / leave2.sh); check Linux boots normally.")
     sys.exit(0)
 
-attach(w.NVME_GATE | w.NVME_SCRATCH | w.NVME_RW)
-spots = [(0, 1), (part.blocks // 2, 8), (part.blocks - 64, 64)]
+if args.partition_is_empty:
+    attach(w.NVME_GATE | w.NVME_SCRATCH | w.NVME_RW)
+    spots = [(0, 1), (part.blocks // 2, 8), (part.blocks - 64, 64)]
+else:
+    attach(w.NVME_GATE | w.NVME_RW)
+    inner = op(w.AHCI_OP_NVME_STATUS, w.NVME_STATUS["inner_bytes"]) // w.NVME_LBA_BYTES
+    if part.blocks - inner < 128:
+        detach()
+        sys.exit("no free tail past the inner disk (backup GPT already at the partition end, or "
+                 "C: extended): W0 has no safe blocks on this partition")
+    spots = [(inner, 1), ((inner + part.blocks) // 2, 8), (part.blocks - 64, 64)]
+    print(f"W0 in the free tail: partition blocks [{inner}, {part.blocks}) (the image ends at "
+          f"block {inner})")
 try:
     for block, count in spots:
         if op(w.AHCI_OP_NVME_TEST, block, count, args.seed, w.NVME_TEST["write"]) != 0:

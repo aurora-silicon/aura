@@ -858,12 +858,45 @@ static void case_gate_w0(void)
     session_setup(HV_AHCI_NVME_RW | HV_AHCI_NVME_GATE);
     hv_ahci_enable();
     EQ(attach(), 0);
-    /* Not a scratch attach: the partition holds an image, test writes are refused. */
+    /* The partition holds an image: test writes inside it are refused, past its end (the
+       installed-but-not-extended tail) they are allowed; the image stays as it was. */
+    u64 inner = hv_ahci_nvme_status(HV_AHCI_NVME_S_INNER_BYTES) / SIM_BLOCK;
+    u64 nblocks = last - first + 1;
+    CHECK(inner > 0 && inner < nblocks);
     EQ(hv_ahci_proxy(HV_AHCI_OP_NVME_TEST, 0, 1, 7, HV_AHCI_NVME_TEST_WRITE), HV_AHCI_ERROR);
+    EQ(hv_ahci_proxy(HV_AHCI_OP_NVME_TEST, inner - 1, 2, 7, HV_AHCI_NVME_TEST_WRITE),
+       HV_AHCI_ERROR);
     CHECK(hv_ahci_proxy(HV_AHCI_OP_NVME_TEST, 0, 1, 7, HV_AHCI_NVME_TEST_CRC) != HV_AHCI_ERROR);
     EQ(hv_ahci_verify(), -1); /* no guest while a gate attach is open */
-    EQ(hv_ahci_proxy(HV_AHCI_OP_DETACH, 0, 0, 0, 0), HV_AHCI_NVME_CLEAN);
     EQ(sim_stats()->writes, 0);
+    const u64 tail[][2] = {{inner, 1}, {(inner + nblocks) / 2, 8}, {nblocks - 64, 64}};
+    for (unsigned i = 0; i < 3; i++)
+        EQ(hv_ahci_proxy(HV_AHCI_OP_NVME_TEST, tail[i][0], tail[i][1], 0x7a11, 1), 0);
+    EQ(hv_ahci_proxy(HV_AHCI_OP_NVME_TEST, 0, 0, 0, HV_AHCI_NVME_TEST_FLUSH), 0);
+    for (unsigned i = 0; i < 3; i++)
+        EQ(hv_ahci_proxy(HV_AHCI_OP_NVME_TEST, tail[i][0], tail[i][1], 0x7a11, 2), 0);
+    EQ(hv_ahci_proxy(HV_AHCI_OP_DETACH, 0, 0, 0, 0), HV_AHCI_NVME_CLEAN);
+    sim_power_cut();
+    for (u64 b = 0; b < inner; b++)
+        if (memcmp(sim_durable(first + b), initial + (first + b) * SIM_BLOCK, SIM_BLOCK)) {
+            fprintf(stderr, "[%s] the inner disk changed at block %llu\n", current,
+                    (unsigned long long)b);
+            failures++;
+            break;
+        }
+    for (unsigned i = 0; i < 3; i++)
+        for (u64 b = 0; b < tail[i][1]; b++)
+            if (((const u64 *)sim_durable(first + tail[i][0] + b))[7] !=
+                hv_ahci_nvme_pattern(0x7a11, tail[i][0] + b, 7)) {
+                fprintf(stderr, "[%s] tail pattern lost at block %llu\n", current,
+                        (unsigned long long)(tail[i][0] + b));
+                failures++;
+            }
+    CHECK(outside_unchanged(sim_durable));
+    invariants();
+    /* A fresh machine for the scratch part (an empty partition, before an install). */
+    sim_init(nsze, image_path);
+    sim_set_guest((u64)ram, (u64)ram + RAM_BYTES);
 
     req.flags = HV_AHCI_NVME_RW | HV_AHCI_NVME_GATE | HV_AHCI_NVME_SCRATCH;
     EQ(attach(), 0);

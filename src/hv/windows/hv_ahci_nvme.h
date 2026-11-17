@@ -80,7 +80,7 @@ enum hv_ahci_nvme_status_index {
 };
 
 /* NVME_TEST ops (op 8, gate only). */
-#define HV_AHCI_NVME_TEST_WRITE  1 /* SCRATCH + RW: write the seeded pattern */
+#define HV_AHCI_NVME_TEST_WRITE  1 /* RW: the seeded pattern, scratch or past the inner disk */
 #define HV_AHCI_NVME_TEST_VERIFY 2 /* read and compare with the seeded pattern: mismatches */
 #define HV_AHCI_NVME_TEST_FLUSH  3
 #define HV_AHCI_NVME_TEST_CRC    4 /* read: CRC-32 of the blocks (compare with Linux) */

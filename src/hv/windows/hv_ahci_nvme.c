@@ -502,10 +502,17 @@ u64 hv_ahci_nvme_test(u64 rel_block, u64 count, u64 seed, u64 op)
                rel_block, count, blocks);
         return err;
     }
+    /*
+     * Test writes never touch a disk image: on a scratch attach (an empty partition) anywhere,
+     * otherwise only past the inner disk's end (its backup GPT header), the tail that is free
+     * until the backup header is moved to the partition's end or Windows extends into it.
+     */
+    bool tail = inner_bytes && rel_block >= inner_bytes / AHCI_NVME_BLOCK;
     if (op == HV_AHCI_NVME_TEST_WRITE &&
-        (!(req.flags & HV_AHCI_NVME_SCRATCH) || !(req.flags & HV_AHCI_NVME_RW))) {
-        printf("HV: T8152: AHCI NVMe: test write refused: only on a scratch read-write attach "
-               "(an empty partition, before the install)\n");
+        (!(req.flags & HV_AHCI_NVME_RW) || (!(req.flags & HV_AHCI_NVME_SCRATCH) && !tail))) {
+        printf("HV: T8152: AHCI NVMe: test write refused: only read-write, and only on a scratch "
+               "attach or past the inner disk's end (block %lu)\n",
+               inner_bytes / AHCI_NVME_BLOCK);
         return err;
     }
     u64 *w = (u64 *)(void *)(pool + AHCI_NVME_WINDOW);

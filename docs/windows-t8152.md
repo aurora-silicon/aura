@@ -397,8 +397,10 @@ in GPT byte order, first, last, image bytes, the UTF-16LE name), 6 DETACH (close
 refused while the guest runs), 7 NVME_STATUS (0 state, 1 flags, 2 commands, 3 NVMe commands, 4
 longest command us, 5 flushes, 6 RMW blocks, 7 guard hits, 8/9 first/last LBA, 10 wrote, 11
 failed commands, 12/13 blocks read/written, 14 inner disk bytes, 15 longest flush us), 8
-NVME_TEST (gate attaches only: write/verify/flush/CRC of seeded blocks; writes only with
-SCRATCH, i.e. on the empty partition before the install).
+NVME_TEST (gate attaches only: write/verify/flush/CRC of seeded blocks; writes only read-write,
+and only on a SCRATCH attach (an empty partition) or past the inner disk's end, the tail an
+installed image leaves free until its backup GPT is moved to the partition's end or C: is
+extended; never inside the image).
 
 Launcher (`run_guest.py`):
 
@@ -423,9 +425,11 @@ Runbook rules: end every session from Windows (Shut down / Restart) or with ^C t
 leave the proxy only through the carrier (`P_REBOOT`, `leave2.sh`, `--windows-reset-on-exit`)
 after the launcher printed CLEAN; never `macvdmtool reboot` after a session that wrote unless
 CLEAN was printed; keep the image as the restore point. Gates before Windows writes:
-`tools/windows_nvme_gate.py r0` (two read-only attaches, no guest), `w0` (only on the empty
-partition, before the install), then the install from Linux
-(`j804-private-data/d5/install-windows-partition.sh`), then a read-only session, then rw.
+`tools/windows_nvme_gate.py r0` (two read-only attaches, no guest), `w0` (seeded writes in the
+free tail past the installed image, or anywhere with `--partition-is-empty`; reset through the
+carrier, then compare the blocks from Linux with `windows_nvme_gate.py expect`), then a
+read-only session, then rw. The install itself is a Linux-side recipe in the owner's private
+data.
 
 Host tests (`test_windows_t8152_ahci_nvme.py`): aura's real `nvme.c` and the carrier files are
 built unchanged with ASan/UBSan against `tests/e2e/windows_nvme_stubs/` and a simulated T8152

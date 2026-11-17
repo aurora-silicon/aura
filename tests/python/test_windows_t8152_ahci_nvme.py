@@ -22,7 +22,6 @@ The failure list comes first: windows-m6/D5-NVME-DESIGN.md section 10 (N1-N22) a
 Nothing here touches hardware.  The artifact is the JSON transcript of the cases.
 """
 
-import hashlib
 import json
 import os
 from pathlib import Path
