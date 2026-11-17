@@ -1789,9 +1789,12 @@ static void nv2_el2_setup(void)
  */
 void nv2_enter_os(u64 entry, u64 a0, u64 a1, u64 a2)
 {
+    sptm_virt_j613_entry_mark(0x60);
     nv2_el2_setup();
+    sptm_virt_j613_entry_mark(0x61);
     if (!(mrs(SCTLR_EL1) & SCTLR_M))
         mmu_init_secondary_local();
+    sptm_virt_j613_entry_mark(0x62);
 
     int cpu = smp_id();
     if (!nv2_pages[cpu])
@@ -1799,6 +1802,7 @@ void nv2_enter_os(u64 entry, u64 a0, u64 a1, u64 a2)
     u64 vncr = (u64)nv2_pages[cpu], avncr = vncr + SZ_4K;
     memset(nv2_pages[cpu], 0, SZ_16K);
     ((u64 *)vncr)[V_HCR / 8] = HCR_RW | HCR_E2H;
+    sptm_virt_j613_entry_mark(0x63);
 
     /* A guarded guest (SPTM) reads its real IDs and runs GXF/SPRR natively, so
      * it takes neither the ID-register trap nor the ID_AA64MMFR4 NV2-only
@@ -1822,6 +1826,8 @@ void nv2_enter_os(u64 entry, u64 a0, u64 a1, u64 a2)
     /* The virtualized SPTM: its per-core state, the last thing before the ERET. */
     if (nv2_guarded)
         sptm_virt_cpu_arm();
+    sptm_virt_j613_entry_mark(0x68);
 
+    sptm_virt_j613_entry_mark(0x69);
     nv2_enter_el1h(entry, a0, a1, a2);
 }

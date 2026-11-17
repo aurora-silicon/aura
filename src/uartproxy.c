@@ -339,8 +339,10 @@ int uartproxy_run(struct uartproxy_msg_start *start)
 #ifdef SPTM_VIRT
                 bool guest_entry = request.prequest.opcode == P_CALL &&
                                    request.prequest.args[0] == (u64)sptm_virt_enter;
-                if (guest_entry)
+                if (guest_entry) {
+                    sptm_virt_j613_entry_mark(0x10);
                     printf("SPTM-virt: dispatching guest entry P_CALL\n");
+                }
 #endif
                 ret = proxy_process(&request.prequest, &reply.preply);
 #ifdef SPTM_VIRT

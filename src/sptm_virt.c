@@ -25,6 +25,7 @@
 #include "uartproxy.h"
 #include "usb.h"
 #include "utils.h"
+#include "wdt.h"
 #include "xnuboot.h"
 
 /*
@@ -47,6 +48,52 @@ static u64 sptm_reset_pa;
 static u32 sptm_cpu_resets[MAX_CPUS];
 /* False while a core runs SPTM's own (re)entry path, true from its first GEXIT into XNU. */
 static volatile bool sptm_cpu_in_xnu[MAX_CPUS];
+
+#define J613_ENTRY_RECORD_MAGIC 0x4a363133454e5452UL /* J613ENTR */
+struct j613_entry_record {
+    u64 magic;
+    u64 sequence;
+    u64 stage;
+    u64 ticks;
+    u64 cpu;
+    u64 check;
+    u64 reserved[2];
+};
+static volatile struct j613_entry_record *j613_entry_record;
+static bool j613_entry_recovery_armed;
+
+void sptm_virt_j613_entry_mark(u32 stage)
+{
+    if (chip_id != T8122 || !j613_entry_record)
+        return;
+    u64 sequence = j613_entry_record->sequence + 1;
+    j613_entry_record->magic = J613_ENTRY_RECORD_MAGIC;
+    j613_entry_record->sequence = sequence;
+    j613_entry_record->stage = stage;
+    j613_entry_record->ticks = mrs(CNTPCT_EL0);
+    j613_entry_record->cpu = smp_id();
+    j613_entry_record->check = J613_ENTRY_RECORD_MAGIC ^ sequence ^ stage;
+    dc_cvac_range((void *)j613_entry_record, sizeof(*j613_entry_record));
+    sysop("dsb sy");
+}
+
+__attribute__((used, retain)) u64 sptm_virt_j613_entry_recovery_arm(u32 seconds)
+{
+    if (chip_id != T8122 || !sptm_images_loaded)
+        return 0;
+    if (!j613_entry_record) {
+        j613_entry_record = memalign(SZ_4K, SZ_4K);
+        if (!j613_entry_record)
+            return 0;
+        memset((void *)j613_entry_record, 0, SZ_4K);
+    }
+    sptm_virt_j613_entry_mark(0x01);
+    if (wdt_arm_recovery(seconds))
+        return 0;
+    j613_entry_recovery_armed = true;
+    sptm_virt_j613_entry_mark(0x02);
+    return (u64)j613_entry_record;
+}
 
 bool sptm_virt_requested(void)
 {
@@ -566,6 +613,12 @@ void sptm_virt_cpu_enters_xnu(int cpu)
     if (sptm_cpu_in_xnu[cpu])
         return;
     sptm_cpu_in_xnu[cpu] = true;
+    if (is_boot_cpu() && j613_entry_recovery_armed) {
+        sptm_virt_j613_entry_mark(0x80);
+        wdt_disable();
+        j613_entry_recovery_armed = false;
+        sptm_virt_j613_entry_mark(0x81);
+    }
     if (!is_boot_cpu())
         printf("SPTM-virt[smp]: cpu%d enters XNU at 0x%lx\n", cpu, mrs(SYS_IMP_APL_ELR_GL12));
     sptm_virt_sample_disarm_here();
@@ -581,14 +634,17 @@ __attribute__((used, retain)) void sptm_virt_enter(void)
     if (!sptm_images_loaded)
         panic("sptm_virt: no SPTM image recorded (call sptm_virt_load first)\n");
 
+    sptm_virt_j613_entry_mark(0x20);
     printf("\nSPTM-virt: entering SPTM at 0x%lx, boot_args 0x%lx\n", sptm_entry_pa,
            sptm_handoff_pa);
     nv2_active = true;
     nv2_guarded = true;
 
     /* iBoot's entry contract: EL1&0 MMU and caches off, x0 = boot_args. */
+    sptm_virt_j613_entry_mark(0x21);
     msr(SYS_SCTLR_EL12, mrs(SYS_SCTLR_EL12) & ~(SCTLR_M | SCTLR_C | SCTLR_I));
     sysop("isb");
+    sptm_virt_j613_entry_mark(0x22);
     printf("SPTM-virt: entry step 1: EL12 MMU and caches disabled\n");
 
     /*
@@ -601,8 +657,10 @@ __attribute__((used, retain)) void sptm_virt_enter(void)
         usb_iodev_shutdown();
 
     /* The proxy flow never passes through kboot's nv2_prepare. */
+    sptm_virt_j613_entry_mark(0x30);
     printf("SPTM-virt: entry step 2: preparing NV2 state\n");
     nv2_prepare();
+    sptm_virt_j613_entry_mark(0x40);
     printf("SPTM-virt: entry step 3: preparing stage 2\n");
     sptm_virt_s2_setup();
     printf("SPTM-virt: entry step 4: stage 2 ready\n");
@@ -644,6 +702,7 @@ __attribute__((used, retain)) void sptm_virt_enter(void)
     dc_cvac_range((void *)&sptm_smp_crumbs, sizeof(sptm_smp_crumbs));
 
     printf("SPTM-virt: entry step 5: transferring to SPTM\n");
+    sptm_virt_j613_entry_mark(0x50);
     nv2_enter_os(sptm_entry_pa, sptm_handoff_pa, 0, 0);
 }
 

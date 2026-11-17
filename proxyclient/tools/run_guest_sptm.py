@@ -63,6 +63,7 @@ Environment (all optional; 1 enables a switch):
   AURA_OS_LONG_VERSION     the guest's Ap,OSLongVersion (--os-long-version)
   AURA_KEEP_BOOT_VIDEO     hand iBoot's boot framebuffer to XNU, aura's console off it
   AURA_TAIL_SECS, AURA_TAIL_IDLE   keep reading the console after entry, until idle
+  AURA_J613_RECOVERY_SECS  firmware-only absolute watchdog across J613 entry (default 30)
   AURA_RETURN_AFTER_NO_ENTER  send P_REBOOT on the same session after a --no-enter admission run
   AURA_AMCC_NOLOCK=<mask>  which of SPTM's AMCC range locks aura shadows (bit 0 +0xacc, 1 +0xadc,
                            2 +0xaec; default 1, the one over aura's image; 0 lets SPTM lock all)
@@ -150,6 +151,7 @@ KNOWN_ENV = {
     "AURA_TAIL_SECS",
     "AURA_TAIL_IDLE",
     "AURA_RETURN_AFTER_NO_ENTER",
+    "AURA_J613_RECOVERY_SECS",
     "AURA_GPU_STOP_SECS",
     "AURA_GPU_STOP_BOOT_SECS",
     "AURA_GPU_STOP_MSG",
@@ -1039,6 +1041,15 @@ def main():
         print(f"AMCC range locks shadowed: mask {env_int('AURA_AMCC_NOLOCK'):#x}")
     if os.environ.get("AURA_RG_XWDT"):
         p.write32(sym["sptm_virt_rg_xwdt"], env_int("AURA_RG_XWDT"))
+    if chip == 0x8122:
+        recovery_secs = int(os.environ.get("AURA_J613_RECOVERY_SECS", "30"), 0)
+        if not 1 <= recovery_secs <= 178:
+            raise SystemExit("AURA_J613_RECOVERY_SECS must be in [1, 178]")
+        crumbs = p.call(sym["sptm_virt_j613_entry_recovery_arm"], recovery_secs)
+        if not crumbs:
+            raise SystemExit("J613 firmware recovery watchdog did not arm")
+        print(f"J613 retained entry crumbs at 0x{crumbs:x}; "
+              f"firmware recovery watchdog {recovery_secs} s")
     print("entering SPTM at virtual EL2 (the result is on aura's console)")
     # sptm_virt_enter does not return. Waiting for a reply or a boot banner would eat the guest's
     # first console output and reopen the link.
