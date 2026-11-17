@@ -29,6 +29,7 @@ typedef uint32_t u32;
 typedef uint64_t u64;
 #define T8140 0x8140
 #define T6040 0x6040
+#define T8122 0x8122
 #define WDT_COUNT 0x10
 #define WDT_ALARM 0x14
 #define WDT_CTL 0x1c
@@ -41,6 +42,7 @@ static u64 primary = 0x1000, primary_size = 0x4000, secondary_size = 4;
 static u64 wdt_base;
 static unsigned writes, disables;
 static void *adt;
+static int pmu_clear_panic_counter(void) { return 0; }
 static void wdt_disable(void)
 {
     disables++;

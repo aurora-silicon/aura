@@ -136,6 +136,17 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
         case P_WDT_DISABLE:
             wdt_disable();
             break;
+        case P_WDT_RECOVERY:
+            if (wdt_arm_recovery(request->args[0])) {
+                reply->status = S_ERROR;
+                break;
+            }
+            uart_printf("J613 recovery watchdog armed (%lu s); parking\n",
+                        request->args[0]);
+            iodev_console_flush();
+            while (true)
+                sysop("wfe");
+            break;
         case P_REBOOT:
             reboot();
             break;

@@ -17,6 +17,7 @@ typedef uint32_t u32;
 typedef uint64_t u64;
 #define T8140 0x8140
 #define T6040 0x6040
+#define T8122 0x8122
 #define WDT_COUNT 0x10
 #define WDT_ALARM 0x14
 #define WDT_CTL 0x1c
@@ -31,6 +32,13 @@ static unsigned writes;
 static bool bad_readback;
 static void *adt;
 static unsigned disables;
+static unsigned panic_counter_clears;
+static int panic_counter_result;
+static int pmu_clear_panic_counter(void)
+{
+    panic_counter_clears++;
+    return panic_counter_result;
+}
 /* The real one clears the primary control and the secondary watchdog */
 static void wdt_disable(void)
 {
@@ -103,6 +111,26 @@ int main(void)
     writes = 0;
     assert(wdt_arm_trial() == -1 && writes == 0);
     adt_version = 2;
+
+    /* Recovery is firmware-only, exact-J613, and refuses to arm unless the
+     * boot-failure counter was cleared successfully first. */
+    chip_id = T8122;
+    writes = panic_counter_clears = 0;
+    assert(wdt_arm_recovery(30) == 0);
+    assert(panic_counter_clears == 1 && writes == 4);
+    assert(regs[WDT_ALARM/4] == 720000000 && regs[WDT_CTL/4] == 4);
+    chip_id = T8140;
+    writes = panic_counter_clears = 0;
+    assert(wdt_arm_recovery(30) == -1);
+    assert(panic_counter_clears == 0 && writes == 0);
+    chip_id = T8122;
+    panic_counter_result = -1;
+    assert(wdt_arm_recovery(30) == -1);
+    assert(panic_counter_clears == 1 && writes == 0);
+    panic_counter_result = 0;
+    writes = panic_counter_clears = 0;
+    assert(wdt_arm_recovery(0) == -1);
+    assert(panic_counter_clears == 0 && writes == 0);
     return 0;
 }
 '''

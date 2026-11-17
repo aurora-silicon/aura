@@ -29,6 +29,7 @@ typedef enum {
     P_GET_CPU_FEATURES,
     P_WDT_ARM,
     P_WDT_DISABLE,
+    P_WDT_RECOVERY,
 
     P_WRITE64 = 0x100, // Generic register functions
     P_WRITE32,

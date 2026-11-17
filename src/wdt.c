@@ -2,6 +2,7 @@
 
 #include "wdt.h"
 #include "adt.h"
+#include "pmu_counter.h"
 #include "types.h"
 #include "utils.h"
 
@@ -94,6 +95,16 @@ static int wdt_arm(unsigned seconds)
 int wdt_arm_seconds(unsigned seconds)
 {
     if (chip_id != T8140 && chip_id != T6040)
+        return -1;
+    return wdt_arm(seconds);
+}
+
+int wdt_arm_recovery(unsigned seconds)
+{
+    /* This command is deliberately narrower than the generic proxy arm. */
+    if (chip_id != T8122 || seconds < 1 || seconds > 178)
+        return -1;
+    if (pmu_clear_panic_counter())
         return -1;
     return wdt_arm(seconds);
 }

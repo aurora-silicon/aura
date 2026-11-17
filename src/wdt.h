@@ -8,6 +8,8 @@
 void wdt_disable(void);
 void wdt_reboot(void);
 int wdt_arm_seconds(unsigned seconds);
+/* Exact-J613, firmware-only recovery arm: clear iBoot's failure counter first. */
+int wdt_arm_recovery(unsigned seconds);
 /* The longest the 24 MHz counter allows, for each stage of a trial boot */
 #define WDT_TRIAL_SECONDS 178
 int wdt_arm_trial(void);

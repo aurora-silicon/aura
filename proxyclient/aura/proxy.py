@@ -664,6 +664,7 @@ class AuraProxy(Reloadable):
     P_GET_CPU_FEATURES = 0x014
     P_WDT_ARM = 0x015
     P_WDT_DISABLE = 0x016
+    P_WDT_RECOVERY = 0x017
 
     P_WRITE64 = 0x100
     P_WRITE32 = 0x101
@@ -956,6 +957,8 @@ class AuraProxy(Reloadable):
         return self.request(self.P_WDT_ARM, seconds, signed=True)
     def wdt_disable(self):
         self.request(self.P_WDT_DISABLE)
+    def wdt_recovery(self, seconds):
+        self.request(self.P_WDT_RECOVERY, seconds, no_reply=True)
     def sleep(self, deep=False):
         self.request(self.P_SLEEP, deep, no_reply=True)
     def el3_call(self, addr, *args):
