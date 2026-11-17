@@ -539,9 +539,9 @@ static const struct dcp_soc dcp_soc_t6050 = {
     .t6050 = true,
 };
 
-static const struct dcp_soc *const dcp_socs[] = {
-    &dcp_soc_t6030, &dcp_soc_t8122,      &dcp_soc_t6031, &dcp_soc_t6034,
-    &dcp_soc_t6041, &dcp_soc_t6041_max, &dcp_soc_t6050};
+static const struct dcp_soc *const dcp_socs[] = {&dcp_soc_t6030, &dcp_soc_t8122, &dcp_soc_t6031,
+                                                 &dcp_soc_t6034, &dcp_soc_t6041, &dcp_soc_t6041_max,
+                                                 &dcp_soc_t6050};
 
 /* T6034 has its own exact J514M/profile/firmware checks above. It reuses only
  * the measured register layout and the generic bounded handoff transaction. */

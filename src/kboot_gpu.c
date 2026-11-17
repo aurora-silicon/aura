@@ -2768,9 +2768,8 @@ static int dt_measure_gpu_t6034(void *dt)
     if (opt && (len != 2 || opt[0] != '1' || opt[1]))
         return 0;
     if (adt_path_offset_trace(adt, "/arm-io/sgx", path) < 0 ||
-        adt_get_reg(adt, path, "reg", 0, &p.sgx_base, &size) < 0 ||
-        p.sgx_base != T6031_SGX_BASE || size < G15_SGX_CORE_MASK + 12 ||
-        t6031_closure_get("/arm-io/sgx", &p.closure) ||
+        adt_get_reg(adt, path, "reg", 0, &p.sgx_base, &size) < 0 || p.sgx_base != T6031_SGX_BASE ||
+        size < G15_SGX_CORE_MASK + 12 || t6031_closure_get("/arm-io/sgx", &p.closure) ||
         t6031_identity_node_named(dt, p.closure.n, node_name) < 0) {
         printf("FDT: GPU: T6034 measurement prerequisites failed; no power-on\n");
         return 0;
@@ -2780,8 +2779,9 @@ static int dt_measure_gpu_t6034(void *dt)
     if (t6031_identity_publish_named(dt, &id, &p.closure, node_name))
         printf("FDT: GPU: T6034 identity publication failed\n");
     printf("FDT: GPU: T6034 identity result %u, version 0x%x counts 0x%x/0x%x "
-           "masks 0x%x/0x%x/0x%x\n", id.result, id.id_version, id.id_counts_1,
-           id.id_counts_2, id.core_mask[0], id.core_mask[1], id.core_mask[2]);
+           "masks 0x%x/0x%x/0x%x\n",
+           id.result, id.id_version, id.id_counts_1, id.id_counts_2, id.core_mask[0],
+           id.core_mask[1], id.core_mask[2]);
     if (id.result == T8122_ID_POWER_OFF_FAILED) {
         printf("FDT: GPU: T6034 WARNING: power closure restoration failed\n");
         return 0;

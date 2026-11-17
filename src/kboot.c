@@ -469,9 +469,12 @@ struct m3_default_board {
  * so with one the J613 gets the plain recipe below.
  */
 static const char *const m3_j613_boards[] = {"apple,j613", NULL};
-static const char *const m3_j613_switches[] = {
-    "asahi,t8122-dcp", "asahi,t8122-gpu", "asahi,t8122-gpu-power-standin",
-    "asahi,t8122-gpu-fuse-leakage", "asahi,t8122-dcpext", NULL};
+static const char *const m3_j613_switches[] = {"asahi,t8122-dcp",
+                                               "asahi,t8122-gpu",
+                                               "asahi,t8122-gpu-power-standin",
+                                               "asahi,t8122-gpu-fuse-leakage",
+                                               "asahi,t8122-dcpext",
+                                               NULL};
 /* The M3 Airs (the J613 on an older kernel) and the 14" M3 MacBook Pro (J504): the T8122 recipe. */
 static const char *const m3_air_boards[] = {"apple,j613", "apple,j615", "apple,j504", NULL};
 static const char *const m3_air_switches[] = {"asahi,t8122-dcp", "asahi,t8122-gpu",
@@ -11329,7 +11332,8 @@ int kboot_prepare_dt(void *fdt)
     // A T6030 also takes its display ADT facts (at most 46K, headers and strings included)
     if (chip_id == T6030)
         dt_bufsize += 4 * SZ_16K;
-    // T6031, J514M and J516M take PMP values (32K) and display, GPU and firmware handoff (about 16K)
+    // T6031, J514M and J516M take PMP values (32K) and display, GPU and firmware handoff (about
+    // 16K)
     if (chip_id == T6031 || t6034_board(fdt) || j516m_board(fdt))
         dt_bufsize += 4 * SZ_16K;
     // A T6032 takes only its firmware image UUID list (about 16K)

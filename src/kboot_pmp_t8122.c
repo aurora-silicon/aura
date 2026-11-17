@@ -47,8 +47,8 @@
  * /arm-io/pmp clock-gates read as actually on. The PTD update page is never accessed. After a
  * guarded fault, or once the node cannot be published, nothing more is read. Only on a J613,
  * J615 or J504 with chosen.asahi,t8122-dcp=1; the caller selects T8122. Each node is built on a
- * copy of the FDT and published only if complete. Failure is non-fatal to kboot, and an existing node is
- * never replaced.
+ * copy of the FDT and published only if complete. Failure is non-fatal to kboot, and an existing
+ * node is never replaced.
  */
 
 #define FACTS_PMP    "asahi,t8122-pmp-facts"
