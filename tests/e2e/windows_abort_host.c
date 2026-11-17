@@ -37,6 +37,9 @@ static u64 hv_translate(u64 a, bool b, bool c, void *d) { (void)b; (void)c; (voi
 static int uartproxy_run(struct uartproxy_msg_start *msg) { assert(bhl); (void)msg; return proxy_result; }
 static void print_regs(u64 *regs, int n) { (void)regs; (void)n; }
 static void flush_and_reboot(void) { abort(); }
+/* The carrier resets only through hv_safe_reset() (NVMe shutdown first). */
+static void hv_safe_reset(const char *why) __attribute__((noreturn));
+static void hv_safe_reset(const char *why) { (void)why; abort(); }
 static void hv_exit_guest(void) __attribute__((noreturn));
 static void hv_exit_guest(void) {
     assert(!bhl);

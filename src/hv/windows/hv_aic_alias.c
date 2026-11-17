@@ -72,6 +72,26 @@ static const struct hv_aic_alias *hv_aic_alias_table(u32 *count)
         *count = ARRAY_SIZE(hv_aic_aliases_t8142);
         return hv_aic_aliases_t8142;
     }
+    /*
+     * T8152 (J804) publishes no aliases yet, on purpose: M2 and M3 describe no
+     * device with a line at or above the 1020 GSIV ceiling, and an alias is
+     * only added with the milestone that needs it, so no line is published
+     * early.  Planned, from a walk of the J804 ADT (520 distinct `interrupts`
+     * lines, 242 inside [32,1020); of 960..1019 only 1009, 1011, 1013 and
+     * 1015..1017 are taken, so 980..999 is free):
+     *
+     *   M4  996 -> 1349  ans (NVMe), the line the J804 DTS uses
+     *   M5  drd1 1692 and drd3 1834, numbers from the free 980..999 block
+     *   M7  MTP 1500/1501
+     *
+     * Re-run the free-line walk on the live ADT before each run.  A published
+     * number must also never be one of aura's reserved timer software lines at
+     * aic->nr_irq - 2 * MAX_CPUS .. aic->nr_irq - 1 (2336..2399 with 0x960).
+     */
+    if (chip_id == T8152) {
+        *count = 0;
+        return NULL;
+    }
 
     *count = 0;
     return NULL;

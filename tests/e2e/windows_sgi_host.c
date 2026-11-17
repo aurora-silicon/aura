@@ -41,6 +41,11 @@ static void smp_send_ipi(int cpu)
     assert(cpu >= 0 && cpu < MAX_CPUS && cpu != sender);
     kicks[cpu]++;
 }
+/* The carrier kicks through hv_kick_cpu(); off T8152 that is smp_send_ipi(). */
+static void hv_kick_cpu(int cpu)
+{
+    smp_send_ipi(cpu);
+}
 static void hv_gic_cpuif_sync_vi(void)
 {
     local_sync++;

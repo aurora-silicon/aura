@@ -2178,6 +2178,22 @@ void hv_vgicv3_init(void)
                 printf("HV vGIC: sizing carrier to %u live CPUs (ADT reports %d)\n", num_cpus,
                        smp_cpu_count());
             break;
+        case T8152:
+            /*
+             * J804 (M6).  The Mu J804 platform reuses the J873 (T8142 family)
+             * PCDs, so the carrier answers at the same 36-bit IPAs.  Nothing on
+             * J804 lives there (no ADT node at 0xF00000000..0xF40000000), and
+             * the vGIC is hooked MMIO, never mapped hardware.  Live cores, for
+             * the same reason as T8142.
+             */
+            dist_base = DIST_BASE_36_BIT;
+            redist_base = REDIST_BASE_36_BIT;
+            its_base = ITS_BASE_36_BIT;
+            num_cpus = hv_vgic_live_cpu_count();
+            if (num_cpus != (u16)smp_cpu_count())
+                printf("HV vGIC: sizing carrier to %u live CPUs (ADT reports %d)\n", num_cpus,
+                       smp_cpu_count());
+            break;
         // case T8010:
         // case T8015:
         // case T8011:

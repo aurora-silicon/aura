@@ -12,6 +12,7 @@
 #include "malloc.h"
 #include "memory.h"
 #include "mtp_handoff.h"
+#include "nvme.h"
 #include "pcie.h"
 #include "serial_capture.h"
 #include "smp.h"
@@ -150,12 +151,96 @@ static u32 hv_windows_ecpu_state;
 static u32 hv_windows_ecpu_khz;
 static bool hv_windows_ecpu_attempted;
 
+/*
+ * Cross-CPU kicks.  The carrier was written for SoCs whose cpu_features
+ * advertise Apple Fast IPIs.  T8152's features_m6 does not (not yet qualified
+ * for aura, Phase 3 measurement (c)), and aura's smp_send_ipi() there is only
+ * SEV, which does not interrupt a CPU that is running a guest.  So on T8152:
+ *
+ *  - by default the carrier polls: every guest CPU has a 1 kHz EL2 tick
+ *    (hv_secondary_tick_interval, set in hv_init()) and the guest-WFI wait
+ *    already wakes at HV_WFI_WAKE_RATE; each FIQ drains queued guest IPIs
+ *    and vSGIs (hv_exc_fiq()).  IPI latency is at most about 1 ms;
+ *  - with HV_WINDOWS_T8152_FAST_IPI (the launcher sets it only once (c)
+ *    passed), the carrier sends real Fast IPIs itself.  cpu_features is left
+ *    alone, so aura's own exception.c PMCR0 paths do not change.
+ */
+static bool hv_t8152_fast_ipi;
+static bool hv_t8152_soft_gic;
+
+/*
+ * The software GIC CPU interface (trapped ICC_* accesses, no list registers)
+ * is the delivery model proven on T8142.  T8152 joins it only when the
+ * launcher opts in after Phase 3 measurement (f) showed that ICC_* accesses
+ * trap to EL2 there; until then those paths stay T8142-only.
+ */
+bool hv_soft_gic_cpuif(void)
+{
+    return chip_id == T8142 || (chip_id == T8152 && hv_t8152_soft_gic);
+}
+
+bool hv_fast_ipi(void)
+{
+    return cpu_features->fast_ipi || hv_t8152_fast_ipi;
+}
+
+void hv_kick_cpu(int cpu)
+{
+    if (chip_id == T8152 && hv_t8152_fast_ipi && cpu >= 0 && cpu < MAX_CPUS) {
+        u64 mpidr = smp_get_mpidr(cpu);
+        sysop("dsb sy");
+        msr(SYS_IMP_APL_IPI_RR_GLOBAL_EL1, (mpidr & 0xff) | ((mpidr & 0xff00) << 8));
+        return;
+    }
+    smp_send_ipi(cpu);
+}
+
+/*
+ * The only way the Windows personality resets the machine.  A watchdog (WD1)
+ * reset must never follow writes that NVMe has not committed, so:
+ *
+ *  - the guest never owns ANS here: on T8152 the stage-2 denylist keeps ANS
+ *    and SART out of the guest (a future milestone that passes them through
+ *    must make this function shut the guest's controller down first);
+ *  - aura's own NVMe session, if any, is shut down first;
+ *  - if that fails, or this is re-entered, the CPU parks instead.  A park
+ *    loses nothing that a reset would not; it needs a power-button hold.
+ *
+ * PSCI SYSTEM_RESET does not come here: it returns 2 to the host proxy
+ * (hv_windows_system_exit()), whose launcher then runs nvme_shutdown and
+ * reboot (proxyclient/aura/windows.py windows_system_reset()).
+ */
+void hv_safe_reset(const char *why)
+{
+    static int entered;
+
+    printf("HV: reset requested: %s\n", why);
+    if (__atomic_fetch_add(&entered, 1, __ATOMIC_ACQ_REL)) {
+        printf("HV: reset re-entered; parking this CPU\n");
+        goto park;
+    }
+    if (!nvme_shutdown()) {
+        printf("HV: NVMe shutdown failed; not resetting. Parking (hold power to exit)\n");
+        goto park;
+    }
+    printf("HV: NVMe is shut down; resetting through WD1\n");
+    flush_and_reboot();
+
+park:
+    iodev_console_flush();
+    while (1)
+        sysop("wfe");
+}
+
 int hv_windows_configure(u64 flags)
 {
     if (hv_windows_initialized ||
         ((hv_windows_flags & HV_WINDOWS_CPUFREQ) && !(flags & HV_WINDOWS_CPUFREQ)) ||
         flags & ~(HV_WINDOWS_GUEST_COMPAT | HV_WINDOWS_FB_SHADOW | HV_WINDOWS_SERIAL_CAPTURE |
-                  HV_WINDOWS_SERIAL_CDC | HV_WINDOWS_MTP | HV_WINDOWS_CPUFREQ))
+                  HV_WINDOWS_SERIAL_CDC | HV_WINDOWS_MTP | HV_WINDOWS_CPUFREQ |
+                  HV_WINDOWS_T8152_FAST_IPI | HV_WINDOWS_T8152_SOFT_GIC))
+        return -1;
+    if ((flags & (HV_WINDOWS_T8152_FAST_IPI | HV_WINDOWS_T8152_SOFT_GIC)) && chip_id != T8152)
         return -1;
     if ((flags & HV_WINDOWS_SERIAL_CDC) &&
         ((flags & HV_WINDOWS_SERIAL_CAPTURE) || uartproxy_iodev < IODEV_USB0 ||
@@ -168,6 +253,8 @@ int hv_windows_configure(u64 flags)
     if ((flags & HV_WINDOWS_SERIAL_CAPTURE) && !hv_windows_serial_available())
         return -1;
     hv_windows_flags = flags;
+    hv_t8152_fast_ipi = flags & HV_WINDOWS_T8152_FAST_IPI;
+    hv_t8152_soft_gic = flags & HV_WINDOWS_T8152_SOFT_GIC;
     return 0;
 }
 
@@ -259,10 +346,19 @@ static int hv_join_cpus(void)
 
 int hv_init(void)
 {
-    if (!is_mac || !cpu_features->fast_ipi || !aic) {
+    /*
+     * The J804 proxy path never initializes the AIC (aura-pr70 238a4432 does
+     * the same in sptm_virt_enter()).  T8152 has no qualified Fast IPI yet;
+     * it polls instead (see hv_kick_cpu()).
+     */
+    if (chip_id == T8152 && !aic)
+        aic_init();
+    if (!is_mac || !aic || !(cpu_features->fast_ipi || chip_id == T8152)) {
         printf("HV: this CPU/interrupt controller lacks the Windows backend prerequisites\n");
         return -1;
     }
+    if (chip_id == T8152 && hv_t8152_preflight() < 0)
+        return -1;
     if (hv_shutdown_failed && hv_join_cpus())
         return -1;
     /* Device and guest state is single-session; reload Aura before another boot. */
@@ -291,8 +387,11 @@ int hv_init(void)
     // Make sure we wake up DCP if we put it to sleep, just quiesce it to match ADT
     if (display_is_external && display_start_dcp() >= 0)
         display_shutdown(DCP_QUIESCED);
-    // reenable hpm interrupts for the guest for unused iodevs
-    usb_hpm_restore_irqs(0);
+    // reenable hpm interrupts for the guest for unused iodevs.  Not on T8152:
+    // USB is withheld from the guest there, and nothing may write to the
+    // USB-C port controllers.
+    if (chip_id != T8152)
+        usb_hpm_restore_irqs(0);
     if (smp_start_secondaries() < 0)
         return -1;
     smp_set_wfe_mode(true);
@@ -395,12 +494,16 @@ int hv_init(void)
      * invisible to the guest.  Cores that can set the retention policy keep
      * running WFI natively; this costs them nothing.
      */
-    if (!cpu_features->apple_sysregs_unlocked) {
+    if (!cpu_features->apple_sysregs_unlocked || chip_id == T8152) {
         hv_write_hcr(mrs(HCR_EL2) | HCR_TWI);
         printf("HV: trapping guest WFI (no CYC_OVRD on this CPU, HCR_EL2=0x%lx)\n", mrs(HCR_EL2));
     }
+    if (chip_id == T8152 && !(mrs(HCR_EL2) & HCR_TWI)) {
+        printf("HV: T8152: HCR_EL2.TWI did not stick; refusing\n");
+        return -1;
+    }
 
-    if (chip_id == T8142) {
+    if (chip_id == T8142 || chip_id == T8152) {
         /*
          * T8142 does not provide the older Apple PMC register bank used by
          * the imported architectural-PMU redirect.  Keep every architectural
@@ -413,8 +516,8 @@ int hv_init(void)
         mdcr |= MDCR_EL2_TPMCR | MDCR_EL2_TPM;
         msr(MDCR_EL2, mdcr);
         sysop("isb");
-        printf("HV: T8142: architectural PMUv3 trapped to synthetic EL2 backend (MDCR=0x%lx)\n",
-               mdcr);
+        printf("HV: %s: architectural PMUv3 trapped to synthetic EL2 backend (MDCR=0x%lx)\n",
+               chip_id == T8152 ? "T8152" : "T8142", mdcr);
     }
 
     // No guest vectors initially
@@ -461,6 +564,16 @@ int hv_init(void)
          * mechanism is understood and can be enabled safely.
          */
         printf("HV: T8142: ECV advertised without CNTPOFF_EL2; using direct-counter fallback\n");
+        hv_has_ecv = false;
+    }
+
+    if (chip_id == T8152 && hv_has_ecv) {
+        /*
+         * Not measured on T8152 yet (Phase 3 measurement (e): is CNTPOFF_EL2
+         * implemented?).  Until it is, take the same direct-counter path as
+         * T8142 rather than one that stalled Mu's first delay loop there.
+         */
+        printf("HV: T8152: ECV not yet qualified; using the direct-counter fallback\n");
         hv_has_ecv = false;
     }
 
@@ -514,6 +627,17 @@ int hv_init(void)
          */
         hv_secondary_tick_interval =
             chip_id == T8142 ? mrs(CNTFRQ_EL0) / HV_SLOW_TICK_RATE : hv_tick_interval;
+    }
+
+    if (chip_id == T8152 && !hv_fast_ipi()) {
+        /* Polling IPI path: every guest CPU re-enters EL2 at least once a millisecond. */
+        u64 poll = mrs(CNTFRQ_EL0) / HV_WFI_WAKE_RATE;
+        if (hv_secondary_tick_interval > poll)
+            hv_secondary_tick_interval = poll;
+        printf("HV: T8152: no Fast IPI; polling guest IPIs at %u Hz on every CPU\n",
+               HV_WFI_WAKE_RATE);
+    } else if (chip_id == T8152) {
+        printf("HV: T8152: kicking guest CPUs with Fast IPIs (measured, launcher opted in)\n");
     }
 
     hv_configure_guest_wfi_mode();
@@ -861,7 +985,8 @@ static bool hv_fb_init(struct boot_args *gba)
     sysop("dsb sy");
     mmu_add_mapping((u64)hv_fb_shadow, (u64)hv_fb_shadow, size, MAIR_IDX_NORMAL_NC, PERM_RW);
     memset(hv_fb_shadow, 0, size);
-    if (hv_map_hw((u64)hv_fb_shadow, (u64)hv_fb_shadow, size) < 0) {
+    if (hv_t8152_allow((u64)hv_fb_shadow, (u64)hv_fb_shadow, size, false, "BGRA shadow") < 0 ||
+        hv_map_hw((u64)hv_fb_shadow, (u64)hv_fb_shadow, size) < 0) {
         printf("HV: cannot map BGRA shadow; guest entry refused\n");
         /* Keep the allocation reserved: its host mapping is now non-cacheable. */
         hv_fb_shadow = NULL;
@@ -1235,9 +1360,28 @@ int hv_start(void *entry, u64 regs[4])
     else
         adt_base = ADT_EL2_42_BIT;
 
-    // map the address of the (EL2) ADT to a fixed location so EL1 can patch it
-    if (hv_map_hw(adt_base, (u64)adt, ALIGN_UP(cur_boot_args.devtree_size, SZ_16K)) < 0) {
+    // map the address of the (EL2) ADT to a fixed location so EL1 can patch it.
+    // On T8152 it is aura's live ADT, so the guest only gets to read it.
+    u64 adt_size = ALIGN_UP(cur_boot_args.devtree_size, SZ_16K);
+    int adt_mapped;
+    if (chip_id == T8152)
+        adt_mapped = hv_t8152_allow(adt_base, (u64)adt, adt_size, true, "Mu ADT alias") < 0
+                         ? -1
+                         : hv_map_hw_ro(adt_base, (u64)adt, adt_size);
+    else
+        adt_mapped = hv_map_hw(adt_base, (u64)adt, adt_size);
+    if (adt_mapped < 0) {
         printf("HV: cannot map the Mu ADT alias\n");
+        hv_windows_mtp_stop();
+        hv_windows_quarantine();
+        return -1;
+    }
+
+    /* T8152: last check of everything the guest can reach, then enter. */
+    if (chip_id == T8152 && hv_t8152_verify((u64)entry, regs[0], hv_secondary_info.hcr,
+                                            hv_windows_flags & HV_WINDOWS_FB_SHADOW) < 0) {
+        msr(CNTP_CTL_EL0, 0); /* the primary host tick armed above */
+        hv_cpus_in_guest = 0;
         hv_windows_mtp_stop();
         hv_windows_quarantine();
         return -1;
@@ -1284,7 +1428,9 @@ static void hv_init_secondary(struct hv_secondary_info_t *info)
     // not a re-derived one, so there is nothing native-AIC-specific to add here beyond
     // this note.
     //
-    msr(HCR_EL2, info->hcr);
+    hv_write_hcr(info->hcr);
+    if (chip_id == T8152 && !(mrs(HCR_EL2) & HCR_TWI))
+        hv_safe_reset("T8152 secondary without HCR_EL2.TWI");
     if (cpu_features->apple_sysregs_unlocked)
         msr(HACR_EL2, info->hacr);
     msr(VTCR_EL2, info->vtcr);
@@ -1399,6 +1545,9 @@ static void hv_enter_secondary(void *entry, u64 regs[4])
 
     hv_started_cpus[smp_id()] = false;
     spin_unlock(&bhl);
+
+    /* PSCI CPU_OFF: this core is back in aura's spin table, ready for CPU_ON. */
+    hv_psci_cpu_parked(smp_id());
 }
 
 int hv_start_secondary(int cpu, void *entry, u64 regs[4])
@@ -1408,6 +1557,14 @@ int hv_start_secondary(int cpu, void *entry, u64 regs[4])
 
     printf("HV: Initializing secondary %d\n", cpu);
     iodev_console_flush();
+
+    /*
+     * A core that the guest turned off with PSCI CPU_OFF may still be on its
+     * way out of hv_enter_secondary(); join that call before the next one.
+     */
+    u64 ignored;
+    if (smp_wait_timed(cpu, &ignored, 1000) == SMP_TIMEOUT)
+        return SMP_TIMEOUT;
 
     hv_setup_pending[cpu] = true;
     int ret = mmu_init_secondary(cpu);
@@ -1595,7 +1752,7 @@ void hv_rendezvous(void)
              */
             for (int i = 0; i < MAX_CPUS; i++) {
                 if (i != smp_id() && hv_started_cpus[i] && (missing & BIT(i))) {
-                    smp_send_ipi(i);
+                    hv_kick_cpu(i);
                 }
             }
             next_ipi = now + ipi_period;
@@ -1641,6 +1798,7 @@ void hv_pin_cpu(int cpu)
 
 void hv_write_hcr(u64 val)
 {
+    val = hv_t8152_hcr_filter(val);
     if (gxf_enabled() && !in_gl12())
         gl2_call(hv_write_hcr, val, 0, 0, 0);
     else

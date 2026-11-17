@@ -685,7 +685,7 @@ static bool hv_guest_ipi_queue_pre_config_carrier(int cpu)
     };
 
     if (hv_sgi_queue_push(cpu, &pending))
-        smp_send_ipi(cpu);
+        hv_kick_cpu(cpu);
     return true;
 }
 #endif
@@ -1169,9 +1169,9 @@ static void _hv_exc_proxy(struct exc_info *ctx, uartproxy_boot_reason_t reason, 
             spin_unlock(&bhl);
             hv_exit_guest(); // does not return
         default:
-            printf("Guest exception not handled, rebooting.\n");
+            printf("Guest exception not handled, resetting.\n");
             print_regs(ctx->regs, 0);
-            flush_and_reboot(); // does not return
+            hv_safe_reset("unhandled guest exception"); // does not return
     }
 }
 
@@ -2267,7 +2267,7 @@ static u32 gic_cpuif_eoi_count[MAX_CPUS];
 
 static struct hv_gic_cpuif *hv_gic_cpuif_this(void)
 {
-    if (chip_id != T8142)
+    if (!hv_soft_gic_cpuif())
         return NULL;
 
     u64 cpu = smp_id();
@@ -2501,7 +2501,7 @@ static void hv_gic_cpuif_send_sgi(u64 val)
         if (cpu == self)
             hv_gic_cpuif_sync_vi();
         else
-            smp_send_ipi(cpu);
+            hv_kick_cpu(cpu);
     }
 }
 
@@ -2637,7 +2637,7 @@ static bool hv_handle_native_aic_carrier_cpuif(u64 reg, bool is_read, u64 rt, u6
 
 static bool hv_handle_t8142_gic_cpuif(u64 reg, bool is_read, u64 rt, u64 regs[32], bool probe)
 {
-    if (chip_id != T8142)
+    if (!hv_soft_gic_cpuif())
         return false;
 
     u64 cpu = smp_id();
@@ -4732,7 +4732,7 @@ void hv_report_t8142_gic_activity(void)
     static u32 last_eoi[MAX_CPUS];
     bool changed = false;
 
-    if (chip_id != T8142)
+    if (!hv_soft_gic_cpuif())
         return;
 
     /*
@@ -5220,7 +5220,7 @@ static bool hv_handle_msr_unlocked(struct exc_info *ctx, u64 iss)
                         .hw_irq = 0,
                     };
                     if (hv_sgi_queue_push(cpu, &pending))
-                        smp_send_ipi(cpu);
+                        hv_kick_cpu(cpu);
                 }
             }
             return true;
@@ -5889,8 +5889,21 @@ static bool hv_handle_msr_unlocked(struct exc_info *ctx, u64 iss)
             return true;
             /* clang-format off */
         /* IPI handling */
-        SYSREG_MAP_IF(SYS_IMP_APL_IPI_CR_EL1, SYS_IMP_APL_IPI_CR_EL1,
-                      cpu_features->fast_ipi)
+        case SYSREG_ISS(SYS_IMP_APL_IPI_CR_EL1):
+            if (hv_fast_ipi()) {
+                if (is_read)
+                    regs[rt] = mrs(SYS_IMP_APL_IPI_CR_EL1);
+                else
+                    msr(SYS_IMP_APL_IPI_CR_EL1, regs[rt]);
+                return true;
+            }
+            /* T8152 polling path: no deferred-IPI countdown; reads 0, writes ignored. */
+            if (chip_id == T8152) {
+                if (is_read)
+                    regs[rt] = 0;
+                return true;
+            }
+            return false;
         /* M1RACLES reg, handle here due to silly 12.0 "mitigation" */
         case SYSREG_ISS(sys_reg(3, 5, 15, 10, 1)):
             if (is_read)
@@ -5993,7 +6006,8 @@ static bool hv_handle_msr(struct exc_info *ctx, u64 iss)
     switch (reg) {
         /* clang-format on */
         case SYSREG_ISS(SYS_IMP_APL_IPI_RR_LOCAL_EL1): {
-            if (!cpu_features->fast_ipi || is_read)
+            /* T8152 without Fast IPI: queue the tag; the target's 1 kHz tick delivers it. */
+            if (is_read || !(hv_fast_ipi() || chip_id == T8152))
                 return false;
             u64 mpidr = (regs[rt] & 0xff) | (mrs(MPIDR_EL1) & 0xffff00);
             for (int i = 0; i < MAX_CPUS; i++)
@@ -6013,13 +6027,16 @@ static bool hv_handle_msr(struct exc_info *ctx, u64 iss)
                      * Windows IPI as an EL2-only rendezvous.
                      */
                     sysop("dsb sy");
-                    msr(SYS_IMP_APL_IPI_RR_LOCAL_EL1, regs[rt]);
+                    if (hv_fast_ipi())
+                        msr(SYS_IMP_APL_IPI_RR_LOCAL_EL1, regs[rt]);
+                    else
+                        hv_kick_cpu(i);
                     return true;
                 }
             return false;
         }
         case SYSREG_ISS(SYS_IMP_APL_IPI_RR_GLOBAL_EL1):
-            if (!cpu_features->fast_ipi || is_read)
+            if (is_read || !(hv_fast_ipi() || chip_id == T8152))
                 return false;
             u64 mpidr = (regs[rt] & 0xff) | ((regs[rt] & 0xff0000) >> 8);
             for (int i = 0; i < MAX_CPUS; i++) {
@@ -6032,7 +6049,10 @@ static bool hv_handle_msr(struct exc_info *ctx, u64 iss)
 #endif
                     __atomic_store_n(&pcpu[i].ipi_queued, true, __ATOMIC_RELEASE);
                     sysop("dsb sy");
-                    msr(SYS_IMP_APL_IPI_RR_GLOBAL_EL1, regs[rt]);
+                    if (hv_fast_ipi())
+                        msr(SYS_IMP_APL_IPI_RR_GLOBAL_EL1, regs[rt]);
+                    else
+                        hv_kick_cpu(i);
                     return true;
                 }
             }
@@ -6678,7 +6698,7 @@ void hv_exc_irq(struct exc_info *ctx)
      * auto-masked the physical source -- the guest's EOIR trap is what unmasks
      * it again.
      */
-    if (chip_id == T8142) {
+    if (hv_soft_gic_cpuif()) {
         /*
          * One line per core the first time a real device interrupt makes it to
          * EL2.  Without it, "the AIC never presented it" and "EL2 never took
@@ -6688,7 +6708,7 @@ void hv_exc_irq(struct exc_info *ctx)
          */
         if (!gic_cpuif_aic_logged[smp_id()]) {
             gic_cpuif_aic_logged[smp_id()] = true;
-            printf("HV: T8142: AIC line %u -> INTID %u at EL2 on CPU %d "
+            printf("HV: soft GIC cpuif: AIC line %u -> INTID %u at EL2 on CPU %d "
                    "(hcr 0x%lx)\n",
                    irq, guest_irq, (int)smp_id(), mrs(HCR_EL2));
         }
@@ -6892,8 +6912,12 @@ void hv_exc_fiq(struct exc_info *ctx)
      * controller EOI commits it. A local-tick retry can re-emit an uncommitted
      * EVENT without consuming a newer DELIVERABLE generation.
      */
-    u64 ipi_status = cpu_features->fast_ipi ? mrs(SYS_IMP_APL_IPI_SR_EL1) : 0;
-    if (ipi_status & IPI_SR_PENDING) {
+    u64 ipi_status = hv_fast_ipi() ? mrs(SYS_IMP_APL_IPI_SR_EL1) : 0;
+    /*
+     * T8152 without Fast IPI has no physical edge: every FIQ (the 1 kHz tick
+     * included) is the delivery point, so drain the queues unconditionally.
+     */
+    if ((ipi_status & IPI_SR_PENDING) || (chip_id == T8152 && !hv_fast_ipi())) {
 #ifdef ENABLE_NATIVE_AIC_PASSTHROUGH
         HV_NATIVE_AIC_HOT_TRACE(HV_NATIVE_AIC_TRACE_IPI_FIQ, ipi_status, PERCPU(ipi_queued));
 #endif
@@ -6904,8 +6928,10 @@ void hv_exc_fiq(struct exc_info *ctx)
          * exchange below.  The previous consume-then-ack order could clear a
          * newly-arrived edge while stranding its tag forever.
          */
-        msr(SYS_IMP_APL_IPI_SR_EL1, IPI_SR_PENDING);
-        sysop("isb");
+        if (ipi_status & IPI_SR_PENDING) {
+            msr(SYS_IMP_APL_IPI_SR_EL1, IPI_SR_PENDING);
+            sysop("isb");
+        }
 #ifdef ENABLE_VGIC_MODULE
 #ifdef ENABLE_NATIVE_AIC_PASSTHROUGH
         if (!hv_native_aic_windows_active()) {

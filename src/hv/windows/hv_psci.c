@@ -303,8 +303,10 @@ void hv_psci_init(void)
            psci_num_clusters, NUM_SYSTEMS_ACTIVE);
 
     /* Public Windows bring-up exposes only implemented virtual CPU services.
-     * Physical CPU_OFF/SUSPEND and memory protection are not implemented. */
+     * CPU_OFF parks the core (hv_psci_turn_off_cpu()); nothing is powered
+     * off.  CPU_SUSPEND and memory protection are not implemented. */
     psci_capabilities = PSCI_GENERIC_CAPABILITY | define_psci_cap(PSCI_CPU_ON_ARM64_FUNCTION_ID) |
+                        define_psci_cap(PSCI_CPU_OFF_FUNCTION_ID) |
                         define_psci_cap(PSCI_SYSTEM_POWEROFF_FUNCTION_ID) |
                         define_psci_cap(PSCI_SYSTEM_RESET_FUNCTION_ID);
 
@@ -951,10 +953,56 @@ void hv_psci_get_parent_nodes(unsigned int cpu_index, unsigned int end_power_lev
  * - PSCI_SUCCESS if CPU powered off successfully.
  * - PSCI_OPERATION_DENIED if an error occurred.
  */
+void hv_exit_guest(void) __attribute__((noreturn));
+
+/*
+ * PSCI CPU_OFF is a park, never a power-off.  On T8152 a core that is really
+ * powered off does not come back (aura smp.c refuses smp_stop_secondaries()
+ * there for that reason), so the core leaves the guest and returns to aura's
+ * spin table in smp_secondary_entry(), where the next CPU_ON (a spin-table
+ * release through hv_start_secondary()) picks it up again.  The same holds on
+ * every other SoC, so this is not chip-gated.
+ *
+ * The affinity state turns OFF only once the core is back in the spin table
+ * (hv_psci_cpu_parked(), called from hv_enter_secondary()), so a CPU_ON that
+ * races the exit sees ON or ON_PENDING rather than a core that is not ready.
+ */
+static bool psci_cpu_parking[MAX_CPUS];
+
 int hv_psci_turn_off_cpu(void)
 {
-    /* The host owns physical power state; no guest CPU_OFF protocol yet. */
-    return PSCI_STATUS_NOT_SUPPORTED;
+    int cpu = smp_id();
+
+    if (cpu < 0 || cpu >= MAX_CPUS || cpu == boot_cpu_idx)
+        return PSCI_STATUS_OPERATION_DENIED;
+    if (__atomic_load_n(&psci_cpu_data_array[cpu].affinity_state, __ATOMIC_ACQUIRE) !=
+        AFFINITY_STATE_ON)
+        return PSCI_STATUS_OPERATION_DENIED;
+
+    __atomic_store_n(&psci_cpu_parking[cpu], true, __ATOMIC_RELEASE);
+
+    /* A parked core must not be woken by a stale guest timer or the host tick. */
+    msr(SYS_CNTV_CTL_EL02, 0);
+    msr(SYS_CNTP_CTL_EL02, 0);
+    if (chip_id == T8142)
+        msr(SYS_CNTHP_CTL_EL2, 0);
+    else
+        msr(CNTP_CTL_EL0, 0);
+    sysop("isb");
+
+    printf("PSCI: CPU %d CPU_OFF: parking in the aura spin table (no power-off)\n", cpu);
+    hv_exit_guest(); /* returns from hv_enter_guest() in hv_enter_secondary() */
+}
+
+void hv_psci_cpu_parked(int cpu)
+{
+    if (cpu < 0 || cpu >= MAX_CPUS)
+        return;
+    if (__atomic_exchange_n(&psci_cpu_parking[cpu], false, __ATOMIC_ACQ_REL)) {
+        __atomic_store_n(&psci_cpu_data_array[cpu].affinity_state, AFFINITY_STATE_OFF,
+                         __ATOMIC_RELEASE);
+        printf("PSCI: CPU %d parked; CPU_ON may release it again\n", cpu);
+    }
 }
 
 //
@@ -1286,35 +1334,12 @@ int hv_psci_suspend_cpu(uint64_t power_state, uint64_t cpu_reentry_addr, uint64_
     return PSCI_STATUS_NOT_SUPPORTED;
 }
 
-//
-// Description:
-// Reboots the entire system. As simple as it sounds.
-// This function should not return.
-//
-// Return value:
-// N/A
-//
-void hv_psci_reset_system(void)
-{
-    iodev_console_flush();
-    //
-    // TODO: replace this placeholder reboot with a poweroff.
-    //
-    reboot();
-}
-
-//
-// Description:
-// Turns off the entire system. As simple as it sounds.
-// This function should not return.
-//
-// Return value:
-// N/A
-//
-void hv_psci_turn_off_system(void)
-{
-    flush_and_reboot();
-}
+/*
+ * SYSTEM_OFF and SYSTEM_RESET end the virtual machine and return to the host
+ * proxy (hv_windows_system_exit()); the machine is reset, if at all, by the
+ * host after an NVMe shutdown.  The former direct-reboot helpers were unused
+ * and are gone, so no guest request can reach the watchdog without it.
+ */
 
 //
 // Description:
@@ -1330,6 +1355,7 @@ int hv_psci_features(unsigned int function_id)
         case PSCI_GET_VERSION_FUNCTION_ID:
         case PSCI_CPU_ON_ARM32_FUNCTION_ID:
         case PSCI_CPU_ON_ARM64_FUNCTION_ID:
+        case PSCI_CPU_OFF_FUNCTION_ID:
         case PSCI_AFFINITY_INFO_ARM32_FUNCTION_ID:
         case PSCI_AFFINITY_INFO_ARM64_FUNCTION_ID:
         case PSCI_SYSTEM_POWEROFF_FUNCTION_ID:
@@ -1390,6 +1416,9 @@ bool hv_handle_psci_smc(struct exc_info *ctx)
         case PSCI_CPU_ON_ARM32_FUNCTION_ID:
         case PSCI_CPU_ON_ARM64_FUNCTION_ID:
             result = hv_psci_turn_on_cpu(a1, a2, a3);
+            break;
+        case PSCI_CPU_OFF_FUNCTION_ID:
+            result = hv_psci_turn_off_cpu(); /* returns only when denied */
             break;
         case PSCI_AFFINITY_INFO_ARM32_FUNCTION_ID:
         case PSCI_AFFINITY_INFO_ARM64_FUNCTION_ID:

@@ -558,7 +558,13 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
                 reply->status = S_ERROR;
             break;
         case P_HV_MAP:
+#ifdef AURA_WINDOWS
+            /* A refused mapping (T8152 stage-2 policy) must not look like success to the host. */
+            if (hv_map(request->args[0], request->args[1], request->args[2], request->args[3]) < 0)
+                reply->status = S_ERROR;
+#else
             hv_map(request->args[0], request->args[1], request->args[2], request->args[3]);
+#endif
             break;
         case P_HV_START:
 #ifdef AURA_WINDOWS
@@ -628,8 +634,10 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
             /* Read-only personality/ABI probe; never initializes hardware. */
 #ifdef AURA_WINDOWS
             /* Bit 13 (0x2000): HvXfer bulk channel, P_HV_MAP_XFER.
-             * Bit 14 (0x4000): explicit J813 E boot state, P_HV_WINDOWS_ECPU_BOOT_STATE. */
-            reply->retval = 0x4157494e00017fffULL;
+             * Bit 14 (0x4000): explicit J813 E boot state, P_HV_WINDOWS_ECPU_BOOT_STATE.
+             * Bit 17 (0x20000): T8152 stage-2 policy, guest RAM window op, T8152 Fast IPI
+             * opt-in. */
+            reply->retval = 0x4157494e00037fffULL;
 #else
             reply->retval = 0;
 #endif
@@ -651,6 +659,13 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
 #ifdef AURA_WINDOWS
             /* Unlike heapblock_alloc(0), this query does not align or advance the heap. */
             reply->retval = heapblock_high_water();
+#else
+            reply->retval = -1;
+#endif
+            break;
+        case P_HV_WINDOWS_GUEST_RAM:
+#ifdef AURA_WINDOWS
+            reply->retval = hv_t8152_set_guest_ram(request->args[0], request->args[1]);
 #else
             reply->retval = -1;
 #endif

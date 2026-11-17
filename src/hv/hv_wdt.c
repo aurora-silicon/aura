@@ -77,7 +77,11 @@ void hv_wdt_bark(void)
     };
 
     uartproxy_run(&start);
+#ifdef AURA_WINDOWS
+    hv_safe_reset("HV watchdog bark");
+#else
     reboot();
+#endif
 }
 
 void hv_wdt_main(void)

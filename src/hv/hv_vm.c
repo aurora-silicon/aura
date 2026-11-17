@@ -357,6 +357,11 @@ static void hv_pt_map_l4(u64 from, u64 to, u64 size, u64 incr)
 int hv_map(u64 from, u64 to, u64 size, u64 incr)
 {
     u64 chunk;
+#ifdef AURA_WINDOWS
+    /* T8152: stage-2 allowlist and denylist, Device-nGnRnE for MMIO (hv_t8152.c). */
+    if (!hv_t8152_map_filter(from, &to, size))
+        return -1;
+#endif
     bool hw = IS_HW(to);
 
     if (from & MASK(VADDR_L4_OFFSET_BITS) || size & MASK(VADDR_L4_OFFSET_BITS))
@@ -442,6 +447,62 @@ int hv_map_hook(u64 from, hv_hook_t *hook, u64 size)
 {
     return hv_map(from, ((u64)hook) | FIELD_PREP(SPTE_TYPE, SPTE_HOOK), size, 0);
 }
+
+#ifdef AURA_WINDOWS
+/*
+ * Visit every non-empty leaf of the stage-2 table: L2 blocks (32 MiB), L3
+ * pages (16 KiB) and L4 software sub-page entries (4 bytes).  pte is the raw
+ * entry, attributes included.  Stops early if fn returns false.
+ */
+void hv_pt_for_each_leaf(hv_pt_leaf_fn *fn, void *ctx)
+{
+    u64 n1 = vaddr_bits > 36 ? BIT(vaddr_bits - VADDR_L1_OFFSET_BITS) : 1;
+
+    for (u64 i1 = 0; i1 < n1; i1++) {
+        u64 *l2 = hv_Ltop;
+        if (vaddr_bits > 36) {
+            u64 l1d = hv_Ltop[i1];
+            if (!l1d)
+                continue;
+            if (!L1_IS_TABLE(l1d)) {
+                if (!fn(ctx, i1 << VADDR_L1_OFFSET_BITS, BIT(VADDR_L1_OFFSET_BITS), l1d, 1))
+                    return;
+                continue;
+            }
+            l2 = (u64 *)(l1d & PTE_TARGET_MASK);
+        }
+        for (u64 i2 = 0; i2 < ENTRIES_PER_L2_TABLE; i2++) {
+            u64 l2d = l2[i2];
+            u64 ipa2 = (i1 << VADDR_L1_OFFSET_BITS) | (i2 << VADDR_L2_OFFSET_BITS);
+            if (!l2d)
+                continue;
+            if (!L2_IS_TABLE(l2d)) {
+                if (!fn(ctx, ipa2, BIT(VADDR_L2_OFFSET_BITS), l2d, 2))
+                    return;
+                continue;
+            }
+            u64 *l3 = (u64 *)(l2d & PTE_TARGET_MASK);
+            for (u64 i3 = 0; i3 < ENTRIES_PER_L3_TABLE; i3++) {
+                u64 l3d = l3[i3];
+                u64 ipa3 = ipa2 | (i3 << VADDR_L3_OFFSET_BITS);
+                if (!l3d)
+                    continue;
+                if (!L3_IS_TABLE(l3d)) {
+                    if (!fn(ctx, ipa3, BIT(VADDR_L3_OFFSET_BITS), l3d, 3))
+                        return;
+                    continue;
+                }
+                u64 *l4 = (u64 *)(l3d & PTE_TARGET_MASK);
+                for (u64 i4 = 0; i4 < ENTRIES_PER_L4_TABLE; i4++) {
+                    if (l4[i4] && !fn(ctx, ipa3 | (i4 << VADDR_L4_OFFSET_BITS),
+                                      BIT(VADDR_L4_OFFSET_BITS), l4[i4], 4))
+                        return;
+                }
+            }
+        }
+    }
+}
+#endif
 
 bool hv_pt_is_ram(u64 ipa)
 {

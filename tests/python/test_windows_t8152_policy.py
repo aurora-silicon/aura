@@ -1,0 +1,412 @@
+# SPDX-License-Identifier: MIT
+"""Host test of the T8152 (J804) Windows carrier safety policy, src/hv/windows/hv_t8152.c.
+
+The production file is compiled unchanged against small stand-in headers (a fake ADT,
+fake system registers, a fake stage-2 leaf walk) and exercised for every rule the
+carrier relies on: the preflight refusals, the guest RAM window checks, the map-time
+filter (denylist, allowlist, Device-nGnRnE), the HCR filter and the pre-entry walk.
+All addresses are synthetic; nothing here is read from a real machine.
+"""
+
+from pathlib import Path
+import shutil
+import subprocess
+
+import pytest
+
+REPO = Path(__file__).resolve().parents[2]
+
+STUBS = {
+    "types.h": r"""
+#pragma once
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+typedef unsigned long u64; /* as in aura (LP64): printf %lx */
+typedef uint32_t u32;
+typedef uint16_t u16;
+typedef uint8_t u8;
+typedef long s64;
+""",
+    "utils.h": r"""
+#pragma once
+#include <stdio.h>
+#include "types.h"
+#define BIT(n) (1UL << (n))
+#define GENMASK(h, l) (((~0UL) << (l)) & (~0UL >> (63 - (h))))
+#define FIELD_GET(m, v) (((v) & (m)) >> __builtin_ctzl(m))
+#define FIELD_PREP(m, v) (((u64)(v) << __builtin_ctzl(m)) & (m))
+#define ALIGN_DOWN(x, a) ((x) & ~((a) - 1))
+#define ALIGN_UP(x, a) (((x) + (a) - 1) & ~((a) - 1))
+#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
+#define HCR_VM BIT(0)
+#define HCR_TWI BIT(13)
+#define HCR_TSC BIT(19)
+#define HCR_FWB BIT(46)
+extern u64 fake_mpidr, fake_hcr, fake_cntfrq;
+#define mrs(r) fake_mrs_##r
+#define fake_mrs_MPIDR_EL1 fake_mpidr
+#define fake_mrs_HCR_EL2 fake_hcr
+#define fake_mrs_CNTFRQ_EL0 fake_cntfrq
+extern u32 board_id, chip_id;
+extern char *fake_base;
+#define _base fake_base
+""",
+    "soc.h": "#pragma once\n#define T8142 0x8142\n#define T8152 0x8152\n",
+    "string.h": "#pragma once\n#include <string.h>\n",
+    "memory.h": "#pragma once\n",
+    "smp.h": "#pragma once\n",
+    "heapblock.h": "#pragma once\n#include \"types.h\"\nuintptr_t heapblock_high_water(void);\n",
+    "ctxr_exec.h": r"""
+#pragma once
+#include "types.h"
+enum ctxr_range { CTXR_RANGE_A, CTXR_RANGE_B, CTXR_RANGE_C, CTXR_RANGE_D, CTRR_RANGE_C,
+                  CTRR_RANGE_D };
+bool ctxr_range(enum ctxr_range range, u64 *start, u64 *end);
+""",
+    "aic.h": r"""
+#pragma once
+#include "types.h"
+struct aic { u64 base; u32 version; u32 nr_irq; };
+extern struct aic *aic;
+""",
+    "xnuboot.h": r"""
+#pragma once
+#include "types.h"
+struct boot_video { u64 base, display, stride, width, height, depth; };
+struct boot_args { u64 phys_base, virt_base, mem_size; void *devtree; u32 devtree_size;
+                   struct boot_video video; };
+extern struct boot_args cur_boot_args;
+""",
+    "hv.h": r"""
+#pragma once
+#include "types.h"
+#define ENABLE_NATIVE_AIC_PASSTHROUGH
+typedef bool(hv_pt_leaf_fn)(void *ctx, u64 ipa, u64 size, u64 pte, int level);
+void hv_pt_for_each_leaf(hv_pt_leaf_fn *fn, void *ctx);
+""",
+    "adt.h": r"""
+#pragma once
+#include "types.h"
+struct adt_property { char name[32]; u32 size; u8 value[]; };
+extern void *adt;
+#define ADT_PROP(adt, offset) ((const struct adt_property *)(((u8 *)(adt)) + (offset)))
+int adt_path_offset(const void *adt, const char *path);
+int adt_path_offset_trace(const void *adt, const char *path, int *offsets);
+const char *adt_get_name(const void *adt, int nodeoffset);
+const void *adt_getprop(const void *adt, int nodeoffset, const char *name, u32 *lenp);
+int adt_get_reg(const void *adt, int *path, const char *prop, int idx, u64 *addr, u64 *size);
+int adt_get_child_count(const void *adt, int offset);
+int adt_first_child_offset(const void *adt, int offset);
+int adt_next_sibling_offset(const void *adt, int offset);
+int adt_get_property_count(const void *adt, int offset);
+int adt_first_property_offset(const void *adt, int offset);
+int adt_next_property_offset(const void *adt, int offset);
+#define ADT_FOREACH_CHILD(adt, node)                                                          \
+    for (int _child_count = adt_get_child_count(adt, node); _child_count; _child_count = 0) \
+        for (node = adt_first_child_offset(adt, node); _child_count--;                      \
+             node = adt_next_sibling_offset(adt, node))
+#define ADT_FOREACH_PROPERTY(adt, node, prop)                                                \
+    for (int _prop_count = adt_get_property_count(adt, node),                               \
+             _poff = adt_first_property_offset(adt, node);                                  \
+         _prop_count; _prop_count = 0)                                                       \
+        for (const struct adt_property *prop = ADT_PROP(adt, _poff); _prop_count--;          \
+             prop = ADT_PROP(adt, _poff = adt_next_property_offset(adt, _poff)))
+""",
+}
+
+HARNESS = r"""
+#include <assert.h>
+#include <stdlib.h>
+#include "adt.h"
+#include "aic.h"
+#include "ctxr_exec.h"
+#include "hv.h"
+#include "hv_t8152.h"
+#include "xnuboot.h"
+#include "utils.h"
+#include "string.h"
+
+/* Synthetic machine: 4 GiB of RAM at 0x10000000000. */
+#define DRAM      0x10000000000UL
+#define DRAM_SIZE 0x100000000UL
+#define AURA      0x10008000000UL
+#define CTXR_D_LO 0x10008000000UL
+#define CTXR_D_HI 0x10010000000UL
+#define HEAP_TOP  0x10012000000UL
+#define MTE       0x100f0000000UL
+#define WIN_LO    0x10040000000UL
+#define WIN_HI    0x100f0000000UL
+#define AIC_BASE  0x2a0000000UL
+#define AIC_SIZE  0x100000UL
+#define QSPI_ADT  0x2b0000000UL
+#define UART0     0x2c0000000UL
+#define J804_QSPI 0x331118000UL
+#define S2_HW     (1UL | (1UL << 10) | (3UL << 8) | (3UL << 6) | (0xfUL << 2))
+#define S2_RO     (1UL | (1UL << 10) | (3UL << 8) | (1UL << 6) | (0xfUL << 2))
+#define S2_HOOK   (1UL << 50)
+#define S2_PROXY  (2UL << 50)
+
+u64 fake_mpidr = 0x10100, fake_hcr = 0x80001UL, fake_cntfrq = 1000000000;
+u32 board_id = 0x22, chip_id = 0x8152;
+char *fake_base = (char *)AURA;
+struct aic fake_aic = {AIC_BASE, 3, 0x960}, *aic = &fake_aic;
+struct boot_args cur_boot_args;
+static bool ctxr_ok = true, qspi_present = true;
+
+uintptr_t heapblock_high_water(void) { return HEAP_TOP; }
+bool ctxr_range(enum ctxr_range range, u64 *start, u64 *end)
+{
+    if (range != CTXR_RANGE_D || !ctxr_ok)
+        return false;
+    *start = CTXR_D_LO;
+    *end = CTXR_D_HI;
+    return true;
+}
+
+/* Fake ADT: node ids are small integers; properties live in a byte buffer. */
+enum { N_ROOT = 1, N_ARMIO, N_QSPI, N_SEP, N_WDT, N_AIC, N_I2C3, N_UART0, N_ADMAC, N_CO, N_MM };
+static const char *names[] = {"", "", "arm-io", "qspi", "sep", "wdt", "aic", "i2c3", "uart0",
+                              "admac-base-ns", "carveout-memory-map", "memory-map"};
+static const u64 regs[][2] = {
+    [N_QSPI] = {QSPI_ADT, 0x8000},   [N_SEP] = {0x2a8000000, 0x74000},
+    [N_WDT] = {0x2b8000000, 0x4000}, [N_AIC] = {AIC_BASE, AIC_SIZE},
+    [N_I2C3] = {0x2b4000000, 0x4000}, [N_UART0] = {UART0, 0x4000},
+    [N_ADMAC] = {0x2b6000000, 0x44000},
+};
+static u8 propbuf[4096];
+void *adt = propbuf;
+static int co_first, co_count, mm_first, mm_count, prop_end = 16;
+static int add_prop(const char *name, u64 base, u64 size)
+{
+    int off = prop_end;
+    struct adt_property *p = (struct adt_property *)(propbuf + off);
+    strncpy(p->name, name, sizeof(p->name));
+    p->size = 16;
+    memcpy(p->value, &base, 8);
+    memcpy(p->value + 8, &size, 8);
+    prop_end += sizeof(*p) + 16;
+    return off;
+}
+int adt_path_offset(const void *a, const char *path)
+{
+    (void)a;
+    if (!strcmp(path, "/arm-io")) return N_ARMIO;
+    if (!strcmp(path, "/chosen/carveout-memory-map")) return N_CO;
+    if (!strcmp(path, "/chosen/memory-map")) return N_MM;
+    return -1;
+}
+int adt_path_offset_trace(const void *a, const char *path, int *offsets)
+{
+    (void)a;
+    if (strcmp(path, "/arm-io/aic")) return -1;
+    offsets[0] = N_ARMIO; offsets[1] = N_AIC; offsets[2] = 0;
+    return N_AIC;
+}
+const char *adt_get_name(const void *a, int n) { (void)a; return names[n]; }
+int adt_get_reg(const void *a, int *path, const char *prop, int idx, u64 *addr, u64 *size)
+{
+    (void)a; (void)prop;
+    if (idx || path[2]) return -1;
+    *addr = regs[path[1]][0]; *size = regs[path[1]][1];
+    return 0;
+}
+int adt_get_child_count(const void *a, int n) { (void)a; return n == N_ARMIO ? (qspi_present ? 7 : 6) : 0; }
+int adt_first_child_offset(const void *a, int n) { (void)a; (void)n; return qspi_present ? N_QSPI : N_SEP; }
+int adt_next_sibling_offset(const void *a, int n) { (void)a; return n + 1; }
+int adt_get_property_count(const void *a, int n) { (void)a; return n == N_CO ? co_count : n == N_MM ? mm_count : 0; }
+int adt_first_property_offset(const void *a, int n) { (void)a; return n == N_CO ? co_first : mm_first; }
+int adt_next_property_offset(const void *a, int off) { (void)a; return off + sizeof(struct adt_property) + 16; }
+const void *adt_getprop(const void *a, int n, const char *name, u32 *len)
+{
+    int count = adt_get_property_count(a, n), off = adt_first_property_offset(a, n);
+    for (int i = 0; i < count; i++, off = adt_next_property_offset(a, off)) {
+        const struct adt_property *p = ADT_PROP(a, off);
+        if (!strcmp(p->name, name)) { *len = p->size; return p->value; }
+    }
+    return NULL;
+}
+
+/* Fake stage 2: a list of leaves. */
+struct leaf { u64 ipa, size, pte; int level; };
+static struct leaf leaves[16];
+static int nleaves;
+void hv_pt_for_each_leaf(hv_pt_leaf_fn *fn, void *ctx)
+{
+    for (int i = 0; i < nleaves; i++)
+        if (!fn(ctx, leaves[i].ipa, leaves[i].size, leaves[i].pte, leaves[i].level))
+            return;
+}
+
+static void build_adt(void)
+{
+    prop_end = 16;
+    co_first = prop_end;
+    add_prop("region-id-24", DRAM, DRAM_SIZE);         /* the usable RAM itself */
+    add_prop("region-id-353", 0x10006000000, 0x1e000000); /* aura and its heaps */
+    add_prop("region-id-60", 0x10030000000, 0x4000000);
+    add_prop("region-id-218", MTE, DRAM + DRAM_SIZE - MTE);
+    add_prop("region-id-4", DRAM + DRAM_SIZE, 0x2000000);
+    co_count = 5;
+    mm_first = prop_end;
+    add_prop("BootArgs", 0x10007000000, 0x4000);
+    mm_count = 1;
+}
+
+static void boot(void)
+{
+    cur_boot_args.phys_base = DRAM;
+    cur_boot_args.mem_size = DRAM_SIZE;
+    cur_boot_args.virt_base = 0xfffffe0000000000UL;
+    cur_boot_args.devtree = (void *)(0xfffffe0000000000UL + 0x7004000UL);
+    cur_boot_args.devtree_size = 0x80000;
+    cur_boot_args.video.base = 0x10180000000UL;
+    cur_boot_args.video.stride = 0x4000;
+    cur_boot_args.video.height = 0x400;
+    build_adt();
+}
+
+static u64 map(u64 ipa, u64 to, u64 size)
+{
+    u64 v = to;
+    return hv_t8152_map_filter(ipa, &v, size) ? v : 0xdead;
+}
+
+int main(void)
+{
+    boot();
+    /* Not armed: the filter is transparent and every entry is refused. */
+    assert(map(J804_QSPI, J804_QSPI | S2_HW, 0x4000) == (J804_QSPI | S2_HW));
+    assert(hv_t8152_set_guest_ram(WIN_LO, WIN_HI - WIN_LO) < 0);
+
+    /* Preflight refusals, one at a time. */
+    ctxr_ok = false;
+    assert(hv_t8152_preflight() < 0 && !hv_t8152_policy_armed());
+    ctxr_ok = true;
+    board_id = 0x24;
+    assert(hv_t8152_preflight() < 0);
+    board_id = 0x22;
+    fake_mpidr = 0x0;
+    assert(hv_t8152_preflight() < 0);
+    fake_mpidr = 0x10100;
+    qspi_present = false;
+    assert(hv_t8152_preflight() < 0);
+    qspi_present = true;
+    fake_hcr |= HCR_FWB;
+    assert(hv_t8152_preflight() < 0);
+    fake_hcr &= ~HCR_FWB;
+    aic = NULL;
+    assert(hv_t8152_preflight() < 0);
+    aic = &fake_aic;
+    assert(hv_t8152_preflight() == 0 && hv_t8152_policy_armed());
+
+    /* Guest RAM window. */
+    assert(hv_t8152_set_guest_ram(WIN_LO + 0x4000, 0x40000000) < 0);  /* not 64 KiB aligned */
+    assert(hv_t8152_set_guest_ram(WIN_LO, 0x1000000) < 0);             /* below 256 MiB */
+    assert(hv_t8152_set_guest_ram(0x10020000000, 0x20000000) < 0);     /* region-id-353 */
+    assert(hv_t8152_set_guest_ram(0x10028000000, 0x10000000) < 0);     /* region-id-60 */
+    assert(hv_t8152_set_guest_ram(WIN_LO, MTE - WIN_LO + 0x10000) < 0);/* MTE tag storage */
+    assert(hv_t8152_set_guest_ram(0x10008000000, 0x10000000) < 0);     /* aura / CTXR_D */
+    assert(hv_t8152_set_guest_ram(WIN_LO, DRAM + DRAM_SIZE + 0x10000 - WIN_LO) < 0); /* past RAM */
+    u64 b, s;
+    assert(!hv_t8152_guest_ram(&b, &s));
+    assert(hv_t8152_set_guest_ram(WIN_LO, WIN_HI - WIN_LO) == 0);
+    assert(hv_t8152_guest_ram(&b, &s) && b == WIN_LO && s == WIN_HI - WIN_LO);
+    assert(hv_t8152_set_guest_ram(WIN_LO, WIN_HI - WIN_LO) < 0);       /* once per session */
+
+    /* Map-time filter. */
+    assert(map(J804_QSPI, J804_QSPI | S2_HW, 0x4000) == 0xdead);        /* fixed NVRAM copy */
+    assert(map(QSPI_ADT, QSPI_ADT | S2_HW, 0x4000) == 0xdead);          /* ADT qspi */
+    assert(map(0x2b4000000, 0x2b4000000 | S2_HW, 0x4000) == 0xdead);    /* i2c3 (amps) */
+    assert(map(0x2b6000000, 0x2b6000000 | S2_HW, 0x4000) == 0xdead);    /* admac */
+    assert(map(0x2a8000000, 0x2a8000000 | S2_HW, 0x4000) == 0xdead);    /* sep */
+    assert(map(0x2b8000000, 0x2b8000000 | S2_HW, 0x4000) == 0xdead);    /* wdt */
+    assert(map(UART0, UART0 | S2_HW, 0x4000) == 0xdead);                /* not allowlisted */
+    assert(map(MTE, MTE | S2_HW, 0x4000) == 0xdead);                    /* MTE tag storage */
+    assert(map(AURA, AURA | S2_HW, 0x4000) == 0xdead);                  /* aura */
+    assert(map(WIN_LO, (WIN_LO + 0x4000) | S2_HW, 0x4000) == 0xdead);   /* not identity */
+    assert(map(WIN_HI - 0x4000, (WIN_HI - 0x4000) | S2_HW, 0x8000) == 0xdead); /* runs past */
+    assert(map(WIN_LO, WIN_LO | S2_HW, WIN_HI - WIN_LO) == (WIN_LO | S2_HW));
+    u64 aic_pte = map(AIC_BASE, AIC_BASE | S2_HW, AIC_SIZE);
+    assert(aic_pte != 0xdead && ((aic_pte >> 2) & 0xf) == 0);            /* Device-nGnRnE */
+    assert(map(0x2c0001000, (u64)0x1234 | S2_HOOK, 0x1000) == ((u64)0x1234 | S2_HOOK));
+    assert(map(J804_QSPI, (7UL << 2) | S2_PROXY, 0x4000) == 0xdead);              /* host hook on NVRAM */
+    assert(map(UART0, (7UL << 2) | S2_PROXY, 0x4000) != 0xdead);
+    assert(map(J804_QSPI, 0, 0x4000) == 0);                               /* unmap always ok */
+    assert(map(J804_QSPI, J804_QSPI, 0x4000) == 0xdead);                 /* sw map onto NVRAM */
+
+    /* Exceptions: inside RAM, never the denylist, read-only where asked. */
+    assert(hv_t8152_allow(MTE, MTE, 0x4000, false, "bad") < 0);
+    assert(hv_t8152_allow(J804_QSPI, J804_QSPI, 0x4000, false, "bad") < 0);
+    assert(hv_t8152_allow(0x10011000000, 0x10011000000, 0x8000, false, "shadow") == 0);
+    assert(hv_t8152_allow(0x5300000000, 0x10007004000, 0x80000, true, "adt") == 0);
+    assert(map(0x10011000000, 0x10011000000 | S2_HW, 0x8000) != 0xdead);
+    assert(map(0x5300000000, 0x10007004000 | S2_HW, 0x80000) == 0xdead); /* RO mapped RW */
+    assert(map(0x5300000000, 0x10007004000 | S2_RO, 0x80000) != 0xdead);
+    assert(map(0x5300004000, 0x10007004000 | S2_RO, 0x4000) == 0xdead);  /* wrong IPA */
+
+    /* HCR filter. */
+    assert(hv_t8152_hcr_filter(HCR_FWB) == HCR_TWI);
+
+    /* Pre-entry walk. */
+    u64 hcr_ok = HCR_VM | HCR_TSC | HCR_TWI;
+    fake_hcr = hcr_ok;
+    leaves[nleaves++] = (struct leaf){WIN_LO, 0x2000000, WIN_LO | S2_HW | 2, 2};
+    leaves[nleaves++] = (struct leaf){AIC_BASE, 0x4000, AIC_BASE | (S2_HW & ~(0xfUL << 2)) | 2, 3};
+    leaves[nleaves++] = (struct leaf){0x10011000000, 0x4000, 0x10011000000 | S2_HW | 2, 3};
+    leaves[nleaves++] = (struct leaf){0x5300000000, 0x4000, 0x10007004000 | S2_RO | 2, 3};
+    leaves[nleaves++] = (struct leaf){UART0, 4, 0x1234 | S2_HOOK | 2, 4};
+    assert(hv_t8152_verify(WIN_LO + 0x1000800, WIN_LO + 0x2000000, hcr_ok, true) == 0);
+    assert(hv_t8152_verify(AURA, WIN_LO + 0x2000000, hcr_ok, true) < 0);       /* entry */
+    assert(hv_t8152_verify(WIN_LO + 0x800, WIN_LO, hcr_ok, false) < 0);        /* no shadow */
+    assert(hv_t8152_verify(WIN_LO + 0x800, WIN_LO, hcr_ok & ~HCR_TWI, true) < 0); /* TWI */
+    fake_hcr = hcr_ok | HCR_FWB;
+    assert(hv_t8152_verify(WIN_LO + 0x800, WIN_LO, hcr_ok, true) < 0);
+    fake_hcr = hcr_ok;
+    leaves[nleaves++] = (struct leaf){AIC_BASE + 0x4000, 0x4000, (AIC_BASE + 0x4000) | S2_HW | 2, 3};
+    assert(hv_t8152_verify(WIN_LO + 0x800, WIN_LO, hcr_ok, true) < 0);         /* AIC normal */
+    leaves[nleaves - 1] = (struct leaf){J804_QSPI, 0x4000, J804_QSPI | S2_HW | 2, 3};
+    assert(hv_t8152_verify(WIN_LO + 0x800, WIN_LO, hcr_ok, true) < 0);         /* NVRAM */
+    leaves[nleaves - 1] = (struct leaf){J804_QSPI, 4, (9UL << 2) | S2_PROXY, 4};
+    assert(hv_t8152_verify(WIN_LO + 0x800, WIN_LO, hcr_ok, true) < 0);         /* host hook */
+    leaves[nleaves - 1] = (struct leaf){0x2000000000, 0x2000000, 0x10006000000 | S2_HW | 2, 2};
+    assert(hv_t8152_verify(WIN_LO + 0x800, WIN_LO, hcr_ok, true) < 0);         /* aura RAM */
+    nleaves--;
+    assert(hv_t8152_verify(WIN_LO + 0x800, WIN_LO, hcr_ok, true) == 0);
+    puts("T8152 POLICY OK");
+    return 0;
+}
+"""
+
+
+def test_t8152_carrier_policy(tmp_path):
+    cc = shutil.which("clang") or shutil.which("cc")
+    if not cc:
+        pytest.skip("no host C compiler")
+    stubs = tmp_path / "stubs"
+    stubs.mkdir()
+    for name, text in STUBS.items():
+        (stubs / name).write_text(text)
+    harness = tmp_path / "harness.c"
+    harness.write_text(HARNESS)
+    exe = tmp_path / "policy"
+    # Compile byte-identical copies next to the stand-ins, so that the production
+    # file's own "hv.h" resolves to the stub rather than the carrier's header.
+    for name in ("hv_t8152.c", "hv_t8152.h"):
+        shutil.copyfile(REPO / "src/hv/windows" / name, stubs / name)
+    source = stubs / "hv_t8152.c"
+    cmd = [cc, "-std=gnu11", "-O1", "-g", "-Wall", "-Wextra", "-Werror",
+           "-Wno-unused-parameter", "-iquote", str(stubs), str(source), str(harness),
+           "-o", str(exe)]
+    subprocess.run(cmd, check=True)
+    result = subprocess.run([str(exe)], check=True, capture_output=True, text=True)
+    assert "T8152 POLICY OK" in result.stdout
+    # Every refusal says why.
+    assert "CTXR_D is not armed" in result.stdout
+    assert "is not J804" in result.stdout
+    assert "lacks /arm-io/qspi" in result.stdout
+    assert "refusing stage-2 map" in result.stdout
+    assert "region-id-218 (MTE tag storage)" in result.stdout
+    assert "qspi NOR/NVRAM (J804 fixed)" in result.stdout
+    assert "MMIO passthrough must be Device-nGnRnE" in result.stdout
+    assert "stage 2 verified" in result.stdout

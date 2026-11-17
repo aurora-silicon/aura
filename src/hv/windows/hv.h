@@ -8,6 +8,7 @@
 #include "../../../config.h"
 
 #include "exception.h"
+#include "hv_t8152.h"
 #include "iodev.h"
 #include "types.h"
 #include "uartproxy.h"
@@ -31,6 +32,15 @@ void hv_windows_quarantine(void);
 #define HV_WINDOWS_SERIAL_CDC     BIT(3)
 #define HV_WINDOWS_MTP            BIT(4)
 #define HV_WINDOWS_CPUFREQ        BIT(5)
+/* T8152 only, after Phase 3 measurement (c): kick guest CPUs with Apple Fast IPIs. */
+#define HV_WINDOWS_T8152_FAST_IPI BIT(16)
+/* T8152 only, after Phase 3 measurement (f): the software GIC CPU interface (as T8142). */
+#define HV_WINDOWS_T8152_SOFT_GIC BIT(17)
+bool hv_fast_ipi(void);
+bool hv_soft_gic_cpuif(void);
+void hv_kick_cpu(int cpu);
+/* Reset the machine only after NVMe is shut down; otherwise park (see hv.c). */
+void hv_safe_reset(const char *why) __attribute__((noreturn));
 
 typedef bool(hv_hook_t)(struct exc_info *ctx, u64 addr, u64 *val, bool write, int width);
 
@@ -88,6 +98,8 @@ int hv_map_hw_ro(u64 from, u64 to, u64 size);
 int hv_map_sw(u64 from, u64 to, u64 size);
 int hv_map_hook(u64 from, hv_hook_t *hook, u64 size);
 bool hv_pt_is_ram(u64 ipa);
+typedef bool(hv_pt_leaf_fn)(void *ctx, u64 ipa, u64 size, u64 pte, int level);
+void hv_pt_for_each_leaf(hv_pt_leaf_fn *fn, void *ctx);
 int hv_pt_set_writable(u64 ipa, bool writable);
 u64 hv_translate(u64 addr, bool s1only, bool w, u64 *par_out);
 u64 hv_pt_walk(u64 addr);
@@ -125,7 +137,7 @@ void hv_do_panic(void);
     do {                                                                                           \
         debug_printf("HV panic:" fmt, ##__VA_ARGS__);                                              \
         hv_do_panic();                                                                             \
-        flush_and_reboot();                                                                        \
+        hv_safe_reset("HV panic");                                                                 \
     } while (0)
 
 /* Utilities */
@@ -209,6 +221,7 @@ void hv_dump_t8142_bugcheck_stack(struct exc_info *ctx);
 //
 
 void hv_psci_init(void);
+void hv_psci_cpu_parked(int cpu);
 #ifdef ENABLE_VGIC_MODULE
 void hv_vgicv3_init(void);
 // Bounded vGIC trace counters -- see hv_vgic.c VGIC_TRACE_LIMIT.

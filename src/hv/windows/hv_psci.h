@@ -273,8 +273,6 @@ void hv_psci_init_requested_local_power_states(void);
 uint64_t hv_psci_mem_protect(unsigned int enable_mem_protect);
 int hv_psci_mem_protect_check_range(unsigned long long base, unsigned long length);
 int hv_psci_features(unsigned int psci_function_id);
-void hv_psci_turn_off_system(void);
-void hv_psci_reset_system(void);
 int hv_psci_suspend_cpu(uint64_t power_state, uint64_t cpu_reentry_addr, uint64_t context);
 int hv_psci_start_cpu_suspend(const entry_point_info_t *entry_point, unsigned int end_power_level,
                               psci_power_state_status_t *power_state_info,
@@ -293,6 +291,7 @@ int hv_psci_validate_entry_point(entry_point_info_t *entry_point,
                                  unsigned long long cpu_reentry_addr, uint64_t context);
 unsigned int hv_psci_find_target_suspend_level(const psci_power_state_status_t *power_state_info);
 int hv_psci_turn_off_cpu(void);
+void hv_psci_cpu_parked(int cpu);
 void hv_psci_acquire_power_domain_tree_locks(unsigned int end_power_level,
                                              const unsigned int *parent_nodes);
 void hv_psci_release_power_domain_tree_locks(unsigned int end_power_level,
