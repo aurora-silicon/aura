@@ -597,6 +597,242 @@ static const u32 *hv_fb_cached_alias(const u32 *p)
     return (const u32 *)(a | REGION_RW_EL0);
 }
 
+/*
+ * Start-up proof that the cached read is coherent here; docs/windows-fb-cached-read.md.
+ *
+ * Everything rests on "after dc civac and a DSB, a write-back read returns what a non-cacheable
+ * write put in DRAM, on any core, whatever another core still holds". Apple cores can turn DC
+ * by-VA operations into no-ops with a chicken bit we cannot read on T8142, and nobody can see
+ * the panel, so the machine has to show it before the converter relies on it.
+ */
+#define HV_FB_SELFTEST_BYTES SZ_1M
+#define HV_FB_SELFTEST_NOTE  48
+
+enum hv_fb_selftest_op { HV_FB_ST_WRITE, HV_FB_ST_HOLD, HV_FB_ST_PEEK, HV_FB_ST_CHECK };
+
+struct hv_fb_selftest {
+    volatile u32 *nc;       /* the region through the shadow's Normal-NC identity mapping */
+    const volatile u32 *wb; /* the same region through the write-back alias */
+    u32 words;
+    bool ok;   /* every call so far ran and returned; after the first failure none is made */
+    bool hung; /* a secondary may still run a call later: it could write the region */
+};
+
+/* One step on the calling CPU: words that differ from (pattern ^ index) after it. */
+static u64 hv_fb_selftest_step(u64 job, u64 op, u64 pattern)
+{
+    struct hv_fb_selftest *t = (struct hv_fb_selftest *)job;
+    u64 bad = 0;
+
+    if (op == HV_FB_ST_WRITE) {
+        for (u32 i = 0; i < t->words; i++)
+            t->nc[i] = (u32)pattern ^ i;
+        sysop("dsb sy");
+        return 0;
+    }
+    if (op == HV_FB_ST_CHECK) {
+        dc_civac_range((void *)t->wb, (size_t)t->words * sizeof(u32));
+        sysop("dsb sy");
+    }
+    for (u32 i = 0; i < t->words; i++)
+        bad += t->wb[i] != ((u32)pattern ^ i);
+    return op == HV_FB_ST_HOLD ? 0 : bad;
+}
+
+/* Runs on a secondary: MMU on for the test. Returns 1 if it was on already (it then stays on). */
+static u64 hv_fb_selftest_mmu_on(void)
+{
+    sysop("isb");
+    if (mrs(SCTLR_EL1) & SCTLR_M)
+        return 1;
+    mmu_init_secondary_local();
+    return 0;
+}
+
+/* fn on a secondary, two seconds at most; any failure ends the test (no further calls). */
+static u64 hv_fb_selftest_remote(struct hv_fb_selftest *t, int cpu, void *fn, u64 a0, u64 a1,
+                                 u64 a2)
+{
+    u64 ret = ~0UL;
+
+    if (!t->ok)
+        return ~0UL;
+    int rc = smp_call4(cpu, fn, a0, a1, a2, 0);
+    if (!rc)
+        rc = smp_wait_timed(cpu, &ret, 2000);
+    if (rc) {
+        t->ok = false;
+        t->hung |= rc == SMP_TIMEOUT;
+        return ~0UL;
+    }
+    return ret;
+}
+
+static u64 hv_fb_selftest_on(struct hv_fb_selftest *t, int cpu, enum hv_fb_selftest_op op,
+                             u32 pattern)
+{
+    if (cpu == smp_id())
+        return t->ok ? hv_fb_selftest_step((u64)t, op, pattern) : ~0UL;
+    return hv_fb_selftest_remote(t, cpu, hv_fb_selftest_step, (u64)t, op, pattern);
+}
+
+static u64 hv_fb_selftest_mpidr(int cpu)
+{
+    return cpu == smp_id() ? mrs(MPIDR_EL1) & 0xffffff : smp_get_mpidr(cpu);
+}
+
+static char hv_fb_selftest_class(int cpu)
+{
+    u64 mpidr = hv_fb_selftest_mpidr(cpu);
+
+    return mpidr & MPIDR_CORE_TYPE_P ? 'p' : mpidr & MPIDR_CORE_TYPE_M ? 'm' : 'e';
+}
+
+/*
+ * One cross-core case: X reads the lines into its caches, Z writes new data through NC, Y checks,
+ * then X checks. Only the two clean+invalidate reads must be exact; the reads before them say
+ * whether a stale line was there to catch. The note names the case "<holder><checker>" by class.
+ */
+static bool hv_fb_selftest_cross(struct hv_fb_selftest *t, int x, int z, int y, u32 seed,
+                                 char *note)
+{
+    int boot = smp_id();
+    u64 base = hv_fb_selftest_on(t, boot, HV_FB_ST_WRITE, seed);
+    base |= hv_fb_selftest_on(t, boot, HV_FB_ST_CHECK, seed);
+    hv_fb_selftest_on(t, x, HV_FB_ST_HOLD, seed);
+    hv_fb_selftest_on(t, z, HV_FB_ST_WRITE, seed ^ 0x5a5a5a5a);
+    u64 y_peek = hv_fb_selftest_on(t, y, HV_FB_ST_PEEK, seed ^ 0x5a5a5a5a);
+    u64 y_bad = hv_fb_selftest_on(t, y, HV_FB_ST_CHECK, seed ^ 0x5a5a5a5a);
+    u64 x_peek = hv_fb_selftest_on(t, x, HV_FB_ST_PEEK, seed ^ 0x5a5a5a5a);
+    u64 x_bad = hv_fb_selftest_on(t, x, HV_FB_ST_CHECK, seed ^ 0x5a5a5a5a);
+
+    if (!t->ok)
+        return false;
+    snprintf(note, HV_FB_SELFTEST_NOTE, "%c%c checker %s/%lu holder %s/%lu",
+             hv_fb_selftest_class(x), hv_fb_selftest_class(y), y_peek ? "stale" : "fresh", y_bad,
+             x_peek ? "stale" : "fresh", x_bad);
+    return !base && !y_bad && !x_bad;
+}
+
+/*
+ * Two non-boot CPUs of the boot CPU's cluster and two of another; false if they do not exist.
+ * CPUs already handed to the guest (or being started for it) are not ours to call.
+ */
+static bool hv_fb_selftest_cpus(int same[2], int other[2])
+{
+    u64 cluster = (hv_fb_selftest_mpidr(smp_id()) >> 8) & 0xffff;
+    int ns = 0, no = 0;
+
+    for (int cpu = 0; cpu < MAX_CPUS; cpu++) {
+        if (cpu == smp_id() || !smp_is_alive(cpu) || hv_started_cpus[cpu] || hv_setup_pending[cpu])
+            continue;
+        if (((smp_get_mpidr(cpu) >> 8) & 0xffff) == cluster) {
+            if (ns < 2)
+                same[ns++] = cpu;
+        } else if (no < 2) {
+            other[no++] = cpu;
+        }
+    }
+    return ns == 2 && no == 2;
+}
+
+/*
+ * Returns false only when a secondary hung (guest entry must then be refused: it may still write
+ * the region). Otherwise it decides hv_fb_source_cached and prints one line; the region is zero
+ * again either way.
+ */
+static bool hv_fb_selftest(void)
+{
+    struct hv_fb_selftest t = {
+        .nc = hv_fb_shadow,
+        .wb = hv_fb_source,
+        .words = HV_FB_SELFTEST_BYTES / sizeof(u32),
+        .ok = true,
+    };
+    int same[2] = {-1, -1}, other[2] = {-1, -1};
+    char same_note[24] = "-", c1[HV_FB_SELFTEST_NOTE] = "-", c2[HV_FB_SELFTEST_NOTE] = "-";
+    char c3[HV_FB_SELFTEST_NOTE] = "-";
+    const char *failed = NULL;
+    int boot = smp_id();
+    int before = exc_count;
+    enum exc_guard_t saved = exc_guard;
+    u64 t0 = hv_host_counter();
+
+    if ((u64)hv_fb_stride_px * hv_fb_height * sizeof(u32) < HV_FB_SELFTEST_BYTES) {
+        failed = "shadow smaller than the test region";
+        goto verdict;
+    }
+    if (!hv_fb_selftest_cpus(same, other)) {
+        failed = "fewer than two free non-boot CPUs in each of two clusters";
+        goto verdict;
+    }
+
+    exc_guard = GUARD_MARK | GUARD_SILENT;
+
+    /* Same core: the boot CPU caches A, B is written NC, maintenance must bring B. */
+    u64 base = hv_fb_selftest_on(&t, boot, HV_FB_ST_WRITE, 0x13572468);
+    base |= hv_fb_selftest_on(&t, boot, HV_FB_ST_CHECK, 0x13572468);
+    hv_fb_selftest_on(&t, boot, HV_FB_ST_HOLD, 0x13572468);
+    hv_fb_selftest_on(&t, boot, HV_FB_ST_WRITE, 0x24681357);
+    u64 peek = hv_fb_selftest_on(&t, boot, HV_FB_ST_PEEK, 0x24681357);
+    u64 bad = hv_fb_selftest_on(&t, boot, HV_FB_ST_CHECK, 0x24681357);
+    snprintf(same_note, sizeof(same_note), "%s/%lu", peek ? "stale" : "fresh", bad);
+    if (base || bad)
+        failed = "same core";
+
+    /* The participating secondaries need their MMU on to use the alias; restored afterwards. */
+    int parts[4] = {same[0], same[1], other[0], other[1]};
+    bool was_on[4] = {0};
+    int up = 0; /* parts[0..up) answered */
+    while (up < 4 && !failed) {
+        u64 r = hv_fb_selftest_remote(&t, parts[up], hv_fb_selftest_mmu_on, 0, 0, 0);
+        if (!t.ok)
+            failed = "secondary MMU start";
+        else
+            was_on[up++] = r == 1;
+    }
+    /* Lines held on the other cluster, checked here; held here, checked there; same cluster. */
+    if (!failed && !hv_fb_selftest_cross(&t, other[0], same[0], boot, 0x0badcafe, c1))
+        failed = t.ok ? "cross-cluster, held there" : "secondary call";
+    if (!failed && !hv_fb_selftest_cross(&t, same[0], other[0], other[1], 0x600df00d, c2))
+        failed = t.ok ? "cross-cluster, held here" : "secondary call";
+    if (!failed && !hv_fb_selftest_cross(&t, same[0], other[0], same[1], 0x7e57ab1e, c3))
+        failed = t.ok ? "same cluster" : "secondary call";
+
+    /* Zero again through NC and drop every cached copy, whatever the verdict. */
+    for (u32 i = 0; i < t.words; i++)
+        t.nc[i] = 0;
+    sysop("dsb sy");
+    dc_civac_range((void *)t.wb, HV_FB_SELFTEST_BYTES);
+    sysop("dsb sy");
+    /* Every CPU brought up goes back to MMU-off, even after a failed case. */
+    for (int i = 0; i < up && !t.hung; i++) {
+        if (was_on[i])
+            continue;
+        t.ok = true;
+        hv_fb_selftest_remote(&t, parts[i], mmu_disable, 0, 0, 0); /* also flushes it by set/way */
+        if (!t.ok && !failed)
+            failed = "secondary MMU stop";
+    }
+    if (!failed && exc_count != before)
+        failed = "exception"; /* a skipped load or maintenance op: trust nothing the test did */
+    exc_guard = saved;
+    if (failed) /* maintenance by VA may be a no-op: flush this CPU by set/way */
+        dcsw_op_all(DCSW_OP_DCCISW);
+
+verdict:;
+    u64 us = (hv_host_counter() - t0) * 1000000 / (mrs(CNTFRQ_EL0) ? mrs(CNTFRQ_EL0) : 1);
+    if (failed) {
+        hv_fb_source = hv_fb_shadow;
+        hv_fb_source_cached = false;
+    }
+    printf("HV: fb cached-read self-test: %s%s%s in %lu us, %u KiB (same %s; %s; %s; %s)%s\n",
+           failed ? "FAIL (" : "PASS", failed ? failed : "", failed ? ")" : "", us,
+           (u32)(HV_FB_SELFTEST_BYTES / 1024), same_note, c1, c2, c3,
+           failed ? " -- reading the shadow non-cacheable" : "");
+    return !t.hung;
+}
+
 static bool hv_fb_init(struct boot_args *gba)
 {
     if (!(hv_windows_flags & HV_WINDOWS_FB_SHADOW))
@@ -639,6 +875,12 @@ static bool hv_fb_init(struct boot_args *gba)
     hv_fb_source_cached = hv_fb_source != NULL;
     if (!hv_fb_source_cached)
         hv_fb_source = hv_fb_shadow;
+    /* Before the guest can touch the shadow: prove the cached read, or fall back to NC. */
+    if (hv_fb_source_cached && !hv_fb_selftest()) {
+        printf("HV: a secondary did not answer the framebuffer self-test; guest entry refused\n");
+        hv_fb_shadow = NULL;
+        return false;
+    }
     hv_fb_epoch = hv_host_counter();
     gba->video.base = (u64)hv_fb_shadow;
     gba->video.depth = (gba->video.depth & ~0xffUL) | 32;
