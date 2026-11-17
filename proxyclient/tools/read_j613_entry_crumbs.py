@@ -37,11 +37,15 @@ def main():
     proxy = AuraProxy(iface)
     if proxy.get_chipid() != 0x8122:
         raise RuntimeError("not T8122/J613")
-    record = decode_record([proxy.read64(args.address + 8 * i) for i in range(8)])
-    record["address"] = args.address
-    print(json.dumps(record, sort_keys=True), flush=True)
-    if args.reboot:
-        proxy.reboot()
+    try:
+        record = decode_record([proxy.read64(args.address + 8 * i) for i in range(8)])
+        record["address"] = args.address
+        print(json.dumps(record, sort_keys=True), flush=True)
+    finally:
+        # A forced power-off can wipe the high-RAM page.  A bad record is still a finding, and
+        # must not strand the machine in Stage 1 when this tool owns the recovery return.
+        if args.reboot:
+            proxy.reboot()
 
 
 if __name__ == "__main__":
