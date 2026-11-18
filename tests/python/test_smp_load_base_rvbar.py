@@ -20,7 +20,8 @@ typedef uint32_t u32;
 _Static_assert(sizeof(u64) == 8, "production u64 ABI");
 #define RVBAR_LOCK 1
 #define RVBAR_ADDR 0x0000fffffffff000UL
-#define RVBAR_ADDR_UNLOCKED 0x00000ffffffff000UL
+/* Userspace test symbols may sit above the hardware's 44-bit RVBAR range. */
+#define RVBAR_ADDR_UNLOCKED 0x0000fffffffff000UL
 #define MAIR_IDX_NORMAL 0
 #define PERM_RW 0
 #define PERM_RX 1
