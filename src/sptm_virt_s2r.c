@@ -685,6 +685,22 @@ static bool s2r_cp_compat(int node, const char *prefix);
 static void s2r_regs_snapshot(const char *tag);
 static void s2r_probe_one(u64 e);
 
+/* A coprocessor whose power domain is already off aborts an ASC register read.  That is an
+ * expected commit-time state, not a hypervisor failure, so make the read observational. */
+static int s2r_snapshot_read32(u64 addr, u32 *value)
+{
+    enum exc_guard_t saved = exc_guard;
+    int before = exc_count;
+
+    exc_guard = GUARD_MARK | GUARD_SILENT;
+    *value = read32(addr);
+    /* Let a pending asynchronous SError arrive while the guard is still armed. */
+    sysop("dsb sy");
+    sysop("isb");
+    exc_guard = saved;
+    return exc_count == before ? 0 : -1;
+}
+
 /* Bit 10 of AURA_S2R_CRUMBS: a compact, read-only J613 commit-time snapshot. The access trace
  * cannot recover domains which were already steady before tracing began, and a successful sleep
  * may make the ring unavailable, so put the values on the always-on console and flush them before
@@ -718,7 +734,12 @@ static void s2r_j613_commit_snapshot(void)
             printf("J613-COMMIT-ASC %s unavailable\n", cp[i].name);
             continue;
         }
-        u32 ctl = read32(base + 0x44);
+        u32 ctl;
+        if (s2r_snapshot_read32(base + 0x44, &ctl) < 0) {
+            printf("J613-COMMIT-ASC %s 0x%lx powered-off-or-unavailable\n", cp[i].name,
+                   base + 0x44);
+            continue;
+        }
         printf("J613-COMMIT-ASC %s 0x%lx 0x%08x RUN=%u\n", cp[i].name, base + 0x44, ctl,
                !!(ctl & 0x10));
     }
