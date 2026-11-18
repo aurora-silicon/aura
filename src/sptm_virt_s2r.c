@@ -137,6 +137,8 @@ static bool s2r_go, s2r_fulltrace, s2r_coproc, s2r_drop_usb;
 static u64 s2r_arm_at;
 /* Cores with their last WFI trapped (stop mode), parked there, and the core that committed. */
 static volatile u32 s2r_twi_mask, s2r_parked_mask;
+/* J613 stop-mode insurance while its clean-room sleep-block map is being qualified. */
+static bool s2r_j613_soc_misc_marked, s2r_j613_aon_pst_marked;
 /* Go mode: the ring position where the first core opened the sleep window (0: none yet). */
 static volatile u64 s2r_sleep_head;
 static volatile int s2r_timer_cpu = -1;
@@ -745,6 +747,7 @@ static void s2r_stop_link_back(void)
 
 static void __attribute__((noreturn)) s2r_stop_before_timer(struct exc_info *ctx, u64 addr, u64 val)
 {
+    sptm_virt_j613_pmu_mark(0xaf); /* Linux-readable proof that the commit was withheld. */
     s2r_marker("S2RSTOP", addr);
     s2r_stop_link_back();
     printf("SPTM-virt[s2r]: cpu%d is starting the S2R timer ([0x%lx] = 0x%lx, pc 0x%lx): NOT "
@@ -983,6 +986,15 @@ static bool s2r_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int w
 
     bool first;
     const char *what = s2r_page_name(addr & ~0x3fffUL, &first);
+    if (write && chip_id == T8122) {
+        if (!strcmp(what, "pmgr-soc-misc") && !s2r_j613_soc_misc_marked) {
+            s2r_j613_soc_misc_marked = true;
+            sptm_virt_j613_pmu_mark(0xa1);
+        } else if (!strcmp(what, "pmgr-aon-pst") && !s2r_j613_aon_pst_marked) {
+            s2r_j613_aon_pst_marked = true;
+            sptm_virt_j613_pmu_mark(0xa2);
+        }
+    }
     bool timer = write && width <= 3 && *val == 1 && !strcmp(what, "pmgr-aon-pst") &&
                  (addr & 0x7fff) == S2R_TIMER_OFF && s2r_armed();
     /* AURA_S2R_GO_COUNT here too (J813): after n go-mode wakes, the next commit stops like stop

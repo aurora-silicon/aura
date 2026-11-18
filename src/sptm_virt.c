@@ -83,6 +83,16 @@ __attribute__((used, retain)) u64 sptm_virt_j613_entry_pmu_stage(void)
     return value;
 }
 
+void sptm_virt_j613_pmu_mark(u8 stage)
+{
+    if (chip_id != T8122)
+        return;
+    if (!j613_entry_crumb_dev)
+        j613_entry_crumb_dev = spmi_init("/arm-io/nub-spmi0");
+    if (j613_entry_crumb_dev)
+        spmi_ext_write_long(j613_entry_crumb_dev, 0xe, J613_ENTRY_PMU_SCRATCH, &stage, 1);
+}
+
 void sptm_virt_j613_entry_mark(u32 stage)
 {
     if (chip_id != T8122 || !j613_entry_record)
@@ -96,10 +106,7 @@ void sptm_virt_j613_entry_mark(u32 stage)
     j613_entry_record->check = J613_ENTRY_RECORD_MAGIC ^ sequence ^ stage;
     dc_cvac_range((void *)j613_entry_record, sizeof(*j613_entry_record));
     sysop("dsb sy");
-    if (j613_entry_crumb_dev) {
-        u8 value = stage;
-        spmi_ext_write_long(j613_entry_crumb_dev, 0xe, J613_ENTRY_PMU_SCRATCH, &value, 1);
-    }
+    sptm_virt_j613_pmu_mark(stage);
 }
 
 __attribute__((used, retain)) u64 sptm_virt_j613_entry_recovery_arm(u32 seconds)

@@ -55,6 +55,12 @@ S2R_OLD = {
                        nub_wake_status=0x388004028, amcc=0, amcc_planes=0,
                        link=["/arm-io/usb-drd0", "/arm-io/dart-usb0", "/arm-io/atc-phy0"],
                        report_off=[0x380700378], port=1),  # #109 ran on port 1 (AURA_DEBUG_PORT)
+    "j613-25G83": dict(soc_ps=30, cluster_ctl=34, pwrgate=32, cllt=43, nub_ap=4, aon=None,
+                       clkgen=2, soc_misc=40, aon_pst=38, pms_pmc=(0, 0),
+                       nub_wake_status=0x2E4004028, amcc=0, amcc_planes=0,
+                       link=["/arm-io/usb-drd0", "/arm-io/dart-usb0", "/arm-io/atc-phy0",
+                             "/arm-io/usb-drd1", "/arm-io/dart-usb1", "/arm-io/atc-phy1"],
+                       report_off=[], skipped=["PMGR block aon", "PMS"]),
 }
 BLOCKS = ("soc_ps", "cluster_ctl", "pwrgate", "cllt", "nub_ap", "aon", "clkgen", "soc_misc",
           "aon_pst")
@@ -210,9 +216,9 @@ def test_s2r_soc_per_image_set(tmp_path):
         if not old:
             continue
         regs = pmgr_regs((d / "dtree").read_bytes())
-        assert res["rc"] == 0 and not res["skipped"], res
+        assert res["rc"] == 0 and res["skipped"] == old.get("skipped", []), res
         for b in BLOCKS:
-            assert res[b] == regs[old[b]], b
+            assert res[b] == ((0, 0) if old[b] is None else regs[old[b]]), b
         for k in ("pms_pmc", "nub_wake_status", "amcc", "amcc_planes", "link", "report_off"):
             want = list(old[k]) if isinstance(old[k], list) else old[k]
             assert res[k] == want, k

@@ -30,7 +30,7 @@ struct s2r_place {
 
 /* Each core's self-disable (soc_misc) and the S2R timer (aon_pst) mark the sleep; the rest is the
  * trace. */
-static const struct s2r_place s2r_places[] = {
+static const struct s2r_place s2r_places_default[] = {
     PLACE(soc_misc, false, true, 0x30000, 0x14000),
     PLACE(aon_pst, true, true, 0x50000, 0x8000),
     PLACE(soc_ps, false, false, 0, 0x18000),
@@ -40,6 +40,21 @@ static const struct s2r_place s2r_places[] = {
     PLACE(aon, true, false, 0, 0x80000),
     PLACE(nub_ap, true, false, -0x27c000, 0x1000),
     PLACE(clkgen, false, false, -0x700000, 0),
+};
+
+/* J613/25G83 swaps which of its first two PMGR groups holds these blocks. The offsets and sizes
+ * below are the clean J613 specification's resolved ADT map: reg[38]+0x4000 is the sleep-start
+ * write, reg[40]+0x4000 is CPUSTART, and reg[4] holds wake masks/status. */
+static const struct s2r_place s2r_places_t8122[] = {
+    PLACE(soc_misc, true, true, 0x30000, 0x14000),
+    PLACE(aon_pst, false, true, 0x50000, 0x8000),
+    PLACE(soc_ps, true, false, 0, 0x18000),
+    PLACE(pwrgate, true, false, 0x24000, 0x4000),
+    PLACE(cllt, true, false, 0x68000, 0x4000),
+    PLACE(cluster_ctl, true, false, 0x80000, 0x4000),
+    PLACE(aon, false, false, 0, 0x80000),
+    PLACE(nub_ap, false, false, -0x27c000, 0x1000),
+    PLACE(clkgen, true, false, -0x700000, 0),
 };
 
 #define S2R_CLKGEN_MIN 0x60000 /* the DCS and mux pages sit below this */
@@ -241,8 +256,15 @@ int s2r_soc_from_adt(const void *adt, const u32 *link_phys, int n_phys, struct s
         if (ps[3 * i] != ps_idx && adt_get_reg(adt, path, "reg", ps[3 * i], &area[1], &sz) < 0)
             return -1;
 
-    for (size_t p = 0; p < ARRAY_SIZE(s2r_places); p++) {
-        const struct s2r_place *pl = &s2r_places[p];
+    const struct s2r_place *places = s2r_places_default;
+    size_t n_places = ARRAY_SIZE(s2r_places_default);
+    if (adt_is_compatible(adt, node, "pmgr1,t8122")) {
+        places = s2r_places_t8122;
+        n_places = ARRAY_SIZE(s2r_places_t8122);
+    }
+
+    for (size_t p = 0; p < n_places; p++) {
+        const struct s2r_place *pl = &places[p];
         struct s2r_blk *blk = (void *)((u8 *)out + pl->field);
         u64 want = area[pl->aon] + pl->offset;
         for (u32 i = 0; i < n_reg && area[pl->aon] && !blk->base; i++) {
