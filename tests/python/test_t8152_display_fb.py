@@ -66,6 +66,7 @@ def unit():
         function(disp, "static bool display_t6030_hands_off("),
         function(disp, "static bool display_unmap_fb("),
         function(disp, "static uintptr_t display_map_fb("),
+        function(disp, "static void display_stop_failed_dcp("),
         function(disp, "int display_start_dcp("),
         block(disp, disp.index("struct display_options {")) + ";\n",
         function(disp, "int display_parse_mode("),
@@ -238,10 +239,18 @@ static void iova_free(void *d, u64 dva, size_t size)
 /* DCP lifecycle */
 static bool has_dcp_left_running;
 static bool dcp_left_running(void) { return has_dcp_left_running; }
+static bool has_dcp_init_left_quiesced;
+static bool dcp_init_left_quiesced(void) { return has_dcp_init_left_quiesced; }
 static const display_config_t *display_get_config(void) { has_dcp = true; return t8152_config; }
+static bool fail_dcp_init, dcp_init_leaves_running;
 static dcp_dev_t *dcp_init(const display_config_t *cfg)
 {
     (void)cfg;
+    if (fail_dcp_init) {
+        /* A failed init that could not quiesce the RTKit it booted. */
+        has_dcp_left_running = dcp_init_leaves_running;
+        return NULL;
+    }
     assert(dcps_started < 4);
     dcp_dev_t *d = &dcps[dcps_started];
     d->dart_disp = &darts[2 * dcps_started];
@@ -254,7 +263,7 @@ static dcp_dev_t *dcp_init(const display_config_t *cfg)
     dcps_started++;
     return d;
 }
-static void dcp_shutdown(dcp_dev_t *d, bool sleep) { (void)d; (void)sleep; assert(!"DCP start failed"); }
+static int dcp_shutdown(dcp_dev_t *d, bool sleep) { (void)d; (void)sleep; assert(!"DCP start failed"); return 0; }
 static dcp_iboot_if_t *dcp_ib_init(dcp_dev_t *d) { iboots[d - dcps].id = d - dcps; return &iboots[d - dcps]; }
 static int display_get_vram(u64 *pa, u64 *size) { *pa = vram_pa; *size = vram_size; return 0; }
 static int display_shutdown(dcp_shutdown_mode mode)
@@ -359,6 +368,8 @@ static void t8152_growth_keeps_scanout(void)
     assert(!find_map(dcp->dart_disp, BOOT_DVA) && !find_map(dcp->dart_dcp, BOOT_DVA));
     assert(cur_boot_args.video.base != vram_pa && cur_boot_args.video.width == 1280);
     assert_scanout_owned(1);
+    /* The internal DCP is running at the hand-off. */
+    assert(display_dcp_handoff_state() == 1);
     u64 grown = fb_dva;
 
     /* A later modeset that fits swaps the same framebuffer again. */
@@ -384,6 +395,8 @@ static void other_chip_growth_remaps(void)
     assert(display_configure("1280x720@60") == 1);
     assert(fb_dva == BOOT_DVA && !live_iovas());
     assert_scanout_owned(1);
+    /* The hand-off state is T8152 only. */
+    assert(display_dcp_handoff_state() == -1);
     /* The HPD poke is T8152 only, also on a DPTX route. */
     assert(display_is_dptx && !hpd_pokes);
 }
@@ -409,6 +422,8 @@ static void second_display_failure_restores_first(void)
                    sizeof(first_video)));
     assert(fb_reinits == 1 && live_maps(first->dart_disp) == first_maps);
     assert(!display_second_video.base);
+    /* The second display's failure is not the internal DCP's state. */
+    assert(display_dcp_handoff_state() == 1);
 
     /* A retry reuses the framebuffer allocated for the failed attempt. */
     u64 second_fb = display_other.video.base;
@@ -437,11 +452,27 @@ static void second_display_identity(void)
     assert(!allocations && !dcps_started && !fb_reinits && !display_other.video.base);
 }
 
+static void t8152_failed_start_state(void)
+{
+    boot(T8152);
+    /* dcp_init() failed and left the internal DCP quiesced. */
+    fail_dcp_init = has_dcp_init_left_quiesced = true;
+    assert(display_configure("1280x720@60") < 0);
+    assert(display_dcp_handoff_state() == 0);
+    /* A failure that left it running reports it running. */
+    has_dcp_init_left_quiesced = false;
+    dcp_init_leaves_running = true;
+    assert(display_configure("1280x720@60") < 0);
+    assert(display_dcp_handoff_state() == 1);
+    assert(!dcps_started && !allocations);
+}
+
 static const struct { const char *name; void (*run)(void); } cases[] = {
     {"t8152-growth-keeps-scanout", t8152_growth_keeps_scanout},
     {"other-chip-growth-remaps", other_chip_growth_remaps},
     {"second-display-failure-restores-first", second_display_failure_restores_first},
     {"second-display-identity", second_display_identity},
+    {"t8152-failed-start-state", t8152_failed_start_state},
 };
 
 int main(int argc, char **argv)
@@ -465,7 +496,8 @@ int main(int argc, char **argv)
 '''
 
 CASES_LIST = ("t8152-growth-keeps-scanout", "other-chip-growth-remaps",
-              "second-display-failure-restores-first", "second-display-identity")
+              "second-display-failure-restores-first", "second-display-identity",
+              "t8152-failed-start-state")
 
 
 @pytest.fixture(scope="module")
