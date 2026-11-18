@@ -56,6 +56,12 @@ static int t8152_psd_power_on(u32 service)
     return state ? -1 : 0;
 }
 
+/* A T8152 PSD service's current state, 0 when powered. Read only. */
+u32 t8152_psd_state(u32 service)
+{
+    return read32(T8152_PSD_BASE + service * T8152_PSD_STRIDE + T8152_PSD_STATE) & 7;
+}
+
 static char dcp_pmgr_dev[16] = "DISP0_CPU0";
 static u32 dcp_die;
 
