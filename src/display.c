@@ -90,6 +90,21 @@ static struct {
     struct boot_video video;
 } display_other;
 struct boot_video display_second_video;
+
+/* T8152: the internal DCP's RTKit at the hand-off, for apple,dcp-rtkit-quiesced: -1 aura
+ * never started it, 1 running, 0 quiesced after a failed start. Only the internal DCP's
+ * own state, not the second display's while that one is swapped in. */
+static int display_dcp_state = -1;
+
+static bool display_internal_active(void)
+{
+    return chip_id == T8152 && !strcmp(t8152_config->dcp, "/arm-io/dcp");
+}
+
+int display_dcp_handoff_state(void)
+{
+    return display_dcp_state;
+}
 /* Framebuffer size display_start_dcp maps instead of /vram (the first
  * display's memory) when bringing up the second display. */
 static u64 display_fb_override_size;
@@ -376,6 +391,15 @@ static bool display_t6030_hands_off(const char *what)
     return true;
 }
 
+/* Stop a DCP that did not come up, and record the internal DCP's state. */
+static void display_stop_failed_dcp(void)
+{
+    bool stopped = !dcp_shutdown(dcp, false);
+
+    if (display_internal_active())
+        display_dcp_state = !stopped;
+}
+
 int display_start_dcp(void)
 {
     if (iboot)
@@ -405,9 +429,18 @@ int display_start_dcp(void)
 
     dcp = dcp_init(disp_cfg);
     if (!dcp) {
+        /* dcp_init() leaves a DCP it booted quiesced, or running if that failed. */
+        if (display_internal_active()) {
+            if (dcp_left_running())
+                display_dcp_state = 1;
+            else if (dcp_init_left_quiesced())
+                display_dcp_state = 0;
+        }
         printf("display: failed to initialize DCP\n");
         return -1;
     }
+    if (display_internal_active())
+        display_dcp_state = 1;
 
     // determine frame buffer PA and size from "/vram"
     u64 pa, size;
@@ -431,14 +464,14 @@ int display_start_dcp(void)
     if (DART_IS_ERR(fb_dva)) {
         printf("display: failed to find display DVA\n");
         fb_dva = 0;
-        dcp_shutdown(dcp, false);
+        display_stop_failed_dcp();
         return -1;
     }
 
     iboot = dcp_ib_init(dcp);
     if (!iboot) {
         printf("display: failed to initialize DCP iBoot interface\n");
-        dcp_shutdown(dcp, false);
+        display_stop_failed_dcp();
         return -1;
     }
 

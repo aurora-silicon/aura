@@ -11561,6 +11561,22 @@ static void dt_set_dcpext_t8152(void)
     }
 }
 
+/*
+ * The internal DCP's RTKit state at the hand-off, for apple_dcpib: 1 when it runs, 0 when
+ * aura quiesced it after a failed display setup. Omitted when aura never started it.
+ */
+static int dt_set_dcp_state_t8152(void)
+{
+    int state = display_dcp_handoff_state();
+    if (state < 0)
+        return 0;
+    int chosen = fdt_path_offset(dt, "/chosen");
+    if (chosen < 0 || fdt_setprop_u32(dt, chosen, "apple,dcp-rtkit-quiesced", state))
+        bail("FDT: couldn't set apple,dcp-rtkit-quiesced\n");
+    printf("FDT: internal DCP %s at the hand-off\n", state ? "running" : "stopped");
+    return 0;
+}
+
 static int dt_prepare_t8152(void)
 {
     if (fdt_getprop(dt, 0, "aurora,minimal-boot", NULL)) {
@@ -11572,6 +11588,8 @@ static int dt_prepare_t8152(void)
             return -1;
         dt_set_dcpext_t8152();
     }
+    if (dt_set_dcp_state_t8152())
+        return -1;
     if (dt_set_cpus())
         return -1;
     if (dt_set_mac_addresses())

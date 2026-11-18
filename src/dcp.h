@@ -49,5 +49,6 @@ dcp_dev_t *dcp_init(const display_config_t *config);
 int dcp_shutdown(dcp_dev_t *dcp, bool sleep);
 bool dcp_left_running(void);
 u32 t8152_psd_state(u32 service);
+bool dcp_init_left_quiesced(void);
 
 #endif
