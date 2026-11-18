@@ -610,7 +610,10 @@ def test_run_guest_nvme_options_and_refusals():
     reset = pyfunc(RUN_GUEST, "def windows_t8152_ahci_nvme_close(")
     assert "CLEAN" in reset and "AHCI_OP_DETACH" in reset
     # Leave-the-proxy advice only after CLEAN; a direct watchdog write is never a carrier exit.
-    assert exit_.index("elif nvme and not clean:") < exit_.index("leave the proxy through")
+    assert exit_.index("elif nvme and not clean:") < exit_.rindex("leave the proxy through")
+    # A session whose hv.start() raises still prints the close verdict (seen 2026-11-17).
+    failed = exit_[exit_.index("result = hv.start()"):exit_.index('print(f"Guest exit status')]
+    assert "windows_t8152_ahci_nvme_close(-1, ahci)" in failed
     for text in (RUN_GUEST, (REPO / "docs/windows-t8152.md").read_text()):
         assert "leave2.sh" not in text
     gate = (REPO / "proxyclient/tools/windows_nvme_gate.py").read_text()

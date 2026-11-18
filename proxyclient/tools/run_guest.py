@@ -789,8 +789,16 @@ def run_windows_t8152(caps):
             except ProxyRemoteError:
                 pass
         if nvme:
-            # hv_start() closes the NVMe disk on every return itself; DETACH is idempotent.
-            windows_t8152_ahci_nvme_detach()
+            # hv_start() closes the NVMe disk on every return itself, a failed or aborted session
+            # included: report its counters and CLEAN or FAILED (with the matching exit advice),
+            # retrying the close once if it is not CLEAN.
+            try:
+                if windows_t8152_ahci_nvme_close(-1, ahci) and ahci["flags"] & 1:
+                    print("The NVMe disk closed CLEAN: leave the proxy through the carrier "
+                          "(tools/windows_nvme_gate.py exit).")
+            except ProxyRemoteError:
+                print("\x1b[31mT8152 AHCI NVMe: the close state could not be read: do not leave "
+                      "the proxy before p.hv_windows_ahci(7, 0) reports 3 (CLEAN).\x1b[0m")
         sys.exit(f"Hypervisor refused or failed: {exc}. The aura proxy keeps running; "
                  "its console says why. USB and input (if any) were detached; a GPU "
                  "admission has no release and lasts until the carrier is reloaded.")
