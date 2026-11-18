@@ -1,9 +1,19 @@
 # SPDX-License-Identifier: MIT
 """Run kboot_gpu.c's T6041 GPU fill on real FDTs with a modelled ADT.
 
-The accepted case uses the operating points, CS/AFR tables and regions of one J616C (32-core
-M4 Max) ADT. The test checks what the fill publishes, what it refuses, and that nothing stays
-published when it refuses. The fill never touches the GPU, so no register access is modelled.
+The accepted cases use the operating points, CS/AFR tables and regions of one J616C (32-core
+M4 Max) ADT on 26.6.2 (two gfx-asc segments: __TEXT and __DATA) and on 27.2 / 26B123 (three
+gfx-asc segments: __TEXT, __DATA and a contiguous __DATA_SHARED_RO tail merged into
+gpu-fw-data).
+
+Failure model for 3-segment 27.2 framing recorded before implementation:
+- segment-ranges counts other than 2 or 3 must be refused.
+- A 3-segment gfx-asc must match /arm-io/sgx gfx-data-shared-ro-{base,size} on physical base,
+  identity remap and non-zero 16 KiB-aligned size, sit immediately after gfx-data with no gap
+  or wrap, and have zero (or absent) gfx-data-shared-rw-{base,size}.
+- Extending gpu-fw-data by gfx-data-shared-ro-size must still satisfy 42-bit OAS bounds and
+  pairwise non-overlap against every other UAT and firmware reservation (including gpu-fw-text).
+- Every refusal leaves the GPU node and all six reserved-memory nodes disabled.
 """
 
 from pathlib import Path
@@ -58,10 +68,11 @@ static struct {
     struct aux_perf_state states[8];
 } cs = {.dies = 1, .count = 8}, afr = {.dies = 1, .count = 8};
 struct adt_segment_ranges { u64 phys, iova, remap; u32 size, unk; };
-static struct adt_segment_ranges segments[2];
-static u64 region[6][2];
+static struct adt_segment_ranges segments[4];
+static u32 segments_len;
+static u64 region[6][2], shared_ro[2], shared_rw[2];
 static u32 raw_count, raw_tables, raw_max_state;
-static bool missing_sgx, missing_asc;
+static bool missing_sgx, missing_asc, has_shared_ro, has_shared_rw, bad_shared_rw_len;
 static const char *const region_names[5] = {
     "gfx-handoff", "gfx-shared-l2-region", "gfx-shared-region", "gpu-region", "gfx-data",
 };
@@ -77,12 +88,24 @@ static int adt_path_offset(void *tree, const char *path)
 }
 static const void *adt_getprop(void *tree, int node, const char *name, u32 *len)
 {
+    u32 dummy = 0;
+    if (!len) len = &dummy;
     (void)tree;
-    if (node == 2 && !strcmp(name, "segment-ranges")) { *len = sizeof(segments); return segments; }
+    if (node == 2 && !strcmp(name, "segment-ranges")) { *len = segments_len; return segments; }
     if (node != 1) return NULL;
     if (!strcmp(name, "perf-states")) { *len = raw_count * raw_tables * sizeof(states[0]); return states; }
     if (!strcmp(name, "cs-perf-states")) { *len = sizeof(cs); return &cs; }
     if (!strcmp(name, "afr-perf-states")) { *len = sizeof(afr); return &afr; }
+    if (has_shared_ro && !strcmp(name, "gfx-data-shared-ro-base")) { *len = sizeof(u64); return &shared_ro[0]; }
+    if (has_shared_ro && !strcmp(name, "gfx-data-shared-ro-size")) { *len = sizeof(u64); return &shared_ro[1]; }
+    if (has_shared_rw && !strcmp(name, "gfx-data-shared-rw-base")) {
+        *len = bad_shared_rw_len ? sizeof(u32) : sizeof(u64);
+        return &shared_rw[0];
+    }
+    if (has_shared_rw && !strcmp(name, "gfx-data-shared-rw-size")) {
+        *len = bad_shared_rw_len ? sizeof(u32) : sizeof(u64);
+        return &shared_rw[1];
+    }
     return NULL;
 }
 static int adt_copy(const char *name, void *out, size_t size)
@@ -91,10 +114,22 @@ static int adt_copy(const char *name, void *out, size_t size)
     if (!strcmp(name, "perf-state-count")) value = raw_count;
     else if (!strcmp(name, "perf-state-table-count")) value = raw_tables;
     else if (!strcmp(name, "gpu-num-perf-states")) value = raw_max_state;
-    else {
+    else if (has_shared_ro && (!strcmp(name, "gfx-data-shared-ro-base") ||
+                               !strcmp(name, "gfx-data-shared-ro-size"))) {
+        if (size != sizeof(u64)) return -1;
+        memcpy(out, &shared_ro[strcmp(name, "gfx-data-shared-ro-base") ? 1 : 0], sizeof(u64));
+        return sizeof(u64);
+    } else if (has_shared_rw && (!strcmp(name, "gfx-data-shared-rw-base") ||
+                                 !strcmp(name, "gfx-data-shared-rw-size"))) {
+        if (bad_shared_rw_len || size != sizeof(u64)) return -1;
+        memcpy(out, &shared_rw[strcmp(name, "gfx-data-shared-rw-base") ? 1 : 0], sizeof(u64));
+        return sizeof(u64);
+    } else {
         for (int i = 0; i < 5; i++) {
             size_t n = strlen(region_names[i]);
-            if (!strncmp(name, region_names[i], n) && size == sizeof(u64)) {
+            if (!strncmp(name, region_names[i], n) &&
+                (!strcmp(name + n, "-base") || !strcmp(name + n, "-size")) &&
+                size == sizeof(u64)) {
                 memcpy(out, &region[i][strcmp(name + n, "-base") ? 1 : 0], sizeof(u64));
                 return sizeof(u64);
             }
@@ -190,11 +225,34 @@ static void world_with(const char *compatible, int gpu_opps, int gpu_cells, int 
     segments[1] = (struct adt_segment_ranges){.phys = region[4][0],
                                               .iova = 0xfffffc0000000000UL + region[5][1],
                                               .remap = region[4][0], .size = region[4][1]};
+    segments_len = 2 * sizeof(segments[0]);
+    os_firmware = (struct fw_version_info){"26.6.2", {26, 6, 2}, 3};
     raw_count = 16; raw_tables = 4; raw_max_state = 15;
-    missing_sgx = missing_asc = false;
+    missing_sgx = missing_asc = has_shared_ro = has_shared_rw = bad_shared_rw_len = false;
+    shared_ro[0] = shared_ro[1] = shared_rw[0] = shared_rw[1] = 0;
 }
 
 static void world(void) { world_with("apple,agx-t6041", 16, 4, 8); }
+
+static void world_27_2(void)
+{
+    world();
+    os_firmware = (struct fw_version_info){"27.2", {27, 2, 0}, 3};
+    region[4][0] = 0x10001f54000UL;
+    region[4][1] = 0xc4000;
+    region[5][0] = 0x10000d70000UL;
+    region[5][1] = 0x64000;
+    shared_ro[0] = region[4][0] + region[4][1];
+    shared_ro[1] = 0x8000;
+    has_shared_ro = true;
+    segments[0] = (struct adt_segment_ranges){.phys = region[5][0], .iova = 0xfffffc0000000000UL,
+                                              .remap = region[5][0], .size = 0x64000, .unk = 1};
+    segments[1] = (struct adt_segment_ranges){.phys = region[4][0], .iova = 0xfffffc0000064000UL,
+                                              .remap = region[4][0], .size = 0xc4000, .unk = 0x10};
+    segments[2] = (struct adt_segment_ranges){.phys = shared_ro[0], .iova = 0xfffffc0000128000UL,
+                                              .remap = shared_ro[0], .size = 0x8000, .unk = 0};
+    segments_len = 3 * sizeof(segments[0]);
+}
 
 static const char *status(const char *path)
 {
@@ -320,6 +378,52 @@ int main(void)
     for (int i = 0; i < 4; i++)
         assert(!strcmp(status(region_paths[i]), "disabled"));
     puts("PASS refused: missing reserved-memory node");
+
+    /* 27.2 (26B123) 3-segment framing: __DATA + contiguous __DATA_SHARED_RO in gpu-fw-data. */
+    world_27_2();
+    has_shared_rw = true;
+    assert(dt_set_gpu_t6041(dt) == 0);
+    assert(!strcmp(status("gpu"), "okay"));
+    for (int i = 0; i < 6; i++) {
+        assert(!strcmp(status(region_paths[i]), "okay"));
+        const fdt64_t *reg = fdt_getprop(dt, fdt_path_offset(dt, region_paths[i]), "reg", &len);
+        u64 want_size = i == 4 ? region[4][1] + shared_ro[1] : region[i][1];
+        assert(reg && len == 16 && fdt64_ld(&reg[0]) == region[i][0] &&
+               fdt64_ld(&reg[1]) == want_size);
+    }
+    version = fdt_getprop(dt, fdt_path_offset(dt, "gpu"), "apple,firmware-version", &len);
+    assert(version && len == 12 && fdt32_ld(&version[0]) == 27 && fdt32_ld(&version[1]) == 2 &&
+           fdt32_ld(&version[2]) == 0);
+    puts("PASS accepted: J616C 27.2 3-segment regions");
+
+    world_27_2(); segments_len = sizeof(segments[0]);
+    expect_refused("1-segment gfx-asc");
+    world_27_2(); segments_len = 4 * sizeof(segments[0]);
+    expect_refused("4-segment gfx-asc");
+    world_27_2(); has_shared_ro = false;
+    expect_refused("missing gfx-data-shared-ro");
+    world_27_2(); segments[2].phys += 0x4000;
+    expect_refused("SHARED_RO segment base disagrees with sgx");
+    world_27_2(); segments[2].remap += 0x4000;
+    expect_refused("SHARED_RO segment remap is not identity");
+    world_27_2(); segments[2].size += 0x4000;
+    expect_refused("SHARED_RO segment size disagrees with sgx");
+    world_27_2(); shared_ro[0] += 0x4000; segments[2].phys = segments[2].remap = shared_ro[0];
+    expect_refused("SHARED_RO not contiguous with DATA");
+    world_27_2(); shared_ro[1] = 0x2000; segments[2].size = 0x2000;
+    expect_refused("unaligned SHARED_RO size");
+    world_27_2(); has_shared_rw = true; shared_rw[1] = 0x4000;
+    expect_refused("non-zero gfx-data-shared-rw");
+    world_27_2(); has_shared_rw = true; bad_shared_rw_len = true;
+    expect_refused("malformed gfx-data-shared-rw");
+    world_27_2(); segments[0].phys = segments[0].remap = shared_ro[0];
+    expect_refused("TEXT overlaps SHARED_RO tail");
+    world_27_2();
+    region[4][0] = (1UL << 42) - region[4][1];
+    shared_ro[0] = region[4][0] + region[4][1];
+    segments[1].phys = segments[1].remap = region[4][0];
+    segments[2].phys = segments[2].remap = shared_ro[0];
+    expect_refused("extended fw-data exceeds 42-bit OAS");
     return 0;
 }
 '''
@@ -352,4 +456,4 @@ def test_t6041_gpu_fill(tmp_path):
                     str(cfile), *sources, "-o", str(binary)], check=True)
     result = subprocess.run([str(binary)], capture_output=True, text=True)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert result.stdout.count("PASS") == 24, result.stdout
+    assert result.stdout.count("PASS") == 37, result.stdout

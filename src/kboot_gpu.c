@@ -3926,8 +3926,20 @@ static int dt_set_gpu_t6041(void *dt)
     if (asc < 0)
         goto disable;
     const struct adt_segment_ranges *segments = adt_getprop(adt, asc, "segment-ranges", &len);
-    if (!segments || len != 2 * sizeof(*segments))
+    if (!segments || (len != 2 * sizeof(*segments) && len != 3 * sizeof(*segments)))
         goto disable;
+    u64 ro_base = 0, ro_size = 0, rw;
+    if (len == 3 * sizeof(*segments)) {
+        if (ADT_GETPROP(adt, sgx, "gfx-data-shared-ro-base", &ro_base) != sizeof(u64) ||
+            ADT_GETPROP(adt, sgx, "gfx-data-shared-ro-size", &ro_size) != sizeof(u64) || !ro_size ||
+            (ro_size & (SZ_16K - 1)) || segments[2].phys != ro_base ||
+            segments[2].remap != ro_base || segments[2].size != ro_size ||
+            (adt_getprop(adt, sgx, "gfx-data-shared-rw-base", NULL) &&
+             (ADT_GETPROP(adt, sgx, "gfx-data-shared-rw-base", &rw) != sizeof(u64) || rw)) ||
+            (adt_getprop(adt, sgx, "gfx-data-shared-rw-size", NULL) &&
+             (ADT_GETPROP(adt, sgx, "gfx-data-shared-rw-size", &rw) != sizeof(u64) || rw)))
+            goto disable;
+    }
 
     u64 region_base[ARRAY_SIZE(t6040_regions)], region_size[ARRAY_SIZE(t6040_regions)];
     for (size_t i = 0; i < ARRAY_SIZE(t6040_regions); i++) {
@@ -3943,6 +3955,17 @@ static int dt_set_gpu_t6041(void *dt)
             region_base[i] = segments[0].phys;
             region_size[i] = segments[0].size;
         }
+        if (i == 4) {
+            if (segments[1].phys != region_base[4] || segments[1].size != region_size[4] ||
+                !region_size[4] || (region_size[4] & (SZ_16K - 1)))
+                goto disable;
+            if (ro_size) {
+                if (region_base[4] > UINT64_MAX - region_size[4] ||
+                    region_base[4] + region_size[4] != ro_base)
+                    goto disable;
+                region_size[4] += ro_size;
+            }
+        }
         if (!region_base[i] || !region_size[i] || (region_base[i] & (SZ_16K - 1)) ||
             (region_size[i] & (SZ_16K - 1)) || region_base[i] > UINT64_MAX - region_size[i] ||
             region_base[i] + region_size[i] > (1ULL << 42) ||
@@ -3953,8 +3976,6 @@ static int dt_set_gpu_t6041(void *dt)
                 region_base[j] < region_base[i] + region_size[i])
                 goto disable;
     }
-    if (segments[1].phys != region_base[4] || segments[1].size != region_size[4])
-        goto disable;
     int table =
         t6040_opp_table(dt, gpu, "operating-points-v2", count, T6041_CLUSTERS * sizeof(u32));
     if (table < 0 || t6040_opp_table(dt, gpu, "apple,cs-opp", aux[0]->count, sizeof(u32)) < 0 ||
