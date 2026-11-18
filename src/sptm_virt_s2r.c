@@ -555,6 +555,8 @@ static struct {
     int data_words; /* data words still to come for that write */
     bool data_pmu;  /* the write is to the PMU */
 } s2r_rtc;
+/* J613 RTC-only GO must stop before the commit if discovery or arming fails. */
+static bool s2r_rtc_required;
 
 static u32 s2r_rtc_patch(u32 reg, u32 v)
 {
@@ -659,7 +661,7 @@ static void s2r_rtc_setup(void)
 }
 
 /* At the GO commit, on the committing core: XNU's PMU accesses are quiesced behind it. */
-static void s2r_rtc_arm(void)
+static bool s2r_rtc_arm(void)
 {
     u8 c[6], b;
     if (!s2r_rtc.dev || spmi_ext_read_long(s2r_rtc.dev, s2r_rtc.slave, s2r_rtc.counter, c, 6) < 0)
@@ -687,9 +689,10 @@ static void s2r_rtc_arm(void)
     s2r_marker("RTCWAKE", at);
     printf("SPTM-virt[s2r]: PMU RTC alarm armed for counter second %u (now %lu, +%u s)\n", at,
            (unsigned long)(cnt >> 16), sptm_virt_s2r_wake_s);
-    return;
+    return true;
 fail:
     printf("SPTM-virt[s2r]: PMU RTC alarm not armed (SPMI error); no timed wake\n");
+    return false;
 }
 
 /* The commit in go mode, before the S2R timer write goes through. */
@@ -1015,8 +1018,13 @@ static bool s2r_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int w
     if (timer && !shadow_timer) {
         s2r_crumb_at(9, ++s2r_crumb_commits);
         s2r_crumb(0x10);
+        bool rtc_ok = !s2r_rtc_required;
         if (sptm_virt_s2r_wake_s)
-            s2r_rtc_arm();
+            rtc_ok = s2r_rtc_arm();
+        if (!rtc_ok) {
+            sptm_virt_rg_disarm();
+            s2r_stop_before_timer(ctx, addr, *val);
+        }
         s2r_commit();
         s2r_crumb(0x20);
     }
@@ -1779,6 +1787,7 @@ void sptm_virt_s2r_setup(bool cdc)
     sptm_virt_rg_passthrough = s2r_go;
     s2r_link_iodev = uartproxy_iodev;
     s2r_usb_setup();
+    s2r_rtc_required = chip_id == T8122 && s2r_go && sptm_virt_s2r_wake_s;
     if (s2r_go && sptm_virt_s2r_wake_s)
         s2r_rtc_setup();
     if (s2r_go && (sptm_virt_s2r_crumbs & 2)) { /* bit 1: SPMI notes */
