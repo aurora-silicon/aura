@@ -2,15 +2,17 @@
 """The proxy-only Stage 1 can select Aura's existing headless display path."""
 
 from pathlib import Path
+import shutil
 import subprocess
 
 
 ROOT = Path(__file__).resolve().parents[2]
+MAKE = shutil.which("gmake") or "make"
 
 
 def build_cfg(no_display: str) -> str:
     subprocess.run(
-        ["gmake", "-s", "build-cfg", f"NO_DISPLAY={no_display}"],
+        [MAKE, "-s", "build-cfg", f"NO_DISPLAY={no_display}"],
         cwd=ROOT,
         check=True,
     )
