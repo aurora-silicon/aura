@@ -688,7 +688,7 @@ static void s2r_probe_one(u64 e);
 /* Bit 10 of AURA_S2R_CRUMBS: a compact, read-only J613 commit-time snapshot. The access trace
  * cannot recover domains which were already steady before tracing began, and a successful sleep
  * may make the ring unavailable, so put the values on the always-on console and flush them before
- * forwarding the commit. */
+ * forwarding or withholding the commit. */
 static void s2r_j613_commit_snapshot(void)
 {
     static u64 addr[384];
@@ -1087,6 +1087,8 @@ static bool s2r_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int w
     bool timer = write && width <= 3 && *val == 1 && !strcmp(what, "pmgr-aon-pst") &&
                  (addr & 0x7fff) == S2R_TIMER_OFF && s2r_armed();
     bool shadow_timer = timer && !s2r_go && chip_id == T8122 && sptm_virt_s2r_late_stop;
+    if (timer && chip_id == T8122 && (sptm_virt_s2r_crumbs & 1024))
+        s2r_j613_commit_snapshot();
     /* AURA_S2R_GO_COUNT here too (J813): after n go-mode wakes, the next commit stops like stop
      * mode, so the ring holds the sleep, the wake and the next entry for the proxy to read. */
     if (timer && (!s2r_go || (sptm_virt_s2r_go_count && s2r_wake_count >= sptm_virt_s2r_go_count))) {
@@ -1110,8 +1112,6 @@ static bool s2r_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int w
             sptm_virt_rg_disarm();
             s2r_stop_before_timer(ctx, addr, *val);
         }
-        if (chip_id == T8122 && (sptm_virt_s2r_crumbs & 1024))
-            s2r_j613_commit_snapshot();
         s2r_commit();
         s2r_crumb(0x20);
     }
