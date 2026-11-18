@@ -837,7 +837,7 @@ static void uat_print(const char *when, const struct gpu_uat_report *rep, bool f
         return;
     printf("HV: GPU: UAT audit %s: %u roots, %u tables%s; leaves pool %u uat %u data %u fw-mmio %u; "
            "outliers %u (%u in the baseline): text %u dram %u mmio %u bad %u table %u; fresh %u "
-           "(%u in guest tables)\n",
+           "(%u in guest-writable tables)\n",
            when, rep->roots, rep->tables, rep->capped ? " (CAPPED: incomplete)" : "",
            rep->leaves[GPU_UC_POOL], rep->leaves[GPU_UC_UAT], rep->leaves[GPU_UC_DATA],
            rep->leaves[GPU_UC_FW_MMIO], rep->outliers, rep->known, rep->leaves[GPU_UC_TEXT],
@@ -845,7 +845,8 @@ static void uat_print(const char *when, const struct gpu_uat_report *rep, bool f
            rep->leaves[GPU_UC_TABLE], rep->fresh, rep->fresh_in_pool);
     for (u32 i = 0; i < rep->nfirst; i++)
         printf("HV: GPU: UAT outlier: entry 0x%lx (level %u%s) descriptor 0x%lx: %s\n",
-               rep->first[i].key, rep->first[i].level, rep->first[i].in_pool ? ", guest table" : "",
+               rep->first[i].key, rep->first[i].level,
+               rep->first[i].in_pool ? ", guest-writable table" : "",
                rep->first[i].desc, gpu_uat_class_name(rep->first[i].cls));
 }
 
@@ -933,7 +934,8 @@ static void count_message(u64 addr, const u64 *val, bool write, int width)
  * G2 C5 and the UAT gate: may this whole host-to-firmware message (W128 on a GFX window) go out?
  * Init data once per role; never a type the recipe refuses; on the two application endpoints only
  * when the page tables pass the audit (init data: no fresh outlier anywhere, as nothing of G2 has
- * reached the firmware yet; any other message: none in a table the guest writes).
+ * reached the firmware yet; any other message: none in a table the guest can write, which is
+ * the pool, the context table and every fw-rw region PROBE maps read-write).
  */
 static bool g2_allow_tx(u32 role, const u64 *val)
 {

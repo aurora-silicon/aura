@@ -720,13 +720,13 @@ def windows_t8152_gpu_status(mode):
               + ", ".join(f"{n} {v}" for n, v in zip(w.GPU_UAT_CLASSES, leaves) if v)
               + f"; {a['outliers']} outside pool/regions/declared windows ({a['known']} in the "
               f"PROBE baseline of {a['baseline']}{', OVERFLOW' if a['baseline_overflow'] else ''})"
-              f", {a['fresh']} new ({a['fresh_guest']} in guest or shared-L2 tables; at most "
+              f", {a['fresh']} new ({a['fresh_guest']} in guest-writable tables; at most "
               f"{a['fresh_max']} in any walk){', CAPPED' if a['capped'] else ''}")
         for i in range(min(a["fresh"], 8)):
             key, desc, kind = (st(w.GPU_STATUS_AUDIT_FRESH + 4 * i + k) for k in range(3))
             cls = kind & 0xff
             print(f"  new entry {key:#x} (level {(kind >> 8) & 0xff}"
-                  f"{', guest table' if kind >> 16 else ''}) = {desc:#x}: "
+                  f"{', guest-writable table' if kind >> 16 else ''}) = {desc:#x}: "
                   f"{w.GPU_UAT_CLASSES[cls] if cls < len(w.GPU_UAT_CLASSES) else cls}")
         if mode != "g2":
             return

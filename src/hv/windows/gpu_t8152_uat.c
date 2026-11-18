@@ -134,16 +134,34 @@ u32 gpu_uat_baseline_cap(const struct gpu_uat_scope *s)
 
 /* Who writes the table an entry lies in. */
 enum owner {
-    OWN_FW = 0,    /* the firmware's own tables (page-table region, extra roots' lower levels) */
-    OWN_HOST = 1,  /* the shared-L2 table: host-owned (Linux maps kernel-high VAs there), seeded
+    OWN_FW = 0,    /* a firmware table the guest cannot write (outside the pool and every fw-rw
+                      region): only the firmware changes it, so a change is reported */
+    OWN_FW_RW = 1, /* a firmware table inside an fw-rw region (the page-table region, the extra
+                      roots): seeded by the boot chain, so what it holds at PROBE is the baseline,
+                      but PROBE maps every fw-rw region read-write for the guest, so anything new
+                      in it may be the guest's and refuses the message */
+    OWN_HOST = 2,  /* the shared-L2 table: host-owned (Linux maps kernel-high VAs there), seeded
                       by the boot chain, so what it holds at PROBE is the baseline */
-    OWN_GUEST = 2, /* pool tables and context-table roots: only the guest writes them */
+    OWN_GUEST = 3, /* pool tables and context-table roots: only the guest writes them */
 };
+
+/* The owner of the table page at pa (by where it lies). */
+static u32 owner_of(const struct gpu_uat_scope *s, u64 pa)
+{
+    if (within(pa, GPU_T8152_PAGE, &s->pool))
+        return OWN_GUEST;
+    if (within(pa, GPU_T8152_PAGE, &s->tables[2]))
+        return OWN_HOST;
+    for (u32 i = 0; i < 4; i++)
+        if (within(pa, GPU_T8152_PAGE, &s->fw_rw[i]))
+            return OWN_FW_RW;
+    return OWN_FW;
+}
 
 static void outlier(struct walk *w, u64 key, u64 desc, u32 cls, u32 level, u32 owner)
 {
     struct gpu_uat_report *rep = w->rep;
-    bool in_pool = owner != OWN_FW;
+    bool in_pool = owner != OWN_FW; /* a table the guest can write, or the host's shared-L2 */
     struct gpu_uat_outlier o = {key, desc, (u8)cls, (u8)level, in_pool};
     rep->leaves[cls]++;
     rep->outliers++;
@@ -194,9 +212,22 @@ static void leaf(struct walk *w, u64 pa, u64 size, u64 key, u64 desc, u32 level,
 static void walk_table(struct walk *w, u64 pa, u32 level, u64 key, u64 desc, u32 from)
 {
     const struct gpu_uat_scope *s = w->s;
-    for (u32 i = 0; i < w->nvisited; i++)
-        if (s->visited[i] == pa)
-            return;
+    /*
+     * Visited tables are recorded with their level (pa is 16 KiB aligned; the level sits in the
+     * low bits).  The same table at the same level (a table shared between contexts) is walked
+     * once.  The same page at two levels is an outlier: its entries mean different things on
+     * each path (a page leaf at one level is a table descriptor at the other), and the walk
+     * would check only one meaning.
+     */
+    for (u32 i = 0; i < w->nvisited; i++) {
+        if ((s->visited[i] & ~3UL) != pa)
+            continue;
+        if ((s->visited[i] & 3) != level) {
+            u32 own = owner_of(s, pa);
+            outlier(w, key, desc, GPU_UC_BAD, level - 1, own > from ? own : from);
+        }
+        return;
+    }
     if (!table_readable(s, pa)) {
         outlier(w, key, desc, GPU_UC_TABLE, level - 1, from);
         return;
@@ -205,16 +236,14 @@ static void walk_table(struct walk *w, u64 pa, u32 level, u64 key, u64 desc, u32
         w->rep->capped = true;
         return;
     }
-    s->visited[w->nvisited++] = pa;
+    s->visited[w->nvisited++] = pa | level;
     const u64 *t = w->ops->page(pa, w->ops->arg);
     if (!t) {
         outlier(w, key, desc, GPU_UC_TABLE, level - 1, from);
         return;
     }
     w->rep->tables++;
-    u32 owner = within(pa, GPU_T8152_PAGE, &s->pool)      ? OWN_GUEST :
-                within(pa, GPU_T8152_PAGE, &s->tables[2]) ? OWN_HOST :
-                                                            OWN_FW;
+    u32 owner = owner_of(s, pa);
     for (u32 i = 0; i < GPU_UAT_ENTRIES; i++) {
         u64 d = t[i];
         if (!(d & 1))

@@ -374,11 +374,37 @@ static void g2_tests(void)
     assert(send(1, 0x0060000000000020UL, 0x0));
     assert(send(0, 0x0089000000000000UL, 0x21) && send(1, 0x0089000000000000UL, 0x21));
     assert(msgs(0, 1, GPU_MK_POWER_END) == 1 && msgs(1, 1, GPU_MK_POWER_END) == 1);
-    /* A fresh outlier in a firmware table: reported, a doorbell still goes out. */
+    /* A fresh outlier in a firmware table: the page-table region is mapped RW for the guest, so
+     * it may be the guest's: the doorbell is refused until it goes. */
     uat_put(pt + 0xc000, 1, 0x3500004000UL | 0x403);
+    assert(!send(0, 0x0084000000000011UL, 0x21));
+    assert(st(HV_GPU_S_AUDIT + HV_GPU_A_FRESH) == 1);
+    assert(st(HV_GPU_S_AUDIT + HV_GPU_A_FRESH_POOL) == 1);
+    assert(st(HV_GPU_S_AUDIT_FRESH) == ((pt + 0xc000) | 1));
+    assert((st(HV_GPU_S_AUDIT_FRESH + 2) >> 16) == 1);
+    uat_put(pt + 0xc000, 1, 0);
     assert(send(0, 0x0084000000000011UL, 0x21));
-    assert(st(HV_GPU_S_AUDIT + HV_GPU_A_FRESH) == 1 && st(HV_GPU_S_AUDIT + HV_GPU_A_FRESH_POOL) == 0);
     assert(msgs(0, 1, GPU_MK_FWCTL) == 1);
+    /* A context root pointing at a guest-built table in a spare page of the page-table region. */
+    uat_put(ctx, 4, (pt + 0x20000) | 1);
+    uat_put(pt + 0x20000, 0, (pt + 0x24000) | 3);
+    uat_put(pt + 0x24000, 0, (pt + 0x28000) | 3);
+    uat_put(pt + 0x28000, 0, 0x3500008000UL | 0x403);
+    assert(!send(0, 0x008300000000000aUL, 0x21));
+    assert(st(HV_GPU_S_AUDIT + HV_GPU_A_FRESH_POOL) == 1);
+    uat_put(ctx, 4, 0);
+    /* One pool page as an L3 table under context 0 and as the L2 table of context 6: its page
+     * leaves would be the hardware's L3 tables on the second path, which the walk never reads. */
+    uat_put(p2, 6, (pool + 0x6c000) | 0x403);   /* a pool leaf at L3 ... */
+    uat_put(pool + 0x6c000, 0, text | 0x403);   /* ... and, read as an L3 table, a text leaf */
+    uat_put(ctx, 6, (pool + 0x70000) | 1);
+    uat_put(pool + 0x70000, 0, p2 | 3);         /* p2 again, now at L2 */
+    assert(!send(0, 0x008300000000000aUL, 0x21));
+    assert(st(HV_GPU_S_AUDIT + HV_GPU_A_FRESH_POOL) == 1);
+    assert((st(HV_GPU_S_AUDIT_FRESH + 2) & 0xff) == GPU_UC_BAD);
+    assert(st(HV_GPU_S_AUDIT_FRESH) == ((pool + 0x70000) | 0));
+    uat_put(ctx, 6, 0);
+    uat_put(p2, 6, 0);
     /* A guest table pointing outside the table regions, or at a page that cannot be read. */
     uat_put(p1, 2, text | 3);
     assert(!send(0, 0x008300000000000aUL, 0x21));
@@ -395,7 +421,7 @@ static void g2_tests(void)
     uat_put(p2, 5, 0);
     assert(send(0, 0x008300000000000aUL, 0x21));
     assert(msgs(0, 1, GPU_MK_DOORBELL) == 1);
-    assert(st(HV_GPU_S_GUARD + HV_GPU_G_AUDIT) == 5);
+    assert(st(HV_GPU_S_GUARD + HV_GPU_G_AUDIT) == 8);
     assert(st(HV_GPU_S_AUDIT + HV_GPU_A_FRESH_MAX) >= 1);
 
     /* The access map shows the new dispositions. */
@@ -412,7 +438,8 @@ static void g2_tests(void)
     check_hw_log();
     allow_boot = false;
 
-    /* STOP: the teardown audit still sees the firmware-table outlier; the marker says so. */
+    /* STOP: the teardown audit sees a firmware-table outlier left behind; the marker says so. */
+    uat_put(pt + 0xc000, 1, 0x3500004000UL | 0x403);
     assert(op(HV_GPU_OP_STOP, 0, 0) == 0);
     m = hv_gpu_host_marker();
     assert((m->state & GPU_BM_ENDED) && (m->state & GPU_BM_GUARD) && (m->state & GPU_BM_G2));
@@ -462,11 +489,16 @@ static void g2_tests(void)
     uat_put(ctx, 10, 0);
     assert(send(0, 0x00810c20001a8000UL, 0x20));
     assert(st(HV_GPU_S_AUDIT + HV_GPU_A_KNOWN) == 3000 && st(HV_GPU_S_AUDIT + HV_GPU_A_FRESH) == 0);
-    /* One firmware leaf changes: found among the 3,000 known ones, reported, not a refusal. */
+    /* One firmware leaf changes: found among the 3,000 known ones; the table is in a region the
+     * guest can write, so the message waits until it is back. */
     uat_put(pt + 0x10000, 100, 0x3600000000UL | 0x403);
-    assert(send(0, 0x0089000000000000UL, 0x21));
+    assert(!send(0, 0x0089000000000000UL, 0x21));
     assert(st(HV_GPU_S_AUDIT + HV_GPU_A_FRESH) == 1 && st(HV_GPU_S_AUDIT + HV_GPU_A_KNOWN) == 2999);
+    assert(st(HV_GPU_S_AUDIT + HV_GPU_A_FRESH_POOL) == 1);
     assert(st(HV_GPU_S_AUDIT_FRESH) == ((pt + 0x10000) | 100));
+    uat_put(pt + 0x10000, 100, (0x3500000000UL + 0x4000UL * (2999 - 2148)) | 0x403);
+    assert(send(0, 0x0089000000000000UL, 0x21));
+    assert(st(HV_GPU_S_AUDIT + HV_GPU_A_FRESH) == 0 && st(HV_GPU_S_AUDIT + HV_GPU_A_KNOWN) == 3000);
     /* The host-owned shared-L2 table: what it held at PROBE is known, anything new refuses. */
     l2r = range_base(GPU_C_FW_RW, GPU_R_SHARED_L2);
     uat_put(ctx, 1, pt | 1);

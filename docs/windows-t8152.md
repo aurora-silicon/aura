@@ -915,10 +915,12 @@ windows G1 already forwards.
   their own tables and the shared-L2 table, sorted for lookup, sized for every entry of those
   tables), before every init-data message (any entry outside the pool, the UAT and DATA
   regions and the declared windows that is not in the baseline refuses it), before every other
-  message on EP 0x20/0x21 (such an entry in a pool table, a context-table root or the shared-L2
-  table refuses it; one in the firmware's own tables is reported), and at teardown (reported,
-  boot marker bit 8). Outliers are classified (firmware TEXT, other DRAM, MMIO, malformed
-  descriptor, table outside the readable regions); `STATUS 0x480` and `0x4c0` give the last
+  message on EP 0x20/0x21 (such an entry in any guest-writable table refuses it: a pool table,
+  a context-table root, and every table in an fw-rw region, since PROBE maps all four RW for the
+  guest; a change the firmware makes to its own tables after init data therefore also refuses
+  the next message), and at teardown (reported, boot marker bit 8). Outliers are classified
+  (firmware TEXT, other DRAM, MMIO, malformed descriptor or a page reached as a table at two
+  different levels, table outside the readable regions); `STATUS 0x480` and `0x4c0` give the last
   walk. Pool pages are read after a guarded probe of the EL2 mapping and a clean+invalidate.
 
 The launcher (`--windows-gpu g2 --windows-gpu-g2-grant fw-mmio,boot-control`) checks CAPS2 bits 4

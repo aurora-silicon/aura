@@ -811,15 +811,18 @@ def test_g1_probe(glue_exe, tmp_path):
 #        refused types and an RTKit IOP power state other than on never reach the firmware; after init data the guest's sgx accesses
 #        (CPU_CONTROL included) are locked; every message is counted by role, direction, kind.
 #   G2-5 the UAT audit: the PROBE baseline keeps the firmware's own mappings as known; a fresh
-#        outlier anywhere refuses init data; a fresh outlier in a guest table (pool or context
-#        table) refuses every application-endpoint message; one in a firmware table is only
-#        reported; tables outside the table regions, unreadable tables and malformed
-#        descriptors are outliers; the teardown audits again and marks the boot marker.
+#        outlier anywhere refuses init data; a fresh outlier in a guest-writable table (pool,
+#        context table, and every table in an fw-rw region PROBE maps RW, the page-table region
+#        included, also behind a context root the guest points there) refuses every
+#        application-endpoint message; tables outside the table regions, unreadable tables,
+#        malformed descriptors and a page reached as a table at two levels are outliers; the
+#        teardown audits again and marks the boot marker.
 #   G2-6 a G1 probe session is unchanged (halves forwarded, no guards) but records the audit.
 #   G2-7 a firmware baseline of thousands of outliers is found by lookup, not capped; an outlier
 #        in a guest table at PROBE (a stale context root into the pool) is never inherited as
 #        known: init data waits until the guest clears it; a new entry in the host-owned
-#        shared-L2 table refuses a doorbell, one in a firmware table is only reported.
+#        shared-L2 table refuses a doorbell, so does a changed firmware-table leaf (guest-writable
+#        region) until it is restored.
 
 
 def test_g2_guards(glue_exe, tmp_path):
@@ -852,15 +855,20 @@ def test_g2_guards(glue_exe, tmp_path):
     assert "refused: a second init-data message to this role" in out
     assert "refused: a message type the G2 recipe never forwards" in out
     assert "GFX init data forwarded: sgx is locked for the guest from now on" in out
-    assert re.search(r"UAT outlier: entry 0x[0-9a-f]+ \(level 3, guest table\) descriptor "
+    assert re.search(r"UAT outlier: entry 0x[0-9a-f]+ \(level 3, guest-writable table\) descriptor "
                      r"0x[0-9a-f]+: text", out), out
     assert re.search(r"UAT outlier: .*: table", out) and re.search(r"UAT outlier: .*: bad", out)
+    # A firmware-region table the guest wrote, and a page reached as a table at two levels.
+    assert re.search(r"UAT outlier: entry 0x[0-9a-f]+ \(level 3, guest-writable table\) descriptor "
+                     r"0x3500004403: mmio", out), out
+    assert re.search(r"UAT outlier: entry 0x[0-9a-f]+ \(level 1, guest-writable table\) descriptor "
+                     r"0x[0-9a-f]+: bad", out), out
     assert "UAT audit at teardown" in out
     assert re.search(r"map post-office\+0x110 W128 mailbox blocked", out), out
     assert re.search(r"map sgx\+0xd04000 R32 sgx locked", out), out
     assert "messages GFX TX init-data n=1" in out and "messages GFX RX init-ack n=1" in out
     assert "refused: an IOP power state other than on" in out
-    assert "G2 guards: 2 second init-data refused, 3 refused types, 5 refused by the UAT audit, " \
+    assert "G2 guards: 2 second init-data refused, 3 refused types, 8 refused by the UAT audit, " \
         "3 sgx accesses locked, 3 mailbox halves denied; init data sent to GFX GFX1" in out
 
 

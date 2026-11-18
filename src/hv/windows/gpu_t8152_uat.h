@@ -21,9 +21,15 @@
  *     root holds, which is the guest's and may be stale from an earlier boot);
  *   - before each init-data message (G2): any entry outside the allowed set that is not in the
  *     baseline refuses the message, so the firmware never sees a graph mapped outside;
- *   - before each other application-endpoint message (G2): such an entry in a guest table (the
- *     pool, the context table) or in the host-owned shared-L2 table refuses the message; one in
- *     the firmware's own tables (which the firmware itself may change) is reported;
+ *   - before each other application-endpoint message (G2): such an entry in any table the guest
+ *     can write refuses the message: the pool, a context-table root, and every table inside an
+ *     fw-rw region (PROBE maps all four read-write for the guest, so the page-table region and
+ *     the shared-L2 table are guest-writable too, and a guest could place a table there or point
+ *     a context root at one).  Only a table outside the pool and every fw-rw region would be the
+ *     firmware's alone and reported; the walk reads none today.  So a change the firmware makes
+ *     to its own tables after init data also refuses the next message (fail-safe);
+ *   - a page reached as a table at two different levels is an outlier (its entries would mean
+ *     different things on the two paths and the walk checks only one);
  *   - at teardown: the whole walk again, reported.
  *
  * What this cannot see: a write between an audit and the firmware's next use of the tables, and
@@ -87,7 +93,7 @@ struct gpu_uat_ops {
 struct gpu_uat_outlier {
     u64 key, desc;
     u8 cls, level;
-    bool in_pool; /* a guest or host-owned table: the pool, a context-table root, shared-L2 */
+    bool in_pool; /* a guest-writable table: the pool, a context-table root, any fw-rw region */
 };
 
 /*
@@ -112,7 +118,7 @@ struct gpu_uat_report {
     u32 outliers;             /* entries outside the allowed set */
     u32 known;                /* of those, in the baseline (same entry, same descriptor) */
     u32 fresh;                /* outliers not in the baseline */
-    u32 fresh_in_pool;        /* of those, in a guest table or shared-L2 (in_pool) */
+    u32 fresh_in_pool;        /* of those, in a guest-writable table (in_pool) */
     bool capped;              /* more tables than visited_cap: the walk is incomplete */
     u32 nfirst;
     struct gpu_uat_outlier first[GPU_UAT_REPORT_MAX]; /* the first fresh outliers */
@@ -123,9 +129,10 @@ const char *gpu_uat_class_name(u32 cls);
 /*
  * Walk every valid root of the context table and the extra roots.  With known, outliers found in
  * it are counted as known, the rest as fresh.  With record and without known (the baseline),
- * every outlier of a firmware table is stored there, counted as known, and the record is sorted
- * at the end (on overflow the rest is not stored, so a later audit counts it as fresh); one in a
- * guest table (pool, context-table root) is fresh and never stored.  With neither, every
+ * every outlier of a firmware or shared-L2 table is stored there, counted as known, and the
+ * record is sorted at the end (on overflow the rest is not stored, so a later audit counts it as
+ * fresh); one in a pool table or behind a context-table root's own descriptor is fresh and never
+ * stored.  With neither, every
  * outlier is fresh.  An incomplete walk (table cap) counts as one fresh outlier.  Returns
  * rep->fresh.
  */
