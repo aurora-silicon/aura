@@ -361,15 +361,23 @@ def env_int(name, default=0):
     return int(value, 0) if value else default
 
 
-def validate_j613_go():
+def validate_j613_go(bootargs):
     recovery = env_int("AURA_J613_RECOVERY_SECS", 30)
     crumbs = env_int("AURA_S2R_CRUMBS")
     wake_s = env_int("AURA_S2R_WAKE_S")
     wake_source = env_on("AURA_J613_PHYSICAL_WAKE") or wake_s > 0
+    quiet_guest = not any(arg == "-v" or arg.startswith("serial=") for arg in bootargs.split())
+    link_release = crumbs & (32 | 64) == (32 | 64)
+    memory_safe = ((env_on("AURA_KEEP_ERRH") and env_on("AURA_AMCC_CLEAR")) or
+                   env_int("AURA_S2R_QUIESCE") & 24 == 24)
     if not (env_on("AURA_S2R_TRACE") and env_on("AURA_S2R_DROP_USB") and
             env_int("AURA_S2R_USB_RETAKE") and recovery == 0 and crumbs >= 3 and wake_source):
         raise SystemExit("J613 GO requires TRACE, DROP_USB, USB_RETAKE, CRUMBS>=3, "
                          "RECOVERY_SECS=0, and PHYSICAL_WAKE=1 or WAKE_S>0")
+    if not (env_on("AURA_HIDE_DOCKCHANNEL") and quiet_guest and link_release and memory_safe):
+        raise SystemExit("J613 GO reuses the qualified sleep window: HIDE_DOCKCHANNEL=1, no -v or "
+                         "serial= boot-arg, CRUMBS bits 5+6, and either KEEP_ERRH=1 with "
+                         "AMCC_CLEAR=1 or QUIESCE=24")
 
 
 def post_entry_drain_needed(iface):
@@ -904,7 +912,7 @@ def main():
         if env_on("AURA_S2R_LATE_STOP") and (not env_on("AURA_S2R_TRACE") or j613_go):
             raise SystemExit("J613: AURA_S2R_LATE_STOP requires stop-mode AURA_S2R_TRACE")
         if j613_go:
-            validate_j613_go()
+            validate_j613_go(args.bootargs)
         # Deliberately before reading images or placing anything on the target.
         try:
             sptm_j613.patch_plan(None, None)
