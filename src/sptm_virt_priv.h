@@ -113,6 +113,7 @@ void sptm_virt_s2r_dump_tail(u64 n);
 void sptm_virt_s2r_dump_prio(u64 near, u64 far);
 void sptm_virt_s2r_wd_stopped(void);
 bool sptm_virt_s2r_wfi(u64 *regs, u64 esr);
+void sptm_virt_s2r_diag_wfx(u64 *regs, u64 esr);
 
 /* sptm_virt_gpu.c */
 void sptm_virt_gpu_setup(void);

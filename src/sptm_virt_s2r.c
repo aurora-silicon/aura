@@ -142,6 +142,7 @@ static volatile u32 s2r_twi_mask, s2r_parked_mask;
 static bool s2r_j613_soc_misc_marked, s2r_j613_aon_pst_marked;
 /* Go mode: the ring position where the first core opened the sleep window (0: none yet). */
 static volatile u64 s2r_sleep_head;
+static volatile u64 s2r_sleep_t;
 static volatile int s2r_timer_cpu = -1;
 /* Go mode, from the first core's self-disable until the wake: aura prints nothing. Printing in
  * that window delays the boot core's last steps past macOS's 5 s reconfig watchdog. */
@@ -387,6 +388,43 @@ static bool s2r_armed(void)
     return s2r_arm_at && mrs(CNTPCT_EL0) >= s2r_arm_at;
 }
 
+/* Bit 11 of AURA_S2R_CRUMBS is a one-run stall witness. Keep the already-selected AON console
+ * usable until the commit, then let trapped WFE/WFI instructions identify every CPU which is
+ * still waiting. The ordinary GO path keeps the console silent and unchanged. */
+void sptm_virt_s2r_diag_wfx(u64 *regs, u64 esr)
+{
+    static volatile u32 reported;
+    static volatile bool ring_dumped;
+
+    if (!(sptm_virt_s2r_crumbs & 2048) || !s2r_sleep_t)
+        return;
+    u64 now = mrs(CNTPCT_EL0), f = mrs(CNTFRQ_EL0);
+    if (now - s2r_sleep_t < 2 * f)
+        return;
+    int cpu = smp_id();
+    if (!(__atomic_fetch_or(&reported, BIT(cpu), __ATOMIC_SEQ_CST) & BIT(cpu))) {
+        u64 pc = mrs(ELR_EL2), fp = regs[29];
+        printf("SPTM-virt[s2r-stall c%d]: %s pc=0x%lx lr=0x%lx sp=0x%lx fp=0x%lx x0=0x%lx "
+               "esr=0x%lx\n",
+               cpu, (esr & 1) ? "WFE" : "WFI", pc, regs[30], mrs(SP_EL1), fp, regs[0], esr);
+        for (int i = 0; i < 16 && fp; i++) {
+            u64 nfp, lr;
+            if (!sptm_virt_el1_va_read64(fp, &nfp) ||
+                !sptm_virt_el1_va_read64(fp + 8, &lr))
+                break;
+            printf("SPTM-virt[s2r-stall c%d]:   frame %d lr 0x%lx\n", cpu, i, lr);
+            if (nfp <= fp)
+                break;
+            fp = nfp;
+        }
+    }
+    if (!__atomic_exchange_n(&ring_dumped, true, __ATOMIC_SEQ_CST)) {
+        printf("SPTM-virt[s2r-stall]: last trapped PMGR/ASC accesses\n");
+        sptm_virt_s2r_dump_prio(2048, 8192);
+    }
+    iodev_console_flush();
+}
+
 /* ---- the sleep ------------------------------------------------------------------------------ */
 
 /* From the commit everything aura writes (console, proxy, XNU's vuart TX) goes to DockChannel:
@@ -521,11 +559,18 @@ static void s2r_core_sleeps(void)
     }
     if (first) {
         s2r_sleep_head = sptm_virt_s2r_head;
+        s2r_sleep_t = mrs(CNTPCT_EL0);
         s2r_clean(&s2r_sleep_head, sizeof(s2r_sleep_head));
+        s2r_clean(&s2r_sleep_t, sizeof(s2r_sleep_t));
         printf("SPTM-virt[s2r]: cpu%d opens the sleep window: aura silent until the wake\n", cpu);
         s2r_console_to_aon();
         iodev_console_flush();
-        s2r_console_off();
+        if (sptm_virt_s2r_crumbs & 2048) {
+            sptm_virt_s2r_quiet = true;
+            s2r_clean(&sptm_virt_s2r_quiet, sizeof(sptm_virt_s2r_quiet));
+        } else {
+            s2r_console_off();
+        }
     }
     if (sptm_virt_s2r_crumbs & 1) /* bit 0: aura takes the cores' deep-sleep WFI (TWI) */
         nv2_hcr_update(HCR_TWI, 0);
@@ -648,7 +693,11 @@ static void s2r_j613_commit_snapshot(void)
 {
     static u64 addr[384];
     static u32 value[384];
-    int n = pmgr_snapshot(addr, value, ARRAY_SIZE(addr));
+    /* Candidate 18 reads the same named Linux power-domain block successfully. Other ADT PMGR
+     * banks are not part of that comparison and may already be inaccessible this late. */
+    printf("J613-COMMIT-SNAPSHOT begin\n");
+    iodev_console_flush();
+    int n = pmgr_snapshot_range(addr, value, ARRAY_SIZE(addr), 0x2d0700000, 0x2d0714000);
 
     printf("J613-COMMIT-SNAPSHOT PMGR %d\n", n);
     for (int i = 0; i < n; i++)

@@ -1170,6 +1170,7 @@ static bool sptm_virt_wfi_watched(u64 esr)
 
 bool sptm_virt_el1_wfx(u64 *regs, u64 esr)
 {
+    sptm_virt_s2r_diag_wfx(regs, esr);
     if (sptm_virt_s2r_wfi(regs, esr))
         return true;
     /*

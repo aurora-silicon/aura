@@ -882,9 +882,9 @@ uintptr_t pmgr_psreg_by_name(int die, const char *name)
     return dev ? pmgr_device_get_addr(die, dev) : 0;
 }
 
-int pmgr_snapshot(u64 *addr, u32 *value, int max)
+int pmgr_snapshot_range(u64 *addr, u32 *value, int max, u64 start, u64 end)
 {
-    if (!pmgr_initialized || !addr || !value || max <= 0)
+    if (!pmgr_initialized || !addr || !value || max <= 0 || start >= end)
         return 0;
 
     int n = 0;
@@ -894,7 +894,7 @@ int pmgr_snapshot(u64 *addr, u32 *value, int max)
             if (dev->flags & PMGR_FLAG_VIRTUAL)
                 continue;
             u64 a = pmgr_device_get_addr(die, dev);
-            if (!a)
+            if (a < start || a >= end)
                 continue;
             bool duplicate = false;
             for (int j = 0; j < n; j++)
