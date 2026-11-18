@@ -12,6 +12,7 @@
 #include "ahci_nvme.h"
 #include "gpt_check.h"
 #include "hv.h"
+#include "hv_fatal.h"
 #include "hv_t8152.h"
 #include "malloc.h"
 #include "nvme.h"
@@ -45,6 +46,44 @@ static bool force_reset;
 /* A close shut the controller down without the lock: that CPU may still touch the queues. */
 static bool closed_without_lock;
 
+/*
+ * Activity record for the fatal report (hv_fatal.h seqlock): the backend's last NVMe command,
+ * written by the CPU that holds the controller lock.  `done` is 0 while the command is in
+ * flight.  A guest SError, a panic or a watchdog bark then says whether the controller was
+ * busy, with what and on which CPU.
+ */
+static struct {
+    u64 seq;
+    u64 n;    /* NVMe commands issued by the backend */
+    u64 op;   /* 'R' read, 'W' write, 'F' flush */
+    u64 cpu;
+    u64 block, count;
+    u64 start, done; /* CNTPCT at issue and at completion (0: in flight) */
+    u64 ok;
+} act;
+
+static void act_begin(char op, u64 block, u64 count, u64 start)
+{
+    hv_fatal_seq_begin(&act.seq);
+    act.n++;
+    act.op = (u64)op;
+    act.cpu = smp_id();
+    act.block = block;
+    act.count = count;
+    act.start = start;
+    act.done = 0;
+    act.ok = 0;
+    hv_fatal_seq_end(&act.seq);
+}
+
+static void act_end(bool ok)
+{
+    hv_fatal_seq_begin(&act.seq);
+    act.done = mrs(CNTPCT_EL0);
+    act.ok = ok;
+    hv_fatal_seq_end(&act.seq);
+}
+
 static u64 ticks_to_us(u64 t)
 {
     u64 f = mrs(CNTFRQ_EL0);
@@ -68,7 +107,9 @@ static bool dev_read(void *opaque, u64 block, u32 count, void *buf)
     if (!nvme_lock_acquire(LOCK_WAIT_US))
         return false;
     u64 start = mrs(CNTPCT_EL0);
+    act_begin('R', block, count, start);
     bool ok = !closing && nvme_read_blocks(NSID, block, buf, count);
+    act_end(ok);
     timed(start, false);
     nvme_lock_release();
     return ok;
@@ -80,7 +121,9 @@ static bool dev_write(void *opaque, u64 block, u32 count, const void *buf)
     if (!nvme_lock_acquire(LOCK_WAIT_US))
         return false;
     u64 start = mrs(CNTPCT_EL0);
+    act_begin('W', block, count, start);
     bool ok = !closing && nvme_write_blocks(NSID, block, buf, count);
+    act_end(ok);
     timed(start, false);
     nvme_lock_release();
     return ok;
@@ -92,7 +135,9 @@ static bool dev_flush(void *opaque)
     if (!nvme_lock_acquire(LOCK_WAIT_US))
         return false;
     u64 start = mrs(CNTPCT_EL0);
+    act_begin('F', 0, 0, start);
     bool ok = !closing && nvme_flush(NSID);
+    act_end(ok);
     timed(start, true);
     nvme_lock_release();
     return ok;
@@ -651,7 +696,14 @@ void hv_ahci_nvme_report(bool final)
            ticks_to_us(longest_flush_ticks), s->guard_hits + nvme_fence_refusals());
 }
 
-void hv_ahci_nvme_fatal_report(void)
+static u64 fatal_age_us(u64 now, u64 then, u64 freq)
+{
+    if (!then || then > now || !freq)
+        return 0;
+    return (now - then) * 1000000 / freq;
+}
+
+void hv_ahci_nvme_fatal_report(u64 now, u64 freq)
 {
     if (state == HV_AHCI_NVME_DETACHED)
         return;
@@ -660,4 +712,28 @@ void hv_ahci_nvme_fatal_report(void)
            state_name(state), found_first, found_last,
            (req.flags & HV_AHCI_NVME_RW) ? "read-write" : "read-only", core.wrote,
            nvme_lock_owner());
+    const struct ahci_nvme_stats *s = &core.stats;
+    printf("HV: fatal: AHCI NVMe activity: %lu AHCI commands (%lu failed, %lu refused), %lu "
+           "NVMe commands; closing %d, fence %s, session %s\n",
+           s->commands, s->failed, s->refused, act.n, (int)closing,
+           nvme_fence_active() ? "set" : "clear", nvme_session_live() ? "live" : "down");
+    typeof(act) a;
+    u64 seq = hv_fatal_read(&act.seq, &act, &a, sizeof(a));
+    if (!a.n) {
+        printf("HV: fatal: AHCI NVMe last command: none issued by the backend\n");
+        return;
+    }
+    const char *op = a.op == 'R' ? "read" : a.op == 'W' ? "write" : "flush";
+    printf("HV: fatal: AHCI NVMe last command #%lu: %s", a.n, op);
+    if (a.op != 'F')
+        printf(" block %lu (partition +%lu), %lu block(s)", a.block,
+               a.block >= found_first ? a.block - found_first : 0, a.count);
+    printf(" on cpu %lu, issued %lu us ago, ", a.cpu, fatal_age_us(now, a.start, freq));
+    if (seq == ~0UL || (seq & 1))
+        printf("record being rewritten (a command is starting or ending)\n");
+    else if (!a.done)
+        printf("IN FLIGHT (no completion yet)\n");
+    else
+        printf("completed in %lu us, %s\n", fatal_age_us(a.done, a.start, freq),
+               a.ok ? "ok" : "FAILED");
 }

@@ -4,7 +4,8 @@ from construct import *
 
 from ..asm import ARMAsm
 from ..tgtypes import *
-from ..proxy import IODEV, START, EVENT, EXC, EXC_RET, ExcInfo
+from ..proxy import (IODEV, START, EVENT, EXC, EXC_RET, ExcInfo, UartTimeout, UartError,
+                     ProxyReplyError)
 from ..utils import *
 from ..sysreg import *
 from ..macho import MachO
@@ -35,6 +36,17 @@ CPU_START_OFFSETS = {
 }
 
 __all__ = ["HV"]
+
+class WindowsGuestAborted(RuntimeError):
+    """hv.start() of a Windows guest that ended on a forwarded exception (a guest SError, an
+    unhandled guest exception, ^C): the carrier exited the guest and hv_start() returned."""
+
+
+class WindowsGuestExitTimeout(RuntimeError):
+    """The host asked the carrier to exit the guest (EXC_RET.EXIT_GUEST) and the carrier then
+    stayed silent through every bounded wait and break: its state, the disk's included, is
+    unknown."""
+
 
 class HV(Reloadable):
     PAC_MASK = 0xfffff00000000000
@@ -105,6 +117,14 @@ class HV(Reloadable):
         # WINDOWS_SERROR_CONTINUE_MAX times per session, then aborts.
         self.windows_serror = "abort"
         self.windows_serrors_continued = 0
+        # The carrier's "HV: fatal:" console lines of this session (its guest SError report
+        # among them), kept for run_guest's summary after an abort; and the breaks sent while
+        # waiting for the guest exit (_windows_wait_guest_exit).
+        self.windows_fatal_lines = []
+        self.windows_exit_breaks = 0
+        # The carrier's last NVMe close/reset verdict line on its console (CLEAN, FAILED, or
+        # the park of flush_and_reboot), for a launcher that can no longer ask it.
+        self.windows_nvme_console = None
         self.windows_usb = "disabled"
         self.windows_gpu = "off"
         self.windows_usb_removed = []
@@ -997,6 +1017,14 @@ class HV(Reloadable):
             self._info_data = new_info
 
     WINDOWS_SERROR_CONTINUE_MAX = 8
+    # After EXC_RET.EXIT_GUEST the carrier joins the CPUs, tears USB down and closes the disks
+    # (the NVMe close waits at most 12 s for the controller lock, then a 10 s flush and the
+    # shutdown), printing as it goes.  This long with no byte from it means it is stuck
+    # (2026-11-17, carrier 353b3cf5: 13 min after a forwarded guest SError, until ^C).  Then
+    # the launcher sends the break ^C sends, at most WINDOWS_EXIT_BREAKS times, and gives up.
+    WINDOWS_EXIT_QUIET_S = 60
+    WINDOWS_EXIT_BREAKS = 2
+    WINDOWS_FATAL_LINES_MAX = 600
 
     def handle_exception(self, reason, code, info):
         if self.windows:
@@ -1093,10 +1121,94 @@ class HV(Reloadable):
         event = {"reason": int(reason), "code": int(code), "info": hex(info)}
         if self.windows_abort_reason is None:
             self.windows_abort_reason = event
+        # Bounded from here: the frame read below and the EXIT are the first requests the
+        # carrier may leave unanswered.
+        self._windows_bound_exit_wait()
         self.log(f"Windows guest forwarded an exception to Python: {event}")
         if reason == START.EXCEPTION_LOWER:
             self._log_windows_exc_info(info)
         self.p.exit(EXC_RET.EXIT_GUEST)
+
+    def _windows_bound_exit_wait(self):
+        """From the EXIT_GUEST on, the carrier owes the reply to hv_start (and to this exit);
+        a finite link timeout turns its silence into UartTimeout, which start() answers
+        (_windows_wait_guest_exit) instead of waiting forever with the timeout None."""
+        dev = getattr(self.iface, "dev", None)
+        if dev is not None:
+            dev.timeout = self.WINDOWS_EXIT_QUIET_S
+
+    def _windows_hv_start(self):
+        try:
+            return self.p.hv_start(self.entry, self.guest_base + self.bootargs_off)
+        except (UartError, ProxyReplyError) as exc:
+            if self.windows_abort_reason is None:
+                raise
+            stale = None if isinstance(exc, UartTimeout) else exc
+        except OSError as exc:
+            # pyserial's SerialException: the USB link went away, e.g. with a carrier reset
+            # (flush_and_reboot after the NVMe close, a watchdog bark).
+            if self.windows_abort_reason is None:
+                raise
+            raise WindowsGuestExitTimeout(
+                f"the link to the carrier failed after the guest exit request: {exc!r}")
+        return self._windows_wait_guest_exit(stale)
+
+    def _windows_wait_guest_exit(self, stale=None):
+        """The carrier went silent after the host asked it to exit the guest.  Send the break
+        ^C sends ('!', the proxy's user interrupt; it ended the 2026-11-17 hang) and go on
+        waiting for hv_start's reply; a late reply to the EXIT itself is dropped.  A carrier
+        still silent after WINDOWS_EXIT_BREAKS breaks raises WindowsGuestExitTimeout: the
+        launcher then reports the disk as unknown instead of hanging."""
+        n = 0
+        timed_out = stale is None
+        if stale is not None:
+            self.log(f"Windows guest exit: dropped a stale reply ({stale})")
+        while True:
+            if timed_out:
+                if n == self.WINDOWS_EXIT_BREAKS:
+                    break
+                n += 1
+                self.windows_exit_breaks = n
+                self.log(f"Windows guest exit: no output from the carrier for "
+                         f"{self.WINDOWS_EXIT_QUIET_S} s after the host asked it to exit the "
+                         f"guest; sending the proxy break ('!', as ^C does) "
+                         f"{n}/{self.WINDOWS_EXIT_BREAKS}")
+                self.iface.dev.write(b"!")
+            try:
+                return self.p.resume_reply(self.p.P_HV_START, skip=(self.p.P_EXIT,))
+            except UartTimeout:
+                timed_out = True
+            except (UartError, ProxyReplyError) as exc:
+                # A late answer to a request whose wait timed out (the frame read): dropped.
+                self.log(f"Windows guest exit: dropped a stale reply ({exc})")
+                timed_out = False
+            except OSError as exc:
+                raise WindowsGuestExitTimeout(
+                    f"the link to the carrier failed while waiting for the guest exit: "
+                    f"{exc!r}")
+        raise WindowsGuestExitTimeout(
+            f"the carrier did not finish the guest exit: silent for "
+            f"{self.WINDOWS_EXIT_QUIET_S} s after the exit request and after each of "
+            f"{self.WINDOWS_EXIT_BREAKS} breaks (abort reason {self.windows_abort_reason})")
+
+    def _windows_tty_line(self, line):
+        """iface.tty_line_hook during a Windows hv.start(): keep the carrier's fatal report."""
+        text = line.decode("utf-8", "replace").rstrip("\r")
+        at = text.find("HV: fatal:")
+        if at >= 0 and len(self.windows_fatal_lines) < self.WINDOWS_FATAL_LINES_MAX:
+            self.windows_fatal_lines.append(text[at:])
+        elif ("AHCI NVMe:" in text and ("CLEAN" in text or "FAILED" in text)) or \
+                "NVMe shutdown not confirmed" in text:
+            self.windows_nvme_console = text.split("] ", 1)[-1]
+
+    def windows_fatal_summary(self):
+        """The lines of the carrier's fatal report that say what happened: the SError line,
+        the verdict, the NVMe/AHCI activity record and the attribution's conclusion and
+        CANDIDATEs.  Empty when the carrier printed no fatal report this session."""
+        keys = ("guest SError on cpu", "SError vs previous exit", "AHCI NVMe",
+                "attribution: CANDIDATE", "candidate(s) reach", "no guest address near",
+                "the host decides", "not contained")
+        return [l for l in self.windows_fatal_lines if any(k in l for k in keys)]
 
     def _windows_serror_continue(self, reason, code, info):
         """--windows-serror continue: a guest SError (the carrier has already printed its
@@ -2668,12 +2780,20 @@ class HV(Reloadable):
                     break
             self.started_cpus[cpu_node.cpu_id] = (getattr(cpu_node, "die_id", 0), cpu_node.cluster_id, cpu_node.cpu_id)
             self.sysreg[cpu_node.cpu_id] = {}
-            result = self.p.hv_start(self.entry, self.guest_base + self.bootargs_off)
+            if self.windows:
+                self.windows_fatal_lines = []
+                self.windows_exit_breaks = 0
+                self.windows_nvme_console = None
+                self.iface.tty_line_hook = self._windows_tty_line
+                result = self._windows_hv_start()
+            else:
+                result = self.p.hv_start(self.entry, self.guest_base + self.bootargs_off)
             if self.windows and self.windows_abort_reason is not None:
-                raise RuntimeError(f"Windows guest aborted: {self.windows_abort_reason}")
+                raise WindowsGuestAborted(f"Windows guest aborted: {self.windows_abort_reason}")
             return result
         finally:
             if restore is not None:
+                self.iface.tty_line_hook = None
                 self.started = False
                 self.iface.dev.timeout = restore[0]
                 signal.signal(signal.SIGINT, restore[1])

@@ -1115,8 +1115,12 @@ def test_run_guest_usb_order_and_refusals():
         t8152.index("windows_t8152_usb_attach(hv, usb_ports, ahci)") < \
         t8152.index("result = hv.start()") \
         < t8152.index("windows_t8152_usb_status(usb_ports)")
-    fail = t8152[t8152.index("except ProxyRemoteError as exc:\n        if usb_ports:"):]
-    assert "p.hv_windows_usb(USB_OP_DETACH)" in fail[:400]
+    # hv.start() failed, refused, or aborted on a forwarded exception: DETACH (skipped only
+    # when the carrier never finished the guest exit: the link then answers nothing).
+    fail = t8152[t8152.index("except (ProxyRemoteError, WindowsGuestAborted, "
+                             "WindowsGuestExitTimeout) as exc:"):]
+    fail = fail[fail.index("if usb_ports and not stuck:"):]
+    assert "p.hv_windows_usb(USB_OP_DETACH)" in fail[:200]
     plan = src[src.index("def windows_t8152_usb_plan"):src.index("def windows_t8152_usb_attach")]
     assert "w.parse_windows_usb(args.windows_usb)" in plan
     assert "w.validate_usb_request(ports, chosen.chip_id" in plan

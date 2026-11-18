@@ -708,6 +708,78 @@ static void reset_mid_command(void (*hook)(void), const char *expect)
     CHECK(strstr(sim_events(), expect) != NULL);
 }
 
+/*
+ * The fatal report's NVMe/AHCI activity record (hv_ahci_fatal_report, printed with every fatal
+ * report, a guest SError's included): taken by another CPU while CPU 0 is inside an NVMe write,
+ * then after it.  The session then ends the way the host ends it after a guest SError
+ * (EXC_RET.EXIT_GUEST: hv_start returns -1, the close runs) and must close CLEAN.
+ */
+static char fatal_text[8192], fatal_mid[8192];
+extern u64 sim_now; /* nvme_sim.c: the 1 MHz clock behind CNTPCT_EL0 */
+
+static void capture_fatal_report(char *out, size_t size)
+{
+    fflush(stdout);
+    int saved = dup(1);
+    FILE *tmp = tmpfile();
+    if (saved < 0 || !tmp) {
+        failures++;
+        return;
+    }
+    dup2(fileno(tmp), 1);
+    hv_ahci_fatal_report(sim_now, 1000000);
+    fflush(stdout);
+    dup2(saved, 1);
+    close(saved);
+    rewind(tmp);
+    size_t n = fread(out, 1, size - 1, tmp);
+    out[n] = 0;
+    fclose(tmp);
+}
+
+static void hook_fatal_report(void)
+{
+    stub_cpu = 7; /* the CPU that took the SError; CPU 0 holds the controller */
+    capture_fatal_report(fatal_mid, sizeof(fatal_mid));
+    stub_cpu = 0;
+}
+
+static void case_fatal_record_mid_command(void)
+{
+    session_setup(HV_AHCI_NVME_RW);
+    EQ(attach(), 0);
+    capture_fatal_report(fatal_text, sizeof(fatal_text));
+    CHECK(strstr(fatal_text, "AHCI NVMe backend ATTACHED") != NULL);
+    CHECK(strstr(fatal_text, "AHCI NVMe last command: none issued by the backend") != NULL);
+    enter();
+    random_traffic(60, 60, false);
+    hook_lba = 8 * (1 + rnd() % (sectors / 8 - 16));
+    sim_set_hook(sim_stats()->io_commands + 1, hook_fatal_report);
+    EQ(io(true, hook_lba, 64, false), 0); /* the report changes nothing: the write completes */
+    char want[160];
+    snprintf(want, sizeof(want), "write block %llu (partition +%llu), 8 block(s) on cpu 0",
+             (unsigned long long)(first + hook_lba / 8), (unsigned long long)(hook_lba / 8));
+    CHECK(strstr(fatal_mid, "AHCI NVMe backend RUNNING") != NULL);
+    CHECK(strstr(fatal_mid, "read-write, wrote 1, controller lock owner 0") != NULL);
+    CHECK(strstr(fatal_mid, "closing 0, fence set, session live") != NULL);
+    CHECK(strstr(fatal_mid, want) != NULL);
+    CHECK(strstr(fatal_mid, "IN FLIGHT (no completion yet)") != NULL);
+    capture_fatal_report(fatal_text, sizeof(fatal_text));
+    CHECK(strstr(fatal_text, "controller lock owner -1") != NULL);
+    CHECK(strstr(fatal_text, want) != NULL);
+    CHECK(strstr(fatal_text, ", ok\n") != NULL && !strstr(fatal_text, "IN FLIGHT"));
+    if (failures)
+        fprintf(stderr, "[%s] mid-command report:\n%s\nafter:\n%s\n", current, fatal_mid,
+                fatal_text);
+    leave(-1);
+    EQ(hv_ahci_nvme_state(), HV_AHCI_NVME_CLEAN);
+    capture_fatal_report(fatal_text, sizeof(fatal_text));
+    CHECK(strstr(fatal_text, "AHCI NVMe backend CLEAN") != NULL);
+    CHECK(strstr(fatal_text, "closing 1, fence clear, session down") != NULL);
+    invariants();
+    survives_power_cut(0, 0);
+}
+
 static void case_reset_other_cpu_mid_command(void)
 {
     reset_mid_command(hook_reset_other_cpu, "SC");
@@ -1058,6 +1130,7 @@ static const struct {
     {"reboot_after_failed_first_wake", case_reboot_after_failed_first_wake},
     {"multi_write_unverified", case_multi_write_unverified},
     {"force_reset_after_failed", case_force_reset_after_failed},
+    {"fatal_record_mid_command", case_fatal_record_mid_command},
 };
 
 /* ---- attach-only mode (GPT and inner-disk variants) -------------------------------------- */

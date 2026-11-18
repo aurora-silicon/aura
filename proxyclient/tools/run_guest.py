@@ -147,7 +147,7 @@ from aura.proxyutils import *
 from aura.utils import *
 from aura.shell import run_shell
 from aura.sysreg import *
-from aura.hv import HV
+from aura.hv import HV, WindowsGuestAborted, WindowsGuestExitTimeout
 from aura.hv.virtio import Virtio9PTransport
 from aura.hw.pmu import PMU
 
@@ -189,6 +189,21 @@ def no_timeout(call, *a):
         return call(*a)
     finally:
         iface.dev.timeout = timeout
+
+
+def bounded_timeout(seconds, call, *a):
+    """A resident op that may take long but must not hang the launcher: a finite link
+    timeout (UartTimeout past it) instead of no_timeout's None."""
+    timeout = iface.dev.timeout
+    iface.dev.timeout = seconds
+    try:
+        return call(*a)
+    finally:
+        iface.dev.timeout = timeout
+
+
+# DETACH retries the NVMe close: at most a 12 s lock wait, a 10 s flush and the shutdown.
+NVME_DETACH_TIMEOUT_S = 90
 
 
 def windows_t8152_ahci_plan(base, top, payload):
@@ -349,27 +364,44 @@ def windows_t8152_ahci_nvme_detach():
         pass
 
 
-def windows_t8152_ahci_nvme_close(result, ahci):
+def windows_t8152_ahci_nvme_close(result, ahci, hv=None):
     """After hv.start(): the resident closed the disk on its way out (CLEAN or FAILED).  DETACH
-    is idempotent and retries the shutdown of a FAILED close once.  True if a reset is safe."""
+    is idempotent and retries the shutdown of a FAILED close once.  True if a reset is safe.
+    Every read is bounded: a resident that does not answer gives the verdict UNKNOWN, never a
+    hang."""
     from aura import windows as w
     status = lambda name: p.hv_windows_ahci(w.AHCI_OP_NVME_STATUS, w.NVME_STATUS[name])
-    state = status("state")
-    if state != 3:
-        try:
-            no_timeout(p.hv_windows_ahci, w.AHCI_OP_DETACH)
-        except ProxyRemoteError:
-            pass
+    try:
         state = status("state")
-    print(f"T8152 AHCI NVMe: {status('commands')} commands, {status('failed_commands')} failed, "
-          f"{status('blocks_read') >> 8} MiB read, {status('blocks_written') >> 8} MiB written, "
-          f"{status('flushes')} flushes, {status('rmw')} RMW blocks; longest NVMe command "
-          f"{status('longest_us')} us, longest flush {status('longest_flush_us')} us; guard hits "
-          f"{status('guard_hits')}")
+        if state != 3:
+            try:
+                bounded_timeout(NVME_DETACH_TIMEOUT_S, p.hv_windows_ahci, w.AHCI_OP_DETACH)
+            except ProxyRemoteError:
+                pass
+            state = status("state")
+        counters = (f"{status('commands')} commands, {status('failed_commands')} failed, "
+                    f"{status('blocks_read') >> 8} MiB read, {status('blocks_written') >> 8} MiB "
+                    f"written, {status('flushes')} flushes, {status('rmw')} RMW blocks; longest "
+                    f"NVMe command {status('longest_us')} us, longest flush "
+                    f"{status('longest_flush_us')} us; guard hits {status('guard_hits')}")
+        wrote = status("wrote")
+    except (UartError, ProxyError) as exc:
+        print(f"\x1b[31mT8152 AHCI NVMe: UNKNOWN: the resident did not answer the close-state "
+              f"read ({exc!r}). Treat the disk as not closed: do not leave the proxy (no "
+              "P_REBOOT, no direct watchdog write through the proxy, no macvdmtool, no power "
+              "hold) until p.hv_windows_ahci(7, 0) reports 3 (CLEAN). If the M6 cannot be "
+              "reached any more, any reset risks the Windows partition: restore it from the "
+              "image or run chkdsk from WinPE before the next read-write session.\x1b[0m")
+        said = hv.windows_nvme_console if hv is not None else None
+        if said:
+            print(f"T8152 AHCI NVMe: the carrier's console last said: {said!r} (not re-read: "
+                  "the state may have changed since)")
+        return False
+    print(f"T8152 AHCI NVMe: {counters}")
     name = w.describe_nvme_state(state)
     if state == 3:
         print(f"T8152 AHCI NVMe: CLEAN: the controller confirmed its shutdown"
-              f"{' after this session wrote' if status('wrote') else ' (nothing written)'}. "
+              f"{' after this session wrote' if wrote else ' (nothing written)'}. "
               "A reset is safe now: through the carrier (P_REBOOT, i.e. "
               "tools/windows_nvme_gate.py exit, or --windows-reset-on-exit).")
         return True
@@ -381,6 +413,24 @@ def windows_t8152_ahci_nvme_close(result, ahci):
           "chkdsk from WinPE, and run the read-only checks of the D5 runbook from Linux "
           "afterwards.\x1b[0m")
     return False
+
+
+def windows_t8152_fatal_summary(hv):
+    """After an aborted session: the carrier's own fatal report (its guest SError report among
+    them) is in the console output above; repeat the lines that say what happened, so they
+    stand next to the disk verdict that follows."""
+    if hv.windows_abort_reason is not None:
+        print(f"T8152: the guest session was aborted on a forwarded exception: "
+              f"{hv.windows_abort_reason} (reason 2 = guest exception; code 3 = SError)")
+    lines = hv.windows_fatal_summary()
+    if not lines:
+        if hv.windows_abort_reason is not None:
+            print("T8152: the carrier printed no fatal report this session")
+        return
+    print(f"T8152: the carrier's fatal report ({len(hv.windows_fatal_lines)} lines above), "
+          "summary:")
+    for line in lines:
+        print(f"  {line}")
 
 
 def windows_t8152_usb_plan(payload, u):
@@ -781,31 +831,38 @@ def run_windows_t8152(caps):
         raise
     try:
         result = hv.start()
-    except ProxyRemoteError as exc:
-        if usb_ports:
+    except (ProxyRemoteError, WindowsGuestAborted, WindowsGuestExitTimeout) as exc:
+        # A failed or refused hv_start(), a session aborted on a forwarded exception (a guest
+        # SError: the carrier printed its report before forwarding it), or a carrier that never
+        # finished the exit.  Never a hang: every read below is bounded.
+        stuck = isinstance(exc, WindowsGuestExitTimeout)
+        windows_t8152_fatal_summary(hv)
+        if stuck:
+            print(f"\x1b[31mT8152: {exc}. The carrier may still be inside the guest exit; "
+                  "USB and input are left as they are.\x1b[0m")
+        if usb_ports and not stuck:
             # hv_start() tears USB down on every exit itself; DETACH is idempotent.
             try:
                 p.hv_windows_usb(USB_OP_DETACH)
-            except ProxyRemoteError:
+            except (ProxyError, UartError):
                 pass
-        if input_sources:
+        if input_sources and not stuck:
             # A pre-entry refusal (hv_t8152_verify, hv_ahci_verify, hv_input_verify) leaves the
             # input device attached and owning the vUART RX; DETACH works until guest entry.
             try:
                 p.hv_windows_input(INPUT_OP_DETACH)
-            except ProxyRemoteError:
+            except (ProxyError, UartError):
                 pass
         if nvme:
             # hv_start() closes the NVMe disk on every return itself, a failed or aborted session
             # included: report its counters and CLEAN or FAILED (with the matching exit advice),
-            # retrying the close once if it is not CLEAN.
-            try:
-                if windows_t8152_ahci_nvme_close(-1, ahci) and ahci["flags"] & 1:
-                    print("The NVMe disk closed CLEAN: leave the proxy through the carrier "
-                          "(tools/windows_nvme_gate.py exit).")
-            except ProxyRemoteError:
-                print("\x1b[31mT8152 AHCI NVMe: the close state could not be read: do not leave "
-                      "the proxy before p.hv_windows_ahci(7, 0) reports 3 (CLEAN).\x1b[0m")
+            # retrying the close once if it is not CLEAN; UNKNOWN if the resident does not answer.
+            if windows_t8152_ahci_nvme_close(-1, ahci, hv) and ahci["flags"] & 1:
+                print("The NVMe disk closed CLEAN: leave the proxy through the carrier "
+                      "(tools/windows_nvme_gate.py exit).")
+        if stuck:
+            sys.exit(f"Hypervisor exit did not finish: {exc}. Check the M6 (its console, the "
+                     "camera) before anything else.")
         sys.exit(f"Hypervisor refused or failed: {exc}. The aura proxy keeps running; "
                  "its console says why. USB and input (if any) were detached; a GPU "
                  "admission has no release and lasts until the carrier is reloaded.")
@@ -815,7 +872,7 @@ def run_windows_t8152(caps):
     windows_t8152_input_status(input_sources)
     clean = True
     if nvme:
-        clean = windows_t8152_ahci_nvme_close(result, ahci)
+        clean = windows_t8152_ahci_nvme_close(result, ahci, hv)
     elif ahci:
         windows_t8152_ahci_seal(result, ahci)
     if result == 2 and args.windows_reset_on_exit and not clean:

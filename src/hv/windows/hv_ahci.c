@@ -809,7 +809,7 @@ void hv_ahci_fatal_report(u64 now, u64 freq)
 
     printf("HV: fatal: AHCI guest RAM [0x%lx, 0x%lx), store [0x%lx, 0x%lx), %lu commands\n", ram_lo,
            ram_hi, store_base, window_top, model.stats.commands);
-    hv_ahci_nvme_fatal_report();
+    hv_ahci_nvme_fatal_report(now, freq);
     if (a.cntpct)
         printf("HV: fatal: AHCI last access: cpu %lu, %lu us ago, %s: %lu-byte %s ABAR+0x%lx "
                "value 0x%lx\n",

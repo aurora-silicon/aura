@@ -566,6 +566,11 @@ frame. The cause is not known. The carrier now prints a report before the host d
     and last saw its line.
   - GPU: state, ranges, handoff page and pool, the logging-hook hits and the last access.
   - Input: the counters, guest page accesses with the last one, and the last host-feed poll.
+  - With the D5 NVMe disk, AHCI NVMe: the backend state (ATTACHED, RUNNING, CLEAN, FAILED),
+    the partition and access mode, the controller lock owner, the AHCI and NVMe command
+    counts, the closing/fence/session flags, and the last NVMe command the backend issued
+    (read, write or flush; namespace block, partition offset, block count, CPU, age) with
+    "IN FLIGHT" while it has no completion, or its duration and result.
 - The guest x0-x30, SP_EL0 and SP_EL1.
 - Last, the attribution (`hv_serror.c`). It is circumstantial. It walks the guest's stage 1 in
   software (TTBR0/1_EL12 and TCR_EL12, descriptors read only from the guest RAM window, never
@@ -590,12 +595,44 @@ and its PA, SPSR, FAR, SP, x0-x30, the code around ELR). `run_guest.py --windows
 The SError is consumed by being taken, and the access that raised it is lost, so a continued
 session only collects more reports. The proxyclient must be from this branch for the host half.
 
+With the D5 NVMe disk (`j804-windows-nvme-serror`), an aborted session ends like any other
+`hv_start` return: the carrier joins the CPUs, tears USB down and closes the disk (CLOSE_PROXY:
+CLEAN or FAILED); an SError the host does not answer with EXIT_GUEST or HANDLED resets through
+`flush_and_reboot()`, which closes NVMe first or parks. The launcher side:
+
+- It keeps the carrier's `HV: fatal:` lines and, after the abort, prints the abort reason and a
+  summary of the report (the SError line, the verdict, the AHCI NVMe records, the attribution's
+  conclusion and CANDIDATEs), then the NVMe close report and its verdict: CLEAN, FAILED, or
+  UNKNOWN when the resident does not answer (with the last NVMe verdict line the carrier
+  printed on its console, if any).
+- It never waits unbounded after EXIT_GUEST. 2026-11-17, carrier 353b3cf5: after the forwarded
+  guest SError the carrier printed nothing for about 13 minutes, until ^C sent the proxy break;
+  then every CPU exited and the disk closed CLEAN. From the exit request on, the link timeout
+  is 60 s of silence (the NVMe close itself is bounded by a 12 s lock wait, a 10 s flush and
+  the shutdown, and prints as it goes). On silence the launcher sends the same break, at most
+  twice, and then gives up with "Hypervisor exit did not finish" and the UNKNOWN verdict. A
+  link that drops (a carrier reset after its NVMe close) ends the same way. The close report's
+  DETACH retry is bounded to 90 s. Why the carrier stalled until the break is not known.
+- `--windows-serror` and the D5 options (`--windows-ahci-backend nvme`,
+  `--windows-ahci-partition`, `--windows-ahci-nvme-access`) are independent and combine.
+
+Capabilities are unchanged by the SError work: `P_HV_WINDOWS_CAPS` = `0x4157494e0001ffdf`
+('AWIN', ABI 1, bits 0-4 and 6-15; bit 5 clear), `P_HV_WINDOWS_CAPS2` = `0x415749320000002f`
+('AWI2'; bit 0 D1 AHCI RAM store, 1 D4 USB, 2 G0 GPU, 3 I0 input, 5 D5 NVMe disk; bit 4
+reserved for GPU wave 2).
+
 Host tests: the `report_guest` and `report_return` cases of `windows_fatal_host.c` (the return
 fence comes before the ISR read, an exit's note clears the old return record, each verdict),
 `tests/e2e/windows_serror_host.c` (the stage-1 walk for 4 and 16 KiB granules, blocks, faults
 and reads that leave RAM; the load/store decode against assembler encodings; the
 classification; the report on a synthetic xHCI load), and `test_windows_t8152_serror_attr.py`
-for the source rules and the launcher policy.
+for the source rules and the launcher policy. With D5: the `fatal_record_mid_command` case of
+`windows_nvme_host.c` (the AHCI NVMe record taken by another CPU in the middle of a write, then
+after it, then a session ended as after an aborted SError, closing CLEAN and surviving a power
+cut), and `test_windows_t8152_nvme_serror.py`: the real UartInterface, AuraProxy and HV
+exception handling against a fake carrier on the wire (the 2026-11-17 stall with the EXIT
+answered or not, a dead carrier, a dropped link, a FAILED close, a normal exit), and run_guest's
+close and summary functions run unchanged.
 
 ## D4: USB keyboard and mouse (usb-drd1 xHCI passthrough)
 

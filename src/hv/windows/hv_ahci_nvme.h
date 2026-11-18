@@ -134,7 +134,12 @@ bool hv_ahci_nvme_reboot_allowed(bool force);
 u64 hv_ahci_nvme_status(u64 index);
 u64 hv_ahci_nvme_test(u64 rel_block, u64 count, u64 seed, u64 op);
 void hv_ahci_nvme_report(bool final);
-void hv_ahci_nvme_fatal_report(void);
+/*
+ * hv_fatal.c (via hv_ahci_fatal_report), every fatal report including a guest SError's: the
+ * backend state, controller lock owner, closing/fence/session flags, and the activity record:
+ * the last NVMe command (read/write/flush, block, count, CPU, age) and whether it is in flight.
+ */
+void hv_ahci_nvme_fatal_report(u64 now, u64 freq);
 
 /* The W0 pattern word (the launcher's tools reproduce it to check from Linux). */
 u64 hv_ahci_nvme_pattern(u64 seed, u64 rel_block, u32 word);

@@ -174,6 +174,10 @@ class UartInterface(Reloadable):
         self.dev.flushInput()
         self.pted = False
         self.tty_log = None
+        # Optional: called with each complete console line (bytes, no newline) that arrives
+        # between replies.  run_guest's T8152 path keeps the carrier's fatal report with it.
+        self.tty_line_hook = None
+        self._tty_line = bytearray()
         #d = self.dev.read(1)
         #while d != "":
             #d = self.dev.read(1)
@@ -234,6 +238,13 @@ class UartInterface(Reloadable):
             if self.tty_log:
                 self.tty_log.write(chr(c))
                 self.tty_log.flush()
+            hook = getattr(self, "tty_line_hook", None)
+            if hook is not None:
+                if c == 10:
+                    line, self._tty_line = bytes(self._tty_line), bytearray()
+                    hook(line)
+                elif len(self._tty_line) < 4096:
+                    self._tty_line.append(c)
 
     def ttymode(self, dev=None):
         if dev is None:
@@ -856,6 +867,21 @@ class AuraProxy(Reloadable):
         reply = self.iface.proxyreq(req, reboot=reboot, no_reply=no_reply, pre_reply=None)
         if no_reply or reboot and reply is None:
             return
+        return self._decode_reply(opcode, reply, reboot=reboot, signed=signed)
+
+    def resume_reply(self, opcode, skip=(), signed=False):
+        """Go on waiting for the reply to an `opcode` request whose wait ended in UartTimeout
+        (the request itself was sent).  Replies to the opcodes in `skip` (a nested request
+        whose own wait timed out, answered late) are read and dropped.  Exceptions and events
+        that arrive meanwhile go to their handlers, as during the original wait."""
+        while True:
+            reply = self.iface.reply(self.iface.REQ_PROXY)
+            rop = struct.unpack("<Q", reply[:8])[0]
+            if rop in skip and rop != opcode:
+                continue
+            return self._decode_reply(opcode, reply, signed=signed)
+
+    def _decode_reply(self, opcode, reply, reboot=False, signed=False):
         ret_fmt = "q" if signed else "Q"
         rop, status, retval = struct.unpack("<Qq" + ret_fmt, reply)
         if self.debug:

@@ -133,8 +133,10 @@ void hv_ahci_nvme_report(bool final)
 {
     (void)final;
 }
-void hv_ahci_nvme_fatal_report(void)
+void hv_ahci_nvme_fatal_report(u64 now, u64 freq)
 {
+    (void)now;
+    (void)freq;
 }
 bool ahci_nvme_begin(void *o, u64 lba, u32 count, bool write)
 {

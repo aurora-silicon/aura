@@ -51,7 +51,8 @@ CASES = ["attach_and_identify", "inner_gpt_read", "data_rmw", "guard_fuzz", "gua
          "reset_inside_controller_lock", "reset_lost_completion", "reset_shst_stuck_parks",
          "close_failed_then_retry", "quiesce_fails_after_commit", "slow_write_completion", "error_status_write",
          "second_attach", "proxy_and_reboot_rules", "gate_w0", "gate_w0_tail_rounding",
-         "reboot_after_failed_first_wake", "multi_write_unverified", "force_reset_after_failed"]
+         "reboot_after_failed_first_wake", "multi_write_unverified", "force_reset_after_failed",
+         "fatal_record_mid_command"]
 
 # Public type GUIDs (UEFI 2.10, Discoverable Partitions Specification, Apple, Microsoft).
 T_ISC = "69646961-6700-11AA-AA11-00306543ECAC"
@@ -613,7 +614,7 @@ def test_run_guest_nvme_options_and_refusals():
     assert exit_.index("elif nvme and not clean:") < exit_.rindex("leave the proxy through")
     # A session whose hv.start() raises still prints the close verdict (seen 2026-11-17).
     failed = exit_[exit_.index("result = hv.start()"):exit_.index('print(f"Guest exit status')]
-    assert "windows_t8152_ahci_nvme_close(-1, ahci)" in failed
+    assert "windows_t8152_ahci_nvme_close(-1, ahci, hv)" in failed
     for text in (RUN_GUEST, (REPO / "docs/windows-t8152.md").read_text()):
         assert "leave2.sh" not in text
     gate = (REPO / "proxyclient/tools/windows_nvme_gate.py").read_text()
