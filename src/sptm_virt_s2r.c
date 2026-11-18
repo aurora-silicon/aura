@@ -40,13 +40,13 @@
 #include "sptm_virt_priv.h"
 #include "sptm_virt_s2r_soc.h"
 #include "string.h"
+#include "tps6598x.h"
 #include "types.h"
 #include "uartproxy.h"
-#include "tps6598x.h"
 #include "usb.h"
-#include "wdt.h"
 #include "usb_cdc_atc.h"
 #include "utils.h"
+#include "wdt.h"
 #include "xnuboot.h"
 
 #define S2R_RING_BYTES     (8UL << 20)
@@ -105,19 +105,20 @@ volatile u64 sptm_virt_s2r_head; /* records ever appended */
 u32 sptm_virt_s2r_pages;         /* pages hooked */
 
 /* Set by the host before entry (run_guest_sptm.py). */
-u32 sptm_virt_s2r_quiesce;    /* S2R_QUIESCE_* */
-u32 sptm_virt_s2r_wake_s;     /* GO, timer-only sleep: PMU RTC alarm this many s after the commit */
-u32 sptm_virt_s2r_go_count;   /* GO, timer-only sleep: stop at the commit after this many wakes */
-u32 sptm_virt_s2r_crumbs;    /* go-mode experiments on J813, a bit mask: see s2r_crumb() */
-u32 sptm_virt_s2r_arm_s;     /* host: seconds from setup to the sleep rules (0: 45) */
+u32 sptm_virt_s2r_quiesce;  /* S2R_QUIESCE_* */
+u32 sptm_virt_s2r_wake_s;   /* GO, timer-only sleep: PMU RTC alarm this many s after the commit */
+u32 sptm_virt_s2r_go_count; /* GO, timer-only sleep: stop at the commit after this many wakes */
+u32 sptm_virt_s2r_crumbs;   /* go-mode experiments on J813, a bit mask: see s2r_crumb() */
+u32 sptm_virt_s2r_arm_s;    /* host: seconds from setup to the sleep rules (0: 45) */
 u32 sptm_virt_s2r_win[2];
 /* The wake core + 1 when it is to arm the stage 2 at its SPTM entry (option bit 256), else 0. */
 u32 sptm_virt_s2r_early_s2;
 /* host: extra registers read at the wake trap with option bit 512 (AURA_S2R_PROBE) */
 u64 sptm_virt_s2r_probe[4];
 u64 sptm_virt_s2r_prewrite[2];
-u64 sptm_virt_s2r_probe_at;    /* host: records before / after the first commit in the after-wake dump */
-u32 sptm_virt_s2r_usb_retake; /* 1: re-take the link after a wake; n > 1: also drop it n s in */
+/* host: records before / after the first commit in the after-wake dump */
+u64 sptm_virt_s2r_probe_at;
+u32 sptm_virt_s2r_usb_retake;   /* 1: re-take the link after a wake; n > 1: also drop it n s in */
 u32 sptm_virt_s2r_usb_delay_ms; /* delay from XNU's return to the re-take, 0 = default */
 u32 sptm_virt_s2r_cp_skip_ans;  /* T6050 COPROC: leave ANS's own pages unhooked */
 u32 sptm_virt_s2r_cp_ansx;      /* T6050 COPROC: S2R_CP_ANSX_* pages around ANS too */
@@ -328,8 +329,10 @@ static u64 s2r_dump_class(u64 from, u64 to, int pass)
         if (pass == 0)
             printf("S2A %lu %lx c%u W%u %lx %lx %lx\n", i, r->t, cpu, w, pa, r->val, r->pc);
         else
+            // clang-format off: it reads "ABCD"[pass] as a lambda and writes r->t as r -> t.
             printf("S2%c %lu %lx %c%u %lx %lx\n", "ABCD"[pass], i, r->t, wr ? 'W' : 'R', w, pa,
                    r->val);
+        // clang-format on
         n++;
     }
     return n;
@@ -842,7 +845,8 @@ bool sptm_virt_s2r_wfi(u64 *regs, u64 esr)
     printf("SPTM-virt[s2r]: macOS reached its final WFI on the S2R-timer core cpu%d; parked 0x%x; "
            "%lu records. Stopping in the proxy (stop mode).\n",
            cpu, s2r_parked_mask, sptm_virt_s2r_head);
-    sptm_virt_s2r_dump_prio(6000, 60000); /* whole classes, newest first: the proxy read-out fails with ten cores */
+    /* whole classes, newest first: the proxy read-out fails with ten cores */
+    sptm_virt_s2r_dump_prio(6000, 60000);
     struct uartproxy_msg_start start = {
         .reason = START_HV, .code = 0x53325221, /* 'S2R!' */
     };
@@ -987,7 +991,8 @@ static bool s2r_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int w
                  (addr & 0x7fff) == S2R_TIMER_OFF && s2r_armed();
     /* AURA_S2R_GO_COUNT here too (J813): after n go-mode wakes, the next commit stops like stop
      * mode, so the ring holds the sleep, the wake and the next entry for the proxy to read. */
-    if (timer && (!s2r_go || (sptm_virt_s2r_go_count && s2r_wake_count >= sptm_virt_s2r_go_count))) {
+    if (timer &&
+        (!s2r_go || (sptm_virt_s2r_go_count && s2r_wake_count >= sptm_virt_s2r_go_count))) {
         sptm_virt_rg_stop_wd2();
         sptm_virt_s2r_note(ctx, addr, *val, true, width);
         s2r_stop_before_timer(ctx, addr, *val);
@@ -1030,8 +1035,8 @@ static bool s2r_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int w
                 s2r_probe_one(sptm_virt_s2r_probe[i]);
         }
     }
-    bool cpustart = !strcmp(what, "pmgr-soc-misc") && (addr & 0xfffff) >= 0x34004 &&
-                    (addr & 0xfffff) < 0x34018;
+    bool cpustart =
+        !strcmp(what, "pmgr-soc-misc") && (addr & 0xfffff) >= 0x34004 && (addr & 0xfffff) < 0x34018;
     if (write && cpustart && *val && sptm_smp_crumbs)
         s2r_cpustart_watch(ctx, addr, *val);
     /* AURA_S2R_LIVE: the guest's writes to the hooked power blocks, as they happen, for a stall
@@ -1354,18 +1359,19 @@ static void s2r_hook_full(void)
             ADT_FOREACH_CHILD(adt, node)
             {
                 const char *name = adt_get_name(adt, node);
-                const char *what = (sptm_virt_s2r_extra & 0x10) && !strcmp(name, "aic")      ? "aic"
-                                   : (sptm_virt_s2r_extra & 0x20) && !strncmp(name, "dart-", 5) ? "dart"
-                                   : (sptm_virt_s2r_extra & 0x40) && !strncmp(name, "apcie", 5) ? "apcie"
-                                   : (sptm_virt_s2r_extra & 0x80) && !strcmp(name, "usb-drd0")
-                                       ? "usb0"
-                                       : NULL;
+                const char *what =
+                    (sptm_virt_s2r_extra & 0x10) && !strcmp(name, "aic")         ? "aic"
+                    : (sptm_virt_s2r_extra & 0x20) && !strncmp(name, "dart-", 5) ? "dart"
+                    : (sptm_virt_s2r_extra & 0x40) && !strncmp(name, "apcie", 5) ? "apcie"
+                    : (sptm_virt_s2r_extra & 0x80) && !strcmp(name, "usb-drd0")  ? "usb0"
+                                                                                 : NULL;
                 char path[48];
                 int p[8];
                 u64 pa, sz;
                 /* bit 8: each RTKit coprocessor's ASC page (CPU control at +0x44) */
                 if (!what && (sptm_virt_s2r_extra & 0x100) &&
-                    (s2r_cp_compat(node, "iop,ascwrap") || s2r_cp_compat(node, "iop-sep,ascwrap"))) {
+                    (s2r_cp_compat(node, "iop,ascwrap") ||
+                     s2r_cp_compat(node, "iop-sep,ascwrap"))) {
                     snprintf(path, sizeof(path), "/arm-io/%s", name);
                     if (adt_path_offset_trace(adt, path, p) >= 0 &&
                         adt_get_reg(adt, p, "reg", 0, &pa, &sz) >= 0)
@@ -1388,14 +1394,15 @@ static void s2r_hook_full(void)
     }
     /* The SMC's SRAM: its shared buffer is in there, and a key write's value only travels there. */
     if (sptm_virt_s2r_extra & 8)
-        /* Not in the ADT's /arm-io/smc reg list; from the Linux DT's "sram" (t8142-j813-j815.dtsi). */
+        /* Not in the ADT's /arm-io/smc reg list; from the Linux DT's "sram" (t8142-j813-j815.dtsi).
+         */
         s2r_hook_range("smc-sram", 0x38de00000UL, 0x120000);
     if (sptm_virt_s2r_extra & 4) {
         static const struct {
             const char *path, *what;
         } mb[] = {
-            {"/arm-io/aop", "aop-mbox"},       {"/arm-io/sio", "sio-mbox"},
-            {"/arm-io/ans", "ans-mbox"},       {"/arm-io/mtp", "mtp-mbox"},
+            {"/arm-io/aop", "aop-mbox"},         {"/arm-io/sio", "sio-mbox"},
+            {"/arm-io/ans", "ans-mbox"},         {"/arm-io/mtp", "mtp-mbox"},
             {"/arm-io/dcpext0", "dcpext0-mbox"}, {"/arm-io/dcpext1", "dcpext1-mbox"},
             {"/arm-io/gfx-asc", "gfx-mbox"},
         };
@@ -1714,7 +1721,7 @@ void sptm_virt_s2r_setup(bool cdc)
     }
     /* A timer-only sleep has no stop before the commit to read a ring from: keep it all. */
     /* With AURA_S2R_GO_COUNT the ring must hold a sleep, its wake and the next entry. */
-    u64 ring_bytes = s2r_soc->timer_only         ? S2R_RING_BYTES_BIG
+    u64 ring_bytes = s2r_soc->timer_only      ? S2R_RING_BYTES_BIG
                      : sptm_virt_s2r_go_count ? (48UL << 20)
                                               : S2R_RING_BYTES;
     if (!s2r_ring_alloc(ring_bytes)) {
@@ -1771,7 +1778,8 @@ void sptm_virt_s2r_setup(bool cdc)
         s2r_crumb(0x01);
         s2r_crumb_at(8, 0);
         s2r_crumb_at(9, 0);
-        printf("SPTM-virt[s2r]: crumbs in PMU scratch 0x830d: %s\n", s2r_crumb_dev ? "on" : "no SPMI");
+        printf("SPTM-virt[s2r]: crumbs in PMU scratch 0x830d: %s\n",
+               s2r_crumb_dev ? "on" : "no SPMI");
     }
 
     /* Each core's self-disable and the commit: a handful of accesses. */
@@ -1920,7 +1928,8 @@ static void s2r_aic_dump(const char *tag)
 }
 
 /* One AURA_S2R_PROBE read into the ring: bit 63 of the entry asks for a 64-bit read (the AMCC
- * takes only those from macOS), else 32-bit. Marker: low 32 address bits << 32 | low 32 value bits. */
+ * takes only those from macOS), else 32-bit. Marker: low 32 address bits << 32 | low 32 value bits.
+ */
 static void s2r_probe_one(u64 e)
 {
     u64 a = e & ~BIT(63);
@@ -2286,12 +2295,12 @@ static void s2r_usb_ring_drain(void)
     s2r_usb_ring_rp = rp + (w > 0 ? w : 0);
 }
 
-
 /* One port again after a sleep took its controller's power: the old device is dropped unstopped. */
 static bool s2r_reinit_hpm_match(char *hpm_path, void *data)
 {
     size_t len = strlen(hpm_path);
-    return len >= 4 && !memcmp(hpm_path + len - 4, "hpm", 3) && hpm_path[len - 1] - '0' == *(int *)data;
+    return len >= 4 && !memcmp(hpm_path + len - 4, "hpm", 3) &&
+           hpm_path[len - 1] - '0' == *(int *)data;
 }
 
 static int s2r_reinit_hpm_one(char *hpm_path, tps6598x_dev_t *tps, void *data)
