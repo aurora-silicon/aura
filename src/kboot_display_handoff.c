@@ -4374,6 +4374,31 @@ static void dcp6_t6050_internal(void *dt, const struct dcp6_t6050_engine *e)
         int panel = at < 0 ? at : fdt_subnode_offset(scratch, at, "panel");
         err = panel >= 0 && fdt_setprop_u32(scratch, panel, "apple,max-brightness", nits);
     }
+    /*
+     * The external engines run this stub's firmware too. The device tree enables them itself and
+     * names the build it was written for in apple,firmware-compat, which picks their method IDs:
+     * replace it with this boot's (same size, in place), and apple,firmware-version if present.
+     */
+    int ext = 0, at = -1;
+    fdt32_t ver[3];
+    for (int i = 0; i < 3; i++)
+        ver[i] = cpu_to_fdt32(i < (int)os_firmware.num_length ? os_firmware.num[i] : 0);
+    while (!err && (at = fdt_node_offset_by_compatible(scratch, at, "apple,t6050-dcpext")) >= 0) {
+        static const char *const props[] = {"apple,firmware-compat", "apple,firmware-version"};
+        bool set = false;
+
+        for (unsigned int i = 0; !err && i < ARRAY_SIZE(props); i++) {
+            int len;
+
+            if (!fdt_getprop(scratch, at, props[i], &len) || len != sizeof(ver))
+                continue;
+            err = fdt_setprop_inplace(scratch, at, props[i], ver, sizeof(ver));
+            set = set || !err;
+        }
+        ext += set;
+    }
+    /* Only -FDT_ERR_NOTFOUND is a walk's normal end: any other error changes nothing. */
+    err = err || at != -FDT_ERR_NOTFOUND;
     if (err)
         free(scratch);
     if (err || dcp6_commit(dt, scratch)) {
@@ -4382,8 +4407,8 @@ static void dcp6_t6050_internal(void *dt, const struct dcp6_t6050_engine *e)
     }
     printf("DCP: T6050: dcp (internal panel) handed off: vram 0x%lx+0x%lx reserved as its "
            "framebuffer; dcp, dart-dcp, dart-disp0, its mailbox, PMC metadata and the display "
-           "subsystem enabled; firmware %s\n",
-           vram, vram_size, os_firmware.string);
+           "subsystem enabled; firmware %s, also on %d external engine(s)\n",
+           vram, vram_size, os_firmware.string, ext);
     for (int i = 0; i < clk.n; i++)
         printf("DCP: T6050: dcp firmware clock %u: %u Hz\n", clk.id[i], clk.rate[i]);
     if (nits)
