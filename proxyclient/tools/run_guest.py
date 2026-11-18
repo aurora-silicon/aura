@@ -385,7 +385,9 @@ def windows_t8152_ahci_nvme_close(result, ahci, hv=None):
                     f"NVMe command {status('longest_us')} us, longest flush "
                     f"{status('longest_flush_us')} us; guard hits {status('guard_hits')}")
         wrote = status("wrote")
-    except (UartError, ProxyError) as exc:
+    except (UartError, ProxyError, OSError) as exc:
+        # OSError: pyserial's SerialException, the link itself is gone (a carrier reset after
+        # the close or a park, a watchdog bark, a cable pull): the verdict is UNKNOWN too.
         print(f"\x1b[31mT8152 AHCI NVMe: UNKNOWN: the resident did not answer the close-state "
               f"read ({exc!r}). Treat the disk as not closed: do not leave the proxy (no "
               "P_REBOOT, no direct watchdog write through the proxy, no macvdmtool, no power "
@@ -844,14 +846,14 @@ def run_windows_t8152(caps):
             # hv_start() tears USB down on every exit itself; DETACH is idempotent.
             try:
                 p.hv_windows_usb(USB_OP_DETACH)
-            except (ProxyError, UartError):
+            except (ProxyError, UartError, OSError):
                 pass
         if input_sources and not stuck:
             # A pre-entry refusal (hv_t8152_verify, hv_ahci_verify, hv_input_verify) leaves the
             # input device attached and owning the vUART RX; DETACH works until guest entry.
             try:
                 p.hv_windows_input(INPUT_OP_DETACH)
-            except (ProxyError, UartError):
+            except (ProxyError, UartError, OSError):
                 pass
         if nvme:
             # hv_start() closes the NVMe disk on every return itself, a failed or aborted session

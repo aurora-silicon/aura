@@ -1173,8 +1173,9 @@ class HV(Reloadable):
                          f"{self.WINDOWS_EXIT_QUIET_S} s after the host asked it to exit the "
                          f"guest; sending the proxy break ('!', as ^C does) "
                          f"{n}/{self.WINDOWS_EXIT_BREAKS}")
-                self.iface.dev.write(b"!")
             try:
+                if timed_out:
+                    self.iface.dev.write(b"!")
                 return self.p.resume_reply(self.p.P_HV_START, skip=(self.p.P_EXIT,))
             except UartTimeout:
                 timed_out = True
@@ -2793,10 +2794,21 @@ class HV(Reloadable):
             return result
         finally:
             if restore is not None:
-                self.iface.tty_line_hook = None
-                self.started = False
-                self.iface.dev.timeout = restore[0]
-                signal.signal(signal.SIGINT, restore[1])
-                signal.signal(signal.SIGQUIT, restore[2])
+                self._windows_start_finish(restore)
+
+    def _windows_start_finish(self, restore):
+        """start()'s cleanup for a Windows guest.  It never raises: on a link that went away
+        (a carrier reset, a cable pull) pyserial's timeout setter reconfigures the dead port and
+        raises SerialException, which would replace start()'s own exception (the exit timeout
+        run_guest turns into the NVMe verdict)."""
+        self.iface.tty_line_hook = None
+        self.started = False
+        signal.signal(signal.SIGINT, restore[1])
+        signal.signal(signal.SIGQUIT, restore[2])
+        try:
+            self.iface.dev.timeout = restore[0]
+        except OSError as exc:
+            self.log(f"Windows guest exit: could not restore the link timeout ({exc!r}); the "
+                     "link to the carrier is probably gone")
 
 from .. import trace

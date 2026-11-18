@@ -18,6 +18,7 @@ unchanged (extracted from its source).
 """
 import ast
 import io
+import signal
 import struct
 import sys
 import types
@@ -66,12 +67,15 @@ class FakeCarrier:
       exit_then_silent: answers EXIT, then nothing until the break (the 2026-11-17 hang);
       exit_unanswered:  the EXIT itself is answered only after the break;
       dead:             nothing after the forwarded exception, breaks included;
-      link_drop:        the USB link goes away after the EXIT (a carrier reset);
+      link_drop:        the USB link goes away after the EXIT (a carrier reset after its
+                        close line);
+      drop_on_break:    the EXIT is answered, then silence; the link is gone when the
+                        launcher sends the break;
       normal:           no exception: hv_start returns SYSTEM_OFF."""
 
     def __init__(self, mode, nvme_state=3, answers_status=True):
         self.mode = mode
-        self.timeout = None
+        self._timeout = None
         self.out = bytearray()
         self.inbuf = bytearray()
         self.breaks = 0
@@ -84,6 +88,17 @@ class FakeCarrier:
         self.checksum = UartInterface.checksum.__get__(self)
 
     # pyserial surface used by UartInterface
+    @property
+    def timeout(self):
+        return self._timeout
+
+    @timeout.setter
+    def timeout(self, value):
+        # pyserial reconfigures an open port (tcgetattr) on every timeout change.
+        if self.dropped:
+            raise OSError("Could not configure port: device disconnected")
+        self._timeout = value
+
     def flushOutput(self):
         pass
 
@@ -91,7 +106,7 @@ class FakeCarrier:
         pass
 
     def read(self, n):
-        if self.dropped:
+        if self.dropped and not self.out:
             raise OSError("device disconnected")
         if not self.out:
             if self.timeout is None:
@@ -104,10 +119,15 @@ class FakeCarrier:
         return data
 
     def write(self, data):
+        if self.dropped:
+            raise OSError("write failed: device disconnected")
         self.inbuf += data
         while self.inbuf:
             if self.inbuf[:1] == b"!":
                 del self.inbuf[:1]
+                if self.mode == "drop_on_break":
+                    self.dropped = True
+                    raise OSError("write failed: device disconnected")
                 self.on_break()
                 continue
             if len(self.inbuf) < 64:
@@ -156,6 +176,8 @@ class FakeCarrier:
             else:
                 self.proxy_reply(opcode)
             if self.mode == "link_drop":
+                # The carrier closed the disk, reset, and the USB device went away.
+                self.console(EXIT_LINES)
                 self.dropped = True
         elif opcode == AuraProxy.P_HV_WINDOWS_AHCI:
             if self.mode == "dead" or not self.answers_status:
@@ -204,6 +226,7 @@ def make_hv(mode, **kw):
     # As HV.start() does around hv_start for a Windows guest.
     iface.tty_line_hook = hv._windows_tty_line
     dev.timeout = None
+    hv.restore = (3, signal.getsignal(signal.SIGINT), signal.getsignal(signal.SIGQUIT))
     return hv, dev, lines
 
 
@@ -222,10 +245,11 @@ def run_guest_functions(p, iface):
     return ns
 
 
-def after_start(hv, dev, timeout=3):
-    """run_guest after hv.start() raised: HV.start()'s finally restored the link timeout."""
-    dev.timeout = timeout
-    hv.iface.tty_line_hook = None
+def after_start(hv, dev):
+    """run_guest after hv.start() raised: first HV.start()'s finally (it restores the link
+    timeout, 3 s here, and must not raise on a dead link)."""
+    hv._windows_start_finish(hv.restore)
+    assert hv.iface.tty_line_hook is None
     rg = run_guest_functions(hv.p, hv.iface)
     out = io.StringIO()
     with redirect_stdout(out):
@@ -293,11 +317,41 @@ def test_failed_close_is_reported_failed():
     assert verdict is False and "FAILED: the controller did NOT confirm its shutdown" in out
 
 
-def test_link_drop_after_the_exit_is_an_exit_timeout():
-    hv, dev, _ = make_hv("link_drop")
+@pytest.mark.parametrize("mode,said", [("link_drop", True), ("drop_on_break", False)])
+def test_link_drop_after_the_exit_ends_in_unknown(mode, said):
+    # A carrier reset (flush_and_reboot after its close or park, a watchdog bark) or a cable
+    # pull: pyserial raises SerialException (an OSError) on every read, write and timeout
+    # change.  The launcher must still print the disk verdict, never a traceback.
+    hv, dev, lines = make_hv(mode)
     with redirect_stdout(io.StringIO()):
         with pytest.raises(WindowsGuestExitTimeout, match="link to the carrier failed"):
             hv._windows_hv_start()
+    assert dev.dropped and not dev.waited_unbounded
+    assert hv.windows_exit_breaks == (1 if mode == "drop_on_break" else 0)
+    verdict, out = after_start(hv, dev)
+    assert any("could not restore the link timeout" in l for l in lines)
+    assert verdict is False
+    assert "guest SError on cpu 6" in out
+    assert "T8152 AHCI NVMe: UNKNOWN" in out and "do not leave the proxy" in out
+    assert "OSError(" in out
+    assert ("the carrier's console last said: 'HV: T8152: AHCI NVMe: guest session failed, "
+            "aborted or refused: CLEAN" in out) == said
+    assert "T8152 AHCI NVMe: CLEAN" not in out
+
+
+def test_start_cleanup_restores_signals_on_a_dead_link():
+    hv, dev, lines = make_hv("link_drop")
+    dev.dropped = True
+    marker = lambda *a: None
+    old = signal.signal(signal.SIGINT, marker)
+    try:
+        hv.iface.tty_line_hook = hv._windows_tty_line
+        hv._windows_start_finish(hv.restore)  # must not raise
+        assert signal.getsignal(signal.SIGINT) is hv.restore[1]
+    finally:
+        signal.signal(signal.SIGINT, old)
+    assert hv.iface.tty_line_hook is None and hv.started is False
+    assert any("could not restore the link timeout" in l for l in lines)
 
 
 def test_without_the_bound_the_launcher_would_hang():
@@ -330,6 +384,16 @@ def test_continue_policy_does_not_bound_the_session():
 def test_start_and_run_guest_wiring():
     hvsrc = (REPO / "proxyclient/aura/hv/__init__.py").read_text()
     start = hvsrc[hvsrc.index("    def start(self):"):]
+    assert "self._windows_start_finish(restore)" in start
+    finish = start[start.index("    def _windows_start_finish("):]
+    finish = finish[:finish.index("\nfrom .. import trace")]
+    assert finish.index("signal.signal(signal.SIGQUIT") < finish.index("try:") < \
+        finish.index("self.iface.dev.timeout = restore[0]") < finish.index("except OSError")
+    wait = hvsrc[hvsrc.index("    def _windows_wait_guest_exit("):]
+    wait = wait[:wait.index("\n    def ", 10)]
+    # The break is written inside the try whose OSError becomes WindowsGuestExitTimeout.
+    assert wait.index("try:") < wait.index('self.iface.dev.write(b"!")') < \
+        wait.index("except OSError")
     assert start.index("self.iface.tty_line_hook = self._windows_tty_line") < \
         start.index("result = self._windows_hv_start()") < \
         start.index("raise WindowsGuestAborted(") < start.index("self.iface.tty_line_hook = None")
@@ -385,6 +449,9 @@ def test_carrier_serror_report_carries_the_nvme_record_and_keeps_the_close():
         b = _body(glue, fn)
         assert b.index("nvme_lock_acquire(") < b.index("act_begin(") < b.index("act_end(") < \
             b.index("nvme_lock_release();")
+        # A call refused because a close is in progress sends no NVMe command: no record.
+        assert "!closing &&" not in b
+        assert b.index("if (!closing) {") < b.index("act_begin(")
     # The SError's own path: EXIT_GUEST returns from hv_start (whose return closes the disk);
     # anything else resets through flush_and_reboot, which closes NVMe first or parks.
     exc = (win / "hv_exc.c").read_text()

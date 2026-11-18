@@ -642,7 +642,7 @@ def test_run_guest_input_order_and_refusals():
     start_fail = start_fail[:start_fail.index("sys.exit(f\"Hypervisor refused")]
     assert "if input_sources and not stuck:" in start_fail
     assert start_fail.index("p.hv_windows_input(INPUT_OP_DETACH)") < \
-        start_fail.index("except (ProxyError, UartError):", start_fail.index("INPUT_OP_DETACH"))
+        start_fail.index("except (ProxyError, UartError, OSError):", start_fail.index("INPUT_OP_DETACH"))
     assert "INPUT_OP_DETACH" in t8152[:t8152.index("hv.init()")]
     tail = src.split("_windows_caps = windows_resident_caps()", 1)[1]
     assert "args.windows_input not in ('off', 'disabled')" in tail

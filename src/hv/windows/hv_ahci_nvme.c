@@ -48,7 +48,8 @@ static bool closed_without_lock;
 
 /*
  * Activity record for the fatal report (hv_fatal.h seqlock): the backend's last NVMe command,
- * written by the CPU that holds the controller lock.  `done` is 0 while the command is in
+ * written by the CPU that holds the controller lock.  A call refused because a close is in
+ * progress sends no NVMe command and is not recorded here; the AHCI command it served fails.  `done` is 0 while the command is in
  * flight.  A guest SError, a panic or a watchdog bark then says whether the controller was
  * busy, with what and on which CPU.
  */
@@ -107,9 +108,12 @@ static bool dev_read(void *opaque, u64 block, u32 count, void *buf)
     if (!nvme_lock_acquire(LOCK_WAIT_US))
         return false;
     u64 start = mrs(CNTPCT_EL0);
-    act_begin('R', block, count, start);
-    bool ok = !closing && nvme_read_blocks(NSID, block, buf, count);
-    act_end(ok);
+    bool ok = false;
+    if (!closing) {
+        act_begin('R', block, count, start);
+        ok = nvme_read_blocks(NSID, block, buf, count);
+        act_end(ok);
+    }
     timed(start, false);
     nvme_lock_release();
     return ok;
@@ -121,9 +125,12 @@ static bool dev_write(void *opaque, u64 block, u32 count, const void *buf)
     if (!nvme_lock_acquire(LOCK_WAIT_US))
         return false;
     u64 start = mrs(CNTPCT_EL0);
-    act_begin('W', block, count, start);
-    bool ok = !closing && nvme_write_blocks(NSID, block, buf, count);
-    act_end(ok);
+    bool ok = false;
+    if (!closing) {
+        act_begin('W', block, count, start);
+        ok = nvme_write_blocks(NSID, block, buf, count);
+        act_end(ok);
+    }
     timed(start, false);
     nvme_lock_release();
     return ok;
@@ -135,9 +142,12 @@ static bool dev_flush(void *opaque)
     if (!nvme_lock_acquire(LOCK_WAIT_US))
         return false;
     u64 start = mrs(CNTPCT_EL0);
-    act_begin('F', 0, 0, start);
-    bool ok = !closing && nvme_flush(NSID);
-    act_end(ok);
+    bool ok = false;
+    if (!closing) {
+        act_begin('F', 0, 0, start);
+        ok = nvme_flush(NSID);
+        act_end(ok);
+    }
     timed(start, true);
     nvme_lock_release();
     return ok;
