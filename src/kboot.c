@@ -5373,9 +5373,12 @@ static bool dt_j713_dcpext_powered(const char *alias)
 /*
  * J713: iBoot starts both external DCPs and leaves them quiesced, as it does the internal one,
  * with their DARTs set up. Reserve their firmware memory and mark each
- * apple,t8132-dcpext node ready for the kernel to adopt the running controller. Only with the
- * boot.bin config line chosen.asahi,j713-dcpext=1, only after the internal DCP was handed over
- * (an external DCP must never cost the panel), and only for a controller iBoot left powered.
+ * apple,t8132-dcpext node ready for the kernel to adopt the running controller. On by default
+ * wherever the tree describes the controller, unless a config line was lost; the boot.bin config
+ * line chosen.asahi,j713-dcpext=0 turns it off (any value other than 1 does). Only after the
+ * internal DCP was handed over (an external DCP must never cost the panel), only for an
+ * apple,t8132-dcpext node, and only for a controller iBoot left powered. Those are the hardware's
+ * conditions, so the board is not checked.
  */
 static void dt_reserve_j713_dcpext(void)
 {
@@ -5383,8 +5386,12 @@ static void dt_reserve_j713_dcpext(void)
     int len = 0;
     const char *opt = chosen < 0 ? NULL : fdt_getprop(dt, chosen, "asahi,j713-dcpext", &len);
     int dcp = fdt_path_offset(dt, "dcp");
-    bool armed = opt && len == 2 && opt[0] == '1' && opt[1] == '\0' && dcp >= 0 &&
-                 fdt_getprop(dt, dcp, "apple,firmware-uuid", NULL);
+    /*
+     * Without a config line the external displays are handed over, unless a line was lost (an
+     * owner's =0 may be among them); with one, only "1" arms.
+     */
+    bool wanted = opt ? len == 2 && opt[0] == '1' && opt[1] == '\0' : !chosen_lost;
+    bool armed = wanted && dcp >= 0 && fdt_getprop(dt, dcp, "apple,firmware-uuid", NULL);
 
     for (size_t n = 0; n < ARRAY_SIZE(dcpext_aliases); n++) {
         const char *alias = dcpext_aliases[n];
@@ -5399,8 +5406,8 @@ static void dt_reserve_j713_dcpext(void)
             continue;
         }
         if (!armed) {
-            printf("FDT: '%s' firmware not reserved (needs chosen.asahi,j713-dcpext=1 and the "
-                   "internal display handoff); kernel gate remains closed\n",
+            printf("FDT: '%s' firmware not reserved (off by chosen.asahi,j713-dcpext, a lost "
+                   "config line, or no internal display handoff); kernel gate remains closed\n",
                    alias);
             continue;
         }
