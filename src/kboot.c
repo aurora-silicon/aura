@@ -4358,7 +4358,7 @@ static int dt_reserve_asc_firmware(const char *adt_path, const char *adt_path_al
  */
 static const char *const ave_compatibles[] = {
     "apple,t6000-ave", "apple,t8112-ave", "apple,t8140-ave", "apple,t6041-ave",
-    "apple,t6050-ave", "apple,t8132-ave", "apple,t8142-ave",
+    "apple,t6050-ave", "apple,t8132-ave", "apple,t8142-ave", "apple,t6021-ave",
 };
 
 /*
@@ -4528,10 +4528,43 @@ static int dt_t8140_ave_enable(u32 self)
     return dt_power_chain_enable(&walk, self);
 }
 
+/* The ADT DART that translates the encoder at @ave_path. */
+static const char *dt_ave_paired_dart(const char *ave_path)
+{
+    if (!strcmp(ave_path, "/arm-io/ave"))
+        return "/arm-io/dart-ave";
+    if (!strcmp(ave_path, "/arm-io/ave0"))
+        return "/arm-io/dart-ave0";
+    if (!strcmp(ave_path, "/arm-io/ave1"))
+        return "/arm-io/dart-ave1";
+    return NULL;
+}
+
+/* aurora,crc32 on one reservation. A shared TEXT segment keeps the first value. */
+static int dt_ave_stamp_crc(const char *name, const char *value)
+{
+    int resv = fdt_path_offset(dt, "/reserved-memory");
+    int node;
+    const char *have;
+
+    if (resv < 0)
+        return -1;
+    node = fdt_subnode_offset(dt, resv, name);
+    if (node < 0)
+        return -1;
+    have = fdt_getprop(dt, node, "aurora,crc32", NULL);
+    if (have) {
+        if (strcmp(have, value))
+            printf("FDT: AVE: %s aurora,crc32 is %s, this segment is %s\n", name, have, value);
+        return 0;
+    }
+    return fdt_setprop_string(dt, node, "aurora,crc32", value);
+}
+
 /*
  * The node is found again by its compatible after each edit, never by its path: on T6050 "/soc"
- * resolves to /soc@200000000, a sibling of the /soc that holds the encoder. On T8140, whose two
- * encoders share a compatible, it is found by @phandle instead; elsewhere @phandle is 0.
+ * resolves to /soc@200000000, a sibling of the /soc that holds the encoder. On T8140 and T6021,
+ * whose encoders share a compatible, it is found by @phandle instead; elsewhere @phandle is 0.
  */
 static int dt_set_ave_node(int node, const char *compat, u32 phandle)
 {
@@ -4541,10 +4574,18 @@ static int dt_set_ave_node(int node, const char *compat, u32 phandle)
 
     const char *reason = "invalid ADT firmware segments";
     bool t8140 = !fdt_node_check_compatible(dt, node, "apple,t8140-ave");
+    bool t6021 = !fdt_node_check_compatible(dt, node, "apple,t6021-ave");
     const char *adt_path = "/arm-io/ave";
+    const char *dart_path = NULL;
     int anode;
-    if (t8140) {
+
+    /* J414c and J416c describe the encoders disabled. Do not hand those over. */
+    if (t6021 && dt_ave_node_disabled(node))
+        return 0;
+    if (t8140 || t6021) {
         adt_path = dt_t8140_ave_adt_path(node);
+        if (t6021)
+            dart_path = adt_path ? dt_ave_paired_dart(adt_path) : NULL;
         anode = adt_path ? adt_path_offset(adt, adt_path) : -1;
     } else {
         anode = adt_path_offset(adt, adt_path);
@@ -4630,13 +4671,15 @@ static int dt_set_ave_node(int node, const char *compat, u32 phandle)
                      !fdt_node_check_compatible(dt, node, "apple,t8132-ave") ||
                      !fdt_node_check_compatible(dt, node, "apple,t8142-ave");
     /*
-     * On T8112 the encoder's DART window starts at the DART's vm-base: iBoot points the
-     * coprocessor code base there, and the firmware addresses DATA at vm-base plus its
-     * offset. Hand both segments over at vm-base + iova-offset.
+     * On T8112 and T6021 the encoder's DART window starts at the DART's vm-base: iBoot
+     * points the coprocessor code base there, and the firmware addresses DATA at vm-base
+     * plus its offset. Hand both segments over at vm-base + iova-offset. T8112 has one
+     * DART. T6021 reads the base from the DART paired with this encoder by MMIO address.
      */
     u64 dva_base = 0;
-    if (!fdt_node_check_compatible(dt, node, "apple,t8112-ave")) {
-        int dnode = adt_path_offset(adt, "/arm-io/dart-ave");
+    if (!fdt_node_check_compatible(dt, node, "apple,t8112-ave") || t6021) {
+        const char *dart = t6021 ? dart_path : "/arm-io/dart-ave";
+        int dnode = dart ? adt_path_offset(adt, dart) : -1;
         u32 vlen = 0;
         const void *vprop = dnode < 0 ? NULL : adt_getprop(adt, dnode, "vm-base", &vlen);
 
@@ -4661,10 +4704,33 @@ static int dt_set_ave_node(int node, const char *compat, u32 phandle)
     }
     for (size_t i = 0; i < count; i++) {
         char prop[48], value[9];
+        int chosen;
+
         snprintf(prop, sizeof(prop), "aurora,ave-%s-crc32", normalized[i]);
         snprintf(value, sizeof(value), "%08x", crcs[i]);
-        int chosen = fdt_path_offset(dt, "/chosen");
-        if (chosen < 0 || fdt_setprop_string(dt, chosen, prop, value)) {
+        /*
+         * Two T6021 encoders share TEXT and have different DATA images, so
+         * each reservation carries its own CRC. /chosen keeps the first
+         * encoder's value as the fallback for a one-encoder hand-off.
+         */
+        if (t6021) {
+            char name[64];
+
+            snprintf(name, sizeof(name), "asc-firmware@%lx", seg[i].phys);
+            if (dt_ave_stamp_crc(name, value)) {
+                reason = "CRC export failed";
+                goto disable;
+            }
+        }
+        /* Stamping a reservation moves every node after it: find /chosen afterwards. */
+        chosen = fdt_path_offset(dt, "/chosen");
+        if (chosen < 0) {
+            reason = "CRC export failed";
+            goto disable;
+        }
+        if (t6021 && fdt_getprop(dt, chosen, prop, NULL))
+            continue;
+        if (fdt_setprop_string(dt, chosen, prop, value)) {
             reason = "CRC export failed";
             goto disable;
         }
@@ -4685,6 +4751,8 @@ static int dt_set_ave_node(int node, const char *compat, u32 phandle)
             goto disable;
         }
         printf("FDT: AVE %s enabled from ADT %s\n", path, adt_path);
+    } else if (t6021) {
+        printf("FDT: AVE %s from ADT %s\n", path, adt_path);
     }
     return 0;
 
@@ -4693,15 +4761,18 @@ disable:
                    : fdt_node_offset_by_compatible(dt, -1, compat);
     if (node >= 0 && fdt_setprop_string(dt, node, "status", "disabled"))
         return -1;
-    if (t8140)
+    if (t8140 || t6021)
         printf("FDT: AVE %s disabled: %s\n", path, reason);
     else
         printf("FDT: AVE disabled: %s\n", reason);
     return 0;
 }
 
-/* Every T8140 encoder node, each found by its phandle: handing one over moves the others. */
-static int dt_set_t8140_aves(void)
+/*
+ * Every encoder of one compatible, each found by its phandle: handing one over moves the
+ * others. Two is the most a SoC in this tree describes.
+ */
+static int dt_set_ave_by_phandle(const char *compat)
 {
     u32 phandles[2];
     size_t count;
@@ -4712,8 +4783,8 @@ static int dt_set_t8140_aves(void)
     do {
         edited = false;
         count = 0;
-        for (int node = fdt_node_offset_by_compatible(dt, -1, "apple,t8140-ave"); node >= 0;
-             node = fdt_node_offset_by_compatible(dt, node, "apple,t8140-ave")) {
+        for (int node = fdt_node_offset_by_compatible(dt, -1, compat); node >= 0;
+             node = fdt_node_offset_by_compatible(dt, node, compat)) {
             u32 ph = fdt_get_phandle(dt, node);
             if (!ph) {
                 if (fdt_generate_phandle(dt, &ph) || fdt_setprop_u32(dt, node, "phandle", ph))
@@ -4723,13 +4794,15 @@ static int dt_set_t8140_aves(void)
             }
             if (count < ARRAY_SIZE(phandles))
                 phandles[count++] = ph;
+            else
+                printf("FDT: AVE: ignoring extra %s node\n", compat);
         }
     } while (edited);
 
     for (size_t i = 0; i < count && !ret; i++) {
         int node = fdt_node_offset_by_phandle(dt, phandles[i]);
         if (node >= 0)
-            ret = dt_set_ave_node(node, "apple,t8140-ave", phandles[i]);
+            ret = dt_set_ave_node(node, compat, phandles[i]);
     }
     return ret;
 }
@@ -4740,8 +4813,9 @@ static int dt_set_ave(void)
         int node = fdt_node_offset_by_compatible(dt, -1, ave_compatibles[i]);
         if (node < 0)
             continue;
-        if (!strcmp(ave_compatibles[i], "apple,t8140-ave"))
-            return dt_set_t8140_aves();
+        if (!strcmp(ave_compatibles[i], "apple,t8140-ave") ||
+            !strcmp(ave_compatibles[i], "apple,t6021-ave"))
+            return dt_set_ave_by_phandle(ave_compatibles[i]);
         return dt_set_ave_node(node, ave_compatibles[i], 0);
     }
     return 0;
