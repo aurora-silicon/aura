@@ -361,6 +361,17 @@ def env_int(name, default=0):
     return int(value, 0) if value else default
 
 
+def validate_j613_go():
+    recovery = env_int("AURA_J613_RECOVERY_SECS", 30)
+    crumbs = env_int("AURA_S2R_CRUMBS")
+    wake_s = env_int("AURA_S2R_WAKE_S")
+    wake_source = env_on("AURA_J613_PHYSICAL_WAKE") or wake_s > 0
+    if not (env_on("AURA_S2R_TRACE") and env_on("AURA_S2R_DROP_USB") and
+            env_int("AURA_S2R_USB_RETAKE") and recovery == 0 and crumbs >= 3 and wake_source):
+        raise SystemExit("J613 GO requires TRACE, DROP_USB, USB_RETAKE, CRUMBS>=3, "
+                         "RECOVERY_SECS=0, and PHYSICAL_WAKE=1 or WAKE_S>0")
+
+
 def post_entry_drain_needed(iface):
     """A device-side USB serial endpoint can stop accepting OUT as the guest enters."""
     if iface.is_kis:
@@ -893,14 +904,7 @@ def main():
         if env_on("AURA_S2R_LATE_STOP") and (not env_on("AURA_S2R_TRACE") or j613_go):
             raise SystemExit("J613: AURA_S2R_LATE_STOP requires stop-mode AURA_S2R_TRACE")
         if j613_go:
-            recovery = int(os.environ.get("AURA_J613_RECOVERY_SECS", "30"), 0)
-            crumbs = int(os.environ.get("AURA_S2R_CRUMBS", "0"), 0)
-            if not (env_on("AURA_S2R_TRACE") and env_on("AURA_S2R_DROP_USB") and
-                    env_on("AURA_J613_PHYSICAL_WAKE") and
-                    int(os.environ.get("AURA_S2R_USB_RETAKE", "0"), 0) and
-                    recovery == 0 and crumbs >= 3 and not os.environ.get("AURA_S2R_WAKE_S")):
-                raise SystemExit("J613 GO requires TRACE, DROP_USB, PHYSICAL_WAKE, USB_RETAKE, "
-                                 "CRUMBS>=3, RECOVERY_SECS=0, and no unproven RTC wake")
+            validate_j613_go()
         # Deliberately before reading images or placing anything on the target.
         try:
             sptm_j613.patch_plan(None, None)

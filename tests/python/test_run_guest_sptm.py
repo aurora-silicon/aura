@@ -112,3 +112,34 @@ def test_go_wake_alarm_covers_non_timer_commit():
     help_text = (REPO / "proxyclient/tools/run_guest_sptm.py").read_text()
     line = next(line for line in help_text.splitlines() if "AURA_S2R_WAKE_S=<s>" in line)
     assert "timer-only" not in line
+
+
+def test_j613_go_accepts_rtc_wake_without_physical_wake(monkeypatch):
+    runner = load_runner()
+    for name, value in {
+        "AURA_S2R_TRACE": "1",
+        "AURA_S2R_DROP_USB": "1",
+        "AURA_S2R_USB_RETAKE": "1",
+        "AURA_S2R_CRUMBS": "3",
+        "AURA_J613_RECOVERY_SECS": "0",
+        "AURA_S2R_WAKE_S": "30",
+    }.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.delenv("AURA_J613_PHYSICAL_WAKE", raising=False)
+    runner.validate_j613_go()
+
+
+def test_j613_go_still_requires_a_wake_source(monkeypatch):
+    runner = load_runner()
+    for name, value in {
+        "AURA_S2R_TRACE": "1",
+        "AURA_S2R_DROP_USB": "1",
+        "AURA_S2R_USB_RETAKE": "1",
+        "AURA_S2R_CRUMBS": "3",
+        "AURA_J613_RECOVERY_SECS": "0",
+    }.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.delenv("AURA_J613_PHYSICAL_WAKE", raising=False)
+    monkeypatch.delenv("AURA_S2R_WAKE_S", raising=False)
+    with pytest.raises(SystemExit, match="PHYSICAL_WAKE=1 or WAKE_S>0"):
+        runner.validate_j613_go()
