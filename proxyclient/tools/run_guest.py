@@ -364,12 +364,15 @@ def windows_t8152_ahci_nvme_close(result, ahci):
     if state == 3:
         print(f"T8152 AHCI NVMe: CLEAN: the controller confirmed its shutdown"
               f"{' after this session wrote' if status('wrote') else ' (nothing written)'}. "
-              "A carrier reset (P_REBOOT, --windows-reset-on-exit, leave2.sh) is safe now.")
+              "A reset is safe now: through the carrier (P_REBOOT, i.e. "
+              "tools/windows_nvme_gate.py exit, or --windows-reset-on-exit).")
         return True
     print(f"\x1b[31mT8152 AHCI NVMe: {name}: the controller did NOT confirm its shutdown after "
-          "this session wrote. Do NOT hard reset (macvdmtool, power hold): retry "
-          "p.hv_windows_ahci(6) from the proxy shell. If it stays FAILED, a reset risks the "
-          "Windows partition; run the read-only checks of the D5 runbook from Linux "
+          "this session wrote. Do NOT leave the proxy (no P_REBOOT, no direct watchdog write "
+          "through the proxy: that is a hard reset; no macvdmtool, no power hold): retry "
+          "p.hv_windows_ahci(6) from the proxy shell. If it stays FAILED, any reset (P_REBOOT "
+          "\"FORCE\" included) risks the Windows partition: restore it from the image or run "
+          "chkdsk from WinPE, and run the read-only checks of the D5 runbook from Linux "
           "afterwards.\x1b[0m")
     return False
 
@@ -807,10 +810,13 @@ def run_windows_t8152(caps):
         print("SYSTEM_RESET: NVMe closed CLEAN; resetting through WD1 (P_REBOOT goes through "
               "flush_and_reboot)")
         windows_system_reset(p)
+    elif nvme and not clean:
+        print("The aura proxy stays up. The NVMe disk is NOT closed CLEAN (see above): do not "
+              "leave the proxy yet; retry p.hv_windows_ahci(6) (DETACH) until it reports CLEAN.")
     elif nvme and ahci["flags"] & 1:
-        print("The aura proxy stays up. The guest wrote only its NVMe partition (closed above); "
-              "leave the proxy through the carrier (leave2.sh / P_REBOOT), never a hard reset "
-              "unless CLEAN was printed.")
+        print("The aura proxy stays up. The guest wrote only its NVMe partition, closed CLEAN "
+              "above; leave the proxy through the carrier (tools/windows_nvme_gate.py exit, "
+              "which is P_REBOOT through flush_and_reboot).")
     else:
         print("The aura proxy stays up. Nothing was written to disk or NVRAM by the guest.")
     sys.exit(0)

@@ -257,8 +257,10 @@ void flush_and_reboot(void)
      * this is nvme_shutdown() as before.  Reset only once the controller confirmed it.
      */
     if (!hv_ahci_nvme_reset_close()) {
-        printf("NVMe shutdown not confirmed: not resetting. Parking (hold power to exit; this "
-               "session's NVMe writes may be lost)\n");
+        printf("NVMe shutdown not confirmed: not resetting. Parking. Holding power to exit is a "
+               "hard reset: the NVMe writes of this session may be lost or reordered, so restore "
+               "the Windows partition from the image or check it (chkdsk from WinPE) before the "
+               "next read-write session\n");
         goto park;
     }
 #endif

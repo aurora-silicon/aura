@@ -374,22 +374,39 @@ Persistent, no upload, and guest RAM is the whole `--windows-guest-ram` window a
   under `bhl` and `ahci_lock`, then the owner-tagged NVMe lock (`nvme_lock_acquire`). The poll
   loop pets the HV watchdog. Writes wait up to 5 s and flushes 10 s for their completion
   (reads 1 s): the only earlier aura write on this SoC lost its completion within 1 s.
+  Multi-block writes (PRP2 or a PRP list) are used only after this session's multi-block reads
+  passed their self-check; otherwise every write is one 4 KiB block per command.
 - **Durability**: on the M6 only a controller shutdown (CC.SHN normal, SHST done) is trusted
-  (a flush is not, across a hard reset). Every exit the carrier controls closes the disk with
-  that shutdown before anything can reset:
+  (a flush is not, across a hard reset). An ATA FLUSH CACHE completes after an NVMe Flush, so
+  NTFS's write barrier holds only as long as the session ends with that shutdown: after a hard
+  reset or power loss writes Windows believes committed may be lost, possibly out of order, and
+  NTFS can be damaged structurally, not just miss recent data. Every exit the carrier controls
+  closes the disk with that shutdown before anything can reset:
   - every `hv_start()` return (PSCI SYSTEM_OFF/RESET, ^C then `exit`, refusals before entry):
     `hv_ahci_session_end()`;
   - `flush_and_reboot()` (panic, assert, EL2 exceptions, SError, the HV watchdog, `P_REBOOT`):
-    `hv_ahci_nvme_reset_close()`, a bounded (3 s) wait for the NVMe lock, then the normal
-    shutdown, or CC.SHN written directly when another CPU holds the lock or a queue failed. It
-    resets only after SHST done (or if nothing was written); otherwise it parks.
+    `hv_ahci_nvme_reset_close()`. It stops the lock owner issuing further I/O commands, waits
+    up to 12 s for the NVMe lock (longer than any one command's timeout), then the normal
+    shutdown; only if a CPU is stuck holding the lock it writes CC.SHN directly and polls CSTS
+    alone, leaving the RTKit mailbox to that CPU. It resets only after SHST done (or if
+    nothing was written, including a carrier whose first NVMe wake failed); otherwise it
+    parks, and the proxy is gone (a park is followed by a power hold, a hard reset).
   - `P_REBOOT` in the Windows personality goes through `flush_and_reboot()`, and is refused
-    while a guest session owns the disk or after a FAILED close (args[0] = `"FORCE"`
-    overrides). `P_NVME_*` refuse while the disk owns the controller.
+    while a guest session owns the disk or after a FAILED close. `P_REBOOT` with args[0] =
+    `"FORCE"` after a FAILED close makes one more shutdown attempt and then resets even without
+    its confirmation (the partition then needs a restore or chkdsk). `P_NVME_*` refuse while
+    the disk owns the controller, and after a close that had to shut down without the lock,
+    until that CPU lets go.
+  - The carrier resets J804 by the watchdog sequence that has worked through the proxy
+    (control = reset enable, then alarm 0, count 0); gate R0 ends by checking that `P_REBOOT`
+    brings Linux back.
   The state is `DETACHED -> ATTACHED -> RUNNING -> CLEAN | FAILED`; FAILED means written and
   not confirmed.
-- **Not covered**: a hard reset (`macvdmtool reboot`), a power-button hold or power loss gives
-  the controller no shutdown. After any session that wrote, that risks the Windows partition.
+- **Not covered**: a hard reset (`macvdmtool reboot`, a direct watchdog write through the
+  proxy), a power-button hold or power loss gives the controller no shutdown. After any session
+  that wrote and did not close CLEAN, do not trust NTFS journal replay: restore the partition
+  from the image, or check it with chkdsk from WinPE (a read-only session first, then a
+  read-write one) before the next full read-write session.
 
 `P_HV_WINDOWS_CAPS2` bit 5. `P_HV_WINDOWS_AHCI` op 5 ATTACH_NVME (a1 = address of the 192-byte
 `hv_ahci_nvme_req`: "AWNVME01", version 1, flags RW/FLUSH_EVERY/GATE/SCRATCH, the three GUIDs
@@ -398,9 +415,10 @@ refused while the guest runs), 7 NVME_STATUS (0 state, 1 flags, 2 commands, 3 NV
 longest command us, 5 flushes, 6 RMW blocks, 7 guard hits, 8/9 first/last LBA, 10 wrote, 11
 failed commands, 12/13 blocks read/written, 14 inner disk bytes, 15 longest flush us), 8
 NVME_TEST (gate attaches only: write/verify/flush/CRC of seeded blocks; writes only read-write,
-and only on a SCRATCH attach (an empty partition) or past the inner disk's end, the tail an
-installed image leaves free until its backup GPT is moved to the partition's end or C: is
-extended; never inside the image).
+and only on a SCRATCH attach or past the inner disk's end (from the first 4 KiB block holding
+no byte of it), the tail an installed image leaves free until its backup GPT is moved to the
+partition's end or C: is extended; never inside the image). A SCRATCH attach is refused unless
+the partition's first 4 KiB are zero (an installed image is never scratch).
 
 Launcher (`run_guest.py`):
 
@@ -422,14 +440,19 @@ compares the resident's first/last LBA with the config. At exit it prints the co
 `CLEAN` or `FAILED`; `--windows-reset-on-exit` resets only after CLEAN.
 
 Runbook rules: end every session from Windows (Shut down / Restart) or with ^C then `exit`;
-leave the proxy only through the carrier (`P_REBOOT`, `leave2.sh`, `--windows-reset-on-exit`)
-after the launcher printed CLEAN; never `macvdmtool reboot` after a session that wrote unless
-CLEAN was printed; keep the image as the restore point. Gates before Windows writes:
-`tools/windows_nvme_gate.py r0` (two read-only attaches, no guest), `w0` (seeded writes in the
-free tail past the installed image, or anywhere with `--partition-is-empty`; reset through the
-carrier, then compare the blocks from Linux with `windows_nvme_gate.py expect`), then a
-read-only session, then rw. The install itself is a Linux-side recipe in the owner's private
-data.
+leave the proxy only through the carrier after the launcher printed CLEAN:
+`tools/windows_nvme_gate.py exit` (refuses unless the disk is DETACHED or CLEAN, then
+`P_REBOOT`) or `--windows-reset-on-exit`. Only `P_REBOOT` goes through `flush_and_reboot()`; a
+Stage 1 exit that writes the watchdog registers directly through the proxy is a hard reset,
+like `macvdmtool reboot`, and is acceptable only after CLEAN. After FAILED the launcher says
+so and gives no exit advice: retry DETACH (`p.hv_windows_ahci(6)`); if it stays FAILED,
+`windows_nvme_gate.py exit --force`, then restore or chkdsk the partition. Keep the image as
+the restore point. Gates before Windows writes: `tools/windows_nvme_gate.py r0` (two read-only
+attaches, no guest, then `exit`, which checks the carrier's own reset brings Linux back),
+`w0` (seeded writes in the free tail past the installed image, or anywhere with
+`--partition-is-empty` on an empty partition; any read-back mismatch fails it; `exit`, then
+compare the blocks from Linux with `windows_nvme_gate.py expect`), then a read-only session,
+then rw. The install itself is a Linux-side recipe in the owner's private data.
 
 Host tests (`test_windows_t8152_ahci_nvme.py`): aura's real `nvme.c` and the carrier files are
 built unchanged with ASan/UBSan against `tests/e2e/windows_nvme_stubs/` and a simulated T8152

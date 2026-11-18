@@ -50,7 +50,8 @@ CASES = ["attach_and_identify", "inner_gpt_read", "data_rmw", "guard_fuzz", "gua
          "exit_abort", "refusal_closes", "reset_other_cpu_mid_command",
          "reset_inside_controller_lock", "reset_lost_completion", "reset_shst_stuck_parks",
          "close_failed_then_retry", "quiesce_fails_after_commit", "slow_write_completion", "error_status_write",
-         "second_attach", "proxy_and_reboot_rules", "gate_w0"]
+         "second_attach", "proxy_and_reboot_rules", "gate_w0", "gate_w0_tail_rounding",
+         "reboot_after_failed_first_wake", "multi_write_unverified", "force_reset_after_failed"]
 
 # Public type GUIDs (UEFI 2.10, Discoverable Partitions Specification, Apple, Microsoft).
 T_ISC = "69646961-6700-11AA-AA11-00306543ECAC"
@@ -295,6 +296,28 @@ def test_reset_paths_never_reset_before_the_commit(sessions):
         e = ev[name]
         assert "X" in e and e.rfind("C", 0, e.index("X")) > e.rfind("W", 0, e.index("X")), name
     assert "P" in ev["reset_shst_stuck_parks"] and "X" not in ev["reset_shst_stuck_parks"]
+    # A failed first carrier wake wrote nothing: P_REBOOT resets, it does not park.
+    assert ev["reboot_after_failed_first_wake"] == "X"
+
+
+def test_w0_tail_starts_after_the_last_inner_byte(host):
+    # An inner disk whose size is not a multiple of 4 KiB: the 4 KiB block holding its backup
+    # GPT header is not free tail (rounded up, in the resident and in the gate tool).
+    binary, out = host
+    sectors = INNER_SECTORS - 3
+    img, rq = out / "unaligned.img", out / "unaligned.req"
+    img.write_bytes(m6_disk(inner=inner_disk(sectors)))
+    rq.write_bytes(request(J804_WIN_IMAGE_BYTES=str(sectors * 512 // BLOCK * BLOCK)))
+    r = subprocess.run([str(binary), str(img), str(rq), "cases", "gate_w0_tail_rounding"],
+                       capture_output=True, text=True, timeout=300,
+                       env={**os.environ, "ASAN_OPTIONS": "detect_leaks=0"})
+    lines = [json.loads(l) for l in r.stdout.splitlines() if l.startswith("{")]
+    assert r.returncode == 0, r.stdout[-3000:] + r.stderr[-3000:]
+    tail = next(l["tail"] for l in lines if "tail" in l)
+    assert tail["inner_bytes"] == sectors * 512
+    assert tail["first_free"] == -(-sectors * 512 // BLOCK) > sectors * 512 // BLOCK
+    gate = (REPO / "proxyclient/tools/windows_nvme_gate.py").read_text()
+    assert '-(-op(w.AHCI_OP_NVME_STATUS, w.NVME_STATUS["inner_bytes"]) // w.NVME_LBA_BYTES)' in gate
 
 
 # ---- 2. GPT and inner-disk refusals -------------------------------------------------------
@@ -428,6 +451,26 @@ def test_reset_paths_go_through_the_backend():
     proxy = (REPO / "src/proxy.c").read_text()
     case = proxy[proxy.index("case P_REBOOT:"):proxy.index("case P_SLEEP:")]
     assert "hv_ahci_nvme_reboot_allowed" in case and "flush_and_reboot();" in case
+    # FORCE reaches the reset path, which then resets after one more attempt (no dead park).
+    assert case.index("hv_ahci_nvme_force_reset()") < case.index("flush_and_reboot();")
+    glue = (WIN / "hv_ahci_nvme.c").read_text()
+    reset = body(glue, "bool hv_ahci_nvme_reset_close(void)")
+    assert "force_reset" in reset and "nvme_has_written()" in reset
+    # The close and reset paths wait at least one command timeout (a 10 s flush) for the lock.
+    nvme = (REPO / "src/nvme.c").read_text()
+    flush_us = int(re.search(r"#define NVME_FLUSH_TIMEOUT (\d+)", nvme)[1])
+    wait_us = int(re.search(r"#define LOCK_WAIT_US\s+(\d+)", glue)[1])
+    assert "#define RESET_LOCK_WAIT_US LOCK_WAIT_US" in glue and wait_us > flush_us
+    assert "nvme_shutdown_for_reset(false)" in body(glue, "static bool shutdown_without_lock(void)")
+    # Multi-block writes only once multi-block reads were verified.
+    writes = body(nvme, "bool nvme_write_blocks(u32 nsid, u64 lba, const void *buffer, u32 count)")
+    assert writes.index("!nvme_multi_enabled || !nvme_multi_verified") < writes.index("nvme_prp_list[")
+    # J804's watchdog reset: reset enable, then alarm 0 and count 0 (the order that works).
+    wdt = body((REPO / "src/wdt.c").read_text(), "void wdt_reboot(void)")
+    t8152 = wdt[wdt.index("chip_id == T8152"):]
+    t8152 = t8152[:t8152.index("return;")]
+    assert (t8152.index("WDT_CTL, 4") < t8152.index("WDT_ALARM, 0") <
+            t8152.index("WDT_COUNT, 0"))
     nv = proxy[proxy.index("case P_NVME_INIT:"):proxy.index("case P_MCC_GET_CARVEOUTS:")]
     assert nv.index("hv_ahci_nvme_owns_controller()") < nv.index("nvme_init()")
     assert "HV_WINDOWS_CAPS2_AHCI_NVME" in proxy
@@ -566,3 +609,10 @@ def test_run_guest_nvme_options_and_refusals():
     assert exit_.index("windows_t8152_ahci_nvme_close(") < exit_.index("windows_system_reset(p)")
     reset = pyfunc(RUN_GUEST, "def windows_t8152_ahci_nvme_close(")
     assert "CLEAN" in reset and "AHCI_OP_DETACH" in reset
+    # Leave-the-proxy advice only after CLEAN; a direct watchdog write is never a carrier exit.
+    assert exit_.index("elif nvme and not clean:") < exit_.index("leave the proxy through")
+    for text in (RUN_GUEST, (REPO / "docs/windows-t8152.md").read_text()):
+        assert "leave2.sh" not in text
+    gate = (REPO / "proxyclient/tools/windows_nvme_gate.py").read_text()
+    assert 'name in ("DETACHED", "CLEAN")' in gate and "p.reboot()" in gate
+    assert "bootstrap_port" in gate.split("from aura.proxyutils import ")[1].split("\n")[0]

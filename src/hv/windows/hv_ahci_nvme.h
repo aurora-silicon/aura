@@ -17,10 +17,14 @@
  * the backend with that shutdown before anything can reset the SoC:
  *   - hv_start() returns (PSCI SYSTEM_OFF/RESET, ^C + exit, refusals): hv_ahci_nvme_close();
  *   - flush_and_reboot() (panic, assert, EL2 exceptions, SError, watchdog, P_REBOOT):
- *     hv_ahci_nvme_reset_close(), which waits a bounded time for the controller lock and
- *     otherwise requests the shutdown directly; the caller resets only if it returns true.
- * A hard reset (macvdmtool, power-button hold, power loss) is outside the carrier: after a
- * session that wrote, it risks the Windows partition.  The launcher prints CLEAN or FAILED.
+ *     hv_ahci_nvme_reset_close(), which stops further I/O, waits one command timeout plus
+ *     margin for the controller lock and otherwise requests the shutdown directly (CSTS only,
+ *     leaving the RTKit mailbox to the CPU that holds it); the caller resets only if it
+ *     returns true.
+ * A hard reset (macvdmtool, a direct WD1 write through the proxy, a power-button hold, power
+ * loss) is outside the carrier: after a session that wrote, it risks the Windows partition.
+ * The launcher prints CLEAN or FAILED.  An ATA FLUSH CACHE maps to an NVMe Flush, which on
+ * this controller is not known to survive a hard reset: only the shutdown is.
  */
 
 #define HV_AHCI_NVME_REQ_MAGIC   "AWNVME01"
@@ -109,11 +113,21 @@ void hv_ahci_nvme_guest_entered(void);
 enum hv_ahci_nvme_state hv_ahci_nvme_close(const char *why);
 /*
  * flush_and_reboot(): may run on any CPU at any moment, inside the backend included.  True if
- * a reset cannot lose acknowledged data (closed CLEAN, nothing written, or no backend and
- * nvme_shutdown() succeeded); false: park.
+ * a reset cannot lose acknowledged data (closed CLEAN, nothing written, or no backend session
+ * ever and nvme_shutdown() succeeded or this carrier never wrote to NVMe), or after
+ * hv_ahci_nvme_force_reset(); false: park.
  */
 bool hv_ahci_nvme_reset_close(void);
-/* proxy.c: the backend owns the controller (P_NVME_* refuse). */
+/*
+ * proxy.c P_REBOOT "FORCE" after a FAILED close: the next hv_ahci_nvme_reset_close() makes one
+ * more shutdown attempt and returns true even if it fails (the partition then needs a restore
+ * or a check).  No effect in any other state.
+ */
+void hv_ahci_nvme_force_reset(void);
+/*
+ * proxy.c: the backend owns the controller (P_NVME_* refuse): attached, running, FAILED, or
+ * a close that had to shut down without the lock while another CPU still holds it.
+ */
 bool hv_ahci_nvme_owns_controller(void);
 /* proxy.c P_REBOOT: refused while a guest session runs or after FAILED (unless forced). */
 bool hv_ahci_nvme_reboot_allowed(bool force);

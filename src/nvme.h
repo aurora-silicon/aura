@@ -37,7 +37,10 @@ bool nvme_write(u32 nsid, u64 lba, const void *buffer);
  * that does not call it.
  */
 #define NVME_MAX_WRITE_BLOCKS 64
-/* `count` (1..64) 4 KiB blocks from a 4 KiB aligned buffer, one command (PRP list). */
+/*
+ * `count` (1..64) 4 KiB blocks from a 4 KiB aligned buffer: one command (PRP list) once this
+ * session's multi-block reads were verified, else one command per block.
+ */
 bool nvme_write_blocks(u32 nsid, u64 lba, const void *buffer, u32 count);
 /* Identify Namespace (CNS 0) into a 4 KiB aligned 4 KiB buffer. */
 bool nvme_identify_ns(u32 nsid, void *buffer);
@@ -61,12 +64,23 @@ extern void (*nvme_poll_hook)(void);
  * A reset is about to happen and nvme_shutdown() cannot run (another CPU owns the controller,
  * or a queue failed): request a normal shutdown with CC.SHN directly and wait for SHST done.
  * Returns true if the controller confirmed it (or holds no session).  Never touches the queues.
+ * `mailbox` false when another CPU may still be inside a command: then only CSTS is polled and
+ * the RTKit mailbox is left alone (one CPU at a time drives it).
  */
-bool nvme_shutdown_for_reset(void);
+bool nvme_shutdown_for_reset(bool mailbox);
 /* True while nvme_init() succeeded and no shutdown ended the session. */
 bool nvme_session_live(void);
 /* True after a setup or shutdown failure: every call refuses until a SoC reset. */
 bool nvme_needs_reboot(void);
+/* True once this image issued an NVMe write or flush (since it started, not per session). */
+bool nvme_has_written(void);
+/* This session's multi-block (PRP list) reads were verified and are in use. */
+bool nvme_multi_io_verified(void);
+/*
+ * D5: while set, nvme_exec_command refuses new I/O commands (admin commands still run), so a
+ * lock owner releases the controller within one command.  Cleared by nvme_init().
+ */
+void nvme_abort_io(bool on);
 /*
  * The controller lock of D5: an owner-tagged CPU lock.  The carrier backend holds it around
  * every command it issues and the reset path takes it with a bounded wait.  `usec` 0 waits

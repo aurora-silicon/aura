@@ -151,12 +151,15 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
              * D5: the Windows personality resets only through flush_and_reboot(), which closes
              * an NVMe-backed AHCI disk with the controller shutdown first.  Refused while a guest
              * session owns the disk, or after a close that was not confirmed (FAILED) unless
-             * args[0] is P_REBOOT_FORCE.
+             * args[0] is P_REBOOT_FORCE: then one more shutdown attempt, and the reset even
+             * without its confirmation (never a park with no proxy left).
              */
             if (!hv_ahci_nvme_reboot_allowed(request->args[0] == P_REBOOT_FORCE)) {
                 reply->status = S_ERROR;
                 break;
             }
+            if (request->args[0] == P_REBOOT_FORCE)
+                hv_ahci_nvme_force_reset();
             flush_and_reboot();
 #else
             reboot();

@@ -20,9 +20,14 @@
 #include "utils.h"
 
 #define NSID 1
-/* Longest wait for the controller lock: a 10 s flush plus margin.  The reset path waits less. */
+/*
+ * Longest wait for the controller lock: one command's longest timeout (nvme.c: a 10 s flush)
+ * plus margin.  The close and reset paths wait as long: they first stop the owner issuing more
+ * I/O commands (nvme_abort_io), so the lock comes free within the command in flight, and only a
+ * CPU that is really stuck makes them shut the controller down without the lock.
+ */
 #define LOCK_WAIT_US       12000000
-#define RESET_LOCK_WAIT_US 3000000
+#define RESET_LOCK_WAIT_US LOCK_WAIT_US
 #define POOL_ALLOC         ((AHCI_NVME_POOL_BYTES + 0x3fffUL) & ~0x3fffUL)
 
 static struct ahci_nvme core;
@@ -35,6 +40,10 @@ static u64 found_first, found_last, inner_bytes;
 static u64 longest_ticks, longest_flush_ticks;
 static u64 reported;
 static volatile bool closing;
+/* P_REBOOT "FORCE" after a FAILED close: reset even if the final shutdown attempt fails. */
+static bool force_reset;
+/* A close shut the controller down without the lock: that CPU may still touch the queues. */
+static bool closed_without_lock;
 
 static u64 ticks_to_us(u64 t)
 {
@@ -185,7 +194,13 @@ int hv_ahci_nvme_attach(u64 req_addr, bool have_ram, u64 ram_lo, u64 ram_hi, u64
         pool_reserved = true;
     }
 
-    nvme_lock_acquire(0);
+    if (!nvme_lock_acquire(LOCK_WAIT_US)) {
+        printf("HV: T8152: AHCI NVMe: attach refused: CPU %d still holds the controller lock "
+               "(a stuck command from an earlier session); reload the carrier\n",
+               nvme_lock_owner());
+        return -1;
+    }
+    closed_without_lock = false; /* the lock was free: no CPU is left inside a command */
     closing = false;
     if (!nvme_init()) {
         nvme_lock_release();
@@ -249,7 +264,19 @@ int hv_ahci_nvme_attach(u64 req_addr, bool have_ram, u64 ram_lo, u64 ram_hi, u64
         goto refuse;
     }
     inner_bytes = 0;
-    if (!(req.flags & HV_AHCI_NVME_SCRATCH)) {
+    if (req.flags & HV_AHCI_NVME_SCRATCH) {
+        /*
+         * A scratch attach lets the W0 test write anywhere in the partition, so the partition
+         * must really be empty: its first block all zero (no protective MBR, GPT header, or
+         * file system boot sector).  An installed image is never a scratch partition.
+         */
+        for (u32 i = 0; i < AHCI_NVME_BLOCK; i++)
+            if (first4k[i]) {
+                why = "scratch attach on a partition that is not empty (its first 4 KiB are not "
+                      "zero: an installed image?); use the free-tail W0 instead";
+                goto refuse;
+            }
+    } else {
         if (gpt_check_inner(first4k, part_bytes, &at_end, &inner_bytes, &why) < 0)
             goto refuse;
         if (req.min_bytes && inner_bytes < req.min_bytes) {
@@ -262,11 +289,16 @@ int hv_ahci_nvme_attach(u64 req_addr, bool have_ram, u64 ram_lo, u64 ram_hi, u64
                    "repairs it on its first GPT write)\n");
     }
 
+    if ((req.flags & HV_AHCI_NVME_RW) && !nvme_multi_io_verified())
+        printf("HV: T8152: AHCI NVMe: multi-block reads not verified on this ANS: every NVMe "
+               "write is issued one 4 KiB block per command\n");
+
     struct ahci_nvme_dev dev = {dev_read, dev_write, dev_flush, NULL};
     ahci_nvme_init(&core, &dev, pool, found_first, found_last, !(req.flags & HV_AHCI_NVME_RW),
                    req.flags & HV_AHCI_NVME_FLUSH_EVERY);
     longest_ticks = longest_flush_ticks = 0;
     reported = 0;
+    force_reset = false;
     nvme_poll_hook = hv_wdt_pet;
     state = HV_AHCI_NVME_ATTACHED;
     nvme_lock_release();
@@ -346,7 +378,7 @@ static bool shutdown_locked(void)
     bool down = nvme_shutdown();
     if (!down) {
         printf("HV: T8152: AHCI NVMe: normal shutdown path failed; requesting CC.SHN directly\n");
-        down = nvme_shutdown_for_reset();
+        down = nvme_shutdown_for_reset(true); /* this CPU holds the lock: it may use RTKit */
     }
     if (!flushed)
         printf("HV: T8152: AHCI NVMe: the final flush failed (the shutdown commits the cache)\n");
@@ -364,7 +396,30 @@ static void finish(bool down, const char *why)
            down ? "confirmed" : "NOT confirmed");
     if (state == HV_AHCI_NVME_FAILED)
         printf("HV: T8152: AHCI NVMe: FAILED: do not hard reset; retry DETACH from the proxy. "
-               "A reset now may lose this session's writes\n");
+               "A reset now may lose writes Windows was told were flushed: afterwards restore "
+               "the partition from the image or run chkdsk (WinPE, read-only first)\n");
+}
+
+/*
+ * Get the controller for a close: stop the owner's further I/O, wait one command timeout plus
+ * margin.  False if a CPU is stuck holding it.
+ */
+static bool close_lock(void)
+{
+    nvme_abort_io(true);
+    if (!nvme_lock_acquire(RESET_LOCK_WAIT_US))
+        return false; /* abort stays set: the stuck CPU must not start another command */
+    nvme_abort_io(false);
+    return true;
+}
+
+static bool shutdown_without_lock(void)
+{
+    printf("HV: T8152: AHCI NVMe: CPU %d did not release the controller in %u s; requesting "
+           "CC.SHN directly (CSTS only; its RTKit mailbox is left alone)\n",
+           nvme_lock_owner(), RESET_LOCK_WAIT_US / 1000000);
+    closed_without_lock = true;
+    return nvme_shutdown_for_reset(false);
 }
 
 enum hv_ahci_nvme_state hv_ahci_nvme_close(const char *why)
@@ -376,13 +431,11 @@ enum hv_ahci_nvme_state hv_ahci_nvme_close(const char *why)
     core.closing = true;
     hv_ahci_nvme_report(true);
     bool down;
-    if (nvme_lock_acquire(RESET_LOCK_WAIT_US)) {
+    if (close_lock()) {
         down = shutdown_locked();
         nvme_lock_release();
     } else {
-        printf("HV: T8152: AHCI NVMe: CPU %d holds the controller; requesting CC.SHN directly\n",
-               nvme_lock_owner());
-        down = nvme_shutdown_for_reset();
+        down = shutdown_without_lock();
     }
     finish(down, why);
     return state;
@@ -390,8 +443,20 @@ enum hv_ahci_nvme_state hv_ahci_nvme_close(const char *why)
 
 bool hv_ahci_nvme_reset_close(void)
 {
-    if (!ever_attached)
-        return nvme_shutdown(); /* unchanged for carriers without the backend */
+    if (!ever_attached) {
+        /*
+         * No backend session ever started (an attach whose nvme_init failed included).  The
+         * carrier wrote nothing to NVMe then, so a reset is safe even when the controller cannot
+         * be shut down (nvme_init's out_preserve after a failed second ANS wake).
+         */
+        if (nvme_shutdown())
+            return true;
+        if (nvme_has_written())
+            return false;
+        printf("HV: T8152: AHCI NVMe: no NVMe shutdown possible, but this carrier wrote nothing "
+               "to NVMe: resetting\n");
+        return true;
+    }
     if (state == HV_AHCI_NVME_CLEAN || state == HV_AHCI_NVME_DETACHED)
         return nvme_shutdown() || !nvme_session_live();
     __atomic_store_n(&closing, true, __ATOMIC_RELEASE);
@@ -400,23 +465,38 @@ bool hv_ahci_nvme_reset_close(void)
     if (nvme_lock_owner() == smp_id()) {
         /* A fault inside nvme.c on this CPU: its state is unknown, do not reuse the queues. */
         printf("HV: T8152: AHCI NVMe: reset from inside the controller lock\n");
-        down = nvme_shutdown_for_reset();
-    } else if (nvme_lock_acquire(RESET_LOCK_WAIT_US)) {
+        down = nvme_shutdown_for_reset(true);
+    } else if (close_lock()) {
         down = shutdown_locked();
         nvme_lock_release();
     } else {
-        printf("HV: T8152: AHCI NVMe: CPU %d did not release the controller in 3 s\n",
-               nvme_lock_owner());
-        down = nvme_shutdown_for_reset();
+        down = shutdown_without_lock();
     }
     finish(down, "reset");
+    if (state == HV_AHCI_NVME_FAILED && force_reset) {
+        printf("HV: T8152: AHCI NVMe: FORCE: resetting although the controller did NOT confirm "
+               "its shutdown. Writes of this session may be lost or reordered: restore the "
+               "Windows partition from the image, or check it (chkdsk from WinPE), before the "
+               "next read-write session\n");
+        return true;
+    }
     return state == HV_AHCI_NVME_CLEAN;
+}
+
+void hv_ahci_nvme_force_reset(void)
+{
+    if (state == HV_AHCI_NVME_FAILED)
+        force_reset = true;
 }
 
 bool hv_ahci_nvme_owns_controller(void)
 {
-    return state == HV_AHCI_NVME_ATTACHED || state == HV_AHCI_NVME_RUNNING ||
-           state == HV_AHCI_NVME_FAILED;
+    if (state == HV_AHCI_NVME_ATTACHED || state == HV_AHCI_NVME_RUNNING ||
+        state == HV_AHCI_NVME_FAILED)
+        return true;
+    /* After a close without the lock, until the stuck CPU lets go of the queues. */
+    int owner = nvme_lock_owner();
+    return closed_without_lock && owner >= 0 && owner != smp_id();
 }
 
 bool hv_ahci_nvme_reboot_allowed(bool force)
@@ -428,7 +508,8 @@ bool hv_ahci_nvme_reboot_allowed(bool force)
     }
     if (state == HV_AHCI_NVME_FAILED && !force) {
         printf("HV: T8152: AHCI NVMe: reboot refused: the last close was not confirmed "
-               "(FAILED); retry DETACH, or force the reset knowing writes may be lost\n");
+               "(FAILED); retry DETACH, or P_REBOOT \"FORCE\" (one more shutdown attempt, then "
+               "a reset even without it: the partition then needs a restore or chkdsk)\n");
         return false;
     }
     return true;
@@ -507,12 +588,14 @@ u64 hv_ahci_nvme_test(u64 rel_block, u64 count, u64 seed, u64 op)
      * otherwise only past the inner disk's end (its backup GPT header), the tail that is free
      * until the backup header is moved to the partition's end or Windows extends into it.
      */
-    bool tail = inner_bytes && rel_block >= inner_bytes / AHCI_NVME_BLOCK;
+    /* Rounded up: a 4 KiB block holding any byte of the inner disk is not tail. */
+    u64 first_free = (inner_bytes + AHCI_NVME_BLOCK - 1) / AHCI_NVME_BLOCK;
+    bool tail = inner_bytes && rel_block >= first_free;
     if (op == HV_AHCI_NVME_TEST_WRITE &&
         (!(req.flags & HV_AHCI_NVME_RW) || (!(req.flags & HV_AHCI_NVME_SCRATCH) && !tail))) {
         printf("HV: T8152: AHCI NVMe: test write refused: only read-write, and only on a scratch "
                "attach or past the inner disk's end (block %lu)\n",
-               inner_bytes / AHCI_NVME_BLOCK);
+               first_free);
         return err;
     }
     u64 *w = (u64 *)(void *)(pool + AHCI_NVME_WINDOW);

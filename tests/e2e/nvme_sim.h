@@ -31,7 +31,9 @@ struct sim_faults {
     bool flush_durable;     /* model a controller whose Flush is durable (not the M6) */
     u32 lbads;              /* Identify LBA data size shift; default 12 */
     bool identify_fails;
-    bool quiesce_fails; /* RTKit quiesce is not acknowledged */
+    bool quiesce_fails;   /* RTKit quiesce is not acknowledged */
+    bool boot_fails;      /* RTKit boot fails with the ASC left running (a failed second wake) */
+    bool prp_list_broken; /* PRP-list DMA lands every page after the first on list entry 0 */
 };
 
 struct sim_stats {
@@ -44,6 +46,7 @@ struct sim_stats {
     u64 after_reset;                /* commands issued after sim_reset_happened() */
     u64 io_min_block, io_max_block; /* I/O range touched since sim_track_io(true) */
     u64 boots, quiesces, shutdowns_done;
+    u64 multi_writes; /* write commands of more than one block */
 };
 
 void sim_init(u64 nsze, const char *image);
@@ -60,6 +63,8 @@ void sim_set_hook(u64 n, void (*hook)(void));
 /* The reset happened: snapshot `durable` for the checks, then drop `volatile`. */
 void sim_reset_happened(void);
 void sim_power_cut(void);
+/* Set blocks [block, block + count) to `v` in both layers (an "empty" partition). */
+void sim_fill(u64 block, u64 count, u8 v);
 bool sim_enabled(void);
 /* What a reader sees now (volatile over durable), and what survives a power cut. */
 const u8 *sim_view(u64 block);

@@ -218,6 +218,12 @@ static bool nvme_force_normal_shutdown;
 /* This session's normal shutdown reached SHST done (whatever failed after it). */
 static bool nvme_shst_confirmed;
 void (*nvme_poll_hook)(void);
+/*
+ * Set by a closer waiting for the controller lock (nvme_abort_io): the owner finishes the I/O
+ * command in flight and issues no further I/O command, so the lock comes free within one
+ * command timeout.  Admin commands (the shutdown's queue deletes) are not affected.
+ */
+static volatile bool nvme_io_abort;
 
 /* unused: the host tests compile this block without the I/O paths */
 static inline __attribute__((unused)) bool nvme_fence_allows(u32 nsid, u64 lba, u32 count)
@@ -339,16 +345,29 @@ static bool nvme_ctrl_enable(void)
     return read32(nvme_base + NVME_CSTS) & NVME_CSTS_RDY;
 }
 
-static bool nvme_ctrl_shutdown(void)
+/*
+ * `mailbox` false: poll CSTS only (and the poll hook), never the RTKit mailbox, for a caller
+ * that may share the controller with a CPU still inside nvme_exec_command (D5 reset path).
+ */
+static bool nvme_ctrl_shutdown_poll(bool mailbox)
 {
     u64 timeout = timeout_calculate(NVME_SHUTDOWN_TIMEOUT);
 
     mask32(nvme_base + NVME_CC, NVME_CC_SHN, FIELD_PREP(NVME_CC_SHN, NVME_CC_SHN_NORMAL));
     while (FIELD_GET(NVME_CSTS_SHST, read32(nvme_base + NVME_CSTS)) != NVME_CSTS_SHST_DONE &&
-           !timeout_expired(timeout))
-        nvme_poll_syslog();
+           !timeout_expired(timeout)) {
+        if (mailbox)
+            nvme_poll_syslog();
+        else if (nvme_poll_hook)
+            nvme_poll_hook();
+    }
 
     return FIELD_GET(NVME_CSTS_SHST, read32(nvme_base + NVME_CSTS)) == NVME_CSTS_SHST_DONE;
+}
+
+static bool nvme_ctrl_shutdown(void)
+{
+    return nvme_ctrl_shutdown_poll(true);
 }
 
 /* As macOS before a sleep: the suspend shutdown, EN kept, until CSTS reports it done. */
@@ -404,6 +423,11 @@ static bool nvme_exec_command(struct nvme_queue *q, struct nvme_command *cmd, u6
     struct nvme_command *queue_cmd = &q->cmds[tag];
     struct apple_nvmmu_tcb *tcb = &q->tcbs[tag];
 
+    if (!q->adminq && __atomic_load_n(&nvme_io_abort, __ATOMIC_ACQUIRE)) {
+        /* Like a timeout for the callers: no single-block fallback, no retry. */
+        nvme_cmd_timed_out = true;
+        return false;
+    }
     nvme_cmd_timed_out = false;
     memcpy(queue_cmd, cmd, sizeof(*cmd));
     queue_cmd->tag = tag;
@@ -668,6 +692,7 @@ bool nvme_init(void)
     nvme_multi_verified = false;
     nvme_multi_fallback_reads = 0;
     nvme_shst_confirmed = false;
+    __atomic_store_n(&nvme_io_abort, false, __ATOMIC_RELEASE);
     nvme_prp_list = NULL;
     nvme_verify_bounce = NULL;
     nvme_boot_ticks = 0;
@@ -1051,6 +1076,9 @@ bool nvme_lock_acquire(u32 usec)
         }
         if (usec && timeout_expired(timeout))
             return false;
+        /* A bounded wait is progress: keep the carrier's watchdog quiet meanwhile. */
+        if (usec && nvme_poll_hook)
+            nvme_poll_hook();
     }
 }
 
@@ -1067,7 +1095,7 @@ int nvme_lock_owner(void)
     return (int)__atomic_load_n(&nvme_lock_cpu, __ATOMIC_ACQUIRE);
 }
 
-bool nvme_shutdown_for_reset(void)
+bool nvme_shutdown_for_reset(bool mailbox)
 {
     if (!nvme_base || (!nvme_initialized && !nvme_reboot_required))
         return true; /* no session: nothing for the controller to commit */
@@ -1081,8 +1109,11 @@ bool nvme_shutdown_for_reset(void)
                read32(nvme_base + NVME_CC), csts);
         return false;
     }
-    bool done = nvme_ctrl_shutdown();
-    printf("nvme: reset shutdown: CC.SHN normal, SHST %s (CSTS 0x%x)\n", done ? "done" : "NOT done",
+    bool done = nvme_ctrl_shutdown_poll(mailbox);
+    if (done)
+        nvme_shst_confirmed = true;
+    printf("nvme: reset shutdown: CC.SHN normal%s, SHST %s (CSTS 0x%x)\n",
+           mailbox ? "" : " (CSTS only, mailbox left to its owner)", done ? "done" : "NOT done",
            read32(nvme_base + NVME_CSTS));
     return done;
 }
@@ -1703,6 +1734,18 @@ bool nvme_write_blocks(u32 nsid, u64 lba, const void *buffer, u32 count)
         lba > UINT64_MAX - (count - 1) || !nvme_fence_allows(nsid, lba, count))
         return false;
 
+    /*
+     * Multi-block (PRP2 / PRP list) transfers only once this session's multi-block reads were
+     * verified (nvme_read_blocks); otherwise, or after that check failed, one command per block.
+     */
+    if (count > 1 && (!nvme_multi_enabled || !nvme_multi_verified)) {
+        const u8 *bytes = buffer;
+        for (u32 i = 0; i < count; i++)
+            if (!nvme_submit_write(nsid, lba + i, bytes + (size_t)i * SZ_4K, 1, 0))
+                return false;
+        return true;
+    }
+
     u64 prp2 = 0;
     if (count == 2) {
         prp2 = (u64)buffer + SZ_4K;
@@ -1806,4 +1849,19 @@ bool nvme_session_live(void)
 bool nvme_needs_reboot(void)
 {
     return nvme_reboot_required;
+}
+
+bool nvme_has_written(void)
+{
+    return nvme_wrote;
+}
+
+bool nvme_multi_io_verified(void)
+{
+    return nvme_multi_enabled && nvme_multi_verified;
+}
+
+void nvme_abort_io(bool on)
+{
+    __atomic_store_n(&nvme_io_abort, on, __ATOMIC_RELEASE);
 }

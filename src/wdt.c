@@ -61,6 +61,19 @@ void wdt_reboot(void)
     if (!wdt_base)
         return;
 
+    if (chip_id == T8152) {
+        /*
+         * J804: P_REBOOT of the installed Stage 1 (the sequence below) did not reset the M6
+         * (2026-11-12; cause not established).  What has reset it every time since, written
+         * through the proxy with write32: reset enable first, then alarm 0 and count 0, an
+         * immediate bite.  D5 gate R0 checks this path on the carrier before any write.
+         */
+        write32(wdt_base + WDT_CTL, 4);
+        write32(wdt_base + WDT_ALARM, 0);
+        write32(wdt_base + WDT_COUNT, 0);
+        return;
+    }
+
     write32(wdt_base + WDT_ALARM, 0x100000);
     write32(wdt_base + WDT_COUNT, 0);
     write32(wdt_base + WDT_CTL, 4);

@@ -186,6 +186,15 @@ void sim_power_cut(void)
     sim_event('X');
 }
 
+void sim_fill(u64 block, u64 count, u8 v)
+{
+    for (u64 b = block; b < block + count && b < S.nsze; b++) {
+        memset(S.durable + b * SIM_BLOCK, v, SIM_BLOCK);
+        memset(S.vol + b * SIM_BLOCK, v, SIM_BLOCK);
+        S.dirty[b] = 0;
+    }
+}
+
 void sim_reset_happened(void)
 {
     if (!S.snap)
@@ -251,7 +260,8 @@ static u64 rd64(const u8 *p)
 static u8 *prp_page(const u8 *cmd, u32 n, u32 i)
 {
     u64 prp1 = rd64(cmd + 24), prp2 = rd64(cmd + 32);
-    u64 page = i == 0 ? prp1 : n == 2 ? prp2 : ((const u64 *)prp2)[i - 1];
+    u32 entry = S.f.prp_list_broken ? 0 : i - 1;
+    u64 page = i == 0 ? prp1 : n == 2 ? prp2 : ((const u64 *)prp2)[entry];
     if (page & (SIM_BLOCK - 1))
         return NULL;
     if (page < S.guest_hi && page + SIM_BLOCK > S.guest_lo) {
@@ -352,6 +362,8 @@ static u16 io_cmd(const u8 *c)
     } else {
         S.s.writes++;
         S.s.blocks_written += n;
+        if (n > 1)
+            S.s.multi_writes++;
         sim_event('W');
     }
     return 0;
@@ -611,6 +623,8 @@ struct rtkit_dev *rtkit_init(const char *name, struct asc_dev *asc, void *dart, 
 bool rtkit_boot(struct rtkit_dev *r)
 {
     (void)r;
+    if (S.f.boot_fails)
+        return false;
     S.regs[R_BOOT / 4] = BOOT_OK;
     S.s.boots++;
     sim_event('B');

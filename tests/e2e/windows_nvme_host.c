@@ -632,6 +632,8 @@ static void writes_then(int status)
 static void case_exit_system_off(void)
 {
     writes_then(1);
+    CHECK(nvme_multi_io_verified());
+    CHECK(sim_stats()->multi_writes > 0); /* verified multi-block reads: PRP-list writes */
     invariants();
     survives_power_cut(0, 0);
 }
@@ -673,6 +675,8 @@ static void hook_reset_other_cpu(void)
 {
     stub_cpu = 5;
     reset_now();
+    /* CPU 0 is still inside its command: the proxy may not drive the controller meanwhile. */
+    CHECK(hv_ahci_nvme_owns_controller());
     stub_cpu = 0;
 }
 
@@ -699,7 +703,8 @@ static void reset_mid_command(void (*hook)(void), const char *expect)
     /* Everything Windows was told survived; the interrupted command's range is undefined. */
     CHECK(partition_is_ref(sim_snapshot, hook_lba, hook_lba + 64));
     CHECK(outside_unchanged(sim_snapshot));
-    CHECK(sim_stats()->after_reset > 0 || true);
+    /* The closer stopped further I/O: at most the interrupted command reached the doorbell. */
+    CHECK(sim_stats()->after_reset <= 1);
     CHECK(strstr(sim_events(), expect) != NULL);
 }
 
@@ -899,6 +904,12 @@ static void case_gate_w0(void)
     sim_set_guest((u64)ram, (u64)ram + RAM_BYTES);
 
     req.flags = HV_AHCI_NVME_RW | HV_AHCI_NVME_GATE | HV_AHCI_NVME_SCRATCH;
+    /* The image is still on the partition: a scratch attach (writes anywhere) is refused. */
+    EQ(attach(), HV_AHCI_ERROR);
+    EQ(sim_stats()->writes, 0);
+    CHECK(!nvme_fence_active());
+    /* An empty partition (first block zero, as after `create`): accepted. */
+    sim_fill(first, last - first + 1, 0);
     EQ(attach(), 0);
     u64 blocks = last - first + 1;
     const u64 at[][2] = {{0, 1}, {blocks / 2, 8}, {blocks - 64, 64}, {blocks - 1, 1}};
@@ -929,6 +940,93 @@ static void case_gate_w0(void)
            (unsigned long long)hv_ahci_nvme_pattern(0x5eed, 12345, 511));
 }
 
+static void case_gate_w0_tail_rounding(void)
+{
+    /* The free tail starts at the first 4 KiB block holding no byte of the inner disk. */
+    session_setup(HV_AHCI_NVME_RW | HV_AHCI_NVME_GATE);
+    EQ(attach(), 0);
+    u64 inner = hv_ahci_nvme_status(HV_AHCI_NVME_S_INNER_BYTES);
+    u64 floor_b = inner / SIM_BLOCK, ceil_b = (inner + SIM_BLOCK - 1) / SIM_BLOCK;
+    CHECK(inner > 0 && ceil_b < last - first + 1);
+    if (floor_b != ceil_b)
+        EQ(hv_ahci_proxy(HV_AHCI_OP_NVME_TEST, floor_b, 1, 3, HV_AHCI_NVME_TEST_WRITE),
+           HV_AHCI_ERROR);
+    EQ(hv_ahci_proxy(HV_AHCI_OP_NVME_TEST, ceil_b, 1, 3, HV_AHCI_NVME_TEST_WRITE), 0);
+    EQ(hv_ahci_proxy(HV_AHCI_OP_DETACH, 0, 0, 0, 0), HV_AHCI_NVME_CLEAN);
+    sim_power_cut();
+    for (u64 b = 0; b < ceil_b; b++)
+        if (memcmp(sim_durable(first + b), initial + (first + b) * SIM_BLOCK, SIM_BLOCK)) {
+            fprintf(stderr, "[%s] the inner disk changed at block %llu\n", current,
+                    (unsigned long long)b);
+            failures++;
+            break;
+        }
+    CHECK(((const u64 *)sim_durable(first + ceil_b))[0] == hv_ahci_nvme_pattern(3, ceil_b, 0));
+    CHECK(outside_unchanged(sim_durable));
+    printf("{\"tail\": {\"inner_bytes\": %llu, \"first_free\": %llu}}\n", (unsigned long long)inner,
+           (unsigned long long)ceil_b);
+}
+
+static void case_reboot_after_failed_first_wake(void)
+{
+    /* The carrier's first wake (the ANS's second this boot) fails with the ASC left running:
+       nvme_init keeps its DMA resources and needs a SoC reset.  Nothing was written, so
+       P_REBOOT (flush_and_reboot) resets instead of parking with no proxy. */
+    session_setup(HV_AHCI_NVME_RW);
+    sim_faults()->boot_fails = true;
+    EQ(attach(), HV_AHCI_ERROR);
+    CHECK(nvme_needs_reboot());
+    CHECK(!nvme_has_written());
+    EQ(hv_ahci_nvme_state(), HV_AHCI_NVME_DETACHED);
+    CHECK(hv_ahci_nvme_reboot_allowed(false));
+    reset_now();
+    CHECK(strchr(sim_events(), 'X') != NULL);
+    CHECK(strchr(sim_events(), 'P') == NULL);
+    EQ(sim_stats()->writes, 0);
+    invariants();
+}
+
+static void case_multi_write_unverified(void)
+{
+    /* PRP-list DMA misbehaves: the attach's multi-block read self-check catches it, and writes
+       then go one block per command as well (never through the PRP list). */
+    session_setup(HV_AHCI_NVME_RW);
+    sim_faults()->prp_list_broken = true;
+    EQ(attach(), 0);
+    CHECK(!nvme_multi_io_verified());
+    enter();
+    random_traffic(300, 300, false);
+    leave(1);
+    EQ(hv_ahci_nvme_state(), HV_AHCI_NVME_CLEAN);
+    CHECK(sim_stats()->writes > 0);
+    EQ(sim_stats()->multi_writes, 0);
+    invariants();
+    survives_power_cut(0, 0);
+}
+
+static void case_force_reset_after_failed(void)
+{
+    session_setup(HV_AHCI_NVME_RW);
+    EQ(attach(), 0);
+    enter();
+    random_traffic(100, 100, false);
+    sim_faults()->shst_stuck = true;
+    leave(1);
+    EQ(hv_ahci_nvme_state(), HV_AHCI_NVME_FAILED);
+    /* Without FORCE: P_REBOOT is refused, and any other reset path parks. */
+    CHECK(!hv_ahci_nvme_reboot_allowed(false));
+    CHECK(!hv_ahci_nvme_reset_close());
+    u64 attempts = (u64)(strrchr(sim_events(), 'S') - sim_events());
+    /* FORCE: one more shutdown attempt, then a reset even without its confirmation (the
+       reset itself is not simulated here: it would lose writes, which is what FORCE accepts). */
+    CHECK(hv_ahci_nvme_reboot_allowed(true));
+    hv_ahci_nvme_force_reset();
+    CHECK(hv_ahci_nvme_reset_close());
+    CHECK((u64)(strrchr(sim_events(), 'S') - sim_events()) >= attempts);
+    EQ(hv_ahci_nvme_state(), HV_AHCI_NVME_FAILED);
+    invariants();
+}
+
 static const struct {
     const char *name;
     void (*fn)(void);
@@ -956,6 +1054,10 @@ static const struct {
     {"second_attach", case_second_attach},
     {"proxy_and_reboot_rules", case_proxy_and_reboot_rules},
     {"gate_w0", case_gate_w0},
+    {"gate_w0_tail_rounding", case_gate_w0_tail_rounding},
+    {"reboot_after_failed_first_wake", case_reboot_after_failed_first_wake},
+    {"multi_write_unverified", case_multi_write_unverified},
+    {"force_reset_after_failed", case_force_reset_after_failed},
 };
 
 /* ---- attach-only mode (GPT and inner-disk variants) -------------------------------------- */
