@@ -7,6 +7,7 @@
 #include "malloc.h"
 #include "memory.h"
 #include "smp.h"
+#include "soc.h"
 #include "string.h"
 #include "utils.h"
 #include "xnuboot.h"
@@ -100,8 +101,9 @@ static void ctxr_exec_warn_unprobed(const char *why)
 }
 
 /*
- * Ask a secondary to run code outside the boot object. This is the whole test:
- * it is not limited to the chips where the confinement was first seen (T8140,
+ * Ask a secondary to run code outside the boot object, except on T6050 where
+ * an out-of-window fetch hangs and the armed range is read directly. The probe
+ * is not limited to the chips where the confinement was first seen (T8140,
  * then T8142), because any Mac whose iBoot entered a kcbz-0 boot object may
  * leave the windows armed, and one that did not (M1 to M3, or a raw boot
  * object) runs the probe and is not confined.
@@ -114,6 +116,20 @@ bool ctxr_exec_confined(void)
 
     if (confined >= 0)
         return confined;
+
+    /*
+     * T6050 hangs instead of faulting when a secondary fetches outside CTXR_D,
+     * so the heap probe below would strand a CPU: read the armed range instead.
+     * Window admission still checks the full range.
+     */
+    if (chip_id == T6050) {
+        u64 lower, upper;
+        confined = ctxr_range(CTXR_RANGE_D, &lower, &upper);
+        if (confined)
+            printf("CTXR exec: T6050 secondaries confined to [0x%lx, 0x%lx) at EL2\n", lower,
+                   upper);
+        return confined;
+    }
 
     int cpu;
     for (cpu = 0; cpu < MAX_CPUS; cpu++)

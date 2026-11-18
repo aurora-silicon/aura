@@ -96,17 +96,20 @@ On T8140 the windows change where a secondary can execute:
   abort straight to EL2 (ESR 0x8200000c), and execution elsewhere works.
 
 At kboot `ctxr_exec_confined()` (`src/ctxr_exec.c`) asks a secondary to run two
-instructions from the heap, and the machine is confined if that faults. The probe
-runs on every chip, not on a list of chips: a Mac without the windows (M1 to M3,
-or any raw boot object) runs it and boots as it always did. Aura reads a `CTXR`
-register there only when it has no secondary to ask, and then under an exception
-guard. There is no boot option or build option.
+instructions from the heap, and the machine is confined if that faults. T6050
+uses a direct, guarded read of `CTXR_D`: an outside-window fetch hangs there
+instead of faulting. Other chips use the probe, including Macs without the
+windows (M1 to M3 or a raw boot object), which run it and boot as before.
+There is no boot option or build option.
 
-With no secondary running there is nobody to ask, which happens where
-`smp_start_secondaries()` fails. Aura then keeps no answer, reads `CTXR_D` under an
-exception guard, and warns if it is armed. The OS still starts, outside the window,
-on the boot CPU alone, because `dt_set_cpus()` drops every CPU that isn't running.
-A probe that couldn't be sent counts as not confined too.
+With no secondary running, an armed `CTXR_D` and a valid OS execute window
+also establish confinement: a boot core leaving reset must be able to run the
+OS there after sleep. Otherwise Aura warns and retains no answer. The OS can
+then start on the boot CPU alone, because `dt_set_cpus()` drops every CPU that
+isn't running. A probe that could not be sent counts as not confined too.
+On T6050 the direct register check applies even with only the boot CPU running,
+and an armed but undersized window refuses the OS through the normal admission
+checks.
 
 A secondary that doesn't take the probe within 1 second, or takes it and doesn't
 answer within 500 ms, stops the boot. Either way the call stays in its slot, and
