@@ -127,13 +127,15 @@ def test_j613_go_accepts_rtc_wake_without_physical_wake(monkeypatch):
         "AURA_S2R_CRUMBS": str(3 | 32 | 64),
         "AURA_J613_RECOVERY_SECS": "0",
         "AURA_S2R_WAKE_S": "30",
-        "AURA_HIDE_DOCKCHANNEL": "1",
+        "AURA_DEBUG_PORT": "1",
+        "AURA_XNU_SERIAL": "uart0",
+        "AURA_WFI_WATCH": "2",
         "AURA_KEEP_ERRH": "1",
         "AURA_AMCC_CLEAR": "1",
     }.items():
         monkeypatch.setenv(name, value)
     monkeypatch.delenv("AURA_J613_PHYSICAL_WAKE", raising=False)
-    runner.validate_j613_go("-nobsdmgroot wdt=-1")
+    runner.validate_j613_go("disable-uart-irq=1 -nobsdmgroot wdt=-1")
 
 
 def test_j613_go_still_requires_a_wake_source(monkeypatch):
@@ -144,7 +146,9 @@ def test_j613_go_still_requires_a_wake_source(monkeypatch):
         "AURA_S2R_USB_RETAKE": "1",
         "AURA_S2R_CRUMBS": str(3 | 32 | 64),
         "AURA_J613_RECOVERY_SECS": "0",
-        "AURA_HIDE_DOCKCHANNEL": "1",
+        "AURA_DEBUG_PORT": "1",
+        "AURA_XNU_SERIAL": "uart0",
+        "AURA_WFI_WATCH": "2",
         "AURA_KEEP_ERRH": "1",
         "AURA_AMCC_CLEAR": "1",
     }.items():
@@ -152,7 +156,7 @@ def test_j613_go_still_requires_a_wake_source(monkeypatch):
     monkeypatch.delenv("AURA_J613_PHYSICAL_WAKE", raising=False)
     monkeypatch.delenv("AURA_S2R_WAKE_S", raising=False)
     with pytest.raises(SystemExit, match="PHYSICAL_WAKE=1 or WAKE_S>0"):
-        runner.validate_j613_go("-nobsdmgroot wdt=-1")
+        runner.validate_j613_go("disable-uart-irq=1 -nobsdmgroot wdt=-1")
 
 
 def test_j613_go_rejects_verbose_guest_console(monkeypatch):
@@ -164,9 +168,92 @@ def test_j613_go_rejects_verbose_guest_console(monkeypatch):
         "AURA_S2R_CRUMBS": str(3 | 32 | 64),
         "AURA_J613_RECOVERY_SECS": "0",
         "AURA_S2R_WAKE_S": "30",
-        "AURA_HIDE_DOCKCHANNEL": "1",
+        "AURA_DEBUG_PORT": "1",
+        "AURA_XNU_SERIAL": "uart0",
+        "AURA_WFI_WATCH": "2",
         "AURA_S2R_QUIESCE": "24",
     }.items():
         monkeypatch.setenv(name, value)
     with pytest.raises(SystemExit, match="no -v or serial="):
-        runner.validate_j613_go("serial=3 -v -nobsdmgroot wdt=-1")
+        runner.validate_j613_go("disable-uart-irq=1 serial=3 -v -nobsdmgroot wdt=-1")
+
+
+def test_j613_go_requires_uart0_with_dockchannel_present(monkeypatch):
+    runner = load_runner()
+    for name, value in {
+        "AURA_S2R_TRACE": "1",
+        "AURA_S2R_DROP_USB": "1",
+        "AURA_S2R_USB_RETAKE": "1",
+        "AURA_S2R_CRUMBS": str(3 | 32 | 64),
+        "AURA_J613_RECOVERY_SECS": "0",
+        "AURA_S2R_WAKE_S": "30",
+        "AURA_DEBUG_PORT": "1",
+        "AURA_WFI_WATCH": "2",
+        "AURA_KEEP_ERRH": "1",
+        "AURA_AMCC_CLEAR": "1",
+    }.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.delenv("AURA_XNU_SERIAL", raising=False)
+    with pytest.raises(SystemExit, match="XNU_SERIAL=uart0"):
+        runner.validate_j613_go("disable-uart-irq=1 -nobsdmgroot wdt=-1")
+
+
+def test_j613_go_requires_polled_vuart(monkeypatch):
+    runner = load_runner()
+    for name, value in {
+        "AURA_S2R_TRACE": "1",
+        "AURA_S2R_DROP_USB": "1",
+        "AURA_S2R_USB_RETAKE": "1",
+        "AURA_S2R_CRUMBS": str(3 | 32 | 64),
+        "AURA_J613_RECOVERY_SECS": "0",
+        "AURA_S2R_WAKE_S": "30",
+        "AURA_DEBUG_PORT": "1",
+        "AURA_XNU_SERIAL": "uart0",
+        "AURA_WFI_WATCH": "2",
+        "AURA_KEEP_ERRH": "1",
+        "AURA_AMCC_CLEAR": "1",
+    }.items():
+        monkeypatch.setenv(name, value)
+    with pytest.raises(SystemExit, match="disable-uart-irq=1"):
+        runner.validate_j613_go("-nobsdmgroot wdt=-1")
+
+
+def test_j613_go_rejects_removed_dockchannel(monkeypatch):
+    runner = load_runner()
+    for name, value in {
+        "AURA_S2R_TRACE": "1",
+        "AURA_S2R_DROP_USB": "1",
+        "AURA_S2R_USB_RETAKE": "1",
+        "AURA_S2R_CRUMBS": str(3 | 32 | 64),
+        "AURA_J613_RECOVERY_SECS": "0",
+        "AURA_S2R_WAKE_S": "30",
+        "AURA_DEBUG_PORT": "1",
+        "AURA_HIDE_DOCKCHANNEL": "1",
+        "AURA_XNU_SERIAL": "uart0",
+        "AURA_WFI_WATCH": "2",
+        "AURA_KEEP_ERRH": "1",
+        "AURA_AMCC_CLEAR": "1",
+    }.items():
+        monkeypatch.setenv(name, value)
+    with pytest.raises(SystemExit, match="DockChannel node present"):
+        runner.validate_j613_go("disable-uart-irq=1 -nobsdmgroot wdt=-1")
+
+
+def test_j613_go_requires_hypervisor_liveness(monkeypatch):
+    runner = load_runner()
+    for name, value in {
+        "AURA_S2R_TRACE": "1",
+        "AURA_S2R_DROP_USB": "1",
+        "AURA_S2R_USB_RETAKE": "1",
+        "AURA_S2R_CRUMBS": str(3 | 32 | 64),
+        "AURA_J613_RECOVERY_SECS": "0",
+        "AURA_S2R_WAKE_S": "30",
+        "AURA_DEBUG_PORT": "1",
+        "AURA_XNU_SERIAL": "uart0",
+        "AURA_KEEP_ERRH": "1",
+        "AURA_AMCC_CLEAR": "1",
+    }.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.delenv("AURA_WFI_WATCH", raising=False)
+    with pytest.raises(SystemExit, match="AURA_WFI_WATCH>0"):
+        runner.validate_j613_go("disable-uart-irq=1 -nobsdmgroot wdt=-1")

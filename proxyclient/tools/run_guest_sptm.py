@@ -366,7 +366,10 @@ def validate_j613_go(bootargs):
     crumbs = env_int("AURA_S2R_CRUMBS")
     wake_s = env_int("AURA_S2R_WAKE_S")
     wake_source = env_on("AURA_J613_PHYSICAL_WAKE") or wake_s > 0
-    quiet_guest = not any(arg == "-v" or arg.startswith("serial=") for arg in bootargs.split())
+    bootarg_words = bootargs.split()
+    quiet_guest = not any(arg == "-v" or arg.startswith("serial=") for arg in bootarg_words)
+    polled_vuart = "disable-uart-irq=1" in bootarg_words
+    hypervisor_liveness = env_int("AURA_WFI_WATCH") > 0
     link_release = crumbs & (32 | 64) == (32 | 64)
     memory_safe = ((env_on("AURA_KEEP_ERRH") and env_on("AURA_AMCC_CLEAR")) or
                    env_int("AURA_S2R_QUIESCE") & 24 == 24)
@@ -374,10 +377,25 @@ def validate_j613_go(bootargs):
             env_int("AURA_S2R_USB_RETAKE") and recovery == 0 and crumbs >= 3 and wake_source):
         raise SystemExit("J613 GO requires TRACE, DROP_USB, USB_RETAKE, CRUMBS>=3, "
                          "RECOVERY_SECS=0, and PHYSICAL_WAKE=1 or WAKE_S>0")
-    if not (env_on("AURA_HIDE_DOCKCHANNEL") and quiet_guest and link_release and memory_safe):
-        raise SystemExit("J613 GO reuses the qualified sleep window: HIDE_DOCKCHANNEL=1, no -v or "
-                         "serial= boot-arg, CRUMBS bits 5+6, and either KEEP_ERRH=1 with "
-                         "AMCC_CLEAR=1 or QUIESCE=24")
+    if "AURA_DEBUG_PORT" not in os.environ or env_int("AURA_DEBUG_PORT") != 1:
+        raise SystemExit("J613 GO requires AURA_DEBUG_PORT=1 (rear-left/ATC0), the qualified "
+                         "physical debug link")
+    serial_redirect = os.environ.get("AURA_XNU_SERIAL") == "uart0"
+    # Three runs with J613's DockChannel node removed reset early in XNU boot; one positive run
+    # with the node restored passed that window. Keep the supported configuration while that
+    # correlation is narrowed further.
+    # Leave the node present, but move XNU's console to aura's polled uart0. The DockChannel
+    # serial driver then refuses the node, while aura retains and later releases the physical
+    # debug link through the common sleep-window mechanism.
+    dockchannel_present = not env_on("AURA_HIDE_DOCKCHANNEL")
+    if not (dockchannel_present and serial_redirect and polled_vuart and quiet_guest and
+            hypervisor_liveness and
+            link_release and memory_safe):
+        raise SystemExit("J613 GO reuses the qualified sleep window: DockChannel node present, "
+                         "XNU_SERIAL=uart0, disable-uart-irq=1, AURA_WFI_WATCH>0, "
+                         "no -v or serial= boot-arg, "
+                         "CRUMBS bits 5+6, and either KEEP_ERRH=1 with AMCC_CLEAR=1 or "
+                         "QUIESCE=24")
 
 
 def post_entry_drain_needed(iface):
