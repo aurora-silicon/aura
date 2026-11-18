@@ -7,6 +7,12 @@ for example XNU's console on the CDC vuart port. Reopens the serial device when 
 (it disappears across a reset) and timestamps each line.
 """
 
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from aura import alba_cable
+alba_cable.identify()
+
 import argparse
 import glob
 import time
@@ -39,7 +45,13 @@ def main():
                 out.write(f"--- console_tail: silent for {args.idle_exit:g}s, exiting ---\n".encode())
                 return
             if dev is None:
-                devs = sorted(glob.glob(args.glob))
+                if alba_cable.ON_ALBA:
+                    suffix = args.glob.rsplit("-ch-", 1)[-1]
+                    channel = suffix if suffix in "01234567" and len(suffix) == 1 else "1"
+                    path = alba_cable.device(args.glob, channel, pattern=True, wait=True)
+                    devs = [path] if path else []
+                else:
+                    devs = sorted(glob.glob(args.glob))
                 if not devs:
                     time.sleep(1)
                     continue

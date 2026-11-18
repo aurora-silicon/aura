@@ -1,4 +1,13 @@
 # SPDX-License-Identifier: MIT AND GPL-2.0-only
+if __name__ == "__main__" and not __package__:
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    __package__ = "aura"
+
+from . import alba_cable
+if __name__ == "__main__":
+    alba_cable.identify()
 import platform, os, sys, struct, serial, time
 from construct import *
 from enum import IntEnum, IntFlag
@@ -13,6 +22,11 @@ __all__ = ["REGION_RWX_EL0", "REGION_RW_EL0", "REGION_RX_EL1"]
 
 # Hack to disable input buffer flushing
 class Serial(serial.Serial):
+    def open(self):
+        if alba_cable.ON_ALBA and not alba_cable.device(self.port, wait=True):
+            raise SerialException(f"debug cable: saw no {self.port}; wait and retry")
+        return super().open()
+
     def _reset_input_buffer(self):
         return
 
@@ -143,6 +157,8 @@ class UartInterface(Reloadable):
         self.devpath = None
         if device is None:
             device = os.environ.get("AURADEVICE", self.DEFAULT_UART_DEV)
+            if alba_cable.ON_ALBA and "AURADEVICE" not in os.environ:
+                device = alba_cable.default_path()
         if isinstance(device, str):
             baud = self.DEFAULT_BAUD_RATE
             if ":" in device:
@@ -357,7 +373,7 @@ class UartInterface(Reloadable):
     def wait_boot(self):
         try:
             return self.reply(self.REQ_BOOT)
-        except:
+        except Exception:
             # Over USB, reboots cause a reconnect
             self.dev.close()
             print("Waiting for reconnection... ", end="")

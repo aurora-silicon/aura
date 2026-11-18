@@ -90,13 +90,18 @@ Example:
       --xnu kernelcache.decompressed --trustcache iboot.tc --dry-run
 """
 
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from aura import alba_cable
+alba_cable.identify()
+
 import argparse
 import os
 import pathlib
 import secrets
 import struct
 import subprocess
-import sys
 import time
 
 # wdt=-1 keeps XNU from arming the SoC watchdog. -vm_compressor_wk_sw avoids the SVE WKdm

@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT AND GPL-2.0-only
-import sys, pathlib
-sys.path.append(str(pathlib.Path(__file__).resolve().parents[1]))
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from aura import alba_cable
+alba_cable.identify()
+
 
 import argparse, pathlib, time
 

@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
-import sys, pathlib
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from aura import alba_cable
+alba_cable.identify()
+
 import serial
-sys.path.append(str(pathlib.Path(__file__).resolve().parents[1]))
 
 import argparse, pathlib
 
@@ -25,6 +29,9 @@ parser.add_argument('--capture-until', help="stop --capture once the console sho
 parser.add_argument('--capture-input', type=pathlib.Path, help="during --capture, send the lines appended to this file")
 args = parser.parse_args()
 
+if args.tty and alba_cable.ON_ALBA:
+    alba_cable.device(args.tty, args.tty.rsplit("-", 1)[-1])
+
 from aura.setup import *
 
 if args.efi and args.u_boot is None:
@@ -42,7 +49,7 @@ if args.compression == 'auto':
         raise ValueError('unknown compression for {}'.format(args.payload))
 
 if args.tty is not None:
-    tty_dev = serial.Serial(args.tty)
+    tty_dev = serial.Serial(alba_cable.device(args.tty, args.tty.rsplit("-", 1)[-1]))
     tty_dev.reset_input_buffer()
     tty_dev.baudrate = 1500000
 else:
