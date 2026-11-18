@@ -74,6 +74,8 @@ int pmgr_power_is_on(int die, const char *name);
 int pmgr_power_is_requested(int die, const char *name);
 /* Power state register of the real (not virtual) device `name`, 0 if none */
 uintptr_t pmgr_psreg_by_name(int die, const char *name);
+/* Read every unique physical power-state word known to the ADT. Returns the number stored. */
+int pmgr_snapshot(u64 *addr, u32 *value, int max);
 int pmgr_power_steps(int die, const char *name, bool on);
 
 int pmgr_set_mode(uintptr_t addr, u8 target_mode);

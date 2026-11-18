@@ -640,6 +640,42 @@ static bool s2r_cp_compat(int node, const char *prefix);
 static void s2r_regs_snapshot(const char *tag);
 static void s2r_probe_one(u64 e);
 
+/* Bit 10 of AURA_S2R_CRUMBS: a compact, read-only J613 commit-time snapshot. The access trace
+ * cannot recover domains which were already steady before tracing began, and a successful sleep
+ * may make the ring unavailable, so put the values on the always-on console and flush them before
+ * forwarding the commit. */
+static void s2r_j613_commit_snapshot(void)
+{
+    static u64 addr[384];
+    static u32 value[384];
+    int n = pmgr_snapshot(addr, value, ARRAY_SIZE(addr));
+
+    printf("J613-COMMIT-SNAPSHOT PMGR %d\n", n);
+    for (int i = 0; i < n; i++)
+        printf("J613-COMMIT-PMGR 0x%lx 0x%08x\n", addr[i], value[i]);
+
+    static const struct {
+        const char *name, *path;
+    } cp[] = {
+        {"SEP", "/arm-io/sep"},       {"PMP", "/arm-io/pmp"},
+        {"GPU", "/arm-io/gfx-asc"}, {"ANS", "/arm-io/ans"},
+        {"DCP", "/arm-io/dcp"},
+    };
+    for (unsigned i = 0; i < ARRAY_SIZE(cp); i++) {
+        int path[8];
+        u64 base = 0;
+        int node = adt_path_offset_trace(adt, cp[i].path, path);
+        if (node < 0 || adt_get_reg(adt, path, "reg", 0, &base, NULL) < 0) {
+            printf("J613-COMMIT-ASC %s unavailable\n", cp[i].name);
+            continue;
+        }
+        u32 ctl = read32(base + 0x44);
+        printf("J613-COMMIT-ASC %s 0x%lx 0x%08x RUN=%u\n", cp[i].name, base + 0x44, ctl,
+               !!(ctl & 0x10));
+    }
+    iodev_console_flush();
+}
+
 static void s2r_rtc_setup(void)
 {
     int bus = adt_path_offset(adt, "/arm-io");
@@ -1025,6 +1061,8 @@ static bool s2r_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int w
             sptm_virt_rg_disarm();
             s2r_stop_before_timer(ctx, addr, *val);
         }
+        if (chip_id == T8122 && (sptm_virt_s2r_crumbs & 1024))
+            s2r_j613_commit_snapshot();
         s2r_commit();
         s2r_crumb(0x20);
     }

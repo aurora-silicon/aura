@@ -882,6 +882,35 @@ uintptr_t pmgr_psreg_by_name(int die, const char *name)
     return dev ? pmgr_device_get_addr(die, dev) : 0;
 }
 
+int pmgr_snapshot(u64 *addr, u32 *value, int max)
+{
+    if (!pmgr_initialized || !addr || !value || max <= 0)
+        return 0;
+
+    int n = 0;
+    for (u8 die = 0; die < pmgr_dies; die++) {
+        for (size_t i = 0; i < pmgr_devices_len; i++) {
+            const struct pmgr_device *dev = &pmgr_devices[i];
+            if (dev->flags & PMGR_FLAG_VIRTUAL)
+                continue;
+            u64 a = pmgr_device_get_addr(die, dev);
+            if (!a)
+                continue;
+            bool duplicate = false;
+            for (int j = 0; j < n; j++)
+                duplicate |= addr[j] == a;
+            if (duplicate)
+                continue;
+            if (n >= max)
+                return n;
+            addr[n] = a;
+            value[n] = read32(a);
+            n++;
+        }
+    }
+    return n;
+}
+
 int pmgr_power_on(int die, const char *name)
 {
     uintptr_t addr = pmgr_psreg_by_name(die, name);
