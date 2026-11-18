@@ -22,6 +22,7 @@ Environment (all optional; 1 enables a switch):
   AURA_AMCC_CLEAR          clear the AMCC error latches stage 1 left, before entry
   AURA_S2R_TRACE           sleep path: hooks on the power blocks and the trace ring
   AURA_S2R_GO              let the sleep proceed (otherwise stop in the proxy before it)
+  AURA_S2R_LATE_STOP       J613 stop mode: shadow the commit, stop at the final deep WFI
   AURA_S2R_FULLTRACE       also hook the high-volume blocks
   AURA_S2R_COPROC          also hook the coprocessor and exclave mailboxes
   AURA_S2R_MEM             T6050: also hook the MCC, AMCC, DCS and coprocessor DARTs
@@ -53,6 +54,7 @@ Environment (all optional; 1 enables a switch):
   AURA_SAMPLE_HZ=<n>       samples per second (default 4)
   AURA_SAMPLE_MAX=<n>      stop printing after n samples (default 64)
   AURA_J613_RUN            admit the exact J613 stock-SPTM path without the bounded MMIO trace
+  AURA_J613_PHYSICAL_WAKE  J613 GO: assert that an attended key/lid wake is available
   AURA_XNU_ENTRY           patch the guest kernelcache's acct(2) so a root process reaches aura's
                            control hvc with no kext (the auractl "xnu" entry; aura/auractl_xnu.py)
   AURA_XNU_RO_RELAX        patch XNU's zalloc_ro_mut RO-zone panic out (tracing only; XNU_QUIRKS)
@@ -129,6 +131,7 @@ KNOWN_ENV = {
     "AURA_S2R_PROBE_AT",
     "AURA_S2R_CRUMBS",
     "AURA_S2R_EXTRA",
+    "AURA_S2R_LATE_STOP",
     "AURA_AURA_HEAP_MIB",
     "AURA_KEEP_EXCLAVES",
     "AURA_OS_LONG_VERSION",
@@ -153,6 +156,7 @@ KNOWN_ENV = {
     "AURA_TAIL_IDLE",
     "AURA_RETURN_AFTER_NO_ENTER",
     "AURA_J613_RUN",
+    "AURA_J613_PHYSICAL_WAKE",
     "AURA_J613_RECOVERY_SECS",
     "AURA_GPU_STOP_SECS",
     "AURA_GPU_STOP_BOOT_SECS",
@@ -777,6 +781,9 @@ def configure(p, sym, plan, adt, ctl_cookie=0):
     if os.environ.get("AURA_S2R_EXTRA"):
         p.write32(sym["sptm_virt_s2r_extra"], env_int("AURA_S2R_EXTRA"))
         print("extra stop-mode trace blocks, mask", os.environ["AURA_S2R_EXTRA"])
+    if env_on("AURA_S2R_LATE_STOP"):
+        p.write32(sym["sptm_virt_s2r_late_stop"], 1)
+        print("J613 late stop: shadow the sleep commit and stop at the final deep WFI")
     if os.environ.get("AURA_S2R_USB_RETAKE"):
         p.write32(sym["sptm_virt_s2r_usb_retake"], env_int("AURA_S2R_USB_RETAKE"))
         p.write32(sym["sptm_virt_s2r_usb_delay_ms"], env_int("AURA_S2R_USB_RETAKE_MS"))
@@ -870,11 +877,25 @@ def main():
         sptm_j613.validate_resources(lambda path, idx: u.adt[path].get_reg(idx))
         if not (env_on("AURA_J613_RUN") or env_on("AURA_J613_TRACE")):
             raise SystemExit("T8122 requires experimental AURA_J613_RUN=1")
+        j613_go = env_on("AURA_S2R_GO")
         allowed = {"AURA_J613_TRACE", "AURA_S2R_TRACE"}
+        if j613_go:
+            allowed |= {"AURA_S2R_GO", "AURA_S2R_DROP_USB"}
         if any(env_on(k) for k in CONFIG_FLAGS if k not in allowed):
-            raise SystemExit("J613: only the exact J613 trace or precommit sleep trace is qualified")
+            raise SystemExit("J613: only the exact trace, stop trace, or explicitly physical-wake GO is qualified")
         if env_on("AURA_J613_TRACE") and env_on("AURA_S2R_TRACE"):
             raise SystemExit("J613: the exact J613 trace and sleep trace are separate modes")
+        if env_on("AURA_S2R_LATE_STOP") and (not env_on("AURA_S2R_TRACE") or j613_go):
+            raise SystemExit("J613: AURA_S2R_LATE_STOP requires stop-mode AURA_S2R_TRACE")
+        if j613_go:
+            recovery = int(os.environ.get("AURA_J613_RECOVERY_SECS", "30"), 0)
+            crumbs = int(os.environ.get("AURA_S2R_CRUMBS", "0"), 0)
+            if not (env_on("AURA_S2R_TRACE") and env_on("AURA_S2R_DROP_USB") and
+                    env_on("AURA_J613_PHYSICAL_WAKE") and
+                    int(os.environ.get("AURA_S2R_USB_RETAKE", "0"), 0) and
+                    recovery == 0 and crumbs >= 3 and not os.environ.get("AURA_S2R_WAKE_S")):
+                raise SystemExit("J613 GO requires TRACE, DROP_USB, PHYSICAL_WAKE, USB_RETAKE, "
+                                 "CRUMBS>=3, RECOVERY_SECS=0, and no unproven RTC wake")
         # Deliberately before reading images or placing anything on the target.
         try:
             sptm_j613.patch_plan(None, None)

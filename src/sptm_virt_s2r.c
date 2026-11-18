@@ -109,6 +109,7 @@ u32 sptm_virt_s2r_quiesce;    /* S2R_QUIESCE_* */
 u32 sptm_virt_s2r_wake_s;     /* GO, timer-only sleep: PMU RTC alarm this many s after the commit */
 u32 sptm_virt_s2r_go_count;   /* GO, timer-only sleep: stop at the commit after this many wakes */
 u32 sptm_virt_s2r_crumbs;    /* go-mode experiments on J813, a bit mask: see s2r_crumb() */
+u32 sptm_virt_s2r_late_stop; /* J613 stop: shadow the commit, stop at the final deep WFI */
 u32 sptm_virt_s2r_arm_s;     /* host: seconds from setup to the sleep rules (0: 45) */
 u32 sptm_virt_s2r_win[2];
 /* The wake core + 1 when it is to arm the stage 2 at its SPTM entry (option bit 256), else 0. */
@@ -997,14 +998,21 @@ static bool s2r_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int w
     }
     bool timer = write && width <= 3 && *val == 1 && !strcmp(what, "pmgr-aon-pst") &&
                  (addr & 0x7fff) == S2R_TIMER_OFF && s2r_armed();
+    bool shadow_timer = timer && !s2r_go && chip_id == T8122 && sptm_virt_s2r_late_stop;
     /* AURA_S2R_GO_COUNT here too (J813): after n go-mode wakes, the next commit stops like stop
      * mode, so the ring holds the sleep, the wake and the next entry for the proxy to read. */
     if (timer && (!s2r_go || (sptm_virt_s2r_go_count && s2r_wake_count >= sptm_virt_s2r_go_count))) {
         sptm_virt_rg_stop_wd2();
         sptm_virt_s2r_note(ctx, addr, *val, true, width);
-        s2r_stop_before_timer(ctx, addr, *val);
+        if (!shadow_timer)
+            s2r_stop_before_timer(ctx, addr, *val);
+        sptm_virt_j613_pmu_mark(0xaf);
+        s2r_marker("S2RSHDW", addr);
+        printf("SPTM-virt[s2r]: J613 sleep commit [0x%lx] <- 0x%lx shadowed; "
+               "waiting for every core's final deep WFI\n",
+               addr, *val);
     }
-    if (timer) {
+    if (timer && !shadow_timer) {
         s2r_crumb_at(9, ++s2r_crumb_commits);
         s2r_crumb(0x10);
         s2r_commit();
@@ -1026,10 +1034,12 @@ static bool s2r_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int w
                addr, ctx->elr);
         return false;
     }
-    sptm_virt_mmio_rw(addr, val, write, width);
-    if (timer)
+    if (!shadow_timer)
+        sptm_virt_mmio_rw(addr, val, write, width);
+    if (timer && !shadow_timer)
         s2r_crumb(0x30);
-    sptm_virt_s2r_note(ctx, addr, *val, write, width);
+    if (!shadow_timer)
+        sptm_virt_s2r_note(ctx, addr, *val, write, width);
     /* host: AURA_S2R_PROBE_AT, a guest write after a wake that, once performed, triggers the
      * AURA_S2R_PROBE reads (once per wake): where in macOS's own sequence a block becomes
      * readable. */
@@ -1715,7 +1725,7 @@ void sptm_virt_s2r_setup(bool cdc)
     }
     /* A timer-only sleep has no stop before the commit to read a ring from: keep it all. */
     /* With AURA_S2R_GO_COUNT the ring must hold a sleep, its wake and the next entry. */
-    u64 ring_bytes = s2r_soc->timer_only         ? S2R_RING_BYTES_BIG
+    u64 ring_bytes = (s2r_soc->timer_only || chip_id == T8122) ? S2R_RING_BYTES_BIG
                      : sptm_virt_s2r_go_count ? (48UL << 20)
                                               : S2R_RING_BYTES;
     if (!s2r_ring_alloc(ring_bytes)) {
