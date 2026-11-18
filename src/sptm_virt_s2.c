@@ -449,8 +449,7 @@ static bool amcc_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int 
         if ((addr & 0x3fff) == t8122_amcc.cache_status) {
             if (!write) {
                 sptm_virt_mmio_rw(addr, val, false, width);
-                *val = (*val & ~t8122_amcc.cache_status_mask) |
-                       t8122_amcc.cache_status_value;
+                *val = (*val & ~t8122_amcc.cache_status_mask) | t8122_amcc.cache_status_value;
             }
             return true;
         }
@@ -486,10 +485,9 @@ static bool sptm_virt_amcc_contract_t8122(void)
         !adt_u32_is(bank, "lower-limit-reg-mask", 0xffffffff) ||
         !adt_u32_is(bank, "upper-limit-reg-offset", 0x694) ||
         !adt_u32_is(bank, "upper-limit-reg-mask", 0xffffffff) ||
-        !adt_u32_is(bank, "enable-reg-offset", 0x698) ||
-        !adt_u32_is(bank, "enable-reg-mask", 1) || !adt_u32_is(bank, "enable-reg-value", 1) ||
-        !adt_u32_is(bank, "lock-reg-offset", 0x69c) || !adt_u32_is(bank, "lock-reg-mask", 1) ||
-        !adt_u32_is(bank, "lock-reg-value", 1) ||
+        !adt_u32_is(bank, "enable-reg-offset", 0x698) || !adt_u32_is(bank, "enable-reg-mask", 1) ||
+        !adt_u32_is(bank, "enable-reg-value", 1) || !adt_u32_is(bank, "lock-reg-offset", 0x69c) ||
+        !adt_u32_is(bank, "lock-reg-mask", 1) || !adt_u32_is(bank, "lock-reg-value", 1) ||
         !adt_u32_is(bank, "write-disable-reg-offset", 0x6a0) ||
         !adt_u32_is(bank, "write-disable-reg-mask", 1) ||
         !adt_u32_is(bank, "write-disable-reg-value", 1) ||
@@ -541,8 +539,7 @@ static bool sptm_virt_amcc_watch_t8122(void)
             u64 page = base + p * stride;
             if (hv_map_hook(page, amcc_hook, 0x4000) < 0) {
                 t8122_amcc_ready = false;
-                printf("SPTM-virt[amcc]: cannot hook T8122 MCC %d plane %d at 0x%lx\n", i, p,
-                       page);
+                printf("SPTM-virt[amcc]: cannot hook T8122 MCC %d plane %d at 0x%lx\n", i, p, page);
                 return false;
             }
         }
