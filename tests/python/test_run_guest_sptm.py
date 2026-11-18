@@ -98,3 +98,17 @@ def test_j613_has_no_ctrr_stash_write():
                               "sptm_virt_ctrr_stash_off": 0x20}, 0x1000,
                       {"patches": [], "mte": None, "ctrr_stash_off": None})
     assert proxy.writes == []
+
+
+def test_go_wake_alarm_covers_non_timer_commit():
+    source = (REPO / "src/sptm_virt_s2r.c").read_text()
+    assert """s2r_usb_setup();
+    if (s2r_go && sptm_virt_s2r_wake_s)
+        s2r_rtc_setup();""" in source
+    commit = source[source.index("if (timer && !shadow_timer) {"):]
+    commit = commit[:commit.index("\n    }") + 6]
+    assert commit.index("s2r_rtc_arm();") < commit.index("s2r_commit();")
+
+    help_text = (REPO / "proxyclient/tools/run_guest_sptm.py").read_text()
+    line = next(line for line in help_text.splitlines() if "AURA_S2R_WAKE_S=<s>" in line)
+    assert "timer-only" not in line

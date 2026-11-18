@@ -106,7 +106,7 @@ u32 sptm_virt_s2r_pages;         /* pages hooked */
 
 /* Set by the host before entry (run_guest_sptm.py). */
 u32 sptm_virt_s2r_quiesce;    /* S2R_QUIESCE_* */
-u32 sptm_virt_s2r_wake_s;     /* GO, timer-only sleep: PMU RTC alarm this many s after the commit */
+u32 sptm_virt_s2r_wake_s;     /* GO: PMU RTC alarm this many s after the commit */
 u32 sptm_virt_s2r_go_count;   /* GO, timer-only sleep: stop at the commit after this many wakes */
 u32 sptm_virt_s2r_crumbs;    /* go-mode experiments on J813, a bit mask: see s2r_crumb() */
 u32 sptm_virt_s2r_late_stop; /* J613 stop: shadow the commit, stop at the final deep WFI */
@@ -1015,6 +1015,8 @@ static bool s2r_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int w
     if (timer && !shadow_timer) {
         s2r_crumb_at(9, ++s2r_crumb_commits);
         s2r_crumb(0x10);
+        if (sptm_virt_s2r_wake_s)
+            s2r_rtc_arm();
         s2r_commit();
         s2r_crumb(0x20);
     }
@@ -1777,6 +1779,8 @@ void sptm_virt_s2r_setup(bool cdc)
     sptm_virt_rg_passthrough = s2r_go;
     s2r_link_iodev = uartproxy_iodev;
     s2r_usb_setup();
+    if (s2r_go && sptm_virt_s2r_wake_s)
+        s2r_rtc_setup();
     if (s2r_go && (sptm_virt_s2r_crumbs & 2)) { /* bit 1: SPMI notes */
         s2r_crumb_dev = spmi_init("/arm-io/nub-spmi0");
         s2r_crumb(0x01);

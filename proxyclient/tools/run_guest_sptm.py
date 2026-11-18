@@ -30,7 +30,7 @@ Environment (all optional; 1 enables a switch):
   AURA_S2R_DCP_PKT         T6050 COPROC: copy the DCPs' IOMFB packets into the ring
   AURA_S2R_CP_ANSX=<mask>  T6050 COPROC: also hook 1 the ANS SART, 2 the NVMe BAR page, 4 AUS5
   AURA_S2R_DROP_USB        tear down aura's USB gadget at the sleep commit
-  AURA_S2R_WAKE_S=<s>      GO, timer-only sleep: arm the PMU RTC alarm s seconds after the commit
+  AURA_S2R_WAKE_S=<s>      GO: arm the PMU RTC alarm s seconds after the commit
   AURA_S2R_GO_COUNT=<n>    GO: after n wakes, stop in the proxy at the next commit
   AURA_S2R_CRUMBS=<mask>   T8142 GO: note steps in PMU scratch (0x830d..0x8311), which a reset
                            keeps; bits as in sptm_virt_s2r.c (s2r_crumb)
