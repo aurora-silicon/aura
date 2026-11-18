@@ -1,17 +1,19 @@
 /* SPDX-License-Identifier: MIT */
 
 /*
- * G0 + G1 GPU passthrough, carrier side.  See hv_gpu.h and windows-m6/G0-CARRIER-CONTRACT.md.
+ * G0 + G1 + G2 GPU passthrough, carrier side.  See hv_gpu.h and windows-m6/G0-CARRIER-CONTRACT.md.
  * Every address comes from the admission (the live ADT); the only fixed values are the J804
  * firmware receipt, the pool rules and the forwarded register offsets of gpu_t8152_probe.c (our
- * own observation).  The PSD power recipe comes from private data at build time.
+ * own observation).  The PSD power recipe and the G2 recipe come from private data at build time.
  */
 
 #include "hv_gpu.h"
 #include "adt.h"
 #include "gpu_t8152_admit.h"
+#include "gpu_t8152_g2.h"
 #include "gpu_t8152_power.h"
 #include "gpu_t8152_probe.h"
+#include "gpu_t8152_uat.h"
 #include "hv.h"
 #include "malloc.h"
 #include "memory.h"
@@ -19,6 +21,9 @@
 #include "string.h"
 #include "utils.h"
 #include "xnuboot.h"
+#ifndef HV_GPU_HOST_TEST
+#include "mcc.h"
+#endif
 
 extern void aura_sha256(const void *data, size_t size, u8 digest[32]);
 
@@ -54,6 +59,31 @@ static struct gpu_access_map amap;
 static u32 amap_lock;
 static u64 forwarded, denied, run_refused, faults;
 static u32 msgs_logged;
+/* G2 */
+static bool g2;       /* HV_GPU_OP_G2 armed this session */
+static u32 g2_grants; /* GPU_G2_GRANT_* */
+static struct gpu_range declared[GPU_G2_MAX_WINDOWS];
+static u32 declared_count;
+static u64 boot_addr;
+static u32 boot_before, boot_after;
+static bool boot_done, sgx_locked;
+static u32 init_sent; /* BIT(role): init data forwarded */
+static u64 msg_count[GPU_T8152_ROLES][2][GPU_MK_COUNT];
+static u64 guard[HV_GPU_G_COUNT];
+/*
+ * Serialises a G2 message decision with its forward (one init-data message per role even if two
+ * CPUs write at once) and every UAT audit (one walk buffer, one report).
+ */
+static u32 g2_lock;
+/* The UAT audit (every PROBE) */
+#define UAT_VISITED_CAP  1024
+#define UAT_PRINT_LIMIT  64
+static struct gpu_uat_scope uat_scope;
+static struct gpu_uat_baseline uat_base;
+static struct gpu_uat_report uat_last;
+static u64 *uat_visited;
+static u32 uat_audits, uat_printed, uat_fresh_max;
+static bool uat_ready;
 
 #ifdef HV_GPU_HOST_TEST
 #define gpu_read_text hv_gpu_host_read_text
@@ -62,6 +92,11 @@ static u32 msgs_logged;
 #define psd_write32 hv_gpu_host_write32
 #define psd_delay   hv_gpu_host_delay
 #define marker_read hv_gpu_host_marker_read
+static const u64 *uat_page(u64 pa, void *arg)
+{
+    (void)arg;
+    return hv_gpu_host_uat_page(pa);
+}
 #else
 /*
  * A forwarded access, with aura's guarded MMIO (a fault returns false instead of taking the
@@ -106,6 +141,33 @@ static bool gpu_read_text(u64 phys, void *buf, u64 size)
     memcpy(buf, (const void *)phys, size);
     return true;
 }
+
+/*
+ * One 16 KiB page of GPU page tables, coherent with what the guest (write-combined pool, or
+ * write-back plus clean) and the firmware wrote.  Only RAM aura maps, outside every unmapped
+ * carve-out, and only after a guarded read proved the page is mapped at EL2 (a cache maintenance
+ * operation on an unmapped page would fault unguarded).  The callers only ask for pages of the
+ * pool and the two page-table regions.
+ */
+static const u64 *uat_page(u64 pa, void *arg)
+{
+    static struct exc_info scratch;
+    (void)arg;
+    if (pa & (GPU_T8152_PAGE - 1) || pa < ram_base || pa - ram_base >= mem_size_actual ||
+        mem_size_actual - (pa - ram_base) < GPU_T8152_PAGE)
+        return NULL;
+    for (size_t i = 0; i < mcc_carveout_count; i++)
+        if (pa < mcc_carveouts[i].base + mcc_carveouts[i].size &&
+            mcc_carveouts[i].base < pa + GPU_T8152_PAGE)
+            return NULL;
+    u64 v[2];
+    if (!hv_pa_read(&scratch, pa, v, 3))
+        return NULL;
+    sysop("dsb sy");
+    dc_civac_range((void *)pa, GPU_T8152_PAGE);
+    sysop("dsb sy");
+    return (const u64 *)pa;
+}
 #endif
 
 /*
@@ -114,11 +176,18 @@ static bool gpu_read_text(u64 phys, void *buf, u64 size)
  */
 static bool handoff_publish(void)
 {
-    struct gpu_t8152_handoff_in in = {state, handoff_pa, pool_base, pool_size, {0}, {0}, {0}};
+    struct gpu_t8152_handoff_in in = {state, handoff_pa, pool_base, pool_size, {0}, {0}, {0},
+                                      0, NULL, 0};
     if (state & GPU_HS_POWERED) {
         memcpy(in.gpu_id, gpu_id, sizeof(gpu_id));
         memcpy(in.cpu_control, cpu_control, sizeof(cpu_control));
         memcpy(in.cpu_status, cpu_status, sizeof(cpu_status));
+    }
+    if (state & GPU_HS_SGX_BOOT)
+        in.boot_control = boot_after;
+    if (g2_grants & GPU_G2_GRANT_FW_MMIO) {
+        in.declared = declared;
+        in.declared_count = declared_count;
     }
     if (!handoff || !gpu_t8152_handoff_build(handoff, GPU_HANDOFF_SIZE, &adm, table, table_count,
                                              &in))
@@ -444,6 +513,9 @@ static void marker_update(u32 set)
     marker->denied = (u32)__atomic_load_n(&denied, __ATOMIC_RELAXED);
     marker->run_refused = (u32)__atomic_load_n(&run_refused, __ATOMIC_RELAXED);
     marker->faults = (u32)__atomic_load_n(&faults, __ATOMIC_RELAXED);
+    marker->boot_control_before = boot_before;
+    marker->boot_control_after = boot_after;
+    marker->g2 = g2 ? HV_GPU_G2_ARMED | g2_grants << 1 : 0;
     gpu_t8152_marker_seal(marker);
     dc_civac_range(marker, sizeof(*marker));
 }
@@ -489,7 +561,7 @@ static int marker_claim(const struct gpu_psd_sample *before, u32 nsteps, bool co
         marker = NULL;
         return -1;
     }
-    marker->state = GPU_BM_CLAIMED | (cold ? 0 : GPU_BM_FOREIGN);
+    marker->state = GPU_BM_CLAIMED | (cold ? 0 : GPU_BM_FOREIGN) | (g2 ? GPU_BM_G2 : 0);
     marker->pool_base = pool_base;
     marker->pool_size = pool_size;
     for (u32 i = 0; i < nsteps && i < GPU_PSD_MAX_STEPS; i++)
@@ -544,6 +616,41 @@ static void read_identity(void)
                run ? ": the firmware is running; the guest adopts it" :
                      ": the carrier never sets RUN, so the probe cannot adopt this ASC");
     }
+}
+
+/*
+ * G2 C1 (owner decision G2-D2): the one checked sgx boot-control step, right after power-on and
+ * before the guest exists.  Read; refuse unless the recipe accepts the value; write it with the
+ * recipe's bits set; read back; it must be the recipe's expected value.  Never again this boot
+ * (POWER runs once per boot).  The GPU stays powered whatever happens.
+ */
+static int boot_control_step(void)
+{
+    const struct gpu_g2_recipe *r = gpu_t8152_g2_recipe();
+    boot_before = hw_read32(boot_addr);
+    if (!gpu_t8152_g2_boot_accepts(r, boot_before)) {
+        marker_update(GPU_BM_GUARD);
+        printf("HV: GPU: boot-control sgx+0x%lx reads 0x%x, not a value the recipe accepts: not "
+               "written; the GPU stays powered: reboot the M6\n",
+               boot_addr - adm.sgx.base, boot_before);
+        return HV_GPU_E_BOOT_CONTROL;
+    }
+    u64 v[2] = {boot_before | r->boot_set, 0};
+    if (!hw_rw(NULL, boot_addr, v, true, 2)) {
+        __atomic_add_fetch(&faults, 1, __ATOMIC_RELAXED);
+        printf("HV: GPU: boot-control write faulted\n");
+    }
+    boot_after = hw_read32(boot_addr);
+    marker_update(GPU_BM_BOOT_CONTROL);
+    printf("HV: GPU: boot-control sgx+0x%lx 0x%x -> 0x%x (G2-D2, once this boot)%s\n",
+           boot_addr - adm.sgx.base, boot_before, boot_after,
+           boot_after == r->boot_expect ? "" : ": NOT the expected value; reboot the M6");
+    if (boot_after != r->boot_expect)
+        return HV_GPU_E_BOOT_CONTROL;
+    boot_done = true;
+    state |= GPU_HS_SGX_BOOT;
+    handoff_publish();
+    return 0;
 }
 
 static int power(void)
@@ -615,7 +722,145 @@ static int power(void)
     handoff_publish();
     printf("HV: GPU: powered: every PSD service on; the GPU firmware session of this boot is "
            "now in use (boot marker)\n");
+    if (g2 && (g2_grants & GPU_G2_GRANT_BOOT_CONTROL))
+        return boot_control_step();
     return 0;
+}
+
+/* ---- G2: the grants ------------------------------------------------------------------------- */
+
+/*
+ * HV_GPU_OP_G2, after ADMIT and before POWER, once: arm the G2 guards for the PROBE that follows,
+ * with the launcher's grants (owner decisions G2-D1 fw-mmio, G2-D2 boot-control).  Everything is
+ * checked before anything is recorded; a refusal touches nothing (the session can still run G1).
+ */
+static int g2_arm(u64 grants)
+{
+    if (!state_ok("G2"))
+        return HV_GPU_E_STATE;
+    if (!admitted || hooked || power_tried || g2) {
+        printf("HV: GPU: G2 refused: %s\n",
+               !admitted   ? "the GPU is not admitted" :
+               hooked      ? "this session has the G0 logging hooks" :
+               power_tried ? "POWER already ran (G2 is armed between ADMIT and POWER)" :
+                             "G2 is armed once per session");
+        return HV_GPU_E_STATE;
+    }
+    const struct gpu_g2_recipe *r = gpu_t8152_g2_recipe();
+    if (grants & ~(u64)GPU_G2_GRANTS) {
+        printf("HV: GPU: G2 refused: unknown grant bits 0x%lx\n", grants);
+        return HV_GPU_E_G2;
+    }
+    if (gpu_t8152_g2_check(r))
+        return HV_GPU_E_G2;
+    u64 rb, rs;
+    hv_t8152_guest_ram(&rb, &rs);
+    int n = 0;
+    if (grants & GPU_G2_GRANT_FW_MMIO) {
+        n = gpu_t8152_g2_declare(r, &adm, table, table_count, rb, rb + rs, declared,
+                                 ARRAY_SIZE(declared));
+        if (n < 0)
+            return HV_GPU_E_G2;
+    }
+    u64 addr = 0;
+    if ((grants & GPU_G2_GRANT_BOOT_CONTROL) &&
+        gpu_t8152_g2_boot_check(r, &adm, table, table_count, &addr))
+        return HV_GPU_E_G2;
+    for (u32 i = 0; i < r->nroots; i++)
+        if (r->root[i].offset >= adm.region[r->root[i].region].size) {
+            printf("HV: GPU: G2 refused: extra UAT root %u lies outside its region\n", i);
+            return HV_GPU_E_G2;
+        }
+    g2 = true;
+    g2_grants = (u32)grants;
+    declared_count = (u32)n;
+    boot_addr = addr;
+    handoff_publish();
+    printf("HV: GPU: G2 armed (%s): fw-mmio %s (G2-D1), boot-control %s (G2-D2); whole messages "
+           "only, one init-data message per role, %u refused types, sgx locked after init, UAT "
+           "audit before every EP 0x%x/0x%x message\n",
+           r->source, n ? "declared" : "not granted", addr ? "granted" : "not granted",
+           r->nrefused, GPU_MSG_EP_GFX, GPU_MSG_EP_DOORBELL);
+    for (u32 i = 0; i < declared_count; i++)
+        printf("HV: GPU: fw-mmio slot %u [0x%lx, +0x%lx) %s, anchored in /arm-io/%s\n",
+               declared[i].tag, declared[i].base, declared[i].size,
+               declared[i].flags & GPU_RF_READ_ONLY ? "RO" : "RW", declared[i].name);
+    return 0;
+}
+
+/* ---- the UAT audit (gpu_t8152_uat.h) --------------------------------------------------------- */
+
+static void uat_setup(void)
+{
+    struct gpu_uat_scope *s = &uat_scope;
+    memset(s, 0, sizeof(*s));
+    s->pool = (struct gpu_uat_span){pool_base, pool_size};
+    for (u32 i = 0; i < 4; i++) {
+        s->fw_rw[i] = (struct gpu_uat_span){adm.region[i].base, adm.region[i].size};
+        s->fw_ro[i] = (struct gpu_uat_span){adm.region[4 + i].base, adm.region[4 + i].size};
+    }
+    for (u32 r = 0; r < GPU_T8152_ROLES; r++)
+        s->text[r] = (struct gpu_uat_span){adm.text[r].base, adm.text[r].size};
+    s->ctx_table = (struct gpu_uat_span){adm.region[GPU_R_TTBS].base, adm.region[GPU_R_TTBS].size};
+    s->tables[0] = s->pool;
+    s->tables[1] = (struct gpu_uat_span){adm.region[GPU_R_PAGETABLES].base,
+                                         adm.region[GPU_R_PAGETABLES].size};
+    s->tables[2] = (struct gpu_uat_span){adm.region[GPU_R_SHARED_L2].base,
+                                         adm.region[GPU_R_SHARED_L2].size};
+    s->dram_base = adm.dram_base;
+    s->dram_size = adm.dram_size;
+    if (g2_grants & GPU_G2_GRANT_FW_MMIO) {
+        s->fw_mmio = declared;
+        s->nfw_mmio = declared_count;
+    }
+    const struct gpu_g2_recipe *r = gpu_t8152_g2_recipe();
+    if (r->available && !gpu_t8152_g2_check(r))
+        for (u32 i = 0; i < r->nroots && s->nroots < GPU_UAT_MAX_ROOTS; i++)
+            if (r->root[i].offset < adm.region[r->root[i].region].size)
+                s->roots[s->nroots++] = adm.region[r->root[i].region].base + r->root[i].offset;
+    if (!uat_visited)
+        uat_visited = malloc(UAT_VISITED_CAP * sizeof(u64));
+    s->visited = uat_visited;
+    s->visited_cap = uat_visited ? UAT_VISITED_CAP : 0;
+    if (!uat_base.e) {
+        /* Room for every entry of every firmware table page (about 1.6 MiB on the M6). */
+        u32 cap = gpu_uat_baseline_cap(s);
+        uat_base.e = malloc((size_t)cap * sizeof(*uat_base.e));
+        uat_base.cap = uat_base.e ? cap : 0;
+    }
+    uat_ready = s->visited && uat_base.e;
+}
+
+static void uat_print(const char *when, const struct gpu_uat_report *rep, bool force)
+{
+    if (!force && __atomic_fetch_add(&uat_printed, 1, __ATOMIC_RELAXED) >= UAT_PRINT_LIMIT)
+        return;
+    printf("HV: GPU: UAT audit %s: %u roots, %u tables%s; leaves pool %u uat %u data %u fw-mmio %u; "
+           "outliers %u (%u in the baseline): text %u dram %u mmio %u bad %u table %u; fresh %u "
+           "(%u in guest tables)\n",
+           when, rep->roots, rep->tables, rep->capped ? " (CAPPED: incomplete)" : "",
+           rep->leaves[GPU_UC_POOL], rep->leaves[GPU_UC_UAT], rep->leaves[GPU_UC_DATA],
+           rep->leaves[GPU_UC_FW_MMIO], rep->outliers, rep->known, rep->leaves[GPU_UC_TEXT],
+           rep->leaves[GPU_UC_DRAM], rep->leaves[GPU_UC_MMIO], rep->leaves[GPU_UC_BAD],
+           rep->leaves[GPU_UC_TABLE], rep->fresh, rep->fresh_in_pool);
+    for (u32 i = 0; i < rep->nfirst; i++)
+        printf("HV: GPU: UAT outlier: entry 0x%lx (level %u%s) descriptor 0x%lx: %s\n",
+               rep->first[i].key, rep->first[i].level, rep->first[i].in_pool ? ", guest table" : "",
+               rep->first[i].desc, gpu_uat_class_name(rep->first[i].cls));
+}
+
+/* One audit against the PROBE baseline; the report stays readable through STATUS. */
+static u32 uat_check(const char *when, bool force_print)
+{
+    static const struct gpu_uat_ops ops = {uat_page, NULL};
+    if (!uat_ready)
+        return 0;
+    gpu_uat_audit(&uat_scope, &ops, &uat_base, NULL, &uat_last);
+    uat_audits++;
+    if (uat_last.fresh > uat_fresh_max)
+        uat_fresh_max = uat_last.fresh;
+    uat_print(when, &uat_last, force_print || uat_last.fresh);
+    return uat_last.fresh;
 }
 
 /* ---- G1: PROBE (mediated forwarding) ------------------------------------------------------- */
@@ -629,6 +874,17 @@ static void amap_acquire(void)
 static void amap_release(void)
 {
     __atomic_store_n(&amap_lock, 0, __ATOMIC_RELEASE);
+}
+
+static void g2_acquire(void)
+{
+    while (__atomic_exchange_n(&g2_lock, 1, __ATOMIC_ACQUIRE))
+        ;
+}
+
+static void g2_release(void)
+{
+    __atomic_store_n(&g2_lock, 0, __ATOMIC_RELEASE);
 }
 
 static const char *where(u32 cls, u64 addr, u64 *off)
@@ -652,22 +908,114 @@ static void log_message(u64 addr, const u64 *val, bool write, int width)
         __atomic_fetch_add(&msgs_logged, 1, __ATOMIC_RELAXED) >= HV_GPU_MSG_LOG_LIMIT)
         return;
     if (width == 4)
-        printf("HV: GPU: %s %s msg 0x%016lx ep 0x%lx\n", role ? "GFX1" : "GFX",
-               write ? "TX" : "RX", val[0], val[1]);
+        printf("HV: GPU: %s %s msg 0x%016lx ep 0x%lx (%s)\n", role ? "GFX1" : "GFX",
+               write ? "TX" : "RX", val[0], val[1],
+               gpu_msg_kind_name(gpu_t8152_msg_kind(val[1], val[0])));
     else
         printf("HV: GPU: %s %s %s half 0x%016lx\n", role ? "GFX1" : "GFX", write ? "TX" : "RX",
                off & 8 ? "high" : "low", val[0]);
 }
 
+/* Count one forwarded RX or TX access of a GFX window by message kind (C6). */
+static void count_message(u64 addr, const u64 *val, bool write, int width)
+{
+    u32 role;
+    if (!gpu_t8152_mailbox_window(&adm, addr, &role))
+        return;
+    u64 off = (addr - adm.mailbox.base) & (GPU_T8152_MBOX_STRIDE - 1);
+    if (off >= 0x20)
+        return; /* status */
+    u32 kind = width == 4 ? gpu_t8152_msg_kind(val[1], val[0]) : GPU_MK_HALF;
+    __atomic_add_fetch(&msg_count[role][write][kind], 1, __ATOMIC_RELAXED);
+}
+
+/*
+ * G2 C5 and the UAT gate: may this whole host-to-firmware message (W128 on a GFX window) go out?
+ * Init data once per role; never a type the recipe refuses; on the two application endpoints only
+ * when the page tables pass the audit (init data: no fresh outlier anywhere, as nothing of G2 has
+ * reached the firmware yet; any other message: none in a table the guest writes).
+ */
+static bool g2_allow_tx(u32 role, const u64 *val)
+{
+    u32 kind = gpu_t8152_msg_kind(val[1], val[0]);
+    const char *who = role ? "GFX1" : "GFX";
+    if (kind == GPU_MK_INIT && (init_sent & BIT(role))) {
+        __atomic_add_fetch(&guard[HV_GPU_G_INIT_AGAIN], 1, __ATOMIC_RELAXED);
+        marker_update(GPU_BM_GUARD);
+        printf("HV: GPU: %s TX 0x%016lx refused: a second init-data message to this role (one "
+               "firmware session per boot)\n",
+               who, val[0]);
+        return false;
+    }
+    if (gpu_t8152_g2_refused(gpu_t8152_g2_recipe(), val[1], val[0])) {
+        __atomic_add_fetch(&guard[HV_GPU_G_REFUSED], 1, __ATOMIC_RELAXED);
+        marker_update(GPU_BM_GUARD);
+        printf("HV: GPU: %s TX 0x%016lx ep 0x%lx refused: a message type the G2 recipe never "
+               "forwards\n",
+               who, val[0], val[1] & 0xff);
+        return false;
+    }
+    if (gpu_t8152_g2_iop_power_down(val[1], val[0])) {
+        __atomic_add_fetch(&guard[HV_GPU_G_REFUSED], 1, __ATOMIC_RELAXED);
+        marker_update(GPU_BM_GUARD);
+        printf("HV: GPU: %s TX 0x%016lx refused: an IOP power state other than on (waking the "
+               "firmware again would be a second start)\n",
+               who, val[0]);
+        return false;
+    }
+    u32 ep = val[1] & 0xff;
+    if (ep != GPU_MSG_EP_GFX && ep != GPU_MSG_EP_DOORBELL)
+        return true;
+    char when[64];
+    snprintf(when, sizeof(when), "before %s %s", who, gpu_msg_kind_name(kind));
+    uat_check(when, kind == GPU_MK_INIT);
+    bool bad = !uat_ready || (kind == GPU_MK_INIT ? uat_last.fresh : uat_last.fresh_in_pool);
+    if (bad) {
+        __atomic_add_fetch(&guard[HV_GPU_G_AUDIT], 1, __ATOMIC_RELAXED);
+        marker_update(GPU_BM_GUARD);
+        printf("HV: GPU: %s TX 0x%016lx refused: %s\n", who, val[0],
+               uat_ready ? "the GPU page tables map outside the pool and the admitted regions" :
+                           "no UAT audit is possible (no memory)");
+        return false;
+    }
+    return true;
+}
+
 static bool probe_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int width)
 {
     u32 cls = GPU_C_NONE, disp = GPU_A_DENIED;
-    u32 act = GPU_P_DENY;
-    if (__atomic_load_n(&forwarding, __ATOMIC_ACQUIRE))
-        act = gpu_t8152_probe_decide(&adm, table, table_count, addr, width, write, &cls);
+    u32 act = GPU_P_DENY, act_any;
+    if (g2)
+        act_any = gpu_t8152_probe_decide_g2(&adm, table, table_count, addr, width, write, &cls);
     else
-        gpu_t8152_probe_decide(&adm, table, table_count, addr, width, write, &cls);
+        act_any = gpu_t8152_probe_decide(&adm, table, table_count, addr, width, write, &cls);
+    if (__atomic_load_n(&forwarding, __ATOMIC_ACQUIRE))
+        act = act_any;
     u64 wrote = write ? val[0] : 0;
+    u32 role = 0;
+    bool gfx_window = cls == GPU_C_MAILBOX && gpu_t8152_mailbox_window(&adm, addr, &role);
+
+    if (g2 && act == GPU_P_DENY && gfx_window && width == 3 &&
+        ((addr - adm.mailbox.base) & (GPU_T8152_MBOX_STRIDE - 1)) < 0x20)
+        __atomic_add_fetch(&guard[HV_GPU_G_HALF], 1, __ATOMIC_RELAXED);
+    if (g2 && act != GPU_P_DENY && __atomic_load_n(&sgx_locked, __ATOMIC_ACQUIRE) &&
+        (cls == GPU_C_SGX || cls == GPU_C_ASC_CTRL)) {
+        /* C4: once init data went out, the firmware owns sgx (it may gate it). */
+        __atomic_add_fetch(&guard[HV_GPU_G_LOCKED], 1, __ATOMIC_RELAXED);
+        act = GPU_P_DENY;
+        disp = GPU_A_LOCKED;
+    }
+    bool init = false, locked = false;
+    if (g2 && act == GPU_P_PASS && gfx_window && write && width == 4) {
+        g2_acquire();
+        locked = true;
+        if (!g2_allow_tx(role, val)) {
+            act = GPU_P_DENY;
+            disp = GPU_A_BLOCKED;
+        } else {
+            init = gpu_t8152_msg_kind(val[1], val[0]) == GPU_MK_INIT;
+        }
+    }
 
     if (act == GPU_P_PASS) {
         if (hw_rw(ctx, addr, val, write, width)) {
@@ -691,6 +1039,15 @@ static bool probe_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int
             val[1] = 0;
     }
 
+    if (init && disp != GPU_A_DENIED) {
+        /* Sent (or faulted on the way: count it as sent).  From now on sgx is the firmware's. */
+        init_sent |= BIT(role);
+        __atomic_store_n(&sgx_locked, true, __ATOMIC_RELEASE);
+        marker_update(0);
+    }
+    if (locked)
+        g2_release();
+
     u64 *counter = disp == GPU_A_PASSED || disp == GPU_A_MEDIATED ? &forwarded :
                    disp == GPU_A_FAULT                            ? &faults :
                                                                     &denied;
@@ -700,9 +1057,10 @@ static bool probe_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int
     __atomic_add_fetch(&class_hits[cls < GPU_C_COUNT ? cls : 0], 1, __ATOMIC_RELAXED);
     __atomic_add_fetch(&total_hits, 1, __ATOMIC_RELAXED);
 
-    u32 role;
-    if (cls == GPU_C_MAILBOX && gpu_t8152_mailbox_window(&adm, addr, &role))
+    if (gfx_window)
         __atomic_add_fetch(&gfx_hits, 1, __ATOMIC_RELAXED);
+    if (disp == GPU_A_PASSED && gfx_window)
+        count_message(addr, val, write, width);
 
     bool first;
     u64 value = write ? wrote : val[0];
@@ -721,6 +1079,9 @@ static bool probe_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int
     if (disp == GPU_A_REFUSED)
         printf("HV: GPU: CPU_CONTROL write 0x%lx refused (RUN is never cleared or toggled)\n",
                wrote);
+    if (init && disp == GPU_A_PASSED)
+        printf("HV: GPU: %s init data forwarded: sgx is locked for the guest from now on\n",
+               role ? "GFX1" : "GFX");
     return true;
 }
 
@@ -787,6 +1148,21 @@ static int probe(void)
     }
     state |= GPU_HS_ASC_RUN | GPU_HS_MMIO_PASS | GPU_HS_FW_MAPPED;
     handoff_publish();
+    /* The UAT baseline: what iBoot and the firmware mapped before the guest exists. */
+    static const struct gpu_uat_ops ops = {uat_page, NULL};
+    uat_setup();
+    if (uat_ready) {
+        gpu_uat_audit(&uat_scope, &ops, NULL, &uat_base, &uat_last);
+        uat_audits++;
+        uat_print("baseline (before the guest)", &uat_last, true);
+        if (uat_base.overflow)
+            printf("HV: GPU: UAT baseline overflow: more than %u outliers; later audits count "
+                   "every outlier past them as fresh\n",
+                   uat_base.cap);
+    } else {
+        printf("HV: GPU: no memory for the UAT audit%s\n",
+               g2 ? ": every G2 message on the application endpoints will be refused" : "");
+    }
     __atomic_store_n(&forwarding, true, __ATOMIC_RELEASE);
     marker_update(GPU_BM_PROBE);
     printf("HV: GPU: probe forwarding on sgx [0x%lx, 0x%lx) and post-office page 0x%lx: %u sgx "
@@ -794,6 +1170,9 @@ static int probe(void)
            "windows (RX, TX, status); everything else read-as-zero; UAT regions mapped RW, DATA "
            "regions RO; IRQs not published (poll)\n",
            adm.sgx.base, adm.sgx.base + adm.sgx.size, mbox->base, n);
+    if (g2)
+        printf("HV: GPU: G2 guards on: 128-bit messages only, init data once per role, sgx locked "
+               "after it, UAT audit before every application-endpoint message\n");
     return 0;
 }
 
@@ -815,6 +1194,19 @@ static void print_map(void)
                e->write ? 'W' : 'R', 8 << e->width, gpu_class_name(e->cls),
                gpu_access_disp_name(e->disp), e->count, e->first, e->last);
     }
+    for (u32 role = 0; role < GPU_T8152_ROLES; role++)
+        for (u32 tx = 0; tx < 2; tx++)
+            for (u32 k = 0; k < GPU_MK_COUNT; k++)
+                if (msg_count[role][tx][k])
+                    printf("HV: GPU: messages %s %s %s n=%lu\n", role ? "GFX1" : "GFX",
+                           tx ? "TX" : "RX", gpu_msg_kind_name(k), msg_count[role][tx][k]);
+    if (g2)
+        printf("HV: GPU: G2 guards: %lu second init-data refused, %lu refused types, %lu refused "
+               "by the UAT audit, %lu sgx accesses locked, %lu mailbox halves denied; init data "
+               "sent to%s%s%s\n",
+               guard[HV_GPU_G_INIT_AGAIN], guard[HV_GPU_G_REFUSED], guard[HV_GPU_G_AUDIT],
+               guard[HV_GPU_G_LOCKED], guard[HV_GPU_G_HALF], init_sent & 1 ? " GFX" : "",
+               init_sent & 2 ? " GFX1" : "", init_sent ? "" : " no role");
 }
 
 void hv_gpu_teardown(const char *why)
@@ -828,6 +1220,12 @@ void hv_gpu_teardown(const char *why)
     handoff_publish();
     if (probing)
         print_map();
+    if (probing) {
+        g2_acquire();
+        if (uat_check("at teardown", true))
+            marker_update(GPU_BM_GUARD);
+        g2_release();
+    }
     marker_update(GPU_BM_ENDED);
     printf("HV: GPU: session ended (%s): forwarding off, firmware regions unmapped; the GPU stays "
            "powered and its firmware running for the rest of this boot (never stopped, powered "
@@ -873,6 +1271,76 @@ static u64 status(u64 index)
     }
     if (index == HV_GPU_S_POWER_RECIPE)
         return gpu_t8152_psd_recipe()->available ? 1 : 0;
+    if (index == HV_GPU_S_G2_RECIPE) {
+        const struct gpu_g2_recipe *r = gpu_t8152_g2_recipe();
+        return r->available && !gpu_t8152_g2_check(r) ? 1 : 0;
+    }
+    if (index == HV_GPU_S_G2)
+        return (g2 ? HV_GPU_G2_ARMED : 0) |
+               (g2_grants & GPU_G2_GRANT_FW_MMIO ? HV_GPU_G2_FW_MMIO : 0) |
+               (g2_grants & GPU_G2_GRANT_BOOT_CONTROL ? HV_GPU_G2_BOOT_GRANTED : 0) |
+               (boot_done ? HV_GPU_G2_BOOT_DONE : 0) |
+               (__atomic_load_n(&sgx_locked, __ATOMIC_ACQUIRE) ? HV_GPU_G2_SGX_LOCKED : 0) |
+               (u64)init_sent << 8;
+    if (index == HV_GPU_S_DECLARED)
+        return g2_grants & GPU_G2_GRANT_FW_MMIO ? declared_count : 0;
+    if (index == HV_GPU_S_BOOT_CONTROL || index == HV_GPU_S_BOOT_CONTROL + 1)
+        return index == HV_GPU_S_BOOT_CONTROL ? boot_before : boot_after;
+    if (index >= HV_GPU_S_MSG && index < HV_GPU_S_MSG + 0x10 * 2 * GPU_T8152_ROLES) {
+        u64 i = index - HV_GPU_S_MSG, k = i & 0xf, rt = i >> 4;
+        return k < GPU_MK_COUNT ? __atomic_load_n(&msg_count[rt >> 1][rt & 1][k], __ATOMIC_RELAXED)
+                                : 0;
+    }
+    if (index >= HV_GPU_S_GUARD && index < HV_GPU_S_GUARD + HV_GPU_G_COUNT)
+        return __atomic_load_n(&guard[index - HV_GPU_S_GUARD], __ATOMIC_RELAXED);
+    if (index >= HV_GPU_S_AUDIT && index < HV_GPU_S_AUDIT + HV_GPU_A_COUNT) {
+        u64 f = index - HV_GPU_S_AUDIT;
+        const struct gpu_uat_report *a = &uat_last;
+        if (f >= HV_GPU_A_LEAVES && f < HV_GPU_A_LEAVES + GPU_UC_COUNT)
+            return a->leaves[f - HV_GPU_A_LEAVES];
+        switch (f) {
+            case HV_GPU_A_AUDITS:
+                return uat_audits;
+            case HV_GPU_A_ROOTS:
+                return a->roots;
+            case HV_GPU_A_TABLES:
+                return a->tables;
+            case HV_GPU_A_OUTLIERS:
+                return a->outliers;
+            case HV_GPU_A_KNOWN:
+                return a->known;
+            case HV_GPU_A_FRESH:
+                return a->fresh;
+            case HV_GPU_A_FRESH_POOL:
+                return a->fresh_in_pool;
+            case HV_GPU_A_CAPPED:
+                return a->capped;
+            case HV_GPU_A_BASELINE:
+                return uat_base.n;
+            case HV_GPU_A_BASELINE_OVF:
+                return uat_base.overflow;
+            case HV_GPU_A_FRESH_MAX:
+                return uat_fresh_max;
+            default:
+                return 0;
+        }
+    }
+    if (index >= HV_GPU_S_AUDIT_FRESH && index < HV_GPU_S_AUDIT_FRESH + 4 * GPU_UAT_REPORT_MAX) {
+        u64 i = (index - HV_GPU_S_AUDIT_FRESH) / 4;
+        if (i >= uat_last.nfirst)
+            return HV_GPU_ERROR;
+        const struct gpu_uat_outlier *o = &uat_last.first[i];
+        switch ((index - HV_GPU_S_AUDIT_FRESH) % 4) {
+            case 0:
+                return o->key;
+            case 1:
+                return o->desc;
+            case 2:
+                return o->cls | (u64)o->level << 8 | (u64)o->in_pool << 16;
+            default:
+                return 0;
+        }
+    }
     if (index >= HV_GPU_S_PSD_BEFORE && index < HV_GPU_S_PSD_BEFORE + GPU_PSD_MAX_STEPS)
         return marker ? marker->psd_before[index - HV_GPU_S_PSD_BEFORE] : 0;
     if (index >= HV_GPU_S_PSD_AFTER && index < HV_GPU_S_PSD_AFTER + GPU_PSD_MAX_STEPS)
@@ -939,6 +1407,8 @@ u64 hv_gpu_proxy(u64 op, u64 a1, u64 a2)
         case HV_GPU_OP_STOP:
             hv_gpu_teardown("launcher STOP");
             return 0;
+        case HV_GPU_OP_G2:
+            return err(g2_arm(a1));
         default:
             return HV_GPU_ERROR;
     }
@@ -965,6 +1435,16 @@ void hv_gpu_host_new_session(void)
     total_hits = gfx_hits = 0;
     last_hook_addr = last_hook_write = 0;
     logged = 0;
+    g2 = boot_done = sgx_locked = uat_ready = false;
+    g2_grants = declared_count = init_sent = 0;
+    boot_addr = 0;
+    boot_before = boot_after = 0;
+    memset(msg_count, 0, sizeof(msg_count));
+    memset(guard, 0, sizeof(guard));
+    memset(&uat_last, 0, sizeof(uat_last));
+    uat_base.n = 0;
+    uat_base.overflow = uat_base.sorted = false;
+    uat_audits = uat_printed = uat_fresh_max = 0;
 }
 
 bool hv_gpu_host_hook(u64 addr, u64 *val, bool write, int width)

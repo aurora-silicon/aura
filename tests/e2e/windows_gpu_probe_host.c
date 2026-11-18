@@ -14,9 +14,15 @@
 #include "windows_gpu_hw_model.h"
 
 #include "gpu_t8152_probe.h"
+#include "gpu_t8152_uat.h"
 
 static const char *adt_path;
 static u64 sgx, sgx_size, mbox, pool, pool_size, wrap[2], vbar0, hole;
+static bool allow_boot; /* G2: the boot-control register is part of the forwarded set */
+
+/* Keep in step with machine() in tests/python/test_windows_t8152_gpu.py (aic, AON_X). */
+#define AIC_BASE   0x280000000UL
+#define AON_X_BASE 0x320000000UL
 
 static void reboot(void)
 {
@@ -80,6 +86,7 @@ static void check_hw_log(void)
             ok |= (a->addr == w || a->addr == w + 8) && !a->write;
             ok |= (a->addr == w + 0x10 || a->addr == w + 0x18) && a->write;
         }
+        ok |= allow_boot && a->addr == sgx + MODEL_BOOT_OFF && a->width == 2;
         if (!ok) {
             printf("unexpected hardware access 0x%lx w%d %c\n", a->addr, a->width,
                    a->write ? 'W' : 'R');
@@ -98,6 +105,381 @@ static u32 page32(u32 off)
     u32 v;
     memcpy(&v, page() + off, 4);
     return v;
+}
+
+/* ---- G2 helpers --------------------------------------------------------------------------- */
+
+/* A range of the class table, by class and tag (STATUS HV_GPU_S_RANGE). */
+static u64 range_base(u32 cls, u32 tag)
+{
+    u64 n = (u64)op(HV_GPU_OP_STATUS, HV_GPU_S_RANGES, 0);
+    for (u64 i = 0; i < n; i++) {
+        u64 k = (u64)op(HV_GPU_OP_STATUS, HV_GPU_S_RANGE + 4 * i + 2, 0);
+        if ((k & 0xffff) == cls && (k >> 16) == tag)
+            return (u64)op(HV_GPU_OP_STATUS, HV_GPU_S_RANGE + 4 * i, 0);
+    }
+    assert(0 && "no such range");
+    return 0;
+}
+
+static u64 st(u64 index)
+{
+    return (u64)op(HV_GPU_OP_STATUS, index, 0);
+}
+
+static u64 msgs(int role, int tx, u32 kind)
+{
+    return st(HV_GPU_S_MSG + 0x10 * (u64)(2 * role + tx) + kind);
+}
+
+/* One whole message to a GFX window; returns whether it reached the hardware. */
+static bool send(int role, u64 msg, u64 ep)
+{
+    int before = tx_count;
+    u64 v[2] = {msg, ep};
+    assert(hv_gpu_host_probe_hook(mbox + 0x100 * (u64)(role + 1) + 0x10, v, true, 4));
+    return tx_count == before + 1 && tx_log[before % 8][0] == msg;
+}
+
+static u32 g2_page_ranges(u64 *first_declared)
+{
+    u32 n = page32(GPU_HO_RANGE_COUNT);
+    *first_declared = (u64)op(HV_GPU_OP_STATUS, HV_GPU_S_RANGES, 0);
+    return n;
+}
+
+static void g2_tests(void)
+{
+    const u64 grants = GPU_G2_GRANT_FW_MMIO | GPU_G2_GRANT_BOOT_CONTROL;
+
+    /* ---- G2-1: order and state rules; a refusal spends nothing ---------------------------- */
+    reboot();
+    uat_mem_reset();
+    assert(op(HV_GPU_OP_G2, 0, 0) == HV_GPU_E_STATE); /* before ADMIT */
+    assert(st(HV_GPU_S_G2_RECIPE) == 1);
+    admit();
+    assert(op(HV_GPU_OP_G2, 0x4, 0) == HV_GPU_E_G2); /* unknown grant */
+    test_g2.available = false;
+    assert(st(HV_GPU_S_G2_RECIPE) == 0);
+    assert(op(HV_GPU_OP_G2, 0, 0) == HV_GPU_E_G2);
+    test_g2.available = true;
+    test_g2.nwindows = 0; /* malformed */
+    assert(op(HV_GPU_OP_G2, 0, 0) == HV_GPU_E_G2 && st(HV_GPU_S_G2_RECIPE) == 0);
+    test_g2.nwindows = 5;
+    entered = true;
+    assert(op(HV_GPU_OP_G2, 0, 0) == HV_GPU_E_STATE);
+    entered = false;
+    assert(op(HV_GPU_OP_G2, 0, 0) == 0); /* not spent by the refusals */
+    assert(st(HV_GPU_S_G2) == HV_GPU_G2_ARMED);
+    assert(op(HV_GPU_OP_G2, 0, 0) == HV_GPU_E_STATE); /* once */
+    reboot();
+    admit();
+    assert(op(HV_GPU_OP_POWER, 0, 0) == 0);
+    assert(op(HV_GPU_OP_G2, 0, 0) == HV_GPU_E_STATE); /* after POWER */
+    reboot();
+    admit();
+    assert(op(HV_GPU_OP_HOOK, 0, 0) == 0);
+    assert(op(HV_GPU_OP_G2, 0, 0) == HV_GPU_E_STATE); /* in a G0 log session */
+    assert(psd_writes == 0 && boot_reads == 0 && boot_writes == 0);
+    puts("G2 ORDER OK");
+
+    /* ---- G2-2: fw-mmio declarations (G2-D1) ------------------------------------------------ */
+    reboot();
+    admit();
+    u64 table_n;
+    assert(g2_page_ranges(&table_n) == table_n); /* nothing declared before G2 */
+    struct gpu_g2_window saved = test_g2.window[0];
+    test_g2.window[0].offset = 0x100000; /* past the end of aic reg 0 */
+    assert(op(HV_GPU_OP_G2, GPU_G2_GRANT_FW_MMIO, 0) == HV_GPU_E_G2);
+    test_g2.window[0] = saved;
+    test_g2.window[0].node = "nope";
+    assert(op(HV_GPU_OP_G2, GPU_G2_GRANT_FW_MMIO, 0) == HV_GPU_E_G2);
+    test_g2.window[0] = saved;
+    saved = test_g2.window[1];
+    test_g2.window[1].offset = wrap[0] - sgx; /* the CPU_CONTROL page of an ASC wrapper */
+    assert(op(HV_GPU_OP_G2, GPU_G2_GRANT_FW_MMIO, 0) == HV_GPU_E_G2);
+    test_g2.window[1].offset = vbar0 - sgx; /* an iop-vbar page */
+    assert(op(HV_GPU_OP_G2, GPU_G2_GRANT_FW_MMIO, 0) == HV_GPU_E_G2);
+    test_g2.window[1] = saved;
+    saved = test_g2.window[4];
+    test_g2.window[4].reg_last = 0; /* the window needs the hull of both regs */
+    assert(op(HV_GPU_OP_G2, GPU_G2_GRANT_FW_MMIO, 0) == HV_GPU_E_G2);
+    test_g2.window[4] = saved;
+    handoff_ok(GPU_HS_ADMITTED);
+    assert(op(HV_GPU_OP_G2, GPU_G2_GRANT_FW_MMIO, 0) == 0);
+    assert(st(HV_GPU_S_DECLARED) == 5);
+    assert(st(HV_GPU_S_G2) == (HV_GPU_G2_ARMED | HV_GPU_G2_FW_MMIO));
+    handoff_ok(GPU_HS_ADMITTED);
+    assert(g2_page_ranges(&table_n) == table_n + 5);
+    static const u32 tags[5] = {2, 5, 6, 7, 8};
+    for (u32 i = 0; i < 5; i++) {
+        const u8 *e = page() + GPU_HANDOFF_HEADER + (table_n + i) * GPU_HANDOFF_RANGE;
+        u64 base, size;
+        u32 cls, tag, flags;
+        memcpy(&base, e, 8);
+        memcpy(&size, e + 8, 8);
+        memcpy(&cls, e + 16, 4);
+        memcpy(&tag, e + 20, 4);
+        memcpy(&flags, e + 24, 4);
+        assert(cls == GPU_C_FW_MMIO && tag == tags[i]);
+        assert(flags == (GPU_RF_DECLARED | (test_g2.window[i].writable ? 0 : GPU_RF_READ_ONLY)));
+        assert(size == test_g2.window[i].size);
+        if (i == 0)
+            assert(base == AIC_BASE + 0x8000);
+        if (i == 2)
+            assert(base == sgx + 0x1800);
+        if (i == 4)
+            assert(base == AON_X_BASE && size == 0x14000);
+    }
+    reboot();
+    admit();
+    assert(op(HV_GPU_OP_G2, 0, 0) == 0 && st(HV_GPU_S_DECLARED) == 0);
+    assert(g2_page_ranges(&table_n) == table_n); /* not granted: nothing declared */
+    puts("G2 DECLARE OK");
+
+    /* ---- G2-3: the boot-control step (G2-D2) ----------------------------------------------- */
+    reboot();
+    admit();
+    assert(op(HV_GPU_OP_G2, GPU_G2_GRANT_BOOT_CONTROL, 0) == 0);
+    assert(boot_reads == 0 && boot_writes == 0); /* nothing before POWER */
+    assert(op(HV_GPU_OP_POWER, 0, 0) == 0);
+    assert(boot_reads == 2 && boot_writes == 1 && model_boot == MODEL_BOOT_EXPECT);
+    handoff_ok(GPU_HS_ADMITTED | GPU_HS_POWERED | GPU_HS_SGX_BOOT);
+    assert(page32(GPU_HO_BOOT_CONTROL) == MODEL_BOOT_EXPECT);
+    const struct gpu_boot_marker *m = hv_gpu_host_marker();
+    assert(gpu_t8152_marker_valid(m) && (m->state & GPU_BM_BOOT_CONTROL) && (m->state & GPU_BM_G2));
+    assert(m->boot_control_before == MODEL_BOOT_COLD && m->boot_control_after == MODEL_BOOT_EXPECT);
+    assert(st(HV_GPU_S_BOOT_CONTROL) == MODEL_BOOT_COLD &&
+           st(HV_GPU_S_BOOT_CONTROL + 1) == MODEL_BOOT_EXPECT);
+    assert(st(HV_GPU_S_G2) & HV_GPU_G2_BOOT_DONE);
+    /* A value the recipe does not accept: nothing written, POWER reports it, GPU stays on. */
+    reboot();
+    model_boot = 0x123;
+    admit();
+    assert(op(HV_GPU_OP_G2, GPU_G2_GRANT_BOOT_CONTROL, 0) == 0);
+    assert(op(HV_GPU_OP_POWER, 0, 0) == HV_GPU_E_BOOT_CONTROL);
+    assert(boot_reads == 1 && boot_writes == 0 && psd_all_on());
+    handoff_ok(GPU_HS_ADMITTED | GPU_HS_POWERED);
+    assert(page32(GPU_HO_BOOT_CONTROL) == 0);
+    m = hv_gpu_host_marker();
+    assert((m->state & GPU_BM_GUARD) && !(m->state & GPU_BM_BOOT_CONTROL));
+    /* The wrong value reads back: reported, not retried. */
+    reboot();
+    model_boot_readback = MODEL_BOOT_COLD;
+    admit();
+    assert(op(HV_GPU_OP_G2, GPU_G2_GRANT_BOOT_CONTROL, 0) == 0);
+    assert(op(HV_GPU_OP_POWER, 0, 0) == HV_GPU_E_BOOT_CONTROL);
+    assert(boot_writes == 1 && boot_reads == 2);
+    handoff_ok(GPU_HS_ADMITTED | GPU_HS_POWERED);
+    /* A register outside a pmgr hole is refused at G2, before anything is touched. */
+    reboot();
+    admit();
+    test_g2.boot_offset = 0x100000;
+    assert(op(HV_GPU_OP_G2, GPU_G2_GRANT_BOOT_CONTROL, 0) == HV_GPU_E_G2);
+    test_g2.boot_offset = MODEL_BOOT_OFF;
+    /* Not granted (G2 or G1): never read, never written. */
+    assert(op(HV_GPU_OP_G2, 0, 0) == 0);
+    assert(op(HV_GPU_OP_POWER, 0, 0) == 0 && boot_reads == 0 && boot_writes == 0);
+    reboot();
+    admit();
+    assert(op(HV_GPU_OP_POWER, 0, 0) == 0 && boot_reads == 0 && boot_writes == 0);
+    puts("G2 BOOT OK");
+
+    /* ---- G2-4/5: message guards and the UAT audit ------------------------------------------- */
+    reboot();
+    uat_mem_reset();
+    admit();
+    u64 ctx = range_base(GPU_C_FW_RW, GPU_R_TTBS);
+    u64 pt = range_base(GPU_C_FW_RW, GPU_R_PAGETABLES);
+    u64 l2r = range_base(GPU_C_FW_RW, GPU_R_SHARED_L2);
+    u64 data = range_base(GPU_C_FW_RO, GPU_R_DATA);
+    u64 text = range_base(GPU_C_FW_TEXT, 0);
+    /* Before the guest: the firmware's own GFX1 root maps one MMIO page (a baseline outlier). */
+    uat_put(pt + 0x40000, 2, (pt + 0x8000) | 3);
+    uat_put(pt + 0x8000, 0, (pt + 0xc000) | 3);
+    uat_put(pt + 0xc000, 0, 0x3500000000UL | 0x403);
+    assert(op(HV_GPU_OP_G2, grants, 0) == 0);
+    assert(op(HV_GPU_OP_POWER, 0, 0) == 0 && op(HV_GPU_OP_PROBE, 0, 0) == 0);
+    assert(st(HV_GPU_S_AUDIT + HV_GPU_A_AUDITS) == 1);
+    assert(st(HV_GPU_S_AUDIT + HV_GPU_A_BASELINE) == 1);
+    assert(st(HV_GPU_S_AUDIT + HV_GPU_A_ROOTS) == 1 && st(HV_GPU_S_AUDIT + HV_GPU_A_TABLES) == 3);
+    handoff_ok(GPU_HS_ADMITTED | GPU_HS_POWERED | GPU_HS_SGX_BOOT | GPU_HS_ASC_RUN |
+               GPU_HS_MMIO_PASS | GPU_HS_FW_MAPPED);
+    int hw0 = hw_count;
+
+    /* Whole messages only: the 64-bit halves never reach the hardware. */
+    hook_rw(mbox + 0x110, 0x1, true, 3);
+    hook_rw(mbox + 0x118, 0x0, true, 3);
+    assert(hook_rw(mbox + 0x200, 0, false, 3) == 0);
+    assert(hw_count == hw0 && st(HV_GPU_S_GUARD + HV_GPU_G_HALF) == 3);
+    /* Management and RX traffic: forwarded and counted by kind. */
+    assert(send(1, 0x0020000000000c0cUL, 0x0));
+    assert(msgs(1, 1, GPU_MK_MGMT) == 1);
+    rx_push(0, 0x0009000000000000UL, 0x20);
+    u64 r128[2] = {0, 0};
+    assert(hv_gpu_host_probe_hook(mbox + 0x100, r128, false, 4) && r128[0] == 0x0009000000000000UL);
+    assert(msgs(0, 0, GPU_MK_INIT_ACK) == 1);
+    /* sgx is the guest's until init data goes out. */
+    assert(hook_rw(sgx + model_id_off[0], 0, false, 2) == model_id[0]);
+
+    /* The guest builds its tables: context 0, a kernel-low VM in the pool. */
+    u64 p0 = pool, p1 = pool + 0x4000, p2 = pool + 0x8000;
+    uat_put(ctx, 0, p0 | 1);
+    uat_put(ctx, 1, pt | 1);
+    uat_put(p0, 7, p1 | 3);
+    uat_put(p1, 0, p2 | 3);
+    uat_put(p2, 0, (pool + 0x100000) | 0x403);
+    uat_put(p2, 1, l2r | 0x403);
+    uat_put(p2, 2, data | 0x403);
+    uat_put(p2, 3, (AIC_BASE + 0x8000) | 0x403); /* a declared window */
+    uat_put(p1, 1, (pool + 0x2000000) | 0x401);  /* a 32 MiB block inside the pool */
+    /* A fresh outlier in a guest table: init data is refused, so is a doorbell. */
+    uat_put(p2, 4, text | 0x403);
+    assert(!send(0, 0x00810c20001a8000UL, 0x20));
+    assert(st(HV_GPU_S_GUARD + HV_GPU_G_AUDIT) == 1);
+    assert(st(HV_GPU_S_AUDIT + HV_GPU_A_FRESH) == 1 && st(HV_GPU_S_AUDIT + HV_GPU_A_FRESH_POOL) == 1);
+    assert(st(HV_GPU_S_AUDIT_FRESH) == (p2 | 4) && st(HV_GPU_S_AUDIT_FRESH + 1) == (text | 0x403));
+    assert((st(HV_GPU_S_AUDIT_FRESH + 2) & 0xff) == GPU_UC_TEXT);
+    assert(!send(0, 0x0089000000000000UL, 0x21));
+    assert(!(st(HV_GPU_S_G2) & HV_GPU_G2_SGX_LOCKED));
+    uat_put(p2, 4, 0);
+    /* Clean: init data to GFX goes out; sgx is locked from then on. */
+    assert(send(0, 0x00810c20001a8000UL, 0x20));
+    assert(st(HV_GPU_S_AUDIT + HV_GPU_A_FRESH) == 0 && st(HV_GPU_S_AUDIT + HV_GPU_A_KNOWN) == 1);
+    assert(st(HV_GPU_S_AUDIT + HV_GPU_A_LEAVES + GPU_UC_POOL) == 2);
+    assert(st(HV_GPU_S_AUDIT + HV_GPU_A_LEAVES + GPU_UC_UAT) == 1);
+    assert(st(HV_GPU_S_AUDIT + HV_GPU_A_LEAVES + GPU_UC_DATA) == 1);
+    assert(st(HV_GPU_S_AUDIT + HV_GPU_A_LEAVES + GPU_UC_FW_MMIO) == 1);
+    assert(st(HV_GPU_S_G2) & (HV_GPU_G2_SGX_LOCKED | HV_GPU_G2_INIT_GFX));
+    assert(msgs(0, 1, GPU_MK_INIT) == 1);
+    hw0 = hw_count;
+    assert(hook_rw(sgx + model_id_off[0], 0, false, 2) == 0);
+    assert(hook_rw(wrap[0] + 0x44, 0, false, 2) == 0);
+    hook_rw(wrap[0] + 0x44, 0x10, true, 2);
+    assert(hw_count == hw0 && st(HV_GPU_S_GUARD + HV_GPU_G_LOCKED) == 3);
+    /* One init-data message per role. */
+    assert(!send(0, 0x00810c20001a8000UL, 0x20));
+    assert(st(HV_GPU_S_GUARD + HV_GPU_G_INIT_AGAIN) == 1);
+    assert(send(1, 0x00810c20001b0000UL, 0x20));
+    assert(st(HV_GPU_S_G2) & HV_GPU_G2_INIT_GFX1);
+    assert(!send(1, 0x00810c20001b0000UL, 0x20));
+    assert(st(HV_GPU_S_GUARD + HV_GPU_G_INIT_AGAIN) == 2);
+    /* The recipe's refused type never goes out; the post-init note does. */
+    assert(!send(0, (u64)MODEL_REFUSED_T << 48, MODEL_REFUSED_EP));
+    assert(st(HV_GPU_S_GUARD + HV_GPU_G_REFUSED) == 1);
+    /* No IOP power state but on (RTKit management type 6): sleep or off, then a wake, would be a
+     * second firmware start.  On itself goes out. */
+    assert(!send(1, 0x0060000000000010UL, 0x0) && !send(0, 0x0060000000000000UL, 0x0));
+    assert(st(HV_GPU_S_GUARD + HV_GPU_G_REFUSED) == 3);
+    assert(send(1, 0x0060000000000020UL, 0x0));
+    assert(send(0, 0x0089000000000000UL, 0x21) && send(1, 0x0089000000000000UL, 0x21));
+    assert(msgs(0, 1, GPU_MK_POWER_END) == 1 && msgs(1, 1, GPU_MK_POWER_END) == 1);
+    /* A fresh outlier in a firmware table: reported, a doorbell still goes out. */
+    uat_put(pt + 0xc000, 1, 0x3500004000UL | 0x403);
+    assert(send(0, 0x0084000000000011UL, 0x21));
+    assert(st(HV_GPU_S_AUDIT + HV_GPU_A_FRESH) == 1 && st(HV_GPU_S_AUDIT + HV_GPU_A_FRESH_POOL) == 0);
+    assert(msgs(0, 1, GPU_MK_FWCTL) == 1);
+    /* A guest table pointing outside the table regions, or at a page that cannot be read. */
+    uat_put(p1, 2, text | 3);
+    assert(!send(0, 0x008300000000000aUL, 0x21));
+    assert((st(HV_GPU_S_AUDIT_FRESH + 2) & 0xff) == GPU_UC_TABLE ||
+           (st(HV_GPU_S_AUDIT_FRESH + 6) & 0xff) == GPU_UC_TABLE);
+    uat_put(p1, 2, 0);
+    uat_unreadable = pool + 0x20000;
+    uat_put(p1, 3, (pool + 0x20000) | 3);
+    assert(!send(0, 0x008300000000000aUL, 0x21));
+    uat_put(p1, 3, 0);
+    /* A malformed descriptor (a block at the last level). */
+    uat_put(p2, 5, (pool + 0x200000) | 0x401);
+    assert(!send(0, 0x008300000000000aUL, 0x21));
+    uat_put(p2, 5, 0);
+    assert(send(0, 0x008300000000000aUL, 0x21));
+    assert(msgs(0, 1, GPU_MK_DOORBELL) == 1);
+    assert(st(HV_GPU_S_GUARD + HV_GPU_G_AUDIT) == 5);
+    assert(st(HV_GPU_S_AUDIT + HV_GPU_A_FRESH_MAX) >= 1);
+
+    /* The access map shows the new dispositions. */
+    u64 count = st(HV_GPU_S_MAP_COUNT);
+    bool saw_locked = false, saw_blocked = false;
+    for (u64 i = 0; i < count; i++) {
+        u64 a = st(HV_GPU_S_MAP + 4 * i), k = st(HV_GPU_S_MAP + 4 * i + 2);
+        u32 disp = (k >> 16) & 0xff;
+        saw_locked |= a == sgx + model_id_off[0] && disp == GPU_A_LOCKED;
+        saw_blocked |= a == mbox + 0x110 && disp == GPU_A_BLOCKED && (k & 0xff) == 4;
+    }
+    assert(saw_locked && saw_blocked);
+    allow_boot = true; /* this session's boot-control step (G2-D2 granted) */
+    check_hw_log();
+    allow_boot = false;
+
+    /* STOP: the teardown audit still sees the firmware-table outlier; the marker says so. */
+    assert(op(HV_GPU_OP_STOP, 0, 0) == 0);
+    m = hv_gpu_host_marker();
+    assert((m->state & GPU_BM_ENDED) && (m->state & GPU_BM_GUARD) && (m->state & GPU_BM_G2));
+    assert(st(HV_GPU_S_AUDIT + HV_GPU_A_FRESH) == 1);
+    assert(m->g2 == (HV_GPU_G2_ARMED | grants << 1));
+    puts("G2 GUARD OK");
+
+    /* ---- G2-6: a G1 probe session keeps its halves and records the audit only -------------- */
+    reboot();
+    uat_mem_reset();
+    admit();
+    assert(op(HV_GPU_OP_POWER, 0, 0) == 0 && op(HV_GPU_OP_PROBE, 0, 0) == 0);
+    hw0 = hw_count;
+    hook_rw(mbox + 0x110, 0x1, true, 3);
+    assert(hw_count == hw0 + 1 && st(HV_GPU_S_GUARD + HV_GPU_G_HALF) == 0);
+    uat_put(range_base(GPU_C_FW_RW, GPU_R_TTBS), 0, pool | 1);
+    uat_put(pool, 7, text | 3);
+    assert(send(0, 0x00810c20001a8000UL, 0x20)); /* G1 has no guards */
+    assert(st(HV_GPU_S_G2) == 0 && st(HV_GPU_S_AUDIT + HV_GPU_A_AUDITS) == 1);
+    assert(op(HV_GPU_OP_STOP, 0, 0) == 0);
+    assert(st(HV_GPU_S_AUDIT + HV_GPU_A_AUDITS) == 2 && st(HV_GPU_S_AUDIT + HV_GPU_A_FRESH) == 1);
+    puts("G2 G1-SESSION OK");
+
+    /* ---- G2-7: a large firmware baseline, and a stale guest-table entry at PROBE ------------ */
+    reboot();
+    uat_mem_reset();
+    admit();
+    pt = range_base(GPU_C_FW_RW, GPU_R_PAGETABLES);
+    ctx = range_base(GPU_C_FW_RW, GPU_R_TTBS);
+    /* The firmware's GFX1 root maps 3,000 MMIO pages through two of its own L3 tables. */
+    uat_put(pt + 0x40000, 2, (pt + 0x8000) | 3);
+    uat_put(pt + 0x8000, 0, (pt + 0xc000) | 3);
+    uat_put(pt + 0x8000, 1, (pt + 0x10000) | 3);
+    for (u32 i = 0; i < 3000; i++)
+        uat_put(pt + (i < 2048 ? 0xc000 : 0x10000), i % 2048,
+                (0x3500000000UL + 0x4000UL * (2999 - i)) | 0x403);
+    /* A stale context-table root left in the pool by an earlier boot, pointing at text. */
+    uat_put(ctx, 10, (pool + 0x40000) | 1);
+    uat_put(pool + 0x40000, 0, text | 3);
+    assert(op(HV_GPU_OP_G2, 0, 0) == 0);
+    assert(op(HV_GPU_OP_POWER, 0, 0) == 0 && op(HV_GPU_OP_PROBE, 0, 0) == 0);
+    assert(st(HV_GPU_S_AUDIT + HV_GPU_A_BASELINE) == 3000);
+    assert(st(HV_GPU_S_AUDIT + HV_GPU_A_BASELINE_OVF) == 0);
+    assert(st(HV_GPU_S_AUDIT + HV_GPU_A_KNOWN) == 3000 && st(HV_GPU_S_AUDIT + HV_GPU_A_FRESH) == 1);
+    /* The stale guest entry is never inherited: init data waits until the guest clears it. */
+    assert(!send(0, 0x00810c20001a8000UL, 0x20));
+    uat_put(ctx, 10, 0);
+    assert(send(0, 0x00810c20001a8000UL, 0x20));
+    assert(st(HV_GPU_S_AUDIT + HV_GPU_A_KNOWN) == 3000 && st(HV_GPU_S_AUDIT + HV_GPU_A_FRESH) == 0);
+    /* One firmware leaf changes: found among the 3,000 known ones, reported, not a refusal. */
+    uat_put(pt + 0x10000, 100, 0x3600000000UL | 0x403);
+    assert(send(0, 0x0089000000000000UL, 0x21));
+    assert(st(HV_GPU_S_AUDIT + HV_GPU_A_FRESH) == 1 && st(HV_GPU_S_AUDIT + HV_GPU_A_KNOWN) == 2999);
+    assert(st(HV_GPU_S_AUDIT_FRESH) == ((pt + 0x10000) | 100));
+    /* The host-owned shared-L2 table: what it held at PROBE is known, anything new refuses. */
+    l2r = range_base(GPU_C_FW_RW, GPU_R_SHARED_L2);
+    uat_put(ctx, 1, pt | 1);
+    uat_put(pt, 2, l2r | 3);
+    assert(send(0, 0x0084000000000011UL, 0x21));
+    uat_put(l2r, 7, 0x3700000000UL | 0x401); /* a 32 MiB block of MMIO */
+    assert(!send(0, 0x008300000000000aUL, 0x21));
+    assert(st(HV_GPU_S_AUDIT + HV_GPU_A_FRESH_POOL) == 1);
+    assert((st(HV_GPU_S_AUDIT_FRESH + 2) >> 16) == 1 || (st(HV_GPU_S_AUDIT_FRESH + 6) >> 16) == 1);
+    uat_put(l2r, 7, 0);
+    assert(send(0, 0x008300000000000aUL, 0x21));
+    assert(op(HV_GPU_OP_STOP, 0, 0) == 0);
+    puts("G2 BASELINE OK");
 }
 
 int main(int argc, char **argv)
@@ -459,6 +841,7 @@ int main(int argc, char **argv)
     assert(hook_rw(sgx + model_id_off[0], 0, false, 2) == 0 && hw_count == hw0);
     puts("G1 STOP OK");
 
+    g2_tests();
     puts("GPU PROBE OK");
     return 0;
 }

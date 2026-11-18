@@ -35,7 +35,8 @@ const struct gpu_probe_reg *gpu_t8152_probe_sgx_reads(u32 *count)
     return sgx_reads;
 }
 
-static u32 decide_mailbox(const struct gpu_t8152_admission *a, u64 addr, int width, bool write)
+static u32 decide_mailbox(const struct gpu_t8152_admission *a, u64 addr, int width, bool write,
+                          bool whole)
 {
     u32 role;
     if (!gpu_t8152_mailbox_window(a, addr, &role))
@@ -44,7 +45,7 @@ static u32 decide_mailbox(const struct gpu_t8152_admission *a, u64 addr, int wid
     if (!write) {
         if (off == MBOX_RX && width == 4)
             return GPU_P_PASS;
-        if ((off == MBOX_RX || off == MBOX_RX + 8) && width == 3)
+        if ((off == MBOX_RX || off == MBOX_RX + 8) && width == 3 && !whole)
             return GPU_P_PASS;
         if (off == MBOX_STATUS && width == 2)
             return GPU_P_PASS;
@@ -52,13 +53,13 @@ static u32 decide_mailbox(const struct gpu_t8152_admission *a, u64 addr, int wid
     }
     if (off == MBOX_TX && width == 4)
         return GPU_P_PASS;
-    if ((off == MBOX_TX || off == MBOX_TX + 8) && width == 3)
+    if ((off == MBOX_TX || off == MBOX_TX + 8) && width == 3 && !whole)
         return GPU_P_PASS;
     return GPU_P_DENY;
 }
 
-u32 gpu_t8152_probe_decide(const struct gpu_t8152_admission *a, const struct gpu_range *table,
-                           u32 count, u64 addr, int width, bool write, u32 *cls)
+static u32 decide(const struct gpu_t8152_admission *a, const struct gpu_range *table, u32 count,
+                  u64 addr, int width, bool write, bool whole, u32 *cls)
 {
     const struct gpu_range *r = gpu_t8152_find(table, count, addr);
     *cls = r ? r->cls : GPU_C_NONE;
@@ -90,17 +91,29 @@ u32 gpu_t8152_probe_decide(const struct gpu_t8152_admission *a, const struct gpu
             return GPU_P_DENY;
         }
         case GPU_C_MAILBOX:
-            return decide_mailbox(a, addr, width, write);
+            return decide_mailbox(a, addr, width, write, whole);
         default:
             /* sgx holes, iop-vbar pages, the rest of the wrappers, anything else: never. */
             return GPU_P_DENY;
     }
 }
 
+u32 gpu_t8152_probe_decide(const struct gpu_t8152_admission *a, const struct gpu_range *table,
+                           u32 count, u64 addr, int width, bool write, u32 *cls)
+{
+    return decide(a, table, count, addr, width, write, false, cls);
+}
+
+u32 gpu_t8152_probe_decide_g2(const struct gpu_t8152_admission *a, const struct gpu_range *table,
+                              u32 count, u64 addr, int width, bool write, u32 *cls)
+{
+    return decide(a, table, count, addr, width, write, true, cls);
+}
+
 const char *gpu_access_disp_name(u32 disp)
 {
     static const char *const names[GPU_A_COUNT] = {"denied", "passed", "mediated", "refused",
-                                                   "fault"};
+                                                   "fault",  "locked", "blocked"};
     return disp < GPU_A_COUNT ? names[disp] : "?";
 }
 

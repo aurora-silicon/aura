@@ -114,7 +114,7 @@ parser.add_argument('--windows-usb', default='off', metavar='{off,drd1,drd1+drd3
                          'guest RAM and AIC 1692 -> SPI 995 (1834 -> 997). Default off. Needs a '
                          'USB FD (Mu J804_WINDOWS_USB, marker J804USB1 at 0x120). usb-drd0, the '
                          'proxy\'s link, is refused in every spelling.')
-parser.add_argument('--windows-gpu', default='off', metavar='{off,admit,log,probe}',
+parser.add_argument('--windows-gpu', default='off', metavar='{off,admit,log,probe,g2}',
                     help='T8152 G0/G1: "admit" runs the resident\'s GPU admission once (firmware '
                          'identities against the live ADT, range table, firmware classes, the '
                          'read-only handoff page Mu\'s GPU0 reads); "log" also puts read-as-zero '
@@ -123,7 +123,19 @@ parser.add_argument('--windows-gpu', default='off', metavar='{off,admit,log,prob
                          '(PSD, boot marker in the live ADT), forwards only the measured '
                          'registers (GPU ID, CPU_CONTROL with RUN guarded, CPU_STATUS, the GFX '
                          'post-office windows) and maps the UAT/DATA regions for a UEFI probe; '
-                         'its firmware then runs until the next reboot. Default off.')
+                         'its firmware then runs until the next reboot. "g2" (G2) is probe plus '
+                         'the resident\'s G2 guards: whole 128-bit messages only, init data once '
+                         'per firmware role, no recovery request, sgx locked after init, and an '
+                         'audit of the GPU page tables before every application-endpoint message '
+                         'and at the end; it forwards no further register. Needs a G2 FD. '
+                         'Default off.')
+parser.add_argument('--windows-gpu-g2-grant', default='none',
+                    metavar='{none,fw-mmio,boot-control,fw-mmio+boot-control}',
+                    help='T8152 G2 owner decisions, comma-separated, only with --windows-gpu g2: '
+                         '"fw-mmio" (G2-D1) declares the GPU firmware\'s register windows in the '
+                         'handoff page so its page tables may map them; "boot-control" (G2-D2) '
+                         'lets the resident do the one checked sgx boot-control write (a '
+                         'pmgr-child register) right after power-on. Default none.')
 parser.add_argument('--windows-gpu-pool-mib', type=int, default=256,
                     help='T8152 G0: the GPU pool, carved from the top of guest RAM (multiple of '
                          '32, at most half of guest RAM). Default 256.')
@@ -549,16 +561,23 @@ def windows_t8152_gpu_plan(u):
                 caps2 = p.hv_windows_capabilities2()
             except ProxyRemoteError:
                 caps2 = 0  # an older resident: Bad Command
-        if mode == "probe" and caps2 & w.CAPS2_GPU_PROBE:
+        grants = w.parse_windows_gpu_g2_grant(args.windows_gpu_g2_grant, mode)
+        g2_recipe = None
+        if mode in w.GPU_PROBE_MODES and caps2 & w.CAPS2_GPU_PROBE:
             # Read-only STATUS: the resident's recipe and this boot's marker (live ADT).
             recipe = p.hv_windows_gpu(w.GPU_OP_STATUS, w.GPU_STATUS_POWER_RECIPE)
             boot = p.hv_windows_gpu(w.GPU_OP_STATUS, w.GPU_STATUS_BOOT)
+        if mode == "g2" and caps2 & w.CAPS2_GPU_G2:
+            g2_recipe = p.hv_windows_gpu(w.GPU_OP_STATUS, w.GPU_STATUS_G2_RECIPE)
         chosen = u.adt["/chosen"]
         w.validate_gpu_request(mode, chosen.chip_id, getattr(chosen, "board_id", -1), caps2,
-                               recipe, boot)
+                               recipe, boot, g2_recipe)
     except ValueError as exc:
         sys.exit(f"T8152 launch refused: {exc}. The aura proxy keeps running; no guest was "
                  "started.")
+    if mode == "g2":
+        print(f"T8152 GPU: G2 session, owner grants {w.describe_gpu_g2_grants(grants)} "
+              f"(fw-mmio = G2-D1, boot-control = G2-D2); needs a G2 FD")
     return mode
 
 
@@ -573,7 +592,7 @@ def windows_t8152_gpu_admit(hv, mode, usb_ports=(), ahci=None):
         return
 
     def refuse(message):
-        if mode == "probe":
+        if mode in w.GPU_PROBE_MODES:
             try:
                 p.hv_windows_gpu(w.GPU_OP_STOP)   # idempotent; never touches the GPU itself
             except ProxyRemoteError:
@@ -605,7 +624,19 @@ def windows_t8152_gpu_admit(hv, mode, usb_ports=(), ahci=None):
         if result != 0:
             refuse(f"T8152: the resident refused the GPU logging hooks: "
                    f"{w.describe_gpu(result)}. Reload the carrier; no guest was started.")
-    if mode == "probe":
+    if mode == "g2":
+        # Between ADMIT and POWER: the guards, and the owner's grants (validated by the plan).
+        grants = w.parse_windows_gpu_g2_grant(args.windows_gpu_g2_grant, mode)
+        result = p.hv_windows_gpu(w.GPU_OP_G2, grants)
+        if result != 0:
+            refuse(f"T8152: the resident refused the G2 guards or grants "
+                   f"({w.describe_gpu_g2_grants(grants)}): {w.describe_gpu(result)} (its "
+                   "console says why). The GPU was not powered; reload the carrier. No guest "
+                   "was started.")
+        declared = p.hv_windows_gpu(w.GPU_OP_STATUS, w.GPU_STATUS_DECLARED)
+        print(f"T8152 GPU: G2 armed, grants {w.describe_gpu_g2_grants(grants)}, {declared} "
+              "firmware register windows declared")
+    if mode in w.GPU_PROBE_MODES:
         result = p.hv_windows_gpu(w.GPU_OP_POWER)
         if result != 0:
             refuse(f"T8152: GPU power-on refused or failed: {w.describe_gpu(result)} (the "
@@ -615,6 +646,12 @@ def windows_t8152_gpu_admit(hv, mode, usb_ports=(), ahci=None):
         print(f"T8152 GPU: powered; GPU ID {' '.join(f'{v:#x}' for v in ids[:6])}, core mask "
               f"{ids[6]:#x}; CPU_CONTROL {cpu[0]:#x}/{cpu[1]:#x}, CPU_STATUS "
               f"{cpu[2]:#x}/{cpu[3]:#x}; this boot's GPU firmware session is now in use")
+        if mode == "g2":
+            g2 = p.hv_windows_gpu(w.GPU_OP_STATUS, w.GPU_STATUS_G2)
+            if g2 & 0x4:
+                before, after = (p.hv_windows_gpu(w.GPU_OP_STATUS, w.GPU_STATUS_BOOT_CONTROL + i)
+                                 for i in range(2))
+                print(f"T8152 GPU: boot-control step {before:#x} -> {after:#x} (G2-D2)")
         result = p.hv_windows_gpu(w.GPU_OP_PROBE)
         if result != 0:
             refuse(f"T8152: the resident refused the G1 probe forwarding: "
@@ -628,8 +665,8 @@ def windows_t8152_gpu_admit(hv, mode, usb_ports=(), ahci=None):
         refuse(f"T8152: GPU admitted but the Mu handshake was refused: {exc}. Reload the "
                "carrier; no guest was started.")
     ranges = p.hv_windows_gpu(w.GPU_OP_STATUS, w.GPU_STATUS_RANGES)
-    if mode == "probe":
-        print(f"T8152 GPU: admitted (probe), {ranges} ranges, pool [{pool[0]:#x}, "
+    if mode in w.GPU_PROBE_MODES:
+        print(f"T8152 GPU: admitted ({mode}), {ranges} ranges, pool [{pool[0]:#x}, "
               f"{pool[0] + pool[1]:#x}), handoff page {ipa:#x} read-only, "
               f"/chosen/{w.GPU_HANDSHAKE_PROPERTY} written; powered, mediated forwarding on, "
               "UAT/DATA regions mapped, IRQs not published (poll)")
@@ -654,7 +691,7 @@ def windows_t8152_gpu_status(mode):
     busy = ", ".join(f"{k} {v}" for k, v in per.items() if v)
     print(f"T8152 GPU: {total} guest GPU accesses hooked ({gfx} in the GFX mailbox windows)"
           f"{': ' + busy if busy else ''}")
-    if mode != "probe":
+    if mode not in w.GPU_PROBE_MODES:
         return
     try:
         fwd, den, ref, flt, n, dropped, boot = (
@@ -672,6 +709,43 @@ def windows_t8152_gpu_status(mode):
                   f"{e['disposition']} n={e['count']} first {e['first']:#x}")
     except ProxyRemoteError as exc:
         print(f"T8152 GPU: G1 status unavailable: {exc}")
+        return
+    try:
+        st = lambda i: p.hv_windows_gpu(w.GPU_OP_STATUS, i)  # noqa: E731
+        a = {k: st(w.GPU_STATUS_AUDIT + v) for k, v in w.GPU_AUDIT.items() if k != "leaves"}
+        leaves = [st(w.GPU_STATUS_AUDIT + w.GPU_AUDIT["leaves"] + i)
+                  for i in range(len(w.GPU_UAT_CLASSES))]
+        print(f"T8152 GPU: UAT audit ({a['audits']} walks, the last at teardown): {a['roots']} "
+              f"roots, {a['tables']} tables; leaves "
+              + ", ".join(f"{n} {v}" for n, v in zip(w.GPU_UAT_CLASSES, leaves) if v)
+              + f"; {a['outliers']} outside pool/regions/declared windows ({a['known']} in the "
+              f"PROBE baseline of {a['baseline']}{', OVERFLOW' if a['baseline_overflow'] else ''})"
+              f", {a['fresh']} new ({a['fresh_guest']} in guest or shared-L2 tables; at most "
+              f"{a['fresh_max']} in any walk){', CAPPED' if a['capped'] else ''}")
+        for i in range(min(a["fresh"], 8)):
+            key, desc, kind = (st(w.GPU_STATUS_AUDIT_FRESH + 4 * i + k) for k in range(3))
+            cls = kind & 0xff
+            print(f"  new entry {key:#x} (level {(kind >> 8) & 0xff}"
+                  f"{', guest table' if kind >> 16 else ''}) = {desc:#x}: "
+                  f"{w.GPU_UAT_CLASSES[cls] if cls < len(w.GPU_UAT_CLASSES) else cls}")
+        if mode != "g2":
+            return
+        g2 = st(w.GPU_STATUS_G2)
+        flags = [n for i, n in enumerate(w.GPU_G2_FLAGS) if g2 & (1 << i)]
+        roles = [r for i, r in enumerate(("GFX", "GFX1")) if g2 >> w.GPU_G2_INIT_SHIFT & (1 << i)]
+        guards = [st(w.GPU_STATUS_GUARD + i) for i in range(len(w.GPU_GUARDS))]
+        print(f"T8152 GPU: G2 {', '.join(flags) or 'not armed'}; init data sent to "
+              f"{'+'.join(roles) or 'no role'}; guards: "
+              + ", ".join(f"{v} {n}" for n, v in zip(w.GPU_GUARDS, guards)))
+        for role in range(2):
+            for tx in range(2):
+                counts = [st(w.GPU_STATUS_MSG + 0x10 * (2 * role + tx) + k)
+                          for k in range(len(w.GPU_MSG_KINDS))]
+                if any(counts):
+                    print(f"  {('GFX', 'GFX1')[role]} {('RX', 'TX')[tx]}: "
+                          + ", ".join(f"{n} {v}" for n, v in zip(w.GPU_MSG_KINDS, counts) if v))
+    except ProxyRemoteError as exc:
+        print(f"T8152 GPU: G2 status unavailable: {exc}")
 
 
 def windows_t8152_usb_status(ports):
@@ -784,7 +858,7 @@ def windows_t8152_input_attach(hv, sources, usb_ports=(), gpu_mode="off"):
         return
 
     def refuse(message):
-        if gpu_mode == "probe":
+        if gpu_mode in ("probe", "g2"):
             try:
                 p.hv_windows_gpu(w.GPU_OP_STOP)   # idempotent; never touches the GPU itself
             except ProxyRemoteError:

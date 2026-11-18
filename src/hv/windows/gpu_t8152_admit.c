@@ -413,7 +413,7 @@ const char *gpu_class_name(u32 cls)
 {
     static const char *const names[GPU_C_COUNT] = {
         "none", "sgx", "sgx-hole", "asc-ctrl", "asc", "iop-vbar", "mailbox",
-        "fw-rw", "fw-ro", "fw-text", "pool", "handoff",
+        "fw-rw", "fw-ro", "fw-text", "pool", "handoff", "fw-mmio",
     };
     return cls < GPU_C_COUNT ? names[cls] : "?";
 }
@@ -613,7 +613,10 @@ u32 gpu_t8152_handoff_build(void *dst, u64 page_size, const struct gpu_t8152_adm
 {
     u8 *page = dst;
     u32 roff = GPU_HANDOFF_HEADER;
-    u64 poff = roff + (u64)count * GPU_HANDOFF_RANGE;
+    u32 declared = in->declared ? in->declared_count : 0;
+    if (declared > GPU_T8152_MAX_RANGES)
+        return 0;
+    u64 poff = roff + (u64)(count + declared) * GPU_HANDOFF_RANGE;
     u64 total = poff + (u64)a->perf_count * GPU_HANDOFF_PERF;
     if (total > page_size || total > GPU_HANDOFF_SIZE)
         return 0;
@@ -627,7 +630,7 @@ u32 gpu_t8152_handoff_build(void *dst, u64 page_size, const struct gpu_t8152_adm
     put32(page, GPU_HO_STATE, in->state);
     put32(page, GPU_HO_CHIP, a->chip_id);
     put32(page, GPU_HO_BOARD, a->board_id);
-    put32(page, GPU_HO_RANGE_COUNT, count);
+    put32(page, GPU_HO_RANGE_COUNT, count + declared);
     put32(page, GPU_HO_RANGE_OFFSET, roff);
     put32(page, GPU_HO_RANGE_STRIDE, GPU_HANDOFF_RANGE);
     put32(page, GPU_HO_PERF_COUNT, a->perf_count);
@@ -652,13 +655,16 @@ u32 gpu_t8152_handoff_build(void *dst, u64 page_size, const struct gpu_t8152_adm
         put32(page, GPU_HO_CPU_CONTROL + 4 * r, in->cpu_control[r]);
         put32(page, GPU_HO_CPU_STATUS + 4 * r, in->cpu_status[r]);
     }
-    for (u32 i = 0; i < count; i++) {
+    if (in->state & GPU_HS_SGX_BOOT)
+        put32(page, GPU_HO_BOOT_CONTROL, in->boot_control);
+    for (u32 i = 0; i < count + declared; i++) {
+        const struct gpu_range *r = i < count ? &table[i] : &in->declared[i - count];
         u32 o = roff + i * GPU_HANDOFF_RANGE;
-        put64(page, o, table[i].base);
-        put64(page, o + 8, table[i].size);
-        put32(page, o + 16, table[i].cls);
-        put32(page, o + 20, table[i].tag);
-        put32(page, o + 24, table[i].flags);
+        put64(page, o, r->base);
+        put64(page, o + 8, r->size);
+        put32(page, o + 16, r->cls);
+        put32(page, o + 20, r->tag);
+        put32(page, o + 24, r->flags);
     }
     for (u32 i = 0; i < a->perf_count; i++) {
         u32 o = (u32)poff + i * GPU_HANDOFF_PERF, f, mv, sram_mv;

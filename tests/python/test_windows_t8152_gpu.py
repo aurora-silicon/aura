@@ -123,6 +123,9 @@ HANDOFF_IPA = 0x8_0600_0000
 # G1: the synthetic PSD blocks (tests/e2e/windows_gpu_hw_model.h MODEL_PSD_BASE) sit inside the
 # reg of an /arm-io node named "pmgr"; /chosen/memory-map carries the two zero slots iBoot leaves.
 PSD_BASE = 0x3_0700_0000
+# G2: a node with two regs and a gap, for a fw-mmio window anchored in the hull of both
+# (windows_gpu_hw_model.h test_g2 slot 8).
+AON_X = [(0x3_2000_0000, 0x4000), (0x3_2001_0000, 0x4000)]
 MARKER_SLOT, POOL_SLOT = "MemoryMapReserved-15", "MemoryMapReserved-14"
 
 # Classes (gpu_t8152_admit.h)
@@ -211,7 +214,8 @@ def machine():
     armio = Node("arm-io", {"#address-cells": u32(2), "#size-cells": u32(2),
                             "ranges": u64(0, BUS, 0x4_0000_0000)},
                  [Node("aic", {"reg": reg((0x2_8000_0000, 0x100000))}), sgx, *ascs, *holes,
-                  Node("pmgr", {"reg": reg((PSD_BASE, 0x4000))})])
+                  Node("pmgr", {"reg": reg((PSD_BASE, 0x4000))}),
+                  Node("aon-x", {"reg": reg(*AON_X)})])
     memory_map = Node("memory-map", {"MemoryMapReserved-13": u64(0, 0), POOL_SLOT: u64(0, 0),
                                      MARKER_SLOT: u64(0, 0)})
     root = Node("device-tree", {"#address-cells": u32(2), "#size-cells": u32(2)}, [
@@ -721,7 +725,8 @@ def glue_exe(tmp_path_factory):
 
 
 GLUE_SOURCES = ("gpu_t8152_admit.c", "gpu_t8152_admit.h", "gpu_t8152_power.c", "gpu_t8152_power.h",
-                "gpu_t8152_probe.c", "gpu_t8152_probe.h", "hv_gpu.c", "hv_gpu.h")
+                "gpu_t8152_probe.c", "gpu_t8152_probe.h", "gpu_t8152_g2.c", "gpu_t8152_g2.h",
+                "gpu_t8152_uat.c", "gpu_t8152_uat.h", "hv_gpu.c", "hv_gpu.h")
 
 
 def test_glue(glue_exe, tmp_path):
@@ -789,6 +794,108 @@ def test_g1_probe(glue_exe, tmp_path):
     assert "PSD core (service 5): request 1 acknowledged after" in out
 
 
+# ---- G2: grants, guards and the UAT audit (hv_gpu.c G2, gpu_t8152_g2.c, gpu_t8152_uat.c) -------
+#
+# Failure modes written down before the code (windows_gpu_probe_host.c g2_tests() covers each):
+#   G2-1 G2 before ADMIT, after POWER, in a G0 log session, twice, after guest entry; unknown
+#        grant bits; no or a malformed private recipe: refused, and a refusal spends nothing.
+#   G2-2 a fw-mmio window outside the hull of its ADT node's regs, on an unknown node, over an ASC
+#        wrapper's CPU_CONTROL page or an iop-vbar page: refused; granted, every window is
+#        published as a class-12 handoff entry (tag = slot, RO flag) after the class table, which
+#        itself is unchanged; not granted, nothing is declared.
+#   G2-3 the boot-control register is touched only when G2-D2 is granted, only at POWER: read,
+#        refused unless the recipe accepts the value (nothing written), written once, read back;
+#        a wrong read-back is reported, never retried; a register outside a pmgr hole is
+#        refused at G2.
+#   G2-4 G2 takes whole messages only; a second init-data message to one role, the recipe's
+#        refused types and an RTKit IOP power state other than on never reach the firmware; after init data the guest's sgx accesses
+#        (CPU_CONTROL included) are locked; every message is counted by role, direction, kind.
+#   G2-5 the UAT audit: the PROBE baseline keeps the firmware's own mappings as known; a fresh
+#        outlier anywhere refuses init data; a fresh outlier in a guest table (pool or context
+#        table) refuses every application-endpoint message; one in a firmware table is only
+#        reported; tables outside the table regions, unreadable tables and malformed
+#        descriptors are outliers; the teardown audits again and marks the boot marker.
+#   G2-6 a G1 probe session is unchanged (halves forwarded, no guards) but records the audit.
+#   G2-7 a firmware baseline of thousands of outliers is found by lookup, not capped; an outlier
+#        in a guest table at PROBE (a stale context root into the pool) is never inherited as
+#        known: init data waits until the guest clears it; a new entry in the host-owned
+#        shared-L2 table refuses a doorbell, one in a firmware table is only reported.
+
+
+def test_g2_guards(glue_exe, tmp_path):
+    (tmp_path / "adt.bin").write_bytes(machine().encode())
+    for r in range(2):
+        (tmp_path / f"text{r}.bin").write_bytes(make_text(r))
+    hole = SGX + 0xe8_0000
+    args = [str(glue_exe["probe"]), str(tmp_path / "adt.bin"), f"{TEXT[0][0]:#x}",
+            str(tmp_path / "text0.bin"), f"{TEXT[1][0]:#x}", str(tmp_path / "text1.bin"),
+            f"{SGX:#x}", f"{SGX_SIZE:#x}", f"{MBOX:#x}", f"{POOL[0]:#x}", f"{POOL[1]:#x}",
+            f"{RAM_BASE:#x}", f"{RAM_TOP:#x}", f"{WRAP[0]:#x}", f"{WRAP[1]:#x}", f"{VBAR[0]:#x}",
+            f"{hole:#x}"]
+    out = subprocess.run(args, check=True, capture_output=True, text=True).stdout
+    for tag in ("ORDER", "DECLARE", "BOOT", "GUARD", "G1-SESSION", "BASELINE"):
+        assert f"G2 {tag} OK" in out, out
+    assert "HV: GPU: G2 armed (synthetic G2 recipe): fw-mmio declared (G2-D1), boot-control " \
+        "granted (G2-D2)" in out
+    assert "fw-mmio slot 8 [0x320000000, +0x14000) RW, anchored in /arm-io/aon-x" in out
+    assert "fw-mmio slot 2 [0x280100000, +0x4000) leaves /arm-io/aic regs 0..0" in out
+    assert "fw-mmio slot 6 [0x440001800, +0x27f8) RO, anchored in /arm-io/sgx" in out
+    assert "touches asc-ctrl range" in out and "touches iop-vbar range" in out
+    assert "boot-control sgx+0xe94000 0x700 -> 0x701 (G2-D2, once this boot)" in out
+    assert "boot-control sgx+0xe94000 reads 0x123, not a value the recipe accepts: not written" \
+        in out
+    assert "NOT the expected value; reboot the M6" in out
+    assert "is not inside a pmgr sgx hole; refused" in out
+    assert re.search(r"UAT audit baseline \(before the guest\): 1 roots, 3 tables; .*outliers 1 "
+                     r"\(1 in the baseline\): text 0 dram 0 mmio 1 bad 0 table 0; fresh 0", out), out
+    assert "GFX TX 0x00810c20001a8000 refused: the GPU page tables map outside" in out
+    assert "refused: a second init-data message to this role" in out
+    assert "refused: a message type the G2 recipe never forwards" in out
+    assert "GFX init data forwarded: sgx is locked for the guest from now on" in out
+    assert re.search(r"UAT outlier: entry 0x[0-9a-f]+ \(level 3, guest table\) descriptor "
+                     r"0x[0-9a-f]+: text", out), out
+    assert re.search(r"UAT outlier: .*: table", out) and re.search(r"UAT outlier: .*: bad", out)
+    assert "UAT audit at teardown" in out
+    assert re.search(r"map post-office\+0x110 W128 mailbox blocked", out), out
+    assert re.search(r"map sgx\+0xd04000 R32 sgx locked", out), out
+    assert "messages GFX TX init-data n=1" in out and "messages GFX RX init-ack n=1" in out
+    assert "refused: an IOP power state other than on" in out
+    assert "G2 guards: 2 second init-data refused, 3 refused types, 5 refused by the UAT audit, " \
+        "3 sgx accesses locked, 3 mailbox halves denied; init data sent to GFX GFX1" in out
+
+
+def test_g2_recipe_is_not_in_the_repository():
+    """D1(a): the G2 recipe (upstream values) only comes from private data at build time, and no
+    G2 source carries an address, a boot-control value or a window table."""
+    recipe = (WIN / "gpu_t8152_g2_recipe.c").read_text()
+    assert '#include "../build/j804_gpu_g2.h"' in recipe
+    assert "#define J804_GPU_G2_RECIPE" not in recipe
+    for name in ("gpu_t8152_g2.c", "gpu_t8152_g2.h", "gpu_t8152_g2_recipe.c", "gpu_t8152_uat.c",
+                 "gpu_t8152_uat.h", "hv_gpu.c", "hv_gpu.h"):
+        code = re.sub(r"/\*.*?\*/", "", (WIN / name).read_text(), flags=re.S)
+        assert not re.search(r"0x[0-9a-fA-F]{6,}", code), name   # no offsets, no addresses
+        assert not re.search(r"0x(86|3000[01])\b", code), name    # no recovery type, no value
+        assert "e90000" not in code and "aon-ptd" not in code, name
+    makefile = (REPO / "Makefile").read_text()
+    assert "$(J804_PRIVATE_DATA)/gpu/carrier/g18g-j804-gpu-g2.h" in makefile
+    assert "#define J804_GPU_G2_RECIPE {.available = false}" in makefile
+    tracked = subprocess.run(["git", "ls-files"], cwd=REPO, capture_output=True, text=True).stdout
+    assert "j804_gpu_g2.h" not in tracked and "g18g-j804-gpu-g2.h" not in tracked
+
+
+def test_g2_forwards_no_new_register():
+    """G2-DESIGN section 7: G2 adds no forwarded register; the sgx read set is the G1 one."""
+    code = (WIN / "gpu_t8152_probe.c").read_text()
+    body = code.split("static const struct gpu_probe_reg sgx_reads[] = {", 1)[1].split("};", 1)[0]
+    assert len(re.findall(r"\{0x[0-9a-f]+,", body)) == 7
+    decide = code.split("static u32 decide(", 1)[1].split("\n}\n", 1)[0]
+    assert "whole" in decide and "GPU_P_PASS" in decide
+    glue = (WIN / "hv_gpu.c").read_text()
+    hook = glue.split("static bool probe_hook(", 1)[1].split("\n}\n", 1)[0]
+    # Every hardware access of the hook is the one hw_rw() of a decided PASS/CPU_CONTROL read.
+    assert hook.count("hw_rw(") == 2
+
+
 def test_g1_marker_layout():
     """The record the next carrier reads: 96 bytes, CRC-32 (zlib) over everything before it."""
     hdr = (WIN / "gpu_t8152_power.h").read_text()
@@ -809,7 +916,7 @@ def test_g1_wired():
     assert reset.index("hv_usb_emergency_stop();") < reset.index("hv_gpu_emergency_stop();") < \
         reset.index("nvme_shutdown()")
     proxy_c = (REPO / "src/proxy.c").read_text()
-    assert "HV_WINDOWS_CAPS2_GPU_PROBE;" in proxy_c
+    assert "HV_WINDOWS_CAPS2_GPU_PROBE | HV_WINDOWS_CAPS2_GPU_G2;" in proxy_c
     makefile = (REPO / "Makefile").read_text()
     objs = makefile.split("ifeq ($(WINDOWS),1)\nHV_OBJECTS", 1)[1].split("endif", 1)[0]
     for o in ("gpu_t8152_power.o", "gpu_t8152_power_recipe.o", "gpu_t8152_probe.o"):
@@ -926,7 +1033,7 @@ class _Exit(Exception):
     pass
 
 
-def _gpu_admit_under_test(results, image_end=None):
+def _gpu_admit_under_test(results, image_end=None, g2_grant="none"):
     """windows_t8152_gpu_admit() from run_guest.py, run against a recording proxy stand-in."""
     import ast
     import types
@@ -962,7 +1069,8 @@ def _gpu_admit_under_test(results, image_end=None):
                                set_windows_gpu_handshake=lambda v: calls.append(("hs", v)))
     env = {"p": Proxy(), "sys": types.SimpleNamespace(exit=sys_exit),
            "ProxyRemoteError": RemoteError,
-           "args": types.SimpleNamespace(windows_gpu_pool_mib=256), "print": lambda *a: None}
+           "args": types.SimpleNamespace(windows_gpu_pool_mib=256, windows_gpu_g2_grant=g2_grant),
+           "print": lambda *a: None}
     exec(compile(ast.Module(body=[fn], type_ignores=[]), "run_guest.py", "exec"), env)
     return env["windows_t8152_gpu_admit"], hv, calls
 
@@ -1067,6 +1175,76 @@ def test_launcher_probe_refusal_stops_and_detaches(failing):
     assert "reboot the M6" in calls[-1][1] or "boot marker" in calls[-1][1]
 
 
+# ---- G2 launcher ------------------------------------------------------------------------------
+
+def test_launcher_g2_request():
+    """G2: g2 needs CAPS2 bits 4 and 5, both private recipes and a free boot marker before the
+    upload; the owner grants are explicit, named, and only valid with g2."""
+    from aura import windows as w
+    assert w.parse_windows_gpu("G2") == "g2"
+    assert w.parse_windows_gpu_g2_grant("none", "probe") == 0
+    assert w.parse_windows_gpu_g2_grant("", "g2") == 0
+    assert w.parse_windows_gpu_g2_grant("fw-mmio", "g2") == 1
+    assert w.parse_windows_gpu_g2_grant("boot-control, FW-MMIO", "g2") == 3
+    for bad, mode in (("fw-mmio", "probe"), ("all", "g2"), ("fw-mmio,fw-mmio", "g2"),
+                      ("boot", "g2")):
+        with pytest.raises(ValueError):
+            w.parse_windows_gpu_g2_grant(bad, mode)
+    assert w.describe_gpu_g2_grants(3) == "fw-mmio+boot-control"
+    assert w.describe_gpu_g2_grants(0) == "none"
+    caps2 = w.CAPS2_MAGIC | w.CAPS2_GPU | w.CAPS2_GPU_PROBE | w.CAPS2_GPU_G2
+    w.validate_gpu_request("g2", w.T8152_CHIP, w.J804_BOARD_ID, caps2, 1, 0, 1)
+    for c2, recipe, boot, g2r, why in (
+            (caps2 & ~w.CAPS2_GPU_G2, 1, 0, 1, "bit 5"),
+            (caps2 & ~w.CAPS2_GPU_PROBE, 1, 0, 1, "bit 4"),
+            (caps2, 1, 0, 0, "without the private G2 recipe"),
+            (caps2, 1, 0, None, "without the private G2 recipe"),
+            (caps2, 0, 0, 1, "without the private GPU power recipe"),
+            (caps2, 1, 0xc3, 1, "already used: marker claimed, powered, boot-control step done, G2 armed")):
+        with pytest.raises(ValueError, match=why):
+            w.validate_gpu_request("g2", w.T8152_CHIP, w.J804_BOARD_ID, c2, recipe, boot, g2r)
+    assert w.describe_gpu(-11 & ((1 << 64) - 1)).startswith("G2: no private G2 recipe")
+    e = w.gpu_map_entry(MBOX + 0x110, 2, 4 | 1 << 8 | 6 << 16 | 6 << 24, 0x81 << 48)
+    assert e["disposition"] == "blocked" and e["class"] == "mailbox" and e["bits"] == 128
+    assert w.GPU_CLASSES[12] == "fw-mmio" and w.GPU_DISPOSITIONS[5] == "locked"
+    run_guest = (REPO / "proxyclient/tools/run_guest.py").read_text()
+    plan = run_guest.split("def windows_t8152_gpu_plan(", 1)[1].split("\ndef ", 1)[0]
+    assert "GPU_STATUS_G2_RECIPE" in plan and "parse_windows_gpu_g2_grant" in plan
+    assert "parser.add_argument('--windows-gpu-g2-grant', default='none'" in run_guest
+
+
+def test_launcher_g2_order():
+    """ADMIT, G2 with the owner's grants, POWER, PROBE, then the Mu handshake."""
+    from aura import windows as w
+    admit, hv, calls = _gpu_admit_under_test({}, g2_grant="fw-mmio,boot-control")
+    admit(hv, "g2", (1,), None)
+    gpu_ops = [c[1:] for c in calls if c[0] == "gpu" and c[1] != w.GPU_OP_STATUS]
+    assert gpu_ops == [(w.GPU_OP_ADMIT, 0x9_1000_0000, 0x1000_0000), (w.GPU_OP_G2, 3),
+                       (w.GPU_OP_POWER,), (w.GPU_OP_PROBE,)]
+    kinds = [c[0] for c in calls]
+    assert kinds.index("hs") > max(i for i, c in enumerate(calls)
+                                   if c[0] == "gpu" and c[1] == w.GPU_OP_PROBE)
+    assert not any(c[0] == "exit" for c in calls)
+    # Without grants the guards still arm (op 7 with 0).
+    admit, hv, calls = _gpu_admit_under_test({})
+    admit(hv, "g2", (), None)
+    assert ("gpu", w.GPU_OP_G2, 0) in calls
+
+
+@pytest.mark.parametrize("failing", ["g2", "power", "probe"])
+def test_launcher_g2_refusal_stops_and_detaches(failing):
+    from aura import windows as w
+    op = {"g2": w.GPU_OP_G2, "power": w.GPU_OP_POWER, "probe": w.GPU_OP_PROBE}[failing]
+    admit, hv, calls = _gpu_admit_under_test({op: -11 & ((1 << 64) - 1)}, g2_grant="fw-mmio")
+    with pytest.raises(_Exit):
+        admit(hv, "g2", (1,), None)
+    kinds = [c[0] for c in calls]
+    assert "hs" not in kinds and kinds[-1] == "exit"
+    assert calls.index(("gpu", w.GPU_OP_STOP)) < calls.index(("usb", w.USB_OP_DETACH))
+    if failing == "g2":
+        assert ("gpu", w.GPU_OP_POWER) not in calls and "not powered" in calls[-1][1]
+
+
 def test_launcher_names_the_reserved_pool():
     """After a probe session the pool slot keeps later guest RAM off the GPU-reachable pool, and
     the host check says why."""
@@ -1125,7 +1303,7 @@ def _input_attach_under_test(query_fails=False, attach_result=0):
     return env["windows_t8152_input_attach"], hv, calls
 
 
-@pytest.mark.parametrize("gpu_mode", ["off", "admit", "probe"])
+@pytest.mark.parametrize("gpu_mode", ["off", "admit", "probe", "g2"])
 @pytest.mark.parametrize("failing", ["query", "attach"])
 def test_launcher_input_refusal_detaches_usb(gpu_mode, failing):
     """An input refusal after USB ATTACH detaches USB (and, with probe, runs GPU STOP first)
@@ -1139,7 +1317,7 @@ def test_launcher_input_refusal_detaches_usb(gpu_mode, failing):
     assert kinds[-1] == "exit" and "hs" not in kinds
     detach = calls.index(("usb", w.USB_OP_DETACH))
     stops = [i for i, c in enumerate(calls) if c[:2] == ("gpu", w.GPU_OP_STOP)]
-    if gpu_mode == "probe":
+    if gpu_mode in ("probe", "g2"):
         assert stops and stops[0] < detach
     else:
         assert not stops

@@ -1295,27 +1295,61 @@ def describe_usb_attach(result):
 # its hooks (GPU ID words, CPU_CONTROL with RUN guarded, CPU_STATUS, the GFX post-office windows),
 # maps the UAT regions RW and the DATA regions RO, and logs every guest access by offset.  The
 # firmware then runs for the rest of the boot; the pool stays reserved (MemoryMapReserved-14).
+#
+# G2 adds "g2": "probe" plus the resident's G2 guards (op 7, between ADMIT and POWER): whole
+# 128-bit mailbox messages only, init data once per firmware role, the private recipe's refused
+# message types (the recovery request) never forwarded, the guest's sgx and CPU_CONTROL/STATUS
+# access locked once init data went out, every message counted by kind, and an audit of the GPU
+# page tables (UAT) before every message on the two application endpoints and at teardown.  No
+# register is forwarded beyond G1's.  Two owner decisions are separate, explicit grants
+# (--windows-gpu-g2-grant): "fw-mmio" (G2-D1) declares the firmware register windows the GPU
+# firmware's page tables may map in the handoff page (class 12), "boot-control" (G2-D2) lets
+# POWER do the one checked sgx boot-control step (a pmgr-child register).  Needs a G2 Mu FD (the
+# G1 FD refuses a page with state bit 7, word 0xec or class-12 ranges, so GPU0 would be missing).
 CAPS2_GPU = 0x0004                        # G0 GPU admission v1
 CAPS2_GPU_PROBE = 0x0010                  # G1 power-on, boot marker, mediated forwarding
-GPU_MODES = ("off", "admit", "log", "probe")
+CAPS2_GPU_G2 = 0x0020                     # G2 guards, grants, UAT audit
+GPU_MODES = ("off", "admit", "log", "probe", "g2")
+GPU_PROBE_MODES = ("probe", "g2")         # the modes that power the GPU and forward
 GPU_OP_ADMIT, GPU_OP_HOOK, GPU_OP_STATUS = 1, 2, 3
 GPU_OP_POWER, GPU_OP_PROBE, GPU_OP_STOP = 4, 5, 6
+GPU_OP_G2 = 7
 GPU_STATUS_STATE, GPU_STATUS_HANDOFF_IPA, GPU_STATUS_HANDOFF_SIZE = 0, 1, 2
 GPU_STATUS_RANGES, GPU_STATUS_ACCESSES, GPU_STATUS_MAILBOX_GFX = 3, 4, 5
 GPU_STATUS_BOOT, GPU_STATUS_FORWARDED, GPU_STATUS_DENIED = 6, 7, 8
 GPU_STATUS_RUN_REFUSED, GPU_STATUS_FAULTS, GPU_STATUS_MAP_COUNT = 9, 10, 11
 GPU_STATUS_MAP_DROPPED, GPU_STATUS_POWER_RECIPE = 12, 13
+GPU_STATUS_G2_RECIPE, GPU_STATUS_G2, GPU_STATUS_DECLARED = 14, 15, 16
+GPU_STATUS_BOOT_CONTROL = 0x48            # + 0 before, + 1 after the boot-control step
+GPU_STATUS_MSG = 0x400                    # + 0x10 * (2 * role + tx) + kind
+GPU_STATUS_GUARD = 0x460                  # + guard
+GPU_STATUS_AUDIT = 0x480                  # + audit field
+GPU_STATUS_AUDIT_FRESH = 0x4c0            # + 4 i + {0 entry, 1 descriptor, 2 kind}
 GPU_STATUS_PSD_BEFORE, GPU_STATUS_PSD_AFTER, GPU_STATUS_GPU_ID, GPU_STATUS_CPU = \
     0x20, 0x28, 0x30, 0x40
 GPU_STATUS_CLASS = 0x100
 GPU_STATUS_MAP = 0x1000
 GPU_BOOT_FOREIGN, GPU_BOOT_NO_SLOT = 1 << 31, 1 << 30
-GPU_BOOT_BITS = ("claimed", "powered", "power failed", "found on", "forwarding", "ended")
-GPU_DISPOSITIONS = ("denied", "passed", "mediated", "refused", "fault")
+GPU_BOOT_BITS = ("claimed", "powered", "power failed", "found on", "forwarding", "ended",
+                 "boot-control step done", "G2 armed", "G2 guard fired")
+GPU_DISPOSITIONS = ("denied", "passed", "mediated", "refused", "fault", "locked", "blocked")
 GPU_BOOT_MARKER_SLOT = "MemoryMapReserved-15"
 GPU_POOL_SLOT = "MemoryMapReserved-14"
 GPU_CLASSES = ("none", "sgx", "sgx-hole", "asc-ctrl", "asc", "iop-vbar", "mailbox", "fw-rw",
-               "fw-ro", "fw-text", "pool", "handoff")
+               "fw-ro", "fw-text", "pool", "handoff", "fw-mmio")
+# G2 (hv_gpu.h, gpu_t8152_g2.h, gpu_t8152_uat.h)
+GPU_G2_GRANTS = {"fw-mmio": 0x1, "boot-control": 0x2}
+GPU_G2_FLAGS = ("armed", "fw-mmio declared", "boot-control granted", "boot-control done",
+                "sgx locked")
+GPU_G2_INIT_SHIFT = 8                     # bit 8 + role: init data forwarded to that role
+GPU_MSG_KINDS = ("mgmt", "crashlog", "init-data", "init-ack", "event", "gfx-other", "post-init",
+                 "doorbell", "fw-control", "ep21-other", "other-ep", "half")
+GPU_GUARDS = ("second init-data refused", "refused types", "refused by the UAT audit",
+              "sgx accesses locked", "mailbox halves denied")
+GPU_UAT_CLASSES = ("pool", "uat", "data", "fw-mmio", "text", "dram", "mmio", "bad", "table")
+GPU_AUDIT = {"audits": 0, "roots": 1, "tables": 2, "leaves": 3, "outliers": 12, "known": 13,
+             "fresh": 14, "fresh_guest": 15, "capped": 16, "baseline": 17, "baseline_overflow": 18,
+             "fresh_max": 19}
 GPU_ERRORS = {-1: "not T8152, the policy is not armed, no guest RAM, the guest already entered, "
                   "ADMIT already ran this carrier session, or HOOK before ADMIT",
               -2: "the pool is not 32 MiB aligned inside guest RAM (nothing was spent)",
@@ -1327,7 +1361,12 @@ GPU_ERRORS = {-1: "not T8152, the policy is not armed, no guest RAM, the guest a
                   "PSD block is not inside an ADT pmgr range (nothing was touched)",
               -8: "this boot's GPU firmware session is already used (boot marker), cannot be "
                   "claimed, or the GPU was found on: reboot the M6",
-              -9: "a PSD power-on step failed; the GPU state is unknown: reboot the M6"}
+              -9: "a PSD power-on step failed; the GPU state is unknown: reboot the M6",
+              -10: "G2: the sgx boot-control step refused the value it read or read back the "
+                   "wrong one (the GPU is powered): reboot the M6",
+              -11: "G2: no private G2 recipe in the resident, unknown grant bits, or a firmware "
+                   "register window or the boot-control register failed its ADT check (nothing "
+                   "was touched)"}
 GPU_HANDSHAKE_PROPERTY = "aura,windows-gpu-v1"
 GPU_HANDSHAKE_SIZE = 16
 GPU_HANDSHAKE_FORMAT = "<QQ"     # handoff page IPA, handoff page size
@@ -1336,19 +1375,43 @@ GPU_POOL_ALIGN = 32 << 20
 
 
 def parse_windows_gpu(value):
-    """--windows-gpu: off (or disabled), admit, log or probe."""
-    require(isinstance(value, str), "--windows-gpu takes off, admit, log or probe")
+    """--windows-gpu: off (or disabled), admit, log, probe or g2."""
+    require(isinstance(value, str), "--windows-gpu takes off, admit, log, probe or g2")
     text = value.strip().lower()
     if text in ("off", "disabled"):
         return "off"
-    require(text in GPU_MODES, f"--windows-gpu: unknown mode {value!r} (off, admit, log, probe)")
+    require(text in GPU_MODES,
+            f"--windows-gpu: unknown mode {value!r} (off, admit, log, probe, g2)")
     return text
 
 
-def validate_gpu_request(mode, chip, board, caps2, recipe=None, boot=None):
+def parse_windows_gpu_g2_grant(value, mode):
+    """--windows-gpu-g2-grant: "none" or a comma list of fw-mmio (G2-D1) and boot-control
+    (G2-D2); only with --windows-gpu g2.  Returns the grant bits for op 7."""
+    require(isinstance(value, str), "--windows-gpu-g2-grant takes none, fw-mmio, boot-control")
+    names = [n.strip().lower() for n in value.split(",") if n.strip()]
+    if names in ([], ["none"]):
+        return 0
+    require(mode == "g2", "--windows-gpu-g2-grant needs --windows-gpu g2")
+    bits = 0
+    for name in names:
+        require(name in GPU_G2_GRANTS, f"--windows-gpu-g2-grant: unknown grant {name!r} "
+                f"({', '.join(GPU_G2_GRANTS)})")
+        require(not bits & GPU_G2_GRANTS[name], f"--windows-gpu-g2-grant: {name} given twice")
+        bits |= GPU_G2_GRANTS[name]
+    return bits
+
+
+def describe_gpu_g2_grants(bits):
+    names = [n for n, b in GPU_G2_GRANTS.items() if bits & b]
+    return "+".join(names) if names else "none"
+
+
+def validate_gpu_request(mode, chip, board, caps2, recipe=None, boot=None, g2_recipe=None):
     """Before anything is uploaded: the chip, the board and the resident's CAPS2 bit 2; for
-    "probe" also CAPS2 bit 4, the resident's power recipe (STATUS 13) and a free boot marker
-    (STATUS 6), so a used boot is refused before the upload, not after hv_init()."""
+    "probe" and "g2" also CAPS2 bit 4, the resident's power recipe (STATUS 13) and a free boot
+    marker (STATUS 6), so a used boot is refused before the upload, not after hv_init(); for
+    "g2" also CAPS2 bit 5 and the resident's G2 recipe (STATUS 14)."""
     if mode == "off":
         return
     require(chip == T8152_CHIP, "--windows-gpu is a T8152 (J804) option")
@@ -1356,15 +1419,20 @@ def validate_gpu_request(mode, chip, board, caps2, recipe=None, boot=None):
     require(isinstance(caps2, int) and caps2 >> 32 == CAPS2_MAGIC >> 32 and caps2 & CAPS2_GPU,
             "the resident has no G0 GPU admission (P_HV_WINDOWS_CAPS2 bit 2): rebuild the "
             "carrier at or after the G0 commit")
-    if mode != "probe":
+    if mode not in GPU_PROBE_MODES:
         return
     require(caps2 & CAPS2_GPU_PROBE, "the resident has no G1 GPU power-on (P_HV_WINDOWS_CAPS2 "
             "bit 4): rebuild the carrier at or after the G1 commit")
+    if mode == "g2":
+        require(caps2 & CAPS2_GPU_G2, "the resident has no G2 GPU guards (P_HV_WINDOWS_CAPS2 "
+                "bit 5): rebuild the carrier at or after the G2 commit")
+        require(g2_recipe == 1, "the resident was built without the private G2 recipe "
+                "(J804_PRIVATE_DATA/gpu/carrier/g18g-j804-gpu-g2.h): --windows-gpu g2 is refused")
     require(recipe == 1, "the resident was built without the private GPU power recipe "
             "(J804_PRIVATE_DATA/aura/g18g-j804-gpu-power.h): --windows-gpu probe cannot power "
             "the GPU")
     require(boot == 0, f"this boot's GPU firmware session is already used: "
-            f"{describe_gpu_boot(boot)}. Reboot the M6 before another --windows-gpu probe")
+            f"{describe_gpu_boot(boot)}. Reboot the M6 before another --windows-gpu {mode}")
 
 
 def describe_gpu_boot(value):

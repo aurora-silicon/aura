@@ -872,6 +872,61 @@ upload, then runs ADMIT, POWER, PROBE and writes `/chosen/aura,windows-gpu-v1`; 
 refusal, or a later input refusal, runs STOP and detaches USB. At exit, a PSCI exit or a host
 stop (Ctrl-C, "Windows guest aborted"), it prints the counters and the access map.
 
+## G2: guards, owner grants and the UAT audit (`--windows-gpu g2`)
+
+Status: built and host-tested only (`test_g2_*` and `test_launcher_g2_*` in
+`tests/python/test_windows_t8152_gpu.py`, driver `g2_tests()` in
+`tests/e2e/windows_gpu_probe_host.c`). Nothing of it has run on the M6. For a UEFI probe that
+publishes the GPU firmware's init data, opens its queues and replays one compute job. CAPS2 bit 5.
+G2 forwards **no register beyond G1's**: every doorbell is a message on the two GFX post-office
+windows G1 already forwards.
+
+- **G2** (op 7, `gpu_t8152_g2.c`): after ADMIT, before POWER, once, not with the G0 hooks. Arms
+  the guards below for the PROBE that follows, with the launcher's grants (args[1]); a refusal
+  touches nothing. The private recipe (`gpu_t8152_g2_recipe.c`) is not in this tree: the
+  Makefile copies `$(J804_PRIVATE_DATA)/gpu/carrier/g18g-j804-gpu-g2.h` into
+  `build/j804_gpu_g2.h`, and without it G2 is refused (`STATUS 14` reads 0, op 7 returns -11).
+- **Grant `fw-mmio`** (owner decision G2-D1): the GPU firmware's page tables may map the
+  recipe's register windows. Each window is anchored at G2 in the live ADT (an `/arm-io` node and
+  a register range of it; the window must stay inside the hull of those registers), must not
+  touch DRAM or guest RAM, and its 16 KiB pages must touch no class-table range other than the
+  sgx window and its holes (no ASC wrapper, CPU_CONTROL page, iop-vbar page, post-office page,
+  firmware memory, pool or handoff page). Accepted windows are published after the class table
+  as handoff ranges of class 12 (`GPU_C_FW_MMIO`, tag = the firmware's slot, flag
+  `GPU_RF_DECLARED`, plus read-only where the firmware only reads). They are never mapped to the
+  guest CPU and never part of the stage-2 policy.
+- **Grant `boot-control`** (owner decision G2-D2): POWER does one checked write to the recipe's
+  sgx boot-control register right after the PSD sequence and the ID reads, before any guest:
+  the register must lie in a pmgr sgx hole of the live ADT (checked at G2); read, refuse unless
+  the value is one the recipe accepts, set the recipe's bits, read back the expected value. A
+  wrong value is reported (`-10`), never retried; the GPU stays powered. Handoff state bit 7 and
+  header word 0xec (the value read back); boot marker bit 6 and its before/after words.
+- **Guards** (PROBE with G2 armed): the GFX windows take whole 128-bit messages only (the 64-bit
+  halves are denied, so every forwarded message is seen whole); a second init-data message
+  (EP 0x20 type 0x81) to one role, the recipe's refused types and an RTKit IOP power state
+  other than on are refused (not sent, counted, boot marker bit 8); once init data went out, the
+  guest's sgx and CPU_CONTROL/STATUS accesses read as zero and are not performed (the firmware
+  power-gates sgx after init); every forwarded message is counted per role, direction and kind
+  (`STATUS 0x400`). The access map gains the dispositions `locked` and `blocked`.
+- **UAT audit** (`gpu_t8152_uat.c`, every PROBE, G1 too): the GPU reaches memory only through
+  its page tables, which the guest writes (pool tables, the UAT regions mapped RW), and stage 2
+  does not apply to it. The carrier walks every context-table root and the recipe's firmware
+  roots: at PROBE before the guest (the baseline: what the boot chain and the firmware mapped in
+  their own tables and the shared-L2 table, sorted for lookup, sized for every entry of those
+  tables), before every init-data message (any entry outside the pool, the UAT and DATA
+  regions and the declared windows that is not in the baseline refuses it), before every other
+  message on EP 0x20/0x21 (such an entry in a pool table, a context-table root or the shared-L2
+  table refuses it; one in the firmware's own tables is reported), and at teardown (reported,
+  boot marker bit 8). Outliers are classified (firmware TEXT, other DRAM, MMIO, malformed
+  descriptor, table outside the readable regions); `STATUS 0x480` and `0x4c0` give the last
+  walk. Pool pages are read after a guarded probe of the EL2 mapping and a clean+invalidate.
+
+The launcher (`--windows-gpu g2 --windows-gpu-g2-grant fw-mmio,boot-control`) checks CAPS2 bits 4
+and 5, both recipes and a free marker before the upload, then runs ADMIT, G2, POWER, PROBE and
+writes the Mu handshake; a refusal at any step runs STOP and detaches USB. At exit it prints the
+G1 counters and access map, the UAT audit and the G2 guards and message counts. Mu needs a G2 FD
+(state bit 7, word 0xec and class-12 ranges accepted); the G1 FD publishes no GPU0 for a G2 page.
+
 ## I0: Mac-fed keyboard and pointer (carrier input device)
 
 Status: built and host-tested only (`tests/python/test_windows_t8152_input.py`). Nothing of it

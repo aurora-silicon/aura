@@ -18,7 +18,7 @@ static u64 block_of(const struct gpu_psd_recipe *r, u32 service)
     return r->base + (u64)service * r->stride;
 }
 
-static bool pmgr_covers(u64 base, u64 size)
+bool gpu_t8152_pmgr_covers(u64 base, u64 size)
 {
     int armio = adt_path_offset(adt, "/arm-io");
     if (armio < 0)
@@ -68,7 +68,7 @@ int gpu_t8152_psd_check(const struct gpu_psd_recipe *r)
     }
     for (u32 i = 0; i < r->nsteps; i++) {
         u64 b = block_of(r, r->step[i].service);
-        if (b < r->base || !pmgr_covers(b, r->block_size)) {
+        if (b < r->base || !gpu_t8152_pmgr_covers(b, r->block_size)) {
             printf("HV: GPU: PSD block of %s (service %u) at 0x%lx is not inside a pmgr register "
                    "range of this ADT: not touching it\n",
                    r->step[i].name, r->step[i].service, b);

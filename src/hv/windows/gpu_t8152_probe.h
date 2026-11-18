@@ -41,7 +41,10 @@ enum gpu_access_disp {
     GPU_A_MEDIATED = 2, /* CPU_CONTROL rewrite of the held value, RUN set: accepted, not written */
     GPU_A_REFUSED = 3,  /* CPU_CONTROL write that would change it (clear or toggle RUN): ignored */
     GPU_A_FAULT = 4,    /* the forwarded access faulted; reads return zero */
-    GPU_A_COUNT = 5,
+    /* G2 (gpu_t8152_g2.h) */
+    GPU_A_LOCKED = 5,   /* sgx access after init data went out (C4): RAZ/WI, not performed */
+    GPU_A_BLOCKED = 6,  /* a firmware message a G2 guard refused (C5, UAT audit): not sent */
+    GPU_A_COUNT = 7,
 };
 
 /* One forwarded sgx register (offset from the sgx window base). */
@@ -59,6 +62,14 @@ const struct gpu_probe_reg *gpu_t8152_probe_sgx_reads(u32 *count);
  */
 u32 gpu_t8152_probe_decide(const struct gpu_t8152_admission *a, const struct gpu_range *table,
                            u32 count, u64 addr, int width, bool write, u32 *cls);
+
+/*
+ * G2: the same, except that the GFX windows take whole messages only (one 128-bit RX read, one
+ * 128-bit TX write; the 64-bit halves are denied), so the carrier sees every message it forwards
+ * whole and can decode, count and refuse it before the firmware sees any part of it.
+ */
+u32 gpu_t8152_probe_decide_g2(const struct gpu_t8152_admission *a, const struct gpu_range *table,
+                              u32 count, u64 addr, int width, bool write, u32 *cls);
 
 const char *gpu_access_disp_name(u32 disp);
 

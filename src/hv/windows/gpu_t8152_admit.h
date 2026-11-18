@@ -138,7 +138,14 @@ enum gpu_class {
     GPU_C_FW_TEXT = 9,  /* __TEXT: denied, never mapped */
     GPU_C_POOL = 10,    /* GPU-visible pool inside guest RAM (Mu reserves it) */
     GPU_C_HANDOFF = 11, /* the carrier's read-only handoff page */
-    GPU_C_COUNT = 12,
+    /*
+     * G2: a register window the GPU firmware's own page tables may map (declared, never mapped
+     * to the guest CPU).  Published only in the handoff page, after the table ranges, and only
+     * when the launcher granted the declaration (gpu_t8152_g2.h); it may overlap sgx ranges and
+     * other declarations, so it is never part of the class table gpu_t8152_find() searches.
+     */
+    GPU_C_FW_MMIO = 12,
+    GPU_C_COUNT = 13,
 };
 
 struct gpu_range {
@@ -154,6 +161,7 @@ struct gpu_range {
 #define GPU_RF_READ_ONLY BIT(2)
 #define GPU_RF_DENIED    BIT(3) /* on the carrier's stage-2 denylist */
 #define GPU_RF_ALLOWED   BIT(4) /* registered with the stage-2 policy, not mapped */
+#define GPU_RF_DECLARED  BIT(5) /* G2 fw-mmio: declared to the GPU firmware, not to the guest CPU */
 
 #define GPU_T8152_MAX_HOLES  64
 #define GPU_T8152_MAX_RANGES 96
@@ -218,6 +226,11 @@ bool gpu_t8152_mailbox_window(const struct gpu_t8152_admission *a, u64 addr, u32
  */
 #define GPU_HS_MMIO_PASS    BIT(5)
 #define GPU_HS_FW_MAPPED    BIT(6) /* G1 PROBE: UAT regions mapped RW, DATA regions RO (IPA = PA) */
+/*
+ * G2: the carrier performed the private recipe's one checked sgx boot-control step at POWER
+ * (gpu_t8152_g2.h); header word GPU_HO_BOOT_CONTROL holds the value it read back.
+ */
+#define GPU_HS_SGX_BOOT     BIT(7)
 
 struct gpu_t8152_handoff_in {
     u32 state;
@@ -226,6 +239,11 @@ struct gpu_t8152_handoff_in {
     /* G1, valid once GPU_HS_POWERED is set (zero before): what the carrier read after power-on. */
     u32 gpu_id[GPU_HANDOFF_ID_WORDS]; /* forwarded ID words, gpu_t8152_probe_sgx_reads() order */
     u32 cpu_control[GPU_T8152_ROLES], cpu_status[GPU_T8152_ROLES];
+    /* G2: the boot-control value read back (only with GPU_HS_SGX_BOOT, zero otherwise). */
+    u32 boot_control;
+    /* G2: class GPU_C_FW_MMIO declarations, published after the table ranges (may be none). */
+    const struct gpu_range *declared;
+    u32 declared_count;
 };
 
 /* Header field offsets (also checked by the host test against a model written from this). */
@@ -262,6 +280,8 @@ enum gpu_handoff_field {
     GPU_HO_GPU_ID = 0xc0,      /* u32[7] */
     GPU_HO_CPU_CONTROL = 0xdc, /* u32[2]: gfx-asc, gfx1-asc */
     GPU_HO_CPU_STATUS = 0xe4,  /* u32[2] */
+    /* G2: the sgx boot-control value read back after the carrier's step (GPU_HS_SGX_BOOT). */
+    GPU_HO_BOOT_CONTROL = 0xec,
 };
 
 /* Build the page; bytes used, or 0 if it does not fit. */

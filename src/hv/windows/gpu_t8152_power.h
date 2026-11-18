@@ -78,6 +78,9 @@ struct gpu_psd_result {
  */
 int gpu_t8152_psd_check(const struct gpu_psd_recipe *r);
 
+/* [base, base + size) lies inside one register range of an /arm-io pmgr* node of the live ADT. */
+bool gpu_t8152_pmgr_covers(u64 base, u64 size);
+
 /* Read every service of the recipe: acknowledge and state, in the recipe's read_order. */
 void gpu_t8152_psd_sample(const struct gpu_psd_recipe *r, const struct gpu_psd_ops *ops,
                           struct gpu_psd_sample *out);
@@ -119,6 +122,9 @@ static inline u32 gpu_psd_pack(const struct gpu_psd_sample *s)
 #define GPU_BM_FOREIGN      BIT(3) /* a service was already on before this carrier asked */
 #define GPU_BM_PROBE        BIT(4) /* mediated forwarding went live for a guest */
 #define GPU_BM_ENDED        BIT(5) /* that session ended; the firmware was left running */
+#define GPU_BM_BOOT_CONTROL BIT(6) /* G2: the sgx boot-control step was performed this boot */
+#define GPU_BM_G2           BIT(7) /* G2: a G2 session (guards, audits) was armed */
+#define GPU_BM_GUARD        BIT(8) /* G2: a guard refused a firmware message or found a PTE */
 
 struct gpu_boot_marker {
     u64 magic;
@@ -126,7 +132,8 @@ struct gpu_boot_marker {
     u64 pool_base, pool_size; /* GPU-reachable guest memory, reserved for the rest of the boot */
     u32 psd_before[GPU_PSD_MAX_STEPS], psd_after[GPU_PSD_MAX_STEPS]; /* gpu_psd_pack() */
     u32 forwarded, denied, run_refused, faults;
-    u32 reserved[3];
+    /* G2 (zero before): the boot-control value before / after the step, and the G2 flags. */
+    u32 boot_control_before, boot_control_after, g2;
     u32 crc; /* CRC-32 (gpu_t8152_crc32) of everything before it */
 };
 

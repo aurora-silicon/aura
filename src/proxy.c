@@ -706,11 +706,14 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
              * PROBE, STOP); the recipe itself may be absent (STATUS HV_GPU_S_POWER_RECIPE).
              * Bit 5: D5 AHCI disk on an NVMe partition (hv_ahci_nvme.c; P_HV_WINDOWS_AHCI ops
              * 5-8, NVMe closed on every exit).
+             * Bit 5: G2 guards, grants and the UAT audit (hv_gpu.c G2); the private G2 recipe
+             * may be absent (STATUS HV_GPU_S_G2_RECIPE).
              */
 #ifdef AURA_WINDOWS
             reply->retval = HV_WINDOWS_CAPS2_MAGIC | HV_WINDOWS_CAPS2_AHCI | HV_WINDOWS_CAPS2_USB |
                             HV_WINDOWS_CAPS2_GPU | HV_WINDOWS_CAPS2_INPUT |
-                            HV_WINDOWS_CAPS2_GPU_PROBE | HV_WINDOWS_CAPS2_AHCI_NVME;
+                            HV_WINDOWS_CAPS2_GPU_PROBE | HV_WINDOWS_CAPS2_AHCI_NVME |
+                            HV_WINDOWS_CAPS2_GPU_G2;
 #else
             reply->retval = 0;
 #endif

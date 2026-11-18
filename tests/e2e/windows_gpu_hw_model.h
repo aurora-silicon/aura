@@ -13,6 +13,7 @@
 #include <assert.h>
 #include <string.h>
 
+#include "gpu_t8152_g2.h"
 #include "gpu_t8152_power.h"
 
 /* Keep in step with PSD_BASE / PSD_NODE in tests/python/test_windows_t8152_gpu.py. */
@@ -40,6 +41,82 @@ static struct gpu_psd_recipe test_recipe = {
 const struct gpu_psd_recipe *gpu_t8152_psd_recipe(void)
 {
     return &test_recipe;
+}
+
+/*
+ * G2: a synthetic G2 recipe.  The boot-control register sits in the synthetic pmgr-child hole of
+ * the sgx window; the windows are anchored in the synthetic machine's aic, sgx and aon-x nodes
+ * (tests/python/test_windows_t8152_gpu.py); the refused type and every value are synthetic.
+ */
+#define MODEL_BOOT_OFF    0xe94000u
+#define MODEL_BOOT_COLD   0x700u
+#define MODEL_BOOT_EXPECT 0x701u
+#define MODEL_REFUSED_EP  0x21u
+#define MODEL_REFUSED_T   0x7eu
+
+static struct gpu_g2_recipe test_g2 = {
+    .available = true,
+    .source = "synthetic G2 recipe",
+    .boot_offset = MODEL_BOOT_OFF,
+    .boot_accept = {MODEL_BOOT_COLD, MODEL_BOOT_EXPECT},
+    .boot_set = 0x1,
+    .boot_expect = MODEL_BOOT_EXPECT,
+    .nwindows = 5,
+    .window = {
+        {2, "aic", 0, 0, 0x8000, 0x4000, true},
+        {5, "sgx", 0, 0, 0x100000, 0x8000, true},
+        {6, "sgx", 0, 0, 0x1800, 0x27f8, false},  /* unaligned, inside the first sgx page */
+        {7, "sgx", 0, 0, 0xe82200, 0xfc, false},  /* inside a pmgr-child hole */
+        {8, "aon-x", 0, 1, 0x0, 0x14000, true},   /* the hull of two regs, gap included */
+    },
+    .nrefused = 1,
+    .refused = {{MODEL_REFUSED_EP, MODEL_REFUSED_T}},
+    .nroots = 1,
+    .root = {{GPU_R_PAGETABLES, 0x40000}},
+};
+
+const struct gpu_g2_recipe *gpu_t8152_g2_recipe(void)
+{
+    return &test_g2;
+}
+
+/*
+ * G2: the memory behind the GPU page tables, as the carrier's audit reads it: 16 KiB pages made
+ * on first use (zero), except one address that cannot be read.
+ */
+static struct {
+    u64 pa;
+    u64 *page;
+} uat_mem[256];
+static int nuat_mem;
+static u64 uat_unreadable;
+
+const u64 *hv_gpu_host_uat_page(u64 pa)
+{
+    assert(!(pa & 0x3fff) && "UAT page read not 16 KiB aligned");
+    if (pa == uat_unreadable)
+        return NULL;
+    for (int i = 0; i < nuat_mem; i++)
+        if (uat_mem[i].pa == pa)
+            return uat_mem[i].page;
+    assert(nuat_mem < 256);
+    uat_mem[nuat_mem].pa = pa;
+    uat_mem[nuat_mem].page = calloc(2048, sizeof(u64));
+    return uat_mem[nuat_mem++].page;
+}
+
+/* Write entry idx of the table page at pa (what the guest or the firmware would do). */
+static inline void uat_put(u64 pa, u32 idx, u64 desc)
+{
+    ((u64 *)hv_gpu_host_uat_page(pa))[idx] = desc;
+}
+
+static inline void uat_mem_reset(void)
+{
+    for (int i = 0; i < nuat_mem; i++)
+        free(uat_mem[i].page);
+    nuat_mem = 0;
+    uat_unreadable = 0;
 }
 
 /* ---- PSD blocks ---------------------------------------------------------------------------- */
@@ -147,6 +224,9 @@ static struct hw_access {
     u64 value;
 } hwlog[512];
 static int hw_count, hw_unexpected, cpu_control_writes;
+/* G2: the boot-control register (MODEL_BOOT_OFF from the sgx base). */
+static u32 model_boot, model_boot_readback = 0;
+static int boot_reads, boot_writes;
 
 static inline void hw_model_reset(void)
 {
@@ -154,6 +234,9 @@ static inline void hw_model_reset(void)
     hw_count = hw_unexpected = cpu_control_writes = 0;
     fault_addr = 0;
     model_cpu_control[0] = model_cpu_control[1] = 0x10;
+    model_boot = MODEL_BOOT_COLD;
+    model_boot_readback = 0;
+    boot_reads = boot_writes = 0;
 }
 
 static inline void rx_push(int role, u64 msg, u64 ep)
@@ -171,6 +254,17 @@ bool hv_gpu_host_mmio(u64 addr, u64 *val, bool write, int width)
     hw_count++;
     if (addr == fault_addr)
         return false;
+    if (addr == model_sgx + MODEL_BOOT_OFF && width == 2) {
+        assert(psd_all_on() && "boot-control access while the GPU is not powered");
+        if (write) {
+            boot_writes++;
+            model_boot = (u32)val[0];
+        } else {
+            boot_reads++;
+            val[0] = model_boot_readback ? model_boot_readback : model_boot;
+        }
+        return true;
+    }
     for (int i = 0; i < 7; i++)
         if (addr == model_sgx + model_id_off[i] && !write && width == 2) {
             assert(psd_all_on() && "sgx read while the GPU is not powered");

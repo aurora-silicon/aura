@@ -257,7 +257,8 @@ HV_OBJECTS := $(patsubst %,hv/windows/%, \
 	hv_fatal.o hv_usb.o hv_usb_dart.o gpu_t8152_admit.o hv_gpu.o input_model.o hv_input.o \
 	ahci_nvme.o gpt_check.o hv_ahci_nvme.o hv_serror.o \
 	mtp_scm.o mtp_dart_t8152.o hid_desc.o input_kbd.o mtp_bringup.o hv_mtp_t8152.o input_tp.o \
-	gpu_t8152_power.o gpu_t8152_power_recipe.o gpu_t8152_probe.o) \
+	gpu_t8152_power.o gpu_t8152_power_recipe.o gpu_t8152_probe.o \
+	gpu_t8152_g2.o gpu_t8152_g2_recipe.o gpu_t8152_uat.o) \
 	hv/hv_vm.o hv/hv_virtio.o hv/hv_vuart.o hv/hv_wdt.o hv/hv_sprr.o
 endif
 
@@ -507,6 +508,26 @@ build/j804_gpu_power.h: always_rebuild
 	    '#define J804_GPU_PSD_RECIPE {.available = false}' > $@.tmp; \
 	  cmp -s $@.tmp $@ 2>/dev/null && rm -f $@.tmp || \
 	  ( mv -f $@.tmp $@ && echo "  J804  $@ (no $(J804_GPU_POWER): GPU power-on disabled)" ); \
+	fi
+
+# G2: J804's private G2 recipe (src/hv/windows/gpu_t8152_g2_recipe.c: the sgx boot-control step,
+# the firmware register windows and their ADT anchors, the refused message types, the extra UAT
+# root) comes from the upstream driver (owner decision D1(a): private bring-up only) and is not
+# kept in this repository. Without $(J804_PRIVATE_DATA)/gpu/carrier/g18g-j804-gpu-g2.h the
+# carrier builds with G2 disabled: --windows-gpu g2 is then refused, nothing else changes.
+J804_GPU_G2 = $(J804_PRIVATE_DATA)/gpu/carrier/g18g-j804-gpu-g2.h
+
+build/hv/windows/gpu_t8152_g2_recipe.o: build/j804_gpu_g2.h
+build/j804_gpu_g2.h: always_rebuild
+	$(QUIET)mkdir -p build
+	$(QUIET)if [ -f "$(J804_GPU_G2)" ]; then \
+	  cmp -s "$(J804_GPU_G2)" $@ 2>/dev/null || \
+	  ( cp "$(J804_GPU_G2)" $@ && echo "  J804  $@" ); \
+	else \
+	  printf '%s\n' '/* No private G2 recipe: G2 disabled. */' \
+	    '#define J804_GPU_G2_RECIPE {.available = false}' > $@.tmp; \
+	  cmp -s $@.tmp $@ 2>/dev/null && rm -f $@.tmp || \
+	  ( mv -f $@.tmp $@ && echo "  J804  $@ (no $(J804_GPU_G2): G2 disabled)" ); \
 	fi
 
 # The built-in boot logos are linked gzip-compressed; fb.c inflates them on first use.
