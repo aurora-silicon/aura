@@ -259,9 +259,16 @@ static int smp_prepare_rvbar(const struct cpu_info *cpu)
     u64 locked = rvbar & RVBAR_ADDR;
     u64 target = (u64)_vectors_start;
 
-    /* A7 to M3: RVBAR is not locked, and smp_start_cpu() sets it. */
-    if (locked == target || cpu_features->apple_sysregs_unlocked)
+    if (locked == target)
         return 0;
+    /* A7 to M3 expose a writable RVBAR.  The ordinary SMP startup path writes it immediately
+     * before releasing a core, but a stock-SPTM guest performs CPUSTART itself, so publish the
+     * active Aura vector here as part of the guest reset contract as well. */
+    if (cpu_features->apple_sysregs_unlocked) {
+        write64(cpu->impl_reg, target);
+        sysop("dsb sy");
+        return (read64(cpu->impl_reg) & RVBAR_ADDR_UNLOCKED) == target ? 0 : -1;
+    }
     /* A stage that moved above the chainloaded image keeps entry at its old base. */
     if (relocated_from && locked == old_vectors_start())
         return 0;

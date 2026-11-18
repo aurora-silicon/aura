@@ -52,6 +52,7 @@ Environment (all optional; 1 enables a switch):
   AURA_SAMPLE              sample the guest's PC until each core's XNU entry (pre-XNU hangs)
   AURA_SAMPLE_HZ=<n>       samples per second (default 4)
   AURA_SAMPLE_MAX=<n>      stop printing after n samples (default 64)
+  AURA_J613_RUN            admit the exact J613 stock-SPTM path without the bounded MMIO trace
   AURA_XNU_ENTRY           patch the guest kernelcache's acct(2) so a root process reaches aura's
                            control hvc with no kext (the auractl "xnu" entry; aura/auractl_xnu.py)
   AURA_XNU_RO_RELAX        patch XNU's zalloc_ro_mut RO-zone panic out (tracing only; XNU_QUIRKS)
@@ -151,6 +152,7 @@ KNOWN_ENV = {
     "AURA_TAIL_SECS",
     "AURA_TAIL_IDLE",
     "AURA_RETURN_AFTER_NO_ENTER",
+    "AURA_J613_RUN",
     "AURA_J613_RECOVERY_SECS",
     "AURA_GPU_STOP_SECS",
     "AURA_GPU_STOP_BOOT_SECS",
@@ -783,13 +785,18 @@ def configure(p, sym, plan, adt, ctl_cookie=0):
 
 
 def tail_console(iface, secs, idle):
-    """Keep reading the console after the entry call: a serial read error reopens the device,
-    and the tail stops after secs, or after idle seconds of silence."""
+    """Keep reading the console after entry, including across KIS re-enumeration.
+
+    Darwin does not reliably revive a pyserial object whose underlying device vanished.  Throw
+    that object away and construct a fresh one on the same physical KIS path instead.  Time spent
+    waiting for the node is not console silence, but it remains bounded by the overall tail window.
+    """
     import serial
 
     end = time.time() + secs
     last = time.time()
     dev = iface.dev
+    serial_cls = type(dev)
     buf = b""
     print(f"--- tailing console for up to {secs}s (stop after {idle:g}s silent) ---", flush=True)
     while time.time() < end:
@@ -799,20 +806,29 @@ def tail_console(iface, secs, idle):
         try:
             chunk = dev.read(4096)
         except (serial.serialutil.SerialException, OSError) as e:
-            print(f"--- tail: read error ({e}); reopening ---", flush=True)
+            lost = time.time()
+            print(f"--- tail: read error ({e}); waiting for re-enumeration ---", flush=True)
             try:
                 dev.close()
             except Exception:
                 pass
-            for _ in range(100):
+            dev = None
+            while time.time() < end:
+                if not iface.devpath or not os.path.exists(iface.devpath):
+                    time.sleep(0.1)
+                    continue
                 try:
-                    dev.open()
-                    print("--- tail: reopened ---", flush=True)
+                    dev = serial_cls(iface.devpath, iface.baudrate)
+                    dev.timeout = min(1, max(0.05, end - time.time()))
+                    iface.dev = dev
+                    gap = time.time() - lost
+                    last += gap
+                    print(f"--- tail: reopened after {gap:.3f}s ---", flush=True)
                     break
                 except (serial.serialutil.SerialException, OSError):
-                    time.sleep(0.2)
+                    time.sleep(0.1)
             else:
-                print("--- tail: device gone ---", flush=True)
+                print("--- tail: device absent through capture window ---", flush=True)
                 break
             continue
         if not chunk:
@@ -849,10 +865,11 @@ def main():
     # below aura's carve-out.
     chip = u.adt["/chosen"].chip_id
     if chip == 0x8122:
+        print(f"J613 host image [0x{sym['_base']:x}, 0x{sym['_end']:x})")
         from aura import sptm_j613
         sptm_j613.validate_resources(lambda path, idx: u.adt[path].get_reg(idx))
-        if not env_on("AURA_J613_TRACE"):
-            raise SystemExit("T8122 requires experimental AURA_J613_TRACE=1")
+        if not (env_on("AURA_J613_RUN") or env_on("AURA_J613_TRACE")):
+            raise SystemExit("T8122 requires experimental AURA_J613_RUN=1")
         if any(env_on(k) for k in CONFIG_FLAGS if k != "AURA_J613_TRACE"):
             raise SystemExit("J613: other trace/sleep modes are not qualified")
         # Deliberately before reading images or placing anything on the target.
@@ -860,8 +877,8 @@ def main():
             sptm_j613.patch_plan(None, None)
         except ValueError as e:
             raise SystemExit(str(e))
-    elif env_on("AURA_J613_TRACE"):
-        raise SystemExit("AURA_J613_TRACE requires T8122")
+    elif env_on("AURA_J613_RUN") or env_on("AURA_J613_TRACE"):
+        raise SystemExit("AURA_J613_RUN/AURA_J613_TRACE require T8122")
     scratch = u.malloc(0x40)
     if p.call(sym["sptm_virt_place"], scratch) != 0:
         raise SystemExit("sptm_virt_place failed: not an SPTM_VIRT build, no FEAT_NV2 or GXF, or "
@@ -937,7 +954,8 @@ def main():
     quirk_hide = tuple(quirks["hide"])
     if env_on("AURA_KEEP_WIFI"):
         quirk_hide = tuple(n for n in quirk_hide if n in port_nodes)
-    keep_ane = env_on("AURA_KEEP_ANE") or (chip == 0x8122 and env_on("AURA_J613_TRACE"))
+    keep_ane = env_on("AURA_KEEP_ANE") or (
+        chip == 0x8122 and (env_on("AURA_J613_RUN") or env_on("AURA_J613_TRACE")))
     hide = port_nodes + (() if keep_ane else STRIP_NODES) + quirk_hide
     if not env_on("AURA_KEEP_ERRH"):
         hide += (ERROR_HANDLER,)
