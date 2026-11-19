@@ -4768,6 +4768,7 @@ static const char *const ane_compatibles[] = {
     "apple,t6050-ane",
     "apple,t8132-ane",
     "apple,t8140-ane",
+    "apple,t8142-ane",
 };
 
 static int dt_ane_fill_region(int resv, uint32_t phandle, const char *kind, u64 phys, u64 size)
@@ -10439,6 +10440,88 @@ undo:
 }
 
 /*
+ * T8142 (M5 MacBook Air) suspend-to-RAM: the kernel's sleep controller (apple,t8142-sleep)
+ * brings ANS's half of the shared APCIe block back after a real sleep, and trains the radio's
+ * port 0 again, through the windows of its "apple,apcie" node (pcie-shared in the DT). The
+ * tables for both are iBoot's, on /arm-io/apcie and its pci-bridge0, the same ones j813_n1.c
+ * applies at boot. Publish them on that node, bounded by its windows. Refusal-safe: with any
+ * table absent or malformed nothing is published, and the driver refuses a real sleep with
+ * ANS stopped (and one with the radio's host bound) instead of driving the block blind.
+ */
+static const struct adt_tunable_info t8142_apcie_tunables[] = {
+    {"apcie-axi2af-tunables", "apple,tunable-axi2af", 0, 0x24000, true},
+    {"apcie-phy-tunables", "apple,tunable-phy", 0, 0x40000, true},
+    {"apcie-phy-ip-pll-tunables", "apple,tunable-phy-ip-pll", 0, 0x20000, true},
+    {"apcie-phy-ip-auspma-tunables", "apple,tunable-phy-ip-auspma", 0, 0x20000, true},
+};
+static const struct adt_tunable_info t8142_radio_tunables[] = {
+    {"apcie-config-tunables", "apple,tunable-radio-port", 0, 0x8000, true},
+    {"pcie-rc-tunables", "apple,tunable-radio-rc", 0, 0x1000, true},
+    {"pcie-rc-gen3-shadow-tunables", "apple,tunable-radio-rc-gen3", 0, 0x1000, true},
+    {"pcie-rc-gen4-shadow-tunables", "apple,tunable-radio-rc-gen4", 0, 0x1000, true},
+};
+
+static int t8142_sleep_apcie_node(void)
+{
+    int sleep_node = fdt_node_offset_by_compatible(dt, -1, "apple,t8142-sleep");
+    if (sleep_node < 0)
+        return -1;
+    const fdt32_t *ph = fdt_getprop(dt, sleep_node, "apple,apcie", NULL);
+    return ph ? fdt_node_offset_by_phandle(dt, fdt32_ld(ph)) : -1;
+}
+
+static int dt_set_t8142_sleep_apcie(void)
+{
+    int node = t8142_sleep_apcie_node();
+    if (node < 0)
+        return 0;
+    /* Idempotent: a loader before this one may have published them. */
+    if (fdt_getprop(dt, node, t8142_apcie_tunables[0].fdt_name, NULL))
+        return 0;
+
+    int anode = adt_path_offset(adt, "/arm-io/apcie");
+    int bnode = adt_path_offset(adt, "/arm-io/apcie/pci-bridge0");
+    if (anode < 0 || bnode < 0 || !adt_is_compatible(adt, anode, "apcie,t8142"))
+        return 0;
+
+    for (size_t i = 0; i < ARRAY_SIZE(t8142_apcie_tunables); i++)
+        if (!t6040_apcie_st_tunable_ok(anode, &t8142_apcie_tunables[i])) {
+            printf("FDT: T8142 sleep: %s absent or malformed; not published\n",
+                   t8142_apcie_tunables[i].adt_name);
+            return 0;
+        }
+    for (size_t i = 0; i < ARRAY_SIZE(t8142_radio_tunables); i++)
+        if (!t6040_apcie_st_tunable_ok(bnode, &t8142_radio_tunables[i])) {
+            printf("FDT: T8142 sleep: pci-bridge0 %s absent or malformed; not published\n",
+                   t8142_radio_tunables[i].adt_name);
+            return 0;
+        }
+
+    /* Each append may move the node: look it up again every time. */
+    for (size_t i = 0; i < ARRAY_SIZE(t8142_apcie_tunables); i++)
+        if ((node = t8142_sleep_apcie_node()) < 0 ||
+            dt_append_acio_tunable(anode, node, &t8142_apcie_tunables[i]) < 0)
+            goto undo;
+    for (size_t i = 0; i < ARRAY_SIZE(t8142_radio_tunables); i++)
+        if ((node = t8142_sleep_apcie_node()) < 0 ||
+            dt_append_acio_tunable(bnode, node, &t8142_radio_tunables[i]) < 0)
+            goto undo;
+
+    printf("FDT: T8142 sleep: published ANS's APCIe and the radio port's tables (8)\n");
+    return 0;
+
+undo:
+    printf("FDT: T8142 sleep: could not publish the APCIe tables; ANS's sleep stays refused\n");
+    if ((node = t8142_sleep_apcie_node()) >= 0) {
+        for (size_t i = 0; i < ARRAY_SIZE(t8142_apcie_tunables); i++)
+            fdt_delprop(dt, node, t8142_apcie_tunables[i].fdt_name);
+        for (size_t i = 0; i < ARRAY_SIZE(t8142_radio_tunables); i++)
+            fdt_delprop(dt, node, t8142_radio_tunables[i].fdt_name);
+    }
+    return 0;
+}
+
+/*
  * T6040 display (DCP) across a real suspend-to-RAM that loses power (U5). On that
  * path the in-tree apple-dcp driver lowers the internal panel's display power
  * domains after it stops the firmware, and raises them again on wake, itself. It
@@ -10733,6 +10816,86 @@ undo:
             fdt_del_node(dt, node);
     }
     return 0;
+}
+
+/*
+ * T6050 deep sleep: the sleep controller's (apple,t6050-sleep) wake sources and the pins it
+ * leaves alone, from the ADT. Each pmgr ap-wake-sources entry is an index and a 32-byte name;
+ * those inside the AP die's ten wake words go to apple,wake-enable, the GFX die's (after them)
+ * to apple,wake-enable-gfx. gpio0's no-restore-gpio-pins go to apple,pinctrl-skip-pins, sorted.
+ * A property that does not decode is left out whole: the driver then leaves the wake masks or
+ * the pins as they are.
+ */
+#define T6050_SLEEP_INIT      __attribute__((minsize, noinline, section(".init.t6050")))
+#define T6050_WAKE_AP_SOURCES (10 * 32)
+
+struct adt_wake_source {
+    u32 index;
+    char name[32];
+} PACKED;
+
+T6050_SLEEP_INIT static void dt_set_t6050_sleep_prop(int node, const char *name, u32 *v, int n)
+{
+    if (n <= 0)
+        return;
+    for (int i = 0; i < n; i++)
+        v[i] = cpu_to_fdt32(v[i]);
+    if (fdt_setprop(dt, node, name, v, n * sizeof(*v)))
+        printf("kboot: couldn't set %s\n", name);
+    else
+        printf("kboot: t6050 sleep: %s, %d from the ADT\n", name, n);
+}
+
+T6050_SLEEP_INIT static void dt_set_t6050_sleep(void)
+{
+    u32 ap[64], gfx[32], pins[32], len, npins_hw = 0;
+    int nap = 0, ngfx = 0, npins = 0;
+
+    int node = fdt_node_offset_by_compatible(dt, -1, "apple,t6050-sleep");
+    if (node < 0)
+        return;
+
+    int pmgr = adt_path_offset(adt, "/arm-io/pmgr");
+    const struct adt_wake_source *ws =
+        pmgr < 0 ? NULL : adt_getprop(adt, pmgr, "ap-wake-sources", &len);
+    if (!ws || !len || len % sizeof(*ws))
+        nap = ngfx = -1;
+    for (u32 i = 0; nap >= 0 && i < len / sizeof(*ws); i++) {
+        u32 id = ws[i].index;
+        if (id < T6050_WAKE_AP_SOURCES && nap < (int)ARRAY_SIZE(ap))
+            ap[nap++] = id;
+        else if (id >= T6050_WAKE_AP_SOURCES && id - T6050_WAKE_AP_SOURCES < 32 &&
+                 ngfx < (int)ARRAY_SIZE(gfx))
+            gfx[ngfx++] = id - T6050_WAKE_AP_SOURCES;
+        else
+            nap = ngfx = -1;
+    }
+    if (nap < 0)
+        printf("kboot: t6050 sleep: no usable ap-wake-sources\n");
+
+    int gpio = adt_path_offset(adt, "/arm-io/gpio0");
+    const u32 *np = gpio < 0 ? NULL : adt_getprop(adt, gpio, "no-restore-gpio-pins", &len);
+    if (gpio < 0 || ADT_GETPROP(adt, gpio, "#gpio-pins", &npins_hw) < 0 || !np || !len || len % 4 ||
+        len / 4 > ARRAY_SIZE(pins))
+        npins = -1;
+    for (u32 i = 0; npins >= 0 && i < len / 4; i++) {
+        u32 pin = np[i];
+        int j = npins++;
+
+        if (pin >= npins_hw) {
+            npins = -1;
+            break;
+        }
+        for (; j > 0 && pins[j - 1] > pin; j--)
+            pins[j] = pins[j - 1];
+        pins[j] = pin;
+    }
+    if (npins < 0)
+        printf("kboot: t6050 sleep: no usable no-restore-gpio-pins\n");
+
+    dt_set_t6050_sleep_prop(node, "apple,wake-enable", ap, nap);
+    dt_set_t6050_sleep_prop(node, "apple,wake-enable-gfx", gfx, ngfx);
+    dt_set_t6050_sleep_prop(node, "apple,pinctrl-skip-pins", pins, npins);
 }
 
 void kboot_set_initrd(void *start, size_t size)
@@ -11460,12 +11623,15 @@ int kboot_prepare_dt(void *fdt)
         return -1;
     if (chip_id == T8132 && (dt_set_ans_nvme(false) || dt_set_t8132_lifecycle()))
         return -1;
+    if (dt_set_t8142_sleep_apcie())
+        return -1;
     if (dt_set_t6040_sleep_apcie())
         return -1;
     if (dt_set_t6040_sleep_display())
         return -1;
     if (dt_set_t6040_sleep_dcpext())
         return -1;
+    dt_set_t6050_sleep();
 #ifndef RELEASE
     if (dt_transfer_virtios())
         return 1;

@@ -14,6 +14,7 @@
 #include "gxf.h"
 #include "heapblock.h"
 #include "iodev.h"
+#include "malloc.h"
 #include "memory.h"
 #include "nv2.h"
 #include "nvme.h"
@@ -486,6 +487,7 @@ bool sptm_virt_sample_fiq(u64 *regs)
 void sptm_virt_cpu_arm(void)
 {
     int cpu = smp_id();
+    sptm_virt_crumb(7);
     u32 ent = sptm_virt_cpu_entries[cpu]++;
 
     sptm_cpu_in_xnu[cpu] = false;
@@ -515,11 +517,44 @@ void sptm_virt_cpu_arm(void)
     sptm_virt_cl4_seed(cpu);
     sptm_virt_amx_host();
     sptm_virt_sample_arm_here();
+    if (sptm_virt_s2r_early_s2 == (u32)cpu + 1) {
+        sptm_virt_s2r_early_s2 = 0;
+        nv2_l1_stage2_enable_here();
+    }
 }
 
 bool sptm_virt_cpu_in_xnu(void)
 {
     return sptm_cpu_in_xnu[smp_id()];
+}
+
+/*
+ * Before one core gives the host the proxy: every other core stops at its next trap, before it
+ * takes a lock or touches the USB controller. The proxy and the console share an unlocked dwc3,
+ * and with the other cores still printing the link died (J813, ten cores, 2026-11-15).
+ */
+volatile int sptm_virt_parking_cpu = -1;
+
+/* First thing in every exception entry: a core other than the parking one stops here. */
+void sptm_virt_park_check(void)
+{
+    if (sptm_virt_parking_cpu >= 0 && sptm_virt_parking_cpu != smp_id())
+        while (1)
+            sysop("wfe");
+}
+
+/* Only one core may own the proxy: a core that loses the election parks like the others. */
+void sptm_virt_park_others(void)
+{
+    int me = smp_id(), none = -1;
+
+    if (!__atomic_compare_exchange_n(&sptm_virt_parking_cpu, &none, me, false, __ATOMIC_SEQ_CST,
+                                     __ATOMIC_SEQ_CST) &&
+        none != me)
+        while (1)
+            sysop("wfe");
+    sysop("dsb sy");
+    udelay(300000);
 }
 
 /* A GEXIT into XNU's normal world: this core runs XNU from now on. */
@@ -528,6 +563,8 @@ void sptm_virt_cpu_enters_xnu(int cpu)
     if (sptm_cpu_in_xnu[cpu])
         return;
     sptm_cpu_in_xnu[cpu] = true;
+    if (!is_boot_cpu())
+        printf("SPTM-virt[smp]: cpu%d enters XNU at 0x%lx\n", cpu, mrs(SYS_IMP_APL_ELR_GL12));
     sptm_virt_sample_disarm_here();
     nv2_hcr_update(0, HCR_TWE);
     sptm_virt_ctrr_publish_rorgn();
@@ -591,7 +628,57 @@ __attribute__((used, retain)) void sptm_virt_enter(void)
     fb_set_active(false);
 #endif
 
+    /* T8142 only: elsewhere an MMU-off fault keeps going through the normal handlers. */
+    sptm_smp_crumbs = chip_id == T8142 ? memalign(0x4000, 0x4000) : NULL;
+    if (sptm_smp_crumbs) {
+        memset((void *)sptm_smp_crumbs, 0, 0x4000);
+        dc_cvac_range((void *)sptm_smp_crumbs, 0x4000);
+    }
+    dc_cvac_range((void *)&sptm_smp_crumbs, sizeof(sptm_smp_crumbs));
+
     nv2_enter_os(sptm_entry_pa, sptm_handoff_pa, 0, 0);
+}
+
+/*
+ * The crumbs are one heap page a core out of reset marks its way on, 64 bytes per core: [0] the
+ * last stage, [1] a count, [8..] ESR, ELR and FAR of a fault taken with the MMU off. The boot
+ * core reads them when XNU starts a core (sptm_virt_s2r.c).
+ */
+volatile u8 *sptm_smp_crumbs;
+
+static inline unsigned sptm_crumb_slot(void)
+{
+    u64 m = mrs(MPIDR_EL1);
+    return (((m >> 8) & 1) * 8 + (m & 7)) * 64;
+}
+
+void sptm_virt_crumb(u8 stage)
+{
+    u8 *c = (u8 *)sptm_smp_crumbs;
+    if (!c)
+        return;
+    c += sptm_crumb_slot();
+    c[0] = stage;
+    c[1]++;
+    sysop("dsb sy");
+}
+
+/* A fault on a core out of reset with its MMU still off: the handlers below would store to the
+ * image and fault again without end. Leave what happened in the crumbs and stay here. */
+void sptm_virt_crumb_fault(void)
+{
+    u8 *c = (u8 *)sptm_smp_crumbs;
+    if (!c || !sptm_virt_guest_live || (mrs(SCTLR_EL1) & SCTLR_M))
+        return;
+    c += sptm_crumb_slot();
+    u64 *w = (u64 *)(c + 8);
+    w[0] = mrs(ESR_EL1);
+    w[1] = mrs(ELR_EL1);
+    w[2] = mrs(FAR_EL1);
+    c[0] |= 0x80;
+    sysop("dsb sy");
+    while (1)
+        sysop("wfe");
 }
 
 /*
@@ -611,6 +698,15 @@ void sptm_virt_cpu_reset(void)
             sysop("wfe");
     }
     msr(TPIDR_EL2, cpu);
+    sptm_virt_crumb(4);
+    if ((sptm_virt_flags & SPTM_VIRT_S2R) && sptm_virt_s2r_restarted_in_sleep(cpu)) {
+        msr(s3_5_c15_c6_2, mrs(s3_5_c15_c6_2) | BIT(0) | BIT(63));
+        while (1) {
+            sysop("dsb sy");
+            sysop("isb");
+            sysop("wfi");
+        }
+    }
     if (sptm_virt_flags & SPTM_VIRT_S2R)
         sptm_virt_s2r_wake(cpu);
 
@@ -628,7 +724,9 @@ void sptm_virt_cpu_reset(void)
         printf("SPTM-virt[smp]: cpu%d (MPIDR 0x%06lx) reset #%u -> SPTM reset vector 0x%lx\n", cpu,
                mpidr, n, sptm_reset_pa);
 
+    sptm_virt_crumb(5);
     gxf_init();
+    sptm_virt_crumb(6);
 
     msr(SYS_SCTLR_EL12, mrs(SYS_SCTLR_EL12) & ~(SCTLR_M | SCTLR_C | SCTLR_I));
     ic_iallu();

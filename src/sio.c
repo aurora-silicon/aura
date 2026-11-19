@@ -235,7 +235,7 @@ static struct copy_rule copy_rules_t6041[] = {
  */
 static int sio_iova_base(int node, u64 *base)
 {
-    if (chip_id != T6040 && chip_id != T6041 && chip_id != T8140) {
+    if (chip_id != T6040 && chip_id != T6041 && chip_id != T8140 && chip_id != T6050) {
         *base = 0x30000;
         return 0;
     }
@@ -298,7 +298,7 @@ struct sio_data *sio_setup_fwdata(const char *adt_path)
     if (chip_id == T6030) {
         rules = copy_rules_v10;
         nrules = ARRAY_SIZE(copy_rules_v10);
-    } else if (chip_id == T6040 || chip_id == T6041 || chip_id == T8140) {
+    } else if (chip_id == T6040 || chip_id == T6041 || chip_id == T8140 || chip_id == T6050) {
         rules = copy_rules_t6041;
         nrules = ARRAY_SIZE(copy_rules_t6041);
     }
@@ -321,6 +321,9 @@ struct sio_data *sio_setup_fwdata(const char *adt_path)
         }
 
         if (!rule->keyed) {
+            /* T6050's asio-ascwrap-tunables is empty: no parameter is sent for it. */
+            if (!len && chip_id == T6050)
+                continue;
             u8 *sio_blob = add_fwdata(siodata, len, rule->fw_param);
             if (!sio_blob)
                 goto err;
