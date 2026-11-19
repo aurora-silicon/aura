@@ -27,7 +27,7 @@ build() { # build <kboot_atc.c> <out>
         -I"$out/src" -I"$root/src" -I"$root" \
         "$out/src/t6030_display_host.c" "$out/src/kboot_atc.c" "$out/src/kboot_display_facts.c" \
         "$root"/src/libfdt/fdt.c "$root"/src/libfdt/fdt_ro.c "$root"/src/libfdt/fdt_rw.c \
-        "$root"/src/libfdt/fdt_wip.c "$root"/src/libfdt/fdt_sw.c \
+        "$root"/src/libfdt/fdt_wip.c "$root"/src/libfdt/fdt_sw.c "$root"/src/libfdt/fdt_addresses.c \
         "$root"/src/libfdt/fdt_empty_tree.c "$root"/src/libfdt/fdt_strerror.c \
         -Wl,--wrap=malloc -o "$out/t6030-display-host"
 }
