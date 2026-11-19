@@ -3045,6 +3045,13 @@ static int dt_append_acio_tunable(int adt_node, int fdt_node,
     for (size_t j = 0; j < n_tunables; j++) {
         const struct acio_tunable *tunable = &tunable_adt[j];
 
+        /* A table padded to a fixed length (J813 admac-dispextN-ced-ssw ssw-tunables: one
+         * entry, then thirteen of zeros) ends at its first all-zero entry. */
+        if (!tunable->size && !tunable->offset && !tunable->mask && !tunable->value) {
+            n_tunables = j;
+            break;
+        }
+
         if (tunable->size != 4) {
             printf("kboot: ACIO tunable has invalid size %d\n", tunable->size);
             return -1;
