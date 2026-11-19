@@ -360,11 +360,6 @@ bool secboot_host_proxy_allowed(void)
 }
 #endif
 
-const char *secboot_flavour(void)
-{
-    return flavour_name;
-}
-
 bool secboot_allow_unverified(const char *what)
 {
     all_verified = false;

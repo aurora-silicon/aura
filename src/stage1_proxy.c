@@ -46,11 +46,6 @@ enum stage1_payload_action stage1_proxy_payload_action(enum stage1_proxy_result 
     return STAGE1_PAYLOAD_HALT;
 }
 
-bool stage1_proxy_action_needs_cleanup(enum stage1_payload_action action)
-{
-    return action == STAGE1_PAYLOAD_NATIVE;
-}
-
 /*
  * The previous boot ended without a clean shutdown before an OS started: a Stage 2 or a later
  * loader that hangs, faults or is forced off. Linux clears the counts once it runs, so this holds

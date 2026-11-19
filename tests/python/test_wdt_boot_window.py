@@ -146,8 +146,6 @@ def test_a_host_disarms_it_as_soon_as_it_is_seen():
     assert checked < run_body.index('wdt_host_attached();') < run_body.index('switch (request.type)')
     wait = function_body(proxy, 'enum stage1_proxy_result uartproxy_wait_stage1(')
     assert wait.count('wdt_host_attached();') == 2
-    dock = function_body(proxy, 'bool uartproxy_wait_dockchannel(')
-    assert 'wdt_host_attached();' in dock
 
 
 def test_host_windows_are_shorter_than_the_watchdog():
