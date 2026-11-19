@@ -838,6 +838,26 @@ def test_g2_guards(glue_exe, tmp_path):
     out = subprocess.run(args, check=True, capture_output=True, text=True).stdout
     for tag in ("ORDER", "DECLARE", "BOOT", "GUARD", "G1-SESSION", "BASELINE"):
         assert f"G2 {tag} OK" in out, out
+    # G5b BM-4: the fatal report describes the G2 session (gpu3's state), not G0's hooks.
+    fatal = out.split("G2 FATAL BEGIN\n", 1)[1].split("G2 FATAL END", 1)[0]
+    lines = fatal.splitlines()
+    assert all(l.startswith("HV: fatal: GPU: ") for l in lines), fatal
+    assert "power tried 1, probe 1, forwarding ON, torn down 0" in lines[0], fatal
+    assert re.search(r"G1 [0-9]+ forwarded, [0-9]+ denied, [0-9]+ CPU_CONTROL writes refused, "
+                     r"0 faults; .*boot marker 0x[0-9a-f]+ GUARD", fatal), fatal
+    assert re.search(r"G2 grants 0x3, [0-9]+ declared windows, boot-control done "
+                     r"\(0x700 -> 0x701\), sgx LOCKED, init data sent to GFX GFX1; guards: "
+                     r"2 second init-data, 3 refused types, 8 refused by the UAT audit, "
+                     r"3 sgx locked, 3 mailbox halves", fatal), fatal
+    assert re.search(r"UAT audits [0-9]+ \(fresh at most [1-9][0-9]* in any walk\)", fatal), fatal
+    assert re.search(r"messages GFX TX: .*init-data 1.*doorbell 1", fatal), fatal
+    assert "last doorbell GFX 0x008300000000000a after forwarded access" in fatal, fatal
+    assert "none passed through" not in fatal and "logging hooks hit" not in fatal
+    src = (WIN / "hv_gpu.c").read_text()
+    body = src.split("void hv_gpu_fatal_report(void)\n{", 1)[1].split("\n}\n", 1)[0]
+    for banned in ("g2_acquire", "amap_acquire", "hw_rw", "read32", "write32", "malloc",
+                   "uat_check", "marker_update"):
+        assert banned not in body, banned
     assert "HV: GPU: G2 armed (synthetic G2 recipe): fw-mmio declared (G2-D1), boot-control " \
         "granted (G2-D2)" in out
     assert "fw-mmio slot 8 [0x320000000, +0x14000) RW, anchored in /arm-io/aon-x" in out

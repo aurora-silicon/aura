@@ -71,6 +71,12 @@ static u32 init_sent; /* BIT(role): init data forwarded */
 static u64 msg_count[GPU_T8152_ROLES][2][GPU_MK_COUNT];
 static u64 guard[HV_GPU_G_COUNT];
 /*
+ * The last forwarded doorbell (EP 0x21 type 0x83) for the fatal report and GPU SUM: the message,
+ * BIT(63) | role in last_db_role (0 = none yet), and the forwarded counter just after it, which
+ * places it in the session's access sequence.  Written by the forwarding CPU, read lock-free.
+ */
+static u64 last_db_msg, last_db_role, last_db_seq;
+/*
  * Serialises a G2 message decision with its forward (one init-data message per role even if two
  * CPUs write at once) and every UAT audit (one walk buffer, one report).
  */
@@ -382,6 +388,17 @@ static bool gpu_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int w
     return true;
 }
 
+static u64 ld(const u64 *p)
+{
+    return __atomic_load_n(p, __ATOMIC_RELAXED);
+}
+
+/*
+ * The EL2 fatal report's GPU part.  G5b: it describes the G1/G2 session (gpu3's state), not G0's
+ * logging hooks only.  Recorded values only: relaxed loads of the statics and of this session's
+ * boot-marker record (RAM); no g2_lock or amap_lock (the report may run on a CPU that holds
+ * either, and a torn read only makes one number stale), no MMIO, no allocation.
+ */
 void hv_gpu_fatal_report(void)
 {
     if (!session_used)
@@ -390,18 +407,70 @@ void hv_gpu_fatal_report(void)
     for (u32 i = 0; i < table_count; i++)
         if (table[i].flags & GPU_RF_HOOKED)
             hooked_ranges++;
-    printf("HV: fatal: GPU: state 0x%x, admitted %d, hooks %d; %u ranges, %u behind the logging "
-           "hooks, none passed through (firmware regions are registered identity exceptions "
-           "without a stage-2 leaf in G0); handoff page IPA 0x%lx read-only; pool [0x%lx, "
-           "0x%lx) in guest RAM\n",
-           state, (int)admitted, (int)hooked, table_count, hooked_ranges, handoff_pa, pool_base,
-           pool_base + pool_size);
-    u64 hits = __atomic_load_n(&total_hits, __ATOMIC_RELAXED);
-    if (hooked || hits)
-        printf("HV: fatal: GPU: logging hooks hit %lu times (GFX mailbox %lu); last %s 0x%lx\n",
-               hits, __atomic_load_n(&gfx_hits, __ATOMIC_RELAXED),
-               __atomic_load_n(&last_hook_write, __ATOMIC_RELAXED) ? "write" : "read",
-               __atomic_load_n(&last_hook_addr, __ATOMIC_RELAXED));
+    bool fwd_on = __atomic_load_n(&forwarding, __ATOMIC_RELAXED);
+    printf("HV: fatal: GPU: state 0x%x, admitted %d, hooks %d, power tried %d, probe %d, "
+           "forwarding %s, torn down %d; %u ranges (%u hooked); handoff page IPA "
+           "0x%lx read-only; pool [0x%lx, 0x%lx)\n",
+           state, (int)admitted, (int)hooked, (int)power_tried, (int)probing,
+           fwd_on ? "ON" : "off", (int)torn_down, table_count, hooked_ranges, handoff_pa,
+           pool_base, pool_base + pool_size);
+    u64 hits = ld(&total_hits);
+    if (hooked)
+        printf("HV: fatal: GPU: G0 logging hooks hit %lu times (GFX mailbox %lu); last %s 0x%lx\n",
+               hits, ld(&gfx_hits), ld(&last_hook_write) ? "write" : "read", ld(&last_hook_addr));
+    if (!power_tried && !probing)
+        return;
+    /* G1 */
+    u32 mstate = marker ? marker->state : 0;
+    printf("HV: fatal: GPU: G1 %lu forwarded, %lu denied, %lu CPU_CONTROL writes refused, %lu "
+           "faults; %lu guest GPU accesses (GFX windows %lu); boot marker %s0x%x%s%s\n",
+           ld(&forwarded), ld(&denied), ld(&run_refused), ld(&faults), hits, ld(&gfx_hits),
+           marker ? "" : "(none) ", mstate, (mstate & GPU_BM_GUARD) ? " GUARD" : "",
+           (mstate & GPU_BM_ENDED) ? " ENDED" : "");
+    if (!g2)
+        return;
+    /* G2 */
+    u64 gs[HV_GPU_G_COUNT];
+    for (u32 i = 0; i < HV_GPU_G_COUNT; i++)
+        gs[i] = ld(&guard[i]);
+    printf("HV: fatal: GPU: G2 grants 0x%x, %u declared windows, boot-control %s (0x%x -> 0x%x), "
+           "sgx %s, init data sent to%s%s%s; guards: %lu second init-data, %lu refused types, "
+           "%lu refused by the UAT audit, %lu sgx locked, %lu mailbox halves\n",
+           g2_grants, declared_count, boot_done ? "done" : "not done", boot_before, boot_after,
+           __atomic_load_n(&sgx_locked, __ATOMIC_RELAXED) ? "LOCKED" : "the guest's",
+           (init_sent & BIT(0)) ? " GFX" : "", (init_sent & BIT(1)) ? " GFX1" : "",
+           init_sent ? "" : " no role", gs[HV_GPU_G_INIT_AGAIN], gs[HV_GPU_G_REFUSED],
+           gs[HV_GPU_G_AUDIT], gs[HV_GPU_G_LOCKED], gs[HV_GPU_G_HALF]);
+    printf("HV: fatal: GPU: UAT audits %u (fresh at most %u in any walk); the last: %u roots, %u "
+           "tables, %u outliers (%u known), fresh %u (%u in guest-writable tables)%s\n",
+           __atomic_load_n(&uat_audits, __ATOMIC_RELAXED),
+           __atomic_load_n(&uat_fresh_max, __ATOMIC_RELAXED), uat_last.roots, uat_last.tables,
+           uat_last.outliers, uat_last.known, uat_last.fresh, uat_last.fresh_in_pool,
+           uat_last.capped ? ", CAPPED" : "");
+    for (u32 role = 0; role < GPU_T8152_ROLES && role < 2; role++) {
+        for (u32 tx = 0; tx < 2; tx++) {
+            bool any = false;
+            for (u32 k = 0; k < GPU_MK_COUNT; k++) {
+                u64 n = ld(&msg_count[role][tx][k]);
+                if (!n)
+                    continue;
+                if (!any)
+                    printf("HV: fatal: GPU: messages %s %s:", role ? "GFX1" : "GFX", tx ? "TX" : "RX");
+                any = true;
+                printf(" %s %lu", gpu_msg_kind_name(k), n);
+            }
+            if (any)
+                printf("\n");
+        }
+    }
+    u64 dbr = __atomic_load_n(&last_db_role, __ATOMIC_ACQUIRE);
+    if (dbr)
+        printf("HV: fatal: GPU: last doorbell %s 0x%016lx after forwarded access %lu (%lu "
+               "forwarded since)\n",
+               (dbr & 1) ? "GFX1" : "GFX", ld(&last_db_msg), ld(&last_db_seq),
+               ld(&forwarded) - ld(&last_db_seq));
+    else
+        printf("HV: fatal: GPU: no doorbell forwarded this session\n");
 }
 
 static int hook(void)
@@ -1061,8 +1130,15 @@ static bool probe_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int
 
     if (gfx_window)
         __atomic_add_fetch(&gfx_hits, 1, __ATOMIC_RELAXED);
-    if (disp == GPU_A_PASSED && gfx_window)
+    if (disp == GPU_A_PASSED && gfx_window) {
         count_message(addr, val, write, width);
+        if (write && width == 4 && gpu_t8152_msg_kind(val[1], val[0]) == GPU_MK_DOORBELL) {
+            __atomic_store_n(&last_db_msg, val[0], __ATOMIC_RELAXED);
+            __atomic_store_n(&last_db_seq, __atomic_load_n(&forwarded, __ATOMIC_RELAXED),
+                             __ATOMIC_RELAXED);
+            __atomic_store_n(&last_db_role, BIT(63) | role, __ATOMIC_RELEASE);
+        }
+    }
 
     bool first;
     u64 value = write ? wrote : val[0];
@@ -1436,6 +1512,7 @@ void hv_gpu_host_new_session(void)
     memset(class_hits, 0, sizeof(class_hits));
     total_hits = gfx_hits = 0;
     last_hook_addr = last_hook_write = 0;
+    last_db_msg = last_db_role = last_db_seq = 0;
     logged = 0;
     g2 = boot_done = sgx_locked = uat_ready = false;
     g2_grants = declared_count = init_sent = 0;

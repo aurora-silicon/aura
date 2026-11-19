@@ -423,6 +423,14 @@ static void g2_tests(void)
     assert(msgs(0, 1, GPU_MK_DOORBELL) == 1);
     assert(st(HV_GPU_S_GUARD + HV_GPU_G_AUDIT) == 8);
     assert(st(HV_GPU_S_AUDIT + HV_GPU_A_FRESH_MAX) >= 1);
+    /* G5b: the fatal report describes this G2 session from recorded values (no lock, no MMIO). */
+    int hw_fatal = hw_count;
+    fflush(stdout);
+    puts("G2 FATAL BEGIN");
+    hv_gpu_fatal_report();
+    fflush(stdout);
+    puts("G2 FATAL END");
+    assert(hw_count == hw_fatal);
 
     /* The access map shows the new dispositions. */
     u64 count = st(HV_GPU_S_MAP_COUNT);
