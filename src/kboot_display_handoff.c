@@ -89,8 +89,9 @@
  * T6050 (M5 Pro/Max): the __OS_LOG buffers of every running display coprocessor are reserved on
  * every boot. When the device tree describes the internal display (aliases dcp and disp0, all its
  * nodes disabled) and every check in t6050_handoff() passes, that handoff is published and those
- * nodes are enabled; otherwise they are left disabled. The J775D (Mac Studio, M5 Ultra) has no
- * panel: t6050_headless_handoff() hands its external engines over with the display subsystem.
+ * nodes are enabled; otherwise they are left disabled. A board without a panel (the J775D, Mac
+ * Studio, M5 Ultra), whose display subsystem scans out through one external engine's display DART:
+ * t6050_headless_handoff() hands its external engines over with the display subsystem.
  *
  * Fail-soft: dt_set_display_handoff() always returns 0; a failed check is logged and changes
  * nothing. Transactional: DT edits are made on a scratch copy that replaces the DT only if every
@@ -3903,29 +3904,26 @@ static T6050_TEXT void t6050_handoff(void *dt)
     dlog("internal display handoff refused; the boot framebuffer keeps the panel\n");
 }
 
-/*
- * J775D (Mac Studio, M5 Ultra): no panel, so its device tree has no dcp or disp0 alias, and iBoot
- * leaves its external engines running (dcpext0..3 on die 0, dcpext4..7 on die 1). The display
- * subsystem scans out through the display DART of one of them (dcpext0's: rear USB-C port 3).
- * That engine is handed off as t6050_ext_one() hands off an engine beside a panel, in one
- * transaction with the subsystem, and /vram, which holds the boot framebuffer, becomes their
- * "framebuffer". Only then is each other engine the device tree describes handed off, on its own
- * (die 1's dcpext4: the HDMI port). Each keeps the bandwidth scratch its node names, in its own
- * die's PMC metadata. The table row is the one of this OS firmware and the image the scanout
- * engine runs; every other engine handed off must run that image too.
- */
-static T6050_TEXT bool t6050_headless(void *dt)
-{
-    return !fdt_node_check_compatible(dt, 0, "apple,j775d");
-}
-
 #define T6050_ENGINES 8 /* dcpext0..7 */
 
-/* The display subsystem, the engine it scans out through, that engine's image, /vram: the engine */
-static T6050_TEXT int t6050_headless_check(void *dt, u64 *vram, u64 *vram_size)
+/*
+ * A board without a panel (the J775D, Mac Studio, M5 Ultra): its device tree has no dcp or disp0
+ * alias, and its display subsystem scans out through one external engine's display DART (the
+ * J775D's dcpext0: rear USB-C port 3). iBoot leaves the external engines running (on the J775D,
+ * dcpext0..3 on die 0, dcpext4..7 on die 1). The scanout engine is handed off as t6050_ext_one()
+ * hands off an engine beside a panel, in one transaction with the subsystem, and /vram, which holds
+ * the boot framebuffer, becomes their "framebuffer". Only then is each other engine the device
+ * tree describes handed off, on its own (the J775D's dcpext4 on die 1: the HDMI port). Each keeps
+ * the bandwidth scratch its node names, in its own die's PMC metadata. The table row is the one of
+ * this OS firmware and the image the scanout engine runs; every other engine handed off must run
+ * that image too.
+ *
+ * The board is chosen by that property, not by name: this returns the engine whose display DART
+ * (by the ADT's dart-dispextN) is the display subsystem's only one, or -1.
+ */
+static T6050_TEXT int t6050_headless_engine(void *dt)
 {
     u32 len = 0;
-    int engine = -1;
     char a[40];
 
     int disp = fdt_node_offset_by_compatible(dt, -1, "apple,display-subsystem");
@@ -3933,19 +3931,29 @@ static T6050_TEXT int t6050_headless_check(void *dt, u64 *vram, u64 *vram_size)
     int dart =
         io && len == 8 && !fdt32_ld(&io[1]) ? fdt_node_offset_by_phandle(dt, fdt32_ld(io)) : -1;
     const fdt64_t *reg = dart < 0 ? NULL : fdt_getprop(dt, dart, "reg", (int *)&len);
-    if (!reg || len < 16 || fdt_getprop(dt, disp, "memory-region", NULL) ||
-        fdt_get_path(dt, disp, t6050.path[T6050_DISP], T6050_PATH))
-        bail("the display subsystem does not scan out through one DART, or has a memory-region\n");
-    if (dcp6_status_disabled(dt, disp, "the display subsystem"))
+    if (!reg || len < 16)
         return -1;
-    for (int n = 0; n < T6050_ENGINES && engine < 0; n++) {
+    for (int n = 0; n < T6050_ENGINES; n++) {
         u64 base;
         snprintf(a, sizeof(a), "/arm-io/dart-dispext%d", n);
         if (!t6050_adt_reg(a, 0, &base, NULL) && base == fdt64_ld(&reg[0]))
-            engine = n;
+            return n;
     }
-    if (engine < 0)
-        bail("the display subsystem's DART at 0x%lx is no dart-dispextN\n", fdt64_ld(&reg[0]));
+    return -1;
+}
+
+/* The display subsystem, that engine's image, /vram: the engine */
+static T6050_TEXT int t6050_headless_check(void *dt, int engine, u64 *vram, u64 *vram_size)
+{
+    u32 len = 0;
+    char a[40];
+
+    int disp = fdt_node_offset_by_compatible(dt, -1, "apple,display-subsystem");
+    if (fdt_getprop(dt, disp, "memory-region", NULL) ||
+        fdt_get_path(dt, disp, t6050.path[T6050_DISP], T6050_PATH))
+        bail("the display subsystem has a memory-region\n");
+    if (dcp6_status_disabled(dt, disp, "the display subsystem"))
+        return -1;
 
     snprintf(a, sizeof(a), "/arm-io/dcpext%d/iop-dcpext%d-nub", engine, engine);
     int nub = adt_path_offset(adt, a);
@@ -3989,13 +3997,13 @@ static T6050_TEXT int t6050_headless_publish(void *dt, int engine, u64 vram, u64
 }
 
 /* Any failure leaves every display node disabled: the boot framebuffer keeps the display */
-static T6050_TEXT void t6050_headless_handoff(void *dt)
+static T6050_TEXT void t6050_headless_handoff(void *dt, int engine)
 {
     u64 vram, vram_size;
 
     memset(&t6050, 0, sizeof(t6050));
     t6050.headless = true;
-    int engine = t6050_headless_check(dt, &vram, &vram_size);
+    engine = t6050_headless_check(dt, engine, &vram, &vram_size);
     void *scratch = engine < 0 ? NULL : dcp6_scratch(dt);
     if (scratch && (t6050_ext_one(scratch, engine) ||
                     t6050_headless_publish(scratch, engine, vram, vram_size))) {
@@ -4031,10 +4039,11 @@ int dt_set_display_handoff(void *dt)
             return 0;
         dcp6_find_nubs();
         dcp6_reserve_oslogs(dt);
+        int engine;
         if (fdt_get_alias(dt, "dcp") && fdt_get_alias(dt, "disp0"))
             t6050_handoff(dt);
-        else if (t6050_headless(dt))
-            t6050_headless_handoff(dt);
+        else if ((engine = t6050_headless_engine(dt)) >= 0)
+            t6050_headless_handoff(dt, engine);
         else
             dlog("the device tree does not describe the internal display: no handoff\n");
         return 0;
