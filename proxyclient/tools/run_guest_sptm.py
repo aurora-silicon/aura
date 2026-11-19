@@ -71,7 +71,7 @@ Environment (all optional; 1 enables a switch):
   AURA_KEEP_ANE            keep /arm-io/ane and dart-ane (the exclaves' manifests name its mappers)
   AURA_KEEP_WIFI           keep the kernelcache workaround's PCIe/Wi-Fi/Bluetooth nodes (not the
                            debug port's): WindowServer waits on TimeSync, which needs a network port
-  AURA_TRAP_DELAY_NS=<n>   spin n ns in every GL trap (workaround: holds off the ~20 s stall)
+  AURA_TRAP_DELAY_NS=<n>   spin n ns in every GL trap (diagnostic: delays the ~20 s stall)
   AURA_TRAP_DELAY_MASK=<m> which GL traps spin: 1 GEXIT, 2 g-ERET, 4 IMPDEF, 8 SPTM's entry
                            sysreg read, 16 HVC, 32 rest, 64 other sysregs
   AURA_SYSREG_CENSUS       print which sysregs the guarded world traps on, every 20 s

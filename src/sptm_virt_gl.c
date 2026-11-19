@@ -1030,12 +1030,17 @@ void sptm_virt_canary_tick(void)
 }
 
 /*
- * AURA_TRAP_DELAY_NS: a workaround knob, not a fix. The guest stops (no trap, no WFI, no panic)
- * ~20-25 s into XNU when aura's GL traps are fast; slowing each one moves that out -- 2.5 us to
- * ~95 s (t102), 10 us to ~6 min (t105) -- so something races with aura's speed.
+ * AURA_TRAP_DELAY_NS: a diagnostic for the macOS guest's ~20 s stall, not a fix, and off unless
+ * run_guest_sptm.py writes it (0 here). No boot path sets it. The guest stops (no trap, no WFI,
+ * no panic) ~20-25 s into XNU when aura's GL traps are fast; slowing each one moves that out --
+ * 2.5 us to ~95 s (t102), 10 us to ~6 min (t105) -- so something races with aura's speed.
  * AURA_TRAP_DELAY_MASK picks the traps that wait (default all): bit 0 GEXIT, 1 guarded ERET,
  * 2 other IMPDEF ops, 3 s3_6_c15_c11_1 (SPTM's entry read), 4 HVC, 5 the rest, 6 other sysregs.
- * Only the sysreg traps matter (t110).
+ * Only the sysreg traps matter (t106-t110); SPTM's rare EL2 control writes alone do not (t115).
+ * The last guest writes before every stall power up the camera ISP; with /arm-io/isp and
+ * /arm-io/dart-isp hidden (AURA_HIDE_NODES) the guest runs on without a delay (t121, eb665623).
+ * The race itself is open: tracked in aura issue "sptm_virt: guest stalls ~20 s into XNU when
+ * the ISP powers up (AURA_TRAP_DELAY_NS hides it)". Keep the knob for that bisection.
  */
 u32 sptm_virt_trap_delay_mask = ~0u;
 
