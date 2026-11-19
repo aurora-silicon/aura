@@ -238,6 +238,9 @@ static bool smp_old_vector_owned(u64 locked)
         if (read32(locked + off) != read32((u64)_vectors_start + off))
             return false;
     }
+    /* J613 stage 1 has the same four reset-vector tags, but no searchable stack marker. */
+    if (chip_id == T8122)
+        return true;
     for (u64 p = locked + 0x200; p <= limit - (sizeof("STACKBOT") - 1); p += 8) {
         if (!memcmp((const void *)p, "STACKBOT", sizeof("STACKBOT") - 1))
             return true;
@@ -264,7 +267,9 @@ static int smp_prepare_rvbar(const struct cpu_info *cpu)
     /* A7 to M3 expose a writable RVBAR.  The ordinary SMP startup path writes it immediately
      * before releasing a core, but a stock-SPTM guest performs CPUSTART itself, so publish the
      * active Aura vector here as part of the guest reset contract as well. */
-    if (cpu_features->apple_sysregs_unlocked) {
+    /* A chainloaded J613 cannot rewrite the running boot core's locked RVBAR: relay it instead. */
+    bool boot_locked = (rvbar & RVBAR_LOCK) && cpu == &cpu_info[boot_cpu_idx];
+    if (cpu_features->apple_sysregs_unlocked && !boot_locked) {
         write64(cpu->impl_reg, target);
         sysop("dsb sy");
         return (read64(cpu->impl_reg) & RVBAR_ADDR_UNLOCKED) == target ? 0 : -1;
@@ -1443,6 +1448,11 @@ int smp_prepare_guest_resets(void)
             if (smp_reset_stacks[i].mpidr != mpidr)
                 printf("SMP-guest: boot cpu%d MPIDR 0x%lx, ADT-derived 0x%lx\n", i,
                        smp_reset_stacks[i].mpidr, mpidr);
+            /* The sleep wake starts on the boot core, so its locked RVBAR must reach this image
+             * too. On J613 a chainloaded image installs the same tested relay used by RAM
+             * trials. */
+            if (chip_id == T8122)
+                rc = smp_prepare_rvbar(cpu);
         } else {
             if (!secondary_stacks[i]) {
                 printf("SMP-guest: cpu%d has no reset stack\n", i);
