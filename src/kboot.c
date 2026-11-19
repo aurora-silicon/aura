@@ -9563,8 +9563,22 @@ static int dt_set_isp(void)
  * placeholders isp-firmware-text and isp-firmware-data and an isp-heap window for the
  * firmware's main memory. Fill the placeholders from this boot's ADT isp segment-ranges: reg,
  * and iommu-addresses where the firmware runs them. Then set the platform ID from the ADT's
- * sensor-type and enable the ISP and its DARTs.
+ * sensor-type, copy the ISP DART's address filter windows into apple,dapf-ranges, and enable the
+ * ISP and its DARTs.
  */
+#define J713_ISP_DAPF_SLICES 16
+
+/*
+ * The register words the ISP driver writes to every slice of its DART's address filter, at each
+ * of the slice's offsets (DAPF_CTRL0_ISP, DAPF_CTRL1 and DAPF_CTRL2_ISP in the Linux driver): the
+ * window control word at 0x00, of which only bits 7:0 read back; the second control word at 0x04;
+ * and the stream ID mask at 0x20, stream 0 only. An ADT record with other words is not what the
+ * driver would program, so it is refused.
+ */
+#define J713_ISP_DAPF_CTRL0   0x31
+#define J713_ISP_DAPF_CTRL1   0
+#define J713_ISP_DAPF_SIDMASK 0x1
+
 static int dt_set_j713_isp_one(unsigned int unused)
 {
     static const char dt_names[] = "text\0data\0heap";
@@ -9643,6 +9657,25 @@ static int dt_set_j713_isp_one(unsigned int unused)
         bail("ADT: J713 ISP segments at 0x%lx and 0x%lx do not fit the firmware window\n", iova[0],
              iova[1]);
 
+    /*
+     * The ISP DART's address filter, which the ISP loses at each power-down: the kernel
+     * programs it before every firmware start, writing the same register words to every
+     * slice, so only records with those words are accepted. Without a usable filter the ISP is
+     * still handed over, without apple,dapf-ranges: a kernel with its own table keeps working,
+     * and one that needs the property leaves the camera off and says why.
+     */
+    u64 ranges[2 * J713_ISP_DAPF_SLICES];
+    fdt64_t dapf[2 * J713_ISP_DAPF_SLICES];
+    int dapf_count = dapf_t8132_ranges("/arm-io/dart-isp", J713_ISP_DAPF_CTRL0, J713_ISP_DAPF_CTRL1,
+                                       J713_ISP_DAPF_SIDMASK, ranges, J713_ISP_DAPF_SLICES);
+    if (dapf_count <= 0) {
+        printf("ADT: J713 ISP DART has no usable address filter; handing over without "
+               "apple,dapf-ranges\n");
+        dapf_count = 0;
+    }
+    for (int i = 0; i < 2 * dapf_count; i++)
+        dapf[i] = cpu_to_fdt64(ranges[i]);
+
     for (int i = 0; i < 2; i++) {
         fdt64_t range[2] = {cpu_to_fdt64(phys[i]), cpu_to_fdt64(size[i])};
         int ret;
@@ -9670,6 +9703,18 @@ static int dt_set_j713_isp_one(unsigned int unused)
     if (isp < 0 || fdt_setprop_u32(dt, isp, "apple,platform-id", sensor))
         return -1;
     isp = fdt_node_offset_by_phandle(dt, isp_phandle);
+    if (isp < 0)
+        return -1;
+    if (dapf_count) {
+        if (fdt_setprop(dt, isp, "apple,dapf-ranges", dapf, 2 * dapf_count * sizeof(*dapf)))
+            return -1;
+    } else {
+        /* A filter already in the tree is not this boot's: drop it. */
+        int ret = fdt_delprop(dt, isp, "apple,dapf-ranges");
+        if (ret && ret != -FDT_ERR_NOTFOUND)
+            return -1;
+    }
+    isp = fdt_node_offset_by_phandle(dt, isp_phandle);
     if (isp < 0 || fdt_setprop_string(dt, isp, "status", "okay"))
         return -1;
     for (int i = 0; i < 3; i++) {
@@ -9677,7 +9722,8 @@ static int dt_set_j713_isp_one(unsigned int unused)
         if (dart < 0 || fdt_setprop_string(dt, dart, "status", "okay"))
             return -1;
     }
-    printf("FDT: J713 ISP handed over, platform ID 0x%x\n", sensor);
+    printf("FDT: J713 ISP handed over, platform ID 0x%x, %d address filter windows\n", sensor,
+           dapf_count);
     return 0;
 }
 
