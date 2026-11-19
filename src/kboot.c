@@ -11924,8 +11924,8 @@ int kboot_boot(void *kernel)
         }
     }
     if (chip_id == T6050 && ret < 0) {
-        /* A stop may mean storage moved under nvme-apple; the port's state is unknown either way */
-        printf("kboot: refusing T6050 handoff after the apcie0 port 2 bring-up stopped\n");
+        /* A stop in shared state or a storage change: storage may have moved under nvme-apple */
+        printf("kboot: refusing T6050 handoff after the apcie0 bring-up stopped\n");
         return -1;
     }
     /* prepare_dt packed the tree: reopen it into its spare capacity for the status edits */

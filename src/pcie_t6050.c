@@ -32,19 +32,24 @@
 
 #define T6050_GP_PORTS 4
 
-/* The ports brought up, in order. Port 2 is required (the result of pcie_t6050_init); the rest are
- * optional: a stop there leaves that port down and the others as they are. A port whose bridge has
- * an SMC function-reset (port 0: the N1, gP13) has it released before its link comes up. */
+/* The ports brought up, in order, each one the board's ADT has a bridge for. A stop in one port
+ * leaves that port down and the others as they are, once the storage check after it passes
+ * (pcie_t6050_init). A port whose bridge has an SMC function-reset (port 0: the N1, gP13) has it
+ * released before its link comes up. */
 static const struct t6050_port {
     int port;
     u32 endpoint_id[2]; /* function 0's vendor/device; the second, if set, an alternative */
+    u32 class_code;     /* or, with no IDs, function 0's class code */
     const char *endpoint;
-    bool required;
 } ports[] = {
-    {2, {0x812710ec}, "RTL8127A", true},
-    {3, {0x21421b21}, "ASM3142 xHCI", false},
+    /*
+     * The wired network port: any Ethernet controller (class 02 00 00). J775d has an RTL8127A
+     * (10ec:8127) there; the J873s ADT has a lan0 with supports-extlom under the same bridge.
+     */
+    {2, {0}, 0x020000, "Ethernet"},
+    {3, {0x21421b21}, 0, "ASM3142 xHCI"},
     /* The N1's control function: 1900 in its ROM personality, 1901 once its firmware runs */
-    {0, {0x1900106b, 0x1901106b}, "N1 Wi-Fi/Bluetooth", false},
+    {0, {0x1900106b, 0x1901106b}, 0, "N1 Wi-Fi/Bluetooth"},
 };
 
 /* apcie0 "reg": shared windows, then six per port */
@@ -80,6 +85,7 @@ static const struct t6050_port {
 
 /* PCI config space */
 #define PCI_COMMAND               0x04
+#define PCI_CLASS_REVISION        0x08
 #define PCI_PRIMARY_BUS           0x18
 #define PCI_CAPABILITY_LIST       0x34
 #define PCI_CAP_ID_EXP            0x10
@@ -388,9 +394,7 @@ static int stage_a(void)
         if (!pr[i].ctl || read32(pr[i].ctl + PORT_LINKSTS) & BIT(0) ||
             (read32(pr[i].perst) & GPIO_PERST_MASK) == GPIO_PERST_LOW)
             continue;
-        if (ports[i].required)
-            FAIL("port %d PERST# is not output-low: 0x%x\n", ports[i].port, read32(pr[i].perst));
-        /* An optional port not left in reset is not ours to sequence: it stays as found */
+        /* A port not left in reset is not ours to sequence: it stays as found */
         printf("pcie-t6050: port %d PERST# is not output-low (0x%x): left down\n", ports[i].port,
                read32(pr[i].perst));
         pr[i].ctl = 0;
@@ -613,9 +617,13 @@ static int stage_f(struct port_regs *pp)
     }
     pp->bus = bus;
     u32 id = read32(r.ecam + ((u64)bus << 20));
-    if (id != pp->p->endpoint_id[0] && (!pp->p->endpoint_id[1] || id != pp->p->endpoint_id[1]))
-        FAIL("endpoint %02x:00.0 is 0x%08x\n", bus, id);
-    printf("pcie-t6050: port %d endpoint %04x:%04x\n", pp->p->port, id & 0xffff, id >> 16);
+    u32 class_code = read32(r.ecam + ((u64)bus << 20) + PCI_CLASS_REVISION) >> 8;
+    if (pp->p->endpoint_id[0]
+            ? id != pp->p->endpoint_id[0] && (!pp->p->endpoint_id[1] || id != pp->p->endpoint_id[1])
+            : id == 0xffffffff || class_code != pp->p->class_code)
+        FAIL("endpoint %02x:00.0 is 0x%08x, class 0x%06x\n", bus, id, class_code);
+    printf("pcie-t6050: port %d endpoint %04x:%04x class 0x%06x\n", pp->p->port, id & 0xffff,
+           id >> 16, class_code);
     return 0;
 }
 
@@ -689,8 +697,8 @@ static int number_like_linux(void)
     return 0;
 }
 
-/* 0 once every required port is up; -1, for the rest of this boot, after a stop in shared state or
- * a required port: a partial state is not retried. An optional port's stop leaves it down. */
+/* 0 once every port is up or left down; -1, for the rest of this boot, after a stop in shared state
+ * or a storage change: a partial state is not retried. A port's own stop leaves it down. */
 int pcie_t6050_init(void)
 {
     static int state = 1;
@@ -701,7 +709,7 @@ int pcie_t6050_init(void)
     TRY(find_regs());
     TRY(storage_find());
     /* A port whose bridge this board's ADT lacks (J716c: ports 2 and 3) is not on the board: it
-     * is neither required nor tried. With none of the ports here, the GP side stays as found. */
+     * is not tried. With none of the ports here, the GP side stays as found. */
     bool any_present = false;
     for (size_t i = 0; i < ARRAY_SIZE(ports); i++) {
         char bridge[40];
@@ -716,11 +724,8 @@ int pcie_t6050_init(void)
             continue;
         }
         any_present = true;
-        if (find_port_regs(&pr[i])) {
-            if (ports[i].required)
-                return -1;
+        if (find_port_regs(&pr[i]))
             pr[i].ctl = 0; /* left down: stages skip it */
-        }
     }
     if (!any_present) {
         printf("pcie-t6050: none of the GP ports is on this board: left as found\n");
@@ -746,9 +751,9 @@ int pcie_t6050_init(void)
         if (!pr[i].ctl) /* its resources were not found: reported above */
             continue;
         if (port_up(&pr[i]) < 0) {
-            if (ports[i].required && !pr[i].absent)
-                return -1;
-            printf("pcie-t6050: port %d left down\n", ports[i].port);
+            /* What a port's stop may not cost is storage: that one still stops the boot */
+            TRY(storage_check("after a port stop", false));
+            printf("pcie-t6050: port %d (%s) left down\n", ports[i].port, ports[i].endpoint);
         }
     }
     TRY(number_like_linux());
@@ -935,7 +940,7 @@ int pcie_t6050_handoff_fdt(void *dt)
             if (pr[i].bus != tp[i].bus)
                 printf("pcie-t6050: port %d: the tree's bus %02x is now %02x\n", ports[i].port,
                        tp[i].bus, pr[i].bus);
-        } else if (!ports[i].required) {
+        } else {
             if (t6050_port_status(dt, i, tp[i].dart, "disabled"))
                 return -1;
             printf("pcie-t6050: port %d down: disabled pci@%d,0 and its DART in the DT\n",
