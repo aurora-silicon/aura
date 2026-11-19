@@ -100,6 +100,7 @@ struct s2r_rec {
 #define S2R_WRITE  BIT(50)
 #define S2R_J613_SNAPSHOT BIT(13) /* AURA_S2R_CRUMBS */
 #define S2R_J613_TRAFFIC  BIT(14)
+#define S2R_J613_WAKE_AT_RESET BIT(15) /* wake register snapshot MMU-off at reset */
 
 /* For the host: read over the proxy after a stop, or after a reset that kept DRAM. */
 struct s2r_rec *sptm_virt_s2r_ring;
@@ -792,7 +793,7 @@ static void s2r_j613_retention(bool wake)
 }
 
 /* Read physical state after releasing the debug domains and again at reset, before SPTM. */
-static void s2r_j613_snapshot(const char *tag, bool wake)
+static void s2r_j613_snapshot(const char *tag, bool wake, bool retention)
 {
     static const struct {
         u64 first, last;
@@ -819,7 +820,8 @@ static void s2r_j613_snapshot(const char *tag, bool wake)
     u64 rvbar_reg = smp_cpu_rvbar_reg(smp_id());
     if (rvbar_reg)
         s2r_j613_snapshot_record("RVBAR", rvbar_reg, s2r_snapshot_read(rvbar_reg, true));
-    s2r_j613_retention(wake);
+    if (retention)
+        s2r_j613_retention(wake);
     if (wake)
         for (unsigned i = 0; i < ARRAY_SIZE(pmgr); i++)
             for (u64 a = pmgr[i].first; a <= pmgr[i].last; a += pmgr[i].stride)
@@ -1334,7 +1336,7 @@ static bool s2r_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int w
         }
         s2r_commit();
         if (s2r_j613_snapshot_enabled())
-            s2r_j613_snapshot("J613PRE", false);
+            s2r_j613_snapshot("J613PRE", false, true);
         s2r_crumb(0x20);
     }
 
@@ -2219,7 +2221,12 @@ void sptm_virt_s2r_wake(int cpu)
     if (s2r_j613_snapshot_enabled()) {
         s2r_wake_head = sptm_virt_s2r_head;
         s2r_retained_marker("J613RST", now);
-        s2r_j613_snapshot("J613WAKE", true);
+        /* Run 39 did not resume with the register reads here, MMU off on the just-reset core:
+         * by default only the DRAM witness runs here and the reads wait for the first trap. */
+        if (sptm_virt_s2r_crumbs & S2R_J613_WAKE_AT_RESET)
+            s2r_j613_snapshot("J613WAKE", true, true);
+        else
+            s2r_j613_retention(true);
     }
     s2r_commit_t = 0;
     s2r_wake_t = now;
@@ -2324,6 +2331,10 @@ void sptm_virt_s2r_wake_trap(u64 esr, u64 elr, bool in_gl)
         !__atomic_exchange_n(&s2r_wake_banner_done, true, __ATOMIC_SEQ_CST)) {
         if (!s2r_j613_snapshot_enabled())
             s2r_wake_head = sptm_virt_s2r_head;
+        else if (!(sptm_virt_s2r_crumbs & S2R_J613_WAKE_AT_RESET)) {
+            s2r_retained_marker("J613TRAP", mrs(CNTPCT_EL0));
+            s2r_j613_snapshot("J613WAKE", true, false);
+        }
         u64 frq = mrs(CNTFRQ_EL0), now = mrs(CNTPCT_EL0);
         printf("SPTM-virt[s2r]: WAKE #%u banner: first guest trap on cpu%d, %lu us after the "
                "reset on cpu%d\n",
