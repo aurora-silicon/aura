@@ -707,14 +707,14 @@ static void s2r_probe_one(u64 e);
 
 /* A coprocessor whose power domain is already off aborts an ASC register read.  That is an
  * expected commit-time state, not a hypervisor failure, so make the read observational. */
-static int s2r_snapshot_read32(u64 addr, u32 *value)
+static u64 s2r_snapshot_read(u64 addr, bool wide)
 {
     enum exc_guard_t saved = exc_guard;
     int before = exc_count;
     u64 daif = mrs(DAIF);
 
     exc_guard = GUARD_MARK | GUARD_SILENT;
-    *value = read32(addr);
+    u64 value = wide ? read64(addr) : read32(addr);
     /* Let a pending asynchronous SError arrive while the guard is still armed. */
     sysop("dsb sy");
     sysop("msr daifclr, 4");
@@ -722,7 +722,7 @@ static int s2r_snapshot_read32(u64 addr, u32 *value)
     msr(DAIF, daif);
     sysop("isb");
     exc_guard = saved;
-    return exc_count == before ? 0 : -1;
+    return exc_count == before ? value : ~0UL;
 }
 
 static bool s2r_j613_snapshot_enabled(void)
@@ -735,15 +735,18 @@ static bool s2r_j613_traffic_enabled(void)
     return chip_id == T8122 && (sptm_virt_s2r_crumbs & S2R_J613_TRAFFIC);
 }
 
-static void s2r_j613_snapshot_word(const char *tag, u64 addr)
+static void s2r_j613_snapshot_record(const char *tag, u64 addr, u64 value)
 {
-    u32 val;
-    bool fault = s2r_snapshot_read32(addr, &val) < 0;
-    struct s2r_rec *r = s2r_record_marker(tag, fault ? ~0UL : val);
+    struct s2r_rec *r = s2r_record_marker(tag, value);
     if (r) {
         r->meta |= addr & GENMASK(47, 0);
         s2r_clean(r, sizeof(*r));
     }
+}
+
+static void s2r_j613_snapshot_word(const char *tag, u64 addr)
+{
+    s2r_j613_snapshot_record(tag, addr, s2r_snapshot_read(addr, false));
 }
 
 /* Aura owns this buffer. Vary the pattern on each commit and publish it to DRAM. */
@@ -788,10 +791,8 @@ static void s2r_j613_snapshot(const char *tag, bool wake)
     };
 
     u64 rvbar_reg = smp_cpu_rvbar_reg(smp_id());
-    if (rvbar_reg) {
-        s2r_j613_snapshot_word("RVBARLO", rvbar_reg);
-        s2r_j613_snapshot_word("RVBARHI", rvbar_reg + 4);
-    }
+    if (rvbar_reg)
+        s2r_j613_snapshot_record("RVBAR", rvbar_reg, s2r_snapshot_read(rvbar_reg, true));
     s2r_j613_retention(wake);
     if (wake)
         for (unsigned i = 0; i < ARRAY_SIZE(pmgr); i++)
@@ -848,13 +849,13 @@ static void s2r_j613_commit_snapshot(void)
             printf("J613-COMMIT-ASC %s unavailable\n", cp[i].name);
             continue;
         }
-        u32 ctl;
-        if (s2r_snapshot_read32(base + 0x44, &ctl) < 0) {
+        u64 ctl = s2r_snapshot_read(base + 0x44, false);
+        if (ctl == ~0UL) {
             printf("J613-COMMIT-ASC %s 0x%lx powered-off-or-unavailable\n", cp[i].name,
                    base + 0x44);
             continue;
         }
-        printf("J613-COMMIT-ASC %s 0x%lx 0x%08x RUN=%u\n", cp[i].name, base + 0x44, ctl,
+        printf("J613-COMMIT-ASC %s 0x%lx 0x%08x RUN=%u\n", cp[i].name, base + 0x44, (u32)ctl,
                !!(ctl & 0x10));
     }
     iodev_console_flush();
