@@ -228,6 +228,15 @@ static int dptx_t8152_impedance_calibration(dptx_phy_t *phy)
     return 0;
 }
 
+/* Settle time after each power-enable request in regs[1] + 0x48 and after
+ * turning the PLL and PHY on. No ready or acknowledge bit for these requests
+ * is known; the T8112/T602x sequence in dptx_phy_activate() writes the same
+ * 0x48 bits with no wait at all. Kept as qualified on J873g HDMI until a
+ * status bit is found or the sequence is shown to work without it (tracking:
+ * aura#344). PLL lock and impedance calibration are
+ * polled separately. */
+#define DPTX_T8152_POWER_SETTLE_MS 1
+
 /* T8152 activation: power up, apply the adapter tunables from the devicetree,
  * then activate the PLL, PHY and AUX. */
 static int dptx_t8152_activate(dptx_phy_t *phy)
@@ -237,15 +246,15 @@ static int dptx_t8152_activate(dptx_phy_t *phy)
 
     /* PLL, AUX and PHY power enables */
     set32(phy->regs[1] + 0x48, 0x010);
-    mdelay(1);
+    mdelay(DPTX_T8152_POWER_SETTLE_MS);
     set32(phy->regs[1] + 0x48, 0x020);
     clear32(phy->regs[1] + 0x48, 0x040);
     set32(phy->regs[1] + 0x48, 0x100);
-    mdelay(1);
+    mdelay(DPTX_T8152_POWER_SETTLE_MS);
     set32(phy->regs[1] + 0x48, 0x200);
     clear32(phy->regs[1] + 0x48, 0x400);
     set32(phy->regs[1] + 0x48, 0x001);
-    mdelay(1);
+    mdelay(DPTX_T8152_POWER_SETTLE_MS);
     set32(phy->regs[1] + 0x48, 0x002);
     clear32(phy->regs[1] + 0x48, 0x004);
 
@@ -258,7 +267,7 @@ static int dptx_t8152_activate(dptx_phy_t *phy)
     dptx_t8152_set_bits(phy, 0x1400, 0, 0x01, 0);     /* AUX common control */
     dptx_t8152_set_bits(phy, 0x1c00, 4, 0x3f0, 0x3c); /* PHY on */
     dptx_t8152_set_bits(phy, 0x0000, 0, 0x01, 1);
-    mdelay(1);
+    mdelay(DPTX_T8152_POWER_SETTLE_MS);
 
     int ret = dptx_phy_set_active_lane_count(phy, DPTX_MAX_LANES);
     if (ret)
