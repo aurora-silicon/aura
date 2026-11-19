@@ -874,6 +874,72 @@ static void s2r_j613_snapshot(const char *tag, bool wake, bool retention)
     s2r_clean(&sptm_virt_s2r_head, sizeof(sptm_virt_s2r_head));
 }
 
+/*
+ * The wake snapshot split by read group, for the last permitted wake only (count >= 2), at its
+ * first guest trap. Runs 39, 44 and 47 lost the wake that carried the whole snapshot. Each group
+ * is a crumb bit; before each, PMU scratch 0x8310 names it (0x91..0x95), so a silent run says
+ * which group it was in. Bit 20 RVBAR; 21 DRAM witness (filled at the preceding entry's early
+ * link release); 22 main PMGR; 23 mini PMGR, watchdog and wake block; 24 gates, cluster, CLLT,
+ * CPU-start, commit word, second watchdog, SPMI notify words.
+ */
+#define S2R_J613_WAKE_GROUPS (BIT(20) | BIT(21) | BIT(22) | BIT(23) | BIT(24))
+
+static bool s2r_j613_group_wake(u32 wake_no)
+{
+    return chip_id == T8122 && (sptm_virt_s2r_crumbs & S2R_J613_WAKE_GROUPS) && s2r_go &&
+           sptm_virt_s2r_go_count >= 2 && wake_no == sptm_virt_s2r_go_count;
+}
+
+static void s2r_j613_wake_groups(void)
+{
+    u32 c = sptm_virt_s2r_crumbs;
+    const char *tag = "J613WAKE";
+    s2r_retained_marker("J613TRAP", mrs(CNTPCT_EL0));
+    if (c & BIT(20)) {
+        s2r_crumb_at(8, 0x91);
+        u64 rvbar_reg = smp_cpu_rvbar_reg(smp_id());
+        if (rvbar_reg)
+            s2r_j613_snapshot_record("RVBAR", rvbar_reg, s2r_snapshot_read(rvbar_reg, true));
+    }
+    if (c & BIT(21)) {
+        s2r_crumb_at(8, 0x92);
+        s2r_j613_retention(true);
+    }
+    if (c & BIT(22)) {
+        s2r_crumb_at(8, 0x93);
+        static const struct {
+            u64 first, last;
+        } pmgr[] = {
+            {0x2d0700100, 0x2d07004c0}, {0x2d0704000, 0x2d0704060},
+            {0x2d0708000, 0x2d0708020}, {0x2d0710000, 0x2d0710000},
+        };
+        for (unsigned i = 0; i < ARRAY_SIZE(pmgr); i++)
+            for (u64 a = pmgr[i].first; a <= pmgr[i].last; a += 8)
+                s2r_j613_snapshot_word(tag, a);
+    }
+    if (c & BIT(23)) {
+        s2r_crumb_at(8, 0x94);
+        for (u64 a = 0x2e4280000; a <= 0x2e4280100; a += 8)
+            s2r_j613_snapshot_word(tag, a);
+        for (u64 a = 0x2e42b0000; a <= 0x2e42b001c; a += 4)
+            s2r_j613_snapshot_word(tag, a);
+        for (u64 a = 0x2e4004000; a <= 0x2e4004044; a += 4)
+            s2r_j613_snapshot_word(tag, a);
+    }
+    if (c & BIT(24)) {
+        s2r_crumb_at(8, 0x95);
+        static const u64 regs[] = {
+            0x2d0724080, 0x2d0724088, 0x2d0724cac, 0x2d0724cd0, 0x2d0724cf0, 0x2d0780000,
+            0x2d0780004, 0x2d0768000, 0x2d0768024, 0x2d0734000, 0x2e42d4000, 0x2e42b8008,
+            0x2e4714040, 0x2e4908040,
+        };
+        for (unsigned i = 0; i < ARRAY_SIZE(regs); i++)
+            s2r_j613_snapshot_word(tag, regs[i]);
+    }
+    s2r_crumb_at(8, 0x9f); /* wake groups done */
+    s2r_clean(&sptm_virt_s2r_head, sizeof(sptm_virt_s2r_head));
+}
+
 /* Bit 10 of AURA_S2R_CRUMBS: a compact, read-only J613 commit-time snapshot. The access trace
  * cannot recover domains which were already steady before tracing began, and a successful sleep
  * may make the ring unavailable, so put the values on the always-on console and flush them before
@@ -2279,6 +2345,8 @@ void sptm_virt_s2r_early_release(void)
     s2r_crumb_at(8, 0x61);
     s2r_release_kept();
     s2r_crumb_at(8, 0x62); /* early release done */
+    if ((sptm_virt_s2r_crumbs & BIT(21)) && s2r_j613_group_wake(s2r_wake_count + 1))
+        s2r_j613_retention(false);
 
 }
 
@@ -2417,6 +2485,8 @@ void sptm_virt_s2r_wake_trap(u64 esr, u64 elr, bool in_gl)
         return;
     if (!s2r_wake_banner_done &&
         !__atomic_exchange_n(&s2r_wake_banner_done, true, __ATOMIC_SEQ_CST)) {
+        if (s2r_j613_group_wake(s2r_wake_count))
+            s2r_j613_wake_groups();
         if (!s2r_j613_wake_snap_enabled(s2r_wake_count))
             s2r_wake_head = sptm_virt_s2r_head;
         else if (!(sptm_virt_s2r_crumbs & S2R_J613_WAKE_AT_RESET)) {
