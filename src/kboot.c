@@ -8222,13 +8222,6 @@ static int dt_set_j773g_display_maps(unsigned int unused)
     u32 fb_phandle = fb < 0 ? 0 : fdt_get_phandle(dt, fb);
     if (!fb_phandle || dt_device_add_mem_region("disp0", fb_phandle, "framebuffer"))
         bail("FDT: cannot reserve the J773g retained framebuffer\n");
-    /*
-     * The DCP's own DART maps the scanout framebuffer at the same DVA as disp0 (as iBoot does,
-     * and as the boot modeset in display.c does), so the framebuffer is the DCP's memory too:
-     * a kernel admits a DCP DART leaf only into a region of the DCP's own memory-region.
-     */
-    if (dt_device_add_mem_region("dcp", fb_phandle, NULL))
-        bail("FDT: cannot link the J773g retained framebuffer to the DCP\n");
     if (seg16 >= 0 && j773g_link_segment("disp0_piodma", &j773g_dcp_segments[seg16]))
         return -1;
 
