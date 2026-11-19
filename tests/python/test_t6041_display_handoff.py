@@ -42,8 +42,13 @@ def build_host(tmp, unknown_profile=False):
         start = code.index("static const struct dcp_soc dcp_soc_t6041 = {")
         end = code.index("\n};", start)
         record = code[start:end]
-        assert ".os_fw = V26_6_2," in record
-        code = code[:start] + record.replace(".os_fw = V26_6_2,", ".os_fw = V_UNKNOWN,") + code[end:]
+        # T6041 lists one record per accepted build: unqualify every one of them
+        fws = re.search(r"\.fws = (\w+),", record).group(1)
+        astart = code.index(f"static const struct dcp6_fw {fws}[] = {{")
+        aend = code.index("\n};", astart)
+        table = re.sub(r"\{V\w+, ", "{V_UNKNOWN, ", code[astart:aend])
+        assert table.count("{V_UNKNOWN, ") >= 1
+        code = code[:astart] + table + code[aend:]
     (src / "kboot_display_handoff.c").write_text(code)
     shutil.copy(ROOT / "tests/t6041_display_host.c", src)
     for header in (ROOT / "tests/t8122_display_host").glob("*.h"):
