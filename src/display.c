@@ -91,7 +91,7 @@ static struct {
 } display_other;
 struct boot_video display_second_video;
 
-/* T8152: the internal DCP's RTKit at the hand-off, for apple,dcp-rtkit-quiesced: -1 aura
+/* T8152: the internal DCP's RTKit at the hand-off, for apple,dcp-rtkit-running: -1 aura
  * never started it, 1 running, 0 quiesced after a failed start. Only the internal DCP's
  * own state, not the second display's while that one is swapped in. */
 static int display_dcp_state = -1;

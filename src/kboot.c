@@ -11571,8 +11571,8 @@ static int dt_set_dcp_state_t8152(void)
     if (state < 0)
         return 0;
     int chosen = fdt_path_offset(dt, "/chosen");
-    if (chosen < 0 || fdt_setprop_u32(dt, chosen, "apple,dcp-rtkit-quiesced", state))
-        bail("FDT: couldn't set apple,dcp-rtkit-quiesced\n");
+    if (chosen < 0 || fdt_setprop_u32(dt, chosen, "apple,dcp-rtkit-running", state))
+        bail("FDT: couldn't set apple,dcp-rtkit-running\n");
     printf("FDT: internal DCP %s at the hand-off\n", state ? "running" : "stopped");
     return 0;
 }
