@@ -562,7 +562,7 @@ static int stage_e(const struct port_regs *pp)
 
     TRY(rmw("LTSSM start", p2 + PORT_LTSSMCTL, 0, BIT(0)));
     TRY(poll_set("link up", p2 + PORT_LINKSTS, BIT(0), 500));
-    mdelay(100);
+    mdelay(pcie_adt_perst_to_config_ms(pp->bridge));
     return 0;
 }
 
@@ -612,7 +612,9 @@ static int stage_f(struct port_regs *pp)
         TRY(set_bus(rp, bus));
     }
     pp->bus = bus;
-    u32 id = read32(r.ecam + ((u64)bus << 20));
+    u32 id;
+    if (pcie_wait_config_ready(r.ecam + ((u64)bus << 20), &id))
+        FAIL("endpoint %02x:00.0 never answered config space\n", bus);
     if (id != pp->p->endpoint_id[0] && (!pp->p->endpoint_id[1] || id != pp->p->endpoint_id[1]))
         FAIL("endpoint %02x:00.0 is 0x%08x\n", bus, id);
     printf("pcie-t6050: port %d endpoint %04x:%04x\n", pp->p->port, id & 0xffff, id >> 16);
@@ -651,8 +653,8 @@ static int port_up(struct port_regs *pp)
         int ret = smc_adt_function_reset(pp->bridge, 50);
         if (ret < 0)
             FAIL("port %d: its SMC function-reset was not released\n", pp->p->port);
-        if (!ret)
-            mdelay(100); /* the endpoint out of reset before the port's own reset table */
+        if (!ret) /* out of its SMC reset: T_PVPERL before PERST# is released in E */
+            mdelay(PCIE_CEM_T_PVPERL_MS);
         TRY(stage_b(pp));
         TRY(stage_c(pp));
         TRY(stage_d(pp));
