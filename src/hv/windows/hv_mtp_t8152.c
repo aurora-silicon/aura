@@ -445,6 +445,7 @@ static bool identity(void)
  * table pages stay cacheable (the device only reads them; every write is cleaned).
  */
 #define MTP_ATTR_NORMAL_NC 0x44
+#define MTP_ATTR_NORMAL_NC_XS0 0x40
 
 static bool prepare_area(void)
 {
@@ -458,7 +459,9 @@ static bool prepare_area(void)
     mmu_flush_own_tlb();
     for (u64 off = 0; off < size; off += MTP_DART_PAGE) {
         int attr = mmu_probe_attr(rings + off);
-        if (attr != MTP_ATTR_NORMAL_NC) {
+        /* PAR_EL1.ATTR reports Normal Inner/Outer Non-cacheable as 0x44, or, with FEAT_XS, as
+         * 0x40 (the XS=0 encoding of the same memory type; seen on the M6). */
+        if (attr != MTP_ATTR_NORMAL_NC && attr != MTP_ATTR_NORMAL_NC_XS0) {
             printf("HV: input: MTP ring page 0x%lx translates with attribute %d, not Normal-NC "
                    "0x%x: attach refused (nothing on the MTP was touched)\n",
                    rings + off, attr, MTP_ATTR_NORMAL_NC);
