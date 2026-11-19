@@ -9395,21 +9395,6 @@ __attribute__((section(".init.t6050_isp"))) static int t6050_isp_add_mem_region(
     return 0;
 }
 
-static const struct {
-    const char *compat;
-    u32 sensor_type;
-    enum fw_version fw;
-} t6050_isp_boards[] = {
-    {"apple,j716c", 0x75, V27_0},
-    {"apple,j714s", 0x74, V27_0},
-    {"apple,k114c", 0xb9, V27_3B},
-    /*
-     * K116s: ADT isp0 of 27.2 (26B8125). Firmware uuid 980F533B-34EA-3FBA-878C-809F6AF57345,
-     * the IPSW's isp_bni/adc-nyx-sck11pm; its K116 connection table has one FrontRGB IMX958.
-     */
-    {"apple,k116s", 0xbc, V27_2},
-};
-
 static int dt_set_t6050_isp(const char **why)
 {
     /* Exact paths: "/soc/isp@..." must not resolve "soc" to "soc@200000000". */
@@ -9418,16 +9403,14 @@ static int dt_set_t6050_isp(const char **why)
     if (node < 0)
         return 0;
 
-    u32 want = 0;
-    *why = "board or firmware not in the table";
-    for (unsigned int i = 0; i < ARRAY_SIZE(t6050_isp_boards); i++) {
-        if (fdt_node_check_compatible(dt, 0, t6050_isp_boards[i].compat))
-            continue;
-        if (os_firmware.version != t6050_isp_boards[i].fw)
-            return -1;
-        want = t6050_isp_boards[i].sensor_type;
-    }
-    if (!want)
+    /*
+     * Any board whose device tree describes the ISP. The camera module is the board's: the OS
+     * passes the ADT isp0 sensor-type (J716c 0x75, J714s 0x74, K114c 0xb9, K116s 0xbc) to the
+     * firmware as its platform id, as macOS does. The firmware layout is checked below, segment by
+     * segment; the OS's driver selects its interface by apple,firmware-version.
+     */
+    *why = "OS firmware older than 27.0";
+    if (os_firmware.version < V27_0)
         return -1;
 
     int chosen = adt_path_offset(adt, "/chosen");
@@ -9440,7 +9423,7 @@ static int dt_set_t6050_isp(const char **why)
     const struct adt_segment_ranges *seg = adt_getprop(adt, isp, "segment-ranges", &len);
     if (ADT_GETPROP(adt, chosen, "dram-base", &ram) != sizeof(ram) ||
         ADT_GETPROP(adt, chosen, "dram-size", &ram_size) != sizeof(ram_size) ||
-        ADT_GETPROP(adt, isp, "sensor-type", &platform) != sizeof(platform) || platform != want ||
+        ADT_GETPROP(adt, isp, "sensor-type", &platform) != sizeof(platform) || !platform ||
         !t6050_isp_segments_valid(seg, len, ram, ram_size) || len != 2 * sizeof(*seg) ||
         seg[0].iova != 0 || seg[0].size != 0xc1c000 || seg[1].iova != 0xc1c000 ||
         seg[1].size != 0x13d0000 || seg[0].remap != 0x10000000000 || seg[1].remap != 0x10000c1c000)
