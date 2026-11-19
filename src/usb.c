@@ -697,9 +697,9 @@ int usb_cdc_poll32(u64 addr, u32 mask, u32 target, u32 timeout_us)
 int usb_cdc_link_start(void (*set_step)(unsigned step), bool force_swapped)
 {
     if (chip_id == T8142) {
-        /* Normal J813 startup already initialized USB0. Do not reinitialize
-         * its live controller or DART during the carrier transition. */
-        return !force_swapped && board_id == 0x24 && iodev_get_opaque(IODEV_USB0) ? 0 : -1;
+        /* Normal T8142 startup already initialized USB0 (J813). Do not reinitialize
+         * its live controller or DART during the carrier transition; without it, fail. */
+        return !force_swapped && iodev_get_opaque(IODEV_USB0) ? 0 : -1;
     }
     if (chip_id == T8152 || usb_cdc_deferred_usb2()) {
         if (force_swapped || iodev_get_opaque(IODEV_USB0))
