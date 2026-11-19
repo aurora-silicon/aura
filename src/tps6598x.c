@@ -13,13 +13,12 @@
 
 #define TPS_REG_MODE        0x03
 #define TPS_REG_CMD1        0x08
-#define TPS_CMD_INVALID     0x444d4321 // !CMD as LE u32
+#define TPS_CMD_INVALID     TPS6598X_TAG('!', 'C', 'M', 'D')
 #define TPS_REG_INT_EVENT1  0x14
 #define TPS_REG_INT_MASK1   0x16
 #define TPS_REG_INT_CLEAR1  0x18
 #define TPS_REG_STATUS      0x1a
 #define TPS_REG_POWER_STATE 0x20
-#define TPS_MODE_DBMA       ((u32)'D' | ((u32)'B' << 8) | ((u32)'M' << 16) | ((u32)'a' << 24))
 
 #define TPS_SPMI_REG_SELECT 0x00
 #define TPS_SPMI_REG_DATA   0x20
@@ -35,12 +34,13 @@ struct tps6598x_dev {
     bool resetting;
     bool command_active;
     u64 command_start;
+    u32 command_budget_ms;
 };
 
 static bool tps6598x_command_expired(tps6598x_dev_t *dev)
 {
     return dev->command_active &&
-           ticks_to_msecs(get_ticks() - dev->command_start) >= TPS6598X_COMMAND_DEADLINE_MS;
+           ticks_to_msecs(get_ticks() - dev->command_start) >= dev->command_budget_ms;
 }
 
 static tps6598x_dev_t *tps6598x_init(const char *adt_node, const char *addr_prop)
@@ -177,19 +177,29 @@ static void tps6598x_command_delay_us(void *ctx, unsigned usec)
     udelay(usec);
 }
 
+static int tps6598x_command_wake(void *ctx)
+{
+    tps6598x_dev_t *dev = ctx;
+    return dev->spmi ? spmi_send_wakeup(dev->spmi, dev->addr) : 0;
+}
+
+static const struct tps6598x_command_ops tps6598x_command_ops = {
+    .write = tps6598x_command_write,
+    .read = tps6598x_command_read,
+    .now_ms = tps6598x_command_now_ms,
+    .delay_us = tps6598x_command_delay_us,
+    .wake = tps6598x_command_wake,
+};
+
 int tps6598x_command(tps6598x_dev_t *dev, const char *cmd, const u8 *data_in, size_t len_in,
                      u8 *data_out, size_t len_out)
 {
-    static const struct tps6598x_command_ops ops = {
-        .write = tps6598x_command_write,
-        .read = tps6598x_command_read,
-        .now_ms = tps6598x_command_now_ms,
-        .delay_us = tps6598x_command_delay_us,
-    };
+    const struct tps6598x_command_ops *ops = &tps6598x_command_ops;
 
     dev->command_start = get_ticks();
+    dev->command_budget_ms = TPS6598X_COMMAND_DEADLINE_MS;
     dev->command_active = true;
-    int ret = tps6598x_command_execute(&ops, dev, cmd, data_in, len_in, data_out, len_out);
+    int ret = tps6598x_command_execute(ops, dev, cmd, data_in, len_in, data_out, len_out);
     if (tps6598x_command_expired(dev))
         ret = TPS6598X_COMMAND_TIMEOUT;
     dev->command_active = false;
@@ -198,10 +208,31 @@ int tps6598x_command(tps6598x_dev_t *dev, const char *cmd, const u8 *data_in, si
 
 int tps6598x_cold_reset(tps6598x_dev_t *dev)
 {
-    /* Gaid resets the HPM itself, so completion cannot be polled on this session. */
+    /* Gaid resets the HPM itself, so it never completes like other commands;
+     * tps6598x_wait_ready() observes the reset and the firmware coming back. */
     if (tps6598x_write_reg(dev, TPS_REG_CMD1, (const u8 *)"Gaid", 4) != 4)
         return -1;
     dev->resetting = true;
+    return 0;
+}
+
+int tps6598x_wait_ready(tps6598x_dev_t *dev)
+{
+    u32 mode;
+
+    /* Bound SPMI register selection by the same deadline as the whole wait. */
+    dev->command_start = get_ticks();
+    dev->command_budget_ms = TPS6598X_RESET_READY_MS;
+    dev->command_active = true;
+    int ret = tps6598x_reset_wait_execute(&tps6598x_command_ops, dev, &mode);
+    u32 elapsed = ticks_to_msecs(get_ticks() - dev->command_start);
+    dev->command_active = false;
+    if (ret) {
+        printf("tps6598x: not ready %u ms after reset (MODE 0x%08x)\n", elapsed, mode);
+        return -1;
+    }
+    dev->resetting = false;
+    printf("tps6598x: application firmware ready %u ms after reset\n", elapsed);
     return 0;
 }
 
@@ -377,7 +408,7 @@ static int tps6598x_dbma_route(tps6598x_dev_t *dev, const u8 vdm[4], const char 
     }
 
     ret = tps6598x_read_reg(dev, TPS_REG_MODE, (u8 *)&mode, 4);
-    if (ret != 4 || mode != TPS_MODE_DBMA) {
+    if (ret != 4 || mode != TPS6598X_MODE_DBMA) {
         printf("%s: Failed to enter DBMa mode, mode=0x%08x\n", who, mode);
         return -1;
     }
