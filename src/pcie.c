@@ -1119,6 +1119,30 @@ int pcie_wait_config_ready(u64 cfg, u32 *id)
     }
 }
 
+int pcie_adt_perst_gpio(const char *bridge, u64 *addr)
+{
+    struct {
+        u32 phandle, fourcc, pin, flags;
+    } perst;
+    int gpio_path[8];
+    u32 gpio_phandle;
+    u64 base, span;
+    int node = adt_path_offset(adt, bridge);
+    int gpio = adt_path_offset_trace(adt, "/arm-io/gpio0", gpio_path);
+
+    /* function-perst = GPIO(pin, flags) of /arm-io/gpio0, its fourcc "OIPG" in ADT byte order */
+    if (node < 0 || gpio < 0 ||
+        adt_getprop_copy(adt, node, "function-perst", &perst, sizeof(perst)) < 0 ||
+        perst.fourcc != 0x4750494f || ADT_GETPROP(adt, gpio, "AAPL,phandle", &gpio_phandle) < 0 ||
+        gpio_phandle != perst.phandle || adt_get_reg(adt, gpio_path, "reg", 0, &base, &span) ||
+        span < 4 * ((u64)perst.pin + 1)) {
+        printf("pcie: cannot resolve %s function-perst\n", bridge);
+        return -1;
+    }
+    *addr = base + 4 * perst.pin;
+    return 0;
+}
+
 int pcie_init(void)
 {
     bool success = false;
