@@ -67,7 +67,8 @@ int usb_cdc_schedule(u32 delay_ms, u32 reserved, u32 flags)
 {
     if (usb2_target()) {
         /* Explicit USB2 transition only: no HPM reset, lane swap or watchdog. */
-        if (flags || reserved || cdc.state != USB_CDC_IDLE || delay_ms < 1000 || delay_ms > 15000)
+        if (flags || reserved || cdc.state != USB_CDC_IDLE || delay_ms < USB_CDC_SCHEDULE_MIN_MS ||
+            delay_ms > USB_CDC_SCHEDULE_MAX_MS)
             return -1;
         cdc.deadline_ms = ticks_to_msecs(get_ticks()) + delay_ms;
         cdc.state = USB_CDC_SCHEDULED;
@@ -117,7 +118,7 @@ void usb_cdc_poll(void)
     cdc.step = 1;
     /* HPM0 cold reset irrevocably retires the inherited KIS carrier. */
     carrier_owned = true;
-    if (cdc.flags & BIT(2)) {
+    if (cdc.flags & USB_CDC_FLAG_HPM_RESET) {
         if (tps6598x_foreach_hpm(cdc_dfu_hpm, cdc_reset_hpm, NULL) != HPM_ACTION_STOP)
             goto failed;
         mdelay(1000);
@@ -127,7 +128,7 @@ void usb_cdc_poll(void)
     if (tps6598x_foreach_hpm(cdc_dfu_hpm, cdc_power_hpm, NULL) != HPM_ACTION_STOP)
         goto failed;
 
-    if (usb_cdc_link_start(cdc_set_step, !!(cdc.flags & BIT(0))))
+    if (usb_cdc_link_start(cdc_set_step, !!(cdc.flags & USB_CDC_FLAG_FORCE_SWAPPED)))
         goto failed;
 
     cdc.state = USB_CDC_DWC_READY;
