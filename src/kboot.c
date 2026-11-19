@@ -8822,16 +8822,22 @@ static int dt_set_sep(void)
         bail("FDT: invalid sep alias path\n");
     memcpy(path, alias, alias_len);
 
-    u64 dram_base = 0, dram_size = 0;
-    if (chip_id == T8140) {
-        int chosen = adt_path_offset(adt, "/chosen");
-        if (chosen < 0 || ADT_GETPROP(adt, chosen, "dram-base", &dram_base) != sizeof(dram_base))
-            bail("ADT: invalid DRAM base for SEP\n");
-        if (ADT_GETPROP(adt, chosen, "dram-size", &dram_size) != sizeof(dram_size))
-            dram_size = mem_size_actual;
-        if (!dram_size || dram_base > UINT64_MAX - dram_size)
-            bail("ADT: invalid DRAM extent for SEP\n");
+    /*
+     * The SEP firmware and the boot-object manifests must lie in physical DRAM. The ADT's
+     * /chosen dram-base and dram-size give it; where an ADT lacks them, the DRAM aura itself maps
+     * (the boot arguments' base rounded down to 4 GiB, and the actual memory size) does.
+     */
+    u64 dram_base = ram_base, dram_size = mem_size_actual;
+    int chosen = adt_path_offset(adt, "/chosen");
+    if (chosen >= 0) {
+        u64 value;
+        if (ADT_GETPROP(adt, chosen, "dram-base", &value) == sizeof(value))
+            dram_base = value;
+        if (ADT_GETPROP(adt, chosen, "dram-size", &value) == sizeof(value))
+            dram_size = value;
     }
+    if (!dram_size || dram_base > UINT64_MAX - dram_size)
+        bail("ADT: invalid DRAM extent for SEP\n");
 
     int anode_mmap = adt_path_offset(adt, "/chosen/memory-map");
     if (anode_mmap < 0)
@@ -8840,9 +8846,8 @@ static int dt_set_sep(void)
     u64 phys_map[2];
     int ret = ADT_GETPROP_ARRAY(adt, anode_mmap, "SEPFW", phys_map);
     if (ret != (int)sizeof(phys_map) || !phys_map[0] || !phys_map[1] ||
-        phys_map[0] > UINT64_MAX - phys_map[1] ||
-        (chip_id == T8140 && (phys_map[0] < dram_base || phys_map[0] > dram_base + dram_size ||
-                              phys_map[1] > dram_base + dram_size - phys_map[0])))
+        phys_map[0] > UINT64_MAX - phys_map[1] || phys_map[0] < dram_base ||
+        phys_map[0] > dram_base + dram_size || phys_map[1] > dram_base + dram_size - phys_map[0])
         bail("ADT: could not get sepfw memory\n");
 
     const char *node_name = "sep-firmware";
@@ -8868,8 +8873,8 @@ static int dt_set_sep(void)
         ret = ADT_GETPROP_ARRAY(adt, anode_manifest, adt_names[i], phys_map);
         if (ret != (int)sizeof(phys_map) || !phys_map[0] || !phys_map[1] ||
             phys_map[1] > (u64)dt_bufsize || phys_map[0] > UINT64_MAX - phys_map[1] ||
-            (chip_id == T8140 && (phys_map[0] < dram_base || phys_map[0] > dram_base + dram_size ||
-                                  phys_map[1] > dram_base + dram_size - phys_map[0]))) {
+            phys_map[0] < dram_base || phys_map[0] > dram_base + dram_size ||
+            phys_map[1] > dram_base + dram_size - phys_map[0]) {
             printf("ADT: no usable SEP %s manifest\n", adt_names[i]);
             continue;
         }
