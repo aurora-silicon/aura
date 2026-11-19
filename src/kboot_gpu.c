@@ -1071,8 +1071,8 @@ static void calc_power_t6030(u32 count, const struct perf_state *core, float lea
 #define G15G_STANDIN_LEAK 6412.0f
 
 /*
- * T8122 (G15G) leakage fuse. On either M3 Air, every boot reads the two fuse words
- * (T8122_LEAK_FUSE_WORD0/1, t8122_leak_fuse_export() below) and decodes two fields:
+ * T8122 (G15G) leakage fuse. On every T8122 boot, whichever Mac the die is in, aura reads the
+ * two fuse words (T8122_LEAK_FUSE_WORD0/1, t8122_leak_fuse_export() below) and decodes two fields:
  * - field A, 14 bits: bits 31:29 of word 0 are its low 3 bits, bits 10:0 of word 1 its high 11;
  * - field B, 10 bits: bits 20:11 of word 1.
  * The other bits are not used. The values are 2 x (A + 1) and B + 1. Both are logged and
@@ -2495,9 +2495,11 @@ static int dt_set_gpu_g15(void *dt, const struct g15_soc *soc)
 static int dt_set_gpu_t8122(void *dt);
 
 /*
- * On a J613 or J615, read the same T8122 leakage fuse words under the
- * exception guard, before anything powers the GPU, then log and export the decoded values (see
- * t8122_leak_fuse_decode()). It changes nothing else: the GPU setup uses them only with
+ * On every T8122, read the leakage fuse words under the exception guard, before anything powers
+ * the GPU, then log and export the decoded values (see t8122_leak_fuse_decode()). The words are
+ * in the T8122 die's own fuse block at a fixed address, so every Mac built on this chip (the M3
+ * Airs J613/J615, the 14" MacBook Pro J504, the iMacs J433/J434) has them; nothing about them is
+ * a board's. It changes nothing else: the GPU setup uses them only with
  * chosen.asahi,t8122-gpu-fuse-leakage=1. A fault or a full device tree is logged, and the boot
  * goes on without the property.
  */
@@ -2505,8 +2507,7 @@ static void t8122_leak_fuse_export(void *dt)
 {
     t8122_fuse_valid = false;
     t8122_fuse_use = g15_optin(dt, T8122_LEAK_FUSE_OPTIN);
-    if (chip_id != T8122 || (fdt_node_check_compatible(dt, 0, "apple,j613") &&
-                             fdt_node_check_compatible(dt, 0, "apple,j615")))
+    if (chip_id != T8122)
         return;
 
     int before = g15_guard_begin();
