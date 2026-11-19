@@ -16,6 +16,8 @@ void tps6598x_shutdown(tps6598x_dev_t *dev);
 int tps6598x_command(tps6598x_dev_t *dev, const char *cmd, const u8 *data_in, size_t len_in,
                      u8 *data_out, size_t len_out);
 int tps6598x_cold_reset(tps6598x_dev_t *dev);
+/* After tps6598x_cold_reset(): wait for the application firmware, or fail. */
+int tps6598x_wait_ready(tps6598x_dev_t *dev);
 int tps6598x_powerup(tps6598x_dev_t *dev);
 /* STATUS (plug) and DATA_STATUS (connection, data role) as little-endian words */
 int tps6598x_read_status(tps6598x_dev_t *dev, u32 *status, u32 *data_status);
