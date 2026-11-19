@@ -76,6 +76,40 @@ kernelcache; the two twin PAC-key guards match twice and are paired in order. Th
 the RO-zone branch, which T6041's kernelcache of the same release does not have. The workarounds
 were not taken out one by one as on the J616c; all of them were applied on every boot.
 
+### T8132 (J773g, Mac mini M4) with macOS 27.2
+
+Not booted yet; what follows is what the host checks. 27.2 (26B123) ships one kernel for the J713
+and the J773g, `kernelcache.release.mac16g`, built from the T8142 entry's XNU release. Its
+`XNU_QUIRKS` entry has every T8142 site, ported from 26B131's mac17g (the entry's comment says how
+each was matched). It hides nothing: with the read-only region in place the PCIe panic doesn't
+come back, and the Mac mini's only link to a host is its PCIe Ethernet. As for 25G83, the build
+manifest has no `Ap,ExclaveOS` or `Ap,cL4`. SPTM's eleven patch sites match `sptm.t8132.release`
+(CTRR stash +0x5f0), TXM takes `--os-long-version 26.2.123.0.0,0`, and the trust cache is the
+volume's static one. `test_sptm_virt_generic.py` plans it from the IPSW's DeviceTree.
+
+The debug cable goes to Port-USB-C@2, which is ATC1 (`hpm1`), not the DFU port. With the proxy on
+CDC there, only ATC1's nodes are hidden: `hpm1`, `usb-drd1`, `dart-usb1`, `atc-phy1` and its
+display crossbar, `acio1` and `apciec1` with their DARTs, and the retimer `i2c2/atcrt1`. ATC0
+and the HDMI port's `dcpext0` stay macOS's.
+
+Stage 1 1.0.0b13 reads the ESP before it falls back to its proxy, and then powers ANS off
+(`docs/sptm-virt-ans-cold-handoff.md`). Through Stage 1's proxy:
+
+```
+CARGO_PROFILE_RELEASE_OPT_LEVEL=z make USE_CLANG=1 BUILDSTD=1 CHAINLOADING=1 SPTM_VIRT=1 \
+    EXTRA_CFLAGS=-Oz
+export PYTHONPATH=proxyclient AURATIMEOUT=15
+python3 proxyclient/tools/ans_sart.py --start          # before the chainload: prints nvme.sart=...
+python3 proxyclient/tools/chainload.py -r --reclaim-stage1-heap build/aura.bin
+AURA_ANS_SART=nvme.sart=... AURA_XNU_SERIAL=uart0 AURA_HIDE_DOCKCHANNEL=1 \
+AURA_OS_LONG_VERSION=26.2.123.0.0,0 \
+    python3 proxyclient/tools/run_guest_sptm.py --sptm sptm.bin --txm txm.bin \
+    --xnu kernelcache.decompressed --trustcache trustcache.bin --nm llvm-nm
+```
+
+An ESP Stage 2 build (`ESP_STAGE2=1` added) at the path Stage 1 chainloads gets the entries from
+Stage 1 itself, and waits in its proxy for the same `run_guest_sptm.py`, without `AURA_ANS_SART`.
+
 The code:
 
 | File | What |

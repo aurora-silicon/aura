@@ -330,6 +330,39 @@ XNU_QUIRKS = (
                     0x1400000f),
                    ("task PAC key reprogramming (4)", "BootKC-rx", 0x31708c4, 0x540001e0,
                     0x1400000f))),
+    # T8132's xnu-13432.41.4 (macOS 27.2 26B123, kernelcache.release.mac16g, the J713's and the
+    # J773g's). Every site of the T8142 entry above, ported from 26B131's mac17g. The rorgn read,
+    # the trust-cache result and the NVRAM write match their 48-instruction windows exactly once,
+    # as above. T8132's structs are smaller and it has no MTE, so the mix-and-match question (48)
+    # and the PAC-key guards (24, the twins paired in order) match only with the struct offsets
+    # masked as well (ldr/str and ldp/stp immediates, add/sub imm12). The RO-zone branch, whose
+    # source here is not tag-stripped, is the b.ls between the two panics of zalloc_ro_mut (lines
+    # 6847 and 6730), with the same 21-instruction skip. The replacements are the T8142 words:
+    # every branch distance is unchanged. The rorgn globals come from the function's own adrp/str
+    # pairs. Nothing is hidden: with the read-only region in place the AppleConvergedPCI panic
+    # doesn't come back (AURA_KEEP_WIFI's finding), WindowServer needs a network port, and a
+    # Mac mini's only link to the host is its PCIe Ethernet.
+    dict(release=b"xnu-13432.41.4~", fingerprint=("__TEXT_EXEC", 0x3acaa78, 0x540002a9),
+         hide=(),
+         ro_relax=(("zalloc_ro_mut RO-zone check", "BootKC-rx", 0x3acaa78, 0x540002a9,
+                    0x14000015),),
+         rorgn=(("rorgn register read", "BootKC-rx", 0x331ade8, 0x370001a8, 0x1400000d),),
+         rorgn_globals=(0xedc020, 0xedc028),
+         nvram_mutable=(("Image4 storageInit mix-and-match question", "BootKC-rx",
+                         0x2bbaed4, 0x34000080, 0x14000022),),
+         tc_force=(("trust-cache load result", "BootKC-rx",
+                    0x378c1c8, 0x340000e0, 0x14000007),),
+         nvram_ro=(("AppleARMNORNVRAM::write", "BootKC-rx", 0x1ab73c, 0xaa0003e8, 0x52800000),
+                   ("AppleARMNORNVRAM::write return", "BootKC-rx", 0x1ab740, 0x52805840,
+                    0xd65f03c0)),
+         pac_keys=(("task PAC key reprogramming (switch)", "BootKC-rx", 0x3138284, 0x540001e0,
+                    0x1400000f),
+                   ("task PAC key reprogramming (2)", "BootKC-rx", 0x3138334, 0x540001e0,
+                    0x1400000f),
+                   ("task PAC key reprogramming (3)", "BootKC-rx", 0x3138520, 0x540001e0,
+                    0x1400000f),
+                   ("task PAC key reprogramming (4)", "BootKC-rx", 0x313877c, 0x540001e0,
+                    0x1400000f))),
 )
 
 
