@@ -9,15 +9,19 @@
  *   B1  happy path: every step in order; exactly the PMGR states that were off are written; no
  *       MMIO write outside the PMGR states; rings registered at the measured DVAs; the keyboard
  *       enable sent once on interface 0 as {0xb4, 2}; READY; reports translated (Fn layer)
- *   B2  RUN already set: refused; nothing is written (no MMIO write, no table write, no RTKit)
+ *   B2  RUN already set on an MTP whose domains are all on: refused, nothing written (no MMIO
+ *       write, no table write, no RTKit); with domains off, RUN is read only after they are
+ *       switched on (the fake ASC faults, all ones, while any is off), and RUN set then is
+ *       refused with only the PMGR writes done.  ASC_CPU_CONTROL is never read unpowered.
  *   B3  TTBR invalid / with bits outside the address field, TCR != 9, the root refused by the
- *       glue: refused before any write
- *   B4  a foreign root entry where the MTP's tables go: refused, nothing written
- *   B5  a PMGR state that never reaches on: refused within 10 ms
+ *       glue: refused before any table write (the domains are on by then)
+ *   B4  a foreign root entry where the MTP's tables go: refused, no table written
+ *   B5  a PMGR state that never reaches on: refused within 10 ms, RUN never read
  *   B6  RTKit start fails: refused
  *   B7  no 0xfe, the mailbox full for good: refused (SCM timeout / send)
- *   B8  no INIT; a complete keyboard INIT with no descriptor; a descriptor that does not map
- *       (no enable is sent then)
+ *   B8  no INIT; a keyboard whose last INIT packet has no descriptor (waited for until the
+ *       INIT deadline, as Linux waits on ring transports, then refused); the descriptor in a
+ *       later INIT packet (the keyboard comes up); a descriptor that does not map (no enable)
  *   B9  the enable: no acknowledgement, a non-zero return code, no READY
  *   B10 a GPIO request during INIT: refused with 0xe000f00d and the request echoed; the
  *       bring-up still completes
@@ -26,6 +30,10 @@
  *   B12 run time: RTKit failure and ring index corruption latch; polls after a latch do nothing
  *   B13 run time: at most max_frames frames per poll; the wake ring is drained too
  *   B14 the mailbox busy at times: sends are retried, never lost
+ *   B15 a GPIO request drained with the keyboard enable's acknowledgement: the enable's result
+ *       is read first (no false KBD_ACK), the refusal follows
+ *   B16 run time, the mailbox full: a poll never spins; the doorbell is owed and rung on a
+ *       later poll; owed for more than 50 ms it latches MTP_E_SCM_SEND
  *   I2 (the trackpad; the keyboard-only cases above make no AFE call and map no firmware):
  *   P1  happy path: multi-touch enabled, the firmware's interface byte patched and written
  *       back, AFE asserted, >= 50 ms, 0x95 with the firmware's DVA (readable through the fake's
@@ -73,7 +81,7 @@ static u64 clock_us;
 struct fault {
     bool run_set, ttbr_bad, ttbr_extra, tcr_bad, root_refused, foreign, pmgr_stuck, rtkit_fail;
     bool no_fe, mbox_full, no_init, no_kbd_desc, mouse_desc, no_ack, ack_error, no_ready;
-    bool gpio, busy_sometimes;
+    bool gpio, busy_sometimes, run_after_power, kbd_desc_late, gpio_with_ack;
     /* I2 */
     bool bad_params, bad_fw_crc, no_mt_init, mt_enable_error, afe_assert_fails, afe_release_fails;
     bool fw_no_ack, fw_error, power_error, no_tp_ready, no_geometry;
@@ -81,6 +89,7 @@ struct fault {
 static struct fault F;
 
 static unsigned mmio_writes, mmio_bad, table_writes, rtkit_starts, app_queued;
+static unsigned asc_reads, asc_unpowered;
 static u64 pool_dva_seen;
 static u64 reg_tx, reg_rx, reg_wake;
 static bool aht_ready, rtkit_failed_now;
@@ -187,8 +196,16 @@ static u32 read32(void *ctx, u64 a)
         mmio_bad++;
         return 0;
     }
-    if (a == MTP_T8152_ASC_CPU_CTRL)
+    if (a == MTP_T8152_ASC_CPU_CTRL) {
+        asc_reads++;
+        /* The ASC block is in the MTP's domains: unpowered, the glue's guarded read gives ~0. */
+        for (u32 i = 0; i < MTP_T8152_PMGR_COUNT; i++)
+            if (MTP_PS_ACTUAL(ps[i]) != 0xf) {
+                asc_unpowered++;
+                return ~0u;
+            }
         return asc_ctrl;
+    }
     if (a == MTP_T8152_DART_TTBR)
         return ttbr;
     if (a == MTP_T8152_DART_TCR)
@@ -420,6 +437,10 @@ static void take_commands(void)
             if (!F.no_ack)
                 send_to_host(MTP_CH_CMD, m.seq, 0, m.flags, F.ack_error ? 0xe00002c2 : 0, m.data,
                              m.len);
+            if (F.gpio_with_ack) {
+                u8 g[5] = {MTP_EV_GPIO, 2, 0, 0, 5};
+                send_to_host(MTP_CH_SCM_REPORT, 0, 0, MTP_FLAGS_INPUT, 0, g, 5);
+            }
             if (!F.no_ready && !F.no_ack && !F.ack_error) {
                 u8 ready[4] = {MTP_EV_READY, m.data[1], 0, 0};
                 send_to_host(MTP_CH_SCM_REPORT, 0, 0, MTP_FLAGS_INPUT, 0, ready, 4);
@@ -472,6 +493,10 @@ static bool scm_send(void *ctx, u64 msg)
                         }
                         if (F.no_kbd_desc)
                             send_init(2, names[i], NULL, 0);
+                        else if (F.kbd_desc_late) {
+                            send_init(2, names[i], NULL, 0); /* last packet, no descriptor */
+                            send_init(2, names[i], kbd_desc, sizeof(kbd_desc));
+                        }
                         else if (F.mouse_desc)
                             send_init(2, names[i], mouse_desc, sizeof(mouse_desc));
                         else
@@ -575,6 +600,7 @@ static void machine(void)
         ps[i] = (i == 6 || i == 10 || i == 11) ? 0x0 : 0xff; /* three off (as measured) */
     clock_us = 1000;
     mmio_writes = mmio_bad = table_writes = rtkit_starts = app_queued = 0;
+    asc_reads = asc_unpowered = 0;
     pool_dva_seen = reg_tx = reg_rx = reg_wake = 0;
     aht_ready = rtkit_failed_now = false;
     enables = gpio_acks = scm_count = 0;
@@ -616,8 +642,14 @@ static void machine(void)
     last_mods = 0;
     last_cons = 0;
     memset(last_keys, 0, sizeof(last_keys));
-    if (F.run_set)
+    if (F.run_set) {
+        /* A running MTP has every domain on. */
         asc_ctrl = MTP_T8152_RUN;
+        for (u32 i = 0; i < MTP_T8152_PMGR_COUNT; i++)
+            ps[i] = 0xff;
+    }
+    if (F.run_after_power)
+        asc_ctrl = MTP_T8152_RUN; /* (inconsistent hardware) seen only once powered */
     if (F.ttbr_bad)
         ttbr &= ~1u;
     if (F.ttbr_extra)
@@ -660,6 +692,8 @@ static void b1_happy(void)
     CHECK(attach() == MTP_E_NONE);
     CHECK(B.state == MTP_ST_KBD_READY && B.reason == MTP_E_NONE && B.kbd_live);
     CHECK(mmio_writes == 3 && B.pmgr_writes == 3 && !mmio_bad);
+    CHECK(asc_reads == 1 && !asc_unpowered && !B.run_read_powered && B.asc_ctrl == 0);
+    CHECK(B.step_ms[MTP_ST_POWER] <= B.step_ms[MTP_ST_DART]);
     for (u32 i = 0; i < MTP_T8152_PMGR_COUNT; i++)
         CHECK(MTP_PS_ACTUAL(ps[i]) == 0xf);
     CHECK(reg_tx == 0x10040000000ull && reg_rx == 0x10040204000ull && reg_wake == 0x10040408000ull);
@@ -694,51 +728,80 @@ static void b1_happy(void)
     result("happy", before, extra);
 }
 
-static void refused(const char *name, struct fault f, int reason, u8 step, bool nothing_written)
+enum written { W_NOTHING, W_PMGR, W_ANY };
+
+static void refused(const char *name, struct fault f, int reason, u8 step, enum written w)
 {
     int before = failures;
     F = f;
     int rc = attach();
     CHECK(rc == reason);
     CHECK(B.reason == reason && B.state == (MTP_ST_FAILED | step) && !B.kbd_live);
-    if (nothing_written)
+    if (w == W_NOTHING)
         CHECK(!mmio_writes && !table_writes && !rtkit_starts && !scm_count);
-    CHECK(!mmio_bad);
+    if (w == W_PMGR)
+        CHECK(mmio_writes == 3 && !table_writes && !rtkit_starts && !scm_count);
+    CHECK(!mmio_bad && !asc_unpowered);
     CHECK(mtp_bringup_poll(&B, 32) == -1);
     result(name, before, NULL);
 }
 
 static void b2_b9_refusals(void)
 {
-    refused("run_set", (struct fault){.run_set = true}, MTP_E_RUNNING, MTP_ST_IDENTITY, true);
-    refused("ttbr_invalid", (struct fault){.ttbr_bad = true}, MTP_E_TTBR, MTP_ST_IDENTITY, true);
-    refused("ttbr_extra", (struct fault){.ttbr_extra = true}, MTP_E_TTBR, MTP_ST_IDENTITY, true);
-    refused("tcr", (struct fault){.tcr_bad = true}, MTP_E_TCR, MTP_ST_IDENTITY, true);
-    refused("root", (struct fault){.root_refused = true}, MTP_E_ROOT, MTP_ST_IDENTITY, true);
-    refused("foreign", (struct fault){.foreign = true}, MTP_E_MAP, MTP_ST_DART, true);
+    refused("run_set", (struct fault){.run_set = true}, MTP_E_RUNNING, MTP_ST_IDENTITY,
+            W_NOTHING);
+    CHECK(B.run_read_powered && asc_reads == 1);
+    refused("run_after_power", (struct fault){.run_after_power = true}, MTP_E_RUNNING,
+            MTP_ST_IDENTITY, W_PMGR);
+    CHECK(!B.run_read_powered && asc_reads == 1);
+    refused("ttbr_invalid", (struct fault){.ttbr_bad = true}, MTP_E_TTBR, MTP_ST_POWER, W_PMGR);
+    refused("ttbr_extra", (struct fault){.ttbr_extra = true}, MTP_E_TTBR, MTP_ST_POWER, W_PMGR);
+    refused("tcr", (struct fault){.tcr_bad = true}, MTP_E_TCR, MTP_ST_POWER, W_PMGR);
+    refused("root", (struct fault){.root_refused = true}, MTP_E_ROOT, MTP_ST_POWER, W_PMGR);
+    refused("foreign", (struct fault){.foreign = true}, MTP_E_MAP, MTP_ST_POWER, W_PMGR);
     {
         int before = failures;
         F = (struct fault){.pmgr_stuck = true};
         u64 t0 = clock_us;
-        CHECK(attach() == MTP_E_POWER && B.state == (MTP_ST_FAILED | MTP_ST_DART));
-        CHECK(clock_us - t0 < 20000 && !rtkit_starts && !scm_count);
+        CHECK(attach() == MTP_E_POWER && B.state == (MTP_ST_FAILED | MTP_ST_IDENTITY));
+        CHECK(clock_us - t0 < 20000 && !rtkit_starts && !scm_count && !table_writes);
+        CHECK(!asc_reads && !asc_unpowered); /* RUN is never read with a domain off */
         result("pmgr_stuck", before, NULL);
     }
-    refused("rtkit", (struct fault){.rtkit_fail = true}, MTP_E_RTKIT, MTP_ST_POWER, false);
-    refused("no_fe", (struct fault){.no_fe = true}, MTP_E_SCM_TIMEOUT, MTP_ST_RTKIT, false);
-    refused("mbox_full", (struct fault){.mbox_full = true}, MTP_E_SCM_SEND, MTP_ST_RTKIT, false);
-    refused("no_init", (struct fault){.no_init = true}, MTP_E_INIT_TIMEOUT, MTP_ST_SCM, false);
-    /* The keyboard's last INIT packet came without a descriptor: no layout, at once. */
-    refused("no_kbd_desc", (struct fault){.no_kbd_desc = true}, MTP_E_LAYOUT, MTP_ST_INIT, false);
+    refused("rtkit", (struct fault){.rtkit_fail = true}, MTP_E_RTKIT, MTP_ST_DART, W_ANY);
+    refused("no_fe", (struct fault){.no_fe = true}, MTP_E_SCM_TIMEOUT, MTP_ST_RTKIT, W_ANY);
+    refused("mbox_full", (struct fault){.mbox_full = true}, MTP_E_SCM_SEND, MTP_ST_RTKIT, W_ANY);
+    refused("no_init", (struct fault){.no_init = true}, MTP_E_INIT_TIMEOUT, MTP_ST_SCM, W_ANY);
+    /* The keyboard's last INIT packet came without a descriptor: waited for until the INIT
+     * deadline (a later packet may bring it), then no layout. */
+    {
+        int before = failures;
+        F = (struct fault){.no_kbd_desc = true};
+        CHECK(attach() == MTP_E_LAYOUT && B.state == (MTP_ST_FAILED | MTP_ST_INIT) && !enables);
+        CHECK(B.step_ms[MTP_ST_INIT] - B.step_ms[MTP_ST_SCM] >= MTP_T_INIT_MS);
+        CHECK(B.comm.iface[2].last && !B.comm.iface[2].complete && !mmio_bad && !asc_unpowered);
+        CHECK(mtp_bringup_poll(&B, 32) == -1);
+        result("no_kbd_desc", before, NULL);
+    }
+    {
+        int before = failures;
+        F = (struct fault){.kbd_desc_late = true};
+        CHECK(attach() == MTP_E_NONE && B.state == MTP_ST_KBD_READY && enables == 1 &&
+              B.comm.iface[2].complete && B.comm.iface[2].desc_len == sizeof(kbd_desc));
+        type_report(0, 0x04, false);
+        mtp_bringup_poll(&B, 32);
+        CHECK(down(0x04));
+        result("kbd_desc_late", before, NULL);
+    }
     {
         int before = failures;
         F = (struct fault){.mouse_desc = true};
         CHECK(attach() == MTP_E_LAYOUT && B.state == (MTP_ST_FAILED | MTP_ST_INIT) && !enables);
         result("layout", before, NULL);
     }
-    refused("no_ack", (struct fault){.no_ack = true}, MTP_E_KBD_ACK, MTP_ST_INIT, false);
-    refused("ack_error", (struct fault){.ack_error = true}, MTP_E_KBD_ENABLE, MTP_ST_INIT, false);
-    refused("no_ready", (struct fault){.no_ready = true}, MTP_E_KBD_READY, MTP_ST_INIT, false);
+    refused("no_ack", (struct fault){.no_ack = true}, MTP_E_KBD_ACK, MTP_ST_INIT, W_ANY);
+    refused("ack_error", (struct fault){.ack_error = true}, MTP_E_KBD_ENABLE, MTP_ST_INIT, W_ANY);
+    refused("no_ready", (struct fault){.no_ready = true}, MTP_E_KBD_READY, MTP_ST_INIT, W_ANY);
 }
 
 static void b10_gpio(void)
@@ -820,6 +883,45 @@ static void b14_busy(void)
     mtp_bringup_poll(&B, 32);
     CHECK(down(0x04));
     result("mbox_busy", before, NULL);
+}
+
+static void b15_gpio_with_ack(void)
+{
+    int before = failures;
+    F = (struct fault){.gpio_with_ack = true};
+    CHECK(attach() == MTP_E_NONE && B.state == MTP_ST_KBD_READY && enables == 1);
+    mtp_bringup_poll(&B, 32);
+    CHECK(gpio_acks == 1 && B.gpio_refused == 1 && gpio_ack_msg[5] == MTP_EV_GPIO &&
+          gpio_ack_msg[9] == 5);
+    result("gpio_with_ack", before, NULL);
+}
+
+static void b16_doorbell_owed(void)
+{
+    int before = failures;
+    F = (struct fault){0};
+    CHECK(attach() == MTP_E_NONE);
+    /* A GPIO request at run time while the mailbox is full. */
+    F.mbox_full = true;
+    u8 g[5] = {MTP_EV_GPIO, 2, 0, 0, 7};
+    send_to_host(MTP_CH_SCM_REPORT, 0, 0, MTP_FLAGS_INPUT, 0, g, 5);
+    u64 t0 = clock_us;
+    CHECK(mtp_bringup_poll(&B, 32) >= 1 && B.kbd_live);
+    CHECK(clock_us - t0 < 1000 && B.doorbell_owed && B.doorbells_owed == 1 && !gpio_acks);
+    CHECK(mtp_bringup_poll(&B, 32) >= 0 && B.doorbell_owed && B.kbd_live);
+    /* The mailbox frees: the doorbell is rung, the refusal is taken and acknowledged. */
+    F.mbox_full = false;
+    CHECK(mtp_bringup_poll(&B, 32) >= 0 && !B.doorbell_owed && gpio_acks == 1);
+    mtp_bringup_poll(&B, 32);
+    CHECK(!B.cmd.busy && B.kbd_live);
+    /* Owed for more than 50 ms: latched. */
+    F.mbox_full = true;
+    send_to_host(MTP_CH_SCM_REPORT, 0, 0, MTP_FLAGS_INPUT, 0, g, 5);
+    CHECK(mtp_bringup_poll(&B, 32) >= 0 && B.doorbell_owed);
+    clock_us += 60000;
+    CHECK(mtp_bringup_poll(&B, 32) == -1 && B.reason == MTP_E_SCM_SEND && !B.kbd_live);
+    F.mbox_full = false;
+    result("doorbell_owed", before, NULL);
 }
 
 /* ---- I2: the trackpad ------------------------------------------------------------------------ */
@@ -973,6 +1075,8 @@ int main(void)
     b10_gpio();
     b11_b13_runtime();
     b14_busy();
+    b15_gpio_with_ack();
+    b16_doorbell_owed();
     p1_happy();
     p2_p7();
     p8_runtime();

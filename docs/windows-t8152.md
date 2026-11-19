@@ -1011,39 +1011,61 @@ carrier then, before guest entry (`hv_mtp_t8152.c`, `mtp_bringup.c`):
 2. reserves the area (`hv_t8152_reserve_input_area()`: above guest RAM, clear of every
    carve-out, CTXR range, aura and its heaps, the AHCI store; denied to stage 2), remaps its
    device-written rings Normal-NC in every alias of its own map (both ring indices share one
-   cache line), and zeroes the rings and the table pages;
-3. reads `ASC_CPU_CONTROL`: **RUN already set refuses with nothing written** (a reboot
-   through iBoot gives a fresh MTP);
+   cache line), invalidates its own EL2&0 translations (`mmu_flush_own_tlb()`:
+   `mmu_add_mapping()`'s `tlbi vmalle1is` reaches only EL1&0 once `hv_init()` cleared TGE),
+   checks with `AT S1E2R` that every ring page now translates with attribute 0x44 (else the
+   attach is refused before the MTP is touched), cleans the rings again and zeroes them and the
+   table pages;
+3. reads the 13 PMGR MTP states at 0x30828c000 + 0x20 i (PMGR is always powered). **All on:**
+   reads `ASC_CPU_CONTROL`; **RUN set refuses with nothing written**. **Any off:** the MTP
+   cannot be running, so the states whose target is not on are switched on (parent first, each
+   write logged, each polled to on for at most 10 ms) and RUN is read after them (set: still
+   refused). `ASC_CPU_CONTROL` is never read with an MTP domain off (an unpowered ASC faults or
+   reads all ones). A reboot through iBoot gives a fresh MTP;
 4. reads only dart-sbr `TTBR[4]` (valid, no bits outside 29:2) and `TCR[4]` (must be 9); the
    root must be carrier-mapped RAM outside guest RAM, the store and the area;
 5. maps the TX ring (DVA 0x10040000000), RX ring (0x10040204000), wake ring (0x10040408000)
    and a 1 MiB RTKit pool (0x10040410000) with its own 3-level entries under that root
    (`mtp_dart_t8152.c`: refuses a foreign table or a valid leaf, checked by its own walk; no
-   DART register write, no TLBI);
-6. turns on the 13 PMGR MTP states at 0x30828c000 + 0x20 i whose target is not on (each write
-   logged, each polled to on for at most 10 ms);
-7. boots RTKit in the new pool-only mode (`rtkit_set_buffer_pool_premapped()`; a grant with a
-   preset address is refused and latched), which writes RUN, then starts endpoint 0x20;
-8. SCM: power 2, waits for 0xfe, registers the three rings, 0xff; reads INIT, finds the
-   interface named "keyboard", maps its HID descriptor to a layout (`hid_desc.c`,
-   `input_kbd.c`; an unmappable descriptor leaves the keyboard off), enables it (`{0xb4, i}`,
-   acknowledged with return code 0) and waits for READY. A GPIO request is refused with
-   0xe000f00d and the request echoed. stm, actuator, tp-accel and mtp are never enabled.
+   DART register write, no DART TLB invalidation);
+6. boots RTKit in the new pool-only mode (`rtkit_set_buffer_pool_premapped()`; a buffer or
+   oslog request with a preset address is answered as our Linux driver answers it: the preset
+   is ignored, a pool slice is granted and its DVA replied, counted as "presets replaced"),
+   which writes RUN, then starts endpoint 0x20;
+7. SCM: power 2, waits for 0xfe, registers the three rings, 0xff; reads INIT, finds the
+   interface named "keyboard" (complete only with its last packet **and** a descriptor: one
+   whose last packet carried none is waited for until the 500 ms INIT deadline, as Linux waits
+   on ring transports), maps its HID descriptor to a layout (`hid_desc.c`, `input_kbd.c`; an
+   unmappable descriptor leaves the keyboard off; Fn is vendor usage 3 on page 0x00FF, 0xFF00
+   or 0xFF0C), enables it (`{0xb4, i}`, acknowledged with return code 0) and waits for READY.
+   A GPIO request is refused with 0xe000f00d and the request echoed; it never takes the
+   command slot while a command is still reading its own acknowledgement. stm, actuator,
+   tp-accel and mtp are never enabled. Frames up to the protocol's 64 KiB are buffered.
+
+STATUS 23 steps: 1 identity, 2 power (domains on, RUN read clear), 3 dart (stream-4 entries),
+4 rtkit, 5 scm, 6 init, 7 keyboard ready, 8 trackpad ready (`| 0x80` where it stopped).
 
 Every step is bounded; a failure stops the MTP part with a step and a reason (STATUS 23/24)
 and leaves the host source attached (ATTACH still returns 0). MMIO is limited to an
 allow-list (read: ASC_CPU_CONTROL, TCR[4], TTBR[4], the 13 PMGR states; write: the PMGR
 states only), each access under the exception guard; the mailbox goes through `asc.c`. No
-NVRAM access in any of these files; the only SMC access is I2's AFE reset below.
+NVRAM access in any of these files; the only SMC traffic is I2's AFE reset session below.
 
 Run time: polled only (lines 1500/1501 stay masked), from the boot CPU's tick before the host
 feed (1 kHz floor) and from the unlocked WFI path, one servicer at a time
-(`hv_mtp_t8152_poll()`), never waiting: at most 4 RTKit messages and 32 frames per call. The
+(`hv_mtp_t8152_poll()`), never waiting: at most 4 RTKit messages and 32 frames per call; a
+command doorbell that finds the mailbox full is retried on the next poll (latched as an SCM
+send failure once it has been owed for 50 ms). The
 WFI path never drives the SPI; the tick does. An RTKit failure, a ring index or framing error,
 or three checksum errors in a row latch: the internal keyboard is released once and servicing
 stops; host input continues. Entry and exit release the internal source (state only). Nothing
 is sent to the MTP at exit: it keeps running and DMAing into the area, so a session that
-brought it up must be left by a reboot.
+brought it up must be left by a reboot. That is enforced on the host: every J804 launch
+(`run_guest.py`) and every `chainload.py` first reads the 13 PMGR states and, only when all are
+on, `ASC_CPU_CONTROL` (read-only, `aura/windows.py t8152_mtp_running()`), and refuses while RUN
+is set. The internal keyboard has no held-key watchdog: its reports come only on change, so
+silence cannot be told from a held key (the Mac-fed source has one because it sends
+keep-alives); a latch releases it.
 
 Keyboard translation: modifiers as reported (Command is GUI, Option is Alt); the Fn layer is
 ours: by default the F-row sends brightness (F1/F2, 0x70/0x6F), AC Search (F4), previous /
@@ -1054,7 +1076,10 @@ sends nothing; usages above 0x9F are dropped (counted); an ErrorRollOver report 
 previous state. The consumer usage the guest sees is the newest non-zero one of all sources.
 
 `P_HV_WINDOWS_INPUT` op 4 `PROBE` (before entry, keyboard live): services for `a1` ms (at
-most 10 s) and logs every frame and every translation (50 per second); ATTACH logs the steps'
+most 10 s) and logs every frame and every translation (50 per second). The launcher runs it
+with `--windows-input-probe SECONDS` (1-120, in 10 s slices) after ATTACH; with
+`--windows-input-probe-only` it then stops without a guest (step A, carrier only: the NVMe
+disk, if any, is closed with its verdict; leave by a reboot). ATTACH logs the steps'
 timings, the register values, the PMGR states before, the INIT interface table and the
 keyboard descriptor in hex. These logs carry the machine's own descriptor: keep them with the
 owner's private data. STATUS 23-31: MTP state, reason, keyboard reports | bad << 32, trackpad
@@ -1069,7 +1094,8 @@ file end (0x12acd8) past the default 0x120000 limit, so the carrier is linked wi
 
 Not verified (each needs the M6): RUN clear when the carrier attaches on the Windows route;
 which PMGR states are off then; TTBR/TCR/root as measured by Linux; the RTKit buffer requests
-fitting a 1 MiB pool with no preset address; the keyboard descriptor mapping; the 1 kHz
+fitting a 1 MiB pool (and whether any carries a preset address); the keyboard descriptor
+mapping; whether its INIT packets carry the descriptor with the last packet; the 1 kHz
 service keeping the syslog backlog drained; GPIO requests; the next Linux boot getting its
 keyboard back after a reboot.
 
@@ -1112,13 +1138,21 @@ tables), and after the keyboard is READY (a trackpad failure never costs the key
 8. asks feature 0xD9 (geometry, 200 ms, optional: without it a 130 x 81 mm, 95 units/mm
    default is used).
 
-SMC: those two writes are the carrier's only SMC access, in `op_afe_reset()` alone: key
-`pcIO` only, those two values only, only while a trackpad ATTACH runs, each command bounded
-(200 ms, `smc_set_timeout()`), through aura's own `smc.c` (the same init / write / shutdown
-path main.c uses for the N1 and SD reader pcIO lines). No other SMC key, no audio, speaker or
-amp key, ever. A failed write ends SMC access for the session. After a failure between the
-two writes the AFE is left in reset (the safe state: Linux saw an MTP SError when the line was
-released during an upload); STATUS 30 then says 1 write.
+SMC: the carrier's only SMC traffic is this one session in `op_afe_reset()`, only while a
+trackpad ATTACH runs, through aura's own `smc.c` (the same init / write / shutdown pattern
+main.c already runs on J804 for the N1 and SD reader pcIO lines). All of it, in order:
+- `smc_init_timed(2 s)`: the RTKit wake (management IOP power state INIT); if the SMC answers
+  HELLO, the version reply, the endpoint-map replies and the IOP and AP power states ON, else
+  the session the boot left running is adopted; endpoint 0x20 started; `SMC_INITIALIZE` (its
+  answer is the shared-memory address). Every wait is bounded (HELLO and each endpoint-map
+  message 1 s, the power states and the `SMC_INITIALIZE` answer 2 s);
+- exactly two key writes, each bounded at 200 ms (`smc_set_timeout()`): `pcIO` <-
+  0x001c0000_00010001 (assert) and `pcIO` <- 0x001c0000_00010000 (release);
+- `smc_shutdown()`: the RTKit AP power state, then the IOP power state, to QUIESCED.
+No other SMC key is read or written: no audio, speaker or amp key, no NVRAM or power key,
+ever. A failed write ends SMC access for the session. After a failure between the two writes
+the AFE is left in reset (the safe state: Linux saw an MTP SError when the line was released
+during an upload); STATUS 30 then says 1 write.
 
 Translation (`input_tp.c`, integer only): report 0x75, a 38-byte header (byte 22 the record
 count, at most 16; byte 23 bit 0 the physical click), 30-byte records (+4 X, +6 Y, Y up, +18
@@ -1131,7 +1165,9 @@ until release; motion is ignored for 40 ms after it starts. Tap: one contact up 
 180 ms, travel under 1.5 mm, no click, no scroll, no internal key in the last 300 ms: left
 down and up; two contacts: right. Two contacts moving the same way: wheel / AC Pan detents
 every 5 mm (dominant axis; traditional unless natural). Three or more: nothing. 500 ms
-without frames drop held contacts and the button. A latch releases the pointer with the
+without frames drop held contacts and the button; while the pad has never ended a touch with
+a zero-contact frame, a touch that ends in that silence is judged as a tap up to its last frame
+(late, but not lost; "silent" taps are counted). A latch releases the pointer with the
 keyboard; entry and exit release the trackpad source (state only).
 
 STATUS: 23 reaches 8 (trackpad ready); 24 is reason | trackpad reason << 8 | trackpad step

@@ -135,6 +135,16 @@ void smc_shutdown(smc_dev_t *smc)
 
 smc_dev_t *smc_init(void)
 {
+    return smc_init_timed(0);
+}
+
+/*
+ * As smc_init(), with every wait bounded when `timeout_usec` is not 0: the RTKit boot's waits
+ * (HELLO and the endpoint map are bounded at 1 s each already; the IOP and AP power states by
+ * `timeout_usec`) and the SMC_INITIALIZE answer (the shared memory) by `timeout_usec`.
+ */
+smc_dev_t *smc_init_timed(u32 timeout_usec)
+{
     smc_dev_t *smc = calloc(1, sizeof(smc_dev_t));
     if (!smc)
         return NULL;
@@ -154,8 +164,12 @@ smc_dev_t *smc_init(void)
     /* On T8152 (J873g) a previous stage leaves the SMC running with its RTKit
      * session established; every other machine boots it as before. */
     bool adopted = false;
-    bool booted =
-        chip_id == T8152 ? rtkit_boot_or_adopt(smc->rtkit, &adopted) : rtkit_boot(smc->rtkit);
+    bool booted;
+    if (chip_id == T8152)
+        booted = rtkit_boot_or_adopt_timed(smc->rtkit, timeout_usec, &adopted);
+    else
+        booted = timeout_usec ? rtkit_boot_timed(smc->rtkit, timeout_usec)
+                              : rtkit_boot(smc->rtkit);
     if (!booted) {
         printf("SMC: failed to boot RTKit\n");
         goto out_rtkit;
@@ -172,13 +186,14 @@ smc_dev_t *smc_init(void)
     smc_send(smc, initialize);
 
     /* An adopted session is confirmed only by the SMC endpoint answering. */
-    u64 timeout = timeout_calculate(2 * USEC_PER_SEC);
+    u64 timeout = timeout_calculate(timeout_usec ? timeout_usec : 2 * USEC_PER_SEC);
     while (!smc->shmem) {
         int ret = smc_work(smc);
         if (ret < 0)
             goto out_rtkit;
-        if (adopted && timeout_expired(timeout)) {
-            printf("SMC: adopted session did not answer, giving up\n");
+        if ((adopted || timeout_usec) && timeout_expired(timeout)) {
+            printf("SMC: %s did not answer SMC_INITIALIZE, giving up\n",
+                   adopted ? "adopted session" : "SMC");
             goto out_rtkit;
         }
     }

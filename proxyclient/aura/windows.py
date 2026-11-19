@@ -1406,7 +1406,7 @@ INPUT_STATUS = {"frames_ok": 0, "bad_crc": 1, "bad_header": 2, "bad_payload": 3,
 INPUT_STATUS_MTP = {"mtp_state": 23, "mtp_reason": 24, "mtp_kbd": 25, "mtp_tp": 26,
                     "mtp_rtkit": 27, "mtp_poll_us": 28, "mtp_errors": 29, "mtp_smc": 30,
                     "mtp_gpio": 31}
-MTP_STATES = {0: "off", 1: "identity", 2: "dart", 3: "power", 4: "rtkit", 5: "scm", 6: "init",
+MTP_STATES = {0: "off", 1: "identity", 2: "power", 3: "dart", 4: "rtkit", 5: "scm", 6: "init",
               7: "keyboard ready", 8: "trackpad ready"}
 MTP_REASONS = {0: "none", 1: "identity", 2: "area", 3: "MTP already running (reboot through iBoot)",
                4: "TTBR", 5: "TCR", 6: "DART root", 7: "stream-4 map", 8: "PMGR power",
@@ -1418,6 +1418,36 @@ MTP_REASONS = {0: "none", 1: "identity", 2: "area", 3: "MTP already running (reb
                25: "firmware unacknowledged or refused", 26: "power method 2 step",
                27: "multi-touch READY", 28: "no multi-touch AFE function in the ADT"}
 INPUT_OPT_FN_FKEYS = 0x100                # ATTACH a1 bit 8: F1-F12 without Fn
+# The MTP's RUN bit and its 13 PMGR states (mtp_bringup.h), for the launch-time check.
+MTP_ASC_CPU_CONTROL = 0x314600044
+MTP_RUN = 0x10
+MTP_PMGR_PS = 0x30828c000
+MTP_PMGR_COUNT = 13
+MTP_PMGR_STRIDE = 0x20
+
+
+def t8152_mtp_running(read32):
+    """Is the M6's MTP running (RUN set), read-only and without ever reading an unpowered ASC?
+
+    `read32(addr)` reads one register (the proxy's).  The 13 PMGR states come first (PMGR is
+    always powered): with any MTP domain off the MTP cannot be running and ASC_CPU_CONTROL is
+    not read (an unpowered ASC faults); with all on it is read.  Returns (running, detail).
+    Nothing is ever written."""
+    states = [read32(MTP_PMGR_PS + i * MTP_PMGR_STRIDE) for i in range(MTP_PMGR_COUNT)]
+    off = [i for i, v in enumerate(states) if (v >> 4) & 0xF != 0xF]
+    if off:
+        return False, (f"MTP domains off ({len(off)} of {MTP_PMGR_COUNT}): not started since "
+                       "iBoot")
+    ctrl = read32(MTP_ASC_CPU_CONTROL)
+    return bool(ctrl & MTP_RUN), f"MTP domains on, ASC_CPU_CONTROL {ctrl:#x}"
+
+
+T8152_MTP_RUNNING_REFUSAL = (
+    "the M6's MTP is running (ASC_CPU_CONTROL RUN set): an earlier carrier session in this "
+    "power cycle brought up the internal keyboard/trackpad, and the MTP keeps DMAing into that "
+    "session's area through its stream-4 entries, which may be RAM this launch uses. Leave by a "
+    "reboot through iBoot (the carrier's P_REBOOT: proxyclient/tools/reboot.py) and start again "
+    "from the fresh proxy")
 # The reserved MTP area (mtp_bringup.h): 8 MiB, 2 MiB aligned, carved off the top of the guest
 # RAM window; the launcher writes the parameter page at +0 and, with the trackpad, the
 # firmware payload at +0x700000 before ATTACH.

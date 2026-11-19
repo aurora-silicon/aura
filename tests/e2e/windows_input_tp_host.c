@@ -22,7 +22,9 @@
  *   T8  three fingers: nothing
  *   T9  malformed: wrong ID, shorter than the header, records past the end, more than 16
  *       records: refused and counted, state unchanged
- *   T10 silence: a held contact and button are dropped after 500 ms, once
+ *   T10 silence: a held contact and button are dropped after 500 ms, once; while the pad has
+ *       never sent a zero-contact lift frame, a short still touch that ends in silence is a
+ *       tap (late), judged up to its last frame; once a lift frame was seen, silence never taps
  *   T11 geometry: 0xD9 parsed and applied (resolution); nonsense refused
  *   T12 palms: touch major above the threshold is ignored; touch major 0 is not touching
  *   T13 fuzz: random frames never overrun, reports stay in range
@@ -427,14 +429,50 @@ static void t10_silence(void)
     feed(&f, 1, false, 8000);
     feed(&f, 1, true, 8000);
     CHECK(btn_n == 1 && btn_log[0] == TP_BTN_LEFT);
-    struct tp_report r;
-    CHECK(tp_idle(&S, T + 400000, &r) == 0);
-    CHECK(tp_idle(&S, T + 600000, &r) == 1 && r.buttons == 0 && S.stale == 1);
-    CHECK(tp_idle(&S, T + 900000, &r) == 0 && S.stale == 1);
+    struct tp_report r[TP_MAX_REPORTS];
+    CHECK(tp_idle(&S, T + 400000, r) == 0);
+    CHECK(tp_idle(&S, T + 600000, r) == 1 && r[0].buttons == 0 && S.stale == 1);
+    CHECK(tp_idle(&S, T + 900000, r) == 0 && S.stale == 1);
+    CHECK(!S.taps && !S.silent_taps); /* a click is never a tap */
     /* The next touch starts clean. */
     T += 1000000;
     reset_sums();
     CHECK(feed(&f, 1, false, 8000) == 0);
+
+    /* No lift frame ever seen: a short still touch ending in silence taps (late). */
+    fresh(NULL);
+    feed(&f, 1, false, 8000);
+    feed(&f, 1, false, 8000);
+    feed(&f, 1, false, 8000);
+    CHECK(tp_idle(&S, T + 400000, r) == 0);
+    CHECK(tp_idle(&S, T + 600000, r) == 2 && r[0].buttons == TP_BTN_LEFT && r[1].buttons == 0 &&
+          S.silent_taps == 1 && S.taps == 1 && !S.lifts);
+    CHECK(tp_idle(&S, T + 900000, r) == 0);
+    /* Two fingers: right. */
+    struct finger two[2] = {{0, 0, 0}, {2000, 0, 0}};
+    T += 1000000;
+    feed(two, 2, false, 8000);
+    feed(two, 2, false, 8000);
+    CHECK(tp_idle(&S, T + 600000, r) == 2 && r[0].buttons == TP_BTN_RIGHT && S.silent_taps == 2);
+    /* A long touch ending in silence: no tap. */
+    T += 1000000;
+    for (int i = 0; i < 40; i++)
+        feed(&f, 1, false, 8000);
+    CHECK(tp_idle(&S, T + 600000, r) == 0 && S.silent_taps == 2);
+    /* A key during the touch: no tap. */
+    T += 1000000;
+    feed(&f, 1, false, 8000);
+    tp_note_key(&S, T);
+    feed(&f, 1, false, 8000);
+    CHECK(tp_idle(&S, T + 600000, r) == 0 && S.silent_taps == 2);
+    /* Once the pad has sent a lift frame, silence never taps (the lift frame does). */
+    T += 1000000;
+    feed(&f, 1, false, 8000);
+    lift();
+    CHECK(S.lifts == 1 && S.taps == 3);
+    T += 1000000;
+    feed(&f, 1, false, 8000);
+    CHECK(tp_idle(&S, T + 600000, r) == 0 && S.silent_taps == 2 && S.taps == 3);
     case_result("silence", before, NULL);
 }
 
@@ -519,8 +557,8 @@ static void t13_fuzz(long iterations)
         if (k >= 0)
             ok++;
         if (rnd() % 64 == 0) {
-            struct tp_report r;
-            tp_idle(&S, T + 600000, &r);
+            struct tp_report r[TP_MAX_REPORTS];
+            CHECK(tp_idle(&S, T + 600000, r) <= (int)TP_MAX_REPORTS);
         }
     }
     char extra[64];

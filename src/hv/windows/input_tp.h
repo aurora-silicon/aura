@@ -120,6 +120,8 @@ struct tp_state {
     s32 acc_v, acc_h;   /* scroll travel carried, um */
 
     u32 frames, bad, ignored, taps, clicks, detents, stale, palms;
+    u32 lifts;       /* touches ended by a zero-contact frame */
+    u32 silent_taps; /* taps judged at a silence (only while no lift frame was ever seen) */
 };
 
 void tp_config_default(struct tp_config *c);
@@ -143,9 +145,11 @@ int tp_frame(struct tp_state *s, const u8 *p, u32 len, u64 now, struct tp_report
 
 /*
  * Time passes without frames: after TP_STALE_US with a contact or the button held, everything
- * is dropped (no tap).  Returns 1 and fills `out` with an all-up report when it did.
+ * is dropped.  Fills `out` and returns how many reports: an all-up report when a button was
+ * held; and, only while the pad has never ended a touch with a zero-contact frame (`lifts` 0),
+ * the tap (down, up) that touch made, judged up to its last frame.
  */
-int tp_idle(struct tp_state *s, u64 now, struct tp_report *out);
+int tp_idle(struct tp_state *s, u64 now, struct tp_report out[TP_MAX_REPORTS]);
 
 /* Forget every contact and the button (a latch, guest entry or exit); returns the all-up report. */
 void tp_release(struct tp_state *s, struct tp_report *out);

@@ -83,6 +83,10 @@ void mmu_shutdown(void);
 void mmu_add_mapping(u64 from, u64 to, size_t size, u8 attribute_index, u64 perms);
 void mmu_map_uncached(u64 base, u64 size);
 void mmu_rm_mapping(u64 from, size_t size);
+/* Invalidate this side's own translations in its current regime (EL2&0 at EL2). */
+void mmu_flush_own_tlb(void);
+/* The MAIR attribute byte of this side's read translation of `va`, or -1 on a fault. */
+int mmu_probe_attr(u64 va);
 void mmu_map_framebuffer(u64 addr, size_t size);
 
 u64 mmu_disable(void);

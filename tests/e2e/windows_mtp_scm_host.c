@@ -366,6 +366,14 @@ static void s8_init(void)
     n = init_event(ev, 1, "multi-touch", 0, desc, 300, true);
     CHECK(mtp_comm_event(&c, ev, n, &iface) == MTP_EVT_INIT && c.iface[1].complete &&
           c.iface[1].desc_len == 300);
+    /* The last packet without a descriptor (ring transports, as Linux waits): last but not
+     * complete; a later packet with the descriptor completes it. */
+    n = init_event(ev, 6, "keyboard2", 0, NULL, 0, true);
+    CHECK(mtp_comm_event(&c, ev, n, &iface) == MTP_EVT_INIT && iface == 6);
+    CHECK(c.iface[6].last && !c.iface[6].complete && !c.iface[6].desc_len);
+    n = init_event(ev, 6, "keyboard2", 0, desc, 40, true);
+    CHECK(mtp_comm_event(&c, ev, n, &iface) == MTP_EVT_INIT && c.iface[6].last &&
+          c.iface[6].complete && c.iface[6].desc_len == 40);
     /* Over the cap: kept truncated and marked. */
     n = init_event(ev, 3, "stm", 0, desc, 2500, true);
     CHECK(mtp_comm_event(&c, ev, n, &iface) == MTP_EVT_INIT && c.iface[3].desc_truncated);

@@ -36,6 +36,15 @@ from aura import asm
 from aura.bootmem import BOOT_BLOBS, find_boot_blobs, copy_boot_blobs
 from construct import Array, Int64ul
 
+# J804 (T8152): never load over a running MTP.  A carrier session that brought up the internal
+# keyboard or trackpad leaves it running and DMAing into that session's area; only a reboot
+# through iBoot stops it.  Read-only (aura/windows.py t8152_mtp_running).
+if u.adt["/chosen"].chip_id == 0x8152 and getattr(u.adt["/chosen"], "board_id", -1) == 0x22:
+    from aura.windows import T8152_MTP_RUNNING_REFUSAL, t8152_mtp_running
+    mtp_running, mtp_detail = t8152_mtp_running(p.read32)
+    if mtp_running:
+        sys.exit(f"chainload refused: {T8152_MTP_RUNNING_REFUSAL}")
+
 new_base = u.base
 
 if args.raw:

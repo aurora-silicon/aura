@@ -30,6 +30,12 @@ static bool is_key_field(const struct hid_field *f)
     return on_page(first, KBD_PAGE_KEYS);
 }
 
+/* The Fn key's usage: vendor usage 3 on any of the vendor pages Apple keyboards use for it. */
+static bool is_fn_usage(u32 usage)
+{
+    return usage == KBD_USAGE_FN || usage == KBD_USAGE_FN_FF00 || usage == KBD_USAGE_FN_FF0C;
+}
+
 int kbd_layout_from_desc(struct kbd_layout *l, const u8 *desc, u32 len)
 {
     static struct hid_desc d; /* 4 KiB+: not on the carrier's stack */
@@ -57,7 +63,7 @@ int kbd_layout_from_desc(struct kbd_layout *l, const u8 *desc, u32 len)
         bool fn = false;
         if (f->variable && f->size == 1 && !f->constant) {
             for (u32 e = 0; e < f->count && !fn; e++) {
-                if (hid_field_usage(f, e) == KBD_USAGE_FN && !l->has_fn) {
+                if (is_fn_usage(hid_field_usage(f, e)) && !l->has_fn) {
                     l->has_fn = true;
                     l->fn_bit = (u16)(f->bit + e);
                     fn = true;

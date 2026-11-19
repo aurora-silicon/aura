@@ -181,8 +181,12 @@ static bool scm_send_bounded(struct mtp_bringup *b, u64 msg, u32 ms)
  * Put one command on the TX ring and ring the doorbell.  One command in flight: false when
  * one is still waiting, or the ring or the mailbox refused it (`*fatal` then says why).
  * Interface 0 takes SET_REPORT commands; a GET_REPORT goes to the interface it reads.
+ * `send_ms` bounds the doorbell: the bring-up waits up to MTP_T_SEND_MS for a full mailbox; the
+ * run time (0) tries once and, when the mailbox is full, owes the doorbell to the next poll
+ * (ring_owed_doorbell()), so a poll never spins.
  */
-static bool send_to(struct mtp_bringup *b, u8 iface, u8 flags, const u8 *msg, u16 n, int *fatal)
+static bool send_to(struct mtp_bringup *b, u8 iface, u8 flags, const u8 *msg, u16 n, int *fatal,
+                    u32 send_ms)
 {
     *fatal = MTP_E_NONE;
     if (b->cmd.busy)
@@ -200,11 +204,31 @@ static bool send_to(struct mtp_bringup *b, u8 iface, u8 flags, const u8 *msg, u1
                               .first = msg[0]};
     b->seq[iface % MTP_MAX_IFACES]++;
     b->cmd_sent_us = now(b);
-    if (!scm_send_bounded(b, MTP_SCM_AP_DOORBELL, MTP_T_SEND_MS)) {
-        *fatal = MTP_E_SCM_SEND;
-        return false;
+    if (!scm_send_bounded(b, MTP_SCM_AP_DOORBELL, send_ms)) {
+        if (send_ms) {
+            *fatal = MTP_E_SCM_SEND;
+            return false;
+        }
+        b->doorbell_owed = true;
+        b->doorbell_since = b->cmd_sent_us;
+        b->doorbells_owed++;
     }
     return true;
+}
+
+/* The run time's doorbell that found the mailbox full: one try per call; MTP_E_SCM_SEND once
+ * it has been owed for MTP_T_SEND_MS. */
+static int ring_owed_doorbell(struct mtp_bringup *b)
+{
+    if (!b->doorbell_owed)
+        return MTP_E_NONE;
+    if (b->ops->scm_send(b->ops->ctx, MTP_SCM_AP_DOORBELL)) {
+        b->scm_sends++;
+        b->doorbell_owed = false;
+        return MTP_E_NONE;
+    }
+    b->scm_busy++;
+    return now(b) - b->doorbell_since > (u64)MTP_T_SEND_MS * 1000 ? MTP_E_SCM_SEND : MTP_E_NONE;
 }
 
 /* A command whose acknowledgement never came is given up (counted), so others can follow. */
@@ -216,19 +240,19 @@ static void cmd_expire(struct mtp_bringup *b)
     }
 }
 
-static bool send_cmd(struct mtp_bringup *b, const u8 *msg, u16 n, int *fatal)
+/*
+ * A pending GPIO refusal takes the command slot only when it is free and no command() is
+ * still reading its own acknowledgement (cmd_waiting): an acknowledgement and a GPIO request
+ * drained in the same pump must not replace the command before command() has seen its result.
+ */
+static int send_pending(struct mtp_bringup *b, u32 send_ms)
 {
-    return send_to(b, 0, MTP_FLAGS_SET_FEATURE, msg, n, fatal);
-}
-
-static int send_pending(struct mtp_bringup *b)
-{
-    if (!b->gpio_pending || b->cmd.busy)
+    if (!b->gpio_pending || b->cmd.busy || b->cmd_waiting)
         return MTP_E_NONE;
     u8 ack[32];
     u16 n = mtp_gpio_ack(ack, sizeof(ack), MTP_GPIO_REFUSED, b->gpio_req, b->gpio_len);
     int fatal;
-    if (send_cmd(b, ack, n, &fatal)) {
+    if (send_to(b, 0, MTP_FLAGS_SET_FEATURE, ack, n, &fatal, send_ms)) {
         b->gpio_pending = false;
         b->gpio_refused++;
     }
@@ -243,7 +267,10 @@ static int pump(struct mtp_bringup *b)
     if (drain(b, &b->rx, 32) < 0 || drain(b, &b->wake, 32) < 0)
         return MTP_E_RING;
     cmd_expire(b);
-    return send_pending(b);
+    int rc = ring_owed_doorbell(b);
+    if (rc)
+        return rc;
+    return send_pending(b, MTP_T_SEND_MS);
 }
 
 /* ---- the bring-up ----------------------------------------------------------------------- */
@@ -300,7 +327,6 @@ static int power_on(struct mtp_bringup *b)
     for (u32 i = 0; i < MTP_T8152_PMGR_COUNT; i++) {
         u64 reg = MTP_T8152_PMGR_PS + (u64)i * MTP_T8152_PMGR_STRIDE;
         u32 v = b->ops->read32(b->ops->ctx, reg);
-        b->ps_before[i] = v;
         if ((v & MTP_PS_TARGET) != MTP_PS_ON) {
             b->ops->write32(b->ops->ctx, reg, (v & MTP_PS_KEEP) | MTP_PS_ON);
             b->pmgr_writes++;
@@ -309,6 +335,39 @@ static int power_on(struct mtp_bringup *b)
         while (MTP_PS_ACTUAL(b->ops->read32(b->ops->ctx, reg)) != MTP_PS_ON)
             if (now(b) >= deadline)
                 return MTP_E_POWER;
+    }
+    return MTP_E_NONE;
+}
+
+/*
+ * The RUN rule, with ASC_CPU_CONTROL read only while the MTP's domains are on (an unpowered
+ * ASC block faults or reads all ones).  The 13 states are read first (PMGR, always powered).
+ * All on: RUN is read before anything is written, and a running MTP is refused untouched.
+ * Any off: the MTP cannot be running (it needs every one of them), so they are switched on
+ * parent first (the only writes) and RUN is read after; set then, it is still refused.
+ */
+static int power_and_run_rule(struct mtp_bringup *b)
+{
+    bool all_on = true;
+    for (u32 i = 0; i < MTP_T8152_PMGR_COUNT; i++) {
+        u64 reg = MTP_T8152_PMGR_PS + (u64)i * MTP_T8152_PMGR_STRIDE;
+        b->ps_before[i] = b->ops->read32(b->ops->ctx, reg);
+        if (MTP_PS_ACTUAL(b->ps_before[i]) != MTP_PS_ON)
+            all_on = false;
+    }
+    b->run_read_powered = all_on;
+    if (all_on) {
+        b->asc_ctrl = b->ops->read32(b->ops->ctx, MTP_T8152_ASC_CPU_CTRL);
+        if (b->asc_ctrl & MTP_T8152_RUN)
+            return MTP_E_RUNNING;
+    }
+    int rc = power_on(b);
+    if (rc)
+        return rc;
+    if (!all_on) {
+        b->asc_ctrl = b->ops->read32(b->ops->ctx, MTP_T8152_ASC_CPU_CTRL);
+        if (b->asc_ctrl & MTP_T8152_RUN)
+            return MTP_E_RUNNING;
     }
     return MTP_E_NONE;
 }
@@ -349,20 +408,21 @@ static int wait_init(struct mtp_bringup *b)
             return rc;
         int k = mtp_comm_find(&b->comm, "keyboard");
         int t = b->want_tp ? mtp_comm_find(&b->comm, "multi-touch") : -1;
+        /* complete: the last packet came and a descriptor with it or before it (mtp_scm.c,
+         * as Linux waits on ring transports): an interface whose last packet had none is
+         * waited for until the deadline, then refused as a layout failure. */
         bool kd = k >= 0 && b->comm.iface[k].complete;
         bool td = t >= 0 && b->comm.iface[t].complete;
-        /* A keyboard INIT without a descriptor needs no more waiting: it is refused at once. */
-        bool kbd_dead = kd && !b->comm.iface[k].desc_len;
-        if (kd && (td || !b->want_tp || kbd_dead)) {
+        if (kd && (td || !b->want_tp)) {
             b->kbd_iface = k;
             b->tp_iface = td ? t : -1;
             return MTP_E_NONE;
         }
         if (now(b) >= deadline) {
-            if (!kd)
+            if (k < 0)
                 return MTP_E_INIT_TIMEOUT;
-            b->kbd_iface = k;
-            b->tp_iface = -1;
+            b->kbd_iface = k; /* seen: incomplete or without a descriptor is MTP_E_LAYOUT */
+            b->tp_iface = td ? t : -1;
             return MTP_E_NONE;
         }
     }
@@ -378,7 +438,7 @@ static int command(struct mtp_bringup *b, u8 iface, u8 flags, const u8 *msg, u16
 {
     u64 deadline = now(b) + (u64)ms * 1000;
     int fatal;
-    while (!send_to(b, iface, flags, msg, n, &fatal)) {
+    while (!send_to(b, iface, flags, msg, n, &fatal, MTP_T_SEND_MS)) {
         if (fatal)
             return fatal;
         int rc = pump(b); /* a GPIO refusal may hold the command slot */
@@ -387,13 +447,16 @@ static int command(struct mtp_bringup *b, u8 iface, u8 flags, const u8 *msg, u16
         if (now(b) >= deadline)
             return e_ack;
     }
+    b->cmd_waiting = true; /* no GPIO refusal takes the slot until the result is read */
+    int rc = MTP_E_NONE;
     while (b->cmd.busy) {
-        int rc = pump(b);
-        if (rc)
-            return rc;
-        if (now(b) >= deadline)
+        rc = pump(b);
+        if (rc || now(b) >= deadline)
             break;
     }
+    b->cmd_waiting = false;
+    if (rc)
+        return rc;
     if (b->cmd.busy || !b->cmd.done || b->cmd.first != msg[0] || b->cmd.iface != iface)
         return e_ack;
     return b->cmd.retcode ? e_ret : MTP_E_NONE;
@@ -617,10 +680,11 @@ int mtp_bringup_attach(struct mtp_bringup *b, const struct mtp_ops *ops, u64 are
     tp_init(&b->tp, &defaults);
     reached(b, MTP_ST_IDENTITY); /* the glue checked the ADT, chip and board */
 
-    /* The RUN rule: read only; a running MTP is never touched. */
-    b->asc_ctrl = ops->read32(ops->ctx, MTP_T8152_ASC_CPU_CTRL);
-    if (b->asc_ctrl & MTP_T8152_RUN)
-        return fail(b, MTP_E_RUNNING);
+    /* Power (only where a domain is off), with the RUN rule: a running MTP is never touched. */
+    int rc = power_and_run_rule(b);
+    if (rc)
+        return fail(b, rc);
+    reached(b, MTP_ST_POWER);
 
     /* I2: the launcher's page and the firmware's CRC, before anything is mapped. */
     if (want_tp) {
@@ -634,16 +698,12 @@ int mtp_bringup_attach(struct mtp_bringup *b, const struct mtp_ops *ops, u64 are
         }
     }
 
-    int rc = check_dart(b);
+    rc = check_dart(b);
+    if (!rc)
+        rc = map_rings(b);
     if (rc)
         return fail(b, rc);
     reached(b, MTP_ST_DART);
-    rc = map_rings(b);
-    if (!rc)
-        rc = power_on(b);
-    if (rc)
-        return fail(b, rc);
-    reached(b, MTP_ST_POWER);
 
     if (!ops->rtkit_start(ops->ctx, b->pool_dva, MTP_T_RTKIT_MS))
         return fail(b, MTP_E_RTKIT);
@@ -659,7 +719,7 @@ int mtp_bringup_attach(struct mtp_bringup *b, const struct mtp_ops *ops, u64 are
         return fail(b, rc);
     reached(b, MTP_ST_INIT);
     const struct mtp_iface_info *k = &b->comm.iface[b->kbd_iface];
-    if (!k->desc_len || k->desc_truncated ||
+    if (!k->complete || !k->desc_len || k->desc_truncated ||
         kbd_layout_from_desc(&b->kbd, k->desc, k->desc_len) != KBD_OK)
         return fail(b, MTP_E_LAYOUT);
 
@@ -733,13 +793,18 @@ int mtp_bringup_poll(struct mtp_bringup *b, u32 max_frames)
     if (b->csum_tripped)
         return latch(b, MTP_E_CSUM);
     cmd_expire(b);
-    int rc = send_pending(b);
+    int rc = ring_owed_doorbell(b);
+    if (!rc)
+        rc = send_pending(b, 0); /* one try: a full mailbox owes the doorbell to the next poll */
     if (rc)
         return latch(b, rc);
     if (b->tp_live) {
-        struct tp_report r;
-        if (tp_idle(&b->tp, now(b), &r)) /* silence: drop held contacts and the button */
-            b->ops->pointer(b->ops->ctx, &r);
+        struct tp_report r[TP_MAX_REPORTS];
+        int k = tp_idle(&b->tp, now(b), r); /* silence: drop held contacts and the button */
+        for (int i = 0; i < k; i++) {
+            b->tp_reports++;
+            b->ops->pointer(b->ops->ctx, &r[i]);
+        }
     }
     return n + w;
 }

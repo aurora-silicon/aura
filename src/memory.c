@@ -546,6 +546,48 @@ void mmu_add_mapping(u64 from, u64 to, size_t size, u8 attribute_index, u64 perm
     sysop("isb");
 }
 
+/*
+ * Make this side's own page-table changes visible in the regime it runs in.  mmu_add_mapping()
+ * issues `tlbi vmalle1is`, which at EL2 with HCR_EL2.{E2H,TGE} = {1,0} (the hypervisor once
+ * hv_init() ran) targets the guest's EL1&0 entries, not the EL2&0 ones this code translates
+ * through: a stale block translation would keep the old memory attributes.  Here the EL2&0
+ * entries go too (all of them: only this side's own translations, never a DART's).
+ */
+void mmu_flush_own_tlb(void)
+{
+    sysop("dsb ishst");
+    if (mrs(CurrentEL) == 8)
+        sysop("tlbi alle2is");
+    else
+        sysop("tlbi vmalle1is");
+    sysop("dsb ish");
+    sysop("isb");
+}
+
+/*
+ * The MAIR attribute byte this side's stage-1 read translation of `va` uses now (AT S1E2R at
+ * EL2, S1E1R otherwise), or -1 when it faults.  PAR_EL1 is restored, interrupts are masked for
+ * the walk.
+ */
+int mmu_probe_attr(u64 va)
+{
+    u64 daif = mrs(DAIF);
+    msr(DAIF, daif | 0x3c0);
+    u64 save = mrs(PAR_EL1);
+    if (mrs(CurrentEL) == 8)
+        __asm__ volatile("at s1e2r, %0" : : "r"(va));
+    else
+        __asm__ volatile("at s1e1r, %0" : : "r"(va));
+    sysop("isb");
+    u64 par = mrs(PAR_EL1);
+    msr(PAR_EL1, save);
+    sysop("isb");
+    msr(DAIF, daif);
+    if (par & 1)
+        return -1;
+    return (int)(par >> 56);
+}
+
 void mmu_rm_mapping(u64 from, size_t size)
 {
     if (mmu_map(from, 0, size) < 0)

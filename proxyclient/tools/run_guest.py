@@ -140,6 +140,14 @@ parser.add_argument('--windows-input-fn-default', choices=('media', 'fkeys'), de
 parser.add_argument('--windows-input-require-mtp', action='store_true',
                     help='T8152 I1/I2: refuse to start the guest unless every asked internal '
                          'source (keyboard, trackpad) came up at ATTACH.')
+parser.add_argument('--windows-input-probe', type=int, default=0, metavar='SECONDS',
+                    help='T8152 I1/I2: after ATTACH and before guest entry, let the carrier '
+                         'service the MTP and log every keyboard/trackpad frame and translation '
+                         'for SECONDS (1-120; type and touch on the M6 meanwhile). Needs '
+                         'host+kbd or host+kbd+tp.')
+parser.add_argument('--windows-input-probe-only', action='store_true',
+                    help='T8152 I1/I2: stop after --windows-input-probe: no guest is started '
+                         '(a carrier-only MTP check). The MTP stays running: leave by a reboot.')
 parser.add_argument('--windows-input-tp-fw', type=pathlib.Path, default=None,
                     help='T8152 I2: the trackpad firmware container (HIDF, the owner\'s own file '
                          'lifted from their recoveryOS; never in a repo). Default '
@@ -653,10 +661,16 @@ def windows_t8152_input_area(top):
     try:
         sources = w.parse_windows_input(args.windows_input)
         w.input_attach_mask(sources, args.windows_input_fn_default)
+        if args.windows_input_probe_only and not args.windows_input_probe:
+            raise ValueError("--windows-input-probe-only needs --windows-input-probe SECONDS")
+        if args.windows_input_probe and not 1 <= args.windows_input_probe <= 120:
+            raise ValueError("--windows-input-probe takes 1 to 120 seconds")
         if not w.input_needs_area(sources):
-            if args.windows_input_require_mtp or args.windows_input_tp_fw:
-                raise ValueError("--windows-input-require-mtp and --windows-input-tp-fw need "
-                                 "--windows-input host+kbd or host+kbd+tp")
+            if args.windows_input_require_mtp or args.windows_input_tp_fw or \
+                    args.windows_input_probe:
+                raise ValueError("--windows-input-require-mtp, --windows-input-tp-fw and "
+                                 "--windows-input-probe need --windows-input host+kbd or "
+                                 "host+kbd+tp")
             return top, None
         base, new_top = w.plan_t8152_input_area(top)
         mtp = {"base": base, "size": w.INPUT_AREA_SIZE, "payload": None, "params": None}
@@ -771,6 +785,39 @@ def windows_t8152_input_attach(hv, sources, usb_ports=(), mtp=None):
           "this Mac on the guest CDC port (never the proxy port)")
 
 
+def windows_t8152_input_probe(sources):
+    """Step A (carrier only): after ATTACH, before entry, PROBE in slices of at most 10 s: the
+    carrier services the MTP and logs frames, keyboard states and pointer reports on its
+    console (rate-limited) while the owner types and touches.  Prints the frame counts and the
+    MTP STATUS.  True when --windows-input-probe-only asks the caller to stop the launch here
+    (it closes the NVMe disk and reports its verdict); the MTP stays running: leave by a reboot."""
+    from aura import windows as w
+    if not args.windows_input_probe or not w.input_needs_area(sources):
+        return False
+    print(f"T8152 input PROBE: {args.windows_input_probe} s from now: type on the M6's keyboard "
+          "and touch, move and click its trackpad (no guest is running; the carrier's console "
+          "logs each frame and translation)")
+    total, left_ms, live = 0, args.windows_input_probe * 1000, True
+    while left_ms > 0:
+        ms = min(10000, left_ms)
+        got = no_timeout(p.hv_windows_input, w.INPUT_OP_PROBE, ms)
+        left_ms -= ms
+        if got >= 1 << 63:
+            live = False
+            print("T8152 input PROBE: the MTP is not live (latched or never up): stopped")
+            break
+        total += got
+        print(f"T8152 input PROBE: {got} frame(s) in {ms} ms ({total} in all)")
+    try:
+        st = {name: p.hv_windows_input(w.INPUT_OP_STATUS, index)
+              for name, index in w.INPUT_STATUS_MTP.items()}
+        print(f"T8152 input PROBE result: {'live' if live else 'NOT live'}, {total} frame(s); "
+              f"{w.describe_mtp_status(st)}")
+    except ProxyRemoteError as exc:
+        print(f"T8152 input PROBE: MTP status unavailable: {exc}")
+    return args.windows_input_probe_only
+
+
 def windows_t8152_input_status(sources):
     from aura import windows as w
     if not sources:
@@ -784,8 +831,9 @@ def windows_t8152_input_status(sources):
     print(f"T8152 input at exit: {st['frames_ok']} host frames ok, {st['bad_crc']} bad CRC, "
           f"{st['bad_header']} bad header, {st['bad_payload']} bad payload, {st['seq_gaps']} seq "
           f"gaps, {st['watchdog']} watchdog releases; {st['reports']} reports queued, "
-          f"{st['dropped']} dropped, high water {st['high_water']}; driver CTRL "
-          f"{st['ctrl']:#x}, LEDs {st['leds']:#x}, {st['bad_access']} bad accesses")
+          f"{st['dropped']} dropped, high water {st['high_water']}; {st['mtp']} internal "
+          f"(MTP keyboard/trackpad) reports; driver CTRL {st['ctrl']:#x}, LEDs "
+          f"{st['leds']:#x}, {st['bad_access']} bad accesses")
     if w.input_needs_area(sources):
         try:
             mst = {name: p.hv_windows_input(w.INPUT_OP_STATUS, index)
@@ -795,6 +843,22 @@ def windows_t8152_input_status(sources):
             print(f"T8152 input: MTP status unavailable: {exc}")
         print("T8152 input: the MTP keeps running and DMAing into its area: leave this session "
               "only by a reboot (P_REBOOT through the carrier), never by loading something else")
+
+
+def windows_t8152_mtp_idle_check(u):
+    """Every J804 launch, before anything on the machine changes: refuse while the MTP runs.
+    An earlier carrier session in this power cycle that brought up the internal keyboard or
+    trackpad leaves it running and DMAing into that session's area (its stream-4 entries stay),
+    so no later launch may plan RAM there.  Read-only: the 13 PMGR states, and ASC_CPU_CONTROL
+    only when every one is on (aura/windows.py t8152_mtp_running)."""
+    from aura import windows as w
+    if getattr(u.adt["/chosen"], "board_id", -1) != w.J804_BOARD_ID:
+        return
+    running, detail = w.t8152_mtp_running(p.read32)
+    print(f"T8152: {detail}")
+    if running:
+        sys.exit(f"T8152 launch refused: {w.T8152_MTP_RUNNING_REFUSAL}. The aura proxy keeps "
+                 "running; no guest was started.")
 
 
 def windows_t8152_ahci_attach(hv, u, ahci):
@@ -887,6 +951,7 @@ def run_windows_t8152(caps):
     u = ProxyUtils(p, heap_size=PROXY_HEAP_SIZE, aura_heap=AURA_HEAP_RESERVE)
     if u.adt["/chosen"].chip_id != T8152_CHIP:
         sys.exit("this Windows resident is not on T8152: use tools/boot_windows.py")
+    windows_t8152_mtp_idle_check(u)
     ba = u.ba
     adt_pa = (ba.devtree - ba.virt_base + ba.phys_base) & ((1 << 64) - 1)
     occupied = [("aura resident and heaps", u.base, u.heap_top - u.base),
@@ -958,11 +1023,25 @@ def run_windows_t8152(caps):
         windows_t8152_usb_attach(hv, usb_ports, ahci)
         windows_t8152_gpu_admit(hv, gpu_mode, usb_ports, ahci)
         windows_t8152_input_attach(hv, input_sources, usb_ports, input_mtp)
+        probe_only = windows_t8152_input_probe(input_sources)
     except BaseException:
         if nvme:
             # D5: the NVMe disk is attached; never leave it owning the controller.
             windows_t8152_ahci_nvme_detach()
         raise
+    if probe_only:
+        # Step A (carrier only): no guest.  Close the disk with its verdict, release the input
+        # device; the MTP keeps running, so the only way out is a reboot through the carrier.
+        clean = windows_t8152_ahci_nvme_close(-1, ahci, hv) if nvme else True
+        try:
+            p.hv_windows_input(INPUT_OP_DETACH)
+        except (ProxyError, UartError, OSError):
+            pass
+        sys.exit("T8152: --windows-input-probe-only: no guest was started. "
+                 f"{'NVMe disk CLEAN. ' if nvme and clean else ''}"
+                 f"{'The NVMe disk did NOT close CLEAN: do not hard-reset. ' if not clean else ''}"
+                 "The MTP stays running and DMAing into its area: leave only by a reboot through "
+                 "the carrier (P_REBOOT).")
     try:
         result = hv.start()
     except (ProxyRemoteError, WindowsGuestAborted, WindowsGuestExitTimeout) as exc:

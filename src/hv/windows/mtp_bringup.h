@@ -15,16 +15,20 @@
  * tests/e2e/windows_mtp_bringup_host.c with a fake MTP.  Sequence (windows-m6/INPUT-I1I2-BUILD.md
  * 2.3, the order our Linux driver measured):
  *
- *   RUN rule   ASC_CPU_CONTROL bit 4 set: refuse, write nothing (only a reboot through iBoot
- *              gives a fresh MTP)
+ *   power and  the 13 PMGR group-1 MTP states read first.  All on: ASC_CPU_CONTROL is read
+ *   RUN rule   and bit 4 (RUN) set is refused with nothing written.  Any off: the MTP cannot be
+ *              running, so those states are switched on (parent first, each polled to "on" for
+ *              at most 10 ms) and RUN is read after them; set then, it is still refused.
+ *              ASC_CPU_CONTROL is never read with a domain off (an unpowered ASC faults).
+ *              Only a reboot through iBoot gives a fresh MTP.
  *   DART       TTBR[4] valid, TCR[4] == 9, the root accepted by the glue; the rings and the
  *              RTKit pool mapped under that root (mtp_dart_t8152.c), checked by a software walk
- *   power      the 13 PMGR group-1 MTP states switched on where their target is not on, each
- *              polled to "on" for at most 10 ms
  *   RTKit      the glue boots it (RUN, HELLO, endpoints, power) with the premapped pool and
  *              starts endpoint 0x20
  *   SCM        power 2, wait for 0xfe, register the TX, RX and wake rings, 0xff
  *   INIT       the interface table; the "keyboard" interface's HID descriptor gives the layout
+ *              (an interface is complete with its last packet and a descriptor: one whose last
+ *              packet carried none is waited for, as Linux does on ring transports)
  *   keyboard   enable it ({0xb4, iface}), wait for the acknowledgement (return code 0) and READY
  *   trackpad   (I2, only when asked and the launcher's parameter page and firmware check out)
  *              enable "multi-touch"; patch the firmware's interface byte; AFE reset asserted
@@ -39,7 +43,8 @@
  * MTP on Linux) and makes no further SMC call.  Run time: mtp_bringup_poll() services RTKit (at
  * most 4 messages) and the rings (at most `max_frames`), never waits, and latches a failure
  * (RTKit, ring indices, 3 checksum errors in a row) after reporting the keyboard and the
- * pointer all up once.
+ * pointer all up once.  The run time never waits: a doorbell that finds the mailbox full is
+ * retried on the next poll (MTP_E_SCM_SEND once it has been owed MTP_T_SEND_MS).
  */
 
 /* The reserved MTP area (carved by the launcher off the top of the guest RAM window). */
@@ -123,8 +128,8 @@ int mtp_params_parse(const u8 *page, struct mtp_params *out);
 enum mtp_state {
     MTP_ST_OFF = 0,
     MTP_ST_IDENTITY = 1,
-    MTP_ST_DART = 2,
-    MTP_ST_POWER = 3,
+    MTP_ST_POWER = 2, /* the domains on and RUN read clear */
+    MTP_ST_DART = 3,  /* the stream-4 entries are in place */
     MTP_ST_RTKIT = 4,
     MTP_ST_SCM = 5,
     MTP_ST_INIT = 6,
@@ -213,6 +218,7 @@ struct mtp_bringup {
     u64 tx_dva, rx_dva, wake_dva, pool_dva, fw_dva;
     u32 ps_before[MTP_T8152_PMGR_COUNT];
     u32 pmgr_writes;
+    bool run_read_powered; /* every domain was already on when RUN was read (nothing written) */
 
     struct mtp_ring tx, rx, wake;
     struct mtp_comm comm;
@@ -235,6 +241,10 @@ struct mtp_bringup {
     u64 cmd_sent_us;
     u8 seq[MTP_MAX_IFACES]; /* each interface's command sequence */
     u32 cmd_timeouts;
+    bool cmd_waiting;   /* command() is reading its acknowledgement: the slot is held */
+    bool doorbell_owed; /* run time: a command is on the ring, its doorbell not yet rung */
+    u64 doorbell_since;
+    u32 doorbells_owed;
 
     bool iop_ready;
     u32 doorbells, app_other, scm_sends, scm_busy;

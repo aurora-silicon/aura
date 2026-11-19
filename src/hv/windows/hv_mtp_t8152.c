@@ -30,7 +30,8 @@
 #define MTP_AFE_KEY       0x7063494fu /* 'pcIO' */
 #define MTP_AFE_LO        0x10000u
 #define MTP_AFE_HI        0x1c0000u
-#define MTP_SMC_TIMEOUT_US 200000u
+#define MTP_SMC_TIMEOUT_US 200000u   /* each SMC command's answer */
+#define MTP_SMC_INIT_US    2000000u  /* each wait of the SMC session set-up (smc_init_timed) */
 
 static struct mtp_bringup mb;
 static asc_dev_t *asc;
@@ -270,7 +271,21 @@ static void op_keyboard(void *ctx, u8 mods, const u8 keys[KBD_BITMAP_BYTES], u16
     hv_input_internal_keyboard(mods, keys, consumer);
 }
 
-/* ---- I2: the AFE reset (the only SMC access), the firmware buffer, the pointer ----------- */
+/*
+ * ---- I2: the AFE reset, the firmware buffer, the pointer ---------------------------------
+ *
+ * The SMC mailbox traffic of a trackpad attach, all of it (the same session pattern the
+ * carrier's boot already runs on J804 for N1 and the SD reader):
+ *   smc_init_timed()  RTKit: wake (IOP power state INIT); on a HELLO, the version, the
+ *                     endpoint map and the IOP/AP power states ON; otherwise the session the
+ *                     boot left running is adopted.  Endpoint 0x20 started, SMC_INITIALIZE
+ *                     (its answer is the shared-memory address).
+ *   smc_write_u64()   exactly twice: pcIO <- 0x1c0000_00010001 (AFE reset asserted), then
+ *                     pcIO <- 0x1c0000_00010000 (released); after a failed write, none more.
+ *   smc_shutdown()    RTKit AP, then IOP power state QUIESCED (as every carrier SMC session
+ *                     ends; the main-boot N1/SD sessions do the same).
+ * No other key is read or written: no audio, speaker-amp, NVRAM or power key.
+ */
 
 static void smc_close(void)
 {
@@ -288,7 +303,7 @@ static bool op_afe_reset(void *ctx, bool assert)
         return false;
     }
     if (!smc) {
-        smc = smc_init();
+        smc = smc_init_timed(MTP_SMC_INIT_US);
         if (!smc) {
             printf("HV: input: SMC unavailable: the trackpad AFE reset was not written\n");
             smc_pcio_failed++;
@@ -423,9 +438,15 @@ static bool identity(void)
  * The device-written rings become Normal-NC in every alias of the carrier's map (the way
  * mmu_remap_smp_shared() treats shared memory), after their lines are cleaned: both ring
  * indices share one line, so a cached write-back of the consumer would also write back a stale
- * producer.  The table pages stay cacheable (the device only reads them; every write is cleaned).
+ * producer.  mmu_add_mapping() only invalidates EL1&0 translations, and ATTACH runs at EL2 after
+ * hv_init() (E2H=1, TGE=0): the carrier's own EL2&0 entries are invalidated here
+ * (mmu_flush_own_tlb()), and every ring page is then checked to translate as Normal-NC (AT, the
+ * MAIR byte in PAR_EL1).  Any other answer refuses the attach before the MTP is touched.  The
+ * table pages stay cacheable (the device only reads them; every write is cleaned).
  */
-static void prepare_area(void)
+#define MTP_ATTR_NORMAL_NC 0x44
+
+static bool prepare_area(void)
 {
     u64 rings = area_pa + MTP_AREA_TX, size = MTP_AREA_RINGS_END - MTP_AREA_TX;
     dc_civac_range((void *)rings, size);
@@ -434,11 +455,29 @@ static void prepare_area(void)
     mmu_add_mapping(rings | REGION_RWX_EL0, rings, size, MAIR_IDX_NORMAL_NC, PERM_RW_EL0);
     mmu_add_mapping(rings | REGION_RW_EL0, rings, size, MAIR_IDX_NORMAL_NC, PERM_RW_EL0);
     mmu_add_mapping(rings | REGION_RX_EL1, rings, size, MAIR_IDX_NORMAL_NC, PERM_RW_EL0);
+    mmu_flush_own_tlb();
+    for (u64 off = 0; off < size; off += MTP_DART_PAGE) {
+        int attr = mmu_probe_attr(rings + off);
+        if (attr != MTP_ATTR_NORMAL_NC) {
+            printf("HV: input: MTP ring page 0x%lx translates with attribute %d, not Normal-NC "
+                   "0x%x: attach refused (nothing on the MTP was touched)\n",
+                   rings + off, attr, MTP_ATTR_NORMAL_NC);
+            return false;
+        }
+    }
+    /* Lines a speculative fill brought in through the old cacheable translation go too. */
+    dc_civac_range((void *)rings, size);
+    sysop("dsb sy");
     memset((void *)rings, 0, size);
+    sysop("dsb sy");
     u64 tables = area_pa + MTP_AREA_TABLES;
     memset((void *)tables, 0, MTP_DART_MAX_TABLES * MTP_DART_PAGE);
     dc_civac_range((void *)tables, MTP_DART_MAX_TABLES * MTP_DART_PAGE);
     sysop("dsb sy");
+    printf("HV: input: MTP rings [0x%lx, 0x%lx) Normal-NC in the carrier's EL2 map (%lu pages "
+           "checked)\n",
+           rings, rings + size, size / MTP_DART_PAGE);
+    return true;
 }
 
 static void log_attach(void)
@@ -450,16 +489,19 @@ static void log_attach(void)
     printf("HV: input: MTP PMGR states before:");
     for (u32 i = 0; i < MTP_T8152_PMGR_COUNT; i++)
         printf(" %x", mb.ps_before[i]);
-    printf("\n");
-    printf("HV: input: MTP steps (ms from start): dart %u power %u rtkit %u scm %u init %u "
+    printf("; RUN read %s\n",
+           mb.run_read_powered ? "with every domain already on (before any write)"
+                               : "after the off domains were switched on");
+    printf("HV: input: MTP steps (ms from start): power %u dart %u rtkit %u scm %u init %u "
            "kbd %u\n",
-           mb.step_ms[MTP_ST_DART], mb.step_ms[MTP_ST_POWER], mb.step_ms[MTP_ST_RTKIT],
+           mb.step_ms[MTP_ST_POWER], mb.step_ms[MTP_ST_DART], mb.step_ms[MTP_ST_RTKIT],
            mb.step_ms[MTP_ST_SCM], mb.step_ms[MTP_ST_INIT], mb.step_ms[MTP_ST_KBD_READY]);
     for (u32 i = 0; i < MTP_MAX_IFACES; i++) {
         const struct mtp_iface_info *f = &mb.comm.iface[i];
         if (f->seen)
             printf("HV: input: MTP INIT iface %u \"%s\"%s%s descriptor %u bytes%s%s\n", i, f->name,
-                   f->complete ? "" : " (incomplete)", f->gpio ? " gpio" : "", f->desc_len,
+                   f->complete ? "" : f->last ? " (last packet, no descriptor)" : " (incomplete)",
+                   f->gpio ? " gpio" : "", f->desc_len,
                    f->desc_truncated ? " (truncated)" : "", f->ready ? " READY" : "");
     }
     if (mb.kbd_iface >= 0) {
@@ -504,11 +546,18 @@ static void log_attach(void)
            mmio_refused, mmio_faults, mem_refused);
     if (mb.reason == MTP_E_RUNNING)
         printf("HV: input: MTP already running: reboot through iBoot for a fresh MTP\n");
-    /* From DART on, stream-4 entries point into the area; from RTKit on, the MTP runs. */
-    if ((mb.state & ~MTP_ST_FAILED) >= MTP_ST_DART)
+    /* Stream-4 entries point into the area once mapping started; the MTP runs once its RTKit
+     * start was tried (RUN is set there). */
+    u8 st = mb.state & ~MTP_ST_FAILED;
+    bool entries = st >= MTP_ST_DART || mb.reason == MTP_E_MAP;
+    bool running = st >= MTP_ST_RTKIT || (st == MTP_ST_DART && mb.reason == MTP_E_RTKIT);
+    if (entries)
         printf("HV: input: stream-4 entries%s point into the area: leave this session by a "
-               "reboot\n",
-               (mb.state & ~MTP_ST_FAILED) >= MTP_ST_POWER ? " and a running MTP" : "");
+               "reboot (the launcher refuses every later T8152 launch while RUN is set)\n",
+               running ? " and a running MTP" : "");
+    if (mb.pmgr_writes && !running)
+        printf("HV: input: %u MTP domain(s) were switched on; the MTP CPU was not started\n",
+               mb.pmgr_writes);
 }
 
 bool hv_mtp_t8152_attach(u64 area, u64 size, bool fn_fkeys, bool trackpad)
@@ -545,7 +594,12 @@ bool hv_mtp_t8152_attach(u64 area, u64 size, bool fn_fkeys, bool trackpad)
     if (trackpad && !tp_identity())
         tp_refused = MTP_E_TP_IDENTITY;
     tp_wanted = trackpad && !tp_refused;
-    prepare_area();
+    if (!prepare_area()) {
+        tp_wanted = false;
+        mb.state = MTP_ST_FAILED | MTP_ST_IDENTITY;
+        mb.reason = MTP_E_AREA;
+        return false;
+    }
     attached = true;
     probing = true; /* log the bring-up's frames too */
     log_budget = MTP_LOG_PER_S;
@@ -623,7 +677,7 @@ s64 hv_mtp_t8152_probe(u32 ms)
 
 u64 hv_mtp_t8152_status(u32 index)
 {
-    struct rtkit_notification_counts n = {0, 0, 0};
+    struct rtkit_notification_counts n = {0};
     switch (index) {
         case 23:
             return mb.state;
@@ -664,15 +718,16 @@ void hv_mtp_t8152_report(void)
     reported_tp = mb.tp_frames;
     reported_bad = bad;
     reported_latch = latched;
-    struct rtkit_notification_counts n = {0, 0, 0};
+    struct rtkit_notification_counts n = {0};
     if (rtk)
         rtkit_get_notification_counts(rtk, &n);
-    printf("HV: input: mtp kbd %u tp %u (reports %u taps %u clicks %u detents %u stale %u) bad %u "
-           "(csum %u ring %u tp %u) frames %u gpio %u; svc max %lu us polls %lu; rtk app %lu "
-           "oslog %lu%s\n",
-           mb.kbd_reports, mb.tp_frames, mb.tp_reports, mb.tp.taps, mb.tp.clicks, mb.tp.detents,
-           mb.tp.stale, bad, mb.csum_errors, mb.ring_errors, mb.tp_bad, mb.frames, mb.gpio_refused,
-           poll_max_us, polls, n.app, n.oslog_notifications,
+    printf("HV: input: mtp kbd %u tp %u (reports %u taps %u (silent %u) clicks %u detents %u "
+           "stale %u lifts %u) bad %u (csum %u ring %u tp %u) frames %u gpio %u doorbells owed "
+           "%u; svc max %lu us polls %lu; rtk app %lu oslog %lu presets replaced %lu%s\n",
+           mb.kbd_reports, mb.tp_frames, mb.tp_reports, mb.tp.taps, mb.tp.silent_taps,
+           mb.tp.clicks, mb.tp.detents, mb.tp.stale, mb.tp.lifts, bad, mb.csum_errors,
+           mb.ring_errors, mb.tp_bad, mb.frames, mb.gpio_refused, mb.doorbells_owed, poll_max_us,
+           polls, n.app, n.oslog_notifications, n.presets_replaced,
            latched ? "; LATCHED, keyboard and trackpad released" : "");
 }
 

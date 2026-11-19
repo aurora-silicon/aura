@@ -42,6 +42,7 @@ bool rtkit_has_owned_buffers(const rtkit_dev_t *rtk);
 bool rtkit_start_ep(rtkit_dev_t *rtk, u8 ep);
 bool rtkit_boot(rtkit_dev_t *rtk);
 bool rtkit_boot_or_adopt(rtkit_dev_t *rtk, bool *adopted);
+bool rtkit_boot_or_adopt_timed(rtkit_dev_t *rtk, u32 timeout_usec, bool *adopted);
 bool rtkit_boot_timed(rtkit_dev_t *rtk, u32 timeout_usec);
 u32 rtkit_get_timeout(rtkit_dev_t *rtk);
 
@@ -72,6 +73,7 @@ struct rtkit_rejection {
 
 struct rtkit_notification_counts {
     u64 app, debug, oslog_notifications;
+    u64 presets_replaced; /* premapped pool: preset buffer addresses answered with a pool DVA */
 };
 
 /* Explicit pre-boot mode. Caller owns/stops the IOP before releasing storage. */
@@ -83,7 +85,9 @@ int rtkit_service_quiet(rtkit_dev_t *rtk, int max_msgs);
 /*
  * I1 (hv_mtp_t8152.c): a pool whose DVAs the caller already mapped (the T8152 MTP's dart-sbr
  * stream 4 is 3-level, which dart_map() does not handle).  Pool-only: no DART, no physical
- * window, so a buffer request with a preset address is refused and latched.
+ * window, so a buffer (or oslog) request with a preset address is answered as our Linux
+ * driver answers it: the preset is ignored, a pool slice is granted and its DVA replied
+ * (counted in presets_replaced).
  */
 bool rtkit_set_buffer_pool_premapped(rtkit_dev_t *rtk, u64 base, u64 dva, size_t size);
 /* Messages for endpoints >= 0x20 go to `fn` (still counted) instead of being dropped. */

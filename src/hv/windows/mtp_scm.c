@@ -290,8 +290,10 @@ static int init_event(struct mtp_comm *c, const u8 *p, u16 len, u8 *out)
         c->bad_events++;
         return MTP_EVT_BAD;
     }
+    /* As Linux on ring transports: the interface is complete only with its descriptor. */
     if (!p[20])
-        f->complete = true;
+        f->last = true;
+    f->complete = f->last && f->desc_len;
     return MTP_EVT_INIT;
 }
 

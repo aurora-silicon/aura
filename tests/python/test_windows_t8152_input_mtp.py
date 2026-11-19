@@ -71,10 +71,11 @@ DRIVERS = {
     "bringup": (["mtp_bringup.c", "mtp_scm.c", "mtp_dart_t8152.c", "hid_desc.c", "input_kbd.c",
                  "input_tp.c"],
                 "windows_mtp_bringup_host.c", [],
-                ["happy", "run_set", "ttbr_invalid", "ttbr_extra", "tcr", "root", "foreign",
-                 "pmgr_stuck", "rtkit", "no_fe", "mbox_full", "no_init", "no_kbd_desc", "layout",
-                 "no_ack", "ack_error", "no_ready", "gpio", "csum_latch", "rtkit_latch",
-                 "ring_latch", "budget_wake", "mbox_busy", "tp_happy", "tp_params", "tp_no_init",
+                ["happy", "run_set", "run_after_power", "ttbr_invalid", "ttbr_extra", "tcr",
+                 "root", "foreign", "pmgr_stuck", "rtkit", "no_fe", "mbox_full", "no_init",
+                 "no_kbd_desc", "kbd_desc_late", "layout", "no_ack", "ack_error", "no_ready",
+                 "gpio", "csum_latch", "rtkit_latch", "ring_latch", "budget_wake", "mbox_busy",
+                 "gpio_with_ack", "doorbell_owed", "tp_happy", "tp_params", "tp_no_init",
                  "tp_enable", "tp_afe_assert", "tp_fw_no_ack", "tp_fw_error", "tp_power_error",
                  "tp_afe_release", "tp_no_ready", "tp_no_geometry", "tp_latch", "tp_silence"]),
 }
@@ -88,6 +89,12 @@ def function_body(text, signature):
     start = text.index(signature)
     end = text.index("\n}\n", start)
     return text[start:end]
+
+
+def py_function(text, signature):
+    start = text.index(signature)
+    end = text.find("\ndef ", start + 1)
+    return text[start:end if end > 0 else len(text)]
 
 
 def clang():
@@ -219,13 +226,24 @@ def test_no_nvram_no_tlbi_and_one_smc_write():
     assert re.search(r"#define MTP_AFE_HI\s+0x1c0000u", glue)
     afe = function_body(glue, "static bool op_afe_reset(void *ctx, bool assert)")
     assert "u64 value = (u64)MTP_AFE_HI << 32 | MTP_AFE_LO | (assert ? 1 : 0);" in afe
-    assert afe.index("if (!tp_wanted || hv_windows_guest_entered())") < afe.index("smc_init()")
+    # Every SMC wait is bounded: the session set-up (smc_init_timed) and each command.
+    assert afe.index("if (!tp_wanted || hv_windows_guest_entered())") < \
+        afe.index("smc_init_timed(MTP_SMC_INIT_US)")
     assert "smc_set_timeout(smc, MTP_SMC_TIMEOUT_US)" in afe
+    assert re.search(r"#define MTP_SMC_INIT_US\s+2000000u", glue)
     attach = function_body(glue, "bool hv_mtp_t8152_attach(")
     # SMC is open only inside the bring-up; refused for good after it.
     assert attach.index("mtp_bringup_attach(") < attach.index("smc_close();") < \
-        attach.index("tp_wanted = false;")
-    assert glue.count("smc_init()") == 1 and glue.count("smc_shutdown(") == 1
+        attach.rindex("tp_wanted = false;")
+    assert glue.count("smc_init_timed(") == 1 and "smc_init()" not in glue
+    assert glue.count("smc_shutdown(") == 1
+    smc = (REPO / "src/smc.c").read_text()
+    timed = function_body(smc, "smc_dev_t *smc_init_timed(u32 timeout_usec)")
+    assert "rtkit_boot_or_adopt_timed(smc->rtkit, timeout_usec, &adopted)" in timed
+    assert "(adopted || timeout_usec) && timeout_expired(timeout)" in timed
+    rtkit = (REPO / "src/rtkit.c").read_text()
+    adopt = function_body(rtkit, "bool rtkit_boot_or_adopt_timed(")
+    assert "timeout_usec ? rtkit_boot_timed(rtk, timeout_usec) : rtkit_boot(rtk)" in adopt
 
 
 def test_trackpad_bringup_order():
@@ -260,13 +278,19 @@ def test_relative_descriptor_has_wheel_and_pan():
 def test_run_rule_before_any_write():
     bring = source("mtp_bringup.c")
     attach = function_body(bring, "int mtp_bringup_attach(")
-    run = attach.index("MTP_T8152_ASC_CPU_CTRL")
-    assert attach.index("if (b->asc_ctrl & MTP_T8152_RUN)") < attach.index("check_dart(b)") < \
-        attach.index("map_rings(b)") < attach.index("power_on(b)") < \
-        attach.index("ops->rtkit_start(") < attach.index("start_scm(b)") < \
-        attach.index("wait_init(b)") < attach.index("kbd_layout_from_desc(") < \
-        attach.index("enable_keyboard(b)")
-    assert run < attach.index("check_dart(b)")
+    assert "MTP_T8152_ASC_CPU_CTRL" not in attach
+    assert attach.index("power_and_run_rule(b)") < attach.index("check_dart(b)") < \
+        attach.index("map_rings(b)") < attach.index("ops->rtkit_start(") < \
+        attach.index("start_scm(b)") < attach.index("wait_init(b)") < \
+        attach.index("kbd_layout_from_desc(") < attach.index("enable_keyboard(b)")
+    # ASC_CPU_CONTROL is read only with every MTP domain on: before any write when they all
+    # were, else only after power_on() switched the off ones on.
+    rule = function_body(bring, "static int power_and_run_rule(struct mtp_bringup *b)")
+    assert rule.count("MTP_T8152_ASC_CPU_CTRL") == 2
+    first, second = (m.start() for m in re.finditer("MTP_T8152_ASC_CPU_CTRL", rule))
+    assert rule.index("b->ps_before[i] = b->ops->read32(") < rule.index("if (all_on) {") < \
+        first < rule.index("int rc = power_on(b);") < rule.index("if (!all_on) {") < second
+    assert "MTP_T8152_ASC_CPU_CTRL" not in function_body(bring, "static int power_on(")
     # Only the keyboard (and, later, multi-touch) is ever enabled.
     assert bring.count("MTP_CMD_ENABLE") == 2
     assert '"keyboard"' in bring and '"multi-touch"' in bring
@@ -275,15 +299,30 @@ def test_run_rule_before_any_write():
 
 def test_rings_noncacheable_and_area_denied():
     glue = source("hv_mtp_t8152.c")
-    prep = function_body(glue, "static void prepare_area(void)")
+    prep = function_body(glue, "static bool prepare_area(void)")
     assert prep.index("dc_civac_range((void *)rings, size)") < \
         prep.index("mmu_add_mapping(rings, rings, size, MAIR_IDX_NORMAL_NC, PERM_RW)")
     for alias in ("REGION_RWX_EL0", "REGION_RW_EL0", "REGION_RX_EL1"):
         assert f"mmu_add_mapping(rings | {alias}, rings, size, MAIR_IDX_NORMAL_NC" in prep
+    # The carrier's own EL2&0 translations are invalidated (mmu_add_mapping's vmalle1is only
+    # reaches EL1&0 with TGE clear), every ring page is checked to translate Normal-NC (0x44),
+    # and only then are the rings cleaned again and zeroed.
+    last_map = prep.index("mmu_add_mapping(rings | REGION_RX_EL1")
+    assert last_map < prep.index("mmu_flush_own_tlb();") < prep.index("mmu_probe_attr(") < \
+        prep.index("memset((void *)rings, 0, size)")
+    assert "attr != MTP_ATTR_NORMAL_NC" in prep and "return false;" in prep
+    assert re.search(r"#define MTP_ATTR_NORMAL_NC 0x44", glue)
+    mem = (REPO / "src/memory.c").read_text()
+    flush = function_body(mem, "void mmu_flush_own_tlb(void)")
+    assert 'if (mrs(CurrentEL) == 8)\n        sysop("tlbi alle2is");' in flush
+    probe = function_body(mem, "int mmu_probe_attr(u64 va)")
+    assert "at s1e2r" in probe and "msr(PAR_EL1, save);" in probe and "return (int)(par >> 56);" in probe
     attach = function_body(glue, "bool hv_mtp_t8152_attach(")
     assert attach.index("identity()") < attach.index("hv_t8152_reserve_input_area(") < \
-        attach.index("asc_init(") < attach.index("prepare_area()") < \
+        attach.index("asc_init(") < attach.index("if (!prepare_area()) {") < \
         attach.index("mtp_bringup_attach(")
+    refuse = attach[attach.index("if (!prepare_area()) {"):attach.index("attached = true;")]
+    assert "mb.reason = MTP_E_AREA;" in refuse and "return false;" in refuse
     policy = (WIN / "hv_t8152.c").read_text()
     area = function_body(policy, "int hv_t8152_reserve_input_area(u64 start, u64 end)")
     assert "start < ram_end" in area and "ram_conflicts(start, end, ram_host_top)" in area
@@ -426,3 +465,91 @@ def test_provenance_of_new_files():
         assert text.startswith("/* SPDX-License-Identifier: MIT */")
         for foreign in ("Copyright", "/Users/", "j804-private-data", "HIDF"):
             assert foreign not in text, (name, foreign)
+
+
+# ---- review fixes: the launch-time RUN check, the RTKit preset, the trackpad's silent lift ----
+
+class _FakeMtpRegs:
+    """PMGR states and ASC_CPU_CONTROL as the M6 would answer; an ASC read with any domain off
+    is the fault the launcher must never cause."""
+
+    def __init__(self, states, ctrl):
+        self.states, self.ctrl, self.reads, self.unpowered = states, ctrl, [], 0
+
+    def read32(self, addr):
+        w = _windows()
+        self.reads.append(addr)
+        if addr == w.MTP_ASC_CPU_CONTROL:
+            if any((v >> 4) & 0xF != 0xF for v in self.states):
+                self.unpowered += 1
+                return 0xFFFFFFFF
+            return self.ctrl
+        index, rem = divmod(addr - w.MTP_PMGR_PS, w.MTP_PMGR_STRIDE)
+        assert rem == 0 and 0 <= index < w.MTP_PMGR_COUNT, hex(addr)
+        return self.states[index]
+
+
+def test_launch_mtp_run_check():
+    w = _windows()
+    hdr = source("mtp_bringup.h")
+    assert int(re.search(r"#define MTP_T8152_PMGR_PS\s+(0x[0-9a-f]+)ull", hdr).group(1), 16) == \
+        w.MTP_PMGR_PS
+    assert w.MTP_ASC_CPU_CONTROL == 0x314600000 + 0x44 and w.MTP_RUN == 0x10
+    fresh = [0x0 if i in (6, 10, 11) else 0xFF for i in range(13)]  # as iBoot leaves it
+    regs = _FakeMtpRegs(fresh, 0x10)
+    assert w.t8152_mtp_running(regs.read32)[0] is False
+    assert w.MTP_ASC_CPU_CONTROL not in regs.reads and regs.unpowered == 0
+    regs = _FakeMtpRegs([0xFF] * 13, 0x10)  # a session left it running
+    running, detail = w.t8152_mtp_running(regs.read32)
+    assert running and "0x10" in detail and regs.unpowered == 0
+    regs = _FakeMtpRegs([0xFF] * 13, 0x0)  # powered by a failed attach, never started
+    assert w.t8152_mtp_running(regs.read32)[0] is False
+    # Every J804 launch and every chainload checks it, read-only, before anything changes.
+    rg = (REPO / "proxyclient/tools/run_guest.py").read_text()
+    check = py_function(rg, "def windows_t8152_mtp_idle_check(u):")
+    assert "w.t8152_mtp_running(p.read32)" in check and "sys.exit(" in check
+    assert "write" not in check
+    run = py_function(rg, "def run_windows_t8152(caps):")
+    assert run.index("chip_id != T8152_CHIP") < run.index("windows_t8152_mtp_idle_check(u)") < \
+        run.index("windows_t8152_usb_attach(")
+    cl = (REPO / "proxyclient/tools/chainload.py").read_text()
+    assert cl.index("t8152_mtp_running(p.read32)") < cl.index("new_base = u.base")
+
+
+def test_rtkit_premapped_preset_replaced():
+    rtkit = (REPO / "src/rtkit.c").read_text()
+    req = function_body(rtkit, "static bool rtkit_handle_buffer_request(")
+    assert req.index("rtk->windows_mode && addr && rtk->pool_premapped") < \
+        req.index("rtk->windows_mode && addr) {")
+    oslog = function_body(rtkit, "static bool rtkit_handle_oslog_request(")
+    assert "rtk->windows_mode && addr && rtk->pool_premapped" in oslog
+
+
+def test_fn_usages_and_silent_tap_sources():
+    kbd = source("input_kbd.h")
+    for usage in ("0x00ff0003u", "0xff000003u", "0xff0c0003u"):
+        assert usage in kbd
+    tp = source("input_tp.c")
+    idle = function_body(tp, "int tp_idle(")
+    assert "!s->lifts && s->session" in idle and "tap_button(s, s->t_prev)" in idle
+    assert re.search(r"#define MTP_FRAME_MAX\s+\(MTP_FRAME_HDR \+ 0xfffcu \+ MTP_FRAME_CSUM\)",
+                     source("mtp_scm.h"))
+
+
+def test_launcher_probe_step_a():
+    # Step A (carrier only): PROBE in slices of at most 10 s after ATTACH; --windows-input-probe-only
+    # closes the NVMe disk with its verdict and stops before hv.start().
+    rg = (REPO / "proxyclient/tools/run_guest.py").read_text()
+    probe = py_function(rg, "def windows_t8152_input_probe(sources):")
+    assert "min(10000, left_ms)" in probe and "w.INPUT_OP_PROBE" in probe
+    assert "return args.windows_input_probe_only" in probe
+    area = py_function(rg, "def windows_t8152_input_area(top):")
+    assert "1 <= args.windows_input_probe <= 120" in area
+    assert "--windows-input-probe-only needs --windows-input-probe" in area
+    run = py_function(rg, "def run_windows_t8152(caps):")
+    assert run.index("windows_t8152_input_attach(hv, input_sources") < \
+        run.index("probe_only = windows_t8152_input_probe(input_sources)") < \
+        run.index("if probe_only:") < run.index("windows_t8152_ahci_nvme_close(-1, ahci, hv)") < \
+        run.index("result = hv.start()")
+    hdr = source("hv_input.h")
+    assert "HV_INPUT_OP_PROBE = 4" in hdr

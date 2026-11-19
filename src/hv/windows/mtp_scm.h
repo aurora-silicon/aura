@@ -94,7 +94,7 @@ int mtp_ring_tx(struct mtp_ring *r, const u8 *frame, u32 len);
 #define MTP_FRAME_SUB  8u
 #define MTP_FRAME_TS   8u
 #define MTP_FRAME_CSUM 4u
-#define MTP_FRAME_MAX  (MTP_FRAME_HDR + 0x1000u + MTP_FRAME_CSUM) /* what this side buffers */
+#define MTP_FRAME_MAX  (MTP_FRAME_HDR + 0xfffcu + MTP_FRAME_CSUM) /* the largest frame (as Linux) */
 
 #define MTP_CH_NOTIFY     0x00u
 #define MTP_CH_CMD        0x11u
@@ -165,7 +165,8 @@ u32 mtp_frame_build(u8 *out, u32 outlen, u8 seq, u8 iface, u8 flags, const u8 *m
 
 struct mtp_iface_info {
     bool seen;      /* an INIT packet arrived */
-    bool complete;  /* its last INIT packet (more_packets == 0) arrived */
+    bool last;      /* its last INIT packet (more_packets == 0) arrived */
+    bool complete;  /* last, and a HID descriptor came with it or before it */
     bool ready;     /* READY arrived */
     bool desc_truncated;
     bool gpio;      /* it announced a GPIO */

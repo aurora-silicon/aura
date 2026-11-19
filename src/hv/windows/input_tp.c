@@ -145,14 +145,43 @@ void tp_release(struct tp_state *s, struct tp_report *out)
     *out = (struct tp_report){0, 0, 0, 0, 0};
 }
 
-int tp_idle(struct tp_state *s, u64 now, struct tp_report *out)
+/*
+ * The button a touch session ending at `end` taps, or 0: short, still, unclicked, one or two
+ * fingers, and no key in the quiet time before it (a key after `end` cannot be placed: no tap).
+ */
+static u8 tap_button(const struct tp_state *s, u64 end)
+{
+    const struct tp_config *c = &s->cfg;
+    bool quiet = !s->key_seen ||
+                 (end >= s->last_key && end - s->last_key >= (u64)c->tap_key_quiet_ms * 1000);
+    if (c->tap && !s->clicked && !s->scrolled && !s->buttons && quiet &&
+        end - s->t_session <= (u64)c->tap_ms * 1000 && s->max_travel_um < c->tap_travel_um &&
+        (s->max_contacts == 1 || s->max_contacts == 2))
+        return s->max_contacts == 1 ? TP_BTN_LEFT : TP_BTN_RIGHT;
+    return 0;
+}
+
+int tp_idle(struct tp_state *s, u64 now, struct tp_report out[TP_MAX_REPORTS])
 {
     if (!s->have_prev || (!s->n_prev && !s->phys) || now - s->t_prev < TP_STALE_US)
         return 0;
     s->stale++;
     bool held = s->last_buttons != 0;
-    tp_release(s, out);
-    return held ? 1 : 0;
+    /* A pad that has never sent a zero-contact frame ends touches only by silence: the touch
+     * is judged as a tap up to its last frame (late, but not lost). */
+    u8 tap = !s->lifts && s->session && s->n_prev ? tap_button(s, s->t_prev) : 0;
+    struct tp_report up;
+    tp_release(s, &up);
+    int n = 0;
+    if (held)
+        out[n++] = up;
+    if (tap) {
+        out[n++] = (struct tp_report){tap, 0, 0, 0, 0};
+        out[n++] = up;
+        s->taps++;
+        s->silent_taps++;
+    }
+    return n;
 }
 
 /*
@@ -355,11 +384,9 @@ int tp_frame(struct tp_state *s, const u8 *p, u32 len, u64 now, struct tp_report
     /* The end of a touch: a tap when it was short, still, unclicked and away from typing. */
     if (s->session && !n) {
         const struct tp_config *c = &s->cfg;
-        bool quiet = !s->key_seen || now - s->last_key >= (u64)c->tap_key_quiet_ms * 1000;
-        if (c->tap && !s->clicked && !s->scrolled && !s->buttons && quiet &&
-            now - s->t_session <= (u64)c->tap_ms * 1000 && s->max_travel_um < c->tap_travel_um &&
-            (s->max_contacts == 1 || s->max_contacts == 2)) {
-            u8 b = s->max_contacts == 1 ? TP_BTN_LEFT : TP_BTN_RIGHT;
+        s->lifts++; /* the pad reports lifts with a zero-contact frame */
+        u8 b = tap_button(s, now);
+        if (b) {
             out[nout++] = (struct tp_report){b, 0, 0, 0, 0};
             out[nout++] = (struct tp_report){0, 0, 0, 0, 0};
             s->last_buttons = 0;

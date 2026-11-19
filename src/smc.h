@@ -22,6 +22,8 @@ smc_dev_t *smc_init(void);
  */
 int smc_adt_function_reset(const char *path, u32 settle_ms);
 int smc_adt_function_set(const char *path, const char *name, u32 level, u32 settle_ms);
+/* smc_init() with every wait bounded (0: as smc_init()). */
+smc_dev_t *smc_init_timed(u32 timeout_usec);
 void smc_shutdown(smc_dev_t *smc);
 /* Bound every later command's wait for its answer (0: wait as long as it takes, the default). */
 void smc_set_timeout(smc_dev_t *smc, u32 usec);

@@ -28,7 +28,9 @@
 #define KBD_CONSUMER_STACK 8u
 
 #define KBD_PAGE_KEYS     0x0007u
-#define KBD_USAGE_FN      0x00ff0003u
+#define KBD_USAGE_FN      0x00ff0003u /* Apple's Fn: vendor page 0x00FF, usage 3 */
+#define KBD_USAGE_FN_FF00 0xff000003u /* the same usage on the 0xFF00 vendor page */
+#define KBD_USAGE_FN_FF0C 0xff0c0003u /* and on 0xFF0C (both seen on other Apple keyboards) */
 #define KBD_ERR_ROLLOVER  0x01u /* ..0x03: the keyboard's error codes */
 
 enum kbd_fn_mode {

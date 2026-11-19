@@ -195,6 +195,22 @@ static void k_layouts(void)
           l.report_id == 1 && !l.has_fn && l.data_bytes == 8);
     CHECK(kbd_layout_from_desc(&l, fn_kbd, sizeof(fn_kbd)) == KBD_OK && l.has_fn &&
           l.fn_bit == 64 && l.data_bytes == 9);
+    /* Fn as vendor usage 3 on the 0xFF00 and 0xFF0C pages too; another usage on 0x00FF is not. */
+    {
+        static u8 v[sizeof(fn_kbd)];
+        const u32 at = 47; /* fn_kbd's Fn usage page item: 0x06, lo, hi */
+        static const u8 pages[3][2] = {{0x00, 0xff}, {0x0c, 0xff}, {0xff, 0x00}};
+        for (u32 i = 0; i < 3; i++) {
+            memcpy(v, fn_kbd, sizeof(v));
+            CHECK(v[at] == 0x06 && v[at + 1] == 0xff && v[at + 2] == 0x00 && v[at + 4] == 0x03);
+            v[at + 1] = pages[i][0];
+            v[at + 2] = pages[i][1];
+            if (i == 2)
+                v[at + 4] = 0x04;
+            CHECK(kbd_layout_from_desc(&l, v, sizeof(v)) == KBD_OK && l.has_fn == (i < 2) &&
+                  (i == 2 || l.fn_bit == 64));
+        }
+    }
     CHECK(kbd_layout_from_desc(&l, nkro_kbd, sizeof(nkro_kbd)) == KBD_OK && l.report_id == 0 &&
           l.data_bytes == 21);
     CHECK(kbd_layout_from_desc(&l, mouse, sizeof(mouse)) == KBD_E_NO_KEYS && !l.valid);

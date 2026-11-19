@@ -504,6 +504,16 @@ static bool rtkit_handle_buffer_request(rtkit_dev_t *rtk, struct rtkit_message *
         return false;
 
 #ifdef AURA_WINDOWS
+    if (rtk->windows_mode && addr && rtk->pool_premapped) {
+        /*
+         * Pool-only (the T8152 MTP): a preset address cannot be honoured (no DART here, no
+         * window), so it is ignored, as our Linux driver's shmem_setup does: a pool slice is
+         * granted below and its DVA is the reply, which the IOP then uses.
+         */
+        if (rtk->notifications.presets_replaced != UINT64_MAX)
+            rtk->notifications.presets_replaced++;
+        addr = 0;
+    }
     if (rtk->windows_mode && addr) {
         if (!rtk->phys_window_size || addr < rtk->phys_window_base ||
             addr - rtk->phys_window_base >= rtk->phys_window_size ||
@@ -571,6 +581,14 @@ static bool rtkit_handle_oslog_request(rtkit_dev_t *rtk, struct rtkit_message *m
         rtkit_printf("duplicate oslog buffer request %lx\n", msg->msg);
         return false;
     }
+#ifdef AURA_WINDOWS
+    /* Pool-only: the preset is replaced by a pool slice, as for the other buffers. */
+    if (rtk->windows_mode && addr && rtk->pool_premapped) {
+        if (rtk->notifications.presets_replaced != UINT64_MAX)
+            rtk->notifications.presets_replaced++;
+        addr = 0;
+    }
+#endif
 
     if (addr) {
         if (rtk->phys_window_size && sz && addr >= rtk->phys_window_base &&
@@ -1280,10 +1298,16 @@ bool rtkit_boot_warm(rtkit_dev_t *rtk, u32 last_mask)
  * still confirm the adopted session on its own endpoint. */
 bool rtkit_boot_or_adopt(rtkit_dev_t *rtk, bool *adopted)
 {
+    return rtkit_boot_or_adopt_timed(rtk, 0, adopted);
+}
+
+/* The same, with every wait of the boot bounded by `timeout_usec` (0: as rtkit_boot()). */
+bool rtkit_boot_or_adopt_timed(rtkit_dev_t *rtk, u32 timeout_usec, bool *adopted)
+{
     bool running = asc_cpu_running(rtk->asc);
 
     *adopted = false;
-    if (rtkit_boot(rtk))
+    if (timeout_usec ? rtkit_boot_timed(rtk, timeout_usec) : rtkit_boot(rtk))
         return true;
     if (!running || !rtk->no_hello)
         return false;

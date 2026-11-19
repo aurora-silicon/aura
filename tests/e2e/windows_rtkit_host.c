@@ -422,7 +422,7 @@ int main(int argc, char **argv)
                    r->oslog_bfr.sz == before_oslog.sz && r->oslog_bfr.owned == before_oslog.owned &&
                    r->oslog_bfr.pooled == before_oslog.pooled);
             r->notifications =
-                (struct rtkit_notification_counts){UINT64_MAX, UINT64_MAX, UINT64_MAX};
+                (struct rtkit_notification_counts){UINT64_MAX, UINT64_MAX, UINT64_MAX, UINT64_MAX};
             queue(3, 0);
             queue(0x20, 0);
             queue(8, 3ULL << 56);
@@ -493,8 +493,9 @@ int main(int argc, char **argv)
     /*
      * I1: a premapped, pool-only RTKit (the T8152 MTP's stream-4 DVAs are mapped by the caller):
      * no DART call at all, grants come from the pool at the caller's DVAs, a grant with a preset
-     * address is refused and latched, app messages reach the handler, the quiet send never
-     * waits, and freeing never unmaps the caller's DVAs.
+     * address is answered with a pool slice and its DVA (as our Linux driver does), a duplicate
+     * grant is refused and latched, app messages reach the handler, the quiet send never waits,
+     * and freeing never unmaps the caller's DVAs.
      */
     void *small_pool = pool;
     size_t small_size = pool_size;
@@ -522,11 +523,21 @@ int main(int argc, char **argv)
         assert(rtkit_set_early_ap_power(r, true));
         boot_messages();
         if (scenario == 1) {
-            assert(!rtkit_boot_timed(r, 1000));
+            /* The ioreport request carried a preset address: a pool slice is granted instead and
+             * the reply names its DVA, never the preset. */
+            assert(rtkit_boot_timed(r, 1000));
             struct rtkit_rejection rejection;
-            assert(rtkit_get_first_rejection(r, &rejection) &&
-                   rejection.reason == RTKIT_REJECT_MESSAGE && rejection.msg1 == 4);
-            assert(!rtkit_send_quiet(r, 0x20, 0x2fd));
+            assert(!rtkit_get_first_rejection(r, &rejection));
+            assert(r->ioreport_bfr.dva == 0x10040418000ULL && r->ioreport_bfr.owned &&
+                   r->ioreport_bfr.bfr == (u8 *)pool + 2 * SZ_16K);
+            struct rtkit_notification_counts counts;
+            assert(rtkit_get_notification_counts(r, &counts) && counts.presets_replaced == 1);
+            int replied = 0;
+            for (unsigned i = 0; i < sent; i++)
+                if (tx[i].msg1 == 4 && FIELD_GET(MGMT_TYPE, tx[i].msg0) == 1)
+                    replied = FIELD_GET(MSG_BUFFER_REQUEST_IOVA, tx[i].msg0) == 0x10040418000ULL;
+            assert(replied);
+            assert(rtkit_send_quiet(r, 0x20, 0x2fd));
         } else {
             assert(rtkit_boot_timed(r, 1000));
             assert(r->syslog_bfr.dva == 0x10040410000ULL && r->syslog_bfr.bfr == pool);
@@ -547,7 +558,8 @@ int main(int argc, char **argv)
             tx_ready = false;
             assert(!rtkit_send_quiet(r, 0x20, 0x2) && sent == before_sent + 1);
             tx_ready = true;
-            /* A preset-address grant after boot: refused and latched; sends stop. */
+            /* A second syslog grant (here with a preset address) after boot: a duplicate,
+             * refused and latched; sends stop. */
             queue(2, (1ULL << 52) | (1ULL << 44) | 0x390100000ULL);
             assert(rtkit_service_quiet(r, 1) < 0 && !rtkit_send_quiet(r, 0x20, 0x2));
             quiet_boundary = false;
