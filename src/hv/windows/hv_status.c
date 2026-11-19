@@ -32,11 +32,11 @@ void hv_status_print(const struct hv_status_snapshot *s)
     for (int cpu = 0; cpu < HV_STATUS_CPUS && at < sizeof(exits); cpu++)
         if (s->exits[cpu] != ~0UL)
             at += snprintf(exits + at, sizeof(exits) - at, " c%d=%lu", cpu, s->exits[cpu]);
-    printf("HV: STATUS t=%lu soc=%lu tick cpu %d boot cpu %d\n", s->guest_s, s->soc_s, s->tick_cpu,
+    printf("HV: status t=%lu soc=%lu tick cpu %d boot cpu %d\n", s->guest_s, s->soc_s, s->tick_cpu,
            s->boot_cpu);
-    printf("HV: STATUS exits/min:%s\n", exits[0] ? exits : " none");
-    printf("HV: STATUS ahci %lu input %u/%u; console dropped %lu stalls %lu longest %lu us now %lu "
-           "us write max %lu us; vuart overruns %lu\n",
+    printf("HV: status exits/min:%s\n", exits[0] ? exits : " none");
+    printf("HV: status ahci %lu input %u/%u; console dropped %lu stalls %lu longest %lu us now %lu "
+           "us write max %lu us; vuart dropped %lu\n",
            s->ahci_commands, s->input_ok, s->input_bad, s->con_dropped, s->con_stalls,
            s->con_longest_stall_us, s->con_stalled_now_us, s->con_longest_call_us,
            s->vuart_overruns);

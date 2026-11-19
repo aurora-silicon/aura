@@ -10,13 +10,14 @@
  * pacing is guest-run time from entry, under bhl like the rest of hv_tick(), so a tick handover
  * (tick 6 or 7) keeps one cadence.  The block (G5B-BUILD 3.2):
  *
- *   HV: STATUS t=<guest s> soc=<SoC s> tick cpu <t> boot cpu <b>
- *   HV: STATUS exits/min: c0=<n> c1=<n> ...            (live CPUs only)
- *   HV: STATUS ahci <commands> input <ok>/<bad>; console dropped <bytes> stalls <n> longest
- *       <us> us now <us> us write max <us> us; vuart overruns <n>
+ *   HV: status t=<guest s> soc=<SoC s> tick cpu <t> boot cpu <b>
+ *   HV: status exits/min: c0=<n> c1=<n> ...            (live CPUs only)
+ *   HV: status ahci <commands> input <ok>/<bad>; console dropped <bytes> stalls <n> longest
+ *       <us> us now <us> us write max <us> us; vuart dropped <bytes>
  *   HV: GPU SUM ...                                     (only while a G1/G2 session forwards)
  *
- * Every line is one printf: one console write each.
+ * Every line is one printf: one console write each.  The lower-case "HV: status" and the
+ * "console dropped" / "vuart dropped" words are what g5watch's condrop rule reads.
  */
 #define HV_STATUS_PERIOD_S 60
 #define HV_STATUS_CPUS     12

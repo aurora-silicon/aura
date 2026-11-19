@@ -1326,9 +1326,9 @@ exited` wait for the host, at most 2 s each. The proxy protocol itself stays blo
 
 **Once a minute of guest run** the tick owner prints:
 
-    HV: STATUS t=<guest s> soc=<SoC s> tick cpu <t> boot cpu <b>
-    HV: STATUS exits/min: c0=<n> ... (live CPUs)
-    HV: STATUS ahci <commands> input <ok>/<bad>; console dropped <bytes> stalls <n> longest <us> us now <us> us write max <us> us; vuart overruns <n>
+    HV: status t=<guest s> soc=<SoC s> tick cpu <t> boot cpu <b>
+    HV: status exits/min: c0=<n> ... (live CPUs)
+    HV: status ahci <commands> input <ok>/<bad>; console dropped <bytes> stalls <n> longest <us> us now <us> us write max <us> us; vuart dropped <bytes>
     HV: GPU SUM t=<s> st=0x<state> g2=<0|1> fwd <n> denied <n> runref <n> faults <n> db <n> aud <n> fresh_max <n> capped <0|1> tbl <n>/1024 guards <n> init 0x<roles> msgs tx/rx <gfx tx>/<gfx rx> <mgmt tx>/<mgmt rx> drop <bytes>
 
 `GPU SUM` appears only while a G1/G2 session forwards. All values are relaxed reads of counters

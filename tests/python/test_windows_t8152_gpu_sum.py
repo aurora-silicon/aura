@@ -162,11 +162,11 @@ def test_sum_pacing(tmp_path):
 def test_status_block_format(tmp_path):
     """C-3: the 60 s block's lines, and GPU SUM last with the console's dropped bytes."""
     out = _status_host(tmp_path).splitlines()
-    i = out.index("HV: STATUS t=1860 soc=2891 tick cpu 7 boot cpu 6")
-    assert out[i + 1] == "HV: STATUS exits/min: c0=0 c1=100 c2=200 c3=300 c4=400 c5=500 c6=600 " \
+    i = out.index("HV: status t=1860 soc=2891 tick cpu 7 boot cpu 6")
+    assert out[i + 1] == "HV: status exits/min: c0=0 c1=100 c2=200 c3=300 c4=400 c5=500 c6=600 " \
                          "c7=700 c8=800 c9=900"
-    assert out[i + 2] == ("HV: STATUS ahci 66734 input 12/0; console dropped 4096 stalls 2 longest "
-                          "705000000 us now 0 us write max 37 us; vuart overruns 3")
+    assert out[i + 2] == ("HV: status ahci 66734 input 12/0; console dropped 4096 stalls 2 longest "
+                          "705000000 us now 0 us write max 37 us; vuart dropped 3")
     assert out[i + 3] == "SUM 1860"
 
 
@@ -194,3 +194,23 @@ def test_sum_backwards_counter_is_flagged():
     b = parse_sum("HV: GPU SUM t=120 st=0xf5 g2=1 fwd 90 denied 0 runref 0 faults 0 db 12 aud 13 "
                   "fresh_max 0 capped 0 tbl 7/1024 guards 0 init 0x3 msgs tx/rx 14/3 2/1 drop 0")
     assert a and b and backwards(a, b) == ["fwd"] and backwards(a, a) == []
+
+
+def test_status_block_is_what_the_watch_reads():
+    """g5watch (windows-m6/tools/g5/g5watch.py) records console/vUART drops with this rule and
+    reads GPU SUM's fields with these; the carrier's lines must keep matching them."""
+    condrop = re.compile(r"HV: (?:status|console)\b.*?\b(?:con(?:sole)?|vuart) drop(?:ped)? ([0-9]+)")
+    line = ("HV: status ahci 66734 input 12/0; console dropped 4096 stalls 2 longest 705000000 us "
+            "now 0 us write max 37 us; vuart dropped 3")
+    assert condrop.search(line).group(1) == "4096"
+    src = (WIN / "hv_status.c").read_text()
+    assert '"HV: status ahci %lu input %u/%u; console dropped %lu ' in src
+    assert 'vuart dropped %lu\\n"' in src
+    s = ("HV: GPU SUM t=120 st=0xf5 g2=1 fwd 10 denied 19 runref 0 faults 0 db 1 aud 15 fresh_max 1 "
+         "capped 0 tbl 7/1024 guards 19 init 0x3 msgs tx/rx 6/1 2/0 drop 7")
+    for rx, want in ((r" denied ([0-9]+)", "19"), (r" faults ([0-9]+)", "0"), (r" db ([0-9]+)", "1"),
+                     (r" fresh_max ([0-9]+)", "1"), (r" capped ([0-9]+)", "0"),
+                     (r" tbl ([0-9]+)/([0-9]+)", "7"), (r" guards ([0-9]+)", "19"),
+                     (r" drop ([0-9]+)", "7")):
+        assert re.search(rx, s).group(1) == want, rx
+    assert parse_sum(s)
