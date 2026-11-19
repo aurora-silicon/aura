@@ -9530,9 +9530,8 @@ static int dt_set_isp(void)
         !fdt_node_check_compatible(dt, 0, "apple,j614s"))
         return 0;
 
-    /* A T8140/T8142 ISP that isp_init() did not bring up has no firmware to reserve. */
-    if ((chip_id == T8140 || chip_id == T8142) &&
-        isp_get_heap(&heap_phys, &heap_iova, &heap_size)) {
+    /* An ISP17a that isp_init() did not bring up has no firmware to reserve. */
+    if (isp_is_isp17a() && isp_get_heap(&heap_phys, &heap_iova, &heap_size)) {
         if (!dt_set_isp_fwdata())
             return 0;
     } else if (!dt_reserve_asc_firmware("/arm-io/isp", "/arm-io/isp0", "isp", false,
