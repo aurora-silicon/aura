@@ -7,7 +7,7 @@
  * performed for real and recorded in a ring in aura's carve-out; writes, the first read of each
  * register and everything in the KSM block are also printed. After a host-set delay from the
  * first GPU access the core that next touches the GPU parks in aura's proxy, so the host can read
- * the ring (sptm_virt_gpu_ring, _head, _nrec).
+ * the ring (sptm_virt_gpu_ring, _head, _nrec, _keep).
  */
 
 #include "sptm_virt.h"
@@ -22,9 +22,10 @@
 #include "uartproxy.h"
 #include "utils.h"
 
-#define GPU_RING_BYTES (16UL << 20)
-#define GPU_SEEN_MAX   2048
-#define GPU_MAX_RANGES 10
+#define GPU_RING_BYTES_MIN (16UL << 20) /* if the heap has no room for the asked size */
+#define GPU_RING_KEEP      16384
+#define GPU_SEEN_MAX       2048
+#define GPU_MAX_RANGES     10
 
 struct gpu_rec {
     u64 t;    /* CNTPCT_EL0 */
@@ -33,10 +34,14 @@ struct gpu_rec {
     u64 pc;   /* guest PC */
 };
 
-/* For the host, after the park. */
+/*
+ * For the host, after the park. Record i is in slot i while i < sptm_virt_gpu_keep (the GPU's
+ * boot, with the firmware's init messages); later records wrap in the slots after those.
+ */
 struct gpu_rec *sptm_virt_gpu_ring;
 u64 sptm_virt_gpu_nrec;
 volatile u64 sptm_virt_gpu_head;
+u64 sptm_virt_gpu_keep = GPU_RING_KEEP;
 
 /* Set by the host before entry (run_guest_sptm.py). */
 u32 sptm_virt_gpu_stop_secs;      /* park this long after the first GPU access; 0 = never */
@@ -44,6 +49,7 @@ u32 sptm_virt_gpu_stop_boot_secs; /* park this long after the guest's entry, GPU
                                    */
 u64 sptm_virt_gpu_stop_msg; /* park after a write of this value (a mailbox message); 0 = never */
 u32 sptm_virt_gpu_print_max = 20000;
+u32 sptm_virt_gpu_ring_mib = 64; /* a steady stream of kicks fills 16 MiB in seconds */
 
 static struct {
     u64 base, size;
@@ -94,7 +100,9 @@ static void gpu_note(struct exc_info *ctx, u64 addr, u64 val, bool write, int wi
     if (!sptm_virt_gpu_ring)
         return;
     u64 i = __atomic_fetch_add(&sptm_virt_gpu_head, 1, __ATOMIC_RELAXED);
-    struct gpu_rec *r = &sptm_virt_gpu_ring[i % sptm_virt_gpu_nrec];
+    u64 keep = sptm_virt_gpu_keep;
+    u64 slot = i < keep ? i : keep + (i - keep) % (sptm_virt_gpu_nrec - keep);
+    struct gpu_rec *r = &sptm_virt_gpu_ring[slot];
     r->t = mrs(CNTPCT_EL0);
     r->meta = (addr & GENMASK(47, 0)) | ((u64)(width & 7) << 48) | ((u64) !!write << 51) |
               ((u64)(smp_id() & 15) << 52);
@@ -250,15 +258,22 @@ void sptm_virt_gpu_setup(void)
     }
     if (!(sptm_virt_flags & SPTM_VIRT_GPU))
         return;
-    sptm_virt_gpu_ring = memalign(0x4000, GPU_RING_BYTES);
+    u64 bytes = (u64)sptm_virt_gpu_ring_mib << 20;
+    sptm_virt_gpu_ring = bytes ? memalign(0x4000, bytes) : NULL;
+    if (!sptm_virt_gpu_ring) {
+        bytes = GPU_RING_BYTES_MIN;
+        sptm_virt_gpu_ring = memalign(0x4000, bytes);
+    }
     if (!sptm_virt_gpu_ring) {
         printf("SPTM-virt[gpu]: no memory for the ring; GPU trace off\n");
         return;
     }
-    memset(sptm_virt_gpu_ring, 0, GPU_RING_BYTES);
+    memset(sptm_virt_gpu_ring, 0, bytes);
     sptm_virt_bss_canary = 0xa5a5c0ffee5a5a5aUL; /* read back while the guest runs */
     dc_cvac_range((void *)&sptm_virt_bss_canary, sizeof(sptm_virt_bss_canary));
-    sptm_virt_gpu_nrec = GPU_RING_BYTES / sizeof(struct gpu_rec);
+    sptm_virt_gpu_nrec = bytes / sizeof(struct gpu_rec);
+    if (sptm_virt_gpu_keep >= sptm_virt_gpu_nrec)
+        sptm_virt_gpu_keep = 0;
     sptm_virt_gpu_head = 0;
 
     /* sgx reg 0 holds the GPU's PMGR (+0xe80000), its start control and both ASCs. */
@@ -270,8 +285,9 @@ void sptm_virt_gpu_setup(void)
     gpu_hook_adt("/arm-io/mcc", 8, "pmp-ptd", 0, 0);
     gpu_hook_adt("/arm-io/mcc", 9, "pmp-ptd-upd", 0, 0);
     gpu_hook_adt("/arm-io/pmp", 0, "pmp-asc", 0, 0);
-    printf("SPTM-virt[gpu]: ring 0x%lx (%lu records, head at 0x%lx), stop after %u s or a write of "
-           "0x%lx, print budget %u\n",
-           (u64)sptm_virt_gpu_ring, sptm_virt_gpu_nrec, (u64)&sptm_virt_gpu_head,
-           sptm_virt_gpu_stop_secs, sptm_virt_gpu_stop_msg, sptm_virt_gpu_print_max);
+    printf("SPTM-virt[gpu]: ring 0x%lx (%lu records, the first %lu kept, head at 0x%lx), stop "
+           "after %u s or a write of 0x%lx, print budget %u\n",
+           (u64)sptm_virt_gpu_ring, sptm_virt_gpu_nrec, sptm_virt_gpu_keep,
+           (u64)&sptm_virt_gpu_head, sptm_virt_gpu_stop_secs, sptm_virt_gpu_stop_msg,
+           sptm_virt_gpu_print_max);
 }
