@@ -4,12 +4,13 @@
 #define MTP_BRINGUP_H
 
 #include "input_kbd.h"
+#include "input_tp.h"
 #include "mtp_dart_t8152.h"
 #include "mtp_scm.h"
 #include "types.h"
 
 /*
- * I1: bring the T8152 MTP up to its keyboard, then service it.  Pure: every hardware access goes
+ * I1/I2: bring the T8152 MTP up to its keyboard and trackpad, then service it.  Pure: every hardware access goes
  * through struct mtp_ops, which hv_mtp_t8152.c implements with allow-listed MMIO and
  * tests/e2e/windows_mtp_bringup_host.c with a fake MTP.  Sequence (windows-m6/INPUT-I1I2-BUILD.md
  * 2.3, the order our Linux driver measured):
@@ -25,12 +26,20 @@
  *   SCM        power 2, wait for 0xfe, register the TX, RX and wake rings, 0xff
  *   INIT       the interface table; the "keyboard" interface's HID descriptor gives the layout
  *   keyboard   enable it ({0xb4, iface}), wait for the acknowledgement (return code 0) and READY
+ *   trackpad   (I2, only when asked and the launcher's parameter page and firmware check out)
+ *              enable "multi-touch"; patch the firmware's interface byte; AFE reset asserted
+ *              (ops->afe_reset, the SMC's pcIO key: the glue's only SMC write), 50 ms; the
+ *              firmware (0x95, its buffer mapped in stream 4 with the rings); power method 2
+ *              "on" announced; AFE reset released, 50 ms; "on" confirmed; READY; then the
+ *              optional 0xD9 geometry
  *
  * Every wait is bounded; a failure stops the bring-up with a step and a reason, and touches
- * nothing more.  The trackpad, its firmware and the SMC AFE reset are a later step: this file
- * makes no SMC call.  Run time: mtp_bringup_poll() services RTKit (at most 4 messages) and the
- * rings (at most `max_frames`), never waits, and latches a failure (RTKit, ring indices, 3
- * checksum errors in a row) after reporting the keyboard all up once.
+ * nothing more.  A trackpad failure leaves the keyboard up (its own reason, tp_reason); after
+ * the assert it leaves the AFE in reset (the safe state: a release during an upload crashed the
+ * MTP on Linux) and makes no further SMC call.  Run time: mtp_bringup_poll() services RTKit (at
+ * most 4 messages) and the rings (at most `max_frames`), never waits, and latches a failure
+ * (RTKit, ring indices, 3 checksum errors in a row) after reporting the keyboard and the
+ * pointer all up once.
  */
 
 /* The reserved MTP area (carved by the launcher off the top of the guest RAM window). */
@@ -44,7 +53,8 @@
 #define MTP_AREA_WAKE      0x500000u
 #define MTP_AREA_POOL      0x504000u
 #define MTP_AREA_POOL_SIZE 0x100000u
-#define MTP_AREA_FW        0x700000u /* I2 */
+#define MTP_AREA_FW        0x700000u /* I2: the multi-touch firmware payload */
+#define MTP_AREA_FW_SIZE   0x20000u  /* 128 KiB, mapped whole */
 #define MTP_AREA_RINGS_END 0x504000u /* [TX, RINGS_END) is the device-written span */
 
 /* T8152 / J804 facts (ADT /arm-io/mtp, /arm-io/dart-sbr, mapper-mtp reg 4; Linux DT). */
@@ -70,6 +80,34 @@
 #define MTP_PS_ON          0xfu
 #define MTP_PS_KEEP        (~(0x10000000u | 0x200u | 0x100u | 0xfu)) /* auto, was-gated, target */
 
+/*
+ * The launcher's parameter page (area + MTP_AREA_PARAMS, little-endian; I2 only):
+ *   +0  "AWMTPP01"     +8  u32 version 1      +12 u32 length 64
+ *   +16 u32 firmware offset in the area (MTP_AREA_FW)   +20 u32 firmware size (payload bytes)
+ *   +24 u32 CRC-32 (zlib) of the payload as written     +28 u32 interface-byte offset (0: none)
+ *   +32 u32 flags: bit 0 tap-to-click, bit 1 natural scrolling
+ *   +36 u16 gain (Q8.8 counts/mm)  +38 u16 acceleration (Q8.8)  +40 u16 accel low (mm/s)
+ *   +42 u16 accel high (mm/s)      +44 u16 scroll travel per detent (um)
+ *   +46 u16 tap time (ms)          +48 u16 tap travel (um)      +50 u16 tap quiet after a key (ms)
+ *   +52 u16 click settle (ms)      +54 u16 palm touch major (0: off)
+ *   +56 u32 reserved (0)           +60 u32 CRC-32 (zlib) of bytes 0..59
+ */
+#define MTP_PARAMS_MAGIC   "AWMTPP01"
+#define MTP_PARAMS_VERSION 1u
+#define MTP_PARAMS_LEN     64u
+#define MTP_PARAMS_TAP     BIT(0)
+#define MTP_PARAMS_NATURAL BIT(1)
+
+struct mtp_params {
+    u32 fw_size, fw_crc, fw_iface_off;
+    struct tp_config tp;
+};
+
+/* zlib's CRC-32. */
+u32 mtp_crc32(u32 crc, const u8 *p, u32 len);
+/* Check the page (and nothing else); MTP_E_NONE or MTP_E_TP_PARAMS. */
+int mtp_params_parse(const u8 *page, struct mtp_params *out);
+
 /* Bounds (ms). */
 #define MTP_T_PMGR_MS   10u
 #define MTP_T_RTKIT_MS  500u
@@ -78,6 +116,8 @@
 #define MTP_T_INIT_MS   500u
 #define MTP_T_CMD_MS    1000u
 #define MTP_T_READY_MS  1000u
+#define MTP_T_AFE_MS    50u   /* after the AFE reset is asserted, and after it is released */
+#define MTP_T_GEOM_MS   200u
 
 /* STATUS index 23 (hv_input.h): the furthest step, | 0x80 when it failed there. */
 enum mtp_state {
@@ -116,6 +156,15 @@ enum mtp_reason {
     MTP_E_RTKIT_FAILED = 18, /* run time: RTKit service latched */
     MTP_E_RING = 19,         /* run time or INIT: ring indices or framing */
     MTP_E_CSUM = 20,         /* run time: 3 checksum errors in a row */
+    /* I2, the trackpad (STATUS 24 bits 15:8; the keyboard stays up): */
+    MTP_E_TP_PARAMS = 21,   /* the parameter page or the firmware's CRC */
+    MTP_E_TP_INIT = 22,     /* no complete "multi-touch" INIT */
+    MTP_E_TP_ENABLE = 23,   /* the enable was not acknowledged with 0 */
+    MTP_E_TP_SMC = 24,      /* the AFE reset write failed (no further SMC call) */
+    MTP_E_TP_FW = 25,       /* the firmware was not acknowledged with 0 */
+    MTP_E_TP_POWER = 26,    /* a power method 2 step was not acknowledged with 0 */
+    MTP_E_TP_READY = 27,
+    MTP_E_TP_IDENTITY = 28, /* the glue: no multi-touch nub or not the expected AFE function */
 };
 
 struct mtp_ops {
@@ -137,6 +186,12 @@ struct mtp_ops {
     bool (*scm_send)(void *ctx, u64 msg);
     /* The internal keyboard's new state. */
     void (*keyboard)(void *ctx, u8 mods, const u8 keys[KBD_BITMAP_BYTES], u16 consumer);
+    /* I2: one relative pointer report from the trackpad. */
+    void (*pointer)(void *ctx, const struct tp_report *r);
+    /* I2: the trackpad AFE reset line (true: asserted); false when the write failed. */
+    bool (*afe_reset)(void *ctx, bool assert);
+    /* I2: write the CPU's view of [pa, pa + size) back for the MTP (the firmware buffer). */
+    void (*dma_sync)(void *ctx, u64 pa, u64 size);
     /* Optional: every well-formed frame (PROBE logging). */
     void (*frame)(void *ctx, const struct mtp_msg *m);
 };
@@ -155,7 +210,7 @@ struct mtp_bringup {
     u32 asc_ctrl, ttbr, tcr;
     u64 root;
     struct mtp_dart dart;
-    u64 tx_dva, rx_dva, wake_dva, pool_dva;
+    u64 tx_dva, rx_dva, wake_dva, pool_dva, fw_dva;
     u32 ps_before[MTP_T8152_PMGR_COUNT];
     u32 pmgr_writes;
 
@@ -166,9 +221,19 @@ struct mtp_bringup {
     struct kbd_state kst;
     bool kbd_live;
 
+    /* I2 */
+    bool want_tp, tp_live, tp_geometry_device;
+    int tp_iface;
+    u8 tp_reason;
+    u8 tp_step; /* how far the trackpad got (1 enable .. 7 READY, 8 geometry) */
+    struct mtp_params params;
+    struct tp_state tp;
+    u32 afe_writes, afe_failed;
+    u32 tp_frames, tp_bad, tp_reports, tp_other;
+
     struct mtp_cmd cmd;
     u64 cmd_sent_us;
-    u8 comm_seq;
+    u8 seq[MTP_MAX_IFACES]; /* each interface's command sequence */
     u32 cmd_timeouts;
 
     bool iop_ready;
@@ -189,11 +254,13 @@ struct mtp_bringup {
 };
 
 /*
- * Bring-up, before guest entry.  The area's rings and table pages must already be zero.
- * Returns MTP_E_NONE, or the reason it stopped (b->state then has MTP_ST_FAILED set).
+ * Bring-up, before guest entry.  The area's rings and table pages must already be zero; with
+ * `want_tp` the launcher's parameter page and firmware payload are in the area.  Returns
+ * MTP_E_NONE when the keyboard is up (the trackpad's result is tp_live / tp_reason), or the
+ * reason it stopped (b->state then has MTP_ST_FAILED set).
  */
 int mtp_bringup_attach(struct mtp_bringup *b, const struct mtp_ops *ops, u64 area_pa,
-                       void *area, enum kbd_fn_mode fn_mode);
+                       void *area, enum kbd_fn_mode fn_mode, bool want_tp);
 
 /* The RTKit app handler's message (from inside ops->rtkit_service). */
 void mtp_bringup_app_msg(struct mtp_bringup *b, u8 ep, u64 msg);

@@ -41,6 +41,7 @@ struct smc_dev {
 
     bool outstanding[SMC_NUM_IDS];
     u64 ret[SMC_NUM_IDS];
+    u32 timeout_usec;
 };
 
 static void smc_handle_msg(smc_dev_t *smc, u64 msg)
@@ -99,9 +100,14 @@ static int smc_cmd(smc_dev_t *smc, u64 message)
     message |= FIELD_PREP(SMC_MSG_ID, id);
 
     smc_send(smc, message);
+    u64 timeout = smc->timeout_usec ? timeout_calculate(smc->timeout_usec) : 0;
     while (smc->outstanding[id]) {
         if (smc_work(smc) < 0)
             return -1;
+        if (timeout && timeout_expired(timeout)) {
+            printf("SMC: smc_cmd[0x%x] timed out\n", id);
+            return -1;
+        }
     }
 
     u64 result = smc->ret[id];
@@ -112,6 +118,11 @@ static int smc_cmd(smc_dev_t *smc, u64 message)
     }
 
     return 0;
+}
+
+void smc_set_timeout(smc_dev_t *smc, u32 usec)
+{
+    smc->timeout_usec = usec;
 }
 
 void smc_shutdown(smc_dev_t *smc)

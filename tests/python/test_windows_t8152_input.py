@@ -55,7 +55,10 @@ Launcher (windows.py, hv/__init__.py, run_guest.py):
   L2  host needs T8152, J804, CAPS2 bit 3 and the FD's J804INP1 marker; an FD with the marker
       needs --windows-input (both directions); a marker with other values is refused
   L3  host needs --windows-serial cdc and the software GIC CPU interface
-  L4  host+kbd and host+kbd+tp are refused by name in this carrier
+  L4  host+kbd and host+kbd+tp are accepted (I1/I2); kbd or tp without host is refused; the
+      resident's Q_SOURCES must cover them; the MTP area plan, the firmware container check
+      and the parameter page (parsed by the carrier's own C parser) are in
+      test_windows_t8152_input_mtp.py
   L5  the handshake is written only after ATTACH returned 0, and is 24 bytes <QIIII>
   L6  the frame encoder's bytes are parsed by the carrier model into the expected reports
 """
@@ -86,7 +89,8 @@ MODEL_CASES = ["crc", "reset_values", "report_layout", "before_enable", "pop_and
                "out_reports", "spi_gate", "fuzz"]
 GLUE_CASES = ["attach_refusals", "attach_once", "poll_budget", "line_sync", "bad_width",
               "watchdog", "exit", "pre_entry", "status", "host_only_no_mtp", "kbd_attach",
-              "kbd_merge"]
+              "kbd_attach_down", "kbd_merge", "tp_attach", "tp_attach_kbd_only", "tp_attach_none",
+              "kbd_attach_no_tp"]
 
 TYPES_H = r"""
 #pragma once
@@ -443,10 +447,18 @@ def test_input_flag_parsing(value, sources):
     assert w.parse_windows_input(value) == sources
 
 
-@pytest.mark.parametrize("value", ["host+kbd", "host+kbd+tp"])
-def test_internal_sources_are_not_in_this_carrier(value):
+@pytest.mark.parametrize("value, sources", [("host+kbd", ("host", "kbd")),
+                                            ("HOST+KBD+TP", ("host", "kbd", "tp"))])
+def test_internal_sources_parse(value, sources):
     # L4
-    with pytest.raises(ValueError, match="not in this carrier yet"):
+    assert w.parse_windows_input(value) == sources
+    assert w.input_needs_area(sources)
+    assert not w.input_needs_area(("host",))
+
+
+@pytest.mark.parametrize("value", ["kbd+tp", "host+tp", "tp+host", "kbd+host"])
+def test_internal_sources_need_host_and_keyboard(value):
+    with pytest.raises(ValueError, match="host source always stays on"):
         w.parse_windows_input(value)
 
 
@@ -506,6 +518,25 @@ def test_contract_query_and_handshake():
     value = w.input_handshake(("host",), 0x1000F)
     assert len(value) == w.INPUT_HANDSHAKE_SIZE == 24
     assert struct.unpack("<QIIII", value) == (0xF50000000, 0x4000, 991, 0x1000F, 1)
+    # I1/I2: the handshake carries what FEATURES says is live after ATTACH, never more than
+    # was asked; a resident without the host bit is refused.
+    sources = ("host", "kbd", "tp")
+    assert struct.unpack("<QIIII", w.input_handshake(sources, 0x7000F))[3] == 0x7000F
+    assert struct.unpack("<QIIII", w.input_handshake(sources, 0x3000F))[3] == 0x3000F
+    assert struct.unpack("<QIIII", w.input_handshake(("host",), 0x7000F))[3] == 0x1000F
+    with pytest.raises(ValueError, match="host source"):
+        w.input_handshake(sources, 0x6000F)
+    assert w.input_live_sources(sources, 0x3000F) == (["host", "kbd"], ["tp"])
+    # Q_SOURCES: an I0 carrier (1) refuses host+kbd; I1 (3) refuses the trackpad.
+    w.check_input_sources(("host", "kbd"), 3)
+    w.check_input_sources(sources, 7)
+    for have, want in ((1, ("host", "kbd")), (3, sources)):
+        with pytest.raises(ValueError, match="rebuild the carrier"):
+            w.check_input_sources(want, have)
+    assert w.input_attach_mask(sources) == 7
+    assert w.input_attach_mask(("host", "kbd"), "fkeys") == 0x103
+    with pytest.raises(ValueError):
+        w.input_attach_mask(("host",), "fkeys")
     with pytest.raises(ValueError):
         w.input_handshake((), 0x1000F)
     assert w.describe_input_attach(0) == "attached"
@@ -615,6 +646,8 @@ def test_run_guest_input_order_and_refusals():
         < t8152.index("hv.init()")
     assert t8152.index("windows_t8152_usb_attach(hv, usb_ports, ahci)") < \
         t8152.index("windows_t8152_input_attach(hv, input_sources)") < \
+        t8152.index("windows_t8152_gpu_admit(hv, gpu_mode, usb_ports, ahci)") < \
+        t8152.index("windows_t8152_input_attach(hv, input_sources, usb_ports, input_mtp)") < \
         t8152.index("result = hv.start()") < \
         t8152.index("windows_t8152_input_status(input_sources)")
     plan = src[src.index("def windows_t8152_input_plan"):
@@ -625,11 +658,29 @@ def test_run_guest_input_order_and_refusals():
     attach = src[src.index("def windows_t8152_input_attach"):
                  src.index("def windows_t8152_input_status")]
     assert attach.index("w.validate_input_contract(") < \
-        attach.index("w.INPUT_OP_ATTACH, w.input_source_mask(sources)") < \
+        attach.index("mask = w.input_attach_mask(sources, args.windows_input_fn_default)") < \
+        attach.index("w.INPUT_OP_ATTACH, mask") < \
         attach.index("if result != 0:") < \
         attach.index("hv.set_windows_input_handshake(w.input_handshake(sources, features))")
     failed = attach[attach.index("except ValueError as exc:\n        p.hv_windows_input"):]
     assert failed.index("w.INPUT_OP_DETACH") < failed.index("sys.exit(")
+        attach.index("features = p.hv_windows_input(w.INPUT_OP_QUERY, w.INPUT_Q[\"features\"])") \
+        < attach.index("hv.set_windows_input_handshake(w.input_handshake(sources, features))")
+    # I1/I2: Q_SOURCES first, then the firmware and the page into the area, then ATTACH.
+    assert attach.index("w.check_input_sources(") < \
+        attach.index("iface.writemem(mtp[\"base\"] + w.INPUT_AREA_FW, mtp[\"payload\"])") < \
+        attach.index("iface.writemem(mtp[\"base\"], mtp[\"params\"])") < \
+        attach.index("w.INPUT_OP_ATTACH, mask, mtp[\"base\"], mtp[\"size\"]")
+    require = attach[attach.index("if down and args.windows_input_require_mtp:"):]
+    assert require.index("w.INPUT_OP_DETACH") < require.index("refuse(")
+    # The area is carved before any plan, the window check covers it.
+    assert t8152.index("top, input_mtp = windows_t8152_input_area(top)") < \
+        t8152.index("ahci = windows_t8152_ahci_nvme_plan(base, top, payload)")
+    assert "t8152_check_window(u.adt, ba, base, window_top, occupied)" in t8152
+    area = src[src.index("def windows_t8152_input_area"):
+               src.index("def windows_t8152_input_attach")]
+    assert "w.parse_tp_firmware(blob)" in area and "hashlib.sha256(blob).hexdigest()" in area
+    assert "print(blob" not in area and "print(payload" not in area
     failed = attach[attach.index("except ValueError as exc:\n"):]
     assert failed.index("w.INPUT_OP_DETACH") < failed.index("refuse(")
     # Merged with G0: every input refusal after USB ATTACH detaches USB before exiting.

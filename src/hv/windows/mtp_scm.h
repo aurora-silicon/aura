@@ -143,6 +143,14 @@ u32 mtp_frame_build(u8 *out, u32 outlen, u8 seq, u8 iface, u8 flags, const u8 *m
 
 #define MTP_CMD_GPIO_ACK  0xa1u
 #define MTP_CMD_ENABLE    0xb4u
+/* I2: {0x95, 2, 0, iface, u64 DVA, u32 size}: the multi-touch firmware, from a DMA buffer. */
+#define MTP_CMD_FIRMWARE  0x95u
+#define MTP_FIRMWARE_LEN  16u
+/* I2: power method 2 {0x40, 2, iface, state, has_changed, 0, 0, 0, 0}: announce, then confirm. */
+#define MTP_CMD_POWER     0x40u
+#define MTP_POWER_LEN     9u
+#define MTP_POWER_METHOD2 2u
+#define MTP_POWER_ON      2u
 #define MTP_GPIO_REFUSED  0xe000f00du /* the return code a refused GPIO request is acked with */
 
 #define MTP_MAX_IFACES 8u
@@ -189,14 +197,20 @@ u16 mtp_gpio_ack(u8 *out, u16 outlen, u32 retcode, const u8 *req, u16 req_len);
 
 /* ---- one command in flight per interface -------------------------------------------------- */
 
+#define MTP_CMD_RESP_MAX 32u
+
 struct mtp_cmd {
     bool busy, done;
     u8 iface, seq, flags, first; /* what the acknowledgement must repeat */
     u32 retcode;
     u16 resp_len;
+    u8 resp[MTP_CMD_RESP_MAX]; /* the acknowledgement's first bytes (a GET_REPORT's answer) */
 };
 
-/* Is `m` (a channel 0x11 frame) the acknowledgement of `c`?  Completes `c` when it is. */
+/*
+ * Is `m` (a channel 0x11 frame) the acknowledgement of `c`?  Completes `c` when it is, keeping
+ * up to MTP_CMD_RESP_MAX bytes of its message (byte 0 repeats the command or report ID).
+ */
 bool mtp_cmd_ack(struct mtp_cmd *c, const struct mtp_msg *m);
 
 #endif

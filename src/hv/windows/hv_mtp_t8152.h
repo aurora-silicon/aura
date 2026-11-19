@@ -6,7 +6,8 @@
 #include "types.h"
 
 /*
- * I1: the J804 (T8152) MTP owned by the Windows carrier for the internal keyboard.  Hardware
+ * I1/I2: the J804 (T8152) MTP owned by the Windows carrier for the internal keyboard and
+ * trackpad.  Hardware
  * glue for mtp_bringup.c (the protocol, pure and host-tested); hv_input.c calls it from its
  * ATTACH, STATUS and PROBE ops and from the tick and the idle path.
  *
@@ -19,7 +20,12 @@
  *    RTKit mailbox through asc.c; RUN is written by rtkit's boot, only after RUN read clear;
  *  - DMA only through stream-4 entries this side writes (mtp_dart_t8152.c) into the area;
  *    the device-written rings are Normal-NC in the carrier's own page tables;
- *  - no SMC access at all (the trackpad's AFE reset is a later step), no NVRAM;
+ *  - SMC: only with the trackpad, only before entry, only the key pcIO and only the two values
+ *    of the ADT's multi-touch function-afe-reset pKW8('pcIO', 0x10000, 0x1c0000) (level 1
+ *    asserts the AFE reset, 0 releases it), each command bounded; no other key, no audio or
+ *    speaker key, ever.  No NVRAM;
+ *  - the trackpad firmware is the launcher's copy in the area (the owner's own lifted file,
+ *    never in a repo): CRC-checked against the parameter page before it is mapped;
  *  - the MTP is serviced by polling only (lines 1500/1501 stay masked), at most every 1 ms,
  *    by one CPU at a time, never waiting; a latched failure releases the keyboard and stops.
  *
@@ -28,14 +34,16 @@
  */
 
 /*
- * Bring the MTP up to its keyboard in the reserved area [area, area + size).  `fn_fkeys`
- * selects the Fn default.  True when the keyboard reached READY; the reason is in STATUS.
- * Before guest entry only, once per carrier session.
+ * Bring the MTP up to its keyboard (and, with `trackpad`, its trackpad) in the reserved area
+ * [area, area + size).  `fn_fkeys` selects the Fn default.  True when the keyboard reached
+ * READY; the reasons are in STATUS.  Before guest entry only, once per carrier session.
  */
-bool hv_mtp_t8152_attach(u64 area, u64 size, bool fn_fkeys);
+bool hv_mtp_t8152_attach(u64 area, u64 size, bool fn_fkeys, bool trackpad);
 
 /* The keyboard is up and nothing has latched. */
 bool hv_mtp_t8152_live(void);
+/* The trackpad came up at ATTACH (FEATURES bit 18). */
+bool hv_mtp_t8152_trackpad_up(void);
 
 /* Service RTKit and the rings (rate-limited to 1 ms, one servicer, never waits). */
 void hv_mtp_t8152_poll(void);

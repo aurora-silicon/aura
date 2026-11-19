@@ -993,8 +993,8 @@ accesses (about ten per report).
 
 Status: built and host-tested only (`tests/python/test_windows_t8152_input_mtp.py`, plus the
 I1 glue cases in `test_windows_t8152_input.py` and the pool-only scenario of
-`tools/windows_rtkit_e2e.py`). Nothing of it has run on the M6, and the launcher does not ask
-for it yet (`--windows-input host+kbd` is still refused by `windows.py`). Plan and reasoning:
+`tools/windows_rtkit_e2e.py`). Nothing of it has run on the M6. The launcher asks for it with
+`--windows-input host+kbd` (I2 below adds `host+kbd+tp`). Plan and reasoning:
 `windows-m6/INPUT-I1I2-BUILD.md` and `INPUT-DESIGN.md` section 3 (owner notes, not in this
 tree). The guest ABI is unchanged: the internal keyboard arrives as the same ID 1 / ID 4
 reports as the host feed, OR-merged with it; FEATURES bit 17 says it is live.
@@ -1002,7 +1002,7 @@ reports as the host feed, OR-merged with it; FEATURES bit 17 says it is live.
 ATTACH (`P_HV_WINDOWS_INPUT` op 1) with `a1 = host | keyboard` (bit 0 | bit 1; bit 8 = Fn
 default "fkeys"), `a2/a3` = an 8 MiB, 2 MiB aligned reserved area above guest RAM, which the
 launcher carves off the top of the guest RAM window. The host source is required (the Mac-fed
-path stays the fallback); the trackpad (bit 2) is refused. `QUERY Q_SOURCES` returns 3. The
+path stays the fallback); the trackpad (bit 2) is I2 below. `QUERY Q_SOURCES` returns 7. The
 carrier then, before guest entry (`hv_mtp_t8152.c`, `mtp_bringup.c`):
 
 1. checks the live ADT: `/arm-io/mtp` `iop,ascwrap-v8` at 0x314600000 / 0x314700000, its
@@ -1033,8 +1033,8 @@ carrier then, before guest entry (`hv_mtp_t8152.c`, `mtp_bringup.c`):
 Every step is bounded; a failure stops the MTP part with a step and a reason (STATUS 23/24)
 and leaves the host source attached (ATTACH still returns 0). MMIO is limited to an
 allow-list (read: ASC_CPU_CONTROL, TCR[4], TTBR[4], the 13 PMGR states; write: the PMGR
-states only), each access under the exception guard; the mailbox goes through `asc.c`. No SMC
-access and no NVRAM access in any of these files.
+states only), each access under the exception guard; the mailbox goes through `asc.c`. No
+NVRAM access in any of these files; the only SMC access is I2's AFE reset below.
 
 Run time: polled only (lines 1500/1501 stay masked), from the boot CPU's tick before the host
 feed (1 kHz floor) and from the unlocked WFI path, one servicer at a time
@@ -1072,3 +1072,74 @@ which PMGR states are off then; TTBR/TCR/root as measured by Linux; the RTKit bu
 fitting a 1 MiB pool with no preset address; the keyboard descriptor mapping; the 1 kHz
 service keeping the syslog backlog drained; GPIO requests; the next Linux boot getting its
 keyboard back after a reboot.
+
+## I2: the M6's trackpad (relative mouse over the same MTP)
+
+Status: built and host-tested only (`windows_input_tp_host.c`, the P cases of
+`windows_mtp_bringup_host.c`, the I2 glue cases, the launcher's area, container and parameter
+page tests). Nothing of it has run on the M6. The guest ABI is unchanged: the trackpad arrives
+as report ID 3 (relative pointer: buttons, dX, dY, wheel, AC Pan; the m6input descriptor has
+all of them, so the Windows driver and image stay as they are); FEATURES bit 18 says it is
+live. Precision Touchpad reports (IDs 0x10-0x14) are a later step (I2b).
+
+Launcher: `--windows-input host+kbd+tp` (with `J804_PRIVATE_DATA` set, or
+`--windows-input-tp-fw PATH`) reads the owner's trackpad firmware container (HIDF: magic,
+version 1, header length, payload length, interface-byte offset; the owner's own file, lifted
+from their recoveryOS, never in a repo or the Windows image), checks it, and before ATTACH
+writes its payload at area + 0x700000 (at most 128 KiB) and a 64-byte parameter page at area
++ 0 (`mtp_bringup.h`: firmware size, CRC-32 and interface offset, the tunables, the page's own
+CRC-32). Only the file's SHA-256 is printed. `QUERY Q_SOURCES` must have bit 2 (7). Options:
+`--windows-input-tp-tap on|off`, `--windows-input-tp-scroll traditional|natural`,
+`--windows-input-tp-gain` (counts per mm, 6), `--windows-input-tp-accel` (3: 4x when fast),
+`--windows-input-tp-scroll-mm` (5), `--windows-input-require-mtp` (refuse to start unless
+FEATURES shows every asked source after ATTACH). The handshake's feature mask is FEATURES as
+read after ATTACH.
+
+ATTACH with `a1 = host | keyboard | trackpad`: the carrier checks the ADT's
+`iop-mtp-nub/multi-touch` `function-afe-reset` is exactly pKW8('pcIO', 0x10000, 0x1c0000),
+checks the parameter page and the firmware's CRC (a bad page or CRC: no trackpad, nothing
+mapped for it), maps the firmware's 128 KiB after the RTKit pool (DVA 0x10040514000, same
+tables), and after the keyboard is READY (a trackpad failure never costs the keyboard):
+
+1. enables "multi-touch" (`{0xb4, i}`, return code 0);
+2. writes the interface number into the firmware at its offset and cleans the buffer to the
+   PoC;
+3. **SMC `pcIO` <- 0x001c0000_00010001**: the AFE reset asserted; services the MTP for 50 ms;
+4. sends the firmware: `{0x95, 2, 0, i, u64 DVA, u32 size}`, return code 0;
+5. power method 2 "on" announced: `{0x40, 2, i, 2, 0, 0, 0, 0, 0}`, return code 0;
+6. **SMC `pcIO` <- 0x001c0000_00010000**: the AFE reset released; 50 ms;
+7. "on" confirmed: `{0x40, 2, i, 2, 1, 0, 0, 0, 0}`; waits for multi-touch READY (1 s);
+8. asks feature 0xD9 (geometry, 200 ms, optional: without it a 130 x 81 mm, 95 units/mm
+   default is used).
+
+SMC: those two writes are the carrier's only SMC access, in `op_afe_reset()` alone: key
+`pcIO` only, those two values only, only while a trackpad ATTACH runs, each command bounded
+(200 ms, `smc_set_timeout()`), through aura's own `smc.c` (the same init / write / shutdown
+path main.c uses for the N1 and SD reader pcIO lines). No other SMC key, no audio, speaker or
+amp key, ever. A failed write ends SMC access for the session. After a failure between the
+two writes the AFE is left in reset (the safe state: Linux saw an MTP SError when the line was
+released during an upload); STATUS 30 then says 1 write.
+
+Translation (`input_tp.c`, integer only): report 0x75, a 38-byte header (byte 22 the record
+count, at most 16; byte 23 bit 0 the physical click), 30-byte records (+4 X, +6 Y, Y up, +18
+touch major; 0 = not touching). Contacts are matched to the previous frame by position. One
+contact (or any while the button is down): the contact that moved most drives the pointer,
+`gain` counts per mm, times an acceleration factor rising linearly from 1 at 15 mm/s to
+1 + `accel` at 150 mm/s, remainders carried; a change in the number of contacts moves
+nothing. Physical click: left, or right when it starts with two or more contacts, latched
+until release; motion is ignored for 40 ms after it starts. Tap: one contact up within
+180 ms, travel under 1.5 mm, no click, no scroll, no internal key in the last 300 ms: left
+down and up; two contacts: right. Two contacts moving the same way: wheel / AC Pan detents
+every 5 mm (dominant axis; traditional unless natural). Three or more: nothing. 500 ms
+without frames drop held contacts and the button. A latch releases the pointer with the
+keyboard; entry and exit release the trackpad source (state only).
+
+STATUS: 23 reaches 8 (trackpad ready); 24 is reason | trackpad reason << 8 | trackpad step
+<< 16 (reasons 21-28 in `mtp_bringup.h`); 26 trackpad frames | bad << 32; 30 SMC pcIO writes
+| failed << 16. ATTACH logs the trackpad's step, firmware DVA and size, the SMC writes, the
+geometry and the multi-touch descriptor in hex; PROBE logs its frames and translations.
+
+Not verified (each needs the M6): the multi-touch descriptor and the 38 + 30n frame layout on
+J804; the 0xD9 answer and the real resolution; whether the MTP asks for GPIO pulses on the
+AFE line (refused); the SMC staying healthy after the two writes; the haptic click with the
+actuator never enabled; the tunables (gain, acceleration, scroll travel, tap limits).

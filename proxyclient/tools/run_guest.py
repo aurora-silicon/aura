@@ -3,7 +3,7 @@
 import sys, pathlib, traceback
 sys.path.append(str(pathlib.Path(__file__).resolve().parents[1]))
 
-import argparse, pathlib, time
+import argparse, hashlib, pathlib, time
 from io import BytesIO
 
 def volumespec(s):
@@ -124,14 +124,38 @@ parser.add_argument('--windows-gpu', default='off', metavar='{off,admit,log}',
 parser.add_argument('--windows-gpu-pool-mib', type=int, default=256,
                     help='T8152 G0: the GPU pool, carved from the top of guest RAM (multiple of '
                          '32, at most half of guest RAM). Default 256.')
-parser.add_argument('--windows-input', default='off', metavar='{off,host}',
-                    help='T8152 I0: the carrier\'s input device (page 0xF50000000, SPI 991) '
-                         'fed from this Mac: "host" lets proxyclient/aura/windows.py input '
-                         'frames on the vUART CDC port (/dev/cu.usbmodemP_03 RX) type and '
-                         'point in Windows. Default off. Needs an input FD (Mu '
-                         'J804_WINDOWS_INPUT, marker J804INP1 at 0x140), --windows-serial cdc '
-                         'and the m6input driver in the Windows image. host+kbd/host+kbd+tp '
-                         '(the internal keyboard and trackpad) are not in this carrier yet.')
+parser.add_argument('--windows-input', default='off', metavar='{off,host,host+kbd,host+kbd+tp}',
+                    help='T8152 I0-I2: the carrier\'s input device (page 0xF50000000, SPI 991). '
+                         '"host" is fed from this Mac (proxyclient/aura/windows.py input frames '
+                         'on the vUART CDC port, /dev/cu.usbmodemP_03 RX); "host+kbd" adds the '
+                         'M6\'s own keyboard and "host+kbd+tp" its trackpad too, both through '
+                         'the MTP, which the carrier brings up before entry in an 8 MiB area '
+                         'carved off the top of the guest RAM window (leave such a session only '
+                         'by a reboot). Default off. Needs an input FD (Mu J804_WINDOWS_INPUT, '
+                         'marker J804INP1 at 0x140), --windows-serial cdc and the m6input '
+                         'driver in the Windows image.')
+parser.add_argument('--windows-input-fn-default', choices=('media', 'fkeys'), default='media',
+                    help='T8152 I1: the internal keyboard\'s top row without Fn: media keys '
+                         '(default, as macOS) or F1-F12.')
+parser.add_argument('--windows-input-require-mtp', action='store_true',
+                    help='T8152 I1/I2: refuse to start the guest unless every asked internal '
+                         'source (keyboard, trackpad) came up at ATTACH.')
+parser.add_argument('--windows-input-tp-fw', type=pathlib.Path, default=None,
+                    help='T8152 I2: the trackpad firmware container (HIDF, the owner\'s own file '
+                         'lifted from their recoveryOS; never in a repo). Default '
+                         '$J804_PRIVATE_DATA/firmware/tpmtfw-j804.bin.')
+parser.add_argument('--windows-input-tp-tap', choices=('on', 'off'), default='on',
+                    help='T8152 I2: tap to click (one finger left, two right). Default on.')
+parser.add_argument('--windows-input-tp-scroll', choices=('traditional', 'natural'),
+                    default='traditional',
+                    help='T8152 I2: two-finger scroll direction. Default traditional.')
+parser.add_argument('--windows-input-tp-gain', type=float, default=6.0,
+                    help='T8152 I2: pointer counts per mm of finger travel when slow. Default 6.')
+parser.add_argument('--windows-input-tp-accel', type=float, default=3.0,
+                    help='T8152 I2: pointer acceleration: the extra factor reached at 150 mm/s '
+                         '(0 = none). Default 3 (4x gain when fast).')
+parser.add_argument('--windows-input-tp-scroll-mm', type=float, default=5.0,
+                    help='T8152 I2: finger travel per wheel or pan detent. Default 5 mm.')
 parser.add_argument('--windows-serror', choices=('abort', 'continue'), default='abort',
                     help='What a guest (lower-EL) SError does after the carrier has printed its '
                          'report: "abort" exits the guest (default, unchanged); "continue" logs '
@@ -620,6 +644,60 @@ def windows_t8152_input_plan(payload, u):
 def windows_t8152_input_attach(hv, sources):
     """After USB, before hv.start(): QUERY the contract, ATTACH, then (only then) write Mu's
     /chosen/aura,windows-input-v1.  A refusal stops the launch."""
+def windows_t8152_input_area(top):
+    """I1/I2, before any plan: with the internal keyboard (and trackpad), carve the 8 MiB MTP
+    area off the window top and, with the trackpad, read and check the owner's firmware and
+    build the parameter page.  Returns (new top, the area plan or None).  Nothing on the
+    machine changes here."""
+    from aura import windows as w
+    try:
+        sources = w.parse_windows_input(args.windows_input)
+        w.input_attach_mask(sources, args.windows_input_fn_default)
+        if not w.input_needs_area(sources):
+            if args.windows_input_require_mtp or args.windows_input_tp_fw:
+                raise ValueError("--windows-input-require-mtp and --windows-input-tp-fw need "
+                                 "--windows-input host+kbd or host+kbd+tp")
+            return top, None
+        base, new_top = w.plan_t8152_input_area(top)
+        mtp = {"base": base, "size": w.INPUT_AREA_SIZE, "payload": None, "params": None}
+        if "tp" in sources:
+            path = args.windows_input_tp_fw or w.default_tp_firmware_path()
+            if path is None:
+                raise ValueError("no trackpad firmware: pass --windows-input-tp-fw or set "
+                                 "J804_PRIVATE_DATA (firmware/tpmtfw-j804.bin there)")
+            try:
+                blob = pathlib.Path(path).read_bytes()
+            except OSError as exc:
+                raise ValueError(f"cannot read the trackpad firmware {path}: {exc.strerror}. "
+                                 "Copy the owner's own lifted file there (never into a repo)")
+            payload, iface_off = w.parse_tp_firmware(blob)
+            opts = w.TpOptions(tap=args.windows_input_tp_tap == 'on',
+                               natural=args.windows_input_tp_scroll == 'natural',
+                               gain=args.windows_input_tp_gain,
+                               accel=args.windows_input_tp_accel,
+                               scroll_mm=args.windows_input_tp_scroll_mm)
+            mtp["payload"] = payload
+            mtp["params"] = w.input_params(payload, iface_off, opts)
+            # The SHA-256 only, for the private run log; the file's bytes are never printed.
+            print(f"T8152 input: trackpad firmware {len(payload)} payload bytes, SHA-256 "
+                  f"{hashlib.sha256(blob).hexdigest()}; tap {args.windows_input_tp_tap}, scroll "
+                  f"{args.windows_input_tp_scroll}, gain {opts.gain}/mm, accel {opts.accel}, "
+                  f"{opts.scroll_mm} mm per detent")
+    except ValueError as exc:
+        sys.exit(f"T8152 launch refused: {exc}. The aura proxy keeps running; no guest was "
+                 "started.")
+    print(f"T8152 input: MTP area [{base:#x}, {base + w.INPUT_AREA_SIZE:#x}) carved off the "
+          f"window top {top:#x}; guest RAM and everything else plan below {new_top:#x}")
+    return new_top, mtp
+
+
+def windows_t8152_input_attach(hv, sources, usb_ports=(), mtp=None):
+    """After USB (and G0), before hv.start(): QUERY the contract, ATTACH, then (only then)
+    write Mu's /chosen/aura,windows-input-v1.  A refusal stops the launch.  USB was attached
+    first, so every refusal here detaches it again, as the GPU and hv.start() failure paths
+    do: no xHCI passthrough or DART map of guest RAM outlives a launch with no guest.  With
+    the internal keyboard/trackpad, the parameter page and the firmware go into the area first
+    and ATTACH brings the MTP up (seconds, no link timeout)."""
     from aura import windows as w
     if not sources:
         return
@@ -634,6 +712,48 @@ def windows_t8152_input_attach(hv, sources):
         sys.exit(f"T8152: the resident refused the input device: "
                  f"{w.describe_input_attach(result)} (its console says why). The carrier "
                  "session is used up: reload the carrier. No guest was started.")
+        refuse(f"T8152: the resident's input device is not this launcher's contract: {exc}. "
+               "No guest was started; the carrier session is used up: reload the carrier.")
+    mask = w.input_attach_mask(sources, args.windows_input_fn_default)
+    if mtp:
+        try:
+            w.check_input_sources(sources,
+                                  p.hv_windows_input(w.INPUT_OP_QUERY, w.INPUT_Q["sources"]))
+        except (ValueError, ProxyRemoteError) as exc:
+            refuse(f"T8152 launch refused: {exc}. No guest was started; reload the carrier.")
+        if mtp["payload"] is not None:
+            iface.writemem(mtp["base"] + w.INPUT_AREA_FW, mtp["payload"])
+            iface.writemem(mtp["base"], mtp["params"])
+        print("T8152 input: ATTACH brings the MTP up (keyboard"
+              f"{', trackpad' if 'tp' in sources else ''}); from here on leave only by a reboot")
+        result = no_timeout(p.hv_windows_input, w.INPUT_OP_ATTACH, mask, mtp["base"], mtp["size"])
+    else:
+        result = p.hv_windows_input(w.INPUT_OP_ATTACH, mask)
+    if result != 0:
+        refuse(f"T8152: the resident refused the input device: "
+               f"{w.describe_input_attach(result)} (its console says why). The carrier "
+               "session is used up: reload the carrier. No guest was started.")
+    # The handshake carries FEATURES as they are after ATTACH: bits 17/18 only for what is live.
+    features = p.hv_windows_input(w.INPUT_OP_QUERY, w.INPUT_Q["features"])
+    if mtp:
+        live, down = w.input_live_sources(sources, features)
+        print(f"T8152 input: live sources {'+'.join(live)}"
+              f"{'; NOT up: ' + '+'.join(down) if down else ''} (FEATURES {features:#x})")
+        if down:
+            try:
+                st = {name: p.hv_windows_input(w.INPUT_OP_STATUS, index)
+                      for name, index in w.INPUT_STATUS_MTP.items()}
+                print(f"T8152 input: {w.describe_mtp_status(st)}")
+            except ProxyRemoteError:
+                pass
+        if down and args.windows_input_require_mtp:
+            try:
+                p.hv_windows_input(w.INPUT_OP_DETACH)
+            except ProxyRemoteError:
+                pass
+            refuse(f"T8152: --windows-input-require-mtp: {'+'.join(down)} did not come up (the "
+                   "resident's console says why). No guest was started. Leave by a reboot "
+                   "(the MTP may be running and DMAing into the area).")
     try:
         hv.set_windows_input_handshake(w.input_handshake(sources, features))
     except ValueError as exc:
@@ -666,6 +786,15 @@ def windows_t8152_input_status(sources):
           f"gaps, {st['watchdog']} watchdog releases; {st['reports']} reports queued, "
           f"{st['dropped']} dropped, high water {st['high_water']}; driver CTRL "
           f"{st['ctrl']:#x}, LEDs {st['leds']:#x}, {st['bad_access']} bad accesses")
+    if w.input_needs_area(sources):
+        try:
+            mst = {name: p.hv_windows_input(w.INPUT_OP_STATUS, index)
+                   for name, index in w.INPUT_STATUS_MTP.items()}
+            print(f"T8152 input at exit: {w.describe_mtp_status(mst)}")
+        except ProxyRemoteError as exc:
+            print(f"T8152 input: MTP status unavailable: {exc}")
+        print("T8152 input: the MTP keeps running and DMAing into its area: leave this session "
+              "only by a reboot (P_REBOOT through the carrier), never by loading something else")
 
 
 def windows_t8152_ahci_attach(hv, u, ahci):
@@ -745,6 +874,9 @@ def run_windows_t8152(caps):
     if not args.windows_guest_ram or ":" not in args.windows_guest_ram:
         sys.exit("T8152 needs --windows-guest-ram BASE:TOP (see docs/windows-t8152.md)")
     base, top = (number(v, "guest RAM") for v in args.windows_guest_ram.split(":", 1))
+    window_top = top
+    # I1/I2: the MTP area comes off the window top first; every plan below uses the new top.
+    top, input_mtp = windows_t8152_input_area(top)
     payload = args.payload.read_bytes()
     if ahci_nvme_requested():
         ahci = windows_t8152_ahci_nvme_plan(base, top, payload)
@@ -761,7 +893,7 @@ def run_windows_t8152(caps):
                 ("live ADT", adt_pa, ba.devtree_size)]
     if ba.video.base and ba.video.stride and ba.video.height:
         occupied.append(("scanout", ba.video.base, ba.video.stride * ba.video.height))
-    t8152_check_window(u.adt, ba, base, top, occupied)
+    t8152_check_window(u.adt, ba, base, window_top, occupied)
     usb_ports = windows_t8152_usb_plan(payload, u)
     gpu_mode = windows_t8152_gpu_plan(u)
     input_sources = windows_t8152_input_plan(payload, u)
@@ -825,7 +957,7 @@ def run_windows_t8152(caps):
     try:
         windows_t8152_usb_attach(hv, usb_ports, ahci)
         windows_t8152_gpu_admit(hv, gpu_mode, usb_ports, ahci)
-        windows_t8152_input_attach(hv, input_sources, usb_ports)
+        windows_t8152_input_attach(hv, input_sources, usb_ports, input_mtp)
     except BaseException:
         if nvme:
             # D5: the NVMe disk is attached; never leave it owning the controller.

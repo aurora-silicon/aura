@@ -59,9 +59,33 @@ static void keyboard_report(struct mtp_bringup *b, const struct mtp_msg *m)
     int rc = kbd_translate(&b->kbd, &b->kst, b->fn_mode, m->data, m->len, &mods, keys, &consumer);
     if (rc == KBD_T_UPDATE) {
         b->kbd_reports++;
+        for (u32 i = 0; i < KBD_BITMAP_BYTES; i++)
+            if (keys[i]) {
+                tp_note_key(&b->tp, now(b)); /* typing: no taps for a while */
+                break;
+            }
         b->ops->keyboard(b->ops->ctx, mods, keys, consumer);
     } else if (rc < 0) {
         b->kbd_bad++;
+    }
+}
+
+static void trackpad_report(struct mtp_bringup *b, const struct mtp_msg *m)
+{
+    if (!b->tp_live) {
+        b->tp_other++;
+        return;
+    }
+    struct tp_report out[TP_MAX_REPORTS];
+    int n = tp_frame(&b->tp, m->data, m->len, now(b), out);
+    if (n < 0) {
+        b->tp_bad++;
+        return;
+    }
+    b->tp_frames++;
+    for (int i = 0; i < n; i++) {
+        b->tp_reports++;
+        b->ops->pointer(b->ops->ctx, &out[i]);
     }
 }
 
@@ -105,6 +129,10 @@ static void handle_frame(struct mtp_bringup *b, const u8 *f, u32 len)
     }
     if (b->kbd_iface >= 0 && m.iface == (u8)b->kbd_iface) {
         keyboard_report(b, &m);
+        return;
+    }
+    if (b->tp_iface >= 0 && m.iface == (u8)b->tp_iface) {
+        trackpad_report(b, &m);
         return;
     }
     b->other_frames++;
@@ -152,14 +180,15 @@ static bool scm_send_bounded(struct mtp_bringup *b, u64 msg, u32 ms)
 /*
  * Put one command on the TX ring and ring the doorbell.  One command in flight: false when
  * one is still waiting, or the ring or the mailbox refused it (`*fatal` then says why).
+ * Interface 0 takes SET_REPORT commands; a GET_REPORT goes to the interface it reads.
  */
-static bool send_cmd(struct mtp_bringup *b, const u8 *msg, u16 n, int *fatal)
+static bool send_to(struct mtp_bringup *b, u8 iface, u8 flags, const u8 *msg, u16 n, int *fatal)
 {
     *fatal = MTP_E_NONE;
     if (b->cmd.busy)
         return false;
-    u32 len = mtp_frame_build(b->tx_buf, sizeof(b->tx_buf), b->comm_seq, 0, MTP_FLAGS_SET_FEATURE,
-                              msg, n);
+    u8 seq = b->seq[iface % MTP_MAX_IFACES];
+    u32 len = mtp_frame_build(b->tx_buf, sizeof(b->tx_buf), seq, iface, flags, msg, n);
     int rc = len ? mtp_ring_tx(&b->tx, b->tx_buf, len) : MTP_TX_BAD_FRAME;
     if (rc == MTP_TX_FULL)
         return false;
@@ -167,12 +196,9 @@ static bool send_cmd(struct mtp_bringup *b, const u8 *msg, u16 n, int *fatal)
         *fatal = MTP_E_TX;
         return false;
     }
-    b->cmd = (struct mtp_cmd){.busy = true,
-                              .iface = 0,
-                              .seq = b->comm_seq,
-                              .flags = MTP_FLAGS_SET_FEATURE,
+    b->cmd = (struct mtp_cmd){.busy = true, .iface = iface, .seq = seq, .flags = flags,
                               .first = msg[0]};
-    b->comm_seq++;
+    b->seq[iface % MTP_MAX_IFACES]++;
     b->cmd_sent_us = now(b);
     if (!scm_send_bounded(b, MTP_SCM_AP_DOORBELL, MTP_T_SEND_MS)) {
         *fatal = MTP_E_SCM_SEND;
@@ -188,6 +214,11 @@ static void cmd_expire(struct mtp_bringup *b)
         b->cmd.busy = false;
         b->cmd_timeouts++;
     }
+}
+
+static bool send_cmd(struct mtp_bringup *b, const u8 *msg, u16 n, int *fatal)
+{
+    return send_to(b, 0, MTP_FLAGS_SET_FEATURE, msg, n, fatal);
 }
 
 static int send_pending(struct mtp_bringup *b)
@@ -245,13 +276,16 @@ static int map_rings(struct mtp_bringup *b)
     } maps[] = {{MTP_AREA_TX, MTP_RING_BYTES, &b->tx_dva},
                 {MTP_AREA_RX, MTP_RING_BYTES, &b->rx_dva},
                 {MTP_AREA_WAKE, MTP_WAKE_BYTES, &b->wake_dva},
-                {MTP_AREA_POOL, MTP_AREA_POOL_SIZE, &b->pool_dva}};
-    for (u32 i = 0; i < 4; i++)
+                {MTP_AREA_POOL, MTP_AREA_POOL_SIZE, &b->pool_dva},
+                {MTP_AREA_FW, MTP_AREA_FW_SIZE, &b->fw_dva}};
+    /* The firmware buffer (I2) after the pool, only when the trackpad is wanted. */
+    u32 count = b->want_tp ? 5 : 4;
+    for (u32 i = 0; i < count; i++)
         if (mtp_dart_map(&b->dart, b->area_pa + maps[i].off, maps[i].size, maps[i].dva))
             return MTP_E_MAP;
     b->ops->dart_sync(b->ops->ctx);
     /* Every page, through this side's own walk (never a DART register). */
-    for (u32 i = 0; i < 4; i++)
+    for (u32 i = 0; i < count; i++)
         for (u64 off = 0; off < maps[i].size; off += MTP_DART_PAGE) {
             u64 pa;
             if (!mtp_dart_lookup(&b->dart, *maps[i].dva + off, &pa) ||
@@ -303,6 +337,9 @@ static int start_scm(struct mtp_bringup *b)
     return MTP_E_NONE;
 }
 
+
+/* INIT for the keyboard (and, I2, multi-touch).  A missing multi-touch INIT costs only the
+ * trackpad (tp_iface stays -1). */
 static int wait_init(struct mtp_bringup *b)
 {
     u64 deadline = now(b) + (u64)MTP_T_INIT_MS * 1000;
@@ -311,55 +348,259 @@ static int wait_init(struct mtp_bringup *b)
         if (rc)
             return rc;
         int k = mtp_comm_find(&b->comm, "keyboard");
-        if (k >= 0 && b->comm.iface[k].complete) {
+        int t = b->want_tp ? mtp_comm_find(&b->comm, "multi-touch") : -1;
+        bool kd = k >= 0 && b->comm.iface[k].complete;
+        bool td = t >= 0 && b->comm.iface[t].complete;
+        /* A keyboard INIT without a descriptor needs no more waiting: it is refused at once. */
+        bool kbd_dead = kd && !b->comm.iface[k].desc_len;
+        if (kd && (td || !b->want_tp || kbd_dead)) {
             b->kbd_iface = k;
+            b->tp_iface = td ? t : -1;
             return MTP_E_NONE;
         }
-        if (now(b) >= deadline)
-            return MTP_E_INIT_TIMEOUT;
+        if (now(b) >= deadline) {
+            if (!kd)
+                return MTP_E_INIT_TIMEOUT;
+            b->kbd_iface = k;
+            b->tp_iface = -1;
+            return MTP_E_NONE;
+        }
     }
 }
 
-static int enable_keyboard(struct mtp_bringup *b)
+/*
+ * One command and its acknowledgement within `ms`: MTP_E_NONE when it was acknowledged with
+ * return code 0; `e_ack` without an acknowledgement, `e_ret` with another return code; the
+ * transport's own reason when the ring, the mailbox or RTKit failed.
+ */
+static int command(struct mtp_bringup *b, u8 iface, u8 flags, const u8 *msg, u16 n, u32 ms,
+                   int e_ack, int e_ret)
 {
-    u8 msg[2] = {MTP_CMD_ENABLE, (u8)b->kbd_iface};
-    u64 deadline = now(b) + (u64)MTP_T_CMD_MS * 1000;
+    u64 deadline = now(b) + (u64)ms * 1000;
     int fatal;
-    while (!send_cmd(b, msg, sizeof(msg), &fatal)) {
+    while (!send_to(b, iface, flags, msg, n, &fatal)) {
         if (fatal)
             return fatal;
         int rc = pump(b); /* a GPIO refusal may hold the command slot */
         if (rc)
             return rc;
         if (now(b) >= deadline)
-            return MTP_E_KBD_ACK;
+            return e_ack;
     }
     while (b->cmd.busy) {
         int rc = pump(b);
         if (rc)
             return rc;
-        if (now(b) >= deadline || !b->cmd.busy)
+        if (now(b) >= deadline)
             break;
     }
-    if (!b->cmd.done || b->cmd.first != MTP_CMD_ENABLE)
-        return MTP_E_KBD_ACK;
-    if (b->cmd.retcode)
-        return MTP_E_KBD_ENABLE;
-    /* The keyboard is live from the acknowledgement: reports may come before READY. */
-    b->kbd_live = true;
-    deadline = now(b) + (u64)MTP_T_READY_MS * 1000;
-    while (!b->comm.iface[b->kbd_iface].ready) {
+    if (b->cmd.busy || !b->cmd.done || b->cmd.first != msg[0] || b->cmd.iface != iface)
+        return e_ack;
+    return b->cmd.retcode ? e_ret : MTP_E_NONE;
+}
+
+static int wait_ready(struct mtp_bringup *b, int iface, u32 ms, int e)
+{
+    u64 deadline = now(b) + (u64)ms * 1000;
+    while (!b->comm.iface[iface].ready) {
         int rc = pump(b);
         if (rc)
             return rc;
         if (now(b) >= deadline)
-            return MTP_E_KBD_READY;
+            return e;
     }
     return MTP_E_NONE;
 }
 
+/* Keep servicing for `ms` (the AFE settle times). */
+static int settle(struct mtp_bringup *b, u32 ms)
+{
+    u64 deadline = now(b) + (u64)ms * 1000;
+    while (now(b) < deadline) {
+        int rc = pump(b);
+        if (rc)
+            return rc;
+    }
+    return MTP_E_NONE;
+}
+
+static int enable_keyboard(struct mtp_bringup *b)
+{
+    u8 msg[2] = {MTP_CMD_ENABLE, (u8)b->kbd_iface};
+    int rc = command(b, 0, MTP_FLAGS_SET_FEATURE, msg, sizeof(msg), MTP_T_CMD_MS, MTP_E_KBD_ACK,
+                     MTP_E_KBD_ENABLE);
+    if (rc)
+        return rc;
+    /* The keyboard is live from the acknowledgement: reports may come before READY. */
+    b->kbd_live = true;
+    return wait_ready(b, b->kbd_iface, MTP_T_READY_MS, MTP_E_KBD_READY);
+}
+
+/* ---- I2: the parameter page and the trackpad ---------------------------------------------- */
+
+static u32 rd32(const u8 *p)
+{
+    return (u32)p[0] | (u32)p[1] << 8 | (u32)p[2] << 16 | (u32)p[3] << 24;
+}
+
+static u16 rd16(const u8 *p)
+{
+    return (u16)(p[0] | p[1] << 8);
+}
+
+u32 mtp_crc32(u32 crc, const u8 *p, u32 len)
+{
+    crc = ~crc;
+    for (u32 i = 0; i < len; i++) {
+        crc ^= p[i];
+        for (u32 k = 0; k < 8; k++)
+            crc = (crc >> 1) ^ (0xedb88320u & (0u - (crc & 1u)));
+    }
+    return ~crc;
+}
+
+int mtp_params_parse(const u8 *pg, struct mtp_params *o)
+{
+    for (u32 i = 0; i < 8; i++)
+        if (pg[i] != (u8)MTP_PARAMS_MAGIC[i])
+            return MTP_E_TP_PARAMS;
+    if (rd32(pg + 8) != MTP_PARAMS_VERSION || rd32(pg + 12) != MTP_PARAMS_LEN ||
+        mtp_crc32(0, pg, 60) != rd32(pg + 60) || rd32(pg + 16) != MTP_AREA_FW ||
+        rd32(pg + 56))
+        return MTP_E_TP_PARAMS;
+    u32 size = rd32(pg + 20), iface_off = rd32(pg + 28), flags = rd32(pg + 32);
+    if (!size || size > MTP_AREA_FW_SIZE || iface_off >= size ||
+        (flags & ~(u32)(MTP_PARAMS_TAP | MTP_PARAMS_NATURAL)))
+        return MTP_E_TP_PARAMS;
+    struct tp_config c;
+    tp_config_default(&c);
+    c.gain_q8 = rd16(pg + 36);
+    c.accel_q8 = rd16(pg + 38);
+    c.accel_lo = rd16(pg + 40);
+    c.accel_hi = rd16(pg + 42);
+    c.scroll_um = rd16(pg + 44);
+    c.tap_ms = rd16(pg + 46);
+    c.tap_travel_um = rd16(pg + 48);
+    c.tap_key_quiet_ms = rd16(pg + 50);
+    c.click_settle_ms = rd16(pg + 52);
+    c.palm_major = rd16(pg + 54);
+    c.tap = flags & MTP_PARAMS_TAP;
+    c.natural = flags & MTP_PARAMS_NATURAL;
+    if (c.gain_q8 < 16 || (c.accel_q8 && c.accel_hi <= c.accel_lo) || c.scroll_um < 500 ||
+        c.tap_ms > 1000 || c.tap_key_quiet_ms > 5000 || c.click_settle_ms > 500)
+        return MTP_E_TP_PARAMS;
+    o->fw_size = size;
+    o->fw_crc = rd32(pg + 24);
+    o->fw_iface_off = iface_off;
+    o->tp = c;
+    return MTP_E_NONE;
+}
+
+static bool tp_reason_code(int rc)
+{
+    return rc >= MTP_E_TP_PARAMS && rc <= MTP_E_TP_IDENTITY;
+}
+
+#define GEOMETRY_MISSING (-1)
+
+static int bring_up_trackpad(struct mtp_bringup *b)
+{
+    if (b->tp_iface < 0)
+        return MTP_E_TP_INIT;
+    u8 i = (u8)b->tp_iface;
+
+    b->tp_step = 1;
+    u8 en[2] = {MTP_CMD_ENABLE, i};
+    int rc = command(b, 0, MTP_FLAGS_SET_FEATURE, en, sizeof(en), MTP_T_CMD_MS, MTP_E_TP_ENABLE,
+                     MTP_E_TP_ENABLE);
+    if (rc)
+        return rc;
+
+    /* The firmware takes its interface number at iface_offset, then goes to the PoC. */
+    if (b->params.fw_iface_off)
+        b->area[MTP_AREA_FW + b->params.fw_iface_off] = i;
+    b->ops->dma_sync(b->ops->ctx, b->area_pa + MTP_AREA_FW, b->params.fw_size);
+
+    b->tp_step = 2;
+    b->afe_writes++;
+    if (!b->ops->afe_reset(b->ops->ctx, true)) {
+        b->afe_failed++;
+        return MTP_E_TP_SMC;
+    }
+    rc = settle(b, MTP_T_AFE_MS);
+    if (rc)
+        return rc;
+
+    b->tp_step = 3;
+    u8 fw[MTP_FIRMWARE_LEN] = {MTP_CMD_FIRMWARE, 2, 0, i};
+    for (u32 k = 0; k < 8; k++)
+        fw[4 + k] = (u8)(b->fw_dva >> (8 * k));
+    for (u32 k = 0; k < 4; k++)
+        fw[12 + k] = (u8)(b->params.fw_size >> (8 * k));
+    rc = command(b, 0, MTP_FLAGS_SET_FEATURE, fw, sizeof(fw), MTP_T_CMD_MS, MTP_E_TP_FW,
+                 MTP_E_TP_FW);
+    if (rc)
+        return rc;
+
+    /* Power method 2, on: announce, release the AFE reset, settle, confirm. */
+    b->tp_step = 4;
+    u8 pw[MTP_POWER_LEN] = {MTP_CMD_POWER, MTP_POWER_METHOD2, i, MTP_POWER_ON, 0};
+    rc = command(b, 0, MTP_FLAGS_SET_FEATURE, pw, sizeof(pw), MTP_T_CMD_MS, MTP_E_TP_POWER,
+                 MTP_E_TP_POWER);
+    if (rc)
+        return rc;
+    b->tp_step = 5;
+    b->afe_writes++;
+    if (!b->ops->afe_reset(b->ops->ctx, false)) {
+        b->afe_failed++;
+        return MTP_E_TP_SMC;
+    }
+    rc = settle(b, MTP_T_AFE_MS);
+    if (rc)
+        return rc;
+    b->tp_step = 6;
+    pw[4] = 1;
+    rc = command(b, 0, MTP_FLAGS_SET_FEATURE, pw, sizeof(pw), MTP_T_CMD_MS, MTP_E_TP_POWER,
+                 MTP_E_TP_POWER);
+    if (rc)
+        return rc;
+
+    /* Live from the confirmation: frames may come before READY. */
+    b->tp_live = true;
+    b->tp_step = 7;
+    rc = wait_ready(b, i, MTP_T_READY_MS, MTP_E_TP_READY);
+    if (rc)
+        return rc;
+
+    /* Optional: the device's geometry (0xD9); without it the defaults stay. */
+    b->tp_step = 8;
+    u8 q = TP_FEATURE_GEOMETRY;
+    rc = command(b, i, MTP_FLAGS_GET_FEATURE, &q, 1, MTP_T_GEOM_MS, GEOMETRY_MISSING,
+                 GEOMETRY_MISSING);
+    if (rc && rc != GEOMETRY_MISSING)
+        return rc;
+    struct tp_geometry g;
+    u32 n = b->cmd.resp_len < MTP_CMD_RESP_MAX ? b->cmd.resp_len : MTP_CMD_RESP_MAX;
+    if (!rc && tp_parse_geometry(b->cmd.resp, n, &g) && tp_set_geometry(&b->tp, &g))
+        b->tp_geometry_device = true;
+    return MTP_E_NONE;
+}
+
+static int latch(struct mtp_bringup *b, int reason);
+
+static void tp_down(struct mtp_bringup *b, int reason)
+{
+    struct tp_report r;
+    bool was = b->tp_live;
+    b->tp_live = false;
+    b->tp_reason = (u8)reason;
+    tp_release(&b->tp, &r);
+    if (was)
+        b->ops->pointer(b->ops->ctx, &r);
+}
+
 int mtp_bringup_attach(struct mtp_bringup *b, const struct mtp_ops *ops, u64 area_pa,
-                       void *area, enum kbd_fn_mode fn_mode)
+                       void *area, enum kbd_fn_mode fn_mode, bool want_tp)
 {
     zero(b, sizeof(*b));
     b->ops = ops;
@@ -367,15 +608,31 @@ int mtp_bringup_attach(struct mtp_bringup *b, const struct mtp_ops *ops, u64 are
     b->area = area;
     b->fn_mode = fn_mode;
     b->kbd_iface = -1;
+    b->tp_iface = -1;
     b->t_start = now(b);
     mtp_comm_init(&b->comm);
     kbd_state_init(&b->kst);
+    struct tp_config defaults;
+    tp_config_default(&defaults);
+    tp_init(&b->tp, &defaults);
     reached(b, MTP_ST_IDENTITY); /* the glue checked the ADT, chip and board */
 
     /* The RUN rule: read only; a running MTP is never touched. */
     b->asc_ctrl = ops->read32(ops->ctx, MTP_T8152_ASC_CPU_CTRL);
     if (b->asc_ctrl & MTP_T8152_RUN)
         return fail(b, MTP_E_RUNNING);
+
+    /* I2: the launcher's page and the firmware's CRC, before anything is mapped. */
+    if (want_tp) {
+        const u8 *a = area;
+        if (mtp_params_parse(a + MTP_AREA_PARAMS, &b->params) ||
+            mtp_crc32(0, a + MTP_AREA_FW, b->params.fw_size) != b->params.fw_crc) {
+            b->tp_reason = MTP_E_TP_PARAMS;
+        } else {
+            b->want_tp = true;
+            tp_init(&b->tp, &b->params.tp);
+        }
+    }
 
     int rc = check_dart(b);
     if (rc)
@@ -410,6 +667,19 @@ int mtp_bringup_attach(struct mtp_bringup *b, const struct mtp_ops *ops, u64 are
     if (rc)
         return fail(b, rc);
     reached(b, MTP_ST_KBD_READY);
+
+    if (b->want_tp) {
+        rc = bring_up_trackpad(b);
+        if (tp_reason_code(rc)) {
+            tp_down(b, rc); /* the keyboard stays */
+        } else if (rc) {
+            latch(b, rc); /* the transport failed: everything stops, all up */
+            b->tp_reason = (u8)rc;
+            return rc;
+        } else {
+            reached(b, MTP_ST_TP_READY);
+        }
+    }
     return MTP_E_NONE;
 }
 
@@ -432,7 +702,8 @@ void mtp_bringup_app_msg(struct mtp_bringup *b, u8 ep, u64 msg)
     }
 }
 
-/* Latch a run-time failure: the keyboard all up, once; nothing is serviced after it. */
+/* Latch a run-time failure: the keyboard and the pointer all up, once; nothing is serviced
+ * after it. */
 static int latch(struct mtp_bringup *b, int reason)
 {
     static const u8 none[KBD_BITMAP_BYTES];
@@ -441,6 +712,8 @@ static int latch(struct mtp_bringup *b, int reason)
     kbd_release_all(&b->kst);
     if (was)
         b->ops->keyboard(b->ops->ctx, 0, none, 0);
+    if (b->tp_live)
+        tp_down(b, MTP_E_NONE); /* the trackpad itself did not fail: the reason says why */
     return -1;
 }
 
@@ -463,5 +736,10 @@ int mtp_bringup_poll(struct mtp_bringup *b, u32 max_frames)
     int rc = send_pending(b);
     if (rc)
         return latch(b, rc);
+    if (b->tp_live) {
+        struct tp_report r;
+        if (tp_idle(&b->tp, now(b), &r)) /* silence: drop held contacts and the button */
+            b->ops->pointer(b->ops->ctx, &r);
+    }
     return n + w;
 }

@@ -116,6 +116,13 @@ void hv_input_internal_keyboard(u8 mods, const u8 keys[INPUT_KBD_BITMAP], u16 co
     spin_unlock(&input_lock);
 }
 
+void hv_input_internal_pointer(u8 buttons, s16 dx, s16 dy, s8 wheel, s8 pan)
+{
+    spin_lock(&input_lock);
+    input_model_set_relative(&model, INPUT_SRC_TRACKPAD, buttons, dx, dy, wheel, pan);
+    spin_unlock(&input_lock);
+}
+
 static bool mtp_service_now(void)
 {
     return __atomic_load_n(&attached, __ATOMIC_ACQUIRE) && (sources & HV_INPUT_SRC_KEYBOARD) &&
@@ -193,14 +200,19 @@ static s64 attach(u64 mask, u64 area_base, u64 area_size)
         return HV_INPUT_E_SOURCES;
     }
     if (src & ~(u64)HV_INPUT_SRC_SUPPORTED) {
-        printf("HV: T8152: input: attach refused: source mask 0x%lx asks for the trackpad, which "
-               "this carrier does not run yet (host and internal keyboard only)\n",
+        printf("HV: T8152: input: attach refused: source mask 0x%lx has a source this carrier "
+               "does not run\n",
                mask);
         return HV_INPUT_E_SOURCES;
     }
     if (!(src & HV_INPUT_SRC_HOST)) {
         printf("HV: T8152: input: attach refused: the internal keyboard needs the host source "
                "too (the Mac-fed path stays the fallback)\n");
+        return HV_INPUT_E_SOURCES;
+    }
+    if ((src & HV_INPUT_SRC_TRACKPAD) && !(src & HV_INPUT_SRC_KEYBOARD)) {
+        printf("HV: T8152: input: attach refused: the trackpad needs the internal keyboard too "
+               "(one MTP bring-up serves both)\n");
         return HV_INPUT_E_SOURCES;
     }
     bool kbd = src & HV_INPUT_SRC_KEYBOARD;
@@ -306,13 +318,20 @@ u64 hv_input_proxy(u64 op, u64 a1, u64 a2, u64 a3)
              * The MTP outside input_lock: its keyboard updates take the lock.  A failure keeps
              * the host source: ATTACH returns 0 and FEATURES lacks bit 17.
              */
-            bool up = hv_mtp_t8152_attach(a2, a3, a1 & HV_INPUT_OPT_FN_FKEYS);
+            bool tp = sources & HV_INPUT_SRC_TRACKPAD;
+            bool up = hv_mtp_t8152_attach(a2, a3, a1 & HV_INPUT_OPT_FN_FKEYS, tp);
+            bool tp_up = up && tp && hv_mtp_t8152_trackpad_up();
             spin_lock(&input_lock);
             if (up)
                 model.features |= INPUT_FEAT_SRC_KBD;
+            if (tp_up)
+                model.features |= INPUT_FEAT_SRC_TP;
             spin_unlock(&input_lock);
-            printf("HV: T8152: input: internal keyboard %s\n",
-                   up ? "live (FEATURES bit 17)" : "not available; host input only");
+            printf("HV: T8152: input: internal keyboard %s%s\n",
+                   up ? "live (FEATURES bit 17)" : "not available; host input only",
+                   !tp      ? ""
+                   : tp_up  ? "; trackpad live (FEATURES bit 18)"
+                            : "; trackpad not available");
             return 0;
         }
         case HV_INPUT_OP_PROBE:
@@ -409,6 +428,7 @@ void hv_input_guest_entered(void)
     input_model_host_restart(&model);
     /* Keys the internal keyboard held before entry: its next report sends the full state. */
     input_model_release(&model, INPUT_SRC_INTERNAL);
+    input_model_release(&model, INPUT_SRC_TRACKPAD);
     model.host_last = now_ticks();
     entered = true;
     spin_unlock(&input_lock);
@@ -429,10 +449,11 @@ void hv_input_guest_exited(int status_code)
     exited = true;
     input_model_release(&model, INPUT_SRC_HOST);
     input_model_release(&model, INPUT_SRC_INTERNAL);
+    input_model_release(&model, INPUT_SRC_TRACKPAD);
     spin_unlock(&input_lock);
     printf("HV: T8152: input: guest exit %d: host keys and buttons released%s\n", status_code,
-           (sources & HV_INPUT_SRC_KEYBOARD) ? ", internal keyboard released (the MTP is left "
-                                               "running: leave by a reboot)"
+           (sources & HV_INPUT_SRC_KEYBOARD) ? ", internal keyboard and trackpad released (the "
+                                               "MTP is left running: leave by a reboot)"
                                              : "");
     hv_input_report();
 }

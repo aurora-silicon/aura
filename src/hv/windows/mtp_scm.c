@@ -345,5 +345,7 @@ bool mtp_cmd_ack(struct mtp_cmd *c, const struct mtp_msg *m)
     c->done = true;
     c->retcode = m->retcode;
     c->resp_len = m->len;
+    for (u32 i = 0; i < MTP_CMD_RESP_MAX; i++)
+        c->resp[i] = i < m->len ? m->data[i] : 0;
     return true;
 }

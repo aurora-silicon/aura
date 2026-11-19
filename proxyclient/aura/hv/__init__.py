@@ -1759,7 +1759,7 @@ class HV(Reloadable):
             if self.windows_input != "off":
                 from ..windows import parse_windows_input
                 if not parse_windows_input(self.windows_input):
-                    raise ValueError("windows_input must be off or host")
+                    raise ValueError("windows_input must be off, host, host+kbd or host+kbd+tp")
                 if self.windows_gic_cpuif != "software":
                     raise ValueError("T8152 input: the input interrupt needs the software GIC "
                                      "CPU interface")

@@ -26,6 +26,21 @@
  *   B12 run time: RTKit failure and ring index corruption latch; polls after a latch do nothing
  *   B13 run time: at most max_frames frames per poll; the wake ring is drained too
  *   B14 the mailbox busy at times: sends are retried, never lost
+ *   I2 (the trackpad; the keyboard-only cases above make no AFE call and map no firmware):
+ *   P1  happy path: multi-touch enabled, the firmware's interface byte patched and written
+ *       back, AFE asserted, >= 50 ms, 0x95 with the firmware's DVA (readable through the fake's
+ *       own stream-4 walk) and size, power "on" announced while still in reset, AFE released,
+ *       >= 50 ms, "on" confirmed, READY, 0xD9 geometry applied; exactly two AFE calls (assert,
+ *       release); finger frames become pointer reports; the firmware DVA follows the pool
+ *   P2  a bad parameter page or firmware CRC: no trackpad, nothing mapped for it, no AFE call,
+ *       the keyboard up
+ *   P3  no multi-touch INIT, the enable refused: no AFE call, the keyboard up
+ *   P4  the AFE assert fails: no further AFE call, no firmware sent
+ *   P5  0x95 unacknowledged or refused, the power announce refused: the AFE stays asserted
+ *       (one call), the keyboard up
+ *   P6  the release fails: two calls, no confirm; no READY: the trackpad down
+ *   P7  no 0xD9 answer: the defaults stay, the trackpad up
+ *   P8  run time: a latch releases the pointer too; a silent pad drops its held button
  */
 #include <stdarg.h>
 #include <stdint.h>
@@ -59,6 +74,9 @@ struct fault {
     bool run_set, ttbr_bad, ttbr_extra, tcr_bad, root_refused, foreign, pmgr_stuck, rtkit_fail;
     bool no_fe, mbox_full, no_init, no_kbd_desc, mouse_desc, no_ack, ack_error, no_ready;
     bool gpio, busy_sometimes;
+    /* I2 */
+    bool bad_params, bad_fw_crc, no_mt_init, mt_enable_error, afe_assert_fails, afe_release_fails;
+    bool fw_no_ack, fw_error, power_error, no_tp_ready, no_geometry;
 };
 static struct fault F;
 
@@ -72,6 +90,20 @@ static u16 gpio_ack_len;
 static u64 app_q[64];
 static unsigned app_head, app_tail;
 static u8 kbd_seq;
+
+/* I2: the fake multi-touch side. */
+#define FW_LEN       3000u
+#define FW_IFACE_OFF 0x10u
+static bool want_tp;
+static u8 fw_payload[FW_LEN];
+static unsigned afe_calls, afe_asserts, afe_releases, mt_enables, fw_msgs, power_msgs, geom_reqs;
+static unsigned syncs, ptr_calls;
+static bool afe_asserted, fw_ok_seen;
+static u64 afe_assert_at, afe_release_at, fw_dva_seen, sync_pa, sync_size;
+static u32 fw_size_seen;
+static struct tp_report last_ptr;
+static long ptr_dx;
+static u8 mt_seq;
 
 static struct mtp_bringup B;
 
@@ -326,12 +358,63 @@ static void take_commands(void)
         put32(tx + 4, (cons + len) % cap);
         struct mtp_msg m;
         if (mtp_frame_parse(f, len, &m) != MTP_PARSE_OK || m.channel != MTP_CH_CMD ||
-            m.iface != 0 || m.flags != MTP_FLAGS_SET_FEATURE) {
+            !((m.iface == 0 && m.flags == MTP_FLAGS_SET_FEATURE) ||
+              (m.iface == 1 && m.flags == MTP_FLAGS_GET_FEATURE && m.len == 1 &&
+               m.data[0] == TP_FEATURE_GEOMETRY))) {
             printf("FAIL: a malformed command frame\n");
             failures++;
             continue;
         }
-        if (m.data[0] == MTP_CMD_ENABLE) {
+        if (m.iface == 1) {
+            /* 0xD9: width 125 mm, height 80 mm, X -6000..6500, Y -100..7900 (100 units/mm). */
+            geom_reqs++;
+            if (!F.no_geometry) {
+                u8 g[TP_GEOMETRY_LEN] = {TP_FEATURE_GEOMETRY};
+                put32(g + 1, 12500);
+                put32(g + 5, 8000);
+                const s16 v[4] = {-6000, -100, 6500, 7900};
+                memcpy(g + 9, v, 8);
+                send_to_host(MTP_CH_CMD, m.seq, 1, m.flags, 0, g, sizeof(g));
+            }
+            continue;
+        }
+        if (m.data[0] == MTP_CMD_ENABLE && m.len == 2 && m.data[1] == 1) {
+            mt_enables++;
+            send_to_host(MTP_CH_CMD, m.seq, 0, m.flags, F.mt_enable_error ? 0xe00002c2 : 0, m.data,
+                         m.len);
+        } else if (m.data[0] == MTP_CMD_FIRMWARE) {
+            fw_msgs++;
+            CHECK(m.len == 16 && m.data[1] == 2 && m.data[2] == 0 && m.data[3] == 1);
+            CHECK(afe_asserted && clock_us - afe_assert_at >= 50000);
+            fw_dva_seen = rd_le(m.data + 4, 8);
+            fw_size_seen = (u32)rd_le(m.data + 12, 4);
+            fw_ok_seen = fw_size_seen == FW_LEN;
+            for (u32 k = 0; fw_ok_seen && k < FW_LEN; k++) {
+                u8 *b = dva_ptr(fw_dva_seen + k);
+                u8 want = k == FW_IFACE_OFF ? 1 : fw_payload[k];
+                fw_ok_seen = b && *b == want;
+            }
+            CHECK(syncs == 1 && sync_pa == AREA_PA + MTP_AREA_FW && sync_size == FW_LEN);
+            if (!F.fw_no_ack)
+                send_to_host(MTP_CH_CMD, m.seq, 0, m.flags, F.fw_error ? 0xe00002bc : 0, m.data,
+                             m.len);
+        } else if (m.data[0] == MTP_CMD_POWER) {
+            power_msgs++;
+            CHECK(m.len == 9 && m.data[1] == 2 && m.data[2] == 1 && m.data[3] == 2);
+            for (u32 k = 5; k < 9 && k < m.len; k++)
+                CHECK(m.data[k] == 0);
+            bool confirm = m.data[4] == 1;
+            if (!confirm)
+                CHECK(afe_asserted && fw_msgs == 1 && power_msgs == 1);
+            else
+                CHECK(!afe_asserted && clock_us - afe_release_at >= 50000 && power_msgs == 2);
+            send_to_host(MTP_CH_CMD, m.seq, 0, m.flags, F.power_error ? 0xe00002bc : 0, m.data,
+                         m.len);
+            if (confirm && !F.no_tp_ready) {
+                u8 ready[4] = {MTP_EV_READY, 1, 0, 0};
+                send_to_host(MTP_CH_SCM_REPORT, 0, 0, MTP_FLAGS_INPUT, 0, ready, 4);
+            }
+        } else if (m.data[0] == MTP_CMD_ENABLE) {
             enables++;
             CHECK(m.len == 2 && m.data[1] == 2);
             if (!F.no_ack)
@@ -395,6 +478,8 @@ static bool scm_send(void *ctx, u64 msg)
                             send_init(2, names[i], kbd_desc, sizeof(kbd_desc));
                     } else {
                         u8 d[4] = {0x06, 0x00, 0xff, 0xc0};
+                        if (i == 1 && F.no_mt_init)
+                            continue;
                         send_init(i, names[i], i ? d : NULL, i ? 4 : 0);
                     }
                 }
@@ -422,6 +507,44 @@ static void keyboard(void *ctx, u8 mods, const u8 keys[KBD_BITMAP_BYTES], u16 co
     last_cons = consumer;
 }
 
+static bool afe_reset(void *ctx, bool assert)
+{
+    (void)ctx;
+    afe_calls++;
+    if (assert) {
+        afe_asserts++;
+        CHECK(!afe_asserted && mt_enables == 1 && !fw_msgs);
+        if (F.afe_assert_fails)
+            return false;
+        afe_asserted = true;
+        afe_assert_at = clock_us;
+    } else {
+        afe_releases++;
+        CHECK(afe_asserted && fw_msgs == 1 && power_msgs == 1);
+        if (F.afe_release_fails)
+            return false;
+        afe_asserted = false;
+        afe_release_at = clock_us;
+    }
+    return true;
+}
+
+static void dma_sync(void *ctx, u64 pa, u64 size)
+{
+    (void)ctx;
+    syncs++;
+    sync_pa = pa;
+    sync_size = size;
+}
+
+static void pointer(void *ctx, const struct tp_report *r)
+{
+    (void)ctx;
+    ptr_calls++;
+    last_ptr = *r;
+    ptr_dx += r->dx;
+}
+
 static const struct mtp_ops ops = {
     .ctx = NULL,
     .now_us = now_us,
@@ -435,6 +558,9 @@ static const struct mtp_ops ops = {
     .scm_send = scm_send,
     .keyboard = keyboard,
     .frame = NULL,
+    .pointer = pointer,
+    .afe_reset = afe_reset,
+    .dma_sync = dma_sync,
 };
 
 static void machine(void)
@@ -455,6 +581,36 @@ static void machine(void)
     gpio_ack_len = 0;
     app_head = app_tail = 0;
     kbd_seq = 0;
+    afe_calls = afe_asserts = afe_releases = mt_enables = fw_msgs = power_msgs = geom_reqs = 0;
+    syncs = ptr_calls = 0;
+    afe_asserted = fw_ok_seen = false;
+    afe_assert_at = afe_release_at = fw_dva_seen = sync_pa = sync_size = 0;
+    fw_size_seen = 0;
+    memset(&last_ptr, 0, sizeof(last_ptr));
+    ptr_dx = 0;
+    mt_seq = 0;
+    if (want_tp) {
+        /* The launcher's work: the payload and the parameter page (tp defaults). */
+        for (u32 k = 0; k < FW_LEN; k++)
+            fw_payload[k] = (u8)(k * 7 + 3);
+        memcpy(area + MTP_AREA_FW, fw_payload, FW_LEN);
+        u8 *pg = area + MTP_AREA_PARAMS;
+        memcpy(pg, MTP_PARAMS_MAGIC, 8);
+        put32(pg + 8, MTP_PARAMS_VERSION);
+        put32(pg + 12, MTP_PARAMS_LEN);
+        put32(pg + 16, MTP_AREA_FW);
+        put32(pg + 20, FW_LEN);
+        put32(pg + 24, mtp_crc32(0, fw_payload, FW_LEN));
+        put32(pg + 28, FW_IFACE_OFF);
+        put32(pg + 32, MTP_PARAMS_TAP);
+        const u16 v[10] = {6 * 256, 3 * 256, 15, 150, 5000, 180, 1500, 300, 40, 0};
+        memcpy(pg + 36, v, sizeof(v));
+        put32(pg + 60, mtp_crc32(0, pg, 60));
+        if (F.bad_params)
+            pg[3] ^= 1;
+        if (F.bad_fw_crc)
+            area[MTP_AREA_FW + 100] ^= 1;
+    }
     busy_tick = 0;
     kbd_calls = 0;
     last_mods = 0;
@@ -475,7 +631,7 @@ static void machine(void)
 static int attach(void)
 {
     machine();
-    return mtp_bringup_attach(&B, &ops, AREA_PA, area, KBD_FN_MEDIA);
+    return mtp_bringup_attach(&B, &ops, AREA_PA, area, KBD_FN_MEDIA, want_tp);
 }
 
 static void type_report(u8 mods, u8 key, bool fn)
@@ -510,6 +666,9 @@ static void b1_happy(void)
     CHECK(pool_dva_seen == 0x10040410000ull && rtkit_starts == 1);
     CHECK(root[0x11] == 0x1234567c01ull);
     CHECK(enables == 1 && B.kbd_iface == 2 && B.comm.inits == 7);
+    /* Keyboard only: no trackpad step, no AFE call, no firmware mapped. */
+    CHECK(!afe_calls && !mt_enables && !fw_msgs && !syncs && !B.fw_dva && !B.tp_live &&
+          B.tp_iface == -1);
     /* Reports. */
     type_report(0, 0x04, false);
     CHECK(mtp_bringup_poll(&B, 32) >= 1 && down(0x04) && !last_cons);
@@ -663,6 +822,147 @@ static void b14_busy(void)
     result("mbox_busy", before, NULL);
 }
 
+/* ---- I2: the trackpad ------------------------------------------------------------------------ */
+
+static void tp_frame_to_host(int x, int y, bool touching, bool button)
+{
+    u8 r[TP_HDR_LEN + TP_REC_LEN];
+    memset(r, 0, sizeof(r));
+    r[0] = TP_REPORT_ID;
+    r[TP_HDR_COUNT] = touching ? 1 : 0;
+    r[TP_HDR_BUTTON] = button ? 1 : 0;
+    u8 *f = r + TP_HDR_LEN;
+    f[TP_REC_X] = (u8)x;
+    f[TP_REC_X + 1] = (u8)((u16)x >> 8);
+    f[TP_REC_Y] = (u8)y;
+    f[TP_REC_Y + 1] = (u8)((u16)y >> 8);
+    f[TP_REC_TOUCH] = 0x80;
+    f[TP_REC_TOUCH + 1] = 0x03;
+    send_to_host(MTP_CH_SCM_REPORT, mt_seq++, 1, MTP_FLAGS_INPUT, 0, r,
+                 (u16)(TP_HDR_LEN + (touching ? TP_REC_LEN : 0)));
+}
+
+static void p1_happy(void)
+{
+    int before = failures;
+    F = (struct fault){0};
+    want_tp = true;
+    CHECK(mtp_crc32(0, (const u8 *)"123456789", 9) == 0xcbf43926u);
+    CHECK(attach() == MTP_E_NONE);
+    CHECK(B.state == MTP_ST_TP_READY && B.reason == MTP_E_NONE && !B.tp_reason && B.kbd_live &&
+          B.tp_live && B.tp_iface == 1 && B.tp_step == 8);
+    CHECK(afe_calls == 2 && afe_asserts == 1 && afe_releases == 1 && !afe_asserted);
+    CHECK(mt_enables == 1 && enables == 1 && fw_msgs == 1 && power_msgs == 2 && geom_reqs == 1);
+    CHECK(fw_ok_seen && fw_size_seen == FW_LEN && fw_dva_seen == 0x10040514000ull &&
+          B.fw_dva == fw_dva_seen);
+    CHECK(B.tp_geometry_device && B.tp.res_x == 100 && B.tp.res_y == 100);
+    CHECK(mmio_writes == 3 && !mmio_bad && B.afe_writes == 2 && !B.afe_failed);
+    CHECK(area[MTP_AREA_FW + FW_IFACE_OFF] == 1 && area[MTP_AREA_FW + FW_IFACE_OFF + 1] ==
+                                                       fw_payload[FW_IFACE_OFF + 1]);
+    /* Frames: a touch, five 1 mm moves, a click and its release. */
+    tp_frame_to_host(0, 0, true, false);
+    for (int i = 1; i <= 5; i++)
+        tp_frame_to_host(i * 100, 0, true, false);
+    mtp_bringup_poll(&B, 32);
+    CHECK(B.tp_frames == 6 && ptr_dx > 0 && !B.tp_bad);
+    tp_frame_to_host(500, 0, true, true);
+    mtp_bringup_poll(&B, 32);
+    CHECK(last_ptr.buttons == TP_BTN_LEFT);
+    tp_frame_to_host(500, 0, true, false);
+    mtp_bringup_poll(&B, 32);
+    CHECK(last_ptr.buttons == 0);
+    /* The keyboard still works next to it. */
+    type_report(0, 0x04, false);
+    mtp_bringup_poll(&B, 32);
+    CHECK(down(0x04));
+    char extra[160];
+    snprintf(extra, sizeof(extra),
+             ",\"fw_dva\":\"0x%llx\",\"afe_calls\":%u,\"tp_ready_ms\":%u,\"tables\":%u",
+             (unsigned long long)fw_dva_seen, afe_calls, B.step_ms[MTP_ST_TP_READY], B.dart.used);
+    result("tp_happy", before, extra);
+    want_tp = false;
+}
+
+static void tp_refused(const char *name, struct fault f, int reason, unsigned afe, u8 fws)
+{
+    int before = failures;
+    F = f;
+    want_tp = true;
+    CHECK(attach() == MTP_E_NONE);
+    CHECK(B.state == MTP_ST_KBD_READY && B.reason == MTP_E_NONE && B.kbd_live);
+    CHECK(B.tp_reason == reason && !B.tp_live);
+    CHECK(afe_calls == afe && fw_msgs == fws && !mmio_bad);
+    /* Trackpad frames now are counted, never translated. */
+    tp_frame_to_host(0, 0, true, true);
+    mtp_bringup_poll(&B, 32);
+    CHECK(!ptr_calls || (last_ptr.buttons == 0 && ptr_calls == 1));
+    type_report(0, 0x05, false);
+    mtp_bringup_poll(&B, 32);
+    CHECK(down(0x05));
+    result(name, before, NULL);
+    want_tp = false;
+}
+
+static void p2_p7(void)
+{
+    {
+        int before = failures;
+        F = (struct fault){.bad_params = true};
+        want_tp = true;
+        CHECK(attach() == MTP_E_NONE && B.tp_reason == MTP_E_TP_PARAMS && !B.want_tp &&
+              !B.fw_dva && !afe_calls && !mt_enables && !syncs && B.state == MTP_ST_KBD_READY);
+        F = (struct fault){.bad_fw_crc = true};
+        CHECK(attach() == MTP_E_NONE && B.tp_reason == MTP_E_TP_PARAMS && !B.fw_dva &&
+              !afe_calls && !mt_enables);
+        result("tp_params", before, NULL);
+        want_tp = false;
+    }
+    tp_refused("tp_no_init", (struct fault){.no_mt_init = true}, MTP_E_TP_INIT, 0, 0);
+    tp_refused("tp_enable", (struct fault){.mt_enable_error = true}, MTP_E_TP_ENABLE, 0, 0);
+    tp_refused("tp_afe_assert", (struct fault){.afe_assert_fails = true}, MTP_E_TP_SMC, 1, 0);
+    tp_refused("tp_fw_no_ack", (struct fault){.fw_no_ack = true}, MTP_E_TP_FW, 1, 1);
+    tp_refused("tp_fw_error", (struct fault){.fw_error = true}, MTP_E_TP_FW, 1, 1);
+    tp_refused("tp_power_error", (struct fault){.power_error = true}, MTP_E_TP_POWER, 1, 1);
+    tp_refused("tp_afe_release", (struct fault){.afe_release_fails = true}, MTP_E_TP_SMC, 2, 1);
+    tp_refused("tp_no_ready", (struct fault){.no_tp_ready = true}, MTP_E_TP_READY, 2, 1);
+    {
+        int before = failures;
+        F = (struct fault){.no_geometry = true};
+        want_tp = true;
+        CHECK(attach() == MTP_E_NONE && B.state == MTP_ST_TP_READY && B.tp_live &&
+              !B.tp_geometry_device && B.tp.res_x == 95 && geom_reqs == 1);
+        result("tp_no_geometry", before, NULL);
+        want_tp = false;
+    }
+}
+
+static void p8_runtime(void)
+{
+    int before = failures;
+    F = (struct fault){0};
+    want_tp = true;
+    CHECK(attach() == MTP_E_NONE && B.tp_live);
+    tp_frame_to_host(0, 0, true, false);
+    tp_frame_to_host(0, 0, true, true);
+    mtp_bringup_poll(&B, 32);
+    CHECK(last_ptr.buttons == TP_BTN_LEFT);
+    rtkit_failed_now = true;
+    CHECK(mtp_bringup_poll(&B, 32) == -1 && !B.tp_live && last_ptr.buttons == 0);
+    result("tp_latch", before, NULL);
+
+    before = failures;
+    CHECK(attach() == MTP_E_NONE && B.tp_live);
+    tp_frame_to_host(0, 0, true, false);
+    tp_frame_to_host(0, 0, true, true);
+    mtp_bringup_poll(&B, 32);
+    CHECK(last_ptr.buttons == TP_BTN_LEFT);
+    clock_us += 600000; /* the pad goes silent with the button down */
+    mtp_bringup_poll(&B, 32);
+    CHECK(last_ptr.buttons == 0 && B.tp.stale == 1 && B.tp_live);
+    result("tp_silence", before, NULL);
+    want_tp = false;
+}
+
 int main(void)
 {
     area = aligned_alloc(0x4000, MTP_AREA_SIZE);
@@ -673,6 +973,9 @@ int main(void)
     b10_gpio();
     b11_b13_runtime();
     b14_busy();
+    p1_happy();
+    p2_p7();
+    p8_runtime();
     free(area);
     return failures ? 1 : 0;
 }

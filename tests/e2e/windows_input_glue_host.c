@@ -128,20 +128,29 @@ bool hv_windows_guest_entered(void)
  * mtp_bringup_poll(); the spin lock stub traps if that ever happens under input_lock.
  */
 static int mtp_attaches, mtp_polls, mtp_probes, mtp_reports;
-static bool mtp_up;
+static bool mtp_up, mtp_tp_up, mtp_tp_asked;
 static u64 mtp_area, mtp_size;
 static bool mtp_fkeys;
-static bool script_pending;
+static bool script_pending, ptr_pending;
 static u8 script_mods, script_keys[20];
 static u16 script_cons;
+static u8 ptr_buttons;
+static s16 ptr_dx;
+static s8 ptr_wheel;
 
-bool hv_mtp_t8152_attach(u64 area, u64 size, bool fn_fkeys)
+bool hv_mtp_t8152_attach(u64 area, u64 size, bool fn_fkeys, bool trackpad)
 {
     mtp_attaches++;
     mtp_area = area;
     mtp_size = size;
     mtp_fkeys = fn_fkeys;
+    mtp_tp_asked = trackpad;
     return mtp_up;
+}
+
+bool hv_mtp_t8152_trackpad_up(void)
+{
+    return mtp_tp_up;
 }
 
 bool hv_mtp_t8152_live(void)
@@ -155,6 +164,10 @@ void hv_mtp_t8152_poll(void)
     if (script_pending) {
         script_pending = false;
         hv_input_internal_keyboard(script_mods, script_keys, script_cons);
+    }
+    if (ptr_pending) {
+        ptr_pending = false;
+        hv_input_internal_pointer(ptr_buttons, ptr_dx, 0, ptr_wheel, 0);
     }
 }
 
@@ -231,9 +244,11 @@ static void begin(const char *name)
     stub_cntpct = 1000;
     mtp_attaches = mtp_polls = mtp_probes = mtp_reports = 0;
     mtp_up = true;
+    mtp_tp_up = true;
+    mtp_tp_asked = false;
     mtp_area = mtp_size = 0;
     mtp_fkeys = false;
-    script_pending = false;
+    script_pending = ptr_pending = false;
 }
 
 static void end(void)
@@ -318,11 +333,14 @@ static void case_attach_refusals(void)
     board_id = 0x22;
     EQ(attach(0, 0, 0), (u64)(s64)HV_INPUT_E_SOURCES);
     EQ(attach(0x8, 0, 0), (u64)(s64)HV_INPUT_E_SOURCES);
-    /* I1: the keyboard needs the area and the host source; the trackpad is not here yet. */
+    /* I1/I2: the keyboard needs the area and the host source; the trackpad the keyboard. */
     EQ(attach(HV_INPUT_SRC_HOST | HV_INPUT_SRC_KEYBOARD, 0, 0), (u64)(s64)HV_INPUT_E_AREA);
+    EQ(attach(HV_INPUT_SRC_HOST | HV_INPUT_SRC_KEYBOARD | HV_INPUT_SRC_TRACKPAD, 0, 0),
+       (u64)(s64)HV_INPUT_E_AREA);
     EQ(attach(HV_INPUT_SRC_KEYBOARD, 0x10f00000000UL, 0x800000), (u64)(s64)HV_INPUT_E_SOURCES);
-    EQ(attach(HV_INPUT_SRC_HOST | HV_INPUT_SRC_KEYBOARD | HV_INPUT_SRC_TRACKPAD, 0x10f00000000UL,
-              0x800000),
+    EQ(attach(HV_INPUT_SRC_HOST | HV_INPUT_SRC_TRACKPAD, 0x10f00000000UL, 0x800000),
+       (u64)(s64)HV_INPUT_E_SOURCES);
+    EQ(attach(HV_INPUT_SRC_KEYBOARD | HV_INPUT_SRC_TRACKPAD, 0x10f00000000UL, 0x800000),
        (u64)(s64)HV_INPUT_E_SOURCES);
     EQ(attach(HV_INPUT_SRC_HOST | HV_INPUT_OPT_FN_FKEYS, 0, 0), (u64)(s64)HV_INPUT_E_SOURCES);
     EQ(attach(HV_INPUT_SRC_HOST | HV_INPUT_SRC_KEYBOARD | BIT(9), 0x10f00000000UL, 0x800000),
@@ -344,7 +362,7 @@ static void case_attach_refusals(void)
     EQ(hv_input_proxy(HV_INPUT_OP_QUERY, HV_INPUT_Q_SIZE, 0, 0), 0x4000);
     EQ(hv_input_proxy(HV_INPUT_OP_QUERY, HV_INPUT_Q_INTID, 0, 0), 991);
     EQ(hv_input_proxy(HV_INPUT_OP_QUERY, HV_INPUT_Q_FEATURES, 0, 0), 0x1000f);
-    EQ(hv_input_proxy(HV_INPUT_OP_QUERY, HV_INPUT_Q_SOURCES, 0, 0), 3);
+    EQ(hv_input_proxy(HV_INPUT_OP_QUERY, HV_INPUT_Q_SOURCES, 0, 0), 7);
     EQ(hv_input_proxy(HV_INPUT_OP_QUERY, 6, 0, 0), HV_INPUT_ERROR);
     EQ(hv_input_proxy(7, 0, 0, 0), HV_INPUT_ERROR);
     EQ(mtp_attaches, 0);
@@ -664,8 +682,9 @@ static void case_kbd_attach(void)
     enter();
     EQ(hv_input_proxy(HV_INPUT_OP_PROBE, 1500, 0, 0), HV_INPUT_ERROR);
     EQ(mtp_probes, 1);
+    end();
 
-    begin("kbd_attach");
+    begin("kbd_attach_down");
     hv_input_enable();
     mtp_up = false;
     EQ(attach(HV_INPUT_SRC_HOST | HV_INPUT_SRC_KEYBOARD, 0x10f00000000UL, 0x800000), 0);
@@ -739,6 +758,82 @@ static void case_kbd_merge(void)
     end();
 }
 
+/* I2 G15: ATTACH with the trackpad: it reaches the MTP glue; FEATURES bit 18 only when the
+ * trackpad came up (bit 17 alone when only the keyboard did); its pointer reports merge with
+ * the host's relative buttons; entry and exit release it. */
+static void case_tp_attach(void)
+{
+    begin("tp_attach");
+    hv_input_enable();
+    EQ(attach(HV_INPUT_SRC_HOST | HV_INPUT_SRC_KEYBOARD | HV_INPUT_SRC_TRACKPAD, 0x10f00000000UL,
+              0x800000),
+       0);
+    CHECK(mtp_tp_asked);
+    EQ(st(HV_INPUT_S_ATTACHED), 7);
+    EQ(hv_input_proxy(HV_INPUT_OP_QUERY, HV_INPUT_Q_FEATURES, 0, 0), 0x7000f);
+    /* A trackpad button held before entry is forgotten at entry. */
+    ptr_buttons = 1;
+    ptr_dx = 0;
+    ptr_wheel = 0;
+    ptr_pending = true;
+    hv_mtp_t8152_poll();
+    enter();
+    g_wr(INPUT_REG_CTRL, INPUT_CTRL_ENABLE | INPUT_CTRL_IRQ_EN, 2);
+    while (g_rd(INPUT_REG_REPORT_LEN, 2)) {
+        u64 r = g_rd(INPUT_REG_REPORT, 3);
+        CHECK((r & 0xff) != INPUT_RID_RELATIVE || !((r >> 8) & 0xff));
+        g_wr(INPUT_REG_POP, 1, 2);
+    }
+    /* Motion with the right button and a wheel detent: report ID 3. */
+    ptr_buttons = 2;
+    ptr_dx = -5;
+    ptr_wheel = -1;
+    ptr_pending = true;
+    hv_input_idle_poll();
+    EQ(g_rd(INPUT_REG_REPORT_LEN, 2), 0x0308);
+    u64 r = g_rd(INPUT_REG_REPORT, 3);
+    EQ(r & 0xff, 3);
+    EQ((r >> 8) & 0xff, 2);
+    EQ((r >> 16) & 0xffff, 0xfffb);
+    EQ((r >> 48) & 0xff, 0xff);
+    g_wr(INPUT_REG_POP, 1, 2);
+    /* Exit: released (state only). */
+    hv_input_guest_exited(0);
+    bool released = false;
+    while (g_rd(INPUT_REG_REPORT_LEN, 2)) {
+        r = g_rd(INPUT_REG_REPORT, 3);
+        if ((r & 0xff) == 3 && !((r >> 8) & 0xff))
+            released = true;
+        g_wr(INPUT_REG_POP, 1, 2);
+    }
+    CHECK(released);
+    end();
+
+    begin("tp_attach_kbd_only");
+    hv_input_enable();
+    mtp_tp_up = false; /* the keyboard came up, the trackpad did not */
+    EQ(attach(HV_INPUT_SRC_HOST | HV_INPUT_SRC_KEYBOARD | HV_INPUT_SRC_TRACKPAD, 0x10f00000000UL,
+              0x800000),
+       0);
+    EQ(hv_input_proxy(HV_INPUT_OP_QUERY, HV_INPUT_Q_FEATURES, 0, 0), 0x3000f);
+    end();
+    begin("tp_attach_none");
+    hv_input_enable();
+    mtp_up = false; /* nothing came up: the trackpad's flag is not believed either */
+    EQ(attach(HV_INPUT_SRC_HOST | HV_INPUT_SRC_KEYBOARD | HV_INPUT_SRC_TRACKPAD, 0x10f00000000UL,
+              0x800000),
+       0);
+    EQ(hv_input_proxy(HV_INPUT_OP_QUERY, HV_INPUT_Q_FEATURES, 0, 0), 0x1000f);
+    end();
+    /* The keyboard alone never asks for the trackpad. */
+    begin("kbd_attach_no_tp");
+    hv_input_enable();
+    EQ(attach(HV_INPUT_SRC_HOST | HV_INPUT_SRC_KEYBOARD, 0x10f00000000UL, 0x800000), 0);
+    CHECK(!mtp_tp_asked);
+    EQ(hv_input_proxy(HV_INPUT_OP_QUERY, HV_INPUT_Q_FEATURES, 0, 0), 0x3000f);
+    end();
+}
+
 int main(void)
 {
     case_attach_refusals();
@@ -753,5 +848,6 @@ int main(void)
     case_host_only_no_mtp();
     case_kbd_attach();
     case_kbd_merge();
+    case_tp_attach();
     return total_failures ? 1 : 0;
 }

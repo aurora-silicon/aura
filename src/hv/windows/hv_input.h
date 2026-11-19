@@ -22,11 +22,13 @@
  *          returned 0) and the FD marker "J804INP1" at 0x140.
  *
  * ATTACH runs once per carrier session, before hv_start.  Sources: the host feed (bit 0,
- * always required) and, I1, the M6's internal keyboard (bit 1): with it, a2/a3 name the 8 MiB
- * reserved MTP area and ATTACH brings the MTP up before returning (hv_mtp_t8152.c).  An MTP
- * failure leaves the host source attached and ATTACH still returns 0; FEATURES bit 17 (and
- * STATUS 23/24) say whether the keyboard is live.  The trackpad (bit 2) is refused here (I2).
- * a1 bit 8 selects the Fn default "fkeys" (F1-F12 without Fn) instead of "media".
+ * always required), I1 the M6's internal keyboard (bit 1) and I2 its trackpad (bit 2, needs
+ * the keyboard): with them, a2/a3 name the 8 MiB reserved MTP area (with the trackpad, the
+ * launcher's parameter page and firmware payload are already in it) and ATTACH brings the MTP
+ * up before returning (hv_mtp_t8152.c).  An MTP failure leaves the host source attached and
+ * ATTACH still returns 0; FEATURES bits 17/18 (and STATUS 23/24) say what is live.  The
+ * trackpad reports as the relative pointer (report ID 3).  a1 bit 8 selects the Fn default
+ * "fkeys" (F1-F12 without Fn) instead of "media".
  */
 
 #define HV_INPUT_BASE      0xf50000000UL
@@ -45,8 +47,8 @@
 /* ATTACH a1: the sources. */
 #define HV_INPUT_SRC_HOST     BIT(0)
 #define HV_INPUT_SRC_KEYBOARD BIT(1) /* I1: the internal keyboard, needs the host source */
-#define HV_INPUT_SRC_TRACKPAD BIT(2) /* I2: refused by this carrier */
-#define HV_INPUT_SRC_SUPPORTED (HV_INPUT_SRC_HOST | HV_INPUT_SRC_KEYBOARD)
+#define HV_INPUT_SRC_TRACKPAD BIT(2) /* I2: the internal trackpad, needs the keyboard */
+#define HV_INPUT_SRC_SUPPORTED (HV_INPUT_SRC_HOST | HV_INPUT_SRC_KEYBOARD | HV_INPUT_SRC_TRACKPAD)
 #define HV_INPUT_SRC_MASK      0xffUL
 /* ATTACH a1 options above the sources. */
 #define HV_INPUT_OPT_FN_FKEYS BIT(8) /* keyboard: F1-F12 without Fn, media keys with Fn */
@@ -82,13 +84,13 @@ enum hv_input_status {
     HV_INPUT_S_OWNS_RX = 22,  /* 1 while the vUART RX belongs to the host feed */
     /* I1, the MTP (hv_mtp_t8152.c; 0 without the internal keyboard): */
     HV_INPUT_S_MTP_STATE = 23,  /* enum mtp_state: furthest step, | 0x80 when it stopped there */
-    HV_INPUT_S_MTP_REASON = 24, /* enum mtp_reason */
+    HV_INPUT_S_MTP_REASON = 24, /* enum mtp_reason | trackpad reason << 8 | trackpad step << 16 */
     HV_INPUT_S_MTP_KBD = 25,    /* keyboard reports | bad reports << 32 */
-    HV_INPUT_S_MTP_TP = 26,     /* trackpad frames (I2) */
+    HV_INPUT_S_MTP_TP = 26,     /* trackpad frames | bad frames << 32 (I2) */
     HV_INPUT_S_MTP_RTKIT = 27,  /* RTKit app messages | doorbells << 32 */
     HV_INPUT_S_MTP_POLL = 28,   /* longest service call, us */
     HV_INPUT_S_MTP_ERRORS = 29, /* checksum | ring << 16 | oversize << 32 | parse << 48 */
-    HV_INPUT_S_MTP_SMC = 30,    /* SMC pcIO writes made (0 here; 0 or 2 at I2) */
+    HV_INPUT_S_MTP_SMC = 30,    /* SMC pcIO writes made | failed << 16 (0 or 2; 1 = left in reset) */
     HV_INPUT_S_MTP_GPIO = 31,   /* GPIO requests refused */
 };
 
@@ -127,6 +129,8 @@ void hv_input_idle_poll(void);
 
 /* hv_mtp_t8152.c: the internal keyboard's new state (modifiers, bitmap, consumer usage). */
 void hv_input_internal_keyboard(u8 mods, const u8 keys[20], u16 consumer);
+/* hv_mtp_t8152.c: one trackpad pointer report (button state, deltas). */
+void hv_input_internal_pointer(u8 buttons, s16 dx, s16 dy, s8 wheel, s8 pan);
 
 /* hv_vuart.c: does the host feed own the vUART's RX direction now? */
 bool hv_input_owns_vuart_rx(void);

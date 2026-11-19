@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: MIT */
 
 /*
- * I1: hardware glue for the T8152 MTP keyboard.  See hv_mtp_t8152.h for the rules and
+ * I1/I2: hardware glue for the T8152 MTP keyboard and trackpad.  See hv_mtp_t8152.h for the rules and
  * mtp_bringup.c for the protocol.  Written on this branch; no third-party source.
  */
 
@@ -15,6 +15,7 @@
 #include "memory.h"
 #include "mtp_bringup.h"
 #include "rtkit.h"
+#include "smc.h"
 #include "soc.h"
 #include "string.h"
 #include "utils.h"
@@ -23,6 +24,13 @@
 #define MTP_POLL_US       1000u
 #define MTP_PROBE_MAX_MS  10000u
 #define MTP_LOG_PER_S     50u
+
+/* I2: the ADT's multi-touch function-afe-reset, pKW8('pcIO', 0x10000, 0x1c0000). */
+#define MTP_AFE_FOURCC    "8WKp"
+#define MTP_AFE_KEY       0x7063494fu /* 'pcIO' */
+#define MTP_AFE_LO        0x10000u
+#define MTP_AFE_HI        0x1c0000u
+#define MTP_SMC_TIMEOUT_US 200000u
 
 static struct mtp_bringup mb;
 static asc_dev_t *asc;
@@ -40,8 +48,13 @@ static u64 log_window;
 /* Counters for the report and STATUS. */
 static u32 mmio_refused, mmio_faults, mem_refused;
 static u64 poll_max_us, polls, last_frames;
-static u32 reported_kbd, reported_bad;
+static u32 reported_kbd, reported_bad, reported_tp;
 static bool reported_latch;
+/* I2 */
+static bool tp_wanted, tp_up;
+static u8 tp_refused; /* the glue's own refusal (identity), kept over mtp_bringup_attach() */
+static smc_dev_t *smc;
+static u32 smc_pcio_writes, smc_pcio_failed;
 
 static u64 ticks(void)
 {
@@ -257,6 +270,67 @@ static void op_keyboard(void *ctx, u8 mods, const u8 keys[KBD_BITMAP_BYTES], u16
     hv_input_internal_keyboard(mods, keys, consumer);
 }
 
+/* ---- I2: the AFE reset (the only SMC access), the firmware buffer, the pointer ----------- */
+
+static void smc_close(void)
+{
+    if (smc) {
+        smc_shutdown(smc);
+        smc = NULL;
+    }
+}
+
+static bool op_afe_reset(void *ctx, bool assert)
+{
+    UNUSED(ctx);
+    if (!tp_wanted || hv_windows_guest_entered()) {
+        printf("HV: input: SMC pcIO write refused (no trackpad attach in progress)\n");
+        return false;
+    }
+    if (!smc) {
+        smc = smc_init();
+        if (!smc) {
+            printf("HV: input: SMC unavailable: the trackpad AFE reset was not written\n");
+            smc_pcio_failed++;
+            return false;
+        }
+        smc_set_timeout(smc, MTP_SMC_TIMEOUT_US);
+    }
+    u64 value = (u64)MTP_AFE_HI << 32 | MTP_AFE_LO | (assert ? 1 : 0);
+    printf("HV: input: SMC pcIO <- 0x%lx (trackpad AFE reset %s)\n", value,
+           assert ? "asserted" : "released");
+    int rc = smc_write_u64(smc, MTP_AFE_KEY, value);
+    smc_pcio_writes++;
+    if (rc) {
+        smc_pcio_failed++;
+        printf("HV: input: SMC pcIO write failed (%d): no further SMC access this session\n", rc);
+    }
+    if (rc || !assert)
+        smc_close();
+    return rc == 0;
+}
+
+static void op_dma_sync(void *ctx, u64 pa, u64 size)
+{
+    UNUSED(ctx);
+    u64 fw = area_pa + MTP_AREA_FW;
+    if (pa < fw || size > MTP_AREA_FW_SIZE || pa + size > fw + MTP_AREA_FW_SIZE) {
+        mem_refused++;
+        return;
+    }
+    dc_civac_range((void *)pa, size);
+    sysop("dsb sy");
+}
+
+static void op_pointer(void *ctx, const struct tp_report *r)
+{
+    UNUSED(ctx);
+    if (log_ok())
+        printf("HV: input: mtp trackpad -> buttons 0x%x dx %d dy %d wheel %d pan %d\n", r->buttons,
+               r->dx, r->dy, r->wheel, r->pan);
+    hv_input_internal_pointer(r->buttons, r->dx, r->dy, r->wheel, r->pan);
+}
+
 static const struct mtp_ops ops = {
     .ctx = NULL,
     .now_us = now_us,
@@ -270,7 +344,36 @@ static const struct mtp_ops ops = {
     .scm_send = op_scm_send,
     .keyboard = op_keyboard,
     .frame = op_frame,
+    .pointer = op_pointer,
+    .afe_reset = op_afe_reset,
+    .dma_sync = op_dma_sync,
 };
+
+/* I2: the multi-touch nub and its AFE reset, exactly the J804 function. */
+struct afe_fn {
+    u32 phandle;
+    char four_cc[4];
+    u32 key;
+    u32 lo;
+    u32 hi;
+};
+
+static bool tp_identity(void)
+{
+    u32 len = 0;
+    int mt = adt_path_offset(adt, "/arm-io/mtp/iop-mtp-nub/multi-touch");
+    const struct afe_fn *fn = mt < 0 ? NULL : adt_getprop(adt, mt, "function-afe-reset", &len);
+    if (!fn || len != sizeof(*fn) || memcmp(fn->four_cc, MTP_AFE_FOURCC, 4) ||
+        fn->key != MTP_AFE_KEY || fn->lo != MTP_AFE_LO || fn->hi != MTP_AFE_HI) {
+        printf("HV: input: trackpad refused: the ADT has no multi-touch nub with "
+               "function-afe-reset pKW8('pcIO', 0x%x, 0x%x)\n",
+               MTP_AFE_LO, MTP_AFE_HI);
+        return false;
+    }
+    printf("HV: input: trackpad AFE reset: ADT pKW8 phandle %u, pcIO 0x%x/0x%x\n", fn->phandle,
+           fn->lo, fn->hi);
+    return true;
+}
 
 /* ---- identity --------------------------------------------------------------------------- */
 
@@ -372,9 +475,31 @@ static void log_attach(void)
                    mb.kbd.report_id, mb.kbd.data_bytes, mb.kbd.n_fields,
                    mb.kbd.has_fn ? "present" : "absent", mb.kbd.fn_bit, mb.kbd.ignored_fields);
     }
+    if (tp_wanted || tp_refused) {
+        const struct tp_state *t = &mb.tp;
+        printf("HV: input: MTP trackpad: %s (reason %u, step %u); firmware %u bytes at DVA 0x%lx, "
+               "SMC pcIO writes %u (failed %u); geometry %s: %ux%u (0.01 mm) X %d..%d Y %d..%d, "
+               "%u/%u units per mm\n",
+               mb.tp_live ? "up" : "not available", mb.tp_reason ? mb.tp_reason : tp_refused,
+               mb.tp_step, mb.params.fw_size, mb.fw_dva, smc_pcio_writes, smc_pcio_failed,
+               mb.tp_geometry_device ? "from 0xD9" : "defaults [?]", t->geo.width, t->geo.height,
+               t->geo.min_x, t->geo.max_x, t->geo.min_y, t->geo.max_y, t->res_x, t->res_y);
+        if (mb.tp_iface >= 0) {
+            const struct mtp_iface_info *f = &mb.comm.iface[mb.tp_iface];
+            for (u32 at = 0; at < f->desc_len; at += 32) {
+                printf("HV: input: MTP multi-touch descriptor +%03x: ", at);
+                hex(f->desc + at, f->desc_len - at > 32 ? 32 : f->desc_len - at);
+                printf("\n");
+            }
+        }
+        if (smc_pcio_writes == 1)
+            printf("HV: input: the trackpad AFE was left in reset (the safe state after a failed "
+                   "upload)\n");
+    }
     printf("HV: input: MTP %s (state 0x%x, reason %u) in %u ms; GPIO refused %u, frames %u, "
            "checksum errors %u, mmio refused %u faulted %u, table refusals %u\n",
-           mb.reason ? "bring-up stopped" : "up (keyboard)", mb.state, mb.reason,
+           mb.reason ? "bring-up stopped" : mb.tp_live ? "up (keyboard, trackpad)" : "up (keyboard)",
+           mb.state, mb.reason,
            mb.step_ms[mb.state & ~MTP_ST_FAILED], mb.gpio_refused, mb.frames, mb.csum_errors,
            mmio_refused, mmio_faults, mem_refused);
     if (mb.reason == MTP_E_RUNNING)
@@ -386,7 +511,7 @@ static void log_attach(void)
                (mb.state & ~MTP_ST_FAILED) >= MTP_ST_POWER ? " and a running MTP" : "");
 }
 
-bool hv_mtp_t8152_attach(u64 area, u64 size, bool fn_fkeys)
+bool hv_mtp_t8152_attach(u64 area, u64 size, bool fn_fkeys, bool trackpad)
 {
     if (session_used) {
         printf("HV: input: MTP attach refused: once per carrier session\n");
@@ -417,17 +542,30 @@ bool hv_mtp_t8152_attach(u64 area, u64 size, bool fn_fkeys)
         mb.reason = MTP_E_IDENTITY;
         return false;
     }
+    if (trackpad && !tp_identity())
+        tp_refused = MTP_E_TP_IDENTITY;
+    tp_wanted = trackpad && !tp_refused;
     prepare_area();
     attached = true;
     probing = true; /* log the bring-up's frames too */
     log_budget = MTP_LOG_PER_S;
     log_window = ticks();
     int rc = mtp_bringup_attach(&mb, &ops, area, (void *)area,
-                                fn_fkeys ? KBD_FN_FKEYS : KBD_FN_MEDIA);
+                                fn_fkeys ? KBD_FN_FKEYS : KBD_FN_MEDIA, tp_wanted);
     probing = false;
+    smc_close(); /* an AFE left asserted after a failure: the session ends, no further write */
+    if (tp_refused)
+        mb.tp_reason = tp_refused;
+    tp_up = rc == MTP_E_NONE && mb.tp_live;
+    tp_wanted = false; /* no SMC access after ATTACH */
     log_attach();
     __atomic_store_n(&live, rc == MTP_E_NONE, __ATOMIC_RELEASE);
     return rc == MTP_E_NONE;
+}
+
+bool hv_mtp_t8152_trackpad_up(void)
+{
+    return tp_up;
 }
 
 bool hv_mtp_t8152_live(void)
@@ -490,11 +628,11 @@ u64 hv_mtp_t8152_status(u32 index)
         case 23:
             return mb.state;
         case 24:
-            return mb.reason;
+            return (u64)mb.reason | (u64)mb.tp_reason << 8 | (u64)mb.tp_step << 16;
         case 25:
             return (u64)mb.kbd_reports | (u64)mb.kbd_bad << 32;
         case 26:
-            return 0; /* trackpad: I2 */
+            return (u64)mb.tp_frames | (u64)mb.tp_bad << 32;
         case 27:
             if (rtk)
                 rtkit_get_notification_counts(rtk, &n);
@@ -505,7 +643,7 @@ u64 hv_mtp_t8152_status(u32 index)
             return (u64)mb.csum_errors | (u64)mb.ring_errors << 16 | (u64)mb.oversize << 32 |
                    (u64)mb.parse_errors << 48;
         case 30:
-            return 0; /* SMC pcIO writes: none in this step (must be 0 or 2 at I2) */
+            return (u64)smc_pcio_writes | (u64)smc_pcio_failed << 16;
         case 31:
             return mb.gpio_refused;
         default:
@@ -518,21 +656,24 @@ void hv_mtp_t8152_report(void)
     if (!attached)
         return;
     bool latched = (mb.state & MTP_ST_FAILED) && mb.reason >= MTP_E_RTKIT_FAILED;
-    u32 bad = mb.kbd_bad + mb.csum_errors + mb.parse_errors + mb.ring_errors;
-    if (mb.kbd_reports == reported_kbd && bad == reported_bad && latched == reported_latch &&
-        !probing)
+    u32 bad = mb.kbd_bad + mb.tp_bad + mb.csum_errors + mb.parse_errors + mb.ring_errors;
+    if (mb.kbd_reports == reported_kbd && mb.tp_frames == reported_tp && bad == reported_bad &&
+        latched == reported_latch && !probing)
         return;
     reported_kbd = mb.kbd_reports;
+    reported_tp = mb.tp_frames;
     reported_bad = bad;
     reported_latch = latched;
     struct rtkit_notification_counts n = {0, 0, 0};
     if (rtk)
         rtkit_get_notification_counts(rtk, &n);
-    printf("HV: input: mtp kbd %u tp 0 bad %u (csum %u ring %u) frames %u gpio %u; svc max %lu us "
-           "polls %lu; rtk app %lu oslog %lu%s\n",
-           mb.kbd_reports, bad, mb.csum_errors, mb.ring_errors, mb.frames, mb.gpio_refused,
+    printf("HV: input: mtp kbd %u tp %u (reports %u taps %u clicks %u detents %u stale %u) bad %u "
+           "(csum %u ring %u tp %u) frames %u gpio %u; svc max %lu us polls %lu; rtk app %lu "
+           "oslog %lu%s\n",
+           mb.kbd_reports, mb.tp_frames, mb.tp_reports, mb.tp.taps, mb.tp.clicks, mb.tp.detents,
+           mb.tp.stale, bad, mb.csum_errors, mb.ring_errors, mb.tp_bad, mb.frames, mb.gpio_refused,
            poll_max_us, polls, n.app, n.oslog_notifications,
-           latched ? "; LATCHED, keyboard released" : "");
+           latched ? "; LATCHED, keyboard and trackpad released" : "");
 }
 
 void hv_mtp_t8152_fatal_report(void)
@@ -543,4 +684,8 @@ void hv_mtp_t8152_fatal_report(void)
            "frames %u; svc max %lu us, polls %lu; area 0x%lx (stream 4 DMA, never guest RAM)\n",
            mb.state, mb.reason, (int)live, mb.kbd_reports, mb.kbd_bad, mb.csum_errors,
            mb.ring_errors, mb.frames, poll_max_us, polls, area_pa);
+    printf("HV: fatal: input: trackpad live %d reason %u step %u frames %u bad %u; SMC pcIO "
+           "writes %u failed %u\n",
+           (int)mb.tp_live, mb.tp_reason, mb.tp_step, mb.tp_frames, mb.tp_bad, smc_pcio_writes,
+           smc_pcio_failed);
 }

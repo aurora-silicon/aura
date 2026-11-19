@@ -1380,7 +1380,7 @@ def describe_gpu(result):
 # Mu installs no SSDT J804INP0 (\_SB.INP0, _HID NTAS2040) and Windows never sees the device.
 CAPS2_INPUT = 0x0008                      # input v1
 CONFIG_T8152_INPUT = 0x200000               # hv_windows_configure BIT(21)
-INPUT_OP_QUERY, INPUT_OP_ATTACH, INPUT_OP_STATUS, INPUT_OP_DETACH = 0, 1, 2, 3
+INPUT_OP_QUERY, INPUT_OP_ATTACH, INPUT_OP_STATUS, INPUT_OP_DETACH, INPUT_OP_PROBE = 0, 1, 2, 3, 4
 INPUT_Q = {"version": 0, "base": 1, "size": 2, "intid": 3, "features": 4, "sources": 5}
 INPUT_VERSION = 1
 INPUT_BASE = 0xF50000000
@@ -1390,7 +1390,7 @@ INPUT_FEATURES_REPORTS = 0x000F           # keyboard, absolute, relative, consum
 INPUT_SRC = {"host": 0x1, "kbd": 0x2, "tp": 0x4}
 INPUT_SRC_FEATURE_SHIFT = 16              # FEATURES bits 16-23 are the live sources
 INPUT_CHOICES = ("off", "host", "host+kbd", "host+kbd+tp")
-INPUT_CARRIER_SOURCES = ("host",)         # what this carrier runs (I1/I2 are later)
+INPUT_CARRIER_SOURCES = ("host", "kbd", "tp")  # I0 host feed, I1 keyboard, I2 trackpad
 INPUT_FD_MARKER_OFFSET = 0x140
 INPUT_FD_MARKER = b"J804INP1"
 # Mu J804Windows.h J804_INPUT_ADT_PROPERTY / _SIZE (layout below).
@@ -1402,6 +1402,40 @@ INPUT_STATUS = {"frames_ok": 0, "bad_crc": 1, "bad_header": 2, "bad_payload": 3,
                 "out_ok": 10, "out_bad": 11, "hellos": 12, "bad_access": 13, "rx_bytes": 14,
                 "dropped": 15, "attached": 16, "ctrl": 17, "depth": 18, "dropped_now": 19,
                 "leds": 20, "line": 21, "owns_rx": 22}
+# I1/I2: the MTP's STATUS indices (hv_input.h) and its reasons (mtp_bringup.h).
+INPUT_STATUS_MTP = {"mtp_state": 23, "mtp_reason": 24, "mtp_kbd": 25, "mtp_tp": 26,
+                    "mtp_rtkit": 27, "mtp_poll_us": 28, "mtp_errors": 29, "mtp_smc": 30,
+                    "mtp_gpio": 31}
+MTP_STATES = {0: "off", 1: "identity", 2: "dart", 3: "power", 4: "rtkit", 5: "scm", 6: "init",
+              7: "keyboard ready", 8: "trackpad ready"}
+MTP_REASONS = {0: "none", 1: "identity", 2: "area", 3: "MTP already running (reboot through iBoot)",
+               4: "TTBR", 5: "TCR", 6: "DART root", 7: "stream-4 map", 8: "PMGR power",
+               9: "RTKit", 10: "SCM send", 11: "SCM timeout", 12: "INIT timeout",
+               13: "keyboard layout", 14: "TX ring", 15: "keyboard enable unacknowledged",
+               16: "keyboard enable refused", 17: "keyboard READY", 18: "RTKit at run time",
+               19: "ring", 20: "checksums", 21: "trackpad parameter page or firmware CRC",
+               22: "no multi-touch INIT", 23: "multi-touch enable", 24: "SMC pcIO write",
+               25: "firmware unacknowledged or refused", 26: "power method 2 step",
+               27: "multi-touch READY", 28: "no multi-touch AFE function in the ADT"}
+INPUT_OPT_FN_FKEYS = 0x100                # ATTACH a1 bit 8: F1-F12 without Fn
+# The reserved MTP area (mtp_bringup.h): 8 MiB, 2 MiB aligned, carved off the top of the guest
+# RAM window; the launcher writes the parameter page at +0 and, with the trackpad, the
+# firmware payload at +0x700000 before ATTACH.
+INPUT_AREA_SIZE = 0x800000
+INPUT_AREA_ALIGN = 0x200000
+INPUT_AREA_FW = 0x700000
+INPUT_AREA_FW_SIZE = 0x20000
+INPUT_PARAMS_MAGIC = b"AWMTPP01"
+INPUT_PARAMS_VERSION = 1
+INPUT_PARAMS_LEN = 64
+INPUT_PARAMS_TAP, INPUT_PARAMS_NATURAL = 0x1, 0x2
+# The trackpad firmware container (the owner's own file, lifted from their recoveryOS by
+# tools/j804-mtfw.py in linux-j804; never in a repo): <IIIII magic "HIDF", version 1, header
+# length, payload length, interface-byte offset>, the header, the payload.
+TP_FW_MAGIC = 0x46444948
+TP_FW_VERSION = 1
+TP_FW_HEADER = "<IIIII"
+TP_FW_DEFAULT_NAME = "firmware/tpmtfw-j804.bin"
 INPUT_ERRORS = {-1: "not configured, not J804, the guest already started or an earlier ATTACH "
                     "this session",
                 -2: "bad source mask, or a source this carrier does not run",
@@ -1422,19 +1456,138 @@ INPUT_KEEPALIVE_S = 0.5                   # a feeder holding keys sends KEEPALIV
 
 
 def parse_windows_input(value):
-    """--windows-input: "off" -> (), else the source names in order.  Only the sources this
-    carrier runs are accepted; host+kbd and host+kbd+tp are refused by name."""
-    require(isinstance(value, str), "--windows-input takes off or host")
+    """--windows-input: "off" -> (), else the source names in order: host, host+kbd (I1, the
+    M6's own keyboard) or host+kbd+tp (I2, its trackpad too).  The host feed is always in: the
+    Mac-fed path stays the fallback.  Whether the resident runs them is QUERY Q_SOURCES."""
+    require(isinstance(value, str), "--windows-input takes off, host, host+kbd or host+kbd+tp")
     text = value.strip().lower()
     if text in ("off", "disabled", "none", ""):
         return ()
     require(text in INPUT_CHOICES, f"--windows-input: unknown choice {value!r} "
-            f"({', '.join(INPUT_CHOICES)})")
+            f"({', '.join(INPUT_CHOICES)}; the Mac-fed host source always stays on)")
     sources = tuple(text.split("+"))
     missing = [s for s in sources if s not in INPUT_CARRIER_SOURCES]
-    require(not missing, f"--windows-input {text}: the internal keyboard/trackpad "
-            f"({'+'.join(missing)}) is not in this carrier yet; use --windows-input host")
+    require(not missing, f"--windows-input {text}: {'+'.join(missing)} is not in this launcher")
     return sources
+
+
+def input_needs_area(sources):
+    """The internal keyboard (and the trackpad with it) runs the MTP in the reserved area."""
+    return "kbd" in sources
+
+
+def plan_t8152_input_area(top):
+    """(area base, new window top): the 8 MiB area at the top of the guest RAM window, 2 MiB
+    aligned; everything else (guest RAM, the AHCI store, the GPU pool) plans below it."""
+    end = top & ~(INPUT_AREA_ALIGN - 1)
+    base = end - INPUT_AREA_SIZE
+    require(base > 0, f"the guest RAM window top {top:#x} leaves no room for the input area")
+    return base, base
+
+
+def default_tp_firmware_path(environ=os.environ):
+    root = environ.get("J804_PRIVATE_DATA")
+    return Path(root) / TP_FW_DEFAULT_NAME if root else None
+
+
+def parse_tp_firmware(blob):
+    """(payload, interface-byte offset) from the owner's HIDF container.  The checks are the
+    container's own (the Linux driver makes the same ones); the payload must fit the area's
+    128 KiB slot."""
+    head = struct.calcsize(TP_FW_HEADER)
+    require(isinstance(blob, (bytes, bytearray)) and len(blob) >= head,
+            "the trackpad firmware is shorter than its container header")
+    magic, version, hdr_len, data_len, iface_off = struct.unpack_from(TP_FW_HEADER, blob)
+    require(magic == TP_FW_MAGIC, "the trackpad firmware is not a HIDF container")
+    require(version == TP_FW_VERSION, f"trackpad firmware container version {version}, not 1")
+    require(head <= hdr_len <= len(blob) and hdr_len + data_len <= len(blob),
+            "the trackpad firmware's header or payload length runs past the file")
+    require(0 < data_len <= INPUT_AREA_FW_SIZE,
+            f"the trackpad firmware payload ({data_len} bytes) does not fit 128 KiB")
+    require(iface_off < data_len, "the trackpad firmware's interface offset is past its payload")
+    return bytes(blob[hdr_len:hdr_len + data_len]), iface_off
+
+
+@dataclass(frozen=True)
+class TpOptions:
+    """The trackpad's tunables (input_tp.h); the defaults are the carrier's."""
+    tap: bool = True
+    natural: bool = False
+    gain: float = 6.0          # pointer counts per mm, slow
+    accel: float = 3.0         # extra factor at accel_hi (0: none)
+    accel_lo: int = 15         # mm/s
+    accel_hi: int = 150        # mm/s
+    scroll_mm: float = 5.0     # finger travel per wheel or pan detent
+    tap_ms: int = 180
+    tap_travel_mm: float = 1.5
+    tap_key_quiet_ms: int = 300
+    click_settle_ms: int = 40
+    palm_major: int = 0        # 0: off
+
+
+def input_params(payload, iface_off, opts=TpOptions()):
+    """The area's 64-byte parameter page for mtp_params_parse() (mtp_bringup.h)."""
+    require(0 < len(payload) <= INPUT_AREA_FW_SIZE and 0 <= iface_off < len(payload),
+            "bad trackpad firmware payload")
+    gain, accel = round(opts.gain * 256), round(opts.accel * 256)
+    scroll, travel = round(opts.scroll_mm * 1000), round(opts.tap_travel_mm * 1000)
+    require(16 <= gain <= 0xFFFF, "--windows-input-tp-gain must be between 1/16 and 255")
+    require(0 <= accel <= 0xFFFF, "--windows-input-tp-accel must be between 0 and 255")
+    require(not accel or 0 <= opts.accel_lo < opts.accel_hi <= 0xFFFF,
+            "the acceleration needs accel_lo < accel_hi")
+    require(500 <= scroll <= 0xFFFF, "--windows-input-tp-scroll-mm must be between 0.5 and 65")
+    require(0 <= opts.tap_ms <= 1000 and 0 <= travel <= 0xFFFF and
+            0 <= opts.tap_key_quiet_ms <= 5000 and 0 <= opts.click_settle_ms <= 500 and
+            0 <= opts.palm_major <= 0xFFFF, "a trackpad tunable is out of range")
+    flags = (INPUT_PARAMS_TAP if opts.tap else 0) | (INPUT_PARAMS_NATURAL if opts.natural else 0)
+    body = INPUT_PARAMS_MAGIC + struct.pack(
+        "<IIIIIIIHHHHHHHHHHI", INPUT_PARAMS_VERSION, INPUT_PARAMS_LEN, INPUT_AREA_FW, len(payload),
+        zlib.crc32(payload) & 0xFFFFFFFF, iface_off, flags, gain, accel, opts.accel_lo,
+        opts.accel_hi, scroll, opts.tap_ms, travel, opts.tap_key_quiet_ms, opts.click_settle_ms,
+        opts.palm_major, 0)
+    assert len(body) == INPUT_PARAMS_LEN - 4
+    return body + struct.pack("<I", zlib.crc32(body) & 0xFFFFFFFF)
+
+
+def input_attach_mask(sources, fn_default="media"):
+    """ATTACH a1: the source bits, and bit 8 for the "fkeys" Fn default (keyboard only)."""
+    require(fn_default in ("media", "fkeys"), "--windows-input-fn-default is media or fkeys")
+    mask = input_source_mask(sources)
+    if fn_default == "fkeys":
+        require("kbd" in sources, "--windows-input-fn-default fkeys needs the internal keyboard")
+        mask |= INPUT_OPT_FN_FKEYS
+    return mask
+
+
+def check_input_sources(sources, carrier_sources):
+    """QUERY Q_SOURCES must cover what is asked (an I0-only carrier answers 1, I1 3, I2 7)."""
+    want = input_source_mask(sources)
+    require(isinstance(carrier_sources, int) and carrier_sources & want == want,
+            f"the resident runs input sources {carrier_sources:#x}, this launch asks for "
+            f"{want:#x}: rebuild the carrier at or after the I1 (keyboard) / I2 (trackpad) commit")
+
+
+def input_live_sources(sources, features):
+    """After ATTACH: the asked sources FEATURES says are live, and those that are not."""
+    live = [s for s in sources if features >> INPUT_SRC_FEATURE_SHIFT & INPUT_SRC[s]]
+    return live, [s for s in sources if s not in live]
+
+
+def describe_mtp_status(st):
+    """STATUS 23..31 as one line (the run log's exit summary and the probe tool)."""
+    state = st["mtp_state"]
+    reason = st["mtp_reason"]
+    failed = state & 0x80
+    text = (f"MTP {'stopped at ' if failed else ''}{MTP_STATES.get(state & 0x7f, state)}"
+            f"{', reason ' + MTP_REASONS.get(reason & 0xff, str(reason & 0xff)) if reason & 0xff else ''}")
+    if reason >> 8 & 0xff:
+        text += (f"; trackpad not up: {MTP_REASONS.get(reason >> 8 & 0xff, reason >> 8 & 0xff)} "
+                 f"(step {reason >> 16 & 0xff})")
+    return (f"{text}; keyboard reports {st['mtp_kbd'] & 0xffffffff} (bad {st['mtp_kbd'] >> 32}), "
+            f"trackpad frames {st['mtp_tp'] & 0xffffffff} (bad {st['mtp_tp'] >> 32}), longest "
+            f"service {st['mtp_poll_us']} us, ring errors {st['mtp_errors']:#x}, SMC pcIO writes "
+            f"{st['mtp_smc'] & 0xffff} (failed {st['mtp_smc'] >> 16}), GPIO refused "
+            f"{st['mtp_gpio']}")
 
 
 def input_source_mask(sources):
@@ -1501,8 +1654,12 @@ def input_handshake(sources, features):
     returned 0: page base, size, GSIV, the feature mask the guest will read (report bits and
     the attached sources in bits 16-23), version 1."""
     require(sources, "no input handshake without a source")
-    mask = (features & INPUT_FEATURES_REPORTS) | \
-        input_source_mask(sources) << INPUT_SRC_FEATURE_SHIFT
+    # The sources the resident says are live after ATTACH (bit 17 only once the keyboard is
+    # READY, 18 the trackpad), never more than were asked for.
+    asked = input_source_mask(sources) << INPUT_SRC_FEATURE_SHIFT
+    mask = (features & INPUT_FEATURES_REPORTS) | (features & asked)
+    require(mask & INPUT_SRC["host"] << INPUT_SRC_FEATURE_SHIFT,
+            "the resident's FEATURES lack the host source")
     value = struct.pack(INPUT_HANDSHAKE_FORMAT, INPUT_BASE, INPUT_SIZE, INPUT_GSIV, mask,
                         INPUT_VERSION)
     assert len(value) == INPUT_HANDSHAKE_SIZE
