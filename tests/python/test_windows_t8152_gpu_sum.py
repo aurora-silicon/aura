@@ -91,42 +91,59 @@ PACE_HOST = r"""
 #include <stdio.h>
 #include "hv_status.h"
 static unsigned long calls[64]; static int ncalls;
-bool hv_gpu_sum(u64 guest_s, u64 dropped) { (void)dropped; calls[ncalls++] = guest_s; return true; }
+bool hv_gpu_sum(u64 guest_s, u64 dropped) { (void)dropped; printf("SUM %lu\n", guest_s); return true; }
+static int tick(u64 now, u64 f)
+{
+    u64 s;
+    if (!hv_status_due(now, f, &s))
+        return 0;
+    calls[ncalls++] = s;
+    return 1;
+}
 int main(void)
 {
     const u64 f = 24000000;
     u64 t0 = 5000 * f;
-    assert(!hv_status_tick(t0, f));                 /* before entry: nothing */
+    assert(!tick(t0, f));                 /* before entry: nothing */
     hv_status_guest_entered(t0, f);
     for (u64 s = 0; s < 59; s++)
-        assert(!hv_status_tick(t0 + s * f, f));
-    assert(hv_status_tick(t0 + 60 * f, f) && calls[0] == 60);
-    assert(!hv_status_tick(t0 + 60 * f + 1, f));    /* a second CPU's tick (handover): no repeat */
-    assert(!hv_status_tick(t0 + 119 * f, f));
-    assert(hv_status_tick(t0 + 120 * f + f / 2, f) && calls[1] == 120);
-    /* A 705 s stall: one line when the tick comes back, then a minute from there. */
-    assert(hv_status_tick(t0 + 825 * f, f) && calls[2] == 825);
-    assert(!hv_status_tick(t0 + 884 * f, f));
-    assert(hv_status_tick(t0 + 885 * f, f) && calls[3] == 885);
+        assert(!tick(t0 + s * f, f));
+    assert(tick(t0 + 60 * f, f) && calls[0] == 60);
+    assert(!tick(t0 + 60 * f + 1, f));    /* a second CPU's tick (handover): no repeat */
+    assert(!tick(t0 + 119 * f, f));
+    assert(tick(t0 + 120 * f + f / 2, f) && calls[1] == 120);
+    /* A 705 s stall: one block when the tick comes back, then a minute from there. */
+    assert(tick(t0 + 825 * f, f) && calls[2] == 825);
+    assert(!tick(t0 + 884 * f, f));
+    assert(tick(t0 + 885 * f, f) && calls[3] == 885);
     assert(ncalls == 4);
     /* A new guest entry restarts the minutes. */
     hv_status_guest_entered(t0 + 1000 * f, f);
-    assert(!hv_status_tick(t0 + 1059 * f, f));
-    assert(hv_status_tick(t0 + 1060 * f, f) && calls[4] == 60);
+    assert(!tick(t0 + 1059 * f, f));
+    assert(tick(t0 + 1060 * f, f) && calls[4] == 60);
+    /* The block: live CPUs only, one printf per line, GPU SUM last with the console drops. */
+    struct hv_status_snapshot s = {.guest_s = 1860, .soc_s = 2891, .tick_cpu = 7, .boot_cpu = 6,
+                                   .ahci_commands = 66734, .input_ok = 12, .input_bad = 0,
+                                   .con_dropped = 4096, .con_stalls = 2,
+                                   .con_longest_stall_us = 705000000, .con_stalled_now_us = 0,
+                                   .con_longest_call_us = 37, .vuart_overruns = 3};
+    for (int c = 0; c < HV_STATUS_CPUS; c++)
+        s.exits[c] = c < 10 ? (unsigned long)(100 * c) : ~0UL;
+    hv_status_print(&s);
     puts("STATUS PACE OK");
     return 0;
 }
 """
 
 
-def test_sum_pacing(tmp_path):
-    """S-4: guest-run minutes from entry, one cadence across tick CPUs, no burst after a stall."""
+def _status_host(tmp_path):
     cc = shutil.which("clang")
     if cc is None:
         pytest.skip("no host clang")
     (tmp_path / "types.h").write_text(
-        "#pragma once\n#include <stdbool.h>\n#include <stdint.h>\n"
+        "#pragma once\n#include <stdbool.h>\n#include <stddef.h>\n#include <stdint.h>\n"
         "typedef unsigned long u64; typedef uint32_t u32;\n")
+    (tmp_path / "utils.h").write_text("#pragma once\n#include <stdio.h>\n")
     (tmp_path / "hv_gpu.h").write_text(
         "#pragma once\n#include \"types.h\"\nbool hv_gpu_sum(u64 guest_s, u64 console_dropped);\n")
     (tmp_path / "pace.c").write_text(PACE_HOST)
@@ -134,18 +151,36 @@ def test_sum_pacing(tmp_path):
     subprocess.run([cc, "-std=gnu11", "-Wall", "-Werror", "-fsanitize=address,undefined",
                     "-iquote", str(tmp_path), "-I", str(WIN), str(WIN / "hv_status.c"),
                     str(tmp_path / "pace.c"), "-o", str(exe)], check=True)
-    assert "STATUS PACE OK" in subprocess.run([str(exe)], check=True, capture_output=True,
-                                              text=True).stdout
+    return subprocess.run([str(exe)], check=True, capture_output=True, text=True).stdout
+
+
+def test_sum_pacing(tmp_path):
+    """S-4: guest-run minutes from entry, one cadence across tick CPUs, no burst after a stall."""
+    assert "STATUS PACE OK" in _status_host(tmp_path)
+
+
+def test_status_block_format(tmp_path):
+    """C-3: the 60 s block's lines, and GPU SUM last with the console's dropped bytes."""
+    out = _status_host(tmp_path).splitlines()
+    i = out.index("HV: STATUS t=1860 soc=2891 tick cpu 7 boot cpu 6")
+    assert out[i + 1] == "HV: STATUS exits/min: c0=0 c1=100 c2=200 c3=300 c4=400 c5=500 c6=600 " \
+                         "c7=700 c8=800 c9=900"
+    assert out[i + 2] == ("HV: STATUS ahci 66734 input 12/0; console dropped 4096 stalls 2 longest "
+                          "705000000 us now 0 us write max 37 us; vuart overruns 3")
+    assert out[i + 3] == "SUM 1860"
 
 
 def test_sum_only_on_the_tick_owner():
     """S-5: one call site, inside hv_tick(), which only the tick owner runs."""
     hv = (WIN / "hv.c").read_text()
     tick = hv.split("void hv_tick(struct exc_info *ctx)\n{", 1)[1].split("\n}\n", 1)[0]
-    assert "hv_status_tick(mrs(CNTPCT_EL0), mrs(CNTFRQ_EL0));" in tick
-    calls = [p for p in WIN.glob("*.c") for _ in re.finditer(r"\bhv_status_tick\(", p.read_text())
+    assert "hv_status_tick();" in tick
+    calls = [p.name for p in WIN.glob("*.c") for _ in re.finditer(r"\bhv_status_due\(", p.read_text())
              if p.name != "hv_status.c"]
-    assert [p.name for p in calls] == ["hv.c"]
+    assert calls == ["hv.c"]
+    body = hv.split("static void hv_status_tick(void)\n{", 1)[1].split("\n}\n", 1)[0]
+    assert "hv_status_due(now, freq, &guest_s)" in body and ".tick_cpu = smp_id()," in body
+    assert hv.count("hv_status_tick();") == 1
     exc = (WIN / "hv_exc.c").read_text()
     assert "interruptible_cpu = hv_tick_owner();" in exc
     assert "hv_status_guest_entered(mrs(CNTPCT_EL0), mrs(CNTFRQ_EL0));" in hv

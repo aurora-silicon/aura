@@ -19,6 +19,8 @@ void usb_dwc3_hs_flush(dwc3_hs_dev_t *dev, cdc_acm_pipe_id_t pipe);
 ssize_t usb_dwc3_hs_vuart_capacity(dwc3_hs_dev_t *dev);
 size_t usb_dwc3_hs_vuart_write(dwc3_hs_dev_t *dev, const void *buf, size_t count);
 void usb_dwc3_hs_vuart_poll(dwc3_hs_dev_t *dev);
+size_t usb_dwc3_hs_console_write(dwc3_hs_dev_t *dev, cdc_acm_pipe_id_t pipe, const void *buf,
+                                    size_t count);
 #endif
 typedef struct dwc3_ss_dev dwc3_ss_dev_t;
 dwc3_ss_dev_t *usb_dwc3_ss_init(uintptr_t regs, dart_dev_t *dart);
@@ -36,6 +38,8 @@ void usb_dwc3_ss_flush(dwc3_ss_dev_t *dev, cdc_acm_pipe_id_t pipe);
 ssize_t usb_dwc3_ss_vuart_capacity(dwc3_ss_dev_t *dev);
 size_t usb_dwc3_ss_vuart_write(dwc3_ss_dev_t *dev, const void *buf, size_t count);
 void usb_dwc3_ss_vuart_poll(dwc3_ss_dev_t *dev);
+size_t usb_dwc3_ss_console_write(dwc3_ss_dev_t *dev, cdc_acm_pipe_id_t pipe, const void *buf,
+                                    size_t count);
 #endif
 
 struct dwc3_dev {
@@ -53,6 +57,15 @@ ssize_t usb_dwc3_vuart_capacity(dwc3_dev_t *dev)
         return -1;
     return dev->superspeed ? usb_dwc3_ss_vuart_capacity(dev->engine.ss)
                            : usb_dwc3_hs_vuart_capacity(dev->engine.hs);
+}
+
+size_t usb_dwc3_console_write(dwc3_dev_t *dev, cdc_acm_pipe_id_t pipe, const void *buf,
+                              size_t count)
+{
+    if (!dev)
+        return 0;
+    return dev->superspeed ? usb_dwc3_ss_console_write(dev->engine.ss, pipe, buf, count)
+                           : usb_dwc3_hs_console_write(dev->engine.hs, pipe, buf, count);
 }
 
 size_t usb_dwc3_vuart_write(dwc3_dev_t *dev, const void *buf, size_t count)

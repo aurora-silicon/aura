@@ -137,6 +137,8 @@ bool hv_input_owns_vuart_rx(void);
 
 /* The 1 Hz HV report: one line when the counters moved. */
 void hv_input_report(void);
+/* G5b status block: host frames ok and bad so far (relaxed reads, no lock). */
+void hv_input_counts(u32 *ok, u32 *bad);
 
 /*
  * The EL2 fatal report's input part (guest SError attribution): attach state, the counters

@@ -33,3 +33,23 @@ void usb_dwc3_vuart_poll(dwc3_dev_t *dev)
         usb_dwc3_cdc_start_bulk_out_xfer(dev, dev->pipe[CDC_ACM_PIPE_1].ep_out);
     }
 }
+
+/*
+ * G5b C-3: the proxy console's write.  A full ring (the Mac asleep, nobody reading) used to keep
+ * usb_dwc3_queue() spinning in handle_events (with no deadline on the HS engine) inside the host
+ * tick, holding the big lock: d5c's 705 s freeze.  This takes what fits now and starts the
+ * bulk-in transfer as usb_dwc3_write() did; no event processing, no wait for the host.  The
+ * console keeps what was not taken in its own buffer and counts what it has to drop.
+ */
+size_t usb_dwc3_console_write(dwc3_dev_t *dev, cdc_acm_pipe_id_t pipe, const void *buf, size_t count)
+{
+    if (!dev || dev->failed || !dev->pipe[pipe].ready || !dev->pipe[pipe].device2host)
+        return 0;
+    ringbuffer_t *device2host = dev->pipe[pipe].device2host;
+    /* ringbuffer_get_free() counts the slot reserved to distinguish empty/full. */
+    size_t free = ringbuffer_get_free(device2host);
+    size_t take = min(count, free ? free - 1 : 0);
+    size_t wrote = take ? ringbuffer_write(buf, take, device2host) : 0;
+    usb_dwc3_cdc_start_bulk_in_xfer(dev, dev->pipe[pipe].ep_in);
+    return wrote;
+}

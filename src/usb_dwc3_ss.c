@@ -16,4 +16,5 @@
 #define usb_dwc3_vuart_capacity usb_dwc3_ss_vuart_capacity
 #define usb_dwc3_vuart_write    usb_dwc3_ss_vuart_write
 #define usb_dwc3_vuart_poll     usb_dwc3_ss_vuart_poll
+#define usb_dwc3_console_write  usb_dwc3_ss_console_write
 #include "usb_dwc3_impl.inc"

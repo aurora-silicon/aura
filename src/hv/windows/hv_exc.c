@@ -1215,8 +1215,10 @@ static void _hv_exc_proxy(struct exc_info *ctx, uartproxy_boot_reason_t reason, 
             printf("Guest exception not handled, resetting.\n");
             print_regs(ctx->regs, 0);
             /* NULL frame: these are guest registers, there is no EL2 chain to walk. */
+            iodev_console_must_deliver(2000); /* G5b C-3: bounded, then the reset path */
             hv_windows_fatal_report(NULL, "unhandled guest exception", par_before,
                                     "before the proxy's translations");
+            iodev_console_must_deliver(0);
             hv_safe_reset("unhandled guest exception"); // does not return
     }
 }
@@ -8220,12 +8222,21 @@ void hv_exc_serr(struct exc_info *ctx)
     hv_get_context(ctx);
     hv_fatal_note_trap(HV_FATAL_TRAP_SERROR, ctx->esr, ctx->elr, ctx->spsr, ctx->far);
     hv_exc_entry();
-    if (chip_id == T8152)
+    /*
+     * G5b C-3: the console never waits for the host, except for this report: up to 2 s in all
+     * for the device to take it (under bhl, as the proxy forward below has always been), so it
+     * reaches the host ahead of the forward when the Mac is reading; after that it drops too.
+     */
+    if (chip_id == T8152) {
+        iodev_console_must_deliver(2000);
         printf("HV: fatal: guest SError on cpu %d: host tick on cpu %d, boot CPU %d\n", smp_id(),
                hv_tick_owner(), boot_cpu_idx);
+    }
     /* Before the proxy: the host ends the session on a guest SError and reads nothing else. */
     hv_windows_guest_serror_report(ctx->regs, ctx->sp, ctx->esr, ctx->elr, ctx->spsr, ctx->far,
                                    ctx->afsr1, &prev, mrs(PAR_EL1));
+    if (chip_id == T8152)
+        iodev_console_must_deliver(0);
     hv_exc_proxy(ctx, START_EXCEPTION_LOWER, EXC_SERROR, NULL);
     hv_exc_exit(ctx);
     hv_wdt_breadcrumb('e');

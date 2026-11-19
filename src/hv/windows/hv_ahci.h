@@ -145,6 +145,8 @@ void hv_ahci_session_end(int status);
  * guest runs it also refreshes the descriptor's alive_cntpct (at most every 10 s).
  */
 void hv_ahci_report(void);
+/* G5b status block: commands so far this session (a relaxed read, no lock). */
+u64 hv_ahci_commands(void);
 
 /*
  * The fatal report's AHCI part (hv_fatal.c): the access being handled now or last, and the

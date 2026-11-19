@@ -493,11 +493,22 @@ static void usb_1_flush(void *dev)
 }
 #endif
 
+#ifdef AURA_WINDOWS
+/* G5b C-3: console output never waits for the host (iodev_console_write's only device write). */
+static ssize_t usb_0_write_nonblocking(void *dev, const void *buf, size_t count)
+{
+    return usb_dwc3_console_write(dev, CDC_ACM_PIPE_0, buf, count);
+}
+#endif
+
 struct iodev_ops iodev_usb_ops = {
     .can_read = usb_0_can_read,
     .can_write = usb_0_can_write,
     .read = usb_0_read,
     .write = usb_0_write,
+#ifdef AURA_WINDOWS
+    .write_nonblocking = usb_0_write_nonblocking,
+#endif
     .queue = usb_0_queue,
     .flush = usb_0_flush,
     .handle_events = usb_0_handle_events,

@@ -24,6 +24,9 @@
 #include "xnuboot.h"
 #include "tick_deadline.h"
 
+/* hv_vuart.c: guest serial bytes the secondary CDC could not take (the G5b status block). */
+extern u64 vuart_tx_overruns;
+
 #define HV_TICK_RATE      5000
 #define HV_SLOW_TICK_RATE 1
 /*
@@ -1633,7 +1636,10 @@ static int hv_start_session(void *entry, u64 regs[4])
             result = -1;
         }
         hv_windows_serial_finish();
+        /* G5b C-3: one of the few lines that may wait for the host, at most 2 s (no bhl here). */
+        iodev_console_must_deliver(2000);
         printf("HV: All CPUs exited\n");
+        iodev_console_must_deliver(0);
     }
     int status = result ? result : __atomic_load_n(&hv_windows_exit_reason, __ATOMIC_ACQUIRE);
     hv_fatal_armed = false;
@@ -2304,6 +2310,42 @@ static void hv_tick_host_io(struct exc_info *ctx)
         hv_vuart_poll();
 }
 
+/*
+ * G5b C-3: the once-a-minute status block (hv_status.h), from the tick owner under bhl.  Every
+ * value is a counter some other path keeps; this only reads them (relaxed, no device access, no
+ * lock beyond the bhl it already holds) and prints through the console, which never waits.
+ */
+static void hv_status_tick(void)
+{
+    static u64 last_exits[HV_STATUS_CPUS];
+    u64 guest_s, now = mrs(CNTPCT_EL0), freq = mrs(CNTFRQ_EL0);
+    if (!hv_status_due(now, freq, &guest_s))
+        return;
+    struct hv_status_snapshot s = {
+        .guest_s = guest_s,
+        .soc_s = freq ? now / freq : 0,
+        .tick_cpu = smp_id(),
+        .boot_cpu = boot_cpu_idx,
+        .ahci_commands = hv_ahci_commands(),
+        .vuart_overruns = __atomic_load_n(&vuart_tx_overruns, __ATOMIC_RELAXED),
+    };
+    for (int cpu = 0; cpu < HV_STATUS_CPUS; cpu++) {
+        u64 n = cpu < MAX_CPUS ? __atomic_load_n(&hv_guest_diag[cpu].exits, __ATOMIC_RELAXED) : 0;
+        bool live = cpu < MAX_CPUS && __atomic_load_n(&hv_started_cpus[cpu], __ATOMIC_RELAXED);
+        s.exits[cpu] = live ? n - last_exits[cpu] : ~0UL;
+        last_exits[cpu] = n;
+    }
+    hv_input_counts(&s.input_ok, &s.input_bad);
+    struct iodev_console_stats con;
+    iodev_console_stats(uartproxy_iodev, &con);
+    s.con_dropped = con.dropped;
+    s.con_stalls = con.stalls;
+    s.con_longest_stall_us = con.longest_stall_us;
+    s.con_stalled_now_us = con.stalled_now_us;
+    s.con_longest_call_us = con.longest_call_us;
+    hv_status_print(&s);
+}
+
 void hv_tick(struct exc_info *ctx)
 {
     struct hv_tick_deadline *state = &hv_periodic_deadlines[smp_id()];
@@ -2344,7 +2386,7 @@ void hv_tick(struct exc_info *ctx)
      * was happening anyway. One tile row is 40 tiles of 64x64 on this panel. */
     hv_fb_report();
     /* G5b: once a minute of guest run, on the tick owner only (this function). */
-    hv_status_tick(mrs(CNTPCT_EL0), mrs(CNTFRQ_EL0));
+    hv_status_tick();
 #ifdef ENABLE_GUEST_PC_SAMPLER
     hv_sample_guest_pc(ctx);
 #endif

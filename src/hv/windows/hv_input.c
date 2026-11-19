@@ -487,6 +487,15 @@ void hv_input_report(void)
            ok, bad, gaps, depth, dropped, wd, acc, enabled ? "yes" : "no");
 }
 
+void hv_input_counts(u32 *ok, u32 *bad)
+{
+    /* G5b status block: relaxed reads without input_lock (the tick may race the feed by one). */
+    *ok = __atomic_load_n(&model.stats[INPUT_ST_FRAMES_OK], __ATOMIC_RELAXED);
+    *bad = __atomic_load_n(&model.stats[INPUT_ST_BAD_CRC], __ATOMIC_RELAXED) +
+           __atomic_load_n(&model.stats[INPUT_ST_BAD_HEADER], __ATOMIC_RELAXED) +
+           __atomic_load_n(&model.stats[INPUT_ST_BAD_PAYLOAD], __ATOMIC_RELAXED);
+}
+
 static u64 fatal_age_ms(u64 now, u64 then)
 {
     u64 freq = mrs(CNTFRQ_EL0);

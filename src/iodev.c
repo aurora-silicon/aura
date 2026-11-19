@@ -36,6 +36,21 @@ char con_buf[CONSOLE_BUFFER_SIZE];
 size_t con_wp;
 size_t con_rp[IODEV_NUM];
 
+/*
+ * G5b C-3: what a console output that cannot keep up costs, per device.  A device whose
+ * write_nonblocking takes fewer bytes than offered keeps the rest in con_buf (its backlog); once
+ * con_buf wraps past it, the oldest bytes are dropped and counted here instead of the writer
+ * waiting for the host.  A stall is a period with a backlog; longest_us its longest duration.
+ */
+static u64 con_dropped[IODEV_NUM], con_stalls[IODEV_NUM], con_stall_since[IODEV_NUM];
+static u64 con_stall_longest[IODEV_NUM], con_call_longest[IODEV_NUM];
+/*
+ * Must-deliver (iodev_console_must_deliver()): until this tick, a device that takes nothing is
+ * polled (its handle_events) and offered the rest again, instead of being left with a backlog.
+ * Only the fatal report and the guest-exit lines set it, with a bounded deadline.
+ */
+static u64 con_must_until;
+
 void iodev_register_device(iodev_id_t id, struct iodev *dev)
 {
     if (id >= IODEV_MAX)
@@ -202,6 +217,58 @@ int in_iodev = 0;
 
 static DECLARE_SPINLOCK(console_lock);
 
+void iodev_console_must_deliver(u32 ms)
+{
+    __atomic_store_n(&con_must_until, ms ? timeout_calculate(ms * 1000) : 0, __ATOMIC_RELEASE);
+}
+
+static bool con_must_deliver(void)
+{
+    u64 until = __atomic_load_n(&con_must_until, __ATOMIC_ACQUIRE);
+    return until && !timeout_expired(until);
+}
+
+/* One device write; in must-deliver mode, poll the device and retry until the deadline. */
+static ssize_t con_dev_write(iodev_id_t id, const void *buf, size_t length)
+{
+    ssize_t ret = iodev_write_nonblocking(id, buf, length);
+    while (ret <= 0 && con_must_deliver() && iodevs[id]->ops->handle_events) {
+        if (mmu_active())
+            spin_lock(&iodevs[id]->lock);
+        iodevs[id]->ops->handle_events(iodevs[id]->opaque);
+        if (mmu_active())
+            spin_unlock(&iodevs[id]->lock);
+        ret = iodev_write_nonblocking(id, buf, length);
+    }
+    return ret;
+}
+
+static void con_backlog_note(iodev_id_t id, bool backlog, u64 now)
+{
+    if (backlog && !con_stall_since[id]) {
+        con_stall_since[id] = now ? now : 1;
+        con_stalls[id]++;
+    } else if (!backlog && con_stall_since[id]) {
+        u64 us = ticks_to_usecs(now - con_stall_since[id]);
+        if (us > con_stall_longest[id])
+            con_stall_longest[id] = us;
+        con_stall_since[id] = 0;
+    }
+}
+
+void iodev_console_stats(iodev_id_t id, struct iodev_console_stats *st)
+{
+    memset(st, 0, sizeof(*st));
+    if ((unsigned)id >= IODEV_NUM)
+        return;
+    st->dropped = __atomic_load_n(&con_dropped[id], __ATOMIC_RELAXED);
+    st->stalls = __atomic_load_n(&con_stalls[id], __ATOMIC_RELAXED);
+    st->longest_stall_us = __atomic_load_n(&con_stall_longest[id], __ATOMIC_RELAXED);
+    st->longest_call_us = __atomic_load_n(&con_call_longest[id], __ATOMIC_RELAXED);
+    u64 since = __atomic_load_n(&con_stall_since[id], __ATOMIC_RELAXED);
+    st->stalled_now_us = since ? ticks_to_usecs(get_ticks() - since) : 0;
+}
+
 static void _iodev_console_write_helper(iodev_id_t iod, char prefix, const void *buf, size_t length)
 {
     if (!length)
@@ -253,9 +320,13 @@ void iodev_console_write(const void *buf, size_t length)
         if (!iodev_can_write(id))
             continue;
 
-        if (con_wp > CONSOLE_BUFFER_SIZE)
-            con_rp[id] = max(con_wp - CONSOLE_BUFFER_SIZE, con_rp[id]);
+        if (con_wp > CONSOLE_BUFFER_SIZE && con_rp[id] < con_wp - CONSOLE_BUFFER_SIZE) {
+            /* C-3: con_buf wrapped past this device's backlog: those bytes are gone. */
+            con_dropped[id] += con_wp - CONSOLE_BUFFER_SIZE - con_rp[id];
+            con_rp[id] = con_wp - CONSOLE_BUFFER_SIZE;
+        }
 
+        u64 t0 = get_ticks();
         dprintf("  rp=%d\n", con_rp[id]);
         // Flush existing buffer to device if possible
         while (con_rp[id] < con_wp) {
@@ -263,7 +334,7 @@ void iodev_console_write(const void *buf, size_t length)
             size_t block = min(con_wp - con_rp[id], CONSOLE_BUFFER_SIZE - buf_rp);
 
             dprintf("  write buf %d\n", block);
-            ssize_t ret = iodev_write_nonblocking(id, &con_buf[buf_rp], block);
+            ssize_t ret = con_dev_write(id, &con_buf[buf_rp], block);
 
             if (ret <= 0)
                 goto next_dev;
@@ -276,7 +347,7 @@ void iodev_console_write(const void *buf, size_t length)
 
         // Write the current buffer
         while (wrote < length) {
-            ssize_t ret = iodev_write_nonblocking(id, p, length - wrote);
+            ssize_t ret = con_dev_write(id, p, length - wrote);
 
             if (ret <= 0)
                 goto next_dev;
@@ -287,6 +358,12 @@ void iodev_console_write(const void *buf, size_t length)
         }
 
     next_dev:;
+        u64 t1 = get_ticks();
+        u64 us = ticks_to_usecs(t1 - t0);
+        if (us > con_call_longest[id])
+            con_call_longest[id] = us;
+        /* After the update below this device is level with con_wp + length, or behind it. */
+        con_backlog_note(id, con_rp[id] < con_wp + length, t1);
     }
 
     // Update console buffer

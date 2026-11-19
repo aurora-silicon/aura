@@ -54,6 +54,14 @@ void usb_dwc3_flush(dwc3_dev_t *dev, cdc_acm_pipe_id_t pipe);
 ssize_t usb_dwc3_vuart_capacity(dwc3_dev_t *dev);
 size_t usb_dwc3_vuart_write(dwc3_dev_t *dev, const void *buf, size_t count);
 void usb_dwc3_vuart_poll(dwc3_dev_t *dev);
+/*
+ * G5b C-3: the proxy console's write without waiting (pipe 0 as the console iodev's
+ * write_nonblocking): what fits in the device-to-host ring now, then a bulk-in start.  Returns the
+ * bytes taken (0 when the ring is full or the pipe is not up).  The proxy protocol keeps
+ * usb_dwc3_write().
+ */
+size_t usb_dwc3_console_write(dwc3_dev_t *dev, cdc_acm_pipe_id_t pipe, const void *buf,
+                              size_t count);
 #endif
 
 #endif

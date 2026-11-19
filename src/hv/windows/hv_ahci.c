@@ -786,6 +786,11 @@ void hv_ahci_report(void)
            s.largest, us);
 }
 
+u64 hv_ahci_commands(void)
+{
+    return __atomic_load_n(&model.stats.commands, __ATOMIC_RELAXED);
+}
+
 /* ---- the fatal report (hv_fatal.h) ------------------------------------------------------- */
 
 static u64 trace_age_us(u64 now, u64 then, u64 freq)

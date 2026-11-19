@@ -67,6 +67,22 @@ void iodev_console_rewind(iodev_id_t id);
 void iodev_console_kick(void);
 void iodev_console_flush(void);
 
+/* G5b C-3: per-device console accounting (see iodev.c). */
+struct iodev_console_stats {
+    u64 dropped;          /* bytes overwritten in con_buf before this device took them */
+    u64 stalls;           /* periods with a backlog */
+    u64 longest_stall_us; /* the longest finished one */
+    u64 stalled_now_us;   /* the current one, 0 when none */
+    u64 longest_call_us;  /* the longest single console write to this device */
+};
+void iodev_console_stats(iodev_id_t id, struct iodev_console_stats *st);
+/*
+ * Until ms from now (0: off), console writes that a device cannot take poll it and retry instead
+ * of leaving a backlog: for the few lines that must reach the host (the fatal report, the guest
+ * exit).  The caller turns it off again; the deadline bounds it either way.
+ */
+void iodev_console_must_deliver(u32 ms);
+
 iodev_usage_t iodev_get_usage(iodev_id_t id);
 void iodev_set_usage(iodev_id_t id, iodev_usage_t usage);
 void *iodev_get_opaque(iodev_id_t id);
