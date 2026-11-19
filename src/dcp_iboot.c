@@ -213,10 +213,6 @@ static int dcp_ib_cmd(dcp_iboot_if_t *iboot, int op, size_t in_size)
             resp->count > (payload_size - sizeof(*resp)) / sizeof(resp->modes[0]))
             return -1;
     }
-#ifdef AFK_TRACE
-    printf("dcp-iboot: operation %d response %zu bytes\n", op, rxsize);
-    hexdump(iboot->rxbuf, min(rxsize, 64));
-#endif
     return 0;
 }
 
