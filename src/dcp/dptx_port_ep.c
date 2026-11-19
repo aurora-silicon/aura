@@ -193,7 +193,7 @@ int dptxport_connect(afk_epic_service_t *service, u8 core, u8 atc, u8 die)
 
     cmd.target = target;
     if (afk_epic_is_v2(service->epic))
-        cmd.unk = 0x100; /* IODPTXPortAttributes supportsHPD */
+        cmd.unk = 0x100; /* port attribute: HPD supported */
     ret = afk_service_call(service, 0, 11, &cmd, sizeof(cmd), 24, &resp, sizeof(resp), 0);
     if (ret)
         return ret;
