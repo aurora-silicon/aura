@@ -123,16 +123,49 @@ measured ADT (same way T8140's was built, no Apple firmware bytes) and adding it
 Run `make clean` between flag sets.
 
 The tool hands each request to the guest's kernel through the entry it is built with
-(`tools/auractl/entry.h`, `make ENTRY=<name>` for `entry_<name>.c`). `ENTRY=iokit` goes through
-the `AuractlDevice` kext this tree ships (`tools/auractl/AuractlDevice`, built by `make kext`).
-`ENTRY=none`, the default, refuses every call, so a tool built with it can only decode saved
-files with `auractl print`. See `tools/auractl/README.md` for signing and loading the kext.
+(`tools/auractl/entry.h`, `make ENTRY=<name>` for `entry_<name>.c`):
+
+- `none` (the default) refuses every call. A build with it can only decode files with
+  `auractl print`.
+- `iokit` goes through the `AuractlDevice` kext this tree ships (`tools/auractl/AuractlDevice`,
+  built by `make kext`). See `tools/auractl/README.md` for signing and loading the kext.
+- `xnu` needs no kext. The host patches the guest kernelcache's `acct(2)` syscall so that, past
+  acct's own root check, the kernel loads the caller's request address into x1 and issues aura's
+  hvc, then returns through acct's own epilogue. The tool reaches aura by calling `acct()` as root,
+  with its request block in place of the path.
 
 Loading the kext needs SIP off and root. Note that under SPTM-virt `kmutil load` cannot build an
 AuxKC: the BootKC is fed by the host loader, not by the booted macOS, so `kmutil` has no writable
 boot kext collection to extend (measured on the J616s). `kextload AuractlDevice.kext` fails the same
 way, and SIP may be on regardless. When the kext cannot load, use `ENTRY=dcc`: it needs none of
 this. `tools/auractl/README.md` has the details.
+
+### The xnu entry
+
+`acct(2)` is a natural host for the call: it is root-only, otherwise unused on these guests, takes
+exactly one user pointer, and its epilogue already returns whatever errno sits in `w0`. So a
+non-root caller still gets `EPERM`, and a root caller that is not auractl passes a real path whose
+first word is not `AURACTL_REQ_MAGIC` and gets `EINVAL` -- either way `acct()` behaves as it did.
+
+The patch replaces the five instructions at the target of acct's root check with
+
+    ldr  x1, [uap]              ; x1 = uap->path = the caller's &struct auractl_req
+    movz w0, #(MAGIC & 0xffff)  ; w0 = AURACTL_HVC_MAGIC
+    movk w0, #(MAGIC >> 16), lsl #16
+    hvc  #AURACTL_HVC_IMM
+    b    <acct's return-with-errno label>
+
+`proxyclient/aura/auractl_xnu.py` plans this patch "from the file alone": it locates `acct()`
+through the syscall table's build-independent fingerprint, reads which register acct saves `uap`
+in and the address of its errno epilogue, and builds every word it writes from named instruction
+fields (it carries no Apple bytes). It **fails closed** -- anything ambiguous raises rather than
+guess -- and runs standalone to dump the plan for a kernelcache:
+
+    python3 proxyclient/aura/auractl_xnu.py kernelcache.decompressed
+
+`proxyclient/tools/run_guest_sptm.py` applies the patch to the BootKC it chainloads when
+`AURA_XNU_ENTRY=1` is set, verifying the five words it overwrites against the file's before it
+writes. Build the tool with `make ENTRY=xnu`.
 
 ## Use
 

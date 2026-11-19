@@ -5,6 +5,8 @@
 #   iokit   issues the hvc through AuractlDevice.kext (make ENTRY=iokit; needs the kext loaded).
 #   dcc     reaches aura through an EL0 debug register, no kext and no root (make ENTRY=dcc); use
 #           this where a kext cannot load (SIP on, or a host-fed BootKC under SPTM-virt).
+#   xnu     calls acct(2), which the host patched into the hvc (make ENTRY=xnu; no kext, but the
+#           guest kernelcache must be booted with AURA_XNU_ENTRY=1; proxyclient/aura/auractl_xnu.py).
 # On macOS the tool is arm64, not arm64e: macOS refuses a third-party arm64e binary without
 # -arm64e_preview_abi. The kext, by contrast, is arm64e (the kernel's ABI): `make kext`.
 CC ?= cc

@@ -269,6 +269,10 @@ void exc_sync(u64 *regs)
     bool in_gl = in_gl12();
     bool el3 = in_el3();
 
+#ifdef SPTM_VIRT
+    sptm_virt_crumb_fault();
+    sptm_virt_park_check();
+#endif
     /* One of the virtualized SPTM's fault-tolerant reads faulted: skip it. */
     if (sptm_virt_peek_fault(in_gl))
         return;
@@ -439,6 +443,9 @@ void exc_sync(u64 *regs)
 void exc_irq(u64 *regs)
 {
 #ifdef SPTM_VIRT
+    sptm_virt_park_check();
+#endif
+#ifdef SPTM_VIRT
     if (nv2_handle_async(regs, 1))
         return;
 #endif
@@ -461,6 +468,9 @@ void exc_irq(u64 *regs)
 
 void exc_fiq(u64 *regs)
 {
+#ifdef SPTM_VIRT
+    sptm_virt_park_check();
+#endif
 #ifdef SPTM_VIRT
     /* aura's own sampling timer while a core is still inside SPTM. */
     if (sptm_virt_sample_fiq(regs))
@@ -573,6 +583,9 @@ void exc_fiq(u64 *regs)
 
 void exc_serr(u64 *regs)
 {
+#ifdef SPTM_VIRT
+    sptm_virt_park_check();
+#endif
 #ifdef SPTM_VIRT
     if (nv2_handle_async(regs, 3))
         return;

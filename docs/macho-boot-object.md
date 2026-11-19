@@ -43,12 +43,18 @@ block can be found by its magic inside the boot object.
 
 ## Use
 
-Wrap a raw image, then enroll it from the target volume's paired Recovery:
+Wrap a raw image, then, from the target volume's paired Recovery, turn off
+Kernel CTRR for that volume and enroll the object:
 
 ```sh
 python3 tools/macho_boot_object.py stage1.bin aura-boot.macho
+bputil -nc
 kmutil configure-boot -c aura-boot.macho -v /Volumes/<volume>
 ```
+
+`bputil -nc` must come first, on every volume that gets an aura object, the
+Mach-O or the raw one. `bputil -d` then shows `Kernel CTRR Status: Disabled` and
+`(sip2): 1` for that volume group.
 
 Check what kmutil will record before enrolling. This also runs in normal
 macOS:
@@ -60,12 +66,18 @@ kmutil inspect -z -B "$PWD/aura-boot.macho" --show-mach-boot-properties
 It must report `kcbz : 0`. [recovery-enroll.md](recovery-enroll.md) describes a
 script that makes these checks in Recovery before it enrolls, and logs them.
 
-Enrolling a Mach-O object turns Kernel CTRR back on in the volume's LocalPolicy
-(`bputil -d`: `Kernel CTRR Status: Enabled`, `sip2` absent), even when the volume
-was set up with it off. A raw Stage 1 enrolled after that boots with `CTXR_D`
-armed from the device tree to its load base, so no secondary can run aura and
-Linux comes up on one CPU (seen on a J616s). To go back to a raw object, run
-`bputil -nc` first, then enroll it.
+Lowering security in Startup Security Utility is not enough on its own: it leaves
+Kernel CTRR on (`bputil -d`: `Kernel CTRR Status: Enabled`, `sip2` absent). With
+Kernel CTRR on, iBoot locks the CTRR ranges over the boot object on the
+secondaries:
+
+- A Stage 1 boots with `CTXR_D` armed from the device tree to its load base, so
+  no secondary can run aura and Linux comes up on one CPU (seen on a J616s).
+- Under the SPTM-virt hypervisor, a secondary's first store into aura's image
+  faults, and the guest panics with "cpu 0 failed to boot for the first time"
+  (seen on a J813).
+
+If `bputil -d` shows `Enabled`, run `bputil -nc`, then enroll again.
 
 An object wrapped this way arms only about 5 MiB of `CTXR_D`, which suits a
 proxy-only Stage 1. To boot an OS it has to be padded, as the installer does when

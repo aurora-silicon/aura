@@ -471,7 +471,7 @@ dwc3_dev_t *usb_iodev_bringup(u32 idx)
 USB_IODEV_WRAPPER(0, CDC_ACM_PIPE_0)
 USB_IODEV_WRAPPER(1, CDC_ACM_PIPE_1)
 
-static struct iodev_ops iodev_usb_ops = {
+struct iodev_ops iodev_usb_ops = {
     .can_read = usb_0_can_read,
     .can_write = usb_0_can_write,
     .read = usb_0_read,

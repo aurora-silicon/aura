@@ -196,6 +196,8 @@ static bool sptm_virt_rg_hook(struct exc_info *ctx, u64 addr, u64 *val, bool wri
                write ? "wr" : "rd", a - rg_xwdt, write ? " <- " : " ", write ? *val : 0, ctx->elr,
                sptm_virt_in_cl4() ? " (cL4)" : "");
     sptm_virt_s2r_note(ctx, addr, write ? *val : 0, write, width);
+    if (write && rg_wdt && (a == rg_wdt || a == rg_wdt + 0x10))
+        sptm_virt_s2r_early_release();
     if (sptm_virt_rg_passthrough) {
         for (int w = 0; write && width == 2 && w < 2; w++) {
             u64 base = w ? rg_xwdt : rg_wdt;
