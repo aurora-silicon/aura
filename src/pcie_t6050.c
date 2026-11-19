@@ -91,10 +91,9 @@ static const struct t6050_port {
 #define PCI_EXP_LNKCTL2           0x30
 #define PCI_CFG_SIZE              0x1000
 
-#define GPIO_PERST_MASK  0x27f
-#define GPIO_PERST_LOW   0x202
-#define GPIO_PERST_LOCK  BIT(21)
-#define GPIO_FOURCC_GPIO 0x4750494f /* "OIPG" in ADT byte order */
+#define GPIO_PERST_MASK 0x27f
+#define GPIO_PERST_LOW  0x202
+#define GPIO_PERST_LOCK BIT(21)
 
 static const char apcie_path[] = "/arm-io/apcie0";
 
@@ -235,7 +234,7 @@ static int find_regs(void)
 /* A port's own windows, PERST# pad, refclk-to-PERST# time and DART, from apcie0 and its bridge */
 static int find_port_regs(struct port_regs *pp)
 {
-    int path_nodes[8], gpio_path[8], dart_path[8];
+    int path_nodes[8], dart_path[8];
     u64 unused, span;
     int n = pp->p->port;
 
@@ -256,25 +255,14 @@ static int find_port_regs(struct port_regs *pp)
             FAIL("apcie0 reg[%d] missing or short\n", regs[i].idx);
     pp->rp = r.ecam + ((u64)n << 15);
 
-    /* PERST#: pci-bridge<n> function-perst = GPIO(pin) of /arm-io/gpio0 */
     snprintf(pp->bridge, sizeof(pp->bridge), "%s/pci-bridge%d", apcie_path, n);
-    struct {
-        u32 phandle, fourcc, pin, flags;
-    } perst;
     int bridge = adt_path_offset(adt, pp->bridge);
-    int gpio = adt_path_offset_trace(adt, "/arm-io/gpio0", gpio_path);
-    u32 gpio_phandle, apcie_port;
-    u64 gpio_base;
+    u32 apcie_port;
     if (bridge < 0 || ADT_GETPROP(adt, bridge, "apcie-port", &apcie_port) < 0 ||
         apcie_port != (u32)n)
         FAIL("%s is not apcie port %d\n", pp->bridge, n);
-    if (gpio < 0 || adt_getprop_copy(adt, bridge, "function-perst", &perst, sizeof(perst)) < 0 ||
-        perst.fourcc != GPIO_FOURCC_GPIO ||
-        ADT_GETPROP(adt, gpio, "AAPL,phandle", &gpio_phandle) < 0 ||
-        gpio_phandle != perst.phandle || adt_get_reg(adt, gpio_path, "reg", 0, &gpio_base, &span) ||
-        span < 4 * (perst.pin + 1))
+    if (pcie_adt_perst_gpio(pp->bridge, &pp->perst))
         FAIL("cannot resolve %s function-perst\n", pp->bridge);
-    pp->perst = gpio_base + 4 * perst.pin;
     if (ADT_GETPROP(adt, bridge, "t-refclk-to-perst", &pp->refclk_to_perst_us) < 0)
         FAIL("%s has no t-refclk-to-perst\n", pp->bridge);
 
@@ -549,8 +537,8 @@ static int stage_e(const struct port_regs *pp)
     mdelay(1);
     TRY(rmw("lane bit 9", pp->lane, 0, BIT(9)));
     TRY(rmw("lane bit 10", pp->lane, 0, BIT(10)));
-    /* refclk to PERST#: the bridge's t-refclk-to-perst (port 2: 100 us), at least 1 ms */
-    udelay(max(pp->refclk_to_perst_us, 1000u));
+    /* refclk to PERST#: the bridge's t-refclk-to-perst */
+    udelay(max(pp->refclk_to_perst_us, (u32)APCIE_REFCLK_TO_PERST_MIN_US));
 
     u32 old = read32(pp->perst);
     if (old & GPIO_PERST_LOCK)

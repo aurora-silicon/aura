@@ -39,8 +39,9 @@
 /* SMC function-reset level hold: assert, then release (smc_adt_function_reset()) */
 #define N1_RESET_SETTLE_MS 50
 
-/* AP GPIO 192 (ADT pci-bridge0 function-perst), driven high as output. */
-#define GPIO_N1_PERST 0x39a000300
+/* function-perst pad: output (bits 3:1 = 1), data bit 0 high releases PERST# */
+#define GPIO_PERST_MODE_MASK 0xf
+#define GPIO_PERST_RELEASE   0x3
 
 static int j813_reg(int *path, int idx, u64 *addr)
 {
@@ -81,6 +82,16 @@ static int j813_n1_link(void)
         j813_reg(path, 8, &port) || j813_reg(path, 10, &lane))
         return -1;
     u64 phycommon = phy + PHY_COMMON_OFF;
+
+    int bridge = adt_path_offset(adt, APCIE_PORT);
+    u32 refclk_to_perst_us;
+    u64 perst;
+    if (bridge < 0 || ADT_GETPROP(adt, bridge, "t-refclk-to-perst", &refclk_to_perst_us) < 0) {
+        printf("j813-n1: %s has no t-refclk-to-perst\n", APCIE_PORT);
+        return -1;
+    }
+    if (pcie_adt_perst_gpio(APCIE_PORT, &perst))
+        return -1;
 
     if (pmgr_adt_power_enable(APCIE))
         return -1;
@@ -152,10 +163,11 @@ static int j813_n1_link(void)
     udelay(1000);
     set32(lane, BIT(9));
     set32(lane, BIT(10));
-    udelay(1000); /* t-refclk-to-perst */
+    /* refclk to PERST#: the bridge's t-refclk-to-perst */
+    udelay(max(refclk_to_perst_us, (u32)APCIE_REFCLK_TO_PERST_MIN_US));
 
     set32(port + PORT_PERST, BIT(0));
-    mask32(GPIO_N1_PERST, 0xf, 0x3);
+    mask32(perst, GPIO_PERST_MODE_MASK, GPIO_PERST_RELEASE);
     if (j813_wait(port + PORT_PIPE_STS, BIT(0), BIT(0), 100000, "lane pipe reset") ||
         j813_wait(port + PORT_STATUS, BIT(0), BIT(0), 250000, "port RUN") ||
         j813_wait(port + PORT_LINKSTS, BIT(2), 0, 500000, "port idle"))
