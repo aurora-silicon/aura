@@ -22,8 +22,9 @@ struct adt_function_smc_gpio {
     u32 unk;
 };
 
-/* T8152 encodes the pcon power enable as pKW8("pcIO", lo, hi): an eight-byte
- * SMC write of (hi << 32) | lo | level. */
+/* The pcon power enable can also be pKW8("pcIO", lo, hi): an eight-byte SMC
+ * write of (hi << 32) | lo | level (t8152 J873, t6050 J873s ADTs). The pKW4
+ * form above (t8132, t6040, t6041 ADTs) names an SMC GPIO key instead. */
 struct adt_function_smc_pw8 {
     u32 phandle;
     char four_cc[4];
@@ -31,6 +32,17 @@ struct adt_function_smc_pw8 {
     u32 lo;
     u32 hi;
 };
+
+/* The ADT stores the function name byte-reversed: "pKW8" reads "8WKp". */
+static const struct adt_function_smc_pw8 *dcp_adt_pw8(int node, const char *name)
+{
+    u32 size;
+    const struct adt_function_smc_pw8 *fn = adt_getprop(adt, node, name, &size);
+
+    if (!fn || size != sizeof(*fn) || memcmp(fn->four_cc, "8WKp", 4))
+        return NULL;
+    return fn;
+}
 
 /* T8152 PMGR2 PSD service blocks (as in t8152-j873-gpu.dtsi): request at
  * +0x90, acknowledge bit 0 at +0xbc, state at +0x80 (read after the ACK). */
@@ -82,20 +94,17 @@ static int dcp_hdmi_dptx_init(dcp_dev_t *dcp, const display_config_t *cfg)
         return -1;
     }
     struct adt_function_smc_gpio dp2hdmi_pwr, hdmi_pwr;
-    u32 pw8_size;
-    const struct adt_function_smc_pw8 *pw8_dp2hdmi =
-        adt_getprop(adt, node, "function-dp2hdmi_pwr_en", &pw8_size);
+    /* Take the SMC key-write path when the ADT function says pKW8, on any chip. */
+    const struct adt_function_smc_pw8 *pw8_dp2hdmi = dcp_adt_pw8(node, "function-dp2hdmi_pwr_en");
 
-    if (chip_id == T8152 && pw8_dp2hdmi && pw8_size == sizeof(*pw8_dp2hdmi)) {
-        u32 hdmi_size;
-        const struct adt_function_smc_pw8 *pw8_hdmi =
-            adt_getprop(adt, node, "function-hdmi_pwr_en", &hdmi_size);
+    if (pw8_dp2hdmi) {
+        const struct adt_function_smc_pw8 *pw8_hdmi = dcp_adt_pw8(node, "function-hdmi_pwr_en");
         smc_dev_t *smc = smc_init();
         if (smc) {
             int r1 = smc_write_u64(smc, pw8_dp2hdmi->key,
                                    ((u64)pw8_dp2hdmi->hi << 32) | pw8_dp2hdmi->lo | 1);
             int r2 = -1;
-            if (pw8_hdmi && hdmi_size == sizeof(*pw8_hdmi))
+            if (pw8_hdmi)
                 r2 =
                     smc_write_u64(smc, pw8_hdmi->key, ((u64)pw8_hdmi->hi << 32) | pw8_hdmi->lo | 1);
             if (r1 || r2)
