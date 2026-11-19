@@ -101,6 +101,7 @@ struct s2r_rec {
 #define S2R_J613_SNAPSHOT BIT(13) /* AURA_S2R_CRUMBS */
 #define S2R_J613_TRAFFIC  BIT(14)
 #define S2R_J613_WAKE_AT_RESET BIT(15) /* wake register snapshot MMU-off at reset */
+#define S2R_J613_STOPSNAP BIT(16) /* commit snapshot and final-WFI state at the counted stop only */
 
 /* For the host: read over the proxy after a stop, or after a reset that kept DRAM. */
 struct s2r_rec *sptm_virt_s2r_ring;
@@ -793,8 +794,18 @@ static void s2r_j613_retention(bool wake)
 }
 
 /* Read physical state after releasing the debug domains and again at reset, before SPTM. */
+static void s2r_crumb_at(u8 off, u8 v);
+
+/* PMU scratch 0x8310 names the group a live snapshot is reading, so one silent run names it. */
+static void s2r_j613_group(bool live, u8 group)
+{
+    if (live)
+        s2r_crumb_at(8, 0x80 | group);
+}
+
 static void s2r_j613_snapshot(const char *tag, bool wake, bool retention)
 {
+    bool live = !wake && strcmp(tag, "J613STOP");
     static const struct {
         u64 first, last;
         unsigned stride;
@@ -826,9 +837,12 @@ static void s2r_j613_snapshot(const char *tag, bool wake, bool retention)
         for (unsigned i = 0; i < ARRAY_SIZE(pmgr); i++)
             for (u64 a = pmgr[i].first; a <= pmgr[i].last; a += pmgr[i].stride)
                 s2r_j613_snapshot_word(tag, a);
-    for (unsigned i = 0; i < ARRAY_SIZE(common); i++)
+    for (unsigned i = 0; i < ARRAY_SIZE(common); i++) {
+        s2r_j613_group(live, 1 + i); /* 0x81 mini PMGR, 0x82 watchdog, 0x83 wake block */
         for (u64 a = common[i].first; a <= common[i].last; a += common[i].stride)
             s2r_j613_snapshot_word(tag, a);
+    }
+    s2r_j613_group(live, 4); /* 0x84 gates, cluster, CLLT, CPU-start, commit, SPMI notify */
     for (unsigned i = 0; i < ARRAY_SIZE(regs); i++)
         s2r_j613_snapshot_word(tag, regs[i]);
     if (!wake)
@@ -838,6 +852,7 @@ static void s2r_j613_snapshot(const char *tag, bool wake, bool retention)
             if (adt_path_offset_trace(adt, asc[i], path) < 0 ||
                 adt_get_reg(adt, path, "reg", 0, &base, NULL) < 0)
                 continue;
+            s2r_j613_group(live, 8 + i); /* 0x88 PMP .. 0x8d SMC */
             s2r_j613_snapshot_word(tag, base + 0x44);
             s2r_j613_snapshot_word(tag, base + 0x48);
         }
@@ -1013,6 +1028,24 @@ static void s2r_j613_stop_export(void)
     iodev_set_usage(IODEV_DOCKCHANNEL_UART,
                     iodev_get_usage(IODEV_DOCKCHANNEL_UART) | USAGE_CONSOLE | USAGE_UARTPROXY);
     uartproxy_iodev = IODEV_DOCKCHANNEL_UART;
+    if (sptm_virt_s2r_crumbs & S2R_J613_STOPSNAP) {
+        /* The committing core does not reach its final WFI here: its state at the withheld
+         * commit, in the same registers the other cores record at theirs. */
+        s2r_retained_marker("STOPDS", SAFE_MRS("s3_5_c15_c6_2"));
+        s2r_retained_marker("STOPPT", mrs(CNTP_CTL_EL02));
+        s2r_retained_marker("STOPVT", mrs(CNTV_CTL_EL02));
+        s2r_retained_marker("STOPVFIQ", SAFE_MRS("s3_5_c15_c1_3"));
+        s2r_retained_marker("STOPPMU", SAFE_MRS("s3_1_c15_c0_0"));
+        s2r_retained_marker("STOPIPI", SAFE_MRS("s3_5_c15_c1_1"));
+        s2r_retained_marker("STOPISR", mrs(ISR_EL1));
+        s2r_retained_marker("STOPSPSR", mrs(SPSR_EL2));
+        s2r_retained_marker("STOPHCR", mrs(HCR_EL2));
+        s2r_retained_marker("STOPHPT", mrs(CNTHP_CTL_EL2));
+        s2r_retained_marker("STOPHVT", mrs(CNTHV_CTL_EL2));
+        printf("J613-STOP snapshot at the withheld commit\n");
+        iodev_console_flush();
+        s2r_j613_snapshot("J613STOP", false, false);
+    }
     u64 head = sptm_virt_s2r_head;
     u64 from = head > sptm_virt_s2r_nrec ? head - sptm_virt_s2r_nrec : 0;
     printf("J613-STOP ring 0x%lx nrec %lu head %lu wakes %u commits %u freq %lu\n",
@@ -1113,7 +1146,10 @@ bool sptm_virt_s2r_wfi(u64 *regs, u64 esr)
         if (cpu == s2r_timer_cpu)
             s2r_crumb(0x40);
         /* J613 entry trace, opt-in via crumb bit 12. CPU and counter are in each record. */
-        bool trace = chip_id == T8122 && (sptm_virt_s2r_crumbs & BIT(12));
+        bool trace = chip_id == T8122 &&
+                     ((sptm_virt_s2r_crumbs & BIT(12)) ||
+                      ((sptm_virt_s2r_crumbs & S2R_J613_STOPSNAP) && s2r_go &&
+                       sptm_virt_s2r_go_count && s2r_wake_count >= sptm_virt_s2r_go_count));
         if (trace) {
             s2r_retained_marker("WFIDS", ds);
             s2r_retained_marker("WFIPT", mrs(CNTP_CTL_EL02));
@@ -1335,8 +1371,12 @@ static bool s2r_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int w
             s2r_stop_before_timer(ctx, addr, *val);
         }
         s2r_commit();
-        if (s2r_j613_snapshot_enabled())
+        static u32 s2r_j613_pre_cycle = ~0U;
+        if (s2r_j613_snapshot_enabled() && s2r_j613_pre_cycle != s2r_wake_count) {
+            s2r_j613_pre_cycle = s2r_wake_count;
             s2r_j613_snapshot("J613PRE", false, true);
+            s2r_crumb_at(8, 0x8f); /* live snapshot done */
+        }
         s2r_crumb(0x20);
     }
 
