@@ -25,6 +25,7 @@
 #include "kboot_audio.h"
 #include "kboot_display_facts.h"
 #include "kboot_gpu_t8122.h"
+#include "kboot_legacy.h"
 #include "kboot_mte.h"
 #include "kboot_pmp_t8122.h"
 #include "kboot_t6031.h"
@@ -417,7 +418,7 @@ static int dt_set_t8140_wfx_args(int node)
  * (J514S, J516S) and the 16-inch M3 Max with the 40-core GPU (J516C) hand the internal display and
  * the GPU to the OS on every boot, as M1 and M2 Macs do. Each switch below
  * is put in /chosen as "1" unless a config line set it
- * already, so chosen.<switch>=0 in /etc/m1n1.conf (update-m1n1 copies it into boot.bin) still
+ * already, so chosen.<switch>=0 in /etc/aura.conf (update-aura copies it into boot.bin) still
  * turns that one off, and chosen.aurora,m3-defaults=0 adds none of them (an owner's own lines,
  * an =1 included, stay as written). If a config line was
  * lost this session (a full table, a failed allocation, or one the payload scan lost), an owner's
@@ -459,7 +460,8 @@ static const char *const m3_pro_boards[] = {"apple,j514s", "apple,j516s", NULL};
 static const char *const m3_pro_switches[] = {"aurora,t6030-dcp", "aurora,t6030-gpu", NULL};
 static const char *const m3_max_boards[] = {"apple,j516c", NULL};
 static const char *const m3_max_switches[] = {"aurora,t6031-dcp", "aurora,t6031-gpu", NULL};
-static const char *const m3_air_graphics[] = {"aurora,t8122-", "aurora,j613-", "aurora,j615-", NULL};
+static const char *const m3_air_graphics[] = {"aurora,t8122-", "aurora,j613-", "aurora,j615-",
+                                              NULL};
 static const char *const m3_pro_graphics[] = {"aurora,t6030-", NULL};
 static const char *const m3_max_graphics[] = {"aurora,t6031-", NULL};
 
@@ -1315,7 +1317,7 @@ static int dt_set_speaker_safety(void)
     for (int node = fdt_first_subnode(dt, chosen); node >= 0;) {
         int next = fdt_next_subnode(dt, node);
         const char *name = fdt_get_name(dt, node, NULL);
-        if (!strncmp(name, "aurora-speaker-safety", 20) && (name[20] == 0 || name[20] == '@'))
+        if (!strncmp(name, "aurora-speaker-safety", 21) && (name[21] == 0 || name[21] == '@'))
             fdt_nop_node(dt, node);
         node = next;
     }
@@ -2254,7 +2256,7 @@ static int dt_set_smbios_firmware(void)
     if (stage1[0] &&
         dt_smbios_firmware(&inv, "stage1", "aura Stage 1", stage1, "Aurora Silicon", 0))
         return -1;
-    /* Stage 2 updates from the OS (update-m1n1); stage 1 needs recoveryOS (kmutil) */
+    /* Stage 2 updates from the OS (update-aura); stage 1 needs recoveryOS (kmutil) */
     if (dt_smbios_firmware(&inv, "stage2", "aura Stage 2", aura_version, "Aurora Silicon",
                            SMBIOS_FW_UPDATABLE))
         return -1;
@@ -2660,7 +2662,8 @@ static int dt_set_mac_addresses(void)
 
         if (chip_id == T8140 && !strcmp(mac_address_devices[i].alias, "wifi0")) {
             int chosen = fdt_path_offset(dt, "/chosen");
-            if (chosen < 0 || fdt_setprop(dt, chosen, "aurora,wifi-mac-address", addr, sizeof(addr)))
+            if (chosen < 0 ||
+                fdt_setprop(dt, chosen, "aurora,wifi-mac-address", addr, sizeof(addr)))
                 bail("FDT: could not set deferred Wi-Fi MAC address\n");
         }
     }
@@ -4987,8 +4990,9 @@ static void dt_ext26_result(int error)
              ext26_detail[0] ? " " : "", ext26_detail);
     printf("FDT: J613 ext26 result: %s\n", result);
     int chosen = fdt_path_offset(dt, "/chosen");
-    int ret = chosen < 0 ? chosen
-                         : fdt_setprop_string(dt, chosen, "aurora,j613-25g83-dcpext-result", result);
+    int ret = chosen < 0
+                  ? chosen
+                  : fdt_setprop_string(dt, chosen, "aurora,j613-25g83-dcpext-result", result);
     if (ret)
         printf("FDT: J613 ext26 result publication failed: %d\n", ret);
 }
@@ -7099,7 +7103,8 @@ static int dt_set_display_t8140(void)
     /* A diagnostic result for this preflight, not a hardware-ready claim.
      * 0: absent, 1: power off, 2..7: validation stage, 8: firmware DART
      * table reservation, 9: dependencies. */
-    if (fdt_setprop_u32(dt, node, "aurora,external-display-preflight", ext_ready ? 0x100 : ext_step))
+    if (fdt_setprop_u32(dt, node, "aurora,external-display-preflight",
+                        ext_ready ? 0x100 : ext_step))
         printf("FDT: external preflight observation unavailable\n");
     free(saved);
     printf("FDT: T8140 DCP enabled with validated framebuffer, firmware and live inherited RTKit "
@@ -8106,8 +8111,8 @@ static int dt_set_display(void)
          * Fail-soft handoff (kboot_display_handoff.c): it always returns 0, never uses the
          * helpers above (they bail out of kboot or enable nodes) and never enables a node.
          * On T8122 it does nothing unless chosen.aurora,t8122-dcp=1; the external DCP firmware is
-         * reserved only with chosen.aurora,t8122-dcpext=1 and that handoff. On T6031 it does nothing
-         * unless the board is a J514C or J516C, and reserves only __OS_LOG unless
+         * reserved only with chosen.aurora,t8122-dcpext=1 and that handoff. On T6031 it does
+         * nothing unless the board is a J514C or J516C, and reserves only __OS_LOG unless
          * chosen.aurora,t6031-dcp=1 (on a J516C, dt_set_m3_defaults() sets it unless a config line
          * set it).
          */
@@ -9308,7 +9313,7 @@ static int dt_set_isp_fwdata(void)
     if (firmware_set_fdt(dt, fdt_node, "apple,firmware-compat", compat) < 0)
         bail("FDT: Could not set apple,firmware-compat for %s\n", fdt_path);
 
-    /* T6041: iBoot's firmware, not m1n1's heap setup */
+    /* T6041: iBoot's firmware, not aura's heap setup */
     if (chip_id == T6041)
         return dt_set_isp_t6041(fdt_node);
 
@@ -10907,10 +10912,27 @@ int kboot_set_chosen(const char *name, const char *value)
 {
     int i = 0;
     char *copy = NULL;
+    char renamed[128];
 
     if (!name) {
         chosen_lost = true;
         return -1;
+    }
+    /*
+     * LEGACY-ASAHI(2027-02-28): an owner's chosen.asahi,X line, or the version line an
+     * older Stage 1 forwards (asahi,m1n1-stage1-version), is kept as aurora,X with m1n1
+     * read as aura. The device tree still gets the old name: aurora_legacy_chosen_aliases().
+     */
+    if (!strncmp(name, "asahi,", 6)) {
+        const char *rest = name + 6, *m = strstr(rest, "m1n1");
+        int n = m ? snprintf(renamed, sizeof(renamed), "aurora,%.*saura%s", (int)(m - rest), rest,
+                             m + 4)
+                  : snprintf(renamed, sizeof(renamed), "aurora,%s", rest);
+        if (n < 0 || n >= (int)sizeof(renamed)) {
+            chosen_lost = true;
+            return -1;
+        }
+        name = renamed;
     }
     /* The new value first: a failure leaves an existing entry (an owner's =0) as it was */
     if (value) {
@@ -11271,6 +11293,25 @@ static int kboot_move_to_exec_window(void **kernel)
     return 0;
 }
 
+/*
+ * LEGACY-ASAHI(2027-02-28): released kernels and U-Boot read the "asahi," names. Fail-soft:
+ * without room the "aurora," names still go to the kernel.
+ */
+static void dt_add_legacy_aliases(void)
+{
+    if (fdt_open_into(dt, dt, dt_bufsize)) {
+        printf("FDT: legacy aliases skipped: could not reopen the tree\n");
+        return;
+    }
+    int n = aurora_legacy_chosen_aliases(dt);
+    if (n < 0)
+        printf("FDT: legacy aliases incomplete: device tree full\n");
+    else
+        printf("FDT: %d legacy aliases\n", n);
+    if (fdt_pack(dt))
+        printf("FDT: fdt_pack() after the legacy aliases failed\n");
+}
+
 /* T8152 has no clock, USB, PCIe or DAPF setup here: j873g_run_proxy() did
  * what the device tree expects, and Linux owns the rest. */
 static int kboot_boot_t8152(void *kernel)
@@ -11281,6 +11322,7 @@ static int kboot_boot_t8152(void *kernel)
         next_stage.entry = NULL;
         bail("kboot: refusing handoff while secondary callbacks are pending\n");
     }
+    dt_add_legacy_aliases();
     printf("Setting SMP mode to WFE...\n");
     smp_set_wfe_mode(true);
     if (fdt_getprop(dt, 0, "aurora,minimal-boot", NULL) && smp_park_for_kernel()) {
@@ -12004,6 +12046,7 @@ int kboot_boot(void *kernel)
         if (fdt_pack(dt))
             return -1;
     }
+    dt_add_legacy_aliases();
     printf("Setting SMP mode to WFE...\n");
     smp_set_wfe_mode(true);
     if (chip_id == T8140 && dt_t8140_recheck_display())

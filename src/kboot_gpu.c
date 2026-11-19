@@ -530,9 +530,9 @@ static int fdt_set_aux_opp(void *dt, int gpu, const char *prop, const struct aux
  *   instead of calc_power_t600x().
  * - The OPP table is rebuilt from the runtime ADT, because the pstate count is not known statically
  *   (iBoot fills in the perf-state properties at boot).
- * - hw-cal-a/hw-cal-b/globals stay disabled: aura's Rust initdata has no G15 layouts, and drm/aurora
- *   only uses these blobs as an optional debug cross-check (gpu.rs load_hwdata_blob(), which falls
- *   back to an empty blob).
+ * - hw-cal-a/hw-cal-b/globals stay disabled: aura's Rust initdata has no G15 layouts, and
+ * drm/aurora only uses these blobs as an optional debug cross-check (gpu.rs load_hwdata_blob(),
+ * which falls back to an empty blob).
  */
 #define G15S_ID_GEN            7        // ID_VERSION[31:24]
 #define G15S_ID_VARIANT        3        // ID_VERSION[23:16], 3 = G15S
@@ -1155,8 +1155,8 @@ static int g15_set_opps(void *dt, u32 opps_ph, u32 count, u32 table_count, u32 c
 
         for (u32 j = 0; j < clusters; j++) {
             /*
-             * One voltage per MGPU (drm/aurora expects max_num_clusters entries). Missing tables and
-             * zero entries are back-filled from table 0.
+             * One voltage per MGPU (drm/aurora expects max_num_clusters entries). Missing tables
+             * and zero entries are back-filled from table 0.
              */
             u32 t = j < table_count ? j : 0;
             u32 mv = perf_states[i + t * count].volt;
@@ -3066,7 +3066,7 @@ static const struct g17_soc g17_soc_t8142 = {
     .firmware_profile = T8142_GPU_FIRMWARE_PROFILE,
 };
 
-/* M5 Max (G17C): four perf-state tables, the OPPs from the first, as m1n1 hands it over. */
+/* M5 Max (G17C): four perf-state tables, the OPPs from the first, as aura hands it over. */
 static const struct g17_soc g17_soc_t6050 = {
     .compat = "apple,agx-t6050",
     .adt_compat = "gpu,t6050",
