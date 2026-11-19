@@ -46,7 +46,9 @@ static int cdc_reset_hpm(char *path, tps6598x_dev_t *hpm, void *unused)
 {
     (void)path;
     (void)unused;
-    return tps6598x_cold_reset(hpm) ? HPM_ACTION_ERROR : HPM_ACTION_STOP;
+    if (tps6598x_cold_reset(hpm) || tps6598x_wait_ready(hpm))
+        return HPM_ACTION_ERROR;
+    return HPM_ACTION_STOP;
 }
 
 static int cdc_power_hpm(char *path, tps6598x_dev_t *hpm, void *unused)
@@ -120,7 +122,6 @@ void usb_cdc_poll(void)
     if (cdc.flags & BIT(2)) {
         if (tps6598x_foreach_hpm(cdc_dfu_hpm, cdc_reset_hpm, NULL) != HPM_ACTION_STOP)
             goto failed;
-        mdelay(1000);
     }
 
     cdc.step = 2;

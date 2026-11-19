@@ -11,11 +11,12 @@ READ = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_uint8,
                         ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t)
 NOW = ctypes.CFUNCTYPE(ctypes.c_uint64, ctypes.c_void_p)
 DELAY = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_uint)
+WAKE = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p)
 
 
 class Ops(ctypes.Structure):
     _fields_ = [("write", WRITE), ("read", READ),
-                ("now_ms", NOW), ("delay_us", DELAY)]
+                ("now_ms", NOW), ("delay_us", DELAY), ("wake", WAKE)]
 
 
 def command_lib(tmp_path):
@@ -29,7 +30,88 @@ def command_lib(tmp_path):
                                               ctypes.c_size_t, ctypes.c_void_p,
                                               ctypes.c_size_t]
     lib.tps6598x_command_execute.restype = ctypes.c_int
+    lib.tps6598x_reset_wait_execute.argtypes = [ctypes.POINTER(Ops), ctypes.c_void_p,
+                                                 ctypes.POINTER(ctypes.c_uint32)]
+    lib.tps6598x_reset_wait_execute.restype = ctypes.c_int
     return lib
+
+
+class ResettingHpm:
+    """CMD1/MODE as a controller rebooting after Gaid: answers `stale` polls
+    from the old firmware, fails the transport for `down` polls, then reads
+    MODE `modes` in turn (the last one sticks)."""
+
+    def __init__(self, stale, down, modes):
+        self.clock = 0
+        self.stale = stale
+        self.down = down
+        self.modes = list(modes)
+        self.wakes = 0
+        self.ops = Ops(WRITE(lambda ctx, reg, data, length: length), READ(self.read),
+                       NOW(lambda ctx: self.clock), DELAY(self.delay), WAKE(self.wake))
+
+    def delay(self, ctx, usec):
+        self.clock += usec // 1000
+        if self.stale:
+            self.stale -= 1
+        elif self.down:
+            self.down -= 1
+        elif len(self.modes) > 1:
+            self.modes.pop(0)
+
+    def wake(self, ctx):
+        self.wakes += 1
+        return 0
+
+    def read(self, ctx, reg, data, length):
+        if self.stale:
+            value = b"Gaid" if reg == 0x08 else b"APP "
+        elif self.down:
+            return -1
+        else:
+            value = b"\0\0\0\0" if reg == 0x08 else self.modes[0]
+        ctypes.memmove(data, value, 4)
+        return length
+
+
+def test_reset_wait_ignores_old_firmware_and_rides_out_the_reset(tmp_path):
+    lib = command_lib(tmp_path)
+    hpm = ResettingHpm(stale=3, down=20, modes=[b"BOOT", b"BOOT", b"APP "])
+    mode = ctypes.c_uint32()
+    assert lib.tps6598x_reset_wait_execute(ctypes.byref(hpm.ops), None,
+                                           ctypes.byref(mode)) == 0
+    assert mode.value == int.from_bytes(b"APP ", "little")
+    # Ready only after the reset was seen and the boot modes passed.
+    assert hpm.clock == (3 + 20 + 2) * 10
+    assert hpm.wakes == 20
+
+
+def test_reset_wait_accepts_app1(tmp_path):
+    lib = command_lib(tmp_path)
+    hpm = ResettingHpm(stale=0, down=0, modes=[b"APP1"])
+    mode = ctypes.c_uint32()
+    assert lib.tps6598x_reset_wait_execute(ctypes.byref(hpm.ops), None,
+                                           ctypes.byref(mode)) == 0
+    assert hpm.clock == 0
+
+
+def test_reset_wait_fails_when_firmware_never_returns(tmp_path):
+    lib = command_lib(tmp_path)
+    hpm = ResettingHpm(stale=0, down=0, modes=[b"BOOT"])
+    mode = ctypes.c_uint32()
+    assert lib.tps6598x_reset_wait_execute(ctypes.byref(hpm.ops), None,
+                                           ctypes.byref(mode)) == -2
+    assert mode.value == int.from_bytes(b"BOOT", "little")
+    assert hpm.clock == 2000
+
+
+def test_reset_wait_fails_when_reset_never_happens(tmp_path):
+    lib = command_lib(tmp_path)
+    hpm = ResettingHpm(stale=10**6, down=0, modes=[b"APP "])
+    mode = ctypes.c_uint32()
+    assert lib.tps6598x_reset_wait_execute(ctypes.byref(hpm.ops), None,
+                                           ctypes.byref(mode)) == -2
+    assert mode.value == 0
 
 
 def test_stuck_register_selection_uses_whole_command_deadline(tmp_path):
