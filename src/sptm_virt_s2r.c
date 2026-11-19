@@ -741,8 +741,10 @@ static bool s2r_j613_wake_snap_enabled(u32 wake_no)
         return false;
     if (sptm_virt_s2r_crumbs & S2R_J613_SNAPSHOT)
         return true;
-    return (sptm_virt_s2r_crumbs & S2R_J613_STOPSNAP) && sptm_virt_s2r_go_count >= 2 &&
-           wake_no == sptm_virt_s2r_go_count;
+    /* Bit 17 adds bit 16's wake snapshot on the last permitted wake. Run 47 (ec87a8cb, bit 16
+     * alone then) did not come back from the wake it was taken on; run 48 without it did. */
+    return (sptm_virt_s2r_crumbs & S2R_J613_STOPSNAP) && (sptm_virt_s2r_crumbs & BIT(17)) &&
+           sptm_virt_s2r_go_count >= 2 && wake_no == sptm_virt_s2r_go_count;
 }
 
 static bool s2r_j613_traffic_enabled(void)
