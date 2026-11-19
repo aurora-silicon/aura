@@ -182,10 +182,11 @@ static void gpu_park(struct exc_info *ctx, const char *why)
     sptm_virt_park_others();
     gpu_parked = true;
     printf("SPTM-virt[gpu]: %s: parking cpu%d in the proxy at XNU pc "
-           "0x%lx; ring 0x%lx, %lu records of %lu written (head 0x%lx at 0x%lx)\n",
+           "0x%lx; ring 0x%lx, %lu records of %lu written (head 0x%lx at 0x%lx); cores held "
+           "0x%lx\n",
            why, smp_id(), ctx->elr, (u64)sptm_virt_gpu_ring,
            sptm_virt_gpu_head < sptm_virt_gpu_nrec ? sptm_virt_gpu_head : sptm_virt_gpu_nrec,
-           sptm_virt_gpu_head, sptm_virt_gpu_head, (u64)&sptm_virt_gpu_head);
+           sptm_virt_gpu_head, sptm_virt_gpu_head, (u64)&sptm_virt_gpu_head, sptm_virt_parked_mask);
     iodev_console_flush();
     struct uartproxy_msg_start start = {
         .reason = START_HV,
