@@ -1036,7 +1036,8 @@ def test_launcher_gpu_option():
     attach = run_guest.split("def windows_t8152_gpu_admit(", 1)[1].split("\ndef ", 1)[0]
     assert attach.index("GPU_OP_ADMIT") < attach.index("set_windows_gpu_handshake")
     assert "if mode == \"off\":\n        return" in attach
-    assert "windows_t8152_gpu_admit(hv, gpu_mode, usb_ports, ahci)" in run_guest
+    assert "windows_t8152_gpu_admit(hv, gpu_mode, usb_ports, ahci, input_sources, input_mtp)" \
+        in run_guest
 
 
 def test_launcher_pool_layout():
@@ -1325,7 +1326,9 @@ def _input_attach_under_test(query_fails=False, attach_result=0):
         raise _Exit(message)
 
     env = {"p": Proxy(), "sys": types.SimpleNamespace(exit=sys_exit),
-           "ProxyRemoteError": RemoteError, "print": lambda *a: None}
+           "ProxyRemoteError": RemoteError, "print": lambda *a: None,
+           "args": types.SimpleNamespace(windows_input_fn_default="media",
+                                         windows_input_require_mtp=False)}
     exec(compile(ast.Module(body=[fn], type_ignores=[]), "run_guest.py", "exec"), env)
     hv = types.SimpleNamespace(set_windows_input_handshake=lambda v: calls.append(("hs", v)))
     return env["windows_t8152_input_attach"], hv, calls
@@ -1335,12 +1338,13 @@ def _input_attach_under_test(query_fails=False, attach_result=0):
 @pytest.mark.parametrize("failing", ["query", "attach"])
 def test_launcher_input_refusal_detaches_usb(gpu_mode, failing):
     """An input refusal after USB ATTACH detaches USB (and, with probe, runs GPU STOP first)
-    instead of dying on a NameError: the refuse() closure only uses names it was given."""
+    instead of dying on a NameError: the refuse() closure only uses names it was given.  G5b:
+    input attaches before the GPU is admitted, so that STOP is a no-op there (kept anyway)."""
     from aura import windows as w
     attach, hv, calls = _input_attach_under_test(
         query_fails=failing == "query", attach_result=0 if failing == "query" else 2)
     with pytest.raises(_Exit):
-        attach(hv, ["host"], (1,), gpu_mode)
+        attach(hv, ["host"], (1,), gpu_mode=gpu_mode)
     kinds = [c[0] for c in calls]
     assert kinds[-1] == "exit" and "hs" not in kinds
     detach = calls.index(("usb", w.USB_OP_DETACH))
@@ -1357,19 +1361,25 @@ def test_launcher_input_refusal_detaches_usb(gpu_mode, failing):
 
 
 def test_launcher_reports_after_a_host_stop():
-    """Ctrl-C is the only way out of the M6 probe build: the abort RuntimeError is caught (only
-    when the guest was aborted) and the USB / GPU / input status, including the G1 access map,
-    is still read from the proxy."""
+    """Ctrl-C is the only way out of the M6 probe build.  G5b: the abort is N's
+    WindowsGuestAborted (a RuntimeError), caught with the other hv.start() failures; before input
+    and USB are detached, the USB / GPU / input status, including the G1 access map, is still read
+    from the proxy (gpu3's host-stop read), then N's NVMe close and exit text follow."""
     src = (REPO / "proxyclient/tools/run_guest.py").read_text()
     t8152 = src[src.index("def run_windows_t8152"):src.index("_windows_caps = windows_resident_caps()")]
     start = t8152.index("result = hv.start()")
-    caught = t8152.index("except RuntimeError as exc:", start)
-    assert t8152.index("if hv.windows_abort_reason is None:\n            raise", caught) < \
-        t8152.index("result = None", caught) < \
-        t8152.index("windows_t8152_usb_status(usb_ports)") < \
-        t8152.index("windows_t8152_gpu_status(gpu_mode)")
+    caught = t8152.index("except (ProxyRemoteError, WindowsGuestAborted, WindowsGuestExitTimeout) "
+                         "as exc:", start)
+    aborted = t8152.index("elif isinstance(exc, WindowsGuestAborted):", caught)
+    assert aborted < t8152.index("windows_t8152_usb_status(usb_ports)", caught) < \
+        t8152.index("windows_t8152_gpu_status(gpu_mode)", caught) < \
+        t8152.index("windows_t8152_input_status(input_sources)", caught) < \
+        t8152.index("p.hv_windows_usb(USB_OP_DETACH)", caught) < \
+        t8152.index("p.hv_windows_input(INPUT_OP_DETACH)", caught)
+    assert "except RuntimeError as exc:" not in t8152
     hv = (REPO / "proxyclient/aura/hv/__init__.py").read_text()
-    assert 'raise RuntimeError(f"Windows guest aborted: {self.windows_abort_reason}")' in hv
+    assert "class WindowsGuestAborted(RuntimeError):" in hv
+    assert 'raise WindowsGuestAborted(f"Windows guest aborted: {self.windows_abort_reason}")' in hv
 
 
 def test_kboot_refuses_after_a_gpu_session():

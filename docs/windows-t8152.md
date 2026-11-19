@@ -1293,3 +1293,43 @@ Not verified (each needs the M6): the multi-touch descriptor and the 38 + 30n fr
 J804; the 0xD9 answer and the real resolution; whether the MTP asks for GPIO pulses on the
 AFE line (refused); the SMC staying healthy after the two writes; the haptic click with the
 actuator never enabled; the tunables (gain, acceleration, scroll travel, tap limits).
+
+## G5b: the merged carrier (D5 + I1/I2 + tick CPU + G1/G2)
+
+Status: built and host-tested only; nothing of the merge has run on the M6. One carrier carries
+the NVMe-backed disk and the guest-SError report (D5), the internal keyboard and trackpad
+(I1/I2), the tick-CPU choice (`P_HV_WINDOWS_TICK_CPU`) and the GPU G1/G2 path.
+`P_HV_WINDOWS_CAPS2` = `0x415749320000007f`: bit 5 is the D5 NVMe disk and **G2 moved to bit 6**
+(gpu3 had it on bit 5). `tests/python/test_windows_t8152_caps2.py` fails on any bit claimed twice.
+
+Launch order (`run_guest.py`): the AHCI store or NVMe disk, USB, then **input ATTACH (the MTP
+bring-up) and the optional input PROBE, then GPU ADMIT, G2, POWER and PROBE**, then `hv.start()`.
+An input refusal therefore never spends the boot's GPU firmware session; a GPU refusal detaches
+input again and says the MTP keeps running (leave by P_REBOOT). Refused before anything reaches
+the M6: `--windows-input-probe-only` with any GPU mode; `--windows-gpu probe|g2` with the NVMe
+backend (the GPU pool is not re-derived for that layout, G5-PLAN C-1); `--windows-serror
+continue` with the GPU (D5). On Ctrl-C or a forwarded guest exception the launcher reads the
+USB, GPU (access map, UAT audit) and input status before it detaches anything.
+
+Teardown: `hv_start()` runs USB, then GPU teardown, then the AHCI/NVMe session end;
+`flush_and_reboot()` stops USB DMA and GPU forwarding, then D5's bounded NVMe close.
+
+The fatal report's GPU part describes the G1/G2 session from recorded values (no lock, no MMIO):
+state, G1 counters and the boot marker, G2 grants, boot-control step, sgx lock, init data, the
+five guards, the UAT audit summary, message counts and the last forwarded doorbell.
+
+**Console.** The proxy CDC's console write no longer waits for the host (d5c froze cpu6 705 s in
+the tick's printout while the Mac slept): it takes what fits in the 1 MiB ring and returns; what
+the 8 KiB console buffer has to overwrite is dropped and counted, with stall count, longest and
+current stall. Only the guest-SError report, the unhandled-exception report and `HV: All CPUs
+exited` wait for the host, at most 2 s each. The proxy protocol itself stays blocking.
+
+**Once a minute of guest run** the tick owner prints:
+
+    HV: STATUS t=<guest s> soc=<SoC s> tick cpu <t> boot cpu <b>
+    HV: STATUS exits/min: c0=<n> ... (live CPUs)
+    HV: STATUS ahci <commands> input <ok>/<bad>; console dropped <bytes> stalls <n> longest <us> us now <us> us write max <us> us; vuart overruns <n>
+    HV: GPU SUM t=<s> st=0x<state> g2=<0|1> fwd <n> denied <n> runref <n> faults <n> db <n> aud <n> fresh_max <n> capped <0|1> tbl <n>/1024 guards <n> init 0x<roles> msgs tx/rx <gfx tx>/<gfx rx> <mgmt tx>/<mgmt rx> drop <bytes>
+
+`GPU SUM` appears only while a G1/G2 session forwards. All values are relaxed reads of counters
+other paths keep. The input line is unchanged (checked each second, printed on change).

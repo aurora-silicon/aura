@@ -1099,6 +1099,18 @@ def run_windows_t8152(caps):
         sys.exit("T8152 launch refused: --windows-serror continue is for the RAM store with the "
                  "GPU off (not --windows-ahci-nvme-access rw, not --windows-gpu "
                  f"{args.windows_gpu}). The aura proxy keeps running; no guest was started.")
+    if args.windows_input_probe_only and args.windows_gpu not in ('off', 'disabled'):
+        # The probe-only launch exits with no guest: a GPU admission or POWER would be spent
+        # (and, for probe/g2, this boot's firmware session) for nothing.
+        sys.exit(f"T8152 launch refused: --windows-input-probe-only starts no guest; it takes "
+                 f"--windows-gpu off, not {args.windows_gpu}. The aura proxy keeps running; no "
+                 "guest was started.")
+    if args.windows_gpu in ('probe', 'g2') and ahci_nvme_requested():
+        # G5b: the GPU pool has not been re-derived for the NVMe-backed layout (G5-PLAN C-1), and
+        # no Windows-M6 partition access runs with the GPU before the owner confirms it.
+        sys.exit(f"T8152 launch refused: --windows-gpu {args.windows_gpu} is for the RAM store "
+                 "(--windows-ahci-backend ram) until the NVMe-route GPU pool is re-derived and "
+                 "reviewed (G5-PLAN C-1). The aura proxy keeps running; no guest was started.")
     if args.windows_tick_cpu is not None and not 0 <= args.windows_tick_cpu < 12:
         sys.exit("T8152 launch refused: --windows-tick-cpu takes a CPU number 0-11")
     if not args.windows_guest_ram or ":" not in args.windows_guest_ram:
