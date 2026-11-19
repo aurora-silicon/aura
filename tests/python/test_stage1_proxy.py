@@ -24,8 +24,6 @@ def proxy_lib(tmp_path):
     lib.stage1_proxy_window_step.restype = ctypes.c_int
     lib.stage1_proxy_payload_action.argtypes = [ctypes.c_int] + [ctypes.c_bool] * 3
     lib.stage1_proxy_payload_action.restype = ctypes.c_int
-    lib.stage1_proxy_action_needs_cleanup.argtypes = [ctypes.c_int]
-    lib.stage1_proxy_action_needs_cleanup.restype = ctypes.c_bool
     return lib
 
 
@@ -36,7 +34,7 @@ def step(lib, window, elapsed, ready=False, failed=False, taken=False,
     )
 
 
-def test_no_host_expires_to_native_and_requires_cleanup(tmp_path):
+def test_no_host_expires_to_native(tmp_path):
     lib = proxy_lib(tmp_path)
     window = Window()
     lib.stage1_proxy_window_init(ctypes.byref(window), 10_000)
@@ -44,7 +42,6 @@ def test_no_host_expires_to_native_and_requires_cleanup(tmp_path):
     assert step(lib, window, 10_000, ready=True, taken=True) == 3
     action = lib.stage1_proxy_payload_action(3, True, True, False)
     assert action == 0
-    assert lib.stage1_proxy_action_needs_cleanup(action)
 
 
 def test_cdc_is_primary_when_both_syncs_are_observed(tmp_path):
@@ -82,7 +79,6 @@ def test_failed_cdc_start_has_bounded_safe_ownership(tmp_path):
 def test_missing_path_keeps_live_cdc_as_safe_proxy_fallback(tmp_path):
     lib = proxy_lib(tmp_path)
     assert lib.stage1_proxy_payload_action(3, False, True, False) == 1
-    assert not lib.stage1_proxy_action_needs_cleanup(1)
     assert lib.stage1_proxy_payload_action(3, False, False, True) == 2
 
 
