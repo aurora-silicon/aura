@@ -488,12 +488,76 @@ static bool nvme_ans_power_off(void)
     return true;
 }
 
-/* Post-M4, ANS off: power, the SART entries back, then the firmware's start after a power loss. */
+/* ASC CPU status bits: stopped, and the state a reset of ANS leaves until the run bit. */
+#define NVME_ASC_STATUS_STOPPED BIT(1)
+#define NVME_ASC_STATUS_RESET   BIT(3)
+
+/* Wait up to timeout_us for one of the ASC CPU status bits in mask. */
+static bool nvme_asc_status_wait(u32 mask, u32 timeout_us)
+{
+    for (u32 waited = 0; !(asc_cpu_status(nvme_asc) & mask); waited += 100) {
+        if (waited >= timeout_us)
+            return false;
+        udelay(100);
+    }
+    return true;
+}
+
+/*
+ * Stop ANS's CPU and reset ANS through its PMGR device, which takes the SART entries with it.
+ * A CPU that was stopped without a reset since it last ran doesn't start again from the run bit:
+ * the firmware sends no HELLO, then or later. The same reset Diljit Singh's U-Boot start from
+ * off does (aurora-silicon/u-boot#38).
+ */
+static void nvme_ans_reset(void)
+{
+    asc_cpu_stop(nvme_asc);
+    if (!nvme_asc_status_wait(NVME_ASC_STATUS_STOPPED, 100000))
+        printf("nvme: ANS CPU didn't report stopped (status 0x%x)\n", asc_cpu_status(nvme_asc));
+    if (pmgr_reset(nvme_die, "ANS")) {
+        printf("nvme: couldn't reset ANS (status 0x%x)\n", asc_cpu_status(nvme_asc));
+        return;
+    }
+    nvme_asc_status_wait(NVME_ASC_STATUS_RESET, 10000);
+    printf("nvme: ANS reset: status 0x%x\n", asc_cpu_status(nvme_asc));
+}
+
+/* The SART entries back, then the firmware's start after a power loss. */
+static bool nvme_ans_start_warm(void)
+{
+    return sart_set_entries(nvme_sart, nvme_sart_saved, nvme_sart_saved_cnt) &&
+           rtkit_boot_warm(nvme_rtkit, BIT(0)) &&
+           poll32(nvme_base + NVME_BOOT_STATUS, 0xffffffff, NVME_BOOT_STATUS_OK, USEC_PER_SEC) >=
+               0;
+}
+
+/*
+ * Post-M4, ANS off: power, then the warm start. ANS is reset first when its CPU isn't in the
+ * state a reset leaves, and once more, with a fresh RTKit instance, when the firmware doesn't
+ * answer the run bit.
+ */
 static bool nvme_ans_power_on(void)
 {
-    if (pcie_ans_power_on() || !sart_set_entries(nvme_sart, nvme_sart_saved, nvme_sart_saved_cnt) ||
-        !rtkit_boot_warm(nvme_rtkit, BIT(0)) ||
-        poll32(nvme_base + NVME_BOOT_STATUS, 0xffffffff, NVME_BOOT_STATUS_OK, USEC_PER_SEC) < 0) {
+    if (pcie_ans_power_on()) {
+        printf("nvme: couldn't power ANS on; it stays down until a reboot\n");
+        return false;
+    }
+    u32 status = asc_cpu_status(nvme_asc);
+    printf("nvme: ANS CPU status 0x%x before the run bit\n", status);
+    if (!(status & NVME_ASC_STATUS_RESET)) {
+        printf("nvme: ANS isn't in its reset state: resetting it\n");
+        nvme_ans_reset();
+    }
+    bool started = nvme_ans_start_warm();
+    if (!started && !rtkit_has_owned_buffers(nvme_rtkit)) {
+        printf("nvme: ANS didn't answer the run bit (status 0x%x): resetting it, one more try\n",
+               asc_cpu_status(nvme_asc));
+        nvme_ans_reset();
+        rtkit_free(nvme_rtkit);
+        nvme_rtkit = rtkit_init("nvme", nvme_asc, NULL, NULL, nvme_sart, false);
+        started = nvme_rtkit && nvme_ans_start_warm();
+    }
+    if (!started) {
         printf("nvme: ANS didn't start from off; it stays down until a reboot\n");
         return false;
     }
