@@ -30,6 +30,7 @@ _Static_assert(sizeof(u64) == 8, "the aura host fixture requires an LP64 host");
 #define PACKED __attribute__((packed))
 #define static_assert _Static_assert
 #define T6040 0x6040
+#define T6050 0x6050
 #define T8132 0x8132
 #define T8140 0x8140
 #define PMGR_FLAG_VIRTUAL 0x10

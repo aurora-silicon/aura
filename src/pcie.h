@@ -11,9 +11,15 @@ int pcie_prepare_fdt(void *dt);
 int pcie_handoff_fdt(void *dt);
 int pcie_init(void);
 int pcie_shutdown(void);
-/* T6050 apcie0 port 2 (pcie_t6050.c): 0 up, -1 stopped (sticky for this boot) */
+/*
+ * T6050 apcie0 GP ports (pcie_t6050.c), sticky for this boot: 0 up; -1 stopped; on a board without
+ * a required port a stop is PCIE_T6050_LEFT (before anything was written: left for the OS) or
+ * PCIE_T6050_PARTIAL (after: the down ports go disabled), and the boot goes on.
+ */
+#define PCIE_T6050_LEFT    1
+#define PCIE_T6050_PARTIAL 2
 int pcie_t6050_init(void);
-/* Disable an untrained optional port's root port and DART in the handed-over tree */
+/* Describe the ports in the handed-over tree as pcie_t6050_init() left them */
 int pcie_t6050_handoff_fdt(void *dt);
 int pcie_ans_power_off(void);
 /* Back on after pcie_ans_power_off(), CPU stopped */

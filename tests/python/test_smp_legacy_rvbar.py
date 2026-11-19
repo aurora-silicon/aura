@@ -36,6 +36,8 @@ static u64 pmgr_die_stride(void) { return PMGR_DIE_OFFSET; }
 #define SZ_16K 0x4000UL
 #define T8142 0x8142
 #define T8152 0x8152
+#define T6050 0x6050
+static int smp_prepare_rvbar_t6050(u64 l, u64 t) { (void)l; (void)t; return -1; }
 #define MAIR_IDX_NORMAL 0
 #define PERM_RW 0
 #define PERM_RX 1
@@ -222,6 +224,8 @@ _Static_assert(sizeof(u64) == 8, "production u64 ABI");
 #define PERM_RX 1
 #define ALIGN_DOWN(x, a) ((x) & ~((a) - 1))
 #define sysop(op) event(op, 0, 0)
+#define T6050 0x6050
+static int smp_prepare_rvbar_t6050(u64 l, u64 t) { (void)l; (void)t; return -1; }
 struct cpu_info { u64 impl_reg; };
 static struct { bool apple_sysregs_unlocked; } features, *cpu_features = &features;
 static unsigned char _vectors_start[4096] __attribute__((aligned(4096)));
@@ -344,3 +348,146 @@ int main(void)
 }
 '''
     compile_and_run(tmp_path, "smp-rvbar-relay-parity", harness)
+
+
+def test_t6050_stage1_vectors_are_forwarded_by_an_absolute_veneer(tmp_path):
+    """The J716s' m1n1 stage 1 stages a 40 MiB stage 2 above the CTRR window: its retired vectors
+    get one absolute relay, written once and read back, and nothing else is ever rewritten.
+
+    MMIO is modeled; smp_write_veneer(), smp_prepare_rvbar_t6050() and smp_prepare_rvbar() are
+    the production bodies.
+    """
+    source = (REPO / "src/smp.c").read_text()
+    bodies = "\n".join(function(source, name) for name in (
+        "smp_write_veneer", "smp_prepare_rvbar_t6050", "smp_prepare_rvbar"))
+    harness = r'''
+#include <assert.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+typedef unsigned long u64;
+typedef uint32_t u32;
+_Static_assert(sizeof(u64) == 8, "production u64 ABI");
+#define T6050 0x6050
+#define T8140 0x8140
+#define RVBAR_LOCK 1
+#define RVBAR_ADDR 0x0000fffffffff000UL
+#define MAIR_IDX_NORMAL 0
+#define PERM_RW 0
+#define PERM_RX 1
+#define SMP_VENEER_LDR 0x58000050u
+#define SMP_VENEER_BR  0xd61f0200u
+#define ALIGN_DOWN(x, a) ((x) & ~((a) - 1))
+#define sysop(op) ((void)(op))
+#define printf(...) ((void)0)
+struct cpu_info { u64 impl_reg; };
+static struct { bool apple_sysregs_unlocked; } features, *cpu_features = &features;
+static unsigned char _vectors_start[4096] __attribute__((aligned(0x4000)));
+static int chip_id, el2 = 1, nmap;
+static u64 installed_relay, relocated_from, rvbar;
+static bool owned;
+/* This image above the earlier stage's base; the secondary-only window's end above both */
+static struct { u64 phys_base, mem_size, top_of_kernel_data; } cur_boot_args;
+static u64 image_base;
+#define _base ((char *)image_base)
+static u64 slot[2];   /* the retired vector table's slot 0, as two 64-bit words */
+static unsigned writes;
+#define LOCKED 0x800000000UL
+static u64 read64(u64 a) { if (a == 8) return rvbar; assert(a == LOCKED + 8); return slot[1]; }
+static u32 read32(u64 a)
+{
+    if (a == (u64)_vectors_start)
+        return 0xd2800609; /* mov x9, #0x30 */
+    if (a == LOCKED + 0x80 || a == LOCKED + 0x100 || a == LOCKED + 0x180)
+        return 0xd503201f; /* not ours: an earlier stage's table */
+    assert(a == LOCKED || a == LOCKED + 4);
+    return a == LOCKED ? (u32)slot[0] : (u32)(slot[0] >> 32);
+}
+static void write32(u64 a, u32 v)
+{
+    assert(a == LOCKED || a == LOCKED + 4);
+    writes++;
+    if (a == LOCKED) slot[0] = (slot[0] & ~0xffffffffUL) | v;
+    else slot[0] = (slot[0] & 0xffffffffUL) | ((u64)v << 32);
+}
+static void write64(u64 a, u64 v) { assert(a == LOCKED + 8); writes++; slot[1] = v; }
+static int in_el2(void) { return el2; }
+static u64 old_vectors_start(void) { return 0; }
+static bool smp_old_vector_owned(u64 a) { assert(a == LOCKED); return owned; }
+static bool mmu_active(void) { return true; }
+static u64 get_page_size(void) { return 0x4000; }
+static void mmu_add_mapping(u64 a, u64 b, u64 size, int attr, int perm)
+{
+    assert(a == LOCKED && b == a && size == 0x4000 && attr == MAIR_IDX_NORMAL);
+    nmap++;
+    (void)perm;
+}
+static void dc_cvac_range(void *a, u64 n) { assert((u64)a == LOCKED && n == 16); }
+static void ic_ivau_range(void *a, u64 n) { assert((u64)a == LOCKED && n == 16); }
+''' + bodies + r'''
+static void setup(int chip, bool own)
+{
+    chip_id = chip; owned = own; el2 = 1; nmap = 0; writes = 0;
+    installed_relay = relocated_from = 0; slot[0] = 0x12345678; slot[1] = 0xabcd;
+    rvbar = LOCKED | RVBAR_LOCK;
+    cur_boot_args.phys_base = 0x10000000UL;
+    cur_boot_args.mem_size = 0x1000000000UL;
+    cur_boot_args.top_of_kernel_data = 0x880000000UL;
+    image_base = 0x900000000UL;
+}
+int main(void)
+{
+    struct cpu_info cpu = {8};
+    u64 target = (u64)_vectors_start;
+
+    /* A retired stage-1 table on T6050: one absolute veneer, even 200 MiB away. */
+    setup(T6050, true);
+    assert(smp_prepare_rvbar(&cpu) == 0);
+    assert(read32(LOCKED) == SMP_VENEER_LDR && read32(LOCKED + 4) == SMP_VENEER_BR);
+    assert(slot[1] == target && installed_relay == LOCKED && writes == 3 && nmap == 2);
+    /* The second secondary finds it done: nothing is written again. */
+    assert(smp_prepare_rvbar(&cpu) == 0 && writes == 3);
+    /* A different locked address after a relay is refused. */
+    rvbar = (LOCKED + 0x4000) | RVBAR_LOCK;
+    assert(smp_prepare_rvbar(&cpu) == -1 && writes == 3);
+
+    /*
+     * Not a retired aura table: the J716s' m1n1 stage 1. Its base below this image and the
+     * inherited top is forwarded, as an m1n1 stage 2 does.
+     */
+    setup(T6050, false);
+    assert(smp_prepare_rvbar(&cpu) == 0 && writes == 3 && installed_relay == LOCKED);
+    assert(read32(LOCKED) == SMP_VENEER_LDR && slot[1] == target);
+    /* ... but not at or above the inherited top, */
+    setup(T6050, false);
+    cur_boot_args.top_of_kernel_data = LOCKED;
+    assert(smp_prepare_rvbar(&cpu) == -1 && !writes && !installed_relay);
+    /* not within 16 bytes of this image, */
+    setup(T6050, false);
+    image_base = LOCKED + 8;
+    assert(smp_prepare_rvbar(&cpu) == -1 && !writes && !installed_relay);
+    /* not outside RAM, */
+    setup(T6050, false);
+    cur_boot_args.phys_base = LOCKED + 0x4000;
+    assert(smp_prepare_rvbar(&cpu) == -1 && !writes && !installed_relay);
+    /* and never outside EL2. */
+    setup(T6050, false);
+    el2 = 0;
+    assert(smp_prepare_rvbar(&cpu) == -1 && !writes && !installed_relay);
+    setup(T6050, true);
+    el2 = 0;
+    assert(smp_prepare_rvbar(&cpu) == -1 && !writes && !installed_relay);
+    /* An unlocked RVBAR that is not this image's stays refused on T6050 too. */
+    setup(T6050, true);
+    rvbar = LOCKED;
+    assert(smp_prepare_rvbar(&cpu) == -1 && !writes);
+    /* Another chip takes the T8140 path, which this test does not drive: no veneer. */
+    setup(T8140, true);
+    rvbar = target | RVBAR_LOCK;
+    assert(smp_prepare_rvbar(&cpu) == 0 && !writes);
+    puts("T6050 veneer PASS");
+    return 0;
+}
+'''
+    compile_and_run(tmp_path, "smp-t6050-veneer", harness)

@@ -4006,12 +4006,12 @@ disable:
 }
 
 /*
- * T6050 G17S (M5 Pro: J714s on the 27.0 firmware, K116s on 27.2). iBoot loads both roles' __TEXT
- * back to back, their __DATA and __DATA_SHARED_RO in one run, and leaves the UAT ranges empty:
- * each role publishes its kernel root while it boots. Linux's driver takes the four UAT ranges,
- * fw-text and fw-data as no-map reservations, and admits only a build whose TEXT normalizes to
- * that build's digest (its fwid rule: the build's boot-filled ranges, the entropy records among
- * them, zeroed; Linux also checks the records' tags).
+ * T6050 G17S (M5 Pro: J714s on the 27.0 firmware, K116s on 27.2, J716s on the 27.3 beta). iBoot
+ * loads both roles' __TEXT back to back, their __DATA and __DATA_SHARED_RO in one run, and leaves
+ * the UAT ranges empty: each role publishes its kernel root while it boots. Linux's driver takes
+ * the four UAT ranges, fw-text and fw-data as no-map reservations, and admits only a build whose
+ * TEXT normalizes to that build's digest (its fwid rule: the build's boot-filled ranges, the
+ * entropy records among them, zeroed; Linux also checks the records' tags).
  *
  * When the device tree describes the GPU (alias "gpu", apple,agx-g17s, disabled), check the ADT
  * and this build, then fill the reservations and enable the GPU power states, both mailboxes and
@@ -4030,7 +4030,7 @@ static const struct {
         u32 fill[8][2];
         u8 sha[32];
         char name[8];
-    } build[2];
+    } build[3];
 } t6050_gpu = {
     /* The UAT ranges (base, size), then the bounds of both roles' __DATA and SRO */
     {"gpu-region-base", "gpu-region-size", "gfx-shared-region-base", "gfx-shared-region-size",
@@ -4073,7 +4073,24 @@ static const struct {
       {0xaf, 0x68, 0xd0, 0x34, 0xa3, 0xf0, 0x06, 0xb4, 0x3d, 0xab, 0x66,
        0x1b, 0x82, 0x5f, 0x12, 0x59, 0x8c, 0xb8, 0x6e, 0x4d, 0x2a, 0x0e,
        0x38, 0x44, 0xf1, 0x4f, 0xa5, 0x05, 0x9f, 0x38, 0xf6, 0xcb},
-      "26B8125"}},
+      "26B8125"},
+     /*
+      * 26C5035r (27.3 beta 1) G17S, the J716s' 27.3 stub: the same sizes and records again, its
+      * records 0x4c further in than 26A428's in the first role and 0x14 in the second. The digest
+      * is that of the firmware file's TEXT with these ranges zeroed.
+      */
+     {{{0x224, 4},
+       {0x23c, 8},
+       {0x4976c, 0x740},
+       {0x49eac, 0x231},
+       {0x50224, 4},
+       {0x5023c, 8},
+       {0x9d1ec, 0x740},
+       {0x9d92c, 0x231}},
+      {0xb5, 0x53, 0x7c, 0x8f, 0x06, 0xbd, 0x19, 0xeb, 0xf0, 0xef, 0xd0,
+       0xcb, 0xfb, 0x65, 0x52, 0x33, 0x9a, 0x10, 0xd4, 0xaf, 0xc4, 0xed,
+       0xa9, 0xd2, 0x1c, 0xbe, 0xdc, 0x36, 0x66, 0x76, 0x36, 0x00},
+      "26C5035"}},
 };
 extern void aura_sha256(const void *data, size_t size, u8 digest[32]);
 

@@ -35,6 +35,7 @@ typedef uint64_t u64; typedef uint32_t u32;
 #define T6040 0x6040
 #define T6041 0x6041
 #define T6050 0x6050
+#define PCIE_T6050_LEFT 1
 #define SZ_16K 16384
 #define sysop(op) ((void)0)
 #define bail(...) do { printf(__VA_ARGS__); return -1; } while (0)

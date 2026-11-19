@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: MIT */
 
 #include "adt.h"
+#include "malloc.h"
 #include "pcie.h"
 #include "pmgr.h"
 #include "smc.h"
@@ -689,15 +690,59 @@ static int number_like_linux(void)
     return 0;
 }
 
-/* 0 once every required port is up; -1, for the rest of this boot, after a stop in shared state or
- * a required port: a partial state is not retried. An optional port's stop leaves it down. */
+/*
+ * A board whose ADT has none of the required ports (the J716s: port 0, the N1, only) loses nothing
+ * it needs when bring-up stops, so a stop there never costs the boot (pcie_t6050_init):
+ *  - before anything was written (t6050_touched clear): the GP side is left as found, for the OS
+ *    to train (PCIE_T6050_LEFT, pcie_t6050_handoff_fdt). The case that matters is storage stopped
+ *    by an earlier stage: an m1n1 stage 1 loads this image through NVMe and then sleeps and resets
+ *    ANS (m1n1's nvme_shutdown()), and nothing here starts it again for a payload it carries.
+ *    The storage checks need ANS running to compare against, so with it stopped none of A, S or
+ *    the ports may run; Linux's nvme-apple starts ANS from cold and its pcie-apple trains the N1,
+ *    as they do behind the m1n1-based J716s stage 2;
+ *  - after: the ports that are down are disabled in the tree, as for an optional port's stop
+ *    (PCIE_T6050_PARTIAL).
+ * A board with a required port keeps the refusal.
+ */
+static bool t6050_required_present, t6050_touched, t6050_left_for_os;
+
+static int t6050_bring_up(void);
+
+/* 0 once every required port is up; PCIE_T6050_LEFT or PCIE_T6050_PARTIAL after a stop on a board
+ * without a required port (above); -1 after a stop in shared state or a required port. The result
+ * holds for the rest of this boot: a partial state is not retried. An optional port's stop leaves
+ * it down. */
 int pcie_t6050_init(void)
 {
-    static int state = 1;
+    static bool done;
+    static int result;
 
-    if (state <= 0)
-        return state;
-    state = -1;
+    if (done)
+        return result;
+    done = true;
+    result = t6050_bring_up();
+    if (result >= 0 || t6050_required_present)
+        return result;
+    if (!t6050_touched) {
+        t6050_left_for_os = true;
+        printf("pcie-t6050: nothing written: GP ports left as found, for the OS to bring up\n");
+        result = PCIE_T6050_LEFT;
+    } else {
+        printf("pcie-t6050: no required port on this board: booting with the down ports "
+               "disabled\n");
+        result = PCIE_T6050_PARTIAL;
+    }
+    return result;
+}
+
+static int t6050_bring_up(void)
+{
+    for (size_t i = 0; i < ARRAY_SIZE(ports); i++) {
+        char bridge[40];
+
+        snprintf(bridge, sizeof(bridge), "%s/pci-bridge%d", apcie_path, ports[i].port);
+        t6050_required_present |= ports[i].required && adt_path_offset(adt, bridge) >= 0;
+    }
     TRY(find_regs());
     TRY(storage_find());
     /* A port whose bridge this board's ADT lacks (J716c: ports 2 and 3) is not on the board: it
@@ -724,10 +769,11 @@ int pcie_t6050_init(void)
     }
     if (!any_present) {
         printf("pcie-t6050: none of the GP ports is on this board: left as found\n");
-        state = 0;
         return 0;
     }
     TRY(storage_check("before", true));
+    /* Everything above only read; from here on a stop may leave state behind */
+    t6050_touched = true;
 
     bool any_down = false;
     for (size_t i = 0; i < ARRAY_SIZE(ports); i++)
@@ -752,7 +798,6 @@ int pcie_t6050_init(void)
         }
     }
     TRY(number_like_linux());
-    state = 0;
     return 0;
 }
 
@@ -856,6 +901,121 @@ static int t6050_port_renumber(void *dt, int rp, u32 bus)
 }
 
 /*
+ * The apcie0 host lists the OS's own T6050 train applies (Linux pcie-apple), from the ADT, as
+ * apple,tunable-<name> in (offset, 4, mask, value) groups; the CIO3 PLL core's records go into the
+ * pcieclkgen window, 0x2200 in. The m1n1-based J716s stage 2 hands over the same. A list
+ * the ADT lacks or that has a record of another width is left out, as there: the train skips it.
+ */
+static const struct {
+    const char *name;
+    u32 add;
+} os_train_lists[] = {
+    {"axi2af", 0}, {"cio3pllcore", 0x2200}, {"pcieclkgen", 0},
+    {"phy", 0},    {"phy-ip-pll", 0},       {"phy-ip-auspma", 0},
+};
+
+static int copy_os_train_lists(void *dt)
+{
+    int anode = adt_path_offset(adt, apcie_path);
+
+    if (anode < 0)
+        return -1;
+    for (size_t i = 0; i < ARRAY_SIZE(os_train_lists); i++) {
+        char aprop[48], fprop[48];
+        u32 len;
+
+        snprintf(aprop, sizeof(aprop), "apcie-%s-tunables", os_train_lists[i].name);
+        snprintf(fprop, sizeof(fprop), "apple,tunable-%s", os_train_lists[i].name);
+        const struct adt_tunable *t = adt_getprop(adt, anode, aprop, &len);
+        size_t n = t ? len / sizeof(*t) : 0;
+        bool ok = n && !(len % sizeof(*t));
+        for (size_t k = 0; ok && k < n; k++)
+            ok = t[k].size == 4 && !(t[k].offset & 3) && !(t[k].mask >> 32) && !(t[k].value >> 32);
+        if (!ok) {
+            printf("pcie-t6050: %s absent or not 32-bit: left out\n", aprop);
+            continue;
+        }
+        fdt32_t *cells = malloc(n * 4 * sizeof(*cells));
+        if (!cells)
+            return -1;
+        for (size_t k = 0; k < n; k++) {
+            cells[4 * k] = cpu_to_fdt32(t[k].offset + os_train_lists[i].add);
+            cells[4 * k + 1] = cpu_to_fdt32(4);
+            cells[4 * k + 2] = cpu_to_fdt32((u32)t[k].mask);
+            cells[4 * k + 3] = cpu_to_fdt32((u32)t[k].value);
+        }
+        int ret = fdt_setprop(dt, t6050_host(dt), fprop, cells, n * 4 * sizeof(*cells));
+        free(cells);
+        if (ret)
+            return -1;
+    }
+    return 0;
+}
+
+/* The phandle of the DART apcie0's iommu-map gives RID `rid`; 0 if none */
+static u32 t6050_dart_for_rid(void *dt, u32 rid)
+{
+    int len;
+    const fdt32_t *m = fdt_getprop(dt, t6050_host(dt), "iommu-map", &len);
+
+    for (int k = 0; m && !(len % 16) && k < len / 16; k++) {
+        u32 base = fdt32_ld(&m[4 * k]), count = fdt32_ld(&m[4 * k + 3]);
+        if (rid >= base && rid - base < count)
+            return fdt32_ld(&m[4 * k + 1]);
+    }
+    return 0;
+}
+
+/*
+ * Nothing was written (PCIE_T6050_LEFT): describe each port the tree has as the OS will find it,
+ * down. A port on this board whose root port names its endpoint's power line (pwren-gpios) and
+ * whose DART waits for its root complex (apple,manual-availability) is the OS's to train: it gets
+ * its link tunables and the host the lists of the train (copy_os_train_lists), then the root port
+ * and the DART go okay, as the m1n1-based J716s stage 2 hands the N1 over. Every other port, and
+ * one whose description could not be completed, gets both disabled: an enabled DART of a port
+ * that is not up takes an SError. Bus numbers and the iommu-map stay the tree's: the OS's train
+ * numbers the port as the tree does. -1 only if a port could not even be disabled.
+ */
+static int t6050_handoff_for_os(void *dt)
+{
+    bool lists = false;
+
+    for (size_t i = 0; i < ARRAY_SIZE(ports); i++) {
+        struct port_regs pp = {.p = &ports[i]};
+        int rp = t6050_port_node(dt, ports[i].port), len;
+
+        if (rp == -FDT_ERR_NOTFOUND)
+            continue;
+        const fdt32_t *br = rp < 0 ? NULL : fdt_getprop(dt, rp, "bus-range", &len);
+        u32 dart = br && len == 8 ? t6050_dart_for_rid(dt, fdt32_ld(&br[0]) << 8) : 0;
+        int dart_node = dart ? fdt_node_offset_by_phandle(dt, dart) : -1;
+        snprintf(pp.bridge, sizeof(pp.bridge), "%s/pci-bridge%d", apcie_path, ports[i].port);
+        bool os_trains = adt_path_offset(adt, pp.bridge) >= 0 && dart_node >= 0 &&
+                         fdt_getprop(dt, rp, "pwren-gpios", NULL) &&
+                         fdt_getprop(dt, dart_node, "apple,manual-availability", NULL);
+
+        if (os_trains && !copy_port_tunables(dt, t6050_port_node(dt, ports[i].port), &pp) &&
+            (lists || !copy_os_train_lists(dt)) && !t6050_port_status(dt, i, dart, "okay")) {
+            lists = true;
+            printf("pcie-t6050: port %d (%s) down, for the OS to train: root port and DART "
+                   "enabled, tunables handed over\n",
+                   ports[i].port, ports[i].endpoint);
+            continue;
+        }
+        if (os_trains)
+            printf("pcie-t6050: port %d: could not describe it for the OS's train\n",
+                   ports[i].port);
+        rp = t6050_port_node(dt, ports[i].port);
+        if (rp < 0 || fdt_setprop_string(dt, rp, "status", "disabled") ||
+            (dart && t6050_port_status(dt, i, dart, "disabled")))
+            return -1;
+        printf("pcie-t6050: port %d down: disabled pci@%d,0%s in the DT\n", ports[i].port,
+               ports[i].port, dart ? " and its DART" : "");
+    }
+    return 0;
+}
+
+/*
  * Make the handed-over tree match the ports as they are. The tree numbers each root port node's
  * bus (its bus-range, its functions' reg, its apcie0 iommu-map entry) for the ports a default boot
  * brings up; Linux numbers the buses itself (see the top of this file). So:
@@ -864,6 +1024,7 @@ static int t6050_port_renumber(void *dt, int rp, u32 bus)
  *  - an optional port that is down gets its root port node and its DART disabled, and its iommu-map
  *    entry dropped: Linux probes an enabled DART whether or not the port trained, and an untrained
  *    port's DART takes an SError.
+ * With the GP side left as found (PCIE_T6050_LEFT), t6050_handoff_for_os() describes it instead.
  */
 int pcie_t6050_handoff_fdt(void *dt)
 {
@@ -875,6 +1036,8 @@ int pcie_t6050_handoff_fdt(void *dt)
 
     if (host < 0)
         return 0;
+    if (t6050_left_for_os)
+        return t6050_handoff_for_os(dt);
     const fdt32_t *m = fdt_getprop(dt, host, "iommu-map", &len);
     if (!m || len % 16 || len > (int)sizeof(map)) {
         printf("pcie-t6050: apcie0's iommu-map is missing or too long\n");

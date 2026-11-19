@@ -47,6 +47,8 @@ int smp_wait(int cpu, u64 *retval);
 /* Join even a timed-out or busy dispatch; never treat an ACK timeout as cancellation. */
 int smp_call_sync0(int cpu, void *func);
 bool smp_has_pending_calls(void);
+/* The locked reset vector rewritten to forward cores to this image, or 0 */
+u64 smp_rvbar_relay(void);
 
 bool smp_is_alive(int cpu);
 uint64_t smp_get_mpidr(int cpu);

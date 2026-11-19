@@ -17,6 +17,19 @@ The boot-argument tokens are matched exactly:
   NVRAM: `touch <esp>/aura-proxy` to turn it on, `rm <esp>/aura-proxy` to turn
   it off. Without either, Stage 1 boots straight through.
 
+- `m1n1.wdt=keep` leaves the SoC watchdog as this stage found it instead of
+  disabling it at start. It is for a chainloading stage that armed the watchdog
+  before starting this one and appends the token to the next stage's boot
+  arguments (the J716s' A/B stage 1 arms 150 s and does; it is an m1n1 build,
+  hence the spelling). A hang in this stage, in the proxy or in a kernel that
+  never takes the watchdog over then resets the machine, and iBoot counts a
+  failed boot, so that stage can boot its fallback. Every proxy request resets
+  the count, so a host session survives while it talks and the machine resets
+  when the host goes quiet; `P_WDT_DISABLE` still disarms it. Linux's
+  `apple_wdt` keeps an armed watchdog fed once it probes. Every stage honours
+  the token, so it does not belong in the NVRAM boot-args: there it would leave
+  iBoot's watchdog running.
+
 - `aura-console` keeps the debug UART as the OS console (see below) without
   the rest of `aura-debug`. `aura-debug` keeps it too.
 
