@@ -17,7 +17,15 @@ libfdt. Covered:
   7. ADT names other than "ave" and "ave<N>" are never taken for an encoder;
   8. dt_set_ave_dapf() programs the CPU DART filter (dart-ave<N>) of every encoder after the
      first that the next stage gets, leaves encoder 0's to dapf.c, disables an encoder whose
-     filter fails, and leaves T8140's inherited filters alone.
+     filter fails, and leaves T8140's inherited filters alone;
+  9. the M3 (T8122) encoder of a J615, with the segment list of its live ADT, is handed over at
+     its DART's window (vm-base plus the segment's offset, where iBoot left it) with no SoC list
+     naming it; with an IPSW ADT (no preload) or an offset past the window it is disabled;
+  10. both M3 Max (T6031) encoders of a J514c (IPSW ADT, modelled segment lists) are handed over,
+     each at its own DART's window, and dart-ave1 is programmed only when the DT enables ave1;
+  11. a node is an encoder by its compatible naming the AVE block ("apple,ave" or
+     "apple,t<SoC>-ave"), never the decoder or a longer name; every SoC reads its window base
+     from its DART, and an encoder whose DART has no vm-base is disabled (M1 Pro and M2 alike).
 
 The harness also runs one DTB against an ADT modelled from it (`dtb <in> <out> <mode>`), which
 compares two versions of the handoff on a kernel's device trees.
@@ -43,7 +51,7 @@ def handoff_source(source):
                "static int dt_device_add_mem_region("),
         region(source, "static int dt_reserve_asc_segments_at(int fdt_node",
                "static int dt_reserve_asc_segments(const char"),
-        region(source, "static const char *const ave_compatibles[] = {",
+        region(source, "/*\n * The AVE video encoders run firmware that iBoot preloads",
                "/*\n * The M4 Pro, M5 Pro and A18 Pro Neural Engines"),
     ])
 
@@ -108,9 +116,10 @@ struct anode {
     struct adt_segment_ranges seg[4];
     char names[32];
     u64 vm_base; /* DARTs */
+    int has_vm_base;
     u32 crc[4];
 };
-static struct anode anodes[16];
+static struct anode anodes[24];
 static int nanodes;
 static u64 dram_base = 0x10000000000ULL;
 
@@ -202,7 +211,7 @@ const void *adt_getprop(const void *a, int off, const char *name, u32 *len)
         *len = strlen(n->names) + 1;
         return n->names;
     }
-    if (!strcmp(name, "vm-base") && n->vm_base) {
+    if (!strcmp(name, "vm-base") && n->has_vm_base) {
         *len = sizeof(n->vm_base);
         return &n->vm_base;
     }
@@ -230,8 +239,14 @@ u32 tinf_crc32(const void *data, u32 size)
     return 0;
 }
 
+static struct anode *add_dart(const char *name, u64 vm_base);
+
+/* An encoder and its DART (dart-<name>, vm-base 0 as on the M1 Pro; add_dart() changes it). */
 static struct anode *add_encoder(const char *name, u64 addr)
 {
+    char dart[32];
+    snprintf(dart, sizeof(dart), "dart-%s", name);
+    add_dart(dart, 0);
     assert(nanodes < (int)ARRAY_SIZE(anodes));
     struct anode *n = &anodes[nanodes];
     memset(n, 0, sizeof(*n));
@@ -252,13 +267,28 @@ static struct anode *add_encoder(const char *name, u64 addr)
 
 static struct anode *add_dart(const char *name, u64 vm_base)
 {
+    for (int i = 0; i < nanodes; i++) {
+        if (!strcmp(anodes[i].name, name)) {
+            anodes[i].vm_base = vm_base;
+            return &anodes[i];
+        }
+    }
     assert(nanodes < (int)ARRAY_SIZE(anodes));
     struct anode *n = &anodes[nanodes++];
     memset(n, 0, sizeof(*n));
     snprintf(n->name, sizeof(n->name), "%s", name);
     n->addr = 0x1000;
     n->vm_base = vm_base;
+    n->has_vm_base = 1;
     return n;
+}
+
+/* The DART's ADT node has no vm-base. */
+static void no_vm_base(const char *name)
+{
+    for (int i = 0; i < nanodes; i++)
+        if (!strcmp(anodes[i].name, name))
+            anodes[i].has_vm_base = 0;
 }
 ''' + "@REGION@" + r'''
 
@@ -323,6 +353,17 @@ static void encoder(int die, const char *compat, u64 addr, const char *status)
         assert(!fdt_setprop_string(dt, n, "status", status));
 }
 
+/* An encoder node with the SoC's compatible and the block's ("apple,t8122-ave", "apple,ave"). */
+static void encoder2(int die, const char *soc, const char *block, u64 addr, const char *status)
+{
+    encoder(die, soc, addr, status);
+    char path[64];
+    snprintf(path, sizeof(path), "%s/video-codec@%llx", die ? "/soc@2200000000" : "/soc@200000000",
+             (unsigned long long)addr);
+    int n = fdt_path_offset(dt, path);
+    assert(n >= 0 && !fdt_appendprop_string(dt, n, "compatible", block));
+}
+
 static int enc(int die, u64 addr)
 {
     char path[64];
@@ -352,16 +393,21 @@ static u64 firmware(int die, u64 addr, int idx)
     return fdt64_to_cpu(r[0]);
 }
 
-/* The device address the node's first firmware region is mapped at (its iommu-addresses). */
-static u64 iova(int die, u64 addr)
+/* The device address the node's firmware region @idx is mapped at (its iommu-addresses). */
+static u64 iova_at(int die, u64 addr, int idx)
 {
     int len;
     const fdt32_t *mr = fdt_getprop(dt, enc(die, addr), "memory-region", &len);
-    assert(mr && len >= 4);
-    int rn = fdt_node_offset_by_phandle(dt, fdt32_to_cpu(mr[0]));
+    assert(mr && len >= (idx + 1) * 4);
+    int rn = fdt_node_offset_by_phandle(dt, fdt32_to_cpu(mr[idx]));
     const fdt32_t *ia = fdt_getprop(dt, rn, "iommu-addresses", &len);
     assert(ia && len >= 20);
     return ((u64)fdt32_to_cpu(ia[1]) << 32) | fdt32_to_cpu(ia[2]);
+}
+
+static u64 iova(int die, u64 addr)
+{
+    return iova_at(die, addr, 0);
 }
 
 static const char *chosen(const char *prop)
@@ -504,9 +550,141 @@ static int scenarios(void)
     tree(1);
     encoder(0, "apple,t8112-ave", 0x267100000ULL, "okay");
     add_encoder("ave", 0x267100000ULL);
+    no_vm_base("dart-ave");
     CHECK(!dt_set_ave());
     CHECK(!strcmp(status(0, 0x267100000ULL), "disabled") && strstr(logbuf, "vm-base missing"));
     puts("PASS: M2 encoder without its DART's vm-base: disabled");
+
+    /* The M1 Pro's window base is read the same way: vm-base 0 is a base, no vm-base is not. */
+    tree(1);
+    encoder(0, "apple,t6000-ave", M1_ENC0, "okay");
+    add_encoder("ave0", M1_ENC0);
+    no_vm_base("dart-ave0");
+    CHECK(!dt_set_ave());
+    CHECK(!strcmp(status(0, M1_ENC0), "disabled") && strstr(logbuf, "vm-base missing"));
+    CHECK(!firmware(0, M1_ENC0, 0) && !chosen("aurora,ave-text-crc32")[0]);
+    puts("PASS: M1 Pro encoder without its DART's vm-base: disabled");
+
+    /*
+     * 9: the M3 (T8122) of a J615 under macOS 27.2, from its live ADT: a lone encoder named ave at
+     * 0x315100000, compatible "apple,t8122-ave", "apple,ave", left disabled by the DT. iBoot's
+     * segment list: TEXT 0x134000 bytes at DART offset 0, DATA 0x128000 bytes after it, both
+     * remapped to dart-ave's vm-base (0x10000000000) plus their offset.
+     */
+#define J615_AVE 0x315100000ULL
+#define M3_VM_BASE 0x10000000000ULL
+    for (int on = 0; on < 2; on++) {
+        tree(1);
+        encoder2(0, "apple,t8122-ave", "apple,ave", J615_AVE, on ? "okay" : "disabled");
+        a = add_encoder("ave", J615_AVE);
+        a->seg[0] = (struct adt_segment_ranges){0x10000a8c000ULL, 0, 0x10000000000ULL, 0x134000, 1};
+        a->seg[1] = (struct adt_segment_ranges){0x10001a2c000ULL, 0x134000, 0x10000134000ULL,
+                                                0x128000, 0};
+        add_dart("dart-ave", M3_VM_BASE);
+        CHECK(!dt_set_ave());
+        CHECK(!strcmp(status(0, J615_AVE), on ? "okay" : "disabled"));
+        CHECK(firmware(0, J615_AVE, 0) == 0x10000a8c000ULL);
+        CHECK(firmware(0, J615_AVE, 1) == 0x10001a2c000ULL);
+        /* Where iBoot left the coprocessor: the remap addresses, the window base plus offset. */
+        CHECK(iova_at(0, J615_AVE, 0) == a->seg[0].remap);
+        CHECK(iova_at(0, J615_AVE, 1) == a->seg[1].remap);
+        CHECK(!strcmp(chosen("aurora,ave-text-crc32"), "460c7a7c"));
+        CHECK(!strcmp(chosen("aurora,ave-data-crc32"), "12345678"));
+        CHECK(!strstr(logbuf, "AVE"));
+    }
+    puts("PASS: J615 (T8122) encoder handed over at dart-ave's window, status kept");
+
+    /* The same J615 with an IPSW ADT: no iBoot preload, no segment list. Disabled, no CRCs. */
+    tree(1);
+    encoder2(0, "apple,t8122-ave", "apple,ave", J615_AVE, "okay");
+    a = add_encoder("ave", J615_AVE);
+    a->preloaded = 0;
+    a->nseg = 0;
+    add_dart("dart-ave", M3_VM_BASE);
+    CHECK(!dt_set_ave());
+    CHECK(!strcmp(status(0, J615_AVE), "disabled") && strstr(logbuf, "firmware not preloaded"));
+    CHECK(!firmware(0, J615_AVE, 0) && !chosen("aurora,ave-text-crc32")[0]);
+    puts("PASS: J615 encoder without an iBoot preload: disabled");
+
+    /* An offset that already carries the window base is not the layout this handoff knows. */
+    tree(1);
+    encoder2(0, "apple,t8122-ave", "apple,ave", J615_AVE, "okay");
+    a = add_encoder("ave", J615_AVE);
+    a->seg[1].iova = M3_VM_BASE + 0xd0000;
+    add_dart("dart-ave", M3_VM_BASE);
+    CHECK(!dt_set_ave());
+    CHECK(!strcmp(status(0, J615_AVE), "disabled") && strstr(logbuf, "outside its DART window"));
+    CHECK(!firmware(0, J615_AVE, 0));
+    puts("PASS: segment offset beyond the DART window: disabled");
+
+    /*
+     * 10: the M3 Max (T6031) of a J514c, from the IPSW ADT: ave0 at 0x285100000 and ave1 at
+     * 0x3c5100000, each with its own DART at vm-base 0x10000000000. IPSW ADTs carry no segment
+     * lists, so each encoder gets the model's, remapped at its window as on the J615.
+     */
+#define T6031_AVE0 0x285100000ULL
+#define T6031_AVE1 0x3c5100000ULL
+    tree(1);
+    encoder2(0, "apple,t6031-ave", "apple,ave", T6031_AVE1, "okay");
+    encoder2(0, "apple,t6031-ave", "apple,ave", T6031_AVE0, "okay");
+    a = add_encoder("ave0", T6031_AVE0);
+    b = add_encoder("ave1", T6031_AVE1);
+    for (int i = 0; i < 2; i++) {
+        a->seg[i].remap = M3_VM_BASE + a->seg[i].iova;
+        b->seg[i].remap = M3_VM_BASE + b->seg[i].iova;
+    }
+    add_dart("dart-ave0", M3_VM_BASE);
+    add_dart("dart-ave1", M3_VM_BASE);
+    CHECK(!dt_set_ave());
+    CHECK(!strcmp(status(0, T6031_AVE0), "okay") && !strcmp(status(0, T6031_AVE1), "okay"));
+    CHECK(firmware(0, T6031_AVE0, 0) == a->seg[0].phys && firmware(0, T6031_AVE1, 0) == b->seg[0].phys);
+    CHECK(firmware(0, T6031_AVE1, 1) == b->seg[1].phys);
+    CHECK(iova_at(0, T6031_AVE0, 0) == M3_VM_BASE && iova_at(0, T6031_AVE1, 0) == M3_VM_BASE);
+    CHECK(iova_at(0, T6031_AVE1, 1) == b->seg[1].remap);
+    CHECK(strstr(logbuf, "video-codec@285100000 handed over from ADT /arm-io/ave0"));
+    CHECK(strstr(logbuf, "video-codec@3c5100000 handed over from ADT /arm-io/ave1"));
+#ifndef NO_AVE_DAPF
+    CHECK(!fdt_pack(dt) && !dt_set_ave_dapf() && !strcmp(programmed, "/arm-io/dart-ave1 "));
+#endif
+    puts("PASS: J514c (T6031) encoders 0 and 1 handed over, each at its own DART's window");
+
+    /* As the kernel DT ships them, both off: handed over, left off, dart-ave1 left alone. */
+    tree(1);
+    encoder2(0, "apple,t6031-ave", "apple,ave", T6031_AVE1, "disabled");
+    encoder2(0, "apple,t6031-ave", "apple,ave", T6031_AVE0, "disabled");
+    add_encoder("ave0", T6031_AVE0);
+    add_encoder("ave1", T6031_AVE1);
+    add_dart("dart-ave0", M3_VM_BASE);
+    add_dart("dart-ave1", M3_VM_BASE);
+    CHECK(!dt_set_ave());
+    CHECK(!strcmp(status(0, T6031_AVE0), "disabled") && !strcmp(status(0, T6031_AVE1), "disabled"));
+    CHECK(firmware(0, T6031_AVE0, 0) && firmware(0, T6031_AVE1, 0));
+#ifndef NO_AVE_DAPF
+    CHECK(!fdt_pack(dt) && !dt_set_ave_dapf() && !programmed[0]);
+#endif
+    puts("PASS: J514c encoders the DT leaves off: handed over, left off");
+
+    /* 11: only the encoder block is an encoder: not the decoder, nor a name that ends otherwise. */
+    tree(1);
+    encoder2(0, "apple,t8122-avd", "apple,avd", J615_AVE, "okay");
+    encoder(0, "apple,t8122-ave-dart", J615_AVE + 0x100000, "okay");
+    encoder(0, "apple,ave2", J615_AVE + 0x200000, "okay");
+    add_encoder("ave", J615_AVE);
+    add_dart("dart-ave", M3_VM_BASE);
+    CHECK(!dt_set_ave());
+    CHECK(!strcmp(status(0, J615_AVE), "okay") && !firmware(0, J615_AVE, 0));
+    CHECK(!strcmp(status(0, J615_AVE + 0x100000), "okay") && !strcmp(status(0, J615_AVE + 0x200000), "okay"));
+    CHECK(!chosen("aurora,ave-text-crc32")[0] && !strstr(logbuf, "AVE"));
+    puts("PASS: nodes that are not the encoder block are left alone");
+
+    /* A node with only the block's compatible is an encoder. */
+    tree(1);
+    encoder(0, "apple,ave", J615_AVE, "okay");
+    a = add_encoder("ave", J615_AVE);
+    add_dart("dart-ave", M3_VM_BASE);
+    CHECK(!dt_set_ave());
+    CHECK(firmware(0, J615_AVE, 0) == a->seg[0].phys && iova(0, J615_AVE) == M3_VM_BASE);
+    puts("PASS: \"apple,ave\" alone is an encoder");
 
     /* 7: names that are not an encoder's */
     tree(1);
@@ -580,12 +758,27 @@ static int scenarios(void)
 }
 
 /* ---------- one kernel DTB against an ADT modelled from it ---------- */
-static int compat_index(int node)
+/*
+ * The first compatible of an encoder node, or NULL: the harness's own reading of the kernel DTs
+ * (a node naming "apple,ave" or "apple,t<SoC>-ave"), so it runs any version of the handoff.
+ */
+static const char *dtb_encoder(int node)
 {
-    for (size_t i = 0; i < ARRAY_SIZE(ave_compatibles); i++)
-        if (!fdt_node_check_compatible(dt, node, ave_compatibles[i]))
-            return i;
-    return -1;
+    int len;
+    const char *list = fdt_getprop(dt, node, "compatible", &len);
+    for (int pos = 0; list && pos < len; pos += strlen(list + pos) + 1) {
+        const char *c = list + pos;
+        size_t n = strlen(c);
+        if (!strcmp(c, "apple,ave") ||
+            (!strncmp(c, "apple,t", 7) && n > 11 && !strcmp(c + n - 4, "-ave")))
+            return list;
+    }
+    return NULL;
+}
+
+static bool compat_is(const char *compat, const char *soc)
+{
+    return !strncmp(compat, soc, strlen(soc));
 }
 
 /*
@@ -608,16 +801,18 @@ static int run_dtb(const char *in, const char *out, const char *mode)
         int rm = fdt_add_subnode(dt, 0, "reserved-memory");
         assert(rm >= 0);
     }
-    int k = 0;
+    int k = 0, total = 0;
+    for (int node = fdt_next_node(dt, -1, NULL); node >= 0; node = fdt_next_node(dt, node, NULL))
+        total += dtb_encoder(node) != NULL;
     for (int node = fdt_next_node(dt, -1, NULL); node >= 0; node = fdt_next_node(dt, node, NULL)) {
-        int c = compat_index(node);
-        if (c < 0 || !strcmp(mode, "none"))
+        const char *compat = dtb_encoder(node);
+        if (!compat || !strcmp(mode, "none"))
             continue;
         u64 addr = dt_get_address(dt, node);
-        const char *compat = ave_compatibles[c];
         char name[16];
-        bool lone = !strcmp(compat, "apple,t8112-ave") || !strcmp(compat, "apple,t8132-ave") ||
-                    !strcmp(compat, "apple,t8142-ave");
+        /* The ADT names a lone encoder ave, except on the M1 Pro and M2 Pro (ave0). */
+        bool lone = total == 1 && !compat_is(compat, "apple,t6000-ave") &&
+                    !compat_is(compat, "apple,t6020-ave") && !compat_is(compat, "apple,t6041-ave");
         if (!strcmp(compat, "apple,t8140-ave")) {
             if (!strcmp(mode, "first") ? addr != 0x289100000ULL : addr != 0x285100000ULL)
                 continue;
@@ -629,9 +824,20 @@ static int run_dtb(const char *in, const char *out, const char *mode)
             continue;
         struct anode *a = add_encoder(name, addr);
         a->preloaded = strcmp(mode, "cold") != 0;
+        /*
+         * The ADTs' DART windows: vm-base 0 on the M1 family, 0x800000000 on the M2 and
+         * 0x10000000000 on every later encoder. iBoot remaps the segments to vm-base plus their
+         * offset, except on the M1 family, where TEXT's remap address is its physical address.
+         */
+        u64 vm_base = compat_is(compat, "apple,t8112-ave") ? 0x800000000ULL : 0x10000000000ULL;
+        bool m1 = compat_is(compat, "apple,t6000-ave") || compat_is(compat, "apple,t8103-ave");
+        if (m1)
+            vm_base = 0;
+        for (int i = 0; i < a->nseg; i++)
+            a->seg[i].remap = m1 ? a->seg[i].phys : vm_base + a->seg[i].iova;
         char dart[24];
         snprintf(dart, sizeof(dart), "dart-%s", name);
-        add_dart(dart, 0x800000000ULL);
+        add_dart(dart, vm_base);
     }
     int ret = dt_set_ave();
     assert(!fdt_pack(dt));
@@ -677,4 +883,4 @@ def test_ave_handoff(tmp_path):
     binary = build(tmp_path, (repo / "src/kboot.c").read_text())
     run = subprocess.run([str(binary)], capture_output=True, text=True)
     assert run.returncode == 0, run.stdout + run.stderr
-    assert run.stdout.count("PASS:") == 18, run.stdout
+    assert run.stdout.count("PASS:") == 26, run.stdout
