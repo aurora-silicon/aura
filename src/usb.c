@@ -407,10 +407,15 @@ static dwc3_dev_t *usb_t6040_init(void (*set_step)(unsigned step))
     udelay(10);
     mask32(pipe + PIPEHANDLER_MUX_CTRL, 3, 2);
     udelay(10);
-    mask32(pipe + PIPEHANDLER_MUX_CTRL, 0x70, 0x40);
+    /* T6040's MUX_CTRL has no bit 6: the M5's 0x42 reads back 0x02 here (J616s hardware row,
+     * 2026-11-19). The dummy USB2 route is 0x22, the value the generic port bring-up writes. */
+    mask32(pipe + PIPEHANDLER_MUX_CTRL, 0x70, PIPEHANDLER_MUX_CTRL_DUMMY & 0x70);
     udelay(10);
-    if ((read32(pipe + PIPEHANDLER_MUX_CTRL) & 0x73) != 0x42)
+    if ((read32(pipe + PIPEHANDLER_MUX_CTRL) & 0x73) != PIPEHANDLER_MUX_CTRL_DUMMY) {
+        printf("CDC USB2: T6040 PIPE mux did not latch (mux=%x)\n",
+               read32(pipe + PIPEHANDLER_MUX_CTRL));
         return NULL;
+    }
 
     set_step(3);
     if (tunables_apply_compact_addr("/arm-io/atc-phy0", "tunable_USB2PHY_DFLT", regs.phy,
@@ -418,6 +423,9 @@ static dwc3_dev_t *usb_t6040_init(void (*set_step)(unsigned step))
         tunables_apply_compact_addr("/arm-io/atc-phy0", "tunable_USB2PHY_DEV", regs.phy,
                                     regs.phy_size))
         return NULL;
+    /* The J616s tunables leave the PHY in host mode (SIG read 0x01c0700f after them on hardware,
+     * 2026-11-19): no device pull-up, so the host never sees a connect. Device mode clears it. */
+    clear32(regs.phy + USB2PHY_SIG, USB2PHY_SIG_HOST);
     set32(regs.phy + USB2PHY_SIG, USB2PHY_SIG_VBUSDET_FORCE_VAL | USB2PHY_SIG_VBUSDET_FORCE_EN |
                                       USB2PHY_SIG_VBUSVLDEXT_FORCE_VAL |
                                       USB2PHY_SIG_VBUSVLDEXT_FORCE_EN);
