@@ -7,7 +7,7 @@
  * performed for real and recorded in a ring in aura's carve-out; writes, the first read of each
  * register and everything in the KSM block are also printed. After a host-set delay from the
  * first GPU access the core that next touches the GPU parks in aura's proxy, so the host can read
- * the ring (sptm_virt_gpu_ring, _head, _nrec, _keep).
+ * the ring (sptm_virt_gpu_ring, _head, _nrec, _keep) and the queue configurations (_configs).
  */
 
 #include "sptm_virt.h"
@@ -57,6 +57,21 @@ static struct {
 } gpu_ranges[GPU_MAX_RANGES];
 static int gpu_nranges;
 static u64 gpu_sgx; /* sgx reg 0: offsets print relative to it */
+
+/*
+ * Distinct host-port queue configurations (a tag written to sgx +0x4090, then a payload naming an
+ * engine at +0x4098), in the order first seen: kept apart from the ring, which wraps long before a
+ * park.
+ */
+#ifndef GPU_CONFIG_MAX
+#define GPU_CONFIG_MAX 768
+#endif
+struct gpu_config {
+    u64 t, tag, payload;
+};
+struct gpu_config sptm_virt_gpu_configs[GPU_CONFIG_MAX];
+volatile u32 sptm_virt_gpu_nconfigs;
+static u64 gpu_port_tag;
 
 static u64 gpu_seen[GPU_SEEN_MAX];
 static u32 gpu_nseen;
@@ -108,6 +123,27 @@ static void gpu_note(struct exc_info *ctx, u64 addr, u64 val, bool write, int wi
               ((u64)(smp_id() & 15) << 52);
     r->val = val;
     r->pc = ctx ? ctx->elr : 0;
+}
+
+static void gpu_note_config(u64 addr, u64 val, u64 now)
+{
+    if (addr == gpu_sgx + 0x4090) {
+        gpu_port_tag = val;
+        return;
+    }
+    u64 engine = val >> 60;
+    if (addr != gpu_sgx + 0x4098 || engine < 1 || engine > 4)
+        return;
+    u32 n = sptm_virt_gpu_nconfigs;
+    for (u32 k = 0; k < n; k++)
+        if (sptm_virt_gpu_configs[k].tag == gpu_port_tag && sptm_virt_gpu_configs[k].payload == val)
+            return;
+    if (n >= GPU_CONFIG_MAX)
+        return;
+    sptm_virt_gpu_configs[n].t = now;
+    sptm_virt_gpu_configs[n].tag = gpu_port_tag;
+    sptm_virt_gpu_configs[n].payload = val;
+    sptm_virt_gpu_nconfigs = n + 1;
 }
 
 static void gpu_park(struct exc_info *ctx, const char *why)
@@ -188,6 +224,8 @@ static bool gpu_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int w
     } else {
         sptm_virt_mmio_rw(addr, val, write, width);
         gpu_note(ctx, addr, *val, write, width);
+        if (write && gpu_sgx)
+            gpu_note_config(addr, *val, now);
     }
 
     u64 off;
