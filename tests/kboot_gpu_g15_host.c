@@ -2024,7 +2024,7 @@ static void t8142_setup(bool shared_ro, u64 ro0_base, bool fw_data_node)
     memset(hnodes, 0, sizeof(hnodes));
 
     const char *sgx = "/arm-io/sgx";
-    struct perf_state states[16];
+    struct perf_state states[G17_MAX_PERF_STATES + 1];
     assert(t8142_count <= ARRAY_SIZE(states));
     for (u32 i = 0; i < t8142_count; i++)
         states[i] = t8142_j704_states ?
@@ -2205,10 +2205,28 @@ static void t8142_j813_dt14(void)
     assert(!strcmp(status_of(dtbuf, "/soc/gpu@582600000"), "disabled"));
 }
 
-/* Only the two known shapes: 14 states with gpu-num-perf-states 12 is refused. */
+/* gpu-num-perf-states must be perf-state-count - 1: 14 states with 12 is refused. */
 static void t8142_mixed_shape(void)
 {
     t8142_shape(14, 12, 14, true);
+    t8142_setup(true, T8142_GFX_DATA + 0xc0000, true);
+    CHK(dt_set_gpu_g17(dtbuf, &g17_soc_t8142));
+    assert(!strcmp(status_of(dtbuf, "/soc/gpu@582600000"), "disabled"));
+}
+
+/* More states than G17_MAX_PERF_STATES, even with a matching DT, are refused. */
+static void t8142_too_many_states(void)
+{
+    t8142_shape(G17_MAX_PERF_STATES + 1, G17_MAX_PERF_STATES, G17_MAX_PERF_STATES + 1, false);
+    t8142_setup(true, T8142_GFX_DATA + 0xc0000, true);
+    CHK(dt_set_gpu_g17(dtbuf, &g17_soc_t8142));
+    assert(!strcmp(status_of(dtbuf, "/soc/gpu@582600000"), "disabled"));
+}
+
+/* A single perf state is refused. */
+static void t8142_one_state(void)
+{
+    t8142_shape(1, 0, 1, false);
     t8142_setup(true, T8142_GFX_DATA + 0xc0000, true);
     CHK(dt_set_gpu_g17(dtbuf, &g17_soc_t8142));
     assert(!strcmp(status_of(dtbuf, "/soc/gpu@582600000"), "disabled"));
@@ -2495,6 +2513,8 @@ static const struct {
     {"t8142-j704-dt13", t8142_j704_dt13},
     {"t8142-j813-dt14", t8142_j813_dt14},
     {"t8142-mixed-shape", t8142_mixed_shape},
+    {"t8142-too-many-states", t8142_too_many_states},
+    {"t8142-one-state", t8142_one_state},
     {"t8140-fw-data", t8140_fw_data},
     {"t8140-fw-data-apart", t8140_fw_data_apart},
     {"t8140-fw-data-no-gfx1", t8140_fw_data_no_gfx1},
