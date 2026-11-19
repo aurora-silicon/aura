@@ -4,28 +4,19 @@
 #include "adt.h"
 #include "string.h"
 #include "tunables.h"
+#include "usb_atc_regs.h"
 #include "usb_cdc.h"
 #include "utils.h"
 
 /* T8130 ATC register facts from public Asahi Linux atc.c and the J700 ADT. */
-#define USB2_CTL         0x04
-#define USB2_SIG         0x08
-#define USB2_MISCTUNE    0x1c
-#define USB2_USBCTL      0x00
-#define ATC_EVT_USB2_CTL 0x00
-#define ATC_CFG0         0x08
-#define ATC_LANE_MODE    0x60
-#define ATC_CROSSBAR     0x64
-#define ATC_RCAL         0x04
-#define ATC_BIAS         0x00
-#define ATC_POWER_CTRL   0x00
-#define ATC_POWER_STAT   0x04
-#define ATC_MISC         0x08
-
-#define PIPE_OVERRIDE    0x00
-#define PIPE_MUX         0x0c
-#define PIPE_AON_GEN     0x1c
-#define PIPE_NONSELECTED 0x20
+#define ATC_CFG0       0x08
+#define ATC_LANE_MODE  0x60
+#define ATC_CROSSBAR   0x64
+#define ATC_RCAL       0x04
+#define ATC_BIAS       0x00
+#define ATC_POWER_CTRL 0x00
+#define ATC_POWER_STAT 0x04
+#define ATC_MISC       0x08
 
 struct atc_tuning_group {
     const char *name;
@@ -144,28 +135,29 @@ int usb_cdc_atc_power_on(uintptr_t pipehandler)
             if (validate_group(node, &lane_groups[lane][i]))
                 return -1;
 
-    set32(usb2 + USB2_SIG, 0xf);
-    clear32(usb2 + USB2_SIG, 7 << 12); /* device role */
+    set32(usb2 + USB2PHY_SIG, USB2PHY_SIG_VBUS_FORCE);
+    clear32(usb2 + USB2PHY_SIG, USB2PHY_SIG_HOST); /* device role */
     udelay(10);
-    clear32(usb2 + USB2_CTL, BIT(3)); /* SIDDQ */
+    clear32(usb2 + USB2PHY_CTL, USB2PHY_CTL_SIDDQ);
     udelay(10);
-    clear32(usb2 + USB2_CTL, BIT(0)); /* RESET */
+    clear32(usb2 + USB2PHY_CTL, USB2PHY_CTL_RESET);
     udelay(10);
-    clear32(usb2 + USB2_CTL, BIT(1)); /* PORT_RESET */
+    clear32(usb2 + USB2PHY_CTL, USB2PHY_CTL_PORT_RESET);
     udelay(10);
-    set32(core + ATC_EVT_USB2_CTL, BIT(0) | BIT(3));
+    set32(core + ATCPHY_EVT_USB2_CTL, ATCPHY_EVT_USB2_CTL_EVT_EN | ATCPHY_EVT_USB2_CTL_LOAD_CNT);
     udelay(10);
-    set32(usb2 + USB2_CTL, BIT(2)); /* APB_RESET_N */
+    set32(usb2 + USB2PHY_CTL, USB2PHY_CTL_APB_RESET_N);
     udelay(10);
-    clear32(usb2 + USB2_MISCTUNE, BIT(29) | BIT(30));
+    clear32(usb2 + USB2PHY_MISCTUNE,
+            USB2PHY_MISCTUNE_APBCLK_GATE_OFF | USB2PHY_MISCTUNE_REFCLK_GATE_OFF);
     /* T8140's eUSB2 repeater needs to settle after reset release (Linux atc.c). */
     usb_cdc_wait_us(5000);
-    write32(usb2 + USB2_USBCTL, 2); /* RUN */
+    write32(usb2 + USB2PHY_USBCTL, USB2PHY_USBCTL_RUN);
 
     /* Park the upstream DWC3 PIPE on the dummy PHY until DWC3 is ready. */
-    write32(pipe + PIPE_MUX, 0x22);
-    write32(pipe + PIPE_AON_GEN, BIT(0));
-    write32(pipe + PIPE_NONSELECTED, 0x9332);
+    write32(pipe + PIPEHANDLER_MUX_CTRL, PIPEHANDLER_MUX_T8103(DUMMY, DUMMY));
+    write32(pipe + PIPEHANDLER_AON_GEN, PIPEHANDLER_AON_GEN_DWC3_RESET_N);
+    write32(pipe + PIPEHANDLER_NONSELECTED_OVERRIDE, 0x9332);
 
     set32(power + ATC_MISC, BIT(0));
     set32(power + ATC_POWER_CTRL, BIT(0));
@@ -245,12 +237,16 @@ int usb_cdc_atc_switch_pipe(void)
         printf("CDC ATC: cable orientation changed, lane=%u\n", lane);
     }
 
-    mask32(pipe + PIPE_MUX, 7 << 3, 0);
+    mask32(pipe + PIPEHANDLER_MUX_CTRL, PIPEHANDLER_MUX_CTRL_CLK_T8103,
+           FIELD_PREP(PIPEHANDLER_MUX_CTRL_CLK_T8103, PIPEHANDLER_MUX_CTRL_CLK_OFF));
     udelay(10);
-    mask32(pipe + PIPE_MUX, 7, 0);
+    mask32(pipe + PIPEHANDLER_MUX_CTRL, PIPEHANDLER_MUX_CTRL_DATA_T8103,
+           FIELD_PREP(PIPEHANDLER_MUX_CTRL_DATA_T8103, PIPEHANDLER_MUX_CTRL_DATA_USB3));
     udelay(10);
-    mask32(pipe + PIPE_MUX, 7 << 3, BIT(3));
+    mask32(pipe + PIPEHANDLER_MUX_CTRL, PIPEHANDLER_MUX_CTRL_CLK_T8103,
+           FIELD_PREP(PIPEHANDLER_MUX_CTRL_CLK_T8103, PIPEHANDLER_MUX_CTRL_CLK_USB3));
     udelay(10);
-    clear32(pipe + PIPE_OVERRIDE, BIT(0) | BIT(2));
+    clear32(pipe + PIPEHANDLER_OVERRIDE,
+            PIPEHANDLER_OVERRIDE_RXVALID | PIPEHANDLER_OVERRIDE_RXDETECT);
     return 0;
 }
