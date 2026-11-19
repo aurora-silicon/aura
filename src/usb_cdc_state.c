@@ -6,8 +6,9 @@ int usb_cdc_state_schedule(struct usb_cdc_state *cdc, u32 delay_ms, u32 reserved
                            u64 now_ms)
 {
     /* Only Gen1 descriptors and controller setup are implemented. */
-    if (!cdc || cdc->state != USB_CDC_IDLE || delay_ms < 1000 || delay_ms > 15000 || reserved ||
-        (flags & ~7u) || !(flags & 2u))
+    if (!cdc || cdc->state != USB_CDC_IDLE || delay_ms < USB_CDC_SCHEDULE_MIN_MS ||
+        delay_ms > USB_CDC_SCHEDULE_MAX_MS || reserved || (flags & ~USB_CDC_FLAGS_ALL) ||
+        !(flags & USB_CDC_FLAG_GEN1))
         return -1;
     cdc->flags = flags;
     cdc->step = 0;
@@ -28,10 +29,10 @@ u32 usb_cdc_state_status(const struct usb_cdc_state *cdc)
 
 void usb_cdc_recovery_arm(struct usb_cdc_recovery *recovery, u64 now_ms)
 {
-    if (!recovery || recovery->pending || recovery->attempts >= 3)
+    if (!recovery || recovery->pending || recovery->attempts >= USB_CDC_RECOVERY_ATTEMPTS)
         return;
     recovery->pending = true;
-    recovery->deadline_ms = now_ms + 25;
+    recovery->deadline_ms = now_ms + USB_CDC_RECOVERY_FIRST_MS;
 }
 
 void usb_cdc_recovery_connected(struct usb_cdc_recovery *recovery)
@@ -53,10 +54,10 @@ void usb_cdc_recovery_attempted(struct usb_cdc_recovery *recovery, u64 now_ms)
     if (!recovery || !recovery->pending)
         return;
     recovery->attempts++;
-    if (recovery->attempts >= 3)
+    if (recovery->attempts >= USB_CDC_RECOVERY_ATTEMPTS)
         recovery->pending = false;
     else
-        recovery->deadline_ms = now_ms + 2000;
+        recovery->deadline_ms = now_ms + USB_CDC_RECOVERY_RETRY_MS;
 }
 
 bool usb_cdc_dma_may_release(bool active, int end_status, bool reset_complete)
