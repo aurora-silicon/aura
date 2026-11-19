@@ -280,7 +280,7 @@ struct adt_function_gpio {
 } PACKED;
 
 /* The base of the /arm-io GPIO controller whose AAPL,phandle is @phandle, and its pin count */
-static int adt_gpio_by_phandle(const void *adt, u32 phandle, u64 *base, u32 *npins)
+int adt_gpio_by_phandle(const void *adt, u32 phandle, u64 *base, u32 *npins)
 {
     int arm_io = adt_path_offset(adt, "/arm-io");
     int node = arm_io;
