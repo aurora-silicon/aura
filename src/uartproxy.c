@@ -9,6 +9,7 @@
 #include "types.h"
 #include "usb.h"
 #include "usb_cdc.h"
+#include "usb_cdc_state.h"
 #include "utils.h"
 #include "wdt.h"
 
@@ -113,7 +114,8 @@ enum stage1_proxy_result uartproxy_wait_stage1(unsigned int timeout_ms)
     stage1_proxy_window_init(&window, timeout_ms);
     bool schedule_failed = false;
     if (chip_id == T8140) {
-        schedule_failed = usb_cdc_schedule(1000, 0, BIT(1) | BIT(2));
+        schedule_failed = usb_cdc_schedule(USB_CDC_SCHEDULE_MIN_MS, 0,
+                                           USB_CDC_FLAG_GEN1 | USB_CDC_FLAG_HPM_RESET);
     } else {
         usb_init();
         usb_iodev_init();
