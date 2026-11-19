@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-2.0-only
-"""Run the production T8132 AOP handoff gate on J713, J604 and boards it does not qualify."""
+"""Run the production T8132 AOP handoff gate on J713, J604, J773g and boards it does not qualify."""
 from pathlib import Path
 
 from test_j713_dapf_instance import block
@@ -24,7 +24,10 @@ typedef struct { int unused; } asc_dev_t;
 static void *dt;
 static asc_dev_t the_asc;
 static int touched, fail;
-static bool running;
+static bool running, live_j773g;
+/* The live machine is a J773g on its qualified firmware and the tree says so. */
+static bool kboot_is_j773g(const void *fdt)
+{ return live_j773g && !fdt_node_check_compatible(fdt, 0, "apple,j773g"); }
 static asc_dev_t *asc_init(const char *path)
 { assert(!strcmp(path, "/arm-io/aop")); touched++; return fail == 1 ? NULL : &the_asc; }
 static bool asc_cpu_running(asc_dev_t *asc) { return running; }
@@ -56,6 +59,7 @@ static void tree(const char *board, bool requested)
     assert(!fdt_setprop_string(dt, aop, "status", "okay"));
     touched = fail = 0;
     running = false;
+    live_j773g = !strcmp(board, "apple,j773g");
 }
 static const char *status(void)
 {
@@ -63,8 +67,9 @@ static const char *status(void)
 }
 int main(void)
 {
-    /* J713 and J604: a requested, halted AOP is handed over; any failed step disables it. */
-    static const char *const qualified[] = {"apple,j713", "apple,j604"};
+    /* J713, J604 and a live J773g: a requested, halted AOP is handed over; any failed step
+     * disables it. */
+    static const char *const qualified[] = {"apple,j713", "apple,j604", "apple,j773g"};
     for (unsigned i = 0; i < sizeof(qualified) / sizeof(*qualified); i++) {
         tree(qualified[i], true);
         assert(!dt_set_t8132_aop("/aop@390600000") && !strcmp(status(), "okay") && touched == 4);
@@ -86,6 +91,8 @@ int main(void)
     for (unsigned i = 0; i < sizeof(others) / sizeof(*others); i++)
         for (int requested = 0; requested <= 1; requested++) {
             tree(others[i], requested);
+            /* A J773g tree on any other machine or firmware is not qualified. */
+            live_j773g = false;
             assert(!dt_set_t8132_aop("/aop@390600000"));
             assert(!strcmp(status(), "disabled") && !touched);
         }

@@ -9027,8 +9027,12 @@ static int dt_set_t8132_aop(const char *path)
     const char *why;
     int node;
 
+    /*
+     * The J773g (Mac mini) tree states the same handoff contract and its 26.6.2 ADT has the same
+     * AOP, DART and segment layout; its headphone jack's audio runs on the AOP.
+     */
     if (fdt_node_check_compatible(dt, 0, "apple,j713") &&
-        fdt_node_check_compatible(dt, 0, "apple,j604")) {
+        fdt_node_check_compatible(dt, 0, "apple,j604") && !kboot_is_j773g(dt)) {
         why = "no handoff is qualified for this board";
         goto disable;
     }
