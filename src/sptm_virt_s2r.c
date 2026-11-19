@@ -732,6 +732,12 @@ static bool s2r_j613_snapshot_enabled(void)
     return chip_id == T8122 && (sptm_virt_s2r_crumbs & S2R_J613_SNAPSHOT);
 }
 
+/* The wake-side snapshot (and its DRAM witness) without the live commit-time reads of bit 13. */
+static bool s2r_j613_wake_snap_enabled(void)
+{
+    return chip_id == T8122 && (sptm_virt_s2r_crumbs & (S2R_J613_SNAPSHOT | S2R_J613_STOPSNAP));
+}
+
 static bool s2r_j613_traffic_enabled(void)
 {
     return chip_id == T8122 && (sptm_virt_s2r_crumbs & S2R_J613_TRAFFIC);
@@ -1029,6 +1035,16 @@ static void s2r_j613_stop_export(void)
                     iodev_get_usage(IODEV_DOCKCHANNEL_UART) | USAGE_CONSOLE | USAGE_UARTPROXY);
     uartproxy_iodev = IODEV_DOCKCHANNEL_UART;
     if (sptm_virt_s2r_crumbs & S2R_J613_STOPSNAP) {
+        /* In GO the other cores take their final WFI just after the commit write; give them
+         * up to 2 s to trap it (and record their state) before reading the commit state. */
+        u32 want = 0;
+        for (int i = 0; i < MAX_CPUS; i++)
+            if (smp_cpu_valid(i) && i != smp_id())
+                want |= BIT(i);
+        u64 end = mrs(CNTPCT_EL0) + 2 * mrs(CNTFRQ_EL0);
+        while ((s2r_crumb_wfi & want) != want && mrs(CNTPCT_EL0) < end)
+            udelay(100);
+        s2r_retained_marker("STOPWAIT", ((u64)want << 32) | (s2r_crumb_wfi & want));
         /* The committing core does not reach its final WFI here: its state at the withheld
          * commit, in the same registers the other cores record at theirs. */
         s2r_retained_marker("STOPDS", SAFE_MRS("s3_5_c15_c6_2"));
@@ -2232,6 +2248,10 @@ void sptm_virt_s2r_early_release(void)
     s2r_crumb_at(8, 0x61);
     s2r_release_kept();
     s2r_crumb_at(8, 0x62); /* early release done */
+    /* Bit 16's DRAM witness, filled here rather than in the commit writes' window. */
+    if (chip_id == T8122 && (sptm_virt_s2r_crumbs & S2R_J613_STOPSNAP) &&
+        !(sptm_virt_s2r_crumbs & S2R_J613_SNAPSHOT))
+        s2r_j613_retention(false);
 }
 
 /* ---- the wake ------------------------------------------------------------------------------- */
@@ -2258,7 +2278,7 @@ void sptm_virt_s2r_wake(int cpu)
     if (!commit)
         return;
     u64 now = mrs(CNTPCT_EL0), frq = mrs(CNTFRQ_EL0);
-    if (s2r_j613_snapshot_enabled()) {
+    if (s2r_j613_wake_snap_enabled()) {
         s2r_wake_head = sptm_virt_s2r_head;
         s2r_retained_marker("J613RST", now);
         /* Run 39 did not resume with the register reads here, MMU off on the just-reset core:
@@ -2286,6 +2306,8 @@ void sptm_virt_s2r_wake(int cpu)
     s2r_wake_mmio = 160;
     s2r_twi_mask = 0;
     s2r_timer_cpu = -1;
+    s2r_crumb_wfi = 0; /* per sleep cycle: the next entry's final WFIs */
+    s2r_clean((const void *)&s2r_crumb_wfi, sizeof(s2r_crumb_wfi));
     /* the sleep rules come back for the next sleep */
     s2r_arm_at = now + (sptm_virt_s2r_usb_retake ? S2R_REARM_AFTER_S : S2R_ARM_AFTER_S) * frq;
     s2r_clean(&s2r_commit_t, sizeof(s2r_commit_t));
@@ -2369,7 +2391,7 @@ void sptm_virt_s2r_wake_trap(u64 esr, u64 elr, bool in_gl)
         return;
     if (!s2r_wake_banner_done &&
         !__atomic_exchange_n(&s2r_wake_banner_done, true, __ATOMIC_SEQ_CST)) {
-        if (!s2r_j613_snapshot_enabled())
+        if (!s2r_j613_wake_snap_enabled())
             s2r_wake_head = sptm_virt_s2r_head;
         else if (!(sptm_virt_s2r_crumbs & S2R_J613_WAKE_AT_RESET)) {
             s2r_retained_marker("J613TRAP", mrs(CNTPCT_EL0));
