@@ -34,6 +34,7 @@ typedef uint64_t u64;
 #define WDT_CTL 0x1c
 #define WDT_TRIAL_SECONDS 178
 #define WDT_BOOT_SECONDS 178
+#define WDT_DISPLAY_SECONDS 90
 #define ADT_GETPROP(a,n,k,v) (*(v)=adt_version,0)
 #define sysop(x) ((void)0)
 static u32 chip_id = 0x8112, adt_version = 2, regs[8], secondary_value;

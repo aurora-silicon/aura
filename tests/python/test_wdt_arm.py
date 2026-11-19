@@ -22,6 +22,7 @@ typedef uint64_t u64;
 #define WDT_CTL 0x1c
 #define WDT_TRIAL_SECONDS 178
 #define WDT_BOOT_SECONDS 178
+#define WDT_DISPLAY_SECONDS 90
 #define ADT_GETPROP(a,n,k,v) (*(v)=adt_version,0)
 #define sysop(x) ((void)0)
 static u32 chip_id = T6040, adt_version = 2, regs[8], secondary_value;
@@ -102,6 +103,17 @@ int main(void)
     adt_version = 3;
     writes = 0;
     assert(wdt_arm_trial() == -1 && writes == 0);
+    adt_version = 2;
+
+    /* The J773g display guard: any chip with the version 2 layout, 90 s, no disarm first */
+    chip_id = 0x8132;
+    writes = disables = 0;
+    assert(wdt_arm_display() == 0 && disables == 0);
+    assert(regs[WDT_ALARM/4] == 2160000000U && regs[WDT_CTL/4] == 4 && regs[WDT_COUNT/4] == 0);
+    assert(writes == 4 && wdt_base == primary);
+    adt_version = 3;
+    writes = 0;
+    assert(wdt_arm_display() == -1 && writes == 0);
     adt_version = 2;
     return 0;
 }

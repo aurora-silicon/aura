@@ -70,7 +70,18 @@ static const void *adt_getprop(void *tree, int node, const char *name, u32 *len)
     (void)tree; (void)node; (void)name; (void)len;
     return NULL;
 }
-static int display_configure(const char *config) { (void)config; configures++; return 0; }
+static bool trial_running, wdt_armed;
+static unsigned wdt_events, armed_configures;
+static bool aura_trial_enabled(void) { return trial_running; }
+static int wdt_arm_display(void) { wdt_armed = true; wdt_events++; return 0; }
+static void wdt_disable(void) { wdt_armed = false; wdt_events++; }
+static int display_configure(const char *config)
+{
+    (void)config;
+    configures++;
+    armed_configures += wdt_armed;
+    return 0;
+}
 static int display_init_t8152(void) { t8152_inits++; return 0; }
 static bool kboot_is_j773g_machine(void) { return admitted_j773g; }
 static void fb_clear_direct(void) {}
@@ -92,7 +103,8 @@ static void boot(u32 chip)
     cur_boot_args.video.height = 1136;
     cur_boot_args.video.depth = 30;
     configures = t8152_inits = dart_queries = config_queries = adt_queries = 0;
-    admitted_j773g = false;
+    wdt_events = armed_configures = 0;
+    admitted_j773g = trial_running = wdt_armed = false;
 }
 
 int main(void)
@@ -101,14 +113,20 @@ int main(void)
     for (unsigned i = 0; i < 2; i++) {
         boot(inherited_only[i]);
         assert(display_init() == 0);
-        assert(!configures && !t8152_inits);
+        assert(!configures && !t8152_inits && !wdt_events);
         assert(!display_dart_tables_inherited());
         assert(!dart_queries && !config_queries);
     }
     boot(T8132);
     admitted_j773g = true;
     assert(display_init() == 0 && configures == 1);
+    /* A plain boot bounds the HDMI bring-up with the watchdog, then disarms it. */
+    assert(armed_configures == 1 && wdt_events == 2 && !wdt_armed);
     assert(display_dart_tables_inherited() && dart_queries == 1 && config_queries == 1);
+    /* A trial runs under its own watchdog, which display_init() leaves armed. */
+    boot(T8132);
+    admitted_j773g = trial_running = true;
+    assert(display_init() == 0 && configures == 1 && !wdt_events);
     /* Positive control: the same dummy framebuffer starts the DCP on T6000,
      * and the inherited-table question goes to its display DARTs. */
     boot(T6000);

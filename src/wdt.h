@@ -16,5 +16,9 @@ int wdt_arm_trial(void);
 int wdt_arm_boot(void);
 void wdt_host_attached(void);
 bool wdt_boot_watchdog_armed(void);
+/* J773g's HDMI bring-up in a plain Stage 2 (display.c): long enough for a sink that is slow to
+ * answer, short enough that a stuck one resets the Mac instead of leaving it dark */
+#define WDT_DISPLAY_SECONDS 90
+int wdt_arm_display(void);
 
 #endif

@@ -5,6 +5,7 @@
 #include "display.h"
 #include "adt.h"
 #include "assert.h"
+#include "boot_options.h"
 #include "dcp.h"
 #include "dcp_iboot.h"
 #include "fb.h"
@@ -14,6 +15,7 @@
 #include "soc.h"
 #include "string.h"
 #include "utils.h"
+#include "wdt.h"
 #include "xnuboot.h"
 
 #include "dcp/dptx_phy.h"
@@ -1030,7 +1032,12 @@ int display_init(void)
 
     if (kboot_is_j773g_machine()) {
         display_is_external = true;
-        return display_configure(NULL);
+        /* A trial already runs under its own watchdog (wdt.c); keep that one armed. */
+        bool guarded = !aura_trial_enabled() && !wdt_arm_display();
+        int ret = display_configure(NULL);
+        if (guarded)
+            wdt_disable();
+        return ret;
     }
 
     const char *disp_path;
