@@ -1277,6 +1277,8 @@ static bool s2r_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int w
     /* AURA_S2R_GO_COUNT here too (J813): after n go-mode wakes, the next commit stops like stop
      * mode, so the ring holds the sleep, the wake and the next entry for the proxy to read. */
     if (timer && (!s2r_go || (sptm_virt_s2r_go_count && s2r_wake_count >= sptm_virt_s2r_go_count))) {
+        if (chip_id == T8122 && s2r_go)
+            s2r_crumb_at(8, 0x63); /* counted GO limit: the next commit was withheld */
         sptm_virt_rg_stop_wd2();
         sptm_virt_s2r_note(ctx, addr, *val, true, width);
         if (!shadow_timer)
