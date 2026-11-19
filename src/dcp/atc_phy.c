@@ -18,8 +18,27 @@
 #define ATC_XBAR             0x74000
 #define ATC_TIMEOUT          10000
 #define ATC_ALT_MODE_TIMEOUT 2000000
+#define ATC_ALT_MODE_POLL_MS 50
 #define ATC_SAVED_MAX        192
 #define ATC_PSD58            0x303a13a00ULL
+
+/* Gap between consecutive PHY control steps that have no status bit: lane
+ * clamp, power and isolation fields in AON 0x1e18/0x1e1c, the PMA clock and
+ * AUX sleep requests in AON 0x24, the CFG clock, reset and sleep controls,
+ * and the crossbar enable writes ahead of their acknowledgement polls. Steps
+ * that do report completion are polled instead (CFG status, crossbar acks,
+ * PSD). */
+#define ATC_STEP_DELAY_US 1
+
+/* Settle time after the DPTX enable in 0x2040 is withdrawn, before the
+ * transmitter control bits in 0x2000 are cleared. No status bit is known. */
+#define ATC_DPTX_DISABLE_SETTLE_US 5
+
+/* Wait after the DCP0 -> DFP0 route is configured, before the DCP continues
+ * link training. The route start already polls every crossbar acknowledgement;
+ * what this additionally waits for is not known. Kept as qualified on J873g
+ * (tracking: aura#344). */
+#define ATC_ROUTE_SETTLE_MS 5
 
 struct atc_saved {
     u32 offset;
@@ -307,7 +326,7 @@ atc_phy_t *atc_phy_init(const char *path)
              (data_status & TPS6598X_DATA_DP_CONNECTION)) ||
             timeout_expired(deadline))
             break;
-        mdelay(50);
+        mdelay(ATC_ALT_MODE_POLL_MS);
     }
     tps6598x_shutdown(tps);
     spmi_shutdown(spmi);
@@ -382,7 +401,7 @@ static int atc_route_stop(atc_phy_t *phy)
     if (atc_update(phy, ATC_XBAR + 0x3c, 1, 0) || atc_update(phy, ATC_XBAR, 1, 0) ||
         atc_update(phy, ATC_XBAR + 0xc, 1, 0) || atc_update(phy, ATC_XBAR + 0x24, 0x100, 0))
         return -1;
-    udelay(1);
+    udelay(ATC_STEP_DELAY_US);
     if (poll32(phy->base + ATC_XBAR + 0x800, 1, 0, ATC_TIMEOUT) ||
         poll32(phy->base + ATC_XBAR + 0x808, 1, 0, ATC_TIMEOUT) ||
         poll32(phy->base + ATC_XBAR + 0x81c, 0x100, 0, ATC_TIMEOUT)) {
@@ -426,7 +445,7 @@ static int atc_route_start(atc_phy_t *phy)
         atc_update(phy, ATC_XBAR + 0x44, 0x00000f00, 0) || atc_update(phy, ATC_XBAR + 4, 1, 0) ||
         atc_update(phy, ATC_XBAR + 0x1c, 1, 0) || atc_update(phy, ATC_XBAR + 0x34, 0x100, 0))
         goto fail;
-    udelay(1);
+    udelay(ATC_STEP_DELAY_US);
     if (poll32(base + 0x804, 1, 0, ATC_TIMEOUT) || poll32(base + 0x818, 1, 0, ATC_TIMEOUT) ||
         poll32(base + 0x82c, 0x100, 0, ATC_TIMEOUT)) {
         printf("ATC3: crossbar reset acknowledgement timeout\n");
@@ -459,7 +478,7 @@ static int atc_dp_stop(atc_phy_t *phy)
     }
     if (atc_update(phy, 0x2040, BIT(16), 0))
         return -1;
-    udelay(5);
+    udelay(ATC_DPTX_DISABLE_SETTLE_US);
     if (atc_update(phy, 0x2000, BIT(15), 0) || atc_update(phy, 0x2000, BIT(13), 0) ||
         atc_update(phy, 0x2000, BIT(14), 0) || atc_update(phy, 0x2000, BIT(2), 0) ||
         atc_update(phy, 0x2000, BIT(3), BIT(3)) || atc_update(phy, 0xe10, BIT(2), BIT(2)) ||
@@ -482,20 +501,20 @@ static int atc_dp_stop(atc_phy_t *phy)
     for (unsigned int i = 0; i < ARRAY_SIZE(requests); i++)
         if (atc_update(phy, ATC_AON + 0x24, requests[i], 0))
             return -1;
-    udelay(1);
+    udelay(ATC_STEP_DELAY_US);
     for (u32 offset = 0x1e18; offset <= 0x1e1c; offset += 4) {
         if (atc_update(phy, offset, BIT(5), 0))
             return -1;
-        udelay(1);
+        udelay(ATC_STEP_DELAY_US);
         if (atc_update(phy, offset, BIT(0), BIT(0)))
             return -1;
-        udelay(1);
+        udelay(ATC_STEP_DELAY_US);
         if (atc_update(phy, offset, BIT(2), 0))
             return -1;
-        udelay(1);
+        udelay(ATC_STEP_DELAY_US);
         if (atc_update(phy, offset, BIT(1), 0))
             return -1;
-        udelay(1);
+        udelay(ATC_STEP_DELAY_US);
     }
     phy->dp_started = false;
     phy->link_rate = 0;
@@ -513,7 +532,7 @@ int atc_phy_set_route(atc_phy_t *phy, bool enable)
         return -1;
     int ret = atc_route_start(phy);
     if (!ret)
-        mdelay(5);
+        mdelay(ATC_ROUTE_SETTLE_MS);
     return ret;
 }
 
@@ -530,16 +549,16 @@ int atc_phy_deactivate(atc_phy_t *phy)
         if (phy->aux_started) {
             u64 aux = phy->base + ATC_AON + 0x24;
             set32(aux, BIT(10));
-            udelay(1);
+            udelay(ATC_STEP_DELAY_US);
             clear32(aux, BIT(6));
-            udelay(1);
+            udelay(ATC_STEP_DELAY_US);
             clear32(aux, BIT(8));
-            udelay(1);
+            udelay(ATC_STEP_DELAY_US);
             phy->aux_started = false;
         }
         /* Assert main reset before restoring volatile setup. */
         clear32(cfg, BIT(4));
-        udelay(1);
+        udelay(ATC_STEP_DELAY_US);
         while (phy->saved_count) {
             struct atc_saved *s = &phy->saved[--phy->saved_count];
             if (atc_restore(phy, s))
@@ -585,7 +604,7 @@ int atc_phy_activate(atc_phy_t *phy)
         goto fail;
     phy->started = true;
     set32(cfg + 0x30, BIT(0));
-    udelay(1);
+    udelay(ATC_STEP_DELAY_US);
     set32(cfg, BIT(0));
     if (poll32(cfg + 4, BIT(0), BIT(0), ATC_TIMEOUT))
         goto fail;
@@ -593,7 +612,7 @@ int atc_phy_activate(atc_phy_t *phy)
     if (poll32(cfg + 4, BIT(1), BIT(1), ATC_TIMEOUT))
         goto fail;
     clear32(cfg, BIT(2));
-    udelay(1);
+    udelay(ATC_STEP_DELAY_US);
     set32(cfg, BIT(3));
 
     for (unsigned int i = 0; i < 2; i++)
@@ -616,13 +635,13 @@ int atc_phy_activate(atc_phy_t *phy)
     phy->aux_started = true;
     if (atc_update(phy, ATC_AON + 0x24, BIT(8), BIT(8)))
         goto fail;
-    udelay(1);
+    udelay(ATC_STEP_DELAY_US);
     if (atc_update(phy, ATC_AON + 0x24, BIT(6), BIT(6)))
         goto fail;
-    udelay(1);
+    udelay(ATC_STEP_DELAY_US);
     if (atc_update(phy, ATC_AON + 0x24, BIT(10), 0))
         goto fail;
-    udelay(1);
+    udelay(ATC_STEP_DELAY_US);
     phy->active = true;
     printf("ATC3: common PHY and AUX initialized, %u registers saved\n", phy->saved_count);
     return 0;
@@ -696,24 +715,23 @@ int atc_phy_set_link_rate(atc_phy_t *phy, u32 rate)
     for (u32 i = 0; i < 2; i++) {
         if (atc_update(phy, ATC_AON + 0x24, BIT(12 + 2 * i), BIT(12 + 2 * i)))
             goto fail;
-        udelay(1);
+        udelay(ATC_STEP_DELAY_US);
         if (atc_update(phy, ATC_AON + 0x24, BIT(16 + 2 * i), BIT(16 + 2 * i)))
             goto fail;
-        udelay(1);
+        udelay(ATC_STEP_DELAY_US);
         u32 offset = 0x1e18 + 4 * i;
         if (atc_update(phy, offset, BIT(1), BIT(1)))
             goto fail;
-        udelay(1);
+        udelay(ATC_STEP_DELAY_US);
         if (atc_update(phy, offset, BIT(2), BIT(2)))
             goto fail;
-        udelay(1);
+        udelay(ATC_STEP_DELAY_US);
         if (atc_update(phy, offset, BIT(0), 0))
             goto fail;
-        udelay(1);
+        udelay(ATC_STEP_DELAY_US);
         if (atc_update(phy, offset, BIT(5), BIT(5)))
             goto fail;
-        udelay(1);
-        udelay(1);
+        udelay(ATC_STEP_DELAY_US);
     }
     if (atc_update(phy, 0x2000, 0x380000, r << 19))
         goto fail;
