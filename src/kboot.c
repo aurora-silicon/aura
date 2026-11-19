@@ -366,52 +366,6 @@ static int dt_set_fb(void)
     return 0;
 }
 
-static bool dt_bootarg_space(char c)
-{
-    return c == ' ' || c == '\t' || c == '\n';
-}
-
-static int dt_set_t8140_wfx_args(int node)
-{
-    static const char token[] = "arm64.nowfxt";
-    int len = 0;
-    const char *args = fdt_getprop(dt, node, "bootargs", &len);
-    size_t size = 0;
-
-    if (args) {
-        if (len <= 0 || !memchr(args, 0, len))
-            bail("FDT: bootargs is not NUL-terminated\n");
-        size = strnlen(args, len);
-        for (size_t i = 0; i < size;) {
-            while (i < size && dt_bootarg_space(args[i]))
-                i++;
-            size_t start = i;
-            while (i < size && !dt_bootarg_space(args[i]))
-                i++;
-            if (i - start == sizeof(token) - 1 && !memcmp(args + start, token, sizeof(token) - 1))
-                return 0;
-        }
-        while (size && dt_bootarg_space(args[size - 1]))
-            size--;
-    }
-
-    if (size > SIZE_MAX - sizeof(token) - 1)
-        return -1;
-    char *updated = malloc(size + sizeof(token) + (size != 0));
-    if (!updated)
-        return -1;
-    if (size)
-        memcpy(updated, args, size);
-    if (size)
-        updated[size] = ' ';
-    memcpy(updated + size + (size != 0), token, sizeof(token));
-    int ret = fdt_setprop_string(dt, node, "bootargs", updated);
-    free(updated);
-    if (ret)
-        bail("FDT: couldn't set T8140 bootargs\n");
-    return 0;
-}
-
 /*
  * M3 graphics on by default, with no boot.bin config line. The M3 Airs (J613, J615), the M3 Pros
  * (J514S, J516S) and the 16-inch M3 Max with the 40-core GPU (J516C) hand the internal display and
@@ -1170,9 +1124,6 @@ static int dt_set_chosen(void)
     if (dt_set_hibernate_layout(node))
         return -1;
 
-    if (chip_id == T8140 && dt_set_t8140_wfx_args(node))
-        return -1;
-
     if (initrd_start && initrd_size) {
         if (fdt_setprop_u64(dt, node, "linux,initrd-start", (u64)initrd_start))
             bail("FDT: couldn't set chosen.linux,initrd-start property\n");
@@ -1265,42 +1216,6 @@ static int dt_set_chosen(void)
     } else if (dt_set_rng_seed_sep(node)) {
         if (dt_set_rng_seed_adt(node))
             bail("FDT: couldn't set random seed");
-    }
-
-    /*
-     * Upstream adds these on every chip with locked Apple system registers,
-     * for kernels that cannot survive WFI state loss. Aurora's kernels for
-     * T8132, T6040 and T6041 boot without them, and idle=nop would keep every
-     * idle CPU spinning. T8140 adds only arm64.nowfxt, in dt_set_wfx_args().
-     */
-    if (!cpu_features->apple_sysregs_unlocked && chip_id != T8140 && chip_id != T8132 &&
-        chip_id != T6040 && chip_id != T6041) {
-        /*
-         * M4 and later lose architectural state in WFI and WFIT. Add the
-         * bootargs to prevent Linux from crashing in the idle loop and delay
-         * function.
-         */
-        const char to_append_wfi[] = " idle=nop arm64.nowfxt";
-        /* The T8152 kernel preserves the state its cores lose in WFI. */
-        const char *to_append = chip_id == T8152 ? " arm64.nowfxt" : to_append_wfi;
-        printf("FDT: appending to bootargs:%s\n", to_append);
-
-        /*
-         * fdt_appendprop_string would create another property value:
-         * "a", "b". But we want "ab", so manually create or grow the prop,
-         * then overwrite the \0 of the existing string.
-         */
-        int oldlen, newlen;
-        void *prop_data;
-
-        if (!fdt_get_property(dt, node, "bootargs", &oldlen) || oldlen < 1)
-            oldlen = 1;
-        newlen = oldlen + strlen(to_append);
-
-        if (fdt_setprop_placeholder(dt, node, "bootargs", newlen, &prop_data))
-            bail("FDT: failed to append to 'bootargs' property\n");
-
-        strncpy(prop_data + oldlen - 1, to_append, strlen(to_append) + 1);
     }
 
     return 0;
