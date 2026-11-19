@@ -4764,11 +4764,7 @@ static int dt_set_ave(void)
  * since iBoot loaded it, so it may start the preloaded firmware itself.
  */
 static const char *const ane_compatibles[] = {
-    "apple,t6041-ane",
-    "apple,t6050-ane",
-    "apple,t8132-ane",
-    "apple,t8140-ane",
-    "apple,t8142-ane",
+    "apple,t6041-ane", "apple,t6050-ane", "apple,t8132-ane", "apple,t8140-ane", "apple,t8142-ane",
 };
 
 static int dt_ane_fill_region(int resv, uint32_t phandle, const char *kind, u64 phys, u64 size)
