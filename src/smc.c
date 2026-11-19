@@ -203,7 +203,7 @@ int smc_write_u64(smc_dev_t *smc, u32 key, u64 value)
     return smc_cmd(smc, msg);
 }
 
-/* ADT function-reset = pKW4/pKW8: the SMC node's phandle, the function name, then its arguments */
+/* ADT SMC function = phandle, pKW4/pKW8 opcode, key and argument words. */
 struct smc_adt_function {
     u32 phandle;
     char four_cc[4];
@@ -212,18 +212,54 @@ struct smc_adt_function {
     u32 hi; /* pKW8 only */
 };
 
-int smc_adt_function_reset(const char *path, u32 settle_ms)
+static int smc_adt_function_read(const char *path, const char *property,
+                                 struct smc_adt_function *fn)
 {
-    struct smc_adt_function fn = {0};
     u32 len;
     int node = adt_path_offset(adt, path);
-    const void *prop = node < 0 ? NULL : adt_getprop(adt, node, "function-reset", &len);
+    const void *prop = node < 0 ? NULL : adt_getprop(adt, node, property, &len);
 
-    if (!prop || len < 12)
+    if (!prop)
         return 1;
-    memcpy(&fn, prop, min(len, (u32)sizeof(fn)));
-    bool wide = !memcmp(fn.four_cc, "8WKp", 4);
-    if (!(wide && len == 20) && !(!memcmp(fn.four_cc, "4WKp", 4) && len == 16))
+    if (len != 16 && len != 20)
+        return -1;
+    memcpy(fn, prop, len);
+    if (memcmp(fn->four_cc, len == 20 ? "8WKp" : "4WKp", 4))
+        return -1;
+    return 0;
+}
+
+static int smc_adt_function_write(smc_dev_t *smc, const struct smc_adt_function *fn, u32 level)
+{
+    if (fn->four_cc[0] == '8')
+        return smc_write_u64(smc, fn->key, ((u64)fn->hi << 32) | fn->lo | level);
+    return smc_write_u32(smc, fn->key, fn->lo | level);
+}
+
+int smc_adt_function_set(const char *path, const char *property, u32 level)
+{
+    struct smc_adt_function fn;
+    int ret = smc_adt_function_read(path, property, &fn);
+    if (ret)
+        return ret;
+
+    u32 phandle;
+    int pmu = adt_path_offset(adt, "/arm-io/smc/iop-smc-nub/smc-pmu");
+    if (pmu < 0 || ADT_GETPROP(adt, pmu, "AAPL,phandle", &phandle) < 0 || fn.phandle != phandle)
+        return -1;
+
+    smc_dev_t *smc = smc_init();
+    if (!smc)
+        return -1;
+    ret = smc_adt_function_write(smc, &fn, level);
+    smc_shutdown(smc);
+    return ret ? -1 : 0;
+}
+
+int smc_adt_function_reset(const char *path, u32 settle_ms)
+{
+    struct smc_adt_function fn;
+    if (smc_adt_function_read(path, "function-reset", &fn))
         return 1; /* a GPIO or other non-SMC function */
 
     smc_dev_t *smc = smc_init();
@@ -231,8 +267,7 @@ int smc_adt_function_reset(const char *path, u32 settle_ms)
         return -1;
     int ret = 0;
     for (u32 level = 0; level < 2 && !ret; level++) {
-        ret = wide ? smc_write_u64(smc, fn.key, ((u64)fn.hi << 32) | fn.lo | level)
-                   : smc_write_u32(smc, fn.key, fn.lo | level);
+        ret = smc_adt_function_write(smc, &fn, level);
         mdelay(settle_ms);
     }
     smc_shutdown(smc);

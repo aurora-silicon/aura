@@ -633,35 +633,33 @@ static int stage_g(const struct port_regs *pp)
     return 0;
 }
 
-/* J775c ADT: sd_pwr_en = smc-pmu pKW8("pcIO", 0, 0x190000).
- * Resolve and validate the native function before powering this optional endpoint.
- * Leave it powered through the Linux handoff; no media-dependent gating here.
- */
+/* Leave the optional reader powered through the Linux handoff. */
 static int sdreader_power(const struct port_regs *pp)
 {
-    char path[64];
-    u32 fn[5], phandle;
-    int smc_node = adt_path_offset(adt, "/arm-io/smc/iop-smc-nub/smc-pmu");
-    snprintf(path, sizeof(path), "%s/pcie-sdreader", pp->bridge);
-    int node = adt_path_offset(adt, path);
-    u32 len;
-    const void *prop = node < 0 ? NULL : adt_getprop(adt, node, "function-sd_pwr_en", &len);
-    if (!prop || len != sizeof(fn) || smc_node < 0 ||
-        ADT_GETPROP(adt, smc_node, "AAPL,phandle", &phandle) < 0)
-        FAIL("SD reader power function missing\n");
-    memcpy(fn, prop, sizeof(fn));
-    if (fn[0] != phandle || memcmp(&fn[1], "8WKp", 4) || fn[2] != 0x7063494f || fn[3] != 0 ||
-        fn[4] != 0x190000)
-        FAIL("SD reader power function differs\n");
-    smc_dev_t *smc = smc_init();
-    if (!smc)
-        return -1;
-    int ret = smc_write_u64(smc, fn[2], ((u64)fn[4] << 32) | fn[3] | 1);
-    smc_shutdown(smc);
-    if (ret)
-        FAIL("SD reader power enable failed: %d\n", ret);
-    mdelay(150);
-    return 0;
+    const char *property = "function-sd_pwr_en";
+    int node = adt_path_offset(adt, pp->bridge);
+    if (node < 0)
+        return 1;
+
+    ADT_FOREACH_CHILD(adt, node)
+    {
+        if (!adt_getprop(adt, node, property, NULL))
+            continue;
+
+        char path[64];
+        const char *name = adt_get_name(adt, node);
+        if (!name || snprintf(path, sizeof(path), "%s/%s", pp->bridge, name) >= (int)sizeof(path))
+            FAIL("%s: cannot resolve SD reader path\n", pp->bridge);
+
+        int ret = smc_adt_function_set(path, property, 1);
+        if (ret)
+            FAIL("%s: SD reader power enable failed: %d\n", path, ret);
+        /* Settle the power before PERST# release (PCIe CEM T_PVPERL >= 100 ms). */
+        const u32 power_to_perst_ms = 150;
+        mdelay(power_to_perst_ms);
+        return 0;
+    }
+    return 1;
 }
 
 /* B-G for one port, after the shared A and S */
@@ -669,8 +667,7 @@ static int port_up(struct port_regs *pp)
 {
     u64 p2 = pp->ctl;
 
-    if (pp->p->port == 1)
-        TRY(sdreader_power(pp));
+    TRY(sdreader_power(pp));
     if (read32(p2 + PORT_LINKSTS) & BIT(0)) {
         printf("pcie-t6050: port %d already has a link: adopting it\n", pp->p->port);
     } else {
