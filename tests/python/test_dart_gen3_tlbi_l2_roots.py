@@ -144,7 +144,8 @@ def dart_source():
     for signature in ("static u64 *dart_get_l2(",
                       "static int dart_map_page(", "int dart_map_flags(",
                       "static void dart_unmap_page(", "bool dart_unmap_checked(",
-                      "void dart_unmap(", "void dart_free_l2(", "bool dart_shutdown_checked(",
+                      "void dart_unmap(", "void dart_free_l2(",
+                      "static bool dart_release_locked_l2(", "bool dart_shutdown_checked(",
                       "bool dart_has_failed("):
         definitions += function(source, signature)
     return definitions

@@ -146,6 +146,30 @@ struct dart_dev {
 static u64 legacy_l2_pages[LEGACY_L2_MAX_PAGES];
 static size_t legacy_l2_count;
 
+static void dart_untrack_legacy_l2(u64 *l2)
+{
+    u64 addr = (u64)l2;
+
+    for (size_t i = 0; i < legacy_l2_count; i++) {
+        if (legacy_l2_pages[i] == addr) {
+            legacy_l2_pages[i] = legacy_l2_pages[--legacy_l2_count];
+            legacy_l2_pages[legacy_l2_count] = 0;
+            return;
+        }
+    }
+}
+
+static bool dart_is_tracked_legacy_l2(const u64 *l2)
+{
+    u64 addr = (u64)l2;
+
+    for (size_t i = 0; i < legacy_l2_count; i++) {
+        if (legacy_l2_pages[i] == addr)
+            return true;
+    }
+    return false;
+}
+
 /* On T8152 a locked Gen3 stream keeps its configuration (TTBR/TCR/stream
  * select) out of reach, but its page tables are ordinary memory and firmware
  * expects the AP side to add translations (RTKit buffers, __OS_LOG): on 26A434
@@ -1055,7 +1079,9 @@ static u64 *dart_get_l2(dart_dev_t *dart, u32 idx)
         return (u64 *)off;
     }
 
-    if (dart->legacy_mutable && legacy_l2_count >= LEGACY_L2_MAX_PAGES)
+    bool track_l2 = dart->legacy_mutable || dart->locked;
+
+    if (track_l2 && legacy_l2_count >= LEGACY_L2_MAX_PAGES)
         return NULL;
 
     u64 *tbl = memalign(SZ_16K, SZ_16K);
@@ -1063,14 +1089,14 @@ static u64 *dart_get_l2(dart_dev_t *dart, u32 idx)
         return NULL;
 
     u64 offset = FIELD_PREP(dart->params->offset_mask, ((u64)tbl) >> DART_PTE_OFFSET_SHIFT);
-    if (dart->legacy_mutable &&
+    if (track_l2 &&
         (FIELD_GET(dart->params->offset_mask, offset) << DART_PTE_OFFSET_SHIFT) != (u64)tbl) {
         free(tbl);
         return NULL;
     }
     memset(tbl, 0, SZ_16K);
 
-    if (dart->legacy_mutable)
+    if (track_l2)
         legacy_l2_pages[legacy_l2_count++] = (u64)tbl;
     dart->l1[ttbr][idx] = offset | DART_PTE_VALID;
 
@@ -1216,6 +1242,7 @@ void dart_free_l2(dart_dev_t *dart, uintptr_t iova)
     if (dart->locked && !is_heap(l2))
         return;
     dart->l1[ttbr][l1_index] = 0;
+    dart_untrack_legacy_l2(l2);
     free(l2);
 }
 
@@ -1430,6 +1457,83 @@ u64 dart_find_iova(dart_dev_t *dart, s64 start, size_t len)
 }
 
 /*
+ * A locked DART's tables are the bootloader's, but the L2 tables dart_get_l2() added under its
+ * roots are aura's heap, which the OS gets back as RAM. Unlink all empty heap L2s, invalidate once
+ * per batch, and free/untrack them only if the invalidation succeeded. Any heap L2 that still maps
+ * pages is kept; if it is not tracked in legacy_l2_pages for reservation, fail closed so the
+ * caller does not hand unreserved heap back.
+ */
+static bool dart_release_locked_l2(dart_dev_t *dart)
+{
+    u64 *batch[64];
+    size_t nbatch = 0;
+    bool unlinked = false;
+    bool kept_untracked = false;
+
+    for (int ttbr = 0; ttbr < dart->params->ttbr_count; ++ttbr) {
+        if (!dart->l1[ttbr])
+            continue;
+        for (int i = 0; i < SZ_16K / 8; ++i) {
+            u64 entry = dart->l1[ttbr][i];
+            if (!(entry & DART_PTE_VALID))
+                continue;
+            u64 *l2 = (u64 *)(FIELD_GET(dart->params->offset_mask, entry) << DART_PTE_OFFSET_SHIFT);
+            if (!is_heap(l2))
+                continue;
+            int mapped = 0;
+            for (int j = 0; j < SZ_16K / 8; ++j) {
+                if (!(l2[j] & DART_PTE_VALID))
+                    continue;
+                if (mapped++ < 4)
+                    printf("dart[%lx %u]: L1[%d][%d] keeps dva %lx -> %lx\n", dart->regs,
+                           dart->device, ttbr, i,
+                           ((u64)ttbr << 36) | ((u64)i << 25) | ((u64)j << 14),
+                           FIELD_GET(dart->params->offset_mask, l2[j]) << DART_PTE_OFFSET_SHIFT);
+            }
+            if (mapped) {
+                printf("dart[%lx %u]: L1[%d][%d] heap L2 %p still maps %d pages; kept\n",
+                       dart->regs, dart->device, ttbr, i, l2, mapped);
+                if (!dart_is_tracked_legacy_l2(l2)) {
+                    if (legacy_l2_count < LEGACY_L2_MAX_PAGES)
+                        legacy_l2_pages[legacy_l2_count++] = (u64)l2;
+                    kept_untracked = true;
+                }
+                continue;
+            }
+            dart->l1[ttbr][i] = 0;
+            batch[nbatch++] = l2;
+            if (nbatch == sizeof(batch) / sizeof(batch[0])) {
+                dart->params->tlb_invalidate(dart);
+                if (dart->failed)
+                    return false;
+                for (size_t k = 0; k < nbatch; k++) {
+                    dart_untrack_legacy_l2(batch[k]);
+                    free(batch[k]);
+                }
+                nbatch = 0;
+                unlinked = true;
+            }
+        }
+    }
+    if (nbatch) {
+        dart->params->tlb_invalidate(dart);
+        if (dart->failed)
+            return false;
+        for (size_t k = 0; k < nbatch; k++) {
+            dart_untrack_legacy_l2(batch[k]);
+            free(batch[k]);
+        }
+        unlinked = true;
+    }
+    if (unlinked)
+        printf("dart[%lx %u]: released aura's empty L2 tables from the locked DART\n", dart->regs,
+               dart->device);
+    if (kept_untracked)
+        return false;
+    return true;
+}
+
+/*
  * Disable the stream, then free its tables only once the invalidation that
  * retires them has completed. On failure the domain and every table stay
  * allocated, because the DART may still walk them.
@@ -1439,6 +1543,9 @@ bool dart_shutdown_checked(dart_dev_t *dart)
     if (!dart || dart->failed)
         return false;
     if (dart->locked || dart->keep) {
+        /* Display DARTs are opened with keep set; a locked one's heap L2s are still ours. */
+        if (dart->locked && !dart_release_locked_l2(dart))
+            return false;
         free(dart);
         return true;
     }
