@@ -436,13 +436,15 @@ def test_t6041_gpu_fill(tmp_path):
     opps = t6040[t6040.index("#define T6040_OPPS"):].split("\n", 1)[0] + "\n"
     regions = t6040[t6040.index("static const struct {\n    const char *name;"):]
     regions = regions[:regions.index("};\n") + 3]
+    fw = source[source.index("struct t604x_gpu_fw {"):]
+    fw = fw[:fw.index("\n}\n", fw.index("static int t604x_gpu_fw_segments(")) + 3]
     clusters = next(line for line in source.splitlines()
                     if line.startswith("#define T6041_CLUSTERS ")) + "\n"
     t6041 = clusters + function(source, "static int dt_set_gpu_t6041(")
     bail = '#define bail(...) do { printf(__VA_ARGS__); return -1; } while (0)\n'
     code = (HARNESS + bail + defs + ADT + opps + function(source, "static int dt_set_resvmem(") +
             function(source, "static int fdt_set_aux_opp(") +
-            function(source, "static int t6040_opp_table(") + regions + t6041 + MAIN)
+            function(source, "static int t6040_opp_table(") + regions + fw + t6041 + MAIN)
     cfile = tmp_path / "t6041-gpu-fill.c"
     cfile.write_text(code)
     libfdt = ROOT / "src/libfdt"

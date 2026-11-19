@@ -3599,6 +3599,56 @@ static const struct {
     {NULL, "/reserved-memory/gpu-fw-text"},
 };
 
+/*
+ * T6040/T6041 GPU firmware segments. /arm-io/gfx-asc segment-ranges lists __TEXT, then __DATA.
+ * Firmware with a __DATA_SHARED_RO segment (the 27.2 GPU firmware) lists it third: iBoot places
+ * it right after __DATA, identity-mapped, describes it on /arm-io/sgx as
+ * gfx-data-shared-ro-{base,size}, and gives no shared RW segment. The layout is chosen by that
+ * ADT shape, not by the chip or the firmware version, and any other shape is refused. gpu-fw-data
+ * reserves __DATA and that tail as one region.
+ */
+struct t604x_gpu_fw {
+    u64 text_base, text_size;
+    u64 data_base, data_size;
+    u64 ro_size; /* __DATA_SHARED_RO right after __DATA, or 0 */
+};
+
+static int t604x_gpu_fw_segments(int sgx, struct t604x_gpu_fw *fw)
+{
+    u32 len;
+    int asc = adt_path_offset(adt, "/arm-io/gfx-asc");
+    if (asc < 0)
+        return -1;
+    const struct adt_segment_ranges *seg = adt_getprop(adt, asc, "segment-ranges", &len);
+    if (!seg || (len != 2 * sizeof(*seg) && len != 3 * sizeof(*seg)))
+        return -1;
+    fw->text_base = seg[0].phys;
+    fw->text_size = seg[0].size;
+    fw->data_base = seg[1].phys;
+    fw->data_size = seg[1].size;
+    fw->ro_size = 0;
+    if (!fw->data_size || (fw->data_size & (SZ_16K - 1)) ||
+        fw->data_base > UINT64_MAX - fw->data_size)
+        return -1;
+    if (len == 2 * sizeof(*seg))
+        return 0;
+
+    u64 ro_base, ro_size, rw;
+    if (ADT_GETPROP(adt, sgx, "gfx-data-shared-ro-base", &ro_base) != sizeof(u64) ||
+        ADT_GETPROP(adt, sgx, "gfx-data-shared-ro-size", &ro_size) != sizeof(u64) || !ro_size ||
+        (ro_size & (SZ_16K - 1)) || ro_base != fw->data_base + fw->data_size ||
+        ro_size > UINT64_MAX - ro_base || seg[2].phys != ro_base || seg[2].remap != ro_base ||
+        seg[2].size != ro_size)
+        return -1;
+    static const char *const rw_props[2] = {"gfx-data-shared-rw-base", "gfx-data-shared-rw-size"};
+    for (int i = 0; i < 2; i++)
+        if (adt_getprop(adt, sgx, rw_props[i], NULL) &&
+            (ADT_GETPROP(adt, sgx, rw_props[i], &rw) != sizeof(u64) || rw))
+            return -1;
+    fw->ro_size = ro_size;
+    return 0;
+}
+
 static int dt_set_gpu_t6040(void *dt)
 {
     int gpu = fdt_path_offset(dt, "gpu");
@@ -3673,11 +3723,8 @@ static int dt_set_gpu_t6040(void *dt)
         goto disable;
     }
 
-    int asc = adt_path_offset(adt, "/arm-io/gfx-asc");
-    if (asc < 0)
-        goto disable;
-    const struct adt_segment_ranges *segments = adt_getprop(adt, asc, "segment-ranges", &len);
-    if (!segments || len != 2 * sizeof(*segments))
+    struct t604x_gpu_fw fw;
+    if (t604x_gpu_fw_segments(sgx, &fw))
         goto disable;
 
     /* The reserved regions, the OPP tables and the GPU node must all take the fill. */
@@ -3692,8 +3739,14 @@ static int dt_set_gpu_t6040(void *dt)
             if (ADT_GETPROP(adt, sgx, prop, &region_size[i]) != sizeof(u64))
                 goto disable;
         } else {
-            region_base[i] = segments[0].phys;
-            region_size[i] = segments[0].size;
+            region_base[i] = fw.text_base;
+            region_size[i] = fw.text_size;
+        }
+        /* gpu-fw-data is __DATA, and the __DATA_SHARED_RO tail when the firmware has one. */
+        if (i == 4) {
+            if (region_base[4] != fw.data_base || region_size[4] != fw.data_size)
+                goto disable;
+            region_size[4] += fw.ro_size;
         }
         if (!region_base[i] || !region_size[i] || (region_base[i] & (SZ_16K - 1)) ||
             (region_size[i] & (SZ_16K - 1)) || region_base[i] > UINT64_MAX - region_size[i] ||
@@ -3705,8 +3758,6 @@ static int dt_set_gpu_t6040(void *dt)
                 region_base[j] < region_base[i] + region_size[i])
                 goto disable;
     }
-    if (segments[1].phys != region_base[4] || segments[1].size != region_size[4])
-        goto disable;
     int table =
         t6040_opp_table(dt, gpu, "operating-points-v2", count, T6040_CLUSTERS * sizeof(u32));
     if (table < 0 || t6040_opp_table(dt, gpu, "apple,cs-opp", aux[0]->count, sizeof(u32)) < 0 ||
@@ -3922,24 +3973,9 @@ static int dt_set_gpu_t6041(void *dt)
                 goto disable;
     }
 
-    int asc = adt_path_offset(adt, "/arm-io/gfx-asc");
-    if (asc < 0)
+    struct t604x_gpu_fw fw;
+    if (t604x_gpu_fw_segments(sgx, &fw))
         goto disable;
-    const struct adt_segment_ranges *segments = adt_getprop(adt, asc, "segment-ranges", &len);
-    if (!segments || (len != 2 * sizeof(*segments) && len != 3 * sizeof(*segments)))
-        goto disable;
-    u64 ro_base = 0, ro_size = 0, rw;
-    if (len == 3 * sizeof(*segments)) {
-        if (ADT_GETPROP(adt, sgx, "gfx-data-shared-ro-base", &ro_base) != sizeof(u64) ||
-            ADT_GETPROP(adt, sgx, "gfx-data-shared-ro-size", &ro_size) != sizeof(u64) || !ro_size ||
-            (ro_size & (SZ_16K - 1)) || segments[2].phys != ro_base ||
-            segments[2].remap != ro_base || segments[2].size != ro_size ||
-            (adt_getprop(adt, sgx, "gfx-data-shared-rw-base", NULL) &&
-             (ADT_GETPROP(adt, sgx, "gfx-data-shared-rw-base", &rw) != sizeof(u64) || rw)) ||
-            (adt_getprop(adt, sgx, "gfx-data-shared-rw-size", NULL) &&
-             (ADT_GETPROP(adt, sgx, "gfx-data-shared-rw-size", &rw) != sizeof(u64) || rw)))
-            goto disable;
-    }
 
     u64 region_base[ARRAY_SIZE(t6040_regions)], region_size[ARRAY_SIZE(t6040_regions)];
     for (size_t i = 0; i < ARRAY_SIZE(t6040_regions); i++) {
@@ -3952,19 +3988,14 @@ static int dt_set_gpu_t6041(void *dt)
             if (ADT_GETPROP(adt, sgx, prop, &region_size[i]) != sizeof(u64))
                 goto disable;
         } else {
-            region_base[i] = segments[0].phys;
-            region_size[i] = segments[0].size;
+            region_base[i] = fw.text_base;
+            region_size[i] = fw.text_size;
         }
+        /* gpu-fw-data is __DATA, and the __DATA_SHARED_RO tail when the firmware has one. */
         if (i == 4) {
-            if (segments[1].phys != region_base[4] || segments[1].size != region_size[4] ||
-                !region_size[4] || (region_size[4] & (SZ_16K - 1)))
+            if (region_base[4] != fw.data_base || region_size[4] != fw.data_size)
                 goto disable;
-            if (ro_size) {
-                if (region_base[4] > UINT64_MAX - region_size[4] ||
-                    region_base[4] + region_size[4] != ro_base)
-                    goto disable;
-                region_size[4] += ro_size;
-            }
+            region_size[4] += fw.ro_size;
         }
         if (!region_base[i] || !region_size[i] || (region_base[i] & (SZ_16K - 1)) ||
             (region_size[i] & (SZ_16K - 1)) || region_base[i] > UINT64_MAX - region_size[i] ||
