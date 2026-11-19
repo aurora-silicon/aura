@@ -4358,7 +4358,7 @@ static int dt_reserve_asc_firmware(const char *adt_path, const char *adt_path_al
  */
 static const char *const ave_compatibles[] = {
     "apple,t6000-ave", "apple,t8112-ave", "apple,t8140-ave", "apple,t6041-ave",
-    "apple,t6050-ave", "apple,t8132-ave", "apple,t8142-ave",
+    "apple,t6050-ave", "apple,t8132-ave", "apple,t8142-ave", "apple,t6021-ave",
 };
 
 /* An ADT encoder node is named "ave" or "ave<N>". */
@@ -4542,6 +4542,27 @@ static int dt_ave_enable(u32 self)
 }
 
 /*
+ * aurora,crc32 on the reservation @name. A segment two encoders share (the M2 Max's TEXT) is one
+ * reservation and keeps the first value.
+ */
+static int dt_ave_stamp_crc(const char *name, const char *value)
+{
+    int resv = fdt_path_offset(dt, "/reserved-memory");
+    int node = resv < 0 ? resv : fdt_subnode_offset(dt, resv, name);
+    const char *have;
+
+    if (node < 0)
+        return -1;
+    have = fdt_getprop(dt, node, "aurora,crc32", NULL);
+    if (have) {
+        if (strcmp(have, value))
+            printf("FDT: AVE: %s aurora,crc32 is %s, this segment is %s\n", name, have, value);
+        return 0;
+    }
+    return fdt_setprop_string(dt, node, "aurora,crc32", value);
+}
+
+/*
  * The node is found again by its compatible after each edit, never by its path: on T6050 "/soc"
  * resolves to /soc@200000000, a sibling of the /soc that holds the encoder. Where several
  * encoders share a compatible, it is found by @phandle instead; for a lone encoder @phandle is 0.
@@ -4625,24 +4646,6 @@ static int dt_set_ave_node(int node, const char *compat, u32 phandle)
         crcs[i] = tinf_crc32((void *)seg[i].phys, seg[i].size);
 
     /*
-     * The driver checks every encoder's firmware against the one set of CRCs in /chosen. An
-     * encoder whose preloaded copy differs from that of an encoder already handed over is left
-     * off rather than overwrite them.
-     */
-    int crc_node = fdt_path_offset(dt, "/chosen");
-    for (size_t i = 0; crc_node >= 0 && i < count; i++) {
-        char prop[48], value[9];
-        int len;
-        snprintf(prop, sizeof(prop), "aurora,ave-%s-crc32", normalized[i]);
-        snprintf(value, sizeof(value), "%08x", crcs[i]);
-        const char *have = fdt_getprop(dt, crc_node, prop, &len);
-        if (have && (len != sizeof(value) || memcmp(have, value, sizeof(value)))) {
-            reason = "firmware differs from the encoder already handed over";
-            goto disable;
-        }
-    }
-
-    /*
      * The pre-M4 (6070) firmware runs from DART address zero (the ADT iova-offset); the
      * M4-generation encoders keep running at their remap addresses.
      */
@@ -4652,12 +4655,14 @@ static int dt_set_ave_node(int node, const char *compat, u32 phandle)
                      !fdt_node_check_compatible(dt, node, "apple,t8132-ave") ||
                      !fdt_node_check_compatible(dt, node, "apple,t8142-ave");
     /*
-     * On T8112 the encoder's DART window starts at the DART's vm-base: iBoot points the
-     * coprocessor code base there, and the firmware addresses DATA at vm-base plus its
+     * On T8112 and T6021 the encoder's DART window starts at the DART's vm-base: iBoot points
+     * the coprocessor code base there, and the firmware addresses DATA at vm-base plus its
      * offset. Hand both segments over at vm-base + iova-offset.
      */
+    bool at_vm_base = !fdt_node_check_compatible(dt, node, "apple,t8112-ave") ||
+                      !fdt_node_check_compatible(dt, node, "apple,t6021-ave");
     u64 dva_base = 0;
-    if (!fdt_node_check_compatible(dt, node, "apple,t8112-ave")) {
+    if (at_vm_base) {
         /* The encoder's DART is its ADT name prefixed with "dart-": dart-ave for ave. */
         snprintf(dart_path, sizeof(dart_path), "/arm-io/dart-%s", adt_path + strlen("/arm-io/"));
         int dnode = adt_path_offset(adt, dart_path);
@@ -4683,12 +4688,24 @@ static int dt_set_ave_node(int node, const char *compat, u32 phandle)
         reason = "firmware reservation failed";
         goto disable;
     }
+    /*
+     * Each reservation carries its own segment's CRC: encoders of one SoC need not have the same
+     * DATA (the M2 Max's two differ). /chosen keeps the first encoder's, for a kernel that reads
+     * only /chosen.
+     */
     for (size_t i = 0; i < count; i++) {
-        char prop[48], value[9];
+        char prop[48], name[64], value[9];
         snprintf(prop, sizeof(prop), "aurora,ave-%s-crc32", normalized[i]);
+        snprintf(name, sizeof(name), "asc-firmware@%lx", seg[i].phys);
         snprintf(value, sizeof(value), "%08x", crcs[i]);
+        if (dt_ave_stamp_crc(name, value)) {
+            reason = "CRC export failed";
+            goto disable;
+        }
+        /* Stamping a reservation moves every node after it: find /chosen afterwards. */
         int chosen = fdt_path_offset(dt, "/chosen");
-        if (chosen < 0 || fdt_setprop_string(dt, chosen, prop, value)) {
+        if (chosen < 0 ||
+            (!fdt_getprop(dt, chosen, prop, NULL) && fdt_setprop_string(dt, chosen, prop, value))) {
             reason = "CRC export failed";
             goto disable;
         }

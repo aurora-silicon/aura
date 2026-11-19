@@ -6,11 +6,15 @@ it calls) on device trees built here, against a small ADT model, with src/device
 libfdt. Covered:
 
   1. a lone encoder (the M1 Pro's, the M2's) is handed over as before: ADT ave0 or ave, its
-     firmware reserved, its CRCs in /chosen, its status left as the DT has it;
+     firmware reserved, its CRCs in /chosen and on each reservation, its status left as the DT
+     has it;
   2. both M1 Max encoders are handed over, each from its own ADT node;
   3. an M1 Max encoder whose ADT node is absent, not preloaded or has a bad segment list is
      disabled, and encoder 0 is not;
-  4. an encoder whose preloaded copy differs from encoder 0's is disabled; the CRCs stay;
+  4. an encoder whose preloaded copy differs from encoder 0's is handed over: each reservation
+     carries its own CRC, /chosen keeps encoder 0's;
+  4a. the M2 Max: two apple,t6021-ave encoders sharing one TEXT, each at its own DART's vm-base,
+     handed over whether the DT enables them or not;
   5. the M1 Ultra: two dies with the same die-local addresses, each node matched to the ADT
      encoder at its translated address;
   6. the M2 encoder's DART window base is read from the DART named after its ADT encoder;
@@ -370,6 +374,40 @@ static const char *chosen(const char *prop)
     return s ? s : "";
 }
 
+/* The aurora,crc32 of the node's firmware region @idx, or "". */
+static const char *region_crc(int die, u64 addr, int idx)
+{
+    int len;
+    const fdt32_t *mr = fdt_getprop(dt, enc(die, addr), "memory-region", &len);
+    if (!mr || len < (idx + 1) * 4)
+        return "";
+    int rn = fdt_node_offset_by_phandle(dt, fdt32_to_cpu(mr[idx]));
+    assert(rn >= 0);
+    const char *s = fdt_getprop(dt, rn, "aurora,crc32", NULL);
+    return s ? s : "";
+}
+
+/* The phandle of the node's firmware region @idx, or 0. */
+static u32 region_ph(int die, u64 addr, int idx)
+{
+    int len;
+    const fdt32_t *mr = fdt_getprop(dt, enc(die, addr), "memory-region", &len);
+    return mr && len >= (idx + 1) * 4 ? fdt32_to_cpu(mr[idx]) : 0;
+}
+
+/* The device address the node's firmware region @idx is mapped at, as iova(). */
+static u64 region_iova(int die, u64 addr, int idx)
+{
+    int len, rn = fdt_node_offset_by_phandle(dt, region_ph(die, addr, idx));
+    assert(rn >= 0);
+    const fdt32_t *ia = fdt_getprop(dt, rn, "iommu-addresses", &len);
+    u32 ph = fdt_get_phandle(dt, enc(die, addr));
+    for (int i = 0; ia && i + 5 <= len / 4; i += 5)
+        if (fdt32_to_cpu(ia[i]) == ph)
+            return ((u64)fdt32_to_cpu(ia[i + 1]) << 32) | fdt32_to_cpu(ia[i + 2]);
+    return 0;
+}
+
 #define CHECK(c) do { if (!(c)) { fprintf(stderr, "FAIL %s:%d: %s\nlog:\n%s\n", __FILE__, __LINE__, #c, logbuf); exit(1); } } while (0)
 
 #define M1_ENC0 0x40d100000ULL
@@ -397,6 +435,8 @@ static int scenarios(void)
     CHECK(iova(0, M1_ENC0) == 0); /* the 6070 firmware runs from DART address zero */
     CHECK(!strcmp(chosen("aurora,ave-text-crc32"), "460c7a7c"));
     CHECK(!strcmp(chosen("aurora,ave-data-crc32"), "12345678"));
+    CHECK(!strcmp(region_crc(0, M1_ENC0, 0), "460c7a7c"));
+    CHECK(!strcmp(region_crc(0, M1_ENC0, 1), "12345678"));
     CHECK(!strstr(logbuf, "AVE"));
     puts("PASS: M1 Pro encoder handed over from ADT ave0");
 
@@ -454,16 +494,50 @@ static int scenarios(void)
     CHECK(!strcmp(status(0, M1_ENC0), "disabled") && firmware(0, M1_ENC1, 0) == b->seg[0].phys);
     puts("PASS: encoder 0 absent: disabled, encoder 1 handed over");
 
-    /* 4: encoder 1's copy differs: it is disabled, encoder 0's CRCs stay. */
+    /* 4: encoder 1's copy differs: handed over, with its own CRC; /chosen keeps encoder 0's. */
     m1max();
-    add_encoder("ave0", M1_ENC0);
-    add_encoder("ave1", M1_ENC1)->crc[1] = 0xdeadbeef;
+    a = add_encoder("ave0", M1_ENC0);
+    b = add_encoder("ave1", M1_ENC1);
+    b->crc[1] = 0xdeadbeef;
     CHECK(!dt_set_ave());
-    CHECK(!strcmp(status(0, M1_ENC0), "okay") && !strcmp(status(0, M1_ENC1), "disabled"));
-    CHECK(!firmware(0, M1_ENC1, 0));
+    CHECK(!strcmp(status(0, M1_ENC0), "okay") && !strcmp(status(0, M1_ENC1), "okay"));
+    CHECK(firmware(0, M1_ENC1, 1) == b->seg[1].phys);
+    CHECK(!strcmp(region_crc(0, M1_ENC0, 1), "12345678"));
+    CHECK(!strcmp(region_crc(0, M1_ENC1, 1), "deadbeef"));
+    CHECK(!strcmp(region_crc(0, M1_ENC1, 0), "460c7a7c"));
     CHECK(!strcmp(chosen("aurora,ave-data-crc32"), "12345678"));
-    CHECK(strstr(logbuf, "differs from the encoder already handed over"));
-    puts("PASS: a differing firmware copy is refused, the published CRCs kept");
+    CHECK(!strstr(logbuf, "disabled"));
+    puts("PASS: a differing firmware copy is handed over with its own CRC, /chosen kept");
+
+    /* 4a: the M2 Max: ave0 and ave1 share one TEXT; each DATA is its own, as are the DARTs. */
+    for (int off = 0; off < 2; off++) {
+        tree(1);
+        encoder(0, "apple,t6021-ave", M1_ENC1, off ? "disabled" : "okay");
+        encoder(0, "apple,t6021-ave", M1_ENC0, off ? "disabled" : "okay");
+        a = add_encoder("ave0", M1_ENC0);
+        b = add_encoder("ave1", M1_ENC1);
+        b->seg[0].phys = a->seg[0].phys;
+        a->crc[1] = 0x7ae71157;
+        b->crc[1] = 0xc1d56196;
+        add_dart("dart-ave0", 0x800000000ULL);
+        add_dart("dart-ave1", 0x900000000ULL);
+        CHECK(!dt_set_ave());
+        CHECK(!strcmp(status(0, M1_ENC0), off ? "disabled" : "okay"));
+        CHECK(!strcmp(status(0, M1_ENC1), off ? "disabled" : "okay"));
+        CHECK(region_ph(0, M1_ENC0, 0) && region_ph(0, M1_ENC0, 0) == region_ph(0, M1_ENC1, 0));
+        CHECK(region_ph(0, M1_ENC0, 1) != region_ph(0, M1_ENC1, 1));
+        CHECK(region_iova(0, M1_ENC0, 0) == 0x800000000ULL);
+        CHECK(region_iova(0, M1_ENC1, 0) == 0x900000000ULL);
+        CHECK(region_iova(0, M1_ENC1, 1) == 0x9000d0000ULL);
+        CHECK(!strcmp(region_crc(0, M1_ENC0, 0), "460c7a7c"));
+        CHECK(!strcmp(region_crc(0, M1_ENC0, 1), "7ae71157"));
+        CHECK(!strcmp(region_crc(0, M1_ENC1, 1), "c1d56196"));
+        CHECK(!strcmp(chosen("aurora,ave-data-crc32"), "7ae71157"));
+        CHECK(strstr(logbuf, "video-codec@40d100000 handed over from ADT /arm-io/ave0"));
+        CHECK(strstr(logbuf, "video-codec@507100000 handed over from ADT /arm-io/ave1"));
+        CHECK(!strstr(logbuf, "aurora,crc32 is"));
+    }
+    puts("PASS: M2 Max encoders handed over, enabled or not: shared TEXT, own DATA and vm-base");
 
     /* 5: the M1 Ultra: die 1 repeats die 0's die-local addresses. */
     tree(2);
@@ -537,6 +611,16 @@ static int scenarios(void)
     CHECK(!dt_set_ave_dapf() && !strcmp(programmed, "/arm-io/dart-ave1 "));
     CHECK(!strcmp(status(0, M1_ENC1), "okay"));
     puts("PASS: M1 Max: dart-ave1 programmed for encoder 1");
+
+    tree(1);
+    encoder(0, "apple,t6021-ave", M1_ENC1, "okay");
+    encoder(0, "apple,t6021-ave", M1_ENC0, "okay");
+    a = add_encoder("ave0", M1_ENC0); add_dart("dart-ave0", 0x800000000ULL);
+    add_encoder("ave1", M1_ENC1)->seg[0].phys = a->seg[0].phys;
+    add_dart("dart-ave1", 0x900000000ULL);
+    CHECK(!dt_set_ave() && !fdt_pack(dt));
+    CHECK(!dt_set_ave_dapf() && !strcmp(programmed, "/arm-io/dart-ave1 "));
+    puts("PASS: M2 Max: dart-ave1 programmed for encoder 1");
 
     m1max();
     add_encoder("ave0", M1_ENC0); add_dart("dart-ave0", 0);
@@ -677,4 +761,4 @@ def test_ave_handoff(tmp_path):
     binary = build(tmp_path, (repo / "src/kboot.c").read_text())
     run = subprocess.run([str(binary)], capture_output=True, text=True)
     assert run.returncode == 0, run.stdout + run.stderr
-    assert run.stdout.count("PASS:") == 18, run.stdout
+    assert run.stdout.count("PASS:") == 20, run.stdout
