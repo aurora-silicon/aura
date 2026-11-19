@@ -35,9 +35,8 @@
 
 #define DBI_RO_WR 0x8bc
 
-/* SMC key gP13: ADT pci-bridge0 function-reset = pKW4('gP13', 0x800000). */
-#define SMC_KEY_GP13 0x67503133
-#define N1_RESET_LO  0x800000
+/* SMC function-reset level hold: assert, then release (smc_adt_function_reset()) */
+#define N1_RESET_SETTLE_MS 50
 
 /* AP GPIO 192 (ADT pci-bridge0 function-perst), driven high as output. */
 #define GPIO_N1_PERST 0x39a000300
@@ -67,21 +66,6 @@ static int j813_tunables(const char *path, const char *prop, u64 base)
         return -1;
     }
     return 0;
-}
-
-static int j813_n1_reset(void)
-{
-    smc_dev_t *smc = smc_init();
-    int ret = 0;
-
-    if (!smc)
-        return -1;
-    for (u32 level = 0; level < 2 && !ret; level++) {
-        ret = smc_write_u32(smc, SMC_KEY_GP13, N1_RESET_LO | level);
-        mdelay(50);
-    }
-    smc_shutdown(smc);
-    return ret;
 }
 
 static int j813_n1_link(void)
@@ -135,7 +119,8 @@ static int j813_n1_link(void)
     if (j813_wait(rc + 0x58, BIT(0), BIT(0), 250000, "gtb_initialized"))
         return -1;
 
-    if (j813_n1_reset()) {
+    /* The SMC holds the N1 in reset: pci-bridge0 function-reset (pKW4 gP13). */
+    if (smc_adt_function_reset(APCIE_PORT, N1_RESET_SETTLE_MS)) {
         printf("j813-n1: SMC N1 reset release failed\n");
         return -1;
     }
