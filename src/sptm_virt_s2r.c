@@ -996,11 +996,44 @@ static void s2r_stop_link_back(void)
     }
 }
 
+/*
+ * J613's counted GO stop: the commit is withheld, so the SoC stays powered and the KIS
+ * DockChannel, which survived the earlier sleeps, still carries the console. The sleep window
+ * made aura silent; speak again, print every retained marker (per-core final-WFI state, the
+ * commit and wake snapshots, SMC payloads) oldest first, then stay in the proxy so the host can
+ * read the whole binary ring.
+ */
+static void s2r_j613_stop_export(void)
+{
+    if (chip_id != T8122 || !s2r_go || !sptm_virt_s2r_ring)
+        return;
+    sptm_virt_s2r_quiet = false;
+    iodev_set_usage(IODEV_DOCKCHANNEL_UART,
+                    iodev_get_usage(IODEV_DOCKCHANNEL_UART) | USAGE_CONSOLE | USAGE_UARTPROXY);
+    uartproxy_iodev = IODEV_DOCKCHANNEL_UART;
+    u64 head = sptm_virt_s2r_head;
+    u64 from = head > sptm_virt_s2r_nrec ? head - sptm_virt_s2r_nrec : 0;
+    printf("J613-STOP ring 0x%lx nrec %lu head %lu wakes %u commits %u freq %lu\n",
+           (u64)sptm_virt_s2r_ring, sptm_virt_s2r_nrec, head, s2r_wake_count, s2r_crumb_commits,
+           mrs(CNTFRQ_EL0));
+    u64 n = 0;
+    for (u64 i = from; i < head; i++) {
+        if (!(sptm_virt_s2r_ring[i % sptm_virt_s2r_nrec].meta & S2R_MARKER))
+            continue;
+        s2r_print_rec(i);
+        if (!(++n & 31))
+            iodev_console_flush();
+    }
+    printf("J613-STOP markers %lu\n", n);
+    iodev_console_flush();
+}
+
 static void __attribute__((noreturn)) s2r_stop_before_timer(struct exc_info *ctx, u64 addr, u64 val)
 {
     sptm_virt_j613_pmu_mark(0xaf); /* Linux-readable proof that the commit was withheld. */
     s2r_marker("S2RSTOP", addr);
     s2r_stop_link_back();
+    s2r_j613_stop_export();
     printf("SPTM-virt[s2r]: cpu%d is starting the S2R timer ([0x%lx] = 0x%lx, pc 0x%lx): NOT "
            "performed (stop mode). TWI armed 0x%x, parked 0x%x, %lu records. Stopping in the "
            "proxy.\n",
