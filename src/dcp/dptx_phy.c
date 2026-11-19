@@ -59,12 +59,12 @@ static const struct dptx_t8152_tunable dptx_t8152_tunables[] = {
 
 /* Every ADT tunable record is {offset, width, mask, pad, value, pad} and is
  * applied as an unshifted read-modify-write. */
-static void dptx_t8152_apply_tunables(dptx_phy_t *phy)
+static int dptx_t8152_apply_tunables(dptx_phy_t *phy)
 {
     int node = adt_path_offset(adt, phy->path);
     if (node < 0) {
         printf("DPTX-PHY: failed to find %s for tunables\n", phy->path);
-        return;
+        return -1;
     }
 
     for (size_t i = 0; i < ARRAY_SIZE(dptx_t8152_tunables); i++) {
@@ -81,6 +81,7 @@ static void dptx_t8152_apply_tunables(dptx_phy_t *phy)
             write32(phy->regs[0] + tunable->offset + rec[0], (reg & ~rec[2]) | rec[4]);
         }
     }
+    return 0;
 }
 
 /* Per-lane configuration on the lane shm blocks. The bits are lane-disable
@@ -204,23 +205,27 @@ static int dptx_t8152_set_link_rate(dptx_phy_t *phy, u32 link_rate)
 }
 
 /* Impedance calibration: the adapter reports completion in bit 0 of 0x1c04
- * and the calibration result in 0x1c24. */
-static void dptx_t8152_impedance_calibration(dptx_phy_t *phy)
-{
-    u32 i;
+ * and the calibration result in 0x1c24. Without the completion bit 0x1c24
+ * holds no calibration result, so a timeout fails the activation instead of
+ * programming the termination from it. */
+#define DPTX_T8152_IMPCAL_STATUS     0x1c04
+#define DPTX_T8152_IMPCAL_DONE       BIT(0)
+#define DPTX_T8152_IMPCAL_TIMEOUT_US 1000000
 
-    for (i = 0; i < 100000; i++) {
-        if (read32(phy->regs[0] + 0x1c04) & 1)
-            break;
-        udelay(10);
+static int dptx_t8152_impedance_calibration(dptx_phy_t *phy)
+{
+    if (poll32(phy->regs[0] + DPTX_T8152_IMPCAL_STATUS, DPTX_T8152_IMPCAL_DONE,
+               DPTX_T8152_IMPCAL_DONE, DPTX_T8152_IMPCAL_TIMEOUT_US)) {
+        printf("DPTX-PHY: impedance calibration timed out (status %#x)\n",
+               read32(phy->regs[0] + DPTX_T8152_IMPCAL_STATUS));
+        return -1;
     }
-    if (i == 100000)
-        printf("DPTX-PHY: impedance calibration timed out\n");
 
     dptx_t8152_set_bits(phy, 0x1c00, 4, 0x3f0, 0x3f);
     u32 value = read32(phy->regs[0] + 0x1c24);
     dptx_t8152_set_bits(phy, 0x1c18, 0xf, 0x3f8000, (value >> 6) & 0x7f);
     dptx_t8152_set_bits(phy, 0x1c18, 0xe, 0x4000, 1);
+    return 0;
 }
 
 /* T8152 activation: power up, apply the adapter tunables from the devicetree,
@@ -244,7 +249,8 @@ static int dptx_t8152_activate(dptx_phy_t *phy)
     set32(phy->regs[1] + 0x48, 0x002);
     clear32(phy->regs[1] + 0x48, 0x004);
 
-    dptx_t8152_apply_tunables(phy);
+    if (dptx_t8152_apply_tunables(phy))
+        return -1;
 
     /* PLL: single-ended clock output, no pclkdrv-select property */
     dptx_t8152_set_bits(phy, 0x08d0, 4, 0x10, 1);
@@ -259,9 +265,7 @@ static int dptx_t8152_activate(dptx_phy_t *phy)
         return ret;
 
     /* T8152 needs no separate AUX power-up or termination override */
-    dptx_t8152_impedance_calibration(phy);
-
-    return 0;
+    return dptx_t8152_impedance_calibration(phy);
 }
 
 int dptx_phy_activate(dptx_phy_t *phy)
