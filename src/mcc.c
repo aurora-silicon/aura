@@ -267,8 +267,17 @@ int mcc_unmap_carveouts(void)
         static const char *const names[] = {"region-id-4", "region-id-2"};
         int node = adt_path_offset(adt, "/chosen/carveout-memory-map");
 
-        if (node < 0)
-            return -1;
+        /*
+         * No list and no TZ registers: nothing aura can unmap. Every Apple Silicon Mac ADT has
+         * this node (iBoot fills in region-id-2/-4 at boot), so only an older SoC without the
+         * node gets here. Say so instead of failing. A node that is present but has no usable
+         * TZ ranges is a real failure below.
+         */
+        if (node < 0) {
+            printf("MMU: no MCC TZ registers and no ADT carveout-memory-map: TZ carveouts stay "
+                   "mapped\n");
+            return 0;
+        }
         if (mem_size_actual > UINT64_MAX - ram_base)
             return -1;
         for (size_t i = 0; i < ARRAY_SIZE(names); i++) {
@@ -276,15 +285,20 @@ int mcc_unmap_carveouts(void)
             const u64 *range = adt_getprop(adt, node, names[i], &len);
             u64 start, size;
 
-            if (!range || len != 2 * sizeof(u64))
+            if (!range || len != 2 * sizeof(u64)) {
+                printf("MMU: ADT carveout-memory-map has no usable %s\n", names[i]);
                 return -1;
+            }
             memcpy(&start, range, sizeof(start));
             memcpy(&size, range + 1, sizeof(size));
             if (!size || start < ram_base || start > UINT64_MAX - size ||
                 start + size > ram_base + mem_size_actual ||
                 ((start | size) & (get_page_size() - 1)) ||
-                mcc_carveout_count >= ARRAY_SIZE(mcc_carveouts) - 1)
+                mcc_carveout_count >= ARRAY_SIZE(mcc_carveouts) - 1) {
+                printf("MMU: ADT %s 0x%lx+0x%lx is outside RAM or unaligned\n", names[i], start,
+                       size);
                 return -1;
+            }
 
             printf("MMU: Unmapping %s at 0x%lx..0x%lx\n", names[i], start, start + size);
             mmu_rm_mapping(start, size);
