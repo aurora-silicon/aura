@@ -4134,8 +4134,9 @@ static T6050_GPU_INIT bool t6050_gpu_enable(void *dt)
 
 /*
  * This part's leakage calibration fuses: three words at 0x74198 in the PMGR window that starts at
- * 0x88300000 on the GPU's die (die 1 on J714s). Linux's driver applies its J714 controller
- * configuration only when they match the part it was made for, so they come from the part.
+ * 0x88300000 on the GPU's die (die 1 on J714s). Linux's driver applies a board's controller
+ * configuration (J714s, J716c) only when they match the part it was made for, so they come from
+ * the part.
  */
 #define T6050_GPU_LEAK_WINDOW 0x88300000
 #define T6050_GPU_LEAK_OFFSET 0x74198
@@ -4199,6 +4200,15 @@ static T6050_GPU_INIT int dt_set_gpu_t6050(void *dt)
     return 0;
 }
 
+/* M5 Max (G17C): the handoff as on the other G17 parts, then this part's leakage words */
+static T6050_GPU_INIT int dt_set_gpu_g17c(void *dt)
+{
+    int ret = dt_set_gpu_g17(dt, &g17_soc_t6050);
+    if (!ret && t6050_gpu_leakage(dt))
+        printf("FDT: GPU: no leakage calibration words; the driver's generic configuration\n");
+    return ret;
+}
+
 int dt_set_gpu(void *dt)
 {
     if (chip_id == T8152) {
@@ -4216,7 +4226,7 @@ int dt_set_gpu(void *dt)
 
     if (chip_id == T6050 &&
         !fdt_node_check_compatible(dt, fdt_path_offset(dt, "gpu"), "apple,agx-g17c"))
-        return dt_set_gpu_g17(dt, &g17_soc_t6050);
+        return dt_set_gpu_g17c(dt);
 
     if (chip_id == T6040)
         return dt_set_gpu_t6040(dt);

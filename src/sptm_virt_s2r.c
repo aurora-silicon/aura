@@ -40,11 +40,13 @@
 #include "sptm_virt_priv.h"
 #include "sptm_virt_s2r_soc.h"
 #include "string.h"
+#include "tps6598x.h"
 #include "types.h"
 #include "uartproxy.h"
 #include "usb.h"
 #include "usb_cdc_atc.h"
 #include "utils.h"
+#include "wdt.h"
 #include "xnuboot.h"
 
 #define S2R_RING_BYTES     (8UL << 20)
@@ -53,7 +55,7 @@
 /* The sleep rules start a while after setup: XNU's PMGR driver writes the same registers while
  * it boots, and a sleep comes minutes after the desktop. After a wake with the link re-taken they
  * come back quickly. */
-#define S2R_ARM_AFTER_S   45
+#define S2R_ARM_AFTER_S   (sptm_virt_s2r_arm_s ? sptm_virt_s2r_arm_s : 45)
 #define S2R_REARM_AFTER_S 3
 
 /* The S2R timer start in pmgr-aon-pst: the last step of XNU's quiesceHW. */
@@ -103,10 +105,20 @@ volatile u64 sptm_virt_s2r_head; /* records ever appended */
 u32 sptm_virt_s2r_pages;         /* pages hooked */
 
 /* Set by the host before entry (run_guest_sptm.py). */
-u32 sptm_virt_s2r_quiesce;    /* S2R_QUIESCE_* */
-u32 sptm_virt_s2r_wake_s;     /* GO, timer-only sleep: PMU RTC alarm this many s after the commit */
-u32 sptm_virt_s2r_go_count;   /* GO, timer-only sleep: stop at the commit after this many wakes */
-u32 sptm_virt_s2r_usb_retake; /* 1: re-take the link after a wake; n > 1: also drop it n s in */
+u32 sptm_virt_s2r_quiesce;  /* S2R_QUIESCE_* */
+u32 sptm_virt_s2r_wake_s;   /* GO, timer-only sleep: PMU RTC alarm this many s after the commit */
+u32 sptm_virt_s2r_go_count; /* GO, timer-only sleep: stop at the commit after this many wakes */
+u32 sptm_virt_s2r_crumbs;   /* go-mode experiments on J813, a bit mask: see s2r_crumb() */
+u32 sptm_virt_s2r_arm_s;    /* host: seconds from setup to the sleep rules (0: 45) */
+u32 sptm_virt_s2r_win[2];
+/* The wake core + 1 when it is to arm the stage 2 at its SPTM entry (option bit 256), else 0. */
+u32 sptm_virt_s2r_early_s2;
+/* host: extra registers read at the wake trap with option bit 512 (AURA_S2R_PROBE) */
+u64 sptm_virt_s2r_probe[4];
+u64 sptm_virt_s2r_prewrite[2];
+/* host: records before / after the first commit in the after-wake dump */
+u64 sptm_virt_s2r_probe_at;
+u32 sptm_virt_s2r_usb_retake;   /* 1: re-take the link after a wake; n > 1: also drop it n s in */
 u32 sptm_virt_s2r_usb_delay_ms; /* delay from XNU's return to the re-take, 0 = default */
 u32 sptm_virt_s2r_cp_skip_ans;  /* T6050 COPROC: leave ANS's own pages unhooked */
 u32 sptm_virt_s2r_cp_ansx;      /* T6050 COPROC: S2R_CP_ANSX_* pages around ANS too */
@@ -147,6 +159,10 @@ static int s2r_nkeep;
  * second into its boot. */
 static bool s2r_keep_always;
 u32 sptm_virt_s2r_live;
+/* Stop mode, more blocks in the full entry trace (AURA_S2R_EXTRA): 1 the MCC's blocks (the AMCC
+ * planes without their first pages, which aura hooks itself), 2 aon-ptd, 4 the other
+ * coprocessors' mailboxes (not the SEP's). */
+u32 sptm_virt_s2r_extra;
 static volatile bool s2r_keep_released;
 
 /*
@@ -162,8 +178,11 @@ static volatile u32 s2r_wake_traps; /* guest traps to log after a wake */
 static volatile u32 s2r_wake_mmio;  /* hooked accesses to log after a wake */
 static volatile bool s2r_wake_banner_done, s2r_wake_xnu_done;
 static u64 s2r_commit_head, s2r_wake_head;
+/* The ring position of this boot's first commit, for the after-wake window (AURA_S2R_WIN). */
+static u64 s2r_first_commit_head;
 
 static void s2r_usb_tick(bool byte);
+static iodev_id_t s2r_link_iodev = IODEV_USB0; /* the port the proxy was on before the sleep */
 static void s2r_usb_quiesce(void);
 static void s2r_usb_wake(void);
 static void s2r_usb_setup(void);
@@ -277,6 +296,66 @@ static bool s2r_is_mbox(const char *what)
     return n > 5 && !strcmp(what + n - 5, "-mbox");
 }
 
+/*
+ * The ring's tail for a console that may die before it has printed it all: the most wanted first,
+ * newest first within each class, one short line each. Classes: A writes and markers outside the
+ * mailboxes and SPMI buses, with the pc; B SPMI writes; C mailbox writes; D the reads outside the
+ * mailboxes. First all four classes of the last @near records (the sleep entry itself), then A,
+ * B and C of the @far records before them. Line: class, record, counter, cpu or width, address,
+ * value (and pc).
+ */
+static u64 s2r_dump_class(u64 from, u64 to, int pass)
+{
+    u64 n = 0;
+    for (u64 i = to; i-- > from;) {
+        struct s2r_rec *r = &sptm_virt_s2r_ring[i % sptm_virt_s2r_nrec];
+        unsigned cpu = (r->meta >> 51) & 15;
+        u64 pa = r->meta & GENMASK(47, 0);
+        if (r->meta & S2R_MARKER) {
+            if (pass == 0) {
+                printf("S2A %lu %lx c%u MARK %.8s %lx\n", i, r->t, cpu, (const char *)&r->pc,
+                       r->val);
+                n++;
+            }
+            continue;
+        }
+        bool first, wr = r->meta & S2R_WRITE;
+        const char *what = s2r_page_name(pa & ~0x3fffUL, &first);
+        bool mbox = s2r_is_mbox(what), spmi = !strncmp(what, "spmi", 4);
+        int cls = wr ? (mbox ? 2 : spmi ? 1 : 0) : (mbox ? -1 : 3);
+        if (cls != pass)
+            continue;
+        unsigned w = 8u << ((r->meta >> 48) & 3);
+        if (pass == 0)
+            printf("S2A %lu %lx c%u W%u %lx %lx %lx\n", i, r->t, cpu, w, pa, r->val, r->pc);
+        else
+            // clang-format off: it reads "ABCD"[pass] as a lambda and writes r->t as r -> t.
+            printf("S2%c %lu %lx %c%u %lx %lx\n", "ABCD"[pass], i, r->t, wr ? 'W' : 'R', w, pa,
+                   r->val);
+        // clang-format on
+        n++;
+    }
+    return n;
+}
+
+void sptm_virt_s2r_dump_prio(u64 near, u64 far)
+{
+    if (!sptm_virt_s2r_ring)
+        return;
+    u64 head = sptm_virt_s2r_head;
+    u64 have = min(head, sptm_virt_s2r_nrec);
+    near = min(near, have);
+    far = min(far, have - near);
+    printf("SPTM-virt[s2r]: prio dump: head %lu, near %lu, far %lu, CNTFRQ %lu\n", head, near, far,
+           mrs(CNTFRQ_EL0));
+    for (int pass = 0; pass < 4; pass++)
+        printf("SPTM-virt[s2r]: prio dump: near class %c complete, %lu lines\n", "ABCD"[pass],
+               s2r_dump_class(head - near, head, pass));
+    for (int pass = 0; pass < 3; pass++)
+        printf("SPTM-virt[s2r]: prio dump: far class %c complete, %lu lines\n", "ABCD"[pass],
+               s2r_dump_class(head - near - far, head - near, pass));
+}
+
 /* A 16-byte access (a trapped LDP/STP: width 4 and two values) as one LDP/STP, as the guest issued
  * it. The ASC mailboxes take their messages as such a pair. */
 static void s2r_rw128(u64 addr, u64 *val, bool write)
@@ -342,9 +421,22 @@ static void s2r_release_kept(void)
 {
     int n = 0;
 
+    if (s2r_keep_released)
+        return; /* done early (sptm_virt_s2r_early_release) */
+
     if (s2r_drop_usb) {
         s2r_marker("USBDROP", 0);
-        usb_iodev_shutdown();
+        /*
+         * Option bit 5 (J813): only the link's own port. usb_iodev_shutdown() stops every gadget
+         * stage 1 registered, and on J813 that includes USB0, the port macOS itself drives: its
+         * controller and DART were being stopped under XNU at the commit.
+         */
+        struct iodev *d;
+        if ((sptm_virt_s2r_crumbs & 32) && s2r_link_iodev >= IODEV_USB0 &&
+            (d = iodev_unregister_device(s2r_link_iodev)))
+            usb_dwc3_shutdown(d->opaque);
+        else
+            usb_iodev_shutdown();
     }
     for (int k = 0; k < s2r_nkeep; k++) {
         if (!s2r_keep_low[k])
@@ -376,6 +468,36 @@ static void s2r_quiesce(void)
 }
 
 /*
+ * Go mode, where the commit ends in a reset (J813: macOS's 5 s WD2 fires, the SoC never powers
+ * down): steps noted in the main PMU's scratch, which a reset keeps, for the host to read through
+ * the proxy afterwards. Bytes 0x830d..0x830f of SID 0xe on nub-spmi0, after the five Linux's sleep
+ * driver uses at 0x8308: the step, then the mask of cores that reached their deep-sleep WFI.
+ * Host: AURA_S2R_CRUMBS=1 notes up to the commit; 2 also after it (SPMI after the commit is a
+ * risk of its own) and at the committing core's last WFI. With crumbs on, the cores' last WFIs
+ * trap (TWI) and aura executes them, so that it can count them.
+ */
+static spmi_dev_t *s2r_crumb_dev;
+static volatile u32 s2r_crumb_wfi;
+
+static void s2r_crumb(u8 step)
+{
+    if (!s2r_crumb_dev)
+        return;
+    u32 m = s2r_crumb_wfi;
+    u8 b[3] = {step, m, m >> 8};
+    spmi_ext_write_long(s2r_crumb_dev, 0xe, 0x830d, b, sizeof(b));
+}
+
+/* More notes: 0x8310 the wake/re-take step, 0x8311 the number of commits this boot. */
+static u8 s2r_crumb_commits;
+
+static void s2r_crumb_at(u8 off, u8 v)
+{
+    if (s2r_crumb_dev)
+        spmi_ext_write_long(s2r_crumb_dev, 0xe, 0x8308 + off, &v, 1);
+}
+
+/*
  * A core taking part in the sleep: it disabled itself in PMGR, or the boot core armed the
  * clusters off or committed. Go mode gets out of its way for good: its last WFI powers it down
  * natively, aura's EL2 timers are stopped on it, and from the first such core aura is silent.
@@ -389,8 +511,11 @@ static void s2r_core_sleeps(void)
     bool first = !__atomic_fetch_or(&s2r_twi_mask, BIT(cpu), __ATOMIC_SEQ_CST);
     if (!s2r_go) {
         nv2_hcr_update(HCR_TWI, 0);
-        if (s2r_timer_cpu < 0)
+        if (s2r_timer_cpu < 0) {
             s2r_timer_cpu = cpu;
+            /* read MMU-off by sptm_virt_s2r_restarted_in_sleep */
+            s2r_clean(&s2r_timer_cpu, sizeof(s2r_timer_cpu));
+        }
         s2r_marker("TWI-ARM", cpu);
         return;
     }
@@ -402,6 +527,8 @@ static void s2r_core_sleeps(void)
         iodev_console_flush();
         s2r_console_off();
     }
+    if (sptm_virt_s2r_crumbs & 1) /* bit 0: aura takes the cores' deep-sleep WFI (TWI) */
+        nv2_hcr_update(HCR_TWI, 0);
     msr(CNTP_CTL_EL0, 0); /* aura's EL2 physical timer (E2H: CNTHP) */
     msr(CNTV_CTL_EL0, 0); /* aura's EL2 virtual timer (CNTHV) */
     sysop("isb");
@@ -507,6 +634,10 @@ static bool s2r_rtc_from(const char *bus, int pmu)
     return true;
 }
 
+static bool s2r_cp_compat(int node, const char *prefix);
+static void s2r_regs_snapshot(const char *tag);
+static void s2r_probe_one(u64 e);
+
 static void s2r_rtc_setup(void)
 {
     int bus = adt_path_offset(adt, "/arm-io");
@@ -578,21 +709,96 @@ static void s2r_commit(void)
  * follows, and the PMU does not wait for the last core), so stop before performing it. The ring
  * holds the whole entry sequence and the machine stays up for the host to read it.
  */
+static int usb_iodev_reinit(int i);
+static bool s2r_link_back; /* this stop brought the link up itself: nobody is at the proxy */
+
+/*
+ * A stop after a wake (AURA_S2R_GO_COUNT): the first sleep took the debug link's port down with
+ * the SoC and nothing brought it back (no re-take on T8142). macOS is halted here on its last
+ * core, so bring that one port up cold, as stage 1 does at boot, wait for the host to open it,
+ * and only then print. Steps noted in PMU scratch (0x8310) for when it resets instead.
+ */
+static void s2r_stop_link_back(void)
+{
+    if (chip_id != T8142 || !s2r_keep_released || s2r_link_iodev < IODEV_USB0)
+        return;
+    s2r_crumb_at(8, 0x70);
+    int ret = usb_iodev_reinit(s2r_link_iodev - IODEV_USB0);
+    s2r_crumb_at(8, ret ? 0x7e : 0x71);
+    if (ret)
+        return;
+    uartproxy_iodev = s2r_link_iodev;
+    sptm_virt_s2r_quiet = false;
+    u64 end = mrs(CNTPCT_EL0) + 40 * mrs(CNTFRQ_EL0);
+    while (mrs(CNTPCT_EL0) < end) {
+        iodev_handle_events(s2r_link_iodev);
+        if (iodev_can_write(s2r_link_iodev))
+            break;
+        udelay(1000);
+    }
+    s2r_crumb_at(8, iodev_can_write(s2r_link_iodev) ? 0x72 : 0x7d);
+    s2r_link_back = true;
+    /* the host has enumerated the port; give its reader a moment to attach */
+    end = mrs(CNTPCT_EL0) + 4 * mrs(CNTFRQ_EL0);
+    while (mrs(CNTPCT_EL0) < end) {
+        iodev_handle_events(s2r_link_iodev);
+        udelay(1000);
+    }
+}
+
 static void __attribute__((noreturn)) s2r_stop_before_timer(struct exc_info *ctx, u64 addr, u64 val)
 {
     s2r_marker("S2RSTOP", addr);
+    s2r_stop_link_back();
     printf("SPTM-virt[s2r]: cpu%d is starting the S2R timer ([0x%lx] = 0x%lx, pc 0x%lx): NOT "
            "performed (stop mode). TWI armed 0x%x, parked 0x%x, %lu records. Stopping in the "
            "proxy.\n",
            smp_id(), addr, val, ctx->elr, s2r_twi_mask, s2r_parked_mask, sptm_virt_s2r_head);
     if (s2r_nvme_quiet_page)
         printf("SPTM-virt[s2r]: %lu NVMe per-I/O writes not recorded\n", s2r_nvme_quiet_n);
-    sptm_virt_s2r_dump_tail(4096);
+    if (s2r_link_back && s2r_first_commit_head) {
+        /*
+         * After a wake what matters is around the FIRST commit, which a newest-first dump may not
+         * reach once more is hooked: the end of that entry and everything for a while after the
+         * wake, every record. The ring must not have wrapped past it.
+         */
+        u64 head = sptm_virt_s2r_head;
+        u64 before = sptm_virt_s2r_win[0] ? sptm_virt_s2r_win[0] : 4000;
+        u64 after = sptm_virt_s2r_win[1] ? sptm_virt_s2r_win[1] : 30000;
+        u64 from = s2r_first_commit_head > before ? s2r_first_commit_head - before : 0;
+        u64 to = min(head, s2r_first_commit_head + after);
+        if (head - from > sptm_virt_s2r_nrec)
+            from = head - sptm_virt_s2r_nrec;
+        printf("SPTM-virt[s2r]: wake window: records %lu..%lu of %lu (first commit at %lu)\n", from,
+               to, head, s2r_first_commit_head);
+        for (u64 i = from; i < to; i++) {
+            s2r_print_rec(i);
+            if (!(i & 255))
+                iodev_handle_events(s2r_link_iodev);
+        }
+    } else {
+        sptm_virt_s2r_dump_prio(6000, 60000);
+    }
+    if (s2r_link_back) {
+        /* Hands-free: the host has the dump; let the last of it drain, then reset into stage 1. */
+        printf("SPTM-virt[s2r]: dump complete after a wake; resetting in 3 s\n");
+        iodev_console_flush();
+        u64 end = mrs(CNTPCT_EL0) + 3 * mrs(CNTFRQ_EL0);
+        while (mrs(CNTPCT_EL0) < end) {
+            iodev_handle_events(s2r_link_iodev);
+            udelay(1000);
+        }
+        s2r_crumb_at(8, 0x73);
+        wdt_reboot();
+        while (1)
+            sysop("wfe");
+    }
     struct uartproxy_msg_start start = {
         .reason = START_HV,
         .code = 0x53325221, /* 'S2R!' */
         .info = ctx,
     };
+    sptm_virt_park_others();
     uartproxy_run(&start);
     while (1)
         sysop("wfe");
@@ -616,6 +822,18 @@ bool sptm_virt_s2r_wfi(u64 *regs, u64 esr)
         msr(ELR_EL2, elr + 4); /* return as if an interrupt woke it */
         return true;
     }
+    if (s2r_go) {
+        __atomic_or_fetch(&s2r_crumb_wfi, BIT(cpu), __ATOMIC_SEQ_CST);
+        if (cpu == s2r_timer_cpu)
+            s2r_crumb(0x40);
+        /* The core's power-down; a wake resets it. Bit 3 of the option: never hand a WFI that
+         * came back (something pending) to the guest, wait again instead. */
+        do {
+            sysop("wfi");
+        } while (sptm_virt_s2r_crumbs & 8);
+        msr(ELR_EL2, elr + 4);
+        return true;
+    }
     s2r_marker("DEEPWFI", ((u64)cpu << 56) | (elr & GENMASK(55, 0)));
     printf("SPTM-virt[s2r]: cpu%d deep-sleep WFI at 0x%lx (S3_5_C15_C6_2 0x%lx)\n", cpu, elr, ds);
     if (cpu != s2r_timer_cpu) {
@@ -627,10 +845,12 @@ bool sptm_virt_s2r_wfi(u64 *regs, u64 esr)
     printf("SPTM-virt[s2r]: macOS reached its final WFI on the S2R-timer core cpu%d; parked 0x%x; "
            "%lu records. Stopping in the proxy (stop mode).\n",
            cpu, s2r_parked_mask, sptm_virt_s2r_head);
-    sptm_virt_s2r_dump_tail(4096);
+    /* whole classes, newest first: the proxy read-out fails with ten cores */
+    sptm_virt_s2r_dump_prio(6000, 60000);
     struct uartproxy_msg_start start = {
         .reason = START_HV, .code = 0x53325221, /* 'S2R!' */
     };
+    sptm_virt_park_others();
     uartproxy_run(&start);
     while (1)
         sysop("wfe");
@@ -639,6 +859,52 @@ bool sptm_virt_s2r_wfi(u64 *regs, u64 esr)
 static void s2r_wakerec_fallback(void);
 static void s2r_wakerec_pump(void);
 static bool s2r_wakerec_printed;
+
+/*
+ * XNU wrote one of the PMGR CPU-start registers (+0x4: BIT(cpu); +0x8 + 4 * cluster: BIT(core),
+ * which is what lets the core run). Watch the started core's crumbs for a while. If it has not
+ * reached its SPTM entry with the MMU on by then, say where it stopped and give the host the
+ * proxy: the boot core would only wait for it forever.
+ */
+static void s2r_cpustart_watch(struct exc_info *ctx, u64 addr, u64 val)
+{
+    u8 *c = (u8 *)sptm_smp_crumbs;
+    u64 off = addr & 0x3fff, f = mrs(CNTFRQ_EL0), t0 = mrs(CNTPCT_EL0);
+    int slot = off >= 8 ? (int)((off - 8) / 4) * 8 + __builtin_ctzl(val) : -1;
+    u8 st = 0;
+
+    if (slot < 0 || slot >= 16) {
+        printf("SPTM-virt[smp]: CPUSTART [0x%lx] <- 0x%lx (pc 0x%lx)\n", addr, val, ctx->elr);
+        return;
+    }
+    do {
+        dc_civac_range(c + slot * 64, 64);
+        st = c[slot * 64];
+        if (st >= 7 || (st & 0x80))
+            break;
+    } while (mrs(CNTPCT_EL0) - t0 < f / 2);
+    u64 *w = (u64 *)(c + slot * 64 + 8);
+    printf("SPTM-virt[smp]: CPUSTART [0x%lx] <- 0x%lx (pc 0x%lx): slot %d stage 0x%x count %u "
+           "after %lu us\n",
+           addr, val, ctx->elr, slot, st, c[slot * 64 + 1], (mrs(CNTPCT_EL0) - t0) * 1000000 / f);
+    if (st >= 7 && !(st & 0x80))
+        return;
+    if (st & 0x80)
+        printf("SPTM-virt[smp]: slot %d faulted with its MMU off: ESR 0x%lx ELR 0x%lx FAR 0x%lx\n",
+               slot, w[0], w[1], w[2]);
+    printf("SPTM-virt[smp]: SMP-PARK: the started core did not reach SPTM; stopping in the "
+           "proxy\n");
+    iodev_console_flush();
+    struct uartproxy_msg_start start = {
+        .reason = START_HV,
+        .code = 0x534d5021, /* 'SMP!' */
+        .info = ctx,
+    };
+    sptm_virt_park_others();
+    uartproxy_run(&start);
+    while (1)
+        sysop("wfe");
+}
 
 static bool s2r_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int width)
 {
@@ -723,13 +989,20 @@ static bool s2r_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int w
     const char *what = s2r_page_name(addr & ~0x3fffUL, &first);
     bool timer = write && width <= 3 && *val == 1 && !strcmp(what, "pmgr-aon-pst") &&
                  (addr & 0x7fff) == S2R_TIMER_OFF && s2r_armed();
-    if (timer && !s2r_go) {
+    /* AURA_S2R_GO_COUNT here too (J813): after n go-mode wakes, the next commit stops like stop
+     * mode, so the ring holds the sleep, the wake and the next entry for the proxy to read. */
+    if (timer &&
+        (!s2r_go || (sptm_virt_s2r_go_count && s2r_wake_count >= sptm_virt_s2r_go_count))) {
         sptm_virt_rg_stop_wd2();
         sptm_virt_s2r_note(ctx, addr, *val, true, width);
         s2r_stop_before_timer(ctx, addr, *val);
     }
-    if (timer)
+    if (timer) {
+        s2r_crumb_at(9, ++s2r_crumb_commits);
+        s2r_crumb(0x10);
         s2r_commit();
+        s2r_crumb(0x20);
+    }
 
     if (s2r_wake_mmio && !s2r_is_mbox(what) && s2r_take(&s2r_wake_mmio))
         printf("S2R-WAKE c%d %s %s%u 0x%lx%s0x%lx pc 0x%lx\n", smp_id(), what, write ? "W" : "R",
@@ -747,7 +1020,25 @@ static bool s2r_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int w
         return false;
     }
     sptm_virt_mmio_rw(addr, val, write, width);
+    if (timer)
+        s2r_crumb(0x30);
     sptm_virt_s2r_note(ctx, addr, *val, write, width);
+    /* host: AURA_S2R_PROBE_AT, a guest write after a wake that, once performed, triggers the
+     * AURA_S2R_PROBE reads (once per wake): where in macOS's own sequence a block becomes
+     * readable. */
+    if (write && sptm_virt_s2r_probe_at && addr == sptm_virt_s2r_probe_at && s2r_wake_t) {
+        static u32 done_wake;
+        if (done_wake != s2r_wake_count) {
+            done_wake = s2r_wake_count;
+            s2r_marker("PROBEAT", addr);
+            for (unsigned i = 0; i < ARRAY_SIZE(sptm_virt_s2r_probe) && sptm_virt_s2r_probe[i]; i++)
+                s2r_probe_one(sptm_virt_s2r_probe[i]);
+        }
+    }
+    bool cpustart =
+        !strcmp(what, "pmgr-soc-misc") && (addr & 0xfffff) >= 0x34004 && (addr & 0xfffff) < 0x34018;
+    if (write && cpustart && *val && sptm_smp_crumbs)
+        s2r_cpustart_watch(ctx, addr, *val);
     /* AURA_S2R_LIVE: the guest's writes to the hooked power blocks, as they happen, for a stall
      * that leaves nothing to read back. */
     if (write && sptm_virt_s2r_live) {
@@ -786,6 +1077,12 @@ static bool s2r_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int w
     if (s2r_wakerec_printed)
         s2r_wakerec_pump();
 
+    /* Every access to the cluster power gates and cluster control: few, and they decide whether
+     * the boot core can power off at the commit. */
+    static u32 pg_logs;
+    if ((!strcmp(what, "pmgr-pwrgate") || !strcmp(what, "pmgr-cluster-ctl")) && pg_logs++ < 96)
+        printf("SPTM-virt[pg c%d]: %s 0x%lx %s 0x%lx pc 0x%lx\n", smp_id(), write ? "W" : "R", addr,
+               write ? "<-" : "=", *val, ctx->elr);
     if (first && !sptm_virt_s2r_quiet)
         printf("SPTM-virt[s2r]: first access to %s page 0x%lx: %s 0x%lx <- 0x%lx pc 0x%lx\n", what,
                addr & ~0x3fffUL, write ? "wr" : "rd", addr, *val, ctx->elr);
@@ -793,13 +1090,19 @@ static bool s2r_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int w
         return true;
     if (timer) {
         s2r_timer_cpu = smp_id();
+        s2r_clean(&s2r_timer_cpu, sizeof(s2r_timer_cpu));
         s2r_marker("S2RTIMER", addr);
+        if (sptm_virt_s2r_crumbs & 512)
+            s2r_regs_snapshot("CREG");
         s2r_commit_head = sptm_virt_s2r_head;
+        if (!s2r_first_commit_head)
+            s2r_first_commit_head = s2r_commit_head;
         s2r_core_sleeps();
     }
     /* Each core disables itself in the PMGR CPU block on its way to its last WFI; a cluster armed
      * off is the same moment for the boot core. */
-    if (write && (!strcmp(what, "pmgr-soc-misc") ||
+    /* Not a write that starts another core: the start registers are in the same block. */
+    if (write && ((!strcmp(what, "pmgr-soc-misc") && !cpustart) ||
                   (!strcmp(what, "pmgr-cluster-ctl") && (*val & 0xf) == 0)))
         s2r_core_sleeps();
     return true;
@@ -1014,8 +1317,13 @@ static void s2r_hook_full(void)
     s2r_hook_blk(&s2r_soc->cllt, "pmgr-cllt", 0, 0);
     s2r_hook_blk(&s2r_soc->nub_ap, "nub-ap-ctrl", 0, 0x4000);
     s2r_hook_blk(&s2r_soc->aon, "pmgr-aon", 0, 0);
-    s2r_hook_blk(&s2r_soc->clkgen, "clkgen-dcs", 0x5c000, 0x4000);
-    s2r_hook_blk(&s2r_soc->clkgen, "clkgen-mux", 0x40000, 0x4000);
+    if (s2r_soc->clkgen.size >= 0x60000) {
+        s2r_hook_blk(&s2r_soc->clkgen, "clkgen-dcs", 0x5c000, 0x4000);
+        s2r_hook_blk(&s2r_soc->clkgen, "clkgen-mux", 0x40000, 0x4000);
+    } else {
+        /* A short clock block (T8142): the whole of it, as its pages are not known yet. */
+        s2r_hook_blk(&s2r_soc->clkgen, "clkgen", 0, 0);
+    }
     for (int i = 0; i < 3; i++)
         s2r_hook_adt("/arm-io/nub-spmi0", i, "spmi0", 0, 0x4000);
     for (int i = 0; i < 3; i++)
@@ -1023,6 +1331,84 @@ static void s2r_hook_full(void)
     s2r_hook_adt("/arm-io/smc", 0, "smc-mbox", 0x8000, 0x4000);
     s2r_hook_adt("/arm-io/pmp", 0, "pmp-mbox", 0x8000, 0x4000);
     s2r_hook_adt("/arm-io/dcp", 0, "dcp-mbox", 0x8000, 0x4000);
+    if (sptm_virt_s2r_extra & 1) {
+        int mp[8];
+        u64 pa, sz;
+        /* reg[0] is the cluster block, hooked above. reg[1] holds the AMCC planes, 0x40000 apart:
+         * the first page of each is aura's own hook (amcc_hook) and stays that. */
+        if (adt_path_offset_trace(adt, "/arm-io/mcc", mp) >= 0)
+            for (int r = 1; r < 32 && adt_get_reg(adt, mp, "reg", r, &pa, &sz) >= 0; r++) {
+                if (r == 1) {
+                    for (u64 page = pa; page < pa + sz; page += 0x4000)
+                        if ((page - pa) & 0x3ffff)
+                            s2r_hook_range("amcc", page, 0x4000);
+                } else {
+                    s2r_hook_range(r < 8 ? "mcc-b" : r < 10 ? "mcc-ptd" : "mcc-ch", pa, sz);
+                }
+            }
+    }
+    if (sptm_virt_s2r_extra & 2)
+        for (int r = 0; r < 4; r++)
+            s2r_hook_adt("/arm-io/aon-ptd", r, "aon-ptd", 0, 0);
+    /* Further blocks by node name: bit 4 the AIC, bit 5 every DART, bit 6 the PCIe controllers,
+     * bit 7 USB-C port 0's controller (the port macOS drives; the debug link is port 1). Its PHY
+     * (atc-phy0) hooked too reset the Mac during macOS's boot. */
+    if (sptm_virt_s2r_extra & 0x1f0) {
+        int node = adt_path_offset(adt, "/arm-io");
+        if (node >= 0)
+            ADT_FOREACH_CHILD(adt, node)
+            {
+                const char *name = adt_get_name(adt, node);
+                const char *what =
+                    (sptm_virt_s2r_extra & 0x10) && !strcmp(name, "aic")         ? "aic"
+                    : (sptm_virt_s2r_extra & 0x20) && !strncmp(name, "dart-", 5) ? "dart"
+                    : (sptm_virt_s2r_extra & 0x40) && !strncmp(name, "apcie", 5) ? "apcie"
+                    : (sptm_virt_s2r_extra & 0x80) && !strcmp(name, "usb-drd0")  ? "usb0"
+                                                                                 : NULL;
+                char path[48];
+                int p[8];
+                u64 pa, sz;
+                /* bit 8: each RTKit coprocessor's ASC page (CPU control at +0x44) */
+                if (!what && (sptm_virt_s2r_extra & 0x100) &&
+                    (s2r_cp_compat(node, "iop,ascwrap") ||
+                     s2r_cp_compat(node, "iop-sep,ascwrap"))) {
+                    snprintf(path, sizeof(path), "/arm-io/%s", name);
+                    if (adt_path_offset_trace(adt, path, p) >= 0 &&
+                        adt_get_reg(adt, p, "reg", 0, &pa, &sz) >= 0)
+                        s2r_hook_range("asc", pa, 0x4000);
+                    continue;
+                }
+                if (!what)
+                    continue;
+                snprintf(path, sizeof(path), "/arm-io/%s", name);
+                if (adt_path_offset_trace(adt, path, p) < 0)
+                    continue;
+                for (int r = 0; r < 32 && adt_get_reg(adt, p, "reg", r, &pa, &sz) >= 0; r++)
+                    if (sz && sz <= 0x200000)
+                        s2r_hook_range(what, pa, sz);
+                    /* PCIe's big windows (config space, reg[5]): their first 0x24000 only, where
+                     * the axi2af tunables (offsets up to 0x20058) would land */
+                    else if (sz && !strcmp(what, "apcie") && pa < 0x1000000000UL)
+                        s2r_hook_range(what, pa, 0x24000);
+            }
+    }
+    /* The SMC's SRAM: its shared buffer is in there, and a key write's value only travels there. */
+    if (sptm_virt_s2r_extra & 8)
+        /* Not in the ADT's /arm-io/smc reg list; from the Linux DT's "sram" (t8142-j813-j815.dtsi).
+         */
+        s2r_hook_range("smc-sram", 0x38de00000UL, 0x120000);
+    if (sptm_virt_s2r_extra & 4) {
+        static const struct {
+            const char *path, *what;
+        } mb[] = {
+            {"/arm-io/aop", "aop-mbox"},         {"/arm-io/sio", "sio-mbox"},
+            {"/arm-io/ans", "ans-mbox"},         {"/arm-io/mtp", "mtp-mbox"},
+            {"/arm-io/dcpext0", "dcpext0-mbox"}, {"/arm-io/dcpext1", "dcpext1-mbox"},
+            {"/arm-io/gfx-asc", "gfx-mbox"},
+        };
+        for (unsigned i = 0; i < ARRAY_SIZE(mb); i++)
+            s2r_hook_adt(mb[i].path, 0, mb[i].what, 0x8000, 0x4000);
+    }
 }
 
 /* ---- T6050: the coprocessors and the memory side ---------------------------------------------
@@ -1275,6 +1661,31 @@ static bool s2r_ring_alloc(u64 ring_bytes)
     return true;
 }
 
+/* A missing sleep profile must not disable link keeping or passive live recording. */
+static void s2r_no_sleep_setup(bool cdc, u64 flags, const char *missing)
+{
+    sptm_virt_flags &= ~(SPTM_VIRT_S2R | SPTM_VIRT_S2R_GO | SPTM_VIRT_S2R_FULL |
+                         SPTM_VIRT_S2R_COPROC | SPTM_VIRT_S2R_DROP_USB | SPTM_VIRT_S2R_MEM);
+    if (cdc && s2r_soc_link_only(adt, sptm_virt_link_phys, ARRAY_SIZE(sptm_virt_link_phys),
+                                 &s2r_soc_adt) == 0) {
+        s2r_soc = &s2r_soc_adt;
+        s2r_keep_always = true;
+        s2r_keep_setup();
+        printf("SPTM-virt[s2r]: no sleep path, the ADT gives no %s; keeping the debug-link "
+               "domains only\n",
+               missing);
+    } else {
+        printf("SPTM-virt[s2r]: no sleep path, the ADT gives no %s; debug-link domains not kept\n",
+               missing);
+    }
+    /* Keep main's passive ring/catalogue on KIS and link-only transports alike.
+     * The full sleep profile and its commit/wake machinery remain disabled. */
+    if ((flags & SPTM_VIRT_S2R) && s2r_ring_alloc(S2R_RING_BYTES))
+        printf(
+            "SPTM-virt[s2r]: %lu-record ring at 0x%lx for live in-guest tracing, no sleep path\n",
+            (unsigned long)sptm_virt_s2r_nrec, (unsigned long)sptm_virt_s2r_ring);
+}
+
 /* cdc: the proxy runs over the DWC3 CDC link, whose domains are kept on even without the trace. */
 void sptm_virt_s2r_setup(bool cdc)
 {
@@ -1283,21 +1694,7 @@ void sptm_virt_s2r_setup(bool cdc)
     const char *missing;
     if (s2r_soc_from_adt(adt, sptm_virt_link_phys, ARRAY_SIZE(sptm_virt_link_phys), &s2r_soc_adt,
                          &missing) < 0) {
-        printf("SPTM-virt[s2r]: no sleep path, the ADT gives no %s; debug-link domains not kept\n",
-               missing);
-        /* The sleep path -- keeping the debug-link domains alive across the sleep, the capture
-         * hooks and the sleep-commit rules -- needs that USB link, so drop every sleep flag. The
-         * record ring and the live in-guest catalogue (auractl arm/read on named MMIO over hvc) do
-         * not: on a KIS/DockChannel proxy there is no debug-link USB port, yet the guest still
-         * drives auractl. If a trace was asked for, allocate the ring alone so recording works; the
-         * sleep machinery stays gated (SPTM_VIRT_S2R stays clear), so nothing on the wake or sleep
-         * path runs without an s2r_soc. */
-        sptm_virt_flags &= ~(SPTM_VIRT_S2R | SPTM_VIRT_S2R_GO | SPTM_VIRT_S2R_FULL |
-                             SPTM_VIRT_S2R_COPROC | SPTM_VIRT_S2R_DROP_USB);
-        if ((flags & SPTM_VIRT_S2R) && s2r_ring_alloc(S2R_RING_BYTES))
-            printf("SPTM-virt[s2r]: no debug-link USB port; %lu-record ring at 0x%lx for live "
-                   "in-guest tracing, no sleep path\n",
-                   sptm_virt_s2r_nrec, (u64)sptm_virt_s2r_ring);
+        s2r_no_sleep_setup(cdc, flags, missing);
         return;
     }
     s2r_soc = &s2r_soc_adt;
@@ -1323,7 +1720,10 @@ void sptm_virt_s2r_setup(bool cdc)
         return;
     }
     /* A timer-only sleep has no stop before the commit to read a ring from: keep it all. */
-    u64 ring_bytes = s2r_soc->timer_only ? S2R_RING_BYTES_BIG : S2R_RING_BYTES;
+    /* With AURA_S2R_GO_COUNT the ring must hold a sleep, its wake and the next entry. */
+    u64 ring_bytes = s2r_soc->timer_only      ? S2R_RING_BYTES_BIG
+                     : sptm_virt_s2r_go_count ? (48UL << 20)
+                                              : S2R_RING_BYTES;
     if (!s2r_ring_alloc(ring_bytes)) {
         printf("SPTM-virt[s2r]: no memory for the ring; sleep path off\n");
         sptm_virt_flags &= ~SPTM_VIRT_S2R;
@@ -1371,7 +1771,16 @@ void sptm_virt_s2r_setup(bool cdc)
     s2r_drop_usb = flags & SPTM_VIRT_S2R_DROP_USB;
     /* In go mode the reset guard leaves macOS's sleep-time watchdog alone. */
     sptm_virt_rg_passthrough = s2r_go;
+    s2r_link_iodev = uartproxy_iodev;
     s2r_usb_setup();
+    if (s2r_go && (sptm_virt_s2r_crumbs & 2)) { /* bit 1: SPMI notes */
+        s2r_crumb_dev = spmi_init("/arm-io/nub-spmi0");
+        s2r_crumb(0x01);
+        s2r_crumb_at(8, 0);
+        s2r_crumb_at(9, 0);
+        printf("SPTM-virt[s2r]: crumbs in PMU scratch 0x830d: %s\n",
+               s2r_crumb_dev ? "on" : "no SPMI");
+    }
 
     /* Each core's self-disable and the commit: a handful of accesses. */
     s2r_hook_blk(&s2r_soc->soc_misc, "pmgr-soc-misc", 0, 0);
@@ -1400,8 +1809,14 @@ void sptm_virt_s2r_setup(bool cdc)
      * second of its quiesce, and trapping each access slows the power-down past the 5 s
      * reconfig watchdog.
      */
-    if (!s2r_go || s2r_fulltrace)
+    if (!s2r_go || s2r_fulltrace) {
         s2r_hook_full();
+    } else if (sptm_virt_s2r_crumbs & 128) {
+        /* The cluster words, the power gates and CLLT: few writes, and most of a wake. */
+        s2r_hook_blk(&s2r_soc->cluster_ctl, "pmgr-cluster-ctl", 0, 0);
+        s2r_hook_blk(&s2r_soc->pwrgate, "pmgr-pwrgate", 0, 0);
+        s2r_hook_blk(&s2r_soc->cllt, "pmgr-cllt", 0, 0);
+    }
 
     s2r_keep_setup();
 
@@ -1414,7 +1829,40 @@ void sptm_virt_s2r_setup(bool cdc)
                            : "GO mode: minimal hooks, the sleep proceeds at native speed");
 }
 
+/*
+ * Option bit 6 (J813): release the debug link when macOS zeroes the watchdog's count on its way
+ * into the sleep, about 14 ms before the commit and before any core has disabled itself, instead
+ * of at the commit. At the commit the teardown (dwc3 stop, three PMGR power-downs with their
+ * polls) sits between the cluster words and the cores' last WFI, where the sleep engine allows
+ * 33 ms, and between WD2's arming and the commit write. Here it only delays the whole entry.
+ */
+void sptm_virt_s2r_early_release(void)
+{
+    if (!s2r_go || !(sptm_virt_s2r_crumbs & 64) || s2r_keep_released || !s2r_armed())
+        return;
+    s2r_crumb_at(8, 0x60); /* early release entered */
+    s2r_console_to_aon();
+    s2r_crumb_at(8, 0x61);
+    s2r_release_kept();
+    s2r_crumb_at(8, 0x62); /* early release done */
+}
+
 /* ---- the wake ------------------------------------------------------------------------------- */
+
+/*
+ * sptm_virt_cpu_reset, MMU off. After the commit the SoC's sleep sequencer may restart a core at
+ * its reset vector (linux: "arm64: spin table: the holding pen's deep-sleep WFI after an Apple
+ * sleep's commit", from T6050). It has to take the deep-sleep WFI again or its cluster cannot
+ * power down, the sequencer waits with no timeout, and macOS's 5 s WD2 resets the SoC. Sent on
+ * into the guest it would execute that WFI at EL1, which does not power a T8142 core down. So a
+ * core other than the committing one that resets while a commit is pending is not the wake: it
+ * takes the WFI here. The committing core's reset is the wake and clears the pending commit
+ * before XNU starts any other core. Host: AURA_S2R_CRUMBS bit 4.
+ */
+bool sptm_virt_s2r_restarted_in_sleep(int cpu)
+{
+    return s2r_go && (sptm_virt_s2r_crumbs & 16) && s2r_commit_t && cpu != s2r_timer_cpu;
+}
 
 /* sptm_virt_cpu_reset, MMU off: the first reset after a commit is the wake. */
 void sptm_virt_s2r_wake(int cpu)
@@ -1428,6 +1876,10 @@ void sptm_virt_s2r_wake(int cpu)
     s2r_wake_commit_t = commit;
     s2r_wake_cpu = cpu;
     s2r_wake_count++;
+    /* Option bit 256: this core arms aura's stage 2 at its entry to SPTM's reset vector, not at
+     * its first GEXIT into XNU, so the hooks also see SPTM's own resume path. */
+    sptm_virt_s2r_early_s2 = (sptm_virt_s2r_crumbs & 256) ? cpu + 1 : 0;
+    s2r_clean(&sptm_virt_s2r_early_s2, sizeof(sptm_virt_s2r_early_s2));
     sptm_virt_s2r_quiet = false;
     iodev_set_usage(IODEV_DOCKCHANNEL_UART,
                     iodev_get_usage(IODEV_DOCKCHANNEL_UART) | USAGE_CONSOLE | USAGE_UARTPROXY);
@@ -1475,6 +1927,45 @@ static void s2r_aic_dump(const char *tag)
            read32(aic->base + aic->regs.mask_set + 4 * (aic->nr_irq / 32)));
 }
 
+/* One AURA_S2R_PROBE read into the ring: bit 63 of the entry asks for a 64-bit read (the AMCC
+ * takes only those from macOS), else 32-bit. Marker: low 32 address bits << 32 | low 32 value bits.
+ */
+static void s2r_probe_one(u64 e)
+{
+    u64 a = e & ~BIT(63);
+    u64 v = (e & BIT(63)) ? read64(a) : read32(a);
+    s2r_marker("PROBE", (a << 32) | (v & 0xffffffff));
+}
+
+/* Option bit 512: a few registers of blocks macOS rewrites at the wake, read into the ring (low 32
+ * bits of the address << 32 | value) at the commit and at the first trap after the wake. Fixed J813
+ * addresses. With the memory controller's blocks in the list as well (0x220028000, 0x220068000,
+ * 0x24f010000, 0x221000580/590, 0x3803d01b8/d8) the wake failed (m2: no wake step, WD2 reset). */
+static void s2r_regs_snapshot(const char *tag)
+{
+    static const u64 regs[] = {
+        0x380038000, 0x380038190, 0x380780000, 0x380780004, 0x380724000, 0x380724060,
+        0x380700c00, 0x380700118, 0x380717ff0, 0x381000014, 0x381001000, 0x381001010,
+        0x3810010f0, 0x381010000, 0x381010004, 0x381010100, 0x381010400, 0x381010800,
+    };
+    for (unsigned i = 0; i < ARRAY_SIZE(regs); i++)
+        s2r_marker(tag, (regs[i] << 32) | read32(regs[i]));
+    /* the AP wake-source page's first 24 words (status at +0x2c..; the enables are near) */
+    for (unsigned i = 0; i < 24; i++)
+        s2r_marker(tag[0] == 'C' ? "CNUB" : "WNUB",
+                   ((u64)(4 * i) << 32) | read32(0x388004000UL + 4 * i));
+    /* host: AURA_S2R_PREWRITE (address, value), written before the probes, at the wake only */
+    if (tag[0] == 'W' && sptm_virt_s2r_prewrite[0]) {
+        write32(sptm_virt_s2r_prewrite[0], (u32)sptm_virt_s2r_prewrite[1]);
+        s2r_marker("PREWR", (sptm_virt_s2r_prewrite[0] << 32) | read32(sptm_virt_s2r_prewrite[0]));
+    }
+    /* host: AURA_S2R_PROBE, up to four more, read at the wake only (unless AURA_S2R_PROBE_AT
+     * names a later point for them) */
+    if (tag[0] == 'W' && !sptm_virt_s2r_probe_at)
+        for (unsigned i = 0; i < ARRAY_SIZE(sptm_virt_s2r_probe) && sptm_virt_s2r_probe[i]; i++)
+            s2r_probe_one(sptm_virt_s2r_probe[i]);
+}
+
 /* exc_sync: the first guest trap after a wake prints the banner; a bounded trail follows. */
 void sptm_virt_s2r_wake_trap(u64 esr, u64 elr, bool in_gl)
 {
@@ -1497,6 +1988,25 @@ void sptm_virt_s2r_wake_trap(u64 esr, u64 elr, bool in_gl)
         }
         s2r_aic_dump("wake");
         s2r_marker("WAKE", s2r_wake_cpu);
+        /* The WAKE record is this first trap; the reset was earlier, by this many counter ticks. */
+        s2r_marker("RSTAGO", now - s2r_wake_t);
+        /* The same state into the ring, which the after-wake dump carries (the console lines
+         * above are lost to the wake's overrun): AIC CONFIG and mask word 0 as SPTM finds them,
+         * and each set AON wake-source word (index << 32 | value). */
+        if (aic) {
+            s2r_marker("AICCFG", read32(aic->base + 0x14));
+            s2r_marker("AICMASK0", read32(aic->base + aic->regs.mask_set));
+        }
+        /* Option bit 512: what survived the sleep in blocks macOS rewrites at the wake, read
+         * before it does; the same registers are read at the commit (CREG). */
+        if (sptm_virt_s2r_crumbs & 512)
+            s2r_regs_snapshot("WREG");
+        if (s2r_soc->nub_wake_status)
+            for (int i = 0; i < S2R_NUB_WAKE_WORDS; i++) {
+                u32 v = read32(s2r_soc->nub_wake_status + 4 * i);
+                if (v)
+                    s2r_marker("WAKESRC", ((u64)i << 32) | v);
+            }
     }
     if (s2r_wake_traps && s2r_take(&s2r_wake_traps))
         printf("S2R-WAKE-TRAP c%d %s EC 0x%02lx iss 0x%06lx pc 0x%lx\n", smp_id(),
@@ -1515,6 +2025,7 @@ void sptm_virt_s2r_xnu_entry(int cpu, u64 target)
            "%lu ms after the reset\n",
            s2r_wake_count, cpu, target, frq ? (now - s2r_wake_t) * 1000 / frq : 0);
     s2r_marker("XNUBACK", cpu);
+    s2r_crumb_at(8, 0x48); /* XNU running again after a wake */
     s2r_usb_wake();
 }
 
@@ -1784,16 +2295,63 @@ static void s2r_usb_ring_drain(void)
     s2r_usb_ring_rp = rp + (w > 0 ? w : 0);
 }
 
+/* One port again after a sleep took its controller's power: the old device is dropped unstopped. */
+static bool s2r_reinit_hpm_match(char *hpm_path, void *data)
+{
+    size_t len = strlen(hpm_path);
+    return len >= 4 && !memcmp(hpm_path + len - 4, "hpm", 3) &&
+           hpm_path[len - 1] - '0' == *(int *)data;
+}
+
+static int s2r_reinit_hpm_one(char *hpm_path, tps6598x_dev_t *tps, void *data)
+{
+    UNUSED(hpm_path);
+    *(int *)data = tps6598x_powerup(tps) < 0 ? -2 : -1; /* -1: powered up, -2: it refused */
+    return HPM_ACTION_STOP;
+}
+
+/*
+ * The whole of what boot does for one port (usb_init + usb_iodev_init): its PD controller powered
+ * up, then the PHY with its three power domains, then the DART and the controller. An earlier
+ * version skipped the first two and went straight to the DART of an unpowered block, which never
+ * came back.
+ */
+static int usb_iodev_reinit(int i)
+{
+    int hpm = i;
+    tps6598x_foreach_hpm(s2r_reinit_hpm_match, s2r_reinit_hpm_one, &hpm);
+    s2r_crumb_at(8, hpm == -1 ? 0x74 : hpm == -2 ? 0x7c : 0x7b); /* PD up / refused / not found */
+    if (usb_phy_bringup(i) < 0) {
+        s2r_crumb_at(8, 0x7a);
+        return -1;
+    }
+    s2r_crumb_at(8, 0x75); /* PHY and power domains up */
+    struct iodev *d = iodev_unregister_device(IODEV_USB0 + i);
+    dwc3_dev_t *opaque = usb_iodev_bringup(i);
+    if (!opaque || !(d || (d = memalign(SPINLOCK_ALIGN, sizeof(*d)))))
+        return -1;
+    d->ops = &iodev_usb_ops;
+    d->opaque = opaque;
+    d->usage = USAGE_CONSOLE | USAGE_UARTPROXY;
+    spin_init(&d->lock);
+    iodev_register_device(IODEV_USB0 + i, d);
+    return 0;
+}
+
 static void __attribute__((noreturn)) s2r_usb_main(void)
 {
     u64 frq = mrs(CNTFRQ_EL0);
 
+    s2r_crumb_at(8, 0x50); /* re-take started */
     s2r_usb_keep_rearm();
     pmgr_keep_configured = true;
     s2r_usb_yieldable = true;
-    int ret = usb_cdc_link_start(s2r_usb_step, usb_cdc_atc_lane());
+    /* T8142: usb_cdc_link_start has no re-take; bring the link's own port up again (J813: USB1). */
+    int ret = chip_id == T8142 ? usb_iodev_reinit(s2r_link_iodev - IODEV_USB0)
+                               : usb_cdc_link_start(s2r_usb_step, usb_cdc_atc_lane());
     s2r_usb_yieldable = false;
     pmgr_keep_configured = false;
+    s2r_crumb_at(8, ret ? 0x5e : 0x51); /* port bring-up failed / returned */
     if (ret) {
         /* The domains stay on and the keep rule stands, so the next commit powers them down. */
         printf("USB-RETAKE: failed at step %u\n", s2r_usb_step_now);
@@ -1801,8 +2359,8 @@ static void __attribute__((noreturn)) s2r_usb_main(void)
         while (1)
             s2r_usb_yield(0);
     }
-    hv_vuart_usb_back(IODEV_USB0);
-    uartproxy_iodev = IODEV_USB0;
+    hv_vuart_usb_back(chip_id == T8142 ? s2r_link_iodev : IODEV_USB0);
+    uartproxy_iodev = chip_id == T8142 ? s2r_link_iodev : IODEV_USB0;
     printf("USB-RETAKE: controller up %lu ms after the start: %u slices, longest %lu us\n",
            frq ? (mrs(CNTPCT_EL0) - s2r_usb_t0) * 1000 / frq : 0, s2r_usb_slices,
            frq ? s2r_usb_slice_max * 1000000 / frq : 0);
@@ -1814,7 +2372,7 @@ static void __attribute__((noreturn)) s2r_usb_main(void)
                s2r_wake_count, s2r_wake_cpu, frq ? (mrs(CNTPCT_EL0) - s2r_wake_t) * 1000 / frq : 0);
     s2r_usb_state = S2R_USB_UP;
     while (1) {
-        iodev_handle_events(IODEV_USB0);
+        iodev_handle_events(uartproxy_iodev);
         s2r_usb_ring_drain();
         s2r_wakerec_pump();
         s2r_coproc_pump();
@@ -1906,7 +2464,8 @@ static void s2r_usb_setup(void)
 {
     if (!sptm_virt_s2r_usb_retake)
         return;
-    if (!s2r_go || !s2r_keep_always || !s2r_drop_usb) {
+    s2r_link_iodev = uartproxy_iodev;
+    if (!s2r_go || !s2r_keep_always || (!s2r_drop_usb && chip_id != T8142)) {
         printf("USB-RETAKE: needs go mode, the proxy on CDC and the USB drop; off\n");
         sptm_virt_s2r_usb_retake = 0;
         return;

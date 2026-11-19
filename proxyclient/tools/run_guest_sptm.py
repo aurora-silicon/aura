@@ -30,7 +30,16 @@ Environment (all optional; 1 enables a switch):
   AURA_S2R_CP_ANSX=<mask>  T6050 COPROC: also hook 1 the ANS SART, 2 the NVMe BAR page, 4 AUS5
   AURA_S2R_DROP_USB        tear down aura's USB gadget at the sleep commit
   AURA_S2R_WAKE_S=<s>      GO, timer-only sleep: arm the PMU RTC alarm s seconds after the commit
-  AURA_S2R_GO_COUNT=<n>    GO, timer-only sleep: after n wakes, stop in the proxy at the next commit
+  AURA_S2R_GO_COUNT=<n>    GO: after n wakes, stop in the proxy at the next commit
+  AURA_S2R_CRUMBS=<mask>   T8142 GO: note steps in PMU scratch (0x830d..0x8311), which a reset
+                           keeps; bits as in sptm_virt_s2r.c (s2r_crumb)
+  AURA_S2R_WIN=<b>,<a>     after a wake, dump b records before the first commit and a after
+  AURA_S2R_ARM_S=<s>       arm the sleep rules s seconds after setup (default 45)
+  AURA_S2R_EXTRA=<mask>    stop mode: also hook 1 the MCC, 2 aon-ptd, 4 other coprocessor mailboxes
+  AURA_S2R_PROBE=<a,...>   read up to four registers at the wake (bit 63: 64-bit read)
+  AURA_S2R_PROBE_AT=<a>    take the AURA_S2R_PROBE reads after the guest's first write to a
+  AURA_S2R_PREWRITE=<a,v>  write v to a at the wake, before the probes
+  AURA_AURA_HEAP_MIB=<n>   aura's own heap under the guest (112 MiB on J813, 128 elsewhere)
   AURA_S2R_QUIESCE=<mask>  AMCC error-enable writes at the commit: 8 DSID_AGE_OUT,
                            16 UNEXP_RT_HIT_DIR
   AURA_S2R_USB_RETAKE=<n>  take the CDC link again after a wake; n > 1 also drops it n s in
@@ -109,6 +118,14 @@ CONFIG_FLAGS = {
     "AURA_AURACTL_DCC": 1 << 10,  # arm auractl's kext-free DCC transport (off by default)
 }
 KNOWN_ENV = {
+    "AURA_S2R_ARM_S",
+    "AURA_S2R_WIN",
+    "AURA_S2R_PROBE",
+    "AURA_S2R_PREWRITE",
+    "AURA_S2R_PROBE_AT",
+    "AURA_S2R_CRUMBS",
+    "AURA_S2R_EXTRA",
+    "AURA_AURA_HEAP_MIB",
     "AURA_KEEP_EXCLAVES",
     "AURA_OS_LONG_VERSION",
     "AURA_KEEP_BOOT_VIDEO",
@@ -259,6 +276,46 @@ XNU_QUIRKS = (
                     0x1400000f),
                    ("task PAC key reprogramming (4)", "BootKC-rx", 0x31488c4, 0x540001e0,
                     0x1400000f))),
+    # T6041's xnu-13432.41.4 (macOS 27.2.1, 26B131, kernelcache.release.mac16j). Its guest needs
+    # only nvram_ro: about 27 s in, while APFS mounts the volumes, AppleARMNORNVRAM sends the NOR a
+    # write enable. The same two words as the J813's, at this kernelcache's offsets; the first is
+    # the fingerprint. Without exclaves its single-user boot reaches the shell with no other patch.
+    dict(release=b"xnu-13432.41.4~", fingerprint=("__TEXT_EXEC", 0x1bdf0c, 0xaa0003e8),
+         hide=(), ro_relax=(),
+         nvram_ro=(("AppleARMNORNVRAM::write", "BootKC-rx", 0x1bdf0c, 0xaa0003e8, 0x52800000),
+                   ("AppleARMNORNVRAM::write return", "BootKC-rx", 0x1bdf10, 0x52805840,
+                    0xd65f03c0))),
+    # T8142's xnu-13432.41.4 (macOS 27.2.1 26B131, kernelcache.release.mac17g; 27.2's 26B123
+    # ships the same XNU release but its kernelcache is not checked). Every site above, ported
+    # from 26A428: each
+    # one's 48-instruction window (PC-relative immediates, and where needed the adrp-paired
+    # imm12, masked) matches exactly once here. The two twin PAC-key guards match twice in both
+    # kernelcaches and are paired in order. The branch replacements are re-encoded for this
+    # kernelcache, and the rorgn globals come from the matched function's own adrp/str pairs.
+    # The fingerprint is the RO-zone branch: T6041's kernelcache of this release does not match it.
+    dict(release=b"xnu-13432.41.4~", fingerprint=("__TEXT_EXEC", 0x3b53c20, 0x540002a9),
+         hide=("/arm-io/apcie", "/arm-io/dart-apcie0", "/arm-io/apcie0-piodma",
+               "/arm-io/apciec0", "/arm-io/dart-apciec0", "/arm-io/apciec0-piodma",
+               "/arm-io/centauri", "/arm-io/bluetooth", "/arm-io/aop-spmi0/spmi-wifibt"),
+         ro_relax=(("zalloc_ro_mut RO-zone check", "BootKC-rx", 0x3b53c20, 0x540002a9,
+                    0x14000015),),
+         rorgn=(("rorgn register read", "BootKC-rx", 0x339a4d0, 0x370001a8, 0x1400000d),),
+         rorgn_globals=(0xf0c020, 0xf0c028),
+         nvram_mutable=(("Image4 storageInit mix-and-match question", "BootKC-rx",
+                         0x2be6254, 0x34000080, 0x14000022),),
+         tc_force=(("trust-cache load result", "BootKC-rx",
+                    0x380fae4, 0x340000e0, 0x14000007),),
+         nvram_ro=(("AppleARMNORNVRAM::write", "BootKC-rx", 0x1c3d9c, 0xaa0003e8, 0x52800000),
+                   ("AppleARMNORNVRAM::write return", "BootKC-rx", 0x1c3da0, 0x52805840,
+                    0xd65f03c0)),
+         pac_keys=(("task PAC key reprogramming (switch)", "BootKC-rx", 0x317034c, 0x540001e0,
+                    0x1400000f),
+                   ("task PAC key reprogramming (2)", "BootKC-rx", 0x3170414, 0x540001e0,
+                    0x1400000f),
+                   ("task PAC key reprogramming (3)", "BootKC-rx", 0x3170614, 0x540001e0,
+                    0x1400000f),
+                   ("task PAC key reprogramming (4)", "BootKC-rx", 0x31708c4, 0x540001e0,
+                    0x1400000f))),
 )
 
 
@@ -295,6 +352,16 @@ def env_on(name):
 def env_int(name, default=0):
     value = os.environ.get(name)
     return int(value, 0) if value else default
+
+
+def aura_heap_size(adt):
+    override = os.environ.get("AURA_AURA_HEAP_MIB")
+    if override is not None:
+        return int(override) * 1024 * 1024
+    # The J813's padded EL2 boot object leaves a 160 MiB carve-out, with about
+    # 33 MiB already used before the host reserves space for aura's own heap.
+    j813 = adt["/chosen"].chip_id == 0x8142 and getattr(adt, "model", None) == "Mac17,3"
+    return (112 if j813 else 128) * 1024 * 1024
 
 
 def parse_args():
@@ -684,6 +751,32 @@ def configure(p, sym, plan, adt, ctl_cookie=0):
     if os.environ.get("AURA_S2R_QUIESCE"):
         p.write32(sym["sptm_virt_s2r_quiesce"], env_int("AURA_S2R_QUIESCE"))
         print("AMCC quiesce writes at the commit:", os.environ["AURA_S2R_QUIESCE"])
+    if os.environ.get("AURA_S2R_CRUMBS"):
+        p.write32(sym["sptm_virt_s2r_crumbs"], env_int("AURA_S2R_CRUMBS"))
+        print("S2R crumbs in PMU scratch, level", os.environ["AURA_S2R_CRUMBS"])
+    if os.environ.get("AURA_S2R_PREWRITE"):
+        a, v = (int(x, 0) for x in os.environ["AURA_S2R_PREWRITE"].split(","))
+        p.write64(sym["sptm_virt_s2r_prewrite"], a)
+        p.write64(sym["sptm_virt_s2r_prewrite"] + 8, v)
+        print("wake-time pre-write: [0x%x] <- 0x%x" % (a, v))
+    if os.environ.get("AURA_S2R_PROBE_AT"):
+        p.write64(sym["sptm_virt_s2r_probe_at"], int(os.environ["AURA_S2R_PROBE_AT"], 0))
+        print("wake-time probes at the guest's write to %s" % os.environ["AURA_S2R_PROBE_AT"])
+    if os.environ.get("AURA_S2R_PROBE"):
+        for i, a in enumerate(os.environ["AURA_S2R_PROBE"].split(",")[:4]):
+            p.write64(sym["sptm_virt_s2r_probe"] + 8 * i, int(a, 0))
+        print("wake-time probes: %s" % os.environ["AURA_S2R_PROBE"])
+    if os.environ.get("AURA_S2R_WIN"):
+        b, a = (int(x, 0) for x in os.environ["AURA_S2R_WIN"].split(","))
+        p.write32(sym["sptm_virt_s2r_win"], b)
+        p.write32(sym["sptm_virt_s2r_win"] + 4, a)
+        print("after-wake dump window: %d records before the first commit, %d after" % (b, a))
+    if os.environ.get("AURA_S2R_ARM_S"):
+        p.write32(sym["sptm_virt_s2r_arm_s"], env_int("AURA_S2R_ARM_S"))
+        print("S2R sleep rules armed", os.environ["AURA_S2R_ARM_S"], "s after setup")
+    if os.environ.get("AURA_S2R_EXTRA"):
+        p.write32(sym["sptm_virt_s2r_extra"], env_int("AURA_S2R_EXTRA"))
+        print("extra stop-mode trace blocks, mask", os.environ["AURA_S2R_EXTRA"])
     if os.environ.get("AURA_S2R_USB_RETAKE"):
         p.write32(sym["sptm_virt_s2r_usb_retake"], env_int("AURA_S2R_USB_RETAKE"))
         p.write32(sym["sptm_virt_s2r_usb_delay_ms"], env_int("AURA_S2R_USB_RETAKE_MS"))
@@ -747,7 +840,7 @@ def main():
     iface = UartInterface()
     p = AuraProxy(iface, debug=False)
     bootstrap_port(iface, p)
-    u = ProxyUtils(p, heap_size=128 * 1024 * 1024)
+    u = ProxyUtils(p, heap_size=128 * 1024 * 1024, aura_heap=aura_heap_size)
     sym = Symbols(args.nm, args.elf, p.get_base())
 
     # SPTM's managed window, as aura computed it: above aura and everything iBoot left low,

@@ -46,4 +46,10 @@ struct s2r_soc {
 int s2r_soc_from_adt(const void *adt, const u32 *link_phys, int n_phys, struct s2r_soc *out,
                      const char **missing);
 
+/*
+ * Only the hidden USB ports' controller, DART and PHY, for an ADT that gives no sleep path: the
+ * debug link's power domains can still be kept on. 0, or -1 if no port is found.
+ */
+int s2r_soc_link_only(const void *adt, const u32 *link_phys, int n_phys, struct s2r_soc *out);
+
 #endif
