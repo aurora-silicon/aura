@@ -143,8 +143,11 @@ int main(int argc, char **argv)
     }
     adt = slurp(argv[1], 0, &asz);
     adt_size = asz;
-    dt = slurp(argv[2], 64 * 1024, &dsz);
-    if (fdt_open_into(dt, dt, dsz + 64 * 1024)) {
+    /* Free space in the tree for the code under test; a small value makes its updates fail */
+    const char *spare_env = getenv("KBOOT_AUDIO_DT_SPARE");
+    size_t spare = spare_env ? strtoul(spare_env, NULL, 0) : 64 * 1024;
+    dt = slurp(argv[2], spare, &dsz);
+    if (fdt_open_into(dt, dt, dsz + spare)) {
         fprintf(stderr, "bad dtb\n");
         return 2;
     }

@@ -21,8 +21,9 @@
  * A property the group does not have (or one without a row for every amp) is
  * removed from its amps, so the kernel never sees a value that did not come from this Mac. Amps
  * are matched to the DT's ti,sn012776 nodes by I2C address, which must name exactly one node. A
- * group with an amp that cannot be matched is left as it is: the kernel gets either the whole
- * group's configuration or none of it. Nothing here stops the boot.
+ * group with an amp that cannot be matched is left as it is, and a group whose DT update fails
+ * part way has every one of these properties removed from all of its amps again: the kernel gets
+ * either the whole group's configuration or none of it. Nothing here stops the boot.
  */
 
 #include "kboot_audio.h"
@@ -128,6 +129,21 @@ static int dt_amp_setprop(void *dt, u32 addr, const char *name, const void *val,
     return 0;
 }
 
+/*
+ * Remove every property this file hands over from the group's amps. Used when a DT update fails
+ * part way, so that no amp keeps a configuration its group-mates did not get. Removing a
+ * property never needs space in the tree, so this cannot fail the way the update did.
+ */
+static void amp_group_clear(void *dt, const u32 *addrs, int n)
+{
+    for (int i = 0; i < n; i++) {
+        for (size_t p = 0; p < ARRAY_SIZE(amp_group_props); p++)
+            dt_amp_setprop(dt, addrs[i], amp_group_props[p].dt, NULL, 0);
+        for (size_t p = 0; p < ARRAY_SIZE(amp_row_props); p++)
+            dt_amp_setprop(dt, addrs[i], amp_row_props[p].dt, NULL, 0);
+    }
+}
+
 static int setup_amp_group(void *dt, const void *adt, int arm_io, int group)
 {
     const char *name = adt_get_name(adt, group);
@@ -181,7 +197,7 @@ static int setup_amp_group(void *dt, const void *adt, int arm_io, int group)
 
         for (int i = 0; i < n; i++) {
             if (dt_amp_setprop(dt, addrs[i], amp_group_props[p].dt, val, len))
-                return -1;
+                goto fail;
         }
     }
 
@@ -199,12 +215,18 @@ static int setup_amp_group(void *dt, const void *adt, int arm_io, int group)
         for (int i = 0; i < n; i++) {
             if (dt_amp_setprop(dt, addrs[i], amp_row_props[p].dt, rows ? rows + i * row : NULL,
                                row))
-                return -1;
+                goto fail;
         }
     }
 
     printf("kboot: audio: %s: amp configuration for %d amps\n", name, n);
     return 0;
+
+fail:
+    amp_group_clear(dt, addrs, n);
+    printf("kboot: audio: %s: DT update failed, amp configuration removed from all %d amps\n", name,
+           n);
+    return -1;
 }
 
 int kboot_audio_amp_config(void *dt, const void *adt)
