@@ -78,6 +78,29 @@ jobs:
           CC: ${{ matrix.compiler == 'llvm' && 'clang' || 'gcc' }}
         run: tests/run-t8122-gpu26-identity.sh
 
+      - name: Install host test tools
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y device-tree-compiler qemu-user-static
+
+      # The host tests of tests/run-*.sh that need no files from a Mac
+      - name: Run host tests
+        if: matrix.os == 'ubuntu-latest'
+        env:
+          CC: ${{ matrix.compiler == 'llvm' && 'clang' || 'gcc' }}
+        run: |
+          for t in kboot-audio logo payload-profile t6030-display t8122-air-pmp t8122-full-start \
+              t8122-gpu-diagnostics; do
+            echo "::group::run-$t"
+            sh "tests/run-$t.sh"
+            echo "::endgroup::"
+          done
+
+      - name: Run the M3 start.S move gate under qemu
+        if: matrix.os == 'ubuntu-latest' && matrix.compiler == 'llvm'
+        run: PATH="$(llvm-config --prefix)/bin:$PATH" sh tests/run-m3-move-gate.sh
+
   arm64-native:
     name: Pytest (ubuntu-24.04-arm, native start.S)
     runs-on: ubuntu-24.04-arm
