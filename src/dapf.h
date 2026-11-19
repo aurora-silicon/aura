@@ -17,8 +17,11 @@ struct dapf_window {
     u64 end;
 };
 
+#define DAPF_T8110_MAX_SLICES 16
+
 int dapf_init_t8132_halted(const char *path, int index);
 int dapf_t8132_windows(const char *path, int index, struct dapf_window *out, int max);
 int dapf_t8132_ranges(const char *path, u32 r0, u32 r4, u32 r20, u64 *ranges, int max);
+int dapf_t8110_ranges(const char *path, u32 instance, struct dapf_window *out, int max);
 
 #endif
