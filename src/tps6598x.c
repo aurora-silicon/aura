@@ -385,13 +385,12 @@ static int tps6598x_dbma_route(tps6598x_dev_t *dev, const u8 vdm[4], const char 
     for (int i = 0; i < 4; i++)
         key[i] = target[3 - i];
 
-    // check status and soft reset if it fails
+    // check status and reset the controller if it fails
     if (tps6598x_cmd_status(dev, "LOCK")) {
         if (!reset_ok)
             return -1;
-        if (tps6598x_command(dev, "Gaid", NULL, 0, NULL, 0))
+        if (tps6598x_cold_reset(dev) || tps6598x_wait_ready(dev))
             return -1;
-        mdelay(20);
     }
 
     ret = tps6598x_command(dev, "LOCK", key, 4, (u8 *)&out, 1);
