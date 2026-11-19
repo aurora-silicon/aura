@@ -98,6 +98,7 @@ struct s2r_rec {
 #define S2R_MARKER BIT(55)
 #define S2R_WRITE  BIT(50)
 #define S2R_J613_SNAPSHOT BIT(13) /* AURA_S2R_CRUMBS */
+#define S2R_J613_TRAFFIC  BIT(14)
 
 /* For the host: read over the proxy after a stop, or after a reset that kept DRAM. */
 struct s2r_rec *sptm_virt_s2r_ring;
@@ -728,6 +729,11 @@ static bool s2r_j613_snapshot_enabled(void)
     return chip_id == T8122 && (sptm_virt_s2r_crumbs & S2R_J613_SNAPSHOT);
 }
 
+static bool s2r_j613_traffic_enabled(void)
+{
+    return chip_id == T8122 && (sptm_virt_s2r_crumbs & S2R_J613_TRAFFIC);
+}
+
 static void s2r_j613_snapshot_word(const char *tag, u64 addr)
 {
     u32 val;
@@ -1074,6 +1080,7 @@ bool sptm_virt_s2r_wfi(u64 *regs, u64 esr)
 
 static void s2r_wakerec_fallback(void);
 static void s2r_wakerec_pump(void);
+static void s2r_j613_export_tick(void);
 static bool s2r_wakerec_printed;
 
 /*
@@ -1246,7 +1253,8 @@ static bool s2r_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int w
         s2r_crumb(0x20);
     }
 
-    if (s2r_wake_mmio && !s2r_is_mbox(what) && s2r_take(&s2r_wake_mmio))
+    if (!s2r_j613_traffic_enabled() && s2r_wake_mmio && !s2r_is_mbox(what) &&
+        s2r_take(&s2r_wake_mmio))
         printf("S2R-WAKE c%d %s %s%u 0x%lx%s0x%lx pc 0x%lx\n", smp_id(), what, write ? "W" : "R",
                8u << width, addr, write ? " = " : " (before read) ", write ? *val : 0UL, ctx->elr);
 
@@ -1317,9 +1325,13 @@ static bool s2r_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int w
             printf("SPTM-virt[hook writes/10s]%s\n", line);
         }
     }
-    s2r_wakerec_fallback();
-    if (s2r_wakerec_printed)
-        s2r_wakerec_pump();
+    if (s2r_j613_traffic_enabled()) {
+        s2r_j613_export_tick();
+    } else {
+        s2r_wakerec_fallback();
+        if (s2r_wakerec_printed)
+            s2r_wakerec_pump();
+    }
 
     /* Every access to the cluster power gates and cluster control: few, and they decide whether
      * the boot core can power off at the commit. */
@@ -2044,11 +2056,19 @@ void sptm_virt_s2r_setup(bool cdc)
      */
     if (!s2r_go || s2r_fulltrace) {
         s2r_hook_full();
-    } else if (sptm_virt_s2r_crumbs & 128) {
+    } else if ((sptm_virt_s2r_crumbs & 128) || s2r_j613_traffic_enabled()) {
         /* The cluster words, the power gates and CLLT: few writes, and most of a wake. */
         s2r_hook_blk(&s2r_soc->cluster_ctl, "pmgr-cluster-ctl", 0, 0);
         s2r_hook_blk(&s2r_soc->pwrgate, "pmgr-pwrgate", 0, 0);
         s2r_hook_blk(&s2r_soc->cllt, "pmgr-cllt", 0, 0);
+    }
+
+    if (s2r_j613_traffic_enabled()) {
+        s2r_hook_blk(&s2r_soc->soc_ps, "pmgr-soc-ps", 0, 0);
+        s2r_hook_range("pmgr-mini", 0x2e4280000, 0x4000);
+        s2r_hook_range("spmi0", 0x2e4714000, 0x4000);
+        s2r_hook_range("spmi-a0", 0x2e4908000, 0x4000);
+        s2r_hook_range("watchdog", 0x2e42b0000, 0x4000); /* skipped if reset guard owns it */
     }
 
     s2r_keep_setup();
@@ -2359,6 +2379,59 @@ static void s2r_wakerec_pump(void)
     s2r_wakerec_rp = s2r_sleeprec_from;
     s2r_wakerec_end = s2r_sleeprec_to;
     s2r_sleeprec_to = 0;
+}
+
+/* J613's KIS DockChannel works after XNU resumes even if the CDC retake fails. Scan the
+ * retained ring once per reset and pace the ordered entry/wake export independently of CDC. */
+static void s2r_j613_export_tick(void)
+{
+    static unsigned busy;
+    static u32 cycle;
+    static u64 from, to;
+    if (!s2r_wake_xnu_done || sptm_virt_s2r_quiet || !sptm_virt_s2r_ring)
+        return;
+    if (__atomic_exchange_n(&busy, 1, __ATOMIC_ACQUIRE))
+        return;
+
+    if (cycle != s2r_wake_count) {
+        u64 freq = mrs(CNTFRQ_EL0);
+        if (mrs(CNTPCT_EL0) - s2r_wake_t < 10 * freq || dockchannel_uart_tx_free() < 512)
+            goto done;
+        cycle = s2r_wake_count;
+        to = sptm_virt_s2r_head;
+        u64 oldest = to > sptm_virt_s2r_nrec ? to - sptm_virt_s2r_nrec : 0;
+        u64 start = s2r_wake_commit_t - 2 * freq;
+        from = min(max(oldest, s2r_commit_head), to);
+        while (from > oldest && sptm_virt_s2r_ring[(from - 1) % sptm_virt_s2r_nrec].t >= start)
+            from--;
+        printf("J613-TRACE start wake=%u records=%lu..%lu commit=%lx reset=%lx freq=%lu\n",
+               cycle, from, to, s2r_wake_commit_t, s2r_wake_t, freq);
+    }
+    if (from >= to)
+        goto done;
+    if (sptm_virt_s2r_head - from > sptm_virt_s2r_nrec) {
+        printf("J613-TRACE overwritten wake=%u record=%lu\n", cycle, from);
+        from = to;
+        goto done;
+    }
+    for (unsigned scanned = 0, sent = 0; from < to && scanned < 256 && sent < 4;
+         scanned++, from++) {
+        if (dockchannel_uart_tx_free() < 256)
+            break;
+        const struct s2r_rec *r = &sptm_virt_s2r_ring[from % sptm_virt_s2r_nrec];
+        u64 page = r->meta & GENMASK(47, 14);
+        bool first;
+        const char *what = page ? s2r_page_name(page, &first) : "";
+        if ((r->meta & (S2R_MARKER | S2R_WRITE)) || s2r_is_mbox(what) ||
+            page == 0x2e4714000 || page == 0x2e4908000) {
+            s2r_print_rec(from);
+            sent++;
+        }
+    }
+    if (from == to)
+        printf("J613-TRACE end wake=%u\n", cycle);
+done:
+    __atomic_store_n(&busy, 0, __ATOMIC_RELEASE);
 }
 
 /* With the coprocessor mailboxes hooked, after the wake record: every mailbox access from before
@@ -2727,6 +2800,8 @@ static void s2r_usb_setup(void)
 void sptm_virt_s2r_uart_tick(void)
 {
     s2r_usb_tick(false);
+    if (s2r_j613_traffic_enabled())
+        s2r_j613_export_tick();
 }
 
 /* A trapped byte of XNU's console. True if the ring holds it, for the CDC pipe. */
