@@ -4,7 +4,7 @@
 Over USB a host chainloads aura and runs proxyclient/tools/run_guest_sptm.py, which sends the macOS
 pieces and its decisions. This module writes the same pieces and decisions to files for the ESP:
 
-    m1n1/stage2-macos.bin        aura (ESP_STAGE2 SPTM_VIRT_ESP ...) + its macos= line
+    aurora/stage2-macos.bin      aura (ESP_STAGE2 SPTM_VIRT_ESP ...) + its macos= line
     aurora/macos/manifest.txt    what to load and how, with sizes and SHA-256s
     aurora/macos/sptm.bin txm.bin kernelcache[.gz] trustcache.bin
     aurora/macos/cl4-bundle.bin exclave-integrity.bin exclave-trustcache.bin
@@ -33,7 +33,7 @@ from . import sptm_patch
 from . import sptm_virt_plan as plan_mod
 
 ESP_DIR = "aurora/macos"
-STAGE2_NAME = "m1n1/stage2-macos.bin"
+STAGE2_NAME = "aurora/stage2-macos.bin"
 RUNNER = pathlib.Path(__file__).resolve().parents[1] / "tools" / "run_guest_sptm.py"
 
 # The trace lane's cp.env (/path/to/capture): TRACE, GO, FULLTRACE,
@@ -215,5 +215,5 @@ def write_staging(bundle, stage2, out, *, partuuid):
     (out / STAGE2_NAME).parent.mkdir(parents=True, exist_ok=True)
     (out / STAGE2_NAME).write_bytes(s2)
     (d / "SHA256SUMS").write_text(sha256sums(dict(bundle.files)) +
-                                  f"{_sha(s2)}  ../../{STAGE2_NAME}\n")
+                                  f"{_sha(s2)}  ../stage2-macos.bin\n")
     return out / STAGE2_NAME

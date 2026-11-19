@@ -277,6 +277,7 @@ static int settle(struct measurement *m, const char *what)
 int secboot_check_payloads(u8 *p, u8 **next)
 {
     *next = p;
+    /* LEGACY-ASAHI(2027-02-28): records signed before the rename carry "m1n1_sig" */
     bool is_sig = !memcmp(p, SIG_TAG, SIG_TAG_LEN) || !memcmp(p, "m1n1_sig", SIG_TAG_LEN);
     if (!is_sig) {
 #ifdef SECBOOT_CHECKS
@@ -321,7 +322,12 @@ u8 *secboot_payload_next(u8 *p)
          * its log, measurements) and the NVMe hand-over. Never a payload, chainload=, boot=,
          * display=, mitigations= or tso=: those must come from the signed bytes.
          */
-        "chosen.", "nvme.adopt=", "aura.host-window=", "m1n1.config-lost=", NULL,
+        "chosen.",
+        "nvme.adopt=",
+        "aura.host-window=",
+        "aura.config-lost=",
+        "m1n1.config-lost=" /* LEGACY-ASAHI(2027-02-28) */,
+        NULL,
     };
     /*
      * Skip what is refused instead of stopping: a stop would also drop the allowed lines after

@@ -77,6 +77,7 @@ def test_capture_and_verify_full_adt_and_immutable_image(tmp_path):
 
 
 def test_legacy_version_marker_is_still_recognised(tmp_path):
+    # LEGACY-ASAHI(2027-02-28): the pre-rename marker
     image = b"##m1n1_ver##candidate-v1" + b"\0" * 17
     interface = SimpleNamespace(readmem=lambda addr, size: image[:size])
     utils = SimpleNamespace(iface=interface, base=0x1000, get_adt=lambda: b"adt")

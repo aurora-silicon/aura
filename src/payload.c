@@ -46,10 +46,12 @@ static const u8 prelink_info_magic[] = {'<', '?', 'x', 'm', 'l', ' '};
 /*
  * aura's own payload records start "aura_". Payloads made for the bootloader aura replaced
  * start "m1n1_" instead; both are accepted so existing installs and payload builders keep
- * working. The two prefixes are the same length, so the record layout is unchanged.
+ * working (LEGACY-ASAHI(2027-02-28)). The two prefixes are the same length, so the record
+ * layout is unchanged.
  */
 #define PAYLOAD_PREFIX_LEN 5
 static const u8 payload_prefix[PAYLOAD_PREFIX_LEN] = {'a', 'u', 'r', 'a', '_'};
+/* LEGACY-ASAHI(2027-02-28) */
 static const u8 legacy_payload_prefix[PAYLOAD_PREFIX_LEN] = {'m', '1', 'n', '1', '_'};
 static const u8 sig_magic[] = {'s', 'i', 'g'};
 static const u8 initramfs_magic[] = {'i', 'n', 'i', 't', 'r', 'a', 'm', 'f', 's'};
@@ -82,7 +84,8 @@ bool stage1_chained;
 bool stage1_window_passed;
 #endif
 
-/* Length of the "aura_<tag>" (or legacy "m1n1_<tag>") record header at p, or 0. */
+/* Length of the "aura_<tag>" (or LEGACY-ASAHI(2027-02-28) "m1n1_<tag>") record header at p, or 0.
+ */
 static size_t payload_record(const u8 *p, const u8 *tag, size_t tag_len)
 {
     if (memcmp(p, payload_prefix, PAYLOAD_PREFIX_LEN) &&
@@ -217,7 +220,7 @@ static void *load_kernel(void *p, size_t size)
 
 #define MAX_CHOSEN_VARS 16
 /* Passed after every other line to a chainloaded stage when a config line was lost */
-#define CONFIG_LOST_VAR "m1n1.config-lost=1"
+#define CONFIG_LOST_VAR "aura.config-lost=1"
 
 /* The two extra slots carry CONFIG_LOST_VAR and nvme.sart without reducing the chosen limit. */
 #ifdef CHAINLOADING
@@ -234,7 +237,7 @@ static bool enable_tso = false;
 
 /*
  * A config line that cannot be kept or read: a chosen. line past the end of chosen[]; a line of a
- * variable m1n1 knows that has no newline or a name or value too long (the scan stops there), or
+ * variable aura knows that has no newline or a name or value too long (the scan stops there), or
  * that a line without '=' took into its name; or a stop at unknown data after the kernel or a
  * config line, before config that may follow. A chainloading stage 1 that lost one says so with
  * CONFIG_LOST_VAR. The value the config set before the lost line still stands, an owner's
@@ -246,14 +249,16 @@ static bool config_seen = false;
 static bool config_lost_passed = false;
 
 static const char *const config_names[] = {
-    "chosen.", "chainload=",        "boot=", "nvme.sart=", "display=", "mitigations=",
-    "tso=",    "m1n1.config-lost=", "hib=",
+    "chosen.", "chainload=",        "boot=", "nvme.sart=",        "display=", "mitigations=",
+    "tso=",    "aura.config-lost=", "hib=",  "m1n1.config-lost=", /* LEGACY-ASAHI(2027-02-28): what
+                                                                     a Stage 1 built before the
+                                                                     rename sends */
 #ifdef SPTM_VIRT_ESP
     "macos=",
 #endif
 };
 
-/* The start of a line of a variable m1n1 knows */
+/* The start of a line of a variable aura knows */
 static bool config_line(const char *s)
 {
     for (size_t i = 0; i < ARRAY_SIZE(config_names); i++)
@@ -262,7 +267,7 @@ static bool config_line(const char *s)
     return false;
 }
 
-/* check_var() cannot read this line: lost if it is one of m1n1's */
+/* check_var() cannot read this line: lost if it is one of aura's */
 static bool config_unreadable(u8 *p)
 {
     if (config_line((char *)p))
@@ -297,7 +302,8 @@ static bool check_var(u8 **p)
         } else {
             chosen[chosen_cnt++] = (char *)*p;
         }
-    } else if (IS_VAR("m1n1.config-lost=")) {
+    } else if (IS_VAR("aura.config-lost=") ||
+               IS_VAR("m1n1.config-lost=") /* LEGACY-ASAHI(2027-02-28) */) {
         /* Any value: an earlier stage lost a line, and nothing after it can take that back */
         config_lost = true;
     } else if (IS_VAR("chainload=")) {
@@ -390,7 +396,7 @@ static void *load_one_payload(void *start, size_t size)
     } else if (check_var(&p)) {
         return p;
     } else {
-        /* After the kernel or a config line, more config may follow (update-m1n1 puts it last) */
+        /* After the kernel or a config line, more config may follow (update-aura puts it last) */
         if (kernel || config_seen)
             config_lost = true;
         printf("Unknown payload at %p (magic: %02x%02x%02x%02x)\n", p, p[0], p[1], p[2], p[3]);

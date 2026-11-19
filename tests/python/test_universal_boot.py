@@ -35,7 +35,7 @@ int main(void) {
  unsigned chips[]={0x8103,0x6000,0x6001,0x6002,0x8112,0x6020,0x6021,0x6022,0x8122,0x6030,0x6031,0x6034,0x8140};
  for (unsigned i=0;i<sizeof(chips)/sizeof(*chips);i++) {
   chip_id=chips[i];stage1_config_applied=false;chainload_spec=NULL;chosen_cnt=0;
-  configured="12345678-abcd-1234-abcd-1234567890ab;m1n1/boot.bin";
+  configured="12345678-abcd-1234-abcd-1234567890ab;aurora/boot.bin";
   assert(apply()==0);assert(chainload_spec && !strcmp(chainload_spec,configured));
   assert(chosen_cnt==1 && strstr(chosen[0],stage1_config_esp_uuid()));
   assert(apply()==0 && chosen_cnt==1);

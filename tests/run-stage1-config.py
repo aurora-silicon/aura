@@ -18,7 +18,7 @@ with tempfile.TemporaryDirectory() as tmp:
     for name in ('crc32.c','tinf.h'):
         (tmp/'src/tinf'/name).write_bytes((root/'src/tinf'/name).read_bytes())
     blank = mod.MAGIC + (1).to_bytes(4, 'little') + bytes(mod.BLOCK_SIZE - 20) + b'STACKBOT'
-    fixture = mod.fill(blank, '01234567-89ab-cdef-0123-456789abcdef', 'm1n1/boot.bin', 15000)
+    fixture = mod.fill(blank, '01234567-89ab-cdef-0123-456789abcdef', 'aurora/boot.bin', 15000)
     (tmp/'config').write_bytes(fixture[:mod.BLOCK_SIZE])
     for target in ('../boot.bin', '/boot.bin', 'x//y', 'x;y', 'x\\y'):
         try: mod.fill(blank, '01234567-89ab-cdef-0123-456789abcdef', target, 15000)

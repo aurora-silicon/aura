@@ -5,8 +5,9 @@
 #
 #   install_esp.sh [--esp <mountpoint>] --partuuid <uuid> [--dry-run] <staging dir>
 #
-# It only ever writes aurora/macos/* and m1n1/stage2-macos.bin. It never touches
-# m1n1/hv_boot.bin (the Linux Stage 2), aurora-linux/, the Linux kernels, the boot loader, the aura-try marker or NVRAM, so how
+# It only ever writes aurora/macos/* and aurora/stage2-macos.bin (and refreshes the legacy
+# m1n1/stage2-macos.bin when one is already there, see below). It never touches
+# the Linux Stage 2, aurora-linux/, the Linux kernels, the boot loader, the aura-try marker or NVRAM, so how
 # Linux boots does not change. Safe to rerun: a file already correct is skipped, a new one goes
 # to a temporary name, is checked, and only then replaces the old one. Selecting this mode is a
 # separate step (arm_trial.sh).
@@ -30,7 +31,10 @@ done
 [ $# -eq 1 ] || { echo "usage: $0 [--esp <mountpoint>] --partuuid <uuid> [--dry-run] <staging dir>" >&2; exit 2; }
 SRC=$1
 BUNDLE=aurora/macos
-STAGE2=m1n1/stage2-macos.bin
+STAGE2=aurora/stage2-macos.bin
+# LEGACY-ASAHI(2027-02-28): a Stage 1 enrolled before the rename may chainload this path; when
+# the file exists it gets the same image so that Stage 1 keeps loading the current one.
+LEGACY_STAGE2=m1n1/stage2-macos.bin
 
 die() { echo "install_esp: $*" >&2; exit 1; }
 [ -n "$PARTUUID" ] || die "--partuuid is required"
@@ -48,7 +52,7 @@ fi
 while read -r want name; do
     [ -n "$name" ] || continue
     case "$name" in
-        ../../m1n1/stage2-macos.bin) f=$SRC/$STAGE2 ;;
+        ../stage2-macos.bin) f=$SRC/$STAGE2 ;;
         */*|..*) die "unexpected name in SHA256SUMS: $name" ;;
         *) f=$SRC/$BUNDLE/$name ;;
     esac
@@ -132,6 +136,9 @@ for f in "$SRC/$BUNDLE"/*; do
 done
 copy_one "$SRC/$BUNDLE/manifest.txt" "$ESP/$BUNDLE/manifest.txt"
 copy_one "$SRC/$STAGE2" "$ESP/$STAGE2"
+if [ -f "$ESP/$LEGACY_STAGE2" ]; then
+    copy_one "$SRC/$STAGE2" "$ESP/$LEGACY_STAGE2"
+fi
 
 if [ "$DRY" = 0 ]; then
     sync
@@ -139,7 +146,7 @@ if [ "$DRY" = 0 ]; then
     while read -r want name; do
         [ -n "$name" ] || continue
         case "$name" in
-            ../../m1n1/stage2-macos.bin) f=$ESP/$STAGE2 ;;
+            ../stage2-macos.bin) f=$ESP/$STAGE2 ;;
             *) f=$ESP/$BUNDLE/$name ;;
         esac
         [ "$(sha "$f")" = "$want" ] || die "$f fails its SHA-256 on the ESP"

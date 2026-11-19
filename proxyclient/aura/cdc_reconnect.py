@@ -111,6 +111,7 @@ def _artifact_regions(artifact_dir, ranges):
 
 
 # aura images carry "##aura_ver##"; images of the bootloader aura replaced carry the legacy tag.
+# LEGACY-ASAHI(2027-02-28): images built before the rename carry "##m1n1_ver##"
 VERSION_MARKERS = (b"##aura_ver##", b"##m1n1_ver##")
 
 

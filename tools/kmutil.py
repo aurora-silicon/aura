@@ -32,7 +32,7 @@ begin-base64 644 aura.bin
 SCRIPT_TRAILER = b'''====
 EOF_AURA
 
-# TODO: ensure this is booted into 1TR and check boot policy, see step2.sh from asahi-installer
+# TODO: ensure this is booted into 1TR and check boot policy, see step2.sh from aurora-installer
 
 echo
 echo "Set aura.bin as custom boot object for \"${system_dir}\"?"
