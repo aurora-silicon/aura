@@ -735,6 +735,32 @@ static bool s2r_j613_traffic_enabled(void)
     return chip_id == T8122 && (sptm_virt_s2r_crumbs & S2R_J613_TRAFFIC);
 }
 
+/* J613 SMC's ASC mailbox and SRAM, from the t8122 device tree. Learn the shared
+ * buffer PA from the guest's existing mailbox receive, without reading the FIFO again. */
+static void s2r_j613_smc_trace(u64 addr, u64 val, bool write, int width)
+{
+    static u64 shmem;
+    if (width != 3)
+        return;
+    if (!write && addr == 0x2ec408830 && val >= 0x2ede00000 && val <= 0x2edeffffc &&
+        !(val & 3)) {
+        shmem = val;
+        s2r_retained_marker("SMCSHM", val);
+    }
+    if (!write || addr != 0x2ec408800 || (val & 0xff) != 0x11)
+        return;
+    u32 key = val >> 32;
+    unsigned size = (val >> 16) & 0xff;
+    if ((key == 0x574b5450 && size == 1) ||
+        ((key == 0x706d5643 || key == 0x4d425345) && size == 4)) {
+        u64 payload = shmem ? s2r_snapshot_read(shmem, false) : ~0UL;
+        if (size == 1 && payload != ~0UL)
+            payload &= 0xff;
+        s2r_retained_marker("SMCWR", val);
+        s2r_retained_marker("SMCDATA", payload);
+    }
+}
+
 static void s2r_j613_snapshot_record(const char *tag, u64 addr, u64 value)
 {
     struct s2r_rec *r = s2r_record_marker(tag, value);
@@ -1299,6 +1325,8 @@ static bool s2r_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int w
         s2r_crumb(0x30);
     if (!shadow_timer)
         sptm_virt_s2r_note(ctx, addr, *val, write, width);
+    if (s2r_j613_traffic_enabled() && (addr & ~0x3fffUL) == 0x2ec408000)
+        s2r_j613_smc_trace(addr, *val, write, width);
     /* host: AURA_S2R_PROBE_AT, a guest write after a wake that, once performed, triggers the
      * AURA_S2R_PROBE reads (once per wake): where in macOS's own sequence a block becomes
      * readable. */
