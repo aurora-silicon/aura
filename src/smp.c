@@ -433,8 +433,8 @@ static bool smp_point_rvbar_here(void)
         if (rvbar & RVBAR_LOCK) {
             if (smp_rvbar_reaches_here(rvbar & RVBAR_ADDR_UNLOCKED))
                 continue;
-            snprintf(smp_s2r_why_buf, sizeof(smp_s2r_why_buf),
-                     "CPU %d RVBAR is locked at 0x%lx", i, rvbar & RVBAR_ADDR_UNLOCKED);
+            snprintf(smp_s2r_why_buf, sizeof(smp_s2r_why_buf), "CPU %d RVBAR is locked at 0x%lx", i,
+                     rvbar & RVBAR_ADDR_UNLOCKED);
             printf("SMP: %s\n", smp_s2r_why_buf);
             return false;
         }
