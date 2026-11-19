@@ -577,9 +577,17 @@ static int pcie_init_controller(int controller, const char *path, bool ans_off)
             u64 ctrl = state->phy_base[phy] + APCIE_PHY_CTRL;
             set32(ctrl, state->pcie_regs->phy_ctrl_reset);
             clear32(ctrl, APCIE_PHY_CTRL_CLK1REQ);
-            poll32(ctrl, APCIE_PHY_CTRL_CLK1ACK, 0, 50000);
+            if (poll32(ctrl, APCIE_PHY_CTRL_CLK1ACK, 0, 50000)) {
+                printf("pcie: Timeout dropping PHY %d CLK1 (0x%x); not powering ANS off\n", phy,
+                       read32(ctrl));
+                return -1;
+            }
             clear32(ctrl, APCIE_PHY_CTRL_CLK0REQ);
-            poll32(ctrl, APCIE_PHY_CTRL_CLK0ACK, 0, 50000);
+            if (poll32(ctrl, APCIE_PHY_CTRL_CLK0ACK, 0, 50000)) {
+                printf("pcie: Timeout dropping PHY %d CLK0 (0x%x); not powering ANS off\n", phy,
+                       read32(ctrl));
+                return -1;
+            }
             /* PHY control keeps its value through the power cycle: take the PHY down whole. */
             clear32(ctrl, pcie_phy_up(state));
             clear32(state->phy_base[phy] + 4, 0x10);
