@@ -47,7 +47,7 @@ def build_host(tmp, unknown_profile=False):
         astart = code.index(f"static const struct dcp6_fw {fws}[] = {{")
         aend = code.index("\n};", astart)
         table = re.sub(r"\{V\w+, ", "{V_UNKNOWN, ", code[astart:aend])
-        assert table.count("{V_UNKNOWN, ") >= 2
+        assert table.count("{V_UNKNOWN, ") >= 1
         code = code[:astart] + table + code[aend:]
     (src / "kboot_display_handoff.c").write_text(code)
     shutil.copy(ROOT / "tests/t6041_display_host.c", src)

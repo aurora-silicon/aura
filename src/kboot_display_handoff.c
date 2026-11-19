@@ -227,7 +227,7 @@ static const char *const dcp6_nubs_t6030[] = {"dcp", "dcpext0", "dcpext1"};
 
 /*
  * One OS firmware the handoff accepts for a SoC. A profile that serves more than one macOS firmware
- * (e.g. the legacy 14.7 image and the 27.2 image for FW272) lists one of these per accepted build.
+ * (e.g. the legacy 14.7 image and the 27.2 image) lists one of these per accepted build.
  * Each build pins its own DCP image UUID: iBoot leaves a different image running per OS, so
  * matching is exact per build. A NULL uuid means the running ADT image is published instead
  * (any_uuid).
@@ -283,7 +283,7 @@ struct dcp_soc {
 
 static const char *const dcp_boards_t6030[] = {"apple,j516s", "apple,j514s", NULL};
 
-/* T6030 (M3 Pro J514s/J516s) DCP images by OS: the 14.7 native image and the 27.2 (FW272) image. */
+/* T6030 (M3 Pro J514s/J516s) DCP images by OS: the 14.7 native image and the 27.2 image. */
 static const struct dcp6_fw dcp6_fws_t6030[] = {
     {V14_7, "14.7", DCP6_UUID},
     {V27_2, "27.2", "94D7C96F-63F6-3D8A-B208-B3D8E2D3621E"},
@@ -326,7 +326,7 @@ static const char *const dcp_boards_t8122[] = {"apple,j613", "apple,j615", NULL}
 
 /*
  * T8122 (M3 MacBook Air J613/J615) DCP images by OS. The 14.7 native image stays pinned; 27.2
- * (FW272) generalises J613/J615 off the 25G83-only special profile below and onto this profile with
+ * generalises J613/J615 off the 25G83-only special profile below and onto this profile with
  * the 27.2 image UUID. The exact-UUID and segment validation are kept for both builds.
  */
 static const struct dcp6_fw dcp6_fws_t8122[] = {
@@ -399,7 +399,7 @@ static const char *const dcp_boards_t6031[] = {"apple,j514c", "apple,j516c", NUL
 
 /*
  * T6031 (M3 Max J514C/J516C) DCP images by OS. The 14.7 arm keeps the long-standing unpinned
- * behaviour (any_uuid: the running ADT image is published); 27.2 (FW272, T603x high-core) pins the
+ * behaviour (any_uuid: the running ADT image is published); 27.2 (T603x high-core) pins the
  * exact 27.2 image UUID, the same exact-UUID whitelist the other refmac SoCs use.
  */
 static const struct dcp6_fw dcp6_fws_t6031[] = {
@@ -443,13 +443,12 @@ static const struct dcp_soc dcp_soc_t6031 = {
 static const char *const dcp_boards_t6041[] = {"apple,j616s", "apple,j614s", NULL};
 
 /*
- * T6041 (M4 Pro/Max) accepts the 26.6.2 desktop image and the 27.2 (FW272) image. Both arms stay
- * unpinned (any_uuid): the kernel's board record decides the image, and aura publishes the running
- * ADT uuid. Every other topology, DART, segment and mailbox check is unchanged between builds.
+ * T6041 (M4 Pro/Max) accepts the 26.6.2 desktop image, unpinned (any_uuid): the kernel's board
+ * record decides the image, and aura publishes the running ADT uuid. 27.2 also changes the display
+ * clock nodes and needs a pinned image, so it is admitted together with that work, not here.
  */
 static const struct dcp6_fw dcp6_fws_t6041[] = {
     {V26_6_2, "26.6.2", NULL},
-    {V27_2, "27.2", NULL},
 };
 
 static const struct dcp_soc dcp_soc_t6041 = {

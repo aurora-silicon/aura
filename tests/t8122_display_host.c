@@ -418,7 +418,7 @@ static u32 ttbr_of(u64 l1)
 
 #define TB         0x10000000000ULL
 static bool fw25;
-static bool fw27; /* FW272: the generalised T8122 profile admitting the 27.2 image */
+static bool fw27; /* the generalised T8122 profile admitting the 27.2 image */
 #define J613_UUID                                                                                  \
     (fw25   ? "C042E95C-B9D8-3F0E-94B3-582A08AA6FDD"                                                \
      : fw27 ? "93FA4B31-BB97-3B2A-8673-49EA489EE9C1"                                                \
@@ -1068,7 +1068,7 @@ int main(int argc, char **argv)
             fdt_delprop(dt, fdt_path_offset(dt, "dcp"), "apple,j613-25g83-profile");
     }
     if (fw27) {
-        /* FW272: a 27.2 boot of the generalised T8122 profile. iBoot leaves the 27.2 image
+        /* a 27.2 boot of the generalised T8122 profile. iBoot leaves the 27.2 image
          * running (J613_UUID above) and dt_set_dcp_firmware() has published <27 2 0>. */
         os_firmware =
             (struct fw_version_info){V27_2, "27.2", {27, 2, 0}, 3, "mBoot-20457.41.3"};

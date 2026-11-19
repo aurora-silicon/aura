@@ -268,11 +268,7 @@ int isp_init(void)
                     selected_top = 0x1800000;
                     break;
                 case V13_5:
-                    selected_top = 0x1000000;
-                    break;
-                case V27_2:
-                    /* 27.2 ISP stays in the H9/H13 legacy lineage; its segment end
-                     * fits below the 13.5 ceiling. See FW272 t-6638. */
+                case V27_2: /* legacy layout; segment end fits the 13.5 ceiling */
                     selected_top = 0x1000000;
                     break;
                 default:
@@ -287,8 +283,6 @@ int isp_init(void)
                     break;
                 case V13_5:
                 case V13_6_1:
-                    selected_top = 0xf00000;
-                    break;
                 case V27_2:
                     selected_top = 0xf00000;
                     break;
@@ -301,8 +295,6 @@ int isp_init(void)
             switch (os_firmware.version) {
                 case V13_5:
                 case V13_6_1:
-                    selected_top = 0xf00000;
-                    break;
                 case V27_2:
                     selected_top = 0xf00000;
                     break;
@@ -315,6 +307,7 @@ int isp_init(void)
         case ISP_VER_T8122:
             switch (os_firmware.version) {
                 case V14_7:
+                case V27_2: /* T8122 and T603x alike; fits the 14.7 ceiling */
                     selected_top = 0x1000000;
                     break;
                 case V26_6_2:
@@ -323,11 +316,6 @@ int isp_init(void)
                         reason = "unsupported firmware";
                         goto out;
                     }
-                    selected_top = 0x1000000;
-                    break;
-                case V27_2:
-                    /* 27.2 admits T8122 and the T6030/T603x H15 ISP alike; the
-                     * measured segment end fits the 14.7/26.6.2 ceiling. */
                     selected_top = 0x1000000;
                     break;
                 default:
