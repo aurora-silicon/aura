@@ -26,10 +26,10 @@ if [ "$DISARM" = 1 ]; then
     echo "marker removed: the next boot takes the configured Stage 2"
     exit 0
 fi
-[ -f "$ESP/m1n1/stage2-macos.bin" ] && [ -f "$ESP/aurora/macos/manifest.txt" ] || {
+[ -f "$ESP/aurora/stage2-macos.bin" ] && [ -f "$ESP/aurora/macos/manifest.txt" ] || {
     echo "no macOS bundle on $ESP: run install_esp.sh first" >&2
     exit 1
 }
-printf 'armed\nm1n1/stage2-macos.bin\n' > "$ESP/aura-try"
+printf 'armed\naurora/stage2-macos.bin\n' > "$ESP/aura-try"
 sync
 echo "armed: the next boot, and only that one, starts macOS under aura"

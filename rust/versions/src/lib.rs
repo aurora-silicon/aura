@@ -95,7 +95,7 @@ static AGX_VERSIONS: VersionConfig = VersionConfig {
     enums: &[
         // G15: Apple M3 family (AGX ID gen 7, e.g. t6030 "g15s").
         &["G13", "G14", "G14X", "G15"],
-        // V14_8_3: the 14.8.3 GPU firmware ABI; mirrors the drm/asahi
+        // V14_8_3: the 14.8.3 GPU firmware ABI; mirrors the drm/aurora
         // versions proc-macro.
         &[
             "V12_3", "V12_4", "V13_0B4", "V13_2", "V13_3", "V13_5", "V14_8_3",

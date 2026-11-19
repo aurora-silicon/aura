@@ -85,7 +85,7 @@ class GPUFrame:
     def load(self, filename):
         with zipfile.ZipFile(filename, "r") as zf:
             with zf.open("cmdbuf.json", "r") as fd:
-                self.cmdbuf = drm_asahi_cmdbuf_t.from_json(fd)
+                self.cmdbuf = drm_aurora_cmdbuf_t.from_json(fd)
             with zf.open("objects.json", "r") as fd:
                 obj_info = json.load(fd)
 
@@ -839,9 +839,9 @@ class GPURenderer:
             cache_lines = align_up(i.size, 128) // 128
             order = 1 # FIXME
             start_3d.attachments.append(Attachment(i.pointer, cache_lines, 0x17, order)) # FIXME check
-            if work.fb is None and i.type == ASAHI_ATTACHMENT_C:
+            if work.fb is None and i.type == AURORA_ATTACHMENT_C:
                 work.fb = i.pointer
-            if work.depth is None and i.type == ASAHI_ATTACHMENT_Z:
+            if work.depth is None and i.type == AURORA_ATTACHMENT_Z:
                 work.depth = i.pointer
         start_3d.attachments += [Attachment(0, 0, 0, 0)] * (16 - len(start_3d.attachments))
         start_3d.num_attachments = cmdbuf.attachment_count

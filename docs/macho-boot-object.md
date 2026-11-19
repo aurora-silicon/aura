@@ -201,8 +201,9 @@ bootloader handoff that overlaps the window fails `kboot_prepare_dt()`.
 ### Which Stage 2 a Stage 1 loads
 
 A Stage 2 from this tree can only run under a padded Stage 1, so on Mach-O chips a
-padded Stage 1 is filled with `m1n1/boot-ctxr.bin` and an older one keeps
-`m1n1/boot.bin`, which package updates stop touching there. An old Stage 1 then
+padded Stage 1 is filled with `aurora/boot-ctxr.bin` and an older one keeps
+`aurora/boot.bin` (installations enrolled before the rename use the same names under the
+legacy `m1n1/` directory), which package updates stop touching there. An old Stage 1 then
 can't load a Stage 2 that would refuse to boot. The installer fills the path with
 the same `tools/fill_stage1_config.py` format. Aura doesn't name either path: a
 Stage 1 reads its target from its configuration block, whose path field is 192
@@ -241,7 +242,7 @@ These worked under the monitor, or were reachable through it, except power-off:
 - **PSCI `SYSTEM_RESET`.** Restart now needs `macsmc-reboot` or the Apple watchdog.
   The monitor answered `SYSTEM_OFF` with a reset as well, so power-off never worked
   through it, and now needs `macsmc-reboot`. The J700 tree describes both, but
-  `macsmc-reboot` is a module in the asahi config, so a kernel that hasn't loaded it
+  `macsmc-reboot` is a module in the aurora config, so a kernel that hasn't loaded it
   can only restart through the watchdog and can't power off.
 - **kexec and kdump.** aurora-silicon/linux#985 refuses both with `EOPNOTSUPP` while
   a window is active, because the relocation code runs outside it.

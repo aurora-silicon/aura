@@ -191,7 +191,7 @@ int main(int argc, char **argv)
     char stage1[64] = "";
     int chosen = fdt_path_offset(dt, "/chosen"), slen;
     const char *s1 =
-        chosen >= 0 ? fdt_getprop(dt, chosen, "asahi,m1n1-stage1-version", &slen) : NULL;
+        chosen >= 0 ? fdt_getprop(dt, chosen, "aurora,aura-stage1-version", &slen) : NULL;
     if (s1)
         snprintf(stage1, sizeof(stage1), "%s", s1);
 

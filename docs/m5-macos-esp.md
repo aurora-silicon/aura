@@ -28,7 +28,7 @@ PARTUUID explicitly with `--esp-partuuid`; there is no machine-specific default.
 The tool writes a staging directory, leaving the disk untouched:
 
 ```text
-m1n1/stage2-macos.bin       aura + macos=<PARTUUID>;aurora/macos;<manifest SHA-256>
+aurora/stage2-macos.bin     aura + macos=<PARTUUID>;aurora/macos;<manifest SHA-256>
 aurora/macos/manifest.txt   sizes, hashes, segments, patches, hidden nodes, S2R settings
 aurora/macos/              stock SPTM, TXM, kernelcache, trustcache and exclave files
 ```

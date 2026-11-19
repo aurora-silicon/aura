@@ -157,7 +157,7 @@ static const struct g15_soc g15_soc_t8122_standin = {
     .name = "T8122",
     .gpu_name = "G15G",
     .compatible = "apple,agx-t8122",
-    .optin = "asahi,t8122-gpu",
+    .optin = "aurora,t8122-gpu",
     .id_gen = 7,
     .id_variant = 2,
     .dies = 1,
@@ -200,9 +200,9 @@ static void make_dt(char *dt, const char *intent, bool with_opps, bool preexisti
     int chosen = fdt_add_subnode(dt, 0, "chosen");
     assert(chosen >= 0);
     if (intent)
-        assert(!fdt_setprop_string(dt, chosen, "asahi,t8122-gpu", intent));
+        assert(!fdt_setprop_string(dt, chosen, "aurora,t8122-gpu", intent));
     if (preexisting_identity) {
-        int node = fdt_add_subnode(dt, chosen, "asahi,t8122-gpu-powered-identity");
+        int node = fdt_add_subnode(dt, chosen, "aurora,t8122-gpu-powered-identity");
         assert(node >= 0);
         assert(!fdt_setprop_u32(dt, node, "schema-version", 1));
     }
@@ -233,7 +233,7 @@ static void make_dt(char *dt, const char *intent, bool with_opps, bool preexisti
 
 static u32 identity_prop(void *dt, const char *name)
 {
-    int node = fdt_path_offset(dt, "/chosen/asahi,t8122-gpu-powered-identity");
+    int node = fdt_path_offset(dt, "/chosen/aurora,t8122-gpu-powered-identity");
     assert(node >= 0);
     int len;
     const fdt32_t *v = fdt_getprop(dt, node, name, &len);
@@ -243,7 +243,7 @@ static u32 identity_prop(void *dt, const char *name)
 
 static void expect_rollback(char *dt, char *before, int size)
 {
-    assert(fdt_path_offset(dt, "/chosen/asahi,t8122-gpu-powered-identity") < 0 ||
+    assert(fdt_path_offset(dt, "/chosen/aurora,t8122-gpu-powered-identity") < 0 ||
            identity_prop(dt, "probe-result") != T8122_ID_PASS);
     assert(!memcmp(dt, before, size));
 }
@@ -280,7 +280,7 @@ int main(void)
         assert(t8122_fdt_transaction(dt, calibrate_txn, NULL));
         assert(late_failure_seen);
         expect_rollback(dt, before, size);
-        assert(fdt_path_offset(dt, "/chosen/asahi,t8122-gpu-powered-identity") ==
+        assert(fdt_path_offset(dt, "/chosen/aurora,t8122-gpu-powered-identity") ==
                -FDT_ERR_NOTFOUND);
         int gpu = fdt_path_offset(dt, "gpu");
         assert(gpu >= 0);

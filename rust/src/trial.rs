@@ -114,13 +114,18 @@ mod tests {
         }
     }
 
-    const MARKER_FILE: &[u8] = b"armed\nm1n1/boot-try.bin\n";
+    const MARKER_FILE: &[u8] = b"armed\naurora/boot-try.bin\n";
 
     #[test]
     fn armed_marker_names_a_path() {
-        assert_eq!(armed_path(MARKER_FILE), Some("m1n1/boot-try.bin"));
+        assert_eq!(armed_path(MARKER_FILE), Some("aurora/boot-try.bin"));
+        // LEGACY-ASAHI(2027-02-28): a marker armed by tools from before the rename still loads
+        assert_eq!(
+            armed_path(b"armed\nm1n1/boot-try.bin\n"),
+            Some("m1n1/boot-try.bin")
+        );
         assert_eq!(armed_path(b"armed\nx\ntrailing"), Some("x"));
-        assert_eq!(armed_path(b"spent\nm1n1/boot-try.bin\n"), None);
+        assert_eq!(armed_path(b"spent\naurora/boot-try.bin\n"), None);
         assert_eq!(armed_path(b"armed\nno-newline"), None);
         assert_eq!(armed_path(b"armed"), None);
         assert_eq!(armed_path(b"armed\n\xff\n"), None);
@@ -131,7 +136,7 @@ mod tests {
         let mut disk = Disk::new(MARKER_FILE);
         assert!(spend(&mut disk, 2, MARKER_FILE));
         assert_eq!(disk.writes, [2]);
-        assert!(disk.blocks[2].starts_with(b"spent\nm1n1/boot-try.bin\n"));
+        assert!(disk.blocks[2].starts_with(b"spent\naurora/boot-try.bin\n"));
         assert!(disk.blocks[2][MARKER_FILE.len()..]
             .iter()
             .all(|&b| b == 0x5a));

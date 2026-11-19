@@ -208,7 +208,7 @@ static void ic_ivau_range(void *p, size_t n) { (void)p; (void)n; }
 #undef _base
 
 static char *vars[] = {
-    "chosen.asahi,efi-system-partition=befb6483-aac4-4ea1-8bc3-7e1f675e5429",
+    "chosen.aurora,efi-system-partition=befb6483-aac4-4ea1-8bc3-7e1f675e5429",
     "nvme.adopt=live-rtkit-v1",
 };
 #define NVARS (sizeof(vars) / sizeof(vars[0]))
@@ -277,12 +277,17 @@ static u8 *make_image(size_t size, u64 magic, u32 version, u32 flags, u64 footpr
     return image;
 }
 
-static u64 image_size_for(size_t size)
+static size_t var_bytes(void)
 {
-    u64 n = size + 4;
+    size_t n = 0;
     for (size_t i = 0; i < NVARS; i++)
         n += strlen(vars[i]) + 1;
-    return ALIGN_UP(n, SZ_16K);
+    return n;
+}
+
+static u64 image_size_for(size_t size)
+{
+    return ALIGN_UP(size + 4 + var_bytes(), SZ_16K);
 }
 
 static u64 run_base_field(u64 image)
@@ -674,7 +679,7 @@ int main(void)
     big_image_runs_from_stage1_base(11426016);
     big_image_runs_from_stage1_base(11413326);
     /* The largest image whose copy still ends below the RO range is unchanged ... */
-    size_t largest = RO_OFF - HOME_OFF - 4 - 96;
+    size_t largest = RO_OFF - HOME_OFF - 4 - var_bytes();
     fitting_image_is_unchanged(largest, true);
     /* ... and one byte more is staged for a run base */
     big_image_runs_from_stage1_base(largest + 1);

@@ -156,7 +156,7 @@ struct t8122_powered_identity { int result; };
 struct fw_version_info { int unused; };
 static const struct fw_version_info *g15_t6031_fw;
 static struct t8122_powered_identity g15_t6031_id;
-static const struct { const char *optin; } g15_soc_t6031 = {"asahi,t6031-gpu"};
+static const struct { const char *optin; } g15_soc_t6031 = {"aurora,t6031-gpu"};
 static int board = 1, reads, probes, setups, disabled;
 static bool t6031_board(void *dt) { return board; }
 static void g15_disable(void *dt) { disabled++; }
@@ -175,14 +175,14 @@ int main(void)
     assert(!reads && !probes && !setups && disabled == 1);
     const char *refused[] = {"0", "", "true", "01", "1x"};
     for (unsigned i = 0; i < sizeof(refused) / sizeof(refused[0]); i++) {
-        assert(!fdt_setprop_string(dt, chosen, "asahi,t6031-gpu", refused[i]));
+        assert(!fdt_setprop_string(dt, chosen, "aurora,t6031-gpu", refused[i]));
         assert(!dt_set_gpu_t6031(dt));
         assert(!reads && !probes && !setups);
     }
     char malformed[] = {'1'};
-    assert(!fdt_setprop(dt, chosen, "asahi,t6031-gpu", malformed, sizeof(malformed)));
+    assert(!fdt_setprop(dt, chosen, "aurora,t6031-gpu", malformed, sizeof(malformed)));
     assert(!dt_set_gpu_t6031(dt) && !reads && !probes);
-    assert(!fdt_setprop_string(dt, chosen, "asahi,t6031-gpu", "1"));
+    assert(!fdt_setprop_string(dt, chosen, "aurora,t6031-gpu", "1"));
     assert(!dt_set_gpu_t6031(dt));
     assert(reads == 1 && probes == 1 && setups == 1);
     board = 0;

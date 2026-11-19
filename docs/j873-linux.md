@@ -30,7 +30,7 @@ procedure. The controller starts Linux with one CPU and the validated low clock
 settings. Secondary CPUs are parked by Aura with their MMUs and caches disabled.
 
 For the G18 graphics smoke, use Mesa `aurora-wip`. The GPU driver additionally
-requests these locally obtained firmware inputs under `/lib/firmware/asahi/`:
+requests these locally obtained firmware inputs under `/lib/firmware/aurora/`:
 
 - `g18-26a428-color-a-v2.bin`
 - `g18-26a428-color-b-v2.bin`

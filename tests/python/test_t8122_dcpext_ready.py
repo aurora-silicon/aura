@@ -142,9 +142,9 @@ static void world(void)
     node = fdt_add_subnode(dt, 0, "aliases");
     assert(node >= 0 && !fdt_setprop_string(dt, node, "dcpext", "/soc/dcpext"));
     assert(!fdt_setprop_string(dt, node, "dcp", "/soc/dcp"));
-    /* Armed: chosen.asahi,t8122-dcpext=1 and the internal display handoff. */
+    /* Armed: chosen.aurora,t8122-dcpext=1 and the internal display handoff. */
     node = fdt_add_subnode(dt, 0, "chosen");
-    assert(node >= 0 && !fdt_setprop_string(dt, node, "asahi,t8122-dcpext", "1"));
+    assert(node >= 0 && !fdt_setprop_string(dt, node, "aurora,t8122-dcpext", "1"));
 }
 static bool ready(void)
 {
@@ -202,16 +202,16 @@ int main(void)
     assert(!dt_reserve_dcpext_firmware(false) && !ready());
     still_disabled();
     /* The reservation is opt-in. */
-    world(); assert(!fdt_delprop(dt, fdt_path_offset(dt, "/chosen"), "asahi,t8122-dcpext"));
+    world(); assert(!fdt_delprop(dt, fdt_path_offset(dt, "/chosen"), "aurora,t8122-dcpext"));
     unarmed();
     const char *values[] = {"0", "", "11", "yes"};
     for (unsigned i = 0; i < ARRAY_SIZE(values); i++) {
         world();
-        assert(!fdt_setprop_string(dt, fdt_path_offset(dt, "/chosen"), "asahi,t8122-dcpext",
+        assert(!fdt_setprop_string(dt, fdt_path_offset(dt, "/chosen"), "aurora,t8122-dcpext",
                                    values[i]));
         unarmed();
     }
-    world(); assert(!fdt_setprop(dt, fdt_path_offset(dt, "/chosen"), "asahi,t8122-dcpext", "1", 1));
+    world(); assert(!fdt_setprop(dt, fdt_path_offset(dt, "/chosen"), "aurora,t8122-dcpext", "1", 1));
     unarmed(); /* "1" without its NUL */
     world(); assert(!fdt_del_node(dt, fdt_path_offset(dt, "/chosen")));
     unarmed();

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-"""A config line m1n1 loses must not leave an earlier graphics value armed on the M3 default boards.
+"""A config line aura loses must not leave an earlier graphics value armed on the M3 default boards.
 
 The whole payload_run() runs on the host, with the real payload scan and loaders (gzip through
 tinf, device tree ranking, the kernel loader), kboot_set_chosen(), dt_set_m3_defaults() and the
@@ -8,7 +8,7 @@ reads them after its boot.bin as on a Mac. On a T6031 the real dt_set_gpu_t6031(
 t6031_board() run after the defaults. Only hardware is a stub: CPU start, mitigations, NVMe, the
 device tree handoff to the kernel and the GPU setups, image read and identity probe behind the
 selectors. When an
-update-m1n1 is available (M1N1_TEST_UPDATE_M1N1, or one on PATH), boot.bin comes from running it,
+update-aura is available (AURA_TEST_UPDATE_AURA, or one on PATH), boot.bin comes from running it,
 with only its two fixed system paths moved into the test directory.
 """
 import gzip
@@ -24,7 +24,7 @@ ROOT = Path(__file__).resolve().parents[2]
 SRC = ROOT / "src"
 MAX_CHOSEN_VARS = 16
 
-M1N1 = b"M" * 64                           # the stage 2 image itself; its payload follows it
+AURA = b"M" * 64                           # the stage 2 image itself; its payload follows it
 UBOOT = (bytes(16) + (0x10000).to_bytes(8, "little") + bytes(32) + b"ARM\x64" + bytes(4)
          + bytes(4096 - 64))               # an arm64 Image header, image_size 64 KiB
 BOARDS = {
@@ -40,20 +40,20 @@ BOARDS = {
 }
 CHIP = {"j613": "8122", "j615": "8122", "j514s": "6030", "j516s": "6030", "j516c": "6031",
         "j514c": "6031", "j514m": "6034", "j516m": "6034", "j293": "8103"}
-FAMILY = {"j613": ("asahi,t8122-", "asahi,j613-", "asahi,j615-"),
-          "j615": ("asahi,t8122-", "asahi,j613-", "asahi,j615-"),
-          "j514s": ("asahi,t6030-",),
-          "j516s": ("asahi,t6030-",),
-          "j516c": ("asahi,t6031-",)}
-M3_LINES = ("asahi,t8122-", "asahi,t6030-", "asahi,t6031-")
-MAX_GPU = "asahi,t6031-gpu"
-MAX_DCP = "asahi,t6031-dcp"
+FAMILY = {"j613": ("aurora,t8122-", "aurora,j613-", "aurora,j615-"),
+          "j615": ("aurora,t8122-", "aurora,j613-", "aurora,j615-"),
+          "j514s": ("aurora,t6030-",),
+          "j516s": ("aurora,t6030-",),
+          "j516c": ("aurora,t6031-",)}
+M3_LINES = ("aurora,t8122-", "aurora,t6030-", "aurora,t6031-")
+MAX_GPU = "aurora,t6031-gpu"
+MAX_DCP = "aurora,t6031-dcp"
 MAX = {MAX_DCP: "1", MAX_GPU: "1"}      # the J516C defaults
-AIR = ("asahi,t8122-dcp", "asahi,t8122-gpu", "asahi,t8122-gpu-power-standin",
-       "asahi,t8122-gpu-fuse-leakage")
-GPU_ON = b"chosen.asahi,t8122-gpu=1\n"
-GPU_OFF = b"chosen.asahi,t8122-gpu=0\n"
-LOST = b"m1n1.config-lost=1\n"
+AIR = ("aurora,t8122-dcp", "aurora,t8122-gpu", "aurora,t8122-gpu-power-standin",
+       "aurora,t8122-gpu-fuse-leakage")
+GPU_ON = b"chosen.aurora,t8122-gpu=1\n"
+GPU_OFF = b"chosen.aurora,t8122-gpu=0\n"
+LOST = b"aura.config-lost=1\n"
 STAGE2 = ["plain", "stage2"]               # stage2: CHAINLOADING + ESP_STAGE2, as packaged
 
 
@@ -150,9 +150,9 @@ void kboot_delete_chosen(const char *name);
 /* kboot_gpu.c: the T8122 selector and the T6031 entry, with the GPU setups, the T6031 image read
    and the T6031 identity probe recorded instead of run */
 struct g15_soc { const char *optin; };
-static const struct g15_soc g15_soc_t8122 = {"asahi,t8122-gpu"};
-static const struct g15_soc g15_soc_t8122_standin = {"asahi,t8122-gpu"};
-static const struct g15_soc g15_soc_t6031 = {"asahi,t6031-gpu"};
+static const struct g15_soc g15_soc_t8122 = {"aurora,t8122-gpu"};
+static const struct g15_soc g15_soc_t8122_standin = {"aurora,t8122-gpu"};
+static const struct g15_soc g15_soc_t6031 = {"aurora,t6031-gpu"};
 static const char *selected = "none";
 static void t8122_leak_fuse_export(void *d) {}
 static int dt_set_gpu_t8122(void *d) { selected = "reservation-only"; return 0; }
@@ -245,13 +245,13 @@ static int mitigations_perform(void) { return 0; }
 static bool smp_is_alive(int cpu) { return false; }
 static int smp_call_sync0(int cpu, void (*fn)(void)) { return 0; }
 static void do_enable_tso(void) {}
-/* Post-M4 ANS (M1N1_TEST_POST_M4): powered off by an earlier stage once nvme.sart= arrives */
+/* Post-M4 ANS (AURA_TEST_POST_M4): powered off by an earlier stage once nvme.sart= arrives */
 static bool nvme_sart_passed, nvme_started;
 static bool nvme_init(void)
 {
     printf("NVME init\n");
     nvme_started = true;
-    return !getenv("M1N1_TEST_NVME_INIT_FAIL");
+    return !getenv("AURA_TEST_NVME_INIT_FAIL");
 }
 static bool nvme_shutdown(void)
 {
@@ -265,7 +265,7 @@ static bool nvme_set_sart_var(const char *v)
 }
 static bool nvme_post_m4_passed_off(void)
 {
-    return getenv("M1N1_TEST_POST_M4") && nvme_sart_passed && !nvme_started;
+    return getenv("AURA_TEST_POST_M4") && nvme_sart_passed && !nvme_started;
 }
 static int display_configure(const char *s) { printf("DISPLAY %s\n", s); return 0; }
 static int display_configure_second(const char *s) { printf("DISPLAY2 %s\n", s); return 0; }
@@ -337,8 +337,8 @@ int main(int argc, char **argv)
     target_type = argv[4];
     forward_path = argv[5];
     calloc_fail_in = atoi(argv[6]);
-    stage1_target = getenv("M1N1_TEST_STAGE1_TARGET");
-    const char *chip = getenv("M1N1_TEST_CHIP");
+    stage1_target = getenv("AURA_TEST_STAGE1_TARGET");
+    const char *chip = getenv("AURA_TEST_CHIP");
     if (chip)
         chip_id = (int)strtol(chip, NULL, 16);
     int rc = payload_run();
@@ -409,21 +409,21 @@ def run(tools, build, image, board="j613", calloc_fail=-1, target=None):
     path.write_bytes(image)
     forwarded = out / "forwarded.txt"
     forwarded.write_bytes(b"")
-    env = {k: v for k, v in os.environ.items() if k != "M1N1_TEST_STAGE1_TARGET"}
-    env["M1N1_TEST_CHIP"] = CHIP[board]
+    env = {k: v for k, v in os.environ.items() if k != "AURA_TEST_STAGE1_TARGET"}
+    env["AURA_TEST_CHIP"] = CHIP[board]
     if target:
-        env["M1N1_TEST_STAGE1_TARGET"] = target
-    r = subprocess.run([str(binaries[build]), "run", str(path), str(len(M1N1)), BOARDS[board][0],
+        env["AURA_TEST_STAGE1_TARGET"] = target
+    r = subprocess.run([str(binaries[build]), "run", str(path), str(len(AURA)), BOARDS[board][0],
                         str(forwarded), str(calloc_fail)], env=env,
                        capture_output=True, text=True, errors="backslashreplace", check=True)
     return Run(r.stdout, forwarded.read_bytes())
 
 
 def boot_bin(tools, config, board="j613"):
-    """boot.bin laid out as update-m1n1 writes it: m1n1, device trees, gzipped U-Boot, config"""
+    """boot.bin laid out as update-aura writes it: aura, device trees, gzipped U-Boot, config"""
     _, _, dtbs = tools
     other = "j516s" if board != "j516s" else "j613"
-    return (M1N1 + dtbs[board].read_bytes() + dtbs[other].read_bytes() +
+    return (AURA + dtbs[board].read_bytes() + dtbs[other].read_bytes() +
             gzip.compress(UBOOT, mtime=0) + config)
 
 
@@ -433,11 +433,11 @@ def boot(tools, build, config, board="j613", trailer=b"", calloc_fail=-1):
 
 def stage1(tools, config, configured=False):
     """A chainloading stage 1 and its own config; returns what it hands to stage 2. A configured
-    one takes its target from stage1_config and adds chosen.asahi,efi-system-partition itself."""
+    one takes its target from stage1_config and adds chosen.aurora,efi-system-partition itself."""
     if configured:
-        r = run(tools, "stage1", M1N1 + config, target="ESP-UUID;m1n1/boot.bin")
+        r = run(tools, "stage1", AURA + config, target="ESP-UUID;aurora/boot.bin")
     else:
-        r = run(tools, "stage1", M1N1 + b"chainload=ESP-UUID;m1n1/boot.bin\n" + config)
+        r = run(tools, "stage1", AURA + b"chainload=ESP-UUID;aurora/boot.bin\n" + config)
     assert r.rc == 0 and r.chainloaded, r.stdout
     return r.forwarded
 
@@ -479,25 +479,25 @@ def test_no_config_gets_the_whole_air_recipe(tools, build):
 def test_the_pro_gets_its_two_defaults(tools, build, board):
     b = boot(tools, build, b"", board=board)
     booted(b)
-    assert {"asahi,t6030-dcp", "asahi,t6030-gpu"} <= b.armed
+    assert {"aurora,t6030-dcp", "aurora,t6030-gpu"} <= b.armed
 
 
 @pytest.mark.parametrize("config,armed", [
-    (b"chosen.asahi,t6030-gpu=0\n", {"asahi,t6030-dcp"}),
-    (b"chosen.asahi,t6030-dcp=0\n", {"asahi,t6030-gpu"}),
-    (b"chosen.asahi,t6030-gpu=1\nchosen.asahi,t6030-gpu=0\n", {"asahi,t6030-dcp"}),
-    (b"chosen.asahi,m3-defaults=0\n", set()),
-    (b"chosen.asahi,m3-defaults=0\nchosen.asahi,t6030-gpu=1\n", {"asahi,t6030-gpu"}),
+    (b"chosen.aurora,t6030-gpu=0\n", {"aurora,t6030-dcp"}),
+    (b"chosen.aurora,t6030-dcp=0\n", {"aurora,t6030-gpu"}),
+    (b"chosen.aurora,t6030-gpu=1\nchosen.aurora,t6030-gpu=0\n", {"aurora,t6030-dcp"}),
+    (b"chosen.aurora,m3-defaults=0\n", set()),
+    (b"chosen.aurora,m3-defaults=0\nchosen.aurora,t6030-gpu=1\n", {"aurora,t6030-gpu"}),
 ], ids=["gpu-off", "dcp-off", "gpu-on-then-off", "master-off", "master-off-gpu-on"])
 @pytest.mark.parametrize("build", STAGE2)
 def test_j514s_owner_lines_are_kept(tools, build, config, armed):
     b = boot(tools, build, config, board="j514s")
     booted(b)
-    assert b.armed & {"asahi,t6030-dcp", "asahi,t6030-gpu"} == armed
+    assert b.armed & {"aurora,t6030-dcp", "aurora,t6030-gpu"} == armed
 
 
 def t6031_lines(r):
-    return {k: v for k, v in r.chosen.items() if k.startswith("asahi,t6031-")}
+    return {k: v for k, v in r.chosen.items() if k.startswith("aurora,t6031-")}
 
 
 @pytest.mark.parametrize("build", STAGE2)
@@ -508,21 +508,21 @@ def test_the_j516c_gets_its_display_and_gpu_defaults_and_nothing_else(tools, bui
     b = boot(tools, build, b"", board="j516c")
     booted(b)
     assert t6031_lines(b) == MAX and {MAX_DCP, MAX_GPU} <= b.armed
-    assert not any(n.startswith(("asahi,t8122-", "asahi,t6030-")) for n in b.chosen)
+    assert not any(n.startswith(("aurora,t8122-", "aurora,t6030-")) for n in b.chosen)
     assert b.probes == ["t6031-image", "t6031-identity 0"] and b.select == "t6031-g15"
 
 
 @pytest.mark.parametrize("config,lines,select", [
-    (b"chosen.asahi,t6031-gpu=0\n", {MAX_DCP: "1", MAX_GPU: "0"}, "t6031-disabled"),
-    (b"chosen.asahi,t6031-gpu=1\nchosen.asahi,t6031-gpu=0\n", {MAX_DCP: "1", MAX_GPU: "0"},
+    (b"chosen.aurora,t6031-gpu=0\n", {MAX_DCP: "1", MAX_GPU: "0"}, "t6031-disabled"),
+    (b"chosen.aurora,t6031-gpu=1\nchosen.aurora,t6031-gpu=0\n", {MAX_DCP: "1", MAX_GPU: "0"},
      "t6031-disabled"),
-    (b"chosen.asahi,t6031-gpu=1\n", MAX, "t6031-g15"),
-    (b"chosen.asahi,m3-defaults=0\n", {}, "t6031-disabled"),
-    (b"chosen.asahi,m3-defaults=0\nchosen.asahi,t6031-gpu=1\n", {MAX_GPU: "1"}, "t6031-g15"),
-    (b"chosen.asahi,m3-defaults=0\nchosen.asahi,t6031-dcp=1\n", {MAX_DCP: "1"}, "t6031-disabled"),
-    (b"chosen.asahi,t6031-dcp=1\n", MAX, "t6031-g15"),
-    (b"chosen.asahi,t6031-dcp=0\n", {MAX_DCP: "0", MAX_GPU: "1"}, "t6031-g15"),
-    (b"chosen.asahi,t6031-dcp=0\nchosen.asahi,t6031-gpu=0\n", {MAX_DCP: "0", MAX_GPU: "0"},
+    (b"chosen.aurora,t6031-gpu=1\n", MAX, "t6031-g15"),
+    (b"chosen.aurora,m3-defaults=0\n", {}, "t6031-disabled"),
+    (b"chosen.aurora,m3-defaults=0\nchosen.aurora,t6031-gpu=1\n", {MAX_GPU: "1"}, "t6031-g15"),
+    (b"chosen.aurora,m3-defaults=0\nchosen.aurora,t6031-dcp=1\n", {MAX_DCP: "1"}, "t6031-disabled"),
+    (b"chosen.aurora,t6031-dcp=1\n", MAX, "t6031-g15"),
+    (b"chosen.aurora,t6031-dcp=0\n", {MAX_DCP: "0", MAX_GPU: "1"}, "t6031-g15"),
+    (b"chosen.aurora,t6031-dcp=0\nchosen.aurora,t6031-gpu=0\n", {MAX_DCP: "0", MAX_GPU: "0"},
      "t6031-disabled"),
 ], ids=["gpu-off", "gpu-on-then-off", "gpu-on", "master-off", "master-off-gpu-on",
         "master-off-dcp-on", "dcp-on", "dcp-off", "both-off"])
@@ -547,8 +547,8 @@ def test_other_maxes_and_macs_get_no_default(tools, build, board):
 
 
 @pytest.mark.parametrize("config,lines", [
-    (b"chosen.asahi,t6031-gpu=1\n", {MAX_GPU: "1"}),
-    (b"chosen.asahi,t6031-gpu=1\nchosen.asahi,t6031-dcp=1\n", MAX),
+    (b"chosen.aurora,t6031-gpu=1\n", {MAX_GPU: "1"}),
+    (b"chosen.aurora,t6031-gpu=1\nchosen.aurora,t6031-dcp=1\n", MAX),
 ], ids=["gpu", "gpu-dcp"])
 @pytest.mark.parametrize("build", STAGE2)
 def test_the_j514c_manual_line_works_as_before(tools, build, config, lines):
@@ -558,12 +558,12 @@ def test_the_j514c_manual_line_works_as_before(tools, build, config, lines):
 
 
 @pytest.mark.parametrize("config,armed,select", [
-    (GPU_OFF, set(AIR) - {"asahi,t8122-gpu"}, "reservation-only"),
+    (GPU_OFF, set(AIR) - {"aurora,t8122-gpu"}, "reservation-only"),
     (GPU_ON, set(AIR), "g15-standin"),
-    (GPU_ON + GPU_OFF, set(AIR) - {"asahi,t8122-gpu"}, "reservation-only"),
-    (b"chosen.asahi,t8122-dcp=0\n" + GPU_ON, {"asahi,t8122-gpu"}, "g15"),
-    (b"chosen.asahi,t8122-dcp=0\n", set(), "reservation-only"),
-    (b"chosen.asahi,m3-defaults=0\n", set(), "reservation-only"),
+    (GPU_ON + GPU_OFF, set(AIR) - {"aurora,t8122-gpu"}, "reservation-only"),
+    (b"chosen.aurora,t8122-dcp=0\n" + GPU_ON, {"aurora,t8122-gpu"}, "g15"),
+    (b"chosen.aurora,t8122-dcp=0\n", set(), "reservation-only"),
+    (b"chosen.aurora,m3-defaults=0\n", set(), "reservation-only"),
 ], ids=["gpu-off", "gpu-on", "gpu-on-then-off", "dcp-off-gpu-on", "dcp-off", "master-off"])
 @pytest.mark.parametrize("build", STAGE2)
 def test_owner_lines_are_kept(tools, build, config, armed, select):
@@ -576,7 +576,7 @@ def test_owner_lines_are_kept(tools, build, config, armed, select):
 def test_a_full_but_not_overflowing_chosen_buffer_is_no_loss(tools, build):
     b = boot(tools, build, GPU_ON + fill(build, keep=1))
     booted(b)
-    assert "asahi,t8122-gpu" in b.armed
+    assert "aurora,t8122-gpu" in b.armed
 
 
 @pytest.mark.parametrize("header", [b"\x30\x83\x01\x02\x00", b"\x30\x83\x3d\x0a\x12"],
@@ -585,16 +585,16 @@ def test_a_full_but_not_overflowing_chosen_buffer_is_no_loss(tools, build):
 def test_an_img4_end_is_no_loss(tools, build, header):
     b = boot(tools, build, GPU_ON, trailer=header + b"\x16\x04IMG4" + bytes(8))
     booted(b)
-    assert "asahi,t8122-gpu" in b.armed
+    assert "aurora,t8122-gpu" in b.armed
 
 
 @pytest.mark.parametrize("config", [b"foo=bar\n", b"junk\nfoo=bar\n"],
                          ids=["unknown-variable", "line-without-equals-before-unknown"])
 @pytest.mark.parametrize("build", STAGE2)
-def test_lines_m1n1_does_not_know_are_no_loss(tools, build, config):
+def test_lines_aura_does_not_know_are_no_loss(tools, build, config):
     b = boot(tools, build, GPU_ON + config)
     booted(b)
-    assert "asahi,t8122-gpu" in b.armed
+    assert "aurora,t8122-gpu" in b.armed
 
 
 @pytest.mark.parametrize("build", STAGE2)
@@ -608,8 +608,8 @@ def test_literal_display_zero_is_the_framebuffer_setting(tools, build):
 
 LOSSES = {
     "gpu-on-fillers-lost-gpu-off": lambda build: GPU_ON + fill(build, keep=1) + GPU_OFF,
-    "missing-newline": lambda build: GPU_ON + b"chosen.asahi,t8122-gpu=0",
-    "overlong-value": lambda build: GPU_ON + b"chosen.asahi,t8122-gpu=0" + b"x" * 1025 + b"\n",
+    "missing-newline": lambda build: GPU_ON + b"chosen.aurora,t8122-gpu=0",
+    "overlong-value": lambda build: GPU_ON + b"chosen.aurora,t8122-gpu=0" + b"x" * 1025 + b"\n",
     "overlong-name": lambda build: GPU_ON + b"chosen." + b"n" * 70 + b"=0\n",
     "overlong-earlier-line": lambda build: GPU_ON + b"display=" + b"x" * 1100 + b"\n" + GPU_OFF,
     "swallowed-line": lambda build: GPU_ON + b"junk\n" + GPU_OFF,
@@ -627,25 +627,25 @@ def test_a_lost_line_keeps_air_graphics_off_and_boots(tools, build, loss):
 
 @pytest.mark.parametrize("build", STAGE2)
 def test_a_lost_line_keeps_pro_graphics_off_and_boots(tools, build):
-    config = (b"chosen.asahi,t6030-gpu=1\nchosen.asahi,t6030-dcpext=1\n" +
-              fill(build, keep=2) + b"chosen.asahi,t6030-gpu=0\n")
+    config = (b"chosen.aurora,t6030-gpu=1\nchosen.aurora,t6030-dcpext=1\n" +
+              fill(build, keep=2) + b"chosen.aurora,t6030-gpu=0\n")
     graphics_off(boot(tools, build, config, board="j516s"), board="j516s")
 
 
 @pytest.mark.parametrize("loss", sorted(LOSSES))
 @pytest.mark.parametrize("build", STAGE2)
 def test_a_lost_line_keeps_max_graphics_off_and_boots(tools, build, loss):
-    config = LOSSES[loss](build).replace(b"asahi,t8122-gpu", b"asahi,t6031-gpu")
+    config = LOSSES[loss](build).replace(b"aurora,t8122-gpu", b"aurora,t6031-gpu")
     graphics_off(boot(tools, build, config, board="j516c"), board="j516c")
 
 
 @pytest.mark.parametrize("build", STAGE2)
 def test_a_lost_line_drops_the_owners_max_lines_and_keeps_the_rest(tools, build):
-    config = (b"chosen.asahi,t6031-gpu=1\nchosen.asahi,t6031-dcp=1\nchosen.asahi,m3-defaults=0\n"
-              + fill(build, keep=3) + b"chosen.asahi,t6031-gpu=0\n")
+    config = (b"chosen.aurora,t6031-gpu=1\nchosen.aurora,t6031-dcp=1\nchosen.aurora,m3-defaults=0\n"
+              + fill(build, keep=3) + b"chosen.aurora,t6031-gpu=0\n")
     b = boot(tools, build, config, board="j516c")
     graphics_off(b, board="j516c")
-    assert b.chosen["asahi,m3-defaults"] == "0" and b.chosen["test,filler"] == "1"
+    assert b.chosen["aurora,m3-defaults"] == "0" and b.chosen["test,filler"] == "1"
 
 
 @pytest.mark.parametrize("build", STAGE2)
@@ -663,8 +663,8 @@ def test_a_kboot_table_too_small_for_the_config(tools, build):
     graphics_off(boot(tools, build, b"tso=1\n" + GPU_ON + lines))
 
 
-@pytest.mark.parametrize("board,line", [("j514c", b"chosen.asahi,t6031-gpu="),
-                                        ("j516m", b"chosen.asahi,t6031-gpu="),
+@pytest.mark.parametrize("board,line", [("j514c", b"chosen.aurora,t6031-gpu="),
+                                        ("j516m", b"chosen.aurora,t6031-gpu="),
                                         ("j293", b"chosen.test,switch=")])
 @pytest.mark.parametrize("build", STAGE2)
 def test_other_boards_keep_their_lines_after_a_loss(tools, build, board, line):
@@ -682,36 +682,46 @@ def test_stage_1_hands_its_loss_on_after_every_owner_line(tools):
     lines = forwarded.splitlines(keepends=True)
     assert lines[-1] == LOST and lines.count(LOST) == 1
     assert len(lines) == MAX_CHOSEN_VARS + 1           # all of chosen[], then the loss
-    b = boot(tools, "stage2", GPU_ON + b"chosen.asahi,m3-defaults=1\n", trailer=forwarded)
+    b = boot(tools, "stage2", GPU_ON + b"chosen.aurora,m3-defaults=1\n", trailer=forwarded)
     graphics_off(b)
 
 
 def test_stage_1_loss_keeps_max_graphics_off(tools):
-    forwarded = stage1(tools, fill("stage1") + b"chosen.asahi,t6031-gpu=0\n")
+    forwarded = stage1(tools, fill("stage1") + b"chosen.aurora,t6031-gpu=0\n")
     assert forwarded.endswith(LOST)
-    graphics_off(boot(tools, "stage2", b"chosen.asahi,t6031-gpu=1\n", board="j516c",
+    graphics_off(boot(tools, "stage2", b"chosen.aurora,t6031-gpu=1\n", board="j516c",
                       trailer=forwarded), board="j516c")
 
 
 def test_a_clean_stage_1_leaves_the_j516c_default(tools):
-    forwarded = stage1(tools, b"chosen.asahi,efi-system-partition=X\n")
+    forwarded = stage1(tools, b"chosen.aurora,efi-system-partition=X\n")
     b = boot(tools, "stage2", b"", board="j516c", trailer=forwarded)
     booted(b)
     assert t6031_lines(b) == MAX and b.select == "t6031-g15"
 
 
 def test_stage_1_loss_survives_a_stage_2_owner_marker_line(tools):
-    forwarded = stage1(tools, b"chosen.asahi,t8122-gpu=0" + b"x" * 1025 + b"\n")
+    forwarded = stage1(tools, b"chosen.aurora,t8122-gpu=0" + b"x" * 1025 + b"\n")
     assert forwarded.endswith(LOST)
-    graphics_off(boot(tools, "stage2", GPU_ON + b"m1n1.config-lost=0\n", trailer=forwarded))
+    graphics_off(boot(tools, "stage2", GPU_ON + b"aura.config-lost=0\n", trailer=forwarded))
+
+
+def test_legacy_config_names_still_count(tools):
+    """LEGACY-ASAHI(2027-02-28): an owner's pre-rename chosen.asahi,X line and an older Stage 1's
+    m1n1.config-lost= line mean what they meant before."""
+    b = boot(tools, "stage2", b"chosen.asahi,t8122-gpu=0\nchosen.asahi,m1n1-stage1-version=old\n")
+    booted(b)
+    assert b.chosen.get("aurora,t8122-gpu") == "0" and "asahi,t8122-gpu" not in b.chosen
+    assert b.chosen.get("aurora,aura-stage1-version") == "old" and b.select == "reservation-only"
+    graphics_off(boot(tools, "stage2", GPU_ON + b"m1n1.config-lost=1\n"))
 
 
 def test_a_clean_stage_1_hands_over_its_lines_only(tools):
-    forwarded = stage1(tools, b"chosen.asahi,efi-system-partition=X\n")
+    forwarded = stage1(tools, b"chosen.aurora,efi-system-partition=X\n")
     assert b"config-lost" not in forwarded
     b = boot(tools, "stage2", GPU_ON, trailer=forwarded)
     booted(b)
-    assert "asahi,t8122-gpu" in b.armed and b.chosen["asahi,efi-system-partition"] == "X"
+    assert "aurora,t8122-gpu" in b.armed and b.chosen["aurora,efi-system-partition"] == "X"
 
 
 def test_stage_2_overflowing_with_stage_1_lines_keeps_graphics_off(tools):
@@ -724,17 +734,17 @@ def test_stage_2_overflowing_with_stage_1_lines_keeps_graphics_off(tools):
 def test_a_configured_stage_1_hands_on_a_loss_within_its_capacity(tools):
     forwarded = stage1(tools, GPU_ON + b"junk\n" + GPU_OFF, configured=True)
     lines = forwarded.splitlines(keepends=True)
-    assert lines[-2:] == [b"chosen.asahi,efi-system-partition=ESP-UUID\n", LOST]
+    assert lines[-2:] == [b"chosen.aurora,efi-system-partition=ESP-UUID\n", LOST]
     graphics_off(boot(tools, "stage2", GPU_ON, trailer=forwarded))
 
 
 def test_a_configured_stage_1_with_a_full_chosen_buffer_still_refuses_as_before(tools):
     """Not new: a configured stage 1 has always refused once chosen[] leaves no room for its
     efi-system-partition line, before #18 too. No loss marker is claimed through this path."""
-    r = run(tools, "stage1", M1N1 + GPU_ON + fill("stage1", keep=1) + GPU_OFF,
-            target="ESP-UUID;m1n1/boot.bin")
+    r = run(tools, "stage1", AURA + GPU_ON + fill("stage1", keep=1) + GPU_OFF,
+            target="ESP-UUID;aurora/boot.bin")
     assert r.rc == -1 and not r.chainloaded and r.forwarded == b""
-    r = run(tools, "stage1", M1N1 + fill("stage1"), target="ESP-UUID;m1n1/boot.bin")
+    r = run(tools, "stage1", AURA + fill("stage1"), target="ESP-UUID;aurora/boot.bin")
     assert r.rc == -1 and not r.chainloaded
 
 
@@ -742,15 +752,15 @@ def test_a_configured_stage_1_with_a_full_chosen_buffer_still_refuses_as_before(
 def test_fourteen_owner_lines_overflow_stage_2_after_a_configured_stage_1(tools, board):
     """Stage 2 keeps its own tag, then 14 owner lines, then stage 1's tag and ESP line: the last
     one does not fit. The M3 default boards drop graphics and boot; other Macs boot as before."""
-    gpu = {"j613": b"chosen.asahi,t8122-gpu=1\n", "j516s": b"chosen.asahi,t6030-gpu=1\n",
-           "j516c": b"chosen.asahi,t6031-gpu=1\n", "j293": b"chosen.test,switch=1\n"}[board]
+    gpu = {"j613": b"chosen.aurora,t8122-gpu=1\n", "j516s": b"chosen.aurora,t6030-gpu=1\n",
+           "j516c": b"chosen.aurora,t6031-gpu=1\n", "j293": b"chosen.test,switch=1\n"}[board]
     owner = gpu + b"".join(b"chosen.test,owner-%d=1\n" % i for i in range(13))
     forwarded = stage1(tools, b"", configured=True)
     assert forwarded.count(b"\n") == 2 and b"config-lost" not in forwarded
     b = boot(tools, "stage2", owner, board=board, trailer=forwarded)
     if board == "j293":
         booted(b)
-        assert b.chosen["test,switch"] == "1" and "asahi,efi-system-partition" not in b.chosen
+        assert b.chosen["test,switch"] == "1" and "aurora,efi-system-partition" not in b.chosen
     else:
         graphics_off(b, board)
 
@@ -782,14 +792,14 @@ def boot_object_tail():
 def test_a_mach_o_stage_1_hands_over_a_complete_config_as_complete(tools):
     forwarded = stage1(tools, boot_object_tail(), configured=True)
     assert forwarded.splitlines(keepends=True)[1:] == [
-        b"chosen.asahi,efi-system-partition=ESP-UUID\n"]
+        b"chosen.aurora,efi-system-partition=ESP-UUID\n"]
     b = boot(tools, "stage2", b"", trailer=forwarded)
     booted(b)
     assert set(AIR) <= b.armed and b.select == "g15-standin"
 
 
 def page_of_lines(config):
-    """config, then lines m1n1 does not know, up to the end of a 16 KiB page"""
+    """config, then lines aura does not know, up to the end of a 16 KiB page"""
     pad = -len(config) % 0x4000
     if pad and pad < 11:                     # the shortest line, "test.pad=x\n"
         pad += 0x4000
@@ -808,61 +818,61 @@ def test_a_mach_o_stage_1_reads_its_own_lines_up_to_the_plist(tools, config, los
     lines = page_of_lines(config)
     assert len(lines) % 0x4000 == 0
     forwarded = stage1(tools, lines + boot_object_tail(), configured=True)
-    assert forwarded.startswith(b"chosen.asahi,m1n1-stage1-version=host-test\n" + GPU_ON)
+    assert forwarded.startswith(b"chosen.aurora,aura-stage1-version=host-test\n" + GPU_ON)
     assert forwarded.count(LOST) == lost and forwarded.endswith(LOST) == lost
     b = boot(tools, "stage2", b"", trailer=forwarded)
     if lost:
         graphics_off(b)
     else:
         booted(b)
-        assert b.chosen["asahi,t8122-gpu"] == "0" and b.select == "reservation-only"
+        assert b.chosen["aurora,t8122-gpu"] == "0" and b.select == "reservation-only"
 
 
-# ---- from /etc/m1n1.conf through update-m1n1 ----
+# ---- from /etc/aura.conf through update-aura ----
 
 def updater():
-    path = os.environ.get("M1N1_TEST_UPDATE_M1N1") or shutil.which("update-m1n1")
+    path = os.environ.get("AURA_TEST_UPDATE_AURA") or shutil.which("update-aura")
     if not path or not Path(path).is_file():
-        pytest.skip("no update-m1n1 (set M1N1_TEST_UPDATE_M1N1 to asahi-scripts' update-m1n1)")
+        pytest.skip("no update-aura (set AURA_TEST_UPDATE_AURA to aurora-scripts' update-aura)")
     return Path(path)
 
 
 def run_updater(tools, conf, board="j613", fix_last_line=False):
-    """update-m1n1 itself; only /etc/default/update-m1n1 and /run/m1n1.conf move into the test"""
+    """update-aura itself; only /etc/default/update-aura and /run/aura.conf move into the test"""
     out, _, dtbs = tools
     script = updater()
     work = out / "updater"
     shutil.rmtree(work, ignore_errors=True)
     work.mkdir()
     text = script.read_text()
-    for fixed in ("/etc/default/update-m1n1", "/run/m1n1.conf"):
+    for fixed in ("/etc/default/update-aura", "/run/aura.conf"):
         assert fixed in text
         text = text.replace(fixed, str(work / fixed.strip("/").replace("/", "_")))
     if fix_last_line:
         assert text.count("    while read line; do\n") == 1
         text = text.replace("    while read line; do\n", '    while read line || [ -n "$line" ]; do\n')
-    (work / "update-m1n1").write_text(text)
+    (work / "update-aura").write_text(text)
     functions = script.parent / "functions.sh"
-    shutil.copy(functions if functions.exists() else "/usr/share/asahi-scripts/functions.sh",
+    shutil.copy(functions if functions.exists() else "/usr/share/aurora-scripts/functions.sh",
                 work / "functions.sh")
-    (work / "m1n1.bin").write_bytes(M1N1)
+    (work / "aura.bin").write_bytes(AURA)
     (work / "u-boot.bin").write_bytes(UBOOT)
-    (work / "m1n1.conf").write_bytes(conf)
+    (work / "aura.conf").write_bytes(conf)
     other = "j516s" if board != "j516s" else "j613"
-    env = {"PATH": os.environ["PATH"], "M1N1": str(work / "m1n1.bin"),
-           "U_BOOT": str(work / "u-boot.bin"), "CONFIG": str(work / "m1n1.conf"),
+    env = {"PATH": os.environ["PATH"], "AURA": str(work / "aura.bin"),
+           "U_BOOT": str(work / "u-boot.bin"), "CONFIG": str(work / "aura.conf"),
            "DTBS": f"{dtbs[board]} {dtbs[other]}"}
-    subprocess.run(["sh", str(work / "update-m1n1"), str(work / "boot.bin")], env=env,
+    subprocess.run(["sh", str(work / "update-aura"), str(work / "boot.bin")], env=env,
                    capture_output=True, check=True)
     return (work / "boot.bin").read_bytes()
 
 
 def test_updater_gpu_on_then_off_keeps_the_gpu_off(tools):
-    image = run_updater(tools, b"chosen.asahi,t8122-gpu=1\n# a comment\nchosen.asahi,t8122-gpu=0\n")
-    forwarded = stage1(tools, b"chosen.asahi,efi-system-partition=X\n")
+    image = run_updater(tools, b"chosen.aurora,t8122-gpu=1\n# a comment\nchosen.aurora,t8122-gpu=0\n")
+    forwarded = stage1(tools, b"chosen.aurora,efi-system-partition=X\n")
     b = run(tools, "stage2", image + forwarded)
     booted(b)
-    assert b.chosen["asahi,t8122-gpu"] == "0" and b.select == "reservation-only"
+    assert b.chosen["aurora,t8122-gpu"] == "0" and b.select == "reservation-only"
 
 
 def test_updater_many_owner_lines_overflow_stage_2_and_keep_graphics_off(tools):
@@ -875,10 +885,10 @@ def test_updater_many_owner_lines_overflow_stage_2_and_keep_graphics_off(tools):
 
 
 def test_updater_empty_config_hands_the_j516c_display_and_gpu_over_on_the_boot_that_loads_it(tools):
-    """No /etc/m1n1.conf line and no second boot: the boot.bin update-m1n1 writes carries the
+    """No /etc/aura.conf line and no second boot: the boot.bin update-aura writes carries the
     defaults itself"""
     image = run_updater(tools, b"", board="j516c")
-    forwarded = stage1(tools, b"chosen.asahi,efi-system-partition=X\n")
+    forwarded = stage1(tools, b"chosen.aurora,efi-system-partition=X\n")
     b = run(tools, "stage2", image + forwarded, board="j516c")
     booted(b)
     assert t6031_lines(b) == MAX and {MAX_DCP, MAX_GPU} <= b.armed and b.select == "t6031-g15"
@@ -887,8 +897,8 @@ def test_updater_empty_config_hands_the_j516c_display_and_gpu_over_on_the_boot_t
 def test_updater_j516c_gpu_zero_keeps_the_handoff_off(tools):
     """An existing GPU =0 (as an earlier installer wrote it) stays the owner's: the GPU stays off,
     and only the display default is added"""
-    image = run_updater(tools, b"chosen.asahi,t6031-gpu=0\n", board="j516c")
-    forwarded = stage1(tools, b"chosen.asahi,efi-system-partition=X\n")
+    image = run_updater(tools, b"chosen.aurora,t6031-gpu=0\n", board="j516c")
+    forwarded = stage1(tools, b"chosen.aurora,efi-system-partition=X\n")
     b = run(tools, "stage2", image + forwarded, board="j516c")
     booted(b)
     assert t6031_lines(b) == {MAX_DCP: "1", MAX_GPU: "0"} and MAX_GPU not in b.armed
@@ -896,8 +906,8 @@ def test_updater_j516c_gpu_zero_keeps_the_handoff_off(tools):
 
 
 def test_updater_j516c_dcp_zero_keeps_the_display_handoff_off(tools):
-    image = run_updater(tools, b"chosen.asahi,t6031-dcp=0\n", board="j516c")
-    forwarded = stage1(tools, b"chosen.asahi,efi-system-partition=X\n")
+    image = run_updater(tools, b"chosen.aurora,t6031-dcp=0\n", board="j516c")
+    forwarded = stage1(tools, b"chosen.aurora,efi-system-partition=X\n")
     b = run(tools, "stage2", image + forwarded, board="j516c")
     booted(b)
     assert t6031_lines(b) == {MAX_DCP: "0", MAX_GPU: "1"} and MAX_DCP not in b.armed
@@ -905,27 +915,27 @@ def test_updater_j516c_dcp_zero_keeps_the_display_handoff_off(tools):
 
 
 def test_updater_j514s_gpu_zero_keeps_the_handoff_off(tools):
-    image = run_updater(tools, b"chosen.asahi,t6030-gpu=0\n", board="j514s")
-    forwarded = stage1(tools, b"chosen.asahi,efi-system-partition=X\n")
+    image = run_updater(tools, b"chosen.aurora,t6030-gpu=0\n", board="j514s")
+    forwarded = stage1(tools, b"chosen.aurora,efi-system-partition=X\n")
     b = run(tools, "stage2", image + forwarded, board="j514s")
     booted(b)
-    assert b.chosen["asahi,t6030-gpu"] == "0" and "asahi,t6030-dcp" in b.armed
+    assert b.chosen["aurora,t6030-gpu"] == "0" and "aurora,t6030-dcp" in b.armed
 
 
-@pytest.mark.xfail(strict=True, reason="upstream update-m1n1's `while read line` drops a last "
-                   "line without its newline before m1n1 sees it")
-def test_updater_last_line_without_newline_reaches_m1n1(tools):
-    image = run_updater(tools, GPU_ON + b"chosen.asahi,t8122-gpu=0")
+@pytest.mark.xfail(strict=True, reason="upstream update-aura's `while read line` drops a last "
+                   "line without its newline before aura sees it")
+def test_updater_last_line_without_newline_reaches_aura(tools):
+    image = run_updater(tools, GPU_ON + b"chosen.aurora,t8122-gpu=0")
     assert image.endswith(GPU_OFF)
 
 
 def test_updater_read_loop_fix_keeps_a_last_line_without_newline(tools):
-    image = run_updater(tools, GPU_ON + b"chosen.asahi,t8122-gpu=0", fix_last_line=True)
+    image = run_updater(tools, GPU_ON + b"chosen.aurora,t8122-gpu=0", fix_last_line=True)
     assert image.endswith(GPU_OFF)
-    forwarded = stage1(tools, b"chosen.asahi,efi-system-partition=X\n")
+    forwarded = stage1(tools, b"chosen.aurora,efi-system-partition=X\n")
     b = run(tools, "stage2", image + forwarded)
     booted(b)
-    assert b.chosen["asahi,t8122-gpu"] == "0"
+    assert b.chosen["aurora,t8122-gpu"] == "0"
 
 
 # ---- hib=: a line of stage 2's own asks kboot for the fixed hibernation layout ----
@@ -966,7 +976,7 @@ def nvme_events(r):
 
 @pytest.mark.parametrize("build", STAGE2)
 def test_post_m4_ans_passed_off_is_started_for_the_payload(tools, build, monkeypatch):
-    monkeypatch.setenv("M1N1_TEST_POST_M4", "1")
+    monkeypatch.setenv("AURA_TEST_POST_M4", "1")
     b = boot(tools, build, b"", trailer=SART)
     booted(b)
     assert nvme_events(b) == ["init", "handoff keep=1"], b.stdout
@@ -974,8 +984,8 @@ def test_post_m4_ans_passed_off_is_started_for_the_payload(tools, build, monkeyp
 
 @pytest.mark.parametrize("build", STAGE2)
 def test_post_m4_ans_start_failure_stops_the_handoff(tools, build, monkeypatch):
-    monkeypatch.setenv("M1N1_TEST_POST_M4", "1")
-    monkeypatch.setenv("M1N1_TEST_NVME_INIT_FAIL", "1")
+    monkeypatch.setenv("AURA_TEST_POST_M4", "1")
+    monkeypatch.setenv("AURA_TEST_NVME_INIT_FAIL", "1")
     b = boot(tools, build, b"", trailer=SART)
     assert b.rc == -1 and not b.booted, b.stdout
     assert nvme_events(b)[0] == "init" and "handoff keep=1" not in nvme_events(b)
@@ -983,7 +993,7 @@ def test_post_m4_ans_start_failure_stops_the_handoff(tools, build, monkeypatch):
 
 @pytest.mark.parametrize("build", STAGE2)
 def test_ans_left_as_found_without_sart_entries(tools, build, monkeypatch):
-    monkeypatch.setenv("M1N1_TEST_POST_M4", "1")
+    monkeypatch.setenv("AURA_TEST_POST_M4", "1")
     b = boot(tools, build, b"")
     booted(b)
     assert nvme_events(b) == ["shutdown keep=0", "handoff keep=0"], b.stdout

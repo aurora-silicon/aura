@@ -35,8 +35,8 @@ def test_fill_takes_the_padded_stage1_path():
     generic = bytearray(module.MAGIC + bytes(module.BLOCK_SIZE - len(module.MAGIC)) + b"STACKBOT")
     struct.pack_into("<I", generic, len(module.MAGIC), 1)
     image = module.fill(bytes(generic), "12345678-abcd-1234-abcd-1234567890ab",
-                        "m1n1/boot-ctxr.bin", 0)
-    assert image.count(b";m1n1/boot-ctxr.bin\0") == 1
+                        "aurora/boot-ctxr.bin", 0)
+    assert image.count(b";aurora/boot-ctxr.bin\0") == 1
 
 
 @pytest.mark.parametrize("uuid,path", [
@@ -81,7 +81,7 @@ int main(void)
     assert(valid_path(path));
     strcpy(path, ";aurora/stage2.bin");
     assert(valid_path(path));
-    strcpy(path, ";m1n1/boot-ctxr.bin");
+    strcpy(path, ";aurora/boot-ctxr.bin");
     assert(valid_path(path));
     strcpy(path, ";;aurora/stage2.bin");
     assert(!valid_path(path));
@@ -114,7 +114,7 @@ def test_rust_fat_parser_uses_same_path_grammar(tmp_path):
     harness = helper + r'''
 fn main() {
     assert!(valid_fat_path("aurora/stage2.bin"));
-    assert!(valid_fat_path("m1n1/boot-ctxr.bin"));
+    assert!(valid_fat_path("aurora/boot-ctxr.bin"));
     for path in ["aurora/a\0b", "aurora/a\x1fb", "aurora//b",
                  "aurora/./b", "aurora/../b"] {
         assert!(!valid_fat_path(path), "accepted {path:?}");

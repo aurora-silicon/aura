@@ -140,7 +140,7 @@ set none.
 
 On the J713, iBoot starts both external display coprocessors, dcpext0 and
 dcpext1, and leaves them quiesced with their DARTs set up. A kernel that drives
-external displays adopts them as they are. With `chosen.asahi,j713-dcpext=1`
+external displays adopts them as they are. With `chosen.aurora,j713-dcpext=1`
 in the aura configuration, kboot hands each one over: it reserves its firmware
 memory (the OS log segment by physical address, as for the internal DCP),
 publishes the firmware UUID and marks the node

@@ -47,15 +47,15 @@ Repository links for these source revisions are
 * J514S native publication requires its matched DT's `apple,j514s-native-piodma`.
   The panel and each external-controller transaction are atomic. The optional
   native path is not exercised by a J516S boot using the legacy handoff.
-* T6031 GPU probing requires the exact chosen string `asahi,t6031-gpu=1`.
+* T6031 GPU probing requires the exact chosen string `aurora,t6031-gpu=1`.
   On a J516C, `dt_set_m3_defaults()` sets it unless a config line set it.
-  `chosen.asahi,t6031-gpu=0` keeps the handoff off. `chosen.asahi,m3-defaults=0`
+  `chosen.aurora,t6031-gpu=0` keeps the handoff off. `chosen.aurora,m3-defaults=0`
   prevents the default and keeps the owner's explicit lines as written, an
-  owner's `asahi,t6031-gpu=1` included. After a lost config line no T6031 line
+  owner's `aurora,t6031-gpu=1` included. After a lost config line no T6031 line
   is passed on, the owner's `=1` included. A J514C still needs the line. This
   does not qualify stand-in power data or widen the kernel's board gate.
 * The T6031 display handoff requires the exact chosen string
-  `asahi,t6031-dcp=1`. On a J516C, `dt_set_m3_defaults()` sets it unless a
+  `aurora,t6031-dcp=1`. On a J516C, `dt_set_m3_defaults()` sets it unless a
   config line set it, beside the GPU default, with the same `=0`,
   `m3-defaults=0` and lost-line rules. Each switch stands alone: `t6031-gpu=0`
   keeps the GPU off and still gets the display default, and `t6031-dcp=0` the

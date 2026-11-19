@@ -155,7 +155,7 @@ def test_t6041_scenario(host, scenario):
 
 def test_publish_without_chosen_property(host):
     out = run(host, "publish").stdout
-    assert "ok   no /chosen/asahi,t6041-dcp in the device tree handed to aura" in out
+    assert "ok   no /chosen/aurora,t6041-dcp in the device tree handed to aura" in out
     assert "handoff published" in out
     assert "not armed" not in out
 
@@ -171,14 +171,14 @@ def test_t6041_record_has_no_optin():
     start = source.index("static const struct dcp_soc dcp_soc_t6041 = {")
     record = source[start:source.index("\n};", start)]
     assert ".optin" not in record
-    assert 'optin_name = "asahi,t6041-dcp"' not in source
-    assert "asahi,t6041-dcp" not in (ROOT / "src/kboot.c").read_text()
+    assert 'optin_name = "aurora,t6041-dcp"' not in source
+    assert "aurora,t6041-dcp" not in (ROOT / "src/kboot.c").read_text()
 
 
 def test_other_socs_keep_their_optin():
     source = (ROOT / "src/kboot_display_handoff.c").read_text()
-    for soc, optin in (("t6030", "asahi,t6030-dcp"), ("t8122", "asahi,t8122-dcp"),
-                       ("j613_25g83", "asahi,t8122-dcp"), ("t6031", "asahi,t6031-dcp")):
+    for soc, optin in (("t6030", "aurora,t6030-dcp"), ("t8122", "aurora,t8122-dcp"),
+                       ("j613_25g83", "aurora,t8122-dcp"), ("t6031", "aurora,t6031-dcp")):
         start = source.index(f"static const struct dcp_soc dcp_soc_{soc} = {{")
         record = source[start:source.index("\n};", start)]
         assert f'.optin = "{optin}",' in record, soc

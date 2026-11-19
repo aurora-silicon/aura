@@ -8,7 +8,7 @@
 
 #include "libfdt/libfdt.h"
 
-#define FW_UUIDS_PROP "asahi,t6031-fw-uuids"
+#define FW_UUIDS_PROP "aurora,t6031-fw-uuids"
 #define UUID_LEN      36
 
 bool t6031_board(const void *dt)
@@ -98,7 +98,7 @@ void dt_t6031_fw_uuids(void *dt)
                (int)ARRAY_SIZE(fw_nubs));
 }
 
-#define FACTS_NODE     "asahi,t6031-facts"
+#define FACTS_NODE     "aurora,t6031-facts"
 #define FACTS_CLOCKS   4   /* disp0 clock ids kept */
 #define FACTS_MCC_REGS 16  /* /arm-io/mcc reg entries kept */
 #define CLOCK_ID_BASE  256 /* clock ids from 256 index /arm-io clock-frequencies */

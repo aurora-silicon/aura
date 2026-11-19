@@ -25,6 +25,7 @@
 #include "kboot_audio.h"
 #include "kboot_display_facts.h"
 #include "kboot_gpu_t8122.h"
+#include "kboot_legacy.h"
 #include "kboot_mte.h"
 #include "kboot_pmp_t8122.h"
 #include "kboot_t6031.h"
@@ -158,7 +159,7 @@ void get_notchless_fb(u64 *fb_base, u64 *fb_height)
 }
 
 /*
- * chosen.asahi,show-notch=1 (aura config): the OS drives the full panel, notch rows
+ * chosen.aurora,show-notch=1 (aura config): the OS drives the full panel, notch rows
  * included (appledrm.show_notch=1). Keep iBoot's full framebuffer then, so
  * the boot framebuffer covers the same rows as the display driver later does and early
  * users (fbcon, Plymouth) do not shift by the notch height at the handoff.
@@ -168,7 +169,7 @@ static bool kboot_show_notch(void)
     for (int i = 0; i < MAX_CHOSEN_PARAMS; i++) {
         if (!chosen_params[i][0])
             break;
-        if (!strcmp(chosen_params[i][0], "asahi,show-notch"))
+        if (!strcmp(chosen_params[i][0], "aurora,show-notch"))
             return chosen_params[i][1] && !strcmp(chosen_params[i][1], "1");
     }
     return false;
@@ -299,7 +300,7 @@ static int dt_set_fb(void)
     get_notchless_fb(&fb_base, &fb_height);
     u64 notch_height = cur_boot_args.video.height - fb_height;
     if (notch_height && kboot_show_notch()) {
-        printf("display: keeping the notch rows (chosen.asahi,show-notch=1), %lux%lu\n",
+        printf("display: keeping the notch rows (chosen.aurora,show-notch=1), %lux%lu\n",
                cur_boot_args.video.width, cur_boot_args.video.height);
         fb_base = cur_boot_args.video.base;
         fb_height = cur_boot_args.video.height;
@@ -417,8 +418,8 @@ static int dt_set_t8140_wfx_args(int node)
  * (J514S, J516S) and the 16-inch M3 Max with the 40-core GPU (J516C) hand the internal display and
  * the GPU to the OS on every boot, as M1 and M2 Macs do. Each switch below
  * is put in /chosen as "1" unless a config line set it
- * already, so chosen.<switch>=0 in /etc/m1n1.conf (update-m1n1 copies it into boot.bin) still
- * turns that one off, and chosen.asahi,m3-defaults=0 adds none of them (an owner's own lines,
+ * already, so chosen.<switch>=0 in /etc/aura.conf (update-aura copies it into boot.bin) still
+ * turns that one off, and chosen.aurora,m3-defaults=0 adds none of them (an owner's own lines,
  * an =1 included, stay as written). If a config line was
  * lost this session (a full table, a failed allocation, or one the payload scan lost), an owner's
  * =0 may be the one lost while an earlier =1 still stands, so these Macs hand no graphics over:
@@ -430,13 +431,13 @@ static int dt_set_t8140_wfx_args(int node)
  * The Air switches are the recipe the boot package wrote on these Macs: the display handoff
  * (which also passes the PMP values), the GPU, and the stand-in power model with this Mac's
  * leakage fuse. It wrote the GPU lines only beside a display line of 1, so an owner's
- * chosen.asahi,t8122-dcp=0 keeps the default GPU switches off as well; an owner's own GPU line
- * still counts. chosen.asahi,t8122-dcpext stays off. The Pro switches are its display handoff
+ * chosen.aurora,t8122-dcp=0 keeps the default GPU switches off as well; an owner's own GPU line
+ * still counts. chosen.aurora,t8122-dcpext stays off. The Pro switches are its display handoff
  * and GPU; its external display handoffs (t6030-dcpext, t6030-dispext) keep their own lines.
  *
  * The J516C switches are its display handoff and GPU, each on its own as on the Pro: an owner's
- * chosen.asahi,t6031-gpu=0 keeps the GPU off and the display default still goes in, and
- * chosen.asahi,t6031-dcp=0 the other way round. The kernel decides whether it takes the display
+ * chosen.aurora,t6031-gpu=0 keeps the GPU off and the display default still goes in, and
+ * chosen.aurora,t6031-dcp=0 the other way round. The kernel decides whether it takes the display
  * over; one that does not leaves it on the boot framebuffer. The J514C (a T6031 board the
  * kernel's GPU driver refuses) and the T6034 Maxes (J514M, J516M) are not touched, nor is any
  * other board.
@@ -452,16 +453,17 @@ struct m3_default_board {
 };
 
 static const char *const m3_air_boards[] = {"apple,j613", "apple,j615", NULL};
-static const char *const m3_air_switches[] = {"asahi,t8122-dcp", "asahi,t8122-gpu",
-                                              "asahi,t8122-gpu-power-standin",
-                                              "asahi,t8122-gpu-fuse-leakage", NULL};
+static const char *const m3_air_switches[] = {"aurora,t8122-dcp", "aurora,t8122-gpu",
+                                              "aurora,t8122-gpu-power-standin",
+                                              "aurora,t8122-gpu-fuse-leakage", NULL};
 static const char *const m3_pro_boards[] = {"apple,j514s", "apple,j516s", NULL};
-static const char *const m3_pro_switches[] = {"asahi,t6030-dcp", "asahi,t6030-gpu", NULL};
+static const char *const m3_pro_switches[] = {"aurora,t6030-dcp", "aurora,t6030-gpu", NULL};
 static const char *const m3_max_boards[] = {"apple,j516c", NULL};
-static const char *const m3_max_switches[] = {"asahi,t6031-dcp", "asahi,t6031-gpu", NULL};
-static const char *const m3_air_graphics[] = {"asahi,t8122-", "asahi,j613-", "asahi,j615-", NULL};
-static const char *const m3_pro_graphics[] = {"asahi,t6030-", NULL};
-static const char *const m3_max_graphics[] = {"asahi,t6031-", NULL};
+static const char *const m3_max_switches[] = {"aurora,t6031-dcp", "aurora,t6031-gpu", NULL};
+static const char *const m3_air_graphics[] = {"aurora,t8122-", "aurora,j613-", "aurora,j615-",
+                                              NULL};
+static const char *const m3_pro_graphics[] = {"aurora,t6030-", NULL};
+static const char *const m3_max_graphics[] = {"aurora,t6031-", NULL};
 
 static const struct m3_default_board m3_default_boards[] = {
     {"apple,t8122", m3_air_boards, m3_air_switches, true, m3_air_graphics},
@@ -469,7 +471,7 @@ static const struct m3_default_board m3_default_boards[] = {
     {"apple,t6031", m3_max_boards, m3_max_switches, false, m3_max_graphics},
 };
 
-#define M3_DEFAULTS_SWITCH "asahi,m3-defaults"
+#define M3_DEFAULTS_SWITCH "aurora,m3-defaults"
 
 /* The config value of chosen.<name>, NULL when no config line set it */
 static const char *kboot_chosen_param(const char *name)
@@ -544,7 +546,7 @@ static int dt_set_m3_defaults(void)
         }
         /*
          * The Air's GPU only beside its display, as the boot package's recipe had it: an owner's
-         * chosen.asahi,t8122-dcp other than 1 keeps the default GPU switches off too. The owner's
+         * chosen.aurora,t8122-dcp other than 1 keeps the default GPU switches off too. The owner's
          * own lines, a GPU line included, stay as written.
          */
         int count = 0;
@@ -855,7 +857,7 @@ static void dt_set_trial_watchdog(void)
 
 /*
  * An aura-try trial must boot the install its Stage 1 names. U-Boot picks the ESP from
- * /chosen/asahi,efi-system-partition; without it, it takes the first ESP with an EFI loader, which
+ * /chosen/aurora,efi-system-partition; without it, it takes the first ESP with an EFI loader, which
  * on a disk with several installs is another system. A trial without the name refuses its payload,
  * and the trial path reboots into the configured Stage 2.
  */
@@ -864,9 +866,9 @@ static int dt_check_trial_esp(void)
     if (!aura_trial_enabled() || chip_id == T8152)
         return 0;
     int chosen = fdt_path_offset(dt, "/chosen");
-    if (chosen >= 0 && fdt_getprop(dt, chosen, "asahi,efi-system-partition", NULL))
+    if (chosen >= 0 && fdt_getprop(dt, chosen, "aurora,efi-system-partition", NULL))
         return 0;
-    printf("FDT: trial boot without asahi,efi-system-partition from Stage 1: not starting the "
+    printf("FDT: trial boot without aurora,efi-system-partition from Stage 1: not starting the "
            "next stage on a guessed ESP\n");
     return -1;
 }
@@ -1195,25 +1197,25 @@ static int dt_set_chosen(void)
         bail("FDT: /chosen node not found in devtree\n");
 
     if (is_mac) {
-        if (fdt_setprop(dt, node, "asahi,iboot1-version", system_firmware.iboot,
+        if (fdt_setprop(dt, node, "aurora,iboot1-version", system_firmware.iboot,
                         strlen(system_firmware.iboot) + 1))
-            bail("FDT: couldn't set asahi,iboot1-version\n");
+            bail("FDT: couldn't set aurora,iboot1-version\n");
 
-        if (fdt_setprop(dt, node, "asahi,system-fw-version", system_firmware.string,
+        if (fdt_setprop(dt, node, "aurora,system-fw-version", system_firmware.string,
                         strlen(system_firmware.string) + 1))
-            bail("FDT: couldn't set asahi,system-fw-version\n");
+            bail("FDT: couldn't set aurora,system-fw-version\n");
     }
 
-    if (fdt_setprop(dt, node, "asahi,iboot2-version", os_firmware.iboot,
+    if (fdt_setprop(dt, node, "aurora,iboot2-version", os_firmware.iboot,
                     strlen(os_firmware.iboot) + 1))
-        bail("FDT: couldn't set asahi,iboot2-version\n");
+        bail("FDT: couldn't set aurora,iboot2-version\n");
 
-    if (fdt_setprop(dt, node, "asahi,os-fw-version", os_firmware.string,
+    if (fdt_setprop(dt, node, "aurora,os-fw-version", os_firmware.string,
                     strlen(os_firmware.string) + 1))
-        bail("FDT: couldn't set asahi,os-fw-version\n");
+        bail("FDT: couldn't set aurora,os-fw-version\n");
 
-    if (fdt_setprop(dt, node, "asahi,m1n1-stage2-version", aura_version, strlen(aura_version) + 1))
-        bail("FDT: couldn't set asahi,m1n1-stage2-version\n");
+    if (fdt_setprop(dt, node, "aurora,aura-stage2-version", aura_version, strlen(aura_version) + 1))
+        bail("FDT: couldn't set aurora,aura-stage2-version\n");
 
     if (adt) {
         int anode = adt_path_offset(adt, "/chosen");
@@ -1315,7 +1317,7 @@ static int dt_set_speaker_safety(void)
     for (int node = fdt_first_subnode(dt, chosen); node >= 0;) {
         int next = fdt_next_subnode(dt, node);
         const char *name = fdt_get_name(dt, node, NULL);
-        if (!strncmp(name, "asahi-speaker-safety", 20) && (name[20] == 0 || name[20] == '@'))
+        if (!strncmp(name, "aurora-speaker-safety", 21) && (name[21] == 0 || name[21] == '@'))
             fdt_nop_node(dt, node);
         node = next;
     }
@@ -1334,15 +1336,15 @@ static int dt_set_speaker_safety(void)
         const char *dt_name;
     } words[] =
         {
-            {"enabledChannels", "asahi,adt-enabled-channels"},
-            {"historyChannels", "asahi,adt-history-channels"},
-            {"supportedChannels", "asahi,adt-supported-channels"},
-            {"safety-offset-seed-us", "asahi,adt-safety-offset-seed-us"},
+            {"enabledChannels", "aurora,adt-enabled-channels"},
+            {"historyChannels", "aurora,adt-history-channels"},
+            {"supportedChannels", "aurora,adt-supported-channels"},
+            {"safety-offset-seed-us", "aurora,adt-safety-offset-seed-us"},
         },
       longs[] = {
-          {"speaker-cpms-bgd_100ms", "asahi,adt-speaker-cpms-bgd-100ms-raw"},
-          {"speaker-cpms-bgd_1s", "asahi,adt-speaker-cpms-bgd-1s-raw"},
-          {"speaker-cpms-bgd_inst", "asahi,adt-speaker-cpms-instant-raw"},
+          {"speaker-cpms-bgd_100ms", "aurora,adt-speaker-cpms-bgd-100ms-raw"},
+          {"speaker-cpms-bgd_1s", "aurora,adt-speaker-cpms-bgd-1s-raw"},
+          {"speaker-cpms-bgd_inst", "aurora,adt-speaker-cpms-instant-raw"},
       };
     u32 word_values[ARRAY_SIZE(words)];
     u64 long_values[ARRAY_SIZE(longs)];
@@ -1353,14 +1355,14 @@ static int dt_set_speaker_safety(void)
         if (ADT_GETPROP(adt, audio, longs[i].adt_name, &long_values[i]) != sizeof(u64))
             bail("ADT: incomplete speaker safety profile\n");
 
-    int node = fdt_add_subnode(dt, chosen, "asahi-speaker-safety");
-    if (node < 0 || fdt_setprop_string(dt, node, "compatible", "asahi,j700-speaker-safety") ||
-        fdt_setprop_u32(dt, node, "asahi,schema-version", 1) ||
-        fdt_setprop_string(dt, node, "asahi,speaker-output-policy", "forbidden") ||
-        fdt_setprop_string(dt, node, "asahi,cpms-value-encoding", "opaque-adt-u64") ||
-        fdt_setprop_string(dt, node, "asahi,calibration-data-status", "not-provided") ||
-        fdt_setprop_string(dt, node, "asahi,source", "adt:/product/audio") ||
-        fdt_setprop_u32(dt, node, "asahi,adt-acoustic-id", acoustic_id))
+    int node = fdt_add_subnode(dt, chosen, "aurora-speaker-safety");
+    if (node < 0 || fdt_setprop_string(dt, node, "compatible", "aurora,j700-speaker-safety") ||
+        fdt_setprop_u32(dt, node, "aurora,schema-version", 1) ||
+        fdt_setprop_string(dt, node, "aurora,speaker-output-policy", "forbidden") ||
+        fdt_setprop_string(dt, node, "aurora,cpms-value-encoding", "opaque-adt-u64") ||
+        fdt_setprop_string(dt, node, "aurora,calibration-data-status", "not-provided") ||
+        fdt_setprop_string(dt, node, "aurora,source", "adt:/product/audio") ||
+        fdt_setprop_u32(dt, node, "aurora,adt-acoustic-id", acoustic_id))
         bail("FDT: could not create speaker safety profile\n");
 
     for (size_t i = 0; i < ARRAY_SIZE(words); i++)
@@ -2223,7 +2225,7 @@ static int dt_set_smbios_firmware(void)
      */
     int chosen = fdt_path_offset(dt, "/chosen");
     if (chosen >= 0) {
-        const char *s1 = fdt_getprop(dt, chosen, "asahi,m1n1-stage1-version", &len);
+        const char *s1 = fdt_getprop(dt, chosen, "aurora,aura-stage1-version", &len);
         if (s1 && len > 1)
             strncpy(stage1, s1, sizeof(stage1) - 1);
         const char *text = fdt_getprop(dt, chosen, "aurora,ave-text-crc32", &len);
@@ -2254,7 +2256,7 @@ static int dt_set_smbios_firmware(void)
     if (stage1[0] &&
         dt_smbios_firmware(&inv, "stage1", "aura Stage 1", stage1, "Aurora Silicon", 0))
         return -1;
-    /* Stage 2 updates from the OS (update-m1n1); stage 1 needs recoveryOS (kmutil) */
+    /* Stage 2 updates from the OS (update-aura); stage 1 needs recoveryOS (kmutil) */
     if (dt_smbios_firmware(&inv, "stage2", "aura Stage 2", aura_version, "Aurora Silicon",
                            SMBIOS_FW_UPDATABLE))
         return -1;
@@ -2660,7 +2662,8 @@ static int dt_set_mac_addresses(void)
 
         if (chip_id == T8140 && !strcmp(mac_address_devices[i].alias, "wifi0")) {
             int chosen = fdt_path_offset(dt, "/chosen");
-            if (chosen < 0 || fdt_setprop(dt, chosen, "asahi,wifi-mac-address", addr, sizeof(addr)))
+            if (chosen < 0 ||
+                fdt_setprop(dt, chosen, "aurora,wifi-mac-address", addr, sizeof(addr)))
                 bail("FDT: could not set deferred Wi-Fi MAC address\n");
         }
     }
@@ -2778,8 +2781,8 @@ static int dt_set_ipd(void)
     }
     u8 code = kblang[1];
 
-    if (fdt_setprop_u32(dt, chosen, "asahi,kblang-code", code))
-        bail("FDT: couldn't set asahi,kblang-code\n");
+    if (fdt_setprop_u32(dt, chosen, "aurora,kblang-code", code))
+        bail("FDT: couldn't set aurora,kblang-code\n");
 
     const char *path = fdt_get_alias(dt, "keyboard");
     if (path == NULL)
@@ -4987,8 +4990,9 @@ static void dt_ext26_result(int error)
              ext26_detail[0] ? " " : "", ext26_detail);
     printf("FDT: J613 ext26 result: %s\n", result);
     int chosen = fdt_path_offset(dt, "/chosen");
-    int ret = chosen < 0 ? chosen
-                         : fdt_setprop_string(dt, chosen, "asahi,j613-25g83-dcpext-result", result);
+    int ret = chosen < 0
+                  ? chosen
+                  : fdt_setprop_string(dt, chosen, "aurora,j613-25g83-dcpext-result", result);
     if (ret)
         printf("FDT: J613 ext26 result publication failed: %d\n", ret);
 }
@@ -5374,14 +5378,14 @@ static bool dt_j713_dcpext_powered(const char *alias)
  * J713: iBoot starts both external DCPs and leaves them quiesced, as it does the internal one,
  * with their DARTs set up. Reserve their firmware memory and mark each
  * apple,t8132-dcpext node ready for the kernel to adopt the running controller. Only with the
- * boot.bin config line chosen.asahi,j713-dcpext=1, only after the internal DCP was handed over
+ * boot.bin config line chosen.aurora,j713-dcpext=1, only after the internal DCP was handed over
  * (an external DCP must never cost the panel), and only for a controller iBoot left powered.
  */
 static void dt_reserve_j713_dcpext(void)
 {
     int chosen = fdt_path_offset(dt, "/chosen");
     int len = 0;
-    const char *opt = chosen < 0 ? NULL : fdt_getprop(dt, chosen, "asahi,j713-dcpext", &len);
+    const char *opt = chosen < 0 ? NULL : fdt_getprop(dt, chosen, "aurora,j713-dcpext", &len);
     int dcp = fdt_path_offset(dt, "dcp");
     bool armed = opt && len == 2 && opt[0] == '1' && opt[1] == '\0' && dcp >= 0 &&
                  fdt_getprop(dt, dcp, "apple,firmware-uuid", NULL);
@@ -5399,7 +5403,7 @@ static void dt_reserve_j713_dcpext(void)
             continue;
         }
         if (!armed) {
-            printf("FDT: '%s' firmware not reserved (needs chosen.asahi,j713-dcpext=1 and the "
+            printf("FDT: '%s' firmware not reserved (needs chosen.aurora,j713-dcpext=1 and the "
                    "internal display handoff); kernel gate remains closed\n",
                    alias);
             continue;
@@ -5428,7 +5432,7 @@ static void dt_reserve_j713_dcpext(void)
 
 /*
  * T8122: reserve the external DCP firmware for the kernel's gate only with the boot.bin config
- * line chosen.asahi,t8122-dcpext=1, and only when the internal display was handed over
+ * line chosen.aurora,t8122-dcpext=1, and only when the internal display was handed over
  * (apple,t8122-handoff on dcp), the one case where the kernel would enable it. Off by default:
  * on an M3 Air with 14.x firmware, a published marker lets the kernel enable dcpext, and the
  * internal DCP then crashes after disp0 DART faults, leaving the panel dark.
@@ -5437,11 +5441,11 @@ static bool dt_t8122_dcpext_armed(void)
 {
     int chosen = fdt_path_offset(dt, "/chosen");
     int len = 0;
-    const char *opt = chosen < 0 ? NULL : fdt_getprop(dt, chosen, "asahi,t8122-dcpext", &len);
+    const char *opt = chosen < 0 ? NULL : fdt_getprop(dt, chosen, "aurora,t8122-dcpext", &len);
     int panel = fdt_path_offset(dt, "dcp");
     bool native = panel >= 0 && fdt_getprop(dt, panel, "apple,j613-25g83-mapping-handoff", NULL);
     if (native)
-        opt = chosen < 0 ? NULL : fdt_getprop(dt, chosen, "asahi,j613-25g83-dcpext", &len);
+        opt = chosen < 0 ? NULL : fdt_getprop(dt, chosen, "aurora,j613-25g83-dcpext", &len);
 
     if (!opt || len != 2 || opt[0] != '1' || opt[1] != '\0')
         return false;
@@ -5489,7 +5493,7 @@ static int dt_reserve_dcpext_firmware(bool enable)
             if (!dt_t8122_dcpext_armed()) {
                 if (native26)
                     dt_ext26_result(-1);
-                printf("FDT: '%s' firmware not reserved (needs chosen.asahi,t8122-dcpext=1 "
+                printf("FDT: '%s' firmware not reserved (needs chosen.aurora,t8122-dcpext=1 "
                        "and the internal display handoff); kernel gate remains closed\n",
                        dcpext_alias);
                 continue;
@@ -7099,7 +7103,8 @@ static int dt_set_display_t8140(void)
     /* A diagnostic result for this preflight, not a hardware-ready claim.
      * 0: absent, 1: power off, 2..7: validation stage, 8: firmware DART
      * table reservation, 9: dependencies. */
-    if (fdt_setprop_u32(dt, node, "asahi,external-display-preflight", ext_ready ? 0x100 : ext_step))
+    if (fdt_setprop_u32(dt, node, "aurora,external-display-preflight",
+                        ext_ready ? 0x100 : ext_step))
         printf("FDT: external preflight observation unavailable\n");
     free(saved);
     printf("FDT: T8140 DCP enabled with validated framebuffer, firmware and live inherited RTKit "
@@ -8105,10 +8110,10 @@ static int dt_set_display(void)
         /*
          * Fail-soft handoff (kboot_display_handoff.c): it always returns 0, never uses the
          * helpers above (they bail out of kboot or enable nodes) and never enables a node.
-         * On T8122 it does nothing unless chosen.asahi,t8122-dcp=1; the external DCP firmware is
-         * reserved only with chosen.asahi,t8122-dcpext=1 and that handoff. On T6031 it does nothing
-         * unless the board is a J514C or J516C, and reserves only __OS_LOG unless
-         * chosen.asahi,t6031-dcp=1 (on a J516C, dt_set_m3_defaults() sets it unless a config line
+         * On T8122 it does nothing unless chosen.aurora,t8122-dcp=1; the external DCP firmware is
+         * reserved only with chosen.aurora,t8122-dcpext=1 and that handoff. On T6031 it does
+         * nothing unless the board is a J514C or J516C, and reserves only __OS_LOG unless
+         * chosen.aurora,t6031-dcp=1 (on a J516C, dt_set_m3_defaults() sets it unless a config line
          * set it).
          */
         ret = dt_set_display_handoff(dt);
@@ -8592,7 +8597,7 @@ static int dt_set_pmp(void)
  * T6030 and T8122: the kernel's display gate adds the PMP itself, halted until
  * the display needs it, so the device tree has no pmp node for dt_set_pmp().
  * The gate needs this Mac's PMP values for it: copy them as dt_set_pmp() does,
- * into /chosen/asahi,<soc>-pmp, and leave the PMP alone. Only when the PMP and
+ * into /chosen/aurora,<soc>-pmp, and leave the PMP alone. Only when the PMP and
  * its DART are where the gate puts them. Fail-soft: without the node the gate
  * keeps the display on the boot framebuffer, except on a J516S, which has
  * built-in values.
@@ -8606,11 +8611,11 @@ struct pmp_values_soc {
 };
 
 static const struct pmp_values_soc pmp_values_t6030 = {
-    "apple,t6030", "asahi,t6030-pmp", "T6030", {731, 730, 733, 732}, 0x350300000, 0x4000,
+    "apple,t6030", "aurora,t6030-pmp", "T6030", {731, 730, 733, 732}, 0x350300000, 0x4000,
 };
 
 static const struct pmp_values_soc pmp_values_t8122 = {
-    "apple,t8122", "asahi,t8122-pmp", "T8122", {622, 621, 624, 623}, 0x2d0300000, 0x4000,
+    "apple,t8122", "aurora,t8122-pmp", "T8122", {622, 621, 624, 623}, 0x2d0300000, 0x4000,
 };
 
 static void dt_pass_pmp(const struct pmp_values_soc *soc)
@@ -8669,7 +8674,7 @@ static int dt_set_pmp_t6030(void)
  * so there are no PMP values to pass (dt_pass_pmp() would refuse them anyway).
  */
 static const struct pmp_values_soc pmp_values_t6031 = {
-    "apple,t6031", "asahi,t6031-pmp", "T6031", {1181, 1180, 1183, 1182}, 0x290300000, 0x4000,
+    "apple,t6031", "aurora,t6031-pmp", "T6031", {1181, 1180, 1183, 1182}, 0x290300000, 0x4000,
 };
 
 static int dt_set_pmp_t6031(void)
@@ -8681,13 +8686,13 @@ static int dt_set_pmp_t6031(void)
 
 /*
  * T8122: pass this Mac's PMP values on either M3 Air with the display
- * handoff switch, chosen.asahi,t8122-dcp=1.
+ * handoff switch, chosen.aurora,t8122-dcp=1.
  */
 static int dt_set_pmp_t8122(void)
 {
     int chosen = fdt_path_offset(dt, "/chosen");
     int len = 0;
-    const char *opt = chosen < 0 ? NULL : fdt_getprop(dt, chosen, "asahi,t8122-dcp", &len);
+    const char *opt = chosen < 0 ? NULL : fdt_getprop(dt, chosen, "aurora,t8122-dcp", &len);
 
     if (!opt || len != 2 || opt[0] != '1' || opt[1] != '\0' ||
         (fdt_node_check_compatible(dt, 0, "apple,j613") &&
@@ -9308,7 +9313,7 @@ static int dt_set_isp_fwdata(void)
     if (firmware_set_fdt(dt, fdt_node, "apple,firmware-compat", compat) < 0)
         bail("FDT: Could not set apple,firmware-compat for %s\n", fdt_path);
 
-    /* T6041: iBoot's firmware, not m1n1's heap setup */
+    /* T6041: iBoot's firmware, not aura's heap setup */
     if (chip_id == T6041)
         return dt_set_isp_t6041(fdt_node);
 
@@ -10907,10 +10912,27 @@ int kboot_set_chosen(const char *name, const char *value)
 {
     int i = 0;
     char *copy = NULL;
+    char renamed[128];
 
     if (!name) {
         chosen_lost = true;
         return -1;
+    }
+    /*
+     * LEGACY-ASAHI(2027-02-28): an owner's chosen.asahi,X line, or the version line an
+     * older Stage 1 forwards (asahi,m1n1-stage1-version), is kept as aurora,X with m1n1
+     * read as aura. The device tree still gets the old name: aurora_legacy_chosen_aliases().
+     */
+    if (!strncmp(name, "asahi,", 6)) {
+        const char *rest = name + 6, *m = strstr(rest, "m1n1");
+        int n = m ? snprintf(renamed, sizeof(renamed), "aurora,%.*saura%s", (int)(m - rest), rest,
+                             m + 4)
+                  : snprintf(renamed, sizeof(renamed), "aurora,%s", rest);
+        if (n < 0 || n >= (int)sizeof(renamed)) {
+            chosen_lost = true;
+            return -1;
+        }
+        name = renamed;
     }
     /* The new value first: a failure leaves an existing entry (an owner's =0) as it was */
     if (value) {
@@ -11271,6 +11293,25 @@ static int kboot_move_to_exec_window(void **kernel)
     return 0;
 }
 
+/*
+ * LEGACY-ASAHI(2027-02-28): released kernels and U-Boot read the "asahi," names. Fail-soft:
+ * without room the "aurora," names still go to the kernel.
+ */
+static void dt_add_legacy_aliases(void)
+{
+    if (fdt_open_into(dt, dt, dt_bufsize)) {
+        printf("FDT: legacy aliases skipped: could not reopen the tree\n");
+        return;
+    }
+    int n = aurora_legacy_chosen_aliases(dt);
+    if (n < 0)
+        printf("FDT: legacy aliases incomplete: device tree full\n");
+    else
+        printf("FDT: %d legacy aliases\n", n);
+    if (fdt_pack(dt))
+        printf("FDT: fdt_pack() after the legacy aliases failed\n");
+}
+
 /* T8152 has no clock, USB, PCIe or DAPF setup here: j873g_run_proxy() did
  * what the device tree expects, and Linux owns the rest. */
 static int kboot_boot_t8152(void *kernel)
@@ -11281,6 +11322,7 @@ static int kboot_boot_t8152(void *kernel)
         next_stage.entry = NULL;
         bail("kboot: refusing handoff while secondary callbacks are pending\n");
     }
+    dt_add_legacy_aliases();
     printf("Setting SMP mode to WFE...\n");
     smp_set_wfe_mode(true);
     if (fdt_getprop(dt, 0, "aurora,minimal-boot", NULL) && smp_park_for_kernel()) {
@@ -12004,6 +12046,7 @@ int kboot_boot(void *kernel)
         if (fdt_pack(dt))
             return -1;
     }
+    dt_add_legacy_aliases();
     printf("Setting SMP mode to WFE...\n");
     smp_set_wfe_mode(true);
     if (chip_id == T8140 && dt_t8140_recheck_display())

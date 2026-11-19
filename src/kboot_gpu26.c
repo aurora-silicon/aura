@@ -32,8 +32,8 @@
  * publication runs on a copy of the FDT and is committed whole or not at all.
  *
  * The GPU node stays disabled unless the board is J613 (or, experimentally, a
- * J615 with chosen.asahi,j615-25g83-experimental=1) and the node carries the
- * exact profile and /chosen asahi,t8122-gpu=1 opt-in. Linux admits the loaded
+ * J615 with chosen.aurora,j615-25g83-experimental=1) and the node carries the
+ * exact profile and /chosen aurora,t8122-gpu=1 opt-in. Linux admits the loaded
  * firmware before starting it. This never fails the boot.
  */
 #define T8122_GPU_REGIONS 6
@@ -42,7 +42,7 @@
 #define T8122_GPU_MAX_SEG 0x200000UL
 #define T8122_GPU_PA_MAX  (1UL << 42)
 #define T8122_GPU_MAX_MR  32
-#define T8122_GPU_OPT_IN  "asahi,t8122-gpu"
+#define T8122_GPU_OPT_IN  "aurora,t8122-gpu"
 
 static const char *const t8122_gpu_names[T8122_GPU_REGIONS] = {
     "ttbs", "pagetables", "handoff", "shared-l2", "fw-text", "fw-data",
@@ -404,7 +404,7 @@ static int t8122_gpu_publish(void *dt, void *arg)
     if (!compat || len != 12 || fdt32_ld(compat) != 26 || fdt32_ld(compat + 1) != 6 ||
         fdt32_ld(compat + 2) != 2)
         return -1;
-    const char *intent = chosen < 0 ? NULL : fdt_getprop(dt, chosen, "asahi,t8122-gpu", &len);
+    const char *intent = chosen < 0 ? NULL : fdt_getprop(dt, chosen, "aurora,t8122-gpu", &len);
     bool board = t8122_25g83_board(dt);
     bool enable = board && os_firmware.version == V26_6_2 && intent && len == 2 &&
                   intent[0] == '1' && intent[1] == 0;

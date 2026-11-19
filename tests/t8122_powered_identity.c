@@ -70,11 +70,11 @@ int main(void)
     int chosen = fdt_add_subnode(dt, 0, "chosen");
     assert(chosen >= 0);
     assert(!t8122_power_probe_opted_in(dt));
-    assert(!fdt_setprop_string(dt, chosen, "asahi,t8122-gpu-power-diag", "0"));
+    assert(!fdt_setprop_string(dt, chosen, "aurora,t8122-gpu-power-diag", "0"));
     assert(!t8122_power_probe_opted_in(dt));
-    assert(!fdt_setprop_string(dt, chosen, "asahi,t8122-gpu-power-diag", "1"));
+    assert(!fdt_setprop_string(dt, chosen, "aurora,t8122-gpu-power-diag", "1"));
     assert(t8122_power_probe_opted_in(dt));
-    assert(!fdt_setprop_string(dt, chosen, "asahi,t8122-gpu-power-diag", "1x"));
+    assert(!fdt_setprop_string(dt, chosen, "aurora,t8122-gpu-power-diag", "1x"));
     assert(!t8122_power_probe_opted_in(dt));
 
     const struct probe_fixture eight_cores = {

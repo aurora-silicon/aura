@@ -101,7 +101,7 @@ def read_export(root):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--root', type=Path, default=Path(
-        '/sys/firmware/devicetree/base/chosen/asahi,t8122-gpu-diagnostics'))
+        '/sys/firmware/devicetree/base/chosen/aurora,t8122-gpu-diagnostics'))
     args = parser.parse_args()
     try:
         result = read_export(args.root)

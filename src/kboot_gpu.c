@@ -506,10 +506,10 @@ static int fdt_set_aux_opp(void *dt, int gpu, const char *prop, const struct aux
  * fail kboot. dt_set_gpu_g15() therefore
  * - marks the gpu node disabled before it does anything else,
  * - positively identifies the loaded GPU firmware as the 14.8.3 ABI before it touches any GPU
- *   register (drm/asahi only accepts apple,firmware-compat = <14 8 3> for G15),
+ *   register (drm/aurora only accepts apple,firmware-compat = <14 8 3> for G15),
  * - length/range checks every ADT input (no ADT_GETPROP: it copies before checking the length),
  * - touches no GPU hardware and leaves the node disabled unless boot.bin carries the opt-in config
- *   line chosen.asahi,t6030-gpu=1 (aura cannot tell which kernel will boot, so this is per
+ *   line chosen.aurora,t6030-gpu=1 (aura cannot tell which kernel will boot, so this is per
  *   boot.bin); without it, it only runs and logs the firmware/ADT/DT checks (dry run),
  * - runs the ID/core-mask register and leakage fuse reads under an exception guard that also
  *   catches asynchronous SErrors (the PMGR power-on is unguarded, as everywhere else in aura; a
@@ -522,7 +522,7 @@ static int fdt_set_aux_opp(void *dt, int gpu, const char *prop, const struct aux
  *   apple,firmware-compat, powers the GPU back off if it was powered on here, and returns 0.
  *
  * apple,firmware-version is the version of the loaded GPU firmware image (14.8.3), not os_firmware
- * as on the other SoCs: iBoot reports 14.8.3 as 14.7. drm/asahi only puts it in crash dumps.
+ * as on the other SoCs: iBoot reports 14.8.3 as 14.7. drm/aurora only puts it in crash dumps.
  *
  * Differences from the t602x path:
  * - No CS/AFR clock domains: no apple,cs-opp / apple,afr-opp.
@@ -530,19 +530,19 @@ static int fdt_set_aux_opp(void *dt, int gpu, const char *prop, const struct aux
  *   instead of calc_power_t600x().
  * - The OPP table is rebuilt from the runtime ADT, because the pstate count is not known statically
  *   (iBoot fills in the perf-state properties at boot).
- * - hw-cal-a/hw-cal-b/globals stay disabled: aura's Rust initdata has no G15 layouts, and drm/asahi
- *   only uses these blobs as an optional debug cross-check (gpu.rs load_hwdata_blob(), which falls
- *   back to an empty blob).
+ * - hw-cal-a/hw-cal-b/globals stay disabled: aura's Rust initdata has no G15 layouts, and
+ * drm/aurora only uses these blobs as an optional debug cross-check (gpu.rs load_hwdata_blob(),
+ * which falls back to an empty blob).
  */
 #define G15S_ID_GEN            7        // ID_VERSION[31:24]
 #define G15S_ID_VARIANT        3        // ID_VERSION[23:16], 3 = G15S
 #define G15S_CORES_PER_CLUSTER 10       // G15S core mask layout: 10 slots per MGPU
 #define G15S_MAX_CORES         20       // max total cores for G15S, max-power divisor
-#define T6030_MAX_CLUSTERS     2        // 20 core slots / 10 per MGPU (drm/asahi max_num_clusters)
+#define T6030_MAX_CLUSTERS     2        // 20 core slots / 10 per MGPU (drm/aurora max_num_clusters)
 #define G15_SGX_ID_VERSION     0xd04000 // = Fender+0x4000
 #define G15_SGX_CORE_MASK      0xe01500 // 3 words, third masked to 16 bits
 #define G15_SGX_ID_COUNTS_1    0xd04010 // [7:0] cores/cluster, [15:8] clusters/die, [19:16] dies
-#define G15_SGX_ID_COUNTS_2    0xd04014 // further topology counts, as drm/asahi reads them
+#define G15_SGX_ID_COUNTS_2    0xd04014 // further topology counts, as drm/aurora reads them
 #define G15_MAX_CLUSTERS       2        // the most clusters an ID_COUNTS_1 topology may report
 #define G15_ARRAY_CLUSTERS     4        // array bound: the most clusters of a supported SoC (G15C)
 #define T6030_LEAK_FUSE        0x3642c81a8 // efuse page 0x3642c8000 + 0x1a8
@@ -722,7 +722,7 @@ static int g15_get_pstates(const struct g15_soc *soc, int sgx, u32 *count_out, u
     /*
      * The ADT order is not strictly increasing in frequency (j516s: 1182 MHz twice, 1312 MHz
      * before 1242 MHz) and must be kept as-is, since the firmware indexes pstates by position.
-     * drm/asahi only relies on the last pstate being the fastest (perf_max_pstate).
+     * drm/aurora only relies on the last pstate being the fastest (perf_max_pstate).
      */
     for (u32 i = 1; i < count - 1; i++)
         if (ps[i].freq > ps[count - 1].freq)
@@ -952,7 +952,7 @@ static int g15_read_hw(void *dt, int gpu, const struct g15_soc *soc, u32 *core_c
         bail("FDT: GPU: not a %s (expected gen %d variant %d)\n", soc->gpu_name, soc->id_gen,
              soc->id_variant);
 
-    /* Cores per cluster and clusters: fixed for the SoC, or as drm/asahi reads them */
+    /* Cores per cluster and clusters: fixed for the SoC, or as drm/aurora reads them */
     u32 cores_per_cluster = soc->cores_per_cluster, clusters = soc->clusters;
     if (hw_topology) {
         u32 dies = (counts >> 16) & 0xf;
@@ -1064,7 +1064,7 @@ static void calc_power_t6030(u32 count, const struct perf_state *core, float lea
  * - Why it overstates: the static term is not scaled down, although G15G has one cluster of 10
  *   core slots where G15S has two, and the leakage is twice the value fused into the J516S M3
  *   Pro's G15S (3206): about four times the J516S's static power per core slot.
- * It is not a power limit and does not lower clocks: drm/asahi sets the firmware's power targets
+ * It is not a power limit and does not lower clocks: drm/aurora sets the firmware's power targets
  * to the largest OPP power, so they rise with this table. The kernel's performance-state cap is
  * what limits the clocks. To be replaced by measured numbers.
  */
@@ -1076,14 +1076,14 @@ static void calc_power_t6030(u32 count, const struct perf_state *core, float lea
  * - field A, 14 bits: bits 31:29 of word 0 are its low 3 bits, bits 10:0 of word 1 its high 11;
  * - field B, 10 bits: bits 20:11 of word 1.
  * The other bits are not used. The values are 2 x (A + 1) and B + 1. Both are logged and
- * exported to the kernel as /chosen/asahi,t8122-gpu-leak-fuse (two IEEE-754 single cells, in that
- * order). The GPU setup keeps G15G_STANDIN_LEAK unless chosen.asahi,t8122-gpu-fuse-leakage=1
+ * exported to the kernel as /chosen/aurora,t8122-gpu-leak-fuse (two IEEE-754 single cells, in that
+ * order). The GPU setup keeps G15G_STANDIN_LEAK unless chosen.aurora,t8122-gpu-fuse-leakage=1
  * asks it to use the first value instead, as g15s_read_leak() uses the T6030 fuse.
  */
 #define T8122_LEAK_FUSE_WORD0 0x2e42c8128UL
 #define T8122_LEAK_FUSE_WORD1 0x2e42c812cUL
-#define T8122_LEAK_FUSE_PROP  "asahi,t8122-gpu-leak-fuse"
-#define T8122_LEAK_FUSE_OPTIN "asahi,t8122-gpu-fuse-leakage"
+#define T8122_LEAK_FUSE_PROP  "aurora,t8122-gpu-leak-fuse"
+#define T8122_LEAK_FUSE_OPTIN "aurora,t8122-gpu-fuse-leakage"
 
 struct t8122_leak_fuse {
     u32 field_a, field_b;
@@ -1155,8 +1155,8 @@ static int g15_set_opps(void *dt, u32 opps_ph, u32 count, u32 table_count, u32 c
 
         for (u32 j = 0; j < clusters; j++) {
             /*
-             * One voltage per MGPU (drm/asahi expects max_num_clusters entries). Missing tables and
-             * zero entries are back-filled from table 0.
+             * One voltage per MGPU (drm/aurora expects max_num_clusters entries). Missing tables
+             * and zero entries are back-filled from table 0.
              */
             u32 t = j < table_count ? j : 0;
             u32 mv = perf_states[i + t * count].volt;
@@ -1295,7 +1295,7 @@ static int g15_set_float_array(void *dt, const char *name, float val, int count)
 
 /*
  * The CS and AFR leakage have no G15C source: 0 stands in, as for the SRAM leakage, and is listed
- * in asahi,t6031-gpu-standin with the other stand-ins.
+ * in aurora,t6031-gpu-standin with the other stand-ins.
  */
 #define G15C_STANDIN_AUX_LEAK 0.0f
 
@@ -1317,8 +1317,8 @@ static int g15_set_standins(void *dt)
     static const char list[] = "apple,core-leak-coef\0apple,sram-leak-coef\0apple,cs-leak-coef\0"
                                "apple,afr-leak-coef\0opp-microwatt";
     int gpu = fdt_path_offset(dt, "gpu");
-    if (gpu < 0 || fdt_setprop(dt, gpu, "asahi,t6031-gpu-standin", list, sizeof(list)))
-        bail("FDT: GPU: failed to set asahi,t6031-gpu-standin\n");
+    if (gpu < 0 || fdt_setprop(dt, gpu, "aurora,t6031-gpu-standin", list, sizeof(list)))
+        bail("FDT: GPU: failed to set aurora,t6031-gpu-standin\n");
     return 0;
 }
 
@@ -1357,7 +1357,7 @@ static int g15_set_status(void *dt, const char *path, const char *status)
 }
 
 /*
- * Power-management values for a SoC whose device tree does not carry them (T8122: drm/asahi then
+ * Power-management values for a SoC whose device tree does not carry them (T8122: drm/aurora then
  * takes them from the boot loader). Each is one 32-bit cell, apple,X from the ADT sgx node's gpu-X
  * (apple,se-target from gpu-se-tgt), copied as it is: the float ones are IEEE-754 bit patterns in
  * both. g15_get_power_props() also adds
@@ -1951,7 +1951,7 @@ static void g15_disable(void *dt)
         printf("FDT: GPU: failed to disable the gpu node\n");
 
     /*
-     * Belt and braces: drm/asahi refuses G15 before any MMIO unless firmware-compat is <14 8 3>.
+     * Belt and braces: drm/aurora refuses G15 before any MMIO unless firmware-compat is <14 8 3>.
      * Zeroing it in place needs no DT space; deleting it (the kernel then refuses too) neither.
      */
     int len;
@@ -1965,7 +1965,7 @@ static void g15_disable(void *dt)
 
 /*
  * T8122 (M3, AGX G15G). Same setup as T6030, with these differences:
- * - the core topology (cores per cluster, clusters) is read from ID_COUNTS_1, the way drm/asahi
+ * - the core topology (cores per cluster, clusters) is read from ID_COUNTS_1, the way drm/aurora
  *   reads it for G15G, and the pstate tables must not outnumber the clusters it reports;
  * - the GPU power closure must be off before the setup powers it on, and a failed setup releases it
  *   recursively and checks that it is off again (as the T8122 powered identity probe does);
@@ -1979,7 +1979,7 @@ static const struct g15_soc g15_soc_t6030 = {
     .name = "T6030",
     .gpu_name = "G15S",
     .compatible = "apple,agx-t6030",
-    .optin = "asahi,t6030-gpu",
+    .optin = "aurora,t6030-gpu",
     .id_gen = G15S_ID_GEN,
     .id_variant = G15S_ID_VARIANT,
     .cores_per_cluster = G15S_CORES_PER_CLUSTER,
@@ -1994,8 +1994,8 @@ static const struct g15_soc g15_soc_t8122 = {
     .name = "T8122",
     .gpu_name = "G15G",
     .compatible = "apple,agx-t8122",
-    .optin = "asahi,t8122-gpu",
-    .id_gen = 7,     // drm/asahi hw/agx3.rs T8122: family 7
+    .optin = "aurora,t8122-gpu",
+    .id_gen = 7,     // drm/aurora hw/agx3.rs T8122: family 7
     .id_variant = 2, // variant 2 = G
     .dies = 1,
     .mask2_bits = 32,
@@ -2003,17 +2003,17 @@ static const struct g15_soc g15_soc_t8122 = {
 };
 
 /*
- * The T8122 experiment, armed by chosen.asahi,t8122-gpu=1 together with
- * chosen.asahi,t8122-gpu-power-standin=1: g15_soc_t8122, plus the experimental G15G firmware
+ * The T8122 experiment, armed by chosen.aurora,t8122-gpu=1 together with
+ * chosen.aurora,t8122-gpu-power-standin=1: g15_soc_t8122, plus the experimental G15G firmware
  * image, the stand-in leakage and power model, and the ADT's power-management values on the gpu
- * node (drm/asahi takes them from the boot loader on T8122).
+ * node (drm/aurora takes them from the boot loader on T8122).
  */
 static const struct g15_soc g15_soc_t8122_standin = {
     .chip = T8122,
     .name = "T8122",
     .gpu_name = "G15G",
     .compatible = "apple,agx-t8122",
-    .optin = "asahi,t8122-gpu",
+    .optin = "aurora,t8122-gpu",
     .id_gen = 7,
     .id_variant = 2,
     .dies = 1,
@@ -2026,7 +2026,7 @@ static const struct g15_soc g15_soc_t8122_standin = {
 };
 
 /*
- * T6031 (M3 Max, G15C), J514C/J516C only, requires chosen.asahi,t6031-gpu=1 (on a J516C,
+ * T6031 (M3 Max, G15C), J514C/J516C only, requires chosen.aurora,t6031-gpu=1 (on a J516C,
  * dt_set_m3_defaults() sets it unless a config line set it): the J613 14.x setup with T6031
  * values, with these differences.
  * - The identity, topology and core masks come from the bounded powered identity read that runs
@@ -2039,7 +2039,7 @@ static const struct g15_soc g15_soc_t8122_standin = {
  *   domains (g15_set_csafr()).
  * - No G15C leakage source and no G15C power model: the T8122 stand-in leakage for every cluster,
  *   0 for the SRAM, CS and AFR leakage, and the G15S model for the OPP powers, all listed in
- *   asahi,t6031-gpu-standin. They do not limit clocks; the kernel's performance-state cap does.
+ *   aurora,t6031-gpu-standin. They do not limit clocks; the kernel's performance-state cap does.
  */
 #define G15C_STANDIN_LEAK G15G_STANDIN_LEAK
 
@@ -2067,9 +2067,9 @@ static const struct g15_soc g15_soc_t6031 = {
     .name = "T6031",
     .gpu_name = "G15C",
     .compatible = "apple,agx-t6031",
-    .optin = "asahi,t6031-gpu",
+    .optin = "aurora,t6031-gpu",
     .id_gen = 7,
-    .id_variant = 4, // drm/asahi hw/agx3.rs T6031: family 7, variant 4 = C
+    .id_variant = 4, // drm/aurora hw/agx3.rs T6031: family 7, variant 4 = C
     .cores_per_cluster = T6031_CORES_PER_CLUSTER,
     .clusters = T6031_GPU_CLUSTERS,
     .dies = 1,
@@ -2126,7 +2126,7 @@ static int g15_probed_hw(void *dt, int gpu, const struct g15_soc *soc, u32 *core
  * after the bounded identity read; Linux owns firmware admission and startup.
  *
  * The kernel's T8122 admission requires the bounded powered-identity witness
- * in /chosen/asahi,t8122-gpu-powered-identity. Reserve it (probe-result
+ * in /chosen/aurora,t8122-gpu-powered-identity. Reserve it (probe-result
  * NOT_RUN) before power-on, retain g15_read_hw()'s genuine guarded read of
  * this boot's ID/core-mask registers, and publish it only after the SGX
  * power vote is confirmed released. The caller runs this on a scratch copy
@@ -2244,7 +2244,7 @@ static int dt_set_gpu_g15_inner(void *dt, const struct g15_soc *soc, bool armed)
     /*
      * 1. Firmware ABI. The GPU firmware ABI is identified from the image iBoot loaded, because
      * 14.8.3 and 14.7 share one iBoot string. Nothing else (in particular no GPU
-     * register) is touched unless it is positively the 14.8.3 G15 ABI drm/asahi supports.
+     * register) is touched unless it is positively the 14.8.3 G15 ABI drm/aurora supports.
      */
     const struct fw_version_info *gfx_fw =
         soc->family_fw ? g15_t6031_fw : firmware_gfx_version_ex(soc->chip, soc->fw_experimental);
@@ -2361,7 +2361,7 @@ static int dt_set_gpu_g15_inner(void *dt, const struct g15_soc *soc, bool armed)
         printf("%d ", max_pwr[i]);
     printf("\n");
 
-    /* drm/asahi divides by max(opp-microwatt) / 1000 (rel_max_powers), so it must be >= 1 mW */
+    /* drm/aurora divides by max(opp-microwatt) / 1000 (rel_max_powers), so it must be >= 1 mW */
     for (u32 i = 1; i < perf_state_count; i++)
         if (max_pwr[i] > max_pwr[perf_state_count - 1])
             bail("FDT: GPU: max power of pstate %u is above the top pstate\n", i);
@@ -2375,7 +2375,7 @@ static int dt_set_gpu_g15_inner(void *dt, const struct g15_soc *soc, bool armed)
 
     /*
      * TODO: G15S has a single leakage value and no SRAM leakage fuse. It is not known yet which
-     * HwData fields the firmware reads it from; drm/asahi wants one value per cluster, so give
+     * HwData fields the firmware reads it from; drm/aurora wants one value per cluster, so give
      * every cluster the fused core value and 0 for SRAM.
      */
     if (g15_set_float_array(dt, "apple,core-leak-coef", leak, clusters))
@@ -2461,7 +2461,7 @@ static int dt_set_gpu_g15(void *dt, const struct g15_soc *soc)
      * Explicit opt-in before any GPU hardware access. aura cannot tell which kernel GRUB will boot,
      * so without it the power-on and GPU register reads would run for every kernel, the default one
      * included. The opt-in is a config line appended to boot.bin (update-aura copies chosen.* lines
-     * from /etc/aura.conf):  chosen.asahi,t6030-gpu=1 (chosen.asahi,t8122-gpu=1 on T8122)
+     * from /etc/aura.conf):  chosen.aurora,t6030-gpu=1 (chosen.aurora,t8122-gpu=1 on T8122)
      * Without it this is a dry run: the firmware identification (DRAM reads only) and all ADT/DT
      * checks run and are logged, then the gpu node is left disabled. T6031 also
      * requires its switch before its powered identity probe. The M3 switches of the boards
@@ -2498,7 +2498,7 @@ static int dt_set_gpu_t8122(void *dt);
  * On a J613 or J615, read the same T8122 leakage fuse words under the
  * exception guard, before anything powers the GPU, then log and export the decoded values (see
  * t8122_leak_fuse_decode()). It changes nothing else: the GPU setup uses them only with
- * chosen.asahi,t8122-gpu-fuse-leakage=1. A fault or a full device tree is logged, and the boot
+ * chosen.aurora,t8122-gpu-fuse-leakage=1. A fault or a full device tree is logged, and the boot
  * goes on without the property.
  */
 static void t8122_leak_fuse_export(void *dt)
@@ -2537,29 +2537,29 @@ static void t8122_leak_fuse_export(void *dt)
 }
 
 /*
- * T8122: the GPU setup runs only with chosen.asahi,t8122-gpu=1; there is no dry run on a default
+ * T8122: the GPU setup runs only with chosen.aurora,t8122-gpu=1; there is no dry run on a default
  * boot. Without it, the reservation-only diagnostic (dt_set_gpu_t8122()) runs if it is opted in.
- * With chosen.asahi,t8122-gpu-power-standin=1 as well, the setup is the stand-in experiment
+ * With chosen.aurora,t8122-gpu-power-standin=1 as well, the setup is the stand-in experiment
  * (g15_soc_t8122_standin); on its own that line is only logged as ignored.
  */
 static int dt_set_gpu_t8122_select(void *dt)
 {
     t8122_leak_fuse_export(dt);
 
-    bool standin = g15_optin(dt, "asahi,t8122-gpu-power-standin");
+    bool standin = g15_optin(dt, "aurora,t8122-gpu-power-standin");
 
     if (!g15_optin(dt, g15_soc_t8122.optin)) {
         if (standin)
-            printf("FDT: GPU: asahi,t8122-gpu-power-standin ignored: it needs "
-                   "chosen.asahi,t8122-gpu=1\n");
+            printf("FDT: GPU: aurora,t8122-gpu-power-standin ignored: it needs "
+                   "chosen.aurora,t8122-gpu=1\n");
         return dt_set_gpu_t8122(dt);
     }
 
-    if (g15_optin(dt, "asahi,t8122-gpu-handoff-diag"))
-        printf("FDT: GPU: asahi,t8122-gpu-handoff-diag ignored: chosen.asahi,t8122-gpu=1 runs "
+    if (g15_optin(dt, "aurora,t8122-gpu-handoff-diag"))
+        printf("FDT: GPU: aurora,t8122-gpu-handoff-diag ignored: chosen.aurora,t8122-gpu=1 runs "
                "the GPU setup\n");
     if (standin) {
-        printf("FDT: GPU: T8122 experiment armed (chosen.asahi,t8122-gpu-power-standin=1): "
+        printf("FDT: GPU: T8122 experiment armed (chosen.aurora,t8122-gpu-power-standin=1): "
                "experimental G15G firmware image, stand-in power model\n");
         return dt_set_gpu_g15(dt, &g15_soc_t8122_standin);
     }
@@ -2579,7 +2579,7 @@ static int t8122_identity_read(void *context, u32 *id, u32 masks[3], u32 *counts
     u64 sgx_base = *(u64 *)context;
     int before = g15_guard_begin();
     *id = read32(sgx_base + G15_SGX_ID_VERSION);
-    /* Core topology, as drm/asahi reads it; published, not checked */
+    /* Core topology, as drm/aurora reads it; published, not checked */
     *counts = read32(sgx_base + G15_SGX_ID_COUNTS_1);
     *counts2 = read32(sgx_base + G15_SGX_ID_COUNTS_2);
     masks[0] = read32(sgx_base + G15_SGX_CORE_MASK);
@@ -2598,13 +2598,13 @@ static int t8122_identity_power_disable(void *context)
 
 /*
  * T6031: the bounded powered identity read, on a J514C or J516C booted with
- * chosen.asahi,t6031-gpu=1. Unlike the T8122 probe it cannot require the GPU power closure to be
+ * chosen.aurora,t6031-gpu=1. Unlike the T8122 probe it cannot require the GPU power closure to be
  * off (GFX's parent AFR is always on), so it records every power state register of the closure,
  * powers the GPU on through PMGR (each step a bounded poll), checks that every device of the
  * closure is on before any GPU register is read, reads the ID, topology and core mask registers
  * under the exception guard, and then puts each register back as it was, children first, and
  * checks that it is. Every result, a failure included, is published with the values read (none
- * after a faulted read) in /chosen/asahi,t6031-gpu-powered-identity.
+ * after a faulted read) in /chosen/aurora,t6031-gpu-powered-identity.
  */
 #define T6031_SGX_BASE 0x408000000UL
 
@@ -2689,7 +2689,7 @@ static void t6031_gpu_probe(void *dt)
 /*
  * T6031 (J514C/J516C): the firmware image facts, the bounded powered identity read, then the GPU
  * setup (which itself touches no GPU hardware). Each part is fail-soft; all three
- * require chosen.asahi,t6031-gpu=1 because this profile uses unmeasured power stand-ins. On a
+ * require chosen.aurora,t6031-gpu=1 because this profile uses unmeasured power stand-ins. On a
  * J516C dt_set_m3_defaults() sets it unless a config line set it (=0 keeps all three off); a
  * J514C still needs the line.
  */
@@ -2774,7 +2774,7 @@ static void t8122_read_powered_identity(void *dt, int gpu)
 
 static bool t8122_identity_matches_j613(void *dt)
 {
-    int node = fdt_path_offset(dt, "/chosen/asahi,t8122-gpu-powered-identity");
+    int node = fdt_path_offset(dt, "/chosen/aurora,t8122-gpu-powered-identity");
     static const struct {
         const char *name;
         u32 value;
@@ -2807,15 +2807,15 @@ static void t8122_admit_image_metadata(void *dt, const struct gfx_fw_image_info 
         return;
 
     int len = 0;
-    const char *ack = fdt_getprop(dt, chosen, "asahi,t8122-gpu-abi-ack", &len);
+    const char *ack = fdt_getprop(dt, chosen, "aurora,t8122-gpu-abi-ack", &len);
     if (!ack || len != sizeof("14.8.3") || memcmp(ack, "14.8.3", sizeof("14.8.3")))
         return;
-    const char *uuid_text = fdt_getprop(dt, chosen, "asahi,t8122-gpu-expected-uuid", &len);
+    const char *uuid_text = fdt_getprop(dt, chosen, "aurora,t8122-gpu-expected-uuid", &len);
     u8 expected_uuid[16];
     if (!gfx_fw_parse_uuid_hex(uuid_text, len, expected_uuid) ||
         memcmp(expected_uuid, image->uuid, sizeof(expected_uuid)))
         return;
-    const char *expected_rtkit = fdt_getprop(dt, chosen, "asahi,t8122-gpu-expected-rtkit", &len);
+    const char *expected_rtkit = fdt_getprop(dt, chosen, "aurora,t8122-gpu-expected-rtkit", &len);
     char observed_rtkit[GFX_FW_VERSION_MAX];
     if (!expected_rtkit || len < 8 || len > GFX_FW_VERSION_MAX || expected_rtkit[len - 1] != '\0' ||
         strlen(expected_rtkit) + 1 != (size_t)len || !firmware_gfx_rtkit_version(observed_rtkit) ||
@@ -2836,13 +2836,13 @@ static void t8122_admit_image_metadata(void *dt, const struct gfx_fw_image_info 
  */
 static void t8122_enable_asc_preflight(void *dt)
 {
-    /* When the full GPU setup is opted in (chosen.asahi,t8122-gpu=1) it owns the
+    /* When the full GPU setup is opted in (chosen.aurora,t8122-gpu=1) it owns the
      * gpu and mailbox enable; the lighter preflight must not also touch them.
      * The reservation-only diagnostic that hosts this preflight does not run
      * under that opt-in, so this is defence in depth, logged when it fires.
      */
-    if (g15_optin(dt, "asahi,t8122-gpu")) {
-        printf("FDT: GPU: T8122 ASC preflight skipped: chosen.asahi,t8122-gpu=1 owns the "
+    if (g15_optin(dt, "aurora,t8122-gpu")) {
+        printf("FDT: GPU: T8122 ASC preflight skipped: chosen.aurora,t8122-gpu=1 owns the "
                "node enable\n");
         return;
     }
@@ -2853,7 +2853,7 @@ static void t8122_enable_asc_preflight(void *dt)
     if (chosen < 0 || gpu < 0 || mailbox < 0 || !t8122_identity_matches_j613(dt))
         return;
     int len = 0;
-    const char *optin = fdt_getprop(dt, chosen, "asahi,t8122-gpu-asc-preflight", &len);
+    const char *optin = fdt_getprop(dt, chosen, "aurora,t8122-gpu-asc-preflight", &len);
     if (!optin || len != sizeof("1") || memcmp(optin, "1", sizeof("1")))
         return;
     const fdt32_t *compat = fdt_getprop(dt, gpu, "apple,firmware-compat", &len);
@@ -2900,7 +2900,7 @@ static int dt_set_gpu_t8122(void *dt)
     int chosen = fdt_path_offset(dt, "/chosen");
     int len = 0;
     const char *optin =
-        chosen >= 0 ? fdt_getprop(dt, chosen, "asahi,t8122-gpu-handoff-diag", &len) : NULL;
+        chosen >= 0 ? fdt_getprop(dt, chosen, "aurora,t8122-gpu-handoff-diag", &len) : NULL;
     if (!optin || len != 2 || strcmp(optin, "1"))
         return 0;
 
@@ -3066,7 +3066,7 @@ static const struct g17_soc g17_soc_t8142 = {
     .firmware_profile = T8142_GPU_FIRMWARE_PROFILE,
 };
 
-/* M5 Max (G17C): four perf-state tables, the OPPs from the first, as m1n1 hands it over. */
+/* M5 Max (G17C): four perf-state tables, the OPPs from the first, as aura hands it over. */
 static const struct g17_soc g17_soc_t6050 = {
     .compat = "apple,agx-t6050",
     .adt_compat = "gpu,t6050",

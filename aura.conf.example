@@ -19,7 +19,7 @@
 
 # Keep the notch rows when the OS drives the full panel
 # Pair with appledrm.show_notch=1 on Linux
-#chosen.asahi,show-notch=1
+#chosen.aurora,show-notch=1
 
 # Bring up a second display (J873g: HDMI next to USB-C) with this mode;
 # "max" picks the largest mode from the monitor's own EDID
@@ -32,7 +32,7 @@
 
 # M4 MacBook Air (J713): hand the external display coprocessors over to the kernel
 # for external displays. Needs a kernel that adopts them
-#chosen.asahi,j713-dcpext=1
+#chosen.aurora,j713-dcpext=1
 
 # Add an arbitrary property to /chosen in the device tree
 #chosen.foo=bar

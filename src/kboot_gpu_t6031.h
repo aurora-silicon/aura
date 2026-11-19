@@ -10,8 +10,8 @@
  * T6031 (M3 Max, G15C) GPU handoff helpers for kboot_gpu.c: the bounded powered identity read,
  * the exact restore of the GPU power closure around it, and the loaded firmware image's facts.
  */
-#define T6031_GPU_IDENTITY      "asahi,t6031-gpu-powered-identity"
-#define T6031_GPU_IMAGE         "asahi,t6031-gpu-image"
+#define T6031_GPU_IDENTITY      "aurora,t6031-gpu-powered-identity"
+#define T6031_GPU_IMAGE         "aurora,t6031-gpu-image"
 #define T6031_GPU_CLUSTERS      4
 #define T6031_CORES_PER_CLUSTER 10
 #define T6031_CORE_SLOTS        (T6031_GPU_CLUSTERS * T6031_CORES_PER_CLUSTER)
@@ -55,11 +55,11 @@ struct t8122_powered_identity t6031_probe_run(const struct t6031_probe_ops *ops,
 
 /* G15C: family 7, variant 4, one die of 4 clusters, 1 to 40 cores in bits 0-39 of the masks */
 bool t6031_identity_valid(const struct t8122_powered_identity *id);
-/* Active cores per cluster (10-bit fields, as drm/asahi unpacks them); returns the total */
+/* Active cores per cluster (10-bit fields, as drm/aurora unpacks them); returns the total */
 u32 t6031_core_counts(const struct t8122_powered_identity *id, u32 counts[T6031_GPU_CLUSTERS]);
 
 /*
- * /chosen/asahi,t6031-gpu-powered-identity, the T8122 layout plus the power closure's registers:
+ * /chosen/aurora,t6031-gpu-powered-identity, the T8122 layout plus the power closure's registers:
  * reserved with probe-result 0 (not run) before any power-on, so that publishing never grows the
  * device tree, then filled with probe-result written last.
  */
@@ -68,7 +68,7 @@ int t6031_identity_publish(void *dt, const struct t8122_powered_identity *id,
                            const struct t6031_closure *c);
 
 /*
- * /chosen/asahi,t6031-gpu-image: the loaded GPU image's header facts, DRAM reads only. Returns the
+ * /chosen/aurora,t6031-gpu-image: the loaded GPU image's header facts, DRAM reads only. Returns the
  * 14.8.3 firmware version if the image is of the 14.8.3 family (see the .c file), else NULL.
  */
 const struct fw_version_info *dt_t6031_gpu_image(void *dt);

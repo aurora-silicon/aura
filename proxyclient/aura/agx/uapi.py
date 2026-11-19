@@ -8,9 +8,9 @@ __all__ = []
 
 DRM_COMMAND_BASE = 0x40
 
-ASAHI_BO_PIPELINE = 1
+AURORA_BO_PIPELINE = 1
 
-class drm_asahi_submit_t(ConstructClass):
+class drm_aurora_submit_t(ConstructClass):
     subcon = Struct(
         "cmdbuf" / Int64ul,
         "in_syncs" / Int64ul,
@@ -18,14 +18,14 @@ class drm_asahi_submit_t(ConstructClass):
         "out_sync" / Int32ul,
     )
 
-class drm_asahi_wait_bo_t(ConstructClass):
+class drm_aurora_wait_bo_t(ConstructClass):
     subcon = Struct(
         "handle" / Int32ul,
         Padding(4),
         "timeout_ns" / Int64sl,
     )
 
-class drm_asahi_create_bo_t(ConstructClass):
+class drm_aurora_create_bo_t(ConstructClass):
     subcon = Struct(
         "size" /  Int32ul,
         "flags" / Int32ul,
@@ -34,45 +34,45 @@ class drm_asahi_create_bo_t(ConstructClass):
         "offset" / Int64ul,
     )
 
-#class drm_asahi_mmap_bo_t(ConstructClass):
+#class drm_aurora_mmap_bo_t(ConstructClass):
     #subcon = Struct(
         #"handle" / Int32ul,
         #"flags" / Int32ul,
         #"offset" / Int64ul,
     #)
 
-class drm_asahi_get_param_t(ConstructClass):
+class drm_aurora_get_param_t(ConstructClass):
     subcon = Struct(
         "param" / Int32ul,
         Padding(4),
         "value" / Int64ul,
     )
 
-class drm_asahi_get_bo_offset_t(ConstructClass):
+class drm_aurora_get_bo_offset_t(ConstructClass):
     subcon = Struct(
         "handle" / Int32ul,
         Padding(4),
         "offset" / Int64ul,
     )
 
-ASAHI_MAX_ATTACHMENTS = 16
+AURORA_MAX_ATTACHMENTS = 16
 
-ASAHI_ATTACHMENT_C  = 0
-ASAHI_ATTACHMENT_Z  = 1
-ASAHI_ATTACHMENT_S  = 2
+AURORA_ATTACHMENT_C  = 0
+AURORA_ATTACHMENT_Z  = 1
+AURORA_ATTACHMENT_S  = 2
 
-class drm_asahi_attachment_t(ConstructClass):
+class drm_aurora_attachment_t(ConstructClass):
     subcon = Struct(
         "type" / Int32ul,
         "size" / Int32ul,
         "pointer" / Int64ul,
     )
 
-ASAHI_CMDBUF_LOAD_C = (1 << 0)
-ASAHI_CMDBUF_LOAD_Z = (1 << 1)
-ASAHI_CMDBUF_LOAD_S = (1 << 2)
+AURORA_CMDBUF_LOAD_C = (1 << 0)
+AURORA_CMDBUF_LOAD_Z = (1 << 1)
+AURORA_CMDBUF_LOAD_S = (1 << 2)
 
-class drm_asahi_cmdbuf_t(ConstructClass):
+class drm_aurora_cmdbuf_t(ConstructClass):
     subcon = Struct(
         "flags" / Int64ul,
 
@@ -108,7 +108,7 @@ class drm_asahi_cmdbuf_t(ConstructClass):
         "stencil_clear_value" / Int8ul,
         Padding(3),
 
-        "attachments" / Array(ASAHI_MAX_ATTACHMENTS, drm_asahi_attachment_t),
+        "attachments" / Array(AURORA_MAX_ATTACHMENTS, drm_aurora_attachment_t),
         "attachment_count" / Int32ul,
     )
 

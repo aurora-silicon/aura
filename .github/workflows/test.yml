@@ -62,6 +62,9 @@ jobs:
       - name: Test PMP boot data fixups
         run: sh tests/run-pmp-boot-data.sh
 
+      - name: Test the legacy /chosen aliases
+        run: sh tests/run-kboot-legacy.sh
+
       - name: Run pytest with clang
         if: matrix.os == 'ubuntu-latest' && matrix.compiler == 'llvm'
         env:

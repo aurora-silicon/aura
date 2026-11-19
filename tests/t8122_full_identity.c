@@ -37,12 +37,12 @@ static void tree(void *dt, int size, const char *compatible, const char *intent)
     int chosen = fdt_add_subnode(dt, 0, "chosen");
     assert(chosen >= 0);
     if (intent)
-        assert(!fdt_setprop_string(dt, chosen, "asahi,t8122-gpu", intent));
+        assert(!fdt_setprop_string(dt, chosen, "aurora,t8122-gpu", intent));
 }
 
 static u32 property(void *dt, const char *name)
 {
-    int node = fdt_path_offset(dt, "/chosen/asahi,t8122-gpu-powered-identity");
+    int node = fdt_path_offset(dt, "/chosen/aurora,t8122-gpu-powered-identity");
     assert(node >= 0);
     int len;
     const fdt32_t *value = fdt_getprop(dt, node, name, &len);
@@ -60,7 +60,7 @@ static void check_fields(void *dt, const struct t8122_powered_identity *raw)
     assert(property(dt, "core-mask-2") == raw->core_mask[2]);
     assert(property(dt, "id-counts-1") == raw->id_counts_1);
     assert(property(dt, "id-counts-2") == raw->id_counts_2);
-    int node = fdt_path_offset(dt, "/chosen/asahi,t8122-gpu-powered-identity");
+    int node = fdt_path_offset(dt, "/chosen/aurora,t8122-gpu-powered-identity");
     const u8 *id = fdt_getprop(dt, node, "id-version", NULL);
     assert(id[0] == 7 && id[1] == 2 && id[2] == 0x20 && id[3] == 0);
 }
@@ -91,7 +91,7 @@ int main(int argc, char **argv)
     for (unsigned i = 0; i < sizeof(intents) / sizeof(intents[0]); i++) {
         tree(dt, sizeof(dt), "apple,j613", intents[i]);
         assert(t8122_full_identity_prepare(dt) < 0);
-        assert(fdt_path_offset(dt, "/chosen/asahi,t8122-gpu-powered-identity") < 0);
+        assert(fdt_path_offset(dt, "/chosen/aurora,t8122-gpu-powered-identity") < 0);
     }
     tree(dt, sizeof(dt), "apple,j713", "1");
     assert(t8122_full_identity_prepare(dt) < 0);
@@ -190,7 +190,7 @@ int main(int argc, char **argv)
     assert(!fdt_pack(dt));
     assert(!fdt_open_into(dt, dt, fdt_totalsize(dt) + 60));
     assert(t8122_full_identity_prepare(dt) < 0);
-    assert(fdt_path_offset(dt, "/chosen/asahi,t8122-gpu-powered-identity") < 0);
+    assert(fdt_path_offset(dt, "/chosen/aurora,t8122-gpu-powered-identity") < 0);
     puts("full14 powered identity producer: positive 8/10-core, opt-in, chip/read/topology, "
          "rollback and FDT failure controls PASS");
     return 0;

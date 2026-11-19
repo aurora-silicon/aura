@@ -148,6 +148,7 @@ def make_record(seed, covered, secver, flags=0):
 
 
 def check_record(pub, rec, covered):
+    # LEGACY-ASAHI(2027-02-28): records signed before the rename carry "m1n1_sig"
     if rec[:8] not in (TAG, b"m1n1_sig") or rec[12:20] != BODY_MAGIC:
         return "bad-format", None, None
     version, alg, secver, flags, covered_len = struct.unpack("<IIIIQ", rec[20:44])
@@ -238,7 +239,7 @@ def main():
     elif a.cmd == "sign-payloads":
         data = open(a.inp, "rb").read()
         head, tail = data[: a.head_len], data[a.head_len :]
-        if tail[:8] in (TAG, b"m1n1_sig"):  # replace an earlier record
+        if tail[:8] in (TAG, b"m1n1_sig"):  # replace an earlier record (LEGACY-ASAHI(2027-02-28) tag too)
             (size,) = struct.unpack("<I", tail[8:12])
             tail = tail[size:]
         forbid_measure_lines(tail)

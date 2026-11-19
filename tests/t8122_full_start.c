@@ -191,7 +191,7 @@ static int g15_unset_fw_segs(void *dt, const char *path)
 static int g15_set_status(void *dt, const char *path, const char *status)
 {
     if (!strcmp(path, "gpu") && !strcmp(status, "okay")) {
-        int witness = fdt_path_offset(dt, "/chosen/asahi,t8122-gpu-powered-identity");
+        int witness = fdt_path_offset(dt, "/chosen/aurora,t8122-gpu-powered-identity");
         assert(witness >= 0);
         int len;
         const fdt32_t *result = fdt_getprop(dt, witness, "probe-result", &len);
@@ -259,7 +259,7 @@ static const struct g15_soc soc = {
     .name = "T8122",
     .gpu_name = "G15G",
     .compatible = "apple,agx-t8122",
-    .optin = "asahi,t8122-gpu",
+    .optin = "aurora,t8122-gpu",
     .id_gen = 7,
     .id_variant = 2,
     .dies = 1,
@@ -287,7 +287,7 @@ static void setup(void *dt, bool armed)
     assert(!fdt_setprop_u32(dt, 0, "#size-cells", 2));
     int node = fdt_add_subnode(dt, 0, "chosen");
     if (armed)
-        assert(!fdt_setprop_string(dt, node, "asahi,t8122-gpu", "1"));
+        assert(!fdt_setprop_string(dt, node, "aurora,t8122-gpu", "1"));
     node = fdt_add_subnode(dt, 0, "gpu");
     assert(!fdt_setprop_string(dt, node, "compatible", "apple,agx-t8122"));
     assert(!fdt_setprop_string(dt, node, "status", "disabled"));
@@ -322,7 +322,7 @@ static void check(void *dt, bool success, unsigned expected_enables, unsigned ex
     assert(disables == (expected_enables && !success ? 1 : 0));
     int gpu = fdt_path_offset(dt, "gpu");
     assert(!strcmp(fdt_getprop(dt, gpu, "status", NULL), success ? "okay" : "disabled"));
-    int node = fdt_path_offset(dt, "/chosen/asahi,t8122-gpu-powered-identity");
+    int node = fdt_path_offset(dt, "/chosen/aurora,t8122-gpu-powered-identity");
     if (node >= 0) {
         int len;
         const fdt32_t *result = fdt_getprop(dt, node, "probe-result", &len);
@@ -385,7 +385,7 @@ int main(void)
     powered = true; /* A pre-existing vote must not be touched or observed. */
     assert(!dt_set_gpu_g15(dt, &soc));
     assert(powered && !enables && !disables && !reads);
-    int witness = fdt_path_offset(dt, "/chosen/asahi,t8122-gpu-powered-identity");
+    int witness = fdt_path_offset(dt, "/chosen/aurora,t8122-gpu-powered-identity");
     assert(witness >= 0);
     const fdt32_t *result = fdt_getprop(dt, witness, "probe-result", NULL);
     assert(result && fdt32_ld(result) == T8122_ID_NOT_RUN);
@@ -397,7 +397,7 @@ int main(void)
     gpu = fdt_path_offset(dt, "gpu");
     assert(!g15_read_hw(dt, gpu, &soc, cores, &clusters, &enabled, &fused, NULL));
     assert(reads == 5 && !counts2_reads && enabled == 10 && clusters == 1);
-    assert(fdt_path_offset(dt, "/chosen/asahi,t8122-gpu-powered-identity") < 0);
+    assert(fdt_path_offset(dt, "/chosen/aurora,t8122-gpu-powered-identity") < 0);
 
     /* J615 follows the same full-start path with its own MMIO identity. */
     static const char j615[] = "apple,j615\0apple,t8122";
@@ -448,7 +448,7 @@ int main(void)
     gpu = fdt_path_offset(dt, "gpu");
     assert(!g15_read_hw(dt, gpu, &pro, cores, &clusters, &enabled, &fused, NULL));
     assert(reads == 4 && !counts2_reads && enabled == 20 && clusters == 2);
-    assert(fdt_path_offset(dt, "/chosen/asahi,t8122-gpu-powered-identity") < 0);
+    assert(fdt_path_offset(dt, "/chosen/aurora,t8122-gpu-powered-identity") < 0);
     puts("actual full14 start callers: 15 inherited and 10 J615 start/refusal controls, existing-vote refusal, "
          "GPU26/T6030 read-path preservation PASS");
 }

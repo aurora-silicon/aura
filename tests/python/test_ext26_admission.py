@@ -48,7 +48,7 @@ int main(void) {
  int panel=fdt_add_subnode(dt,0,"panel"); assert(panel>=0);
  int chosen=fdt_add_subnode(dt,0,"chosen"); assert(chosen>=0);
  assert(!dt_t8122_dcpext_armed());
- assert(!fdt_setprop_string(dt,chosen,"asahi,t8122-dcpext","1"));
+ assert(!fdt_setprop_string(dt,chosen,"aurora,t8122-dcpext","1"));
  assert(!dt_t8122_dcpext_armed());
  panel=fdt_path_offset(dt,"dcp");
  assert(!fdt_setprop_u32(dt,panel,"apple,t8122-handoff",1));
@@ -56,11 +56,11 @@ int main(void) {
  assert(!fdt_setprop_u32(dt,panel,"apple,j613-25g83-mapping-handoff",1));
  assert(!dt_t8122_dcpext_armed()); /* Old opt-in cannot arm native26. */
  chosen=fdt_path_offset(dt,"/chosen");
- assert(!fdt_setprop_string(dt,chosen,"asahi,j613-25g83-dcpext","1"));
+ assert(!fdt_setprop_string(dt,chosen,"aurora,j613-25g83-dcpext","1"));
  assert(dt_t8122_dcpext_armed());
  const char *bad[]={"", "0", "true", "11"};
  for (unsigned i=0;i<4;i++) {
-  assert(!fdt_setprop_string(dt,chosen,"asahi,j613-25g83-dcpext",bad[i]));
+  assert(!fdt_setprop_string(dt,chosen,"aurora,j613-25g83-dcpext",bad[i]));
   assert(!dt_t8122_dcpext_armed());
  }
  struct adt_segment_ranges segments[4] = {0};
@@ -100,14 +100,14 @@ int main(void) {
  assert(compat && compat_len==12 && fdt32_ld(compat)==26 && fdt32_ld(compat+1)==6 && fdt32_ld(compat+2)==2);
  ext26_step="locked-stream5-pages";dt_ext26_result(-7);
  chosen=fdt_path_offset(dt,"/chosen");
- assert(!strcmp(fdt_getprop(dt,chosen,"asahi,j613-25g83-dcpext-result",NULL),"step=locked-stream5-pages error=-7"));
+ assert(!strcmp(fdt_getprop(dt,chosen,"aurora,j613-25g83-dcpext-result",NULL),"step=locked-stream5-pages error=-7"));
  int ret=dt_display_transaction(reject_transaction,0); assert(ret==-17);
  dt_ext26_result(ret); chosen=fdt_path_offset(dt,"/chosen");
  assert(!fdt_getprop(dt,chosen,"partial-test-property",NULL));
- assert(!strcmp(fdt_getprop(dt,chosen,"asahi,j613-25g83-dcpext-result",NULL),"step=fixture-rollback error=-17"));
+ assert(!strcmp(fdt_getprop(dt,chosen,"aurora,j613-25g83-dcpext-result",NULL),"step=fixture-rollback error=-17"));
  strcpy(ext26_detail,"substep=L1-target l1=7 descriptor=123 page=456 bytes=4000");
  ext26_step="locked-table-collection";dt_ext26_result(-5);chosen=fdt_path_offset(dt,"/chosen");
- assert(!strcmp(fdt_getprop(dt,chosen,"asahi,j613-25g83-dcpext-result",NULL),"step=locked-table-collection error=-5 substep=L1-target l1=7 descriptor=123 page=456 bytes=4000"));
+ assert(!strcmp(fdt_getprop(dt,chosen,"aurora,j613-25g83-dcpext-result",NULL),"step=locked-table-collection error=-5 substep=L1-target l1=7 descriptor=123 page=456 bytes=4000"));
  ext26_detail[0]=0;
  external=fdt_path_offset(dt,"dcpext");
  int n;const char *published=fdt_getprop(dt,external,"apple,firmware-uuid",&n);

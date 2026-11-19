@@ -17,7 +17,7 @@ typedef uint8_t u8;
 typedef uint16_t u16;
 typedef uint32_t u32;
 typedef unsigned long u64;
-_Static_assert(sizeof(u64) == 8, "the m1n1 host fixture requires an LP64 host");
+_Static_assert(sizeof(u64) == 8, "the aura host fixture requires an LP64 host");
 #define PACKED __attribute__((packed))
 #define static_assert _Static_assert
 #define T8132 0x8132

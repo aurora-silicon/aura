@@ -18,14 +18,14 @@ bool t6031_board(const void *dt);
 bool t6032_board(const void *dt);
 
 /*
- * /chosen/asahi,t6031-fw-uuids: one "<owner>=<uuid>" string per firmware image iBoot loaded, for
+ * /chosen/aurora,t6031-fw-uuids: one "<owner>=<uuid>" string per firmware image iBoot loaded, for
  * gfx, dcp, dcpext0..3 and pmp, read from the ADT's iop nubs (<uuid> is "absent" or "invalid"
  * when the ADT has no well-formed one). ADT memory only.
  */
 void dt_t6031_fw_uuids(void *dt);
 
 /*
- * /chosen/asahi,t6031-facts: ADT values the kernel needs at boot and no device tree carries yet:
+ * /chosen/aurora,t6031-facts: ADT values the kernel needs at boot and no device tree carries yet:
  * disp0's clock ids and their /arm-io clock-frequencies entries (the display clock), and the
  * /arm-io/mcc register windows (the GPU's memory-cache IO mapping). ADT memory only; what the ADT
  * lacks is left out.

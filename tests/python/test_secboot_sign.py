@@ -82,7 +82,7 @@ def aura_stage2(footprint=0x20000):
 
 
 def composed(image, lines=b"chosen.aurora,stage1-flavour=secure\nmitigations=auto\n"):
-    # update-m1n1's order: aura, DTBs, gzip'd U-Boot, then the config lines with no separator.
+    # update-aura's order: aura, DTBs, gzip'd U-Boot, then the config lines with no separator.
     return image + b"\xd0\x0d\xfe\xed" + bytes(60) + b"\x1f\x8b\x08" + bytes(29) + lines
 
 

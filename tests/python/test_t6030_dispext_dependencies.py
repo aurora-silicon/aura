@@ -53,13 +53,14 @@ static void dispext6_handoff(void *tree, const struct dcpext6_inst *inst)
 }
 ''' + function("static bool dcpext6_flag(") +
         function("static void dcpext6_handoffs(") + r'''
+static const char *dispext_name = "aurora,t6030-dispext";
 static void world(const char *memory, const char *display, bool ext1, int reject)
 {
     assert(!fdt_create_empty_tree(dt, sizeof(blob)));
     int chosen = fdt_add_subnode(dt, 0, "chosen");
     assert(chosen >= 0);
-    if (memory) assert(!fdt_setprop_string(dt, chosen, "asahi,t6030-dcpext", memory));
-    if (display) assert(!fdt_setprop_string(dt, chosen, "asahi,t6030-dispext", display));
+    if (memory) assert(!fdt_setprop_string(dt, chosen, "aurora,t6030-dcpext", memory));
+    if (display) assert(!fdt_setprop_string(dt, chosen, dispext_name, display));
     assert(fdt_add_subnode(dt, 0, "dcpext0") >= 0);
     if (ext1) assert(fdt_add_subnode(dt, 0, "dcpext1") >= 0);
     int aliases = fdt_add_subnode(dt, 0, "aliases");
@@ -99,6 +100,13 @@ int main(void)
     assert(has("dcpext1", "display-ready"));
     world(NULL, "1", true, 1);
     assert(has("dcpext0", "display-ready") && !has("dcpext1", "display-ready"));
+    /* A J514S DT built before the rename names the switch asahi,t6030-dispext (LEGACY-ASAHI(2027-02-28)). */
+    dispext_name = "asahi,t6030-dispext";
+    world(NULL, "1", true, -1);
+    assert(has("dcpext0", "display-ready") && has("dcpext1", "display-ready"));
+    assert(ncalls == 4);
+    world(NULL, "0", true, -1);
+    assert(ncalls == 0);
     return 0;
 }
 ''')
