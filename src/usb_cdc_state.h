@@ -15,6 +15,8 @@ typedef uint64_t u64;
 #define USB_CDC_FLAG_FORCE_SWAPPED (1u << 0) /* drive the ATC lanes flipped */
 #define USB_CDC_FLAG_GEN1          (1u << 1) /* Gen1 descriptors and link: required */
 #define USB_CDC_FLAG_HPM_RESET     (1u << 2) /* cold-reset HPM0 first, retiring KIS */
+
+/* Every flag usb_cdc_schedule() accepts */
 #define USB_CDC_FLAGS_ALL (USB_CDC_FLAG_FORCE_SWAPPED | USB_CDC_FLAG_GEN1 | USB_CDC_FLAG_HPM_RESET)
 
 /* Accepted delay before a scheduled transition starts (policy, not a hardware wait). */
