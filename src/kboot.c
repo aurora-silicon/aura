@@ -7939,8 +7939,21 @@ static int dt_set_j713_display_maps(const struct adt_segment_ranges *segments, u
 }
 
 /*
+ * A T8132 Mac without a panel (the Mac mini) drives a fixed HDMI port from its main DCP. The
+ * tree says so on the DCP node; the ADT says so with disp0's "external".
+ */
+static bool dt_dcp_is_hdmi(int dcp_node)
+{
+    int len;
+    const char *type = fdt_getprop(dt, dcp_node, "apple,connector-type", &len);
+    return type && len == sizeof("HDMI-A") && !memcmp(type, "HDMI-A", len);
+}
+
+/*
  * Publish the inherited DCP firmware mapping without starting a display driver: on the J713
- * on any firmware as before, and on any other M4 Mac with a panel on 26.6.2.
+ * on any firmware as before, on any other M4 Mac with a panel on 26.6.2, and on any T8132 tree
+ * whose DCP drives an HDMI port when the ADT's disp0 is external too. All take the same path:
+ * the reservations come from the ADT's segment list.
  */
 static int dt_set_m4_dcp_handoff(void)
 {
@@ -7948,15 +7961,22 @@ static int dt_set_m4_dcp_handoff(void)
     if (dcp_node < 0)
         return 0; /* Older DT with simple-framebuffer only. */
     bool j713 = !fdt_node_check_compatible(dt, 0, "apple,j713");
-    if (chip_id != T8132 || (!j713 && os_firmware.version != V26_6_2) ||
+    bool hdmi = dt_dcp_is_hdmi(dcp_node);
+    if (chip_id != T8132 || (!j713 && !hdmi && os_firmware.version != V26_6_2) ||
         fdt_node_check_compatible(dt, dcp_node, "apple,t8132-dcp"))
         bail("FDT: unsupported native DCP handoff target\n");
-    /* The Mac mini's disp0 is external: its DCP drives a port, not a panel. */
+    /* A tree and a machine that disagree about what the DCP drives get no handoff. */
     if (!j713) {
         int disp0 = adt_path_offset(adt, "/arm-io/disp0");
-        if (disp0 < 0 || adt_getprop(adt, disp0, "external", NULL))
+        bool external = disp0 >= 0 && adt_getprop(adt, disp0, "external", NULL);
+        if (disp0 < 0 || (external && !hdmi))
             bail("FDT: no internal panel, no native DCP handoff\n");
+        if (hdmi && !external)
+            bail("FDT: HDMI DCP in the tree but a panel in the ADT, no native DCP handoff\n");
     }
+    /* The reservations below are appended: a tree that already lists some would double them. */
+    if (hdmi && fdt_getprop(dt, dcp_node, "memory-region", NULL))
+        bail("FDT: HDMI DCP already has memory-region in the tree, no native DCP handoff\n");
 
     int nub = adt_path_offset(adt, "/arm-io/dcp/iop-dcp-nub");
     if (nub < 0)
@@ -8010,7 +8030,8 @@ static int dt_set_m4_dcp_handoff(void)
             printf("FDT: M4 PIODMA handoff unqualified; retaining disabled device\n");
     }
 
-    printf("FDT: M4 DCP firmware mappings published; display device status unchanged\n");
+    printf("FDT: M4 DCP firmware mappings published%s; display device status unchanged\n",
+           hdmi ? " (HDMI DCP, external disp0)" : "");
     return 0;
 }
 

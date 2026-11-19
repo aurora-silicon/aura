@@ -2,7 +2,12 @@
 """Run the M4 internal DCP handoff, with production kboot code and real FDTs, per board.
 
 Each board's DCP segment list is the one its ADT carries (the J713 on 26.5.1, the J604 and
-the J773g on 26.6.2, the J715 on 27.0). The handed-over trees are written out as DTBs.
+the J773g on 26.6.2, the J715 on 27.0, the J773g again on the 27.2 stub). The handed-over trees
+are written out as DTBs.
+
+The Mac mini has no panel. Its handoff is decided by two properties, not by its name: the
+tree's DCP says apple,connector-type = "HDMI-A" and the ADT's disp0 is external. The test gives
+those two properties to trees of other names and takes them away from the J773g's.
 """
 
 import re
@@ -31,6 +36,7 @@ def test_m4_dcp_handoff_follows_the_firmware_and_the_panel(tmp_path):
         function(kboot, "dt_device_add_mem_region") + function(kboot, "dt_set_dcp_firmware") +
         function(kboot, "dt_reserve_asc_segments_at") + function(kboot, "dt_reserve_asc_segments") + function(kboot, "dt_reserve_asc_firmware") +
         maps + function(kboot, "j713_display_page") + function(kboot, "dt_set_j713_display_maps") +
+        function(kboot, "dt_dcp_is_hdmi", "static bool ") +
         function(kboot, "dt_set_m4_dcp_handoff"))
     production = function(firmware, "firmware_set_fdt", "int ") + production
     assert not re.search(r"\bdt_set_j713_dcp_handoff\b", kboot)
@@ -57,7 +63,7 @@ typedef uint8_t u8;
 #define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
 #define bail(...) do { printf(__VA_ARGS__); return -1; } while (0)
 enum fw_version { V12_3, V12_3_1, V12_4, V13_5B4, V13_5, V13_6_1, V14_7, V26_5, V26_6, V26_6_2,
-                  V27_0 };
+                  V27_0, V27_2 };
 struct fw_version_info {
     enum fw_version version;
     const char *string;
@@ -73,6 +79,7 @@ static const struct fw_version_info fw_versions[] = {
     [V26_6] = {V26_6, "26.6", {26, 6, 0}, 3, ""},
     [V26_6_2] = {V26_6_2, "26.6.2", {26, 6, 2}, 3, ""},
     [V27_0] = {V27_0, "27.0", {27, 0, 0}, 2, ""},
+    [V27_2] = {V27_2, "27.2", {27, 2, 0}, 2, ""},
 };
 static struct fw_version_info os_firmware;
 ''' + layout + r'''
@@ -87,6 +94,7 @@ struct board {
     bool native;  /* the DT asks for PIODMA and scanout (t8132-laptop.dtsi) */
     unsigned count;
     struct adt_segment_ranges segs[7];
+    bool hdmi;    /* the DT's DCP has apple,connector-type = "HDMI-A" */
 };
 #define FW2662 "81BAF476-679D-3CC0-8C6A-E6B6FA659D5E"
 #define SEG(p, i, r, s, f) {.phys = p, .iova = i, .remap = r, .size = s, .unk = f}
@@ -120,6 +128,16 @@ static const struct board j773g = {"j773g", FW2662, 16UL << 30, 1, false, 6, { /
     SEG(0x100002a8000, 0, 0x10001c4c000, 0x806000, 1),
     SEG(0x103e4f94000, 0x806000, 0x10002454000, 0x325000, 0),
     SEG(0x10003f0c000, 0xb2b000, 0x10003f0c000, 0x24000, 10),
+    SEG(0x103e5c1c000, NONE, 0x10000b70000, 0x1000000, 2),
+    SEG(0x103e5c18000, NONE, 0x10001b88000, 0x4000, 2),
+    SEG(0x103e5b58000, NONE, 0x10001b8c000, 0xc0000, 2)}};
+
+/* The same machine on the macOS 27.2 (26B123) stub: another image, an OS log of 0x26000. */
+static const struct board j773g_272 = {"j773g", "B3BA603C-3CA7-3E21-B393-44EB20BD2AEF",
+                                       16UL << 30, 1, false, 6, {
+    SEG(0x100002a8000, 0, 0x10001c4c000, 0x843000, 1),
+    SEG(0x103e4f90000, 0x843000, 0x10002490000, 0x32c000, 0),
+    SEG(0x1000de0c000, 0xb6f000, 0x1000de0c000, 0x26000, 10),
     SEG(0x103e5c1c000, NONE, 0x10000b70000, 0x1000000, 2),
     SEG(0x103e5c18000, NONE, 0x10001b88000, 0x4000, 2),
     SEG(0x103e5b58000, NONE, 0x10001b8c000, 0xc0000, 2)}};
@@ -207,6 +225,8 @@ static void world(const struct board *board, enum fw_version fw)
     assert(!fdt_setprop_string(dt, dcp, "compatible", "apple,t8132-dcp"));
     assert(!fdt_setprop(dt, dcp, "iommus", iommus, sizeof(iommus)));
     assert(!fdt_setprop_string(dt, dcp, "status", "disabled"));
+    if (b.hdmi)
+        assert(!fdt_setprop_string(dt, dcp, "apple,connector-type", "HDMI-A"));
     if (b.native) {
         assert(!fdt_setprop_empty(dt, dcp, "apple,j713-native-piodma"));
         assert(!fdt_setprop_empty(dt, dcp, "apple,j713-native-scanout"));
@@ -341,12 +361,58 @@ int main(int argc, char **argv)
             refused();
         }
 
-    /* No internal panel: the Mac mini, or no disp0 at all. */
-    world(&j773g, V26_6_2); refused(); save("j773g-26.6.2");
-    world(&j773g, V26_6); refused();
-    struct board bare = j604;
+    /*
+     * An HDMI DCP in the tree and an external disp0 in the ADT: handed over through the same
+     * path, on any firmware and under any board name. Nothing reads the display DART.
+     */
+    struct board mini = j773g, mini272 = j773g_272;
+    mini.hdmi = mini272.hdmi = true;
+    handed_over(&mini, V26_6_2, false);
+    handed_over(&mini272, V27_2, false);
+    handed_over(&mini272, V27_0, false);
+    /* The 27.2 OS log is not a 16K multiple: its reservation is rounded up to 0x28000. */
+    world(&mini272, V27_2);
+    assert(!dt_set_m4_dcp_handoff());
+    {
+        int len, node = fdt_subnode_offset(dt, fdt_path_offset(dt, "/reserved-memory"),
+                                           "asc-firmware@1000de0c000");
+        const fdt64_t *reg = fdt_getprop(dt, node, "reg", &len);
+        assert(reg && len == 16 && fdt64_ld(&reg[1]) == 0x28000);
+        assert(fdt_getprop(dt, node, "apple,dcp-os-log", NULL));
+    }
+    struct board renamed = mini272;
+    renamed.name = "j999";
+    handed_over(&renamed, V27_2, false);
+
+    /* Either property missing, or the two disagreeing: refused, tree untouched. */
+    world(&j773g, V26_6_2); refused(); save("j773g-no-connector-type"); /* tree does not say HDMI */
+    world(&j773g_272, V27_2); refused();
+    world(&mini272, V27_2);
+    assert(!fdt_setprop_string(dt, fdt_path_offset(dt, "dcp"), "apple,connector-type", "DP"));
+    refused();
+    struct board panel_hdmi = j604; /* HDMI tree, but the ADT has a panel */
+    panel_hdmi.hdmi = true;
+    world(&panel_hdmi, V26_6_2); refused();
+    world(&panel_hdmi, V27_2); refused();
+    struct board bare = j604; /* no disp0 at all */
     bare.external = -1;
     world(&bare, V26_6_2); refused();
+    bare.hdmi = true;
+    world(&bare, V27_2); refused();
+
+    /* An HDMI tree that already lists DCP regions would have them doubled: refused. */
+    world(&mini272, V27_2);
+    assert(!fdt_setprop_u32(dt, fdt_path_offset(dt, "dcp"), "memory-region", 99));
+    refused();
+
+    /* The ADT side incomplete: no image UUID, an empty list, a segment outside DRAM. */
+    struct board broken = mini272;
+    broken.uuid = "";
+    world(&broken, V27_2); refused();
+    broken = mini272; broken.count = 0;
+    world(&broken, V27_2); refused();
+    broken = mini272; broken.segs[5].phys = 0x20000000000UL;
+    world(&broken, V27_2); refused();
 
     /* Not a T8132, or not its DCP. */
     world(&j713, V26_6_2); chip_id = T8122; refused();
@@ -368,7 +434,8 @@ int main(int argc, char **argv)
     lib = ROOT / "src/libfdt"
     subprocess.run(
         ["cc", "-std=gnu11", "-D_GNU_SOURCE", "-Wall", "-Wextra", "-Werror",
-         "-Wno-unused-parameter", "-Wno-unused-function", "-I", str(lib), "-x", "c", "-",
+         "-Wno-unused-parameter", "-Wno-unused-function", "-Wno-missing-field-initializers",
+         "-I", str(lib), "-x", "c", "-",
          *map(str, (lib / f for f in (
              "fdt.c", "fdt_ro.c", "fdt_rw.c", "fdt_sw.c", "fdt_wip.c",
              "fdt_empty_tree.c", "fdt_strerror.c"))), "-o", str(binary)],
@@ -376,7 +443,12 @@ int main(int argc, char **argv)
     )
     result = subprocess.run([str(binary), str(tmp_path)], capture_output=True, text=True)
     assert result.returncode == 0, result.stdout + result.stderr
-    for name in ("j713-26.6.2", "j604-26.6.2", "j715-26.6.2", "j624-26.6.2", "j773g-26.6.2"):
+    for name in ("j713-26.6.2", "j604-26.6.2", "j715-26.6.2", "j624-26.6.2", "j773g-26.6.2",
+                 "j773g-27.2", "j999-27.2", "j773g-no-connector-type"):
         assert (tmp_path / f"{name}.dtb").stat().st_size > 0
     # The refusals say why.
     assert "no internal panel" in result.stdout
+    assert "HDMI DCP in the tree but a panel in the ADT" in result.stdout
+    assert "HDMI DCP already has memory-region" in result.stdout
+    # The line a hardware boot is judged by: once per HDMI handoff, never for a panel Mac.
+    assert result.stdout.count("published (HDMI DCP, external disp0)") == 5
