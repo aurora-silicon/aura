@@ -44,14 +44,37 @@ u64 sptm_virt_gpu_nrec;
 volatile u64 sptm_virt_gpu_head;
 u64 sptm_virt_gpu_keep = GPU_RING_KEEP;
 
-/* Set by the host before entry (run_guest_sptm.py). */
-u32 sptm_virt_gpu_stop_secs;      /* park this long after the first GPU access; 0 = never */
-u32 sptm_virt_gpu_stop_boot_secs; /* park this long after the guest's entry, GPU or not; 0 = never
-                                   */
-u64 sptm_virt_gpu_stop_msg; /* park after a write of this value (a mailbox message); 0 = never */
-u32 sptm_virt_gpu_print_max = 20000;
-u32 sptm_virt_gpu_ring_mib = 64; /* a steady stream of kicks fills 16 MiB in seconds */
-u32 sptm_virt_gpu_pmp = 1;       /* also hook the PMP's dashboard and mailbox */
+/*
+ * Set by the host before entry (run_guest_sptm.py). An ESP boot has no host, so a trace build
+ * sets them instead (-DSPTM_VIRT_GPU_STOP_SECS=... and so on).
+ */
+#ifndef SPTM_VIRT_GPU_STOP_SECS
+#define SPTM_VIRT_GPU_STOP_SECS 0
+#endif
+#ifndef SPTM_VIRT_GPU_STOP_BOOT_SECS
+#define SPTM_VIRT_GPU_STOP_BOOT_SECS 0
+#endif
+#ifndef SPTM_VIRT_GPU_STOP_MSG
+#define SPTM_VIRT_GPU_STOP_MSG 0
+#endif
+#ifndef SPTM_VIRT_GPU_PRINT_MAX
+#define SPTM_VIRT_GPU_PRINT_MAX 20000
+#endif
+#ifndef SPTM_VIRT_GPU_RING_MIB
+#define SPTM_VIRT_GPU_RING_MIB 64 /* a steady stream of kicks fills 16 MiB in seconds */
+#endif
+#ifndef SPTM_VIRT_GPU_PMP
+#define SPTM_VIRT_GPU_PMP 1
+#endif
+/* Park this long after the first GPU access; 0 = never. */
+u32 sptm_virt_gpu_stop_secs = SPTM_VIRT_GPU_STOP_SECS;
+/* Park this long after the guest's entry, GPU or not; 0 = never. */
+u32 sptm_virt_gpu_stop_boot_secs = SPTM_VIRT_GPU_STOP_BOOT_SECS;
+/* Park after a write of this value (a mailbox message); 0 = never. */
+u64 sptm_virt_gpu_stop_msg = SPTM_VIRT_GPU_STOP_MSG;
+u32 sptm_virt_gpu_print_max = SPTM_VIRT_GPU_PRINT_MAX;
+u32 sptm_virt_gpu_ring_mib = SPTM_VIRT_GPU_RING_MIB;
+u32 sptm_virt_gpu_pmp = SPTM_VIRT_GPU_PMP; /* also hook the PMP's dashboard and mailbox */
 
 static struct {
     u64 base, size;
