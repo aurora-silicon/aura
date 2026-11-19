@@ -205,15 +205,15 @@ int main(void)
 {
     run("legacy only", T8142, 0, 1, false, "disp0_piodma", "/legacy");
     run("canonical only", T8142, 1, 0, false, "disp0-piodma", "/canonical");
-    run("both different", T8142, 1, 1, false, "disp0-piodma", "/canonical");
-    run("both same", T8142, 1, 1, true, "disp0-piodma", "/canonical");
-    run("invalid canonical does not fall back", T8142, 2, 1, false, "disp0-piodma", NULL);
-    run("invalid legacy", T8142, 0, 2, false, "disp0_piodma", NULL);
-    run("no aliases", T8142, 0, 0, false, "disp0_piodma", NULL);
+    run("both different", T8142, 1, 1, false, "disp0_piodma", "/legacy");
+    run("both same", T8142, 1, 1, true, "disp0_piodma", "/canonical");
+    run("invalid canonical only", T8142, 2, 0, false, "disp0-piodma", NULL);
+    run("invalid legacy does not fall back", T8142, 1, 2, false, "disp0_piodma", NULL);
+    run("no aliases", T8142, 0, 0, false, "disp0-piodma", NULL);
     run("M1 precedence unchanged", T8103, 1, 1, false, "disp0_piodma", "/legacy");
     run("M2 precedence unchanged", T8112, 1, 1, false, "disp0_piodma", "/legacy");
     reset(T8142, 1, 1, false);
-    refuse_phandle = 3;
+    refuse_phandle = 4;
     assert(dt_set_display() == -1);
     assert(!owner_enables && !vram_calls && !segment_calls);
     assert(!has_regions("/canonical") && !has_regions("/legacy"));
