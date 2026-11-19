@@ -453,12 +453,17 @@ static bool nvme_own_rtkit(void)
 
 /*
  * T6040/T6041 (M4 Pro/Max): a cold start of ANS after the generic power-off gets no RTKit HELLO
- * (ASC CPU running, pmgr domains on), and an RTKit quiesce times out. Keep ANS live between
- * stages and adopt it in the next stage, as T6050 does.
+ * (ASC CPU running, pmgr domains on), and an RTKit quiesce times out. T8132 (M4): the same cold
+ * start intermittently leaves the next stage without NVMe after a warm reboot. Keep ANS live
+ * between stages and adopt it in the next stage, as T6050 does.
+ *
+ * Not every post-M4 ANS (nvme_post_m4()) is listed. T8152 stays quiesced: its Linux driver wakes
+ * ANS with a fresh RTKit handshake and neither adopts a live session nor restarts a stopped one.
+ * T8140 keeps the power-off path, which works there; live adoption by the next stage is untested.
  */
 static bool nvme_post_m4_keeps_live(void)
 {
-    return chip_id == T6040 || chip_id == T6041;
+    return chip_id == T6040 || chip_id == T6041 || chip_id == T8132;
 }
 
 static bool nvme_post_m4_hands_on_live(void)
@@ -958,10 +963,11 @@ bool nvme_shutdown(void)
     /*
      * T6040/T6041: the firmware acknowledges neither an RTKit power transition (quiesce times out)
      * nor a start after power-off (no HELLO), but a session left fully running is adopted by the
-     * next nvme_init() and reads correctly (J614c, 3/3 cycles). Hand it on with the controller
-     * enabled and RTKit untouched; only the I/O queue registers are cleared.
+     * next nvme_init() and reads correctly (J614c, 3/3 cycles). T8132 is handed on the same way
+     * (J713). Hand it on with the controller enabled and RTKit untouched; only the I/O queue
+     * registers are cleared. A next stage that asks for a quiesced ANS still gets one.
      */
-    if (nvme_type == NVME_T8132 && nvme_post_m4_keeps_live()) {
+    if (nvme_type == NVME_T8132 && nvme_post_m4_keeps_live() && !nvme_quiesce_for_next) {
         write64_lo_hi(nvme_qreg(NVME_IOQ_CMDS), 0);
         write64_lo_hi(nvme_qreg(NVME_IOQ_CQES), 0);
         nvme_initialized = false;

@@ -341,8 +341,11 @@ int main(int argc, char **argv)
         assert(nvme_initialized);
         assert(nvme_shutdown());
         assert(!nvme_initialized);
-        /* Powered off, post-M4 frees its queues too; only Linux's live handoff keeps them. */
-        assert(queue_frees == (failure == 9 ? 0 : 2));
+        /*
+         * Powered off, post-M4 frees its queues too. Linux's live handoff keeps them, and so does
+         * T8132 (23, 26), which hands its session on live to the next stage.
+         */
+        assert(queue_frees == (failure == 9 || failure == 23 || failure == 26 ? 0 : 2));
         assert(resets == (legacy ? 2 : 0));
         /* A healthy shutdown still allows reinitialization. */
         assert(nvme_init());
