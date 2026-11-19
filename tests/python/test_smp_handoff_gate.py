@@ -70,6 +70,7 @@ static int fdt_pack(void *p) { return 0; }
 static u32 fdt_totalsize(void *p) { return 0x8000; }
 static int dapf_init_fdt(void *p) { return 0; }
 static int dapf_init_all(void) { return 0; }
+static int dt_set_ave_dapf(void) { return 0; }
 static void pcie_shutdown(void) {}
 static void smp_set_wfe_mode(bool value) {}
 /* The J614s AOP/ISP handoff is gated on the board; no modelled chip is a J614s. */
