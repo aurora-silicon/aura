@@ -5,6 +5,8 @@
 #include "dart.h"
 #include "soc.h"
 #include "string.h"
+#include "usb_atc_regs.h"
+#include "usb_dwc3_regs.h"
 #include "utils.h"
 
 #define USB0_DWC  0x402430000ULL
@@ -15,6 +17,11 @@
 #define USB0_AON  0x308290100ULL
 #define USB0_GATE 0x308290120ULL
 #define USB0_WAIT 250000
+
+/* USB2 event counter: advances only while the PHY's UTMI clock runs. */
+#define USB0_EVT_USB2_COUNT 0x20
+/* GSNPSID of the DWC_usb31 core this path was brought up on. */
+#define USB0_GSNPSID 0x33313130
 
 static bool reg_is(const char *path, const char *compat, unsigned idx, u64 base, u64 size)
 {
@@ -170,39 +177,44 @@ dwc3_dev_t *usb_t8152_init(void (*set_step)(unsigned step))
         return NULL;
 
     set_step(3);
-    if (read32(USB0_PIPE + 0xc) != 0x42 || read32(USB0_PIPE + 0x1c) != 0 || read32(USB0_PHY) != 4 ||
-        read32(USB0_PHY + 4) != 0xb)
+    if (read32(USB0_PIPE + PIPEHANDLER_MUX_CTRL) != PIPEHANDLER_MUX_T8142(DUMMY, DUMMY) ||
+        read32(USB0_PIPE + PIPEHANDLER_AON_GEN) != 0 ||
+        read32(USB0_PHY + USB2PHY_USBCTL) != USB2PHY_USBCTL_ISOLATION ||
+        read32(USB0_PHY + USB2PHY_CTL) !=
+            (USB2PHY_CTL_SIDDQ | USB2PHY_CTL_PORT_RESET | USB2PHY_CTL_RESET))
         return NULL;
-    clear32(USB0_DWC + 0xc200, 0x40);
-    clear32(USB0_DWC + 0xc2c0, 0x20000);
-    write32(USB0_PIPE + 0x1c, 1);
-    if (read32(USB0_DWC + 0xc120) != 0x33313130 || (read32(USB0_DWC + 0xc704) & BIT(31))) {
-        write32(USB0_PIPE + 0x1c, 0);
+    clear32(USB0_DWC + DWC3_GUSB2PHYCFG(0), DWC3_GUSB2PHYCFG_SUSPHY);
+    clear32(USB0_DWC + DWC3_GUSB3PIPECTL(0), DWC3_GUSB3PIPECTL_SUSPHY);
+    write32(USB0_PIPE + PIPEHANDLER_AON_GEN, PIPEHANDLER_AON_GEN_DWC3_RESET_N);
+    if (read32(USB0_DWC + DWC3_GSNPSID) != USB0_GSNPSID ||
+        (read32(USB0_DWC + DWC3_DCTL) & DWC3_DCTL_RUN_STOP)) {
+        write32(USB0_PIPE + PIPEHANDLER_AON_GEN, 0);
         return NULL;
     }
-    write32(USB0_PIPE + 0x1c, 0);
+    write32(USB0_PIPE + PIPEHANDLER_AON_GEN, 0);
     phy_tuning(phy, "tunable_USB2PHY_DFLT", true);
     phy_tuning(phy, "tunable_USB2PHY_DEV", true);
-    set32(USB0_PHY + 8, 4);
-    set32(USB0_PHY + 8, 8);
+    set32(USB0_PHY + USB2PHY_SIG, USB2PHY_SIG_VBUSVLDEXT_FORCE_VAL);
+    set32(USB0_PHY + USB2PHY_SIG, USB2PHY_SIG_VBUSVLDEXT_FORCE_EN);
     mdelay(10);
-    clear32(USB0_PHY + 4, 8);
+    clear32(USB0_PHY + USB2PHY_CTL, USB2PHY_CTL_SIDDQ);
     udelay(10);
-    clear32(USB0_PHY + 4, 1);
-    clear32(USB0_PHY + 4, 2);
-    set32(USB0_EVT, 9);
-    set32(USB0_PHY + 4, 4);
-    clear32(USB0_PHY + 0x1c, BIT(29));
-    clear32(USB0_PHY + 0x1c, BIT(30));
+    clear32(USB0_PHY + USB2PHY_CTL, USB2PHY_CTL_RESET);
+    clear32(USB0_PHY + USB2PHY_CTL, USB2PHY_CTL_PORT_RESET);
+    set32(USB0_EVT + ATCPHY_EVT_USB2_CTL,
+          ATCPHY_EVT_USB2_CTL_EVT_EN | ATCPHY_EVT_USB2_CTL_LOAD_CNT);
+    set32(USB0_PHY + USB2PHY_CTL, USB2PHY_CTL_APB_RESET_N);
+    clear32(USB0_PHY + USB2PHY_MISCTUNE, USB2PHY_MISCTUNE_APBCLK_GATE_OFF);
+    clear32(USB0_PHY + USB2PHY_MISCTUNE, USB2PHY_MISCTUNE_REFCLK_GATE_OFF);
     udelay(30);
-    if (!read32(USB0_EVT + 0x20)) {
+    if (!read32(USB0_EVT + USB0_EVT_USB2_COUNT)) {
         printf("USB0: no UTMI clock; leaving controller in reset\n");
         return NULL;
     }
     mdelay(5);
-    mask32(USB0_PHY, 7, 2);
-    write32(USB0_PIPE + 0x1c, 1);
-    set32(USB0_PIPE + 0x20, BIT(15)); /* DUMMY_PHY_READY */
+    mask32(USB0_PHY + USB2PHY_USBCTL, USB2PHY_USBCTL_USB_MODE, USB2PHY_USBCTL_RUN);
+    write32(USB0_PIPE + PIPEHANDLER_AON_GEN, PIPEHANDLER_AON_GEN_DWC3_RESET_N);
+    set32(USB0_PIPE + PIPEHANDLER_NONSELECTED_OVERRIDE, PIPEHANDLER_DUMMY_PHY_EN);
 
     set_step(4);
     dart_dev_t *dart = dart_gen3_init_adt_cold("/arm-io/dart-usb0", 1, 1);

@@ -15,6 +15,7 @@
 #include "tps6598x.h"
 #include "tunables.h"
 #include "types.h"
+#include "usb_atc_regs.h"
 #include "usb_cdc.h"
 #include "usb_cdc_atc.h"
 #include "usb_dwc3.h"
@@ -50,47 +51,6 @@ struct usb_drd_regs {
 
 static tps6598x_irq_state_t tps6598x_irq_state[USB_IODEV_COUNT];
 static bool usb_is_initialized = false;
-
-/* USB2 PHY regs */
-#define USB2PHY_USBCTL           0x00
-#define USB2PHY_USBCTL_USB_MODE  0x7
-#define USB2PHY_USBCTL_RUN       2
-#define USB2PHY_USBCTL_ISOLATION 4
-
-#define USB2PHY_CTL             0x04
-#define USB2PHY_CTL_RESET       BIT(0)
-#define USB2PHY_CTL_PORT_RESET  BIT(1)
-#define USB2PHY_CTL_APB_RESET_N BIT(2)
-#define USB2PHY_CTL_SIDDQ       BIT(3)
-
-#define USB2PHY_SIG                      0x08
-#define USB2PHY_SIG_VBUSDET_FORCE_VAL    BIT(0)
-#define USB2PHY_SIG_VBUSDET_FORCE_EN     BIT(1)
-#define USB2PHY_SIG_VBUSVLDEXT_FORCE_VAL BIT(2)
-#define USB2PHY_SIG_VBUSVLDEXT_FORCE_EN  BIT(3)
-#define USB2PHY_SIG_HOST                 (7 << 12)
-
-#define USB2PHY_MISCTUNE                 0x1c
-#define USB2PHY_MISCTUNE_APBCLK_GATE_OFF BIT(29)
-#define USB2PHY_MISCTUNE_REFCLK_GATE_OFF BIT(30)
-
-#define PIPEHANDLER_MUX_CTRL             0x0c
-#define PIPEHANDLER_MUX_CTRL_USB3        0x08
-#define PIPEHANDLER_MUX_CTRL_USB4_TUNNEL 0x11
-#define PIPEHANDLER_MUX_CTRL_DUMMY       0x22
-
-#define PIPEHANDLER_LOCK_REQ 0x10
-#define PIPEHANDLER_LOCK_ACK 0x14
-#define PIPEHANDLER_LOCK_EN  BIT(0)
-
-#define PIPEHANDLER_AON_GEN                     0x1C
-#define PIPEHANDLER_AON_GEN_DWC3_FORCE_CLAMP_EN BIT(4)
-#define PIPEHANDLER_AON_GEN_DWC3_RESET_N        BIT(0)
-
-#define PIPEHANDLER_NONSELECTED_OVERRIDE 0x20
-#define PIPEHANDLER_NATIVE_RESET         BIT(12)
-#define PIPEHANDLER_DUMMY_PHY_EN         BIT(15)
-#define PIPEHANDLER_NATIVE_POWER_DOWN    GENMASK(3, 0)
 
 static dart_dev_t *usb_dart_init(u32 idx)
 {
@@ -200,6 +160,11 @@ static int usb_t6050_get_regs(struct usb_t6050_regs *regs)
  * apple_t6050_usb3_pipe.h (cold dummy), atc-t6050-combo.h (reset).
  * Only USB2 is needed: no ACIO firmware, high-speed lanes or internal PHY3.
  * Device-role values come from this machine's ADT, not the host-role table. */
+
+/* Older loaders leave the PIPE on the dummy data producer with the clock field
+ * as the domain came up (0x22, see apple_t6050_usb3_pipe_cold_dummy()). */
+#define T6050_MUX_OLD_LOADER_RELEASED PIPEHANDLER_MUX_T8142(USB4, DUMMY)
+
 static dwc3_dev_t *usb_t6050_init(void (*set_step)(unsigned step))
 {
     struct usb_t6050_regs regs;
@@ -216,7 +181,7 @@ static dwc3_dev_t *usb_t6050_init(void (*set_step)(unsigned step))
 
     u64 pipe = regs.pipe;
     u32 aon = read32(pipe + PIPEHANDLER_AON_GEN);
-    u32 mux = read32(pipe + PIPEHANDLER_MUX_CTRL) & 0x73;
+    u32 mux = read32(pipe + PIPEHANDLER_MUX_CTRL) & PIPEHANDLER_MUX_CTRL_T8142_MASK;
     if (dart_adt_locked("/arm-io/dart-usb0", 1)) {
         printf("CDC USB2: T6050 USB DART is locked; leaving it alone\n");
         return NULL;
@@ -224,14 +189,15 @@ static dwc3_dev_t *usb_t6050_init(void (*set_step)(unsigned step))
     /* An in-place raw chainload retires Stage 1's gadget before this stage
      * starts. Older loaders leave its dummy PIPE released (0x22). Accept
      * only that fully stopped device, never a live or native PIPE producer. */
-    if ((aon & PIPEHANDLER_AON_GEN_DWC3_RESET_N) || mux == 0x22) {
+    if ((aon & PIPEHANDLER_AON_GEN_DWC3_RESET_N) || mux == T6050_MUX_OLD_LOADER_RELEASED) {
         u32 gctl = read32(regs.dwc + DWC3_GCTL);
-        bool retired = (mux == 0x22 || mux == 0x42) &&
-                       (gctl & DWC3_GCTL_PRTCAPDIR(DWC3_GCTL_PRTCAP_OTG)) ==
-                           DWC3_GCTL_PRTCAPDIR(DWC3_GCTL_PRTCAP_DEVICE) &&
-                       !(read32(regs.dwc + DWC3_DCTL) & DWC3_DCTL_RUN_STOP) &&
-                       (read32(regs.dwc + DWC3_DSTS) & DWC3_DSTS_DEVCTRLHLT) &&
-                       !read32(regs.dwc + DWC3_DEVTEN) && !read32(regs.dwc + DWC3_DALEPENA);
+        bool retired =
+            (mux == T6050_MUX_OLD_LOADER_RELEASED || mux == PIPEHANDLER_MUX_T8142(DUMMY, DUMMY)) &&
+            (gctl & DWC3_GCTL_PRTCAPDIR(DWC3_GCTL_PRTCAP_OTG)) ==
+                DWC3_GCTL_PRTCAPDIR(DWC3_GCTL_PRTCAP_DEVICE) &&
+            !(read32(regs.dwc + DWC3_DCTL) & DWC3_DCTL_RUN_STOP) &&
+            (read32(regs.dwc + DWC3_DSTS) & DWC3_DSTS_DEVCTRLHLT) &&
+            !read32(regs.dwc + DWC3_DEVTEN) && !read32(regs.dwc + DWC3_DALEPENA);
         if (!retired) {
             printf("CDC USB2: T6050 PIPE consumer is not retired (aon=%x mux=%x)\n", aon, mux);
             return NULL;
@@ -242,18 +208,24 @@ static dwc3_dev_t *usb_t6050_init(void (*set_step)(unsigned step))
             return NULL;
         udelay(10);
         printf("CDC USB2: retired Stage 1 gadget held in reset\n");
-    } else if (mux != 0 && mux != 2 && mux != 0x42) {
+    } else if (mux != PIPEHANDLER_MUX_T8142(OFF, USB3) &&
+               mux != PIPEHANDLER_MUX_T8142(OFF, DUMMY) &&
+               mux != PIPEHANDLER_MUX_T8142(DUMMY, DUMMY)) {
         printf("CDC USB2: unknown T6050 PIPE producer (aon=%x mux=%x)\n", aon, mux);
         return NULL;
     }
     set32(pipe + PIPEHANDLER_AON_GEN, PIPEHANDLER_AON_GEN_DWC3_FORCE_CLAMP_EN);
-    mask32(pipe + PIPEHANDLER_MUX_CTRL, 0x70, 0);
+    mask32(pipe + PIPEHANDLER_MUX_CTRL, PIPEHANDLER_MUX_CTRL_CLK_T8142,
+           FIELD_PREP(PIPEHANDLER_MUX_CTRL_CLK_T8142, PIPEHANDLER_MUX_CTRL_CLK_OFF));
     udelay(10);
-    mask32(pipe + PIPEHANDLER_MUX_CTRL, 3, 2);
+    mask32(pipe + PIPEHANDLER_MUX_CTRL, PIPEHANDLER_MUX_CTRL_DATA_T8142,
+           FIELD_PREP(PIPEHANDLER_MUX_CTRL_DATA_T8142, PIPEHANDLER_MUX_CTRL_DATA_DUMMY));
     udelay(10);
-    mask32(pipe + PIPEHANDLER_MUX_CTRL, 0x70, 0x40);
+    mask32(pipe + PIPEHANDLER_MUX_CTRL, PIPEHANDLER_MUX_CTRL_CLK_T8142,
+           FIELD_PREP(PIPEHANDLER_MUX_CTRL_CLK_T8142, PIPEHANDLER_MUX_CTRL_CLK_DUMMY));
     udelay(10);
-    if ((read32(pipe + PIPEHANDLER_MUX_CTRL) & 0x73) != 0x42)
+    if ((read32(pipe + PIPEHANDLER_MUX_CTRL) & PIPEHANDLER_MUX_CTRL_T8142_MASK) !=
+        PIPEHANDLER_MUX_T8142(DUMMY, DUMMY))
         return NULL;
 
     set_step(3);
@@ -262,14 +234,13 @@ static dwc3_dev_t *usb_t6050_init(void (*set_step)(unsigned step))
         tunables_apply_compact_addr("/arm-io/atc-phy0", "tunable_USB2PHY_DEV", regs.phy,
                                     regs.phy_size))
         return NULL;
-    set32(regs.phy + USB2PHY_SIG, USB2PHY_SIG_VBUSDET_FORCE_VAL | USB2PHY_SIG_VBUSDET_FORCE_EN |
-                                      USB2PHY_SIG_VBUSVLDEXT_FORCE_VAL |
-                                      USB2PHY_SIG_VBUSVLDEXT_FORCE_EN);
+    set32(regs.phy + USB2PHY_SIG, USB2PHY_SIG_VBUS_FORCE);
     udelay(10000);
     clear32(regs.phy + USB2PHY_CTL, USB2PHY_CTL_SIDDQ);
     udelay(10);
     clear32(regs.phy + USB2PHY_CTL, USB2PHY_CTL_RESET | USB2PHY_CTL_PORT_RESET);
-    set32(regs.digital, BIT(0) | BIT(3)); /* USB2 event counter enable/load */
+    set32(regs.digital + ATCPHY_EVT_USB2_CTL,
+          ATCPHY_EVT_USB2_CTL_EVT_EN | ATCPHY_EVT_USB2_CTL_LOAD_CNT);
     set32(regs.phy + USB2PHY_CTL, USB2PHY_CTL_APB_RESET_N);
     clear32(regs.phy + USB2PHY_MISCTUNE,
             USB2PHY_MISCTUNE_APBCLK_GATE_OFF | USB2PHY_MISCTUNE_REFCLK_GATE_OFF);
@@ -284,7 +255,7 @@ static dwc3_dev_t *usb_t6050_init(void (*set_step)(unsigned step))
                PIPEHANDLER_AON_GEN_DWC3_FORCE_CLAMP_EN | PIPEHANDLER_AON_GEN_DWC3_RESET_N,
                PIPEHANDLER_AON_GEN_DWC3_RESET_N, 1000) ||
         (read32(regs.phy + USB2PHY_USBCTL) & USB2PHY_USBCTL_USB_MODE) != USB2PHY_USBCTL_RUN ||
-        (read32(regs.phy + USB2PHY_CTL) & 0xf) != USB2PHY_CTL_APB_RESET_N) {
+        (read32(regs.phy + USB2PHY_CTL) & USB2PHY_CTL_MASK) != USB2PHY_CTL_APB_RESET_N) {
         printf("CDC USB2: T6050 reset/clock setup did not latch\n");
         return NULL;
     }
