@@ -82,7 +82,7 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends -y device-tree-compiler qemu-user-static
+          sudo apt-get install --no-install-recommends -y device-tree-compiler qemu-user
 
       # The host tests of tests/run-*.sh that need no files from a Mac
       - name: Run host tests
