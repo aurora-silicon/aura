@@ -21,7 +21,7 @@
  *    mapping against the ADT firmware segments. Unarmed this is a dry run: the result is only
  *    logged.
  *
- * T6030 armed (boot.bin config line chosen.asahi,t6030-dcp=1), and only if every check below
+ * T6030 armed (boot.bin config line chosen.aurora,t6030-dcp=1), and only if every check below
  * passes:
  *  - one /reserved-memory node (no-map) per iop-dcp-nub segment, with iommu-addresses for exactly
  *    the mappings found in the page tables (SID 5 for dcp, SID 0 for the display, SID 4 for the
@@ -33,13 +33,13 @@
  *  locked DARTs, so only a kernel that knows the marker may enable them.
  *
  * T6030 external display processors, dcpext0 and, if the ADT and the device tree have it,
- * dcpext1 (see dcpext6_insts[]): with chosen asahi,t6030-dcpext=1 and the panel handoff
+ * dcpext1 (see dcpext6_insts[]): with chosen aurora,t6030-dcpext=1 and the panel handoff
  * published, each processor's firmware memory (apple,t6030-dcpext-memory-ready); with chosen
- * asahi,t6030-dispext=1, that memory plus its empty, locked display DART and a scanout child
+ * aurora,t6030-dispext=1, that memory plus its empty, locked display DART and a scanout child
  * (apple,t6030-dispext-handoff).
  *
  * T8122 (M3): the __OS_LOG reservations on every boot (oslog_always), and nothing else unless the
- * boot.bin config line chosen.asahi,t8122-dcp=1 is set. Armed, it does a dry run: the ADT values a
+ * boot.bin config line chosen.aurora,t8122-dcp=1 is set. Armed, it does a dry run: the ADT values a
  * T8122 handoff and device tree need are logged (including every clock-gate and power-gate of the
  * display nodes resolved through the ADT's PMGR table, the panel properties and the PMP nub's
  * values), the __OS_LOG buffers are reserved, and the DCP state and page tables are read and
@@ -61,7 +61,7 @@
  * kernel device tree without display nodes is normal. No T8122 PMP is handed off here.
  *
  * T6031 (M3 Max, J514C/J516C only; nothing at all on another board or chip, so not on a T6034):
- * the T8122 handoff with T6031 values, armed by chosen.asahi,t6031-dcp=1, as on T6030 and T8122.
+ * the T8122 handoff with T6031 values, armed by chosen.aurora,t6031-dcp=1, as on T6030 and T8122.
  * On a J516C dt_set_m3_defaults() (kboot.c) sets it unless a config line set it; a J514C still
  * needs the boot.bin config line. The kernel decides whether to take the display over (a kernel
  * may leave that to its command line), so the handoff must be harmless when ignored: the nodes
@@ -220,7 +220,7 @@ static const struct dcp6_seg_def dcp6_seg_defs_t6030[DCP6_SEGS] = {
 #define DCP6_OSLOG_NODE "dcp-oslog"
 #define DCP6_OSLOG_PROP "apple,dcp-os-log"
 /* (address, size) of each __OS_LOG buffer found on the loaded file part of aura */
-#define DCP6_OVERLAP_PROP "asahi,aura-oslog-overlap"
+#define DCP6_OVERLAP_PROP "aurora,aura-oslog-overlap"
 
 /* Owners of the nubs whose __OS_LOG is reserved: /arm-io/<owner>/iop-<owner>-nub */
 static const char *const dcp6_nubs_t6030[] = {"dcp", "dcpext0", "dcpext1"};
@@ -275,7 +275,7 @@ static const struct dcp_soc dcp_soc_t6030 = {
     .dcp_compat = "apple,t6030-dcp",
     .disp_compat = "apple,t6030-display-subsystem",
     .marker = "apple,t6030-handoff",
-    .optin = "asahi,t6030-dcp",
+    .optin = "aurora,t6030-dcp",
     .always = true,
     .ext = true,
     .uuid = DCP6_UUID,
@@ -311,7 +311,7 @@ static const struct dcp_soc dcp_soc_t8122 = {
     .dcp_compat = "apple,t8122-dcp",
     .disp_compat = "apple,t8122-display-subsystem",
     .marker = "apple,t8122-handoff",
-    .optin = "asahi,t8122-dcp",
+    .optin = "aurora,t8122-dcp",
     /*
      * On a J613 the dcp __OS_LOG buffer was seen inside the RAM handed to Linux on every boot
      * checked, and armed J613 boots have shown the reservation. Reserve it on every T8122 boot,
@@ -338,7 +338,7 @@ static const struct dcp_soc dcp_soc_j613_25g83 = {
     .dcp_compat = "apple,t8122-dcp",
     .disp_compat = "apple,t8122-display-subsystem",
     .marker = "apple,j613-25g83-mapping-handoff",
-    .optin = "asahi,t8122-dcp",
+    .optin = "aurora,t8122-dcp",
     .oslog_always = true,
     .describe = true,
     .adt_psreg = true,
@@ -375,7 +375,7 @@ static const struct dcp_soc dcp_soc_t6031 = {
     .dcp_compat = "apple,t6031-dcp",
     .disp_compat = "apple,t6031-display-subsystem",
     .marker = "apple,t6031-handoff",
-    .optin = "asahi,t6031-dcp",
+    .optin = "aurora,t6031-dcp",
     .oslog_always = true,
     .adt_psreg = true,
     .board_gate = true,
@@ -2502,8 +2502,8 @@ static __attribute__((noinline)) void dcp6_handoff(void *dt)
  * only while the processor's CPU power domain is on; it never restarts or locks it. Every external
  * node stays disabled until a kernel that knows the markers enables it.
  *
- * Both processors are armed by the same /chosen flags: asahi,t6030-dcpext for memory only and
- * asahi,t6030-dispext for the display DART and its prerequisite memory. dcpext1 is handed off
+ * Both processors are armed by the same /chosen flags: aurora,t6030-dcpext for memory only and
+ * aurora,t6030-dispext for the display DART and its prerequisite memory. dcpext1 is handed off
  * only if the ADT has it and the device tree describes it (alias dcpext1); otherwise it is
  * skipped and nothing changes. Each
  * handoff is its own transaction, so a refused dcpext1 leaves dcpext0's in place.
@@ -2917,8 +2917,8 @@ static bool dcpext6_present(void *dt, const struct dcpext6_inst *inst)
 /* dcpext0, then dcpext1; each processor's memory handoff before its display DART handoff */
 static void dcpext6_handoffs(void *dt)
 {
-    bool disp = dcpext6_flag(dt, "asahi,t6030-dispext");
-    bool mem = disp || dcpext6_flag(dt, "asahi,t6030-dcpext");
+    bool disp = dcpext6_flag(dt, "aurora,t6030-dispext");
+    bool mem = disp || dcpext6_flag(dt, "aurora,t6030-dcpext");
 
     if (!mem && !disp)
         return;
@@ -3255,7 +3255,7 @@ static const struct {
 #define T6050_CLOCKS    4
 #define T6050_MBOX      0x8000 /* the ASC mailbox, from the coprocessor base */
 #define T6050_PATH      64
-#define T6050_STATUS    "asahi,t6050-dcp-handoff"
+#define T6050_STATUS    "aurora,t6050-dcp-handoff"
 #define T6050_TCR_WANT  (DART_T8110_TCR_TRANSLATE | DART_T8110_TCR_FOUR_LEVEL)
 #define T6050_TCR_MASK  (T6050_TCR_WANT | DART_T8110_TCR_BYPASS_DART)
 /* Runs once per boot: size over speed, and out of .text where it fits (aura.ld) */

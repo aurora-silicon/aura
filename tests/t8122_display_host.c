@@ -1059,7 +1059,7 @@ int main(int argc, char **argv)
     }
     if (o.armed)
         fdt_setprop_string(dt, fdt_path_offset(dt, "/chosen"),
-                           t6030 ? "asahi,t6030-dcp" : "asahi,t8122-dcp", "1");
+                           t6030 ? "aurora,t6030-dcp" : "aurora,t8122-dcp", "1");
 
     printf("== %s\n", sc);
     fflush(stdout);

@@ -639,9 +639,9 @@ static void expect_gpu_off(const void *dt)
 
 /* ---------- scenarios ---------- */
 
-static const struct fixture t6030_fx = {T6030, "apple,agx-t6030", "asahi,t6030-gpu", 2, 0, 65536};
+static const struct fixture t6030_fx = {T6030, "apple,agx-t6030", "aurora,t6030-gpu", 2, 0, 65536};
 #if defined(G15_NEW) || defined(G15_T8122_BASE)
-static const struct fixture t8122_fx = {T8122, "apple,agx-t8122", "asahi,t8122-gpu", 1, 1, 65536};
+static const struct fixture t8122_fx = {T8122, "apple,agx-t8122", "aurora,t8122-gpu", 1, 1, 65536};
 #endif
 
 static struct fixture fx;
@@ -800,7 +800,7 @@ static void t6030_standin_switch(void)
 
     prepare(&t6030_fx);
     CHK(fdt_setprop_string(dtbuf, fdt_path_offset(dtbuf, "/chosen"),
-                           "asahi,t8122-gpu-power-standin", "1"));
+                           "aurora,t8122-gpu-power-standin", "1"));
     run();
     assert(!strcmp(log0, log_buf) && !strcmp(trace0, trace_buf));
     for (int i = 0; i < 3; i++) {
@@ -844,7 +844,7 @@ static void t8122_armed_refuses(void)
 /*
  * A 10-core J613 (M3 Air, 16 GB): its ADT pstates, power-management values, UAT regions, firmware
  * segments and G15G firmware image, and its powered identity, with `core_mask` 0x3ff (10 cores) or
- * 0x37e (8 cores). Armed with chosen.asahi,t8122-gpu=1, plus the stand-in switch if `standin`.
+ * 0x37e (8 cores). Armed with chosen.aurora,t8122-gpu=1, plus the stand-in switch if `standin`.
  */
 static const u8 g15g_c0_uuid[16] = {0xdf, 0x69, 0x7f, 0x05, 0xf6, 0xb5, 0x33, 0xef,
                                     0xa1, 0x37, 0x61, 0xc4, 0xa7, 0x3d, 0x66, 0x6a};
@@ -963,7 +963,7 @@ static void prepare_j613_setup(u32 core_mask, int standin)
     CHK(fdt_delprop(dtbuf, gpu, "apple,sram-leak-coef"));
     if (standin)
         CHK(fdt_setprop_string(dtbuf, fdt_path_offset(dtbuf, "/chosen"),
-                               "asahi,t8122-gpu-power-standin", "1"));
+                               "aurora,t8122-gpu-power-standin", "1"));
 }
 
 static void t8122_j613_switch_off(void)
@@ -1118,7 +1118,7 @@ static void t8122_small_dt(void)
  */
 static u32 identity_u32(const char *name)
 {
-    int n = fdt_path_offset(dtbuf, "/chosen/asahi,t8122-gpu-powered-identity"), len = 0;
+    int n = fdt_path_offset(dtbuf, "/chosen/aurora,t8122-gpu-powered-identity"), len = 0;
     assert(n >= 0);
     const fdt32_t *v = fdt_getprop(dtbuf, n, name, &len);
     assert(v && len == 4);
@@ -1131,8 +1131,8 @@ static void prepare_powered_identity(void)
     f.optin = NULL;
     prepare(&f);
     CHK(fdt_setprop_string(dtbuf, fdt_path_offset(dtbuf, "/chosen"),
-                           "asahi,t8122-gpu-handoff-diag", "1"));
-    CHK(fdt_setprop_string(dtbuf, fdt_path_offset(dtbuf, "/chosen"), "asahi,t8122-gpu-power-diag",
+                           "aurora,t8122-gpu-handoff-diag", "1"));
+    CHK(fdt_setprop_string(dtbuf, fdt_path_offset(dtbuf, "/chosen"), "aurora,t8122-gpu-power-diag",
                            "1"));
 }
 
@@ -1217,9 +1217,9 @@ static void prepare_j613(void)
     mmio_set(SGX_BASE + 0xd04010, 0x0011010a, 0);
     mmio_set(SGX_BASE + 0xe01500, 0x37e, 0);
     int chosen = fdt_path_offset(dtbuf, "/chosen");
-    CHK(fdt_setprop_string(dtbuf, chosen, "asahi,t8122-gpu-abi-ack", "14.8.3"));
-    CHK(fdt_setprop_string(dtbuf, chosen, "asahi,t8122-gpu-expected-uuid", J613_UUID));
-    CHK(fdt_setprop_string(dtbuf, chosen, "asahi,t8122-gpu-expected-rtkit", "RTKit-test"));
+    CHK(fdt_setprop_string(dtbuf, chosen, "aurora,t8122-gpu-abi-ack", "14.8.3"));
+    CHK(fdt_setprop_string(dtbuf, chosen, "aurora,t8122-gpu-expected-uuid", J613_UUID));
+    CHK(fdt_setprop_string(dtbuf, chosen, "aurora,t8122-gpu-expected-rtkit", "RTKit-test"));
 }
 
 static void t8122_j613_image_admitted(void)
@@ -1243,10 +1243,10 @@ static void t8122_j613_image_admitted(void)
 
 static void t8122_asc_preflight_enables(void)
 {
-    /* With only asahi,t8122-gpu-asc-preflight=1, the preflight enables both nodes */
+    /* With only aurora,t8122-gpu-asc-preflight=1, the preflight enables both nodes */
     prepare_j613();
     CHK(fdt_setprop_string(dtbuf, fdt_path_offset(dtbuf, "/chosen"),
-                           "asahi,t8122-gpu-asc-preflight", "1"));
+                           "aurora,t8122-gpu-asc-preflight", "1"));
     run();
     assert(log_has("J613 exact image metadata admitted"));
     assert(log_has("one-boot ASC register preflight enabled"));
@@ -1266,8 +1266,8 @@ static void t8122_asc_preflight_full_optin_noop(void)
     assert(log_has("J613 exact image metadata admitted"));
     assert(!strcmp(status_of(dtbuf, "/soc/gpu@292400000"), "disabled"));
     int chosen = fdt_path_offset(dtbuf, "/chosen");
-    CHK(fdt_setprop_string(dtbuf, chosen, "asahi,t8122-gpu", "1"));
-    CHK(fdt_setprop_string(dtbuf, chosen, "asahi,t8122-gpu-asc-preflight", "1"));
+    CHK(fdt_setprop_string(dtbuf, chosen, "aurora,t8122-gpu", "1"));
+    CHK(fdt_setprop_string(dtbuf, chosen, "aurora,t8122-gpu-asc-preflight", "1"));
     log_len = 0;
     log_buf[0] = 0;
     t8122_enable_asc_preflight(dtbuf);
@@ -1281,7 +1281,7 @@ static void t8122_with_diag_optin(void)
 {
     /* The full setup takes precedence over the reservation-only diagnostic */
     prepare(&t8122_fx);
-    fdt_setprop_string(dtbuf, fdt_path_offset(dtbuf, "/chosen"), "asahi,t8122-gpu-handoff-diag",
+    fdt_setprop_string(dtbuf, fdt_path_offset(dtbuf, "/chosen"), "aurora,t8122-gpu-handoff-diag",
                        "1");
     run();
     expect_gpu_off(dtbuf);
@@ -1289,8 +1289,8 @@ static void t8122_with_diag_optin(void)
 }
 
 /*
- * The stand-in experiment on the J613 inputs: chosen.asahi,t8122-gpu=1 and
- * chosen.asahi,t8122-gpu-power-standin=1.
+ * The stand-in experiment on the J613 inputs: chosen.aurora,t8122-gpu=1 and
+ * chosen.aurora,t8122-gpu-power-standin=1.
  */
 static const fdt32_t *gpu_prop(const char *name, int *len)
 {
@@ -1326,7 +1326,7 @@ static void expect_standin_handoff(const u32 *max_pwr)
     /* Not a J613 root here: no fuse read, and the stand-in leakage */
     assert(log_has("FDT: GPU: T8122 leakage: the stand-in\n"));
     assert(!strstr(trace_buf, "0x2e42c812"));
-    assert(prop_len(dtbuf, "/chosen", "asahi,t8122-gpu-leak-fuse") < 0);
+    assert(prop_len(dtbuf, "/chosen", "aurora,t8122-gpu-leak-fuse") < 0);
     assert(log_has("FDT: GPU: Leakage: 6412.000"));
     assert(log_has("FDT: GPU: T8122 GPU enabled (firmware 14.8.3)"));
     assert(log_has("ADT: GPU: 39 power-management values, fast-die sensor mask 0x2, SRAM floor "
@@ -1430,13 +1430,13 @@ static void t8122_j613_standin_only(void)
 {
     /* The stand-in switch alone arms nothing: logged, and the boot is the default one */
     prepare_j613_setup(0x3ff, 1);
-    fdt_delprop(dtbuf, fdt_path_offset(dtbuf, "/chosen"), "asahi,t8122-gpu");
+    fdt_delprop(dtbuf, fdt_path_offset(dtbuf, "/chosen"), "aurora,t8122-gpu");
     static u8 before[sizeof(dtbuf)];
     memcpy(before, dtbuf, sizeof(dtbuf));
     run();
     assert(!memcmp(before, dtbuf, sizeof(dtbuf)));
     assert(!trace_len && !pmgr_enables && !mmio_reads);
-    assert(log_has("asahi,t8122-gpu-power-standin ignored: it needs chosen.asahi,t8122-gpu=1"));
+    assert(log_has("aurora,t8122-gpu-power-standin ignored: it needs chosen.aurora,t8122-gpu=1"));
 }
 
 static void t8122_j613_standin_missing_value(void)
@@ -1655,7 +1655,7 @@ static void expect_fuse_prop(u32 v0, u32 v1)
 {
     int len = 0;
     const fdt32_t *p = fdt_getprop(dtbuf, fdt_path_offset(dtbuf, "/chosen"),
-                                   "asahi,t8122-gpu-leak-fuse", &len);
+                                   "aurora,t8122-gpu-leak-fuse", &len);
     assert(p && len == 8);
     assert(fdt32_to_cpu(p[0]) == float_bits((float)v0) && fdt32_to_cpu(p[1]) == float_bits((float)v1));
 }
@@ -1668,11 +1668,11 @@ static void t8122_j613_fuse_export(void)
     run();
     expect_fuse_prop(10924, 342);
     assert(log_has("FDT: GPU: T8122 leakage fuse: field A 0x1555, field B 0x155; values 10924 and 342\n"));
-    assert(log_has("FDT: GPU: T8122 leakage fuse values in /chosen/asahi,t8122-gpu-leak-fuse; "
+    assert(log_has("FDT: GPU: T8122 leakage fuse values in /chosen/aurora,t8122-gpu-leak-fuse; "
                    "the GPU setup does not use them\n"));
     assert(!strcmp(trace_buf, "read32 0x2e42c8128\nread32 0x2e42c812c\n"));
     assert(mmio_reads == 2 && !pmgr_enables && !exc_count && !unguarded_faults);
-    CHK(fdt_delprop(dtbuf, fdt_path_offset(dtbuf, "/chosen"), "asahi,t8122-gpu-leak-fuse"));
+    CHK(fdt_delprop(dtbuf, fdt_path_offset(dtbuf, "/chosen"), "aurora,t8122-gpu-leak-fuse"));
     char *after = dump_path(dtbuf, "/");
     assert(!strcmp(before, after));
     free(before);
@@ -1695,7 +1695,7 @@ static void t8122_j613_fuse_fault(void)
     /* A faulting read is caught, logged, and the boot goes on without the property */
     prepare_fuse(1, 0, 0, 1);
     run();
-    assert(prop_len(dtbuf, "/chosen", "asahi,t8122-gpu-leak-fuse") < 0);
+    assert(prop_len(dtbuf, "/chosen", "aurora,t8122-gpu-leak-fuse") < 0);
     assert(log_has("FDT: GPU: T8122 leakage fuse: the read faulted; nothing exported\n"));
     assert(exc_count == 1 && !unguarded_faults && !pmgr_enables);
 }
@@ -1709,7 +1709,7 @@ static void prepare_j613_standin_fuse(int use, int fault)
     mmio_set(T8122_LEAK_FUSE_WORD1, 0x000aaaaa, 0);
     if (use)
         CHK(fdt_setprop_string(dtbuf, fdt_path_offset(dtbuf, "/chosen"),
-                               "asahi,t8122-gpu-fuse-leakage", "1"));
+                               "aurora,t8122-gpu-fuse-leakage", "1"));
 }
 
 static void t8122_j613_standin_fuse_off(void)
@@ -1739,14 +1739,14 @@ static void t8122_j613_standin_fuse_off(void)
 
 static void t8122_j613_standin_fuse_on(void)
 {
-    /* chosen.asahi,t8122-gpu-fuse-leakage=1: the first value takes the stand-in's place */
+    /* chosen.aurora,t8122-gpu-fuse-leakage=1: the first value takes the stand-in's place */
     prepare_j613_standin_fuse(1, 0);
     run();
     assert(gpu_u32("apple,core-leak-coef") == float_bits(10924.0f));
     assert(gpu_u32("apple,sram-leak-coef") == 0);
     assert(log_has("FDT: GPU: T8122 leakage: 10924, from this Mac's fuse "
-                   "(chosen.asahi,t8122-gpu-fuse-leakage=1)\n"));
-    assert(log_has("the GPU setup uses the first (chosen.asahi,t8122-gpu-fuse-leakage=1)"));
+                   "(chosen.aurora,t8122-gpu-fuse-leakage=1)\n"));
+    assert(log_has("the GPU setup uses the first (chosen.aurora,t8122-gpu-fuse-leakage=1)"));
     assert(log_has("FDT: GPU: Leakage: 10924.000"));
     assert(log_has("FDT: GPU: T8122 GPU enabled (firmware 14.8.3)"));
     expect_fuse_prop(10924, 342);
@@ -1768,10 +1768,10 @@ static void t8122_j613_standin_fuse_on_fault(void)
     prepare_j613_standin_fuse(1, 1);
     run();
     expect_gpu_off(dtbuf);
-    assert(log_has("FDT: GPU: chosen.asahi,t8122-gpu-fuse-leakage=1, but this boot has no T8122 "
+    assert(log_has("FDT: GPU: chosen.aurora,t8122-gpu-fuse-leakage=1, but this boot has no T8122 "
                    "leakage fuse values\n"));
     assert(log_has("T8122 GPU setup failed"));
-    assert(prop_len(dtbuf, "/chosen", "asahi,t8122-gpu-leak-fuse") < 0);
+    assert(prop_len(dtbuf, "/chosen", "aurora,t8122-gpu-leak-fuse") < 0);
     assert(pmgr_enables == 1 && pmgr_disables == 1 && pmgr_off == 1);
 }
 
@@ -1779,7 +1779,7 @@ static void t8122_j613_standin_fuse_not_j613(void)
 {
     /* The switch on another T8122 root: no fuse values, so the setup refuses */
     prepare_j613_setup(0x3ff, 1);
-    CHK(fdt_setprop_string(dtbuf, fdt_path_offset(dtbuf, "/chosen"), "asahi,t8122-gpu-fuse-leakage",
+    CHK(fdt_setprop_string(dtbuf, fdt_path_offset(dtbuf, "/chosen"), "aurora,t8122-gpu-fuse-leakage",
                            "1"));
     run();
     expect_gpu_off(dtbuf);
@@ -1798,7 +1798,7 @@ static void prepare_air_current14(bool j615, u32 mask, unsigned unit)
     mmio_set(T8122_LEAK_FUSE_WORD0, unit ? 0 : 0x80000000, 0);
     mmio_set(T8122_LEAK_FUSE_WORD1, unit ? 0x70 : 0x46, 0);
     CHK(fdt_setprop_string(dtbuf, fdt_path_offset(dtbuf, "/chosen"),
-                           "asahi,t8122-gpu-fuse-leakage", "1"));
+                           "aurora,t8122-gpu-fuse-leakage", "1"));
     hset_u32("/arm-io/sgx", "gpu-se-tgt", unit ? 1421 : 1411);
     if (unit) {
         int sgx = adt_path_offset(adt, "/arm-io/sgx");
@@ -1901,7 +1901,7 @@ static void prepare_25(int intent, int fault)
     CHK(fdt_setprop(dtbuf, dcp, "apple,firmware-compat", compat, sizeof(compat)));
     CHK(fdt_setprop_string(dtbuf, fdt_path_offset(dtbuf, "/aliases"), "dcp", "/soc/dcp"));
     if (!intent)
-        CHK(fdt_delprop(dtbuf, fdt_path_offset(dtbuf, "/chosen"), "asahi,t8122-gpu"));
+        CHK(fdt_delprop(dtbuf, fdt_path_offset(dtbuf, "/chosen"), "aurora,t8122-gpu"));
 }
 static void t8122_25_calibrated(void)
 {

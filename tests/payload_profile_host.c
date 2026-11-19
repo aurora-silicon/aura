@@ -44,7 +44,7 @@ int main(void)
     assert(payload_profile_rank(profile, false) == 0);
     assert(!fdt_setprop_string(profile, 0, "compatible", "apple,j504"));
     assert(payload_profile_rank(profile, true) == 0);
-    /* Handoffs: a J613, or a J615 only with chosen.asahi,j615-25g83-experimental=1. */
+    /* Handoffs: a J613, or a J615 only with chosen.aurora,j615-25g83-experimental=1. */
     assert(!fdt_setprop_string(profile, 0, "compatible", "apple,j613"));
     assert(t8122_25g83_board(profile));
     static const char ambiguous[] = "apple,j613\0apple,j615\0";

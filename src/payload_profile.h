@@ -8,7 +8,7 @@
  * regardless of archive order; other firmware never selects that profile.
  * The J615 25G83 tree (experimental) ranks like the J613's: selecting it
  * hands nothing over by itself, the display and GPU handoffs also need
- * chosen.asahi,j615-25g83-experimental=1 (t8122_25g83.h), which aura.conf
+ * chosen.aurora,j615-25g83-experimental=1 (t8122_25g83.h), which aura.conf
  * supplies only after the device trees have been ranked.
  */
 static inline int payload_profile_rank(const void *dt, bool os_26_6_2)

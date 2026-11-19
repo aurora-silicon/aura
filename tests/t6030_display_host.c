@@ -812,7 +812,7 @@ static u64 digest_without_facts(void *fdt)
 {
     void *copy = malloc(totalsize(fdt));
     memcpy(copy, fdt, totalsize(fdt));
-    int n = fdt_path_offset(copy, "/chosen/asahi,t6030-display-facts");
+    int n = fdt_path_offset(copy, "/chosen/aurora,t6030-display-facts");
     if (n >= 0)
         CHECK(!fdt_del_node(copy, n));
     u64 h = digest(copy, 0, 0xcbf29ce484222325ULL);
@@ -853,7 +853,7 @@ static void check_budget(void *fdt)
     int len = 0;
     u32 growth = fdt_used(fdt) - used_before, skipped = 0;
 
-    if (getp(fdt, "/chosen/asahi,t6030-display-facts", "skipped", &len))
+    if (getp(fdt, "/chosen/aurora,t6030-display-facts", "skipped", &len))
         skipped = 12 + ((len + 3) & ~3) + 8;
     CHECK(skipped <= SKIPPED_MAX);
     CHECK(growth >= skipped + FACTS_NODE_COST);
@@ -870,7 +870,7 @@ static void facts(void *fdt)
     in_facts = 0;
 }
 
-#define FACTS "/chosen/asahi,t6030-display-facts"
+#define FACTS "/chosen/aurora,t6030-display-facts"
 
 static void *run_facts(const struct shape *s, int fdt_size, u64 *before)
 {
@@ -1175,7 +1175,7 @@ static void facts_refusals(void)
         void *fdt = make_fdt(mode == 0 ? 2 * 1024 : 64 * 1024, false);
         if (mode == 1)
             CHECK(fdt_add_subnode(fdt, fdt_path_offset(fdt, "/chosen"),
-                                  "asahi,t6030-display-facts") >= 0);
+                                  "aurora,t6030-display-facts") >= 0);
         int size = totalsize(fdt);
         void *orig = malloc(size);
         memcpy(orig, fdt, size);

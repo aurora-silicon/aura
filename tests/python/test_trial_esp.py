@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-2.0-only
 """An aura-try trial only starts its next stage on the ESP its Stage 1 names.
 
-Without /chosen/asahi,efi-system-partition U-Boot boots the first ESP with an EFI loader, which on a
+Without /chosen/aurora,efi-system-partition U-Boot boots the first ESP with an EFI loader, which on a
 disk with several installs is another system. kboot_prepare_dt() must refuse such a trial (the trial
 path then reboots into the configured Stage 2) and leave every other boot as it was.
 """
@@ -39,7 +39,7 @@ static int fdt_path_offset(const void *fdt, const char *path)
 static const void *fdt_getprop(const void *fdt, int node, const char *name, int *len)
 {
     (void)fdt; (void)len;
-    return node == 8 && esp_prop && !strcmp(name, "asahi,efi-system-partition") ? "x" : NULL;
+    return node == 8 && esp_prop && !strcmp(name, "aurora,efi-system-partition") ? "x" : NULL;
 }
 ''' + function + '\nint main(void)\n{\n' + body + '\n    return 0;\n}\n'
 

@@ -629,7 +629,7 @@ static void check_display_refused(const void *dt)
           "display refused: dart-dcp not written, not locked");
 }
 
-/* The GPU setup, as drm/asahi's boot-loader admission reads it */
+/* The GPU setup, as drm/aurora's boot-loader admission reads it */
 static void check_gpu_published(const void *dt)
 {
     int len, sgx = adt_path_offset(adt, "/arm-io/sgx");
@@ -708,11 +708,11 @@ static void check_gpu_published(const void *dt)
     leak_ok &= sram && len == 16 && !fdt32_ld(sram) && !fdt32_ld(sram + 3);
     leak_ok &=
         u32_is(dt, GPU, "apple,cs-leak-coef", zb) && u32_is(dt, GPU, "apple,afr-leak-coef", zb);
-    const char *standins = prop(dt, GPU, "asahi,t6031-gpu-standin", &len);
+    const char *standins = prop(dt, GPU, "aurora,t6031-gpu-standin", &len);
     check(leak_ok && standins &&
-              fdt_stringlist_count(dt, node_at(dt, GPU), "asahi,t6031-gpu-standin") == 5,
+              fdt_stringlist_count(dt, node_at(dt, GPU), "aurora,t6031-gpu-standin") == 5,
           "gpu: stand-in leakage 6412 x 4 clusters, 0 for SRAM, CS and AFR, all listed in "
-          "asahi,t6031-gpu-standin");
+          "aurora,t6031-gpu-standin");
 
     /* CS and AFR: one OPP per ADT state, one voltage each */
     static const char *const aux[][2] = {{"cs-perf-states", "/opp-table-gpu-cs"},
@@ -859,9 +859,9 @@ static void dump_published(const void *dt)
         snprintf(p, sizeof(p), CHOSEN "/%s", fdt_get_name(dt, child, NULL));
         dump_node(dt, p);
     }
-    printf("  " CHOSEN " asahi,t6031-fw-uuids =");
+    printf("  " CHOSEN " aurora,t6031-fw-uuids =");
     int len;
-    const char *u = prop(dt, CHOSEN, "asahi,t6031-fw-uuids", &len);
+    const char *u = prop(dt, CHOSEN, "aurora,t6031-fw-uuids", &len);
     for (int i = 0; u && i < len; i += strlen(u + i) + 1)
         printf(" \"%s\"", u + i);
     printf("\n");
@@ -899,8 +899,8 @@ static void *load_dt(int room)
 {
     static u8 dt[1 << 21];
     assert(!fdt_open_into(dt_in, dt, fdt_totalsize(dt_in) + room));
-    assert(!fdt_setprop_string(dt, fdt_path_offset(dt, CHOSEN), "asahi,t6031-gpu", "1"));
-    assert(!fdt_setprop_string(dt, fdt_path_offset(dt, CHOSEN), "asahi,t6031-dcp", "1"));
+    assert(!fdt_setprop_string(dt, fdt_path_offset(dt, CHOSEN), "aurora,t6031-gpu", "1"));
+    assert(!fdt_setprop_string(dt, fdt_path_offset(dt, CHOSEN), "aurora,t6031-dcp", "1"));
     return dt;
 }
 
@@ -961,19 +961,19 @@ static void sc_publish(void *dt, bool dump)
           grew);
     check_oslogs(dt, true);
     check_display_published(dt);
-    check(prop(dt, CHOSEN "/asahi,t6031-pmp", "apple,tunable-uuid", NULL) &&
-              u32_is(dt, CHOSEN "/asahi,t6031-pmp", "apple,board-id", 0x5a),
-          "pmp: /chosen/asahi,t6031-pmp has board-id, dram-vendor-id and the tunables, "
+    check(prop(dt, CHOSEN "/aurora,t6031-pmp", "apple,tunable-uuid", NULL) &&
+              u32_is(dt, CHOSEN "/aurora,t6031-pmp", "apple,board-id", 0x5a),
+          "pmp: /chosen/aurora,t6031-pmp has board-id, dram-vendor-id and the tunables, "
           "tunable-uuid among them");
     int len;
-    const char *u = prop(dt, CHOSEN, "asahi,t6031-fw-uuids", &len);
-    check(u && fdt_stringlist_count(dt, node_at(dt, CHOSEN), "asahi,t6031-fw-uuids") == 7 &&
+    const char *u = prop(dt, CHOSEN, "aurora,t6031-fw-uuids", &len);
+    check(u && fdt_stringlist_count(dt, node_at(dt, CHOSEN), "aurora,t6031-fw-uuids") == 7 &&
               !strncmp(u, "gfx=5E5E5E5E", 12),
           "fw-uuids: seven entries, gfx first");
-    const fdt32_t *clk = prop(dt, CHOSEN "/asahi,t6031-facts", "disp0-clock-frequencies", &len);
-    const fdt64_t *mcc = prop(dt, CHOSEN "/asahi,t6031-facts", "mcc-reg", &len);
+    const fdt32_t *clk = prop(dt, CHOSEN "/aurora,t6031-facts", "disp0-clock-frequencies", &len);
+    const fdt64_t *mcc = prop(dt, CHOSEN "/aurora,t6031-facts", "mcc-reg", &len);
     check(clk && fdt32_ld(clk) == 712000000 &&
-              u32_is(dt, CHOSEN "/asahi,t6031-facts", "schema-version", 1) && mcc && len == 32 &&
+              u32_is(dt, CHOSEN "/aurora,t6031-facts", "schema-version", 1) && mcc && len == 32 &&
               fdt64_ld(mcc) == 0x280000000UL && fdt64_ld(mcc + 2) == 0x280400000UL,
           "facts: disp0 clock rates and the mcc windows, translated through /arm-io ranges");
     check(!strcmp(prop(dt, IMG, "firmware-family", NULL), "14.8.3") &&
@@ -1030,7 +1030,7 @@ static void sc_other_board(void *dt)
     check(!nwrites && !gpu_reads, "another T6031 board: no register written or GPU register read");
 }
 
-/* Only chosen.asahi,t6031-dcp=1 arms the display handoff; __OS_LOG is reserved regardless */
+/* Only chosen.aurora,t6031-dcp=1 arms the display handoff; __OS_LOG is reserved regardless */
 static void sc_dcp_not_armed(void *dt)
 {
     static u8 armed[1 << 21];
@@ -1039,15 +1039,15 @@ static void sc_dcp_not_armed(void *dt)
     for (size_t i = 0; i < ARRAY_SIZE(values); i++) {
         memcpy(dt, armed, fdt_totalsize(armed));
         if (values[i])
-            chosen_set(dt, "asahi,t6031-dcp", values[i]);
+            chosen_set(dt, "aurora,t6031-dcp", values[i]);
         else
-            assert(!fdt_delprop(dt, node_at(dt, CHOSEN), "asahi,t6031-dcp"));
+            assert(!fdt_delprop(dt, node_at(dt, CHOSEN), "aurora,t6031-dcp"));
         world(&(struct opts){0});
         run(dt);
         check_oslogs(dt, true);
         check_display_refused(dt);
         check(!count_writes(DCP_COPROC, DCP_COPROC + 0x100000) &&
-                  log_has("not armed (no chosen.asahi,t6031-dcp=1)"),
+                  log_has("not armed (no chosen.aurora,t6031-dcp=1)"),
               "dcp not armed (%s): logged, nothing written to the display blocks",
               values[i] ? values[i] : "absent");
         check_identity(dt, T8122_ID_PASS, true);
@@ -1059,7 +1059,7 @@ static void sc_dcp_not_armed(void *dt)
 static void sc_gpu_off(void *dt)
 {
     world(&(struct opts){0});
-    chosen_set(dt, "asahi,t6031-gpu", "0");
+    chosen_set(dt, "aurora,t6031-gpu", "0");
     run(dt);
     check(node_at(dt, ID_NODE) < 0, "gpu switched off: no identity node");
     check(node_at(dt, IMG) < 0, "gpu switched off: no image node");
@@ -1171,7 +1171,7 @@ static void sc_no_dcp_uuid(void *dt)
     adt_hide("/arm-io/dcp/iop-dcp-nub", "uuid");
     run(dt);
     check_display_refused(dt);
-    const char *u = prop(dt, CHOSEN, "asahi,t6031-fw-uuids", NULL);
+    const char *u = prop(dt, CHOSEN, "aurora,t6031-fw-uuids", NULL);
     check(u && !strcmp(u + strlen(u) + 1, "dcp=absent"), "fw-uuids: dcp=absent");
     expect_power_restored();
 }
@@ -1183,9 +1183,9 @@ static void sc_no_facts(void *dt)
     adt_hide("/arm-io/mcc", "name");
     run(dt);
     int len;
-    const fdt32_t *clk = prop(dt, CHOSEN "/asahi,t6031-facts", "disp0-clock-frequencies", &len);
+    const fdt32_t *clk = prop(dt, CHOSEN "/aurora,t6031-facts", "disp0-clock-frequencies", &len);
     check(clk && len == 8 && !fdt32_ld(clk) &&
-              !prop(dt, CHOSEN "/asahi,t6031-facts", "mcc-reg", NULL),
+              !prop(dt, CHOSEN "/aurora,t6031-facts", "mcc-reg", NULL),
           "facts without clock-frequencies or mcc: the clock ids with rate 0, no mcc-reg");
     check_display_published(dt);
 }

@@ -253,12 +253,12 @@ int kboot_audio_amp_config(void *dt, const void *adt)
  * controller is switched to a plain GPIO input (pull left as it is) and sampled once, with no
  * delay and no restore; a strap that does not resolve reads as 0. The control word's second
  * byte gives the polarity: nonzero reads a high pin as 1, zero inverts it. The ID goes to the
- * kernel as /chosen/asahi,speaker-id (one u32): the sampled value when valid-speaker-ids lists
+ * kernel as /chosen/aurora,speaker-id (one u32): the sampled value when valid-speaker-ids lists
  * it, else 65535, which is what macOS publishes then. A Mac without find-speaker-id = 1, or
  * with neither strap resolving, gets no property.
  */
 
-#define SPEAKER_ID_DT_PROP "asahi,speaker-id"
+#define SPEAKER_ID_DT_PROP "aurora,speaker-id"
 #define SPEAKER_ID_STRAPS  2
 #define SPEAKER_ID_INVALID 0xffff
 #define MAX_VALID_SPEAKERS 32

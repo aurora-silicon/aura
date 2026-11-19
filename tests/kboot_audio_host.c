@@ -10,7 +10,7 @@
  * apple,speaker-config and apple,amp-tx-zd-config ("-" when absent), one line each ("amp ..."),
  * after aura's own log lines.
  *
- * Then runs kboot_audio_speaker_id() and prints "speaker-id <value>" (/chosen/asahi,speaker-id,
+ * Then runs kboot_audio_speaker_id() and prints "speaker-id <value>" (/chosen/aurora,speaker-id,
  * "-" when absent) and, for every modelled GPIO pin, "gpio <address> <register>" with the
  * register as the code left it. The pins come from KBOOT_AUDIO_GPIO, a comma-separated list of
  * <address>:<register>:<pad level>. A pin's data bit reads as its pad level only while the pin
@@ -181,7 +181,7 @@ int main(int argc, char **argv)
     }
     int chosen = fdt_path_offset(dt, "/chosen");
     int len = 0;
-    const fdt32_t *id = chosen < 0 ? NULL : fdt_getprop(dt, chosen, "asahi,speaker-id", &len);
+    const fdt32_t *id = chosen < 0 ? NULL : fdt_getprop(dt, chosen, "aurora,speaker-id", &len);
     if (!id)
         printf("speaker-id -\n");
     else if (len != sizeof(*id))

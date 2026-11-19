@@ -233,9 +233,9 @@ static void world(void)
     assert(node >= 0 && !fdt_setprop_string(dt, node, "dcp", "/soc/dcp"));
     assert(!fdt_setprop_string(dt, node, "dcpext0", "/soc/dcpext0"));
     assert(!fdt_setprop_string(dt, node, "dcpext1", "/soc/dcpext1"));
-    /* Armed: chosen.asahi,j713-dcpext=1. */
+    /* Armed: chosen.aurora,j713-dcpext=1. */
     node = fdt_add_subnode(dt, 0, "chosen");
-    assert(node >= 0 && !fdt_setprop_string(dt, node, "asahi,j713-dcpext", "1"));
+    assert(node >= 0 && !fdt_setprop_string(dt, node, "aurora,j713-dcpext", "1"));
 }
 static int ext(int n) { return fdt_path_offset(dt, n ? "dcpext1" : "dcpext0"); }
 static int reserved(int n, int segment)
@@ -331,16 +331,16 @@ int main(void)
     }
 
     /* Opt-in, and only after the internal DCP was handed over. */
-    world(); assert(!fdt_delprop(dt, fdt_path_offset(dt, "/chosen"), "asahi,j713-dcpext"));
+    world(); assert(!fdt_delprop(dt, fdt_path_offset(dt, "/chosen"), "aurora,j713-dcpext"));
     unarmed();
     const char *values[] = {"0", "", "11", "yes"};
     for (unsigned i = 0; i < ARRAY_SIZE(values); i++) {
         world();
-        assert(!fdt_setprop_string(dt, fdt_path_offset(dt, "/chosen"), "asahi,j713-dcpext",
+        assert(!fdt_setprop_string(dt, fdt_path_offset(dt, "/chosen"), "aurora,j713-dcpext",
                                    values[i]));
         unarmed();
     }
-    world(); assert(!fdt_setprop(dt, fdt_path_offset(dt, "/chosen"), "asahi,j713-dcpext", "1", 1));
+    world(); assert(!fdt_setprop(dt, fdt_path_offset(dt, "/chosen"), "aurora,j713-dcpext", "1", 1));
     unarmed(); /* "1" without its NUL */
     world(); assert(!fdt_del_node(dt, fdt_path_offset(dt, "/chosen")));
     unarmed();
@@ -380,7 +380,7 @@ int main(void)
                 }
                 if (mode == 1) { fault = 9; victims = 2; }
                 if (mode == 2) {
-                    assert(!fdt_delprop(dt, fdt_path_offset(dt, "/chosen"), "asahi,j713-dcpext"));
+                    assert(!fdt_delprop(dt, fdt_path_offset(dt, "/chosen"), "aurora,j713-dcpext"));
                     unarmed();
                     continue;
                 }

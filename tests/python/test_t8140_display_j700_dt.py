@@ -386,7 +386,7 @@ static bool live_claim(void)
 }
 static u32 preflight(void)
 {
-    const fdt32_t *cell = fdt_getprop(dt, off("/chosen"), "asahi,external-display-preflight", NULL);
+    const fdt32_t *cell = fdt_getprop(dt, off("/chosen"), "aurora,external-display-preflight", NULL);
     assert(cell);
     return fdt32_to_cpu(*cell);
 }

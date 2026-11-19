@@ -62,7 +62,7 @@ if [ -n "$args" ]; then
     echo "chosen.bootargs=$args" >>"$TMPDIR/aura-linux.bin"
 fi
 if [ -n "${esp}" ]; then
-    echo "chosen.asahi,efi-system-partition=${esp}" >>"$TMPDIR/aura-linux.bin"
+    echo "chosen.aurora,efi-system-partition=${esp}" >>"$TMPDIR/aura-linux.bin"
 fi
 
 cat "$kernel_base"/arch/arm64/boot/dts/apple/*.dtb >>"$TMPDIR/aura-linux.bin"

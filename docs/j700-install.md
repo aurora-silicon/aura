@@ -84,7 +84,7 @@ Test every new build before replacing an installed image:
 - Boot Stage 2 from its separate ESP file through a Stage 1 configured for
   that path. Keep the previous `aurora/stage2.bin` as a backup.
 - Check the build tag in the Stage 2 console and
-  `/chosen/asahi,m1n1-stage2-version`. Keep the kernel log of each test boot.
+  `/chosen/aurora,aura-stage2-version`. Keep the kernel log of each test boot.
 - Test a new Stage 1 with a host claiming the proxy window, with no host
   until the window expires, and with a missing Stage 2 file. Check proxy
   fallback, image length and the panel logo.

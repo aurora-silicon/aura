@@ -20,9 +20,9 @@
  * SRAM bytes in memory order, and every other value is big-endian cells. They are not device
  * bindings.
  *
- * asahi,t8122-pmp-facts
+ * aurora,t8122-pmp-facts
  *   pmp/, iop-pmp-nub/  the ADT properties of /arm-io/pmp, every iop-pmp-nub property name,
- *                       and the iop-pmp-nub properties /chosen/asahi,t8122-pmp does not carry
+ *                       and the iop-pmp-nub properties /chosen/aurora,t8122-pmp does not carry
  *                       as apple,tunable-*
  *   power-*             the PMGR power states the /arm-io/pmp clock-gates resolve to
  *   sram-*              the image UUID at SRAM +0x214, and whether it is the iop-pmp-nub uuid
@@ -35,7 +35,7 @@
  *                       that node's own PMGR power states are actually on
  *   skipped             why a reading was not taken
  *
- * asahi,t8122-clock-facts
+ * aurora,t8122-clock-facts
  *   pmgr/               every PMGR property name and size, and its clocks, perf-regs,
  *                       power-domains and voltage-states* tables
  *   dcp/, disp0/, dcpext/, dispext0/
@@ -46,14 +46,14 @@
  * aligned 64-bit loads, under an exception guard, and only after every PMGR power state of the
  * /arm-io/pmp clock-gates read as actually on. The PTD update page is never accessed. After a
  * guarded fault, or once the node cannot be published, nothing more is read. Only on a J613
- * with chosen.asahi,t8122-dcp=1; the caller selects T8122. Each node is built on a copy of the
+ * with chosen.aurora,t8122-dcp=1; the caller selects T8122. Each node is built on a copy of the
  * FDT and published only if complete. Failure is non-fatal to kboot, and an existing node is
  * never replaced.
  */
 
-#define FACTS_PMP    "asahi,t8122-pmp-facts"
-#define FACTS_CLOCK  "asahi,t8122-clock-facts"
-#define VALUES_NODE  "asahi,t8122-pmp"
+#define FACTS_PMP    "aurora,t8122-pmp-facts"
+#define FACTS_CLOCK  "aurora,t8122-clock-facts"
+#define VALUES_NODE  "aurora,t8122-pmp"
 #define FACTS_SCHEMA 1
 #define LOG          "PMP: T8122: "
 
@@ -299,7 +299,7 @@ static bool facts_wanted(void *dt)
 {
     int chosen = fdt_path_offset(dt, "/chosen");
     int len = 0;
-    const char *opt = chosen < 0 ? NULL : fdt_getprop(dt, chosen, "asahi,t8122-dcp", &len);
+    const char *opt = chosen < 0 ? NULL : fdt_getprop(dt, chosen, "aurora,t8122-dcp", &len);
 
     return opt && len == 2 && opt[0] == '1' && opt[1] == '\0' &&
            !fdt_node_check_compatible(dt, 0, "apple,t8122") &&
@@ -307,7 +307,7 @@ static bool facts_wanted(void *dt)
             !fdt_node_check_compatible(dt, 0, "apple,j615"));
 }
 
-/* ---- asahi,t8122-pmp-facts ---- */
+/* ---- aurora,t8122-pmp-facts ---- */
 
 /* Every /arm-io/pmp property, and the iop-pmp-nub properties the values node does not carry */
 static void pmp_adt(struct facts *f, int pmp, int nub)
@@ -814,7 +814,7 @@ static void build_pmp_facts(struct facts *f)
     pmp_ptd(f, pmp_path, pmp, nub, on);
 }
 
-/* ---- asahi,t8122-clock-facts ---- */
+/* ---- aurora,t8122-clock-facts ---- */
 
 static const char *const pmgr_tables[] = {"clocks", "perf-regs", "power-domains"};
 

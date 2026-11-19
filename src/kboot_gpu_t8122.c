@@ -18,11 +18,11 @@
  * RTKit version string at the fixed image-info header's bounded text offset.
  * Only identity fields are exported, with no GPU MMIO reads.
  *
- * No export unless chosen.asahi,t8122-gpu-diag=1. The caller selects T8122.
+ * No export unless chosen.aurora,t8122-gpu-diag=1. The caller selects T8122.
  * Build in a private FDT copy and publish only on success, including strings.
  * Failure is non-fatal to kboot. A pre-existing export is never overwritten.
  */
-#define EXPORT_NAME        "asahi,t8122-gpu-diagnostics"
+#define EXPORT_NAME        "aurora,t8122-gpu-diagnostics"
 #define EXPORT_PATH        "/chosen/" EXPORT_NAME
 #define MAX_PROPERTY_BYTES 32768u
 #define MAX_TOTAL_BYTES    49152u
@@ -222,7 +222,7 @@ int dt_gpu_t8122_diagnostics(void *dt)
 {
     int chosen = fdt_path_offset(dt, "/chosen");
     int len = 0;
-    const char *opt = chosen < 0 ? NULL : fdt_getprop(dt, chosen, "asahi,t8122-gpu-diag", &len);
+    const char *opt = chosen < 0 ? NULL : fdt_getprop(dt, chosen, "aurora,t8122-gpu-diag", &len);
     if (!opt || len != 2 || opt[0] != '1' || opt[1] != '\0')
         return 0;
     if (fdt_path_offset(dt, EXPORT_PATH) >= 0)

@@ -7,7 +7,7 @@
 #include "libfdt/libfdt.h"
 
 /* J615 display and GPU handoffs require their own explicit switch. */
-#define T8122_25G83_J615_OPT_IN "asahi,j615-25g83-experimental"
+#define T8122_25G83_J615_OPT_IN "aurora,j615-25g83-experimental"
 
 /* A J613, or a J615 with the opt-in. `dt` has /chosen set already. */
 static inline bool t8122_25g83_board(const void *dt)

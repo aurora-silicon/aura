@@ -480,8 +480,8 @@ static void setup(void)
 static void check_claim(bool present)
 {
     const char *observations[] = {
-        "asahi,external-display-metadata", "asahi,external-display-mappers",
-        "asahi,external-display-registers",
+        "aurora,external-display-metadata", "aurora,external-display-mappers",
+        "aurora,external-display-registers",
     };
     for (size_t i = 0; i < ARRAY_SIZE(observations); i++)
         assert(!fdt_getprop(dt, fdt_path_offset(dt, "/chosen"), observations[i], NULL));
@@ -562,7 +562,7 @@ int main(void)
     check_status("disp0", "okay");
     check_status("dcpext", "okay");
     const fdt32_t *preflight = fdt_getprop(dt, fdt_path_offset(dt, "/chosen"),
-                                         "asahi,external-display-preflight", NULL);
+                                         "aurora,external-display-preflight", NULL);
     assert(preflight && fdt32_to_cpu(*preflight) == 0x100);
     check_status("external-power", "okay");
     check_status("dispext0", "disabled");

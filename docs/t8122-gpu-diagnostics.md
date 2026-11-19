@@ -7,11 +7,11 @@ constants are not evidence for T8122.
 Append this option when constructing a **stage-2** boot.bin:
 
 ```
-chosen.asahi,t8122-gpu-diag=1
+chosen.aurora,t8122-gpu-diag=1
 ```
 
 On T8122 only, after mandatory device-tree fixups, aura copies selected fields
-from the iBoot ADT into `/chosen/asahi,t8122-gpu-diagnostics`. It reads ADT RAM
+from the iBoot ADT into `/chosen/aurora,t8122-gpu-diagnostics`. It reads ADT RAM
 only: no GPU registers, power changes, firmware reads, memory reservations or
 GPU enablement. The exported metadata is not a driver handoff.
 
@@ -119,13 +119,13 @@ The local reader reports them under `firmware_image` with
 image; it does not prove the firmware ABI or authorize GPU startup. Keep actual
 UUIDs and other machine-derived values outside git.
 
-## GPU setup: `chosen.asahi,t8122-gpu=1`
+## GPU setup: `chosen.aurora,t8122-gpu=1`
 
-This switch runs the same fail-soft G15 GPU setup that `chosen.asahi,t6030-gpu=1`
+This switch runs the same fail-soft G15 GPU setup that `chosen.aurora,t6030-gpu=1`
 runs on the M3 Pro (`dt_set_gpu_g15()` in `src/kboot_gpu.c`), with the T8122
 entry of its SoC table. It is off by default: without it a T8122 boot does not
 run the setup at all (there is no dry run), and only the diagnostic switches
-above apply. With it, `asahi,t8122-gpu-handoff-diag` is ignored.
+above apply. With it, `aurora,t8122-gpu-handoff-diag` is ignored.
 
 The setup needs a `gpu` alias to an `apple,agx-t8122` node with the same inputs
 as the T6030 node (`reg`/`reg-names` for asc and sgx, `operating-points-v2`,
@@ -139,7 +139,7 @@ as the T6030 node (`reg`/`reg-names` for asc and sgx, `operating-points-v2`,
    segments from the ADT, and the gpu node, OPP table and mailbox from the DT;
 4. requires the GPU power closure to be off, powers it on, reads the GPU ID
    (family 7, variant 2), `ID_COUNTS_1` (one die; cores per cluster and
-   clusters, as drm/asahi reads them for G15G) and the core masks, and
+   clusters, as drm/aurora reads them for G15G) and the core masks, and
    rejects mask bits beyond the reported slots or more pstate tables than
    clusters;
 5. reads the leakage value, computes the per-pstate maximum power and fills
@@ -179,9 +179,9 @@ bounded powered identity read with this J613's measured G15G core mask and
 counts. It then requires three strings in `/chosen`:
 
 ```dts
-asahi,t8122-gpu-abi-ack = "14.8.3";
-asahi,t8122-gpu-expected-uuid = "<32 lowercase or uppercase hex digits>";
-asahi,t8122-gpu-expected-rtkit = "<exact version string>";
+aurora,t8122-gpu-abi-ack = "14.8.3";
+aurora,t8122-gpu-expected-uuid = "<32 lowercase or uppercase hex digits>";
+aurora,t8122-gpu-expected-rtkit = "<exact version string>";
 ```
 
 The expected values are owner-supplied and must stay outside source control.
@@ -200,7 +200,7 @@ firmware startup and the J613 hardware configuration before enabling them.
 ## Separate J613 ASC register preflight
 
 The `air/t8122-asc-preflight` experiment additionally accepts
-`/chosen/asahi,t8122-gpu-asc-preflight = "1"`. Only after the exact J613
+`/chosen/aurora,t8122-gpu-asc-preflight = "1"`. Only after the exact J613
 identity, loaded image metadata and UAT/firmware reservations pass does it
 enable the GPU and mailbox nodes together in the FDT. The status edits are
 published atomically from a copy, so an unsuccessful edit leaves both nodes
@@ -210,7 +210,7 @@ handshake, firmware initdata, GPU job or DRM render node is part of this test.
 The boot opt-in is separate from image admission and has not been enabled or
 booted on J613 yet.
 
-When the full GPU setup is opted in with `chosen.asahi,t8122-gpu=1`, that path
+When the full GPU setup is opted in with `chosen.aurora,t8122-gpu=1`, that path
 owns the gpu and mailbox enable and the reservation-only diagnostic that hosts
 this preflight does not run. The preflight additionally no-ops (and logs one
 line) if it ever sees that opt-in, so the two paths can never both enable the

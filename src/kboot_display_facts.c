@@ -14,7 +14,7 @@
 
 /*
  * T6030 (M3 Pro): the ADT's description of the external display blocks and the Type-C PHYs, for
- * Linux-side inspection, as /chosen/asahi,t6030-display-facts. It is not a device binding and no
+ * Linux-side inspection, as /chosen/aurora,t6030-display-facts. It is not a device binding and no
  * driver reads it. adt,* properties are raw ADT bytes (little-endian cells); translated-reg (an
  * address and a size per reg entry, translated through the bus ranges) and adt-property-sizes are
  * big-endian cells.
@@ -48,7 +48,7 @@
  * point and is reported in `skipped`; what was found before it is still published.
  */
 
-#define FACTS_NODE   "asahi,t6030-display-facts"
+#define FACTS_NODE   "aurora,t6030-display-facts"
 #define FACTS_SCHEMA 1
 #define LOG          "ADT facts: T6030: "
 

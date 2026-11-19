@@ -156,7 +156,7 @@ SPEAKER_ID_SCENARIOS = {
     "speaker-id-no-valid-ids": ([strap(0x34), strap(0x35)], None, 1, None, ""),
     "speaker-id-find-off": ([strap(0x34), strap(0x35)], (0, 3), 0, None, ""),
     "speaker-id-find-2": ([strap(0x34), strap(0x35)], (0, 3), 2, None, ""),
-    "speaker-id-stale": ([], None, None, None, "asahi,speaker-id = <7>; "),
+    "speaker-id-stale": ([], None, None, None, "aurora,speaker-id = <7>; "),
     "speaker-id-third-strap-ignored": ([strap(0x30), strap(0x31), strap(0x32)], (0, 1, 5), 1, None,
                                        ""),
 }

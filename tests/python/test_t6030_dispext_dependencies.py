@@ -58,8 +58,8 @@ static void world(const char *memory, const char *display, bool ext1, int reject
     assert(!fdt_create_empty_tree(dt, sizeof(blob)));
     int chosen = fdt_add_subnode(dt, 0, "chosen");
     assert(chosen >= 0);
-    if (memory) assert(!fdt_setprop_string(dt, chosen, "asahi,t6030-dcpext", memory));
-    if (display) assert(!fdt_setprop_string(dt, chosen, "asahi,t6030-dispext", display));
+    if (memory) assert(!fdt_setprop_string(dt, chosen, "aurora,t6030-dcpext", memory));
+    if (display) assert(!fdt_setprop_string(dt, chosen, "aurora,t6030-dispext", display));
     assert(fdt_add_subnode(dt, 0, "dcpext0") >= 0);
     if (ext1) assert(fdt_add_subnode(dt, 0, "dcpext1") >= 0);
     int aliases = fdt_add_subnode(dt, 0, "aliases");

@@ -452,7 +452,7 @@ static u32 ttbr_of(u64 l1)
 #define SID_DISP   0
 #define SID_PIODMA 16
 #define MARKER     "apple,t6041-handoff"
-#define OPTIN      "asahi,t6041-dcp" /* the removed opt-in, for the stale-optin scenario */
+#define OPTIN      "aurora,t6041-dcp" /* the removed opt-in, for the stale-optin scenario */
 #define DCP_UUID   "8E5C2B1A-4F7D-3A6E-9B0C-1D2E3F405162"
 #define EXT0       0x3a2e00000ULL
 #define EXT1       0x602e00000ULL
@@ -997,8 +997,8 @@ static const struct scenario scenarios[] = {
     {"publish", PUBLISH, "a supported boot with no /chosen property publishes"},
     {"external", PUBLISH, "both external firmware memories come from the ADT"},
     {"external-refuse", PUBLISH, "one bad external ADT leaves its placeholders disabled"},
-    {"stale-optin", PUBLISH, "a left-over chosen.asahi,t6041-dcp=1 changes nothing"},
-    {"stale-optin-zero", PUBLISH, "a left-over chosen.asahi,t6041-dcp=0 does not disable it"},
+    {"stale-optin", PUBLISH, "a left-over chosen.aurora,t6041-dcp=1 changes nothing"},
+    {"stale-optin-zero", PUBLISH, "a left-over chosen.aurora,t6041-dcp=0 does not disable it"},
     {"repeat", PUBLISH, "a second call adds nothing"},
     {"oslog-in-memreserve", PUBLISH, "an __OS_LOG wholly inside a /memreserve/ is still described"},
     {"os-26-7-train", PUBLISH, "26.7.1 booted by an 18000.161.10 train iBoot publishes the 26.6.2 images"},

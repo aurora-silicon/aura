@@ -59,7 +59,7 @@ def IOWR(nr, cls):
         return f
     return dec
 
-class DRMAsahiShim:
+class DRMAuroraShim:
     def __init__(self, memfd):
         self.memfd = memfd
         self.initialized = False
@@ -70,8 +70,8 @@ class DRMAsahiShim:
             if ioctl is not None:
                 self.ioctl_map[ioctl.value] = ioctl, f
         self.bos = {}
-        self.pull_buffers = bool(os.getenv("ASAHI_SHIM_PULL"))
-        self.dump_frames = bool(os.getenv("ASAHI_SHIM_DUMP"))
+        self.pull_buffers = bool(os.getenv("AURORA_SHIM_PULL"))
+        self.dump_frames = bool(os.getenv("AURORA_SHIM_DUMP"))
         self.frame = 0
         self.agx = None
 
@@ -110,13 +110,13 @@ class DRMAsahiShim:
 
         self.initialized = True
 
-    @IOW(DRM_COMMAND_BASE + 0x00, drm_asahi_submit_t)
+    @IOW(DRM_COMMAND_BASE + 0x00, drm_aurora_submit_t)
     def submit(self, fd, args):
         sys.stdout.write(".")
         sys.stdout.flush()
 
-        size = drm_asahi_cmdbuf_t.sizeof()
-        cmdbuf = drm_asahi_cmdbuf_t.parse(self.read_buf(args.cmdbuf, size))
+        size = drm_aurora_cmdbuf_t.sizeof()
+        cmdbuf = drm_aurora_cmdbuf_t.parse(self.read_buf(args.cmdbuf, size))
 
         self.log("Pushing objects...")
         for obj in self.bos.values():
@@ -163,16 +163,16 @@ class DRMAsahiShim:
         self.frame += 1
         return 0
 
-    @IOW(DRM_COMMAND_BASE + 0x01, drm_asahi_wait_bo_t)
+    @IOW(DRM_COMMAND_BASE + 0x01, drm_aurora_wait_bo_t)
     def wait_bo(self, fd, args):
         self.log("Wait BO!", args)
         return 0
 
-    @IOWR(DRM_COMMAND_BASE + 0x02, drm_asahi_create_bo_t)
+    @IOWR(DRM_COMMAND_BASE + 0x02, drm_aurora_create_bo_t)
     def create_bo(self, fd, args):
         memfd_offset = args.offset
 
-        if args.flags & ASAHI_BO_PIPELINE:
+        if args.flags & AURORA_BO_PIPELINE:
             alloc = self.renderer.ctx.pobj
         else:
             alloc = self.renderer.ctx.gobj
@@ -184,18 +184,18 @@ class DRMAsahiShim:
         self.bos[memfd_offset] = obj
         args.offset = obj._addr
 
-        if args.flags & ASAHI_BO_PIPELINE:
+        if args.flags & AURORA_BO_PIPELINE:
             args.offset -= self.renderer.ctx.pipeline_base
 
         self.log(f"Create BO @ {memfd_offset:#x}")
         return 0
 
-    @IOWR(DRM_COMMAND_BASE + 0x04, drm_asahi_get_param_t)
+    @IOWR(DRM_COMMAND_BASE + 0x04, drm_aurora_get_param_t)
     def get_param(self, fd, args):
         self.log("Get Param!", args)
         return 0
 
-    @IOWR(DRM_COMMAND_BASE + 0x05, drm_asahi_get_bo_offset_t)
+    @IOWR(DRM_COMMAND_BASE + 0x05, drm_aurora_get_bo_offset_t)
     def get_bo_offset(self, fd, args):
         self.log("Get BO Offset!", args)
         return 0
@@ -241,4 +241,4 @@ class DRMAsahiShim:
         else:
             self.agx.log("[Shim] " + s)
 
-Shim = DRMAsahiShim
+Shim = DRMAuroraShim

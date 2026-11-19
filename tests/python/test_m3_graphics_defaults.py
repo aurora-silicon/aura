@@ -16,7 +16,7 @@ def between(source, start, end_marker):
 
 def harness():
     source = (ROOT / "src/kboot.c").read_text()
-    tables = between(source, "struct m3_default_board {", '#define M3_DEFAULTS_SWITCH "asahi,m3-defaults"\n')
+    tables = between(source, "struct m3_default_board {", '#define M3_DEFAULTS_SWITCH "aurora,m3-defaults"\n')
     lookup = between(source, "static const char *kboot_chosen_param(const char *name)\n{", "\n}\n")
     drop = between(source, "static void dt_drop_m3_defaults(void)\n{", "\n}\n")
     drop_graphics = between(source, "static void dt_drop_m3_graphics(", "\n}\n")
@@ -124,13 +124,13 @@ static void fill(int n)
         assert(kboot_set_chosen(name, "x") >= 0);
     }
 }
-static const char *air[] = {"asahi,t8122-dcp", "asahi,t8122-gpu", "asahi,t8122-gpu-power-standin",
-                            "asahi,t8122-gpu-fuse-leakage"};
-static const char *pro[] = {"asahi,t6030-dcp", "asahi,t6030-gpu"};
-static const char *max[] = {"asahi,t6031-dcp", "asahi,t6031-gpu"};
-static const char *never[] = {"asahi,t8122-dcpext", "asahi,t6030-dcpext", "asahi,t6030-dispext",
-                              "asahi,t8122-gpu-asc-preflight",
-                              "asahi,t8122-gpu-handoff-diag", "asahi,m3-defaults"};
+static const char *air[] = {"aurora,t8122-dcp", "aurora,t8122-gpu", "aurora,t8122-gpu-power-standin",
+                            "aurora,t8122-gpu-fuse-leakage"};
+static const char *pro[] = {"aurora,t6030-dcp", "aurora,t6030-gpu"};
+static const char *max[] = {"aurora,t6031-dcp", "aurora,t6031-gpu"};
+static const char *never[] = {"aurora,t8122-dcpext", "aurora,t6030-dcpext", "aurora,t6030-dispext",
+                              "aurora,t8122-gpu-asc-preflight",
+                              "aurora,t8122-gpu-handoff-diag", "aurora,m3-defaults"};
 static int listed(const char *name, const char **list, int n)
 {
     for (int i = 0; i < n; i++) if (!strcmp(name, list[i])) return 1;
@@ -158,7 +158,7 @@ int main(void)
     RESET(J514S); assert(!run()); expect_only(pro, 2);
     RESET(J516C); assert(!run()); expect_only(max, 2);
     assert(entries() == 2 && defaults() == 2 && chosen_is_default[0] && chosen_is_default[1]);
-    assert(slot("asahi,t6031-dcp") == 0 && slot("asahi,t6031-gpu") == 1);
+    assert(slot("aurora,t6031-dcp") == 0 && slot("aurora,t6031-gpu") == 1);
 
     /* the J514C, the T6034 Maxes, a Max board name on another SoC or none, unknown M3 boards, a
        board without its SoC, M1/M2: untouched */
@@ -178,119 +178,119 @@ int main(void)
 
     /* an explicit config value wins: =0 keeps that switch off, the others still default on */
     RESET("apple,j613\0apple,t8122\0apple,arm-platform");
-    assert(kboot_set_chosen("asahi,t8122-gpu", "0") >= 0);
+    assert(kboot_set_chosen("aurora,t8122-gpu", "0") >= 0);
     assert(!run());
-    assert(armed("asahi,t8122-dcp") && !armed("asahi,t8122-gpu") && present("asahi,t8122-gpu"));
-    assert(armed("asahi,t8122-gpu-power-standin") && armed("asahi,t8122-gpu-fuse-leakage"));
+    assert(armed("aurora,t8122-dcp") && !armed("aurora,t8122-gpu") && present("aurora,t8122-gpu"));
+    assert(armed("aurora,t8122-gpu-power-standin") && armed("aurora,t8122-gpu-fuse-leakage"));
     RESET("apple,j516s\0apple,t6030\0apple,arm-platform");
-    assert(kboot_set_chosen("asahi,t6030-dcp", "0") >= 0);
-    assert(kboot_set_chosen("asahi,t6030-dcpext", "1") >= 0);   /* its own line, kept as is */
+    assert(kboot_set_chosen("aurora,t6030-dcp", "0") >= 0);
+    assert(kboot_set_chosen("aurora,t6030-dcpext", "1") >= 0);   /* its own line, kept as is */
     assert(!run());
-    assert(!armed("asahi,t6030-dcp") && armed("asahi,t6030-gpu") && armed("asahi,t6030-dcpext"));
+    assert(!armed("aurora,t6030-dcp") && armed("aurora,t6030-gpu") && armed("aurora,t6030-dcpext"));
     /* an explicit =1 stays one entry */
     RESET("apple,j516s\0apple,t6030\0apple,arm-platform");
-    assert(kboot_set_chosen("asahi,t6030-gpu", "1") >= 0);
+    assert(kboot_set_chosen("aurora,t6030-gpu", "1") >= 0);
     assert(!run());
-    assert(entries() == 2 && armed("asahi,t6030-dcp") && armed("asahi,t6030-gpu"));
+    assert(entries() == 2 && armed("aurora,t6030-dcp") && armed("aurora,t6030-gpu"));
 
     /* the 14-inch M3 Pro (J514S): its two defaults, and an owner's =0 keeps each one off */
     RESET(J514S);
-    assert(kboot_set_chosen("asahi,t6030-gpu", "0") >= 0);
+    assert(kboot_set_chosen("aurora,t6030-gpu", "0") >= 0);
     assert(!run());
-    assert(armed("asahi,t6030-dcp") && present("asahi,t6030-gpu") && !armed("asahi,t6030-gpu"));
-    assert(entries() == 2 && !chosen_is_default[slot("asahi,t6030-gpu")] && defaults() == 1);
+    assert(armed("aurora,t6030-dcp") && present("aurora,t6030-gpu") && !armed("aurora,t6030-gpu"));
+    assert(entries() == 2 && !chosen_is_default[slot("aurora,t6030-gpu")] && defaults() == 1);
     RESET(J514S);
-    assert(kboot_set_chosen("asahi,t6030-dcp", "0") >= 0);
+    assert(kboot_set_chosen("aurora,t6030-dcp", "0") >= 0);
     assert(!run());
-    assert(present("asahi,t6030-dcp") && !armed("asahi,t6030-dcp") && armed("asahi,t6030-gpu"));
+    assert(present("aurora,t6030-dcp") && !armed("aurora,t6030-dcp") && armed("aurora,t6030-gpu"));
     assert(entries() == 2 && defaults() == 1);
     RESET(J514S);
-    assert(kboot_set_chosen("asahi,t6030-gpu", "1") >= 0);
-    assert(kboot_set_chosen("asahi,t6030-gpu", "0") >= 0);       /* the later line wins */
+    assert(kboot_set_chosen("aurora,t6030-gpu", "1") >= 0);
+    assert(kboot_set_chosen("aurora,t6030-gpu", "0") >= 0);       /* the later line wins */
     assert(!run());
-    assert(armed("asahi,t6030-dcp") && present("asahi,t6030-gpu") && !armed("asahi,t6030-gpu"));
+    assert(armed("aurora,t6030-dcp") && present("aurora,t6030-gpu") && !armed("aurora,t6030-gpu"));
     RESET(J514S);
-    assert(kboot_set_chosen("asahi,m3-defaults", "0") >= 0);
+    assert(kboot_set_chosen("aurora,m3-defaults", "0") >= 0);
     assert(!run());
-    assert(!present("asahi,t6030-dcp") && !present("asahi,t6030-gpu") && entries() == 1);
+    assert(!present("aurora,t6030-dcp") && !present("aurora,t6030-gpu") && entries() == 1);
 
     /* the J516C: each switch stands alone, as on the Pro. An owner's =0 keeps that one off (the
        GPU =0 an earlier installer wrote included) while the other still defaults on, and any owner
        value stays the owner's */
     RESET(J516C);
-    assert(kboot_set_chosen("asahi,t6031-gpu", "0") >= 0);
+    assert(kboot_set_chosen("aurora,t6031-gpu", "0") >= 0);
     assert(!run());
-    assert(present("asahi,t6031-gpu") && !armed("asahi,t6031-gpu") && armed("asahi,t6031-dcp"));
-    assert(entries() == 2 && defaults() == 1 && !chosen_is_default[slot("asahi,t6031-gpu")]);
-    assert(!strcmp(chosen_params[slot("asahi,t6031-gpu")][1], "0"));
+    assert(present("aurora,t6031-gpu") && !armed("aurora,t6031-gpu") && armed("aurora,t6031-dcp"));
+    assert(entries() == 2 && defaults() == 1 && !chosen_is_default[slot("aurora,t6031-gpu")]);
+    assert(!strcmp(chosen_params[slot("aurora,t6031-gpu")][1], "0"));
     RESET(J516C);
-    assert(kboot_set_chosen("asahi,t6031-gpu", "1") >= 0);
-    assert(kboot_set_chosen("asahi,t6031-gpu", "0") >= 0);       /* the later line wins */
+    assert(kboot_set_chosen("aurora,t6031-gpu", "1") >= 0);
+    assert(kboot_set_chosen("aurora,t6031-gpu", "0") >= 0);       /* the later line wins */
     assert(!run());
-    assert(present("asahi,t6031-gpu") && !armed("asahi,t6031-gpu") && armed("asahi,t6031-dcp"));
+    assert(present("aurora,t6031-gpu") && !armed("aurora,t6031-gpu") && armed("aurora,t6031-dcp"));
     assert(entries() == 2 && defaults() == 1);
     RESET(J516C);
-    assert(kboot_set_chosen("asahi,t6031-gpu", "1") >= 0);
+    assert(kboot_set_chosen("aurora,t6031-gpu", "1") >= 0);
     assert(!run());
-    assert(armed("asahi,t6031-gpu") && armed("asahi,t6031-dcp") && entries() == 2 && defaults() == 1);
-    assert(!chosen_is_default[slot("asahi,t6031-gpu")] && chosen_is_default[slot("asahi,t6031-dcp")]);
+    assert(armed("aurora,t6031-gpu") && armed("aurora,t6031-dcp") && entries() == 2 && defaults() == 1);
+    assert(!chosen_is_default[slot("aurora,t6031-gpu")] && chosen_is_default[slot("aurora,t6031-dcp")]);
     RESET(J516C);
-    assert(kboot_set_chosen("asahi,t6031-gpu", "yes") >= 0);     /* kept; no reader takes it as 1 */
+    assert(kboot_set_chosen("aurora,t6031-gpu", "yes") >= 0);     /* kept; no reader takes it as 1 */
     assert(!run());
-    assert(present("asahi,t6031-gpu") && !armed("asahi,t6031-gpu") && entries() == 2);
+    assert(present("aurora,t6031-gpu") && !armed("aurora,t6031-gpu") && entries() == 2);
     RESET(J516C);
-    assert(kboot_set_chosen("asahi,t6031-dcp", "1") >= 0);
+    assert(kboot_set_chosen("aurora,t6031-dcp", "1") >= 0);
     assert(!run());
-    assert(armed("asahi,t6031-dcp") && armed("asahi,t6031-gpu") && entries() == 2);
-    assert(!chosen_is_default[slot("asahi,t6031-dcp")] && chosen_is_default[slot("asahi,t6031-gpu")]);
+    assert(armed("aurora,t6031-dcp") && armed("aurora,t6031-gpu") && entries() == 2);
+    assert(!chosen_is_default[slot("aurora,t6031-dcp")] && chosen_is_default[slot("aurora,t6031-gpu")]);
     RESET(J516C);
-    assert(kboot_set_chosen("asahi,t6031-dcp", "0") >= 0);
+    assert(kboot_set_chosen("aurora,t6031-dcp", "0") >= 0);
     assert(!run());
-    assert(present("asahi,t6031-dcp") && !armed("asahi,t6031-dcp") && armed("asahi,t6031-gpu"));
-    assert(entries() == 2 && defaults() == 1 && !chosen_is_default[slot("asahi,t6031-dcp")]);
+    assert(present("aurora,t6031-dcp") && !armed("aurora,t6031-dcp") && armed("aurora,t6031-gpu"));
+    assert(entries() == 2 && defaults() == 1 && !chosen_is_default[slot("aurora,t6031-dcp")]);
     RESET(J516C);
-    assert(kboot_set_chosen("asahi,t6031-dcp", "0") >= 0);
-    assert(kboot_set_chosen("asahi,t6031-gpu", "0") >= 0);
+    assert(kboot_set_chosen("aurora,t6031-dcp", "0") >= 0);
+    assert(kboot_set_chosen("aurora,t6031-gpu", "0") >= 0);
     assert(!run());
-    assert(!armed("asahi,t6031-dcp") && !armed("asahi,t6031-gpu") && entries() == 2 && defaults() == 0);
+    assert(!armed("aurora,t6031-dcp") && !armed("aurora,t6031-gpu") && entries() == 2 && defaults() == 0);
 
-    /* chosen.asahi,m3-defaults=0 (or anything but 1) adds no default and keeps explicit lines,
+    /* chosen.aurora,m3-defaults=0 (or anything but 1) adds no default and keeps explicit lines,
        an owner's =1 included */
     RESET("apple,j613\0apple,t8122\0apple,arm-platform");
-    assert(kboot_set_chosen("asahi,m3-defaults", "0") >= 0);
-    assert(kboot_set_chosen("asahi,t8122-dcp", "1") >= 0);
+    assert(kboot_set_chosen("aurora,m3-defaults", "0") >= 0);
+    assert(kboot_set_chosen("aurora,t8122-dcp", "1") >= 0);
     assert(!run());
-    assert(armed("asahi,t8122-dcp") && !present("asahi,t8122-gpu"));
-    assert(!present("asahi,t8122-gpu-power-standin") && !present("asahi,t8122-gpu-fuse-leakage"));
+    assert(armed("aurora,t8122-dcp") && !present("aurora,t8122-gpu"));
+    assert(!present("aurora,t8122-gpu-power-standin") && !present("aurora,t8122-gpu-fuse-leakage"));
     RESET("apple,j516s\0apple,t6030\0apple,arm-platform");
-    assert(kboot_set_chosen("asahi,m3-defaults", "1") >= 0);
+    assert(kboot_set_chosen("aurora,m3-defaults", "1") >= 0);
     assert(!run());
-    assert(armed("asahi,t6030-dcp") && armed("asahi,t6030-gpu"));
+    assert(armed("aurora,t6030-dcp") && armed("aurora,t6030-gpu"));
     RESET(J516C);
-    assert(kboot_set_chosen("asahi,m3-defaults", "0") >= 0);
+    assert(kboot_set_chosen("aurora,m3-defaults", "0") >= 0);
     assert(!run());
-    assert(!present("asahi,t6031-gpu") && !present("asahi,t6031-dcp"));
+    assert(!present("aurora,t6031-gpu") && !present("aurora,t6031-dcp"));
     assert(entries() == 1 && defaults() == 0);
     RESET(J516C);
-    assert(kboot_set_chosen("asahi,m3-defaults", "off") >= 0);
+    assert(kboot_set_chosen("aurora,m3-defaults", "off") >= 0);
     assert(!run());
-    assert(!present("asahi,t6031-gpu") && !present("asahi,t6031-dcp") && entries() == 1);
+    assert(!present("aurora,t6031-gpu") && !present("aurora,t6031-dcp") && entries() == 1);
     RESET(J516C);                                    /* the owner's =1 stays; no display default */
-    assert(kboot_set_chosen("asahi,m3-defaults", "0") >= 0);
-    assert(kboot_set_chosen("asahi,t6031-gpu", "1") >= 0);
+    assert(kboot_set_chosen("aurora,m3-defaults", "0") >= 0);
+    assert(kboot_set_chosen("aurora,t6031-gpu", "1") >= 0);
     assert(!run());
-    assert(armed("asahi,t6031-gpu") && !present("asahi,t6031-dcp") && entries() == 2);
+    assert(armed("aurora,t6031-gpu") && !present("aurora,t6031-dcp") && entries() == 2);
     assert(defaults() == 0);
     RESET(J516C);
-    assert(kboot_set_chosen("asahi,m3-defaults", "0") >= 0);
-    assert(kboot_set_chosen("asahi,t6031-gpu", "1") >= 0);
-    assert(kboot_set_chosen("asahi,t6031-dcp", "1") >= 0);
+    assert(kboot_set_chosen("aurora,m3-defaults", "0") >= 0);
+    assert(kboot_set_chosen("aurora,t6031-gpu", "1") >= 0);
+    assert(kboot_set_chosen("aurora,t6031-dcp", "1") >= 0);
     assert(!run());
-    assert(armed("asahi,t6031-gpu") && armed("asahi,t6031-dcp") && entries() == 3 && defaults() == 0);
+    assert(armed("aurora,t6031-gpu") && armed("aurora,t6031-dcp") && entries() == 3 && defaults() == 0);
     RESET(J516C);
-    assert(kboot_set_chosen("asahi,m3-defaults", "1") >= 0);
+    assert(kboot_set_chosen("aurora,m3-defaults", "1") >= 0);
     assert(!run());
-    assert(armed("asahi,t6031-gpu") && armed("asahi,t6031-dcp") && entries() == 3 && defaults() == 2);
+    assert(armed("aurora,t6031-gpu") && armed("aurora,t6031-dcp") && entries() == 3 && defaults() == 2);
 
     /* a short chosen table: all of the recipe or none of it, nothing overwritten */
     RESET("apple,j613\0apple,t8122\0apple,arm-platform");
@@ -300,29 +300,29 @@ int main(void)
     assert(entries() == MAX_CHOSEN_PARAMS - 3 && !strcmp(chosen_params[0][1], "x"));
     RESET("apple,j516s\0apple,t6030\0apple,arm-platform");      /* the Pro's two still fit */
     fill(MAX_CHOSEN_PARAMS - 2);
-    assert(!run()); assert(armed("asahi,t6030-dcp") && armed("asahi,t6030-gpu"));
+    assert(!run()); assert(armed("aurora,t6030-dcp") && armed("aurora,t6030-gpu"));
     RESET(J516C);                                                 /* the Max's two in the last entries */
     fill(MAX_CHOSEN_PARAMS - 2);
     assert(!run());
-    assert(armed("asahi,t6031-dcp") && armed("asahi,t6031-gpu") && entries() == MAX_CHOSEN_PARAMS);
+    assert(armed("aurora,t6031-dcp") && armed("aurora,t6031-gpu") && entries() == MAX_CHOSEN_PARAMS);
     assert(chosen_is_default[MAX_CHOSEN_PARAMS - 2] && chosen_is_default[MAX_CHOSEN_PARAMS - 1]);
     assert(defaults() == 2);
     RESET(J516C);                                                 /* not one of them into one entry */
     fill(MAX_CHOSEN_PARAMS - 1);
     assert(!run());
-    assert(!present("asahi,t6031-dcp") && !present("asahi,t6031-gpu"));
+    assert(!present("aurora,t6031-dcp") && !present("aurora,t6031-gpu"));
     assert(entries() == MAX_CHOSEN_PARAMS - 1 && defaults() == 0 && !chosen_lost);
     for (int i = 0; i < MAX_CHOSEN_PARAMS - 1; i++) assert(!strcmp(chosen_params[i][1], "x"));
     RESET(J516C);                                     /* one entry is enough beside an owner's line */
-    assert(kboot_set_chosen("asahi,t6031-gpu", "0") >= 0);
+    assert(kboot_set_chosen("aurora,t6031-gpu", "0") >= 0);
     fill(MAX_CHOSEN_PARAMS - 2);
     assert(!run());
-    assert(armed("asahi,t6031-dcp") && present("asahi,t6031-gpu") && !armed("asahi,t6031-gpu"));
+    assert(armed("aurora,t6031-dcp") && present("aurora,t6031-gpu") && !armed("aurora,t6031-gpu"));
     assert(entries() == MAX_CHOSEN_PARAMS && defaults() == 1 && chosen_is_default[MAX_CHOSEN_PARAMS - 1]);
     RESET(J516C);                                                 /* and not into a full table */
     fill(MAX_CHOSEN_PARAMS);
     assert(!run());
-    assert(!present("asahi,t6031-dcp") && !present("asahi,t6031-gpu"));
+    assert(!present("aurora,t6031-dcp") && !present("aurora,t6031-gpu"));
     assert(entries() == MAX_CHOSEN_PARAMS && defaults() == 0);
     assert(!chosen_lost);                                         /* every config line was kept */
     for (int i = 0; i < MAX_CHOSEN_PARAMS; i++) assert(!strcmp(chosen_params[i][1], "x"));
@@ -334,20 +334,20 @@ int main(void)
     for (int i = 0; i < 4; i++) assert(armed(air[i]));
     RESET(J516C);
     assert(!run()); TREE(J516C); assert(!run()); TREE(J516C); assert(!run());
-    assert(entries() == 2 && defaults() == 2 && armed("asahi,t6031-gpu") && armed("asahi,t6031-dcp"));
+    assert(entries() == 2 && defaults() == 2 && armed("aurora,t6031-gpu") && armed("aurora,t6031-dcp"));
 
     /* the master switch set after a first preparation: the earlier defaults go */
     RESET("apple,j613\0apple,t8122\0apple,arm-platform");
     assert(!run());
-    assert(kboot_set_chosen("asahi,m3-defaults", "0") >= 0);
+    assert(kboot_set_chosen("aurora,m3-defaults", "0") >= 0);
     TREE("apple,j613\0apple,t8122\0apple,arm-platform"); assert(!run());
     for (int i = 0; i < 4; i++) assert(!present(air[i]));
     assert(entries() == 1);
     RESET(J516C);
     assert(!run());
-    assert(kboot_set_chosen("asahi,m3-defaults", "0") >= 0);
+    assert(kboot_set_chosen("aurora,m3-defaults", "0") >= 0);
     TREE(J516C); assert(!run());
-    assert(!present("asahi,t6031-gpu") && !present("asahi,t6031-dcp"));
+    assert(!present("aurora,t6031-gpu") && !present("aurora,t6031-dcp"));
     assert(entries() == 1 && defaults() == 0);
 
     /* another device tree in the same process: no default carries over to another board */
@@ -355,7 +355,7 @@ int main(void)
     assert(!run());
     TREE("apple,j516s\0apple,t6030\0apple,arm-platform"); assert(!run());
     for (int i = 0; i < 4; i++) assert(!present(air[i]));
-    assert(armed("asahi,t6030-dcp") && armed("asahi,t6030-gpu") && entries() == 2);
+    assert(armed("aurora,t6030-dcp") && armed("aurora,t6030-gpu") && entries() == 2);
     TREE(J516C); assert(!run());
     expect_only(max, 2); assert(entries() == 2);
     TREE(J514C); assert(!run());
@@ -364,11 +364,11 @@ int main(void)
     /* an owner's later value for a defaulted switch is theirs and survives */
     RESET("apple,j613\0apple,t8122\0apple,arm-platform");
     assert(!run());
-    assert(kboot_set_chosen("asahi,t8122-gpu", "0") >= 0);
+    assert(kboot_set_chosen("aurora,t8122-gpu", "0") >= 0);
     TREE("apple,j613\0apple,t8122\0apple,arm-platform"); assert(!run());
-    assert(present("asahi,t8122-gpu") && !armed("asahi,t8122-gpu"));
-    assert(armed("asahi,t8122-dcp") && armed("asahi,t8122-gpu-power-standin") &&
-           armed("asahi,t8122-gpu-fuse-leakage") && entries() == 4);
+    assert(present("aurora,t8122-gpu") && !armed("aurora,t8122-gpu"));
+    assert(armed("aurora,t8122-dcp") && armed("aurora,t8122-gpu-power-standin") &&
+           armed("aurora,t8122-gpu-fuse-leakage") && entries() == 4);
 
     /* generated-entry flags: a default deleted from the middle moves the owner's later line down
        without its flag, the owner's later value takes a default over, and switching boards in one
@@ -380,11 +380,11 @@ int main(void)
     assert(entries() == 4 && chosen_is_default[1] && chosen_is_default[2] && !chosen_is_default[3]);
     TREE(J516C); assert(!run());                          /* the defaults dropped, then added last */
     assert(entries() == 4 && slot("test,later") == 1 && !chosen_is_default[1]);
-    assert(slot("asahi,t6031-dcp") == 2 && slot("asahi,t6031-gpu") == 3);
+    assert(slot("aurora,t6031-dcp") == 2 && slot("aurora,t6031-gpu") == 3);
     assert(chosen_is_default[2] && chosen_is_default[3] && defaults() == 2);
     TREE(J516S); assert(!run());
-    assert(!present("asahi,t6031-gpu") && !present("asahi,t6031-dcp"));
-    assert(armed("asahi,t6030-dcp") && armed("asahi,t6030-gpu"));
+    assert(!present("aurora,t6031-gpu") && !present("aurora,t6031-dcp"));
+    assert(armed("aurora,t6030-dcp") && armed("aurora,t6030-gpu"));
     assert(entries() == 4 && !chosen_is_default[0] && !chosen_is_default[1] && defaults() == 2);
     TREE(J613); assert(!run());
     expect_only(air, 4); assert(entries() == 6 && defaults() == 4);
@@ -394,15 +394,15 @@ int main(void)
     expect_none(); assert(entries() == 2 && defaults() == 0);
     TREE(J516C); assert(!run());
     expect_only(max, 2); assert(entries() == 4 && defaults() == 2);
-    assert(kboot_set_chosen("asahi,t6031-gpu", "0") >= 0);   /* the owner takes the GPU over */
-    assert(defaults() == 1 && slot("asahi,t6031-gpu") == 3 && !chosen_is_default[3]);
+    assert(kboot_set_chosen("aurora,t6031-gpu", "0") >= 0);   /* the owner takes the GPU over */
+    assert(defaults() == 1 && slot("aurora,t6031-gpu") == 3 && !chosen_is_default[3]);
     TREE(J516C); assert(!run());                          /* the display default moves after it */
-    assert(present("asahi,t6031-gpu") && !armed("asahi,t6031-gpu") && armed("asahi,t6031-dcp"));
-    assert(entries() == 4 && slot("asahi,t6031-gpu") == 2 && slot("asahi,t6031-dcp") == 3);
+    assert(present("aurora,t6031-gpu") && !armed("aurora,t6031-gpu") && armed("aurora,t6031-dcp"));
+    assert(entries() == 4 && slot("aurora,t6031-gpu") == 2 && slot("aurora,t6031-dcp") == 3);
     assert(chosen_is_default[3] && defaults() == 1);
     TREE(J516S); assert(!run());                          /* an owner's T6031 line stays on a Pro */
-    assert(present("asahi,t6031-gpu") && !present("asahi,t6031-dcp") && armed("asahi,t6030-gpu"));
-    assert(entries() == 5 && defaults() == 2 && !chosen_is_default[slot("asahi,t6031-gpu")]);
+    assert(present("aurora,t6031-gpu") && !present("aurora,t6031-dcp") && armed("aurora,t6030-gpu"));
+    assert(entries() == 5 && defaults() == 2 && !chosen_is_default[slot("aurora,t6031-gpu")]);
     assert(!strcmp(chosen_params[0][0], "test,first") && !strcmp(chosen_params[1][0], "test,later"));
 
     /* allocation failure part way through: no partial recipe, no crash */
@@ -423,14 +423,14 @@ int main(void)
         calloc_fail_in = fail;
         assert(!run());
         calloc_fail_in = -1;
-        int on = present("asahi,t6031-dcp") + present("asahi,t6031-gpu");
+        int on = present("aurora,t6031-dcp") + present("aurora,t6031-gpu");
         assert(on == 0 || on == 2);                      /* both defaults or neither */
         assert(entries() == 1 + on && armed("test,owner") && !chosen_is_default[0]);
-        assert(defaults() == on && (!on || (armed("asahi,t6031-dcp") && armed("asahi,t6031-gpu"))));
+        assert(defaults() == on && (!on || (armed("aurora,t6031-dcp") && armed("aurora,t6031-gpu"))));
         assert(on || chosen_lost);                       /* a default that failed marks the loss */
         assert(on || fail < 4);                          /* each of the four allocations was hit */
         TREE(J516C); assert(!run());                     /* and a loss stays: graphics stay off */
-        assert(present("asahi,t6031-dcp") + present("asahi,t6031-gpu") == on);
+        assert(present("aurora,t6031-dcp") + present("aurora,t6031-gpu") == on);
         assert(entries() == 1 + on);
     }
     /* kboot_set_chosen itself: a failed allocation leaves the table as it was */
@@ -445,25 +445,25 @@ int main(void)
 
     /* a failed overwrite keeps an owner's =0 (name, value and ownership), and the defaults stay off */
     RESET("apple,j613\0apple,t8122\0apple,arm-platform");
-    assert(kboot_set_chosen("asahi,t8122-gpu", "0") >= 0);
+    assert(kboot_set_chosen("aurora,t8122-gpu", "0") >= 0);
     assert(!run());
     calloc_fail_in = 0;
-    assert(kboot_set_chosen("asahi,t8122-gpu", "0") < 0);
-    assert(entries() == 4 && !strcmp(chosen_params[0][0], "asahi,t8122-gpu") &&
+    assert(kboot_set_chosen("aurora,t8122-gpu", "0") < 0);
+    assert(entries() == 4 && !strcmp(chosen_params[0][0], "aurora,t8122-gpu") &&
            !strcmp(chosen_params[0][1], "0") && !chosen_is_default[0]);
     TREE("apple,j613\0apple,t8122\0apple,arm-platform"); assert(!run());
     for (int i = 0; i < 4; i++) assert(!present(air[i]));     /* fail closed: no graphics at all */
     assert(entries() == 0);
     RESET(J516C);
-    assert(kboot_set_chosen("asahi,t6031-gpu", "0") >= 0);
+    assert(kboot_set_chosen("aurora,t6031-gpu", "0") >= 0);
     calloc_fail_in = 0;
-    assert(kboot_set_chosen("asahi,t6031-gpu", "1") < 0);
+    assert(kboot_set_chosen("aurora,t6031-gpu", "1") < 0);
     assert(!strcmp(chosen_params[0][1], "0") && !chosen_is_default[0] && chosen_lost);
     assert(!run());
     expect_none(); assert(entries() == 0);
 
     /* an owner's =0 that could not be stored at all: no default goes in */
-    static const char *zero[] = {"asahi,t8122-gpu", "asahi,t6030-gpu", "asahi,t6031-gpu"};
+    static const char *zero[] = {"aurora,t8122-gpu", "aurora,t6030-gpu", "aurora,t6031-gpu"};
     for (int b = 0; b < 3; b++) {
         if (b == 2) RESET(J516C);
         else if (b) RESET("apple,j516s\0apple,t6030\0apple,arm-platform");
@@ -476,15 +476,15 @@ int main(void)
     /* nor when a config line was lost to a full table */
     RESET("apple,j516s\0apple,t6030\0apple,arm-platform");
     fill(MAX_CHOSEN_PARAMS);
-    assert(kboot_set_chosen("asahi,t6030-gpu", "0") < 0 && chosen_lost);
+    assert(kboot_set_chosen("aurora,t6030-gpu", "0") < 0 && chosen_lost);
     assert(!run());
     expect_none();
     RESET(J516C);
-    assert(kboot_set_chosen("asahi,t6031-gpu", "1") >= 0);
+    assert(kboot_set_chosen("aurora,t6031-gpu", "1") >= 0);
     fill(MAX_CHOSEN_PARAMS - 1);
-    assert(kboot_set_chosen("asahi,t6031-gpu", "1") >= 0);      /* the same entry: no loss */
+    assert(kboot_set_chosen("aurora,t6031-gpu", "1") >= 0);      /* the same entry: no loss */
     assert(!chosen_lost);
-    assert(kboot_set_chosen("asahi,t6031-gpu-later", "0") < 0 && chosen_lost);
+    assert(kboot_set_chosen("aurora,t6031-gpu-later", "0") < 0 && chosen_lost);
     assert(!run());
     expect_none(); assert(entries() == MAX_CHOSEN_PARAMS - 1);
 
@@ -492,27 +492,27 @@ int main(void)
     for (int b = 0; b < 2; b++) {
         if (b) RESET("apple,j615\0apple,t8122\0apple,arm-platform");
         else RESET("apple,j613\0apple,t8122\0apple,arm-platform");
-        assert(kboot_set_chosen("asahi,t8122-dcp", "0") >= 0);
+        assert(kboot_set_chosen("aurora,t8122-dcp", "0") >= 0);
         assert(!run());
-        assert(present("asahi,t8122-dcp") && !armed("asahi,t8122-dcp"));
+        assert(present("aurora,t8122-dcp") && !armed("aurora,t8122-dcp"));
         for (int i = 1; i < 4; i++) assert(!present(air[i]));
         assert(entries() == 1);
     }
     /* an owner's own GPU line beside it stays, with no default power switches added */
     RESET("apple,j613\0apple,t8122\0apple,arm-platform");
-    assert(kboot_set_chosen("asahi,t8122-dcp", "0") >= 0);
-    assert(kboot_set_chosen("asahi,t8122-gpu", "1") >= 0);
+    assert(kboot_set_chosen("aurora,t8122-dcp", "0") >= 0);
+    assert(kboot_set_chosen("aurora,t8122-gpu", "1") >= 0);
     assert(!run());
-    assert(armed("asahi,t8122-gpu") && !present("asahi,t8122-gpu-power-standin"));
-    assert(!present("asahi,t8122-gpu-fuse-leakage") && entries() == 2);
+    assert(armed("aurora,t8122-gpu") && !present("aurora,t8122-gpu-power-standin"));
+    assert(!present("aurora,t8122-gpu-fuse-leakage") && entries() == 2);
     /* the display line changed after a first preparation: =0 takes the GPU defaults away, =1 restores them */
     RESET("apple,j613\0apple,t8122\0apple,arm-platform");
     assert(!run()); assert(entries() == 4);
-    assert(kboot_set_chosen("asahi,t8122-dcp", "0") >= 0);
+    assert(kboot_set_chosen("aurora,t8122-dcp", "0") >= 0);
     TREE("apple,j613\0apple,t8122\0apple,arm-platform"); assert(!run());
     for (int i = 1; i < 4; i++) assert(!present(air[i]));
     assert(entries() == 1);
-    assert(kboot_set_chosen("asahi,t8122-dcp", "1") >= 0);
+    assert(kboot_set_chosen("aurora,t8122-dcp", "1") >= 0);
     TREE("apple,j613\0apple,t8122\0apple,arm-platform"); assert(!run());
     for (int i = 0; i < 4; i++) assert(armed(air[i]));
     assert(entries() == 4);
@@ -521,70 +521,70 @@ int main(void)
     /* after a lost line an owner's earlier =1 no longer stands on the five boards: every graphics
        line of the board goes, other lines stay, and the preparation still succeeds */
     RESET("apple,j613\0apple,t8122\0apple,arm-platform");
-    assert(kboot_set_chosen("asahi,t8122-gpu", "1") >= 0);
-    assert(kboot_set_chosen("asahi,t8122-dcpext", "1") >= 0);
-    assert(kboot_set_chosen("asahi,j615-25g83-experimental", "1") >= 0);
+    assert(kboot_set_chosen("aurora,t8122-gpu", "1") >= 0);
+    assert(kboot_set_chosen("aurora,t8122-dcpext", "1") >= 0);
+    assert(kboot_set_chosen("aurora,j615-25g83-experimental", "1") >= 0);
     assert(kboot_set_chosen("test,other", "1") >= 0);
     chosen_lost = true;
     assert(!run());
     for (int i = 0; i < 4; i++) assert(!present(air[i]));
-    assert(!present("asahi,t8122-dcpext") && !present("asahi,j615-25g83-experimental"));
+    assert(!present("aurora,t8122-dcpext") && !present("aurora,j615-25g83-experimental"));
     assert(present("test,other") && entries() == 1);
     RESET("apple,j516s\0apple,t6030\0apple,arm-platform");
-    assert(kboot_set_chosen("asahi,t6030-gpu", "1") >= 0);
-    assert(kboot_set_chosen("asahi,t6030-dispext", "1") >= 0);
+    assert(kboot_set_chosen("aurora,t6030-gpu", "1") >= 0);
+    assert(kboot_set_chosen("aurora,t6030-dispext", "1") >= 0);
     chosen_lost = true;
     assert(!run());
     for (int i = 0; i < 2; i++) assert(!present(pro[i]));
-    assert(!present("asahi,t6030-dispext") && entries() == 0);
+    assert(!present("aurora,t6030-dispext") && entries() == 0);
     RESET(J516C);
-    assert(kboot_set_chosen("asahi,t6031-gpu", "1") >= 0);
-    assert(kboot_set_chosen("asahi,t6031-dcp", "1") >= 0);
-    assert(kboot_set_chosen("asahi,efi-system-partition", "X") >= 0);
-    assert(kboot_set_chosen("asahi,t6030-gpu", "1") >= 0);      /* another SoC's line: not this board's */
+    assert(kboot_set_chosen("aurora,t6031-gpu", "1") >= 0);
+    assert(kboot_set_chosen("aurora,t6031-dcp", "1") >= 0);
+    assert(kboot_set_chosen("aurora,efi-system-partition", "X") >= 0);
+    assert(kboot_set_chosen("aurora,t6030-gpu", "1") >= 0);      /* another SoC's line: not this board's */
     chosen_lost = true;
     assert(!run());
-    assert(!present("asahi,t6031-gpu") && !present("asahi,t6031-dcp"));
-    assert(present("asahi,efi-system-partition") && present("asahi,t6030-gpu") && entries() == 2);
+    assert(!present("aurora,t6031-gpu") && !present("aurora,t6031-dcp"));
+    assert(present("aurora,efi-system-partition") && present("aurora,t6030-gpu") && entries() == 2);
     RESET(J516C);                                         /* the master switch does not keep them */
-    assert(kboot_set_chosen("asahi,m3-defaults", "0") >= 0);
-    assert(kboot_set_chosen("asahi,t6031-gpu", "1") >= 0);
+    assert(kboot_set_chosen("aurora,m3-defaults", "0") >= 0);
+    assert(kboot_set_chosen("aurora,t6031-gpu", "1") >= 0);
     chosen_lost = true;
     assert(!run());
-    assert(!present("asahi,t6031-gpu") && entries() == 1);
+    assert(!present("aurora,t6031-gpu") && entries() == 1);
     RESET(J516C);                                         /* nothing to drop: no default either */
     chosen_lost = true;
     assert(!run()); assert(entries() == 0);
     TREE(J516C); assert(!run()); assert(entries() == 0 && chosen_lost);
     RESET(J516C);                                         /* a loss after a first preparation */
-    assert(!run()); assert(armed("asahi,t6031-gpu") && armed("asahi,t6031-dcp"));
+    assert(!run()); assert(armed("aurora,t6031-gpu") && armed("aurora,t6031-dcp"));
     chosen_lost = true;
     TREE(J516C); assert(!run());
-    assert(!present("asahi,t6031-gpu") && !present("asahi,t6031-dcp"));
+    assert(!present("aurora,t6031-gpu") && !present("aurora,t6031-dcp"));
     assert(entries() == 0 && defaults() == 0);
     RESET(J516C);                                         /* an owner's =0 and the other default */
-    assert(kboot_set_chosen("asahi,t6031-gpu", "0") >= 0);
-    assert(!run()); assert(armed("asahi,t6031-dcp"));
+    assert(kboot_set_chosen("aurora,t6031-gpu", "0") >= 0);
+    assert(!run()); assert(armed("aurora,t6031-dcp"));
     chosen_lost = true;
     TREE(J516C); assert(!run());
-    assert(!present("asahi,t6031-gpu") && !present("asahi,t6031-dcp") && entries() == 0);
+    assert(!present("aurora,t6031-gpu") && !present("aurora,t6031-dcp") && entries() == 0);
     /* other boards keep their lines: the rule is only for the five with defaults */
     RESET(J514C);
-    assert(kboot_set_chosen("asahi,t6031-gpu", "1") >= 0);
-    assert(kboot_set_chosen("asahi,t6031-dcp", "1") >= 0);
+    assert(kboot_set_chosen("aurora,t6031-gpu", "1") >= 0);
+    assert(kboot_set_chosen("aurora,t6031-dcp", "1") >= 0);
     chosen_lost = true;
     assert(!run());
-    assert(armed("asahi,t6031-gpu") && armed("asahi,t6031-dcp") && entries() == 2);
+    assert(armed("aurora,t6031-gpu") && armed("aurora,t6031-dcp") && entries() == 2);
     RESET(J516M);
-    assert(kboot_set_chosen("asahi,t6031-gpu", "1") >= 0);
+    assert(kboot_set_chosen("aurora,t6031-gpu", "1") >= 0);
     chosen_lost = true;
     assert(!run());
-    assert(armed("asahi,t6031-gpu") && entries() == 1);
+    assert(armed("aurora,t6031-gpu") && entries() == 1);
     RESET("apple,j293\0apple,t8103\0apple,arm-platform");
-    assert(kboot_set_chosen("asahi,t8122-gpu", "1") >= 0);   /* a line no M1 reads: kept as is */
+    assert(kboot_set_chosen("aurora,t8122-gpu", "1") >= 0);   /* a line no M1 reads: kept as is */
     chosen_lost = true;
     assert(!run());
-    assert(armed("asahi,t8122-gpu") && entries() == 1);
+    assert(armed("aurora,t8122-gpu") && entries() == 1);
     puts("ok");
     return 0;
 }
@@ -612,13 +612,13 @@ def test_the_j516c_defaults_are_the_switches_the_t6031_entries_read():
     gpu = (ROOT / "src/kboot_gpu.c").read_text()
     handoff = (ROOT / "src/kboot_display_handoff.c").read_text()
     assert 'm3_max_boards[] = {"apple,j516c", NULL};' in kboot
-    assert 'm3_max_switches[] = {"asahi,t6031-dcp", "asahi,t6031-gpu", NULL};' in kboot
+    assert 'm3_max_switches[] = {"aurora,t6031-dcp", "aurora,t6031-gpu", NULL};' in kboot
     display = between(handoff, "static const struct dcp_soc dcp_soc_t6031 = {", "};")
-    assert '.optin = "asahi,t6031-dcp",' in display and ".board_gate = true," in display
+    assert '.optin = "aurora,t6031-dcp",' in display and ".board_gate = true," in display
     assert 'dcp_boards_t6031[] = {"apple,j514c", "apple,j516c", NULL};' in handoff
     assert '{"apple,t6031", m3_max_boards, m3_max_switches, false, m3_max_graphics},' in kboot
     soc = between(gpu, "static const struct g15_soc g15_soc_t6031 = {", "};")
-    assert '.optin = "asahi,t6031-gpu",' in soc
+    assert '.optin = "aurora,t6031-gpu",' in soc
     entry = definition(gpu, "dt_set_gpu_t6031")
     order = ["t6031_board(dt)", "g15_optin(dt, g15_soc_t6031.optin)", "dt_t6031_gpu_image(dt)",
              "t6031_gpu_probe(dt)", "dt_set_gpu_g15(dt, &g15_soc_t6031)"]

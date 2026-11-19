@@ -86,14 +86,14 @@ static void prepare(void *dt, int size, const void *opt, int len)
     assert(node >= 0);
     assert(!fdt_setprop_string(dt, node, "bootargs", "unchanged"));
     if (opt)
-        assert(!fdt_setprop(dt, node, "asahi,t8122-gpu-diag", opt, len));
+        assert(!fdt_setprop(dt, node, "aurora,t8122-gpu-diag", opt, len));
     mode = reads = image_reads = 0;
 }
 
 int main(void)
 {
     static unsigned char dt[131072], before[sizeof(dt)];
-    const char *export_path = "/chosen/asahi,t8122-gpu-diagnostics";
+    const char *export_path = "/chosen/aurora,t8122-gpu-diagnostics";
 
     assert(!fdt_create_empty_tree(dt, sizeof(dt)));
     memcpy(before, dt, sizeof(dt));
@@ -134,12 +134,12 @@ int main(void)
         assert(!fdt_getprop(dt, node, "reg", &len));
         assert(!fdt_getprop(dt, node, "compatible", &len));
     }
-    int asc = fdt_path_offset(dt, "/chosen/asahi,t8122-gpu-diagnostics/gfx-asc");
+    int asc = fdt_path_offset(dt, "/chosen/aurora,t8122-gpu-diagnostics/gfx-asc");
     assert(fdt_getprop(dt, asc, "adt,segment-ranges", &len) && len == 64);
-    int nub = fdt_path_offset(dt, "/chosen/asahi,t8122-gpu-diagnostics/gfx-nub");
+    int nub = fdt_path_offset(dt, "/chosen/aurora,t8122-gpu-diagnostics/gfx-nub");
     assert(fdt_getprop(dt, nub, "adt,segment-names", &len) && len == 14);
     assert(!fdt_getprop(dt, nub, "adt,reg", &len));
-    int sgx = fdt_path_offset(dt, "/chosen/asahi,t8122-gpu-diagnostics/sgx");
+    int sgx = fdt_path_offset(dt, "/chosen/aurora,t8122-gpu-diagnostics/sgx");
     assert(fdt_getprop(dt, sgx, "adt,gpu-fast-die0-target", &len) && len == 4);
     assert(!fdt_getprop(dt, sgx, "adt,segment-ranges", &len));
     const void *usable_prop = fdt_getprop(dt, root, "usable-memory", &len);
@@ -178,7 +178,7 @@ int main(void)
     assert(!dt_gpu_t8122_diagnostics(dt));
     root = fdt_path_offset(dt, export_path);
     assert(root >= 0 && fdt_getprop(dt, root, "complete", &len));
-    assert(fdt_path_offset(dt, "/chosen/asahi,t8122-gpu-diagnostics/gfx-nub") < 0);
+    assert(fdt_path_offset(dt, "/chosen/aurora,t8122-gpu-diagnostics/gfx-nub") < 0);
     assert(!fdt_getprop(dt, root, "image-uuid", &len));
 
     /* Exercise every out-of-space boundary, including partial child writes. */

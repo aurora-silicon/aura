@@ -223,7 +223,7 @@ static void *load_kernel(void *p, size_t size)
 #ifdef CHAINLOADING
 static size_t chosen_cnt = 1;
 static char *chosen[MAX_CHOSEN_VARS + 2] = {
-    "chosen.asahi,m1n1-stage1-version=" BUILD_TAG,
+    "chosen.aurora,aura-stage1-version=" BUILD_TAG,
 };
 #else
 static size_t chosen_cnt = 0;
@@ -492,7 +492,7 @@ int payload_run(void)
             if (chosen_cnt >= MAX_CHOSEN_VARS)
                 return -1;
             snprintf(stage1_esp_chosen, sizeof(stage1_esp_chosen),
-                     "chosen.asahi,efi-system-partition=%s", stage1_config_esp_uuid());
+                     "chosen.aurora,efi-system-partition=%s", stage1_config_esp_uuid());
             chosen[chosen_cnt++] = stage1_esp_chosen;
         }
         stage1_config_applied = true;

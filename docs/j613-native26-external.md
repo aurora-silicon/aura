@@ -1,7 +1,7 @@
 # J613 native26 external handoff
 
-`chosen.asahi,j613-25g83-dcpext=1` is a separate, default-off switch for
-J613 firmware 26.6.2. The existing `asahi,t8122-dcpext` switch retains its
+`chosen.aurora,j613-25g83-dcpext=1` is a separate, default-off switch for
+J613 firmware 26.6.2. The existing `aurora,t8122-dcpext` switch retains its
 classic internal-marker requirement and does not admit native26.
 
 The native reservation transaction requires the internal mapping handoff,

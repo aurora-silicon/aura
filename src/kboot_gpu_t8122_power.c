@@ -13,7 +13,7 @@ bool t8122_power_probe_opted_in(const void *dt)
     int chosen = fdt_path_offset(dt, "/chosen");
     int len = 0;
     const char *value =
-        chosen < 0 ? NULL : fdt_getprop(dt, chosen, "asahi,t8122-gpu-power-diag", &len);
+        chosen < 0 ? NULL : fdt_getprop(dt, chosen, "aurora,t8122-gpu-power-diag", &len);
     return value && len == 2 && value[0] == '1' && value[1] == '\0';
 }
 
@@ -45,9 +45,9 @@ struct t8122_powered_identity t8122_power_probe_run(const struct t8122_power_pro
 int t8122_identity_node(void *dt)
 {
     int chosen = fdt_path_offset(dt, "/chosen");
-    if (chosen < 0 || fdt_subnode_offset(dt, chosen, "asahi,t8122-gpu-powered-identity") >= 0)
+    if (chosen < 0 || fdt_subnode_offset(dt, chosen, "aurora,t8122-gpu-powered-identity") >= 0)
         return -1;
-    int node = fdt_add_subnode(dt, chosen, "asahi,t8122-gpu-powered-identity");
+    int node = fdt_add_subnode(dt, chosen, "aurora,t8122-gpu-powered-identity");
     if (node < 0)
         return -1;
     if (fdt_setprop_u32(dt, node, "schema-version", 1) ||
@@ -74,7 +74,7 @@ int t8122_full_identity_prepare(void *dt)
 {
     int chosen = fdt_path_offset(dt, "/chosen");
     int len = 0;
-    const char *armed = chosen < 0 ? NULL : fdt_getprop(dt, chosen, "asahi,t8122-gpu", &len);
+    const char *armed = chosen < 0 ? NULL : fdt_getprop(dt, chosen, "aurora,t8122-gpu", &len);
     if ((fdt_node_check_compatible(dt, 0, "apple,j613") &&
          fdt_node_check_compatible(dt, 0, "apple,j615")) ||
         fdt_node_check_compatible(dt, 0, "apple,t8122") || !armed || len != 2 || armed[0] != '1' ||
@@ -113,7 +113,7 @@ int t8122_full_identity_read(t8122_identity_reader read, void *context,
 
 int t8122_full_identity_publish(void *dt, const struct t8122_powered_identity *identity)
 {
-    int node = fdt_path_offset(dt, "/chosen/asahi,t8122-gpu-powered-identity");
+    int node = fdt_path_offset(dt, "/chosen/aurora,t8122-gpu-powered-identity");
     if (node < 0 || identity->result != T8122_ID_PASS || !t8122_full_identity_valid(identity))
         return -1;
     /* All properties were reserved before power-on. Publish PASS last. */
@@ -130,7 +130,7 @@ int t8122_full_identity_publish(void *dt, const struct t8122_powered_identity *i
 
 void t8122_full_identity_invalidate(void *dt)
 {
-    int node = fdt_path_offset(dt, "/chosen/asahi,t8122-gpu-powered-identity");
+    int node = fdt_path_offset(dt, "/chosen/aurora,t8122-gpu-powered-identity");
     if (node >= 0)
         t8122_identity_set_u32(dt, node, "probe-result", T8122_ID_NOT_RUN);
 }

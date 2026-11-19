@@ -208,7 +208,7 @@ static void ic_ivau_range(void *p, size_t n) { (void)p; (void)n; }
 #undef _base
 
 static char *vars[] = {
-    "chosen.asahi,efi-system-partition=befb6483-aac4-4ea1-8bc3-7e1f675e5429",
+    "chosen.aurora,efi-system-partition=befb6483-aac4-4ea1-8bc3-7e1f675e5429",
     "nvme.adopt=live-rtkit-v1",
 };
 #define NVARS (sizeof(vars) / sizeof(vars[0]))

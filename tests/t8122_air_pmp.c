@@ -44,7 +44,7 @@ static void setup(char *tree, const char *board, bool armed)
     memcpy(root, board, n); memcpy(root + n, "apple,t8122", sizeof("apple,t8122"));
     assert(!fdt_setprop(dt, 0, "compatible", root, n + sizeof("apple,t8122")));
     int chosen = fdt_add_subnode(dt, 0, "chosen"); assert(chosen >= 0);
-    if (armed) assert(!fdt_setprop_string(dt, chosen, "asahi,t8122-dcp", "1"));
+    if (armed) assert(!fdt_setprop_string(dt, chosen, "aurora,t8122-dcp", "1"));
 }
 int main(void)
 {
@@ -52,14 +52,14 @@ int main(void)
     for (unsigned b = 0; b < 2; b++) {
         setup(tree, boards[b], true); board_value = 0x40 + b;
         assert(facts_wanted(dt)); assert(!dt_set_pmp_t8122()); assert(fills == 1);
-        int node = fdt_path_offset(dt, "/chosen/asahi,t8122-pmp"); assert(node >= 0);
+        int node = fdt_path_offset(dt, "/chosen/aurora,t8122-pmp"); assert(node >= 0);
         const fdt32_t *value = fdt_getprop(dt, node, "apple,board-id", NULL);
         assert(value && fdt32_ld(value) == board_value);
         setup(tree, boards[b], false); assert(!facts_wanted(dt));
         assert(!dt_set_pmp_t8122() && !fills);
         setup(tree, boards[b], true); raw_dart += 0x4000;
         assert(!dt_set_pmp_t8122() && !fills);
-        node = fdt_path_offset(dt, "/chosen/asahi,t8122-pmp"); assert(node >= 0);
+        node = fdt_path_offset(dt, "/chosen/aurora,t8122-pmp"); assert(node >= 0);
         assert(!fdt_getprop(dt, node, "apple,board-id", NULL));
     }
     setup(tree, "apple,j504", true); assert(!facts_wanted(dt));
