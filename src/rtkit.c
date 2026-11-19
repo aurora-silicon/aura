@@ -1075,17 +1075,29 @@ static void rtkit_drain(rtkit_dev_t *rtk)
         rtkit_printf("dropping late message 0x%02x: %lx\n", msg.msg1, msg.msg0);
 }
 
+/* How long a coprocessor CPU may take to halt once RUN is cleared. */
+#define RTKIT_STOP_TIMEOUT_US 1000
+
 /*
  * Stop an IOP that did not complete a power transition. Its CPU is left with RUN set and its
  * acknowledgement may still arrive, so a later owner would find a running coprocessor and stale
- * mailbox traffic instead of a fresh boot. Stop the CPU and drop what it sent, so that a reset
- * after this leaves the same state as a completed sleep.
+ * mailbox traffic instead of a fresh boot. Stop the CPU, wait until CPU_STATUS reports it halted
+ * (nothing it sends can follow that), and drop what it sent, so that a reset after this leaves
+ * the same state as a completed sleep. A CPU that never reports halted is reported; the
+ * caller's reset follows either way.
  */
 void rtkit_stop(rtkit_dev_t *rtk)
 {
     rtkit_drain(rtk);
     asc_cpu_stop(rtk->asc);
-    udelay(1000);
+    u64 timeout = timeout_calculate(RTKIT_STOP_TIMEOUT_US);
+    while (!asc_cpu_stopped(rtk->asc)) {
+        if (timeout_expired(timeout)) {
+            printf("rtkit(%s): CPU not halted %u us after RUN was cleared (status 0x%x)\n",
+                   rtk->name, RTKIT_STOP_TIMEOUT_US, asc_cpu_status(rtk->asc));
+            break;
+        }
+    }
     rtkit_drain(rtk);
     rtk->crashed = true;
 }
