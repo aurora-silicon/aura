@@ -619,7 +619,8 @@ CLEAN or FAILED); an SError the host does not answer with EXIT_GUEST or HANDLED 
 Capabilities are unchanged by the SError work: `P_HV_WINDOWS_CAPS` = `0x4157494e0001ffdf`
 ('AWIN', ABI 1, bits 0-4 and 6-15; bit 5 clear), `P_HV_WINDOWS_CAPS2` = `0x415749320000002f`
 ('AWI2'; bit 0 D1 AHCI RAM store, 1 D4 USB, 2 G0 GPU, 3 I0 input, 5 D5 NVMe disk; bit 4
-reserved for GPU wave 2).
+reserved for GPU wave 2). The G5b merge (D5 + I1/I2 + tick CPU + G1/G2) reports
+`0x415749320000007f`: bit 4 G1 GPU power-on, bit 5 D5 NVMe disk, bit 6 G2 (bit 5 on gpu3).
 
 Host tests: the `report_guest` and `report_return` cases of `windows_fatal_host.c` (the return
 fence comes before the ISR read, an exit's note clears the old return record, each verdict),
@@ -877,7 +878,8 @@ stop (Ctrl-C, "Windows guest aborted"), it prints the counters and the access ma
 Status: built and host-tested only (`test_g2_*` and `test_launcher_g2_*` in
 `tests/python/test_windows_t8152_gpu.py`, driver `g2_tests()` in
 `tests/e2e/windows_gpu_probe_host.c`). Nothing of it has run on the M6. For a UEFI probe that
-publishes the GPU firmware's init data, opens its queues and replays one compute job. CAPS2 bit 5.
+publishes the GPU firmware's init data, opens its queues and replays one compute job. CAPS2 bit 6 (bit 5 on gpu3 `22261c1c`; the G5b
+merge moved it because D5 holds bit 5).
 G2 forwards **no register beyond G1's**: every doorbell is a message on the two GFX post-office
 windows G1 already forwards.
 
@@ -924,7 +926,7 @@ windows G1 already forwards.
   walk. Pool pages are read after a guarded probe of the EL2 mapping and a clean+invalidate.
 
 The launcher (`--windows-gpu g2 --windows-gpu-g2-grant fw-mmio,boot-control`) checks CAPS2 bits 4
-and 5, both recipes and a free marker before the upload, then runs ADMIT, G2, POWER, PROBE and
+and 6, both recipes and a free marker before the upload, then runs ADMIT, G2, POWER, PROBE and
 writes the Mu handshake; a refusal at any step runs STOP and detaches USB. At exit it prints the
 G1 counters and access map, the UAT audit and the G2 guards and message counts. Mu needs a G2 FD
 (state bit 7, word 0xec and class-12 ranges accepted); the G1 FD publishes no GPU0 for a G2 page.

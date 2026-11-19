@@ -922,9 +922,9 @@ def test_g1_wired():
     utils = (REPO / "src/utils.c").read_text()
     reset = utils.split("void flush_and_reboot(void)", 1)[1].split("reboot();", 1)[0]
     assert reset.index("hv_usb_emergency_stop();") < reset.index("hv_gpu_emergency_stop();") < \
-        reset.index("nvme_shutdown()")
+        reset.index("hv_ahci_nvme_reset_close()")
     proxy_c = (REPO / "src/proxy.c").read_text()
-    assert "HV_WINDOWS_CAPS2_GPU_PROBE | HV_WINDOWS_CAPS2_GPU_G2;" in proxy_c
+    assert "HV_WINDOWS_CAPS2_GPU_PROBE |\n                            HV_WINDOWS_CAPS2_GPU_G2;" in proxy_c
     makefile = (REPO / "Makefile").read_text()
     objs = makefile.split("ifeq ($(WINDOWS),1)\nHV_OBJECTS", 1)[1].split("endif", 1)[0]
     for o in ("gpu_t8152_power.o", "gpu_t8152_power_recipe.o", "gpu_t8152_probe.o"):
@@ -1203,7 +1203,7 @@ def test_launcher_g2_request():
     caps2 = w.CAPS2_MAGIC | w.CAPS2_GPU | w.CAPS2_GPU_PROBE | w.CAPS2_GPU_G2
     w.validate_gpu_request("g2", w.T8152_CHIP, w.J804_BOARD_ID, caps2, 1, 0, 1)
     for c2, recipe, boot, g2r, why in (
-            (caps2 & ~w.CAPS2_GPU_G2, 1, 0, 1, "bit 5"),
+            (caps2 & ~w.CAPS2_GPU_G2, 1, 0, 1, "bit 6"),
             (caps2 & ~w.CAPS2_GPU_PROBE, 1, 0, 1, "bit 4"),
             (caps2, 1, 0, 0, "without the private G2 recipe"),
             (caps2, 1, 0, None, "without the private G2 recipe"),

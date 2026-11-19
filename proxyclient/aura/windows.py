@@ -1308,7 +1308,7 @@ def describe_usb_attach(result):
 # G1 FD refuses a page with state bit 7, word 0xec or class-12 ranges, so GPU0 would be missing).
 CAPS2_GPU = 0x0004                        # G0 GPU admission v1
 CAPS2_GPU_PROBE = 0x0010                  # G1 power-on, boot marker, mediated forwarding
-CAPS2_GPU_G2 = 0x0020                     # G2 guards, grants, UAT audit
+CAPS2_GPU_G2 = 0x0040                     # G2 guards, grants, UAT audit (bit 5 on gpu3)
 GPU_MODES = ("off", "admit", "log", "probe", "g2")
 GPU_PROBE_MODES = ("probe", "g2")         # the modes that power the GPU and forward
 GPU_OP_ADMIT, GPU_OP_HOOK, GPU_OP_STATUS = 1, 2, 3
@@ -1411,7 +1411,7 @@ def validate_gpu_request(mode, chip, board, caps2, recipe=None, boot=None, g2_re
     """Before anything is uploaded: the chip, the board and the resident's CAPS2 bit 2; for
     "probe" and "g2" also CAPS2 bit 4, the resident's power recipe (STATUS 13) and a free boot
     marker (STATUS 6), so a used boot is refused before the upload, not after hv_init(); for
-    "g2" also CAPS2 bit 5 and the resident's G2 recipe (STATUS 14)."""
+    "g2" also CAPS2 bit 6 and the resident's G2 recipe (STATUS 14)."""
     if mode == "off":
         return
     require(chip == T8152_CHIP, "--windows-gpu is a T8152 (J804) option")
@@ -1425,7 +1425,7 @@ def validate_gpu_request(mode, chip, board, caps2, recipe=None, boot=None, g2_re
             "bit 4): rebuild the carrier at or after the G1 commit")
     if mode == "g2":
         require(caps2 & CAPS2_GPU_G2, "the resident has no G2 GPU guards (P_HV_WINDOWS_CAPS2 "
-                "bit 5): rebuild the carrier at or after the G2 commit")
+                "bit 6): rebuild the carrier at or after the G5b merge (gpu3 had G2 on bit 5)")
         require(g2_recipe == 1, "the resident was built without the private G2 recipe "
                 "(J804_PRIVATE_DATA/gpu/carrier/g18g-j804-gpu-g2.h): --windows-gpu g2 is refused")
     require(recipe == 1, "the resident was built without the private GPU power recipe "

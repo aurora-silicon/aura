@@ -34,7 +34,7 @@
 /*
  * D5: the AHCI disk on an internal NVMe partition (hv_ahci_nvme.c), v1: ops 5-8, the backend
  * closes with a controller shutdown on every hv_start() return and in flush_and_reboot(), and
- * P_REBOOT goes through flush_and_reboot().  Bit 4 belongs to GPU wave 2.
+ * P_REBOOT goes through flush_and_reboot().  Bit 4 is G1 (GPU power-on), bit 6 G2 (hv_gpu.h).
  */
 #define HV_WINDOWS_CAPS2_AHCI_NVME BIT(5)
 

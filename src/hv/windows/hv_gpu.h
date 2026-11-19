@@ -56,8 +56,12 @@
 
 /* P_HV_WINDOWS_CAPS2 bit 4: G1 GPU power-on, boot marker and mediated forwarding. */
 #define HV_WINDOWS_CAPS2_GPU_PROBE BIT(4)
-/* P_HV_WINDOWS_CAPS2 bit 5: G2 guards, grants and the UAT audit (the recipe may be absent). */
-#define HV_WINDOWS_CAPS2_GPU_G2 BIT(5)
+/*
+ * P_HV_WINDOWS_CAPS2 bit 6: G2 guards, grants and the UAT audit (the recipe may be absent).
+ * gpu3 (22261c1c) used bit 5, which D5 (hv_ahci.h) already holds for the NVMe-backed disk; the
+ * G5b merge moved G2 here, so a gpu3-era launcher refuses this carrier and the other way round.
+ */
+#define HV_WINDOWS_CAPS2_GPU_G2 BIT(6)
 
 /*
  * The boot-wide marker: a 16-byte /chosen/memory-map slot of the live ADT (all zero as iBoot

@@ -706,8 +706,9 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
              * PROBE, STOP); the recipe itself may be absent (STATUS HV_GPU_S_POWER_RECIPE).
              * Bit 5: D5 AHCI disk on an NVMe partition (hv_ahci_nvme.c; P_HV_WINDOWS_AHCI ops
              * 5-8, NVMe closed on every exit).
-             * Bit 5: G2 guards, grants and the UAT audit (hv_gpu.c G2); the private G2 recipe
-             * may be absent (STATUS HV_GPU_S_G2_RECIPE).
+             * Bit 6: G2 guards, grants and the UAT audit (hv_gpu.c G2); the private G2 recipe may
+             * be absent (STATUS HV_GPU_S_G2_RECIPE).  An earlier build had G2 on bit 5.
+             * Every bit has one meaning: tests/python/test_windows_t8152_caps2.py.
              */
 #ifdef AURA_WINDOWS
             reply->retval = HV_WINDOWS_CAPS2_MAGIC | HV_WINDOWS_CAPS2_AHCI | HV_WINDOWS_CAPS2_USB |
