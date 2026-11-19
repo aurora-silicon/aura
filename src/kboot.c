@@ -10011,6 +10011,49 @@ __attribute__((unused)) static int dt_transfer_virtios(void)
 }
 
 /*
+ * macOS's Low Power mode CPU ceiling: the ADT has it as pmgr/clpc
+ * cpu-low-power-frequency-max, in MHz. Pass it to the OS on the enabled
+ * performance-controller node ("apple,<soc>-clpc") as
+ * apple,low-power-frequency-max-mhz, in the same unit. Without either,
+ * nothing is done.
+ */
+static int dt_set_clpc_low_power(void)
+{
+    int anode = adt_path_offset(adt, "/arm-io/pmgr/clpc");
+    if (anode < 0)
+        return 0;
+
+    u32 mhz;
+    if (ADT_GETPROP(adt, anode, "cpu-low-power-frequency-max", &mhz) < 0 || !mhz)
+        return 0;
+
+    for (int node = fdt_next_node(dt, -1, NULL); node >= 0; node = fdt_next_node(dt, node, NULL)) {
+        int count = fdt_stringlist_count(dt, node, "compatible");
+        bool clpc = false;
+
+        for (int i = 0; i < count && !clpc; i++) {
+            const char *compat = fdt_stringlist_get(dt, node, "compatible", i, NULL);
+            size_t len = compat ? strlen(compat) : 0;
+
+            clpc = len > 11 && !strncmp(compat, "apple,", 6) && !strcmp(compat + len - 5, "-clpc");
+        }
+        if (!clpc)
+            continue;
+
+        const char *status = fdt_getprop(dt, node, "status", NULL);
+        if (status && strcmp(status, "okay") && strcmp(status, "ok"))
+            continue;
+
+        if (fdt_setprop_u32(dt, node, "apple,low-power-frequency-max-mhz", mhz))
+            bail("FDT: CLPC: cannot set apple,low-power-frequency-max-mhz\n");
+        printf("FDT: CLPC: Low Power mode CPU ceiling %u MHz\n", mhz);
+        return 0;
+    }
+
+    return 0;
+}
+
+/*
  * Remove unneeded apple,always-on from unused memory channels on T8012.
  * This is needed because the amount of memory and the amount of used
  * memory channels depends on the storage configuration of the host Mac
@@ -11619,6 +11662,8 @@ int kboot_prepare_dt(void *fdt)
         return -1;
     dt_set_j713_isp();
     if (dt_set_pmgr())
+        return -1;
+    if (dt_set_clpc_low_power())
         return -1;
     if (chip_id == T8132 && (dt_set_ans_nvme(false) || dt_set_t8132_lifecycle()))
         return -1;
