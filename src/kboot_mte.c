@@ -3,8 +3,9 @@
  * The MTE tag storage, for kboot. On SoCs with MTE2, iBoot keeps dram-size / 32 at the top of the
  * RAM it hands over for the tags, and writes the base to TagOffset_EL2 ([41:20], locked by bit 63).
  * The tags of PA p live at base + (p - dram-base) / 32. The OS must not use that range as RAM:
- * /memory ends at the base and a no-map node describes the storage. If any check fails, MTE stays
- * off.
+ * /memory ends at the base and a no-map node describes the storage. If any check fails, no node is
+ * added and the kernel keeps MTE off: Linux applies its MTE-off override on an apple,arm-platform
+ * with MTE2 when /reserved-memory has no apple,mte-tag-storage node.
  *
  * Kept out of kboot.c: the raw image puts kboot.o's code in the .init slot, which has no room.
  */
@@ -155,22 +156,14 @@ int kboot_mte_reserve(void *dt, u64 os_end, u64 dram_base, u64 dram_size, u64 ra
         return 0;
     }
 
+    /*
+     * Without an apple,mte-tag-storage node the kernel keeps MTE off by itself (the root is
+     * apple,arm-platform and the CPU has MTE2), whatever the boot path does to bootargs.
+     */
     printf("kboot: MTE off: %s\n", why);
     int chosen = fdt_path_offset(dt, "/chosen");
     if (chosen < 0)
         bail("FDT: /chosen not found\n");
-    int len = 0;
-    const char *args = fdt_getprop(dt, chosen, "bootargs", &len);
-    if (!args || len < 1 || !strstr(args, "arm64.nomte")) {
-        static const char nomte[] = " arm64.nomte";
-        char *prop;
-        if (!args || len < 1)
-            len = 1;
-        if (fdt_setprop_placeholder(dt, chosen, "bootargs", len + sizeof(nomte) - 1,
-                                    (void **)&prop))
-            bail("FDT: couldn't add arm64.nomte to bootargs\n");
-        memcpy(prop + len - 1, nomte, sizeof(nomte));
-    }
     char note[96];
     snprintf(note, sizeof(note), "off: %s", why);
     if (fdt_setprop_string(dt, chosen, "aurora,mte", note))
