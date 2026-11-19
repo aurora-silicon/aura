@@ -1090,6 +1090,35 @@ static int pcie_init_controller(int controller, const char *path, bool ans_off)
     return 0;
 }
 
+u32 pcie_adt_perst_to_config_ms(const char *bridge)
+{
+    int node = adt_path_offset(adt, bridge);
+    u32 ms = 0;
+
+    if (node < 0 || ADT_GETPROP(adt, node, "perst-to-config", &ms) < 0)
+        ms = 0;
+    return max(ms, (u32)PCIE_RESET_TO_CONFIG_MS);
+}
+
+int pcie_wait_config_ready(u64 cfg, u32 *id)
+{
+    u64 timeout = timeout_calculate(PCIE_RESET_READY_MS * 1000);
+
+    while (true) {
+        u32 vendor = (*id = read32(cfg)) & 0xffff;
+
+        /* All ones: no completion; 0x0001: Request Retry Status */
+        if (vendor != 0xffff && vendor != 0x0001)
+            return 0;
+        if (timeout_expired(timeout)) {
+            printf("pcie: function at 0x%lx not ready after %u ms (0x%08x)\n", cfg,
+                   PCIE_RESET_READY_MS, *id);
+            return -1;
+        }
+        udelay(100);
+    }
+}
+
 int pcie_init(void)
 {
     bool success = false;
