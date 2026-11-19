@@ -999,6 +999,8 @@ struct j614s_atc_tunable {
     const char *adt_name, *fdt_name, *resource;
     u32 bias, window, limit;
     bool controller_source, controller_target;
+    /* A port without this ADT list still exports the others (the DT property is removed). */
+    bool optional;
 };
 
 static const struct j614s_atc_tunable j614s_atc_tunables[] = {
@@ -1012,6 +1014,9 @@ static const struct j614s_atc_tunable j614s_atc_tunables[] = {
     {"tunable_AUSPLL_CORE", "apple,tunable-auspll", "core", 0x3200, 0, 0, false, false},
     {"tunable_CIO4PLL_CORE", "apple,tunable-cio4pll", "core", 0x3a00, 0, 0, false, false},
     {"tunable_USB2PHY_HOST", "apple,tunable-usb2-host", "bank0", 0, 0, 0, false, false},
+    /* USB2 device mode (Linux phy-apple-t6040-usb2): default list, then the device list. */
+    {"tunable_USB2PHY_DFLT", "apple,tunable-usb2-default", "bank0", 0, 0, 0, false, false, true},
+    {"tunable_USB2PHY_DEV", "apple,tunable-usb2-device", "bank0", 0, 0, 0, false, false, true},
     {"tunable_PIPE_HANDLER_DEFAULT", "apple,tunable-pipehandler", "pipehandler", 0, 0, 0, true,
      false},
     {"tunable_DRD_USB31_GBL_DEFAULT", "apple,tunable-gbl-default", "dwc3-core", 0, 0xc100, 0x600,
@@ -1079,6 +1084,13 @@ static int j614s_export_atc(void *dt, int port)
         int src = item->controller_source ? usb_source : source;
         u64 size;
         u32 len;
+        if (item->optional && target >= 0 &&
+            (!adt_getprop(adt, src, item->adt_name, &len) || !len)) {
+            int ret = fdt_delprop(dt, target, item->fdt_name);
+            if (ret && ret != -FDT_ERR_NOTFOUND)
+                return -1;
+            continue;
+        }
         if (target < 0 || j614s_resource_size(dt, target, item->resource, &size) ||
             item->window > size || (item->limit && item->limit > size - item->window) ||
             item->bias >= (item->limit ? item->limit : size - item->window) ||
