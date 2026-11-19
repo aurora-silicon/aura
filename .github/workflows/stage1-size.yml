@@ -45,6 +45,10 @@ jobs:
         run: |
           export MAKE=gmake NM="$(brew --prefix llvm)/bin/llvm-nm"
           sh tools/stage1_size.sh clang-macos BUILTIN_LOGO=aurora
+      - name: Link the ESP Stage 2
+        run: |
+          gmake clean
+          gmake -j3 RELEASE=1 CHAINLOADING=1 ESP_STAGE2=1 BUILTIN_LOGO=aurora
 
   fedora:
     # As fedora-aurora's aura.spec builds it: Fedora clang and Rust, core built from rust-src.
