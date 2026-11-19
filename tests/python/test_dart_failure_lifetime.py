@@ -90,13 +90,21 @@ void dart_unmap(dart_dev_t *dart, uintptr_t iova, size_t len);
     for signature in ("static u64 *dart_get_l2(",
                       "static int dart_map_page(", "int dart_map_flags(",
                       "static void dart_unmap_page(", "bool dart_unmap_checked(",
-                      "void dart_unmap(", "void dart_free_l2(", "bool dart_shutdown_checked(",
+                      "void dart_unmap(", "void dart_free_l2(",
+                      "static bool dart_release_locked_l2(", "bool dart_shutdown_checked(",
                       "bool dart_has_failed("):
         harness += function(source, signature)
     harness += r'''
 #undef free
 static void *memalign(size_t a, size_t s) { (void)a; (void)s; assert(0); return NULL; }
-static void reset(void) { failure = writes = polls = frees = 0; forbidden = false; memset(pool, 0, sizeof(pool)); }
+static void reset(void)
+{
+    failure = writes = polls = frees = 0;
+    forbidden = false;
+    legacy_l2_count = 0;
+    memset(legacy_l2_pages, 0, sizeof(legacy_l2_pages));
+    memset(pool, 0, sizeof(pool));
+}
 static dart_dev_t *domain(const struct dart_params *params)
 {
     /* Roots in pool[0..3], their L2 tables in pool[4..7], the domain in pool[9]. */
@@ -179,6 +187,51 @@ int main(void)
     assert(!dart_unmap_checked(dart, 0x4001, SZ_16K));
     assert(!dart_unmap_checked(dart, 0x4000, SZ_16K - 1));
     assert(!writes && !polls && !dart_has_failed(dart));
+
+    /* Locked DART: multiple empty heap L2s share one TLBI, get freed and untracked. */
+    reset();
+    dart = domain(PARAMS);
+    dart->locked = true;
+    dart->legacy_mutable = true;
+    pool[0][1] = FIELD_PREP(PARAMS->offset_mask, (u64)pool[8] >> DART_PTE_OFFSET_SHIFT) |
+                 DART_PTE_VALID;
+    legacy_l2_pages[legacy_l2_count++] = (u64)pool[4];
+    legacy_l2_pages[legacy_l2_count++] = (u64)pool[8];
+    for (int i = 1; i < PARAMS->ttbr_count; i++)
+        legacy_l2_pages[legacy_l2_count++] = (u64)pool[4 + i];
+    assert(dart_shutdown_checked(dart));
+    assert(polls == 1);
+    assert(legacy_l2_count == 0);
+    assert(frees == PARAMS->ttbr_count + 2);
+    assert(pool[0][0] == 0 && pool[0][1] == 0);
+
+    /* Locked DART: failed TLBI keeps all heap L2s allocated and tracked, fails closed. */
+    reset();
+    dart = domain(PARAMS);
+    dart->locked = true;
+    dart->legacy_mutable = true;
+    legacy_l2_pages[legacy_l2_count++] = (u64)pool[4];
+    failure = 1;
+    assert(!dart_shutdown_checked(dart));
+    assert(dart_has_failed(dart) && frees == 0 && legacy_l2_count == 1);
+
+    /* Locked DART: mapped heap L2 is kept and reserved on legacy_mutable, fails closed otherwise. */
+    reset();
+    dart = domain(PARAMS);
+    dart->locked = true;
+    dart->legacy_mutable = true;
+    pool[4][0] = DART_PTE_VALID;
+    legacy_l2_pages[legacy_l2_count++] = (u64)pool[4];
+    assert(dart_shutdown_checked(dart));
+    assert(legacy_l2_count == 1 && (pool[0][0] & DART_PTE_VALID));
+
+    reset();
+    dart = domain(PARAMS);
+    dart->locked = true;
+    dart->legacy_mutable = false;
+    pool[4][0] = DART_PTE_VALID;
+    assert(!dart_shutdown_checked(dart));
+    assert(pool[0][0] & DART_PTE_VALID);
     return 0;
 }
 '''
