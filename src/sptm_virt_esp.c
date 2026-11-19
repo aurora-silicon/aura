@@ -11,9 +11,6 @@
  * watchdog then brings the Mac back on its configured Stage 2.
  */
 
-#ifdef ESP_BOOT_HOST
-#include "esp_boot_host.h" /* tests/esp_boot_host: this file on a fake machine */
-#else
 #include "../build/build_cfg.h"
 
 #include "adt.h"
@@ -32,7 +29,6 @@
 #include "xnuboot.h"
 
 #include "tinf/tinf.h"
-#endif
 
 #ifdef SPTM_VIRT_ESP
 
