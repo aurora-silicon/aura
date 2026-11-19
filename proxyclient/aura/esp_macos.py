@@ -26,6 +26,7 @@ import importlib.util
 import os
 import pathlib
 import plistlib
+import secrets
 from dataclasses import dataclass, field
 
 from . import sptm_patch
@@ -185,6 +186,11 @@ def build(sptm, txm, xnu, trustcache, adt, *, exclave=None, love=None, bootargs=
         lines.append(f"love {love}")
     lines.append(f"video {1 if keep_video else 0}")
     args = bootargs if bootargs is not None else r.DEFAULT_BOOTARGS
+    if "AURA_AURACTL_DCC" in flags:
+        # Self-boot has no host to hand aura the DCC transport's cookie, so bake a per-bundle random
+        # one into the boot-args; aura reads it back from there (src/sptm_virt_esp.c) and, in the
+        # guest, only root can (sysctl kern.bootargs).
+        args = f"{args} aura-actl-ck={secrets.randbits(64) or 1:016x}"
     if "\n" in args or len(args) >= 1024:
         raise BundleError("boot-args must be one line under 1024 bytes")
     lines.append(f"bootargs {args}")

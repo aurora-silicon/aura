@@ -43,6 +43,8 @@ Environment (all optional; 1 enables a switch):
   AURA_SAMPLE              sample the guest's PC until each core's XNU entry (pre-XNU hangs)
   AURA_SAMPLE_HZ=<n>       samples per second (default 4)
   AURA_SAMPLE_MAX=<n>      stop printing after n samples (default 64)
+  AURA_XNU_ENTRY           patch the guest kernelcache's acct(2) so a root process reaches aura's
+                           control hvc with no kext (the auractl "xnu" entry; aura/auractl_xnu.py)
   AURA_XNU_RO_RELAX        patch XNU's zalloc_ro_mut RO-zone panic out (tracing only; XNU_QUIRKS)
   AURA_XNU_TC_FORCE        accept a trust cache TXM refused, so the cryptex graft proceeds
   AURA_SHARE_NVRAM         let the guest reach the real NVRAM (a failed boot pollutes it)
@@ -77,6 +79,7 @@ Example:
 import argparse
 import os
 import pathlib
+import secrets
 import struct
 import subprocess
 import sys
@@ -102,6 +105,8 @@ CONFIG_FLAGS = {
     "AURA_GPU_TRACE": 1 << 6,
     "AURA_SAMPLE": 1 << 7,
     "AURA_S2R_MEM": 1 << 8,
+    # bit 9 is reserved for AURA_AURACTL in the feat/auractl runner
+    "AURA_AURACTL_DCC": 1 << 10,  # arm auractl's kext-free DCC transport (off by default)
 }
 KNOWN_ENV = {
     "AURA_KEEP_EXCLAVES",
@@ -131,6 +136,7 @@ KNOWN_ENV = {
     "AURA_GPU_PRINT_MAX",
     "AURA_SAMPLE_HZ",
     "AURA_SAMPLE_MAX",
+    "AURA_XNU_ENTRY",
     "AURA_XNU_RO_RELAX",
     "AURA_SHARE_NVRAM",
     "AURA_XNU_TC_FORCE",
@@ -252,6 +258,37 @@ XNU_QUIRKS = (
                    ("task PAC key reprogramming (3)", "BootKC-rx", 0x3148614, 0x540001e0,
                     0x1400000f),
                    ("task PAC key reprogramming (4)", "BootKC-rx", 0x31488c4, 0x540001e0,
+                    0x1400000f))),
+    # T8142's xnu-13432.41.4 (macOS 27.2.1 26B131, kernelcache.release.mac17g; 27.2's 26B123
+    # ships the same XNU release but its kernelcache is not checked). Every site above, ported
+    # from 26A428: each
+    # one's 48-instruction window (PC-relative immediates, and where needed the adrp-paired
+    # imm12, masked) matches exactly once here. The two twin PAC-key guards match twice in both
+    # kernelcaches and are paired in order. The branch replacements are re-encoded for this
+    # kernelcache, and the rorgn globals come from the matched function's own adrp/str pairs.
+    # The fingerprint is the RO-zone branch: T6041's kernelcache of this release does not match it.
+    dict(release=b"xnu-13432.41.4~", fingerprint=("__TEXT_EXEC", 0x3b53c20, 0x540002a9),
+         hide=("/arm-io/apcie", "/arm-io/dart-apcie0", "/arm-io/apcie0-piodma",
+               "/arm-io/apciec0", "/arm-io/dart-apciec0", "/arm-io/apciec0-piodma",
+               "/arm-io/centauri", "/arm-io/bluetooth", "/arm-io/aop-spmi0/spmi-wifibt"),
+         ro_relax=(("zalloc_ro_mut RO-zone check", "BootKC-rx", 0x3b53c20, 0x540002a9,
+                    0x14000015),),
+         rorgn=(("rorgn register read", "BootKC-rx", 0x339a4d0, 0x370001a8, 0x1400000d),),
+         rorgn_globals=(0xf0c020, 0xf0c028),
+         nvram_mutable=(("Image4 storageInit mix-and-match question", "BootKC-rx",
+                         0x2be6254, 0x34000080, 0x14000022),),
+         tc_force=(("trust-cache load result", "BootKC-rx",
+                    0x380fae4, 0x340000e0, 0x14000007),),
+         nvram_ro=(("AppleARMNORNVRAM::write", "BootKC-rx", 0x1c3d9c, 0xaa0003e8, 0x52800000),
+                   ("AppleARMNORNVRAM::write return", "BootKC-rx", 0x1c3da0, 0x52805840,
+                    0xd65f03c0)),
+         pac_keys=(("task PAC key reprogramming (switch)", "BootKC-rx", 0x317034c, 0x540001e0,
+                    0x1400000f),
+                   ("task PAC key reprogramming (2)", "BootKC-rx", 0x3170414, 0x540001e0,
+                    0x1400000f),
+                   ("task PAC key reprogramming (3)", "BootKC-rx", 0x3170614, 0x540001e0,
+                    0x1400000f),
+                   ("task PAC key reprogramming (4)", "BootKC-rx", 0x31708c4, 0x540001e0,
                     0x1400000f))),
 )
 
@@ -483,6 +520,31 @@ def patch_xnu(p, sym, plan, patches):
         print(f"XNU {what}: [0x{pa:x}] 0x{before:08x} -> 0x{p.read32(pa):08x}")
 
 
+def patch_xnu_entry(p, sym, plan, kernelcache):
+    """AURA_XNU_ENTRY: patch the guest kernelcache's acct(2) so a root process reaches aura's
+    control hvc with no kext (the auractl "xnu" entry, aura/auractl_xnu.py). The site is located in
+    the kernelcache file, build-independently and fail-closed; the words it overwrites are verified
+    against the loaded BootKC before the write, so a mismatched kernelcache stops the boot."""
+    from aura.auractl_xnu import AURACTL_HVC_IMM, XnuEntryError, find_acct_entry
+
+    try:
+        entry = find_acct_entry(kernelcache)
+    except XnuEntryError as e:
+        raise SystemExit(f"AURA_XNU_ENTRY: cannot place the acct() entry: {e}")
+    base = plan.regions["BootKC-rx"][0]
+    site = base + entry["text_off"]
+    for i, want in enumerate(entry["expected"]):
+        have = p.read32(site + 4 * i)
+        if have != want:
+            raise SystemExit(f"AURA_XNU_ENTRY: acct site [0x{site + 4 * i:x}] = 0x{have:08x}, the "
+                             f"finder read 0x{want:08x} from the file: wrong kernelcache loaded")
+    for i, new in enumerate(entry["replacement"]):
+        p.write32(site + 4 * i, new)
+    p.call(sym["sptm_virt_flush"], site & ~0x3f, 0x80 + len(entry["replacement"]) * 4)
+    print(f"XNU auractl entry: acct() 0x{entry['acct_va']:x}, 5 instructions at 0x{site:x} "
+          f"(uap in x{entry['uap_reg']}) -> hvc #0x{AURACTL_HVC_IMM:x}, b 0x{entry['epilogue_va']:x}")
+
+
 def set_xnu_rorgn(p, sym, plan, quirks):
     """Hand XNU the read-only region iBoot would have locked: the BootKC's text and const."""
     lo = plan.regions["BootKC-rx"][0]
@@ -613,12 +675,16 @@ def debug_port(adt, proxy_phy=0, port=None):
     return [_u32(nodes[h]["AAPL,phandle"]) for h in phys], tuple(sorted(out))
 
 
-def configure(p, sym, plan, adt):
+def configure(p, sym, plan, adt, ctl_cookie=0):
     p.write64(sym["sptm_virt_diag_pa"], plan.diag_pa)
     if plan.diag_pa:
         print(f"SPTM diagnostic record at 0x{plan.diag_pa:x}")
     flags = sum(bit for name, bit in CONFIG_FLAGS.items() if env_on(name))
     p.call(sym["sptm_virt_config"], flags)
+    if ctl_cookie:
+        # The DCC transport's per-boot cookie; the same value is in the guest's boot-args, which
+        # only root can read. aura refuses every gated DCC command without it.
+        p.call(sym["sptm_virt_ctl_set_cookie"], ctl_cookie)
     for env, symbol in (("AURA_SAMPLE_HZ", "sptm_virt_sample_hz"),
                         ("AURA_SAMPLE_MAX", "sptm_virt_sample_max")):
         if os.environ.get(env):
@@ -808,6 +874,13 @@ def main():
                                                chip)
     serial = os.environ.get("AURA_XNU_SERIAL")
 
+    # auractl's DCC transport is gated behind a per-boot cookie: a random value that goes both into
+    # the guest's boot-args (only root can read kern.bootargs) and into aura (configure() below).
+    ctl_cookie = 0
+    if env_on("AURA_AURACTL_DCC"):
+        ctl_cookie = secrets.randbits(64) or 1
+        args.bootargs = f"{args.bootargs} aura-actl-ck={ctl_cookie:016x}"
+
     plan = plan_mod.plan_boot(
         images["sptm"], images["txm"], images["xnu"], live_adt,
         dram_base=dram_base, phys_base=phys_base, mem_size=managed_end - phys_base,
@@ -854,7 +927,9 @@ def main():
         patch_xnu(p, sym, plan, quirks["nvram_ro"])
     if env_on("AURA_XNU_TC_FORCE") and quirks.get("tc_force"):
         patch_xnu(p, sym, plan, quirks["tc_force"])
-    configure(p, sym, plan, live_adt)
+    if env_on("AURA_XNU_ENTRY"):
+        patch_xnu_entry(p, sym, plan, images["xnu"])
+    configure(p, sym, plan, live_adt, ctl_cookie)
     if p.call(sym["sptm_virt_load"], entry, handoff) != 0:
         raise SystemExit("sptm_virt_load rejected the entry/handoff (see aura's console)")
     if args.no_enter:

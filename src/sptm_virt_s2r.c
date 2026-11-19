@@ -117,6 +117,9 @@ static struct {
     u64 page;
     const char *what;
     bool seen;
+#ifdef AURACTL
+    bool ctl; /* armed through auractl; page 0 marks a slot auractl released */
+#endif
 } s2r_pages[S2R_TRACE_MAX_PAGES];
 
 static bool s2r_go, s2r_fulltrace, s2r_coproc, s2r_drop_usb;
@@ -184,10 +187,18 @@ static bool s2r_take(volatile u32 *budget)
 
 /* ---- the ring ------------------------------------------------------------------------------- */
 
+#ifdef AURACTL
+volatile bool sptm_virt_s2r_ctl_paused; /* auractl stop: hooks stay, nothing is appended */
+#endif
+
 static struct s2r_rec *s2r_slot(void)
 {
     if (!sptm_virt_s2r_ring)
         return NULL;
+#ifdef AURACTL
+    if (sptm_virt_s2r_ctl_paused)
+        return NULL;
+#endif
     u64 i = __atomic_fetch_add(&sptm_virt_s2r_head, 1, __ATOMIC_RELAXED);
     return &sptm_virt_s2r_ring[i % sptm_virt_s2r_nrec];
 }
@@ -631,8 +642,9 @@ static bool s2r_wakerec_printed;
 
 static bool s2r_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int width)
 {
-    /* Timer-only sleep: the S2R timer's start is the commit; everything else is recorded. */
-    if (s2r_soc->timer_only) {
+    /* With no debug-link USB port (a KIS/DockChannel proxy) the ring is armed for live in-guest
+     * tracing with no s2r_soc and no sleep path, so take the plain record path below. */
+    if (s2r_soc && s2r_soc->timer_only) {
         if (write && width == 2 && addr == s2r_soc->stop_timer && *val == 1 && s2r_armed()) {
             sptm_virt_s2r_note(ctx, addr, *val, true, width);
             if (!s2r_go || (sptm_virt_s2r_go_count && s2r_wake_count >= sptm_virt_s2r_go_count)) {
@@ -851,6 +863,107 @@ static void s2r_hook_blk(const struct s2r_blk *blk, const char *what, u64 off, u
     if (blk->base)
         s2r_hook_range(what, blk->base + off, size ? size : blk->size);
 }
+
+#ifdef AURACTL
+#include "auractl_abi.h"
+/*
+ * auractl (sptm_virt_ctl.c), with the guest running: hook or release one 16 KiB page. Its block
+ * was split at setup, so this rewrites one L3 leaf; the caller invalidates the TLBs and takes the
+ * new tree as the stage-2 reference. Returns 1 if the page changed, 0 if it already was in that
+ * state, or -errno: a page another aura hook owns, or one the trace setup hooked, is refused.
+ */
+AURA_XTEXT int sptm_virt_s2r_ctl_page(const char *what, u64 page, bool arm)
+{
+    int slot = -1, spare = -1;
+
+    for (u32 i = 0; i < sptm_virt_s2r_pages; i++) {
+        if (s2r_pages[i].page == page)
+            slot = i;
+        else if (!s2r_pages[i].page && spare < 0)
+            spare = i;
+    }
+    if (!arm) {
+        if (slot < 0)
+            return 0;
+        if (!s2r_pages[slot].ctl)
+            return -AURACTL_EBUSY;
+        if (hv_map_hw(page, page, 0x4000) < 0)
+            return -AURACTL_EINVAL;
+        s2r_pages[slot].ctl = false;
+        s2r_pages[slot].page = 0;
+        return 1;
+    }
+    if (slot >= 0)
+        return 0; /* the trace setup or an earlier call hooks it already */
+    if (!sptm_virt_s2r_ring)
+        return -AURACTL_ENODEV;
+    /* Any other aura hook (vuart, reset guard, AMCC watch, GPU, coprocessor trace) or the aura
+     * guard leaves the page's first leaf invalid, a sub-page hook included. */
+    if (sptm_virt_rg_owns(page) || !(hv_pt_walk(page) & PTE_VALID))
+        return -AURACTL_EACCES;
+    if (spare < 0) {
+        if (sptm_virt_s2r_pages >= ARRAY_SIZE(s2r_pages))
+            return -AURACTL_ENOSPC;
+        spare = sptm_virt_s2r_pages;
+    }
+    s2r_pages[spare].what = what;
+    s2r_pages[spare].seen = false;
+    s2r_pages[spare].ctl = true;
+    __atomic_store_n(&s2r_pages[spare].page, page, __ATOMIC_RELEASE);
+    if ((u32)spare == sptm_virt_s2r_pages)
+        sptm_virt_s2r_pages++;
+    if (hv_map_hook(page, s2r_hook, 0x4000) < 0) {
+        s2r_pages[spare].page = 0;
+        s2r_pages[spare].ctl = false;
+        return -AURACTL_EINVAL;
+    }
+    return 1;
+}
+
+/* Release every page auractl armed; returns how many. */
+AURA_XTEXT u32 sptm_virt_s2r_ctl_release_all(void)
+{
+    u32 n = 0;
+    for (u32 i = 0; i < sptm_virt_s2r_pages; i++)
+        if (s2r_pages[i].page && s2r_pages[i].ctl)
+            n += sptm_virt_s2r_ctl_page(NULL, s2r_pages[i].page, false) > 0;
+    return n;
+}
+
+/* The ring slot of record seq (the caller checks seq against head and capacity). */
+AURA_XTEXT const void *sptm_virt_s2r_ctl_rec(u64 seq)
+{
+    _Static_assert(sizeof(struct s2r_rec) == sizeof(struct auractl_rec), "record layout");
+    return &sptm_virt_s2r_ring[seq % sptm_virt_s2r_nrec];
+}
+
+/* Pages of [base, base + size) hooked by anyone, and how many of those auractl armed. */
+AURA_XTEXT u32 sptm_virt_s2r_ctl_count(u64 base, u64 size, u32 *ctl_pages)
+{
+    u32 n = 0, c = 0;
+    for (u32 i = 0; i < sptm_virt_s2r_pages; i++) {
+        u64 p = s2r_pages[i].page;
+        if (p && p + 0x4000 > base && p < base + size) {
+            n++;
+            c += s2r_pages[i].ctl;
+        }
+    }
+    if (ctl_pages)
+        *ctl_pages = c;
+    return n;
+}
+
+AURA_XTEXT void sptm_virt_s2r_marker(const char *tag, u64 arg)
+{
+    s2r_marker(tag, arg);
+}
+
+/* The SoC blocks the sleep path found in the ADT, or NULL: auractl's catalogue. */
+AURA_XTEXT const struct s2r_soc *sptm_virt_s2r_ctl_soc(void)
+{
+    return s2r_soc;
+}
+#endif
 
 static void s2r_keep_setup(void)
 {
@@ -1145,6 +1258,23 @@ static void s2r_t6050_coproc(bool mem)
            s2r_n_cp_pages - before, s2r_sep_mbox, s2r_esm_mbox);
 }
 
+/* Allocate and clear the record ring, setting its capacity and head. A big ring falls back to the
+ * small size if the heap is short. Returns false only if even the small ring will not fit. */
+static bool s2r_ring_alloc(u64 ring_bytes)
+{
+    sptm_virt_s2r_ring = memalign(0x4000, ring_bytes);
+    if (!sptm_virt_s2r_ring && ring_bytes != S2R_RING_BYTES) {
+        ring_bytes = S2R_RING_BYTES;
+        sptm_virt_s2r_ring = memalign(0x4000, ring_bytes);
+    }
+    if (!sptm_virt_s2r_ring)
+        return false;
+    memset(sptm_virt_s2r_ring, 0, ring_bytes);
+    sptm_virt_s2r_nrec = ring_bytes / sizeof(struct s2r_rec);
+    sptm_virt_s2r_head = 0;
+    return true;
+}
+
 /* cdc: the proxy runs over the DWC3 CDC link, whose domains are kept on even without the trace. */
 void sptm_virt_s2r_setup(bool cdc)
 {
@@ -1155,8 +1285,19 @@ void sptm_virt_s2r_setup(bool cdc)
                          &missing) < 0) {
         printf("SPTM-virt[s2r]: no sleep path, the ADT gives no %s; debug-link domains not kept\n",
                missing);
+        /* The sleep path -- keeping the debug-link domains alive across the sleep, the capture
+         * hooks and the sleep-commit rules -- needs that USB link, so drop every sleep flag. The
+         * record ring and the live in-guest catalogue (auractl arm/read on named MMIO over hvc) do
+         * not: on a KIS/DockChannel proxy there is no debug-link USB port, yet the guest still
+         * drives auractl. If a trace was asked for, allocate the ring alone so recording works; the
+         * sleep machinery stays gated (SPTM_VIRT_S2R stays clear), so nothing on the wake or sleep
+         * path runs without an s2r_soc. */
         sptm_virt_flags &= ~(SPTM_VIRT_S2R | SPTM_VIRT_S2R_GO | SPTM_VIRT_S2R_FULL |
                              SPTM_VIRT_S2R_COPROC | SPTM_VIRT_S2R_DROP_USB);
+        if ((flags & SPTM_VIRT_S2R) && s2r_ring_alloc(S2R_RING_BYTES))
+            printf("SPTM-virt[s2r]: no debug-link USB port; %lu-record ring at 0x%lx for live "
+                   "in-guest tracing, no sleep path\n",
+                   sptm_virt_s2r_nrec, (u64)sptm_virt_s2r_ring);
         return;
     }
     s2r_soc = &s2r_soc_adt;
@@ -1183,21 +1324,13 @@ void sptm_virt_s2r_setup(bool cdc)
     }
     /* A timer-only sleep has no stop before the commit to read a ring from: keep it all. */
     u64 ring_bytes = s2r_soc->timer_only ? S2R_RING_BYTES_BIG : S2R_RING_BYTES;
-    sptm_virt_s2r_ring = memalign(0x4000, ring_bytes);
-    if (!sptm_virt_s2r_ring && ring_bytes != S2R_RING_BYTES) {
-        ring_bytes = S2R_RING_BYTES;
-        sptm_virt_s2r_ring = memalign(0x4000, ring_bytes);
-    }
-    if (!sptm_virt_s2r_ring) {
+    if (!s2r_ring_alloc(ring_bytes)) {
         printf("SPTM-virt[s2r]: no memory for the ring; sleep path off\n");
         sptm_virt_flags &= ~SPTM_VIRT_S2R;
         if (cdc && !s2r_soc->timer_only)
             s2r_keep_setup();
         return;
     }
-    memset(sptm_virt_s2r_ring, 0, ring_bytes);
-    sptm_virt_s2r_nrec = ring_bytes / sizeof(struct s2r_rec);
-    sptm_virt_s2r_head = 0;
     if (s2r_soc->timer_only) {
         /* No link keeping, USB, per-core or WFI rules: the timer's start is the sleep. */
         s2r_go = flags & SPTM_VIRT_S2R_GO;
