@@ -227,3 +227,21 @@ def test_guards_let_the_b0_b1_launch_through(argv):
     """L-5: these get past every guard to the next check (the guest RAM window)."""
     msg = _run_guards(argv)
     assert msg.startswith("T8152 needs --windows-guest-ram"), msg
+
+
+def test_input_service_does_not_depend_on_the_tick_cpu():
+    """G5B-BUILD 2.3.8: with --windows-tick-cpu 7 the MTP is serviced from hv_tick() on cpu7 or
+    from the WFI path on any idle CPU.  The I1/I2 code never reads the CPU identity (the replay
+    hosts therefore cover any tick owner), and hv_tick() has no GPU work."""
+    win = REPO / "src/hv/windows"
+    for name in ("hv_input.c", "hv_mtp_t8152.c", "mtp_bringup.c", "input_kbd.c", "input_tp.c",
+                 "input_model.c", "mtp_scm.c", "mtp_dart_t8152.c"):
+        text = (win / name).read_text()
+        for banned in ("smp_id()", "boot_cpu_idx", "hv_tick_owner", "is_boot_cpu"):
+            assert banned not in text, (name, banned)
+    hv = (win / "hv.c").read_text()
+    tick = hv.split("void hv_tick(struct exc_info *ctx)\n{", 1)[1].split("\n}\n", 1)[0]
+    assert "hv_input_poll();" in tick
+    assert "hv_gpu_" not in tick
+    exc = (win / "hv_exc.c").read_text()
+    assert "hv_input_idle_poll();" in exc
