@@ -2230,6 +2230,27 @@ void sptm_virt_s2r_setup(bool cdc)
         s2r_hook_range("spmi-a0", 0x2e4908000, 0x4000);
         s2r_hook_range("watchdog", 0x2e42b0000, 0x4000); /* skipped if reset guard owns it */
     }
+    /* J613 B10/B8 opt-ins, without the T6050 path's DART hooks. Bit 18: the memory controller,
+     * as the full trace hooks it (reg[1]'s AMCC planes minus each plane's first page, which is
+     * aura's own AMCC hook; the remaining MCC regs by name). Bit 19: the PCIe controller's own
+     * register windows (not the debug port's apciec0, which is hidden). */
+    if (chip_id == T8122 && (sptm_virt_s2r_crumbs & BIT(18))) {
+        int mp[8];
+        u64 pa, sz;
+        if (adt_path_offset_trace(adt, "/arm-io/mcc", mp) >= 0)
+            for (int r = 1; r < 32 && adt_get_reg(adt, mp, "reg", r, &pa, &sz) >= 0; r++) {
+                if (r == 1) {
+                    for (u64 page = pa; page < pa + sz; page += 0x4000)
+                        if ((page - pa) & 0x3ffff)
+                            s2r_hook_range("amcc", page, 0x4000);
+                } else {
+                    s2r_hook_range(r < 8 ? "mcc-b" : r < 10 ? "mcc-ptd" : "mcc-ch", pa, sz);
+                }
+            }
+    }
+    if (chip_id == T8122 && (sptm_virt_s2r_crumbs & BIT(19)))
+        for (int r = 0; r < 8; r++)
+            s2r_hook_adt("/arm-io/apcie", r, "apcie", 0, 0);
 
     s2r_keep_setup();
 
