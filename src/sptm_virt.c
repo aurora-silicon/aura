@@ -597,10 +597,14 @@ __attribute__((used, retain)) void sptm_virt_enter(void)
      * aura's own USB gadgets (DWC3 + DART, set up at boot as proxy transports) would keep running
      * under the guest with their interrupts and DMA into aura's heap. With the proxy on the
      * DockChannel nothing uses them, and the guest, which has their nodes hidden, does not know
-     * them: shut them down.
+     * them: shut them down. With the proxy on one of them, the guest owns the others' ports
+     * (only the proxy's is hidden) and resets their controllers, which aura's console would still
+     * write to: shut those down.
      */
     if (uartproxy_iodev == IODEV_DOCKCHANNEL_UART)
         usb_iodev_shutdown();
+    else if (uartproxy_iodev >= IODEV_USB0 && uartproxy_iodev < IODEV_MAX)
+        usb_iodev_shutdown_except(uartproxy_iodev);
 
     /* The proxy flow never passes through kboot's nv2_prepare. */
     nv2_prepare();

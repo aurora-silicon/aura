@@ -657,9 +657,17 @@ void usb_iodev_init(void)
 /* False when a controller may still reach its DMA buffers (they are retained, see usb_dwc3.h). */
 bool usb_iodev_shutdown(void)
 {
+    return usb_iodev_shutdown_except(IODEV_MAX);
+}
+
+/* usb_iodev_shutdown(), but the controller behind keep stays up. */
+bool usb_iodev_shutdown_except(iodev_id_t keep)
+{
     bool stopped = true;
 
     for (int i = FIRST_USB_IODEV; i < USB_IODEV_COUNT; i++) {
+        if (IODEV_USB0 + i == keep)
+            continue;
         struct iodev *usb_iodev = iodev_unregister_device(IODEV_USB0 + i);
         if (!usb_iodev)
             continue;
