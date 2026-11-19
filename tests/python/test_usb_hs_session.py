@@ -49,6 +49,8 @@ typedef uint8_t u8; typedef uint16_t u16; typedef uint32_t u32; typedef uint64_t
 #define DWC3_DCFG 0
 #define DWC3_DALEPENA 4
 #define DWC3_DSTS 8
+#define DWC3_DCTL 12
+#define DWC3_DCTL_RUN_STOP (1U << 31)
 #define DWC3_DSTS_CONNECTSPD 7
 #define DWC3_DSTS_HIGHSPEED 0
 #define DWC3_DSTS_FULLSPEED2 1
@@ -90,7 +92,10 @@ static u32 dsts_speed = DWC3_DSTS_HIGHSPEED;
 static u32 read32(unsigned reg) {(void)reg; return dsts_speed;}
 /* Bulk endpoint resizes (DEPCFG modify): count and last packet size. */
 static int resizes; static u32 resized_mps;
-static int usb_dwc3_ep_reconfigure_mps(dwc3_dev_t *d, u8 ep, u32 mps) {(void)d; assert(ep == 4 || ep == 5 || ep == 0); resizes++; resized_mps = mps; return 0;}
+static int resize_fail, link_failures; static bool run_stop = true;
+static int usb_dwc3_ep_reconfigure_mps(dwc3_dev_t *d, u8 ep, u32 mps) {(void)d; assert(ep == 4 || ep == 5 || ep == 0); if (resize_fail) return -1; resizes++; resized_mps = mps; return 0;}
+static void clear32(unsigned reg, unsigned mask) {if (reg == DWC3_DCTL && (mask & DWC3_DCTL_RUN_STOP)) run_stop = false;}
+static void usb_cdc_link_failed(void) {link_failures++;}
 static int usb_dwc3_end_transfer(dwc3_dev_t *d, int ep) {(void)d; assert(address == 0 && enabled == 3); hw_owned[ep] = false; ends++; return 0;}
 static void usb_dwc3_ep_set_stall(dwc3_dev_t *d, int ep, int value) {assert(!value); d->endpoints[ep].stalled = false;}
 static int usb_dwc3_start_setup_phase(dwc3_dev_t *d) {
@@ -200,7 +205,13 @@ int main(void) {
         assert(d.bulk_mps == CDC_BULK_PACKET_SIZE && resized_mps == CDC_BULK_PACKET_SIZE);
     }
 
-    puts("USB HS session: reset, disconnect, closed-pipe and full-speed loops PASS");
+    /* A resize that fails drops the link instead of advertising sizes the endpoints lack. */
+    setup(); idle_with_setup_armed(); dsts_speed = DWC3_DSTS_FULLSPEED1; resize_fail = 1;
+    dev_event(DWC3_DEVT_USBRST); dev_event(DWC3_DEVT_CONNECTDONE);
+    assert(link_failures == 1 && !run_stop && d.bulk_mps == CDC_BULK_PACKET_SIZE);
+    resize_fail = 0; run_stop = true; dsts_speed = DWC3_DSTS_HIGHSPEED;
+
+    puts("USB HS session: reset, disconnect, closed-pipe, full-speed and resize-failure loops PASS");
     return 0;
 }
 '''

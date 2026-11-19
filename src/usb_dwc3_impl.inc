@@ -1664,8 +1664,14 @@ static void usb_dwc3_handle_event_connect_done(dwc3_dev_t *dev)
         /* USB 2.0 9.6.6: full-speed bulk endpoints carry at most 64 bytes per packet. */
         for (int i = 0; i < CDC_ACM_PIPE_MAX; i++) {
             if (usb_dwc3_ep_reconfigure_mps(dev, dev->pipe[i].ep_in, bulk_mps) ||
-                usb_dwc3_ep_reconfigure_mps(dev, dev->pipe[i].ep_out, bulk_mps))
+                usb_dwc3_ep_reconfigure_mps(dev, dev->pipe[i].ep_out, bulk_mps)) {
+                /* The descriptors would advertise a packet size the endpoints do not have:
+                 * drop the link rather than run with mismatched bulk endpoints. */
                 usb_debug_printf("cannot resize bulk endpoints for speed %02x\n", speed);
+                clear32(dev->regs + DWC3_DCTL, DWC3_DCTL_RUN_STOP);
+                usb_cdc_link_failed();
+                return;
+            }
         }
         dev->bulk_mps = bulk_mps;
     }
