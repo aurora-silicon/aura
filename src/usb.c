@@ -131,15 +131,19 @@ static int usb_drd_adt_offset(u32 idx, char drd_path[sizeof(FMT_DRD_PATH)], int 
     return offset;
 }
 
-/* The J616s (T6040) Mac mini's ATC0 is the tether/debug port. Scope the explicit CDC handoff to
- * this board so other T6040 (J614s) and T6041 (M4 Max J614c/J616c) machines keep the generic path.
- */
-static bool usb_cdc_j616s(void)
+/* ATC0 is the tether/debug port. Select the T6040 explicit USB2 handoff by the port's PHY IP
+ * revision in the ADT, not by board: any machine whose atc-phy0 is atc-phy,t6040 gets it (proven
+ * on the J616s, the 16-inch M4 Pro MacBook Pro), and usb_t6040_get_regs() still refuses a port
+ * whose DRD, DART or register layout does not match. */
+static bool usb_atc0_phy_is_t6040(void)
 {
-    return chip_id == T6040 && board_id == 6 && adt && adt_is_compatible(adt, 0, "J616sAP");
+    if (!adt)
+        return false;
+    int node = adt_path_offset(adt, "/arm-io/atc-phy0");
+    return node >= 0 && adt_is_compatible(adt, node, "atc-phy,t6040");
 }
 
-/* T6050 and the J616s T6040 have a different PIPE clock field. Never run the older automatic
+/* The T6050 and T6040 ATC PHYs have a different PIPE clock field. Never run the older automatic
  * gadget initialization on them, including when the explicit setup is refused. */
 bool usb_cdc_deferred_usb2(void)
 {
@@ -153,10 +157,9 @@ bool usb_cdc_deferred_usb2(void)
          * The J714c (M5 Max) enumerates through the generic gadget path on every port, as the
          * omacom m1n1 Stage 1 does there; the explicit port-0 setup never comes up on it.
          */
-        deferred =
-            node >= 0 && ((adt_is_compatible(adt, node, "atc-phy,t6050") &&
-                           !adt_is_compatible(adt, 0, "J714cAP")) ||
-                          (adt_is_compatible(adt, node, "atc-phy,t6040") && usb_cdc_j616s()));
+        deferred = node >= 0 && ((adt_is_compatible(adt, node, "atc-phy,t6050") &&
+                                  !adt_is_compatible(adt, 0, "J714cAP")) ||
+                                 adt_is_compatible(adt, node, "atc-phy,t6040"));
     }
     return deferred;
 }
@@ -311,7 +314,7 @@ static dwc3_dev_t *usb_t6050_init(void (*set_step)(unsigned step))
     return dwc;
 }
 
-/* The J616s (T6040) tether/debug port. ATC0 USB-drd0/dart-usb0/atc-phy0 are the same roles as the
+/* The T6040 ATC0 tether/debug port. ATC0 USB-drd0/dart-usb0/atc-phy0 are the same roles as the
  * M5's, so this mirrors usb_t6050_init: resolve the DWC3 core (usb-drd0 reg 0), the PIPEHANDLER
  * (usb-drd0 reg 3), the USB2 PHY (atc-phy0 reg 0) and the T8110 DART (dart-usb0 reg 1, mapper SID)
  * from the ADT, validate by compatible and size, then park the dummy PIPE and bring up the USB2
@@ -875,7 +878,7 @@ int usb_cdc_link_start(void (*set_step)(unsigned step), bool force_swapped)
         dwc3_dev_t *dwc;
         if (!usb_cdc_deferred_usb2())
             dwc = usb_t8152_init(set_step);
-        else if (chip_id == T6040)
+        else if (usb_atc0_phy_is_t6040())
             dwc = usb_t6040_init(set_step);
         else
             dwc = usb_t6050_init(set_step);
