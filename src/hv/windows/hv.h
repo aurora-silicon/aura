@@ -11,6 +11,7 @@
 #include "hv_ahci.h"
 #include "hv_gpu.h"
 #include "hv_input.h"
+#include "hv_status.h"
 #include "hv_t8152.h"
 #include "hv_usb.h"
 #include "iodev.h"

@@ -299,6 +299,7 @@ static void g2_tests(void)
     uat_put(pt + 0x8000, 0, (pt + 0xc000) | 3);
     uat_put(pt + 0xc000, 0, 0x3500000000UL | 0x403);
     assert(op(HV_GPU_OP_G2, grants, 0) == 0);
+    assert(!hv_gpu_sum(1, 0)); /* C-2: silent until a G1/G2 session forwards */
     assert(op(HV_GPU_OP_POWER, 0, 0) == 0 && op(HV_GPU_OP_PROBE, 0, 0) == 0);
     assert(st(HV_GPU_S_AUDIT + HV_GPU_A_AUDITS) == 1);
     assert(st(HV_GPU_S_AUDIT + HV_GPU_A_BASELINE) == 1);
@@ -431,6 +432,13 @@ static void g2_tests(void)
     fflush(stdout);
     puts("G2 FATAL END");
     assert(hw_count == hw_fatal);
+    /* C-2: the GPU SUM line, from the same recorded values. */
+    fflush(stdout);
+    puts("G2 SUM BEGIN");
+    assert(hv_gpu_sum(120, 7));
+    fflush(stdout);
+    puts("G2 SUM END");
+    assert(hw_count == hw_fatal);
 
     /* The access map shows the new dispositions. */
     u64 count = st(HV_GPU_S_MAP_COUNT);
@@ -453,6 +461,7 @@ static void g2_tests(void)
     assert((m->state & GPU_BM_ENDED) && (m->state & GPU_BM_GUARD) && (m->state & GPU_BM_G2));
     assert(st(HV_GPU_S_AUDIT + HV_GPU_A_FRESH) == 1);
     assert(m->g2 == (HV_GPU_G2_ARMED | grants << 1));
+    assert(!hv_gpu_sum(180, 0)); /* the session ended: silent */
     puts("G2 GUARD OK");
 
     /* ---- G2-6: a G1 probe session keeps its halves and records the audit only -------------- */

@@ -1617,6 +1617,8 @@ static int hv_start_session(void *entry, u64 regs[4])
     else
         printf("HV: host tick: the boot CPU %d\n", boot_cpu_idx);
     printf("HV: Entering guest at %p (x0=0x%lx)\n", entry, regs[0]);
+    /* G5b: the once-a-minute status (GPU SUM) counts guest-run time from here. */
+    hv_status_guest_entered(mrs(CNTPCT_EL0), mrs(CNTFRQ_EL0));
     hv_enter_guest(regs[0], regs[1], regs[2], regs[3], entry);
 
     __atomic_and_fetch(&hv_cpus_in_guest, ~BIT(smp_id()), __ATOMIC_ACQUIRE);
@@ -2341,6 +2343,8 @@ void hv_tick(struct exc_info *ctx)
     /* Same budget rationale as the slice above: bounded work on an exit that
      * was happening anyway. One tile row is 40 tiles of 64x64 on this panel. */
     hv_fb_report();
+    /* G5b: once a minute of guest run, on the tick owner only (this function). */
+    hv_status_tick(mrs(CNTPCT_EL0), mrs(CNTFRQ_EL0));
 #ifdef ENABLE_GUEST_PC_SAMPLER
     hv_sample_guest_pc(ctx);
 #endif

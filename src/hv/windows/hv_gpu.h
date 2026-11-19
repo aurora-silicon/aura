@@ -192,6 +192,19 @@ void hv_gpu_teardown(const char *why);
 /* flush_and_reboot(): lock-free, forwarding off before the reset. */
 void hv_gpu_emergency_stop(void);
 
+/*
+ * The EL2 fatal report's GPU part (guest SError attribution): the G1/G2 session state (power,
+ * probe, G2), the grants, the forwarding and refusal counters, the guards, the UAT audit and the
+ * last doorbell.  Recorded values only, no locks, no MMIO.
+ */
+void hv_gpu_fatal_report(void);
+
+/*
+ * G5b C-2: the "HV: GPU SUM" line (counters at guest second guest_s, plus the console's dropped
+ * bytes) while a G1/G2 session forwards; false and silent otherwise.  Relaxed loads only.
+ */
+bool hv_gpu_sum(u64 guest_s, u64 console_dropped);
+
 #ifdef HV_GPU_HOST_TEST
 void hv_gpu_host_new_session(void);
 bool hv_gpu_host_read_text(u64 phys, void *buf, u64 size);

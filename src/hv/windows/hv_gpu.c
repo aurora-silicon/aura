@@ -473,6 +473,42 @@ void hv_gpu_fatal_report(void)
         printf("HV: fatal: GPU: no doorbell forwarded this session\n");
 }
 
+/*
+ * G5b C-2: "HV: GPU SUM", one fixed-format line (about 230 bytes) of this session's counters for
+ * the tick owner once a minute of guest run (hv_status.c), only while a G1/G2 session forwards.
+ * g5watch stops on denied, faults or capped rising, tbl above 900 of the 1024 the walk may visit,
+ * and db growing while no demo runs.  Relaxed loads only: no lock, no MMIO, no allocation, so it
+ * may run on a CPU that holds bhl while another holds g2_lock.  One printf: one console write.
+ */
+bool hv_gpu_sum(u64 guest_s, u64 console_dropped)
+{
+    if (!probing || torn_down)
+        return false;
+    u64 db = 0, gfx[2] = {0, 0}, mgmt[2] = {0, 0}, guards = 0;
+    for (u32 role = 0; role < GPU_T8152_ROLES; role++)
+        for (u32 tx = 0; tx < 2; tx++)
+            for (u32 k = 0; k < GPU_MK_COUNT; k++) {
+                u64 n = ld(&msg_count[role][tx][k]);
+                if (tx && k == GPU_MK_DOORBELL)
+                    db += n;
+                if (k == GPU_MK_MGMT || k == GPU_MK_CRASHLOG)
+                    mgmt[tx] += n;
+                else
+                    gfx[tx] += n;
+            }
+    for (u32 i = 0; i < HV_GPU_G_COUNT; i++)
+        guards += ld(&guard[i]);
+    printf("HV: GPU SUM t=%lu st=0x%x g2=%d fwd %lu denied %lu runref %lu faults %lu db %lu aud %u "
+           "fresh_max %u capped %d tbl %u/%u guards %lu init 0x%x msgs tx/rx %lu/%lu %lu/%lu drop "
+           "%lu\n",
+           guest_s, state, (int)g2, ld(&forwarded), ld(&denied), ld(&run_refused), ld(&faults), db,
+           __atomic_load_n(&uat_audits, __ATOMIC_RELAXED),
+           __atomic_load_n(&uat_fresh_max, __ATOMIC_RELAXED), (int)uat_last.capped,
+           uat_last.tables, (u32)UAT_VISITED_CAP, guards, init_sent, gfx[1], gfx[0], mgmt[1],
+           mgmt[0], console_dropped);
+    return true;
+}
+
 static int hook(void)
 {
     if (!state_ok("HOOK"))
