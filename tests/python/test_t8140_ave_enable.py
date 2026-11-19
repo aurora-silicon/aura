@@ -34,11 +34,12 @@ HARNESS = r'''
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include "adt.h"
+#include "devicetree.h"
 #include "libfdt.h"
-typedef uint32_t u32;
-typedef uint64_t u64;
 #define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
-static void *dt, *adt;
+static void *dt;
+void *adt;
 static char logbuf[8192];
 static size_t loglen;
 static int log_printf(const char *fmt, ...)
@@ -53,27 +54,60 @@ static int log_printf(const char *fmt, ...)
 }
 #define printf log_printf
 
-/* The ADT has one encoder node, at the address this scenario puts it. */
+/* The ADT's /arm-io has one encoder node, at the address this scenario puts it. */
 static const char *adt_encoder = "/arm-io/ave";
 static u64 adt_encoder_addr = 0x285100000ULL;
 
-static int adt_path_offset_trace(void *tree, const char *path, int *trace)
+int adt_path_offset(const void *tree, const char *path)
 {
     (void)tree;
-    if (strcmp(path, adt_encoder))
-        return -1;
-    trace[0] = 1;
-    return 1;
+    return !strcmp(path, "/arm-io") ? 1 : !strcmp(path, adt_encoder) ? 2 : -1;
 }
 
-static int adt_get_reg(void *tree, int *path, const char *prop, int idx, u64 *addr, u64 *size)
+int adt_path_offset_trace(const void *tree, const char *path, int *trace)
+{
+    if (adt_path_offset(tree, path) != 2)
+        return -1;
+    trace[0] = 1;
+    trace[1] = 2;
+    trace[2] = 0;
+    return 2;
+}
+
+int adt_get_child_count(const void *tree, int offset)
+{
+    (void)tree;
+    return offset == 1;
+}
+
+int adt_first_child_offset(const void *tree, int offset)
+{
+    (void)tree; (void)offset;
+    return 2;
+}
+
+int adt_next_sibling_offset(const void *tree, int offset)
+{
+    (void)tree;
+    return offset + 1;
+}
+
+const char *adt_get_name(const void *tree, int offset)
+{
+    (void)tree;
+    return offset == 2 ? adt_encoder + strlen("/arm-io/") : NULL;
+}
+
+int adt_get_reg(const void *tree, int *path, const char *prop, int idx, u64 *addr, u64 *size)
 {
     (void)tree; (void)prop; (void)size;
-    if (path[0] != 1 || idx)
+    if (path[0] != 1 || path[1] != 2 || idx)
         return -1;
     *addr = adt_encoder_addr;
     return 0;
 }
+
+static char adt_buf[40];
 ''' + "@REGION@" + r'''
 
 static unsigned char blob[65536];
@@ -125,6 +159,8 @@ static void reset(void)
 {
     dt = blob;
     assert(!fdt_create_empty_tree(dt, sizeof(blob)));
+    assert(!fdt_setprop_u32(dt, 0, "#address-cells", 2));
+    assert(!fdt_setprop_u32(dt, 0, "#size-cells", 2));
     next_phandle = 1;
     loglen = 0;
     logbuf[0] = 0;
@@ -189,9 +225,9 @@ int main(void)
 {
     /* 1+2: J700 encoder 0, chain eight providers deep, DARTs share it. */
     j700();
-    assert(!strcmp(dt_t8140_ave_adt_path(node("ave0")), "/arm-io/ave"));
-    assert(dt_t8140_ave_adt_path(node("ave1")) == NULL);
-    assert(!dt_t8140_ave_enable(ave0));
+    assert(!strcmp(dt_ave_adt_path(node("ave0"), adt_buf, sizeof(adt_buf)), "/arm-io/ave"));
+    assert(dt_ave_adt_path(node("ave1"), adt_buf, sizeof(adt_buf)) == NULL);
+    assert(!dt_ave_enable(ave0));
     for (size_t i = 0; i < ARRAY_SIZE(enc0_chain); i++)
         if (!okay(enc0_chain[i])) {
             fprintf(stderr, "FAIL: %s not enabled\nlog:\n%s\n", enc0_chain[i], logbuf);
@@ -206,9 +242,9 @@ int main(void)
     j700();
     adt_encoder = "/arm-io/ave1";
     adt_encoder_addr = 0x289100000ULL;
-    assert(dt_t8140_ave_adt_path(node("ave0")) == NULL);
-    assert(!strcmp(dt_t8140_ave_adt_path(node("ave1")), "/arm-io/ave1"));
-    assert(!dt_t8140_ave_enable(ave1));
+    assert(dt_ave_adt_path(node("ave0"), adt_buf, sizeof(adt_buf)) == NULL);
+    assert(!strcmp(dt_ave_adt_path(node("ave1"), adt_buf, sizeof(adt_buf)), "/arm-io/ave1"));
+    assert(!dt_ave_enable(ave1));
     for (size_t i = 0; i < ARRAY_SIZE(enc1_only); i++)
         assert(okay(enc1_only[i]));
     assert(okay("ps_218") && okay("ps_1e8") && okay("ps_198"));
@@ -229,7 +265,7 @@ int main(void)
     encoder("ave0", 0x285100000ULL, dd, dd, a);
     u32 two[] = {a, 7, b};
     set_cells("ave0", "power-domains", two, 3);
-    assert(!dt_t8140_ave_enable(fdt_get_phandle(dt, node("ave0"))));
+    assert(!dt_ave_enable(fdt_get_phandle(dt, node("ave0"))));
     assert(okay("ave0") && okay("a") && okay("b") && okay("top") && okay("dart"));
     puts("PASS: several providers and power-domain cells");
 
@@ -239,7 +275,7 @@ int main(void)
     pd("c1", c2); pd("c2", c3); pd("c3", c1);
     dd = dart("dart", c1);
     encoder("ave0", 0x285100000ULL, dd, dd, c1);
-    assert(dt_t8140_ave_enable(fdt_get_phandle(dt, node("ave0"))) < 0);
+    assert(dt_ave_enable(fdt_get_phandle(dt, node("ave0"))) < 0);
     assert(!okay("c1") && !okay("c2") && !okay("c3") && !okay("ave0"));
     assert(strstr(logbuf, "cycle"));
     puts("PASS: power-domain cycle refused and logged");
@@ -250,7 +286,7 @@ int main(void)
     pd("c1", c1);
     dd = dart("dart", c1);
     encoder("ave0", 0x285100000ULL, dd, dd, c1);
-    assert(dt_t8140_ave_enable(fdt_get_phandle(dt, node("ave0"))) < 0);
+    assert(dt_ave_enable(fdt_get_phandle(dt, node("ave0"))) < 0);
     assert(!okay("c1") && strstr(logbuf, "cycle"));
     puts("PASS: self-referencing power domain refused and logged");
 
@@ -269,7 +305,7 @@ int main(void)
         }
         dd = dart("dart", prev);
         encoder("ave0", 0x285100000ULL, dd, dd, prev);
-        int ret = dt_t8140_ave_enable(fdt_get_phandle(dt, node("ave0")));
+        int ret = dt_ave_enable(fdt_get_phandle(dt, node("ave0")));
         if (pass) {
             assert(!ret && okay("ave0") && okay("p0") && okay("p29"));
         } else {
@@ -285,7 +321,7 @@ int main(void)
     pd("p", 0xdead);
     dd = dart("dart", p);
     encoder("ave0", 0x285100000ULL, dd, dd, p);
-    assert(dt_t8140_ave_enable(fdt_get_phandle(dt, node("ave0"))) < 0);
+    assert(dt_ave_enable(fdt_get_phandle(dt, node("ave0"))) < 0);
     assert(!okay("p") && !okay("ave0") && strstr(logbuf, "0xdead"));
     puts("PASS: dangling power-domain phandle refused and logged");
     return 0;
@@ -297,17 +333,18 @@ def test_t8140_ave_enable_walk(tmp_path):
     repo = Path(__file__).resolve().parents[2]
     source = (repo / "src/kboot.c").read_text()
     code = HARNESS.replace("@REGION@", region(
-        source, "static const char *dt_t8140_ave_adt_path(",
+        source, "static bool adt_ave_name(",
         "/*\n * The node is found again by its compatible"))
     harness = tmp_path / "t8140-ave-enable.c"
     harness.write_text(code)
     binary = tmp_path / "t8140-ave-enable"
     lib = repo / "src/libfdt"
-    files = ["fdt.c", "fdt_ro.c", "fdt_rw.c", "fdt_wip.c", "fdt_sw.c", "fdt_empty_tree.c"]
+    files = ["fdt.c", "fdt_ro.c", "fdt_rw.c", "fdt_wip.c", "fdt_sw.c", "fdt_empty_tree.c",
+             "fdt_addresses.c"]
     subprocess.run([
         *host_cc(), "-std=gnu11", "-Wall", "-Werror", "-Wno-sign-compare",
-        "-Wno-unused-function", "-I", str(lib), str(harness),
-        *[str(lib / f) for f in files], "-o", str(binary),
+        "-Wno-unused-function", "-I", str(lib), "-I", str(repo / "src"), str(harness),
+        str(repo / "src/devicetree.c"), *[str(lib / f) for f in files], "-o", str(binary),
     ], check=True)
     run = subprocess.run([str(binary)], capture_output=True, text=True)
     assert run.returncode == 0, run.stdout + run.stderr

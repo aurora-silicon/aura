@@ -35,10 +35,11 @@ static bool preloaded = true, have_seg = true;
 static u64 regs[16 * 16];
 #define ADT_DART 1
 #define ADT_AVE 2
+static const char *adt_encoder = "/arm-io/ave0";
 static int adt_path_offset(void *a, const char *p)
 {
     (void)a;
-    return !strcmp(p, "/arm-io/ave0") ? ADT_AVE : -1;
+    return !strcmp(p, adt_encoder) ? ADT_AVE : -1;
 }
 static const void *adt_getprop(void *a, int node, const char *name, u32 *len)
 {
@@ -108,6 +109,18 @@ int main(void)
     reset(); row(0x1f000000000, 0x1f0ffffffff, 0x33);
     assert(!dapf_init_t8020("/arm-io/dart-isp0", 0, ADT_DART) && R0(1) == 0);
 
+    /* Encoder 1's DART admits encoder 1's TEXT; a DART named for no encoder N admits none. */
+    reset(); adt_encoder = "/arm-io/ave1"; row(0x1f000000000, 0x1f0ffffffff, 0x33);
+    assert(!dapf_init_t8020("/arm-io/dart-ave1", 0, ADT_DART));
+    assert(R0(1) == 0x11 && START(1) == 0x10000b28000);
+    reset(); row(0x1f000000000, 0x1f0ffffffff, 0x33);
+    assert(!dapf_init_t8020("/arm-io/dart-ave0", 0, ADT_DART) && R0(1) == 0);
+    reset(); adt_encoder = "/arm-io/ave"; row(0x1f000000000, 0x1f0ffffffff, 0x33);
+    assert(!dapf_init_t8020("/arm-io/dart-ave", 0, ADT_DART) && R0(1) == 0);
+    reset(); adt_encoder = "/arm-io/ave1x"; row(0x1f000000000, 0x1f0ffffffff, 0x33);
+    assert(!dapf_init_t8020("/arm-io/dart-ave1x", 0, ADT_DART) && R0(1) == 0);
+    adt_encoder = "/arm-io/ave0";
+
     /* Sixteen ADT entries leave no room: refuse, do not write past the bank. */
     reset();
     for (int i = 0; i < 16; i++)
@@ -123,6 +136,7 @@ int main(void)
 def test_ave_preloaded_text_dapf(tmp_path):
     src = (Path(__file__).resolve().parents[2] / "src" / "dapf.c").read_text()
     code = (PREFIX + block(src, "struct dapf_segment {") + ";\n" +
+            block(src, "static const char *dapf_ave_of_dart(") + "\n" +
             block(src, "static bool dapf_preload_text(") + "\n" +
             block(src, "static int dapf_init_t8020(") + "\n" + MAIN)
     c = tmp_path / "t.c"
