@@ -4,6 +4,9 @@
 
 #include "types.h"
 
+/* USB2 targets (usb2_target()): the only flag they accept. T8140 uses bits 0-2. */
+#define USB_CDC_USB2_FULL_SPEED BIT(3)
+
 int usb_cdc_schedule(u32 delay_ms, u32 reserved, u32 flags);
 u32 usb_cdc_status(void);
 void usb_cdc_poll(void);

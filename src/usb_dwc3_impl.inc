@@ -49,6 +49,7 @@
 #define DWC3_EP0_MAX_DESC_LEN   62
 #define CDC_BULK_PACKET_SIZE    512
 #define CDC_CONTROL_PACKET_SIZE 64
+#define CDC_FS_BULK_PACKET_SIZE 64
 #endif
 
 #define CDC_DEVICE_CLASS 0x02
@@ -134,6 +135,10 @@ typedef struct dwc3_dev {
     bool dma_unsafe;
     /* usb_dwc3_shutdown() is retiring transfers: only their completions are handled */
     bool shutting_down;
+#if !USB_DWC3_SUPERSPEED
+    /* Bulk max packet size for the connected speed: 512 at high speed, 64 at full speed. */
+    u16 bulk_mps;
+#endif
 #if USB_DWC3_SUPERSPEED
     bool reset_in_progress;
     bool ep0_progressed_during_reset;
@@ -515,6 +520,20 @@ static int usb_dwc3_retire_transfer(dwc3_dev_t *dev, u8 ep)
     return 0;
 }
 
+#if !USB_DWC3_SUPERSPEED
+/* DEPCFG "modify" action: change an initialized, not yet enabled bulk endpoint's packet size. */
+#define DWC3_DEPCFG_ACTION_MODIFY (2 << 30)
+static int usb_dwc3_ep_reconfigure_mps(dwc3_dev_t *dev, u8 ep, u32 max_packet_len)
+{
+    u32 param0 = DWC3_DEPCFG_EP_TYPE(DWC3_DEPCMD_TYPE_BULK) |
+                 DWC3_DEPCFG_MAX_PACKET_SIZE(max_packet_len) | DWC3_DEPCFG_FIFO_NUMBER(ep) |
+                 DWC3_DEPCFG_ACTION_MODIFY;
+    u32 param1 =
+        DWC3_DEPCFG_XFER_COMPLETE_EN | DWC3_DEPCFG_XFER_NOT_READY_EN | DWC3_DEPCFG_EP_NUMBER(ep);
+    return usb_dwc3_ep_command(dev, ep, DWC3_DEPCMD_SETEPCONFIG, param0, param1, 0);
+}
+#endif
+
 static int usb_dwc3_ep_configure(dwc3_dev_t *dev, u8 ep, u8 type, u32 max_packet_len)
 {
     u32 param0, param1;
@@ -813,6 +832,29 @@ static void usb_cdc_get_string_descriptor(u32 index, const void **descriptor, u1
     *descriptor_len = min(*descriptor_len, DWC3_EP0_MAX_DESC_LEN);
 }
 
+#if !USB_DWC3_SUPERSPEED
+/* The configuration descriptor with bulk packet sizes for the connected speed. */
+static const void *usb_dwc3_cdc_config_for(dwc3_dev_t *dev)
+{
+    static u8 fs[sizeof(struct cdc_dev_desc)] ALIGNED(4);
+    static const size_t bulk[] = {
+        offsetof(struct cdc_dev_desc, endpoint_data_in),
+        offsetof(struct cdc_dev_desc, endpoint_data_out),
+        offsetof(struct cdc_dev_desc, sec_endpoint_data_in),
+        offsetof(struct cdc_dev_desc, sec_endpoint_data_out),
+    };
+    u16 mps = dev->bulk_mps;
+
+    if (mps == CDC_BULK_PACKET_SIZE)
+        return &cdc_configuration_descriptor;
+    memcpy(fs, &cdc_configuration_descriptor, sizeof(fs));
+    for (size_t i = 0; i < ARRAY_SIZE(bulk); i++)
+        memcpy(fs + bulk[i] + offsetof(struct usb_endpoint_descriptor, wMaxPacketSize), &mps,
+               sizeof(mps));
+    return fs;
+}
+#endif
+
 static int
 usb_dwc3_handle_ep0_get_descriptor(dwc3_dev_t *dev,
                                    const struct usb_setup_packet_get_descriptor *get_descriptor)
@@ -835,7 +877,7 @@ usb_dwc3_handle_ep0_get_descriptor(dwc3_dev_t *dev,
             descriptor = usb_cdc_ss_configuration;
             descriptor_len = usb_cdc_ss_configuration_len;
 #else
-            descriptor = &cdc_configuration_descriptor;
+            descriptor = usb_dwc3_cdc_config_for(dev);
             descriptor_len = cdc_configuration_descriptor.configuration.wTotalLength;
 #endif
             break;
@@ -1301,7 +1343,11 @@ static void usb_dwc3_cdc_start_bulk_in_xfer(dwc3_dev_t *dev, u8 endpoint_number)
         device2host->read = previous_read;
         return;
     }
+#if USB_DWC3_SUPERSPEED
     dev->endpoints[endpoint_number].zlp_pending = len && (len % CDC_BULK_PACKET_SIZE) == 0;
+#else
+    dev->endpoints[endpoint_number].zlp_pending = len && (len % dev->bulk_mps) == 0;
+#endif
 }
 
 static bool usb_dwc3_cdc_copy_bulk_out_progress(dwc3_dev_t *dev, u8 ep)
@@ -1609,11 +1655,21 @@ static void usb_dwc3_handle_event_connect_done(dwc3_dev_t *dev)
         return;
     }
 #else
-    if (speed != DWC3_DSTS_HIGHSPEED) {
-        usb_debug_printf(
-            "WARNING: we only support high speed right now but %02x was requested in DSTS\n",
-            speed);
+    bool full_speed = speed == DWC3_DSTS_FULLSPEED1 || speed == DWC3_DSTS_FULLSPEED2;
+    if (!full_speed && speed != DWC3_DSTS_HIGHSPEED) {
+        usb_debug_printf("WARNING: unsupported USB2 speed %02x in DSTS\n", speed);
     }
+    u16 bulk_mps = full_speed ? CDC_FS_BULK_PACKET_SIZE : CDC_BULK_PACKET_SIZE;
+    if (bulk_mps != dev->bulk_mps) {
+        /* USB 2.0 9.6.6: full-speed bulk endpoints carry at most 64 bytes per packet. */
+        for (int i = 0; i < CDC_ACM_PIPE_MAX; i++) {
+            if (usb_dwc3_ep_reconfigure_mps(dev, dev->pipe[i].ep_in, bulk_mps) ||
+                usb_dwc3_ep_reconfigure_mps(dev, dev->pipe[i].ep_out, bulk_mps))
+                usb_debug_printf("cannot resize bulk endpoints for speed %02x\n", speed);
+        }
+        dev->bulk_mps = bulk_mps;
+    }
+    usb_debug_printf("CDC USB2: connected at %s speed\n", full_speed ? "full" : "high");
 #endif
 
     if (!dev->endpoints[USB_LEP_CTRL_OUT].xfer_in_progress &&
@@ -1936,7 +1992,9 @@ dwc3_dev_t *usb_dwc3_init(uintptr_t regs, dart_dev_t *dart)
 #if USB_DWC3_SUPERSPEED
     mask32(dev->regs + DWC3_DCFG, DWC3_DCFG_SPEED_MASK, DWC3_DCFG_SUPERSPEED);
 #else
-    mask32(dev->regs + DWC3_DCFG, DWC3_DCFG_SPEED_MASK, DWC3_DCFG_HIGHSPEED);
+    dev->bulk_mps = CDC_BULK_PACKET_SIZE;
+    mask32(dev->regs + DWC3_DCFG, DWC3_DCFG_SPEED_MASK,
+           usb_dwc3_usb2_full_speed ? DWC3_DCFG_FULLSPEED2 : DWC3_DCFG_HIGHSPEED);
 #endif
 
     /* setup scratchpad at SCRATCHPAD_IOVA */

@@ -15,6 +15,12 @@ typedef enum _cdc_acm_pipe_id_t {
 } cdc_acm_pipe_id_t;
 
 dwc3_dev_t *usb_dwc3_init(uintptr_t regs, dart_dev_t *dart);
+/*
+ * USB2 (high-speed engine) only: advertise full speed instead of high speed on the next
+ * usb_dwc3_init(). Hosts or hubs limited to 12 Mb/s get the same CDC device either way; the
+ * bulk endpoints follow the speed the host actually connected at.
+ */
+extern bool usb_dwc3_usb2_full_speed;
 dwc3_dev_t *usb_dwc3_init_mode(uintptr_t regs, dart_dev_t *dart, bool superspeed);
 /* False when the controller may still reach its DMA buffers; they are then retained. */
 bool usb_dwc3_shutdown(dwc3_dev_t *dev);

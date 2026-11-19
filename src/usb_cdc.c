@@ -8,6 +8,7 @@
 #include "usb.h"
 #include "usb_cdc.h"
 #include "usb_cdc_state.h"
+#include "usb_dwc3.h"
 #include "utils.h"
 #include "wdt.h"
 
@@ -66,9 +67,12 @@ static void cdc_set_step(unsigned step)
 int usb_cdc_schedule(u32 delay_ms, u32 reserved, u32 flags)
 {
     if (usb2_target()) {
-        /* Explicit USB2 transition only: no HPM reset, lane swap or watchdog. */
-        if (flags || reserved || cdc.state != USB_CDC_IDLE || delay_ms < 1000 || delay_ms > 15000)
+        /* Explicit USB2 transition only: no HPM reset, lane swap or watchdog. The one
+         * accepted flag advertises full speed (12 Mb/s) instead of high speed. */
+        if ((flags & ~USB_CDC_USB2_FULL_SPEED) || reserved || cdc.state != USB_CDC_IDLE ||
+            delay_ms < 1000 || delay_ms > 15000)
             return -1;
+        usb_dwc3_usb2_full_speed = !!(flags & USB_CDC_USB2_FULL_SPEED);
         cdc.deadline_ms = ticks_to_msecs(get_ticks()) + delay_ms;
         cdc.state = USB_CDC_SCHEDULED;
         return 0;

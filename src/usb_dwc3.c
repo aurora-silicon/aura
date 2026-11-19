@@ -3,6 +3,8 @@
 #include "usb_dwc3.h"
 #include "malloc.h"
 
+bool usb_dwc3_usb2_full_speed;
+
 typedef struct dwc3_hs_dev dwc3_hs_dev_t;
 dwc3_hs_dev_t *usb_dwc3_hs_init(uintptr_t regs, dart_dev_t *dart);
 bool usb_dwc3_hs_shutdown(dwc3_hs_dev_t *dev);
