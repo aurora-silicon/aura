@@ -33,6 +33,22 @@ struct dapf_segment {
 static_assert(sizeof(struct dapf_segment) == 32, "Invalid segment-ranges entry size");
 
 /*
+ * The CPU DART of video encoder N is /arm-io/dart-ave<N>, the encoder /arm-io/ave<N>. Return the
+ * encoder's name ("ave<N>") for such a DART name, or NULL.
+ */
+static const char *dapf_ave_of_dart(const char *name)
+{
+    const char *p;
+
+    if (!name || strncmp(name, "dart-ave", 8) || !name[8])
+        return NULL;
+    for (p = name + 8; *p; p++)
+        if (*p < '0' || *p > '9')
+            return NULL;
+    return name + 5;
+}
+
+/*
  * A coprocessor whose firmware iBoot preloads fetches its __TEXT physically at the
  * address iBoot latched in its reset vector, through its CPU DART's filter. The
  * filter must admit that range. Return the preloaded __TEXT range of the ADT node
@@ -40,11 +56,14 @@ static_assert(sizeof(struct dapf_segment) == 32, "Invalid segment-ranges entry s
  */
 static bool dapf_preload_text(const char *path, u64 *start, u64 *end)
 {
-    if (strcmp(path, "/arm-io/dart-ave0"))
+    char encoder[32];
+    const char *ave =
+        strncmp(path, "/arm-io/", 8) ? NULL : dapf_ave_of_dart(path + strlen("/arm-io/"));
+    if (!ave || snprintf(encoder, sizeof(encoder), "/arm-io/%s", ave) >= (int)sizeof(encoder))
         return false;
 
     u32 len;
-    int node = adt_path_offset(adt, "/arm-io/ave0");
+    int node = adt_path_offset(adt, encoder);
     if (node < 0 || !adt_getprop(adt, node, "pre-loaded", &len))
         return false;
     const struct dapf_segment *seg = adt_getprop(adt, node, "segment-ranges", &len);
@@ -67,7 +86,7 @@ static int dapf_init_t8020(const char *path, u64 base, int node)
     }
 
     int count = length / sizeof(*config);
-    u64 text_start, text_end;
+    u64 text_start = 0, text_end = 0;
     bool text = dapf_preload_text(path, &text_start, &text_end);
 
     for (int i = 0; i < count; i++) {
