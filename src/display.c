@@ -997,9 +997,11 @@ int display_init(void)
 
     if (chip_id == T8140 || chip_id == T8132 ||
         (chip_id == T6040 && board_id == 4 && adt_is_compatible(adt, 0, "J614sAP")) ||
-        /* J575c: iBoot leaves the internal DCP running with no panel and a dummy framebuffer;
-         * the T6041 display handoff gives it to the kernel as iBoot left it. */
-        (chip_id == T6041 && adt_is_compatible(adt, 0, "J575cAP"))) {
+        /* An M4 Pro/Max Mac without a panel (ADT disp0 external: J575c, J773s): iBoot leaves the
+         * internal DCP running with no panel and a dummy framebuffer, and aura's DCP code has no
+         * interface for this display block's firmware; the T6041 display handoff gives the external
+         * processors to the kernel as iBoot left them. */
+        ((chip_id == T6040 || chip_id == T6041) && display_is_external)) {
         printf("display: preserving inherited display (%ldx%ld)\n", cur_boot_args.video.width,
                cur_boot_args.video.height);
         return 0;

@@ -71,14 +71,14 @@ def run(binary, scenario):
     return subprocess.run([str(binary), scenario], capture_output=True, text=True, env=env)
 
 
-SCENARIOS = re.findall(r'^    \{"([a-z0-9-]+)", (?:PUBLISH|NOTHING|REFUSE|REFUSE_NO_OSLOG),',
+SCENARIOS = re.findall(r'^    \{"([a-z0-9-]+)", (?:PUBLISH|NOTHING|REFUSE|REFUSE_NO_OSLOG|HEADLESS),',
                        (ROOT / "tests/t6041_display_host.c").read_text(), re.M)
 
 
 def test_scenario_list_matches(host):
     assert scenarios(host) == SCENARIOS
     assert sorted(REASONS) == sorted(SCENARIOS)
-    for required in ("publish", "wrong-chip", "wrong-board", "no-display-dt", "no-adt-nub",
+    for required in ("publish", "wrong-chip", "other-board", "headless", "no-display-dt", "no-adt-nub",
                      "no-adt-dart-dcp", "wrong-os", "not-running", "outside-segment"):
         assert required in SCENARIOS
 
@@ -90,21 +90,22 @@ REASONS = {
     "publish": PUBLISHED,
     "external": PUBLISHED,
     "external-refuse": PUBLISHED,
+    "headless": "no panel: the internal DCP is not handed over",
     "stale-optin": PUBLISHED,
     "stale-optin-zero": PUBLISHED,
     "repeat": "handoff already published",
     "oslog-in-memreserve": "lies inside /memreserve/",
     "os-26-7-train": PUBLISHED,
-    "wrong-chip": "not a J616s/J614s (chip 0x6041): nothing done",
-    "wrong-board": "not a J616s/J614s (chip 0x6040): nothing done",
+    "wrong-chip": "not a T6040 (chip 0x6041): nothing done",
+    "other-board": PUBLISHED,
     "j614-no-optin": PUBLISHED,
     "j614-optin": PUBLISHED,
     "j616c": PUBLISHED,
     "j616c-external": PUBLISHED,
-    "j616c-on-t6040": "not a J616C/J614C/J575C (chip 0x6040): nothing done",
+    "j616c-on-t6040": "not a T6041 (chip 0x6040): nothing done",
     "j614c": PUBLISHED,
     "j614c-external": PUBLISHED,
-    "j614c-on-t6040": "not a J616C/J614C/J575C (chip 0x6040): nothing done",
+    "j614c-on-t6040": "not a T6041 (chip 0x6040): nothing done",
     "no-display-dt": NOT_DESCRIBED,
     "no-dcp-alias": NOT_DESCRIBED,
     "wrong-dcp-compat": NOT_DESCRIBED,
