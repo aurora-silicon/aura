@@ -24,6 +24,17 @@
 
 #define POLL_US 1000000
 
+/*
+ * eUSB2 PHY bring-up waits with no ready bit known, the times of the traced sequence (tracking
+ * issue: find the PHY's status bits): power-up settle, PHY reset release to the UTMI clock request,
+ * and UTMI clock up to the PHY mode switch. The UTMI clock itself is polled (evt + 0x20 counts its
+ * events), within the 1 ms the sequence allows it.
+ */
+#define EUSB2_POWER_SETTLE_MS 10
+#define EUSB2_RESET_SETTLE_US 1000
+#define EUSB2_UTMI_CLK_US     1000
+#define EUSB2_MODE_SETTLE_MS  5
+
 struct j873_usb {
     u64 aon, bank, gate, dart0, dart1, pipe, phy, evt, dwc;
     const char *hpm;
@@ -137,21 +148,24 @@ static int j873_usb_phy_host(const struct j873_usb *u)
     mask32(u->phy + 0x14, 0x7f000000, 0x23000000);
     mask32(u->phy + 0x18, 0x703, 0x103);
     mask32(u->phy + 8, 0x7003, 0x7003);
-    mdelay(10);
+    mdelay(EUSB2_POWER_SETTLE_MS);
     mask32(u->phy + 4, 8, 0);
-    udelay(1000);
+    udelay(EUSB2_RESET_SETTLE_US);
     mask32(u->phy + 4, 1, 0);
     mask32(u->phy + 4, 2, 0);
     mask32(u->evt, 0, 9);
     mask32(u->phy + 4, 0, 4);
     mask32(u->phy + 0x1c, 0x20000000, 0);
     mask32(u->phy + 0x1c, 0x40000000, 0);
-    udelay(1000);
-    if (!read32(u->evt + 0x20)) {
-        printf("j873: USB: no UTMI clock events, PHY did not start\n");
-        return -1;
+    u64 timeout = timeout_calculate(EUSB2_UTMI_CLK_US);
+    while (!read32(u->evt + 0x20)) {
+        if (timeout_expired(timeout)) {
+            printf("j873: USB: no UTMI clock events, PHY did not start\n");
+            return -1;
+        }
+        udelay(10);
     }
-    mdelay(5);
+    mdelay(EUSB2_MODE_SETTLE_MS);
     mask32(u->phy, 7, 2);
     write32(u->pipe + 0x1c, 1);
     mask32(u->pipe + 0x20, 0, 0x8000);
