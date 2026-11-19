@@ -1308,10 +1308,15 @@ static bool s2r_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int w
         printf("S2R-WAKE c%d %s %s%u 0x%lx%s0x%lx pc 0x%lx\n", smp_id(), what, write ? "W" : "R",
                8u << width, addr, write ? " = " : " (before read) ", write ? *val : 0UL, ctx->elr);
 
+    bool j613_smc = s2r_j613_traffic_enabled() && (addr & ~0x3fffUL) == 0x2ec408000;
+    if (j613_smc && write)
+        s2r_j613_smc_trace(addr, *val, true, min(width, 3));
     if (width == 4) {
         s2r_rw128(addr, val, write);
         sptm_virt_s2r_note(ctx, addr, val[0], write, 3);
         sptm_virt_s2r_note(ctx, addr + 8, val[1], write, 3);
+        if (j613_smc && !write)
+            s2r_j613_smc_trace(addr, val[0], false, 3);
         return true;
     }
     if (width > 4) {
@@ -1319,9 +1324,6 @@ static bool s2r_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int w
                addr, ctx->elr);
         return false;
     }
-    bool j613_smc = s2r_j613_traffic_enabled() && (addr & ~0x3fffUL) == 0x2ec408000;
-    if (j613_smc && write)
-        s2r_j613_smc_trace(addr, *val, true, width);
     if (!shadow_timer)
         sptm_virt_mmio_rw(addr, val, write, width);
     if (timer && !shadow_timer)
