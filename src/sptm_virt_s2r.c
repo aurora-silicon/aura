@@ -1319,14 +1319,17 @@ static bool s2r_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int w
                addr, ctx->elr);
         return false;
     }
+    bool j613_smc = s2r_j613_traffic_enabled() && (addr & ~0x3fffUL) == 0x2ec408000;
+    if (j613_smc && write)
+        s2r_j613_smc_trace(addr, *val, true, width);
     if (!shadow_timer)
         sptm_virt_mmio_rw(addr, val, write, width);
     if (timer && !shadow_timer)
         s2r_crumb(0x30);
     if (!shadow_timer)
         sptm_virt_s2r_note(ctx, addr, *val, write, width);
-    if (s2r_j613_traffic_enabled() && (addr & ~0x3fffUL) == 0x2ec408000)
-        s2r_j613_smc_trace(addr, *val, write, width);
+    if (j613_smc && !write)
+        s2r_j613_smc_trace(addr, *val, false, width);
     /* host: AURA_S2R_PROBE_AT, a guest write after a wake that, once performed, triggers the
      * AURA_S2R_PROBE reads (once per wake): where in macOS's own sequence a block becomes
      * readable. */
