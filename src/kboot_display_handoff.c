@@ -84,7 +84,9 @@
  * reservation and every check below run as on T6031, and the handoff is published only if all of
  * them pass. The DCP maps through dart-dcp SID 23 and the display and its piodma through dart-disp0
  * SIDs 0 and 16, of 32 streams each, so these SIDs are per SoC (struct dcp_soc .sids). Marker
- * apple,t6041-handoff; the nodes stay disabled.
+ * apple,t6041-handoff; the nodes stay disabled. On T6041 running macOS 27.2 (26B123), the 27.2
+ * firmware row pins the DCP image on dcp and dcpext, publishes the /arm-io/disp0 firmware clocks
+ * on dcp, and publishes empty apple,clock-ids on dcpext.
  *
  * T6050 (M5 Pro/Max): the __OS_LOG buffers of every running display coprocessor are reserved on
  * every boot. When the device tree describes the internal display (aliases dcp and disp0, all its
@@ -180,11 +182,13 @@
 #define DCP6_DEF_LEN      16
 #define DCP6_NUBS_MAX     10
 #define DCP6_NUB          "/arm-io/dcp/iop-dcp-nub"
-#define DCP6_PS_MAX       8  /* power states (or parents) followed per ADT gate list */
-#define DCP6_GATE_DEPTH   8  /* PMGR parent levels followed */
-#define DCP6_GATES_MAX    32 /* entries per clock-gates/power-gates list */
-#define DCP6_VALUE_MAX    64 /* longest panel/dcp property value printed */
-#define DCP6_PMP_VALUE    16 /* longest iop-pmp-nub property value printed */
+#define DCP6_PS_MAX       8   /* power states (or parents) followed per ADT gate list */
+#define DCP6_GATE_DEPTH   8   /* PMGR parent levels followed */
+#define DCP6_GATES_MAX    32  /* entries per clock-gates/power-gates list */
+#define DCP6_VALUE_MAX    64  /* longest panel/dcp property value printed */
+#define DCP6_PMP_VALUE    16  /* longest iop-pmp-nub property value printed */
+#define DCP_CLOCK_ID_BASE 256 /* /arm-io clock-frequencies index 0 */
+#define DCP6_CLOCKS_MAX   4
 
 #define SEG_FLAGS_DATA  0
 #define SEG_FLAGS_TEXT  1
@@ -225,6 +229,15 @@ static const struct dcp6_seg_def dcp6_seg_defs_t6030[DCP6_SEGS] = {
 /* Owners of the nubs whose __OS_LOG is reserved: /arm-io/<owner>/iop-<owner>-nub */
 static const char *const dcp6_nubs_t6030[] = {"dcp", "dcpext0", "dcpext1"};
 
+/* One OS firmware release's DCP contract when an SoC supports more than one */
+struct dcp_fw {
+    u32 os_fw;
+    const char *os_fw_name;
+    const char *uuid;  /* pinned DCP firmware image, or NULL with any_uuid */
+    bool any_uuid;     /* no image pinned: the running image's ADT uuid is published */
+    bool disp0_clocks; /* publish /arm-io/disp0 clocks on dcp and uuid + clock-ids on dcpext */
+};
+
 /* One SoC's internal display handoff */
 struct dcp_soc {
     const char *name;          /* log prefix */
@@ -254,6 +267,8 @@ struct dcp_soc {
     const char *uuid; /* DCP firmware image; NULL: none pinned, dry run only (unless any_uuid) */
     u32 os_fw;        /* enum fw_version the kernel's DCP interface is written for */
     const char *os_fw_name;
+    const struct dcp_fw *fws; /* per-OS-firmware rows, or NULL to use os_fw/uuid/any_uuid */
+    int nfws;
     /* Nonzero: the ADT must say the same. Zero: taken from the ADT. */
     u64 coproc, dart_dcp, dart_disp;
     u64 vm_base, vm_size; /* both DARTs' DVA window (vm-base, vm-size, apple,dma-range) */
@@ -433,10 +448,20 @@ static const struct dcp_soc dcp_soc_t6041 = {
  * The same T6041 display block on the M4 Max itself (T6041, J616C and J614C). Their ADTs have the
  * J616s's addresses and streams: dcp at 0x402e00000 through dart-dcp SID 23, disp0 and its piodma
  * through dart-disp0 SIDs 0 and 16, of 32 streams each; the iop-dcp-nub segments come from the ADT
- * as on the J616s. Same 26.6.2 firmware gate and no opt-in.
+ * as on the J616s. Keyed by OS firmware: 26.6.2 leaves UUID selection to the kernel board record,
+ * while 27.2 (26B123) pins the DCP image on dcp and dcpext and publishes /arm-io/disp0's firmware
+ * clocks on dcp. Display nodes stay disabled.
  */
 static const char *const dcp_boards_t6041_max[] = {"apple,j616c", "apple,j614c", "apple,j575c",
                                                    NULL};
+
+static const struct dcp_fw dcp_fws_t6041_max[] = {
+    {.os_fw = V26_6_2, .os_fw_name = "26.6.2", .any_uuid = true},
+    {.os_fw = V27_2,
+     .os_fw_name = "27.2",
+     .uuid = "964EDE5B-8F78-38C2-A727-519CC9F0AF27",
+     .disp0_clocks = true},
+};
 
 static const struct dcp_soc dcp_soc_t6041_max = {
     .name = "T6041",
@@ -449,7 +474,6 @@ static const struct dcp_soc dcp_soc_t6041_max = {
     .marker = "apple,t6041-handoff",
     .adt_psreg = true,
     .board_gate = true,
-    .any_uuid = true,
     .log_streams = true,
     .sids = true,
     .oslog_in_rsv = true,
@@ -457,8 +481,8 @@ static const struct dcp_soc dcp_soc_t6041_max = {
     .sid_disp = 0,
     .sid_piodma = 16,
     .streams = 32,
-    .os_fw = V26_6_2,
-    .os_fw_name = "26.6.2",
+    .fws = dcp_fws_t6041_max,
+    .nfws = ARRAY_SIZE(dcp_fws_t6041_max),
     .coproc = 0x402e00000UL,
     .dart_dcp = 0x402340000UL,
     .dart_disp = 0x402300000UL,
@@ -513,6 +537,9 @@ enum { VM_DCP, VM_DISP }; /* dart-dcp, dart-disp0 */
 /* Per-kboot state, used by the armed part. Reset on every call. */
 static struct {
     const struct dcp_soc *soc;
+    const struct dcp_fw *fw; /* matched OS firmware row, or NULL */
+    struct dcp_fw fw_single;
+    u32 nclk, clk_id[DCP6_CLOCKS_MAX], clk_hz[DCP6_CLOCKS_MAX];
     u64 coproc, dart_dcp, dart_disp; /* as checked against the ADT */
     u64 vm_base[2], vm_size[2];      /* DVA windows of dart-dcp and dart-disp0 */
     bool vm_ok;
@@ -532,6 +559,28 @@ static struct {
     struct dcp6_sid sid[3]; /* dcp SID 5, display SID 0, piodma SID 4 */
     char uuid[40];          /* the DCP image the handoff publishes, once checked */
 } dcp6;
+
+static const struct dcp_fw *dcp6_select_fw(const struct dcp_soc *soc)
+{
+    u32 cur = firmware_os_components();
+    if (cur == V_UNKNOWN)
+        return NULL;
+    if (soc->fws) {
+        for (int i = 0; i < soc->nfws; i++)
+            if (soc->fws[i].os_fw != V_UNKNOWN && soc->fws[i].os_fw == cur)
+                return &soc->fws[i];
+        return NULL;
+    }
+    if (soc->os_fw == V_UNKNOWN || soc->os_fw != cur)
+        return NULL;
+    dcp6.fw_single = (struct dcp_fw){
+        .os_fw = soc->os_fw,
+        .os_fw_name = soc->os_fw_name,
+        .uuid = soc->uuid,
+        .any_uuid = soc->any_uuid,
+    };
+    return &dcp6.fw_single;
+}
 
 /* ---- small helpers ---- */
 
@@ -1601,7 +1650,9 @@ static void dcp6_check_hw(void)
         dlog("DCP not running, leaving dart-dcp unlocked\n");
         return;
     }
-    if (!soc->uuid && !soc->any_uuid) {
+    const struct dcp_fw *fw = dcp6.fw;
+    bool have_image = fw ? (fw->uuid || fw->any_uuid) : (soc->uuid || soc->any_uuid);
+    if (!have_image) {
         dlog("dry run: no %s DCP firmware image is pinned, leaving dart-dcp unlocked\n", soc->name);
         return;
     }
@@ -2208,6 +2259,12 @@ static int dcp6_check_dt(void *dt, struct dcp6_dt *n)
         bail("display and piodma must share one DART, dcp another\n");
 
     int len;
+    if (dcp6.fw && dcp6.fw->disp0_clocks) {
+        const void *clks = fdt_getprop(dt, dcp, "clocks", &len);
+        if ((clks && len != sizeof(fdt32_t)) || fdt_getprop(dt, dcp, "clock-names", NULL) ||
+            fdt_getprop(dt, dcp, "apple,clock-ids", NULL))
+            bail("%s dcp already has firmware clock properties\n", dcp6.fw->os_fw_name);
+    }
     const fdt32_t *mbox = fdt_getprop(dt, dcp, "mboxes", &len);
     int mb = mbox && len == sizeof(fdt32_t) ? fdt_node_offset_by_phandle(dt, fdt32_ld(mbox)) : -1;
     if (mb < 0 || dcp6_status_disabled(dt, mb, "the dcp mailbox"))
@@ -2238,22 +2295,23 @@ static int dcp6_check_adt(void)
 
     if (chip_id != soc->chip)
         bail("chip 0x%x is not %s\n", chip_id, soc->name);
-    if (firmware_os_components() != soc->os_fw)
-        bail("OS firmware %s is not %s\n", os_firmware.string, soc->os_fw_name);
+    if (!dcp6.fw)
+        bail("OS firmware %s is not %s\n", os_firmware.string,
+             soc->os_fw_name ? soc->os_fw_name : "qualified");
 
     int nub = adt_path_offset(adt, DCP6_NUB);
     u32 len = 0, preloaded, running;
     const char *uuid = nub < 0 ? NULL : adt_getprop(adt, nub, "uuid", &len);
-    if (!soc->uuid && !soc->any_uuid)
+    if (!dcp6.fw->uuid && !dcp6.fw->any_uuid)
         bail("no %s DCP firmware image is pinned (the ADT names %.40s)\n", soc->name,
              uuid && len ? uuid : "none");
-    if (soc->any_uuid) {
+    if (dcp6.fw->any_uuid) {
         if (!dcp6_is_uuid(uuid, len))
             bail("the dcp firmware image has no well-formed ADT uuid\n");
         dlog_debug("dcp firmware image %s, not pinned here: the kernel's board record decides\n",
                    uuid);
-    } else if (!uuid || len != strlen(soc->uuid) + 1 || memcmp(uuid, soc->uuid, len)) {
-        bail("dcp firmware is not image %s\n", soc->uuid);
+    } else if (!uuid || len != strlen(dcp6.fw->uuid) + 1 || memcmp(uuid, dcp6.fw->uuid, len)) {
+        bail("dcp firmware is not image %s\n", dcp6.fw->uuid);
     }
     memcpy(dcp6.uuid, uuid, len);
     if (dcp6_adt_u32(nub, "pre-loaded", &preloaded) || preloaded != 1 ||
@@ -2349,6 +2407,81 @@ static int dcp25_publish_clock(void *dt)
                                     sizeof(cells));
 }
 
+/* /arm-io/disp0 clock-ids index /arm-io clock-frequencies from DCP_CLOCK_ID_BASE. */
+static int dcp6_read_disp0_clocks(void)
+{
+    int disp = adt_path_offset(adt, "/arm-io/disp0");
+    int arm = adt_path_offset(adt, "/arm-io");
+    u32 len = 0, flen = 0;
+    const u8 *raw_ids = disp < 0 ? NULL : adt_getprop(adt, disp, "clock-ids", &len);
+    const u8 *freq = arm < 0 ? NULL : adt_getprop(adt, arm, "clock-frequencies", &flen);
+    u32 nclk = raw_ids ? len / sizeof(u32) : 0;
+    if (!nclk || len % sizeof(u32) || nclk > DCP6_CLOCKS_MAX || !freq || flen % sizeof(u32))
+        bail("%s display clock metadata is missing or invalid\n", dcp6.fw->os_fw_name);
+    for (u32 i = 0; i < nclk; i++) {
+        u32 id, hz;
+        memcpy(&id, raw_ids + i * sizeof(u32), sizeof(id));
+        if (id < DCP_CLOCK_ID_BASE || id - DCP_CLOCK_ID_BASE >= flen / sizeof(u32))
+            bail("%s display clock %u is out of range\n", dcp6.fw->os_fw_name, id);
+        for (u32 j = 0; j < i; j++)
+            if (dcp6.clk_id[j] == id)
+                bail("%s display clock %u is duplicated\n", dcp6.fw->os_fw_name, id);
+        memcpy(&hz, freq + (id - DCP_CLOCK_ID_BASE) * sizeof(u32), sizeof(hz));
+        dcp6.clk_id[i] = id;
+        dcp6.clk_hz[i] = hz;
+    }
+    if (!dcp6.clk_hz[0])
+        bail("%s primary display clock frequency is zero\n", dcp6.fw->os_fw_name);
+    dcp6.nclk = nclk;
+    return 0;
+}
+
+static bool dcp6_disp0_profile_ok(void)
+{
+    u32 len = 0;
+    int nub = adt_path_offset(adt, DCP6_NUB);
+    const char *uuid = nub < 0 ? NULL : adt_getprop(adt, nub, "uuid", &len);
+    if (dcp6.fw->uuid &&
+        (!uuid || len != strlen(dcp6.fw->uuid) + 1 || memcmp(uuid, dcp6.fw->uuid, len))) {
+        dlog("%s DCP image mismatch: nothing done\n", dcp6.fw->os_fw_name);
+        return false;
+    }
+    return dcp6_read_disp0_clocks() == 0;
+}
+
+static int dcp6_publish_disp0_clocks(void *dt, const char *dcp_path)
+{
+    fdt32_t clocks[DCP6_CLOCKS_MAX], fw_ids[DCP6_CLOCKS_MAX];
+    char names[DCP6_CLOCKS_MAX * 12];
+    int names_len = 0;
+
+    if (!dcp6.nclk)
+        return -1;
+    for (u32 i = 0; i < dcp6.nclk; i++) {
+        char name[32], path[36];
+        snprintf(name, sizeof(name), "clock-dcp-firmware-%u", dcp6.clk_id[i]);
+        snprintf(path, sizeof(path), "/%s", name);
+        int node = fdt_add_subnode(dt, 0, name);
+        if (node < 0 || fdt_setprop_string(dt, node, "compatible", "fixed-clock") ||
+            fdt_setprop_u32(dt, fdt_path_offset(dt, path), "#clock-cells", 0) ||
+            fdt_setprop_u32(dt, fdt_path_offset(dt, path), "clock-frequency", dcp6.clk_hz[i]))
+            return -1;
+        u32 ph = dcp6_phandle(dt, path);
+        if (!ph)
+            return -1;
+        clocks[i] = cpu_to_fdt32(ph);
+        fw_ids[i] = cpu_to_fdt32(dcp6.clk_id[i]);
+        names_len += snprintf(names + names_len, sizeof(names) - names_len, "firmware-%u", i) + 1;
+    }
+    if (fdt_setprop(dt, fdt_path_offset(dt, dcp_path), "clocks", clocks,
+                    dcp6.nclk * sizeof(*clocks)) ||
+        fdt_setprop(dt, fdt_path_offset(dt, dcp_path), "clock-names", names, names_len) ||
+        fdt_setprop(dt, fdt_path_offset(dt, dcp_path), "apple,clock-ids", fw_ids,
+                    dcp6.nclk * sizeof(*fw_ids)))
+        return -1;
+    return 0;
+}
+
 /* Write the whole handoff into `dt` (a scratch copy). Any failure leaves it half-written. */
 static int dcp6_publish(void *dt, const struct dcp6_dt *n)
 {
@@ -2423,6 +2556,8 @@ static int dcp6_publish(void *dt, const struct dcp6_dt *n)
         return -1;
     dcp = fdt_path_offset(dt, n->dcp);
     if (dcp < 0 || firmware_set_fdt(dt, dcp, "apple,firmware-compat", dcp6_fw_release()))
+        return -1;
+    if (dcp6.fw && dcp6.fw->disp0_clocks && dcp6_publish_disp0_clocks(dt, n->dcp))
         return -1;
     return 0;
 }
@@ -3031,10 +3166,15 @@ static int t6041_ext_fill(void *dt, const struct t6041_ext *ext)
     }
 
     int nub = adt_path_offset(adt, ext->nub_path);
-    u32 seg_len = 0, names_len = 0, preloaded, running;
+    u32 seg_len = 0, names_len = 0, uuid_len = 0, preloaded, running;
     const struct adt_segment_ranges *ranges =
         nub < 0 ? NULL : adt_getprop(adt, nub, "segment-ranges", &seg_len);
     const char *seg_names = nub < 0 ? NULL : adt_getprop(adt, nub, "segment-names", &names_len);
+    const char *ext_uuid = nub < 0 ? NULL : adt_getprop(adt, nub, "uuid", &uuid_len);
+    if (dcp6.fw && dcp6.fw->uuid &&
+        (!ext_uuid || uuid_len != strlen(dcp6.fw->uuid) + 1 ||
+         memcmp(ext_uuid, dcp6.fw->uuid, uuid_len)))
+        return -1;
     if (!ranges || seg_len != DCPEXT6_SEGS * sizeof(*ranges) || !seg_names ||
         !dcp6_seg_name_is(seg_names, names_len, SEG_TEXT, "__TEXT") ||
         !dcp6_seg_name_is(seg_names, names_len, SEG_DATA, "__DATA") ||
@@ -3133,8 +3273,15 @@ static int t6041_ext_fill(void *dt, const struct t6041_ext *ext)
         return -1;
     node = fdt_path_offset(dt, ext->dt_path);
     if (node < 0 || firmware_set_fdt(dt, node, "apple,firmware-version", dcp6_fw_release()) ||
-        firmware_set_fdt(dt, node, "apple,firmware-compat", dcp6_fw_release()))
+        firmware_set_fdt(dt, fdt_path_offset(dt, ext->dt_path), "apple,firmware-compat",
+                         dcp6_fw_release()))
         return -1;
+    if (dcp6.fw && dcp6.fw->disp0_clocks) {
+        if (fdt_setprop_string(dt, fdt_path_offset(dt, ext->dt_path), "apple,firmware-uuid",
+                               dcp6.fw->uuid) ||
+            fdt_setprop_empty(dt, fdt_path_offset(dt, ext->dt_path), "apple,clock-ids"))
+            return -1;
+    }
     return 0;
 }
 
@@ -3775,9 +3922,10 @@ int dt_set_display_handoff(void *dt)
         return 0;
     }
 
+    dcp6.fw = dcp6_select_fw(dcp6.soc);
+
     /* Reject unsupported firmware before reserving __OS_LOG or touching registers. */
-    if (!dcp6.soc->optin &&
-        (dcp6.soc->os_fw == V_UNKNOWN || firmware_os_components() != dcp6.soc->os_fw)) {
+    if (!dcp6.soc->optin && !dcp6.fw) {
         dlog("no qualified OS firmware for %s: nothing done\n", dcp6.soc->dcp_compat);
         return 0;
     }
@@ -3788,6 +3936,9 @@ int dt_set_display_handoff(void *dt)
              dcp6.soc->dcp_compat, dcp6.soc->disp_compat);
         return 0;
     }
+
+    if (dcp6.fw && dcp6.fw->disp0_clocks && !dcp6_disp0_profile_ok())
+        return 0;
 
     bool armed = dcp6_armed(dt);
     if (!dcp6.soc->always && !armed) {
