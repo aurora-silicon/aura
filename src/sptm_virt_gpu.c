@@ -3,11 +3,12 @@
 /*
  * GPU bring-up trace under the virtualized SPTM (SPTM_VIRT_GPU): pass-through stage-2 hooks on
  * the AGX register window (/arm-io/sgx reg 0, which holds the GPU's PMGR, its start control and
- * both ASC coprocessors) and on the PMP's dashboard and mailbox. Every access XNU makes there is
- * performed for real and recorded in a ring in aura's carve-out; writes, the first read of each
- * register and everything in the KSM block are also printed. After a host-set delay from the
- * first GPU access the core that next touches the GPU parks in aura's proxy, so the host can read
- * the ring (sptm_virt_gpu_ring, _head, _nrec, _keep) and the queue configurations (_configs).
+ * both ASC coprocessors) and, unless the host says not to, on the PMP's dashboard and mailbox.
+ * Every access XNU makes there is performed for real and recorded in a ring in aura's carve-out;
+ * writes, the first read of each register and everything in the KSM block are also printed.
+ * After a host-set delay from the first GPU access the core that next touches the GPU parks in
+ * aura's proxy, so the host can read the ring (sptm_virt_gpu_ring, _head, _nrec, _keep) and the
+ * queue configurations (_configs).
  */
 
 #include "sptm_virt.h"
@@ -50,6 +51,7 @@ u32 sptm_virt_gpu_stop_boot_secs; /* park this long after the guest's entry, GPU
 u64 sptm_virt_gpu_stop_msg; /* park after a write of this value (a mailbox message); 0 = never */
 u32 sptm_virt_gpu_print_max = 20000;
 u32 sptm_virt_gpu_ring_mib = 64; /* a steady stream of kicks fills 16 MiB in seconds */
+u32 sptm_virt_gpu_pmp = 1;       /* also hook the PMP's dashboard and mailbox */
 
 static struct {
     u64 base, size;
@@ -320,9 +322,11 @@ void sptm_virt_gpu_setup(void)
     gpu_hook_adt("/arm-io/gfx-asc", 0, "gfx-asc", 0, 0);
     gpu_hook_adt("/arm-io/gfx1-asc", 0, "gfx1-asc", 0, 0);
     /* The PMP dashboard (PTD records, update words) and the PMP's mailbox. */
-    gpu_hook_adt("/arm-io/mcc", 8, "pmp-ptd", 0, 0);
-    gpu_hook_adt("/arm-io/mcc", 9, "pmp-ptd-upd", 0, 0);
-    gpu_hook_adt("/arm-io/pmp", 0, "pmp-asc", 0, 0);
+    if (sptm_virt_gpu_pmp) {
+        gpu_hook_adt("/arm-io/mcc", 8, "pmp-ptd", 0, 0);
+        gpu_hook_adt("/arm-io/mcc", 9, "pmp-ptd-upd", 0, 0);
+        gpu_hook_adt("/arm-io/pmp", 0, "pmp-asc", 0, 0);
+    }
     printf("SPTM-virt[gpu]: ring 0x%lx (%lu records, the first %lu kept, head at 0x%lx), stop "
            "after %u s or a write of 0x%lx, print budget %u\n",
            (u64)sptm_virt_gpu_ring, sptm_virt_gpu_nrec, sptm_virt_gpu_keep,

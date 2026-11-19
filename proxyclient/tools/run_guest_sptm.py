@@ -50,6 +50,7 @@ Environment (all optional; 1 enables a switch):
   AURA_GPU_STOP_MSG=<v>    park right after the guest writes v to the GPU (a mailbox message)
   AURA_GPU_PRINT_MAX=<n>   print at most n GPU accesses on aura's console (default 20000)
   AURA_GPU_RING_MIB=<n>    the GPU trace ring's size (default 64; 16 if the heap has no room)
+  AURA_GPU_PMP=0           trace the GPU alone, without the PMP's dashboard and mailbox
   AURA_SAMPLE              sample the guest's PC until each core's XNU entry (pre-XNU hangs)
   AURA_SAMPLE_HZ=<n>       samples per second (default 4)
   AURA_SAMPLE_MAX=<n>      stop printing after n samples (default 64)
@@ -153,6 +154,7 @@ KNOWN_ENV = {
     "AURA_GPU_STOP_MSG",
     "AURA_GPU_PRINT_MAX",
     "AURA_GPU_RING_MIB",
+    "AURA_GPU_PMP",
     "AURA_SAMPLE_HZ",
     "AURA_SAMPLE_MAX",
     "AURA_XNU_ENTRY",
@@ -737,6 +739,8 @@ def configure(p, sym, plan, adt, ctl_cookie=0):
         p.write32(sym["sptm_virt_gpu_print_max"], env_int("AURA_GPU_PRINT_MAX"))
     if os.environ.get("AURA_GPU_RING_MIB"):
         p.write32(sym["sptm_virt_gpu_ring_mib"], env_int("AURA_GPU_RING_MIB"))
+    if os.environ.get("AURA_GPU_PMP"):
+        p.write32(sym["sptm_virt_gpu_pmp"], env_int("AURA_GPU_PMP"))
     if env_on("AURA_S2R_DCP_PKT"):
         p.write32(sym["sptm_virt_s2r_dcp_pkt"], 1)
         print("coprocessor trace: DCP IOMFB packets copied into the ring")
