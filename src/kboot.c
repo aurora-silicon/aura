@@ -834,10 +834,10 @@ static int dt_reserve_secondary_ro(void)
  * watchdog over and services it from its own loops, so a U-Boot that waits forever (on a disk it
  * cannot reach, say) would never be reset. Tell it to leave the watchdog alone on a trial boot.
  */
-static void dt_set_trial_watchdog(void)
+static int dt_set_trial_watchdog(void)
 {
     if (!aura_trial_enabled())
-        return;
+        return 0;
     /* The compatibles U-Boot's apple_wdt driver binds to */
     static const char *const compat[] = {"apple,t8103-wdt", "apple,wdt"};
     for (size_t i = 0; i < ARRAY_SIZE(compat); i++) {
@@ -845,12 +845,16 @@ static void dt_set_trial_watchdog(void)
         while ((node = fdt_node_offset_by_compatible(dt, node, compat[i])) >= 0) {
             if (fdt_getprop(dt, node, "u-boot,noautostart", NULL))
                 continue;
+            /*
+             * Unmarked, U-Boot would feed the watchdog forever and a trial that hangs in it would
+             * never reset. Refuse the payload: the trial path reboots into the configured Stage 2.
+             */
             if (fdt_setprop(dt, node, "u-boot,noautostart", NULL, 0))
-                printf("FDT: couldn't mark the watchdog for the trial\n");
-            else
-                printf("FDT: trial boot: U-Boot leaves the watchdog to the trial budget\n");
+                bail("FDT: couldn't mark the watchdog for the trial\n");
+            printf("FDT: trial boot: U-Boot leaves the watchdog to the trial budget\n");
         }
     }
+    return 0;
 }
 
 /*
@@ -11531,7 +11535,8 @@ int kboot_prepare_dt(void *fdt)
         return -1;
     if (dt_set_chosen())
         return -1;
-    dt_set_trial_watchdog();
+    if (dt_set_trial_watchdog())
+        return -1;
     if (dt_check_trial_esp())
         return -1;
     secboot_export_fdt(dt);
