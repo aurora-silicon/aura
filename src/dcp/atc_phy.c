@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-/* T8152 ATC common/AUX initialization, derived from the matching 26A428
- * driver and qualified incrementally on J873g. DP lanes and crossbar clocks
- * are separate stages; common initialization alone does not establish a link. */
+/* T8152 ATC common/AUX initialization, qualified incrementally on J873g.
+ * DP lanes and crossbar clocks are separate stages; common initialization
+ * alone does not establish a link. */
 #include "atc_phy.h"
 #include "dptx_phy.h"
 #include "malloc.h"
@@ -70,7 +70,7 @@ struct atc_tunable {
     bool optional;
 };
 
-/* _sRegisters table indices 4, 8, 2, 82, 6, 5, 78 respectively. */
+/* The ADT tunables applied by the common initialization, in order. */
 static const struct atc_tunable tunables[] = {
     {"tunable_ACIOPHY_CMN_DFLT", 0x800, 0x6c, false},
     {"tunable_CIOPLL_CORE_DFLT", 0x1600, 0x280, false},
@@ -414,8 +414,8 @@ static int atc_route_stop(atc_phy_t *phy)
         return -1;
     for (unsigned int i = phy->saved_count; i > 0; i--) {
         struct atc_saved *s = &phy->saved[i - 1];
-        /* This output latch ignores an ordinary clear. The matching driver's
-         * teardown leaves it set; it is not a reversible configuration field. */
+        /* This output latch ignores an ordinary clear and stays set after
+         * teardown; it is not a reversible configuration field. */
         if (s->offset == ATC_XBAR + 0x4c) {
             s->mask = 0;
             continue;
@@ -618,8 +618,8 @@ int atc_phy_activate(atc_phy_t *phy)
     for (unsigned int i = 0; i < 2; i++)
         if (atc_tunable_check(phy, i, true))
             goto fail;
-    /* aciophy_xbar_config(mode=3): both PMAs carry DisplayPort. This is the
-     * PHY's lane mapping, not the DCP-to-ATC display crossbar. */
+    /* PHY lane mapping: both PMAs carry DisplayPort. This is not the
+     * DCP-to-ATC display crossbar. */
     if (atc_update(phy, 0x4c, 0x1f, 0x14) ||
         atc_update(phy, 0x4c, 0x3ffe0, phy->swap ? 0x100 : 0x22000))
         goto fail;
@@ -631,7 +631,7 @@ int atc_phy_activate(atc_phy_t *phy)
     set32(cfg, BIT(4));
     if ((read32(cfg) & 0x1f) != 0x1b)
         goto fail;
-    /* aciophy_aux_init: release small/big sleep, then AUX clamp. */
+    /* AUX init: release small/big sleep, then AUX clamp. */
     phy->aux_started = true;
     if (atc_update(phy, ATC_AON + 0x24, BIT(8), BIT(8)))
         goto fail;
