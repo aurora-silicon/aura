@@ -96,7 +96,9 @@ if ro_end and image_end > ro_start and new_base < ro_end:
 if not args.relocate and live_heap > inherited_top and image_end > inherited_top and new_base < live_heap:
     raise ValueError("Image overlaps live Stage 1 heap")
 
-park_fw = not args.relocate and (image_end < inherited_top or
+# --reclaim-stage1-heap drops Stage 1's heap from the next stage's top; a block parked in that
+# heap would hold the top above it, so that mode keeps the packed layout below inherited_top.
+park_fw = not args.relocate and ((image_end < inherited_top and not args.reclaim_stage1_heap) or
            (ro_end and packed_end > ro_start and image_end < ro_end) or
            (live_heap > inherited_top and packed_end > inherited_top and image_end < live_heap))
 fw_dest = new_base + image_only_size

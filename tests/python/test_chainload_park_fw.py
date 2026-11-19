@@ -17,6 +17,11 @@ Failure model recorded before changing proxyclient/tools/chainload.py:
   it must reject the parked destination.
 - Relocated uploads (--relocate) and in-place uploads where image_end already
   reaches inherited_top without overlapping live_heap keep the packed layout.
+- --reclaim-stage1-heap drops Stage 1's heap from the next stage's
+  top_of_kernel_data (the J714s SPTM_VIRT + MTE carve-out floor). A block parked
+  above live_heap would hold that top above the heap and silently undo the
+  option, so with it an image ending below inherited_top keeps the packed
+  layout, and the next top stays at inherited_top.
 """
 
 from pathlib import Path
@@ -244,3 +249,23 @@ def test_relocated_and_at_top_uploads_keep_packed_layout(tmp_path, monkeypatch):
     assert dest_base == at_top_env.base
     assert copy_size == image_only_size + fw_size
     assert bootargs_addr == at_top_env.base + image_only_size + align(at_top_env.sepfw[1])
+
+
+def test_reclaim_keeps_packed_layout_below_inherited_top(tmp_path, monkeypatch):
+    inherited_top = 0x10009000000
+    live_heap = 0x1000B000000
+    env = FakeTargetEnv(tmp_path, inherited_top=inherited_top, live_heap=live_heap)
+    env.run(monkeypatch, extra_args=("--reclaim-stage1-heap",))
+
+    image_only_size = align(env.payload.stat().st_size + 4)
+    fw_size = align(env.sepfw[1]) + 0x4000
+    assert env.base + image_only_size < inherited_top
+    _stub_addr, bootargs_addr, _image_addr, dest_base, copy_size = env.reloads[0]
+    assert dest_base == env.base
+    assert copy_size == image_only_size + fw_size
+    assert env.adt.mm._properties["SEPFW"][0] == env.base + image_only_size
+    assert bootargs_addr == env.base + image_only_size + align(env.sepfw[1])
+
+    ba_writes = [data for _addr, data in env.writes if len(data) == BootArgs_r3.sizeof()]
+    assert len(ba_writes) == 1
+    assert BootArgs_r3.parse(ba_writes[0]).top_of_kernel_data == inherited_top
