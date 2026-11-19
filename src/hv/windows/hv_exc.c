@@ -7451,6 +7451,8 @@ static bool hv_handle_wfx(struct exc_info *ctx)
      * so waiting on one would stall until the next physical tick.
      */
     hv_windows_mtp_poll();
+    /* I1: the T8152 MTP keyboard, the same way (1 ms floor, one servicer, no SPI driven here). */
+    hv_input_idle_poll();
     if (mrs(ISR_EL1) == 0 && !(mrs(HCR_EL2) & (HCR_VI | HCR_VF))) {
         /*
          * Bound the wait.  A virtual interrupt does not end a WFI executed at

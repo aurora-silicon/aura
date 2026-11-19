@@ -52,6 +52,22 @@ bool hv_t8152_guest_ram(u64 *base, u64 *size);
 int hv_t8152_reserve_store(u64 start, u64 end);
 
 /*
+ * I1: the reserved MTP area [start, end) (input ATTACH with the internal keyboard), directly
+ * above guest RAM like the AHCI store: 2 MiB aligned, inside boot_args RAM, clear of every
+ * carve-out, CTXR range, aura, its heaps, the live ADT, the scanout and the AHCI store, and
+ * denied to stage 2.  Once per session.  0, or -1 with the reason.
+ */
+int hv_t8152_reserve_input_area(u64 start, u64 end);
+
+/*
+ * I1: may the carrier itself read and write [start, end) as RAM (the dart-sbr root table the
+ * MTP's stream uses)?  Inside the RAM the carrier maps [map_lo, map_hi) (memory.c: ram_base ..
+ * ram_base + mem_size_actual), clear of the unmapped carve-out above RAM (region-id-4), guest
+ * RAM, the AHCI store and the input area.  Reads the lists only.
+ */
+bool hv_t8152_carrier_ram(u64 start, u64 end, u64 map_lo, u64 map_hi);
+
+/*
  * D4: the usb-drd<port> (1 or 3) xHCI window [xhci, xhci + 0x8000) as an identity Device-nGnRnE
  * passthrough.  Only the window build_denylist() split off that port's ADT reg 0; the rest of
  * the controller, atc-phy*, dart-usb* and the TLBI aperture stay denied.  0, or -1 with the

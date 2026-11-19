@@ -132,7 +132,9 @@ struct rtkit_dev {
     bool inherited;
 #ifdef AURA_WINDOWS
     bool windows_mode, windows_failed, boot_started, early_ap_power;
-    bool quiet, service_busy, pool_mapped;
+    bool quiet, service_busy, pool_mapped, pool_premapped;
+    rtkit_app_handler_t app_fn;
+    void *app_ctx;
     u64 pool_base, pool_dva;
     size_t pool_size, pool_used;
     struct rtkit_rejection rejection;
@@ -235,13 +237,21 @@ out_free_rtk:
 static bool rtkit_windows_configurable(rtkit_dev_t *rtk)
 {
     return rtk && !rtk->boot_started && !rtk->windows_failed && !rtk->sram && !rtk->sart &&
-           rtk->dart && rtk->dart_iovad && !rtk->pool_used && !rtk->syslog_bfr.bfr &&
-           !rtk->crashlog_bfr.bfr && !rtk->ioreport_bfr.bfr && !rtk->oslog_bfr.bfr;
+           ((rtk->dart && rtk->dart_iovad) || rtk->pool_premapped) && !rtk->pool_used &&
+           !rtk->syslog_bfr.bfr && !rtk->crashlog_bfr.bfr && !rtk->ioreport_bfr.bfr &&
+           !rtk->oslog_bfr.bfr;
+}
+
+/* The quiet service has somewhere to put grants: a physical window, or a premapped pool. */
+static bool rtkit_windows_grants(const rtkit_dev_t *rtk)
+{
+    return rtk->phys_window_size || rtk->pool_premapped;
 }
 
 bool rtkit_set_phys_window(rtkit_dev_t *rtk, u64 base, size_t size)
 {
-    if (!rtkit_windows_configurable(rtk) || !base || !size || base > UINT64_MAX - size ||
+    if (!rtkit_windows_configurable(rtk) || rtk->pool_premapped || !base || !size ||
+        base > UINT64_MAX - size ||
         rtk->phys_window_size ||
         (rtk->pool_size && base < rtk->pool_base + rtk->pool_size && rtk->pool_base < base + size))
         return false;
@@ -278,6 +288,33 @@ bool rtkit_set_buffer_pool(rtkit_dev_t *rtk, u64 base, size_t size)
     return true;
 }
 
+bool rtkit_set_buffer_pool_premapped(rtkit_dev_t *rtk, u64 base, u64 dva, size_t size)
+{
+    if (!rtk || rtk->boot_started || rtk->windows_failed || rtk->sram || rtk->sart || rtk->dart ||
+        rtk->pool_mapped || rtk->phys_window_size || rtk->pool_used || !base || !dva || !size ||
+        size > 16 * 1024 * 1024 || ((base | dva | size) & (SZ_16K - 1)) ||
+        base > UINT64_MAX - size || dva > MSG_BUFFER_REQUEST_IOVA ||
+        size - 1 > MSG_BUFFER_REQUEST_IOVA - dva || ((dva + size - 1) >> 12) > OSLOG_IOVA)
+        return false;
+    rtk->windows_mode = true;
+    rtk->pool_base = base;
+    rtk->pool_dva = dva;
+    rtk->pool_size = size;
+    rtk->pool_mapped = true;
+    rtk->pool_premapped = true;
+    return true;
+}
+
+bool rtkit_set_app_handler(rtkit_dev_t *rtk, rtkit_app_handler_t fn, void *ctx)
+{
+    if (!rtkit_windows_configurable(rtk))
+        return false;
+    rtk->windows_mode = true;
+    rtk->app_fn = fn;
+    rtk->app_ctx = ctx;
+    return true;
+}
+
 bool rtkit_set_early_ap_power(rtkit_dev_t *rtk, bool enable)
 {
     if (!rtkit_windows_configurable(rtk))
@@ -295,7 +332,9 @@ void rtkit_free(rtkit_dev_t *rtk)
         !rtkit_free_buffer(rtk, &rtk->ioreport_bfr) || !rtkit_free_buffer(rtk, &rtk->oslog_bfr))
         return;
 #ifdef AURA_WINDOWS
-    if (rtk->pool_mapped && !rtkit_unmap(rtk, rtk->pool_dva, rtk->pool_size))
+    /* A premapped pool's DVAs belong to the caller: it is never unmapped here. */
+    if (rtk->pool_mapped && !rtk->pool_premapped &&
+        !rtkit_unmap(rtk, rtk->pool_dva, rtk->pool_size))
         return;
 #endif
     free(rtk->name);
@@ -642,6 +681,9 @@ static bool rtkit_windows_message(rtkit_dev_t *rtk, const struct asc_message *wi
         u64 *count = wire->msg1 >= 0x20 ? &rtk->notifications.app : &rtk->notifications.debug;
         if (*count != UINT64_MAX)
             ++*count;
+        /* The owner's handler records the message; it never sends from inside the service. */
+        if (wire->msg1 >= 0x20 && rtk->app_fn)
+            rtk->app_fn(rtk->app_ctx, (u8)wire->msg1, wire->msg0);
         return true;
     }
     struct rtkit_message msg = {.ep = wire->msg1, .msg = wire->msg0};
@@ -702,7 +744,7 @@ static bool rtkit_windows_message(rtkit_dev_t *rtk, const struct asc_message *wi
 int rtkit_service_quiet(rtkit_dev_t *rtk, int max_msgs)
 {
     if (!rtk || !rtk->windows_mode || !rtk->boot_started || !rtk->pool_mapped ||
-        !rtk->phys_window_size || rtk->windows_failed || rtk->crashed || max_msgs < 1 ||
+        !rtkit_windows_grants(rtk) || rtk->windows_failed || rtk->crashed || max_msgs < 1 ||
         max_msgs > 64 || __atomic_test_and_set(&rtk->service_busy, __ATOMIC_ACQUIRE))
         return -1;
     int count = 0;
@@ -727,6 +769,15 @@ int rtkit_service_quiet(rtkit_dev_t *rtk, int max_msgs)
     return count;
 }
 
+bool rtkit_send_quiet(rtkit_dev_t *rtk, u8 ep, u64 msg)
+{
+    if (!rtk || !rtk->windows_mode || !rtk->boot_started || rtk->windows_failed || rtk->crashed ||
+        !asc_can_send(rtk->asc))
+        return false;
+    struct asc_message m = {.msg0 = msg, .msg1 = ep};
+    return asc_send(rtk->asc, &m);
+}
+
 static bool rtkit_windows_send(rtkit_dev_t *rtk, const struct asc_message *msg, u64 deadline)
 {
     do {
@@ -748,7 +799,7 @@ static bool rtkit_windows_recv(rtkit_dev_t *rtk, struct asc_message *msg, u64 de
 static bool rtkit_windows_boot(rtkit_dev_t *rtk, u32 usec)
 {
     if (!usec || rtk->boot_started || rtk->windows_failed || !rtk->early_ap_power ||
-        !rtk->pool_mapped || !rtk->phys_window_size)
+        !rtk->pool_mapped || !rtkit_windows_grants(rtk))
         return false;
     rtk->boot_started = true;
     rtk->no_hello = false;

@@ -174,11 +174,15 @@ static u8 rel_buttons(const struct input_model *m)
 
 static u16 consumer_usage(const struct input_model *m)
 {
-    /* One usage at a time (an array of one): the host's, else the internal source's. */
+    /* One usage at a time (an array of one): the newest non-zero source's. */
+    u16 usage = 0;
+    u32 stamp = 0;
     for (u32 s = 0; s < INPUT_SRC_COUNT; s++)
-        if (m->src[s].consumer)
-            return m->src[s].consumer;
-    return 0;
+        if (m->src[s].consumer && (!usage || m->src[s].consumer_stamp - stamp < 0x80000000u)) {
+            usage = m->src[s].consumer;
+            stamp = m->src[s].consumer_stamp;
+        }
+    return usage;
 }
 
 static void emit_keyboard(struct input_model *m, bool force)
@@ -271,7 +275,43 @@ void input_model_set_keyboard(struct input_model *m, u32 src, u8 mods,
         return;
     m->src[src].mods = mods;
     copy(m->src[src].keys, keys, INPUT_KBD_BITMAP);
+    if (src != INPUT_SRC_HOST)
+        m->stats[INPUT_ST_MTP]++;
     emit_keyboard(m, false);
+}
+
+void input_model_set_consumer(struct input_model *m, u32 src, u16 usage)
+{
+    if (src >= INPUT_SRC_COUNT || usage > INPUT_CONSUMER_MAX)
+        return;
+    struct input_source_state *s = &m->src[src];
+    if (usage && usage != s->consumer)
+        s->consumer_stamp = ++m->consumer_clock;
+    s->consumer = usage;
+    if (src != INPUT_SRC_HOST)
+        m->stats[INPUT_ST_MTP]++;
+    emit_consumer(m, false);
+}
+
+static s16 clamp16(s16 v)
+{
+    return v < -INPUT_REL_MAX ? -INPUT_REL_MAX : v;
+}
+
+static s8 clamp8(s8 v)
+{
+    return v < -INPUT_WHEEL_MAX ? -INPUT_WHEEL_MAX : v;
+}
+
+void input_model_set_relative(struct input_model *m, u32 src, u8 buttons, s16 dx, s16 dy,
+                              s8 wheel, s8 pan)
+{
+    if (src >= INPUT_SRC_COUNT)
+        return;
+    m->src[src].rel_buttons = buttons & INPUT_BUTTONS_MASK;
+    if (src != INPUT_SRC_HOST)
+        m->stats[INPUT_ST_MTP]++;
+    emit_relative(m, false, clamp16(dx), clamp16(dy), clamp8(wheel), clamp8(pan));
 }
 
 void input_model_release(struct input_model *m, u32 src)
@@ -354,15 +394,13 @@ static bool host_frame(struct input_model *m, u8 type, const u8 *p, u8 len)
             if (p[0] & ~INPUT_BUTTONS_MASK || dx < -INPUT_REL_MAX || dy < -INPUT_REL_MAX ||
                 wheel < -INPUT_WHEEL_MAX || pan < -INPUT_WHEEL_MAX)
                 return false;
-            s->rel_buttons = p[0];
-            emit_relative(m, false, dx, dy, wheel, pan);
+            input_model_set_relative(m, INPUT_SRC_HOST, p[0], dx, dy, wheel, pan);
             return true;
         }
         case INPUT_HOST_CONSUMER:
             if (len != 2 || le16(p) > INPUT_CONSUMER_MAX)
                 return false;
-            s->consumer = le16(p);
-            emit_consumer(m, false);
+            input_model_set_consumer(m, INPUT_SRC_HOST, le16(p));
             return true;
         case INPUT_HOST_KEEPALIVE:
             return len == 0;

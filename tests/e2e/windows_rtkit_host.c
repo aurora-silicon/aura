@@ -47,6 +47,7 @@ static bool adt_is_compatible(void *a, int n, const char *p)
     return false;
 }
 static bool quiet_boundary, tx_ready = true, fail_map, omit_ap_ack, fail_send;
+static bool preset_ioreport = true; /* the ioreport grant arrives with a preset address */
 static u64 now;
 static unsigned maps, unmaps, cleans, heap_allocations, barriers;
 #define sysop(op)                                                                                  \
@@ -175,7 +176,10 @@ bool asc_send(asc_dev_t *a, const struct asc_message *m)
         queue(2, (1ULL << 52) | (1ULL << 44));
         queue(2, (8ULL << 52) | (64ULL << 24) | 4);
         queue(8, (1ULL << 56) | (0x4000ULL << 36));
-        queue(4, (1ULL << 52) | (1ULL << 44) | 0x390000000ULL);
+        if (preset_ioreport)
+            queue(4, (1ULL << 52) | (1ULL << 44) | 0x390000000ULL);
+        else
+            queue(4, (1ULL << 52) | (1ULL << 44));
         queue(0, (7ULL << 52) | 0x20);
         if (!omit_ap_ack)
             queue(0, (0xbULL << 52) | 0x20);
@@ -236,6 +240,16 @@ bool sart_remove_allowed_region(sart_dev_t *s, void *p, size_t n)
     return false;
 }
 #include "../../src/rtkit.c"
+void app(void *c, u8 ep, u64 msg)
+{
+    struct app_ctx {
+        unsigned *seen;
+        u64 *last;
+    } *ctx = c;
+    assert(ep >= 0x20);
+    ++*ctx->seen;
+    *ctx->last = msg;
+}
 static void reset_bus(void)
 {
     read_at = write_at = sent = 0;
@@ -476,7 +490,79 @@ int main(int argc, char **argv)
         asc_cpu_stop(&asc);
         rtkit_free(r);
     }
+    /*
+     * I1: a premapped, pool-only RTKit (the T8152 MTP's stream-4 DVAs are mapped by the caller):
+     * no DART call at all, grants come from the pool at the caller's DVAs, a grant with a preset
+     * address is refused and latched, app messages reach the handler, the quiet send never
+     * waits, and freeing never unmaps the caller's DVAs.
+     */
+    void *small_pool = pool;
+    size_t small_size = pool_size;
+    pool_size = 4 * SZ_16K;
+    assert(posix_memalign(&pool, SZ_16K, pool_size) == 0);
+    for (unsigned scenario = 0; scenario < 2; scenario++) {
+        memset(pool, 0xa5, pool_size);
+        reset_bus();
+        preset_ioreport = scenario == 1;
+        unsigned maps0 = maps, unmaps0 = unmaps;
+        r = rtkit_init("pool-only", &asc, NULL, NULL, NULL, false);
+        assert(r);
+        assert(!rtkit_set_buffer_pool_premapped(r, (u64)pool + 1, 0x10040410000ULL, pool_size));
+        assert(!rtkit_set_buffer_pool_premapped(r, (u64)pool, 0x10040410001ULL, pool_size));
+        assert(rtkit_set_buffer_pool_premapped(r, (u64)pool, 0x10040410000ULL, pool_size));
+        assert(!rtkit_set_buffer_pool_premapped(r, (u64)pool, 0x10040410000ULL, pool_size));
+        assert(!rtkit_set_phys_window(r, 0x390000000ULL, 0x100000)); /* pool-only */
+        static unsigned app_seen;
+        static u64 app_last;
+        app_seen = 0;
+        struct app_ctx { unsigned *seen; u64 *last; } ctx = {&app_seen, &app_last};
+        assert(rtkit_set_app_handler(r, (rtkit_app_handler_t)0, NULL));
+        void app(void *c, u8 ep, u64 msg);
+        assert(rtkit_set_app_handler(r, app, &ctx));
+        assert(rtkit_set_early_ap_power(r, true));
+        boot_messages();
+        if (scenario == 1) {
+            assert(!rtkit_boot_timed(r, 1000));
+            struct rtkit_rejection rejection;
+            assert(rtkit_get_first_rejection(r, &rejection) &&
+                   rejection.reason == RTKIT_REJECT_MESSAGE && rejection.msg1 == 4);
+            assert(!rtkit_send_quiet(r, 0x20, 0x2fd));
+        } else {
+            assert(rtkit_boot_timed(r, 1000));
+            assert(r->syslog_bfr.dva == 0x10040410000ULL && r->syslog_bfr.bfr == pool);
+            assert(r->ioreport_bfr.dva == 0x10040418000ULL && r->ioreport_bfr.owned);
+            int grant = 0;
+            for (unsigned i = 0; i < sent; i++)
+                if (tx[i].msg1 == 2 && FIELD_GET(MGMT_TYPE, tx[i].msg0) == 1)
+                    grant = FIELD_GET(MSG_BUFFER_REQUEST_IOVA, tx[i].msg0) == 0x10040410000ULL;
+            assert(grant);
+            quiet_boundary = true;
+            queue(0x20, 0xfe);
+            queue(0x20, 0x01);
+            queue(0x21, 0x1234);
+            assert(rtkit_service_quiet(r, 4) == 3 && app_seen == 3 && app_last == 0x1234);
+            unsigned before_sent = sent;
+            assert(rtkit_send_quiet(r, 0x20, 0x2fd) && sent == before_sent + 1 &&
+                   tx[sent - 1].msg0 == 0x2fd && tx[sent - 1].msg1 == 0x20);
+            tx_ready = false;
+            assert(!rtkit_send_quiet(r, 0x20, 0x2) && sent == before_sent + 1);
+            tx_ready = true;
+            /* A preset-address grant after boot: refused and latched; sends stop. */
+            queue(2, (1ULL << 52) | (1ULL << 44) | 0x390100000ULL);
+            assert(rtkit_service_quiet(r, 1) < 0 && !rtkit_send_quiet(r, 0x20, 0x2));
+            quiet_boundary = false;
+        }
+        assert(maps == maps0);
+        asc_cpu_stop(&asc);
+        rtkit_free(r);
+        assert(unmaps == unmaps0);
+    }
+    preset_ioreport = true;
+    real_free(pool);
+    pool = small_pool;
+    pool_size = small_size;
     real_free(pool);
     puts("{\"passed\":true,\"heap_grants\":0,\"quiet_poll_bound\":64,"
-         "\"phase7_notifications\":true,\"oslog_opaque_types\":255,\"rejection_transcripts\":9}");
+         "\"phase7_notifications\":true,\"oslog_opaque_types\":255,\"rejection_transcripts\":9,"
+         "\"premapped_pool_only\":true}");
 }

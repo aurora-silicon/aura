@@ -24,8 +24,10 @@
  * report that is dropped or coalesced never leaves a key or button down.
  *
  * Sources: the host feed (frames from this Mac on the vUART CDC pipe's RX direction, parsed
- * here) and, later, the internal keyboard and trackpad.  Each source keeps its own state;
- * the keyboard report is the bitwise OR of all sources.
+ * here), the internal keyboard (I1, translated by input_kbd.c) and the trackpad (I2).  Each
+ * source keeps its own state.  The keyboard report is the bitwise OR of all sources; relative
+ * pointer buttons are the OR of the sources' buttons, and each source's motion passes through;
+ * the absolute pointer is the host's alone; the consumer usage is the newest non-zero one.
  */
 
 /* ---- the register page (INPUT-DESIGN.md 1.3) ---------------------------------------------- */
@@ -140,11 +142,12 @@ enum input_host_type {
     INPUT_HOST_RELEASE_ALL = 0x07, /* host keys and buttons up */
 };
 
-/* Sources.  The host feed is the only one this model is fed by in I0. */
+/* Sources.  Only the host source has the held-key watchdog: the others send full state. */
 enum input_source {
     INPUT_SRC_HOST = 0,
-    INPUT_SRC_INTERNAL = 1,
-    INPUT_SRC_COUNT = 2,
+    INPUT_SRC_INTERNAL = 1, /* the M6's own keyboard (I1) */
+    INPUT_SRC_TRACKPAD = 2, /* the M6's own trackpad (I2) */
+    INPUT_SRC_COUNT = 3,
 };
 
 struct input_report {
@@ -162,6 +165,7 @@ struct input_source_state {
     bool abs_valid; /* an ABS state was ever given (a release keeps the position) */
     u8 rel_buttons;
     u16 consumer;
+    u32 consumer_stamp; /* when this source's non-zero usage began (the newest one wins) */
 };
 
 struct input_model {
@@ -191,6 +195,7 @@ struct input_model {
     u8 last_abs[INPUT_LEN_ABSOLUTE];
     u8 last_rel_buttons;
     u16 last_consumer;
+    u32 consumer_clock;
     bool last_valid; /* last_* hold what the queue's end state is */
 
     /* Host parser. */
@@ -233,6 +238,16 @@ bool input_model_line(const struct input_model *m);
 /* Set one source's keyboard state (modifier bits, bitmap of usages 0x00-0x9F). */
 void input_model_set_keyboard(struct input_model *m, u32 src, u8 mods,
                               const u8 keys[INPUT_KBD_BITMAP]);
+
+/* Set one source's consumer usage (0 = released, else <= 0x3FF). */
+void input_model_set_consumer(struct input_model *m, u32 src, u16 usage);
+
+/*
+ * One source's relative pointer: buttons (bits 0-4) are state, the rest are deltas
+ * (-32767..32767, wheel and pan -127..127; out-of-range values are clamped).
+ */
+void input_model_set_relative(struct input_model *m, u32 src, u8 buttons, s16 dx, s16 dy,
+                              s8 wheel, s8 pan);
 
 /* All of one source's keys and buttons up (watchdog, RELEASE_ALL, carrier exit). */
 void input_model_release(struct input_model *m, u32 src);

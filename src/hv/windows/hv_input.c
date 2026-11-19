@@ -9,6 +9,7 @@
 
 #include "hv_input.h"
 #include "hv.h"
+#include "hv_mtp_t8152.h"
 #include "hv_vdev_spi.h"
 #include "input_model.h"
 #include "iodev.h"
@@ -107,10 +108,33 @@ static bool hv_input_mmio(struct exc_info *ctx, u64 addr, u64 *val, bool write, 
 
 /* ---- the host feed ----------------------------------------------------------------------- */
 
+void hv_input_internal_keyboard(u8 mods, const u8 keys[INPUT_KBD_BITMAP], u16 consumer)
+{
+    spin_lock(&input_lock);
+    input_model_set_keyboard(&model, INPUT_SRC_INTERNAL, mods, keys);
+    input_model_set_consumer(&model, INPUT_SRC_INTERNAL, consumer);
+    spin_unlock(&input_lock);
+}
+
+static bool mtp_service_now(void)
+{
+    return __atomic_load_n(&attached, __ATOMIC_ACQUIRE) && (sources & HV_INPUT_SRC_KEYBOARD) &&
+           entered && !exited;
+}
+
+void hv_input_idle_poll(void)
+{
+    if (mtp_service_now())
+        hv_mtp_t8152_poll();
+}
+
 void hv_input_poll(void)
 {
     if (!attached || !entered || exited || !(sources & HV_INPUT_SRC_HOST))
         return;
+    /* Before input_lock: the MTP's keyboard updates take it themselves. */
+    if (mtp_service_now())
+        hv_mtp_t8152_poll();
 
     u8 buf[HV_INPUT_RX_BUDGET];
     u32 n = 0;
@@ -162,20 +186,28 @@ static s64 attach(u64 mask, u64 area_base, u64 area_size)
                "guest started\n");
         return HV_INPUT_E_STATE;
     }
-    if (!mask || (mask & ~(u64)(HV_INPUT_SRC_HOST | HV_INPUT_SRC_KEYBOARD |
-                                HV_INPUT_SRC_TRACKPAD))) {
+    u64 src = mask & HV_INPUT_SRC_MASK, opts = mask & ~HV_INPUT_SRC_MASK;
+    if (!src || (src & ~(u64)(HV_INPUT_SRC_HOST | HV_INPUT_SRC_KEYBOARD | HV_INPUT_SRC_TRACKPAD)) ||
+        (opts & ~(u64)HV_INPUT_OPT_MASK) || (opts && !(src & HV_INPUT_SRC_KEYBOARD))) {
         printf("HV: T8152: input: attach refused: bad source mask 0x%lx\n", mask);
         return HV_INPUT_E_SOURCES;
     }
-    if (mask & ~(u64)HV_INPUT_SRC_SUPPORTED) {
-        printf("HV: T8152: input: attach refused: source mask 0x%lx asks for the internal "
-               "keyboard/trackpad, which this carrier does not run yet (host only)\n",
+    if (src & ~(u64)HV_INPUT_SRC_SUPPORTED) {
+        printf("HV: T8152: input: attach refused: source mask 0x%lx asks for the trackpad, which "
+               "this carrier does not run yet (host and internal keyboard only)\n",
                mask);
         return HV_INPUT_E_SOURCES;
     }
-    if (area_base || area_size) {
-        printf("HV: T8152: input: attach refused: the host source takes no reserved area "
-               "(0x%lx +0x%lx)\n",
+    if (!(src & HV_INPUT_SRC_HOST)) {
+        printf("HV: T8152: input: attach refused: the internal keyboard needs the host source "
+               "too (the Mac-fed path stays the fallback)\n");
+        return HV_INPUT_E_SOURCES;
+    }
+    bool kbd = src & HV_INPUT_SRC_KEYBOARD;
+    if (kbd ? (!area_base || !area_size) : (area_base || area_size)) {
+        printf("HV: T8152: input: attach refused: %s (0x%lx +0x%lx)\n",
+               kbd ? "the internal keyboard needs the reserved MTP area"
+                   : "the host source takes no reserved area",
                area_base, area_size);
         return HV_INPUT_E_AREA;
     }
@@ -188,7 +220,7 @@ static s64 attach(u64 mask, u64 area_base, u64 area_size)
                HV_INPUT_BASE);
         return HV_INPUT_E_HOOK;
     }
-    sources = (u32)mask;
+    sources = (u32)src;
     __atomic_store_n(&attached, true, __ATOMIC_RELEASE);
     printf("HV: T8152: input: attached (host feed on the vUART RX); page 0x%lx hooked, SPI %u; "
            "held-key watchdog %u ms\n",
@@ -208,7 +240,10 @@ static u64 query(u64 index)
         case HV_INPUT_Q_INTID:
             return HV_INPUT_INTID;
         case HV_INPUT_Q_FEATURES:
-            return INPUT_FEAT_REPORTS | INPUT_FEAT_SRC_HOST;
+            /* After ATTACH the live sources (bit 17 only once the keyboard is READY). */
+            return __atomic_load_n(&attached, __ATOMIC_ACQUIRE) ? model.features
+                                                                 : INPUT_FEAT_REPORTS |
+                                                                       INPUT_FEAT_SRC_HOST;
         case HV_INPUT_Q_SOURCES:
             return HV_INPUT_SRC_SUPPORTED;
         default:
@@ -222,6 +257,8 @@ static u64 status(u64 index)
     spin_lock(&input_lock);
     if (index < INPUT_ST_COUNT) {
         v = model.stats[index];
+    } else if (index >= HV_INPUT_S_MTP_STATE && index <= HV_INPUT_S_MTP_GPIO) {
+        v = (sources & HV_INPUT_SRC_KEYBOARD) ? hv_mtp_t8152_status((u32)index) : 0;
     } else {
         switch (index) {
             case HV_INPUT_S_ATTACHED:
@@ -263,8 +300,28 @@ u64 hv_input_proxy(u64 op, u64 a1, u64 a2, u64 a3)
             spin_lock(&input_lock);
             s64 ret = attach(a1, a2, a3);
             spin_unlock(&input_lock);
-            return (u64)ret;
+            if (ret || !(sources & HV_INPUT_SRC_KEYBOARD))
+                return (u64)ret;
+            /*
+             * The MTP outside input_lock: its keyboard updates take the lock.  A failure keeps
+             * the host source: ATTACH returns 0 and FEATURES lacks bit 17.
+             */
+            bool up = hv_mtp_t8152_attach(a2, a3, a1 & HV_INPUT_OPT_FN_FKEYS);
+            spin_lock(&input_lock);
+            if (up)
+                model.features |= INPUT_FEAT_SRC_KBD;
+            spin_unlock(&input_lock);
+            printf("HV: T8152: input: internal keyboard %s\n",
+                   up ? "live (FEATURES bit 17)" : "not available; host input only");
+            return 0;
         }
+        case HV_INPUT_OP_PROBE:
+            if (!attached || entered || hv_windows_guest_entered() ||
+                !(sources & HV_INPUT_SRC_KEYBOARD)) {
+                printf("HV: T8152: input: PROBE needs the internal keyboard, before entry\n");
+                return HV_INPUT_ERROR;
+            }
+            return (u64)hv_mtp_t8152_probe((u32)a1);
         case HV_INPUT_OP_STATUS:
             return status(a1);
         case HV_INPUT_OP_DETACH:
@@ -350,6 +407,8 @@ void hv_input_guest_entered(void)
         dropped += (u64)got;
     }
     input_model_host_restart(&model);
+    /* Keys the internal keyboard held before entry: its next report sends the full state. */
+    input_model_release(&model, INPUT_SRC_INTERNAL);
     model.host_last = now_ticks();
     entered = true;
     spin_unlock(&input_lock);
@@ -369,8 +428,12 @@ void hv_input_guest_exited(int status_code)
      */
     exited = true;
     input_model_release(&model, INPUT_SRC_HOST);
+    input_model_release(&model, INPUT_SRC_INTERNAL);
     spin_unlock(&input_lock);
-    printf("HV: T8152: input: guest exit %d: host keys and buttons released\n", status_code);
+    printf("HV: T8152: input: guest exit %d: host keys and buttons released%s\n", status_code,
+           (sources & HV_INPUT_SRC_KEYBOARD) ? ", internal keyboard released (the MTP is left "
+                                               "running: leave by a reboot)"
+                                             : "");
     hv_input_report();
 }
 
@@ -382,6 +445,8 @@ void hv_input_report(void)
     if (!exited && now < report_next)
         return;
     report_next = now + mrs(CNTFRQ_EL0);
+    if (sources & HV_INPUT_SRC_KEYBOARD)
+        hv_mtp_t8152_report(); /* its own line, when its counters moved */
     spin_lock(&input_lock);
     u32 ok = model.stats[INPUT_ST_FRAMES_OK];
     u32 bad = model.stats[INPUT_ST_BAD_CRC] + model.stats[INPUT_ST_BAD_HEADER] +
@@ -430,6 +495,8 @@ void hv_input_fatal_report(void)
     else
         printf("%lu ms ago", poll_age);
     printf(", %lu bytes in all\n", poll_bytes);
+    if (sources & HV_INPUT_SRC_KEYBOARD)
+        hv_mtp_t8152_fatal_report();
 }
 
 #ifdef HV_INPUT_HOST_TEST

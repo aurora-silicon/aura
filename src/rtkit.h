@@ -80,6 +80,17 @@ bool rtkit_set_buffer_pool(rtkit_dev_t *rtk, u64 base, size_t size);
 bool rtkit_set_early_ap_power(rtkit_dev_t *rtk, bool enable);
 /* Single ASC owner; returns handled count, or a latched failure. Never waits. */
 int rtkit_service_quiet(rtkit_dev_t *rtk, int max_msgs);
+/*
+ * I1 (hv_mtp_t8152.c): a pool whose DVAs the caller already mapped (the T8152 MTP's dart-sbr
+ * stream 4 is 3-level, which dart_map() does not handle).  Pool-only: no DART, no physical
+ * window, so a buffer request with a preset address is refused and latched.
+ */
+bool rtkit_set_buffer_pool_premapped(rtkit_dev_t *rtk, u64 base, u64 dva, size_t size);
+/* Messages for endpoints >= 0x20 go to `fn` (still counted) instead of being dropped. */
+typedef void (*rtkit_app_handler_t)(void *ctx, u8 ep, u64 msg);
+bool rtkit_set_app_handler(rtkit_dev_t *rtk, rtkit_app_handler_t fn, void *ctx);
+/* One message, never waiting: false when the mailbox has no free slot or service failed. */
+bool rtkit_send_quiet(rtkit_dev_t *rtk, u8 ep, u64 msg);
 /* Sole owner, after service returns; copies metadata only, never reads MMIO. */
 bool rtkit_get_first_rejection(const rtkit_dev_t *rtk, struct rtkit_rejection *out);
 bool rtkit_get_notification_counts(const rtkit_dev_t *rtk, struct rtkit_notification_counts *out);

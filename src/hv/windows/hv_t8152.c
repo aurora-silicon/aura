@@ -47,6 +47,7 @@
  * DWC3_XHCI_REGS_START/END 0x0..0x7fff; the dwc3 globals start at +0xc100).  Two 16 KiB pages.
  */
 #define T8152_XHCI_SIZE     0x8000UL
+#define T8152_INPUT_AREA_ALIGN 0x200000UL /* I1 reserved MTP area */
 #define T8152_USB_PORTS     4 /* usb-drd0..3; port 0 (the proxy's) is never split */
 #define T8152_REPORT_LIMIT  16
 #define T8152_CPUS          12 /* E cpu0-5, P cpu6-7, M cpu8-11 (smp_init_t8152 checks the ADT) */
@@ -88,6 +89,9 @@ struct t8152_allow {
 static bool armed;
 static bool ram_set;
 static bool store_set;
+static u64 store_start, store_end; /* D1 AHCI store, when set */
+static bool input_set;
+static u64 input_start, input_end; /* I1 reserved MTP area, when set */
 static u64 ram_start, ram_end;   /* guest RAM window */
 static u64 ram_host_top;         /* the launcher's heap top, from hv_t8152_set_guest_ram() */
 static u64 dram_start, dram_end; /* boot_args normal RAM */
@@ -418,6 +422,7 @@ int hv_t8152_preflight(void)
     armed = false;
     ram_set = false;
     store_set = false;
+    input_set = false;
     allow_count = 0;
 
     if (chip_id != T8152) {
@@ -655,11 +660,83 @@ int hv_t8152_reserve_store(u64 start, u64 end)
                start, end, bad);
         return -1;
     }
+    if (input_set && overlaps(start, end, input_start, input_end)) {
+        printf("HV: T8152: AHCI store [0x%lx, 0x%lx) overlaps the input area [0x%lx, 0x%lx)\n",
+               start, end, input_start, input_end);
+        return -1;
+    }
     if (deny_add(start, end - start, "AHCI disk store (D1)"))
         return -1;
     store_set = true;
+    store_start = start;
+    store_end = end;
     printf("HV: T8152: AHCI store [0x%lx, 0x%lx) reserved and denied to stage 2\n", start, end);
     return 0;
+}
+
+int hv_t8152_reserve_input_area(u64 start, u64 end)
+{
+    if (!armed || !ram_set) {
+        printf("HV: T8152: input area refused: the policy is not armed or guest RAM is not set\n");
+        return -1;
+    }
+    if (input_set) {
+        printf("HV: T8152: input area refused: an area is already reserved this session\n");
+        return -1;
+    }
+    if (end <= start || (start | end) & (T8152_INPUT_AREA_ALIGN - 1) || start < ram_end) {
+        printf("HV: T8152: input area [0x%lx, 0x%lx) refused: it must be a 2 MiB aligned range "
+               "above guest RAM [0x%lx, 0x%lx)\n",
+               start, end, ram_start, ram_end);
+        return -1;
+    }
+    if (!inside(start, end, dram_start, dram_end)) {
+        printf("HV: T8152: input area [0x%lx, 0x%lx) is not inside boot_args RAM [0x%lx, 0x%lx)\n",
+               start, end, dram_start, dram_end);
+        return -1;
+    }
+    if (store_set && overlaps(start, end, store_start, store_end)) {
+        printf("HV: T8152: input area [0x%lx, 0x%lx) overlaps the AHCI store [0x%lx, 0x%lx)\n",
+               start, end, store_start, store_end);
+        return -1;
+    }
+    const struct t8152_range *hit = deny_hit(start, end);
+    if (hit) {
+        printf("HV: T8152: input area [0x%lx, 0x%lx) overlaps denied %s\n", start, end,
+               hit->name);
+        return -1;
+    }
+    int bad = ram_conflicts(start, end, ram_host_top);
+    if (bad) {
+        printf("HV: T8152: input area [0x%lx, 0x%lx) refused (%d conflict(s); the lines above say "
+               "\"guest RAM\" for the area)\n",
+               start, end, bad);
+        return -1;
+    }
+    if (deny_add(start, end - start, "input MTP area (I1)"))
+        return -1;
+    input_set = true;
+    input_start = start;
+    input_end = end;
+    printf("HV: T8152: input area [0x%lx, 0x%lx) reserved and denied to stage 2\n", start, end);
+    return 0;
+}
+
+bool hv_t8152_carrier_ram(u64 start, u64 end, u64 map_lo, u64 map_hi)
+{
+    u64 c_start, c_size;
+    if (end <= start || !inside(start, end, map_lo, map_hi))
+        return false;
+    if (carveout("region-id-4", &c_start, &c_size) == 0 &&
+        overlaps(start, end, c_start, c_start + c_size))
+        return false;
+    if (ram_set && overlaps(start, end, ram_start, ram_end))
+        return false;
+    if (store_set && overlaps(start, end, store_start, store_end))
+        return false;
+    if (input_set && overlaps(start, end, input_start, input_end))
+        return false;
+    return true;
 }
 
 int hv_t8152_allow(u64 ipa, u64 pa, u64 size, bool read_only, const char *name)

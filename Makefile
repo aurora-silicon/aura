@@ -255,7 +255,8 @@ HV_OBJECTS := $(patsubst %,hv/windows/%, \
 	hv_aic_alias.o hv_t8152.o hv_gic_cpuif.o fb_capture.o windows_compat.o windows_n1.o \
 	serial_capture.o mtp_handoff.o hv_xfer.o ahci_model.o hv_ahci.o hv_vdev_spi.o \
 	hv_fatal.o hv_usb.o hv_usb_dart.o gpu_t8152_admit.o hv_gpu.o input_model.o hv_input.o \
-	ahci_nvme.o gpt_check.o hv_ahci_nvme.o hv_serror.o) \
+	ahci_nvme.o gpt_check.o hv_ahci_nvme.o hv_serror.o \
+	mtp_scm.o mtp_dart_t8152.o hid_desc.o input_kbd.o mtp_bringup.o hv_mtp_t8152.o) \
 	hv/hv_vm.o hv/hv_virtio.o hv/hv_vuart.o hv/hv_wdt.o hv/hv_sprr.o
 endif
 

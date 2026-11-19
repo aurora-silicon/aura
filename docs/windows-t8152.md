@@ -988,3 +988,87 @@ Not verified (each needs Windows or the M6): kbdhid with a bitmap keyboard on AR
 SPI 991 free on the live machine (980..999 were free except 984 in the last ADT walk); the
 CDC RX path under sustained host traffic while the guest runs; the cost of the trapped
 accesses (about ten per report).
+
+## I1: the M6's internal keyboard (carrier-owned MTP)
+
+Status: built and host-tested only (`tests/python/test_windows_t8152_input_mtp.py`, plus the
+I1 glue cases in `test_windows_t8152_input.py` and the pool-only scenario of
+`tools/windows_rtkit_e2e.py`). Nothing of it has run on the M6, and the launcher does not ask
+for it yet (`--windows-input host+kbd` is still refused by `windows.py`). Plan and reasoning:
+`windows-m6/INPUT-I1I2-BUILD.md` and `INPUT-DESIGN.md` section 3 (owner notes, not in this
+tree). The guest ABI is unchanged: the internal keyboard arrives as the same ID 1 / ID 4
+reports as the host feed, OR-merged with it; FEATURES bit 17 says it is live.
+
+ATTACH (`P_HV_WINDOWS_INPUT` op 1) with `a1 = host | keyboard` (bit 0 | bit 1; bit 8 = Fn
+default "fkeys"), `a2/a3` = an 8 MiB, 2 MiB aligned reserved area above guest RAM, which the
+launcher carves off the top of the guest RAM window. The host source is required (the Mac-fed
+path stays the fallback); the trackpad (bit 2) is refused. `QUERY Q_SOURCES` returns 3. The
+carrier then, before guest entry (`hv_mtp_t8152.c`, `mtp_bringup.c`):
+
+1. checks the live ADT: `/arm-io/mtp` `iop,ascwrap-v8` at 0x314600000 / 0x314700000, its
+   `iommu-parent` is `dart-sbr/mapper-mtp` stream 4, `dart-sbr` at 0x318100000 with vm-base
+   0x10040000000, the `keyboard` nub;
+2. reserves the area (`hv_t8152_reserve_input_area()`: above guest RAM, clear of every
+   carve-out, CTXR range, aura and its heaps, the AHCI store; denied to stage 2), remaps its
+   device-written rings Normal-NC in every alias of its own map (both ring indices share one
+   cache line), and zeroes the rings and the table pages;
+3. reads `ASC_CPU_CONTROL`: **RUN already set refuses with nothing written** (a reboot
+   through iBoot gives a fresh MTP);
+4. reads only dart-sbr `TTBR[4]` (valid, no bits outside 29:2) and `TCR[4]` (must be 9); the
+   root must be carrier-mapped RAM outside guest RAM, the store and the area;
+5. maps the TX ring (DVA 0x10040000000), RX ring (0x10040204000), wake ring (0x10040408000)
+   and a 1 MiB RTKit pool (0x10040410000) with its own 3-level entries under that root
+   (`mtp_dart_t8152.c`: refuses a foreign table or a valid leaf, checked by its own walk; no
+   DART register write, no TLBI);
+6. turns on the 13 PMGR MTP states at 0x30828c000 + 0x20 i whose target is not on (each write
+   logged, each polled to on for at most 10 ms);
+7. boots RTKit in the new pool-only mode (`rtkit_set_buffer_pool_premapped()`; a grant with a
+   preset address is refused and latched), which writes RUN, then starts endpoint 0x20;
+8. SCM: power 2, waits for 0xfe, registers the three rings, 0xff; reads INIT, finds the
+   interface named "keyboard", maps its HID descriptor to a layout (`hid_desc.c`,
+   `input_kbd.c`; an unmappable descriptor leaves the keyboard off), enables it (`{0xb4, i}`,
+   acknowledged with return code 0) and waits for READY. A GPIO request is refused with
+   0xe000f00d and the request echoed. stm, actuator, tp-accel and mtp are never enabled.
+
+Every step is bounded; a failure stops the MTP part with a step and a reason (STATUS 23/24)
+and leaves the host source attached (ATTACH still returns 0). MMIO is limited to an
+allow-list (read: ASC_CPU_CONTROL, TCR[4], TTBR[4], the 13 PMGR states; write: the PMGR
+states only), each access under the exception guard; the mailbox goes through `asc.c`. No SMC
+access and no NVRAM access in any of these files.
+
+Run time: polled only (lines 1500/1501 stay masked), from the boot CPU's tick before the host
+feed (1 kHz floor) and from the unlocked WFI path, one servicer at a time
+(`hv_mtp_t8152_poll()`), never waiting: at most 4 RTKit messages and 32 frames per call. The
+WFI path never drives the SPI; the tick does. An RTKit failure, a ring index or framing error,
+or three checksum errors in a row latch: the internal keyboard is released once and servicing
+stops; host input continues. Entry and exit release the internal source (state only). Nothing
+is sent to the MTP at exit: it keeps running and DMAing into the area, so a session that
+brought it up must be left by a reboot.
+
+Keyboard translation: modifiers as reported (Command is GUI, Option is Alt); the Fn layer is
+ours: by default the F-row sends brightness (F1/F2, 0x70/0x6F), AC Search (F4), previous /
+play / next (F7-F9) and mute / volume down / up (F10-F12) as consumer usages and F1-F12 with
+Fn ("fkeys" swaps that); Fn + arrows give Home/End/PgUp/PgDn, Fn + Backspace Delete, Fn +
+Return Insert. A key keeps the translation it was pressed with until released. Fn alone
+sends nothing; usages above 0x9F are dropped (counted); an ErrorRollOver report keeps the
+previous state. The consumer usage the guest sees is the newest non-zero one of all sources.
+
+`P_HV_WINDOWS_INPUT` op 4 `PROBE` (before entry, keyboard live): services for `a1` ms (at
+most 10 s) and logs every frame and every translation (50 per second); ATTACH logs the steps'
+timings, the register values, the PMGR states before, the INIT interface table and the
+keyboard descriptor in hex. These logs carry the machine's own descriptor: keep them with the
+owner's private data. STATUS 23-31: MTP state, reason, keyboard reports | bad << 32, trackpad
+(0), RTKit app messages | doorbells << 32, longest service call (us), checksum | ring << 16 |
+oversize << 32 | parse << 48 errors, SMC writes (0), GPIO requests refused. The 1 Hz report
+adds `HV: input: mtp kbd ...` when its counters move.
+
+Build: the I1 code pushes `.text` across a 64 KiB boundary, which moves `.data` and the vital
+file end (0x12acd8) past the default 0x120000 limit, so the carrier is linked with
+`FILE_LIMIT=0x200000`, the J804 value `aura-raw.ld` documents (the panel DCP's `__OS_LOG` is
+0x234000 past the installed stage 1's base).
+
+Not verified (each needs the M6): RUN clear when the carrier attaches on the Windows route;
+which PMGR states are off then; TTBR/TCR/root as measured by Linux; the RTKit buffer requests
+fitting a 1 MiB pool with no preset address; the keyboard descriptor mapping; the 1 kHz
+service keeping the syslog backlog drained; GPIO requests; the next Linux boot getting its
+keyboard back after a reboot.

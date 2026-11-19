@@ -20,6 +20,7 @@
 
 #include "hv.h"
 #include "hv_input.h"
+#include "hv_mtp_t8152.h"
 #include "input_model.h"
 #include "iodev.h"
 #include "utils.h"
@@ -121,6 +122,72 @@ bool hv_windows_guest_entered(void)
     return guest_entered;
 }
 
+/*
+ * I1: the MTP glue (hv_mtp_t8152.c) is replaced by a recorder.  Its poll can deliver a scripted
+ * internal keyboard state through hv_input_internal_keyboard(), as the real one does from
+ * mtp_bringup_poll(); the spin lock stub traps if that ever happens under input_lock.
+ */
+static int mtp_attaches, mtp_polls, mtp_probes, mtp_reports;
+static bool mtp_up;
+static u64 mtp_area, mtp_size;
+static bool mtp_fkeys;
+static bool script_pending;
+static u8 script_mods, script_keys[20];
+static u16 script_cons;
+
+bool hv_mtp_t8152_attach(u64 area, u64 size, bool fn_fkeys)
+{
+    mtp_attaches++;
+    mtp_area = area;
+    mtp_size = size;
+    mtp_fkeys = fn_fkeys;
+    return mtp_up;
+}
+
+bool hv_mtp_t8152_live(void)
+{
+    return mtp_up;
+}
+
+void hv_mtp_t8152_poll(void)
+{
+    mtp_polls++;
+    if (script_pending) {
+        script_pending = false;
+        hv_input_internal_keyboard(script_mods, script_keys, script_cons);
+    }
+}
+
+u64 hv_mtp_t8152_status(u32 index)
+{
+    return 0x100 + index;
+}
+
+s64 hv_mtp_t8152_probe(u32 ms)
+{
+    mtp_probes++;
+    return ms;
+}
+
+void hv_mtp_t8152_report(void)
+{
+    mtp_reports++;
+}
+
+void hv_mtp_t8152_fatal_report(void)
+{
+}
+
+static void script(u8 mods, u8 usage, u16 consumer)
+{
+    memset(script_keys, 0, sizeof(script_keys));
+    if (usage)
+        script_keys[usage / 8] |= (u8)(1u << (usage % 8));
+    script_mods = mods;
+    script_cons = consumer;
+    script_pending = true;
+}
+
 /* ---- harness ----------------------------------------------------------------------------- */
 
 static int failures, total_failures;
@@ -162,6 +229,11 @@ static void begin(const char *name)
     chip_id = 0x8152;
     board_id = 0x22;
     stub_cntpct = 1000;
+    mtp_attaches = mtp_polls = mtp_probes = mtp_reports = 0;
+    mtp_up = true;
+    mtp_area = mtp_size = 0;
+    mtp_fkeys = false;
+    script_pending = false;
 }
 
 static void end(void)
@@ -246,7 +318,15 @@ static void case_attach_refusals(void)
     board_id = 0x22;
     EQ(attach(0, 0, 0), (u64)(s64)HV_INPUT_E_SOURCES);
     EQ(attach(0x8, 0, 0), (u64)(s64)HV_INPUT_E_SOURCES);
-    EQ(attach(HV_INPUT_SRC_HOST | HV_INPUT_SRC_KEYBOARD, 0, 0), (u64)(s64)HV_INPUT_E_SOURCES);
+    /* I1: the keyboard needs the area and the host source; the trackpad is not here yet. */
+    EQ(attach(HV_INPUT_SRC_HOST | HV_INPUT_SRC_KEYBOARD, 0, 0), (u64)(s64)HV_INPUT_E_AREA);
+    EQ(attach(HV_INPUT_SRC_KEYBOARD, 0x10f00000000UL, 0x800000), (u64)(s64)HV_INPUT_E_SOURCES);
+    EQ(attach(HV_INPUT_SRC_HOST | HV_INPUT_SRC_KEYBOARD | HV_INPUT_SRC_TRACKPAD, 0x10f00000000UL,
+              0x800000),
+       (u64)(s64)HV_INPUT_E_SOURCES);
+    EQ(attach(HV_INPUT_SRC_HOST | HV_INPUT_OPT_FN_FKEYS, 0, 0), (u64)(s64)HV_INPUT_E_SOURCES);
+    EQ(attach(HV_INPUT_SRC_HOST | HV_INPUT_SRC_KEYBOARD | BIT(9), 0x10f00000000UL, 0x800000),
+       (u64)(s64)HV_INPUT_E_SOURCES);
     EQ(attach(HV_INPUT_SRC_TRACKPAD, 0, 0), (u64)(s64)HV_INPUT_E_SOURCES);
     EQ(attach(HV_INPUT_SRC_HOST, 0x10000000000UL, 0), (u64)(s64)HV_INPUT_E_AREA);
     EQ(attach(HV_INPUT_SRC_HOST, 0, 0x4000), (u64)(s64)HV_INPUT_E_AREA);
@@ -264,9 +344,10 @@ static void case_attach_refusals(void)
     EQ(hv_input_proxy(HV_INPUT_OP_QUERY, HV_INPUT_Q_SIZE, 0, 0), 0x4000);
     EQ(hv_input_proxy(HV_INPUT_OP_QUERY, HV_INPUT_Q_INTID, 0, 0), 991);
     EQ(hv_input_proxy(HV_INPUT_OP_QUERY, HV_INPUT_Q_FEATURES, 0, 0), 0x1000f);
-    EQ(hv_input_proxy(HV_INPUT_OP_QUERY, HV_INPUT_Q_SOURCES, 0, 0), 1);
+    EQ(hv_input_proxy(HV_INPUT_OP_QUERY, HV_INPUT_Q_SOURCES, 0, 0), 3);
     EQ(hv_input_proxy(HV_INPUT_OP_QUERY, 6, 0, 0), HV_INPUT_ERROR);
     EQ(hv_input_proxy(7, 0, 0, 0), HV_INPUT_ERROR);
+    EQ(mtp_attaches, 0);
     /* A hook failure uses the session up and attaches nothing. */
     map_fails = true;
     EQ(attach(HV_INPUT_SRC_HOST, 0, 0), (u64)(s64)HV_INPUT_E_HOOK);
@@ -531,8 +612,130 @@ static void case_status(void)
     EQ(st(HV_INPUT_S_LEDS), 2);
     EQ(st(HV_INPUT_S_CTRL), 0);
     EQ(st(HV_INPUT_S_DROPPED), 0);
-    EQ(st(23), HV_INPUT_ERROR);
+    EQ(st(HV_INPUT_S_MTP_STATE), 0); /* host only: no MTP */
+    EQ(st(HV_INPUT_S_MTP_GPIO), 0);
+    EQ(st(32), HV_INPUT_ERROR);
     hv_input_report();
+    EQ(mtp_reports, 0);
+    end();
+}
+
+/* I1 G12: a host-only session never calls the MTP glue (attach, tick, idle, exit). */
+static void case_host_only_no_mtp(void)
+{
+    begin("host_only_no_mtp");
+    hv_input_enable();
+    EQ(attach(HV_INPUT_SRC_HOST, 0, 0), 0);
+    hv_input_idle_poll();
+    enter();
+    push_keys(0, 0x04);
+    hv_input_poll();
+    hv_input_idle_poll();
+    stub_cntpct += 3 * stub_cntfrq;
+    hv_input_report();
+    EQ(hv_input_proxy(HV_INPUT_OP_PROBE, 100, 0, 0), HV_INPUT_ERROR);
+    hv_input_guest_exited(0);
+    EQ(mtp_attaches + mtp_polls + mtp_probes + mtp_reports, 0);
+    EQ(hv_input_proxy(HV_INPUT_OP_QUERY, HV_INPUT_Q_FEATURES, 0, 0), 0x1000f);
+    end();
+}
+
+/* I1 G13: ATTACH with the keyboard: the area and the Fn option reach the MTP glue; FEATURES
+ * bit 17 only when it came up; a failed MTP keeps the host source. */
+static void case_kbd_attach(void)
+{
+    begin("kbd_attach");
+    hv_input_enable();
+    EQ(attach(HV_INPUT_SRC_HOST | HV_INPUT_SRC_KEYBOARD | HV_INPUT_OPT_FN_FKEYS, 0x10f00000000UL,
+              0x800000),
+       0);
+    EQ(mtp_attaches, 1);
+    EQ(mtp_area, 0x10f00000000UL);
+    EQ(mtp_size, 0x800000);
+    CHECK(mtp_fkeys);
+    EQ(st(HV_INPUT_S_ATTACHED), 3);
+    EQ(hv_input_proxy(HV_INPUT_OP_QUERY, HV_INPUT_Q_FEATURES, 0, 0), 0x3000f);
+    EQ(st(HV_INPUT_S_MTP_STATE), 0x100 + 23);
+    EQ(st(HV_INPUT_S_MTP_GPIO), 0x100 + 31);
+    CHECK(hv_input_owns_vuart_rx());
+    EQ(hv_input_verify(), 0);
+    /* PROBE before entry only. */
+    EQ(hv_input_proxy(HV_INPUT_OP_PROBE, 1500, 0, 0), 1500);
+    enter();
+    EQ(hv_input_proxy(HV_INPUT_OP_PROBE, 1500, 0, 0), HV_INPUT_ERROR);
+    EQ(mtp_probes, 1);
+
+    begin("kbd_attach");
+    hv_input_enable();
+    mtp_up = false;
+    EQ(attach(HV_INPUT_SRC_HOST | HV_INPUT_SRC_KEYBOARD, 0x10f00000000UL, 0x800000), 0);
+    CHECK(!mtp_fkeys);
+    EQ(hv_input_proxy(HV_INPUT_OP_QUERY, HV_INPUT_Q_FEATURES, 0, 0), 0x1000f);
+    CHECK(hv_input_owns_vuart_rx());
+    EQ(attach(HV_INPUT_SRC_HOST | HV_INPUT_SRC_KEYBOARD, 0x10f00000000UL, 0x800000),
+       (u64)(s64)HV_INPUT_E_STATE);
+    EQ(mtp_attaches, 1);
+    end();
+}
+
+/* I1 G14: the internal keyboard and the host merge; the idle path services but never drives
+ * the SPI; the tick does; nothing is serviced before entry or after exit. */
+static void case_kbd_merge(void)
+{
+    begin("kbd_merge");
+    hv_input_enable();
+    EQ(attach(HV_INPUT_SRC_HOST | HV_INPUT_SRC_KEYBOARD, 0x10f00000000UL, 0x800000), 0);
+    hv_input_idle_poll();
+    hv_input_poll();
+    EQ(mtp_polls, 0);
+    /* A key the internal keyboard held before entry is forgotten at entry. */
+    script(0, 0x2c, 0);
+    enter();
+    g_wr(INPUT_REG_CTRL, INPUT_CTRL_ENABLE | INPUT_CTRL_IRQ_EN, 2);
+    g_wr(INPUT_REG_POP, 1, 2);
+    g_wr(INPUT_REG_POP, 1, 2);
+    EQ(st(HV_INPUT_S_DEPTH), 0);
+    int calls = spi_calls;
+    hv_input_idle_poll(); /* delivers the scripted state: queued, line not driven here */
+    EQ(mtp_polls, 1);
+    EQ(st(HV_INPUT_S_DEPTH), 1);
+    EQ(spi_calls, calls);
+    push_keys(0x02, 0x04);
+    script(0x10, 0x2c, 0xe9);
+    hv_input_poll(); /* the tick: MTP first, then the host feed, then the SPI */
+    EQ(mtp_polls, 2);
+    EQ(spi_calls, calls + 1);
+    CHECK(spi_level_now);
+    g_wr(INPUT_REG_POP, 1, 2); /* the idle path's report */
+    /* Merged keyboard: both sources' modifiers and keys. */
+    bool merged = false, volume = false;
+    while (g_rd(INPUT_REG_REPORT_LEN, 2)) {
+        u64 r = g_rd(INPUT_REG_REPORT, 3);
+        /* id 1, Shift (host) | GUI (internal), usage 0x04 (host) and 0x2c (internal). */
+        if ((r & 0xff) == 1 && ((r >> 8) & 0xff) == 0x12 && ((r >> 16) & 0x10) &&
+            ((r >> 56) & 0x10))
+            merged = true;
+        if ((r & 0xff) == 4 && ((r >> 8) & 0xffff) == 0xe9)
+            volume = true;
+        g_wr(INPUT_REG_POP, 1, 2);
+    }
+    CHECK(merged && volume);
+    EQ(st(INPUT_ST_MTP) >= 2, 1);
+    /* Exit: both released, state only; no MTP service after it. */
+    calls = spi_calls;
+    hv_input_guest_exited(0);
+    int polls = mtp_polls;
+    hv_input_poll();
+    hv_input_idle_poll();
+    EQ(mtp_polls, polls);
+    /* Host released (internal GUI + 0x2c left), then internal: all up, then consumer 0. */
+    EQ(st(HV_INPUT_S_DEPTH), 3);
+    g_wr(INPUT_REG_POP, 1, 2);
+    u64 r = g_rd(INPUT_REG_REPORT, 3);
+    EQ(r & 0xffffff, 0x000001);
+    g_wr(INPUT_REG_POP, 1, 2);
+    EQ(g_rd(INPUT_REG_REPORT, 2) & 0xffffff, 0x000004);
+    EQ(spi_calls, calls); /* never driven after exit */
     end();
 }
 
@@ -547,5 +750,8 @@ int main(void)
     case_exit();
     case_pre_entry();
     case_status();
+    case_host_only_no_mtp();
+    case_kbd_attach();
+    case_kbd_merge();
     return total_failures ? 1 : 0;
 }

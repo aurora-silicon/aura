@@ -1018,6 +1018,78 @@ static void case_merge(void)
     end();
 }
 
+/*
+ * I1: the internal keyboard and the trackpad as model sources.  The consumer usage is the newest
+ * non-zero source's; trackpad buttons OR with the host's relative buttons and each source's
+ * motion passes through; releasing one source leaves the others; the watchdog is host-only;
+ * internal updates count in INPUT_ST_MTP.
+ */
+static void case_sources(void)
+{
+    begin("sources");
+    enable();
+    struct got g;
+    drain(&g);
+    /* Consumer: host volume up, then the internal keyboard's mute wins, then falls back. */
+    consumer(0xe9);
+    input_model_set_consumer(&M, INPUT_SRC_INTERNAL, 0xe2);
+    drain(&g);
+    EQ(g.n, 2);
+    EQ(g.r[0][1] | g.r[0][2] << 8, 0xe9);
+    EQ(g.r[1][1] | g.r[1][2] << 8, 0xe2);
+    input_model_set_consumer(&M, INPUT_SRC_INTERNAL, 0);
+    drain(&g);
+    EQ(g.n, 1);
+    EQ(g.r[0][1] | g.r[0][2] << 8, 0xe9);
+    consumer(0);
+    drain(&g);
+    EQ(g.n, 1);
+    EQ(g.r[0][1] | g.r[0][2] << 8, 0);
+    input_model_set_consumer(&M, INPUT_SRC_INTERNAL, 0x400); /* out of range: ignored */
+    drain(&g);
+    EQ(g.n, 0);
+    /* Relative: host holds button 1, the trackpad moves and holds button 2. */
+    relf(0x01, 0, 0, 0, 0);
+    input_model_set_relative(&M, INPUT_SRC_TRACKPAD, 0x02, 5, -7, 1, -1);
+    input_model_set_relative(&M, INPUT_SRC_TRACKPAD, 0x02, 0, 0, 0, 0); /* nothing new */
+    input_model_set_relative(&M, INPUT_SRC_TRACKPAD, 0x00, -32768, 0, -128, 0); /* clamped */
+    drain(&g);
+    EQ(g.n, 3);
+    EQ(g.r[0][1], 0x01);
+    EQ(g.r[1][1], 0x03);
+    EQ((s16)(g.r[1][2] | g.r[1][3] << 8), 5);
+    EQ((s16)(g.r[1][4] | g.r[1][5] << 8), -7);
+    EQ((s8)g.r[1][6], 1);
+    EQ((s8)g.r[1][7], -1);
+    EQ(g.r[2][1], 0x01);
+    EQ((s16)(g.r[2][2] | g.r[2][3] << 8), -32767);
+    EQ((s8)g.r[2][6], -127);
+    /* Releasing the internal keyboard leaves the host's keys. */
+    u8 bm[INPUT_KBD_BITMAP] = {0};
+    bm[0x04 / 8] |= 1u << (0x04 % 8);
+    keys(0, 1, 0x05);
+    input_model_set_keyboard(&M, INPUT_SRC_INTERNAL, 0x02, bm);
+    input_model_release(&M, INPUT_SRC_INTERNAL);
+    drain(&g);
+    EQ(g.n, 3);
+    CHECK(key_down(g.r[1], 0x04) && key_down(g.r[1], 0x05) && g.r[1][1] == 0x02);
+    CHECK(!key_down(g.r[2], 0x04) && key_down(g.r[2], 0x05) && g.r[2][1] == 0);
+    /* The watchdog releases the host only: the trackpad's button stays. */
+    input_model_set_relative(&M, INPUT_SRC_TRACKPAD, 0x04, 0, 0, 0, 0);
+    drain(&g);
+    now += 3 * WATCHDOG;
+    input_model_poll(&M, now);
+    drain(&g);
+    CHECK(g.n >= 1);
+    bool found = false;
+    for (int i = 0; i < g.n; i++)
+        if (g.r[i][0] == INPUT_RID_RELATIVE)
+            found = g.r[i][1] == 0x04;
+    CHECK(found);
+    CHECK(stat(INPUT_ST_MTP) >= 7);
+    end();
+}
+
 /* F11/F17: overflow keeps every collection's final state; pointers go first; the latched
  * report never changes under the driver. */
 static void case_overflow(void)
@@ -1486,6 +1558,7 @@ int main(int argc, char **argv)
     case_watchdog();
     case_release_all();
     case_merge();
+    case_sources();
     case_overflow();
     case_overflow_reference();
     case_access_widths();

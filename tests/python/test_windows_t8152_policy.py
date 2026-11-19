@@ -543,6 +543,39 @@ int main(void)
     }
 
     /*
+     * I1: the reserved MTP area above guest RAM in a fresh session (2 MiB aligned, clear of
+     * carve-outs and the AHCI store, denied to stage 2), and the carrier-RAM test the MTP's
+     * dart-sbr root must pass.
+     */
+    puts("INPUT AREA CHECK");
+    assert(hv_t8152_preflight() == 0);
+    {
+        u64 area = WIN_HI - 0x800000UL;
+        assert(hv_t8152_reserve_input_area(area, WIN_HI) < 0);            /* no guest RAM yet */
+        assert(hv_t8152_set_guest_ram(WIN_LO, area - 0x20000000UL - WIN_LO, HOST_TOP) == 0);
+        u64 store = area - 0x20000000UL;
+        assert(hv_t8152_reserve_input_area(area + 0x100000UL, WIN_HI + 0x100000UL) < 0); /* 1 MiB */
+        assert(hv_t8152_reserve_input_area(store - 0x200000UL, store + 0x600000UL) < 0); /* RAM */
+        assert(hv_t8152_reserve_input_area(WIN_HI, WIN_HI + 0x800000UL) < 0);  /* MTE storage */
+        assert(hv_t8152_reserve_input_area(area, area) < 0);                   /* empty */
+        assert(hv_t8152_reserve_store(store, store + 0x10000000UL) == 0);
+        assert(hv_t8152_reserve_input_area(store, store + 0x800000UL) < 0);    /* the store */
+        assert(hv_t8152_reserve_input_area(area, WIN_HI) == 0);
+        assert(hv_t8152_reserve_input_area(area, WIN_HI) < 0);                 /* once */
+        assert(map(area, area | S2_HW, 0x4000) == 0xdead);                     /* denied */
+        assert(map(WIN_HI - 0x4000, (WIN_HI - 0x4000) | S2_HW, 0x4000) == 0xdead);
+        u64 lo = DRAM, hi = DRAM + DRAM_SIZE + 0x4000000UL;
+        u64 root = DRAM + DRAM_SIZE + 0x2000000UL; /* above region-id-4, inside the map */
+        assert(hv_t8152_carrier_ram(root, root + 0x4000, lo, hi));
+        assert(!hv_t8152_carrier_ram(DRAM + DRAM_SIZE, DRAM + DRAM_SIZE + 0x4000, lo, hi));
+        assert(!hv_t8152_carrier_ram(WIN_LO, WIN_LO + 0x4000, lo, hi));       /* guest RAM */
+        assert(!hv_t8152_carrier_ram(area, area + 0x4000, lo, hi));           /* the area */
+        assert(!hv_t8152_carrier_ram(store, store + 0x4000, lo, hi));         /* the store */
+        assert(!hv_t8152_carrier_ram(hi, hi + 0x4000, lo, hi));               /* past the map */
+        assert(!hv_t8152_carrier_ram(root, root, lo, hi));                    /* empty */
+    }
+
+    /*
      * B2, Part C (h): the guest's ACTLR_EL1 goes through ACTLR_EL12 only.  The write of
      * that register is not yet measured on the M6, so restoring the value it already holds
      * must issue no write at all; a different value must be written exactly once.
@@ -639,6 +672,13 @@ def test_t8152_carrier_policy(tmp_path):
     assert "a store is already reserved this session" in store
     assert "AHCI disk store (D1)" in store
     assert "only 11 of 12 CPUs are live in aura's dispatch loop (not live: cpu0)" in live
+    area = result.stdout.split("INPUT AREA CHECK", 1)[1].split("T8152 POLICY OK", 1)[0]
+    assert "input area refused: the policy is not armed or guest RAM is not set" in area
+    assert "must be a 2 MiB aligned range above guest RAM" in area
+    assert "region-id-218" in area
+    assert "overlaps the AHCI store" in area
+    assert "input area [0x100ef800000, 0x100f0000000) reserved and denied to stage 2" in area
+    assert "an area is already reserved this session" in area
 
 
 def test_exec_window_constants_match_ctxr_exec():

@@ -2315,6 +2315,7 @@ void hv_tick(struct exc_info *ctx)
     /*
      * I0: the host feed, right after the vUART poll has taken the CDC events: at most
      * HV_INPUT_RX_BUDGET bytes per tick, then the held-key watchdog.  No-op unless attached.
+     * I1: first the MTP keyboard's service (1 ms floor; the WFI path does the same).
      */
     hv_input_poll();
     hv_fatal_stage(HV_FATAL_STAGE_DONE);

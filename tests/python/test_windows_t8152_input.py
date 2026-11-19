@@ -82,10 +82,11 @@ from aura import windows as w  # noqa: E402
 MODEL_CASES = ["crc", "reset_values", "report_layout", "before_enable", "pop_and_line",
                "enable_reset", "no_duplicate", "garbage_resync", "bad_crc_rescan", "bad_header",
                "stalled_header", "bad_payload", "split_feed", "seq_gaps", "watchdog",
-               "release_all", "merge", "overflow", "overflow_reference", "access_widths",
+               "release_all", "merge", "sources", "overflow", "overflow_reference", "access_widths",
                "out_reports", "spi_gate", "fuzz"]
 GLUE_CASES = ["attach_refusals", "attach_once", "poll_budget", "line_sync", "bad_width",
-              "watchdog", "exit", "pre_entry", "status"]
+              "watchdog", "exit", "pre_entry", "status", "host_only_no_mtp", "kbd_attach",
+              "kbd_merge"]
 
 TYPES_H = r"""
 #pragma once
@@ -212,7 +213,7 @@ def glue_replay(tmp_path_factory):
     for name, text in GLUE_STUBS.items():
         (out / name).write_text(text)
     for name in ("hv_input.c", "hv_input.h", "input_model.c", "input_model.h", "hv_vdev_spi.c",
-                 "hv_vdev_spi.h"):
+                 "hv_vdev_spi.h", "hv_mtp_t8152.h"):
         shutil.copy2(WIN / name, out / name)
     binary = out / "input-glue-host"
     build = subprocess.run([cc, "-std=gnu11", "-O1", "-g", "-Wall", "-Wextra", "-Werror",
@@ -356,7 +357,8 @@ def test_contract_constants_agree():
     status = dict(re.findall(r"HV_INPUT_S_(\w+) = (\d+),", hdr))
     assert {k.lower(): int(v) for k, v in status.items()} == {
         "attached": 16, "ctrl": 17, "depth": 18, "dropped": 19, "leds": 20, "line": 21,
-        "owns_rx": 22}
+        "owns_rx": 22, "mtp_state": 23, "mtp_reason": 24, "mtp_kbd": 25, "mtp_tp": 26,
+        "mtp_rtkit": 27, "mtp_poll": 28, "mtp_errors": 29, "mtp_smc": 30, "mtp_gpio": 31}
     assert w.INPUT_STATUS["dropped_now"] == 19
     query = dict(re.findall(r"HV_INPUT_Q_(\w+) = (\d+),", hdr))
     assert {k.lower(): int(v) for k, v in query.items()} == w.INPUT_Q
@@ -422,7 +424,7 @@ def test_hv_start_and_configure():
     assert "if (flags & HV_WINDOWS_T8152_INPUT)\n        hv_input_enable();" in configure
     assert "hv_input_report();" in function_body(hv_c, "void hv_fb_report(void)")
     make = (REPO / "Makefile").read_text()
-    assert "input_model.o hv_input.o) \\" in make
+    assert "input_model.o hv_input.o \\" in make
 
 
 def test_clean_room_headers():
