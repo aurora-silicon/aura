@@ -161,6 +161,7 @@ KNOWN_ENV = {
     "AURA_TAIL_IDLE",
     "AURA_RETURN_AFTER_NO_ENTER",
     "AURA_J613_RUN",
+    "AURA_J613_TRAFFIC",
     "AURA_J613_PHYSICAL_WAKE",
     "AURA_J613_RECOVERY_SECS",
     "AURA_GPU_STOP_SECS",
@@ -923,6 +924,10 @@ def main():
         allowed = {"AURA_J613_TRACE", "AURA_S2R_TRACE"}
         if j613_go:
             allowed |= {"AURA_S2R_GO", "AURA_S2R_DROP_USB"}
+            # Explicit traffic capture: coprocessor mailboxes and the memory controller hooked
+            # on GO cycles. Wide hooks have stopped a power-down before; opt-in only.
+            if os.environ.get("AURA_J613_TRAFFIC") == "1":
+                allowed |= {"AURA_S2R_COPROC", "AURA_S2R_MEM"}
         if any(env_on(k) for k in CONFIG_FLAGS if k not in allowed):
             raise SystemExit("J613: only the exact trace, stop trace, or explicitly physical-wake GO is qualified")
         if env_on("AURA_J613_TRACE") and env_on("AURA_S2R_TRACE"):
