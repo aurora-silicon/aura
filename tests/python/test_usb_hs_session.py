@@ -37,7 +37,7 @@ PRELUDE = r'''#include <assert.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/types.h>
-typedef uint8_t u8; typedef uint32_t u32; typedef uint64_t u64;
+typedef uint8_t u8; typedef uint16_t u16; typedef uint32_t u32; typedef uint64_t u64;
 #define USB_DWC3_SUPERSPEED 0
 #define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
 #define MAX_ENDPOINTS 6
@@ -51,6 +51,10 @@ typedef uint8_t u8; typedef uint32_t u32; typedef uint64_t u64;
 #define DWC3_DSTS 8
 #define DWC3_DSTS_CONNECTSPD 7
 #define DWC3_DSTS_HIGHSPEED 0
+#define DWC3_DSTS_FULLSPEED2 1
+#define DWC3_DSTS_FULLSPEED1 3
+#define CDC_BULK_PACKET_SIZE 512
+#define CDC_FS_BULK_PACKET_SIZE 64
 #define DWC3_DCFG_DEVADDR_MASK 127
 #define DWC3_DCFG_DEVADDR(x) (x)
 #define DWC3_DALEPENA_EP(x) (1U << (x))
@@ -70,7 +74,7 @@ struct dwc3_trb {uint64_t a, b;};
 typedef struct {size_t read, write;} ringbuffer_t;
 struct endpoint {bool xfer_in_progress, zlp_pending, stalled; int resource_index, trb_count,
                  completed_trbs, transfer_length; unsigned char xfer_buffer[16]; struct dwc3_trb trb[2];};
-typedef struct {unsigned regs; bool failed; int ep0_state; struct endpoint endpoints[MAX_ENDPOINTS];
+typedef struct {unsigned regs; bool failed; int ep0_state; u16 bulk_mps; struct endpoint endpoints[MAX_ENDPOINTS];
                 struct {bool ready; ringbuffer_t *host2device, *device2host; u8 ep_in, ep_out;} pipe[2];} dwc3_dev_t;
 
 /* Controller model. */
@@ -82,7 +86,11 @@ static u32 chip_id = T8122;
 static u64 now_ms;
 static void mask32(unsigned reg, unsigned mask, unsigned value) {(void)mask; if (reg == DWC3_DCFG) address = value;}
 static void write32(unsigned reg, unsigned value) {if (reg == DWC3_DALEPENA) enabled = value;}
-static u32 read32(unsigned reg) {(void)reg; return DWC3_DSTS_HIGHSPEED;}
+static u32 dsts_speed = DWC3_DSTS_HIGHSPEED;
+static u32 read32(unsigned reg) {(void)reg; return dsts_speed;}
+/* Bulk endpoint resizes (DEPCFG modify): count and last packet size. */
+static int resizes; static u32 resized_mps;
+static int usb_dwc3_ep_reconfigure_mps(dwc3_dev_t *d, u8 ep, u32 mps) {(void)d; assert(ep == 4 || ep == 5 || ep == 0); resizes++; resized_mps = mps; return 0;}
 static int usb_dwc3_end_transfer(dwc3_dev_t *d, int ep) {(void)d; assert(address == 0 && enabled == 3); hw_owned[ep] = false; ends++; return 0;}
 static void usb_dwc3_ep_set_stall(dwc3_dev_t *d, int ep, int value) {assert(!value); d->endpoints[ep].stalled = false;}
 static int usb_dwc3_start_setup_phase(dwc3_dev_t *d) {
@@ -113,6 +121,7 @@ static void setup(void) {
     memset(&d, 0, sizeof(d)); memset(hw_owned, 0, sizeof(hw_owned));
     ends = setup_starts = setup_failures = out_arms = in_kicks = events_polled = 0;
     address = 29; enabled = 63; now_ms = 0; close_after = -1; stuck_ms = 0; chip_id = T8122;
+    d.bulk_mps = CDC_BULK_PACKET_SIZE; dsts_speed = DWC3_DSTS_HIGHSPEED; resizes = 0; resized_mps = 0;
     for (int i = 0; i < 2; i++) {
         d.pipe[i].ready = true; d.pipe[i].host2device = &rb[2 * i]; d.pipe[i].device2host = &rb[2 * i + 1];
         rb[2 * i] = (ringbuffer_t){0, 0}; rb[2 * i + 1] = (ringbuffer_t){0, 0};
@@ -174,7 +183,24 @@ int main(void) {
     setup(); assert(usb_dwc3_can_read(&d, 0) == 0 && out_arms == 1);
     d.pipe[0].ready = false; assert(usb_dwc3_can_read(&d, 0) == 0 && out_arms == 1);
 
-    puts("USB HS session: reset, disconnect and closed-pipe loops PASS");
+    /* High speed keeps the 512-byte bulk endpoints untouched. */
+    setup(); idle_with_setup_armed();
+    dev_event(DWC3_DEVT_USBRST); dev_event(DWC3_DEVT_CONNECTDONE);
+    assert(d.bulk_mps == CDC_BULK_PACKET_SIZE && !resizes);
+    /* A full-speed host gets 64-byte bulk endpoints on every pipe; SETUP still re-arms. */
+    for (u32 fs = DWC3_DSTS_FULLSPEED2; fs <= DWC3_DSTS_FULLSPEED1; fs += 2) {
+        setup(); idle_with_setup_armed(); dsts_speed = fs;
+        dev_event(DWC3_DEVT_USBRST); dev_event(DWC3_DEVT_CONNECTDONE);
+        assert(d.bulk_mps == CDC_FS_BULK_PACKET_SIZE && resizes == 2 * CDC_ACM_PIPE_MAX);
+        assert(resized_mps == CDC_FS_BULK_PACKET_SIZE && !setup_failures);
+        assert(setup_completion_seen(&d));
+        /* A later high-speed connect restores 512. */
+        dsts_speed = DWC3_DSTS_HIGHSPEED;
+        dev_event(DWC3_DEVT_USBRST); dev_event(DWC3_DEVT_CONNECTDONE);
+        assert(d.bulk_mps == CDC_BULK_PACKET_SIZE && resized_mps == CDC_BULK_PACKET_SIZE);
+    }
+
+    puts("USB HS session: reset, disconnect, closed-pipe and full-speed loops PASS");
     return 0;
 }
 '''
