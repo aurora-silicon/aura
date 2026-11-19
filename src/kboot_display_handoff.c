@@ -230,7 +230,8 @@ struct dcp_soc {
     const char *name;          /* log prefix */
     u32 chip;                  /* chip_id */
     const char *compat;        /* root compatible of the device trees this entry serves */
-    const char *const *boards; /* root compatibles the handoff is written for, NULL-terminated */
+    const char *const *boards; /* root compatibles the handoff is written for, NULL-terminated;
+                                  NULL: any board whose device tree describes the block */
     const char *boards_desc;
     const char *dcp_compat;
     const char *disp_compat;
@@ -244,7 +245,8 @@ struct dcp_soc {
     bool adt_psreg;     /* the display power state is what /arm-io/dcp's ADT clock-gates name */
     bool fw25;          /* exact J613 25G83 profile */
     bool ext;           /* T6030 dcpextN memory and dispextN DART handoffs */
-    bool board_gate;    /* nothing at all unless chip_id is .chip and the root is one of .boards */
+    bool board_gate;    /* nothing at all unless chip_id is .chip and the root is one of .boards
+                           (any root with .boards NULL) */
     bool any_uuid;      /* no image pinned: the running image's ADT uuid is published */
     bool log_streams;   /* log the DART stream registers, without the ADT description */
     bool sids;          /* the stream IDs and stream count below; otherwise SIDs 5/0/4 of 16 */
@@ -392,21 +394,20 @@ static const struct dcp_soc dcp_soc_t6031 = {
 };
 
 /*
- * T6041 display block of the M4 Pro (T6040, J616s), with the desktop 26.6.2 DCP firmware. The DCP
- * maps through dart-dcp SID 23 and the display and its piodma through dart-disp0 SIDs 0 and 16, of
- * 32 streams each (ADT sid, sid-count, l2-tt-N). The addresses are this ADT's, after the arm-io
+ * T6041 display block of the M4 Pro (T6040), with the desktop 26.6.2 DCP firmware. The DCP maps
+ * through dart-dcp SID 23 and the display and its piodma through dart-disp0 SIDs 0 and 16, of 32
+ * streams each (ADT sid, sid-count, l2-tt-N). The addresses are this ADT's, after the arm-io
  * ranges; segments and the display power state come from the ADT. The DCP image is not pinned:
- * the kernel accepts only the 26.6.2 firmware. No opt-in: nothing happens unless the device tree
- * describes this display block (dcp6_dt_describes()), and the display nodes stay disabled.
+ * the kernel accepts only the 26.6.2 firmware. No opt-in and no board list: every T6040 board
+ * has this display block at these addresses (J616s, J614s, J773s), so the chip, the firmware and a
+ * device tree that describes the block (dcp6_dt_describes()) decide, and the ADT and register
+ * checks below refuse anything that differs. The display nodes stay disabled.
  */
-static const char *const dcp_boards_t6041[] = {"apple,j616s", "apple,j614s", NULL};
-
 static const struct dcp_soc dcp_soc_t6041 = {
     .name = "T6041",
     .chip = T6040,
     .compat = "apple,t6040",
-    .boards = dcp_boards_t6041,
-    .boards_desc = "J616s/J614s",
+    .boards_desc = "T6040",
     .dcp_compat = "apple,t6041-dcp",
     .disp_compat = "apple,display-subsystem",
     .marker = "apple,t6041-handoff",
@@ -430,20 +431,16 @@ static const struct dcp_soc dcp_soc_t6041 = {
 };
 
 /*
- * The same T6041 display block on the M4 Max itself (T6041, J616C and J614C). Their ADTs have the
- * J616s's addresses and streams: dcp at 0x402e00000 through dart-dcp SID 23, disp0 and its piodma
- * through dart-disp0 SIDs 0 and 16, of 32 streams each; the iop-dcp-nub segments come from the ADT
- * as on the J616s. Same 26.6.2 firmware gate and no opt-in.
+ * The same T6041 display block on the M4 Max itself (T6041: J616C, J614C, J575C). Their ADTs have
+ * the J616s's addresses and streams: dcp at 0x402e00000 through dart-dcp SID 23, disp0 and its
+ * piodma through dart-disp0 SIDs 0 and 16, of 32 streams each; the iop-dcp-nub segments come from
+ * the ADT as on the J616s. Same 26.6.2 firmware gate, no opt-in and no board list.
  */
-static const char *const dcp_boards_t6041_max[] = {"apple,j616c", "apple,j614c", "apple,j575c",
-                                                   NULL};
-
 static const struct dcp_soc dcp_soc_t6041_max = {
     .name = "T6041",
     .chip = T6041,
     .compat = "apple,t6041",
-    .boards = dcp_boards_t6041_max,
-    .boards_desc = "J616C/J614C/J575C",
+    .boards_desc = "T6041",
     .dcp_compat = "apple,t6041-dcp",
     .disp_compat = "apple,display-subsystem",
     .marker = "apple,t6041-handoff",
@@ -2143,6 +2140,8 @@ static int dcp6_alias_path(void *dt, const char *name, char *path, size_t len)
 
 static bool dcp6_board_ok(void *dt)
 {
+    if (!dcp6.soc->boards)
+        return true;
     for (const char *const *b = dcp6.soc->boards; *b; b++)
         if (!fdt_node_check_compatible(dt, 0, *b))
             return true;
@@ -2961,15 +2960,20 @@ static const struct t6041_ext t6041_exts[] = {
 };
 
 /*
- * J575c (Mac Studio): no panel. The internal DCP is never handed over: an older Stage 1 starts it,
- * finds nothing connected and puts it to sleep, and a kernel has no panel to drive with it anyway.
- * The external processors are left as iBoot started them, so they are handed over on their own:
- * the first one's ADT __TEXT stands in for the panel's, and its reservation is made here instead
- * of by the internal handoff.
+ * A Mac without a panel (J575c Mac Studio, J773s Mac mini): the ADT marks its display pipe
+ * external (/arm-io/disp0 "external"), as on every desktop; the laptops have no such property. The
+ * internal DCP is never handed over: an older Stage 1 starts it, finds nothing connected and puts
+ * it to sleep, and a kernel has no panel to drive with it anyway. The external processors are left
+ * as iBoot started them, so they are handed over on their own: the first one's ADT __TEXT stands
+ * in for the panel's, and its reservation is made here instead of by the internal handoff.
  */
 static bool t6041_headless(void *dt)
 {
-    return dcp6.soc == &dcp_soc_t6041_max && !fdt_node_check_compatible(dt, 0, "apple,j575c");
+    UNUSED(dt);
+    if (dcp6.soc != &dcp_soc_t6041 && dcp6.soc != &dcp_soc_t6041_max)
+        return false;
+    int disp0 = adt_path_offset(adt, "/arm-io/disp0");
+    return disp0 >= 0 && adt_getprop(adt, disp0, "external", NULL);
 }
 
 static struct dcp6_seg t6041_headless_text;

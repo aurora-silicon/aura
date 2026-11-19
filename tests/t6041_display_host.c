@@ -2,10 +2,12 @@
 /*
  * Host test of the T6041 (M4 Pro J616s) internal display handoff in src/kboot_display_handoff.c.
  *
- * The T6041 handoff has no /chosen opt-in: the chip (T6040), the board (apple,j616s) and the
+ * The T6041 handoff has no /chosen opt-in and no board list: the chip (T6040), the firmware and the
  * device tree (aliases dcp and disp0 naming apple,t6041-dcp and apple,display-subsystem nodes)
- * decide whether it is attempted. This checks that a boot with no chosen property publishes, that
- * an unsupported chip, board or device tree gets nothing at all (no register access, the device
+ * decide whether it is attempted. This checks that a boot with no chosen property publishes, on
+ * any board of the chip, that a Mac without a panel (ADT disp0 "external") hands over only its
+ * external processors and the display subsystem, that an unsupported chip, firmware or device
+ * tree gets nothing at all (no register access, the device
  * tree byte for byte unchanged), and that every failed validation publishes nothing: no marker, no
  * memory-region, no firmware property and no reserved-memory node other than the __OS_LOG one,
  * which is its own transaction and is kept from the OS on every supported boot.
@@ -900,6 +902,29 @@ static void contract_check(const void *dt)
     check(peek32(DART_DCP + 0x200) & 1, "published: dart-dcp locked after every check passed");
 }
 
+/* No panel: the internal DCP is not handed over, the display subsystem and its DART are enabled */
+static void headless_check(const void *dt)
+{
+    int dcp = alias_node(dt, "dcp"), disp = alias_node(dt, "disp0");
+    check(dcp >= 0 && disp >= 0 && !marker_set(dt, dcp) && !marker_set(dt, disp),
+          "headless: no " MARKER " on dcp or display");
+    check(dcp >= 0 && status_is(dt, dcp, "disabled") &&
+              !fdt_getprop(dt, dcp, "apple,firmware-uuid", NULL) &&
+              status_is(dt, fdt_node_offset_by_phandle(dt, PH_DART_DCP), "disabled") &&
+              status_is(dt, fdt_node_offset_by_phandle(dt, PH_MBOX), "disabled"),
+          "headless: the internal dcp, its DART and mailbox stay disabled and unpublished");
+    check(disp >= 0 && status_is(dt, disp, "okay") &&
+              status_is(dt, fdt_node_offset_by_phandle(dt, PH_DART_DISP), "okay"),
+          "headless: the display subsystem and its DART are enabled for the external chains");
+    int fb_idx =
+        disp < 0 ? -1 : fdt_stringlist_search(dt, disp, "memory-region-names", "framebuffer");
+    int fb = fb_idx >= 0 ? region_at(dt, disp, fb_idx) : -1;
+    u64 base = 0, size = 0;
+    check(fb >= 0 && !fdt_node_check_compatible(dt, fb, "framebuffer") &&
+              reg_of(dt, fb, &base, &size) && base == fb_base,
+          "headless: the display's \"framebuffer\" memory-region is the boot framebuffer");
+}
+
 /*
  * Every node and property of @out is in @in with the same value, and the other way round, except
  * for the nodes named in @extra (NULL-terminated), which @out may add.
@@ -985,6 +1010,7 @@ enum kind {
                 byte-identical */
     REFUSE,  /* refused after the gates, __OS_LOG reserved */
     REFUSE_NO_OSLOG,
+    HEADLESS, /* no panel: no internal handoff, external processors and the display subsystem */
 };
 
 struct scenario {
@@ -997,6 +1023,7 @@ static const struct scenario scenarios[] = {
     {"publish", PUBLISH, "a supported boot with no /chosen property publishes"},
     {"external", PUBLISH, "both external firmware memories come from the ADT"},
     {"external-refuse", PUBLISH, "one bad external ADT leaves its placeholders disabled"},
+    {"headless", HEADLESS, "no panel (ADT disp0 external): external processors and display only"},
     {"stale-optin", PUBLISH, "a left-over chosen.asahi,t6041-dcp=1 changes nothing"},
     {"stale-optin-zero", PUBLISH, "a left-over chosen.asahi,t6041-dcp=0 does not disable it"},
     {"repeat", PUBLISH, "a second call adds nothing"},
@@ -1004,7 +1031,7 @@ static const struct scenario scenarios[] = {
     {"os-26-7-train", PUBLISH, "26.7.1 booted by an 18000.161.10 train iBoot publishes the 26.6.2 images"},
     /* chip, board and device tree */
     {"wrong-chip", NOTHING, "chip T6041 with a T6040 device tree"},
-    {"wrong-board", NOTHING, "an unsupported T6040 board"},
+    {"other-board", PUBLISH, "a T6040 board named nowhere in aura publishes as the J616s"},
     {"j614-no-optin", PUBLISH, "J614s publishes without an explicit opt-in"},
     {"j614-optin", PUBLISH, "J614s ignores a stale explicit opt-in"},
     {"j616c", PUBLISH, "a J616C (chip T6041) boot publishes"},
@@ -1089,14 +1116,14 @@ int main(int argc, char **argv)
     bool j616c = !strncmp(s, "j616c", 5), j614c = !strncmp(s, "j614c", 5);
     _Static_assert(sizeof(J616C) == sizeof(J616S), "root compatibles of equal length");
     _Static_assert(sizeof(J614C) == sizeof(J616S), "root compatibles of equal length");
-    const char *board = is(s, "wrong-board")                            ? OTHER
+    const char *board = is(s, "other-board")                            ? OTHER
                         : (is(s, "j614-no-optin") || is(s, "j614-optin")) ? J614S
                         : j616c                                          ? J616C
                         : j614c                                          ? J614C
                                                                          : J616S;
     build_dt(dt, board, sizeof(J616S));
     if (is(s, "external") || is(s, "external-refuse") || is(s, "j616c-external") ||
-        is(s, "j614c-external")) {
+        is(s, "j614c-external") || is(s, "headless")) {
         for (int i = 0; i < 2; i++) {
             build_ext(dt, i);
             world_ext(i);
@@ -1106,6 +1133,12 @@ int main(int argc, char **argv)
     }
 
     /* ADT side */
+    if (is(s, "headless")) {
+        /* A desktop's display pipe; iBoot's dummy boot framebuffer is the DRM aperture */
+        prop_u32("/arm-io/disp0", "external", 1);
+        cur_boot_args.video.stride = 640 * 4;
+        cur_boot_args.video.height = 1136;
+    }
     if (is(s, "wrong-chip") || (j616c && !is(s, "j616c-on-t6040")) ||
         (j614c && !is(s, "j614c-on-t6040")))
         chip_id = T6041;
@@ -1202,7 +1235,7 @@ int main(int argc, char **argv)
     check(exc_count == 0, "no MMIO access faulted");
 
     if (is(s, "external") || is(s, "external-refuse") || is(s, "j616c-external") ||
-        is(s, "j614c-external")) {
+        is(s, "j614c-external") || is(s, "headless")) {
         for (int i = 0; i < 2; i++) {
             char path[40];
             snprintf(path, sizeof(path), "/dcp@%llx", (unsigned long long)(i ? EXT1 : EXT0));
@@ -1293,6 +1326,11 @@ int main(int argc, char **argv)
         case REFUSE:
         case REFUSE_NO_OSLOG:
             refusal_check(in, dt, sc->kind == REFUSE);
+            break;
+        case HEADLESS:
+            headless_check(dt);
+            oslog_check(dt, true);
+            check(mmio_writes == 0, "headless: no MMIO write (dart-dcp not locked)");
             break;
     }
 
