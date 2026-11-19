@@ -2314,9 +2314,12 @@ void sptm_virt_s2r_setup(bool cdc)
                 }
             }
     }
+    /* Run 53: reg[0] (the root port's config space and more) alone filled the table. Take its
+     * first page (the root port's header and port logic), and the first 64 KiB of each other
+     * window (port and PHY control). */
     if (chip_id == T8122 && (sptm_virt_s2r_crumbs & BIT(19)))
-        for (int r = 0; r < 8; r++)
-            s2r_hook_adt("/arm-io/apcie", r, "apcie", 0, 0);
+        for (int r = 0; r < 12; r++)
+            s2r_hook_adt("/arm-io/apcie", r, "apcie", 0, r ? 0x10000 : 0x4000);
 
     s2r_keep_setup();
 
