@@ -268,15 +268,13 @@ int mcc_unmap_carveouts(void)
         int node = adt_path_offset(adt, "/chosen/carveout-memory-map");
 
         /*
-         * No list and no TZ registers: nothing aura can unmap. Every Apple Silicon Mac ADT has
-         * this node (iBoot fills in region-id-2/-4 at boot), so only an older SoC without the
-         * node gets here. Say so instead of failing. A node that is present but has no usable
-         * TZ ranges is a real failure below.
+         * No TZ registers and no ADT list: aura cannot tell where the firmware-owned TZ memory is,
+         * so it cannot keep it out of its own RWX map. Every Apple Silicon Mac ADT carries this
+         * node (iBoot fills in region-id-2/-4 at boot), so its absence is a failure.
          */
         if (node < 0) {
-            printf("MMU: no MCC TZ registers and no ADT carveout-memory-map: TZ carveouts stay "
-                   "mapped\n");
-            return 0;
+            printf("MMU: no MCC TZ registers and no ADT carveout-memory-map\n");
+            return -1;
         }
         if (mem_size_actual > UINT64_MAX - ram_base)
             return -1;
@@ -778,7 +776,12 @@ int mcc_init(void)
     } else if (adt_is_compatible(adt, node, "mcc,t6031")) {
         return mcc_init_m3(node, path);
     } else {
+        /*
+         * An MCC revision aura has no driver for: no cache control and no TZ registers. This is
+         * not a failure of a known block; carveouts then come from the ADT list, which
+         * mcc_unmap_carveouts() requires.
+         */
         printf("MCC: Unsupported version:%s\n", adt_get_property(adt, node, "compatible")->value);
-        return -1;
+        return MCC_UNSUPPORTED;
     }
 }
