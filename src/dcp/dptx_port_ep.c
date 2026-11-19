@@ -19,6 +19,13 @@
 #define TXBUF_LEN 0x4000
 #define RXBUF_LEN 0x4000
 
+/* IOReturn status codes for EPIC service call replies, from the public IOKit
+ * IOReturn.h (sys_iokit | sub_iokit_common | code). */
+#define IORETURN_ERROR        0xe00002bc /* kIOReturnError */
+#define IORETURN_BAD_ARGUMENT 0xe00002c2 /* kIOReturnBadArgument */
+#define IORETURN_UNSUPPORTED  0xe00002c7 /* kIOReturnUnsupported */
+#define IORETURN_NOT_READY    0xe00002d8 /* kIOReturnNotReady */
+
 struct dcpdptx_connection_cmd {
     u32 unk;
     u32 target;
@@ -537,7 +544,7 @@ static u32 dptxport_call_v2(afk_epic_service_t *service, u16 group, u32 command,
                             size_t data_size, void *reply, size_t reply_size)
 {
     if (group && !(group == 1 && command == DPTX_APCALL_SET_DRIVE_SETTINGS))
-        return 0xe00002c7; /* kIOReturnUnsupported */
+        return IORETURN_UNSUPPORTED;
 
     dptx_port_t *port = service->cookie;
     dprintf("DPTXV2: port %d group %u cmd %u size %zu\n", port ? (int)port->unit : -1, group,
@@ -549,25 +556,25 @@ static u32 dptxport_call_v2(afk_epic_service_t *service, u16 group, u32 command,
          command == DPTX_APCALL_SET_DOWN_SPREAD || command == DPTX_APCALL_SET_ACTIVE_LANE_COUNT ||
          command == DPTX_APCALL_SET_DRIVE_SETTINGS || command == DPTX_APCALL_GET_LINK_RATE ||
          command == DPTX_APCALL_GET_ACTIVE_LANE_COUNT))
-        return 0xe00002d8; /* kIOReturnNotReady */
+        return IORETURN_NOT_READY;
     /* Only the hardware-qualified HBR/four-lane configuration is exposed.
      * Training changes still require their own implementation. */
     u64 value;
     switch (command) {
         case DPTX_APCALL_ACTIVATE:
             if (dptx_phy_activate(port->phy))
-                return 0xe00002bc; /* kIOReturnError */
+                return IORETURN_ERROR;
             port->link_rate = port->pending_link_rate = LINK_RATE_HBR;
             return 0;
         case DPTX_APCALL_DEACTIVATE:
             if (dptx_phy_deactivate(port->phy))
-                return 0xe00002bc;
+                return IORETURN_ERROR;
             port->link_rate = port->pending_link_rate = 0;
             return 0;
         case DPTX_APCALL_WILL_CHANGE_LINKG_CONFIG:
         case DPTX_APCALL_DID_CHANGE_LINK_CONFIG:
             return dptx_phy_set_route(port->phy, command == DPTX_APCALL_DID_CHANGE_LINK_CONFIG)
-                       ? 0xe00002bc
+                       ? IORETURN_ERROR
                        : 0;
         case DPTX_APCALL_GET_MAX_LINK_RATE:
             value = port->phy ? dptx_phy_max_link_rate(port->phy) / 270 : LINK_RATE_HBR;
@@ -578,16 +585,16 @@ static u32 dptxport_call_v2(afk_epic_service_t *service, u16 group, u32 command,
         case DPTX_APCALL_SET_LINK_RATE: {
             u8 rate;
             if (!data || data_size < 17)
-                return 0xe00002c2;
+                return IORETURN_BAD_ARGUMENT;
             rate = ((const u8 *)data)[16];
             if (rate * 270 > dptx_phy_max_link_rate(port->phy))
-                return 0xe00002c7;
+                return IORETURN_UNSUPPORTED;
             /* A phy qualified only at HBR keeps that single rate. */
             if (dptx_phy_max_link_rate(port->phy) == 2700 &&
                 (rate != LINK_RATE_HBR || port->link_rate != LINK_RATE_HBR))
-                return 0xe00002c7;
+                return IORETURN_UNSUPPORTED;
             if (dptx_phy_set_link_rate(port->phy, rate * 270))
-                return 0xe00002bc;
+                return IORETURN_ERROR;
             port->link_rate = rate;
             return 0;
         }
@@ -600,15 +607,15 @@ static u32 dptxport_call_v2(afk_epic_service_t *service, u16 group, u32 command,
         case DPTX_APCALL_SET_ACTIVE_LANE_COUNT: {
             u32 count;
             if (!data || data_size < 20)
-                return 0xe00002c2;
+                return IORETURN_BAD_ARGUMENT;
             memcpy(&count, data + 16, sizeof(count));
             printf("DPTXV2: active lane count %u\n", count);
-            return dptx_phy_set_active_lane_count(port->phy, count) ? 0xe00002c2 : 0;
+            return dptx_phy_set_active_lane_count(port->phy, count) ? IORETURN_BAD_ARGUMENT : 0;
         }
         case DPTX_APCALL_GET_MAX_DRIVE_SETTINGS: {
             const dptx_drive_settings_t maximum = {0, 3, 3};
             if (reply_size < 32)
-                return 0xe00002c2;
+                return IORETURN_BAD_ARGUMENT;
             memcpy(reply + 16, &maximum, sizeof(maximum));
             return 0;
         }
@@ -616,25 +623,25 @@ static u32 dptxport_call_v2(afk_epic_service_t *service, u16 group, u32 command,
             u32 count;
             dptx_drive_settings_t settings[4];
             if (group != 1)
-                return 0xe00002c7;
+                return IORETURN_UNSUPPORTED;
             if (!data || data_size < 32)
-                return 0xe00002c2;
+                return IORETURN_BAD_ARGUMENT;
             memcpy(&count, data + 16, sizeof(count));
             if (count > 4 || data_size < 32 + count * sizeof(*settings))
-                return 0xe00002c2;
+                return IORETURN_BAD_ARGUMENT;
             memcpy(settings, data + 32, count * sizeof(*settings));
-            return dptx_phy_set_drive_settings(port->phy, settings, count) ? 0xe00002bc : 0;
+            return dptx_phy_set_drive_settings(port->phy, settings, count) ? IORETURN_ERROR : 0;
         }
         case DPTX_APCALL_SET_DOWN_SPREAD:
             if (!data || data_size < 17)
-                return 0xe00002c2;
+                return IORETURN_BAD_ARGUMENT;
             /* Matching ATC port code records this request for the following
              * rate setup. The qualified setup uses downspread disabled. */
-            return ((const u8 *)data)[16] ? 0xe00002c7 : 0;
+            return ((const u8 *)data)[16] ? IORETURN_UNSUPPORTED : 0;
         case DPTX_APCALL_GET_SUPPORTS_DOWN_SPREAD:
         case DPTX_APCALL_GET_DOWN_SPREAD:
         case DPTX_APCALL_GET_SUPPORTS_LANE_MAPPING:
-        case 26: /* GetVirtualDeviceMode: this is a physical display path. */
+        case DPTX_APCALL_GET_VIRTUAL_DEVICE_MODE: /* A physical display path. */
             value = 0;
             break;
         case DPTX_APCALL_GET_SUPPORTS_HPD:
@@ -648,7 +655,7 @@ static u32 dptxport_call_v2(afk_epic_service_t *service, u16 group, u32 command,
              * with a zeroed retcode; they are not requests we can answer.
              * Other machines keep answering them as unsupported. */
             if (chip_id != T8152)
-                return 0xe00002c7;
+                return IORETURN_UNSUPPORTED;
             dprintf("DPTXPort: firmware reports link fault %u\n", command);
             memcpy(reply, data, min(reply_size, data_size));
             if (reply_size > 4)
@@ -656,17 +663,17 @@ static u32 dptxport_call_v2(afk_epic_service_t *service, u16 group, u32 command,
             return 0;
         case DPTX_APCALL_SET_TILED_DISPLAY_HINTS: {
             if (chip_id != T8152)
-                return 0xe00002c7;
+                return IORETURN_UNSUPPORTED;
             u32 retcode = 1;
             memcpy(reply, data, min(reply_size, data_size));
             memcpy(reply, &retcode, min(reply_size, sizeof(retcode)));
             return 0;
         }
         default:
-            return 0xe00002c7;
+            return IORETURN_UNSUPPORTED;
     }
     if (reply_size < 32)
-        return 0xe00002c2; /* kIOReturnBadArgument */
+        return IORETURN_BAD_ARGUMENT;
     memcpy(reply + 16, &value, sizeof(value));
     return 0;
 }
