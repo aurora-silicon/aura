@@ -1225,7 +1225,7 @@ static const u8 t6050_ans_on[] = {6, 5, 4, 1, 3, 0, 2};
 
 /*
  * T8142 (J704/J813/J815: same gates, ids and parents in their 27.2.1 ADTs), the storage half of
- * AppleT8142PCIe's power-down: ST0_AUS5 then ST0_AUS5_AON (its CLK0REQ-down step), then of its
+ * the traced macOS power-down: ST0_AUS5 then ST0_AUS5_AON (its CLK0REQ-down step), then of its
  * gate loop the ones on ANS's side, APCIE_SYS_ST, APCIE_ST and ANS. Its power-up raises the gates
  * in ADT order, which is the reverse. APCIE_GP, APCIE_SYS_GP and APCIE_PHY_SW stay up for N1 (and
  * J704's second port): macOS leaves PHY_SW on with APCIE_SYS_ST off too.
