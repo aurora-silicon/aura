@@ -14,6 +14,7 @@
 
 #include "j813_n1.h"
 #include "adt.h"
+#include "pcie.h"
 #include "pmgr.h"
 #include "smc.h"
 #include "tunables.h"
@@ -124,7 +125,8 @@ static int j813_n1_link(void)
         printf("j813-n1: SMC N1 reset release failed\n");
         return -1;
     }
-    mdelay(100);
+    /* The N1 is out of its SMC reset: T_PVPERL before PERST# is released below. */
+    mdelay(PCIE_CEM_T_PVPERL_MS);
 
     /* APCIECoreRCGen4Port::_resetPortHardware */
     static const u32 port_reset[][2] = {
@@ -172,8 +174,10 @@ static int j813_n1_link(void)
 
     /* Root port bus numbers, then check the endpoint. */
     write32(ecam + 0x18, 0x00010100);
-    mdelay(100);
-    u32 ident = read32(ecam + 0x100000);
+    mdelay(pcie_adt_perst_to_config_ms(APCIE_PORT));
+    u32 ident;
+    if (pcie_wait_config_ready(ecam + 0x100000, &ident))
+        return -1;
     printf("j813-n1: link up (0x%x), endpoint %04x:%04x\n", read32(port + PORT_LINKSTS),
            ident & 0xffff, ident >> 16);
     return (ident & 0xffff) == 0x106b ? 0 : -1;
