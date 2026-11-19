@@ -236,7 +236,7 @@ void sptm_virt_s2r_note(struct exc_info *ctx, u64 addr, u64 val, bool write, int
     r->pc = ctx ? ctx->elr : 0;
 }
 
-static void s2r_marker(const char *tag, u64 arg)
+static struct s2r_rec *s2r_record_marker(const char *tag, u64 arg)
 {
     struct s2r_rec *r = s2r_slot();
     u64 t = 0;
@@ -248,9 +248,23 @@ static void s2r_marker(const char *tag, u64 arg)
         r->val = arg;
         r->pc = t;
     }
+    return r;
+}
+
+static void s2r_marker(const char *tag, u64 arg)
+{
+    s2r_record_marker(tag, arg);
     if (!sptm_virt_s2r_quiet)
         printf("SPTM-virt[s2r]: marker %.8s 0x%lx (cpu%d, rec %lu)\n", tag, arg, smp_id(),
                sptm_virt_s2r_head);
+}
+
+/* These measurements must survive a powered-off core, including its dirty cache lines. */
+static void s2r_retained_marker(const char *tag, u64 arg)
+{
+    struct s2r_rec *r = s2r_record_marker(tag, arg);
+    if (r)
+        s2r_clean(r, sizeof(*r));
 }
 
 static void s2r_print_rec(u64 i)
@@ -936,10 +950,32 @@ bool sptm_virt_s2r_wfi(u64 *regs, u64 esr)
         __atomic_or_fetch(&s2r_crumb_wfi, BIT(cpu), __ATOMIC_SEQ_CST);
         if (cpu == s2r_timer_cpu)
             s2r_crumb(0x40);
+        /* J613 entry trace, opt-in via crumb bit 12. CPU and counter are in each record. */
+        bool trace = chip_id == T8122 && (sptm_virt_s2r_crumbs & BIT(12));
+        if (trace) {
+            s2r_retained_marker("WFIDS", ds);
+            s2r_retained_marker("WFIPT", mrs(CNTP_CTL_EL02));
+            s2r_retained_marker("WFIVT", mrs(CNTV_CTL_EL02));
+            s2r_retained_marker("WFIVFIQ", SAFE_MRS("s3_5_c15_c1_3"));
+            s2r_retained_marker("WFIPMU", SAFE_MRS("s3_1_c15_c0_0"));
+            s2r_retained_marker("WFIIPI", SAFE_MRS("s3_5_c15_c1_1"));
+            s2r_retained_marker("WFIISR", mrs(ISR_EL1));
+            s2r_retained_marker("WFISPSR", mrs(SPSR_EL2));
+            s2r_retained_marker("WFIHCR", mrs(HCR_EL2));
+            s2r_retained_marker("WFIHPT", mrs(CNTHP_CTL_EL2));
+            s2r_retained_marker("WFIHVT", mrs(CNTHV_CTL_EL2));
+            s2r_retained_marker("WFIENTER", elr);
+            s2r_clean(&sptm_virt_s2r_head, sizeof(sptm_virt_s2r_head));
+        }
         /* The core's power-down; a wake resets it. Bit 3 of the option: never hand a WFI that
          * came back (something pending) to the guest, wait again instead. */
         do {
             sysop("wfi");
+            if (trace) {
+                s2r_retained_marker("WFIRET", elr);
+                s2r_clean(&sptm_virt_s2r_head, sizeof(sptm_virt_s2r_head));
+                trace = false;
+            }
         } while (sptm_virt_s2r_crumbs & 8);
         msr(ELR_EL2, elr + 4);
         return true;
