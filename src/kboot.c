@@ -11282,7 +11282,12 @@ static void dt_set_dcpext_t8152(void)
             printf("FDT: cannot clear the dcpext%u wake handoff\n", n);
             continue;
         }
-        /* An HDMI session aura started is a running one, not one to wake. */
+        /*
+         * An HDMI session aura started is a running one, not one to wake. Its
+         * apple,afk-active-endpoints would describe that session's live
+         * endpoints. Publishing or withdrawing it is the display hand-off's
+         * job (dt_set_display_t8152() runs first), so it is not touched here.
+         */
         if (n == 0 && display_second_attempted()) {
             printf("FDT: dcpext0 was started by aura; no RTKit wake handoff\n");
             continue;
