@@ -2897,6 +2897,16 @@ static bool dcpext6_flag(void *dt, const char *name)
 {
     int chosen = fdt_path_offset(dt, "/chosen"), len = 0;
     const char *opt = chosen < 0 ? NULL : fdt_getprop(dt, chosen, name, &len);
+    if (!opt && chosen >= 0 && !strncmp(name, "aurora,", 7)) {
+        /* LEGACY-ASAHI(2027-02-28): a device tree built before the rename names the flag asahi,<x> */
+        char legacy[64];
+        size_t n = strlen(name + 7);
+        if (n + 7 <= sizeof(legacy)) {
+            memcpy(legacy, "asahi,", 6);
+            memcpy(legacy + 6, name + 7, n + 1);
+            opt = fdt_getprop(dt, chosen, legacy, &len);
+        }
+    }
     return opt && len == 2 && !memcmp(opt, "1", 2);
 }
 
