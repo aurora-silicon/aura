@@ -97,6 +97,7 @@ struct s2r_rec {
      ((u64)((cpu) & 15) << 51) | ((u64) !!(marker) << 55) | ((u64)(((cpu) >> 4) & 3) << 56))
 #define S2R_MARKER BIT(55)
 #define S2R_WRITE  BIT(50)
+#define S2R_J613_SNAPSHOT BIT(13) /* AURA_S2R_CRUMBS */
 
 /* For the host: read over the proxy after a stop, or after a reset that kept DRAM. */
 struct s2r_rec *sptm_virt_s2r_ring;
@@ -272,7 +273,10 @@ static void s2r_print_rec(u64 i)
     struct s2r_rec *r = &sptm_virt_s2r_ring[i % sptm_virt_s2r_nrec];
     unsigned cpu = (r->meta >> 51) & 15;
 
-    if (r->meta & S2R_MARKER)
+    if ((r->meta & S2R_MARKER) && (r->meta & GENMASK(47, 0)))
+        printf("S2R %lu t=%lx c%u MARK %.8s 0x%lx 0x%lx\n", i, r->t, cpu,
+               (const char *)&r->pc, r->meta & GENMASK(47, 0), r->val);
+    else if (r->meta & S2R_MARKER)
         printf("S2R %lu t=%lx c%u MARK %.8s 0x%lx\n", i, r->t, cpu, (const char *)&r->pc, r->val);
     else
         printf("S2R %lu t=%lx c%u %s%u 0x%lx = 0x%lx pc=0x%lx\n", i, r->t, cpu,
@@ -705,14 +709,81 @@ static int s2r_snapshot_read32(u64 addr, u32 *value)
 {
     enum exc_guard_t saved = exc_guard;
     int before = exc_count;
+    u64 daif = mrs(DAIF);
 
     exc_guard = GUARD_MARK | GUARD_SILENT;
     *value = read32(addr);
     /* Let a pending asynchronous SError arrive while the guard is still armed. */
     sysop("dsb sy");
+    sysop("msr daifclr, 4");
+    sysop("isb");
+    msr(DAIF, daif);
     sysop("isb");
     exc_guard = saved;
     return exc_count == before ? 0 : -1;
+}
+
+static bool s2r_j613_snapshot_enabled(void)
+{
+    return chip_id == T8122 && (sptm_virt_s2r_crumbs & S2R_J613_SNAPSHOT);
+}
+
+static void s2r_j613_snapshot_word(const char *tag, u64 addr)
+{
+    u32 val;
+    bool fault = s2r_snapshot_read32(addr, &val) < 0;
+    struct s2r_rec *r = s2r_record_marker(tag, fault ? ~0UL : val);
+    if (r) {
+        r->meta |= addr & GENMASK(47, 0);
+        s2r_clean(r, sizeof(*r));
+    }
+}
+
+/* Read physical state after releasing the debug domains and again at reset, before SPTM. */
+static void s2r_j613_snapshot(const char *tag, bool wake)
+{
+    static const struct {
+        u64 first, last;
+        unsigned stride;
+    } pmgr[] = {
+        {0x2d0700100, 0x2d07004c0, 8},
+        {0x2d0704000, 0x2d0704060, 8},
+        {0x2d0708000, 0x2d0708020, 8},
+        {0x2d0710000, 0x2d0710000, 8},
+    }, common[] = {
+        {0x2e4280000, 0x2e4280100, 8}, /* mini PMGR power words */
+        {0x2e42b0000, 0x2e42b001c, 4}, /* watchdog */
+        {0x2e4004000, 0x2e4004044, 4}, /* wake-source block */
+    };
+    static const u64 regs[] = {
+        0x2d0700c00, 0x2d0724080, 0x2d0724088, 0x2d0724cac, 0x2d0724cd0, 0x2d0724cf0,
+        0x2d0780000, 0x2d0780004, 0x2d0768000, 0x2d0768024, 0x2d0734000, 0x2e42d4000,
+        0x2e42b8008, 0x2e4714040, 0x2e4908040,
+    };
+    static const char *const asc[] = {
+        "/arm-io/pmp", "/arm-io/ans", "/arm-io/sio", "/arm-io/dcp", "/arm-io/gfx-asc", "/arm-io/smc",
+    };
+
+    if (wake)
+        for (unsigned i = 0; i < ARRAY_SIZE(pmgr); i++)
+            for (u64 a = pmgr[i].first; a <= pmgr[i].last; a += pmgr[i].stride)
+                s2r_j613_snapshot_word(tag, a);
+    for (unsigned i = 0; i < ARRAY_SIZE(common); i++)
+        for (u64 a = common[i].first; a <= common[i].last; a += common[i].stride)
+            s2r_j613_snapshot_word(tag, a);
+    for (unsigned i = 0; i < ARRAY_SIZE(regs); i++)
+        s2r_j613_snapshot_word(tag, regs[i]);
+    if (!wake)
+        for (unsigned i = 0; i < ARRAY_SIZE(asc); i++) {
+            int path[8];
+            u64 base;
+            if (adt_path_offset_trace(adt, asc[i], path) < 0 ||
+                adt_get_reg(adt, path, "reg", 0, &base, NULL) < 0)
+                continue;
+            s2r_j613_snapshot_word(tag, base + 0x44);
+            s2r_j613_snapshot_word(tag, base + 0x48);
+        }
+    s2r_clean(&sptm_virt_s2r_head, sizeof(sptm_virt_s2r_head));
 }
 
 /* Bit 10 of AURA_S2R_CRUMBS: a compact, read-only J613 commit-time snapshot. The access trace
@@ -1170,6 +1241,8 @@ static bool s2r_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int w
             s2r_stop_before_timer(ctx, addr, *val);
         }
         s2r_commit();
+        if (s2r_j613_snapshot_enabled())
+            s2r_j613_snapshot("J613PRE", false);
         s2r_crumb(0x20);
     }
 
@@ -2031,6 +2104,11 @@ void sptm_virt_s2r_wake(int cpu)
     if (!commit)
         return;
     u64 now = mrs(CNTPCT_EL0), frq = mrs(CNTFRQ_EL0);
+    if (s2r_j613_snapshot_enabled()) {
+        s2r_wake_head = sptm_virt_s2r_head;
+        s2r_retained_marker("J613RST", now);
+        s2r_j613_snapshot("J613WAKE", true);
+    }
     s2r_commit_t = 0;
     s2r_wake_t = now;
     s2r_wake_commit_t = commit;
@@ -2132,7 +2210,8 @@ void sptm_virt_s2r_wake_trap(u64 esr, u64 elr, bool in_gl)
         return;
     if (!s2r_wake_banner_done &&
         !__atomic_exchange_n(&s2r_wake_banner_done, true, __ATOMIC_SEQ_CST)) {
-        s2r_wake_head = sptm_virt_s2r_head;
+        if (!s2r_j613_snapshot_enabled())
+            s2r_wake_head = sptm_virt_s2r_head;
         u64 frq = mrs(CNTFRQ_EL0), now = mrs(CNTPCT_EL0);
         printf("SPTM-virt[s2r]: WAKE #%u banner: first guest trap on cpu%d, %lu us after the "
                "reset on cpu%d\n",
@@ -2263,7 +2342,8 @@ static void s2r_wakerec_pump(void)
     for (int k = 0; k < 8 && s2r_wakerec_rp < s2r_wakerec_end; k++, s2r_wakerec_rp++) {
         if (dock && dockchannel_uart_tx_free() < 256)
             break;
-        if (!(sptm_virt_s2r_ring[s2r_wakerec_rp % sptm_virt_s2r_nrec].meta & S2R_MARKER))
+        u64 meta = sptm_virt_s2r_ring[s2r_wakerec_rp % sptm_virt_s2r_nrec].meta;
+        if (!(meta & S2R_MARKER) || s2r_j613_snapshot_enabled())
             s2r_print_rec(s2r_wakerec_rp);
     }
     if (s2r_wakerec_rp < s2r_wakerec_end)
