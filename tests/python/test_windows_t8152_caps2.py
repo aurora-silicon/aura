@@ -9,8 +9,10 @@ only, a value that differs, or a resident that does not advertise exactly the me
 """
 import pathlib
 import re
+import sys
 
 REPO = pathlib.Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO / "proxyclient"))
 WIN = REPO / "src/hv/windows"
 
 # What the G5b carrier advertises (G5B-BUILD 2.3.1); every session gate pins it exactly.
