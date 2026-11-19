@@ -8037,7 +8037,7 @@ void hv_exc_fiq(struct exc_info *ctx)
 
     int interruptible_cpu = hv_pinned_cpu;
     if (interruptible_cpu == -1)
-        interruptible_cpu = boot_cpu_idx;
+        interruptible_cpu = hv_tick_owner(); /* the boot CPU unless --windows-tick-cpu moved it */
 
     /*
      * Recover a guest-origin Fast-IPI tag even when its physical IPI latch was
@@ -8220,6 +8220,9 @@ void hv_exc_serr(struct exc_info *ctx)
     hv_get_context(ctx);
     hv_fatal_note_trap(HV_FATAL_TRAP_SERROR, ctx->esr, ctx->elr, ctx->spsr, ctx->far);
     hv_exc_entry();
+    if (chip_id == T8152)
+        printf("HV: fatal: guest SError on cpu %d: host tick on cpu %d, boot CPU %d\n", smp_id(),
+               hv_tick_owner(), boot_cpu_idx);
     /* Before the proxy: the host ends the session on a guest SError and reads nothing else. */
     hv_windows_guest_serror_report(ctx->regs, ctx->sp, ctx->esr, ctx->elr, ctx->spsr, ctx->far,
                                    ctx->afsr1, &prev, mrs(PAR_EL1));

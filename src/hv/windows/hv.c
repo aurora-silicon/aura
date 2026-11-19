@@ -65,6 +65,19 @@ static struct hv_tick_deadline hv_periodic_deadlines[MAX_CPUS];
 int hv_pinned_cpu;
 int hv_want_cpu;
 
+/*
+ * SError A/B (windows-m6/SERROR-INVESTIGATION.md).  Every T8152 SError so far (one at EL2,
+ * three forwarded from the guest) was on the boot CPU, which is also the only CPU that runs
+ * hv_tick() (the converter band, the CDC proxy link, the vUART, the tick's guest walks).
+ * hv_tick_cpu_req moves that work to another CPU while that CPU is in the guest, so the next
+ * SErrors say whether they follow the tick or stay on the boot CPU.  Unlike hv_pin_cpu() it
+ * does not restrict which CPU may enter the proxy (hv_exc_proxy() is unchanged: any CPU's
+ * exception still reaches the host), and hv_start() does not reset it.  -1, the default, is
+ * the boot CPU: the carrier then behaves as before.
+ */
+static int hv_tick_cpu_req = -1;
+static int hv_tick_cpu_last = -1; /* under bhl: the CPU of the last hv_tick() */
+
 static bool hv_has_ecv;
 static bool hv_should_exit[MAX_CPUS];
 bool hv_started_cpus[MAX_CPUS];
@@ -1592,6 +1605,13 @@ static int hv_start_session(void *entry, u64 regs[4])
     hv_input_guest_entered();
     /* The EL2 fatal report (hv_fatal.h) speaks only while a T8152 guest is entered. */
     hv_fatal_armed = chip_id == T8152;
+    hv_tick_cpu_last = -1;
+    if (hv_tick_cpu_req >= 0 && hv_tick_cpu_req != boot_cpu_idx)
+        printf("HV: host tick: CPU %d while it is in the guest, the boot CPU %d until then and "
+               "whenever it is not\n",
+               hv_tick_cpu_req, boot_cpu_idx);
+    else
+        printf("HV: host tick: the boot CPU %d\n", boot_cpu_idx);
     printf("HV: Entering guest at %p (x0=0x%lx)\n", entry, regs[0]);
     hv_enter_guest(regs[0], regs[1], regs[2], regs[3], entry);
 
@@ -1999,6 +2019,42 @@ void hv_pin_cpu(int cpu)
     hv_pinned_cpu = cpu;
 }
 
+int hv_windows_set_tick_cpu(s64 cpu)
+{
+    if (hv_windows_entered) {
+        printf("HV: host tick CPU: refused, the guest session has already started\n");
+        return -1;
+    }
+    if (cpu == -1) {
+        hv_tick_cpu_req = -1;
+        return 0;
+    }
+    if (cpu < 0 || cpu >= MAX_CPUS || boot_cpu_idx == -1 ||
+        (cpu != boot_cpu_idx && !smp_is_alive(cpu))) {
+        printf("HV: host tick CPU: refused, CPU %ld is not a live CPU\n", (long)cpu);
+        return -1;
+    }
+    hv_tick_cpu_req = (int)cpu;
+    printf("HV: host tick CPU %d requested (boot CPU %d)\n", hv_tick_cpu_req, boot_cpu_idx);
+    return 0;
+}
+
+/*
+ * The CPU that runs hv_tick() now: the requested one while it is in the guest, else the boot
+ * CPU (before the guest OS starts it, after a PSCI CPU_OFF, and by default).  Read on every FIQ;
+ * the handover is self-correcting because each CPU re-arms its own timer by what this returns
+ * (hv_exc_fiq(): tick rate on the owner, the secondary interval elsewhere).
+ */
+int hv_tick_owner(void)
+{
+    int cpu = __atomic_load_n(&hv_tick_cpu_req, __ATOMIC_RELAXED);
+
+    if (cpu < 0 || cpu >= MAX_CPUS || cpu == boot_cpu_idx ||
+        !__atomic_load_n(&hv_started_cpus[cpu], __ATOMIC_ACQUIRE))
+        return boot_cpu_idx;
+    return cpu;
+}
+
 void hv_write_hcr(u64 val)
 {
     val = hv_t8152_hcr_filter(val);
@@ -2263,6 +2319,12 @@ void hv_tick(struct exc_info *ctx)
      * apart next time.  A no-op on other chips.
      */
     hv_wdt_pet();
+    if (smp_id() != hv_tick_cpu_last) {
+        /* SError A/B: the arm is in the log, with the time of each handover. */
+        printf("HV: host tick now on CPU %d (requested %d, boot CPU %d)\n", smp_id(),
+               hv_tick_cpu_req, boot_cpu_idx);
+        hv_tick_cpu_last = smp_id();
+    }
     hv_windows_serial_flush();
     hv_fatal_stage(HV_FATAL_STAGE_FB);
     /*

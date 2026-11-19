@@ -207,6 +207,9 @@ void hv_exit_cpu(int cpu);
 void hv_rendezvous(void);
 bool hv_switch_cpu(int cpu);
 void hv_pin_cpu(int cpu);
+/* SError A/B: the host tick's CPU (hv.c).  set: before entry; owner: the CPU that ticks now. */
+int hv_windows_set_tick_cpu(s64 cpu);
+int hv_tick_owner(void);
 u64 hv_host_counter(void);
 void hv_arm_tick(bool secondary);
 void hv_arm_wfi_wake(void);

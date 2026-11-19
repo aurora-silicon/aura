@@ -815,6 +815,7 @@ class AuraProxy(Reloadable):
     P_HV_WINDOWS_USB = 0xc87
     P_HV_WINDOWS_GPU = 0xc88
     P_HV_WINDOWS_INPUT = 0xc89
+    P_HV_WINDOWS_TICK_CPU = 0xc8a
 
     P_FB_INIT = 0xd00
     P_FB_SHUTDOWN = 0xd01
@@ -1387,6 +1388,12 @@ class AuraProxy(Reloadable):
         return self.request(self.P_HV_WINDOWS_GPU, op, a1, a2, signed=op in (1, 2))
     def hv_windows_input(self, op, a1=0, a2=0, a3=0):
         return self.request(self.P_HV_WINDOWS_INPUT, op, a1, a2, a3, signed=op == 1)
+
+    def hv_windows_tick_cpu(self, cpu):
+        """SError A/B: the CPU that runs the host tick while it is in the guest (the boot CPU
+        before that and by default).  Before hv.start() only; 0 or -1 (refused: the resident's
+        console says why).  An older resident answers Bad Command."""
+        return self.request(self.P_HV_WINDOWS_TICK_CPU, cpu, signed=True)
 
     def fb_init(self):
         return self.request(self.P_FB_INIT)

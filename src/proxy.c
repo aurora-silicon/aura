@@ -743,6 +743,17 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
             reply->retval = -1;
 #endif
             break;
+        case P_HV_WINDOWS_TICK_CPU:
+            /*
+             * SError A/B (windows-m6/SERROR-INVESTIGATION.md): the CPU that runs hv_tick() once
+             * it is in the guest; -1 = the boot CPU (the default).  Before entry only.
+             */
+#ifdef AURA_WINDOWS
+            reply->retval = hv_windows_set_tick_cpu(request->args[0]);
+#else
+            reply->retval = -1;
+#endif
+            break;
         case P_HV_WINDOWS_N1_ACQUIRE:
         case P_HV_WINDOWS_N1_PREPARE:
 #ifdef AURA_WINDOWS

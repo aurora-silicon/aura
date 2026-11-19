@@ -170,6 +170,12 @@ parser.add_argument('--windows-serror', choices=('abort', 'continue'), default='
                          'the guest frame and resumes the guest, at most 8 times per session, '
                          'to collect more reports. The SError is consumed; the access that '
                          'raised it is lost, so a continued session is diagnostic only.')
+parser.add_argument('--windows-tick-cpu', type=int, default=None, metavar='CPU',
+                    help='T8152 SError A/B: run the carrier\'s host tick (the framebuffer band, '
+                         'the proxy link, the vUART, the tick\'s guest walks) on this CPU while '
+                         'it is in the guest; the boot CPU keeps it before the guest OS starts '
+                         'that CPU and whenever it is off. Default: the boot CPU, as before. '
+                         'Needs a carrier with P_HV_WINDOWS_TICK_CPU.')
 parser.add_argument('payload', type=pathlib.Path)
 parser.add_argument('boot_args', default=[], nargs="*")
 args = parser.parse_args()
@@ -453,12 +459,18 @@ def windows_t8152_fatal_summary(hv):
     """After an aborted session: the carrier's own fatal report (its guest SError report among
     them) is in the console output above; repeat the lines that say what happened, so they
     stand next to the disk verdict that follows."""
-    if hv.windows_abort_reason is not None:
+    event = hv.windows_abort_reason
+    guest_exc = event is not None and int(event.get("reason", -1)) == 2
+    if guest_exc:
         print(f"T8152: the guest session was aborted on a forwarded exception: "
-              f"{hv.windows_abort_reason} (reason 2 = guest exception; code 3 = SError)")
+              f"{event} (reason 2 = guest exception; code 3 = SError)")
+    elif event is not None:
+        # d5g: a plain ^C (reason 3 = START_HV, from the host tick) was reported as an abort.
+        print(f"T8152: the guest session was ended from the host: {event} (reason 3 = the "
+              f"carrier's host event, e.g. Ctrl-C; not a guest exception)")
     lines = hv.windows_fatal_summary()
     if not lines:
-        if hv.windows_abort_reason is not None:
+        if guest_exc:
             print("T8152: the carrier printed no fatal report this session")
         return
     print(f"T8152: the carrier's fatal report ({len(hv.windows_fatal_lines)} lines above), "
@@ -935,6 +947,16 @@ def run_windows_t8152(caps):
     if args.symbols or args.debug_xnu or args.volume or args.emulate_sprr or args.cpus or \
             args.strip_node or args.shell or args.script or args.command:
         sys.exit("T8152 Windows guests take only -r, -E, -a, -l and boot arguments")
+    if args.windows_serror == 'continue' and (
+            args.windows_ahci_nvme_access == 'rw' or
+            args.windows_gpu not in ('off', 'disabled')):
+        # A continued SError loses the access that raised it: never on a persistent disk or
+        # with the GPU admitted.
+        sys.exit("T8152 launch refused: --windows-serror continue is for the RAM store with the "
+                 "GPU off (not --windows-ahci-nvme-access rw, not --windows-gpu "
+                 f"{args.windows_gpu}). The aura proxy keeps running; no guest was started.")
+    if args.windows_tick_cpu is not None and not 0 <= args.windows_tick_cpu < 12:
+        sys.exit("T8152 launch refused: --windows-tick-cpu takes a CPU number 0-11")
     if not args.windows_guest_ram or ":" not in args.windows_guest_ram:
         sys.exit("T8152 needs --windows-guest-ram BASE:TOP (see docs/windows-t8152.md)")
     base, top = (number(v, "guest RAM") for v in args.windows_guest_ram.split(":", 1))
@@ -964,6 +986,18 @@ def run_windows_t8152(caps):
     input_sources = windows_t8152_input_plan(payload, u)
     print(f"T8152: guest RAM [{base:#x}, {top:#x}) passes the host check; NVRAM, QSPI and the "
           f"audio/AOP/ADMAC/i2c nodes are hidden, and the resident re-checks everything")
+
+    if args.windows_tick_cpu is not None:
+        # Before the HV is initialised: a refusal here leaves the carrier as it was.
+        try:
+            ret = p.hv_windows_tick_cpu(args.windows_tick_cpu)
+        except ProxyRemoteError:
+            ret = None
+        if ret != 0:
+            sys.exit(f"T8152 launch refused: the carrier did not take --windows-tick-cpu "
+                     f"{args.windows_tick_cpu} ({'no P_HV_WINDOWS_TICK_CPU' if ret is None else ret}"
+                     "). The aura proxy keeps running; no guest was started.")
+        print(f"T8152: host tick on CPU {args.windows_tick_cpu} while it is in the guest")
 
     hv = HV(iface, p, u, windows=True)
     hv.windows_framebuffer = "bgra-shadow"
