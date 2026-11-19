@@ -64,7 +64,11 @@ u64 sptm_virt_gpu_keep = GPU_RING_KEEP;
 #define SPTM_VIRT_GPU_RING_MIB 64 /* a steady stream of kicks fills 16 MiB in seconds */
 #endif
 #ifndef SPTM_VIRT_GPU_PMP
+#ifdef SPTM_VIRT_GPU_HOP_PAGES
+#define SPTM_VIRT_GPU_PMP 0 /* the hop pages alone */
+#else
 #define SPTM_VIRT_GPU_PMP 1
+#endif
 #endif
 /* Park this long after the first GPU access; 0 = never. */
 u32 sptm_virt_gpu_stop_secs = SPTM_VIRT_GPU_STOP_SECS;
@@ -78,6 +82,7 @@ u32 sptm_virt_gpu_pmp = SPTM_VIRT_GPU_PMP; /* also hook the PMP's dashboard and 
 
 static struct {
     u64 base, size;
+    u64 origin; /* offsets print relative to the start of the ADT reg */
     const char *what;
 } gpu_ranges[GPU_MAX_RANGES];
 static int gpu_nranges;
@@ -109,7 +114,7 @@ static const char *gpu_range_name(u64 addr, u64 *off)
 {
     for (int i = 0; i < gpu_nranges; i++)
         if (addr >= gpu_ranges[i].base && addr < gpu_ranges[i].base + gpu_ranges[i].size) {
-            *off = addr - gpu_ranges[i].base;
+            *off = addr - gpu_ranges[i].origin;
             return gpu_ranges[i].what;
         }
     *off = addr;
@@ -281,13 +286,14 @@ static bool gpu_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int w
     return true;
 }
 
-static void gpu_hook_range(const char *what, u64 base, u64 size)
+static void gpu_hook_range(const char *what, u64 origin, u64 base, u64 size)
 {
     if (gpu_nranges >= GPU_MAX_RANGES || !size)
         return;
     base &= ~0x3fffUL;
     size = ALIGN_UP(size, 0x4000);
     gpu_ranges[gpu_nranges].base = base;
+    gpu_ranges[gpu_nranges].origin = origin & ~0x3fffUL;
     gpu_ranges[gpu_nranges].size = size;
     gpu_ranges[gpu_nranges].what = what;
     gpu_nranges++;
@@ -308,7 +314,7 @@ static void gpu_hook_adt(const char *path, int idx, const char *what, u64 off, u
     }
     if (!strcmp(what, "sgx"))
         gpu_sgx = pa;
-    gpu_hook_range(what, pa + off, size ? size : sz);
+    gpu_hook_range(what, pa, pa + off, size ? size : sz);
 }
 
 void sptm_virt_gpu_setup(void)
@@ -339,11 +345,25 @@ void sptm_virt_gpu_setup(void)
         sptm_virt_gpu_keep = 0;
     sptm_virt_gpu_head = 0;
 
+#ifdef SPTM_VIRT_GPU_HOP_PAGES
+    /*
+     * T6050: only the pages the GPU driver uses once the GPU runs: the host port, two status
+     * pages, the core gating control, the GPU's PMGR and both ASC mailboxes. Hooking the whole
+     * window also traps SPTM's own setup of the DARTs in it, and XNU can then take an LLC decode
+     * error at boot.
+     */
+    static const u64 sgx_pages[] = {0x4000, 0x20000, 0xd04000, 0xd10000, 0xe80000};
+    for (unsigned int i = 0; i < ARRAY_SIZE(sgx_pages); i++)
+        gpu_hook_adt("/arm-io/sgx", 0, "sgx", sgx_pages[i], 0x4000);
+    gpu_hook_adt("/arm-io/gfx-asc", 0, "gfx-asc", 0x8000, 0x4000);
+    gpu_hook_adt("/arm-io/gfx1-asc", 0, "gfx1-asc", 0x8000, 0x4000);
+#else
     /* sgx reg 0 holds the GPU's PMGR (+0xe80000), its start control and both ASCs. */
     gpu_hook_adt("/arm-io/sgx", 0, "sgx", 0, 0);
     /* Both GPU coprocessors' ASC windows: the mailboxes the driver and firmware talk over. */
     gpu_hook_adt("/arm-io/gfx-asc", 0, "gfx-asc", 0, 0);
     gpu_hook_adt("/arm-io/gfx1-asc", 0, "gfx1-asc", 0, 0);
+#endif
     /* The PMP dashboard (PTD records, update words) and the PMP's mailbox. */
     if (sptm_virt_gpu_pmp) {
         gpu_hook_adt("/arm-io/mcc", 8, "pmp-ptd", 0, 0);

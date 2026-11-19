@@ -26,6 +26,8 @@ knobs (`src/sptm_virt_gpu.c`) along with the trace mask: for example
 parks in the proxy `<s>` seconds after the first GPU access, and the host then
 reads the ring over the debug link. `SPTM_VIRT_GPU_STOP_BOOT_SECS`, `_STOP_MSG`,
 `_RING_MIB` and `_PMP` are the build's versions of the other `AURA_GPU_*` settings.
+`-DSPTM_VIRT_GPU_HOP_PAGES` hooks only the GPU pages its driver uses at run time
+(and not the PMP); hooking the whole GPU window can fault XNU's boot.
 
 ## Bundle
 
