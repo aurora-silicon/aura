@@ -423,9 +423,24 @@ static bool smp_point_rvbar_here(void)
             continue;
         if (i != boot_cpu_idx && !smp_is_alive(i))
             continue;
-        if ((read64(cpu->impl_reg) & RVBAR_ADDR_UNLOCKED) != target)
-            write64(cpu->impl_reg, target);
         u64 rvbar = read64(cpu->impl_reg);
+        /*
+         * A core's own lock bit is set even where iBoot leaves the rest unlocked (a running
+         * boot core, as smp_start_secondaries() already allows). A store to a locked RVBAR
+         * takes an SError (T8122), so never write one: accept it only if it already resets
+         * into this image.
+         */
+        if (rvbar & RVBAR_LOCK) {
+            if (smp_rvbar_reaches_here(rvbar & RVBAR_ADDR_UNLOCKED))
+                continue;
+            snprintf(smp_s2r_why_buf, sizeof(smp_s2r_why_buf),
+                     "CPU %d RVBAR is locked at 0x%lx", i, rvbar & RVBAR_ADDR_UNLOCKED);
+            printf("SMP: %s\n", smp_s2r_why_buf);
+            return false;
+        }
+        if ((rvbar & RVBAR_ADDR_UNLOCKED) != target)
+            write64(cpu->impl_reg, target);
+        rvbar = read64(cpu->impl_reg);
         if ((rvbar & RVBAR_ADDR_UNLOCKED) != target) {
             snprintf(smp_s2r_why_buf, sizeof(smp_s2r_why_buf),
                      "CPU %d RVBAR reads 0x%lx after writing 0x%lx", i, rvbar, target);
