@@ -9187,10 +9187,19 @@ static int dt_set_aop_firmware(void)
         return 0;
     }
 
-    if (dt_reserve_asc_segments("/arm-io/aop", NULL, path, true, 0, true))
-        printf("FDT: %s: reserving the AOP firmware segments failed\n", path);
-    else
-        printf("FDT: %s: AOP firmware segments reserved\n", path);
+    /*
+     * The OS starts the AOP from these segments through its DART. Unreserved (or only some of
+     * them), they are free RAM to the OS, and the AOP would run code from pages it reuses:
+     * disable the AOP instead, as on T8132.
+     */
+    if (dt_reserve_asc_segments("/arm-io/aop", NULL, path, true, 0, true)) {
+        printf("FDT: %s: reserving the AOP firmware segments failed, disabling the AOP\n", path);
+        node = fdt_path_offset(dt, path);
+        if (node < 0 || fdt_setprop_string(dt, node, "status", "disabled"))
+            bail("FDT: %s: cannot disable the AOP\n", path);
+        return 0;
+    }
+    printf("FDT: %s: AOP firmware segments reserved\n", path);
 
     return 0;
 }
