@@ -872,10 +872,11 @@ static void dt_copy_atc_tunables(void *dt, const char *adt_path, const char *dt_
     if (adt_node < 0)
         return;
 
-    if (chip_id == T8132 &&
-        (!fdt_node_check_compatible(dt, 0, "apple,j713") ||
-         !fdt_node_check_compatible(dt, 0, "apple,j604")) &&
-        !fdt_node_check_compatible(dt, fdt_node, "apple,t8132-atcphy") &&
+    /*
+     * Any T8132 PHY, whatever the board: a PHY whose ADT node has the whole USB3 bundle gets
+     * it, one that lacks a group keeps its USB2 fallback.
+     */
+    if (!fdt_node_check_compatible(dt, fdt_node, "apple,t8132-atcphy") &&
         adt_is_compatible_at(adt, adt_node, "atc-phy,t8132", 0)) {
         dt_copy_t8132_usb3_tunables(dt, adt_node, fdt_node);
         return;
