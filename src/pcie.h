@@ -43,6 +43,15 @@ u32 pcie_adt_perst_to_config_ms(const char *bridge);
  * vendor/device word. -1, and a log line, if it never does. */
 int pcie_wait_config_ready(u64 cfg, u32 *id);
 
+/* The MMIO pad register of the ADT bridge's function-perst GPIO on /arm-io/gpio0 */
+int pcie_adt_perst_gpio(const char *bridge, u64 *addr);
+/*
+ * Refclk running to PERST# deasserted: the ADT bridge's t-refclk-to-perst (us; 100 on every apcie
+ * bridge, the CEM T_PERST-CLK minimum), but never less than 1 ms, the time every Aura bring-up has
+ * used since its first trace. Nothing shorter has been tried.
+ */
+#define APCIE_REFCLK_TO_PERST_MIN_US 1000
+
 /* Disable optional radio PCIe admission after rail/controller/DART failure. */
 int pcie_disable_j713_fdt(void *dt);
 /* Post-M4: copy the APCIe tables from the ADT to the DT's PCIe host and its port. */
