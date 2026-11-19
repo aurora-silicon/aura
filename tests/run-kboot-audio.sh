@@ -189,4 +189,27 @@ for s in $(python3 -I tests/kboot_audio_adt.py scenarios); do
     n=$((n + 1))
 done
 [ "$n" -gt 0 ] || fail "no scenarios ran"
+
+# A tree too full for the whole group: whatever free space the update runs out at, every amp must
+# end up with the whole group's configuration or with none of it, never a mix.
+none() { amp 40 - - - -; amp 42 - - - -; amp 41 - - - -; }
+expect group > "$tmp/full.want"
+none > "$tmp/none.want"
+full=0 empty=0
+for spare in $(seq 0 16 2048); do
+    KBOOT_AUDIO_DT_SPARE=$spare KBOOT_AUDIO_GPIO=$(gpio_env group) "$tmp/kboot-audio-host" \
+        "$tmp/group.adt" "$tmp/group.dtb" > "$tmp/spare.out" 2>&1 || true
+    grep -E '^amp ' "$tmp/spare.out" > "$tmp/spare.got" || true
+    if cmp -s "$tmp/spare.got" "$tmp/full.want"; then
+        full=$((full + 1))
+    elif cmp -s "$tmp/spare.got" "$tmp/none.want"; then
+        empty=$((empty + 1))
+    else
+        cat "$tmp/spare.out"
+        fail "dt-full: $spare bytes free left a partial group configuration"
+    fi
+done
+[ "$full" -gt 0 ] && [ "$empty" -gt 0 ] || fail "dt-full: sweep did not cover both outcomes ($full full, $empty none)"
+echo "ok dt-full: $full whole, $empty none, no partial group"
+n=$((n + 1))
 echo "kboot audio: $n scenarios pass"
