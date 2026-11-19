@@ -4548,8 +4548,19 @@ int dt_set_gpu(void *dt)
 
     size_t data_a_size, data_b_size, globals_size;
     if (rust_gpu_initdata_size(compat->num[0], compat->num[1], &data_a_size, &data_b_size,
-                               &globals_size) == -1)
-        return -1;
+                               &globals_size) == -1) {
+        /*
+         * No init data layout for this GPU and firmware (for example G13 on a 27.2 stub). The
+         * kernel can't start the GPU without one, but everything else can still boot: leave the
+         * GPU off instead of refusing the whole device tree.
+         */
+        printf("FDT: GPU: no init data for firmware %u.%u, booting with the GPU disabled\n",
+               compat->num[0], compat->num[1]);
+        gpu = fdt_path_offset(dt, "gpu");
+        if (gpu >= 0 && fdt_setprop_string(dt, gpu, "status", "disabled"))
+            return -1;
+        return 0;
+    }
 
     void *data_a = (void *)top_of_memory_alloc(ALIGN_UP(data_a_size, SZ_16K));
     void *data_b = (void *)top_of_memory_alloc(ALIGN_UP(data_b_size, SZ_16K));
