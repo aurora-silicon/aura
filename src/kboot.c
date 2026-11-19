@@ -9013,30 +9013,46 @@ static int dt_reserve_t8132_aop_windows(const char *path)
     return 0;
 }
 
+/* dt_display_transaction has an integer-only callback; the handoff is single-threaded. */
+static const char *t8132_aop_path;
+
 /*
- * J713 and J604: iBoot leaves the AOP halted, its DART's DAPF empty, its
+ * Every FDT edit of the AOP handoff, then the one hardware write, last: the DAPF is programmed
+ * only once the segments and windows are reserved, and dapf_init_t8132_halted() puts every
+ * slice back if its own read-back fails. Run as a transaction, so a failure at any step leaves
+ * neither the tree nor the DAPF half done.
+ */
+static int dt_set_t8132_aop_one(unsigned int unused)
+{
+    UNUSED(unused);
+    if (dt_reserve_asc_segments("/arm-io/aop/iop-aop-nub", NULL, t8132_aop_path, true, 0, true))
+        bail("FDT: %s: AOP firmware segments are not reserved\n", t8132_aop_path);
+    if (dt_reserve_t8132_aop_windows(t8132_aop_path))
+        bail("FDT: %s: AOP DAPF windows are not reserved\n", t8132_aop_path);
+    if (dapf_init_t8132_halted("/arm-io/dart-aop", 1))
+        bail("FDT: %s: AOP DAPF is not programmed\n", t8132_aop_path);
+    return 0;
+}
+
+/*
+ * T8132: iBoot leaves the AOP halted, its DART's DAPF empty, its
  * external code (__ETEXT) in DRAM at a fixed address and its log (__OS_LOG) at
- * a new one every boot. When the OS asks for the AOP's handoff, program the
- * DAPF, then reserve both segments at the IOVAs the firmware uses (their remap
- * addresses: EC0p for __ETEXT, the physical address for __OS_LOG) and the
- * DAPF windows. Without all of it the firmware cannot run, so on any failure
- * the AOP is disabled.
+ * a new one every boot. When the OS asks for the AOP's handoff, reserve both
+ * segments at the IOVAs the firmware uses (their remap addresses: EC0p for
+ * __ETEXT, the physical address for __OS_LOG) and the DAPF windows, then
+ * program the DAPF. Without all of it the firmware cannot run, so on any
+ * failure the AOP is disabled. Nothing here depends on the board. A tree that
+ * does not ask for the handoff is left as it is.
  */
 static int dt_set_t8132_aop(const char *path)
 {
     const char *why;
     int node;
 
-    if (fdt_node_check_compatible(dt, 0, "apple,j713") &&
-        fdt_node_check_compatible(dt, 0, "apple,j604"))
-        return 0; /* No other M4 board's AOP handoff is qualified. */
-
     int chosen = fdt_path_offset(dt, "/chosen");
     if (chosen < 0 ||
-        fdt_stringlist_search(dt, chosen, "linux-enablement-mac,dapf-handoff", "/arm-io/aop") < 0) {
-        why = "its handoff was not requested";
-        goto disable;
-    }
+        fdt_stringlist_search(dt, chosen, "linux-enablement-mac,dapf-handoff", "/arm-io/aop") < 0)
+        return 0;
 
     asc_dev_t *asc = asc_init("/arm-io/aop");
     if (!asc) {
@@ -9050,16 +9066,11 @@ static int dt_set_t8132_aop(const char *path)
         goto disable;
     }
 
-    if (dapf_init_t8132_halted("/arm-io/dart-aop", 1)) {
-        why = "its DAPF is not programmed";
-        goto disable;
-    }
-    if (dt_reserve_asc_segments("/arm-io/aop/iop-aop-nub", NULL, path, true, 0, true)) {
-        why = "its firmware segments are not reserved";
-        goto disable;
-    }
-    if (dt_reserve_t8132_aop_windows(path)) {
-        why = "its DAPF windows are not reserved";
+    t8132_aop_path = path;
+    int ret = dt_display_transaction(dt_set_t8132_aop_one, 0);
+    t8132_aop_path = NULL;
+    if (ret) {
+        why = "its handoff is incomplete";
         goto disable;
     }
 
