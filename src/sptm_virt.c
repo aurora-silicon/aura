@@ -345,6 +345,12 @@ __attribute__((used, retain)) int sptm_virt_ans_cold(u64 flags)
     return nvme_cold_handoff(flags & 1, flags & 2);
 }
 
+/* What the host decides the ANS handoff from (nvme_cold_state()): bit 0 on, bit 1 SART entries. */
+__attribute__((used, retain)) int sptm_virt_ans_state(void)
+{
+    return nvme_cold_state();
+}
+
 __attribute__((used, retain)) int sptm_virt_load(u64 sptm_entry, u64 handoff)
 {
     struct sptm_virt_layout l;

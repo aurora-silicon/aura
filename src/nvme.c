@@ -1365,6 +1365,54 @@ static int nvme_cold_reset(int die, asc_dev_t *asc, sart_dev_t *sart, const u64 
     return ret;
 }
 
+/* Post-M4, ANS's own gate is off: an earlier stage powered it off (nvme_ans_power_off()). */
+static bool nvme_cold_ans_off(int die)
+{
+    return nvme_post_m4() && pmgr_power_is_requested(die, "ANS") == 0;
+}
+
+/*
+ * For the host, before it builds the guest: bit 0, ANS is on (or isn't a post-M4 one that can be
+ * off); bit 1, an earlier stage's SART entries were passed on (nvme.sart=).
+ */
+int nvme_cold_state(void)
+{
+    int node = adt_path_offset(adt, "/arm-io/ans"), die = 0;
+    u32 cg;
+
+    if (node >= 0 && ADT_GETPROP(adt, node, "clock-gates", &cg) >= 0)
+        die = FIELD_GET(PMGR_DIE_ID, cg);
+    return (nvme_cold_ans_off(die) ? 0 : 1) | (nvme_sart_saved_cnt ? 2 : 0);
+}
+
+/*
+ * A post-M4 ANS that an earlier stage powered off, as Stage 1 1.0.0b13 does on T8132 once it has
+ * read the ESP, lost its SART with its power, iBoot's entries with the stage's own. They survive
+ * only where that stage passed them on (nvme.sart=). Power ANS back on, its CPU stopped, and put
+ * them back: nvme_cold_handoff() then takes it as a stopped ANS, and clears the stage's own
+ * entries before XNU registers the rest as the bootloader's.
+ */
+static int nvme_cold_power_on(int die)
+{
+    if (!nvme_cold_ans_off(die))
+        return 0;
+    if (!nvme_sart_saved_cnt) {
+        printf("nvme: cold handoff: ANS is off and no stage passed its SART entries on\n");
+        return -1;
+    }
+    if (pcie_ans_power_on()) {
+        printf("nvme: cold handoff: ANS is off and didn't power on\n");
+        return -1;
+    }
+    sart_dev_t *sart = sart_init("/arm-io/sart-ans");
+    bool ok = sart && sart_set_entries(sart, nvme_sart_saved, nvme_sart_saved_cnt);
+    if (sart)
+        sart_release(sart);
+    printf("nvme: cold handoff: ANS was off: powered on, %d SART entries %s\n", nvme_sart_saved_cnt,
+           ok ? "put back" : "NOT put back");
+    return ok ? 0 : -1;
+}
+
 /*
  * For an OS that starts ANS itself, as XNU does from an iop-ans-nub without "quiesced": end the
  * session an earlier stage left (iBoot's, or one an aura stage negotiated and kept), with the
@@ -1392,6 +1440,8 @@ int nvme_cold_handoff(bool idle, bool no_probe)
     }
     if (ADT_GETPROP(adt, node, "clock-gates", &cg) >= 0)
         die = FIELD_GET(PMGR_DIE_ID, cg);
+    if (nvme_cold_power_on(die))
+        return -1;
 
     int adt_path[8];
     u64 base = 0;

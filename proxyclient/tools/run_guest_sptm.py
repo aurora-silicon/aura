@@ -77,6 +77,11 @@ Environment (all optional; 1 enables a switch):
   AURA_SYSREG_CENSUS       print which sysregs the guarded world traps on, every 20 s
   AURA_S2R_LIVE            print the guest's writes to the hooked power blocks as they happen
   AURA_CPTR_LIVE=0         keep SPTM's CPTR_EL2 writes a shadow (default: XNU's CPACR_EL1)
+  AURA_ANS_COLD=<mode>     ANS for XNU to start cold: sleep, idle or off (default: sleep on
+                           T8140 and for an ANS an earlier stage powered off, else off)
+  AURA_ANS_PROBE=0         skip the cold handoff's HELLO check
+  AURA_ANS_SART=<v>        the nvme.sart= value tools/ans_sart.py printed on the stage that
+                           powered ANS off (route: the host chainloads this image from its proxy)
   XNU_BOOTARGS             XNU's command line
 
 Example:
@@ -170,6 +175,10 @@ KNOWN_ENV = {
     "AURA_CPTR_LIVE",
     "AURA_SYSREG_CENSUS",
     "AURA_S2R_LIVE",
+    "AURA_ANS_COLD",
+    "AURA_ANS_PROBE",
+    "AURA_ANS_DROP",
+    "AURA_ANS_SART",
 } | set(CONFIG_FLAGS)
 
 # The debug link's USB-C port: XNU must never drive it (it resets the port about 3 s into IOKit
@@ -887,10 +896,31 @@ def main():
     # ANS, and XNU starts it cold. AURA_ANS_COLD=idle (IDLE instead of SLEEP) is a diagnostic,
     # =off keeps the old handoff; AURA_ANS_PROBE=0 skips the HELLO check before XNU.
     # Measured on T8140 only: elsewhere it's opt-in, and XNU wakes iBoot's quiesced session.
+    # A post-M4 ANS that an earlier stage powered off (Stage 1 1.0.0b13 on T8132, after it read
+    # the ESP) has no session to wake and has lost its SART: XNU can only start it cold, and the
+    # handoff powers it on again with the SART entries that stage passed on. Chainloaded by that
+    # stage, this image has them (nvme.sart=); chainloaded by the host from that stage's proxy, the
+    # host passes them (AURA_ANS_SART, from tools/ans_sart.py before the chainload).
+    if os.environ.get("AURA_ANS_SART"):
+        val = os.environ["AURA_ANS_SART"].removeprefix("nvme.sart=").encode()
+        buf = u.malloc(len(val) + 1)
+        iface.writemem(buf, val + b"\0")
+        if not p.call(sym["nvme_set_sart_var"], buf):
+            raise SystemExit("AURA_ANS_SART: not an nvme.sart= value")
+    ans_state = p.call(sym["sptm_virt_ans_state"])
+    ans_off = not ans_state & 1
+    print(f"ANS {'powered off' if ans_off else 'on'}, "
+          f"{'SART entries passed on' if ans_state & 2 else 'no SART entries passed on'}")
     t8140 = u.adt["/chosen"].chip_id == 0x8140
-    ans_cold = os.environ.get("AURA_ANS_COLD", "sleep" if t8140 else "off")
+    ans_cold = os.environ.get("AURA_ANS_COLD", "sleep" if t8140 or ans_off else "off")
     if ans_cold not in ("sleep", "idle", "off"):
         raise SystemExit(f"AURA_ANS_COLD={ans_cold}: sleep, idle or off")
+    if ans_off and ans_cold == "off":
+        raise SystemExit("ANS is powered off: XNU can only start it cold (AURA_ANS_COLD=sleep)")
+    if ans_off and not ans_state & 2:
+        raise SystemExit("ANS is powered off and its SART entries weren't passed on: run "
+                         "tools/ans_sart.py --start on the stage that powered it off, before the "
+                         "chainload, and pass what it prints as AURA_ANS_SART")
     if ans_cold != "off":
         # An unanswered RTKit or controller step takes seconds, more than a read's timeout.
         to, iface.dev.timeout = iface.dev.timeout, 30

@@ -13,6 +13,8 @@ extern bool nvme_keep_running_for_linux;
 extern bool nvme_quiesce_for_next;
 bool nvme_shutdown(void);
 int nvme_cold_handoff(bool idle, bool no_probe);
+/* bit 0: ANS is on; bit 1: an earlier stage passed its SART entries on (SPTM_VIRT) */
+int nvme_cold_state(void);
 /* Post-M4: how a stage that powered ANS off tells the next one to start it again. */
 bool nvme_post_m4(void);
 bool nvme_post_m4_passed_off(void);

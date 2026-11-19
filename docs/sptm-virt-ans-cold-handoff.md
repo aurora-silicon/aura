@@ -15,7 +15,7 @@ Measured on the MacBook Neo (J700), macOS 26 (25G83), on both routes:
 Both reached the desktop.
 
 `AURA_ANS_COLD` selects the mode:
-- `sleep`, the default on T8140;
+- `sleep`, the default on T8140 and for an ANS an earlier stage powered off (below);
 - `idle`, a diagnostic;
 - `off`, the old handoff and the default elsewhere.
 
@@ -45,3 +45,21 @@ Both reached the desktop.
 
 Before XNU, the handoff starts ANS once and waits for its HELLO, then stops and resets it again.
 Without a HELLO it fails, and the host stops before XNU rather than letting XNU panic 20 s in.
+
+## An ANS an earlier stage powered off (post-M4)
+
+From 1.0.0b13, a post-M4 stage that read NVMe powers ANS off when it is done
+(`nvme_ans_power_off()`). On T8132 Stage 1 does that after its ESP read, also when the file it
+looked for is missing and it falls back to its proxy. Then there is no session for XNU to wake,
+and the SART lost its entries with the power, iBoot's included. They survive only in that stage,
+which passes them on as `nvme.sart=` to an image it chainloads itself. Not tested on hardware yet.
+
+- `run_guest_sptm.py` reads the state first (`sptm_virt_ans_state()`). With ANS off, the cold
+  handoff is the default, `AURA_ANS_COLD=off` is refused, and so is a boot without the entries.
+- The handoff powers ANS on again with its CPU stopped (`pcie_ans_power_on()`, as the next stage
+  of a Linux boot does), puts the entries back, and goes on as for a stopped ANS. It clears the
+  stage's own entries, resets ANS and probes the HELLO.
+- An image the host chainloads from that stage's proxy has no entries. Before the chainload,
+  `proxyclient/tools/ans_sart.py --start` has the stage start ANS again, reads its SART and prints
+  the `nvme.sart=` value; `AURA_ANS_SART` passes it on. That start is the stage's own start from
+  off. If it fails, the stage refuses to chainload anything (its NVMe needs a reboot).
