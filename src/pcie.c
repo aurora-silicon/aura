@@ -1119,7 +1119,7 @@ int pcie_wait_config_ready(u64 cfg, u32 *id)
         if (vendor != 0xffff && vendor != 0x0001)
             return 0;
         if (timeout_expired(timeout)) {
-            printf("pcie: function at 0x%lx not ready after %u ms (0x%08x)\n", cfg,
+            printf("pcie: function at 0x%lx not ready after %u ms (0x%08x)\n", (unsigned long)cfg,
                    PCIE_RESET_READY_MS, *id);
             return -1;
         }
