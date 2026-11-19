@@ -1498,6 +1498,11 @@ bool smp_cpu_valid(int cpu)
     return cpu >= 0 && cpu < MAX_CPUS && cpu_info[cpu].valid;
 }
 
+u64 smp_cpu_rvbar_reg(int cpu)
+{
+    return smp_cpu_valid(cpu) ? cpu_info[cpu].impl_reg : 0;
+}
+
 /* The memory a core's reset path writes with the MMU off: invalidate any line a previous
  * (cacheable) life of this core left in the cluster cache before it turns its MMU on. */
 void smp_reset_stack_range(int cpu, u64 *base, u64 *size)

@@ -29,6 +29,7 @@ int smp_start_secondaries(void);
 int smp_prepare_guest_resets(void);
 int smp_index_for_mpidr(u64 mpidr);
 bool smp_cpu_valid(int cpu);
+u64 smp_cpu_rvbar_reg(int cpu);
 void smp_reset_stack_range(int cpu, u64 *base, u64 *size);
 int smp_stop_secondaries(bool deep_sleep);
 

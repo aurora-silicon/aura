@@ -43,6 +43,7 @@
 #include "types.h"
 #include "uartproxy.h"
 #include "tps6598x.h"
+#include "tinf/tinf.h"
 #include "usb.h"
 #include "wdt.h"
 #include "usb_cdc_atc.h"
@@ -745,6 +746,22 @@ static void s2r_j613_snapshot_word(const char *tag, u64 addr)
     }
 }
 
+/* Aura owns this buffer. Vary the pattern on each commit and publish it to DRAM. */
+static u32 s2r_j613_dram[256] __attribute__((aligned(64)));
+
+static void s2r_j613_retention(bool wake)
+{
+    if (!wake) {
+        u32 seed = mrs(CNTPCT_EL0);
+        for (unsigned i = 0; i < ARRAY_SIZE(s2r_j613_dram); i++)
+            s2r_j613_dram[i] = seed + i * 0x9e3779b9U;
+        s2r_clean(s2r_j613_dram, sizeof(s2r_j613_dram));
+        s2r_retained_marker("DRAMPA", (u64)s2r_j613_dram);
+    }
+    s2r_retained_marker(wake ? "DRAMPOST" : "DRAMPRE",
+                        tinf_crc32(s2r_j613_dram, sizeof(s2r_j613_dram)));
+}
+
 /* Read physical state after releasing the debug domains and again at reset, before SPTM. */
 static void s2r_j613_snapshot(const char *tag, bool wake)
 {
@@ -770,6 +787,12 @@ static void s2r_j613_snapshot(const char *tag, bool wake)
         "/arm-io/pmp", "/arm-io/ans", "/arm-io/sio", "/arm-io/dcp", "/arm-io/gfx-asc", "/arm-io/smc",
     };
 
+    u64 rvbar_reg = smp_cpu_rvbar_reg(smp_id());
+    if (rvbar_reg) {
+        s2r_j613_snapshot_word("RVBARLO", rvbar_reg);
+        s2r_j613_snapshot_word("RVBARHI", rvbar_reg + 4);
+    }
+    s2r_j613_retention(wake);
     if (wake)
         for (unsigned i = 0; i < ARRAY_SIZE(pmgr); i++)
             for (u64 a = pmgr[i].first; a <= pmgr[i].last; a += pmgr[i].stride)
