@@ -9129,6 +9129,11 @@ static void dt_set_aop_motion_cal(const char *path)
  * firmware.
  */
 /*
+ * The M1 (T8103) AOP firmware from macOS 27 on does the same: its __ETEXT, __EDATA and __OS_LOG
+ * segments are in DRAM, and it faults before its RTKit HELLO if the OS hasn't mapped them. The
+ * 13.5 firmware runs from SRAM alone and has none, so nothing changes for it (DRAM segments only).
+ */
+/*
  * M1 Pro (T6000) and M2 (T8112): iBoot starts the AOP firmware itself and the
  * OS needs no firmware segments, but the accelerometer and gyroscope services
  * wait for the same calibration as on the M4 Pro. The ADT carries it in the
@@ -9160,11 +9165,16 @@ static int dt_set_aop_firmware(void)
     if (chip_id == T6000 || chip_id == T8112)
         return dt_set_aop_motion_cal_only();
 
-    if (chip_id != T6040 && chip_id != T6041 && chip_id != T8132)
+    if (chip_id != T6040 && chip_id != T6041 && chip_id != T8132 && chip_id != T8103)
         return 0;
 
-    int node = fdt_node_offset_by_compatible(
-        dt, -1, chip_id == T8132 ? "apple,t8132-aop" : "apple,t6041-aop");
+    const char *compat = "apple,t6041-aop";
+    if (chip_id == T8132)
+        compat = "apple,t8132-aop";
+    else if (chip_id == T8103)
+        compat = "apple,t8103-aop";
+
+    int node = fdt_node_offset_by_compatible(dt, -1, compat);
     if (node < 0)
         return 0;
 
@@ -9178,7 +9188,8 @@ static int dt_set_aop_firmware(void)
         return 0;
     }
 
-    dt_set_aop_motion_cal(path);
+    if (chip_id != T8103)
+        dt_set_aop_motion_cal(path);
 
     if (chip_id == T8132)
         return dt_set_t8132_aop(path);
