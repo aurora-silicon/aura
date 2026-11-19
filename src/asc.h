@@ -21,6 +21,7 @@ bool asc_is_v8(asc_dev_t *asc);
 void asc_cpu_start(asc_dev_t *asc);
 void asc_cpu_stop(asc_dev_t *asc);
 bool asc_cpu_running(asc_dev_t *asc);
+bool asc_cpu_stopped(asc_dev_t *asc);
 bool asc_cpu_idle(asc_dev_t *asc);
 void asc_i2a_enable(asc_dev_t *asc, bool on);
 u32 asc_cpu_status(asc_dev_t *asc);

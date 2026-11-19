@@ -158,6 +158,12 @@ bool asc_cpu_running(asc_dev_t *asc)
     return read32(asc->cpu_base + ASC_CPU_CONTROL) & ASC_CPU_CONTROL_START;
 }
 
+/* The coprocessor's CPU has halted (in its idle loop, or after asc_cpu_stop()). */
+bool asc_cpu_stopped(asc_dev_t *asc)
+{
+    return read32(asc->cpu_base + ASC_CPU_STATUS) & ASC_CPU_STATUS_STOPPED;
+}
+
 /* The mailbox's receive side (I2A) on or off, as macOS sets it around an IOP's power loss. */
 void asc_i2a_enable(asc_dev_t *asc, bool on)
 {
