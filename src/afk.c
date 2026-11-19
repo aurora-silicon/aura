@@ -1070,7 +1070,6 @@ int afk_epic_start_interface(afk_epic_ep_t *epic, void *intf, int expected, size
         if (ret < 0)
             return ret;
 
-
         if (msg->type != TYPE_NOTIFY && msg->type != TYPE_REPLY) {
             dprintf("AFK[ep:%02x]: got unexpected message type %d during iface start\n", epic->ep,
                     msg->type);
