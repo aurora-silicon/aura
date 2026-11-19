@@ -44,14 +44,14 @@ aura make` or `docker-compose run aura make`.
 ## Boot and host tools
 
 See [the J700 installation guide](docs/j700-install.md) for Stage 1 and ESP
-Stage 2 setup. Host tools are in `proxyclient`. The inherited Python package
-name `aura`, USB identifiers, payload markers and device-tree properties
-remain compatible with existing tools and kernels. New device rules provide
-`/dev/aura` and `/dev/aura-sec`, with the original aliases retained.
+Stage 2 setup. Host tools are in `proxyclient`, in the Python package `aura`.
+USB identifiers, payload markers and device-tree properties remain compatible
+with existing tools and kernels. The udev rules in `udev/` provide `/dev/aura`
+and `/dev/aura-sec`.
 
 The raw format supports concatenated kernel, device-tree and initramfs
-payloads, including gzip and xz compression. Mach-O boot-object support
-from Aurora's x1n1 development will be reviewed separately.
+payloads, including gzip and xz compression. The Mach-O boot object is
+described in [docs/macho-boot-object.md](docs/macho-boot-object.md).
 
 The built-in boot logo is Aurora at 48, 128, and 256 pixels. A fork or
 distribution can link its own logo instead: make its assets with
@@ -135,7 +135,8 @@ retained by the protected [`aurora-m1n1-v1` tag](https://github.com/aurora-silic
 The fork's [AURORA.md](https://github.com/aurora-silicon/fatfs/blob/aurora-m1n1-v1/AURORA.md)
 describes the changes from upstream.
 
-Aura embeds other Rust crates. Licenses can be found in their vendor directories.
+Aura embeds other Rust crates (rust/Cargo.toml). Their licenses ship with each
+crate's source.
 
 J700 Stage 1 configuration, ESP Stage 2 setup and installation are documented in
 [docs/j700-install.md](docs/j700-install.md). Release packages include this guide
