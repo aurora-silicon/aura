@@ -1640,7 +1640,7 @@ static void s2r_hook_adt(const char *path, int idx, const char *what, u64 off, u
         printf("SPTM-virt[s2r]: no %s reg[%d]; %s not traced\n", path, idx, what);
         return;
     }
-    s2r_hook_range(what, pa + off, size ? min(size, sz > off ? sz - off : size) : sz);
+    s2r_hook_range(what, pa + off, size ? size : sz);
 }
 
 static void s2r_hook_blk(const struct s2r_blk *blk, const char *what, u64 off, u64 size)
