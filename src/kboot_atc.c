@@ -872,10 +872,13 @@ static void dt_copy_atc_tunables(void *dt, const char *adt_path, const char *dt_
     if (adt_node < 0)
         return;
 
-    if (chip_id == T8132 &&
-        (!fdt_node_check_compatible(dt, 0, "apple,j713") ||
-         !fdt_node_check_compatible(dt, 0, "apple,j604")) &&
-        !fdt_node_check_compatible(dt, fdt_node, "apple,t8132-atcphy") &&
+    /*
+     * Every T8132 board (J604, J623/J624, J713/J715, J773g) describes its ports with
+     * apple,t8132-atcphy nodes, and the bundle comes from the port's own ADT node. A port
+     * whose ADT lacks a required group keeps USB2, and Linux only uses the bundle on a
+     * node that also maps the SuperSpeed banks, so the board does not matter here.
+     */
+    if (!fdt_node_check_compatible(dt, fdt_node, "apple,t8132-atcphy") &&
         adt_is_compatible_at(adt, adt_node, "atc-phy,t8132", 0)) {
         dt_copy_t8132_usb3_tunables(dt, adt_node, fdt_node);
         return;
