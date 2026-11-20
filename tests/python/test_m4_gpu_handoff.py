@@ -8,6 +8,13 @@ def test_m4_gpu_resource_admission(tmp_path):
     repo = Path(__file__).resolve().parents[2]
     production = (repo / 'src/kboot_gpu_m4.c').read_text()
     production = '\n'.join(line for line in production.splitlines() if not line.startswith('#include'))
+    # The firmware segments come from the helper the T6040/T6041 fills share (kboot_gpu.c).
+    header = (repo / 'src/kboot.h').read_text()
+    layout = header[header.index('struct gpu_fw_layout {'):]
+    layout = layout[:layout.index('};\n') + 3]
+    gpu = (repo / 'src/kboot_gpu.c').read_text()
+    helper = gpu[gpu.index('int gpu_fw_layout('):]
+    helper = helper[:helper.index('\n}\n') + 3]
     harness = r'''
 #include <assert.h>
 #include <stdbool.h>
@@ -19,7 +26,7 @@ typedef uint64_t u64;
 typedef uint32_t u32;
 #define T8132 0x8132
 #define SZ_16K 0x4000
-enum { V26_6, V26_6_2 };
+enum { V26_6, V26_6_2, V27_2 };
 static struct { int version; } os_firmware;
 struct adt_segment_ranges { u64 phys, iova, remap; u32 size, unk; };
 static void *adt;
@@ -28,8 +35,9 @@ static int fault;
 static struct adt_segment_ranges segs[2];
 static u64 bases[4], sizes[4];
 static u32 irqs[4];
+static int adt_path_offset(void *a, const char *p) { return strstr(p, "gfx-asc") ? 2 : 1; }
 static int adt_path_offset_trace(void *a, const char *p, int *trace)
-{ trace[0] = strstr(p, "gfx-asc") ? 2 : 1; return trace[0]; }
+{ trace[0] = adt_path_offset(a, p); return trace[0]; }
 static int adt_get_reg(void *a, int *trace, const char *name, unsigned i, u64 *base, u64 *size)
 {
     *base = trace[0] == 1 ? 0x300000000 : 0x302600000;
@@ -40,6 +48,8 @@ static int adt_get_reg(void *a, int *trace, const char *name, unsigned i, u64 *b
 static const void *adt_getprop(void *a, int n, const char *p, u32 *len)
 {
     const char *names[] = {"gpu-region", "gfx-shared-region", "gfx-handoff", "gfx-shared-l2-region"};
+    u32 unused;
+    if (!len) len = &unused;
     if (!strcmp(p, "interrupts")) { *len = sizeof(irqs); return irqs; }
     if (!strcmp(p, "segment-names")) { *len = sizeof("__TEXT;__DATA"); return "__TEXT;__DATA"; }
     if (!strcmp(p, "segment-ranges")) { *len = sizeof(segs); return segs; }
@@ -52,7 +62,16 @@ static const void *adt_getprop(void *a, int n, const char *p, u32 *len)
     }
     *len = 0; return NULL;
 }
-''' + production + r'''
+static int adt_getprop_copy(void *a, int n, const char *p, void *out, size_t size)
+{
+    u32 len;
+    const void *value = adt_getprop(a, n, p, &len);
+    if (!value || len != size) return -1;
+    memcpy(out, value, size);
+    return len;
+}
+#define ADT_GETPROP(a, n, name, ptr) adt_getprop_copy(a, n, name, (ptr), sizeof(*(ptr)))
+''' + layout + helper + production + r'''
 int main(void)
 {
     char blob[32768];
