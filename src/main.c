@@ -416,9 +416,16 @@ void aura_main(void)
     /*
      * A known MCC that fails to initialize is fatal on every chip; an unknown revision
      * (MCC_UNSUPPORTED) or a SoC with no MCC in the ADT (MCC_ABSENT) is not.
+     * Except T8132, for now: the J773g's ADT stores amcc_aperture_count in 4 bytes, mcc_init_m4()
+     * reads it as 8 and fails, and every stage that ran there did so without MCC (as before this
+     * became fatal). Reading the count right would run the MCC setup on T8132 for the first time,
+     * which wants its own hardware test.
      */
-    if (mcc_init() < 0)
-        panic("MCC initialization failed\n");
+    if (mcc_init() < 0) {
+        if (chip_id != T8132)
+            panic("MCC initialization failed\n");
+        printf("MCC: initialization failed; T8132 goes on without it, as before\n");
+    }
     mmu_init();
     aic_init();
     smp_init();
