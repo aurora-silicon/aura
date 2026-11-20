@@ -841,6 +841,7 @@ static void s2r_j613_snapshot(const char *tag, bool wake, bool retention)
     };
     static const char *const asc[] = {
         "/arm-io/pmp", "/arm-io/ans", "/arm-io/sio", "/arm-io/dcp", "/arm-io/gfx-asc", "/arm-io/smc",
+        "/arm-io/aop", "/arm-io/mtp", "/arm-io/dcpext",
     };
 
     u64 rvbar_reg = smp_cpu_rvbar_reg(smp_id());
@@ -871,7 +872,7 @@ static void s2r_j613_snapshot(const char *tag, bool wake, bool retention)
             if (adt_path_offset_trace(adt, asc[i], path) < 0 ||
                 adt_get_reg(adt, path, "reg", 0, &base, NULL) < 0)
                 continue;
-            s2r_j613_group(live, 8 + i); /* 0x88 PMP .. 0x8d SMC */
+            s2r_j613_group(live, 8 + i); /* 0x88 PMP .. 0x8d SMC, 0x8e AOP, 0x8f MTP, 0x90 dcpext */
             s2r_j613_snapshot_word(tag, base + 0x44);
             s2r_j613_snapshot_word(tag, base + 0x48);
         }
