@@ -63,16 +63,43 @@ powered-off ANS.
 - **XNU** under the hypervisor (`run_guest_sptm.py`): cold handoff by default on every SoC that
   follows the contract. The runner drops `quiesced` from the guest's `iop-ans-nub`. `AURA_ANS_COLD=off`
   keeps XNU's warm wake of an untouched iBoot session.
-- **U-Boot** (the one aura embeds) adopts only a running session: it needs the run bit and
-  BOOT_STATUS OK. It can't start from STOPPED or from off. So for every payload, the stage starts
-  ANS itself and hands it on running, as `boot=` already did for Linux.
-- **Linux** started from the bootloader directly (the proxy's kboot) gets STOPPED. By its code,
-  apple-nvme starts an ANS whose run bit is clear on every post-M4 compatible:
-  - it sets RUN and runs a fresh RTKit boot, relying on the bootloader's reset;
-  - on T8132 it resets ANS again itself.
+- **U-Boot** (the one aura embeds, `drivers/nvme/nvme_apple.c`) adopts only a running session.
+  - It needs the run bit and BOOT_STATUS OK. Without them its probe fails, and later probes give
+    up.
+  - It can start neither from STOPPED nor from off. A migration branch starts from off only when
+    `apple,sart-entries` is present.
+  - It doesn't bind the T8142 or T6050 compatibles at all.
 
-  This is untested on hardware. Before, that route got ANS off plus `apple,sart-entries`, which
-  Linux never reads.
+  So for every payload, the stage starts ANS itself (`nvme_post_m4_needs_start()`) and hands it on
+  running, as `boot=` already did for Linux.
+- **Linux** started by the bootloader directly (the proxy's kboot) gets STOPPED. By its code
+  (`drivers/nvme/host/apple.c`), apple-nvme starts an ANS whose run bit is clear on every post-M4
+  compatible.
+  - It sets RUN and runs a fresh RTKit boot. It doesn't need BOOT_STATUS beforehand.
+  - On T8140, T8142, T6041 and T6050 it relies on the bootloader's reset; a stop without one (its
+    own QUIESCED, SLEEP, run bit cleared) times out on the next boot. T8132 resets ANS again
+    itself.
+  - It turns the mailbox receive side on only for the T8140 mailbox.
+  - It must not get `apple,rtkit-handoff` for a stopped ANS (probe fails with -EIO), and aura
+    doesn't set it.
+
+  None of this is tested on hardware. Before, that route got ANS off plus `apple,sart-entries`,
+  which Linux never reads.
+
+## Where it lives
+
+- `src/nvme.c`:
+  - `nvme_ans_to_stopped()` brings ANS from any state to STOPPED in `nvme_init()`, through
+    `nvme_session_stop()`, `nvme_ans_power_on_legacy()` and `nvme_ans_reset()`.
+  - `nvme_ans_stop_own()` is the end of `nvme_shutdown()`.
+  - `nvme_handoff_var()` and `nvme_set_ans_var()` pass the state on.
+  - `nvme_cold_handoff()` is the hypervisor's version.
+- `src/pcie.c`:
+  - `pcie_ans_power_on()` brings ANS back on its storage side only.
+  - `pcie_ans_power_off()` refuses on chips without a storage gate table.
+- `src/pmgr.c`:
+  - `pmgr_adt_power_enable_under()` powers on the gates under ANS.
+  - `pmgr_reset_held()` is now in every build.
 
 ## Ways this can fail (written before the code)
 
