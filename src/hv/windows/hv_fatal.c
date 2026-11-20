@@ -267,6 +267,45 @@ const char *hv_fatal_serror_relation(const struct hv_fatal_trap *prev, u64 elr, 
            "work in that exit with PSTATE.A masked, or a guest access just before the exit)";
 }
 
+const char *hv_fatal_exit_device_free(u64 esr)
+{
+    /* EC 0x18, trapped MSR/MRS: ISS Op0 [21:20], Op2 [19:17], Op1 [16:14], CRn [13:10],
+     * CRm [4:1], Direction [0] (1 = read). */
+    if (((esr >> 26) & 0x3f) != 0x18)
+        return NULL;
+    u32 op0 = (esr >> 20) & 3, op2 = (esr >> 17) & 7, op1 = (esr >> 14) & 7;
+    u32 crn = (esr >> 10) & 0xf, crm = (esr >> 1) & 0xf;
+    bool read = esr & 1;
+    if (op0 != 3 || op1 != 0)
+        return NULL;
+    if (crn == 4 && crm == 6 && op2 == 0)
+        return read ? "ICC_PMR_EL1 read" : "ICC_PMR_EL1 write";
+    if (crn != 12)
+        return NULL;
+    if (read) {
+        if (crm == 12 && op2 == 0)
+            return "ICC_IAR1_EL1 read";
+        if (crm == 12 && op2 == 2)
+            return "ICC_HPPIR1_EL1 read";
+        if (crm == 11 && op2 == 3)
+            return "ICC_RPR_EL1 read";
+        if (crm == 12 && op2 == 3)
+            return "ICC_BPR1_EL1 read";
+        if (crm == 12 && op2 == 4)
+            return "ICC_CTLR_EL1 read";
+        if (crm == 12 && op2 == 7)
+            return "ICC_IGRPEN1_EL1 read";
+        if (crm >= 8 && crm <= 12)
+            return "ICC_* read";
+        return NULL;
+    }
+    if (crm == 12 && op2 == 3)
+        return "ICC_BPR1_EL1 write";
+    if (crm == 12 && op2 == 4)
+        return "ICC_CTLR_EL1 write";
+    return NULL;
+}
+
 /* ---- the report --------------------------------------------------------------------------- */
 
 static const char *mode_name(u64 spsr)
@@ -362,6 +401,29 @@ static void report_cpu(int cpu, int self, u64 now, u64 freq)
     printf("\n");
 }
 
+/*
+ * G6 r5: Apple's error-status registers, last (implementation-defined reads, the likeliest to
+ * trap), read only and guarded (hv_fatal_apl.c).  L2C_ERR_ADR holds the physical address of a
+ * latched L2/fabric error, which is what an SError with ISS 0 cannot say.  Bits of
+ * L2C_ERR_STS named in cpu_regs.h: 1 recursive fault, 7 access fault.
+ */
+static void report_apple_errors(void)
+{
+    printf("HV: fatal: Apple error registers (read only, guarded):");
+    for (unsigned int i = 0; i < HV_FATAL_APL_REGS; i++) {
+        const char *name = "?";
+        u64 val = 0;
+        if (hv_fatal_apl_err_read(i, &name, &val))
+            printf(" %s 0x%lx", name, val);
+        else
+            printf(" %s UNDEF", name);
+        if (i == 0 && (val & (BIT(1) | BIT(7))))
+            printf(" (%s%s)", (val & BIT(7)) ? "access fault" : "",
+                   (val & BIT(1)) ? ((val & BIT(7)) ? ", recursive" : "recursive") : "");
+    }
+    printf("\n");
+}
+
 void hv_windows_fatal_report(u64 *regs, const char *what, u64 par, const char *par_when)
 {
     if (chip_id != T8152 || !hv_fatal_armed)
@@ -418,6 +480,7 @@ void hv_windows_fatal_report(u64 *regs, const char *what, u64 par, const char *p
         printf("HV: fatal: DISR_EL1 absent (no FEAT_RAS)\n");
     printf("HV: fatal: guest EL1 ELR_EL12 0x%lx ESR_EL12 0x%lx FAR_EL12 0x%lx SPSR_EL12 0x%lx\n",
            mrs(ELR_EL12), mrs(ESR_EL12), mrs(FAR_EL12), mrs(SPSR_EL12));
+    report_apple_errors();
     if (hv_fatal_guest_caller)
         printf("HV: fatal: %s: the host decides what follows (run_guest --windows-serror: abort "
                "exits the guest, continue resumes it)\n",
@@ -469,6 +532,16 @@ void hv_windows_guest_serror_report(const u64 *regs, const u64 *sp, u64 esr, u64
     int code;
     const char *why = hv_fatal_serror_relation(prev, elr, age, &code);
     printf("HV: fatal: cpu%2d SError vs previous exit: verdict %d: %s\n", self, code, why);
+    const char *pure =
+        prev && prev->kind == HV_FATAL_TRAP_SYNC ? hv_fatal_exit_device_free(prev->esr) : NULL;
+    if (pure && (code == HV_SERR_REL_EL2_WORK || code == HV_SERR_REL_EL2_LATE ||
+                 code == HV_SERR_REL_MASKED_RAN))
+        printf("HV: fatal: cpu%2d that exit (%s) runs the software GIC model only (past its "
+               "one-time log line on each CPU): carrier memory and system registers, no device "
+               "access; the verdict names the window, "
+               "not the source (an earlier access, of this CPU or another agent, signalled "
+               "late)\n",
+               self, pure);
 
     hv_fatal_guest_caller = true;
     hv_windows_fatal_report(NULL, "guest SError", par, "at the guest SError");

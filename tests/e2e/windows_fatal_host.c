@@ -120,6 +120,24 @@ u64 hv_wdt_breadcrumbs_read(int cpu)
     return stub_crumbs[cpu];
 }
 
+/* hv_fatal_apl.c: guarded reads of Apple's error registers; here register 3 traps (UNDEF). */
+u64 stub_apl[HV_FATAL_APL_REGS];
+int stub_apl_reads;
+bool hv_fatal_apl_err_read(unsigned int which, const char **name, u64 *val)
+{
+    static const char *const names[HV_FATAL_APL_REGS] = {
+        "L2C_ERR_STS", "L2C_ERR_ADR", "L2C_ERR_INF", "LSU_ERR_STS", "FED_ERR_STS", "MMU_ERR_STS"};
+    stub_apl_reads++;
+    if (which >= HV_FATAL_APL_REGS) {
+        *name = "?";
+        *val = 0;
+        return false;
+    }
+    *name = names[which];
+    *val = which == 3 ? 0 : stub_apl[which];
+    return which != 3;
+}
+
 /* ---- harness --------------------------------------------------------------------------- */
 
 static int failures;
@@ -601,6 +619,85 @@ static void case_return(void)
     end(before);
 }
 
+/*
+ * G6 r5 (run 20261120-053521): verdict 2 on a trapped ICC_IAR1_EL1 read (ESR 0x62303139).  The
+ * EL2 path of that exit is the software GIC model, so the report says the verdict names the
+ * window and not the source; then the Apple error registers come last, read only, with a
+ * trapping one reported as UNDEF.  Register values are synthetic.
+ */
+static void case_icc(void)
+{
+    int before = failures;
+    begin("report_icc");
+    reset_state();
+    hv_fatal_armed = true;
+    stub_pfr0 = 0;
+    stub_cpu = 6;
+    stub_cntpct = 3000000;
+    stub_isr = 0;
+    stub_apl_reads = 0;
+    stub_apl[0] = BIT(7) | BIT(1);
+    stub_apl[1] = 0x10012345678UL;
+    stub_apl[2] = 0x42;
+    stub_apl[4] = 0;
+    stub_apl[5] = 0;
+
+    /* The classifier: ICC reads and the pure writes; never EOIR1, DIR, SGI1R or IGRPEN1 writes,
+     * nor other system registers or other exception classes. */
+    CHECK(hv_fatal_exit_device_free(0x62303139UL) &&
+          !strcmp(hv_fatal_exit_device_free(0x62303139UL), "ICC_IAR1_EL1 read"));
+    CHECK(!strcmp(hv_fatal_exit_device_free(0x623010cdUL), "ICC_PMR_EL1 read")); /* S3_0_C4_C6_0 */
+    CHECK(!strcmp(hv_fatal_exit_device_free(0x623010ccUL), "ICC_PMR_EL1 write"));
+    CHECK(!strcmp(hv_fatal_exit_device_free(0x62383118UL), "ICC_CTLR_EL1 write")); /* C12_C12_4 */
+    CHECK(hv_fatal_exit_device_free(0x62323118UL) == NULL); /* ICC_EOIR1_EL1 write (C12_C12_1) */
+    CHECK(hv_fatal_exit_device_free(0x62323116UL) == NULL); /* ICC_DIR_EL1 write (C12_C11_1) */
+    CHECK(hv_fatal_exit_device_free(0x623a3116UL) == NULL); /* ICC_SGI1R_EL1 write (C12_C11_5) */
+    CHECK(hv_fatal_exit_device_free(0x623e3118UL) == NULL); /* ICC_IGRPEN1_EL1 write */
+    CHECK(!strcmp(hv_fatal_exit_device_free(0x623e3119UL), "ICC_IGRPEN1_EL1 read"));
+    CHECK(hv_fatal_exit_device_free(0x6230e51bUL) == NULL); /* S3_3_C9_C13_0 (PMCCNTR) */
+    CHECK(hv_fatal_exit_device_free(0x5a004e87UL) == NULL); /* HVC */
+    CHECK(hv_fatal_exit_device_free(0x04000001UL) == NULL); /* WFI */
+
+    /* The run's shape: the IAR exit, not pending at the exit, pending after the return fence,
+     * taken at its return point 8 us later. */
+    hv_fatal_note_trap(HV_FATAL_TRAP_SYNC, 0x62303139UL, 0xfffff800280a60b0UL, 0x42000bc4, 0);
+    stub_isr_on_fence = BIT(8);
+    stub_elr2 = 0xfffff800280a60b4UL;
+    stub_spsr2 = 0x42000bc4;
+    stub_cntpct += 24;
+    hv_fatal_note_return();
+    struct hv_fatal_trap prev;
+    hv_fatal_trap_snapshot(&prev);
+    stub_cntpct += 24 * 8;
+    hv_fatal_note_trap(HV_FATAL_TRAP_SERROR, 0xbe000000UL, 0xfffff800280a60b4UL, 0x42000bc4, 0);
+    u64 regs[31] = {0};
+    u64 sp[2] = {0, 0};
+    printf("report-begin %s\n", current);
+    hv_windows_guest_serror_report(regs, sp, 0xbe000000UL, 0xfffff800280a60b4UL, 0x42000bc4, 0, 0,
+                                   &prev, 0);
+    printf("report-end %s\n", current);
+    EQ(stub_apl_reads, HV_FATAL_APL_REGS);
+
+    /* A WFI exit with the same verdict gets no such line (its idle path polls devices). */
+    reset_state();
+    hv_fatal_armed = true;
+    stub_cpu = 6;
+    stub_isr = 0;
+    hv_fatal_note_trap(HV_FATAL_TRAP_SYNC, 0x04000001UL, 0xfffff80000101000UL, 0x60000005, 0);
+    stub_isr_on_fence = BIT(8);
+    stub_elr2 = 0xfffff80000101004UL;
+    stub_spsr2 = 0x60000005;
+    hv_fatal_note_return();
+    hv_fatal_trap_snapshot(&prev);
+    stub_isr = 0;
+    hv_fatal_note_trap(HV_FATAL_TRAP_SERROR, 0xbe000000UL, 0xfffff80000101004UL, 0x60000005, 0);
+    printf("report-begin report_icc_wfi\n");
+    hv_windows_guest_serror_report(regs, sp, 0xbe000000UL, 0xfffff80000101004UL, 0x60000005, 0, 0,
+                                   &prev, 0);
+    printf("report-end report_icc_wfi\n");
+    end(before);
+}
+
 int main(void)
 {
     case_gating();
@@ -611,5 +708,6 @@ int main(void)
     case_report(1);
     case_guest();
     case_return();
+    case_icc();
     return failures ? 1 : 0;
 }

@@ -43,7 +43,7 @@ REPO = Path(__file__).resolve().parents[2]
 WIN = REPO / "src/hv/windows"
 
 CASES = ["gating", "reentry", "unwind", "seqlock", "report_d3", "report_ras",
-         "report_guest", "report_return"]
+         "report_guest", "report_return", "report_icc"]
 
 STUBS = {
     "types.h": r'''
@@ -524,3 +524,53 @@ def test_makefile_links_the_report():
     make = source("Makefile")
     assert "ahci_model.o hv_ahci.o hv_vdev_spi.o hv_fatal.o" in make
     assert "mtp_handoff.o hv_serror.o" in make
+
+
+def test_r5_an_icc_exit_is_named_as_the_window_not_the_source(replay):
+    """G6 r5 (run 20261120-053521): verdict 2 on a trapped ICC_IAR1_EL1 read.  The software GIC
+    model touches no device, so the report must not leave "raised by the EL2 work of that exit"
+    standing as the cause; a WFI exit (its idle path polls devices) gets no such line."""
+    text = report(replay, "report_icc")
+    assert "cpu 6 SError vs previous exit: verdict 2: taken at that exit's return point; not " \
+           "pending when the guest exited, pending when EL2 returned" in text
+    assert "HV: fatal: cpu 6 that exit (ICC_IAR1_EL1 read) runs the software GIC model only " \
+           "(past its one-time log line on each CPU): carrier memory and system registers, no " \
+           "device access; the verdict names the window, not the source" in text
+    assert text.index("verdict 2") < text.index("ICC_IAR1_EL1 read") < \
+        text.index("carrier context follows")
+    wfi = report(replay, "report_icc_wfi")
+    assert "verdict 2" in wfi
+    assert "software GIC model" not in wfi
+
+
+def test_r5_apple_error_registers_come_last_read_only(replay):
+    """The latched-error registers are read after everything else, each guarded; a trapping
+    one is reported as UNDEF and the report goes on to its last line."""
+    text = report(replay, "report_icc")
+    assert "HV: fatal: Apple error registers (read only, guarded): L2C_ERR_STS 0x82 (access " \
+           "fault, recursive) L2C_ERR_ADR 0x10012345678 L2C_ERR_INF 0x42 LSU_ERR_STS UNDEF " \
+           "FED_ERR_STS 0x0 MMU_ERR_STS 0x0\n" in text
+    assert text.index("guest EL1 ELR_EL12") < text.index("Apple error registers") < \
+        text.index("the host decides what follows")
+    d3 = report(replay, "report_d3")
+    assert d3.index("Apple error registers") < d3.index("not contained")
+    assert d3.rstrip().endswith("not contained: the carrier does not resume after this "
+                                "(SError at EL2)")
+
+
+def test_r5_the_apple_error_reads_never_write_and_are_guarded():
+    src = code(source("src/hv/windows/hv_fatal_apl.c"))
+    assert "msr(" not in src and "_msr(" not in src and "reg_set" not in src \
+        and "reg_clr" not in src
+    on = function_body(src, "static void guard_on(void)")
+    assert "exc_guard = GUARD_MARK | GUARD_SILENT;" in on
+    assert "exc_guard = GUARD_OFF;" in function_body(src, "static void guard_off(void)")
+    body = function_body(src, "bool hv_fatal_apl_err_read(")
+    # Only the MRS of the chosen register runs inside the guard; the trap count decides.
+    assert body.index("int before = exc_count;") < body.index("guard_on();") \
+        < body.index("switch (which)") < body.index("guard_off();") \
+        < body.index("if (exc_count != before)")
+    inside = body[body.index("guard_on();"):body.index("guard_off();")]
+    assert inside.count("= mrs(SYS_IMP_APL_") == 9
+    assert "printf" not in inside
+    assert "hv_fatal_apl.o" in source("Makefile")

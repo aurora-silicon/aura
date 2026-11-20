@@ -259,7 +259,7 @@ HV_OBJECTS := $(patsubst %,hv/windows/%, \
 	mtp_scm.o mtp_dart_t8152.o hid_desc.o input_kbd.o mtp_bringup.o hv_mtp_t8152.o input_tp.o \
 	gpu_t8152_power.o gpu_t8152_power_recipe.o gpu_t8152_probe.o \
 	gpu_t8152_g2.o gpu_t8152_g2_recipe.o gpu_t8152_uat.o hv_status.o \
-	scanout_model.o hv_scanout.o) \
+	scanout_model.o hv_scanout.o hv_fatal_apl.o) \
 	hv/hv_vm.o hv/hv_virtio.o hv/hv_vuart.o hv/hv_wdt.o hv/hv_sprr.o
 endif
 

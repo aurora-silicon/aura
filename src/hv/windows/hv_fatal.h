@@ -214,4 +214,27 @@ void hv_windows_guest_serror_report(const u64 *regs, const u64 *sp, u64 esr, u64
 /* hv_wdt.c: this CPU's last eight breadcrumbs, oldest in the top byte. */
 u64 hv_wdt_breadcrumbs_read(int cpu);
 
+/*
+ * G6 r5 (run 20261120-053521): verdict 2 named a trapped ICC_IAR1_EL1 read on cpu 6, but the EL2
+ * path of a trapped ICC_* read on T8152 is the software GIC model (hv_handle_t8152_gic_cpuif()
+ * and hv_update_fiq()): carrier memory and system registers, no device access.  An SError that
+ * becomes pending inside such an exit was raised by an earlier access (this CPU's, or another
+ * agent's) and only signalled in that window, so the verdict names the window, not the source.
+ * hv_fatal_exit_device_free(): the name of the register for such an exit (an ICC_* read, or an
+ * ICC_PMR_EL1 / BPR / CTLR write), else NULL (pure; host-tested).  ICC_EOIR1/DIR/SGI1R and
+ * IGRPEN1 writes are not listed: completing an AIC-alias SPI unmasks its AIC line (MMIO) and the
+ * first Group 1 enable on a CPU logs a line (console, so the DWC3).
+ */
+const char *hv_fatal_exit_device_free(u64 esr);
+
+/*
+ * hv_fatal_apl.c (carrier only): Apple's implementation-defined error-status registers,
+ * read only, one at a time under the exception guard (an UNDEF is skipped and reported, never
+ * fatal).  Never written: a write acknowledges (clears) the latched error.  `which` runs from 0
+ * to HV_FATAL_APL_REGS - 1; false when the read trapped.  The SError of the G6 runs stays
+ * pending after `continue` (a latched source), which is what these registers latch.
+ */
+#define HV_FATAL_APL_REGS 6
+bool hv_fatal_apl_err_read(unsigned int which, const char **name, u64 *val);
+
 #endif
