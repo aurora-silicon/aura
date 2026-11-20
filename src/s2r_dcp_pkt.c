@@ -28,6 +28,12 @@
 #define S2R_PKT_TAG   0x544b5043UL /* "CPKT" */
 #define S2R_PKT_MAX   128
 #define S2R_DCP_OPEN  4
+/*
+ * dart_walk_locked_t8110() visits 2048 L1 entries of 32 MiB: 36-bit IOVAs. A DVA's bits above
+ * that are not table indices (J613's RPC memory is at 0x1000003c000), so only the walk's width is
+ * compared. A walk of wider tables (T6050's three levels) needs its own width here.
+ */
+#define S2R_DCP_T8110_IOVA_BITS 36
 
 static struct s2r_dcp {
     u64 mbox, dart, dart_size;
@@ -45,7 +51,7 @@ u32 sptm_virt_s2r_dcp_pkt; /* host: copy the DCPs' IOMFB packets into the ring *
 
 struct s2r_dcp_walk {
     struct s2r_dcp *d;
-    u64 lo; /* the DVA's low 36 bits: the DART tables index those, not a high base (J613: bit 40) */
+    u64 lo; /* the DVA within the walk's IOVA width: J613's DVA carries bit 40 above it */
     int found;
 };
 
@@ -67,7 +73,7 @@ static int s2r_dcp_resolve(struct s2r_dcp *d)
     d->lo = d->dva & ~0x3fffUL;
     u32 walked = 0;
     for (u8 sid = 0; sid < 16; sid++) {
-        struct s2r_dcp_walk w = {d, d->lo & GENMASK(35, 0), 0};
+        struct s2r_dcp_walk w = {d, d->lo & GENMASK(S2R_DCP_T8110_IOVA_BITS - 1, 0), 0};
         int ret = dart_walk_locked_t8110(d->dart, d->dart_size, sid, ram, mem_size_actual,
                                          s2r_dcp_visit, &w);
         if (ret >= 0)
