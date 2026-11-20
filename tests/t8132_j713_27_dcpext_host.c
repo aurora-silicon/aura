@@ -74,8 +74,7 @@ static void check_j713_ext(const void *in, const void *dt, int i, bool want)
     int in_ext = fdt_path_offset(in, path);
     const char *in_status = fdt_getprop(in, in_ext, "status", NULL);
     const char *status = fdt_getprop(dt, ext, "status", NULL);
-    check(in_status && status && !strcmp(in_status, status) &&
-              props_unchanged(in, dt, dart_path),
+    check(in_status && status && !strcmp(in_status, status) && props_unchanged(in, dt, dart_path),
           "dcpext%d and its DART keep the device tree's status (%s)", i, status ? status : "?");
     if (!mr || len != 12)
         return;
@@ -85,8 +84,8 @@ static void check_j713_ext(const void *in, const void *dt, int i, bool want)
               u32s_are(dt, ext, "apple,firmware-compat", ver, 3) && uuid &&
               !strcmp(uuid, J773G_UUID),
           "dcpext%d: firmware 27.2.0 and the pinned UUID", i);
-    check(u32s_are(dt, ext, "apple,clock-ids", ext_clk[i], 2), "dcpext%d: dispext%d's clock-ids",
-          i, i);
+    check(u32s_are(dt, ext, "apple,clock-ids", ext_clk[i], 2), "dcpext%d: dispext%d's clock-ids", i,
+          i);
     check_clock(dt, ext, 0, ext_clk[i][0], EXT_HZ);
     check_clock(dt, ext, 1, ext_clk[i][1], 0);
 
