@@ -52,6 +52,9 @@ Environment (all optional; 1 enables a switch):
                            AURA_GPU_STOP_MSG=0x0081000000000000: the first InitData doorbell)
   AURA_GPU_STOP_EP=<ep>    and only a mailbox message to endpoint ep (e.g. 0x20)
   AURA_GPU_PRINT_MAX=<n>   print at most n GPU accesses on aura's console (default 20000)
+  AURA_GPU_NARROW=1        with AURA_GPU_TRACE, hook only the GPU/PMP record's pages: the gfx-asc
+                           and pmp-asc mailbox pages, sgx +0xe00000 (MMIO_PROTECTED), +0x1000000
+                           (AXI2AF), +0xd60000 (the host block); not the rest of sgx, not pmp-ptd
   AURA_GPU_MSG_PARK=0      the write AURA_GPU_STOP_MSG names doesn't park (it snapshots, below)
   AURA_GPU_SNAP=<n>        copy the GPU firmware's memory (its page tables, the objects the
                            doorbell names, the chains) at every n-th such write, before it is
@@ -193,6 +196,7 @@ KNOWN_ENV = {
     "AURA_GPU_STOP_MSG_MASK",
     "AURA_GPU_STOP_EP",
     "AURA_GPU_PRINT_MAX",
+    "AURA_GPU_NARROW",
     "AURA_GPU_MSG_PARK",
     "AURA_GPU_SNAP",
     "AURA_GPU_SNAP_MAX",
@@ -882,6 +886,9 @@ def configure(p, sym, plan, adt, ctl_cookie=0):
         p.write32(sym["sptm_virt_gpu_stop_ep"], env_int("AURA_GPU_STOP_EP") + 1)
     if os.environ.get("AURA_GPU_PRINT_MAX"):
         p.write32(sym["sptm_virt_gpu_print_max"], env_int("AURA_GPU_PRINT_MAX"))
+    if env_on("AURA_GPU_NARROW"):
+        p.write32(sym["sptm_virt_gpu_narrow"], 1)
+        print("GPU trace: the record's pages only (AURA_GPU_NARROW)")
     from aura import hvsnap
 
     try:

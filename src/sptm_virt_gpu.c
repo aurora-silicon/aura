@@ -59,6 +59,9 @@ u64 sptm_virt_gpu_stop_msg; /* park after a write of this value (a mailbox messa
 u64 sptm_virt_gpu_stop_msg_mask;
 u32 sptm_virt_gpu_stop_ep;
 u32 sptm_virt_gpu_print_max = 20000;
+/* Hook only the GPU/PMP record's pages, not the whole sgx window or the PMP's dashboard: with
+ * those trapped (hv22) the GPU never answered InitData. */
+u32 sptm_virt_gpu_narrow;
 u32 sptm_virt_gpu_msg_park = 1;  /* the first write the host names parks; 0: it only snapshots */
 u32 sptm_virt_gpu_snap_every;    /* a snapshot at every n-th of those writes; 0: none */
 u32 sptm_virt_gpu_snap_mib = 32; /* the snapshot buffer */
@@ -87,7 +90,8 @@ static struct {
     const char *what;
 } gpu_ranges[GPU_MAX_RANGES];
 static int gpu_nranges;
-static u64 gpu_sgx; /* sgx reg 0: offsets print relative to it */
+static u64 gpu_sgx;      /* sgx reg 0: offsets print relative to it */
+static u64 gpu_sgx_size; /* and its size (the record's sgx window, hooked whole or not) */
 
 static u64 gpu_seen[GPU_SEEN_MAX];
 static u32 gpu_nseen;
@@ -470,7 +474,9 @@ static void gpu_hook_range(const char *what, u64 base, u64 size)
         printf("SPTM-virt[gpu]: hooked %s 0x%lx+0x%lx\n", what, base, size);
 }
 
-static void gpu_hook_adt(const char *path, int idx, const char *what, u64 off, u64 size)
+/* With hook false (narrow), the window is only noted: its pages are hooked one by one. */
+static void gpu_hook_adt_as(const char *path, int idx, const char *what, u64 off, u64 size,
+                            bool hook)
 {
     int p[8];
     u64 pa, sz;
@@ -479,8 +485,10 @@ static void gpu_hook_adt(const char *path, int idx, const char *what, u64 off, u
         printf("SPTM-virt[gpu]: no %s reg[%d]; %s not traced\n", path, idx, what);
         return;
     }
-    if (!strcmp(what, "sgx"))
+    if (!strcmp(what, "sgx")) {
         gpu_sgx = pa;
+        gpu_sgx_size = sz;
+    }
     if (!strcmp(what, "gfx-asc") || !strcmp(what, "gfx1-asc")) {
         gpu_asc[what[3] == '1'].pa = pa;
         gpu_asc[what[3] == '1'].size = sz;
@@ -489,7 +497,34 @@ static void gpu_hook_adt(const char *path, int idx, const char *what, u64 off, u
         gpu_pmp_asc.pa = pa;
         gpu_pmp_asc.size = sz;
     }
-    gpu_hook_range(what, pa + off, size ? size : sz);
+    if (hook)
+        gpu_hook_range(what, pa + off, size ? size : sz);
+}
+
+static void gpu_hook_adt(const char *path, int idx, const char *what, u64 off, u64 size)
+{
+    gpu_hook_adt_as(path, idx, what, off, size, true);
+}
+
+/* AURA_GPU_NARROW: the ASCs' mailbox pages (A2I_SEND +0x8800, I2A_RECV +0x8830, their controls),
+ * and the sgx pages the record reads: MMIO_PROTECTED, AXI2AF (+0x1000100..), the host block. */
+static void gpu_hook_narrow(void)
+{
+    gpu_hook_adt_as("/arm-io/sgx", 0, "sgx", 0, 0, false);
+    gpu_hook_adt_as("/arm-io/gfx-asc", 0, "gfx-asc", 0, 0, false);
+    gpu_hook_adt_as("/arm-io/gfx1-asc", 0, "gfx1-asc", 0, 0, false);
+    gpu_hook_adt_as("/arm-io/pmp", 0, "pmp-asc", 0, 0, false);
+    if (gpu_asc[0].size)
+        gpu_hook_range("gfx-asc-mbox", gpu_asc[0].pa + 0x8000, 0x4000);
+    if (gpu_asc[1].size)
+        gpu_hook_range("gfx1-asc-mbox", gpu_asc[1].pa + 0x8000, 0x4000);
+    if (gpu_pmp_asc.size)
+        gpu_hook_range("pmp-asc-mbox", gpu_pmp_asc.pa + 0x8000, 0x4000);
+    if (gpu_sgx) {
+        gpu_hook_range("sgx-protected", gpu_sgx + 0xe00000, 0x4000);
+        gpu_hook_range("sgx-axi2af", gpu_sgx + 0x1000000, 0x4000);
+        gpu_hook_range("sgx-hostblk", gpu_sgx + 0xd60000, 0x4000);
+    }
 }
 
 /* /arm-io/sgx's <name>-base and -size. */
@@ -608,9 +643,8 @@ static void gpu_gfxrec_setup(void)
     sptm_virt_gfxrec_source(GFXREC_SRC_GFX_ASC, gpu_asc[0].pa, gpu_asc[0].size);
     sptm_virt_gfxrec_source(GFXREC_SRC_GFX1_ASC, gpu_asc[1].pa, gpu_asc[1].size);
     sptm_virt_gfxrec_source(GFXREC_SRC_PMP_ASC, gpu_pmp_asc.pa, gpu_pmp_asc.size);
-    for (int i = 0; i < gpu_nranges; i++)
-        if (!strcmp(gpu_ranges[i].what, "sgx"))
-            sptm_virt_gfxrec_source(GFXREC_SRC_SGX, gpu_sgx, gpu_ranges[i].size);
+    /* Its window, whether the GPU trace hooks it whole or (narrow) only the pages it reads. */
+    sptm_virt_gfxrec_source(GFXREC_SRC_SGX, gpu_sgx, gpu_sgx_size);
     /* The PS words: the debug link's keep hook (sptm_virt_s2r.c) traps their PMGR page and hands
      * its accesses on; a word no hook traps is listed and never recorded. No hook is added. */
     u64 ps[GFXREC_PS_MAX];
@@ -653,15 +687,19 @@ void sptm_virt_gpu_setup(void)
     sptm_virt_gpu_nrec = GPU_RING_BYTES / sizeof(struct gpu_rec);
     sptm_virt_gpu_head = 0;
 
-    /* sgx reg 0 holds the GPU's PMGR (+0xe80000), its start control and both ASCs. */
-    gpu_hook_adt("/arm-io/sgx", 0, "sgx", 0, 0);
-    /* Both GPU coprocessors' ASC windows: the mailboxes the driver and firmware talk over. */
-    gpu_hook_adt("/arm-io/gfx-asc", 0, "gfx-asc", 0, 0);
-    gpu_hook_adt("/arm-io/gfx1-asc", 0, "gfx1-asc", 0, 0);
-    /* The PMP dashboard (PTD records, update words) and the PMP's mailbox. */
-    gpu_hook_adt("/arm-io/mcc", 8, "pmp-ptd", 0, 0);
-    gpu_hook_adt("/arm-io/mcc", 9, "pmp-ptd-upd", 0, 0);
-    gpu_hook_adt("/arm-io/pmp", 0, "pmp-asc", 0, 0);
+    if (sptm_virt_gpu_narrow) {
+        gpu_hook_narrow();
+    } else {
+        /* sgx reg 0 holds the GPU's PMGR (+0xe80000), its start control and both ASCs. */
+        gpu_hook_adt("/arm-io/sgx", 0, "sgx", 0, 0);
+        /* Both GPU coprocessors' ASC windows: the mailboxes the driver and firmware talk over. */
+        gpu_hook_adt("/arm-io/gfx-asc", 0, "gfx-asc", 0, 0);
+        gpu_hook_adt("/arm-io/gfx1-asc", 0, "gfx1-asc", 0, 0);
+        /* The PMP dashboard (PTD records, update words) and the PMP's mailbox. */
+        gpu_hook_adt("/arm-io/mcc", 8, "pmp-ptd", 0, 0);
+        gpu_hook_adt("/arm-io/mcc", 9, "pmp-ptd-upd", 0, 0);
+        gpu_hook_adt("/arm-io/pmp", 0, "pmp-asc", 0, 0);
+    }
     gpu_snap_setup();
     gpu_gfxrec_setup();
     printf("SPTM-virt[gpu]: ring 0x%lx (%lu records, head at 0x%lx), stop after %u s or a write of "

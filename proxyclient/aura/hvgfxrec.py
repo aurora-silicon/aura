@@ -606,6 +606,9 @@ def check_env(env):
             return "AURA_GFXPMP_BLK: a 4-byte-aligned PA and a length"
     if env.get("AURA_GPU_TRACE") != "1":
         return "AURA_GFXPMP needs AURA_GPU_TRACE (its hooks feed the record)"
+    if env.get("AURA_GPU_NARROW") != "1":
+        return ("AURA_GFXPMP needs AURA_GPU_NARROW=1: with the whole sgx window and the PMP "
+                "dashboard trapped (hv22) the GPU never answered InitData")
     for var in ("AURA_GPU_STOP_MSG", "AURA_GPU_STOP_MSG_MASK", "AURA_GPU_STOP_EP"):
         if not env.get(var):
             return f"AURA_GFXPMP starts at the write AURA_GPU_STOP_MSG names: set {var}"

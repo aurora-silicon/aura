@@ -440,13 +440,16 @@ def test_read_from_a_park():
 def test_env_refuses_what_parks():
     ok = {"AURA_GFXPMP": "2000", "AURA_GPU_TRACE": "1", "AURA_GPU_STOP_MSG": "0x0081000000000000",
           "AURA_GPU_STOP_MSG_MASK": "0xffff000000000000", "AURA_GPU_STOP_EP": "0x20",
-          "AURA_GPU_PRINT_MAX": "0"}
+          "AURA_GPU_PRINT_MAX": "0", "AURA_GPU_NARROW": "1"}
     assert hvgfxrec.check_env(ok) == "" and hvgfxrec.check_env({}) == ""
+    # hv22: the whole sgx window and the PMP dashboard trapped, the GPU never answered InitData.
+    # A record takes only the narrow hooks.
     for extra in ({"AURA_GPU_MSG_PARK": "1"}, {"AURA_GPU_STOP_BOOT_SECS": "240"},
                   {"AURA_GPU_STOP_SECS": "5"}, {"AURA_GPU_SNAP": "1"}, {"AURA_GPU_TRACE": "0"},
-                  {"AURA_GFXPMP": "0"}, {"AURA_GFXPMP_MAX": "0"}):
+                  {"AURA_GFXPMP": "0"}, {"AURA_GFXPMP_MAX": "0"}, {"AURA_GPU_NARROW": "0"}):
         assert hvgfxrec.check_env({**ok, **extra}), extra
-    for missing in ("AURA_GPU_STOP_MSG", "AURA_GPU_STOP_MSG_MASK", "AURA_GPU_STOP_EP"):
+    for missing in ("AURA_GPU_STOP_MSG", "AURA_GPU_STOP_MSG_MASK", "AURA_GPU_STOP_EP",
+                    "AURA_GPU_NARROW"):
         assert hvgfxrec.check_env({k: v for k, v in ok.items() if k != missing}), missing
 
 
