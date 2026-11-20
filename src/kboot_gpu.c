@@ -3600,20 +3600,14 @@ static const struct {
 };
 
 /*
- * T6040/T6041 GPU firmware segments. /arm-io/gfx-asc segment-ranges lists __TEXT, then __DATA.
- * Firmware with a __DATA_SHARED_RO segment (the 27.2 GPU firmware) lists it third: iBoot places
- * it right after __DATA, identity-mapped, describes it on /arm-io/sgx as
+ * GPU firmware segments (T8132, T6040, T6041). /arm-io/gfx-asc segment-ranges lists __TEXT, then
+ * __DATA. Firmware with a __DATA_SHARED_RO segment (the 27.2 GPU firmware) lists it third: iBoot
+ * places it right after __DATA, identity-mapped, describes it on /arm-io/sgx as
  * gfx-data-shared-ro-{base,size}, and gives no shared RW segment. The layout is chosen by that
  * ADT shape, not by the chip or the firmware version, and any other shape is refused. gpu-fw-data
  * reserves __DATA and that tail as one region.
  */
-struct t604x_gpu_fw {
-    u64 text_base, text_size;
-    u64 data_base, data_size;
-    u64 ro_size; /* __DATA_SHARED_RO right after __DATA, or 0 */
-};
-
-static int t604x_gpu_fw_segments(int sgx, struct t604x_gpu_fw *fw)
+int gpu_fw_layout(int sgx, struct gpu_fw_layout *fw)
 {
     u32 len;
     int asc = adt_path_offset(adt, "/arm-io/gfx-asc");
@@ -3622,6 +3616,8 @@ static int t604x_gpu_fw_segments(int sgx, struct t604x_gpu_fw *fw)
     const struct adt_segment_ranges *seg = adt_getprop(adt, asc, "segment-ranges", &len);
     if (!seg || (len != 2 * sizeof(*seg) && len != 3 * sizeof(*seg)))
         return -1;
+    fw->seg = seg;
+    fw->count = len / sizeof(*seg);
     fw->text_base = seg[0].phys;
     fw->text_size = seg[0].size;
     fw->data_base = seg[1].phys;
@@ -3723,8 +3719,8 @@ static int dt_set_gpu_t6040(void *dt)
         goto disable;
     }
 
-    struct t604x_gpu_fw fw;
-    if (t604x_gpu_fw_segments(sgx, &fw))
+    struct gpu_fw_layout fw;
+    if (gpu_fw_layout(sgx, &fw))
         goto disable;
 
     /* The reserved regions, the OPP tables and the GPU node must all take the fill. */
@@ -3973,8 +3969,8 @@ static int dt_set_gpu_t6041(void *dt)
                 goto disable;
     }
 
-    struct t604x_gpu_fw fw;
-    if (t604x_gpu_fw_segments(sgx, &fw))
+    struct gpu_fw_layout fw;
+    if (gpu_fw_layout(sgx, &fw))
         goto disable;
 
     u64 region_base[ARRAY_SIZE(t6040_regions)], region_size[ARRAY_SIZE(t6040_regions)];
