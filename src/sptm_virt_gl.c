@@ -767,6 +767,7 @@ static bool sptm_virt_guarded_gexit(u64 *regs)
                        sptm_virt_bss_canary, (int)again, again ? " -- REVERTED" : "");
         }
         sptm_virt_cpu_enters_xnu(cpu);
+        sptm_virt_pmu_xnu_entry();
         if (sptm_virt_flags & SPTM_VIRT_S2R)
             sptm_virt_s2r_xnu_entry(cpu, target);
         if ((sptm_virt_flags & SPTM_VIRT_XNU_BT) && el == 2 && !sptm_virt_s2r_quiet)
@@ -927,6 +928,7 @@ bool sptm_virt_gl_sync(u64 *regs, u64 esr, u64 elr, u64 spsr)
      * the watchdog alone -- every boot that has not reached WindowServer -- still hands the
      * proxy back instead of running on with aura's console gone.
      */
+    sptm_virt_pmu_tick();
     if (sptm_virt_gpu_deadline_due()) {
         struct exc_info pctx;
         sptm_virt_fill_ctx(&pctx, regs, true);
@@ -1176,6 +1178,7 @@ bool sptm_virt_el1_wfx(u64 *regs, u64 esr)
      * The deadline park, offered here too: a guest that only spins in WFE or idles in WFI makes
      * no GL trap and touches no hooked page, so neither of the other two offers would ever come.
      */
+    sptm_virt_pmu_tick();
     if (sptm_virt_gpu_deadline_due()) {
         struct exc_info pctx;
         sptm_virt_fill_ctx(&pctx, regs, false);

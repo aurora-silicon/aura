@@ -16,6 +16,8 @@ spmi_dev_t *spmi_init(const char *adt_node);
 void spmi_shutdown(spmi_dev_t *dev);
 /* Physical address of the controller's command register. */
 u64 spmi_cmd_reg(spmi_dev_t *dev);
+/* Its status, command and reply registers and the status bits for empty RX and TX FIFOs. */
+void spmi_layout(spmi_dev_t *dev, u64 *status, u64 *cmd, u64 *reply, u32 *rx_empty, u32 *tx_empty);
 
 int spmi_reg0_write(spmi_dev_t *dev, u8 addr, u8 value);
 

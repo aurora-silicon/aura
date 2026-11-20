@@ -565,6 +565,7 @@ void sptm_virt_s2_setup(void)
            link_on_usb || link_on_dockchannel ? "kept on" : "NOT kept on");
     sptm_virt_s2r_setup(link_on_usb || link_on_dockchannel);
     sptm_virt_gpu_setup();
+    sptm_virt_pmu_setup(); /* after the sleep path, which may own the SPMI page */
 #ifdef AURACTL
     sptm_virt_ctl_s2_setup(); /* splits blocks: before the tree is summed */
 #endif

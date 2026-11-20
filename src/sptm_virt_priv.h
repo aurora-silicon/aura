@@ -115,6 +115,9 @@ bool sptm_virt_s2r_wfi(u64 *regs, u64 esr);
 
 /* sptm_virt_gpu.c */
 void sptm_virt_gpu_setup(void);
+void sptm_virt_pmu_setup(void);
+void sptm_virt_pmu_tick(void);
+void sptm_virt_pmu_xnu_entry(void);
 
 #ifdef AURACTL
 /* auractl (sptm_virt_ctl.c, src/auractl_abi.h) */

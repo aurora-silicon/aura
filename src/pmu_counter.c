@@ -58,6 +58,15 @@ static int pmu_find_scratchpad(char *path, size_t path_len, u8 *addr, u16 *scrpa
  * An aura chain that never reaches an OS which clears the counts must clear them itself, or
  * repeated test boots end in the recovery error screen.
  */
+int pmu_counter_locate(char *path, size_t path_len, u8 *addr, u16 *reg)
+{
+    u16 scrpad;
+    if (pmu_find_scratchpad(path, path_len, addr, &scrpad))
+        return -1;
+    *reg = scrpad + PMU_SCRPAD_COUNTS;
+    return 0;
+}
+
 int pmu_clear_panic_counter(void)
 {
     char path[64];

@@ -1,0 +1,177 @@
+/* SPDX-License-Identifier: MIT */
+/*
+ * iBoot's failed-boot count while a guest runs.
+ *
+ * aura_main clears the count once, when this image starts (pmu_counter.c). A guest under the
+ * hypervisor never ends its boot the way iBoot counts as clean, and on a T8132 Mac mini a run of
+ * guests, each ended by a reset, left 2 behind every time and twice ended in recoveryOS (11-19,
+ * 11-20). So aura also keeps the count at zero while the guest runs: XNU entry + 30 s, + 90 s, then
+ * every 120 s, and logs every non-zero value it clears (which also says who counts, and when).
+ *
+ * aura's transaction must not interleave with one of XNU's on the same controller. The guest's
+ * accesses to the controller's register page trap here, under one lock, and this file follows
+ * XNU's commands: a command word opens one, its data words follow, and it closes once XNU has read
+ * the reply and the RX FIFO is empty again. aura writes only between XNU's commands, with both
+ * FIFOs empty, holding the lock, so XNU's next access waits until aura's reply has been read.
+ */
+#include "adt.h"
+#include "hv.h"
+#include "pmu_counter.h"
+#include "spmi.h"
+#include "sptm_virt.h"
+#include "sptm_virt_priv.h"
+#include "utils.h"
+
+#define PMU_KEEP_FIRST_S  30
+#define PMU_KEEP_SECOND_S 90
+#define PMU_KEEP_EVERY_S  120
+/* XNU abandoned a command (timeout, reset) if it stays open this long with both FIFOs empty. */
+#define PMU_STALE_S 1
+
+#define SPMI_OPC_EXT_WRITE  0x00 /* 0x00-0x0f: 8-bit register, (opc & 0xf) + 1 bytes */
+#define SPMI_OPC_EXT_WRITEL 0x30 /* 0x30-0x37: 16-bit register, (opc & 7) + 1 bytes */
+
+static struct {
+    spmi_dev_t *dev;
+    u8 slave;
+    u16 counter;
+    u64 status, cmd, reply;
+    u32 rx_empty, tx_empty;
+    bool on;
+    /* XNU's command in flight */
+    bool open;
+    int data_words;
+    u64 open_t;
+    /* the schedule */
+    u64 next_t;
+    int round;
+    u32 cleared, skipped;
+} pk;
+
+static DECLARE_SPINLOCK(pk_lock);
+
+static bool pk_fifos_empty(void)
+{
+    u32 st = read32(pk.status);
+    return (st & pk.rx_empty) && (st & pk.tx_empty);
+}
+
+/* With pk_lock held and XNU between commands. */
+static void pk_clear(void)
+{
+    u8 v = 0, zero = 0;
+    if (spmi_ext_read_long(pk.dev, pk.slave, pk.counter, &v, 1) < 0) {
+        printf("SPTM-virt[pmu]: reading the failed-boot count failed\n");
+        return;
+    }
+    if (v && spmi_ext_write_long(pk.dev, pk.slave, pk.counter, &zero, 1) < 0) {
+        printf("SPTM-virt[pmu]: clearing the failed-boot count (0x%02x) failed\n", v);
+        return;
+    }
+    if (v || pk.round < 2)
+        printf("SPTM-virt[pmu]: failed-boot count 0x%02x%s (round %d)\n", v, v ? " -> 0x00" : "",
+               pk.round);
+    if (v)
+        pk.cleared++;
+}
+
+static void pk_schedule(u64 now)
+{
+    u64 f = mrs(CNTFRQ_EL0);
+    pk.round++;
+    pk.next_t = now + f * (pk.round == 1 ? PMU_KEEP_SECOND_S - PMU_KEEP_FIRST_S : PMU_KEEP_EVERY_S);
+}
+
+/* With pk_lock held. */
+static void pk_maybe(u64 now)
+{
+    if (!pk.next_t || now < pk.next_t)
+        return;
+    if (pk.open && !(now - pk.open_t > PMU_STALE_S * mrs(CNTFRQ_EL0) && pk_fifos_empty()))
+        return; /* XNU has a command in flight: at its end, or the next trap */
+    if (!pk_fifos_empty()) {
+        if (pk.skipped++ < 4)
+            printf("SPTM-virt[pmu]: controller FIFOs not empty between XNU's commands; later\n");
+        return;
+    }
+    pk.open = false;
+    pk_clear();
+    pk_schedule(now);
+}
+
+static bool pk_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int width)
+{
+    UNUSED(ctx);
+    u64 now = mrs(CNTPCT_EL0);
+
+    spin_lock(&pk_lock);
+    if (write && addr == pk.cmd && width == 2) {
+        u32 v = *val;
+        if (pk.data_words > 0) {
+            pk.data_words--;
+        } else {
+            /* A new command: aura's turn first, if one is due. */
+            pk_maybe(now);
+            u32 opc = v & 0xff, len = 0;
+            if ((opc & 0xf8) == SPMI_OPC_EXT_WRITEL)
+                len = (opc & 7) + 1;
+            else if (opc < 0x10)
+                len = (opc & 0xf) + 1;
+            pk.data_words = (len + 3) / 4;
+            pk.open = true;
+            pk.open_t = now;
+        }
+    }
+    sptm_virt_mmio_rw(addr, val, write, width);
+    if (!write && addr == pk.reply && pk.open && !pk.data_words &&
+        (read32(pk.status) & pk.rx_empty))
+        pk.open = false;
+    spin_unlock(&pk_lock);
+    return true;
+}
+
+/* From the guest's frequent traps (GL calls): a guest that leaves SPMI alone still gets cleared. */
+void sptm_virt_pmu_tick(void)
+{
+    if (!pk.on || !pk.next_t)
+        return;
+    u64 now = mrs(CNTPCT_EL0);
+    if (now < pk.next_t)
+        return;
+    spin_lock(&pk_lock);
+    pk_maybe(now);
+    spin_unlock(&pk_lock);
+}
+
+/* At XNU's entry: start the schedule. */
+void sptm_virt_pmu_xnu_entry(void)
+{
+    if (!pk.on || pk.next_t)
+        return;
+    pk.next_t = mrs(CNTPCT_EL0) + (u64)PMU_KEEP_FIRST_S * mrs(CNTFRQ_EL0);
+}
+
+void sptm_virt_pmu_setup(void)
+{
+    char path[64];
+    if (sptm_virt_flags & SPTM_VIRT_S2R) {
+        printf("SPTM-virt[pmu]: the sleep path owns the SPMI hooks; failed-boot count not kept\n");
+        return;
+    }
+    if (pmu_counter_locate(path, sizeof(path), &pk.slave, &pk.counter) < 0)
+        return;
+    pk.dev = spmi_init(path);
+    if (!pk.dev)
+        return;
+    spmi_layout(pk.dev, &pk.status, &pk.cmd, &pk.reply, &pk.rx_empty, &pk.tx_empty);
+    if ((pk.status & ~0x3fffUL) != (pk.cmd & ~0x3fffUL) ||
+        (pk.reply & ~0x3fffUL) != (pk.cmd & ~0x3fffUL) ||
+        hv_map_hook(pk.cmd & ~0x3fffUL, pk_hook, 0x4000) < 0) {
+        printf("SPTM-virt[pmu]: cannot hook %s's registers; failed-boot count not kept\n", path);
+        return;
+    }
+    pk.on = true;
+    printf("SPTM-virt[pmu]: keeping iBoot's failed-boot count (%s SID 0x%x reg 0x%x) at zero: XNU "
+           "entry + %d s, + %d s, then every %d s\n",
+           path, pk.slave, pk.counter, PMU_KEEP_FIRST_S, PMU_KEEP_SECOND_S, PMU_KEEP_EVERY_S);
+}

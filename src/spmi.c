@@ -130,6 +130,15 @@ u64 spmi_cmd_reg(spmi_dev_t *dev)
     return dev->base + dev->regs->cmd_offset;
 }
 
+void spmi_layout(spmi_dev_t *dev, u64 *status, u64 *cmd, u64 *reply, u32 *rx_empty, u32 *tx_empty)
+{
+    *status = dev->base + dev->regs->status_offset;
+    *cmd = dev->base + dev->regs->cmd_offset;
+    *reply = dev->base + dev->regs->reply_offset;
+    *rx_empty = dev->regs->status_rx_empty_mask;
+    *tx_empty = dev->regs->status_tx_empty_mask;
+}
+
 void spmi_shutdown(spmi_dev_t *dev)
 {
     free(dev);
