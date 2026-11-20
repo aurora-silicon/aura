@@ -550,6 +550,17 @@ int payload_run(void)
     }
 
     if (kernel && fdt) {
+#ifdef BRINGUP
+        /*
+         * A BRINGUP build skips MMU, MCC, AIC and SMP init: no carveouts are unmapped and no
+         * secondary CPU is started or set up. A kernel would get a half-initialized machine, so
+         * these builds never hand off; they are for the proxy only. Refuse here, before NVMe or
+         * CPU work, with a message that says why.
+         */
+        printf("BRINGUP build: kernel handoff is not supported (no MMU/MCC/AIC/SMP init); "
+               "use the proxy\n");
+        goto boot_failed;
+#endif
         /*
          * Linux adopts a running post-M4 ANS from boot=. The U-Boot we embed adopts a running
          * post-M4 ANS too, and can't start one from off: if an earlier stage powered ANS off
@@ -564,37 +575,32 @@ int payload_run(void)
         if (!nvme_keep_running_for_linux && !nvme_shutdown())
             goto boot_failed;
         cpufreq_init();
-        if (smp_start_secondaries() && chip_id == T8140) {
-            printf("SMP: refusing payload handoff with missing T8140 CPUs\n");
+        /*
+         * Fail closed on every chip. smp_start_secondaries() only counts a CPU as missing when
+         * the ADT lists it: iBoot drops the node of a fused-off core (J773s has no cpu9), so a
+         * binned part has nothing missing. A listed core that did not start, or one that did
+         * not take its mitigation or TSO setup, would reach the kernel half initialized.
+         */
+        if (smp_start_secondaries()) {
+            printf("SMP: refusing payload handoff with missing CPUs\n");
             goto boot_failed;
         }
-        int mitigation_ret = mitigations_perform();
-        if (mitigation_ret) {
-            if (mitigation_ret == SMP_TIMEOUT || chip_id == T8140)
-                goto boot_failed;
-            printf("Mitigations: continuing payload handoff with incomplete CPU initialization\n");
+        if (mitigations_perform()) {
+            printf("Mitigations: refusing payload handoff with incomplete CPU initialization\n");
+            goto boot_failed;
         }
         if (enable_tso) {
             kboot_delete_chosen("apple,tso");
-            bool tso_failed = false;
             do_enable_tso();
             for (int i = 0; i < MAX_CPUS; i++) {
                 if (i == boot_cpu_idx)
                     continue;
-                if (smp_is_alive(i)) {
-                    int ret = smp_call_sync0(i, do_enable_tso);
-                    if (ret) {
-                        printf("TSO: CPU %d initialization failed\n", i);
-                        if (ret == SMP_TIMEOUT || chip_id == T8140)
-                            goto boot_failed;
-                        tso_failed = true;
-                    }
+                if (smp_is_alive(i) && smp_call_sync0(i, do_enable_tso)) {
+                    printf("TSO: CPU %d initialization failed, refusing payload handoff\n", i);
+                    goto boot_failed;
                 }
             }
-            if (!tso_failed)
-                kboot_set_chosen("apple,tso", "");
-            else
-                printf("TSO: continuing payload handoff without advertising complete TSO setup\n");
+            kboot_set_chosen("apple,tso", "");
         }
 
         for (size_t i = 0; i < chosen_cnt; i++) {
