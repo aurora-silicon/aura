@@ -574,12 +574,17 @@ struct dcp6_sid {
 
 enum { VM_DCP, VM_DISP }; /* dart-dcp, dart-disp0 */
 
+/* A display pipe's firmware clocks: its ADT clock-ids and their /arm-io clock-frequencies */
+struct dcp6_clocks {
+    u32 n, id[DCP6_CLOCKS_MAX], hz[DCP6_CLOCKS_MAX];
+};
+
 /* Per-kboot state, used by the armed part. Reset on every call. */
 static struct {
     const struct dcp_soc *soc;
     const struct dcp_fw *fw; /* matched OS firmware row, or NULL */
     struct dcp_fw fw_single;
-    u32 nclk, clk_id[DCP6_CLOCKS_MAX], clk_hz[DCP6_CLOCKS_MAX];
+    struct dcp6_clocks clk;          /* /arm-io/disp0's, for dcp */
     u64 coproc, dart_dcp, dart_disp; /* as checked against the ADT */
     u64 vm_base[2], vm_size[2];      /* DVA windows of dart-dcp and dart-disp0 */
     bool vm_ok;
@@ -2447,32 +2452,33 @@ static int dcp25_publish_clock(void *dt)
                                     sizeof(cells));
 }
 
-/* /arm-io/disp0 clock-ids index /arm-io clock-frequencies from DCP_CLOCK_ID_BASE. */
-static int dcp6_read_disp0_clocks(void)
+/* A pipe's clock-ids (/arm-io/disp0, dispextN) index /arm-io clock-frequencies from 256 */
+static int dcp6_read_clocks(const char *path, struct dcp6_clocks *c)
 {
-    int disp = adt_path_offset(adt, "/arm-io/disp0");
+    int disp = adt_path_offset(adt, path);
     int arm = adt_path_offset(adt, "/arm-io");
     u32 len = 0, flen = 0;
     const u8 *raw_ids = disp < 0 ? NULL : adt_getprop(adt, disp, "clock-ids", &len);
     const u8 *freq = arm < 0 ? NULL : adt_getprop(adt, arm, "clock-frequencies", &flen);
     u32 nclk = raw_ids ? len / sizeof(u32) : 0;
+    memset(c, 0, sizeof(*c));
     if (!nclk || len % sizeof(u32) || nclk > DCP6_CLOCKS_MAX || !freq || flen % sizeof(u32))
-        bail("%s display clock metadata is missing or invalid\n", dcp6.fw->os_fw_name);
+        bail("%s %s clock metadata is missing or invalid\n", dcp6.fw->os_fw_name, path);
     for (u32 i = 0; i < nclk; i++) {
         u32 id, hz;
         memcpy(&id, raw_ids + i * sizeof(u32), sizeof(id));
         if (id < DCP_CLOCK_ID_BASE || id - DCP_CLOCK_ID_BASE >= flen / sizeof(u32))
-            bail("%s display clock %u is out of range\n", dcp6.fw->os_fw_name, id);
+            bail("%s %s clock %u is out of range\n", dcp6.fw->os_fw_name, path, id);
         for (u32 j = 0; j < i; j++)
-            if (dcp6.clk_id[j] == id)
-                bail("%s display clock %u is duplicated\n", dcp6.fw->os_fw_name, id);
+            if (c->id[j] == id)
+                bail("%s %s clock %u is duplicated\n", dcp6.fw->os_fw_name, path, id);
         memcpy(&hz, freq + (id - DCP_CLOCK_ID_BASE) * sizeof(u32), sizeof(hz));
-        dcp6.clk_id[i] = id;
-        dcp6.clk_hz[i] = hz;
+        c->id[i] = id;
+        c->hz[i] = hz;
     }
-    if (!dcp6.clk_hz[0])
-        bail("%s primary display clock frequency is zero\n", dcp6.fw->os_fw_name);
-    dcp6.nclk = nclk;
+    if (!c->hz[0])
+        bail("%s %s primary clock frequency is zero\n", dcp6.fw->os_fw_name, path);
+    c->n = nclk;
     return 0;
 }
 
@@ -2486,38 +2492,55 @@ static bool dcp6_disp0_profile_ok(void)
         dlog("%s DCP image mismatch: nothing done\n", dcp6.fw->os_fw_name);
         return false;
     }
-    return dcp6_read_disp0_clocks() == 0;
+    return dcp6_read_clocks("/arm-io/disp0", &dcp6.clk) == 0;
 }
 
-static int dcp6_publish_disp0_clocks(void *dt, const char *dcp_path)
+/*
+ * One fixed-clock provider /clock-dcp-firmware-<id> per clock, and clocks, clock-names
+ * (firmware-0, firmware-1, ...) and apple,clock-ids on the processor at `dcp_path`. A provider
+ * the device tree already has is used if it is a fixed-clock of the same rate, and refuses the
+ * processor otherwise.
+ */
+static int dcp6_publish_clocks(void *dt, const char *dcp_path, const struct dcp6_clocks *c)
 {
     fdt32_t clocks[DCP6_CLOCKS_MAX], fw_ids[DCP6_CLOCKS_MAX];
     char names[DCP6_CLOCKS_MAX * 12];
     int names_len = 0;
 
-    if (!dcp6.nclk)
+    if (!c->n)
         return -1;
-    for (u32 i = 0; i < dcp6.nclk; i++) {
+    for (u32 i = 0; i < c->n; i++) {
         char name[32], path[36];
-        snprintf(name, sizeof(name), "clock-dcp-firmware-%u", dcp6.clk_id[i]);
+        int len;
+        snprintf(name, sizeof(name), "clock-dcp-firmware-%u", c->id[i]);
         snprintf(path, sizeof(path), "/%s", name);
-        int node = fdt_add_subnode(dt, 0, name);
-        if (node < 0 || fdt_setprop_string(dt, node, "compatible", "fixed-clock") ||
-            fdt_setprop_u32(dt, fdt_path_offset(dt, path), "#clock-cells", 0) ||
-            fdt_setprop_u32(dt, fdt_path_offset(dt, path), "clock-frequency", dcp6.clk_hz[i]))
-            return -1;
+        int node = fdt_subnode_offset(dt, 0, name);
+        if (node >= 0) {
+            const fdt32_t *hz = fdt_getprop(dt, node, "clock-frequency", &len);
+            if (fdt_node_check_compatible(dt, node, "fixed-clock") || !hz || len != 4 ||
+                fdt32_ld(hz) != c->hz[i])
+                bail("%s exists with another rate\n", path);
+            const fdt32_t *cells = fdt_getprop(dt, node, "#clock-cells", &len);
+            if (!cells || len != 4 || fdt32_ld(cells))
+                bail("%s is not a single clock\n", path);
+        } else {
+            node = fdt_add_subnode(dt, 0, name);
+            if (node < 0 || fdt_setprop_string(dt, node, "compatible", "fixed-clock") ||
+                fdt_setprop_u32(dt, fdt_path_offset(dt, path), "#clock-cells", 0) ||
+                fdt_setprop_u32(dt, fdt_path_offset(dt, path), "clock-frequency", c->hz[i]))
+                return -1;
+        }
         u32 ph = dcp6_phandle(dt, path);
         if (!ph)
             return -1;
         clocks[i] = cpu_to_fdt32(ph);
-        fw_ids[i] = cpu_to_fdt32(dcp6.clk_id[i]);
+        fw_ids[i] = cpu_to_fdt32(c->id[i]);
         names_len += snprintf(names + names_len, sizeof(names) - names_len, "firmware-%u", i) + 1;
     }
-    if (fdt_setprop(dt, fdt_path_offset(dt, dcp_path), "clocks", clocks,
-                    dcp6.nclk * sizeof(*clocks)) ||
+    if (fdt_setprop(dt, fdt_path_offset(dt, dcp_path), "clocks", clocks, c->n * sizeof(*clocks)) ||
         fdt_setprop(dt, fdt_path_offset(dt, dcp_path), "clock-names", names, names_len) ||
         fdt_setprop(dt, fdt_path_offset(dt, dcp_path), "apple,clock-ids", fw_ids,
-                    dcp6.nclk * sizeof(*fw_ids)))
+                    c->n * sizeof(*fw_ids)))
         return -1;
     return 0;
 }
@@ -2597,7 +2620,7 @@ static int dcp6_publish(void *dt, const struct dcp6_dt *n)
     dcp = fdt_path_offset(dt, n->dcp);
     if (dcp < 0 || firmware_set_fdt(dt, dcp, "apple,firmware-compat", dcp6_fw_release()))
         return -1;
-    if (dcp6.fw && dcp6.fw->disp0_clocks && dcp6_publish_disp0_clocks(dt, n->dcp))
+    if (dcp6.fw && dcp6.fw->disp0_clocks && dcp6_publish_clocks(dt, n->dcp, &dcp6.clk))
         return -1;
     return 0;
 }
