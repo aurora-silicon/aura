@@ -452,6 +452,40 @@ class Symbols:
         return self.run_base + (self.syms[name] - self.link_base)
 
 
+# Functions whose code the running image must share with --elf before the first call into it.
+IMAGE_CHECK_FUNCS = ("sptm_virt_place", "sptm_virt_config", "sptm_virt_load")
+IMAGE_CHECK_BYTES = 64
+
+
+def elf_load_bytes(elf, vaddr, size):
+    """size bytes at vaddr in the ELF's PT_LOAD segments (as linked, before relocation)."""
+    data = pathlib.Path(elf).read_bytes()
+    phoff, = struct.unpack_from("<Q", data, 0x20)
+    phentsize, phnum = struct.unpack_from("<HH", data, 0x36)
+    for i in range(phnum):
+        p_type, _flags, off, va, _pa, filesz, _memsz, _align = struct.unpack_from(
+            "<IIQQQQQQ", data, phoff + i * phentsize)
+        if p_type == 1 and va <= vaddr and vaddr + size <= va + filesz:
+            return data[off + vaddr - va:off + vaddr - va + size]
+    return None
+
+
+def check_running_image(iface, sym, elf):
+    """Refuse a proxy that isn't running the image in --elf. A host that chainloaded an image
+    and then reached another proxy (the image reset the SoC and an earlier stage came back) would
+    otherwise call that stage at this image's offsets. Code is position-independent, so the
+    running bytes equal the ELF's. Nothing is called or written before this passes."""
+    for name in IMAGE_CHECK_FUNCS:
+        want = elf_load_bytes(elf, sym.syms[name], IMAGE_CHECK_BYTES)
+        if want is None:
+            raise SystemExit(f"{name} isn't in a loadable segment of {elf}")
+        got = iface.readmem(sym[name], IMAGE_CHECK_BYTES)
+        if got != want:
+            raise SystemExit(f"the proxy at base 0x{sym.run_base:x} isn't running {elf}: the code "
+                             f"at {name} differs. Stopping before any call into it.")
+    print(f"running image matches {elf} at base 0x{sym.run_base:x}")
+
+
 def ans_drop_props():
     """AURA_ANS_DROP=quiesced,running: ANS was powered off and back with its CPU stopped, so XNU
     starts it as after a sleep instead of waking iBoot's quiesced session."""
@@ -894,8 +928,10 @@ def main():
     iface = UartInterface()
     p = AuraProxy(iface, debug=False)
     bootstrap_port(iface, p)
-    u = ProxyUtils(p, heap_size=128 * 1024 * 1024, aura_heap=aura_heap_size)
+    # Before anything else talks to it (ProxyUtils sets the proxy's heap up): is this the image?
     sym = Symbols(args.nm, args.elf, p.get_base())
+    check_running_image(iface, sym, args.elf)
+    u = ProxyUtils(p, heap_size=128 * 1024 * 1024, aura_heap=aura_heap_size)
 
     # SPTM's managed window, as aura computed it: above aura and everything iBoot left low,
     # below aura's carve-out.
