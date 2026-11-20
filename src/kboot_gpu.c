@@ -4264,6 +4264,59 @@ static T6050_GPU_INIT int dt_set_gpu_g17c(void *dt)
     return ret;
 }
 
+/*
+ * T8103 (G13G) on GPU firmware 27.2. The kernel builds the 27.2 init data itself from the
+ * same inputs as the 13.5 path, so there are no hw-cal-a/hw-cal-b/globals blobs. Publish what
+ * that path needs instead:
+ * - the shared second-level UAT table (gfx-shared-l2-region) as the "shared-l2" region,
+ * - "apple,agx-t8103-identify" ahead of the gpu node's other compatibles,
+ * - the firmware's meta software interrupt and coredump copy buffer size,
+ * - /chosen/aurora-gpu-resources/sgx, with the ADT's SRAM operating points if it has them.
+ */
+static int dt_set_gpu_t8103_27(void *dt, int sgx)
+{
+    static const char compatible[] =
+        "apple,agx-t8103-identify\0apple,agx-t8103\0apple,agx-g13g";
+    int len;
+
+    if (dt_set_region(dt, sgx, "gfx-shared-l2-region", "/reserved-memory/uat-pagetables-l2"))
+        return -1;
+
+    const u8 *irq = adt_getprop(adt, sgx, "meta-sw-interrupt", &len);
+    if (!irq || len < 8)
+        bail("ADT: GPU: meta-sw-interrupt not found\n");
+    u64 meta_irq;
+    memcpy(&meta_irq, irq, sizeof(meta_irq));
+
+    int gpu = fdt_path_offset(dt, "gpu");
+    if (gpu < 0)
+        bail("FDT: GPU: gpu alias not found in device tree\n");
+    if (fdt_setprop(dt, gpu, "compatible", compatible, sizeof(compatible)) ||
+        fdt_setprop_u64(dt, gpu, "apple,meta-sw-interrupt", meta_irq) ||
+        fdt_setprop_u32(dt, gpu, "apple,coredump-copy-buffer", 0x8000))
+        bail("FDT: GPU: failed to set the 27.2 gpu properties\n");
+
+    int chosen = fdt_path_offset(dt, "/chosen");
+    if (chosen < 0)
+        bail("FDT: GPU: /chosen not found\n");
+    int res = fdt_subnode_offset(dt, chosen, "aurora-gpu-resources");
+    if (res < 0)
+        res = fdt_add_subnode(dt, chosen, "aurora-gpu-resources");
+    if (res < 0)
+        bail("FDT: GPU: failed to add aurora-gpu-resources\n");
+    int node = fdt_add_subnode(dt, res, "sgx");
+    if (node < 0)
+        bail("FDT: GPU: failed to add aurora-gpu-resources/sgx\n");
+
+    const void *sram = adt_getprop(adt, sgx, "perf-states-sram", &len);
+    if (sram && len > 0 && fdt_setprop(dt, node, "adt-perf-states-sram", sram, len))
+        bail("FDT: GPU: failed to set adt-perf-states-sram\n");
+
+    printf("FDT: GPU: T8103 firmware 27.2: identify node, meta interrupt %#lx, SRAM table %s\n",
+           meta_irq, sram ? "from the ADT" : "absent");
+    return 0;
+}
+
 int dt_set_gpu(void *dt)
 {
     if (chip_id == T8152) {
@@ -4554,6 +4607,8 @@ int dt_set_gpu(void *dt)
          * kernel can't start the GPU without one, but everything else can still boot: leave the
          * GPU off instead of refusing the whole device tree.
          */
+        if (chip_id == T8103 && compat->num[0] == 27 && compat->num[1] == 2)
+            return dt_set_gpu_t8103_27(dt, sgx);
         printf("FDT: GPU: no init data for firmware %u.%u, booting with the GPU disabled\n",
                compat->num[0], compat->num[1]);
         gpu = fdt_path_offset(dt, "gpu");
