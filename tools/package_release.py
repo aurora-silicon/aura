@@ -36,6 +36,8 @@ def main():
     files += [repo / "LICENSE", repo / "docs/releases/0.1.0.md"]
     files += [repo / "docs/boot-options.md", repo / "docs/j700-install.md",
               repo / "docs/stage2-dtbs.md", repo / "tools/compose_stage2.py"]
+    # The one copy of which chips pad the Stage 1 boot object, for the installer and its tools.
+    files += [repo / "data/execute-window.json", repo / "tools/execute_window.py"]
     files += [repo / "docs/macho-boot-object.md"]
     for folder in ("LICENSES", "3rdparty_licenses"):
         files += sorted(p for p in (repo / folder).rglob("*") if p.is_file())

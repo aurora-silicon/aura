@@ -48,8 +48,9 @@ SECTIONS {
      */
     .text : {
         _text_content_start = .;
-        *(.text)
-        *(.text.*)
+        *(EXCLUDE_FILE(*sptm_virt*.o) .text .text.*)
+        /* The largest guest-only object; the others are in .rodata, so both fill their steps. */
+        *sptm_virt_s2r.o(.text .text.*)
         . = ALIGN(8);
         *(.got.plt)
         _text_content_end = .;
@@ -57,7 +58,10 @@ SECTIONS {
     } :text
     _text_size = . - _text_start;
     .rodata : ALIGN(0x10000) {
-        *(.rodata)
+        /* Guest-only code uses the existing executable read-only region. */
+        *sptm_virt*.o(.text .text.*)
+        /* The compressed logos are .rodata (Makefile), but they go with the pixel data below. */
+        *(EXCLUDE_FILE(*_48.o *_128.o *_256.o) .rodata)
         *(.rodata.*)
         . = ALIGN(8);
     } :rodata
@@ -103,9 +107,9 @@ SECTIONS {
         _file_vital_end = .;
         *font.o(.data)
         *font_retina.o(.data)
-        *_48.o(.data)
-        *_128.o(.data)
-        *_256.o(.data)
+        *_48.o(.data .rodata)
+        *_128.o(.data .rodata)
+        *_256.o(.data .rodata)
         . = ALIGN(0x10000);
         _file_end = .;
     } :data

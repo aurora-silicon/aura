@@ -99,6 +99,21 @@ struct tz_regs t8142_tz_regs = {
 #define T8142_CACHE_STATUS_DATA_COUNT GENMASK(30, 24)
 #define T8142_CACHE_STATUS_TAG_COUNT  GENMASK(14, 8)
 
+/*
+ * The one mcc,t6041 layout the firmware-cache path admits (J616s, J614s, J773s): the ADT must
+ * describe exactly this, and every plane's cache status must read as expected.
+ */
+#define T6041_MCC_REG_IDX         12
+#define T6041_MCC_COUNT           4
+#define T6041_MCC_CHANNELS        4
+#define T6041_MCC_PLANES          4
+#define T6041_MCC_PLANE_STRIDE    0x40000
+#define T6041_MCC_APERTURE_BASE   0x220000000ULL
+#define T6041_MCC_APERTURE_STRIDE 0x2000000ULL
+#define T6041_MCC_APERTURE_SIZE   0x200000
+#define T6041_CACHE_STATUS_MASK   0x1f001f00
+#define T6041_CACHE_STATUS_EXPECT 0x0c000c00
+
 #define T8103_CACHE_STATUS_DATA_COUNT GENMASK(14, 10)
 #define T8103_CACHE_STATUS_TAG_COUNT  GENMASK(9, 5)
 
@@ -265,10 +280,27 @@ int mcc_unmap_carveouts(void)
     // mapped as normal memory.
     if (!mcc_initialized || !mcc_regs[0].tz || !mcc_regs[0].tz->count) {
         static const char *const names[] = {"region-id-4", "region-id-2"};
+        /*
+         * The ADT list is required only where the SoC has an MCC. Every Apple Silicon Mac ADT has
+         * /arm-io/mcc and a /chosen/carveout-memory-map with region-id-2/-4 filled in by iBoot.
+         * Older SoCs that aura also boots (A7-A11, T2) have no /arm-io/mcc node; their carveout
+         * list, if any, is used as far as it goes, and nothing missing there is fatal.
+         */
+        bool required = adt_path_offset(adt, "/arm-io/mcc") >= 0;
         int node = adt_path_offset(adt, "/chosen/carveout-memory-map");
 
-        if (node < 0)
+        if (node < 0) {
+            if (!required) {
+                printf("MMU: no MCC and no ADT carveout-memory-map; no carveouts to unmap\n");
+                return 0;
+            }
+            /*
+             * An MCC without known TZ registers and no ADT list: aura cannot tell where the
+             * firmware-owned TZ memory is, so it cannot keep it out of its own RWX map.
+             */
+            printf("MMU: no MCC TZ registers and no ADT carveout-memory-map\n");
             return -1;
+        }
         if (mem_size_actual > UINT64_MAX - ram_base)
             return -1;
         for (size_t i = 0; i < ARRAY_SIZE(names); i++) {
@@ -276,15 +308,25 @@ int mcc_unmap_carveouts(void)
             const u64 *range = adt_getprop(adt, node, names[i], &len);
             u64 start, size;
 
-            if (!range || len != 2 * sizeof(u64))
-                return -1;
+            if (!range || len != 2 * sizeof(u64)) {
+                printf("MMU: ADT carveout-memory-map has no usable %s%s\n", names[i],
+                       required ? "" : " (no MCC; skipped)");
+                if (required)
+                    return -1;
+                continue;
+            }
             memcpy(&start, range, sizeof(start));
             memcpy(&size, range + 1, sizeof(size));
             if (!size || start < ram_base || start > UINT64_MAX - size ||
                 start + size > ram_base + mem_size_actual ||
                 ((start | size) & (get_page_size() - 1)) ||
-                mcc_carveout_count >= ARRAY_SIZE(mcc_carveouts) - 1)
-                return -1;
+                mcc_carveout_count >= ARRAY_SIZE(mcc_carveouts) - 1) {
+                printf("MMU: ADT %s 0x%lx+0x%lx is outside RAM or unaligned%s\n", names[i], start,
+                       size, required ? "" : " (no MCC; skipped)");
+                if (required)
+                    return -1;
+                continue;
+            }
 
             printf("MMU: Unmapping %s at 0x%lx..0x%lx\n", names[i], start, start + size);
             mmu_rm_mapping(start, size);
@@ -600,6 +642,17 @@ int mcc_init_m4(int node, int *path)
     return 0;
 }
 
+/* The AMCC planes of one instance, for a caller that watches them (sptm_virt_s2.c). */
+int mcc_plane_info(int mcc, u64 *base, u64 *stride, int *count)
+{
+    if (!mcc_initialized || mcc < 0 || mcc >= mcc_count)
+        return -1;
+    *base = mcc_regs[mcc].plane_base;
+    *stride = mcc_regs[mcc].plane_stride;
+    *count = mcc_regs[mcc].plane_count;
+    return 0;
+}
+
 /* T8142 (M5): the T8122 plane layout with the DCS block at +16 MiB, four planes per AMCC and
  * the plane cache controls at 0x2800. */
 static int mcc_init_m5(int node, int *path)
@@ -679,10 +732,13 @@ static int mcc_init_firmware_cache(int node, int *path)
     if (!planes || planes > INT32_MAX || !stride || (stride & 3))
         return -1;
 
-    /* Restrict this path to the observed J616s and J614s layouts. */
-    if (t6041 && (chip_id != T6040 ||
-                  !(board_id == 6 || (board_id == 4 && adt_is_compatible(adt, 0, "J614sAP"))) ||
-                  reg_idx != 12 || count != 4 || channels != 4 || planes != 4 || stride != 0x40000))
+    /*
+     * Admit mcc,t6041 by what the ADT describes, not by board or chip: this geometry here, the
+     * apertures and the live cache status below.
+     */
+    if (t6041 && (reg_idx != T6041_MCC_REG_IDX || count != T6041_MCC_COUNT ||
+                  channels != T6041_MCC_CHANNELS || planes != T6041_MCC_PLANES ||
+                  stride != T6041_MCC_PLANE_STRIDE))
         return -1;
 
     mcc_count = count;
@@ -691,7 +747,8 @@ static int mcc_init_firmware_cache(int node, int *path)
         if (reg_idx > (u32)(INT32_MAX - i) ||
             adt_get_reg(adt, path, "reg", reg_idx + i, &base, &size) || !base ||
             (planes - 1) > (UINT64_MAX - 4) / stride || (planes - 1) * stride + 4 > size ||
-            (t6041 && (base != 0x220000000 + (u64)i * 0x2000000 || size != 0x200000)))
+            (t6041 && (base != T6041_MCC_APERTURE_BASE + i * T6041_MCC_APERTURE_STRIDE ||
+                       size != T6041_MCC_APERTURE_SIZE)))
             return -1;
         mcc_regs[i].plane_base = base;
         mcc_regs[i].plane_stride = stride;
@@ -704,8 +761,8 @@ static int mcc_init_firmware_cache(int node, int *path)
     if (t6041) {
         for (int i = 0; i < mcc_count; i++) {
             for (int plane = 0; plane < mcc_regs[i].plane_count; plane++) {
-                u32 status = plane_read32(i, plane, 0x2804);
-                if ((status & 0x1f001f00) != 0x0c000c00) {
+                u32 status = plane_read32(i, plane, T8142_PLANE_CACHE_STATUS);
+                if ((status & T6041_CACHE_STATUS_MASK) != T6041_CACHE_STATUS_EXPECT) {
                     printf("MCC: Unexpected cache status on MCC %d plane %d: 0x%x\n", i, plane,
                            status);
                     return -1;
@@ -726,8 +783,12 @@ int mcc_init(void)
     int node = adt_path_offset_trace(adt, "/arm-io/mcc", path);
 
     if (node < 0) {
-        printf("MCC: MCC node not found!\n");
-        return -1;
+        /*
+         * No MCC in the ADT (A7-A11, T2): nothing to initialize here. mcc_unmap_carveouts() then
+         * uses whatever carveout list the ADT has, without requiring one.
+         */
+        printf("MCC: no /arm-io/mcc in the ADT; no MCC on this SoC\n");
+        return MCC_ABSENT;
     }
 
     if (adt_is_compatible(adt, node, "mcc,t8103")) {
@@ -753,7 +814,12 @@ int mcc_init(void)
     } else if (adt_is_compatible(adt, node, "mcc,t6031")) {
         return mcc_init_m3(node, path);
     } else {
+        /*
+         * An MCC revision aura has no driver for: no cache control and no TZ registers. This is
+         * not a failure of a known block; carveouts then come from the ADT list, which
+         * mcc_unmap_carveouts() requires.
+         */
         printf("MCC: Unsupported version:%s\n", adt_get_property(adt, node, "compatible")->value);
-        return -1;
+        return MCC_UNSUPPORTED;
     }
 }

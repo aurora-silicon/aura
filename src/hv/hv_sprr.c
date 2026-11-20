@@ -32,14 +32,31 @@ static u8 sprr_perm_nibble(u64 perm, u32 index)
 
 bool hv_sprr_active = false;
 
+static struct hv_sprr_cpu hv_sprr_cpus[MAX_CPUS];
+/*
+ * The shadow cache and the write-protect hash are allocated when emulation is first enabled, not
+ * kept in .bss: on T8140 .bss must end below the DCP __OS_LOG buffers iBoot places after stage 1.
+ */
+static struct hv_sprr_shadow *sprr_shadows;
+static struct sprr_wp_page **sprr_wp_hash;
+
 void hv_sprr_set_active(bool active)
 {
+    if (active && !sprr_shadows) {
+        struct hv_sprr_shadow *sh = calloc(SPRR_N_CACHED_SHADOWS, sizeof(*sh));
+        struct sprr_wp_page **wp = calloc(SPRR_WP_N_BUCKETS, sizeof(*wp));
+        if (!sh || !wp) {
+            printf("HV: cannot allocate the emulated SPRR tables; emulation stays off\n");
+            free(sh);
+            free(wp);
+            return;
+        }
+        sprr_shadows = sh;
+        sprr_wp_hash = wp;
+    }
     printf("HV: emulated SPRR/GXF %s\n", active ? "enabled" : "disabled");
     hv_sprr_active = active;
 }
-
-static struct hv_sprr_cpu hv_sprr_cpus[MAX_CPUS];
-static struct hv_sprr_shadow sprr_shadows[SPRR_N_CACHED_SHADOWS];
 static u32 sprr_lru_clock;
 
 static struct hv_sprr_cpu *hv_sprr_this(void)
@@ -57,8 +74,6 @@ static int sprr_start_level(u32 va_bits)
     return 3;
 }
 
-static struct sprr_wp_page *sprr_wp_hash[SPRR_WP_N_BUCKETS];
-
 static struct sprr_wp_page **sprr_wp_bucket(u64 ipa)
 {
     return &sprr_wp_hash[(ipa >> SPRR_PAGE_SHIFT) & (SPRR_WP_N_BUCKETS - 1)];
@@ -67,6 +82,8 @@ static struct sprr_wp_page **sprr_wp_bucket(u64 ipa)
 static struct sprr_wp_page *sprr_wp_find(u64 ipa)
 {
     ipa &= ~(u64)(SZ_16K - 1);
+    if (!sprr_wp_hash)
+        return NULL;
     for (struct sprr_wp_page *wp = *sprr_wp_bucket(ipa); wp; wp = wp->hnext)
         if (wp->ipa == ipa)
             return wp;
@@ -444,6 +461,8 @@ static struct hv_sprr_shadow *sprr_get_shadow(struct exc_info *ctx, struct hv_sp
 {
     struct hv_sprr_shadow *slot = NULL;
 
+    if (!sprr_shadows)
+        return NULL;
     if (va_bits < SPRR_PAGE_SHIFT || va_bits > 48 || (guest_ttbr & TTBR_BADDR & (SZ_16K - 1)) ||
         !hv_pt_is_ram(guest_ttbr & SPRR_OA_MASK)) {
         printf("hv_sprr: unsupported TTBR%d root 0x%lx (%d VA bits)\n", ttbr_idx, guest_ttbr,
@@ -639,6 +658,8 @@ static void sprr_write_sctlr(struct exc_info *ctx, struct hv_sprr_cpu *cpu, u64 
 
 static void sprr_drop_asid(u64 asid)
 {
+    if (!sprr_shadows)
+        return;
     for (int i = 0; i < SPRR_N_CACHED_SHADOWS; i++) {
         struct hv_sprr_shadow *sh = &sprr_shadows[i];
 

@@ -1903,12 +1903,12 @@ dwc3_dev_t *usb_dwc3_init(uintptr_t regs, dart_dev_t *dart)
     set32(dev->regs + DWC3_GCTL, DWC3_GCTL_CORESOFTRESET);
     set32(dev->regs + DWC3_GUSB3PIPECTL(0), DWC3_GUSB3PIPECTL_PHYSOFTRST);
     set32(dev->regs + DWC3_GUSB2PHYCFG(0), DWC3_GUSB2PHYCFG_PHYSOFTRST);
-    mdelay(100);
+    usb_cdc_wait_us(100000);
     clear32(dev->regs + DWC3_GUSB3PIPECTL(0), DWC3_GUSB3PIPECTL_PHYSOFTRST);
     clear32(dev->regs + DWC3_GUSB2PHYCFG(0), DWC3_GUSB2PHYCFG_PHYSOFTRST);
-    mdelay(100);
+    usb_cdc_wait_us(100000);
     clear32(dev->regs + DWC3_GCTL, DWC3_GCTL_CORESOFTRESET);
-    mdelay(100);
+    usb_cdc_wait_us(100000);
 
 #if USB_DWC3_SUPERSPEED
     clear32(dev->regs + DWC3_GUSB2PHYCFG(0), DWC3_GUSB2PHYCFG_SUSPHY);
@@ -2281,16 +2281,23 @@ void usb_dwc3_flush(dwc3_dev_t *dev, cdc_acm_pipe_id_t pipe)
         return;
 
     u8 ep = dev->pipe[pipe].ep_in;
-    /* After the host restores KIS, USB2 may retain an open pipe with TX
-     * pending. Console flushing must not block a guarded RAM handoff. */
-    bool bounded = USB_DWC3_SUPERSPEED || chip_id == T8122 || chip_id == T8142 ||
-                   chip_id == T8152 || chip_id == T6050;
-    u64 start = get_ticks();
+    /* A host that keeps the pipe open but stops reading (one that restored KIS
+     * leaves USB2 that way, a hung or detached one too) would hold the flush,
+     * and with it a guarded RAM handoff, forever. Give up once the ring has not
+     * drained for CDC_IO_TIMEOUT_MS; a host that is reading keeps it going. */
+    u64 last_progress = get_ticks();
+    size_t pending = ringbuffer_get_used(device2host);
 
     while (CDC_LOOP_READY(dev, pipe) &&
            (ringbuffer_get_used(device2host) != 0 || dev->endpoints[ep].xfer_in_progress)) {
-        if (bounded && ticks_to_msecs(get_ticks() - start) >= 3000)
+        size_t used = ringbuffer_get_used(device2host);
+        if (used < pending) {
+            pending = used;
+            last_progress = get_ticks();
+        } else if (ticks_to_msecs(get_ticks() - last_progress) >= CDC_IO_TIMEOUT_MS) {
+            /* No printf: the console may be this pipe. */
             return;
+        }
         usb_dwc3_handle_events(dev);
 #if !USB_DWC3_SUPERSPEED
         usb_dwc3_cdc_start_bulk_in_xfer(dev, ep);

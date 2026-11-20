@@ -167,6 +167,11 @@ void asc_i2a_enable(asc_dev_t *asc, bool on)
         clear32(asc->base + ASC_MBOX_I2A_CONTROL, ASC_MBOX_CONTROL_ENABLE);
 }
 
+u32 asc_cpu_status(asc_dev_t *asc)
+{
+    return read32(asc->cpu_base + ASC_CPU_STATUS);
+}
+
 /* Stopped in its idle loop, as an IOP that acknowledged an idle request reads. */
 bool asc_cpu_idle(asc_dev_t *asc)
 {

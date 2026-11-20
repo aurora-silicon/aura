@@ -12,6 +12,7 @@
 #include "sart.h"
 #include "string.h"
 #include "utils.h"
+#include "xnuboot.h"
 
 #define NVME_TIMEOUT 1000000
 /*
@@ -26,7 +27,14 @@
 
 static u32 nvme_cmd_timeout_us = NVME_TIMEOUT;
 
-#define NVME_CC             0x14
+/* NVMe Base Specification 2.0, 3.1.4.1: CAP.MPSMIN, the smallest host memory page size. */
+#define NVME_CAP        0x00
+#define NVME_CAP_MPSMIN GENMASK(51, 48)
+
+#define NVME_CC 0x14
+/* 3.1.4.5: CC.MPS, host memory page size 2^(12 + MPS); PRP entries use it (4.1.1). */
+#define NVME_CC_MPS         GENMASK(10, 7)
+#define NVME_CC_MPS_4K      0
 #define NVME_CC_SHN         GENMASK(15, 14)
 #define NVME_CC_SHN_NONE    0
 #define NVME_CC_SHN_NORMAL  1
@@ -161,6 +169,7 @@ static int nvme_sart_saved_cnt;
 /* aura only reads the drive; only a proxy-issued flush means the drive has data to settle. */
 static bool nvme_wrote;
 bool nvme_keep_running_for_linux = false;
+bool nvme_quiesce_for_next = false;
 static u8 nvme_die;
 /* When this stage started the ANS firmware, for the shutdown timing line. */
 static u64 nvme_boot_ticks;
@@ -179,6 +188,8 @@ static struct nvme_queue adminq, ioq;
 static bool nvme_cmd_timed_out;
 static bool nvme_multi_enabled = true;
 static bool nvme_multi_verified;
+/* Multi-block reads served one block at a time after the multi-block path was turned off. */
+static u32 nvme_multi_fallback_reads;
 static u64 *nvme_prp_list;
 static u8 *nvme_verify_bounce;
 
@@ -436,6 +447,39 @@ bool nvme_post_m4(void)
                          adt_get_property(adt, node, "nvme-secure-reg-layout"));
 }
 
+/* ANS is powered through its own storage gates (pcie_ans_power_off()), not the APCIe block. */
+static bool nvme_ans_storage_gated(void)
+{
+    return chip_id == T6050 || chip_id == T8142;
+}
+
+/* An adopted session has no RTKit instance of this stage's until it is powered off or quiesced. */
+static bool nvme_own_rtkit(void)
+{
+    return nvme_rtkit ||
+           (nvme_rtkit = rtkit_init("nvme", nvme_asc, NULL, NULL, nvme_sart, false)) != NULL;
+}
+
+/*
+ * T6040/T6041 (M4 Pro/Max): a cold start of ANS after the generic power-off gets no RTKit HELLO
+ * (ASC CPU running, pmgr domains on), and an RTKit quiesce times out. T8132 (M4): the same cold
+ * start intermittently leaves the next stage without NVMe after a warm reboot. Keep ANS live
+ * between stages and adopt it in the next stage, as T6050 does.
+ *
+ * Not every post-M4 ANS (nvme_post_m4()) is listed. T8152 stays quiesced: its Linux driver wakes
+ * ANS with a fresh RTKit handshake and neither adopts a live session nor restarts a stopped one.
+ * T8140 keeps the power-off path, which works there; live adoption by the next stage is untested.
+ */
+static bool nvme_post_m4_keeps_live(void)
+{
+    return chip_id == T6040 || chip_id == T6041 || chip_id == T8132;
+}
+
+static bool nvme_post_m4_hands_on_live(void)
+{
+    return nvme_ans_storage_gated() || nvme_post_m4_keeps_live();
+}
+
 /*
  * Post-M4, done with ANS: stop the controller, idle the firmware as macOS does before a sleep,
  * keep the SART entries, then power ANS and the PCIe block it runs on off. Every later stage that
@@ -445,14 +489,17 @@ bool nvme_post_m4(void)
  */
 static bool nvme_ans_power_off(void)
 {
-    /* An adopted session has no RTKit instance of this stage's until it is powered off. */
-    if (!nvme_rtkit && !(nvme_rtkit = rtkit_init("nvme", nvme_asc, NULL, NULL, nvme_sart, false)))
+    if (!nvme_own_rtkit())
         return false;
     if (chip_id == T6050) {
         if ((read32(nvme_base + NVME_CC) & NVME_CC_EN) && !nvme_ctrl_suspend())
             printf("nvme: controller suspend timed out\n");
     } else if (read32(nvme_base + NVME_CC) & NVME_CC_EN) {
-        if (nvme_wrote && !nvme_ctrl_shutdown())
+        /*
+         * T8142: the firmware's context is saved by the normal shutdown, which an adopted
+         * session's idle (its RTKit started elsewhere) may not acknowledge before the stop.
+         */
+        if ((nvme_wrote || chip_id == T8142) && !nvme_ctrl_shutdown())
             printf("nvme: controller shutdown timed out\n");
         if (!nvme_ctrl_disable())
             printf("nvme: controller disable timed out\n");
@@ -525,6 +572,7 @@ bool nvme_init(void)
     memset(&ioq, 0, sizeof(ioq));
     nvme_multi_enabled = true;
     nvme_multi_verified = false;
+    nvme_multi_fallback_reads = 0;
     nvme_prp_list = NULL;
     nvme_verify_bounce = NULL;
     nvme_boot_ticks = 0;
@@ -647,8 +695,9 @@ bool nvme_init(void)
         /*
          * T6050: adopt a healthy session as it is. Left 16 s (an ESP Stage 2 behind its host
          * window), its firmware no longer acknowledged the idle, and ANS didn't start from off.
+         * T8142 does the same with a session an older stage handed on running.
          */
-        adopted = earlier && chip_id == T6050 &&
+        adopted = earlier && nvme_post_m4_hands_on_live() &&
                   read32(nvme_base + NVME_BOOT_STATUS) == NVME_BOOT_STATUS_OK &&
                   !(read32(nvme_base + NVME_CSTS) & NVME_CSTS_CFS);
         from_off = !running || (earlier && !adopted);
@@ -702,6 +751,25 @@ setup_controller:
         printf("nvme: timeout while waiting for CSTS.RDY to clear\n");
         goto out_shutdown;
     }
+    /*
+     * The PRPs nvme_read_blocks() builds describe 4 KiB memory pages: PRP2 is the second page,
+     * or a list of 4 KiB page addresses. The controller reads them in CC.MPS pages, and CC keeps
+     * whatever the previous owner wrote, so set 4 KiB here, while CC.EN is clear (3.1.4.5), as
+     * Linux does. A controller that can't take 4 KiB pages (CAP.MPSMIN) gets single-block
+     * reads only: a 4 KiB transfer at a 4 KiB-aligned PRP1 fits any page size.
+     */
+    u64 cap = nvme_read64_lo_hi(nvme_base + NVME_CAP);
+    u32 cc = read32(nvme_base + NVME_CC);
+    if (FIELD_GET(NVME_CAP_MPSMIN, cap)) {
+        printf("nvme: CAP 0x%lx: MPSMIN %lu is above 4 KiB pages; reading one block per "
+               "command\n",
+               cap, FIELD_GET(NVME_CAP_MPSMIN, cap));
+        nvme_multi_enabled = false;
+    } else if (FIELD_GET(NVME_CC_MPS, cc) != NVME_CC_MPS_4K) {
+        printf("nvme: CC.MPS was %u (%u KiB pages) from the previous owner; setting 4 KiB\n",
+               (u32)FIELD_GET(NVME_CC_MPS, cc), 4u << (u32)FIELD_GET(NVME_CC_MPS, cc));
+        mask32(nvme_base + NVME_CC, NVME_CC_MPS, FIELD_PREP(NVME_CC_MPS, NVME_CC_MPS_4K));
+    }
     write64_lo_hi(nvme_qreg(NVME_ASQ), (u64)adminq.cmds);
     write64_lo_hi(nvme_qreg(NVME_ACQ), (u64)adminq.cqes);
     write32(nvme_qreg(NVME_AQA), ((NVME_QUEUE_SIZE - 1) << 16) | (NVME_QUEUE_SIZE - 1));
@@ -714,7 +782,7 @@ setup_controller:
                "BOOT_STATUS=0x%x\n",
                read32(nvme_base + NVME_CC), read32(nvme_base + NVME_CSTS),
                read32(nvme_base + NVME_BOOT_STATUS));
-        if (earlier && !restarted && chip_id == T6050) {
+        if (earlier && !restarted && nvme_ans_storage_gated()) {
             restarted = true;
             if (!nvme_ans_power_off() || !nvme_ans_power_on())
                 goto out_preserve;
@@ -880,6 +948,9 @@ bool nvme_shutdown(void)
         // nvme_ensure_shutdown();
         return true;
     }
+    if (nvme_multi_fallback_reads)
+        printf("nvme: %u multi-block reads were served one block per command\n",
+               nvme_multi_fallback_reads);
 
     /* A failed queue can still own DMA even when the controller looks ready. */
     if (nvme_type == NVME_T8132 && (adminq.failed || ioq.failed))
@@ -921,7 +992,23 @@ bool nvme_shutdown(void)
             goto out_preserve;
     }
 
-    if (nvme_type == NVME_T8132 && !nvme_secure_regs) {
+    /*
+     * T6040/T6041: the firmware acknowledges neither an RTKit power transition (quiesce times out)
+     * nor a start after power-off (no HELLO), but a session left fully running is adopted by the
+     * next nvme_init() and reads correctly (J614c, 3/3 cycles). T8132 is handed on the same way
+     * (J713). Hand it on with the controller enabled and RTKit untouched; only the I/O queue
+     * registers are cleared. A next stage that asks for a quiesced ANS still gets one.
+     */
+    if (nvme_type == NVME_T8132 && nvme_post_m4_keeps_live() && !nvme_quiesce_for_next) {
+        write64_lo_hi(nvme_qreg(NVME_IOQ_CMDS), 0);
+        write64_lo_hi(nvme_qreg(NVME_IOQ_CQES), 0);
+        nvme_initialized = false;
+        printf("nvme: handing the live ANS session on: CC=0x%x CSTS=0x%x BOOT_STATUS=0x%x\n",
+               read32(nvme_base + NVME_CC), read32(nvme_base + NVME_CSTS),
+               read32(nvme_base + NVME_BOOT_STATUS));
+        return true;
+    }
+    if (nvme_type == NVME_T8132 && !nvme_secure_regs && !nvme_quiesce_for_next) {
         write64_lo_hi(nvme_qreg(NVME_IOQ_CMDS), 0);
         write64_lo_hi(nvme_qreg(NVME_IOQ_CQES), 0);
         if (!nvme_ans_power_off())
@@ -957,7 +1044,7 @@ bool nvme_shutdown(void)
          * nor restarts a stopped ANS. Quiesce RTKit and leave the ASC running, as iBoot does. */
         write64_lo_hi(nvme_qreg(NVME_IOQ_CMDS), 0);
         write64_lo_hi(nvme_qreg(NVME_IOQ_CQES), 0);
-        if (!rtkit_quiesce(nvme_rtkit))
+        if (!nvme_own_rtkit() || !rtkit_quiesce(nvme_rtkit))
             goto out_preserve;
         nvme_initialized = false;
         printf("nvme: controller disabled, RTKit quiesced\n");
@@ -1105,6 +1192,7 @@ bool nvme_read_blocks(u32 nsid, u64 lba, void *buffer, u32 count)
         if (count > 2 && !nvme_prp_list)
             nvme_prp_list = memalign(SZ_16K, SZ_4K);
         if (nvme_verify_bounce && (count <= 2 || nvme_prp_list)) {
+            /* NVMe 2.0 4.1.1: PRP1 is the first page; PRP2 the second, or a PRP list. */
             u64 prp2 = (u64)buffer + SZ_4K;
             if (count > 2) {
                 for (u32 i = 1; i < count; i++)
@@ -1113,7 +1201,11 @@ bool nvme_read_blocks(u32 nsid, u64 lba, void *buffer, u32 count)
             }
             if (!nvme_multi_verified)
                 memset(buffer, 0xa5, (size_t)count * SZ_4K);
-            if (nvme_submit_read(nsid, lba, buffer, count, prp2)) {
+            if (!nvme_submit_read(nsid, lba, buffer, count, prp2)) {
+                /* The failed command's status is printed by nvme_exec_command(). */
+                printf("nvme: %u-block read at LBA 0x%lx failed%s\n", count, lba,
+                       nvme_multi_verified ? " after earlier reads verified" : "");
+            } else {
                 if (nvme_multi_verified)
                     return true;
 
@@ -1122,8 +1214,21 @@ bool nvme_read_blocks(u32 nsid, u64 lba, void *buffer, u32 count)
                 for (u32 i = 0; i < 2; i++) {
                     u32 block = i ? count - 1 : 0;
                     memset(nvme_verify_bounce, 0x5a, SZ_4K);
-                    if (!nvme_submit_read(nsid, lba + block, nvme_verify_bounce, 1, 0) ||
-                        memcmp(nvme_verify_bounce, bytes + (size_t)block * SZ_4K, SZ_4K)) {
+                    if (!nvme_submit_read(nsid, lba + block, nvme_verify_bounce, 1, 0)) {
+                        printf("nvme: single-block read of LBA 0x%lx for the check failed\n",
+                               lba + block);
+                        verified = false;
+                        break;
+                    }
+                    const u8 *got = bytes + (size_t)block * SZ_4K;
+                    if (memcmp(nvme_verify_bounce, got, SZ_4K)) {
+                        u32 off = 0;
+                        while (got[off] == nvme_verify_bounce[off])
+                            off++;
+                        printf("nvme: %u-block read at LBA 0x%lx: block %u (LBA 0x%lx) differs "
+                               "from a single-block read at byte 0x%x (0x%02x, want 0x%02x)\n",
+                               count, lba, block, lba + block, off, got[off],
+                               nvme_verify_bounce[off]);
                         verified = false;
                         break;
                     }
@@ -1136,10 +1241,15 @@ bool nvme_read_blocks(u32 nsid, u64 lba, void *buffer, u32 count)
             }
             if (nvme_cmd_timed_out)
                 return false;
-            printf("nvme: multi-block read failed verification; using single blocks\n");
+            printf("nvme: multi-block reads OFF for this boot; reading one block per command\n");
+            nvme_multi_enabled = false;
+        } else {
+            printf("nvme: no memory for the PRP list; reading one block per command\n");
             nvme_multi_enabled = false;
         }
     }
+    if (count > 1 && !nvme_multi_enabled)
+        nvme_multi_fallback_reads++;
 
     u8 *bytes = buffer;
     for (u32 i = 0; i < count; i++) {
@@ -1179,3 +1289,210 @@ bool nvme_write(u32 nsid, u64 lba, const void *buffer)
 
     return nvme_exec_io_write(&cmd, "write");
 }
+
+#ifdef SPTM_VIRT
+/*
+ * What an aura stage gave ANS: its RTKit buffers, in the OS's DRAM (cur_boot_args), outside the
+ * firmware's own segments. iBoot's entries (MMIO pages, its carve-outs) stay for XNU.
+ */
+static bool nvme_aura_memory(int nub, u64 pa, u64 size)
+{
+    u32 len = 0;
+    const u8 *seg = adt_getprop(adt, nub, "segment-ranges", &len);
+    struct adt_segment_ranges r;
+
+    if (pa < cur_boot_args.phys_base ||
+        pa + size > cur_boot_args.phys_base + cur_boot_args.mem_size)
+        return false;
+    for (u32 off = 0; seg && off + sizeof(r) <= len; off += sizeof(r)) {
+        memcpy(&r, seg + off, sizeof(r));
+        if (pa < r.phys + r.size && r.phys < pa + size)
+            return false;
+    }
+    return true;
+}
+
+#define NVME_SART_ENTRIES 16
+
+/* A reset of ANS's own gate (on T8140 its ADT gate is APCIE_SYS_ST-V); SART entries put back. */
+static int nvme_cold_reset(int die, asc_dev_t *asc, sart_dev_t *sart, const u64 *pa,
+                           const size_t *sz)
+{
+    u32 before = asc_cpu_status(asc);
+    int ret = pmgr_reset_held(die, "ANS");
+
+    /* 0x6a on the J700 right after a reset (bit 3 with the CPU stopped and idle). */
+    printf("nvme: cold handoff: CPU status 0x%x before the reset, 0x%x after\n", before,
+           asc_cpu_status(asc));
+
+    for (int i = 0; sart && i < NVME_SART_ENTRIES; i++) {
+        u64 now_pa;
+        size_t now_sz;
+        if (!sz[i] ||
+            (sart_get_allowed(sart, i, &now_pa, &now_sz) && now_pa == pa[i] && now_sz == sz[i]))
+            continue;
+        printf("nvme: cold handoff: SART entry %d lost in the reset: put back\n", i);
+        sart_set_allowed(sart, i, pa[i], sz[i]);
+    }
+    return ret;
+}
+
+/*
+ * For an OS that starts ANS itself, as XNU does from an iop-ans-nub without "quiesced": end the
+ * session an earlier stage left (iBoot's, or one an aura stage negotiated and kept), with the
+ * controller off first. The firmware goes to SLEEP (with idle, IDLE as before macOS's own sleep),
+ * its CPU stops, the aura stage's SART entries go, and ANS is reset with its power and iBoot's
+ * entries kept, so that XNU registers those as at a normal boot. Unless no_probe, ANS is started
+ * once to check that it says HELLO from cold, then stopped and reset again. XNU then maps the
+ * firmware and sets RUN, and the firmware boots with no earlier session. Returns 0 when ready.
+ */
+int nvme_cold_handoff(bool idle, bool no_probe)
+{
+    const char *path = "/arm-io/ans";
+    int node = adt_path_offset(adt, path);
+    int nub = adt_path_offset(adt, "/arm-io/ans/iop-ans-nub");
+    u64 pa[NVME_SART_ENTRIES] = {0};
+    size_t sz[NVME_SART_ENTRIES] = {0};
+    int ret = -1, die = 0;
+    u32 cg;
+
+    if (nvme_initialized && !nvme_shutdown())
+        return -1;
+    if (node < 0 || nub < 0) {
+        printf("nvme: cold handoff: no %s or its iop-ans-nub\n", path);
+        return -1;
+    }
+    if (ADT_GETPROP(adt, node, "clock-gates", &cg) >= 0)
+        die = FIELD_GET(PMGR_DIE_ID, cg);
+
+    int adt_path[8];
+    u64 base = 0;
+    bool split = adt_get_property(adt, node, "nvme-secure-bar");
+    if (adt_path_offset_trace(adt, path, adt_path) < 0 ||
+        adt_get_reg(adt, adt_path, "reg", split ? 9 : 3, &base, NULL) < 0 || !base) {
+        printf("nvme: cold handoff: no NVMe registers\n");
+        return -1;
+    }
+
+    asc_dev_t *asc = asc_init(path);
+    if (!asc)
+        return -1;
+    rtkit_dev_t *rtk = NULL;
+    u64 saved_base = nvme_base;
+    rtkit_dev_t *saved_rtkit = nvme_rtkit;
+    bool running = asc_cpu_running(asc);
+    u32 cc = read32(base + NVME_CC), csts = read32(base + NVME_CSTS);
+
+    printf("nvme: cold handoff: ANS %s, CC 0x%x CSTS 0x%x\n", running ? "running" : "stopped", cc,
+           csts);
+    if (running) {
+        /*
+         * A session whose controller an earlier stage shut down (CC.SHN set) was quiesced
+         * with it, and answers nothing until it's woken: wake it as XNU does (INIT, then
+         * the handshake, its buffers through the SART), then put it to sleep. A firmware
+         * stopped without an acknowledged sleep doesn't start again from the run bit.
+         */
+        bool wake = FIELD_GET(NVME_CC_SHN, cc) != NVME_CC_SHN_NONE;
+        bool done = false;
+        sart_dev_t *wsart = sart_init("/arm-io/sart-ans");
+
+        for (int attempt = 0; attempt < 2 && !done; attempt++) {
+            if (rtk)
+                rtkit_free(rtk);
+            rtk = rtkit_init("nvme-cold", asc, NULL, NULL, wake ? wsart : NULL, false);
+            if (!rtk)
+                break;
+            /* The controller helpers serve the firmware's log through nvme_rtkit meanwhile. */
+            nvme_base = base;
+            nvme_rtkit = rtk;
+            if (wake) {
+                bool up = rtkit_boot(rtk);
+                printf("nvme: cold handoff: woke the quiesced session: %s\n",
+                       up ? "HELLO, handshake done" : "no HELLO");
+                if (!up)
+                    break;
+            }
+            if (read32(base + NVME_CC) & NVME_CC_EN) {
+                if (!nvme_ctrl_shutdown())
+                    printf("nvme: cold handoff: controller shutdown timed out\n");
+                if (!nvme_ctrl_disable())
+                    printf("nvme: cold handoff: controller disable timed out\n");
+            }
+            done = idle ? rtkit_idle(rtk) : rtkit_sleep(rtk);
+            if (!done && !wake) {
+                printf("nvme: cold handoff: ANS didn't acknowledge %s; waking it first\n",
+                       idle ? "IDLE" : "SLEEP");
+                wake = true;
+            }
+        }
+        if (!done) {
+            printf("nvme: cold handoff: ANS didn't acknowledge %s; stopping it\n",
+                   idle ? "IDLE" : "SLEEP");
+            if (rtk)
+                rtkit_stop(rtk);
+            else
+                asc_cpu_stop(asc);
+        } else {
+            printf("nvme: cold handoff: ANS acknowledged %s\n", idle ? "IDLE" : "SLEEP");
+        }
+        nvme_base = saved_base;
+        nvme_rtkit = saved_rtkit;
+        /* Stopped: its buffers and their SART entries go now, before the entries are sorted. */
+        if (rtk) {
+            rtkit_free(rtk);
+            rtk = NULL;
+        }
+        if (wsart)
+            sart_release(wsart);
+    }
+
+    u64 timeout = timeout_calculate(100000);
+    while (!asc_cpu_idle(asc) && !timeout_expired(timeout))
+        ;
+    printf("nvme: cold handoff: CPU %s\n", asc_cpu_idle(asc) ? "idle" : "NOT idle");
+
+    sart_dev_t *sart = sart_init("/arm-io/sart-ans");
+    for (int i = 0; sart && i < NVME_SART_ENTRIES; i++) {
+        if (!sart_get_allowed(sart, i, &pa[i], &sz[i]))
+            continue;
+        if (!nvme_aura_memory(nub, pa[i], sz[i])) {
+            printf("nvme: cold handoff: SART entry %d 0x%lx+0x%lx kept\n", i, pa[i], sz[i]);
+            continue;
+        }
+        printf("nvme: cold handoff: SART entry %d 0x%lx+0x%lx is an aura stage's: cleared\n", i,
+               pa[i], sz[i]);
+        sart_clear_entry(sart, i);
+        sz[i] = 0;
+    }
+
+    if (nvme_cold_reset(die, asc, sart, pa, sz)) {
+        printf("nvme: cold handoff: ANS didn't reset\n");
+        goto out_sart;
+    }
+    if (!no_probe) {
+        int hello = rtkit_probe_hello(asc);
+        printf("nvme: cold handoff: probe: %s\n", hello == 1   ? "HELLO unprompted"
+                                                  : hello == 2 ? "HELLO after INIT"
+                                                               : "NO HELLO");
+        asc_cpu_stop(asc);
+        timeout = timeout_calculate(100000);
+        while (!asc_cpu_idle(asc) && !timeout_expired(timeout))
+            ;
+        if (nvme_cold_reset(die, asc, sart, pa, sz) || !hello) {
+            printf("nvme: cold handoff: ANS not ready for a cold start\n");
+            goto out_sart;
+        }
+    }
+    printf("nvme: cold handoff: ANS stopped (%s), reset, iBoot's SART entries kept\n",
+           idle ? "IDLE" : "SLEEP");
+    ret = 0;
+
+out_sart:
+    if (sart)
+        sart_release(sart);
+    if (rtk)
+        rtkit_free(rtk);
+    asc_free(asc);
+    return ret;
+}
+#endif /* SPTM_VIRT */

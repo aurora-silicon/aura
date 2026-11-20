@@ -20,6 +20,9 @@ versions = { path = "./versions" }
 
 [features]
 chainload = ["dep:fatfs", "dep:uuid"]
+# rust_read_into() (the macos= bundle reader) is pulled in only by the SPTM-virt ESP Stage 2;
+# keep its fatfs/GPT monomorphisations out of every other Stage 1 (aura-raw.ld size).
+sptm_virt_esp = ["chainload"]
 
 # One codegen unit: with the default 16, functions are ordered differently from build to
 # build, and the same tree gives a different image.
@@ -28,4 +31,10 @@ codegen-units = 1
 
 # Signature checks run once per boot: size matters more than speed (aura-raw.ld file limit).
 [profile.release.package.ed25519-compact]
+opt-level = "z"
+
+# So is aura's own Rust: setup code (ADT lookups, GPU init data, the ESP and chainload paths),
+# none of it in an exception or I/O path. sha2 keeps the default: it hashes every kernel that
+# aura measures.
+[profile.release.package.rust]
 opt-level = "z"
