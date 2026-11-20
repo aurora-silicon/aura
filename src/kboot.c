@@ -9850,6 +9850,23 @@ static int dt_set_j713_isp_one(unsigned int unused)
             phys[i] - dram_base > dram_size - size[i])
             bail("ADT: J713 ISP segment %d 0x%lx+0x%lx outside DRAM\n", i, phys[i], size[i]);
     }
+    /*
+     * The firmware's memory ends at the first 2 MiB boundary above DATA (0x13ec000 -> 20 MiB on
+     * 26.6.2). A firmware whose DATA ends past the tree's window (27.2: 0x1aec000) gets the
+     * window grown to that boundary, within the 64 MiB the window may span; it never shrinks.
+     */
+    u64 heap_grow = 0;
+    if (iova[1] >= heap_base && iova[1] - heap_base < 64 * SZ_1M && size[1] <= 64 * SZ_1M &&
+        iova[1] + size[1] > heap_base + heap_size) {
+        u64 top = ALIGN_UP(iova[1] + size[1], 2 * SZ_1M);
+        if (top - heap_base > 64 * SZ_1M)
+            bail("ADT: J713 ISP DATA ends at 0x%lx, past a 64 MiB firmware window\n",
+                 iova[1] + size[1]);
+        printf("FDT: J713 ISP DATA ends at 0x%lx; firmware window 0x%lx -> 0x%lx\n",
+               iova[1] + size[1], heap_size, top - heap_base);
+        heap_grow = top - heap_base;
+        heap_size = heap_grow;
+    }
     /* TEXT at the start of the firmware's memory, DATA right above it, both below the heap top. */
     if (iova[0] != heap_base || iova[1] != iova[0] + size[0] ||
         size[1] > heap_base + heap_size - iova[1] ||
@@ -9898,6 +9915,14 @@ static int dt_set_j713_isp_one(unsigned int unused)
             return -1;
         printf("FDT: J713 ISP %s at 0x%lx (+0x%lx), runs at 0x%lx\n", i ? "DATA" : "TEXT", phys[i],
                size[i], iova[i]);
+    }
+    if (heap_grow) {
+        fdt32_t window[5] = {cpu_to_fdt32(isp_phandle), cpu_to_fdt32(heap_base >> 32),
+                             cpu_to_fdt32((u32)heap_base), cpu_to_fdt32(heap_grow >> 32),
+                             cpu_to_fdt32((u32)heap_grow)};
+        node = fdt_path_offset(dt, paths[2]);
+        if (node < 0 || fdt_setprop(dt, node, "iommu-addresses", window, sizeof(window)))
+            return -1;
     }
     isp = fdt_node_offset_by_phandle(dt, isp_phandle);
     if (isp < 0 || fdt_setprop_u32(dt, isp, "apple,platform-id", sensor))
