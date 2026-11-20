@@ -26,7 +26,7 @@ def test_adopted_queue_lifetime(tmp_path):
     sleep_reset = source[source.index("static bool nvme_ans_sleep_and_reset(void)"):
                          source.index("static bool nvme_exec_command(")]
     # The handoff and the SART entries it reports to the next stage.
-    shutdown = source[source.index("bool nvme_shutdown(void)"):
+    shutdown = source[source.index("bool nvme_keep_for_kboot(bool keep)"):
                       source.index("bool nvme_set_sart_var(")]
     harness = r'''
 #include <assert.h>
@@ -216,6 +216,40 @@ int main(int argc, char **argv)
 {
     assert(argc == 2);
     failure = atoi(argv[1]);
+    if (failure >= 37) {
+        /*
+         * Proxy kboot Linux handoff on T8132 (37: prepare_dt -> Linux branch -> flag cleared;
+         * 38: prepare_dt aborted before chainload -> stage-to-stage power-off branch).
+         */
+        bool aborted = failure == 38;
+        chip_id = T8132;
+        model_power = true;
+        nvme_sart_saved_cnt = 1;
+        cpu_off = true;
+        failure = 0;
+        assert(nvme_init());
+        assert(nvme_keep_for_kboot(true));
+        struct sart_entry e[4];
+        bool off = true;
+        assert(nvme_sart_entries(e, 4, &off) > 0 && !off);
+        if (aborted) {
+            assert(!nvme_keep_for_kboot(false));
+            assert(nvme_sart_entries(e, 4, &off) > 0 && off);
+            assert(nvme_shutdown());
+            assert(ans_offs == 1 && cpu_off && queue_frees == 2);
+        } else {
+            assert(nvme_shutdown());
+            assert(!nvme_initialized && !nvme_keep_running_for_linux);
+            assert(ans_offs == 0 && !cpu_off && queue_frees == 0);
+            /* Next stage init/shutdown without keep_for_kboot takes the normal power-off path. */
+            assert(nvme_init());
+            assert(nvme_shutdown());
+            assert(ans_offs == 1 && cpu_off);
+        }
+        for (unsigned i = 0; i < allocated; i++)
+            free(allocations[i]);
+        return 0;
+    }
     if (failure >= 33) {
         /*
          * Post-M4 handoffs, modelled with ANS's power.
@@ -439,5 +473,5 @@ int main(int argc, char **argv)
          "-Wno-unused-variable", "-Wno-format", "-x", "c", "-", "-o", str(binary)],
         input=harness, text=True, check=True,
     )
-    for failure in range(37):
+    for failure in range(39):
         subprocess.run([str(binary), str(failure)], check=True)
