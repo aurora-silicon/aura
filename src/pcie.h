@@ -15,8 +15,9 @@ int pcie_shutdown(void);
 int pcie_t6050_init(void);
 /* Disable an untrained optional port's root port and DART in the handed-over tree */
 int pcie_t6050_handoff_fdt(void *dt);
+/* Post-M4 ANS through its storage gate table only (T6050, T8142); -1 elsewhere */
 int pcie_ans_power_off(void);
-/* Back on after pcie_ans_power_off(), CPU stopped */
+/* ANS's side back on after a power-off, CPU stopped; never a root port */
 int pcie_ans_power_on(void);
 
 /* Disable optional radio PCIe admission after rail/controller/DART failure. */
