@@ -4305,8 +4305,8 @@ static int dt_vram_reserved_region(const char *dcp_alias, const char *disp_alias
                                    disp_reserved_regions_vram, &region, 1);
 }
 
-#define DART_T8110_PARAMS3            0x08
-#define DART_T8110_PARAMS3_VA_WIDTH   GENMASK(21, 16)
+#define DART_T8110_PARAMS3          0x08
+#define DART_T8110_PARAMS3_VA_WIDTH GENMASK(21, 16)
 
 /*
  * The input address width of the T8110-style DART that translates for a device: the FDT
@@ -4409,7 +4409,7 @@ static int dt_reserve_asc_segments_at(int fdt_node, const char *adt_path, const 
     /* Only the DRAM segment reservation (dram_only) checks them against the DART's range */
     u32 va_bits = 0;
     bool have_window = dram_only && !dt_device_dart_va_bits(fdt_node, node, &va_bits);
-    u64 win_end = have_window ? BIT(va_bits) : 0;
+    u64 win_end = have_window ? 1ULL << va_bits : 0;
     if (dram_only)
         printf("FDT: %s: DART input range %s%u bits\n", fdt_path, have_window ? "" : "unknown, ",
                va_bits);
