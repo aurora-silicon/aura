@@ -152,6 +152,13 @@ typedef struct dwc3_dev {
      * twice.
      */
     spinlock_t bulk_in_lock;
+    /*
+     * The event buffer, read and acknowledged (GEVNTCOUNT) by whoever pumps events: the console
+     * and the proxy under one iodev's lock, an HV's vuart (another iodev on the same controller)
+     * under its own. Two CPUs in usb_dwc3_handle_events() at once copy the same events or skip
+     * some, and a lost bulk-in completion leaves that endpoint busy for good.
+     */
+    spinlock_t event_lock;
 
     struct {
         bool xfer_in_progress;
@@ -1777,9 +1784,20 @@ static void usb_dwc3_maybe_reannounce(dwc3_dev_t *dev)
 }
 #endif
 
+static void usb_dwc3_handle_events_locked(dwc3_dev_t *dev);
+
 void usb_dwc3_handle_events(dwc3_dev_t *dev)
 {
     if (!dev || dev->failed)
+        return;
+    spin_lock(&dev->event_lock);
+    usb_dwc3_handle_events_locked(dev);
+    spin_unlock(&dev->event_lock);
+}
+
+static void usb_dwc3_handle_events_locked(dwc3_dev_t *dev)
+{
+    if (dev->failed)
         return;
 
     u32 count = read32(dev->regs + DWC3_GEVNTCOUNT(0)) & DWC3_GEVNTCOUNT_MASK;
@@ -1857,6 +1875,7 @@ dwc3_dev_t *usb_dwc3_init(uintptr_t regs, dart_dev_t *dart)
 
     memset(dev, 0, sizeof(*dev));
     spin_init(&dev->bulk_in_lock);
+    spin_init(&dev->event_lock);
     for (int i = 0; i < CDC_ACM_PIPE_MAX; i++)
         memcpy(dev->pipe[i].cdc_line_coding, cdc_default_line_coding,
                sizeof(cdc_default_line_coding));
