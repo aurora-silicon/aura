@@ -550,6 +550,17 @@ int payload_run(void)
     }
 
     if (kernel && fdt) {
+#ifdef BRINGUP
+        /*
+         * A BRINGUP build skips MMU, MCC, AIC and SMP init: no carveouts are unmapped and no
+         * secondary CPU is started or set up. A kernel would get a half-initialized machine, so
+         * these builds never hand off; they are for the proxy only. Refuse here, before NVMe or
+         * CPU work, with a message that says why.
+         */
+        printf("BRINGUP build: kernel handoff is not supported (no MMU/MCC/AIC/SMP init); "
+               "use the proxy\n");
+        goto boot_failed;
+#endif
         /*
          * Linux adopts a running post-M4 ANS from boot=. The U-Boot we embed adopts a running
          * post-M4 ANS too, and can't start one from off: if an earlier stage powered ANS off

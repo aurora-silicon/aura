@@ -3576,6 +3576,8 @@ static int dt_set_pcie_tunables(void)
 
         memset(fdt_alias, 0, sizeof(adt_path));
         snprintf(fdt_alias, sizeof(fdt_alias), "usb4_%d_pcie", i);
+        if (!fdt_get_alias(dt, fdt_alias))
+            snprintf(fdt_alias, sizeof(fdt_alias), "usb4-%d-pcie", i);
 
         dt_copy_pciec_tunables(adt_path, fdt_alias);
     }
@@ -9265,26 +9267,41 @@ static void dt_set_aop_motion_cal(const char *path)
             }
             copied++;
         }
-        printf("FDT: %s/%s: %d of %d calibration properties\n", path, services[i], copied,
-               (int)ARRAY_SIZE(props));
+        if (copied)
+            printf("FDT: %s/%s: %d of %d calibration properties\n", path, services[i], copied,
+                   (int)ARRAY_SIZE(props));
     }
 }
 
-/* The first AOP node: a compatible of the form "apple,<soc>-aop" */
-static int dt_find_aop_node(void)
+/*
+ * The OS AOP node: the enabled node with an "apple,<soc>-aop" compatible.
+ * Every SoC has one AOP, so no table of SoCs is needed to find it.
+ */
+static int dt_find_aop(char *path, size_t size)
 {
     for (int node = fdt_next_node(dt, -1, NULL); node >= 0; node = fdt_next_node(dt, node, NULL)) {
-        int len = 0;
-        const char *compat = fdt_getprop(dt, node, "compatible", &len);
+        int count = fdt_stringlist_count(dt, node, "compatible");
+        bool aop = false;
 
-        for (const char *c = compat; c && len > 0; c += strlen(c) + 1) {
-            size_t n = strnlen(c, len);
-            if (n > 10 && !strncmp(c, "apple,", 6) && !strcmp(c + n - 4, "-aop"))
-                return node;
-            len -= n + 1;
+        for (int i = 0; i < count && !aop; i++) {
+            const char *compat = fdt_stringlist_get(dt, node, "compatible", i, NULL);
+            size_t len = compat ? strlen(compat) : 0;
+
+            aop = len > 10 && !strncmp(compat, "apple,", 6) && !strcmp(compat + len - 4, "-aop");
         }
+        if (!aop)
+            continue;
+
+        const char *status = fdt_getprop(dt, node, "status", NULL);
+        if (status && strcmp(status, "okay") && strcmp(status, "ok"))
+            return -1;
+        if (fdt_get_path(dt, node, path, size)) {
+            printf("FDT: AOP node path too long\n");
+            return -1;
+        }
+        return node;
     }
-    return -FDT_ERR_NOTFOUND;
+    return -1;
 }
 
 /*
@@ -9299,20 +9316,17 @@ static int dt_find_aop_node(void)
  */
 static int dt_set_aop_firmware(void)
 {
-    int node = dt_find_aop_node();
+    char path[64];
+    int node = dt_find_aop(path, sizeof(path));
     if (node < 0)
         return 0;
 
-    const char *status = fdt_getprop(dt, node, "status", NULL);
-    if (status && strcmp(status, "okay") && strcmp(status, "ok"))
-        return 0;
-
-    char path[64];
-    if (fdt_get_path(dt, node, path, sizeof(path))) {
-        printf("FDT: AOP node path too long\n");
-        return 0;
-    }
-
+    /*
+     * The accelerometer and gyroscope services wait for the machine's
+     * calibration wherever the ADT carries it (M1 Pro, M2, M4, M4 Pro, M5:
+     * range-intr-cal, nominal-extr-cal and range-extr-cal in one container
+     * format). Copy whatever this ADT has.
+     */
     dt_set_aop_motion_cal(path);
 
     /* The T8132 AOP reaches DRAM through DAPF windows instead */

@@ -35,14 +35,29 @@
  * J615 with chosen.asahi,j615-25g83-experimental=1) and the node carries the
  * exact profile and /chosen asahi,t8122-gpu=1 opt-in. Linux admits the loaded
  * firmware before starting it. This never fails the boot.
+ *
+ * The segment list decides the handoff layout, not the board or the release:
+ * - two segments, __TEXT;__DATA with flags <1 0>: apple,m3-handoff-version 1;
+ * - three segments, __TEXT;__DATA;__DATA_SHARED_RO with flags <1 0x10 0>, as
+ *   iBoot loads the G15G firmware on macOS 27.2 (26B123): the read-only tail
+ *   must follow __DATA directly in memory and match the sgx
+ *   gfx-data-shared-ro-{base,size} pair (and gfx-data-shared-rw-size, if
+ *   present, must be 0). fw-data then covers __DATA and the tail, and the
+ *   description has three VAs and flags: apple,m3-handoff-version 2, which a
+ *   version-1 kernel refuses before it maps anything.
+ * On OS firmware 27.2 the handoff is published (reservations, links, segment
+ * description, firmware-compat) with the GPU node disabled: no kernel has a
+ * 27.2 G15G firmware interface yet, so there is nothing to enable. That still
+ * keeps the loaded firmware and the UAT tables out of the kernel's memory.
  */
-#define T8122_GPU_REGIONS 6
-#define T8122_GPU_UAT     4
-#define T8122_GPU_FW_VA   0xfffffc0000000000UL
-#define T8122_GPU_MAX_SEG 0x200000UL
-#define T8122_GPU_PA_MAX  (1UL << 42)
-#define T8122_GPU_MAX_MR  32
-#define T8122_GPU_OPT_IN  "asahi,t8122-gpu"
+#define T8122_GPU_REGIONS  6
+#define T8122_GPU_UAT      4
+#define T8122_GPU_FW_VA    0xfffffc0000000000UL
+#define T8122_GPU_MAX_SEG  0x200000UL
+#define T8122_GPU_PA_MAX   (1UL << 42)
+#define T8122_GPU_MAX_MR   32
+#define T8122_GPU_OPT_IN   "asahi,t8122-gpu"
+#define T8122_GPU_MAX_SEGS 3
 
 static const char *const t8122_gpu_names[T8122_GPU_REGIONS] = {
     "ttbs", "pagetables", "handoff", "shared-l2", "fw-text", "fw-data",
@@ -63,8 +78,18 @@ static const char *const t8122_gpu_adt_regions[T8122_GPU_UAT] = {
 
 struct t8122_gpu_fw {
     u64 base[T8122_GPU_REGIONS], size[T8122_GPU_REGIONS];
-    u64 vas[2];
-    u32 flags[2];
+    u64 vas[T8122_GPU_MAX_SEGS];
+    u32 flags[T8122_GPU_MAX_SEGS];
+    int segments;
+};
+
+/* The two segment layouts iBoot uses for the G15G firmware (see the top of this file). */
+static const struct {
+    const char *names;
+    u32 flags[T8122_GPU_MAX_SEGS];
+} t8122_gpu_layouts[] = {
+    [2] = {"__TEXT;__DATA", {1, 0}},
+    [3] = {"__TEXT;__DATA;__DATA_SHARED_RO", {1, 0x10, 0}},
 };
 
 static int t8122_adt_u64(int node, const char *name, u64 *val)
@@ -132,11 +157,14 @@ static int t8122_gpu_read_adt(struct t8122_gpu_fw *fw)
     u32 len, nub_len, preloaded;
     const struct adt_segment_ranges *seg = adt_getprop(adt, asc, "segment-ranges", &len);
     const void *nub_seg = adt_getprop(adt, nub, "segment-ranges", &nub_len);
-    if (!seg || len != 2 * sizeof(*seg) || !nub_seg || nub_len != len || memcmp(seg, nub_seg, len))
+    if (!seg || (len != 2 * sizeof(*seg) && len != 3 * sizeof(*seg)) || !nub_seg ||
+        nub_len != len || memcmp(seg, nub_seg, len))
         bail("ADT: GPU: T8122 gfx-asc segment-ranges missing or unlike iop-gfx-nub\n");
+    int segments = len / sizeof(*seg);
+    const char *layout = t8122_gpu_layouts[segments].names;
     const char *names = adt_getprop(adt, asc, "segment-names", &len);
-    if (!names || len < 14 || memcmp(names, "__TEXT;__DATA", 14))
-        bail("ADT: GPU: T8122 gfx-asc segment-names is not __TEXT;__DATA\n");
+    if (!names || len < strlen(layout) + 1 || memcmp(names, layout, strlen(layout) + 1))
+        bail("ADT: GPU: T8122 gfx-asc segment-names is not %s\n", layout);
     const void *pre = adt_getprop(adt, nub, "pre-loaded", &len);
     if (!pre || len != sizeof(preloaded))
         bail("ADT: GPU: T8122 GPU firmware is not pre-loaded\n");
@@ -144,20 +172,37 @@ static int t8122_gpu_read_adt(struct t8122_gpu_fw *fw)
     if (preloaded != 1)
         bail("ADT: GPU: T8122 GPU firmware is not pre-loaded\n");
 
-    for (int i = 0; i < 2; i++) {
+    u64 next_va = T8122_GPU_FW_VA;
+    for (int i = 0; i < segments; i++) {
         struct adt_segment_ranges s;
         memcpy(&s, &seg[i], sizeof(s));
         if (s.phys != s.remap || !s.size || s.size & (SZ_16K - 1) || s.size > T8122_GPU_MAX_SEG ||
-            s.unk != (i == 0 ? 1 : 0))
+            s.unk != t8122_gpu_layouts[segments].flags[i])
             bail("ADT: GPU: T8122 gfx-asc segment %d is not a plain preloaded segment\n", i);
-        fw->base[T8122_GPU_UAT + i] = s.phys;
-        fw->size[T8122_GPU_UAT + i] = s.size;
+        if (s.iova != next_va)
+            bail("ADT: GPU: T8122 firmware segment %d at unexpected VA 0x%lx (expected 0x%lx)\n", i,
+                 s.iova, next_va);
+        next_va += s.size;
+        if (i < 2) {
+            fw->base[T8122_GPU_UAT + i] = s.phys;
+            fw->size[T8122_GPU_UAT + i] = s.size;
+        } else if (s.phys != fw->base[T8122_GPU_UAT + 1] + fw->size[T8122_GPU_UAT + 1]) {
+            bail("ADT: GPU: T8122 __DATA_SHARED_RO 0x%lx does not follow __DATA\n", s.phys);
+        } else {
+            /* fw-data covers __DATA and the read-only tail after it. */
+            u64 ro_base, ro_size, rw_size;
+            if (t8122_adt_u64(sgx, "gfx-data-shared-ro-base", &ro_base) ||
+                t8122_adt_u64(sgx, "gfx-data-shared-ro-size", &ro_size) || ro_base != s.phys ||
+                ro_size != s.size)
+                bail("ADT: GPU: T8122 sgx gfx-data-shared-ro does not match __DATA_SHARED_RO\n");
+            if (!t8122_adt_u64(sgx, "gfx-data-shared-rw-size", &rw_size) && rw_size)
+                bail("ADT: GPU: T8122 sgx has a gfx-data-shared-rw region (0x%lx)\n", rw_size);
+            fw->size[T8122_GPU_UAT + 1] += s.size;
+        }
         fw->vas[i] = s.iova;
         fw->flags[i] = s.unk;
     }
-    if (fw->vas[0] != T8122_GPU_FW_VA || fw->vas[1] != fw->vas[0] + fw->size[T8122_GPU_UAT])
-        bail("ADT: GPU: T8122 firmware segments at unexpected VAs 0x%lx/0x%lx\n", fw->vas[0],
-             fw->vas[1]);
+    fw->segments = segments;
 
     u64 dram_start, dram_end;
     if (t8122_gpu_dram(&dram_start, &dram_end))
@@ -351,6 +396,43 @@ static int t8122_gpu_link(void *dt, int gpu, const u32 *phandles)
     return 0;
 }
 
+static void t8122_gpu_log(const struct t8122_gpu_fw *fw, const char *state)
+{
+    for (int i = 0; i < T8122_GPU_REGIONS; i++)
+        printf("FDT: GPU: T8122 %s: 0x%lx+0x%lx (no-map)\n", t8122_gpu_names[i], fw->base[i],
+               fw->size[i]);
+    if (fw->segments > 2)
+        printf("FDT: GPU: T8122 firmware VAs 0x%lx/0x%lx/0x%lx; handoff version 2 published, GPU "
+               "%s\n",
+               fw->vas[0], fw->vas[1], fw->vas[2], state);
+    else
+        printf("FDT: GPU: T8122 firmware VAs 0x%lx/0x%lx; handoff published, GPU %s\n", fw->vas[0],
+               fw->vas[1], state);
+}
+
+/*
+ * OS firmware 27.2: the reservations, links and segment description are in place. Publish the
+ * firmware version and leave the GPU node disabled; the mailbox is not enabled. The 25G83 profile
+ * switches do not apply. Only with chosen.asahi,t8122-gpu-power-diag=1 the bounded powered
+ * identity probe (the SGX ID and core-mask reads the kernel's T8122 admission checks) runs, with
+ * the SGX power voted off again before Linux starts; without it nothing powers the GPU.
+ */
+static int t8122_gpu_publish_27(void *dt, const struct t8122_gpu_fw *fw)
+{
+    int gpu = t8122_gpu_node(dt);
+    if (gpu < 0 || firmware_set_fdt(dt, gpu, "apple,firmware-compat", &os_firmware) ||
+        firmware_set_fdt(dt, gpu, "apple,firmware-version", &os_firmware))
+        bail("FDT: GPU: T8122 cannot set the 27.2 firmware version\n");
+    gpu = t8122_gpu_node(dt);
+    if (gpu < 0 || fdt_setprop_string(dt, gpu, "status", "disabled"))
+        bail("FDT: GPU: T8122 cannot set GPU status\n");
+    gpu = t8122_gpu_node(dt);
+    if (gpu >= 0)
+        t8122_read_powered_identity(dt, gpu);
+    t8122_gpu_log(fw, "left disabled (no 27.2 G15G firmware interface in the kernel yet)");
+    return 0;
+}
+
 static int t8122_gpu_publish(void *dt, void *arg)
 {
     const struct t8122_gpu_fw *fw = arg;
@@ -382,17 +464,21 @@ static int t8122_gpu_publish(void *dt, void *arg)
     if (gpu < 0 || t8122_gpu_link(dt, gpu, phandles))
         return -1;
 
-    fdt64_t vas[2];
-    fdt32_t flags[2];
-    for (int i = 0; i < 2; i++) {
+    fdt64_t vas[T8122_GPU_MAX_SEGS];
+    fdt32_t flags[T8122_GPU_MAX_SEGS];
+    for (int i = 0; i < fw->segments; i++) {
         fdt64_st(&vas[i], fw->vas[i]);
         flags[i] = cpu_to_fdt32(fw->flags[i]);
     }
     gpu = t8122_gpu_node(dt);
-    if (gpu < 0 || fdt_setprop_u32(dt, gpu, "apple,m3-handoff-version", 1) ||
-        fdt_setprop(dt, gpu, "apple,firmware-segment-vas", vas, sizeof(vas)) ||
-        fdt_setprop(dt, gpu, "apple,firmware-segment-flags", flags, sizeof(flags)))
+    if (gpu < 0 || fdt_setprop_u32(dt, gpu, "apple,m3-handoff-version", fw->segments - 1) ||
+        fdt_setprop(dt, gpu, "apple,firmware-segment-vas", vas, fw->segments * sizeof(vas[0])) ||
+        fdt_setprop(dt, gpu, "apple,firmware-segment-flags", flags,
+                    fw->segments * sizeof(flags[0])))
         bail("FDT: GPU: T8122 cannot set the firmware segment description\n");
+
+    if (os_firmware.version == V27_2)
+        return t8122_gpu_publish_27(dt, fw);
 
     int chosen = fdt_path_offset(dt, "/chosen"), len;
     int dcp = fdt_path_offset(dt, "dcp");
@@ -435,11 +521,7 @@ static int t8122_gpu_publish(void *dt, void *arg)
     if (fdt_setprop_string(dt, gpu, "status", enable ? "okay" : "disabled"))
         bail("FDT: GPU: T8122 cannot set GPU status\n");
 
-    for (int i = 0; i < T8122_GPU_REGIONS; i++)
-        printf("FDT: GPU: T8122 %s: 0x%lx+0x%lx (no-map)\n", t8122_gpu_names[i], fw->base[i],
-               fw->size[i]);
-    printf("FDT: GPU: T8122 firmware VAs 0x%lx/0x%lx; handoff published, GPU %s\n", fw->vas[0],
-           fw->vas[1], enable ? "enabled (" T8122_GPU_OPT_IN ")" : "left disabled");
+    t8122_gpu_log(fw, enable ? "enabled (" T8122_GPU_OPT_IN ")" : "left disabled");
     return 0;
 }
 

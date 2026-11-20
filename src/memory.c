@@ -614,8 +614,13 @@ static void mmu_add_default_mappings(void)
     mmu_add_mapping(ram_base, ram_base, mem_size_actual, MAIR_IDX_NORMAL, PERM_RWX);
 
     /*
-     * Unmap carveout regions. Fatal on every chip: a failure here leaves firmware-owned TZ memory
-     * mapped RWX. mcc_unmap_carveouts() returns 0 when the SoC describes nothing to unmap.
+     * Unmap carveout regions. A failure is fatal on every chip: it leaves firmware-owned TZ memory
+     * mapped RWX. mcc_unmap_carveouts() returns 0 when it unmapped every range it found:
+     * - MCC TZ registers known: every enabled TZ window, when the windows lie in RAM and cover
+     *   the ADT's region-id-2 and region-id-4 (or the ADT has no usable list to compare);
+     * - otherwise, with /arm-io/mcc in the ADT: region-id-2 and region-id-4 from
+     *   /chosen/carveout-memory-map, both required (a missing or bad one returns -1);
+     * - no /arm-io/mcc (A7-A11, T2): whichever of those ranges the ADT carries, none required.
      */
     if (mcc_unmap_carveouts())
         panic("MMU: Firmware carveouts are unavailable\n");
