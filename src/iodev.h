@@ -43,6 +43,8 @@ struct iodev {
     spinlock_t lock;
     iodev_usage_t usage;
     void *opaque;
+    /* Drives a console's controller: accessors hold console_lock too (iodev.c, G6 r3). */
+    bool console_controller;
 };
 
 void iodev_register_device(iodev_id_t id, struct iodev *dev);

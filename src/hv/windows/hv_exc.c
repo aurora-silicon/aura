@@ -4751,7 +4751,9 @@ static bool hv_handle_t8142_pmu_site(struct exc_info *ctx, u32 imm)
             printf("HV: %s: CALLEE-SAVED WRITE x%ld = 0x%lx at 0x%lx (insn 0x%08x)\n",
                    hv_absent_pmu_chip(), rt, out, site, insn);
         callee_saved_emulated++;
-    } else if (__atomic_load_n(&site_emulated, __ATOMIC_RELAXED) < 8) {
+    } else if (chip_id != T8152) {
+        if (__atomic_load_n(&site_emulated, __ATOMIC_RELAXED) >= 8)
+            return true;
         /*
          * The first few only.  The old every-4096th line was a console write
          * (console_lock, then USB) from this unlocked path on whichever guest
@@ -4765,7 +4767,21 @@ static bool hv_handle_t8142_pmu_site(struct exc_info *ctx, u32 imm)
         if (n < 8)
             printf("HV: %s: site emulated 0x%08x at 0x%lx (#%ld)\n", hv_absent_pmu_chip(), insn,
                    site, n);
+    } else {
+        /*
+         * G6 r3: this runs on the unlocked fast path on every CPU.  A G6 desktop emulates about
+         * 600k sites a second, so "every 4096th" was ~150 console lines a second from CPUs that
+         * hold no hypervisor lock (a G6 session).  Every 2^20th (about one every 2 s there),
+         * counted atomically so two CPUs never print the same number.
+         */
+        u64 n = __atomic_fetch_add(&site_emulated, 1, __ATOMIC_RELAXED);
+        if (n < 8 || (n & (BIT(20) - 1)) == 0)
+            printf("HV: %s: site emulated 0x%08x at 0x%lx (#%ld)\n", hv_absent_pmu_chip(), insn,
+                   site, n);
+        return true;
     }
+    if (chip_id == T8152)
+        __atomic_fetch_add(&site_emulated, 1, __ATOMIC_RELAXED);
     return true;
 }
 

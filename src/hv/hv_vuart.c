@@ -75,7 +75,9 @@ static void update_irq(void)
     if (!vuart_tx_only) {
 #ifdef AURA_WINDOWS
         /* Generic I/O event dispatch also flushes every console, which can block
-         * on an unrelated transport. Poll only the guest debug controller here. */
+         * on an unrelated transport. Poll only the guest debug controller here.
+         * G6 r3: iodev_lock() on the vUART also takes console_lock, because the controller
+         * is the proxy console's DWC3 and printf reaches it from unlocked CPUs (iodev.c). */
         iodev_lock(IODEV_USB_VUART);
         usb_dwc3_vuart_poll(iodev_get_opaque(IODEV_USB_VUART));
         iodev_unlock(IODEV_USB_VUART);

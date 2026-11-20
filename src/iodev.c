@@ -36,6 +36,44 @@ char con_buf[CONSOLE_BUFFER_SIZE];
 size_t con_wp;
 size_t con_rp[IODEV_NUM];
 
+int in_iodev = 0;
+
+static DECLARE_SPINLOCK(console_lock);
+
+/*
+ * G6 r3: a device with console_controller set drives the same controller as a console (the
+ * Windows vUART is the second CDC interface of the proxy link's DWC3).  console_lock is what
+ * serializes the console's users of that controller: every console write, and every
+ * iodev_handle_events().  The console writes run on any CPU and need not hold the hypervisor
+ * lock (printf from an unlocked fast path), so the device's own lock alone let a vUART poll on one
+ * CPU run the DWC3 event loop and endpoint commands while another CPU's printf started a
+ * transfer on the same controller (the EL2 SError of G6 session 230552).  Such a device's
+ * accessors therefore take console_lock first, then the device lock, and mark the console busy
+ * (in_iodev) as iodev_handle_events() does, so a nested printf cannot re-enter the controller.
+ * Order: console_lock, then the device lock; nothing takes them the other way round.
+ */
+static void iodev_take(iodev_id_t id)
+{
+    if (!mmu_active())
+        return;
+    if (iodevs[id]->console_controller) {
+        spin_lock(&console_lock);
+        in_iodev++;
+    }
+    spin_lock(&iodevs[id]->lock);
+}
+
+static void iodev_drop(iodev_id_t id)
+{
+    if (!mmu_active())
+        return;
+    spin_unlock(&iodevs[id]->lock);
+    if (iodevs[id]->console_controller) {
+        in_iodev--;
+        spin_unlock(&console_lock);
+    }
+}
+
 /*
  * G5b C-3: what a console output that cannot keep up costs, per device.  A device whose
  * write_nonblocking takes fewer bytes than offered keeps the rest in con_buf (its backlog); once
@@ -74,11 +112,9 @@ ssize_t iodev_can_read(iodev_id_t id)
     if (!iodevs[id] || !iodevs[id]->ops->can_read)
         return 0;
 
-    if (mmu_active())
-        spin_lock(&iodevs[id]->lock);
+    iodev_take(id);
     ssize_t ret = iodevs[id]->ops->can_read(iodevs[id]->opaque);
-    if (mmu_active())
-        spin_unlock(&iodevs[id]->lock);
+    iodev_drop(id);
     return ret;
 }
 
@@ -87,11 +123,9 @@ bool iodev_can_write(iodev_id_t id)
     if (!iodevs[id] || !iodevs[id]->ops->can_write)
         return false;
 
-    if (mmu_active())
-        spin_lock(&iodevs[id]->lock);
+    iodev_take(id);
     bool ret = iodevs[id]->ops->can_write(iodevs[id]->opaque);
-    if (mmu_active())
-        spin_unlock(&iodevs[id]->lock);
+    iodev_drop(id);
     return ret;
 }
 
@@ -100,11 +134,9 @@ ssize_t iodev_read(iodev_id_t id, void *buf, size_t length)
     if (!iodevs[id] || !iodevs[id]->ops->read)
         return -1;
 
-    if (mmu_active())
-        spin_lock(&iodevs[id]->lock);
+    iodev_take(id);
     ssize_t ret = iodevs[id]->ops->read(iodevs[id]->opaque, buf, length);
-    if (mmu_active())
-        spin_unlock(&iodevs[id]->lock);
+    iodev_drop(id);
     return ret;
 }
 
@@ -113,11 +145,9 @@ ssize_t iodev_write(iodev_id_t id, const void *buf, size_t length)
     if (!iodevs[id] || !iodevs[id]->ops->write)
         return -1;
 
-    if (mmu_active())
-        spin_lock(&iodevs[id]->lock);
+    iodev_take(id);
     ssize_t ret = iodevs[id]->ops->write(iodevs[id]->opaque, buf, length);
-    if (mmu_active())
-        spin_unlock(&iodevs[id]->lock);
+    iodev_drop(id);
     return ret;
 }
 
@@ -126,13 +156,11 @@ ssize_t iodev_write_nonblocking(iodev_id_t id, const void *buf, size_t length)
     if (!iodevs[id] || !iodevs[id]->ops->write)
         return -1;
 
-    if (mmu_active())
-        spin_lock(&iodevs[id]->lock);
+    iodev_take(id);
     ssize_t ret = iodevs[id]->ops->write_nonblocking
                       ? iodevs[id]->ops->write_nonblocking(iodevs[id]->opaque, buf, length)
                       : iodevs[id]->ops->write(iodevs[id]->opaque, buf, length);
-    if (mmu_active())
-        spin_unlock(&iodevs[id]->lock);
+    iodev_drop(id);
     return ret;
 }
 
@@ -141,13 +169,11 @@ ssize_t iodev_write_atomic(iodev_id_t id, const void *buf, size_t length)
     if (!iodevs[id] || !iodevs[id]->ops->write)
         return -1;
 
-    if (mmu_active())
-        spin_lock(&iodevs[id]->lock);
+    iodev_take(id);
     ssize_t ret = iodevs[id]->ops->write_atomic
                       ? iodevs[id]->ops->write_atomic(iodevs[id]->opaque, buf, length)
                       : iodevs[id]->ops->write(iodevs[id]->opaque, buf, length);
-    if (mmu_active())
-        spin_unlock(&iodevs[id]->lock);
+    iodev_drop(id);
     return ret;
 }
 
@@ -162,11 +188,9 @@ ssize_t iodev_try_write_atomic(iodev_id_t id, const void *buf, size_t length)
 {
     if (!iodev_has_atomic_write(id))
         return -1;
-    if (mmu_active())
-        spin_lock(&iodevs[id]->lock);
+    iodev_take(id);
     ssize_t ret = iodevs[id]->ops->write_atomic(iodevs[id]->opaque, buf, length);
-    if (mmu_active())
-        spin_unlock(&iodevs[id]->lock);
+    iodev_drop(id);
     return ret;
 }
 
@@ -175,11 +199,9 @@ ssize_t iodev_queue(iodev_id_t id, const void *buf, size_t length)
     if (!iodevs[id] || !iodevs[id]->ops->queue)
         return iodev_write(id, buf, length);
 
-    if (mmu_active())
-        spin_lock(&iodevs[id]->lock);
+    iodev_take(id);
     ssize_t ret = iodevs[id]->ops->queue(iodevs[id]->opaque, buf, length);
-    if (mmu_active())
-        spin_unlock(&iodevs[id]->lock);
+    iodev_drop(id);
     return ret;
 }
 
@@ -188,11 +210,9 @@ void iodev_flush(iodev_id_t id)
     if (!iodevs[id] || !iodevs[id]->ops->flush)
         return;
 
-    if (mmu_active())
-        spin_lock(&iodevs[id]->lock);
+    iodev_take(id);
     iodevs[id]->ops->flush(iodevs[id]->opaque);
-    if (mmu_active())
-        spin_unlock(&iodevs[id]->lock);
+    iodev_drop(id);
 }
 
 void iodev_lock(iodev_id_t id)
@@ -200,8 +220,7 @@ void iodev_lock(iodev_id_t id)
     if (!iodevs[id])
         return;
 
-    if (mmu_active())
-        spin_lock(&iodevs[id]->lock);
+    iodev_take(id);
 }
 
 void iodev_unlock(iodev_id_t id)
@@ -209,13 +228,8 @@ void iodev_unlock(iodev_id_t id)
     if (!iodevs[id])
         return;
 
-    if (mmu_active())
-        spin_unlock(&iodevs[id]->lock);
+    iodev_drop(id);
 }
-
-int in_iodev = 0;
-
-static DECLARE_SPINLOCK(console_lock);
 
 void iodev_console_must_deliver(u32 ms)
 {

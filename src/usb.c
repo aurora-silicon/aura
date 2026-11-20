@@ -552,6 +552,10 @@ struct iodev iodev_usb_vuart = {
     .ops = &iodev_usb_sec_ops,
     .usage = 0,
     .lock = SPINLOCK_INIT,
+#ifdef AURA_WINDOWS
+    /* The vUART is the second CDC interface of the console's DWC3 (usb_iodev_vuart_setup). */
+    .console_controller = true,
+#endif
 };
 
 static int hpm_idx(char *hpm_path)
