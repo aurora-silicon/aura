@@ -49,8 +49,13 @@ SECTIONS {
     .text : {
         _text_content_start = .;
         *(EXCLUDE_FILE(*sptm_virt*.o) .text .text.*)
-        /* The largest guest-only object; the others are in .rodata, so both fill their steps. */
+        /*
+         * The largest guest-only object, and two small ones that pushed .rodata over its last
+         * 64 KiB step; the others are in .rodata, so both fill their steps.
+         */
         *sptm_virt_s2r.o(.text .text.*)
+        *sptm_virt_gpu.o(.text .text.*)
+        *sptm_virt_pmu.o(.text .text.*)
         . = ALIGN(8);
         *(.got.plt)
         _text_content_end = .;
