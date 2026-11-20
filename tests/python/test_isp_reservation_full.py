@@ -31,6 +31,7 @@ typedef uint32_t u32;
 #define T6030 0x6030
 #define T6041 0x6041
 #define T8132 0x8132
+#define T8152 0x8152
 /* Only the dram_only segment filter reads properties this way. */
 #define ADT_GETPROP(a, n, k, v) ((size_t)0)
 static u32 chip_id;
