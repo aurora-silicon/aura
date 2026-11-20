@@ -47,6 +47,7 @@ struct sart_entry { u8 index, flags; u64 paddr, size; };
 #define BIT(n) (1ULL << (n))
 #define GENMASK(h, l) ((BIT((h) + 1) - 1) & ~(BIT(l) - 1))
 #define FIELD_GET(mask, value) (((value) & (mask)) >> __builtin_ctzll(mask))
+#define FIELD_PREP(mask, value) (((u64)(value) << __builtin_ctzll(mask)) & (mask))
 #define PMGR_DIE_ID GENMASK(31, 28)
 #define USEC_PER_SEC 1000000
 #define ADT_GETPROP(...) (-1)
@@ -129,6 +130,8 @@ static u32 read32(u64 addr)
 }
 static void write32(u64 addr, u32 value) {}
 static void set32(u64 addr, u32 value) {}
+/* nvme_init() sets CC.MPS to 4 KiB pages; nothing else in this model is masked. */
+static void mask32(u64 addr, u32 clear, u32 set) { assert(addr == nvme_base + NVME_CC); }
 static void write64_lo_hi(u64 addr, u64 value)
 {
     publications++;

@@ -413,7 +413,8 @@ void aura_main(void)
 #ifndef BRINGUP
     if (supports_gxf())
         gxf_init();
-    if (mcc_init() && (chip_id == T8140 || chip_id == T6040))
+    /* A known MCC that fails to initialize is fatal on every chip; an unknown revision is not. */
+    if (mcc_init() < 0)
         panic("MCC initialization failed\n");
     mmu_init();
     aic_init();
