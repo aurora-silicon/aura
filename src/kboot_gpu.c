@@ -4484,6 +4484,24 @@ static const struct fw_version_info *gpu_initdata_compat(void)
     }
 }
 
+/*
+ * Keep iBoot's UAT carveouts reserved and leave the GPU disabled, without touching its power state
+ * or publishing an ABI.
+ */
+static int gpu_leave_disabled(void *dt, int sgx)
+{
+    if (dt_set_region(dt, sgx, "gfx-handoff", "/reserved-memory/uat-handoff") ||
+        dt_set_region(dt, sgx, "gfx-shared-region", "/reserved-memory/uat-pagetables") ||
+        dt_set_region(dt, sgx, "gpu-region", "/reserved-memory/uat-ttbs"))
+        return -1;
+    int gpu = fdt_path_offset(dt, "gpu");
+    if (gpu < 0)
+        return 0;
+    printf("FDT: GPU: no initdata layout for firmware %s; GPU disabled, boot continues\n",
+           os_firmware.string);
+    return fdt_setprop_string(dt, gpu, "status", "disabled");
+}
+
 int dt_set_gpu(void *dt)
 {
     if (chip_id == T8152) {
@@ -4594,22 +4612,19 @@ int dt_set_gpu(void *dt)
     size_t data_a_size, data_b_size, globals_size;
 
     /*
-     * Without an initdata layout for this firmware (T8112's G14G on 27.2), the GPU cannot be
-     * started. Keep iBoot's carveouts reserved and leave the GPU disabled, without touching its
-     * power state or publishing an ABI, instead of refusing the whole boot.
+     * Without an initdata layout for this firmware (T8112's G14G on 27.2), aura cannot set the
+     * GPU up, so it is left disabled instead of refusing the whole boot. The exception is a loaded
+     * image that firmware_gfx_version() identifies, which the kernel starts itself from the
+     * handoff (dt_set_gpu_g14g_handoff()): the operating points are published below as usual,
+     * then the handoff. Any other image, or a handoff the ADT does not describe, leaves the GPU
+     * disabled.
      */
+    const struct fw_version_info *handoff = NULL;
     if (rust_gpu_initdata_size(compat->num[0], compat->num[1], &data_a_size, &data_b_size,
                                &globals_size) == -1) {
-        if (dt_set_region(dt, sgx, "gfx-handoff", "/reserved-memory/uat-handoff") ||
-            dt_set_region(dt, sgx, "gfx-shared-region", "/reserved-memory/uat-pagetables") ||
-            dt_set_region(dt, sgx, "gpu-region", "/reserved-memory/uat-ttbs"))
-            return -1;
-        gpu = fdt_path_offset(dt, "gpu");
-        if (gpu < 0)
-            return 0;
-        printf("FDT: GPU: no initdata layout for firmware %s; GPU disabled, boot continues\n",
-               os_firmware.string);
-        return fdt_setprop_string(dt, gpu, "status", "disabled");
+        handoff = downstream_dtb ? firmware_gfx_version(chip_id) : NULL;
+        if (!handoff)
+            return gpu_leave_disabled(dt, sgx);
     }
 
     u32 perf_state_count;
@@ -4749,6 +4764,13 @@ int dt_set_gpu(void *dt)
             if (fdt_set_float_array(dt, gpu, "apple,afr-leak-coef", afr_leak, dies))
                 return -1;
         }
+    }
+
+    if (handoff) {
+        if (!dt_set_gpu_g14g_handoff(dt, handoff))
+            return 0;
+        printf("FDT: GPU: firmware %s handoff not published\n", handoff->string);
+        return gpu_leave_disabled(dt, sgx);
     }
 
     if (dt_set_region(dt, sgx, "gfx-handoff", "/reserved-memory/uat-handoff"))

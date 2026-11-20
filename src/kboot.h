@@ -53,6 +53,8 @@ struct gpu_fw_layout {
     u64 ro_size; /* __DATA_SHARED_RO right after __DATA, or 0 */
 };
 int gpu_fw_layout(int sgx, struct gpu_fw_layout *fw);
+struct fw_version_info;
+int dt_set_gpu_g14g_handoff(void *dt, const struct fw_version_info *image);
 int kboot_prepare_dt(void *fdt);
 int kboot_boot(void *kernel);
 /* Reserve the DMA a USB controller that could not be stopped keeps (main.c, after USB shutdown). */

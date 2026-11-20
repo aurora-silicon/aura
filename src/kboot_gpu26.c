@@ -77,7 +77,27 @@ static const char *const t8122_gpu_adt_regions[T8122_GPU_UAT] = {
     "gfx-shared-l2-region",
 };
 
+/*
+ * Which GPU the handoff is for: the name in the log, the /arm-io/sgx compatible to require (NULL:
+ * any), the compatible of the DT GPU node, and the VA of the first firmware segment (0: take it
+ * from the segment list; the others must then follow on from it).
+ */
+struct gpu26_target {
+    const char *tag;
+    const char *sgx_compat;
+    const char *gpu_compat;
+    u64 fw_va;
+};
+
+static const struct gpu26_target t8122_target = {
+    "T8122",
+    "gpu,t8122",
+    "apple,agx-t8122",
+    T8122_GPU_FW_VA,
+};
+
 struct t8122_gpu_fw {
+    const struct gpu26_target *t;
     u64 base[T8122_GPU_REGIONS], size[T8122_GPU_REGIONS];
     u64 vas[T8122_GPU_MAX_SEGS];
     u32 flags[T8122_GPU_MAX_SEGS];
@@ -134,70 +154,76 @@ static bool t8122_gpu_range_ok(u64 base, u64 size, u64 dram_start, u64 dram_end)
 }
 
 /* Validate the complete ADT description before anything touches the FDT. */
-static int t8122_gpu_read_adt(struct t8122_gpu_fw *fw)
+static int gpu26_read_adt(const struct gpu26_target *t, struct t8122_gpu_fw *fw)
 {
+    fw->t = t;
     int sgx = adt_path_offset(adt, "/arm-io/sgx");
-    if (sgx < 0 || !t8122_adt_compatible(sgx, "gpu,t8122"))
-        bail("ADT: GPU: T8122 /arm-io/sgx missing or not gpu,t8122\n");
+    if (sgx < 0 || (t->sgx_compat && !t8122_adt_compatible(sgx, t->sgx_compat)))
+        bail("ADT: GPU: %s /arm-io/sgx missing or not %s\n", t->tag,
+             t->sgx_compat ? t->sgx_compat : "present");
 
     for (int i = 0; i < T8122_GPU_UAT; i++) {
         char prop[64];
         snprintf(prop, sizeof(prop), "%s-base", t8122_gpu_adt_regions[i]);
         if (t8122_adt_u64(sgx, prop, &fw->base[i]))
-            bail("ADT: GPU: T8122 sgx %s missing\n", prop);
+            bail("ADT: GPU: %s sgx %s missing\n", t->tag, prop);
         snprintf(prop, sizeof(prop), "%s-size", t8122_gpu_adt_regions[i]);
         if (t8122_adt_u64(sgx, prop, &fw->size[i]))
-            bail("ADT: GPU: T8122 sgx %s missing\n", prop);
+            bail("ADT: GPU: %s sgx %s missing\n", t->tag, prop);
     }
 
     int asc = adt_path_offset(adt, "/arm-io/gfx-asc");
     int nub = adt_path_offset(adt, "/arm-io/gfx-asc/iop-gfx-nub");
     if (asc < 0 || nub < 0)
-        bail("ADT: GPU: T8122 gfx-asc or iop-gfx-nub missing\n");
+        bail("ADT: GPU: %s gfx-asc or iop-gfx-nub missing\n", t->tag);
 
     u32 len, nub_len, preloaded;
     const struct adt_segment_ranges *seg = adt_getprop(adt, asc, "segment-ranges", &len);
     const void *nub_seg = adt_getprop(adt, nub, "segment-ranges", &nub_len);
     if (!seg || (len != 2 * sizeof(*seg) && len != 3 * sizeof(*seg)) || !nub_seg ||
         nub_len != len || memcmp(seg, nub_seg, len))
-        bail("ADT: GPU: T8122 gfx-asc segment-ranges missing or unlike iop-gfx-nub\n");
+        bail("ADT: GPU: %s gfx-asc segment-ranges missing or unlike iop-gfx-nub\n", t->tag);
     int segments = len / sizeof(*seg);
     const char *layout = t8122_gpu_layouts[segments].names;
     const char *names = adt_getprop(adt, asc, "segment-names", &len);
     if (!names || len < strlen(layout) + 1 || memcmp(names, layout, strlen(layout) + 1))
-        bail("ADT: GPU: T8122 gfx-asc segment-names is not %s\n", layout);
+        bail("ADT: GPU: %s gfx-asc segment-names is not %s\n", t->tag, layout);
     const void *pre = adt_getprop(adt, nub, "pre-loaded", &len);
     if (!pre || len != sizeof(preloaded))
-        bail("ADT: GPU: T8122 GPU firmware is not pre-loaded\n");
+        bail("ADT: GPU: %s GPU firmware is not pre-loaded\n", t->tag);
     memcpy(&preloaded, pre, sizeof(preloaded));
     if (preloaded != 1)
-        bail("ADT: GPU: T8122 GPU firmware is not pre-loaded\n");
+        bail("ADT: GPU: %s GPU firmware is not pre-loaded\n", t->tag);
 
-    u64 next_va = T8122_GPU_FW_VA;
+    u64 next_va = t->fw_va;
     for (int i = 0; i < segments; i++) {
         struct adt_segment_ranges s;
         memcpy(&s, &seg[i], sizeof(s));
+        /* Without a fixed base, the segments only have to run on from the first one. */
+        if (!i && !next_va && s.iova && !(s.iova & (SZ_16K - 1)))
+            next_va = s.iova;
         if (s.phys != s.remap || !s.size || s.size & (SZ_16K - 1) || s.size > T8122_GPU_MAX_SEG ||
             s.unk != t8122_gpu_layouts[segments].flags[i])
-            bail("ADT: GPU: T8122 gfx-asc segment %d is not a plain preloaded segment\n", i);
+            bail("ADT: GPU: %s gfx-asc segment %d is not a plain preloaded segment\n", t->tag, i);
         if (s.iova != next_va)
-            bail("ADT: GPU: T8122 firmware segment %d at unexpected VA 0x%lx (expected 0x%lx)\n", i,
-                 s.iova, next_va);
+            bail("ADT: GPU: %s firmware segment %d at unexpected VA 0x%lx (expected 0x%lx)\n",
+                 t->tag, i, s.iova, next_va);
         next_va += s.size;
         if (i < 2) {
             fw->base[T8122_GPU_UAT + i] = s.phys;
             fw->size[T8122_GPU_UAT + i] = s.size;
         } else if (s.phys != fw->base[T8122_GPU_UAT + 1] + fw->size[T8122_GPU_UAT + 1]) {
-            bail("ADT: GPU: T8122 __DATA_SHARED_RO 0x%lx does not follow __DATA\n", s.phys);
+            bail("ADT: GPU: %s __DATA_SHARED_RO 0x%lx does not follow __DATA\n", t->tag, s.phys);
         } else {
             /* fw-data covers __DATA and the read-only tail after it. */
             u64 ro_base, ro_size, rw_size;
             if (t8122_adt_u64(sgx, "gfx-data-shared-ro-base", &ro_base) ||
                 t8122_adt_u64(sgx, "gfx-data-shared-ro-size", &ro_size) || ro_base != s.phys ||
                 ro_size != s.size)
-                bail("ADT: GPU: T8122 sgx gfx-data-shared-ro does not match __DATA_SHARED_RO\n");
+                bail("ADT: GPU: %s sgx gfx-data-shared-ro does not match __DATA_SHARED_RO\n",
+                     t->tag);
             if (!t8122_adt_u64(sgx, "gfx-data-shared-rw-size", &rw_size) && rw_size)
-                bail("ADT: GPU: T8122 sgx has a gfx-data-shared-rw region (0x%lx)\n", rw_size);
+                bail("ADT: GPU: %s sgx has a gfx-data-shared-rw region (0x%lx)\n", t->tag, rw_size);
             fw->size[T8122_GPU_UAT + 1] += s.size;
         }
         fw->vas[i] = s.iova;
@@ -210,11 +236,11 @@ static int t8122_gpu_read_adt(struct t8122_gpu_fw *fw)
         return -1;
     for (int i = 0; i < T8122_GPU_REGIONS; i++) {
         if (!t8122_gpu_range_ok(fw->base[i], fw->size[i], dram_start, dram_end))
-            bail("ADT: GPU: T8122 %s region 0x%lx+0x%lx is not a 16K-aligned DRAM range\n",
+            bail("ADT: GPU: %s %s region 0x%lx+0x%lx is not a 16K-aligned DRAM range\n", t->tag,
                  t8122_gpu_names[i], fw->base[i], fw->size[i]);
         for (int j = 0; j < i; j++)
             if (fw->base[i] < fw->base[j] + fw->size[j] && fw->base[j] < fw->base[i] + fw->size[i])
-                bail("ADT: GPU: T8122 %s region overlaps %s\n", t8122_gpu_names[i],
+                bail("ADT: GPU: %s %s region overlaps %s\n", t->tag, t8122_gpu_names[i],
                      t8122_gpu_names[j]);
     }
     return 0;
@@ -235,17 +261,22 @@ static int t8122_fdt_transaction(void *dt, int (*fn)(void *dt, void *arg), void 
 }
 
 /* The GPU node: the gpu alias (as for the other SoCs), else the only
- * apple,agx-t8122 node. An alias to anything else is refused.
+ * node with the target's compatible. An alias to anything else is refused.
  */
-static int t8122_gpu_node(void *dt)
+static int gpu26_node(void *dt, const struct gpu26_target *t)
 {
     int gpu = fdt_path_offset(dt, "gpu");
     if (gpu >= 0)
-        return fdt_node_check_compatible(dt, gpu, "apple,agx-t8122") ? -FDT_ERR_BADVALUE : gpu;
-    gpu = fdt_node_offset_by_compatible(dt, -1, "apple,agx-t8122");
-    if (gpu >= 0 && fdt_node_offset_by_compatible(dt, gpu, "apple,agx-t8122") >= 0)
+        return fdt_node_check_compatible(dt, gpu, t->gpu_compat) ? -FDT_ERR_BADVALUE : gpu;
+    gpu = fdt_node_offset_by_compatible(dt, -1, t->gpu_compat);
+    if (gpu >= 0 && fdt_node_offset_by_compatible(dt, gpu, t->gpu_compat) >= 0)
         return -FDT_ERR_BADVALUE;
     return gpu;
+}
+
+static int t8122_gpu_node(void *dt)
+{
+    return gpu26_node(dt, &t8122_target);
 }
 
 static int t8122_resv_node(void *dt)
@@ -274,8 +305,8 @@ static void t8122_gpu_node_name(char *name, size_t len, int i, u64 base)
  * already describes exactly this range. Sets *covered when an overlapping
  * entry contains the whole range. Returns 1 on overlap, 0 if free, -1 on error.
  */
-static int t8122_resv_overlap(void *dt, const char *self, bool self_any, u64 base, u64 size,
-                              bool *covered)
+static int t8122_resv_overlap(void *dt, const char *tag, const char *self, bool self_any, u64 base,
+                              u64 size, bool *covered)
 {
     int resv = t8122_resv_node(dt), node, ret = 0;
     *covered = false;
@@ -296,7 +327,7 @@ static int t8122_resv_overlap(void *dt, const char *self, bool self_any, u64 bas
         for (int i = 0; i + 16 <= len; i += 16, reg += 2) {
             u64 start = fdt64_ld(reg), end = start + fdt64_ld(reg + 1);
             if (start < base + size && base < end) {
-                printf("FDT: GPU: T8122 range 0x%lx+0x%lx overlaps /reserved-memory/%s\n", base,
+                printf("FDT: GPU: %s range 0x%lx+0x%lx overlaps /reserved-memory/%s\n", tag, base,
                        size, name);
                 *covered |= start <= base && base + size <= end;
                 ret = 1;
@@ -307,7 +338,7 @@ static int t8122_resv_overlap(void *dt, const char *self, bool self_any, u64 bas
         u64 start, len;
         if (fdt_get_mem_rsv(dt, i, &start, &len) == 0 && start < base + size &&
             base < start + len) {
-            printf("FDT: GPU: T8122 range 0x%lx+0x%lx overlaps /memreserve/ 0x%lx+0x%lx\n", base,
+            printf("FDT: GPU: %s range 0x%lx+0x%lx overlaps /memreserve/ 0x%lx+0x%lx\n", tag, base,
                    size, start, len);
             *covered |= start <= base && base + size <= start + len;
             ret = 1;
@@ -348,7 +379,7 @@ static u32 t8122_gpu_reserve(void *dt, const char *name, bool asc_mem, u64 base,
  * already has under other names stay first, in order; the six handoff regions
  * replace any of the same name.
  */
-static int t8122_gpu_link(void *dt, int gpu, const u32 *phandles)
+static int gpu26_link(void *dt, const struct gpu26_target *t, int gpu, const u32 *phandles)
 {
     fdt32_t regions[T8122_GPU_MAX_MR];
     char names[512];
@@ -358,16 +389,16 @@ static int t8122_gpu_link(void *dt, int gpu, const u32 *phandles)
     const char *old_names = fdt_getprop(dt, gpu, "memory-region-names", &names_len);
     int old_count = old ? len / 4 : 0;
     if ((old && len % 4) || (old_count && !old_names) || (!old && old_names))
-        bail("FDT: GPU: T8122 GPU node memory-region lists are inconsistent\n");
+        bail("FDT: GPU: %s GPU node memory-region lists are inconsistent\n", t->tag);
 
     int off = 0;
     for (int i = 0; i < old_count; i++) {
         if (off >= names_len)
-            bail("FDT: GPU: T8122 GPU node has fewer memory-region-names than regions\n");
+            bail("FDT: GPU: %s GPU node has fewer memory-region-names than regions\n", t->tag);
         const char *name = old_names + off;
         int n = strnlen(name, names_len - off) + 1;
         if (off + n > names_len)
-            bail("FDT: GPU: T8122 GPU node memory-region-names is not terminated\n");
+            bail("FDT: GPU: %s GPU node memory-region-names is not terminated\n", t->tag);
         off += n;
         bool ours = false;
         for (int j = 0; j < T8122_GPU_REGIONS; j++)
@@ -375,13 +406,13 @@ static int t8122_gpu_link(void *dt, int gpu, const u32 *phandles)
         if (ours)
             continue;
         if (count >= T8122_GPU_MAX_MR - T8122_GPU_REGIONS || used + n > (int)sizeof(names) - 64)
-            bail("FDT: GPU: T8122 GPU node has too many memory regions\n");
+            bail("FDT: GPU: %s GPU node has too many memory regions\n", t->tag);
         regions[count++] = old[i];
         memcpy(names + used, name, n);
         used += n;
     }
     if (old_names && off != names_len)
-        bail("FDT: GPU: T8122 GPU node has more memory-region-names than regions\n");
+        bail("FDT: GPU: %s GPU node has more memory-region-names than regions\n", t->tag);
     for (int j = 0; j < T8122_GPU_REGIONS; j++) {
         regions[count++] = cpu_to_fdt32(phandles[j]);
         int n = strlen(t8122_gpu_names[j]) + 1;
@@ -390,10 +421,10 @@ static int t8122_gpu_link(void *dt, int gpu, const u32 *phandles)
     }
 
     if (fdt_setprop(dt, gpu, "memory-region", regions, count * sizeof(fdt32_t)))
-        bail("FDT: GPU: T8122 cannot set memory-region\n");
-    gpu = t8122_gpu_node(dt);
+        bail("FDT: GPU: %s cannot set memory-region\n", t->tag);
+    gpu = gpu26_node(dt, t);
     if (gpu < 0 || fdt_setprop(dt, gpu, "memory-region-names", names, used))
-        bail("FDT: GPU: T8122 cannot set memory-region-names\n");
+        bail("FDT: GPU: %s cannot set memory-region-names\n", t->tag);
     return 0;
 }
 
@@ -508,36 +539,51 @@ static int t8122_gpu_publish_27(void *dt, const struct t8122_gpu_fw *fw)
     return 0;
 }
 
-static int t8122_gpu_publish(void *dt, void *arg)
+/*
+ * Reserve the six handoff regions no-map and link them to the GPU node by name. Fails, before
+ * writing anything, if another reservation claims any part of them.
+ */
+static int gpu26_publish_regions(void *dt, const struct t8122_gpu_fw *fw)
 {
-    const struct t8122_gpu_fw *fw = arg;
+    const struct gpu26_target *t = fw->t;
     u32 phandles[T8122_GPU_REGIONS];
     char name[64];
 
-    int gpu = t8122_gpu_node(dt);
+    int gpu = gpu26_node(dt, t);
     if (gpu < 0)
-        bail("FDT: GPU: T8122 DT has no apple,agx-t8122 GPU node (gpu alias)\n");
+        bail("FDT: GPU: %s DT has no %s GPU node (gpu alias)\n", t->tag, t->gpu_compat);
     if (t8122_resv_node(dt) < 0)
-        bail("FDT: GPU: T8122 DT has no usable /reserved-memory\n");
+        bail("FDT: GPU: %s DT has no usable /reserved-memory\n", t->tag);
 
     /* Nothing else may already claim any part of the handoff. */
     for (int i = 0; i < T8122_GPU_REGIONS; i++) {
         bool covered;
         t8122_gpu_node_name(name, sizeof(name), i, fw->base[i]);
-        if (t8122_resv_overlap(dt, name, i < T8122_GPU_UAT, fw->base[i], fw->size[i], &covered))
-            bail("FDT: GPU: T8122 %s region conflicts with an existing reservation\n",
+        if (t8122_resv_overlap(dt, t->tag, name, i < T8122_GPU_UAT, fw->base[i], fw->size[i],
+                               &covered))
+            bail("FDT: GPU: %s %s region conflicts with an existing reservation\n", t->tag,
                  t8122_gpu_names[i]);
     }
     for (int i = 0; i < T8122_GPU_REGIONS; i++) {
         t8122_gpu_node_name(name, sizeof(name), i, fw->base[i]);
         phandles[i] = t8122_gpu_reserve(dt, name, i >= T8122_GPU_UAT, fw->base[i], fw->size[i]);
         if (!phandles[i])
-            bail("FDT: GPU: T8122 cannot reserve %s region\n", t8122_gpu_names[i]);
+            bail("FDT: GPU: %s cannot reserve %s region\n", t->tag, t8122_gpu_names[i]);
     }
 
-    gpu = t8122_gpu_node(dt);
-    if (gpu < 0 || t8122_gpu_link(dt, gpu, phandles))
+    gpu = gpu26_node(dt, t);
+    if (gpu < 0 || gpu26_link(dt, t, gpu, phandles))
         return -1;
+    return 0;
+}
+
+static int t8122_gpu_publish(void *dt, void *arg)
+{
+    const struct t8122_gpu_fw *fw = arg;
+
+    if (gpu26_publish_regions(dt, fw))
+        return -1;
+    int gpu;
 
     fdt64_t vas[T8122_GPU_MAX_SEGS];
     fdt32_t flags[T8122_GPU_MAX_SEGS];
@@ -626,7 +672,7 @@ static void t8122_gpu_reserve_range(void *dt, const struct t8122_gpu_range *r, u
         return;
     }
     int overlap =
-        t8122_resv_overlap(dt, name, r->index < T8122_GPU_UAT, r->base, r->size, &covered);
+        t8122_resv_overlap(dt, "T8122", name, r->index < T8122_GPU_UAT, r->base, r->size, &covered);
     if (overlap) {
         printf("FDT: GPU: T8122 %s 0x%lx+0x%lx %s\n", r->what, r->base, r->size,
                overlap < 0 ? "not reserved (no /reserved-memory)"
@@ -700,7 +746,7 @@ int dt_set_gpu_t8122_26(void *dt)
     struct t8122_gpu_fw fw;
 
     printf("FDT: GPU: T8122 firmware handoff\n");
-    if (!t8122_gpu_read_adt(&fw) && !t8122_fdt_transaction(dt, t8122_gpu_publish, &fw))
+    if (!gpu26_read_adt(&t8122_target, &fw) && !t8122_fdt_transaction(dt, t8122_gpu_publish, &fw))
         return 0;
 
     printf("FDT: GPU: T8122 handoff not published; reserving the GPU firmware memory only\n");
@@ -708,4 +754,81 @@ int dt_set_gpu_t8122_26(void *dt)
         printf("FDT: GPU: T8122 cannot mark the GPU node disabled\n");
     t8122_gpu_reserve_all(dt);
     return 0;
+}
+
+/*
+ * G14G (T8112) on firmware whose GPU interface the kernel starts itself (on 27.2, Linux's
+ * g14_v27_2 backend). The caller has identified the image iBoot loaded (firmware_gfx_version())
+ * and has no initdata layout for it, and has already published the operating points. The ADT
+ * must describe the same handoff as on T8122: four UAT regions in /arm-io/sgx and the preloaded
+ * gfx-asc segments, the __DATA_SHARED_RO tail matching the sgx gfx-data-shared-ro pair. Their
+ * firmware VAs are not fixed here: they must follow on from the first segment's.
+ */
+static const struct gpu26_target g14g_target = {
+    "G14G",
+    NULL,
+    "apple,agx-g14g",
+    0,
+};
+
+struct g14g_handoff {
+    struct t8122_gpu_fw fw;
+    const struct fw_version_info *image;
+    u32 copy_bytes;
+    const void *sram;
+    u32 sram_len;
+};
+
+static int g14g_gpu_publish(void *dt, void *arg)
+{
+    const struct g14g_handoff *h = arg;
+
+    if (gpu26_publish_regions(dt, &h->fw))
+        return -1;
+
+    /*
+     * The kernel's 27.2 backend reads the SRAM voltage of each operating point from
+     * /chosen/aurora-gpu-resources/sgx adt-perf-states-sram, the ADT property as it is.
+     */
+    int chosen = fdt_path_offset(dt, "/chosen");
+    int res = chosen < 0 ? chosen : fdt_subnode_offset(dt, chosen, "aurora-gpu-resources");
+    if (chosen >= 0 && res == -FDT_ERR_NOTFOUND)
+        res = fdt_add_subnode(dt, chosen, "aurora-gpu-resources");
+    int sgx = res < 0 ? res : fdt_subnode_offset(dt, res, "sgx");
+    if (res >= 0 && sgx == -FDT_ERR_NOTFOUND)
+        sgx = fdt_add_subnode(dt, res, "sgx");
+    if (sgx < 0 || (h->sram && fdt_setprop(dt, sgx, "adt-perf-states-sram", h->sram, h->sram_len)))
+        bail("FDT: GPU: G14G cannot publish /chosen/aurora-gpu-resources/sgx\n");
+
+    int gpu = gpu26_node(dt, h->fw.t);
+    if (gpu < 0 || firmware_set_fdt(dt, gpu, "apple,firmware-compat", h->image) ||
+        firmware_set_fdt(dt, gpu, "apple,firmware-version", h->image))
+        bail("FDT: GPU: G14G cannot set the firmware version\n");
+    gpu = gpu26_node(dt, h->fw.t);
+    if (gpu < 0 || fdt_setprop_u32(dt, gpu, "apple,coredump-copy-buffer", h->copy_bytes))
+        bail("FDT: GPU: G14G cannot set apple,coredump-copy-buffer\n");
+    gpu = gpu26_node(dt, h->fw.t);
+    if (gpu < 0 || fdt_setprop_string(dt, gpu, "status", "okay"))
+        bail("FDT: GPU: G14G cannot set GPU status\n");
+
+    for (int i = 0; i < T8122_GPU_REGIONS; i++)
+        printf("FDT: GPU: G14G %s: 0x%lx+0x%lx (no-map)\n", t8122_gpu_names[i], h->fw.base[i],
+               h->fw.size[i]);
+    printf("FDT: GPU: G14G firmware %s handoff published, GPU enabled\n", h->image->string);
+    return 0;
+}
+
+int dt_set_gpu_g14g_handoff(void *dt, const struct fw_version_info *image)
+{
+    struct g14g_handoff h = {.image = image};
+
+    if (gpu26_read_adt(&g14g_target, &h.fw))
+        return -1;
+    int nub = adt_path_offset(adt, "/arm-io/gfx-asc/iop-gfx-nub");
+    if (nub < 0 || ADT_GETPROP(adt, nub, "coredump-copy-buffer", &h.copy_bytes) < 0 ||
+        !h.copy_bytes)
+        bail("ADT: GPU: G14G iop-gfx-nub coredump-copy-buffer missing\n");
+    int sgx = adt_path_offset(adt, "/arm-io/sgx");
+    h.sram = sgx < 0 ? NULL : adt_getprop(adt, sgx, "perf-states-sram", &h.sram_len);
+    return t8122_fdt_transaction(dt, g14g_gpu_publish, &h);
 }
