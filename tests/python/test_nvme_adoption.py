@@ -182,6 +182,10 @@ static int pmgr_reset(u8 die, const char *name) { resets++; event('R'); return 0
 static void udelay(u32 us) {}
 /* As right after a reset of ANS (0x6a on the J700): a start from off needs no reset first. */
 static u32 asc_cpu_status(asc_dev_t *a) { return 0x6a; }
+/* An empty receive mailbox: nothing stale to drop before the run bit. */
+struct asc_message { u64 msg0; u32 msg1; };
+static void asc_i2a_enable(asc_dev_t *a, bool on) {}
+static bool asc_recv(asc_dev_t *a, struct asc_message *m) { return false; }
 static bool rtkit_has_owned_buffers(const rtkit_dev_t *r) { return false; }
 static int poll32(u64 a, u32 mask, u32 value, unsigned timeout) { return 0; }
 static bool nvme_ctrl_disable(void)
