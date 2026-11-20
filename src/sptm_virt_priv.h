@@ -87,6 +87,7 @@ void sptm_virt_s2_enter_xnu(int cpu);
 void sptm_virt_ctrr_publish_rorgn(void);
 void sptm_virt_gpu_deadline(struct exc_info *ctx);
 bool sptm_virt_gpu_deadline_due(void);
+bool sptm_virt_gpu_is_parked(void);
 void sptm_virt_gpu_park_now(struct exc_info *ctx, const char *why);
 void sptm_virt_report_guest(u64 *regs, u64 pc);
 void sptm_virt_canary_tick(void);
