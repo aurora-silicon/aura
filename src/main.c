@@ -414,8 +414,11 @@ void aura_main(void)
     if (supports_gxf())
         gxf_init();
     /*
-     * A known MCC that fails to initialize is fatal on every chip; an unknown revision
-     * (MCC_UNSUPPORTED) or a SoC with no MCC in the ADT (MCC_ABSENT) is not.
+     * mcc_init() fails only where the MCC must be driven: the firmware-cache path (T8140, T6041)
+     * fails on a layout or cache status it does not expect. An unknown revision, or an ADT that
+     * does not give a driver its counts (4 or 8 bytes) or register windows (MCC_UNSUPPORTED),
+     * and a SoC with no MCC in the ADT (MCC_ABSENT) boot on; mcc_unmap_carveouts() then takes
+     * the carveouts from the ADT list, which it requires.
      */
     if (mcc_init() < 0)
         panic("MCC initialization failed\n");
