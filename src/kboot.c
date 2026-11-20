@@ -8187,6 +8187,16 @@ static int dt_set_dcp_fw27_clocks(const char *alias, const char *adt_engine)
     return ret;
 }
 
+/*
+ * The J773g on 27.2: macOS drives the HDMI port from dcpext0 and parks the internal DCP, so its
+ * display goes through the external-processor handoff of kboot_display_handoff.c (headless, as
+ * the J575c). Every other T8132 boot keeps the M4 handoff, which is written for 26.6.2.
+ */
+static bool dt_t8132_external_display(void)
+{
+    return firmware_os_components() == V27_2 && !fdt_node_check_compatible(dt, 0, "apple,j773g");
+}
+
 static int dt_set_display(void)
 {
     if (chip_id == T8140)
@@ -8212,6 +8222,8 @@ static int dt_set_display(void)
         disp0_piodma_alias = compat_piodma_alias;
 
     if (chip_id == T8132) {
+        if (dt_t8132_external_display())
+            return dt_set_display_handoff(dt);
         if (dt_set_m4_dcp_handoff())
             printf("FDT: M4 DCP handoff refused; keeping the boot framebuffer\n");
         else
