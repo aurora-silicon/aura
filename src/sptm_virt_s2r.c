@@ -1516,11 +1516,10 @@ static bool s2r_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int w
     }
     if (!shadow_timer)
         sptm_virt_mmio_rw(addr, val, write, width);
-    if (commit_rb) {
+    /* One read straight after: runs 59 and 61 (with the 5 us wait and crumb bit 10's PMGR
+     * snapshot at every commit write) lost their first wake. */
+    if (commit_rb)
         s2r_j613_snapshot_word("J613CR0", addr);
-        udelay(5);
-        s2r_j613_snapshot_word("J613CR5", addr);
-    }
     if (timer && !shadow_timer)
         s2r_crumb(0x30);
     if (!shadow_timer)
