@@ -175,9 +175,9 @@ static void sptm_virt_rg_report(struct exc_info *ctx, const char *what, u64 addr
         .code = 0x52535421, /* 'RST!' */
         .info = ctx,
     };
-    uartproxy_run(&start);
-    while (1)
-        sysop("wfe");
+    /* The other cores stop first; a host that closes the port and opens it again finds the proxy
+     * still there. */
+    sptm_virt_park_oneway(&start);
 }
 
 static bool sptm_virt_rg_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int width)
@@ -715,6 +715,9 @@ bool sptm_virt_s2_dabort(u64 *regs)
     if (hv_handle_dabort(&ctx)) {
         memcpy(regs, ctx.regs, 31 * sizeof(u64));
         msr(ELR_EL2, ctx.elr + 4);
+        /* An EL2 trap, the host's request's first choice: the access is complete. */
+        if (sptm_virt_park_requested(false))
+            sptm_virt_park_host(&ctx);
         return true;
     }
 
