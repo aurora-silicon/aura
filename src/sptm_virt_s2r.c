@@ -2313,6 +2313,12 @@ void sptm_virt_s2r_setup(bool cdc)
         s2r_hook_adt("/arm-io/aop2-exclave-mailbox", 0, "aop2x-mbox", 0, 0);
         s2r_hook_adt("/arm-io/dcp-exclave-mailbox", 0, "dcpx-mbox", 0, 0);
         s2r_hook_adt("/arm-io/esm", 0, "esm-mbox", 0, 0);
+        /* Bit 27 (J613): ANS's and the PMP's ASC pages (CPU_CONTROL +0x44, CPU_STATUS +0x48),
+         * for macOS's own run-bit writes and status reads around each one's idle. */
+        if (chip_id == T8122 && (sptm_virt_s2r_crumbs & BIT(27))) {
+            s2r_hook_adt("/arm-io/ans", 0, "ans-asc", 0, 0x4000);
+            s2r_hook_adt("/arm-io/pmp", 0, "pmp-asc", 0, 0x4000);
+        }
     }
     /*
      * The full entry trace. Not in a plain go-mode sleep: XNU hammers these blocks in the last
