@@ -304,3 +304,10 @@ def test_mailbox_log_decoding():
     assert lines[1].startswith(">> 1 ") and "ep 0x21 0x0083000000000011 kick" in lines[1]
     assert "c5 I2A asc0 ep 0x20 0x0042000000000001" in lines[2] and lines[2].startswith("  ")
     assert "c6 I2A asc0 ep 0x21 0x0042000000000002" in lines[3] and lines[3].startswith(">>")
+    # A first half whose second never came (the log ended between them, or the core read again)
+    # is still a message: it isn't dropped, and a later first half doesn't overwrite it.
+    raw2 = (rec(20, 0x0042000000000003, 0, 1 | 1 << 2 | 5 << 8, 1)
+            + rec(21, 0x0042000000000004, 0, 1 | 1 << 2 | 5 << 8, 1))
+    lines2 = hvsnap.mbox_lines(raw2)
+    assert len(lines2) == 2 and "0x0042000000000003" in lines2[0], lines2
+    assert "0x0042000000000004" in lines2[1] and "first word only" in lines2[1], lines2

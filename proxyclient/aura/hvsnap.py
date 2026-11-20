@@ -256,7 +256,9 @@ def summary(h, snaps, chain_names=None):
 # ---- the mailbox log ----------------------------------------------------------------------
 
 MBOX = struct.Struct("<QQQII")
-EP21_TYPES = {3: "kick", 4: "device control", 6: "generation"}
+# (msg >> 48) & 0x3f of a message on EP 0x21: 0x83 is the TX doorbell (a channel's kick, or
+# DEVCTRL 0x11 / KICKFW 0x10), 0x84 FWCTL's (asahi gpu.rs MSG_TX_DOORBELL, MSG_FWCTL).
+EP21_TYPES = {3: "kick", 4: "fwctl", 6: "generation"}
 
 
 def mbox_lines(raw):
@@ -264,14 +266,21 @@ def mbox_lines(raw):
     the GPU's work goes, is marked."""
     recs = [MBOX.unpack_from(raw, i) for i in range(0, len(raw) - MBOX.size + 1, MBOX.size)]
     out, pend = [], {}
+
+    def lone(n, t, msg, recv, asc, cpu):
+        return (f"{n} t={t:#x} c{cpu} {'I2A' if recv else 'A2I'} asc{asc} {msg:#018x} (first "
+                f"word only)")
+
     for n, (t, msg, hi, meta, match) in enumerate(recs):
         recv, asc, words, cpu = meta & 1, (meta >> 1) & 1, (meta >> 2) & 3, (meta >> 8) & 15
         key = (recv, asc, cpu)
         if words == 1:
-            pend[key] = (t, msg)
+            if key in pend:  # the core started another before this one's second half
+                out.append("   " + lone(*pend.pop(key), *key))
+            pend[key] = (n, t, msg)
             continue
         if words == 2:
-            t, msg = pend.pop(key, (t, None))
+            _n, t, msg = pend.pop(key, (n, t, None))
             if msg is None:
                 out.append(f"{n} t={t:#x} c{cpu} {'I2A' if recv else 'A2I'} asc{asc} (second "
                            f"word only) {hi:#018x}")
@@ -282,4 +291,6 @@ def mbox_lines(raw):
         what = f" {EP21_TYPES.get(typ, f'type {typ}')}" if ep == 0x21 else ""
         out.append(f"{mark} {n} t={t:#x} c{cpu} {'I2A' if recv else 'A2I'} asc{asc} ep 0x{ep:02x} "
                    f"{msg:#018x}{what} (after {match} named writes)")
+    # First halves the log ended before the second of.
+    out += ["   " + lone(n, t, msg, *key) for key, (n, t, msg) in pend.items()]
     return out
