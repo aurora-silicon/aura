@@ -994,6 +994,20 @@ bool nvme_post_m4_passed_off(void)
     return !nvme_initialized && nvme_sart_saved_cnt && nvme_post_m4();
 }
 
+/*
+ * A proxy kboot (P_KBOOT_PREPARE_DT, then P_KBOOT_BOOT) hands Linux this stage's ANS session, as
+ * payload.c's boot= does. Key on the same controller state nvme_shutdown() acts on for boot=
+ * (NVME_T8132 with non-secure registers), so the two Linux entry points cannot drift apart: the
+ * tree describes ANS as running, and nvme_shutdown() verifies the controller and leaves it and
+ * RTKit to Linux, or refuses an unhealthy one and the stage returns to the proxy.
+ */
+bool nvme_keep_for_kboot(bool keep)
+{
+    nvme_keep_running_for_linux =
+        keep && nvme_initialized && nvme_type == NVME_T8132 && !nvme_secure_regs;
+    return nvme_keep_running_for_linux;
+}
+
 bool nvme_shutdown(void)
 {
     if (nvme_reboot_required) {
@@ -1023,6 +1037,7 @@ bool nvme_shutdown(void)
             return false;
         }
         nvme_initialized = false;
+        nvme_keep_running_for_linux = false;
         printf("nvme: leaving controller and RTKit running for Linux adoption\n");
         return true;
     }
