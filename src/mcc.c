@@ -99,6 +99,21 @@ struct tz_regs t8142_tz_regs = {
 #define T8142_CACHE_STATUS_DATA_COUNT GENMASK(30, 24)
 #define T8142_CACHE_STATUS_TAG_COUNT  GENMASK(14, 8)
 
+/*
+ * The one mcc,t6041 layout the firmware-cache path admits (J616s, J614s, J773s): the ADT must
+ * describe exactly this, and every plane's cache status must read as expected.
+ */
+#define T6041_MCC_REG_IDX         12
+#define T6041_MCC_COUNT           4
+#define T6041_MCC_CHANNELS        4
+#define T6041_MCC_PLANES          4
+#define T6041_MCC_PLANE_STRIDE    0x40000
+#define T6041_MCC_APERTURE_BASE   0x220000000ULL
+#define T6041_MCC_APERTURE_STRIDE 0x2000000ULL
+#define T6041_MCC_APERTURE_SIZE   0x200000
+#define T6041_CACHE_STATUS_MASK   0x1f001f00
+#define T6041_CACHE_STATUS_EXPECT 0x0c000c00
+
 #define T8103_CACHE_STATUS_DATA_COUNT GENMASK(14, 10)
 #define T8103_CACHE_STATUS_TAG_COUNT  GENMASK(9, 5)
 
@@ -717,10 +732,13 @@ static int mcc_init_firmware_cache(int node, int *path)
     if (!planes || planes > INT32_MAX || !stride || (stride & 3))
         return -1;
 
-    /* Restrict this path to the observed J616s and J614s layouts. */
-    if (t6041 && (chip_id != T6040 ||
-                  !(board_id == 6 || (board_id == 4 && adt_is_compatible(adt, 0, "J614sAP"))) ||
-                  reg_idx != 12 || count != 4 || channels != 4 || planes != 4 || stride != 0x40000))
+    /*
+     * Admit mcc,t6041 by what the ADT describes, not by board or chip: this geometry here, the
+     * apertures and the live cache status below.
+     */
+    if (t6041 && (reg_idx != T6041_MCC_REG_IDX || count != T6041_MCC_COUNT ||
+                  channels != T6041_MCC_CHANNELS || planes != T6041_MCC_PLANES ||
+                  stride != T6041_MCC_PLANE_STRIDE))
         return -1;
 
     mcc_count = count;
@@ -729,7 +747,8 @@ static int mcc_init_firmware_cache(int node, int *path)
         if (reg_idx > (u32)(INT32_MAX - i) ||
             adt_get_reg(adt, path, "reg", reg_idx + i, &base, &size) || !base ||
             (planes - 1) > (UINT64_MAX - 4) / stride || (planes - 1) * stride + 4 > size ||
-            (t6041 && (base != 0x220000000 + (u64)i * 0x2000000 || size != 0x200000)))
+            (t6041 && (base != T6041_MCC_APERTURE_BASE + i * T6041_MCC_APERTURE_STRIDE ||
+                       size != T6041_MCC_APERTURE_SIZE)))
             return -1;
         mcc_regs[i].plane_base = base;
         mcc_regs[i].plane_stride = stride;
@@ -742,8 +761,8 @@ static int mcc_init_firmware_cache(int node, int *path)
     if (t6041) {
         for (int i = 0; i < mcc_count; i++) {
             for (int plane = 0; plane < mcc_regs[i].plane_count; plane++) {
-                u32 status = plane_read32(i, plane, 0x2804);
-                if ((status & 0x1f001f00) != 0x0c000c00) {
+                u32 status = plane_read32(i, plane, T8142_PLANE_CACHE_STATUS);
+                if ((status & T6041_CACHE_STATUS_MASK) != T6041_CACHE_STATUS_EXPECT) {
                     printf("MCC: Unexpected cache status on MCC %d plane %d: 0x%x\n", i, plane,
                            status);
                     return -1;
