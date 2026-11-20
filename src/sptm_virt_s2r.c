@@ -792,6 +792,36 @@ static void s2r_j613_snapshot_word(const char *tag, u64 addr)
     s2r_j613_snapshot_record(tag, addr, s2r_snapshot_read(addr, false));
 }
 
+/*
+ * Crumb bit 28: at the withheld commit, every 32-bit word of the Linux sleep node's register
+ * ranges (the T8122 DT's sleep-controller reg list), so the two sides diff word for word
+ * instead of over a chosen list. Reads are guarded: a word that aborts records ~0.
+ */
+static void s2r_j613_wide(const char *tag)
+{
+    static const struct {
+        u64 base, size;
+    } wide[] = {
+        {0x2d0700000, 0x14000}, /* ps */
+        {0x2d0724000, 0x4000},  /* pwrgate */
+        {0x2d0734000, 0x10},    /* cpu-start */
+        {0x2d0768000, 0x40},    /* cllt */
+        {0x2d0780000, 0x8},     /* cluster */
+        {0x2e42d4000, 0x100},   /* commit page */
+        {0x2e42b0000, 0x30},    /* wdt */
+        {0x2e4714000, 0x100},   /* spmi */
+        {0x2e4908000, 0x100},   /* spmi-hpm */
+        {0x2e4280000, 0x4000},  /* ps-aon */
+        {0x2e4004000, 0x48},    /* wake */
+    };
+    s2r_retained_marker("WIDEBEG", ARRAY_SIZE(wide));
+    for (unsigned i = 0; i < ARRAY_SIZE(wide); i++)
+        for (u64 a = wide[i].base; a < wide[i].base + wide[i].size; a += 4)
+            s2r_j613_snapshot_word(tag, a);
+    s2r_retained_marker("WIDEEND", sptm_virt_s2r_head);
+    s2r_clean(&sptm_virt_s2r_head, sizeof(sptm_virt_s2r_head));
+}
+
 /* Aura owns this buffer. Vary the pattern on each commit and publish it to DRAM. */
 static u32 s2r_j613_dram[256] __attribute__((aligned(64)));
 
@@ -1141,6 +1171,8 @@ static void s2r_j613_stop_export(void)
         printf("J613-STOP snapshot at the withheld commit\n");
         iodev_console_flush();
         s2r_j613_snapshot("J613STOP", false, false);
+        if (chip_id == T8122 && (sptm_virt_s2r_crumbs & BIT(28)))
+            s2r_j613_wide("J613WIDE");
     }
     u64 head = sptm_virt_s2r_head;
     u64 from = head > sptm_virt_s2r_nrec ? head - sptm_virt_s2r_nrec : 0;
