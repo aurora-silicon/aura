@@ -12,6 +12,7 @@
 
 #include "sptm_virt.h"
 #include "adt.h"
+#include "dapf.h"
 #include "exception.h"
 #include "hv.h"
 #include "iodev.h"
@@ -244,11 +245,13 @@ static void gpu_hook_adt(const char *path, int idx, const char *what, u64 off, u
 
 /*
  * The ANE trace: every register window the ADT gives the Neural Engine (/arm-io/ane) and its DART
- * (/arm-io/dart-ane), and the interrupt controller's (/arm-io/aic reg[0]). A window inside another
- * is traced through the larger one. A missing node or empty window refuses the trace before any
- * hook; nothing the ADT does not name is hooked.
+ * (/arm-io/dart-ane), the interrupt controller's (/arm-io/aic reg[0]), and each slice of the
+ * DART's dapf-instance-N properties, at the filter's four-byte granularity. A window inside
+ * another is traced through the larger one. A missing node, an empty window or a malformed DAPF
+ * property refuses the trace before any hook; nothing the ADT does not name is hooked.
  */
-#define ANE_TRACE_MAX_REGS 16
+#define ANE_TRACE_MAX_REGS  16
+#define ANE_TRACE_DAPF_INST 8
 
 static void ane_trace_setup(void)
 {
@@ -263,7 +266,7 @@ static void ane_trace_setup(void)
     static struct {
         u64 base, size;
         const char *what;
-    } w[2 * ANE_TRACE_MAX_REGS + 1];
+    } w[2 * ANE_TRACE_MAX_REGS + 1 + 2 * DAPF_T8110_MAX_SLICES];
     int n = 0;
 
     sptm_virt_gpu_print_max = 0; /* export the ring; no per-access console timing noise */
@@ -286,6 +289,36 @@ static void ane_trace_setup(void)
         if (!idx)
             panic("ANE trace: %s has no reg\n", nodes[i].path);
     }
+    /* The words the ANE DART's filter admits: every slice of every dapf-instance-N it has. */
+    int dart = adt_path_offset(adt, "/arm-io/dart-ane");
+    int nslices = 0;
+    for (u32 inst = 0; dart >= 0 && inst < ANE_TRACE_DAPF_INST; inst++) {
+        struct dapf_window s[DAPF_T8110_MAX_SLICES];
+        char prop[32];
+        u32 len;
+
+        snprintf(prop, sizeof(prop), "dapf-instance-%u", inst);
+        if (!adt_getprop(adt, dart, prop, &len))
+            continue;
+        int count = dapf_t8110_ranges("/arm-io/dart-ane", inst, s, ARRAY_SIZE(s));
+        if (count <= 0)
+            panic("ANE trace: /arm-io/dart-ane %s is malformed\n", prop);
+        if (nslices + count > 2 * DAPF_T8110_MAX_SLICES)
+            panic("ANE trace: /arm-io/dart-ane has more than %d DAPF slices\n",
+                  2 * DAPF_T8110_MAX_SLICES);
+        for (int k = 0; k < count; k++) {
+            /* Inclusive ends; the filter compares whole words. */
+            if (!s[k].start || (s[k].start & 3) || ((s[k].end + 1) & 3) ||
+                s[k].end + 1 <= s[k].start)
+                panic("ANE trace: /arm-io/dart-ane %s slice %d is malformed\n", prop, k);
+            w[n].base = s[k].start;
+            w[n].size = s[k].end + 1 - s[k].start;
+            w[n++].what = "ane-dapf";
+        }
+        nslices += count;
+    }
+    if (!nslices)
+        printf("ANE trace: /arm-io/dart-ane has no DAPF slices\n");
     static bool inside[ARRAY_SIZE(w)];
     int keep = 0;
     for (int i = 0; i < n; i++) {
