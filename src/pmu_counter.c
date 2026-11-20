@@ -145,6 +145,15 @@ void pmu_take_failed_boots_var(const char *val)
 /* Only a count handed on by an earlier stage: this stage's own read follows its clear. */
 bool pmu_failed_boots_passed(u8 *count)
 {
+    /*
+     * LAB ONLY (J713 default, never ship): this Air's enrolled Stage 1 (3d517e63) hands no count
+     * on and doesn't clear iBoot's count on T8132, so this stage's own read before its clear is
+     * the real count.
+     */
+    if (!passed_valid && own_valid && chip_id == T8132) {
+        *count = own_failed;
+        return true;
+    }
     if (!passed_valid)
         return false;
     *count = passed_failed > own_failed ? passed_failed : own_failed;
