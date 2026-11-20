@@ -8022,8 +8022,13 @@ static int dt_set_m4_dcp_handoff(void)
  */
 static int dt_set_dcp_fw27_clocks(const char *alias, const char *adt_engine)
 {
-    const char *path = fdt_get_alias(dt, alias);
-    int node = path ? fdt_path_offset(dt, path) : -1;
+    /* Copied: the alias string lives in the blob, which the node additions below move. */
+    char path[64];
+    const char *alias_path = fdt_get_alias(dt, alias);
+    if (!alias_path || strlen(alias_path) >= sizeof(path))
+        return 0;
+    strcpy(path, alias_path);
+    int node = fdt_path_offset(dt, path);
     if (node < 0 || os_firmware.version < V27_0 || fdt_getprop(dt, node, "apple,clock-ids", NULL))
         return 0;
 
@@ -8238,10 +8243,11 @@ static int dt_set_display(void)
     if (ret)
         return ret;
 
-    ret = dt_set_dcp_fw27_clocks("dcp", "/arm-io/disp0");
-    ret = ret ?: dt_set_dcp_fw27_clocks("dcpext", "/arm-io/dispext0");
-    if (ret)
-        return ret;
+    /* Without them the firmware-27 DCP does not start, but the rest of the boot does. */
+    if (dt_set_dcp_fw27_clocks("dcp", "/arm-io/disp0"))
+        printf("FDT: dcp: publishing the firmware clocks failed\n");
+    if (dt_set_dcp_fw27_clocks("dcpext", "/arm-io/dispext0"))
+        printf("FDT: dcpext: publishing the firmware clocks failed\n");
 
     /*
      * Ignore errors for dcpext firmware reservation, nodes should be disabled
