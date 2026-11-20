@@ -338,3 +338,38 @@ def test_launcher_order():
     assert "if ret != 0" in body
     run = (REPO / "proxyclient/tools/run_guest.py").read_text()
     assert "--windows-scanout" in run
+
+
+def test_contract_matches_mu_header():
+    # The Mu side (docs/windows-t8152.md "G6-S"): checked once a Mu tree carries it.
+    tree = os.environ.get("AURA_MU_TREE")
+    if not tree:
+        pytest.skip("AURA_MU_TREE not set")
+    header = Path(tree) / "Platform/MacBookPro2026Pkg/Include/J804Windows.h"
+    if not header.exists() or "J804_SCANOUT_BASE" not in header.read_text():
+        pytest.skip("Mu tree without the G6-S header")
+    text = header.read_text()
+    values = dict(re.findall(r"#define (J804_\w+)\s+(0x[0-9A-Fa-f]+|\d+)\b", text))
+    assert int(values["J804_SCANOUT_BASE"], 0) == w.SCANOUT_BASE
+    assert int(values["J804_SCANOUT_SIZE"], 0) == w.SCANOUT_SIZE
+    assert int(values["J804_GSIV_SCANOUT"], 0) == w.SCANOUT_GSIV
+    assert int(values["J804_SCANOUT_FD_MARKER_OFFSET"], 0) == w.SCANOUT_FD_MARKER_OFFSET
+    assert int(values["J804_SCANOUT_ADT_PROPERTY_SIZE"], 0) == w.SCANOUT_HANDSHAKE_SIZE
+    assert int(values["J804_SCANOUT_VERSION"], 0) == w.SCANOUT_VERSION
+    required = int(values["J804_SCANOUT_FEATURES_REQUIRED"], 0)
+    known = int(values["J804_SCANOUT_FEATURES_KNOWN"], 0)
+    assert w.SCANOUT_FEATURES & required == required and w.SCANOUT_FEATURES & ~known == 0
+    assert f'"{w.SCANOUT_HANDSHAKE_PROPERTY}"' in text
+
+
+def test_marker_in_a_built_fd():
+    # A scanout FD built from that tree (AURA_SCANOUT_FD), and the plain G5b FD if given.
+    fd = os.environ.get("AURA_SCANOUT_FD")
+    if not fd:
+        pytest.skip("AURA_SCANOUT_FD not set")
+    data = Path(fd).read_bytes()
+    assert w.fd_scanout_marker(data) == (w.SCANOUT_BASE, w.SCANOUT_GSIV)
+    assert w.fd_input_marker(data) == (w.INPUT_BASE, w.INPUT_GSIV)
+    plain = os.environ.get("AURA_PLAIN_FD")
+    if plain:
+        assert w.fd_scanout_marker(Path(plain).read_bytes()) is None
