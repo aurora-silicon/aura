@@ -8,4 +8,5 @@
 #define T6040 0x6040
 #define T6041 0x6041
 #define T6050 0x6050
+#define T8132 0x8132
 #endif
