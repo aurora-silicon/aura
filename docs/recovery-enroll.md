@@ -69,8 +69,9 @@ The checks, in order, all before anything changes:
    paired with the volume.
 4. For a Mach-O object, `kmutil inspect` reports `kcbz` 0, so iBoot won't start
    SPTM.
-5. For a raw image, Kernel CTRR is not enabled. Enrolling a Mach-O object turns it
-   back on, and a raw Stage 1 then gets no secondary CPUs
+5. Kernel CTRR is not enabled, for either object type. With it on, a raw Stage 1
+   gets no secondary CPUs, and under the SPTM-virt hypervisor a secondary faults on
+   its first store into aura's image
    ([macho-boot-object.md](macho-boot-object.md#use)). If it is enabled, the script
    stops and prints the `bputil -nc -v <group>` to run first.
 

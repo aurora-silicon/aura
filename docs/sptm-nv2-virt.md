@@ -43,6 +43,39 @@ The sleep record follows it: from 512 records before the first core's self-disab
 On T8132 the commit is followed 3 ms later by four SPMI commands to the PMU (`nub-spmi0`, slave 0xe):
 read 0x2000, a 4-byte write at 0x2008, `0x200e <- 0`, and `0x2000 <- 0x41`, T8132's "go hib".
 
+### T6041 (J616c, MacBook Pro M4 Max)
+
+27.2.1 (26B131) boots to its single-user shell on all sixteen cores, with SPTM, TXM and XNU only (no
+`AURA_KEEP_EXCLAVES`); the kernel is `kernelcache.release.mac16j`. Its kernelcache entry patches only
+the NVRAM writes. What differs from the J700:
+
+- The ADT has no `soc_misc` block, so there is no sleep path. The debug link's domains are kept on
+  regardless: otherwise XNU lowers them a few seconds into IOKit and the link drops.
+- The NOR's NVRAM partition (`/arm-io/qspi/spinor/anvram`) has to stay visible, as it does by
+  default. 27.2.1's AppleImage4 does not finish starting until the IONVRAM resource is published,
+  which only a registered NVRAM controller does. Without it the Image4 kext never completes, and
+  libignition, right after printing its arguments, waits forever in the
+  `security.mac.img4.ignition_blob` sysctl. The guest does write NVRAM: about 27 s in, while APFS
+  mounts the volumes, AppleARMNORNVRAM sends the NOR a write enable, which `nvram_ro` turns into a
+  success that writes nothing.
+  This quirk patches that write routine only; it does not patch `eraseBank`, which the tested
+  configuration did not reach. It does not establish read-only NOR behavior for other paths.
+- The secondaries' window holds here too: each cluster's `ACC_CTXR_D` is locked over the boot
+  object, and a secondary started at code outside it powers up but never reports in, so aura stays at
+  stage 1's base.
+- TXM fails selector 45 with errno 78 on every boot (`AppleImage4: failed to set boot uuid in
+  supervisor: 78`): this TXM has no handler for that request type. AppleImage4 logs it and carries
+  on; it is not why a boot stops.
+
+### T8142 (J815, MacBook Air 15" M5) with macOS 27.2.1
+
+27.2.1 (26B131) boots to the login window on a J815 with exclaves (`AURA_KEEP_EXCLAVES`), the kernel
+`kernelcache.release.mac17g`. Its `XNU_QUIRKS` entry carries every J813 26A428 workaround, ported:
+each site's 48-instruction window, PC-relative immediates masked, matches exactly once in this
+kernelcache; the two twin PAC-key guards match twice and are paired in order. The fingerprint is
+the RO-zone branch, which T6041's kernelcache of the same release does not have. The workarounds
+were not taken out one by one as on the J616c; all of them were applied on every boot.
+
 The code:
 
 | File | What |
@@ -105,6 +138,9 @@ the host's plan and the sleep path's discovery on real image sets (`SPTM_VIRT_IM
   managed window, below the fixed high-firmware regions (SAPT, the GPU handoff). SPTM's
   `region-id-24` is shortened to end below it and the carve-out is declared as a reserved region
   of its own (`sptm_virt_compute_layout`, unit-tested).
+  The host reserves 112 MiB for aura's own heap on J813 (`Mac17,3`, T8142) because the
+  padded EL2 boot object leaves a tighter carve-out. The default stays 128 MiB elsewhere.
+  `AURA_AURA_HEAP_MIB` can override either default.
 - SPTM's window starts above everything aura and iBoot left low (`sptm_virt_low_floor`). This is
   the native layout: physBase is the window's base, the images follow a 32 MiB phys slide that
   XNU frees to its VM, and iBoot's data regions (RTBuddySeg, SEPFW, SEPPatches, uStuff, preoslog)
