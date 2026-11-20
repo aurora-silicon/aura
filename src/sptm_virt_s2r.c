@@ -117,7 +117,8 @@ static u64 s2r_nvme_quiet_page, s2r_nvme_quiet_n;
  * to hook; empty hooks every coprocessor. A name also matches that node's "dart-" form. */
 char sptm_virt_s2r_cp_only[256];
 /* From the host (AURA_S2R_CP_NODES): a comma list of /arm-io nodes whose every reg window (up to
- * 1 MiB) is hooked, such as the ATC PHYs and ACIOs; "name:N" hooks only reg N, whatever its size. */
+ * 1 MiB) is hooked, such as the ATC PHYs and ACIOs; "name:N" hooks only reg N, whatever its size.
+ */
 char sptm_virt_s2r_cp_nodes[512];
 /* From the host (AURA_S2R_CP_RANGE): up to 4 { base, size } of extra pages to hook, such as the
  * AOP's SRAM. */
@@ -1254,7 +1255,8 @@ static void s2r_cp_nodes(void)
                 break;
             if (only >= 0 ? r != only : sz > 0x100000) {
                 if (only < 0)
-                    printf("SPTM-virt[s2r]: cp-nodes: %s reg%d 0x%lx + 0x%lx too big\n", name, r, pa, sz);
+                    printf("SPTM-virt[s2r]: cp-nodes: %s reg%d 0x%lx + 0x%lx too big\n", name, r,
+                           pa, sz);
                 continue;
             }
             snprintf(what, sizeof(what), "r%d", r);
