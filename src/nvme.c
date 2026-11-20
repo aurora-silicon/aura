@@ -173,6 +173,14 @@ bool nvme_quiesce_for_next = false;
 static u8 nvme_die;
 /* When this stage started the ANS firmware, for the shutdown timing line. */
 static u64 nvme_boot_ticks;
+/*
+ * Post-M4: this stage started the session from off (an earlier stage powered ANS off and passed
+ * its SART entries, or this stage cycled a session it found), rather than taking iBoot's session
+ * or adopting a live one. Such a session goes on powered off, as it came (nvme_shutdown()).
+ */
+static bool nvme_session_from_off;
+/* nvme_shutdown() handed the session on running: the next stage must not be told ANS is off. */
+static bool nvme_handed_on_live;
 
 static asc_dev_t *nvme_asc = NULL;
 static rtkit_dev_t *nvme_rtkit = NULL;
@@ -462,17 +470,20 @@ static bool nvme_own_rtkit(void)
 
 /*
  * T6040/T6041 (M4 Pro/Max): a cold start of ANS after the generic power-off gets no RTKit HELLO
- * (ASC CPU running, pmgr domains on), and an RTKit quiesce times out. T8132 (M4): the same cold
- * start intermittently leaves the next stage without NVMe after a warm reboot. Keep ANS live
- * between stages and adopt it in the next stage, as T6050 does.
+ * (ASC CPU running, pmgr domains on), and an RTKit quiesce times out. Keep ANS live between
+ * stages and adopt it in the next stage, as T6050 does.
  *
- * Not every post-M4 ANS (nvme_post_m4()) is listed. T8152 stays quiesced: its Linux driver wakes
- * ANS with a fresh RTKit handshake and neither adopts a live session nor restarts a stopped one.
- * T8140 keeps the power-off path, which works there; live adoption by the next stage is untested.
+ * Not every post-M4 ANS (nvme_post_m4()) is listed. T8132 (M4) powers ANS off and passes its SART
+ * entries: a next aura stage's PCIe init faults on a live ANS (synchronous external abort in
+ * pcie_init(), J713 console on aura#406), whether it adopts the session or starts it again. The
+ * power-off path is what every 1.0.0b13 stage does on T8132. T8152 stays quiesced: its Linux
+ * driver wakes ANS with a fresh RTKit handshake and neither adopts a live session nor restarts a
+ * stopped one. T8140 keeps the power-off path, which works there; live adoption by the next stage
+ * is untested.
  */
 static bool nvme_post_m4_keeps_live(void)
 {
-    return chip_id == T6040 || chip_id == T6041 || chip_id == T8132;
+    return chip_id == T6040 || chip_id == T6041;
 }
 
 static bool nvme_post_m4_hands_on_live(void)
@@ -576,6 +587,8 @@ bool nvme_init(void)
     nvme_prp_list = NULL;
     nvme_verify_bounce = NULL;
     nvme_boot_ticks = 0;
+    nvme_session_from_off = false;
+    nvme_handed_on_live = false;
 
     bool from_off = false, earlier = false, adopted = false, restarted = false;
     int adt_path[8];
@@ -827,6 +840,7 @@ setup_controller:
         write64_lo_hi(nvme_qreg(NVME_IOQ_CMDS), (u64)ioq.cmds);
     }
 
+    nvme_session_from_off = from_off;
     nvme_initialized = true;
     printf("nvme: initialized at 0x%lx\n", nvme_base);
     return true;
@@ -998,11 +1012,20 @@ bool nvme_shutdown(void)
      * next nvme_init() and reads correctly (J614c, 3/3 cycles). T8132 is handed on the same way
      * (J713). Hand it on with the controller enabled and RTKit untouched; only the I/O queue
      * registers are cleared. A next stage that asks for a quiesced ANS still gets one.
+     *
+     * Only a session that came to this stage running, iBoot's or one an earlier stage handed on
+     * live, goes on live. One this stage started from off goes on as it came, powered off with
+     * its SART entries passed on: the earlier stage chose that, and the firmware has just shown
+     * it starts from off. On a J713, a 1.0.0b13 Stage 1 (ANS off, nvme.sart=) followed by a
+     * Stage 1 that handed its from-off session on live reset the Mac at the handoff, whichever
+     * Stage 2 came next.
      */
-    if (nvme_type == NVME_T8132 && nvme_post_m4_keeps_live() && !nvme_quiesce_for_next) {
+    if (nvme_type == NVME_T8132 && nvme_post_m4_keeps_live() && !nvme_quiesce_for_next &&
+        !nvme_session_from_off) {
         write64_lo_hi(nvme_qreg(NVME_IOQ_CMDS), 0);
         write64_lo_hi(nvme_qreg(NVME_IOQ_CQES), 0);
         nvme_initialized = false;
+        nvme_handed_on_live = true;
         printf("nvme: handing the live ANS session on: CC=0x%x CSTS=0x%x BOOT_STATUS=0x%x\n",
                read32(nvme_base + NVME_CC), read32(nvme_base + NVME_CSTS),
                read32(nvme_base + NVME_BOOT_STATUS));
@@ -1088,6 +1111,12 @@ out_preserve:
 int nvme_sart_entries(struct sart_entry *entries, int max, bool *off)
 {
     *off = false;
+    /*
+     * A session handed on running is the next stage's to adopt; entries kept from an earlier
+     * power-off no longer describe it (J713: nvme.sart= beside a live ANS faulted the next stage).
+     */
+    if (nvme_handed_on_live)
+        return 0;
     if (nvme_initialized) {
         if (nvme_type != NVME_T8132)
             return 0;
