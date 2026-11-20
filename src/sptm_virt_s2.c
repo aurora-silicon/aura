@@ -20,6 +20,7 @@
 #include "nv2.h"
 #include "smp.h"
 #include "sptm_virt_priv.h"
+#include "nvme.h"
 #include "string.h"
 #include "uartproxy.h"
 #include "utils.h"
@@ -527,6 +528,58 @@ static bool sptm_virt_aura_guard_fault(u64 *regs, bool gl)
         sysop("wfe");
 }
 
+/*
+ * APCIe root ports with no pci-bridge node (an empty slot: port 1 of a T8132 Mac mini). iBoot leaves
+ * such a port's windows readable and XNU reads them. Once an earlier stage has powered the controller
+ * off and aura has brought it back for ANS (nvme_cold_powered_on), the port, which has no lanes and
+ * never reaches RUN, isn't, and XNU's first read of its fourth window (0x497050000) is an LLC SLVERR
+ * panic. Stand in for the absent port instead: reads return 0, as for a port with no link, writes are
+ * dropped, and the first accesses are logged.
+ */
+static bool sptm_virt_apcie_ghost_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int width)
+{
+    static u32 logged;
+
+    UNUSED(width);
+    if (logged++ < 64)
+        printf("SPTM-virt[apcie c%d]: absent port %s 0x%lx%s0x%lx pc 0x%lx\n", smp_id(),
+               write ? "wr" : "rd", addr, write ? " <- " : "", write ? *val : 0, ctx->elr);
+    if (!write)
+        *val = 0;
+    return true;
+}
+
+static void sptm_virt_apcie_ghost_setup(void)
+{
+    const int shared = 7, per_port = 8; /* apcie,t8132: 7 shared windows, then 8 per root port */
+    int path[8];
+    u32 nports = 0;
+
+    if (!nvme_cold_powered_on)
+        return;
+    int node = adt_path_offset_trace(adt, "/arm-io/apcie", path);
+    if (node < 0 || !adt_is_compatible(adt, node, "apcie,t8132") ||
+        ADT_GETPROP(adt, node, "#ports", &nports) < 0)
+        return;
+    for (u32 port = 0; port < nports && port < 8; port++) {
+        char bridge[48];
+        snprintf(bridge, sizeof(bridge), "/arm-io/apcie/pci-bridge%u", port);
+        if (adt_path_offset(adt, bridge) >= 0)
+            continue;
+        for (int k = 0; k < per_port; k++) {
+            u64 pa, sz;
+            if (adt_get_reg(adt, path, "reg", shared + port * per_port + k, &pa, &sz) < 0)
+                continue;
+            u64 lo = pa & ~0x3fffUL, hi = ALIGN_UP(pa + sz, 0x4000);
+            if (hv_map_hook(lo, sptm_virt_apcie_ghost_hook, hi - lo) < 0)
+                printf("SPTM-virt[apcie]: cannot hook port %u window %d\n", port, k);
+        }
+        printf("SPTM-virt[apcie]: port %u has no pci-bridge node: its windows read as an absent "
+               "port (the controller was powered back on for ANS)\n",
+               port);
+    }
+}
+
 void sptm_virt_s2_setup(void)
 {
     hv_pt_init(); /* programs this CPU's VTCR/VTTBR */
@@ -548,6 +601,7 @@ void sptm_virt_s2_setup(void)
     sptm_virt_amcc_watch();
     sptm_virt_s2_split_ctrr_blocks();
     sptm_virt_reset_guard_setup();
+    sptm_virt_apcie_ghost_setup();
     /* After the guard, whose pages the sleep path leaves alone. */
     /*
      * Keep the proxy link's power domains whichever transport carries it. Only the DWC3 CDC

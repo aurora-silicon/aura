@@ -1392,6 +1392,9 @@ int nvme_cold_state(void)
  * them back: nvme_cold_handoff() then takes it as a stopped ANS, and clears the stage's own
  * entries before XNU registers the rest as the bootloader's.
  */
+/* Set when the cold handoff powered ANS, and with it the APCIe controller, back on (SPTM_VIRT). */
+bool nvme_cold_powered_on;
+
 static int nvme_cold_power_on(int die)
 {
     if (!nvme_cold_ans_off(die))
@@ -1408,6 +1411,7 @@ static int nvme_cold_power_on(int die)
     bool ok = sart && sart_set_entries(sart, nvme_sart_saved, nvme_sart_saved_cnt);
     if (sart)
         sart_release(sart);
+    nvme_cold_powered_on = true;
     printf("nvme: cold handoff: ANS was off: powered on, %d SART entries %s\n", nvme_sart_saved_cnt,
            ok ? "put back" : "NOT put back");
     return ok ? 0 : -1;

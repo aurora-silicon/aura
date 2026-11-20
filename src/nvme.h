@@ -15,6 +15,8 @@ bool nvme_shutdown(void);
 int nvme_cold_handoff(bool idle, bool no_probe);
 /* bit 0: ANS is on; bit 1: an earlier stage passed its SART entries on (SPTM_VIRT) */
 int nvme_cold_state(void);
+/* The cold handoff powered ANS and the APCIe controller back on (an earlier stage had them off). */
+extern bool nvme_cold_powered_on;
 /* Post-M4: how a stage that powered ANS off tells the next one to start it again. */
 bool nvme_post_m4(void);
 bool nvme_post_m4_passed_off(void);
