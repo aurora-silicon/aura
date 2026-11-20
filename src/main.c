@@ -459,8 +459,12 @@ void aura_main(void)
 #if defined(CHAINLOADING) && !defined(ESP_STAGE2)
     stage1_read_boot_record();
 #endif
-    /* T6040, T8140, T6050: nothing else in an aura chain clears iBoot's failed-boot count. */
-    if (chip_id == T6040 || chip_id == T8140 || chip_id == T6050)
+    /*
+     * T6040, T8132, T8140, T6050: nothing else in an aura chain clears iBoot's failed-boot count.
+     * On a T8132 Mac mini a chain of proxy sessions (Stage 1 to the hypervisor or a host-loaded
+     * stage, each ended by a USB-C reset) counted up until iBoot booted recoveryOS (11-19).
+     */
+    if (chip_id == T6040 || chip_id == T8132 || chip_id == T8140 || chip_id == T6050)
         pmu_clear_panic_counter();
 
     printf("Initialization complete.\n");
