@@ -525,10 +525,20 @@ static void nvme_ans_reset(void)
 /* The SART entries back, then the firmware's start after a power loss. */
 static bool nvme_ans_start_warm(void)
 {
-    return sart_set_entries(nvme_sart, nvme_sart_saved, nvme_sart_saved_cnt) &&
-           rtkit_boot_warm(nvme_rtkit, BIT(0)) &&
-           poll32(nvme_base + NVME_BOOT_STATUS, 0xffffffff, NVME_BOOT_STATUS_OK, USEC_PER_SEC) >=
-               0;
+    if (!sart_set_entries(nvme_sart, nvme_sart_saved, nvme_sart_saved_cnt)) {
+        printf("nvme: warm start: couldn't put the %d SART entries back\n", nvme_sart_saved_cnt);
+        return false;
+    }
+    if (!rtkit_boot_warm(nvme_rtkit, BIT(0))) {
+        printf("nvme: warm start: no RTKit session (status 0x%x)\n", asc_cpu_status(nvme_asc));
+        return false;
+    }
+    if (poll32(nvme_base + NVME_BOOT_STATUS, 0xffffffff, NVME_BOOT_STATUS_OK, USEC_PER_SEC) < 0) {
+        printf("nvme: warm start: RTKit up, boot status 0x%x after 1 s\n",
+               read32(nvme_base + NVME_BOOT_STATUS));
+        return false;
+    }
+    return true;
 }
 
 /*

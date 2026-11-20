@@ -82,6 +82,8 @@
 
 /* Bound on an IOP power state change, for a firmware that has stopped answering. */
 #define RTKIT_IOP_POWER_TIMEOUT 5000000
+/* Messages a warm start drops before the run bit, and again before the HELLO. */
+#define RTKIT_WARM_STALE_MAX 64
 
 enum rtkit_power_state {
     RTKIT_POWER_OFF = 0x00,
@@ -672,6 +674,39 @@ static bool rtkit_wait_for_power(rtkit_dev_t *rtk, enum rtkit_power_state *state
 }
 
 /*
+ * The firmware's HELLO, the first thing it says after the run bit. A warm start waits out the
+ * rest of the HELLO second over other messages (ones a previous run left, or that arrived while
+ * the CPU was starting); a cold start, which may find a running coprocessor to adopt, takes the
+ * first message as the answer.
+ */
+static bool rtkit_wait_hello(rtkit_dev_t *rtk, struct asc_message *msg, bool warm)
+{
+    u64 hello_timeout = timeout_calculate(USEC_PER_SEC);
+
+    for (int dropped = 0;; dropped++) {
+        if (!asc_recv_timeout(rtk->asc, msg, USEC_PER_SEC)) {
+            rtkit_printf("did not receive HELLO%s\n", dropped ? " after other messages" : "");
+            rtk->no_hello = true;
+            return false;
+        }
+
+        u32 msgtype = FIELD_GET(MGMT_TYPE, msg->msg0);
+        if (msg->msg1 == RTKIT_EP_MGMT && msgtype == MGMT_MSG_HELLO)
+            return true;
+
+        if (!warm || dropped + 1 >= RTKIT_WARM_STALE_MAX || timeout_expired(hello_timeout)) {
+            if (msg->msg1 != RTKIT_EP_MGMT)
+                rtkit_printf("expected HELLO but got message for EP 0x%x", msg->msg1);
+            else
+                rtkit_printf("expected HELLO but got message with type 0x%02x", msgtype);
+            return false;
+        }
+        rtkit_printf("warm start: dropping a message for EP 0x%x before HELLO: %lx\n", msg->msg1,
+                     msg->msg0);
+    }
+}
+
+/*
  * Warm: after a power cycle under kept firmware state. The firmware says HELLO by itself, the
  * endpoint map is answered as macOS does after a wake (bit 1 added to every part but the last,
  * the last masked by warm_last_mask) and no endpoint is started again.
@@ -683,8 +718,18 @@ static bool rtkit_boot_internal(rtkit_dev_t *rtk, u32 timeout_usec, bool warm, u
     rtk->no_hello = false;
 
     /* After a power loss macOS turns the receive side on before the run bit (T6050 cp9d). */
-    if (warm)
+    if (warm) {
         asc_i2a_enable(rtk->asc, true);
+        /*
+         * A reset of the coprocessor's block need not empty its outbound mailbox: what an
+         * earlier run of the firmware sent and nobody read would be taken for the reply to
+         * this run bit. Drop it first.
+         */
+        for (int i = 0; i < RTKIT_WARM_STALE_MAX && asc_recv(rtk->asc, &msg); i++)
+            rtkit_printf("warm start: dropping a stale message for EP 0x%x before the run bit: "
+                         "%lx\n",
+                         msg.msg1, msg.msg0);
+    }
     /* boot the IOP if it isn't already */
     asc_cpu_start(rtk->asc);
     /* can be sent unconditionally to wake up a possibly sleeping IOP */
@@ -696,25 +741,10 @@ static bool rtkit_boot_internal(rtkit_dev_t *rtk, u32 timeout_usec, bool warm, u
         return false;
     }
 
-    if (!asc_recv_timeout(rtk->asc, &msg, USEC_PER_SEC)) {
-        rtkit_printf("did not receive HELLO\n");
-        rtk->no_hello = true;
+    if (!rtkit_wait_hello(rtk, &msg, warm))
         return false;
-    }
-
-    if (msg.msg1 != RTKIT_EP_MGMT) {
-        rtkit_printf("expected HELLO but got message for EP 0x%x", msg.msg1);
-        return false;
-    }
 
     u32 msgtype;
-    msgtype = FIELD_GET(MGMT_TYPE, msg.msg0);
-    if (msgtype != MGMT_MSG_HELLO) {
-        rtkit_printf("expected HELLO but got message with type 0x%02x", msgtype);
-
-        return false;
-    }
-
     u32 min_ver, max_ver, want_ver;
     min_ver = FIELD_GET(MGMT_MSG_HELLO_MINVER, msg.msg0);
     max_ver = FIELD_GET(MGMT_MSG_HELLO_MAXVER, msg.msg0);

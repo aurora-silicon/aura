@@ -74,6 +74,7 @@ static bool rtkit_boot_warm(rtkit_dev_t *r, u32 mask)
     return !(fails && fails--);
 }
 static int poll32(u64 a, u32 m, u32 v, unsigned t) { return 0; }
+static u32 read32(u64 a) { return NVME_BOOT_STATUS_OK; }
 static bool rtkit_has_owned_buffers(const rtkit_dev_t *r) { return owned; }
 static void rtkit_free(rtkit_dev_t *r) {}
 static rtkit_dev_t *rtkit_init(const char *n, asc_dev_t *a, void *d, void *i, sart_dev_t *s,
