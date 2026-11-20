@@ -55,6 +55,7 @@
 static struct s2r_dcp {
     u64 mbox, dart, dart_size;
     u64 dva, lo;
+    u32 levels; /* table depth from the DART's VA window; 0 when the ADT names none */
     u64 pa[S2R_DCP_PAGES];
     int resolved; /* 0 not yet, 1 found, -1 not found: tried again after 256 more messages */
     u32 miss;
@@ -101,30 +102,29 @@ static int s2r_dcp_visit(u64 iova, u64 pa, void *opaque)
 static void s2r_pkt_rec(int idx, int kind, int word, u64 pa, u64 v, bool a2i);
 
 /* The IOMFB shared memory is on whichever of the DART's streams (T6050: 23 carries it; 24 has no
- * tables) maps most of its pages, in three levels there and in two on older DARTs: walk every
- * stream both ways and keep the best. One ring record per attempt (kind 7): found pages, the
- * stream, the streams no walk accepted. */
+ * tables) maps most of its pages. The walk's depth is the DART node's VA window (vm-base + vm-size
+ * in the ADT): an L-level table covers DART_PTE_INDEX_BITS * L + 14 IOVA bits, so a window past
+ * S2R_DCP_VM_LOW walks three levels (the T6050 DCP stream's base is bit 40), one inside it two.
+ * Every DART node this code has met names both properties; one that does not leaves the stream
+ * unresolved rather than guessed. One ring record per attempt (kind 7): found pages, the stream,
+ * the streams no walk accepted. */
 static int s2r_dcp_resolve(struct s2r_dcp *d)
 {
     u64 ram = ALIGN_DOWN(cur_boot_args.phys_base, BIT(32)), best[S2R_DCP_PAGES] = {0};
     int best_found = 0, best_sid = -1, refused = 0;
 
     d->lo = d->dva & ~0x3fffUL;
-    for (u8 sid = 0; sid < S2R_DCP_SIDS; sid++) {
-        bool accepted = false;
-        for (u32 levels = 3; levels >= 2; levels--) {
-            struct s2r_dcp_walk w = {d, 0, levels};
-            memset(d->pa, 0, sizeof(d->pa));
-            int rc = dart_walk_locked_t8110(d->dart, d->dart_size, sid, ram, mem_size_actual,
-                                            levels, s2r_dcp_visit, &w);
-            accepted |= rc >= 0;
-            if (rc >= 0 && w.found > best_found) {
-                best_found = w.found;
-                best_sid = sid;
-                memcpy(best, d->pa, sizeof(best));
-            }
+    for (u8 sid = 0; sid < S2R_DCP_SIDS && d->levels; sid++) {
+        struct s2r_dcp_walk w = {d, 0, d->levels};
+        memset(d->pa, 0, sizeof(d->pa));
+        int rc = dart_walk_locked_t8110(d->dart, d->dart_size, sid, ram, mem_size_actual, d->levels,
+                                        s2r_dcp_visit, &w);
+        if (rc >= 0 && w.found > best_found) {
+            best_found = w.found;
+            best_sid = sid;
+            memcpy(best, d->pa, sizeof(best));
         }
-        refused += !accepted;
+        refused += rc < 0;
     }
     memcpy(d->pa, best, sizeof(best));
     s2r_pkt_rec(d - s2r_dcp, 7, best_sid < 0 ? 0 : best_sid, d->dva,
@@ -313,9 +313,16 @@ void s2r_dcp_add(const char *name, u64 mbox)
     if (s2r_n_dcp >= S2R_DCP_N)
         return;
     snprintf(path, sizeof(path), "/arm-io/dart-%s", name);
-    if (adt_path_offset_trace(adt, path, p) < 0 || adt_get_reg(adt, p, "reg", 0, &base, &size) < 0)
+    int node = adt_path_offset_trace(adt, path, p);
+    if (node < 0 || adt_get_reg(adt, p, "reg", 0, &base, &size) < 0)
         return;
-    s2r_dcp[s2r_n_dcp] = (struct s2r_dcp){.mbox = mbox, .dart = base, .dart_size = size};
+    u64 vm_base, vm_size;
+    u32 levels = 0;
+    if (ADT_GETPROP(adt, node, "vm-base", &vm_base) == sizeof(vm_base) &&
+        ADT_GETPROP(adt, node, "vm-size", &vm_size) == sizeof(vm_size))
+        levels = vm_base + vm_size > S2R_DCP_VM_LOW ? 3 : 2;
+    s2r_dcp[s2r_n_dcp] =
+        (struct s2r_dcp){.mbox = mbox, .dart = base, .dart_size = size, .levels = levels};
     s2r_big[s2r_n_dcp] = calloc(S2R_BIG_SLOTS, sizeof(struct s2r_big));
     printf("SPTM-virt[s2r]: dcp-pkt %d %s mbox 0x%lx dart 0x%lx\n", s2r_n_dcp, name, mbox, base);
     s2r_n_dcp++;

@@ -6,8 +6,9 @@
  * DART is built in memory at fixed addresses. Its stream 23 is shaped like the tables read from
  * the M5 guest (T6050) with the proxy: three levels, root[iova >> 36] to a mid table to a leaf
  * table, the IOMFB shared memory at the DVA 0x1000004c000 the AP sent in its init word (root
- * index 16), leaf entries with flag bits above bit 39. Streams 5 and 24 map it the same way,
- * stream 9 with the older two levels; stream 3 has no TTBR and stream 27 is a remap stream. The
+ * index 16), leaf entries with flag bits above bit 39. Streams 5 and 24 map it the same way;
+ * stream 9 carries a two-level table the three-level walk must not resolve; stream 3 has no
+ * TTBR and stream 27 is a remap stream. The
  * tables are identity maps of host memory, so this checks the logic, not the hardware's tables.
  *
  * One IOMFB call and its reply go through the mailbox registers; the copier must put the packet's
@@ -43,6 +44,17 @@ int adt_get_reg(void *a, int *p, const char *n, int i, u64 *b, u64 *s)
     *b = 0x48a340000UL;
     *s = 0x10000;
     return 0;
+}
+/* The fake dart-dcp node's VA window: the T6050 DCP stream's base is bit 40, so the window's top
+ * is past 2^36 and the resolve must walk three levels. */
+static u64 host_vm_base = 1ULL << 40, host_vm_size = 0x8000000;
+int adt_getprop_copy(const void *a, int nodeoffset, const char *name, void *out, size_t len)
+{
+    (void)a, (void)nodeoffset;
+    if (len != sizeof(u64))
+        return -1;
+    memcpy(out, name[3] == 'b' ? &host_vm_base : &host_vm_size, len);
+    return (int)len;
 }
 void debug_printf(const char *f, ...)
 {
@@ -266,11 +278,13 @@ int main(void)
     unmap_stream(5);
     map_stream(SID, L1, L2, L3, 0, NPG, 3);
 
-    /* An older two-level stream still resolves, and wins the tie against stream 23 as the lower one. */
+    /* A two-level table under a window past 2^36 is not a stream the hardware can have: walked
+     * at the window's three levels it must find nothing, and stream 23 keeps the resolve. */
     map_stream(9, L1B, L2B, L3B, 0, NPG, 2);
     ap_call(DVA, 0x302);
-    r = find(7, 9);
-    CHECK(r && r->val >> 32 == NPG && count_kind(0) == 6, "two-level stream 9: want %d pages", NPG);
+    r = find(7, SID);
+    CHECK(!find(7, 9) && r && r->val >> 32 == NPG && count_kind(0) == 6,
+          "two-level stream 9 under a three-level window must not resolve");
     unmap_stream(9);
 
     /* A three-level stream that maps the same low bits under root[0], not the DVA's root[16], is a
