@@ -2717,7 +2717,7 @@ static int dt_set_gpu_t6031(void *dt)
  * T8122 handoff checks. Power is voted on solely for bounded ID/core-mask
  * reads, then voted off before Linux starts. Neither GPU nor mailbox is enabled.
  */
-static void t8122_read_powered_identity(void *dt, int gpu)
+void t8122_read_powered_identity(void *dt, int gpu)
 {
     if (!t8122_power_probe_opted_in(dt))
         return;

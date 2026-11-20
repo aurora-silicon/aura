@@ -412,8 +412,10 @@ static void t8122_gpu_log(const struct t8122_gpu_fw *fw, const char *state)
 
 /*
  * OS firmware 27.2: the reservations, links and segment description are in place. Publish the
- * firmware version and leave the GPU node disabled; nothing here powers the GPU or enables its
- * mailbox. The 25G83 profile switches do not apply.
+ * firmware version and leave the GPU node disabled; the mailbox is not enabled. The 25G83 profile
+ * switches do not apply. Only with chosen.asahi,t8122-gpu-power-diag=1 the bounded powered
+ * identity probe (the SGX ID and core-mask reads the kernel's T8122 admission checks) runs, with
+ * the SGX power voted off again before Linux starts; without it nothing powers the GPU.
  */
 static int t8122_gpu_publish_27(void *dt, const struct t8122_gpu_fw *fw)
 {
@@ -424,6 +426,9 @@ static int t8122_gpu_publish_27(void *dt, const struct t8122_gpu_fw *fw)
     gpu = t8122_gpu_node(dt);
     if (gpu < 0 || fdt_setprop_string(dt, gpu, "status", "disabled"))
         bail("FDT: GPU: T8122 cannot set GPU status\n");
+    gpu = t8122_gpu_node(dt);
+    if (gpu >= 0)
+        t8122_read_powered_identity(dt, gpu);
     t8122_gpu_log(fw, "left disabled (no 27.2 G15G firmware interface in the kernel yet)");
     return 0;
 }

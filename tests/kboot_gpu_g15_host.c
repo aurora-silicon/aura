@@ -2103,6 +2103,33 @@ static void t8122_27_names(void)
     t27_refused();
     assert(log_has("segment-names is not __TEXT;__DATA;__DATA_SHARED_RO"));
 }
+static void t8122_27_identity(void)
+{
+    /* chosen.asahi,t8122-gpu-power-diag=1: the bounded identity read, then power off again. */
+    prepare_27(0x10, 0, T27_RO_SIZE, 0, 3);
+    CHK(fdt_setprop_string(dtbuf, fdt_path_offset(dtbuf, "/chosen"), "asahi,t8122-gpu-power-diag",
+                           "1"));
+    run();
+    assert(gpu_u32("apple,m3-handoff-version") == 2);
+    assert(!strcmp(status_of(dtbuf, "/soc/gpu@292400000"), "disabled"));
+    assert(strcmp(status_of(dtbuf, "/soc/mbox@292408000"), "okay"));
+    int n = fdt_path_offset(dtbuf, "/chosen/asahi,t8122-gpu-powered-identity"), len;
+    assert(n >= 0);
+    const fdt32_t *v = fdt_getprop(dtbuf, n, "probe-result", &len);
+    assert(v && len == 4 && fdt32_ld(v) == T8122_ID_PASS);
+    v = fdt_getprop(dtbuf, n, "id-version", &len);
+    assert(v && len == 4 && fdt32_ld(v) == 0x07022000);
+    assert(pmgr_enables == 1 && pmgr_disables == 1 && pmgr_off == 1 && unguarded_faults == 0);
+    assert(log_has("GPU and ASC remain disabled"));
+}
+static void t8122_27_no_identity(void)
+{
+    /* Without the switch: no identity node and the GPU is never powered. */
+    prepare_27(0x10, 0, T27_RO_SIZE, 0, 3);
+    run();
+    assert(fdt_path_offset(dtbuf, "/chosen/asahi,t8122-gpu-powered-identity") < 0);
+    assert(!pmgr_enables && !pmgr_disables);
+}
 static void t8122_25_handoff_v1(void)
 {
     /* 26.6.2 (two segments) is unchanged: version 1, two VAs and flags <1 0>. */
@@ -2481,6 +2508,8 @@ static const struct {
     {"t8122-27-shared-rw", t8122_27_shared_rw},
     {"t8122-27-data-flags", t8122_27_data_flags},
     {"t8122-27-names", t8122_27_names},
+    {"t8122-27-identity", t8122_27_identity},
+    {"t8122-27-no-identity", t8122_27_no_identity},
 #endif
     {"t6030-dry", t6030_dry},
     {"t6030-armed", t6030_armed},
