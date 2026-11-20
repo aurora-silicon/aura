@@ -110,3 +110,53 @@ int pmu_read_boot_record(u8 *counts, u8 *error_stage)
     *error_stage = record[1];
     return 0;
 }
+
+/*
+ * Every aura stage clears iBoot's count (main.c), so only the first one sees it. Each stage reads
+ * it before its clear and hands on the larger of that and what the stage before it handed on:
+ * a later stage then knows how many boots in a row have failed. A stage that got no count from the
+ * stage before it can't tell a first failure from a count an older Stage 1 cleared.
+ */
+static bool own_valid, passed_valid;
+static u8 own_failed, passed_failed;
+
+void pmu_snapshot_failed_boots(void)
+{
+    u8 counts, error_stage;
+    own_valid = !pmu_read_boot_record(&counts, &error_stage);
+    own_failed = own_valid ? PMU_FAILED_BOOTS(counts) : 0;
+}
+
+/* aura.failed-boots=<count>, decimal, 0 to 15 */
+void pmu_take_failed_boots_var(const char *val)
+{
+    unsigned count = 0;
+    const char *p = val;
+    for (; *p >= '0' && *p <= '9' && count <= 15; p++)
+        count = count * 10 + (*p - '0');
+    if (p == val || *p || count > 15) {
+        printf("pmu: ignoring aura.failed-boots=%s\n", val);
+        return;
+    }
+    passed_valid = true;
+    passed_failed = count;
+}
+
+/* Only a count handed on by an earlier stage: this stage's own read follows its clear. */
+bool pmu_failed_boots_passed(u8 *count)
+{
+    if (!passed_valid)
+        return false;
+    *count = passed_failed > own_failed ? passed_failed : own_failed;
+    return true;
+}
+
+const char *pmu_failed_boots_var(void)
+{
+    static char var[sizeof("aura.failed-boots=255")];
+    if (!own_valid && !passed_valid)
+        return NULL;
+    u8 count = passed_failed > own_failed ? passed_failed : own_failed;
+    snprintf(var, sizeof(var), "aura.failed-boots=%u", count);
+    return var;
+}
