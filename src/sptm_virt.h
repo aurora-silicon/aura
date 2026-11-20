@@ -51,8 +51,8 @@ struct sptm_virt_placement {
 #define SPTM_VIRT_SAMPLE       BIT(7) /* sample the guest's PC until its XNU entry */
 #define SPTM_VIRT_S2R_MEM      BIT(8) /* T6050: also hook the MCC and the coprocessor DARTs */
 /* bit 9 is AURA_AURACTL in the feat/auractl runner; left free here so the two never clash */
-#define SPTM_VIRT_CTL_DCC    BIT(10) /* arm auractl's DCC transport (MDCR_EL2.TDCC) at boot */
-#define SPTM_VIRT_J613_TRACE BIT(11) /* bounded J613 ANE/AIC trace; exact ADT resources only */
+#define SPTM_VIRT_CTL_DCC   BIT(10) /* arm auractl's DCC transport (MDCR_EL2.TDCC) at boot */
+#define SPTM_VIRT_ANE_TRACE BIT(11) /* bounded ANE, ANE DART and AIC trace from the ADT */
 /* sptm_virt_s2r_cp_ansx, with COPROC on T6050 */
 #define S2R_CP_ANSX_SART  BIT(0) /* sart-ans reg[0-2], first page each */
 #define S2R_CP_ANSX_NVME  BIT(1) /* the NVMe BAR's first page (reg[9]) */

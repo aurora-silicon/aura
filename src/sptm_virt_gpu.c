@@ -17,7 +17,6 @@
 #include "iodev.h"
 #include "malloc.h"
 #include "memory.h"
-#include "soc.h"
 #include "sptm_virt_priv.h"
 #include "string.h"
 #include "uartproxy.h"
@@ -153,8 +152,8 @@ void sptm_virt_gpu_deadline(struct exc_info *ctx)
 
 static bool gpu_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int width)
 {
-    if ((sptm_virt_flags & SPTM_VIRT_J613_TRACE) && sptm_virt_gpu_head + 2 >= sptm_virt_gpu_nrec)
-        gpu_park(ctx, "the bounded J613 trace ring is full");
+    if ((sptm_virt_flags & SPTM_VIRT_ANE_TRACE) && sptm_virt_gpu_head + 2 >= sptm_virt_gpu_nrec)
+        gpu_park(ctx, "the bounded ANE trace ring is full");
     u64 now = mrs(CNTPCT_EL0);
 
     if (!gpu_first_t) {
@@ -243,52 +242,73 @@ static void gpu_hook_adt(const char *path, int idx, const char *what, u64 off, u
     gpu_hook_range(what, pa + off, size ? size : sz);
 }
 
-/* J613 ranges transcribed from the retained ADT, not from a J700 base shift.
- * Validate the entire resource list before installing any hook; no MMIO sweep. */
-static void j613_capture_setup(void)
+/*
+ * The ANE trace: every register window the ADT gives the Neural Engine (/arm-io/ane) and its DART
+ * (/arm-io/dart-ane), and the interrupt controller's (/arm-io/aic reg[0]). A window inside another
+ * is traced through the larger one. A missing node or empty window refuses the trace before any
+ * hook; nothing the ADT does not name is hooked.
+ */
+#define ANE_TRACE_MAX_REGS 16
+
+static void ane_trace_setup(void)
 {
+    static const struct {
+        const char *path, *what;
+        int max;
+    } nodes[] = {
+        {"/arm-io/ane", "ane", ANE_TRACE_MAX_REGS},
+        {"/arm-io/dart-ane", "dart-ane", ANE_TRACE_MAX_REGS},
+        {"/arm-io/aic", "aic", 1},
+    };
+    static struct {
+        u64 base, size;
+        const char *what;
+    } w[2 * ANE_TRACE_MAX_REGS + 1];
+    int n = 0;
+
     sptm_virt_gpu_print_max = 0; /* export the ring; no per-access console timing noise */
-    if (chip_id != T8122 || (sptm_virt_flags & ~SPTM_VIRT_J613_TRACE))
-        panic("J613 capture: wrong chip or conflicting capture modes\n");
-    static const struct {
-        const char *path;
-        int idx;
-        u64 base, size;
-    } resources[] = {
-        {"/arm-io/ane", 0, 0x311400000UL, 0x6c000UL},
-        {"/arm-io/ane", 1, 0x311050000UL, 0x4000UL},
-        {"/arm-io/ane", 2, 0x310000000UL, 0x2000000UL},
-        {"/arm-io/ane", 3, 0x2d0700000UL, 0x18000UL},
-        {"/arm-io/ane", 4, 0x2d0724000UL, 0x4000UL},
-        {"/arm-io/dart-ane", 0, 0x311800000UL, 0x4000UL},
-        {"/arm-io/dart-ane", 1, 0x311810000UL, 0x4000UL},
-        {"/arm-io/dart-ane", 2, 0x311820000UL, 0x4000UL},
-        {"/arm-io/dart-ane", 3, 0x311804000UL, 0x4000UL},
-        {"/arm-io/aic", 0, 0x2d1000000UL, 0x184000UL},
-    };
-    for (size_t i = 0; i < ARRAY_SIZE(resources); i++) {
-        int p[8];
-        u64 a, n;
-        if (adt_path_offset_trace(adt, resources[i].path, p) < 0 ||
-            adt_get_reg(adt, p, "reg", resources[i].idx, &a, &n) < 0 || a != resources[i].base ||
-            n != resources[i].size)
-            panic("J613 capture: ADT resource drift\n");
+    if (sptm_virt_flags & ~SPTM_VIRT_ANE_TRACE)
+        panic("ANE trace: conflicting capture modes\n");
+    for (size_t i = 0; i < ARRAY_SIZE(nodes); i++) {
+        int p[8], idx;
+        if (adt_path_offset_trace(adt, nodes[i].path, p) < 0)
+            panic("ANE trace: no %s in the ADT\n", nodes[i].path);
+        for (idx = 0; idx < nodes[i].max; idx++) {
+            u64 a, sz;
+            if (adt_get_reg(adt, p, "reg", idx, &a, &sz) < 0)
+                break;
+            if (!a || !sz || a + sz < a)
+                panic("ANE trace: %s reg[%d] is empty\n", nodes[i].path, idx);
+            w[n].base = a;
+            w[n].size = sz;
+            w[n++].what = nodes[i].what;
+        }
+        if (!idx)
+            panic("ANE trace: %s has no reg\n", nodes[i].path);
     }
-    static const struct {
-        u64 base, size;
-    } windows[] = {
-        {0x292468000UL, 0x4UL},    {0x2a5468000UL, 0x4UL},      {0x2d0700000UL, 0x18000UL},
-        {0x2d0724000UL, 0x4000UL}, {0x2d1000000UL, 0x184000UL}, {0x310000000UL, 0x2000000UL},
-    };
-    for (size_t i = 0; i < ARRAY_SIZE(windows); i++) {
-        gpu_ranges[gpu_nranges].base = windows[i].base;
-        gpu_ranges[gpu_nranges].size = windows[i].size;
-        gpu_ranges[gpu_nranges++].what = "j613";
-        /* Keep the two AON words at four-byte granularity. */
-        if (hv_map_hook(windows[i].base, gpu_hook, windows[i].size) < 0)
-            panic("J613 capture: hook installation failed\n");
+    static bool inside[ARRAY_SIZE(w)];
+    int keep = 0;
+    for (int i = 0; i < n; i++) {
+        inside[i] = false;
+        for (int j = 0; j < n && !inside[i]; j++)
+            inside[i] = j != i && w[j].base <= w[i].base &&
+                        w[i].base + w[i].size <= w[j].base + w[j].size &&
+                        (w[j].size != w[i].size || j < i);
     }
-    printf("J613 capture: %d exact windows, ring at 0x%lx; export before reset\n", gpu_nranges,
+    for (int i = 0; i < n; i++)
+        if (!inside[i])
+            w[keep++] = w[i];
+    if (gpu_nranges + keep > GPU_MAX_RANGES)
+        panic("ANE trace: %d windows, more than %d\n", keep, GPU_MAX_RANGES);
+    for (int i = 0; i < keep; i++) {
+        gpu_ranges[gpu_nranges].base = w[i].base;
+        gpu_ranges[gpu_nranges].size = w[i].size;
+        gpu_ranges[gpu_nranges++].what = w[i].what;
+        if (hv_map_hook(w[i].base, gpu_hook, w[i].size) < 0)
+            panic("ANE trace: cannot hook %s 0x%lx+0x%lx\n", w[i].what, w[i].base, w[i].size);
+        printf("ANE trace: hooked %s 0x%lx+0x%lx\n", w[i].what, w[i].base, w[i].size);
+    }
+    printf("ANE trace: %d windows from the ADT, ring at 0x%lx; export before reset\n", gpu_nranges,
            (u64)sptm_virt_gpu_ring);
 }
 
@@ -300,7 +320,7 @@ void sptm_virt_gpu_setup(void)
         printf("SPTM-virt[park]: the guest parks in the proxy at its first GL trap after %u s\n",
                sptm_virt_gpu_stop_boot_secs);
     }
-    if (!(sptm_virt_flags & (SPTM_VIRT_GPU | SPTM_VIRT_J613_TRACE)))
+    if (!(sptm_virt_flags & (SPTM_VIRT_GPU | SPTM_VIRT_ANE_TRACE)))
         return;
     sptm_virt_gpu_ring = memalign(0x4000, GPU_RING_BYTES);
     if (!sptm_virt_gpu_ring) {
@@ -313,8 +333,8 @@ void sptm_virt_gpu_setup(void)
     sptm_virt_gpu_nrec = GPU_RING_BYTES / sizeof(struct gpu_rec);
     sptm_virt_gpu_head = 0;
 
-    if (sptm_virt_flags & SPTM_VIRT_J613_TRACE) {
-        j613_capture_setup();
+    if (sptm_virt_flags & SPTM_VIRT_ANE_TRACE) {
+        ane_trace_setup();
         return;
     }
 
