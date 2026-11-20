@@ -13,6 +13,13 @@
  * XNU's commands: a command word opens one, its data words follow, and it closes once XNU has read
  * the reply and the RX FIFO is empty again. aura writes only between XNU's commands, with both
  * FIFOs empty, holding the lock, so XNU's next access waits until aura's reply has been read.
+ *
+ * That holds for a driver that polls the controller with 32-bit accesses to its status, command and
+ * reply registers. aura stops keeping the count, for the rest of the boot, on the first sign of
+ * anything else: XNU writing a non-zero value to any other register of the page (an interrupt
+ * enable or acknowledge: aura's own reply would then interrupt XNU), a command-register write of
+ * another width, or a transaction of aura's that fails (its reply is drained first, so XNU never
+ * reads it). The registers XNU uses besides those three are logged with the first rounds.
  */
 #include "adt.h"
 #include "hv.h"
@@ -30,6 +37,7 @@
 
 #define SPMI_OPC_EXT_WRITE  0x00 /* 0x00-0x0f: 8-bit register, (opc & 0xf) + 1 bytes */
 #define SPMI_OPC_EXT_WRITEL 0x30 /* 0x30-0x37: 16-bit register, (opc & 7) + 1 bytes */
+#define PK_OTHER 16
 
 static struct {
     spmi_dev_t *dev;
@@ -46,6 +54,13 @@ static struct {
     u64 next_t;
     int round;
     u32 cleared, skipped;
+    /* XNU's accesses to the page's other registers */
+    struct {
+        u32 off, reads, writes;
+        u64 last;
+    } other[PK_OTHER];
+    int n_other;
+    bool other_lost, other_nonzero_write;
 } pk;
 
 static DECLARE_SPINLOCK(pk_lock);
@@ -56,23 +71,103 @@ static bool pk_fifos_empty(void)
     return (st & pk.rx_empty) && (st & pk.tx_empty);
 }
 
+static void pk_print_other(void)
+{
+    if (!pk.n_other)
+        printf("SPTM-virt[pmu]: XNU has used only the status, command and reply registers\n");
+    for (int i = 0; i < pk.n_other; i++)
+        printf("SPTM-virt[pmu]: XNU's other register +0x%x: %u reads, %u writes, last write 0x%lx\n",
+               pk.other[i].off, pk.other[i].reads, pk.other[i].writes, pk.other[i].last);
+    if (pk.other_lost)
+        printf("SPTM-virt[pmu]: (more registers than recorded)\n");
+}
+
+/* For the rest of the boot: the hook stays, as a pass-through. With pk_lock held. */
+static void pk_off(const char *why)
+{
+    if (!pk.on)
+        return;
+    pk.on = false;
+    printf("SPTM-virt[pmu]: no longer keeping the failed-boot count: %s (round %d, %u cleared)\n",
+           why, pk.round, pk.cleared);
+    pk_print_other();
+}
+
+/*
+ * aura's transaction failed, and its reply may still come. With pk_lock held (XNU waits), drain
+ * RX until both FIFOs have stayed empty for 1 ms, for at most 20 ms, then stop keeping.
+ */
+static void pk_fail(const char *what)
+{
+    u64 f = mrs(CNTFRQ_EL0), t0 = mrs(CNTPCT_EL0), quiet = t0, now;
+    u32 drained = 0;
+    bool clean = false;
+
+    while ((now = mrs(CNTPCT_EL0)) - t0 < f / 50) {
+        u32 st = read32(pk.status);
+        if (!(st & pk.rx_empty)) {
+            read32(pk.reply);
+            drained++;
+            quiet = now;
+        } else if (!(st & pk.tx_empty)) {
+            quiet = now;
+        } else if (now - quiet > f / 1000) {
+            clean = true;
+            break;
+        }
+    }
+    printf("SPTM-virt[pmu]: %s failed; %u reply words drained, FIFOs %s\n", what, drained,
+           clean ? "empty" : "STILL NOT EMPTY after 20 ms");
+    pk_off("aura's own transaction failed");
+}
+
 /* With pk_lock held and XNU between commands. */
 static void pk_clear(void)
 {
     u8 v = 0, zero = 0;
     if (spmi_ext_read_long(pk.dev, pk.slave, pk.counter, &v, 1) < 0) {
-        printf("SPTM-virt[pmu]: reading the failed-boot count failed\n");
+        pk_fail("reading the failed-boot count");
         return;
     }
     if (v && spmi_ext_write_long(pk.dev, pk.slave, pk.counter, &zero, 1) < 0) {
-        printf("SPTM-virt[pmu]: clearing the failed-boot count (0x%02x) failed\n", v);
+        printf("SPTM-virt[pmu]: clearing the failed-boot count (0x%02x)\n", v);
+        pk_fail("clearing the failed-boot count");
         return;
     }
-    if (v || pk.round < 2)
+    if (v || pk.round < 2) {
         printf("SPTM-virt[pmu]: failed-boot count 0x%02x%s (round %d)\n", v, v ? " -> 0x00" : "",
                pk.round);
+        if (pk.round < 2)
+            pk_print_other();
+    }
     if (v)
         pk.cleared++;
+}
+
+/* With pk_lock held: an access of XNU's to a register other than status, command and reply. */
+static void pk_note_other(u64 addr, bool write, u64 val)
+{
+    u32 off = addr & 0x3fff;
+    int i;
+
+    for (i = 0; i < pk.n_other && pk.other[i].off != off; i++)
+        ;
+    if (i == pk.n_other) {
+        if (i == PK_OTHER) {
+            pk.other_lost = true;
+            i = -1;
+        } else {
+            pk.other[pk.n_other++].off = off;
+        }
+    }
+    if (i >= 0 && write) {
+        pk.other[i].writes++;
+        pk.other[i].last = val;
+    } else if (i >= 0) {
+        pk.other[i].reads++;
+    }
+    if (write && val)
+        pk.other_nonzero_write = true;
 }
 
 static void pk_schedule(u64 now)
@@ -85,8 +180,12 @@ static void pk_schedule(u64 now)
 /* With pk_lock held. */
 static void pk_maybe(u64 now)
 {
-    if (!pk.next_t || now < pk.next_t)
+    if (!pk.on || !pk.next_t || now < pk.next_t)
         return;
+    if (pk.other_nonzero_write) {
+        pk_off("XNU wrote a non-zero value to another register of the controller (interrupts?)");
+        return;
+    }
     if (pk.open && !(now - pk.open_t > PMU_STALE_S * mrs(CNTFRQ_EL0) && pk_fifos_empty()))
         return; /* XNU has a command in flight: at its end, or the next trap */
     if (!pk_fifos_empty()) {
@@ -95,6 +194,7 @@ static void pk_maybe(u64 now)
         return;
     }
     pk.open = false;
+    pk.data_words = 0;
     pk_clear();
     pk_schedule(now);
 }
@@ -105,6 +205,10 @@ static bool pk_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int wi
     u64 now = mrs(CNTPCT_EL0);
 
     spin_lock(&pk_lock);
+    if (addr != pk.status && addr != pk.cmd && addr != pk.reply)
+        pk_note_other(addr, write, write ? *val : 0);
+    if (write && addr == pk.cmd && width != 2)
+        pk_off("a command-register write that isn't 32-bit");
     if (write && addr == pk.cmd && width == 2) {
         u32 v = *val;
         if (pk.data_words > 0) {
