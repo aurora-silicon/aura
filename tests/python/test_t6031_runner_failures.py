@@ -67,6 +67,8 @@ def runner(tmp_path):
         (tree / f"tests/run-t6031-{name}.sh").write_bytes(source.read_bytes())
     (tree / "rust/src/adt.rs").write_text("// from_raw_parts(self.name.as_ptr() as *const u8, 32)\n")
     (tree / "src/kboot.c").write_text("""
+static int dt_fill_pmp_from(void) { return 0;
+}
 static int dt_fill_pmp(void) { return 0;
 }
 static void dt_pass_pmp(void) {

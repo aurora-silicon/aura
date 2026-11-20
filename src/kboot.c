@@ -8529,18 +8529,18 @@ static int adt_get_u32_exact(int node, const char *name, u32 *val)
 }
 
 /*
- * Copies this Mac's PMP values from the ADT onto the FDT node @pmp_node. Used for
- * T6000/T8112 and by dt_pass_pmp() on T6030 and T8122. Scalar values must be
- * exactly a u32; calibration tables stay in their original byte order.
+ * Copies this Mac's PMP values from the ADT onto the FDT node @pmp_node: /chosen's board-id and
+ * dram-vendor-id, and the properties of the PMP nub at @nub_path. Scalar values must be exactly
+ * a u32; calibration tables stay in their original byte order.
  */
-static int dt_fill_pmp(int pmp_node)
+static int dt_fill_pmp_from(int pmp_node, const char *nub_path)
 {
     int chosen_anode = adt_path_offset(adt, "/chosen");
     if (chosen_anode < 0)
         bail("ADT: /chosen not found \n");
-    int pmp_iop_anode = adt_path_offset(adt, "/arm-io/pmp/iop-pmp-nub");
+    int pmp_iop_anode = adt_path_offset(adt, nub_path);
     if (pmp_iop_anode < 0)
-        bail("ADT: /arm-io/pmp/iop-pmp-nub not found \n");
+        bail("ADT: %s not found \n", nub_path);
 
     u32 board_id, dram_vendor_id, dram_capacity = 0xFFFFFFFF;
     if (adt_get_u32_exact(chosen_anode, "board-id", &board_id))
@@ -8571,6 +8571,138 @@ static int dt_fill_pmp(int pmp_node)
     return 0;
 }
 
+/* T6000/T8112, and dt_pass_pmp() on T6030 and T8122: the ADT's one PMP */
+static int dt_fill_pmp(int pmp_node)
+{
+    return dt_fill_pmp_from(pmp_node, "/arm-io/pmp/iop-pmp-nub");
+}
+
+/*
+ * The boot arguments the PMP driver patches into the firmware from an optional
+ * apple,<name>; the firmware's default for each is 0. iBoot sets them where they
+ * apply, e.g. a J616s has dram-channel-disable 0xffff0000.
+ */
+static int dt_set_pmp_bootargs(int pmp_node, int pmp_iop_anode)
+{
+    static const char *const pmp_bootargs[] = {"dram-channel-disable", "pmc-msg-disabled",
+                                               "soc-chip-variant"};
+    for (size_t i = 0; i < ARRAY_SIZE(pmp_bootargs); i++) {
+        u32 val;
+        char arg_name[64];
+
+        if (adt_get_u32_exact(pmp_iop_anode, pmp_bootargs[i], &val))
+            continue;
+        snprintf(arg_name, sizeof(arg_name), "apple,%s", pmp_bootargs[i]);
+        if (fdt_setprop_u32(dt, pmp_node, arg_name, val))
+            bail("FDT: failed to set pmp boot argument %s\n", pmp_bootargs[i]);
+        printf("FDT: pmp %s = 0x%x\n", pmp_bootargs[i], val);
+    }
+    return 0;
+}
+
+/*
+ * The ADT node of device_type "pmp" that has a register window at @address, with its name in
+ * @name: -1 if none has it, -2 if more than one does. The window joins the two trees, as for the
+ * DARTs: names need not match (T6050's DT has pmp@284e00000, whose first reg, the PMP window
+ * 0x284500000, is the ADT pmp0's third).
+ */
+static int adt_find_pmp_by_window(u64 address, char *name, size_t name_size)
+{
+    int path[8];
+    int arm_io = adt_path_offset_trace(adt, "/arm-io", path);
+    int depth = 0, found = -1;
+
+    if (arm_io < 0)
+        return -1;
+    while (depth < (int)ARRAY_SIZE(path) && path[depth])
+        depth++;
+    if (depth + 1 >= (int)ARRAY_SIZE(path))
+        return -1;
+    path[depth + 1] = 0;
+
+    int node = arm_io;
+    ADT_FOREACH_CHILD(adt, node)
+    {
+        u32 len = 0;
+        const char *type = adt_getprop(adt, node, "device_type", &len);
+        const char *child = adt_get_name(adt, node);
+
+        if (!type || len != sizeof("pmp") || memcmp(type, "pmp", sizeof("pmp")) || !child)
+            continue;
+        path[depth] = node;
+        for (int i = 0; i < 16; i++) {
+            u64 base;
+
+            if (adt_get_reg(adt, path, "reg", i, &base, NULL) < 0)
+                break;
+            if (base != address)
+                continue;
+            if (found >= 0)
+                return -2;
+            found = node;
+            snprintf(name, name_size, "%s", child);
+            break;
+        }
+    }
+    return found;
+}
+
+/*
+ * A DT without the pmp alias (T6050, whose PMP is pmp0): pair each enabled PMP with its ADT node
+ * by register window and copy this Mac's values onto it, as the alias path does, without
+ * touching its status. A board DT carries one Mac's values, and they vary from Mac to Mac (the
+ * DRAM vendor, for one). Never fatal and all or nothing: an unpaired or ambiguous window, a
+ * missing nub, a malformed value or a full DT leaves the node as the DT has it.
+ */
+static int dt_set_pmp_by_window(void)
+{
+    int node = -1, enabled = 0;
+
+    while ((node = fdt_node_offset_by_compatible(dt, node, "apple,t6000-pmp-v2")) >= 0) {
+        int len;
+        const char *status = fdt_getprop(dt, node, "status", &len);
+        if (status ? strcmp(status, "okay") && strcmp(status, "ok") : len != -FDT_ERR_NOTFOUND)
+            continue;
+        enabled++;
+
+        char path[64], name[32], nub[96];
+        if (fdt_get_path(dt, node, path, sizeof(path)))
+            snprintf(path, sizeof(path), "pmp");
+        u64 address = dt_get_address(dt, node);
+        int anode = address ? adt_find_pmp_by_window(address, name, sizeof(name)) : -1;
+        if (anode < 0) {
+            printf("FDT: %s: %s at 0x%lx; keeping the DT's values\n", path,
+                   !address      ? "no register window"
+                   : anode == -2 ? "more than one ADT PMP has its window"
+                                 : "no ADT PMP has its window",
+                   address);
+            continue;
+        }
+        snprintf(nub, sizeof(nub), "/arm-io/%s/iop-%s-nub", name, name);
+        int nub_anode = adt_path_offset(adt, nub);
+        void *saved = nub_anode < 0 ? NULL : malloc(dt_bufsize);
+        if (!saved) {
+            printf("FDT: %s: %s; keeping the DT's values\n", path,
+                   nub_anode < 0 ? "no ADT PMP nub" : "no memory for the PMP values");
+            continue;
+        }
+        memcpy(saved, dt, dt_bufsize);
+        if (dt_fill_pmp_from(node, nub) || dt_set_pmp_bootargs(node, nub_anode)) {
+            memcpy(dt, saved, dt_bufsize);
+            printf("FDT: %s: ADT %s values not copied; keeping the DT's values\n", path, name);
+        } else {
+            const fdt32_t *bdid = fdt_getprop(dt, node, "apple,board-id", NULL);
+            const fdt32_t *dvid = fdt_getprop(dt, node, "apple,dram-vendor-id", NULL);
+            printf("FDT: %s: this Mac's PMP values from ADT %s (board-id %u, dram-vendor-id %u)\n",
+                   path, name, fdt32_ld(bdid), fdt32_ld(dvid));
+        }
+        free(saved);
+    }
+    if (!enabled)
+        printf("FDT: pmp not found in devtree\n");
+    return 0;
+}
+
 /* The device tree's pmp node (M1 Pro/Max/Ultra, M2, M2 Pro/Max/Ultra): as upstream has it */
 static int dt_set_pmp(void)
 {
@@ -8592,10 +8724,8 @@ static int dt_set_pmp(void)
             return 0;
         return dt_fill_pmp(pmp_node);
     }
-    if (pmp_node < 0) {
-        printf("FDT: pmp not found in devtree\n");
-        return 0;
-    }
+    if (pmp_node < 0)
+        return dt_set_pmp_by_window();
     int chosen_anode = adt_path_offset(adt, "/chosen");
     if (chosen_anode < 0)
         bail("ADT: /chosen not found \n");
@@ -8628,25 +8758,8 @@ static int dt_set_pmp(void)
             bail("FDT: failed to transfer pmp tunable");
     }
 
-    /*
-     * The boot arguments the PMP driver patches into the firmware from an optional
-     * apple,<name>; the firmware's default for each is 0. iBoot sets them where they
-     * apply, e.g. a J616s has dram-channel-disable 0xffff0000.
-     */
-    static const char *const pmp_bootargs[] = {"dram-channel-disable", "pmc-msg-disabled",
-                                               "soc-chip-variant"};
-    for (size_t i = 0; i < ARRAY_SIZE(pmp_bootargs); i++) {
-        u32 val;
-        char arg_name[64];
-
-        if (adt_get_u32_exact(pmp_iop_anode, pmp_bootargs[i], &val))
-            continue;
-        snprintf(arg_name, sizeof(arg_name), "apple,%s", pmp_bootargs[i]);
-        pmp_node = fdt_path_offset(dt, "pmp");
-        if (fdt_setprop_u32(dt, pmp_node, arg_name, val))
-            bail("FDT: failed to set pmp boot argument %s\n", pmp_bootargs[i]);
-        printf("FDT: pmp %s = 0x%x\n", pmp_bootargs[i], val);
-    }
+    if (dt_set_pmp_bootargs(fdt_path_offset(dt, "pmp"), pmp_iop_anode))
+        return -1;
 
     pmp_node = fdt_path_offset(dt, "pmp");
     fdt_setprop_string(dt, pmp_node, "status", "okay");
