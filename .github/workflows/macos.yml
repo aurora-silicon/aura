@@ -1,0 +1,106 @@
+name: macos
+
+# The jobs that need a macOS runner: link Stage 1 and the ESP Stage 2 with Homebrew clang as a
+# Mac builds aura, check Stage 1 room with that toolchain, and run pytest on macOS.
+#
+# The organisation has few macOS runners, and running these on every pull request push left
+# pull requests queued for hours. They run on every push to main and on demand. On a pull
+# request they run only when it carries the `ci-macos` label: adding the label starts them,
+# and later pushes to a labelled pull request run them again. Without the label the jobs are
+# skipped and take no runner.
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+    types: [ opened, synchronize, reopened, labeled ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # A new push to a pull request replaces its older runs; pushes to main each keep their run.
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  stage1-clang:
+    # Stage 1 has to end below the panel DCP's log buffer (aura-raw.ld). Releases build with
+    # gcc. Link both stages with clang too, as a Mac builds them, so that a change that pushes
+    # Stage 1 over fails here.
+    if: >-
+      github.event_name != 'pull_request' ||
+      (github.event.action == 'labeled' && github.event.label.name == 'ci-macos') ||
+      (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'ci-macos'))
+    runs-on: macos-26
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install LLVM, LLD and GNU make
+        run: brew install llvm lld make
+
+      - name: Install aarch64-unknown-none-softfloat rust target
+        run: rustup target install aarch64-unknown-none-softfloat
+
+      - name: Link Stage 1 and the ESP Stage 2 with clang
+        run: |
+          gmake -j3 RELEASE=1 CHAINLOADING=1 BUILTIN_LOGO=aurora
+          gmake clean
+          gmake -j3 RELEASE=1 CHAINLOADING=1 ESP_STAGE2=1 BUILTIN_LOGO=aurora
+
+  stage1-size-clang-macos:
+    # stage1-size's room check (tools/stage1_size.sh) with the Mac toolchain.
+    if: >-
+      github.event_name != 'pull_request' ||
+      (github.event.action == 'labeled' && github.event.label.name == 'ci-macos') ||
+      (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'ci-macos'))
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install LLVM, LLD, GNU make and the Rust target
+        run: |
+          brew install llvm lld make
+          rustup target install aarch64-unknown-none-softfloat
+      - name: Stage 1 room
+        run: |
+          export MAKE=gmake NM="$(brew --prefix llvm)/bin/llvm-nm"
+          sh tools/stage1_size.sh clang-macos BUILTIN_LOGO=aurora
+
+  pytest:
+    name: Pytest (${{ matrix.os }} + llvm-brew)
+    if: >-
+      github.event_name != 'pull_request' ||
+      (github.event.action == 'labeled' && github.event.label.name == 'ci-macos') ||
+      (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'ci-macos'))
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      matrix:
+        os: [ macos-26, macos-15 ]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+
+      - name: Install python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest==9.1.1
+
+      - name: Install Clang w/ brew
+        run: brew install llvm lld
+
+      - name: Test PMP boot data fixups
+        run: sh tests/run-pmp-boot-data.sh
+
+      - name: Run pytest
+        run: pytest tests/python tests/test_t8122_gpu_reader.py tests/test_t8122_gpu_resources.py

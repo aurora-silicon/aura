@@ -15,6 +15,11 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  # A new push to a pull request replaces its older runs; pushes to main each keep their run.
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   gcc:
     runs-on: ubuntu-24.04
@@ -31,20 +36,6 @@ jobs:
         run: >
           sh tools/stage1_size.sh gcc ARCH=aarch64-linux-gnu- BUILTIN_LOGO=aurora
           EXTRA_CFLAGS='-Wstack-usage=2048 -Os'
-
-  clang-macos:
-    # As a Mac builds aura.
-    runs-on: macos-26
-    steps:
-      - uses: actions/checkout@v7
-      - name: Install LLVM, LLD, GNU make and the Rust target
-        run: |
-          brew install llvm lld make
-          rustup target install aarch64-unknown-none-softfloat
-      - name: Stage 1 room
-        run: |
-          export MAKE=gmake NM="$(brew --prefix llvm)/bin/llvm-nm"
-          sh tools/stage1_size.sh clang-macos BUILTIN_LOGO=aurora
 
   fedora:
     # As fedora-aurora's aura.spec builds it: Fedora clang and Rust, core built from rust-src.

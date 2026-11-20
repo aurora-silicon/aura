@@ -10,6 +10,11 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  # A new push to a pull request replaces its older runs; pushes to main each keep their run.
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   test:
     name: Pytest (${{ matrix.os }} + ${{ matrix.compiler }})
@@ -22,10 +27,6 @@ jobs:
             compiler: gcc
           - os: ubuntu-latest
             compiler: llvm
-          - os: macos-26
-            compiler: llvm-brew
-          - os: macos-15
-            compiler: llvm-brew
 
     steps:
       - name: Checkout code
@@ -53,11 +54,6 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y llvm lld
-
-      - name: Install Clang on macOS w/ brew
-        if: matrix.compiler == 'llvm-brew'
-        run: |
-          brew install llvm lld
 
       - name: Test PMP boot data fixups
         run: sh tests/run-pmp-boot-data.sh
