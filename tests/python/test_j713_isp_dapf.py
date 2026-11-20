@@ -101,7 +101,7 @@ def test_j713_isp_dapf(tmp_path):
         ("words", "config[i].r4 != r4 ||", "false ||"),
         ("room", "count > (u32)max", "false"),
         ("order", "ranges[2 * i] = config[i].start;", "ranges[2 * i] = config[count - 1 - i].start;"),
-        ("slice order", "config[i].end < config[i].start", "false"),
+        ("slice order", "entry.end < entry.start", "false"),
         ("smmu", "case DAPF_INSTANCE_SMMU:", ""),
         ("one bank", "if (found >= 0) {", "if (false) {"),
     ]

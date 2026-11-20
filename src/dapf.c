@@ -110,6 +110,7 @@ struct dapf_t8110_config {
     u8 r0_lo;
     u8 unk4;
 } PACKED;
+static_assert(sizeof(struct dapf_t8110_config) == 52, "Invalid T8110 DAPF entry size");
 
 struct dapf_t8110b_config {
     u64 start;
@@ -223,24 +224,26 @@ static void dapf_t8132_put(u64 base, const struct dapf_slice *slice)
     write32(base + 0x20, slice->r20);
 }
 
-static const struct dapf_t8110_config *dapf_t8132_config(const char *path, int node, u32 instance,
+static const struct dapf_t8110_config *dapf_t8110_slices(const char *path, int node, u32 instance,
                                                          u32 *count)
 {
     char prop[32];
-    u32 length;
+    u32 length = 0;
 
     snprintf(prop, sizeof(prop), "dapf-instance-%u", instance);
     const struct dapf_t8110_config *config = adt_getprop(adt, node, prop, &length);
     if (!config || !length || length % sizeof(*config) ||
         length / sizeof(*config) > T8132_DAPF_SLICES) {
-        printf("dapf: Invalid T8132 %s for %s\n", prop, path);
+        printf("dapf: Invalid %s for %s (len %u)\n", prop, path, length);
         return NULL;
     }
 
     *count = length / sizeof(*config);
     for (u32 i = 0; i < *count; i++) {
-        if (config[i].end < config[i].start) {
-            printf("dapf: Invalid T8132 %s slice %u for %s\n", prop, i, path);
+        struct dapf_t8110_config entry;
+        memcpy(&entry, &config[i], sizeof(entry));
+        if (entry.end < entry.start) {
+            printf("dapf: Invalid %s slice %u for %s\n", prop, i, path);
             return NULL;
         }
     }
@@ -257,7 +260,7 @@ static int dapf_program_t8132(const char *path, u64 base, int node, u32 instance
 {
     struct dapf_slice want[T8132_DAPF_SLICES], had[T8132_DAPF_SLICES];
     u32 count;
-    const struct dapf_t8110_config *config = dapf_t8132_config(path, node, instance, &count);
+    const struct dapf_t8110_config *config = dapf_t8110_slices(path, node, instance, &count);
 
     if (!config)
         return -1;
@@ -410,7 +413,7 @@ int dapf_t8132_windows(const char *path, int index, struct dapf_window *out, int
         dapf_select_t8132(path, index, node, dart_path, &instance) != 1)
         return -1;
 
-    const struct dapf_t8110_config *config = dapf_t8132_config(path, node, instance, &count);
+    const struct dapf_t8110_config *config = dapf_t8110_slices(path, node, instance, &count);
     if (!config)
         return -1;
 
@@ -492,7 +495,7 @@ int dapf_t8132_ranges(const char *path, u32 r0, u32 r4, u32 r20, u64 *ranges, in
     if (index < 0 || dapf_select_t8132(path, index, node, dart_path, &instance) != 1)
         return -1;
 
-    const struct dapf_t8110_config *config = dapf_t8132_config(path, node, instance, &count);
+    const struct dapf_t8110_config *config = dapf_t8110_slices(path, node, instance, &count);
     if (!config || !count || count > (u32)max)
         return -1;
 
@@ -507,6 +510,32 @@ int dapf_t8132_ranges(const char *path, u32 r0, u32 r4, u32 r20, u64 *ranges, in
         ranges[2 * i + 1] = config[i].end;
     }
     return count;
+}
+
+/*
+ * Return the raw inclusive [start, end] slices of a T8110 DART's dapf-instance
+ * property (up to max entries), or -1 on missing or malformed ADT metadata.
+ */
+int dapf_t8110_ranges(const char *path, u32 instance, struct dapf_window *out, int max)
+{
+    int node = adt_path_offset(adt, path);
+    u32 count = 0;
+
+    if (node < 0 || max <= 0) {
+        printf("dapf: Missing ADT node %s for dapf-instance-%u\n", path, instance);
+        return -1;
+    }
+
+    const struct dapf_t8110_config *config = dapf_t8110_slices(path, node, instance, &count);
+    if (!config || (int)count > max)
+        return -1;
+
+    for (u32 i = 0; i < count; i++) {
+        struct dapf_t8110_config entry;
+        memcpy(&entry, &config[i], sizeof(entry));
+        out[i] = (struct dapf_window){.start = entry.start, .end = entry.end};
+    }
+    return (int)count;
 }
 
 static bool dapf_is_j614s(void)

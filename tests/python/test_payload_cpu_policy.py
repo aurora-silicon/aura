@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: GPL-2.0-only
-"""Exercise payload CPU setup with failures on older chips and T8140."""
+"""Exercise payload CPU setup failures: every chip refuses the handoff."""
 
 from test_smp_timeouts import REPO, compile_and_run
 
 
-def test_payload_handoff_policy_and_best_effort_mitigations(tmp_path):
+def test_payload_handoff_fails_closed_on_every_chip(tmp_path):
     smp = (REPO / "src/smp.c").read_text()
     sync = smp[smp.index("int smp_call_sync0("):smp.index("bool smp_has_pending_calls(")]
     payload = (REPO / "src/payload.c").read_text()
@@ -66,21 +66,22 @@ static void reset(void)
 }
 int main(void)
 {
-    int chips[] = {0x8103, 0x6000, 0x8112, 0x6020, 0x8122, 0x6030, T8140};
+    int chips[] = {0x8103, 0x6000, 0x8112, 0x6020, 0x8122, 0x6030, 0x8132, 0x6040, 0x6050, T8140};
     for (unsigned i = 0; i < ARRAY_SIZE(chips); i++) {
         chip_id = chips[i];
         reset();
         assert(prepare_cpus() == 0 && advertised_tso == 1);
         fail_tso_cpu = 1;
-        assert(prepare_cpus() == (chip_id == T8140 ? -1 : 0));
+        assert(prepare_cpus() == -1);
         assert(!advertised_tso);
         reset(); fail_mitigation_cpu = 1;
-        assert(prepare_cpus() == (chip_id == T8140 ? -1 : 0));
-        assert(mitigation_calls == 3); /* Every live CPU is still attempted. */
+        assert(prepare_cpus() == -1);
+        assert(mitigation_calls == 3); /* Every live CPU is still attempted and reported. */
+        assert(tso_calls == 0);
         reset(); fail_tso_cpu = 1;
-        assert(prepare_cpus() == (chip_id == T8140 ? -1 : 0));
+        assert(prepare_cpus() == -1);
         assert(!advertised_tso);
-        assert(tso_calls == (chip_id == T8140 ? 1 : 3));
+        assert(tso_calls == 1);
         reset(); fail_mitigation_wait = 1;
         assert(prepare_cpus() == -1);
         assert(mitigation_calls == 1);
@@ -89,7 +90,8 @@ int main(void)
         assert(!advertised_tso);
         assert(tso_calls == 1);
         reset(); start_error = -1;
-        assert(prepare_cpus() == (chip_id == T8140 ? -1 : 0));
+        assert(prepare_cpus() == -1);
+        assert(mitigation_calls == 0);
     }
     return 0;
 }
