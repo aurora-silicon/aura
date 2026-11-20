@@ -263,6 +263,7 @@ static bool nvme_set_sart_var(const char *v)
     nvme_sart_passed = true;
     return true;
 }
+static void pmu_take_failed_boots_var(const char *v) {}
 static bool nvme_post_m4_passed_off(void)
 {
     return getenv("M1N1_TEST_POST_M4") && nvme_sart_passed && !nvme_started;
@@ -301,6 +302,9 @@ static int chainload_load(const char *spec, char **vars, size_t *var_cnt, size_t
 ''' + between(payload, "// Kernels must be 2MB aligned", "static void finalize_uncompression(") + \
         between(payload, "static void finalize_uncompression(", "#define MAX_VAR_NAME 64") + \
         between(payload, "#define MAX_VAR_NAME 64", "void do_enable_tso(void)") + \
+        ("/* No failed-boot count here: an ANS start failure stays in the proxy */\n"
+         "static void payload_nvme_start_failed(void) {}\n"
+         if "payload_nvme_start_failed" in payload else "") + \
         function(payload, "int payload_run(void)\n{") + r'''
 static u8 image[1 << 20] __attribute__((aligned(16)));
 
