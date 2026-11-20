@@ -813,9 +813,11 @@ static void dt_copy_atc_t6030_dp_tunables(void *dt, int adt_node, int fdt_node,
 
 /*
  * The controller tunables macOS applies in either role (usb-drdN in the ADT), for the dwc3 node
- * driven by that ATC PHY. dwc3-apple applies them after each core reset. Without them a T8132
- * controller in device mode enumerates but never finishes SET_CONFIGURATION for a function that
- * queues an interrupt IN transfer during it (CDC NCM/ACM; J713 on 27.2).
+ * driven by that ATC PHY. dwc3-apple applies them after each core reset. Without them a controller
+ * in device mode enumerates but never finishes SET_CONFIGURATION for a function that queues an
+ * interrupt IN transfer during it (CDC NCM/ACM; seen on T8132 J713 and T8122 J615 on 27.2). The
+ * ADT offsets are relative to the block each list names (dwc3 globals, debug, link registers),
+ * which is what the windows below and dwc3-apple's blocks are.
  */
 static const struct adt_tunable_info drd_default_tunables[] = {
     {"tunable_DRD_USB31_GBL_DEFAULT", "apple,tunable-gbl-default", 0, 0x600, true},
@@ -842,19 +844,28 @@ static int dt_find_atc_controller(void *dt, int phy_node)
 }
 
 /*
- * All of the controller defaults or none of them. The PHY is looked up by its alias here: a path
- * read earlier points into /aliases, which moves when properties are added to nodes before it.
+ * All of the controller defaults or none of them, for any ATC port whose usb-drdN carries them.
+ * A controller whose ADT has none of the lists (M1, for one) is left as its device tree describes
+ * it. The PHY is looked up by its alias here: a path read earlier points into /aliases, which
+ * moves when properties are added to nodes before it.
  */
 static void dt_copy_drd_default_tunables(void *dt, int port, const char *phy_alias)
 {
     char adt_path[32];
     snprintf(adt_path, sizeof(adt_path), "/arm-io/usb-drd%d", port);
     int adt_node = adt_path_offset(adt, adt_path);
+    bool listed = false;
+
+    for (size_t i = 0; adt_node >= 0 && i < ARRAY_SIZE(drd_default_tunables); i++)
+        listed |= adt_getprop(adt, adt_node, drd_default_tunables[i].adt_name, NULL) != NULL;
+    if (!listed)
+        return;
+
     const char *phy_path = fdt_get_alias(dt, phy_alias);
     int phy_node = phy_path ? fdt_path_offset(dt, phy_path) : -1;
     int node = phy_node < 0 ? -1 : dt_find_atc_controller(dt, phy_node);
 
-    if (adt_node < 0 || node < 0) {
+    if (node < 0) {
         printf("FDT: no controller for %s: its defaults stay unset\n", adt_path);
         return;
     }
@@ -1033,6 +1044,7 @@ static void dt_copy_atc_tunables(void *dt, const char *adt_path, const char *dt_
         goto cleanup;
     }
 
+    dt_copy_drd_default_tunables(dt, port, dt_alias);
     return;
 
 cleanup:

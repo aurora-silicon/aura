@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: GPL-2.0-only OR MIT
 """The usb-drdN controller defaults go to the dwc3 node whose first PHY is that ATC PHY: all three
-lists or none, stale lists replaced, other controllers untouched. The PHY is found by its alias in
+lists or none, stale lists replaced, other controllers untouched. A usb-drdN that carries none of
+the lists (M1) leaves the device tree as it is. The PHY is found by its alias in
 an /aliases node that follows /soc, after the PHY node has grown (as the calibration copy does), so
 a path read before that would point at moved data. Synthetic tunable values."""
 from pathlib import Path
@@ -17,6 +18,7 @@ CASES = {
     "link-missing": ("tunable_LINK_REGS_DEFAULT", None, True, "none"),
     "dbg-out-of-range": (None, "tunable_DRD_USB31_DBG_DEFAULT", True, "none"),
     "no-controller": (None, None, False, "none"),
+    "no-lists": ("*", None, True, "untouched"),
 }
 
 
@@ -49,7 +51,7 @@ const void *adt_getprop(const void *tree, int node, const char *name, u32 *len)
 {
     const u32 *p = NULL;
     u32 n = 0;
-    if (node != 7 || (omit && !strcmp(name, omit)))
+    if (node != 7 || (omit && (!strcmp(omit, "*") || !strcmp(name, omit))))
         return NULL;
     if (!strcmp(name, "tunable_DRD_USB31_GBL_DEFAULT")) { p = gbl; n = sizeof(gbl); }
     if (!strcmp(name, "tunable_DRD_USB31_DBG_DEFAULT")) {
@@ -125,6 +127,13 @@ int main(void)
         cells(dt, usb1, "apple,tunable-dbg", want_dbg, 3) &&
         cells(dt, usb1, "apple,tunable-link", want_link, 3)) {
         printf("RESULT copied\n");
+        return 0;
+    }
+    const u32 stale[] = {0x99};
+    if (usb1 >= 0 && cells(dt, usb1, "apple,tunable-dbg", stale, 1) &&
+        !fdt_getprop(dt, usb1, "apple,tunable-gbl-default", NULL) &&
+        !fdt_getprop(dt, usb1, "apple,tunable-link", NULL)) {
+        printf("RESULT untouched\n");
         return 0;
     }
     for (size_t i = 0; usb1 >= 0 && i < ARRAY_SIZE(drd_default_tunables); i++)
