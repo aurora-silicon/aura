@@ -176,6 +176,11 @@ static void event(char c) { size_t n = strlen(events); if (n + 1 < sizeof(events
 static bool rtkit_sleep(rtkit_dev_t *r) { event(sleep_fails ? 'F' : 'S'); return !sleep_fails; }
 static void rtkit_stop(rtkit_dev_t *r) { event('X'); }
 static void asc_cpu_stop(asc_dev_t *a) { event('X'); }
+/* An empty receive mailbox (nothing stale to drop before the run bit), CPU in its reset state. */
+struct asc_message { u64 msg0; u32 msg1; };
+static void asc_i2a_enable(asc_dev_t *a, bool on) {}
+static bool asc_recv(asc_dev_t *a, struct asc_message *m) { return false; }
+static u32 asc_cpu_status(asc_dev_t *a) { return 0x6a; }
 static bool rtkit_quiesce(rtkit_dev_t *r) { assert(r); quiesces++; return true; }
 static void rtkit_free(rtkit_dev_t *r) {}
 static void pmgr_reset(u8 die, const char *name) { resets++; event('R'); }

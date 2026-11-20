@@ -498,11 +498,42 @@ static bool nvme_ans_power_off(void)
 }
 
 /* Post-M4, ANS off: power, the SART entries back, then the firmware's start after a power loss. */
+/*
+ * Discard what an earlier owner left in the receive mailbox before the run bit: the warm start's
+ * handshake would read it in place of the firmware's HELLO.
+ */
+static void nvme_ans_drain(void)
+{
+    struct asc_message msg;
+    u32 count = 0;
+
+    asc_i2a_enable(nvme_asc, true);
+    while (count < 256 && asc_recv(nvme_asc, &msg)) {
+        if (count < 4)
+            printf("nvme: stale ANS message: 0x%lx ep 0x%x\n", msg.msg0, msg.msg1);
+        count++;
+    }
+    if (count)
+        printf("nvme: discarded %u stale ANS message%s\n", count, count == 1 ? "" : "s");
+}
+
 static bool nvme_ans_power_on(void)
 {
-    if (pcie_ans_power_on() || !sart_set_entries(nvme_sart, nvme_sart_saved, nvme_sart_saved_cnt) ||
-        !rtkit_boot_warm(nvme_rtkit, BIT(0)) ||
-        poll32(nvme_base + NVME_BOOT_STATUS, 0xffffffff, NVME_BOOT_STATUS_OK, USEC_PER_SEC) < 0) {
+    bool ok = !pcie_ans_power_on();
+
+    if (!ok)
+        printf("nvme: couldn't power ANS on\n");
+    if (ok)
+        nvme_ans_drain();
+    if (ok && !(ok = sart_set_entries(nvme_sart, nvme_sart_saved, nvme_sart_saved_cnt)))
+        printf("nvme: couldn't restore the %d SART entries\n", nvme_sart_saved_cnt);
+    if (ok && !(ok = rtkit_boot_warm(nvme_rtkit, BIT(0))))
+        printf("nvme: no warm handshake (CPU status 0x%x)\n", asc_cpu_status(nvme_asc));
+    if (ok && !(ok = poll32(nvme_base + NVME_BOOT_STATUS, 0xffffffff, NVME_BOOT_STATUS_OK,
+                            USEC_PER_SEC) >= 0))
+        printf("nvme: BOOT_STATUS 0x%x after the handshake\n",
+               read32(nvme_base + NVME_BOOT_STATUS));
+    if (!ok) {
         printf("nvme: ANS didn't start from off; it stays down until a reboot\n");
         return false;
     }
