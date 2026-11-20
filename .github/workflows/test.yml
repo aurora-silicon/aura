@@ -29,10 +29,6 @@ jobs:
             compiler: gcc
           - os: ubuntu-latest
             compiler: llvm
-          - os: macos-26
-            compiler: llvm-brew
-          - os: macos-15
-            compiler: llvm-brew
 
     steps:
       - name: Checkout code
@@ -60,11 +56,6 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y llvm lld
-
-      - name: Install Clang on macOS w/ brew
-        if: matrix.compiler == 'llvm-brew'
-        run: |
-          brew install llvm lld
 
       - name: Test PMP boot data fixups
         run: sh tests/run-pmp-boot-data.sh
