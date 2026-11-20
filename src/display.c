@@ -819,6 +819,12 @@ static void display_swap_state(void)
 #undef SWAP
 }
 
+/* Whether aura ever started DCPEXT0 for the second display, successfully or not. */
+bool display_second_attempted(void)
+{
+    return display_other.cfg;
+}
+
 /* Configure the second display: bring it up on first use with its own
  * framebuffer, or modeset it later (the loader calls this by symbol). */
 int display_configure_second(const char *config)

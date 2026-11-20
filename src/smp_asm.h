@@ -3,9 +3,12 @@
 #ifndef __SMP_ASM_H__
 #define __SMP_ASM_H__
 
-#define MAX_CPUS     32
+/* Per-CPU tables are indexed by ADT cpu-id, which runs to 34 on T6050 Ultra (30 CPUs). */
+#define MAX_CPUS     64
 #define MAX_EL3_CPUS 4
 
+/* One per CPU present, not per cpu-id (smp.c) */
+#define SECONDARY_STACKS     32
 #define SECONDARY_STACK_SIZE 0x10000
 
 /*

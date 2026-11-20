@@ -1,0 +1,33 @@
+{
+  "SPDX-License-Identifier": "GPL-2.0-only OR MIT",
+  "source": "J773s (Mac16,11) ioreg -a -l -p IODeviceTree, macOS 26.6.2, posted in aurora-silicon/linux#1479 (gist eXsoR65/037e37dfe29f06f4eaf440d043ac0508, iodevicetree-redacted.plist)",
+  "source_sha256": "8dd70d63fdfa46b0c67879378be47f966bf9c7f812b97ebc7bd2e1848b41f487",
+  "description": "Factual hardware values the T6041 firmware-cache MCC path reads, reduced from the reporter-posted J773s IODeviceTree (attribution: eXsoR65, aurora-silicon/linux#1479); aperture reg entries translated by the arm-io ranges. No serials, UUIDs, ECID, MAC addresses, user names or live register values.",
+  "root_compatible": "J773sAP",
+  "board_id": 2,
+  "chip_id": "0x6040",
+  "mcc_compatible": "mcc,t6041",
+  "amcc_reg_idx": 12,
+  "amcc_count": 4,
+  "dcs_count_per_amcc": 4,
+  "lock_regs_plane_count": 4,
+  "lock_regs_plane_stride": "0x40000",
+  "apertures": [
+    {
+      "base": "0x220000000",
+      "size": "0x200000"
+    },
+    {
+      "base": "0x222000000",
+      "size": "0x200000"
+    },
+    {
+      "base": "0x224000000",
+      "size": "0x200000"
+    },
+    {
+      "base": "0x226000000",
+      "size": "0x200000"
+    }
+  ]
+}
