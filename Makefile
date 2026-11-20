@@ -95,7 +95,9 @@ CARGO_FLAGS :=
 endif
 
 # Bring-up: skip MMU, MCC, AIC, SMP, PMGR, display and USB init and go
-# straight to the proxy on the boot console.
+# straight to the proxy on the boot console. A BRINGUP build never hands
+# off to a kernel payload (secondary CPUs are not started and carveouts are
+# not unmapped): it prints why and stays in the proxy.
 ifeq ($(BRINGUP),1)
 CFG += BRINGUP
 endif
