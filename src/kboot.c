@@ -4339,8 +4339,17 @@ static int dt_device_dart_va_bits(int fdt_node, int adt_node, u32 *bits)
         return -1;
     ADT_FOREACH_CHILD(adt, node)
     {
+        /* iommu-parent names the DART or, as on the T8112 AOP, one of its mapper children */
         u32 ph;
-        if (ADT_GETPROP(adt, node, "AAPL,phandle", &ph) != sizeof(ph) || ph != parent)
+        bool match = ADT_GETPROP(adt, node, "AAPL,phandle", &ph) == sizeof(ph) && ph == parent;
+        int mapper = node;
+        ADT_FOREACH_CHILD(adt, mapper)
+        {
+            if (!match && ADT_GETPROP(adt, mapper, "AAPL,phandle", &ph) == sizeof(ph) &&
+                ph == parent)
+                match = true;
+        }
+        if (!match || !adt_is_compatible(adt, node, "dart,t8110"))
             continue;
 
         char path[64];
@@ -4401,6 +4410,9 @@ static int dt_reserve_asc_segments_at(int fdt_node, const char *adt_path, const 
     u32 va_bits = 0;
     bool have_window = dram_only && !dt_device_dart_va_bits(fdt_node, node, &va_bits);
     u64 win_end = have_window ? BIT(va_bits) : 0;
+    if (dram_only)
+        printf("FDT: %s: DART input range %s%u bits\n", fdt_path, have_window ? "" : "unknown, ",
+               va_bits);
 
     uint32_t dev_phandle = fdt_get_phandle(dt, fdt_node);
     if (!dev_phandle) {
