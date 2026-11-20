@@ -423,9 +423,24 @@ static bool smp_point_rvbar_here(void)
             continue;
         if (i != boot_cpu_idx && !smp_is_alive(i))
             continue;
-        if ((read64(cpu->impl_reg) & RVBAR_ADDR_UNLOCKED) != target)
-            write64(cpu->impl_reg, target);
         u64 rvbar = read64(cpu->impl_reg);
+        /*
+         * A core's own lock bit is set even where iBoot leaves the rest unlocked (a running
+         * boot core, as smp_start_secondaries() already allows). A store to a locked RVBAR
+         * takes an SError (T8122), so never write one: accept it only if it already resets
+         * into this image.
+         */
+        if (rvbar & RVBAR_LOCK) {
+            if (smp_rvbar_reaches_here(rvbar & RVBAR_ADDR_UNLOCKED))
+                continue;
+            snprintf(smp_s2r_why_buf, sizeof(smp_s2r_why_buf), "CPU %d RVBAR is locked at 0x%lx", i,
+                     rvbar & RVBAR_ADDR_UNLOCKED);
+            printf("SMP: %s\n", smp_s2r_why_buf);
+            return false;
+        }
+        if ((rvbar & RVBAR_ADDR_UNLOCKED) != target)
+            write64(cpu->impl_reg, target);
+        rvbar = read64(cpu->impl_reg);
         if ((rvbar & RVBAR_ADDR_UNLOCKED) != target) {
             snprintf(smp_s2r_why_buf, sizeof(smp_s2r_why_buf),
                      "CPU %d RVBAR reads 0x%lx after writing 0x%lx", i, rvbar, target);
@@ -561,9 +576,6 @@ void smp_secondary_entry(void)
         msr(TPIDR_EL2, index);
     else
         msr(TPIDR_EL1, index);
-
-    if (chip_id != T8142 && chip_id != T8152 && !smp_s2r_published())
-        printf("  Index: %d (table: %p)\n\n", index, me);
 
     me->mpidr = mpidr;
 
@@ -710,7 +722,8 @@ static int smp_start_cpu(int index, const struct cpu_info *cpu)
     if (i >= 100) {
         printf("Failed!\n");
     } else {
-        printf("  Started.\n");
+        sysop("dmb ld");
+        printf("  Started, MPIDR 0x%lx.\n", spin_table[index].mpidr);
     }
 
     _reset_stack = dummy_stack + DUMMY_STACK_SIZE;
@@ -1123,8 +1136,14 @@ int smp_start_secondaries(void)
     for (int i = 0; i < MAX_CPUS; i++) {
         struct cpu_info *cpu = &cpu_info[i];
 
+        /*
+         * A CPU is expected when the ADT lists it. iBoot removes the node of a core fused off on
+         * a binned part, so those never reach this loop. A listed core aura cannot describe
+         * (no reg, or no cpu-impl-reg and no /arm-io reg slot for it) cannot be started, and
+         * counts as missing on every chip.
+         */
         if (!cpu->valid) {
-            if (chip_id == T8140 && cpu_nodes[i]) {
+            if (cpu_nodes[i]) {
                 printf("SMP: ADT CPU %d has no valid implementation register\n", i);
                 failed = true;
             }
