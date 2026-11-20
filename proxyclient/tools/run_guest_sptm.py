@@ -48,6 +48,9 @@ Environment (all optional; 1 enables a switch):
   AURA_GPU_TRACE           hook the GPU (sgx reg 0) and PMP registers, record every access
   AURA_GPU_STOP_SECS=<n>   park in the proxy n s after the first GPU access (read the ring)
   AURA_GPU_STOP_MSG=<v>    park right after the guest writes v to the GPU (a mailbox message)
+  AURA_GPU_STOP_MSG_MASK=<m> compare only the bits in m (e.g. 0xffff000000000000 with
+                           AURA_GPU_STOP_MSG=0x0081000000000000: the first InitData doorbell)
+  AURA_GPU_STOP_EP=<ep>    and only a mailbox message to endpoint ep (e.g. 0x20)
   AURA_GPU_PRINT_MAX=<n>   print at most n GPU accesses on aura's console (default 20000)
   AURA_SAMPLE              sample the guest's PC until each core's XNU entry (pre-XNU hangs)
   AURA_SAMPLE_HZ=<n>       samples per second (default 4)
@@ -155,6 +158,8 @@ KNOWN_ENV = {
     "AURA_GPU_STOP_SECS",
     "AURA_GPU_STOP_BOOT_SECS",
     "AURA_GPU_STOP_MSG",
+    "AURA_GPU_STOP_MSG_MASK",
+    "AURA_GPU_STOP_EP",
     "AURA_GPU_PRINT_MAX",
     "AURA_SAMPLE_HZ",
     "AURA_SAMPLE_MAX",
@@ -740,6 +745,10 @@ def configure(p, sym, plan, adt, ctl_cookie=0):
         p.write32(sym["sptm_virt_gpu_stop_boot_secs"], env_int("AURA_GPU_STOP_BOOT_SECS"))
     if os.environ.get("AURA_GPU_STOP_MSG"):
         p.write64(sym["sptm_virt_gpu_stop_msg"], env_int("AURA_GPU_STOP_MSG"))
+    if os.environ.get("AURA_GPU_STOP_MSG_MASK"):
+        p.write64(sym["sptm_virt_gpu_stop_msg_mask"], env_int("AURA_GPU_STOP_MSG_MASK"))
+    if os.environ.get("AURA_GPU_STOP_EP"):
+        p.write32(sym["sptm_virt_gpu_stop_ep"], env_int("AURA_GPU_STOP_EP") + 1)
     if os.environ.get("AURA_GPU_PRINT_MAX"):
         p.write32(sym["sptm_virt_gpu_print_max"], env_int("AURA_GPU_PRINT_MAX"))
     if env_on("AURA_S2R_DCP_PKT"):
