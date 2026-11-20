@@ -68,6 +68,15 @@ Environment (all optional; 1 enables a switch):
   AURA_GPU_MBOX=<n>        log n GPU-ASC mailbox messages, both ways, from the first such write
   AURA_GPU_MBOX_STOP=<msg>,<mask>,<ep>[,<after>]  and end the log at the after+1-th message to
                            the GPU that matches (the first work submission)
+  AURA_GFXPMP=<ms>         the GPU/PMP record: from the write AURA_GPU_STOP_MSG names, which then
+                           doesn't park, ms of every gfx-asc and pmp-asc mailbox message both ways,
+                           sgx +0xd60000..+0xd60067, +0x1000104, +0x1000108 writes and the GFX PS
+                           word's writes; the MMIO ring stops at its end (aura/hvgfxrec.py reads both
+                           at a park). Needs AURA_GPU_TRACE; refuses anything that parks the guest
+  AURA_GFXPMP_MAX=<n>      its records (default 262144, 32 bytes each)
+  AURA_GFXPMP_BLK=<pa>,<len>  the block whose every access (SPTM's and XNU's, from the first trap
+                           to the window's end) the record keeps apart (default sgx +0xe00000,
+                           0x4000: MMIO_PROTECTED); AURA_GFXPMP_BLK_MAX=<n> its records (131072)
   AURA_SAMPLE              sample the guest's PC until each core's XNU entry (pre-XNU hangs)
   AURA_SAMPLE_HZ=<n>       samples per second (default 4)
   AURA_SAMPLE_MAX=<n>      stop printing after n samples (default 64)
@@ -194,6 +203,10 @@ KNOWN_ENV = {
     "AURA_GPU_SNAP_WATCH",
     "AURA_GPU_MBOX",
     "AURA_GPU_MBOX_STOP",
+    "AURA_GFXPMP",
+    "AURA_GFXPMP_MAX",
+    "AURA_GFXPMP_BLK",
+    "AURA_GFXPMP_BLK_MAX",
     "AURA_SAMPLE_HZ",
     "AURA_SAMPLE_MAX",
     "AURA_XNU_ENTRY",
@@ -875,6 +888,13 @@ def configure(p, sym, plan, adt, ctl_cookie=0):
         hvsnap.configure(p, sym, os.environ)
     except ValueError as e:
         raise SystemExit(f"AURA_GPU_SNAP_*: {e}")
+    from aura import hvgfxrec
+
+    hvgfxrec.configure(p, sym, os.environ)
+    if os.environ.get("AURA_GFXPMP"):
+        p.write32(sym["sptm_virt_gpu_msg_park"], 0)
+        print(f"GPU/PMP record: {os.environ['AURA_GFXPMP']} ms from the named write, which doesn't "
+              f"park")
     if env_on("AURA_S2R_DCP_PKT"):
         p.write32(sym["sptm_virt_s2r_dcp_pkt"], 1)
         print("coprocessor trace: DCP IOMFB packets copied into the ring")
@@ -986,6 +1006,11 @@ def main():
     unknown = sorted(k for k in os.environ if k.startswith("AURA_") and k not in KNOWN_ENV)
     if unknown:
         print("not run_guest_sptm.py switches, ignored:", " ".join(unknown))
+    from aura import hvgfxrec
+
+    refused = hvgfxrec.check_env(os.environ)
+    if refused:
+        raise SystemExit(f"refused before anything was sent: {refused}")
 
     from aura import sptm_patch, sptm_virt_plan as plan_mod
     from aura.proxy import AuraProxy, UartInterface
