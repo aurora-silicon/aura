@@ -21,12 +21,19 @@
  * A property the group does not have (or one without a row for every amp) is
  * removed from its amps, so the kernel never sees a value that did not come from this Mac. Amps
  * are matched to the DT's ti,sn012776 nodes by I2C address, which must name exactly one node. A
- * group with an amp that cannot be matched is left as it is: the kernel gets either the whole
- * group's configuration or none of it. Nothing here stops the boot.
+ * group with an amp that cannot be matched is left as it is. Nothing here stops the boot.
+ *
+ * kboot_audio_amp_config() writes straight into the tree, one property on one amp at a time. If
+ * the tree runs out of room partway through a group (the only write that can fail once the amps
+ * are matched), the amps already written keep the new values and the rest keep the tree's.
+ * kboot_audio_amp_config_staged() (T8152) does the same work for each group on a copy of the
+ * tree and writes the copy back only when every property of every amp of the group was set, so
+ * the kernel gets either the whole group's configuration or none of it.
  */
 
 #include "kboot_audio.h"
 #include "adt.h"
+#include "malloc.h"
 #include "string.h"
 #include "types.h"
 #include "utils.h"
@@ -207,7 +214,30 @@ static int setup_amp_group(void *dt, const void *adt, int arm_io, int group)
     return 0;
 }
 
-int kboot_audio_amp_config(void *dt, const void *adt)
+/*
+ * setup_amp_group() on a copy of the tree: the copy replaces the tree only when the whole group
+ * was set, so a write that fails partway (no room left) leaves every amp as the tree gave it.
+ */
+static int setup_amp_group_staged(void *dt, const void *adt, int arm_io, int group)
+{
+    size_t size = fdt_totalsize(dt);
+    void *scratch = malloc(size);
+    int ret;
+
+    if (!scratch) {
+        printf("kboot: audio: %s: no memory for a copy of the tree, group left alone\n",
+               adt_get_name(adt, group));
+        return -1;
+    }
+    memcpy(scratch, dt, size);
+    ret = setup_amp_group(scratch, adt, arm_io, group);
+    if (!ret)
+        memcpy(dt, scratch, size);
+    free(scratch);
+    return ret;
+}
+
+static int amp_config(void *dt, const void *adt, bool staged)
 {
     int arm_io = adt_path_offset(adt, "/arm-io");
     int bus = arm_io;
@@ -230,10 +260,23 @@ int kboot_audio_amp_config(void *dt, const void *adt)
                 !adt_getprop(adt, dev, "speaker-config", NULL) &&
                 !adt_getprop(adt, dev, "amp-tx-zd-config", NULL))
                 continue;
-            setup_amp_group(dt, adt, arm_io, dev);
+            if (staged)
+                setup_amp_group_staged(dt, adt, arm_io, dev);
+            else
+                setup_amp_group(dt, adt, arm_io, dev);
         }
     }
     return 0;
+}
+
+int kboot_audio_amp_config(void *dt, const void *adt)
+{
+    return amp_config(dt, adt, false);
+}
+
+int kboot_audio_amp_config_staged(void *dt, const void *adt)
+{
+    return amp_config(dt, adt, true);
 }
 
 /*

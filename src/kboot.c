@@ -80,6 +80,7 @@ extern const char *const aura_version;
 extern u64 relocated_from;
 
 int dt_set_gpu(void *dt);
+int dt_set_gpu_perf_states_t8152(void *dt);
 int dt_set_display_handoff(void *dt);
 
 u64 kboot_ram_base(void)
@@ -11382,6 +11383,94 @@ static int dt_set_display_t8152(void)
     return 0;
 }
 
+/*
+ * T8152 PMP: this Mac's PMP values (board-id, dram-vendor-id, dram-capacity and every
+ * iop-pmp-nub tunable), copied from the ADT onto the J804 tree's pmp node by dt_fill_pmp(), as
+ * dt_pass_pmp() does for T6030 and T8122. Values only: the node's status is the tree's (or its
+ * overlay's) to set, never this loader's. All or nothing: a refused copy leaves the node exactly
+ * as the tree gave it, logs why, and the boot goes on.
+ */
+#define T8152_PMP_PATH "/soc/pmp@300500000"
+
+static int dt_set_pmp_t8152_one(unsigned int unused)
+{
+    int node = fdt_path_offset(dt, T8152_PMP_PATH);
+
+    UNUSED(unused);
+    if (node < 0)
+        return -1;
+    return dt_fill_pmp(node);
+}
+
+static void dt_set_pmp_t8152(void)
+{
+    int node = fdt_path_offset(dt, T8152_PMP_PATH);
+
+    if (node < 0 || fdt_node_check_compatible(dt, node, "apple,t8152-pmp-v2"))
+        return;
+    if (dt_display_transaction(dt_set_pmp_t8152_one, 0))
+        printf("FDT: T8152 PMP values not copied from the ADT; %s left as it was\n",
+               T8152_PMP_PATH);
+    else
+        printf("FDT: T8152 PMP values copied from the ADT to %s\n", T8152_PMP_PATH);
+}
+
+/*
+ * J804 camera: two ADT values the kernel's ISP driver reads from its node.
+ *
+ *   apple,lpdprx-cfg-fuses = <fuse76 fuse532 fuse549>   /arm-io/isp lpdprx_cfg_fuse76,
+ *                                                       lpdprx_cfg_fuse532, lpdprx_cfg_fuse549
+ *   apple,cil-config = <u32>                            /arm-io/eic cil-gpio-config
+ *
+ * Each ADT value must be exactly a u32; the three receiver words are written together or not at
+ * all. A missing or odd value leaves that DT property as the tree gave it and is logged. Never
+ * fatal, and the node's status is not touched.
+ */
+static void dt_set_isp_adt_t8152(void)
+{
+    static const char *const fuses[] = {"lpdprx_cfg_fuse76", "lpdprx_cfg_fuse532",
+                                        "lpdprx_cfg_fuse549"};
+    fdt32_t cells[ARRAY_SIZE(fuses)];
+    u32 value;
+    int isp, anode;
+
+    if (fdt_node_check_compatible(dt, 0, "apple,j804"))
+        return;
+    isp = fdt_node_offset_by_compatible(dt, -1, "apple,t8152-isp");
+    if (isp < 0)
+        return;
+
+    anode = adt_path_offset(adt, "/arm-io/isp");
+    for (size_t i = 0; i < ARRAY_SIZE(fuses); i++) {
+        if (anode < 0 || adt_get_u32_exact(anode, fuses[i], &value)) {
+            printf("FDT: J804 ISP: ADT %s is missing or not a u32; "
+                   "apple,lpdprx-cfg-fuses not copied\n",
+                   fuses[i]);
+            anode = -1;
+            break;
+        }
+        cells[i] = cpu_to_fdt32(value);
+    }
+    if (anode >= 0) {
+        if (fdt_setprop(dt, isp, "apple,lpdprx-cfg-fuses", cells, sizeof(cells)))
+            printf("FDT: J804 ISP: apple,lpdprx-cfg-fuses could not be set\n");
+        else
+            printf("FDT: J804 ISP: receiver calibration copied from the ADT\n");
+    }
+
+    anode = adt_path_offset(adt, "/arm-io/eic");
+    if (anode < 0 || adt_get_u32_exact(anode, "cil-gpio-config", &value)) {
+        printf("FDT: J804 ISP: ADT eic cil-gpio-config is missing or not a u32; "
+               "apple,cil-config not copied\n");
+        return;
+    }
+    isp = fdt_node_offset_by_compatible(dt, -1, "apple,t8152-isp");
+    if (isp < 0 || fdt_setprop_u32(dt, isp, "apple,cil-config", value))
+        printf("FDT: J804 ISP: apple,cil-config could not be set\n");
+    else
+        printf("FDT: J804 ISP: CIL configuration copied from the ADT\n");
+}
+
 static int dt_prepare_t8152(void)
 {
     if (fdt_getprop(dt, 0, "aurora,minimal-boot", NULL)) {
@@ -11392,6 +11481,17 @@ static int dt_prepare_t8152(void)
         if (dt_set_serial_number() || dt_set_display_t8152() || dt_set_gpu(dt))
             return -1;
     }
+    /*
+     * This Mac's own values for what the kernel reads from the DT, ADT to FDT only, on every
+     * T8152 boot path. Each one fails soft and is logged: a missing or odd ADT value leaves
+     * the tree's property as it was (the amp copy, as on every other chip, removes one the ADT's
+     * amp group does not have). The amp copy is staged per group: all of a group's amps get
+     * their values or none does. No node's status changes.
+     */
+    kboot_audio_amp_config_staged(dt, adt);
+    dt_set_pmp_t8152();
+    dt_set_isp_adt_t8152();
+    dt_set_gpu_perf_states_t8152(dt);
     if (dt_set_cpus())
         return -1;
     if (dt_set_mac_addresses())
@@ -11539,6 +11639,10 @@ int kboot_prepare_dt(void *fdt)
         dt_bufsize += SZ_16K;
     // A T6040 takes its PMP values (about 38K) and its firmware handoffs
     if (chip_id == T6040)
+        dt_bufsize += 4 * SZ_16K;
+    // A T8152 takes its PMP values (about 35K on J804, most replacing the tree's own), its amp,
+    // camera and GPU performance-state values
+    if (chip_id == T8152)
         dt_bufsize += 4 * SZ_16K;
     dt = memalign(DT_ALIGN, dt_bufsize);
 
