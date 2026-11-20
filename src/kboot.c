@@ -8455,6 +8455,35 @@ static bool skip_pmp_prop(const char *prop_name)
     return false;
 }
 
+/* The high bit of the ADT property size is a flag. */
+static u32 pmp_prop_size(const struct adt_property *prop)
+{
+    return prop->size & 0x7fffffff;
+}
+
+/*
+ * Bytes dt_set_pmp() adds to the device tree: one "apple,tunable-<name>" property per PMP tunable,
+ * each with its FDT property header, its value padded to four bytes and its name in the strings.
+ * A T6020 has 81 of them, about 16K, which the 96K of headroom does not hold once the rest of
+ * kboot_prepare_dt() has used it.
+ */
+static u32 pmp_tunables_size(void)
+{
+    int pmp_iop_anode = adt_path_offset(adt, "/arm-io/pmp/iop-pmp-nub");
+    u32 need = 0;
+
+    if (pmp_iop_anode < 0)
+        return 0;
+    ADT_FOREACH_PROPERTY(adt, pmp_iop_anode, prop)
+    {
+        if (skip_pmp_prop(prop->name))
+            continue;
+        need += sizeof(struct fdt_property) + ALIGN_UP(pmp_prop_size(prop), 4) +
+                strlen("apple,tunable-") + strlen(prop->name) + 1;
+    }
+    return need;
+}
+
 /* Reads a u32 ADT property only if it is exactly four bytes long. */
 static int adt_get_u32_exact(int node, const char *name, u32 *val)
 {
@@ -8549,6 +8578,20 @@ static int dt_set_pmp(void)
         bail("ADT: failed to get dram vendor id\n");
     ADT_GETPROP(adt, pmp_iop_anode, "dram-capacity", &dram_capacity);
 
+    /*
+     * Copy the tunables only if they fit with room left for what runs after this: a copy that
+     * stops half way leaves a PMP node with some of its tunables, and a bail() here ends the boot.
+     * Without the copy the node keeps its status from the device tree (disabled), so the Mac boots
+     * without the PMP and says why.
+     */
+    u32 need = pmp_tunables_size();
+    u32 free_space = fdt_totalsize(dt) - fdt_off_dt_strings(dt) - fdt_size_dt_strings(dt);
+    if (need + SZ_16K > free_space) {
+        printf("FDT: pmp left disabled: its tunables need %u bytes, %u free (raise the headroom)\n",
+               need, free_space);
+        return 0;
+    }
+
     if (fdt_setprop_u32(dt, pmp_node, "apple,board-id", board_id))
         bail("FDT: failed to set board id\n");
     if (fdt_setprop_u32(dt, pmp_node, "apple,dram-vendor-id", dram_vendor_id))
@@ -8563,7 +8606,7 @@ static int dt_set_pmp(void)
             continue;
         char prop_name[128];
         snprintf(prop_name, sizeof(prop_name), "apple,tunable-%s", prop->name);
-        if (fdt_setprop(dt, pmp_node, prop_name, prop->value, prop->size))
+        if (fdt_setprop(dt, pmp_node, prop_name, prop->value, pmp_prop_size(prop)))
             bail("FDT: failed to transfer pmp tunable");
     }
 
@@ -11521,7 +11564,10 @@ int kboot_prepare_dt(void *fdt)
     assert(dt_bufsize);
 
     dt_bufsize += 6 * SZ_16K; // Add 96K of buffer for modifications
-    dt_bufsize += SZ_16K;     // and the SMBIOS description U-Boot builds its tables from (about 6K)
+    // A device tree with a pmp alias takes the PMP tunables (about 16K on a T6020)
+    if (fdt_path_offset(fdt, "pmp") >= 0)
+        dt_bufsize += ALIGN_UP(pmp_tunables_size(), SZ_16K) + SZ_16K;
+    dt_bufsize += SZ_16K; // and the SMBIOS description U-Boot builds its tables from (about 6K)
     // A T6030 or T8122 also takes its PMP values
     if (chip_id == T6030 || chip_id == T8122)
         dt_bufsize += 2 * SZ_16K;
