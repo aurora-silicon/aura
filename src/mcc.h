@@ -13,6 +13,9 @@ struct mcc_carveout {
 extern size_t mcc_carveout_count;
 extern struct mcc_carveout mcc_carveouts[];
 
+/* mcc_init() result for an MCC revision with no driver here (not an error). */
+#define MCC_UNSUPPORTED 1
+
 int mcc_init(void);
 int mcc_unmap_carveouts(void);
 int mcc_enable_cache(void);

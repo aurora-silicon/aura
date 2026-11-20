@@ -78,6 +78,20 @@ static u32 chip_id = T8132;
 static int fault;
 static unsigned char blob[16384], original[16384];
 ''' + layout + r'''
+#define J713_ISP_DAPF_SLICES 16
+#define J713_ISP_DAPF_CTRL0 0x31
+#define J713_ISP_DAPF_CTRL1 0
+#define J713_ISP_DAPF_SIDMASK 0x1
+/* Two of the J713 ISP DART's address filter windows; dapf_t8132_ranges has its own test. */
+static const u64 isp_dapf[] = {0x380704000UL, 0x380704063UL, 0x382824000UL, 0x382824004UL};
+static int dapf_t8132_ranges(const char *path, u32 r0, u32 r4, u32 r20, u64 *ranges, int max)
+{
+    assert(!strcmp(path, "/arm-io/dart-isp"));
+    assert(r0 == 0x31 && r4 == 0 && r20 == 1 && max == J713_ISP_DAPF_SLICES);
+    if (fault == 13) return -1;
+    memcpy(ranges, isp_dapf, sizeof(isp_dapf));
+    return 2;
+}
 static struct adt_segment_ranges segments[2];
 static u64 dram_base, dram_size;
 static u32 sensor;
@@ -177,6 +191,11 @@ int main(void)
     const fdt32_t *id = fdt_getprop(dt, fdt_path_offset(dt, "/soc/isp@48c000000"),
                                     "apple,platform-id", &len);
     assert(id && len == 4 && fdt32_ld(id) == 0x17);
+    const fdt64_t *dapf = fdt_getprop(dt, fdt_path_offset(dt, "/soc/isp@48c000000"),
+                                      "apple,dapf-ranges", &len);
+    assert(dapf && len == sizeof(isp_dapf));
+    for (int i = 0; i < 4; i++)
+        assert(fdt64_ld(dapf + i) == isp_dapf[i]);
     assert(!strcmp(status("/soc/isp@48c000000"), "okay"));
     for (int i = 0; i < 3; i++)
         assert(!strcmp(status(darts[i]), "okay"));
@@ -215,6 +234,30 @@ int main(void)
         dt_set_j713_isp();
         assert(!memcmp(original, blob, sizeof(blob)));
         assert(!strcmp(status("/soc/isp@48c000000"), "disabled"));
+    }
+
+    /*
+     * No usable address filter: the ISP is still handed over in full, only without
+     * apple,dapf-ranges, and a filter already in the tree (not this boot's) is dropped.
+     */
+    for (int stale = 0; stale < 2; stale++) {
+        fault = 13;
+        world(DTB_PATH);
+        if (stale)
+            assert(!fdt_setprop(dt, fdt_path_offset(dt, "/soc/isp@48c000000"), "apple,dapf-ranges",
+                                isp_dapf, sizeof(isp_dapf)));
+        dt_set_j713_isp();
+        check_region("/reserved-memory/isp-firmware-text", 0x10000d30000ULL, 0x10000000000ULL,
+                     0xca4000);
+        check_region("/reserved-memory/isp-firmware-data", 0x10001f40000ULL, 0x10000ca4000ULL,
+                     0x748000);
+        id = fdt_getprop(dt, fdt_path_offset(dt, "/soc/isp@48c000000"), "apple,platform-id", &len);
+        assert(id && len == 4 && fdt32_ld(id) == 0x17);
+        assert(!fdt_getprop(dt, fdt_path_offset(dt, "/soc/isp@48c000000"), "apple,dapf-ranges",
+                            NULL));
+        assert(!strcmp(status("/soc/isp@48c000000"), "okay"));
+        for (int i = 0; i < 3; i++)
+            assert(!strcmp(status(darts[i]), "okay"));
     }
 
     /* Trees that are not handoff targets are left alone: an enabled ISP (a kernel that
