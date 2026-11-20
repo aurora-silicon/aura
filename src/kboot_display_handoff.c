@@ -4221,8 +4221,7 @@ int dt_set_j713_dcpext_handoff(void *dt)
             continue;
         }
         if (!dcp6_commit(dt, scratch))
-            dlog("%s firmware memory and clocks published for 27.2 (USB-C displays)\n",
-                 ext->name);
+            dlog("%s firmware memory and clocks published for 27.2 (USB-C displays)\n", ext->name);
     }
     return 0;
 }
