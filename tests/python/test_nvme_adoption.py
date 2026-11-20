@@ -224,8 +224,11 @@ int main(int argc, char **argv)
          * 35 (T6040): an adopted live session is handed on live, and the SART entries this stage
          * reports never say "off" for it, even with stale entries from an earlier power-off
          * (J713: nvme.sart= beside a live session faulted the next stage's ANS power-on).
+         * 36 (T6040): as 35, asked before the handoff, the way chainload_load() builds nvme.sart=
+         * after nvme_init() and before nvme_shutdown(): no entries and not "off" there either.
          */
-        bool t6040 = failure == 35;
+        bool t6040 = failure == 35 || failure == 36;
+        bool asked_before = failure == 36;
         chip_id = t6040 ? T6040 : T8132;
         model_power = true;
         bool arrived_off = failure == 33;
@@ -245,6 +248,12 @@ int main(int argc, char **argv)
             assert(boots == 0 && ans_offs == 1 && warm_boots == 1 && !cpu_off);
         if (t6040)
             nvme_sart_saved_cnt = 1;
+        if (asked_before) {
+            struct sart_entry e[4];
+            bool off = true;
+            assert(nvme_sart_entries(e, 4, &off) == 0 && !off);
+            assert(nvme_sart_var() == NULL);
+        }
         assert(nvme_shutdown());
         assert(!nvme_initialized && !nvme_reboot_required);
         if (t6040) {
@@ -425,5 +434,5 @@ int main(int argc, char **argv)
          "-Wno-unused-variable", "-Wno-format", "-x", "c", "-", "-o", str(binary)],
         input=harness, text=True, check=True,
     )
-    for failure in range(36):
+    for failure in range(37):
         subprocess.run([str(binary), str(failure)], check=True)
