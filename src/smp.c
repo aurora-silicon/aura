@@ -1138,8 +1138,14 @@ int smp_start_secondaries(void)
     for (int i = 0; i < MAX_CPUS; i++) {
         struct cpu_info *cpu = &cpu_info[i];
 
+        /*
+         * A CPU is expected when the ADT lists it. iBoot removes the node of a core fused off on
+         * a binned part, so those never reach this loop. A listed core aura cannot describe
+         * (no reg, or no cpu-impl-reg and no /arm-io reg slot for it) cannot be started, and
+         * counts as missing on every chip.
+         */
         if (!cpu->valid) {
-            if (chip_id == T8140 && cpu_nodes[i]) {
+            if (cpu_nodes[i]) {
                 printf("SMP: ADT CPU %d has no valid implementation register\n", i);
                 failed = true;
             }
