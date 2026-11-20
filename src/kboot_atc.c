@@ -1128,7 +1128,7 @@ static void t6040_export_usb2_device_tunables(void *dt)
 
     for (int port = 0; port < 3; port++) {
         char path[24];
-        int trace[8] = {0}, len, n = 0;
+        int trace[8] = {0}, len;
         int phy = fdt_path_offset(dt, j614s_phys[port]);
 
         snprintf(path, sizeof(path), "/arm-io/atc-phy%d", port);
@@ -1157,29 +1157,40 @@ static void t6040_export_usb2_device_tunables(void *dt)
             continue;
         }
 
-        for (size_t i = 0; i < ARRAY_SIZE(names); i++) {
+        /* Check both lists before touching the node: replace the pair, or leave it alone. */
+        const char *missing = NULL, *invalid = NULL;
+        for (size_t i = 0; i < ARRAY_SIZE(names) && !missing && !invalid; i++) {
             u32 plen;
-            int ret = fdt_delprop(dt, phy, names[i][1]);
-            if (ret && ret != -FDT_ERR_NOTFOUND) {
-                n = -1;
-                break;
-            }
-            if (!adt_getprop(adt, src, names[i][0], &plen) || !plen)
-                continue;
-            struct adt_tunable_info info = {names[i][0], names[i][1], 0, size, true};
-            if (dt_append_atc_tunable(dt, src, phy, &info)) {
-                for (size_t j = 0; j < ARRAY_SIZE(names); j++)
-                    fdt_delprop(dt, phy, names[j][1]);
-                n = -1;
-                break;
-            }
-            n++;
+            const struct atc_tunable *list = adt_getprop(adt, src, names[i][0], &plen);
+            if (!list || !plen)
+                missing = names[i][0];
+            else if (plen % sizeof(*list))
+                invalid = names[i][0];
+            for (u32 j = 0; !missing && !invalid && j < plen / sizeof(*list); j++)
+                if (list[j].size != 32 || list[j].offset % 4 || (u64)list[j].offset + 4 > size)
+                    invalid = names[i][0];
         }
-        printf("FDT: T6040 ATC%d USB2 device tunables: %s\n", port,
-               n < 0    ? "invalid, none exported"
-               : n == 2 ? "default + device"
-               : n      ? "partial"
-                        : "none");
+        if (missing || invalid) {
+            printf("FDT: T6040 ATC%d: %s %s, USB2 device tunables left as in the DT\n", port,
+                   missing ? "no" : "invalid", missing ? missing : invalid);
+            continue;
+        }
+
+        int ret = 0;
+        for (size_t i = 0; i < ARRAY_SIZE(names) && !ret; i++) {
+            struct adt_tunable_info info = {names[i][0], names[i][1], 0, size, true};
+            ret = fdt_delprop(dt, phy, names[i][1]);
+            if (!ret || ret == -FDT_ERR_NOTFOUND)
+                ret = dt_append_atc_tunable(dt, src, phy, &info);
+        }
+        if (ret) {
+            /* Only an FDT write can fail here; never leave half a pair behind. */
+            for (size_t i = 0; i < ARRAY_SIZE(names); i++)
+                fdt_delprop(dt, phy, names[i][1]);
+            printf("FDT: T6040 ATC%d: FDT write failed, no USB2 device tunables\n", port);
+            continue;
+        }
+        printf("FDT: T6040 ATC%d USB2 device tunables: default + device\n", port);
     }
 }
 
@@ -1342,8 +1353,7 @@ int kboot_setup_atc(void *dt)
         free(scratch);
         return 0;
     }
-    if (chip_id == T6040)
-        t6040_export_usb2_device_tunables(dt);
+    t6040_export_usb2_device_tunables(dt);
 
     for (int i = 0; i < MAX_ATC_DEVS; ++i) {
         memset(adt_path, 0, sizeof(adt_path));
