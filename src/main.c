@@ -413,7 +413,8 @@ void aura_main(void)
 #ifndef BRINGUP
     if (supports_gxf())
         gxf_init();
-    if (mcc_init() && (chip_id == T8140 || chip_id == T6040))
+    /* A known MCC that fails to initialize is fatal on every chip; an unknown revision is not. */
+    if (mcc_init() < 0)
         panic("MCC initialization failed\n");
     mmu_init();
     aic_init();
@@ -458,9 +459,14 @@ void aura_main(void)
 #if defined(CHAINLOADING) && !defined(ESP_STAGE2)
     stage1_read_boot_record();
 #endif
-    /* T6040, T8140, T6050: nothing else in an aura chain clears iBoot's failed-boot count. */
-    if (chip_id == T6040 || chip_id == T8140 || chip_id == T6050)
-        pmu_clear_panic_counter();
+    /*
+     * Nothing else in an aura chain clears iBoot's failed-boot count, on any chip: a test kernel
+     * that hangs, or a proxy session that ends in a reset, counts as a failed boot, and enough of
+     * them end in recoveryOS. The primary PMU's info-leg_scrpad in the ADT locates the count on
+     * every SoC; one without it is left alone, and the Stage 1 recovery window has already read
+     * the record.
+     */
+    pmu_clear_panic_counter();
 
     printf("Initialization complete.\n");
 

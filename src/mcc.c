@@ -267,8 +267,15 @@ int mcc_unmap_carveouts(void)
         static const char *const names[] = {"region-id-4", "region-id-2"};
         int node = adt_path_offset(adt, "/chosen/carveout-memory-map");
 
-        if (node < 0)
+        /*
+         * No TZ registers and no ADT list: aura cannot tell where the firmware-owned TZ memory is,
+         * so it cannot keep it out of its own RWX map. Every Apple Silicon Mac ADT carries this
+         * node (iBoot fills in region-id-2/-4 at boot), so its absence is a failure.
+         */
+        if (node < 0) {
+            printf("MMU: no MCC TZ registers and no ADT carveout-memory-map\n");
             return -1;
+        }
         if (mem_size_actual > UINT64_MAX - ram_base)
             return -1;
         for (size_t i = 0; i < ARRAY_SIZE(names); i++) {
@@ -276,15 +283,20 @@ int mcc_unmap_carveouts(void)
             const u64 *range = adt_getprop(adt, node, names[i], &len);
             u64 start, size;
 
-            if (!range || len != 2 * sizeof(u64))
+            if (!range || len != 2 * sizeof(u64)) {
+                printf("MMU: ADT carveout-memory-map has no usable %s\n", names[i]);
                 return -1;
+            }
             memcpy(&start, range, sizeof(start));
             memcpy(&size, range + 1, sizeof(size));
             if (!size || start < ram_base || start > UINT64_MAX - size ||
                 start + size > ram_base + mem_size_actual ||
                 ((start | size) & (get_page_size() - 1)) ||
-                mcc_carveout_count >= ARRAY_SIZE(mcc_carveouts) - 1)
+                mcc_carveout_count >= ARRAY_SIZE(mcc_carveouts) - 1) {
+                printf("MMU: ADT %s 0x%lx+0x%lx is outside RAM or unaligned\n", names[i], start,
+                       size);
                 return -1;
+            }
 
             printf("MMU: Unmapping %s at 0x%lx..0x%lx\n", names[i], start, start + size);
             mmu_rm_mapping(start, size);
@@ -764,7 +776,12 @@ int mcc_init(void)
     } else if (adt_is_compatible(adt, node, "mcc,t6031")) {
         return mcc_init_m3(node, path);
     } else {
+        /*
+         * An MCC revision aura has no driver for: no cache control and no TZ registers. This is
+         * not a failure of a known block; carveouts then come from the ADT list, which
+         * mcc_unmap_carveouts() requires.
+         */
         printf("MCC: Unsupported version:%s\n", adt_get_property(adt, node, "compatible")->value);
-        return -1;
+        return MCC_UNSUPPORTED;
     }
 }
