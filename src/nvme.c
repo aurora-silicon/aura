@@ -173,6 +173,12 @@ bool nvme_quiesce_for_next = false;
 static u8 nvme_die;
 /* When this stage started the ANS firmware, for the shutdown timing line. */
 static u64 nvme_boot_ticks;
+/*
+ * Post-M4: this stage started the session from off (an earlier stage powered ANS off and passed
+ * its SART entries, or this stage cycled a session it found), rather than taking iBoot's session
+ * or adopting a live one. Such a session goes on powered off, as it came (nvme_shutdown()).
+ */
+static bool nvme_session_from_off;
 
 static asc_dev_t *nvme_asc = NULL;
 static rtkit_dev_t *nvme_rtkit = NULL;
@@ -576,6 +582,7 @@ bool nvme_init(void)
     nvme_prp_list = NULL;
     nvme_verify_bounce = NULL;
     nvme_boot_ticks = 0;
+    nvme_session_from_off = false;
 
     bool from_off = false, earlier = false, adopted = false, restarted = false;
     int adt_path[8];
@@ -827,6 +834,7 @@ setup_controller:
         write64_lo_hi(nvme_qreg(NVME_IOQ_CMDS), (u64)ioq.cmds);
     }
 
+    nvme_session_from_off = from_off;
     nvme_initialized = true;
     printf("nvme: initialized at 0x%lx\n", nvme_base);
     return true;
@@ -998,8 +1006,16 @@ bool nvme_shutdown(void)
      * next nvme_init() and reads correctly (J614c, 3/3 cycles). T8132 is handed on the same way
      * (J713). Hand it on with the controller enabled and RTKit untouched; only the I/O queue
      * registers are cleared. A next stage that asks for a quiesced ANS still gets one.
+     *
+     * Only a session that came to this stage running, iBoot's or one an earlier stage handed on
+     * live, goes on live. One this stage started from off goes on as it came, powered off with
+     * its SART entries passed on: the earlier stage chose that, and the firmware has just shown
+     * it starts from off. On a J713, a 1.0.0b13 Stage 1 (ANS off, nvme.sart=) followed by a
+     * Stage 1 that handed its from-off session on live reset the Mac at the handoff, whichever
+     * Stage 2 came next.
      */
-    if (nvme_type == NVME_T8132 && nvme_post_m4_keeps_live() && !nvme_quiesce_for_next) {
+    if (nvme_type == NVME_T8132 && nvme_post_m4_keeps_live() && !nvme_quiesce_for_next &&
+        !nvme_session_from_off) {
         write64_lo_hi(nvme_qreg(NVME_IOQ_CMDS), 0);
         write64_lo_hi(nvme_qreg(NVME_IOQ_CQES), 0);
         nvme_initialized = false;

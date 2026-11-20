@@ -208,6 +208,45 @@ int main(int argc, char **argv)
 {
     assert(argc == 2);
     failure = atoi(argv[1]);
+    if (failure >= 33) {
+        /*
+         * T8132, which hands a live session on (nvme_post_m4_keeps_live()), modelled with ANS's
+         * power. 33: the earlier stage powered ANS off and passed its SART entries (nvme.sart=,
+         * a 1.0.0b11 to 1.0.0b13.1 Stage 1), so this stage starts it from off, warm. That
+         * session goes on as it came: powered off again with its entries kept, never live
+         * (J713, b13 Stage 1 then a b14 trial Stage 1: live, the Mac reset at the handoff).
+         * 34: an earlier stage handed its session on live and this one adopted it: it stays live.
+         */
+        chip_id = T8132;
+        model_power = true;
+        bool arrived_off = failure == 33;
+        earlier_session = !arrived_off;
+        failure = 0;
+        if (arrived_off) {
+            nvme_sart_saved_cnt = 1;
+            cpu_off = true;
+        }
+        assert(nvme_init());
+        if (arrived_off)
+            assert(boots == 0 && warm_boots == 1 && !ans_offs && !cpu_off);
+        else
+            assert(boots == 0 && !warm_boots && !ans_offs && !nvme_rtkit);
+        assert(nvme_shutdown());
+        assert(!nvme_initialized && !nvme_reboot_required);
+        if (arrived_off) {
+            assert(ans_offs == 1 && cpu_off && queue_frees == 2);
+            /* The next owner starts it from off again with the entries kept. */
+            assert(nvme_init());
+            assert(boots == 0 && warm_boots == 2 && !cpu_off);
+            assert(nvme_shutdown());
+            assert(ans_offs == 2 && cpu_off);
+        } else {
+            assert(!ans_offs && !cpu_off && queue_frees == 0 && cleared_ioq == 2);
+        }
+        for (unsigned i = 0; i < allocated; i++)
+            free(allocations[i]);
+        return 0;
+    }
     if (failure >= 30) {
         /* T8142: ANS is cycled through its storage gates (pcie_ans_power_off()). */
         chip_id = T8142;
@@ -366,5 +405,5 @@ int main(int argc, char **argv)
          "-Wno-unused-variable", "-Wno-format", "-x", "c", "-", "-o", str(binary)],
         input=harness, text=True, check=True,
     )
-    for failure in range(33):
+    for failure in range(35):
         subprocess.run([str(binary), str(failure)], check=True)
