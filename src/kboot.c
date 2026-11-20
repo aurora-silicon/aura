@@ -4305,6 +4305,53 @@ static int dt_vram_reserved_region(const char *dcp_alias, const char *disp_alias
                                    disp_reserved_regions_vram, &region, 1);
 }
 
+static u64 adt_u64_or_u32(const void *val, u32 len)
+{
+    u64 v64;
+    u32 v32;
+
+    if (len == sizeof(v64)) {
+        memcpy(&v64, val, sizeof(v64));
+        return v64;
+    }
+    memcpy(&v32, val, sizeof(v32));
+    return v32;
+}
+
+/*
+ * The DVA window [*base, *end) of the DART an ADT device names in iommu-parent, from the
+ * DART's vm-base and vm-size. Nonzero when the device or its DART does not describe one.
+ */
+static int adt_iommu_window(int adt_node, u64 *base, u64 *end)
+{
+    u32 len = 0, parent;
+    const void *pprop = adt_getprop(adt, adt_node, "iommu-parent", &len);
+    if (!pprop || len != sizeof(parent))
+        return -1;
+    memcpy(&parent, pprop, sizeof(parent));
+
+    int node = adt_path_offset(adt, "/arm-io");
+    if (node < 0)
+        return -1;
+    ADT_FOREACH_CHILD(adt, node)
+    {
+        u32 ph, blen = 0, slen = 0;
+        if (ADT_GETPROP(adt, node, "AAPL,phandle", &ph) != sizeof(ph) || ph != parent)
+            continue;
+        const void *vb = adt_getprop(adt, node, "vm-base", &blen);
+        const void *vs = adt_getprop(adt, node, "vm-size", &slen);
+        if (!vb || !vs || (blen != 4 && blen != 8) || (slen != 4 && slen != 8))
+            return -1;
+        u64 b = adt_u64_or_u32(vb, blen), size = adt_u64_or_u32(vs, slen);
+        if (!size || b > UINT64_MAX - size)
+            return -1;
+        *base = b;
+        *end = b + size;
+        return 0;
+    }
+    return -1;
+}
+
 /*
  * Reserve the firmware segments of an ASC coprocessor from its ADT
  * segment-ranges and attach them to its FDT node. With dram_only, segments
@@ -4340,6 +4387,10 @@ static int dt_reserve_asc_segments_at(int fdt_node, const char *adt_path, const 
             bail("ADT: no DRAM range for '%s'\n", adt_path);
         dram_end = dram_base + dram_size;
     }
+
+    /* Only the DRAM segment reservation (dram_only) checks them against the DART's window */
+    u64 win_base = 0, win_end = 0;
+    bool have_window = dram_only && !adt_iommu_window(node, &win_base, &win_end);
 
     uint32_t dev_phandle = fdt_get_phandle(dt, fdt_node);
     if (!dev_phandle) {
@@ -4377,13 +4428,16 @@ static int dt_reserve_asc_segments_at(int fdt_node, const char *adt_path, const 
         if (mem_node < 0)
             return mem_node;
         /*
-         * The T8112 AOP's OS log segment (flags 0xa) on 27.2 firmware runs at its DRAM
-         * address, above the AOP DART's 32-bit range. Reserve its RAM without listing it as
-         * an IOVA of the device.
+         * A segment the device's DART cannot address (the T8112 AOP's OS log on 27.2
+         * firmware runs at its DRAM address, above the DART's window) is reserved RAM
+         * only, not an IOVA of the device.
          */
-        if (chip_id == T8112 && dram_only && seg->unk == 0xa && iova == seg->phys &&
-            iova > UINT32_MAX)
+        if (have_window && (iova < win_base || seg_size > win_end - win_base ||
+                            iova - win_base > win_end - win_base - seg_size)) {
+            printf("FDT: %s: segment 0x%lx at 0x%lx is outside the DART window, RAM only\n",
+                   fdt_path, seg->phys, iova);
             continue;
+        }
         uint32_t mem_phandle = fdt_get_phandle(dt, mem_node);
 
         /*
@@ -9195,88 +9249,36 @@ static void dt_set_aop_motion_cal(const char *path)
     }
 }
 
-/*
- * The T6040/T6041 AOP runs its __TEXT and __DATA from its own SRAM, but iBoot
- * leaves its external code (__ETEXT) and its log (__OS_LOG) in DRAM. Reserve
- * those segments with the IOVAs the firmware uses for them (their remap
- * addresses), so that the OS maps them in the AOP's DART before it starts the
- * firmware.
- */
-/*
- * M1 Pro (T6000) and M2 (T8112): iBoot starts the AOP firmware itself and the
- * OS needs no firmware segments, but the accelerometer and gyroscope services
- * wait for the same calibration as on the M4 Pro. The ADT carries it in the
- * same properties and container format.
- */
-static int dt_set_aop_motion_cal_only(void)
+/* The first AOP node: a compatible of the form "apple,<soc>-aop" */
+static int dt_find_aop_node(void)
 {
-    const char *compat = chip_id == T8112 ? "apple,t8112-aop" : "apple,t6000-aop";
-    int node = fdt_node_offset_by_compatible(dt, -1, compat);
-    if (node < 0)
-        return 0;
+    for (int node = fdt_next_node(dt, -1, NULL); node >= 0; node = fdt_next_node(dt, node, NULL)) {
+        int len = 0;
+        const char *compat = fdt_getprop(dt, node, "compatible", &len);
 
-    const char *status = fdt_getprop(dt, node, "status", NULL);
-    if (status && strcmp(status, "okay") && strcmp(status, "ok"))
-        return 0;
-
-    char path[64];
-    if (fdt_get_path(dt, node, path, sizeof(path))) {
-        printf("FDT: AOP node path too long\n");
-        return 0;
+        for (const char *c = compat; c && len > 0; c += strlen(c) + 1) {
+            size_t n = strnlen(c, len);
+            if (n > 10 && !strncmp(c, "apple,", 6) && !strcmp(c + n - 4, "-aop"))
+                return node;
+            len -= n + 1;
+        }
     }
-
-    dt_set_aop_motion_cal(path);
-    return 0;
+    return -FDT_ERR_NOTFOUND;
 }
 
-static int dt_set_t8112_aop_27_2(void)
-{
-    int node = fdt_node_offset_by_compatible(dt, -1, "apple,t8112-aop");
-    if (node < 0)
-        return 0;
-
-    const char *status = fdt_getprop(dt, node, "status", NULL);
-    if (status && strcmp(status, "okay") && strcmp(status, "ok"))
-        return dt_set_aop_motion_cal_only();
-
-    char path[64];
-    if (fdt_get_path(dt, node, path, sizeof(path))) {
-        printf("FDT: AOP node path too long\n");
-        return 0;
-    }
-
-    dt_set_aop_motion_cal(path);
-
-    u32 len = 0;
-    int anode = adt_path_offset(adt, "/arm-io/aop");
-    if (anode < 0 || !adt_getprop(adt, anode, "segment-ranges", &len) || !len ||
-        len % sizeof(struct adt_segment_ranges)) {
-        printf("ADT: /arm-io/aop has no firmware segments, %s left without them\n", path);
-        return 0;
-    }
-
-    if (dt_reserve_asc_segments("/arm-io/aop", NULL, path, true, 0, true))
-        printf("FDT: %s: reserving the AOP firmware segments failed\n", path);
-    else
-        printf("FDT: %s: AOP firmware segments reserved\n", path);
-
-    return 0;
-}
-
+/*
+ * The AOP's accelerometer and gyroscope services wait for their calibration, which the ADT
+ * carries on every AOP. iBoot starts the AOP firmware and leaves the part that does not run
+ * from the AOP's own SRAM in DRAM, where the ADT lists its segments: the external code
+ * (__ETEXT) and the log (__OS_LOG) on the T6040/T6041, and the external code and data on
+ * T8112 27.2 firmware. Reserve the DRAM segments with the IOVAs the firmware uses for them
+ * (their remap addresses), so that the OS maps them in the AOP's DART before it touches the
+ * firmware; SRAM segments are left alone (dram_only), so an AOP without DRAM segments gets
+ * none.
+ */
 static int dt_set_aop_firmware(void)
 {
-    /* The 27.2 T8112 AOP firmware runs its external code and data from DRAM. */
-    if (chip_id == T8112 && os_firmware.version >= V27_2)
-        return dt_set_t8112_aop_27_2();
-
-    if (chip_id == T6000 || chip_id == T8112)
-        return dt_set_aop_motion_cal_only();
-
-    if (chip_id != T6040 && chip_id != T6041 && chip_id != T8132)
-        return 0;
-
-    int node = fdt_node_offset_by_compatible(
-        dt, -1, chip_id == T8132 ? "apple,t8132-aop" : "apple,t6041-aop");
+    int node = dt_find_aop_node();
     if (node < 0)
         return 0;
 
@@ -9292,7 +9294,8 @@ static int dt_set_aop_firmware(void)
 
     dt_set_aop_motion_cal(path);
 
-    if (chip_id == T8132)
+    /* The T8132 AOP reaches DRAM through DAPF windows instead */
+    if (!fdt_node_check_compatible(dt, node, "apple,t8132-aop"))
         return dt_set_t8132_aop(path);
 
     u32 len = 0;
