@@ -263,7 +263,6 @@ struct dcp_soc {
     bool any_uuid;      /* no image pinned: the running image's ADT uuid is published */
     bool log_streams;   /* log the DART stream registers, without the ADT description */
     bool sids;          /* the stream IDs and stream count below; otherwise SIDs 5/0/4 of 16 */
-    bool oslog_in_rsv;  /* an __OS_LOG wholly inside a /memreserve/ is still given its node */
     bool t6050;         /* the T6050 path below, not the two-level table handoff */
     u8 sid_dcp, sid_disp, sid_piodma, streams;
     const char *uuid; /* DCP firmware image; NULL: none pinned, dry run only (unless any_uuid) */
@@ -432,7 +431,6 @@ static const struct dcp_soc dcp_soc_t6041 = {
     .any_uuid = true,
     .log_streams = true,
     .sids = true,
-    .oslog_in_rsv = true,
     .sid_dcp = 23,
     .sid_disp = 0,
     .sid_piodma = 16,
@@ -478,7 +476,6 @@ static const struct dcp_soc dcp_soc_t6041_max = {
     .board_gate = true,
     .log_streams = true,
     .sids = true,
-    .oslog_in_rsv = true,
     .sid_dcp = 23,
     .sid_disp = 0,
     .sid_piodma = 16,
@@ -732,16 +729,8 @@ static int dcp6_guard_end(int before)
     return exc_count == before ? 0 : -1;
 }
 
-/* Whether [base, base+size) overlaps an enabled /reserved-memory node or a /memreserve/ entry */
-static int dcp6_resv_conflict(void *dt, u64 base, u64 size, const char *what)
+static int dcp6_resv_node_conflict(void *dt, u64 base, u64 size, const char *what)
 {
-    int n = fdt_num_mem_rsv(dt);
-    for (int i = 0; i < n; i++) {
-        u64 a, s;
-        if (!fdt_get_mem_rsv(dt, i, &a, &s) && dcp6_overlaps(base, size, a, s))
-            bail("%s 0x%lx+0x%lx overlaps /memreserve/ 0x%lx+0x%lx\n", what, base, size, a, s);
-    }
-
     int resv = fdt_path_offset(dt, "/reserved-memory");
     if (resv < 0)
         return 0;
@@ -767,37 +756,39 @@ static int dcp6_resv_conflict(void *dt, u64 base, u64 size, const char *what)
     return 0;
 }
 
-/*
- * As dcp6_resv_conflict(), for an __OS_LOG buffer: with .oslog_in_rsv, a /memreserve/ that
- * contains it whole is no conflict (the buffer is already kept from the OS; the no-map node only
- * describes it). On the J616s the buffers sit inside the aura retained range on tether boots.
- */
-static void *dcp6_scratch(void *dt);
+/* Whether [base, base+size) overlaps an enabled /reserved-memory node or a /memreserve/ entry */
+static int dcp6_resv_conflict(void *dt, u64 base, u64 size, const char *what)
+{
+    int n = fdt_num_mem_rsv(dt);
+    for (int i = 0; i < n; i++) {
+        u64 a, s;
+        if (!fdt_get_mem_rsv(dt, i, &a, &s) && dcp6_overlaps(base, size, a, s))
+            bail("%s 0x%lx+0x%lx overlaps /memreserve/ 0x%lx+0x%lx\n", what, base, size, a, s);
+    }
 
+    return dcp6_resv_node_conflict(dt, base, size, what);
+}
+
+/*
+ * A /memreserve/ entry that wholly contains __OS_LOG already keeps it from the OS.
+ * Reject partial overlaps and conflicts with enabled /reserved-memory nodes.
+ */
 static int dcp6_oslog_conflict(void *dt, u64 base, u64 size)
 {
-    if (!dcp6.soc->oslog_in_rsv)
-        return dcp6_resv_conflict(dt, base, size, "__OS_LOG");
+    if (!size || base + size < base)
+        bail("__OS_LOG 0x%lx+0x%lx has an invalid extent\n", base, size);
 
     int n = fdt_num_mem_rsv(dt);
     for (int i = 0; i < n; i++) {
         u64 a, s;
         if (fdt_get_mem_rsv(dt, i, &a, &s) || !dcp6_overlaps(base, size, a, s))
             continue;
-        if (base < a || base + size > a + s)
+        if (a + s < a || base < a || base + size > a + s)
             bail("__OS_LOG 0x%lx+0x%lx straddles /memreserve/ 0x%lx+0x%lx\n", base, size, a, s);
         dlog_debug("__OS_LOG 0x%lx+0x%lx lies inside /memreserve/ 0x%lx+0x%lx\n", base, size, a, s);
     }
 
-    /* the /reserved-memory part, with no /memreserve/ entries in the way */
-    void *copy = dcp6_scratch(dt);
-    if (!copy)
-        return -1;
-    while (fdt_num_mem_rsv(copy) > 0)
-        fdt_del_mem_rsv(copy, 0);
-    int ret = dcp6_resv_conflict(copy, base, size, "__OS_LOG");
-    free(copy);
-    return ret;
+    return dcp6_resv_node_conflict(dt, base, size, "__OS_LOG");
 }
 
 static int dcp6_carveout_conflict(u64 base, u64 size, const char *what)
