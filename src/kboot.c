@@ -8018,6 +8018,87 @@ static int dt_set_m4_dcp_handoff(void)
     return 0;
 }
 
+/*
+ * Firmware 27 DCPs are given their firmware clocks by the OS: /arm-io/<engine> clock-ids index
+ * /arm-io clock-frequencies from 256 (a zero rate is a real entry). Device trees written for
+ * older firmware (M1/M2) list only the display clock. Publish the rest as fixed clocks named
+ * firmware-<n> after it, with apple,clock-ids, when the node has no apple,clock-ids of its own.
+ */
+static int dt_set_dcp_fw27_clocks(const char *alias, const char *adt_engine)
+{
+    const char *path = fdt_get_alias(dt, alias);
+    int node = path ? fdt_path_offset(dt, path) : -1;
+    if (node < 0 || os_firmware.version < V27_0 || fdt_getprop(dt, node, "apple,clock-ids", NULL))
+        return 0;
+
+    int disp = adt_path_offset(adt, adt_engine);
+    int arm = adt_path_offset(adt, "/arm-io");
+    u32 len = 0, flen = 0;
+    const u8 *raw_ids = disp < 0 ? NULL : adt_getprop(adt, disp, "clock-ids", &len);
+    const u8 *freq = arm < 0 ? NULL : adt_getprop(adt, arm, "clock-frequencies", &flen);
+    u32 nclk = raw_ids ? len / sizeof(u32) : 0;
+    if (!nclk || len % sizeof(u32) || nclk > 8 || !freq || flen % sizeof(u32)) {
+        printf("FDT: %s: no firmware clocks in the ADT; left unchanged\n", alias);
+        return 0;
+    }
+
+    int clen = 0;
+    const fdt32_t *display = fdt_getprop(dt, node, "clocks", &clen);
+    if (!display || clen != sizeof(fdt32_t) || fdt_getprop(dt, node, "clock-names", NULL)) {
+        printf("FDT: %s: unexpected clock properties; firmware clocks not published\n", alias);
+        return 0;
+    }
+
+    fdt32_t clocks[9], ids[8];
+    char names[9 * 12];
+    int names_len = snprintf(names, sizeof(names), "display") + 1;
+    clocks[0] = *display;
+    for (u32 i = 0; i < nclk; i++) {
+        u32 id, hz;
+        memcpy(&id, raw_ids + i * sizeof(u32), sizeof(id));
+        if (id < 256 || id - 256 >= flen / sizeof(u32)) {
+            printf("FDT: %s: firmware clock %u out of range; not published\n", alias, id);
+            return 0;
+        }
+        memcpy(&hz, freq + (id - 256) * sizeof(u32), sizeof(hz));
+
+        char name[40];
+        snprintf(name, sizeof(name), "clock-%s-firmware-%u", alias, id);
+        int clk = fdt_subnode_offset(dt, 0, name);
+        if (clk < 0)
+            clk = fdt_add_subnode(dt, 0, name);
+        if (clk < 0)
+            return clk;
+        u32 ph = fdt_get_phandle(dt, clk);
+        if (!ph) {
+            int ret = fdt_generate_phandle(dt, &ph);
+            if (ret)
+                return ret;
+        }
+        int ret = fdt_setprop_string(dt, clk, "compatible", "fixed-clock");
+        ret = ret ?: fdt_setprop_u32(dt, clk, "#clock-cells", 0);
+        ret = ret ?: fdt_setprop_u32(dt, clk, "clock-frequency", hz);
+        ret = ret ?: fdt_setprop_u32(dt, clk, "phandle", ph);
+        if (ret)
+            return ret;
+        clocks[i + 1] = cpu_to_fdt32(ph);
+        ids[i] = cpu_to_fdt32(id);
+        names_len += snprintf(names + names_len, sizeof(names) - names_len, "firmware-%u", i) + 1;
+    }
+
+    node = fdt_path_offset(dt, path);
+    if (node < 0)
+        return node;
+    int ret = fdt_setprop(dt, node, "clocks", clocks, (nclk + 1) * sizeof(*clocks));
+    node = fdt_path_offset(dt, path);
+    ret = ret ?: fdt_setprop(dt, node, "clock-names", names, names_len);
+    node = fdt_path_offset(dt, path);
+    ret = ret ?: fdt_setprop(dt, node, "apple,clock-ids", ids, nclk * sizeof(*ids));
+    if (!ret)
+        printf("FDT: %s: %u firmware clocks published from %s\n", alias, nclk, adt_engine);
+    return ret;
+}
+
 static int dt_set_display(void)
 {
     if (chip_id == T8140)
@@ -8158,6 +8239,11 @@ static int dt_set_display(void)
         printf("FDT: unknown compatible, skip display reserved-memory setup\n");
         return 0;
     }
+    if (ret)
+        return ret;
+
+    ret = dt_set_dcp_fw27_clocks("dcp", "/arm-io/disp0");
+    ret = ret ?: dt_set_dcp_fw27_clocks("dcpext", "/arm-io/dispext0");
     if (ret)
         return ret;
 
