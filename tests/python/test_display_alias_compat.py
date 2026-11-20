@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-2.0-only
 # Generated-by: LLM
 # Assisted-by: LLM
-"""The shared display reservation keeps its older-SoC alias fallback."""
+"""A display device the DT does not describe is skipped; one it describes must resolve."""
 
 from pathlib import Path
 import subprocess
@@ -9,8 +9,9 @@ import subprocess
 import pytest
 
 
-@pytest.mark.parametrize("older_chip", [0x8103, 0x8112], ids=["M1", "M2"])
-def test_missing_display_alias_is_fatal_only_on_t8140(tmp_path, older_chip):
+@pytest.mark.parametrize("chip", [0x8103, 0x8112, 0x6000, 0x8142, 0x8140],
+                         ids=["M1", "M2", "M1Pro", "M5", "A18Pro"])
+def test_display_alias_absent_skips_unresolved_refuses(tmp_path, chip):
     repo = Path(__file__).resolve().parents[2]
     source = (repo / "src/kboot.c").read_text()
     def definition(start_text, terminator):
@@ -20,6 +21,7 @@ def test_missing_display_alias_is_fatal_only_on_t8140(tmp_path, older_chip):
     helper = "\n".join((
         definition("struct disp_mapping {", "\n};"),
         definition("struct mem_region {", "\n};"),
+        definition("static int dt_display_node_unresolved(", "\n}"),
         definition("static int dt_add_reserved_regions(", "\n}"),
     ))
     harness = r'''
@@ -34,10 +36,13 @@ typedef int dart_dev_t;
 #define T8140 0x8140
 #define bail_cleanup(...) do { ret = -1; goto err; } while (0)
 static void *dt;
-static u32 chip_id;
+static u32 chip_id = CHIP;
 static const char *missing;
+static bool alias_defined;
 static int fdt_path_offset(const void *tree, const char *path)
 { (void)tree; return !strcmp(path, missing) ? -1 : 1; }
+static const char *fdt_get_alias(const void *tree, const char *name)
+{ (void)tree; return strcmp(name, missing) || alias_defined ? "/soc/somewhere" : NULL; }
 static dart_dev_t *dt_init_dart_by_node(int node, int index)
 { static dart_dev_t dart; (void)node; (void)index; return &dart; }
 static uint32_t fdt_get_phandle(const void *tree, int node)
@@ -58,27 +63,34 @@ static int dt_get_iommu_node(int node, u32 index)
 static int fdt_setprop_string(void *tree, int node, const char *name, const char *value)
 { (void)tree; (void)node; (void)name; (void)value; return 0; }
 static void dart_shutdown(dart_dev_t *dart) { (void)dart; }
-/* Every scenario returns at the missing alias before enabling any owner. */
+/* Every scenario returns at the missing device before enabling any owner. */
 static int dt_enable_dcp_with_typec_routes(const char *alias)
 { (void)alias; assert(0); return -1; }
 ''' + helper + r'''
 int main(void)
 {
+    (void)chip_id;
     const char *aliases[] = {"dcp", "disp", "piodma"};
     for (int i = 0; i < 3; i++) {
+        /* No such alias: an older DT without that display device. */
         missing = aliases[i];
-        chip_id = OLDER_CHIP;
+        alias_defined = false;
         assert(dt_add_reserved_regions("dcp", "disp", "piodma", NULL,
                                        NULL, NULL, 0) == 0);
-        chip_id = T8140;
+        /* The alias is there but does not resolve: refused. */
+        alias_defined = true;
         assert(dt_add_reserved_regions("dcp", "disp", "piodma", NULL,
                                        NULL, NULL, 0) == -1);
     }
+    /* An absolute path from the caller always names a described device. */
+    missing = "/soc/dcp@1";
+    alias_defined = false;
+    assert(dt_add_reserved_regions("/soc/dcp@1", NULL, NULL, NULL, NULL, NULL, 0) == -1);
     return 0;
 }
 '''
     binary = tmp_path / "display-alias-compat"
-    subprocess.run(["cc", f"-DOLDER_CHIP={older_chip}", "-std=c11", "-Wall", "-Wextra", "-Werror",
+    subprocess.run(["cc", f"-DCHIP={chip}", "-std=c11", "-Wall", "-Wextra", "-Werror",
                     "-x", "c", "-", "-o", str(binary)],
                    input=harness, text=True, check=True)
     subprocess.run([str(binary)], check=True)
