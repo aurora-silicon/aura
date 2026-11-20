@@ -11678,11 +11678,12 @@ int kboot_prepare_dt(void *fdt)
     }
 
     /*
-     * A post-M4 ANS keeps every buffer an earlier stage gave it (on a normal boot Stage 1 read
-     * the ESP, so the buffers are in Stage 1's heap, not this one's), running or powered off.
-     * Reserve each SART-allowed range inside RAM. If ANS will be off when the payload starts,
-     * the SART has lost the entries, and its next start writes them back from the nvme node's
-     * apple,sart-entries: per entry, (index << 8 | flags), address and size, 64 bits each.
+     * A post-M4 ANS handed on running keeps every buffer the stage that started it gave it. A
+     * STOPPED one keeps iBoot's entries only (its firmware's segments among them). Reserve each
+     * SART-allowed range inside RAM. If ANS will be off when the payload starts (T6050, or an
+     * older stage's off passed through), the SART has lost the entries, and its next start
+     * writes them back from the nvme node's apple,sart-entries: per entry, (index << 8 | flags),
+     * address and size, 64 bits each.
      */
     struct sart_entry sart[16];
     bool ans_off;

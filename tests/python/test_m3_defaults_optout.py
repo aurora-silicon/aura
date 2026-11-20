@@ -245,7 +245,10 @@ static int mitigations_perform(void) { return 0; }
 static bool smp_is_alive(int cpu) { return false; }
 static int smp_call_sync0(int cpu, void (*fn)(void)) { return 0; }
 static void do_enable_tso(void) {}
-/* Post-M4 ANS (M1N1_TEST_POST_M4): powered off by an earlier stage once nvme.sart= arrives */
+/*
+ * Post-M4 ANS (M1N1_TEST_POST_M4): left not running by an earlier stage once nvme.sart= (off) or
+ * nvme.ans=stopped arrives
+ */
 static bool nvme_sart_passed, nvme_started;
 static bool nvme_init(void)
 {
@@ -263,7 +266,12 @@ static bool nvme_set_sart_var(const char *v)
     nvme_sart_passed = true;
     return true;
 }
-static bool nvme_post_m4_passed_off(void)
+static bool nvme_set_ans_var(const char *v)
+{
+    nvme_sart_passed = true;
+    return true;
+}
+static bool nvme_post_m4_needs_start(void)
 {
     return getenv("M1N1_TEST_POST_M4") && nvme_sart_passed && !nvme_started;
 }

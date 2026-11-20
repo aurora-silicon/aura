@@ -19,7 +19,7 @@ def test_adopted_queue_lifetime(tmp_path):
             "static ", "static __attribute__((unused)) ", 1))
     # The queue register helpers, which place the registers for the secure layout too.
     qregs = source[source.index("static u64 nvme_qreg(u32 reg)"):source.index("static void nvme_log_entry_state")]
-    # The post-M4 power off and power on around a stage's use of ANS.
+    # The post-M4 handoff: T6050's power off and on, every other SoC's STOPPED.
     power = source[source.index("/* The ADT describes a post-M4 ANS"):source.index("/* A write or flush, timed:")]
     init = source[source.index("bool nvme_init(void)"):source.index("void nvme_ensure_shutdown(void)")]
     # The M1-M3 sleep-and-reset helper that every legacy power-down goes through.
@@ -59,6 +59,10 @@ struct sart_entry { u8 index, flags; u64 paddr, size; };
 #define T8142 0x8142
 static u32 chip_id = T8140;
 static void *adt;
+struct adt_segment_ranges { u64 phys, iova, remap; u32 size, unk; };
+static struct { u64 phys_base, mem_size; } cur_boot_args;
+static u64 timeout_calculate(u64 us) { return us; }
+static bool timeout_expired(u64 timeout) { return true; }
 static u64 get_ticks(void) { return 0; }
 static u64 ticks_to_msecs(u64 ticks) { return ticks; }
 ''' + declarations + r'''
@@ -110,15 +114,17 @@ static int adt_get_reg(void *a, int *path, const char *p, int i, u64 *base, u64 
     return 0;
 }
 static asc_dev_t *asc_init(const char *path) { return &asc; }
-/* 30-32 (T8142) model ANS's power: its CPU is stopped from the power off to a warm boot. */
-static bool model_power, cpu_off, earlier_session, enable_fails_once;
-static int ans_offs, ans_ons, warm_boots, quiesces;
-static bool asc_cpu_running(asc_dev_t *a)
-{
-    if (model_power && cpu_off)
-        return false;
-    return started || (failure != 1 && failure != 27);
-}
+/*
+ * ANS's power and its CPU's run bit. iBoot leaves its session running; 1 and 27 model an ANS an
+ * earlier stage powered off without passing its SART entries on.
+ */
+static bool ans_powered = true, cpu_running = true, earlier_session, enable_fails_once;
+static int ans_offs, ans_ons, warm_boots, quiesces, held_resets, idles;
+static bool asc_cpu_running(asc_dev_t *a) { return cpu_running; }
+static bool asc_cpu_idle(asc_dev_t *a) { return !cpu_running; }
+static u32 asc_cpu_status(asc_dev_t *a) { return cpu_running ? 0 : 0x6a; }
+static void asc_i2a_enable(asc_dev_t *a, bool on) {}
+static int pmgr_power_is_requested(int die, const char *name) { return ans_powered; }
 static void asc_free(asc_dev_t *a) { asc_frees++; }
 static u32 read32(u64 addr)
 {
@@ -142,46 +148,58 @@ static void nvme_log_entry_state(bool running) {}
 /* No earlier aura stage's queue setup, unless one is modelled: a running session is iBoot's. */
 static u64 nvme_read64_lo_hi(u64 addr) { return earlier_session && addr == nvmmu_base + NVMMU_ASQ_BASE; }
 static int adt_path_offset(void *a, const char *p) { return 1; }
-static int pcie_init(void) { return 0; }
 /* The power steps succeed; T6050's controller suspend isn't modelled (nvme_ctrl_suspend()). */
-static int pcie_ans_power_on(void) { assert(chip_id != T6050); ans_ons++; return pcie_init(); }
-/* Shutdown faults 3 and 4: ANS doesn't power off. */
-static int pcie_ans_power_off(void)
-{
-    if (shutdown_fault == 3 || shutdown_fault == 4)
-        return -1;
-    ans_offs++;
-    cpu_off = true;
-    return 0;
-}
-static bool rtkit_idle(rtkit_dev_t *r) { return true; }
-static bool rtkit_boot_warm(rtkit_dev_t *r, u32 mask)
-{
-    assert(r);
-    warm_boots++;
-    cpu_off = false;
-    return true;
-}
+static int pcie_ans_power_on(void) { assert(chip_id != T6050); ans_ons++; ans_powered = true; return 0; }
+/* Only T6050 powers ANS off, and it isn't modelled: every other SoC leaves it STOPPED. */
+static int pcie_ans_power_off(void) { ans_offs++; return -1; }
+static bool rtkit_boot_warm(rtkit_dev_t *r, u32 mask) { assert(0); return false; }
 static int sart_get_entries(sart_dev_t *s, struct sart_entry *e, int max) { return 1; }
 static bool sart_set_entries(sart_dev_t *s, const struct sart_entry *e, int n) { return true; }
 static sart_dev_t *sart_init(const char *path) { return &sart; }
 static void sart_free(sart_dev_t *s) {}
+static void sart_release(sart_dev_t *s) {}
+static bool sart_get_allowed(sart_dev_t *s, int i, u64 *pa, size_t *sz) { *pa = *sz = 0; return false; }
+static bool sart_set_allowed(sart_dev_t *s, int i, u64 pa, size_t sz) { return true; }
+static int sart_clears;
+static bool sart_clear_entry(sart_dev_t *s, int i) { sart_clears++; return true; }
 static rtkit_dev_t *rtkit_init(const char *name, asc_dev_t *a, void *d, void *i,
                               sart_dev_t *s, bool sram) { return &rtkit; }
-static bool rtkit_boot(rtkit_dev_t *r) { boots++; started = failure != 8; return failure != 8; }
-/* M1-M3 power-down order, one letter per step: S sleep acked, F sleep failed, X stop, R reset. */
+/* The run bit is set whether or not the firmware answers. */
+static bool rtkit_boot(rtkit_dev_t *r)
+{
+    boots++;
+    cpu_running = true;
+    started = failure != 8;
+    return failure != 8;
+}
+/*
+ * Power-down order, one letter per step: S sleep acked, F sleep failed, X stop, R reset (M1-M3),
+ * H ANS reset with its gate held (post-M4 STOPPED).
+ */
 static char events[64];
 static bool sleep_fails;
 static void event(char c) { size_t n = strlen(events); if (n + 1 < sizeof(events)) events[n] = c; }
-static bool rtkit_sleep(rtkit_dev_t *r) { event(sleep_fails ? 'F' : 'S'); return !sleep_fails; }
-static void rtkit_stop(rtkit_dev_t *r) { event('X'); }
-static void asc_cpu_stop(asc_dev_t *a) { event('X'); }
+static bool rtkit_sleep(rtkit_dev_t *r)
+{
+    event(sleep_fails ? 'F' : 'S');
+    cpu_running = cpu_running && sleep_fails;
+    return !sleep_fails;
+}
+static bool rtkit_idle(rtkit_dev_t *r) { idles++; cpu_running = false; return true; }
+static void rtkit_stop(rtkit_dev_t *r) { event('X'); cpu_running = false; }
+static void asc_cpu_stop(asc_dev_t *a) { event('X'); cpu_running = false; }
 static bool rtkit_quiesce(rtkit_dev_t *r) { assert(r); quiesces++; return true; }
 static void rtkit_free(rtkit_dev_t *r) {}
 static void pmgr_reset(u8 die, const char *name) { resets++; event('R'); }
+static int pmgr_reset_held(int die, const char *name) { held_resets++; event('H'); return 0; }
 static int poll32(u64 a, u32 mask, u32 value, unsigned timeout) { return 0; }
+/* Shutdown fault 4: the first disable after the stage's own setup times out. */
+static int fail_disable_after;
 static bool nvme_ctrl_disable(void)
-{ disable_calls++; return failure != 2 && !(shutdown_fault == 4 && disable_calls == 2); }
+{
+    disable_calls++;
+    return failure != 2 && !(fail_disable_after && disable_calls > fail_disable_after);
+}
 static bool nvme_ctrl_enable(void)
 {
     if (enable_fails_once) {
@@ -190,6 +208,7 @@ static bool nvme_ctrl_enable(void)
     }
     return failure != 3;
 }
+/* Shutdown fault 3: the normal shutdown after a write times out. */
 static bool nvme_ctrl_shutdown(void) { shutdown_calls++; return shutdown_fault != 3; }
 /* The T6050 controller suspend protocol is outside this queue-lifetime model. */
 static bool nvme_ctrl_suspend(void) { abort(); }
@@ -208,41 +227,40 @@ int main(int argc, char **argv)
 {
     assert(argc == 2);
     failure = atoi(argv[1]);
+    (void)nvme_ans_stops;
+    (void)nvme_ans_adt_die;
     if (failure >= 30) {
-        /* T8142: ANS is cycled through its storage gates (pcie_ans_power_off()). */
+        /*
+         * T8142, as every post-M4 SoC but T6050: ANS goes from whatever a stage finds to STOPPED,
+         * is started from there, and is left STOPPED. Its power is never cycled.
+         */
         chip_id = T8142;
-        model_power = true;
         earlier_session = failure >= 31;
         enable_fails_once = failure == 32;
         failure = 0;
-        assert(nvme_init());
-        if (!earlier_session) {
-            /* iBoot's session: this stage's handshake. */
-            assert(boots == 1 && !warm_boots && !ans_offs);
-        } else if (!enable_fails_once && ans_offs) {
-            /* An adopted session that didn't come ready: off and started again, warm. */
-            assert(boots == 0 && ans_offs == 1 && ans_ons == 1 && warm_boots == 1);
-        } else {
-            /* A healthy adopted session, taken as it is, without an RTKit instance yet. */
-            assert(boots == 0 && !ans_offs && !nvme_rtkit);
-            nvme_quiesce_for_next = true;
-            /* A next stage that doesn't service the mailbox: quiesced through an own instance. */
-            assert(nvme_shutdown());
-            assert(quiesces == 1 && !ans_offs && !nvme_initialized && !nvme_reboot_required);
+        if (enable_fails_once) {
+            /* A cold start that doesn't come ready keeps its queues: no adopted session to cycle. */
+            assert(!nvme_init() && nvme_reboot_required);
             for (unsigned i = 0; i < allocated; i++)
                 free(allocations[i]);
             return 0;
         }
-        /* Done with ANS: a normal shutdown even after only reads, then the power off. */
-        int saved_shutdowns = shutdown_calls, saved_offs = ans_offs;
-        assert(nvme_shutdown());
-        assert(shutdown_calls == saved_shutdowns + 1 && ans_offs == saved_offs + 1);
-        assert(!nvme_initialized && !nvme_reboot_required && cpu_off);
-        /* The next owner starts it from off with the SART entries kept. */
-        int saved_boots = boots, saved_warm = warm_boots;
         assert(nvme_init());
-        assert(boots == saved_boots && warm_boots == saved_warm + 1 && !cpu_off);
+        /* iBoot's session is woken for its handshake first; an older stage's is asked directly. */
+        assert(boots == (earlier_session ? 1 : 2) && held_resets == 1 && cpu_running);
+        assert(!ans_offs && !ans_ons && !warm_boots);
+        /* Done with ANS: SLEEP acknowledged, its CPU stopped, then ANS alone reset. */
+        memset(events, 0, sizeof(events));
         assert(nvme_shutdown());
+        assert(!strcmp(events, "SH") && !cpu_running && ans_powered && !ans_offs);
+        assert(!nvme_initialized && !nvme_reboot_required && queue_frees == 2);
+        /* The next owner starts it from STOPPED: reset again, one cold boot, nothing to stop. */
+        int saved_boots = boots, saved_shutdowns = shutdown_calls;
+        memset(events, 0, sizeof(events));
+        assert(nvme_init());
+        assert(boots == saved_boots + 1 && !strcmp(events, "H") && cpu_running);
+        assert(shutdown_calls == saved_shutdowns && !warm_boots);
+        assert(nvme_shutdown() && !cpu_running && !ans_offs);
         for (unsigned i = 0; i < allocated; i++)
             free(allocations[i]);
         return 0;
@@ -275,6 +293,12 @@ int main(int argc, char **argv)
         shutdown_fault = failure - 14;
         failure = 0;
         assert(nvme_init());
+        int init_shutdowns = shutdown_calls, init_disables = disable_calls;
+        memset(events, 0, sizeof(events));
+        if (shutdown_fault == 3)
+            nvme_wrote = true;
+        if (shutdown_fault == 4)
+            fail_disable_after = disable_calls;
         if (shutdown_fault == 5 || shutdown_fault == 7)
             adminq.failed = true;
         if (shutdown_fault == 6 || shutdown_fault == 8)
@@ -285,13 +309,15 @@ int main(int argc, char **argv)
         assert(nvme_reboot_required);
         assert(nvme_initialized);
         assert(!queue_frees && !asc_frees && !resets);
-        /* Faults 3 and 4 fail the power off, after the I/O queue registers were cleared. */
+        /* Faults 3 and 4 fail the controller's shutdown, after the I/O queue registers were cleared. */
         int cleared = shutdown_fault == 3 || shutdown_fault == 4 ? 2 : 0;
         assert(cleared_ioq == cleared && publications == saved_publications + cleared);
         assert(commands == (shutdown_fault == 1 ? 3 : shutdown_fault <= 4 ? 4 : 2));
-        /* A stage that only read disables the controller before the power off, with no shutdown. */
-        assert(shutdown_calls == 0);
-        assert(disable_calls == 1 + (shutdown_fault == 3 || shutdown_fault == 4));
+        /* Only a stage that wrote shuts the controller down normally before disabling it. */
+        assert(shutdown_calls == init_shutdowns + (shutdown_fault == 3));
+        assert(disable_calls == init_disables + (shutdown_fault == 4));
+        assert(!strchr(events, 'S') && cpu_running);
+        fail_disable_after = 0;
         int saved_commands = commands, saved_disable = disable_calls;
         shutdown_fault = 0;
         adminq.failed = ioq.failed = false;
@@ -305,15 +331,20 @@ int main(int argc, char **argv)
     }
     if (failure == 11 || failure >= 23)
         chip_id = T8132;
+    if (failure == 1 || failure == 27)
+        ans_powered = cpu_running = false;
     nvme_keep_running_for_linux = failure == 9;
     assert(nvme_shutdown());
     assert(nvme_init() == (failure == 0 || failure == 7 || failure == 9 || failure == 10 ||
                            failure == 23 || failure == 26));
-    /* A running session from iBoot gets the handshake; ANS off with no entries is refused. */
+    /*
+     * A running session from iBoot gets its handshake, SLEEP and a reset, then the start from
+     * STOPPED; ANS off with no entries is refused before any register of it is read.
+     */
     if (failure == 26)
-        assert(boots == 1);
+        assert(boots == 2 && held_resets == 1);
     if (failure == 27)
-        assert(boots == 0);
+        assert(boots == 0 && !held_resets && !ans_ons);
     if (failure == 1 || failure == 6 || (failure >= 11 && failure <= 14) || failure == 24 ||
         failure == 25 || failure == 27) {
         /* Rejection before publication does not poison a later attempt. */
@@ -322,6 +353,7 @@ int main(int argc, char **argv)
         assert(nvme_shutdown());
         failure = 0;
         chip_id = T8140;
+        ans_powered = cpu_running = true;
         assert(nvme_init());
         assert(nvme_shutdown());
     } else if ((failure >= 2 && failure <= 5) || failure == 8) {
@@ -344,9 +376,11 @@ int main(int argc, char **argv)
         assert(nvme_initialized);
         assert(nvme_shutdown());
         assert(!nvme_initialized);
-        /* Powered off, post-M4 frees its queues too; only Linux's live handoff keeps them. */
+        /* STOPPED, post-M4 frees its queues too; only Linux's live handoff keeps them. */
         assert(queue_frees == (failure == 9 ? 0 : 2));
         assert(resets == (legacy ? 2 : 0));
+        /* ANS is never powered off; its CPU is stopped unless Linux adopts the session. */
+        assert(!ans_offs && cpu_running == (failure == 9));
         /* A healthy shutdown still allows reinitialization. */
         assert(nvme_init());
         assert(nvme_shutdown());

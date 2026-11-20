@@ -219,7 +219,10 @@ static void *load_kernel(void *p, size_t size)
 /* Passed after every other line to a chainloaded stage when a config line was lost */
 #define CONFIG_LOST_VAR "m1n1.config-lost=1"
 
-/* The two extra slots carry CONFIG_LOST_VAR and nvme.sart without reducing the chosen limit. */
+/*
+ * The two extra slots carry CONFIG_LOST_VAR and the NVMe handoff (nvme.sart= or nvme.ans=) without
+ * reducing the chosen limit.
+ */
 #ifdef CHAINLOADING
 static size_t chosen_cnt = 1;
 static char *chosen[MAX_CHOSEN_VARS + 2] = {
@@ -246,8 +249,8 @@ static bool config_seen = false;
 static bool config_lost_passed = false;
 
 static const char *const config_names[] = {
-    "chosen.", "chainload=",        "boot=", "nvme.sart=", "display=", "mitigations=",
-    "tso=",    "m1n1.config-lost=", "hib=",
+    "chosen.",  "chainload=",   "boot=", "nvme.sart=",        "nvme.ans=",
+    "display=", "mitigations=", "tso=",  "m1n1.config-lost=", "hib=",
 #ifdef SPTM_VIRT_ESP
     "macos=",
 #endif
@@ -313,6 +316,10 @@ static bool check_var(u8 **p)
     } else if (IS_VAR("nvme.sart=")) {
         /* Started by an earlier aura stage, which has had its host window already. */
         if (nvme_set_sart_var(val))
+            stage1_chained = true;
+    } else if (IS_VAR("nvme.ans=")) {
+        /* Left STOPPED by an earlier aura stage, which has had its host window already. */
+        if (nvme_set_ans_var(val))
             stage1_chained = true;
     } else if (IS_VAR("nvme.adopt=")) {
         /* An older Stage 1 hands its session on running; nvme_init() finds it by itself. */
@@ -563,12 +570,12 @@ int payload_run(void)
 #endif
         /*
          * Linux adopts a running post-M4 ANS from boot=. The U-Boot we embed adopts a running
-         * post-M4 ANS too, and can't start one from off: if an earlier stage powered ANS off
-         * (nvme.sart=), start it here and hand it on running, as for boot=. Otherwise any other
-         * payload gets ANS as this stage found it, or powered off with the SART entries passed
-         * on if this stage used it.
+         * post-M4 ANS too, and can start one neither from STOPPED nor from off: if an earlier
+         * stage left ANS so (nvme.ans=stopped, nvme.sart=), start it here and hand it on running,
+         * as for boot=. Otherwise any other payload gets ANS as this stage found it, or as this
+         * stage's shutdown leaves it if it used it (STOPPED; off on T6050).
          */
-        bool nvme_started = !boot_spec && nvme_post_m4_passed_off();
+        bool nvme_started = !boot_spec && nvme_post_m4_needs_start();
         if (nvme_started && !nvme_init())
             goto boot_failed;
         nvme_keep_running_for_linux = boot_spec || nvme_started;

@@ -378,19 +378,22 @@ int chainload_load(const char *spec, char **vars, size_t *var_cnt, size_t var_ca
         return -1;
     }
 
-    /* Post-M4: the SART entries the next stage starts ANS again with, after nvme_shutdown(). */
-    char *sart_var = nvme_sart_var();
-    if (sart_var) {
+    /*
+     * Post-M4: what nvme_shutdown() leaves ANS in for the next stage (nvme.ans=stopped), or the
+     * SART entries it starts ANS again with (nvme.sart=, T6050).
+     */
+    char *nvme_var = nvme_handoff_var();
+    if (nvme_var) {
         bool present = false;
         for (size_t i = 0; i < *var_cnt; i++)
-            present |= vars[i] == sart_var;
+            present |= vars[i] == nvme_var;
         if (!present) {
             if (*var_cnt >= var_capacity) {
-                printf("chainload: no room for nvme.sart\n");
+                printf("chainload: no room for %s\n", nvme_var);
                 nvme_shutdown();
                 return -1;
             }
-            vars[(*var_cnt)++] = sart_var;
+            vars[(*var_cnt)++] = nvme_var;
         }
     }
 
