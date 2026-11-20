@@ -9,7 +9,9 @@ CTXR_A-C pages, boot_args and top_of_kernel_data after it, this stage's heap 0xf
 when the tree is allocated. Only the load base moves, over every 16 KiB step of the range iBoot
 loads this object in, and a little past it.
 """
+import re
 import subprocess
+import sys
 
 from test_locked_dart_tables import function
 from test_smp_timeouts import REPO
@@ -66,7 +68,7 @@ static bool confined;
 static int probe_stuck_cpu = -1;
 static bool ctxr_exec_confined(void) { return confined; }
 static void fb_set_active(bool active) { (void)active; }
-''' + "%(ranges)s\n%(ctxr_range)s\n%(window)s" + r'''
+''' + "%(ranges)s\n%(ctxr_range)s\n%(expected)s\n%(window)s" + r'''
 struct mcc_carveout { u64 base, size; };
 static struct mcc_carveout mcc_carveouts[4];
 static size_t mcc_carveout_count;
@@ -404,6 +406,12 @@ def build(tmp_path):
         "ranges": header[start:header.index("};", start) + 2],
         "ctxr_range": function(ctxr, "ctxr_range"),
         "window": ctxr[ctxr.index("#define CTXR_EXEC_AURA_SLOT"):],
+        # The boot's check of data/execute-window.json against the probe, with the header the
+        # build generates from it.
+        "expected": subprocess.run([sys.executable, str(REPO / "tools/execute_window.py"), "c-header"],
+                                   check=True, capture_output=True, text=True).stdout +
+                    re.search(r"^static void ctxr_exec_check_expected\(bool confined\)\n\{.*?\n\}\n",
+                              ctxr, re.M | re.S)[0],
         "raise_base": function(heap, "heapblock_raise_base"),
         "block": hibernation_block(kboot),
         "end_check": prepare_dt_end_check(kboot),

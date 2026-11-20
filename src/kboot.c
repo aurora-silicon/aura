@@ -61,6 +61,9 @@
 
 #define MAX_MEM_REGIONS 32
 
+/* Room kboot_prepare_dt() leaves for its own additions to the tree (272K). */
+#define DT_EDIT_MARGIN (17 * SZ_16K)
+
 static void *dt = NULL;
 static int dt_bufsize = 0;
 static bool dt_ready;
@@ -1320,15 +1323,6 @@ static int dt_set_speaker_safety(void)
         node = next;
     }
 
-    if (chip_id != T8140)
-        return 0;
-
-    int audio = adt_path_offset(adt, "/product/audio");
-    u32 acoustic_id;
-    if (audio < 0 || ADT_GETPROP(adt, audio, "acoustic-id", &acoustic_id) != sizeof(acoustic_id) ||
-        acoustic_id != 44)
-        return 0;
-
     static const struct {
         const char *adt_name;
         const char *dt_name;
@@ -1344,6 +1338,25 @@ static int dt_set_speaker_safety(void)
           {"speaker-cpms-bgd_1s", "asahi,adt-speaker-cpms-bgd-1s-raw"},
           {"speaker-cpms-bgd_inst", "asahi,adt-speaker-cpms-instant-raw"},
       };
+
+    /*
+     * The profile is published wherever /product/audio carries the speaker CPMS background
+     * values (speaker-cpms-bgd_*), whatever the SoC or board. Without them the ADT describes no
+     * such profile and none is published. With any of them, the acoustic ID and the whole set
+     * above must be there: a partial profile stops the boot rather than publish half of it.
+     */
+    int audio = adt_path_offset(adt, "/product/audio");
+    if (audio < 0)
+        return 0;
+    bool described = false;
+    for (size_t i = 0; i < ARRAY_SIZE(longs); i++)
+        described |= adt_getprop(adt, audio, longs[i].adt_name, NULL) != NULL;
+    if (!described)
+        return 0;
+
+    u32 acoustic_id;
+    if (ADT_GETPROP(adt, audio, "acoustic-id", &acoustic_id) != sizeof(acoustic_id))
+        bail("ADT: incomplete speaker safety profile\n");
     u32 word_values[ARRAY_SIZE(words)];
     u64 long_values[ARRAY_SIZE(longs)];
     for (size_t i = 0; i < ARRAY_SIZE(words); i++)
@@ -1353,8 +1366,17 @@ static int dt_set_speaker_safety(void)
         if (ADT_GETPROP(adt, audio, longs[i].adt_name, &long_values[i]) != sizeof(u64))
             bail("ADT: incomplete speaker safety profile\n");
 
+    /*
+     * J700 (acoustic ID 44) keeps the board compatible its binding names first; every
+     * profile also carries the board-independent one.
+     */
+    static const char j700_compatible[] = "asahi,j700-speaker-safety\0asahi,adt-speaker-safety";
+    static const char adt_compatible[] = "asahi,adt-speaker-safety";
     int node = fdt_add_subnode(dt, chosen, "asahi-speaker-safety");
-    if (node < 0 || fdt_setprop_string(dt, node, "compatible", "asahi,j700-speaker-safety") ||
+    if (node < 0 ||
+        (acoustic_id == 44
+             ? fdt_setprop(dt, node, "compatible", j700_compatible, sizeof(j700_compatible))
+             : fdt_setprop(dt, node, "compatible", adt_compatible, sizeof(adt_compatible))) ||
         fdt_setprop_u32(dt, node, "asahi,schema-version", 1) ||
         fdt_setprop_string(dt, node, "asahi,speaker-output-policy", "forbidden") ||
         fdt_setprop_string(dt, node, "asahi,cpms-value-encoding", "opaque-adt-u64") ||
@@ -2600,6 +2622,30 @@ err:
     return ret;
 }
 
+/*
+ * Whether one of the node's compatible strings starts with prefix. The radios are PCI functions,
+ * named by PCI vendor: "pci14e4," is Broadcom, "pci14c3," is MediaTek.
+ */
+static bool dt_compatible_has_prefix(int node, const char *prefix)
+{
+    int count = fdt_stringlist_count(dt, node, "compatible");
+    size_t plen = strlen(prefix);
+
+    for (int i = 0; i < count; i++) {
+        int len;
+        const char *compatible = fdt_stringlist_get(dt, node, "compatible", i, &len);
+        if (compatible && (size_t)len >= plen && !strncmp(compatible, prefix, plen))
+            return true;
+    }
+    return false;
+}
+
+/* The Wi-Fi and Bluetooth calibration and identity below are Broadcom's. */
+static bool dt_is_broadcom_radio(int node)
+{
+    return dt_compatible_has_prefix(node, "pci14e4,") || dt_compatible_has_prefix(node, "brcm,");
+}
+
 static struct {
     const char *alias;
     const char *fdt_property;
@@ -2658,7 +2704,9 @@ static int dt_set_mac_addresses(void)
         if (fdt_setprop(dt, node, mac_address_devices[i].fdt_property, addr, sizeof(addr)))
             bail("FDT: could not set %s MAC address\n", mac_address_devices[i].alias);
 
-        if (chip_id == T8140 && !strcmp(mac_address_devices[i].alias, "wifi0")) {
+        /* A MediaTek radio's driver takes its address from /chosen as well. */
+        if (!strcmp(mac_address_devices[i].alias, "wifi0") &&
+            dt_compatible_has_prefix(node, "pci14c3,")) {
             int chosen = fdt_path_offset(dt, "/chosen");
             if (chosen < 0 || fdt_setprop(dt, chosen, "asahi,wifi-mac-address", addr, sizeof(addr)))
                 bail("FDT: could not set deferred Wi-Fi MAC address\n");
@@ -2684,10 +2732,6 @@ static int dt_set_bluetooth_cal(int anode, int node, const char *adt_name, const
 
 static int dt_set_bluetooth(void)
 {
-    /* J700's Bluetooth function is part of its PCIe MediaTek radio. */
-    if (chip_id == T8140)
-        return 0;
-
     int ret;
     int anode = adt_path_offset(adt, "/arm-io/bluetooth");
 
@@ -2706,6 +2750,10 @@ static int dt_set_bluetooth(void)
 
     int node = fdt_path_offset(dt, path);
     if (node < 0)
+        return 0;
+
+    /* A Bluetooth function of another vendor (J700's MediaTek radio) has no such blobs. */
+    if (!dt_is_broadcom_radio(node))
         return 0;
 
     ret = dt_set_bluetooth_cal(anode, node, "bluetooth-taurus-calibration-bf",
@@ -2881,8 +2929,8 @@ static int dt_set_wifi(void)
     if (node < 0)
         return 0;
 
-    /* The J700 endpoint is MediaTek, not a Broadcom device. */
-    if (chip_id == T8140)
+    /* The SKU, module and antenna facts below are Broadcom's (J700's radio is MediaTek). */
+    if (!dt_is_broadcom_radio(node))
         return 0;
 
     uint8_t info[16];
@@ -4025,6 +4073,22 @@ struct mem_region {
     u64 size;
 };
 
+/*
+ * A display device that does not resolve. A DT without that alias does not describe the device
+ * (an older DT without display nodes): skip it, as on any chip. An alias that is there but does
+ * not resolve, or an absolute path a caller took from the DT, names a device the DT describes:
+ * reserving its memory without it would hand the OS a device whose DMA view is unknown, so refuse.
+ */
+static int dt_display_node_unresolved(const char *name)
+{
+    if (name[0] != '/' && !fdt_get_alias(dt, name)) {
+        printf("FDT: no '%s' alias, the device tree describes no such display device\n", name);
+        return 0;
+    }
+    printf("FDT: could not resolve '%s', refusing its display reservations\n", name);
+    return -1;
+}
+
 static int dt_add_reserved_regions(const char *dcp_alias, const char *disp_alias,
                                    const char *piodma_alias, const char *compat,
                                    struct disp_mapping *maps, struct mem_region *region,
@@ -4034,15 +4098,14 @@ static int dt_add_reserved_regions(const char *dcp_alias, const char *disp_alias
     dart_dev_t *dart_dcp = NULL, *dart_disp = NULL, *dart_piodma = NULL;
     uint32_t dcp_phandle = 0, disp_phandle = 0, piodma_phandle = 0;
 
-    /* Check for display device aliases, if one is missing assume it is an old DT
-     * without display nodes and return without error.
+    /* Resolve each display device; dt_display_node_unresolved() decides whether a missing
+     * one is an old DT without display nodes (no error) or a broken one (refused).
      * Otherwise init each dart and retrieve the node's phandle.
      */
     if (dcp_alias) {
         int dcp_node = fdt_path_offset(dt, dcp_alias);
         if (dcp_node < 0) {
-            printf("FDT: could not resolve '%s' alias\n", dcp_alias);
-            ret = chip_id == T8140 ? -1 : 0;
+            ret = dt_display_node_unresolved(dcp_alias);
             goto err; // cleanup
         }
         dart_dcp = dt_init_dart_by_node(dcp_node, 0);
@@ -4054,8 +4117,7 @@ static int dt_add_reserved_regions(const char *dcp_alias, const char *disp_alias
     if (disp_alias) {
         int disp_node = fdt_path_offset(dt, disp_alias);
         if (disp_node < 0) {
-            printf("FDT: could not resolve '%s' alias\n", disp_alias);
-            ret = chip_id == T8140 ? -1 : 0;
+            ret = dt_display_node_unresolved(disp_alias);
             goto err; // cleanup
         }
         dart_disp = dt_init_dart_by_node(disp_node, 0);
@@ -4067,8 +4129,7 @@ static int dt_add_reserved_regions(const char *dcp_alias, const char *disp_alias
     if (piodma_alias) {
         int piodma_node = fdt_path_offset(dt, piodma_alias);
         if (piodma_node < 0) {
-            printf("FDT: could not resolve '%s' alias\n", piodma_alias);
-            ret = chip_id == T8140 ? -1 : 0;
+            ret = dt_display_node_unresolved(piodma_alias);
             goto err; // cleanup
         }
 
@@ -8834,16 +8895,22 @@ static int dt_set_sep(void)
         bail("FDT: invalid sep alias path\n");
     memcpy(path, alias, alias_len);
 
-    u64 dram_base = 0, dram_size = 0;
-    if (chip_id == T8140) {
-        int chosen = adt_path_offset(adt, "/chosen");
-        if (chosen < 0 || ADT_GETPROP(adt, chosen, "dram-base", &dram_base) != sizeof(dram_base))
-            bail("ADT: invalid DRAM base for SEP\n");
-        if (ADT_GETPROP(adt, chosen, "dram-size", &dram_size) != sizeof(dram_size))
-            dram_size = mem_size_actual;
-        if (!dram_size || dram_base > UINT64_MAX - dram_size)
-            bail("ADT: invalid DRAM extent for SEP\n");
+    /*
+     * The SEP firmware and the boot-object manifests must lie in physical DRAM. The ADT's
+     * /chosen dram-base and dram-size give it; where an ADT lacks them, the DRAM aura itself maps
+     * (the boot arguments' base rounded down to 4 GiB, and the actual memory size) does.
+     */
+    u64 dram_base = ram_base, dram_size = mem_size_actual;
+    int chosen = adt_path_offset(adt, "/chosen");
+    if (chosen >= 0) {
+        u64 value;
+        if (ADT_GETPROP(adt, chosen, "dram-base", &value) == sizeof(value))
+            dram_base = value;
+        if (ADT_GETPROP(adt, chosen, "dram-size", &value) == sizeof(value))
+            dram_size = value;
     }
+    if (!dram_size || dram_base > UINT64_MAX - dram_size)
+        bail("ADT: invalid DRAM extent for SEP\n");
 
     int anode_mmap = adt_path_offset(adt, "/chosen/memory-map");
     if (anode_mmap < 0)
@@ -8852,9 +8919,8 @@ static int dt_set_sep(void)
     u64 phys_map[2];
     int ret = ADT_GETPROP_ARRAY(adt, anode_mmap, "SEPFW", phys_map);
     if (ret != (int)sizeof(phys_map) || !phys_map[0] || !phys_map[1] ||
-        phys_map[0] > UINT64_MAX - phys_map[1] ||
-        (chip_id == T8140 && (phys_map[0] < dram_base || phys_map[0] > dram_base + dram_size ||
-                              phys_map[1] > dram_base + dram_size - phys_map[0])))
+        phys_map[0] > UINT64_MAX - phys_map[1] || phys_map[0] < dram_base ||
+        phys_map[0] > dram_base + dram_size || phys_map[1] > dram_base + dram_size - phys_map[0])
         bail("ADT: could not get sepfw memory\n");
 
     const char *node_name = "sep-firmware";
@@ -8880,8 +8946,8 @@ static int dt_set_sep(void)
         ret = ADT_GETPROP_ARRAY(adt, anode_manifest, adt_names[i], phys_map);
         if (ret != (int)sizeof(phys_map) || !phys_map[0] || !phys_map[1] ||
             phys_map[1] > (u64)dt_bufsize || phys_map[0] > UINT64_MAX - phys_map[1] ||
-            (chip_id == T8140 && (phys_map[0] < dram_base || phys_map[0] > dram_base + dram_size ||
-                                  phys_map[1] > dram_base + dram_size - phys_map[0]))) {
+            phys_map[0] < dram_base || phys_map[0] > dram_base + dram_size ||
+            phys_map[1] > dram_base + dram_size - phys_map[0]) {
             printf("ADT: no usable SEP %s manifest\n", adt_names[i]);
             continue;
         }
@@ -9707,8 +9773,8 @@ static int dt_set_isp(void)
                 return -1;
             resv = fdt_path_offset(dt, "/reserved-memory");
         }
-    } else if ((chip_id == T8140 || chip_id == T8142) &&
-               isp_get_heap(&heap_phys, &heap_iova, &heap_size)) {
+    } else if (isp_is_isp17a() && isp_get_heap(&heap_phys, &heap_iova, &heap_size)) {
+        /* An ISP17a that isp_init() did not bring up has no firmware to reserve. */
         if (!dt_set_isp_fwdata())
             return 0;
     } else if (!dt_reserve_asc_firmware("/arm-io/isp", "/arm-io/isp0", "isp", false,
@@ -11566,26 +11632,15 @@ int kboot_prepare_dt(void *fdt)
     dt_bufsize = fdt_totalsize(fdt);
     assert(dt_bufsize);
 
-    dt_bufsize += 6 * SZ_16K; // Add 96K of buffer for modifications
-    dt_bufsize += SZ_16K;     // and the SMBIOS description U-Boot builds its tables from (about 6K)
-    // A T6030 or T8122 also takes its PMP values
-    if (chip_id == T6030 || chip_id == T8122)
-        dt_bufsize += 2 * SZ_16K;
-    // A T8122 also takes its GPU and PMP facts and the display clock description
-    if (chip_id == T8122)
-        dt_bufsize += 8 * SZ_16K;
-    // A T6030 also takes its display ADT facts (at most 46K, headers and strings included)
-    if (chip_id == T6030)
-        dt_bufsize += 4 * SZ_16K;
-    // A T6031 takes its PMP values (32K) and its display, GPU and firmware handoff (about 16K)
-    if (chip_id == T6031)
-        dt_bufsize += 4 * SZ_16K;
-    // A T6032 takes only its firmware image UUID list (about 16K)
-    if (chip_id == T6032)
-        dt_bufsize += SZ_16K;
-    // A T6040 takes its PMP values (about 38K) and its firmware handoffs
-    if (chip_id == T6040)
-        dt_bufsize += 4 * SZ_16K;
+    /*
+     * Room for what kboot adds to the tree. One margin on every Mac, sized for the largest
+     * addition kboot makes on any SoC today: 96K of general edits, about 6K of SMBIOS description
+     * U-Boot builds its tables from, and up to 160K of handoff data (a T8122's PMP values, GPU and
+     * PMP facts and display clock description; a T6030's PMP values and display ADT facts, at
+     * most 46K; a T6031's or T6040's PMP values and firmware handoffs; a T6032's firmware UUID
+     * list).
+     */
+    dt_bufsize += DT_EDIT_MARGIN;
     dt = memalign(DT_ALIGN, dt_bufsize);
 
     if (fdt_open_into(fdt, dt, dt_bufsize) < 0)

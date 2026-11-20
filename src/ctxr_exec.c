@@ -7,9 +7,12 @@
 #include "malloc.h"
 #include "memory.h"
 #include "smp.h"
+#include "soc.h"
 #include "string.h"
 #include "utils.h"
 #include "xnuboot.h"
+
+#include "../build/execute_window.h" /* execute_window_expected(), data/execute-window.json */
 
 /*
  * A boot object with no __TEXT_BOOT_EXEC (kcbz 0) runs without SPTM, but iBoot
@@ -193,6 +196,28 @@ bool ctxr_exec_confined(void)
                "confined at EL2\n",
                cpu, exc_last_esr);
     return confined;
+}
+
+/*
+ * The installer, the payload assembler and aurora-secboot choose a padded or an unpadded Stage 1
+ * from data/execute-window.json before aura runs. The probe is the hardware's answer, so check the
+ * file against it, once a boot. A confined chip the file leaves out is enrolled unpadded and can't
+ * start an OS; a listed chip that is not confined is expected only under a raw or a proxy-only
+ * boot object.
+ */
+static void ctxr_exec_check_expected(bool confined)
+{
+    static bool checked;
+    bool expected = execute_window_expected(chip_id);
+
+    if (checked)
+        return;
+    checked = true;
+    if (confined && !expected)
+        printf("CTXR exec: WARNING: chip 0x%x is confined but not in data/execute-window.json\n",
+               chip_id);
+    else if (!confined && expected)
+        printf("CTXR exec: chip 0x%x is in data/execute-window.json but not confined\n", chip_id);
 }
 
 /*
@@ -392,6 +417,7 @@ bool ctxr_exec_os_may_start(void)
     /* ctxr_exec_confined() said why on the panel. */
     if (probe_stuck_cpu >= 0)
         return false;
+    ctxr_exec_check_expected(confined);
     if (!confined || !ctxr_exec_problem())
         return true;
 
