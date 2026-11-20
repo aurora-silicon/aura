@@ -62,9 +62,10 @@ static int publish_gpu_m4(void *dt)
     int gpu = fdt_path_offset(dt, "gpu");
     if (gpu < 0)
         return 0; /* A framebuffer-only DT needs no GPU handoff. */
-    /* The G16 handoff follows the 26.6.2 firmware, not the board; J713 as before. */
+    /* The G16 handoff follows the 26.6.2 and 27.2 firmware, not the board; J713 as before. */
     if (chip_id != T8132 ||
-        (fdt_node_check_compatible(dt, 0, "apple,j713") && os_firmware.version != V26_6_2) ||
+        (fdt_node_check_compatible(dt, 0, "apple,j713") && os_firmware.version != V26_6_2 &&
+         os_firmware.version != V27_2) ||
         fdt_node_check_compatible(dt, gpu, "apple,agx-t8132"))
         return -1;
 
@@ -105,27 +106,39 @@ static int publish_gpu_m4(void *dt)
         if (read_range(sgx, properties[i], &ranges[i]))
             return -1;
 
+    /*
+     * The firmware layout, by the ADT's shape (shared with T6040/T6041): __TEXT and __DATA
+     * (26.6.2), or those and a __DATA_SHARED_RO tail right after __DATA (27.2). Each layout has
+     * its segment names and the flags iBoot gives its segments, at consecutive firmware VAs.
+     */
+    struct gpu_fw_layout fw;
+    if (gpu_fw_layout(sgx, &fw))
+        return -1;
+    static const char *const layout_names[2] = {"__TEXT;__DATA", "__TEXT;__DATA;__DATA_SHARED_RO"};
+    static const u32 layout_flags[2][3] = {{1, 0}, {1, 0x10, 0}};
+    unsigned shape = fw.count - 2;
     u32 len;
     const char *names = adt_getprop(adt, asc, "segment-names", &len);
-    if (!names || len != sizeof("__TEXT;__DATA") || memcmp(names, "__TEXT;__DATA", len))
-        return -1;
-    const struct adt_segment_ranges *segments = adt_getprop(adt, asc, "segment-ranges", &len);
-    if (!segments || len != 2 * sizeof(*segments))
+    if (!names || len != strlen(layout_names[shape]) + 1 || memcmp(names, layout_names[shape], len))
         return -1;
 
-    fdt64_t vas[2];
-    fdt32_t flags[2];
-    for (unsigned i = 0; i < 2; i++) {
-        ranges[4 + i] = (struct gpu_m4_range){segments[i].phys, segments[i].size};
-        if (!valid_range(ranges[4 + i]) || segments[i].remap != segments[i].phys ||
-            segments[i].unk != (i == 0 ? 1 : 0))
+    fdt64_t vas[3];
+    fdt32_t flags[3];
+    u64 va = 0xfffffc0000000000;
+    for (unsigned i = 0; i < fw.count; i++) {
+        const struct adt_segment_ranges *seg = &fw.seg[i];
+        if (!valid_range((struct gpu_m4_range){seg->phys, seg->size}) || seg->remap != seg->phys ||
+            seg->unk != layout_flags[shape][i] || seg->iova != va ||
+            seg->iova + seg->size <= seg->iova)
             return -1;
-        fdt64_st(&vas[i], segments[i].iova);
-        flags[i] = cpu_to_fdt32(segments[i].unk);
+        va += seg->size;
+        fdt64_st(&vas[i], seg->iova);
+        flags[i] = cpu_to_fdt32(seg->unk);
     }
-    if (segments[0].iova != 0xfffffc0000000000 ||
-        segments[1].iova != segments[0].iova + segments[0].size ||
-        segments[1].iova + segments[1].size <= segments[1].iova)
+    /* gpu-fw-data is __DATA, and the __DATA_SHARED_RO tail when the firmware has one. */
+    ranges[4] = (struct gpu_m4_range){fw.text_base, fw.text_size};
+    ranges[5] = (struct gpu_m4_range){fw.data_base, fw.data_size + fw.ro_size};
+    if (!valid_range(ranges[5]))
         return -1;
 
     /* Boot addresses are observed, never copied from one successful boot. */
@@ -150,12 +163,15 @@ static int publish_gpu_m4(void *dt)
             fdt_setprop_empty(dt, node, "no-map") || fdt_setprop_string(dt, node, "status", "okay"))
             return -1;
     }
+    /* Version 1: two segments. Version 2: three, gpu-fw-data with the __DATA_SHARED_RO tail. */
     gpu = fdt_path_offset(dt, "gpu");
-    if (fdt_setprop(dt, gpu, "apple,firmware-segment-vas", vas, sizeof(vas)) ||
-        fdt_setprop(dt, gpu, "apple,firmware-segment-flags", flags, sizeof(flags)) ||
-        fdt_setprop_u32(dt, gpu, "apple,g16-handoff-version", 1))
+    if (fdt_setprop(dt, gpu, "apple,firmware-segment-vas", vas, fw.count * sizeof(vas[0])) ||
+        fdt_setprop(dt, gpu, "apple,firmware-segment-flags", flags, fw.count * sizeof(flags[0])) ||
+        fdt_setprop_u32(dt, gpu, "apple,g16-handoff-version", shape + 1))
         return -1;
-    printf("FDT: GPU: published M4 G16 memory resources without starting the GPU\n");
+    printf("FDT: GPU: published M4 G16 memory resources (%u firmware segments) without starting "
+           "the GPU\n",
+           fw.count);
     return 0;
 }
 
