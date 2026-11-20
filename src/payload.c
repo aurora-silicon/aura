@@ -597,6 +597,12 @@ int payload_run(void)
          * on if this stage used it.
          */
         bool nvme_started = !boot_spec && nvme_post_m4_passed_off();
+        /* LAB ONLY (J713-IO2): take the failed-start path without starting ANS */
+        if (nvme_started) {
+            printf("nvme: LAB forced ANS start failure (lab image, never ship)\n");
+            payload_nvme_start_failed();
+            goto boot_failed;
+        }
         if (nvme_started && !nvme_init()) {
             payload_nvme_start_failed();
             goto boot_failed;
