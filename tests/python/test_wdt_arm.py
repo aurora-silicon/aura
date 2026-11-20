@@ -72,8 +72,10 @@ int main(void)
     writes = 0;
     assert(wdt_arm_seconds(0) == -1 && writes == 0);
     assert(wdt_arm_seconds(179) == -1 && writes == 0);
+    /* Any chip with the version 2 layout: the ADT decides, not the chip */
     chip_id = 0x8103;
-    assert(wdt_arm_seconds(30) == -1 && writes == 0);
+    assert(wdt_arm_seconds(30) == 0 && writes == 4);
+    writes = 0;
     chip_id = T6040;
     adt_version = 3;
     assert(wdt_arm_seconds(30) == -1 && writes == 0);
@@ -93,7 +95,6 @@ int main(void)
 
     /* A trial arms on any chip with the version 2 layout, after disarming iBoot's */
     chip_id = 0x6000;
-    assert(wdt_arm_seconds(30) == -1);
     secondary_value = 1;
     writes = disables = 0;
     assert(wdt_arm_trial() == 0 && disables == 1);

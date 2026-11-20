@@ -95,7 +95,9 @@ CARGO_FLAGS :=
 endif
 
 # Bring-up: skip MMU, MCC, AIC, SMP, PMGR, display and USB init and go
-# straight to the proxy on the boot console.
+# straight to the proxy on the boot console. A BRINGUP build never hands
+# off to a kernel payload (secondary CPUs are not started and carveouts are
+# not unmapped): it prints why and stays in the proxy.
 ifeq ($(BRINGUP),1)
 CFG += BRINGUP
 endif
@@ -238,7 +240,6 @@ OBJECTS := \
 	chickens.o \
 	clk.o \
 	cpufreq.o \
-	cpufreq_t6040.o \
 	dapf.o \
 	dart.o \
 	dcp.o \
@@ -422,6 +423,9 @@ build-cfg src/../build/build_cfg.h &:
 	$(QUIET)python3 tools/secboot_sign.py c-header $(SECBOOT_PUBKEY) > build/secboot_key.tmp
 	$(QUIET)cmp -s build/secboot_key.h build/secboot_key.tmp 2>/dev/null || \
 	( mv -f build/secboot_key.tmp build/secboot_key.h && echo "  KEY   build/secboot_key.h" )
+	$(QUIET)python3 tools/execute_window.py c-header > build/execute_window.tmp
+	$(QUIET)cmp -s build/execute_window.h build/execute_window.tmp 2>/dev/null || \
+	( mv -f build/execute_window.tmp build/execute_window.h && echo "  XWIN  build/execute_window.h" )
 	$(QUIET)for i in $(CFG); do echo "#define $$i"; done > build/build_cfg.tmp
 	$(QUIET)echo "#define BUILTIN_LOGO $(BUILTIN_LOGO)" >> build/build_cfg.tmp
 	$(QUIET)cmp -s build/build_cfg.h build/build_cfg.tmp 2>/dev/null || \

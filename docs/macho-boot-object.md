@@ -204,6 +204,27 @@ an image without the `ARM\x64` magic, or one that doesn't fit the window. It als
 won't place one when the initrd or the device tree overlaps the window. A described
 bootloader handoff that overlaps the window fails `kboot_prepare_dt()`.
 
+### Which chips pad the boot object
+
+The installer has to choose a padded or an unpadded Stage 1 before aura has run on the
+Mac, and nothing in the ADT says whether iBoot will leave the CTXR windows armed. The
+choice is a chip ID rule, and `data/execute-window.json` is its only copy: inclusive
+ranges of chip IDs, at present `0x8130`-`0x8fff` (T8132, T8140, T8142, T8152 and later)
+and `0x6040`-`0x6fff` (T6040/T6041, T605x and later). M1 to M3 (T8103, T8112, T8122,
+T600x, T602x, T603x) are below both.
+
+- `tools/execute_window.py check 0x8132` exits 0 for a chip that pads and 1 for one
+  that doesn't; `tools/execute_window.py json` prints the ranges. Release packages
+  carry both files.
+- aura builds `build/execute_window.h` from the file. On every boot that probes, it
+  compares the answer with the file: a confined chip that the file leaves out gets a
+  warning (`CTXR exec: WARNING: chip 0x... is confined but not in
+  data/execute-window.json`), since the installer would enroll it unpadded and it
+  could not start an OS. A listed chip that isn't confined gets a note; that is
+  expected under a raw or proxy-only boot object.
+- On a running system the hardware answer is `/chosen/aurora,ctxr-exec-window`: aura
+  publishes it on every boot whose secondaries are confined and that starts an OS.
+
 ### Which Stage 2 a Stage 1 loads
 
 A Stage 2 from this tree can only run under a padded Stage 1, so on Mach-O chips a
