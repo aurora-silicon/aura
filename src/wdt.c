@@ -99,6 +99,17 @@ int wdt_arm_seconds(unsigned seconds)
     return wdt_arm(seconds);
 }
 
+/*
+ * J613 capture: the same arm as Linux's sleep witness (count 0, alarm, reset enabled), at macOS's
+ * own commit writes, to learn whether this watchdog bites a SoC that really sleeps.
+ */
+int wdt_arm_sleep_witness(unsigned seconds)
+{
+    if (chip_id != T8122)
+        return -1;
+    return wdt_arm(seconds);
+}
+
 int wdt_arm_recovery(unsigned seconds)
 {
     /* This command is deliberately narrower than the generic proxy arm. */

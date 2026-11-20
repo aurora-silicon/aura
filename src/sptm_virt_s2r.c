@@ -1364,6 +1364,10 @@ static bool s2r_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int w
                    smp_id(), ctx->elr, sptm_virt_s2r_head);
             if (sptm_virt_s2r_wake_s)
                 s2r_rtc_arm();
+#ifdef SPTM_VIRT_S2R_WD1_S
+            /* A capture build's watchdog witness: does it bite a SoC that really sleeps? */
+            s2r_marker("WD1ARM", wdt_arm_sleep_witness(SPTM_VIRT_S2R_WD1_S) ? 0 : SPTM_VIRT_S2R_WD1_S);
+#endif
             iodev_console_flush();
             s2r_commit();
             msr(CNTP_CTL_EL0, 0); /* aura's EL2 timers (E2H: CNTHP, CNTHV) on this core */
