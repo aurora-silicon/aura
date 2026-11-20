@@ -110,3 +110,45 @@ int pmu_read_boot_record(u8 *counts, u8 *error_stage)
     *error_stage = record[1];
     return 0;
 }
+
+/*
+ * T6040, T8140 and T6050 clear the count in every aura stage (pmu_clear_panic_counter()), so a
+ * later stage never sees it: there it can't bound anything.
+ */
+bool pmu_counter_cleared_by_aura(void)
+{
+    return chip_id == T6040 || chip_id == T8140 || chip_id == T6050;
+}
+
+/*
+ * Count this boot as failed now, before a reboot that iBoot may or may not count itself: the next
+ * boot then sees at least one more failed boot. The panic count is kept.
+ */
+int pmu_count_failed_boot(u8 *before)
+{
+    char path[64];
+    u8 addr;
+    u16 scrpad;
+    if (pmu_find_scratchpad(path, sizeof(path), &addr, &scrpad))
+        return -1;
+
+    spmi_dev_t *spmi = spmi_init(path);
+    if (!spmi)
+        return -1;
+
+    u16 counter = scrpad + PMU_SCRPAD_COUNTS;
+    u8 val = 0;
+    int ret = spmi_ext_read_long(spmi, addr, counter, &val, 1);
+    if (!ret) {
+        u8 next = pmu_counts_add_failed_boot(val);
+        if (next != val)
+            ret = spmi_ext_write_long(spmi, addr, counter, &next, 1);
+    }
+    spmi_shutdown(spmi);
+    if (ret) {
+        printf("pmu: failed to count the failed boot at %s:%02x reg %x\n", path, addr, counter);
+        return -1;
+    }
+    *before = val;
+    return 0;
+}
