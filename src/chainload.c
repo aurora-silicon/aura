@@ -10,6 +10,7 @@
 #include "malloc.h"
 #include "memory.h"
 #include "nvme.h"
+#include "pmu_counter.h"
 #include "secboot.h"
 #include "stage1_config.h"
 #include "string.h"
@@ -392,6 +393,18 @@ int chainload_load(const char *spec, char **vars, size_t *var_cnt, size_t var_ca
             }
             vars[(*var_cnt)++] = sart_var;
         }
+    }
+
+    /* The failed-boot count this stage cleared, for a later stage's reboot decision. */
+    const char *failed_var = pmu_failed_boots_var();
+    if (failed_var) {
+        bool present = false;
+        for (size_t i = 0; i < *var_cnt; i++)
+            present |= vars[i] == failed_var;
+        if (!present && *var_cnt < var_capacity)
+            vars[(*var_cnt)++] = (char *)failed_var;
+        else if (!present)
+            printf("chainload: no room for aura.failed-boots\n");
     }
 
     bool proxy_request = false;
