@@ -20,8 +20,6 @@ typedef uint32_t u32;
 _Static_assert(sizeof(u64) == 8, "production u64 ABI");
 #define RVBAR_LOCK 1
 #define RVBAR_ADDR 0x0000fffffffff000UL
-/* Userspace test symbols may sit above the hardware's 44-bit RVBAR range. */
-#define RVBAR_ADDR_UNLOCKED 0x0000fffffffff000UL
 #define MAIR_IDX_NORMAL 0
 #define PERM_RW 0
 #define PERM_RX 1
@@ -35,7 +33,6 @@ static u32 word;
 static int writes, mappings[2], nmap, owned_asks;
 static bool active = true;
 static u64 read64(u64 address) { assert(address == 8); return rvbar; }
-static void write64(u64 address, u64 value) { assert(address == 8); rvbar = value; }
 static u32 read32(u64 address) { assert(address == locked); return word; }
 static void write32(u64 address, u32 value) { assert(address == locked); word = value; writes++; }
 static u64 old_vectors_start(void) { return 0; }

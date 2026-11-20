@@ -288,16 +288,9 @@ static int smp_prepare_rvbar(const struct cpu_info *cpu)
     u64 locked = rvbar & RVBAR_ADDR;
     u64 target = (u64)_vectors_start;
 
-    if (locked == target)
+    /* A7 to M3: RVBAR is not locked, and smp_start_cpu() sets it. */
+    if (locked == target || cpu_features->apple_sysregs_unlocked)
         return 0;
-    /* A7 to M3 expose a writable RVBAR.  The ordinary SMP startup path writes it immediately
-     * before releasing a core, but a stock-SPTM guest performs CPUSTART itself, so publish the
-     * active Aura vector here as part of the guest reset contract as well. */
-    if (cpu_features->apple_sysregs_unlocked) {
-        write64(cpu->impl_reg, target);
-        sysop("dsb sy");
-        return (read64(cpu->impl_reg) & RVBAR_ADDR_UNLOCKED) == target ? 0 : -1;
-    }
     /* A stage that moved above the chainloaded image keeps entry at its old base. */
     if (relocated_from && locked == old_vectors_start())
         return 0;
@@ -1468,6 +1461,27 @@ static u64 smp_guest_mpidr(int i)
 }
 
 /*
+ * The stock-SPTM guest's reset contract. A7 to M3 leave RVBAR writable, and the ordinary SMP path
+ * writes it only in smp_start_cpu(), just before releasing a core. Here the guest performs CPUSTART
+ * itself, so publish this image's vector into an unlocked RVBAR now and read it back. A locked
+ * RVBAR (M4 on, or a core's own lock bit) is never written; smp_prepare_rvbar() checks it.
+ */
+static int smp_prepare_guest_rvbar(const struct cpu_info *cpu)
+{
+    u64 target = (u64)_vectors_start;
+    u64 rvbar = read64(cpu->impl_reg);
+
+    if (!cpu_features->apple_sysregs_unlocked || (rvbar & RVBAR_LOCK) ||
+        (rvbar & RVBAR_ADDR_UNLOCKED) == target)
+        return smp_prepare_rvbar(cpu);
+    if (target & ~RVBAR_ADDR_UNLOCKED)
+        return -1;
+    write64(cpu->impl_reg, target);
+    sysop("dsb sy");
+    return (read64(cpu->impl_reg) & RVBAR_ADDR_UNLOCKED) == target ? 0 : -1;
+}
+
+/*
  * Under the virtualized SPTM every core enters the guest through a hardware reset, as natively:
  * XNU starts a core with PMGR CPUSTART, and a core that power-gates in idle or sleep comes back
  * the same way, at its iBoot-locked RVBAR, which must reach aura (sptm_virt_cpu_reset). So nothing
@@ -1500,7 +1514,7 @@ int smp_prepare_guest_resets(void)
             }
             smp_reset_stacks[i].mpidr = mpidr;
             smp_reset_stacks[i].stack = (u64)cpu_stack(i) + SECONDARY_STACK_SIZE;
-            rc = smp_prepare_rvbar(cpu);
+            rc = smp_prepare_guest_rvbar(cpu);
         }
         /* A secondary must be powered off here: XNU's CPUSTART only resets a core that is
          * off, and one left running (an earlier stage's park loop) never reaches SPTM. */
