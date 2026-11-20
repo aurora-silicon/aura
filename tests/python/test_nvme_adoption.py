@@ -152,7 +152,14 @@ static int adt_path_offset(void *a, const char *p) { return 1; }
 static int pcie_ans_power_on(void) { assert(chip_id != T6050); ans_ons++; ans_powered = true; return 0; }
 /* Only T6050 powers ANS off, and it isn't modelled: every other SoC leaves it STOPPED. */
 static int pcie_ans_power_off(void) { ans_offs++; return -1; }
-static bool rtkit_boot_warm(rtkit_dev_t *r, u32 mask) { assert(0); return false; }
+/* Every post-M4 start from STOPPED is the warm start after the reset (Ryan Murray's order). */
+static bool rtkit_boot_warm(rtkit_dev_t *r, u32 mask)
+{
+    warm_boots++;
+    cpu_running = true;
+    started = failure != 8;
+    return failure != 8;
+}
 static int sart_get_entries(sart_dev_t *s, struct sart_entry *e, int max) { return 1; }
 static bool sart_set_entries(sart_dev_t *s, const struct sart_entry *e, int n) { return true; }
 static sart_dev_t *sart_init(const char *path) { return &sart; }
@@ -246,20 +253,25 @@ int main(int argc, char **argv)
             return 0;
         }
         assert(nvme_init());
-        /* iBoot's session is woken for its handshake first; an older stage's is asked directly. */
-        assert(boots == (earlier_session ? 1 : 2) && held_resets == 1 && cpu_running);
-        assert(!ans_offs && !ans_ons && !warm_boots);
+        /*
+         * iBoot's session is woken for its handshake first (one cold boot); an older stage's is
+         * asked directly. Then ANS is reset and started from STOPPED: the warm start.
+         */
+        assert(boots == (earlier_session ? 0 : 1) && warm_boots == 1 && held_resets == 1 &&
+               cpu_running);
+        assert(!ans_offs && !ans_ons);
         /* Done with ANS: SLEEP acknowledged, its CPU stopped, then ANS alone reset. */
         memset(events, 0, sizeof(events));
         assert(nvme_shutdown());
         assert(!strcmp(events, "SH") && !cpu_running && ans_powered && !ans_offs);
         assert(!nvme_initialized && !nvme_reboot_required && queue_frees == 2);
-        /* The next owner starts it from STOPPED: reset again, one cold boot, nothing to stop. */
-        int saved_boots = boots, saved_shutdowns = shutdown_calls;
+        /* The next owner starts it from STOPPED: reset again, one warm start, nothing to stop. */
+        int saved_boots = boots, saved_warm = warm_boots, saved_shutdowns = shutdown_calls;
         memset(events, 0, sizeof(events));
         assert(nvme_init());
-        assert(boots == saved_boots + 1 && !strcmp(events, "H") && cpu_running);
-        assert(shutdown_calls == saved_shutdowns && !warm_boots);
+        assert(boots == saved_boots && warm_boots == saved_warm + 1 && !strcmp(events, "H") &&
+               cpu_running);
+        assert(shutdown_calls == saved_shutdowns);
         assert(nvme_shutdown() && !cpu_running && !ans_offs);
         for (unsigned i = 0; i < allocated; i++)
             free(allocations[i]);
@@ -338,11 +350,11 @@ int main(int argc, char **argv)
     assert(nvme_init() == (failure == 0 || failure == 7 || failure == 9 || failure == 10 ||
                            failure == 23 || failure == 26));
     /*
-     * A running session from iBoot gets its handshake, SLEEP and a reset, then the start from
-     * STOPPED; ANS off with no entries is refused before any register of it is read.
+     * A running session from iBoot gets its handshake (a cold boot), SLEEP and a reset, then the
+     * warm start from STOPPED; ANS off with no entries is refused before any register is read.
      */
     if (failure == 26)
-        assert(boots == 2 && held_resets == 1);
+        assert(boots == 1 && warm_boots == 1 && held_resets == 1);
     if (failure == 27)
         assert(boots == 0 && !held_resets && !ans_ons);
     if (failure == 1 || failure == 6 || (failure >= 11 && failure <= 14) || failure == 24 ||

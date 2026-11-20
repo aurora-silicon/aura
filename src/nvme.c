@@ -23,6 +23,8 @@
 #define NVME_ENABLE_TIMEOUT   5000000
 #define NVME_SHUTDOWN_TIMEOUT 5000000
 #define NVME_SUSPEND_TIMEOUT  35000 /* macOS's, from its console */
+/* ASC CPU status: the state a reset of ANS leaves its CPU in until the run bit. */
+#define NVME_ASC_STATUS_RESET BIT(3)
 #define NVME_QUEUE_SIZE       64
 
 static u32 nvme_cmd_timeout_us = NVME_TIMEOUT;
@@ -1021,10 +1023,24 @@ bool nvme_init(void)
         if ((earlier && !nvme_ans_power_off()) || !nvme_ans_power_on())
             goto out_preserve;
     } else {
-        /* From STOPPED: the mailbox's receive side on before the run bit, as after a power loss. */
-        if (stopped_contract)
+        /*
+         * From STOPPED: a CPU that was stopped without a reset since it last ran doesn't start
+         * again from the run bit, and its firmware sends no HELLO, then or later. So check the
+         * reset state first and, when it's missing, stop the CPU and reset ANS (its SART entries
+         * put back) before the run bit; then the mailbox's receive side on and the warm start, as
+         * after a power loss. The order Ryan Murray's post-M4 start from off uses (aura c0a50c00,
+         * the J713 27.2 chain).
+         */
+        if (stopped_contract) {
+            u32 st = asc_cpu_status(nvme_asc);
+            printf("nvme: from STOPPED: ANS CPU status 0x%x before the run bit\n", st);
+            if (!(st & NVME_ASC_STATUS_RESET)) {
+                asc_cpu_stop(nvme_asc);
+                nvme_ans_reset(nvme_die, nvme_asc);
+            }
             asc_i2a_enable(nvme_asc, true);
-        if (!rtkit_boot(nvme_rtkit))
+        }
+        if (!(stopped_contract ? rtkit_boot_warm(nvme_rtkit, BIT(0)) : rtkit_boot(nvme_rtkit)))
             goto out_rtkit;
         nvme_boot_ticks = get_ticks();
 
