@@ -822,6 +822,41 @@ static void s2r_j613_wide(const char *tag)
     s2r_clean(&sptm_virt_s2r_head, sizeof(sptm_virt_s2r_head));
 }
 
+/*
+ * J613: bit 30 of each +0x10 word in the PMGR's 0x80-byte controller blocks at 0x2d0725000..
+ * 0x2d0726fff, one bit per block (block 0 in bit 0). Linux's own probe and hold print the same
+ * mask; macOS's commit has six blocks set that Linux never sets.
+ */
+void sptm_virt_s2r_ctl_print(const char *when)
+{
+    if (chip_id != T8122)
+        return;
+    u64 m = 0;
+    for (unsigned i = 0; i < 64; i++) {
+        u64 v = s2r_snapshot_read(0x2d0725010 + i * 0x80, false);
+        if (v != ~0UL && (v & BIT(30)))
+            m |= BIT(i);
+    }
+    printf("SPTM-virt[ctl]: controller blocks active %s %016lx\n", when, m);
+}
+
+/* Every 10 s while the guest runs: the same mask, printed only when it changes. */
+void sptm_virt_s2r_ctl_watch(void)
+{
+    static u64 last = ~0UL;
+    if (chip_id != T8122)
+        return;
+    u64 m = 0;
+    for (unsigned i = 0; i < 64; i++) {
+        u64 v = s2r_snapshot_read(0x2d0725010 + i * 0x80, false);
+        if (v != ~0UL && (v & BIT(30)))
+            m |= BIT(i);
+    }
+    if (m != last)
+        printf("SPTM-virt[ctl]: controller blocks active now %016lx (was %016lx)\n", m, last);
+    last = m;
+}
+
 /* Aura owns this buffer. Vary the pattern on each commit and publish it to DRAM. */
 static u32 s2r_j613_dram[256] __attribute__((aligned(64)));
 
@@ -1173,6 +1208,7 @@ static void s2r_j613_stop_export(void)
         s2r_j613_snapshot("J613STOP", false, false);
         if (chip_id == T8122 && (sptm_virt_s2r_crumbs & BIT(28)))
             s2r_j613_wide("J613WIDE");
+        sptm_virt_s2r_ctl_print("at the withheld commit");
     }
     u64 head = sptm_virt_s2r_head;
     u64 from = head > sptm_virt_s2r_nrec ? head - sptm_virt_s2r_nrec : 0;

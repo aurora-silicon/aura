@@ -146,6 +146,8 @@ bool sptm_virt_s2r_uart_byte(u8 b);
 /* usb.c: the link's bring-up after a wake runs on a coroutine whose waits give the core back. */
 bool sptm_virt_s2r_usb_yieldable(void);
 bool sptm_virt_s2r_usb_yield(u32 us);
+void sptm_virt_s2r_ctl_print(const char *when);
+void sptm_virt_s2r_ctl_watch(void);
 
 #else
 
@@ -166,6 +168,13 @@ static inline bool sptm_virt_sample_fiq(u64 *regs)
 {
     (void)regs;
     return false;
+}
+static inline void sptm_virt_s2r_ctl_print(const char *when)
+{
+    (void)when;
+}
+static inline void sptm_virt_s2r_ctl_watch(void)
+{
 }
 static inline void sptm_virt_s2r_uart_tick(void)
 {

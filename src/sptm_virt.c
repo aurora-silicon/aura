@@ -669,6 +669,7 @@ __attribute__((used, retain)) void sptm_virt_enter(void)
     sptm_virt_j613_entry_mark(0x20);
     printf("\nSPTM-virt: entering SPTM at 0x%lx, boot_args 0x%lx\n", sptm_entry_pa,
            sptm_handoff_pa);
+    sptm_virt_s2r_ctl_print("at guest entry");
     nv2_active = true;
     nv2_guarded = true;
 
