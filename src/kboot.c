@@ -2600,6 +2600,30 @@ err:
     return ret;
 }
 
+/*
+ * Whether one of the node's compatible strings starts with prefix. The radios are PCI functions,
+ * named by PCI vendor: "pci14e4," is Broadcom, "pci14c3," is MediaTek.
+ */
+static bool dt_compatible_has_prefix(int node, const char *prefix)
+{
+    int count = fdt_stringlist_count(dt, node, "compatible");
+    size_t plen = strlen(prefix);
+
+    for (int i = 0; i < count; i++) {
+        int len;
+        const char *compatible = fdt_stringlist_get(dt, node, "compatible", i, &len);
+        if (compatible && (size_t)len >= plen && !strncmp(compatible, prefix, plen))
+            return true;
+    }
+    return false;
+}
+
+/* The Wi-Fi and Bluetooth calibration and identity below are Broadcom's. */
+static bool dt_is_broadcom_radio(int node)
+{
+    return dt_compatible_has_prefix(node, "pci14e4,") || dt_compatible_has_prefix(node, "brcm,");
+}
+
 static struct {
     const char *alias;
     const char *fdt_property;
@@ -2658,7 +2682,9 @@ static int dt_set_mac_addresses(void)
         if (fdt_setprop(dt, node, mac_address_devices[i].fdt_property, addr, sizeof(addr)))
             bail("FDT: could not set %s MAC address\n", mac_address_devices[i].alias);
 
-        if (chip_id == T8140 && !strcmp(mac_address_devices[i].alias, "wifi0")) {
+        /* A MediaTek radio's driver takes its address from /chosen as well. */
+        if (!strcmp(mac_address_devices[i].alias, "wifi0") &&
+            dt_compatible_has_prefix(node, "pci14c3,")) {
             int chosen = fdt_path_offset(dt, "/chosen");
             if (chosen < 0 || fdt_setprop(dt, chosen, "asahi,wifi-mac-address", addr, sizeof(addr)))
                 bail("FDT: could not set deferred Wi-Fi MAC address\n");
@@ -2684,10 +2710,6 @@ static int dt_set_bluetooth_cal(int anode, int node, const char *adt_name, const
 
 static int dt_set_bluetooth(void)
 {
-    /* J700's Bluetooth function is part of its PCIe MediaTek radio. */
-    if (chip_id == T8140)
-        return 0;
-
     int ret;
     int anode = adt_path_offset(adt, "/arm-io/bluetooth");
 
@@ -2706,6 +2728,10 @@ static int dt_set_bluetooth(void)
 
     int node = fdt_path_offset(dt, path);
     if (node < 0)
+        return 0;
+
+    /* A Bluetooth function of another vendor (J700's MediaTek radio) has no such blobs. */
+    if (!dt_is_broadcom_radio(node))
         return 0;
 
     ret = dt_set_bluetooth_cal(anode, node, "bluetooth-taurus-calibration-bf",
@@ -2881,8 +2907,8 @@ static int dt_set_wifi(void)
     if (node < 0)
         return 0;
 
-    /* The J700 endpoint is MediaTek, not a Broadcom device. */
-    if (chip_id == T8140)
+    /* The SKU, module and antenna facts below are Broadcom's (J700's radio is MediaTek). */
+    if (!dt_is_broadcom_radio(node))
         return 0;
 
     uint8_t info[16];
