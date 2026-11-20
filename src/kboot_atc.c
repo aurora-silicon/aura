@@ -811,6 +811,62 @@ static void dt_copy_atc_t6030_dp_tunables(void *dt, int adt_node, int fdt_node,
     printf("FDT: Copied the DP calibration for %s\n", adt_path);
 }
 
+/*
+ * The controller tunables macOS applies in either role (usb-drdN in the ADT), for the dwc3 node
+ * driven by that ATC PHY. dwc3-apple applies them after each core reset. Without them a T8132
+ * controller in device mode enumerates but never finishes SET_CONFIGURATION for a function that
+ * queues an interrupt IN transfer during it (CDC NCM/ACM; J713 on 27.2).
+ */
+static const struct adt_tunable_info drd_default_tunables[] = {
+    {"tunable_DRD_USB31_GBL_DEFAULT", "apple,tunable-gbl-default", 0, 0x600, true},
+    {"tunable_DRD_USB31_DBG_DEFAULT", "apple,tunable-dbg", 0, 0x800, true},
+    {"tunable_LINK_REGS_DEFAULT", "apple,tunable-link", 0, 0x800, true},
+};
+
+/* The dwc3 node whose first PHY is this ATC PHY node. */
+static int dt_find_atc_controller(void *dt, int phy_node)
+{
+    u32 phandle = fdt_get_phandle(dt, phy_node);
+    if (!phandle)
+        return -1;
+
+    for (int node = fdt_next_node(dt, -1, NULL); node >= 0; node = fdt_next_node(dt, node, NULL)) {
+        int len;
+        const fdt32_t *phys = fdt_getprop(dt, node, "phys", &len);
+
+        if (phys && len >= (int)sizeof(*phys) && fdt32_ld(phys) == phandle &&
+            fdt_stringlist_search(dt, node, "reg-names", "dwc3-core") >= 0)
+            return node;
+    }
+    return -1;
+}
+
+/* All of the controller defaults or none of them. */
+static void dt_copy_drd_default_tunables(void *dt, int port, const char *phy_path)
+{
+    char adt_path[32];
+    snprintf(adt_path, sizeof(adt_path), "/arm-io/usb-drd%d", port);
+    int adt_node = adt_path_offset(adt, adt_path);
+    int phy_node = fdt_path_offset(dt, phy_path);
+    int node = phy_node < 0 ? -1 : dt_find_atc_controller(dt, phy_node);
+
+    if (adt_node < 0 || node < 0) {
+        printf("FDT: no controller for %s: its defaults stay unset\n", adt_path);
+        return;
+    }
+    for (size_t i = 0; i < ARRAY_SIZE(drd_default_tunables); i++)
+        fdt_delprop(dt, node, drd_default_tunables[i].fdt_name);
+    for (size_t i = 0; i < ARRAY_SIZE(drd_default_tunables); i++) {
+        if (dt_append_atc_tunable(dt, adt_node, node, &drd_default_tunables[i])) {
+            for (size_t j = 0; j < ARRAY_SIZE(drd_default_tunables); j++)
+                fdt_delprop(dt, node, drd_default_tunables[j].fdt_name);
+            printf("FDT: %s controller defaults incomplete; none passed\n", adt_path);
+            return;
+        }
+    }
+    printf("FDT: Copied %s controller defaults\n", adt_path);
+}
+
 /* Publish the complete USB3 bundle or none of it, preserving USB2 fallback. */
 static void dt_copy_t8132_usb3_tunables(void *dt, int adt_node, int fdt_node)
 {
@@ -878,6 +934,7 @@ static void dt_copy_atc_tunables(void *dt, const char *adt_path, const char *dt_
         !fdt_node_check_compatible(dt, fdt_node, "apple,t8132-atcphy") &&
         adt_is_compatible_at(adt, adt_node, "atc-phy,t8132", 0)) {
         dt_copy_t8132_usb3_tunables(dt, adt_node, fdt_node);
+        dt_copy_drd_default_tunables(dt, port, fdt_path);
         return;
     }
 
