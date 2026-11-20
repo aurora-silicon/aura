@@ -4305,28 +4305,32 @@ static int dt_vram_reserved_region(const char *dcp_alias, const char *disp_alias
                                    disp_reserved_regions_vram, &region, 1);
 }
 
-static u64 adt_u64_or_u32(const void *val, u32 len)
-{
-    u64 v64;
-    u32 v32;
-
-    if (len == sizeof(v64)) {
-        memcpy(&v64, val, sizeof(v64));
-        return v64;
-    }
-    memcpy(&v32, val, sizeof(v32));
-    return v32;
-}
+#define DART_T8110_PARAMS3            0x08
+#define DART_T8110_PARAMS3_VA_WIDTH   GENMASK(21, 16)
 
 /*
- * The DVA window [*base, *end) of the DART an ADT device names in iommu-parent, from the
- * DART's vm-base and vm-size. Nonzero when the device or its DART does not describe one.
+ * The input address width of the T8110-style DART that translates for a device: the FDT
+ * node's first iommus entry, which must be the DART the ADT device names in iommu-parent
+ * (same registers), read from the DART's PARAMS3 as Linux does. Nonzero when either tree
+ * does not describe one.
  */
-static int adt_iommu_window(int adt_node, u64 *base, u64 *end)
+static int dt_device_dart_va_bits(int fdt_node, int adt_node, u32 *bits)
 {
-    u32 len = 0, parent;
-    const void *pprop = adt_getprop(adt, adt_node, "iommu-parent", &len);
-    if (!pprop || len != sizeof(parent))
+    int len = 0;
+    const fdt32_t *iommus = fdt_getprop(dt, fdt_node, "iommus", &len);
+    if (!iommus || len < 4)
+        return -1;
+    int dart = fdt_node_offset_by_phandle(dt, fdt32_ld(iommus));
+    if (dart < 0 || fdt_node_check_compatible(dt, dart, "apple,t8110-dart"))
+        return -1;
+    const fdt32_t *reg = fdt_getprop(dt, dart, "reg", &len);
+    if (!reg || len < 16)
+        return -1;
+    u64 base = ((u64)fdt32_ld(&reg[0]) << 32) | fdt32_ld(&reg[1]);
+
+    u32 plen = 0, parent;
+    const void *pprop = adt_getprop(adt, adt_node, "iommu-parent", &plen);
+    if (!pprop || plen != sizeof(parent))
         return -1;
     memcpy(&parent, pprop, sizeof(parent));
 
@@ -4335,18 +4339,23 @@ static int adt_iommu_window(int adt_node, u64 *base, u64 *end)
         return -1;
     ADT_FOREACH_CHILD(adt, node)
     {
-        u32 ph, blen = 0, slen = 0;
+        u32 ph;
         if (ADT_GETPROP(adt, node, "AAPL,phandle", &ph) != sizeof(ph) || ph != parent)
             continue;
-        const void *vb = adt_getprop(adt, node, "vm-base", &blen);
-        const void *vs = adt_getprop(adt, node, "vm-size", &slen);
-        if (!vb || !vs || (blen != 4 && blen != 8) || (slen != 4 && slen != 8))
+
+        char path[64];
+        int trace[8];
+        u64 adt_base, adt_size;
+        snprintf(path, sizeof(path), "/arm-io/%s", adt_get_name(adt, node));
+        if (adt_path_offset_trace(adt, path, trace) < 0 ||
+            adt_get_reg(adt, trace, "reg", 0, &adt_base, &adt_size) < 0 || adt_base != base ||
+            adt_size < DART_T8110_PARAMS3 + 4)
             return -1;
-        u64 b = adt_u64_or_u32(vb, blen), size = adt_u64_or_u32(vs, slen);
-        if (!size || b > UINT64_MAX - size)
+
+        u32 va = FIELD_GET(DART_T8110_PARAMS3_VA_WIDTH, read32(base + DART_T8110_PARAMS3));
+        if (va < 32 || va > 48)
             return -1;
-        *base = b;
-        *end = b + size;
+        *bits = va;
         return 0;
     }
     return -1;
@@ -4388,9 +4397,10 @@ static int dt_reserve_asc_segments_at(int fdt_node, const char *adt_path, const 
         dram_end = dram_base + dram_size;
     }
 
-    /* Only the DRAM segment reservation (dram_only) checks them against the DART's window */
-    u64 win_base = 0, win_end = 0;
-    bool have_window = dram_only && !adt_iommu_window(node, &win_base, &win_end);
+    /* Only the DRAM segment reservation (dram_only) checks them against the DART's range */
+    u32 va_bits = 0;
+    bool have_window = dram_only && !dt_device_dart_va_bits(fdt_node, node, &va_bits);
+    u64 win_end = have_window ? BIT(va_bits) : 0;
 
     uint32_t dev_phandle = fdt_get_phandle(dt, fdt_node);
     if (!dev_phandle) {
@@ -4428,14 +4438,13 @@ static int dt_reserve_asc_segments_at(int fdt_node, const char *adt_path, const 
         if (mem_node < 0)
             return mem_node;
         /*
-         * A segment the device's DART cannot address (the T8112 AOP's OS log on 27.2
-         * firmware runs at its DRAM address, above the DART's window) is reserved RAM
+         * A segment above the device DART's input address range (the T8112 AOP's OS log on
+         * 27.2 firmware runs at its DRAM address, past the DART's 32 bits) is reserved RAM
          * only, not an IOVA of the device.
          */
-        if (have_window && (iova < win_base || seg_size > win_end - win_base ||
-                            iova - win_base > win_end - win_base - seg_size)) {
-            printf("FDT: %s: segment 0x%lx at 0x%lx is outside the DART window, RAM only\n",
-                   fdt_path, seg->phys, iova);
+        if (have_window && (seg_size > win_end || iova > win_end - seg_size)) {
+            printf("FDT: %s: segment 0x%lx at 0x%lx is past the DART's %u-bit range, RAM only\n",
+                   fdt_path, seg->phys, iova, va_bits);
             continue;
         }
         uint32_t mem_phandle = fdt_get_phandle(dt, mem_node);
