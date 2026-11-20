@@ -15,6 +15,7 @@
 #include "hv_usb.h"
 #include "hv_vdev_spi.h"
 #include "hv_input.h"
+#include "hv_scanout.h"
 #include "hv_vgic.h"
 #include "mtp_handoff.h"
 #include "smp.h"
@@ -2783,7 +2784,8 @@ static u32 t8152_vspi_level[GICV3_CPUIF_WORDS];
 static bool hv_t8152_vspi_live(u32 intid)
 {
     u32 devices = (hv_ahci_enabled() ? VDEV_SPI_DEV_AHCI : 0) |
-                  (hv_input_enabled() ? VDEV_SPI_DEV_INPUT : 0);
+                  (hv_input_enabled() ? VDEV_SPI_DEV_INPUT : 0) |
+                  (hv_scanout_enabled() ? VDEV_SPI_DEV_SCANOUT : 0);
     return vdev_spi_live(intid, devices);
 }
 
@@ -7469,7 +7471,14 @@ static bool hv_handle_wfx(struct exc_info *ctx)
          * a whole frame, under the lock -- cut guest interrupt throughput by
          * more than an order of magnitude.
          */
-        hv_fb_convert_idle();
+        if (chip_id == T8152) {
+            /* G6-S: a flip in flight first (one band), else the shadow sweep (which stands
+             * down while flips own the panel). */
+            if (!hv_scanout_work(HV_SCANOUT_IDLE_ROWS))
+                hv_fb_convert_slice(HV_FB_SLICE_IDLE);
+        } else {
+            hv_fb_convert_idle();
+        }
         /* Unlocked idle path, same as the slice above: this is where most of
          * the change detection actually happens, because an idle guest exits
          * here constantly and a busy one does not need watching as closely. */
@@ -8087,6 +8096,8 @@ void hv_exc_fiq(struct exc_info *ctx)
         hv_get_context(ctx);
         hv_fatal_note_trap(HV_FATAL_TRAP_FIQ_FAST, ctx->esr, ctx->elr, ctx->spsr, ctx->far);
         hv_update_fiq(ctx);
+        /* G6-S: one bounded band of a flip in flight, unlocked (two loads when there is none). */
+        hv_scanout_work(HV_SCANOUT_FAST_ROWS);
         hv_arm_tick(true);
         return;
     }

@@ -167,6 +167,7 @@ typedef enum {
     P_HV_WINDOWS_GPU = 0xc88,
     P_HV_WINDOWS_INPUT = 0xc89,
     P_HV_WINDOWS_TICK_CPU = 0xc8a,
+    P_HV_WINDOWS_SCANOUT = 0xc8b,
 
     P_FB_INIT = 0xd00,
     P_FB_SHUTDOWN,

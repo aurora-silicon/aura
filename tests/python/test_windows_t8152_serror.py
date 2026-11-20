@@ -68,6 +68,7 @@ static inline int smp_id(void) { return stub_cpu; }
     "hv_usb.h": '#pragma once\nvoid hv_usb_fatal_report(void);\n',
     "hv_gpu.h": '#pragma once\nvoid hv_gpu_fatal_report(void);\n',
     "hv_input.h": '#pragma once\nvoid hv_input_fatal_report(void);\n',
+    "hv_scanout.h": '#pragma once\nvoid hv_scanout_fatal_report(void);\n',
     "hv_serror.h": '#pragma once\n#include "types.h"\n'
                    'void hv_serror_attribute(const u64 *regs, const u64 *sp, u64 esr, u64 elr, '
                    'u64 spsr);\n',

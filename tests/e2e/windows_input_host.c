@@ -1400,7 +1400,10 @@ static void case_spi_gate(void)
     begin("spi_gate");
     CHECK(vdev_spi_is_virtual(990));
     CHECK(vdev_spi_is_virtual(991));
-    CHECK(!vdev_spi_is_virtual(989) && !vdev_spi_is_virtual(992) && !vdev_spi_is_virtual(995));
+    CHECK(!vdev_spi_is_virtual(989) && !vdev_spi_is_virtual(995));
+    /* G6-S: 992 is the scanout service's SPI, live only with its own device. */
+    CHECK(vdev_spi_is_virtual(992) && vdev_spi_device(992) == VDEV_SPI_DEV_SCANOUT);
+    CHECK(!vdev_spi_live(992, VDEV_SPI_DEV_AHCI | VDEV_SPI_DEV_INPUT));
     EQ(vdev_spi_device(990), VDEV_SPI_DEV_AHCI);
     EQ(vdev_spi_device(991), VDEV_SPI_DEV_INPUT);
     EQ(vdev_spi_device(995), 0);
@@ -1417,9 +1420,10 @@ static void case_spi_gate(void)
     u32 both = VDEV_SPI_DEV_AHCI | VDEV_SPI_DEV_INPUT;
     CHECK(vdev_spi_live(990, both) && vdev_spi_live(991, both));
     CHECK(!vdev_spi_live(995, both) && !vdev_spi_live(1020, both) && !vdev_spi_live(27, both));
-    EQ(VDEV_SPI_COUNT, 2);
+    EQ(VDEV_SPI_COUNT, 3);
     EQ(vdev_spi_intids[0], 990);
     EQ(vdev_spi_intids[1], 991);
+    EQ(vdev_spi_intids[2], 992);
     /*
      * 990 and 991 both high: each has its own state machine.  990 active on CPU 3 while 991
      * becomes pending: 991 is raised on its target, 990 nowhere else.

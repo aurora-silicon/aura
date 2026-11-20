@@ -156,6 +156,8 @@ class HV(Reloadable):
         self.windows_ahci = None
         # T8152 I0: "off" or the --windows-input sources ("host"); the carrier's input device.
         self.windows_input = "off"
+        # T8152 G6-S: the scanout service's refresh in mHz (0 = off); --windows-scanout.
+        self.windows_scanout = 0
         self.windows_hidden = []
         self.pac_mask = self.PAC_MASK
         self.user_pac_mask = self.PAC_MASK
@@ -1753,7 +1755,7 @@ class HV(Reloadable):
             elif (self.windows_guest_ram is not None or self.windows_ipi != "poll" or
                   self.windows_gic_cpuif != "carrier" or self.windows_wfi != "poll" or
                   self.windows_ahci is not None or self.windows_usb != "disabled" or
-                  self.windows_input != "off"):
+                  self.windows_input != "off" or self.windows_scanout):
                 raise ValueError("guest RAM window, IPI mode, GIC cpuif, the AHCI disk, USB "
                                  "passthrough and the input device are T8152 options")
             if self.windows_input != "off":
@@ -1765,6 +1767,15 @@ class HV(Reloadable):
                                      "CPU interface")
                 if self.windows_serial != "cdc":
                     raise ValueError("T8152 input: the host feed needs --windows-serial cdc")
+            if self.windows_scanout:
+                from ..windows import SCANOUT_MIN_MHZ, SCANOUT_MAX_MHZ
+                if not SCANOUT_MIN_MHZ <= self.windows_scanout <= SCANOUT_MAX_MHZ:
+                    raise ValueError("windows_scanout is a refresh in mHz, 1000..240000")
+                if self.windows_gic_cpuif != "software":
+                    raise ValueError("T8152 scanout: the vblank interrupt needs the software GIC "
+                                     "CPU interface")
+                if self.windows_framebuffer != "bgra-shadow":
+                    raise ValueError("T8152 scanout: flips need the BGRA shadow framebuffer")
             if self.windows_usb != "disabled":
                 from ..windows import parse_windows_usb
                 if not parse_windows_usb(self.windows_usb):
@@ -1858,6 +1869,9 @@ class HV(Reloadable):
                 if self.windows_input != "off":
                     from ..windows import CONFIG_T8152_INPUT
                     flags |= CONFIG_T8152_INPUT
+                if self.windows_scanout:
+                    from ..windows import CONFIG_T8152_SCANOUT
+                    flags |= CONFIG_T8152_SCANOUT
                 if self.p.hv_windows_configure(flags) != 0:
                     raise WindowsLaunchRefused("Windows hypervisor configuration rejected")
                 # Applied once by hv_start() before guest entry; never retried on this resident.
@@ -2251,6 +2265,33 @@ class HV(Reloadable):
         except ValueError:
             chosen._properties.pop(INPUT_HANDSHAKE_PROPERTY, None)
             chosen._types.pop(INPUT_HANDSHAKE_PROPERTY, None)
+            raise
+
+    def windows_scanout_attach(self):
+        """G6-S, after hv.init() and before start(): QUERY the contract, ATTACH at the refresh
+        asked for, and only then write /chosen/aura,windows-scanout-v1 (32 bytes) so Mu gives
+        GPU0 the page and SPI 992.  Raises ValueError on any refusal (the resident then refuses
+        guest entry: reload the carrier)."""
+        from ..windows import (SCANOUT_HANDSHAKE_PROPERTY, SCANOUT_OP_ATTACH, SCANOUT_OP_QUERY,
+                               SCANOUT_Q, describe_scanout_attach, scanout_handshake,
+                               validate_scanout_contract)
+        if not self.windows or not self.windows_scanout:
+            raise ValueError("the scanout service needs a Windows launch with --windows-scanout")
+        validate_scanout_contract(
+            lambda name: self.p.hv_windows_scanout(SCANOUT_OP_QUERY, SCANOUT_Q[name]))
+        ret = self.p.hv_windows_scanout(SCANOUT_OP_ATTACH, self.windows_scanout)
+        if ret != 0:
+            raise ValueError(f"the resident refused the scanout service: "
+                             f"{describe_scanout_attach(ret)} (its console says why)")
+        value = scanout_handshake(self.windows_scanout)
+        chosen = self.adt["/chosen"]
+        chosen._properties[SCANOUT_HANDSHAKE_PROPERTY] = value
+        chosen._types[SCANOUT_HANDSHAKE_PROPERTY] = (Bytes(len(value)), False)
+        try:
+            self._windows_adt_blob()
+        except ValueError:
+            chosen._properties.pop(SCANOUT_HANDSHAKE_PROPERTY, None)
+            chosen._types.pop(SCANOUT_HANDSHAKE_PROPERTY, None)
             raise
 
     def _hide_windows_t8152_nodes(self):

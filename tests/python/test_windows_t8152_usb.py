@@ -929,7 +929,7 @@ def test_configure_proxy_and_build_agree():
     assert re.search(r"#define HV_WINDOWS_T8152_USB BIT\(9\)", hv_h)
     conf = function_body(hv_c, "int hv_windows_configure(u64 flags)")
     # The accepted-flags mask ends with USB (I0 appends its own flag after it).
-    assert re.search(r"HV_WINDOWS_T8152_USB(?: \| HV_WINDOWS_T8152_INPUT)?\)\)\n        return -1;",
+    assert re.search(r"HV_WINDOWS_T8152_USB(?: \| HV_WINDOWS_T8152_INPUT(?: \| HV_WINDOWS_T8152_SCANOUT)?)?\)\)\n        return -1;",
                      conf)
     assert "(!(flags & HV_WINDOWS_T8152_SOFT_GIC) || board_id != 0x22)" in conf
     assert "if (flags & HV_WINDOWS_T8152_USB)\n        hv_usb_enable();" in conf

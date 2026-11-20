@@ -50,7 +50,8 @@ struct vdev_spi_plan vdev_spi_plan(bool pend, int target, u64 pending, u64 activ
     return plan;
 }
 
-const u32 vdev_spi_intids[VDEV_SPI_COUNT] = {HV_VDEV_SPI_AHCI, HV_VDEV_SPI_INPUT};
+const u32 vdev_spi_intids[VDEV_SPI_COUNT] = {HV_VDEV_SPI_AHCI, HV_VDEV_SPI_INPUT,
+                                                 HV_VDEV_SPI_SCANOUT};
 
 u32 vdev_spi_device(u32 intid)
 {
@@ -59,6 +60,8 @@ u32 vdev_spi_device(u32 intid)
             return VDEV_SPI_DEV_AHCI;
         case HV_VDEV_SPI_INPUT:
             return VDEV_SPI_DEV_INPUT;
+        case HV_VDEV_SPI_SCANOUT:
+            return VDEV_SPI_DEV_SCANOUT;
         default:
             return 0;
     }

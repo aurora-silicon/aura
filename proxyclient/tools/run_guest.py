@@ -149,6 +149,12 @@ parser.add_argument('--windows-input', default='off', metavar='{off,host,host+kb
                          'by a reboot). Default off. Needs an input FD (Mu J804_WINDOWS_INPUT, '
                          'marker J804INP1 at 0x140), --windows-serial cdc and the m6input '
                          'driver in the Windows image.')
+parser.add_argument('--windows-scanout', default='off', metavar='{off,on,HZ,MHZ}',
+                    help='T8152 G6-S: the carrier\'s scanout service for the WDDM driver (page '
+                         '0xF60000000, SPI 992): a virtual vblank at this rate (on = 60 Hz; '
+                         '120, or 59940 mHz) and flips copied into the iBoot scanout. Default '
+                         'off. Needs a scanout FD (Mu WM6_J804_SCANOUT, marker J804SCN1 at '
+                         '0x150) and the BGRA shadow. The DCP is never touched.')
 parser.add_argument('--windows-input-fn-default', choices=('media', 'fkeys'), default='media',
                     help='T8152 I1: the internal keyboard\'s top row without Fn: media keys '
                          '(default, as macOS) or F1-F12.')
@@ -791,6 +797,31 @@ def windows_t8152_input_plan(payload, u):
 def windows_t8152_input_attach(hv, sources):
     """After USB, before hv.start(): QUERY the contract, ATTACH, then (only then) write Mu's
     /chosen/aura,windows-input-v1.  A refusal stops the launch."""
+def windows_t8152_scanout_plan(payload, u):
+    """G6-S: check --windows-scanout against the chip, the board, the resident and the FD
+    (both directions) before anything is uploaded.  Returns the refresh in mHz (0 when off)."""
+    from aura import windows as w
+    try:
+        mhz = w.parse_scanout_flag(args.windows_scanout)
+        marker = w.fd_scanout_marker(payload)
+        caps2 = 0
+        if mhz or marker is not None:
+            try:
+                caps2 = p.hv_windows_capabilities2()
+            except ProxyRemoteError:
+                caps2 = 0  # an older resident: Bad Command
+        chosen = u.adt["/chosen"]
+        w.check_scanout_request(mhz, chosen.chip_id, getattr(chosen, "board_id", -1), caps2,
+                                marker is not None, True)
+    except ValueError as exc:
+        sys.exit(f"T8152 launch refused: {exc}. The aura proxy keeps running; no guest was "
+                 "started.")
+    if mhz:
+        print(f"T8152 scanout: vblank {mhz / 1000:g} Hz, flips copied into the iBoot scanout "
+              f"(CAPS2 {caps2:#x}, FD marker J804SCN1)")
+    return mhz
+
+
 def windows_t8152_input_area(top):
     """I1/I2, before any plan: with the internal keyboard (and trackpad), carve the 8 MiB MTP
     area off the window top and, with the trackpad, read and check the owner's firmware and
@@ -1140,6 +1171,7 @@ def run_windows_t8152(caps):
     usb_ports = windows_t8152_usb_plan(payload, u)
     gpu_mode = windows_t8152_gpu_plan(u)
     input_sources = windows_t8152_input_plan(payload, u)
+    scanout_mhz = windows_t8152_scanout_plan(payload, u)
     print(f"T8152: guest RAM [{base:#x}, {top:#x}) passes the host check; NVRAM, QSPI and the "
           f"audio/AOP/ADMAC/i2c nodes are hidden, and the resident re-checks everything")
 
@@ -1163,6 +1195,7 @@ def run_windows_t8152(caps):
     hv.windows_usb = usb_spelling(usb_ports)
     hv.windows_gpu = gpu_mode
     hv.windows_input = "+".join(input_sources) if input_sources else "off"
+    hv.windows_scanout = scanout_mhz
     hv.windows_serror = args.windows_serror
     hv.windows_ipi = args.windows_ipi
     hv.windows_gic_cpuif = args.windows_gic_cpuif or "software"
@@ -1210,6 +1243,15 @@ def run_windows_t8152(caps):
     windows_t8152_gpu_admit(hv, gpu_mode, usb_ports, ahci)
     windows_t8152_input_attach(hv, input_sources)
     try:
+        if scanout_mhz:
+            # G6-S first: it only hooks a page, so its refusal leaves nothing else attached
+            # (the NVMe disk is detached by the handler below).
+            try:
+                hv.windows_scanout_attach()
+            except (ValueError, ProxyRemoteError) as exc:
+                sys.exit(f"T8152: {exc}. No guest was started; the carrier session is used up: "
+                         "reload the carrier.")
+            print(f"T8152 scanout: attached; /chosen/aura,windows-scanout-v1 written")
         windows_t8152_usb_attach(hv, usb_ports, ahci)
         windows_t8152_gpu_admit(hv, gpu_mode, usb_ports, ahci)
         windows_t8152_input_attach(hv, input_sources, usb_ports, input_mtp)

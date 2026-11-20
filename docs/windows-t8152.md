@@ -1333,3 +1333,47 @@ exited` wait for the host, at most 2 s each. The proxy protocol itself stays blo
 
 `GPU SUM` appears only while a G1/G2 session forwards. All values are relaxed reads of counters
 other paths keep. The input line is unchanged (checked each second, printed on change).
+
+## G6-S: the scanout service (virtual vblank and flips, `--windows-scanout`)
+
+Status: built and host-tested only; nothing of it has run on the M6. The carrier gives the
+WDDM driver a frame-based path to the internal panel without touching the DCP.
+
+**How the panel is driven (unchanged).** iBoot leaves the DCP scanning one X2R10G10B10 surface
+(the boot framebuffer, `boot_args.video`). The DCP is not the carrier's: its MMIO stays on the
+stage-2 denylist and no swap or vblank comes from it. With `--windows-fb-shadow` the guest's
+framebuffer is a BGRA shadow that the carrier repacks into that surface from idle CPUs
+(`hv_fb_convert_slice`), a free-running sweep with no frames.
+
+**What G6-S adds.** One hooked page and one level SPI, off unless the launcher passes
+`--windows-scanout on|HZ|MHZ` (configure `BIT(11)`, CAPS2 bit 7, `P_HV_WINDOWS_SCANOUT 0xc8b`):
+
+- page IPA `0xF60000000`, 16 KiB, never mapped (`hv_scanout.c`, model `scanout_model.c`);
+- SPI GSIV 992, level, no AIC line, live only with the scanout flag (`hv_vdev_spi`);
+- **vblank**: from the system counter at the attached rate (default 60 Hz: 400000 ticks of the
+  24 MHz counter), epoch at guest entry, edges at `epoch + floor(n * F / mHz)` (no drift), run
+  on the 5 kHz host tick (edges land within 200 µs), 64-bit count and guest-virtual edge time;
+- **flip**: the driver names a buffer in guest RAM (or the shadow): BGRA8888 or the panel's own
+  A2R10G10B10, 64-byte aligned base and stride, optional dirty rectangle, a nonzero cookie. The
+  carrier copies it into the scanout in row bands: 160 rows on a CPU about to idle (unlocked),
+  32 rows on every non-tick CPU's 1 kHz FIQ fast path (unlocked, ~75 µs), 16 rows on the tick
+  (big lock) as a floor. Each band cleans and invalidates its source rows first and is fenced
+  and recorded like the converter's (`hv_fatal_fb_begin/end`). The flip is reported done
+  (DONE_COOKIE, STATUS.FLIP_DONE) at the first vblank after its last band. One flip in flight
+  plus one waiting; a third is refused BUSY;
+- while CTRL.ENABLE and CTRL.FLIP_MODE are set the shadow sweep stands down; clearing either
+  (or guest exit) retires both slots and gives the panel back to the shadow.
+
+Panel tearing: the copy is not synchronised with the DCP's real scan position (that needs the
+DCP), so a fast-moving frame can still tear on the glass; the guest-visible flip/vblank
+sequence is consistent. FEATURES bits 5 (hardware vblank) and 6 (scanout retarget) stay clear.
+
+**Mu side** (`J804Windows.h`, Mu branch `j804-windows-g6-scanout`): FD marker `J804SCN1` at
+0x150 (`u32 base >> 12, u32 GSIV`); `/chosen/aura,windows-scanout-v1`, 32 bytes `<QIIIII4x>`
+= page base, size, GSIV, FEATURES, refresh mHz, version 1, written by the launcher only after
+ATTACH returned 0. With it (and the GPU handshake) J804GpuAcpiDxe installs the GPU0 variant
+whose `_CRS` adds resource 5 (the page) and resource 6 (`Interrupt` 992, level, active-high)
+and whose `_DSD` names `aura,scanout-ipa`, `aura,scanout-gsiv`, `aura,scanout-refresh-mhz`.
+
+The register map and buffer rules for the driver are in the G6 interface note kept with the
+build outputs (out/g6-scanout/INTERFACE.md); `scanout_model.h` is the authority.

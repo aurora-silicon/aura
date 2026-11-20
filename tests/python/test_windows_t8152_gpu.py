@@ -944,7 +944,7 @@ def test_g1_wired():
     assert reset.index("hv_usb_emergency_stop();") < reset.index("hv_gpu_emergency_stop();") < \
         reset.index("hv_ahci_nvme_reset_close()")
     proxy_c = (REPO / "src/proxy.c").read_text()
-    assert "HV_WINDOWS_CAPS2_GPU_PROBE |\n                            HV_WINDOWS_CAPS2_GPU_G2;" in proxy_c
+    assert "HV_WINDOWS_CAPS2_GPU_PROBE |\n                            HV_WINDOWS_CAPS2_GPU_G2" in proxy_c
     makefile = (REPO / "Makefile").read_text()
     objs = makefile.split("ifeq ($(WINDOWS),1)\nHV_OBJECTS", 1)[1].split("endif", 1)[0]
     for o in ("gpu_t8152_power.o", "gpu_t8152_power_recipe.o", "gpu_t8152_probe.o"):

@@ -18,6 +18,7 @@
 #include "hv_ahci.h"
 #include "hv_gpu.h"
 #include "hv_input.h"
+#include "hv_scanout.h"
 #include "hv_serror.h"
 #include "hv_usb.h"
 #include "soc.h"
@@ -397,6 +398,7 @@ void hv_windows_fatal_report(u64 *regs, const char *what, u64 par, const char *p
     hv_usb_fatal_report();
     hv_gpu_fatal_report();
     hv_input_fatal_report();
+    hv_scanout_fatal_report();
 
     if (regs) {
         /* The EL2 frame sits on this CPU's stack (64 KiB); the interrupted frames are above. */

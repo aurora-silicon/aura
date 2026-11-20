@@ -1869,6 +1869,132 @@ def input_hello(seq=0):
     return input_frame(INPUT_HELLO, struct.pack("<HH", INPUT_PROTO, 0), seq)
 
 
+# ---- G6-S: the scanout service (src/hv/windows/hv_scanout.h, scanout_model.h) ---------------
+#
+# A register page (0xF60000000, 16 KiB) and SPI 992 for the WDDM driver: a virtual vblank at the
+# panel rate from the system counter and FLIP, which copies a guest buffer into the iBoot
+# scanout (the DCP is never touched).  The page needs the BGRA shadow.  Values must agree with
+# the resident (CAPS2 bit 7, P_HV_WINDOWS_SCANOUT QUERY) and with Mu's J804Windows.h: the FD
+# marker "J804SCN1" at 0x150 and the 32-byte /chosen/aura,windows-scanout-v1 handshake, without
+# which Mu leaves the page and the SPI out of GPU0's resources.
+CAPS2_SCANOUT = 0x0080                    # scanout v1
+CONFIG_T8152_SCANOUT = 0x400000             # hv_windows_configure BIT(22)
+SCANOUT_OP_QUERY, SCANOUT_OP_ATTACH, SCANOUT_OP_STATUS, SCANOUT_OP_DETACH = 0, 1, 2, 3
+SCANOUT_Q = {"version": 0, "base": 1, "size": 2, "intid": 3, "features": 4, "refresh": 5}
+SCANOUT_S = {"attached": 16, "ctrl": 17, "line": 18, "vblank_count": 19, "done_cookie": 20,
+             "owns_panel": 21, "geometry": 22}
+SCANOUT_STATS = {"vblanks": 0, "submitted": 1, "done": 2, "refused": 3, "busy": 4, "late": 5,
+                 "rows": 6, "retired": 7, "bad_access": 8, "missed": 9, "stale_bands": 10}
+SCANOUT_VERSION = 1
+SCANOUT_BASE = 0xF60000000
+SCANOUT_SIZE = 0x4000
+SCANOUT_GSIV = 992
+SCANOUT_FEATURES = 0x1F                   # timer vblank, copy flip, BGRA, A2R10G10B10, rect
+SCANOUT_MIN_MHZ, SCANOUT_MAX_MHZ, SCANOUT_DEFAULT_MHZ = 1000, 240000, 60000
+SCANOUT_FD_MARKER_OFFSET = 0x150
+SCANOUT_FD_MARKER = b"J804SCN1"
+# Mu J804Windows.h J804_SCANOUT_ADT_PROPERTY / _SIZE.
+SCANOUT_HANDSHAKE_PROPERTY = "aura,windows-scanout-v1"
+SCANOUT_HANDSHAKE_FORMAT = "<QIIIII4x"    # base, size, GSIV, features, refresh mHz, version
+SCANOUT_HANDSHAKE_SIZE = 32
+# The page's registers (scanout_model.h), for tools that read it from the host side.
+SCANOUT_REGS = {"ID": 0x000, "VERSION_REG": 0x004, "FEATURES": 0x008, "CTRL": 0x00C,
+                "STATUS": 0x010, "WIDTH": 0x014, "HEIGHT": 0x018, "PANEL_FORMAT": 0x01C,
+                "REFRESH_MHZ": 0x020, "PERIOD_TICKS": 0x024, "SHADOW_LO": 0x028,
+                "SHADOW_HI": 0x02C, "SHADOW_STRIDE": 0x030, "COUNTER_HZ": 0x034,
+                "VBLANK_COUNT_LO": 0x038, "VBLANK_COUNT_HI": 0x03C, "VBLANK_TIME_LO": 0x040,
+                "VBLANK_TIME_HI": 0x044, "FLIP_ADDR_LO": 0x080, "FLIP_ADDR_HI": 0x084,
+                "FLIP_STRIDE": 0x088, "FLIP_FORMAT": 0x08C, "FLIP_RECT_TL": 0x090,
+                "FLIP_RECT_BR": 0x094, "FLIP_SUBMIT": 0x098, "FLIP_ERROR": 0x09C,
+                "PENDING_COOKIE": 0x0A0, "ACTIVE_COOKIE": 0x0A4, "DONE_COOKIE": 0x0A8,
+                "ERROR_COOKIE": 0x0AC, "DONE_VBLANK_LO": 0x0B0, "DONE_VBLANK_HI": 0x0B4,
+                "STATS": 0x100, "REG_END": 0x200}
+SCANOUT_ERRORS = {-1: "not configured, not J804, the guest already started or an earlier ATTACH "
+                      "this session", -2: "refresh outside 1..240 Hz",
+                  -4: "the page could not be hooked"}
+
+
+def parse_scanout_flag(value):
+    """--windows-scanout: off, on (60 Hz), a rate in Hz (60, 120) or in mHz (59940).  Returns
+    the refresh in mHz, 0 for off."""
+    require(isinstance(value, str) and value, "--windows-scanout takes off, on, Hz or mHz")
+    if value in ("off", "disabled"):
+        return 0
+    if value == "on":
+        return SCANOUT_DEFAULT_MHZ
+    require(value.isdigit(), f"--windows-scanout {value!r}: off, on, a rate in Hz or mHz")
+    n = int(value)
+    mhz = n * 1000 if n <= SCANOUT_MAX_MHZ // 1000 else n
+    require(SCANOUT_MIN_MHZ <= mhz <= SCANOUT_MAX_MHZ and n,
+            f"--windows-scanout {value}: the refresh must be 1..240 Hz")
+    return mhz
+
+
+def scanout_fd_marker_bytes():
+    """The 16-byte FD marker a scanout build carries at 0x150 (Mu's FDF writes the same)."""
+    return SCANOUT_FD_MARKER + struct.pack("<II", SCANOUT_BASE >> 12, SCANOUT_GSIV)
+
+
+def fd_scanout_marker(fd):
+    """(page base, GSIV) from a scanout FD's marker at 0x150, None for any other FD; a marker
+    with other values is refused."""
+    block = bytes(fd[SCANOUT_FD_MARKER_OFFSET:SCANOUT_FD_MARKER_OFFSET + 16])
+    if len(block) != 16 or block[:8] != SCANOUT_FD_MARKER:
+        return None
+    page, gsiv = struct.unpack("<II", block[8:])
+    require((page << 12, gsiv) == (SCANOUT_BASE, SCANOUT_GSIV),
+            f"the FD's scanout marker {page << 12:#x}/{gsiv} differs from the carrier's "
+            f"{SCANOUT_BASE:#x}/{SCANOUT_GSIV}")
+    return page << 12, gsiv
+
+
+def check_scanout_request(mhz, chip, board, caps2, fd_has_marker, fb_shadow):
+    """Before anything is uploaded: --windows-scanout against the chip, the board, the
+    resident's CAPS2 bit 7, the FD's marker (both directions) and the BGRA shadow."""
+    if fd_has_marker:
+        require(mhz, "this FD gives GPU0 the scanout page (marker J804SCN1 at 0x150) but "
+                "--windows-scanout is off: Windows would touch an unhooked page. Pass "
+                "--windows-scanout on or use an FD built without J804_WINDOWS_SCANOUT")
+    if not mhz:
+        return
+    require(chip == T8152_CHIP, "--windows-scanout is a T8152 (J804) option")
+    require(board == J804_BOARD_ID, f"--windows-scanout needs the J804 board (0x22), not "
+            f"{board:#x}")
+    require(isinstance(caps2, int) and caps2 >> 32 == CAPS2_MAGIC >> 32 and
+            caps2 & CAPS2_SCANOUT, "the resident has no scanout service (P_HV_WINDOWS_CAPS2 "
+            "bit 7): rebuild the carrier at or after the G6-S commit")
+    require(fd_has_marker, "--windows-scanout: the FD has no J804SCN1 marker at 0x150, so GPU0 "
+            "has no scanout resources: use a Mu FD built with WM6_J804_SCANOUT=TRUE")
+    require(fb_shadow, "--windows-scanout copies flips into the panel next to the BGRA shadow: "
+            "it needs --windows-fb-shadow (the T8152 default)")
+
+
+def validate_scanout_contract(query):
+    """The resident's QUERY answers must be this launcher's contract."""
+    want = {"version": SCANOUT_VERSION, "base": SCANOUT_BASE, "size": SCANOUT_SIZE,
+            "intid": SCANOUT_GSIV, "features": SCANOUT_FEATURES}
+    for name, value in want.items():
+        got = query(name)
+        require(got == value, f"the resident's scanout {name} is {got:#x}, this launcher "
+                f"expects {value:#x}")
+
+
+def scanout_handshake(mhz):
+    """/chosen/aura,windows-scanout-v1 for Mu's J804GpuAcpiDxe, written only after ATTACH
+    returned 0: page base, size, GSIV, FEATURES, refresh in mHz, version 1, 4 bytes zero."""
+    require(SCANOUT_MIN_MHZ <= mhz <= SCANOUT_MAX_MHZ, "no scanout handshake without a rate")
+    value = struct.pack(SCANOUT_HANDSHAKE_FORMAT, SCANOUT_BASE, SCANOUT_SIZE, SCANOUT_GSIV,
+                        SCANOUT_FEATURES, mhz, SCANOUT_VERSION)
+    assert len(value) == SCANOUT_HANDSHAKE_SIZE
+    return value
+
+
+def describe_scanout_attach(result):
+    """P_HV_WINDOWS_SCANOUT ATTACH's answer as text (0 is success)."""
+    value = result - (1 << 64) if result >= 1 << 63 else result
+    return "attached" if value == 0 else SCANOUT_ERRORS.get(value, f"error {value}")
+
+
 def _aligned(value, alignment):
     return (value + alignment - 1) & -alignment
 

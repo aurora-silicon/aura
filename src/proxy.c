@@ -708,13 +708,15 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
              * 5-8, NVMe closed on every exit).
              * Bit 6: G2 guards, grants and the UAT audit (hv_gpu.c G2); the private G2 recipe may
              * be absent (STATUS HV_GPU_S_G2_RECIPE).  An earlier build had G2 on bit 5.
+             * Bit 7: G6-S scanout service v1 (hv_scanout.c, P_HV_WINDOWS_SCANOUT, configure
+             * BIT(11)).
              * Every bit has one meaning: tests/python/test_windows_t8152_caps2.py.
              */
 #ifdef AURA_WINDOWS
             reply->retval = HV_WINDOWS_CAPS2_MAGIC | HV_WINDOWS_CAPS2_AHCI | HV_WINDOWS_CAPS2_USB |
                             HV_WINDOWS_CAPS2_GPU | HV_WINDOWS_CAPS2_INPUT |
                             HV_WINDOWS_CAPS2_GPU_PROBE | HV_WINDOWS_CAPS2_AHCI_NVME |
-                            HV_WINDOWS_CAPS2_GPU_G2;
+                            HV_WINDOWS_CAPS2_GPU_G2 | HV_WINDOWS_CAPS2_SCANOUT;
 #else
             reply->retval = 0;
 #endif
@@ -745,6 +747,14 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
 #ifdef AURA_WINDOWS
             reply->retval = hv_input_proxy(request->args[0], request->args[1], request->args[2],
                                            request->args[3]);
+#else
+            reply->retval = -1;
+#endif
+            break;
+        case P_HV_WINDOWS_SCANOUT:
+#ifdef AURA_WINDOWS
+            reply->retval = hv_scanout_proxy(request->args[0], request->args[1], request->args[2],
+                                             request->args[3]);
 #else
             reply->retval = -1;
 #endif

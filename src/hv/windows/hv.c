@@ -11,6 +11,7 @@
 #include "guest_diag.h"
 #include "gxf.h"
 #include "hv_fatal.h"
+#include "hv_scanout.h"
 #include "malloc.h"
 #include "memory.h"
 #include "mtp_handoff.h"
@@ -291,10 +292,11 @@ int hv_windows_configure(u64 flags)
                   HV_WINDOWS_SERIAL_CDC | HV_WINDOWS_MTP | HV_WINDOWS_CPUFREQ |
                   HV_WINDOWS_T8152_FAST_IPI | HV_WINDOWS_T8152_SOFT_GIC | HV_WINDOWS_T8152_WFI |
                   HV_WINDOWS_T8152_AHCI | HV_WINDOWS_T8152_USB |
-                  HV_WINDOWS_T8152_INPUT))
+                  HV_WINDOWS_T8152_INPUT | HV_WINDOWS_T8152_SCANOUT))
         return -1;
     if ((flags & (HV_WINDOWS_T8152_FAST_IPI | HV_WINDOWS_T8152_SOFT_GIC | HV_WINDOWS_T8152_WFI |
-                  HV_WINDOWS_T8152_AHCI | HV_WINDOWS_T8152_USB | HV_WINDOWS_T8152_INPUT)) &&
+                  HV_WINDOWS_T8152_AHCI | HV_WINDOWS_T8152_USB | HV_WINDOWS_T8152_INPUT |
+                  HV_WINDOWS_T8152_SCANOUT)) &&
         chip_id != T8152)
         return -1;
     /* D1: the AHCI disk's SPI is delivered only by the software GIC CPU interface. */
@@ -307,6 +309,11 @@ int hv_windows_configure(u64 flags)
     /* I0: the input SPI too, J804 only (Mu's INP0 is a J804 table). */
     if ((flags & HV_WINDOWS_T8152_INPUT) &&
         (!(flags & HV_WINDOWS_T8152_SOFT_GIC) || board_id != 0x22))
+        return -1;
+    /* G6-S: its SPI needs the software GIC, its frames the BGRA shadow; J804 only (Mu's GPU0). */
+    if ((flags & HV_WINDOWS_T8152_SCANOUT) &&
+        (!(flags & HV_WINDOWS_T8152_SOFT_GIC) || !(flags & HV_WINDOWS_FB_SHADOW) ||
+         board_id != 0x22))
         return -1;
     if (chip_id == T8152 && !(flags & HV_WINDOWS_T8152_SOFT_GIC)) {
         printf("HV: T8152: the hardware GIC CPU interface path is refused (measurement (f): "
@@ -343,6 +350,8 @@ int hv_windows_configure(u64 flags)
         hv_usb_enable();
     if (flags & HV_WINDOWS_T8152_INPUT)
         hv_input_enable();
+    if (flags & HV_WINDOWS_T8152_SCANOUT)
+        hv_scanout_enable();
     return 0;
 }
 
@@ -1146,6 +1155,9 @@ static bool hv_fb_init(struct boot_args *gba)
     gba->video.depth = (gba->video.depth & ~0xffUL) | 32;
     fb_capture_set_shadow((u64)hv_fb_shadow, gba->video.width, gba->video.height,
                           gba->video.stride);
+    /* G6-S: the flip path's panel (a no-op unless the scanout service is attached). */
+    hv_scanout_set_panel((u64)hv_fb_shadow, hv_fb_scanout, gba->video.width, gba->video.height,
+                         gba->video.stride);
     printf("HV: BGRA shadow %p -> X2R10G10B10 scanout %p (%ux%u), read %s\n", hv_fb_shadow,
            hv_fb_scanout, hv_fb_stride_px, hv_fb_height,
            hv_fb_source_cached ? "write-back alias" : "non-cacheable");
@@ -1170,7 +1182,8 @@ static bool hv_fb_init(struct boot_args *gba)
  */
 void hv_fb_convert_slice(u32 lines)
 {
-    if (!hv_fb_shadow)
+    /* G6-S: while flips own the panel the scanout holds frames, not the shadow. */
+    if (!hv_fb_shadow || hv_scanout_owns_panel())
         return;
 
     struct hv_fb_cost *cost = &hv_fb_cost[smp_id()];
@@ -1310,6 +1323,8 @@ void hv_fb_report(void)
     hv_usb_report();
     /* I0: host-feed counters, one line when they moved. */
     hv_input_report();
+    /* G6-S: vblank and flip rates, one line when the driver is active. */
+    hv_scanout_report();
 }
 
 bool hv_fb_shadow_contains(u64 pa)
@@ -1590,7 +1605,8 @@ static int hv_start_session(void *entry, u64 regs[4])
     /* T8152: last check of everything the guest can reach, then enter. */
     if (chip_id == T8152 && (hv_t8152_verify((u64)entry, regs[0], hv_secondary_info.hcr,
                                              hv_windows_flags & HV_WINDOWS_FB_SHADOW) < 0 ||
-                             hv_ahci_verify() < 0 || hv_input_verify() < 0)) {
+                             hv_ahci_verify() < 0 || hv_input_verify() < 0 ||
+                             hv_scanout_verify() < 0)) {
         msr(CNTP_CTL_EL0, 0); /* the primary host tick armed above */
         hv_cpus_in_guest = 0;
         hv_windows_mtp_stop();
@@ -1610,6 +1626,8 @@ static int hv_start_session(void *entry, u64 regs[4])
     hv_ahci_guest_entered();
     /* I0: from here the host feed is parsed on the tick (state only until the driver enables). */
     hv_input_guest_entered();
+    /* G6-S: the vblank clock starts at entry. */
+    hv_scanout_guest_entered();
     /* The EL2 fatal report (hv_fatal.h) speaks only while a T8152 guest is entered. */
     hv_fatal_armed = chip_id == T8152;
     hv_tick_cpu_last = -1;
@@ -1645,6 +1663,7 @@ static int hv_start_session(void *entry, u64 regs[4])
     hv_fatal_armed = false;
     hv_ahci_guest_exited(status);
     hv_input_guest_exited(status);
+    hv_scanout_guest_exited(status);
     return status;
 }
 
@@ -2375,6 +2394,8 @@ void hv_tick(struct exc_info *ctx)
     }
     hv_windows_serial_flush();
     hv_fatal_stage(HV_FATAL_STAGE_FB);
+    /* G6-S: the vblank clock (5 kHz: edges land within 200 us) and a floor band of a flip. */
+    hv_scanout_tick();
     /*
      * A floor, not the main path: this runs with the big hypervisor lock held,
      * so it converts only a band. Idle cores parking in WFI do the bulk of the

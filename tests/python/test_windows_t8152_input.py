@@ -422,13 +422,14 @@ def test_hv_start_and_configure():
     assert start.index("hv_input_verify()") < start.index("hv_input_guest_entered();") < \
         start.index("hv_enter_guest(") < start.index("hv_input_guest_exited(status);")
     configure = function_body(hv_c, "int hv_windows_configure(u64 flags)")
-    assert "HV_WINDOWS_T8152_USB | HV_WINDOWS_T8152_INPUT))\n        return -1;" in configure
+    assert ("HV_WINDOWS_T8152_USB | HV_WINDOWS_T8152_INPUT | HV_WINDOWS_T8152_SCANOUT))\n"
+            "        return -1;") in configure
     assert ("if ((flags & HV_WINDOWS_T8152_INPUT) &&\n        (!(flags & HV_WINDOWS_T8152_SOFT_GIC)"
             " || board_id != 0x22))\n        return -1;") in configure
     assert "if (flags & HV_WINDOWS_T8152_INPUT)\n        hv_input_enable();" in configure
     assert "hv_input_report();" in function_body(hv_c, "void hv_fb_report(void)")
     make = (REPO / "Makefile").read_text()
-    assert "input_model.o hv_input.o \\" in make
+    assert "input_model.o hv_input.o" in make
 
 
 def test_clean_room_headers():

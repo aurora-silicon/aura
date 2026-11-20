@@ -11,6 +11,7 @@
 #include "hv_ahci.h"
 #include "hv_gpu.h"
 #include "hv_input.h"
+#include "hv_scanout.h"
 #include "hv_status.h"
 #include "hv_t8152.h"
 #include "hv_usb.h"
@@ -67,6 +68,8 @@ void hv_windows_quarantine(void);
 #define HV_WINDOWS_T8152_USB BIT(20)
 /* I0: the input device fed from the host over the vUART RX (hv_input.c); T8152 J804, soft GIC. */
 #define HV_WINDOWS_T8152_INPUT BIT(21)
+/* G6-S: the scanout service (vblank, flips) on the BGRA shadow (hv_scanout.c); T8152 J804. */
+#define HV_WINDOWS_T8152_SCANOUT BIT(22)
 bool hv_t8152_native_wfi(void);
 /* The guest's ACTLR_EL1 from EL2. T8152 never touches the implementation-defined alias. */
 u64 hv_guest_actlr_read(void);

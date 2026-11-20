@@ -23,6 +23,8 @@
 #define HV_VDEV_SPI_AHCI 990u
 /* I0: the input device's SPI: GSIV 991, level, active-high.  No AIC line; never an alias. */
 #define HV_VDEV_SPI_INPUT 991u
+/* G6-S: the scanout service's SPI (vblank, flip done, flip error): GSIV 992, level. */
+#define HV_VDEV_SPI_SCANOUT 992u
 
 /*
  * The devices behind them, as a mask of the configure flags that are set.  An emulated SPI is
@@ -31,6 +33,7 @@
  */
 #define VDEV_SPI_DEV_AHCI  BIT(0)
 #define VDEV_SPI_DEV_INPUT BIT(1)
+#define VDEV_SPI_DEV_SCANOUT BIT(2)
 
 /* GICD_IROUTER<n> fields (IHI 0069). */
 #define VDEV_SPI_IROUTER_IRM BIT(31)
@@ -77,7 +80,7 @@ u32 vdev_spi_device(u32 intid);
 bool vdev_spi_live(u32 intid, u32 devices);
 
 /* The carrier-emulated SPIs, for the re-evaluation loops (claim, distributor writes). */
-#define VDEV_SPI_COUNT 2
+#define VDEV_SPI_COUNT 3
 extern const u32 vdev_spi_intids[VDEV_SPI_COUNT];
 
 #endif

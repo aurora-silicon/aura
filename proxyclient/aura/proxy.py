@@ -816,6 +816,7 @@ class AuraProxy(Reloadable):
     P_HV_WINDOWS_GPU = 0xc88
     P_HV_WINDOWS_INPUT = 0xc89
     P_HV_WINDOWS_TICK_CPU = 0xc8a
+    P_HV_WINDOWS_SCANOUT = 0xc8b
 
     P_FB_INIT = 0xd00
     P_FB_SHUTDOWN = 0xd01
@@ -1394,6 +1395,12 @@ class AuraProxy(Reloadable):
         before that and by default).  Before hv.start() only; 0 or -1 (refused: the resident's
         console says why).  An older resident answers Bad Command."""
         return self.request(self.P_HV_WINDOWS_TICK_CPU, cpu, signed=True)
+
+    def hv_windows_scanout(self, op, a1=0, a2=0, a3=0):
+        """G6-S scanout service (src/hv/windows/hv_scanout.h): QUERY(index), ATTACH(refresh
+        mHz), STATUS(index), DETACH.  ATTACH returns 0 or a negative reason (signed); other
+        refusals are 2**64 - 1."""
+        return self.request(self.P_HV_WINDOWS_SCANOUT, op, a1, a2, a3, signed=op == 1)
 
     def fb_init(self):
         return self.request(self.P_FB_INIT)

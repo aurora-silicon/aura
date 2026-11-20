@@ -99,6 +99,11 @@ void hv_input_fatal_report(void)
     printf("HV: fatal: input stub report\n");
 }
 
+/* G6-S part (hv_scanout.c): silent unless a session used it, as here. */
+void hv_scanout_fatal_report(void)
+{
+}
+
 /* hv_serror.c: replayed by windows_serror_host.c; here only its place in the report. */
 void hv_serror_attribute(const u64 *regs, const u64 *sp, u64 esr, u64 elr, u64 spsr)
 {
