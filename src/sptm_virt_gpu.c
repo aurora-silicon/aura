@@ -57,9 +57,6 @@ u64 sptm_virt_gpu_keep = GPU_RING_KEEP;
 #ifndef SPTM_VIRT_GPU_STOP_MSG
 #define SPTM_VIRT_GPU_STOP_MSG 0
 #endif
-#ifndef SPTM_VIRT_GPU_PARK_RING_MIN
-#define SPTM_VIRT_GPU_PARK_RING_MIN 0
-#endif
 #ifndef SPTM_VIRT_GPU_PARK_KICKS
 #define SPTM_VIRT_GPU_PARK_KICKS 0
 #endif
@@ -95,17 +92,12 @@ u32 sptm_virt_gpu_stop_boot_secs = SPTM_VIRT_GPU_STOP_BOOT_SECS;
 /* Park after a write of this value (a mailbox message); 0 = never. */
 u64 sptm_virt_gpu_stop_msg = SPTM_VIRT_GPU_STOP_MSG;
 /*
- * Park at the Nth kick publication on a queue ring >= RING_MIN (an app's queues get rings past
- * the ones the system configures at boot), so the park lands inside that app's own GPU burst
- * while its descriptors are still in the shared pool; 0 = never.
+ * Park at the Nth kick publication on an app's queue rings, so the park lands inside that app's
+ * own GPU burst while its descriptors are still in the shared pool; 0 = never. An app's rings are
+ * the ones configured ARM_SECS or more after the first GPU access: the system configures its
+ * rings during boot, and the ring ids differ from boot to boot. Both must be set.
  */
-u32 sptm_virt_gpu_park_ring_min = SPTM_VIRT_GPU_PARK_RING_MIN;
 u32 sptm_virt_gpu_park_kicks = SPTM_VIRT_GPU_PARK_KICKS;
-/*
- * App rings may also be told by when they were configured: ARM_SECS or more after the first GPU
- * access (the system configures its rings during boot; the ring ids differ from boot to boot).
- * 0 = off.
- */
 u32 sptm_virt_gpu_park_arm_secs = SPTM_VIRT_GPU_PARK_ARM_SECS;
 /*
  * An app's GPU work comes in bursts (one per benchmark workload) with quiet gaps between them. A
@@ -229,14 +221,11 @@ static void gpu_note_config(u64 addr, u64 val, u64 now)
 static bool gpu_note_kick(u64 addr, u64 val, u64 now)
 {
     if (addr != gpu_sgx + 0x4098 || val != 1 || (gpu_port_tag & 0xff) != 0x18 ||
-        !sptm_virt_gpu_park_kicks || !(sptm_virt_gpu_park_ring_min || sptm_virt_gpu_park_arm_secs))
+        !sptm_virt_gpu_park_kicks || !sptm_virt_gpu_park_arm_secs)
         return false;
     u32 ring = (gpu_port_tag >> 44) & 0x7f;
     u64 frq = mrs(CNTFRQ_EL0);
-    bool app = (sptm_virt_gpu_park_ring_min && ring >= sptm_virt_gpu_park_ring_min) ||
-               (sptm_virt_gpu_park_arm_secs &&
-                gpu_ring_cfg_t[ring] >= gpu_first_t + (u64)sptm_virt_gpu_park_arm_secs * frq);
-    if (!app)
+    if (gpu_ring_cfg_t[ring] < gpu_first_t + (u64)sptm_virt_gpu_park_arm_secs * frq)
         return false;
     sptm_virt_gpu_park_ring = ring;
     u32 total = __atomic_add_fetch(&sptm_virt_gpu_app_kicks, 1, __ATOMIC_RELAXED);
