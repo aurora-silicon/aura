@@ -3220,8 +3220,8 @@ static int dt_set_gpu_g17(void *dt, const struct g17_soc *soc)
     const struct perf_state *states, *sram;
     if (sgx < 0 || ADT_GETPROP(adt, sgx, "perf-state-count", &count) != sizeof(count) ||
         ADT_GETPROP(adt, sgx, "gpu-num-perf-states", &num_states) != sizeof(num_states) ||
-        ADT_GETPROP(adt, sgx, "perf-state-table-count", &tables) != sizeof(tables) ||
-        count < 2 || count > G17_MAX_PERF_STATES || num_states != count - 1 ||
+        ADT_GETPROP(adt, sgx, "perf-state-table-count", &tables) != sizeof(tables) || count < 2 ||
+        count > G17_MAX_PERF_STATES || num_states != count - 1 ||
         tables != (soc->tables ? soc->tables : 1))
         goto disable;
     /* The ADT's perf-state-count is the number of OPP entries the DT must have. */
