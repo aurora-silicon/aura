@@ -1,0 +1,15 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Stub bputil. Both `-d -v <group>` and `-d` print a boot-policy dump that satisfies:
+#   enroll-stage1.sh : 'one true recoveryOS', ': Paired', 'Kernel CTRR Status: Disabled'
+#   uninstall un-enrol: 'one true recoveryOS', ': Paired'
+#   uninstall all     : `bputil -d` grep 'one true recoveryOS'
+: "${STUBLOG:=/dev/null}"
+echo "bputil $*" >> "$STUBLOG"
+cat <<'EOF'
+Current local policy nonce hash (lpnh): abc123
+This is the one true recoveryOS for the volume group.
+OS pairing status: Paired
+Kernel CTRR Status: Disabled
+EOF
+exit 0

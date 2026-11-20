@@ -1,0 +1,50 @@
+{
+  "_comment": [
+    "Supported-Mac list for the macOS-under-aura-HV installer. This is a conservative",
+    "draft: a Mac/SoC/build is listed only when there is a path to qualify it. The",
+    "'self_boot' status says whether 'pick the macOS volume and it boots under the HV",
+    "on its own, no host' has actually been proven on that SoC yet. As of this writing",
+    "that has NOT been proven on any SoC (see docs/macos-hv-install.md); the installer",
+    "refuses an unqualified SoC unless run with --allow-unqualified, which only stages",
+    "files and does the enrol without claiming the self-boot works.",
+    "Fields marked 'confirm-on-hardware' are the hardware-free best effort; the J616s",
+    "acceptance run (ESPBOOT-3) confirms or corrects them."
+  ],
+  "version": 1,
+  "socs": {
+    "T6041": {
+      "marketing": "M4 Pro",
+      "exclaves": false,
+      "exclaves_note": "the j616sap BuildIdentity carries no Ap,ExclaveOS/Ap,cL4: guest is SPTM+TXM+XNU only (confirm-on-hardware)",
+      "stage2_build_flags": "CHAINLOADING=1 ESP_STAGE2=1 SPTM_VIRT=1 SPTM_VIRT_GUARDED=1 SPTM_VIRT_ESP=1 AURACTL=1",
+      "self_boot": "qualifying",
+      "self_boot_note": "first SoC targeted for on-device self-boot (ESPBOOT-3 acceptance)",
+      "builds_tested": ["26A428"]
+    },
+    "T6050": {
+      "marketing": "M5 Pro",
+      "exclaves": true,
+      "exclaves_note": "exclavecore_bundle.t6050 present",
+      "stage2_build_flags": "CHAINLOADING=1 ESP_STAGE2=1 SPTM_VIRT=1 SPTM_VIRT_ESP=1 DEBUGUSB_PROXY=1",
+      "self_boot": "no",
+      "self_boot_note": "files load from the ESP but the validated entry is still a host chainload of stage2-macos.bin; its Stage 1 ignored aura-try (docs/m5-macos-esp.md). No unattended self-boot yet.",
+      "builds_tested": []
+    },
+    "T8140": {
+      "marketing": "A18 Pro class (Neo / J700)",
+      "exclaves": true,
+      "stage2_build_flags": "CHAINLOADING=1 ESP_STAGE2=1 SPTM_VIRT=1 SPTM_VIRT_GUARDED=1 SPTM_VIRT_ESP=1 AURACTL=1 ATC0_TO_MACOS=1",
+      "self_boot": "no",
+      "self_boot_note": "entry is a one-shot bless of the macOS volume -> aura proxy -> host chainload. No unattended self-boot yet.",
+      "builds_tested": []
+    }
+  },
+  "models": {
+    "Mac16,5": "T6041",
+    "Mac16,6": "T6041",
+    "Mac16,7": "T6041",
+    "Mac16,8": "T6041",
+    "Mac16,9": "T6041",
+    "Mac16,11": "T6041"
+  }
+}

@@ -1,0 +1,13 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Stub `script`: enroll-stage1.sh runs the real enrol as `script -q -a LOG cmd...`.
+# Drop the -q/-a LOG framing and exec the command, so our kmutil stub actually runs
+# (and logs configure-boot).
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -q) shift ;;
+        -a) shift 2 ;;
+        *)  break ;;
+    esac
+done
+exec "$@"
