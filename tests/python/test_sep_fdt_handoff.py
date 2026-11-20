@@ -13,6 +13,7 @@ def test_sep_fdt_handoff(tmp_path):
     helper = source[start:end]
     harness = r'''
 #include <assert.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -20,6 +21,7 @@ def test_sep_fdt_handoff(tmp_path):
 typedef uint64_t u64;
 typedef uint32_t u32;
 #define T8140 1
+#define T8152 2
 #define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
 #define bail(...) do { printf(__VA_ARGS__); return -1; } while (0)
 #define ADT_GETPROP(a, n, p, v) adt_get((n), (p), (v), sizeof(*(v)))
@@ -157,6 +159,24 @@ int main(void)
     node = fdt_path_offset(dt, "/soc/sep@0");
     assert(fdt_getprop(dt, node, "local-policy-manifest", NULL) == NULL);
     assert(fdt_getprop(dt, node, "iboot-manifest", &len) && len == sizeof(ibot));
+
+    setup();
+    bad_sepfw = 1;
+    assert(dt_set_sep() == -1 && reservations == 0);
+
+    /* T8152 takes the same DRAM bounds as T8140. */
+    chip_id = T8152;
+    bad_sepfw = 0;
+    bad_lpol = 0;
+    setup();
+    manifest_present = 1;
+    assert(dt_set_sep() == 0);
+    expect_region();
+    node = fdt_path_offset(dt, "/soc/sep@0");
+    prop = fdt_getprop(dt, node, "local-policy-manifest", &len);
+    assert(prop && len == sizeof(lpol) && !memcmp(prop, lpol, len));
+    prop = fdt_getprop(dt, node, "iboot-manifest", &len);
+    assert(prop && len == sizeof(ibot) && !memcmp(prop, ibot, len));
 
     setup();
     bad_sepfw = 1;
