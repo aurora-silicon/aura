@@ -330,8 +330,11 @@ XNU_QUIRKS = (
                     0x1400000f),
                    ("task PAC key reprogramming (4)", "BootKC-rx", 0x31708c4, 0x540001e0,
                     0x1400000f))),
-    # T8132's xnu-13432.41.4 (macOS 27.2 26B123, kernelcache.release.mac16g, the J713's and the
-    # J773g's). Every site of the T8142 entry above, ported from 26B131's mac17g. The rorgn read,
+    # T8132's xnu-13432.41.4 (kernelcache.release.mac16g, the J713's and the J773g's), in macOS 27.2
+    # (26B123) and 27.2.1 (26B131). 26B131's differs from 26B123's only in the code of a few file
+    # system kexts (nfs to webdav, __TEXT_EXEC +0x3068000 to +0x3132000): every site below, the
+    # 0x200 bytes around it, and the rorgn globals are the same in both, so one entry serves both.
+    # Every site of the T8142 entry above, ported from 26B131's mac17g. The rorgn read,
     # the trust-cache result and the NVRAM write match their 48-instruction windows exactly once,
     # as above. T8132's structs are smaller and it has no MTE, so the mix-and-match question (48)
     # and the PAC-key guards (24, the twins paired in order) match only with the struct offsets
