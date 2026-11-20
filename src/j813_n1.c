@@ -191,7 +191,13 @@ static int j813_n1_link(void)
     u32 ident = read32(ecam + 0x100000);
     printf("j813-n1: link up (0x%x), endpoint %04x:%04x\n", read32(port + PORT_LINKSTS),
            ident & 0xffff, ident >> 16);
-    return (ident & 0xffff) == 0x106b ? 0 : -1;
+    /*
+     * J813/J815 carry Apple's N1; J704 (MacBook Pro 14", M5) carries a
+     * Broadcom BCM4388 (ADT module-instance linosa) on the same port, with
+     * the same reg_on key (gP13) and PERST GPIO, so the same sequence trains it.
+     */
+    u16 vendor = ident & 0xffff;
+    return (vendor == 0x106b || vendor == 0x14e4) ? 0 : -1;
 }
 
 int j813_n1_prepare(void *dt)
@@ -212,6 +218,6 @@ int j813_n1_prepare(void *dt)
         return 0;
 
     /* An untrained link would hang Linux's first config access. */
-    printf("j813-n1: N1 PCIe bring-up failed; disabling the ECAM host\n");
+    printf("j813-n1: radio PCIe bring-up failed; disabling the ECAM host\n");
     return fdt_setprop_string(dt, node, "status", "disabled") ? -1 : 0;
 }
