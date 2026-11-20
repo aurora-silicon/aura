@@ -42,6 +42,7 @@ static bool nvme_io_failed(void) { return io_failed; }
 static bool nvme_init(void) { inits++; io_failed = false; return true; }
 static char sart_var[] = "nvme.sart=0";
 static char *nvme_sart_var(void) { return sart_var; }
+static const char *pmu_failed_boots_var(void) { return NULL; }
 static bool nvme_shutdown(void) { return shutdown_ok; }
 static int rust_load_image(const char *spec, void **data, size_t *size, bool *proxy_request,
                            char *trial, size_t trial_capacity)

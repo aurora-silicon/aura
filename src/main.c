@@ -470,8 +470,9 @@ void aura_main(void)
      * that hangs, or a proxy session that ends in a reset, counts as a failed boot, and enough of
      * them end in recoveryOS. The primary PMU's info-leg_scrpad in the ADT locates the count on
      * every SoC; one without it is left alone, and the Stage 1 recovery window has already read
-     * the record.
+     * the record. Its failed-boot count goes on to the next stage first (aura.failed-boots=).
      */
+    pmu_snapshot_failed_boots();
     pmu_clear_panic_counter();
 
     printf("Initialization complete.\n");
