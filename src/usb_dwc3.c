@@ -14,6 +14,8 @@ void usb_dwc3_hs_putbyte(dwc3_hs_dev_t *dev, cdc_acm_pipe_id_t pipe, u8 byte);
 size_t usb_dwc3_hs_read(dwc3_hs_dev_t *dev, cdc_acm_pipe_id_t pipe, void *buf, size_t count);
 size_t usb_dwc3_hs_write(dwc3_hs_dev_t *dev, cdc_acm_pipe_id_t pipe, const void *buf, size_t count);
 size_t usb_dwc3_hs_queue(dwc3_hs_dev_t *dev, cdc_acm_pipe_id_t pipe, const void *buf, size_t count);
+size_t usb_dwc3_hs_queue_nonblocking(dwc3_hs_dev_t *dev, cdc_acm_pipe_id_t pipe, const void *buf,
+                                     size_t count);
 void usb_dwc3_hs_flush(dwc3_hs_dev_t *dev, cdc_acm_pipe_id_t pipe);
 typedef struct dwc3_ss_dev dwc3_ss_dev_t;
 dwc3_ss_dev_t *usb_dwc3_ss_init(uintptr_t regs, dart_dev_t *dart);
@@ -26,6 +28,8 @@ void usb_dwc3_ss_putbyte(dwc3_ss_dev_t *dev, cdc_acm_pipe_id_t pipe, u8 byte);
 size_t usb_dwc3_ss_read(dwc3_ss_dev_t *dev, cdc_acm_pipe_id_t pipe, void *buf, size_t count);
 size_t usb_dwc3_ss_write(dwc3_ss_dev_t *dev, cdc_acm_pipe_id_t pipe, const void *buf, size_t count);
 size_t usb_dwc3_ss_queue(dwc3_ss_dev_t *dev, cdc_acm_pipe_id_t pipe, const void *buf, size_t count);
+size_t usb_dwc3_ss_queue_nonblocking(dwc3_ss_dev_t *dev, cdc_acm_pipe_id_t pipe, const void *buf,
+                                     size_t count);
 void usb_dwc3_ss_flush(dwc3_ss_dev_t *dev, cdc_acm_pipe_id_t pipe);
 
 struct dwc3_dev {
@@ -137,6 +141,15 @@ size_t usb_dwc3_queue(dwc3_dev_t *dev, cdc_acm_pipe_id_t pipe, const void *buf, 
         return 0;
     return dev->superspeed ? usb_dwc3_ss_queue(dev->engine.ss, pipe, buf, count)
                            : usb_dwc3_hs_queue(dev->engine.hs, pipe, buf, count);
+}
+
+size_t usb_dwc3_queue_nonblocking(dwc3_dev_t *dev, cdc_acm_pipe_id_t pipe, const void *buf,
+                                  size_t count)
+{
+    if (!dev)
+        return 0;
+    return dev->superspeed ? usb_dwc3_ss_queue_nonblocking(dev->engine.ss, pipe, buf, count)
+                           : usb_dwc3_hs_queue_nonblocking(dev->engine.hs, pipe, buf, count);
 }
 
 void usb_dwc3_flush(dwc3_dev_t *dev, cdc_acm_pipe_id_t pipe)

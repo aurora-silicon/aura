@@ -463,6 +463,11 @@ dwc3_dev_t *usb_iodev_bringup(u32 idx)
         return usb_dwc3_queue(dev, pipe, buf, count);                                              \
     }                                                                                              \
                                                                                                    \
+    static ssize_t usb_##name##_write_nonblocking(void *dev, const void *buf, size_t count)        \
+    {                                                                                              \
+        return usb_dwc3_queue_nonblocking(dev, pipe, buf, count);                                  \
+    }                                                                                              \
+                                                                                                   \
     static void usb_##name##_handle_events(void *dev)                                              \
     {                                                                                              \
         usb_dwc3_handle_events(dev);                                                               \
@@ -482,6 +487,7 @@ struct iodev_ops iodev_usb_ops = {
     .read = usb_0_read,
     .write = usb_0_write,
     .queue = usb_0_queue,
+    .write_nonblocking = usb_0_write_nonblocking,
     .flush = usb_0_flush,
     .handle_events = usb_0_handle_events,
 };
@@ -492,6 +498,7 @@ static struct iodev_ops iodev_usb_sec_ops = {
     .read = usb_1_read,
     .write = usb_1_write,
     .queue = usb_1_queue,
+    .write_nonblocking = usb_1_write_nonblocking,
     .flush = usb_1_flush,
     .handle_events = usb_1_handle_events,
 };
