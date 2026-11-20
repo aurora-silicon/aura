@@ -468,6 +468,10 @@ def test_t6040_gpu_fill(tmp_path):
     defs = source[source.index("#define MAX_PSTATES"):source.index("int32_t rust_gpu_initdata_size(")]
     start = source.index("/*\n * T6040 (M4 Pro).")
     t6040 = source[start:source.index("int dt_set_gpu_m4(void *dt);", start)]
+    # The firmware segment helper's result, shared with T6041 and T8132, is declared in kboot.h.
+    header = (ROOT / "src/kboot.h").read_text()
+    layout = header[header.index("struct gpu_fw_layout {"):]
+    t6040 = layout[:layout.index("};\n") + 3] + t6040
     # The rounding barrier uses an AArch64 register constraint; a memory one works on any host.
     t6040, replaced = re.subn(r'#define T6040_ROUND\(x\) __asm__\(""\s*:\s*"\+w"\(x\)\)',
                               '#define T6040_ROUND(x) __asm__("" : "+m"(x))', t6040)
