@@ -282,8 +282,8 @@ static int enable_power_domains(void *dt, u32 phandle, unsigned int depth)
         return -1;
     u32 parent = fdt32_ld(domains);
     int supplier = fdt_node_offset_by_phandle(dt, parent);
-    const fdt32_t *cells = supplier < 0 ? NULL :
-        fdt_getprop(dt, supplier, "#power-domain-cells", &len);
+    const fdt32_t *cells =
+        supplier < 0 ? NULL : fdt_getprop(dt, supplier, "#power-domain-cells", &len);
     if (!cells || len != sizeof(*cells) || fdt32_ld(cells) ||
         enable_power_domains(dt, parent, depth + 1))
         return -1;

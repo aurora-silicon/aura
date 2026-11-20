@@ -23,8 +23,8 @@
 #include "j813_n1.h"
 #include "kboot_atc.h"
 #include "kboot_audio.h"
-#include "kboot_display_t8142.h"
 #include "kboot_display_facts.h"
+#include "kboot_display_t8142.h"
 #include "kboot_gpu_t8122.h"
 #include "kboot_mte.h"
 #include "kboot_pmp_t8122.h"
@@ -8109,7 +8109,9 @@ static int dt_set_m4_dcp_handoff(void)
 static int dt_refuse_t8142_display(void)
 {
     static const char *const compats[] = {
-        "apple,t8142-dcp", "apple,t8142-dcpext", "apple,display-subsystem",
+        "apple,t8142-dcp",
+        "apple,t8142-dcpext",
+        "apple,display-subsystem",
     };
     for (size_t i = 0; i < ARRAY_SIZE(compats); i++) {
         int node = -1;
@@ -8194,8 +8196,7 @@ static int dt_set_display_t8142(void)
     if (!fdt_get_alias(dt, "dcp"))
         return 0;
     /* A refused session may still DMA; its proven RAM/table reservations stay. */
-    if (kboot_t8142_display_reserve(dt, "dcp") ||
-        dt_display_transaction(dt_set_t8142_dcp, 0)) {
+    if (kboot_t8142_display_reserve(dt, "dcp") || dt_display_transaction(dt_set_t8142_dcp, 0)) {
         printf("FDT: T8142 display handoff refused; keeping the boot framebuffer\n");
         return dt_refuse_t8142_display();
     }
