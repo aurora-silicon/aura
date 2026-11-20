@@ -84,6 +84,7 @@ extern u64 relocated_from;
 
 int dt_set_gpu(void *dt);
 int dt_set_display_handoff(void *dt);
+int dt_set_j713_dcpext_handoff(void *dt);
 
 u64 kboot_ram_base(void)
 {
@@ -8197,6 +8198,17 @@ static bool dt_t8132_external_display(void)
     return firmware_os_components() == V27_2 && !fdt_node_check_compatible(dt, 0, "apple,j773g");
 }
 
+/*
+ * The J713 on 27.2: iBoot leaves dcpext0 and dcpext1 running the internal DCP's 27.2 image, and
+ * the kernel drives them through its firmware-27 backend for the USB-C ports. They are handed
+ * over by kboot_display_handoff.c beside the internal panel (dt_set_j713_dcpext_handoff()), not
+ * through the 26.6.2 firmware-ready path of dt_reserve_j713_dcpext().
+ */
+static bool dt_t8132_j713_external_v27_2(void)
+{
+    return firmware_os_components() == V27_2 && !fdt_node_check_compatible(dt, 0, "apple,j713");
+}
+
 static int dt_set_display(void)
 {
     if (chip_id == T8140)
@@ -8226,6 +8238,8 @@ static int dt_set_display(void)
             return dt_set_display_handoff(dt);
         if (dt_set_m4_dcp_handoff())
             printf("FDT: M4 DCP handoff refused; keeping the boot framebuffer\n");
+        else if (dt_t8132_j713_external_v27_2())
+            dt_set_j713_dcpext_handoff(dt);
         else
             dt_reserve_j713_dcpext();
         return 0;

@@ -482,6 +482,8 @@ static const struct j773g_scenario j773g_scenarios[] = {
     {"dt-full", J_PUBLISH, false, false, false, "no room: refused without partial edits"},
 };
 
+/* t8132_j713_27_dcpext_host.c includes this file for its world and builders */
+#ifndef J773G_HOST_NO_MAIN
 int main(int argc, char **argv)
 {
     if (argc == 2 && is(argv[1], "list")) {
@@ -649,3 +651,4 @@ int main(int argc, char **argv)
     printf("%s: %s\n", s, failures ? "FAIL" : "pass");
     return failures ? 1 : 0;
 }
+#endif /* J773G_HOST_NO_MAIN */
