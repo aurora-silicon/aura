@@ -57,6 +57,12 @@ u64 sptm_virt_gpu_keep = GPU_RING_KEEP;
 #ifndef SPTM_VIRT_GPU_STOP_MSG
 #define SPTM_VIRT_GPU_STOP_MSG 0
 #endif
+#ifndef SPTM_VIRT_GPU_PARK_RING_MIN
+#define SPTM_VIRT_GPU_PARK_RING_MIN 0
+#endif
+#ifndef SPTM_VIRT_GPU_PARK_KICKS
+#define SPTM_VIRT_GPU_PARK_KICKS 0
+#endif
 #ifndef SPTM_VIRT_GPU_PRINT_MAX
 #define SPTM_VIRT_GPU_PRINT_MAX 20000
 #endif
@@ -76,6 +82,15 @@ u32 sptm_virt_gpu_stop_secs = SPTM_VIRT_GPU_STOP_SECS;
 u32 sptm_virt_gpu_stop_boot_secs = SPTM_VIRT_GPU_STOP_BOOT_SECS;
 /* Park after a write of this value (a mailbox message); 0 = never. */
 u64 sptm_virt_gpu_stop_msg = SPTM_VIRT_GPU_STOP_MSG;
+/*
+ * Park at the Nth kick publication on a queue ring >= RING_MIN (an app's queues get rings past
+ * the ones the system configures at boot), so the park lands inside that app's own GPU burst
+ * while its descriptors are still in the shared pool; 0 = never.
+ */
+u32 sptm_virt_gpu_park_ring_min = SPTM_VIRT_GPU_PARK_RING_MIN;
+u32 sptm_virt_gpu_park_kicks = SPTM_VIRT_GPU_PARK_KICKS;
+volatile u32 sptm_virt_gpu_app_kicks; /* kicks counted on app rings */
+u32 sptm_virt_gpu_park_ring;          /* the ring of the latest of them */
 u32 sptm_virt_gpu_print_max = SPTM_VIRT_GPU_PRINT_MAX;
 u32 sptm_virt_gpu_ring_mib = SPTM_VIRT_GPU_RING_MIB;
 u32 sptm_virt_gpu_pmp = SPTM_VIRT_GPU_PMP; /* also hook the PMP's dashboard and mailbox */
@@ -176,11 +191,31 @@ static void gpu_note_config(u64 addr, u64 val, u64 now)
     sptm_virt_gpu_nconfigs = n + 1;
 }
 
+/*
+ * A kick publication (sgx +0x4090 = (ring << 44) | ... | 0x18, then +0x4098 = 1) on an app's
+ * ring: true at the one the kick park waits for.
+ */
+static bool gpu_note_kick(u64 addr, u64 val)
+{
+    if (addr != gpu_sgx + 0x4098 || val != 1 || (gpu_port_tag & 0xff) != 0x18 ||
+        !sptm_virt_gpu_park_kicks || !sptm_virt_gpu_park_ring_min)
+        return false;
+    u32 ring = (gpu_port_tag >> 44) & 0x7f;
+    if (ring < sptm_virt_gpu_park_ring_min)
+        return false;
+    sptm_virt_gpu_park_ring = ring;
+    return __atomic_add_fetch(&sptm_virt_gpu_app_kicks, 1, __ATOMIC_RELAXED) >=
+           sptm_virt_gpu_park_kicks;
+}
+
 static void gpu_park(struct exc_info *ctx, const char *why)
 {
     /* First: of several cores that reach here at once, one owns the console and the proxy. */
     sptm_virt_park_others();
     gpu_parked = true;
+    if (sptm_virt_gpu_park_kicks)
+        printf("SPTM-virt[gpu]: app kick %u, on ring %u\n", sptm_virt_gpu_app_kicks,
+               sptm_virt_gpu_park_ring);
     printf("SPTM-virt[gpu]: %s: parking cpu%d in the proxy at XNU pc "
            "0x%lx; ring 0x%lx, %lu records of %lu written (head 0x%lx at 0x%lx); cores held "
            "0x%lx\n",
@@ -228,6 +263,7 @@ void sptm_virt_gpu_deadline(struct exc_info *ctx)
 static bool gpu_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int width)
 {
     u64 now = mrs(CNTPCT_EL0);
+    bool kick_park = false;
 
     if (!gpu_first_t) {
         gpu_first_t = now;
@@ -255,8 +291,10 @@ static bool gpu_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int w
     } else {
         sptm_virt_mmio_rw(addr, val, write, width);
         gpu_note(ctx, addr, *val, write, width);
-        if (write && gpu_sgx)
+        if (write && gpu_sgx) {
             gpu_note_config(addr, *val, now);
+            kick_park = gpu_note_kick(addr, *val);
+        }
     }
 
     u64 off;
@@ -284,6 +322,8 @@ static bool gpu_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int w
         gpu_park(ctx, "the write the host asked for");
     else if (gpu_stop_t && now >= gpu_stop_t)
         gpu_park(ctx, "the time the host asked for");
+    else if (kick_park)
+        gpu_park(ctx, "the app kick the host asked for");
     return true;
 }
 

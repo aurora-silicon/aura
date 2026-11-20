@@ -28,6 +28,9 @@ reads the ring over the debug link. `SPTM_VIRT_GPU_STOP_BOOT_SECS`, `_STOP_MSG`,
 `_RING_MIB` and `_PMP` are the build's versions of the other `AURA_GPU_*` settings.
 `-DSPTM_VIRT_GPU_HOP_PAGES` hooks only the GPU pages its driver uses at run time
 (and not the PMP); hooking the whole GPU window can fault XNU's boot.
+`-DSPTM_VIRT_GPU_PARK_RING_MIN=<r> -DSPTM_VIRT_GPU_PARK_KICKS=<n>` parks at the
+`<n>`-th kick on queue rings `<r>` and up instead, where an app's queues get
+their rings; the time park stays as a fallback.
 
 ## Bundle
 
