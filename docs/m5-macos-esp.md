@@ -30,7 +30,12 @@ reads the ring over the debug link. `SPTM_VIRT_GPU_STOP_BOOT_SECS`, `_STOP_MSG`,
 (and not the PMP); hooking the whole GPU window can fault XNU's boot.
 `-DSPTM_VIRT_GPU_PARK_RING_MIN=<r> -DSPTM_VIRT_GPU_PARK_KICKS=<n>` parks at the
 `<n>`-th kick on queue rings `<r>` and up instead, where an app's queues get
-their rings; the time park stays as a fallback.
+their rings; the time park stays as a fallback. The ring ids differ from boot to
+boot, so `-DSPTM_VIRT_GPU_PARK_ARM_SECS=<a>` takes the rings configured `<a>`
+seconds or more after the first GPU access as an app's instead. With
+`-DSPTM_VIRT_GPU_PARK_BURST=<b>` the park comes at kick `<n>` of the app's
+`<b>`-th burst: a quiet gap of `SPTM_VIRT_GPU_PARK_GAP_MS` (1500) ends a burst,
+and only bursts of `SPTM_VIRT_GPU_PARK_BIG` (100) kicks or more count.
 
 ## Bundle
 

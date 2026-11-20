@@ -63,6 +63,18 @@ u64 sptm_virt_gpu_keep = GPU_RING_KEEP;
 #ifndef SPTM_VIRT_GPU_PARK_KICKS
 #define SPTM_VIRT_GPU_PARK_KICKS 0
 #endif
+#ifndef SPTM_VIRT_GPU_PARK_ARM_SECS
+#define SPTM_VIRT_GPU_PARK_ARM_SECS 0
+#endif
+#ifndef SPTM_VIRT_GPU_PARK_BURST
+#define SPTM_VIRT_GPU_PARK_BURST 0
+#endif
+#ifndef SPTM_VIRT_GPU_PARK_BIG
+#define SPTM_VIRT_GPU_PARK_BIG 100
+#endif
+#ifndef SPTM_VIRT_GPU_PARK_GAP_MS
+#define SPTM_VIRT_GPU_PARK_GAP_MS 1500
+#endif
 #ifndef SPTM_VIRT_GPU_PRINT_MAX
 #define SPTM_VIRT_GPU_PRINT_MAX 20000
 #endif
@@ -89,8 +101,24 @@ u64 sptm_virt_gpu_stop_msg = SPTM_VIRT_GPU_STOP_MSG;
  */
 u32 sptm_virt_gpu_park_ring_min = SPTM_VIRT_GPU_PARK_RING_MIN;
 u32 sptm_virt_gpu_park_kicks = SPTM_VIRT_GPU_PARK_KICKS;
+/*
+ * App rings may also be told by when they were configured: ARM_SECS or more after the first GPU
+ * access (the system configures its rings during boot; the ring ids differ from boot to boot).
+ * 0 = off.
+ */
+u32 sptm_virt_gpu_park_arm_secs = SPTM_VIRT_GPU_PARK_ARM_SECS;
+/*
+ * An app's GPU work comes in bursts (one per benchmark workload) with quiet gaps between them. A
+ * gap of GAP_MS ends a burst, and only bursts of BIG kicks or more count. With BURST = n, the park
+ * comes at kick PARK_KICKS of the n-th big burst; 0 = off (PARK_KICKS counts every app kick).
+ */
+u32 sptm_virt_gpu_park_burst = SPTM_VIRT_GPU_PARK_BURST;
+u32 sptm_virt_gpu_park_big = SPTM_VIRT_GPU_PARK_BIG;
+u32 sptm_virt_gpu_park_gap_ms = SPTM_VIRT_GPU_PARK_GAP_MS;
 volatile u32 sptm_virt_gpu_app_kicks; /* kicks counted on app rings */
 u32 sptm_virt_gpu_park_ring;          /* the ring of the latest of them */
+u32 sptm_virt_gpu_bursts_done;        /* big app bursts completed */
+u32 sptm_virt_gpu_burst_kicks;        /* kicks in the current app burst */
 u32 sptm_virt_gpu_print_max = SPTM_VIRT_GPU_PRINT_MAX;
 u32 sptm_virt_gpu_ring_mib = SPTM_VIRT_GPU_RING_MIB;
 u32 sptm_virt_gpu_pmp = SPTM_VIRT_GPU_PMP; /* also hook the PMP's dashboard and mailbox */
@@ -117,6 +145,8 @@ struct gpu_config {
 struct gpu_config sptm_virt_gpu_configs[GPU_CONFIG_MAX];
 volatile u32 sptm_virt_gpu_nconfigs;
 static u64 gpu_port_tag;
+static u64 gpu_ring_cfg_t[128]; /* CNTPCT of each ring's latest configuration */
+static u64 gpu_last_app_t;
 
 static u64 gpu_seen[GPU_SEEN_MAX];
 static u32 gpu_nseen;
@@ -179,6 +209,7 @@ static void gpu_note_config(u64 addr, u64 val, u64 now)
     u64 engine = val >> 60;
     if (addr != gpu_sgx + 0x4098 || engine < 1 || engine > 4)
         return;
+    gpu_ring_cfg_t[(gpu_port_tag >> 44) & 0x7f] = now;
     u32 n = sptm_virt_gpu_nconfigs;
     for (u32 k = 0; k < n; k++)
         if (sptm_virt_gpu_configs[k].tag == gpu_port_tag && sptm_virt_gpu_configs[k].payload == val)
@@ -195,17 +226,31 @@ static void gpu_note_config(u64 addr, u64 val, u64 now)
  * A kick publication (sgx +0x4090 = (ring << 44) | ... | 0x18, then +0x4098 = 1) on an app's
  * ring: true at the one the kick park waits for.
  */
-static bool gpu_note_kick(u64 addr, u64 val)
+static bool gpu_note_kick(u64 addr, u64 val, u64 now)
 {
     if (addr != gpu_sgx + 0x4098 || val != 1 || (gpu_port_tag & 0xff) != 0x18 ||
-        !sptm_virt_gpu_park_kicks || !sptm_virt_gpu_park_ring_min)
+        !sptm_virt_gpu_park_kicks || !(sptm_virt_gpu_park_ring_min || sptm_virt_gpu_park_arm_secs))
         return false;
     u32 ring = (gpu_port_tag >> 44) & 0x7f;
-    if (ring < sptm_virt_gpu_park_ring_min)
+    u64 frq = mrs(CNTFRQ_EL0);
+    bool app = (sptm_virt_gpu_park_ring_min && ring >= sptm_virt_gpu_park_ring_min) ||
+               (sptm_virt_gpu_park_arm_secs &&
+                gpu_ring_cfg_t[ring] >= gpu_first_t + (u64)sptm_virt_gpu_park_arm_secs * frq);
+    if (!app)
         return false;
     sptm_virt_gpu_park_ring = ring;
-    return __atomic_add_fetch(&sptm_virt_gpu_app_kicks, 1, __ATOMIC_RELAXED) >=
-           sptm_virt_gpu_park_kicks;
+    u32 total = __atomic_add_fetch(&sptm_virt_gpu_app_kicks, 1, __ATOMIC_RELAXED);
+    if (gpu_last_app_t && now - gpu_last_app_t > (u64)sptm_virt_gpu_park_gap_ms * (frq / 1000)) {
+        if (sptm_virt_gpu_burst_kicks >= sptm_virt_gpu_park_big)
+            sptm_virt_gpu_bursts_done++;
+        sptm_virt_gpu_burst_kicks = 0;
+    }
+    sptm_virt_gpu_burst_kicks++;
+    gpu_last_app_t = now;
+    if (sptm_virt_gpu_park_burst)
+        return sptm_virt_gpu_bursts_done + 1 == sptm_virt_gpu_park_burst &&
+               sptm_virt_gpu_burst_kicks >= sptm_virt_gpu_park_kicks;
+    return total >= sptm_virt_gpu_park_kicks;
 }
 
 static void gpu_park(struct exc_info *ctx, const char *why)
@@ -214,8 +259,9 @@ static void gpu_park(struct exc_info *ctx, const char *why)
     sptm_virt_park_others();
     gpu_parked = true;
     if (sptm_virt_gpu_park_kicks)
-        printf("SPTM-virt[gpu]: app kick %u, on ring %u\n", sptm_virt_gpu_app_kicks,
-               sptm_virt_gpu_park_ring);
+        printf("SPTM-virt[gpu]: app kick %u, on ring %u; big bursts done %u, kick %u of this one\n",
+               sptm_virt_gpu_app_kicks, sptm_virt_gpu_park_ring, sptm_virt_gpu_bursts_done,
+               sptm_virt_gpu_burst_kicks);
     printf("SPTM-virt[gpu]: %s: parking cpu%d in the proxy at XNU pc "
            "0x%lx; ring 0x%lx, %lu records of %lu written (head 0x%lx at 0x%lx); cores held "
            "0x%lx\n",
@@ -293,7 +339,7 @@ static bool gpu_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int w
         gpu_note(ctx, addr, *val, write, width);
         if (write && gpu_sgx) {
             gpu_note_config(addr, *val, now);
-            kick_park = gpu_note_kick(addr, *val);
+            kick_park = gpu_note_kick(addr, *val, now);
         }
     }
 
