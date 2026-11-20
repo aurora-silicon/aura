@@ -26,7 +26,7 @@ def host(tmp_path_factory):
     return build_host(tmp_path_factory.mktemp("t6041"))
 
 
-def build_host(tmp, unknown_profile=False, host_source="t6041_display_host.c"):
+def build_host(tmp, unknown_profile=False, host_source="t6041_display_host.c", includes=()):
     cc = host_cc()
     if not shutil.which(cc[0]):
         pytest.skip("no host C compiler")
@@ -48,6 +48,8 @@ def build_host(tmp, unknown_profile=False, host_source="t6041_display_host.c"):
     shutil.copy(ROOT / "tests/t6041_display_host.c", src)
     if host_source != "t6041_display_host.c":
         shutil.copy(ROOT / "tests" / host_source, src)
+    for included in includes:  # host sources that host_source #includes
+        shutil.copy(ROOT / "tests" / included, src)
     for header in (ROOT / "tests/t8122_display_host").glob("*.h"):
         shutil.copy(header, src)
     binary = tmp / "t6041-display-host"

@@ -327,6 +327,13 @@ struct dcp_soc {
     const char *ext_compat; /* their device tree compatible */
     /* Root compatible of the board whose internal DCP is not handed over, or NULL */
     const char *headless;
+    /*
+     * The external processors are handed over beside kboot.c's M4 internal handoff (the J713 on
+     * 27.2, dt_set_j713_dcpext_handoff()): their nodes and DARTs may be enabled (the J713 tree
+     * enables them for the 26.6.2 path, whose kernel gate is a firmware-ready marker), and their
+     * shared __TEXT is the internal DCP's, which that handoff reserved as asc-firmware@<phys>.
+     */
+    bool ext_beside_m4;
 };
 
 static const char *const dcp_boards_t6030[] = {"apple,j516s", "apple,j514s", NULL};
@@ -613,6 +620,44 @@ static const struct dcp_soc dcp_soc_t6050 = {
     .os_fw = V27_0,
     .os_fw_name = "27.0",
     .t6050 = true,
+};
+
+/*
+ * T8132 MacBook Air (J713) on macOS 27.2 (26B123). iBoot leaves dcp, dcpext0 and dcpext1 running
+ * the same image as on the J773g (B3BA603C, shared __TEXT, four-segment dcpext layout, SIDs 23;
+ * 0 and 16, of 32). kboot.c's M4 handoff hands the internal panel's DCP over; this hands the two
+ * external processors over beside it, each with its pipe's firmware clocks, for the USB-C ports
+ * (DisplayPort alt mode). Never part of dcp_socs[]: only dt_set_j713_dcpext_handoff() uses it,
+ * after the internal handoff was published.
+ */
+static const char *const dcp_boards_t8132_j713[] = {"apple,j713", NULL};
+static const char *const dcp_nubs_t8132_j713[] = {"dcpext0", "dcpext1"};
+
+static const struct dcp_soc dcp_soc_t8132_j713 = {
+    .name = "T8132 J713",
+    .chip = T8132,
+    .compat = "apple,t8132",
+    .boards = dcp_boards_t8132_j713,
+    .boards_desc = "J713",
+    .dcp_compat = "apple,t8132-dcp",
+    .disp_compat = "apple,t8132-display-subsystem",
+    .board_gate = true,
+    .sids = true,
+    .oslog_in_rsv = true,
+    .sid_dcp = 23,
+    .sid_disp = 0,
+    .sid_piodma = 16,
+    .streams = 32,
+    .fws = dcp_fws_t8132,
+    .nfws = ARRAY_SIZE(dcp_fws_t8132),
+    .vm_base = DCP6_DART_VM_BASE,
+    .vm_size = DCP6_DART_VM_SIZE,
+    .nubs = dcp_nubs_t8132_j713,
+    .nnubs = ARRAY_SIZE(dcp_nubs_t8132_j713),
+    .exts = t8132_exts,
+    .nexts = ARRAY_SIZE(t8132_exts),
+    .ext_compat = "apple,t8132-dcpext",
+    .ext_beside_m4 = true,
 };
 
 static const struct dcp_soc *const dcp_socs[] = {&dcp_soc_t6030, &dcp_soc_t8122,     &dcp_soc_t6031,
@@ -3214,6 +3259,8 @@ static bool dcp6_headless(void *dt)
 }
 
 static struct dcp6_seg dcp6_headless_text;
+/* With ext_beside_m4: the internal DCP's __TEXT, which kboot.c's M4 handoff reserved */
+static struct dcp6_seg dcp6_m4_text;
 
 static int dcp6_ext_fill(void *dt, const struct dcp6_ext *ext)
 {
@@ -3233,7 +3280,7 @@ static int dcp6_ext_fill(void *dt, const struct dcp6_ext *ext)
         return 1;
     if (fdt_node_check_compatible(dt, node, dcp6.soc->ext_compat))
         bail("%s is not %s\n", ext->name, dcp6.soc->ext_compat);
-    if (dcp6_status_disabled(dt, node, ext->name))
+    if (!dcp6.soc->ext_beside_m4 && dcp6_status_disabled(dt, node, ext->name))
         return -1;
     if (dcp6_adt_reg(ext->adt_path, 0, &coproc) || coproc != ext->coproc ||
         dcp6_adt_reg(ext->dart_path, 0, &dart) || dart != ext->dart)
@@ -3250,7 +3297,7 @@ static int dcp6_ext_fill(void *dt, const struct dcp6_ext *ext)
     int dart_node = fdt_node_offset_by_phandle(dt, fdt32_ld(iommu));
     if (dart_node < 0 || fdt_node_check_compatible(dt, dart_node, "apple,t8110-dart"))
         bail("%s is not an apple,t8110-dart\n", dart_what);
-    if (dcp6_status_disabled(dt, dart_node, dart_what))
+    if (!dcp6.soc->ext_beside_m4 && dcp6_status_disabled(dt, dart_node, dart_what))
         return -1;
     reg = fdt_getprop(dt, dart_node, "reg", &len);
     if (!reg || len < 2 * (int)sizeof(fdt64_t) || fdt64_ld(reg) != dart)
@@ -3340,7 +3387,9 @@ static int dcp6_ext_fill(void *dt, const struct dcp6_ext *ext)
     }
     /* The two external processors and the panel share immutable TEXT. */
     const struct dcp6_seg *shared_text = &dcp6.segs[SEG_TEXT];
-    if (dcp6_headless(dt)) {
+    if (dcp6.soc->ext_beside_m4) {
+        shared_text = &dcp6_m4_text;
+    } else if (dcp6_headless(dt)) {
         if (!dcp6_headless_text.phys)
             dcp6_headless_text = segs[SEG_TEXT];
         shared_text = &dcp6_headless_text;
@@ -3359,8 +3408,11 @@ static int dcp6_ext_fill(void *dt, const struct dcp6_ext *ext)
      */
     char text_name[64];
     const struct dcp6_seg *text = &segs[SEG_TEXT];
-    snprintf(text_name, sizeof(text_name), "dcp-text@%lx", text->phys);
+    snprintf(text_name, sizeof(text_name),
+             dcp6.soc->ext_beside_m4 ? "asc-firmware@%lx" : "dcp-text@%lx", text->phys);
     int shared = dcp6_find_resv(dt, text_name, text->phys, text->size);
+    if (shared < 0 && dcp6.soc->ext_beside_m4)
+        bail("%s: the internal handoff's /reserved-memory/%s is missing\n", ext->name, text_name);
     if (shared < 0 && dcp6_headless(dt)) {
         if (dcp6_resv_conflict(dt, text->phys, text->size, text_name) ||
             !dcp6_add_resv(dt, text_name, text->phys, text->size, "apple,asc-mem"))
@@ -4098,5 +4150,79 @@ int dt_set_display_handoff(void *dt)
         dcpext6_handoffs(dt);
     if (dcp6.soc->exts)
         dcp6_ext_handoffs(dt);
+    return 0;
+}
+
+/*
+ * The J713 on macOS 27.2: hand dcpext0 and dcpext1 over beside kboot.c's M4 internal handoff,
+ * which must have been published first (the dcp node carries the pinned image's
+ * apple,firmware-uuid and the internal __TEXT is reserved). Each processor is its own transaction
+ * (dcp6_ext_fill()); a refused one is logged and leaves its placeholders disabled. Their nodes
+ * and DARTs keep whatever status the device tree gives them: the kernel's display gate decides.
+ * No apple,t8132-dcpext-firmware-ready marker is written (that is the 26.6.2 path's), and no MMIO
+ * is touched. Always returns 0.
+ */
+int dt_set_j713_dcpext_handoff(void *dt)
+{
+    memset(&dcp6, 0, sizeof(dcp6));
+    memset(&dcp6_m4_text, 0, sizeof(dcp6_m4_text));
+    dcp6.soc = &dcp_soc_t8132_j713;
+
+    if (chip_id != dcp6.soc->chip || !dcp6_board_ok(dt))
+        return 0;
+    dcp6.fw = dcp6_select_fw(dcp6.soc);
+    if (!dcp6.fw) {
+        dlog("not macOS 27.2: external processors not handed over\n");
+        return 0;
+    }
+
+    const char *dcp_path = fdt_get_alias(dt, "dcp");
+    int dcp = dcp_path ? fdt_path_offset(dt, dcp_path) : -1;
+    int len = 0;
+    const char *uuid = dcp < 0 ? NULL : fdt_getprop(dt, dcp, "apple,firmware-uuid", &len);
+    if (!uuid || len != (int)strlen(dcp6.fw->uuid) + 1 || memcmp(uuid, dcp6.fw->uuid, len)) {
+        dlog("internal DCP not handed over with image %s: external processors not handed "
+             "over\n",
+             dcp6.fw->uuid);
+        return 0;
+    }
+
+    /* The shared __TEXT: the internal nub's first segment, as kboot.c reserved it. */
+    u32 seg_len = 0, names_len = 0;
+    int nub = adt_path_offset(adt, DCP6_NUB);
+    const struct adt_segment_ranges *ranges =
+        nub < 0 ? NULL : adt_getprop(adt, nub, "segment-ranges", &seg_len);
+    const char *names = nub < 0 ? NULL : adt_getprop(adt, nub, "segment-names", &names_len);
+    if (!ranges || seg_len < sizeof(*ranges) || seg_len % sizeof(*ranges) || !names ||
+        !dcp6_seg_name_is(names, names_len, SEG_TEXT, "__TEXT")) {
+        dlog("internal DCP nub has no __TEXT: external processors not handed over\n");
+        return 0;
+    }
+    struct adt_segment_ranges r;
+    memcpy(&r, &ranges[SEG_TEXT], sizeof(r));
+    if (r.unk != SEG_FLAGS_TEXT || !r.size) {
+        dlog("internal DCP __TEXT has flags 0x%x: external processors not handed over\n", r.unk);
+        return 0;
+    }
+    dcp6_m4_text = (struct dcp6_seg){r.phys, ALIGN_UP((u64)r.size, SZ_16K), r.remap, r.unk};
+
+    dcp6_find_nubs();
+    dcp6_reserve_oslogs(dt);
+    for (int i = 0; i < dcp6.soc->nexts; i++) {
+        const struct dcp6_ext *ext = &dcp6.soc->exts[i];
+        void *scratch = dcp6_scratch(dt);
+        if (!scratch)
+            return 0;
+        int ret = dcp6_ext_fill(scratch, ext);
+        if (ret) {
+            if (ret < 0)
+                dlog("%s firmware memory refused; placeholder remains disabled\n", ext->name);
+            free(scratch);
+            continue;
+        }
+        if (!dcp6_commit(dt, scratch))
+            dlog("%s firmware memory and clocks published for 27.2 (USB-C displays)\n",
+                 ext->name);
+    }
     return 0;
 }
