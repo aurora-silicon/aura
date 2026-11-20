@@ -3576,6 +3576,8 @@ static int dt_set_pcie_tunables(void)
 
         memset(fdt_alias, 0, sizeof(adt_path));
         snprintf(fdt_alias, sizeof(fdt_alias), "usb4_%d_pcie", i);
+        if (!fdt_get_alias(dt, fdt_alias))
+            snprintf(fdt_alias, sizeof(fdt_alias), "usb4-%d-pcie", i);
 
         dt_copy_pciec_tunables(adt_path, fdt_alias);
     }
