@@ -1497,8 +1497,30 @@ static bool s2r_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int w
                addr, ctx->elr);
         return false;
     }
+    /* Bit 26 (J613): the commit word read back around each performed commit write, and the
+     * boot's first commit: its page, the mini PMGR and SIO_CPU, just before the write. Linux
+     * reads its commit word 0 straight after its writes; this is macOS at the same moment. */
+    bool commit_rb = timer && !shadow_timer && chip_id == T8122 &&
+                     (sptm_virt_s2r_crumbs & BIT(26));
+    if (commit_rb) {
+        static bool page_done;
+        if (!page_done) {
+            page_done = true;
+            for (u64 a = 0x2e42d4000; a <= 0x2e42d40fc; a += 4)
+                s2r_j613_snapshot_word("J613CPG", a);
+            for (u64 a = 0x2e4280000; a <= 0x2e4280100; a += 8)
+                s2r_j613_snapshot_word("J613CPG", a);
+            s2r_j613_snapshot_word("J613CPG", 0x2d0700210);
+        }
+        s2r_j613_snapshot_word("J613CRP", addr);
+    }
     if (!shadow_timer)
         sptm_virt_mmio_rw(addr, val, write, width);
+    if (commit_rb) {
+        s2r_j613_snapshot_word("J613CR0", addr);
+        udelay(5);
+        s2r_j613_snapshot_word("J613CR5", addr);
+    }
     if (timer && !shadow_timer)
         s2r_crumb(0x30);
     if (!shadow_timer)
