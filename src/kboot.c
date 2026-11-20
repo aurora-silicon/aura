@@ -61,6 +61,9 @@
 
 #define MAX_MEM_REGIONS 32
 
+/* Room kboot_prepare_dt() leaves for its own additions to the tree (272K). */
+#define DT_EDIT_MARGIN (17 * SZ_16K)
+
 static void *dt = NULL;
 static int dt_bufsize = 0;
 static bool dt_ready;
@@ -11583,26 +11586,15 @@ int kboot_prepare_dt(void *fdt)
     dt_bufsize = fdt_totalsize(fdt);
     assert(dt_bufsize);
 
-    dt_bufsize += 6 * SZ_16K; // Add 96K of buffer for modifications
-    dt_bufsize += SZ_16K;     // and the SMBIOS description U-Boot builds its tables from (about 6K)
-    // A T6030 or T8122 also takes its PMP values
-    if (chip_id == T6030 || chip_id == T8122)
-        dt_bufsize += 2 * SZ_16K;
-    // A T8122 also takes its GPU and PMP facts and the display clock description
-    if (chip_id == T8122)
-        dt_bufsize += 8 * SZ_16K;
-    // A T6030 also takes its display ADT facts (at most 46K, headers and strings included)
-    if (chip_id == T6030)
-        dt_bufsize += 4 * SZ_16K;
-    // A T6031 takes its PMP values (32K) and its display, GPU and firmware handoff (about 16K)
-    if (chip_id == T6031)
-        dt_bufsize += 4 * SZ_16K;
-    // A T6032 takes only its firmware image UUID list (about 16K)
-    if (chip_id == T6032)
-        dt_bufsize += SZ_16K;
-    // A T6040 takes its PMP values (about 38K) and its firmware handoffs
-    if (chip_id == T6040)
-        dt_bufsize += 4 * SZ_16K;
+    /*
+     * Room for what kboot adds to the tree. One margin on every Mac, sized for the largest
+     * addition kboot makes on any SoC today: 96K of general edits, about 6K of SMBIOS description
+     * U-Boot builds its tables from, and up to 160K of handoff data (a T8122's PMP values, GPU and
+     * PMP facts and display clock description; a T6030's PMP values and display ADT facts, at
+     * most 46K; a T6031's or T6040's PMP values and firmware handoffs; a T6032's firmware UUID
+     * list).
+     */
+    dt_bufsize += DT_EDIT_MARGIN;
     dt = memalign(DT_ALIGN, dt_bufsize);
 
     if (fdt_open_into(fdt, dt, dt_bufsize) < 0)
