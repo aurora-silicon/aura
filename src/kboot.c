@@ -9222,6 +9222,33 @@ static bool dt_isp_has_placeholders(void)
 }
 
 /*
+ * The ISP node: the one the isp alias names or, on a tree with firmware placeholders but no isp
+ * alias (the M4 Pro MacBooks' t604x-j614-j616.dtsi), the one node whose first memory region is
+ * the isp-firmware-text placeholder.
+ */
+static int dt_isp_node(void)
+{
+    int node = fdt_path_offset(dt, "isp");
+    if (node >= 0 || !dt_isp_has_placeholders())
+        return node;
+    int resv = fdt_path_offset(dt, "/reserved-memory");
+    u32 text = fdt_get_phandle(dt, fdt_subnode_offset(dt, resv, "isp-firmware-text"));
+    int found = -FDT_ERR_NOTFOUND;
+    if (!text)
+        return found;
+    for (node = fdt_next_node(dt, -1, NULL); node >= 0; node = fdt_next_node(dt, node, NULL)) {
+        int len;
+        const fdt32_t *mr = fdt_getprop(dt, node, "memory-region", &len);
+        if (!mr || len < (int)sizeof(*mr) || fdt32_ld(mr) != text)
+            continue;
+        if (found >= 0)
+            return -FDT_ERR_NOTFOUND;
+        found = node;
+    }
+    return found;
+}
+
+/*
  * Placeholder-driven ISP handoff (T6040/T6041 and any tree with /reserved-memory/isp-firmware-text
  * and isp-firmware-data): iBoot loads the firmware and Linux starts it as iBoot left it. Fill the
  * kernel DT's placeholders from this boot's ADT segment-ranges within dart-isp vm-base + isp-heap,
@@ -9404,7 +9431,7 @@ static int dt_set_isp_fwdata(void)
 
     u64 phys, iova, size;
 
-    int fdt_node = fdt_path_offset(dt, fdt_path);
+    int fdt_node = dt_isp_node();
     if (fdt_node < 0) {
         printf("FDT: '%s' not found\n", fdt_path);
         return 0;
@@ -9671,7 +9698,7 @@ static int dt_set_isp(void)
         return 0;
     }
 
-    int node = fdt_path_offset(dt, "isp");
+    int node = dt_isp_node();
     if (node < 0)
         return -1;
     printf("FDT: ISP firmware or heap not reserved, disabling the ISP\n");
