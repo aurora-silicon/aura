@@ -25,8 +25,9 @@ def test_adopted_queue_lifetime(tmp_path):
     # The M1-M3 sleep-and-reset helper that every legacy power-down goes through.
     sleep_reset = source[source.index("static bool nvme_ans_sleep_and_reset(void)"):
                          source.index("static bool nvme_exec_command(")]
+    # The handoff and the SART entries it reports to the next stage.
     shutdown = source[source.index("bool nvme_shutdown(void)"):
-                      source.index("int nvme_sart_entries(")]
+                      source.index("bool nvme_set_sart_var(")]
     harness = r'''
 #include <assert.h>
 #include <stdbool.h>
@@ -43,6 +44,7 @@ typedef int rtkit_dev_t;
 typedef int sart_dev_t;
 struct sart_entry { u8 index, flags; u64 paddr, size; };
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
+#define min(a, b) ((a) < (b) ? (a) : (b))
 #define static_assert _Static_assert
 #define BIT(n) (1ULL << (n))
 #define GENMASK(h, l) ((BIT((h) + 1) - 1) & ~(BIT(l) - 1))
@@ -166,6 +168,7 @@ static int sart_get_entries(sart_dev_t *s, struct sart_entry *e, int max) { retu
 static bool sart_set_entries(sart_dev_t *s, const struct sart_entry *e, int n) { return true; }
 static sart_dev_t *sart_init(const char *path) { return &sart; }
 static void sart_free(sart_dev_t *s) {}
+static void sart_release(sart_dev_t *s) {}
 static rtkit_dev_t *rtkit_init(const char *name, asc_dev_t *a, void *d, void *i,
                               sart_dev_t *s, bool sram) { return &rtkit; }
 static bool rtkit_boot(rtkit_dev_t *r) { boots++; started = failure != 8; return failure != 8; }
@@ -210,14 +213,20 @@ int main(int argc, char **argv)
     failure = atoi(argv[1]);
     if (failure >= 33) {
         /*
-         * T8132, which hands a live session on (nvme_post_m4_keeps_live()), modelled with ANS's
-         * power. 33: the earlier stage powered ANS off and passed its SART entries (nvme.sart=,
-         * a 1.0.0b11 to 1.0.0b13.1 Stage 1), so this stage starts it from off, warm. That
-         * session goes on as it came: powered off again with its entries kept, never live
-         * (J713, b13 Stage 1 then a b14 trial Stage 1: live, the Mac reset at the handoff).
-         * 34: an earlier stage handed its session on live and this one adopted it: it stays live.
+         * Post-M4 handoffs, modelled with ANS's power.
+         * 33 (T8132): the earlier stage powered ANS off and passed its SART entries (nvme.sart=, a
+         * 1.0.0b11 to 1.0.0b13.1 Stage 1), so this stage starts it from off, warm, and hands it
+         * on powered off again with its entries kept.
+         * 34 (T8132): an earlier stage handed its session on live (a stage built with #305). T8132
+         * no longer hands a live session to another aura stage: the next stage's PCIe init
+         * faults on a live ANS (J713, aura#406 console), so the session is cycled from off and
+         * goes on powered off, never live.
+         * 35 (T6040): an adopted live session is handed on live, and the SART entries this stage
+         * reports never say "off" for it, even with stale entries from an earlier power-off
+         * (J713: nvme.sart= beside a live session faulted the next stage's ANS power-on).
          */
-        chip_id = T8132;
+        bool t6040 = failure == 35;
+        chip_id = t6040 ? T6040 : T8132;
         model_power = true;
         bool arrived_off = failure == 33;
         earlier_session = !arrived_off;
@@ -229,19 +238,30 @@ int main(int argc, char **argv)
         assert(nvme_init());
         if (arrived_off)
             assert(boots == 0 && warm_boots == 1 && !ans_offs && !cpu_off);
-        else
+        else if (t6040)
             assert(boots == 0 && !warm_boots && !ans_offs && !nvme_rtkit);
+        else
+            /* Not adopted: the earlier stage's session is stopped and started from off. */
+            assert(boots == 0 && ans_offs == 1 && warm_boots == 1 && !cpu_off);
+        if (t6040)
+            nvme_sart_saved_cnt = 1;
         assert(nvme_shutdown());
         assert(!nvme_initialized && !nvme_reboot_required);
-        if (arrived_off) {
-            assert(ans_offs == 1 && cpu_off && queue_frees == 2);
+        if (t6040) {
+            assert(!ans_offs && !cpu_off && queue_frees == 0 && cleared_ioq == 2);
+            struct sart_entry e[4];
+            bool off = true;
+            assert(nvme_sart_entries(e, 4, &off) == 0 && !off);
+            assert(nvme_sart_var() == NULL);
+        } else {
+            /* Powered off at the handoff: once here, after the cycle at nvme_init() for 34. */
+            int offs = arrived_off ? 1 : 2;
+            assert(ans_offs == offs && cpu_off && queue_frees == 2);
             /* The next owner starts it from off again with the entries kept. */
             assert(nvme_init());
-            assert(boots == 0 && warm_boots == 2 && !cpu_off);
+            assert(boots == 0 && !cpu_off);
             assert(nvme_shutdown());
-            assert(ans_offs == 2 && cpu_off);
-        } else {
-            assert(!ans_offs && !cpu_off && queue_frees == 0 && cleared_ioq == 2);
+            assert(ans_offs == offs + 1 && cpu_off);
         }
         for (unsigned i = 0; i < allocated; i++)
             free(allocations[i]);
@@ -384,10 +404,10 @@ int main(int argc, char **argv)
         assert(nvme_shutdown());
         assert(!nvme_initialized);
         /*
-         * Powered off, post-M4 frees its queues too. Linux's live handoff keeps them, and so does
-         * T8132 (23, 26), which hands its session on live to the next stage.
+         * Powered off, post-M4 frees its queues too, T8132 (23, 26) included. Only Linux's live
+         * handoff keeps them.
          */
-        assert(queue_frees == (failure == 9 || failure == 23 || failure == 26 ? 0 : 2));
+        assert(queue_frees == (failure == 9 ? 0 : 2));
         assert(resets == (legacy ? 2 : 0));
         /* A healthy shutdown still allows reinitialization. */
         assert(nvme_init());
@@ -405,5 +425,5 @@ int main(int argc, char **argv)
          "-Wno-unused-variable", "-Wno-format", "-x", "c", "-", "-o", str(binary)],
         input=harness, text=True, check=True,
     )
-    for failure in range(35):
+    for failure in range(36):
         subprocess.run([str(binary), str(failure)], check=True)
