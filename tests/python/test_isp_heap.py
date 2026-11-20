@@ -347,7 +347,7 @@ def test_isp_fdt_fails_closed_and_exports_heap(tmp_path):
     source = (repo / "src/kboot.c").read_text()
     start = source.index("static int dt_set_isp_fwdata(void)")
     end = source.index("\n}\n", start) + 3
-    helper = source[start:end]
+    helper = "/* Without placeholders the ISP node is the one the isp alias names. */\nstatic int dt_isp_node(void) { return fdt_path_offset(dt, \"isp\"); }\n" + source[start:end]
     harness = r"""
 #include <assert.h>
 #include <stdbool.h>

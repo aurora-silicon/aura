@@ -18,7 +18,7 @@ def test_isp_reservation_no_space(tmp_path):
     firmware = definition("static int dt_reserve_asc_segments_at(") + "\n" + \
         definition("static int dt_reserve_asc_segments(") + "\n" + \
         definition("static int dt_reserve_asc_firmware(")
-    heap = definition("static int dt_set_isp_fwdata(void)")
+    heap = "/* Without placeholders the ISP node is the one the isp alias names. */\nstatic int dt_isp_node(void) { return fdt_path_offset(dt, \"isp\"); }\n" + definition("static int dt_set_isp_fwdata(void)")
     harness = r'''
 #include <assert.h>
 #include <stdbool.h>

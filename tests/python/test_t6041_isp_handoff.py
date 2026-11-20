@@ -170,7 +170,7 @@ static bool isp_is_isp17a(void)
         node = adt_path_offset(adt, "/arm-io/isp0");
     return node >= 0 && adt_is_compatible(adt, node, "isp,isp-generic-ex");
 }
-''' + needs_init + dapf_slices + dapf_ranges + kboot_fn("static bool dt_isp_has_placeholders(") +
+''' + needs_init + dapf_slices + dapf_ranges + kboot_fn("static bool dt_isp_has_placeholders(") + kboot_fn("static int dt_isp_node(") +
         kboot_fn("static int dt_fill_isp_placeholders(") + kboot_fn("static int dt_set_isp_fwdata(") +
         kboot_fn("static int dt_set_isp(") + kboot_fn("static int dt_finish_j614s_isp(") + r'''
 static void setup(unsigned int amccs)
@@ -246,6 +246,40 @@ int main(void)
     dart = fdt_path_offset(dt, "/soc/iommu@5828c0000");
     assert(fdt_getprop(dt, dart, "apple,dapf-ranges", &len) && len == 13 * 16);
     assert(!strcmp(fdt_getprop(dt, fdt_path_offset(dt, "isp"), "status", NULL), "okay"));
+
+    /* 3a. The real J616s tree (t604x-j614-j616.dtsi) has no isp alias: the ISP is found through
+     * its isp-firmware-text placeholder and filled from the ADT all the same. */
+    setup(6);
+    chip_id = T6040;
+    assert(!fdt_delprop(dt, fdt_path_offset(dt, "/aliases"), "isp"));
+    assert(fdt_path_offset(dt, "isp") < 0);
+    assert(dt_set_isp() == 0);
+    resv = fdt_path_offset(dt, "/reserved-memory");
+    reg = fdt_getprop(dt, fdt_subnode_offset(dt, resv, "isp-firmware-text"), "reg", &len);
+    assert(reg && len == 16 && fdt64_ld(reg) == 0x10000dd4000ULL && fdt64_ld(reg + 1) == 0xbf0000);
+    assert(!strcmp(fdt_getprop(dt, fdt_path_offset(dt, "/soc/isp@580000000"), "status", NULL), "okay"));
+    assert(fdt_getprop(dt, fdt_path_offset(dt, "/soc/isp@580000000"), "apple,firmware-version", NULL));
+
+    /* 3b. ... and a refused fill there still disables that ISP instead of failing the boot. */
+    setup(6);
+    chip_id = T6040;
+    assert(!fdt_delprop(dt, fdt_path_offset(dt, "/aliases"), "isp"));
+    segments[1].phys = segments[0].phys + 0x4000;
+    assert(dt_set_isp() == 0);
+    assert(!strcmp(fdt_getprop(dt, fdt_path_offset(dt, "/soc/isp@580000000"), "status", NULL), "disabled"));
+
+    /* 3c. Two nodes that take isp-firmware-text: no ISP node is guessed, nothing is filled. */
+    setup(6);
+    chip_id = T6040;
+    assert(!fdt_delprop(dt, fdt_path_offset(dt, "/aliases"), "isp"));
+    resv = fdt_path_offset(dt, "/reserved-memory");
+    u32 text_ph = fdt_get_phandle(dt, fdt_subnode_offset(dt, resv, "isp-firmware-text"));
+    int other = fdt_add_subnode(dt, fdt_path_offset(dt, "/soc"), "other@0");
+    assert(other >= 0 && !fdt_setprop_u32(dt, other, "memory-region", text_ph));
+    assert(dt_set_isp() == 0);
+    resv = fdt_path_offset(dt, "/reserved-memory");
+    reg = fdt_getprop(dt, fdt_subnode_offset(dt, resv, "isp-firmware-text"), "reg", &len);
+    assert(reg && len == 16 && fdt64_ld(reg) == 0x10000c44000ULL);
 
     /* 4. J614s disabled-at-boot flow shares dt_fill_isp_placeholders() and enables ISP + 3 DARTs. */
     setup(6);

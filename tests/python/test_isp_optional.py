@@ -20,6 +20,8 @@ def test_isp_without_usable_firmware_is_disabled_and_boot_continues(tmp_path):
 
     start = source.index("static bool dt_isp_has_placeholders(void)")
     has_placeholders = source[start:source.index("\n}", start) + 2] + "\n"
+    start = source.index("static int dt_isp_node(void)")
+    has_placeholders += source[start:source.index("\n}", start) + 2] + "\n"
     start = source.index("/*\n * The camera is optional.")
     set_isp = source[start:source.index("\n}", start) + 2] + "\n"
     header = (ROOT / "src/adt.h").read_text()
