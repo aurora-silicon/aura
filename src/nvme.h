@@ -16,6 +16,8 @@ int nvme_cold_handoff(bool idle, bool no_probe);
 /* Post-M4: how a stage that powered ANS off tells the next one to start it again. */
 bool nvme_post_m4(void);
 bool nvme_post_m4_passed_off(void);
+/* A proxy kboot: keep this stage's live T8132 ANS session running for Linux to adopt. */
+bool nvme_keep_for_kboot(bool keep);
 int nvme_sart_entries(struct sart_entry *entries, int max, bool *off);
 char *nvme_sart_var(void);
 bool nvme_set_sart_var(const char *val);

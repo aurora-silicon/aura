@@ -1013,6 +1013,20 @@ bool nvme_post_m4_passed_off(void)
     return !nvme_initialized && nvme_sart_saved_cnt && nvme_post_m4();
 }
 
+/*
+ * A proxy kboot (P_KBOOT_PREPARE_DT, then P_KBOOT_BOOT) hands Linux this stage's ANS session as
+ * payload.c's boot= path does. Otherwise the next-stage nvme_shutdown() powers a T8132 ANS off and
+ * kboot passes its SART entries on, but Linux's nvme-apple adopts a running post-M4 ANS and has no
+ * path that writes those entries back and starts it from off (J773g on 27.2: no nvme0n1). Keep the
+ * session running when this stage owns one: nvme_shutdown() then leaves it to Linux, or refuses
+ * the handoff, and the stage returns to the proxy, when the controller isn't healthy.
+ */
+bool nvme_keep_for_kboot(bool keep)
+{
+    nvme_keep_running_for_linux = keep && nvme_initialized && chip_id == T8132;
+    return nvme_keep_running_for_linux;
+}
+
 bool nvme_shutdown(void)
 {
     if (nvme_reboot_required) {
