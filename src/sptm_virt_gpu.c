@@ -8,7 +8,9 @@
  * register and everything in the KSM block are also printed. At a host-set time, or at a write
  * the host names, the core parks in aura's proxy, so the host can read the ring
  * (sptm_virt_gpu_ring, _head, _nrec); the host's P_EXIT resumes the guest. Each of these parks
- * happens once.
+ * happens once. At every n-th write the host names, before it is performed, the GPU firmware's
+ * memory is copied into a snapshot (sptm_virt_snap.c); from the first, every message on the GPU
+ * ASCs' mailboxes goes into a log of its own.
  */
 
 #include "sptm_virt.h"
@@ -19,9 +21,11 @@
 #include "malloc.h"
 #include "memory.h"
 #include "sptm_virt_priv.h"
+#include "sptm_virt_snap.h"
 #include "string.h"
 #include "uartproxy.h"
 #include "utils.h"
+#include "xnuboot.h"
 
 #define GPU_RING_BYTES (16UL << 20)
 #define GPU_SEEN_MAX   2048
@@ -50,6 +54,28 @@ u64 sptm_virt_gpu_stop_msg; /* park after a write of this value (a mailbox messa
 u64 sptm_virt_gpu_stop_msg_mask;
 u32 sptm_virt_gpu_stop_ep;
 u32 sptm_virt_gpu_print_max = 20000;
+u32 sptm_virt_gpu_msg_park = 1;  /* the first write the host names parks; 0: it only snapshots */
+u32 sptm_virt_gpu_snap_every;    /* a snapshot at every n-th of those writes; 0: none */
+u32 sptm_virt_gpu_snap_mib = 32; /* the snapshot buffer */
+u32 sptm_virt_gpu_mbox_max;      /* the mailbox log's records, from the first; 0: no log */
+/* The log also ends after the mailbox message that matches these (as stop_msg/_mask/_ep, to the
+ * GPU) for the stop_after + 1-th time: the first work submission. 0: only the count ends it. */
+u64 sptm_virt_gpu_mbox_stop_msg, sptm_virt_gpu_mbox_stop_mask;
+u32 sptm_virt_gpu_mbox_stop_ep, sptm_virt_gpu_mbox_stop_after;
+
+/* For the host, at a park (dump_snapshot.py). */
+u8 *sptm_virt_snap_buf;
+u64 sptm_virt_snap_bytes;
+struct gpu_mbox_rec {
+    u64 t;
+    u64 msg;   /* the mailbox's first word */
+    u64 hi;    /* its second: the endpoint in [7:0] */
+    u32 meta;  /* recv [0], asc [1], words [3:2] (0 both, 1 first, 2 second), cpu [11:8] */
+    u32 match; /* the named writes before it */
+};
+struct gpu_mbox_rec *sptm_virt_gpu_mbox;
+volatile u32 sptm_virt_gpu_mbox_n;
+u32 sptm_virt_gpu_mbox_cap;
 
 static struct {
     u64 base, size;
@@ -64,6 +90,10 @@ static u64 gpu_first_t, gpu_stop_t;
 static volatile u32 gpu_printed;
 static u64 gpu_boot_stop_t;
 static u32 gpu_msg_parks, gpu_now_parks;
+static volatile u32 gpu_matches;
+static volatile bool gpu_mbox_on;
+static u32 gpu_mbox_stops;
+static DECLARE_SPINLOCK(gpu_snap_lock);
 
 static const char *gpu_range_name(u64 addr, u64 *off)
 {
@@ -176,6 +206,127 @@ static bool gpu_stop_msg_hit(u64 addr, const u64 *pair, u64 v, int width)
     return false;
 }
 
+/* ---- snapshots and the mailbox log ------------------------------------------------------- */
+
+#define GPU_A2I_SEND 0x8800 /* the message to the ASC, its endpoint word at +8 */
+#define GPU_I2A_RECV 0x8830 /* the ASC's message, read */
+
+/* Guest RAM aura maps identity, normal write-back: anything else, MMIO first, is never read. */
+bool sptm_virt_snap_pa_ok(u64 pa, u64 len)
+{
+    u64 ram = ALIGN_DOWN(cur_boot_args.phys_base, BIT(32)), end = ram + mem_size_actual;
+    u64 buf = (u64)sptm_virt_snap_buf;
+
+    if (!len || pa < ram || pa >= end || len > end - pa)
+        return false;
+    if (pa < buf + sptm_virt_snap_bytes && pa + len > buf)
+        return false;
+    u64 save = mrs(PAR_EL1);
+    bool ok = true;
+    for (u64 pg = pa & ~0x3fffUL; ok && pg < pa + len; pg += 0x4000) {
+        __asm__ volatile("at s1e2r, %0" ::"r"(pg) : "memory");
+        sysop("isb");
+        u64 par = mrs(PAR_EL1);
+        ok = !(par & PAR_F) && (par >> 56) == 0xff && (par & GENMASK(47, 14)) == pg;
+    }
+    msr(PAR_EL1, save);
+    sysop("isb");
+    return ok;
+}
+
+const void *sptm_virt_snap_pa(u64 pa)
+{
+    return (const void *)pa;
+}
+
+u64 sptm_virt_snap_ticks(void)
+{
+    return mrs(CNTPCT_EL0);
+}
+
+static int gpu_asc_of(u64 addr)
+{
+    for (unsigned i = 0; i < ARRAY_SIZE(gpu_asc); i++)
+        if (gpu_asc[i].size && addr >= gpu_asc[i].pa && addr < gpu_asc[i].pa + gpu_asc[i].size)
+            return i;
+    return -1;
+}
+
+/* After the access: a message on a GPU ASC's mailbox, either way, into the log. */
+static void gpu_mbox_note(u64 addr, const u64 *val, bool write, int width)
+{
+    int asc = gpu_asc_of(addr);
+    if (asc < 0)
+        return;
+    u64 off = addr - gpu_asc[asc].pa, box = write ? GPU_A2I_SEND : GPU_I2A_RECV;
+    if ((off & ~8UL) != box || width < 3 || (width == 4 && off != box))
+        return;
+    u32 words = width == 4 ? 0 : off == box ? 1 : 2;
+    u64 msg = words == 2 ? 0 : val[0], hi = words == 0 ? val[1] : words == 2 ? val[0] : 0;
+    u32 i = __atomic_fetch_add(&sptm_virt_gpu_mbox_n, 1, __ATOMIC_RELAXED);
+    if (i >= sptm_virt_gpu_mbox_cap) {
+        gpu_mbox_on = false;
+        return;
+    }
+    struct gpu_mbox_rec *r = &sptm_virt_gpu_mbox[i];
+    r->t = mrs(CNTPCT_EL0);
+    r->msg = msg;
+    r->hi = hi;
+    r->meta = !write | asc << 1 | words << 2 | (smp_id() & 15) << 8;
+    r->match = gpu_matches;
+    if (i + 1 >= min(sptm_virt_gpu_mbox_max, sptm_virt_gpu_mbox_cap))
+        gpu_mbox_on = false;
+    u64 mask = sptm_virt_gpu_mbox_stop_mask ? sptm_virt_gpu_mbox_stop_mask : ~0UL;
+    if (write && words == 0 && sptm_virt_gpu_mbox_stop_ep &&
+        (hi & 0xff) == sptm_virt_gpu_mbox_stop_ep - 1 &&
+        (msg & mask) == sptm_virt_gpu_mbox_stop_msg &&
+        __atomic_fetch_add(&gpu_mbox_stops, 1, __ATOMIC_RELAXED) == sptm_virt_gpu_mbox_stop_after) {
+        gpu_mbox_on = false;
+        printf("SPTM-virt[mbox]: the log ends at its stop message 0x%lx (%u records)\n", msg,
+               i + 1);
+    }
+}
+
+/* Before the access: a write the host names. Counts it, and takes the snapshot due. */
+static void gpu_kick(struct exc_info *ctx, const u64 *val, int width)
+{
+    u32 n = __atomic_add_fetch(&gpu_matches, 1, __ATOMIC_SEQ_CST);
+
+    if (n == 1 && sptm_virt_gpu_mbox)
+        gpu_mbox_on = true;
+    if (!sptm_virt_gpu_snap_every || !sptm_virt_snap_buf || (n - 1) % sptm_virt_gpu_snap_every)
+        return;
+    struct snap_kick k = {
+        .t = mrs(CNTPCT_EL0),
+        .value = val[0],
+        .value_hi = width == 4 ? val[1] : 0,
+        .pc = ctx->elr,
+        .ring_head = sptm_virt_gpu_head,
+        .cpu = smp_id(),
+        .ep = width == 4 ? val[1] & 0xff : 0xff,
+        .match = n,
+    };
+    spin_lock(&gpu_snap_lock);
+    bool took = sptm_virt_snap_take(&k);
+    spin_unlock(&gpu_snap_lock);
+    const struct snap_hdr *h = (const struct snap_hdr *)sptm_virt_snap_buf;
+    if (!took) {
+        if (h->skipped == 1)
+            printf("SPTM-virt[snap]: match %u: no snapshot (budget %u, buffer %s)\n", n,
+                   sptm_virt_snap_max, (h->flags & SNAP_F_FULL) ? "full" : "not full");
+        return;
+    }
+    printf("SPTM-virt[snap]: #%u at match %u (0x%lx, pc 0x%lx), before the write; %lu of %lu "
+           "bytes, flags 0x%x, in %lu us\n",
+           h->nsnap - 1, n, val[0], ctx->elr, h->used, h->capacity, h->flags,
+           (mrs(CNTPCT_EL0) - k.t) / (mrs(CNTFRQ_EL0) / 1000000));
+    for (u32 i = 0; h->nsnap == 1 && i < ARRAY_SIZE(h->watch); i++)
+        if (h->watch_ok & BIT(i))
+            printf("SPTM-virt[snap]: watch %u (%s +0x%lx) = 0x%lx\n", i,
+                   sptm_virt_snap_chains[sptm_virt_snap_watch[i].chain - 1].name,
+                   sptm_virt_snap_watch[i].off, h->watch[i]);
+}
+
 static bool gpu_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int width)
 {
     u64 now = mrs(CNTPCT_EL0);
@@ -190,6 +341,8 @@ static bool gpu_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int w
     /* The value decides, so the write the host names is known before it is performed. */
     bool hit = sptm_virt_gpu_stop_msg && write &&
                gpu_stop_msg_hit(addr, width == 4 ? val : NULL, *val, width);
+    if (hit)
+        gpu_kick(ctx, val, width);
 
     if (width == 4) {
         /* A trapped LDP/STP pair (the ASC mailboxes take their messages so). */
@@ -202,6 +355,8 @@ static bool gpu_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int w
                              : "memory");
         gpu_note(ctx, addr, val[0], write, 3);
         gpu_note(ctx, addr + 8, val[1], write, 3);
+        if (gpu_mbox_on)
+            gpu_mbox_note(addr, val, write, width);
     } else if (width > 4) {
         printf("SPTM-virt[gpu]: %u-byte access at 0x%lx (pc 0x%lx) not supported\n", 1u << width,
                addr, ctx->elr);
@@ -209,6 +364,8 @@ static bool gpu_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int w
     } else {
         sptm_virt_mmio_rw(addr, val, write, width);
         gpu_note(ctx, addr, *val, write, width);
+        if (gpu_mbox_on)
+            gpu_mbox_note(addr, val, write, width);
     }
 
     u64 off;
@@ -229,7 +386,7 @@ static bool gpu_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int w
     sptm_virt_gpu_deadline(ctx);
     /* A message the host names is a repeatable park point; the seconds are not (the guest's own
      * timing varies from boot to boot by more than the whole bring-up lasts). */
-    if (hit && !__atomic_fetch_add(&gpu_msg_parks, 1, __ATOMIC_SEQ_CST))
+    if (hit && sptm_virt_gpu_msg_park && !__atomic_fetch_add(&gpu_msg_parks, 1, __ATOMIC_SEQ_CST))
         gpu_park(ctx, "the write the host asked for");
     else if (gpu_claim_time(&gpu_stop_t, now))
         gpu_park(ctx, "the time the host asked for");
@@ -270,6 +427,63 @@ static void gpu_hook_adt(const char *path, int idx, const char *what, u64 off, u
     gpu_hook_range(what, pa + off, size ? size : sz);
 }
 
+/* /arm-io/sgx's <name>-base and -size. */
+static void gpu_snap_region(int idx, const char *name)
+{
+    char prop[48];
+    int node = adt_path_offset(adt, "/arm-io/sgx");
+    u64 v[2] = {0, 0};
+
+    for (int i = 0; i < 2 && node >= 0; i++) {
+        u32 len = 0;
+        snprintf(prop, sizeof(prop), "%s-%s", name, i ? "size" : "base");
+        const void *val = adt_getprop(adt, node, prop, &len);
+        if (val && len >= sizeof(u64))
+            memcpy(&v[i], val, sizeof(u64));
+        else if (val && len == sizeof(u32))
+            v[i] = *(const u32 *)val;
+    }
+    sptm_virt_snap_region[idx][0] = v[0];
+    sptm_virt_snap_region[idx][1] = v[1];
+}
+
+static void gpu_snap_setup(void)
+{
+    if (sptm_virt_gpu_snap_every) {
+        sptm_virt_snap_bytes = (u64)sptm_virt_gpu_snap_mib << 20;
+        sptm_virt_snap_buf = memalign(0x4000, sptm_virt_snap_bytes);
+        if (!sptm_virt_snap_buf) {
+            printf("SPTM-virt[snap]: no memory for %u MiB; no snapshots\n", sptm_virt_gpu_snap_mib);
+            sptm_virt_snap_bytes = 0;
+        } else {
+            sptm_virt_snap_init(sptm_virt_snap_buf, sptm_virt_snap_bytes);
+            gpu_snap_region(0, "gfx-shared-region");
+            gpu_snap_region(1, "gfx-shared-l2-region");
+            gpu_snap_region(2, "gpu-region");
+            gpu_snap_region(3, "gfx-handoff");
+            u32 chains = 0;
+            for (u32 i = 0; i < SNAP_CHAINS; i++)
+                chains += !!sptm_virt_snap_chains[i].len;
+            printf("SPTM-virt[snap]: every %u-th named write, %u in all, into %u MiB at 0x%lx "
+                   "(sptm_virt_snap_buf); %u chains; TTBAT 0x%lx\n",
+                   sptm_virt_gpu_snap_every, sptm_virt_snap_max, sptm_virt_gpu_snap_mib,
+                   (u64)sptm_virt_snap_buf, chains, sptm_virt_snap_region[2][0]);
+        }
+    }
+    if (sptm_virt_gpu_mbox_max) {
+        sptm_virt_gpu_mbox_cap = min(sptm_virt_gpu_mbox_max, 65536U);
+        sptm_virt_gpu_mbox = memalign(0x4000, sptm_virt_gpu_mbox_cap * sizeof(struct gpu_mbox_rec));
+        if (!sptm_virt_gpu_mbox) {
+            sptm_virt_gpu_mbox_cap = 0;
+            printf("SPTM-virt[mbox]: no memory for the mailbox log\n");
+        } else {
+            printf("SPTM-virt[mbox]: logging up to %u GPU mailbox messages from the first named "
+                   "write (sptm_virt_gpu_mbox)\n",
+                   sptm_virt_gpu_mbox_cap);
+        }
+    }
+}
+
 void sptm_virt_gpu_setup(void)
 {
     /* The deadline park is offered from every GL trap (sptm_virt_gl_sync), GPU trace or not. */
@@ -300,6 +514,7 @@ void sptm_virt_gpu_setup(void)
     gpu_hook_adt("/arm-io/mcc", 8, "pmp-ptd", 0, 0);
     gpu_hook_adt("/arm-io/mcc", 9, "pmp-ptd-upd", 0, 0);
     gpu_hook_adt("/arm-io/pmp", 0, "pmp-asc", 0, 0);
+    gpu_snap_setup();
     printf("SPTM-virt[gpu]: ring 0x%lx (%lu records, head at 0x%lx), stop after %u s or a write of "
            "0x%lx (mask 0x%lx, endpoint %d), print budget %u\n",
            (u64)sptm_virt_gpu_ring, sptm_virt_gpu_nrec, (u64)&sptm_virt_gpu_head,

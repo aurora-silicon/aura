@@ -57,6 +57,7 @@ SECTIONS {
         *sptm_virt_gpu.o(.text .text.*)
         *sptm_virt_pmu.o(.text .text.*)
         *sptm_virt_park.o(.text .text.*)
+        *sptm_virt_snap.o(.text .text.*)
         . = ALIGN(8);
         *(.got.plt)
         _text_content_end = .;

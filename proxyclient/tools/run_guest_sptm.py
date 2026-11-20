@@ -52,6 +52,22 @@ Environment (all optional; 1 enables a switch):
                            AURA_GPU_STOP_MSG=0x0081000000000000: the first InitData doorbell)
   AURA_GPU_STOP_EP=<ep>    and only a mailbox message to endpoint ep (e.g. 0x20)
   AURA_GPU_PRINT_MAX=<n>   print at most n GPU accesses on aura's console (default 20000)
+  AURA_GPU_MSG_PARK=0      the write AURA_GPU_STOP_MSG names doesn't park (it snapshots, below)
+  AURA_GPU_SNAP=<n>        copy the GPU firmware's memory (its page tables, the objects the
+                           doorbell names, the chains) at every n-th such write, before it is
+                           performed (tools/dump_snapshot.py reads it at a park)
+  AURA_GPU_SNAP_MAX=<k>    k snapshots in all (default 1); AURA_GPU_SNAP_MIB=<m> buffer (32)
+  AURA_GPU_SNAP_PARTS=<m>  what snapshots after the first take: 1 regions, 2 walk, 4 objects,
+                           8 chains (default 12)
+  AURA_GPU_SNAP_ROOTS=<va,...>  the objects' roots after all (default: the doorbell's address)
+  AURA_GPU_SNAP_CHAINS=<s> pointer chains from the InitData root, copied whole: g16g-272 (HW
+                           data, the main config, every channel ring's state, the device-control
+                           ring, FWCTL), or name=step/step:len;... (aura/hvsnap.py)
+  AURA_GPU_SNAP_WATCH=<name+off:bytes,...>  words of a chain kept in the snapshot's header
+                           (g16g-272 brings HW data +0xfa0 and +0xfa8)
+  AURA_GPU_MBOX=<n>        log n GPU-ASC mailbox messages, both ways, from the first such write
+  AURA_GPU_MBOX_STOP=<msg>,<mask>,<ep>[,<after>]  and end the log at the after+1-th message to
+                           the GPU that matches (the first work submission)
   AURA_SAMPLE              sample the guest's PC until each core's XNU entry (pre-XNU hangs)
   AURA_SAMPLE_HZ=<n>       samples per second (default 4)
   AURA_SAMPLE_MAX=<n>      stop printing after n samples (default 64)
@@ -168,6 +184,16 @@ KNOWN_ENV = {
     "AURA_GPU_STOP_MSG_MASK",
     "AURA_GPU_STOP_EP",
     "AURA_GPU_PRINT_MAX",
+    "AURA_GPU_MSG_PARK",
+    "AURA_GPU_SNAP",
+    "AURA_GPU_SNAP_MAX",
+    "AURA_GPU_SNAP_MIB",
+    "AURA_GPU_SNAP_PARTS",
+    "AURA_GPU_SNAP_ROOTS",
+    "AURA_GPU_SNAP_CHAINS",
+    "AURA_GPU_SNAP_WATCH",
+    "AURA_GPU_MBOX",
+    "AURA_GPU_MBOX_STOP",
     "AURA_SAMPLE_HZ",
     "AURA_SAMPLE_MAX",
     "AURA_XNU_ENTRY",
@@ -843,6 +869,12 @@ def configure(p, sym, plan, adt, ctl_cookie=0):
         p.write32(sym["sptm_virt_gpu_stop_ep"], env_int("AURA_GPU_STOP_EP") + 1)
     if os.environ.get("AURA_GPU_PRINT_MAX"):
         p.write32(sym["sptm_virt_gpu_print_max"], env_int("AURA_GPU_PRINT_MAX"))
+    from aura import hvsnap
+
+    try:
+        hvsnap.configure(p, sym, os.environ)
+    except ValueError as e:
+        raise SystemExit(f"AURA_GPU_SNAP_*: {e}")
     if env_on("AURA_S2R_DCP_PKT"):
         p.write32(sym["sptm_virt_s2r_dcp_pkt"], 1)
         print("coprocessor trace: DCP IOMFB packets copied into the ring")
