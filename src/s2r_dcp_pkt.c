@@ -45,14 +45,15 @@ u32 sptm_virt_s2r_dcp_pkt; /* host: copy the DCPs' IOMFB packets into the ring *
 
 struct s2r_dcp_walk {
     struct s2r_dcp *d;
+    u64 lo; /* the DVA's low 36 bits: the DART tables index those, not a high base (J613: bit 40) */
     int found;
 };
 
 static int s2r_dcp_visit(u64 iova, u64 pa, void *opaque)
 {
     struct s2r_dcp_walk *w = opaque;
-    if (iova >= w->d->lo && iova < w->d->lo + S2R_DCP_PAGES * 0x4000UL) {
-        w->d->pa[(iova - w->d->lo) / 0x4000] = pa;
+    if (iova >= w->lo && iova < w->lo + S2R_DCP_PAGES * 0x4000UL) {
+        w->d->pa[(iova - w->lo) / 0x4000] = pa;
         if (++w->found == S2R_DCP_PAGES)
             return 1;
     }
@@ -64,13 +65,20 @@ static int s2r_dcp_resolve(struct s2r_dcp *d)
     u64 ram = ALIGN_DOWN(cur_boot_args.phys_base, BIT(32));
     memset(d->pa, 0, sizeof(d->pa));
     d->lo = d->dva & ~0x3fffUL;
+    u32 walked = 0;
     for (u8 sid = 0; sid < 16; sid++) {
-        struct s2r_dcp_walk w = {d, 0};
-        if (dart_walk_locked_t8110(d->dart, d->dart_size, sid, ram, mem_size_actual, s2r_dcp_visit,
-                                   &w) >= 0 &&
-            w.found)
+        struct s2r_dcp_walk w = {d, d->lo & GENMASK(35, 0), 0};
+        int ret = dart_walk_locked_t8110(d->dart, d->dart_size, sid, ram, mem_size_actual,
+                                         s2r_dcp_visit, &w);
+        if (ret >= 0)
+            walked |= BIT(sid);
+        if (ret >= 0 && w.found) {
+            printf("SPTM-virt[s2r]: dcp-pkt dva 0x%lx: sid %u, %d of %lu pages\n", d->dva, sid,
+                   w.found, S2R_DCP_PAGES);
             return 1;
+        }
     }
+    printf("SPTM-virt[s2r]: dcp-pkt dva 0x%lx not found (walkable sids 0x%x)\n", d->dva, walked);
     return -1;
 }
 
