@@ -9226,11 +9226,29 @@ static int dt_set_aop_firmware(void)
     if (chip_id == T6000 || chip_id == T8112)
         return dt_set_aop_motion_cal_only();
 
-    if (chip_id != T6040 && chip_id != T6041 && chip_id != T8132)
-        return 0;
+    /*
+     * T8122 (M3): iBoot leaves the AOP halted as on T6040, with __ETEXT,
+     * __EDATA and __OS_LOG in DRAM; the firmware fetches __ETEXT at EC0p
+     * through its DART, so without the segments it never says hello. Which
+     * segments to reserve comes from the ADT's segment-ranges below.
+     */
+    const char *compat;
+    switch (chip_id) {
+        case T6040:
+        case T6041:
+            compat = "apple,t6041-aop";
+            break;
+        case T8122:
+            compat = "apple,t8122-aop";
+            break;
+        case T8132:
+            compat = "apple,t8132-aop";
+            break;
+        default:
+            return 0;
+    }
 
-    int node = fdt_node_offset_by_compatible(
-        dt, -1, chip_id == T8132 ? "apple,t8132-aop" : "apple,t6041-aop");
+    int node = fdt_node_offset_by_compatible(dt, -1, compat);
     if (node < 0)
         return 0;
 
