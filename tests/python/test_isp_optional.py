@@ -18,6 +18,8 @@ def test_isp_without_usable_firmware_is_disabled_and_boot_continues(tmp_path):
         start = source.index("static int " + name + "(")
         return source[start:source.index("\n}", start) + 2] + "\n"
 
+    start = source.index("static bool dt_isp_has_placeholders(void)")
+    has_placeholders = source[start:source.index("\n}", start) + 2] + "\n"
     start = source.index("/*\n * The camera is optional.")
     set_isp = source[start:source.index("\n}", start) + 2] + "\n"
     header = (ROOT / "src/adt.h").read_text()
@@ -41,6 +43,7 @@ typedef uint32_t u32;
 #define T8142 0x8142
 #define T8132 0x8132
 #define SZ_16K 16384
+#define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
 #define ALIGN_UP(x, a) (((x) + (a) - 1) & ~((a) - 1))
 #define bail(...) do { printf(__VA_ARGS__); return -1; } while (0)
 /* Only the dram_only segment filter reads properties this way; ISP reservations do not. */
@@ -99,7 +102,8 @@ static int dt_set_isp_fwdata(void)
 /* This fixture exercises the legacy optional-camera path, never the T6050 transaction. */
 static int dt_t6050_isp_transaction(void) { abort(); }
 ''' + function("dt_device_set_reserved_mem") +
-        function("dt_reserve_asc_segments_at") + function("dt_reserve_asc_segments") + function("dt_reserve_asc_firmware") + set_isp + r'''
+        function("dt_reserve_asc_segments_at") + function("dt_reserve_asc_segments") +
+        function("dt_reserve_asc_firmware") + has_placeholders + set_isp + r'''
 static void world(int which)
 {
     fault = which;
@@ -162,6 +166,24 @@ int main(void)
     /* If its firmware data then fails, it is disabled too. */
     world(2); chip_id = T8140; isp_up = false; fwdata_fault = 1;
     assert(dt_set_isp() == 0 && !strcmp(isp_status(), "disabled"));
+    /* Any chip (T6040, T6041, etc.) with placeholders fills them directly without asc-firmware. */
+    for (int k = 0; k < 2; k++) {
+        world(2); chip_id = k ? 0x6041 : T6040;
+        int resv = fdt_path_offset(dt, "/reserved-memory");
+        assert(fdt_add_subnode(dt, resv, "isp-firmware-text") >= 0);
+        resv = fdt_path_offset(dt, "/reserved-memory");
+        assert(fdt_add_subnode(dt, resv, "isp-firmware-data") >= 0);
+        assert(dt_set_isp() == 0 && fwdata_calls == 1 && !reservations && !strcmp(isp_status(), "okay"));
+        world(2); chip_id = k ? 0x6041 : T6040; fwdata_fault = 1;
+        resv = fdt_path_offset(dt, "/reserved-memory");
+        assert(fdt_add_subnode(dt, resv, "isp-firmware-text") >= 0);
+        resv = fdt_path_offset(dt, "/reserved-memory");
+        assert(fdt_add_subnode(dt, resv, "isp-firmware-data") >= 0);
+        assert(dt_set_isp() == 0 && !reservations && !strcmp(isp_status(), "disabled"));
+        resv = fdt_path_offset(dt, "/reserved-memory");
+        int t = fdt_subnode_offset(dt, resv, "isp-firmware-text");
+        assert(!strcmp(fdt_getprop(dt, t, "status", NULL), "disabled"));
+    }
     puts("PASS isp optional");
     return 0;
 }

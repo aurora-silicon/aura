@@ -10,6 +10,38 @@
 #include "utils.h"
 #include "xnuboot.h"
 
+#include "libfdt/libfdt.h"
+
+/*
+ * Loader ISP power-up and heap carveout apply only when the kernel tree enables an
+ * `isp` node that has neither firmware segment placeholders nor a kernel-managed ISP
+ * compatible (apple,t8132-isp, apple,t6041-isp on T6040/T6041, apple,t6050-isp).
+ */
+bool isp_fdt_needs_init(const void *fdt)
+{
+    static const char *const kernel_owned[] = {
+        "apple,t8132-isp",
+        "apple,t6041-isp",
+        "apple,t6050-isp",
+    };
+    if (!fdt || fdt_check_header(fdt) != 0)
+        return false;
+    int isp = fdt_path_offset(fdt, "isp");
+    if (isp < 0)
+        return false;
+    const char *status = fdt_getprop(fdt, isp, "status", NULL);
+    if (status && strcmp(status, "okay") && strcmp(status, "ok"))
+        return false;
+    int resv = fdt_path_offset(fdt, "/reserved-memory");
+    if (resv >= 0 && fdt_subnode_offset(fdt, resv, "isp-firmware-text") >= 0 &&
+        fdt_subnode_offset(fdt, resv, "isp-firmware-data") >= 0)
+        return false;
+    for (size_t i = 0; i < ARRAY_SIZE(kernel_owned); i++)
+        if (!fdt_node_check_compatible(fdt, isp, kernel_owned[i]))
+            return false;
+    return true;
+}
+
 #define ISP_ASC_VERSION 0x1800000
 
 #define ISP_VER_T8103 0xb0090
@@ -55,6 +87,11 @@ static const struct {
 
 static bool isp_initialized = false;
 static u64 heap_phys, heap_iova, heap_size;
+
+void isp_reset(void)
+{
+    isp_initialized = false;
+}
 
 int isp_get_heap(u64 *phys, u64 *iova, u64 *size)
 {
@@ -110,9 +147,7 @@ static int isp_firmware_end(const struct adt_segment_ranges *segments, u32 lengt
 
 int isp_init(void)
 {
-    /* The T6050 kernel owns power-up. Its handoff only reserves memory. */
-    if (chip_id == T6050)
-        return 0;
+    isp_initialized = false;
 
     int err = -1;
     /* Every ISP17a takes the same path; T8142 keeps its own measured constants below. */
