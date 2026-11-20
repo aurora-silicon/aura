@@ -4315,6 +4315,14 @@ static int dt_reserve_asc_segments_at(int fdt_node, const char *adt_path, const 
             dt_get_or_add_reserved_mem(node_name, "apple,asc-mem", true, seg->phys, seg_size);
         if (mem_node < 0)
             return mem_node;
+        /*
+         * The T8112 AOP's OS log segment (flags 0xa) on 27.2 firmware runs at its DRAM
+         * address, above the AOP DART's 32-bit range. Reserve its RAM without listing it as
+         * an IOVA of the device.
+         */
+        if (chip_id == T8112 && dram_only && seg->unk == 0xa && iova == seg->phys &&
+            iova > UINT32_MAX)
+            continue;
         uint32_t mem_phandle = fdt_get_phandle(dt, mem_node);
 
         /*
@@ -9155,8 +9163,46 @@ static int dt_set_aop_motion_cal_only(void)
     return 0;
 }
 
+static int dt_set_t8112_aop_27_2(void)
+{
+    int node = fdt_node_offset_by_compatible(dt, -1, "apple,t8112-aop");
+    if (node < 0)
+        return 0;
+
+    const char *status = fdt_getprop(dt, node, "status", NULL);
+    if (status && strcmp(status, "okay") && strcmp(status, "ok"))
+        return dt_set_aop_motion_cal_only();
+
+    char path[64];
+    if (fdt_get_path(dt, node, path, sizeof(path))) {
+        printf("FDT: AOP node path too long\n");
+        return 0;
+    }
+
+    dt_set_aop_motion_cal(path);
+
+    u32 len = 0;
+    int anode = adt_path_offset(adt, "/arm-io/aop");
+    if (anode < 0 || !adt_getprop(adt, anode, "segment-ranges", &len) || !len ||
+        len % sizeof(struct adt_segment_ranges)) {
+        printf("ADT: /arm-io/aop has no firmware segments, %s left without them\n", path);
+        return 0;
+    }
+
+    if (dt_reserve_asc_segments("/arm-io/aop", NULL, path, true, 0, true))
+        printf("FDT: %s: reserving the AOP firmware segments failed\n", path);
+    else
+        printf("FDT: %s: AOP firmware segments reserved\n", path);
+
+    return 0;
+}
+
 static int dt_set_aop_firmware(void)
 {
+    /* The 27.2 T8112 AOP firmware runs its external code and data from DRAM. */
+    if (chip_id == T8112 && os_firmware.version >= V27_2)
+        return dt_set_t8112_aop_27_2();
+
     if (chip_id == T6000 || chip_id == T8112)
         return dt_set_aop_motion_cal_only();
 
