@@ -37,7 +37,7 @@
 
 #define SPMI_OPC_EXT_WRITE  0x00 /* 0x00-0x0f: 8-bit register, (opc & 0xf) + 1 bytes */
 #define SPMI_OPC_EXT_WRITEL 0x30 /* 0x30-0x37: 16-bit register, (opc & 7) + 1 bytes */
-#define PK_OTHER 16
+#define PK_OTHER            16
 
 static struct {
     spmi_dev_t *dev;
@@ -76,8 +76,9 @@ static void pk_print_other(void)
     if (!pk.n_other)
         printf("SPTM-virt[pmu]: XNU has used only the status, command and reply registers\n");
     for (int i = 0; i < pk.n_other; i++)
-        printf("SPTM-virt[pmu]: XNU's other register +0x%x: %u reads, %u writes, last write 0x%lx\n",
-               pk.other[i].off, pk.other[i].reads, pk.other[i].writes, pk.other[i].last);
+        printf(
+            "SPTM-virt[pmu]: XNU's other register +0x%x: %u reads, %u writes, last write 0x%lx\n",
+            pk.other[i].off, pk.other[i].reads, pk.other[i].writes, pk.other[i].last);
     if (pk.other_lost)
         printf("SPTM-virt[pmu]: (more registers than recorded)\n");
 }

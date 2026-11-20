@@ -155,7 +155,8 @@ void sptm_virt_gpu_deadline(struct exc_info *ctx)
     gpu_park(ctx, "the deadline the host asked for");
 }
 
-/* The GPU's own ASCs (gfx-asc, gfx1-asc): an endpoint's message is a mailbox write to one of them. */
+/* The GPU's own ASCs (gfx-asc, gfx1-asc): an endpoint's message is a mailbox write to one of them.
+ */
 static struct {
     u64 pa, size;
 } gpu_asc[2];
@@ -230,7 +231,8 @@ static bool gpu_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int w
         gpu_park(ctx, "the deadline the host asked for");
     /* A message the host names is a repeatable park point; the seconds are not (the guest's own
      * timing varies from boot to boot by more than the whole bring-up lasts). */
-    if (sptm_virt_gpu_stop_msg && write && gpu_stop_msg_hit(addr, width == 4 ? val : NULL, *val, width))
+    if (sptm_virt_gpu_stop_msg && write &&
+        gpu_stop_msg_hit(addr, width == 4 ? val : NULL, *val, width))
         gpu_park(ctx, "the write the host asked for");
     else if (gpu_stop_t && now >= gpu_stop_t)
         gpu_park(ctx, "the time the host asked for");

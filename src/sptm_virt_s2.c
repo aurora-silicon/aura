@@ -18,9 +18,9 @@
 #include "mcc.h"
 #include "memory.h"
 #include "nv2.h"
+#include "nvme.h"
 #include "smp.h"
 #include "sptm_virt_priv.h"
-#include "nvme.h"
 #include "string.h"
 #include "uartproxy.h"
 #include "utils.h"
@@ -529,21 +529,22 @@ static bool sptm_virt_aura_guard_fault(u64 *regs, bool gl)
 }
 
 /*
- * APCIe root ports with no pci-bridge node (an empty slot: port 1 of a T8132 Mac mini). iBoot leaves
- * such a port's windows readable and XNU reads them. Once an earlier stage has powered the controller
- * off and aura has brought it back for ANS (nvme_cold_powered_on), the port, which has no lanes and
- * never reaches RUN, isn't, and XNU's first read of its fourth window (0x497050000) is an LLC SLVERR
- * panic. Stand in for the absent port instead: reads return 0, as for a port with no link, writes are
- * dropped, and the first accesses are logged.
+ * APCIe root ports with no pci-bridge node (an empty slot: port 1 of a T8132 Mac mini). iBoot
+ * leaves such a port's windows readable and XNU reads them. Once an earlier stage has powered the
+ * controller off and aura has brought it back for ANS (nvme_cold_powered_on), the port, which has
+ * no lanes and never reaches RUN, isn't, and XNU's first read of its fourth window (0x497050000) is
+ * an LLC SLVERR panic. Stand in for the absent port instead: reads return 0, as for a port with no
+ * link, writes are dropped, and the first accesses are logged.
  */
-static bool sptm_virt_apcie_ghost_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int width)
+static bool sptm_virt_apcie_ghost_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write,
+                                       int width)
 {
     static u32 logged;
 
     UNUSED(width);
     if (logged++ < 64 && write)
-        printf("SPTM-virt[apcie c%d]: absent port wr 0x%lx <- 0x%lx pc 0x%lx\n", smp_id(), addr, *val,
-               ctx->elr);
+        printf("SPTM-virt[apcie c%d]: absent port wr 0x%lx <- 0x%lx pc 0x%lx\n", smp_id(), addr,
+               *val, ctx->elr);
     else if (logged <= 64)
         printf("SPTM-virt[apcie c%d]: absent port rd 0x%lx pc 0x%lx\n", smp_id(), addr, ctx->elr);
     if (!write)
