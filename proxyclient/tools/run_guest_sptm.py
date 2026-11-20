@@ -52,7 +52,10 @@ Environment (all optional; 1 enables a switch):
   AURA_SAMPLE              sample the guest's PC until each core's XNU entry (pre-XNU hangs)
   AURA_SAMPLE_HZ=<n>       samples per second (default 4)
   AURA_SAMPLE_MAX=<n>      stop printing after n samples (default 64)
-  AURA_J613_RUN            admit the exact J613 stock-SPTM path without the bounded MMIO trace
+  AURA_SPTM_EXPORT         admit an SPTM image that has a reviewed clean-room export
+                           (aura/sptm_exports), without the bounded MMIO trace
+  AURA_ANE_TRACE           trace the ANE, its DART and the AIC (windows from the ADT) into a
+                           bounded ring, and park when it is full
   AURA_XNU_ENTRY           patch the guest kernelcache's acct(2) so a root process reaches aura's
                            control hvc with no kext (the auractl "xnu" entry; aura/auractl_xnu.py)
   AURA_XNU_RO_RELAX        patch XNU's zalloc_ro_mut RO-zone panic out (tracing only; XNU_QUIRKS)
@@ -113,7 +116,7 @@ CONFIG_FLAGS = {
     "AURA_S2R_DROP_USB": 1 << 4,
     "AURA_XNU_BT": 1 << 5,
     "AURA_GPU_TRACE": 1 << 6,
-    "AURA_J613_TRACE": 1 << 11,
+    "AURA_ANE_TRACE": 1 << 11,
     "AURA_SAMPLE": 1 << 7,
     "AURA_S2R_MEM": 1 << 8,
     # bit 9 is reserved for AURA_AURACTL in the feat/auractl runner
@@ -149,7 +152,7 @@ KNOWN_ENV = {
     "AURA_S2R_USB_RETAKE_MS",
     "AURA_TAIL_SECS",
     "AURA_TAIL_IDLE",
-    "AURA_J613_RUN",
+    "AURA_SPTM_EXPORT",
     "AURA_GPU_STOP_SECS",
     "AURA_GPU_STOP_BOOT_SECS",
     "AURA_GPU_STOP_MSG",
@@ -859,7 +862,7 @@ def main():
     if unknown:
         print("not run_guest_sptm.py switches, ignored:", " ".join(unknown))
 
-    from aura import sptm_patch, sptm_virt_plan as plan_mod
+    from aura import sptm_export, sptm_patch, sptm_virt_plan as plan_mod
     from aura.proxy import AuraProxy, UartInterface
     from aura.proxyutils import ProxyUtils, bootstrap_port
 
@@ -871,22 +874,23 @@ def main():
 
     # SPTM's managed window, as aura computed it: above aura and everything iBoot left low,
     # below aura's carve-out.
-    chip = u.adt["/chosen"].chip_id
-    if chip == 0x8122:
-        print(f"J613 host image [0x{sym['_base']:x}, 0x{sym['_end']:x})")
-        from aura import sptm_j613
-        sptm_j613.validate_resources(lambda path, idx: u.adt[path].get_reg(idx))
-        if not (env_on("AURA_J613_RUN") or env_on("AURA_J613_TRACE")):
-            raise SystemExit("T8122 requires experimental AURA_J613_RUN=1")
-        if any(env_on(k) for k in CONFIG_FLAGS if k != "AURA_J613_TRACE"):
-            raise SystemExit("J613: other trace/sleep modes are not qualified")
-        # Deliberately before reading images or placing anything on the target.
+    # An SPTM image with a clean-room export is patched only from that export (selected by the
+    # image itself, not by SoC or OS build), and only when asked. Checked on the host's copy of
+    # the image, before anything is placed on the target.
+    export = sptm_export.find(args.sptm.read_bytes())
+    if export:
+        print(f"SPTM export {export['_name']}: {export.get('label', '')}; host image "
+              f"[0x{sym['_base']:x}, 0x{sym['_end']:x})")
+        if not (env_on("AURA_SPTM_EXPORT") or env_on("AURA_ANE_TRACE")):
+            raise SystemExit("this SPTM has a clean-room export: set AURA_SPTM_EXPORT=1")
+        if any(env_on(k) for k in CONFIG_FLAGS if k != "AURA_ANE_TRACE"):
+            raise SystemExit("SPTM export: other trace/sleep modes are not qualified")
         try:
-            sptm_j613.patch_plan(None, None)
+            sptm_export.admit(export)
         except ValueError as e:
             raise SystemExit(str(e))
-    elif env_on("AURA_J613_RUN") or env_on("AURA_J613_TRACE"):
-        raise SystemExit("AURA_J613_RUN/AURA_J613_TRACE require T8122")
+    elif env_on("AURA_SPTM_EXPORT"):
+        raise SystemExit("AURA_SPTM_EXPORT: no clean-room export matches this SPTM image")
     scratch = u.malloc(0x40)
     if p.call(sym["sptm_virt_place"], scratch) != 0:
         raise SystemExit("sptm_virt_place failed: not an SPTM_VIRT build, no FEAT_NV2 or GXF, or "
@@ -916,7 +920,7 @@ def main():
 
     entry_off = plan_mod.macho_info(images["sptm"]).entry - plan_mod.macho_info(images["sptm"]).virtlo
     try:
-        sp = (sptm_j613.patch_plan(images["sptm"], entry_off) if chip == 0x8122
+        sp = (sptm_export.patch_plan(images["sptm"], entry_off, export) if export
               else sptm_patch.plan(images["sptm"], entry_off))
     except (sptm_patch.SptmPatchError, ValueError) as e:
         raise SystemExit(f"this SPTM can't be patched: {e}")
@@ -962,8 +966,7 @@ def main():
     quirk_hide = tuple(quirks["hide"])
     if env_on("AURA_KEEP_WIFI"):
         quirk_hide = tuple(n for n in quirk_hide if n in port_nodes)
-    keep_ane = env_on("AURA_KEEP_ANE") or (
-        chip == 0x8122 and (env_on("AURA_J613_RUN") or env_on("AURA_J613_TRACE")))
+    keep_ane = env_on("AURA_KEEP_ANE") or env_on("AURA_ANE_TRACE") or bool(export)
     hide = port_nodes + (() if keep_ane else STRIP_NODES) + quirk_hide
     if not env_on("AURA_KEEP_ERRH"):
         hide += (ERROR_HANDLER,)

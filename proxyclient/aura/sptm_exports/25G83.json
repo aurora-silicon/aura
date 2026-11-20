@@ -1,0 +1,36 @@
+{
+  "label": "SPTM shipped with macOS 26.6.2 (25G83), measured on a J613",
+  "image_sha256": "6ab3f26ff9445a802e2e88d2347f7d64157d1b9eab783523ab0e7eab183bef6b",
+  "uuid": "2B57CA7A-3D9C-3C70-B5E0-7C3F74C5323B",
+  "entry_file_offset": "0xa8388",
+  "groups": {
+    "APSTS poll": [
+      {
+        "purpose": "shared cold/reset readiness wait",
+        "pattern_offset": "0xab7ac",
+        "pattern": "df3f03d51f8708d59f3b03d580fc3ed501004092c1ffffb480f03cd5000040b2",
+        "patch_offset": "0xab7c0",
+        "entry_offset": "0x3438",
+        "expected": "0xb4ffffc1",
+        "replacement": "0xd503201f"
+      },
+      {
+        "purpose": "early-entry readiness wait",
+        "pattern_offset": "0x9c0b0",
+        "pattern": "28a2acf228a294f2482018d58afc3ed548014092c8ffffb48af03cd54a0140b2",
+        "patch_offset": "0x9c0c4",
+        "entry_offset": "-0xc2c4",
+        "expected": "0xb4ffffc8",
+        "replacement": "0xd503201f"
+      }
+    ],
+    "CTRR check": [],
+    "CTRR reset-path check": [],
+    "ctXr lock check": [],
+    "AMCC CTRR match": []
+  },
+  "ctrr_stash_off": null,
+  "ctxr_ctl": null,
+  "sptm_va_maps": null,
+  "reviewed": true
+}
