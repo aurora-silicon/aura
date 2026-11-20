@@ -37,7 +37,10 @@
 
 #define SPMI_OPC_EXT_WRITE  0x00 /* 0x00-0x0f: 8-bit register, (opc & 0xf) + 1 bytes */
 #define SPMI_OPC_EXT_WRITEL 0x30 /* 0x30-0x37: 16-bit register, (opc & 7) + 1 bytes */
-#define PK_OTHER            16
+#define SPMI_OPC_EXT_READL  0x38 /* 0x38-0x3f: 16-bit register, (opc & 7) + 1 bytes */
+/* XNU's commands on the scratchpad (boot stage +1, failed-boot count +2, ...) are logged. */
+#define PK_WATCH_LOGS 48
+#define PK_OTHER      16
 
 static struct {
     spmi_dev_t *dev;
@@ -61,6 +64,10 @@ static struct {
     } other[PK_OTHER];
     int n_other;
     bool other_lost, other_nonzero_write;
+    /* XNU's command on the scratchpad in flight: its register, and whether it writes */
+    int watch_reg;
+    bool watch_write;
+    u32 watch_logs;
 } pk;
 
 static DECLARE_SPINLOCK(pk_lock);
@@ -214,6 +221,13 @@ static bool pk_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int wi
         u32 v = *val;
         if (pk.data_words > 0) {
             pk.data_words--;
+            if (pk.watch_reg >= 0 && pk.watch_write) {
+                /* The first data word after an EXT_WRITEL: its bytes, the register's first. */
+                if (pk.watch_logs++ < PK_WATCH_LOGS)
+                    printf("SPTM-virt[pmu]: XNU writes PMU 0x%x = 0x%08x (first data word)\n",
+                           pk.watch_reg, v);
+                pk.watch_reg = -1;
+            }
         } else {
             /* A new command: aura's turn first, if one is due. */
             pk_maybe(now);
@@ -225,6 +239,16 @@ static bool pk_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int wi
             pk.data_words = (len + 3) / 4;
             pk.open = true;
             pk.open_t = now;
+            /* gen-1 command word: register [31:16], slave [14:8], opcode [7:0] */
+            u32 reg = v >> 16, slave = (v >> 8) & 0x7f, scr = pk.counter - 2;
+            pk.watch_reg = -1;
+            if (slave == pk.slave && reg >= scr && reg < scr + 4 &&
+                ((opc & 0xf8) == SPMI_OPC_EXT_WRITEL || (opc & 0xf8) == SPMI_OPC_EXT_READL)) {
+                pk.watch_reg = reg;
+                pk.watch_write = (opc & 0xf8) == SPMI_OPC_EXT_WRITEL;
+                if (!pk.watch_write && pk.watch_logs++ < PK_WATCH_LOGS)
+                    printf("SPTM-virt[pmu]: XNU reads PMU 0x%x (%u bytes)\n", reg, (opc & 7) + 1);
+            }
         }
     }
     sptm_virt_mmio_rw(addr, val, write, width);
@@ -265,6 +289,7 @@ void sptm_virt_pmu_setup(void)
     }
     if (pmu_counter_locate(path, sizeof(path), &pk.slave, &pk.counter) < 0)
         return;
+    pk.watch_reg = -1;
     pk.dev = spmi_init(path);
     if (!pk.dev)
         return;
