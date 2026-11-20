@@ -145,6 +145,13 @@ typedef struct dwc3_dev {
     void *scratchpad;
     void *xferbuffer;
     struct dwc3_trb *trbs;
+    /*
+     * Starting a bulk-in transfer, from several CPUs: the console and the proxy (console lock),
+     * an HV's vuart TX (its own lock, from stage-2 traps on any CPU) and the event handler's
+     * restart after a completion. Two at once would read the ring twice and start the endpoint
+     * twice.
+     */
+    spinlock_t bulk_in_lock;
 
     struct {
         bool xfer_in_progress;
@@ -1275,7 +1282,7 @@ static void usb_dwc3_cdc_start_bulk_out_xfer(dwc3_dev_t *dev, u8 endpoint_number
     usb_dwc3_start_bulk_transfer(dev, endpoint_number, XFER_SIZE);
 }
 
-static void usb_dwc3_cdc_start_bulk_in_xfer(dwc3_dev_t *dev, u8 endpoint_number)
+static void usb_dwc3_cdc_start_bulk_in_xfer_locked(dwc3_dev_t *dev, u8 endpoint_number)
 {
     if (!usb_dwc3_trb_available(dev, endpoint_number))
         return;
@@ -1302,6 +1309,13 @@ static void usb_dwc3_cdc_start_bulk_in_xfer(dwc3_dev_t *dev, u8 endpoint_number)
         return;
     }
     dev->endpoints[endpoint_number].zlp_pending = len && (len % CDC_BULK_PACKET_SIZE) == 0;
+}
+
+static void usb_dwc3_cdc_start_bulk_in_xfer(dwc3_dev_t *dev, u8 endpoint_number)
+{
+    spin_lock(&dev->bulk_in_lock);
+    usb_dwc3_cdc_start_bulk_in_xfer_locked(dev, endpoint_number);
+    spin_unlock(&dev->bulk_in_lock);
 }
 
 static bool usb_dwc3_cdc_copy_bulk_out_progress(dwc3_dev_t *dev, u8 ep)
@@ -1842,6 +1856,7 @@ dwc3_dev_t *usb_dwc3_init(uintptr_t regs, dart_dev_t *dart)
         return NULL;
 
     memset(dev, 0, sizeof(*dev));
+    spin_init(&dev->bulk_in_lock);
     for (int i = 0; i < CDC_ACM_PIPE_MAX; i++)
         memcpy(dev->pipe[i].cdc_line_coding, cdc_default_line_coding,
                sizeof(cdc_default_line_coding));
@@ -2211,7 +2226,8 @@ size_t usb_dwc3_queue_nonblocking(dwc3_dev_t *dev, cdc_acm_pipe_id_t pipe, const
         return 0;
 
     /* No event handling here: the callers' own loops pump events (hv_vuart's update_irq(), the
-     * HV tick, the proxy), under the console lock that keeps them to one CPU at a time. */
+     * HV tick, the proxy). The start itself takes bulk_in_lock: the vuart's TX holds only the
+     * vuart's lock, and another CPU may be starting the same endpoint from the event handler. */
     size_t wrote = ringbuffer_write(buf, count, device2host);
     usb_dwc3_cdc_start_bulk_in_xfer(dev, dev->pipe[pipe].ep_in);
     return wrote;
