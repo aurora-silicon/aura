@@ -28,8 +28,6 @@ _Static_assert(sizeof(u64) == 8, "production u64 ABI");
 #define BIT(n) (1ULL << (n))
 #define RVBAR_LOCK 1
 #define RVBAR_ADDR 0x0000fffffffff000ULL
-/* Userspace test symbols may sit above the hardware's 44-bit RVBAR range. */
-#define RVBAR_ADDR_UNLOCKED 0x0000fffffffff000ULL
 #define PMGR_DIE_OFFSET 0x100000
 static u64 pmgr_die_stride(void) { return PMGR_DIE_OFFSET; }
 #define T8103 0x8103
@@ -162,9 +160,9 @@ int main(void) {
             assert((rvbars[i] & RVBAR_ADDR) == (u64)_vectors_start);
         }
         assert(alive == 0xff);
-        /* The guest reset contract publishes Aura's vector during admission,
-         * then each secondary's established caller-side write repeats it. */
-        assert(write64_count == 15);
+        /* Only established caller-side writes: seven secondary RVBARs,
+         * plus boot RVBAR when its hardware lock bit is clear. */
+        assert(write64_count == (lock && boot_cpu_idx == 4 ? 7 : 8));
         assert(write32_count == 14);
       }
     }
@@ -219,8 +217,6 @@ _Static_assert(sizeof(u64) == 8, "production u64 ABI");
 #define SZ_16K 0x4000UL
 #define RVBAR_LOCK 1
 #define RVBAR_ADDR 0x0000fffffffff000UL
-/* Userspace test symbols may sit above the hardware's 44-bit RVBAR range. */
-#define RVBAR_ADDR_UNLOCKED 0x0000fffffffff000UL
 #define MAIR_IDX_NORMAL 0
 #define PERM_RW 0
 #define PERM_RX 1
@@ -245,12 +241,6 @@ static u64 read64(u64 address)
     assert(address == 8);
     event("read64", address, rvbar);
     return rvbar;
-}
-static void write64(u64 address, u64 value)
-{
-    assert(address == 8);
-    event("write64", address, value);
-    rvbar = value;
 }
 static u32 read32(u64 address)
 {
@@ -342,18 +332,13 @@ int main(void)
         assert(!strcmp(events[1].name, "read32"));
     }
     /* M3's architectural permission remains true across a relocated image.
-     * Guest admission publishes and verifies the active Aura vector itself. */
+     * The helper writes nothing; the established caller owns any RVBAR write. */
     reset();
     chip_id = 0x6030;
     features.apple_sysregs_unlocked = true;
     relocated_from = 0x800000000UL;
     old_vector = locked_vector;
-    assert(smp_prepare_rvbar(&cpu) == 0 && event_count == 4);
-    assert(!strcmp(events[0].name, "read64"));
-    assert(!strcmp(events[1].name, "write64"));
-    assert(!strcmp(events[2].name, "dsb sy"));
-    assert(!strcmp(events[3].name, "read64"));
-    assert(rvbar == (u64)_vectors_start);
+    assert(smp_prepare_rvbar(&cpu) == 0 && event_count == 1);
     assert(branch_word == 0 && installed_relay == 0);
     return 0;
 }
