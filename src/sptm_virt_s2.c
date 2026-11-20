@@ -541,9 +541,11 @@ static bool sptm_virt_apcie_ghost_hook(struct exc_info *ctx, u64 addr, u64 *val,
     static u32 logged;
 
     UNUSED(width);
-    if (logged++ < 64)
-        printf("SPTM-virt[apcie c%d]: absent port %s 0x%lx%s0x%lx pc 0x%lx\n", smp_id(),
-               write ? "wr" : "rd", addr, write ? " <- " : "", write ? *val : 0, ctx->elr);
+    if (logged++ < 64 && write)
+        printf("SPTM-virt[apcie c%d]: absent port wr 0x%lx <- 0x%lx pc 0x%lx\n", smp_id(), addr, *val,
+               ctx->elr);
+    else if (logged <= 64)
+        printf("SPTM-virt[apcie c%d]: absent port rd 0x%lx pc 0x%lx\n", smp_id(), addr, ctx->elr);
     if (!write)
         *val = 0;
     return true;
