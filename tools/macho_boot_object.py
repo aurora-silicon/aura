@@ -14,7 +14,8 @@ mode). A Stage 1 configuration block filled into the raw image before
 wrapping, or found by its magic afterwards, is unchanged.
 
 `--execute-window` also pads __TEXT_EXEC for the code-execute window that
-M4-generation and later chips (T8132, T6040 and up) need to run an OS, the
+M4-generation and later chips need to run an OS (the chips listed in
+data/execute-window.json; `tools/execute_window.py check CHIP`), the
 same padding aurora-installer's Recovery and `aura-execute-window` apply. It
 takes a raw image or an existing boot object. The padding is written as a
 hole, so the file is sparse; enroll it with `kmutil configure-boot --compress`.
