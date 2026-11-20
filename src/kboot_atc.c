@@ -1033,6 +1033,10 @@ static void dt_copy_atc_tunables(void *dt, const char *adt_path, const char *dt_
         goto cleanup;
     }
 
+    /* T8122 controllers take their defaults from the same usb-drdN lists as T8132's. */
+    if (adt_is_compatible_at(adt, adt_node, "atc-phy,t8122", 0))
+        dt_copy_drd_default_tunables(dt, port, dt_alias);
+
     return;
 
 cleanup:
