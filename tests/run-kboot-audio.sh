@@ -80,6 +80,21 @@ expect() { # expect <scenario>: the amp lines that scenario must give (tree orde
         amp 40 $BOP $DCB $R0 $Z0
         amp 42 $BOP $DCB $R2 $Z2
         amp 41 $BOP $DCB $R1 $Z1 ;;
+    card-masks-agree|card-masks-agree-t8122|card-codecs-not-bare|card-mask-not-zero-mode)
+        expect group ;;
+    card-mask-short-rows) expect short-speaker-config ;;
+    card-mask-contradicts|card-mask-contradicts-t8122) # amp 0x41's row lost, its stale copy too
+        amp 40 $BOP $DCB $R0 $Z0
+        amp 42 $BOP $DCB $R2 $Z2
+        amp 41 $BOP $DCB $R1 - ;;
+    card-masks-two-links-disagree)
+        amp 40 $BOP $DCB $R0 -
+        amp 42 $BOP $DCB $R2 $Z2
+        amp 41 $BOP $DCB $R1 $Z1 ;;
+    j613) # the woofers' rows lost, amp 0x41's (all zero) kept
+        amp 40 $BOP $DCB $R0 -
+        amp 42 $BOP $DCB $R2 -
+        amp 41 $BOP $DCB $R1 0000000000000000 ;;
     no-dcblocker) # as on the 14"/16" M1 Pro/Max, whose ADT has no DC blocker setting
         amp 40 $BOP - $R0 $Z0
         amp 42 $BOP - $R2 $Z2
