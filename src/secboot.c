@@ -318,10 +318,11 @@ u8 *secboot_payload_next(u8 *p)
     static const char *const loader_lines[] = {
         /*
          * What an earlier aura stage appends: /chosen strings (its version, the ESP, the trial,
-         * its log, measurements) and the NVMe hand-over. Never a payload, chainload=, boot=,
-         * display=, mitigations= or tso=: those must come from the signed bytes.
+         * its log, measurements) and the NVMe hand-over (nvme.ans= names a state, no address).
+         * Never a payload, chainload=, boot=, display=, mitigations= or tso=: those must come
+         * from the signed bytes.
          */
-        "chosen.", "nvme.adopt=", "aura.host-window=", "m1n1.config-lost=", NULL,
+        "chosen.", "nvme.adopt=", "nvme.ans=", "aura.host-window=", "m1n1.config-lost=", NULL,
     };
     /*
      * Skip what is refused instead of stopping: a stop would also drop the allowed lines after

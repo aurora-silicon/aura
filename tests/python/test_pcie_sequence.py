@@ -120,7 +120,7 @@ static int pmgr_power_steps(int die, const char *name, bool on)
     return fail_step && !strcmp(name, fail_step) ? -1 : 0;
 }
 static int pmgr_adt_power_disable_index(const char *path, int i) { assert(0); return -1; }
-static int pmgr_adt_power_disable_under(const char *path, const char *name) { assert(0); return -1; }
+static int pmgr_adt_power_enable_under(const char *path, const char *name) { assert(0); return -1; }
 static void access_mmio(u64 addr)
 {
     assert(powered);

@@ -566,10 +566,13 @@ static bool pmgr_depends_on(u16 id, u16 root, size_t depth)
 }
 
 /*
- * Power off the gates of the ADT node at path that are the device named name or depend on it,
- * children first. A virtual gate stands for its parent. The node's other gates stay on.
+ * Power on the gates of the ADT node at path that are the device named name or depend on it,
+ * parents first, and leave any that is on already as it is. A virtual gate stands for its parent.
+ * The node's other gates aren't touched. For ANS under /arm-io/apcie these are exactly the gates a
+ * whole-block ANS power-off (1.0.0b13, pcie_ans_power_off()) took down: on T8132 APCIE_PHY_SW,
+ * APCIE_SYS_ST, APCIE_ST and ANS, with APCIE_GP and APCIE_SYS_GP left on.
  */
-int pmgr_adt_power_disable_under(const char *path, const char *name)
+int pmgr_adt_power_enable_under(const char *path, const char *name)
 {
     const struct pmgr_device *device;
     const u32 *devices;
@@ -610,13 +613,20 @@ int pmgr_adt_power_disable_under(const char *path, const char *name)
 
     while (count) {
         size_t i = 0;
-        /* A gate no other remaining one depends on. The topology is validated acyclic. */
+        /* A gate that depends on no other remaining one. The topology is validated acyclic. */
         for (size_t j = 0; j < count; j++)
-            if (j != i && pmgr_depends_on(ids[j], ids[i], 0))
+            if (j != i && pmgr_depends_on(ids[i], ids[j], 0))
                 i = j, j = (size_t)-1;
-        if (pmgr_find_device(ids[i], &device) ||
-            pmgr_set_mode(pmgr_device_get_addr(dies[i], device), PMGR_PS_PWRGATE))
+        if (pmgr_find_device(ids[i], &device))
             return -1;
+        uintptr_t addr = pmgr_device_get_addr(dies[i], device);
+        if (!addr)
+            return -1;
+        if (FIELD_GET(PMGR_PS_ACTUAL, read32(addr)) != PMGR_PS_ACTIVE) {
+            printf("pmgr: %d.%.16s on\n", dies[i], device->name);
+            if (pmgr_set_mode(addr, PMGR_PS_ACTIVE))
+                return -1;
+        }
         ids[i] = ids[--count];
         dies[i] = dies[count];
     }
@@ -842,10 +852,10 @@ int pmgr_reset(int die, const char *name)
     return pmgr_reset_device(die, dev);
 }
 
-#ifdef SPTM_VIRT
 /*
  * A device's reset, with the device held on for it (an idle one won't take a reset), then its
- * target and auto-enable as they were.
+ * target and auto-enable as they were. The post-M4 ANS reset: a plain reset of an ANS left idle
+ * under auto-enable is refused, and on T8140 ANS's ADT gate is a virtual one.
  */
 int pmgr_reset_held(int die, const char *name)
 {
@@ -872,7 +882,6 @@ int pmgr_reset_held(int die, const char *name)
            ret ? ", NOT reset" : "");
     return ret;
 }
-#endif /* SPTM_VIRT */
 
 uintptr_t pmgr_psreg_by_name(int die, const char *name)
 {

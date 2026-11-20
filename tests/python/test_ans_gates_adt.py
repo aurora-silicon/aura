@@ -1,5 +1,8 @@
 # SPDX-License-Identifier: MIT
-"""Which gates pmgr_adt_power_disable_under() powers off for ANS, on real ADTs.
+"""Which gates pmgr_adt_power_enable_under() powers on for ANS, on real ADTs.
+
+They are the gates a whole-block ANS power-off (1.0.0b13) took down, which a later stage powers
+back on for ANS alone before it puts iBoot's SART entries back (nvme.c, legacy OFF).
 
 The real pmgr.c runs on the PMGR table and APCIe power-gates of each ADT text dump in
 AURA_ADT_DUMPS (proxyclient's format, as in GravityLinux/adt-collection). Skipped without it.
@@ -112,7 +115,7 @@ static u32 read32(uintptr_t addr) { return 0; }
 static void write32(uintptr_t addr, u32 v) {}
 static u32 mask32(uintptr_t addr, u32 clear, u32 set)
 {
-    printf("LOWER %lx\n", (unsigned long)addr);
+    printf("RAISE %lx\n", (unsigned long)addr);
     return 0;
 }
 static u32 set32(uintptr_t addr, u32 set) { return 0; }
@@ -161,7 +164,7 @@ int main(void)
     devices_len = sizeof(table);
     if (pmgr_init())
         return 2;
-    printf("RESULT %d\n", pmgr_adt_power_disable_under("/arm-io/%s", "ANS"));
+    printf("RESULT %d\n", pmgr_adt_power_enable_under("/arm-io/%s", "ANS"));
     return 0;
 }
 """.replace("%s", node)
@@ -171,8 +174,8 @@ int main(void)
     out = subprocess.run([str(binary)], capture_output=True, text=True, check=True).stdout
 
     by_addr = {addr(d): d["name"] for d in devices.values() if not d.get("no_ps")}
-    lowered = [by_addr[int(l.split()[1], 16)] for l in out.splitlines() if l.startswith("LOWER ")]
-    print(f"{dump.stem}: /arm-io/{node} gates {gates}: lowered {lowered}")
+    raised = [by_addr[int(l.split()[1], 16)] for l in out.splitlines() if l.startswith("RAISE ")]
+    print(f"{dump.stem}: /arm-io/{node} gates {gates}: raised {raised}")
     assert "RESULT 0" in out
     by_name = {d["name"]: d for d in devices.values()}
 
@@ -183,8 +186,8 @@ int main(void)
         names = {devices[p]["name"] for p in d["parents"] if p in devices}
         return names.union(*(ancestors(n, seen + (name,)) for n in names))
 
-    assert lowered[-1] == "ANS"
-    for i, name in enumerate(lowered):
-        # Each one is ANS or depends on it, and nothing lowered later depends on it.
+    assert raised[0] == "ANS"
+    for i, name in enumerate(raised):
+        # Each one is ANS or depends on it, and none depends on one raised after it.
         assert name == "ANS" or "ANS" in ancestors(name)
-        assert not any(name in ancestors(later) for later in lowered[i + 1:])
+        assert not any(later in ancestors(name) for later in raised[i + 1:])

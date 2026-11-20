@@ -371,8 +371,15 @@ static u32 pcie_phy_up(const struct state *state)
     return BIT(27);
 }
 
-/* With ans_off, only read the windows, stop the shared PHY and power ANS's gates off. */
-static int pcie_init_controller(int controller, const char *path, bool ans_off)
+/*
+ * With storage_only, for a post-M4 ANS that an older stage powered off with the whole block
+ * (1.0.0b13): only the gates that depend on ANS go back on, the shared PHY comes up as for a full
+ * init, and no root port is touched. The GP side stays as iBoot left it: re-initializing it
+ * differently from iBoot is what XNU doesn't take (T8132: an LLC SLVERR on the empty port 1's
+ * window after a full re-init). The controller then reads as not initialized, so a later
+ * pcie_init() (kboot for Linux) still brings the root ports up.
+ */
+static int pcie_init_controller(int controller, const char *path, bool storage_only)
 {
     struct state *state = &controllers[controller];
     int adt_path[8];
@@ -572,30 +579,10 @@ static int pcie_init_controller(int controller, const char *path, bool ans_off)
         return -1;
     }
 
-    if (ans_off) {
-        for (int phy = 0; phy < state->num_phys; phy++) {
-            u64 ctrl = state->phy_base[phy] + APCIE_PHY_CTRL;
-            set32(ctrl, state->pcie_regs->phy_ctrl_reset);
-            clear32(ctrl, APCIE_PHY_CTRL_CLK1REQ);
-            poll32(ctrl, APCIE_PHY_CTRL_CLK1ACK, 0, 50000);
-            clear32(ctrl, APCIE_PHY_CTRL_CLK0REQ);
-            poll32(ctrl, APCIE_PHY_CTRL_CLK0ACK, 0, 50000);
-            /* PHY control keeps its value through the power cycle: take the PHY down whole. */
-            clear32(ctrl, pcie_phy_up(state));
-            clear32(state->phy_base[phy] + 4, 0x10);
-            clear32(state->phy_base[phy] + 4, 0x01);
-        }
-        if (pmgr_adt_power_disable_under(path, "ANS"))
-            return -1;
-        /* Off at least as long as in the power cycle measured on the J700. */
-        udelay(100000);
-        return 0;
-    }
-
     state->dirty = true;
     if (state->pcie_regs->type == APCIE_T8140)
         printf("pcie: T8140 enabling controller power\n");
-    if (pmgr_adt_power_enable(path)) {
+    if (storage_only ? pmgr_adt_power_enable_under(path, "ANS") : pmgr_adt_power_enable(path)) {
         printf("pcie: Error enabling power for %s\n", path);
         return -1;
     }
@@ -779,6 +766,13 @@ static int pcie_init_controller(int controller, const char *path, bool ans_off)
                 clear32(state->rc_base + 0x3c, 0x1);
             pmgr_adt_power_disable_index(path, 1);
         }
+    }
+
+    if (storage_only) {
+        printf("pcie: controller %d shared PHY up for ANS; root ports left as they are\n",
+               controller);
+        state->dirty = false;
+        return 0;
     }
 
     for (u32 port = 0; port < state->port_count; port++) {
@@ -1140,7 +1134,7 @@ int pcie_init(void)
     return success ? 0 : -1;
 }
 
-/* For a stage done with a post-M4 ANS, which runs on the APCIe PHY: the PHY and ANS powered off. */
+/* The APCIe block a post-M4 ANS's storage gates are listed under. */
 static const char *pcie_ans_path(void)
 {
     return adt_path_offset(adt, "/arm-io/apcie") >= 0 ? "/arm-io/apcie" : "/arm-io/apcie0";
@@ -1210,27 +1204,36 @@ static int pcie_ans_ps_step(const char *name, bool on)
     return -1;
 }
 
+/*
+ * Only through a storage gate table. Elsewhere ANS shares the APCIe PHY with the GP ports, and a
+ * stage leaves it powered and STOPPED instead (nvme.c, docs/post-m4-ans-handoff.md): the
+ * whole-block power-off that 1.0.0b13 did takes that PHY down with it.
+ */
 int pcie_ans_power_off(void)
 {
     const struct pcie_ans_ps *ps = pcie_ans_ps();
 
-    if (ps) {
-        for (size_t i = 0; i < ps->count; i++)
-            if (pcie_ans_ps_step(ps->gates[i], false))
-                return -1;
-        udelay(ps->off_us);
-        return 0;
+    if (!ps) {
+        printf("pcie: ANS has no storage gates of its own here; it stays powered\n");
+        return -1;
     }
-    pcie_initialized = false;
-    return pcie_init_controller(APCIE, pcie_ans_path(), true);
+    for (size_t i = 0; i < ps->count; i++)
+        if (pcie_ans_ps_step(ps->gates[i], false))
+            return -1;
+    udelay(ps->off_us);
+    return 0;
 }
 
+/*
+ * ANS's side back on after a power-off, its CPU stopped: the storage gate table, or (an older
+ * stage's whole-block power-off) the gates that depend on ANS and the shared PHY, no root port.
+ */
 int pcie_ans_power_on(void)
 {
     const struct pcie_ans_ps *ps = pcie_ans_ps();
 
     if (!ps)
-        return pcie_init();
+        return pcie_init_controller(APCIE, pcie_ans_path(), true);
     for (size_t i = 0; i < ps->count; i++)
         if (pcie_ans_ps_step(ps->gates[ps->on[i]], true))
             return -1;

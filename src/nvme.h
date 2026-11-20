@@ -13,12 +13,17 @@ extern bool nvme_keep_running_for_linux;
 extern bool nvme_quiesce_for_next;
 bool nvme_shutdown(void);
 int nvme_cold_handoff(bool idle, bool no_probe);
-/* Post-M4: how a stage that powered ANS off tells the next one to start it again. */
+/*
+ * Post-M4: how a stage tells the next one what it left ANS in (docs/post-m4-ans-handoff.md):
+ * nvme.ans=stopped, or nvme.sart= for an ANS powered off (T6050, older stages).
+ */
 bool nvme_post_m4(void);
-bool nvme_post_m4_passed_off(void);
+bool nvme_post_m4_needs_start(void);
 int nvme_sart_entries(struct sart_entry *entries, int max, bool *off);
 char *nvme_sart_var(void);
+char *nvme_handoff_var(void);
 bool nvme_set_sart_var(const char *val);
+bool nvme_set_ans_var(const char *val);
 
 bool nvme_flush(u32 nsid);
 /* A command of this session failed or timed out: later ones fail until a restart. */

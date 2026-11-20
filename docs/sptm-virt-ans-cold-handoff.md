@@ -1,4 +1,4 @@
-# ANS for a macOS guest: the cold handoff (T8140)
+# ANS for a macOS guest: the cold handoff (post-M4)
 
 On a native boot iBoot hands ANS to XNU running, with its RTKit session quiesced, and XNU wakes
 that session with one INIT. Under aura, a stage that read NVMe first (Stage 1 for the ESP's
@@ -12,12 +12,19 @@ Measured on the MacBook Neo (J700), macOS 26 (25G83), on both routes:
 - through a blessed Aurora stub;
 - through a one-shot bless of the macOS volume.
 
-Both reached the desktop.
+Both reached the desktop. On the M4 Mac mini (J773g, macOS 27.2) XNU started ANS cold from this
+state too (`RTBuddy(ANS2): start`, its endpoint found).
+
+The state this handoff leaves, STOPPED, is the one every aura stage now leaves a post-M4 ANS in
+([post-m4-ans-handoff.md](post-m4-ans-handoff.md)). After such a stage the handoff only checks
+it: nothing is running, no aura SART entry is left, and ANS is reset and probed.
 
 `AURA_ANS_COLD` selects the mode:
-- `sleep`, the default on T8140;
+- `sleep`, the default on every SoC whose stages leave ANS STOPPED (T8132, T6040, T6041, T8140,
+  T8142);
 - `idle`, a diagnostic;
-- `off`, the old handoff and the default elsewhere.
+- `off`, XNU's warm wake of iBoot's quiesced session, which only an ANS no stage touched still
+  has; the default elsewhere (T6050).
 
 `AURA_ANS_PROBE=0` skips the check below.
 
@@ -45,3 +52,20 @@ Both reached the desktop.
 
 Before XNU, the handoff starts ANS once and waits for its HELLO, then stops and resets it again.
 Without a HELLO it fails, and the host stops before XNU rather than letting XNU panic 20 s in.
+
+## An ANS an older stage powered off
+
+Stages from 1.0.0b13 until the STOPPED handoff powered a post-M4 ANS off with the whole APCIe
+block once they had read the disk, and passed the SART entries they held as `nvme.sart=` to an
+image they chainloaded themselves. The SART loses its entries with ANS's power, iBoot's included.
+
+- The handoff powers back only the gates that depend on ANS: on T8132 and T8140 these are ANS,
+  APCIE_ST, APCIE_SYS_ST and APCIE_PHY_SW.
+- It brings the shared PHY up as `pcie_init()` does, and touches no root port.
+- It puts iBoot's entries back from `nvme.sart=`, leaving out the older stage's own buffers.
+- It then goes on as for a stopped ANS.
+
+On T8132, XNU read the empty port 1's window after a full re-init that included the root ports,
+and took an LLC SLVERR. Whether XNU takes the GP side as the older stage left it is still to be
+seen on hardware. An image a host chainloads from such a stage's proxy has no `nvme.sart=`, and
+the handoff refuses it.

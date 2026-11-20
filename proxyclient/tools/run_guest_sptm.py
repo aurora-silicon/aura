@@ -200,6 +200,9 @@ ROUTES_PROPS = (("/arm-io/dcp/iop-dcp-nub", "routes"), ("/arm-io/aop/iop-aop-nub
 # Without it XNU powers ANS on, maps its firmware and sets RUN itself, instead of waking a
 # running session.
 ANS_QUIESCED = (("/arm-io/ans/iop-ans-nub", "quiesced"),)
+# The SoCs whose aura stages leave ANS STOPPED for the next one (src/nvme.c nvme_ans_stops()):
+# T8132, T6040, T6041, T8140, T8142.
+ANS_STOPPED_CHIPS = (0x8132, 0x6040, 0x6041, 0x8140, 0x8142)
 # iBoot's data regions copied to the blob tail, in iBoot's order (the native layout).
 IBOOT_COPIES = ("RTBuddySeg", "SEPFW", "SEPPatches", "uStuff", "preoslog")
 
@@ -883,12 +886,14 @@ def main():
     if xnu_release:
         print(f"XNU {xnu_release}: hiding " + " ".join(quirks["hide"]))
 
-    # Any stage that used NVMe left ANS in a session XNU can't take over: end it, stop and reset
-    # ANS, and XNU starts it cold. AURA_ANS_COLD=idle (IDLE instead of SLEEP) is a diagnostic,
-    # =off keeps the old handoff; AURA_ANS_PROBE=0 skips the HELLO check before XNU.
-    # Measured on T8140 only: elsewhere it's opt-in, and XNU wakes iBoot's quiesced session.
-    t8140 = u.adt["/chosen"].chip_id == 0x8140
-    ans_cold = os.environ.get("AURA_ANS_COLD", "sleep" if t8140 else "off")
+    # Any stage that used NVMe left ANS STOPPED (docs/post-m4-ans-handoff.md), or in a session XNU
+    # can't take over: end it, stop and reset ANS, and XNU starts it cold. That is the default on
+    # every SoC whose stages leave ANS STOPPED. AURA_ANS_COLD=idle (IDLE instead of SLEEP) is a
+    # diagnostic; =off keeps XNU's warm wake of iBoot's quiesced session, which only an ANS no
+    # stage touched still has. AURA_ANS_PROBE=0 skips the HELLO check before XNU.
+    # Measured on T8140 (macOS 26) and T8132 (27.2); T6050 keeps its own handoff.
+    stops = u.adt["/chosen"].chip_id in ANS_STOPPED_CHIPS
+    ans_cold = os.environ.get("AURA_ANS_COLD", "sleep" if stops else "off")
     if ans_cold not in ("sleep", "idle", "off"):
         raise SystemExit(f"AURA_ANS_COLD={ans_cold}: sleep, idle or off")
     if ans_cold != "off":
