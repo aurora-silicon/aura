@@ -7938,6 +7938,8 @@ static int dt_set_j713_display_maps(const struct adt_segment_ranges *segments, u
     return 0;
 }
 
+static int dt_set_dcp_fw27_clocks(const char *alias, const char *adt_engine);
+
 /*
  * Publish the inherited DCP firmware mapping without starting a display driver: on the J713
  * on any firmware as before, and on any other M4 Mac with a panel on 26.6.2.
@@ -8002,10 +8004,21 @@ static int dt_set_m4_dcp_handoff(void)
     if (ret)
         return ret;
 
+    /*
+     * Firmware 27 is given its clocks by the OS (/arm-io/disp0 clock-ids); without them it
+     * does not start, but the rest of the boot does. Nothing is published on 26.6.2.
+     */
+    if (dt_set_dcp_fw27_clocks("dcp", "/arm-io/disp0"))
+        printf("FDT: M4 DCP firmware clocks not published\n");
+
     dcp_node = fdt_path_offset(dt, "dcp");
     if (fdt_getprop(dt, dcp_node, "apple,j713-native-piodma", NULL)) {
-        /* The DCP image is per firmware, the same on every M4 Mac. */
-        if (os_firmware.version != V26_6_2 ||
+        /*
+         * The DCP image is per firmware, the same on every M4 Mac: 26.6.2 and the 27.2 stub.
+         * The walk checks every inherited SID0/SID16 page against this image's segments and
+         * publishes nothing unless all of them match.
+         */
+        if ((os_firmware.version != V26_6_2 && os_firmware.version != V27_2) ||
             dt_set_j713_display_maps(segments, count, dram_start, dram_size))
             printf("FDT: M4 PIODMA handoff unqualified; retaining disabled device\n");
     }
@@ -8043,17 +8056,26 @@ static int dt_set_dcp_fw27_clocks(const char *alias, const char *adt_engine)
         return 0;
     }
 
+    /*
+     * A tree written for older firmware has the display clock alone; one written for a
+     * processor that only ever ran firmware-27-style interfaces (T8132) has no clocks at all.
+     */
     int clen = 0;
     const fdt32_t *display = fdt_getprop(dt, node, "clocks", &clen);
-    if (!display || clen != sizeof(fdt32_t) || fdt_getprop(dt, node, "clock-names", NULL)) {
+    if ((display && clen != sizeof(fdt32_t)) || fdt_getprop(dt, node, "clock-names", NULL)) {
         printf("FDT: %s: unexpected clock properties; firmware clocks not published\n", alias);
         return 0;
     }
 
     fdt32_t clocks[9], ids[8];
     char names[9 * 12];
-    int names_len = snprintf(names, sizeof(names), "display") + 1;
-    clocks[0] = *display;
+    u32 first = 0;
+    int names_len = 0;
+    if (display) {
+        names_len = snprintf(names, sizeof(names), "display") + 1;
+        clocks[0] = *display;
+        first = 1;
+    }
     for (u32 i = 0; i < nclk; i++) {
         u32 id, hz;
         memcpy(&id, raw_ids + i * sizeof(u32), sizeof(id));
@@ -8082,7 +8104,7 @@ static int dt_set_dcp_fw27_clocks(const char *alias, const char *adt_engine)
         ret = ret ?: fdt_setprop_u32(dt, clk, "phandle", ph);
         if (ret)
             return ret;
-        clocks[i + 1] = cpu_to_fdt32(ph);
+        clocks[i + first] = cpu_to_fdt32(ph);
         ids[i] = cpu_to_fdt32(id);
         names_len += snprintf(names + names_len, sizeof(names) - names_len, "firmware-%u", i) + 1;
     }
@@ -8090,7 +8112,7 @@ static int dt_set_dcp_fw27_clocks(const char *alias, const char *adt_engine)
     node = fdt_path_offset(dt, path);
     if (node < 0)
         return node;
-    int ret = fdt_setprop(dt, node, "clocks", clocks, (nclk + 1) * sizeof(*clocks));
+    int ret = fdt_setprop(dt, node, "clocks", clocks, (nclk + first) * sizeof(*clocks));
     node = fdt_path_offset(dt, path);
     ret = ret ?: fdt_setprop(dt, node, "clock-names", names, names_len);
     node = fdt_path_offset(dt, path);
