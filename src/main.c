@@ -413,7 +413,10 @@ void aura_main(void)
 #ifndef BRINGUP
     if (supports_gxf())
         gxf_init();
-    /* A known MCC that fails to initialize is fatal on every chip; an unknown revision is not. */
+    /*
+     * A known MCC that fails to initialize is fatal on every chip; an unknown revision
+     * (MCC_UNSUPPORTED) or a SoC with no MCC in the ADT (MCC_ABSENT) is not.
+     */
     if (mcc_init() < 0)
         panic("MCC initialization failed\n");
     mmu_init();
