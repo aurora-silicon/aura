@@ -51,40 +51,54 @@ static u64 firmware_ro_start;
 static u64 firmware_ro_end;
 static bool firmware_ro_checked;
 static bool firmware_ro_valid;
+static int firmware_ro_none;
 
+/*
+ * The firmware's read-only (CTRR_C) range at the bottom of managed RAM, read once on the boot CPU:
+ * 1 with [start, end), 0 when there is none, -1 when it is invalid. Every chip that sets CTRR_C
+ * reports its range. Only T8140 treats a range it cannot use as an error, because chainload, SMP
+ * bring-up and the MMU rely on it there; elsewhere such a range reads as none, as before.
+ */
 int memory_fw_ro_range(u64 *start, u64 *end)
 {
-    if (chip_id != T8140)
-        return 0;
-
     if (!firmware_ro_checked) {
         u64 lower, upper, ram_end;
 
         firmware_ro_checked = true;
+        firmware_ro_none = chip_id == T8140 ? -1 : 0;
         if (!is_boot_cpu())
-            return -1;
+            return firmware_ro_none;
+        /* CTRR_C is an EL2 register; an aura guest at EL1 leaves the range to its host. */
+        if (chip_id != T8140 && !in_el2())
+            return firmware_ro_none;
         lower = mrs(SYS_IMP_APL_CTRR_C_LWR_EL2);
         upper = mrs(SYS_IMP_APL_CTRR_C_UPR_EL2);
         if ((lower | upper) & (SZ_4K - 1))
-            return -1;
+            return firmware_ro_none;
         if (!cur_boot_args.mem_size ||
             cur_boot_args.phys_base > UINT64_MAX - cur_boot_args.mem_size ||
             upper > UINT64_MAX - SZ_4K)
-            return -1;
+            return firmware_ro_none;
         ram_end = cur_boot_args.phys_base + cur_boot_args.mem_size;
         firmware_ro_end = upper + SZ_4K;
-        if (firmware_ro_end < lower || firmware_ro_end - lower != 3 * SZ_16K ||
-            lower < cur_boot_args.phys_base || firmware_ro_end > ram_end ||
+        if (firmware_ro_end <= lower || lower < cur_boot_args.phys_base ||
+            firmware_ro_end > ram_end ||
             cur_boot_args.top_of_kernel_data < cur_boot_args.phys_base ||
             cur_boot_args.top_of_kernel_data >= ram_end)
-            return -1;
+            return firmware_ro_none;
+        /*
+         * T8140 only: its iBoot always sets three 16 KiB pages, and chainload and SMP bring-up
+         * were measured with that size. The other chips set a size of their own.
+         */
+        if (chip_id == T8140 && firmware_ro_end - lower != 3 * SZ_16K)
+            return firmware_ro_none;
         firmware_ro_start = lower;
         firmware_ro_valid = true;
         printf("MMU: firmware RO range [0x%lx, 0x%lx)\n", firmware_ro_start, firmware_ro_end);
     }
 
     if (!firmware_ro_valid)
-        return -1;
+        return firmware_ro_none;
     if (start)
         *start = firmware_ro_start;
     if (end)
