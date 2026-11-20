@@ -2194,6 +2194,29 @@ size_t usb_dwc3_queue(dwc3_dev_t *dev, cdc_acm_pipe_id_t pipe, const void *buf, 
     return sent;
 }
 
+/*
+ * Queue what fits and start the IN transfer, never waiting for the host. For the console and an
+ * HV's vuart: on a high-speed link usb_dwc3_queue() has no timeout, and a pipe the host stopped
+ * draining (no reader, or a bulk-in that never completes) would hold every CPU that then prints
+ * or traps into the vuart (macOS 27.2 guests froze 1-60 s into the boot this way, T8132 11-20).
+ */
+size_t usb_dwc3_queue_nonblocking(dwc3_dev_t *dev, cdc_acm_pipe_id_t pipe, const void *buf,
+                                  size_t count)
+{
+    if (!dev || !dev->pipe[pipe].ready)
+        return 0;
+
+    ringbuffer_t *device2host = dev->pipe[pipe].device2host;
+    if (!device2host)
+        return 0;
+
+    /* No event handling here: the callers' own loops pump events (hv_vuart's update_irq(), the
+     * HV tick, the proxy), under the console lock that keeps them to one CPU at a time. */
+    size_t wrote = ringbuffer_write(buf, count, device2host);
+    usb_dwc3_cdc_start_bulk_in_xfer(dev, dev->pipe[pipe].ep_in);
+    return wrote;
+}
+
 size_t usb_dwc3_write(dwc3_dev_t *dev, cdc_acm_pipe_id_t pipe, const void *buf, size_t count)
 {
     if (!dev)

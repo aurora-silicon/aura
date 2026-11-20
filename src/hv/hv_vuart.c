@@ -26,6 +26,7 @@ static bool vuart_hw_off = false;
 /* With the proxy on CDC, XNU's TX is also copied to DockChannel (always-on, bounded writes): if
  * the CDC link goes away, `macvdmtool debugusb` brings XNU's console back on KIS. */
 static iodev_id_t vuart_tx_mirror = IODEV_MAX;
+static u64 vuart_tx_dropped;
 
 static void update_irq(void)
 {
@@ -111,9 +112,13 @@ static bool handle_vuart(struct exc_info *ctx, u64 addr, u64 *val, bool write, i
                 uint8_t b = *val;
                 /* After a sleep with the link re-taken, the S2R ring feeds the CDC pipe. */
                 bool ringed = sptm_virt_s2r_uart_byte(b);
+                /* Never wait for the host here: a stalled pipe would freeze the guest. */
                 if (!(ringed && vuart_tx_iodev == IODEV_USB_VUART) &&
-                    iodev_can_write(vuart_tx_iodev))
-                    iodev_write(vuart_tx_iodev, &b, 1);
+                    iodev_can_write(vuart_tx_iodev) &&
+                    iodev_write_nonblocking(vuart_tx_iodev, &b, 1) < 1 &&
+                    !(vuart_tx_dropped++ & 0xffff))
+                    printf("HV: vuart TX: the host isn't draining iodev %d, %lu bytes dropped\n",
+                           vuart_tx_iodev, vuart_tx_dropped);
                 if (vuart_tx_mirror != IODEV_MAX && vuart_tx_mirror != vuart_tx_iodev &&
                     iodev_can_write(vuart_tx_mirror))
                     iodev_write(vuart_tx_mirror, &b, 1);
