@@ -265,10 +265,27 @@ int mcc_unmap_carveouts(void)
     // mapped as normal memory.
     if (!mcc_initialized || !mcc_regs[0].tz || !mcc_regs[0].tz->count) {
         static const char *const names[] = {"region-id-4", "region-id-2"};
+        /*
+         * The ADT list is required only where the SoC has an MCC. Every Apple Silicon Mac ADT has
+         * /arm-io/mcc and a /chosen/carveout-memory-map with region-id-2/-4 filled in by iBoot.
+         * Older SoCs that aura also boots (A7-A11, T2) have no /arm-io/mcc node; their carveout
+         * list, if any, is used as far as it goes, and nothing missing there is fatal.
+         */
+        bool required = adt_path_offset(adt, "/arm-io/mcc") >= 0;
         int node = adt_path_offset(adt, "/chosen/carveout-memory-map");
 
-        if (node < 0)
+        if (node < 0) {
+            if (!required) {
+                printf("MMU: no MCC and no ADT carveout-memory-map; no carveouts to unmap\n");
+                return 0;
+            }
+            /*
+             * An MCC without known TZ registers and no ADT list: aura cannot tell where the
+             * firmware-owned TZ memory is, so it cannot keep it out of its own RWX map.
+             */
+            printf("MMU: no MCC TZ registers and no ADT carveout-memory-map\n");
             return -1;
+        }
         if (mem_size_actual > UINT64_MAX - ram_base)
             return -1;
         for (size_t i = 0; i < ARRAY_SIZE(names); i++) {
@@ -276,15 +293,25 @@ int mcc_unmap_carveouts(void)
             const u64 *range = adt_getprop(adt, node, names[i], &len);
             u64 start, size;
 
-            if (!range || len != 2 * sizeof(u64))
-                return -1;
+            if (!range || len != 2 * sizeof(u64)) {
+                printf("MMU: ADT carveout-memory-map has no usable %s%s\n", names[i],
+                       required ? "" : " (no MCC; skipped)");
+                if (required)
+                    return -1;
+                continue;
+            }
             memcpy(&start, range, sizeof(start));
             memcpy(&size, range + 1, sizeof(size));
             if (!size || start < ram_base || start > UINT64_MAX - size ||
                 start + size > ram_base + mem_size_actual ||
                 ((start | size) & (get_page_size() - 1)) ||
-                mcc_carveout_count >= ARRAY_SIZE(mcc_carveouts) - 1)
-                return -1;
+                mcc_carveout_count >= ARRAY_SIZE(mcc_carveouts) - 1) {
+                printf("MMU: ADT %s 0x%lx+0x%lx is outside RAM or unaligned%s\n", names[i], start,
+                       size, required ? "" : " (no MCC; skipped)");
+                if (required)
+                    return -1;
+                continue;
+            }
 
             printf("MMU: Unmapping %s at 0x%lx..0x%lx\n", names[i], start, start + size);
             mmu_rm_mapping(start, size);
@@ -737,8 +764,12 @@ int mcc_init(void)
     int node = adt_path_offset_trace(adt, "/arm-io/mcc", path);
 
     if (node < 0) {
-        printf("MCC: MCC node not found!\n");
-        return -1;
+        /*
+         * No MCC in the ADT (A7-A11, T2): nothing to initialize here. mcc_unmap_carveouts() then
+         * uses whatever carveout list the ADT has, without requiring one.
+         */
+        printf("MCC: no /arm-io/mcc in the ADT; no MCC on this SoC\n");
+        return MCC_ABSENT;
     }
 
     if (adt_is_compatible(adt, node, "mcc,t8103")) {
@@ -764,7 +795,12 @@ int mcc_init(void)
     } else if (adt_is_compatible(adt, node, "mcc,t6031")) {
         return mcc_init_m3(node, path);
     } else {
+        /*
+         * An MCC revision aura has no driver for: no cache control and no TZ registers. This is
+         * not a failure of a known block; carveouts then come from the ADT list, which
+         * mcc_unmap_carveouts() requires.
+         */
         printf("MCC: Unsupported version:%s\n", adt_get_property(adt, node, "compatible")->value);
-        return -1;
+        return MCC_UNSUPPORTED;
     }
 }

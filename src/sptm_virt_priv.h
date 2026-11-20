@@ -103,9 +103,13 @@ void sptm_virt_mmio_rw(u64 addr, u64 *val, bool write, int width);
 extern volatile bool sptm_virt_s2r_quiet;
 void sptm_virt_s2r_setup(bool cdc);
 void sptm_virt_s2r_wake(int cpu);
+bool sptm_virt_s2r_restarted_in_sleep(int cpu);
+extern u32 sptm_virt_s2r_early_s2;
+void sptm_virt_s2r_early_release(void);
 void sptm_virt_s2r_xnu_entry(int cpu, u64 target);
 void sptm_virt_s2r_note(struct exc_info *ctx, u64 addr, u64 val, bool write, int width);
 void sptm_virt_s2r_dump_tail(u64 n);
+void sptm_virt_s2r_dump_prio(u64 near, u64 far);
 void sptm_virt_s2r_wd_stopped(void);
 bool sptm_virt_s2r_wfi(u64 *regs, u64 esr);
 

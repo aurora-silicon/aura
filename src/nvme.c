@@ -27,7 +27,14 @@
 
 static u32 nvme_cmd_timeout_us = NVME_TIMEOUT;
 
-#define NVME_CC             0x14
+/* NVMe Base Specification 2.0, 3.1.4.1: CAP.MPSMIN, the smallest host memory page size. */
+#define NVME_CAP        0x00
+#define NVME_CAP_MPSMIN GENMASK(51, 48)
+
+#define NVME_CC 0x14
+/* 3.1.4.5: CC.MPS, host memory page size 2^(12 + MPS); PRP entries use it (4.1.1). */
+#define NVME_CC_MPS         GENMASK(10, 7)
+#define NVME_CC_MPS_4K      0
 #define NVME_CC_SHN         GENMASK(15, 14)
 #define NVME_CC_SHN_NONE    0
 #define NVME_CC_SHN_NORMAL  1
@@ -181,6 +188,8 @@ static struct nvme_queue adminq, ioq;
 static bool nvme_cmd_timed_out;
 static bool nvme_multi_enabled = true;
 static bool nvme_multi_verified;
+/* Multi-block reads served one block at a time after the multi-block path was turned off. */
+static u32 nvme_multi_fallback_reads;
 static u64 *nvme_prp_list;
 static u8 *nvme_verify_bounce;
 
@@ -438,6 +447,19 @@ bool nvme_post_m4(void)
                          adt_get_property(adt, node, "nvme-secure-reg-layout"));
 }
 
+/* ANS is powered through its own storage gates (pcie_ans_power_off()), not the APCIe block. */
+static bool nvme_ans_storage_gated(void)
+{
+    return chip_id == T6050 || chip_id == T8142;
+}
+
+/* An adopted session has no RTKit instance of this stage's until it is powered off or quiesced. */
+static bool nvme_own_rtkit(void)
+{
+    return nvme_rtkit ||
+           (nvme_rtkit = rtkit_init("nvme", nvme_asc, NULL, NULL, nvme_sart, false)) != NULL;
+}
+
 /*
  * Post-M4, done with ANS: stop the controller, idle the firmware as macOS does before a sleep,
  * keep the SART entries, then power ANS and the PCIe block it runs on off. Every later stage that
@@ -447,14 +469,17 @@ bool nvme_post_m4(void)
  */
 static bool nvme_ans_power_off(void)
 {
-    /* An adopted session has no RTKit instance of this stage's until it is powered off. */
-    if (!nvme_rtkit && !(nvme_rtkit = rtkit_init("nvme", nvme_asc, NULL, NULL, nvme_sart, false)))
+    if (!nvme_own_rtkit())
         return false;
     if (chip_id == T6050) {
         if ((read32(nvme_base + NVME_CC) & NVME_CC_EN) && !nvme_ctrl_suspend())
             printf("nvme: controller suspend timed out\n");
     } else if (read32(nvme_base + NVME_CC) & NVME_CC_EN) {
-        if (nvme_wrote && !nvme_ctrl_shutdown())
+        /*
+         * T8142: the firmware's context is saved by the normal shutdown, which an adopted
+         * session's idle (its RTKit started elsewhere) may not acknowledge before the stop.
+         */
+        if ((nvme_wrote || chip_id == T8142) && !nvme_ctrl_shutdown())
             printf("nvme: controller shutdown timed out\n");
         if (!nvme_ctrl_disable())
             printf("nvme: controller disable timed out\n");
@@ -527,6 +552,7 @@ bool nvme_init(void)
     memset(&ioq, 0, sizeof(ioq));
     nvme_multi_enabled = true;
     nvme_multi_verified = false;
+    nvme_multi_fallback_reads = 0;
     nvme_prp_list = NULL;
     nvme_verify_bounce = NULL;
     nvme_boot_ticks = 0;
@@ -649,8 +675,9 @@ bool nvme_init(void)
         /*
          * T6050: adopt a healthy session as it is. Left 16 s (an ESP Stage 2 behind its host
          * window), its firmware no longer acknowledged the idle, and ANS didn't start from off.
+         * T8142 does the same with a session an older stage handed on running.
          */
-        adopted = earlier && chip_id == T6050 &&
+        adopted = earlier && nvme_ans_storage_gated() &&
                   read32(nvme_base + NVME_BOOT_STATUS) == NVME_BOOT_STATUS_OK &&
                   !(read32(nvme_base + NVME_CSTS) & NVME_CSTS_CFS);
         from_off = !running || (earlier && !adopted);
@@ -704,6 +731,25 @@ setup_controller:
         printf("nvme: timeout while waiting for CSTS.RDY to clear\n");
         goto out_shutdown;
     }
+    /*
+     * The PRPs nvme_read_blocks() builds describe 4 KiB memory pages: PRP2 is the second page,
+     * or a list of 4 KiB page addresses. The controller reads them in CC.MPS pages, and CC keeps
+     * whatever the previous owner wrote, so set 4 KiB here, while CC.EN is clear (3.1.4.5), as
+     * Linux does. A controller that can't take 4 KiB pages (CAP.MPSMIN) gets single-block
+     * reads only: a 4 KiB transfer at a 4 KiB-aligned PRP1 fits any page size.
+     */
+    u64 cap = nvme_read64_lo_hi(nvme_base + NVME_CAP);
+    u32 cc = read32(nvme_base + NVME_CC);
+    if (FIELD_GET(NVME_CAP_MPSMIN, cap)) {
+        printf("nvme: CAP 0x%lx: MPSMIN %lu is above 4 KiB pages; reading one block per "
+               "command\n",
+               cap, FIELD_GET(NVME_CAP_MPSMIN, cap));
+        nvme_multi_enabled = false;
+    } else if (FIELD_GET(NVME_CC_MPS, cc) != NVME_CC_MPS_4K) {
+        printf("nvme: CC.MPS was %u (%u KiB pages) from the previous owner; setting 4 KiB\n",
+               (u32)FIELD_GET(NVME_CC_MPS, cc), 4u << (u32)FIELD_GET(NVME_CC_MPS, cc));
+        mask32(nvme_base + NVME_CC, NVME_CC_MPS, FIELD_PREP(NVME_CC_MPS, NVME_CC_MPS_4K));
+    }
     write64_lo_hi(nvme_qreg(NVME_ASQ), (u64)adminq.cmds);
     write64_lo_hi(nvme_qreg(NVME_ACQ), (u64)adminq.cqes);
     write32(nvme_qreg(NVME_AQA), ((NVME_QUEUE_SIZE - 1) << 16) | (NVME_QUEUE_SIZE - 1));
@@ -716,7 +762,7 @@ setup_controller:
                "BOOT_STATUS=0x%x\n",
                read32(nvme_base + NVME_CC), read32(nvme_base + NVME_CSTS),
                read32(nvme_base + NVME_BOOT_STATUS));
-        if (earlier && !restarted && chip_id == T6050) {
+        if (earlier && !restarted && nvme_ans_storage_gated()) {
             restarted = true;
             if (!nvme_ans_power_off() || !nvme_ans_power_on())
                 goto out_preserve;
@@ -882,6 +928,9 @@ bool nvme_shutdown(void)
         // nvme_ensure_shutdown();
         return true;
     }
+    if (nvme_multi_fallback_reads)
+        printf("nvme: %u multi-block reads were served one block per command\n",
+               nvme_multi_fallback_reads);
 
     /* A failed queue can still own DMA even when the controller looks ready. */
     if (nvme_type == NVME_T8132 && (adminq.failed || ioq.failed))
@@ -959,7 +1008,7 @@ bool nvme_shutdown(void)
          * nor restarts a stopped ANS. Quiesce RTKit and leave the ASC running, as iBoot does. */
         write64_lo_hi(nvme_qreg(NVME_IOQ_CMDS), 0);
         write64_lo_hi(nvme_qreg(NVME_IOQ_CQES), 0);
-        if (!rtkit_quiesce(nvme_rtkit))
+        if (!nvme_own_rtkit() || !rtkit_quiesce(nvme_rtkit))
             goto out_preserve;
         nvme_initialized = false;
         printf("nvme: controller disabled, RTKit quiesced\n");
@@ -1107,6 +1156,7 @@ bool nvme_read_blocks(u32 nsid, u64 lba, void *buffer, u32 count)
         if (count > 2 && !nvme_prp_list)
             nvme_prp_list = memalign(SZ_16K, SZ_4K);
         if (nvme_verify_bounce && (count <= 2 || nvme_prp_list)) {
+            /* NVMe 2.0 4.1.1: PRP1 is the first page; PRP2 the second, or a PRP list. */
             u64 prp2 = (u64)buffer + SZ_4K;
             if (count > 2) {
                 for (u32 i = 1; i < count; i++)
@@ -1115,7 +1165,11 @@ bool nvme_read_blocks(u32 nsid, u64 lba, void *buffer, u32 count)
             }
             if (!nvme_multi_verified)
                 memset(buffer, 0xa5, (size_t)count * SZ_4K);
-            if (nvme_submit_read(nsid, lba, buffer, count, prp2)) {
+            if (!nvme_submit_read(nsid, lba, buffer, count, prp2)) {
+                /* The failed command's status is printed by nvme_exec_command(). */
+                printf("nvme: %u-block read at LBA 0x%lx failed%s\n", count, lba,
+                       nvme_multi_verified ? " after earlier reads verified" : "");
+            } else {
                 if (nvme_multi_verified)
                     return true;
 
@@ -1124,8 +1178,21 @@ bool nvme_read_blocks(u32 nsid, u64 lba, void *buffer, u32 count)
                 for (u32 i = 0; i < 2; i++) {
                     u32 block = i ? count - 1 : 0;
                     memset(nvme_verify_bounce, 0x5a, SZ_4K);
-                    if (!nvme_submit_read(nsid, lba + block, nvme_verify_bounce, 1, 0) ||
-                        memcmp(nvme_verify_bounce, bytes + (size_t)block * SZ_4K, SZ_4K)) {
+                    if (!nvme_submit_read(nsid, lba + block, nvme_verify_bounce, 1, 0)) {
+                        printf("nvme: single-block read of LBA 0x%lx for the check failed\n",
+                               lba + block);
+                        verified = false;
+                        break;
+                    }
+                    const u8 *got = bytes + (size_t)block * SZ_4K;
+                    if (memcmp(nvme_verify_bounce, got, SZ_4K)) {
+                        u32 off = 0;
+                        while (got[off] == nvme_verify_bounce[off])
+                            off++;
+                        printf("nvme: %u-block read at LBA 0x%lx: block %u (LBA 0x%lx) differs "
+                               "from a single-block read at byte 0x%x (0x%02x, want 0x%02x)\n",
+                               count, lba, block, lba + block, off, got[off],
+                               nvme_verify_bounce[off]);
                         verified = false;
                         break;
                     }
@@ -1138,10 +1205,15 @@ bool nvme_read_blocks(u32 nsid, u64 lba, void *buffer, u32 count)
             }
             if (nvme_cmd_timed_out)
                 return false;
-            printf("nvme: multi-block read failed verification; using single blocks\n");
+            printf("nvme: multi-block reads OFF for this boot; reading one block per command\n");
+            nvme_multi_enabled = false;
+        } else {
+            printf("nvme: no memory for the PRP list; reading one block per command\n");
             nvme_multi_enabled = false;
         }
     }
+    if (count > 1 && !nvme_multi_enabled)
+        nvme_multi_fallback_reads++;
 
     u8 *bytes = buffer;
     for (u32 i = 0; i < count; i++) {

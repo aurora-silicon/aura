@@ -269,6 +269,10 @@ void exc_sync(u64 *regs)
     bool in_gl = in_gl12();
     bool el3 = in_el3();
 
+#ifdef SPTM_VIRT
+    sptm_virt_crumb_fault();
+    sptm_virt_park_check();
+#endif
     /* One of the virtualized SPTM's fault-tolerant reads faulted: skip it. */
     if (sptm_virt_peek_fault(in_gl))
         return;
@@ -400,6 +404,12 @@ void exc_sync(u64 *regs)
     exc_last_esr = esr;
     exc_last_afsr1 = (in_gl || el3) ? 0 : mrs(SYS_AFSR1_EL1);
 
+    /*
+     * GUARD_RETURN clears exc_guard below. Latch GUARD_SILENT first, or a silent probe that
+     * returns still prints "Recovering from exception".
+     */
+    bool silent = exc_guard & GUARD_SILENT;
+
     switch (exc_guard & GUARD_TYPE_MASK) {
         case GUARD_SKIP:
             elr += 4;
@@ -423,7 +433,7 @@ void exc_sync(u64 *regs)
 
     exc_count++;
 
-    if (!(exc_guard & GUARD_SILENT))
+    if (!silent)
         printf("Recovering from exception (ELR=0x%lx)\n", elr);
     if (in_gl)
         msr(SYS_IMP_APL_ELR_GL1, elr);
@@ -438,6 +448,9 @@ void exc_sync(u64 *regs)
 
 void exc_irq(u64 *regs)
 {
+#ifdef SPTM_VIRT
+    sptm_virt_park_check();
+#endif
 #ifdef SPTM_VIRT
     if (nv2_handle_async(regs, 1))
         return;
@@ -461,6 +474,9 @@ void exc_irq(u64 *regs)
 
 void exc_fiq(u64 *regs)
 {
+#ifdef SPTM_VIRT
+    sptm_virt_park_check();
+#endif
 #ifdef SPTM_VIRT
     /* aura's own sampling timer while a core is still inside SPTM. */
     if (sptm_virt_sample_fiq(regs))
@@ -573,6 +589,9 @@ void exc_fiq(u64 *regs)
 
 void exc_serr(u64 *regs)
 {
+#ifdef SPTM_VIRT
+    sptm_virt_park_check();
+#endif
 #ifdef SPTM_VIRT
     if (nv2_handle_async(regs, 3))
         return;

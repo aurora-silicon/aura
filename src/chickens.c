@@ -110,6 +110,17 @@ const struct midr_part_features features_m3 = {
     .counter_redirect = true,
 };
 
+/*
+ * SIQ_CFG_EL1 on M4 and later: with no write only the boot CPU accepts AIC IRQs, so every device
+ * interrupt wakes CPU0 and its cluster whichever core is waiting for it. The native OS's kernel
+ * writes 0 to SIQ_CFG_EL1 on every CPU as it starts, so each running CPU accepts device interrupts
+ * and the AIC picks one; route 0 matches it. The register belongs to the core (MIDR part), not the
+ * SoC: aura writes it on M1-M3 and on the M4 Pro/Max (Brava) and M5 Pro/Max (Sotra) cores, so the
+ * other cores of those generations, M4 (Donan), A18 Pro (Tahiti) and M5 (Hidra), have it too. All
+ * of these SoCs have an AIC3 (ADT compatible "aic,3"). M6 (features_m6) is left out: no M6 core
+ * writes the register yet.
+ */
+
 // XXX figure out what features are actually available on M4
 const struct midr_part_features features_m4 = {
     .sleep_mode = SLEEP_NONE, // XXX probably new mode required
@@ -119,15 +130,12 @@ const struct midr_part_features features_m4 = {
     .mmu_sprr = true,
 #endif
     .fast_ipi = true,
+    .siq_cfg = SIQ_CFG_ROUTE_0,
     .actlr_el2 = true,
     .unsafe_wfi = true,
 };
 
-/*
- * M4 Pro/Max: as M4, and every core accepts AIC IRQs. With no SIQ_CFG_EL1 write only the boot
- * CPU takes them, so every device interrupt wakes CPU0 and its cluster whichever core is waiting
- * for it. Route 0 lets the AIC pick a running CPU, as on M5 Pro/Max below.
- */
+/* M4 Pro/Max: as M4, AIC IRQs on every core (route 0, see above). */
 const struct midr_part_features features_m4_pro = {
     .sleep_mode = SLEEP_NONE,
     .fast_ipi = true,
@@ -136,11 +144,7 @@ const struct midr_part_features features_m4_pro = {
     .unsafe_wfi = true,
 };
 
-/*
- * M5 Pro/Max/Ultra (Sotra cores): as M4, and every core accepts AIC IRQs. Without a SIQ_CFG_EL1
- * write only the boot CPU takes them. The native OS's kernel writes 0 to SIQ_CFG_EL1 on every CPU
- * as it starts, so each running CPU accepts device interrupts and the AIC picks one; 0 matches it.
- */
+/* M5 Pro/Max/Ultra (Sotra cores): as M4, AIC IRQs on every core (route 0, see above). */
 const struct midr_part_features features_m5_sotra = {
     .sleep_mode = SLEEP_NONE,
     .fast_ipi = true,
@@ -276,15 +280,13 @@ void init_cpu(void)
     if (cpu_features->siq_cfg
 #ifdef SPTM_VIRT
         /*
-         * The M4 Pro/Max route-0 AIC-IRQ setting (features_m4_pro) is a bare-metal tuning.
-         * Writing SIQ_CFG_EL1 on a secondary just after its first guest SPTM entry stalls XNU
-         * on T6040/T6041 under the virtualized SPTM, so on a guest boot keep iBoot's value and
-         * let the native kernel choose its own routing. This is keyed on the live guest-boot
-         * path, not the build flag, so a mixed build still serves Linux bare metal unchanged;
-         * other SoCs (A18 Pro keeps features_m4, M5 Pro/Max keeps features_m5_sotra) are
-         * untouched.
+         * The route written here is for the OS aura boots on bare metal. Writing SIQ_CFG_EL1 on
+         * a secondary just after its first guest SPTM entry stalls XNU (seen on T6040/T6041),
+         * and the guest's kernel programs SIQ_CFG_EL1 on every CPU itself, so on a guest boot
+         * keep iBoot's value on every chip. This is keyed on the live guest-boot path, not the
+         * build flag, so a mixed build still serves Linux bare metal unchanged.
          */
-        && !(sptm_virt_guest_live && cpu_features == &features_m4_pro)
+        && !sptm_virt_guest_live
 #endif
     ) {
         // Enable IRQs (at least necessary on t600x)
