@@ -23,13 +23,14 @@ def test_cpu_features_match_the_c_struct(tmp_path):
         re.search(r"enum cpufeat_uncore_version \{.*?\};", header, re.S).group(0),
         re.search(r"struct midr_part_features \{.*?\n\};", header, re.S).group(0),
     ]
-    fields = re.findall(r"^\s+(?:enum \w+|bool) (\w+);", blocks[2], re.M)
+    fields = re.findall(r"^\s+(?:enum \w+|bool|u8) (\w+);", blocks[2], re.M)
     prints = "".join(
         f'    printf("{name} %zu\\n", offsetof(struct midr_part_features, {name}));\n'
         for name in fields
     )
     source = (
-        "#include <stdbool.h>\n#include <stddef.h>\n#include <stdio.h>\n"
+        "#include <stdbool.h>\n#include <stddef.h>\n#include <stdint.h>\n#include <stdio.h>\n"
+        + "typedef uint8_t u8;\n"
         + "\n".join(blocks)
         + "\nint main(void)\n{\n"
         + '    printf("size %zu\\n", sizeof(struct midr_part_features));\n'

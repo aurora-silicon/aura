@@ -2986,7 +2986,9 @@ struct g17_soc {
     const char *name;             /* for the log */
     u32 count;                    /* perf-state-count, also the number of OPP entries */
     u32 num_states;               /* gpu-num-perf-states */
+    u32 tables;                   /* perf-state-table-count, 0 for 1; OPPs from the first */
     bool firmware_data;           /* also hand over gfx-data/gfx1-data (the firmware __DATA) */
+    bool data_span;               /* gfx-data..gfx1-data end as /reserved-memory/gpu-fw-data */
     bool (*firmware_known)(void); /* when true, /chosen gets firmware_profile_prop */
     const char *firmware_profile_prop;
     const char *firmware_profile;
@@ -2998,6 +3000,7 @@ static const struct g17_soc g17_soc_t8140 = {
     .name = "T8140",
     .count = 16,
     .num_states = 15,
+    .data_span = true,
 };
 
 /*
@@ -3063,6 +3066,16 @@ static const struct g17_soc g17_soc_t8142 = {
     .firmware_profile = T8142_GPU_FIRMWARE_PROFILE,
 };
 
+/* M5 Max (G17C): four perf-state tables, the OPPs from the first, as m1n1 hands it over. */
+static const struct g17_soc g17_soc_t6050 = {
+    .compat = "apple,agx-t6050",
+    .adt_compat = "gpu,t6050",
+    .name = "T6050",
+    .count = 14,
+    .num_states = 13,
+    .tables = 4,
+};
+
 /*
  * macOS 27.0's M5 GPU firmware gives each role a __DATA_SHARED_RO segment, where it keeps its
  * crash log, and iBoot places it right after that role's __DATA (sgx gfx-data-shared-ro and
@@ -3099,6 +3112,102 @@ apart:
     return 0;
 }
 
+/*
+ * On T8140, iBoot loads both roles' __DATA back to back (sgx gfx-data, then gfx1-data), and each
+ * role's firmware keeps its RTKit crash log in its own __DATA: the crash log requests name a
+ * physical address there. A DT with a /reserved-memory/gpu-fw-data node gets the span of both as
+ * that node's reg, which the DT keeps no-map, so the kernel can map the log the firmware asks for.
+ * The region is not needed to run the GPU: ADT data that is missing, unaligned, apart, or on
+ * another enabled reserved-memory node leaves the node as the DT has it (disabled), and the GPU
+ * setup goes on. Only an FDT write error fails.
+ */
+static int g17_set_data_span(void *dt, int sgx)
+{
+    static const char *const data[2] = {"gfx-data", "gfx1-data"};
+    static const char path[] = "/reserved-memory/gpu-fw-data";
+    u64 base[2], size[2];
+
+    int node = fdt_path_offset(dt, path);
+    if (node < 0)
+        return 0;
+    for (int i = 0; i < 2; i++) {
+        char prop[64];
+        snprintf(prop, sizeof(prop), "%s-base", data[i]);
+        bool ok = ADT_GETPROP(adt, sgx, prop, &base[i]) == sizeof(u64);
+        snprintf(prop, sizeof(prop), "%s-size", data[i]);
+        ok = ok && ADT_GETPROP(adt, sgx, prop, &size[i]) == sizeof(u64);
+        if (!ok || !base[i] || !size[i] || ((base[i] | size[i]) & (SZ_16K - 1)) ||
+            base[i] > UINT64_MAX - size[i]) {
+            printf("FDT: GPU: no valid %s in the ADT, leaving %s disabled\n", data[i], path);
+            return 0;
+        }
+    }
+    if (base[1] != base[0] + size[0]) {
+        printf("FDT: GPU: firmware data segments are not contiguous, leaving %s disabled\n", path);
+        return 0;
+    }
+    u64 start = base[0], end = base[1] + size[1];
+
+    int resv = fdt_parent_offset(dt, node), other;
+    fdt_for_each_subnode(other, dt, resv)
+    {
+        const char *status = fdt_getprop(dt, other, "status", NULL);
+        if (other == node || (status && strcmp(status, "okay") && strcmp(status, "ok")))
+            continue;
+        int len;
+        const fdt64_t *reg = fdt_getprop(dt, other, "reg", &len);
+        for (int k = 0; reg && (k + 2) * (int)sizeof(*reg) <= len; k += 2) {
+            u64 b = fdt64_ld(&reg[k]), sz = fdt64_ld(&reg[k + 1]);
+            if (sz && b < end && start < b + sz) {
+                printf("FDT: GPU: firmware data 0x%lx..0x%lx overlaps /reserved-memory/%s, "
+                       "leaving %s disabled\n",
+                       start, end, fdt_get_name(dt, other, NULL), path);
+                return 0;
+            }
+        }
+    }
+
+    printf("FDT: GPU: firmware data (gfx-data, gfx1-data) 0x%lx..0x%lx\n", start, end);
+    return dt_set_resvmem(dt, path, start, end - start);
+}
+
+/*
+ * iBoot loads the primary's and the secondary's __TEXT back to back (gfx-asc and gfx1-asc
+ * segment-ranges, __TEXT first), at an address that depends on the macOS release (27.0 and 27.2
+ * differ by 64 KiB on T8142). A DT with a /reserved-memory/fw-text node, which Linux uses to
+ * identify the firmware build before it starts it, gets the span iBoot used. TEXT placed apart
+ * leaves the node as the DT has it.
+ */
+static int g17_set_fw_text(void *dt)
+{
+    static const char *const asc[2] = {"/arm-io/gfx-asc", "/arm-io/gfx1-asc"};
+    static const char path[] = "/reserved-memory/fw-text";
+    u64 text_base[2], text_size[2];
+
+    if (fdt_path_offset(dt, path) < 0)
+        return 0;
+    for (int i = 0; i < 2; i++) {
+        int node = adt_path_offset(adt, asc[i]);
+        if (node < 0)
+            return 0;
+        u32 len = 0;
+        const struct adt_segment_ranges *seg = adt_getprop(adt, node, "segment-ranges", &len);
+        const char *names = adt_getprop(adt, node, "segment-names", NULL);
+        if (!seg || len < sizeof(*seg) || !names || strncmp(names, "__TEXT;", 7))
+            return 0;
+        text_base[i] = seg[0].phys;
+        text_size[i] = seg[0].size;
+        if (!text_base[i] || !text_size[i] || (text_base[i] & (SZ_16K - 1)) ||
+            (text_size[i] & (SZ_16K - 1)))
+            return 0;
+    }
+    if (text_base[0] + text_size[0] != text_base[1]) {
+        printf("FDT: GPU: firmware text segments are not contiguous, leaving %s\n", path);
+        return 0;
+    }
+    return dt_set_resvmem(dt, path, text_base[0], text_size[0] + text_size[1]);
+}
+
 static int dt_set_gpu_g17(void *dt, const struct g17_soc *soc)
 {
     int gpu = fdt_path_offset(dt, "gpu");
@@ -3114,13 +3223,14 @@ static int dt_set_gpu_g17(void *dt, const struct g17_soc *soc)
     if (sgx < 0 || ADT_GETPROP(adt, sgx, "perf-state-count", &count) != sizeof(count) ||
         ADT_GETPROP(adt, sgx, "gpu-num-perf-states", &num_states) != sizeof(num_states) ||
         ADT_GETPROP(adt, sgx, "perf-state-table-count", &tables) != sizeof(tables) ||
-        count != soc->count || num_states != soc->num_states || tables != 1)
+        count != soc->count || num_states != soc->num_states ||
+        tables != (soc->tables ? soc->tables : 1))
         goto disable;
     states = adt_getprop(adt, sgx, "perf-states", &len);
-    if (!states || len != count * sizeof(*states))
+    if (!states || len != tables * count * sizeof(*states))
         goto disable;
     sram = adt_getprop(adt, sgx, "perf-states-sram", &len);
-    if (!sram || len != count * sizeof(*sram))
+    if (!sram || len != tables * count * sizeof(*sram))
         goto disable;
     for (u32 i = 0; i < count; i++)
         if (states[i].volt > UINT32_MAX / 1000)
@@ -3186,7 +3296,11 @@ static int dt_set_gpu_g17(void *dt, const struct g17_soc *soc)
             goto disable;
     /* gfx-data and gfx1-data are the last two regions. */
     if (soc->firmware_data &&
-        g17_set_fw_data(dt, sgx, &base[ARRAY_SIZE(regions) - 2], &size[ARRAY_SIZE(regions) - 2]))
+        (g17_set_fw_data(dt, sgx, &base[ARRAY_SIZE(regions) - 2], &size[ARRAY_SIZE(regions) - 2]) ||
+         g17_set_fw_text(dt)))
+        goto disable;
+    /* After the UAT regions, which it must not overlap */
+    if (soc->data_span && g17_set_data_span(dt, sgx))
         goto disable;
 
     if (soc->firmware_known) {
@@ -3485,6 +3599,56 @@ static const struct {
     {NULL, "/reserved-memory/gpu-fw-text"},
 };
 
+/*
+ * T6040/T6041 GPU firmware segments. /arm-io/gfx-asc segment-ranges lists __TEXT, then __DATA.
+ * Firmware with a __DATA_SHARED_RO segment (the 27.2 GPU firmware) lists it third: iBoot places
+ * it right after __DATA, identity-mapped, describes it on /arm-io/sgx as
+ * gfx-data-shared-ro-{base,size}, and gives no shared RW segment. The layout is chosen by that
+ * ADT shape, not by the chip or the firmware version, and any other shape is refused. gpu-fw-data
+ * reserves __DATA and that tail as one region.
+ */
+struct t604x_gpu_fw {
+    u64 text_base, text_size;
+    u64 data_base, data_size;
+    u64 ro_size; /* __DATA_SHARED_RO right after __DATA, or 0 */
+};
+
+static int t604x_gpu_fw_segments(int sgx, struct t604x_gpu_fw *fw)
+{
+    u32 len;
+    int asc = adt_path_offset(adt, "/arm-io/gfx-asc");
+    if (asc < 0)
+        return -1;
+    const struct adt_segment_ranges *seg = adt_getprop(adt, asc, "segment-ranges", &len);
+    if (!seg || (len != 2 * sizeof(*seg) && len != 3 * sizeof(*seg)))
+        return -1;
+    fw->text_base = seg[0].phys;
+    fw->text_size = seg[0].size;
+    fw->data_base = seg[1].phys;
+    fw->data_size = seg[1].size;
+    fw->ro_size = 0;
+    if (!fw->data_size || (fw->data_size & (SZ_16K - 1)) ||
+        fw->data_base > UINT64_MAX - fw->data_size)
+        return -1;
+    if (len == 2 * sizeof(*seg))
+        return 0;
+
+    u64 ro_base, ro_size, rw;
+    if (ADT_GETPROP(adt, sgx, "gfx-data-shared-ro-base", &ro_base) != sizeof(u64) ||
+        ADT_GETPROP(adt, sgx, "gfx-data-shared-ro-size", &ro_size) != sizeof(u64) || !ro_size ||
+        (ro_size & (SZ_16K - 1)) || ro_base != fw->data_base + fw->data_size ||
+        ro_size > UINT64_MAX - ro_base || seg[2].phys != ro_base || seg[2].remap != ro_base ||
+        seg[2].size != ro_size)
+        return -1;
+    static const char *const rw_props[2] = {"gfx-data-shared-rw-base", "gfx-data-shared-rw-size"};
+    for (int i = 0; i < 2; i++)
+        if (adt_getprop(adt, sgx, rw_props[i], NULL) &&
+            (ADT_GETPROP(adt, sgx, rw_props[i], &rw) != sizeof(u64) || rw))
+            return -1;
+    fw->ro_size = ro_size;
+    return 0;
+}
+
 static int dt_set_gpu_t6040(void *dt)
 {
     int gpu = fdt_path_offset(dt, "gpu");
@@ -3559,11 +3723,8 @@ static int dt_set_gpu_t6040(void *dt)
         goto disable;
     }
 
-    int asc = adt_path_offset(adt, "/arm-io/gfx-asc");
-    if (asc < 0)
-        goto disable;
-    const struct adt_segment_ranges *segments = adt_getprop(adt, asc, "segment-ranges", &len);
-    if (!segments || len != 2 * sizeof(*segments))
+    struct t604x_gpu_fw fw;
+    if (t604x_gpu_fw_segments(sgx, &fw))
         goto disable;
 
     /* The reserved regions, the OPP tables and the GPU node must all take the fill. */
@@ -3578,8 +3739,14 @@ static int dt_set_gpu_t6040(void *dt)
             if (ADT_GETPROP(adt, sgx, prop, &region_size[i]) != sizeof(u64))
                 goto disable;
         } else {
-            region_base[i] = segments[0].phys;
-            region_size[i] = segments[0].size;
+            region_base[i] = fw.text_base;
+            region_size[i] = fw.text_size;
+        }
+        /* gpu-fw-data is __DATA, and the __DATA_SHARED_RO tail when the firmware has one. */
+        if (i == 4) {
+            if (region_base[4] != fw.data_base || region_size[4] != fw.data_size)
+                goto disable;
+            region_size[4] += fw.ro_size;
         }
         if (!region_base[i] || !region_size[i] || (region_base[i] & (SZ_16K - 1)) ||
             (region_size[i] & (SZ_16K - 1)) || region_base[i] > UINT64_MAX - region_size[i] ||
@@ -3591,8 +3758,6 @@ static int dt_set_gpu_t6040(void *dt)
                 region_base[j] < region_base[i] + region_size[i])
                 goto disable;
     }
-    if (segments[1].phys != region_base[4] || segments[1].size != region_size[4])
-        goto disable;
     int table =
         t6040_opp_table(dt, gpu, "operating-points-v2", count, T6040_CLUSTERS * sizeof(u32));
     if (table < 0 || t6040_opp_table(dt, gpu, "apple,cs-opp", aux[0]->count, sizeof(u32)) < 0 ||
@@ -3808,11 +3973,8 @@ static int dt_set_gpu_t6041(void *dt)
                 goto disable;
     }
 
-    int asc = adt_path_offset(adt, "/arm-io/gfx-asc");
-    if (asc < 0)
-        goto disable;
-    const struct adt_segment_ranges *segments = adt_getprop(adt, asc, "segment-ranges", &len);
-    if (!segments || len != 2 * sizeof(*segments))
+    struct t604x_gpu_fw fw;
+    if (t604x_gpu_fw_segments(sgx, &fw))
         goto disable;
 
     u64 region_base[ARRAY_SIZE(t6040_regions)], region_size[ARRAY_SIZE(t6040_regions)];
@@ -3826,8 +3988,14 @@ static int dt_set_gpu_t6041(void *dt)
             if (ADT_GETPROP(adt, sgx, prop, &region_size[i]) != sizeof(u64))
                 goto disable;
         } else {
-            region_base[i] = segments[0].phys;
-            region_size[i] = segments[0].size;
+            region_base[i] = fw.text_base;
+            region_size[i] = fw.text_size;
+        }
+        /* gpu-fw-data is __DATA, and the __DATA_SHARED_RO tail when the firmware has one. */
+        if (i == 4) {
+            if (region_base[4] != fw.data_base || region_size[4] != fw.data_size)
+                goto disable;
+            region_size[4] += fw.ro_size;
         }
         if (!region_base[i] || !region_size[i] || (region_base[i] & (SZ_16K - 1)) ||
             (region_size[i] & (SZ_16K - 1)) || region_base[i] > UINT64_MAX - region_size[i] ||
@@ -3839,8 +4007,6 @@ static int dt_set_gpu_t6041(void *dt)
                 region_base[j] < region_base[i] + region_size[i])
                 goto disable;
     }
-    if (segments[1].phys != region_base[4] || segments[1].size != region_size[4])
-        goto disable;
     int table =
         t6040_opp_table(dt, gpu, "operating-points-v2", count, T6041_CLUSTERS * sizeof(u32));
     if (table < 0 || t6040_opp_table(dt, gpu, "apple,cs-opp", aux[0]->count, sizeof(u32)) < 0 ||
@@ -3892,28 +4058,37 @@ disable:
 }
 
 /*
- * T6050 G17S (M5 Pro, J714s) on the 27.0 firmware. iBoot loads both roles' __TEXT back to back,
- * their __DATA and __DATA_SHARED_RO in one run, and leaves the UAT ranges empty: each role
- * publishes its kernel root while it boots. Linux's driver takes the four UAT ranges, fw-text and
- * fw-data as no-map reservations, and admits only the build whose TEXT normalizes to this digest
- * (its fwid rule: the boot-filled ranges, the entropy records among them, zeroed; Linux also
- * checks the records' tags).
+ * T6050 G17S (M5 Pro: J714s on the 27.0 firmware, K116s on 27.2). iBoot loads both roles' __TEXT
+ * back to back, their __DATA and __DATA_SHARED_RO in one run, and leaves the UAT ranges empty:
+ * each role publishes its kernel root while it boots. Linux's driver takes the four UAT ranges,
+ * fw-text and fw-data as no-map reservations, and admits only a build whose TEXT normalizes to
+ * that build's digest (its fwid rule: the build's boot-filled ranges, the entropy records among
+ * them, zeroed; Linux also checks the records' tags).
  *
  * When the device tree describes the GPU (alias "gpu", apple,agx-g17s, disabled), check the ADT
  * and this build, then fill the reservations and enable the GPU power states, both mailboxes and
  * the GPU, the GPU last. On any mismatch they all stay disabled and the rest of the boot
  * (simpledrm, DCP) is unaffected. Built for size, in .init's and .text's last free bytes; there
  * is no room for apple,firmware-version, which Linux only takes as a hint here.
+ *
+ * T6050 G17D (M5 Ultra, J775D, 27.0 and 27.2) is the same handoff with its own build: GFX1's __TEXT
+ * is 0x4000 longer, so its fw-text is 0xa8000 and GFX1's boot-filled ranges move with it. The G17S
+ * builds are tried as before. The G17D build is tried only when the ADT puts GFX1's __TEXT right
+ * after GFX's and the two reach 0xa8000, so its check reads no further than the loaded TEXT.
  */
 #define T6050_GPU_INIT    __attribute__((minsize, noinline, section(".init.t6050gpu")))
 #define T6050_GPU_TEXT_FN __attribute__((minsize, noinline))
-#define T6050_GPU_TEXT    0xa4000
+#define T6050_GPU_TEXT    0xa4000 /* G17S */
+#define T6050_GPU_TEXT_D  0xa8000 /* G17D, the largest */
 #define T6050_GPU_DATA    0x184000
 
 static const struct {
     const char *props[11], *resv[6], *on[7];
-    u32 fill[8][2];
-    u8 sha[32];
+    struct {
+        u32 text, fill[8][2]; /* fw-text's size, its boot-filled ranges */
+        u8 sha[32];
+        char name[8], gpu; /* G17<gpu> for the log */
+    } build[4];
 } t6050_gpu = {
     /* The UAT ranges (base, size), then the bounds of both roles' __DATA and SRO */
     {"gpu-region-base", "gpu-region-size", "gfx-shared-region-base", "gfx-shared-region-size",
@@ -3927,26 +4102,81 @@ static const struct {
      "/soc/power-management@2300e80000/power-controller@100",
      "/soc/power-management@2300e80000/power-controller@110", "/soc/mailbox@2302600000",
      "/soc/mailbox@2302e00000", "gpu"},
-    {{0x224, 4},
-     {0x23c, 8},
-     {0x49720, 0x740},
-     {0x49e60, 0x231},
-     {0x50224, 4},
-     {0x5023c, 8},
-     {0x9d1d8, 0x740},
-     {0x9d918, 0x231}},
-    /* 26A428 G17S, both roles: Linux's hw/t6050.rs CONFIG digest */
-    {0x85, 0xd0, 0xfd, 0x82, 0x80, 0xf7, 0x24, 0x65, 0x5c, 0xa9, 0xa9,
-     0x71, 0x7b, 0xc9, 0x1a, 0x8a, 0x5e, 0xf6, 0x09, 0x28, 0xd7, 0x72,
-     0x00, 0xf6, 0xd5, 0x3b, 0xd0, 0x99, 0xb9, 0x47, 0x39, 0xc6},
+    /* Each build's boot-filled ranges and digest, both roles: Linux's hw/t6050.rs CONFIG */
+    {/* 26A428 (27.0) G17S, J714s */
+     {T6050_GPU_TEXT,
+      {{0x224, 4},
+       {0x23c, 8},
+       {0x49720, 0x740},
+       {0x49e60, 0x231},
+       {0x50224, 4},
+       {0x5023c, 8},
+       {0x9d1d8, 0x740},
+       {0x9d918, 0x231}},
+      {0x85, 0xd0, 0xfd, 0x82, 0x80, 0xf7, 0x24, 0x65, 0x5c, 0xa9, 0xa9,
+       0x71, 0x7b, 0xc9, 0x1a, 0x8a, 0x5e, 0xf6, 0x09, 0x28, 0xd7, 0x72,
+       0x00, 0xf6, 0xd5, 0x3b, 0xd0, 0x99, 0xb9, 0x47, 0x39, 0xc6},
+      "26A428",
+      'S'},
+     /*
+      * 26B8125 (27.2) G17S, the K114/K116 restore image, which iBoot loads on the K116s: the
+      * same sizes and records as 26A428, its entropy records 0x44 and 0x14 bytes further in
+      */
+     {T6050_GPU_TEXT,
+      {{0x224, 4},
+       {0x23c, 8},
+       {0x49764, 0x740},
+       {0x49ea4, 0x231},
+       {0x50224, 4},
+       {0x5023c, 8},
+       {0x9d1ec, 0x740},
+       {0x9d92c, 0x231}},
+      {0xaf, 0x68, 0xd0, 0x34, 0xa3, 0xf0, 0x06, 0xb4, 0x3d, 0xab, 0x66,
+       0x1b, 0x82, 0x5f, 0x12, 0x59, 0x8c, 0xb8, 0x6e, 0x4d, 0x2a, 0x0e,
+       0x38, 0x44, 0xf1, 0x4f, 0xa5, 0x05, 0x9f, 0x38, 0xf6, 0xcb},
+      "26B8125",
+      'S'},
+     /* 26A428 (27.0) G17D, J775D: Linux's hw/t6050.rs CONFIG_ULTRA */
+     {T6050_GPU_TEXT_D,
+      {{0x224, 4},
+       {0x23c, 8},
+       {0x49720, 0x740},
+       {0x49e60, 0x231},
+       {0x50224, 4},
+       {0x5023c, 8},
+       {0xa11d8, 0x740},
+       {0xa1918, 0x231}},
+      {0xc3, 0x53, 0x54, 0x40, 0x76, 0x02, 0x48, 0x44, 0x04, 0xaa, 0x6f,
+       0xc9, 0x46, 0xcd, 0xd2, 0x4c, 0xb8, 0x2c, 0x64, 0xa8, 0xbb, 0xd1,
+       0x07, 0xa4, 0x94, 0x79, 0xa0, 0x8c, 0xe9, 0xcc, 0x82, 0x51},
+      "26A428",
+      'D'},
+     /*
+      * 26B123 (27.2) G17D, J775D: the GFX and GFX1 images the 27.2 stub loads; the same sizes
+      * and records as 26A428's G17D, its entropy records 0x44 and 0x14 bytes further in
+      */
+     {T6050_GPU_TEXT_D,
+      {{0x224, 4},
+       {0x23c, 8},
+       {0x49764, 0x740},
+       {0x49ea4, 0x231},
+       {0x50224, 4},
+       {0x5023c, 8},
+       {0xa11ec, 0x740},
+       {0xa192c, 0x231}},
+      {0x54, 0xc5, 0x28, 0x19, 0x97, 0x10, 0x71, 0x1b, 0x27, 0x11, 0x9b,
+       0xd0, 0x6d, 0xb0, 0x16, 0xec, 0xee, 0x42, 0x32, 0xff, 0x1a, 0x0b,
+       0x6e, 0xd8, 0x02, 0x5a, 0x61, 0x46, 0x64, 0x6e, 0x3b, 0x03},
+      "26B123",
+      'D'}},
 };
 extern void aura_sha256(const void *data, size_t size, u8 digest[32]);
 
 /*
  * r: the four UAT ranges, fw-text (from GFX's __TEXT, GFX1's after it) and fw-data (GFX's __DATA
  * to GFX1's SRO end), base and size, from the ADT. Returns -1 if the device tree does not describe
- * this GPU, 0 if the ADT does not have the ranges, 1 if fw-text is not this build (normalized as
- * Linux's fwid does), 2 if it is.
+ * this GPU, 0 if the ADT does not have the ranges, 1 if fw-text is none of the builds (normalized
+ * as Linux's fwid does), and 2 plus the build's index if it is one of them.
  */
 static T6050_GPU_TEXT_FN int t6050_gpu_check(void *dt, u64 r[12])
 {
@@ -3964,20 +4194,37 @@ static T6050_GPU_TEXT_FN int t6050_gpu_check(void *dt, u64 r[12])
                          sizeof(seg)) != sizeof(seg) ||
         seg[4] != r[8] || r[9] + r[10] != r[8] + T6050_GPU_DATA)
         return 0;
+    u64 seg1[12]; /* GFX1's, the same layout; [3]'s low half is a __TEXT's size */
+    /* The G17D build only if GFX1's __TEXT follows GFX's and the two reach its size */
+    u32 limit = T6050_GPU_TEXT;
+    if (adt_getprop_copy(adt, adt_path_offset(adt, "/arm-io/gfx1-asc"), "segment-ranges", seg1,
+                         sizeof(seg1)) == sizeof(seg1) &&
+        seg1[0] > seg[0] && seg1[0] - seg[0] == (u32)seg[3] &&
+        seg1[0] - seg[0] + (u32)seg1[3] >= T6050_GPU_TEXT_D)
+        limit = T6050_GPU_TEXT_D;
     r[10] = r[8];
     r[11] = T6050_GPU_DATA;
     r[8] = seg[0];
-    r[9] = T6050_GPU_TEXT;
 
-    u8 *copy = malloc(T6050_GPU_TEXT), digest[32];
+    u8 *copy = malloc(limit), digest[32];
     if (!copy)
         return 1;
-    memcpy(copy, (const void *)seg[0], T6050_GPU_TEXT);
-    for (int i = 0; i < 8; i++)
-        memset(copy + t6050_gpu.fill[i][0], 0, t6050_gpu.fill[i][1]);
-    aura_sha256(copy, T6050_GPU_TEXT, digest);
+    int ret = 1;
+    for (size_t b = 0; ret == 1 && b < ARRAY_SIZE(t6050_gpu.build); b++) {
+        u32 text = t6050_gpu.build[b].text;
+        if (text > limit)
+            continue;
+        memcpy(copy, (const void *)seg[0], text);
+        for (int i = 0; i < 8; i++)
+            memset(copy + t6050_gpu.build[b].fill[i][0], 0, t6050_gpu.build[b].fill[i][1]);
+        aura_sha256(copy, text, digest);
+        if (!memcmp(digest, t6050_gpu.build[b].sha, sizeof(digest))) {
+            r[9] = text;
+            ret = 2 + b;
+        }
+    }
     free(copy);
-    return memcmp(digest, t6050_gpu.sha, sizeof(digest)) ? 1 : 2;
+    return ret;
 }
 
 /* Enables every node of t6050_gpu.on, in order, if they all exist */
@@ -3994,8 +4241,9 @@ static T6050_GPU_INIT bool t6050_gpu_enable(void *dt)
 
 /*
  * This part's leakage calibration fuses: three words at 0x74198 in the PMGR window that starts at
- * 0x88300000 on the GPU's die (die 1 on J714s). Linux's driver applies its J714 controller
- * configuration only when they match the part it was made for, so they come from the part.
+ * 0x88300000 on the GPU's die (die 1 on J714s). Linux's driver applies a board's controller
+ * configuration (J714s, J716c) only when they match the part it was made for, so they come from
+ * the part.
  */
 #define T6050_GPU_LEAK_WINDOW 0x88300000
 #define T6050_GPU_LEAK_OFFSET 0x74198
@@ -4036,19 +4284,36 @@ static T6050_GPU_INIT int dt_set_gpu_t6050(void *dt)
     int step = t6050_gpu_check(dt, r);
     if (step < 0)
         return 0;
-    bool ok = step == 2;
+    bool ok = step >= 2;
     for (int i = 0; ok && i < 6; i++)
         ok = !dt_set_resvmem(dt, t6050_gpu.resv[i], r[2 * i], r[2 * i + 1]);
     if (!ok || !t6050_gpu_enable(dt)) {
         printf("FDT: GPU: T6050 G17S handoff refused at check %d (0 ADT, 1 firmware build, 2 DT); "
                "GPU left disabled\n",
-               step);
+               min(step, 2));
         return 0;
     }
-    printf("FDT: GPU: T6050 G17S enabled, fw-text at %#lx\n", r[8]);
+    printf("FDT: GPU: T6050 G17%c %s enabled, fw-text at %#lx\n", t6050_gpu.build[step - 2].gpu,
+           t6050_gpu.build[step - 2].name, r[8]);
+    /*
+     * The driver tries the build of the reported release first. Without the hint it walks its
+     * table in order and logs each earlier build as not admitted before it finds this one.
+     */
+    int gpu = kboot_fdt_path_exact(dt, "gpu");
+    if (gpu < 0 || firmware_set_fdt(dt, gpu, "apple,firmware-version", &os_firmware))
+        printf("FDT: GPU: T6050: no apple,firmware-version for the driver\n");
     if (t6050_gpu_leakage(dt))
         printf("FDT: GPU: no leakage calibration words; the driver's generic configuration\n");
     return 0;
+}
+
+/* M5 Max (G17C): the handoff as on the other G17 parts, then this part's leakage words */
+static T6050_GPU_INIT int dt_set_gpu_g17c(void *dt)
+{
+    int ret = dt_set_gpu_g17(dt, &g17_soc_t6050);
+    if (!ret && t6050_gpu_leakage(dt))
+        printf("FDT: GPU: no leakage calibration words; the driver's generic configuration\n");
+    return ret;
 }
 
 int dt_set_gpu(void *dt)
@@ -4065,6 +4330,10 @@ int dt_set_gpu(void *dt)
         return dt_set_gpu_g17(dt, &g17_soc_t8140);
     if (chip_id == T8142)
         return dt_set_gpu_g17(dt, &g17_soc_t8142);
+
+    if (chip_id == T6050 &&
+        !fdt_node_check_compatible(dt, fdt_path_offset(dt, "gpu"), "apple,agx-g17c"))
+        return dt_set_gpu_g17c(dt);
 
     if (chip_id == T6040)
         return dt_set_gpu_t6040(dt);

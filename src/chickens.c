@@ -4,6 +4,7 @@
 #include "cpu_regs.h"
 #include "midr.h"
 #include "smp.h"
+#include "sptm_virt.h"
 #include "uart.h"
 #include "utils.h"
 
@@ -76,7 +77,7 @@ const struct midr_part_features features_m1 = {
     .nex_powergating = true,
     .fast_ipi = true,
     .mmu_sprr = true,
-    .siq_cfg = true,
+    .siq_cfg = SIQ_CFG_ROUTE_2,
     .amx = true,
 };
 
@@ -89,7 +90,7 @@ const struct midr_part_features features_m2 = {
     .nex_powergating = true,
     .fast_ipi = true,
     .mmu_sprr = true,
-    .siq_cfg = true,
+    .siq_cfg = SIQ_CFG_ROUTE_2,
     .amx = true,
     .actlr_el2 = true,
 };
@@ -103,16 +104,51 @@ const struct midr_part_features features_m3 = {
     .nex_powergating = true,
     .fast_ipi = true,
     .mmu_sprr = true,
-    .siq_cfg = true,
+    .siq_cfg = SIQ_CFG_ROUTE_2,
     .amx = true,
     .actlr_el2 = true,
     .counter_redirect = true,
 };
 
+/*
+ * SIQ_CFG_EL1 on M4 and later: with no write only the boot CPU accepts AIC IRQs, so every device
+ * interrupt wakes CPU0 and its cluster whichever core is waiting for it. The native OS's kernel
+ * writes 0 to SIQ_CFG_EL1 on every CPU as it starts, so each running CPU accepts device interrupts
+ * and the AIC picks one; route 0 matches it. The register belongs to the core (MIDR part), not the
+ * SoC: aura writes it on M1-M3 and on the M4 Pro/Max (Brava) and M5 Pro/Max (Sotra) cores, so the
+ * other cores of those generations, M4 (Donan), A18 Pro (Tahiti) and M5 (Hidra), have it too. All
+ * of these SoCs have an AIC3 (ADT compatible "aic,3"). M6 (features_m6) is left out: no M6 core
+ * writes the register yet.
+ */
+
 // XXX figure out what features are actually available on M4
 const struct midr_part_features features_m4 = {
     .sleep_mode = SLEEP_NONE, // XXX probably new mode required
+#ifdef SPTM_VIRT
+    /* The virtualized SPTM needs aura's own GL2 (SPRR and GXF), which iBoot leaves writable for a
+     * kcbz=0 boot object. apple_sysregs_unlocked stays false: CYC_OVRD is locked. */
+    .mmu_sprr = true,
+#endif
     .fast_ipi = true,
+    .siq_cfg = SIQ_CFG_ROUTE_0,
+    .actlr_el2 = true,
+    .unsafe_wfi = true,
+};
+
+/* M4 Pro/Max: as M4, AIC IRQs on every core (route 0, see above). */
+const struct midr_part_features features_m4_pro = {
+    .sleep_mode = SLEEP_NONE,
+    .fast_ipi = true,
+    .siq_cfg = SIQ_CFG_ROUTE_0,
+    .actlr_el2 = true,
+    .unsafe_wfi = true,
+};
+
+/* M5 Pro/Max/Ultra (Sotra cores): as M4, AIC IRQs on every core (route 0, see above). */
+const struct midr_part_features features_m5_sotra = {
+    .sleep_mode = SLEEP_NONE,
+    .fast_ipi = true,
+    .siq_cfg = SIQ_CFG_ROUTE_0,
     .actlr_el2 = true,
     .unsafe_wfi = true,
 };
@@ -161,18 +197,20 @@ const struct midr_part_info midr_parts[] = {
     {MIDR_PART_T8122_SAWTOOTH, "M3 Sawtooth", init_t8122_sawtooth, &features_m3},
     {MIDR_PART_T8132_DONAN_ECORE, "M4 Donan (E core)", NULL, &features_m4},
     {MIDR_PART_T8132_DONAN_PCORE, "M4 Donan (P core)", NULL, &features_m4},
-    {MIDR_PART_T6040_BRAVA_CHOP_ECORE, "M4 Pro Brava Chop (E core)", NULL, &features_m4},
-    {MIDR_PART_T6040_BRAVA_CHOP_PCORE, "M4 Pro Brava Chop (P core)", NULL, &features_m4},
-    {MIDR_PART_T6041_BRAVA_ECORE, "M4 Max Brava (E core)", NULL, &features_m4},
-    {MIDR_PART_T6041_BRAVA_PCORE, "M4 Max Brava (P core)", NULL, &features_m4},
+    {MIDR_PART_T6040_BRAVA_CHOP_ECORE, "M4 Pro Brava Chop (E core)", NULL, &features_m4_pro},
+    {MIDR_PART_T6040_BRAVA_CHOP_PCORE, "M4 Pro Brava Chop (P core)", NULL, &features_m4_pro},
+    {MIDR_PART_T6041_BRAVA_ECORE, "M4 Max Brava (E core)", NULL, &features_m4_pro},
+    {MIDR_PART_T6041_BRAVA_PCORE, "M4 Max Brava (P core)", NULL, &features_m4_pro},
     {MIDR_PART_T8140_TAHITI_ECORE, "A18 Pro Tahiti (E core)", NULL, &features_m4},
     {MIDR_PART_T8140_TAHITI_PCORE, "A18 Pro Tahiti (P core)", NULL, &features_m4},
     {MIDR_PART_T8142_HIDRA_ECORE, "M5 Hidra (E core)", NULL, &features_m4},
     {MIDR_PART_T8142_HIDRA_PCORE, "M5 Hidra (P core)", NULL, &features_m4},
-    {MIDR_PART_T6050_SOTRA_MCORE, "M5 Pro Sotra (M core)", NULL, &features_m4},
-    {MIDR_PART_T6050_SOTRA_PCORE, "M5 Pro Sotra (P core)", NULL, &features_m4},
-    {MIDR_PART_T6051_SOTRAC_MCORE, "M5 Max Sotra C (M core)", NULL, &features_m4},
-    {MIDR_PART_T6051_SOTRAC_PCORE, "M5 Max Sotra C (P core)", NULL, &features_m4},
+    {MIDR_PART_T6050_SOTRA_MCORE, "M5 Pro Sotra (M core)", NULL, &features_m5_sotra},
+    {MIDR_PART_T6050_SOTRA_PCORE, "M5 Pro Sotra (P core)", NULL, &features_m5_sotra},
+    {MIDR_PART_T6051_SOTRAC_MCORE, "M5 Max Sotra C (M core)", NULL, &features_m5_sotra},
+    {MIDR_PART_T6051_SOTRAC_PCORE, "M5 Max Sotra C (P core)", NULL, &features_m5_sotra},
+    {MIDR_PART_T6050_ULTRA_MCORE, "M5 Ultra (M core)", NULL, &features_m5_sotra},
+    {MIDR_PART_T6050_ULTRA_PCORE, "M5 Ultra (P core)", NULL, &features_m5_sotra},
     {MIDR_PART_T8152_KOMODO_ECORE, "M6 (E/M core)", NULL, &features_m6},
     {MIDR_PART_T8152_KOMODO_PCORE, "M6 (P core)", NULL, &features_m6},
 };
@@ -197,7 +235,8 @@ void init_cpu(void)
     int part = FIELD_GET(MIDR_PART, midr);
     int rev = (FIELD_GET(MIDR_REV_HIGH, midr) << 4) | FIELD_GET(MIDR_REV_LOW, midr);
 
-    bool quiet = ((chip_id == T8142 || chip_id == T8152) && !is_boot_cpu()) || smp_s2r_published();
+    bool quiet = ((chip_id == T8142 || chip_id == T8152) && !is_boot_cpu()) ||
+                 sptm_virt_guest_live || smp_s2r_published();
     if (!quiet)
         printf("  CPU part: 0x%x rev: 0x%x\n", part, rev);
 
@@ -238,10 +277,21 @@ void init_cpu(void)
     if (midr_part_info->init)
         midr_part_info->init(rev);
 
-    if (cpu_features->siq_cfg) {
+    if (cpu_features->siq_cfg
+#ifdef SPTM_VIRT
+        /*
+         * The route written here is for the OS aura boots on bare metal. Writing SIQ_CFG_EL1 on
+         * a secondary just after its first guest SPTM entry stalls XNU (seen on T6040/T6041),
+         * and the guest's kernel programs SIQ_CFG_EL1 on every CPU itself, so on a guest boot
+         * keep iBoot's value on every chip. This is keyed on the live guest-boot path, not the
+         * build flag, so a mixed build still serves Linux bare metal unchanged.
+         */
+        && !sptm_virt_guest_live
+#endif
+    ) {
         // Enable IRQs (at least necessary on t600x)
-        // XXX 0 causes pathological behavior in EL1, 2 works.
-        msr(SYS_IMP_APL_SIQ_CFG_EL1, 2);
+        // XXX 0 causes pathological behavior in EL1 on M1, 2 works there.
+        msr(SYS_IMP_APL_SIQ_CFG_EL1, cpu_features->siq_cfg == SIQ_CFG_ROUTE_0 ? 0 : 2);
         sysop("isb");
     }
 

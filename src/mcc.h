@@ -13,8 +13,14 @@ struct mcc_carveout {
 extern size_t mcc_carveout_count;
 extern struct mcc_carveout mcc_carveouts[];
 
+/* mcc_init() result for an MCC revision with no driver here (not an error). */
+#define MCC_UNSUPPORTED 1
+/* mcc_init() result when the ADT has no /arm-io/mcc (A7-A11, T2; not an error). */
+#define MCC_ABSENT 2
+
 int mcc_init(void);
 int mcc_unmap_carveouts(void);
 int mcc_enable_cache(void);
+int mcc_plane_info(int mcc, u64 *base, u64 *stride, int *count);
 
 #endif

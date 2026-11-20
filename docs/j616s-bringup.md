@@ -23,22 +23,23 @@ not working USB data or SuperSpeed.
 
 ## CPU clocks
 
-`cpufreq_init()` validates the device identity, three translated CPM apertures,
-and the ADT OPP tables without changing clock settings. Proxy operations
-`cpufreq_get_cluster_hz(cluster)` and `cpufreq_set_cluster_pstate(cluster, state)`
-use cluster 0 for E, 1 for P0 and 2 for P1. The getter reports the ADT frequency
-for the accepted command state; it is not a frequency measurement.
+`cpufreq_init()` runs the same cluster code as every other chip. On T6040/T6041
+it checks each cluster block against the ADT CPU nodes' `cpm-impl-reg` and keeps
+the clock states firmware left: there is no hold state, voltage, PLL, feature or
+thermal-policy programming. Proxy operations `cpufreq_get_cluster_hz(cluster)` and
+`cpufreq_set_cluster_pstate(cluster, state)` use cluster 0 for E, 1 for P0 and 2
+for P1, bounded by the PMGR ladders `voltage-states1-sram`, `voltage-states5-sram`
+and `voltage-states13-sram`. The getter reports the ADT frequency for the accepted
+command state; it is not a frequency measurement.
 
-Only states 1 and 2 are enabled. Fixed-work measurements on running cores
-matched the ADT nominal transitions of 1020 -> 1404 MHz for E and
-1260 -> 1512 MHz for both P clusters, with execution-rate ratios of 1.376,
-1.200 and 1.200. Each test restored state 1 and approximately its original
-execution time. Higher states were rejected without changing the command.
-There is no voltage, PLL or thermal-policy programming here.
+Fixed-work measurements on running cores matched the ADT nominal transitions of
+1020 -> 1404 MHz for E and 1260 -> 1512 MHz for both P clusters (states 1 and 2),
+with execution-rate ratios of 1.376, 1.200 and 1.200. Each test restored state 1
+and approximately its original execution time. Higher states have not been measured.
 
-The driver preserves other command bits, checks the previous expected state,
-and bounds each busy poll to 2 ms. An unexpected command state or failed transition
-locks out subsequent writes for that cluster until the image is restarted.
+The request preserves other command bits, waits for the previous request, verifies
+the accepted state and bounds each busy poll to 2 ms. A failed transition locks out
+subsequent proxy writes for that cluster until the image is restarted.
 A timeout does not imply that hardware reverted to the previous state.
 
 ## SMP and MMU

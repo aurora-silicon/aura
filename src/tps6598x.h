@@ -17,6 +17,8 @@ int tps6598x_command(tps6598x_dev_t *dev, const char *cmd, const u8 *data_in, si
                      u8 *data_out, size_t len_out);
 int tps6598x_cold_reset(tps6598x_dev_t *dev);
 int tps6598x_powerup(tps6598x_dev_t *dev);
+/* STATUS (plug) and DATA_STATUS (connection, data role) as little-endian words */
+int tps6598x_read_status(tps6598x_dev_t *dev, u32 *status, u32 *data_status);
 
 typedef bool(hpm_match_t)(char *hpm_path, void *data);
 // Return codes for hpm_action_t
@@ -47,7 +49,9 @@ int tps6598x_restore_irqs(tps6598x_dev_t *dev, tps6598x_irq_state_t *state);
 #define TPS6598X_REG_DATA_STATUS         0x5f
 #define TPS6598X_STATUS_PLUG_PRESENT     BIT(0)
 #define TPS6598X_STATUS_PLUG_UPSIDE_DOWN BIT(4)
+#define TPS6598X_DATA_CONNECTION         BIT(0)
 #define TPS6598X_DATA_USB3_CONNECTION    BIT(5)
+#define TPS6598X_DATA_ROLE_UFP           BIT(7)
 #define TPS6598X_DATA_DP_CONNECTION      BIT(8)
 #define TPS6598X_DATA_TBT_CONNECTION     BIT(16)
 #define TPS6598X_DATA_USB4_CONNECTION    BIT(23)

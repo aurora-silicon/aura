@@ -40,6 +40,7 @@ void iodev_register_device(iodev_id_t id, struct iodev *dev)
 {
     if (id >= IODEV_MAX)
         return;
+    sysop("dmb ish"); /* a re-take registers it with other cores running (sptm_virt_s2r.c) */
     iodevs[id] = dev;
 }
 

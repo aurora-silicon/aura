@@ -35,8 +35,10 @@ need their own flags, and each overwrites `build/`:
 Only an `ESP_STAGE2=1` image may be used as the ESP Stage 2;
 `tools/compose_stage2.py` rejects any other. See
 [boot options](docs/boot-options.md) and
-[Stage 2 device trees](docs/stage2-dtbs.md). On macOS, install LLVM and LLD through Homebrew and run
-`make`. A container build is also available through `podman-compose run
+[Stage 2 device trees](docs/stage2-dtbs.md). On macOS, install LLVM, LLD and GNU Make through
+Homebrew (`brew install llvm lld make`) and run `gmake`, as the macOS CI job does: the
+Makefile uses grouped targets (`&:`), which the GNU Make 3.81 that macOS ships as `make`
+does not support. A container build is also available through `podman-compose run
 aura make` or `docker-compose run aura make`.
 
 ## Boot and host tools

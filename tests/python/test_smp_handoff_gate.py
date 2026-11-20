@@ -45,6 +45,8 @@ static void *dt = (void *)0x1000;
 static int dt_bufsize = 0x10000;
 static int chip_id, mode, hardware_calls;
 static int kboot_move_to_exec_window(void **kernel) { return 0; }
+/* Without hib=1 the tree is handed over where it is: test_t6040_hibernate_layout.py has the slot */
+static void *kboot_hibernate_handoff_dt(void) { return dt; }
 static bool ctxr_exec_os_may_start(void) { return true; }
 static jmp_buf refused;
 static _Noreturn void panic(const char *format, ...) { longjmp(refused, 1); }

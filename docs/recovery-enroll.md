@@ -23,9 +23,11 @@ For a Mach-O object, check it while still in macOS. It must report `kcbz : 0`:
 kmutil inspect -z -B "$PWD/aura-boot.macho" --show-mach-boot-properties
 ```
 
-This script doesn't pad an object. On T8140 and later an OS only starts from a
-padded object, which aurora-installer makes (see
-[Running the OS](macho-boot-object.md#running-the-os)). An unpadded object suits a
+This script doesn't pad an object. On M4-generation chips and later (T8132,
+T6040 and up) an OS only starts from a padded object, which aurora-installer
+makes, as does `tools/macho_boot_object.py --execute-window` (see
+[Running the OS](macho-boot-object.md#running-the-os)). Enroll a padded object
+with `--compress`. An unpadded object suits a
 proxy-only Stage 1 there, and M1 to M3.
 
 ## In Recovery
@@ -67,8 +69,9 @@ The checks, in order, all before anything changes:
    paired with the volume.
 4. For a Mach-O object, `kmutil inspect` reports `kcbz` 0, so iBoot won't start
    SPTM.
-5. For a raw image, Kernel CTRR is not enabled. Enrolling a Mach-O object turns it
-   back on, and a raw Stage 1 then gets no secondary CPUs
+5. Kernel CTRR is not enabled, for either object type. With it on, a raw Stage 1
+   gets no secondary CPUs, and under the SPTM-virt hypervisor a secondary faults on
+   its first store into aura's image
    ([macho-boot-object.md](macho-boot-object.md#use)). If it is enabled, the script
    stops and prints the `bputil -nc -v <group>` to run first.
 

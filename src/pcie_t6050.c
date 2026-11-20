@@ -313,7 +313,7 @@ static int storage_find(void)
 
     if (adt_path_offset_trace(adt, "/arm-io/ans", path_nodes) < 0 ||
         adt_get_reg(adt, path_nodes, "reg", 0, &ans, &span) || span < 0x8118 ||
-        adt_get_reg(adt, path_nodes, "reg", 3, &nvme, &span) || span < 0x1304)
+        adt_get_reg(adt, path_nodes, "reg", 9, &nvme, &span) || span < 0x1304)
         FAIL("no /arm-io/ans\n");
     if (adt_path_offset_trace(adt, "/arm-io/sart-ans", path_nodes) < 0 ||
         adt_get_reg(adt, path_nodes, "reg", 0, &sart, &span) || span < 0xc0 + 4 * SART_SLOTS)
@@ -322,6 +322,7 @@ static int storage_find(void)
     storage_addr[ST_ANS_STATUS] = ans + 0x48;
     storage_addr[ST_A2I] = ans + 0x8110;
     storage_addr[ST_I2A] = ans + 0x8114;
+    /* reg 9 is the NVMe block, as Aura's nvme.c and Linux's DT use it; reg 3 is the NVMMU */
     storage_addr[ST_BOOT_STATUS] = nvme + 0x1300;
     storage_addr[ST_CC] = nvme + 0x14;
     storage_addr[ST_CSTS] = nvme + 0x1c;
@@ -349,8 +350,16 @@ static int storage_check(const char *tag, bool reference)
         printf("pcie-t6050: storage %s: 0x%lx 0x%08x -> 0x%08x\n", tag, storage_addr[i],
                storage_ref[i], cur[i]);
         changed++;
-        /* PS actual state and was-gated flags may move; target and auto must not */
-        if (i >= ST_PS && i < ST_SART && !((cur[i] ^ storage_ref[i]) & ~0x3f0))
+        /*
+         * PS actual state and was-gated flags may move; target and auto-enable must not. A
+         * domain under auto power management (AUTO_ENABLE, bit 28, set before and after) also
+         * moves its auto state (bits 27:24) on its own: on a J714s APCIE_SYS_ST0 went 0x1f0003ff
+         * -> 0x1000030f while the N1's link came up (storage idle, gated by the hardware).
+         */
+        u32 may_move = 0x3f0;
+        if (storage_ref[i] & cur[i] & BIT(28))
+            may_move |= 0x0f000000;
+        if (i >= ST_PS && i < ST_SART && !((cur[i] ^ storage_ref[i]) & ~may_move))
             continue;
         if (i >= ST_PS || i == ST_BOOT_STATUS || i == ST_CC)
             FAIL("storage changed %s\n", tag);

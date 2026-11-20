@@ -274,6 +274,8 @@ static enum stage1_proxy_result uartproxy_wait_stage1(unsigned ms)
 static void fb_set_active(bool on) { (void)on; }
 static int uartproxy_run_presynced(void) { next_stage.entry = (void *)1; return 0; }
 static int uartproxy_run(void *start) { (void)start; return 0; }
+/* secboot.c: not enforcing, a host may get the proxy */
+static bool secboot_host_proxy_allowed(void) { return true; }
 ''' + source[start:end] + r'''
 static void reset(void)
 {
@@ -396,6 +398,12 @@ static int chainload_image(void *data, size_t size, char **vars, size_t count)
 static void rust_free_image(void *data, size_t size) {}
 static void stage1_log_handoff(char **vars, size_t *var_cnt, size_t var_capacity) {}
 static bool stage1_recovery_window(void) { return false; }
+/* secboot.c: no image trailer, nothing enforced */
+static int secboot_check_chainload(void *data, size_t *size, char **vars, size_t *var_cnt,
+                                   size_t var_capacity)
+{
+    return 0;
+}
 static bool stage1_proxy_request_window(void) { return false; }
 static bool stage1_window_offered(void) { return offered; }
 ''' + source + r'''

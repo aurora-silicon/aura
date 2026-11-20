@@ -1,5 +1,7 @@
 /* SPDX-License-Identifier: MIT AND GPL-2.0-only */
 
+#include "../build/build_cfg.h"
+
 #include "pmgr.h"
 #include "adt.h"
 #include "string.h"
@@ -66,6 +68,9 @@ static u32 pmgr_devices_len = 0;
 static bool pmgr_u8id = false;
 static bool pmgr_use_group_and_offset = false;
 static bool pmgr_protected_addr(uintptr_t addr);
+/* While a running OS owns the PMGR (the debug link's re-take under the virtualized SPTM): a domain
+ * that is already on keeps its word, including the auto bits the OS configured. */
+bool pmgr_keep_configured;
 
 static bool pmgr_protected_device(const struct pmgr_device *device)
 {
@@ -102,6 +107,9 @@ int pmgr_set_mode(uintptr_t addr, u8 target_mode)
         printf("pmgr: refusing protected display CPU power transition at 0x%lx\n", addr);
         return -1;
     }
+    if (pmgr_keep_configured && target_mode && (read32(addr) & PMGR_PS_TARGET) &&
+        (read32(addr) & PMGR_PS_ACTUAL))
+        return 0;
     mask32(addr, PMGR_AUTO_ENABLE | PMGR_WAS_CLKGATED | PMGR_WAS_PWRGATED | PMGR_PS_TARGET,
            FIELD_PREP(PMGR_PS_TARGET, target_mode));
     if (poll32(addr, PMGR_PS_ACTUAL, FIELD_PREP(PMGR_PS_ACTUAL, target_mode), PMGR_POLL_TIMEOUT) <
@@ -136,6 +144,19 @@ static int pmgr_find_device(u16 id, const struct pmgr_device **device)
     return -1;
 }
 
+/* T6050 has die-stride 0x4000000000; at 0x2000000000 its die 1 lands in die 0's MMIO. */
+u64 pmgr_die_stride(void)
+{
+    static u64 stride;
+
+    if (!stride) {
+        int node = adt_path_offset(adt, "/arm-io/pmgr");
+        if (node < 0 || ADT_GETPROP(adt, node, "die-stride", &stride) < 0 || !stride)
+            stride = PMGR_DIE_OFFSET;
+    }
+    return stride;
+}
+
 static uintptr_t pmgr_device_get_addr(u8 die, const struct pmgr_device *device)
 {
     if (die >= pmgr_dies)
@@ -148,7 +169,7 @@ static uintptr_t pmgr_device_get_addr(u8 die, const struct pmgr_device *device)
     if (addr == 0)
         return 0;
 
-    addr += PMGR_DIE_OFFSET * die;
+    addr += pmgr_die_stride() * die;
 
     if (pmgr_use_group_and_offset)
         addr += device->group_and_offset.offset;
@@ -365,7 +386,7 @@ static int pmgr_adt_find_devices(const char *path, const u32 **devices, u32 *n_d
 }
 
 /*
- * PS register addresses (die 0) of a node's clock-gates and all their ancestors, with their ADT
+ * PS register addresses (per die) of a node's clock-gates and all their ancestors, with their ADT
  * flags if asked, for a caller that must keep a device powered (the virtualized SPTM keeps its
  * debug link up under macOS).
  */
@@ -373,22 +394,23 @@ int pmgr_adt_collect_psregs(const char *path, u64 *out, u8 *flags, int max)
 {
     const u32 *devices;
     u32 n_devices;
-    u16 stack[64];
+    u32 stack[64]; /* die and device id, as in the ADT */
     int sp = 0, cnt = 0;
 
     if (!pmgr_devices || pmgr_adt_find_devices(path, &devices, &n_devices) < 0)
         return -1;
     for (u32 i = 0; i < n_devices && sp < (int)ARRAY_SIZE(stack); i++)
-        stack[sp++] = FIELD_GET(PMGR_DEVICE_ID, devices[i]);
+        stack[sp++] = devices[i] & (PMGR_DIE_ID | PMGR_DEVICE_ID);
     while (sp) {
         const struct pmgr_device *device;
-        u16 id = stack[--sp], parents[2];
+        u8 die = FIELD_GET(PMGR_DIE_ID, stack[--sp]);
+        u16 id = FIELD_GET(PMGR_DEVICE_ID, stack[sp]), parents[2];
         if (!id || pmgr_find_device(id, &device))
             continue;
         /* A virtual device has no PS word: its address computes to the group base, which is the
          * first real domain's (ECPU_0). Follow its parents, but don't list it. */
         if (!(device->flags & PMGR_FLAG_VIRTUAL)) {
-            u64 addr = pmgr_device_get_addr(0, device);
+            u64 addr = pmgr_device_get_addr(die, device);
             bool dup = !addr;
             for (int i = 0; i < cnt; i++)
                 dup |= out[i] == addr;
@@ -403,7 +425,7 @@ int pmgr_adt_collect_psregs(const char *path, u64 *out, u8 *flags, int max)
         pmgr_adt_get_parents(device, parents);
         for (int i = 0; i < 2 && sp < (int)ARRAY_SIZE(stack); i++)
             if (parents[i])
-                stack[sp++] = parents[i];
+                stack[sp++] = FIELD_PREP(PMGR_DIE_ID, die) | parents[i];
     }
     return cnt;
 }
@@ -820,6 +842,38 @@ int pmgr_reset(int die, const char *name)
     return pmgr_reset_device(die, dev);
 }
 
+#ifdef SPTM_VIRT
+/*
+ * A device's reset, with the device held on for it (an idle one won't take a reset), then its
+ * target and auto-enable as they were.
+ */
+int pmgr_reset_held(int die, const char *name)
+{
+    const struct pmgr_device *dev = NULL;
+
+    for (unsigned int i = 0; i < pmgr_devices_len; ++i) {
+        if (strncmp(pmgr_devices[i].name, name, 0x10) == 0) {
+            dev = &pmgr_devices[i];
+            break;
+        }
+    }
+    if (!dev || die < 0 || die >= pmgr_dies)
+        return -1;
+    uintptr_t addr = pmgr_device_get_addr(die, dev);
+    if (!addr)
+        return -1;
+
+    u32 was = read32(addr);
+    int ret = pmgr_set_mode(addr, PMGR_PS_ACTIVE);
+    if (!ret)
+        ret = pmgr_reset_device(die, dev);
+    mask32(addr, PMGR_AUTO_ENABLE | PMGR_PS_TARGET, was & (PMGR_AUTO_ENABLE | PMGR_PS_TARGET));
+    printf("pmgr: %d.%s 0x%x before, 0x%x after%s\n", die, dev->name, was, read32(addr),
+           ret ? ", NOT reset" : "");
+    return ret;
+}
+#endif /* SPTM_VIRT */
+
 uintptr_t pmgr_psreg_by_name(int die, const char *name)
 {
     if (die < 0 || die >= pmgr_dies)
@@ -884,6 +938,50 @@ int pmgr_adt_path_offset_trace(const void *adt_ptr, int *path)
     pmgr_name = pmgr_name_t8152;
 
     return adt_path_offset_trace(adt, pmgr_name, path);
+}
+
+/*
+ * Turn the off parents of an active device on, each one's own off parents first. A stage that
+ * powered ANS off through its storage gates (T8142) leaves APCIE_PHY_SW on under an off
+ * APCIE_SYS_ST, whose parents ANS and APCIE_ST are off too: APCIE_SYS_ST must not be raised
+ * before them.
+ */
+static int pmgr_enable_parents(u8 die, const struct pmgr_device *device, const char *active,
+                               unsigned int depth)
+{
+    u16 parent[2];
+
+    if (depth >= PMGR_MAX_PARENT_DEPTH)
+        return -1;
+    pmgr_adt_get_parents(device, parent);
+    for (int j = 0; j < 2; j++) {
+        const struct pmgr_device *pdevice;
+
+        if (!parent[j])
+            continue;
+        if (pmgr_find_device(parent[j], &pdevice)) {
+            /* As pmgr_validate_parents(): only a direct parent the ADT doesn't list fails. */
+            if (depth)
+                continue;
+            printf("pmgr: Failed to find parent #%d for %s\n", parent[j], device->name);
+            return -1;
+        }
+        if ((pdevice->flags & PMGR_FLAG_VIRTUAL) || pmgr_protected_device(pdevice))
+            continue;
+
+        uintptr_t addr = pmgr_device_get_addr(die, pdevice);
+        if (!addr)
+            return -1;
+        u32 reg = read32(addr);
+        if (reg & PMGR_AUTO_ENABLE || FIELD_GET(PMGR_PS_TARGET, reg) == PMGR_PS_ACTIVE)
+            continue;
+        if (pmgr_enable_parents(die, pdevice, active, depth + 1))
+            return -1;
+        printf("pmgr: Enabling %d.%s, parent of active device %s\n", die, pdevice->name, active);
+        if (pmgr_set_mode(addr, PMGR_PS_ACTIVE))
+            return -1;
+    }
+    return 0;
 }
 
 int pmgr_init(void)
@@ -962,41 +1060,9 @@ int pmgr_init(void)
                 return -1;
 
             u32 reg = read32(addr);
-
-            if (reg & PMGR_AUTO_ENABLE || FIELD_GET(PMGR_PS_TARGET, reg) == PMGR_PS_ACTIVE) {
-                for (int j = 0; j < 2; j++) {
-                    u16 parent[2];
-                    pmgr_adt_get_parents(device, parent);
-                    if (parent[j]) {
-                        const struct pmgr_device *pdevice;
-                        if (pmgr_find_device(parent[j], &pdevice)) {
-                            printf("pmgr: Failed to find parent #%d for %s\n", parent[j],
-                                   device->name);
-                            return -1;
-                        }
-
-                        if ((pdevice->flags & PMGR_FLAG_VIRTUAL))
-                            continue;
-
-                        if (pmgr_protected_device(pdevice))
-                            continue;
-
-                        addr = pmgr_device_get_addr(die, pdevice);
-                        if (!addr)
-                            return -1;
-
-                        reg = read32(addr);
-
-                        if (!(reg & PMGR_AUTO_ENABLE) &&
-                            FIELD_GET(PMGR_PS_TARGET, reg) != PMGR_PS_ACTIVE) {
-                            printf("pmgr: Enabling %d.%s, parent of active device %s\n", die,
-                                   pdevice->name, device->name);
-                            if (pmgr_set_mode(addr, PMGR_PS_ACTIVE))
-                                return -1;
-                        }
-                    }
-                }
-            }
+            if ((reg & PMGR_AUTO_ENABLE || FIELD_GET(PMGR_PS_TARGET, reg) == PMGR_PS_ACTIVE) &&
+                pmgr_enable_parents(die, device, device->name, 0))
+                return -1;
         }
     }
 

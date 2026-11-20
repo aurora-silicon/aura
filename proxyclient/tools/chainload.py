@@ -16,9 +16,14 @@ parser.add_argument('--vector-only', action="store_true", help="Return after vec
 parser.add_argument('--capture', type=pathlib.Path, help="Write raw post-vector console bytes to this file")
 parser.add_argument('--capture-seconds', type=float, default=0, help="Seconds of raw console capture after vector")
 parser.add_argument('--relocate', action='store_true', help='Allocate a new raw-image span while retaining the live stage-1 heap')
+parser.add_argument('--reclaim-stage1-heap', action='store_true', help='After raw image replacement, reclaim the discarded Stage 1 heap; preserve native boot data and firmware')
+parser.add_argument('--capture-until', help="Stop the capture early once the console shows this regex")
+parser.add_argument('--stub', type=pathlib.Path, help="Prebuilt copy stub (8-byte LE entry, then code) for a host without a toolchain")
 parser.add_argument('payload', type=pathlib.Path)
 parser.add_argument('boot_args', default=[], nargs="*")
 args = parser.parse_args()
+if args.reclaim_stage1_heap and (not args.raw or args.call or args.relocate or args.xnu):
+    parser.error('--reclaim-stage1-heap requires in-place raw replacement, not call, relocation or XNU mode')
 if args.vector_only and args.call:
     parser.error('--vector-only cannot be combined with --call')
 if args.capture and not args.vector_only:
@@ -91,7 +96,10 @@ if ro_end and image_end > ro_start and new_base < ro_end:
 if not args.relocate and live_heap > inherited_top and image_end > inherited_top and new_base < live_heap:
     raise ValueError("Image overlaps live Stage 1 heap")
 
-park_fw = not args.relocate and ((ro_end and packed_end > ro_start and image_end < ro_end) or
+# --reclaim-stage1-heap drops Stage 1's heap from the next stage's top; a block parked in that
+# heap would hold the top above it, so that mode keeps the packed layout below inherited_top.
+park_fw = not args.relocate and ((image_end < inherited_top and not args.reclaim_stage1_heap) or
+           (ro_end and packed_end > ro_start and image_end < ro_end) or
            (live_heap > inherited_top and packed_end > inherited_top and image_end < live_heap))
 fw_dest = new_base + image_only_size
 if park_fw:
@@ -166,7 +174,16 @@ u.push_adt()
 print("Setting up bootargs...")
 tba = u.ba.copy()
 
-tba.top_of_kernel_data = max(image_end, fw_dest + fw_size, live_heap, inherited_top, ro_end)
+retained_top = max(image_end, fw_dest + fw_size, inherited_top, ro_end)
+if args.reclaim_stage1_heap:
+    # After an in-place raw replacement Stage 1's heap is dead; the image, the firmware, the
+    # inherited boot data and the ADT stay below the new top.
+    retained_top = max(retained_top,
+                       u.ba.devtree - u.ba.virt_base + u.ba.phys_base + u.ba.devtree_size)
+tba.top_of_kernel_data = max(retained_top, 0 if args.reclaim_stage1_heap else live_heap)
+if args.reclaim_stage1_heap:
+    print(f"Reclaiming Stage 1 temporary heap after vector: inherited top 0x{inherited_top:x}, "
+          f"new top 0x{tba.top_of_kernel_data:x}, old heap high-water 0x{live_heap:x}")
 
 if len(args.boot_args) > 0:
     boot_args = " ".join(args.boot_args)
@@ -193,7 +210,27 @@ p.dc_cvac(fw_stage, fw_size)
 
 print(f"Copying stub...")
 
-stub = asm.ARMAsm(f"""
+class PrebuiltStub:
+    """
+    A stub assembled elsewhere, with the entry address it was built for in its
+    first 8 bytes. The code is position independent and takes the entry from a
+    literal, so that literal is rewritten with this boot's entry.
+    """
+    def __init__(self, path, addr, entry):
+        blob = path.read_bytes()
+        baked = blob[:8]
+        code = blob[8:]
+        if code.count(baked) != 1:
+            raise ValueError(f"{path}: expected exactly one copy of the entry literal in the stub")
+        self.addr = addr
+        self.data = code.replace(baked, entry.to_bytes(8, "little"))
+        self.len = len(self.data)
+        print(f"Prebuilt stub: entry literal set to 0x{entry:x}")
+
+if args.stub:
+    stub = PrebuiltStub(args.stub, image_addr + copy_size, entry)
+else:
+    stub = asm.ARMAsm(f"""
         mov x7, x2
         mov x8, x3
 1:
@@ -247,12 +284,8 @@ elif args.vector_only:
     print(f"Vectoring to 0x{stub.addr:x}; no next-stage proxy request will be sent")
     p.request(p.P_VECTOR, stub.addr, fw_dest + bootargs_off, image_addr, new_base, copy_size)
     if args.capture:
-        deadline = time.monotonic() + max(0, args.capture_seconds)
-        with args.capture.open('wb') as output:
-            while time.monotonic() < deadline:
-                data = iface.dev.read(4096)
-                if data:
-                    output.write(data)
+        from aura.console import capture
+        capture(iface.dev, args.capture, args.capture_seconds, args.capture_until)
     sys.exit(0)
 else:
     print(f"Reloading into stub at 0x{stub.addr:x}")

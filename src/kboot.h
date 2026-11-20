@@ -23,6 +23,7 @@ struct kernel_header {
 #define KERNEL_HEADER_MAGIC 0x644d5241
 
 void kboot_set_initrd(void *start, size_t size);
+void kboot_request_hibernate_layout(bool on);
 int kboot_set_chosen(const char *name, const char *value);
 void kboot_delete_chosen(const char *name);
 void kboot_set_config_lost(void);
@@ -31,6 +32,8 @@ int dt_gpu_t8122_26_calibrate(void *dt);
 int dt_set_gpu_t8122_26(void *dt);
 int kboot_prepare_dt(void *fdt);
 int kboot_boot(void *kernel);
+/* Reserve the DMA a USB controller that could not be stopped keeps (main.c, after USB shutdown). */
+int kboot_reserve_usb_dma(void);
 
 /* Boot-args RAM range and boot framebuffer base, for the kboot_* SoC helpers */
 u64 kboot_ram_base(void);

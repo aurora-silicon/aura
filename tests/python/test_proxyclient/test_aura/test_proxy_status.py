@@ -25,6 +25,8 @@ def test_memory_reads_are_bounded_for_dockchannel():
     class Reader:
         def __init__(self):
             self.calls = []
+            # DockChannel, not KIS: exercises readmem's plain chunked path.
+            self.is_kis = False
 
         def _readmem_one(self, addr, size):
             self.calls.append((addr, size))

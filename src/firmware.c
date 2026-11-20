@@ -215,6 +215,12 @@ const struct fw_version_info fw_versions[NUM_FW_VERSIONS] = {
     // Same iBoot string as 27.0: detect_firmware() always picks V27_0. Verified from the J575D
     // (M3 Ultra) 27.0.1 iBoot (26A434): both report "mBoot-20457.1.29", so no V27_0_1 exists.
     [V27_0]      = {V27_0,      "27.0",        {27, 0, 0},     3, "mBoot-20457.1.29"},
+    // macOS 27.2 (26B123), read from a J813 stub booted by it (system and OS iBoot alike).
+    [V27_2]      = {V27_2,      "27.2",        {27, 2, 0},     3, "mBoot-20457.41.3"},
+    // macOS 27.3 beta (26C5035r), read from a K114c (M5 Max): system and OS iBoot alike. The numbers
+    // follow the beta rows above (N.M beta = {N, M-1, 98, k}, as 26.3 beta = {26, 2, 98, 1}); the
+    // beta index k = 1 is assumed, the iBoot string does not say which beta it is.
+    [V27_3B]     = {V27_3B,     "27.3 beta",   {27, 2, 98, 1}, 4, "mBoot-20457.60.65.0.1"},
     // clang-format on
 };
 
@@ -244,6 +250,28 @@ void firmware_parse_version(const char *s, u32 *out)
         while (*s >= '0' && *s <= '9')
             s++;
     }
+}
+
+/*
+ * The release whose coprocessor firmware (DCP, GPU, ISP images) the OS iBoot loads. Apple's later
+ * iBoots of a train keep its version and add a suffix. A J616s (T6040) installed from Recovery runs
+ * macOS 26.7.1 25G241 (SystemVersion and Preboot cryptex1 read from its disk) with the OS iBoot
+ * "mBoot-18000.161.10.701.1", which the table above lists as 26.7: the 26.6.2 iBoot
+ * "mBoot-18000.161.10" plus ".701.1". Booted by it, the GPU driver admits the loaded GPU firmware
+ * only by its text SHA-256, and it matched 25G83, the 26.6.2 image; our earlier aura ran its DCP
+ * and ISP handoffs there as 26.6.2. So for the handoffs, an iBoot of the 18000.161.10 train counts
+ * as 26.6.2. The OS version published in the device tree stays the detected one, and the kernel
+ * still checks each image it takes over.
+ */
+enum fw_version firmware_os_components(void)
+{
+    static const char train[] = "mBoot-18000.161.10.";
+
+    if (os_firmware.version == V26_6_2)
+        return V26_6_2;
+    if (os_firmware.iboot && !strncmp(os_firmware.iboot, train, sizeof(train) - 1))
+        return V26_6_2;
+    return os_firmware.version;
 }
 
 static void detect_firmware(struct fw_version_info *info, const char *ver)

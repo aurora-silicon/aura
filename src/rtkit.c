@@ -1,5 +1,7 @@
 /* SPDX-License-Identifier: MIT AND GPL-2.0-only */
 
+#include "../build/build_cfg.h"
+
 #include "../config.h"
 
 #include "rtkit.h"
@@ -214,10 +216,10 @@ out_free_rtk:
 
 void rtkit_free(rtkit_dev_t *rtk)
 {
-    rtkit_free_buffer(rtk, &rtk->syslog_bfr);
-    rtkit_free_buffer(rtk, &rtk->crashlog_bfr);
-    rtkit_free_buffer(rtk, &rtk->ioreport_bfr);
-    rtkit_free_buffer(rtk, &rtk->oslog_bfr);
+    /* A buffer the IOMMU may still reach is kept, and so is its owner. */
+    if (!rtkit_free_buffer(rtk, &rtk->syslog_bfr) || !rtkit_free_buffer(rtk, &rtk->crashlog_bfr) ||
+        !rtkit_free_buffer(rtk, &rtk->ioreport_bfr) || !rtkit_free_buffer(rtk, &rtk->oslog_bfr))
+        return;
     free(rtk->name);
     free(rtk);
 }
@@ -251,6 +253,8 @@ bool rtkit_map(rtkit_dev_t *rtk, void *phys, size_t sz, u64 *dva)
         *dva = (u64)phys;
         return true;
     } else if (rtk->dart) {
+        if (dart_has_failed(rtk->dart))
+            return false;
         u64 iova = iova_alloc(rtk->dart_iovad, sz);
         if (!iova) {
             rtkit_printf("failed to alloc iova (size 0x%lx)\n", sz);
@@ -259,7 +263,11 @@ bool rtkit_map(rtkit_dev_t *rtk, void *phys, size_t sz, u64 *dva)
 
         if (dart_map(rtk->dart, iova, phys, sz) < 0) {
             rtkit_printf("failed to DART map (size 0x%lx)\n", sz);
-            iova_free(rtk->dart_iovad, iova, sz);
+            /* After a failed invalidation the pages may be live: keep the IOVA. */
+            if (dart_has_failed(rtk->dart))
+                *dva = iova | rtk->dva_base;
+            else
+                iova_free(rtk->dart_iovad, iova, sz);
             return false;
         }
 
@@ -281,7 +289,8 @@ bool rtkit_unmap(rtkit_dev_t *rtk, u64 dva, size_t sz)
         return true;
     } else if (rtk->dart) {
         dva &= ~rtk->dva_base;
-        dart_unmap(rtk->dart, dva & IOVA_MASK, sz);
+        if (!dart_unmap_checked(rtk->dart, dva & IOVA_MASK, sz))
+            return false;
         iova_free(rtk->dart_iovad, dva, sz);
         return true;
     } else {
@@ -292,6 +301,8 @@ bool rtkit_unmap(rtkit_dev_t *rtk, u64 dva, size_t sz)
 
 bool rtkit_alloc_buffer(rtkit_dev_t *rtk, struct rtkit_buffer *bfr, size_t sz)
 {
+    if (rtk->dart && dart_has_failed(rtk->dart))
+        return false;
     if (!sz || sz > (size_t)-1 - (SZ_16K - 1))
         return false;
 
@@ -304,13 +315,16 @@ bool rtkit_alloc_buffer(rtkit_dev_t *rtk, struct rtkit_buffer *bfr, size_t sz)
 
     memset(bfr->bfr, 0, alloc_sz);
     bfr->sz = alloc_sz;
+    bfr->owned = true;
     if (!rtkit_map(rtk, bfr->bfr, alloc_sz, &bfr->dva))
         goto error;
 
-    bfr->owned = true;
     return true;
 
 error:
+    /* A failed map can leave translations to this allocation published. */
+    if (rtk->dart && dart_has_failed(rtk->dart))
+        return false;
     free(bfr->bfr);
     memset(bfr, 0, sizeof(*bfr));
     return false;
@@ -1018,6 +1032,40 @@ bool rtkit_sleep(rtkit_dev_t *rtk)
     asc_cpu_stop(rtk->asc);
     return true;
 }
+
+#ifdef SPTM_VIRT
+/*
+ * Start a stopped IOP and wait for its HELLO without answering it: unprompted first, as after a
+ * power-on, then after the INIT that a quiesced IOP waits for. The caller stops it again.
+ * Returns 1 for an unprompted HELLO, 2 for one after INIT, 0 for none.
+ */
+int rtkit_probe_hello(asc_dev_t *asc)
+{
+    struct asc_message msg;
+    u64 timeout;
+
+    asc_i2a_enable(asc, true);
+    asc_cpu_start(asc);
+    for (int round = 1; round <= 2; round++) {
+        if (round == 2) {
+            msg.msg0 = FIELD_PREP(MGMT_TYPE, MGMT_MSG_IOP_PWR_STATE) |
+                       FIELD_PREP(MGMT_PWR_STATE, RTKIT_POWER_INIT);
+            msg.msg1 = RTKIT_EP_MGMT;
+            if (!asc_send(asc, &msg))
+                return 0;
+        }
+        timeout = timeout_calculate(round == 1 ? 50000 : 1000000);
+        while (!timeout_expired(timeout)) {
+            if (!asc_recv(asc, &msg))
+                continue;
+            if (msg.msg1 == RTKIT_EP_MGMT && FIELD_GET(MGMT_TYPE, msg.msg0) == MGMT_MSG_HELLO)
+                return round;
+            printf("rtkit: probe: message 0x%lx for EP 0x%x before HELLO\n", msg.msg0, msg.msg1);
+        }
+    }
+    return 0;
+}
+#endif /* SPTM_VIRT */
 
 static void rtkit_drain(rtkit_dev_t *rtk)
 {

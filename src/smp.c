@@ -30,6 +30,11 @@
 
 #define RVBAR_LOCK BIT(0)
 #define RVBAR_ADDR GENMASK(47, 12)
+/*
+ * A7 to M3: the address a write leaves in a running core's register. Above it, that core
+ * reads back state bits (44, 48 and 52 on a running T8112 secondary), not address.
+ */
+#define RVBAR_ADDR_UNLOCKED GENMASK(43, 12)
 
 struct spin_table {
     u64 mpidr;
@@ -54,12 +59,12 @@ u8 dummy_stack_el1[DUMMY_STACK_SIZE]; // EL1 stack if EL3 exists
  * it takes them from the heap as m1n1 v1.6 did. The pointers are shared like smp_reset_stacks: a
  * T8152 core reads its own in cpu_reset with the MMU off.
  */
-u8 *secondary_stacks[MAX_CPUS] SMP_SHARED;
+u8 *secondary_stacks[SECONDARY_STACKS] SMP_SHARED;
 u8 *secondary_stacks_el3[MAX_EL3_CPUS] SMP_SHARED;
 
 static int smp_alloc_stacks(void)
 {
-    for (int i = 0; i < MAX_CPUS; i++) {
+    for (int i = 0; i < SECONDARY_STACKS; i++) {
         if (!secondary_stacks[i])
             secondary_stacks[i] = memalign(SZ_16K, SECONDARY_STACK_SIZE);
         if (!secondary_stacks[i])
@@ -74,7 +79,7 @@ static int smp_alloc_stacks(void)
     return 0;
 }
 #else
-u8 secondary_stacks[MAX_CPUS][SECONDARY_STACK_SIZE] ALIGNED(0x4000);
+u8 secondary_stacks[SECONDARY_STACKS][SECONDARY_STACK_SIZE] ALIGNED(0x4000);
 u8 secondary_stacks_el3[MAX_EL3_CPUS][SECONDARY_STACK_SIZE] ALIGNED(0x4000);
 
 static int smp_alloc_stacks(void)
@@ -153,11 +158,40 @@ extern u8 _vectors_start[0];
 static u8 *t8142_block SMP_SHARED;
 static size_t t8142_block_size;
 
+/*
+ * A CPU's secondary stack is its place among the CPUs present, in cpu-id order, not its cpu-id:
+ * T6050 Ultra numbers its 30 CPUs 0 to 34 (18 per die), and a stack per cpu-id would add 2 MiB
+ * to every image's .bss. Shared like smp_reset_stacks: a secondary reads its own with the MMU off.
+ */
+static u8 stack_slot[MAX_CPUS] SMP_SHARED;
+
+static u8 *cpu_stack(int index)
+{
+    return secondary_stacks[stack_slot[index]];
+}
+
+/* In cpu-id order, so T8152's slots are its cpu-ids, as its cpu_reset assumes (start.S). */
+static void smp_assign_stacks(void)
+{
+    int slot = 0;
+
+    for (int i = 0; i < MAX_CPUS; i++) {
+        if (!cpu_nodes[i])
+            continue;
+        if (slot == SECONDARY_STACKS) {
+            printf("cpu-id %d has no stack: more than %d CPUs\n", i, SECONDARY_STACKS);
+            cpu_nodes[i] = 0;
+            continue;
+        }
+        stack_slot[i] = slot++;
+    }
+}
+
 static u64 secondary_stack_top(int index)
 {
     if (t8142_block)
         return (u64)t8142_block + (u64)(index + 1) * SECONDARY_STACK_SIZE;
-    return (u64)secondary_stacks[index] + SECONDARY_STACK_SIZE;
+    return (u64)cpu_stack(index) + SECONDARY_STACK_SIZE;
 }
 
 u8 *smp_secondary_stack(int index)
@@ -195,6 +229,7 @@ static int smp_t8142_block_init(int cpus)
 }
 
 extern u8 _stack_bot[0];
+extern char _stack_top[], _data_start[], _bss_end[];
 int boot_cpu_idx SMP_SHARED = -1;
 u64 boot_cpu_mpidr SMP_SHARED = 0;
 static u64 installed_relay SMP_SHARED;
@@ -386,16 +421,78 @@ static bool smp_rvbar_reaches_here(u64 locked)
 }
 
 /*
+ * A7 to M3: nothing locks RVBAR, and smp_start_cpu() already pointed each secondary's here.
+ * Point the boot core's here too, so that a reset after a system sleep comes back through
+ * this image on every core, as it does where iBoot locked RVBAR. Whether the value outlives
+ * a SoC sleep is the SoC's own matter: the OS only sleeps where that was tested.
+ */
+static char smp_s2r_why_buf[96];
+
+/* Why the last smp_resets_return_here() said no, for the OS's device tree. */
+const char *smp_s2r_why(void)
+{
+    return smp_s2r_why_buf[0] ? smp_s2r_why_buf : "RVBAR does not return here";
+}
+
+static bool smp_point_rvbar_here(void)
+{
+    u64 target = (u64)_vectors_start;
+
+    if (target & ~RVBAR_ADDR_UNLOCKED) {
+        snprintf(smp_s2r_why_buf, sizeof(smp_s2r_why_buf),
+                 "vectors at 0x%lx are outside RVBAR's address field", target);
+        printf("SMP: %s\n", smp_s2r_why_buf);
+        return false;
+    }
+
+    for (int i = 0; i < MAX_CPUS; i++) {
+        const struct cpu_info *cpu = &cpu_info[i];
+
+        if (!cpu->valid)
+            continue;
+        if (i != boot_cpu_idx && !smp_is_alive(i))
+            continue;
+        u64 rvbar = read64(cpu->impl_reg);
+        /*
+         * A core's own lock bit is set even where iBoot leaves the rest unlocked (a running
+         * boot core, as smp_start_secondaries() already allows). A store to a locked RVBAR
+         * takes an SError (T8122), so never write one: accept it only if it already resets
+         * into this image.
+         */
+        if (rvbar & RVBAR_LOCK) {
+            if (smp_rvbar_reaches_here(rvbar & RVBAR_ADDR_UNLOCKED))
+                continue;
+            snprintf(smp_s2r_why_buf, sizeof(smp_s2r_why_buf), "CPU %d RVBAR is locked at 0x%lx", i,
+                     rvbar & RVBAR_ADDR_UNLOCKED);
+            printf("SMP: %s\n", smp_s2r_why_buf);
+            return false;
+        }
+        if ((rvbar & RVBAR_ADDR_UNLOCKED) != target)
+            write64(cpu->impl_reg, target);
+        rvbar = read64(cpu->impl_reg);
+        if ((rvbar & RVBAR_ADDR_UNLOCKED) != target) {
+            snprintf(smp_s2r_why_buf, sizeof(smp_s2r_why_buf),
+                     "CPU %d RVBAR reads 0x%lx after writing 0x%lx", i, rvbar, target);
+            printf("SMP: %s\n", smp_s2r_why_buf);
+            return false;
+        }
+    }
+    return true;
+}
+
+/*
  * Whether a reset brings the cores back into this image. From M4 on (A18 Pro too), iBoot locks
  * every core's RVBAR to the same address, the boot core's too, and smp_prepare_rvbar() checked a
  * running secondary's before starting it. An OS started on the boot core alone suspends with that
  * core only, so it gets the same check and relay. On A7 to M3 RVBAR isn't locked: the OS can point
- * it anywhere.
+ * it anywhere, so it is pointed here.
  */
 bool smp_resets_return_here(void)
 {
-    if (cpu_features->apple_sysregs_unlocked || boot_cpu_idx < 0)
+    if (boot_cpu_idx < 0)
         return false;
+    if (cpu_features->apple_sysregs_unlocked)
+        return smp_point_rvbar_here();
     int i;
     for (i = 0; i < MAX_CPUS; i++)
         if (i != boot_cpu_idx && cpu_info[i].valid && smp_is_alive(i))
@@ -459,9 +556,13 @@ void smp_s2r_return_to_os(void)
 
     /* A reset the OS didn't arm: reboot rather than guess what state it's in. */
     bool armed = entry && (mrs(MPIDR_EL1) & 0xFFFFFF) == s2r_mailbox.boot_mpidr;
-    /* One line on the always-on DockChannel only: USB and the display are the OS's. */
-    dockchannel_uart_puts(armed ? "aura: S2R wake, resuming the OS"
-                                : "aura: S2R reset not armed, rebooting");
+    /*
+     * One line on the always-on DockChannel only: USB and the display are the OS's. Only
+     * if it fits: with nobody draining the FIFO (a T6040, whose OS keeps the DockChannel
+     * off), a waiting write held the boot core here until the SMC watchdog reset the SoC.
+     */
+    dockchannel_uart_try_puts(armed ? "aura: S2R wake, resuming the OS"
+                                    : "aura: S2R reset not armed, rebooting");
     if (!armed)
         reboot();
 
@@ -504,9 +605,6 @@ void smp_secondary_entry(void)
         msr(TPIDR_EL2, index);
     else
         msr(TPIDR_EL1, index);
-
-    if (chip_id != T8142 && chip_id != T8152 && !smp_s2r_published())
-        printf("  Index: %d (table: %p)\n\n", index, me);
 
     me->mpidr = mpidr;
 
@@ -634,7 +732,7 @@ static int smp_start_cpu(int index, const struct cpu_info *cpu)
         write64(cpu->impl_reg, (u64)_vectors_start);
     }
 
-    u64 start_base = cpu_start_base + cpu->die * PMGR_DIE_OFFSET;
+    u64 start_base = cpu_start_base + cpu->die * pmgr_die_stride();
 
     // Some kind of system level startup/status bit
     // Without this, IRQs don't work
@@ -653,7 +751,8 @@ static int smp_start_cpu(int index, const struct cpu_info *cpu)
     if (i >= 100) {
         printf("Failed!\n");
     } else {
-        printf("  Started.\n");
+        sysop("dmb ld");
+        printf("  Started, MPIDR 0x%lx.\n", spin_table[index].mpidr);
     }
 
     _reset_stack = dummy_stack + DUMMY_STACK_SIZE;
@@ -680,7 +779,7 @@ static int smp_stop_cpu(int index, const struct cpu_info *cpu, bool deep_sleep)
         }
 
         printf("Stopping CPU %d (%d:%d:%d)... ", index, cpu->die, cpu->cluster, cpu->core);
-        u64 start_base = cpu_start_base + cpu->die * PMGR_DIE_OFFSET;
+        u64 start_base = cpu_start_base + cpu->die * pmgr_die_stride();
         cpu_stop_state[index].flag = spin_table[index].flag;
         cpu_stop_state[index].deep_sleep = deep_sleep;
         cpu_stop_state[index].pending = true;
@@ -786,6 +885,7 @@ static int smp_init_t8152(void)
     int boot_cpu = t8152_cpu_index(mrs(MPIDR_EL1));
     if (present != 0xfff || boot_cpu < 0)
         return -1;
+    smp_assign_stacks();
 
     boot_cpu_idx = boot_cpu;
     boot_cpu_mpidr = mrs(MPIDR_EL1);
@@ -905,6 +1005,7 @@ int smp_init(void)
 
         cpu_nodes[cpu_id] = node;
     }
+    smp_assign_stacks();
 
     int running_cpu = -1;
     for (int i = 0; i < MAX_CPUS; i++) {
@@ -975,7 +1076,12 @@ int smp_init(void)
         cpu_info[i].valid = true;
         cpu_info[i].core = FIELD_GET(CPU_REG_CORE, reg);
         cpu_info[i].cluster = FIELD_GET(CPU_REG_CLUSTER, reg);
-        cpu_info[i].die = FIELD_GET(CPU_REG_DIE, reg);
+        /* T6050 Ultra's reg puts the die at bit 12 (die 1 = 0x1000); use die-id where given. */
+        u32 die_id;
+        if (ADT_GETPROP(adt, cpu_node, "die-id", &die_id) == sizeof(die_id))
+            cpu_info[i].die = die_id;
+        else
+            cpu_info[i].die = FIELD_GET(CPU_REG_DIE, reg);
         cpu_info[i].impl_reg = cpu_impl_reg[0];
 
         /* Publish a permanent stack before the first reset, including late entries. */
@@ -1022,7 +1128,7 @@ static void smp_start_t8152(void)
         if (!(rvbar & RVBAR_LOCK))
             write64(cpu->impl_reg, (u64)_vectors_start);
         sysop("dsb sy");
-        /* T8152ACC setCoreOnline/wakeCore preserve other released cores. */
+        /* Setting the start bits leaves the cores already released running. */
         set32(cpu_start_base + 4, BIT(i));
         set32(cpu_start_base + 8 + 4 * cpu->cluster, BIT(cpu->core));
         sysop("dsb sy");
@@ -1061,8 +1167,14 @@ int smp_start_secondaries(void)
     for (int i = 0; i < MAX_CPUS; i++) {
         struct cpu_info *cpu = &cpu_info[i];
 
+        /*
+         * A CPU is expected when the ADT lists it. iBoot removes the node of a core fused off on
+         * a binned part, so those never reach this loop. A listed core aura cannot describe
+         * (no reg, or no cpu-impl-reg and no /arm-io reg slot for it) cannot be started, and
+         * counts as missing on every chip.
+         */
         if (!cpu->valid) {
-            if (chip_id == T8140 && cpu_nodes[i]) {
+            if (cpu_nodes[i]) {
                 printf("SMP: ADT CPU %d has no valid implementation register\n", i);
                 failed = true;
             }
@@ -1326,4 +1438,108 @@ int smp_park_for_kernel(void)
     }
     sysop("dsb sy");
     return 0;
+}
+
+/*
+ * ADT reg omits MPIDR Aff2, the core class. Above cluster 0 it is 1 (the performance cluster of
+ * an E/P chip, as on T8142). A boot core with a non-zero Aff2 gives it to every core of its own
+ * cluster-type (T6050's M cores: 4).
+ */
+static u64 smp_guest_mpidr(int i)
+{
+    const struct cpu_info *cpu = &cpu_info[i];
+    u64 aff2 = cpu->cluster ? 1 : 0, boot_aff2 = (boot_cpu_mpidr >> 16) & 0xff;
+    u32 len = 0, boot_len = 0;
+
+    if (boot_aff2 && boot_cpu_idx >= 0) {
+        const char *type = adt_getprop(adt, cpu_nodes[i], "cluster-type", &len);
+        const char *boot = adt_getprop(adt, cpu_nodes[boot_cpu_idx], "cluster-type", &boot_len);
+        if (type && boot && len && boot_len && type[0] == boot[0])
+            aff2 = boot_aff2;
+    }
+    return ((u64)cpu->cluster << 8) | cpu->core | (aff2 << 16);
+}
+
+/*
+ * Under the virtualized SPTM every core enters the guest through a hardware reset, as natively:
+ * XNU starts a core with PMGR CPUSTART, and a core that power-gates in idle or sleep comes back
+ * the same way, at its iBoot-locked RVBAR, which must reach aura (sptm_virt_cpu_reset). So nothing
+ * is started here: publish each core's reset stack by MPIDR (cpu_reset finds it with the MMU
+ * off), make sure its RVBAR lands in aura, and clean the image to DRAM for MMU-off readers.
+ */
+int smp_prepare_guest_resets(void)
+{
+    int ready = 0;
+
+    if (!smp_initialized)
+        return -1;
+
+    for (int i = 0; i < MAX_CPUS; i++) {
+        struct cpu_info *cpu = &cpu_info[i];
+        if (!cpu->valid)
+            continue;
+        u64 mpidr = smp_guest_mpidr(i);
+        u64 rvbar = read64(cpu->impl_reg);
+        int rc = 0;
+
+        if (i == boot_cpu_idx) {
+            if (smp_reset_stacks[i].mpidr != mpidr)
+                printf("SMP-guest: boot cpu%d MPIDR 0x%lx, ADT-derived 0x%lx\n", i,
+                       smp_reset_stacks[i].mpidr, mpidr);
+        } else {
+            if (!cpu_stack(i)) {
+                printf("SMP-guest: cpu%d has no reset stack\n", i);
+                continue;
+            }
+            smp_reset_stacks[i].mpidr = mpidr;
+            smp_reset_stacks[i].stack = (u64)cpu_stack(i) + SECONDARY_STACK_SIZE;
+            rc = smp_prepare_rvbar(cpu);
+        }
+        /* A secondary must be powered off here: XNU's CPUSTART only resets a core that is
+         * off, and one left running (an earlier stage's park loop) never reaches SPTM. */
+        u64 state = read64(cpu->impl_reg + 0x100) & 0xff;
+        printf("SMP-guest: cpu%d mpidr 0x%06lx rvbar 0x%lx%s -> %s, core state 0x%lx%s\n", i,
+               smp_reset_stacks[i].mpidr, rvbar & RVBAR_ADDR, (rvbar & RVBAR_LOCK) ? " locked" : "",
+               rc ? "UNREACHABLE (no relay)" : "aura", state,
+               (i != boot_cpu_idx && state) ? " (RUNNING!)" : "");
+        if (!rc)
+            ready++;
+    }
+
+    /* Text/rodata, then data+bss. Not the stacks: the boot stack has an unmapped guard
+     * page at _stack_top (a clean over [_base, _end) faults there), and no other core
+     * reads another's stack. */
+    dc_cvac_range((void *)_base, _rodata_end - (char *)_base);
+    dc_cvac_range((void *)_data_start, _bss_end - _data_start);
+    mmu_publish_secondary();
+    sysop("dsb sy");
+    return ready;
+}
+
+int smp_index_for_mpidr(u64 mpidr)
+{
+    mpidr &= 0xffffff;
+    for (int i = 0; i < MAX_CPUS; i++)
+        if (smp_reset_stacks[i].mpidr == mpidr && smp_reset_stacks[i].stack &&
+            (i == boot_cpu_idx || cpu_info[i].valid))
+            return i;
+    return -1;
+}
+
+bool smp_cpu_valid(int cpu)
+{
+    return cpu >= 0 && cpu < MAX_CPUS && cpu_info[cpu].valid;
+}
+
+/* The memory a core's reset path writes with the MMU off: invalidate any line a previous
+ * (cacheable) life of this core left in the cluster cache before it turns its MMU on. */
+void smp_reset_stack_range(int cpu, u64 *base, u64 *size)
+{
+    if (cpu == boot_cpu_idx) {
+        *base = (u64)_stack_top;
+        *size = (u64)_stack_bot - (u64)_stack_top;
+    } else {
+        *base = (u64)cpu_stack(cpu);
+        *size = cpu_stack(cpu) ? SECONDARY_STACK_SIZE : 0;
+    }
 }

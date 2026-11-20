@@ -15,7 +15,8 @@ def test_isp_reservation_no_space(tmp_path):
         start = source.index(signature)
         return source[start:source.index("\n}", start) + 2]
 
-    firmware = definition("static int dt_reserve_asc_segments(") + "\n" + \
+    firmware = definition("static int dt_reserve_asc_segments_at(") + "\n" + \
+        definition("static int dt_reserve_asc_segments(") + "\n" + \
         definition("static int dt_reserve_asc_firmware(")
     heap = definition("static int dt_set_isp_fwdata(void)")
     harness = r'''
@@ -35,8 +36,10 @@ typedef uint32_t u32;
 static u32 chip_id;
 static unsigned int mappings, links;
 #define ALIGN_UP(x, a) (((x) + (a) - 1) & ~((a) - 1))
-/* Stub: the T6041 ISP handoff isn't exercised here. */
-__attribute__((unused)) static int dt_set_isp_t6041(int node) { (void)node; return 0; }
+/* Stub: placeholder-based ISP handoff isn't exercised here. */
+__attribute__((unused)) static bool dt_isp_has_placeholders(void) { return false; }
+__attribute__((unused)) static int dt_fill_isp_placeholders(int node, bool req)
+{ (void)node; (void)req; return 0; }
 #define V13_5 0
 #define V13_6_1 1
 #define bail(...) do { return -1; } while (0)
@@ -64,8 +67,10 @@ static int dt_get_or_add_reserved_mem(const char *name, const char *compat,
 static int dt_device_set_reserved_mem(int node, const char *name, u32 handle,
                                       u64 iova, u64 size)
 { (void)node; (void)name; (void)handle; (void)iova; (void)size; mappings++; return 0; }
-static int dt_device_add_mem_region(const char *path, u32 handle, const char *name)
-{ (void)path; (void)handle; (void)name; links++; return 0; }
+static int fdt_node_offset_by_phandle(const void *tree, u32 handle)
+{ (void)tree; (void)handle; return 1; }
+static int fdt_appendprop_u32(void *tree, int node, const char *name, u32 value)
+{ (void)tree; (void)node; (void)name; (void)value; links++; return 0; }
 static int firmware_set_fdt(void *tree, int node, const char *name,
                             const struct fw_version_info *version)
 { (void)tree; (void)node; (void)name; (void)version; return 0; }

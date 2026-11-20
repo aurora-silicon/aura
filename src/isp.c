@@ -10,6 +10,38 @@
 #include "utils.h"
 #include "xnuboot.h"
 
+#include "libfdt/libfdt.h"
+
+/*
+ * Loader ISP power-up and heap carveout apply only when the kernel tree enables an
+ * `isp` node that has neither firmware segment placeholders nor a kernel-managed ISP
+ * compatible (apple,t8132-isp, apple,t6041-isp on T6040/T6041, apple,t6050-isp).
+ */
+bool isp_fdt_needs_init(const void *fdt)
+{
+    static const char *const kernel_owned[] = {
+        "apple,t8132-isp",
+        "apple,t6041-isp",
+        "apple,t6050-isp",
+    };
+    if (!fdt || fdt_check_header(fdt) != 0)
+        return false;
+    int isp = fdt_path_offset(fdt, "isp");
+    if (isp < 0)
+        return false;
+    const char *status = fdt_getprop(fdt, isp, "status", NULL);
+    if (status && strcmp(status, "okay") && strcmp(status, "ok"))
+        return false;
+    int resv = fdt_path_offset(fdt, "/reserved-memory");
+    if (resv >= 0 && fdt_subnode_offset(fdt, resv, "isp-firmware-text") >= 0 &&
+        fdt_subnode_offset(fdt, resv, "isp-firmware-data") >= 0)
+        return false;
+    for (size_t i = 0; i < ARRAY_SIZE(kernel_owned); i++)
+        if (!fdt_node_check_compatible(fdt, isp, kernel_owned[i]))
+            return false;
+    return true;
+}
+
 #define ISP_ASC_VERSION 0x1800000
 
 #define ISP_VER_T8103 0xb0090
@@ -56,6 +88,11 @@ static const struct {
 static bool isp_initialized = false;
 static u64 heap_phys, heap_iova, heap_size;
 
+void isp_reset(void)
+{
+    isp_initialized = false;
+}
+
 int isp_get_heap(u64 *phys, u64 *iova, u64 *size)
 {
     if (!isp_initialized)
@@ -78,6 +115,21 @@ u64 isp_iova_base(void)
     }
 }
 
+/*
+ * The ISP17a generation (A18 Pro T8140, M5 T8142) is the one the ADT names "isp,isp-generic-ex"
+ * (the others are "isp,isp-generic-1" or "isp,<soc>"). Its power is split between a global and a
+ * local PMGR aperture and it stays powered for the OS handoff, so it takes its own
+ * power-up, heap and handoff path. The revision register can't tell it apart before that
+ * power-up, so the ADT compatible is the key.
+ */
+bool isp_is_isp17a(void)
+{
+    int node = adt_path_offset(adt, "/arm-io/isp");
+    if (node < 0)
+        node = adt_path_offset(adt, "/arm-io/isp0");
+    return node >= 0 && adt_is_compatible(adt, node, "isp,isp-generic-ex");
+}
+
 static int isp_firmware_end(const struct adt_segment_ranges *segments, u32 length, u64 *end)
 {
     if (!segments || length < 2 * sizeof(*segments) || length % sizeof(*segments))
@@ -95,14 +147,12 @@ static int isp_firmware_end(const struct adt_segment_ranges *segments, u32 lengt
 
 int isp_init(void)
 {
-    /* The T6050 kernel owns power-up. Its handoff only reserves memory. */
-    if (chip_id == T6050)
-        return 0;
+    isp_initialized = false;
 
     int err = -1;
-    /* T8142 takes the T8140 (ISP17a) path throughout. */
-    bool t8142 = chip_id == T8142;
-    bool t8140 = chip_id == T8140 || t8142;
+    /* Every ISP17a takes the same path; T8142 keeps its own measured constants below. */
+    bool t8140 = isp_is_isp17a();
+    bool t8142 = t8140 && chip_id == T8142;
     bool powered = false;
     unsigned int local_powered = 0;
     unsigned int global_attempted = 0;
@@ -248,10 +298,10 @@ int isp_init(void)
         /* The J813 revision is not known yet; it is printed above. */
         /*
          * 27.0's ISP firmware moves the __TEXT/__DATA split but still ends at ISP_T8142_SEG_END
-         * (J813 ADTs of both), which the segment check below still verifies.
+         * (J813 ADTs of both), which the segment check below still verifies. So does 27.2's.
          */
         if (os_firmware.version != V26_6 && os_firmware.version != V26_6_2 &&
-            os_firmware.version != V27_0) {
+            os_firmware.version != V27_0 && os_firmware.version != V27_2) {
             reason = "unsupported T8142 firmware";
             goto out;
         }

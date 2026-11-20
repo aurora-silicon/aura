@@ -10,6 +10,7 @@
 #include "iodev.h"
 #include "malloc.h"
 #include "pmgr.h"
+#include "sptm_virt.h"
 #include "string.h"
 #include "tps6598x.h"
 #include "tunables.h"
@@ -91,17 +92,33 @@ static bool usb_is_initialized = false;
 #define PIPEHANDLER_DUMMY_PHY_EN         BIT(15)
 #define PIPEHANDLER_NATIVE_POWER_DOWN    GENMASK(3, 0)
 
+/*
+ * Resolve the ADT path of a USB port node. Most ADTs number every port's nodes
+ * (usb-drd0, dart-usb0/mapper-usb0), but an ADT with a single port may name them
+ * without an index (J700: usb-drd, dart-usb/mapper-usb). Use the numbered node
+ * whenever it exists; for port 0 only, fall back to the unnumbered name when the
+ * numbered node is missing and the unnumbered one exists. An unnumbered node can
+ * only stand for the one port, so other indices never fall back.
+ */
+static void usb_adt_node_path(char *path, size_t size, const char *fmt, const char *unindexed,
+                              u32 idx)
+{
+    snprintf(path, size, fmt, idx, idx);
+    if (idx != 0 || adt_path_offset(adt, path) >= 0)
+        return;
+    if (adt_path_offset(adt, unindexed) >= 0) {
+        printf("usb: %s missing, using %s\n", path, unindexed);
+        snprintf(path, size, "%s", unindexed);
+    }
+}
+
 static dart_dev_t *usb_dart_init(u32 idx)
 {
     int mapper_offset;
     char path[sizeof(FMT_DART_MAPPER_PATH)];
 
-    snprintf(path, sizeof(path), FMT_DART_MAPPER_PATH, idx, idx);
+    usb_adt_node_path(path, sizeof(path), FMT_DART_MAPPER_PATH, "/arm-io/dart-usb/mapper-usb", idx);
     mapper_offset = adt_path_offset(adt, path);
-    if (mapper_offset < 0 && chip_id == T8140 && idx == 0) {
-        snprintf(path, sizeof(path), "/arm-io/dart-usb/mapper-usb");
-        mapper_offset = adt_path_offset(adt, path);
-    }
     if (mapper_offset < 0) {
         // Device not present
         return NULL;
@@ -113,21 +130,14 @@ static dart_dev_t *usb_dart_init(u32 idx)
         return NULL;
     }
 
-    snprintf(path, sizeof(path), FMT_DART_PATH, idx);
-    if (chip_id == T8140 && idx == 0 && adt_path_offset(adt, path) < 0)
-        snprintf(path, sizeof(path), "/arm-io/dart-usb");
+    usb_adt_node_path(path, sizeof(path), FMT_DART_PATH, "/arm-io/dart-usb", idx);
     return dart_init_adt(path, 1, dart_idx, false);
 }
 
 static int usb_drd_adt_offset(u32 idx, char drd_path[sizeof(FMT_DRD_PATH)], int *adt_drd_path)
 {
-    snprintf(drd_path, sizeof(FMT_DRD_PATH), FMT_DRD_PATH, idx);
-    int offset = adt_path_offset_trace(adt, drd_path, adt_drd_path);
-    if (offset < 0 && chip_id == T8140 && idx == 0) {
-        snprintf(drd_path, sizeof(FMT_DRD_PATH), "/arm-io/usb-drd");
-        offset = adt_path_offset_trace(adt, drd_path, adt_drd_path);
-    }
-    return offset;
+    usb_adt_node_path(drd_path, sizeof(FMT_DRD_PATH), FMT_DRD_PATH, "/arm-io/usb-drd", idx);
+    return adt_path_offset_trace(adt, drd_path, adt_drd_path);
 }
 
 /* T6050 has a different PIPE clock field. Never run the older automatic
@@ -140,7 +150,12 @@ bool usb_cdc_deferred_usb2(void)
     /* This is also queried on every proxy poll; the firmware ADT is fixed. */
     if (deferred < 0) {
         int node = adt_path_offset(adt, "/arm-io/atc-phy0");
-        deferred = node >= 0 && adt_is_compatible(adt, node, "atc-phy,t6050");
+        /*
+         * The J714c (M5 Max) enumerates through the generic gadget path on every port, as the
+         * omacom m1n1 Stage 1 does there; the explicit port-0 setup never comes up on it.
+         */
+        deferred = node >= 0 && adt_is_compatible(adt, node, "atc-phy,t6050") &&
+                   !adt_is_compatible(adt, 0, "J714cAP");
     }
     return deferred;
 }
@@ -298,9 +313,19 @@ static dwc3_dev_t *usb_t6050_init(void (*set_step)(unsigned step))
 /*
  * The ADT marks ports that must never run as a USB device with usb-device-disable, for
  * example the J773 front ports, whose hub prohibits device mode. Leave those alone.
+ *
+ * The T8140 CDC handoff (usb_cdc_link_start) is the exception: J700's ATC0 usb-drd carries
+ * the property too, yet that port is the debug port. The handoff has already cold-reset its
+ * HPM and taken the carrier over, and explicitly asks for device mode on it, so it bypasses
+ * the property. Every other bring-up still honours it.
  */
+static bool usb_cdc_device_override;
+
 static bool usb_device_mode_disabled(u32 idx)
 {
+    if (usb_cdc_device_override && chip_id == T8140 && idx == 0)
+        return false;
+
     int adt_drd_path[8];
     char drd_path[sizeof(FMT_DRD_PATH)];
     int node = usb_drd_adt_offset(idx, drd_path, adt_drd_path);
@@ -369,15 +394,11 @@ int usb_phy_bringup(u32 idx)
     if (pmgr_adt_power_enable(path) < 0)
         return -1;
 
-    snprintf(path, sizeof(path), FMT_DART_PATH, idx);
-    if (chip_id == T8140 && idx == 0)
-        snprintf(path, sizeof(path), "/arm-io/dart-usb");
+    usb_adt_node_path(path, sizeof(path), FMT_DART_PATH, "/arm-io/dart-usb", idx);
     if (pmgr_adt_power_enable(path) < 0)
         return -1;
 
-    snprintf(path, sizeof(path), FMT_DRD_PATH, idx);
-    if (chip_id == T8140 && idx == 0)
-        snprintf(path, sizeof(path), "/arm-io/usb-drd");
+    usb_adt_node_path(path, sizeof(path), FMT_DRD_PATH, "/arm-io/usb-drd", idx);
     if (pmgr_adt_power_enable(path) < 0)
         return -1;
 
@@ -455,7 +476,7 @@ dwc3_dev_t *usb_iodev_bringup(u32 idx)
 USB_IODEV_WRAPPER(0, CDC_ACM_PIPE_0)
 USB_IODEV_WRAPPER(1, CDC_ACM_PIPE_1)
 
-static struct iodev_ops iodev_usb_ops = {
+struct iodev_ops iodev_usb_ops = {
     .can_read = usb_0_can_read,
     .can_write = usb_0_can_write,
     .read = usb_0_read,
@@ -626,17 +647,24 @@ void usb_iodev_init(void)
     }
 }
 
-void usb_iodev_shutdown(void)
+/* False when a controller may still reach its DMA buffers (they are retained, see usb_dwc3.h). */
+bool usb_iodev_shutdown(void)
 {
+    bool stopped = true;
+
     for (int i = FIRST_USB_IODEV; i < USB_IODEV_COUNT; i++) {
         struct iodev *usb_iodev = iodev_unregister_device(IODEV_USB0 + i);
         if (!usb_iodev)
             continue;
 
         printf("USB%d: shutdown\n", i);
-        usb_dwc3_shutdown(usb_iodev->opaque);
+        if (!usb_dwc3_shutdown(usb_iodev->opaque)) {
+            printf("USB%d: controller not stopped, its DMA buffers are retained\n", i);
+            stopped = false;
+        }
         free(usb_iodev);
     }
+    return stopped;
 }
 
 void usb_iodev_vuart_setup(iodev_id_t iodev)
@@ -645,6 +673,30 @@ void usb_iodev_vuart_setup(iodev_id_t iodev)
         return;
 
     iodev_usb_vuart.opaque = iodev_get_opaque(iodev);
+}
+
+/*
+ * The waits of the CDC link's bring-up. Under the virtualized SPTM the link can come back on a
+ * running macOS, where the bring-up runs on a coroutine and these give the core back to the guest
+ * instead of spinning.
+ */
+void usb_cdc_wait_us(u32 us)
+{
+    if (!sptm_virt_s2r_usb_yield(us) && us)
+        udelay(us);
+}
+
+int usb_cdc_poll32(u64 addr, u32 mask, u32 target, u32 timeout_us)
+{
+    if (!sptm_virt_s2r_usb_yieldable())
+        return poll32(addr, mask, target, timeout_us);
+    u64 end = mrs(CNTPCT_EL0) + (u64)timeout_us * mrs(CNTFRQ_EL0) / 1000000;
+    while ((read32(addr) & mask) != target) {
+        if (mrs(CNTPCT_EL0) >= end)
+            return -1;
+        usb_cdc_wait_us(0);
+    }
+    return 0;
 }
 
 int usb_cdc_link_start(void (*set_step)(unsigned step), bool force_swapped)
@@ -677,11 +729,16 @@ int usb_cdc_link_start(void (*set_step)(unsigned step), bool force_swapped)
         return -1;
     set_step(3);
     usb_cdc_atc_force_swapped(force_swapped);
-    if (usb_phy_bringup(0))
+    usb_cdc_device_override = true;
+    int phy = usb_phy_bringup(0);
+    if (phy) {
+        usb_cdc_device_override = false;
         return -1;
+    }
 
     set_step(4);
     dwc3_dev_t *dwc = usb_iodev_bringup(0);
+    usb_cdc_device_override = false;
     if (!dwc)
         return -1;
 

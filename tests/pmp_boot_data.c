@@ -7,6 +7,7 @@
 
 #include "libfdt/libfdt.h"
 typedef uint32_t u32;
+#define ARRAY_SIZE(s) (sizeof(s) / sizeof((s)[0]))
 #define T6000 0x6000
 #define T8112 0x8112
 #define T8122 0x8122

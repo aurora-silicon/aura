@@ -17,6 +17,23 @@ from .virtutils import *
 from .virtio import *
 from .sprr import patch_text_sprr_emu
 
+
+def pmgr_hook_devs(iodev):
+    """PMGR devices whose power state the hypervisor keeps alive for the proxy session."""
+    devs = ["UART0"]
+    if iodev >= IODEV.USB0:
+        idx = iodev - IODEV.USB0
+        devs += [f"ATC{idx}_USB", f"ATC{idx}_USB_AON"]
+    return devs
+
+# Offset of the CPU-start block from PMGR0 reg 0. Keep in step with smp.c (tests/python/test_hv_cpustart_offsets.py).
+CPU_START_OFFSETS = {
+    **dict.fromkeys((0x8103, 0x6000, 0x6001, 0x6002), 0x54000),
+    **dict.fromkeys((0x8112, 0x8122, 0x8132, 0x8140, 0x8142, 0x6030), 0x34000),
+    **dict.fromkeys((0x6020, 0x6021, 0x6022), 0x28000),
+    **dict.fromkeys((0x6031, 0x6032, 0x6034, 0x6040, 0x6041, 0x6050, 0x6051), 0x88000),
+}
+
 __all__ = ["HV"]
 
 class HV(Reloadable):
@@ -1486,10 +1503,7 @@ class HV(Reloadable):
             self.log(f"PMGR R {base:x}+{off:x}:{width} = 0x{data:x} -> 0x{ret:x}")
             return ret
 
-        atc = f"ATC{self.iodev - IODEV.USB0}_USB"
-        atc_aon = f"ATC{self.iodev - IODEV.USB0}_USB_AON"
-
-        hook_devs = ["UART0", atc, atc_aon]
+        hook_devs = pmgr_hook_devs(self.iodev)
 
         pmgr = self.adt["/arm-io/pmgr"]
         dev_by_name = {dev.name: dev for dev in pmgr.devices}
@@ -1559,17 +1573,10 @@ class HV(Reloadable):
 
         for die in range(0, die_count):
             chip_id = self.u.adt["/chosen"].chip_id
-            if chip_id in (0x8103, 0x6000, 0x6001, 0x6002):
-                cpu_start = 0x54000 + die * 0x20_0000_0000
-            elif chip_id in (0x8112, 0x8122, 0x8132, 0x8140, 0x6030):
-                cpu_start = 0x34000 + die * 0x20_0000_0000
-            elif chip_id in (0x6020, 0x6021, 0x6022):
-                cpu_start = 0x28000 + die * 0x20_0000_0000
-            elif chip_id in (0x6031, 0x6032, 0x6034, 0x6040, 0x6041):
-                cpu_start = 0x88000 + die * 0x20_0000_0000
-            else:
+            if chip_id not in CPU_START_OFFSETS:
                 self.log("CPUSTART unknown for this SoC!")
                 break
+            cpu_start = CPU_START_OFFSETS[chip_id] + die * 0x20_0000_0000
 
             zone = irange(pmgr0_start + cpu_start, 0x20)
             self.map_hook(pmgr0_start + cpu_start, 0x20, write=cpustart_wh)

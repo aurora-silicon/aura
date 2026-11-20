@@ -26,7 +26,7 @@ def host(tmp_path_factory):
     return build_host(tmp_path_factory.mktemp("t6041"))
 
 
-def build_host(tmp, unknown_profile=False):
+def build_host(tmp, unknown_profile=False, host_source="t6041_display_host.c"):
     cc = host_cc()
     if not shutil.which(cc[0]):
         pytest.skip("no host C compiler")
@@ -46,6 +46,8 @@ def build_host(tmp, unknown_profile=False):
         code = code[:start] + record.replace(".os_fw = V26_6_2,", ".os_fw = V_UNKNOWN,") + code[end:]
     (src / "kboot_display_handoff.c").write_text(code)
     shutil.copy(ROOT / "tests/t6041_display_host.c", src)
+    if host_source != "t6041_display_host.c":
+        shutil.copy(ROOT / "tests" / host_source, src)
     for header in (ROOT / "tests/t8122_display_host").glob("*.h"):
         shutil.copy(header, src)
     binary = tmp / "t6041-display-host"
@@ -54,7 +56,7 @@ def build_host(tmp, unknown_profile=False):
          "-Wno-format", "-Wno-format-truncation", "-fsanitize=address,undefined",
          "-fno-omit-frame-pointer", "-fno-sanitize-recover=undefined",
          "-I", str(src), "-I", str(ROOT / "src"),
-         str(src / "t6041_display_host.c"), str(src / "kboot_display_handoff.c"),
+         str(src / host_source), str(src / "kboot_display_handoff.c"),
          *(str(ROOT / "src/libfdt" / f) for f in LIBFDT), "-o", str(binary)],
         check=True,
     )
@@ -94,16 +96,17 @@ REASONS = {
     "stale-optin-zero": PUBLISHED,
     "repeat": "handoff already published",
     "oslog-in-memreserve": "lies inside /memreserve/",
+    "os-26-7-train": PUBLISHED,
     "wrong-chip": "not a J616s/J614s (chip 0x6041): nothing done",
     "wrong-board": "not a J616s/J614s (chip 0x6040): nothing done",
     "j614-no-optin": PUBLISHED,
     "j614-optin": PUBLISHED,
     "j616c": PUBLISHED,
     "j616c-external": PUBLISHED,
-    "j616c-on-t6040": "not a J616C/J614C (chip 0x6040): nothing done",
+    "j616c-on-t6040": "not a J616C/J614C/J575C (chip 0x6040): nothing done",
     "j614c": PUBLISHED,
     "j614c-external": PUBLISHED,
-    "j614c-on-t6040": "not a J616C/J614C (chip 0x6040): nothing done",
+    "j614c-on-t6040": "not a J616C/J614C/J575C (chip 0x6040): nothing done",
     "no-display-dt": NOT_DESCRIBED,
     "no-dcp-alias": NOT_DESCRIBED,
     "wrong-dcp-compat": NOT_DESCRIBED,

@@ -24,6 +24,13 @@ __attribute__((noinline)) bool ctxr_range(enum ctxr_range range, u64 *start, u64
 bool ctxr_exec_confined(void);
 /* The physical window the OS runs in at EL2, false if there is none to use. */
 bool ctxr_exec_window(u64 *base, u64 *size);
+/*
+ * Ask for the window at the same address on every boot of this boot object (kboot's hib=1), before
+ * the window is first looked up. False when it is too late for this boot.
+ */
+bool ctxr_exec_request_fixed_window(bool on);
+/* Whether the window the OS gets is that fixed one. */
+bool ctxr_exec_window_is_fixed(void);
 /* False on a confined machine with no window, or with a probe still pending, having said why. */
 bool ctxr_exec_os_may_start(void);
 

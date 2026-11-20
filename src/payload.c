@@ -17,7 +17,11 @@
 #include "mitigations.h"
 #include "nvme.h"
 #include "payload_profile.h"
+#include "secboot.h"
 #include "smp.h"
+#ifdef SPTM_VIRT_ESP
+#include "sptm_virt.h"
+#endif
 #include "stage1_config.h"
 #include "utils.h"
 
@@ -62,6 +66,9 @@ static void *fdt = NULL;
 static int fdt_rank;
 static char *chainload_spec = NULL;
 static char *boot_spec = NULL;
+#ifdef SPTM_VIRT_ESP
+static char *macos_spec = NULL; /* macos=: boot macOS under SPTM-virt from the ESP */
+#endif
 static bool payload_scanned = false;
 #ifndef ESP_STAGE2
 static bool stage1_config_applied = false;
@@ -151,7 +158,7 @@ static void *decompress_xz(void *p, size_t size)
 
 static void *load_fdt(void *p, size_t size)
 {
-    int rank = payload_profile_rank(p, os_firmware.version == V26_6_2);
+    int rank = payload_profile_rank(p, firmware_os_components() == V26_6_2);
     if (rank && rank >= fdt_rank && fdt_node_check_compatible(p, 0, expect_compatible) == 0) {
         printf("Found a devicetree for %s at %p\n", expect_compatible, p);
         fdt = p;
@@ -173,9 +180,12 @@ static void *load_cpio(void *p, size_t size)
     return ((u8 *)p) + size;
 }
 
+static size_t kernel_payload_size;
+
 static void *load_kernel(void *p, size_t size)
 {
     kernel = p;
+    kernel_payload_size = size ? size : kernel->image_size;
 
     assert(size <= kernel->image_size);
 
@@ -236,8 +246,12 @@ static bool config_seen = false;
 static bool config_lost_passed = false;
 
 static const char *const config_names[] = {
-    "chosen.",  "chainload=",   "boot=", "nvme.sart=",
-    "display=", "mitigations=", "tso=",  "m1n1.config-lost="};
+    "chosen.", "chainload=",        "boot=", "nvme.sart=", "display=", "mitigations=",
+    "tso=",    "m1n1.config-lost=", "hib=",
+#ifdef SPTM_VIRT_ESP
+    "macos=",
+#endif
+};
 
 /* The start of a line of a variable m1n1 knows */
 static bool config_line(const char *s)
@@ -291,6 +305,11 @@ static bool check_var(u8 **p)
     } else if (IS_VAR("boot=")) {
         if (!boot_spec)
             boot_spec = val;
+#ifdef SPTM_VIRT_ESP
+    } else if (IS_VAR("macos=")) {
+        if (!macos_spec)
+            macos_spec = val;
+#endif
     } else if (IS_VAR("nvme.sart=")) {
         /* Started by an earlier aura stage, which has had its host window already. */
         if (nvme_set_sart_var(val))
@@ -310,6 +329,8 @@ static bool check_var(u8 **p)
         mitigations_configure(val);
     } else if (IS_VAR("tso=")) {
         enable_tso = val[0] == '1';
+    } else if (IS_VAR("hib=")) {
+        kboot_request_hibernate_layout(val[0] == '1');
     } else {
         printf("Unknown variable %.*s\n", (int)(val - (char *)*p - 1), (char *)*p);
     }
@@ -346,6 +367,9 @@ static void *load_one_payload(void *start, size_t size)
         memcpy(&size, p + hdr, 4);
 
         printf("Found a signature at %p, skipping 0x%x bytes\n", p, size);
+        /* An image trailer (secboot.c) ends the image: nothing after it is a payload. */
+        if (!memcmp(p + size + 8, "AURSIGT1", 8))
+            return NULL;
         return p + size;
     } else if ((hdr = payload_record(p, initramfs_magic, sizeof initramfs_magic))) {
         u32 size;
@@ -443,9 +467,14 @@ int payload_run(void)
     }
 
     if (!payload_scanned) {
-        void *p = payload_start();
+        u8 *p = payload_start();
+        /* Before anything in the payloads is parsed: an enforcing stage runs only signed ones. */
+        if (secboot_check_payloads(p, &p)) {
+            next_stage.entry = NULL;
+            return -1;
+        }
         cpufreq_payload_boost(true);
-        while (p)
+        while (p && (p = secboot_payload_next(p)))
             p = load_one_payload(p, 0);
         cpufreq_payload_boost(false);
         payload_scanned = true;
@@ -482,6 +511,18 @@ int payload_run(void)
         return -1;
     }
 
+#ifdef SPTM_VIRT_ESP
+    if (macos_spec) {
+        /* An explicit line in this image only, never a default: returns only on failure. */
+        next_stage.entry = NULL;
+        if (chainload_spec || boot_spec)
+            printf("Payload: macos= takes this boot; ignoring boot= and chainload=\n");
+        sptm_virt_esp_boot(macos_spec);
+        nvme_shutdown();
+        return -1;
+    }
+#endif
+
     if (chainload_spec) {
         next_stage.entry = NULL;
         /* Last, after every owner line, in a slot of its own: the next stage cannot miss it */
@@ -509,46 +550,57 @@ int payload_run(void)
     }
 
     if (kernel && fdt) {
+#ifdef BRINGUP
         /*
-         * Linux adopts a running post-M4 ANS from boot=. Any other payload starts ANS itself:
-         * power it off before kboot's pcie_init(), which brings its PCIe block and the radio's
-         * link back up, and kboot_prepare_dt() passes the SART entries on.
+         * A BRINGUP build skips MMU, MCC, AIC and SMP init: no carveouts are unmapped and no
+         * secondary CPU is started or set up. A kernel would get a half-initialized machine, so
+         * these builds never hand off; they are for the proxy only. Refuse here, before NVMe or
+         * CPU work, with a message that says why.
          */
-        nvme_keep_running_for_linux = boot_spec != NULL;
-        if (!boot_spec && !nvme_shutdown())
+        printf("BRINGUP build: kernel handoff is not supported (no MMU/MCC/AIC/SMP init); "
+               "use the proxy\n");
+        goto boot_failed;
+#endif
+        /*
+         * Linux adopts a running post-M4 ANS from boot=. The U-Boot we embed adopts a running
+         * post-M4 ANS too, and can't start one from off: if an earlier stage powered ANS off
+         * (nvme.sart=), start it here and hand it on running, as for boot=. Otherwise any other
+         * payload gets ANS as this stage found it, or powered off with the SART entries passed
+         * on if this stage used it.
+         */
+        bool nvme_started = !boot_spec && nvme_post_m4_passed_off();
+        if (nvme_started && !nvme_init())
+            goto boot_failed;
+        nvme_keep_running_for_linux = boot_spec || nvme_started;
+        if (!nvme_keep_running_for_linux && !nvme_shutdown())
             goto boot_failed;
         cpufreq_init();
-        if (smp_start_secondaries() && chip_id == T8140) {
-            printf("SMP: refusing payload handoff with missing T8140 CPUs\n");
+        /*
+         * Fail closed on every chip. smp_start_secondaries() only counts a CPU as missing when
+         * the ADT lists it: iBoot drops the node of a fused-off core (J773s has no cpu9), so a
+         * binned part has nothing missing. A listed core that did not start, or one that did
+         * not take its mitigation or TSO setup, would reach the kernel half initialized.
+         */
+        if (smp_start_secondaries()) {
+            printf("SMP: refusing payload handoff with missing CPUs\n");
             goto boot_failed;
         }
-        int mitigation_ret = mitigations_perform();
-        if (mitigation_ret) {
-            if (mitigation_ret == SMP_TIMEOUT || chip_id == T8140)
-                goto boot_failed;
-            printf("Mitigations: continuing payload handoff with incomplete CPU initialization\n");
+        if (mitigations_perform()) {
+            printf("Mitigations: refusing payload handoff with incomplete CPU initialization\n");
+            goto boot_failed;
         }
         if (enable_tso) {
             kboot_delete_chosen("apple,tso");
-            bool tso_failed = false;
             do_enable_tso();
             for (int i = 0; i < MAX_CPUS; i++) {
                 if (i == boot_cpu_idx)
                     continue;
-                if (smp_is_alive(i)) {
-                    int ret = smp_call_sync0(i, do_enable_tso);
-                    if (ret) {
-                        printf("TSO: CPU %d initialization failed\n", i);
-                        if (ret == SMP_TIMEOUT || chip_id == T8140)
-                            goto boot_failed;
-                        tso_failed = true;
-                    }
+                if (smp_is_alive(i) && smp_call_sync0(i, do_enable_tso)) {
+                    printf("TSO: CPU %d initialization failed, refusing payload handoff\n", i);
+                    goto boot_failed;
                 }
             }
-            if (!tso_failed)
-                kboot_set_chosen("apple,tso", "");
-            else
-                printf("TSO: continuing payload handoff without advertising complete TSO setup\n");
+            kboot_set_chosen("apple,tso", "");
         }
 
         for (size_t i = 0; i < chosen_cnt; i++) {
@@ -564,6 +616,20 @@ int payload_run(void)
 
         if (config_lost)
             kboot_set_config_lost();
+        if (!boot_spec) {
+            secboot_measure("dtb", fdt, fdt_totalsize(fdt), SECBOOT_MEASURED);
+            secboot_measure("kernel", kernel, kernel_payload_size, SECBOOT_MEASURED);
+        }
+#ifdef SPTM_VIRT_ESP
+        /*
+         * A macOS-only ESP stage 2 (SPTM_VIRT_ESP) boots via the macos= line above and never
+         * prepares a Linux devicetree or hands off to a kernel. The whole kboot/DT/display/GPU-
+         * initdata/PCIe tree is gated out of this build so the vital region fits below the DCP
+         * __OS_LOG buffer (aura-raw.ld _file_limit). Reaching here means a boot=/chainload= path
+         * produced a kernel+fdt, which this image deliberately does not support: fail loudly.
+         */
+        panic("payload: Linux kboot path is gated out of SPTM_VIRT_ESP builds\n");
+#else
         if (kboot_prepare_dt(fdt)) {
             printf("Failed to prepare FDT!\n");
             goto boot_failed;
@@ -572,11 +638,13 @@ int payload_run(void)
         if (kboot_boot(kernel))
             goto boot_failed;
         return 0;
+#endif
 
     boot_failed:
         next_stage.entry = NULL;
-        if (boot_spec) {
+        if (boot_spec)
             kboot_set_initrd(NULL, 0);
+        if (nvme_keep_running_for_linux) {
             nvme_keep_running_for_linux = false;
             nvme_shutdown();
         }

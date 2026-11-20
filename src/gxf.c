@@ -29,6 +29,16 @@ void gxf_init(void)
               gl1_stack[cpu] ? gl1_stack[cpu] + GL_STACK_SIZE : NULL);
 }
 
+/* Allocate a core's GL stacks ahead of time, from the boot CPU: a core entering the
+ * virtualized SPTM through a hardware reset runs gxf_init() with its MMU off. */
+void gxf_prealloc(int cpu)
+{
+    if (!gl2_stack[cpu])
+        gl2_stack[cpu] = memalign(0x4000, GL_STACK_SIZE);
+    if (in_el2() && !gl1_stack[cpu])
+        gl1_stack[cpu] = memalign(0x4000, GL_STACK_SIZE);
+}
+
 bool gxf_enabled(void)
 {
     if (!supports_gxf())

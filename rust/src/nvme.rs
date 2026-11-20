@@ -7,6 +7,7 @@ use fatfs::SeekFrom;
 
 extern "C" {
     pub(crate) fn nvme_read(nsid: u32, lba: u64, buffer: *mut c_void) -> bool;
+    pub(crate) fn nvme_dma_uncertain() -> bool;
     fn nvme_read_blocks(nsid: u32, lba: u64, buffer: *mut c_void, count: u32) -> bool;
     pub(crate) fn nvme_write(nsid: u32, lba: u64, buffer: *const c_void) -> bool;
     pub(crate) fn nvme_flush(nsid: u32) -> bool;
@@ -38,7 +39,7 @@ struct WindowBuffer([u8; SECTOR_SIZE * WINDOW_SECTORS]);
 struct Window {
     start: u64,
     sectors: u64,
-    buf: Box<WindowBuffer>,
+    buf: Option<Box<WindowBuffer>>,
 }
 
 impl Window {
@@ -48,7 +49,7 @@ impl Window {
         Window {
             start: 0,
             sectors: 0,
-            buf,
+            buf: Some(buf),
         }
     }
 
@@ -71,6 +72,7 @@ pub struct NVMEStorage {
     mru: usize,
     last_miss: Option<u64>,
     multi_ok: bool,
+    dma_uncertain: bool,
     pos: u64,
 }
 
@@ -88,6 +90,7 @@ impl NVMEStorage {
             mru: 0,
             last_miss: None,
             multi_ok: true,
+            dma_uncertain: false,
             pos: 0,
         }
     }
@@ -108,6 +111,17 @@ impl NVMEStorage {
         self.bytes_budget = Some(sectors.saturating_mul(SECTOR_SIZE as u64));
         self.op_budget = Some((1 << 20) - 1);
         self
+    }
+
+    fn retain_window_if_uncertain(&mut self, victim: usize) -> bool {
+        if unsafe { nvme_dma_uncertain() } {
+            self.dma_uncertain = true;
+            if let Some(buf) = self.windows[victim].buf.take() {
+                core::mem::forget(buf);
+            }
+            return true;
+        }
+        false
     }
 
     fn charge_op(&mut self) -> Result<(), Error> {
@@ -171,8 +185,11 @@ impl NVMEStorage {
         }
         self.charge(count as usize)?;
         self.windows[victim].sectors = 0;
-        let ptr = self.windows[victim].buf.0.as_mut_ptr() as *mut c_void;
+        let ptr = self.windows[victim].buf.as_mut().ok_or(())?.0.as_mut_ptr() as *mut c_void;
         if count > 1 && !unsafe { nvme_read_blocks(self.nsid, abs, ptr, count) } {
+            if self.retain_window_if_uncertain(victim) {
+                return Err(());
+            }
             println!(
                 "nvme_read_blocks({}, {}, {}) failed, using single-block reads",
                 self.nsid, abs, count
@@ -182,6 +199,7 @@ impl NVMEStorage {
             count = 1;
         }
         if count == 1 && !unsafe { nvme_read(self.nsid, abs, ptr) } {
+            self.retain_window_if_uncertain(victim);
             println!("nvme_read({}, {}) failed", self.nsid, abs);
             return Err(());
         }
@@ -198,6 +216,9 @@ impl fatfs::IoBase for NVMEStorage {
 
 impl fatfs::Read for NVMEStorage {
     fn read(&mut self, mut buf: &mut [u8]) -> Result<usize, Self::Error> {
+        if self.dma_uncertain {
+            return Err(());
+        }
         self.charge_op()?;
         if let Some(left) = self.bytes_budget.as_mut() {
             if *left < buf.len() as u64 {
@@ -240,6 +261,12 @@ impl fatfs::Read for NVMEStorage {
                 if !unsafe {
                     nvme_read_blocks(self.nsid, lba, bulk.0.as_mut_ptr().cast(), sectors as u32)
                 } {
+                    if unsafe { nvme_dma_uncertain() } {
+                        self.dma_uncertain = true;
+                        if let Some(buf) = self.bulk.take() {
+                            core::mem::forget(buf);
+                        }
+                    }
                     return Err(());
                 }
                 let copy_len = min(requested, sectors * SECTOR_SIZE - off);
@@ -256,7 +283,7 @@ impl fatfs::Read for NVMEStorage {
             let off = (self.pos - w.start * SECTOR_SIZE as u64) as usize;
             let avail = w.sectors as usize * SECTOR_SIZE - off;
             let copy_len = min(avail, requested);
-            buf[..copy_len].copy_from_slice(&w.buf.0[off..off + copy_len]);
+            buf[..copy_len].copy_from_slice(&w.buf.as_ref().ok_or(())?.0[off..off + copy_len]);
             buf = &mut buf[copy_len..];
             read += copy_len;
             self.pos = self.pos.checked_add(copy_len as u64).ok_or(())?;
@@ -296,12 +323,37 @@ mod tests {
         offset: u64,
         sectors: u64,
         reads: Vec<(u64, u32)>,
+        fail: bool,
+        uncertain: bool,
+        destination: usize,
+    }
+
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+    static FREED: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+    impl Drop for SectorBuffer {
+        fn drop(&mut self) {
+            FREED.lock().unwrap().push(self.0.as_ptr() as usize);
+        }
+    }
+    impl Drop for WindowBuffer {
+        fn drop(&mut self) {
+            FREED.lock().unwrap().push(self.0.as_ptr() as usize);
+        }
+    }
+    impl Drop for BulkBuffer {
+        fn drop(&mut self) {
+            FREED.lock().unwrap().push(self.0.as_ptr() as usize);
+        }
     }
 
     static MOCK: Mutex<Mock> = Mutex::new(Mock {
         offset: 0,
         sectors: 0,
         reads: Vec::new(),
+        fail: false,
+        uncertain: false,
+        destination: 0,
     });
 
     fn reset(offset: u64, sectors: u64) {
@@ -309,6 +361,9 @@ mod tests {
             offset,
             sectors,
             reads: Vec::new(),
+            fail: false,
+            uncertain: false,
+            destination: 0,
         };
     }
 
@@ -323,6 +378,10 @@ mod tests {
         assert!(relative < mock.sectors);
         assert!(count > 0 && count as u64 <= mock.sectors - relative);
         mock.reads.push((lba, count));
+        mock.destination = buffer as usize;
+        if mock.fail {
+            return false;
+        }
         for i in 0..count as usize {
             unsafe {
                 core::ptr::write_bytes(
@@ -333,6 +392,11 @@ mod tests {
             }
         }
         true
+    }
+
+    #[no_mangle]
+    extern "C" fn nvme_dma_uncertain() -> bool {
+        MOCK.lock().unwrap().uncertain
     }
 
     #[no_mangle]
@@ -353,6 +417,7 @@ mod tests {
 
     #[test]
     fn bounded_read_ahead_and_bulk_reads() {
+        let _lock = TEST_LOCK.lock().unwrap();
         reset(100, 3);
         let mut storage = NVMEStorage::new(1, 100)
             .with_extent(3)
@@ -404,5 +469,85 @@ mod tests {
         assert_eq!(storage.read(&mut byte), Ok(1));
         assert_eq!(MOCK.lock().unwrap().reads, [(u64::MAX, 1)]);
         assert!(NVMEStorage::new(1, u64::MAX).with_extent(2).is_err());
+    }
+    #[test]
+    fn uncertain_destinations_survive_storage_drop() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        FREED.lock().unwrap().clear();
+        for bulk in [false, true] {
+            reset(100, 4);
+            {
+                let mut mock = MOCK.lock().unwrap();
+                mock.fail = true;
+                mock.uncertain = true;
+            }
+            let mut storage = NVMEStorage::new(1, 100).with_extent(4).unwrap();
+            let mut bytes = vec![0; if bulk { 2 * SECTOR_SIZE } else { 1 }];
+            assert_eq!(storage.read(&mut bytes), Err(()));
+            assert!(storage.dma_uncertain);
+            let destination = MOCK.lock().unwrap().destination;
+            assert_ne!(destination, 0);
+            assert_eq!(storage.read(&mut bytes), Err(()));
+            assert_eq!(MOCK.lock().unwrap().reads.len(), 1);
+            drop(storage);
+            assert!(!FREED.lock().unwrap().contains(&destination));
+            // The mock controller has now stopped; reclaim the exact retained allocation.
+            unsafe {
+                if bulk {
+                    drop(Box::from_raw(destination as *mut BulkBuffer));
+                } else {
+                    drop(Box::from_raw(destination as *mut WindowBuffer));
+                }
+            }
+            assert!(FREED.lock().unwrap().contains(&destination));
+            FREED.lock().unwrap().clear();
+        }
+    }
+    #[test]
+    fn completed_errors_release_destinations() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        FREED.lock().unwrap().clear();
+        for bulk in [false, true] {
+            reset(100, 4);
+            MOCK.lock().unwrap().fail = true;
+            let mut storage = NVMEStorage::new(1, 100).with_extent(4).unwrap();
+            let mut bytes = vec![0; if bulk { 2 * SECTOR_SIZE } else { 1 }];
+            assert_eq!(storage.read(&mut bytes), Err(()));
+            assert!(!storage.dma_uncertain);
+            let destination = MOCK.lock().unwrap().destination;
+            drop(storage);
+            assert!(FREED.lock().unwrap().contains(&destination));
+            FREED.lock().unwrap().clear();
+        }
+    }
+    #[test]
+    fn apfs_direct_read_retains_only_uncertain_destination() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        for (fail, uncertain) in [(true, true), (true, false), (false, false), (false, true)] {
+            reset(100, 1);
+            FREED.lock().unwrap().clear();
+            {
+                let mut mock = MOCK.lock().unwrap();
+                mock.fail = fail;
+                mock.uncertain = uncertain;
+            }
+            // Run the actual APFS scanner and unwind its owned partition on failure.
+            // A successful mock read contains zeroes, so its invalid superblock also errors.
+            assert!(crate::apfs::test_scan_volume(100).is_err());
+            let mock = MOCK.lock().unwrap();
+            assert_eq!(mock.reads, [(100, 1)]);
+            let destination = mock.destination;
+            drop(mock);
+            assert_ne!(destination, 0);
+            assert_eq!(
+                FREED.lock().unwrap().contains(&destination),
+                !(fail && uncertain)
+            );
+            if fail && uncertain {
+                // The host mock has now stopped DMA; reclaim the exact retained box.
+                unsafe { drop(Box::from_raw(destination as *mut SectorBuffer)) };
+                assert!(FREED.lock().unwrap().contains(&destination));
+            }
+        }
     }
 }

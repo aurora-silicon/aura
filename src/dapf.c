@@ -22,6 +22,39 @@ struct dapf_t8020_config {
     u32 r4;
 } PACKED;
 
+/* One ADT "segment-ranges" entry (adt.h's struct adt_segment_ranges). */
+struct dapf_segment {
+    u64 phys;
+    u64 iova;
+    u64 remap;
+    u32 size;
+    u32 flags;
+} PACKED;
+static_assert(sizeof(struct dapf_segment) == 32, "Invalid segment-ranges entry size");
+
+/*
+ * A coprocessor whose firmware iBoot preloads fetches its __TEXT physically at the
+ * address iBoot latched in its reset vector, through its CPU DART's filter. The
+ * filter must admit that range. Return the preloaded __TEXT range of the ADT node
+ * that owns the DART at @path, or false when there is none.
+ */
+static bool dapf_preload_text(const char *path, u64 *start, u64 *end)
+{
+    if (strcmp(path, "/arm-io/dart-ave0"))
+        return false;
+
+    u32 len;
+    int node = adt_path_offset(adt, "/arm-io/ave0");
+    if (node < 0 || !adt_getprop(adt, node, "pre-loaded", &len))
+        return false;
+    const struct dapf_segment *seg = adt_getprop(adt, node, "segment-ranges", &len);
+    if (!seg || len < sizeof(*seg) || seg[0].size < 4 || (seg[0].phys & 3))
+        return false;
+    *start = seg[0].phys;
+    *end = seg[0].phys + ALIGN_DOWN(seg[0].size, 4) - 4;
+    return true;
+}
+
 static int dapf_init_t8020(const char *path, u64 base, int node)
 {
     u32 length;
@@ -34,6 +67,8 @@ static int dapf_init_t8020(const char *path, u64 base, int node)
     }
 
     int count = length / sizeof(*config);
+    u64 text_start, text_end;
+    bool text = dapf_preload_text(path, &text_start, &text_end);
 
     for (int i = 0; i < count; i++) {
         write32(base + 0x04, config[i].r4);
@@ -41,6 +76,24 @@ static int dapf_init_t8020(const char *path, u64 base, int node)
         write64(base + 0x10, config[i].end);
         write32(base + 0x00, (config[i].r0_hi << 4) | config[i].r0_lo);
         base += 0x40;
+        if (text && config[i].start <= text_start && config[i].end >= text_end)
+            text = false;
+    }
+
+    /*
+     * The preloaded __TEXT is admitted read-only (r0 0x11, as iBoot's own entry
+     * for ISP's preloaded firmware). Only when no ADT entry covers it already.
+     */
+    if (text) {
+        if (count >= 16) {
+            printf("dapf: %s: no free entry for the preloaded TEXT\n", path);
+            return -1;
+        }
+        write32(base + 0x04, 1);
+        write64(base + 0x08, text_start);
+        write64(base + 0x10, text_end);
+        write32(base + 0x00, 0x11);
+        printf("dapf: %s: admitted preloaded TEXT 0x%lx-0x%lx\n", path, text_start, text_end);
     }
     return 0;
 }
@@ -57,6 +110,7 @@ struct dapf_t8110_config {
     u8 r0_lo;
     u8 unk4;
 } PACKED;
+static_assert(sizeof(struct dapf_t8110_config) == 52, "Invalid T8110 DAPF entry size");
 
 struct dapf_t8110b_config {
     u64 start;
@@ -139,6 +193,7 @@ enum dapf_instance_type {
     DAPF_INSTANCE_DART = 0x44415254,
     DAPF_INSTANCE_DAPF = 0x44415046,
     DAPF_INSTANCE_GAPF = 0x47415046,
+    DAPF_INSTANCE_SMMU = 0x534d4d55,
 };
 
 struct dapf_instance {
@@ -169,24 +224,26 @@ static void dapf_t8132_put(u64 base, const struct dapf_slice *slice)
     write32(base + 0x20, slice->r20);
 }
 
-static const struct dapf_t8110_config *dapf_t8132_config(const char *path, int node, u32 instance,
+static const struct dapf_t8110_config *dapf_t8110_slices(const char *path, int node, u32 instance,
                                                          u32 *count)
 {
     char prop[32];
-    u32 length;
+    u32 length = 0;
 
     snprintf(prop, sizeof(prop), "dapf-instance-%u", instance);
     const struct dapf_t8110_config *config = adt_getprop(adt, node, prop, &length);
     if (!config || !length || length % sizeof(*config) ||
         length / sizeof(*config) > T8132_DAPF_SLICES) {
-        printf("dapf: Invalid T8132 %s for %s\n", prop, path);
+        printf("dapf: Invalid %s for %s (len %u)\n", prop, path, length);
         return NULL;
     }
 
     *count = length / sizeof(*config);
     for (u32 i = 0; i < *count; i++) {
-        if (config[i].end < config[i].start) {
-            printf("dapf: Invalid T8132 %s slice %u for %s\n", prop, i, path);
+        struct dapf_t8110_config entry;
+        memcpy(&entry, &config[i], sizeof(entry));
+        if (entry.end < entry.start) {
+            printf("dapf: Invalid %s slice %u for %s\n", prop, i, path);
             return NULL;
         }
     }
@@ -203,7 +260,7 @@ static int dapf_program_t8132(const char *path, u64 base, int node, u32 instance
 {
     struct dapf_slice want[T8132_DAPF_SLICES], had[T8132_DAPF_SLICES];
     u32 count;
-    const struct dapf_t8110_config *config = dapf_t8132_config(path, node, instance, &count);
+    const struct dapf_t8110_config *config = dapf_t8110_slices(path, node, instance, &count);
 
     if (!config)
         return -1;
@@ -275,6 +332,7 @@ static int dapf_select_t8132(const char *path, int index, int node, int *dart_pa
                 has_dapf = true;
                 break;
             case DAPF_INSTANCE_GAPF:
+            case DAPF_INSTANCE_SMMU: /* the ISP DART's stream MMU banks */
                 break;
             default:
                 printf("dapf: Unknown T8132 instance type for %s\n", path);
@@ -355,7 +413,7 @@ int dapf_t8132_windows(const char *path, int index, struct dapf_window *out, int
         dapf_select_t8132(path, index, node, dart_path, &instance) != 1)
         return -1;
 
-    const struct dapf_t8110_config *config = dapf_t8132_config(path, node, instance, &count);
+    const struct dapf_t8110_config *config = dapf_t8110_slices(path, node, instance, &count);
     if (!config)
         return -1;
 
@@ -391,6 +449,93 @@ int dapf_t8132_windows(const char *path, int index, struct dapf_window *out, int
         }
     }
     return used;
+}
+
+/*
+ * The index of a T8132 DART's one genuine DAPF bank in its instance metadata, found by type.
+ * A DART with none, or with more than one, has no bank to pick: -1.
+ */
+static int dapf_t8132_dapf_index(const char *path, int node)
+{
+    u32 length;
+    const struct dapf_instance *instances = adt_getprop(adt, node, "instance", &length);
+    int found = -1;
+
+    if (!instances || !length || length % sizeof(*instances))
+        return -1;
+    for (u32 i = 0; i < length / sizeof(*instances); i++) {
+        if (instances[i].type != DAPF_INSTANCE_DAPF)
+            continue;
+        if (found >= 0) {
+            printf("dapf: %s has more than one DAPF bank\n", path);
+            return -1;
+        }
+        found = i;
+    }
+    if (found < 0)
+        printf("dapf: %s has no DAPF bank\n", path);
+    return found;
+}
+
+/*
+ * The records of a T8132 DART's DAPF bank as start and end pairs, both inclusive, in record
+ * order, for a consumer that programs the bank itself after each of its power-ups with the
+ * register words r0, r4 and r20 given here. A record with other words is refused. Returns the
+ * pair count, at most max, or -1.
+ */
+int dapf_t8132_ranges(const char *path, u32 r0, u32 r4, u32 r20, u64 *ranges, int max)
+{
+    int dart_path[8];
+    int node = adt_path_offset_trace(adt, path, dart_path);
+    u32 instance, count;
+
+    if (chip_id != T8132 || node < 0 || max <= 0)
+        return -1;
+    int index = dapf_t8132_dapf_index(path, node);
+    if (index < 0 || dapf_select_t8132(path, index, node, dart_path, &instance) != 1)
+        return -1;
+
+    const struct dapf_t8110_config *config = dapf_t8110_slices(path, node, instance, &count);
+    if (!config || !count || count > (u32)max)
+        return -1;
+
+    for (u32 i = 0; i < count; i++) {
+        if ((u32)((config[i].r0_hi << 4) | config[i].r0_lo) != r0 || config[i].r4 != r4 ||
+            config[i].r20 != r20) {
+            printf("dapf: %s slice %u has r0 0x%x r4 0x%x r20 0x%x\n", path, i,
+                   (config[i].r0_hi << 4) | config[i].r0_lo, config[i].r4, config[i].r20);
+            return -1;
+        }
+        ranges[2 * i] = config[i].start;
+        ranges[2 * i + 1] = config[i].end;
+    }
+    return count;
+}
+
+/*
+ * Return the raw inclusive [start, end] slices of a T8110 DART's dapf-instance
+ * property (up to max entries), or -1 on missing or malformed ADT metadata.
+ */
+int dapf_t8110_ranges(const char *path, u32 instance, struct dapf_window *out, int max)
+{
+    int node = adt_path_offset(adt, path);
+    u32 count = 0;
+
+    if (node < 0 || max <= 0) {
+        printf("dapf: Missing ADT node %s for dapf-instance-%u\n", path, instance);
+        return -1;
+    }
+
+    const struct dapf_t8110_config *config = dapf_t8110_slices(path, node, instance, &count);
+    if (!config || (int)count > max)
+        return -1;
+
+    for (u32 i = 0; i < count; i++) {
+        struct dapf_t8110_config entry;
+        memcpy(&entry, &config[i], sizeof(entry));
+        out[i] = (struct dapf_window){.start = entry.start, .end = entry.end};
+    }
+    return (int)count;
 }
 
 static bool dapf_is_j614s(void)
@@ -510,8 +655,16 @@ struct entry {
 
 struct entry dapf_entries[] = {
     /* Keep dart-ane out: its Linux driver owns that DAPF on T8140. */
-    {"/arm-io/dart-aop", 1, "aop"}, {"/arm-io/dart-mtp", 1, "mtp"},  {"/arm-io/dart-pmp", 1, "pmp"},
-    {"/arm-io/dart-isp", 5, "isp"}, {"/arm-io/dart-isp0", 5, "isp"}, {NULL, -1, NULL},
+    {"/arm-io/dart-aop", 1, "aop"},
+    {"/arm-io/dart-mtp", 1, "mtp"},
+    {"/arm-io/dart-pmp", 1, "pmp"},
+    /* T6050: the PMP's DART is dart-pmp0 (dart,t8110; DAPF aperture reg[1], live-verified on the
+     * J714c). */
+    {"/arm-io/dart-pmp0", 1, "pmp0"},
+    {"/arm-io/dart-isp", 5, "isp"},
+    {"/arm-io/dart-isp0", 5, "isp"},
+    {"/arm-io/dart-ave0", 3, "ave"},
+    {NULL, -1, NULL},
 };
 
 static int dapf_init_j713(void *dt)

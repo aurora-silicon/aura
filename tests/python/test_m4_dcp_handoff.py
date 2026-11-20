@@ -29,7 +29,7 @@ def test_m4_dcp_handoff_follows_the_firmware_and_the_panel(tmp_path):
         function(kboot, "dt_get_iommu_node") + function(kboot, "dt_device_set_reserved_mem") +
         function(kboot, "dt_get_or_add_reserved_mem") +
         function(kboot, "dt_device_add_mem_region") + function(kboot, "dt_set_dcp_firmware") +
-        function(kboot, "dt_reserve_asc_segments") + function(kboot, "dt_reserve_asc_firmware") +
+        function(kboot, "dt_reserve_asc_segments_at") + function(kboot, "dt_reserve_asc_segments") + function(kboot, "dt_reserve_asc_firmware") +
         maps + function(kboot, "j713_display_page") + function(kboot, "dt_set_j713_display_maps") +
         function(kboot, "dt_set_m4_dcp_handoff"))
     production = function(firmware, "firmware_set_fdt", "int ") + production
