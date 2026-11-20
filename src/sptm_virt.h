@@ -148,6 +148,7 @@ bool sptm_virt_s2r_usb_yieldable(void);
 bool sptm_virt_s2r_usb_yield(u32 us);
 void sptm_virt_s2r_ctl_print(const char *when);
 void sptm_virt_s2r_ctl_watch(void);
+void sptm_virt_s2r_ctl_trap(u64 far);
 
 #else
 
@@ -175,6 +176,10 @@ static inline void sptm_virt_s2r_ctl_print(const char *when)
 }
 static inline void sptm_virt_s2r_ctl_watch(void)
 {
+}
+static inline void sptm_virt_s2r_ctl_trap(u64 far)
+{
+    (void)far;
 }
 static inline void sptm_virt_s2r_uart_tick(void)
 {

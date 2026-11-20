@@ -801,6 +801,7 @@ static void sptm_virt_s2_activity(struct exc_info *ctx)
     static u64 n, n_last, t_last;
     u64 now = mrs(CNTPCT_EL0), f = mrs(CNTFRQ_EL0);
     n++;
+    sptm_virt_s2r_ctl_trap(ctx->far);
     if (!t_last)
         t_last = now;
     if (now - t_last < 10 * f)

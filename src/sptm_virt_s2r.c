@@ -840,6 +840,26 @@ void sptm_virt_s2r_ctl_print(const char *when)
     printf("SPTM-virt[ctl]: controller blocks active %s %016lx\n", when, m);
 }
 
+/*
+ * On every stage-2 trap: blocks 0-7 only, a ring marker "CTLCHG" (the mask, and the trapped
+ * address in the record) when it changes, so the moment each turns on sits among the hooked
+ * mailbox and PMGR accesses around it.
+ */
+void sptm_virt_s2r_ctl_trap(u64 far)
+{
+    static u32 last = ~0U;
+    if (chip_id != T8122 || !sptm_virt_s2r_ring)
+        return;
+    u32 m = 0;
+    for (unsigned i = 0; i < 8; i++)
+        if (read32(0x2d0725010 + i * 0x80) & BIT(30))
+            m |= BIT(i);
+    if (m != last) {
+        s2r_j613_snapshot_record("CTLCHG", far, m);
+        last = m;
+    }
+}
+
 /* Every 10 s while the guest runs: the same mask, printed only when it changes. */
 void sptm_virt_s2r_ctl_watch(void)
 {
