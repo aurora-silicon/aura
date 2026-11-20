@@ -492,6 +492,17 @@ static bool nvme_post_m4_hands_on_live(void)
 }
 
 /*
+ * nvme_shutdown() will hand this stage's session on running to the next aura stage. Asked before
+ * the handoff too: chainload_load() builds nvme.sart= after nvme_init() and before nvme_shutdown(),
+ * and a session that goes on live must not be reported off there either.
+ */
+static bool nvme_will_hand_on_live(void)
+{
+    return nvme_type == NVME_T8132 && nvme_post_m4_keeps_live() && !nvme_quiesce_for_next &&
+           !nvme_session_from_off && !nvme_keep_running_for_linux;
+}
+
+/*
  * Post-M4, done with ANS: stop the controller, idle the firmware as macOS does before a sleep,
  * keep the SART entries, then power ANS and the PCIe block it runs on off. Every later stage that
  * needs it starts it again with nvme_ans_power_on(). The firmware resumes from what it saves at
@@ -1020,8 +1031,7 @@ bool nvme_shutdown(void)
      * Stage 1 that handed its from-off session on live reset the Mac at the handoff, whichever
      * Stage 2 came next.
      */
-    if (nvme_type == NVME_T8132 && nvme_post_m4_keeps_live() && !nvme_quiesce_for_next &&
-        !nvme_session_from_off) {
+    if (nvme_will_hand_on_live()) {
         write64_lo_hi(nvme_qreg(NVME_IOQ_CMDS), 0);
         write64_lo_hi(nvme_qreg(NVME_IOQ_CQES), 0);
         nvme_initialized = false;
@@ -1118,7 +1128,7 @@ int nvme_sart_entries(struct sart_entry *entries, int max, bool *off)
     if (nvme_handed_on_live)
         return 0;
     if (nvme_initialized) {
-        if (nvme_type != NVME_T8132)
+        if (nvme_type != NVME_T8132 || nvme_will_hand_on_live())
             return 0;
         *off = !nvme_secure_regs && !nvme_keep_running_for_linux;
         return sart_get_entries(nvme_sart, entries, max);
