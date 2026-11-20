@@ -577,9 +577,6 @@ void smp_secondary_entry(void)
     else
         msr(TPIDR_EL1, index);
 
-    if (chip_id != T8142 && chip_id != T8152 && !smp_s2r_published())
-        printf("  Index: %d (table: %p)\n\n", index, me);
-
     me->mpidr = mpidr;
 
     sysop("dmb sy");
@@ -725,7 +722,8 @@ static int smp_start_cpu(int index, const struct cpu_info *cpu)
     if (i >= 100) {
         printf("Failed!\n");
     } else {
-        printf("  Started.\n");
+        sysop("dmb ld");
+        printf("  Started, MPIDR 0x%lx.\n", spin_table[index].mpidr);
     }
 
     _reset_stack = dummy_stack + DUMMY_STACK_SIZE;

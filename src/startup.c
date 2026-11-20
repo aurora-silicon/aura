@@ -277,12 +277,16 @@ void _cpu_reset_c(void *stack)
         sptm_virt_cpu_reset();
     }
 #endif
-    bool quiet = (chip_id == T8142 && !is_boot_cpu()) || smp_s2r_published();
+    /*
+     * A secondary comes through here with its MMU off, so its console writes skip the
+     * console lock and land in the middle of the boot CPU's "Starting CPU n..." line.
+     * The boot CPU reports each start (and the MPIDR it saw) once the core checks in,
+     * so secondaries stay off the console. Once the S2R mailbox is out, the OS owns
+     * the UART and the display, so the boot CPU stays quiet too.
+     */
+    bool quiet = !is_boot_cpu() || smp_s2r_published();
     if (!quiet) {
-        if (!is_boot_cpu())
-            uart_puts("RVBAR entry on secondary CPU");
-        else
-            uart_puts("RVBAR entry on primary CPU");
+        uart_puts("RVBAR entry on primary CPU");
 
         printf("\n  Stack base: %p\n", stack);
         printf("  MPIDR: 0x%lx\n", mrs(MPIDR_EL1));
