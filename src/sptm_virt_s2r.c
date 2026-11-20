@@ -860,6 +860,10 @@ static void s2r_j613_snapshot(const char *tag, bool wake, bool retention)
     s2r_j613_group(live, 4); /* 0x84 gates, cluster, CLLT, CPU-start, commit, SPMI notify */
     for (unsigned i = 0; i < ARRAY_SIZE(regs); i++)
         s2r_j613_snapshot_word(tag, regs[i]);
+    /* 0x85: the rest of the commit word's page (Linux reads its commit word back 0 at once) */
+    s2r_j613_group(live, 5);
+    for (u64 a = 0x2e42d4004; a <= 0x2e42d40fc; a += 4)
+        s2r_j613_snapshot_word(tag, a);
     if (!wake)
         for (unsigned i = 0; i < ARRAY_SIZE(asc); i++) {
             int path[8];
