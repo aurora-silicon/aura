@@ -195,6 +195,9 @@ void s2r_dcp_add(const char *name, u64 mbox)
 
     if (s2r_n_dcp >= S2R_DCP_N)
         return;
+    for (int i = 0; i < s2r_n_dcp; i++)
+        if (s2r_dcp[i].mbox == mbox)
+            return; /* both the coprocessor trace and s2r_hook's mailbox list can name it */
     snprintf(path, sizeof(path), "/arm-io/dart-%s", name);
     if (adt_path_offset_trace(adt, path, p) < 0 || adt_get_reg(adt, p, "reg", 0, &base, &size) < 0)
         return;

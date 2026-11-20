@@ -1012,6 +1012,7 @@ static bool s2r_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int w
         s2r_rw128(addr, val, write);
         sptm_virt_s2r_note(ctx, addr, val[0], write, 3);
         sptm_virt_s2r_note(ctx, addr + 8, val[1], write, 3);
+        s2r_dcp_watch(addr, val, 4);
         return true;
     }
     if (width > 4) {
@@ -1023,6 +1024,8 @@ static bool s2r_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int w
     if (timer)
         s2r_crumb(0x30);
     sptm_virt_s2r_note(ctx, addr, *val, write, width);
+    /* The DCP's RPC records at each of its mailbox messages (AURA_S2R_DCP_PKT). */
+    s2r_dcp_watch(addr, val, width);
     /* host: AURA_S2R_PROBE_AT, a guest write after a wake that, once performed, triggers the
      * AURA_S2R_PROBE reads (once per wake): where in macOS's own sequence a block becomes
      * readable. */
@@ -1798,6 +1801,16 @@ void sptm_virt_s2r_setup(bool cdc)
         };
         for (unsigned i = 0; i < ARRAY_SIZE(mb); i++)
             s2r_hook_adt(mb[i].path, 0, mb[i].what, 0x8000, 0x4000);
+        /* These go through s2r_hook, not the generic coprocessor trace: register the DCP for
+         * the RPC record copy here (s2r_hook calls s2r_dcp_watch). */
+        /* Registered whatever the switch: s2r_dcp_watch reads it at each access. */
+        {
+            int dp[8];
+            u64 dpa, dsz;
+            if (adt_path_offset_trace(adt, "/arm-io/dcp", dp) >= 0 &&
+                adt_get_reg(adt, dp, "reg", 0, &dpa, &dsz) >= 0)
+                s2r_dcp_add("dcp", dpa + 0x8000);
+        }
         /* Without stage 2 in the secure kernel's world these see XNU's side only. */
         s2r_hook_adt("/arm-io/aop-exclave-mailbox", 0, "aopx-mbox", 0, 0);
         s2r_hook_adt("/arm-io/aop2-exclave-mailbox", 0, "aop2x-mbox", 0, 0);
