@@ -47,6 +47,7 @@ struct sart_entry { u8 index, flags; u64 paddr, size; };
 #define BIT(n) (1ULL << (n))
 #define GENMASK(h, l) ((BIT((h) + 1) - 1) & ~(BIT(l) - 1))
 #define FIELD_GET(mask, value) (((value) & (mask)) >> __builtin_ctzll(mask))
+#define FIELD_PREP(mask, value) (((u64)(value) << __builtin_ctzll(mask)) & (mask))
 #define PMGR_DIE_ID GENMASK(31, 28)
 #define USEC_PER_SEC 1000000
 #define ADT_GETPROP(...) (-1)
@@ -129,6 +130,8 @@ static u32 read32(u64 addr)
 }
 static void write32(u64 addr, u32 value) {}
 static void set32(u64 addr, u32 value) {}
+/* nvme_init() sets CC.MPS to 4 KiB pages; nothing else in this model is masked. */
+static void mask32(u64 addr, u32 clear, u32 set) { assert(addr == nvme_base + NVME_CC); }
 static void write64_lo_hi(u64 addr, u64 value)
 {
     publications++;
@@ -341,8 +344,11 @@ int main(int argc, char **argv)
         assert(nvme_initialized);
         assert(nvme_shutdown());
         assert(!nvme_initialized);
-        /* Powered off, post-M4 frees its queues too; only Linux's live handoff keeps them. */
-        assert(queue_frees == (failure == 9 ? 0 : 2));
+        /*
+         * Powered off, post-M4 frees its queues too. Linux's live handoff keeps them, and so does
+         * T8132 (23, 26), which hands its session on live to the next stage.
+         */
+        assert(queue_frees == (failure == 9 || failure == 23 || failure == 26 ? 0 : 2));
         assert(resets == (legacy ? 2 : 0));
         /* A healthy shutdown still allows reinitialization. */
         assert(nvme_init());

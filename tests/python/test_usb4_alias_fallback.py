@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-"""dt_set_acio_tunables() finds each USB4 node under either alias spelling.
+"""dt_set_acio_tunables() and dt_set_pcie_tunables() find each USB4 node under either alias spelling.
 
 Runs the production function against real FDTs. The tunable copies themselves are recorded,
 not performed, so this checks which alias each lookup hands on.
@@ -110,3 +110,78 @@ def test_usb4_pcie_adapter_alias_fallback(tmp_path):
     result = subprocess.run([str(binary)], capture_output=True, text=True)
     assert result.returncode == 0, result.stdout + result.stderr
     assert "PASS usb4 alias fallback" in result.stdout
+
+
+PCIE_HARNESS = r'''
+#include <assert.h>
+#include <stdio.h>
+#include <string.h>
+#include "libfdt.h"
+#define MAX_CIO_DEVS 8
+static unsigned char blob[8192];
+static void *dt = blob;
+static char seen[64][32];
+static int nseen;
+static int dt_copy_pciec_tunables(const char *adt_path, const char *alias)
+{
+    (void)adt_path;
+    snprintf(seen[nseen++], sizeof(seen[0]), "%s", alias);
+    return 0;
+}
+'''
+
+PCIE_MAIN = r'''
+static void tree(const char *const *aliases)
+{
+    assert(!fdt_create_empty_tree(dt, sizeof(blob)));
+    int node = fdt_add_subnode(dt, 0, "aliases");
+    assert(node >= 0);
+    for (; *aliases; aliases++)
+        assert(!fdt_setprop_string(dt, fdt_path_offset(dt, "/aliases"), *aliases, "/soc/x"));
+    nseen = 0;
+}
+
+int main(void)
+{
+    /* Only the hyphenated spelling, which the device tree checks accept. */
+    static const char *const hyphen[] = {"usb4-1-pcie", NULL};
+    tree(hyphen);
+    assert(dt_set_pcie_tunables() == 0);
+    assert(nseen == MAX_CIO_DEVS);
+    assert(!strcmp(seen[0], "usb4-0-pcie") && !strcmp(seen[1], "usb4-1-pcie"));
+
+    /* Both spellings: the underscored one stays first, as before. */
+    static const char *const both[] = {"usb4_1_pcie", "usb4-1-pcie", NULL};
+    tree(both);
+    assert(dt_set_pcie_tunables() == 0);
+    assert(!strcmp(seen[1], "usb4_1_pcie"));
+
+    /* The underscored spelling alone still works. */
+    static const char *const underscore[] = {"usb4_1_pcie", NULL};
+    tree(underscore);
+    assert(dt_set_pcie_tunables() == 0);
+    assert(!strcmp(seen[1], "usb4_1_pcie"));
+    puts("PASS usb4 pcie alias fallback");
+    return 0;
+}
+'''
+
+
+def test_usb4_pcie_alias_fallback(tmp_path):
+    source = (ROOT / "src/kboot.c").read_text()
+    start = source.index("static int dt_set_pcie_tunables(void)")
+    function = source[start:source.index("\n}", start) + 2] + "\n"
+    cfile = tmp_path / "usb4-pcie-alias.c"
+    cfile.write_text(PCIE_HARNESS + function + PCIE_MAIN)
+    libfdt = ROOT / "src/libfdt"
+    sources = [str(libfdt / name) for name in (
+        "fdt.c", "fdt_ro.c", "fdt_rw.c", "fdt_sw.c", "fdt_wip.c", "fdt_empty_tree.c",
+        "fdt_strerror.c",
+    )]
+    binary = tmp_path / "usb4-pcie-alias"
+    subprocess.run(["cc", "-D_GNU_SOURCE", "-std=gnu11", "-Wall", "-Wextra", "-Werror",
+                    "-Wno-unused-parameter", "-I", str(libfdt),
+                    str(cfile), *sources, "-o", str(binary)], check=True)
+    result = subprocess.run([str(binary)], capture_output=True, text=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "PASS usb4 pcie alias fallback" in result.stdout

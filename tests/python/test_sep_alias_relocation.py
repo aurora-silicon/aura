@@ -33,8 +33,9 @@ typedef uint32_t u32;
 static unsigned char blob[16384];
 static void *dt = blob;
 static size_t dt_bufsize = sizeof(blob);
-static u32 chip_id;
-static u64 mem_size_actual;
+/* No /chosen in this ADT: the SEP bounds fall back to the DRAM aura maps, here all of it. */
+static u64 ram_base;
+static u64 mem_size_actual = 1ULL << 48;
 static void *adt;
 static int scenario, reservations;
 static unsigned char lpol[] = {1, 2, 3, 4}, ibot[] = {5, 6, 7};

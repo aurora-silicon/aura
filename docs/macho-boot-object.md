@@ -95,18 +95,24 @@ On T8140 the windows change where a secondary can execute:
 - At EL1 the rule inverts. Executing inside `CTXR_D` takes an instruction
   abort straight to EL2 (ESR 0x8200000c), and execution elsewhere works.
 
-At kboot `ctxr_exec_confined()` (`src/ctxr_exec.c`) asks a secondary to run two
-instructions from the heap, and the machine is confined if that faults. The probe
-runs on every chip, not on a list of chips: a Mac without the windows (M1 to M3,
-or any raw boot object) runs it and boots as it always did. Aura reads a `CTXR`
-register there only when it has no secondary to ask, and then under an exception
-guard. There is no boot option or build option.
+At kboot `ctxr_exec_confined()` (`src/ctxr_exec.c`) first reads `CTXR_D` under an
+exception guard, at EL2 only (at EL1 nothing is read and the probe decides). An
+armed `CTXR_D` is the answer: the machine is confined, and no probe is sent. This
+matters on T6050, where a secondary that fetches outside the window hangs instead
+of faulting, so a probe would strand it. Only when `CTXR_D` is unarmed or
+unreadable (M1 to M3 fault on the read) does it ask a secondary to run two
+instructions from the heap, and the machine is confined if that faults. Every chip
+is decided the same way, not by a list of chips: a Mac without the windows (M1 to
+M3, or any raw boot object) runs the probe and boots as it always did. There is no
+boot option or build option.
 
 With no secondary running there is nobody to ask, which happens where
-`smp_start_secondaries()` fails. Aura then keeps no answer, reads `CTXR_D` under an
-exception guard, and warns if it is armed. The OS still starts, outside the window,
-on the boot CPU alone, because `dt_set_cpus()` drops every CPU that isn't running.
-A probe that couldn't be sent counts as not confined too.
+`smp_start_secondaries()` fails. An armed `CTXR_D` with a valid OS window still
+counts as confined: a boot core leaving reset (an S2R wake) has to run the OS in
+the window. Without a window, or with `CTXR_D` unarmed, aura keeps no answer and
+warns if it is armed. The OS still starts, outside the window, on the boot CPU
+alone, because `dt_set_cpus()` drops every CPU that isn't running. A probe that
+couldn't be sent counts as not confined too.
 
 A secondary that doesn't take the probe within 1 second, or takes it and doesn't
 answer within 500 ms, stops the boot. Either way the call stays in its slot, and
@@ -197,6 +203,27 @@ Later steps refuse too, and take the same failure path. `kboot_boot()` won't pla
 an image without the `ARM\x64` magic, or one that doesn't fit the window. It also
 won't place one when the initrd or the device tree overlaps the window. A described
 bootloader handoff that overlaps the window fails `kboot_prepare_dt()`.
+
+### Which chips pad the boot object
+
+The installer has to choose a padded or an unpadded Stage 1 before aura has run on the
+Mac, and nothing in the ADT says whether iBoot will leave the CTXR windows armed. The
+choice is a chip ID rule, and `data/execute-window.json` is its only copy: inclusive
+ranges of chip IDs, at present `0x8130`-`0x8fff` (T8132, T8140, T8142, T8152 and later)
+and `0x6040`-`0x6fff` (T6040/T6041, T605x and later). M1 to M3 (T8103, T8112, T8122,
+T600x, T602x, T603x) are below both.
+
+- `tools/execute_window.py check 0x8132` exits 0 for a chip that pads and 1 for one
+  that doesn't; `tools/execute_window.py json` prints the ranges. Release packages
+  carry both files.
+- aura builds `build/execute_window.h` from the file. On every boot that probes, it
+  compares the answer with the file: a confined chip that the file leaves out gets a
+  warning (`CTXR exec: WARNING: chip 0x... is confined but not in
+  data/execute-window.json`), since the installer would enroll it unpadded and it
+  could not start an OS. A listed chip that isn't confined gets a note; that is
+  expected under a raw or proxy-only boot object.
+- On a running system the hardware answer is `/chosen/aurora,ctxr-exec-window`: aura
+  publishes it on every boot whose secondaries are confined and that starts an OS.
 
 ### Which Stage 2 a Stage 1 loads
 
