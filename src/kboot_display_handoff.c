@@ -229,6 +229,33 @@ static const struct dcp6_seg_def dcp6_seg_defs_t6030[DCP6_SEGS] = {
 /* Owners of the nubs whose __OS_LOG is reserved: /arm-io/<owner>/iop-<owner>-nub */
 static const char *const dcp6_nubs_t6030[] = {"dcp", "dcpext0", "dcpext1"};
 
+/*
+ * J616s external DCPs use the same four-segment ASC layout as the T6030
+ * external DCPs. The kernel DT supplies disabled text/data/heap placeholders;
+ * fill those only from this boot's ADT. In particular, do not enable the DCP,
+ * its DART or any display route here: the kernel's PMP-aware gate owns that.
+ */
+struct dcp6_ext {
+    const char *name, *dt_path, *adt_path, *nub_path, *dart_path;
+    u64 coproc, dart;
+};
+
+static const struct dcp6_ext t6041_exts[] = {
+    {"dcpext0", "/dcp@3a2e00000", "/arm-io/dcpext0", "/arm-io/dcpext0/iop-dcpext0-nub",
+     "/arm-io/dart-dcpext0", 0x3a2e00000UL, 0x3a2340000UL},
+    {"dcpext1", "/dcp@602e00000", "/arm-io/dcpext1", "/arm-io/dcpext1/iop-dcpext1-nub",
+     "/arm-io/dart-dcpext1", 0x602e00000UL, 0x602340000UL},
+    /*
+     * J614s: no dcpext0 in the ADT; its HDMI processor is dcpext2. Only a
+     * device tree that describes /dcp@606e00000 gets it (t6040-j614s.dts).
+     */
+    {"dcpext2", "/dcp@606e00000", "/arm-io/dcpext2", "/arm-io/dcpext2/iop-dcpext2-nub",
+     "/arm-io/dart-dcpext2", 0x606e00000UL, 0x606340000UL},
+    /* J614c/J616c: dcpext3, a third USB-C processor (linux t6041-j616c-usbc-dcpext3.dtsi). */
+    {"dcpext3", "/dcp@306e00000", "/arm-io/dcpext3", "/arm-io/dcpext3/iop-dcpext3-nub",
+     "/arm-io/dart-dcpext3", 0x306e00000UL, 0x306340000UL},
+};
+
 /* One OS firmware release's DCP contract when an SoC supports more than one */
 struct dcp_fw {
     u32 os_fw;
@@ -277,6 +304,12 @@ struct dcp_soc {
     int nsegs;
     const char *const *nubs; /* owners whose __OS_LOG is reserved, or NULL: every dcp/dcpextN */
     int nnubs;
+    /* External processors handed over on their own (dcp6_ext_handoffs()), or NULL */
+    const struct dcp6_ext *exts;
+    int nexts;
+    const char *ext_compat; /* their device tree compatible */
+    /* Root compatible of the board whose internal DCP is not handed over, or NULL */
+    const char *headless;
 };
 
 static const char *const dcp_boards_t6030[] = {"apple,j516s", "apple,j514s", NULL};
@@ -442,6 +475,9 @@ static const struct dcp_soc dcp_soc_t6041 = {
     .dart_disp = 0x402300000UL,
     .vm_base = DCP6_DART_VM_BASE,
     .vm_size = DCP6_DART_VM_SIZE,
+    .exts = t6041_exts,
+    .nexts = ARRAY_SIZE(t6041_exts),
+    .ext_compat = "apple,t6041-dcpext",
 };
 
 /*
@@ -488,6 +524,10 @@ static const struct dcp_soc dcp_soc_t6041_max = {
     .dart_disp = 0x402300000UL,
     .vm_base = DCP6_DART_VM_BASE,
     .vm_size = DCP6_DART_VM_SIZE,
+    .exts = t6041_exts,
+    .nexts = ARRAY_SIZE(t6041_exts),
+    .ext_compat = "apple,t6041-dcpext",
+    .headless = "apple,j575c",
 };
 
 /*
@@ -2594,7 +2634,7 @@ static int dcp6_check_resv(void *dt)
     return 0;
 }
 
-static bool t6041_headless(void *dt);
+static bool dcp6_headless(void *dt);
 
 static __attribute__((noinline)) void dcp6_handoff(void *dt)
 {
@@ -3069,47 +3109,20 @@ static void dcpext6_handoffs(void *dt)
 }
 
 /*
- * J616s external DCPs use the same four-segment ASC layout as the T6030
- * external DCPs. The kernel DT supplies disabled text/data/heap placeholders;
- * fill those only from this boot's ADT. In particular, do not enable the DCP,
- * its DART or any display route here: the kernel's PMP-aware gate owns that.
- */
-struct t6041_ext {
-    const char *name, *dt_path, *adt_path, *nub_path, *dart_path;
-    u64 coproc, dart;
-};
-
-static const struct t6041_ext t6041_exts[] = {
-    {"dcpext0", "/dcp@3a2e00000", "/arm-io/dcpext0", "/arm-io/dcpext0/iop-dcpext0-nub",
-     "/arm-io/dart-dcpext0", 0x3a2e00000UL, 0x3a2340000UL},
-    {"dcpext1", "/dcp@602e00000", "/arm-io/dcpext1", "/arm-io/dcpext1/iop-dcpext1-nub",
-     "/arm-io/dart-dcpext1", 0x602e00000UL, 0x602340000UL},
-    /*
-     * J614s: no dcpext0 in the ADT; its HDMI processor is dcpext2. Only a
-     * device tree that describes /dcp@606e00000 gets it (t6040-j614s.dts).
-     */
-    {"dcpext2", "/dcp@606e00000", "/arm-io/dcpext2", "/arm-io/dcpext2/iop-dcpext2-nub",
-     "/arm-io/dart-dcpext2", 0x606e00000UL, 0x606340000UL},
-    /* J614c/J616c: dcpext3, a third USB-C processor (linux t6041-j616c-usbc-dcpext3.dtsi). */
-    {"dcpext3", "/dcp@306e00000", "/arm-io/dcpext3", "/arm-io/dcpext3/iop-dcpext3-nub",
-     "/arm-io/dart-dcpext3", 0x306e00000UL, 0x306340000UL},
-};
-
-/*
  * J575c (Mac Studio): no panel. The internal DCP is never handed over: an older Stage 1 starts it,
  * finds nothing connected and puts it to sleep, and a kernel has no panel to drive with it anyway.
  * The external processors are left as iBoot started them, so they are handed over on their own:
  * the first one's ADT __TEXT stands in for the panel's, and its reservation is made here instead
  * of by the internal handoff.
  */
-static bool t6041_headless(void *dt)
+static bool dcp6_headless(void *dt)
 {
-    return dcp6.soc == &dcp_soc_t6041_max && !fdt_node_check_compatible(dt, 0, "apple,j575c");
+    return dcp6.soc->headless && !fdt_node_check_compatible(dt, 0, dcp6.soc->headless);
 }
 
-static struct dcp6_seg t6041_headless_text;
+static struct dcp6_seg dcp6_headless_text;
 
-static int t6041_ext_fill(void *dt, const struct t6041_ext *ext)
+static int dcp6_ext_fill(void *dt, const struct dcp6_ext *ext)
 {
     static const u32 flags[DCPEXT6_SEGS] = {SEG_FLAGS_TEXT, SEG_FLAGS_DATA, SEG_FLAGS_OSLOG,
                                             SEG_FLAGS_HEAP};
@@ -3125,7 +3138,7 @@ static int t6041_ext_fill(void *dt, const struct t6041_ext *ext)
     /* A DT without #451's external nodes is an ordinary internal-only boot. */
     if (node < 0)
         return 1;
-    if (fdt_node_check_compatible(dt, node, "apple,t6041-dcpext") ||
+    if (fdt_node_check_compatible(dt, node, dcp6.soc->ext_compat) ||
         dcp6_status_disabled(dt, node, ext->name) || dcp6_adt_reg(ext->adt_path, 0, &coproc) ||
         coproc != ext->coproc || dcp6_adt_reg(ext->dart_path, 0, &dart) || dart != ext->dart)
         return -1;
@@ -3213,10 +3226,10 @@ static int t6041_ext_fill(void *dt, const struct t6041_ext *ext)
     }
     /* The two external processors and the panel share immutable TEXT. */
     const struct dcp6_seg *shared_text = &dcp6.segs[SEG_TEXT];
-    if (t6041_headless(dt)) {
-        if (!t6041_headless_text.phys)
-            t6041_headless_text = segs[SEG_TEXT];
-        shared_text = &t6041_headless_text;
+    if (dcp6_headless(dt)) {
+        if (!dcp6_headless_text.phys)
+            dcp6_headless_text = segs[SEG_TEXT];
+        shared_text = &dcp6_headless_text;
     }
     if (segs[SEG_TEXT].phys != shared_text->phys || segs[SEG_TEXT].size != shared_text->size)
         return -1;
@@ -3233,7 +3246,7 @@ static int t6041_ext_fill(void *dt, const struct t6041_ext *ext)
     const struct dcp6_seg *text = &segs[SEG_TEXT];
     snprintf(text_name, sizeof(text_name), "dcp-text@%lx", text->phys);
     int shared = dcp6_find_resv(dt, text_name, text->phys, text->size);
-    if (shared < 0 && t6041_headless(dt)) {
+    if (shared < 0 && dcp6_headless(dt)) {
         if (dcp6_resv_conflict(dt, text->phys, text->size, text_name) ||
             !dcp6_add_resv(dt, text_name, text->phys, text->size, "apple,asc-mem"))
             return -1;
@@ -3290,7 +3303,7 @@ static int t6041_ext_fill(void *dt, const struct t6041_ext *ext)
  * chains join, nor its own DART (disp0's, which iBoot leaves locked). Enable both once an external
  * processor has its firmware memory; the kernel's gate then enables that processor's chain.
  */
-static int t6041_headless_display(void *dt)
+static int dcp6_headless_display(void *dt)
 {
     int display = fdt_path_offset(dt, "disp0");
     int len;
@@ -3323,39 +3336,39 @@ static int t6041_headless_display(void *dt)
     return display < 0 ? -1 : fdt_setprop_string(dt, display, "status", "okay");
 }
 
-static void t6041_ext_handoffs(void *dt)
+static void dcp6_ext_handoffs(void *dt)
 {
     int panel = fdt_path_offset(dt, "dcp");
     bool panel_handoff = panel >= 0 && fdt_getprop(dt, panel, dcp6.soc->marker, NULL);
     bool published = false;
     if (!panel_handoff) {
-        if (!t6041_headless(dt))
+        if (!dcp6_headless(dt))
             return;
         dlog("no internal display handoff (no panel): external processors only\n");
     }
-    for (size_t i = 0; i < ARRAY_SIZE(t6041_exts); i++) {
+    for (int i = 0; i < dcp6.soc->nexts; i++) {
+        const struct dcp6_ext *ext = &dcp6.soc->exts[i];
         void *scratch = dcp6_scratch(dt);
         if (!scratch)
             return;
-        int ret = t6041_ext_fill(scratch, &t6041_exts[i]);
+        int ret = dcp6_ext_fill(scratch, ext);
         if (ret) {
             if (ret < 0)
-                dlog("%s firmware memory refused; placeholder remains disabled\n",
-                     t6041_exts[i].name);
+                dlog("%s firmware memory refused; placeholder remains disabled\n", ext->name);
             free(scratch);
             continue;
         }
         if (!dcp6_commit(dt, scratch)) {
-            dlog("%s firmware memory published; processor remains disabled\n", t6041_exts[i].name);
+            dlog("%s firmware memory published; processor remains disabled\n", ext->name);
             published = true;
         }
     }
-    if (!published || !t6041_headless(dt) || panel_handoff)
+    if (!published || !dcp6_headless(dt) || panel_handoff)
         return;
     void *scratch = dcp6_scratch(dt);
     if (!scratch)
         return;
-    if (t6041_headless_display(scratch)) {
+    if (dcp6_headless_display(scratch)) {
         dlog("display subsystem not enabled; the external processors stay disabled\n");
         free(scratch);
     } else if (!dcp6_commit(dt, scratch)) {
@@ -3957,7 +3970,7 @@ int dt_set_display_handoff(void *dt)
     dcp6_check_hw();
     dcp6_dry_run();
 
-    if (armed && t6041_headless(dt))
+    if (armed && dcp6_headless(dt))
         dlog("no panel: the internal DCP is not handed over\n");
     else if (armed)
         dcp6_handoff(dt);
@@ -3965,7 +3978,7 @@ int dt_set_display_handoff(void *dt)
         dlog("not armed (no chosen.%s=1): no display handoff\n", dcp6.soc->optin);
     if (dcp6.soc->ext)
         dcpext6_handoffs(dt);
-    if (dcp6.soc == &dcp_soc_t6041 || dcp6.soc == &dcp_soc_t6041_max)
-        t6041_ext_handoffs(dt);
+    if (dcp6.soc->exts)
+        dcp6_ext_handoffs(dt);
     return 0;
 }
