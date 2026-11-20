@@ -82,6 +82,17 @@ int adt_path_offset_trace(const void *tree, const char *path, int *trace)
     trace[0] = 1;
     return strstr(path, "dart-") ? 2 : 1;
 }
+int adt_path_offset(const void *tree, const char *path)
+{
+    (void)tree;
+    return strstr(path, "dart-") ? 2 : 1;
+}
+/* The ADT names the ISP17a (T8140, T8142) "isp,isp-generic-ex". */
+bool adt_is_compatible(const void *tree, int node, const char *compat)
+{
+    (void)tree; (void)node;
+    return !strcmp(compat, "isp,isp-generic-ex") && (chip_id == T8140 || chip_id == T8142);
+}
 int pmgr_adt_power_enable(const char *path)
 {
     (void)path;
