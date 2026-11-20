@@ -11,6 +11,7 @@
 
 #include "sptm_virt_s2r_soc.h"
 #include "adt.h"
+#include "smp_asm.h"
 #include "string.h"
 #include "utils.h"
 
@@ -164,8 +165,8 @@ static int s2r_trace_cpus(const void *adt, struct s2r_soc *out)
     {
         u32 id;
         u64 reg[2];
-        if (ADT_GETPROP(adt, node, "cpu-id", &id) != sizeof(id) || id >= 32 || (seen & BIT(id)) ||
-            ADT_GETPROP_ARRAY(adt, node, "cpu-impl-reg", reg) != sizeof(reg) ||
+        if (ADT_GETPROP(adt, node, "cpu-id", &id) != sizeof(id) || id >= MAX_CPUS ||
+            (seen & BIT(id)) || ADT_GETPROP_ARRAY(adt, node, "cpu-impl-reg", reg) != sizeof(reg) ||
             s2r_trace_add(reg[0], reg[1], "cpu-impl", false, out) < 0)
             return -1;
         seen |= BIT(id);

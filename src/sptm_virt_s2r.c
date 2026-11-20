@@ -137,7 +137,7 @@ static struct {
 static bool s2r_go, s2r_fulltrace, s2r_coproc, s2r_drop_usb;
 static u64 s2r_arm_at;
 /* Cores with their last WFI trapped (stop mode), parked there, and the core that committed. */
-static volatile u32 s2r_twi_mask, s2r_parked_mask;
+static volatile u64 s2r_twi_mask, s2r_parked_mask;
 /* Go mode: the ring position where the first core opened the sleep window (0: none yet). */
 static volatile u64 s2r_sleep_head;
 static volatile int s2r_timer_cpu = -1;
@@ -477,13 +477,13 @@ static void s2r_quiesce(void)
  * trap (TWI) and aura executes them, so that it can count them.
  */
 static spmi_dev_t *s2r_crumb_dev;
-static volatile u32 s2r_crumb_wfi;
+static volatile u64 s2r_crumb_wfi;
 
 static void s2r_crumb(u8 step)
 {
     if (!s2r_crumb_dev)
         return;
-    u32 m = s2r_crumb_wfi;
+    u64 m = s2r_crumb_wfi;
     u8 b[3] = {step, m, m >> 8};
     spmi_ext_write_long(s2r_crumb_dev, 0xe, 0x830d, b, sizeof(b));
 }
@@ -751,7 +751,7 @@ static void __attribute__((noreturn)) s2r_stop_before_timer(struct exc_info *ctx
     s2r_marker("S2RSTOP", addr);
     s2r_stop_link_back();
     printf("SPTM-virt[s2r]: cpu%d is starting the S2R timer ([0x%lx] = 0x%lx, pc 0x%lx): NOT "
-           "performed (stop mode). TWI armed 0x%x, parked 0x%x, %lu records. Stopping in the "
+           "performed (stop mode). TWI armed 0x%lx, parked 0x%lx, %lu records. Stopping in the "
            "proxy.\n",
            smp_id(), addr, val, ctx->elr, s2r_twi_mask, s2r_parked_mask, sptm_virt_s2r_head);
     if (s2r_nvme_quiet_page)
@@ -842,7 +842,7 @@ bool sptm_virt_s2r_wfi(u64 *regs, u64 esr)
         while (1)
             sysop("wfe");
     }
-    printf("SPTM-virt[s2r]: macOS reached its final WFI on the S2R-timer core cpu%d; parked 0x%x; "
+    printf("SPTM-virt[s2r]: macOS reached its final WFI on the S2R-timer core cpu%d; parked 0x%lx; "
            "%lu records. Stopping in the proxy (stop mode).\n",
            cpu, s2r_parked_mask, sptm_virt_s2r_head);
     /* whole classes, newest first: the proxy read-out fails with ten cores */
