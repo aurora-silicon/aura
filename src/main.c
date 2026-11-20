@@ -459,7 +459,7 @@ void aura_main(void)
     stage1_read_boot_record();
 #endif
     /* T6040, T8140, T6050: nothing else in an aura chain clears iBoot's failed-boot count. */
-    if (chip_id == T6040 || chip_id == T8140 || chip_id == T6050)
+    if (pmu_counter_cleared_by_aura())
         pmu_clear_panic_counter();
 
     printf("Initialization complete.\n");

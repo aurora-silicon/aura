@@ -17,6 +17,7 @@
 #include "mitigations.h"
 #include "nvme.h"
 #include "payload_profile.h"
+#include "pmu_counter.h"
 #include "secboot.h"
 #include "smp.h"
 #ifdef SPTM_VIRT_ESP
@@ -450,6 +451,51 @@ bool payload_logo(void **custom_128, void **custom_256)
     return false;
 }
 
+/*
+ * Reboot after a failed start while fewer than this many boots in a row have failed: an ANS that
+ * a Stage 2 couldn't start from off came up again after one or two reboots each time on the J713
+ * (about 1 start in 7 failed, 2026-11-21). A harder failure still ends in the proxy.
+ */
+#define PAYLOAD_NVME_START_REBOOTS 2
+
+/* The decision alone, from iBoot's counts byte. */
+static bool payload_nvme_start_reboot(bool counter_usable, int record_ret, u8 counts)
+{
+    return counter_usable && !record_ret && PMU_FAILED_BOOTS(counts) < PAYLOAD_NVME_START_REBOOTS;
+}
+
+/*
+ * A post-M4 ANS that didn't start from off stays down until a reboot. Rather than stop in the
+ * proxy, where only a tether can reboot it, count this boot as failed in iBoot's record and reboot,
+ * bounded by that record: the OS clears it once it runs, so a boot that got there resets the
+ * bound. Where aura clears the record itself nothing bounds it, and the proxy stays.
+ */
+static void payload_nvme_start_failed(void)
+{
+    bool usable = !pmu_counter_cleared_by_aura();
+    u8 counts = 0, error_stage = 0;
+    int ret = usable ? pmu_read_boot_record(&counts, &error_stage) : -1;
+
+    if (!payload_nvme_start_reboot(usable, ret, counts)) {
+        if (!usable)
+            printf("nvme: this chip's failed-boot count is cleared by aura: no reboot, proxy\n");
+        else if (ret)
+            printf("nvme: no failed-boot record: no reboot, proxy\n");
+        else
+            printf("nvme: %u failed boots in a row already: no reboot, proxy\n",
+                   PMU_FAILED_BOOTS(counts));
+        return;
+    }
+    u8 before;
+    if (pmu_count_failed_boot(&before)) {
+        printf("nvme: couldn't count this boot as failed: no reboot, proxy\n");
+        return;
+    }
+    printf("nvme: ANS start failed: rebooting (%u failed boots in a row before, limit %u)\n",
+           PMU_FAILED_BOOTS(before), PAYLOAD_NVME_START_REBOOTS);
+    flush_and_reboot();
+}
+
 int payload_run(void)
 {
     const char *target = adt_getprop(adt, 0, "target-type", NULL);
@@ -558,8 +604,10 @@ int payload_run(void)
          * on if this stage used it.
          */
         bool nvme_started = !boot_spec && nvme_post_m4_passed_off();
-        if (nvme_started && !nvme_init())
+        if (nvme_started && !nvme_init()) {
+            payload_nvme_start_failed();
             goto boot_failed;
+        }
         nvme_keep_running_for_linux = boot_spec || nvme_started;
         if (!nvme_keep_running_for_linux && !nvme_shutdown())
             goto boot_failed;
