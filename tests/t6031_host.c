@@ -1002,7 +1002,8 @@ static void sc_t6034(void *dt)
     static u8 before[1 << 21];
     world(&(struct opts){0});
     chip_id = T6034;
-    static const char compat[] = "apple,j516m\0apple,t6034\0apple,arm-platform";
+    /* J514M and J516M are admitted; an unknown T6034 board must stay untouched */
+    static const char compat[] = "apple,j999\0apple,t6034\0apple,arm-platform";
     assert(!fdt_setprop(dt, 0, "compatible", compat, sizeof(compat)));
     memcpy(before, dt, fdt_totalsize(dt));
     assert(pmgr_init() == 0);
@@ -1013,8 +1014,8 @@ static void sc_t6034(void *dt)
     boot(dt);
     check(!memcmp(before, dt, fdt_totalsize(before)), "T6034: the device tree is unchanged");
     check(!nwrites && !gpu_reads, "T6034: no register written, no GPU register read");
-    check(log_has("ADT: GPU: unsupported chip!"),
-          "T6034: the GPU setup says unsupported, as before");
+    check(!log_has("ADT: GPU: unsupported chip!") && !log_has("FDT: GPU: T6034"),
+          "T6034: an unknown board returns quietly from the J514M/J516M GPU path");
 }
 
 static void sc_other_board(void *dt)

@@ -33,6 +33,9 @@ static void tree(void *dt, int size, const char *compatible, const char *intent)
     } else if (!strcmp(compatible, "apple,j615")) {
         static const char compat[] = "apple,j615\0apple,t8122";
         assert(!fdt_setprop(dt, 0, "compatible", compat, sizeof(compat)));
+    } else if (!strcmp(compatible, "apple,j504")) {
+        static const char compat[] = "apple,j504\0apple,t8122";
+        assert(!fdt_setprop(dt, 0, "compatible", compat, sizeof(compat)));
     }
     int chosen = fdt_add_subnode(dt, 0, "chosen");
     assert(chosen >= 0);
@@ -120,6 +123,32 @@ int main(int argc, char **argv)
     tree(dt, sizeof(dt), "apple,j615", "1");
     assert(!fdt_setprop_string(dt, 0, "compatible", "apple,j615"));
     assert(t8122_full_identity_prepare(dt) < 0); /* Exact chip is mandatory. */
+
+    /* The 14-inch M3 MacBook Pro (J504) takes the same path with its own measured mask. */
+    for (unsigned i = 0; i < sizeof(j615_masks) / sizeof(j615_masks[0]); i++) {
+        struct fixture f = supported;
+        f.raw.core_mask[0] = j615_masks[i];
+        tree(dt, sizeof(dt), "apple,j504", "1");
+        assert(t8122_full_identity_prepare(dt) >= 0);
+        assert(property(dt, "probe-result") == T8122_ID_NOT_RUN);
+        struct t8122_powered_identity identity;
+        assert(!t8122_full_identity_read(read_identity, &f, &identity));
+        assert(!t8122_full_identity_publish(dt, &identity));
+        check_fields(dt, &f.raw);
+        t8122_full_identity_invalidate(dt);
+    }
+    for (unsigned i = 0; i < sizeof(intents) / sizeof(intents[0]); i++) {
+        tree(dt, sizeof(dt), "apple,j504", intents[i]);
+        assert(t8122_full_identity_prepare(dt) < 0);
+    }
+    tree(dt, sizeof(dt), "apple,j504", "1");
+    assert(!fdt_setprop_string(dt, 0, "compatible", "apple,j504"));
+    assert(t8122_full_identity_prepare(dt) < 0); /* Exact chip is mandatory. */
+    /* Other base-M3 boards (the J433/J434 iMacs) stay refused. */
+    tree(dt, sizeof(dt), "apple,j433", "1");
+    static const char j433[] = "apple,j433\0apple,t8122";
+    assert(!fdt_setprop(dt, 0, "compatible", j433, sizeof(j433)));
+    assert(t8122_full_identity_prepare(dt) < 0);
 
     const u32 masks[] = {0x3ff, 0x37e, 0xff};
     for (unsigned i = 0; i < sizeof(masks) / sizeof(masks[0]); i++) {

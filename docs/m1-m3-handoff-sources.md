@@ -48,18 +48,19 @@ Repository links for these source revisions are
   The panel and each external-controller transaction are atomic. The optional
   native path is not exercised by a J516S boot using the legacy handoff.
 * T6031 GPU probing requires the exact chosen string `asahi,t6031-gpu=1`.
-  On a J516C, `dt_set_m3_defaults()` sets it unless a config line set it.
+  On J514C and J516C, `dt_set_m3_defaults()` sets it unless a config line set it.
   `chosen.asahi,t6031-gpu=0` keeps the handoff off. `chosen.asahi,m3-defaults=0`
   prevents the default and keeps the owner's explicit lines as written, an
   owner's `asahi,t6031-gpu=1` included. After a lost config line no T6031 line
-  is passed on, the owner's `=1` included. A J514C still needs the line. This
+  is passed on, the owner's `=1` included. No manual enable line is needed on
+  either supported board. This
   does not qualify stand-in power data or widen the kernel's board gate.
 * The T6031 display handoff requires the exact chosen string
-  `asahi,t6031-dcp=1`. On a J516C, `dt_set_m3_defaults()` sets it unless a
+  `asahi,t6031-dcp=1`. On J514C and J516C, `dt_set_m3_defaults()` sets it unless a
   config line set it, beside the GPU default, with the same `=0`,
   `m3-defaults=0` and lost-line rules. Each switch stands alone: `t6031-gpu=0`
   keeps the GPU off and still gets the display default, and `t6031-dcp=0` the
-  other way round. A J514C still needs the line. Whether the kernel takes the
+  other way round. No manual enable line is needed. Whether the kernel takes the
   display over is the kernel's decision; one that does not leaves the boot
   framebuffer. Its `__OS_LOG` reservations are made on every J514C or J516C
   boot without it.

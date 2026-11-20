@@ -73,4 +73,10 @@ int t6031_identity_publish(void *dt, const struct t8122_powered_identity *id,
  */
 const struct fw_version_info *dt_t6031_gpu_image(void *dt);
 
+/* Shared G15C measurement schema, with a SoC-specific chosen node name. */
+int t6031_identity_node_named(void *dt, int nps, const char *node_name);
+int t6031_identity_publish_named(void *dt, const struct t8122_powered_identity *id,
+                                 const struct t6031_closure *c, const char *node_name);
+const struct fw_version_info *dt_t6031_gpu_image_named(void *dt, const char *node_name);
+
 #endif

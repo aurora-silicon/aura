@@ -29,7 +29,11 @@ UBOOT = (bytes(16) + (0x10000).to_bytes(8, "little") + bytes(32) + b"ARM\x64" + 
          + bytes(4096 - 64))               # an arm64 Image header, image_size 64 KiB
 BOARDS = {
     "j613": ("J613", "apple,j613;apple,t8122;apple,arm-platform"),
+    # a J613 device tree from a kernel before linux-aurora aurora15: no common scanout aperture
+    "j613-old": ("J613", "old;apple,j613;apple,t8122;apple,arm-platform"),
     "j615": ("J615", "apple,j615;apple,t8122;apple,arm-platform"),
+    "j504": ("J504", "apple,j504;apple,t8122;apple,arm-platform"),
+    "j433": ("J433", "apple,j433;apple,t8122;apple,arm-platform"),
     "j514s": ("J514S", "apple,j514s;apple,t6030;apple,arm-platform"),
     "j516s": ("J516S", "apple,j516s;apple,t6030;apple,arm-platform"),
     "j516c": ("J516C", "apple,j516c;apple,t6031;apple,arm-platform"),
@@ -38,14 +42,16 @@ BOARDS = {
     "j516m": ("J516M", "apple,j516m;apple,t6034;apple,arm-platform"),
     "j293": ("J293", "apple,j293;apple,t8103;apple,arm-platform"),
 }
-CHIP = {"j613": "8122", "j615": "8122", "j514s": "6030", "j516s": "6030", "j516c": "6031",
+CHIP = {"j613": "8122", "j613-old": "8122", "j615": "8122", "j504": "8122", "j433": "8122", "j514s": "6030", "j516s": "6030", "j516c": "6031",
         "j514c": "6031", "j514m": "6034", "j516m": "6034", "j293": "8103"}
 FAMILY = {"j613": ("asahi,t8122-", "asahi,j613-", "asahi,j615-"),
+          "j613-old": ("asahi,t8122-", "asahi,j613-", "asahi,j615-"),
           "j615": ("asahi,t8122-", "asahi,j613-", "asahi,j615-"),
+          "j504": ("asahi,t8122-", "asahi,j613-", "asahi,j615-"),
           "j514s": ("asahi,t6030-",),
           "j516s": ("asahi,t6030-",),
           "j516c": ("asahi,t6031-",)}
-M3_LINES = ("asahi,t8122-", "asahi,t6030-", "asahi,t6031-")
+M3_LINES = ("asahi,t8122-", "asahi,t6030-", "asahi,t6031-", "asahi,t6034-")
 MAX_GPU = "asahi,t6031-gpu"
 MAX_DCP = "asahi,t6031-dcp"
 MAX = {MAX_DCP: "1", MAX_GPU: "1"}      # the J516C defaults
@@ -153,23 +159,26 @@ struct g15_soc { const char *optin; };
 static const struct g15_soc g15_soc_t8122 = {"asahi,t8122-gpu"};
 static const struct g15_soc g15_soc_t8122_standin = {"asahi,t8122-gpu"};
 static const struct g15_soc g15_soc_t6031 = {"asahi,t6031-gpu"};
+static const struct g15_soc g15_soc_t6034 = {"asahi,t6034-gpu"};
 static const char *selected = "none";
 static void t8122_leak_fuse_export(void *d) {}
 static int dt_set_gpu_t8122(void *d) { selected = "reservation-only"; return 0; }
 static int dt_set_gpu_g15(void *d, const struct g15_soc *soc)
 {
     selected = soc == &g15_soc_t8122_standin ? "g15-standin" :
-               soc == &g15_soc_t6031         ? "t6031-g15"   : "g15";
+               soc == &g15_soc_t6031         ? "t6031-g15"   :
+               soc == &g15_soc_t6034         ? "t6034-g15"   : "g15";
     return 0;
 }
 #define T6031 0x6031
+#define T6034 0x6034
 static int chip_id = 0x8122, boot_cpu_idx;
 struct fw_version_info { const char *string; };
 enum { T8122_ID_NOT_RUN };
 struct t8122_powered_identity { int result; };
-static const struct fw_version_info *g15_t6031_fw;
-static struct t8122_powered_identity g15_t6031_id;
-static void g15_disable(void *d) { selected = "t6031-disabled"; }
+static const struct fw_version_info *g15_g15c_fw;
+static struct t8122_powered_identity g15_g15c_id;
+static void g15_disable(void *d) { selected = chip_id == T6034 ? "t6034-disabled" : "t6031-disabled"; }
 static const struct fw_version_info *dt_t6031_gpu_image(void *d)
 {
     printf("PROBE t6031-image\n");
@@ -177,14 +186,22 @@ static const struct fw_version_info *dt_t6031_gpu_image(void *d)
 }
 static void t6031_gpu_probe(void *d)
 {
-    printf("PROBE t6031-identity %d\n", g15_t6031_id.result);
-    if (g15_t6031_fw)
-        printf("%s\n", g15_t6031_fw->string);
+    printf("PROBE t6031-identity %d\n", g15_g15c_id.result);
+    if (g15_g15c_fw)
+        printf("%s\n", g15_g15c_fw->string);
+}
+static int dt_measure_gpu_t6034(void *d)
+{
+    printf("PROBE t6034-identity\n");
+    return 0;
 }
 ''' + function(t6031, "bool t6031_board(const void *dt)\n{") + \
+        function(t6031, "bool t6034_board(const void *dt)\n{") + \
+        function(t6031, "bool j516m_board(const void *dt)\n{") + \
         function(gpu, "static bool g15_optin(") + \
         function(gpu, "static int dt_set_gpu_t8122_select(void *dt)\n{") + \
-        function(gpu, "static int dt_set_gpu_t6031(void *dt)\n{") + r'''
+        function(gpu, "static int dt_set_gpu_t6031(void *dt)\n{") + \
+        function(gpu, "static int dt_set_gpu_t6034(void *dt)\n{") + r'''
 /* kboot's handoff: /chosen as dt_set_chosen() writes it, then what the GPU code would see */
 static void kboot_set_initrd(void *start, size_t size) {}
 static void kboot_request_hibernate_layout(bool on) { printf("HIB %d\n", on); }
@@ -205,6 +222,8 @@ static int kboot_prepare_dt(void *fdt)
         assert(!dt_set_gpu_t8122_select(dt));
     if (chip_id == T6031)                     /* dt_set_gpu()'s switch on the chip */
         assert(!dt_set_gpu_t6031(dt));
+    if (chip_id == T6034 && !chosen_lost)
+        assert(!dt_set_gpu_t6034(dt));
     int prop;
     fdt_for_each_property_offset(prop, dt, node) {
         const char *name;
@@ -308,6 +327,10 @@ static int mkdtb(const char *compat_list, const char *path)
 {
     static unsigned char tree[4096];
     char compat[128];
+    /* "old;" first: a kernel before aurora15, whose display subsystem has no apple,dma-range */
+    int old = !strncmp(compat_list, "old;", 4);
+    if (old)
+        compat_list += 4;
     int len = snprintf(compat, sizeof(compat), "%s", compat_list) + 1;
     for (char *c = compat; *c; c++)
         if (*c == ';')
@@ -315,6 +338,12 @@ static int mkdtb(const char *compat_list, const char *path)
     assert(!fdt_create_empty_tree(tree, sizeof(tree)));
     assert(!fdt_setprop(tree, 0, "compatible", compat, len));
     assert(fdt_add_subnode(tree, 0, "chosen") >= 0);
+    int disp = fdt_add_subnode(tree, 0, "display-subsystem");
+    assert(disp >= 0);
+    assert(!fdt_setprop_string(tree, disp, "compatible", "apple,t8122-display-subsystem"));
+    if (!old)
+        assert(!fdt_setprop_u64(tree, disp, "apple,dma-range", 0x10000000000ull) &&
+               !fdt_appendprop_u64(tree, disp, "apple,dma-range", 0x1000000000ull));
     assert(!fdt_pack(tree));
     FILE *out = fopen(path, "wb");
     assert(out && fwrite(tree, 1, fdt_totalsize(tree), out) == fdt_totalsize(tree));
@@ -455,7 +484,7 @@ def graphics_off(r, board="j613"):
     assert r.rc == 0 and r.booted, r.stdout
     for name in r.chosen:
         assert not name.startswith(FAMILY[board]), (name, r.stdout)
-    if board in ("j613", "j615"):
+    if board in ("j613", "j615", "j504"):
         assert r.select == "reservation-only", r.stdout
     if board == "j516c":                      # no image read, no identity probe, GPU node disabled
         assert r.select == "t6031-disabled" and not r.probes, r.stdout
@@ -467,9 +496,57 @@ def booted(r):
 
 # ---- a complete config: unchanged ----
 
+@pytest.mark.parametrize("board", ["j613", "j615", "j504"])
 @pytest.mark.parametrize("build", STAGE2)
-def test_no_config_gets_the_whole_air_recipe(tools, build):
+def test_no_config_gets_the_whole_air_recipe(tools, build, board):
+    b = boot(tools, build, b"", board=board)
+    booted(b)
+    assert set(AIR) <= b.armed and b.select == "g15-standin"
+
+
+DCPEXT = "asahi,t8122-dcpext"
+
+
+@pytest.mark.parametrize("build", STAGE2)
+def test_the_j613_gets_its_external_display_by_default(tools, build):
     b = boot(tools, build, b"")
+    booted(b)
+    assert DCPEXT in b.armed and b.chosen[DCPEXT] == "1"
+
+
+@pytest.mark.parametrize("build", STAGE2)
+def test_a_j613_with_an_older_kernel_gets_no_external_display_default(tools, build):
+    """Before aurora15 the kernel crashes the internal DCP when dcpext is reserved: its device
+    tree has no common scanout aperture, so the J613 gets the plain Air recipe."""
+    b = boot(tools, build, b"", board="j613-old")
+    booted(b)
+    assert set(AIR) <= b.armed and DCPEXT not in b.chosen
+
+
+@pytest.mark.parametrize("build", STAGE2)
+def test_the_j615_gets_no_external_display_default(tools, build):
+    b = boot(tools, build, b"", board="j615")
+    booted(b)
+    assert set(AIR) <= b.armed and DCPEXT not in b.chosen
+
+
+@pytest.mark.parametrize("config,lines", [
+    (b"chosen.asahi,t8122-dcpext=0\n", {DCPEXT: "0"}),
+    (b"chosen.asahi,t8122-dcpext=1\nchosen.asahi,t8122-dcpext=0\n", {DCPEXT: "0"}),
+    (b"chosen.asahi,t8122-dcp=0\n", {}),
+    (b"chosen.asahi,m3-defaults=0\n", {}),
+], ids=["dcpext-off", "dcpext-on-then-off", "dcp-off", "master-off"])
+@pytest.mark.parametrize("build", STAGE2)
+def test_j613_owner_lines_keep_the_external_display_off(tools, build, config, lines):
+    b = boot(tools, build, config)
+    booted(b)
+    assert DCPEXT not in b.armed
+    assert {k: v for k, v in b.chosen.items() if k == DCPEXT} == lines
+
+
+@pytest.mark.parametrize("build", STAGE2)
+def test_j613_dcpext_zero_keeps_the_rest_of_the_air_recipe(tools, build):
+    b = boot(tools, build, b"chosen.asahi,t8122-dcpext=0\n")
     booted(b)
     assert set(AIR) <= b.armed and b.select == "g15-standin"
 
@@ -500,12 +577,13 @@ def t6031_lines(r):
     return {k: v for k, v in r.chosen.items() if k.startswith("asahi,t6031-")}
 
 
+@pytest.mark.parametrize("board", ["j514c", "j516c"])
 @pytest.mark.parametrize("build", STAGE2)
-def test_the_j516c_gets_its_display_and_gpu_defaults_and_nothing_else(tools, build):
+def test_the_t6031_boards_get_display_and_gpu_without_config(tools, build, board):
     """A boot.bin with no config: both switches are armed, and the real T6031 GPU entry sees its
     switch and runs its image read, identity probe and setup, all on the first boot that loads
     this stage 2"""
-    b = boot(tools, build, b"", board="j516c")
+    b = boot(tools, build, b"", board=board)
     booted(b)
     assert t6031_lines(b) == MAX and {MAX_DCP, MAX_GPU} <= b.armed
     assert not any(n.startswith(("asahi,t8122-", "asahi,t6030-")) for n in b.chosen)
@@ -526,32 +604,33 @@ def test_the_j516c_gets_its_display_and_gpu_defaults_and_nothing_else(tools, bui
      "t6031-disabled"),
 ], ids=["gpu-off", "gpu-on-then-off", "gpu-on", "master-off", "master-off-gpu-on",
         "master-off-dcp-on", "dcp-on", "dcp-off", "both-off"])
+@pytest.mark.parametrize("board", ["j514c", "j516c"])
 @pytest.mark.parametrize("build", STAGE2)
-def test_j516c_owner_lines_are_kept(tools, build, config, lines, select):
-    b = boot(tools, build, config, board="j516c")
+def test_t6031_owner_lines_are_kept(tools, build, board, config, lines, select):
+    b = boot(tools, build, config, board=board)
     booted(b)
     assert t6031_lines(b) == lines and b.select == select
     assert bool(b.probes) == (select == "t6031-g15")
     assert b.armed & {MAX_DCP, MAX_GPU} == {k for k, v in lines.items() if v == "1"}
 
 
-@pytest.mark.parametrize("board", ["j514c", "j514m", "j516m", "j293"])
+@pytest.mark.parametrize("board", ["j293", "j433"])
 @pytest.mark.parametrize("build", STAGE2)
 def test_other_maxes_and_macs_get_no_default(tools, build, board):
     b = boot(tools, build, b"", board=board)
     booted(b)
     assert not any(n.startswith(M3_LINES) for n in b.chosen), b.stdout
     assert not b.probes
-    # the J514C reaches the T6031 entry, which needs its line as before; T6034 has no GPU path
-    assert b.select == ("t6031-disabled" if board == "j514c" else "none")
+    # these boards have no admitted GPU path; the J433 (M3 iMac) reaches only the T8122 reservations
+    assert b.select == {"j433": "reservation-only"}.get(board, "none")
 
 
 @pytest.mark.parametrize("config,lines", [
-    (b"chosen.asahi,t6031-gpu=1\n", {MAX_GPU: "1"}),
+    (b"chosen.asahi,t6031-gpu=1\n", MAX),
     (b"chosen.asahi,t6031-gpu=1\nchosen.asahi,t6031-dcp=1\n", MAX),
 ], ids=["gpu", "gpu-dcp"])
 @pytest.mark.parametrize("build", STAGE2)
-def test_the_j514c_manual_line_works_as_before(tools, build, config, lines):
+def test_explicit_j514c_enable_lines_match_normal_defaults(tools, build, config, lines):
     b = boot(tools, build, config, board="j514c")
     booted(b)
     assert t6031_lines(b) == lines and b.select == "t6031-g15"
@@ -604,7 +683,7 @@ def test_literal_display_zero_is_the_framebuffer_setting(tools, build):
     assert set(AIR) <= b.armed
 
 
-# ---- a lost line: no graphics on the four boards, and the Mac still boots ----
+# ---- a lost line: no graphics on the supported boards, and the Mac still boots ----
 
 LOSSES = {
     "gpu-on-fillers-lost-gpu-off": lambda build: GPU_ON + fill(build, keep=1) + GPU_OFF,
@@ -619,10 +698,11 @@ LOSSES = {
 }
 
 
+@pytest.mark.parametrize("board", ["j613", "j504"])
 @pytest.mark.parametrize("loss", sorted(LOSSES))
 @pytest.mark.parametrize("build", STAGE2)
-def test_a_lost_line_keeps_air_graphics_off_and_boots(tools, build, loss):
-    graphics_off(boot(tools, build, LOSSES[loss](build)))
+def test_a_lost_line_keeps_air_graphics_off_and_boots(tools, build, loss, board):
+    graphics_off(boot(tools, build, LOSSES[loss](build), board=board), board=board)
 
 
 @pytest.mark.parametrize("build", STAGE2)
@@ -663,16 +743,13 @@ def test_a_kboot_table_too_small_for_the_config(tools, build):
     graphics_off(boot(tools, build, b"tso=1\n" + GPU_ON + lines))
 
 
-@pytest.mark.parametrize("board,line", [("j514c", b"chosen.asahi,t6031-gpu="),
-                                        ("j516m", b"chosen.asahi,t6031-gpu="),
+@pytest.mark.parametrize("board,line", [("j516m", b"chosen.asahi,t6031-gpu="),
                                         ("j293", b"chosen.test,switch=")])
 @pytest.mark.parametrize("build", STAGE2)
 def test_other_boards_keep_their_lines_after_a_loss(tools, build, board, line):
     b = boot(tools, build, line + b"1\n" + fill(build, keep=1) + line + b"0\n", board=board)
     booted(b)
     assert b.chosen[line[7:-1].decode()] == "1"   # as before the M3 defaults: no rule there
-    if board == "j514c":
-        assert b.select == "t6031-g15"
 
 
 # ---- the chainload route ----
@@ -994,3 +1071,23 @@ def test_pre_m4_ignores_sart_entries(tools, build):
     b = boot(tools, build, b"", trailer=SART)
     booted(b)
     assert nvme_events(b) == ["shutdown keep=0", "handoff keep=0"], b.stdout
+
+@pytest.mark.parametrize("build", STAGE2)
+@pytest.mark.parametrize("config,gpu,display", [
+    (b"", True, True),
+    (b"chosen.asahi,t6034-gpu=0\n", False, True),
+    (b"chosen.asahi,t6034-dcp=0\n", True, False),
+    (b"chosen.asahi,m3-defaults=0\n", False, False),
+    (b"chosen.asahi,m3-defaults=0\nchosen.asahi,t6034-gpu=1\n", True, False),
+    (b"chosen.asahi,m3-defaults=0\nchosen.asahi,t6034-dcp=1\n", False, True),
+    (LOST, False, False),
+])
+@pytest.mark.parametrize("board", ["j514m", "j516m"])
+def test_t6034_defaults_and_owner_choices(tools, build, board, config, gpu, display):
+    b = boot(tools, build, config, board=board)
+    booted(b)
+    assert ("asahi,t6034-gpu" in b.armed) == gpu
+    assert ("asahi,t6034-dcp" in b.armed) == display
+    assert bool(b.probes) == gpu
+    if gpu:
+        assert b.select == "t6034-g15"

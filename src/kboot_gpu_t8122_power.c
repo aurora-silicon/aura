@@ -76,7 +76,8 @@ int t8122_full_identity_prepare(void *dt)
     int len = 0;
     const char *armed = chosen < 0 ? NULL : fdt_getprop(dt, chosen, "asahi,t8122-gpu", &len);
     if ((fdt_node_check_compatible(dt, 0, "apple,j613") &&
-         fdt_node_check_compatible(dt, 0, "apple,j615")) ||
+         fdt_node_check_compatible(dt, 0, "apple,j615") &&
+         fdt_node_check_compatible(dt, 0, "apple,j504")) ||
         fdt_node_check_compatible(dt, 0, "apple,t8122") || !armed || len != 2 || armed[0] != '1' ||
         armed[1] != '\0')
         return -1;
