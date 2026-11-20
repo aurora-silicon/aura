@@ -1320,15 +1320,6 @@ static int dt_set_speaker_safety(void)
         node = next;
     }
 
-    if (chip_id != T8140)
-        return 0;
-
-    int audio = adt_path_offset(adt, "/product/audio");
-    u32 acoustic_id;
-    if (audio < 0 || ADT_GETPROP(adt, audio, "acoustic-id", &acoustic_id) != sizeof(acoustic_id) ||
-        acoustic_id != 44)
-        return 0;
-
     static const struct {
         const char *adt_name;
         const char *dt_name;
@@ -1344,6 +1335,25 @@ static int dt_set_speaker_safety(void)
           {"speaker-cpms-bgd_1s", "asahi,adt-speaker-cpms-bgd-1s-raw"},
           {"speaker-cpms-bgd_inst", "asahi,adt-speaker-cpms-instant-raw"},
       };
+
+    /*
+     * The profile is published wherever /product/audio carries the speaker CPMS background
+     * values (speaker-cpms-bgd_*), whatever the SoC or board. Without them the ADT describes no
+     * such profile and none is published. With any of them, the acoustic ID and the whole set
+     * above must be there: a partial profile stops the boot rather than publish half of it.
+     */
+    int audio = adt_path_offset(adt, "/product/audio");
+    if (audio < 0)
+        return 0;
+    bool described = false;
+    for (size_t i = 0; i < ARRAY_SIZE(longs); i++)
+        described |= adt_getprop(adt, audio, longs[i].adt_name, NULL) != NULL;
+    if (!described)
+        return 0;
+
+    u32 acoustic_id;
+    if (ADT_GETPROP(adt, audio, "acoustic-id", &acoustic_id) != sizeof(acoustic_id))
+        bail("ADT: incomplete speaker safety profile\n");
     u32 word_values[ARRAY_SIZE(words)];
     u64 long_values[ARRAY_SIZE(longs)];
     for (size_t i = 0; i < ARRAY_SIZE(words); i++)
@@ -1353,8 +1363,17 @@ static int dt_set_speaker_safety(void)
         if (ADT_GETPROP(adt, audio, longs[i].adt_name, &long_values[i]) != sizeof(u64))
             bail("ADT: incomplete speaker safety profile\n");
 
+    /*
+     * J700 (acoustic ID 44) keeps the board compatible its binding names first; every
+     * profile also carries the board-independent one.
+     */
+    static const char j700_compatible[] = "asahi,j700-speaker-safety\0asahi,adt-speaker-safety";
+    static const char adt_compatible[] = "asahi,adt-speaker-safety";
     int node = fdt_add_subnode(dt, chosen, "asahi-speaker-safety");
-    if (node < 0 || fdt_setprop_string(dt, node, "compatible", "asahi,j700-speaker-safety") ||
+    if (node < 0 ||
+        (acoustic_id == 44
+             ? fdt_setprop(dt, node, "compatible", j700_compatible, sizeof(j700_compatible))
+             : fdt_setprop(dt, node, "compatible", adt_compatible, sizeof(adt_compatible))) ||
         fdt_setprop_u32(dt, node, "asahi,schema-version", 1) ||
         fdt_setprop_string(dt, node, "asahi,speaker-output-policy", "forbidden") ||
         fdt_setprop_string(dt, node, "asahi,cpms-value-encoding", "opaque-adt-u64") ||
