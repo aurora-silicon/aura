@@ -356,6 +356,45 @@ def trace_lines(rec, msgs=None, title="the record"):
     return out
 
 
+def after_bursts(msgs, h, gap_ms=2.0, follow=8, most=16):
+    """What the AP sends after each of the GPU firmware's 0x42 (RX doorbell) bursts: the GPU's
+    0x42 messages on EP 0x20 less than gap_ms apart make one burst; after its last, the AP's first
+    follow messages to either coprocessor, until the next burst."""
+    def is42(m):
+        return (m.kind == "mbox" and m.src_i in (SRC_GFX, SRC_GFX1) and not m.write
+                and m.ep == 0x20 and m.msg is not None and m.msg >> 48 == 0x42)
+
+    gap = gap_ms * h["cntfrq"] / 1000
+    bursts = []
+    for m in msgs:
+        if is42(m):
+            if bursts and m.t - bursts[-1][-1].t < gap:
+                bursts[-1].append(m)
+            else:
+                bursts.append([m])
+    out = [f"what the AP sends after each GPU firmware 0x42 (RX doorbell) burst ({len(bursts)}; "
+           f"a burst: 0x42s < {gap_ms:g} ms apart; ms after its last 0x42):"]
+    for n, b in enumerate(bursts[:most]):
+        end = b[-1].t
+        nxt = bursts[n + 1][0].t if n + 1 < len(bursts) else None
+        out.append(f"  burst {n + 1}: {len(b)} GPU 0x42 messages, {_ms(b[0].t, h):+.3f} .. "
+                   f"{_ms(end, h):+.3f} ms")
+        after = [m for m in msgs if m.kind == "mbox" and m.write and m.t > end
+                 and (nxt is None or m.t < nxt)]
+        for m in after[:follow]:
+            ep = "??" if m.ep is None else f"{m.ep:02x}"
+            msg = "?" * 18 if m.msg is None else f"0x{m.msg:016x}"
+            out.append(f"    {(m.t - end) * 1000 / h['cntfrq']:+.3f} ms {m.src} {m.dir} ep 0x{ep} "
+                       f"{msg}  {decode(m, h)}")
+        gpu = next((m for m in after if m.src_i in (SRC_GFX, SRC_GFX1)), None)
+        out.append("    the AP's first message to the GPU: "
+                   + (f"{(gpu.t - end) * 1000 / h['cntfrq']:+.3f} ms ({decode(gpu, h)})" if gpu
+                      else "none before the next burst or the record's end"))
+    if len(bursts) > most:
+        out.append(f"  ... {len(bursts) - most} more bursts in trace.txt")
+    return out
+
+
 def summary(rec, ring=None):
     """The header, then counts by source, direction and endpoint, the PMP patterns, the register
     writes; ring: (messages, records read, head, capacity) of the MMIO ring if it was read."""
@@ -400,6 +439,8 @@ def summary(rec, ring=None):
         first = f", first {_ms(hits[0].t, h):+.3f} ms, last {_ms(hits[-1].t, h):+.3f} ms" \
             if hits else ""
         out.append(f"  0x{pat:016x} ({name}): A2I {by['A2I']}, I2A {by['I2A']}{first}")
+    out.append("")
+    out += after_bursts(msgs, h)
     out.append("")
     out.append("register writes:")
     regs = collections.OrderedDict()
@@ -481,7 +522,9 @@ def blk_lines(blk, main_hdr):
            "# from the first access the stage 2 traps (each core's XNU entry; SPTM's own bring-up "
            "before it runs without stage 2 and isn't seen) to the window's end",
            "# columns: ms tick cpu who pc R/W<bits> +offset value  (who: SPTM = a GL1 trap, "
-           "XNU = an EL trap)"]
+           "XNU = an EL trap)",
+           "# only the AP's accesses trap: the GPU firmware's own (the J713's G16 27.2 maps the "
+           "block at fw VA 0xfffffc11c0000000 + offset) don't, nor do its RAM writes"]
     for r in blk.recs:
         pair = " (128-bit pair)" if r.pair else ""
         out.append(f"{_ms(r.t, main_hdr):+13.6f} 0x{r.t:012x} c{r.cpu:<2d} {blk_who(r):4s} "
