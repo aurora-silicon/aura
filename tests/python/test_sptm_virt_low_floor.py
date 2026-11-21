@@ -63,26 +63,34 @@ static bool sptm_virt_carveout_low(void) { return false; }
 static u64 heapblock_high_water(void) { return stub_heap_hw; }
 static u64 heapblock_limit(void) { return stub_heap_lim; }
 #define _end ((void *)stub_end)
-/* Only the line for a rejected CTRR_C pair is kept: how often it came and with which registers. */
-static int rejects;
+/*
+ * Two lines are kept: a rejected CTRR_C pair (how often, with which registers) and a missing
+ * pair (how often, with which cause).
+ */
+static int rejects, absents;
 static u64 rej_lwr, rej_upr;
+static const char *absent_why;
 static void stub_printf(const char *fmt, ...)
 {
     va_list ap;
 
-    if (strncmp(fmt, "MMU: unusable CTRR_C range", 26))
-        return;
     va_start(ap, fmt);
-    rej_lwr = va_arg(ap, u64);
-    rej_upr = va_arg(ap, u64);
+    if (!strncmp(fmt, "MMU: unusable CTRR_C range", 26)) {
+        rej_lwr = va_arg(ap, u64);
+        rej_upr = va_arg(ap, u64);
+        rejects++;
+    } else if (!strncmp(fmt, "MMU: no CTRR_C range", 20)) {
+        absent_why = va_arg(ap, const char *);
+        absents++;
+    }
     va_end(ap);
-    rejects++;
 }
 #define printf(...) stub_printf(__VA_ARGS__)
 static bool firmware_ro_checked, firmware_ro_valid;
 static int firmware_ro_none;
 static u64 firmware_ro_start, firmware_ro_end;
 @RO_REJECT@
+@RO_ABSENT@
 @RO_RANGE@
 @FLOOR@
 #undef printf
@@ -113,6 +121,7 @@ def build(tmp_path, name, body):
     source = (HARNESS
               .replace("@GUARD@", guard_enum())
               .replace("@RO_REJECT@", function("src/memory.c", "static int firmware_ro_reject(u64 lower, u64 upper)"))
+              .replace("@RO_ABSENT@", function("src/memory.c", "static int firmware_ro_absent(const char *why)"))
               .replace("@RO_RANGE@", function("src/memory.c", "int memory_fw_ro_range(u64 *start, u64 *end)"))
               .replace("@FLOOR@", function("src/sptm_virt.c", "static u64 sptm_virt_low_floor(u64 limit)"))
               + body)
@@ -248,6 +257,41 @@ int main(void)
     assert(probe(lwr, upr) == 1 && rejects == 0);
     assert(probe(lwr, upr + SZ_16K) == -1 && rejects == 1 && rej_upr == upr + SZ_16K);
     assert(probe(0, 0) == -1 && rejects == 0);
+    return 0;
+}
+''')
+
+
+def test_missing_ctrr_pair_is_named_where_it_is_an_error(tmp_path):
+    build(tmp_path, "floor_absent", r'''
+static int probe(bool present)
+{
+    has_ctrr = present;
+    reg_lwr = reg_upr = 0;
+    firmware_ro_checked = firmware_ro_valid = false;
+    rejects = absents = 0;
+    absent_why = NULL;
+    return memory_fw_ro_range(NULL, NULL);
+}
+
+int main(void)
+{
+    run(0x10005c28000UL, true);
+
+    /* Where no range is fine, unset registers and a faulting read both stay silent. */
+    chip_id = T8132;
+    assert(probe(true) == 0 && absents == 0 && rejects == 0);
+    chip_id = T8112;
+    assert(probe(false) == 0 && absents == 0 && rejects == 0);
+
+    /* T8140 returns its error for both, and each says once which of the two it was. */
+    chip_id = T8140;
+    assert(probe(true) == -1 && absents == 1 && rejects == 0);
+    assert(strstr(absent_why, "unset") && !strstr(absent_why, "fault"));
+    assert(memory_fw_ro_range(NULL, NULL) == -1 && absents == 1);
+    assert(probe(false) == -1 && absents == 1 && rejects == 0);
+    assert(strstr(absent_why, "fault") && !strstr(absent_why, "unset"));
+    assert(memory_fw_ro_range(NULL, NULL) == -1 && absents == 1);
     return 0;
 }
 ''')
