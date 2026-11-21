@@ -721,10 +721,10 @@ int ctl_host_call_unauth(u64 req_va)
  */
 #define CTL_DCC_TAG 0xAC71UL /* top 16 bits of a doorbell write, and of its errno read-back */
 
-static int ctl_dcc_errno[32]; /* per core, indexed by smp_id() */
-static u64 ctl_dcc_cookie;    /* the boot's cookie; 0 (unset) refuses every gated command */
-static u64
-    ctl_dcc_presented[32]; /* per core, the cookie last written to DBGDTRTX before a doorbell */
+static int ctl_dcc_errno[MAX_CPUS]; /* per core, indexed by smp_id() */
+static u64 ctl_dcc_cookie;          /* the boot's cookie; 0 (unset) refuses every gated command */
+/* per core, the cookie last written to DBGDTRTX before a doorbell */
+static u64 ctl_dcc_presented[MAX_CPUS];
 
 /* The per-boot cookie, from the host (run_guest_sptm.py, over the proxy) or extracted from the
  * ESP manifest's boot-args (src/sptm_virt_esp.c). used+retain: a host-called entry, like
