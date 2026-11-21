@@ -572,10 +572,14 @@ int dapf_init(const char *path, int index)
 
         if (ret <= 0)
             return ret;
-        /* Do not admit the legacy writer, even for a genuine T8132 DAPF bank. */
-        printf("dapf: T8132 DAPF programming is unsupported for %s; preserving filter state\n",
-               path);
-        return -1;
+        /* J715: Linux cold-starts the MTP; its filter needs the legacy writer, as m1n1 stage 2 programs it. */
+        if (!(adt_is_compatible(adt, 0, "J715AP") && !strcmp(path, "/arm-io/dart-mtp"))) {
+            /* Do not admit the legacy writer, even for a genuine T8132 DAPF bank. */
+            printf("dapf: T8132 DAPF programming is unsupported for %s; preserving filter state\n",
+                   path);
+            return -1;
+        }
+        printf("dapf: J715: programming %s with the m1n1 writer\n", path);
     }
 
     u32 pwr;
@@ -693,6 +697,17 @@ static int dapf_init_j713(void *dt)
     while (entry->path != NULL) {
         if (adt_path_offset(adt, entry->path) < 0) {
             entry++;
+            continue;
+        }
+
+        /* J715: program the MTP's filter before Linux cold-starts the MTP. */
+        if (adt_is_compatible(adt, 0, "J715AP") && !strcmp(entry->path, "/arm-io/dart-mtp")) {
+            int r = dapf_init(entry->path, entry->index);
+            printf("dapf: J715: %s programmed for the MTP cold start: %d\n", entry->path, r);
+            if (r < 0)
+                ret = -1;
+            entry++;
+            count++;
             continue;
         }
 
