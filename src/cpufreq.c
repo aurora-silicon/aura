@@ -137,6 +137,11 @@ static int set_pstate_ps2(const struct cluster_t *cluster, uint32_t pstate, uint
 {
     bool checked = requests_checked();
     u32 timeout = checked ? CLUSTER_CHECKED_SWITCH_TIMEOUT : CLUSTER_SWITCH_TIMEOUT;
+#ifdef AURA_WINDOWS
+    /* J813 Windows E boot state: qualified with this bound (tests/e2e/windows_ecpu_boot.c). */
+    if (chip_id == T8142)
+        timeout = CLUSTER_SWITCH_TIMEOUT;
+#endif
 
     if (checked && poll64(cluster->base + CLUSTER_PSTATE, CLUSTER_PSTATE_BUSY, 0, timeout) < 0) {
         printf("cpufreq: Cluster %s is busy before P-State request\n", cluster->name);
@@ -951,6 +956,11 @@ void cpufreq_payload_boost(bool enable)
 {
     const struct cluster_t *clusters = chip_clusters();
 
+#ifdef AURA_WINDOWS
+    /* The J813 Windows resident was qualified with both clusters as firmware handed them over. */
+    if (chip_id == T8142)
+        return;
+#endif
     if (!boost_supported(clusters))
         return;
     for (unsigned int i = 0; i < CLUSTER_MAX && clusters[i].base; i++) {
