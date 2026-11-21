@@ -845,7 +845,7 @@ int dapf_init_fdt(const void *fdt)
     dapf_nprogrammed = dapf_nfailed = 0;
     if (chip_id == T8132) {
         /* M4 laptops whose trees state the same DAPF handoff contract as the J713. */
-        static const char *const boards[] = {"apple,j713", "apple,j604", NULL};
+        static const char *const boards[] = {"apple,j713", "apple,j715", "apple,j604", NULL};
         bool known = false;
 
         for (const char *const *board = boards; fdt && *board; board++)
