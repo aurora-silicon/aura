@@ -17,10 +17,12 @@ libfdt. Covered:
   7. ADT names other than "ave" and "ave<N>" are never taken for an encoder;
   8. dt_set_ave_dapf() programs the CPU DART filter (dart-ave<N>) of every encoder after the
      first that the next stage gets, leaves encoder 0's to dapf.c, disables an encoder whose
-     filter fails, and leaves T8140's inherited filters alone;
+     filter fails (and reports a failure to disable it, which stops the handoff), and leaves
+     T8140's inherited filters alone;
   9. the M3 (T8122) encoder of a J615, with the segment list of its live ADT, is handed over at
      its DART's window (vm-base plus the segment's offset, where iBoot left it) with no SoC list
-     naming it; with an IPSW ADT (no preload) or an offset past the window it is disabled;
+     naming it; with an IPSW ADT (no preload), an offset past the window or a remap address
+     other than the window address it is disabled;
   10. both M3 Max (T6031) encoders of a J514c (IPSW ADT, modelled segment lists) are handed over,
      each at its own DART's window, and dart-ave1 is programmed only when the DT enables ave1;
   11. a node is an encoder by its compatible naming the AVE block ("apple,ave" or
@@ -85,6 +87,11 @@ static int dapf_init(const char *path, int index)
     strcat(programmed, path);
     strcat(programmed, " ");
     return failing_dart && !strcmp(path, failing_dart) ? -1 : 0;
+}
+/* dapf.c's predicate: T8140 keeps every inherited filter but its MTP's and PMP's. */
+static bool dapf_keeps_inherited(const char *path)
+{
+    return chip_id == T8140 && strcmp(path, "/arm-io/dart-mtp") && strcmp(path, "/arm-io/dart-pmp");
 }
 void *adt;
 static struct { u64 phys_base; } cur_boot_args = {0x800000000000ULL};
@@ -267,6 +274,14 @@ static struct anode *add_encoder(const char *name, u64 addr)
 
 static struct anode *add_dart(const char *name, u64 vm_base)
 {
+    /*
+     * From the M2 on (vm-base not 0), iBoot remaps each of the encoder's segments to the window:
+     * vm-base plus the segment's offset, as in every live ADT (M2, M3, M4, M4 Pro, A18 Pro).
+     */
+    for (int i = 0; vm_base && !strncmp(name, "dart-", 5) && i < nanodes; i++)
+        if (!strcmp(anodes[i].name, name + 5))
+            for (int s = 0; s < anodes[i].nseg; s++)
+                anodes[i].seg[s].remap = vm_base + anodes[i].seg[s].iova;
     for (int i = 0; i < nanodes; i++) {
         if (!strcmp(anodes[i].name, name)) {
             anodes[i].vm_base = vm_base;
@@ -606,6 +621,20 @@ static int scenarios(void)
     CHECK(!firmware(0, J615_AVE, 0) && !chosen("aurora,ave-text-crc32")[0]);
     puts("PASS: J615 encoder without an iBoot preload: disabled");
 
+    /* iBoot's DATA remap address is not dart-ave's vm-base plus its offset: fail closed. */
+    tree(1);
+    encoder2(0, "apple,t8122-ave", "apple,ave", J615_AVE, "okay");
+    a = add_encoder("ave", J615_AVE);
+    add_dart("dart-ave", M3_VM_BASE);
+    a->seg[0] = (struct adt_segment_ranges){0x10000a8c000ULL, 0, 0x10000000000ULL, 0x134000, 1};
+    a->seg[1] = (struct adt_segment_ranges){0x10001a2c000ULL, 0x134000, 0x10000138000ULL,
+                                            0x128000, 0};
+    CHECK(!dt_set_ave());
+    CHECK(!strcmp(status(0, J615_AVE), "disabled") &&
+          strstr(logbuf, "ADT remap disagrees with the DART window"));
+    CHECK(!firmware(0, J615_AVE, 0) && !chosen("aurora,ave-text-crc32")[0]);
+    puts("PASS: J615 encoder whose ADT remap disagrees with its DART window: disabled");
+
     /* An offset that already carries the window base is not the layout this handoff knows. */
     tree(1);
     encoder2(0, "apple,t8122-ave", "apple,ave", J615_AVE, "okay");
@@ -728,10 +757,23 @@ static int scenarios(void)
     add_encoder("ave1", M1_ENC1); add_dart("dart-ave1", 0);
     CHECK(!dt_set_ave() && !fdt_pack(dt));
     failing_dart = "/arm-io/dart-ave1";
-    CHECK(dt_set_ave_dapf() < 0);
+    CHECK(dt_set_ave_dapf() == 1);
     CHECK(!strcmp(status(0, M1_ENC1), "disabled") && !strcmp(status(0, M1_ENC0), "okay"));
     CHECK(fdt_totalsize(dt) < (u32)dt_bufsize); /* packed again */
     puts("PASS: dart-ave1 failure leaves encoder 1 off");
+
+    /* The filter fails and there is no room to disable the encoder: the handoff must stop. */
+    m1max();
+    add_encoder("ave0", M1_ENC0); add_dart("dart-ave0", 0);
+    add_encoder("ave1", M1_ENC1); add_dart("dart-ave1", 0);
+    CHECK(!dt_set_ave() && !fdt_pack(dt));
+    failing_dart = "/arm-io/dart-ave1";
+    int saved_bufsize = dt_bufsize;
+    dt_bufsize = fdt_totalsize(dt); /* "okay" cannot grow to "disabled" */
+    CHECK(dt_set_ave_dapf() < 0);
+    dt_bufsize = saved_bufsize;
+    CHECK(!strcmp(status(0, M1_ENC1), "okay"));
+    puts("PASS: dart-ave1 failure that cannot disable encoder 1 refuses the handoff");
 
     tree(2);
     encoder(1, "apple,t6000-ave", M1_ENC1, "okay");
@@ -883,4 +925,4 @@ def test_ave_handoff(tmp_path):
     binary = build(tmp_path, (repo / "src/kboot.c").read_text())
     run = subprocess.run([str(binary)], capture_output=True, text=True)
     assert run.returncode == 0, run.stdout + run.stderr
-    assert run.stdout.count("PASS:") == 26, run.stdout
+    assert run.stdout.count("PASS:") == 28, run.stdout

@@ -4813,6 +4813,15 @@ static int dt_set_ave_node(int node, const char *compat, u32 phandle)
             reason = "firmware segment outside its DART window";
             goto disable;
         }
+        /*
+         * Fail closed where iBoot's remap address is not the window address computed here:
+         * such an encoder is left off rather than handed over at an address its firmware does
+         * not run at.
+         */
+        if (seg[i].remap != (dva_base | seg[i].iova)) {
+            reason = "ADT remap disagrees with the DART window";
+            goto disable;
+        }
     }
     if (dt_reserve_asc_segments_at(node, adt_path, NULL, path, false, dva_base, false)) {
         reason = "firmware reservation failed";
@@ -4938,15 +4947,16 @@ static int dt_set_ave(void)
  * dapf_entries). Every further encoder (the M1 Max's second, the M1 Ultra's three more) fetches
  * its own preloaded __TEXT through its own CPU DART, dart-ave<N>: program the filters of those the
  * next stage gets, after the DT is final, and leave off one whose filter cannot be programmed.
- * T8140 keeps every inherited filter but its MTP's and PMP's (dapf_init_fdt()).
+ * A DART filter dapf.c keeps as inherited (dapf_keeps_inherited()) is left alone.
+ *
+ * Returns how many encoders were left off, or -1 if one whose filter failed could not be
+ * disabled: that encoder would stay on with an unprogrammed filter, so the handoff must stop.
  */
 static int dt_set_ave_dapf(void)
 {
     bool edited = false;
-    int ret = 0;
+    int off = 0;
 
-    if (chip_id == T8140)
-        return 0;
     for (int node = fdt_next_node(dt, -1, NULL); node >= 0; node = fdt_next_node(dt, node, NULL)) {
         char adt_buf[40], dart[48];
 
@@ -4956,19 +4966,19 @@ static int dt_set_ave_dapf(void)
         if (!adt_path || !strcmp(adt_path, "/arm-io/ave") || !strcmp(adt_path, "/arm-io/ave0"))
             continue;
         snprintf(dart, sizeof(dart), "/arm-io/dart-%s", adt_path + strlen("/arm-io/"));
-        if (adt_path_offset(adt, dart) < 0 || dapf_init(dart, 3) >= 0)
+        if (dapf_keeps_inherited(dart) || adt_path_offset(adt, dart) < 0 || dapf_init(dart, 3) >= 0)
             continue;
         /* Node offsets survive reopening the packed tree in place. */
         if ((!edited && fdt_open_into(dt, dt, dt_bufsize)) ||
             fdt_setprop_string(dt, node, "status", "disabled"))
             return -1;
         edited = true;
-        ret = -1;
+        off++;
         printf("FDT: AVE %s disabled: its DART filter %s cannot be programmed\n", adt_path, dart);
     }
     if (edited && fdt_pack(dt))
         return -1;
-    return ret;
+    return off;
 }
 
 /*
@@ -12431,8 +12441,14 @@ int kboot_boot(void *kernel)
     }
     ret = (chip_id == T8142 || chip_id == T6041 || chip_id == T8132) ? dapf_init_fdt(dt)
                                                                      : dapf_init_all();
-    if (dt_set_ave_dapf() < 0)
-        printf("kboot: a video encoder's DART filter failed; that encoder is left off\n");
+    int ave_off = dt_set_ave_dapf();
+    if (ave_off < 0) {
+        printf("kboot: refusing handoff: a video encoder whose DART filter failed could not be "
+               "disabled\n");
+        return -1;
+    }
+    if (ave_off > 0)
+        printf("kboot: %d video encoder(s) left off: DART filter failed\n", ave_off);
     if (ret < 0 && chip_id == T8140) {
         printf("kboot: refusing T8140 handoff after DAPF failure\n");
         pcie_shutdown();

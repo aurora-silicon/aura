@@ -686,6 +686,16 @@ struct entry dapf_entries[] = {
     {NULL, -1, NULL},
 };
 
+/*
+ * T8140 programs only its MTP and PMP DART filters and keeps every other filter as inherited
+ * (programming the rest raised an SError on a J700). dapf_init_fdt() and the encoder filters in
+ * kboot.c both ask this, so the two cannot drift.
+ */
+bool dapf_keeps_inherited(const char *path)
+{
+    return chip_id == T8140 && strcmp(path, "/arm-io/dart-mtp") && strcmp(path, "/arm-io/dart-pmp");
+}
+
 static int dapf_init_j713(void *dt)
 {
     int ret = 0;
@@ -806,8 +816,7 @@ int dapf_init_fdt(const void *fdt)
     struct entry *entry = dapf_entries;
 
     while (entry->path != NULL) {
-        if (chip_id == T8140 && strcmp(entry->path, "/arm-io/dart-mtp") &&
-            strcmp(entry->path, "/arm-io/dart-pmp")) {
+        if (dapf_keeps_inherited(entry->path)) {
             printf("dapf: preserving inherited %s state on T8140\n", entry->path);
             entry++;
             continue;
