@@ -23,6 +23,7 @@ dart_dev_t *dart_gen3_init_adt_cold(const char *path, int instance, int device);
 int dart_set_bypass_fdt(void *dt, u32 phandle, u8 device);
 dart_dev_t *dart_init_adt_display(const char *path, int instance, int device);
 bool dart_adt_locked(const char *path, int instance);
+bool dart_t8110_is_locked(uintptr_t base, u64 size);
 void dart_lock_adt(const char *path, int instance);
 dart_dev_t *dart_init_fdt(void *dt, u32 phandle, int device, bool keep_pts);
 dart_dev_t *dart_init_fdt_locked(void *dt, u32 phandle, int device);
