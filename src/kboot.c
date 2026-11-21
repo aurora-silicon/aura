@@ -11821,6 +11821,7 @@ static int kboot_boot_t8152(void *kernel)
     next_stage.args[3] = 0;
     next_stage.args[4] = 0;
     next_stage.restore_logo = false;
+    next_stage.chained = false;
     return 0;
 }
 
@@ -12485,6 +12486,7 @@ int kboot_boot(void *kernel)
     next_stage.args[3] = 0;
     next_stage.args[4] = 0;
     next_stage.restore_logo = false;
+    next_stage.chained = false;
 
     return 0;
 }

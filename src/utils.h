@@ -484,6 +484,8 @@ struct vector_args {
     generic_func *entry;
     u64 args[5];
     bool restore_logo;
+    /* The next stage is an aura image this stage chainloads: the chain goes on there. */
+    bool chained;
 };
 
 extern u32 board_id, chip_id;

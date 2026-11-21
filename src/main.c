@@ -88,6 +88,7 @@ static void stage1_run_host_proxy(void)
 {
     printf("Stage 1: host request received\n");
     fb_set_active(true);
+    pmu_chain_leave();
     uartproxy_run_presynced();
     while (!next_stage.entry)
         uartproxy_run(NULL);
@@ -241,6 +242,7 @@ void run_actions(void)
                 iodev_handle_events(iodev);
                 if (iodev_can_write(iodev) || iodev_can_write(IODEV_USB_VUART)) {
                     printf(" Connected!\n");
+                    pmu_chain_leave();
                     uartproxy_run(NULL);
                     return;
                 }
@@ -277,6 +279,7 @@ void run_actions(void)
         printf("\naura-try: the trial could not start its payload; rebooting to the configured "
                "Stage 2 in 10 s\n");
         mdelay(10000);
+        pmu_chain_leave();
         flush_and_reboot();
     }
     if (stage1_config_target())
@@ -303,6 +306,7 @@ void run_actions(void)
                "  no USB host a proxy. Rebooting in 10 s. To stop, hold the power button and\n"
                "  choose another system; then reinstall a signed Stage 2.\n");
         mdelay(10000);
+        pmu_chain_leave();
         flush_and_reboot();
     }
 
@@ -316,6 +320,7 @@ void run_actions(void)
 
     printf("Running proxy...\n");
 
+    pmu_chain_leave();
     uartproxy_run(NULL);
 }
 
@@ -468,13 +473,11 @@ void aura_main(void)
     stage1_read_boot_record();
 #endif
     /*
-     * Nothing else in an aura chain clears iBoot's failed-boot count, on any chip: a test kernel
-     * that hangs, or a proxy session that ends in a reset, counts as a failed boot, and enough of
-     * them end in recoveryOS. The primary PMU's info-leg_scrpad in the ADT locates the count on
-     * every SoC; one without it is left alone, and the Stage 1 recovery window has already read
-     * the record.
+     * iBoot's failed-boot count goes on to the next stage (aura.failed-boots=) and stays in the PMU
+     * until the chain leaves aura (pmu_chain_leave()). The primary PMU's info-leg_scrpad in the ADT
+     * locates it on every SoC; one without it is left alone.
      */
-    pmu_clear_panic_counter();
+    pmu_snapshot_failed_boots();
 
     printf("Initialization complete.\n");
 
@@ -489,10 +492,15 @@ next_stage:
         panic("Refusing next stage while secondary callbacks are pending\n");
     }
 
+    /* A chainloaded aura stage carries the chain on; anything else ends it here. */
+    if (!next_stage.chained)
+        pmu_chain_leave();
+
     printf("Preparing to run next stage at %p...\n", next_stage.entry);
 
     if (!nvme_shutdown()) {
         printf("NVMe handoff failed; returning to proxy\n");
+        pmu_chain_leave();
         if (!secboot_host_proxy_allowed())
             flush_and_reboot();
         uartproxy_run(NULL);
@@ -512,6 +520,7 @@ next_stage:
         /* Its firmware may still use memory the next stage will reuse. */
         if (display_shutdown(DCP_SLEEP_IF_EXTERNAL) < 0) {
             printf("Display handoff failed; returning to proxy\n");
+            pmu_chain_leave();
             if (!secboot_host_proxy_allowed())
                 flush_and_reboot();
             uartproxy_run(NULL);
