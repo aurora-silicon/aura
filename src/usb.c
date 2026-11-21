@@ -551,9 +551,13 @@ void usb_init(void)
         return;
 
     /* This PHY requires a deferred carrier transition; normal boots never
-     * enter this fallback path before handing over to the OS. */
+     * enter this fallback path before handing over to the OS. The schedule
+     * takes 1 to 15 s (usb_cdc_state_schedule()); a shorter delay is refused,
+     * which left a host-less proxy here with no carrier and without the CDC
+     * watchdog (usb_cdc_arm_watchdog()) that resets a proxy nobody opens. */
     if (chip_id == T8140) {
-        if (!usb_cdc_ready() && !usb_cdc_owns_carrier() && usb_cdc_schedule(0, 0, BIT(1) | BIT(2)))
+        if (!usb_cdc_ready() && !usb_cdc_owns_carrier() &&
+            usb_cdc_schedule(1000, 0, BIT(1) | BIT(2)))
             printf("usb: unable to schedule proxy transport\n");
         return;
     }
