@@ -58,7 +58,7 @@ u32 chip_id;
 volatile enum exc_guard_t exc_guard;
 volatile int exc_count;
 struct fw_version_info os_firmware = {V14_7, "14.7", {14, 7, 0}, 3, "iBoot-10151.140.19.700.2"};
-const struct fw_version_info fw_versions[V27_2 + 1] = {
+const struct fw_version_info fw_versions[V27_3B + 1] = {
     [V14_7] = {V14_7, "14.7", {14, 7, 0}, 3, "iBoot"},
     [V26_6_2] = {V26_6_2, "26.6.2", {26, 6, 2}, 3, "mBoot-18000.161.10"},
     [V27_2] = {V27_2, "27.2", {27, 2, 0}, 3, "mBoot-20457.41.3"},
