@@ -761,21 +761,25 @@ static int mcc_init_m5(int node, int *path)
  * there (a binned M4 Max has 8 AMCCs with 6 enabled), the planes and their stride in
  * /chosen/lock-regs/amcc, and each enabled AMCC's register window, which lock-regs lists too.
  *
- * - An ADT that contradicts itself fails, before any register is read: a mask that names no AMCC
- *   or one past amcc-count, more enabled channels than the enabled AMCCs hold, an enabled AMCC
- *   without a window large enough for its planes, a window lock-regs does not list.
- * - An ADT that does not give what this needs (a missing property or one of another width, more
- *   AMCCs or channels than aura tracks, and for the status reads a plane stride from lock-regs)
- *   leaves the MCC alone, as for a revision with no driver here.
- * - A cache status other than the one iBoot leaves on the M4 Pro leaves the MCC alone too: this
- *   path writes no register, and the carveouts come from the ADT list either way.
+ * None of these stops the boot; each leaves the MCC alone (MCC_UNSUPPORTED), as for a revision
+ * with no driver here:
+ * - an ADT that contradicts itself, found before any register is read: a mask that names no AMCC
+ *   or one past amcc-count, a channel on an AMCC the mask leaves out, an enabled AMCC without a
+ *   window large enough for its planes, a window lock-regs does not list;
+ * - an ADT that does not give what this needs: a missing property or one of another width, more
+ *   AMCCs or channels than aura tracks, and for the status reads a plane stride from lock-regs;
+ * - a cache status other than the one iBoot leaves on the M4 Pro.
+ * This path writes no register and its carveouts come from the ADT list either way, so failing
+ * here would add nothing but a reset: aura_main() panics on mcc_init() < 0 before the trial
+ * watchdog is armed, which loops a trial Stage 1 with no fallback. A T8140 left alone is still
+ * refused at kboot_boot(), which needs its MCC.
  *
  * Only the enabled AMCCs are recorded and read: a fused-off AMCC's window is never touched.
  */
 static int mcc_firmware_cache_inconsistent(const char *what)
 {
-    printf("MCC: the ADT contradicts itself: %s\n", what);
-    return -1;
+    printf("MCC: the ADT contradicts itself: %s; going on without the MCC\n", what);
+    return MCC_UNSUPPORTED;
 }
 
 static int mcc_init_firmware_cache(int node, int *path)
@@ -819,11 +823,15 @@ static int mcc_init_firmware_cache(int node, int *path)
         if (channels > 64 / count)
             return mcc_undriven();
         u64 all = count * channels == 64 ? ~0ULL : BIT(count * channels) - 1;
-        if (!mask || (mask & ~all) ||
-            (u64)__builtin_popcountll(mask) > __builtin_popcountll(amcc_mask) * channels)
+        if (!mask || (mask & ~all))
             return mcc_firmware_cache_inconsistent(
-                "dcs-channel-enable-mask is empty, past the channels, or more than the enabled "
-                "AMCCs hold");
+                "dcs-channel-enable-mask is empty or past the channels");
+        /* The mask has dcs-count-per-amcc bits per AMCC, AMCC 0 lowest (0x3f / 0xffffff). */
+        for (u64 b = 0; b < count * channels; b++)
+            if ((mask & BIT(b)) && !(amcc_mask & BIT(b / channels)))
+                return mcc_firmware_cache_inconsistent(
+                    "dcs-channel-enable-mask enables a channel of an AMCC amcc-enable-mask leaves "
+                    "out");
     }
 
     if (lock_node >= 0 && adt_getprop(adt, lock_node, "plane-count", NULL)) {

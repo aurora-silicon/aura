@@ -12,11 +12,13 @@ The ways this initializer can fail, which the cases below cover:
      the binned one (8 AMCCs, 6 enabled), an M4 Max tree before iBoot adds its masks, the M4 Pro.
  F2. An AMCC that amcc-enable-mask leaves out (fused off on a binned part) is read: an SError.
  F3. An ADT that contradicts itself is admitted and its registers read: amcc-count 0, an empty
-     amcc-enable-mask or one past amcc-count, more enabled channels than the enabled AMCCs hold,
-     a channel mask past the channel count, a channel mask with no channel count, an enabled AMCC
-     with no window or one too small for its planes and the status read, a window lock-regs does
-     not list or of another size, a lock-regs list whose count disagrees with it, no planes, or a
-     stride that is not word aligned. Each must fail before any register is read.
+     amcc-enable-mask or one past amcc-count, a channel on an AMCC the mask leaves out, a channel
+     mask past the channel count, a channel mask with no channel count, an enabled AMCC with no
+     window or one too small for its planes and the status read, a window lock-regs does not list
+     or of another size, a lock-regs list whose count disagrees with it, no planes, or a stride
+     that is not word aligned. Each must leave the MCC alone before any register is read, say that
+     the ADT contradicts itself, and not stop the boot: aura_main() panics on mcc_init() < 0
+     before the trial watchdog is armed, so a fatal result is a reset loop with no fallback.
  F4. An ADT that does not describe what this needs stops the boot: a missing amcc-reg-idx, a count
      or mask of another width, more AMCCs than aura tracks, a channel mask wider than 64 channels,
      or (for the status reads) no plane stride in lock-regs. The MCC must be left alone instead,
@@ -29,6 +31,9 @@ The ways this initializer can fail, which the cases below cover:
      order, and mcc_plane_info() refuses an index past them.
  F8. A firmware-cache MCC, driven or left alone, takes its carveouts from the ADT list, never TZ
      registers, and mcc_enable_cache() writes nothing.
+ F9. The boot gates around it: aura_main()'s MCC check (src/main.c) must not panic on any of these
+     trees, and kboot_boot()'s T8140 refusal (src/kboot.c) must still refuse a T8140 MCC that was
+     left alone, so the Neo stops there, with the trial watchdog armed, rather than booting on.
 """
 
 import json
@@ -45,8 +50,24 @@ PRELUDE = r'''
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
+
+/* The last line printed, so a case can tell which reason the MCC was left alone for. */
+static char last_print[256];
+static int test_printf(const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(last_print, sizeof(last_print), fmt, ap);
+    va_end(ap);
+    va_start(ap, fmt);
+    int ret = vprintf(fmt, ap);
+    va_end(ap);
+    return ret;
+}
+#define printf test_printf
 
 typedef uint8_t u8;
 typedef uint32_t u32;
@@ -222,6 +243,8 @@ CASES = r'''
 #define ADT_TZ2_SIZE  0x2000000ULL
 #define STATUS_REG    0x2804
 
+static void expect_gates(bool driven);
+
 static const struct profile *cur;
 static long long amcc_mask_of(const struct profile *p)
 {
@@ -349,32 +372,50 @@ static void expect_driven(long long mask, int planes, u64 stride)
     assert(mcc_plane_info(enabled, &base, &st, &count) < 0);
     expect_adt_carveouts();
     assert(mcc_enable_cache() == 0 && !writes);
+    expect_gates(true);
 }
 
-/* F4, F5: left alone and the boot goes on, after at most `reads` register reads. */
-static void expect_left_alone(int reads)
+/*
+ * F9: aura_main()'s MCC check does not panic, and kboot_boot() refuses only a T8140 whose MCC was
+ * left alone.
+ */
+static void expect_gates(bool driven)
 {
+    panicked = false;
+    main_mcc_gate();
+    assert(!panicked);
+    bool t8140 = chip_id == T8140;
+    assert(kboot_mcc_gate() == (!driven && t8140 ? -1 : 0));
+}
+
+/*
+ * F3, F4, F5: left alone and the boot goes on, after at most `reads` register reads; F3 says the
+ * ADT contradicts itself, F4 and F5 do not.
+ */
+static void left_alone(int reads, bool contradicts)
+{
+    last_print[0] = 0;
     int ret = mcc_init();
     if (ret != MCC_UNSUPPORTED)
         printf("%s: mcc_init() = %d, want MCC_UNSUPPORTED\n", cur->name, ret);
     assert(ret == MCC_UNSUPPORTED);
+    bool said = strstr(last_print, "contradicts itself");
+    if (said != contradicts)
+        printf("%s: last line \"%s\"\n", cur->name, last_print);
+    assert(said == contradicts);
     assert(!mcc_initialized && mmio_reads == reads);
     u64 base, stride;
     int count;
     assert(mcc_plane_info(0, &base, &stride, &count) < 0);
     expect_adt_carveouts();
     assert(mcc_enable_cache() < 0 && !writes);
+    expect_gates(false);
 }
 
-/* F3: refused before any register is read. */
-static void expect_inconsistent(void)
-{
-    int ret = mcc_init();
-    if (ret >= 0)
-        printf("%s: mcc_init() = %d, want < 0\n", cur->name, ret);
-    assert(ret < 0);
-    assert(!mcc_initialized && !mmio_reads);
-}
+static void expect_left_alone(int reads) { left_alone(reads, false); }
+
+/* F3: left alone before any register is read, saying why, and the boot goes on. */
+static void expect_inconsistent(void) { left_alone(0, true); }
 
 static void real_trees(void)
 {
@@ -460,6 +501,15 @@ static void inconsistent_trees(void)
     load(&j616c_binned);
     add_m4_max_lock_regs(8);
     set_count(MCC_NODE, "dcs-channel-enable-mask", 0xffffffff, 4);
+    expect_inconsistent();
+    /* Channels on AMCCs the mask leaves out, with no more channels than the enabled ones hold. */
+    load(&j616c_binned);
+    add_m4_max_lock_regs(8);
+    set_count(MCC_NODE, "dcs-channel-enable-mask", 0xffffff00, 4);
+    expect_inconsistent();
+    load(&j616c);
+    set_count(MCC_NODE, "amcc-enable-mask", 0xb5, 4);
+    set_count(MCC_NODE, "dcs-channel-enable-mask", 0x0fff0f0f, 4);
     expect_inconsistent();
     /* A channel past amcc-count * dcs-count-per-amcc. */
     load(&j773s);
@@ -668,12 +718,27 @@ struct profile {
     return "\n".join(out) + "\n"
 
 
+def gates():
+    """aura_main()'s MCC check and kboot_boot()'s T8140 MCC refusal, as production has them."""
+    main = (ROOT / "src/main.c").read_text()
+    start = main.index("    if (mcc_init() < 0)\n")
+    end = main.index("\n", main.index("panic(", start)) + 1
+    assert main.count("if (mcc_init() < 0)") == 1
+    kboot = (ROOT / "src/kboot.c").read_text()
+    kstart = kboot.index("    int ret = mcc_enable_cache();\n")
+    kend = kboot.index("    }\n", kstart) + len("    }\n")
+    assert kboot.count("mcc_enable_cache()") == 1 and "T8140" in kboot[kstart:kend]
+    return ("static bool panicked;\n#define panic(...) (panicked = true)\n"
+            "static void main_mcc_gate(void)\n{\n" + main[start:end] + "}\n#undef panic\n"
+            "static int kboot_mcc_gate(void)\n{\n" + kboot[kstart:kend] + "    return 0;\n}\n")
+
+
 def test_mcc_firmware_cache(tmp_path):
     header = strip_includes((ROOT / "src/mcc.h").read_text())
     source = strip_includes((ROOT / "src/mcc.c").read_text())
     cfile = tmp_path / "mcc_firmware_cache.c"
     binary = tmp_path / "mcc_firmware_cache"
-    cfile.write_text(PRELUDE + header + source + profiles() + CASES)
+    cfile.write_text(PRELUDE + header + source + profiles() + gates() + CASES)
     subprocess.run(host_cc() + ["-std=gnu11", "-Wall", "-Wno-format", "-Wno-unused-function",
                                 "-o", str(binary), str(cfile)], check=True)
     result = subprocess.run([str(binary)], capture_output=True, text=True)

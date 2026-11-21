@@ -414,12 +414,13 @@ void aura_main(void)
     if (supports_gxf())
         gxf_init();
     /*
-     * mcc_init() fails only on an ADT that contradicts itself about the MCC (the firmware-cache
-     * path: a mask past its counts, an enabled AMCC without a usable window). An unknown
-     * revision, an ADT that does not give a driver its counts (4 or 8 bytes) or register windows,
-     * a firmware-owned cache in a state aura does not know (MCC_UNSUPPORTED), and a SoC with no
-     * MCC in the ADT (MCC_ABSENT) boot on; mcc_unmap_carveouts() then takes the carveouts from
-     * the ADT list, which it requires.
+     * This runs before the trial watchdog is armed, so a failure here resets the Mac with no
+     * trial fallback. No MCC driver fails on what the ADT says: an unknown revision, an ADT that
+     * does not give a driver its counts (4 or 8 bytes) or register windows, or that contradicts
+     * itself, and a firmware-owned cache in a state aura does not know leave the MCC alone
+     * (MCC_UNSUPPORTED), as does a SoC with no MCC in the ADT (MCC_ABSENT).
+     * mcc_unmap_carveouts() then takes the carveouts from the ADT list, which it requires, and
+     * kboot_boot() refuses a T8140 whose MCC was left alone.
      */
     if (mcc_init() < 0)
         panic("MCC initialization failed\n");
