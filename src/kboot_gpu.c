@@ -2717,7 +2717,7 @@ static int dt_set_gpu_t6031(void *dt)
  * T8122 handoff checks. Power is voted on solely for bounded ID/core-mask
  * reads, then voted off before Linux starts. Neither GPU nor mailbox is enabled.
  */
-static void t8122_read_powered_identity(void *dt, int gpu)
+void t8122_read_powered_identity(void *dt, int gpu)
 {
     if (!t8122_power_probe_opted_in(dt))
         return;
@@ -4316,6 +4316,20 @@ static T6050_GPU_INIT int dt_set_gpu_g17c(void *dt)
     return ret;
 }
 
+/* The firmware version whose initdata layout the G13/G14 path builds. */
+static const struct fw_version_info *gpu_initdata_compat(void)
+{
+    switch (os_firmware.version) {
+        case V12_3_1:
+            return &fw_versions[V12_3];
+        case V13_5B4:
+        case V13_6_1:
+            return &fw_versions[V13_5];
+        default:
+            return &os_firmware;
+    }
+}
+
 int dt_set_gpu(void *dt)
 {
     if (chip_id == T8152) {
@@ -4390,7 +4404,8 @@ int dt_set_gpu(void *dt)
             int dcp = fdt_path_offset(dt, "dcp"), len;
             const fdt32_t *profile =
                 dcp < 0 ? NULL : fdt_getprop(dt, dcp, "apple,j613-25g83-profile", &len);
-            if (profile && len == 4 && fdt32_ld(profile) == 1) {
+            /* 27.2 (26B123) firmware: the handoff publication only; it leaves the GPU disabled. */
+            if ((profile && len == 4 && fdt32_ld(profile) == 1) || os_firmware.version == V27_2) {
                 t8122_leak_fuse_export(dt);
                 return dt_set_gpu_t8122_26(dt);
             }
@@ -4420,6 +4435,28 @@ int dt_set_gpu(void *dt)
     int sgx = adt_path_offset(adt, "/arm-io/sgx");
     if (sgx < 0)
         bail("ADT: GPU: /arm-io/sgx node not found\n");
+
+    const struct fw_version_info *compat = gpu_initdata_compat();
+    size_t data_a_size, data_b_size, globals_size;
+
+    /*
+     * Without an initdata layout for this firmware (T8112's G14G on 27.2), the GPU cannot be
+     * started. Keep iBoot's carveouts reserved and leave the GPU disabled, without touching its
+     * power state or publishing an ABI, instead of refusing the whole boot.
+     */
+    if (rust_gpu_initdata_size(compat->num[0], compat->num[1], &data_a_size, &data_b_size,
+                               &globals_size) == -1) {
+        if (dt_set_region(dt, sgx, "gfx-handoff", "/reserved-memory/uat-handoff") ||
+            dt_set_region(dt, sgx, "gfx-shared-region", "/reserved-memory/uat-pagetables") ||
+            dt_set_region(dt, sgx, "gpu-region", "/reserved-memory/uat-ttbs"))
+            return -1;
+        gpu = fdt_path_offset(dt, "gpu");
+        if (gpu < 0)
+            return 0;
+        printf("FDT: GPU: no initdata layout for firmware %s; GPU disabled, boot continues\n",
+               os_firmware.string);
+        return fdt_setprop_string(dt, gpu, "status", "disabled");
+    }
 
     u32 perf_state_count;
     if (ADT_GETPROP(adt, sgx, "perf-state-count", &perf_state_count) < 0 || !perf_state_count)
@@ -4574,21 +4611,6 @@ int dt_set_gpu(void *dt)
         return 0;
     }
 
-    const struct fw_version_info *compat;
-
-    switch (os_firmware.version) {
-        case V12_3_1:
-            compat = &fw_versions[V12_3];
-            break;
-        case V13_5B4:
-        case V13_6_1:
-            compat = &fw_versions[V13_5];
-            break;
-        default:
-            compat = &os_firmware;
-            break;
-    }
-
     if (downstream_dtb) {
         if (firmware_set_fdt(dt, gpu, "apple,firmware-version", &os_firmware))
             return -1;
@@ -4597,11 +4619,6 @@ int dt_set_gpu(void *dt)
     }
     // Ignoring errors for old dts compat
     firmware_set_fdt(dt, gpu, "apple,firmware-abi", compat);
-
-    size_t data_a_size, data_b_size, globals_size;
-    if (rust_gpu_initdata_size(compat->num[0], compat->num[1], &data_a_size, &data_b_size,
-                               &globals_size) == -1)
-        return -1;
 
     void *data_a = (void *)top_of_memory_alloc(ALIGN_UP(data_a_size, SZ_16K));
     void *data_b = (void *)top_of_memory_alloc(ALIGN_UP(data_b_size, SZ_16K));

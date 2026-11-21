@@ -19,6 +19,7 @@ int display_init(void);
 int display_start_dcp(void);
 int display_configure(const char *config);
 int display_configure_second(const char *config);
+bool display_second_attempted(void);
 int display_shutdown(dcp_shutdown_mode mode);
 const display_config_t *display_get_config(void);
 bool display_dart_tables_inherited(void);

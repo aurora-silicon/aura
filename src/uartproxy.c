@@ -89,24 +89,6 @@ static bool uartproxy_sync_iodev(iodev_id_t iodev)
     return false;
 }
 
-bool uartproxy_wait_dockchannel(unsigned int timeout_ms)
-{
-    const iodev_id_t iodev = IODEV_DOCKCHANNEL_UART;
-    if (!(iodev_get_usage(iodev) & USAGE_UARTPROXY)) {
-        printf("Proxy: DockChannel unavailable; skipping host window\n");
-        return false;
-    }
-    for (unsigned int ms = 0; ms < timeout_ms; ms++) {
-        if (uartproxy_sync_iodev(iodev)) {
-            presynced_iodev = iodev;
-            wdt_host_attached();
-            return true;
-        }
-        mdelay(1);
-    }
-    return false;
-}
-
 enum stage1_proxy_result uartproxy_wait_stage1(unsigned int timeout_ms)
 {
     struct stage1_proxy_window window;

@@ -173,6 +173,14 @@ bool nvme_quiesce_for_next = false;
 static u8 nvme_die;
 /* When this stage started the ANS firmware, for the shutdown timing line. */
 static u64 nvme_boot_ticks;
+/*
+ * Post-M4: this stage started the session from off (an earlier stage powered ANS off and passed
+ * its SART entries, or this stage cycled a session it found), rather than taking iBoot's session
+ * or adopting a live one. Such a session goes on powered off, as it came (nvme_shutdown()).
+ */
+static bool nvme_session_from_off;
+/* nvme_shutdown() handed the session on running: the next stage must not be told ANS is off. */
+static bool nvme_handed_on_live;
 
 static asc_dev_t *nvme_asc = NULL;
 static rtkit_dev_t *nvme_rtkit = NULL;
@@ -461,6 +469,40 @@ static bool nvme_own_rtkit(void)
 }
 
 /*
+ * T6040/T6041 (M4 Pro/Max): a cold start of ANS after the generic power-off gets no RTKit HELLO
+ * (ASC CPU running, pmgr domains on), and an RTKit quiesce times out. Keep ANS live between
+ * stages and adopt it in the next stage, as T6050 does.
+ *
+ * Not every post-M4 ANS (nvme_post_m4()) is listed. T8132 (M4) powers ANS off and passes its SART
+ * entries: a next aura stage's PCIe init faults on a live ANS (synchronous external abort in
+ * pcie_init(), J713 console on aura#406), whether it adopts the session or starts it again. The
+ * power-off path is what every 1.0.0b13 stage does on T8132. T8152 stays quiesced: its Linux
+ * driver wakes ANS with a fresh RTKit handshake and neither adopts a live session nor restarts a
+ * stopped one. T8140 keeps the power-off path, which works there; live adoption by the next stage
+ * is untested.
+ */
+static bool nvme_post_m4_keeps_live(void)
+{
+    return chip_id == T6040 || chip_id == T6041;
+}
+
+static bool nvme_post_m4_hands_on_live(void)
+{
+    return nvme_ans_storage_gated() || nvme_post_m4_keeps_live();
+}
+
+/*
+ * nvme_shutdown() will hand this stage's session on running to the next aura stage. Asked before
+ * the handoff too: chainload_load() builds nvme.sart= after nvme_init() and before nvme_shutdown(),
+ * and a session that goes on live must not be reported off there either.
+ */
+static bool nvme_will_hand_on_live(void)
+{
+    return nvme_type == NVME_T8132 && nvme_post_m4_keeps_live() && !nvme_quiesce_for_next &&
+           !nvme_session_from_off && !nvme_keep_running_for_linux;
+}
+
+/*
  * Post-M4, done with ANS: stop the controller, idle the firmware as macOS does before a sleep,
  * keep the SART entries, then power ANS and the PCIe block it runs on off. Every later stage that
  * needs it starts it again with nvme_ans_power_on(). The firmware resumes from what it saves at
@@ -498,11 +540,42 @@ static bool nvme_ans_power_off(void)
 }
 
 /* Post-M4, ANS off: power, the SART entries back, then the firmware's start after a power loss. */
+/*
+ * Discard what an earlier owner left in the receive mailbox before the run bit: the warm start's
+ * handshake would read it in place of the firmware's HELLO.
+ */
+static void nvme_ans_drain(void)
+{
+    struct asc_message msg;
+    u32 count = 0;
+
+    asc_i2a_enable(nvme_asc, true);
+    while (count < 256 && asc_recv(nvme_asc, &msg)) {
+        if (count < 4)
+            printf("nvme: stale ANS message: 0x%lx ep 0x%x\n", msg.msg0, msg.msg1);
+        count++;
+    }
+    if (count)
+        printf("nvme: discarded %u stale ANS message%s\n", count, count == 1 ? "" : "s");
+}
+
 static bool nvme_ans_power_on(void)
 {
-    if (pcie_ans_power_on() || !sart_set_entries(nvme_sart, nvme_sart_saved, nvme_sart_saved_cnt) ||
-        !rtkit_boot_warm(nvme_rtkit, BIT(0)) ||
-        poll32(nvme_base + NVME_BOOT_STATUS, 0xffffffff, NVME_BOOT_STATUS_OK, USEC_PER_SEC) < 0) {
+    bool ok = !pcie_ans_power_on();
+
+    if (!ok)
+        printf("nvme: couldn't power ANS on\n");
+    if (ok)
+        nvme_ans_drain();
+    if (ok && !(ok = sart_set_entries(nvme_sart, nvme_sart_saved, nvme_sart_saved_cnt)))
+        printf("nvme: couldn't restore the %d SART entries\n", nvme_sart_saved_cnt);
+    if (ok && !(ok = rtkit_boot_warm(nvme_rtkit, BIT(0))))
+        printf("nvme: no warm handshake (CPU status 0x%x)\n", asc_cpu_status(nvme_asc));
+    if (ok && !(ok = poll32(nvme_base + NVME_BOOT_STATUS, 0xffffffff, NVME_BOOT_STATUS_OK,
+                            USEC_PER_SEC) >= 0))
+        printf("nvme: BOOT_STATUS 0x%x after the handshake\n",
+               read32(nvme_base + NVME_BOOT_STATUS));
+    if (!ok) {
         printf("nvme: ANS didn't start from off; it stays down until a reboot\n");
         return false;
     }
@@ -556,6 +629,8 @@ bool nvme_init(void)
     nvme_prp_list = NULL;
     nvme_verify_bounce = NULL;
     nvme_boot_ticks = 0;
+    nvme_session_from_off = false;
+    nvme_handed_on_live = false;
 
     bool from_off = false, earlier = false, adopted = false, restarted = false;
     int adt_path[8];
@@ -677,7 +752,7 @@ bool nvme_init(void)
          * window), its firmware no longer acknowledged the idle, and ANS didn't start from off.
          * T8142 does the same with a session an older stage handed on running.
          */
-        adopted = earlier && nvme_ans_storage_gated() &&
+        adopted = earlier && nvme_post_m4_hands_on_live() &&
                   read32(nvme_base + NVME_BOOT_STATUS) == NVME_BOOT_STATUS_OK &&
                   !(read32(nvme_base + NVME_CSTS) & NVME_CSTS_CFS);
         from_off = !running || (earlier && !adopted);
@@ -807,6 +882,7 @@ setup_controller:
         write64_lo_hi(nvme_qreg(NVME_IOQ_CMDS), (u64)ioq.cmds);
     }
 
+    nvme_session_from_off = from_off;
     nvme_initialized = true;
     printf("nvme: initialized at 0x%lx\n", nvme_base);
     return true;
@@ -972,6 +1048,30 @@ bool nvme_shutdown(void)
             goto out_preserve;
     }
 
+    /*
+     * T6040/T6041: the firmware acknowledges neither an RTKit power transition (quiesce times out)
+     * nor a start after power-off (no HELLO), but a session left fully running is adopted by the
+     * next nvme_init() and reads correctly (J614c, 3/3 cycles). T8132 is handed on the same way
+     * (J713). Hand it on with the controller enabled and RTKit untouched; only the I/O queue
+     * registers are cleared. A next stage that asks for a quiesced ANS still gets one.
+     *
+     * Only a session that came to this stage running, iBoot's or one an earlier stage handed on
+     * live, goes on live. One this stage started from off goes on as it came, powered off with
+     * its SART entries passed on: the earlier stage chose that, and the firmware has just shown
+     * it starts from off. On a J713, a 1.0.0b13 Stage 1 (ANS off, nvme.sart=) followed by a
+     * Stage 1 that handed its from-off session on live reset the Mac at the handoff, whichever
+     * Stage 2 came next.
+     */
+    if (nvme_will_hand_on_live()) {
+        write64_lo_hi(nvme_qreg(NVME_IOQ_CMDS), 0);
+        write64_lo_hi(nvme_qreg(NVME_IOQ_CQES), 0);
+        nvme_initialized = false;
+        nvme_handed_on_live = true;
+        printf("nvme: handing the live ANS session on: CC=0x%x CSTS=0x%x BOOT_STATUS=0x%x\n",
+               read32(nvme_base + NVME_CC), read32(nvme_base + NVME_CSTS),
+               read32(nvme_base + NVME_BOOT_STATUS));
+        return true;
+    }
     if (nvme_type == NVME_T8132 && !nvme_secure_regs && !nvme_quiesce_for_next) {
         write64_lo_hi(nvme_qreg(NVME_IOQ_CMDS), 0);
         write64_lo_hi(nvme_qreg(NVME_IOQ_CQES), 0);
@@ -1052,8 +1152,14 @@ out_preserve:
 int nvme_sart_entries(struct sart_entry *entries, int max, bool *off)
 {
     *off = false;
+    /*
+     * A session handed on running is the next stage's to adopt; entries kept from an earlier
+     * power-off no longer describe it (J713: nvme.sart= beside a live ANS faulted the next stage).
+     */
+    if (nvme_handed_on_live)
+        return 0;
     if (nvme_initialized) {
-        if (nvme_type != NVME_T8132)
+        if (nvme_type != NVME_T8132 || nvme_will_hand_on_live())
             return 0;
         *off = !nvme_secure_regs && !nvme_keep_running_for_linux;
         return sart_get_entries(nvme_sart, entries, max);
