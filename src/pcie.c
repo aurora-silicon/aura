@@ -809,7 +809,7 @@ static int pcie_init_controller(int controller, const char *path, bool ans_off)
         /*
          * The port's registers are found by its index, which assumes the bridge sits at device
          * number == port. The bridge's reg holds its device number (phys.hi bits 15:11, as in the
-         * PCI bus binding), so say so when the two differ instead of setting up another port.
+         * PCI bus binding), so log it when the two differ; the port is still set up by its index.
          */
         if (controller == APCIE) {
             u32 reg_len = 0, phys_hi;
