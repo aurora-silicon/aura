@@ -44,9 +44,24 @@ def region(source, start_marker, end_marker):
     return source[start:source.index(end_marker, start)]
 
 
+# dt_reserve_asc_segments_at() reads the DART's input range only for a DRAM-only reservation; the
+# encoder handoff reserves with dram_only false, so the read never runs here. A kboot.c that has
+# the helper gets a stand-in that reports no range (the helper itself reads DART registers).
+DART_VA_BITS_STUB = r"""
+static int dt_device_dart_va_bits(int fdt_node, int adt_node, u32 *bits)
+{
+    (void)fdt_node;
+    (void)adt_node;
+    (void)bits;
+    return -1;
+}
+"""
+
+
 def handoff_source(source):
     """The handoff and the reserved-memory helpers it calls, from a kboot.c."""
-    return "\n".join([
+    stub = DART_VA_BITS_STUB if "static int dt_device_dart_va_bits(int fdt_node" in source else ""
+    return stub + "\n".join([
         region(source, "static int dt_device_set_reserved_mem(int node",
                "static int dt_device_set_reserved_mem_from_dart("),
         region(source, "static int dt_get_or_add_reserved_mem(const char *node_name",
