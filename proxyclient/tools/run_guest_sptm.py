@@ -65,7 +65,12 @@ Environment (all optional; 1 enables a switch):
   AURA_SPTM_DIAG           give SPTM a diagnostic record (boot_args revision 3, SPTMDebug)
   AURA_OS_LONG_VERSION     the guest's Ap,OSLongVersion (--os-long-version)
   AURA_KEEP_BOOT_VIDEO     hand iBoot's boot framebuffer to XNU, aura's console off it
-  AURA_TAIL_SECS, AURA_TAIL_IDLE   keep reading the console after entry, until idle
+  AURA_TAIL_SECS, AURA_TAIL_IDLE   keep reading the console after entry, until idle; a park
+                           (the HV's START) ends the tail at once and says whether it resumes
+  AURA_PARK_AFTER_SECS=<n> while tailing, ask the guest to park n s after entry (as SIGUSR1 to
+                           this process does at any time); then tools/sptm_park.py --continue
+  AURA_XNU_PATCH_LOG=<f>   record every XNU word patched (quirk, PA, original, patch) in f, as
+                           JSON: sptm_park.py --restore-nvram-write --patch-log f takes it
   AURA_AMCC_NOLOCK=<mask>  which of SPTM's AMCC range locks aura shadows (bit 0 +0xacc, 1 +0xadc,
                            2 +0xaec; default 1, the one over aura's image; 0 lets SPTM lock all)
   AURA_WFI_WATCH=1|2       trap XNU's WFIs (2: and WFEs) and report every 10 s (idle vs. dead)
@@ -155,6 +160,8 @@ KNOWN_ENV = {
     "AURA_S2R_USB_RETAKE_MS",
     "AURA_TAIL_SECS",
     "AURA_TAIL_IDLE",
+    "AURA_PARK_AFTER_SECS",
+    "AURA_XNU_PATCH_LOG",
     "AURA_GPU_STOP_SECS",
     "AURA_GPU_STOP_BOOT_SECS",
     "AURA_GPU_STOP_MSG",
@@ -626,7 +633,11 @@ def rewrite_sptm_seq(p, sym, entry, seq):
     print(f"rewrote {len(new)} instructions at 0x{pa:x} (MTE tag storage from the window)")
 
 
-def patch_xnu(p, sym, plan, patches):
+# What patch_xnu wrote, for AURA_XNU_PATCH_LOG: the late NVRAM write enable puts nvram_ro's back.
+XNU_PATCHES = []
+
+
+def patch_xnu(p, sym, plan, patches, quirk=None):
     for what, region, off, expected, new in patches:
         if region not in plan.regions:
             raise SystemExit(f"{what}: the plan has no {region} region")
@@ -638,6 +649,17 @@ def patch_xnu(p, sym, plan, patches):
         p.write32(pa, new)
         p.call(sym["sptm_virt_flush"], pa & ~0x3f, 0x80)
         print(f"XNU {what}: [0x{pa:x}] 0x{before:08x} -> 0x{p.read32(pa):08x}")
+        XNU_PATCHES.append(dict(quirk=quirk, what=what, region=region, off=off, pa=pa,
+                                original=before, patched=new))
+
+
+def write_patch_log():
+    path = os.environ.get("AURA_XNU_PATCH_LOG")
+    if path:
+        import json
+
+        pathlib.Path(path).write_text(json.dumps(XNU_PATCHES, indent=1) + "\n")
+        print(f"XNU patches recorded in {path} ({len(XNU_PATCHES)} words)")
 
 
 def patch_xnu_entry(p, sym, plan, kernelcache):
@@ -672,7 +694,7 @@ def set_xnu_rorgn(p, sym, plan, quirks):
     p.write64(sym["sptm_virt_xnu_rorgn"], lo)
     p.write64(sym["sptm_virt_xnu_rorgn"] + 8, hi & ~0xfff)
     print(f"XNU read-only region 0x{lo:x}-0x{hi:x}")
-    patch_xnu(p, sym, plan, quirks["rorgn"])
+    patch_xnu(p, sym, plan, quirks["rorgn"], "rorgn")
     base = plan.regions["BootKC-ro"][0]
     for off, value in zip(quirks["rorgn_globals"], (lo, hi)):
         p.write64(base + off, value)
@@ -873,45 +895,57 @@ def configure(p, sym, plan, adt, ctl_cookie=0):
 
 
 def tail_console(iface, secs, idle):
-    """Keep reading the console after the entry call: a serial read error reopens the device,
-    and the tail stops after secs, or after idle seconds of silence."""
+    """Keep reading the console after the entry call: a serial read error reopens the device, and
+    the tail stops after secs, after idle seconds of silence, or at once when the HV parks (its
+    START, which says whether P_EXIT resumes the guest). AURA_PARK_AFTER_SECS, and SIGUSR1 at any
+    time, ask the guest to park."""
+    import signal
+
     import serial
+    from aura import hvpark
 
     end = time.time() + secs
-    last = time.time()
     dev = iface.dev
-    buf = b""
+    dev.timeout = 0.5
+    ask = {"at": time.time() + env_int("AURA_PARK_AFTER_SECS")
+           if os.environ.get("AURA_PARK_AFTER_SECS") else None}
+    signal.signal(signal.SIGUSR1, lambda *a: ask.update(at=time.time()))
+
+    def poll():
+        if ask["at"] is not None and time.time() >= ask["at"]:
+            ask["at"] = None
+            hvpark.request(dev)
+            print("--- tail: park requested ---", flush=True)
+
+    tail = hvpark.ConsoleTail(dev)
     print(f"--- tailing console for up to {secs}s (stop after {idle:g}s silent) ---", flush=True)
-    while time.time() < end:
-        if idle and time.time() - last > idle:
-            print(f"--- tail: console silent for {idle:g}s ---", flush=True)
+    while True:
+        res = tail.run(max(0.0, end - time.time()), idle, poll)
+        if res[0] != "gone":
             break
+        print(f"--- tail: read error ({res[1]}); reopening ---", flush=True)
         try:
-            chunk = dev.read(4096)
-        except (serial.serialutil.SerialException, OSError) as e:
-            print(f"--- tail: read error ({e}); reopening ---", flush=True)
+            dev.close()
+        except Exception:
+            pass
+        for _ in range(100):
             try:
-                dev.close()
-            except Exception:
-                pass
-            for _ in range(100):
-                try:
-                    dev.open()
-                    print("--- tail: reopened ---", flush=True)
-                    break
-                except (serial.serialutil.SerialException, OSError):
-                    time.sleep(0.2)
-            else:
-                print("--- tail: device gone ---", flush=True)
+                dev.open()
+                print("--- tail: reopened ---", flush=True)
                 break
-            continue
-        if not chunk:
-            continue
-        last = time.time()
-        buf += chunk
-        while b"\n" in buf:
-            line, buf = buf.split(b"\n", 1)
-            print("TTY> " + line.decode("latin1", "replace").rstrip("\r"), flush=True)
+            except (serial.serialutil.SerialException, OSError):
+                time.sleep(0.2)
+        else:
+            print("--- tail: device gone ---", flush=True)
+            break
+    tail.flush()
+    if res[0] == "park":
+        st = res[1]
+        then = ("the guest waits for the host: tools/sptm_park.py --continue resumes it"
+                if st.resumes else "a one-way park: the guest stays stopped")
+        print(f"--- tail: the HV parked in its proxy ({st}); {then} ---", flush=True)
+    elif res[0] == "idle":
+        print(f"--- tail: console silent for {idle:g}s ---", flush=True)
     print("--- tail done ---", flush=True)
 
 
@@ -1089,19 +1123,20 @@ def main():
     if env_on("AURA_XNU_RO_RELAX"):
         if not quirks["ro_relax"]:
             raise SystemExit("AURA_XNU_RO_RELAX: no RO-zone patch matches this kernelcache")
-        patch_xnu(p, sym, plan, quirks["ro_relax"])
+        patch_xnu(p, sym, plan, quirks["ro_relax"], "ro_relax")
     if quirks.get("rorgn"):
         set_xnu_rorgn(p, sym, plan, quirks)
     if quirks.get("nvram_mutable"):
-        patch_xnu(p, sym, plan, quirks["nvram_mutable"])
+        patch_xnu(p, sym, plan, quirks["nvram_mutable"], "nvram_mutable")
     if quirks.get("pac_keys") and not env_on("AURA_XNU_TASK_KEYS"):
-        patch_xnu(p, sym, plan, quirks["pac_keys"])
+        patch_xnu(p, sym, plan, quirks["pac_keys"], "pac_keys")
     if quirks.get("nvram_ro") and not env_on("AURA_SHARE_NVRAM"):
-        patch_xnu(p, sym, plan, quirks["nvram_ro"])
+        patch_xnu(p, sym, plan, quirks["nvram_ro"], "nvram_ro")
     if env_on("AURA_XNU_TC_FORCE") and quirks.get("tc_force"):
-        patch_xnu(p, sym, plan, quirks["tc_force"])
+        patch_xnu(p, sym, plan, quirks["tc_force"], "tc_force")
     if env_on("AURA_XNU_ENTRY"):
         patch_xnu_entry(p, sym, plan, images["xnu"])
+    write_patch_log()
     configure(p, sym, plan, live_adt, ctl_cookie)
     if p.call(sym["sptm_virt_load"], entry, handoff) != 0:
         raise SystemExit("sptm_virt_load rejected the entry/handoff (see aura's console)")
