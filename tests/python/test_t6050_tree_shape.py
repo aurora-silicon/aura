@@ -488,3 +488,115 @@ int main(void)
 }
 '''
     run(tmp_path, "disp-node", code, "PASS display subsystem 4 cases")
+
+
+def test_t6050_external_engines_get_the_stub_version(tmp_path):
+    source = (REPO / "src/kboot_display_handoff.c").read_text()
+    firmware = (REPO / "src/firmware.c").read_text()
+    code = PRELUDE + r'''
+#include <stdlib.h>
+#define T6050_TEXT
+#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
+#define OS_VER_COMP 4
+enum fw_version { V_UNKNOWN = 0, V27_0, V27_2, V27_3 };
+struct fw_version_info {
+    enum fw_version version;
+    const char *string;
+    u32 num[OS_VER_COMP];
+    size_t num_length;
+    const char *iboot;
+};
+static struct fw_version_info os_firmware;
+static struct { const char *name; } soc = {"t6050"};
+static struct { const typeof(soc) *soc; } dcp6 = {&soc};
+#define dlog(fmt, ...) printf("DCP: %s: " fmt, dcp6.soc->name, ##__VA_ARGS__)
+''' + definition(firmware, "int firmware_set_fdt(") + \
+        definition(source, "static void *dcp6_scratch(") + \
+        definition(source, "static int dcp6_commit(") + \
+        definition(source, "static T6050_TEXT bool t6050_available(") + \
+        definition(source, "static T6050_TEXT void t6050_ext_version(") + r'''
+static const u32 tree_version[3] = {27, 0, 0};
+/* A dcpext node with apple,firmware-compat, and apple,firmware-version when @version */
+static int engine(const char *name, const char *status, bool version)
+{
+    int n = node_at("/", name);
+    fdt32_t v[3];
+    for (int i = 0; i < 3; i++)
+        v[i] = cpu_to_fdt32(tree_version[i]);
+    assert(!fdt_setprop_string(tree, n, "compatible", "apple,t6050-dcpext"));
+    assert(!fdt_setprop(tree, n, "apple,firmware-compat", v, sizeof(v)));
+    if (version)
+        assert(!fdt_setprop(tree, n, "apple,firmware-version", v, sizeof(v)));
+    if (status)
+        assert(!fdt_setprop_string(tree, n, "status", status));
+    return n;
+}
+/* Whether @prop of node @name is @want's cells */
+static bool is(const char *name, const char *prop, const struct fw_version_info *want)
+{
+    int len;
+    const fdt32_t *v = fdt_getprop(tree, fdt_path_offset(tree, name), prop, &len);
+    if (!v || len != (int)(want->num_length * 4))
+        return false;
+    for (size_t i = 0; i < want->num_length; i++)
+        if (fdt32_ld(&v[i]) != want->num[i])
+            return false;
+    return true;
+}
+static void world(void)
+{
+    fresh();
+    engine("dcpext0", NULL, true);
+    engine("dcpext1", "okay", false);
+    engine("dcpext2", "disabled", true);
+}
+int main(void)
+{
+    static const struct fw_version_info old = {V27_0, "27.0", {27, 0, 0}, 3, NULL};
+    static const struct fw_version_info v272 = {V27_2, "27.2", {27, 2, 0}, 3, NULL};
+    static const struct fw_version_info v273 = {V27_3, "27.3.1", {27, 3, 1, 4}, 4, NULL};
+    static unsigned char before[sizeof(tree)];
+    int cases = 0;
+    /* A three-cell stub: the engines the tree enables take it, a disabled one keeps the tree's. */
+    world();
+    os_firmware = v272;
+    t6050_ext_version(tree);
+    assert(is("/dcpext0", "apple,firmware-compat", &v272));
+    assert(is("/dcpext0", "apple,firmware-version", &v272));
+    assert(is("/dcpext1", "apple,firmware-compat", &v272));
+    assert(!fdt_getprop(tree, fdt_path_offset(tree, "/dcpext1"), "apple,firmware-version", NULL));
+    assert(is("/dcpext2", "apple,firmware-compat", &old)); cases++;
+    /* An enabled engine the tree gave no apple,firmware-compat gets one: the driver has no
+     * method table without it. apple,firmware-version is not added where it was absent. */
+    world();
+    assert(!fdt_delprop(tree, fdt_path_offset(tree, "/dcpext1"), "apple,firmware-compat"));
+    os_firmware = v272;
+    t6050_ext_version(tree);
+    assert(is("/dcpext1", "apple,firmware-compat", &v272));
+    assert(!fdt_getprop(tree, fdt_path_offset(tree, "/dcpext1"), "apple,firmware-version", NULL));
+    assert(is("/dcpext0", "apple,firmware-compat", &v272)); cases++;
+    /* A four-cell stub fits too: the properties grow. */
+    world();
+    os_firmware = v273;
+    t6050_ext_version(tree);
+    assert(is("/dcpext0", "apple,firmware-compat", &v273));
+    assert(is("/dcpext0", "apple,firmware-version", &v273));
+    assert(is("/dcpext1", "apple,firmware-compat", &v273));
+    assert(is("/dcpext2", "apple,firmware-version", &old)); cases++;
+    /* No room in the tree for the four cells: nothing changes. */
+    world();
+    assert(!fdt_pack(tree));
+    memcpy(before, tree, fdt_totalsize(tree));
+    t6050_ext_version(tree);
+    assert(!memcmp(before, tree, fdt_totalsize(tree))); cases++;
+    /* An unknown firmware: nothing changes. */
+    world();
+    os_firmware = (struct fw_version_info){V_UNKNOWN, NULL, {0}, 0, NULL};
+    memcpy(before, tree, sizeof(tree));
+    t6050_ext_version(tree);
+    assert(!memcmp(before, tree, sizeof(tree))); cases++;
+    printf("PASS dcpext version %d cases\n", cases);
+    return 0;
+}
+'''
+    run(tmp_path, "ext-version", code, "PASS dcpext version 5 cases")

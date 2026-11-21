@@ -4162,6 +4162,10 @@ static T6050_TEXT int t6050_ext_one(void *dt, int n)
     if (t6050_adt_reg(a, 0, &coproc, NULL))
         bail("dcpext%d: no ADT reg\n", n);
     node = t6050_ext_node(dt, coproc);
+    if (node >= 0 && t6050_available(dt, node)) {
+        dlog("dcpext%d: the device tree enables it itself\n", n);
+        return 1;
+    }
     if (node < 0 || dcp6_status_disabled(dt, node, a))
         bail("dcpext%d: no disabled node at 0x%lx\n", n, coproc);
 
@@ -4293,18 +4297,70 @@ static T6050_TEXT int t6050_ext_one(void *dt, int n)
     return 0;
 }
 
-/* Each engine but `skip` in its own transaction, after the internal display's (or the first's) */
+/*
+ * Each engine but `skip` in its own transaction, after the internal display's (or the first's).
+ * One the device tree enables itself is left to it (t6050_ext_version()).
+ */
 static T6050_TEXT void t6050_ext_handoff(void *dt, int engines, int skip)
 {
     for (int n = 0; n < engines; n++) {
         if (n == skip)
             continue;
         void *scratch = dcp6_scratch(dt);
-        if (!scratch || t6050_ext_one(scratch, n) || dcp6_commit(dt, scratch)) {
-            if (scratch)
-                free(scratch);
+        int ret = scratch ? t6050_ext_one(scratch, n) : -1;
+        if (ret && scratch)
+            free(scratch);
+        if (ret > 0)
+            continue;
+        if (ret || dcp6_commit(dt, scratch))
             dlog("dcpext%d stays with iBoot: no handoff\n", n);
+    }
+}
+
+/*
+ * External engines the device tree enables itself (the J716c's) run this boot's firmware, but
+ * the tree names the build it was written for in their apple,firmware-compat, from which the
+ * driver picks their method IDs. Set it to this boot's version on every such engine, adding it
+ * where the tree left it out (the driver has no method table without it), and rewrite
+ * apple,firmware-version where the node has one, whatever their number of cells, as
+ * t6050_publish() does for the internal dcp. A node not available (status absent, "okay" or "ok")
+ * is t6050_ext_one()'s. The edit is made on a scratch copy: a failed write or walk changes nothing.
+ */
+static T6050_TEXT void t6050_ext_version(void *dt)
+{
+    static const char *const props[] = {"apple,firmware-compat", "apple,firmware-version"};
+    int count = 0, err = 0, at = -1;
+
+    if (os_firmware.version == V_UNKNOWN || !os_firmware.num_length) {
+        dlog("firmware %s is unknown: the external engines keep the tree's version\n",
+             os_firmware.string ? os_firmware.string : "");
+        return;
+    }
+    void *scratch = dcp6_scratch(dt);
+    if (!scratch)
+        return;
+    while (!err && (at = fdt_node_offset_by_compatible(scratch, at, "apple,t6050-dcpext")) >= 0) {
+        bool set = false;
+        if (!t6050_available(scratch, at))
+            continue;
+        for (size_t i = 0; !err && i < ARRAY_SIZE(props); i++) {
+            /* apple,firmware-compat (props[0]) always; apple,firmware-version only if present */
+            if (i && !fdt_getprop(scratch, at, props[i], NULL))
+                continue;
+            err = firmware_set_fdt(scratch, at, props[i], &os_firmware);
+            set = set || !err;
         }
+        count += set;
+    }
+    /* Only -FDT_ERR_NOTFOUND is a walk's normal end */
+    if (err || at != -FDT_ERR_NOTFOUND) {
+        free(scratch);
+        dlog("could not give the external engines the firmware version: nothing changed\n");
+    } else if (!count) {
+        free(scratch);
+    } else if (!dcp6_commit(dt, scratch)) {
+        dlog("firmware %s on %d external engine(s) the device tree enables\n", os_firmware.string,
+             count);
     }
 }
 
@@ -4470,6 +4526,7 @@ int dt_set_display_handoff(void *dt)
             return 0;
         dcp6_find_nubs();
         dcp6_reserve_oslogs(dt);
+        t6050_ext_version(dt);
         int engine;
         if (fdt_get_alias(dt, "dcp") && fdt_get_alias(dt, "disp0"))
             t6050_handoff(dt, false);
