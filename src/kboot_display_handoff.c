@@ -3809,11 +3809,11 @@ static T6050_TEXT int t6050_publish(void *dt)
 
 /*
  * Headless, the device tree keeps what an engine's output needs disabled until that engine is
- * handed off. A Type-C route (typec-routes: dcpext0's on J775D): the PHYs (phys) with their
- * mailboxes and the crossbar (mux-controls), each with its power domains, and the HPM its route@0
- * endpoint leads to, with the bus it sits on. A fixed route (die 1's dcpext4, the HDMI port): the
- * PHY with its power domains, and the GPIO controllers of the converter's hotplug input and power
- * enables. The walk finds the first of them still disabled, or with `all` checks the whole route.
+ * handed off. A Type-C route (typec-routes): the PHYs (phys) with their mailboxes and the
+ * crossbars (mux-controls), each with its power domains, and the HPM each route's endpoint leads
+ * to, with the bus it sits on. A fixed route (die 1's dcpext4, the HDMI port): the PHY with its
+ * power domains, and the GPIO controllers of the converter's hotplug input and power enables.
+ * The walk finds the first of them still disabled, or with `all` checks the whole route.
  */
 enum { T6050_ROUTE_DONE = -1, T6050_ROUTE_BAD = -2 };
 
@@ -3874,30 +3874,48 @@ static T6050_TEXT int t6050_route_next(void *dt, int node, bool all)
     if (r != T6050_ROUTE_DONE)
         return r;
 
-    static const char *const hops[] = {"route@0", "port", "endpoint"};
-    for (size_t i = 0; ep >= 0 && i < ARRAY_SIZE(hops); i++)
-        ep = fdt_subnode_offset(dt, ep, hops[i]);
-    const fdt32_t *remote = ep < 0 ? NULL : fdt_getprop(dt, ep, "remote-endpoint", NULL);
-    int hpm = remote ? fdt_node_offset_by_phandle(dt, fdt32_ld(remote)) : -1;
-    for (int up = 0; hpm >= 0 && up < 5 && fdt_node_check_compatible(dt, hpm, "apple,sn201202x");
-         up++)
-        hpm = fdt_parent_offset(dt, hpm);
-    if (hpm < 0 || fdt_node_check_compatible(dt, hpm, "apple,sn201202x"))
-        return T6050_ROUTE_BAD;
-    r = t6050_route_node(dt, hpm, 0, all);
-    return r == T6050_ROUTE_DONE ? t6050_route_node(dt, fdt_parent_offset(dt, hpm), 0, all) : r;
+    /* Every route's PD controller, and the bus it sits on */
+    int rt, routes = 0;
+    fdt_for_each_subnode(rt, dt, ep)
+    {
+        const char *status = fdt_getprop(dt, rt, "status", NULL);
+        if (status && strcmp(status, "okay") && strcmp(status, "ok"))
+            continue;
+        int e = fdt_subnode_offset(dt, rt, "port");
+        e = e < 0 ? e : fdt_subnode_offset(dt, e, "endpoint");
+        const fdt32_t *remote = e < 0 ? NULL : fdt_getprop(dt, e, "remote-endpoint", NULL);
+        int hpm = remote ? fdt_node_offset_by_phandle(dt, fdt32_ld(remote)) : -1;
+        for (int up = 0;
+             hpm >= 0 && up < 5 && fdt_node_check_compatible(dt, hpm, "apple,sn201202x"); up++)
+            hpm = fdt_parent_offset(dt, hpm);
+        if (hpm < 0 || fdt_node_check_compatible(dt, hpm, "apple,sn201202x"))
+            return T6050_ROUTE_BAD;
+        r = t6050_route_node(dt, hpm, 0, all);
+        if (r == T6050_ROUTE_DONE)
+            r = t6050_route_node(dt, fdt_parent_offset(dt, hpm), 0, all);
+        if (r != T6050_ROUTE_DONE)
+            return r;
+        routes++;
+    }
+    return routes ? T6050_ROUTE_DONE : T6050_ROUTE_BAD;
 }
 
-/* Enable an engine's route, node by node (each write moves the offsets); one not fully described
- * is left disabled */
+/*
+ * Enable an engine's routes, node by node (each write moves the offsets); routes not fully
+ * described are left disabled. Each step enables one disabled node, so the tree's node count
+ * bounds the walk.
+ */
 static T6050_TEXT int t6050_route(void *dt, const char *path, int n)
 {
-    int count = 0, r = t6050_route_next(dt, kboot_fdt_path_exact(dt, path), true);
+    int count = 0, nodes = 0, r = t6050_route_next(dt, kboot_fdt_path_exact(dt, path), true);
     if (r == T6050_ROUTE_BAD) {
         dlog("dcpext%d: its route is not fully described: handed off without it\n", n);
         return 0;
     }
-    while ((r = t6050_route_next(dt, kboot_fdt_path_exact(dt, path), false)) >= 0 && count < 16) {
+    for (int o = fdt_next_node(dt, -1, NULL); o >= 0; o = fdt_next_node(dt, o, NULL))
+        nodes++;
+    while ((r = t6050_route_next(dt, kboot_fdt_path_exact(dt, path), false)) >= 0 &&
+           count < nodes) {
         if (fdt_setprop_string(dt, r, "status", "okay"))
             return -1;
         count++;
