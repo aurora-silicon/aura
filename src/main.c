@@ -183,7 +183,6 @@ bool stage1_recovery_window(void)
 
 void run_actions(void)
 {
-    bool usb_up = false;
     enum stage1_proxy_result window_result = STAGE1_PROXY_TIMEOUT;
     enum stage1_payload_action payload_action;
 
@@ -207,51 +206,6 @@ void run_actions(void)
         }
         printf("Stage 1: proxy window ended\n");
     }
-
-#ifndef BRINGUP
-#ifdef EARLY_PROXY_TIMEOUT
-    int node = adt_path_offset(adt, "/chosen/asmb");
-    u64 lp_sip0 = 0;
-
-    if (node >= 0) {
-        ADT_GETPROP(adt, node, "lp-sip0", &lp_sip0);
-        printf("Boot policy: sip0 = %ld\n", lp_sip0);
-    }
-
-    if (chip_id != T8140 && !cur_boot_args.video.display && lp_sip0 == 127 &&
-        secboot_host_proxy_allowed()) {
-        if (!usb_up) {
-            printf("Bringing up USB for early debug...\n");
-            usb_init();
-            usb_iodev_init();
-            usb_up = true;
-        }
-
-        printf("Waiting for proxy connection... ");
-        for (int i = 0; i < EARLY_PROXY_TIMEOUT * 100; i++) {
-            for (int j = 0; j < USB_IODEV_COUNT; j++) {
-                iodev_id_t iodev = IODEV_USB0 + j;
-
-                if (!(iodev_get_usage(iodev) & USAGE_UARTPROXY))
-                    continue;
-
-                usb_iodev_vuart_setup(iodev);
-                iodev_handle_events(iodev);
-                if (iodev_can_write(iodev) || iodev_can_write(IODEV_USB_VUART)) {
-                    printf(" Connected!\n");
-                    uartproxy_run(NULL);
-                    return;
-                }
-            }
-
-            mdelay(10);
-            if (i % 100 == 99)
-                printf(".");
-        }
-        printf(" Timed out\n");
-    }
-#endif
-#endif
 
     printf("Checking for payloads...\n");
 
@@ -306,7 +260,7 @@ void run_actions(void)
 
 #ifndef BRINGUP
     /* A proxy window brought USB up already; a second bring-up would register its ports twice. */
-    if (!usb_up && !aura_debug_enabled() && !(stage1_window_done && chip_id != T8140)) {
+    if (!aura_debug_enabled() && !(stage1_window_done && chip_id != T8140)) {
         usb_init();
         usb_iodev_init();
     }
@@ -436,12 +390,8 @@ void aura_main(void)
 #ifndef BRINGUP
     if (pmgr_init() && chip_id == T8140)
         panic("T8140 PMGR initialization failed\n");
-#ifdef USE_DEBUG_USB
-    tps6598x_enable_debugusb();
-#else
     if (aura_debug_enabled())
         tps6598x_enable_debugusb();
-#endif
 #ifdef USE_FB
     display_init();
     // Kick DCP to sleep, so dodgy monitors which cause reconnect cycles don't cause us to lose the

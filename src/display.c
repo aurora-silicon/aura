@@ -101,33 +101,19 @@ static bool display_mode_max;
  * to the allocator when it is replaced. */
 static bool fb_dva_allocated;
 
-#define USE_DCPEXT 1
-
 static const display_config_t display_config_m2 = {
-#if USE_DCPEXT
     .dcp = "/arm-io/dcpext",
     .dcp_dart = "/arm-io/dart-dcpext",
     .disp_dart = "/arm-io/dart-dispext0",
     .pmgr_dev = "DISPEXT_CPU0",
     .dcp_alias = "dcpext",
     .dcp_index = 1,
-#else
-    .dcp = "/arm-io/dcp",
-    .dcp_dart = "/arm-io/dart-dcp",
-    .disp_dart = "/arm-io/dart-disp0",
-    .dp2hdmi_gpio = "/arm-io/dp2hdmi-gpio",
-    .dptx_phy = "/arm-io/dptx-phy",
-    .pmgr_dev = "DISP0_CPU0",
-    .dcp_alias = "dcp",
-    .dcp_index = 0,
-#endif
     .dp2hdmi_gpio = "/arm-io/dp2hdmi-gpio",
     .dptx_phy = "/arm-io/dptx-phy",
     .num_dptxports = 2,
 };
 
 static const display_config_t display_config_m2_pro_max = {
-#if USE_DCPEXT
     .dcp = "/arm-io/dcpext0",
     .dcp_dart = "/arm-io/dart-dcpext0",
     .disp_dart = "/arm-io/dart-dispext0",
@@ -135,15 +121,6 @@ static const display_config_t display_config_m2_pro_max = {
     .dcp_alias = "dcpext0",
     .dcp_index = 1,
     .num_dptxports = 2,
-#else
-    .dcp = "/arm-io/dcp0",
-    .dcp_dart = "/arm-io/dart-dcp0",
-    .disp_dart = "/arm-io/dart-disp0",
-    .pmgr_dev = "DISP0_CPU0",
-    .dcp_alias = "dcp",
-    .dcp_index = 0,
-    .num_dptxports = 1,
-#endif
     .dp2hdmi_gpio = "/arm-io/dp2hdmi-gpio0",
     .dptx_phy = "/arm-io/lpdptx-phy0",
 };
@@ -389,11 +366,6 @@ int display_start_dcp(void)
     if (display_t6030_hands_off("DCP start"))
         return 0;
 
-#ifdef NO_DISPLAY
-    printf("display: NO_DISPLAY!\n");
-    return 0;
-#endif
-
     const display_config_t *disp_cfg = display_get_config();
 
     if (!has_dcp) {
@@ -521,11 +493,6 @@ int display_configure(const char *config)
 {
     dcp_timing_mode_t want;
     struct display_options opts = {0};
-
-#ifdef NO_DISPLAY
-    printf("display: skip configuration (NO_DISPLAY)\n");
-    return 0;
-#endif
 
     if (display_t6030_hands_off("DCP modeset"))
         return 0;
