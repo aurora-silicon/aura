@@ -1072,8 +1072,6 @@ struct j614s_atc_tunable {
     const char *adt_name, *fdt_name, *resource;
     u32 bias, window, limit;
     bool controller_source, controller_target;
-    /* A port without this ADT list still exports the others (the DT property is removed). */
-    bool optional;
 };
 
 static const struct j614s_atc_tunable j614s_atc_tunables[] = {
@@ -1087,9 +1085,6 @@ static const struct j614s_atc_tunable j614s_atc_tunables[] = {
     {"tunable_AUSPLL_CORE", "apple,tunable-auspll", "core", 0x3200, 0, 0, false, false},
     {"tunable_CIO4PLL_CORE", "apple,tunable-cio4pll", "core", 0x3a00, 0, 0, false, false},
     {"tunable_USB2PHY_HOST", "apple,tunable-usb2-host", "bank0", 0, 0, 0, false, false},
-    /* USB2 device mode (Linux phy-apple-t6040-usb2): default list, then the device list. */
-    {"tunable_USB2PHY_DFLT", "apple,tunable-usb2-default", "bank0", 0, 0, 0, false, false, true},
-    {"tunable_USB2PHY_DEV", "apple,tunable-usb2-device", "bank0", 0, 0, 0, false, false, true},
     {"tunable_PIPE_HANDLER_DEFAULT", "apple,tunable-pipehandler", "pipehandler", 0, 0, 0, true,
      false},
     {"tunable_DRD_USB31_GBL_DEFAULT", "apple,tunable-gbl-default", "dwc3-core", 0, 0xc100, 0x600,
@@ -1125,6 +1120,56 @@ static int j614s_resource_size(void *dt, int node, const char *name, u64 *size)
     return *size ? 0 : -1;
 }
 
+/*
+ * Optional USB2 device mode pair (Linux phy-apple-t6040-usb2): export both lists on bank0 or
+ * neither, clearing any stale properties. Missing or invalid ADT lists omit the pair without
+ * disabling the port so USB2 host and USB3 stay usable; only an FDT write error fails the port.
+ */
+static int j614s_export_usb2_device_pair(void *dt, int port, int src, const char *phy_path)
+{
+    static const char *const names[][2] = {
+        {"tunable_USB2PHY_DFLT", "apple,tunable-usb2-default"},
+        {"tunable_USB2PHY_DEV", "apple,tunable-usb2-device"},
+    };
+    int phy = fdt_path_offset(dt, phy_path);
+    u64 size;
+    if (phy < 0 || j614s_resource_size(dt, phy, "bank0", &size))
+        return -1;
+
+    for (size_t i = 0; i < ARRAY_SIZE(names); i++) {
+        int ret = fdt_delprop(dt, phy, names[i][1]);
+        if (ret && ret != -FDT_ERR_NOTFOUND)
+            return -1;
+    }
+
+    const char *missing = NULL, *invalid = NULL;
+    for (size_t i = 0; i < ARRAY_SIZE(names) && !missing && !invalid; i++) {
+        u32 plen;
+        const struct atc_tunable *list = adt_getprop(adt, src, names[i][0], &plen);
+        if (!list || !plen)
+            missing = names[i][0];
+        else if (plen % sizeof(*list))
+            invalid = names[i][0];
+        /* Keep in step with dt_append_atc_tunable()'s size, alignment, and bounds checks. */
+        for (u32 j = 0; !missing && !invalid && j < plen / sizeof(*list); j++)
+            if (list[j].size != 32 || list[j].offset % 4 || (u64)list[j].offset + 4 > size)
+                invalid = names[i][0];
+    }
+    if (missing || invalid) {
+        printf("FDT: ATC%d: %s %s, USB2 device tunables omitted\n", port,
+               missing ? "no" : "invalid", missing ? missing : invalid);
+        return 0;
+    }
+
+    for (size_t i = 0; i < ARRAY_SIZE(names); i++) {
+        struct adt_tunable_info info = {names[i][0], names[i][1], 0, size, true};
+        phy = fdt_path_offset(dt, phy_path);
+        if (phy < 0 || dt_append_atc_tunable(dt, src, phy, &info))
+            return -1;
+    }
+    return 0;
+}
+
 static int j614s_export_atc(void *dt, int port)
 {
     char adt_path[32];
@@ -1157,13 +1202,6 @@ static int j614s_export_atc(void *dt, int port)
         int src = item->controller_source ? usb_source : source;
         u64 size;
         u32 len;
-        if (item->optional && target >= 0 &&
-            (!adt_getprop(adt, src, item->adt_name, &len) || !len)) {
-            int ret = fdt_delprop(dt, target, item->fdt_name);
-            if (ret && ret != -FDT_ERR_NOTFOUND)
-                return -1;
-            continue;
-        }
         if (target < 0 || j614s_resource_size(dt, target, item->resource, &size) ||
             item->window > size || (item->limit && item->limit > size - item->window) ||
             item->bias >= (item->limit ? item->limit : size - item->window) ||
@@ -1178,6 +1216,8 @@ static int j614s_export_atc(void *dt, int port)
     }
     if (port == 3)
         return 0; /* The PMP-aware display gate owns PHY power. */
+    if (j614s_export_usb2_device_pair(dt, port, source, phy_path))
+        return -1;
     phy = fdt_path_offset(dt, phy_path);
     if (phy < 0 || fdt_setprop_string(dt, phy, "status", "okay"))
         return -1;
