@@ -507,35 +507,43 @@ static bool nvme_will_hand_on_live(void)
  * keep the SART entries, then power ANS and the PCIe block it runs on off. Every later stage that
  * needs it starts it again with nvme_ans_power_on(). The firmware resumes from what it saves at
  * the idle. On T6050 the controller step is macOS's suspend shutdown (traced); elsewhere it is
- * disabled, as M1-M3 do.
+ * the normal shutdown, then the disable, as iBoot hands ANS on and as M1-M3 do.
+ *
+ * The normal shutdown comes first even when this stage only read. Without it the firmware does
+ * its shutdown work under the idle, and the idle can find commands still open: on a J773g
+ * (T8132), 14 of 57 1.0.0b13 Stage 1 boots, which only read, had the firmware crash in the idle
+ * with commands open and no shutdown seen (4) or not acknowledge the idle within its 5 s (10;
+ * the others took up to 5.1 s), and the next stage could not start ANS again. iBoot had shut the
+ * controller down normally and disabled it on every one of those boots (CC.SHN normal, CC.EN
+ * clear at entry).
  */
 static bool nvme_ans_power_off(void)
 {
     if (!nvme_own_rtkit())
         return false;
+    u64 t_start = get_ticks();
     if (chip_id == T6050) {
         if ((read32(nvme_base + NVME_CC) & NVME_CC_EN) && !nvme_ctrl_suspend())
             printf("nvme: controller suspend timed out\n");
     } else if (read32(nvme_base + NVME_CC) & NVME_CC_EN) {
-        /*
-         * T8142: the firmware's context is saved by the normal shutdown, which an adopted
-         * session's idle (its RTKit started elsewhere) may not acknowledge before the stop.
-         */
-        if ((nvme_wrote || chip_id == T8142) && !nvme_ctrl_shutdown())
+        if (!nvme_ctrl_shutdown())
             printf("nvme: controller shutdown timed out\n");
         if (!nvme_ctrl_disable())
             printf("nvme: controller disable timed out\n");
     }
     nvme_sart_saved_cnt = sart_get_entries(nvme_sart, nvme_sart_saved, ARRAY_SIZE(nvme_sart_saved));
+    u64 t_ctrl = get_ticks();
     if (!rtkit_idle(nvme_rtkit)) {
         printf("nvme: ANS didn't acknowledge idle, stopping it anyway\n");
         asc_cpu_stop(nvme_asc);
     }
+    u64 t_idle = get_ticks();
     if (pcie_ans_power_off()) {
         printf("nvme: couldn't power ANS off; it stays down until a reboot\n");
         return false;
     }
-    printf("nvme: ANS powered off, %d SART entries kept\n", nvme_sart_saved_cnt);
+    printf("nvme: ANS powered off, %d SART entries kept (controller %lu ms, idle %lu ms)\n",
+           nvme_sart_saved_cnt, ticks_to_msecs(t_ctrl - t_start), ticks_to_msecs(t_idle - t_ctrl));
     return true;
 }
 
