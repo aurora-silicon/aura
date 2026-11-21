@@ -31,6 +31,8 @@ bool rtkit_sleep(rtkit_dev_t *rtk);
 bool rtkit_idle(rtkit_dev_t *rtk);
 int rtkit_probe_hello(asc_dev_t *asc);
 bool rtkit_boot_warm(rtkit_dev_t *rtk, u32 last_mask);
+/* rtkit_boot_warm() with timeout_usec for HELLO and each power report, times logged */
+bool rtkit_boot_warm_patient(rtkit_dev_t *rtk, u32 last_mask, u32 timeout_usec);
 void rtkit_stop(rtkit_dev_t *rtk);
 void rtkit_free(rtkit_dev_t *rtk);
 bool rtkit_has_owned_buffers(const rtkit_dev_t *rtk);
