@@ -61,13 +61,22 @@ static int firmware_ro_reject(u64 lower, u64 upper)
     return firmware_ro_none;
 }
 
+/* No CTRR_C pair at all. That says nothing, except where no range is an error: name the cause. */
+static int firmware_ro_absent(const char *why)
+{
+    if (firmware_ro_none < 0)
+        printf("MMU: no CTRR_C range: %s\n", why);
+    return firmware_ro_none;
+}
+
 /*
  * The firmware's read-only (CTRR_C) range at the bottom of managed RAM, read once on the boot CPU:
  * 1 with [start, end), 0 when there is none, -1 when it is invalid. Every chip that sets CTRR_C
  * reports its range. Only T8140 treats a range it cannot use as an error, because chainload, SMP
  * bring-up and the MMU rely on it there; elsewhere such a range reads as none, as before.
  * The log keeps the two kinds of "none" apart: registers that are unset or absent say nothing,
- * and a pair that is set but fails a check is printed once.
+ * and a pair that is set but fails a check is printed once. Where "none" is the error return,
+ * unset or absent registers are named as well, so the panic in mmu_init() has its cause above it.
  */
 int memory_fw_ro_range(u64 *start, u64 *end)
 {
@@ -91,10 +100,10 @@ int memory_fw_ro_range(u64 *start, u64 *end)
         upper = mrs(SYS_IMP_APL_CTRR_C_UPR_EL2);
         exc_guard = GUARD_OFF;
         if (exc_count != exc_before)
-            return firmware_ro_none;
+            return firmware_ro_absent("the read faulted");
         /* An unset pair is no range. A set pair that fails a check below is reported. */
         if (!lower && !upper)
-            return firmware_ro_none;
+            return firmware_ro_absent("the registers are unset");
         if ((lower | upper) & (SZ_4K - 1))
             return firmware_ro_reject(lower, upper);
         if (!cur_boot_args.mem_size ||
