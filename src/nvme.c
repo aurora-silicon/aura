@@ -570,23 +570,35 @@ static void nvme_ans_drain(const char *when)
         printf("nvme: discarded %u stale ANS message%s %s\n", count, count == 1 ? "" : "s", when);
 }
 
-/* The SART entries back, then the firmware's start after a power loss. */
-static bool nvme_ans_start_warm(const char *when)
+/*
+ * The first start after a power loss waits as XNU does: a busy firmware (the M4 mini's ANS for
+ * minutes after a macOS session) answers late, and a start that gave up can't be retried cleanly.
+ */
+#define NVME_ANS_PATIENT_US (20 * USEC_PER_SEC)
+
+/* The SART entries back, then the firmware's start after a power loss (patient: XNU's waits). */
+static bool nvme_ans_start_warm(const char *when, bool patient)
 {
     nvme_ans_drain(when);
     if (!sart_set_entries(nvme_sart, nvme_sart_saved, nvme_sart_saved_cnt)) {
         printf("nvme: couldn't restore the %d SART entries\n", nvme_sart_saved_cnt);
         return false;
     }
-    if (!rtkit_boot_warm(nvme_rtkit, BIT(0))) {
+    bool up = patient ? rtkit_boot_warm_patient(nvme_rtkit, BIT(0), NVME_ANS_PATIENT_US)
+                      : rtkit_boot_warm(nvme_rtkit, BIT(0));
+    if (!up) {
         printf("nvme: no warm handshake (CPU status 0x%x)\n", asc_cpu_status(nvme_asc));
         return false;
     }
-    if (poll32(nvme_base + NVME_BOOT_STATUS, 0xffffffff, NVME_BOOT_STATUS_OK, USEC_PER_SEC) < 0) {
+    u64 start = get_ticks();
+    if (poll32(nvme_base + NVME_BOOT_STATUS, 0xffffffff, NVME_BOOT_STATUS_OK,
+               patient ? 10 * USEC_PER_SEC : USEC_PER_SEC) < 0) {
         printf("nvme: BOOT_STATUS 0x%x after the handshake\n",
                read32(nvme_base + NVME_BOOT_STATUS));
         return false;
     }
+    if (patient)
+        printf("nvme: BOOT_STATUS ready after %lu ms\n", ticks_to_msecs(get_ticks() - start));
     return true;
 }
 
@@ -607,14 +619,14 @@ static bool nvme_ans_power_on(void)
         printf("nvme: ANS isn't in its reset state: resetting it\n");
         nvme_ans_reset();
     }
-    bool started = nvme_ans_start_warm("before the run bit");
+    bool started = nvme_ans_start_warm("before the run bit", true);
     if (!started && !rtkit_has_owned_buffers(nvme_rtkit)) {
         printf("nvme: ANS didn't answer the run bit (status 0x%x): resetting it, one more try\n",
                asc_cpu_status(nvme_asc));
         nvme_ans_reset();
         rtkit_free(nvme_rtkit);
         nvme_rtkit = rtkit_init("nvme", nvme_asc, NULL, NULL, nvme_sart, false);
-        started = nvme_rtkit && nvme_ans_start_warm("after the reset");
+        started = nvme_rtkit && nvme_ans_start_warm("after the reset", false);
     }
     if (!started) {
         printf("nvme: ANS didn't start from off; it stays down until a reboot\n");
