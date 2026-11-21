@@ -305,6 +305,7 @@ static int chainload_load(const char *spec, char **vars, size_t *var_cnt, size_t
         ("/* No failed-boot count here: an ANS start failure stays in the proxy */\n"
          "static void payload_nvme_start_failed(void) {}\n"
          if "payload_nvme_start_failed" in payload else "") + \
+        ("static bool payload_failed;\n" if "static bool payload_failed;" in payload else "") + \
         function(payload, "int payload_run(void)\n{") + r'''
 static u8 image[1 << 20] __attribute__((aligned(16)));
 
