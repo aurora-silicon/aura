@@ -837,10 +837,10 @@ static int dt_reserve_secondary_ro(void)
  * watchdog over and services it from its own loops, so a U-Boot that waits forever (on a disk it
  * cannot reach, say) would never be reset. Tell it to leave the watchdog alone on a trial boot.
  */
-static void dt_set_trial_watchdog(void)
+static int dt_set_trial_watchdog(void)
 {
     if (!aura_trial_enabled())
-        return;
+        return 0;
     /* The compatibles U-Boot's apple_wdt driver binds to */
     static const char *const compat[] = {"apple,t8103-wdt", "apple,wdt"};
     for (size_t i = 0; i < ARRAY_SIZE(compat); i++) {
@@ -848,12 +848,16 @@ static void dt_set_trial_watchdog(void)
         while ((node = fdt_node_offset_by_compatible(dt, node, compat[i])) >= 0) {
             if (fdt_getprop(dt, node, "u-boot,noautostart", NULL))
                 continue;
+            /*
+             * Unmarked, U-Boot would feed the watchdog forever and a trial that hangs in it would
+             * never reset. Refuse the payload: the trial path reboots into the configured Stage 2.
+             */
             if (fdt_setprop(dt, node, "u-boot,noautostart", NULL, 0))
-                printf("FDT: couldn't mark the watchdog for the trial\n");
-            else
-                printf("FDT: trial boot: U-Boot leaves the watchdog to the trial budget\n");
+                bail("FDT: couldn't mark the watchdog for the trial\n");
+            printf("FDT: trial boot: U-Boot leaves the watchdog to the trial budget\n");
         }
     }
+    return 0;
 }
 
 /*
@@ -9398,10 +9402,27 @@ static int dt_reserve_t8132_aop_windows(const char *path)
  * DAPF windows. Without all of it the firmware cannot run, so on any failure
  * the AOP is disabled.
  */
+/*
+ * Take an AOP node out of the OS's tree after its handoff failed. That failure is often a full
+ * DT, where growing status to "disabled" fails too: overwrite "okay" in place with "fail" (same
+ * length, no new space; Linux treats anything but "okay" as unavailable) and only grow the
+ * property when the node has no "okay" to overwrite.
+ */
+static int dt_disable_aop(const char *path)
+{
+    int node = fdt_path_offset(dt, path);
+    if (node < 0)
+        return -1;
+    int len;
+    const char *status = fdt_getprop(dt, node, "status", &len);
+    if (status && len == sizeof("okay") && !memcmp(status, "okay", len))
+        return fdt_setprop_inplace(dt, node, "status", "fail", sizeof("fail")) ? -1 : 0;
+    return fdt_setprop_string(dt, node, "status", "disabled") ? -1 : 0;
+}
+
 static int dt_set_t8132_aop(const char *path)
 {
     const char *why;
-    int node;
 
     if (fdt_node_check_compatible(dt, 0, "apple,j713") &&
         fdt_node_check_compatible(dt, 0, "apple,j604"))
@@ -9444,8 +9465,7 @@ static int dt_set_t8132_aop(const char *path)
 
 disable:
     printf("FDT: %s: disabling the AOP: %s\n", path, why);
-    node = fdt_path_offset(dt, path);
-    if (node < 0 || fdt_setprop_string(dt, node, "status", "disabled"))
+    if (dt_disable_aop(path))
         bail("FDT: %s: cannot disable the AOP\n", path);
     return 0;
 }
@@ -9565,10 +9585,18 @@ static int dt_set_aop_firmware(void)
         return 0;
     }
 
-    if (dt_reserve_asc_segments("/arm-io/aop", NULL, path, true, 0, true))
-        printf("FDT: %s: reserving the AOP firmware segments failed\n", path);
-    else
-        printf("FDT: %s: AOP firmware segments reserved\n", path);
+    /*
+     * The OS starts the AOP from these segments through its DART. Unreserved (or only some of
+     * them), they are free RAM to the OS, and the AOP would run code from pages it reuses:
+     * disable the AOP instead, as on T8132.
+     */
+    if (dt_reserve_asc_segments("/arm-io/aop", NULL, path, true, 0, true)) {
+        printf("FDT: %s: reserving the AOP firmware segments failed, disabling the AOP\n", path);
+        if (dt_disable_aop(path))
+            bail("FDT: %s: cannot disable the AOP\n", path);
+        return 0;
+    }
+    printf("FDT: %s: AOP firmware segments reserved\n", path);
 
     return 0;
 }
@@ -12249,7 +12277,8 @@ int kboot_prepare_dt(void *fdt)
         return -1;
     if (dt_set_chosen())
         return -1;
-    dt_set_trial_watchdog();
+    if (dt_set_trial_watchdog())
+        return -1;
     if (dt_check_trial_esp())
         return -1;
     secboot_export_fdt(dt);

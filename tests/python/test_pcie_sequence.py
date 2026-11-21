@@ -19,6 +19,9 @@ def test_t8140_sequence(tmp_path):
     source = (repo / "src/pcie.c").read_text()
     source = "\n".join(line for line in source.splitlines()
                        if not line.startswith("#include"))
+    # pcie.c's own constants (the include above is dropped): take them from pcie.h so they can't drift
+    pcie_h = "\n".join(line for line in (repo / "src/pcie.h").read_text().splitlines()
+                       if line.startswith("#define PCIE_") or line.startswith("#define APCIE_"))
     harness = r'''
 #include <assert.h>
 #include <stdbool.h>
@@ -38,6 +41,12 @@ typedef uint64_t u64;
 #define T6050 0x6050
 #define T8142 0x8142
 #define ADT_GETPROP(a, n, p, v) adt_getprop_copy(a, n, p, v, sizeof(*(v)))
+#define max(a, b) ((a) > (b) ? (a) : (b))
+/* Timeouts count polls, not time: a bound of N us allows N polls */
+static uint64_t timeout_calculate(uint64_t us) { return us; }
+static uint64_t timeout_polls;
+static bool timeout_expired(uint64_t timeout) { return ++timeout_polls > timeout; }
+''' + pcie_h + r'''
 static void *adt;
 static int chip_id = T8140;
 static const char *controller_compat = "apcie,t8140";

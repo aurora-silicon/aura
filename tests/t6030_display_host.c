@@ -337,6 +337,24 @@ bool adt_is_compatible_at(const void *a, int node, const char *compat, size_t in
     return false;
 }
 
+/* Any entry of the compatible list, as aura's ADT reader (rust/src/adt.rs) matches it */
+bool adt_is_compatible(const void *a, int node, const char *compat)
+{
+    u32 len = 0;
+    const char *c = adt_getprop(a, node, "compatible", &len);
+
+    while (c && len) {
+        size_t n = strnlen(c, len);
+        if (n == strlen(compat) && !memcmp(c, compat, n))
+            return true;
+        if (n + 1 > len)
+            break;
+        c += n + 1;
+        len -= n + 1;
+    }
+    return false;
+}
+
 /* Child lookup by name; a miss past the last child is an error, not a panic */
 static int child_named(int node, const char *name, size_t n)
 {
