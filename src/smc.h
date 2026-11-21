@@ -14,6 +14,9 @@ int smc_write_u64(smc_dev_t *smc, u32 key, u64 value);
 
 smc_dev_t *smc_init(void);
 
+/* Set the level of a pKW4/pKW8 function provided by smc-pmu. 1 if absent, negative on failure. */
+int smc_adt_function_set(const char *path, const char *property, u32 level);
+
 /*
  * Release the reset an ADT node's "function-reset" names through the SMC: pKW4(key, lo) is a
  * four-byte write of lo | level, pKW8(key, lo, hi) an eight-byte write of (hi << 32) | lo | level,
