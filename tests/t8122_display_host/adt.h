@@ -23,6 +23,14 @@ int adt_getprop_copy(const void *adt, int nodeoffset, const char *name, void *ou
 int adt_get_reg(const void *adt, int *path, const char *prop, int idx, u64 *addr, u64 *size);
 bool adt_is_compatible(const void *adt, int nodeoffset, const char *compat);
 int adt_get_property_count(const void *adt, int offset);
+int adt_get_child_count(const void *adt, int offset);
+int adt_first_child_offset(const void *adt, int offset);
+int adt_next_sibling_offset(const void *adt, int offset);
+const char *adt_get_name(const void *adt, int nodeoffset);
+#define ADT_FOREACH_CHILD(adt, node)                                                               \
+    for (int _child_count = adt_get_child_count(adt, node); _child_count; _child_count = 0)        \
+        for (node = adt_first_child_offset(adt, node); _child_count--;                             \
+             node = adt_next_sibling_offset(adt, node))
 int host_adt_nprops(int node);
 const struct adt_property *host_adt_prop(int node, int i);
 #define ADT_FOREACH_PROPERTY(adt, node, prop)                                                      \

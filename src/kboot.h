@@ -76,6 +76,7 @@ enum dcp_internal {
                               firmware clocks */
     DCP_INTERNAL_NO_PANEL, /* not attempted: ADT /arm-io/disp0 is external (no panel) */
 };
+int dt_set_dcpext_handoff(void *dt, enum dcp_internal internal);
 
 // from rust/usb4.rs
 u64 rust_usb4_router_uuid(void);
