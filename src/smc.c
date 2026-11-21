@@ -203,7 +203,8 @@ int smc_write_u64(smc_dev_t *smc, u32 key, u64 value)
     return smc_cmd(smc, msg);
 }
 
-/* ADT pKW4/pKW8 function: the SMC node's phandle, the function name, then its arguments */
+/* ADT pKW4/pKW8 function: the phandle of the SMC node or one of its children, the function
+ * name, then its arguments */
 struct smc_adt_function_prop {
     u32 phandle;
     char four_cc[4];
@@ -211,6 +212,26 @@ struct smc_adt_function_prop {
     u32 lo;
     u32 hi; /* pKW8 only */
 };
+
+/* Whether phandle names node or a node below it, at most depth levels down. The functions point
+ * at the SMC's PMU (J704: /arm-io/smc/iop-smc-nub/smc-pmu), not at /arm-io/smc itself. */
+static bool smc_adt_node_has_phandle(int node, u32 phandle, int depth)
+{
+    u32 own;
+
+    if (ADT_GETPROP(adt, node, "AAPL,phandle", &own) >= 0 && own == phandle)
+        return true;
+    if (depth == 0)
+        return false;
+
+    int child = node;
+    ADT_FOREACH_CHILD(adt, child)
+    {
+        if (smc_adt_node_has_phandle(child, phandle, depth - 1))
+            return true;
+    }
+    return false;
+}
 
 int smc_adt_function_get(const char *path, const char *prop, struct smc_adt_function *fn)
 {
@@ -225,6 +246,9 @@ int smc_adt_function_get(const char *path, const char *prop, struct smc_adt_func
     bool wide = !memcmp(raw.four_cc, "8WKp", 4);
     if (!(wide && len == 20) && !(!memcmp(raw.four_cc, "4WKp", 4) && len == 16))
         return 1; /* a GPIO or other non-SMC function */
+    int smc_node = adt_path_offset(adt, "/arm-io/smc");
+    if (smc_node < 0 || !smc_adt_node_has_phandle(smc_node, raw.phandle, 2))
+        return 1; /* a pKW4/pKW8 aimed at a controller other than the SMC */
 
     *fn = (struct smc_adt_function){.key = raw.key, .lo = raw.lo, .hi = raw.hi, .wide = wide};
     return 0;
