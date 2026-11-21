@@ -145,6 +145,20 @@ typedef struct dwc3_dev {
     void *scratchpad;
     void *xferbuffer;
     struct dwc3_trb *trbs;
+    /*
+     * Starting a bulk-in transfer, from several CPUs: the console and the proxy (console lock),
+     * an HV's vuart TX (its own lock, from stage-2 traps on any CPU) and the event handler's
+     * restart after a completion. Two at once would read the ring twice and start the endpoint
+     * twice.
+     */
+    spinlock_t bulk_in_lock;
+    /*
+     * The event buffer, read and acknowledged (GEVNTCOUNT) by whoever pumps events: the console
+     * and the proxy under one iodev's lock, an HV's vuart (another iodev on the same controller)
+     * under its own. Two CPUs in usb_dwc3_handle_events() at once copy the same events or skip
+     * some, and a lost bulk-in completion leaves that endpoint busy for good.
+     */
+    spinlock_t event_lock;
 
     struct {
         bool xfer_in_progress;
@@ -1275,7 +1289,7 @@ static void usb_dwc3_cdc_start_bulk_out_xfer(dwc3_dev_t *dev, u8 endpoint_number
     usb_dwc3_start_bulk_transfer(dev, endpoint_number, XFER_SIZE);
 }
 
-static void usb_dwc3_cdc_start_bulk_in_xfer(dwc3_dev_t *dev, u8 endpoint_number)
+static void usb_dwc3_cdc_start_bulk_in_xfer_locked(dwc3_dev_t *dev, u8 endpoint_number)
 {
     if (!usb_dwc3_trb_available(dev, endpoint_number))
         return;
@@ -1302,6 +1316,17 @@ static void usb_dwc3_cdc_start_bulk_in_xfer(dwc3_dev_t *dev, u8 endpoint_number)
         return;
     }
     dev->endpoints[endpoint_number].zlp_pending = len && (len % CDC_BULK_PACKET_SIZE) == 0;
+}
+
+static void usb_dwc3_cdc_start_bulk_in_xfer(dwc3_dev_t *dev, u8 endpoint_number)
+{
+    bool do_lock = mmu_active();
+
+    if (do_lock)
+        spin_lock(&dev->bulk_in_lock);
+    usb_dwc3_cdc_start_bulk_in_xfer_locked(dev, endpoint_number);
+    if (do_lock)
+        spin_unlock(&dev->bulk_in_lock);
 }
 
 static bool usb_dwc3_cdc_copy_bulk_out_progress(dwc3_dev_t *dev, u8 ep)
@@ -1763,9 +1788,24 @@ static void usb_dwc3_maybe_reannounce(dwc3_dev_t *dev)
 }
 #endif
 
+static void usb_dwc3_handle_events_locked(dwc3_dev_t *dev);
+
 void usb_dwc3_handle_events(dwc3_dev_t *dev)
 {
     if (!dev || dev->failed)
+        return;
+    bool do_lock = mmu_active();
+
+    if (do_lock)
+        spin_lock(&dev->event_lock);
+    usb_dwc3_handle_events_locked(dev);
+    if (do_lock)
+        spin_unlock(&dev->event_lock);
+}
+
+static void usb_dwc3_handle_events_locked(dwc3_dev_t *dev)
+{
+    if (dev->failed)
         return;
 
     u32 count = read32(dev->regs + DWC3_GEVNTCOUNT(0)) & DWC3_GEVNTCOUNT_MASK;
@@ -1842,6 +1882,8 @@ dwc3_dev_t *usb_dwc3_init(uintptr_t regs, dart_dev_t *dart)
         return NULL;
 
     memset(dev, 0, sizeof(*dev));
+    spin_init(&dev->bulk_in_lock);
+    spin_init(&dev->event_lock);
     for (int i = 0; i < CDC_ACM_PIPE_MAX; i++)
         memcpy(dev->pipe[i].cdc_line_coding, cdc_default_line_coding,
                sizeof(cdc_default_line_coding));
@@ -2172,7 +2214,13 @@ size_t usb_dwc3_queue(dwc3_dev_t *dev, cdc_acm_pipe_id_t pipe, const void *buf, 
 #endif
 
     while (count && CDC_LOOP_READY(dev, pipe)) {
+        bool do_lock = mmu_active();
+
+        if (do_lock)
+            spin_lock(&dev->bulk_in_lock);
         wrote = ringbuffer_write(p, count, device2host);
+        if (do_lock)
+            spin_unlock(&dev->bulk_in_lock);
         if (wrote) {
 #if USB_DWC3_SUPERSPEED
             last_progress = get_ticks();
@@ -2192,6 +2240,37 @@ size_t usb_dwc3_queue(dwc3_dev_t *dev, cdc_acm_pipe_id_t pipe, const void *buf, 
     }
 
     return sent;
+}
+
+/*
+ * Queue what fits and start the IN transfer, never waiting for the host. For the console and an
+ * HV's vuart: on a high-speed link usb_dwc3_queue() has no timeout, and a pipe the host stopped
+ * draining (no reader, or a bulk-in that never completes) would hold every CPU that then prints
+ * or traps into the vuart (macOS 27.2 guests froze 1-60 s into the boot this way, T8132 11-20).
+ */
+size_t usb_dwc3_queue_nonblocking(dwc3_dev_t *dev, cdc_acm_pipe_id_t pipe, const void *buf,
+                                  size_t count)
+{
+    if (!dev || !dev->pipe[pipe].ready)
+        return 0;
+
+    ringbuffer_t *device2host = dev->pipe[pipe].device2host;
+    if (!device2host)
+        return 0;
+
+    /* No event handling here: the callers' own loops pump events (hv_vuart's update_irq(), the
+     * HV tick, the proxy). Take bulk_in_lock across both the ring write and the IN start so
+     * producer and consumer never race on device2host (the vuart holds only its own lock, while
+     * another CPU may drain or retry the same ring from the event handler). */
+    bool do_lock = mmu_active();
+
+    if (do_lock)
+        spin_lock(&dev->bulk_in_lock);
+    size_t wrote = ringbuffer_write(buf, count, device2host);
+    usb_dwc3_cdc_start_bulk_in_xfer_locked(dev, dev->pipe[pipe].ep_in);
+    if (do_lock)
+        spin_unlock(&dev->bulk_in_lock);
+    return wrote;
 }
 
 size_t usb_dwc3_write(dwc3_dev_t *dev, cdc_acm_pipe_id_t pipe, const void *buf, size_t count)
