@@ -301,8 +301,8 @@ static void published(bool piodma)
     assert(!!fdt_getprop(dt, fdt_path_offset(dt, "disp0"), "apple,j713-inherited-mappings",
                          NULL) == piodma);
     assert(!!fdt_getprop(dt, fdt_path_offset(dt, "disp0"), "memory-region", NULL) == piodma);
-    assert(walks == (b.native && (os_firmware.version == V26_6_2 ||
-                                  os_firmware.version == V27_2) ? 2 : 0));
+    /* The walk runs wherever the DT asks for PIODMA, on any firmware. */
+    assert(walks == (b.native ? 2 : 0));
     /*
      * Firmware 27 is given /arm-io/disp0's clocks, only with the inherited display maps (the
      * kernel admits the DCP on apple,clock-ids); 26.x trees are not touched.
@@ -354,13 +354,17 @@ int main(int argc, char **argv)
     assert(argc == 2);
     outdir = argv[1];
 
-    /* The J713 as before: on 26.6.2 with PIODMA and scanout, and on any other firmware. */
+    /*
+     * Every M4 Mac whose ADT has an internal panel on disp0, on any firmware: the J713 on
+     * 26.6.2 with PIODMA and scanout, and the same on older images. PIODMA follows the
+     * inherited pages, not a firmware version list.
+     */
     handed_over(&j713, V26_6_2, true);
     struct board old = j713;
-    old.uuid = "0BC97BDD-E2FE-3A1B-96B4-8EA8FC5B8BE8"; /* 26.5.1: PIODMA unqualified */
-    handed_over(&old, V26_5, false);
-    handed_over(&old, V27_0, false);
-    handed_over(&old, V26_6, false);
+    old.uuid = "0BC97BDD-E2FE-3A1B-96B4-8EA8FC5B8BE8"; /* 26.5.1 */
+    handed_over(&old, V26_5, true);
+    handed_over(&old, V27_0, true);
+    handed_over(&old, V26_6, true);
     /* The 27.2 stub: the 26.6.2 path's PIODMA and scanout, plus the firmware-27 clocks. */
     struct board stub = j713;
     stub.uuid = "B3BA603C-3CA7-3E21-B393-44EB20BD2AEF";
@@ -380,11 +384,16 @@ int main(int argc, char **argv)
            !fdt_getprop(dt, fdt_path_offset(dt, "dcp"), "clocks", NULL) &&
            fdt_path_offset(dt, "/clock-dcp-firmware-364") < 0);
     assert(fdt_getprop(dt, fdt_path_offset(dt, "dcp"), "apple,firmware-uuid", NULL));
-    /* The J713's disp0 is never read. PIODMA follows the firmware version, not the image. */
-    old = j713; old.external = -1;
-    handed_over(&old, V26_6, false);
+    /* The same pages on 26.6.2 are refused the same way. */
+    world(&j713, V26_6_2);
+    dart_skew = SZ_16K;
+    assert(!dt_set_m4_dcp_handoff(&internal) && internal == DCP_INTERNAL_NONE);
+    assert(walks == 1 && status_is("/soc/display-subsystem", "disabled"));
 
-    /* Every other M4 Mac with a panel, on 26.6.2. The laptops' DT asks for PIODMA. */
+    /*
+     * The other M4 Macs with a panel take the same handoff as the J713, decided by their ADT
+     * and not their board name. The laptops' DT asks for PIODMA.
+     */
     handed_over(&j604, V26_6_2, true);
     handed_over(&j715, V26_6_2, true);
     struct board other = j604;
@@ -395,22 +404,26 @@ int main(int argc, char **argv)
     imac.name = "j624";
     imac.native = false;
     handed_over(&imac, V26_6_2, false);
-
-    /* Any other firmware: nothing, as before. */
+    struct board pro = j604;
+    pro.name = "j604-27.2";
+    pro.uuid = stub.uuid;
+    handed_over(&pro, V27_2, true);
     const enum fw_version others[] = {V26_5, V26_6, V27_0, V27_2, V14_7};
     const struct board *panels[] = {&j604, &j715, &imac};
     for (unsigned i = 0; i < ARRAY_SIZE(others); i++)
-        for (unsigned k = 0; k < ARRAY_SIZE(panels); k++) {
-            world(panels[k], others[i]);
-            refused();
-        }
+        for (unsigned k = 0; k < ARRAY_SIZE(panels); k++)
+            handed_over(panels[k], others[i], panels[k]->native);
 
-    /* No internal panel: the Mac mini, or no disp0 at all. */
+    /* No internal panel: the Mac mini on any firmware, or no disp0 at all, the J713 too. */
     world(&j773g, V26_6_2); refused(); save("j773g-26.6.2");
     world(&j773g, V26_6); refused();
+    world(&j773g, V27_2); refused();
     struct board bare = j604;
     bare.external = -1;
     world(&bare, V26_6_2); refused();
+    bare = j713;
+    bare.external = -1;
+    world(&bare, V27_2); refused();
 
     /* Not a T8132, or not its DCP. */
     world(&j713, V26_6_2); chip_id = T8122; refused();
@@ -443,7 +456,12 @@ int main(int argc, char **argv)
     )
     result = subprocess.run([str(binary), str(tmp_path)], capture_output=True, text=True)
     assert result.returncode == 0, result.stdout + result.stderr
-    for name in ("j713-27.2", "j713-26.6.2", "j604-26.6.2", "j715-26.6.2", "j624-26.6.2", "j773g-26.6.2"):
+    for name in ("j713-27.2", "j713-26.6.2", "j604-26.6.2", "j715-26.6.2", "j624-26.6.2", "j773g-26.6.2",
+                 "j604-27.2-27.2", "j715-27.2"):
         assert (tmp_path / f"{name}.dtb").stat().st_size > 0
     # The refusals say why.
     assert "no internal panel" in result.stdout
+    # No board name decides the handoff.
+    handoff = function(kboot, "dt_set_m4_dcp_handoff")
+    assert not re.search(r"check_compatible\(dt, 0,", handoff)
+    assert "V26_6_2" not in handoff and "V27_2" not in handoff
