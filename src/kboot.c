@@ -9352,7 +9352,7 @@ static int dt_setup_sio(void)
 #define T8132_AOP_DAPF_WINDOWS 16
 
 /*
- * The J713 AOP firmware reaches its DAPF windows (MMIO) through its DART at
+ * The T8132 AOP firmware reaches its DAPF windows (MMIO) through its DART at
  * their physical addresses: reserve them there, so that the OS maps them in
  * the AOP's DART before it starts the firmware.
  */
@@ -9390,22 +9390,22 @@ static int dt_reserve_t8132_aop_windows(const char *path)
 }
 
 /*
- * J713 and J604: iBoot leaves the AOP halted, its DART's DAPF empty, its
- * external code (__ETEXT) in DRAM at a fixed address and its log (__OS_LOG) at
- * a new one every boot. When the OS asks for the AOP's handoff, program the
- * DAPF, then reserve both segments at the IOVAs the firmware uses (their remap
- * addresses: EC0p for __ETEXT, the physical address for __OS_LOG) and the
- * DAPF windows. Without all of it the firmware cannot run, so on any failure
- * the AOP is disabled.
+ * T8132: iBoot leaves the AOP halted, its DART's DAPF empty, its external code
+ * (__ETEXT) in DRAM at a fixed address and its log (__OS_LOG) at a new one
+ * every boot; the 27.2 firmware adds its external data (__EDATA) after
+ * __ETEXT. When the OS tree asks for the AOP's handoff, program the DAPF, then
+ * reserve the DRAM segments at the IOVAs the firmware uses (their remap
+ * addresses: EC0p for __ETEXT and the address after it for __EDATA, the
+ * physical address for __OS_LOG) and the DAPF windows. The board does not
+ * matter, only the tree's request, the halted AOP and the ADT's segments and
+ * DAPF instance; the J713, J604 and J773g (whose headphone jack and speaker
+ * run on the AOP) all state the same contract. Without all of it the firmware
+ * cannot run, so on any failure the AOP is disabled.
  */
 static int dt_set_t8132_aop(const char *path)
 {
     const char *why;
     int node;
-
-    if (fdt_node_check_compatible(dt, 0, "apple,j713") &&
-        fdt_node_check_compatible(dt, 0, "apple,j604"))
-        return 0; /* No other M4 board's AOP handoff is qualified. */
 
     int chosen = fdt_path_offset(dt, "/chosen");
     if (chosen < 0 ||
