@@ -346,6 +346,41 @@ def test_the_j773g_adt(tmp_path):
     assert out[1:] == ["ps GFX 0x380700250"], out
 
 
+def test_what_follows_each_firmware_burst():
+    """The question the record is for: what macOS sends right after the firmware's 0x42 (RX
+    doorbell) bursts. A burst is the GPU's 0x42 messages (not the PMP's) less than 2 ms apart; the
+    answer is the AP's first messages after its last one, to either coprocessor, never one
+    from before it."""
+    h = {"t_start": 0, "cntfrq": 24000000, "trig_val": 0, "trig_hi": 0, "trig_cpu": 0}
+    ms = 24000
+
+    def m(t_ms, src, write, msg, ep):
+        return hvgfxrec.Message("mbox", int(t_ms * ms), 0, src, write, 0, msg, ep, 4, 2)
+
+    G, P = hvgfxrec.SRC_GFX, hvgfxrec.SRC_PMP
+    msgs = [m(0.0, G, True, 0x0083000000000011, 0x21),        # before: never an answer
+            m(1.0, G, False, 0x0042000000000000, 0x20), m(1.5, G, False, 0x0042000000000000, 0x20),
+            m(2.9, G, False, 0x0042000000000000, 0x20),        # 1.4 ms on: the same burst
+            m(3.0, P, False, 0x0042000000000000, 0x20),        # the PMP's: not the GPU's burst
+            m(3.2, P, True, 0x0037000000000008, 0x20),         # the first answers, PMP's and
+            m(3.3, G, True, 0x0083000000000010, 0x21),         # the GPU's
+            m(9.0, G, False, 0x0042000000000000, 0x20),        # a second burst, 6 ms later
+            m(9.1, G, False, 0x00b0000000000020, 0x00),
+            m(12.0, G, True, 0x00b0000000000020, 0x00)]
+    lines = hvgfxrec.after_bursts(msgs, h)
+    text = "\n".join(lines)
+    assert sum(x.startswith("  burst ") for x in lines) == 2, text
+    assert "burst 1: 3 GPU 0x42 messages, +1.000 .. +2.900 ms" in text
+    assert "burst 2: 1 GPU 0x42 messages, +9.000 .. +9.000 ms" in text
+    first = text.split("burst 2")[0]
+    assert "+0.300 ms" in first and "pmp A2I" in first and "0x0037000000000008" in first
+    assert "+0.400 ms" in first and "TX doorbell KICKFW" in first
+    assert "DEVCTRL" not in first, "a message from before the burst"
+    assert "the AP's first message to the GPU: +0.400 ms" in first
+    second = text.split("burst 2")[1]
+    assert "the AP's first message to the GPU: +3.000 ms" in second and "AP_PWR_STATE ON" in second
+
+
 class FakePark:
     """A parked HV's memory as the proxy reads it: each read must fall inside what was put."""
 
