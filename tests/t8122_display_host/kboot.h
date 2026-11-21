@@ -19,5 +19,5 @@ enum dcp_internal {
                               firmware clocks */
     DCP_INTERNAL_NO_PANEL, /* not attempted: ADT /arm-io/disp0 is external (no panel) */
 };
-int dt_set_dcpext_handoff(void *dt, enum dcp_internal internal);
+int dt_set_dcpext_handoff(void *dt, enum dcp_internal internal, bool fw_clocks);
 #endif

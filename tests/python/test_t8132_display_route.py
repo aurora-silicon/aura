@@ -3,8 +3,9 @@
 
 The external processors follow the internal M4 DCP handoff's reported outcome: there is no root
 compatible, chip id or OS release test in the route. dt_set_dcpext_handoff() is given that outcome
-whatever it is; the firmware-ready path (dt_reserve_j713_dcpext()) runs only for an image the ADT
-path does not know, and only after an internal handoff that was not refused.
+whatever it is, with kboot.c's firmware-27 clocks rule (dt_dcp_fw_clocks()); the firmware-ready path
+(dt_reserve_j713_dcpext()) runs only when the ADT path declines (firmware not given clocks), and only
+after an internal handoff that was not refused.
 """
 import subprocess
 from pathlib import Path
@@ -60,9 +61,11 @@ static int dt_set_m4_dcp_handoff(enum dcp_internal *internal)
     *internal = {outcome};
     return {m4_ret};
 }}
-static int dt_set_dcpext_handoff(void *tree, enum dcp_internal internal)
+static int dt_dcp_fw_clocks(void) {{ return 1; }}
+static int dt_set_dcpext_handoff(void *tree, enum dcp_internal internal, int fw_clocks)
 {{
     (void)tree;
+    assert(fw_clocks == 1);
     seen = internal;
     return {claims};
 }}

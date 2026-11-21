@@ -92,11 +92,11 @@
  * T8132 path after its internal M4 DCP handoff): no board, chip or OS release is tested. A device
  * tree node of a known block (dcpext_blocks[], by compatible) is matched to the ADT processor at
  * its address, its firmware DART stream and window and its display pipe come from the ADT and
- * are checked against the device tree, and the image it runs must be the internal DCP's, share
- * its __TEXT and be one whose external interface is known (dcpext_images[], keyed by the image's
- * uuid; any other image is refused). Each processor is its own transaction and gets its firmware
- * memory, apple,firmware-uuid/-version/-compat and its pipe's firmware clocks. Only beside a
- * complete internal handoff (the processors keep their status) or on a board with no panel (the
+ * are checked against the device tree, and the image it runs must be the internal DCP's and share
+ * its __TEXT; its firmware must be one the OS gives clocks (the internal handoff's decision; any
+ * other keeps kboot.c's firmware-ready path). Each processor is its own transaction and gets its
+ * firmware memory, apple,firmware-uuid/-version/-compat and its pipe's firmware clocks. Only beside
+ * a complete internal handoff (the processors keep their status) or on a board with no panel (the
  * processors must be disabled, and the display subsystem is enabled for them). No MMIO.
  *
  * T6050 (M5 Pro/Max): the __OS_LOG buffers of every running display coprocessor are reserved on
@@ -3460,19 +3460,6 @@ static const struct {
     {"apple,t8132-dcpext", "apple,t8132-display-subsystem"},
 };
 
-/*
- * The external processor interface of a DCP firmware image, by the image's own uuid (iop nub
- * uuid). This is the image's ABI, what its firmware asks the OS for, not a board or OS release
- * list: the processors of an image not listed here are not handed over.
- */
-static const struct {
-    const char *uuid;
-    bool pipe_clocks; /* its firmware is given its pipe's ADT clock-ids as firmware clocks */
-} dcpext_images[] = {
-    /* The T8132 image of macOS 27.2 (26B123), which dcp, dcpext0 and dcpext1 run */
-    {"B3BA603C-3CA7-3E21-B393-44EB20BD2AEF", true},
-};
-
 #define DCPEXT_MAX 8
 
 static const struct dcp_soc dcp_soc_dcpext = {.name = "dcpext"};
@@ -3492,7 +3479,6 @@ struct dcpext {
 static struct {
     bool headless;        /* no panel: no internal handoff, the external processors only */
     const char *uuid;     /* the image the internal DCP's nub runs, which each must run */
-    bool pipe_clocks;     /* that image's interface */
     struct dcp6_seg text; /* the internal nub's __TEXT, which each must share */
     int n;
     struct dcpext ext[DCPEXT_MAX];
@@ -3713,14 +3699,17 @@ static int dcpext_fill(void *dt, struct dcpext *x)
         bail("%s: __TEXT 0x%lx+0x%lx is not the internal DCP's\n", x->name, segs[SEG_TEXT].phys,
              segs[SEG_TEXT].size);
 
-    if (dcpext_run.pipe_clocks) {
-        if (fdt_getprop(dt, node, "clocks", NULL) || fdt_getprop(dt, node, "clock-names", NULL) ||
-            fdt_getprop(dt, node, "apple,clock-ids", NULL))
-            bail("%s: already has clocks\n", x->name);
-        int pipe = dcpext_pipe(dt, x);
-        if (pipe < 0 || dcp6_read_clocks(pipe, adt_get_name(adt, pipe), &x->clk))
-            return -1;
-    }
+    /* Its firmware is given its pipe's ADT clock-ids, as the internal DCP's is given disp0's */
+    if (fdt_getprop(dt, node, "clocks", NULL) || fdt_getprop(dt, node, "clock-names", NULL) ||
+        fdt_getprop(dt, node, "apple,clock-ids", NULL))
+        bail("%s: already has clocks\n", x->name);
+    int pipe = dcpext_pipe(dt, x);
+    char pipe_what[2 * DCP6_NAME_LEN + 4];
+    if (pipe < 0)
+        return -1;
+    snprintf(pipe_what, sizeof(pipe_what), "%s: %s", x->name, adt_get_name(adt, pipe));
+    if (dcp6_read_clocks(pipe, pipe_what, &x->clk))
+        return -1;
 
     /*
      * Beside the internal handoff, __TEXT is its region (kboot.c reserved it as asc-firmware@);
@@ -3745,9 +3734,7 @@ static int dcpext_fill(void *dt, struct dcpext *x)
     if (dcpext_fill_mem(dt, x->dt_path, x->name, segs, ph, text_name, dcpext_run.headless,
                         x->vm_base) ||
         fdt_setprop_string(dt, fdt_path_offset(dt, x->dt_path), "apple,firmware-uuid", uuid) ||
-        (dcpext_run.pipe_clocks
-             ? dcp6_publish_clocks(dt, x->dt_path, x->name, &x->clk)
-             : fdt_setprop_empty(dt, fdt_path_offset(dt, x->dt_path), "apple,clock-ids")))
+        dcp6_publish_clocks(dt, x->dt_path, x->name, &x->clk))
         bail("%s: no room in the device tree for its handoff\n", x->name);
     return 0;
 }
@@ -3811,11 +3798,13 @@ static void dcpext_reserve_oslogs(void *dt)
  * kboot.c's M4 handoff, after its internal DCP handoff: hand the external display processors over
  * from this boot's ADT and device tree, with no board, chip or OS release test and no MMIO.
  *
- * Only for an image whose external interface is known (dcpext_images[], by the uuid of the
- * internal DCP's nub); otherwise nothing is done and 0 is returned. Otherwise 1, whatever was
- * published: the processors of such an image are this function's. Each processor of a known
- * block (dcpext_blocks[]) is matched to its ADT node by address and checked against it (DART
- * stream and window, pipe, image, layout, the shared __TEXT), and is its own transaction: a
+ * Only for an image whose firmware the OS gives its clocks (`fw_clocks`: kboot.c's firmware-27
+ * rule, the one it publishes dcp's clocks by; beside the internal handoff, dcp must carry them);
+ * otherwise nothing is done and 0 is returned, and kboot.c keeps the firmware-ready path. Otherwise
+ * 1, whatever was published: the processors of such an image are this function's. Which images
+ * the kernel drives is its own decision, by the apple,firmware-uuid published here. Each processor
+ * of a known block (dcpext_blocks[]) is matched to its ADT node by address and checked against it
+ * (DART stream and window, pipe, image, layout, the shared __TEXT), and is its own transaction: a
  * refusal is one log line and leaves the device tree as it was for that processor.
  *
  * Beside a complete internal handoff (DCP_INTERNAL_COMPLETE, which published this image on dcp
@@ -3825,7 +3814,7 @@ static void dcpext_reserve_oslogs(void *dt)
  * subsystem and its DART are enabled for them. After any other internal outcome nothing is handed
  * over: an external processor must never cost the panel.
  */
-int dt_set_dcpext_handoff(void *dt, enum dcp_internal internal)
+int dt_set_dcpext_handoff(void *dt, enum dcp_internal internal, bool fw_clocks)
 {
     memset(&dcp6, 0, sizeof(dcp6));
     memset(&dcpext_run, 0, sizeof(dcpext_run));
@@ -3839,17 +3828,13 @@ int dt_set_dcpext_handoff(void *dt, enum dcp_internal internal)
              DCP6_NUB);
         return 0;
     }
-    for (size_t i = 0; i < ARRAY_SIZE(dcpext_images) && !dcpext_run.uuid; i++)
-        if (!strcmp(uuid, dcpext_images[i].uuid)) {
-            dcpext_run.uuid = dcpext_images[i].uuid;
-            dcpext_run.pipe_clocks = dcpext_images[i].pipe_clocks;
-        }
-    if (!dcpext_run.uuid) {
-        dlog("no external processor interface known for image %s: external processors left to "
-             "the firmware-ready path\n",
+    if (!fw_clocks) {
+        dlog("image %s is not given its clocks by the OS: external processors left to the "
+             "firmware-ready path\n",
              uuid);
         return 0;
     }
+    dcpext_run.uuid = uuid;
     dcpext_run.headless = internal == DCP_INTERNAL_NO_PANEL;
     if (!dcpext_find(dt)) {
         dlog("the device tree describes no external processor\n");
@@ -3868,6 +3853,12 @@ int dt_set_dcpext_handoff(void *dt, enum dcp_internal internal)
         if (!published || ulen != (int)len || memcmp(published, uuid, len)) {
             dlog("dcp was not handed over with image %s: external processors not handed over\n",
                  uuid);
+            return 1;
+        }
+        /* The internal handoff gave this image's firmware its clocks: so are the processors'. */
+        if (!fdt_getprop(dt, dcp, "apple,clock-ids", NULL)) {
+            dlog("dcp was handed over without firmware clocks: external processors not handed "
+                 "over\n");
             return 1;
         }
     }

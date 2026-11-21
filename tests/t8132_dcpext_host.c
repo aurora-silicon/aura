@@ -317,10 +317,12 @@ static void build_t8132(void *dt, const char *root, size_t root_len, size_t size
  * What kboot.c's M4 handoff leaves when it is complete: the image's uuid on dcp, and every
  * internal segment reserved as asc-firmware@<phys>, __TEXT with the dcp's mapping.
  */
-static void m4_handoff(void *dt, const char *uuid)
+static void m4_handoff(void *dt, const char *uuid, bool clocks)
 {
     int dcp = alias_node(dt, "dcp");
     OK(fdt_setprop_string(dt, dcp, "apple,firmware-uuid", uuid));
+    if (clocks) /* firmware 27: /arm-io/disp0's firmware clocks (one is enough here) */
+        OK(fdt_setprop_u32(dt, alias_node(dt, "dcp"), "apple,clock-ids", 364));
     OK(fdt_setprop_u32(dt, alias_node(dt, "dcp"), "phandle", 130));
     char name[48];
     snprintf(name, sizeof(name), "asc-firmware@%llx", (unsigned long long)dcp_segs[0].phys);
@@ -336,6 +338,8 @@ static void m4_handoff(void *dt, const char *uuid)
 }
 
 /* ---- checks ---- */
+
+static const char *image = UUID27; /* the image every nub runs in this scenario */
 
 /* Every property of the node at `path` is the same in both trees (and so are its children's) */
 static bool node_same(const void *a, const void *b, const char *path)
@@ -402,7 +406,7 @@ static void check_ext(const void *in, const void *dt, int i, bool headless)
           i, in_status ? in_status : "?");
     check(!fdt_getprop(dt, ext, READY, NULL), "dcpext%d has no 26.6.2 firmware-ready marker", i);
     const char *uuid = fdt_getprop(dt, ext, "apple,firmware-uuid", &len);
-    check(uuid && !strcmp(uuid, UUID27), "dcpext%d apple,firmware-uuid is the ADT image's", i);
+    check(uuid && !strcmp(uuid, image), "dcpext%d apple,firmware-uuid is the ADT image's", i);
     const fdt32_t *v = fdt_getprop(dt, ext, "apple,firmware-version", &len);
     check(v && len == 12 && fdt32_ld(&v[0]) == 27 && fdt32_ld(&v[1]) == 2 && !fdt32_ld(&v[2]),
           "dcpext%d apple,firmware-version is 27.2.0", i);
@@ -514,7 +518,10 @@ static const struct t8132_scenario t8132_scenarios[] = {
     {"j713-one", "J713: dcpext1 not running, dcpext0 handed over alone"},
     {"j713-refused-uuid", "J713: dcpext1 runs another image than the internal DCP"},
     {"j713-internal-walk-failed", "J713: the internal SID0/SID16 walk failed: nothing external"},
-    {"j713-unknown-image", "J713: an image with no known external interface: not ours"},
+    {"j713-26-6-2", "J713 on 26.6.2: firmware not given clocks, the firmware-ready path's"},
+    {"j713-other-image", "J713: another image given clocks by the OS: handed over, no list"},
+    {"j713-dcp-no-clocks", "J713: complete outcome but dcp has no firmware clocks"},
+    {"j713-pipe-no-clocks", "J713: dispext1 has no clock-ids"},
     {"j713-dcp-uuid-missing", "J713: complete outcome but dcp has no apple,firmware-uuid"},
     {"j713-sid-mismatch", "J713: the ADT mapper's stream is not the DT iommus cell"},
     {"j713-dart-reg-mismatch", "J713: the DT DART is not at the ADT DART's address"},
@@ -558,13 +565,20 @@ int main(int argc, char **argv)
     printf("%s: %s\n", s, sc->what);
 
     bool j773g = !strncmp(s, "j773g", 5), later = is(s, "later-soc");
-    bool unknown = is(s, "j713-unknown-image");
+    bool unknown = is(s, "j713-26-6-2");
+    if (is(s, "j713-other-image"))
+        image = UUID_X;
+    if (unknown)
+        image = UUID262;
     if (is(s, "j713-adt272-layout")) {
         layout272 = true;
         dcp_segs = j713_272_segs;
         dcp_nsegs = ARRAY_SIZE(j713_272_segs);
     }
-    world_t8132(j773g, unknown ? UUID262 : UUID27);
+    world_t8132(j773g, image);
+    if (unknown)
+        os_firmware =
+            (struct fw_version_info){V26_6_2, "26.6.2", {26, 6, 2}, 3, "mBoot-18000.161.10"};
 
     static u8 dt[DT_SIZE], in[DT_SIZE];
     size_t size = DT_SIZE;
@@ -576,7 +590,7 @@ int main(int argc, char **argv)
                         !j773g || is(s, "j773g-enabled"), !is(s, "j773g-headless") || i == 0);
     enum dcp_internal internal = j773g ? DCP_INTERNAL_NO_PANEL : DCP_INTERNAL_COMPLETE;
     if (!j773g && !is(s, "j713-dcp-uuid-missing"))
-        m4_handoff(dt, unknown ? UUID262 : UUID27);
+        m4_handoff(dt, image, !unknown && !is(s, "j713-dcp-no-clocks"));
     if (is(s, "j713-internal-walk-failed"))
         internal = DCP_INTERNAL_NONE;
 
@@ -602,6 +616,8 @@ int main(int argc, char **argv)
     }
     if (is(s, "j713-no-mapper"))
         node_drop("/arm-io/dart-dcpext1/mapper-dcpext1");
+    if (is(s, "j713-pipe-no-clocks"))
+        prop_drop("/arm-io/dispext1", "clock-ids");
     if (is(s, "j713-no-pipe"))
         node_drop("/arm-io/dispext1");
     if (is(s, "j713-two-pipes")) {
@@ -629,11 +645,12 @@ int main(int argc, char **argv)
 
     memcpy(in, dt, fdt_totalsize(dt));
     mmio_reads = mmio_writes = 0;
-    int ret = dt_set_dcpext_handoff(dt, internal);
+    bool fw_clocks = os_firmware.version >= V27_0; /* kboot.c's dt_dcp_fw_clocks() */
+    int ret = dt_set_dcpext_handoff(dt, internal, fw_clocks);
     if (is(s, "j713-repeat")) {
         static u8 once[DT_SIZE];
         memcpy(once, dt, fdt_totalsize(dt));
-        check(dt_set_dcpext_handoff(dt, internal) == 1, "the second call is ours too");
+        check(dt_set_dcpext_handoff(dt, internal, fw_clocks) == 1, "the second call is ours too");
         check(fdt_totalsize(dt) == fdt_totalsize(once) && node_same(once, dt, "/"),
               "the second call changes nothing");
     }
@@ -642,7 +659,7 @@ int main(int argc, char **argv)
     check(fdt_check_header(dt) == 0, "the device tree is valid");
     check(ret == !unknown, "returns %d (%s)", ret, unknown ? "not ours" : "ours");
 
-    if (is(s, "j713-both") || is(s, "j713-repeat") || layout272) {
+    if (is(s, "j713-both") || is(s, "j713-repeat") || layout272 || is(s, "j713-other-image")) {
         check_ext(in, dt, 0, false);
         check_ext(in, dt, 1, false);
         check_oslogs(dt, true, true, false);
@@ -659,7 +676,7 @@ int main(int argc, char **argv)
               "the internal __TEXT keeps the dcp's mapping");
     } else if (is(s, "j713-one") || is(s, "j713-refused-uuid") || is(s, "j713-dart-reg-mismatch") ||
                is(s, "j713-no-mapper") || is(s, "j713-no-pipe") || is(s, "j713-no-adt-node") ||
-               is(s, "j713-text-not-shared")) {
+               is(s, "j713-text-not-shared") || is(s, "j713-pipe-no-clocks")) {
         check_ext(in, dt, 0, false);
         check(ext_untouched(in, dt, 1), "dcpext1 is left as it was");
         check_internal_untouched(in, dt);
@@ -671,7 +688,7 @@ int main(int argc, char **argv)
         check_ext(in, dt, 1, false);
         check_internal_untouched(in, dt);
     } else if (is(s, "j713-internal-walk-failed") || is(s, "j713-dcp-uuid-missing") ||
-               is(s, "j713-dt-full")) {
+               is(s, "j713-dcp-no-clocks") || is(s, "j713-dt-full")) {
         check(ext_untouched(in, dt, 0) && ext_untouched(in, dt, 1),
               "no external processor is handed over");
         check_internal_untouched(in, dt);

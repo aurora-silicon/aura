@@ -34,7 +34,10 @@ REASONS = {
     "j713-one": [H0, "dcpext1: iBoot did not leave its four-segment firmware loaded and running"],
     "j713-refused-uuid": [H0, "dcpext1: does not run the internal DCP's image B3BA603C-"],
     "j713-internal-walk-failed": ["internal DCP handoff not complete: external processors not handed over"],
-    "j713-unknown-image": ["no external processor interface known for image 81BAF476-"],
+    "j713-26-6-2": ["image 81BAF476-679D-3CC0-8C6A-E6B6FA659D5E is not given its clocks by the OS"],
+    "j713-other-image": ["dcpext0 handed over (image 0BC97BDD-", "dcpext1 handed over (image 0BC97BDD-"],
+    "j713-dcp-no-clocks": ["dcp was handed over without firmware clocks"],
+    "j713-pipe-no-clocks": [H0, "dcpext1: dispext1 clock metadata is missing or invalid"],
     "j713-dcp-uuid-missing": ["dcp was not handed over with image B3BA603C-"],
     "j713-sid-mismatch": [H1, "dcpext0: iommus is not <&dart 22>, the ADT's stream"],
     "j713-dart-reg-mismatch": [H0, "dcpext1: its DART is not the ADT's apple,t8110-dart at 0x48a440000"],
@@ -59,13 +62,14 @@ REASONS = {
 # Scenarios in which exactly one processor is refused: its refusal is one log line.
 ONE_REFUSAL = {"j713-one", "j713-refused-uuid", "j713-sid-mismatch", "j713-dart-reg-mismatch",
                "j713-dma-range-mismatch", "j713-window-too-small", "j713-no-mapper", "j713-no-pipe", "j713-two-pipes",
-               "j713-no-adt-node", "j713-text-not-shared", "j713-bad-layout", "j713-has-clocks"}
+               "j713-no-adt-node", "j713-text-not-shared", "j713-bad-layout", "j713-has-clocks",
+               "j713-pipe-no-clocks"}
 
 
 def test_every_scenario_has_its_reason():
     assert sorted(REASONS) == sorted(SCENARIOS)
     for required in ("j713-both", "j713-one", "j713-refused-uuid", "j713-internal-walk-failed",
-                     "j713-unknown-image", "j773g-headless"):
+                     "j713-26-6-2", "j773g-headless"):
         assert required in SCENARIOS
 
 
