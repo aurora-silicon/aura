@@ -40,7 +40,7 @@ typedef uint64_t u64; typedef uint32_t u32;
 #define bail(...) do { printf(__VA_ARGS__); return -1; } while (0)
 ''' + table + r'''
 static struct spin_table spin_table[MAX_CPUS];
-static struct { void *entry; u64 args[5]; bool restore_logo; } next_stage;
+static struct { void *entry; u64 args[5]; bool restore_logo; bool chained; } next_stage;
 static void *dt = (void *)0x1000;
 static int dt_bufsize = 0x10000;
 static int chip_id, mode, hardware_calls;
@@ -56,6 +56,7 @@ static int mcc_enable_cache(void) { hardware_calls++; return 0; }
 static void tunables_apply_static(void) {}
 static void clk_init(void) { if (mode == 2) spin_table[1].target = 0x1234; }
 static void usb_init(void) {}
+static void pmu_chain_leave(void) {}
 static int pcie_init(void) { return 0; }
 static bool pcie_radio_board_fdt(void *p) { return false; }
 static int pcie_prepare_fdt(void *p) { return 0; }

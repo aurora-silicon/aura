@@ -113,6 +113,7 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
             next_stage.entry = (generic_func *)request->args[0];
             memcpy(next_stage.args, &request->args[1], 5 * sizeof(u64));
             next_stage.restore_logo = true;
+            next_stage.chained = false;
             return 1;
         case P_GL1_CALL:
             reply->retval = gl1_call((void *)request->args[0], request->args[1], request->args[2],

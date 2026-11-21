@@ -16,5 +16,7 @@ void pmu_snapshot_failed_boots(void);
 void pmu_take_failed_boots_var(const char *val);
 bool pmu_failed_boots_passed(u8 *count);
 const char *pmu_failed_boots_var(void);
+/* The chain leaves aura here (OS, proxy or a deliberate reboot): clear iBoot's counts, once. */
+void pmu_chain_leave(void);
 
 #endif

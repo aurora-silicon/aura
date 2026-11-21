@@ -131,6 +131,7 @@ static struct {
     void *entry;
     u64 args[5];
     bool restore_logo;
+    bool chained;
 } next_stage;
 
 #define _chainload_stub_start stub_code

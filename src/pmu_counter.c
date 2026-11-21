@@ -112,17 +112,19 @@ int pmu_read_boot_record(u8 *counts, u8 *error_stage)
 }
 
 /*
- * Every aura stage clears iBoot's count (main.c), so only the first one sees it. Each stage reads
- * it before its clear and hands on the larger of that and what the stage before it handed on:
- * a later stage then knows how many boots in a row have failed. A stage that got no count from the
- * stage before it can't tell a first failure from a count an older Stage 1 cleared.
+ * No aura stage clears iBoot's count before the chain leaves aura (pmu_chain_leave()), so the count
+ * carries over a Stage 2's reboot after a failed ANS start and bounds those reboots. Each stage
+ * reads it at start and hands on the larger of that and what the stage before it handed on. An
+ * older Stage 1 clears the count at start and hands on none: a stage that got no count can't tell
+ * a first failure from a cleared count.
  */
-static bool own_valid, passed_valid;
+static bool snapshot_taken, own_valid, passed_valid;
 static u8 own_failed, passed_failed;
 
 void pmu_snapshot_failed_boots(void)
 {
     u8 counts, error_stage;
+    snapshot_taken = true;
     own_valid = !pmu_read_boot_record(&counts, &error_stage);
     own_failed = own_valid ? PMU_FAILED_BOOTS(counts) : 0;
 }
@@ -159,4 +161,22 @@ const char *pmu_failed_boots_var(void)
     u8 count = passed_failed > own_failed ? passed_failed : own_failed;
     snprintf(var, sizeof(var), "aura.failed-boots=%u", count);
     return var;
+}
+
+/*
+ * Nothing else in an aura chain clears iBoot's counts: a test kernel that hangs, or a proxy session
+ * that ends in a reset, counts as a failed boot, and enough of them end in recoveryOS. Clear them
+ * once the chain leaves aura: when the last stage vectors to its OS, stops in the proxy, or reboots
+ * on purpose. Not when a stage chainloads the next aura stage, and not when a Stage 2 reboots after
+ * a failed ANS start: that reboot counts. A stage that resets before it leaves (a panic, a hang the
+ * watchdog ends) is counted too, as iBoot counts any boot that never reached an OS. A boot that
+ * never took the snapshot (T8152's proxy-only path) leaves the counts alone, as before.
+ */
+void pmu_chain_leave(void)
+{
+    static bool done;
+    if (done || !snapshot_taken)
+        return;
+    done = true;
+    pmu_clear_panic_counter();
 }
