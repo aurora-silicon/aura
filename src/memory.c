@@ -4,6 +4,7 @@
 #include "adt.h"
 #include "assert.h"
 #include "cpu_regs.h"
+#include "ctxr_exec.h"
 #include "fb.h"
 #include "gxf.h"
 #include "malloc.h"
@@ -402,6 +403,49 @@ static void mmu_pt_map_l3(u64 from, u64 to, u64 size)
     }
 }
 
+/*
+ * iBoot can arm CTRR_C and CTRR_D over physical ranges that L2 blocks would cover: on T8152 it
+ * arms CTRR_C over the 48 KiB below its top_of_kernel_data, above the boot object. A secondary CPU
+ * takes an address size fault on an L2 block whose output range contains an armed range, through
+ * any of the RAM's virtual aliases, so mmu_map() builds those blocks from L3 pages, as it does for
+ * the firmware's read-only range. The ranges are read once, and only with locked Apple system
+ * registers, as kboot reads them; an absent or unarmed range changes nothing.
+ */
+static struct {
+    u64 start, end;
+} mmu_ctrr[2];
+static int mmu_ctrr_count = -1;
+
+static int mmu_ctrr_ranges(void)
+{
+    static const enum ctxr_range ranges[] = {CTRR_RANGE_C, CTRR_RANGE_D};
+    static const char names[] = {'C', 'D'};
+    u64 start, end;
+
+    if (mmu_ctrr_count >= 0)
+        return mmu_ctrr_count;
+    mmu_ctrr_count = 0;
+    if (cpu_features->apple_sysregs_unlocked)
+        return 0;
+    for (size_t i = 0; i < ARRAY_SIZE(ranges); i++) {
+        if (!ctxr_range(ranges[i], &start, &end) || end <= start)
+            continue;
+        mmu_ctrr[mmu_ctrr_count].start = start;
+        mmu_ctrr[mmu_ctrr_count].end = end;
+        mmu_ctrr_count++;
+        printf("MMU: L3 pages over CTRR_%c [0x%lx, 0x%lx)\n", names[i], start, end);
+    }
+    return mmu_ctrr_count;
+}
+
+static bool mmu_holds_ctrr(u64 target, u64 size)
+{
+    for (int i = 0; i < mmu_ctrr_count; i++)
+        if (target < mmu_ctrr[i].end && target + size > mmu_ctrr[i].start)
+            return true;
+    return false;
+}
+
 int mmu_map(u64 from, u64 to, u64 size)
 {
     u64 chunk;
@@ -411,7 +455,7 @@ int mmu_map(u64 from, u64 to, u64 size)
     // Map L3 until L2-aligned or reached end of mapping
     u64 boundary_l2 = ALIGN_UP(from, MASK(VADDR_L2_OFFSET_BITS));
     // CPU CTRR doesn't like L2 mappings crossing CTRR boundaries!
-    // Map everything below the aura base as L3
+    // Map everything below the aura base as L3 (armed CTRR ranges above it: see below)
     if (boundary_l2 >= ram_base && boundary_l2 < (u64)_base)
         boundary_l2 = ALIGN_UP((u64)_base, MASK(VADDR_L2_OFFSET_BITS));
 
@@ -423,7 +467,8 @@ int mmu_map(u64 from, u64 to, u64 size)
         size -= chunk;
     }
 
-    // 16K does not support L1 blocks without FEAT_LPA2
+    // 16K does not support L1 blocks without FEAT_LPA2. The CTRR split below relies on that: it
+    // checks L2 blocks only, so a 4K build would map an armed CTRR range here with an L1 block.
     if (!mmu_active() && !is_16k() && chip_id != T8140) {
         // Map L2 until L1-aligned or reached end of mapping
         u64 boundary_l1 = ALIGN_UP(from, MASK(VADDR_L1_OFFSET_BITS));
@@ -450,15 +495,18 @@ int mmu_map(u64 from, u64 to, u64 size)
     if (!mmu_active() && chunk && (to & VADDR_L2_ALIGN_MASK) == 0) {
         u64 ro_start, ro_end;
         bool split_ro = (to & PTE_VALID) && memory_fw_ro_range(&ro_start, &ro_end) > 0;
+        bool split_ctrr = (to & PTE_VALID) && mmu_ctrr_ranges() > 0;
         u64 block_size = BIT(VADDR_L2_OFFSET_BITS);
 
-        if (!split_ro) {
+        if (!split_ro && !split_ctrr) {
             mmu_pt_map_l2(from, to, chunk);
         } else {
             for (u64 offset = 0; offset < chunk; offset += block_size) {
                 u64 target = (to + offset) & PTE_TARGET_MASK;
-                if (target < ro_end && target + block_size > ro_start) {
+                if (split_ro && target < ro_end && target + block_size > ro_start) {
                     printf("MMU: splitting firmware RO block at 0x%lx\n", target);
+                    mmu_pt_map_l3(from + offset, to + offset, block_size);
+                } else if (split_ctrr && mmu_holds_ctrr(target, block_size)) {
                     mmu_pt_map_l3(from + offset, to + offset, block_size);
                 } else {
                     mmu_pt_map_l2(from + offset, to + offset, block_size);
