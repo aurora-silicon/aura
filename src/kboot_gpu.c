@@ -2212,6 +2212,9 @@ int dt_gpu_t8122_26_calibrate(void *dt)
                               "g15s-fuse-scaled-experimental");
 }
 
+/* Boot config opt-in for the G14G (T8112) firmware handoff: chosen.asahi,t8112-gpu=1. */
+#define G14G_HANDOFF_OPTIN "asahi,t8112-gpu"
+
 /* Whether /chosen has `name` = "1" */
 static bool g15_optin(void *dt, const char *name)
 {
@@ -4316,6 +4319,38 @@ static T6050_GPU_INIT int dt_set_gpu_g17c(void *dt)
     return ret;
 }
 
+/* The firmware version whose initdata layout the G13/G14 path builds. */
+static const struct fw_version_info *gpu_initdata_compat(void)
+{
+    switch (os_firmware.version) {
+        case V12_3_1:
+            return &fw_versions[V12_3];
+        case V13_5B4:
+        case V13_6_1:
+            return &fw_versions[V13_5];
+        default:
+            return &os_firmware;
+    }
+}
+
+/*
+ * Keep iBoot's UAT carveouts reserved and leave the GPU disabled, without touching its power state
+ * or publishing an ABI.
+ */
+static int gpu_leave_disabled(void *dt, int sgx)
+{
+    if (dt_set_region(dt, sgx, "gfx-handoff", "/reserved-memory/uat-handoff") ||
+        dt_set_region(dt, sgx, "gfx-shared-region", "/reserved-memory/uat-pagetables") ||
+        dt_set_region(dt, sgx, "gpu-region", "/reserved-memory/uat-ttbs"))
+        return -1;
+    int gpu = fdt_path_offset(dt, "gpu");
+    if (gpu < 0)
+        return 0;
+    printf("FDT: GPU: no initdata layout for firmware %s; GPU disabled, boot continues\n",
+           os_firmware.string);
+    return fdt_setprop_string(dt, gpu, "status", "disabled");
+}
+
 int dt_set_gpu(void *dt)
 {
     if (chip_id == T8152) {
@@ -4422,20 +4457,58 @@ int dt_set_gpu(void *dt)
     if (sgx < 0)
         bail("ADT: GPU: /arm-io/sgx node not found\n");
 
+    const struct fw_version_info *compat = gpu_initdata_compat();
+    size_t data_a_size, data_b_size, globals_size;
+
+    /*
+     * Without an initdata layout for this firmware (T8112's G14G on 27.2), aura cannot set the
+     * GPU up, so it is left disabled instead of refusing the whole boot. The exception, only with
+     * the boot config line chosen.asahi,t8112-gpu=1, is a loaded image that firmware_gfx_version()
+     * identifies, which the kernel starts itself from the handoff (dt_set_gpu_g14g_handoff()): the
+     * operating points are published below as usual, then the handoff. The kernel's 27.2 backend
+     * is compute-only, and desktop userspace that finds its render node uses it for GL and fails,
+     * so without the opt-in the GPU stays disabled. Any other image, any operating-point or
+     * ADT problem on the handoff path, or a handoff the ADT does not describe also leaves the GPU
+     * disabled; the boot continues.
+     */
+    const struct fw_version_info *handoff = NULL;
+    if (rust_gpu_initdata_size(compat->num[0], compat->num[1], &data_a_size, &data_b_size,
+                               &globals_size) == -1) {
+        handoff = downstream_dtb ? firmware_gfx_version(chip_id) : NULL;
+        if (handoff && !g15_optin(dt, G14G_HANDOFF_OPTIN)) {
+            printf("FDT: GPU: firmware %s identified; its handoff needs chosen.%s=1\n",
+                   handoff->string, G14G_HANDOFF_OPTIN);
+            handoff = NULL;
+        }
+        if (!handoff)
+            return gpu_leave_disabled(dt, sgx);
+    }
+
+    /* On the handoff path a failure below leaves the GPU disabled instead of failing the boot. */
+#define gpu_fail(...)                                                                              \
+    do {                                                                                           \
+        printf(__VA_ARGS__);                                                                       \
+        if (handoff) {                                                                             \
+            printf("FDT: GPU: firmware %s handoff refused\n", handoff->string);                    \
+            return gpu_leave_disabled(dt, sgx);                                                    \
+        }                                                                                          \
+        return -1;                                                                                 \
+    } while (0)
+
     u32 perf_state_count;
     if (ADT_GETPROP(adt, sgx, "perf-state-count", &perf_state_count) < 0 || !perf_state_count)
-        bail("ADT: GPU: missing perf-state-count\n");
+        gpu_fail("ADT: GPU: missing perf-state-count\n");
 
     u32 perf_state_table_count;
     if (ADT_GETPROP(adt, sgx, "perf-state-table-count", &perf_state_table_count) < 0 ||
         !perf_state_table_count)
-        bail("ADT: GPU: missing perf-state-table-count\n");
+        gpu_fail("ADT: GPU: missing perf-state-table-count\n");
 
     if (perf_state_count > MAX_PSTATES)
-        bail("ADT: GPU: perf-state-count too large\n");
+        gpu_fail("ADT: GPU: perf-state-count too large\n");
 
     if (perf_state_table_count > MAX_CLUSTERS)
-        bail("ADT: GPU: perf-state-table-count too large\n");
+        gpu_fail("ADT: GPU: perf-state-table-count too large\n");
 
     u32 perf_states_len;
     const struct perf_state *perf_states, *perf_states_sram;
@@ -4444,21 +4517,24 @@ int dt_set_gpu(void *dt)
     perf_states = adt_getprop(adt, sgx, "perf-states", &perf_states_len);
     if (!perf_states ||
         perf_states_len != sizeof(*perf_states) * perf_state_count * perf_state_table_count)
-        bail("ADT: GPU: invalid perf-states length\n");
+        gpu_fail("ADT: GPU: invalid perf-states length\n");
 
     perf_states_sram = adt_getprop(adt, sgx, "perf-states-sram", &perf_states_len);
+    /* The 27.2 backend takes each operating point's SRAM voltage from the handoff. */
+    if (handoff && !perf_states_sram)
+        gpu_fail("ADT: GPU: perf-states-sram missing\n");
     if (perf_states_sram &&
         perf_states_len != sizeof(*perf_states) * perf_state_count * perf_state_table_count)
-        bail("ADT: GPU: invalid perf-states-sram length\n");
+        gpu_fail("ADT: GPU: invalid perf-states-sram length\n");
 
     perf_states_afr = adt_getprop(adt, sgx, "afr-perf-states", NULL);
     perf_states_cs = adt_getprop(adt, sgx, "cs-perf-states", NULL);
 
     if (has_cs_afr && !perf_states_cs)
-        bail("ADT: GPU: cs-perf-states not found\n");
+        gpu_fail("ADT: GPU: cs-perf-states not found\n");
 
     if (has_cs_afr && !perf_states_afr)
-        bail("ADT: GPU: afr-perf-states not found\n");
+        gpu_fail("ADT: GPU: afr-perf-states not found\n");
 
     u32 max_pwr[MAX_PSTATES];
     float core_leak[MAX_CLUSTERS];
@@ -4468,7 +4544,7 @@ int dt_set_gpu(void *dt)
 
     if (calc_power(perf_state_count, perf_state_table_count, perf_states, perf_states_sram,
                    perf_states_cs, max_pwr, core_leak, sram_leak, cs_leak, afr_leak))
-        return -1;
+        gpu_fail("FDT: GPU: power table calculation failed\n");
 
     printf("FDT: GPU: Max power table: ");
     for (u32 i = 0; i < perf_state_count; i++) {
@@ -4500,19 +4576,19 @@ int dt_set_gpu(void *dt)
 
     if (downstream_dtb) {
         if (fdt_set_float_array(dt, gpu, "apple,core-leak-coef", core_leak, perf_state_table_count))
-            return -1;
+            gpu_fail("FDT: GPU: cannot set leakage coefficients\n");
 
         if (fdt_set_float_array(dt, gpu, "apple,sram-leak-coef", sram_leak, perf_state_table_count))
-            return -1;
+            gpu_fail("FDT: GPU: cannot set leakage coefficients\n");
 
         int len;
         const fdt32_t *opps_ph = fdt_getprop(dt, gpu, "operating-points-v2", &len);
         if (!opps_ph || len != 4)
-            bail("FDT: GPU: operating-points-v2 not found\n");
+            gpu_fail("FDT: GPU: operating-points-v2 not found\n");
 
         int opps = fdt_node_offset_by_phandle(dt, fdt32_ld(opps_ph));
         if (opps < 0)
-            bail("FDT: GPU: node for phandle %u not found\n", fdt32_ld(opps_ph));
+            gpu_fail("FDT: GPU: node for phandle %u not found\n", fdt32_ld(opps_ph));
 
         u32 i = 0;
         int opp;
@@ -4525,23 +4601,24 @@ int dt_set_gpu(void *dt)
             }
 
             if (i >= perf_state_count)
-                bail("FDT: GPU: Expected %d operating points, but found more\n", perf_state_count);
+                gpu_fail("FDT: GPU: Expected %d operating points, but found more\n",
+                         perf_state_count);
 
             if (fdt_setprop_inplace(dt, opp, "opp-microvolt", &volts,
                                     sizeof(u32) * perf_state_table_count))
-                bail("FDT: GPU: Failed to set opp-microvolt for PS %d\n", i);
+                gpu_fail("FDT: GPU: Failed to set opp-microvolt for PS %d\n", i);
 
             if (fdt_setprop_inplace_u64(dt, opp, "opp-hz", perf_states[i].freq))
-                bail("FDT: GPU: Failed to set opp-hz for PS %d\n", i);
+                gpu_fail("FDT: GPU: Failed to set opp-hz for PS %d\n", i);
 
             if (fdt_setprop_inplace_u32(dt, opp, "opp-microwatt", max_pwr[i]))
-                bail("FDT: GPU: Failed to set opp-microwatt for PS %d\n", i);
+                gpu_fail("FDT: GPU: Failed to set opp-microwatt for PS %d\n", i);
 
             i++;
         }
 
         if (i != perf_state_count)
-            bail("FDT: GPU: Expected %d operating points, but found %d\n", perf_state_count, i);
+            gpu_fail("FDT: GPU: Expected %d operating points, but found %d\n", perf_state_count, i);
 
         if (has_cs_afr) {
             int ret = fdt_set_aux_opp(dt, gpu, "apple,cs-opp", perf_states_cs, dies);
@@ -4561,6 +4638,15 @@ int dt_set_gpu(void *dt)
         }
     }
 
+#undef gpu_fail
+
+    if (handoff) {
+        if (!dt_set_gpu_g14g_handoff(dt, handoff))
+            return 0;
+        printf("FDT: GPU: firmware %s handoff not published\n", handoff->string);
+        return gpu_leave_disabled(dt, sgx);
+    }
+
     if (dt_set_region(dt, sgx, "gfx-handoff", "/reserved-memory/uat-handoff"))
         return -1;
     if (dt_set_region(dt, sgx, "gfx-shared-region", "/reserved-memory/uat-pagetables"))
@@ -4575,21 +4661,6 @@ int dt_set_gpu(void *dt)
         return 0;
     }
 
-    const struct fw_version_info *compat;
-
-    switch (os_firmware.version) {
-        case V12_3_1:
-            compat = &fw_versions[V12_3];
-            break;
-        case V13_5B4:
-        case V13_6_1:
-            compat = &fw_versions[V13_5];
-            break;
-        default:
-            compat = &os_firmware;
-            break;
-    }
-
     if (downstream_dtb) {
         if (firmware_set_fdt(dt, gpu, "apple,firmware-version", &os_firmware))
             return -1;
@@ -4598,11 +4669,6 @@ int dt_set_gpu(void *dt)
     }
     // Ignoring errors for old dts compat
     firmware_set_fdt(dt, gpu, "apple,firmware-abi", compat);
-
-    size_t data_a_size, data_b_size, globals_size;
-    if (rust_gpu_initdata_size(compat->num[0], compat->num[1], &data_a_size, &data_b_size,
-                               &globals_size) == -1)
-        return -1;
 
     void *data_a = (void *)top_of_memory_alloc(ALIGN_UP(data_a_size, SZ_16K));
     void *data_b = (void *)top_of_memory_alloc(ALIGN_UP(data_b_size, SZ_16K));

@@ -31,6 +31,8 @@ int kboot_set_uboot(const char *name, const char *value);
 int dt_gpu_t8122_26_calibrate(void *dt);
 void t8122_read_powered_identity(void *dt, int gpu);
 int dt_set_gpu_t8122_26(void *dt);
+struct fw_version_info;
+int dt_set_gpu_g14g_handoff(void *dt, const struct fw_version_info *image);
 int kboot_prepare_dt(void *fdt);
 int kboot_boot(void *kernel);
 /* Reserve the DMA a USB controller that could not be stopped keeps (main.c, after USB shutdown). */
