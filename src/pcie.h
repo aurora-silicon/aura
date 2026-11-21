@@ -27,7 +27,8 @@ int pcie_ans_power_on(void);
  *
  * PCIE_RESET_TO_CONFIG_MS: PCIe Base r6.0 6.6.1: with a port faster than 5 GT/s, at least 100 ms
  * after link training completes before the first Configuration Request. The ADT bridge states it
- * too, as perst-to-config (ms); pcie_adt_perst_to_config_ms() takes the longer of the two.
+ * too, as perst-to-config (ms); pcie_adt_perst_to_config_ms() takes the longer of the two, capped at
+ * PCIE_RESET_READY_MS.
  *
  * PCIE_RESET_READY_MS: PCIe Base r6.0 6.6.1: a function completes Configuration Requests
  * successfully within 1.0 s of a Conventional Reset. Until then it answers with Request Retry
@@ -37,7 +38,7 @@ int pcie_ans_power_on(void);
 #define PCIE_RESET_TO_CONFIG_MS 100
 #define PCIE_RESET_READY_MS     1000
 
-/* The ADT bridge's perst-to-config in ms, at least PCIE_RESET_TO_CONFIG_MS */
+/* The ADT bridge's perst-to-config in ms, at least PCIE_RESET_TO_CONFIG_MS and at most PCIE_RESET_READY_MS */
 u32 pcie_adt_perst_to_config_ms(const char *bridge);
 /* Wait up to PCIE_RESET_READY_MS for the function at `cfg` to answer config space; *id gets its
  * vendor/device word. -1, and a log line, if it never does. */
