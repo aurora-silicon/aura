@@ -806,6 +806,23 @@ static int pcie_init_controller(int controller, const char *path, bool ans_off)
 
         printf("pcie: Initializing port %d\n", port);
 
+        /*
+         * The port's registers are found by its index, which assumes the bridge sits at device
+         * number == port. The bridge's reg holds its device number (phys.hi bits 15:11, as in the
+         * PCI bus binding), so say so when the two differ instead of setting up another port.
+         */
+        if (controller == APCIE) {
+            u32 reg_len = 0, phys_hi;
+            const void *bridge_reg = adt_getprop(adt, bridge_offset, "reg", &reg_len);
+
+            if (bridge_reg && reg_len >= sizeof(phys_hi)) {
+                memcpy(&phys_hi, bridge_reg, sizeof(phys_hi));
+                if (((phys_hi >> 11) & 0x1f) != port)
+                    printf("pcie: %s is device %u, not port %u\n", bridge, (phys_hi >> 11) & 0x1f,
+                           port);
+            }
+        }
+
         if (adt_get_reg(adt, adt_path, "reg",
                         port * port_reg_cnt + state->pcie_regs->shared_reg_count,
                         &state->port_base[port], NULL)) {
