@@ -3443,25 +3443,6 @@ static bool adt_acio_is_v2(int adt_node)
     return adt_is_compatible(adt, adt_node, "acio,v2");
 }
 
-/*
- * Which /arm-io/acioN register is the root complex block that the DT names
- * its cio@ node after. v1 routers list a 0x30004 window ahead of it (reg 2),
- * v2 routers drop that window (reg 1).
- */
-static int adt_acio_rc_regnum(void)
-{
-    char adt_path[32];
-
-    for (int i = 0; i < MAX_CIO_DEVS; ++i) {
-        snprintf(adt_path, sizeof(adt_path), "/arm-io/acio%d", i);
-        int node = adt_path_offset(adt, adt_path);
-        if (node >= 0)
-            return adt_acio_is_v2(node) ? 1 : 2;
-    }
-
-    return 2;
-}
-
 static int dt_set_acio_tunables(void)
 {
     char adt_path[32];
@@ -9994,15 +9975,23 @@ static int dt_disable_missing_j700_touch_id(void)
     return 0;
 }
 
-static int dt_disable_missing_devs(const char *adt_prefix, const char *dt_prefix, int max_devs,
-                                   int regnum)
+/*
+ * Disable every DT device of a kind (dt_prefix) whose address is none of the register windows of
+ * the ADT's devices of that kind (adt_prefix). The DT names a node after one window of its device,
+ * and which one depends on the block (an ACIO v1 router lists a window ahead of its root complex,
+ * v2 does not), so every window counts: no two devices of a kind share one (checked on the ADTs of
+ * every Mac in the 27.2.1 IPSW).
+ */
+static int dt_disable_missing_devs(const char *adt_prefix, const char *dt_prefix, int max_devs)
 {
+    /* Windows kept per ADT device: the most any Mac's usb-drd, acio or i2c lists is 10. */
+    enum { MAX_REGS = 16 };
     int ret = -1;
     int adt_prefix_len = strlen(adt_prefix);
     int dt_prefix_len = strlen(dt_prefix);
 
-    int acnt = 0, phcnt = 0;
-    u64 *addrs = calloc(max_devs, sizeof(u64));
+    int acnt = 0, ndevs = 0, phcnt = 0;
+    u64 *addrs = calloc(max_devs * MAX_REGS, sizeof(u64));
     u32 *phandles = calloc(max_devs * 5, sizeof(u32)); // Allow up to 5 extra nodes per device
     if (!addrs || !phandles)
         bail_cleanup("FDT: out of memory\n");
@@ -10036,12 +10025,20 @@ static int dt_disable_missing_devs(const char *adt_prefix, const char *dt_prefix
         if (name[adt_prefix_len] && (name[adt_prefix_len] < '0' || name[adt_prefix_len] > '9'))
             continue;
 
-        if (acnt >= max_devs)
+        if (ndevs++ >= max_devs)
             bail_cleanup("ADT: too many /arm-io/%s devices\n", adt_prefix);
 
         path[pp] = node;
-        if (adt_get_reg(adt, path, "reg", regnum, &addrs[acnt++], NULL) < 0)
+        int nregs = 0;
+        while (nregs < MAX_REGS &&
+               adt_get_reg(adt, path, "reg", nregs, &addrs[acnt + nregs], NULL) >= 0)
+            nregs++;
+        if (!nregs)
             bail_cleanup("Error getting /arm-io/%s regs\n", name);
+        if (nregs == MAX_REGS && adt_get_reg(adt, path, "reg", nregs, &(u64){0}, NULL) >= 0)
+            printf("ADT: /arm-io/%s: only its first %d register windows are matched\n", name,
+                   MAX_REGS);
+        acnt += nregs;
     }
 
     for (u32 die = 0; die < die_count; ++die) {
@@ -11939,11 +11936,11 @@ int kboot_prepare_dt(void *fdt)
         return -1;
     if (dt_set_ipd())
         return -1;
-    if (dt_disable_missing_devs("usb-drd", "usb@", 8, 0))
+    if (dt_disable_missing_devs("usb-drd", "usb@", 8))
         return -1;
-    if (dt_disable_missing_devs("acio", "cio@", 8, adt_acio_rc_regnum()))
+    if (dt_disable_missing_devs("acio", "cio@", 8))
         return -1;
-    if (dt_disable_missing_devs("i2c", "i2c@", 16, 0)) /* T6050 has nine */
+    if (dt_disable_missing_devs("i2c", "i2c@", 16)) /* T6050 has nine */
         return -1;
     if (dt_disable_missing_j700_touch_id())
         return -1;
