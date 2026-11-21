@@ -17,6 +17,8 @@
  */
 
 static void *heap_base;
+/* Where the heap started: this stage's allocations are [heap_start, heap_base). */
+static uintptr_t heap_start;
 static void *heap_limit;
 
 void heapblock_init(void)
@@ -27,6 +29,7 @@ void heapblock_init(void)
     if (sptm_virt_heap_window(&carveout_base, &carveout_limit)) {
         heap_base = (void *)carveout_base;
         heapblock_alloc(0); // align base
+        heap_start = (uintptr_t)heap_base;
         printf("Heap base (SPTM-virt carve-out): %p\n", heap_base);
         heapblock_set_limit((void *)carveout_limit);
         return;
@@ -34,6 +37,7 @@ void heapblock_init(void)
 
     heap_base = (void *)cur_boot_args.top_of_kernel_data;
     heapblock_alloc(0); // align base
+    heap_start = (uintptr_t)heap_base;
 
     printf("Heap base: %p\n", heap_base);
 }
@@ -59,6 +63,11 @@ bool heapblock_raise_base(uintptr_t base)
         return false;
     heap_base = (void *)base;
     return true;
+}
+
+uintptr_t heapblock_start(void)
+{
+    return heap_start;
 }
 
 uintptr_t heapblock_high_water(void)

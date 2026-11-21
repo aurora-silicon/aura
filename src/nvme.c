@@ -4,6 +4,7 @@
 
 #include "adt.h"
 #include "assert.h"
+#include "heapblock.h"
 #include "malloc.h"
 #include "nvme.h"
 #include "pcie.h"
@@ -641,6 +642,71 @@ bool nvme_io_failed(void)
     return nvme_reboot_required || ioq.failed || adminq.failed;
 }
 
+/*
+ * What an aura stage gave ANS: its RTKit buffers, in the OS's DRAM (cur_boot_args), outside the
+ * firmware's own segments. iBoot's entries (MMIO pages, its carve-outs) are the rest.
+ */
+static bool nvme_aura_memory(int nub, u64 pa, u64 size)
+{
+    u32 len = 0;
+    const u8 *seg = adt_getprop(adt, nub, "segment-ranges", &len);
+    struct adt_segment_ranges r;
+
+    if (pa < cur_boot_args.phys_base ||
+        pa + size > cur_boot_args.phys_base + cur_boot_args.mem_size)
+        return false;
+    for (u32 off = 0; seg && off + sizeof(r) <= len; off += sizeof(r)) {
+        memcpy(&r, seg + off, sizeof(r));
+        if (pa < r.phys + r.size && r.phys < pa + size)
+            return false;
+    }
+    return true;
+}
+
+/*
+ * Post-M4, from off: the firmware resumes from the idle the stage that powered it off left it in,
+ * with the RTKit buffers that stage gave it (Stage 1 1.0.0b13's, in its dead heap once this image
+ * replaced it in place), and asks this stage for none. Their SART entries go back with iBoot's:
+ * without them its start stalls ("timed out waiting for IOP power state 0x20", M4 mini 11-20; the
+ * HV's cold path, hv25). This stage must then never allocate them: refuse one inside this image or
+ * among this stage's allocations so far, and raise the heap above the rest. The OS gets them
+ * reserved with every live SART range (kboot).
+ */
+static bool nvme_keep_stage_buffers(void)
+{
+    int nub = adt_path_offset(adt, "/arm-io/ans/iop-ans-nub");
+    uintptr_t hstart = heapblock_start();
+
+    for (int i = 0; nub >= 0 && i < nvme_sart_saved_cnt; i++) {
+        const struct sart_entry *e = &nvme_sart_saved[i];
+        u64 end = e->paddr + e->size;
+
+        if (!nvme_aura_memory(nub, e->paddr, e->size))
+            continue;
+        uintptr_t top = heapblock_high_water();
+        if (end <= e->paddr || (e->paddr < (u64)_end && (u64)_base < end)) {
+            printf("nvme: SART entry %u 0x%lx+0x%lx: an earlier stage's buffer inside this "
+                   "image: refusing the start\n",
+                   e->index, e->paddr, e->size);
+            return false;
+        }
+        if (e->paddr < top && hstart < end) {
+            printf("nvme: SART entry %u 0x%lx+0x%lx: an earlier stage's buffer among this stage's "
+                   "allocations [0x%lx, 0x%lx): refusing the start\n",
+                   e->index, e->paddr, e->size, hstart, top);
+            return false;
+        }
+        if (end > top && !heapblock_raise_base(ALIGN_UP(end, SZ_16K))) {
+            printf("nvme: SART entry %u 0x%lx+0x%lx: couldn't keep the heap off it\n", e->index,
+                   e->paddr, e->size);
+            return false;
+        }
+        printf("nvme: SART entry %u 0x%lx+0x%lx: an earlier stage's buffer, kept%s\n", e->index,
+               e->paddr, e->size, end > top ? "; the heap now starts above it" : "");
+    }
+    return true;
+}
+
 bool nvme_init(void)
 {
     if (nvme_reboot_required) {
@@ -773,6 +839,8 @@ bool nvme_init(void)
 
     if (nvme_type == NVME_T8132 && !nvme_secure_regs) {
         /* ANS that an earlier owner powered off has nothing to read until its power is back. */
+        if (nvme_sart_saved_cnt && !nvme_keep_stage_buffers())
+            goto out_asc;
         if (nvme_sart_saved_cnt && pcie_ans_power_on()) {
             printf("nvme: couldn't power ANS back on\n");
             goto out_asc;
@@ -1382,27 +1450,6 @@ bool nvme_write(u32 nsid, u64 lba, const void *buffer)
 }
 
 #ifdef SPTM_VIRT
-/*
- * What an aura stage gave ANS: its RTKit buffers, in the OS's DRAM (cur_boot_args), outside the
- * firmware's own segments. iBoot's entries (MMIO pages, its carve-outs) stay for XNU.
- */
-static bool nvme_aura_memory(int nub, u64 pa, u64 size)
-{
-    u32 len = 0;
-    const u8 *seg = adt_getprop(adt, nub, "segment-ranges", &len);
-    struct adt_segment_ranges r;
-
-    if (pa < cur_boot_args.phys_base ||
-        pa + size > cur_boot_args.phys_base + cur_boot_args.mem_size)
-        return false;
-    for (u32 off = 0; seg && off + sizeof(r) <= len; off += sizeof(r)) {
-        memcpy(&r, seg + off, sizeof(r));
-        if (pa < r.phys + r.size && r.phys < pa + size)
-            return false;
-    }
-    return true;
-}
-
 #define NVME_SART_ENTRIES 16
 
 /* A reset of ANS's own gate (on T8140 its ADT gate is APCIE_SYS_ST-V); SART entries put back. */
