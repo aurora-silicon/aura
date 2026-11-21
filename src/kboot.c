@@ -8113,6 +8113,7 @@ struct j713_display_maps {
     const struct adt_segment_ranges *segments;
     u32 count;
     u64 bytes[32];
+    u64 fb_base, fb_size; /* the retained framebuffer a stream may also map; none when 0 */
 };
 
 static int j713_display_page(u64 iova, u64 physical, void *opaque)
@@ -8129,11 +8130,20 @@ static int j713_display_page(u64 iova, u64 physical, void *opaque)
         maps->bytes[i] += SZ_16K;
         return 0;
     }
+    if (physical >= maps->fb_base && physical - maps->fb_base < maps->fb_size)
+        return 0;
     return -1; /* Never drop an inherited mapping that we cannot describe. */
 }
 
+/*
+ * Describe the display frontend's inherited mappings: SID0 (disp0) and SID16 (PIODMA) of the
+ * display DART. With a panel SID0 maps two DCP segments, and the devices are enabled. With an
+ * HDMI DCP (hdmi) SID0 maps one segment and may still map pages of the retained framebuffer
+ * (/vram), which disp0 is given as a "framebuffer" region; the devices are left as the tree
+ * has them, and a tree that already describes disp0 is not changed.
+ */
 static int dt_set_j713_display_maps(const struct adt_segment_ranges *segments, u32 count,
-                                    u64 dram_start, u64 dram_size)
+                                    u64 dram_start, u64 dram_size, bool hdmi)
 {
     const char *aliases[] = {"disp0", "disp0_piodma"};
     const u8 streams[] = {0, 16};
@@ -8142,6 +8152,16 @@ static int dt_set_j713_display_maps(const struct adt_segment_ranges *segments, u
         {.segments = segments, .count = count},
     };
     u32 phandles[2];
+
+    if (hdmi) {
+        int vram_path[8], disp0 = fdt_path_offset(dt, "disp0");
+        if (disp0 >= 0 && fdt_getprop(dt, disp0, "memory-region", NULL))
+            return 0;
+        if (adt_path_offset_trace(adt, "/vram", vram_path) < 0 ||
+            adt_get_reg(adt, vram_path, "reg", 0, &maps[0].fb_base, &maps[0].fb_size) < 0 ||
+            !maps[0].fb_size || (maps[0].fb_base | maps[0].fb_size) & (SZ_16K - 1))
+            return -1;
+    }
 
     /* The T8132 disp0 DART (every M4 ADT); reading tables must not enable/reset streams. */
     for (u32 n = 0; n < 2; n++) {
@@ -8156,7 +8176,7 @@ static int dt_set_j713_display_maps(const struct adt_segment_ranges *segments, u
                 return -1;
             regions++;
         }
-        if (regions != (n == 0 ? 2 : 1))
+        if (regions != (n == 0 && !hdmi ? 2 : 1))
             return -1;
     }
 
@@ -8188,9 +8208,22 @@ static int dt_set_j713_display_maps(const struct adt_segment_ranges *segments, u
                 return -1;
         }
         for (u32 n = 0; n < 2; n++) {
-            if (maps[n].bytes[i] && dt_device_add_mem_region(aliases[n], phandle, NULL))
+            if (maps[n].bytes[i] &&
+                dt_device_add_mem_region(aliases[n], phandle, hdmi ? name : NULL))
                 return -1;
         }
+    }
+    if (hdmi) {
+        char name[64];
+        snprintf(name, sizeof(name), "framebuffer@%lx", maps[0].fb_base);
+        int node = dt_get_or_add_reserved_mem(name, "apple,asc-mem", true, maps[0].fb_base,
+                                              maps[0].fb_size);
+        if (node < 0 || dt_device_add_mem_region("disp0", fdt_get_phandle(dt, node), "framebuffer"))
+            return -1;
+        printf("FDT: M4 HDMI DISP0 SID0/SID16 mappings and framebuffer [0x%lx, +0x%lx) "
+               "published\n",
+               maps[0].fb_base, maps[0].fb_size);
+        return 0;
     }
     int piodma = fdt_path_offset(dt, "disp0_piodma");
     int dart = dt_get_iommu_node(piodma, 0);
@@ -8218,8 +8251,21 @@ static int dt_set_j713_display_maps(const struct adt_segment_ranges *segments, u
 }
 
 /*
+ * A T8132 Mac without a panel (the Mac mini) drives a fixed HDMI port from its main DCP. The
+ * tree says so on the DCP node; the ADT says so with disp0's "external".
+ */
+static bool dt_dcp_is_hdmi(int dcp_node)
+{
+    int len;
+    const char *type = fdt_getprop(dt, dcp_node, "apple,connector-type", &len);
+    return type && len == sizeof("HDMI-A") && !memcmp(type, "HDMI-A", len);
+}
+
+/*
  * Publish the inherited DCP firmware mapping without starting a display driver: on the J713
- * on any firmware as before, and on any other M4 Mac with a panel on 26.6.2.
+ * on any firmware as before, on any other M4 Mac with a panel on 26.6.2, and on any T8132 tree
+ * whose DCP drives an HDMI port when the ADT's disp0 is external too. All take the same path:
+ * the reservations come from the ADT's segment list.
  */
 static int dt_set_m4_dcp_handoff(void)
 {
@@ -8227,15 +8273,22 @@ static int dt_set_m4_dcp_handoff(void)
     if (dcp_node < 0)
         return 0; /* Older DT with simple-framebuffer only. */
     bool j713 = !fdt_node_check_compatible(dt, 0, "apple,j713");
-    if (chip_id != T8132 || (!j713 && os_firmware.version != V26_6_2) ||
+    bool hdmi = dt_dcp_is_hdmi(dcp_node);
+    if (chip_id != T8132 || (!j713 && !hdmi && os_firmware.version != V26_6_2) ||
         fdt_node_check_compatible(dt, dcp_node, "apple,t8132-dcp"))
         bail("FDT: unsupported native DCP handoff target\n");
-    /* The Mac mini's disp0 is external: its DCP drives a port, not a panel. */
+    /* A tree and a machine that disagree about what the DCP drives get no handoff. */
     if (!j713) {
         int disp0 = adt_path_offset(adt, "/arm-io/disp0");
-        if (disp0 < 0 || adt_getprop(adt, disp0, "external", NULL))
+        bool external = disp0 >= 0 && adt_getprop(adt, disp0, "external", NULL);
+        if (disp0 < 0 || (external && !hdmi))
             bail("FDT: no internal panel, no native DCP handoff\n");
+        if (hdmi && !external)
+            bail("FDT: HDMI DCP in the tree but a panel in the ADT, no native DCP handoff\n");
     }
+    /* The reservations below are appended: a tree that already lists some would double them. */
+    if (hdmi && fdt_getprop(dt, dcp_node, "memory-region", NULL))
+        bail("FDT: HDMI DCP already has memory-region in the tree, no native DCP handoff\n");
 
     int nub = adt_path_offset(adt, "/arm-io/dcp/iop-dcp-nub");
     if (nub < 0)
@@ -8282,14 +8335,18 @@ static int dt_set_m4_dcp_handoff(void)
         return ret;
 
     dcp_node = fdt_path_offset(dt, "dcp");
-    if (fdt_getprop(dt, dcp_node, "apple,j713-native-piodma", NULL)) {
+    if (!hdmi && fdt_getprop(dt, dcp_node, "apple,j713-native-piodma", NULL)) {
         /* The DCP image is per firmware, the same on every M4 Mac. */
         if (os_firmware.version != V26_6_2 ||
-            dt_set_j713_display_maps(segments, count, dram_start, dram_size))
+            dt_set_j713_display_maps(segments, count, dram_start, dram_size, false))
             printf("FDT: M4 PIODMA handoff unqualified; retaining disabled device\n");
     }
+    /* Fail-soft: without it the kernel only leaves the display frontend alone. */
+    if (hdmi && dt_set_j713_display_maps(segments, count, dram_start, dram_size, true))
+        printf("FDT: M4 HDMI display frontend regions refused; DCP mappings kept\n");
 
-    printf("FDT: M4 DCP firmware mappings published; display device status unchanged\n");
+    printf("FDT: M4 DCP firmware mappings published%s; display device status unchanged\n",
+           hdmi ? " (HDMI DCP, external disp0)" : "");
     return 0;
 }
 
@@ -9389,30 +9446,46 @@ static int dt_reserve_t8132_aop_windows(const char *path)
     return 0;
 }
 
+/* dt_display_transaction has an integer-only callback; the handoff is single-threaded. */
+static const char *t8132_aop_path;
+
 /*
- * J713 and J604: iBoot leaves the AOP halted, its DART's DAPF empty, its
+ * Every FDT edit of the AOP handoff, then the one hardware write, last: the DAPF is programmed
+ * only once the segments and windows are reserved, and dapf_init_t8132_halted() puts every
+ * slice back if its own read-back fails. Run as a transaction, so a failure at any step leaves
+ * neither the tree nor the DAPF half done.
+ */
+static int dt_set_t8132_aop_one(unsigned int unused)
+{
+    UNUSED(unused);
+    if (dt_reserve_asc_segments("/arm-io/aop/iop-aop-nub", NULL, t8132_aop_path, true, 0, true))
+        bail("FDT: %s: AOP firmware segments are not reserved\n", t8132_aop_path);
+    if (dt_reserve_t8132_aop_windows(t8132_aop_path))
+        bail("FDT: %s: AOP DAPF windows are not reserved\n", t8132_aop_path);
+    if (dapf_init_t8132_halted("/arm-io/dart-aop", 1))
+        bail("FDT: %s: AOP DAPF is not programmed\n", t8132_aop_path);
+    return 0;
+}
+
+/*
+ * T8132: iBoot leaves the AOP halted, its DART's DAPF empty, its
  * external code (__ETEXT) in DRAM at a fixed address and its log (__OS_LOG) at
- * a new one every boot. When the OS asks for the AOP's handoff, program the
- * DAPF, then reserve both segments at the IOVAs the firmware uses (their remap
- * addresses: EC0p for __ETEXT, the physical address for __OS_LOG) and the
- * DAPF windows. Without all of it the firmware cannot run, so on any failure
- * the AOP is disabled.
+ * a new one every boot. When the OS asks for the AOP's handoff, reserve both
+ * segments at the IOVAs the firmware uses (their remap addresses: EC0p for
+ * __ETEXT, the physical address for __OS_LOG) and the DAPF windows, then
+ * program the DAPF. Without all of it the firmware cannot run, so on any
+ * failure the AOP is disabled. Nothing here depends on the board. A tree that
+ * does not ask for the handoff is left as it is.
  */
 static int dt_set_t8132_aop(const char *path)
 {
     const char *why;
     int node;
 
-    if (fdt_node_check_compatible(dt, 0, "apple,j713") &&
-        fdt_node_check_compatible(dt, 0, "apple,j604"))
-        return 0; /* No other M4 board's AOP handoff is qualified. */
-
     int chosen = fdt_path_offset(dt, "/chosen");
     if (chosen < 0 ||
-        fdt_stringlist_search(dt, chosen, "linux-enablement-mac,dapf-handoff", "/arm-io/aop") < 0) {
-        why = "its handoff was not requested";
-        goto disable;
-    }
+        fdt_stringlist_search(dt, chosen, "linux-enablement-mac,dapf-handoff", "/arm-io/aop") < 0)
+        return 0;
 
     asc_dev_t *asc = asc_init("/arm-io/aop");
     if (!asc) {
@@ -9426,16 +9499,11 @@ static int dt_set_t8132_aop(const char *path)
         goto disable;
     }
 
-    if (dapf_init_t8132_halted("/arm-io/dart-aop", 1)) {
-        why = "its DAPF is not programmed";
-        goto disable;
-    }
-    if (dt_reserve_asc_segments("/arm-io/aop/iop-aop-nub", NULL, path, true, 0, true)) {
-        why = "its firmware segments are not reserved";
-        goto disable;
-    }
-    if (dt_reserve_t8132_aop_windows(path)) {
-        why = "its DAPF windows are not reserved";
+    t8132_aop_path = path;
+    int ret = dt_display_transaction(dt_set_t8132_aop_one, 0);
+    t8132_aop_path = NULL;
+    if (ret) {
+        why = "its handoff is incomplete";
         goto disable;
     }
 
@@ -12333,6 +12401,12 @@ int kboot_prepare_dt(void *fdt)
         return -1;
     if (dt_set_aop_firmware())
         return -1;
+    /*
+     * Before dt_set_isp(): on a Mac with no ISP in its ADT that disables the ISP but not its
+     * DARTs, and this rule leaves an ISP that is already disabled as it is.
+     */
+    if (dt_disable_t8132_absent_isp(dt))
+        printf("FDT: T8132 absent-ISP rule failed; the ISP nodes stay as the tree has them\n");
     if (dt_set_isp())
         return -1;
     dt_set_j713_isp();

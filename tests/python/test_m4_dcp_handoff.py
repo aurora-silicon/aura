@@ -2,7 +2,12 @@
 """Run the M4 internal DCP handoff, with production kboot code and real FDTs, per board.
 
 Each board's DCP segment list is the one its ADT carries (the J713 on 26.5.1, the J604 and
-the J773g on 26.6.2, the J715 on 27.0). The handed-over trees are written out as DTBs.
+the J773g on 26.6.2, the J715 on 27.0, the J773g again on the 27.2 stub). The handed-over trees
+are written out as DTBs.
+
+The Mac mini has no panel. Its handoff is decided by two properties, not by its name: the
+tree's DCP says apple,connector-type = "HDMI-A" and the ADT's disp0 is external. The test gives
+those two properties to trees of other names and takes them away from the J773g's.
 """
 
 import re
@@ -31,6 +36,7 @@ def test_m4_dcp_handoff_follows_the_firmware_and_the_panel(tmp_path):
         function(kboot, "dt_device_add_mem_region") + function(kboot, "dt_set_dcp_firmware") +
         function(kboot, "dt_reserve_asc_segments_at") + function(kboot, "dt_reserve_asc_segments") + function(kboot, "dt_reserve_asc_firmware") +
         maps + function(kboot, "j713_display_page") + function(kboot, "dt_set_j713_display_maps") +
+        function(kboot, "dt_dcp_is_hdmi", "static bool ") +
         function(kboot, "dt_set_m4_dcp_handoff"))
     production = function(firmware, "firmware_set_fdt", "int ") + production
     assert not re.search(r"\bdt_set_j713_dcp_handoff\b", kboot)
@@ -57,7 +63,7 @@ typedef uint8_t u8;
 #define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
 #define bail(...) do { printf(__VA_ARGS__); return -1; } while (0)
 enum fw_version { V12_3, V12_3_1, V12_4, V13_5B4, V13_5, V13_6_1, V14_7, V26_5, V26_6, V26_6_2,
-                  V27_0 };
+                  V27_0, V27_2 };
 struct fw_version_info {
     enum fw_version version;
     const char *string;
@@ -73,6 +79,7 @@ static const struct fw_version_info fw_versions[] = {
     [V26_6] = {V26_6, "26.6", {26, 6, 0}, 3, ""},
     [V26_6_2] = {V26_6_2, "26.6.2", {26, 6, 2}, 3, ""},
     [V27_0] = {V27_0, "27.0", {27, 0, 0}, 2, ""},
+    [V27_2] = {V27_2, "27.2", {27, 2, 0}, 2, ""},
 };
 static struct fw_version_info os_firmware;
 ''' + layout + r'''
@@ -87,6 +94,7 @@ struct board {
     bool native;  /* the DT asks for PIODMA and scanout (t8132-laptop.dtsi) */
     unsigned count;
     struct adt_segment_ranges segs[7];
+    bool hdmi;    /* the DT's DCP has apple,connector-type = "HDMI-A" */
 };
 #define FW2662 "81BAF476-679D-3CC0-8C6A-E6B6FA659D5E"
 #define SEG(p, i, r, s, f) {.phys = p, .iova = i, .remap = r, .size = s, .unk = f}
@@ -124,10 +132,35 @@ static const struct board j773g = {"j773g", FW2662, 16UL << 30, 1, false, 6, { /
     SEG(0x103e5c18000, NONE, 0x10001b88000, 0x4000, 2),
     SEG(0x103e5b58000, NONE, 0x10001b8c000, 0xc0000, 2)}};
 
+/* The same machine on the macOS 27.2 (26B123) stub: another image, an OS log of 0x26000. */
+static const struct board j773g_272 = {"j773g", "B3BA603C-3CA7-3E21-B393-44EB20BD2AEF",
+                                       16UL << 30, 1, false, 6, {
+    SEG(0x100002a8000, 0, 0x10001c4c000, 0x843000, 1),
+    SEG(0x103e4f90000, 0x843000, 0x10002490000, 0x32c000, 0),
+    SEG(0x1000de0c000, 0xb6f000, 0x1000de0c000, 0x26000, 10),
+    SEG(0x103e5c1c000, NONE, 0x10000b70000, 0x1000000, 2),
+    SEG(0x103e5c18000, NONE, 0x10001b88000, 0x4000, 2),
+    SEG(0x103e5b58000, NONE, 0x10001b8c000, 0xc0000, 2)}};
+
 static struct board b;
 static u64 dram_base = 0x10000000000UL;
 static const u32 one = 1;
 static int walks;
+static bool hdmi_scanout, hdmi_stray, hdmi_partial, hdmi_two, hdmi_fb16, hdmi_wrongphys;
+/* /vram: the retained scanout framebuffer an HDMI DCP's SID0 may still map. */
+static u64 vram_base = 0x103e5300000UL, vram_size = 0x854000;
+static int adt_path_offset_trace(void *tree, const char *path, int *trace)
+{
+    if (strcmp(path, "/vram")) return -1;
+    trace[0] = 4; trace[1] = 0;
+    return 4;
+}
+static int adt_get_reg(void *tree, int *path, const char *prop, int index, u64 *base, u64 *size)
+{
+    if (path[0] != 4 || strcmp(prop, "reg") || index) return -1;
+    *base = vram_base; *size = vram_size;
+    return 0;
+}
 static int adt_path_offset(void *tree, const char *path)
 {
     if (!strcmp(path, "/chosen")) return 1;
@@ -168,6 +201,29 @@ static int dart_walk_locked_t8110(uintptr_t base, u64 size, u8 sid, u64 dram_sta
 {
     assert(base == 0x30a300000 && size == 0xc000 && (sid == 0 || sid == 16));
     walks++;
+    if (b.hdmi) {
+        /* As read on a J773g: SID0 maps segment 4 and, while still scanned out, framebuffer
+         * pages; SID16 maps segment 5. */
+        const struct adt_segment_ranges *s = &b.segs[sid == 0 ? 4 : 5];
+        u64 span = ALIGN_UP((u64)s->size, SZ_16K) - (sid == 16 && hdmi_partial ? SZ_16K : 0);
+        for (u64 at = 0; at < span; at += SZ_16K)
+            if (visit((s->remap & ((1UL << 36) - 1)) + at,
+                      s->phys + at + (hdmi_wrongphys && at == 0 ? SZ_16K : 0), opaque))
+                return -1;
+        if (sid == 0 && hdmi_two) /* a second whole segment in SID0 */
+            for (u64 at = 0; at < b.segs[5].size; at += SZ_16K)
+                if (visit((b.segs[5].remap & ((1UL << 36) - 1)) + at, b.segs[5].phys + at, opaque))
+                    return -1;
+        if (sid == 16 && hdmi_fb16) /* the PIODMA stream may not map the framebuffer */
+            return visit(0x80000000UL, vram_base, opaque);
+        if (sid == 0 && hdmi_scanout)
+            for (u64 at = 0; at < 0x2c4000; at += SZ_16K)
+                if (visit(0x80000000UL + at, vram_base + at, opaque))
+                    return -1;
+        if (sid == 0 && hdmi_stray)
+            return visit(0x90000000UL, 0x103e0000000UL, opaque);
+        return 0;
+    }
     for (unsigned i = 0, n = 0; i < b.count; i++) {
         if (b.segs[i].unk != 2) continue;
         bool mapped = sid == 0 ? n == 0 || n == 2 : n == 1;
@@ -207,6 +263,8 @@ static void world(const struct board *board, enum fw_version fw)
     assert(!fdt_setprop_string(dt, dcp, "compatible", "apple,t8132-dcp"));
     assert(!fdt_setprop(dt, dcp, "iommus", iommus, sizeof(iommus)));
     assert(!fdt_setprop_string(dt, dcp, "status", "disabled"));
+    if (b.hdmi)
+        assert(!fdt_setprop_string(dt, dcp, "apple,connector-type", "HDMI-A"));
     if (b.native) {
         assert(!fdt_setprop_empty(dt, dcp, "apple,j713-native-piodma"));
         assert(!fdt_setprop_empty(dt, dcp, "apple,j713-native-scanout"));
@@ -246,6 +304,52 @@ static void version_is(const char *name, const u32 *num, size_t count)
     assert(v && len == (int)(count * 4));
     for (size_t i = 0; i < count; i++) assert(fdt32_ld(&v[i]) == num[i]);
 }
+/* Reservation <phandle> is segment seg's, with exactly one tuple of owner at its remap address. */
+static void owns(int owner, u32 phandle, unsigned seg)
+{
+    int len, node = fdt_node_offset_by_phandle(dt, phandle);
+    const fdt64_t *reg = fdt_getprop(dt, node, "reg", &len);
+    assert(reg && fdt64_ld(&reg[0]) == b.segs[seg].phys);
+    const fdt32_t *iova = fdt_getprop(dt, node, "iommu-addresses", &len);
+    unsigned matches = 0;
+    for (int j = 0; iova && j < len / 4; j += 5)
+        if (fdt32_ld(&iova[j]) == fdt_get_phandle(dt, owner)) {
+            assert(((u64)fdt32_ld(&iova[j + 1]) << 32 | fdt32_ld(&iova[j + 2])) == b.segs[seg].remap);
+            matches++;
+        }
+    assert(matches == 1);
+}
+/* The frontend description this loader is meant to produce (a host model, not the kernel). */
+static void frontend_published(void)
+{
+    int disp0 = fdt_path_offset(dt, "disp0"), len;
+    const fdt32_t *mr = fdt_getprop(dt, disp0, "memory-region", &len);
+    assert(mr && len == 8);
+    assert(fdt_stringlist_count(dt, disp0, "memory-region-names") == 2);
+    assert(!strcmp(fdt_stringlist_get(dt, disp0, "memory-region-names", 1, NULL), "framebuffer"));
+    owns(disp0, fdt32_ld(&mr[0]), 4);
+    int fb = fdt_node_offset_by_phandle(dt, fdt32_ld(&mr[1]));
+    const fdt64_t *reg = fdt_getprop(dt, fb, "reg", &len);
+    assert(reg && fdt64_ld(&reg[0]) == vram_base && fdt64_ld(&reg[1]) == vram_size);
+    assert(fdt_getprop(dt, fb, "no-map", NULL) && !fdt_getprop(dt, fb, "iommu-addresses", NULL));
+    assert(!fdt_node_check_compatible(dt, fb, "apple,asc-mem"));
+    int piodma = fdt_path_offset(dt, "disp0_piodma");
+    mr = fdt_getprop(dt, piodma, "memory-region", &len);
+    assert(mr && len == 4);
+    owns(piodma, fdt32_ld(&mr[0]), 5);
+    assert(status_is("/soc/display-subsystem", "disabled")); /* the kernel DT enables it */
+}
+/* The DCP's own regions are there and the frontend is left undescribed. */
+static void frontend_refused(void)
+{
+    assert(!dt_set_m4_dcp_handoff());
+    assert(!fdt_getprop(dt, fdt_path_offset(dt, "disp0"), "memory-region", NULL));
+    assert(!fdt_getprop(dt, fdt_path_offset(dt, "disp0_piodma"), "memory-region", NULL));
+    int len;
+    assert(fdt_getprop(dt, fdt_path_offset(dt, "dcp"), "memory-region", &len) && len == 24);
+    hdmi_stray = hdmi_partial = hdmi_two = hdmi_fb16 = hdmi_wrongphys = false;
+    vram_base = 0x103e5300000UL;
+}
 /* What the kernel's iomfb_m4_init() and the reserved-memory code read. */
 static void published(bool piodma)
 {
@@ -284,8 +388,11 @@ static void published(bool piodma)
     assert(status_is("/soc/display-subsystem", piodma ? "okay" : "disabled"));
     assert(!!fdt_getprop(dt, fdt_path_offset(dt, "disp0"), "apple,j713-inherited-mappings",
                          NULL) == piodma);
-    assert(!!fdt_getprop(dt, fdt_path_offset(dt, "disp0"), "memory-region", NULL) == piodma);
-    assert(walks == (b.native && os_firmware.version == V26_6_2 ? 2 : 0));
+    assert(!!fdt_getprop(dt, fdt_path_offset(dt, "disp0"), "memory-region", NULL) ==
+           (piodma || b.hdmi));
+    assert(walks == ((b.native && os_firmware.version == V26_6_2) || b.hdmi ? 2 : 0));
+    if (b.hdmi)
+        frontend_published();
 }
 static void handed_over(const struct board *board, enum fw_version fw, bool piodma)
 {
@@ -341,12 +448,83 @@ int main(int argc, char **argv)
             refused();
         }
 
-    /* No internal panel: the Mac mini, or no disp0 at all. */
-    world(&j773g, V26_6_2); refused(); save("j773g-26.6.2");
-    world(&j773g, V26_6); refused();
-    struct board bare = j604;
+    /*
+     * An HDMI DCP in the tree and an external disp0 in the ADT: handed over through the same
+     * path, on any firmware and under any board name, followed by the display frontend step.
+     */
+    struct board mini = j773g, mini272 = j773g_272;
+    mini.hdmi = mini272.hdmi = true;
+    handed_over(&mini, V26_6_2, false);
+    handed_over(&mini272, V27_2, false);
+    handed_over(&mini272, V27_0, false);
+    /* The 27.2 OS log is not a 16K multiple: its reservation is rounded up to 0x28000. */
+    world(&mini272, V27_2);
+    assert(!dt_set_m4_dcp_handoff());
+    {
+        int len, node = fdt_subnode_offset(dt, fdt_path_offset(dt, "/reserved-memory"),
+                                           "asc-firmware@1000de0c000");
+        const fdt64_t *reg = fdt_getprop(dt, node, "reg", &len);
+        assert(reg && len == 16 && fdt64_ld(&reg[1]) == 0x28000);
+        assert(fdt_getprop(dt, node, "apple,dcp-os-log", NULL));
+    }
+    struct board renamed = mini272;
+    renamed.name = "j999";
+    handed_over(&renamed, V27_2, false);
+
+    /* Still scanning out of /vram: the same publication. */
+    hdmi_scanout = true;
+    handed_over(&mini, V26_6_2, false);
+    hdmi_scanout = false;
+    /* A page outside the segment and /vram, or a segment only partly mapped: the DCP mappings
+     * stay and the frontend is left undescribed. */
+    world(&mini272, V27_2); hdmi_stray = true; frontend_refused();
+    world(&mini272, V27_2); hdmi_partial = true; frontend_refused();
+    /* SID0 mapping two whole segments; SID16 mapping a framebuffer page; a page of a segment
+     * at the wrong physical address; a /vram that is not page aligned. */
+    world(&mini272, V27_2); hdmi_two = true; frontend_refused();
+    world(&mini272, V27_2); hdmi_fb16 = true; frontend_refused();
+    world(&mini272, V27_2); hdmi_wrongphys = true; frontend_refused();
+    world(&mini272, V27_2); vram_base += 0x1000; frontend_refused();
+    /* A tree that already describes disp0 is left as it is. */
+    world(&mini272, V27_2);
+    assert(!fdt_setprop_u32(dt, fdt_path_offset(dt, "disp0"), "memory-region", 77));
+    assert(!dt_set_m4_dcp_handoff());
+    {
+        int len;
+        const fdt32_t *mr = fdt_getprop(dt, fdt_path_offset(dt, "disp0"), "memory-region", &len);
+        assert(mr && len == 4 && fdt32_ld(mr) == 77);
+        assert(!fdt_getprop(dt, fdt_path_offset(dt, "disp0_piodma"), "memory-region", NULL));
+    }
+
+    /* Either property missing, or the two disagreeing: refused, tree untouched. */
+    world(&j773g, V26_6_2); refused(); save("j773g-no-connector-type"); /* tree does not say HDMI */
+    world(&j773g_272, V27_2); refused();
+    world(&mini272, V27_2);
+    assert(!fdt_setprop_string(dt, fdt_path_offset(dt, "dcp"), "apple,connector-type", "DP"));
+    refused();
+    struct board panel_hdmi = j604; /* HDMI tree, but the ADT has a panel */
+    panel_hdmi.hdmi = true;
+    world(&panel_hdmi, V26_6_2); refused();
+    world(&panel_hdmi, V27_2); refused();
+    struct board bare = j604; /* no disp0 at all */
     bare.external = -1;
     world(&bare, V26_6_2); refused();
+    bare.hdmi = true;
+    world(&bare, V27_2); refused();
+
+    /* An HDMI tree that already lists DCP regions would have them doubled: refused. */
+    world(&mini272, V27_2);
+    assert(!fdt_setprop_u32(dt, fdt_path_offset(dt, "dcp"), "memory-region", 99));
+    refused();
+
+    /* The ADT side incomplete: no image UUID, an empty list, a segment outside DRAM. */
+    struct board broken = mini272;
+    broken.uuid = "";
+    world(&broken, V27_2); refused();
+    broken = mini272; broken.count = 0;
+    world(&broken, V27_2); refused();
+    broken = mini272; broken.segs[5].phys = 0x20000000000UL;
+    world(&broken, V27_2); refused();
 
     /* Not a T8132, or not its DCP. */
     world(&j713, V26_6_2); chip_id = T8122; refused();
@@ -368,7 +546,8 @@ int main(int argc, char **argv)
     lib = ROOT / "src/libfdt"
     subprocess.run(
         ["cc", "-std=gnu11", "-D_GNU_SOURCE", "-Wall", "-Wextra", "-Werror",
-         "-Wno-unused-parameter", "-Wno-unused-function", "-I", str(lib), "-x", "c", "-",
+         "-Wno-unused-parameter", "-Wno-unused-function", "-Wno-missing-field-initializers",
+         "-I", str(lib), "-x", "c", "-",
          *map(str, (lib / f for f in (
              "fdt.c", "fdt_ro.c", "fdt_rw.c", "fdt_sw.c", "fdt_wip.c",
              "fdt_empty_tree.c", "fdt_strerror.c"))), "-o", str(binary)],
@@ -376,7 +555,14 @@ int main(int argc, char **argv)
     )
     result = subprocess.run([str(binary), str(tmp_path)], capture_output=True, text=True)
     assert result.returncode == 0, result.stdout + result.stderr
-    for name in ("j713-26.6.2", "j604-26.6.2", "j715-26.6.2", "j624-26.6.2", "j773g-26.6.2"):
+    for name in ("j713-26.6.2", "j604-26.6.2", "j715-26.6.2", "j624-26.6.2", "j773g-26.6.2",
+                 "j773g-27.2", "j999-27.2", "j773g-no-connector-type"):
         assert (tmp_path / f"{name}.dtb").stat().st_size > 0
     # The refusals say why.
     assert "no internal panel" in result.stdout
+    assert "HDMI DCP in the tree but a panel in the ADT" in result.stdout
+    assert "HDMI DCP already has memory-region" in result.stdout
+    # The line a hardware boot is judged by: once per HDMI handoff, never for a panel Mac.
+    assert result.stdout.count("published (HDMI DCP, external disp0)") == 13
+    assert result.stdout.count("M4 HDMI display frontend regions refused; DCP mappings kept") == 6
+    assert result.stdout.count("M4 HDMI DISP0 SID0/SID16 mappings and framebuffer") == 6
