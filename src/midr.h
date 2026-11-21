@@ -4,32 +4,13 @@
 #define MIDR_H
 
 /* Part IDs in MIDR_EL1 */
-#define MIDR_PART_S5L8960X_CYCLONE       0x1
-#define MIDR_PART_T7000_TYPHOON          0x2
-#define MIDR_PART_T7001_TYPHOON          0x3
-#define MIDR_PART_S8000_TWISTER          0x4
-#define MIDR_PART_S8001_3_TWISTER        0x5
-#define MIDR_PART_T8010_2_HURRICANE      0x6
-#define MIDR_PART_T8011_HURRICANE        0x7
-#define MIDR_PART_T8015_MONSOON          0x8
-#define MIDR_PART_T8015_MISTRAL          0x9
-#define MIDR_PART_T8020_VORTEX           0xb
-#define MIDR_PART_T8020_TEMPSET          0xc
-#define MIDR_PART_T8006_TEMPSET          0xf
-#define MIDR_PART_T8027_VORTEX           0x10
-#define MIDR_PART_T8027_TEMPSET          0x11
-#define MIDR_PART_T8030_LIGHTNING        0x12
-#define MIDR_PART_T8030_THUNDER          0x13
-#define MIDR_PART_T8101_ICESTORM         0x20
 #define MIDR_PART_T8101_FIRESTORM        0x21
 #define MIDR_PART_T8103_ICESTORM         0x22
 #define MIDR_PART_T8103_FIRESTORM        0x23
 #define MIDR_PART_T6000_ICESTORM         0x24
 #define MIDR_PART_T6000_FIRESTORM        0x25
-#define MIDR_PART_T8301_THUNDER          0x26
 #define MIDR_PART_T6001_ICESTORM         0x28
 #define MIDR_PART_T6001_FIRESTORM        0x29
-#define MIDR_PART_T8110_BLIZZARD         0x30
 #define MIDR_PART_T8110_AVALANCHE        0x31
 #define MIDR_PART_T8112_BLIZZARD         0x32
 #define MIDR_PART_T8112_AVALANCHE        0x33

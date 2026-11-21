@@ -32,11 +32,7 @@ struct usb_drd_regs {
 #error "USB_IODEV_COUNT is limited to 100 to prevent overflow in ADT path names"
 #endif
 
-#ifdef USE_DEBUG_USB
-#define FIRST_USB_IODEV 1
-#else
 #define FIRST_USB_IODEV 0
-#endif
 
 // length of the format string is is used as buffer size
 // limits the USB instance numbers to reasonable 2 digits

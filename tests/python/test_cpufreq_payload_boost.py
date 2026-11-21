@@ -25,12 +25,12 @@ def defines(source, code, prefix):
 def test_payload_boost(tmp_path):
     source = (ROOT / 'src/cpufreq.c').read_text()
     cluster = section(source, 'struct cluster_t {', '};') + '};'
-    tables = section(source, 'static const struct cluster_t s5l8960x_clusters[]',
+    tables = section(source, 'static const struct cluster_t t8103_clusters[]',
                      'const struct cluster_t *cpufreq_get_clusters(void)')
     ladder = section(source, 'struct cluster_ladder {', 'static bool cluster_failed[')
     boost = section(source, '/*\n * Loading payloads', 'int cpufreq_init(void)')
     code = tables + ladder + boost
-    macros = defines(source, code, 'CLUSTER_') + '\n' + defines(source, code, 'PMGR_VOLTAGE_CTL_OFF_')
+    macros = defines(source, code, 'CLUSTER_')
     program = r'''
 #include <assert.h>
 #include <stdbool.h>
@@ -167,13 +167,6 @@ int main(void)
         cpufreq_payload_boost(true); cpufreq_payload_boost(false); assert(!calls);
     }
 
-    /* Before T8103 the table programs PMGR voltage control: no raise ahead of cpufreq_init(). */
-    const u32 early[] = {S5L8960X, T7000, S8000, T8010, T8015};
-    for (unsigned i = 0; i < ARRAY_SIZE(early); i++) {
-        machine(early[i], true, false);
-        cpufreq_payload_boost(true); cpufreq_payload_boost(false); assert(!calls);
-    }
-
     /* No table: nothing. */
     machine(0x1234, false, false); cpufreq_payload_boost(true); assert(!calls);
     puts("payload boost and inherited-state restoration passed");
@@ -208,7 +201,7 @@ typedef uint64_t u64;
 #define GENMASK(h, l) ((UINT64_MAX << (l)) & (UINT64_MAX >> (63 - (h))))
 #define FIELD_GET(mask, value) (((value) & (mask)) >> __builtin_ctzll(mask))
 #define FIELD_PREP(mask, value) (((u64)(value) << __builtin_ctzll(mask)) & (mask))
-struct cluster_t { const char *name; u64 base; bool pcluster; u32 apsc_pstate, default_pstate, voltage_ctl; };
+struct cluster_t { const char *name; u64 base; bool pcluster; u32 apsc_pstate, default_pstate; };
 ''' + macros + r'''
 static u32 chip_id = T8140;
 static u64 reg, writes;
@@ -232,7 +225,7 @@ static int poll64(u64 addr, u64 mask, u64 target, u32 timeout)
 ''' + functions + r'''
 int main(void)
 {
-    const struct cluster_t c = {"PCPU", 0x211e00000, true, 0, 0, 0};
+    const struct cluster_t c = {"PCPU", 0x211e00000, true, 0, 0};
     reg = 1;
     assert(!set_pstate(&c, 8) && writes == 1 && pstate_reg_to_pstate(reg) == 8);
     /* Busy before the request: nothing is written. */

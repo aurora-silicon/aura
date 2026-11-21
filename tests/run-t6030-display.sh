@@ -1,6 +1,5 @@
 #!/bin/sh
-# Host test of the T6030 display ADT facts (src/kboot_display_facts.c) and of the atc-phy3 lane
-# tunable rule (src/kboot_atc.c).
+# Host test of the T6030 atc-phy3 lane tunable rule (src/kboot_atc.c).
 #
 #   sh tests/run-t6030-display.sh [BASE_REF]
 #
@@ -19,16 +18,17 @@ build() { # build <kboot_atc.c> <out>
     atc=$1 out=$2
     mkdir -p "$out/src"
     cp "$atc" "$out/src/kboot_atc.c"
-    cp "$root/src/kboot_display_facts.c" "$root/tests/t6030_display_host.c" \
+    cp "$root/tests/t6030_display_host.c" \
         "$root"/tests/t6030_host/*.h "$out/src/"
     ${CC:-cc} -std=gnu11 -D_GNU_SOURCE -O1 -g -Wall -Wextra -Wno-unused-function \
         -Wno-unused-parameter -Wno-sign-compare -Wno-format-truncation \
         -fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=undefined \
         -I"$out/src" -I"$root/src" -I"$root" \
-        "$out/src/t6030_display_host.c" "$out/src/kboot_atc.c" "$out/src/kboot_display_facts.c" \
+        "$out/src/t6030_display_host.c" "$out/src/kboot_atc.c" \
         "$root"/src/libfdt/fdt.c "$root"/src/libfdt/fdt_ro.c "$root"/src/libfdt/fdt_rw.c \
         "$root"/src/libfdt/fdt_wip.c "$root"/src/libfdt/fdt_sw.c \
         "$root"/src/libfdt/fdt_empty_tree.c "$root"/src/libfdt/fdt_strerror.c \
+        "$root"/src/libfdt/fdt_addresses.c \
         -Wl,--wrap=malloc -o "$out/t6030-display-host"
 }
 

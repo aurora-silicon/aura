@@ -51,21 +51,21 @@ int main(void)
     char tree[4096]; const char *boards[] = {"apple,j613", "apple,j615"};
     for (unsigned b = 0; b < 2; b++) {
         setup(tree, boards[b], true); board_value = 0x40 + b;
-        assert(facts_wanted(dt)); assert(!dt_set_pmp_t8122()); assert(fills == 1);
+        assert(!dt_set_pmp_t8122()); assert(fills == 1);
         int node = fdt_path_offset(dt, "/chosen/asahi,t8122-pmp"); assert(node >= 0);
         const fdt32_t *value = fdt_getprop(dt, node, "apple,board-id", NULL);
         assert(value && fdt32_ld(value) == board_value);
-        setup(tree, boards[b], false); assert(!facts_wanted(dt));
+        setup(tree, boards[b], false);
         assert(!dt_set_pmp_t8122() && !fills);
         setup(tree, boards[b], true); raw_dart += 0x4000;
         assert(!dt_set_pmp_t8122() && !fills);
         node = fdt_path_offset(dt, "/chosen/asahi,t8122-pmp"); assert(node >= 0);
         assert(!fdt_getprop(dt, node, "apple,board-id", NULL));
     }
-    setup(tree, "apple,j504", true); assert(!facts_wanted(dt));
+    setup(tree, "apple,j504", true);
     assert(!dt_set_pmp_t8122() && !fills);
     setup(tree, "apple,j615", true);
     assert(!fdt_setprop_string(dt, 0, "compatible", "apple,j615"));
-    assert(!facts_wanted(dt)); assert(!dt_set_pmp_t8122() && !fills);
+    assert(!dt_set_pmp_t8122() && !fills);
     puts("actual Air PMP admission/callers: both boards, explicit intent, own data and resource refusal PASS");
 }

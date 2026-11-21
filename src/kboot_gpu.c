@@ -515,8 +515,8 @@ static int fdt_set_aux_opp(void *dt, int gpu, const char *prop, const struct aux
  *   catches asynchronous SErrors (the PMGR power-on is unguarded, as everywhere else in aura; a
  *   read that stalls the bus without faulting cannot be caught by any guard),
  * - checks the uat-* regions against everything dt_set_memory() later bails on,
- * - adds the description of the loaded firmware segments (fw-text/fw-data, see g15_get_fw_segs())
- *   completely or not at all; the GPU setup does not depend on it,
+ * - adds the description of the loaded firmware segments (fw-text/fw-data, see
+ * g15_get_fw_segs_nub()) completely or not at all; the GPU setup does not depend on it,
  * - enables the uat-* regions and then the gpu node only after every step has succeeded,
  * - on any failure removes the firmware segment description, disables the node again, zeroes
  *   apple,firmware-compat, powers the GPU back off if it was powered on here, and returns 0.
@@ -1572,19 +1572,10 @@ static bool g15_overlaps(u64 a, u64 a_size, u64 b, u64 b_size)
 }
 
 /*
- * Read and check the firmware segments from the ADT and the gpu node inputs from the DT. Changes
- * nothing. `regions` are the checked UAT regions. Returns 0 if the description can be added.
+ * Read and check the firmware segments from the ADT, at the firmware nub `nub_path` (T6031:
+ * iop-gfx-nub0), and the gpu node inputs from the DT. Changes nothing. `regions` are the checked
+ * UAT regions. Returns 0 if the description can be added.
  */
-static int g15_get_fw_segs_nub(void *dt, int gpu, const struct g15_region *regions,
-                               struct g15_fw_seg *segs, const char *nub_path);
-
-static int g15_get_fw_segs(void *dt, int gpu, const struct g15_region *regions,
-                           struct g15_fw_seg *segs)
-{
-    return g15_get_fw_segs_nub(dt, gpu, regions, segs, "/arm-io/gfx-asc/iop-gfx-nub");
-}
-
-/* As g15_get_fw_segs(), with the firmware nub at `nub_path` (T6031: iop-gfx-nub0) */
 static int g15_get_fw_segs_nub(void *dt, int gpu, const struct g15_region *regions,
                                struct g15_fw_seg *segs, const char *nub_path)
 {
@@ -1788,7 +1779,7 @@ static int g15_set_fw_segs_inner(void *dt, const char *gpu_path, const struct g1
     fdt32_t version = cpu_to_fdt32(G15_HANDOFF_VERSION);
     int len;
 
-    /* Copy what gets appended to, for the undo (bounds checked by g15_get_fw_segs()) */
+    /* Copy what gets appended to, for the undo (bounds checked by g15_get_fw_segs_nub()) */
     int gpu = fdt_path_offset(dt, gpu_path);
     if (gpu < 0)
         bail("FDT: GPU: gpu alias lost\n");
@@ -1863,8 +1854,9 @@ static int g15_set_fw_segs_inner(void *dt, const char *gpu_path, const struct g1
 }
 
 /*
- * Add the firmware segment description checked by g15_get_fw_segs(). Returns 0 when it was added,
- * 1 when it was not and the DT is unchanged, -1 when a partial description could not be removed.
+ * Add the firmware segment description checked by g15_get_fw_segs_nub(). Returns 0 when it was
+ * added, 1 when it was not and the DT is unchanged, -1 when a partial description could not be
+ * removed.
  */
 static int g15_set_fw_segs(void *dt, const char *gpu_path, const struct g15_fw_seg *segs)
 {
@@ -2492,8 +2484,6 @@ static int dt_set_gpu_g15(void *dt, const struct g15_soc *soc)
     return 0;
 }
 
-static int dt_set_gpu_t8122(void *dt);
-
 /*
  * On a J613 or J615, read the same T8122 leakage fuse words under the
  * exception guard, before anything powers the GPU, then log and export the decoded values (see
@@ -2538,8 +2528,7 @@ static void t8122_leak_fuse_export(void *dt)
 
 /*
  * T8122: the GPU setup runs only with chosen.asahi,t8122-gpu=1; there is no dry run on a default
- * boot. Without it, the reservation-only diagnostic (dt_set_gpu_t8122()) runs if it is opted in.
- * With chosen.asahi,t8122-gpu-power-standin=1 as well, the setup is the stand-in experiment
+ * boot. With chosen.asahi,t8122-gpu-power-standin=1 as well, the setup is the stand-in experiment
  * (g15_soc_t8122_standin); on its own that line is only logged as ignored.
  */
 static int dt_set_gpu_t8122_select(void *dt)
@@ -2552,12 +2541,11 @@ static int dt_set_gpu_t8122_select(void *dt)
         if (standin)
             printf("FDT: GPU: asahi,t8122-gpu-power-standin ignored: it needs "
                    "chosen.asahi,t8122-gpu=1\n");
-        return dt_set_gpu_t8122(dt);
+        printf("FDT: GPU: T8122: not armed (no chosen.asahi,t8122-gpu=1): GPU hardware not "
+               "touched\n");
+        return 0;
     }
 
-    if (g15_optin(dt, "asahi,t8122-gpu-handoff-diag"))
-        printf("FDT: GPU: asahi,t8122-gpu-handoff-diag ignored: chosen.asahi,t8122-gpu=1 runs "
-               "the GPU setup\n");
     if (standin) {
         printf("FDT: GPU: T8122 experiment armed (chosen.asahi,t8122-gpu-power-standin=1): "
                "experimental G15G firmware image, stand-in power model\n");
@@ -2770,213 +2758,6 @@ void t8122_read_powered_identity(void *dt, int gpu)
            "0x%08x core masks 0x%x 0x%x 0x%x\n",
            identity.id_version, identity.id_counts_1, identity.id_counts_2, identity.core_mask[0],
            identity.core_mask[1], identity.core_mask[2]);
-}
-
-static bool t8122_identity_matches_j613(void *dt)
-{
-    int node = fdt_path_offset(dt, "/chosen/asahi,t8122-gpu-powered-identity");
-    static const struct {
-        const char *name;
-        u32 value;
-    } expected[] = {
-        {"schema-version", 1},       {"probe-result", T8122_ID_PASS},
-        {"id-version", 0x07022000},  {"id-counts-1", 0x0011010a},
-        {"id-counts-2", 0x00040404}, {"core-mask-0", 0x37e},
-        {"core-mask-1", 0},          {"core-mask-2", 0},
-    };
-    if (node < 0)
-        return false;
-    for (u32 i = 0; i < ARRAY_SIZE(expected); i++) {
-        int len = 0;
-        const fdt32_t *raw = fdt_getprop(dt, node, expected[i].name, &len);
-        if (!raw || len != sizeof(*raw) || fdt32_ld(raw) != expected[i].value)
-            return false;
-    }
-    return true;
-}
-
-/* Publish an ABI claim only for this boot's exact owner-approved image and
- * measured J613 identity. GPU and mailbox status remain disabled.
- */
-static void t8122_admit_image_metadata(void *dt, const struct gfx_fw_image_info *image)
-{
-    int chosen = fdt_path_offset(dt, "/chosen");
-    int gpu = fdt_path_offset(dt, "/soc/gpu@292400000");
-    if (chosen < 0 || gpu < 0 || fdt_node_check_compatible(dt, 0, "apple,j613") ||
-        !t8122_identity_matches_j613(dt))
-        return;
-
-    int len = 0;
-    const char *ack = fdt_getprop(dt, chosen, "asahi,t8122-gpu-abi-ack", &len);
-    if (!ack || len != sizeof("14.8.3") || memcmp(ack, "14.8.3", sizeof("14.8.3")))
-        return;
-    const char *uuid_text = fdt_getprop(dt, chosen, "asahi,t8122-gpu-expected-uuid", &len);
-    u8 expected_uuid[16];
-    if (!gfx_fw_parse_uuid_hex(uuid_text, len, expected_uuid) ||
-        memcmp(expected_uuid, image->uuid, sizeof(expected_uuid)))
-        return;
-    const char *expected_rtkit = fdt_getprop(dt, chosen, "asahi,t8122-gpu-expected-rtkit", &len);
-    char observed_rtkit[GFX_FW_VERSION_MAX];
-    if (!expected_rtkit || len < 8 || len > GFX_FW_VERSION_MAX || expected_rtkit[len - 1] != '\0' ||
-        strlen(expected_rtkit) + 1 != (size_t)len || !firmware_gfx_rtkit_version(observed_rtkit) ||
-        strcmp(expected_rtkit, observed_rtkit))
-        return;
-
-    const fdt32_t compat[] = {cpu_to_fdt32(14), cpu_to_fdt32(8), cpu_to_fdt32(3)};
-    if (fdt_setprop(dt, gpu, "apple,firmware-compat", compat, sizeof(compat))) {
-        printf("FDT: GPU: T8122 exact image metadata matched but ABI property could not be set\n");
-        return;
-    }
-    printf("FDT: GPU: T8122 J613 exact image metadata admitted; GPU and ASC remain disabled\n");
-}
-
-/* Separate one-boot ASC register preflight. Publish both status changes only
- * after all J613 identity, image, reservation and opt-in checks have passed.
- * Linux's diagnostic driver still returns ENODEV without RTKit or DRM setup.
- */
-static void t8122_enable_asc_preflight(void *dt)
-{
-    /* When the full GPU setup is opted in (chosen.asahi,t8122-gpu=1) it owns the
-     * gpu and mailbox enable; the lighter preflight must not also touch them.
-     * The reservation-only diagnostic that hosts this preflight does not run
-     * under that opt-in, so this is defence in depth, logged when it fires.
-     */
-    if (g15_optin(dt, "asahi,t8122-gpu")) {
-        printf("FDT: GPU: T8122 ASC preflight skipped: chosen.asahi,t8122-gpu=1 owns the "
-               "node enable\n");
-        return;
-    }
-
-    int chosen = fdt_path_offset(dt, "/chosen");
-    int gpu = fdt_path_offset(dt, "/soc/gpu@292400000");
-    int mailbox = fdt_path_offset(dt, "/soc/mbox@292408000");
-    if (chosen < 0 || gpu < 0 || mailbox < 0 || !t8122_identity_matches_j613(dt))
-        return;
-    int len = 0;
-    const char *optin = fdt_getprop(dt, chosen, "asahi,t8122-gpu-asc-preflight", &len);
-    if (!optin || len != sizeof("1") || memcmp(optin, "1", sizeof("1")))
-        return;
-    const fdt32_t *compat = fdt_getprop(dt, gpu, "apple,firmware-compat", &len);
-    if (!compat || len != 3 * sizeof(*compat) || fdt32_ld(&compat[0]) != 14 ||
-        fdt32_ld(&compat[1]) != 8 || fdt32_ld(&compat[2]) != 3)
-        return;
-
-    size_t size = fdt_totalsize(dt);
-    void *copy = malloc(size);
-    if (!copy)
-        return;
-    memcpy(copy, dt, size);
-    if (!g15_set_status(copy, "/soc/mbox@292408000", "okay") &&
-        !g15_set_status(copy, "/soc/gpu@292400000", "okay")) {
-        memcpy(dt, copy, size);
-        printf("FDT: GPU: T8122 J613 one-boot ASC register preflight enabled\n");
-    } else {
-        printf("FDT: GPU: T8122 ASC preflight status change failed; GPU and ASC stay disabled\n");
-    }
-    free(copy);
-}
-
-/*
- * Export the four T8122 UAT carveouts from this boot's ADT. Their physical
- * addresses depend on the installed RAM size: a J615's fixed addresses are
- * not valid on this J613. Normal diagnostics do not power or enable the GPU.
- */
-static int dt_set_gpu_t8122(void *dt)
-{
-    static const char *const gpu_path = "/soc/gpu@292400000";
-    int gpu = fdt_path_offset(dt, gpu_path);
-    if (gpu < 0 || fdt_node_check_compatible(dt, gpu, "apple,agx-t8122"))
-        return 0;
-
-    const char *gpu_status = fdt_getprop(dt, gpu, "status", NULL);
-    int mailbox = fdt_path_offset(dt, "/soc/mbox@292408000");
-    const char *mailbox_status = mailbox >= 0 ? fdt_getprop(dt, mailbox, "status", NULL) : NULL;
-    if (!gpu_status || strcmp(gpu_status, "disabled") || !mailbox_status ||
-        strcmp(mailbox_status, "disabled")) {
-        printf("FDT: GPU: T8122 diagnostic requires disabled GPU and mailbox nodes\n");
-        return 0;
-    }
-
-    int chosen = fdt_path_offset(dt, "/chosen");
-    int len = 0;
-    const char *optin =
-        chosen >= 0 ? fdt_getprop(dt, chosen, "asahi,t8122-gpu-handoff-diag", &len) : NULL;
-    if (!optin || len != 2 || strcmp(optin, "1"))
-        return 0;
-
-    /* Never carry a compatibility claim from an input DT into a diagnostic boot.
-     * Done only once the diagnostic is opted in, so a default boot is untouched. */
-    int compat_err = fdt_delprop(dt, gpu, "apple,firmware-compat");
-    if (compat_err && compat_err != -FDT_ERR_NOTFOUND) {
-        printf("FDT: GPU: T8122 could not clear input firmware compatibility claim\n");
-        return 0;
-    }
-
-    int sgx = adt_path_offset(adt, "/arm-io/sgx");
-    if (sgx < 0)
-        return 0;
-
-    struct g15_region regions[G15_NUM_REGIONS];
-    for (int i = 0; i < G15_NUM_REGIONS; i++) {
-        regions[i] = g15_region_names[i];
-        if (g15_get_region(dt, sgx, &regions[i]))
-            return 0;
-        int node = fdt_path_offset(dt, regions[i].dt_path);
-        const char *status = node >= 0 ? fdt_getprop(dt, node, "status", NULL) : NULL;
-        if (!status || strcmp(status, "disabled")) {
-            printf("FDT: GPU: T8122 expected a disabled %s\n", regions[i].dt_path);
-            return 0;
-        }
-    }
-    if (g15_check_regions(dt, regions))
-        return 0;
-
-    struct g15_fw_seg fw_segs[G15_FW_SEGS];
-    if (g15_get_fw_segs(dt, gpu, regions, fw_segs))
-        return 0;
-    struct gfx_fw_image_info image;
-    if (!firmware_gfx_image_info(&image) || image.text_size != fw_segs[0].size) {
-        printf("FDT: GPU: T8122 firmware header and ADT text extent disagree\n");
-        return 0;
-    }
-
-    /* Fixed-size reg writes cannot change the DT structure. */
-    for (int i = 0; i < G15_NUM_REGIONS; i++) {
-        fdt64_t reg[2];
-        fdt64_st(&reg[0], regions[i].base);
-        fdt64_st(&reg[1], regions[i].size);
-        int node = fdt_path_offset(dt, regions[i].dt_path);
-        if (node < 0 || fdt_setprop_inplace(dt, node, "reg", reg, sizeof(reg))) {
-            printf("FDT: GPU: T8122 cannot fill %s; all UAT nodes remain disabled\n",
-                   regions[i].dt_path);
-            return 0;
-        }
-    }
-
-    /* Reuse the guarded, rollback-capable G15 segment description. */
-    memset(&g15_fw_undo, 0, sizeof(g15_fw_undo));
-    if (g15_set_fw_segs(dt, gpu_path, fw_segs))
-        return 0;
-
-    int enabled = 0;
-    for (; enabled < G15_NUM_REGIONS; enabled++)
-        if (g15_set_status(dt, regions[enabled].dt_path, "okay"))
-            break;
-    if (enabled != G15_NUM_REGIONS) {
-        for (int i = 0; i < enabled; i++)
-            if (g15_set_status(dt, regions[i].dt_path, "disabled"))
-                printf("FDT: GPU: T8122 failed to restore %s disabled\n", regions[i].dt_path);
-        if (g15_unset_fw_segs(dt, gpu_path))
-            printf("FDT: GPU: T8122 failed to remove firmware segment description\n");
-        return 0;
-    }
-
-    printf("FDT: GPU: T8122 UAT and firmware reservations supplied from ADT; "
-           "GPU and ASC remain disabled\n");
-    t8122_read_powered_identity(dt, gpu);
-    t8122_admit_image_metadata(dt, &image);
-    t8122_enable_asc_preflight(dt);
-    return 0;
 }
 
 /* G17 SoCs whose firmware iBoot loads and whose UAT it sets up for a raw boot object */

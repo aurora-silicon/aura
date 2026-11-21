@@ -433,11 +433,6 @@ int hv_map_hw_ro(u64 from, u64 to, u64 size)
     return hv_map(from, to | PTE_ATTRIBUTES_RO | PTE_VALID, size, 1);
 }
 
-int hv_map_sw(u64 from, u64 to, u64 size)
-{
-    return hv_map(from, to | FIELD_PREP(SPTE_TYPE, SPTE_MAP), size, 1);
-}
-
 int hv_map_hook(u64 from, hv_hook_t *hook, u64 size)
 {
     return hv_map(from, ((u64)hook) | FIELD_PREP(SPTE_TYPE, SPTE_HOOK), size, 0);

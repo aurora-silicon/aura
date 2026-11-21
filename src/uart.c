@@ -70,11 +70,6 @@ void uart_putchar(u8 c)
     uart_putbyte(c);
 }
 
-u8 uart_getchar(void)
-{
-    return uart_getbyte();
-}
-
 void uart_puts(const char *s)
 {
     while (*s)

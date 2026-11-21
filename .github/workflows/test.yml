@@ -73,11 +73,11 @@ jobs:
         if: matrix.os == 'ubuntu-latest' && matrix.compiler == 'llvm'
         env:
           USE_CLANG: '1'
-        run: PATH="$(llvm-config --prefix)/bin:$PATH" pytest tests/python tests/test_t8122_gpu_reader.py tests/test_t8122_gpu_resources.py
+        run: PATH="$(llvm-config --prefix)/bin:$PATH" pytest tests/python
 
       - name: Run pytest without clang
         if: matrix.compiler != 'llvm'
-        run: pytest tests/python tests/test_t8122_gpu_reader.py tests/test_t8122_gpu_resources.py
+        run: pytest tests/python
 
       - name: Run T8122 GPU26 powered identity host test
         if: matrix.os == 'ubuntu-latest'

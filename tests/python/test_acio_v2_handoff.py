@@ -4,8 +4,9 @@
 Runs kboot.c's ACIO helpers and dt_set_acio_tunables() as they are against a
 mock ADT and real FDTs:
 
-- v2 routers ("acio,v2") keep their cio@ node: its root complex is ADT reg 1, not reg 2;
-- v2 routers take the NHI table whose per-direction fabric lists are optional;
+- v2 routers ("acio,v2") take the NHI table whose per-direction fabric lists are optional;
+- the cio@ node is kept by any of the router's ADT register windows (dt_disable_missing_devs()),
+  so no generation decides which one;
 """
 
 from pathlib import Path
@@ -21,7 +22,8 @@ def between(source, start, end):
 
 def test_acio_generation_handoff(tmp_path):
     source = (ROOT / "src/kboot.c").read_text()
-    assert 'dt_disable_missing_devs("acio", "cio@", 8, adt_acio_rc_regnum())' in source
+    assert 'dt_disable_missing_devs("acio", "cio@", 8)' in source
+    assert "adt_acio_rc_regnum" not in source
     assert "dt_copy_usb4_dart_tunables" not in source
     tables = between(source, "struct adt_tunable_info {", "struct acio_tunable {")
     acio = between(source, "/* The router generation is in the ADT",
@@ -132,7 +134,6 @@ int main(void)
     /* v1 (M1/M2/M3/M4 T8132): RC is ADT reg 2, all NHI tables required. */
     nodes = v1;
     nnodes = ARRAY_SIZE(v1);
-    assert(adt_acio_rc_regnum() == 2);
     assert(dt_set_acio_tunables() == 0);
     assert(rc_calls == 2);
     assert(nhi_table[0] == usb4_nhi_tunables && nhi_table[1] == usb4_nhi_tunables);
@@ -143,7 +144,6 @@ int main(void)
     rc_calls = 0;
     nodes = v2;
     nnodes = ARRAY_SIZE(v2);
-    assert(adt_acio_rc_regnum() == 1);
     assert(dt_set_acio_tunables() == 0);
     assert(rc_calls == 3);
     assert(nhi_table[0] == usb4_v2_nhi_tunables && nhi_table[3] == usb4_v2_nhi_tunables);
@@ -154,10 +154,6 @@ int main(void)
         bool published = strstr(name, "merge") || !strcmp(name, "fw_int_ctl_management_tunables");
         assert(usb4_v2_nhi_tunables[i].required == published);
     }
-
-    /* No router at all (T8140): nothing to do, generation defaults to v1. */
-    nnodes = 0;
-    assert(adt_acio_rc_regnum() == 2);
     return 0;
 }
 ''')

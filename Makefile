@@ -200,14 +200,10 @@ LIBFDT_OBJECTS := $(patsubst %,libfdt/%, \
 CHICKENS_OBJECTS := $(patsubst %,chickens/%, \
 	avalanche.o \
 	blizzard.o \
-	cyclone_typhoon.o \
 	everest.o \
 	firestorm.o \
-	hurricane_zephyr.o \
 	icestorm.o \
-	monsoon_mistral.o \
-	sawtooth.o \
-	twister.o)
+	sawtooth.o)
 
 DCP_OBJECTS := $(patsubst %,dcp/%, \
 	atc_phy.o \
@@ -258,9 +254,9 @@ OBJECTS := \
 	iova.o \
 	isp.o \
 	j873.o \
-	kboot.o kboot_atc.o kboot_audio.o kboot_mte.o kboot_gpu_t8122.o kboot_gpu_t8122_power.o kboot_pmp_t8122.o \
+	kboot.o kboot_atc.o kboot_audio.o kboot_mte.o kboot_gpu_t8122_power.o \
 	kboot_t6020_compat.o \
-	kboot_display_handoff.o kboot_display_facts.o kboot_gpu26.o kboot_gpu_t6031.o kboot_t6031.o \
+	kboot_display_handoff.o kboot_gpu26.o kboot_gpu_t6031.o kboot_t6031.o \
 	main.o boot_options.o \
 	mitigations.o \
 	mcc.o \

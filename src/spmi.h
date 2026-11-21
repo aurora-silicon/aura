@@ -26,7 +26,6 @@ int spmi_ext_read_long(spmi_dev_t *dev, u8 addr, u16 reg, u8 *bfr, size_t len);
 int spmi_ext_write_long(spmi_dev_t *dev, u8 addr, u16 reg, const u8 *bfr, size_t len);
 
 int spmi_send_reset(spmi_dev_t *dev, u8 addr);
-int spmi_send_sleep(spmi_dev_t *dev, u8 addr);
 int spmi_send_shutdown(spmi_dev_t *dev, u8 addr);
 int spmi_send_wakeup(spmi_dev_t *dev, u8 addr);
 

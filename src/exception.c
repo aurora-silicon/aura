@@ -156,9 +156,6 @@ void exception_initialize(void)
     }
 
     switch (cpu_features->uncore_version) {
-        case UNCORE_V1:
-            reg_clr(SYS_IMP_APL_UPMCR0, UPMCR0_IMODE_T8015);
-            break;
         case UNCORE_V2:
             reg_clr(SYS_IMP_APL_UPMCR0, UPMCR0_IMODE_T8020);
             break;
@@ -543,9 +540,6 @@ void exc_fiq(u64 *regs)
     if (cpu_features->uncore_version) {
         uint64_t upmcr0_imode = 0;
         switch (cpu_features->uncore_version) {
-            case UNCORE_V1:
-                upmcr0_imode = UPMCR0_IMODE_T8015;
-                break;
             case UNCORE_V2:
                 upmcr0_imode = UPMCR0_IMODE_T8020;
                 break;

@@ -798,9 +798,6 @@ setup_controller:
     write64_lo_hi(nvme_qreg(NVME_ACQ), (u64)adminq.cqes);
     write32(nvme_qreg(NVME_AQA), ((NVME_QUEUE_SIZE - 1) << 16) | (NVME_QUEUE_SIZE - 1));
     bool ready = nvme_ctrl_enable();
-#ifdef NVME_TEST_ADOPT_RESTART
-    ready = ready && !(earlier && !restarted);
-#endif
     if (!ready) {
         printf("nvme: timeout while waiting for CSTS.RDY to be set: CC=0x%x CSTS=0x%x "
                "BOOT_STATUS=0x%x\n",

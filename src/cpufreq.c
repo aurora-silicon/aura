@@ -19,11 +19,6 @@
 #define CLUSTER_PSTATE_DESIRED2               GENMASK(15, 12)
 #define CLUSTER_PSTATE_APSC_BUSY              BIT(7)
 #define CLUSTER_PSTATE_DESIRED1               GENMASK(4, 0)
-#define CLUSTER_PSTATE_DESIRED1_S5L8960X      GENMASK(24, 22)
-
-#define PMGR_VOLTAGE_CTL_OFF_S5L8960X 0x20c00
-#define PMGR_VOLTAGE_CTL_OFF_T7000    0x23000
-#define PMGR_VOLTAGE_CTL_OFF_S8000    0xa0000
 
 #define CLUSTER_SWITCH_TIMEOUT 400
 /* Bound for the generations that verify each request (2 ms, as Linux's T8152/T6050 bound). */
@@ -40,7 +35,6 @@ struct cluster_t {
     bool pcluster;
     uint32_t apsc_pstate;
     uint32_t default_pstate;
-    uint32_t voltage_ctl;
     /* PMGR ADT property with this cluster's [frequency, mV] ladder, where the ADT has one. */
     const char *ladder;
 };
@@ -57,17 +51,6 @@ struct feat_t {
 static u32 pstate_reg_to_pstate(u64 val)
 {
     switch (chip_id) {
-        case S5L8960X:
-        case T7000:
-        case T7001:
-            return FIELD_GET(CLUSTER_PSTATE_DESIRED1_S5L8960X, val);
-        case S8000:
-        case S8001:
-        case S8003:
-        case T8010:
-        case T8011:
-        case T8012:
-        case T8015:
         case T8103:
         case T6000:
         case T6001:
@@ -93,13 +76,6 @@ static u32 pstate_reg_to_pstate(u64 val)
 static bool has_ps2(void)
 {
     switch (chip_id) {
-        case S8000:
-        case S8001:
-        case S8003:
-        case T8010:
-        case T8011:
-        case T8012:
-        case T8015:
         case T8103:
         case T6000:
         case T6001:
@@ -148,19 +124,6 @@ static int set_pstate_ps2(const struct cluster_t *cluster, uint32_t pstate, uint
     if (pstate_reg_to_pstate(val) != pstate ||
         (ps2 != pstate && has_ps2() && FIELD_GET(CLUSTER_PSTATE_DESIRED2, val) != ps2)) {
         switch (chip_id) {
-            case S5L8960X:
-            case T7000:
-            case T7001:
-                val &= ~CLUSTER_PSTATE_DESIRED1_S5L8960X;
-                val |= CLUSTER_PSTATE_SET | FIELD_PREP(CLUSTER_PSTATE_DESIRED1_S5L8960X, pstate);
-                break;
-            case S8000:
-            case S8001:
-            case S8003:
-            case T8010:
-            case T8011:
-            case T8012:
-            case T8015:
             case T8103:
             case T6000:
             case T6001:
@@ -233,15 +196,7 @@ int cpufreq_init_cluster(const struct cluster_t *cluster, const struct feat_t *f
         }
     }
 
-    /* Pre M1 voltage control handling in pmgr.reg[0]. */
-    if (cluster->voltage_ctl)
-        pmgr_set_voltage_ctl(cluster->voltage_ctl);
-
     switch (chip_id) {
-        case S5L8960X:
-        case T7000 ... T7001:
-        case S8000 ... S8003:
-        case T8010 ... T8015: /* This covers a gap but T8013 and T8014 will not randomly appear. */
         /*
          * Keep firmware voltage, PLL and throttling configuration: the 0x440f8/APSC snooze
          * writes below are not established on these generations.
@@ -336,44 +291,6 @@ void cpufreq_fixup_cluster(const struct cluster_t *cluster)
     }
 }
 
-static const struct cluster_t s5l8960x_clusters[] = {
-    {"CPU", 0x202200000, false, 2, 6, PMGR_VOLTAGE_CTL_OFF_S5L8960X},
-    {},
-};
-
-static const struct cluster_t t7000_clusters[] = {
-    {"CPU", 0x202200000, false, 2, 5, PMGR_VOLTAGE_CTL_OFF_T7000},
-    {},
-};
-
-static const struct cluster_t t7001_clusters[] = {
-    {"CPU", 0x202200000, false, 2, 7, PMGR_VOLTAGE_CTL_OFF_T7000},
-    {},
-};
-
-static const struct cluster_t s8000_clusters[] = {
-    {"CPU", 0x202200000, false, 2, 7, PMGR_VOLTAGE_CTL_OFF_S8000},
-    {},
-};
-
-static const struct cluster_t t8010_clusters[] = {
-    /* Fused cluster, kernel expects E-core entry */
-    {"CPU", 0x202f00000, false, 2, 4, PMGR_VOLTAGE_CTL_OFF_S8000},
-    {},
-};
-
-static const struct cluster_t t8012_clusters[] = {
-    /* Fused cluster, kernel expects P-core entry */
-    {"CPU", 0x202f00000, false, 6, 10, PMGR_VOLTAGE_CTL_OFF_S8000},
-    {},
-};
-
-static const struct cluster_t t8015_clusters[] = {
-    {"ECPU", 0x208e00000, false, 2, 6, PMGR_VOLTAGE_CTL_OFF_S8000},
-    {"PCPU", 0x208e80000, true, 2, 7, 0 /* already written for the first cluster */},
-    {},
-};
-
 static const struct cluster_t t8103_clusters[] = {
     {"ECPU", 0x210e00000, false, 1, 5},
     {"PCPU", 0x211e00000, true, 1, 7},
@@ -463,45 +380,28 @@ static const struct cluster_t t8142_clusters[] = {
  * the state firmware left. No APSC reset state: that sequence is not established on T8140.
  */
 static const struct cluster_t t8140_clusters[] = {
-    {"ECPU0", 0x210e00000, false, 0, 0, 0, "voltage-states1-sram"},
-    {"PCPU0", 0x211e00000, true, 0, 8, 0, "voltage-states5-sram"},
+    {"ECPU0", 0x210e00000, false, 0, 0, "voltage-states1-sram"},
+    {"PCPU0", 0x211e00000, true, 0, 8, "voltage-states5-sram"},
     {},
 };
 
 /* Firmware's states are kept; the clusters are listed for the proxy and the payload code. */
 static const struct cluster_t t6040_clusters[] = {
-    {"ECPU0", 0x210e00000, false, 0, 0, 0, "voltage-states1-sram"},
-    {"PCPU0", 0x211e00000, true, 0, 0, 0, "voltage-states5-sram"},
-    {"PCPU1", 0x212e00000, true, 0, 0, 0, "voltage-states13-sram"},
+    {"ECPU0", 0x210e00000, false, 0, 0, "voltage-states1-sram"},
+    {"PCPU0", 0x211e00000, true, 0, 0, "voltage-states5-sram"},
+    {"PCPU1", 0x212e00000, true, 0, 0, "voltage-states13-sram"},
     {},
 };
 
 static const struct cluster_t t8152_clusters[] = {
-    {"ECPU0", 0x210e00000, false, 0, 0, 0, "voltage-states1-sram"},
-    {"PCPU0", 0x211e00000, true, 0, 0, 0, "voltage-states5-sram"},
+    {"ECPU0", 0x210e00000, false, 0, 0, "voltage-states1-sram"},
+    {"PCPU0", 0x211e00000, true, 0, 0, "voltage-states5-sram"},
     {},
 };
 
 static const struct cluster_t *chip_clusters(void)
 {
     switch (chip_id) {
-        case S5L8960X:
-            return s5l8960x_clusters;
-        case T7000:
-            return t7000_clusters;
-        case T7001:
-            return t7001_clusters;
-        case S8000:
-        case S8001:
-        case S8003:
-            return s8000_clusters;
-        case T8010:
-        case T8011:
-            return t8010_clusters;
-        case T8012:
-            return t8012_clusters;
-        case T8015:
-            return t8015_clusters;
         case T8103:
             return t8103_clusters;
         case T6000:
@@ -546,27 +446,6 @@ const struct cluster_t *cpufreq_get_clusters(void)
         printf("cpufreq: Chip 0x%x is unsupported\n", chip_id);
     return clusters;
 }
-
-static const struct feat_t s5l8960x_features[] = {
-    {},
-};
-
-static const struct feat_t s8000_features[] = {
-    {"cpu-apsc", CLUSTER_PSTATE, CLUSTER_PSTATE_M1_APSC_DIS, 0, CLUSTER_PSTATE_APSC_BUSY, false},
-    {},
-};
-
-static const struct feat_t t8010_features[] = {
-    {"cpu-apsc", CLUSTER_PSTATE, CLUSTER_PSTATE_M1_APSC_DIS, 0, CLUSTER_PSTATE_APSC_BUSY, false},
-    {},
-};
-
-static const struct feat_t t8015_features[] = {
-    {"cpu-apsc", CLUSTER_PSTATE, CLUSTER_PSTATE_M1_APSC_DIS, 0, CLUSTER_PSTATE_APSC_BUSY, false},
-    {"cpu-fixed-freq-pll-relock", CLUSTER_PSTATE, 0, CLUSTER_PSTATE_FIXED_FREQ_PLL_RECLOCK, 0,
-     false},
-    {},
-};
 
 static const struct feat_t t8103_features[] = {
     {"cpu-apsc", CLUSTER_PSTATE, CLUSTER_PSTATE_M1_APSC_DIS, 0, CLUSTER_PSTATE_APSC_BUSY, false},
@@ -635,20 +514,6 @@ static const struct feat_t firmware_features[] = {
 const struct feat_t *cpufreq_get_features(void)
 {
     switch (chip_id) {
-        case S5L8960X:
-        case T7000:
-        case T7001:
-            return s5l8960x_features;
-        case S8000:
-        case S8001:
-        case S8003:
-            return s8000_features;
-        case T8010:
-        case T8011:
-        case T8012:
-            return t8010_features;
-        case T8015:
-            return t8015_features;
         case T8103:
         case T6000:
         case T6001:
@@ -816,16 +681,6 @@ static struct {
     bool owed;
 } boost[CLUSTER_MAX];
 
-static bool boost_supported(const struct cluster_t *clusters)
-{
-    if (!clusters)
-        return false;
-    for (const struct cluster_t *c = clusters; c->base; c++)
-        if (c->voltage_ctl)
-            return false;
-    return true;
-}
-
 static void cluster_boost(const struct cluster_t *cluster, unsigned int index)
 {
     /* Raised already, or a restore is still owed: keep the saved state as it is. */
@@ -890,7 +745,7 @@ void cpufreq_payload_boost(bool enable)
 {
     const struct cluster_t *clusters = chip_clusters();
 
-    if (!boost_supported(clusters))
+    if (!clusters)
         return;
     for (unsigned int i = 0; i < CLUSTER_MAX && clusters[i].base; i++) {
         if (enable)
@@ -909,10 +764,6 @@ int cpufreq_init(void)
 
     if (!cluster || !features)
         return -1;
-
-    /* Without this, CLUSTER_PSTATE_BUSY gets stuck */
-    if (chip_id == T8012 || chip_id == T8015)
-        pmgr_power_on(0, "SPMI");
 
     bool err = false;
     while (cluster->base) {

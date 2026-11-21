@@ -1,9 +1,8 @@
 /* SPDX-License-Identifier: MIT */
 /*
  * Host-test stand-in for src/utils.h, for tests/t6030_display_host.c. The test copies
- * kboot_atc.c and kboot_display_facts.c next to this file, so their #include "utils.h" resolves
- * here. Every register access aborts the test: neither file may touch the hardware in the
- * scenarios it runs.
+ * kboot_atc.c next to this file, so its #include "utils.h" resolves here. Every register access
+ * aborts the test: the file may not touch the hardware in the scenarios it runs.
  */
 #ifndef UTILS_H
 #define UTILS_H

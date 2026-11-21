@@ -54,7 +54,7 @@ def unit():
     disp = (SOURCE / "src/display.c").read_text()
     types = ibh[ibh.index("enum DCPEOTF {"):ibh.index("dcp_iboot_if_t *dcp_ib_init")]
     config = dcph[dcph.index("typedef struct {"):dcph.index("} display_config_t;")] + "} display_config_t;\n"
-    state = disp[disp.index("static dcp_dev_t *dcp;"):disp.index("#define USE_DCPEXT 1")]
+    state = disp[disp.index("static dcp_dev_t *dcp;"):disp.index("static const display_config_t display_config_m2 = {")]
     display = "".join((
         define(disp, "DISPLAY_STATUS_DELAY"), define(disp, "DISPLAY_STATUS_RETRIES"),
         define(disp, "COMPARE"), define(disp, "abs"),

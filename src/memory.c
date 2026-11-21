@@ -20,19 +20,11 @@
 #define CACHE_RANGE_OP(func, op)                                                                   \
     void func(void *addr, size_t length)                                                           \
     {                                                                                              \
-        if (func == dc_civac_range && cpu_features->workaround_cyclone_cache) {                    \
-            reg_clr(SYS_IMP_APL_HID4, HID4_DISABLE_DC_MVA);                                        \
-            sysop("isb");                                                                          \
-        }                                                                                          \
         u64 p = (u64)addr;                                                                         \
         u64 end = p + length;                                                                      \
         while (p < end) {                                                                          \
             cacheop(op, p);                                                                        \
             p += CACHE_LINE_SIZE;                                                                  \
-        }                                                                                          \
-        if (func == dc_civac_range && cpu_features->workaround_cyclone_cache) {                    \
-            reg_set(SYS_IMP_APL_HID4, HID4_DISABLE_DC_MVA);                                        \
-            sysop("isb");                                                                          \
         }                                                                                          \
     }
 
@@ -522,10 +514,6 @@ static void mmu_map_mmio(void)
     while (range_cnt--) {
         u64 bus = ranges[2] | ((u64)ranges[3] << 32);
         u64 size = ranges[4] | ((u64)ranges[5] << 32);
-
-        /* T2 is really stupid */
-        if (chip_id == T8012)
-            size = ALIGN_UP(size, PAGE_SIZE);
 
         mmu_add_mapping(bus, bus, size, MAIR_IDX_DEVICE_nGnRnE, PERM_RW_EL0);
         ranges += 6;

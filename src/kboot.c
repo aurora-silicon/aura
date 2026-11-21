@@ -23,10 +23,7 @@
 #include "j813_n1.h"
 #include "kboot_atc.h"
 #include "kboot_audio.h"
-#include "kboot_display_facts.h"
-#include "kboot_gpu_t8122.h"
 #include "kboot_mte.h"
-#include "kboot_pmp_t8122.h"
 #include "kboot_t6031.h"
 #include "malloc.h"
 #include "mcc.h"
@@ -84,6 +81,7 @@ extern u64 relocated_from;
 
 int dt_set_gpu(void *dt);
 int dt_set_display_handoff(void *dt);
+bool dt_display_handoff_has_profile(void *dt);
 
 u64 kboot_ram_base(void)
 {
@@ -135,16 +133,13 @@ void get_notchless_fb(u64 *fb_base, u64 *fb_height)
 
     u32 val;
 
-    if ((ADT_GETPROP(adt, node, "partially-occluded-display", &val) < 0 || !val) &&
-        (chip_id != T8015 || (board_id != 0x6 && board_id != 0xe))) {
+    if (ADT_GETPROP(adt, node, "partially-occluded-display", &val) < 0 || !val) {
         printf("FDT: No notch detected\n");
         return;
     }
 
     u64 hfrac = cur_boot_args.video.height * 16 / cur_boot_args.video.width;
     u64 new_height = cur_boot_args.video.width * hfrac / 16;
-    if (chip_id == T8015 && (board_id == 0x6 || board_id == 0xe))
-        new_height = 2346;
 
     if (new_height == cur_boot_args.video.height) {
         printf("FDT: Notch detected, but display aspect is already 16:%lu?\n", hfrac);
@@ -1197,15 +1192,13 @@ static int dt_set_chosen(void)
     if (node < 0)
         bail("FDT: /chosen node not found in devtree\n");
 
-    if (is_mac) {
-        if (fdt_setprop(dt, node, "asahi,iboot1-version", system_firmware.iboot,
-                        strlen(system_firmware.iboot) + 1))
-            bail("FDT: couldn't set asahi,iboot1-version\n");
+    if (fdt_setprop(dt, node, "asahi,iboot1-version", system_firmware.iboot,
+                    strlen(system_firmware.iboot) + 1))
+        bail("FDT: couldn't set asahi,iboot1-version\n");
 
-        if (fdt_setprop(dt, node, "asahi,system-fw-version", system_firmware.string,
-                        strlen(system_firmware.string) + 1))
-            bail("FDT: couldn't set asahi,system-fw-version\n");
-    }
+    if (fdt_setprop(dt, node, "asahi,system-fw-version", system_firmware.string,
+                    strlen(system_firmware.string) + 1))
+        bail("FDT: couldn't set asahi,system-fw-version\n");
 
     if (fdt_setprop(dt, node, "asahi,iboot2-version", os_firmware.iboot,
                     strlen(os_firmware.iboot) + 1))
@@ -3446,25 +3439,6 @@ static void dt_set_admac_control_tunables(void)
 static bool adt_acio_is_v2(int adt_node)
 {
     return adt_is_compatible(adt, adt_node, "acio,v2");
-}
-
-/*
- * Which /arm-io/acioN register is the root complex block that the DT names
- * its cio@ node after. v1 routers list a 0x30004 window ahead of it (reg 2),
- * v2 routers drop that window (reg 1).
- */
-static int adt_acio_rc_regnum(void)
-{
-    char adt_path[32];
-
-    for (int i = 0; i < MAX_CIO_DEVS; ++i) {
-        snprintf(adt_path, sizeof(adt_path), "/arm-io/acio%d", i);
-        int node = adt_path_offset(adt, adt_path);
-        if (node >= 0)
-            return adt_acio_is_v2(node) ? 1 : 2;
-    }
-
-    return 2;
 }
 
 static int dt_set_acio_tunables(void)
@@ -8173,51 +8147,20 @@ static int dt_set_display(void)
             return 0;
         dt_set_j514s_native();
         return 0;
-    } else if (!fdt_node_check_compatible(dt, 0, "apple,t6030") ||
-               !fdt_node_check_compatible(dt, 0, "apple,t8122") ||
-               !fdt_node_check_compatible(dt, 0, "apple,t6031")) {
+    } else if (dt_display_handoff_has_profile(dt)) {
         /*
-         * Fail-soft handoff (kboot_display_handoff.c): it always returns 0, never uses the
-         * helpers above (they bail out of kboot or enable nodes) and never enables a node.
-         * On T8122 it does nothing unless chosen.asahi,t8122-dcp=1; the external DCP firmware is
-         * reserved only with chosen.asahi,t8122-dcpext=1 and that handoff. On T6031 it does nothing
-         * unless the board is a J514C or J516C, and reserves only __OS_LOG unless
-         * chosen.asahi,t6031-dcp=1 (on a J516C, dt_set_m3_defaults() sets it unless a config line
-         * set it).
+         * The SoCs the profile-driven, fail-soft handoff (kboot_display_handoff.c) has a profile
+         * for (T6030, T8122, T6031, T6040, T6041, T6050). It always returns 0, never uses the
+         * helpers above (they bail out of kboot or enable nodes) and never enables a node; the
+         * profile, the OS firmware and the device tree decide what it hands over. On T8122 the
+         * external DCP firmware is reserved only with chosen.asahi,t8122-dcpext=1 and that
+         * handoff. A SoC without a profile (T6032: its 27.0.1 ADT has no dcp/disp0, the Studio's
+         * displays are dcpext0..7) gets nothing.
          */
         ret = dt_set_display_handoff(dt);
         if (!fdt_node_check_compatible(dt, 0, "apple,t8122"))
             dt_reserve_dcpext_firmware(false);
         return ret;
-    } else if (!fdt_node_check_compatible(dt, 0, "apple,t6040")) {
-        /*
-         * Fail-soft T6041 display block handoff (kboot_display_handoff.c): nothing unless the
-         * board is a J616s whose device tree describes the display block; the display nodes stay
-         * disabled.
-         */
-        return dt_set_display_handoff(dt);
-    } else if (!fdt_node_check_compatible(dt, 0, "apple,t6041")) {
-        /*
-         * The same fail-soft handoff on the M4 Max: nothing unless the board is a J616C or
-         * J614C whose device tree describes the display block; the display nodes stay disabled.
-         */
-        return dt_set_display_handoff(dt);
-    } else if (!fdt_node_check_compatible(dt, 0, "apple,t6032")) {
-        /*
-         * T6032 (J575D): refused until the handoff's firmware ABI exists. The missing pieces:
-         * a dcp6 display-gate profile for T6032 pinned to this OS firmware (27.0/27.0.1,
-         * mBoot-20457.1.29) in kboot_display_handoff.c, and a kernel side T6032 ABI; the 27.0.1
-         * ADT also has no dcp/disp0 processor at all (the Studio's displays are dcpext0..7), so
-         * the T6031 profile cannot be reused as is. Nothing is enabled by default.
-         */
-        printf("FDT: T6032: display handoff refused: no T6032 dcp6 display-gate profile for this "
-               "OS firmware (%s) or kernel ABI exists yet; the ADT also has no dcp/disp0 "
-               "(displays are dcpext0..7)\n",
-               os_firmware.string);
-        return 0;
-    } else if (!fdt_node_check_compatible(dt, 0, "apple,t6050")) {
-        /* Fail-soft (kboot_display_handoff.c): __OS_LOG reservations and the internal panel. */
-        return dt_set_display_handoff(dt);
     } else if (!fdt_node_check_compatible(dt, 0, "apple,t8142")) {
         ret = dt_carveout_reserved_regions("dcp", "disp0", "disp0_piodma",
                                            disp_reserved_regions_t8142,
@@ -9999,15 +9942,23 @@ static int dt_disable_missing_j700_touch_id(void)
     return 0;
 }
 
-static int dt_disable_missing_devs(const char *adt_prefix, const char *dt_prefix, int max_devs,
-                                   int regnum)
+/*
+ * Disable every DT device of a kind (dt_prefix) whose address is none of the register windows of
+ * the ADT's devices of that kind (adt_prefix). The DT names a node after one window of its device,
+ * and which one depends on the block (an ACIO v1 router lists a window ahead of its root complex,
+ * v2 does not), so every window counts: no two devices of a kind share one (checked on the ADTs of
+ * every Mac in the 27.2.1 IPSW).
+ */
+static int dt_disable_missing_devs(const char *adt_prefix, const char *dt_prefix, int max_devs)
 {
+    /* Windows kept per ADT device: the most any Mac's usb-drd, acio or i2c lists is 10. */
+    enum { MAX_REGS = 16 };
     int ret = -1;
     int adt_prefix_len = strlen(adt_prefix);
     int dt_prefix_len = strlen(dt_prefix);
 
-    int acnt = 0, phcnt = 0;
-    u64 *addrs = calloc(max_devs, sizeof(u64));
+    int acnt = 0, ndevs = 0, phcnt = 0;
+    u64 *addrs = calloc(max_devs * MAX_REGS, sizeof(u64));
     u32 *phandles = calloc(max_devs * 5, sizeof(u32)); // Allow up to 5 extra nodes per device
     if (!addrs || !phandles)
         bail_cleanup("FDT: out of memory\n");
@@ -10041,12 +9992,20 @@ static int dt_disable_missing_devs(const char *adt_prefix, const char *dt_prefix
         if (name[adt_prefix_len] && (name[adt_prefix_len] < '0' || name[adt_prefix_len] > '9'))
             continue;
 
-        if (acnt >= max_devs)
+        if (ndevs++ >= max_devs)
             bail_cleanup("ADT: too many /arm-io/%s devices\n", adt_prefix);
 
         path[pp] = node;
-        if (adt_get_reg(adt, path, "reg", regnum, &addrs[acnt++], NULL) < 0)
+        int nregs = 0;
+        while (nregs < MAX_REGS &&
+               adt_get_reg(adt, path, "reg", nregs, &addrs[acnt + nregs], NULL) >= 0)
+            nregs++;
+        if (!nregs)
             bail_cleanup("Error getting /arm-io/%s regs\n", name);
+        if (nregs == MAX_REGS && adt_get_reg(adt, path, "reg", nregs, &(u64){0}, NULL) >= 0)
+            printf("ADT: /arm-io/%s: only its first %d register windows are matched\n", name,
+                   MAX_REGS);
+        acnt += nregs;
     }
 
     for (u32 die = 0; die < die_count; ++die) {
@@ -10284,43 +10243,6 @@ __attribute__((unused)) static int dt_transfer_virtios(void)
         if (fdt_setprop(dt, fnode, "interrupts", intprop, 4 * intcells))
             bail("FDT: couldn't set %s.interrupts\n", fullname);
     }
-
-    return 0;
-}
-
-/*
- * Remove unneeded apple,always-on from unused memory channels on T8012.
- * This is needed because the amount of memory and the amount of used
- * memory channels depends on the storage configuration of the host Mac
- * and can only be determined at runtime.
- */
-static int dt_set_pmgr(void)
-{
-    if (chip_id != T8012)
-        return 0;
-
-    if (mem_size_actual > 0x40000000)
-        return 0;
-
-    int pmgr_node = fdt_path_offset(dt, "/soc/power-management@20e000000");
-    if (pmgr_node < 0) {
-        printf("FDT: Failed to find pmgr node\n");
-        return 0;
-    }
-
-    int dcs2_node = fdt_path_offset(dt, "/soc/power-management@20e000000/power-controller@80258");
-    if (dcs2_node < 0)
-        bail("FDT: failed to find ps_dcs2 node\n");
-
-    /* Allow failure */
-    fdt_delprop(dt, dcs2_node, "apple,always-on");
-
-    int dcs3_node = fdt_path_offset(dt, "/soc/power-management@20e000000/power-controller@80260");
-    if (dcs3_node < 0)
-        bail("FDT: failed to find ps_dcs3 node\n");
-
-    /* Allow failure */
-    fdt_delprop(dt, dcs3_node, "apple,always-on");
 
     return 0;
 }
@@ -11735,10 +11657,8 @@ int kboot_prepare_dt(void *fdt)
     /*
      * Room for what kboot adds to the tree. One margin on every Mac, sized for the largest
      * addition kboot makes on any SoC today: 96K of general edits, about 6K of SMBIOS description
-     * U-Boot builds its tables from, and up to 160K of handoff data (a T8122's PMP values, GPU and
-     * PMP facts and display clock description; a T6030's PMP values and display ADT facts, at
-     * most 46K; a T6031's or T6040's PMP values and firmware handoffs; a T6032's firmware UUID
-     * list).
+     * U-Boot builds its tables from, and up to 160K of handoff data (PMP values, GPU and display
+     * firmware handoffs, a T6031's ADT facts, a T6032's firmware UUID list).
      */
     dt_bufsize += DT_EDIT_MARGIN;
     dt = memalign(DT_ALIGN, dt_bufsize);
@@ -11981,11 +11901,11 @@ int kboot_prepare_dt(void *fdt)
         return -1;
     if (dt_set_ipd())
         return -1;
-    if (dt_disable_missing_devs("usb-drd", "usb@", 8, 0))
+    if (dt_disable_missing_devs("usb-drd", "usb@", 8))
         return -1;
-    if (dt_disable_missing_devs("acio", "cio@", 8, adt_acio_rc_regnum()))
+    if (dt_disable_missing_devs("acio", "cio@", 8))
         return -1;
-    if (dt_disable_missing_devs("i2c", "i2c@", 16, 0)) /* T6050 has nine */
+    if (dt_disable_missing_devs("i2c", "i2c@", 16)) /* T6050 has nine */
         return -1;
     if (dt_disable_missing_j700_touch_id())
         return -1;
@@ -11996,8 +11916,6 @@ int kboot_prepare_dt(void *fdt)
     if (dt_set_isp())
         return -1;
     dt_set_j713_isp();
-    if (dt_set_pmgr())
-        return -1;
     if (chip_id == T8132 && (dt_set_ans_nvme(false) || dt_set_t8132_lifecycle()))
         return -1;
     if (dt_set_t8142_sleep_apcie())
@@ -12038,19 +11956,8 @@ int kboot_prepare_dt(void *fdt)
     if (dt_set_pmp_t6030())
         return -1;
 
-    /* Optional export goes last so it cannot consume space needed by fixups. */
     if (chip_id == T8122)
-        dt_gpu_t8122_diagnostics(dt);
-
-    /* After the GPU export, so that one stays as before. */
-    if (chip_id == T8122) {
         dt_set_pmp_t8122();
-        dt_pmp_t8122_facts(dt);
-    }
-
-    /* Read-only ADT export, last, in its own buffer room. */
-    if (chip_id == T6030)
-        dt_display_facts_t6030(dt);
 
     /* T6031 (J514C/J516C): this Mac's PMP values and firmware image UUIDs, in their own room.
      * T6032 (J575D): the UUID list only (its 27.0.1 ADT has no PMP and no disp0 clock facts).
