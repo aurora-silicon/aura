@@ -4361,6 +4361,15 @@ static int dt_device_dart_mmio(int fdt_node, int adt_node, u64 *addr, u64 *size)
             adt_get_reg(adt, trace, "reg", 0, &adt_base, size) < 0 || adt_base != base)
             return -1;
 
+        /*
+         * The callers read the DART's registers. Leave a DART that the PMGR reports gated
+         * untouched: an access to a powered-down block can stall the bus instead of faulting.
+         */
+        if (pmgr_adt_is_powered(path) == 0) {
+            printf("FDT: %s is powered down, not reading its registers\n", path);
+            return -1;
+        }
+
         *addr = adt_base;
         return 0;
     }
