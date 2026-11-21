@@ -30,7 +30,6 @@ enum { V26_6, V26_6_2, V27_2 };
 static struct { int version; } os_firmware;
 struct adt_segment_ranges { u64 phys, iova, remap; u32 size, unk; };
 static void *adt;
-static unsigned chip_id = T8132;
 static int fault;
 static struct adt_segment_ranges segs[2];
 static u64 bases[4], sizes[4];
@@ -76,7 +75,8 @@ int main(void)
 {
     char blob[32768];
     const char *regions[] = {"uat-ttbs", "uat-pagetables", "uat-handoff", "uat-shared-l2", "gpu-fw-text", "gpu-fw-data"};
-    /* 13: another M4 Mac on 26.6.2 publishes; 14: the J713 on 26.6 still does. */
+    /* Board and release never decide: 13, another M4 Mac, publishes; 14, the J713 on 26.6, does
+     * too; 11, the J715 on 26.6 with an ADT layout gpu_fw_layout() rejects, is refused. */
     for (fault = 0; fault <= 14; fault++) {
         os_firmware.version = fault == 14 ? V26_6 : V26_6_2;
         assert(!fdt_create_empty_tree(blob, sizeof(blob)));
@@ -108,6 +108,7 @@ int main(void)
         if (fault == 11) {
             assert(!fdt_setprop_string(blob, 0, "compatible", "apple,j715"));
             os_firmware.version = V26_6;
+            segs[1].unk = 0x10; /* two segments with 27.2's __DATA flags: an unknown shape */
         }
         if (fault == 12) {
             gpu = fdt_path_offset(blob, "/gpu");
@@ -120,7 +121,11 @@ int main(void)
         gpu = fdt_path_offset(blob, "/gpu");
         int len;
         const fdt32_t *version = fdt_getprop(blob, gpu, "apple,g16-handoff-version", &len);
-        if (fault && fault < 13) {
+        if (fault == 12) {
+            /* Another GPU's node is left to its own handoff, untouched. */
+            assert(!result && version && fdt32_to_cpu(*version) == 99 && !fdt_num_mem_rsv(blob));
+            assert(!fdt_getprop(blob, gpu, "status", NULL));
+        } else if (fault && fault < 13) {
             assert(!result && !version && !fdt_num_mem_rsv(blob));
             const char *status = fdt_getprop(blob, gpu, "status", NULL);
             assert(status && !strcmp(status, "disabled"));

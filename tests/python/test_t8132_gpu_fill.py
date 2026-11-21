@@ -59,7 +59,6 @@ _Static_assert(sizeof(u64) == 8, "the aura host fixture requires an LP64 host");
 #define T8132 0x8132
 enum fw_version { V_UNKNOWN, V26_6, V26_6_2, V27_0, V27_2 };
 static struct { enum fw_version version; } os_firmware;
-static unsigned chip_id = T8132;
 static void *adt = (void *)1;
 struct adt_segment_ranges { u64 phys, iova, remap; u32 size, unk; };
 
@@ -166,7 +165,6 @@ static void uat_regions(void)
     };
     memcpy(uat, j773g, sizeof(uat));
     irqs[0] = 994; irqs[1] = 993; irqs[2] = 996; irqs[3] = 995;
-    chip_id = T8132;
     has_shared_ro = has_shared_rw = false;
     shared_ro[0] = shared_ro[1] = shared_rw[0] = shared_rw[1] = 0;
 }
@@ -248,7 +246,7 @@ static void expect_published(const char *what, u32 version)
                    fdt64_ld(&reg[1]) == want[i][1]);
             assert(fdt_getprop(dt, node, "no-map", &len) && !len);
             assert(!strcmp(status(node), "okay"));
-            u64 base, size;
+            uint64_t base, size;
             assert(!fdt_get_mem_rsv(dt, i, &base, &size) && base == want[i][0] &&
                    size == want[i][1]);
         }
@@ -294,9 +292,14 @@ int main(void)
     expect_published("J713 on 27.0, three segments", 2);
 
     world_27_2(); os_firmware.version = V27_0;
-    expect_refused("27.0 on the J773g");
+    expect_published("27.0 on the J773g, three segments: the ADT picks the layout", 2);
     world_26_6_2(); os_firmware.version = V_UNKNOWN;
-    expect_refused("unknown release on the J773g");
+    expect_published("unknown release on the J773g, two segments", 1);
+
+    world_27_2(); os_firmware.version = V27_0; segment_count = 1;
+    expect_refused("unknown ADT shape on 27.0");
+    world_26_6_2(); os_firmware.version = V_UNKNOWN; segment_count = 4;
+    expect_refused("unknown ADT shape on an unknown release");
     world_27_2(); segment_count = 1;
     expect_refused("one segment");
     world_27_2(); segment_count = 4;
@@ -363,4 +366,4 @@ def test_t8132_gpu_fill(tmp_path):
                     "-I", str(libfdt), str(cfile), *sources, "-o", str(binary)], check=True)
     result = subprocess.run([str(binary)], capture_output=True, text=True)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert result.stdout.count("PASS") == 26, result.stdout
+    assert result.stdout.count("PASS") == 28, result.stdout

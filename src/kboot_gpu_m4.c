@@ -48,7 +48,7 @@ static int reserve_range(void *dt, struct gpu_m4_range range)
     if (count < 0)
         return count;
     for (int i = 0; i < count; i++) {
-        u64 base, size;
+        uint64_t base, size;
         if (fdt_get_mem_rsv(dt, i, &base, &size))
             return -1;
         if (base + size >= base && base <= range.base && base + size >= range.base + range.size)
@@ -62,11 +62,12 @@ static int publish_gpu_m4(void *dt)
     int gpu = fdt_path_offset(dt, "gpu");
     if (gpu < 0)
         return 0; /* A framebuffer-only DT needs no GPU handoff. */
-    /* The G16 handoff follows the 26.6.2 and 27.2 firmware, not the board; J713 as before. */
-    if (chip_id != T8132 ||
-        (fdt_node_check_compatible(dt, 0, "apple,j713") && os_firmware.version != V26_6_2 &&
-         os_firmware.version != V27_2) ||
-        fdt_node_check_compatible(dt, gpu, "apple,agx-t8132"))
+    /*
+     * The handoff follows what the machine describes, not the board or the OS release: a GPU
+     * node for the T8132 GPU and, below, a gfx-asc firmware layout gpu_fw_layout() accepts.
+     * Anything else keeps the GPU off and the Mac on its framebuffer.
+     */
+    if (fdt_node_check_compatible(dt, gpu, "apple,agx-t8132"))
         return -1;
 
     /* A failed refresh must never leave a stale completed-handoff marker. */
@@ -177,8 +178,9 @@ static int publish_gpu_m4(void *dt)
 
 int dt_set_gpu_m4(void *dt)
 {
+    /* Only a DT that describes the T8132 GPU gets this handoff; other GPUs have their own. */
     int gpu = fdt_path_offset(dt, "gpu");
-    if (chip_id != T8132 || gpu < 0)
+    if (gpu < 0 || fdt_node_check_compatible(dt, gpu, "apple,agx-t8132"))
         return 0;
 
     if (!publish_gpu_m4(dt))
