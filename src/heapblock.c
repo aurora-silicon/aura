@@ -66,6 +66,23 @@ uintptr_t heapblock_high_water(void)
     return (uintptr_t)heap_base;
 }
 
+/*
+ * Whether malloc() can take @size bytes without running the heap into its limit, which panics.
+ * dlmalloc grows the heap by at most the request plus its padding, rounded up to its granularity
+ * (the page size), and a page to align the heap's end; the slack covers that many times over.
+ * Without a limit the heap can always grow.
+ */
+#define HEAPBLOCK_MALLOC_SLACK (256 * 1024)
+
+bool heapblock_malloc_fits(size_t size)
+{
+    uintptr_t base = (uintptr_t)heap_base, limit = (uintptr_t)heap_limit;
+    if (!heap_limit)
+        return true;
+    return base <= limit && limit - base >= HEAPBLOCK_MALLOC_SLACK &&
+           size <= limit - base - HEAPBLOCK_MALLOC_SLACK;
+}
+
 void *heapblock_alloc(size_t size)
 {
     return heapblock_alloc_aligned(size, 64);
