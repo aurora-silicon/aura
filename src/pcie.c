@@ -361,6 +361,36 @@ static int pcie_t8140_preflight(const char *path, int *adt_path, u32 ports, u32 
     return 0;
 }
 
+/*
+ * The link speed the ADT sets for the port behind bridge node `bridge`, as a Target Link Speed
+ * value (1: 2.5 GT/s, 2: 5 GT/s, 3: 8 GT/s, ...), in *speed. -1 when the bridge has no
+ * "maximum-link-speed": the ADT sets no limit.
+ *
+ * Some devices override "maximum-link-speed" in the device child nodes.
+ * The property used for the link speed seems to be ad-hoc made up.
+ * The 10 GB ethernet adapter uses "target-link-speed" and the SD card
+ * reader uses "expected-link-speed". Assume that PCIe link speed override
+ * resides in the first (only?) child node.
+ */
+int pcie_adt_link_speed(int bridge, u32 *speed)
+{
+    if (ADT_GETPROP(adt, bridge, "maximum-link-speed", speed) < 0)
+        return -1;
+    if (*speed == 1) {
+        int np = adt_first_child_offset(adt, bridge);
+        if (np >= 0) {
+            int target_speed;
+            if (ADT_GETPROP(adt, np, "target-link-speed", &target_speed) >= 0 && target_speed > 0) {
+                *speed = target_speed;
+            } else if (ADT_GETPROP(adt, np, "expected-link-speed", &target_speed) >= 0 &&
+                       target_speed > 0) {
+                *speed = target_speed;
+            }
+        }
+    }
+    return 0;
+}
+
 /* What PHY control gets once the PHY is ready. */
 static u32 pcie_phy_up(const struct state *state)
 {
@@ -1038,27 +1068,7 @@ static int pcie_init_controller(int controller, const char *path, bool ans_off)
         }
 
         u32 max_speed;
-        if (ADT_GETPROP(adt, bridge_offset, "maximum-link-speed", &max_speed) >= 0) {
-            /* Some devices override "maximum-link-speed" in the device child nodes.
-             * The property used for the link speed seems to be ad-hoc made up.
-             * The 10 GB ethernet adapter uses "target-link-speed" and the SD card
-             * reader uses "expected-link-speed". Assume that PCIe link speed override
-             * resides in the first (only?) child node.
-             */
-            if (max_speed == 1) {
-                int np = adt_first_child_offset(adt, bridge_offset);
-                if (np >= 0) {
-                    int target_speed;
-                    if (ADT_GETPROP(adt, np, "target-link-speed", &target_speed) >= 0 &&
-                        target_speed > 0) {
-                        max_speed = target_speed;
-                    } else if (ADT_GETPROP(adt, np, "expected-link-speed", &target_speed) >= 0 &&
-                               target_speed > 0) {
-                        max_speed = target_speed;
-                    }
-                }
-            }
-
+        if (pcie_adt_link_speed(bridge_offset, &max_speed) >= 0) {
             printf("pcie: Port %d max speed = %d\n", port, max_speed);
 
             if (max_speed == 0) {

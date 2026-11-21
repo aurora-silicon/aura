@@ -79,17 +79,17 @@ static const struct t6050_port {
 #define DBI_RO_WR_EN   0x8bc
 
 /* PCI config space */
-#define PCI_COMMAND               0x04
-#define PCI_PRIMARY_BUS           0x18
-#define PCI_CAPABILITY_LIST       0x34
-#define PCI_CAP_ID_EXP            0x10
-#define PCI_EXP_LNKCAP            0x0c
-#define PCI_EXP_LNKCTL            0x10
-#define PCI_EXP_LNKSTA            0x12
-#define PCI_EXP_LNKCAP2           0x2c
-#define PCI_EXP_LNKCAP2_SLS_8_0GB BIT(3)
-#define PCI_EXP_LNKCTL2           0x30
-#define PCI_CFG_SIZE              0x1000
+#define PCI_COMMAND         0x04
+#define PCI_PRIMARY_BUS     0x18
+#define PCI_CAPABILITY_LIST 0x34
+#define PCI_CAP_ID_EXP      0x10
+#define PCI_EXP_LNKCAP      0x0c
+#define PCI_EXP_LNKCTL      0x10
+#define PCI_EXP_LNKSTA      0x12
+#define PCI_EXP_LNKCAP2     0x2c
+#define PCI_EXP_LNKCAP2_SLS GENMASK(7, 1)
+#define PCI_EXP_LNKCTL2     0x30
+#define PCI_CFG_SIZE        0x1000
 
 #define GPIO_PERST_MASK  0x27f
 #define GPIO_PERST_LOW   0x202
@@ -495,7 +495,39 @@ static int find_pcie_cap(u64 rp)
     FAIL("no PCI Express capability on the root port\n");
 }
 
-/* D: root-port DBI tunables and the Gen3 x1 policy, in the order Apple's driver uses */
+/*
+ * The Target Link Speed for a port: what its ADT bridge sets (pcie_adt_link_speed(), the rule
+ * pcie.c applies on the other Apple PCIe hosts), else, for a bridge with no "maximum-link-speed",
+ * the fastest the root port supports, which pcie.c leaves such a port at too. The link then trains
+ * at the fastest speed both ends have (J775D: 16 GT/s on port 2, the RTL8127A's fastest; the ports
+ * whose bridges set 3 stay at 8 GT/s). It never asks for a speed the root port does not support.
+ */
+static int target_link_speed(const struct port_regs *pp, u32 lnkcap2)
+{
+    u32 sls = FIELD_GET(PCI_EXP_LNKCAP2_SLS, lnkcap2);
+    int bridge = adt_path_offset(adt, pp->bridge);
+    u32 top = 0, speed;
+
+    for (u32 s = 1; s <= 7; s++)
+        if (sls & BIT(s - 1))
+            top = s;
+    if (bridge < 0 || !top || !(sls & BIT(0)))
+        FAIL("no bridge, or link speeds 0x%x\n", sls);
+    if (pcie_adt_link_speed(bridge, &speed) < 0) {
+        speed = top;
+    } else if (!speed) {
+        FAIL("maximum-link-speed 0\n");
+    } else if (speed > top) {
+        printf("pcie-t6050: port %d: the ADT's speed %u is above the root port's %u\n", pp->p->port,
+               speed, top);
+        speed = top;
+    }
+    if (!(sls & BIT(speed - 1)))
+        FAIL("speed %u not supported (0x%x)\n", speed, sls);
+    return speed;
+}
+
+/* D: root-port DBI tunables, then an x1 link at the ADT's speed */
 static int stage_d(const struct port_regs *pp)
 {
     static const struct {
@@ -517,12 +549,13 @@ static int stage_d(const struct port_regs *pp)
         TRY(apply_tunables(pp->bridge, shadows[i].prop, rp, PCI_CFG_SIZE, NO_CHECK));
     }
     TRY(rmw("Gen3 EQ", rp + DBI_GEN3_EQ, 0, BIT(0)));
-    if (!(read32(rp + cap + PCI_EXP_LNKCAP2) & PCI_EXP_LNKCAP2_SLS_8_0GB))
-        FAIL("Gen3 not advertised\n");
+    int speed = target_link_speed(pp, read32(rp + cap + PCI_EXP_LNKCAP2));
+    TRY(speed);
     u16 lnkctl2 = read16(rp + cap + PCI_EXP_LNKCTL2);
-    write16(rp + cap + PCI_EXP_LNKCTL2, (lnkctl2 & ~0xf) | 3);
-    if ((read16(rp + cap + PCI_EXP_LNKCTL2) & 0xf) != 3)
+    write16(rp + cap + PCI_EXP_LNKCTL2, (lnkctl2 & ~0xf) | speed);
+    if ((read16(rp + cap + PCI_EXP_LNKCTL2) & 0xf) != (u16)speed)
         FAIL("target link speed did not take\n");
+    printf("pcie-t6050: port %d target link speed Gen%d\n", pp->p->port, speed);
     TRY(rmw("link width 1", rp + DBI_LINK_WIDTH, 0x3f << 16, 1 << 16));
     TRY(rmw("lanes 1", rp + DBI_GEN2_CTRL, 0x1f << 8, 1 << 8));
     TRY(rmw("link cap x1", rp + cap + PCI_EXP_LNKCAP, 0x3f << 4, 1 << 4));
