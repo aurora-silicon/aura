@@ -628,7 +628,12 @@ def test_nothing_reserves_the_window_from_the_os():
     source = kboot_source()
     # Each range that can span the window goes around it: the heap, the image, CTXR_D
     # and the T8132 high-water interval.
-    assert source.count("dt_reserve_outside_exec_window(") == 5
+    assert source.count("dt_reserve_outside_exec_window(") == 4
+    # Heap/image reservations use the recording wrapper, which still excludes the OS window.
+    assert source.count("dt_reserve_retained_extent(") == 3
+    retained = function(source, "dt_reserve_retained_extent")
+    assert "dt_reserve_outside_exec_window(start, size)" in retained
+    assert "fdt_add_mem_rsv" not in retained
     assert "dt_reserve_outside_exec_window(start, end - start))\n            bail(\"FDT: couldn't reserve the T8132" in source
     # The firmware RO range stays reserved in every mode, before the EL1 guest goes its own way.
     ro = function(source, "dt_reserve_secondary_ro")
