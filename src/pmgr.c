@@ -874,6 +874,18 @@ int pmgr_reset_held(int die, const char *name)
 }
 #endif /* SPTM_VIRT */
 
+/* The ADT's device i: its name (16 bytes, NUL-terminated only if shorter) and its PS word on die 0,
+ * 0 for one without (a virtual device). -1 past the last, or before pmgr_init. */
+int pmgr_device_at(u32 i, const char **name, uintptr_t *psreg)
+{
+    if (!pmgr_initialized || !pmgr_devices || i >= pmgr_devices_len)
+        return -1;
+    const struct pmgr_device *dev = &pmgr_devices[i];
+    *name = dev->name;
+    *psreg = (dev->flags & PMGR_FLAG_VIRTUAL) ? 0 : pmgr_device_get_addr(0, dev);
+    return 0;
+}
+
 uintptr_t pmgr_psreg_by_name(int die, const char *name)
 {
     if (die < 0 || die >= pmgr_dies)

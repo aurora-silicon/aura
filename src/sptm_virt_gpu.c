@@ -10,16 +10,21 @@
  * (sptm_virt_gpu_ring, _head, _nrec); the host's P_EXIT resumes the guest. Each of these parks
  * happens once. At every n-th write the host names, before it is performed, the GPU firmware's
  * memory is copied into a snapshot (sptm_virt_snap.c); from the first, every message on the GPU
- * ASCs' mailboxes goes into a log of its own.
+ * ASCs' mailboxes goes into a log of its own. With AURA_GFXPMP the first starts the GPU/PMP
+ * record instead of a park (sptm_virt_gfxrec.c): every hooked access is handed to it once
+ * performed, and the ring stops at its window's end. Every access to the MMIO_PROTECTED block
+ * (sgx +0xe00000), SPTM's and XNU's, goes into a record of its own from the first trap on.
  */
 
 #include "sptm_virt.h"
 #include "adt.h"
 #include "exception.h"
+#include "gxf.h"
 #include "hv.h"
 #include "iodev.h"
 #include "malloc.h"
 #include "memory.h"
+#include "sptm_virt_gfxrec.h"
 #include "sptm_virt_priv.h"
 #include "sptm_virt_snap.h"
 #include "string.h"
@@ -129,9 +134,13 @@ static void gpu_note(struct exc_info *ctx, u64 addr, u64 val, bool write, int wi
 {
     if (!sptm_virt_gpu_ring)
         return;
+    /* The GPU/PMP record's window end: the ring keeps what led up to its doorbell. */
+    u64 t = mrs(CNTPCT_EL0), stop = __atomic_load_n(&sptm_virt_gfxrec_ring_stop, __ATOMIC_RELAXED);
+    if (stop && t >= stop)
+        return;
     u64 i = __atomic_fetch_add(&sptm_virt_gpu_head, 1, __ATOMIC_RELAXED);
     struct gpu_rec *r = &sptm_virt_gpu_ring[i % sptm_virt_gpu_nrec];
-    r->t = mrs(CNTPCT_EL0);
+    r->t = t;
     r->meta = (addr & GENMASK(47, 0)) | ((u64)(width & 7) << 48) | ((u64) !!write << 51) |
               ((u64)(smp_id() & 15) << 52);
     r->val = val;
@@ -187,7 +196,7 @@ void sptm_virt_gpu_deadline(struct exc_info *ctx)
  */
 static struct {
     u64 pa, size;
-} gpu_asc[2];
+} gpu_asc[2], gpu_pmp_asc;
 
 static bool gpu_stop_msg_hit(u64 addr, const u64 *pair, u64 v, int width)
 {
@@ -327,6 +336,44 @@ static void gpu_kick(struct exc_info *ctx, const u64 *val, int width)
                    sptm_virt_snap_watch[i].off, h->watch[i]);
 }
 
+/* ---- the GPU/PMP record ------------------------------------------------------------------ */
+
+/* An access a hook has performed, for the record (the debug link's PMGR hook calls it too). */
+void sptm_virt_gfxrec_tap(u64 addr, const u64 *val, bool write, int width)
+{
+    if (sptm_virt_gfxrec_buf)
+        sptm_virt_gfxrec_note(addr, val, write, width, smp_id(), mrs(CNTPCT_EL0));
+}
+
+/* An access to the MMIO_PROTECTED block, once performed: who (a GL1 trap is SPTM's), and where. */
+static void gpu_blk_tap(struct exc_info *ctx, u64 addr, const u64 *val, bool write, int width)
+{
+    struct gfxblk_hdr *b = sptm_virt_gfxrec_blk;
+
+    if (b && addr - b->base < b->size)
+        sptm_virt_gfxrec_blk_note(addr, val, write, width, smp_id(), mrs(CNTPCT_EL0), ctx->elr,
+                                  in_gl12());
+}
+
+/* Once, on the core that sees the record over: how it ended. */
+static void gpu_gfxrec_tell(void)
+{
+    static u32 told;
+    struct gfxrec_hdr *h = sptm_virt_gfxrec_buf;
+
+    if (!h || __atomic_load_n(&h->state, __ATOMIC_ACQUIRE) < GFXREC_DONE_TIME ||
+        __atomic_exchange_n(&told, 1, __ATOMIC_SEQ_CST))
+        return;
+    u64 n = min(h->claimed, h->cap);
+    struct gfxblk_hdr *b = sptm_virt_gfxrec_blk;
+    printf("SPTM-virt[gfxpmp]: the record %s at +%lu ms: %lu records of %lu (%lu dropped); the "
+           "MMIO_PROTECTED block's: %lu so far; the MMIO ring stopped at the window's end; read "
+           "them at a park (dump_gfxpmp.py)\n",
+           h->state == GFXREC_DONE_TIME ? "ended by time" : "is FULL",
+           (h->t_done - h->t_start) / (h->cntfrq / 1000), n, h->cap, h->claimed - n,
+           b ? min(b->claimed, b->cap) : 0);
+}
+
 static bool gpu_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int width)
 {
     u64 now = mrs(CNTPCT_EL0);
@@ -341,6 +388,9 @@ static bool gpu_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int w
     /* The value decides, so the write the host names is known before it is performed. */
     bool hit = sptm_virt_gpu_stop_msg && write &&
                gpu_stop_msg_hit(addr, width == 4 ? val : NULL, *val, width);
+    /* Before the doorbell is performed, so the record's window starts ahead of it. */
+    bool started =
+        hit && sptm_virt_gfxrec_trigger(now, val[0], width == 4 ? val[1] : 0, ctx->elr, smp_id());
     if (hit)
         gpu_kick(ctx, val, width);
 
@@ -355,6 +405,8 @@ static bool gpu_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int w
                              : "memory");
         gpu_note(ctx, addr, val[0], write, 3);
         gpu_note(ctx, addr + 8, val[1], write, 3);
+        sptm_virt_gfxrec_tap(addr, val, write, width);
+        gpu_blk_tap(ctx, addr, val, write, width);
         if (gpu_mbox_on)
             gpu_mbox_note(addr, val, write, width);
     } else if (width > 4) {
@@ -364,6 +416,8 @@ static bool gpu_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int w
     } else {
         sptm_virt_mmio_rw(addr, val, write, width);
         gpu_note(ctx, addr, *val, write, width);
+        sptm_virt_gfxrec_tap(addr, val, write, width);
+        gpu_blk_tap(ctx, addr, val, write, width);
         if (gpu_mbox_on)
             gpu_mbox_note(addr, val, write, width);
     }
@@ -382,6 +436,13 @@ static bool gpu_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int w
         if (gpu_printed == sptm_virt_gpu_print_max)
             printf("SPTM-virt[gpu]: print budget used up; the ring keeps recording\n");
     }
+
+    if (started)
+        printf("SPTM-virt[gfxpmp]: cpu%d's doorbell 0x%lx (pc 0x%lx) started the record: %lu ms, "
+               "until tick 0x%lx; the guest goes on\n",
+               smp_id(), val[0], ctx->elr, sptm_virt_gfxrec_buf->window_ms,
+               sptm_virt_gfxrec_buf->t_end);
+    gpu_gfxrec_tell();
 
     sptm_virt_gpu_deadline(ctx);
     /* A message the host names is a repeatable park point; the seconds are not (the guest's own
@@ -423,6 +484,10 @@ static void gpu_hook_adt(const char *path, int idx, const char *what, u64 off, u
     if (!strcmp(what, "gfx-asc") || !strcmp(what, "gfx1-asc")) {
         gpu_asc[what[3] == '1'].pa = pa;
         gpu_asc[what[3] == '1'].size = sz;
+    }
+    if (!strcmp(what, "pmp-asc")) {
+        gpu_pmp_asc.pa = pa;
+        gpu_pmp_asc.size = sz;
     }
     gpu_hook_range(what, pa + off, size ? size : sz);
 }
@@ -484,6 +549,89 @@ static void gpu_snap_setup(void)
     }
 }
 
+static bool gpu_in_hooked_range(u64 pa)
+{
+    for (int i = 0; i < gpu_nranges; i++)
+        if (pa >= gpu_ranges[i].base && pa < gpu_ranges[i].base + gpu_ranges[i].size)
+            return true;
+    return false;
+}
+
+/* The MMIO_PROTECTED block's record: on from the first trap, its own buffer. */
+static void gpu_blk_setup(void)
+{
+    u64 pa = sptm_virt_gfxrec_blk_pa ? sptm_virt_gfxrec_blk_pa : gpu_sgx + 0xe00000;
+    u64 len = sptm_virt_gfxrec_blk_pa ? sptm_virt_gfxrec_blk_len : 0x4000;
+    char node[48];
+
+    if (!gpu_sgx || !len || !gpu_in_hooked_range(pa) || !gpu_in_hooked_range(pa + len - 1)) {
+        printf("SPTM-virt[gfxpmp]: the block 0x%lx+0x%lx isn't all in the GPU trace's windows; no "
+               "block record\n",
+               pa, len);
+        return;
+    }
+    u32 n = min(max(sptm_virt_gfxrec_blk_max, 2U), 1U << 20);
+    u64 bytes = ALIGN_UP(sizeof(struct gfxblk_hdr) + (u64)n * sizeof(struct gfxblk_rec), 0x4000);
+    void *buf = memalign(0x4000, bytes);
+    if (!buf) {
+        printf("SPTM-virt[gfxpmp]: no memory for %u block records; no block record\n", n);
+        return;
+    }
+    memset(buf, 0, bytes);
+    sptm_virt_gfxrec_adt_cover(pa, len, node, sizeof(node));
+    sptm_virt_gfxrec_blk_init(buf, bytes, mrs(CNTFRQ_EL0), pa, len, node);
+    printf("SPTM-virt[gfxpmp]: MMIO_PROTECTED block 0x%lx+0x%lx (%s): every access, SPTM's and "
+           "XNU's, from the first trap to the window's end, into %lu records at 0x%lx "
+           "(sptm_virt_gfxrec_blk)\n",
+           pa, len, node[0] ? node : "no ADT reg covers it", sptm_virt_gfxrec_blk->cap, (u64)buf);
+}
+
+/* The record: its buffer, the windows, the GFX/AGX/SGX PS words; no park at the doorbell. */
+static void gpu_gfxrec_setup(void)
+{
+    if (!sptm_virt_gfxrec_ms)
+        return;
+    if (!sptm_virt_gpu_stop_msg) {
+        printf("SPTM-virt[gfxpmp]: the record starts at the write AURA_GPU_STOP_MSG names, and "
+               "none is named; no record\n");
+        return;
+    }
+    u32 max = sptm_virt_gfxrec_max ? min(sptm_virt_gfxrec_max, 1U << 20) : 1;
+    u64 bytes = ALIGN_UP(sizeof(struct gfxrec_hdr) + (u64)max * sizeof(struct gfxrec_rec), 0x4000);
+    void *buf = memalign(0x4000, bytes);
+    if (!buf) {
+        printf("SPTM-virt[gfxpmp]: no memory for %u records; no record\n", max);
+        return;
+    }
+    memset(buf, 0, bytes);
+    sptm_virt_gfxrec_init(buf, bytes, mrs(CNTFRQ_EL0), sptm_virt_gfxrec_ms);
+    sptm_virt_gfxrec_source(GFXREC_SRC_GFX_ASC, gpu_asc[0].pa, gpu_asc[0].size);
+    sptm_virt_gfxrec_source(GFXREC_SRC_GFX1_ASC, gpu_asc[1].pa, gpu_asc[1].size);
+    sptm_virt_gfxrec_source(GFXREC_SRC_PMP_ASC, gpu_pmp_asc.pa, gpu_pmp_asc.size);
+    for (int i = 0; i < gpu_nranges; i++)
+        if (!strcmp(gpu_ranges[i].what, "sgx"))
+            sptm_virt_gfxrec_source(GFXREC_SRC_SGX, gpu_sgx, gpu_ranges[i].size);
+    /* The PS words: the debug link's keep hook (sptm_virt_s2r.c) traps their PMGR page and hands
+     * its accesses on; a word no hook traps is listed and never recorded. No hook is added. */
+    u64 ps[GFXREC_PS_MAX];
+    char names[GFXREC_PS_MAX][17];
+    int nps = sptm_virt_gfxrec_adt_ps(ps, names, GFXREC_PS_MAX);
+    for (int i = 0; i < nps; i++) {
+        bool trapped = sptm_virt_s2r_hooks_page(ps[i] & ~0x3fffUL) || gpu_in_hooked_range(ps[i]);
+        sptm_virt_gfxrec_add_ps(ps[i], names[i], trapped);
+        printf("SPTM-virt[gfxpmp]: PMGR %s's PS word 0x%lx: %s\n", names[i], ps[i],
+               trapped ? "its page traps; its writes go in the record"
+                       : "its page doesn't trap; NOT recorded");
+    }
+    sptm_virt_gpu_msg_park = 0;
+    struct gfxrec_hdr *h = sptm_virt_gfxrec_buf;
+    printf("SPTM-virt[gfxpmp]: from the named write, %u ms of gfx-asc 0x%lx and pmp-asc 0x%lx "
+           "mailbox messages and sgx 0x%lx writes into %lu records at 0x%lx "
+           "(sptm_virt_gfxrec_buf); the write doesn't park\n",
+           sptm_virt_gfxrec_ms, gpu_asc[0].pa, gpu_pmp_asc.pa, gpu_sgx, h->cap, (u64)h);
+    gpu_blk_setup();
+}
+
 void sptm_virt_gpu_setup(void)
 {
     /* The deadline park is offered from every GL trap (sptm_virt_gl_sync), GPU trace or not. */
@@ -515,6 +663,7 @@ void sptm_virt_gpu_setup(void)
     gpu_hook_adt("/arm-io/mcc", 9, "pmp-ptd-upd", 0, 0);
     gpu_hook_adt("/arm-io/pmp", 0, "pmp-asc", 0, 0);
     gpu_snap_setup();
+    gpu_gfxrec_setup();
     printf("SPTM-virt[gpu]: ring 0x%lx (%lu records, head at 0x%lx), stop after %u s or a write of "
            "0x%lx (mask 0x%lx, endpoint %d), print budget %u\n",
            (u64)sptm_virt_gpu_ring, sptm_virt_gpu_nrec, (u64)&sptm_virt_gpu_head,

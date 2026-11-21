@@ -930,10 +930,12 @@ static bool s2r_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int w
         }
         if (width == 4) {
             s2r_rw128(addr, val, write);
+            sptm_virt_gfxrec_tap(addr, val, write, width);
             sptm_virt_s2r_note(ctx, addr, val[0], write, 3);
             sptm_virt_s2r_note(ctx, addr + 8, val[1], write, 3);
         } else if (width >= 0 && width <= 3) {
             sptm_virt_mmio_rw(addr, val, write, width);
+            sptm_virt_gfxrec_tap(addr, val, write, width);
             /* XNU polls the cores' counters there all the time; their writes still go in. */
             bool first;
             if (write || strcmp(s2r_page_name(addr & ~0x3fffUL, &first), "cpu-impl"))
@@ -1007,6 +1009,7 @@ static bool s2r_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int w
 
     if (width == 4) {
         s2r_rw128(addr, val, write);
+        sptm_virt_gfxrec_tap(addr, val, write, width);
         sptm_virt_s2r_note(ctx, addr, val[0], write, 3);
         sptm_virt_s2r_note(ctx, addr + 8, val[1], write, 3);
         return true;
@@ -1017,6 +1020,8 @@ static bool s2r_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int w
         return false;
     }
     sptm_virt_mmio_rw(addr, val, write, width);
+    /* The GPU/PMP record takes the GFX domain's PS writes from here (sptm_virt_gfxrec.c). */
+    sptm_virt_gfxrec_tap(addr, val, write, width);
     if (timer)
         s2r_crumb(0x30);
     sptm_virt_s2r_note(ctx, addr, *val, write, width);
@@ -1103,6 +1108,15 @@ static bool s2r_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int w
                   (!strcmp(what, "pmgr-cluster-ctl") && (*val & 0xf) == 0)))
         s2r_core_sleeps();
     return true;
+}
+
+/* Does this hook trap the guest's accesses to page (for the GPU/PMP record's PS words)? */
+bool sptm_virt_s2r_hooks_page(u64 page)
+{
+    for (u32 i = 0; i < sptm_virt_s2r_pages; i++)
+        if (s2r_pages[i].page == page)
+            return true;
+    return false;
 }
 
 static void s2r_hook_range(const char *what, u64 base, u64 size)

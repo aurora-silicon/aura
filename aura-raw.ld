@@ -58,6 +58,17 @@ SECTIONS {
         *sptm_virt_pmu.o(.text .text.*)
         *sptm_virt_park.o(.text .text.*)
         *sptm_virt_snap.o(.text .text.*)
+        *sptm_virt_gfxrec.o(.text .text.*)
+        *sptm_virt_gfxrec_adt.o(.text .text.*)
+        /*
+         * And the read-only data (format strings) of the small ones: with the GPU/PMP record's,
+         * .rodata had 120 bytes left below its last 64 KiB step; .text has 20 KiB.
+         */
+        *sptm_virt_gpu.o(.rodata .rodata.*)
+        *sptm_virt_park.o(.rodata .rodata.*)
+        *sptm_virt_snap.o(.rodata .rodata.*)
+        *sptm_virt_gfxrec.o(.rodata .rodata.*)
+        *sptm_virt_gfxrec_adt.o(.rodata .rodata.*)
         . = ALIGN(8);
         *(.got.plt)
         _text_content_end = .;
