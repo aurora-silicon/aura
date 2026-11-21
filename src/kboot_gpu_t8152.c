@@ -142,10 +142,15 @@ int dt_set_gpu_t8152(void *dt)
     int defaults = adt_path_offset(adt, "/defaults");
     int reserved = fdt_path_offset(dt, "/reserved-memory");
     u64 dram, dram_size, width, mode, vm;
+    /*
+     * Every T8152 board: the GPU is the SoC's (ADT sgx "gpu,t8152"), and what this admits is the
+     * firmware iBoot loaded, matched below by its nub uuids and text digests against builds[]. A
+     * board whose GPU firmware is not one of those builds is refused there, with the message
+     * below, until its build is added.
+     */
     if (gpu < 0 || chosen < 0 || sgx < 0 || defaults < 0 || reserved < 0 || chip_id != T8152 ||
-        board_id != 0x24 || !string_is(sgx, "compatible", "gpu,t8152") ||
-        !number(chosen, "dram-base", &dram) || !number(chosen, "dram-size", &dram_size) ||
-        !dram_size || dram > UINT64_MAX - dram_size ||
+        !string_is(sgx, "compatible", "gpu,t8152") || !number(chosen, "dram-base", &dram) ||
+        !number(chosen, "dram-size", &dram_size) || !dram_size || dram > UINT64_MAX - dram_size ||
         !number(defaults, "uat-vaddr-size", &width) || width != 43 ||
         !number(sgx, "agx-address-space-mgmt-mode", &mode) || mode != 1 ||
         !number(sgx, "rtkit-private-vm-region-base", &vm) || fdt_address_cells(dt, reserved) != 2 ||
@@ -197,8 +202,13 @@ int dt_set_gpu_t8152(void *dt)
     for (size_t b = 0; nub >= 0 && b < ARRAY_SIZE(builds); b++)
         if (string_is(nub, "uuid", builds[b].profiles[0].uuid))
             build = &builds[b];
-    if (!build)
+    if (!build) {
+        u32 len = 0;
+        const char *uuid = nub < 0 ? NULL : adt_getprop(adt, nub, "uuid", &len);
+        printf("GPU: gfx-asc firmware %.*s is not a known G18G build\n", uuid ? (int)len : 6,
+               uuid ? uuid : "(none)");
         goto refused;
+    }
     const struct gpu_profile *profiles = build->profiles;
 
     const struct adt_segment_ranges *segments[2];
