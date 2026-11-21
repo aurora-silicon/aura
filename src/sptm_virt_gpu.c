@@ -12,6 +12,7 @@
 
 #include "sptm_virt.h"
 #include "adt.h"
+#include "dapf.h"
 #include "exception.h"
 #include "hv.h"
 #include "iodev.h"
@@ -152,6 +153,8 @@ void sptm_virt_gpu_deadline(struct exc_info *ctx)
 
 static bool gpu_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int width)
 {
+    if ((sptm_virt_flags & SPTM_VIRT_ANE_TRACE) && sptm_virt_gpu_head + 2 >= sptm_virt_gpu_nrec)
+        gpu_park(ctx, "the bounded ANE trace ring is full");
     u64 now = mrs(CNTPCT_EL0);
 
     if (!gpu_first_t) {
@@ -240,6 +243,108 @@ static void gpu_hook_adt(const char *path, int idx, const char *what, u64 off, u
     gpu_hook_range(what, pa + off, size ? size : sz);
 }
 
+/*
+ * The ANE trace: every register window the ADT gives the Neural Engine (/arm-io/ane) and its DART
+ * (/arm-io/dart-ane), the interrupt controller's (/arm-io/aic reg[0]), and each slice of the
+ * DART's dapf-instance-N properties, at the filter's four-byte granularity. A window inside
+ * another is traced through the larger one. A missing node, an empty window or a malformed DAPF
+ * property refuses the trace before any hook; nothing the ADT does not name is hooked.
+ */
+#define ANE_TRACE_MAX_REGS  16
+#define ANE_TRACE_DAPF_INST 8
+
+static void ane_trace_setup(void)
+{
+    static const struct {
+        const char *path, *what;
+        int max;
+    } nodes[] = {
+        {"/arm-io/ane", "ane", ANE_TRACE_MAX_REGS},
+        {"/arm-io/dart-ane", "dart-ane", ANE_TRACE_MAX_REGS},
+        {"/arm-io/aic", "aic", 1},
+    };
+    static struct {
+        u64 base, size;
+        const char *what;
+    } w[2 * ANE_TRACE_MAX_REGS + 1 + 2 * DAPF_T8110_MAX_SLICES];
+    int n = 0;
+
+    sptm_virt_gpu_print_max = 0; /* export the ring; no per-access console timing noise */
+    if (sptm_virt_flags & ~SPTM_VIRT_ANE_TRACE)
+        panic("ANE trace: conflicting capture modes\n");
+    for (size_t i = 0; i < ARRAY_SIZE(nodes); i++) {
+        int p[8], idx;
+        if (adt_path_offset_trace(adt, nodes[i].path, p) < 0)
+            panic("ANE trace: no %s in the ADT\n", nodes[i].path);
+        for (idx = 0; idx < nodes[i].max; idx++) {
+            u64 a, sz;
+            if (adt_get_reg(adt, p, "reg", idx, &a, &sz) < 0)
+                break;
+            if (!a || !sz || a + sz < a)
+                panic("ANE trace: %s reg[%d] is empty\n", nodes[i].path, idx);
+            w[n].base = a;
+            w[n].size = sz;
+            w[n++].what = nodes[i].what;
+        }
+        if (!idx)
+            panic("ANE trace: %s has no reg\n", nodes[i].path);
+    }
+    /* The words the ANE DART's filter admits: every slice of every dapf-instance-N it has. */
+    int dart = adt_path_offset(adt, "/arm-io/dart-ane");
+    int nslices = 0;
+    for (u32 inst = 0; dart >= 0 && inst < ANE_TRACE_DAPF_INST; inst++) {
+        struct dapf_window s[DAPF_T8110_MAX_SLICES];
+        char prop[32];
+        u32 len;
+
+        snprintf(prop, sizeof(prop), "dapf-instance-%u", inst);
+        if (!adt_getprop(adt, dart, prop, &len))
+            continue;
+        int count = dapf_t8110_ranges("/arm-io/dart-ane", inst, s, ARRAY_SIZE(s));
+        if (count <= 0)
+            panic("ANE trace: /arm-io/dart-ane %s is malformed\n", prop);
+        if (nslices + count > 2 * DAPF_T8110_MAX_SLICES)
+            panic("ANE trace: /arm-io/dart-ane has more than %d DAPF slices\n",
+                  2 * DAPF_T8110_MAX_SLICES);
+        for (int k = 0; k < count; k++) {
+            /* Inclusive ends; the filter compares whole words. */
+            if (!s[k].start || (s[k].start & 3) || ((s[k].end + 1) & 3) ||
+                s[k].end + 1 <= s[k].start)
+                panic("ANE trace: /arm-io/dart-ane %s slice %d is malformed\n", prop, k);
+            w[n].base = s[k].start;
+            w[n].size = s[k].end + 1 - s[k].start;
+            w[n++].what = "ane-dapf";
+        }
+        nslices += count;
+    }
+    if (!nslices)
+        printf("ANE trace: /arm-io/dart-ane has no DAPF slices\n");
+    static bool inside[ARRAY_SIZE(w)];
+    int keep = 0;
+    for (int i = 0; i < n; i++) {
+        inside[i] = false;
+        for (int j = 0; j < n && !inside[i]; j++)
+            inside[i] = j != i && w[j].base <= w[i].base &&
+                        w[i].base + w[i].size <= w[j].base + w[j].size &&
+                        (w[j].size != w[i].size || j < i);
+    }
+    for (int i = 0; i < n; i++)
+        if (!inside[i])
+            w[keep++] = w[i];
+    if (gpu_nranges + keep > GPU_MAX_RANGES)
+        panic("ANE trace: %d windows, more than %d\n", keep, GPU_MAX_RANGES);
+    for (int i = 0; i < keep; i++) {
+        gpu_ranges[gpu_nranges].base = w[i].base;
+        gpu_ranges[gpu_nranges].size = w[i].size;
+        gpu_ranges[gpu_nranges++].what = w[i].what;
+        if (hv_map_hook(w[i].base, gpu_hook, w[i].size) < 0)
+            panic("ANE trace: cannot hook %s 0x%lx+0x%lx\n", w[i].what, w[i].base, w[i].size);
+        printf("ANE trace: hooked %s 0x%lx+0x%lx\n", w[i].what, w[i].base, w[i].size);
+    }
+    printf("ANE trace: %d windows from the ADT, ring at 0x%lx; export before reset\n", gpu_nranges,
+           (u64)sptm_virt_gpu_ring);
+}
+
 void sptm_virt_gpu_setup(void)
 {
     /* The deadline park is offered from every GL trap (sptm_virt_gl_sync), GPU trace or not. */
@@ -248,7 +353,7 @@ void sptm_virt_gpu_setup(void)
         printf("SPTM-virt[park]: the guest parks in the proxy at its first GL trap after %u s\n",
                sptm_virt_gpu_stop_boot_secs);
     }
-    if (!(sptm_virt_flags & SPTM_VIRT_GPU))
+    if (!(sptm_virt_flags & (SPTM_VIRT_GPU | SPTM_VIRT_ANE_TRACE)))
         return;
     sptm_virt_gpu_ring = memalign(0x4000, GPU_RING_BYTES);
     if (!sptm_virt_gpu_ring) {
@@ -260,6 +365,11 @@ void sptm_virt_gpu_setup(void)
     dc_cvac_range((void *)&sptm_virt_bss_canary, sizeof(sptm_virt_bss_canary));
     sptm_virt_gpu_nrec = GPU_RING_BYTES / sizeof(struct gpu_rec);
     sptm_virt_gpu_head = 0;
+
+    if (sptm_virt_flags & SPTM_VIRT_ANE_TRACE) {
+        ane_trace_setup();
+        return;
+    }
 
     /* sgx reg 0 holds the GPU's PMGR (+0xe80000), its start control and both ASCs. */
     gpu_hook_adt("/arm-io/sgx", 0, "sgx", 0, 0);

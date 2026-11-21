@@ -52,6 +52,10 @@ Environment (all optional; 1 enables a switch):
   AURA_SAMPLE              sample the guest's PC until each core's XNU entry (pre-XNU hangs)
   AURA_SAMPLE_HZ=<n>       samples per second (default 4)
   AURA_SAMPLE_MAX=<n>      stop printing after n samples (default 64)
+  AURA_SPTM_EXPORT         admit an SPTM image that has a reviewed clean-room export
+                           (aura/sptm_exports), without the bounded MMIO trace
+  AURA_ANE_TRACE           trace the ANE, its DART and the AIC (windows from the ADT) into a
+                           bounded ring, and park when it is full
   AURA_XNU_ENTRY           patch the guest kernelcache's acct(2) so a root process reaches aura's
                            control hvc with no kext (the auractl "xnu" entry; aura/auractl_xnu.py)
   AURA_XNU_RO_RELAX        patch XNU's zalloc_ro_mut RO-zone panic out (tracing only; XNU_QUIRKS)
@@ -112,6 +116,7 @@ CONFIG_FLAGS = {
     "AURA_S2R_DROP_USB": 1 << 4,
     "AURA_XNU_BT": 1 << 5,
     "AURA_GPU_TRACE": 1 << 6,
+    "AURA_ANE_TRACE": 1 << 11,
     "AURA_SAMPLE": 1 << 7,
     "AURA_S2R_MEM": 1 << 8,
     # bit 9 is reserved for AURA_AURACTL in the feat/auractl runner
@@ -147,6 +152,7 @@ KNOWN_ENV = {
     "AURA_S2R_USB_RETAKE_MS",
     "AURA_TAIL_SECS",
     "AURA_TAIL_IDLE",
+    "AURA_SPTM_EXPORT",
     "AURA_GPU_STOP_SECS",
     "AURA_GPU_STOP_BOOT_SECS",
     "AURA_GPU_STOP_MSG",
@@ -362,6 +368,15 @@ def aura_heap_size(adt):
     # 33 MiB already used before the host reserves space for aura's own heap.
     j813 = adt["/chosen"].chip_id == 0x8142 and getattr(adt, "model", None) == "Mac17,3"
     return (112 if j813 else 128) * 1024 * 1024
+
+
+def post_entry_drain_needed(iface):
+    """A device-side USB serial endpoint can stop accepting OUT as the guest enters."""
+    if iface.is_kis:
+        return False
+    port = iface.devpath or getattr(iface.dev, "port", "") or ""
+    device = os.path.basename(os.path.realpath(port))
+    return not device.startswith(("ttyACM", "cu.usbmodem", "tty.usbmodem"))
 
 
 def parse_args():
@@ -785,13 +800,18 @@ def configure(p, sym, plan, adt, ctl_cookie=0):
 
 
 def tail_console(iface, secs, idle):
-    """Keep reading the console after the entry call: a serial read error reopens the device,
-    and the tail stops after secs, or after idle seconds of silence."""
+    """Keep reading the console after entry, including across KIS re-enumeration.
+
+    Darwin does not reliably revive a pyserial object whose underlying device vanished.  Throw
+    that object away and construct a fresh one on the same physical KIS path instead.  Time spent
+    waiting for the node is not console silence, but it remains bounded by the overall tail window.
+    """
     import serial
 
     end = time.time() + secs
     last = time.time()
     dev = iface.dev
+    serial_cls = type(dev)
     buf = b""
     print(f"--- tailing console for up to {secs}s (stop after {idle:g}s silent) ---", flush=True)
     while time.time() < end:
@@ -801,20 +821,29 @@ def tail_console(iface, secs, idle):
         try:
             chunk = dev.read(4096)
         except (serial.serialutil.SerialException, OSError) as e:
-            print(f"--- tail: read error ({e}); reopening ---", flush=True)
+            lost = time.time()
+            print(f"--- tail: read error ({e}); waiting for re-enumeration ---", flush=True)
             try:
                 dev.close()
             except Exception:
                 pass
-            for _ in range(100):
+            dev = None
+            while time.time() < end:
+                if not iface.devpath or not os.path.exists(iface.devpath):
+                    time.sleep(0.1)
+                    continue
                 try:
-                    dev.open()
-                    print("--- tail: reopened ---", flush=True)
+                    dev = serial_cls(iface.devpath, iface.baudrate)
+                    dev.timeout = min(1, max(0.05, end - time.time()))
+                    iface.dev = dev
+                    gap = time.time() - lost
+                    last += gap
+                    print(f"--- tail: reopened after {gap:.3f}s ---", flush=True)
                     break
                 except (serial.serialutil.SerialException, OSError):
-                    time.sleep(0.2)
+                    time.sleep(0.1)
             else:
-                print("--- tail: device gone ---", flush=True)
+                print("--- tail: device absent through capture window ---", flush=True)
                 break
             continue
         if not chunk:
@@ -833,7 +862,7 @@ def main():
     if unknown:
         print("not run_guest_sptm.py switches, ignored:", " ".join(unknown))
 
-    from aura import sptm_patch, sptm_virt_plan as plan_mod
+    from aura import sptm_export, sptm_patch, sptm_virt_plan as plan_mod
     from aura.proxy import AuraProxy, UartInterface
     from aura.proxyutils import ProxyUtils, bootstrap_port
 
@@ -845,6 +874,23 @@ def main():
 
     # SPTM's managed window, as aura computed it: above aura and everything iBoot left low,
     # below aura's carve-out.
+    # An SPTM image with a clean-room export is patched only from that export (selected by the
+    # image itself, not by SoC or OS build), and only when asked. Checked on the host's copy of
+    # the image, before anything is placed on the target.
+    export = sptm_export.find(args.sptm.read_bytes())
+    if export:
+        print(f"SPTM export {export['_name']}: {export.get('label', '')}; host image "
+              f"[0x{sym['_base']:x}, 0x{sym['_end']:x})")
+        if not (env_on("AURA_SPTM_EXPORT") or env_on("AURA_ANE_TRACE")):
+            raise SystemExit("this SPTM has a clean-room export: set AURA_SPTM_EXPORT=1")
+        if any(env_on(k) for k in CONFIG_FLAGS if k != "AURA_ANE_TRACE"):
+            raise SystemExit("SPTM export: other trace/sleep modes are not qualified")
+        try:
+            sptm_export.admit(export)
+        except ValueError as e:
+            raise SystemExit(str(e))
+    elif env_on("AURA_SPTM_EXPORT"):
+        raise SystemExit("AURA_SPTM_EXPORT: no clean-room export matches this SPTM image")
     scratch = u.malloc(0x40)
     if p.call(sym["sptm_virt_place"], scratch) != 0:
         raise SystemExit("sptm_virt_place failed: not an SPTM_VIRT build, no FEAT_NV2 or GXF, or "
@@ -874,8 +920,9 @@ def main():
 
     entry_off = plan_mod.macho_info(images["sptm"]).entry - plan_mod.macho_info(images["sptm"]).virtlo
     try:
-        sp = sptm_patch.plan(images["sptm"], entry_off)
-    except sptm_patch.SptmPatchError as e:
+        sp = (sptm_export.patch_plan(images["sptm"], entry_off, export) if export
+              else sptm_patch.plan(images["sptm"], entry_off))
+    except (sptm_patch.SptmPatchError, ValueError) as e:
         raise SystemExit(f"this SPTM can't be patched: {e}")
     print(f"SPTM: {len(sp['patches'])} patch sites found"
           + (", MTE tag-storage sequence found" if sp["mte"] else ""))
@@ -919,7 +966,8 @@ def main():
     quirk_hide = tuple(quirks["hide"])
     if env_on("AURA_KEEP_WIFI"):
         quirk_hide = tuple(n for n in quirk_hide if n in port_nodes)
-    hide = port_nodes + (() if env_on("AURA_KEEP_ANE") else STRIP_NODES) + quirk_hide
+    keep_ane = env_on("AURA_KEEP_ANE") or env_on("AURA_ANE_TRACE") or bool(export)
+    hide = port_nodes + (() if keep_ane else STRIP_NODES) + quirk_hide
     if not env_on("AURA_KEEP_ERRH"):
         hide += (ERROR_HANDLER,)
     if env_on("AURA_HIDE_DOCKCHANNEL"):
@@ -1022,7 +1070,11 @@ def main():
     # sptm_virt_enter does not return. Waiting for a reply or a boot banner would eat the guest's
     # first console output and reopen the link.
     p.request(p.P_CALL, sym["sptm_virt_enter"], no_reply=True)
-    iface.dev.flush()
+    # Once a USB target enters the guest it can stop consuming host OUT immediately.  The enter
+    # request is already queued by write(); tcdrain here can then block forever and prevent the
+    # console tail from reading the guest's first output.  Real UARTs retain the drain.
+    if post_entry_drain_needed(iface):
+        iface.dev.flush()
     secs = env_int("AURA_TAIL_SECS")
     if secs > 0:
         tail_console(iface, secs, float(os.environ.get("AURA_TAIL_IDLE") or 10))
