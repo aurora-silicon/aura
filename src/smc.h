@@ -14,6 +14,21 @@ int smc_write_u64(smc_dev_t *smc, u32 key, u64 value);
 
 smc_dev_t *smc_init(void);
 
+/* An ADT SMC function: pKW4(key, lo) writes four bytes of lo | level, pKW8(key, lo, hi) eight
+ * bytes of (hi << 32) | lo | level. */
+struct smc_adt_function {
+    u32 key;
+    u32 lo;
+    u32 hi;
+    bool wide;
+};
+
+/* Read the SMC function in property prop of the ADT node at path: 0 when it is one, 1 when the
+ * node or property is missing, is not a pKW4/pKW8 (a GPIO, say), or its phandle is not that of
+ * /arm-io/smc or a node below it. */
+int smc_adt_function_get(const char *path, const char *prop, struct smc_adt_function *fn);
+int smc_adt_function_write(smc_dev_t *smc, const struct smc_adt_function *fn, u32 level);
+
 /*
  * Release the reset an ADT node's "function-reset" names through the SMC: pKW4(key, lo) is a
  * four-byte write of lo | level, pKW8(key, lo, hi) an eight-byte write of (hi << 32) | lo | level,
