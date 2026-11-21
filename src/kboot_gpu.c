@@ -4643,7 +4643,7 @@ int dt_set_gpu(void *dt)
     do {                                                                                           \
         printf(__VA_ARGS__);                                                                       \
         if (handoff) {                                                                             \
-            printf("FDT: GPU: firmware %s handoff refused\n", handoff->string);                   \
+            printf("FDT: GPU: firmware %s handoff refused\n", handoff->string);                    \
             return gpu_leave_disabled(dt, sgx);                                                    \
         }                                                                                          \
         return -1;                                                                                 \
@@ -4755,7 +4755,8 @@ int dt_set_gpu(void *dt)
             }
 
             if (i >= perf_state_count)
-                gpu_fail("FDT: GPU: Expected %d operating points, but found more\n", perf_state_count);
+                gpu_fail("FDT: GPU: Expected %d operating points, but found more\n",
+                         perf_state_count);
 
             if (fdt_setprop_inplace(dt, opp, "opp-microvolt", &volts,
                                     sizeof(u32) * perf_state_table_count))
