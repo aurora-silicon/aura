@@ -4421,43 +4421,115 @@ static int dt_reserve_asc_firmware(const char *adt_path, const char *adt_path_al
 }
 
 /*
- * The AVE video encoder runs firmware that iBoot preloads. The ADT calls the
- * encoder "ave" on the M2, A18 Pro and M5 and "ave0" on the M1 Pro/Max and M4 Pro.
- * The DT node is found by its compatible, so describing a SoC's encoder is all
- * it takes.
+ * The AVE video encoders run firmware that iBoot preloads, each its own copy. The ADT calls an
+ * encoder "ave" on the M2, M3, A18 Pro and M5, and "ave<N>" where a SoC has several (ave0 and ave1
+ * on the M1 Max, M3 Max and M4 Max, one per encoder on each die of the M1 and M3 Ultra). A DT node
+ * is an encoder when one of its compatibles names the block: "apple,ave", or "apple,t<SoC>-ave".
+ * No SoC is listed: every encoder the DT describes is handed over when its ADT twin (the encoder
+ * at its address) has a preloaded firmware with a valid segment list, and disabled otherwise.
  */
-static const char *const ave_compatibles[] = {
-    "apple,t6000-ave", "apple,t8112-ave", "apple,t8140-ave", "apple,t6041-ave",
-    "apple,t6050-ave", "apple,t8132-ave", "apple,t8142-ave",
-};
+static bool dt_ave_compatible(const char *c)
+{
+    size_t n = strlen(c);
+
+    if (!strcmp(c, "apple,ave"))
+        return true;
+    if (n <= strlen("apple,t-ave") || strncmp(c, "apple,t", 7) || strcmp(c + n - 4, "-ave"))
+        return false;
+    for (c += 7, n -= 11; n; c++, n--)
+        if (!((*c >= '0' && *c <= '9') || (*c >= 'a' && *c <= 'z')))
+            return false;
+    return true;
+}
 
 /*
- * An A18 Pro has one of two encoders, and the ADT describes the one this part has: ave
- * (encoder 0, 0x285100000) or ave1 (encoder 1, 0x289100000, on the J700 measured). The
- * DT describes both, disabled. Match the DT node to the ADT node at its address.
+ * The compatible an encoder node is found again by, its first (the SoC's own), or NULL when the
+ * node is not an encoder.
  */
-static const char *dt_t8140_ave_adt_path(int node)
+static const char *dt_ave_node_compat(int node)
 {
-    static const char *const paths[] = {"/arm-io/ave", "/arm-io/ave0", "/arm-io/ave1"};
-    const fdt32_t *reg;
     int len;
+    const char *list = fdt_getprop(dt, node, "compatible", &len);
 
-    reg = fdt_getprop(dt, node, "reg", &len);
-    /* The SoC bus maps one-to-one ("ranges;"), with two address cells. */
-    if (!reg || len < 2 * (int)sizeof(*reg))
+    if (!list || len <= 0 || list[len - 1])
         return NULL;
-    u64 dt_address = ((u64)fdt32_to_cpu(reg[0]) << 32) | fdt32_to_cpu(reg[1]);
+    for (int pos = 0; pos < len; pos += strlen(list + pos) + 1)
+        if (dt_ave_compatible(list + pos))
+            return list;
+    return NULL;
+}
 
-    for (size_t i = 0; i < ARRAY_SIZE(paths); i++) {
+#define AVE_MAX_COMPATIBLES 4
+#define AVE_COMPATIBLE_LEN  32
+
+/* The distinct first compatibles of the DT's encoder nodes, in tree order, or -1. */
+static int dt_ave_compatibles(char compats[AVE_MAX_COMPATIBLES][AVE_COMPATIBLE_LEN])
+{
+    int count = 0;
+
+    for (int node = fdt_next_node(dt, -1, NULL); node >= 0; node = fdt_next_node(dt, node, NULL)) {
+        const char *compat = dt_ave_node_compat(node);
+        bool seen = false;
+
+        if (!compat)
+            continue;
+        for (int i = 0; i < count; i++)
+            seen |= !strcmp(compats[i], compat);
+        if (seen)
+            continue;
+        if (count == AVE_MAX_COMPATIBLES || strlen(compat) >= AVE_COMPATIBLE_LEN) {
+            /* No DT has this many; one that is not handed over stays off. */
+            printf("FDT: AVE %s disabled: too many encoder compatibles\n",
+                   fdt_get_name(dt, node, NULL));
+            if (fdt_setprop_string(dt, node, "status", "disabled"))
+                return -1;
+            continue;
+        }
+        strcpy(compats[count++], compat);
+    }
+    return count;
+}
+
+/* An ADT encoder node is named "ave" or "ave<N>". */
+static bool adt_ave_name(const char *name)
+{
+    if (!name || strncmp(name, "ave", 3))
+        return false;
+    for (name += 3; *name; name++)
+        if (*name < '0' || *name > '9')
+            return false;
+    return true;
+}
+
+/*
+ * The ADT encoder a DT encoder node describes: the /arm-io/ave<N> whose first register range is
+ * at the node's first register address. Where a SoC has several encoders the names say nothing
+ * about which DT node is which, and an A18 Pro has one of two encoders, which the ADT describes
+ * as ave (encoder 0, 0x285100000) or ave1 (encoder 1, 0x289100000, on the J700 measured).
+ * Returns @buf, or NULL when no ADT encoder is at that address.
+ */
+static const char *dt_ave_adt_path(int node, char *buf, size_t size)
+{
+    u64 dt_address = dt_get_address(dt, node);
+    int arm_io = adt_path_offset(adt, "/arm-io");
+
+    if (!dt_address || arm_io < 0)
+        return NULL;
+    int child = arm_io;
+    ADT_FOREACH_CHILD(adt, child)
+    {
+        const char *name = adt_get_name(adt, child);
         int adt_path[8] = {0};
         u64 adt_address;
 
-        if (adt_path_offset_trace(adt, paths[i], adt_path) < 0)
+        if (!adt_ave_name(name) || snprintf(buf, size, "/arm-io/%s", name) >= (int)size)
+            continue;
+        if (adt_path_offset_trace(adt, buf, adt_path) < 0)
             continue;
         if (adt_get_reg(adt, adt_path, "reg", 0, &adt_address, NULL) < 0)
             continue;
         if (adt_address == dt_address)
-            return paths[i];
+            return buf;
     }
     return NULL;
 }
@@ -4567,7 +4639,7 @@ static int dt_power_chain_enable(struct dt_power_chain *walk, u32 phandle)
 }
 
 /* The encoder, its DARTs and the power states of both. */
-static int dt_t8140_ave_enable(u32 self)
+static int dt_ave_enable(u32 self)
 {
     u32 refs[8];
     size_t count = 0;
@@ -4600,9 +4672,11 @@ static int dt_t8140_ave_enable(u32 self)
 
 /*
  * The node is found again by its compatible after each edit, never by its path: on T6050 "/soc"
- * resolves to /soc@200000000, a sibling of the /soc that holds the encoder. On T8140, whose two
- * encoders share a compatible, it is found by @phandle instead; elsewhere @phandle is 0.
+ * resolves to /soc@200000000, a sibling of the /soc that holds the encoder. Where several
+ * encoders share a compatible, it is found by @phandle instead; for a lone encoder @phandle is 0.
  */
+static int dt_ave_next(int node, const char *compat);
+
 static int dt_set_ave_node(int node, const char *compat, u32 phandle)
 {
     char path[64];
@@ -4611,18 +4685,9 @@ static int dt_set_ave_node(int node, const char *compat, u32 phandle)
 
     const char *reason = "invalid ADT firmware segments";
     bool t8140 = !fdt_node_check_compatible(dt, node, "apple,t8140-ave");
-    const char *adt_path = "/arm-io/ave";
-    int anode;
-    if (t8140) {
-        adt_path = dt_t8140_ave_adt_path(node);
-        anode = adt_path ? adt_path_offset(adt, adt_path) : -1;
-    } else {
-        anode = adt_path_offset(adt, adt_path);
-        if (anode < 0) {
-            adt_path = "/arm-io/ave0";
-            anode = adt_path_offset(adt, adt_path);
-        }
-    }
+    char adt_buf[40], dart_path[48];
+    const char *adt_path = dt_ave_adt_path(node, adt_buf, sizeof(adt_buf));
+    int anode = adt_path ? adt_path_offset(adt, adt_path) : -1;
     if (anode < 0) {
         reason = "ADT node absent";
         goto disable;
@@ -4691,41 +4756,93 @@ static int dt_set_ave_node(int node, const char *compat, u32 phandle)
         crcs[i] = tinf_crc32((void *)seg[i].phys, seg[i].size);
 
     /*
-     * The pre-M4 (6070) firmware runs from DART address zero (the ADT iova-offset); the
-     * M4-generation encoders keep running at their remap addresses.
+     * The driver checks every encoder's firmware against the one set of CRCs in /chosen. An
+     * encoder whose preloaded copy differs from that of an encoder already handed over is left
+     * off rather than overwrite them.
      */
-    bool use_remap = !fdt_node_check_compatible(dt, node, "apple,t8140-ave") ||
-                     !fdt_node_check_compatible(dt, node, "apple,t6041-ave") ||
-                     !fdt_node_check_compatible(dt, node, "apple,t6050-ave") ||
-                     !fdt_node_check_compatible(dt, node, "apple,t8132-ave") ||
-                     !fdt_node_check_compatible(dt, node, "apple,t8142-ave");
-    /*
-     * On T8112 the encoder's DART window starts at the DART's vm-base: iBoot points the
-     * coprocessor code base there, and the firmware addresses DATA at vm-base plus its
-     * offset. Hand both segments over at vm-base + iova-offset.
-     */
-    u64 dva_base = 0;
-    if (!fdt_node_check_compatible(dt, node, "apple,t8112-ave")) {
-        int dnode = adt_path_offset(adt, "/arm-io/dart-ave");
-        u32 vlen = 0;
-        const void *vprop = dnode < 0 ? NULL : adt_getprop(adt, dnode, "vm-base", &vlen);
-
-        if (vprop && vlen == sizeof(u64)) {
-            memcpy(&dva_base, vprop, sizeof(dva_base));
-        } else if (vprop && vlen == sizeof(u32)) {
-            u32 v;
-            memcpy(&v, vprop, sizeof(v));
-            dva_base = v;
-        } else {
-            reason = "AVE DART vm-base missing";
-            goto disable;
-        }
-        if (dva_base & (SZ_16K - 1)) {
-            reason = "AVE DART vm-base not 16K aligned";
+    int crc_node = fdt_path_offset(dt, "/chosen");
+    for (size_t i = 0; crc_node >= 0 && i < count; i++) {
+        char prop[48], value[9];
+        int len;
+        snprintf(prop, sizeof(prop), "aurora,ave-%s-crc32", normalized[i]);
+        snprintf(value, sizeof(value), "%08x", crcs[i]);
+        const char *have = fdt_getprop(dt, crc_node, prop, &len);
+        if (have && (len != sizeof(value) || memcmp(have, value, sizeof(value)))) {
+            reason = "firmware differs from the encoder already handed over";
             goto disable;
         }
     }
-    if (dt_reserve_asc_segments_at(node, adt_path, NULL, path, use_remap, dva_base, false)) {
+
+    /*
+     * The firmware runs where iBoot left it: TEXT at the start of the encoder's DART window,
+     * the DART's ADT vm-base, and each segment at vm-base plus its offset (the ADT iova-offset).
+     * That is 0 on the M1 family (vm-base 0), 0x800000000 on the M2, and 0x10000000000 on the M2
+     * Pro and every later encoder, M3 to M5 and the A18 Pro. From the M2 on, the segments' ADT
+     * remap addresses are those same addresses (live ADTs of an M2, an M3 J615 and an M4 Pro
+     * J616s; iBoot's TEXT address on the A18 Pro). The M1 family's remap address is TEXT's
+     * physical address, beyond the 32-bit DART, so the remap addresses are never used.
+     */
+    u64 dva_base = 0;
+    /* The encoder's DART is its ADT name prefixed with "dart-": dart-ave for ave. */
+    snprintf(dart_path, sizeof(dart_path), "/arm-io/dart-%s", adt_path + strlen("/arm-io/"));
+    int dnode = adt_path_offset(adt, dart_path);
+    u32 vlen = 0;
+    const void *vprop = dnode < 0 ? NULL : adt_getprop(adt, dnode, "vm-base", &vlen);
+
+    if (vprop && vlen == sizeof(u64)) {
+        memcpy(&dva_base, vprop, sizeof(dva_base));
+    } else if (vprop && vlen == sizeof(u32)) {
+        u32 v;
+        memcpy(&v, vprop, sizeof(v));
+        dva_base = v;
+    } else {
+        reason = "AVE DART vm-base missing";
+        goto disable;
+    }
+    if (dva_base & (SZ_16K - 1)) {
+        reason = "AVE DART vm-base not 16K aligned";
+        goto disable;
+    }
+    /*
+     * Each offset stays below the window base's lowest set bit, so base | offset (as the
+     * reservation computes it) is base + offset. An offset that already carries the base is
+     * not the layout described above.
+     */
+    for (size_t i = 0; dva_base && i < count; i++) {
+        u64 window = dva_base & -dva_base, span = ALIGN_UP((u64)seg[i].size, SZ_16K);
+
+        if (seg[i].iova > window || span > window - seg[i].iova) {
+            reason = "firmware segment outside its DART window";
+            goto disable;
+        }
+        /*
+         * Fail closed where iBoot's remap address is not the window address computed here:
+         * such an encoder is left off rather than handed over at an address its firmware does
+         * not run at.
+         */
+        if (seg[i].remap != (dva_base | seg[i].iova)) {
+            reason = "ADT remap disagrees with the DART window";
+            goto disable;
+        }
+    }
+    /*
+     * With vm-base 0 (the M1 family) each segment is reserved at its own ADT offset, so check the
+     * shape that layout has in every live M1 ADT instead: TEXT's remap address is its physical
+     * address, and every offset is 16K aligned with its segment inside the 32-bit DART. Anything
+     * else is left off, as above.
+     */
+    for (size_t i = 0; !dva_base && i < count; i++) {
+        const u64 dart_end = 1ULL << 32;
+        u64 span = ALIGN_UP((u64)seg[i].size, SZ_16K);
+
+        if ((seg[i].iova & (SZ_16K - 1)) || seg[i].iova > dart_end ||
+            span > dart_end - seg[i].iova ||
+            (!strcmp(normalized[i], "text") && seg[i].remap != seg[i].phys)) {
+            reason = "ADT remap disagrees with the DART window";
+            goto disable;
+        }
+    }
+    if (dt_reserve_asc_segments_at(node, adt_path, NULL, path, false, dva_base, false)) {
         reason = "firmware reservation failed";
         goto disable;
     }
@@ -4740,81 +4857,169 @@ static int dt_set_ave_node(int node, const char *compat, u32 phandle)
         }
     }
     /* The qualified T8112 AVE AXI2AF list is explicitly empty. */
-    node = phandle ? fdt_node_offset_by_phandle(dt, phandle)
-                   : fdt_node_offset_by_compatible(dt, -1, compat);
+    node = phandle ? fdt_node_offset_by_phandle(dt, phandle) : dt_ave_next(-1, compat);
     if (node < 0 || (!fdt_node_check_compatible(dt, node, "apple,t8112-ave") &&
                      !fdt_getprop(dt, node, "apple,tunable-axi2af", NULL) &&
                      fdt_setprop_empty(dt, node, "apple,tunable-axi2af") < 0)) {
         reason = "AXI2AF tunable handoff failed";
         goto disable;
     }
-    /* The DT leaves both T8140 encoders off: this part has the one just handed over. */
+    /*
+     * An A18 Pro has one of its two encoders, and only the ADT says which: the DT leaves both
+     * T8140 encoders off, and this part has the one just handed over. Elsewhere every encoder
+     * the SoC has is there, and the DT enables those Linux may use.
+     */
     if (t8140) {
-        if (dt_t8140_ave_enable(phandle)) {
+        if (dt_ave_enable(phandle ? phandle : fdt_get_phandle(dt, node))) {
             reason = "cannot enable it, its DARTs or its power states";
             goto disable;
         }
         printf("FDT: AVE %s enabled from ADT %s\n", path, adt_path);
+    } else if (phandle) {
+        printf("FDT: AVE %s handed over from ADT %s\n", path, adt_path);
     }
     return 0;
 
 disable:
-    node = phandle ? fdt_node_offset_by_phandle(dt, phandle)
-                   : fdt_node_offset_by_compatible(dt, -1, compat);
+    node = phandle ? fdt_node_offset_by_phandle(dt, phandle) : dt_ave_next(-1, compat);
     if (node >= 0 && fdt_setprop_string(dt, node, "status", "disabled"))
         return -1;
-    if (t8140)
+    if (phandle)
         printf("FDT: AVE %s disabled: %s\n", path, reason);
     else
         printf("FDT: AVE disabled: %s\n", reason);
     return 0;
 }
 
-/* Every T8140 encoder node, each found by its phandle: handing one over moves the others. */
-static int dt_set_t8140_aves(void)
+#define AVE_MAX_ENCODERS 8
+
+/*
+ * The next encoder node after @node whose FIRST compatible is @compat.
+ * fdt_node_offset_by_compatible() also matches fallbacks: a node whose fallback is another
+ * encoder's first compatible would otherwise be handed over twice.
+ */
+static int dt_ave_next(int node, const char *compat)
 {
-    u32 phandles[2];
-    size_t count;
+    for (node = fdt_node_offset_by_compatible(dt, node, compat); node >= 0;
+         node = fdt_node_offset_by_compatible(dt, node, compat)) {
+        const char *first = dt_ave_node_compat(node);
+        if (first && !strcmp(first, compat))
+            return node;
+    }
+    return node;
+}
+
+/*
+ * Every encoder node of @compat. A lone node is handed over as it is found. Several (two on the
+ * A18 Pro, M1 Max and M5 Pro/Max, four on the M1 Ultra) are each found by their phandle: handing
+ * one over moves the others.
+ */
+static int dt_set_aves(const char *compat)
+{
+    u32 phandles[AVE_MAX_ENCODERS];
+    size_t count = 0;
     bool edited;
     int ret = 0;
+
+    int first = dt_ave_next(-1, compat);
+    if (first < 0)
+        return 0;
+    if (dt_ave_next(first, compat) < 0)
+        return dt_set_ave_node(first, compat, 0);
 
     /* A node without a phandle gets one; that moves the nodes, so look again from the start. */
     do {
         edited = false;
         count = 0;
-        for (int node = fdt_node_offset_by_compatible(dt, -1, "apple,t8140-ave"); node >= 0;
-             node = fdt_node_offset_by_compatible(dt, node, "apple,t8140-ave")) {
+        for (int node = dt_ave_next(-1, compat); node >= 0; node = dt_ave_next(node, compat)) {
             u32 ph = fdt_get_phandle(dt, node);
+            if (count == ARRAY_SIZE(phandles)) {
+                /* No SoC has this many; more than are handed over stay off. */
+                printf("FDT: more than %d %s nodes, %s disabled\n", AVE_MAX_ENCODERS, compat,
+                       fdt_get_name(dt, node, NULL));
+                if (fdt_setprop_string(dt, node, "status", "disabled"))
+                    return -1;
+                continue;
+            }
             if (!ph) {
                 if (fdt_generate_phandle(dt, &ph) || fdt_setprop_u32(dt, node, "phandle", ph))
                     bail("FDT: couldn't give an AVE node a phandle\n");
                 edited = true;
                 break;
             }
-            if (count < ARRAY_SIZE(phandles))
-                phandles[count++] = ph;
+            phandles[count++] = ph;
         }
     } while (edited);
 
     for (size_t i = 0; i < count && !ret; i++) {
         int node = fdt_node_offset_by_phandle(dt, phandles[i]);
         if (node >= 0)
-            ret = dt_set_ave_node(node, "apple,t8140-ave", phandles[i]);
+            ret = dt_set_ave_node(node, compat, phandles[i]);
     }
     return ret;
 }
 
 static int dt_set_ave(void)
 {
-    for (size_t i = 0; i < ARRAY_SIZE(ave_compatibles); i++) {
-        int node = fdt_node_offset_by_compatible(dt, -1, ave_compatibles[i]);
-        if (node < 0)
-            continue;
-        if (!strcmp(ave_compatibles[i], "apple,t8140-ave"))
-            return dt_set_t8140_aves();
-        return dt_set_ave_node(node, ave_compatibles[i], 0);
+    char compats[AVE_MAX_COMPATIBLES][AVE_COMPATIBLE_LEN];
+    int count = dt_ave_compatibles(compats);
+
+    if (count < 0)
+        return -1;
+    for (int i = 0; i < count; i++) {
+        int ret = dt_set_aves(compats[i]);
+        if (ret)
+            return ret;
     }
     return 0;
+}
+
+/*
+ * Program the CPU DART filter of every encoder the next stage gets, after the DT is final, and
+ * leave off one whose filter is not programmed. Each encoder fetches its preloaded __TEXT through
+ * its own CPU DART, dart-<ADT name>:
+ *  - dart-ave0 (encoder 0 of the M1 Pro and later multi-encoder SoCs) is one of dapf.c's
+ *    dapf_entries: one dapf_init_fdt() programmed is done, one it failed leaves its encoder off,
+ *    and one it skipped (a tree without the "ave" alias, as on T6041) is programmed here;
+ *  - dart-ave (the one encoder of the M2 through M5 and T8152) keeps the filter iBoot left
+ *    (dapf_ave_filter_inherited());
+ *  - every further encoder's (the M1 Max's second, the M1 Ultra's three more) is programmed here;
+ *  - a filter dapf.c keeps as inherited (dapf_keeps_inherited(), T8140) is left alone.
+ *
+ * Returns how many encoders were left off, or -1 if one whose filter failed could not be
+ * disabled: that encoder would stay on with an unprogrammed filter, so the handoff must stop.
+ */
+static int dt_set_ave_dapf(void)
+{
+    bool edited = false;
+    int off = 0;
+
+    for (int node = fdt_next_node(dt, -1, NULL); node >= 0; node = fdt_next_node(dt, node, NULL)) {
+        char adt_buf[40], dart[48];
+
+        if (!dt_ave_node_compat(node) || dt_ave_node_disabled(node))
+            continue;
+        const char *adt_path = dt_ave_adt_path(node, adt_buf, sizeof(adt_buf));
+        if (!adt_path)
+            continue;
+        snprintf(dart, sizeof(dart), "/arm-io/dart-%s", adt_path + strlen("/arm-io/"));
+        if (dapf_keeps_inherited(dart) || dapf_ave_filter_inherited(dart) ||
+            adt_path_offset(adt, dart) < 0)
+            continue;
+        /* dapf.c programmed it, or did not try (no DT alias): program it here. */
+        if (dapf_programmed(dart) || (!dapf_failed(dart) && dapf_init(dart, 3) >= 0))
+            continue;
+        /* Node offsets survive reopening the packed tree in place. */
+        if ((!edited && fdt_open_into(dt, dt, dt_bufsize)) ||
+            fdt_setprop_string(dt, node, "status", "disabled"))
+            return -1;
+        edited = true;
+        off++;
+        printf("FDT: AVE %s disabled: its DART filter %s cannot be programmed\n", adt_path, dart);
+    }
+    if (edited && fdt_pack(dt))
+        return -1;
+    return off;
 }
 
 /*
@@ -12414,6 +12619,14 @@ int kboot_boot(void *kernel)
     }
     ret = (chip_id == T8142 || chip_id == T6041 || chip_id == T8132) ? dapf_init_fdt(dt)
                                                                      : dapf_init_all();
+    int ave_off = dt_set_ave_dapf();
+    if (ave_off < 0) {
+        printf("kboot: refusing handoff: a video encoder whose DART filter failed could not be "
+               "disabled\n");
+        return -1;
+    }
+    if (ave_off > 0)
+        printf("kboot: %d video encoder(s) left off: DART filter failed\n", ave_off);
     if (ret < 0 && chip_id == T8140) {
         printf("kboot: refusing T8140 handoff after DAPF failure\n");
         pcie_shutdown();
