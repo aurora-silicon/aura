@@ -8863,47 +8863,47 @@ static int dt_set_pmp_t8122(void)
     return 0;
 }
 
-/* J614s warm SEP shares physical ranges with live DCP logs. Retain the
- * entire firmware descriptor while leaving the DCP no-map nodes intact.
- * This runs after the other firmware reservations have been published. */
+/*
+ * On some boots iBoot places the DCP __OS_LOG buffers inside the SEP firmware range it reports:
+ * the M4 Pro MacBooks (J614s, J616s) do, and other coprocessors' live firmware (an AOP segment on
+ * a J616s) can sit in it too. The kernel then sees sep-firmware overlap those no-map
+ * reservations. Where a DCP OS log (apple,dcp-os-log, from the display handoff) lies inside the
+ * range, retain the whole warm SEP range as plain reservations around it and around the other
+ * no-map coprocessor reservations there (apple,asc-mem), and leave their nodes intact. Without an
+ * OS log inside the range, or with any other reservation in it, sep-firmware stays as
+ * dt_set_sep() made it. This runs after the other firmware reservations have been published.
+ */
 struct sep_interval {
     u64 start, end;
 };
 
-static int dt_split_j614s_sep_reservations(void)
+static int dt_split_sep_reservations(void)
 {
     struct sep_interval spans[64], tmp;
     u64 start, end, cursor;
     const fdt64_t *reg;
     const fdt32_t *ref;
-    const char *name;
+    const char *name, *alias, *why;
+    char sep_path[256];
     u32 phandle;
-    int parent, sep, fw, node, len, count = 0, i, j, ret;
+    int parent, sep, fw, node, len, count = 0, logs = 0, i, j, ret;
 
     parent = fdt_path_offset(dt, "/reserved-memory");
-    if (parent < 0 || fdt_address_cells(dt, parent) != 2 || fdt_size_cells(dt, parent) != 2)
-        return -1;
-    sep = fdt_path_offset(dt, "/sep@406600000");
-    fw = fdt_path_offset(dt, "/reserved-memory/sep-firmware");
-    if (fw == -FDT_ERR_NOTFOUND)
+    fw = parent < 0 ? parent : fdt_subnode_offset(dt, parent, "sep-firmware");
+    if (fw < 0)
         return 0;
-    if (sep < 0 || fw < 0 || fdt_node_check_compatible(dt, sep, "apple,sep") ||
-        fdt_node_check_compatible(dt, fw, "apple,asc-mem") || fdt_getprop(dt, fw, "no-map", NULL))
-        return -1;
+    why = "unexpected sep-firmware reservation";
+    if (fdt_address_cells(dt, parent) != 2 || fdt_size_cells(dt, parent) != 2)
+        goto keep;
     reg = fdt_getprop(dt, fw, "reg", &len);
     if (!reg || len != 16)
-        return -1;
+        goto keep;
     start = fdt64_ld(reg);
     end = start + fdt64_ld(reg + 1);
     if (!start || end <= start || (start & 0x3fff) || (end & 0x3fff))
-        return -1;
-    phandle = fdt_get_phandle(dt, fw);
-    ref = fdt_getprop(dt, sep, "memory-region", &len);
-    if (!phandle || !ref || len != 4 || fdt32_ld(ref) != phandle)
-        return -1;
-    name = fdt_getprop(dt, sep, "memory-region-names", &len);
-    if (!name || len != 6 || memcmp(name, "sepfw", 6))
-        return -1;
+        goto keep;
+
+    why = "a reservation inside the SEP range is not a no-map coprocessor reservation";
     fdt_for_each_subnode(node, dt, parent)
     {
         u64 a, b;
@@ -8913,25 +8913,51 @@ static int dt_split_j614s_sep_reservations(void)
         if (!reg)
             continue;
         if (len != 16)
-            return -1;
+            goto keep;
         a = fdt64_ld(reg);
         b = a + fdt64_ld(reg + 1);
         if (b < a)
-            return -1;
+            goto keep;
         /* Empty placeholders reserve no physical memory. */
         if (a == b)
             continue;
         if (a >= end || b <= start)
             continue;
+        bool log = fdt_getprop(dt, node, "apple,dcp-os-log", NULL);
         if (!fdt_getprop(dt, node, "no-map", NULL) ||
-            (fdt_node_check_compatible(dt, node, "apple,asc-mem") &&
-             !fdt_getprop(dt, node, "apple,dcp-os-log", NULL)) ||
-            count == 64)
-            return -1;
+            (!log && fdt_node_check_compatible(dt, node, "apple,asc-mem")) || count == 64)
+            goto keep;
+        logs += log;
         spans[count++] = (struct sep_interval){a < start ? start : a, b > end ? end : b};
     }
+    /* Nothing inside the SEP range: the reservation stands as dt_set_sep() made it. */
     if (!count)
         return 0;
+    /* Only the DCP OS logs show the warm SEP range is shared; without one it stays whole. */
+    why = "no DCP OS log inside the SEP range";
+    if (!logs)
+        goto keep;
+
+    /* The SEP node is the one the sep alias names, as in dt_set_sep(). */
+    why = "the SEP node does not reference sep-firmware as sepfw";
+    node = fdt_path_offset(dt, "/aliases");
+    alias = node < 0 ? NULL : fdt_getprop(dt, node, "sep", &len);
+    if (!alias || len < 2 || len > (int)sizeof(sep_path) || alias[0] != '/' ||
+        memchr(alias, '\0', len) != alias + len - 1)
+        goto keep;
+    memcpy(sep_path, alias, len);
+    sep = fdt_path_offset(dt, sep_path);
+    if (sep < 0 || fdt_node_check_compatible(dt, sep, "apple,sep") ||
+        fdt_node_check_compatible(dt, fw, "apple,asc-mem") || fdt_getprop(dt, fw, "no-map", NULL))
+        goto keep;
+    phandle = fdt_get_phandle(dt, fw);
+    ref = fdt_getprop(dt, sep, "memory-region", &len);
+    if (!phandle || !ref || len != 4 || fdt32_ld(ref) != phandle)
+        goto keep;
+    name = fdt_getprop(dt, sep, "memory-region-names", &len);
+    if (!name || len != 6 || memcmp(name, "sepfw", 6))
+        goto keep;
+
     for (i = 1; i < count; i++)
         for (j = i; j > 0 && spans[j].start < spans[j - 1].start; j--) {
             tmp = spans[j];
@@ -8939,12 +8965,14 @@ static int dt_split_j614s_sep_reservations(void)
             spans[j - 1] = tmp;
         }
     /* Existing reservations must themselves be disjoint. */
+    why = "the reservations inside the SEP range overlap each other";
     for (i = 1; i < count; i++)
         if (spans[i].start < spans[i - 1].end)
-            return -1;
+            goto keep;
+    /* From here on the tree is being changed: a failure fails the handoff. */
     if (fdt_delprop(dt, sep, "memory-region"))
         return -1;
-    sep = fdt_path_offset(dt, "/sep@406600000");
+    sep = fdt_path_offset(dt, sep_path);
     if (fdt_delprop(dt, sep, "memory-region-names"))
         return -1;
     fw = fdt_path_offset(dt, "/reserved-memory/sep-firmware");
@@ -8967,7 +8995,13 @@ static int dt_split_j614s_sep_reservations(void)
         if (i < count)
             cursor = spans[i].end;
     }
-    printf("J614s: retained warm SEP range around %d existing no-map regions\n", count);
+    printf("FDT: retained warm SEP range around %d existing no-map regions (%d DCP OS logs)\n",
+           count, logs);
+    return 0;
+
+keep:
+    /* Refused before any change: the tree keeps the SEP reservation as it was. */
+    printf("FDT: SEP reservation left whole (%s)\n", why);
     return 0;
 }
 
@@ -9391,6 +9425,33 @@ static bool dt_isp_has_placeholders(void)
 }
 
 /*
+ * The ISP node: the one the isp alias names or, on a tree with firmware placeholders but no isp
+ * alias (the M4 Pro MacBooks' t604x-j614-j616.dtsi), the one node whose first memory region is
+ * the isp-firmware-text placeholder.
+ */
+static int dt_isp_node(void)
+{
+    int node = fdt_path_offset(dt, "isp");
+    if (node >= 0 || !dt_isp_has_placeholders())
+        return node;
+    int resv = fdt_path_offset(dt, "/reserved-memory");
+    u32 text = fdt_get_phandle(dt, fdt_subnode_offset(dt, resv, "isp-firmware-text"));
+    int found = -FDT_ERR_NOTFOUND;
+    if (!text)
+        return found;
+    for (node = fdt_next_node(dt, -1, NULL); node >= 0; node = fdt_next_node(dt, node, NULL)) {
+        int len;
+        const fdt32_t *mr = fdt_getprop(dt, node, "memory-region", &len);
+        if (!mr || len < (int)sizeof(*mr) || fdt32_ld(mr) != text)
+            continue;
+        if (found >= 0)
+            return -FDT_ERR_NOTFOUND;
+        found = node;
+    }
+    return found;
+}
+
+/*
  * Placeholder-driven ISP handoff (T6040/T6041 and any tree with /reserved-memory/isp-firmware-text
  * and isp-firmware-data): iBoot loads the firmware and Linux starts it as iBoot left it. Fill the
  * kernel DT's placeholders from this boot's ADT segment-ranges within dart-isp vm-base + isp-heap,
@@ -9573,7 +9634,7 @@ static int dt_set_isp_fwdata(void)
 
     u64 phys, iova, size;
 
-    int fdt_node = fdt_path_offset(dt, fdt_path);
+    int fdt_node = dt_isp_node();
     if (fdt_node < 0) {
         printf("FDT: '%s' not found\n", fdt_path);
         return 0;
@@ -9840,7 +9901,7 @@ static int dt_set_isp(void)
         return 0;
     }
 
-    int node = fdt_path_offset(dt, "isp");
+    int node = dt_isp_node();
     if (node < 0)
         return -1;
     printf("FDT: ISP firmware or heap not reserved, disabling the ISP\n");
@@ -12200,9 +12261,8 @@ int kboot_prepare_dt(void *fdt)
         dt_t6031_fw_uuids(dt);
     }
 
-    if (chip_id == T6040 && board_id == 4 && adt_is_compatible(adt, 0, "J614sAP") &&
-        !fdt_node_check_compatible(dt, 0, "apple,j614s") && dt_split_j614s_sep_reservations())
-        bail("FDT: could not split J614s SEP reservations\n");
+    if (dt_split_sep_reservations())
+        bail("FDT: could not split the SEP reservation around DCP logs\n");
 
     /* J813: train the N1 Wi-Fi/Bluetooth link, or disable its ECAM host. */
     if (j813_n1_prepare(dt))
