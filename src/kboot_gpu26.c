@@ -691,7 +691,7 @@ int dt_set_gpu_t8122_26(void *dt)
  */
 static const struct gpu26_target g14g_target = {
     "G14G",
-    NULL,
+    "gpu,t8112",
     "apple,agx-g14g",
     0,
 };
@@ -722,7 +722,7 @@ static int g14g_gpu_publish(void *dt, void *arg)
     int sgx = res < 0 ? res : fdt_subnode_offset(dt, res, "sgx");
     if (res >= 0 && sgx == -FDT_ERR_NOTFOUND)
         sgx = fdt_add_subnode(dt, res, "sgx");
-    if (sgx < 0 || (h->sram && fdt_setprop(dt, sgx, "adt-perf-states-sram", h->sram, h->sram_len)))
+    if (sgx < 0 || fdt_setprop(dt, sgx, "adt-perf-states-sram", h->sram, h->sram_len))
         bail("FDT: GPU: G14G cannot publish /chosen/aurora-gpu-resources/sgx\n");
 
     int gpu = gpu26_node(dt, h->fw.t);
@@ -755,5 +755,7 @@ int dt_set_gpu_g14g_handoff(void *dt, const struct fw_version_info *image)
         bail("ADT: GPU: G14G iop-gfx-nub coredump-copy-buffer missing\n");
     int sgx = adt_path_offset(adt, "/arm-io/sgx");
     h.sram = sgx < 0 ? NULL : adt_getprop(adt, sgx, "perf-states-sram", &h.sram_len);
+    if (!h.sram || !h.sram_len)
+        bail("ADT: GPU: G14G perf-states-sram missing; handoff refused\n");
     return t8122_fdt_transaction(dt, g14g_gpu_publish, &h);
 }
