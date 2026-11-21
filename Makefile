@@ -200,14 +200,10 @@ LIBFDT_OBJECTS := $(patsubst %,libfdt/%, \
 CHICKENS_OBJECTS := $(patsubst %,chickens/%, \
 	avalanche.o \
 	blizzard.o \
-	cyclone_typhoon.o \
 	everest.o \
 	firestorm.o \
-	hurricane_zephyr.o \
 	icestorm.o \
-	monsoon_mistral.o \
-	sawtooth.o \
-	twister.o)
+	sawtooth.o)
 
 DCP_OBJECTS := $(patsubst %,dcp/%, \
 	atc_phy.o \

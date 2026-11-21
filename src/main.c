@@ -62,8 +62,6 @@ void get_device_info(void)
     if (target)
         printf("  Target: %s\n", target);
 
-    is_mac = !!strstr(model, "Mac");
-
     int chosen = adt_path_offset(adt, "/chosen");
     if (chosen > 0) {
         if (ADT_GETPROP(adt, chosen, "board-id", &board_id) < 0)
@@ -449,8 +447,7 @@ void aura_main(void)
     // Kick DCP to sleep, so dodgy monitors which cause reconnect cycles don't cause us to lose the
     // framebuffer.
     display_shutdown(DCP_SLEEP_IF_EXTERNAL);
-    // On idevice we need to always clear, because otherwise it looks scuffed on white devices
-    fb_init(!is_mac);
+    fb_init(false);
     fb_display_logo();
 #ifdef FB_SILENT_MODE
     fb_set_active(!cur_boot_args.video.display);

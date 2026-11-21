@@ -135,16 +135,13 @@ void get_notchless_fb(u64 *fb_base, u64 *fb_height)
 
     u32 val;
 
-    if ((ADT_GETPROP(adt, node, "partially-occluded-display", &val) < 0 || !val) &&
-        (chip_id != T8015 || (board_id != 0x6 && board_id != 0xe))) {
+    if (ADT_GETPROP(adt, node, "partially-occluded-display", &val) < 0 || !val) {
         printf("FDT: No notch detected\n");
         return;
     }
 
     u64 hfrac = cur_boot_args.video.height * 16 / cur_boot_args.video.width;
     u64 new_height = cur_boot_args.video.width * hfrac / 16;
-    if (chip_id == T8015 && (board_id == 0x6 || board_id == 0xe))
-        new_height = 2346;
 
     if (new_height == cur_boot_args.video.height) {
         printf("FDT: Notch detected, but display aspect is already 16:%lu?\n", hfrac);
@@ -1197,15 +1194,13 @@ static int dt_set_chosen(void)
     if (node < 0)
         bail("FDT: /chosen node not found in devtree\n");
 
-    if (is_mac) {
-        if (fdt_setprop(dt, node, "asahi,iboot1-version", system_firmware.iboot,
-                        strlen(system_firmware.iboot) + 1))
-            bail("FDT: couldn't set asahi,iboot1-version\n");
+    if (fdt_setprop(dt, node, "asahi,iboot1-version", system_firmware.iboot,
+                    strlen(system_firmware.iboot) + 1))
+        bail("FDT: couldn't set asahi,iboot1-version\n");
 
-        if (fdt_setprop(dt, node, "asahi,system-fw-version", system_firmware.string,
-                        strlen(system_firmware.string) + 1))
-            bail("FDT: couldn't set asahi,system-fw-version\n");
-    }
+    if (fdt_setprop(dt, node, "asahi,system-fw-version", system_firmware.string,
+                    strlen(system_firmware.string) + 1))
+        bail("FDT: couldn't set asahi,system-fw-version\n");
 
     if (fdt_setprop(dt, node, "asahi,iboot2-version", os_firmware.iboot,
                     strlen(os_firmware.iboot) + 1))
@@ -10288,43 +10283,6 @@ __attribute__((unused)) static int dt_transfer_virtios(void)
     return 0;
 }
 
-/*
- * Remove unneeded apple,always-on from unused memory channels on T8012.
- * This is needed because the amount of memory and the amount of used
- * memory channels depends on the storage configuration of the host Mac
- * and can only be determined at runtime.
- */
-static int dt_set_pmgr(void)
-{
-    if (chip_id != T8012)
-        return 0;
-
-    if (mem_size_actual > 0x40000000)
-        return 0;
-
-    int pmgr_node = fdt_path_offset(dt, "/soc/power-management@20e000000");
-    if (pmgr_node < 0) {
-        printf("FDT: Failed to find pmgr node\n");
-        return 0;
-    }
-
-    int dcs2_node = fdt_path_offset(dt, "/soc/power-management@20e000000/power-controller@80258");
-    if (dcs2_node < 0)
-        bail("FDT: failed to find ps_dcs2 node\n");
-
-    /* Allow failure */
-    fdt_delprop(dt, dcs2_node, "apple,always-on");
-
-    int dcs3_node = fdt_path_offset(dt, "/soc/power-management@20e000000/power-controller@80260");
-    if (dcs3_node < 0)
-        bail("FDT: failed to find ps_dcs3 node\n");
-
-    /* Allow failure */
-    fdt_delprop(dt, dcs3_node, "apple,always-on");
-
-    return 0;
-}
-
 static int dt_set_adt_regs(const char *alias, const u64 *addrs, const u64 *sizes, size_t count)
 {
     const char *path = fdt_get_alias(dt, alias);
@@ -11996,8 +11954,6 @@ int kboot_prepare_dt(void *fdt)
     if (dt_set_isp())
         return -1;
     dt_set_j713_isp();
-    if (dt_set_pmgr())
-        return -1;
     if (chip_id == T8132 && (dt_set_ans_nvme(false) || dt_set_t8132_lifecycle()))
         return -1;
     if (dt_set_t8142_sleep_apcie())

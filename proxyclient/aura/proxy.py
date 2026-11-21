@@ -607,13 +607,11 @@ REGION_RX_EL1 = 0xc0000000000
 
 SleepMode = "SleepMode" / Enum(Int32ul,
     SLEEP_NONE = 0,
-    SLEEP_LEGACY = 1,
     SLEEP_GLOBAL = 2,
 )
 
 UncoreVersion = "UncoreVersion" / Enum(Int32ul,
     UNCORE_NONE = 0,
-    UNCORE_V1 = 1,
     UNCORE_V2 = 2,
 )
 
@@ -623,7 +621,7 @@ CPUFeatures = Struct(
     "disable_dc_mva" / bool_,
     "acc_cfg" / bool_,
     "apple_sysregs_unlocked" / bool_,
-    "workaround_cyclone_cache" / bool_,
+    "reserved" / bool_,
     "nex_powergating" / bool_,
     "fast_ipi" / bool_,
     "mmu_sprr" / bool_,

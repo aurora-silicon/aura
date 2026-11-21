@@ -13,8 +13,6 @@
 #include "vsprintf.h"
 #include "xnuboot.h"
 
-bool is_mac;
-
 static char ascii(char s)
 {
     if (s < 0x20)
@@ -277,10 +275,6 @@ void cpu_sleep(bool deep)
                          ACC_OVRD_PWR_DN_SRM(3) | ACC_OVRD_DIS_L2_FLUSH_ACC_SLEEP(2) |
                              ACC_OVRD_TRAIN_DOWN_LINK(3) | ACC_OVRD_POWER_DOWN_CPM(3) |
                              ACC_OVRD_DISABLE_PIO_ON_WFI_CPU | ACC_OVRD_DEEP_SLEEP);
-                break;
-
-            case SLEEP_LEGACY:
-                reg_set(SYS_IMP_APL_ACC_CFG, ACC_CFG_DEEP_SLEEP);
                 break;
 
             default:

@@ -15,12 +15,10 @@
 #include "utils.h"
 #include "xnuboot.h"
 
-#define CPU_START_OFF_S5L8960X 0x30000
-#define CPU_START_OFF_S8000    0xd4000
-#define CPU_START_OFF_T8103    0x54000
-#define CPU_START_OFF_T8112    0x34000
-#define CPU_START_OFF_T6020    0x28000
-#define CPU_START_OFF_T6031    0x88000
+#define CPU_START_OFF_T8103 0x54000
+#define CPU_START_OFF_T8112 0x34000
+#define CPU_START_OFF_T6020 0x28000
+#define CPU_START_OFF_T6031 0x88000
 
 #define CPU_REG_CORE    GENMASK(7, 0)
 #define CPU_REG_CLUSTER GENMASK(10, 8)
@@ -941,20 +939,6 @@ int smp_init(void)
     memset(cpu_info, 0, sizeof(cpu_info));
 
     switch (chip_id) {
-        case S5L8960X:
-        case T7000:
-        case T7001:
-            cpu_start_off = CPU_START_OFF_S5L8960X;
-            break;
-        case S8000:
-        case S8001:
-        case S8003:
-        case T8010:
-        case T8011:
-        case T8012:
-        case T8015:
-            cpu_start_off = CPU_START_OFF_S8000;
-            break;
         case T8103:
         case T6000:
         case T6001:

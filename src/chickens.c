@@ -8,16 +8,6 @@
 #include "uart.h"
 #include "utils.h"
 
-void init_s5l8960x_cyclone(int rev);
-void init_t7000_typhoon(int rev);
-void init_t7001_typhoon(int rev);
-void init_samsung_twister(int rev);
-void init_tsmc_twister(int rev);
-void init_t8010_2_hurricane_zephyr(int rev);
-void init_t8011_hurricane_zephyr(int rev);
-void init_t8015_monsoon(int rev);
-void init_t8015_mistral(int rev);
-void init_t8015_monsoon(int rev);
 void init_m1_icestorm(int rev);
 void init_t8103_firestorm(int rev);
 void init_t6000_firestorm(int rev);
@@ -40,32 +30,6 @@ struct midr_part_info {
     const char *name;
     void (*init)(int rev);
     const struct midr_part_features *features;
-};
-
-const struct midr_part_features features_a7 = {
-    .disable_dc_mva = true,
-    .acc_cfg = true,
-    .apple_sysregs_unlocked = true,
-    .workaround_cyclone_cache = true,
-    .sleep_mode = SLEEP_LEGACY,
-};
-
-const struct midr_part_features features_a10 = {
-    .disable_dc_mva = true,
-    .acc_cfg = true,
-    .apple_sysregs_unlocked = true,
-    .workaround_cyclone_cache = false,
-    .sleep_mode = SLEEP_GLOBAL,
-};
-
-const struct midr_part_features features_a11 = {
-    .disable_dc_mva = true,
-    .acc_cfg = true,
-    .apple_sysregs_unlocked = true,
-    .sleep_mode = SLEEP_GLOBAL,
-    .uncore_version = UNCORE_V1,
-    .nex_powergating = true,
-    .fast_ipi = true,
 };
 
 const struct midr_part_features features_m1 = {
@@ -166,17 +130,6 @@ const struct midr_part_features features_m6 = {
 };
 
 const struct midr_part_info midr_parts[] = {
-    {MIDR_PART_S5L8960X_CYCLONE, "A7 Cyclone", init_s5l8960x_cyclone, &features_a7},
-    {MIDR_PART_T7000_TYPHOON, "A8 Typhoon", init_t7000_typhoon, &features_a7},
-    {MIDR_PART_T7001_TYPHOON, "A8X Typhoon", init_t7001_typhoon, &features_a7},
-    {MIDR_PART_S8000_TWISTER, "A9 Twister (Samsung)", init_samsung_twister, &features_a7},
-    {MIDR_PART_S8001_3_TWISTER, "A9(X) Twister (TSMC)", init_tsmc_twister, &features_a7},
-    {MIDR_PART_T8010_2_HURRICANE, "A10/T2 Hurricane-Zephyr", init_t8010_2_hurricane_zephyr,
-     &features_a10},
-    {MIDR_PART_T8011_HURRICANE, "A10X Hurricane-Zephyr", init_t8011_hurricane_zephyr,
-     &features_a10},
-    {MIDR_PART_T8015_MONSOON, "A11 Monsoon", init_t8015_monsoon, &features_a11},
-    {MIDR_PART_T8015_MISTRAL, "A11 Mistral", init_t8015_mistral, &features_a11},
     {MIDR_PART_T8103_FIRESTORM, "M1 Firestorm", init_t8103_firestorm, &features_m1},
     {MIDR_PART_T6000_FIRESTORM, "M1 Pro Firestorm", init_t6000_firestorm, &features_m1},
     {MIDR_PART_T6001_FIRESTORM, "M1 Max Firestorm", init_t6001_firestorm, &features_m1},
@@ -300,11 +253,6 @@ void init_cpu(void)
         int core = mrs(MPIDR_EL1) & 0xff;
         msr(SYS_IMP_APL_AMX_CTX_EL1, core);
         msr(SYS_IMP_APL_AMX_CTL_EL1, 0x100);
-    }
-
-    if (cpu_features->sleep_mode == SLEEP_LEGACY) {
-        /* Disable deep sleep */
-        reg_clr(SYS_IMP_APL_ACC_CFG, ACC_CFG_DEEP_SLEEP);
     }
 
     if (cpu_features->apple_sysregs_unlocked) {

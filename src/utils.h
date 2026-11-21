@@ -328,16 +328,8 @@ static inline void write64_lo_hi(u64 addr, u64 val)
 #define dma_wmb() sysop("dmb oshst")
 
 extern u32 board_id, chip_id;
-static inline bool is_heterogeneous(void)
-{
-    return !(chip_id == S5L8960X || chip_id == T7000 || chip_id == T7001 || chip_id == S8000 ||
-             chip_id == S8001 || chip_id == S8003);
-}
-
 static inline int is_ecore(void)
 {
-    if (!is_heterogeneous())
-        return false;
     u32 mpidr_el1 = mrs(MPIDR_EL1);
     if (mpidr_el1 & MPIDR_CORE_TYPE_P)
         return false;
@@ -488,16 +480,15 @@ struct vector_args {
 
 extern u32 board_id, chip_id;
 
+/* Values and the struct below are the proxy's CPU features ABI (proxyclient/aura/proxy.py). */
 enum cpufeat_sleep_mode {
-    SLEEP_NONE,
-    SLEEP_LEGACY,
-    SLEEP_GLOBAL,
+    SLEEP_NONE = 0,
+    SLEEP_GLOBAL = 2, /* 1 was the pre-M1 mode */
 };
 
 enum cpufeat_uncore_version {
-    UNCORE_NONE,
-    UNCORE_V1,
-    UNCORE_V2,
+    UNCORE_NONE = 0,
+    UNCORE_V2 = 2, /* 1 was the pre-M1 uncore */
 };
 
 /*
@@ -519,13 +510,13 @@ struct midr_part_features {
     bool acc_cfg;
     /*
      * CYC_OVRD, and what aura sets up along with it (RVBAR, the L2C error status, the
-     * hypervisor's SPRR/GXF): A7 to M3. False from M4 on, where CYC_OVRD is locked.
+     * hypervisor's SPRR/GXF): M1 to M3. False from M4 on, where CYC_OVRD is locked.
      * Only CYC_OVRD is: at EL2 HACR_EL2, the ACTLR bits and the per-core deep-sleep
      * enable (s3_5_c15_c6_2) can be set, and with a kcbz-0 boot object the GXF
      * registers are writable too. aura uses none of them for the OS.
      */
     bool apple_sysregs_unlocked;
-    bool workaround_cyclone_cache;
+    bool reserved; /* was a pre-M1 cache workaround */
     bool nex_powergating;
     bool fast_ipi;
     bool mmu_sprr;
@@ -536,7 +527,6 @@ struct midr_part_features {
     bool unsafe_wfi;
 };
 
-extern bool is_mac;
 extern const struct midr_part_features *cpu_features;
 
 extern struct vector_args next_stage;

@@ -496,13 +496,7 @@ void fb_init(bool clear)
     if (!cached)
         memcpy(fb.ptr, fb.hwptr, fb.size);
 
-    // This is the touchbar, make everything tiny
-    if (chip_id == T8012) {
-        logo = builtin_logo(&logo_48);
-        console.font.ptr = _binary_build_font_bin_start;
-        console.font.width = 8;
-        console.font.height = 16;
-    } else if (cur_boot_args.video.depth & FB_DEPTH_FLAG_RETINA) {
+    if (cur_boot_args.video.depth & FB_DEPTH_FLAG_RETINA) {
         logo = builtin_logo(&logo_256);
         console.font.ptr = _binary_build_font_retina_bin_start;
         console.font.width = 16;

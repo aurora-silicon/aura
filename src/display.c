@@ -1011,20 +1011,19 @@ int display_init(void)
         return 0;
     }
 
-    if (!display_is_external && is_mac && display_internal_panel_absent(node, product)) {
+    if (!display_is_external && display_internal_panel_absent(node, product)) {
         printf("display: no internal panel (dot-pitch 0, no panel serial), skipping display "
                "setup\n");
         return 0;
     }
 
-    if ((cur_boot_args.video.width == 640 && cur_boot_args.video.height == 1136) &&
-        chip_id != S5L8960X) {
+    if (cur_boot_args.video.width == 640 && cur_boot_args.video.height == 1136) {
         printf("display: Dummy framebuffer found, initializing display\n");
         return display_configure(NULL);
-    } else if (display_is_external && is_mac) {
+    } else if (display_is_external) {
         printf("display: External display found, reconfiguring\n");
         return display_configure(NULL);
-    } else if ((!(cur_boot_args.video.depth & FB_DEPTH_FLAG_RETINA)) && is_mac) {
+    } else if (!(cur_boot_args.video.depth & FB_DEPTH_FLAG_RETINA)) {
         printf("display: Internal display with non-retina flag, assuming Sonoma bug and "
                "reconfiguring\n");
         fb_clear_direct(); // Old aura stage1 ends up with an ugly logo situation, clear it.
