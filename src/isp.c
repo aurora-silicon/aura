@@ -333,7 +333,6 @@ int isp_init(void)
                     break;
                 case V13_5:
                 case V13_6_1:
-                case V27_2:
                     selected_top = 0xf00000;
                     break;
                 default:
@@ -345,7 +344,6 @@ int isp_init(void)
             switch (os_firmware.version) {
                 case V13_5:
                 case V13_6_1:
-                case V27_2:
                     selected_top = 0xf00000;
                     break;
                 default:
@@ -374,7 +372,7 @@ int isp_init(void)
             }
             break;
         case ISP_VER_T8140:
-            if (!t8140 || (os_firmware.version != V26_6_2 && os_firmware.version != V27_2)) {
+            if (!t8140 || os_firmware.version != V26_6_2) {
                 reason = "unsupported T8140 firmware or SoC";
                 goto out;
             }
