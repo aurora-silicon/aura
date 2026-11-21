@@ -8015,9 +8015,10 @@ static int dt_set_j713_display_maps(const struct adt_segment_ranges *segments, u
 static int dt_set_dcp_fw27_clocks(const char *alias, const char *adt_engine);
 
 /*
- * Publish the inherited DCP firmware mapping without starting a display driver: on the J713
- * on any firmware as before, and on any other M4 Mac with a panel on 26.6.2. *internal says
- * what was done, for the external display processors (dt_set_dcpext_handoff()).
+ * Publish the inherited DCP firmware mapping without starting a display driver, on any M4 Mac
+ * whose ADT describes an internal panel on disp0, whatever its firmware. The kernel picks the
+ * display backend from the firmware the DCP runs. *internal says what was done, for the
+ * external display processors (dt_set_dcpext_handoff()).
  */
 static int dt_set_m4_dcp_handoff(enum dcp_internal *internal)
 {
@@ -8025,17 +8026,15 @@ static int dt_set_m4_dcp_handoff(enum dcp_internal *internal)
     int dcp_node = fdt_path_offset(dt, "dcp");
     if (dcp_node < 0)
         return 0; /* Older DT with simple-framebuffer only. */
-    /* The Mac mini's disp0 is external: its DCP drives a port, not a panel. */
+    /* A Mac mini's disp0 is external: its DCP drives a port, not a panel. */
     int disp0 = adt_path_offset(adt, "/arm-io/disp0");
     if (disp0 >= 0 && adt_getprop(adt, disp0, "external", NULL)) {
         *internal = DCP_INTERNAL_NO_PANEL;
         bail("FDT: no internal panel, no native DCP handoff\n");
     }
-    bool j713 = !fdt_node_check_compatible(dt, 0, "apple,j713");
-    if (chip_id != T8132 || (!j713 && os_firmware.version != V26_6_2) ||
-        fdt_node_check_compatible(dt, dcp_node, "apple,t8132-dcp"))
+    if (chip_id != T8132 || fdt_node_check_compatible(dt, dcp_node, "apple,t8132-dcp"))
         bail("FDT: unsupported native DCP handoff target\n");
-    if (!j713 && disp0 < 0)
+    if (disp0 < 0)
         bail("FDT: no internal panel, no native DCP handoff\n");
 
     int nub = adt_path_offset(adt, "/arm-io/dcp/iop-dcp-nub");
@@ -8086,12 +8085,11 @@ static int dt_set_m4_dcp_handoff(enum dcp_internal *internal)
     dcp_node = fdt_path_offset(dt, "dcp");
     if (fdt_getprop(dt, dcp_node, "apple,j713-native-piodma", NULL)) {
         /*
-         * The DCP image is per firmware, the same on every M4 Mac: 26.6.2 and the 27.2 stub.
-         * The walk checks every inherited SID0/SID16 page against this image's segments and
-         * publishes nothing unless all of them match.
+         * The walk checks every inherited SID0/SID16 page against the segments of the image
+         * the DCP runs and publishes nothing unless all of them match, so it needs no list of
+         * firmware versions.
          */
-        if ((os_firmware.version != V26_6_2 && os_firmware.version != V27_2) ||
-            dt_set_j713_display_maps(segments, count, dram_start, dram_size))
+        if (dt_set_j713_display_maps(segments, count, dram_start, dram_size))
             printf("FDT: M4 PIODMA handoff unqualified; retaining disabled device\n");
         else
             maps = true;
