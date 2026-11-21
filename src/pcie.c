@@ -806,6 +806,30 @@ static int pcie_init_controller(int controller, const char *path, bool ans_off)
 
         printf("pcie: Initializing port %d\n", port);
 
+        /*
+         * The port's registers are found by its index, which assumes the bridge is that port.
+         * Check it against the bridge's apcie-port (read as pcie_t6050.c reads it) or, when it
+         * has none, its reg's device number (phys.hi bits 15:11, as in the PCI bus binding), and
+         * log a bridge that names another port or carries neither. This only logs; the port is
+         * still set up by its index.
+         */
+        if (controller == APCIE) {
+            u32 apcie_port, reg_len = 0, phys_hi;
+            const void *bridge_reg;
+
+            if (ADT_GETPROP(adt, bridge_offset, "apcie-port", &apcie_port) >= 0) {
+                if (apcie_port != port)
+                    printf("pcie: %s has apcie-port %u\n", bridge, apcie_port);
+            } else if ((bridge_reg = adt_getprop(adt, bridge_offset, "reg", &reg_len)) &&
+                       reg_len >= sizeof(phys_hi)) {
+                memcpy(&phys_hi, bridge_reg, sizeof(phys_hi));
+                if (((phys_hi >> 11) & 0x1f) != port)
+                    printf("pcie: %s has reg device %u\n", bridge, (phys_hi >> 11) & 0x1f);
+            } else {
+                printf("pcie: %s has neither apcie-port nor reg\n", bridge);
+            }
+        }
+
         if (adt_get_reg(adt, adt_path, "reg",
                         port * port_reg_cnt + state->pcie_regs->shared_reg_count,
                         &state->port_base[port], NULL)) {
