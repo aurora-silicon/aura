@@ -67,16 +67,45 @@ enum {
 };
 
 /* The internal nub: __TEXT (shared by all three processors), __DATA, __OS_LOG, a heap */
-static const struct seg dcp_segs[4] = {
+static const struct seg synth_segs[4] = {
     {TB + 0x280000000ULL, 0, TB + 0x40000000, 0x10000, 1},
     {TB + 0x280010000ULL, 0x10000, TB + 0x80000000, 0x8000, 0},
     {TB + 0x24a4000ULL, 0x18000, TB + 0x24a4000ULL, 0x20000, 0xa},
     {TB + 0x280020000ULL, ~0ULL, TB + 0x968000, 0x40000, 2},
 };
 
+/*
+ * The J713's 27.2 layout, as its ADT gives it (the values, not the blob): __TEXT below the
+ * boot-args RAM and not a multiple of 16K, __OS_LOG not a multiple of 16K, __DATA and the heaps
+ * above the RAM; the internal nub has seven segments, each external one four, whose DVAs are the
+ * same for both (each processor has its own DART).
+ */
+static const struct seg j713_272_segs[7] = {
+    {TB + 0x2a8000ULL, 0, TB + 0x5bcc000ULL, 0x843000, 1},
+    {TB + 0x3e1874000ULL, 0x843000, TB + 0x6410000ULL, 0x32c000, 0},
+    {TB + 0xe4d4000ULL, 0xb6f000, TB + 0xe4d4000ULL, 0x26000, 0xa},
+    {TB + 0x3e5c1c000ULL, ~0ULL, TB + 0xb70000ULL, 0x1000000, 2},
+    {TB + 0x3e5c18000ULL, ~0ULL, TB + 0x1b98000ULL, 0x4000, 2},
+    {TB + 0x3e5b58000ULL, ~0ULL, TB + 0x1b9c000ULL, 0xc0000, 2},
+    {TB + 0x3e1be8000ULL, ~0ULL, TB + 0x1c5c000ULL, 0x3f70000, 2},
+};
+static const u64 j713_272_ext_data[2] = {TB + 0x3e1548000ULL, TB + 0x3e021c000ULL};
+static const u64 j713_272_ext_oslog[2] = {TB + 0xe4fc000ULL, TB + 0xe524000ULL};
+static const u64 j713_272_ext_heap[2] = {TB + 0x3e0548000ULL, TB + 0x3df21c000ULL};
+
+static bool layout272;
+static const struct seg *dcp_segs = synth_segs;
+static size_t dcp_nsegs = ARRAY_SIZE(synth_segs);
+
 static void ext_segs(int i, struct seg out[4])
 {
     out[0] = dcp_segs[0];
+    if (layout272) {
+        out[1] = (struct seg){j713_272_ext_data[i], 0x843000, TB + 0x6410000ULL, 0x32c000, 0};
+        out[2] = (struct seg){j713_272_ext_oslog[i], 0xb6f000, j713_272_ext_oslog[i], 0x26000, 0xa};
+        out[3] = (struct seg){j713_272_ext_heap[i], ~0ULL, TB + 0x673c000ULL, 0x1000000, 2};
+        return;
+    }
     out[1] = (struct seg){TB + 0x281200000ULL + i * 0x200000, 0, TB + 0x51000000 + i * 0x100000,
                           0x8000, 0};
     out[2] = (struct seg){TB + 0x28030000ULL + i * 0x40000, 0, TB + 0x28030000ULL + i * 0x40000,
@@ -96,8 +125,8 @@ static void world_t8132(bool no_panel, const char *uuid)
 {
     chip_id = 0x8132;
     os_firmware = (struct fw_version_info){V27_2, "27.2", {27, 2, 0}, 3, "mBoot-20457.41.3"};
-    ram_base = TB + 0x800000;
-    ram_size = 0x200000000ULL - 0x800000;
+    ram_base = layout272 ? TB + 0xc00000 : TB + 0x800000;
+    ram_size = layout272 ? 0x3dd1a4000ULL - 0xc00000 : 0x200000000ULL - 0x800000;
     fb_base = TB + 0x290000000ULL;
     cur_boot_args.video.stride = 2560 * 4;
     cur_boot_args.video.height = 1664;
@@ -116,8 +145,10 @@ static void world_t8132(bool no_panel, const char *uuid)
     reg_add("/arm-io/dcp", M4_DCP, 0x6c000);
     prop_u32("/arm-io/dcp", "iommu-parent", APH_MAPPER_DCP);
     const char *nub = "/arm-io/dcp/iop-dcp-nub";
-    prop_set(nub, "segment-ranges", dcp_segs, sizeof(dcp_segs));
-    prop_str(nub, "segment-names", "__TEXT;__DATA;__OS_LOG;unknown");
+    prop_set(nub, "segment-ranges", dcp_segs, dcp_nsegs * sizeof(*dcp_segs));
+    prop_str(nub, "segment-names",
+             layout272 ? "__TEXT;__DATA;__OS_LOG;unknown;unknown;unknown;unknown"
+                       : "__TEXT;__DATA;__OS_LOG;unknown");
     prop_str(nub, "uuid", uuid);
     prop_u32(nub, "pre-loaded", 1);
     prop_u32(nub, "running", 1);
@@ -384,9 +415,11 @@ static void check_ext(const void *in, const void *dt, int i, bool headless)
     snprintf(want, sizeof(want), headless ? "dcp-text@%llx" : "asc-firmware@%llx",
              (unsigned long long)es[0].phys);
     check(region_count(dt, ext) == 3 && text >= 0 && !strcmp(fdt_get_name(dt, text, NULL), want) &&
-              reg_of(dt, text, &base, &size) && base == es[0].phys && size == 0x10000,
+              reg_of(dt, text, &base, &size) && base == es[0].phys &&
+              size == ALIGN_UP((u64)es[0].size, SZ_16K),
           "dcpext%d text is /reserved-memory/%s", i, want);
-    check(tuple_for(dt, text, ext, es[0].remap, 0x10000), "dcpext%d maps the shared __TEXT", i);
+    check(tuple_for(dt, text, ext, es[0].remap, ALIGN_UP((u64)es[0].size, SZ_16K)),
+          "dcpext%d maps the shared __TEXT", i);
     check(!headless || fdt_getprop(dt, text, "no-map", NULL), "the shared __TEXT is no-map");
     const int seg_of[3] = {0, 1, 3};
     for (int k = 1; k < 3; k++) {
@@ -477,6 +510,7 @@ struct t8132_scenario {
 
 static const struct t8132_scenario t8132_scenarios[] = {
     {"j713-both", "J713 27.2 beside a complete internal handoff: both processors"},
+    {"j713-adt272-layout", "J713 with the segment layout and RAM range of its 27.2 ADT and boot"},
     {"j713-one", "J713: dcpext1 not running, dcpext0 handed over alone"},
     {"j713-refused-uuid", "J713: dcpext1 runs another image than the internal DCP"},
     {"j713-internal-walk-failed", "J713: the internal SID0/SID16 walk failed: nothing external"},
@@ -524,6 +558,11 @@ int main(int argc, char **argv)
 
     bool j773g = !strncmp(s, "j773g", 5), later = is(s, "later-soc");
     bool unknown = is(s, "j713-unknown-image");
+    if (is(s, "j713-adt272-layout")) {
+        layout272 = true;
+        dcp_segs = j713_272_segs;
+        dcp_nsegs = ARRAY_SIZE(j713_272_segs);
+    }
     world_t8132(j773g, unknown ? UUID262 : UUID27);
 
     static u8 dt[DT_SIZE], in[DT_SIZE];
@@ -595,7 +634,7 @@ int main(int argc, char **argv)
     check(fdt_check_header(dt) == 0, "the device tree is valid");
     check(ret == !unknown, "returns %d (%s)", ret, unknown ? "not ours" : "ours");
 
-    if (is(s, "j713-both") || is(s, "j713-repeat")) {
+    if (is(s, "j713-both") || is(s, "j713-repeat") || layout272) {
         check_ext(in, dt, 0, false);
         check_ext(in, dt, 1, false);
         check_oslogs(dt, true, true, false);
@@ -604,7 +643,10 @@ int main(int argc, char **argv)
                   node_same(in, dt, "/soc/dcp@30ae00000"),
               "the internal DCP node is untouched");
         u64 sz;
-        int text = fdt_path_offset(dt, "/reserved-memory/asc-firmware@10280000000");
+        char tpath[64];
+        snprintf(tpath, sizeof(tpath), "/reserved-memory/asc-firmware@%llx",
+                 (unsigned long long)dcp_segs[0].phys);
+        int text = fdt_path_offset(dt, tpath);
         check(iommu_dva(dt, text, alias_node(dt, "dcp"), &sz) == dcp_segs[0].remap,
               "the internal __TEXT keeps the dcp's mapping");
     } else if (is(s, "j713-one") || is(s, "j713-refused-uuid") || is(s, "j713-dart-reg-mismatch") ||

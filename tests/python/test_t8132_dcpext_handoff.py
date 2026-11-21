@@ -30,6 +30,7 @@ H0 = "dcpext: dcpext0 handed over (image B3BA603C-3CA7-3E21-B393-44EB20BD2AEF, s
 H1 = "dcpext: dcpext1 handed over (image B3BA603C-3CA7-3E21-B393-44EB20BD2AEF, stream 23, 2 pipe clocks)"
 REASONS = {
     "j713-both": [H0, H1],
+    "j713-adt272-layout": [H0, H1],
     "j713-one": [H0, "dcpext1: iBoot did not leave its four-segment firmware loaded and running"],
     "j713-refused-uuid": [H0, "dcpext1: does not run the internal DCP's image B3BA603C-"],
     "j713-internal-walk-failed": ["internal DCP handoff not complete: external processors not handed over"],
@@ -75,6 +76,19 @@ def test_no_board_chip_or_release_test_in_the_adt_path():
     for banned in ("chip_id", "apple,j", "V27_", "V26_", "V_UNKNOWN +", "os_firmware",
                    "board", "0x286", "0x48a", "0x30a", "dcpext0", "dcpext1", "dispext", "23"):
         assert banned not in path, banned
+
+
+def test_no_silent_early_return():
+    """Every way out of dt_set_dcpext_handoff() before a handoff says why, in one line."""
+    code = (ROOT / "src/kboot_display_handoff.c").read_text()
+    start = code.index("int dt_set_dcpext_handoff(void *dt")
+    body = code[start:code.index("\n}\n", start)].splitlines()
+    for n, line in enumerate(body):
+        if line.strip() not in ("return 0;", "return 1;"):
+            continue
+        before = "\n".join(body[max(0, n - 6):n])
+        assert "dlog(" in before or "dcp6_scratch(dt)" in before or "display" in before, \
+            (n, before)
 
 
 @pytest.fixture(scope="module")
