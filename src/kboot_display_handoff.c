@@ -3503,8 +3503,8 @@ static T6050_INIT int t6050_check_adt(void)
     bool vram_seg = false;
     if (t6050_adt_reg("/vram", 0, &t6050.vram, &t6050.vram_size) || !t6050.vram_size ||
         ((t6050.vram | t6050.vram_size) & (SZ_16K - 1)) || !fb || fb < t6050.vram ||
-        fb_size > t6050.vram + t6050.vram_size - fb || !seg || !len || len % sizeof(*seg) ||
-        len > 16 * sizeof(*seg))
+        fb - t6050.vram >= t6050.vram_size || fb_size > t6050.vram + t6050.vram_size - fb || !seg ||
+        !len || len % sizeof(*seg) || len > 16 * sizeof(*seg))
         bail("no /vram holding the boot framebuffer, or bad segment-ranges\n");
     for (u32 i = 0; i < len / sizeof(*seg); i++) {
         struct adt_segment_ranges r;
@@ -3936,7 +3936,7 @@ static T6050_TEXT int t6050_ext_one(void *dt, int n)
         bw = fdt32_ld(&v[3]);
         if (!r || len != 16 || t6050_adt_reg(b, 4, &meta, &meta_size) || fdt64_ld(&r[0]) != meta ||
             fdt64_ld(&r[1]) != meta_size || fdt32_ld(&v[1]) || fdt32_ld(&v[2]) != T6050_NDISP ||
-            bw > meta_size - 4)
+            meta_size < 4 || bw > meta_size - 4)
             bail("dcpext%d: apple,bw-scratch is not in %s's PMC metadata\n", n, b);
     } else {
         int disp = adt_path_offset(adt, b), pmgr = adt_path_offset(adt, "/arm-io/pmgr");
@@ -4103,7 +4103,7 @@ static T6050_TEXT int t6050_headless_check(void *dt, int engine, u64 *vram, u64 
     u64 fb = cur_boot_args.video.base,
         fb_size = cur_boot_args.video.stride * cur_boot_args.video.height;
     if (t6050_adt_reg("/vram", 0, vram, vram_size) || !*vram_size ||
-        ((*vram | *vram_size) & (SZ_16K - 1)) || !fb || fb < *vram ||
+        ((*vram | *vram_size) & (SZ_16K - 1)) || !fb || fb < *vram || fb - *vram >= *vram_size ||
         fb_size > *vram + *vram_size - fb || dcp6_resv_conflict(dt, *vram, *vram_size, "/vram"))
         bail("no /vram holding the boot framebuffer\n");
     return engine;
