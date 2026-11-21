@@ -29,14 +29,16 @@
 #define S2R_PKT_MAX   128
 #define S2R_DCP_OPEN  4
 /*
- * dart_walk_locked_t8110() visits 2048 L1 entries of 32 MiB: 36-bit IOVAs. A DVA's bits above
- * that are not table indices (J613's RPC memory is at 0x1000003c000), so only the walk's width is
- * compared. A walk of wider tables (T6050's three levels) needs its own width here.
+ * dart_walk_locked_t8110() visits 2048 L1 entries of 32 MiB: 36-bit IOVAs. A DVA is the DART's
+ * vm-base (its ADT node's property, as dart.c reads it) plus such an IOVA: J613's RPC memory is
+ * at 0x1000003c000. Without a vm-base only the walk's width is compared, as before.
  */
 #define S2R_DCP_T8110_IOVA_BITS 36
 
 static struct s2r_dcp {
     u64 mbox, dart, dart_size;
+    u64 vm_base;
+    bool have_vm_base;
     u64 dva, lo;
     u64 pa[S2R_DCP_PAGES];
     int resolved; /* 0 not yet, 1 found, -1 not found */
@@ -71,9 +73,23 @@ static int s2r_dcp_resolve(struct s2r_dcp *d)
     u64 ram = ALIGN_DOWN(cur_boot_args.phys_base, BIT(32));
     memset(d->pa, 0, sizeof(d->pa));
     d->lo = d->dva & ~0x3fffUL;
+    u64 iova = d->lo & GENMASK(S2R_DCP_T8110_IOVA_BITS - 1, 0);
+    /*
+     * With a vm-base that the DVA sits above, the IOVA is the difference, bounded by the walk's
+     * width. A DVA outside it keeps the width-only compare (and says so): the J613 value this was
+     * written against has not been read from its ADT yet.
+     */
+    if (d->have_vm_base) {
+        if (d->lo >= d->vm_base && d->lo - d->vm_base < BIT(S2R_DCP_T8110_IOVA_BITS))
+            iova = d->lo - d->vm_base;
+        else
+            printf("SPTM-virt[s2r]: dcp-pkt dva 0x%lx not within vm-base 0x%lx + 2^%u; "
+                   "comparing the low %u bits\n",
+                   d->dva, d->vm_base, S2R_DCP_T8110_IOVA_BITS, S2R_DCP_T8110_IOVA_BITS);
+    }
     u32 walked = 0;
     for (u8 sid = 0; sid < 16; sid++) {
-        struct s2r_dcp_walk w = {d, d->lo & GENMASK(S2R_DCP_T8110_IOVA_BITS - 1, 0), 0};
+        struct s2r_dcp_walk w = {d, iova, 0};
         int ret = dart_walk_locked_t8110(d->dart, d->dart_size, sid, ram, mem_size_actual,
                                          s2r_dcp_visit, &w);
         if (ret >= 0)
@@ -81,6 +97,11 @@ static int s2r_dcp_resolve(struct s2r_dcp *d)
         if (ret >= 0 && w.found) {
             printf("SPTM-virt[s2r]: dcp-pkt dva 0x%lx: sid %u, %d of %lu pages\n", d->dva, sid,
                    w.found, S2R_DCP_PAGES);
+            for (unsigned i = 0; i < S2R_DCP_PAGES; i++)
+                if (!d->pa[i])
+                    printf("SPTM-virt[s2r]: dcp-pkt dva 0x%lx: page %u (+0x%x) not mapped; its "
+                           "records are dropped\n",
+                           d->dva, i, i * 0x4000);
             return 1;
         }
     }
@@ -205,9 +226,20 @@ void s2r_dcp_add(const char *name, u64 mbox)
         if (s2r_dcp[i].mbox == mbox)
             return; /* both the coprocessor trace and s2r_hook's mailbox list can name it */
     snprintf(path, sizeof(path), "/arm-io/dart-%s", name);
-    if (adt_path_offset_trace(adt, path, p) < 0 || adt_get_reg(adt, p, "reg", 0, &base, &size) < 0)
+    int node = adt_path_offset_trace(adt, path, p);
+    if (node < 0 || adt_get_reg(adt, p, "reg", 0, &base, &size) < 0)
         return;
     s2r_dcp[s2r_n_dcp] = (struct s2r_dcp){.mbox = mbox, .dart = base, .dart_size = size};
-    printf("SPTM-virt[s2r]: dcp-pkt %d %s mbox 0x%lx dart 0x%lx\n", s2r_n_dcp, name, mbox, base);
+    u32 len = 0;
+    const void *vb = adt_getprop(adt, node, "vm-base", &len);
+    if (vb && (len == 4 || len == 8)) {
+        u64 v = 0;
+        memcpy(&v, vb, len);
+        s2r_dcp[s2r_n_dcp].vm_base = v;
+        s2r_dcp[s2r_n_dcp].have_vm_base = true;
+    }
+    printf("SPTM-virt[s2r]: dcp-pkt %d %s mbox 0x%lx dart 0x%lx vm-base %s0x%lx\n", s2r_n_dcp, name,
+           mbox, base, s2r_dcp[s2r_n_dcp].have_vm_base ? "" : "(none) ",
+           s2r_dcp[s2r_n_dcp].vm_base);
     s2r_n_dcp++;
 }
