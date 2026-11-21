@@ -99,6 +99,17 @@ void sptm_virt_rg_stop_wd2(void);
 void sptm_virt_rg_disarm(void);
 void sptm_virt_mmio_rw(u64 addr, u64 *val, bool write, int width);
 
+/* sptm_virt_park.c */
+struct uartproxy_msg_start;
+void sptm_virt_park_release(void);
+void sptm_virt_park_forever(void) __attribute__((noreturn));
+int sptm_virt_proxy_hold(struct uartproxy_msg_start *start);
+int sptm_virt_park_proxy(struct exc_info *ctx, u32 code);
+void sptm_virt_park_oneway(struct uartproxy_msg_start *start) __attribute__((noreturn));
+bool sptm_virt_park_requested(bool gl);
+void sptm_virt_park_host(struct exc_info *ctx);
+void sptm_virt_park_arrive(void);
+
 /* sptm_virt_s2r.c */
 extern volatile bool sptm_virt_s2r_quiet;
 void sptm_virt_s2r_setup(bool cdc);

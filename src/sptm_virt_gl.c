@@ -926,8 +926,14 @@ bool sptm_virt_gl_sync(u64 *regs, u64 esr, u64 elr, u64 spsr)
      * The deadline the host asked for, offered from the busiest path there is: SPTM's guarded
      * ERETs and GEXITs arrive all the while the guest runs, so a guest that leaves the GPU and
      * the watchdog alone -- every boot that has not reached WindowServer -- still hands the
-     * proxy back instead of running on with aura's console gone.
+     * proxy back instead of running on with aura's console gone. The host's own request too, but
+     * never in cL4's world, whose per-level state aura has switched to.
      */
+    if (!sptm_virt_in_cl4() && sptm_virt_park_requested(true)) {
+        struct exc_info pctx;
+        sptm_virt_fill_ctx(&pctx, regs, true);
+        sptm_virt_park_host(&pctx);
+    }
     sptm_virt_pmu_tick();
     if (sptm_virt_gpu_deadline_due()) {
         struct exc_info pctx;
@@ -1177,7 +1183,13 @@ bool sptm_virt_el1_wfx(u64 *regs, u64 esr)
     /*
      * The deadline park, offered here too: a guest that only spins in WFE or idles in WFI makes
      * no GL trap and touches no hooked page, so neither of the other two offers would ever come.
+     * The host's request is offered here too.
      */
+    if (sptm_virt_park_requested(false)) {
+        struct exc_info pctx;
+        sptm_virt_fill_ctx(&pctx, regs, false);
+        sptm_virt_park_host(&pctx);
+    }
     sptm_virt_pmu_tick();
     if (sptm_virt_gpu_deadline_due()) {
         struct exc_info pctx;

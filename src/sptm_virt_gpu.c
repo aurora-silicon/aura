@@ -5,9 +5,10 @@
  * the AGX register window (/arm-io/sgx reg 0, which holds the GPU's PMGR, its start control and
  * both ASC coprocessors) and on the PMP's dashboard and mailbox. Every access XNU makes there is
  * performed for real and recorded in a ring in aura's carve-out; writes, the first read of each
- * register and everything in the KSM block are also printed. After a host-set delay from the
- * first GPU access the core that next touches the GPU parks in aura's proxy, so the host can read
- * the ring (sptm_virt_gpu_ring, _head, _nrec).
+ * register and everything in the KSM block are also printed. At a host-set time, or at a write
+ * the host names, the core parks in aura's proxy, so the host can read the ring
+ * (sptm_virt_gpu_ring, _head, _nrec); the host's P_EXIT resumes the guest. Each of these parks
+ * happens once.
  */
 
 #include "sptm_virt.h"
@@ -61,8 +62,8 @@ static u64 gpu_seen[GPU_SEEN_MAX];
 static u32 gpu_nseen;
 static u64 gpu_first_t, gpu_stop_t;
 static volatile u32 gpu_printed;
-static volatile bool gpu_parked;
 static u64 gpu_boot_stop_t;
+static u32 gpu_msg_parks, gpu_now_parks;
 
 static const char *gpu_range_name(u64 addr, u64 *off)
 {
@@ -111,21 +112,20 @@ static void gpu_park(struct exc_info *ctx, const char *why)
 {
     /* First: of several cores that reach here at once, one owns the console and the proxy. */
     sptm_virt_park_others();
-    gpu_parked = true;
     printf("SPTM-virt[gpu]: %s: parking cpu%d in the proxy at XNU pc "
-           "0x%lx; ring 0x%lx, %lu records of %lu written (head 0x%lx at 0x%lx)\n",
+           "0x%lx; ring 0x%lx, %lu records of %lu written (head 0x%lx at 0x%lx); P_EXIT resumes\n",
            why, smp_id(), ctx->elr, (u64)sptm_virt_gpu_ring,
            sptm_virt_gpu_head < sptm_virt_gpu_nrec ? sptm_virt_gpu_head : sptm_virt_gpu_nrec,
            sptm_virt_gpu_head, sptm_virt_gpu_head, (u64)&sptm_virt_gpu_head);
-    iodev_console_flush();
-    struct uartproxy_msg_start start = {
-        .reason = START_HV,
-        .code = 0x47505521, /* 'GPU!' */
-        .info = ctx,
-    };
-    uartproxy_run(&start);
-    while (1)
-        sysop("wfe");
+    sptm_virt_park_proxy(ctx, 0x47505521 /* 'GPU!' */);
+}
+
+/* A one-shot trigger at time *t: true on the one core that takes it. */
+static bool gpu_claim_time(u64 *t, u64 now)
+{
+    u64 due = __atomic_load_n(t, __ATOMIC_RELAXED);
+    return due && now >= due &&
+           __atomic_compare_exchange_n(t, &due, 0, false, __ATOMIC_SEQ_CST, __ATOMIC_RELAXED);
 }
 
 /*
@@ -137,22 +137,20 @@ static void gpu_park(struct exc_info *ctx, const char *why)
 /* Park on demand, for a caller that has found something worth stopping the world for. */
 void sptm_virt_gpu_park_now(struct exc_info *ctx, const char *why)
 {
-    if (gpu_parked)
-        return;
-    gpu_park(ctx, why);
+    if (!__atomic_fetch_add(&gpu_now_parks, 1, __ATOMIC_SEQ_CST))
+        gpu_park(ctx, why);
 }
 
 /* Cheap enough to ask on every trap, before building a context to park with. */
 bool sptm_virt_gpu_deadline_due(void)
 {
-    return !gpu_parked && gpu_boot_stop_t && mrs(CNTPCT_EL0) >= gpu_boot_stop_t;
+    return gpu_boot_stop_t && mrs(CNTPCT_EL0) >= gpu_boot_stop_t;
 }
 
 void sptm_virt_gpu_deadline(struct exc_info *ctx)
 {
-    if (gpu_parked || !gpu_boot_stop_t || mrs(CNTPCT_EL0) < gpu_boot_stop_t)
-        return;
-    gpu_park(ctx, "the deadline the host asked for");
+    if (gpu_claim_time(&gpu_boot_stop_t, mrs(CNTPCT_EL0)))
+        gpu_park(ctx, "the deadline the host asked for");
 }
 
 /* The GPU's own ASCs (gfx-asc, gfx1-asc): an endpoint's message is a mailbox write to one of them.
@@ -189,6 +187,9 @@ static bool gpu_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int w
         printf("SPTM-virt[gpu]: first GPU access, %s 0x%lx pc 0x%lx\n", write ? "wr" : "rd", addr,
                ctx->elr);
     }
+    /* The value decides, so the write the host names is known before it is performed. */
+    bool hit = sptm_virt_gpu_stop_msg && write &&
+               gpu_stop_msg_hit(addr, width == 4 ? val : NULL, *val, width);
 
     if (width == 4) {
         /* A trapped LDP/STP pair (the ASC mailboxes take their messages so). */
@@ -225,16 +226,12 @@ static bool gpu_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int w
             printf("SPTM-virt[gpu]: print budget used up; the ring keeps recording\n");
     }
 
-    if (gpu_parked)
-        return true;
-    if (gpu_boot_stop_t && now >= gpu_boot_stop_t)
-        gpu_park(ctx, "the deadline the host asked for");
+    sptm_virt_gpu_deadline(ctx);
     /* A message the host names is a repeatable park point; the seconds are not (the guest's own
      * timing varies from boot to boot by more than the whole bring-up lasts). */
-    if (sptm_virt_gpu_stop_msg && write &&
-        gpu_stop_msg_hit(addr, width == 4 ? val : NULL, *val, width))
+    if (hit && !__atomic_fetch_add(&gpu_msg_parks, 1, __ATOMIC_SEQ_CST))
         gpu_park(ctx, "the write the host asked for");
-    else if (gpu_stop_t && now >= gpu_stop_t)
+    else if (gpu_claim_time(&gpu_stop_t, now))
         gpu_park(ctx, "the time the host asked for");
     return true;
 }

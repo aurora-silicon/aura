@@ -839,8 +839,7 @@ bool sptm_virt_s2r_wfi(u64 *regs, u64 esr)
     if (cpu != s2r_timer_cpu) {
         __atomic_or_fetch(&s2r_parked_mask, BIT(cpu), __ATOMIC_SEQ_CST);
         printf("SPTM-virt[s2r]: cpu%d parked at its last WFI (stop mode)\n", cpu);
-        while (1)
-            sysop("wfe");
+        sptm_virt_park_forever();
     }
     printf("SPTM-virt[s2r]: macOS reached its final WFI on the S2R-timer core cpu%d; parked 0x%x; "
            "%lu records. Stopping in the proxy (stop mode).\n",
@@ -848,7 +847,8 @@ bool sptm_virt_s2r_wfi(u64 *regs, u64 esr)
     /* whole classes, newest first: the proxy read-out fails with ten cores */
     sptm_virt_s2r_dump_prio(6000, 60000);
     struct uartproxy_msg_start start = {
-        .reason = START_HV, .code = 0x53325221, /* 'S2R!' */
+        .reason = START_HV,
+        .code = 0x53325221, /* 'S2R!' */
     };
     sptm_virt_park_others();
     uartproxy_run(&start);
@@ -900,10 +900,7 @@ static void s2r_cpustart_watch(struct exc_info *ctx, u64 addr, u64 val)
         .code = 0x534d5021, /* 'SMP!' */
         .info = ctx,
     };
-    sptm_virt_park_others();
-    uartproxy_run(&start);
-    while (1)
-        sysop("wfe");
+    sptm_virt_park_oneway(&start);
 }
 
 static bool s2r_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int width)
