@@ -33,6 +33,22 @@ struct dapf_segment {
 static_assert(sizeof(struct dapf_segment) == 32, "Invalid segment-ranges entry size");
 
 /*
+ * The CPU DART of video encoder N is /arm-io/dart-ave<N>, the encoder /arm-io/ave<N>. Return the
+ * encoder's name ("ave<N>") for such a DART name, or NULL.
+ */
+static const char *dapf_ave_of_dart(const char *name)
+{
+    const char *p;
+
+    if (!name || strncmp(name, "dart-ave", 8) || !name[8])
+        return NULL;
+    for (p = name + 8; *p; p++)
+        if (*p < '0' || *p > '9')
+            return NULL;
+    return name + 5;
+}
+
+/*
  * A coprocessor whose firmware iBoot preloads fetches its __TEXT physically at the
  * address iBoot latched in its reset vector, through its CPU DART's filter. The
  * filter must admit that range. Return the preloaded __TEXT range of the ADT node
@@ -40,11 +56,14 @@ static_assert(sizeof(struct dapf_segment) == 32, "Invalid segment-ranges entry s
  */
 static bool dapf_preload_text(const char *path, u64 *start, u64 *end)
 {
-    if (strcmp(path, "/arm-io/dart-ave0"))
+    char encoder[32];
+    const char *ave =
+        strncmp(path, "/arm-io/", 8) ? NULL : dapf_ave_of_dart(path + strlen("/arm-io/"));
+    if (!ave || snprintf(encoder, sizeof(encoder), "/arm-io/%s", ave) >= (int)sizeof(encoder))
         return false;
 
     u32 len;
-    int node = adt_path_offset(adt, "/arm-io/ave0");
+    int node = adt_path_offset(adt, encoder);
     if (node < 0 || !adt_getprop(adt, node, "pre-loaded", &len))
         return false;
     const struct dapf_segment *seg = adt_getprop(adt, node, "segment-ranges", &len);
@@ -67,7 +86,7 @@ static int dapf_init_t8020(const char *path, u64 base, int node)
     }
 
     int count = length / sizeof(*config);
-    u64 text_start, text_end;
+    u64 text_start = 0, text_end = 0;
     bool text = dapf_preload_text(path, &text_start, &text_end);
 
     for (int i = 0; i < count; i++) {
@@ -667,6 +686,16 @@ struct entry dapf_entries[] = {
     {NULL, -1, NULL},
 };
 
+/*
+ * T8140 programs only its MTP and PMP DART filters and keeps every other filter as inherited
+ * (programming the rest raised an SError on a J700). dapf_init_fdt() and the encoder filters in
+ * kboot.c both ask this, so the two cannot drift.
+ */
+bool dapf_keeps_inherited(const char *path)
+{
+    return chip_id == T8140 && strcmp(path, "/arm-io/dart-mtp") && strcmp(path, "/arm-io/dart-pmp");
+}
+
 static int dapf_init_j713(void *dt)
 {
     int ret = 0;
@@ -787,8 +816,7 @@ int dapf_init_fdt(const void *fdt)
     struct entry *entry = dapf_entries;
 
     while (entry->path != NULL) {
-        if (chip_id == T8140 && strcmp(entry->path, "/arm-io/dart-mtp") &&
-            strcmp(entry->path, "/arm-io/dart-pmp")) {
+        if (dapf_keeps_inherited(entry->path)) {
             printf("dapf: preserving inherited %s state on T8140\n", entry->path);
             entry++;
             continue;
