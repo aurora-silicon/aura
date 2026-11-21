@@ -3212,8 +3212,8 @@ static int dcpext_nub_segs(const char *name, int nub, u64 vm_base, u64 vm_size,
         if (i == SEG_OSLOG) {
             if (s->remap != s->phys || s->size > DCP6_OSLOG_MAX)
                 bail("%s: __OS_LOG is not a physical buffer\n", name);
-        } else if (s->remap < vm_base || s->remap - vm_base > vm_size - s->size ||
-                   (s->remap & (SZ_16K - 1)) ||
+        } else if (s->size > vm_size || s->remap < vm_base ||
+                   s->remap - vm_base > vm_size - s->size || (s->remap & (SZ_16K - 1)) ||
                    !(s->phys + s->size <= kboot_ram_base() || s->phys >= ram_end)) {
             bail("%s: segment %d 0x%lx+0x%lx at 0x%lx is kernel RAM or outside the DVA window\n",
                  name, i, s->phys, s->size, s->remap);

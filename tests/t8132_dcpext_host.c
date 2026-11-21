@@ -519,6 +519,7 @@ static const struct t8132_scenario t8132_scenarios[] = {
     {"j713-sid-mismatch", "J713: the ADT mapper's stream is not the DT iommus cell"},
     {"j713-dart-reg-mismatch", "J713: the DT DART is not at the ADT DART's address"},
     {"j713-dma-range-mismatch", "J713: apple,dma-range is not the ADT vm-base/vm-size-23"},
+    {"j713-window-too-small", "J713: dcpext0's DART window is smaller than a segment"},
     {"j713-no-mapper", "J713: the ADT has no mapper for the processor"},
     {"j713-no-pipe", "J713: no ADT pipe on the piodma stream"},
     {"j713-two-pipes", "J713: two ADT pipes on the piodma stream"},
@@ -592,6 +593,13 @@ int main(int argc, char **argv)
         node_get("/arm-io/dart-dcpext1")->reg[0][0] += 0x100000;
     if (is(s, "j713-dma-range-mismatch"))
         prop_u64("/arm-io/dart-dcpext0", "vm-size-23", 0x800000000ULL);
+    if (is(s, "j713-window-too-small")) {
+        /* ADT and DT agree on a one-page window: the 16K-rounded segments do not fit in it */
+        prop_u64("/arm-io/dart-dcpext0", "vm-size-23", 0x4000);
+        int dart = fdt_node_offset_by_phandle(dt, PH_EXT_DART);
+        fdt32_t range[4] = {cpu_to_fdt32(0x100), 0, 0, cpu_to_fdt32(0x4000)};
+        OK(fdt_setprop(dt, dart, "apple,dma-range", range, sizeof(range)));
+    }
     if (is(s, "j713-no-mapper"))
         node_drop("/arm-io/dart-dcpext1/mapper-dcpext1");
     if (is(s, "j713-no-pipe"))
@@ -657,7 +665,8 @@ int main(int argc, char **argv)
         check_internal_untouched(in, dt);
         check_display(in, dt, false);
     } else if (is(s, "j713-sid-mismatch") || is(s, "j713-dma-range-mismatch") ||
-               is(s, "j713-bad-layout") || is(s, "j713-has-clocks") || is(s, "j713-two-pipes")) {
+               is(s, "j713-window-too-small") || is(s, "j713-bad-layout") ||
+               is(s, "j713-has-clocks") || is(s, "j713-two-pipes")) {
         check(ext_untouched(in, dt, 0), "dcpext0 is left as it was");
         check_ext(in, dt, 1, false);
         check_internal_untouched(in, dt);

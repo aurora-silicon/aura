@@ -39,6 +39,7 @@ REASONS = {
     "j713-sid-mismatch": [H1, "dcpext0: iommus is not <&dart 22>, the ADT's stream"],
     "j713-dart-reg-mismatch": [H0, "dcpext1: its DART is not the ADT's apple,t8110-dart at 0x48a440000"],
     "j713-dma-range-mismatch": [H1, "dcpext0: DART apple,dma-range is not the ADT window <0x10000000000 0x800000000>"],
+    "j713-window-too-small": [H1, "dcpext0: segment 0 0x10280000000+0x10000 at 0x10040000000 is kernel RAM or outside the DVA window"],
     "j713-no-mapper": [H0, "dcpext1: the ADT does not describe its DART stream"],
     "j713-no-pipe": [H0, "dcpext1: 0 ADT display pipes use its piodma stream 16 at 0x48a300000"],
     "j713-two-pipes": [H1, "dcpext0: 2 ADT display pipes use its piodma stream 16 at 0x286300000"],
@@ -57,7 +58,7 @@ REASONS = {
 }
 # Scenarios in which exactly one processor is refused: its refusal is one log line.
 ONE_REFUSAL = {"j713-one", "j713-refused-uuid", "j713-sid-mismatch", "j713-dart-reg-mismatch",
-               "j713-dma-range-mismatch", "j713-no-mapper", "j713-no-pipe", "j713-two-pipes",
+               "j713-dma-range-mismatch", "j713-window-too-small", "j713-no-mapper", "j713-no-pipe", "j713-two-pipes",
                "j713-no-adt-node", "j713-text-not-shared", "j713-bad-layout", "j713-has-clocks"}
 
 
