@@ -84,7 +84,14 @@ jobs:
             sed -i -e "s/^CheckSpace/#CheckSpace/" -e "/^\[options\]/a DisableSandbox" /etc/pacman.conf
             pacman-key --init >/dev/null
             pacman-key --populate archlinuxarm >/dev/null
-            pacman -Syu --noconfirm --needed clang lld llvm rustup make python >/dev/null
+            # mirror.archlinuxarm.org stalls now and then ("Operation too slow"); a stalled
+            # download fails the whole transaction, so try it again before giving up.
+            for try in 1 2 3; do
+              pacman -Syu --noconfirm --needed clang lld llvm rustup make python >/dev/null && break
+              [ "$try" = 3 ] && exit 1
+              echo "pacman: download failed (try $try of 3), retrying in 60 s"
+              sleep 60
+            done
             # The toolchain alarm-aurora packages/aura/PKGBUILD pins.
             rustup toolchain install 1.99.0 --profile minimal --target aarch64-unknown-none-softfloat >/dev/null
             export RUSTUP_TOOLCHAIN=1.99.0
