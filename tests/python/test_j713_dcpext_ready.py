@@ -190,6 +190,8 @@ __attribute__((unused)) static u32 clear32(uintptr_t addr, u32 clear) { return p
         # The native26 path is T8122-only; J713 must never reach it.
         "static int dt_ext26_snapshot(const char *alias) { assert(0); return -1; }\n"
         "static int dt_ext26_reserve(const char *alias) { assert(0); return -1; }\n"
+        "static int dt_dcpext_inherited_darts(const char *alias) { assert(0); return -1; }\n"
+        "static int dt_t8122_dcpext_reserve(const char *nub, const char *alias) { assert(0); return -1; }\n"
         "static void dt_ext26_step(const char *step) { assert(0); }\n"
         "static int dt_ext26_retain_cpu(const char *alias) { assert(0); return -1; }\n" +
         function(kboot, "dt_reserve_dcpext_ready") +

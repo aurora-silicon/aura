@@ -81,6 +81,9 @@
 #define DART_T8110_PARAMS2        0x4
 #define DART_T8110_PARAMS2_BYPASS BIT(0)
 
+#define DART_T8110_PARAMS4          0xc
+#define DART_T8110_PARAMS4_NUM_SIDS GENMASK(8, 0)
+
 #define DART_T8110_PROTECT          0x200
 #define DART_T8110_PROTECT_TTBR_TCR BIT(0)
 
@@ -949,6 +952,56 @@ int dart_collect_native_t8110(uintptr_t base, u8 sid, u64 dram_base, u64 dram_si
     *count = used;
     snprintf(detail, detail_size, "substep=accepted root=%lx pages=%zu", root, used);
     printf("dart: native table collection accepted root=%lx pages=%zu\n", root, used);
+    return 0;
+}
+
+/*
+ * Inspect a T8110 DART that an earlier boot stage may have left set up, before a kernel is
+ * promised the processor behind it. Unlocked with every stream idle, the kernel programs it
+ * itself: nothing to keep (*count = 0); an unlocked stream that still translates, bypasses or
+ * remaps refuses. Locked, every enabled stream must translate through tables in DRAM,
+ * which are collected for a reservation; a locked stream that bypasses, remaps or has no valid
+ * root, or tables that cannot all be collected, refuse (nonzero).
+ */
+int dart_collect_inherited_t8110(uintptr_t base, u64 dram_base, u64 dram_size, u64 *pages,
+                                 size_t capacity, size_t *count, char *detail, size_t detail_size)
+{
+    if (!count || !pages || !detail || !detail_size)
+        return -2;
+    *count = 0;
+    u32 protect = read32(base + DART_T8110_PROTECT);
+    u32 sids = FIELD_GET(DART_T8110_PARAMS4_NUM_SIDS, read32(base + DART_T8110_PARAMS4));
+    if (!sids || sids > 256) {
+        snprintf(detail, detail_size, "locked protect=%x streams=%u (no stream count)", protect,
+                 sids);
+        return -3;
+    }
+    if (!(protect & DART_T8110_PROTECT_TTBR_TCR)) {
+        /* Unlocked: the kernel reprograms it, but a stream still translating would walk tables
+         * nothing keeps until then. */
+        for (u32 sid = 0; sid < sids; sid++) {
+            u32 tcr = read32(base + DART_T8110_TCR_OFF + 4 * sid);
+            if (tcr & (DART_T8110_TCR_TRANSLATE_ENABLE | DART_T8110_TCR_BYPASS_DART |
+                       DART_T8110_TCR_REMAP_EN)) {
+                snprintf(detail, detail_size, "unlocked protect=%x streams=%u live sid=%u tcr=%x",
+                         protect, sids, sid, tcr);
+                return -8;
+            }
+        }
+        snprintf(detail, detail_size, "unlocked protect=%x streams=%u idle", protect, sids);
+        return 0;
+    }
+    for (u32 sid = 0; sid < sids; sid++) {
+        if (!read32(base + DART_T8110_TCR_OFF + 4 * sid))
+            continue;
+        size_t found = 0;
+        int ret = dart_collect_native_t8110(base, sid, dram_base, dram_size, pages + *count,
+                                            capacity - *count, &found, detail, detail_size);
+        if (ret)
+            return ret;
+        *count += found;
+    }
+    snprintf(detail, detail_size, "locked protect=%x streams=%u tables=%zu", protect, sids, *count);
     return 0;
 }
 

@@ -53,5 +53,7 @@ u64 dart_vm_base(dart_dev_t *dart);
 
 int dart_collect_native_t8110(uintptr_t base, u8 sid, u64 dram_base, u64 dram_size, u64 *pages,
                               size_t capacity, size_t *count, char *detail, size_t detail_size);
+int dart_collect_inherited_t8110(uintptr_t base, u64 dram_base, u64 dram_size, u64 *pages,
+                                 size_t capacity, size_t *count, char *detail, size_t detail_size);
 
 #endif
