@@ -8008,13 +8008,7 @@ static int dt_set_m4_dcp_handoff(void)
     if (ret)
         return ret;
 
-    /*
-     * Firmware 27 is given its clocks by the OS (/arm-io/disp0 clock-ids); without them it
-     * does not start, but the rest of the boot does. Nothing is published on 26.6.2.
-     */
-    if (dt_set_dcp_fw27_clocks("dcp", "/arm-io/disp0"))
-        printf("FDT: M4 DCP firmware clocks not published\n");
-
+    bool maps = false;
     dcp_node = fdt_path_offset(dt, "dcp");
     if (fdt_getprop(dt, dcp_node, "apple,j713-native-piodma", NULL)) {
         /*
@@ -8025,7 +8019,18 @@ static int dt_set_m4_dcp_handoff(void)
         if ((os_firmware.version != V26_6_2 && os_firmware.version != V27_2) ||
             dt_set_j713_display_maps(segments, count, dram_start, dram_size))
             printf("FDT: M4 PIODMA handoff unqualified; retaining disabled device\n");
+        else
+            maps = true;
     }
+
+    /*
+     * Firmware 27 is given its clocks by the OS (/arm-io/disp0 clock-ids); without them it
+     * does not start, but the rest of the boot does. Nothing is published on 26.6.2.
+     * The kernel admits a firmware-27 DCP on apple,clock-ids, so they go out only together
+     * with the inherited display maps: a DCP adopted without them faults on its DART.
+     */
+    if (maps && dt_set_dcp_fw27_clocks("dcp", "/arm-io/disp0"))
+        printf("FDT: M4 DCP firmware clocks not published\n");
 
     printf("FDT: M4 DCP firmware mappings published; display device status unchanged\n");
     return 0;

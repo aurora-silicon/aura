@@ -299,9 +299,12 @@ static void published(bool piodma)
     assert(!!fdt_getprop(dt, fdt_path_offset(dt, "disp0"), "memory-region", NULL) == piodma);
     assert(walks == (b.native && (os_firmware.version == V26_6_2 ||
                                   os_firmware.version == V27_2) ? 2 : 0));
-    /* Firmware 27 is given /arm-io/disp0's clocks; 26.x trees are not touched. */
+    /*
+     * Firmware 27 is given /arm-io/disp0's clocks, only with the inherited display maps (the
+     * kernel admits the DCP on apple,clock-ids); 26.x trees are not touched.
+     */
     const fdt32_t *ids = fdt_getprop(dt, dcp, "apple,clock-ids", &len);
-    if (os_firmware.version < V27_0) {
+    if (os_firmware.version < V27_0 || !piodma) {
         assert(!ids && !fdt_getprop(dt, dcp, "clocks", NULL) &&
                fdt_path_offset(dt, "/clock-dcp-firmware-364") < 0);
         return;
@@ -356,7 +359,8 @@ int main(int argc, char **argv)
     handed_over(&stub, V27_2, true);
     /*
      * Inherited pages that do not match the image's segments: nothing of PIODMA or scanout is
-     * published (the walk stops at the first page), the DCP keeps its firmware and clocks.
+     * published (the walk stops at the first page), and neither are the firmware clocks, so
+     * the kernel does not admit the DCP. It keeps its firmware.
      */
     world(&stub, V27_2);
     dart_skew = SZ_16K;
@@ -364,7 +368,10 @@ int main(int argc, char **argv)
     assert(walks == 1 && status_is("/soc/display-subsystem", "disabled") &&
            status_is("/soc/dcp@30ae00000/piodma", "disabled") &&
            status_is("/soc/iommu@30a300000", "disabled"));
-    assert(fdt_getprop(dt, fdt_path_offset(dt, "dcp"), "apple,clock-ids", NULL));
+    assert(!fdt_getprop(dt, fdt_path_offset(dt, "dcp"), "apple,clock-ids", NULL) &&
+           !fdt_getprop(dt, fdt_path_offset(dt, "dcp"), "clocks", NULL) &&
+           fdt_path_offset(dt, "/clock-dcp-firmware-364") < 0);
+    assert(fdt_getprop(dt, fdt_path_offset(dt, "dcp"), "apple,firmware-uuid", NULL));
     /* The J713's disp0 is never read. PIODMA follows the firmware version, not the image. */
     old = j713; old.external = -1;
     handed_over(&old, V26_6, false);
