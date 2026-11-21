@@ -3469,6 +3469,56 @@ static int adt_acio_rc_regnum(void)
     return 2;
 }
 
+/* The size of node's reg entry named name, at its bus's #address-cells and #size-cells. */
+static int dt_get_named_reg_size(int node, const char *name, u64 *size)
+{
+    int index = fdt_stringlist_search(dt, node, "reg-names", name);
+    int bus = fdt_parent_offset(dt, node);
+    int len;
+
+    if (index < 0 || bus < 0)
+        return -1;
+
+    int ac = fdt_address_cells(dt, bus);
+    int sc = fdt_size_cells(dt, bus);
+    const fdt32_t *reg = fdt_getprop(dt, node, "reg", &len);
+    if (ac < 1 || ac > 2 || sc < 1 || sc > 2 || !reg ||
+        len < (int)((index + 1) * (ac + sc) * sizeof(*reg)))
+        return -1;
+
+    reg += index * (ac + sc) + ac;
+    *size = sc == 2 ? ((u64)fdt32_ld(reg) << 32) | fdt32_ld(reg + 1) : fdt32_ld(reg);
+    return 0;
+}
+
+/*
+ * The router's AP firmware window takes its own table. The kernel applies it
+ * only to a router whose reg names that window ("router-ap-fw"), so it is
+ * copied only to such a router, and each row must fall inside that window.
+ * A tree that still carries the table keeps it.
+ */
+static void dt_copy_router_ap_fw_tunable(int adt_node, const char *fdt_alias)
+{
+    const char *fdt_path = fdt_get_alias(dt, fdt_alias);
+    int fdt_node = fdt_path ? fdt_path_offset(dt, fdt_path) : -1;
+    struct adt_tunable_info tunable = {
+        .adt_name = "pcie_router_ap_fw",
+        .fdt_name = "apple,tunable-router-ap-fw",
+    };
+    u64 size;
+
+    if (fdt_node < 0 || fdt_getprop(dt, fdt_node, tunable.fdt_name, NULL) ||
+        dt_get_named_reg_size(fdt_node, "router-ap-fw", &size))
+        return;
+
+    tunable.reg_size = size;
+    if (dt_append_acio_tunable(adt_node, fdt_node, &tunable)) {
+        /* The converter can have appended valid rows before rejecting one. */
+        fdt_delprop(dt, fdt_node, tunable.fdt_name);
+        printf("kboot: %s: router AP firmware tunable not copied\n", fdt_alias);
+    }
+}
+
 static int dt_set_acio_tunables(void)
 {
     char adt_path[32];
@@ -3496,6 +3546,7 @@ static int dt_set_acio_tunables(void)
             snprintf(fdt_alias, sizeof(fdt_alias), "usb4-%d-acio", i);
         dt_copy_acio_tunables(adt_path, fdt_alias, usb4_rc_tunables,
                               sizeof(usb4_rc_tunables) / sizeof(*usb4_rc_tunables));
+        dt_copy_router_ap_fw_tunable(adt_node, fdt_alias);
 
         snprintf(fdt_alias, sizeof(fdt_alias), "usb4_%d_pcie_adapter", i);
         if (!fdt_get_alias(dt, fdt_alias))
