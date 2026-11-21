@@ -37,7 +37,7 @@ struct hvtrace_rec {
 
 struct hvtrace_rng {
     u64 pa;
-    u32 len; /* bytes, whole 16 KiB pages */
+    u32 len; /* bytes, 4-byte aligned: a sub-page range traps its page and records its bytes */
     u32 blk;
 };
 
@@ -87,6 +87,9 @@ const char *sptm_virt_trace_check(const struct hvtrace_cfg *c);
 /* A ring of cap records in bytes (at least the header and two records), empty. */
 void sptm_virt_trace_ring_init(struct hvtrace_hdr *h, u64 bytes, u32 kind, u64 cntfrq, u64 t);
 /* An access performed: one record (a 128-bit access two), or counted lost if the ring is full. */
+/* The debug link's keep hook hands on an access it performed on a page a range names. */
+void sptm_virt_trace_tap(u64 addr, const u64 *val, bool write, int width, u64 pc);
+extern u64 sptm_virt_trace_unlisted;
 void sptm_virt_trace_note(struct hvtrace_hdr *h, u64 addr, const u64 *val, bool write, int width,
                           u32 blk, u64 pc, bool gl, u32 cpu, u64 t);
 /* From the host at a park: [tail, upto) has been read; free it. 0, or < 0 refused. */

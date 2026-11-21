@@ -23,8 +23,16 @@ The ring
      or move the tail before the slots are zeroed (a stale record read again as a new one);
   F8 accept a drain of anything but its own two rings.
 The block list (the host's, before entry; checked again by aura before it hooks anything)
-  F9 (M) accept a range that isn't whole 16 KiB pages, one past 48 bits, two that overlap, more
-     than 16 ranges, 8 blocks or 32 pages, a range in no block or a block with no range.
+  F9 (M) accept a range that isn't 4-byte aligned, one past 48 bits, two that overlap, more than
+     16 ranges, 8 blocks or 32 distinct pages (two ranges on one page count it once), a range in
+     no block or a block with no range.
+Sub-page ranges and the debug link's PMGR page (the ports lane's list, 11-21)
+  F10 (M) record an access on a trapped page outside every listed range (a sub-page range records
+     only its own bytes; the rest of its page is performed once and not recorded), or not perform
+     it;
+  F11 hook a page two ranges share twice, or one of a range's pages not at all;
+  F12 (M) record an access the keep hook hands on (sptm_virt_trace_tap) outside every range, with
+     another pc than the keep hook's guest pc, or crash with no block trace set up.
 The decoder
   D1 decode a slot still being written (t = 0) or one past the reader's cut;
   D2 duplicate or drop records across reads and drains (the capture directory's index);
@@ -39,7 +47,8 @@ What only the hardware shows (the run's console and summary tell each one):
      controller): aura refuses the whole list from its ADT ("SPTM-virt[trace]: refused"), and
      run_guest_sptm refuses it before anything is sent; no page is hooked;
   H2 a page another aura hook owns (the reset guard, the vuart, the GPU record, the sleep path):
-     refused the same way, the page named;
+     refused the same way, the page named; except a page of the debug link's keep hook (the PMGR
+     PS words), which isn't hooked again: the keep hook hands its accesses on (F12);
   H3 the trap rate slows the guest: the "SPTM-virt[s2 traps]" lines every 10 s give it;
   H4 a register that misbehaves under the HV's emulation (an LDP/STP of two W registers is one
      64-bit access; a 32-byte one isn't supported and fails the access): an SError or an XNU
@@ -122,11 +131,11 @@ MUTATIONS = {
                                                 "            b = i;\n")],
     "F3 the value read before the access": [(
         "    if (!trace_perform(ctx, addr, val, write, width))\n        return false;\n"
-        "    u64 t = trace_now();\n    for (u32 i = 0;",
+        "    u64 t = trace_now();\n    u32 b = trace_blk_of(h, addr);",
         "    u64 saved = val[0];\n    if (!trace_perform(ctx, addr, val, write, width))\n"
         "        return false;\n    u64 t = trace_now();\n    u64 got = val[0];\n"
         "    val[0] = saved;\n    sptm_virt_trace_note(h, addr, val, write, width, 0, ctx->elr, 0, 0, t);\n"
-        "    h->head--;\n    val[0] = got;\n    for (u32 i = 0;")],
+        "    h->head--;\n    val[0] = got;\n    u32 b = trace_blk_of(h, addr);")],
     "F4 slots claimed non-atomically": [(CLAIM, """    if (head + n - __atomic_load_n(&h->tail, __ATOMIC_ACQUIRE) > h->cap)
         return false;
     for (volatile int spin = 0; spin < 50; spin++)
@@ -159,10 +168,13 @@ MUTATIONS = {
 """)],
     "F8 a drain of anything accepted": [(
         "    if (!h || (h != sptm_virt_trace_blk && h != sptm_virt_trace_irq))\n", "    if (!h)\n")],
-    "F9 a misaligned range accepted": [("((r->pa | r->len) & 0x3fff)", "((r->pa | r->len) & 0xfff)")],
+    "F9 a misaligned range accepted": [("((r->pa | r->len) & 3)", "((r->pa | r->len) & 1)")],
     "F9 a PA past 48 bits accepted": [(" || r->pa >> 48 ||", " ||")],
     "F9 overlapping ranges accepted": [("                return \"two ranges overlap\";\n", "                ;\n")],
-    "F9 33 pages accepted": [("    if (pages > HVTRACE_PAGES)\n", "    if (pages > 2 * HVTRACE_PAGES)\n")],
+    "F9 33 pages accepted": [("            if (n_pages >= HVTRACE_PAGES)\n", "            if (n_pages > HVTRACE_PAGES)\n")],
+    "F10 an access outside every range recorded": [(
+        "    if (b == 15) {\n        __atomic_fetch_add(&sptm_virt_trace_unlisted, 1, __ATOMIC_RELAXED);\n        return true;\n    }\n", "")],
+    "F12 a tap outside every range recorded": [("    if (b == 15)\n        return;\n", "")],
     "F9 a block with no range accepted": [("    if (used != (1U << c->n_blk) - 1)\n", "    if (0)\n")],
     "F9 9 blocks accepted": [("c->n_blk > HVTRACE_BLKS)", "c->n_blk > HVTRACE_BLKS + 1)")],
 }
@@ -415,7 +427,7 @@ def test_the_first_runs_list_parses():
 
 
 @pytest.mark.parametrize("spec", [
-    "0x3803c1000:0x4000", "0x3803c0000:0x2000", "0x3803c0000:0", "0x1000000000000:0x4000",
+    "0x3803c0002:0x4000", "0x3803c0000:0x2002", "0x3803c0000:0", "0x1000000000000:0x4000",
     "0x413000000:0x8000:a,0x413004000:0x4000:b", "0x3803c0000", "x:0x4000", "0x0:0x4000:bad name",
     ",".join(f"0x{0x413000000 + 0x8000 * i:x}:0x4000" for i in range(17)),
     ",".join(f"0x{0x413000000 + 0x8000 * i:x}:0x4000:b{i}" for i in range(9)),
@@ -549,7 +561,7 @@ def test_h1_aura_refuses_the_debug_link_on_the_j773g_adt(tmp_path):
     assert out[3].startswith("ok "), out  # the GPIO page isn't a USB-C port's
 
 
-@pytest.mark.parametrize("env", [{"AURA_TRACE_BLKS": "0x3803c1000:0x4000"},
+@pytest.mark.parametrize("env", [{"AURA_TRACE_BLKS": "0x3803c1002:0x4000"},
                                  {"AURA_IRQ_TRACE": "yes"},
                                  {"AURA_TRACE_BLKS": FIRST_RUN + ",0x420000000:0x58000:big"}])
 def test_run_guest_sptm_refuses_before_it_connects(env, tmp_path):

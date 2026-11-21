@@ -194,8 +194,8 @@ static void test_check(void)
         __VA_ARGS__;                                                                               \
         CHECK(sptm_virt_trace_check(&d), "accepted: %s", what);                                    \
     } while (0)
-    REFUSED("a range not page-aligned", d.rng[1].pa += 0x1000);
-    REFUSED("a length not whole pages", d.rng[1].len = 0x2000);
+    REFUSED("a range not 4-byte aligned", d.rng[1].pa += 2);
+    REFUSED("a length not 4-byte aligned", d.rng[1].len = 0x2002);
     REFUSED("an empty range", d.rng[2].len = 0);
     REFUSED("a PA past 48 bits", d.rng[0].pa |= 1UL << 48);
     REFUSED("two ranges that overlap", d.rng[2].pa = ATC2);
@@ -215,6 +215,16 @@ static void test_check(void)
     d.rng[1].len = 30 * 0x4000;
     d.rng[2].pa = ATC2 + 30 * 0x4000;
     CHECK(!sptm_virt_trace_check(&d), "32 pages refused: %s", sptm_virt_trace_check(&d));
+    /* Sub-page ranges: two on one page count it once (31 + 1 shared = 32 distinct pages). */
+    d = c;
+    d.n_rng = 4;
+    d.rng[1] = (struct hvtrace_rng){ATC2, 30 * 0x4000, 1};
+    d.rng[2] = (struct hvtrace_rng){ATC2 + 30 * 0x4000 + 0x100, 0x40, 1};
+    d.rng[3] = (struct hvtrace_rng){ATC2 + 30 * 0x4000 + 0x420, 0x20, 1};
+    CHECK(!sptm_virt_trace_check(&d), "two sub-page ranges on one page refused: %s",
+          sptm_virt_trace_check(&d));
+    d.rng[3].pa = ATC2 + 31 * 0x4000 + 0x420;
+    CHECK(sptm_virt_trace_check(&d), "33 distinct pages accepted");
     d = c;
     d.n_rng = 16;
     d.n_blk = 8;
@@ -293,6 +303,45 @@ static void test_blk_hook(const char *out)
     CHECK(dev_accesses == acc && h->head == head, "a 32-byte access was performed or recorded");
     CHECK(h->blk_base[1] == ATC2, "atc2's base");
     save(out, "blk.bin", h);
+}
+
+/* ---- F10, F12: sub-page ranges and the keep hook's tap --------------------------------------- */
+
+static void test_subpage(void)
+{
+    struct hvtrace_cfg c = {.n_rng = 2, .n_blk = 1};
+    c.rng[0] = (struct hvtrace_rng){ATC2 + 0x20, 0x40, 0};  /* xHCI USBCMD.. */
+    c.rng[1] = (struct hvtrace_rng){ATC2 + 0x420, 0x20, 0}; /* a PORTSC */
+    strcpy(c.name[0], "drd");
+    CHECK(!sptm_virt_trace_check(&c), "sub-page ranges refused: %s", sptm_virt_trace_check(&c));
+    struct hvtrace_hdr *h = blk_ring(16, &c);
+    CHECK(h->blk_base[0] == ATC2 + 0x20, "the block's base isn't its lowest range");
+    blk_access(h, ATC2 + 0x24, 0, 0, false, 2, 1, false, XNU_PC, 0);
+    blk_access(h, ATC2 + 0x424, 0x1234, 0, true, 2, 2, false, XNU_PC + 4, 0);
+    /* The same page outside both ranges (a doorbell): performed once, not recorded. */
+    struct exc_info ctx = {.elr = XNU_PC + 8};
+    u64 val[2] = {0x77, 0};
+    u32 acc = dev_accesses;
+    u64 head = h->head, seen = h->blk_seen[0];
+    CHECK(sptm_virt_trace_blk_hook(&ctx, ATC2 + 0x480, val, true, 2), "an unlisted access failed");
+    CHECK(dev_accesses == acc + 1 && dev_last_addr == ATC2 + 0x480,
+          "an unlisted access wasn't performed once");
+    CHECK(*(u32 *)dev_at(ATC2 + 0x480, 4) == 0x77, "an unlisted write's value didn't reach it");
+    CHECK(h->head == head && h->blk_seen[0] == seen, "an unlisted access was recorded");
+    /* The keep hook's tap: recorded inside a range with its pc, nothing outside. */
+    u64 tv[2] = {0x5a, 0};
+    cur_cpu = 7;
+    cur_gl = false;
+    sptm_virt_trace_tap(ATC2 + 0x428, tv, true, 2, XNU_PC + 12);
+    CHECK(h->head == head + 1, "a tap inside a range wasn't recorded");
+    struct hvtrace_rec *r = &recs(h)[head % h->cap];
+    CHECK(r->val == 0x5a && r->pc == XNU_PC + 12, "a tap's record: val 0x%lx pc 0x%lx", r->val,
+          r->pc);
+    meta_is(r, ATC2 + 0x428, 2, true, 7, 0, false, false);
+    sptm_virt_trace_tap(ATC2 + 0x900, tv, true, 2, XNU_PC);
+    CHECK(h->head == head + 1, "a tap outside every range was recorded");
+    sptm_virt_trace_blk = NULL;
+    sptm_virt_trace_tap(ATC2 + 0x428, tv, true, 2, XNU_PC);
 }
 
 /* ---- F2: the IRQ hook ---------------------------------------------------------------------- */
@@ -513,6 +562,7 @@ int main(int argc, char **argv)
     CHECK(argc == 2, "usage: trace_host OUT");
     test_check();
     test_blk_hook(argv[1]);
+    test_subpage();
     test_irq_hook(argv[1]);
     test_full();
     test_threads();

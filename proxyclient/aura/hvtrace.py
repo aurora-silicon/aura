@@ -67,16 +67,17 @@ def parse_blks(spec):
 def check_rngs(rngs, n_blk):
     if not 1 <= len(rngs) <= RNGS or not 1 <= n_blk <= BLKS:
         raise ValueError(f"1-{RNGS} ranges in 1-{BLKS} blocks ({len(rngs)} in {n_blk})")
-    pages = 0
+    pages = set()
     for i, (pa, length, blk) in enumerate(rngs):
-        if not length or (pa | length) % PAGE or pa >> 48 or length >> 32 or blk >= n_blk:
-            raise ValueError(f"0x{pa:x}:0x{length:x}: not whole 16 KiB pages below 2^48")
+        if not length or (pa | length) % 4 or pa >> 48 or length >> 32 or blk >= n_blk:
+            raise ValueError(f"0x{pa:x}:0x{length:x}: not 4-byte aligned below 2^48")
         for pa2, len2, _ in rngs[:i]:
             if pa < pa2 + len2 and pa2 < pa + length:
                 raise ValueError(f"0x{pa:x}:0x{length:x} overlaps 0x{pa2:x}:0x{len2:x}")
-        pages += length // PAGE
-    if pages > PAGES:
-        raise ValueError(f"{pages} pages: at most {PAGES}")
+        # A sub-page range traps its whole page and records only its own bytes.
+        pages |= set(range(pa & ~(PAGE - 1), pa + length, PAGE))
+    if len(pages) > PAGES:
+        raise ValueError(f"{len(pages)} distinct pages: at most {PAGES}")
     if {b for *_, b in rngs} != set(range(n_blk)):
         raise ValueError("a block with no range")
 

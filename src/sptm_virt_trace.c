@@ -4,12 +4,17 @@
  * Record-only traces of the guest's own MMIO accesses and IRQs under the virtualized SPTM
  * (src/sptm_virt_trace.h has the layout).
  *
- * Blocks (AURA_TRACE_BLKS): the host names up to HVTRACE_RNGS page ranges in up to HVTRACE_BLKS
- * named blocks, HVTRACE_PAGES pages in all. Each page traps in stage 2. Every guest access to
+ * Blocks (AURA_TRACE_BLKS): the host names up to HVTRACE_RNGS ranges (4-byte aligned; a range may
+ * be part of a page) in up to HVTRACE_BLKS named blocks, on HVTRACE_PAGES distinct 16 KiB pages in
+ * all. Each such page traps in stage 2, once however many ranges it holds. Every guest access to
  * one, XNU's and SPTM's (its GL1 runtime calls), is performed exactly once as the guest asked (the
- * width the HV decoded, the guest's value; a read returns what the device returned), then becomes
- * a record: the time once performed, the core, PA, width, direction, value and guest PC. Nothing
- * is emulated, dropped or changed, and nothing the guest didn't access is ever read.
+ * width the HV decoded, the guest's value; a read returns what the device returned); one inside a
+ * range then becomes a record: the time once performed, the core, PA, width, direction, value and
+ * guest PC. One outside every range (a doorbell beside the registers a block names) is only
+ * counted (sptm_virt_trace_unlisted). Nothing is emulated, dropped or changed, and nothing the
+ * guest didn't access is ever read. A page the debug link's keep hook already traps (the PMGR PS
+ * words) isn't hooked again: that hook performs its accesses and hands them on
+ * (sptm_virt_trace_tap).
  *
  * IRQs (AURA_IRQ_TRACE): the 16 KiB page that holds the AIC's event register (aic-iack-offset)
  * traps. A read of the event register acknowledges the IRQ it returns, so the hook reads it once
@@ -68,6 +73,8 @@ _Static_assert(sizeof(struct hvtrace_cfg) == 408, "hvtrace_cfg");
 
 struct hvtrace_cfg sptm_virt_trace_cfg;
 struct hvtrace_hdr *sptm_virt_trace_blk, *sptm_virt_trace_irq;
+/* Accesses on a trapped page outside every range: performed, not recorded. */
+u64 sptm_virt_trace_unlisted;
 
 static u32 trace_printed[HVTRACE_BLKS];
 
@@ -78,22 +85,31 @@ static struct hvtrace_rec *trace_recs(struct hvtrace_hdr *h)
 
 const char *sptm_virt_trace_check(const struct hvtrace_cfg *c)
 {
-    u32 pages = 0, used = 0;
+    u64 pages[HVTRACE_PAGES + 1];
+    u32 n_pages = 0, used = 0;
 
     if (!c->n_rng || c->n_rng > HVTRACE_RNGS || !c->n_blk || c->n_blk > HVTRACE_BLKS)
         return "1-16 ranges in 1-8 blocks";
     for (u32 i = 0; i < c->n_rng; i++) {
         const struct hvtrace_rng *r = &c->rng[i];
-        if (!r->len || ((r->pa | r->len) & 0x3fff) || r->pa >> 48 || r->blk >= c->n_blk)
-            return "a range that isn't whole 16 KiB pages below 2^48 in a named block";
+        if (!r->len || ((r->pa | r->len) & 3) || r->pa >> 48 || r->blk >= c->n_blk)
+            return "a range that isn't 4-byte aligned below 2^48 in a named block";
         for (u32 k = 0; k < i; k++)
             if (r->pa < c->rng[k].pa + c->rng[k].len && c->rng[k].pa < r->pa + r->len)
                 return "two ranges overlap";
-        pages += r->len >> 14;
+        /* Distinct pages: two ranges on one page trap it once. */
+        for (u64 pg = r->pa & ~0x3fffUL; pg < r->pa + r->len; pg += 0x4000) {
+            u32 k = 0;
+            while (k < n_pages && pages[k] != pg)
+                k++;
+            if (k < n_pages)
+                continue;
+            if (n_pages >= HVTRACE_PAGES)
+                return "more than 32 pages";
+            pages[n_pages++] = pg;
+        }
         used |= 1U << r->blk;
     }
-    if (pages > HVTRACE_PAGES)
-        return "more than 32 pages";
     if (used != (1U << c->n_blk) - 1)
         return "a block with no range";
     return NULL;
@@ -190,23 +206,52 @@ static bool trace_perform(struct exc_info *ctx, u64 addr, u64 *val, bool write, 
     return true;
 }
 
+/* The block of the range holding addr, or 15: none (the rest of a trapped page). */
+static u32 trace_blk_of(const struct hvtrace_hdr *h, u64 addr)
+{
+    u32 b = 15;
+
+    for (u32 i = 0; i < h->n_rng; i++)
+        if (addr - h->rng[i].pa < h->rng[i].len)
+            b = h->rng[i].blk;
+    return b;
+}
+
 bool sptm_virt_trace_blk_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int width)
 {
     struct hvtrace_hdr *h = sptm_virt_trace_blk;
-    u32 b = 15;
 
     if (!trace_perform(ctx, addr, val, write, width))
         return false;
     u64 t = trace_now();
-    for (u32 i = 0; i < h->n_rng; i++)
-        if (addr - h->rng[i].pa < h->rng[i].len)
-            b = h->rng[i].blk;
+    u32 b = trace_blk_of(h, addr);
+    if (b == 15) {
+        __atomic_fetch_add(&sptm_virt_trace_unlisted, 1, __ATOMIC_RELAXED);
+        return true;
+    }
     sptm_virt_trace_note(h, addr, val, write, width, b, ctx->elr, trace_gl(), trace_cpu(), t);
     if (b < HVTRACE_BLKS && __atomic_load_n(&trace_printed[b], __ATOMIC_RELAXED) < h->print_max &&
         __atomic_fetch_add(&trace_printed[b], 1, __ATOMIC_RELAXED) < h->print_max)
         printf("TRACE %s c%u %s%u +0x%lx = 0x%lx pc 0x%lx\n", h->name[b], trace_cpu(),
                write ? "W" : "R", 8u << width, addr - h->blk_base[b], val[0], ctx->elr);
     return true;
+}
+
+/*
+ * An access the debug link's keep hook (sptm_virt_s2r.c) performed on a page it owns that a range
+ * names (the PMGR PS words): recorded like this hook's own when it lies inside a range.
+ */
+void sptm_virt_trace_tap(u64 addr, const u64 *val, bool write, int width, u64 pc)
+{
+    struct hvtrace_hdr *h = sptm_virt_trace_blk;
+
+    if (!h)
+        return;
+    u64 t = trace_now();
+    u32 b = trace_blk_of(h, addr);
+    if (b == 15)
+        return;
+    sptm_virt_trace_note(h, addr, val, write, width, b, pc, trace_gl(), trace_cpu(), t);
 }
 
 bool sptm_virt_trace_irq_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int width)
@@ -273,8 +318,8 @@ static void trace_blk_setup(void)
         else if ((dev = sptm_virt_trace_adt_refused(r->pa, r->len)))
             why = link ? "it is the debug link's: "
                        : "the debug link is unknown, and it is a USB-C port's: ";
-        for (u64 pg = r->pa; !why && pg < r->pa + r->len; pg += 0x4000)
-            if (!trace_page_free(pg))
+        for (u64 pg = r->pa & ~0x3fffUL; !why && pg < r->pa + r->len; pg += 0x4000)
+            if (!trace_page_free(pg) && !sptm_virt_s2r_hooks_page(pg))
                 why = "another of aura's hooks has a page of it";
         if (!dev)
             dev = "";
@@ -299,16 +344,34 @@ static void trace_blk_setup(void)
     for (i = 0; i < c->n_rng; i++)
         h->blk_base[c->rng[i].blk] = min(h->blk_base[c->rng[i].blk], c->rng[i].pa);
     sptm_virt_trace_blk = h;
+    u64 hooked[HVTRACE_PAGES];
+    u32 n_hooked = 0;
     for (i = 0; i < c->n_rng; i++) {
         const struct hvtrace_rng *r = &c->rng[i];
         sptm_virt_gfxrec_adt_cover(r->pa, r->len, node, sizeof(node));
-        bool ok = hv_map_hook(r->pa, sptm_virt_trace_blk_hook, r->len) >= 0;
+        const char *how = "hooked";
+        for (u64 pg = r->pa & ~0x3fffUL; pg < r->pa + r->len; pg += 0x4000) {
+            u32 k = 0;
+            while (k < n_hooked && hooked[k] != pg)
+                k++;
+            if (k < n_hooked)
+                continue; /* another range's page, hooked once */
+            if (sptm_virt_s2r_hooks_page(pg)) {
+                how = "tapped through the debug link's keep hook";
+                continue;
+            }
+            if (hv_map_hook(pg, sptm_virt_trace_blk_hook, 0x4000) < 0)
+                how = "NOT HOOKED";
+            else if (n_hooked < HVTRACE_PAGES)
+                hooked[n_hooked++] = pg;
+        }
         printf("SPTM-virt[trace]: %s +0x%lx: 0x%lx+0x%x (%s) %s\n", h->name[r->blk],
-               r->pa - h->blk_base[r->blk], r->pa, r->len, node, ok ? "hooked" : "NOT HOOKED");
+               r->pa - h->blk_base[r->blk], r->pa, r->len, node, how);
     }
-    printf("SPTM-virt[trace]: every access to these pages, performed as the guest asks, into %lu "
-           "records at 0x%lx (sptm_virt_trace_blk); %u printed per block\n",
-           h->cap, (u64)h, h->print_max);
+    printf("SPTM-virt[trace]: every access to these ranges, performed as the guest asks, into %lu "
+           "records at 0x%lx (sptm_virt_trace_blk), %u pages trapped; the rest of a trapped page "
+           "is performed and counted (sptm_virt_trace_unlisted); %u printed per block\n",
+           h->cap, (u64)h, n_hooked, h->print_max);
 }
 
 static void trace_irq_setup(void)

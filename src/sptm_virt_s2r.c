@@ -39,6 +39,7 @@
 #include "spmi.h"
 #include "sptm_virt_priv.h"
 #include "sptm_virt_s2r_soc.h"
+#include "sptm_virt_trace.h"
 #include "string.h"
 #include "tps6598x.h"
 #include "types.h"
@@ -930,11 +931,13 @@ static bool s2r_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int w
         if (width == 4) {
             s2r_rw128(addr, val, write);
             sptm_virt_gfxrec_tap(addr, val, write, width);
+            sptm_virt_trace_tap(addr, val, write, width, ctx->elr);
             sptm_virt_s2r_note(ctx, addr, val[0], write, 3);
             sptm_virt_s2r_note(ctx, addr + 8, val[1], write, 3);
         } else if (width >= 0 && width <= 3) {
             sptm_virt_mmio_rw(addr, val, write, width);
             sptm_virt_gfxrec_tap(addr, val, write, width);
+            sptm_virt_trace_tap(addr, val, write, width, ctx->elr);
             /* XNU polls the cores' counters there all the time; their writes still go in. */
             bool first;
             if (write || strcmp(s2r_page_name(addr & ~0x3fffUL, &first), "cpu-impl"))
@@ -1009,6 +1012,7 @@ static bool s2r_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int w
     if (width == 4) {
         s2r_rw128(addr, val, write);
         sptm_virt_gfxrec_tap(addr, val, write, width);
+        sptm_virt_trace_tap(addr, val, write, width, ctx->elr);
         sptm_virt_s2r_note(ctx, addr, val[0], write, 3);
         sptm_virt_s2r_note(ctx, addr + 8, val[1], write, 3);
         return true;
@@ -1021,6 +1025,8 @@ static bool s2r_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int w
     sptm_virt_mmio_rw(addr, val, write, width);
     /* The GPU/PMP record takes the GFX domain's PS writes from here (sptm_virt_gfxrec.c). */
     sptm_virt_gfxrec_tap(addr, val, write, width);
+    /* And the record-only block trace, for a range on a page this hook owns (sptm_virt_trace.c). */
+    sptm_virt_trace_tap(addr, val, write, width, ctx->elr);
     if (timer)
         s2r_crumb(0x30);
     sptm_virt_s2r_note(ctx, addr, *val, write, width);
