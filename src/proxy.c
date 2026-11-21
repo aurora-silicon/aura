@@ -107,6 +107,8 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
                                      request->args[3], request->args[4]);
             break;
         case P_VECTOR:
+            /* A chainload is not a Linux kboot; clear any stale prepare_dt request. */
+            nvme_keep_for_kboot(false);
             // forcefully restore tps6598x IRQs
             usb_hpm_restore_irqs(1);
             iodev_console_flush();
@@ -438,6 +440,7 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
 #else
             if (kboot_boot((void *)request->args[0]) == 0)
                 return 1;
+            nvme_keep_for_kboot(false);
 #endif
             break;
         case P_KBOOT_SET_CHOSEN:
@@ -450,7 +453,12 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
 #ifdef SPTM_VIRT_ESP
             panic("proxy: P_KBOOT_PREPARE_DT is gated out of SPTM_VIRT_ESP builds\n");
 #else
+            /* Decided before the tree is built: it describes ANS as running or as powered off. */
+            if (nvme_keep_for_kboot(true))
+                printf("kboot: keeping this stage's ANS session running for Linux to adopt\n");
             reply->retval = kboot_prepare_dt((void *)request->args[0]);
+            if (reply->retval)
+                nvme_keep_for_kboot(false);
 #endif
             break;
         case P_KBOOT_SET_UBOOT:
@@ -650,9 +658,11 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
             break;
 
         case P_NVME_INIT:
+            nvme_keep_for_kboot(false);
             reply->retval = nvme_init();
             break;
         case P_NVME_SHUTDOWN:
+            nvme_keep_for_kboot(false);
             if (!nvme_shutdown())
                 reply->status = S_ERROR;
             break;
