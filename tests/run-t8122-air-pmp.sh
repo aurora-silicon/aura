@@ -22,7 +22,6 @@ blocks = definition(source, r'^struct pmp_values_soc \{')
 blocks += definition(source, r'^static const struct pmp_values_soc pmp_values_t8122 = \{')
 for name in ['dt_pass_pmp', 'dt_set_pmp_t8122']:
     blocks += definition(source, r'^static (?:void|int) ' + name + r'\([^;]+?\)\n\{')
-blocks += definition(Path('src/kboot_pmp_t8122.c').read_text(), r'^static bool facts_wanted\([^;]+?\)\n\{')
 Path(sys.argv[1]).write_text(Path('tests/t8122_air_pmp.c').read_text().replace('/* SOURCE FUNCTIONS */', blocks))
 PY
 ${CC:-cc} -std=gnu11 -D_GNU_SOURCE -O1 -g -Wall -Wextra -Werror \

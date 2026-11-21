@@ -23,10 +23,7 @@
 #include "j813_n1.h"
 #include "kboot_atc.h"
 #include "kboot_audio.h"
-#include "kboot_display_facts.h"
-#include "kboot_gpu_t8122.h"
 #include "kboot_mte.h"
-#include "kboot_pmp_t8122.h"
 #include "kboot_t6031.h"
 #include "malloc.h"
 #include "mcc.h"
@@ -11690,10 +11687,8 @@ int kboot_prepare_dt(void *fdt)
     /*
      * Room for what kboot adds to the tree. One margin on every Mac, sized for the largest
      * addition kboot makes on any SoC today: 96K of general edits, about 6K of SMBIOS description
-     * U-Boot builds its tables from, and up to 160K of handoff data (a T8122's PMP values, GPU and
-     * PMP facts and display clock description; a T6030's PMP values and display ADT facts, at
-     * most 46K; a T6031's or T6040's PMP values and firmware handoffs; a T6032's firmware UUID
-     * list).
+     * U-Boot builds its tables from, and up to 160K of handoff data (PMP values, GPU and display
+     * firmware handoffs, a T6031's ADT facts, a T6032's firmware UUID list).
      */
     dt_bufsize += DT_EDIT_MARGIN;
     dt = memalign(DT_ALIGN, dt_bufsize);
@@ -11991,19 +11986,8 @@ int kboot_prepare_dt(void *fdt)
     if (dt_set_pmp_t6030())
         return -1;
 
-    /* Optional export goes last so it cannot consume space needed by fixups. */
     if (chip_id == T8122)
-        dt_gpu_t8122_diagnostics(dt);
-
-    /* After the GPU export, so that one stays as before. */
-    if (chip_id == T8122) {
         dt_set_pmp_t8122();
-        dt_pmp_t8122_facts(dt);
-    }
-
-    /* Read-only ADT export, last, in its own buffer room. */
-    if (chip_id == T6030)
-        dt_display_facts_t6030(dt);
 
     /* T6031 (J514C/J516C): this Mac's PMP values and firmware image UUIDs, in their own room.
      * T6032 (J575D): the UUID list only (its 27.0.1 ADT has no PMP and no disp0 clock facts).
