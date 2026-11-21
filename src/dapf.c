@@ -596,10 +596,14 @@ int dapf_init(const char *path, int index)
 
         if (ret <= 0)
             return ret;
-        /* Do not admit the legacy writer, even for a genuine T8132 DAPF bank. */
-        printf("dapf: T8132 DAPF programming is unsupported for %s; preserving filter state\n",
-               path);
-        return -1;
+        /* J715: Linux cold-starts the MTP; its filter needs the legacy writer, as m1n1 stage 2 programs it. */
+        if (!(adt_is_compatible(adt, 0, "J715AP") && !strcmp(path, "/arm-io/dart-mtp"))) {
+            /* Do not admit the legacy writer, even for a genuine T8132 DAPF bank. */
+            printf("dapf: T8132 DAPF programming is unsupported for %s; preserving filter state\n",
+                   path);
+            return -1;
+        }
+        printf("dapf: J715: programming %s with the m1n1 writer\n", path);
     }
 
     u32 pwr;
@@ -768,6 +772,17 @@ static int dapf_init_j713(void *dt)
             continue;
         }
 
+        /* J715: program the MTP's filter before Linux cold-starts the MTP. */
+        if (adt_is_compatible(adt, 0, "J715AP") && !strcmp(entry->path, "/arm-io/dart-mtp")) {
+            int r = dapf_init(entry->path, entry->index);
+            printf("dapf: J715: %s programmed for the MTP cold start: %d\n", entry->path, r);
+            if (r < 0)
+                ret = -1;
+            entry++;
+            count++;
+            continue;
+        }
+
         /* kboot programs the AOP's with its firmware handoff, once the AOP is
          * known to be halted. */
         if (!strcmp(entry->consumer, "/arm-io/aop")) {
@@ -845,7 +860,7 @@ int dapf_init_fdt(const void *fdt)
     dapf_nprogrammed = dapf_nfailed = 0;
     if (chip_id == T8132) {
         /* M4 laptops whose trees state the same DAPF handoff contract as the J713. */
-        static const char *const boards[] = {"apple,j713", "apple,j604", NULL};
+        static const char *const boards[] = {"apple,j713", "apple,j715", "apple,j604", NULL};
         bool known = false;
 
         for (const char *const *board = boards; fdt && *board; board++)
