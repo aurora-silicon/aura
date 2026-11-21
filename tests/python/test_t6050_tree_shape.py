@@ -245,13 +245,94 @@ int main(void)
 
 def test_t6050_external_scanout_darts_resolved(tmp_path):
     source = (REPO / "src/kboot_display_handoff.c").read_text()
+    header = (REPO / "src/adt.h").read_text()
+    layout_start = header.index("struct adt_segment_ranges {")
+    layout = header[layout_start:header.index("} PACKED;", layout_start) + len("} PACKED;")]
     code = PRELUDE + r'''
 #define T6050_TEXT
 #define T6050_INIT
+#define T6050_ENGINES 8
+#define PACKED __attribute__((packed))
+#define SEG_FLAGS_OSLOG 0xa
+#define SZ_16K 0x4000UL
+#define DART_PAGE 0x4000UL
+#define ALIGN_DOWN(x, a) ((x) & ~((u64)(a) - 1))
+#define ALIGN_UP(x, a) ALIGN_DOWN((x) + (a) - 1, a)
+#define dlog(fmt, ...) printf(fmt, ##__VA_ARGS__)
+''' + layout + r'''
+static struct { u64 phys_base, mem_size; } cur_boot_args = {0x10000000000UL, 0x200000000UL};
+static struct { const char *uuid; } t6050;
+static void *adt;
 #define DART_DCP 0x48a340000UL
 #define DART_DISP0 0x48a300000UL
 #define EXT0 0x2b2e00000UL
 #define DART_DISPEXT0 0x2b2300000UL
+#define UUID_A "C51FB0C8-C45D-39B0-85BC-520E600FC950"
+#define UUID_B "64863924-B56B-3E32-87FE-038677F52709"
+static struct adt_segment_ranges ext0_segs[2];
+static u32 ext0_nsegs;
+static u32 ext0_running;
+static const char *ext0_uuid;
+static u64 pt23[2], l1_23[2], pt16[2], l1_16[2];
+static void reset_adt(void)
+{
+    t6050.uuid = UUID_A;
+    ext0_uuid = UUID_A;
+    ext0_running = 1;
+    ext0_nsegs = 2;
+    ext0_segs[0] = (struct adt_segment_ranges){0x10200000000UL, 0, 0x10200000000UL, 0x4000, 0};
+    ext0_segs[1] = (struct adt_segment_ranges){0x10004500000UL, 0, 0x10004500000UL, 0x4000, SEG_FLAGS_OSLOG};
+    pt23[0] = 0x10201000000UL; pt23[1] = 0x10201040000UL;
+    l1_23[0] = 0x10201000000UL; l1_23[1] = 1;
+    pt16[0] = 0x10201100000UL; pt16[1] = 0x10201140000UL;
+    l1_16[0] = 0x10201100000UL; l1_16[1] = 1;
+}
+enum { ADT_NUB = 1, ADT_DDCP, ADT_DDISP };
+static int adt_path_offset(const void *a, const char *path)
+{
+    (void)a;
+    if (!strcmp(path, "/arm-io/dcpext0/iop-dcpext0-nub")) return ADT_NUB;
+    if (!strcmp(path, "/arm-io/dart-dcpext0")) return ADT_DDCP;
+    if (!strcmp(path, "/arm-io/dart-dispext0")) return ADT_DDISP;
+    return -1;
+}
+static const void *adt_getprop(const void *a, int node, const char *name, u32 *len)
+{
+    (void)a;
+    if (node == ADT_NUB) {
+        if (!strcmp(name, "uuid") && ext0_uuid) {
+            if (len) *len = strlen(ext0_uuid) + 1;
+            return ext0_uuid;
+        }
+        if (!strcmp(name, "running")) {
+            if (len) *len = sizeof(ext0_running);
+            return &ext0_running;
+        }
+        if (!strcmp(name, "segment-ranges") && ext0_nsegs) {
+            if (len) *len = ext0_nsegs * sizeof(ext0_segs[0]);
+            return ext0_segs;
+        }
+    } else if (node == ADT_DDCP) {
+        if (!strcmp(name, "l1-tt-23") && l1_23[0]) {
+            if (len) *len = sizeof(l1_23);
+            return l1_23;
+        }
+        if (!strcmp(name, "pt-region-23")) {
+            if (len) *len = sizeof(pt23);
+            return pt23;
+        }
+    } else if (node == ADT_DDISP) {
+        if (!strcmp(name, "l1-tt-16") && l1_16[0]) {
+            if (len) *len = sizeof(l1_16);
+            return l1_16;
+        }
+        if (!strcmp(name, "pt-region-16")) {
+            if (len) *len = sizeof(pt16);
+            return pt16;
+        }
+    }
+    return NULL;
+}
 /* The ADT: the internal DARTs, dcpext0 and its display DART; nothing else */
 static int t6050_adt_reg(const char *path, int idx, u64 *addr, u64 *size)
 {
@@ -263,9 +344,16 @@ static int t6050_adt_reg(const char *path, int idx, u64 *addr, u64 *size)
     else return -1;
     return 0;
 }
-''' + definition(source, "static T6050_TEXT int t6050_node_at(") + \
+''' + definition(source, "static bool dcp6_overlaps(") + \
+        definition(source, "static int dcp6_adt_u32(") + \
+        definition(source, "static int dcp6_adt_u64_pair(") + \
+        definition(source, "static bool dcp6_is_uuid(") + \
+        definition(source, "static T6050_TEXT int t6050_node_at(") + \
         definition(source, "static T6050_TEXT bool t6050_available(") + \
         definition(source, "static T6050_INIT bool t6050_identity_reg(") + \
+        definition(source, "static T6050_TEXT int t6050_check_placement(") + \
+        definition(source, "static T6050_TEXT int t6050_check_ext_adt(") + \
+        definition(source, "static T6050_TEXT bool t6050_ext_dart_engine(") + \
         definition(source, "static T6050_TEXT bool t6050_ext_display_dart(") + r'''
 enum { PH_EXT = 1, PH_DCP, PH_DISP0, PH_OTHER };
 static void dart(const char *name, u64 base, u32 ph, u32 cells, const char *status)
@@ -282,6 +370,7 @@ static void dart(const char *name, u64 base, u32 ph, u32 cells, const char *stat
 static void world(u32 ph, u32 sid, const char *ext_status, u32 cells, const char *dstatus)
 {
     fresh();
+    reset_adt();
     assert(!fdt_setprop_u32(tree, 0, "#address-cells", 2));
     assert(!fdt_setprop_u32(tree, 0, "#size-cells", 2));
     dart("iommu@2b2300000", DART_DISPEXT0, PH_EXT, cells, dstatus);
@@ -324,19 +413,46 @@ int main(void)
     assert(!t6050_ext_display_dart(tree, PH_DISP0)); cases++;
     world(PH_OTHER, 16, "okay", 1, NULL);
     assert(!t6050_ext_display_dart(tree, PH_OTHER)); cases++;
-    /* status as whole strings: "okay"/"ok" with their terminator, nothing longer or shorter */
+    /* Placement and ADT image checks: segment in OS RAM, pt-region in RAM, running/uuid. */
+    world(PH_EXT, 16, "okay", 1, "okay");
+    ext0_segs[0].phys = cur_boot_args.phys_base + 0x100000;
+    assert(!t6050_ext_display_dart(tree, PH_EXT)); cases++;
+    world(PH_EXT, 16, "okay", 1, "okay");
+    pt23[0] = cur_boot_args.phys_base + 0x200000;
+    pt23[1] = cur_boot_args.phys_base + 0x240000;
+    l1_23[0] = pt23[0];
+    assert(!t6050_ext_display_dart(tree, PH_EXT)); cases++;
+    world(PH_EXT, 16, "okay", 1, "okay");
+    pt16[0] = cur_boot_args.phys_base + 0x300000;
+    pt16[1] = cur_boot_args.phys_base + 0x340000;
+    l1_16[0] = pt16[0];
+    assert(!t6050_ext_display_dart(tree, PH_EXT)); cases++;
+    world(PH_EXT, 16, "okay", 1, "okay");
+    l1_16[0] = 0;
+    assert(!t6050_ext_display_dart(tree, PH_EXT)); cases++;
+    world(PH_EXT, 16, "okay", 1, "okay");
+    ext0_running = 0;
+    assert(!t6050_ext_display_dart(tree, PH_EXT)); cases++;
+    world(PH_EXT, 16, "okay", 1, "okay");
+    ext0_uuid = UUID_B;
+    assert(!t6050_ext_display_dart(tree, PH_EXT)); cases++;
+    /* status as Linux reads it: absent, or first string "okay"/"ok", regardless of trailing bytes */
     fresh();
     int n = node_at("/", "n");
     assert(t6050_available(tree, n)); cases++;
     assert(!fdt_setprop_string(tree, n, "status", "ok") && t6050_available(tree, n)); cases++;
     assert(!fdt_setprop(tree, n, "status", "okay", 4) && !t6050_available(tree, n)); cases++;
-    assert(!fdt_setprop(tree, n, "status", "okay\0x", 6) && !t6050_available(tree, n)); cases++;
+    assert(!fdt_setprop(tree, n, "status", "", 0) && !t6050_available(tree, n)); cases++;
+    assert(!fdt_setprop(tree, n, "status", "okay\0x", 6) && t6050_available(tree, n)); cases++;
+    assert(!fdt_setprop(tree, n, "status", "okay\0disabled", 14) && t6050_available(tree, n)); cases++;
+    assert(!fdt_setprop(tree, n, "status", "ok\0extra", 9) && t6050_available(tree, n)); cases++;
     assert(!fdt_setprop_string(tree, n, "status", "fail") && !t6050_available(tree, n)); cases++;
+    assert(!t6050_available(tree, -1)); cases++;
     printf("PASS external scanout darts %d cases\n", cases);
     return 0;
 }
 '''
-    run(tmp_path, "ext-darts", code, "PASS external scanout darts 15 cases")
+    run(tmp_path, "ext-darts", code, "PASS external scanout darts 25 cases")
 
 
 def test_t6050_rx_clock_groups_pass_whole(tmp_path):
@@ -488,3 +604,521 @@ int main(void)
 }
 '''
     run(tmp_path, "disp-node", code, "PASS display subsystem 4 cases")
+
+
+def test_t6050_external_engines_get_the_stub_version(tmp_path):
+    source = (REPO / "src/kboot_display_handoff.c").read_text()
+    firmware = (REPO / "src/firmware.c").read_text()
+    header = (REPO / "src/adt.h").read_text()
+    layout_start = header.index("struct adt_segment_ranges {")
+    layout = header[layout_start:header.index("} PACKED;", layout_start) + len("} PACKED;")]
+    code = PRELUDE + r'''
+#include <stdlib.h>
+#define T6050_TEXT
+#define T6050_INIT
+#define T6050_PATH 64
+#define T6050_ENGINES 8
+#define PACKED __attribute__((packed))
+#define SEG_FLAGS_OSLOG 0xa
+#define SZ_16K 0x4000UL
+#define DART_PAGE 0x4000UL
+#define ALIGN_DOWN(x, a) ((x) & ~((u64)(a) - 1))
+#define ALIGN_UP(x, a) ALIGN_DOWN((x) + (a) - 1, a)
+#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
+#define OS_VER_COMP 4
+enum fw_version { V_UNKNOWN = 0, V27_0, V27_2, V27_3 };
+struct fw_version_info {
+    enum fw_version version;
+    const char *string;
+    u32 num[OS_VER_COMP];
+    size_t num_length;
+    const char *iboot;
+};
+''' + layout + r'''
+static struct fw_version_info os_firmware;
+static struct { u64 phys_base, mem_size; } cur_boot_args = {0x10000000000UL, 0x200000000UL};
+static struct { const char *uuid; } t6050;
+static struct { const char *name; } soc = {"t6050"};
+static struct { const typeof(soc) *soc; } dcp6 = {&soc};
+static void *adt;
+#define dlog(fmt, ...) printf("DCP: %s: " fmt, dcp6.soc->name, ##__VA_ARGS__)
+#define UUID_A "C51FB0C8-C45D-39B0-85BC-520E600FC950"
+#define UUID_B "64863924-B56B-3E32-87FE-038677F52709"
+#define DART_DISP0 0x48a300000UL
+struct fake_ext {
+    u64 coproc;
+    u64 dart_disp;
+    u32 running;
+    const char *uuid;
+    struct adt_segment_ranges seg[2];
+    u32 nseg;
+    u64 pt23[2], l1_23[2], pt16[2], l1_16[2];
+};
+static struct fake_ext exts[3];
+static void reset_adt(void)
+{
+    t6050.uuid = UUID_A;
+    for (int i = 0; i < 3; i++) {
+        exts[i] = (struct fake_ext){
+            .coproc = 0x2b2e00000UL + (u64)i * 0x1000000UL,
+            .dart_disp = 0x2b2300000UL + (u64)i * 0x1000000UL,
+            .running = 1,
+            .uuid = UUID_A,
+            .seg = {
+                {0x10200000000UL + (u64)i * 0x1000000UL, 0,
+                 0x10200000000UL + (u64)i * 0x1000000UL, 0x4000, 0},
+                {0x10004500000UL + (u64)i * 0x4000UL, 0,
+                 0x10004500000UL + (u64)i * 0x4000UL, 0x4000, SEG_FLAGS_OSLOG},
+            },
+            .nseg = 2,
+            .pt23 = {0x10201000000UL, 0x10201040000UL},
+            .l1_23 = {0x10201000000UL, 1},
+            .pt16 = {0x10201100000UL, 0x10201140000UL},
+            .l1_16 = {0x10201100000UL, 1},
+        };
+    }
+}
+static int kboot_fdt_path_exact(void *t, const char *path)
+{
+    return fdt_path_offset(t, path);
+}
+static int t6050_adt_reg(const char *path, int idx, u64 *addr, u64 *size)
+{
+    (void)idx; (void)size;
+    if (!strcmp(path, "/arm-io/dart-disp0")) {
+        *addr = DART_DISP0;
+        return 0;
+    }
+    for (int i = 0; i < 3; i++) {
+        char a[32];
+        snprintf(a, sizeof(a), "/arm-io/dcpext%d", i);
+        if (!strcmp(path, a)) {
+            *addr = exts[i].coproc;
+            return 0;
+        }
+        snprintf(a, sizeof(a), "/arm-io/dart-dispext%d", i);
+        if (!strcmp(path, a)) {
+            *addr = exts[i].dart_disp;
+            return 0;
+        }
+    }
+    return -1;
+}
+static int adt_path_offset(const void *a, const char *path)
+{
+    (void)a;
+    for (int i = 0; i < 3; i++) {
+        char b[64];
+        snprintf(b, sizeof(b), "/arm-io/dcpext%d/iop-dcpext%d-nub", i, i);
+        if (!strcmp(path, b)) return i * 3 + 1;
+        snprintf(b, sizeof(b), "/arm-io/dart-dcpext%d", i);
+        if (!strcmp(path, b)) return i * 3 + 2;
+        snprintf(b, sizeof(b), "/arm-io/dart-dispext%d", i);
+        if (!strcmp(path, b)) return i * 3 + 3;
+    }
+    return -1;
+}
+static const void *adt_getprop(const void *a, int node, const char *name, u32 *len)
+{
+    (void)a;
+    if (node <= 0)
+        return NULL;
+    int i = (node - 1) / 3, kind = (node - 1) % 3;
+    if (kind == 0) {
+        if (!strcmp(name, "uuid") && exts[i].uuid) {
+            if (len) *len = strlen(exts[i].uuid) + 1;
+            return exts[i].uuid;
+        }
+        if (!strcmp(name, "running")) {
+            if (len) *len = sizeof(exts[i].running);
+            return &exts[i].running;
+        }
+        if (!strcmp(name, "segment-ranges") && exts[i].nseg) {
+            if (len) *len = exts[i].nseg * sizeof(exts[i].seg[0]);
+            return exts[i].seg;
+        }
+    } else if (kind == 1) {
+        if (!strcmp(name, "l1-tt-23") && exts[i].l1_23[0]) {
+            if (len) *len = sizeof(exts[i].l1_23);
+            return exts[i].l1_23;
+        }
+        if (!strcmp(name, "pt-region-23")) {
+            if (len) *len = sizeof(exts[i].pt23);
+            return exts[i].pt23;
+        }
+    } else {
+        if (!strcmp(name, "l1-tt-16") && exts[i].l1_16[0]) {
+            if (len) *len = sizeof(exts[i].l1_16);
+            return exts[i].l1_16;
+        }
+        if (!strcmp(name, "pt-region-16")) {
+            if (len) *len = sizeof(exts[i].pt16);
+            return exts[i].pt16;
+        }
+    }
+    return NULL;
+}
+''' + definition(firmware, "int firmware_set_fdt(") + \
+        definition(source, "static bool dcp6_overlaps(") + \
+        definition(source, "static int dcp6_adt_u32(") + \
+        definition(source, "static int dcp6_adt_u64_pair(") + \
+        definition(source, "static bool dcp6_is_uuid(") + r'''
+static bool fail_scratch;
+static void *test_malloc(size_t n)
+{
+    return fail_scratch ? NULL : malloc(n);
+}
+#define malloc test_malloc
+''' + definition(source, "static void *dcp6_scratch(") + r'''
+#undef malloc
+''' + definition(source, "static int dcp6_commit(") + \
+        definition(source, "static T6050_TEXT bool t6050_available(") + \
+        definition(source, "static T6050_INIT bool t6050_identity_reg(") + \
+        definition(source, "static T6050_TEXT int t6050_check_placement(") + \
+        definition(source, "static T6050_TEXT int t6050_check_ext_adt(") + \
+        definition(source, "static T6050_TEXT int t6050_ext_index(") + \
+        definition(source, "static T6050_TEXT bool t6050_dart_at(") + \
+        definition(source, "static T6050_TEXT int t6050_drop_ext_scanout(") + \
+        definition(source, "static T6050_TEXT int t6050_ext_walk(") + \
+        definition(source, "static T6050_TEXT void t6050_ext_reject(") + \
+        definition(source, "static T6050_TEXT void t6050_ext_version(") + r'''
+static const u32 tree_version[3] = {27, 0, 0};
+enum { PH_DISP0 = 10, PH_DART0 = 11, PH_DART1 = 12, PH_DART2 = 13 };
+static void dart_node(const char *name, u64 base, u32 ph)
+{
+    int n = node_at("/", name);
+    assert(!fdt_setprop_string(tree, n, "compatible", "apple,t8110-dart"));
+    reg(n, base, 0x20000);
+    assert(!fdt_setprop_u32(tree, n, "#iommu-cells", 1));
+    assert(!fdt_setprop_u32(tree, n, "phandle", ph));
+}
+/* A dcpext node with reg, piodma, apple,firmware-compat, and apple,firmware-version when @version */
+static int engine_under(const char *parent, const char *name, u64 coproc, const char *status,
+                        bool version, u32 dart_ph)
+{
+    int n = node_at(parent, name);
+    fdt32_t v[3];
+    for (int i = 0; i < 3; i++)
+        v[i] = cpu_to_fdt32(tree_version[i]);
+    assert(!fdt_setprop_string(tree, n, "compatible", "apple,t6050-dcpext"));
+    reg(n, coproc, 0x4000);
+    assert(!fdt_setprop(tree, n, "apple,firmware-compat", v, sizeof(v)));
+    if (version)
+        assert(!fdt_setprop(tree, n, "apple,firmware-version", v, sizeof(v)));
+    if (status)
+        assert(!fdt_setprop_string(tree, n, "status", status));
+    char ep[160];
+    int elen = snprintf(ep, sizeof(ep), "%s%s%s", strcmp(parent, "/") ? parent : "", "/", name);
+    assert(elen > 0 && (size_t)elen < sizeof(ep));
+    int pio = node_at(ep, "piodma");
+    fdt32_t io[2] = {cpu_to_fdt32(dart_ph), cpu_to_fdt32(16)};
+    assert(!fdt_setprop(tree, pio, "iommus", io, sizeof(io)));
+    return n;
+}
+/* Whether @prop of node @name is @want's cells */
+static bool is(const char *name, const char *prop, const struct fw_version_info *want)
+{
+    int len;
+    const fdt32_t *v = fdt_getprop(tree, fdt_path_offset(tree, name), prop, &len);
+    if (!v || len != (int)(want->num_length * 4))
+        return false;
+    for (size_t i = 0; i < want->num_length; i++)
+        if (fdt32_ld(&v[i]) != want->num[i])
+            return false;
+    return true;
+}
+static bool is_disabled(const char *path)
+{
+    int n = fdt_path_offset(tree, path);
+    const char *s = n < 0 ? NULL : fdt_getprop(tree, n, "status", NULL);
+    return s && !strcmp(s, "disabled");
+}
+static bool has_scanout_dart(u32 ph)
+{
+    int disp = fdt_path_offset(tree, "/display");
+    int len = 0;
+    const fdt32_t *io = disp < 0 ? NULL : fdt_getprop(tree, disp, "iommus", &len);
+    for (int i = 0; io && i + 2 <= len / 4; i += 2)
+        if (fdt32_ld(&io[i]) == ph)
+            return true;
+    return false;
+}
+static void world(void)
+{
+    fresh();
+    reset_adt();
+    assert(!fdt_setprop_u32(tree, 0, "#address-cells", 2));
+    assert(!fdt_setprop_u32(tree, 0, "#size-cells", 2));
+    dart_node("iommu@48a300000", DART_DISP0, PH_DISP0);
+    dart_node("iommu@2b2300000", exts[0].dart_disp, PH_DART0);
+    dart_node("iommu@2b3300000", exts[1].dart_disp, PH_DART1);
+    dart_node("iommu@2b4300000", exts[2].dart_disp, PH_DART2);
+    int disp = node_at("/", "display");
+    assert(!fdt_setprop_string(tree, disp, "compatible", "apple,display-subsystem"));
+    fdt32_t io[8] = {cpu_to_fdt32(PH_DISP0), 0, cpu_to_fdt32(PH_DART0), 0,
+                     cpu_to_fdt32(PH_DART1), 0, cpu_to_fdt32(PH_DART2), 0};
+    assert(!fdt_setprop(tree, disp, "iommus", io, sizeof(io)));
+    engine_under("/", "dcpext0", exts[0].coproc, NULL, true, PH_DART0);
+    engine_under("/", "dcpext1", exts[1].coproc, "okay", false, PH_DART1);
+    engine_under("/", "dcpext2", exts[2].coproc, "disabled", true, PH_DART2);
+}
+static void assert_rejected(const char *path, u32 dart_ph, const struct fw_version_info *old)
+{
+    assert(is_disabled(path));
+    assert(is(path, "apple,firmware-compat", old));
+    assert(has_scanout_dart(PH_DISP0));
+    assert(has_scanout_dart(PH_DART0));
+    assert(!has_scanout_dart(dart_ph));
+}
+int main(void)
+{
+    static const struct fw_version_info old = {V27_0, "27.0", {27, 0, 0}, 3, NULL};
+    static const struct fw_version_info v272 = {V27_2, "27.2", {27, 2, 0}, 3, NULL};
+    static const struct fw_version_info v273 = {V27_3, "27.3.1", {27, 3, 1, 4}, 4, NULL};
+    static unsigned char before[sizeof(tree)];
+    int cases = 0;
+    /* A three-cell stub: the engines the tree enables take it, a disabled one keeps the tree's. */
+    world();
+    os_firmware = v272;
+    t6050_ext_version(tree);
+    assert(is("/dcpext0", "apple,firmware-compat", &v272));
+    assert(is("/dcpext0", "apple,firmware-version", &v272));
+    assert(is("/dcpext1", "apple,firmware-compat", &v272));
+    assert(!fdt_getprop(tree, fdt_path_offset(tree, "/dcpext1"), "apple,firmware-version", NULL));
+    assert(is("/dcpext2", "apple,firmware-compat", &old));
+    assert(has_scanout_dart(PH_DART0) && has_scanout_dart(PH_DART1)); cases++;
+    /* An enabled engine the tree gave no apple,firmware-compat gets one: the driver has no
+     * method table without it. apple,firmware-version is not added where it was absent. */
+    world();
+    assert(!fdt_delprop(tree, fdt_path_offset(tree, "/dcpext1"), "apple,firmware-compat"));
+    os_firmware = v272;
+    t6050_ext_version(tree);
+    assert(is("/dcpext1", "apple,firmware-compat", &v272));
+    assert(!fdt_getprop(tree, fdt_path_offset(tree, "/dcpext1"), "apple,firmware-version", NULL));
+    assert(is("/dcpext0", "apple,firmware-compat", &v272)); cases++;
+    /* A four-cell stub fits too: the properties grow. */
+    world();
+    os_firmware = v273;
+    t6050_ext_version(tree);
+    assert(is("/dcpext0", "apple,firmware-compat", &v273));
+    assert(is("/dcpext0", "apple,firmware-version", &v273));
+    assert(is("/dcpext1", "apple,firmware-compat", &v273));
+    assert(is("/dcpext2", "apple,firmware-version", &old)); cases++;
+    /* No room in the tree for the four cells: nothing changes. */
+    world();
+    assert(!fdt_pack(tree));
+    memcpy(before, tree, fdt_totalsize(tree));
+    t6050_ext_version(tree);
+    assert(!memcmp(before, tree, fdt_totalsize(tree))); cases++;
+    /* An unknown firmware: nothing changes. */
+    world();
+    os_firmware = (struct fw_version_info){V_UNKNOWN, NULL, {0}, 0, NULL};
+    memcpy(before, tree, sizeof(tree));
+    t6050_ext_version(tree);
+    assert(!memcmp(before, tree, sizeof(tree))); cases++;
+    /* One engine fails placement (segment in OS RAM): disabled and dropped from scanout. */
+    world();
+    os_firmware = v272;
+    exts[1].seg[0].phys = cur_boot_args.phys_base + 0x100000;
+    t6050_ext_version(tree);
+    assert(is("/dcpext0", "apple,firmware-compat", &v272));
+    assert_rejected("/dcpext1", PH_DART1, &old); cases++;
+    /* One engine fails pt-region placement: disabled and dropped from scanout. */
+    world();
+    exts[1].pt16[0] = cur_boot_args.phys_base + 0x200000;
+    exts[1].pt16[1] = cur_boot_args.phys_base + 0x240000;
+    exts[1].l1_16[0] = exts[1].pt16[0];
+    t6050_ext_version(tree);
+    assert(is("/dcpext0", "apple,firmware-compat", &v272));
+    assert_rejected("/dcpext1", PH_DART1, &old); cases++;
+    /* One engine fails running or uuid check: disabled and dropped from scanout. */
+    world();
+    exts[1].running = 0;
+    t6050_ext_version(tree);
+    assert(is("/dcpext0", "apple,firmware-compat", &v272));
+    assert_rejected("/dcpext1", PH_DART1, &old); cases++;
+    world();
+    exts[1].uuid = UUID_B;
+    t6050_ext_version(tree);
+    assert(is("/dcpext0", "apple,firmware-compat", &v272));
+    assert_rejected("/dcpext1", PH_DART1, &old); cases++;
+    /* An engine with no matching ADT dcpextN: disabled and dropped from scanout. */
+    world();
+    reg(fdt_path_offset(tree, "/dcpext1"), 0x2b9e00000UL, 0x4000);
+    t6050_ext_version(tree);
+    assert(is("/dcpext0", "apple,firmware-compat", &v272));
+    assert_rejected("/dcpext1", PH_DART1, &old); cases++;
+    /* An engine behind a translated bus (non-1:1 ranges) whose raw reg equals dcpext1 is
+     * rejected rather than matched to ADT dcpext1. */
+    fresh();
+    reset_adt();
+    assert(!fdt_setprop_u32(tree, 0, "#address-cells", 2));
+    assert(!fdt_setprop_u32(tree, 0, "#size-cells", 2));
+    dart_node("iommu@48a300000", DART_DISP0, PH_DISP0);
+    dart_node("iommu@2b2300000", exts[0].dart_disp, PH_DART0);
+    dart_node("iommu@2b3300000", exts[1].dart_disp, PH_DART1);
+    int disp = node_at("/", "display");
+    assert(!fdt_setprop_string(tree, disp, "compatible", "apple,display-subsystem"));
+    fdt32_t io2[6] = {cpu_to_fdt32(PH_DISP0), 0, cpu_to_fdt32(PH_DART0), 0,
+                      cpu_to_fdt32(PH_DART1), 0};
+    assert(!fdt_setprop(tree, disp, "iommus", io2, sizeof(io2)));
+    engine_under("/", "dcpext0", exts[0].coproc, "okay", true, PH_DART0);
+    int bus = node_at("/", "bus");
+    assert(!fdt_setprop_u32(tree, bus, "#address-cells", 2));
+    assert(!fdt_setprop_u32(tree, bus, "#size-cells", 2));
+    fdt32_t tr[6] = {cpu_to_fdt32((u32)(exts[1].coproc >> 32)), cpu_to_fdt32((u32)exts[1].coproc),
+                     cpu_to_fdt32(5), 0, 0, cpu_to_fdt32(0x10000)};
+    assert(!fdt_setprop(tree, bus, "ranges", tr, sizeof(tr)));
+    engine_under("/bus", "dcpext1", exts[1].coproc, "okay", false, PH_DART1);
+    t6050_ext_version(tree);
+    assert(is("/dcpext0", "apple,firmware-compat", &v272));
+    assert_rejected("/bus/dcpext1", PH_DART1, &old); cases++;
+    /* Even when every available engine is rejected (zero version updates), the rejection still
+     * commits. */
+    fresh();
+    reset_adt();
+    assert(!fdt_setprop_u32(tree, 0, "#address-cells", 2));
+    assert(!fdt_setprop_u32(tree, 0, "#size-cells", 2));
+    dart_node("iommu@48a300000", DART_DISP0, PH_DISP0);
+    dart_node("iommu@2b3300000", exts[1].dart_disp, PH_DART1);
+    disp = node_at("/", "display");
+    assert(!fdt_setprop_string(tree, disp, "compatible", "apple,display-subsystem"));
+    fdt32_t io3[4] = {cpu_to_fdt32(PH_DISP0), 0, cpu_to_fdt32(PH_DART1), 0};
+    assert(!fdt_setprop(tree, disp, "iommus", io3, sizeof(io3)));
+    engine_under("/", "dcpext1", exts[1].coproc, "okay", false, PH_DART1);
+    exts[1].running = 0;
+    t6050_ext_version(tree);
+    assert(is_disabled("/dcpext1") && has_scanout_dart(PH_DISP0) && !has_scanout_dart(PH_DART1));
+    cases++;
+    /* Unknown stub: healthy engines keep the tree's version, rejected ones are still disabled and
+     * stripped from scanout. */
+    world();
+    os_firmware = (struct fw_version_info){V_UNKNOWN, NULL, {0}, 0, NULL};
+    exts[1].running = 0;
+    t6050_ext_version(tree);
+    assert(is("/dcpext0", "apple,firmware-compat", &old) && !is_disabled("/dcpext0"));
+    assert(has_scanout_dart(PH_DISP0) && has_scanout_dart(PH_DART0));
+    assert_rejected("/dcpext1", PH_DART1, &old); cases++;
+    /* Packed DT where the four-cell version write fails: rejection is NOT rolled back. */
+    world();
+    os_firmware = v273;
+    exts[1].running = 0;
+    assert(!fdt_pack(tree));
+    t6050_ext_version(tree);
+    assert(is("/dcpext0", "apple,firmware-compat", &old) && !is_disabled("/dcpext0"));
+    assert_rejected("/dcpext1", PH_DART1, &old); cases++;
+    /* Packed DT where status = "disabled" cannot fit (absent status on dcpext0): the rejected
+     * node is deleted instead and its scanout DART is stripped. */
+    world();
+    os_firmware = v273;
+    exts[0].running = 0;
+    assert(!fdt_pack(tree));
+    t6050_ext_version(tree);
+    assert(fdt_path_offset(tree, "/dcpext0") < 0 && !has_scanout_dart(PH_DART0));
+    assert(has_scanout_dart(PH_DISP0) && has_scanout_dart(PH_DART1)); cases++;
+    /* Stopped engine behind two identity-mapped buses with path > 64 bytes: still disabled and
+     * stripped from scanout rather than aborting on T6050_PATH. */
+    fresh();
+    reset_adt();
+    os_firmware = v272;
+    assert(!fdt_setprop_u32(tree, 0, "#address-cells", 2));
+    assert(!fdt_setprop_u32(tree, 0, "#size-cells", 2));
+    dart_node("iommu@48a300000", DART_DISP0, PH_DISP0);
+    dart_node("iommu@2b2300000", exts[0].dart_disp, PH_DART0);
+    dart_node("iommu@2b3300000", exts[1].dart_disp, PH_DART1);
+    disp = node_at("/", "display");
+    assert(!fdt_setprop_string(tree, disp, "compatible", "apple,display-subsystem"));
+    assert(!fdt_setprop(tree, disp, "iommus", io2, sizeof(io2)));
+    engine_under("/", "dcpext0", exts[0].coproc, "okay", true, PH_DART0);
+    int b1 = node_at("/", "bus-level-one-display-fabric");
+    assert(!fdt_setprop_u32(tree, b1, "#address-cells", 2));
+    assert(!fdt_setprop_u32(tree, b1, "#size-cells", 2));
+    fdt32_t idr[6] = {cpu_to_fdt32(2), 0, cpu_to_fdt32(2), 0, cpu_to_fdt32(4), 0};
+    assert(!fdt_setprop(tree, b1, "ranges", idr, sizeof(idr)));
+    int b2 = node_at("/bus-level-one-display-fabric", "bus-level-two-external-engines");
+    assert(!fdt_setprop_u32(tree, b2, "#address-cells", 2));
+    assert(!fdt_setprop_u32(tree, b2, "#size-cells", 2));
+    assert(!fdt_setprop_empty(tree, b2, "ranges"));
+    static const char nested_ep[] =
+        "/bus-level-one-display-fabric/bus-level-two-external-engines/dcpext@2b3e00000";
+    _Static_assert(sizeof(nested_ep) > T6050_PATH, "test path must exceed T6050_PATH");
+    engine_under("/bus-level-one-display-fabric/bus-level-two-external-engines",
+                 "dcpext@2b3e00000", exts[1].coproc, "okay", false, PH_DART1);
+    exts[1].running = 0;
+    t6050_ext_version(tree);
+    assert(is("/dcpext0", "apple,firmware-compat", &v272));
+    assert_rejected(nested_ep, PH_DART1, &old); cases++;
+    /* Scratch allocation failure during rejection: falls back to in-place editing so the
+     * unsafe engine is still disabled (or deleted on a packed DT) and stripped from scanout. */
+    world();
+    os_firmware = v272;
+    exts[1].running = 0;
+    fail_scratch = true;
+    t6050_ext_version(tree);
+    fail_scratch = false;
+    assert(is("/dcpext0", "apple,firmware-compat", &old));
+    assert_rejected("/dcpext1", PH_DART1, &old); cases++;
+    world();
+    os_firmware = v272;
+    exts[0].running = 0;
+    assert(!fdt_pack(tree));
+    fail_scratch = true;
+    t6050_ext_version(tree);
+    fail_scratch = false;
+    assert(fdt_path_offset(tree, "/dcpext0") < 0 && !has_scanout_dart(PH_DART0));
+    assert(has_scanout_dart(PH_DISP0) && has_scanout_dart(PH_DART1)); cases++;
+    /* Scanout iommus > 128 bytes on an enabled display-subsystem: compacts iommus in place
+     * without allocating, strips PH_DART1 while keeping other phandles intact, disables the
+     * rejected engine, and updates healthy engines. */
+    for (int inplace = 0; inplace < 2; inplace++) {
+        world();
+        os_firmware = v272;
+        exts[1].running = 0;
+        int d = fdt_path_offset(tree, "/display");
+        assert(!fdt_setprop_string(tree, d, "status", "okay"));
+        fdt32_t big_io[36];
+        big_io[0] = cpu_to_fdt32(PH_DISP0); big_io[1] = 0;
+        big_io[2] = cpu_to_fdt32(PH_DART0); big_io[3] = 0;
+        big_io[4] = cpu_to_fdt32(PH_DART1); big_io[5] = 0;
+        for (int i = 3; i < 18; i++) {
+            big_io[2 * i] = cpu_to_fdt32(100 + i);
+            big_io[2 * i + 1] = 0;
+        }
+        assert(!fdt_setprop(tree, d, "iommus", big_io, sizeof(big_io)));
+        if (inplace) {
+            assert(!fdt_pack(tree));
+            fail_scratch = true;
+        }
+        t6050_ext_version(tree);
+        fail_scratch = false;
+        assert(is_disabled("/dcpext1") && is("/dcpext1", "apple,firmware-compat", &old));
+        if (!inplace)
+            assert(is("/dcpext0", "apple,firmware-compat", &v272));
+        else
+            assert(is("/dcpext0", "apple,firmware-compat", &old));
+        int len = 0;
+        const fdt32_t *got = fdt_getprop(tree, fdt_path_offset(tree, "/display"), "iommus", &len);
+        assert(got && len == 34 * (int)sizeof(fdt32_t));
+        assert(fdt32_ld(&got[0]) == PH_DISP0 && !fdt32_ld(&got[1]));
+        assert(fdt32_ld(&got[2]) == PH_DART0 && !fdt32_ld(&got[3]));
+        for (int i = 3; i < 18; i++) {
+            int j = (i - 1) * 2;
+            assert(fdt32_ld(&got[j]) == (u32)(100 + i) && !fdt32_ld(&got[j + 1]));
+        }
+        assert(!has_scanout_dart(PH_DART1));
+        cases++;
+    }
+    /* status = "okay\0..." with trailing bytes: Linux probes the first string, so rejection
+     * still disables the engine and strips its scanout DART. */
+    world();
+    os_firmware = v272;
+    exts[1].running = 0;
+    assert(!fdt_setprop(tree, fdt_path_offset(tree, "/dcpext1"), "status", "okay\0disabled", 14));
+    t6050_ext_version(tree);
+    assert(is("/dcpext0", "apple,firmware-compat", &v272));
+    assert_rejected("/dcpext1", PH_DART1, &old); cases++;
+    printf("PASS dcpext version %d cases\n", cases);
+    return 0;
+}
+'''
+    run(tmp_path, "ext-version", code, "PASS dcpext version 21 cases")

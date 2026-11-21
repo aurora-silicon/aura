@@ -3452,6 +3452,7 @@ static const struct {
 #define T6050_CLOCKS    4
 #define T6050_MBOX      0x8000 /* the ASC mailbox, from the coprocessor base */
 #define T6050_PATH      64
+#define T6050_ENGINES   8 /* dcpext0..7 */
 #define T6050_STATUS    "asahi,t6050-dcp-handoff"
 #define T6050_TCR_WANT  (DART_T8110_TCR_TRANSLATE | DART_T8110_TCR_FOUR_LEVEL)
 #define T6050_TCR_MASK  (T6050_TCR_WANT | DART_T8110_TCR_BYPASS_DART)
@@ -3662,13 +3663,17 @@ static T6050_INIT int t6050_check_adt(void)
     return 0;
 }
 
-/* Whether `node` is available as Linux reads status: absent, "okay" or "ok" (whole strings) */
+/* Whether `node` is available as Linux reads status: absent, or first string "okay" or "ok" */
 static T6050_TEXT bool t6050_available(void *dt, int node)
 {
     int len;
-    const char *status = fdt_getprop(dt, node, "status", &len);
-    return !status || (len == sizeof("okay") && !memcmp(status, "okay", len)) ||
-           (len == sizeof("ok") && !memcmp(status, "ok", len));
+    const char *status = node < 0 ? NULL : fdt_getprop(dt, node, "status", &len);
+    if (!status)
+        return node >= 0 && len == -FDT_ERR_NOTFOUND;
+    size_t slen = strnlen(status, len);
+    if (slen == (size_t)len)
+        return false;
+    return (slen == 4 && !memcmp(status, "okay", 4)) || (slen == 2 && !memcmp(status, "ok", 2));
 }
 
 /*
@@ -3832,11 +3837,78 @@ static T6050_INIT int t6050_check_dt(void *dt)
 }
 
 /*
- * Whether phandle `ph` is the display DART of an apple,t6050-dcpext engine the tree enables: an
- * available t8110 DART with one iommu cell at the ADT's dart-dispextN of engine dcpextN, that
+ * An engine's memory stays out of the OS's RAM [phys_base, +mem_size): every segment of the nub at
+ * `nub_path` but __OS_LOG (dcp6_reserve_oslogs() reserves those) and, for each of the `nstreams`
+ * streams (ADT DART darts[i], stream sids[i]), its ADT page-table region pt-region-<sid>, which
+ * must be page-aligned and hold the stream's l1-tt root page.
+ */
+static T6050_TEXT int t6050_check_placement(const char *nub_path, const char *const *darts,
+                                            const u8 *sids, int nstreams)
+{
+    u64 ram = cur_boot_args.phys_base, ram_size = cur_boot_args.mem_size;
+    u32 len = 0;
+    int nub = adt_path_offset(adt, nub_path);
+    const struct adt_segment_ranges *seg =
+        nub < 0 ? NULL : adt_getprop(adt, nub, "segment-ranges", &len);
+
+    if (!seg || !len || len % sizeof(*seg) || len > 16 * sizeof(*seg))
+        bail("%s: no or bad segment-ranges\n", nub_path);
+    for (u32 i = 0; i < len / sizeof(*seg); i++) {
+        struct adt_segment_ranges r;
+        memcpy(&r, &seg[i], sizeof(r));
+        u64 size = ALIGN_UP((u64)r.size, SZ_16K);
+        if (r.unk != SEG_FLAGS_OSLOG && dcp6_overlaps(r.phys, size, ram, ram_size))
+            bail("%s: segment %u (0x%lx) lies in the OS's RAM\n", nub_path, i, r.phys);
+    }
+
+    for (int i = 0; i < nstreams; i++) {
+        char name[16];
+        u64 lo, hi, l1, count;
+        int node = adt_path_offset(adt, darts[i]);
+        snprintf(name, sizeof(name), "l1-tt-%u", sids[i]);
+        if (node < 0 || dcp6_adt_u64_pair(node, name, &l1, &count) || !l1)
+            bail("%s: no %s\n", darts[i], name);
+        snprintf(name, sizeof(name), "pt-region-%u", sids[i]);
+        if (dcp6_adt_u64_pair(node, name, &lo, &hi) || hi <= lo ||
+            ((lo | hi | l1) & (DART_PAGE - 1)) || l1 < lo || l1 > hi - DART_PAGE ||
+            dcp6_overlaps(lo, hi - lo, ram, ram_size))
+            bail("%s: %s is missing, does not hold l1-tt-%u or lies in the OS's RAM\n", darts[i],
+                 name, sids[i]);
+    }
+    return 0;
+}
+
+/*
+ * External engine `n` in the ADT: its nub must report running == 1 and a valid UUID (matching the
+ * pinned image when one has been selected), and its firmware segments and both DART page-table
+ * regions (dart-dcpextN SID 23, dart-dispextN SID 16) must lie outside the OS's RAM.
+ */
+static T6050_TEXT int t6050_check_ext_adt(int n)
+{
+    char nub_path[64], dd[2][32];
+    const char *darts[2] = {dd[0], dd[1]};
+    static const u8 sids[2] = {23, 16};
+    u32 len = 0, val = 0;
+
+    if (n < 0 || n >= T6050_ENGINES)
+        return -1;
+    snprintf(nub_path, sizeof(nub_path), "/arm-io/dcpext%d/iop-dcpext%d-nub", n, n);
+    int nub = adt_path_offset(adt, nub_path);
+    const char *uuid = nub < 0 ? NULL : adt_getprop(adt, nub, "uuid", &len);
+    if (!dcp6_is_uuid(uuid, len) || (t6050.uuid && strcmp(uuid, t6050.uuid)) ||
+        dcp6_adt_u32(nub, "running", &val) || val != 1)
+        bail("dcpext%d: not running the pinned image\n", n);
+    snprintf(dd[0], sizeof(dd[0]), "/arm-io/dart-dcpext%d", n);
+    snprintf(dd[1], sizeof(dd[1]), "/arm-io/dart-dispext%d", n);
+    return t6050_check_placement(nub_path, darts, sids, 2);
+}
+
+/*
+ * Whether phandle `ph` is the display DART of an available apple,t6050-dcpext engine matching ADT
+ * dcpextN (`*eng`): an available t8110 DART with one iommu cell at the ADT's dart-dispextN, that
  * the engine's piodma child maps through as SID 16. Neither internal DART is one.
  */
-static T6050_TEXT bool t6050_ext_display_dart(void *dt, u32 ph)
+static T6050_TEXT bool t6050_ext_dart_engine(void *dt, u32 ph, int *eng)
 {
     int dart = fdt_node_offset_by_phandle(dt, ph), clen = 0, rlen = 0;
     const fdt32_t *cells = dart < 0 ? NULL : fdt_getprop(dt, dart, "#iommu-cells", &clen);
@@ -3853,7 +3925,7 @@ static T6050_TEXT bool t6050_ext_display_dart(void *dt, u32 ph)
     if ((!t6050_adt_reg("/arm-io/dart-dcp", 0, &adt_base, NULL) && adt_base == base) ||
         (!t6050_adt_reg("/arm-io/dart-disp0", 0, &adt_base, NULL) && adt_base == base))
         return false;
-    for (int n = 0; n < 8; n++) { /* dcpext0..7 */
+    for (int n = 0; n < T6050_ENGINES; n++) { /* dcpext0..7 */
         snprintf(a, sizeof(a), "/arm-io/dart-dispext%d", n);
         if (t6050_adt_reg(a, 0, &adt_base, NULL) || adt_base != base)
             continue;
@@ -3863,15 +3935,30 @@ static T6050_TEXT bool t6050_ext_display_dart(void *dt, u32 ph)
                       : t6050_node_at(dt, "apple,t6050-dcpext", coproc);
         int pio = ext < 0 ? -1 : fdt_subnode_offset(dt, ext, "piodma"), plen = 0;
         const fdt32_t *p = pio < 0 ? NULL : fdt_getprop(dt, pio, "iommus", &plen);
-        return t6050_available(dt, ext) && t6050_identity_reg(dt, ext) && p && plen == 8 &&
-               fdt32_ld(&p[0]) == ph && fdt32_ld(&p[1]) == 16;
+        if (!t6050_available(dt, ext) || !t6050_identity_reg(dt, ext) || !p || plen != 8 ||
+            fdt32_ld(&p[0]) != ph || fdt32_ld(&p[1]) != 16)
+            return false;
+        if (eng)
+            *eng = n;
+        return true;
     }
     return false;
 }
 
 /*
+ * Whether phandle `ph` is the display DART of an apple,t6050-dcpext engine the tree enables whose
+ * ADT image and placement checks pass.
+ */
+static T6050_TEXT bool t6050_ext_display_dart(void *dt, u32 ph)
+{
+    int n;
+    return t6050_ext_dart_engine(dt, ph, &n) && !t6050_check_ext_adt(n);
+}
+
+/*
  * A prewired display subsystem's iommus after its first entry: each <&dart 0> an enabled
- * external engine's display DART (t6050_ext_display_dart()), each once.
+ * external engine's display DART (t6050_ext_dart_engine()), each once. Engines whose ADT image or
+ * placement check fails are dropped from the published scanout list and disabled.
  */
 static T6050_TEXT int t6050_check_ext_scanout(void *dt, const fdt32_t *io, int len)
 {
@@ -3880,7 +3967,7 @@ static T6050_TEXT int t6050_check_ext_scanout(void *dt, const fdt32_t *io, int l
             if (fdt32_ld(&io[j]) == fdt32_ld(&io[i]))
                 bail("the display subsystem lists one external display DART twice\n");
         if (fdt32_ld(&io[i + 1]) || fdt32_ld(&io[i]) == fdt32_ld(&io[0]) ||
-            !t6050_ext_display_dart(dt, fdt32_ld(&io[i])))
+            !t6050_ext_dart_engine(dt, fdt32_ld(&io[i]), NULL))
             bail("display subsystem iommus entry %d is not an enabled external engine's display "
                  "DART\n",
                  i / 2);
@@ -4001,7 +4088,8 @@ static T6050_TEXT int t6050_publish_wiring(void *dt)
 
 /*
  * A prewired tree names both (t6050_check_prewired() checked them): the clocks get their rates
- * from the ADT, and the PMC metadata node is enabled.
+ * from the ADT, the PMC metadata node is enabled, and any external engine failing ADT image or
+ * placement checks is left out of the display subsystem's scanout iommus.
  */
 static T6050_TEXT int t6050_publish_prewired(void *dt)
 {
@@ -4016,6 +4104,22 @@ static T6050_TEXT int t6050_publish_prewired(void *dt)
     for (u32 i = 0; i < t6050.nclk; i++) {
         int node = fdt_node_offset_by_phandle(dt, fdt32_ld(&clk[i]));
         if (node < 0 || fdt_setprop_u32(dt, node, "clock-frequency", t6050.clk_hz[i]))
+            return -1;
+    }
+    int disp = kboot_fdt_path_exact(dt, t6050.path[T6050_DISP]);
+    fdt32_t *io = disp < 0 ? NULL : fdt_getprop_w(dt, disp, "iommus", &len);
+    if (io && len > 8 && !(len % 8)) {
+        int nkept = 2;
+        for (int i = 2; i < len / 4; i += 2) {
+            if (!t6050_ext_display_dart(dt, fdt32_ld(&io[i])))
+                continue;
+            if (nkept != i)
+                memmove(&io[nkept], &io[i], 2 * sizeof(io[0]));
+            nkept += 2;
+        }
+        void *prop_data;
+        if (nkept < len / 4 &&
+            fdt_setprop_placeholder(dt, disp, "iommus", nkept * (int)sizeof(io[0]), &prop_data))
             return -1;
     }
     return t6050_setprop(dt, T6050_PMC, "status", "okay", sizeof("okay"));
@@ -4192,6 +4296,10 @@ static T6050_TEXT int t6050_ext_one(void *dt, int n)
     if (t6050_adt_reg(a, 0, &coproc, NULL))
         bail("dcpext%d: no ADT reg\n", n);
     node = t6050_ext_node(dt, coproc);
+    if (node >= 0 && t6050_available(dt, node)) {
+        dlog("dcpext%d: the device tree enables it itself\n", n);
+        return 1;
+    }
     if (node < 0 || dcp6_status_disabled(dt, node, a))
         bail("dcpext%d: no disabled node at 0x%lx\n", n, coproc);
 
@@ -4323,18 +4431,279 @@ static T6050_TEXT int t6050_ext_one(void *dt, int n)
     return 0;
 }
 
-/* Each engine but `skip` in its own transaction, after the internal display's (or the first's) */
+/*
+ * Each engine but `skip` in its own transaction, after the internal display's (or the first's).
+ * One the device tree enables itself is left to it (t6050_ext_version()).
+ */
 static T6050_TEXT void t6050_ext_handoff(void *dt, int engines, int skip)
 {
     for (int n = 0; n < engines; n++) {
         if (n == skip)
             continue;
         void *scratch = dcp6_scratch(dt);
-        if (!scratch || t6050_ext_one(scratch, n) || dcp6_commit(dt, scratch)) {
-            if (scratch)
-                free(scratch);
+        int ret = scratch ? t6050_ext_one(scratch, n) : -1;
+        if (ret && scratch)
+            free(scratch);
+        if (ret > 0)
+            continue;
+        if (ret || dcp6_commit(dt, scratch))
             dlog("dcpext%d stays with iBoot: no handoff\n", n);
+    }
+}
+
+/*
+ * The ADT dcpextN index whose coprocessor is at `node`'s identity-mapped reg[0], or -1
+ */
+static T6050_TEXT int t6050_ext_index(void *dt, int node)
+{
+    int len;
+    const fdt64_t *reg = fdt_getprop(dt, node, "reg", &len);
+    if (!reg || len < 16 || !t6050_identity_reg(dt, node))
+        return -1;
+    u64 coproc = fdt64_ld(&reg[0]);
+    for (int n = 0; n < T6050_ENGINES; n++) {
+        char a[32];
+        u64 adt_coproc;
+        snprintf(a, sizeof(a), "/arm-io/dcpext%d", n);
+        if (!t6050_adt_reg(a, 0, &adt_coproc, NULL) && adt_coproc == coproc)
+            return n;
+    }
+    return -1;
+}
+
+/* Whether `ph` is the display DART node matching `dart_addr` (an identity-mapped t8110 DART) */
+static T6050_TEXT bool t6050_dart_at(void *dt, u32 ph, u64 dart_addr)
+{
+    int dart = fdt_node_offset_by_phandle(dt, ph), rlen = 0;
+    const fdt64_t *reg = dart < 0 ? NULL : fdt_getprop(dt, dart, "reg", &rlen);
+    return reg && rlen >= 16 && !fdt_node_check_compatible(dt, dart, "apple,t8110-dart") &&
+           t6050_identity_reg(dt, dart) && fdt64_ld(&reg[0]) == dart_addr;
+}
+
+/*
+ * Remove any scanout reference to a rejected external engine `ext` (index `n`, or -1) from every
+ * apple,display-subsystem node's `iommus`. Matches by `ext`'s piodma `iommus` phandle and, when
+ * `n >= 0`, by `/arm-io/dart-dispextN` address, never dropping `/arm-io/dart-disp0`.
+ */
+static T6050_TEXT int t6050_drop_ext_scanout(void *dt, int ext, int n, bool *changed)
+{
+    int pio = fdt_subnode_offset(dt, ext, "piodma"), plen = 0;
+    const fdt32_t *p = pio < 0 ? NULL : fdt_getprop(dt, pio, "iommus", &plen);
+    u32 pio_ph = p && plen >= 8 ? fdt32_ld(&p[0]) : 0;
+    u64 dispext_addr = 0, disp0_addr = 0;
+    bool has_dispext = false, has_disp0 = false;
+
+    if (n >= 0) {
+        char a[32];
+        snprintf(a, sizeof(a), "/arm-io/dart-dispext%d", n);
+        has_dispext = !t6050_adt_reg(a, 0, &dispext_addr, NULL);
+    }
+    has_disp0 = !t6050_adt_reg("/arm-io/dart-disp0", 0, &disp0_addr, NULL);
+
+    int ret = 0;
+
+    for (int disp = fdt_node_offset_by_compatible(dt, -1, "apple,display-subsystem"); disp >= 0;
+         disp = fdt_node_offset_by_compatible(dt, disp, "apple,display-subsystem")) {
+        int len = 0;
+        fdt32_t *io = fdt_getprop_w(dt, disp, "iommus", &len);
+        if (!io || len <= 0 || len % 8)
+            continue;
+        int nkept = 0;
+        bool dropped = false;
+        for (int i = 0; i < len / 4; i += 2) {
+            u32 ph = fdt32_ld(&io[i]);
+            bool is_disp0 = has_disp0 && t6050_dart_at(dt, ph, disp0_addr);
+            bool match = !is_disp0 && ((pio_ph && ph == pio_ph) ||
+                                       (has_dispext && t6050_dart_at(dt, ph, dispext_addr)));
+            if (match) {
+                dropped = true;
+                continue;
+            }
+            if (nkept != i)
+                memmove(&io[nkept], &io[i], 2 * sizeof(io[0]));
+            nkept += 2;
         }
+        if (!dropped)
+            continue;
+        if (nkept) {
+            void *prop_data;
+            if (fdt_setprop_placeholder(dt, disp, "iommus", nkept * (int)sizeof(io[0]),
+                                        &prop_data)) {
+                ret = -1;
+                continue;
+            }
+            *changed = true;
+        } else {
+            if (fdt_delprop(dt, disp, "iommus")) {
+                ret = -1;
+                continue;
+            }
+            *changed = true;
+            if (t6050_available(dt, disp) && fdt_setprop_string(dt, disp, "status", "disabled")) {
+                if (fdt_del_node(dt, disp)) {
+                    ret = -1;
+                    continue;
+                }
+                disp = -1;
+            }
+        }
+    }
+    return ret;
+}
+
+/*
+ * Walk apple,t6050-dcpext nodes in `dt`: return the count, or a negative FDT error.
+ * Stores `target`'s 0-based ordinal in `*ord` when `ord` is set, and the offset of the
+ * `want_ord`-th node in `*found` when `found` is set.
+ */
+static T6050_TEXT int t6050_ext_walk(void *dt, int target, int *ord, int want_ord, int *found)
+{
+    int count = 0, o = -1;
+
+    if (ord)
+        *ord = -1;
+    if (found)
+        *found = -FDT_ERR_NOTFOUND;
+    while ((o = fdt_node_offset_by_compatible(dt, o, "apple,t6050-dcpext")) >= 0) {
+        if (ord && o == target)
+            *ord = count;
+        if (found && count == want_ord)
+            *found = o;
+        count++;
+    }
+    return o == -FDT_ERR_NOTFOUND ? count : o;
+}
+
+/*
+ * Disable every available apple,t6050-dcpext node that has no identity-mapped ADT match or fails
+ * t6050_check_ext_adt(), and strip it from any display-subsystem scanout iommus. Runs on a
+ * scratch copy when available (falling back to editing `dt` in place if scratch allocation fails)
+ * before firmware-version writes, independent of os_firmware and without rolling back if a packed
+ * DT lacks room for a firmware-version update or if scanout cleanup fails. Shrinking iommus
+ * first frees space in packed trees; if setting status = "disabled" still hits NOSPACE (e.g.
+ * absent status), delete the rejected node instead so Linux never probes it.
+ */
+static T6050_TEXT void t6050_ext_reject(void *dt)
+{
+    void *scratch = NULL;
+    bool in_place = false, changed = false;
+    int err = 0, at = fdt_node_offset_by_compatible(dt, -1, "apple,t6050-dcpext");
+
+    while (at >= 0) {
+        void *cur = scratch ? scratch : dt;
+        if (!t6050_available(cur, at)) {
+            at = fdt_node_offset_by_compatible(cur, at, "apple,t6050-dcpext");
+            continue;
+        }
+        int n = t6050_ext_index(cur, at);
+        if (n >= 0 && !t6050_check_ext_adt(n)) {
+            at = fdt_node_offset_by_compatible(cur, at, "apple,t6050-dcpext");
+            continue;
+        }
+        if (!scratch && !in_place) {
+            scratch = dcp6_scratch(dt);
+            if (scratch)
+                cur = scratch;
+            else
+                in_place = true;
+        }
+        int ord, total = t6050_ext_walk(cur, at, &ord, -1, NULL);
+        const char *name = fdt_get_name(cur, at, NULL);
+        if (total < 0 || ord < 0) {
+            err = -1;
+            break;
+        }
+        if (n < 0)
+            dlog("external engine %s has no matching ADT dcpextN: disabling\n",
+                 name ? name : "(unknown)");
+        else
+            dlog("dcpext%d rejected: disabling and keeping out of scanout\n", n);
+        if (t6050_drop_ext_scanout(cur, at, n, &changed))
+            dlog("could not drop %s from display scanout\n",
+                 name ? name : "rejected external engine");
+        int after = t6050_ext_walk(cur, -1, NULL, ord, &at);
+        if (after < 0) {
+            err = -1;
+            break;
+        }
+        if (after != total) {
+            /* A deleted display-subsystem node enclosed an engine: re-scan from the top. */
+            at = fdt_node_offset_by_compatible(cur, -1, "apple,t6050-dcpext");
+            continue;
+        }
+        if (at < 0 ||
+            (fdt_setprop_string(cur, at, "status", "disabled") && fdt_del_node(cur, at))) {
+            err = -1;
+            break;
+        }
+        changed = true;
+        at = fdt_node_offset_by_compatible(cur, -1, "apple,t6050-dcpext");
+    }
+    if (err || (at < 0 && at != -FDT_ERR_NOTFOUND))
+        dlog("could not disable rejected external engines%s\n",
+             changed ? " (partial)" : ": nothing changed");
+    if (scratch && changed)
+        dcp6_commit(dt, scratch);
+    else
+        free(scratch);
+}
+
+/*
+ * External engines the device tree enables itself (the J716c's) run this boot's firmware, but
+ * the tree names the build it was written for in their apple,firmware-compat, from which the
+ * driver picks their method IDs. Set it to this boot's version on every such engine that passes
+ * the ADT running/uuid and placement checks, adding it where the tree left it out (the driver
+ * has no method table without it), and rewrite apple,firmware-version where the node has one,
+ * whatever their number of cells, as t6050_publish() does for the internal dcp. An available
+ * engine with no valid ADT match or failing the ADT running/uuid or placement checks is disabled
+ * and stripped from any display-subsystem scanout iommus first by t6050_ext_reject(), even on an
+ * unknown stub or when the version write runs out of space. A node not available (status absent,
+ * "okay" or "ok") is t6050_ext_one()'s. The version edit is made on its own scratch copy: a
+ * failed write or walk leaves the versions unchanged while keeping any rejections.
+ */
+static T6050_TEXT void t6050_ext_version(void *dt)
+{
+    static const char *const props[] = {"apple,firmware-compat", "apple,firmware-version"};
+    int count = 0, err = 0, at = -1;
+    bool changed = false;
+
+    t6050_ext_reject(dt);
+
+    if (os_firmware.version == V_UNKNOWN || !os_firmware.num_length) {
+        dlog("firmware %s is unknown: the external engines keep the tree's version\n",
+             os_firmware.string ? os_firmware.string : "");
+        return;
+    }
+    void *scratch = dcp6_scratch(dt);
+    if (!scratch)
+        return;
+    while (!err && (at = fdt_node_offset_by_compatible(scratch, at, "apple,t6050-dcpext")) >= 0) {
+        bool set = false;
+        if (!t6050_available(scratch, at))
+            continue;
+        int n = t6050_ext_index(scratch, at);
+        if (n < 0 || t6050_check_ext_adt(n))
+            continue;
+        for (size_t i = 0; !err && i < ARRAY_SIZE(props); i++) {
+            /* apple,firmware-compat (props[0]) always; apple,firmware-version only if present */
+            if (i && !fdt_getprop(scratch, at, props[i], NULL))
+                continue;
+            err = firmware_set_fdt(scratch, at, props[i], &os_firmware);
+            set = set || !err;
+        }
+        count += set;
+        changed |= set;
+    }
+    /* Only -FDT_ERR_NOTFOUND is a walk's normal end */
+    if (err || at != -FDT_ERR_NOTFOUND) {
+        free(scratch);
+        dlog("could not give the external engines the firmware version: version unchanged\n");
+    } else if (!changed) {
+        free(scratch);
+    } else if (!dcp6_commit(dt, scratch)) {
+        if (count)
+            dlog("firmware %s on %d external engine(s) the device tree enables\n",
+                 os_firmware.string, count);
     }
 }
 
@@ -4364,8 +4733,6 @@ static T6050_TEXT void t6050_handoff(void *dt, bool prewired)
         dlog("could not set /chosen/" T6050_STATUS "\n");
     dlog("internal display handoff refused; the boot framebuffer keeps the panel\n");
 }
-
-#define T6050_ENGINES 8 /* dcpext0..7 */
 
 /*
  * A board without a panel (the J775D, Mac Studio, M5 Ultra): its device tree has no dcp or disp0
@@ -4498,6 +4865,7 @@ int dt_set_display_handoff(void *dt)
     if (dcp6.soc->t6050) {
         if (chip_id != T6050)
             return 0;
+        memset(&t6050, 0, sizeof(t6050));
         dcp6_find_nubs();
         dcp6_reserve_oslogs(dt);
         int engine;
@@ -4509,6 +4877,7 @@ int dt_set_display_handoff(void *dt)
             t6050_handoff(dt, true);
         else
             dlog("the device tree does not describe the internal display: no handoff\n");
+        t6050_ext_version(dt);
         return 0;
     }
 
