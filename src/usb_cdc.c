@@ -16,9 +16,14 @@ static tps6598x_irq_state_t cdc_irq_state;
 static bool watchdog_armed;
 static bool carrier_owned;
 
+/*
+ * The chips whose CDC transition is the explicit USB2 one (hpm0 routes the AP's USB2 to USB0),
+ * on every board: T8142 and T8152 have no other. A board whose hpm0 refuses the route (J804) fails
+ * the transition at step 5, reported, instead of having it refused up front.
+ */
 static bool usb2_target(void)
 {
-    return ((chip_id == T8142 || chip_id == T8152) && board_id == 0x24) || usb_cdc_deferred_usb2();
+    return chip_id == T8142 || chip_id == T8152 || usb_cdc_deferred_usb2();
 }
 
 static bool cdc_usb2_hpm(char *path, void *unused)
