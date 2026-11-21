@@ -9105,10 +9105,27 @@ static int dt_reserve_t8132_aop_windows(const char *path)
  * DAPF windows. Without all of it the firmware cannot run, so on any failure
  * the AOP is disabled.
  */
+/*
+ * Take an AOP node out of the OS's tree after its handoff failed. That failure is often a full
+ * DT, where growing status to "disabled" fails too: overwrite "okay" in place with "fail" (same
+ * length, no new space; Linux treats anything but "okay" as unavailable) and only grow the
+ * property when the node has no "okay" to overwrite.
+ */
+static int dt_disable_aop(const char *path)
+{
+    int node = fdt_path_offset(dt, path);
+    if (node < 0)
+        return -1;
+    int len;
+    const char *status = fdt_getprop(dt, node, "status", &len);
+    if (status && len == sizeof("okay") && !memcmp(status, "okay", len))
+        return fdt_setprop_inplace(dt, node, "status", "fail", sizeof("fail")) ? -1 : 0;
+    return fdt_setprop_string(dt, node, "status", "disabled") ? -1 : 0;
+}
+
 static int dt_set_t8132_aop(const char *path)
 {
     const char *why;
-    int node;
 
     if (fdt_node_check_compatible(dt, 0, "apple,j713") &&
         fdt_node_check_compatible(dt, 0, "apple,j604"))
@@ -9151,8 +9168,7 @@ static int dt_set_t8132_aop(const char *path)
 
 disable:
     printf("FDT: %s: disabling the AOP: %s\n", path, why);
-    node = fdt_path_offset(dt, path);
-    if (node < 0 || fdt_setprop_string(dt, node, "status", "disabled"))
+    if (dt_disable_aop(path))
         bail("FDT: %s: cannot disable the AOP\n", path);
     return 0;
 }
@@ -9279,8 +9295,7 @@ static int dt_set_aop_firmware(void)
      */
     if (dt_reserve_asc_segments("/arm-io/aop", NULL, path, true, 0, true)) {
         printf("FDT: %s: reserving the AOP firmware segments failed, disabling the AOP\n", path);
-        int node = fdt_path_offset(dt, path);
-        if (node < 0 || fdt_setprop_string(dt, node, "status", "disabled"))
+        if (dt_disable_aop(path))
             bail("FDT: %s: cannot disable the AOP\n", path);
         return 0;
     }
