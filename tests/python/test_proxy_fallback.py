@@ -45,7 +45,7 @@ def test_every_host_less_proxy_stop_falls_back():
         "Display handoff failed": handoff,
     }
     for why, body in stops.items():
-        call = body.index(f'proxy_fallback("{why}");')
+        call = body.index(f'proxy_fallback("{why}",')
         proxy = body.index("uartproxy_run(NULL);", call)
         between = body[call:proxy]
         assert "flush_and_reboot" not in between and "panic(" not in between, why
@@ -53,8 +53,14 @@ def test_every_host_less_proxy_stop_falls_back():
             assert "if (" not in between, why
     # run_actions() decides before it brings USB up for the proxy (a port controller reset and a
     # watchdog of the USB path's own must not come before a reboot).
-    call = run_actions.index('proxy_fallback("no payload could be started");')
-    assert call < run_actions.index("usb_init();", run_actions.index("No valid payload found"))
+    call = run_actions.index('proxy_fallback("no payload could be started", payload_start_failed())')
+    usb = run_actions.index("usb_init();", run_actions.index("No valid payload found"))
+    assert call < usb
+    # A host that attached in the window keeps its carrier: USB is not brought up under it.
+    assert re.search(r"if \(!host_attached && ", run_actions[call:usb])
+    # The handoff stops are failures to start.
+    for why in ("NVMe handoff failed", "Display handoff failed"):
+        assert f'proxy_fallback("{why}", true);' in handoff
     # The last proxy entry of run_actions() and both handoff ones, and no other host-less one.
     assert len(re.findall(r"\buartproxy_run\(NULL\);", handoff)) == 2
     tail = run_actions[run_actions.index("No valid payload found"):]
@@ -181,3 +187,15 @@ def test_bytes_without_the_sync_word_are_no_host(tmp_path):
 def test_host_after_the_deadline_is_too_late(tmp_path):
     host, _, ms, _ = _wait_host(tmp_path, "late")
     assert host == 0 and ms < 20000
+
+
+def test_payload_start_failed_marks_failures_only():
+    """A load that returned an error or a refused handoff counts as a failed start; an image with
+    nothing to start does not (it stops in the proxy as before, on any count)."""
+    payload = (ROOT / "src/payload.c").read_text()
+    run = _body(payload, "int payload_run(void)")
+    assert run.index("payload_failed = false;") < run.index("payload_scanned")
+    for marker in ("int ret = chainload_load(", "int ret = boot_storage_load(", "boot_failed:"):
+        at = run.index(marker)
+        assert "payload_failed = true;" in run[at:at + 260], marker
+    assert run.count("payload_failed = true;") == 3

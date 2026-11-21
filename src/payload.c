@@ -464,8 +464,21 @@ static void payload_nvme_start_failed(void)
     printf("nvme: ANS didn't start from off\n");
 }
 
+/*
+ * Whether this stage had something to start and starting it failed (a load that returned an error,
+ * or a handoff that was refused), as opposed to an image with nothing to start. proxy_fallback()
+ * reboots only for the first.
+ */
+static bool payload_failed;
+
+bool payload_start_failed(void)
+{
+    return payload_failed;
+}
+
 int payload_run(void)
 {
+    payload_failed = false;
     const char *target = adt_getprop(adt, 0, "target-type", NULL);
     if (target) {
         strcpy(expect_compatible, "apple,");
@@ -547,6 +560,7 @@ int payload_run(void)
         }
         int ret = chainload_load(chainload_spec, chosen, &chosen_cnt, ARRAY_SIZE(chosen));
         if (ret) {
+            payload_failed = true;
             next_stage.entry = NULL;
             nvme_shutdown();
         }
@@ -558,6 +572,7 @@ int payload_run(void)
         int ret = boot_storage_load(boot_spec, &kernel, &fdt);
         cpufreq_payload_boost(false);
         if (ret) {
+            payload_failed = true;
             next_stage.entry = NULL;
             return -1;
         }
@@ -657,6 +672,7 @@ int payload_run(void)
 #endif
 
     boot_failed:
+        payload_failed = true;
         next_stage.entry = NULL;
         if (boot_spec)
             kboot_set_initrd(NULL, 0);

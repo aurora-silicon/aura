@@ -304,11 +304,15 @@ void run_actions(void)
      * already up and decides before USB is brought up below: that bring-up may reset a port
      * controller and arm a watchdog of its own, which a stage on its way to a reboot must not do.
      */
-    proxy_fallback("no payload could be started");
+    bool host_attached = proxy_fallback("no payload could be started", payload_start_failed());
 
 #ifndef BRINGUP
-    /* A proxy window brought USB up already; a second bring-up would register its ports twice. */
-    if (!usb_up && !aura_debug_enabled() && !(stage1_window_done && chip_id != T8140)) {
+    /*
+     * A proxy window brought USB up already; a second bring-up would register its ports twice. A
+     * host that attached in the fallback window has its carrier: bringing USB up could drop it.
+     */
+    if (!host_attached && !usb_up && !aura_debug_enabled() &&
+        !(stage1_window_done && chip_id != T8140)) {
         usb_init();
         usb_iodev_init();
     }
@@ -485,10 +489,6 @@ next_stage:
         panic("Refusing next stage while secondary callbacks are pending\n");
     }
 
-    /* A chainloaded aura stage carries the chain on; anything else ends it here. */
-    if (!next_stage.chained)
-        pmu_chain_leave();
-
     printf("Preparing to run next stage at %p...\n", next_stage.entry);
 
     if (!nvme_shutdown()) {
@@ -497,7 +497,7 @@ next_stage:
             pmu_chain_leave();
             flush_and_reboot();
         }
-        proxy_fallback("NVMe handoff failed");
+        proxy_fallback("NVMe handoff failed", true);
         uartproxy_run(NULL);
         panic("NVMe handoff failed\n");
     }
@@ -519,11 +519,19 @@ next_stage:
                 pmu_chain_leave();
                 flush_and_reboot();
             }
-            proxy_fallback("Display handoff failed");
+            proxy_fallback("Display handoff failed", true);
             uartproxy_run(NULL);
             panic("Display handoff failed\n");
         }
     }
+#endif
+    /*
+     * Both handoffs are done. A chainloaded aura stage carries the chain on; anything else ends it
+     * here. Not earlier: a handoff that fails must still find the count it reboots on.
+     */
+    if (!next_stage.chained)
+        pmu_chain_leave();
+#ifndef BRINGUP
 #ifdef USE_FB
     fb_shutdown(next_stage.restore_logo);
 #endif

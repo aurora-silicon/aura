@@ -43,6 +43,12 @@ CASES = {
     "trial-limit-reached": (True, 0x00, "2", True, False, "reboot", "aura.failed-boots=2", 1),
     "trial-host-attaches": (True, 0x00, None, True, True, "proxy", "aura.failed-boots=0", 1),
 }
+# Cases where nothing failed to start (an image with nothing to start): the proxy as before, on a
+# count too; a trial still reboots. Same tuple, start_failed false.
+NOTHING_TO_START = {
+    "nothing-to-start-first": (True, 0x00, "0", False, False, "proxy", "aura.failed-boots=0", 1),
+    "nothing-to-start-trial": (True, 0x00, None, True, False, "reboot", "aura.failed-boots=0", 1),
+}
 
 def _between(text, start, end):
     i = text.index(start)
@@ -74,7 +80,8 @@ static int pmu_clear_panic_counter(void)
     return 0;
 }
 static void flush_and_reboot(void) { rebooted = 1; }
-static bool trial, host;
+static bool trial, host, start_failed = true;
+#define WDT_TRIAL_SECONDS 178
 static bool aura_trial_enabled(void) { return trial; }
 static bool uartproxy_wait_host(unsigned int timeout_ms) { (void)timeout_ms; return host; }
 @HELPERS@
@@ -91,11 +98,12 @@ int main(void)
     const char *var = @VAR@;
     trial = @TRIAL@;
     host = @HOST@;
+    start_failed = @FAILED@;
     pmu_snapshot_failed_boots();
     if (var)
         pmu_take_failed_boots_var(var);
     const char *next = pmu_failed_boots_var();
-    proxy_fallback("nvme");
+    proxy_fallback("nvme", start_failed);
     printf("%s %s %d\n", rebooted ? "reboot" : "proxy", next ? next : "none", clears);
     return 0;
 }
@@ -112,6 +120,7 @@ int main(int argc, char **argv)
     const char *role = argv[1];
     counts = (u8)strtoul(argv[2], NULL, 0);
     bool ans_ok = !strcmp(argv[4], "ok");
+    bool handoff_fail = !strcmp(argv[4], "handoff");
     if (!strcmp(role, "stage1-old")) {
         /* An older Stage 1: clears at start, hands on no count. */
         pmu_clear_panic_counter();
@@ -128,9 +137,18 @@ int main(int argc, char **argv)
     trial = !strcmp(role, "trial2");
     if (strcmp(argv[3], "-"))
         pmu_take_failed_boots_var(argv[3]);
+    if (handoff_fail) {
+        /* The payload is ready (not chained) and its NVMe or display handoff fails, in main.c's
+         * order: @LEAVE_FIRST@ is 1 if the chain leaves aura before the handoffs. */
+        if (@LEAVE_FIRST@)
+            pmu_chain_leave();
+        proxy_fallback("handoff", true);
+        printf("%s %u\n", rebooted ? "reboot" : "proxy", counts);
+        return 0;
+    }
     if (!ans_ok) {
         /* No payload: run_actions() falls back, then stops in the proxy. */
-        proxy_fallback("nvme");
+        proxy_fallback("nvme", start_failed);
         printf("%s %u\n", rebooted ? "reboot" : "proxy", counts);
         return 0;
     }
@@ -141,6 +159,14 @@ int main(int argc, char **argv)
     return 0;
 }
 '''
+
+
+def _leave_first():
+    """1 if main.c leaves the chain (non-chained next stage) before the NVMe handoff."""
+    main = (ROOT / "src/main.c").read_text()
+    handoff = main[main.index("next_stage:"):]
+    leave = re.search(r"if \(!next_stage\.chained\)\s+pmu_chain_leave\(\);", handoff)
+    return int(leave.start() < handoff.index("nvme_shutdown()"))
 
 
 def _build(tmp_path, main, subst=None):
@@ -163,6 +189,7 @@ def _build(tmp_path, main, subst=None):
         harness = harness.replace(key, val)
     for key, val in (subst or {}).items():
         harness = harness.replace(key, val)
+    harness = harness.replace("@LEAVE_FIRST@", str(_leave_first()))
     src = tmp_path / "t.c"
     src.write_text(harness)
     exe = tmp_path / "t"
@@ -171,13 +198,16 @@ def _build(tmp_path, main, subst=None):
     return exe
 
 
-@pytest.mark.parametrize("case", sorted(CASES))
+@pytest.mark.parametrize("case", sorted(CASES) + sorted(NOTHING_TO_START))
 def test_nvme_start_reboot(tmp_path, case):
-    read_ok, counts, var, trial, host, expected, next_var, clears = CASES[case]
+    failed = case in CASES
+    read_ok, counts, var, trial, host, expected, next_var, clears = \
+        CASES[case] if failed else NOTHING_TO_START[case]
     exe = _build(tmp_path, SINGLE_MAIN, {
         "@READ_OK@": str(read_ok).lower(), "@COUNTS@": hex(counts),
         "@VAR@": f'"{var}"' if var is not None else "NULL",
         "@TRIAL@": str(trial).lower(), "@HOST@": str(host).lower(),
+        "@FAILED@": str(failed).lower(),
     })
     out = subprocess.run([str(exe)], check=True, capture_output=True, text=True).stdout
     assert out.splitlines()[-1].split() == [expected, next_var, str(clears)]
@@ -225,6 +255,10 @@ MULTI_BOOT = {
     # An older Stage 1 clears at start and hands on no count: the proxy, as before.
     "older-stage-1": ("stage1-old", ["fail"], 0x00, ["proxy"], 0),
     "older-stage-1-normal": ("stage1-old", ["ok"], 0x01, ["os"], 0),
+    # A persistent NVMe or display handoff failure on a non-chained next stage (review of fb9b62f2):
+    # the count must still be there when the handoff fails, so it ends in the proxy.
+    "persistent-handoff-failure": ("stage1", ["handoff"], 0x00, ["reboot", "reboot", "proxy"], 0),
+    "single-handoff-failure": ("stage1", ["handoff", "ok"], 0x00, ["reboot", "os"], 0),
 }
 
 
@@ -285,8 +319,13 @@ def test_counts_cleared_only_where_the_chain_leaves_aura():
                 f"{name}: {m.group(0)} at {m.start()} without pmu_chain_leave() or " \
                 "proxy_fallback() right before it"
 
-    vec = handoff[:handoff.index("Preparing to run next stage")]
-    assert re.search(r"if \(!next_stage\.chained\)\s+pmu_chain_leave\(\);", vec)
+    # The chain leaves aura only after both handoffs: a handoff that fails must still find the
+    # count it reboots on (a persistent NVMe or display handoff failure: reboot, reboot, proxy).
+    leave = re.search(r"if \(!next_stage\.chained\)\s+pmu_chain_leave\(\);", handoff)
+    assert leave
+    assert handoff.index('proxy_fallback("NVMe handoff failed"') < leave.start()
+    assert handoff.index('proxy_fallback("Display handoff failed"') < leave.start()
+    assert leave.start() < handoff.index("Vectoring to next stage")
 
     chainload = (ROOT / "src/chainload.c").read_text()
     assert "next_stage.chained = true;" in chainload

@@ -23,14 +23,16 @@ enum proxy_fallback_action {
     PROXY_FALLBACK_REBOOT_COUNTED,
 };
 
-enum proxy_fallback_action proxy_fallback_decide(bool trial, bool count_passed, u8 failed_boots);
+enum proxy_fallback_action proxy_fallback_decide(bool trial, bool start_failed, bool count_passed,
+                                                 u8 failed_boots);
 
 /*
- * A stage that would stop in the proxy calls this first, with the reason. It waits a bounded
- * time for a host and reboots if none came and the decision above allows it. It returns, with
- * the chain left (pmu_chain_leave()), when the proxy should run: a host is attached, or no reboot
- * is allowed.
+ * A stage that would stop in the proxy calls this first, with the reason and whether something
+ * failed to start (as opposed to an image with nothing to start). It waits a bounded time for a
+ * host and reboots if none came and the decision above allows it. It returns, with the chain left
+ * (pmu_chain_leave()), when the proxy should run: true if a host attached in the window (it has a
+ * carrier already), false if no reboot is allowed.
  */
-void proxy_fallback(const char *why);
+bool proxy_fallback(const char *why, bool start_failed);
 
 #endif
