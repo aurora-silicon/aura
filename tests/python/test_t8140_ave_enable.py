@@ -329,6 +329,22 @@ int main(void)
 '''
 
 
+
+# aura's types.h typedefs uintptr_t, ptrdiff_t and ssize_t from u64/s64, which matches the target and a Linux
+# host but not macOS (uint64_t is unsigned long long there). Host builds take types.h with those three renamed.
+HOST_TYPES = r'''
+#include <stddef.h>
+#include <stdint.h>
+#include <sys/types.h>
+#define uintptr_t aura_host_uintptr_t
+#define ptrdiff_t aura_host_ptrdiff_t
+#define ssize_t aura_host_ssize_t
+#include "types.h"
+#undef uintptr_t
+#undef ptrdiff_t
+#undef ssize_t
+'''
+
 def test_t8140_ave_enable_walk(tmp_path):
     repo = Path(__file__).resolve().parents[2]
     source = (repo / "src/kboot.c").read_text()
@@ -341,9 +357,12 @@ def test_t8140_ave_enable_walk(tmp_path):
     lib = repo / "src/libfdt"
     files = ["fdt.c", "fdt_ro.c", "fdt_rw.c", "fdt_wip.c", "fdt_sw.c", "fdt_empty_tree.c",
              "fdt_addresses.c"]
+    shim = tmp_path / "host-types.h"
+    shim.write_text(HOST_TYPES)
     subprocess.run([
         *host_cc(), "-std=gnu11", "-Wall", "-Werror", "-Wno-sign-compare",
-        "-Wno-unused-function", "-I", str(lib), "-I", str(repo / "src"), str(harness),
+        "-Wno-unused-function", "-Wno-format", "-include", str(shim), "-I", str(lib),
+        "-I", str(repo / "src"), str(harness),
         str(repo / "src/devicetree.c"), *[str(lib / f) for f in files], "-o", str(binary),
     ], check=True)
     run = subprocess.run([str(binary)], capture_output=True, text=True)
