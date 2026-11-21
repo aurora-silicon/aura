@@ -271,11 +271,16 @@ int main(int argc, char **argv)
             /* Powered off at the handoff: once here, after the cycle at nvme_init() for 34. */
             int offs = arrived_off ? 1 : 2;
             assert(ans_offs == offs && cpu_off && queue_frees == 2);
+            /*
+             * Each power off follows a normal shutdown, though this stage only read: without it
+             * the firmware's idle can find commands still open and crash (J773g, 1.0.0b13).
+             */
+            assert(shutdown_calls == offs);
             /* The next owner starts it from off again with the entries kept. */
             assert(nvme_init());
             assert(boots == 0 && !cpu_off);
             assert(nvme_shutdown());
-            assert(ans_offs == offs + 1 && cpu_off);
+            assert(ans_offs == offs + 1 && cpu_off && shutdown_calls == offs + 1);
         }
         for (unsigned i = 0; i < allocated; i++)
             free(allocations[i]);
@@ -302,6 +307,8 @@ int main(int argc, char **argv)
             /* A next stage that doesn't service the mailbox: quiesced through an own instance. */
             assert(nvme_shutdown());
             assert(quiesces == 1 && !ans_offs && !nvme_initialized && !nvme_reboot_required);
+            /* Quiesce on a read-only stage stays unchanged (no normal shutdown). */
+            assert(shutdown_calls == 0);
             for (unsigned i = 0; i < allocated; i++)
                 free(allocations[i]);
             return 0;
@@ -362,8 +369,8 @@ int main(int argc, char **argv)
         int cleared = shutdown_fault == 3 || shutdown_fault == 4 ? 2 : 0;
         assert(cleared_ioq == cleared && publications == saved_publications + cleared);
         assert(commands == (shutdown_fault == 1 ? 3 : shutdown_fault <= 4 ? 4 : 2));
-        /* A stage that only read disables the controller before the power off, with no shutdown. */
-        assert(shutdown_calls == 0);
+        /* A stage that only read still shuts the controller down normally before the power off. */
+        assert(shutdown_calls == (shutdown_fault == 3 || shutdown_fault == 4));
         assert(disable_calls == 1 + (shutdown_fault == 3 || shutdown_fault == 4));
         int saved_commands = commands, saved_disable = disable_calls;
         shutdown_fault = 0;
