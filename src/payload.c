@@ -456,8 +456,9 @@ bool payload_logo(void **custom_128, void **custom_256)
 /*
  * Reboot after a failed start while fewer than this many boots in a row have failed: an ANS that
  * a Stage 2 couldn't start from off came up again after one or two reboots each time on the J713
- * (about 1 start in 7 failed, 2026-11-21). iBoot counts each such reset as a failed boot, and the
- * OS clears the count once it runs. A harder failure still ends in the proxy.
+ * (about 1 start in 7 failed, 2026-11-21). iBoot counts each such reset as a failed boot, and no
+ * aura stage clears the count until the chain reaches an OS or the proxy (pmu_chain_leave()), so
+ * a failure that persists ends in the proxy after this many reboots.
  */
 #define PAYLOAD_NVME_START_REBOOTS 2
 

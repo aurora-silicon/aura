@@ -273,6 +273,7 @@ static enum stage1_proxy_result uartproxy_wait_stage1(unsigned ms)
 }
 static void fb_set_active(bool on) { (void)on; }
 static int uartproxy_run_presynced(void) { next_stage.entry = (void *)1; return 0; }
+static void pmu_chain_leave(void) {}
 static int uartproxy_run(void *start) { (void)start; return 0; }
 /* secboot.c: not enforcing, a host may get the proxy */
 static bool secboot_host_proxy_allowed(void) { return true; }
