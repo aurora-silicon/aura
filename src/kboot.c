@@ -8383,41 +8383,6 @@ static struct disp_mapping *const dcpext_reserved_regions_t8142[ARRAY_SIZE(dcpex
 
 static const char *t8142_dcpext_result;
 
-/*
- * Reserve the page tables of a locked stream. A two-level 16K T8110 stream has
- * one root and at most 2048 L2 tables. With !required, a stream that is not
- * locked or has no translating root is idle and has nothing to keep (0). Once
- * a translating root is seen, every failure returns -1: the DART may still be
- * walking a table that would otherwise be left to the kernel.
- */
-static int dt_reserve_t8142_stream_tables(u32 provider, u32 sid, bool required)
-{
-    int chosen = adt_path_offset(adt, "/chosen");
-    u64 dram, size;
-    if (chosen < 0 || ADT_GETPROP(adt, chosen, "dram-base", &dram) != sizeof(dram) ||
-        ADT_GETPROP(adt, chosen, "dram-size", &size) != sizeof(size))
-        return -1;
-    /* Read before a DART view is made, so a view that fails is not taken as idle. */
-    int translating = dart_fdt_t8110_translating(dt, provider, sid);
-    if (translating <= 0)
-        return translating < 0 || required ? -1 : 0;
-    dart_dev_t *dart = dart_init_fdt_locked(dt, provider, sid);
-    if (!dart)
-        return -1;
-    const size_t capacity = 1 + SZ_16K / sizeof(u64);
-    u64 *pages = malloc(capacity * sizeof(*pages));
-    size_t count = 0;
-    int ret = pages ? dart_collect_locked_tables(dart, dram, size, pages, capacity, &count) : -1;
-    dart_shutdown(dart);
-    /* Tables remain CPU-mapped: the kernel may extend an inherited root. */
-    for (size_t i = 0; !ret && i < count; i++)
-        if (fdt_add_mem_rsv(dt, pages[i], SZ_16K))
-            ret = -1;
-    if (pages)
-        free(pages);
-    return ret;
-}
-
 struct t8142_stream_pages {
     u64 mapped, outside;
     u64 first_iova, first_paddr;
@@ -8540,8 +8505,11 @@ static int dt_set_t8142_dcpext(unsigned int n)
 
     /* The PIODMA stream of the external display's frontend DART. */
     u32 pio_dart = 0, pio_sid = 0;
-    int piodma = fdt_subnode_offset(dt, node, "piodma");
-    prop = piodma < 0 ? NULL : fdt_getprop(dt, piodma, "iommus", &len);
+    char pio_path[160];
+    int piodma = node < 0 ? node : kboot_t8142_dcpext_piodma(dt, alias);
+    if (piodma < 0 || fdt_get_path(dt, piodma, pio_path, sizeof(pio_path)))
+        return -1;
+    prop = fdt_getprop(dt, piodma, "iommus", &len);
     if (prop && len == 8) {
         pio_dart = fdt32_ld(&prop[0]);
         pio_sid = fdt32_ld(&prop[1]);
@@ -8565,12 +8533,15 @@ static int dt_set_t8142_dcpext(unsigned int n)
         return -1;
 
     t8142_dcpext_result = "firmware DART not locked or not translating";
-    if (dt_reserve_t8142_stream_tables(fw_dart, fw_sid, true))
+    if (dart_fdt_t8110_translating(dt, fw_dart, fw_sid) != 1)
         return -1;
-    /* Idle scanout and PIODMA roots have no mappings yet; keep what exists. */
-    t8142_dcpext_result = "scanout or PIODMA tables not reserved";
-    if (dt_reserve_t8142_stream_tables(pio_dart, pio_sid, false) ||
-        dt_reserve_t8142_stream_tables(pio_dart, 0, false))
+
+    /*
+     * Every page the three streams map and their page tables, so a port iBoot lit keeps its
+     * scanout buffer. Idle scanout and PIODMA streams have nothing to keep yet.
+     */
+    t8142_dcpext_result = "live display mappings not preserved";
+    if (kboot_t8142_dcpext_preserve(dt, alias, pio_path))
         return -1;
 
     t8142_dcpext_result = "carveout reservation failed";
@@ -9989,8 +9960,9 @@ static int dt_set_display_t8142(void)
     }
     dt_t8142_handoff_result("dcp", result);
 
-    /* Never fatal: a refused external DCP only stays disabled. */
     dt_set_t8142_dcpexts();
+    if (kboot_t8142_display_prune(dt))
+        printf("FDT: disp0: could not drop the external DARTs that stay disabled\n");
     dt_t8142_log_fdt_space();
     return 0;
 }
