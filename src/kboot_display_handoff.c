@@ -534,12 +534,17 @@ struct dcp6_sid {
 
 enum { VM_DCP, VM_DISP }; /* dart-dcp, dart-disp0 */
 
+/* A display pipe's firmware clocks: its ADT clock-ids and their /arm-io clock-frequencies */
+struct dcp6_clocks {
+    u32 n, id[DCP6_CLOCKS_MAX], hz[DCP6_CLOCKS_MAX];
+};
+
 /* Per-kboot state, used by the armed part. Reset on every call. */
 static struct {
     const struct dcp_soc *soc;
     const struct dcp_fw *fw; /* matched OS firmware row, or NULL */
     struct dcp_fw fw_single;
-    u32 nclk, clk_id[DCP6_CLOCKS_MAX], clk_hz[DCP6_CLOCKS_MAX];
+    struct dcp6_clocks clk;          /* /arm-io/disp0's, for dcp */
     u64 coproc, dart_dcp, dart_disp; /* as checked against the ADT */
     u64 vm_base[2], vm_size[2];      /* DVA windows of dart-dcp and dart-disp0 */
     bool vm_ok;
@@ -2407,32 +2412,35 @@ static int dcp25_publish_clock(void *dt)
                                     sizeof(cells));
 }
 
-/* /arm-io/disp0 clock-ids index /arm-io clock-frequencies from DCP_CLOCK_ID_BASE. */
-static int dcp6_read_disp0_clocks(void)
+/*
+ * A display pipe's firmware clocks: the clock-ids of its ADT node (`engine`, named `what` in the
+ * log) index /arm-io clock-frequencies from DCP_CLOCK_ID_BASE.
+ */
+static int dcp6_read_clocks(int engine, const char *what, struct dcp6_clocks *c)
 {
-    int disp = adt_path_offset(adt, "/arm-io/disp0");
     int arm = adt_path_offset(adt, "/arm-io");
     u32 len = 0, flen = 0;
-    const u8 *raw_ids = disp < 0 ? NULL : adt_getprop(adt, disp, "clock-ids", &len);
+    const u8 *raw_ids = engine < 0 ? NULL : adt_getprop(adt, engine, "clock-ids", &len);
     const u8 *freq = arm < 0 ? NULL : adt_getprop(adt, arm, "clock-frequencies", &flen);
     u32 nclk = raw_ids ? len / sizeof(u32) : 0;
+    memset(c, 0, sizeof(*c));
     if (!nclk || len % sizeof(u32) || nclk > DCP6_CLOCKS_MAX || !freq || flen % sizeof(u32))
-        bail("%s display clock metadata is missing or invalid\n", dcp6.fw->os_fw_name);
+        bail("%s clock metadata is missing or invalid\n", what);
     for (u32 i = 0; i < nclk; i++) {
         u32 id, hz;
         memcpy(&id, raw_ids + i * sizeof(u32), sizeof(id));
         if (id < DCP_CLOCK_ID_BASE || id - DCP_CLOCK_ID_BASE >= flen / sizeof(u32))
-            bail("%s display clock %u is out of range\n", dcp6.fw->os_fw_name, id);
+            bail("%s clock %u is out of range\n", what, id);
         for (u32 j = 0; j < i; j++)
-            if (dcp6.clk_id[j] == id)
-                bail("%s display clock %u is duplicated\n", dcp6.fw->os_fw_name, id);
+            if (c->id[j] == id)
+                bail("%s clock %u is duplicated\n", what, id);
         memcpy(&hz, freq + (id - DCP_CLOCK_ID_BASE) * sizeof(u32), sizeof(hz));
-        dcp6.clk_id[i] = id;
-        dcp6.clk_hz[i] = hz;
+        c->id[i] = id;
+        c->hz[i] = hz;
     }
-    if (!dcp6.clk_hz[0])
-        bail("%s primary display clock frequency is zero\n", dcp6.fw->os_fw_name);
-    dcp6.nclk = nclk;
+    if (!c->hz[0])
+        bail("%s primary clock frequency is zero\n", what);
+    c->n = nclk;
     return 0;
 }
 
@@ -2446,38 +2454,44 @@ static bool dcp6_disp0_profile_ok(void)
         dlog("%s DCP image mismatch: nothing done\n", dcp6.fw->os_fw_name);
         return false;
     }
-    return dcp6_read_disp0_clocks() == 0;
+    char what[32];
+    snprintf(what, sizeof(what), "%s display", dcp6.fw->os_fw_name);
+    return dcp6_read_clocks(adt_path_offset(adt, "/arm-io/disp0"), what, &dcp6.clk) == 0;
 }
 
-static int dcp6_publish_disp0_clocks(void *dt, const char *dcp_path)
+/*
+ * One fixed-clock provider /clock-<owner>-firmware-<id> per clock, and clocks, clock-names
+ * (firmware-0, firmware-1, ...) and apple,clock-ids on the processor at `dcp_path`.
+ */
+static int dcp6_publish_clocks(void *dt, const char *dcp_path, const char *owner,
+                               const struct dcp6_clocks *c)
 {
     fdt32_t clocks[DCP6_CLOCKS_MAX], fw_ids[DCP6_CLOCKS_MAX];
     char names[DCP6_CLOCKS_MAX * 12];
     int names_len = 0;
 
-    if (!dcp6.nclk)
+    if (!c->n)
         return -1;
-    for (u32 i = 0; i < dcp6.nclk; i++) {
-        char name[32], path[36];
-        snprintf(name, sizeof(name), "clock-dcp-firmware-%u", dcp6.clk_id[i]);
+    for (u32 i = 0; i < c->n; i++) {
+        char name[DCP6_NAME_LEN + 24], path[DCP6_NAME_LEN + 25];
+        snprintf(name, sizeof(name), "clock-%s-firmware-%u", owner, c->id[i]);
         snprintf(path, sizeof(path), "/%s", name);
         int node = fdt_add_subnode(dt, 0, name);
         if (node < 0 || fdt_setprop_string(dt, node, "compatible", "fixed-clock") ||
             fdt_setprop_u32(dt, fdt_path_offset(dt, path), "#clock-cells", 0) ||
-            fdt_setprop_u32(dt, fdt_path_offset(dt, path), "clock-frequency", dcp6.clk_hz[i]))
+            fdt_setprop_u32(dt, fdt_path_offset(dt, path), "clock-frequency", c->hz[i]))
             return -1;
         u32 ph = dcp6_phandle(dt, path);
         if (!ph)
             return -1;
         clocks[i] = cpu_to_fdt32(ph);
-        fw_ids[i] = cpu_to_fdt32(dcp6.clk_id[i]);
+        fw_ids[i] = cpu_to_fdt32(c->id[i]);
         names_len += snprintf(names + names_len, sizeof(names) - names_len, "firmware-%u", i) + 1;
     }
-    if (fdt_setprop(dt, fdt_path_offset(dt, dcp_path), "clocks", clocks,
-                    dcp6.nclk * sizeof(*clocks)) ||
+    if (fdt_setprop(dt, fdt_path_offset(dt, dcp_path), "clocks", clocks, c->n * sizeof(*clocks)) ||
         fdt_setprop(dt, fdt_path_offset(dt, dcp_path), "clock-names", names, names_len) ||
         fdt_setprop(dt, fdt_path_offset(dt, dcp_path), "apple,clock-ids", fw_ids,
-                    dcp6.nclk * sizeof(*fw_ids)))
+                    c->n * sizeof(*fw_ids)))
         return -1;
     return 0;
 }
@@ -2557,7 +2571,7 @@ static int dcp6_publish(void *dt, const struct dcp6_dt *n)
     dcp = fdt_path_offset(dt, n->dcp);
     if (dcp < 0 || firmware_set_fdt(dt, dcp, "apple,firmware-compat", dcp6_fw_release()))
         return -1;
-    if (dcp6.fw && dcp6.fw->disp0_clocks && dcp6_publish_disp0_clocks(dt, n->dcp))
+    if (dcp6.fw && dcp6.fw->disp0_clocks && dcp6_publish_clocks(dt, n->dcp, "dcp", &dcp6.clk))
         return -1;
     return 0;
 }
@@ -3109,17 +3123,175 @@ static bool t6041_headless(void *dt)
 
 static struct dcp6_seg t6041_headless_text;
 
-static int t6041_ext_fill(void *dt, const struct t6041_ext *ext)
+/*
+ * The text, data and heap placeholders a kernel device tree gives an external processor (node
+ * `node`, `name` in the log): memory-region names three distinct, disabled, empty apple,asc-mem
+ * nodes, in that order (memory-region-names). Their phandles go to ph[].
+ */
+static int dcpext_placeholders(void *dt, int node, const char *name, u32 ph[3])
+{
+    static const char mr_names[] = "text\0data\0heap";
+    static const char *const parts[] = {"text", "data", "heap"};
+    int len;
+
+    const fdt32_t *mr = fdt_getprop(dt, node, "memory-region", &len);
+    if (!mr || len != 3 * (int)sizeof(fdt32_t))
+        bail("%s: no text, data and heap memory-region placeholders\n", name);
+    for (int i = 0; i < 3; i++)
+        ph[i] = fdt32_ld(&mr[i]);
+    if (!ph[0] || !ph[1] || !ph[2] || ph[0] == ph[1] || ph[0] == ph[2] || ph[1] == ph[2])
+        bail("%s: the memory-region placeholders are not three distinct nodes\n", name);
+    const char *names = fdt_getprop(dt, node, "memory-region-names", &len);
+    if (!names || len != sizeof(mr_names) || memcmp(names, mr_names, sizeof(mr_names)))
+        bail("%s: memory-region-names is not text, data, heap\n", name);
+    for (int i = 0; i < 3; i++) {
+        int region = fdt_node_offset_by_phandle(dt, ph[i]);
+        const char *status = region < 0 ? NULL : fdt_getprop(dt, region, "status", NULL);
+        const fdt64_t *r = region < 0 ? NULL : fdt_getprop(dt, region, "reg", &len);
+        if (!status || strcmp(status, "disabled") ||
+            fdt_node_check_compatible(dt, region, "apple,asc-mem") ||
+            !fdt_getprop(dt, region, "no-map", NULL) ||
+            fdt_getprop(dt, region, "iommu-addresses", NULL) || !r ||
+            len != 2 * (int)sizeof(fdt64_t) || fdt64_ld(r) || fdt64_ld(&r[1]) != SZ_16K)
+            bail("%s: the %s placeholder is not an empty, disabled apple,asc-mem\n", name,
+                 parts[i]);
+    }
+    return 0;
+}
+
+/*
+ * The four segments iBoot left an external processor running from (ADT nub `nub`): __TEXT,
+ * __DATA, __OS_LOG and its heap, with flags 1/0/0xa/2, preloaded and running. All are in DRAM;
+ * __OS_LOG is a physical buffer, the others are outside kernel RAM and the carveouts and mapped
+ * inside the DART window vm_base+vm_size. None overlaps another.
+ */
+static int dcpext_nub_segs(const char *name, int nub, u64 vm_base, u64 vm_size,
+                           struct dcp6_seg segs[DCPEXT6_SEGS])
 {
     static const u32 flags[DCPEXT6_SEGS] = {SEG_FLAGS_TEXT, SEG_FLAGS_DATA, SEG_FLAGS_OSLOG,
                                             SEG_FLAGS_HEAP};
-    static const char mr_names[] = "text\0data\0heap";
+    u32 seg_len = 0, names_len = 0, preloaded, running;
+    u64 dram, dram_size, ram_end;
+
+    const struct adt_segment_ranges *ranges =
+        nub < 0 ? NULL : adt_getprop(adt, nub, "segment-ranges", &seg_len);
+    const char *seg_names = nub < 0 ? NULL : adt_getprop(adt, nub, "segment-names", &names_len);
+    if (!ranges || seg_len != DCPEXT6_SEGS * sizeof(*ranges) || !seg_names ||
+        !dcp6_seg_name_is(seg_names, names_len, SEG_TEXT, "__TEXT") ||
+        !dcp6_seg_name_is(seg_names, names_len, SEG_DATA, "__DATA") ||
+        !dcp6_seg_name_is(seg_names, names_len, SEG_OSLOG, "__OS_LOG") ||
+        dcp6_adt_u32(nub, "pre-loaded", &preloaded) || preloaded != 1 ||
+        dcp6_adt_u32(nub, "running", &running) || running != 1)
+        bail("%s: iBoot did not leave its four-segment firmware loaded and running\n", name);
+    if (dcp6_dram(&dram, &dram_size))
+        return -1;
+    ram_end = kboot_ram_base() + kboot_ram_size();
+    if (ram_end < kboot_ram_base())
+        return -1;
+    for (int i = 0; i < DCPEXT6_SEGS; i++) {
+        struct adt_segment_ranges r;
+        memcpy(&r, &ranges[i], sizeof(r));
+        segs[i] = (struct dcp6_seg){r.phys, ALIGN_UP((u64)r.size, SZ_16K), r.remap, r.unk};
+        const struct dcp6_seg *s = &segs[i];
+        if (s->flags != flags[i] || !r.size || s->size > DCP6_SEG_MAX_SIZE ||
+            (s->phys & (SZ_16K - 1)) || s->phys < dram || s->phys + s->size < s->phys ||
+            s->phys + s->size > dram + dram_size)
+            bail("%s: segment %d 0x%lx+0x%lx (flags 0x%x) is not a DRAM segment of this layout\n",
+                 name, i, s->phys, s->size, s->flags);
+        if (i == SEG_OSLOG) {
+            if (s->remap != s->phys || s->size > DCP6_OSLOG_MAX)
+                bail("%s: __OS_LOG is not a physical buffer\n", name);
+        } else if (s->remap < vm_base || s->remap - vm_base > vm_size - s->size ||
+                   (s->remap & (SZ_16K - 1)) ||
+                   !(s->phys + s->size <= kboot_ram_base() || s->phys >= ram_end)) {
+            bail("%s: segment %d 0x%lx+0x%lx at 0x%lx is kernel RAM or outside the DVA window\n",
+                 name, i, s->phys, s->size, s->remap);
+        } else if (dcp6_carveout_conflict(s->phys, s->size, name)) {
+            return -1;
+        }
+        for (int j = 0; j < i; j++)
+            if (dcp6_overlaps(s->phys, s->size, segs[j].phys, segs[j].size) ||
+                (i != SEG_OSLOG && j != SEG_OSLOG &&
+                 dcp6_overlaps(s->remap, s->size, segs[j].remap, segs[j].size)))
+                bail("%s: segments %d and %d overlap\n", name, j, i);
+    }
+    return 0;
+}
+
+/*
+ * Describe an external processor's firmware memory in its placeholders (ph[], checked by
+ * dcpext_placeholders()). __TEXT is shared with the other processors: it is the region
+ * /reserved-memory/<text_name>, created here only with `add_text`, which gets this processor's
+ * mapping and takes the text entry's place (the text placeholder is deleted). Data and heap fill
+ * their placeholders, which are renamed <name>-data@ and <name>-heap@ and enabled. The
+ * iommu-addresses are in the alias form of the DART window at vm_base. Then
+ * apple,firmware-version and apple,firmware-compat. Any failure leaves `dt` half-written.
+ */
+static int dcpext_fill_mem(void *dt, const char *dt_path, const char *name,
+                           const struct dcp6_seg segs[DCPEXT6_SEGS], const u32 ph[3],
+                           const char *text_name, bool add_text, u64 vm_base)
+{
     static const char *const parts[] = {"text", "data", "heap"};
     static const int seg_index[] = {SEG_TEXT, SEG_DATA, SEG_3};
-    u64 coproc, dart, dram, dram_size, ram_end;
+    const struct dcp6_seg *text = &segs[SEG_TEXT];
+    int node;
+
+    u32 owner = dcp6_phandle(dt, dt_path);
+    if (!owner)
+        return -1;
+    int shared = dcp6_find_resv(dt, text_name, text->phys, text->size);
+    if (shared < 0 && add_text) {
+        if (dcp6_resv_conflict(dt, text->phys, text->size, text_name) ||
+            !dcp6_add_resv(dt, text_name, text->phys, text->size, "apple,asc-mem"))
+            return -1;
+        shared = dcp6_find_resv(dt, text_name, text->phys, text->size);
+    }
+    if (shared < 0)
+        bail("%s: no /reserved-memory/%s for the shared __TEXT\n", name, text_name);
+    if (fdt_node_check_compatible(dt, shared, "apple,asc-mem") ||
+        dcp6_append_iommu_addr(dt, shared, owner, vm_base, text->remap - vm_base, text->size))
+        return -1;
+    shared = dcp6_find_resv(dt, text_name, text->phys, text->size);
+    u32 shared_ph = shared < 0 ? 0 : fdt_get_phandle(dt, shared);
+    if (!shared_ph)
+        return -1;
+    for (int i = 1; i < 3; i++) {
+        const struct dcp6_seg *s = &segs[seg_index[i]];
+        char region_name[64];
+        fdt64_t region_reg[2] = {cpu_to_fdt64(s->phys), cpu_to_fdt64(s->size)};
+        if (dcp6_resv_conflict(dt, s->phys, s->size, name))
+            return -1;
+        snprintf(region_name, sizeof(region_name), "%s-%s@%lx", name, parts[i], s->phys);
+        int region = fdt_node_offset_by_phandle(dt, ph[i]);
+        if (region < 0 || fdt_set_name(dt, region, region_name))
+            return -1;
+        region = fdt_node_offset_by_phandle(dt, ph[i]);
+        if (region < 0 || fdt_setprop(dt, region, "reg", region_reg, sizeof(region_reg)) ||
+            dcp6_append_iommu_addr(dt, region, owner, vm_base, s->remap - vm_base, s->size) ||
+            fdt_setprop_string(dt, region, "status", "okay"))
+            return -1;
+    }
+    fdt32_t mr_new[3] = {cpu_to_fdt32(shared_ph), cpu_to_fdt32(ph[1]), cpu_to_fdt32(ph[2])};
+    node = fdt_path_offset(dt, dt_path);
+    if (node < 0 || fdt_setprop(dt, node, "memory-region", mr_new, sizeof(mr_new)))
+        return -1;
+    int placeholder = fdt_node_offset_by_phandle(dt, ph[0]);
+    if (placeholder < 0 || fdt_del_node(dt, placeholder))
+        return -1;
+    node = fdt_path_offset(dt, dt_path);
+    if (node < 0 || firmware_set_fdt(dt, node, "apple,firmware-version", dcp6_fw_release()) ||
+        firmware_set_fdt(dt, fdt_path_offset(dt, dt_path), "apple,firmware-compat",
+                         dcp6_fw_release()))
+        return -1;
+    return 0;
+}
+
+static int t6041_ext_fill(void *dt, const struct t6041_ext *ext)
+{
+    u64 coproc, dart;
     int node = fdt_path_offset(dt, ext->dt_path), len;
     const fdt64_t *reg;
-    const fdt32_t *iommu, *mr;
+    const fdt32_t *iommu;
     u32 ph[3];
 
     /* A DT without #451's external nodes is an ordinary internal-only boot. */
@@ -3142,75 +3314,19 @@ static int t6041_ext_fill(void *dt, const struct t6041_ext *ext)
     reg = fdt_getprop(dt, dart_node, "reg", &len);
     if (!reg || len < 2 * (int)sizeof(fdt64_t) || fdt64_ld(reg) != dart)
         return -1;
-
-    mr = fdt_getprop(dt, node, "memory-region", &len);
-    if (!mr || len != 3 * (int)sizeof(fdt32_t))
+    if (dcpext_placeholders(dt, node, ext->name, ph))
         return -1;
-    for (int i = 0; i < 3; i++)
-        ph[i] = fdt32_ld(&mr[i]);
-    if (!ph[0] || !ph[1] || !ph[2] || ph[0] == ph[1] || ph[0] == ph[2] || ph[1] == ph[2])
-        return -1;
-    const char *names = fdt_getprop(dt, node, "memory-region-names", &len);
-    if (!names || len != sizeof(mr_names) || memcmp(names, mr_names, sizeof(mr_names)))
-        return -1;
-    for (int i = 0; i < 3; i++) {
-        int region = fdt_node_offset_by_phandle(dt, ph[i]);
-        const char *status = region < 0 ? NULL : fdt_getprop(dt, region, "status", NULL);
-        const fdt64_t *r = region < 0 ? NULL : fdt_getprop(dt, region, "reg", &len);
-        if (!status || strcmp(status, "disabled") ||
-            fdt_node_check_compatible(dt, region, "apple,asc-mem") ||
-            !fdt_getprop(dt, region, "no-map", NULL) ||
-            fdt_getprop(dt, region, "iommu-addresses", NULL) || !r ||
-            len != 2 * (int)sizeof(fdt64_t) || fdt64_ld(r) || fdt64_ld(&r[1]) != SZ_16K)
-            return -1;
-    }
 
     int nub = adt_path_offset(adt, ext->nub_path);
-    u32 seg_len = 0, names_len = 0, uuid_len = 0, preloaded, running;
-    const struct adt_segment_ranges *ranges =
-        nub < 0 ? NULL : adt_getprop(adt, nub, "segment-ranges", &seg_len);
-    const char *seg_names = nub < 0 ? NULL : adt_getprop(adt, nub, "segment-names", &names_len);
+    u32 uuid_len = 0;
     const char *ext_uuid = nub < 0 ? NULL : adt_getprop(adt, nub, "uuid", &uuid_len);
     if (dcp6.fw && dcp6.fw->uuid &&
         (!ext_uuid || uuid_len != strlen(dcp6.fw->uuid) + 1 ||
          memcmp(ext_uuid, dcp6.fw->uuid, uuid_len)))
         return -1;
-    if (!ranges || seg_len != DCPEXT6_SEGS * sizeof(*ranges) || !seg_names ||
-        !dcp6_seg_name_is(seg_names, names_len, SEG_TEXT, "__TEXT") ||
-        !dcp6_seg_name_is(seg_names, names_len, SEG_DATA, "__DATA") ||
-        !dcp6_seg_name_is(seg_names, names_len, SEG_OSLOG, "__OS_LOG") ||
-        dcp6_adt_u32(nub, "pre-loaded", &preloaded) || preloaded != 1 ||
-        dcp6_adt_u32(nub, "running", &running) || running != 1 || dcp6_dram(&dram, &dram_size))
-        return -1;
-    ram_end = kboot_ram_base() + kboot_ram_size();
-    if (ram_end < kboot_ram_base())
-        return -1;
     struct dcp6_seg segs[DCPEXT6_SEGS];
-    for (int i = 0; i < DCPEXT6_SEGS; i++) {
-        struct adt_segment_ranges r;
-        memcpy(&r, &ranges[i], sizeof(r));
-        segs[i] = (struct dcp6_seg){r.phys, ALIGN_UP((u64)r.size, SZ_16K), r.remap, r.unk};
-        const struct dcp6_seg *s = &segs[i];
-        if (s->flags != flags[i] || !r.size || s->size > DCP6_SEG_MAX_SIZE ||
-            (s->phys & (SZ_16K - 1)) || s->phys < dram || s->phys + s->size < s->phys ||
-            s->phys + s->size > dram + dram_size)
-            return -1;
-        if (i == SEG_OSLOG) {
-            if (s->remap != s->phys || s->size > DCP6_OSLOG_MAX)
-                return -1;
-        } else if (s->remap < DCP6_DART_VM_BASE ||
-                   s->remap - DCP6_DART_VM_BASE > DCP6_DART_VM_SIZE - s->size ||
-                   (s->remap & (SZ_16K - 1)) ||
-                   !(s->phys + s->size <= kboot_ram_base() || s->phys >= ram_end) ||
-                   dcp6_carveout_conflict(s->phys, s->size, ext->name)) {
-            return -1;
-        }
-        for (int j = 0; j < i; j++)
-            if (dcp6_overlaps(s->phys, s->size, segs[j].phys, segs[j].size) ||
-                (i != SEG_OSLOG && j != SEG_OSLOG &&
-                 dcp6_overlaps(s->remap, s->size, segs[j].remap, segs[j].size)))
-                return -1;
-    }
+    if (dcpext_nub_segs(ext->name, nub, DCP6_DART_VM_BASE, DCP6_DART_VM_SIZE, segs))
+        return -1;
     /* The two external processors and the panel share immutable TEXT. */
     const struct dcp6_seg *shared_text = &dcp6.segs[SEG_TEXT];
     if (t6041_headless(dt)) {
@@ -3221,60 +3337,15 @@ static int t6041_ext_fill(void *dt, const struct t6041_ext *ext)
     if (segs[SEG_TEXT].phys != shared_text->phys || segs[SEG_TEXT].size != shared_text->size)
         return -1;
 
-    u32 owner = dcp6_phandle(dt, ext->dt_path);
-    if (!owner)
-        return -1;
     /*
      * TEXT is the panel's own region: give it this processor's mapping and
      * point the text entry at it, as dcpext6 does, instead of describing the
      * same memory a second time. The text placeholder is then deleted.
      */
     char text_name[64];
-    const struct dcp6_seg *text = &segs[SEG_TEXT];
-    snprintf(text_name, sizeof(text_name), "dcp-text@%lx", text->phys);
-    int shared = dcp6_find_resv(dt, text_name, text->phys, text->size);
-    if (shared < 0 && t6041_headless(dt)) {
-        if (dcp6_resv_conflict(dt, text->phys, text->size, text_name) ||
-            !dcp6_add_resv(dt, text_name, text->phys, text->size, "apple,asc-mem"))
-            return -1;
-        shared = dcp6_find_resv(dt, text_name, text->phys, text->size);
-    }
-    if (shared < 0 || fdt_node_check_compatible(dt, shared, "apple,asc-mem") ||
-        dcp6_append_iommu_addr(dt, shared, owner, DCP6_DART_VM_BASE,
-                               text->remap - DCP6_DART_VM_BASE, text->size))
-        return -1;
-    shared = dcp6_find_resv(dt, text_name, text->phys, text->size);
-    u32 shared_ph = shared < 0 ? 0 : fdt_get_phandle(dt, shared);
-    if (!shared_ph)
-        return -1;
-    for (int i = 1; i < 3; i++) {
-        const struct dcp6_seg *s = &segs[seg_index[i]];
-        char name[64];
-        fdt64_t region_reg[2] = {cpu_to_fdt64(s->phys), cpu_to_fdt64(s->size)};
-        if (dcp6_resv_conflict(dt, s->phys, s->size, ext->name))
-            return -1;
-        snprintf(name, sizeof(name), "%s-%s@%lx", ext->name, parts[i], s->phys);
-        int region = fdt_node_offset_by_phandle(dt, ph[i]);
-        if (region < 0 || fdt_set_name(dt, region, name))
-            return -1;
-        region = fdt_node_offset_by_phandle(dt, ph[i]);
-        if (region < 0 || fdt_setprop(dt, region, "reg", region_reg, sizeof(region_reg)) ||
-            dcp6_append_iommu_addr(dt, region, owner, DCP6_DART_VM_BASE,
-                                   s->remap - DCP6_DART_VM_BASE, s->size) ||
-            fdt_setprop_string(dt, region, "status", "okay"))
-            return -1;
-    }
-    fdt32_t mr_new[3] = {cpu_to_fdt32(shared_ph), cpu_to_fdt32(ph[1]), cpu_to_fdt32(ph[2])};
-    node = fdt_path_offset(dt, ext->dt_path);
-    if (node < 0 || fdt_setprop(dt, node, "memory-region", mr_new, sizeof(mr_new)))
-        return -1;
-    int placeholder = fdt_node_offset_by_phandle(dt, ph[0]);
-    if (placeholder < 0 || fdt_del_node(dt, placeholder))
-        return -1;
-    node = fdt_path_offset(dt, ext->dt_path);
-    if (node < 0 || firmware_set_fdt(dt, node, "apple,firmware-version", dcp6_fw_release()) ||
-        firmware_set_fdt(dt, fdt_path_offset(dt, ext->dt_path), "apple,firmware-compat",
-                         dcp6_fw_release()))
+    snprintf(text_name, sizeof(text_name), "dcp-text@%lx", segs[SEG_TEXT].phys);
+    if (dcpext_fill_mem(dt, ext->dt_path, ext->name, segs, ph, text_name, t6041_headless(dt),
+                        DCP6_DART_VM_BASE))
         return -1;
     if (dcp6.fw && dcp6.fw->disp0_clocks) {
         if (fdt_setprop_string(dt, fdt_path_offset(dt, ext->dt_path), "apple,firmware-uuid",
@@ -3287,15 +3358,16 @@ static int t6041_ext_fill(void *dt, const struct t6041_ext *ext)
 
 /*
  * Headless: with no internal handoff, nothing else enables the display subsystem the external
- * chains join, nor its own DART (disp0's, which iBoot leaves locked). Enable both once an external
- * processor has its firmware memory; the kernel's gate then enables that processor's chain.
+ * chains join (alias disp0, of compatible `compat`), nor its own DART (disp0's, which iBoot leaves
+ * locked). Enable both once an external processor has its firmware memory; the kernel's gate then
+ * enables that processor's chain.
  */
-static int t6041_headless_display(void *dt)
+static int dcp6_headless_display(void *dt, const char *compat)
 {
     int display = fdt_path_offset(dt, "disp0");
     int len;
     const fdt32_t *iommu = display < 0 ? NULL : fdt_getprop(dt, display, "iommus", &len);
-    if (display < 0 || fdt_node_check_compatible(dt, display, dcp6.soc->disp_compat) || !iommu ||
+    if (display < 0 || fdt_node_check_compatible(dt, display, compat) || !iommu ||
         len != 2 * (int)sizeof(fdt32_t) || dcp6_status_disabled(dt, display, "display subsystem"))
         return -1;
     int dart = fdt_node_offset_by_phandle(dt, fdt32_ld(iommu));
@@ -3355,7 +3427,7 @@ static void t6041_ext_handoffs(void *dt)
     void *scratch = dcp6_scratch(dt);
     if (!scratch)
         return;
-    if (t6041_headless_display(scratch)) {
+    if (dcp6_headless_display(scratch, dcp6.soc->disp_compat)) {
         dlog("display subsystem not enabled; the external processors stay disabled\n");
         free(scratch);
     } else if (!dcp6_commit(dt, scratch)) {
