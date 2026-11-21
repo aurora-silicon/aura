@@ -47,6 +47,7 @@ static void *dt, *adt;
 static u32 chip_id = T8122;
 #define V26_6_2 2662
 static const struct { int version; } os_firmware = {147};
+static bool chosen_lost;
 static int dt_ext26_retain_cpu(const char *alias) { (void)alias; assert(0 && "native CPU lease on classic path"); return -1; }
 static void dt_ext26_step(const char *step) { (void)step; }
 static void dt_ext26_result(int error) { (void)error; assert(0 && "native receipt on classic path"); }
@@ -54,15 +55,20 @@ static void dt_ext26_result(int error) { (void)error; assert(0 && "native receip
 static int fault, reservations;
 static unsigned char blob[32768];
 ''' + layout + r'''
-static struct adt_segment_ranges segments[2];
+static struct adt_segment_ranges segments[2], dcp_segments[2];
 static u64 dram_base = 0x10000000000ULL, dram_size = 0x1000000;
 static int adt_path_offset(void *tree, const char *path)
 {
     if (!strcmp(path, "/chosen")) return 2;
+    if (!strcmp(path, "/arm-io/dcp/iop-dcp-nub")) return 3;
     return !strcmp(path, "/arm-io/dcpext/iop-dcpext-nub") && fault != 5 ? 1 : -1;
 }
 static const void *adt_getprop(void *tree, int node, const char *name, u32 *len)
 {
+    if (node == 3 && !strcmp(name, "segment-ranges")) {
+        *len = sizeof(dcp_segments);
+        return dcp_segments;
+    }
     if (!strcmp(name, "segment-ranges")) {
         *len = fault == 6 ? 0 : fault == 7 ? sizeof(segments) - 1 : sizeof(segments);
         return fault == 8 ? NULL : segments;
@@ -116,16 +122,22 @@ static int set_u32(void *tree, int node, const char *name, uint32_t value)
         "static int dt_ext26_reserve(const char *alias) { return -1; }\n"
         "static int dt_ext26_snapshot(const char *alias) { return 0; }\n" +
         function("dt_reserve_dcpext_ready") + function("dt_reserve_t8122_dcpext_one") +
+        function("adt_nub_first_segment", "static bool ") +
+        function("dt_t8122_dcpext_shares_image", "static bool ") +
         function("dt_t8122_dcpext_armed", "static bool ") +
         function("dt_reserve_dcpext_firmware") + r'''
 static void world(void)
 {
-    fault = reservations = 0; chip_id = T8122;
+    fault = reservations = 0; chip_id = T8122; chosen_lost = false;
     dram_base = 0x10000000000ULL; dram_size = 0x1000000;
     segments[0] = (struct adt_segment_ranges){.phys = dram_base + 0x4000,
         .remap = 0x10000000, .size = 0x4000};
     segments[1] = (struct adt_segment_ranges){.phys = dram_base + 0x10000,
         .remap = 0x20000000, .size = 0x8000};
+    /* By default the internal DCP's text is elsewhere: the external one has its own image. */
+    dcp_segments[0] = (struct adt_segment_ranges){.phys = dram_base + 0x40000,
+        .remap = 0x10000000, .size = 0x4000};
+    dcp_segments[1] = segments[1];
     memset(blob, 0, sizeof(blob)); dt = blob;
     assert(!fdt_create_empty_tree(dt, sizeof(blob)));
     assert(!fdt_setprop_string(dt, 0, "compatible", "apple,t8122"));
@@ -207,6 +219,30 @@ int main(void)
     const char *values[] = {"0", "", "11", "yes"};
     for (unsigned i = 0; i < ARRAY_SIZE(values); i++) {
         world();
+        assert(!fdt_setprop_string(dt, fdt_path_offset(dt, "/chosen"), "asahi,t8122-dcpext",
+                                   values[i]));
+        unarmed();
+    }
+    /*
+     * No config line: on by default where the external processor runs the internal handoff's
+     * image (its first segment is the internal DCP's text), unless a config line was lost.
+     */
+    world(); assert(!fdt_delprop(dt, fdt_path_offset(dt, "/chosen"), "asahi,t8122-dcpext"));
+    dcp_segments[0] = segments[0];
+    assert(!dt_reserve_dcpext_firmware(false) && ready() && reservations == 2);
+    still_disabled();
+    world(); assert(!fdt_delprop(dt, fdt_path_offset(dt, "/chosen"), "asahi,t8122-dcpext"));
+    dcp_segments[0] = segments[0]; chosen_lost = true;
+    unarmed();
+    world(); assert(!fdt_delprop(dt, fdt_path_offset(dt, "/chosen"), "asahi,t8122-dcpext"));
+    dcp_segments[0] = segments[0]; dcp_segments[0].size += 0x4000; /* not the same image */
+    unarmed();
+    world(); assert(!fdt_delprop(dt, fdt_path_offset(dt, "/chosen"), "asahi,t8122-dcpext"));
+    dcp_segments[0] = segments[0];
+    assert(!fdt_delprop(dt, fdt_path_offset(dt, "/soc/dcp"), "apple,t8122-handoff"));
+    unarmed(); /* the shared image needs the internal handoff too */
+    for (unsigned i = 0; i < ARRAY_SIZE(values); i++) {
+        world(); dcp_segments[0] = segments[0]; /* =0 (any value but 1) turns the default off */
         assert(!fdt_setprop_string(dt, fdt_path_offset(dt, "/chosen"), "asahi,t8122-dcpext",
                                    values[i]));
         unarmed();

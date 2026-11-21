@@ -434,8 +434,9 @@ static int dt_set_t8140_wfx_args(int node)
  * (which also passes the PMP values), the GPU, and the stand-in power model with this Mac's
  * leakage fuse. It wrote the GPU lines only beside a display line of 1, so an owner's
  * chosen.asahi,t8122-dcp=0 keeps the default GPU switches off as well; an owner's own GPU line
- * still counts. chosen.asahi,t8122-dcpext stays off. The Pro switches are its display handoff
- * and GPU; its external display handoffs (t6030-dcpext, t6030-dispext) keep their own lines.
+ * still counts. chosen.asahi,t8122-dcpext gets no default here (dt_t8122_dcpext_armed() decides).
+ * The Pro switches are its display handoff and GPU; its external display handoffs (t6030-dcpext,
+ * t6030-dispext) keep their own lines.
  *
  * The J516C switches are its display handoff and GPU, each on its own as on the Pro: an owner's
  * chosen.asahi,t6031-gpu=0 keeps the GPU off and the display default still goes in, and
@@ -5501,13 +5502,51 @@ static void dt_reserve_j713_dcpext(void)
 }
 
 /*
- * T8122: reserve the external DCP firmware for the kernel's gate only with the boot.bin config
- * line chosen.asahi,t8122-dcpext=1, and only when the internal display was handed over
- * (apple,t8122-handoff on dcp), the one case where the kernel would enable it. Off by default:
- * on an M3 Air with 14.x firmware, a published marker lets the kernel enable dcpext, and the
- * internal DCP then crashes after disp0 DART faults, leaving the panel dark.
+ * The first firmware segment of the ADT nub at @path: where the processor's image (its text) sits.
  */
-static bool dt_t8122_dcpext_armed(void)
+static bool adt_nub_first_segment(const char *path, u64 *phys, u32 *size)
+{
+    int nub = adt_path_offset(adt, path);
+    u32 len = 0;
+    const struct adt_segment_ranges *seg =
+        nub < 0 ? NULL : adt_getprop(adt, nub, "segment-ranges", &len);
+
+    if (!seg || len < sizeof(*seg) || len % sizeof(*seg) || !seg[0].size)
+        return false;
+    *phys = seg[0].phys;
+    *size = seg[0].size;
+    return true;
+}
+
+/*
+ * Does the external processor at @alias run the image the internal display handoff pinned? iBoot
+ * then loads no image of its own for it: the first segment of its nub is the internal DCP's text
+ * (seen with macOS 27.2 on the J615). The kernel starts it on that image, beside the panel, in
+ * the panel's DMA window.
+ */
+static bool dt_t8122_dcpext_shares_image(const char *alias)
+{
+    char path[48];
+    u64 ext_phys, dcp_phys;
+    u32 ext_size, dcp_size;
+
+    snprintf(path, sizeof(path), "/arm-io/%s/iop-%s-nub", alias, alias);
+    return adt_nub_first_segment(path, &ext_phys, &ext_size) &&
+           adt_nub_first_segment("/arm-io/dcp/iop-dcp-nub", &dcp_phys, &dcp_size) &&
+           ext_phys == dcp_phys && ext_size == dcp_size;
+}
+
+/*
+ * T8122: reserve the external DCP firmware for the kernel's gate only when the internal display
+ * was handed over (apple,t8122-handoff on dcp), the one case where the kernel would enable it.
+ * With the boot.bin config line chosen.asahi,t8122-dcpext=1 it is armed; any other value turns it
+ * off. Without a line it is on by default where the external processor runs the image the
+ * internal handoff pinned (dt_t8122_dcpext_shares_image()), unless a config line was lost (an
+ * owner's =0 may be among them). Otherwise it stays off without the line: on an M3 Air with 14.x
+ * firmware a published marker lets the kernel enable dcpext, and the internal DCP then crashes
+ * after disp0 DART faults, leaving the panel dark.
+ */
+static bool dt_t8122_dcpext_armed(const char *alias)
 {
     int chosen = fdt_path_offset(dt, "/chosen");
     int len = 0;
@@ -5517,10 +5556,13 @@ static bool dt_t8122_dcpext_armed(void)
     if (native)
         opt = chosen < 0 ? NULL : fdt_getprop(dt, chosen, "asahi,j613-25g83-dcpext", &len);
 
-    if (!opt || len != 2 || opt[0] != '1' || opt[1] != '\0')
+    if (native)
+        return opt && len == 2 && opt[0] == '1' && opt[1] == '\0';
+    if (panel < 0 || !fdt_getprop(dt, panel, "apple,t8122-handoff", NULL))
         return false;
-    int dcp = fdt_path_offset(dt, "dcp");
-    return native || (dcp >= 0 && fdt_getprop(dt, dcp, "apple,t8122-handoff", NULL));
+    if (opt)
+        return len == 2 && opt[0] == '1' && opt[1] == '\0';
+    return !chosen_lost && dt_t8122_dcpext_shares_image(alias);
 }
 
 /*
@@ -5560,11 +5602,12 @@ static int dt_reserve_dcpext_firmware(bool enable)
                 os_firmware.version == V26_6_2 && !fdt_node_check_compatible(dt, 0, "apple,j613");
             if (native26)
                 dt_ext26_step("native-switch-and-internal-handoff");
-            if (!dt_t8122_dcpext_armed()) {
+            if (!dt_t8122_dcpext_armed(dcpext_alias)) {
                 if (native26)
                     dt_ext26_result(-1);
-                printf("FDT: '%s' firmware not reserved (needs chosen.asahi,t8122-dcpext=1 "
-                       "and the internal display handoff); kernel gate remains closed\n",
+                printf("FDT: '%s' firmware not reserved (needs the internal display handoff, and "
+                       "chosen.asahi,t8122-dcpext=1 unless it runs the handed-over image); "
+                       "kernel gate remains closed\n",
                        dcpext_alias);
                 continue;
             }
@@ -8266,7 +8309,7 @@ static int dt_set_display(void)
          * Fail-soft handoff (kboot_display_handoff.c): it always returns 0, never uses the
          * helpers above (they bail out of kboot or enable nodes) and never enables a node.
          * On T8122 it does nothing unless chosen.asahi,t8122-dcp=1; the external DCP firmware is
-         * reserved only with chosen.asahi,t8122-dcpext=1 and that handoff. On T6031 it does nothing
+         * reserved only after that handoff (dt_t8122_dcpext_armed()). On T6031 it does nothing
          * unless the board is a J514C or J516C, and reserves only __OS_LOG unless
          * chosen.asahi,t6031-dcp=1 (on a J516C, dt_set_m3_defaults() sets it unless a config line
          * set it).
