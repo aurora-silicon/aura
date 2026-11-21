@@ -3391,10 +3391,18 @@ static bool dcp6_dt_describes(void *dt)
  * iommu-addresses: only what the ADT says, checked against the device tree and the registers.
  * The image is pinned per OS firmware because 27.0 and 27.0.1 report the same iBoot version.
  */
+/*
+ * The DCP image of 27.3 beta 1 takes the 27.3 method table: its nodes get 27.3.0, which the kernel
+ * maps to that table, rather than the beta's OS firmware numbers (27.2.98.1).
+ */
+static const struct fw_version_info t6050_fw_27_3 = {V27_3B, "27.3", {27, 3, 0}, 3, NULL};
+
 static const struct {
     u32 os_fw;
     char uuid[37];
     bool ext; /* also hand off the external display engines running this image */
+    /* The firmware version the DCP nodes get, if not the OS firmware's (see t6050_fw_27_3) */
+    const struct fw_version_info *dcp_fw;
 } t6050_images[] = {
     {V27_0, "64863924-B56B-3E32-87FE-038677F52709", true},
     /* K116s (16" M5 Pro, OLED), 26B8125: the internal panel only */
@@ -3403,6 +3411,8 @@ static const struct {
      * machine; the image id is not shared across T6050 boards, so the rows pair with the
      * image the ADT reports below. The J775D's (M5 Ultra) dcpext engines run it too */
     {V27_2, "C51FB0C8-C45D-39B0-85BC-520E600FC950", true},
+    /* J714c (14" M5 Max) on 27.3 beta 1 (26C5035, mBoot-20457.60.65.0.1) */
+    {V27_3B, "58CB3FFC-B2BA-352E-B20B-71A91B15FA9F", true, &t6050_fw_27_3},
 };
 #define T6050_NDISP     5       /* disp0 reg[0..4] are the dcp's disp-0..disp-4 */
 #define T6050_BW_BASE   0x20000 /* bandwidth agent 0's scratch in the PMC metadata */
@@ -3427,6 +3437,7 @@ static struct {
     const char *gamut;
     const char *uuid; /* the pinned image of the running OS firmware */
     bool ext;
+    const struct fw_version_info *dcp_fw; /* the version the DCP nodes get */
     bool headless; /* no panel: t6050_headless_handoff() */
 } t6050;
 
@@ -3486,6 +3497,7 @@ static T6050_TEXT bool t6050_pick_image(const char *uuid, u32 len)
             !strcmp(uuid, t6050_images[i].uuid)) {
             t6050.uuid = t6050_images[i].uuid;
             t6050.ext = t6050_images[i].ext;
+            t6050.dcp_fw = t6050_images[i].dcp_fw ? t6050_images[i].dcp_fw : &os_firmware;
             return true;
         }
     return false;
@@ -3676,9 +3688,9 @@ static T6050_TEXT int t6050_publish(void *dt)
     int nlen = 0;
 
     if (firmware_set_fdt(dt, kboot_fdt_path_exact(dt, t6050.path[T6050_DCP]),
-                         "apple,firmware-version", &os_firmware) ||
+                         "apple,firmware-version", t6050.dcp_fw) ||
         firmware_set_fdt(dt, kboot_fdt_path_exact(dt, t6050.path[T6050_DCP]),
-                         "apple,firmware-compat", &os_firmware) ||
+                         "apple,firmware-compat", t6050.dcp_fw) ||
         t6050_setprop(dt, T6050_DCP, "apple,firmware-uuid", t6050.uuid, strlen(t6050.uuid) + 1))
         return -1;
 
@@ -3993,9 +4005,9 @@ static T6050_TEXT int t6050_ext_one(void *dt, int n)
         if (fdt_get_path(dt, targets[i], path[i], T6050_PATH))
             return -1;
     if (firmware_set_fdt(dt, kboot_fdt_path_exact(dt, path[0]), "apple,firmware-version",
-                         &os_firmware) ||
+                         t6050.dcp_fw) ||
         firmware_set_fdt(dt, kboot_fdt_path_exact(dt, path[0]), "apple,firmware-compat",
-                         &os_firmware) ||
+                         t6050.dcp_fw) ||
         fdt_setprop(dt, kboot_fdt_path_exact(dt, path[0]), "apple,firmware-uuid", t6050.uuid,
                     strlen(t6050.uuid) + 1) ||
         fdt_setprop(dt, kboot_fdt_path_exact(dt, path[0]), "apple,bw-scratch", v, sizeof(v)))
@@ -4031,7 +4043,8 @@ static T6050_TEXT void t6050_ext_handoff(void *dt, int engines, int skip)
 static T6050_TEXT void t6050_handoff(void *dt)
 {
     memset(&t6050, 0, sizeof(t6050));
-    if (!t6050_check_adt() && !t6050_check_dt(dt) && !t6050_check_darts(dt)) {
+    int adt_ok = !t6050_check_adt();
+    if (adt_ok && !t6050_check_dt(dt) && !t6050_check_darts(dt)) {
         void *scratch = dcp6_scratch(dt);
         if (scratch && t6050_publish(scratch)) {
             dlog("DT write failed (full?)\n");
@@ -4051,6 +4064,25 @@ static T6050_TEXT void t6050_handoff(void *dt)
     if (t6050_setprop(dt, -1, T6050_STATUS, "refused", sizeof("refused")))
         dlog("could not set /chosen/" T6050_STATUS "\n");
     dlog("internal display handoff refused; the boot framebuffer keeps the panel\n");
+    /*
+     * A device tree that enables the dcp itself (a kernel that adopts the internal DCP on its own)
+     * still gets the external engines running the same image. They need the PMC metadata node
+     * their bandwidth scratch points into, which the internal handoff would have published.
+     */
+    if (adt_ok && t6050.ext && !t6050.pmc_ph && t6050.pmc && t6050.pmc_size &&
+        dcp6_status_disabled(dt, kboot_fdt_path_exact(dt, "dcp"), "dcp")) {
+        char name[48], node[T6050_PATH];
+        snprintf(name, sizeof(name), "pmc-metadata@%lx", t6050.pmc);
+        snprintf(node, sizeof(node), "/soc/%s", name);
+        u32 ph = t6050_add_node(dt, "/soc", name);
+        fdt64_t reg[2] = {cpu_to_fdt64(t6050.pmc), cpu_to_fdt64(t6050.pmc_size)};
+        if (ph && !fdt_setprop(dt, kboot_fdt_path_exact(dt, node), "reg", reg, sizeof(reg)) &&
+            !fdt_setprop_u32(dt, kboot_fdt_path_exact(dt, node), "#apple,bw-scratch-cells", 3)) {
+            t6050.pmc_ph = ph;
+            dlog("the device tree adopts the internal DCP: handing off the external engines\n");
+            t6050_ext_handoff(dt, 4, -1);
+        }
+    }
 }
 
 #define T6050_ENGINES 8 /* dcpext0..7 */
