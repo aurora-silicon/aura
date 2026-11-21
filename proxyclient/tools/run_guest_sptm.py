@@ -114,6 +114,13 @@ Environment (all optional; 1 enables a switch):
   AURA_ANS_COLD=<mode>     ANS for XNU to start cold: sleep, idle or off (default: sleep on
                            T8140 and for an ANS an earlier stage powered off, else off)
   AURA_ANS_PROBE=0         skip the cold handoff's HELLO check
+  AURA_ANS_COLDPATH=<mode> an ANS an earlier stage idled and powered off (Stage 1 1.0.0b13 on
+                           T8132): aura starts it from off, then hands it over quiesced (XNU
+                           wakes it, "quiesced" kept) or stopped (SLEEP and reset, XNU starts it
+                           cold). Instead of AURA_ANS_COLD; needs AURA_ANS_SART
+  AURA_ANS_COLDPATH_CLEAR=1  quiesced: clear the stage's own SART entries too (default: kept,
+                           in memory nobody owns, for a firmware that goes on with its buffers)
+  AURA_ANS_COLDPATH_AUTO=1   last: iBoot's auto-enable back on the APCIe storage/GP power words
   AURA_ANS_SART=<v>        the nvme.sart= value tools/ans_sart.py printed on the stage that
                            powered ANS off (route: the host chainloads this image from its proxy)
   XNU_BOOTARGS             XNU's command line
@@ -232,6 +239,9 @@ KNOWN_ENV = {
     "AURA_ANS_PROBE",
     "AURA_ANS_DROP",
     "AURA_ANS_SART",
+    "AURA_ANS_COLDPATH",
+    "AURA_ANS_COLDPATH_CLEAR",
+    "AURA_ANS_COLDPATH_AUTO",
 } | set(CONFIG_FLAGS)
 
 # The debug link's USB-C port: XNU must never drive it (it resets the port about 3 s into IOKit
@@ -532,6 +542,27 @@ def check_running_image(iface, sym, elf):
             raise SystemExit(f"the proxy at base 0x{sym.run_base:x} isn't running {elf}: the code "
                              f"at {name} differs. Stopping before any call into it.")
     print(f"running image matches {elf} at base 0x{sym.run_base:x}")
+
+
+COLDPATH_STOPPED, COLDPATH_CLEAR, COLDPATH_AUTO = 1, 2, 4  # src/nvme.h NVME_COLDPATH_*
+
+
+def ans_coldpath_mode(env, ans_off, sart_passed):
+    """AURA_ANS_COLDPATH=quiesced|stopped, or None. Refused unless ANS is off with its SART entries
+    passed on, and never together with AURA_ANS_COLD (the older cold handoff)."""
+    mode = env.get("AURA_ANS_COLDPATH", "")
+    if not mode:
+        return None
+    if mode not in ("quiesced", "stopped"):
+        raise SystemExit(f"AURA_ANS_COLDPATH={mode}: quiesced or stopped")
+    if env.get("AURA_ANS_COLD"):
+        raise SystemExit("AURA_ANS_COLDPATH and AURA_ANS_COLD are two different handoffs: one only")
+    if not ans_off:
+        raise SystemExit("AURA_ANS_COLDPATH: ANS is on here; it's for an ANS a stage powered off")
+    if not sart_passed:
+        raise SystemExit("AURA_ANS_COLDPATH: ANS is off and its SART entries weren't passed on "
+                         "(AURA_ANS_SART)")
+    return mode
 
 
 def ans_drop_props():
@@ -1089,16 +1120,39 @@ def main():
     print(f"ANS {'powered off' if ans_off else 'on'}, "
           f"{'SART entries passed on' if ans_state & 2 else 'no SART entries passed on'}")
     t8140 = u.adt["/chosen"].chip_id == 0x8140
-    ans_cold = os.environ.get("AURA_ANS_COLD", "sleep" if t8140 or ans_off else "off")
-    if ans_cold not in ("sleep", "idle", "off"):
-        raise SystemExit(f"AURA_ANS_COLD={ans_cold}: sleep, idle or off")
-    if ans_off and ans_cold == "off":
+    coldpath = ans_coldpath_mode(os.environ, ans_off, bool(ans_state & 2))
+    if coldpath:
+        flags = ((COLDPATH_STOPPED if coldpath == "stopped" else 0) |
+                 (COLDPATH_CLEAR if env_on("AURA_ANS_COLDPATH_CLEAR") else 0) |
+                 (COLDPATH_AUTO if env_on("AURA_ANS_COLDPATH_AUTO") else 0))
+        # nvme_init() from off: two warm starts of up to 6 s each, the queues, then the handoff.
+        to, iface.dev.timeout = iface.dev.timeout, 120
+        try:
+            rc = p.call(sym["sptm_virt_ans_coldpath"], flags)
+        finally:
+            iface.dev.timeout = to
+        rc &= 0xffffffff
+        rc = rc - (1 << 32) if rc >= 1 << 31 else rc
+        if rc != 0:
+            raise SystemExit(f"ANS coldpath ({coldpath}) failed ({rc}): no XNU (see aura's console)")
+        if p.call(sym["sptm_virt_place"], scratch) != 0 or \
+                (p.read64(scratch), p.read64(scratch + 8)) != (managed_base, managed_end):
+            raise SystemExit("the managed window moved during the ANS coldpath: stop")
+        print(f"ANS coldpath: {coldpath.upper()} for XNU")
+    if coldpath:
+        # Quiesced: XNU wakes it as iBoot's session ("quiesced" kept); stopped: it starts it cold.
+        ans_cold = "off" if coldpath == "quiesced" else "coldpath"
+    else:
+        ans_cold = os.environ.get("AURA_ANS_COLD", "sleep" if t8140 or ans_off else "off")
+        if ans_cold not in ("sleep", "idle", "off"):
+            raise SystemExit(f"AURA_ANS_COLD={ans_cold}: sleep, idle or off")
+    if ans_off and ans_cold == "off" and not coldpath:
         raise SystemExit("ANS is powered off: XNU can only start it cold (AURA_ANS_COLD=sleep)")
     if ans_off and not ans_state & 2:
         raise SystemExit("ANS is powered off and its SART entries weren't passed on: run "
                          "tools/ans_sart.py --start on the stage that powered it off, before the "
                          "chainload, and pass what it prints as AURA_ANS_SART")
-    if ans_cold != "off":
+    if ans_cold not in ("off", "coldpath"):
         # An unanswered RTKit or controller step takes seconds, more than a read's timeout.
         to, iface.dev.timeout = iface.dev.timeout, 30
         try:

@@ -345,6 +345,12 @@ __attribute__((used, retain)) int sptm_virt_ans_cold(u64 flags)
     return nvme_cold_handoff(flags & 1, flags & 2);
 }
 
+/* The cold path's ANS handoff (nvme_coldpath_handoff()): QUIESCED or STOPPED, from off. */
+__attribute__((used, retain)) int sptm_virt_ans_coldpath(u64 flags)
+{
+    return nvme_coldpath_handoff(flags);
+}
+
 /* What the host decides the ANS handoff from (nvme_cold_state()): bit 0 on, bit 1 SART entries. */
 __attribute__((used, retain)) int sptm_virt_ans_state(void)
 {

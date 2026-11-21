@@ -13,6 +13,10 @@
 #include "string.h"
 #include "utils.h"
 #include "xnuboot.h"
+#ifdef SPTM_VIRT
+#include "sptm_virt.h"
+#include "sptm_virt_priv.h"
+#endif
 
 #define NVME_TIMEOUT 1000000
 /*
@@ -1606,6 +1610,229 @@ out_sart:
     if (rtk)
         rtkit_free(rtk);
     asc_free(asc);
+    return ret;
+}
+
+/* The power words of ANS and the APCIe gates it shares, for the log (die 0, as on T8132). */
+static void nvme_coldpath_log_pmgr(const char *when)
+{
+    static const char *const names[] = {"ANS",          "APCIE_ST", "APCIE_SYS_ST",
+                                        "APCIE_PHY_SW", "APCIE_GP", "APCIE_SYS_GP"};
+
+    printf("nvme: coldpath: PMGR %s:", when);
+    for (size_t i = 0; i < ARRAY_SIZE(names); i++) {
+        uintptr_t a = pmgr_psreg_by_name(0, names[i]);
+        if (a)
+            printf(" %s 0x%08x", names[i], read32(a));
+    }
+    printf("\n");
+}
+
+/*
+ * Where an aura stage's ANS buffer may stay in use after this image hands over: above everything
+ * the boot data keeps (top_of_kernel_data: this image, its firmware block, iBoot's boot data and
+ * the ADT) and below SPTM's managed window, so neither aura nor XNU will ever allocate it. That is
+ * where Stage 1's dead heap lies once this image replaced Stage 1 in place.
+ */
+static bool nvme_coldpath_unowned(u64 pa, u64 size, const struct sptm_virt_layout *l)
+{
+    u64 end = pa + size;
+
+    return end > pa && pa >= cur_boot_args.top_of_kernel_data && end <= l->managed_base &&
+           !(pa < (u64)_end && (u64)_base < end) && !(pa < l->aura_top && l->aura_base < end);
+}
+
+/* Delete the I/O queues, then the controller's normal shutdown and disable (nvme_shutdown()). */
+static bool nvme_coldpath_stop_controller(void)
+{
+    struct nvme_command cmd;
+
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.opcode = NVME_ADMIN_CMD_DELETE_SQ;
+    cmd.cdw10 = 1;
+    if (!nvme_exec_command(&adminq, &cmd, NULL)) {
+        printf("nvme: coldpath: delete sq command failed\n");
+        return false;
+    }
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.opcode = NVME_ADMIN_CMD_DELETE_CQ;
+    cmd.cdw10 = 1;
+    if (!nvme_exec_command(&adminq, &cmd, NULL)) {
+        printf("nvme: coldpath: delete cq command failed\n");
+        return false;
+    }
+    if (!nvme_ctrl_shutdown())
+        printf("nvme: coldpath: controller shutdown timed out\n");
+    if (!nvme_ctrl_disable()) {
+        printf("nvme: coldpath: controller disable timed out\n");
+        return false;
+    }
+    write64_lo_hi(nvme_qreg(NVME_IOQ_CMDS), 0);
+    write64_lo_hi(nvme_qreg(NVME_IOQ_CQES), 0);
+    return true;
+}
+
+/*
+ * The cold path's ANS handoff to XNU, for a post-M4 ANS that an earlier stage idled and powered
+ * off (Stage 1 1.0.0b13 on T8132, once it has read the ESP; nvme_ans_power_off()).
+ *
+ * The firmware resumes from that IDLE with the stage's own RTKit buffers. Started by XNU as a
+ * first boot (nvme_cold_handoff(), "quiesced" dropped), it asks XNU for no buffer, acknowledges
+ * its IOP power but never XNU's AP power, and XNU panics 20 s later ("ANS2 NMI: No response to AP
+ * power notification", hv11/hv22/hv23 on the M4 mini): its syslog would go to buffers whose SART
+ * entries that handoff had cleared. aura's own warm start from the same state works (l01).
+ *
+ * So start it as every aura stage does from off (nvme_init(): power, all SART entries back, the
+ * warm start, the queues), then end the session in a state XNU takes over:
+ *  - QUIESCED (the default): controller off and RTKit quiesced, its CPU running, the state iBoot
+ *    hands on (XNU woke iBoot's session to the desktop, hv21) and the one Stage 1's proxy left a
+ *    T6050 ANS in for XNU (sptm_virt_esp_ans_handoff()). XNU wakes it; the host keeps "quiesced"
+ *    in the guest's tree. The stage's SART entries stay unless NVME_COLDPATH_CLEAR, so a firmware
+ *    that goes on with those buffers still reaches them; they must then lie where nothing will
+ *    allocate (nvme_coldpath_unowned()).
+ *  - STOPPED: the controller shut down and off, RTKit SLEEP (the end of a session, after which
+ *    the next start is a first boot, as nvme_ans_sleep_and_reset() leaves an M1-M3 ANS), its CPU
+ *    stopped, the stage's entries cleared, ANS reset. XNU starts it cold; the host drops
+ *    "quiesced".
+ * NVME_COLDPATH_AUTO: as the last write, give APCIE_SYS_ST, APCIE_PHY_SW and APCIE_SYS_GP back
+ * the hardware auto-enable iBoot leaves on them (aura's power-on clears it).
+ *
+ * Returns 0 when ready; -1 refused before any write, -2 no SART entries to restore, -4 ANS didn't
+ * start, -5 the RTKit or controller step failed (ANS left as it is: no XNU).
+ */
+int nvme_coldpath_handoff(u32 flags)
+{
+    int nub = adt_path_offset(adt, "/arm-io/ans/iop-ans-nub");
+    struct sptm_virt_layout l;
+    bool stopped = flags & NVME_COLDPATH_STOPPED;
+    bool clear = stopped || (flags & NVME_COLDPATH_CLEAR);
+    int ret = -5;
+
+    printf("nvme: coldpath: %s%s%s\n", stopped ? "STOPPED" : "QUIESCED",
+           clear ? ", the stage's SART entries cleared" : ", the stage's SART entries kept",
+           (flags & NVME_COLDPATH_AUTO) ? ", AUTO" : "");
+    if (nub < 0 || !nvme_post_m4() || nvme_initialized || nvme_reboot_required) {
+        printf("nvme: coldpath: refused: not a post-M4 ANS this stage can start\n");
+        return -1;
+    }
+    int node = adt_path_offset(adt, "/arm-io/ans"), die = 0;
+    u32 cg;
+    if (node >= 0 && ADT_GETPROP(adt, node, "clock-gates", &cg) >= 0)
+        die = FIELD_GET(PMGR_DIE_ID, cg);
+    if (!nvme_cold_ans_off(die)) {
+        printf("nvme: coldpath: refused: ANS is on (this path is for an ANS a stage powered off)\n");
+        return -1;
+    }
+    if (!nvme_sart_saved_cnt) {
+        printf("nvme: coldpath: refused: no SART entries were passed on (nvme.sart=)\n");
+        return -2;
+    }
+    if (sptm_virt_layout(&l) < 0) {
+        printf("nvme: coldpath: refused: no SPTM-virt layout\n");
+        return -1;
+    }
+    /* The resumed firmware writes the stage's buffers from the warm start on. */
+    for (int i = 0; i < nvme_sart_saved_cnt; i++) {
+        const struct sart_entry *e = &nvme_sart_saved[i];
+        if (!nvme_aura_memory(nub, e->paddr, e->size))
+            continue;
+        bool unowned = nvme_coldpath_unowned(e->paddr, e->size, &l);
+        printf("nvme: coldpath: SART entry %u 0x%lx+0x%lx is an aura stage's (%s)\n", e->index,
+               e->paddr, e->size,
+               unowned ? "in memory nobody owns now" : "in memory aura or XNU may use");
+        if ((e->paddr < (u64)_end && (u64)_base < e->paddr + e->size) ||
+            (e->paddr < l.aura_top && l.aura_base < e->paddr + e->size) || (!clear && !unowned)) {
+            printf("nvme: coldpath: refused: the firmware would write that buffer\n");
+            return -1;
+        }
+    }
+    nvme_coldpath_log_pmgr("before");
+
+    /* Power, the SART back, the warm start (one retry), the queues: as every stage from off. */
+    if (!nvme_init()) {
+        printf("nvme: coldpath: ANS didn't start from off\n");
+        nvme_coldpath_log_pmgr("after the failed start");
+        return -4;
+    }
+    /* aura powered the APCIe controller back on for ANS: port 1 now needs the HV's ghost. */
+    nvme_cold_powered_on = true;
+    nvme_coldpath_log_pmgr("after the start");
+    printf("nvme: coldpath: ANS started from off: CC 0x%x CSTS 0x%x BOOT_STATUS 0x%x\n",
+           read32(nvme_base + NVME_CC), read32(nvme_base + NVME_CSTS),
+           read32(nvme_base + NVME_BOOT_STATUS));
+
+    if (!stopped) {
+        nvme_quiesce_for_next = true;
+        bool ok = nvme_shutdown();
+        nvme_quiesce_for_next = false;
+        if (!ok) {
+            printf("nvme: coldpath: the quiesce failed\n");
+            return -5;
+        }
+    } else {
+        if (!nvme_coldpath_stop_controller()) {
+            nvme_reboot_required = true;
+            return -5;
+        }
+        if (!rtkit_sleep(nvme_rtkit)) {
+            printf("nvme: coldpath: ANS didn't acknowledge SLEEP; stopping it\n");
+            rtkit_stop(nvme_rtkit);
+            nvme_reboot_required = true;
+            return -5;
+        }
+        printf("nvme: coldpath: ANS acknowledged SLEEP\n");
+        u64 timeout = timeout_calculate(100000);
+        while (!asc_cpu_idle(nvme_asc) && !timeout_expired(timeout))
+            ;
+        printf("nvme: coldpath: CPU %s, status 0x%x\n", asc_cpu_idle(nvme_asc) ? "idle" : "NOT idle",
+               asc_cpu_status(nvme_asc));
+        if (rtkit_has_owned_buffers(nvme_rtkit))
+            printf("nvme: coldpath: the warm start asked for buffers: freed with their entries\n");
+        rtkit_free(nvme_rtkit);
+        nvme_rtkit = NULL;
+        nvme_initialized = false;
+    }
+
+    /* The stage's (and any of this image's) entries, unless kept for a resumed firmware. */
+    u64 pa[NVME_SART_ENTRIES] = {0};
+    size_t sz[NVME_SART_ENTRIES] = {0};
+    for (int i = 0; nvme_sart && i < NVME_SART_ENTRIES; i++) {
+        if (!sart_get_allowed(nvme_sart, i, &pa[i], &sz[i]))
+            continue;
+        bool aura = nvme_aura_memory(nub, pa[i], sz[i]);
+        printf("nvme: coldpath: SART entry %d 0x%lx+0x%lx %s\n", i, pa[i], sz[i],
+               !aura ? "kept (iBoot's)" : clear ? "is an aura stage's: cleared"
+                                                : "is an aura stage's: kept");
+        if (aura && clear) {
+            sart_clear_entry(nvme_sart, i);
+            sz[i] = 0;
+        }
+    }
+    if (stopped && nvme_cold_reset(die, nvme_asc, nvme_sart, pa, sz)) {
+        printf("nvme: coldpath: ANS didn't reset\n");
+        goto out;
+    }
+    if (flags & NVME_COLDPATH_AUTO) {
+        static const char *const autos[] = {"APCIE_SYS_ST", "APCIE_PHY_SW", "APCIE_SYS_GP"};
+        for (size_t i = 0; i < ARRAY_SIZE(autos); i++)
+            if (pmgr_power_steps(0, autos[i], true))
+                printf("nvme: coldpath: %s: auto-enable not set\n", autos[i]);
+    }
+    nvme_coldpath_log_pmgr("at the handoff");
+    printf("nvme: coldpath: ANS %s for XNU: CC 0x%x CSTS 0x%x, CPU status 0x%x\n",
+           stopped ? "STOPPED (SLEEP, reset)" : "QUIESCED (controller off, CPU running)",
+           read32(nvme_base + NVME_CC), read32(nvme_base + NVME_CSTS), asc_cpu_status(nvme_asc));
+    ret = 0;
+out:
+    if (stopped) {
+        if (nvme_sart)
+            sart_release(nvme_sart);
+        nvme_sart = NULL;
+        asc_free(nvme_asc);
+        nvme_asc = NULL;
+        free_queue(&ioq);
+        free_queue(&adminq);
+    }
     return ret;
 }
 #endif /* SPTM_VIRT */
