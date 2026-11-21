@@ -48,6 +48,9 @@ Environment (all optional; 1 enables a switch):
   AURA_GPU_TRACE           hook the GPU (sgx reg 0) and PMP registers, record every access
   AURA_GPU_STOP_SECS=<n>   park in the proxy n s after the first GPU access (read the ring)
   AURA_GPU_STOP_MSG=<v>    park right after the guest writes v to the GPU (a mailbox message)
+  AURA_GPU_STOP_MSG_MASK=<m> compare only the bits in m (e.g. 0xffff000000000000 with
+                           AURA_GPU_STOP_MSG=0x0081000000000000: the first InitData doorbell)
+  AURA_GPU_STOP_EP=<ep>    and only a mailbox message to endpoint ep (e.g. 0x20)
   AURA_GPU_PRINT_MAX=<n>   print at most n GPU accesses on aura's console (default 20000)
   AURA_SAMPLE              sample the guest's PC until each core's XNU entry (pre-XNU hangs)
   AURA_SAMPLE_HZ=<n>       samples per second (default 4)
@@ -150,6 +153,8 @@ KNOWN_ENV = {
     "AURA_GPU_STOP_SECS",
     "AURA_GPU_STOP_BOOT_SECS",
     "AURA_GPU_STOP_MSG",
+    "AURA_GPU_STOP_MSG_MASK",
+    "AURA_GPU_STOP_EP",
     "AURA_GPU_PRINT_MAX",
     "AURA_SAMPLE_HZ",
     "AURA_SAMPLE_MAX",
@@ -316,6 +321,42 @@ XNU_QUIRKS = (
                     0x1400000f),
                    ("task PAC key reprogramming (4)", "BootKC-rx", 0x31708c4, 0x540001e0,
                     0x1400000f))),
+    # T8132's xnu-13432.41.4 (kernelcache.release.mac16g, the J713's and the J773g's), in macOS 27.2
+    # (26B123) and 27.2.1 (26B131). 26B131's differs from 26B123's only in the code of a few file
+    # system kexts (nfs to webdav, __TEXT_EXEC +0x3068000 to +0x3132000): every site below, the
+    # 0x200 bytes around it, and the rorgn globals are the same in both, so one entry serves both.
+    # Every site of the T8142 entry above, ported from 26B131's mac17g. The rorgn read,
+    # the trust-cache result and the NVRAM write match their 48-instruction windows exactly once,
+    # as above. T8132's structs are smaller and it has no MTE, so the mix-and-match question (48)
+    # and the PAC-key guards (24, the twins paired in order) match only with the struct offsets
+    # masked as well (ldr/str and ldp/stp immediates, add/sub imm12). The RO-zone branch, whose
+    # source here is not tag-stripped, is the b.ls between the two panics of zalloc_ro_mut (lines
+    # 6847 and 6730), with the same 21-instruction skip. The replacements are the T8142 words:
+    # every branch distance is unchanged. The rorgn globals come from the function's own adrp/str
+    # pairs. Nothing is hidden: with the read-only region in place the AppleConvergedPCI panic
+    # doesn't come back (AURA_KEEP_WIFI's finding), WindowServer needs a network port, and a
+    # Mac mini's only link to the host is its PCIe Ethernet.
+    dict(release=b"xnu-13432.41.4~", fingerprint=("__TEXT_EXEC", 0x3acaa78, 0x540002a9),
+         hide=(),
+         ro_relax=(("zalloc_ro_mut RO-zone check", "BootKC-rx", 0x3acaa78, 0x540002a9,
+                    0x14000015),),
+         rorgn=(("rorgn register read", "BootKC-rx", 0x331ade8, 0x370001a8, 0x1400000d),),
+         rorgn_globals=(0xedc020, 0xedc028),
+         nvram_mutable=(("Image4 storageInit mix-and-match question", "BootKC-rx",
+                         0x2bbaed4, 0x34000080, 0x14000022),),
+         tc_force=(("trust-cache load result", "BootKC-rx",
+                    0x378c1c8, 0x340000e0, 0x14000007),),
+         nvram_ro=(("AppleARMNORNVRAM::write", "BootKC-rx", 0x1ab73c, 0xaa0003e8, 0x52800000),
+                   ("AppleARMNORNVRAM::write return", "BootKC-rx", 0x1ab740, 0x52805840,
+                    0xd65f03c0)),
+         pac_keys=(("task PAC key reprogramming (switch)", "BootKC-rx", 0x3138284, 0x540001e0,
+                    0x1400000f),
+                   ("task PAC key reprogramming (2)", "BootKC-rx", 0x3138334, 0x540001e0,
+                    0x1400000f),
+                   ("task PAC key reprogramming (3)", "BootKC-rx", 0x3138520, 0x540001e0,
+                    0x1400000f),
+                   ("task PAC key reprogramming (4)", "BootKC-rx", 0x313877c, 0x540001e0,
+                    0x1400000f))),
 )
 
 
@@ -400,6 +441,40 @@ class Symbols:
 
     def __getitem__(self, name):
         return self.run_base + (self.syms[name] - self.link_base)
+
+
+# Functions whose code the running image must share with --elf before the first call into it.
+IMAGE_CHECK_FUNCS = ("sptm_virt_place", "sptm_virt_config", "sptm_virt_load")
+IMAGE_CHECK_BYTES = 64
+
+
+def elf_load_bytes(elf, vaddr, size):
+    """size bytes at vaddr in the ELF's PT_LOAD segments (as linked, before relocation)."""
+    data = pathlib.Path(elf).read_bytes()
+    phoff, = struct.unpack_from("<Q", data, 0x20)
+    phentsize, phnum = struct.unpack_from("<HH", data, 0x36)
+    for i in range(phnum):
+        p_type, _flags, off, va, _pa, filesz, _memsz, _align = struct.unpack_from(
+            "<IIQQQQQQ", data, phoff + i * phentsize)
+        if p_type == 1 and va <= vaddr and vaddr + size <= va + filesz:
+            return data[off + vaddr - va:off + vaddr - va + size]
+    return None
+
+
+def check_running_image(iface, sym, elf):
+    """Refuse a proxy that isn't running the image in --elf. A host that chainloaded an image
+    and then reached another proxy (the image reset the SoC and an earlier stage came back) would
+    otherwise call that stage at this image's offsets. Code is position-independent, so the
+    running bytes equal the ELF's. Nothing is called or written before this passes."""
+    for name in IMAGE_CHECK_FUNCS:
+        want = elf_load_bytes(elf, sym.syms[name], IMAGE_CHECK_BYTES)
+        if want is None:
+            raise SystemExit(f"{name} isn't in a loadable segment of {elf}")
+        got = iface.readmem(sym[name], IMAGE_CHECK_BYTES)
+        if got != want:
+            raise SystemExit(f"the proxy at base 0x{sym.run_base:x} isn't running {elf}: the code "
+                             f"at {name} differs. Stopping before any call into it.")
+    print(f"running image matches {elf} at base 0x{sym.run_base:x}")
 
 
 def ans_drop_props():
@@ -731,6 +806,10 @@ def configure(p, sym, plan, adt, ctl_cookie=0):
         p.write32(sym["sptm_virt_gpu_stop_boot_secs"], env_int("AURA_GPU_STOP_BOOT_SECS"))
     if os.environ.get("AURA_GPU_STOP_MSG"):
         p.write64(sym["sptm_virt_gpu_stop_msg"], env_int("AURA_GPU_STOP_MSG"))
+    if os.environ.get("AURA_GPU_STOP_MSG_MASK"):
+        p.write64(sym["sptm_virt_gpu_stop_msg_mask"], env_int("AURA_GPU_STOP_MSG_MASK"))
+    if os.environ.get("AURA_GPU_STOP_EP"):
+        p.write32(sym["sptm_virt_gpu_stop_ep"], env_int("AURA_GPU_STOP_EP") + 1)
     if os.environ.get("AURA_GPU_PRINT_MAX"):
         p.write32(sym["sptm_virt_gpu_print_max"], env_int("AURA_GPU_PRINT_MAX"))
     if env_on("AURA_S2R_DCP_PKT"):
@@ -840,8 +919,10 @@ def main():
     iface = UartInterface()
     p = AuraProxy(iface, debug=False)
     bootstrap_port(iface, p)
-    u = ProxyUtils(p, heap_size=128 * 1024 * 1024, aura_heap=aura_heap_size)
+    # Before anything else talks to it (ProxyUtils sets the proxy's heap up): is this the image?
     sym = Symbols(args.nm, args.elf, p.get_base())
+    check_running_image(iface, sym, args.elf)
+    u = ProxyUtils(p, heap_size=128 * 1024 * 1024, aura_heap=aura_heap_size)
 
     # SPTM's managed window, as aura computed it: above aura and everything iBoot left low,
     # below aura's carve-out.

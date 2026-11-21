@@ -43,6 +43,11 @@ u32 sptm_virt_gpu_stop_secs;      /* park this long after the first GPU access; 
 u32 sptm_virt_gpu_stop_boot_secs; /* park this long after the guest's entry, GPU or not; 0 = never
                                    */
 u64 sptm_virt_gpu_stop_msg; /* park after a write of this value (a mailbox message); 0 = never */
+/* With stop_msg: compare only these bits of the written value (0 = all of them), and on a 128-bit
+ * mailbox write only a message to endpoint stop_ep - 1 (the second word; 0 = any endpoint). An
+ * InitData doorbell carries an address the host cannot know before the boot. */
+u64 sptm_virt_gpu_stop_msg_mask;
+u32 sptm_virt_gpu_stop_ep;
 u32 sptm_virt_gpu_print_max = 20000;
 
 static struct {
@@ -150,6 +155,29 @@ void sptm_virt_gpu_deadline(struct exc_info *ctx)
     gpu_park(ctx, "the deadline the host asked for");
 }
 
+/* The GPU's own ASCs (gfx-asc, gfx1-asc): an endpoint's message is a mailbox write to one of them.
+ */
+static struct {
+    u64 pa, size;
+} gpu_asc[2];
+
+static bool gpu_stop_msg_hit(u64 addr, const u64 *pair, u64 v, int width)
+{
+    u64 mask = sptm_virt_gpu_stop_msg_mask ? sptm_virt_gpu_stop_msg_mask : ~0UL;
+
+    if ((v & mask) != sptm_virt_gpu_stop_msg)
+        return false;
+    if (!sptm_virt_gpu_stop_ep)
+        return true;
+    if (width != 4 || !pair || (pair[1] & 0xff) != sptm_virt_gpu_stop_ep - 1)
+        return false;
+    /* Not the PMP's ASC, also hooked: only a message to the GPU firmware parks. */
+    for (unsigned i = 0; i < ARRAY_SIZE(gpu_asc); i++)
+        if (gpu_asc[i].size && addr >= gpu_asc[i].pa && addr < gpu_asc[i].pa + gpu_asc[i].size)
+            return true;
+    return false;
+}
+
 static bool gpu_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int width)
 {
     u64 now = mrs(CNTPCT_EL0);
@@ -203,7 +231,8 @@ static bool gpu_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int w
         gpu_park(ctx, "the deadline the host asked for");
     /* A message the host names is a repeatable park point; the seconds are not (the guest's own
      * timing varies from boot to boot by more than the whole bring-up lasts). */
-    if (sptm_virt_gpu_stop_msg && write && (width == 4 ? val[0] : *val) == sptm_virt_gpu_stop_msg)
+    if (sptm_virt_gpu_stop_msg && write &&
+        gpu_stop_msg_hit(addr, width == 4 ? val : NULL, *val, width))
         gpu_park(ctx, "the write the host asked for");
     else if (gpu_stop_t && now >= gpu_stop_t)
         gpu_park(ctx, "the time the host asked for");
@@ -237,6 +266,10 @@ static void gpu_hook_adt(const char *path, int idx, const char *what, u64 off, u
     }
     if (!strcmp(what, "sgx"))
         gpu_sgx = pa;
+    if (!strcmp(what, "gfx-asc") || !strcmp(what, "gfx1-asc")) {
+        gpu_asc[what[3] == '1'].pa = pa;
+        gpu_asc[what[3] == '1'].size = sz;
+    }
     gpu_hook_range(what, pa + off, size ? size : sz);
 }
 
@@ -271,7 +304,8 @@ void sptm_virt_gpu_setup(void)
     gpu_hook_adt("/arm-io/mcc", 9, "pmp-ptd-upd", 0, 0);
     gpu_hook_adt("/arm-io/pmp", 0, "pmp-asc", 0, 0);
     printf("SPTM-virt[gpu]: ring 0x%lx (%lu records, head at 0x%lx), stop after %u s or a write of "
-           "0x%lx, print budget %u\n",
+           "0x%lx (mask 0x%lx, endpoint %d), print budget %u\n",
            (u64)sptm_virt_gpu_ring, sptm_virt_gpu_nrec, (u64)&sptm_virt_gpu_head,
-           sptm_virt_gpu_stop_secs, sptm_virt_gpu_stop_msg, sptm_virt_gpu_print_max);
+           sptm_virt_gpu_stop_secs, sptm_virt_gpu_stop_msg, sptm_virt_gpu_stop_msg_mask,
+           (int)sptm_virt_gpu_stop_ep - 1, sptm_virt_gpu_print_max);
 }
