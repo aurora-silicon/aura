@@ -56,6 +56,7 @@ typedef uint8_t u8;
 #define ALIGN_UP(x, a) (((x) + (a) - 1) & ~((u64)(a) - 1))
 #define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
 #define bail(...) do { printf(__VA_ARGS__); return -1; } while (0)
+static int dt_device_dart_va_bits(int fdt_node, int adt_node, u32 *bits) { (void)fdt_node; (void)adt_node; (void)bits; return -1; }
 enum fw_version { V12_3, V12_3_1, V12_4, V13_5B4, V13_5, V13_6_1, V14_7, V26_5, V26_6, V26_6_2,
                   V27_0 };
 struct fw_version_info {

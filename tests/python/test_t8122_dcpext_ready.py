@@ -43,6 +43,7 @@ typedef uint32_t u32;
 #define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
 #define T8122_DCPEXT_READY "apple,t8122-dcpext-firmware-ready"
 #define bail(...) do { return -1; } while (0)
+static int dt_device_dart_va_bits(int fdt_node, int adt_node, u32 *bits) { (void)fdt_node; (void)adt_node; (void)bits; return -1; }
 static void *dt, *adt;
 static u32 chip_id = T8122;
 #define V26_6_2 2662
