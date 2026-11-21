@@ -20,7 +20,6 @@
  * cache and background work after a warm reboot; Linux allows every I/O command 30 s.
  */
 #define NVME_WRITE_TIMEOUT    30000000
-#define NVME_ENABLE_TIMEOUT   5000000
 #define NVME_SHUTDOWN_TIMEOUT 5000000
 #define NVME_SUSPEND_TIMEOUT  35000 /* macOS's, from its console */
 #define NVME_QUEUE_SIZE       64
@@ -30,6 +29,17 @@ static u32 nvme_cmd_timeout_us = NVME_TIMEOUT;
 /* NVMe Base Specification 2.0, 3.1.4.1: CAP.MPSMIN, the smallest host memory page size. */
 #define NVME_CAP        0x00
 #define NVME_CAP_MPSMIN GENMASK(51, 48)
+/*
+ * CAP.TO: the longest the controller may take to set CSTS.RDY after CC.EN goes from 0 to 1, in
+ * 500 ms units. Waiting less can give up on a controller that is still coming up: right after
+ * macOS had used it, a T8132 SSD booted its firmware but did not report ready within a fixed 5 s
+ * on four starts in a row. The wait is CAP.TO, never less than the fixed 5 s used before and
+ * never more than 60 s, so that a controller reporting a nonsensical value cannot hold the boot.
+ */
+#define NVME_CAP_TO             GENMASK(31, 24)
+#define NVME_CAP_TO_UNIT_US     500000
+#define NVME_ENABLE_TIMEOUT_MIN 5000000
+#define NVME_ENABLE_TIMEOUT_MAX 60000000
 
 #define NVME_CC 0x14
 /* 3.1.4.5: CC.MPS, host memory page size 2^(12 + MPS); PRP entries use it (4.1.1). */
@@ -283,13 +293,21 @@ static bool nvme_ctrl_disable(void)
 
 static bool nvme_ctrl_enable(void)
 {
-    u64 timeout = timeout_calculate(NVME_ENABLE_TIMEOUT);
+    u32 cap_to = FIELD_GET(NVME_CAP_TO, nvme_read64_lo_hi(nvme_base + NVME_CAP));
+    u32 wait_us =
+        min(max(cap_to * NVME_CAP_TO_UNIT_US, NVME_ENABLE_TIMEOUT_MIN), NVME_ENABLE_TIMEOUT_MAX);
+    u64 start = get_ticks();
+    u64 timeout = timeout_calculate(wait_us);
 
     mask32(nvme_base + NVME_CC, NVME_CC_SHN, NVME_CC_EN);
     while (!(read32(nvme_base + NVME_CSTS) & NVME_CSTS_RDY) && !timeout_expired(timeout))
         nvme_poll_syslog();
 
-    return read32(nvme_base + NVME_CSTS) & NVME_CSTS_RDY;
+    bool ready = read32(nvme_base + NVME_CSTS) & NVME_CSTS_RDY;
+    printf("nvme: CAP.TO %u (%u ms): CSTS.RDY %s after %lu ms (wait up to %u ms)\n", cap_to,
+           cap_to * (NVME_CAP_TO_UNIT_US / 1000), ready ? "set" : "not set",
+           ticks_to_usecs(get_ticks() - start) / 1000, wait_us / 1000);
+    return ready;
 }
 
 static bool nvme_ctrl_shutdown(void)
