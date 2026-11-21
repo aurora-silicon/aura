@@ -436,8 +436,9 @@ def test_t6041_gpu_fill(tmp_path):
     opps = t6040[t6040.index("#define T6040_OPPS"):].split("\n", 1)[0] + "\n"
     regions = t6040[t6040.index("static const struct {\n    const char *name;"):]
     regions = regions[:regions.index("};\n") + 3]
-    fw = source[source.index("struct t604x_gpu_fw {"):]
-    fw = fw[:fw.index("\n}\n", fw.index("static int t604x_gpu_fw_segments(")) + 3]
+    header = (ROOT / "src/kboot.h").read_text()
+    fw = header[header.index("struct gpu_fw_layout {"):]
+    fw = fw[:fw.index("};\n") + 3] + function(source, "int gpu_fw_layout(")
     clusters = next(line for line in source.splitlines()
                     if line.startswith("#define T6041_CLUSTERS ")) + "\n"
     t6041 = clusters + function(source, "static int dt_set_gpu_t6041(")
