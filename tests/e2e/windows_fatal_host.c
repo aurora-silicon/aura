@@ -138,6 +138,14 @@ bool hv_fatal_apl_err_read(unsigned int which, const char **name, u64 *val)
     return which != 3;
 }
 
+/* hv_fatal_apl.c, G6 r6: the carve-out decoder (replayed by test_t8152_el2_carveouts.py). */
+int stub_adr_reports;
+void hv_fatal_apl_report_adr(u64 adr)
+{
+    stub_adr_reports++;
+    printf("HV: fatal: L2C_ERR_ADR decoder stub (0x%lx)\n", adr);
+}
+
 /* ---- harness --------------------------------------------------------------------------- */
 
 static int failures;

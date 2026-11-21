@@ -409,19 +409,30 @@ static void report_cpu(int cpu, int self, u64 now, u64 freq)
  */
 static void report_apple_errors(void)
 {
+    u64 adr = 0;
+    bool adr_ok = false;
+
     printf("HV: fatal: Apple error registers (read only, guarded):");
     for (unsigned int i = 0; i < HV_FATAL_APL_REGS; i++) {
         const char *name = "?";
         u64 val = 0;
-        if (hv_fatal_apl_err_read(i, &name, &val))
+        bool ok = hv_fatal_apl_err_read(i, &name, &val);
+        if (ok)
             printf(" %s 0x%lx", name, val);
         else
             printf(" %s UNDEF", name);
         if (i == 0 && (val & (BIT(1) | BIT(7))))
             printf(" (%s%s)", (val & BIT(7)) ? "access fault" : "",
                    (val & BIT(1)) ? ((val & BIT(7)) ? ", recursive" : "recursive") : "");
+        if (i == 1) {
+            adr = val;
+            adr_ok = ok;
+        }
     }
     printf("\n");
+    /* G6 r6: which carve-out the latched address is in (hv_fatal_apl.c). */
+    if (adr_ok && adr)
+        hv_fatal_apl_report_adr(adr);
 }
 
 void hv_windows_fatal_report(u64 *regs, const char *what, u64 par, const char *par_when)

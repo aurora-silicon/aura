@@ -552,6 +552,11 @@ def test_r5_apple_error_registers_come_last_read_only(replay):
            "FED_ERR_STS 0x0 MMU_ERR_STS 0x0\n" in text
     assert text.index("guest EL1 ELR_EL12") < text.index("Apple error registers") < \
         text.index("the host decides what follows")
+    # G6 r6: a nonzero L2C_ERR_ADR that read is handed to the carve-out decoder once, after the
+    # register line; a report whose ADR read zero never calls it.
+    assert "MMU_ERR_STS 0x0\nHV: fatal: L2C_ERR_ADR decoder stub (0x10012345678)\n" in text
+    assert text.count("L2C_ERR_ADR decoder stub") == 1
+    assert "L2C_ERR_ADR decoder stub" not in report(replay, "report_d3")
     d3 = report(replay, "report_d3")
     assert d3.index("Apple error registers") < d3.index("not contained")
     assert d3.rstrip().endswith("not contained: the carrier does not resume after this "

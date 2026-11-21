@@ -237,4 +237,10 @@ const char *hv_fatal_exit_device_free(u64 esr);
 #define HV_FATAL_APL_REGS 6
 bool hv_fatal_apl_err_read(unsigned int which, const char **name, u64 *val);
 
+/*
+ * hv_fatal_apl.c (carrier only), G6 r6: one line naming the ADT carve-out that holds
+ * L2C_ERR_ADR's address (bits 41:0), or saying that none does.  Reads ADT memory only.
+ */
+void hv_fatal_apl_report_adr(u64 adr);
+
 #endif

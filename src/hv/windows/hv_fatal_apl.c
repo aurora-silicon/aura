@@ -15,9 +15,13 @@
 
 #include "hv_fatal.h"
 
+#include "../../adt.h"
 #include "../../cpu_regs.h"
 #include "../../exception.h"
+#include "../../mcc.h"
 #include "../../utils.h"
+
+#include "string.h"
 
 static void guard_on(void)
 {
@@ -86,4 +90,53 @@ bool hv_fatal_apl_err_read(unsigned int which, const char **name, u64 *val)
         return false;
     *val = v;
     return true;
+}
+
+/*
+ * G6 r6: where L2C_ERR_ADR points.  Its address field is taken as bits 41:0.  That is an
+ * inference, not a documented layout: T8152 DRAM lies below 2^42, the register's upper bits
+ * were set in a G6 run, and its low 42 bits named a line inside an ADT carve-out.
+ * The smallest /chosen/carveout-memory-map entry that holds the address is named; the
+ * usable-RAM entry holds all of normal RAM, so an address there is named by it.  Whether the
+ * address lies in a carve-out mcc_unmap_carveouts() took out of aura's EL2 map (mcc_carveouts[],
+ * region-id-4 and region-id-2 on T8152) is said too.  Only ADT memory and that table are read
+ * (no device, no system register), so this is safe inside the fatal report.
+ */
+void hv_fatal_apl_report_adr(u64 adr)
+{
+    u64 pa = adr & GENMASK(41, 0);
+    int node = adt_path_offset(adt, "/chosen/carveout-memory-map");
+
+    printf("HV: fatal: L2C_ERR_ADR bits 41:0 (taken as the physical address): 0x%lx", pa);
+    if (node < 0) {
+        printf(", carve-out map missing\n");
+        return;
+    }
+
+    const char *best = NULL;
+    u64 best_start = 0, best_size = 0;
+    ADT_FOREACH_PROPERTY(adt, node, prop)
+    {
+        u64 r[2];
+        if (prop->size != sizeof(r))
+            continue;
+        memcpy(r, prop->value, sizeof(r));
+        if (!r[1] || pa < r[0] || pa - r[0] >= r[1])
+            continue;
+        if (!best || r[1] < best_size) {
+            best = prop->name;
+            best_start = r[0];
+            best_size = r[1];
+        }
+    }
+    bool unmapped = false;
+    for (size_t i = 0; i < mcc_carveout_count; i++)
+        if (mcc_carveouts[i].size && pa >= mcc_carveouts[i].base &&
+            pa - mcc_carveouts[i].base < mcc_carveouts[i].size)
+            unmapped = true;
+    if (!best)
+        printf(", in no carve-out%s\n", unmapped ? " (EL2-unmapped by mcc)" : "");
+    else
+        printf(", in carve-out %s [0x%lx, 0x%lx) at +0x%lx%s\n", best, best_start,
+               best_start + best_size, pa - best_start, unmapped ? " (EL2-unmapped by mcc)" : "");
 }
