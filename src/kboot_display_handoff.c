@@ -318,6 +318,16 @@ static const struct dcp_soc dcp_soc_t6030 = {
  */
 static const char *const dcp_boards_t8122[] = {"apple,j613", "apple,j615", NULL};
 
+/*
+ * T8122 (M3 MacBook Air J613/J615) DCP images by OS. The 14.7 native image stays pinned; 27.2
+ * generalises J613/J615 off the 25G83-only special profile below and onto this profile with
+ * the 27.2 image UUID. The exact-UUID and segment validation are kept for both builds.
+ */
+static const struct dcp_fw dcp_fws_t8122[] = {
+    {.os_fw = V14_7, .os_fw_name = "14.7", .uuid = DCP8_UUID},
+    {.os_fw = V27_2, .os_fw_name = "27.2", .uuid = "93FA4B31-BB97-3B2A-8673-49EA489EE9C1"},
+};
+
 static const struct dcp_soc dcp_soc_t8122 = {
     .name = "T8122",
     .chip = T8122,
@@ -336,9 +346,10 @@ static const struct dcp_soc dcp_soc_t8122 = {
     .oslog_always = true,
     .describe = true,
     .adt_psreg = true,
+    /* Only read when no build matches (the dry-run/lock decision), as before the build rows. */
     .uuid = DCP8_UUID,
-    .os_fw = V14_7,
-    .os_fw_name = "14.7",
+    .fws = dcp_fws_t8122,
+    .nfws = ARRAY_SIZE(dcp_fws_t8122),
     .pmgr_disp_cpu = 0x2d0710000UL,
 };
 
