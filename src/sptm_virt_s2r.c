@@ -839,8 +839,7 @@ bool sptm_virt_s2r_wfi(u64 *regs, u64 esr)
     if (cpu != s2r_timer_cpu) {
         __atomic_or_fetch(&s2r_parked_mask, BIT(cpu), __ATOMIC_SEQ_CST);
         printf("SPTM-virt[s2r]: cpu%d parked at its last WFI (stop mode)\n", cpu);
-        while (1)
-            sysop("wfe");
+        sptm_virt_park_forever();
     }
     printf("SPTM-virt[s2r]: macOS reached its final WFI on the S2R-timer core cpu%d; parked 0x%x; "
            "%lu records. Stopping in the proxy (stop mode).\n",
@@ -848,7 +847,8 @@ bool sptm_virt_s2r_wfi(u64 *regs, u64 esr)
     /* whole classes, newest first: the proxy read-out fails with ten cores */
     sptm_virt_s2r_dump_prio(6000, 60000);
     struct uartproxy_msg_start start = {
-        .reason = START_HV, .code = 0x53325221, /* 'S2R!' */
+        .reason = START_HV,
+        .code = 0x53325221, /* 'S2R!' */
     };
     sptm_virt_park_others();
     uartproxy_run(&start);
@@ -900,10 +900,7 @@ static void s2r_cpustart_watch(struct exc_info *ctx, u64 addr, u64 val)
         .code = 0x534d5021, /* 'SMP!' */
         .info = ctx,
     };
-    sptm_virt_park_others();
-    uartproxy_run(&start);
-    while (1)
-        sysop("wfe");
+    sptm_virt_park_oneway(&start);
 }
 
 static bool s2r_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int width)
@@ -933,10 +930,12 @@ static bool s2r_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int w
         }
         if (width == 4) {
             s2r_rw128(addr, val, write);
+            sptm_virt_gfxrec_tap(addr, val, write, width);
             sptm_virt_s2r_note(ctx, addr, val[0], write, 3);
             sptm_virt_s2r_note(ctx, addr + 8, val[1], write, 3);
         } else if (width >= 0 && width <= 3) {
             sptm_virt_mmio_rw(addr, val, write, width);
+            sptm_virt_gfxrec_tap(addr, val, write, width);
             /* XNU polls the cores' counters there all the time; their writes still go in. */
             bool first;
             if (write || strcmp(s2r_page_name(addr & ~0x3fffUL, &first), "cpu-impl"))
@@ -1010,6 +1009,7 @@ static bool s2r_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int w
 
     if (width == 4) {
         s2r_rw128(addr, val, write);
+        sptm_virt_gfxrec_tap(addr, val, write, width);
         sptm_virt_s2r_note(ctx, addr, val[0], write, 3);
         sptm_virt_s2r_note(ctx, addr + 8, val[1], write, 3);
         return true;
@@ -1020,6 +1020,8 @@ static bool s2r_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int w
         return false;
     }
     sptm_virt_mmio_rw(addr, val, write, width);
+    /* The GPU/PMP record takes the GFX domain's PS writes from here (sptm_virt_gfxrec.c). */
+    sptm_virt_gfxrec_tap(addr, val, write, width);
     if (timer)
         s2r_crumb(0x30);
     sptm_virt_s2r_note(ctx, addr, *val, write, width);
@@ -1106,6 +1108,15 @@ static bool s2r_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int w
                   (!strcmp(what, "pmgr-cluster-ctl") && (*val & 0xf) == 0)))
         s2r_core_sleeps();
     return true;
+}
+
+/* Does this hook trap the guest's accesses to page (for the GPU/PMP record's PS words)? */
+bool sptm_virt_s2r_hooks_page(u64 page)
+{
+    for (u32 i = 0; i < sptm_virt_s2r_pages; i++)
+        if (s2r_pages[i].page == page)
+            return true;
+    return false;
 }
 
 static void s2r_hook_range(const char *what, u64 base, u64 size)

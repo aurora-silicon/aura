@@ -15,6 +15,11 @@ bool nvme_shutdown(void);
 int nvme_cold_handoff(bool idle, bool no_probe);
 /* bit 0: ANS is on; bit 1: an earlier stage passed its SART entries on (SPTM_VIRT) */
 int nvme_cold_state(void);
+/* nvme_coldpath_handoff() flags (SPTM_VIRT) */
+#define NVME_COLDPATH_STOPPED BIT(0) /* SLEEP, stop, reset: XNU starts it cold (else QUIESCED) */
+#define NVME_COLDPATH_CLEAR   BIT(1) /* QUIESCED: clear the earlier stage's SART entries too */
+#define NVME_COLDPATH_AUTO    BIT(2) /* last: iBoot's auto-enable on the APCIe storage/GP words */
+int nvme_coldpath_handoff(u32 flags);
 /* The cold handoff powered ANS and the APCIe controller back on (an earlier stage had them off). */
 extern bool nvme_cold_powered_on;
 /* Post-M4: how a stage that powered ANS off tells the next one to start it again. */

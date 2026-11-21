@@ -111,7 +111,9 @@ void sptm_virt_crumb(u8 stage);
 void sptm_virt_crumb_fault(void);
 extern volatile int sptm_virt_parking_cpu;
 void sptm_virt_park_others(void);
-void sptm_virt_park_check(void);
+/* exception.c: first and last in every handler (src/sptm_virt_park.c) */
+int sptm_virt_park_enter(void);
+void sptm_virt_park_exit(int token);
 
 /* nv2.c: the last step of every guest entry on a core. */
 void sptm_virt_cpu_arm(void);

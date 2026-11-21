@@ -345,6 +345,12 @@ __attribute__((used, retain)) int sptm_virt_ans_cold(u64 flags)
     return nvme_cold_handoff(flags & 1, flags & 2);
 }
 
+/* The cold path's ANS handoff (nvme_coldpath_handoff()): QUIESCED or STOPPED, from off. */
+__attribute__((used, retain)) int sptm_virt_ans_coldpath(u64 flags)
+{
+    return nvme_coldpath_handoff(flags);
+}
+
 /* What the host decides the ANS handoff from (nvme_cold_state()): bit 0 on, bit 1 SART entries. */
 __attribute__((used, retain)) int sptm_virt_ans_state(void)
 {
@@ -493,6 +499,7 @@ bool sptm_virt_sample_fiq(u64 *regs)
 void sptm_virt_cpu_arm(void)
 {
     int cpu = smp_id();
+    sptm_virt_park_arrive();
     sptm_virt_crumb(7);
     u32 ent = sptm_virt_cpu_entries[cpu]++;
 
@@ -532,35 +539,6 @@ void sptm_virt_cpu_arm(void)
 bool sptm_virt_cpu_in_xnu(void)
 {
     return sptm_cpu_in_xnu[smp_id()];
-}
-
-/*
- * Before one core gives the host the proxy: every other core stops at its next trap, before it
- * takes a lock or touches the USB controller. The proxy and the console share an unlocked dwc3,
- * and with the other cores still printing the link died (J813, ten cores, 2026-11-15).
- */
-volatile int sptm_virt_parking_cpu = -1;
-
-/* First thing in every exception entry: a core other than the parking one stops here. */
-void sptm_virt_park_check(void)
-{
-    if (sptm_virt_parking_cpu >= 0 && sptm_virt_parking_cpu != smp_id())
-        while (1)
-            sysop("wfe");
-}
-
-/* Only one core may own the proxy: a core that loses the election parks like the others. */
-void sptm_virt_park_others(void)
-{
-    int me = smp_id(), none = -1;
-
-    if (!__atomic_compare_exchange_n(&sptm_virt_parking_cpu, &none, me, false, __ATOMIC_SEQ_CST,
-                                     __ATOMIC_SEQ_CST) &&
-        none != me)
-        while (1)
-            sysop("wfe");
-    sysop("dsb sy");
-    udelay(300000);
 }
 
 /* A GEXIT into XNU's normal world: this core runs XNU from now on. */
