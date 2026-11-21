@@ -1687,18 +1687,20 @@ static bool nvme_coldpath_stop_controller(void)
  *  - QUIESCED (the default): controller off and RTKit quiesced, its CPU running, the state iBoot
  *    hands on (XNU woke iBoot's session to the desktop, hv21) and the one Stage 1's proxy left a
  *    T6050 ANS in for XNU (sptm_virt_esp_ans_handoff()). XNU wakes it; the host keeps "quiesced"
- *    in the guest's tree. The stage's SART entries stay unless NVME_COLDPATH_CLEAR, so a firmware
- *    that goes on with those buffers still reaches them; they must then lie where nothing will
- *    allocate (nvme_coldpath_unowned()).
+ *    in the guest's tree. The stage's SART entries stay where they lie in memory nothing will
+ *    allocate (nvme_coldpath_unowned()), so a firmware that goes on with those buffers still
+ *    reaches them; elsewhere, or with NVME_COLDPATH_CLEAR, they are cleared (a woken quiesced
+ *    firmware asks for new buffers).
  *  - STOPPED: the controller shut down and off, RTKit SLEEP (the end of a session, after which
  *    the next start is a first boot, as nvme_ans_sleep_and_reset() leaves an M1-M3 ANS), its CPU
  *    stopped, the stage's entries cleared, ANS reset. XNU starts it cold; the host drops
  *    "quiesced".
- * NVME_COLDPATH_AUTO: as the last write, give APCIE_SYS_ST, APCIE_PHY_SW and APCIE_SYS_GP back
- * the hardware auto-enable iBoot leaves on them (aura's power-on clears it).
+ * NVME_COLDPATH_AUTO: as the last APCIe write, give APCIE_SYS_ST, APCIE_PHY_SW and APCIE_SYS_GP
+ * back the hardware auto-enable iBoot leaves on them (aura's power-on clears it).
  *
  * Returns 0 when ready; -1 refused before any write, -2 no SART entries to restore, -4 ANS didn't
- * start, -5 the RTKit or controller step failed (ANS left as it is: no XNU).
+ * start, -5 the RTKit or controller step failed (ANS left as it is: no XNU). After a 0, ANS is
+ * XNU's: this image starts, stops or reports it no more.
  */
 int nvme_coldpath_handoff(u32 flags)
 {
@@ -1706,21 +1708,26 @@ int nvme_coldpath_handoff(u32 flags)
     struct sptm_virt_layout l;
     bool stopped = flags & NVME_COLDPATH_STOPPED;
     bool clear = stopped || (flags & NVME_COLDPATH_CLEAR);
+    int node = adt_path_offset(adt, "/arm-io/ans"), die = 0;
+    u32 keep = 0; /* the stage's SART entries kept for XNU, by index */
     int ret = -5;
 
     printf("nvme: coldpath: %s%s%s\n", stopped ? "STOPPED" : "QUIESCED",
-           clear ? ", the stage's SART entries cleared" : ", the stage's SART entries kept",
+           clear ? ", the stage's SART entries cleared"
+                 : ", the stage's SART entries kept where nothing will allocate",
            (flags & NVME_COLDPATH_AUTO) ? ", AUTO" : "");
-    if (nub < 0 || !nvme_post_m4() || nvme_initialized || nvme_reboot_required) {
+    /* The split secure BAR (T8132-class): nvme_init() has a start from off only there. */
+    if (nub < 0 || node < 0 || !adt_get_property(adt, node, "nvme-secure-bar") ||
+        nvme_initialized || nvme_reboot_required) {
         printf("nvme: coldpath: refused: not a post-M4 ANS this stage can start\n");
         return -1;
     }
-    int node = adt_path_offset(adt, "/arm-io/ans"), die = 0;
     u32 cg;
-    if (node >= 0 && ADT_GETPROP(adt, node, "clock-gates", &cg) >= 0)
+    if (ADT_GETPROP(adt, node, "clock-gates", &cg) >= 0)
         die = FIELD_GET(PMGR_DIE_ID, cg);
     if (!nvme_cold_ans_off(die)) {
-        printf("nvme: coldpath: refused: ANS is on (this path is for an ANS a stage powered off)\n");
+        printf(
+            "nvme: coldpath: refused: ANS is on (this path is for an ANS a stage powered off)\n");
         return -1;
     }
     if (!nvme_sart_saved_cnt) {
@@ -1741,10 +1748,16 @@ int nvme_coldpath_handoff(u32 flags)
                e->paddr, e->size,
                unowned ? "in memory nobody owns now" : "in memory aura or XNU may use");
         if ((e->paddr < (u64)_end && (u64)_base < e->paddr + e->size) ||
-            (e->paddr < l.aura_top && l.aura_base < e->paddr + e->size) || (!clear && !unowned)) {
+            (e->paddr < l.aura_top && l.aura_base < e->paddr + e->size)) {
             printf("nvme: coldpath: refused: the firmware would write that buffer\n");
             return -1;
         }
+        /*
+         * Elsewhere the entry can only be cleared: a woken quiesced firmware asks for new
+         * buffers (Stage 1 1.0.0b13 waking iBoot's session on T8132 gave it three).
+         */
+        if (!clear && unowned && e->index < 32)
+            keep |= BIT(e->index);
     }
     nvme_coldpath_log_pmgr("before");
 
@@ -1784,8 +1797,8 @@ int nvme_coldpath_handoff(u32 flags)
         u64 timeout = timeout_calculate(100000);
         while (!asc_cpu_idle(nvme_asc) && !timeout_expired(timeout))
             ;
-        printf("nvme: coldpath: CPU %s, status 0x%x\n", asc_cpu_idle(nvme_asc) ? "idle" : "NOT idle",
-               asc_cpu_status(nvme_asc));
+        printf("nvme: coldpath: CPU %s, status 0x%x\n",
+               asc_cpu_idle(nvme_asc) ? "idle" : "NOT idle", asc_cpu_status(nvme_asc));
         if (rtkit_has_owned_buffers(nvme_rtkit))
             printf("nvme: coldpath: the warm start asked for buffers: freed with their entries\n");
         rtkit_free(nvme_rtkit);
@@ -1797,21 +1810,36 @@ int nvme_coldpath_handoff(u32 flags)
     u64 pa[NVME_SART_ENTRIES] = {0};
     size_t sz[NVME_SART_ENTRIES] = {0};
     for (int i = 0; nvme_sart && i < NVME_SART_ENTRIES; i++) {
-        if (!sart_get_allowed(nvme_sart, i, &pa[i], &sz[i]))
+        /* sart_get_allowed() fills these in for an unused slot too */
+        if (!sart_get_allowed(nvme_sart, i, &pa[i], &sz[i])) {
+            pa[i] = 0;
+            sz[i] = 0;
             continue;
+        }
         bool aura = nvme_aura_memory(nub, pa[i], sz[i]);
+        bool kept = !aura || (keep & BIT(i));
         printf("nvme: coldpath: SART entry %d 0x%lx+0x%lx %s\n", i, pa[i], sz[i],
-               !aura ? "kept (iBoot's)" : clear ? "is an aura stage's: cleared"
-                                                : "is an aura stage's: kept");
-        if (aura && clear) {
+               !aura  ? "kept (iBoot's)"
+               : kept ? "is an aura stage's: kept"
+                      : "is an aura stage's: cleared");
+        if (!kept) {
             sart_clear_entry(nvme_sart, i);
             sz[i] = 0;
         }
     }
-    if (stopped && nvme_cold_reset(die, nvme_asc, nvme_sart, pa, sz)) {
-        printf("nvme: coldpath: ANS didn't reset\n");
-        goto out;
+    if (stopped) {
+        if (nvme_cold_reset(die, nvme_asc, nvme_sart, pa, sz)) {
+            printf("nvme: coldpath: ANS didn't reset\n");
+            nvme_reboot_required = true;
+            goto out;
+        }
+        /* What a late message left would stand in for XNU's HELLO. */
+        nvme_ans_drain("after the handoff reset");
     }
+    printf("nvme: coldpath: ANS %s for XNU: CC 0x%x CSTS 0x%x, CPU status 0x%x\n",
+           stopped ? "STOPPED (SLEEP, reset)" : "QUIESCED (controller off, CPU running)",
+           read32(nvme_base + NVME_CC), read32(nvme_base + NVME_CSTS), asc_cpu_status(nvme_asc));
+    /* Last of all (no ANS or APCIe access after it): iBoot's auto-enable bits. */
     if (flags & NVME_COLDPATH_AUTO) {
         static const char *const autos[] = {"APCIE_SYS_ST", "APCIE_PHY_SW", "APCIE_SYS_GP"};
         for (size_t i = 0; i < ARRAY_SIZE(autos); i++)
@@ -1819,9 +1847,9 @@ int nvme_coldpath_handoff(u32 flags)
                 printf("nvme: coldpath: %s: auto-enable not set\n", autos[i]);
     }
     nvme_coldpath_log_pmgr("at the handoff");
-    printf("nvme: coldpath: ANS %s for XNU: CC 0x%x CSTS 0x%x, CPU status 0x%x\n",
-           stopped ? "STOPPED (SLEEP, reset)" : "QUIESCED (controller off, CPU running)",
-           read32(nvme_base + NVME_CC), read32(nvme_base + NVME_CSTS), asc_cpu_status(nvme_asc));
+    /* ANS is XNU's from here: no later call of this image starts, stops or reports it. */
+    nvme_sart_saved_cnt = 0;
+    nvme_reboot_required = true;
     ret = 0;
 out:
     if (stopped) {
