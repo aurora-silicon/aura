@@ -8,7 +8,7 @@ from host_compiler import host_cc
 REPO = Path(__file__).resolve().parents[2]
 LIBFDT = REPO / "src/libfdt"
 LIBFDT_SOURCES = ("fdt.c", "fdt_ro.c", "fdt_rw.c", "fdt_wip.c", "fdt_sw.c", "fdt_strerror.c",
-                  "fdt_empty_tree.c")
+                  "fdt_empty_tree.c", "fdt_addresses.c")
 
 
 def definition(source, signature):
