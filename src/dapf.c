@@ -691,26 +691,32 @@ struct entry dapf_entries[] = {
     {NULL, -1, NULL},
 };
 
-/* The dapf_entries filters dapf_init_fdt() failed to program on this boot. */
-static const char *dapf_failed_paths[8];
-static unsigned int dapf_nfailed;
+/*
+ * The dapf_entries filters dapf_init_fdt() programmed, and those it failed to program, on this
+ * boot. An entry it skipped (its DT alias absent or disabled, its DART not in the ADT) is in
+ * neither.
+ */
+static const char *dapf_programmed_paths[8], *dapf_failed_paths[8];
+static unsigned int dapf_nprogrammed, dapf_nfailed;
 
-/* @path is a DART whose filter dapf_init_fdt() programs (it is one of dapf_entries). */
-bool dapf_programs(const char *path)
+static bool dapf_listed(const char *const *paths, unsigned int n, const char *path)
 {
-    for (const struct entry *e = dapf_entries; e->path; e++)
-        if (!strcmp(e->path, path))
+    for (unsigned int i = 0; i < n; i++)
+        if (!strcmp(paths[i], path))
             return true;
     return false;
+}
+
+/* dapf_init_fdt() programmed the filter of the DART at @path on this boot. */
+bool dapf_programmed(const char *path)
+{
+    return dapf_listed(dapf_programmed_paths, dapf_nprogrammed, path);
 }
 
 /* dapf_init_fdt() tried to program the filter of the DART at @path on this boot and failed. */
 bool dapf_failed(const char *path)
 {
-    for (unsigned int i = 0; i < dapf_nfailed; i++)
-        if (!strcmp(dapf_failed_paths[i], path))
-            return true;
-    return false;
+    return dapf_listed(dapf_failed_paths, dapf_nfailed, path);
 }
 
 /*
@@ -836,7 +842,7 @@ int dapf_init_fdt(const void *fdt)
 {
     j614s_aop_ready = false;
     j614s_isp_ready = false;
-    dapf_nfailed = 0;
+    dapf_nprogrammed = dapf_nfailed = 0;
     if (chip_id == T8132) {
         /* M4 laptops whose trees state the same DAPF handoff contract as the J713. */
         static const char *const boards[] = {"apple,j713", "apple,j604", NULL};
@@ -884,10 +890,13 @@ int dapf_init_fdt(const void *fdt)
             if (dapf_nfailed < sizeof(dapf_failed_paths) / sizeof(dapf_failed_paths[0]))
                 dapf_failed_paths[dapf_nfailed++] = entry->path;
             ret = -1;
-        } else if (dapf_is_j614s() && !strcmp(entry->path, "/arm-io/dart-aop")) {
-            j614s_aop_ready = true;
-        } else if (dapf_is_j614s() && !strcmp(entry->path, "/arm-io/dart-isp0")) {
-            j614s_isp_ready = true;
+        } else {
+            if (dapf_nprogrammed < sizeof(dapf_programmed_paths) / sizeof(dapf_programmed_paths[0]))
+                dapf_programmed_paths[dapf_nprogrammed++] = entry->path;
+            if (dapf_is_j614s() && !strcmp(entry->path, "/arm-io/dart-aop"))
+                j614s_aop_ready = true;
+            else if (dapf_is_j614s() && !strcmp(entry->path, "/arm-io/dart-isp0"))
+                j614s_isp_ready = true;
         }
         entry++;
         count += 1;

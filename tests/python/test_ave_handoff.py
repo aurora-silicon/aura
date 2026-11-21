@@ -31,7 +31,8 @@ libfdt. Covered:
   12. with vm-base 0 (the M1 family) the segments must have the live M1 shape: TEXT remapped at
      its physical address, 16K-aligned offsets inside the 32-bit DART; a node whose fallback
      compatible is another encoder's first is handed over once; an encoder 0 whose dart-ave0
-     filter dapf.c failed to program is left off, and dart-ave keeps its inherited filter.
+     filter dapf.c failed to program is left off, one dapf.c skipped is programmed here (and left
+     off if that fails), and dart-ave keeps its inherited filter.
 
 The harness also runs one DTB against an ADT modelled from it (`dtb <in> <out> <mode>`), which
 compares two versions of the handoff on a kernel's device trees.
@@ -112,15 +113,19 @@ static bool dapf_keeps_inherited(const char *path)
 {
     return chip_id == T8140 && strcmp(path, "/arm-io/dart-mtp") && strcmp(path, "/arm-io/dart-pmp");
 }
-/* dapf.c's dapf_entries hold encoder 0's filter, dart-ave0; failing_entry models its failure. */
-static const char *failing_entry;
-static bool dapf_programs(const char *path)
-{
-    return !strcmp(path, "/arm-io/dart-ave0");
-}
+/*
+ * dapf.c's dapf_entries hold encoder 0's filter, dart-ave0: dapf_init_fdt() programs it, or fails
+ * (failing_entry), or skips it (skipped_entry: a tree without the "ave" alias, as on T6041).
+ */
+static const char *failing_entry, *skipped_entry;
 static bool dapf_failed(const char *path)
 {
-    return dapf_programs(path) && failing_entry && !strcmp(path, failing_entry);
+    return failing_entry && !strcmp(path, failing_entry);
+}
+static bool dapf_programmed(const char *path)
+{
+    return !strcmp(path, "/arm-io/dart-ave0") && !dapf_failed(path) &&
+           !(skipped_entry && !strcmp(path, skipped_entry));
 }
 /* dapf.c's predicate: dart-ave (one encoder, M2 through M5) keeps the filter iBoot left. */
 static bool dapf_ave_filter_inherited(const char *path)
@@ -380,6 +385,7 @@ static void tree(int dies)
     programmed[0] = 0;
     failing_dart = NULL;
     failing_entry = NULL;
+    skipped_entry = NULL;
     chip_id = 0;
 }
 
@@ -875,6 +881,24 @@ static int scenarios(void)
     CHECK(!strcmp(status(0, M1_ENC0), "disabled"));
     puts("PASS: dart-ave0 failure in dapf.c leaves encoder 0 off");
 
+    /* dapf.c skipped dart-ave0 (no "ave" alias, as on T6041): it is programmed here instead. */
+    tree(1);
+    encoder(0, "apple,t6000-ave", M1_ENC0, "okay");
+    add_encoder("ave0", M1_ENC0); add_dart("dart-ave0", 0);
+    CHECK(!dt_set_ave() && !fdt_pack(dt));
+    skipped_entry = "/arm-io/dart-ave0";
+    CHECK(!dt_set_ave_dapf() && !strcmp(programmed, "/arm-io/dart-ave0 "));
+    CHECK(!strcmp(status(0, M1_ENC0), "okay"));
+    puts("PASS: dart-ave0 that dapf.c skipped is programmed for encoder 0");
+
+    tree(1);
+    encoder(0, "apple,t6000-ave", M1_ENC0, "okay");
+    add_encoder("ave0", M1_ENC0); add_dart("dart-ave0", 0);
+    CHECK(!dt_set_ave() && !fdt_pack(dt));
+    skipped_entry = failing_dart = "/arm-io/dart-ave0";
+    CHECK(dt_set_ave_dapf() == 1 && !strcmp(status(0, M1_ENC0), "disabled"));
+    puts("PASS: dart-ave0 that dapf.c skipped and that fails here leaves encoder 0 off");
+
     /* The M2 and later single encoder (dart-ave) keeps iBoot's filter: nothing programmed. */
     tree(1);
     encoder(0, "apple,t8112-ave", 0x267100000ULL, "okay");
@@ -1037,4 +1061,4 @@ def test_ave_handoff(tmp_path):
     binary = build(tmp_path, (repo / "src/kboot.c").read_text())
     run = subprocess.run([str(binary)], capture_output=True, text=True)
     assert run.returncode == 0, run.stdout + run.stderr
-    assert run.stdout.count("PASS:") == 34, run.stdout
+    assert run.stdout.count("PASS:") == 36, run.stdout

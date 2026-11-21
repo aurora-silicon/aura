@@ -4675,6 +4675,8 @@ static int dt_ave_enable(u32 self)
  * resolves to /soc@200000000, a sibling of the /soc that holds the encoder. Where several
  * encoders share a compatible, it is found by @phandle instead; for a lone encoder @phandle is 0.
  */
+static int dt_ave_next(int node, const char *compat);
+
 static int dt_set_ave_node(int node, const char *compat, u32 phandle)
 {
     char path[64];
@@ -4855,8 +4857,7 @@ static int dt_set_ave_node(int node, const char *compat, u32 phandle)
         }
     }
     /* The qualified T8112 AVE AXI2AF list is explicitly empty. */
-    node = phandle ? fdt_node_offset_by_phandle(dt, phandle)
-                   : fdt_node_offset_by_compatible(dt, -1, compat);
+    node = phandle ? fdt_node_offset_by_phandle(dt, phandle) : dt_ave_next(-1, compat);
     if (node < 0 || (!fdt_node_check_compatible(dt, node, "apple,t8112-ave") &&
                      !fdt_getprop(dt, node, "apple,tunable-axi2af", NULL) &&
                      fdt_setprop_empty(dt, node, "apple,tunable-axi2af") < 0)) {
@@ -4880,8 +4881,7 @@ static int dt_set_ave_node(int node, const char *compat, u32 phandle)
     return 0;
 
 disable:
-    node = phandle ? fdt_node_offset_by_phandle(dt, phandle)
-                   : fdt_node_offset_by_compatible(dt, -1, compat);
+    node = phandle ? fdt_node_offset_by_phandle(dt, phandle) : dt_ave_next(-1, compat);
     if (node >= 0 && fdt_setprop_string(dt, node, "status", "disabled"))
         return -1;
     if (phandle)
@@ -4979,7 +4979,8 @@ static int dt_set_ave(void)
  * leave off one whose filter is not programmed. Each encoder fetches its preloaded __TEXT through
  * its own CPU DART, dart-<ADT name>:
  *  - dart-ave0 (encoder 0 of the M1 Pro and later multi-encoder SoCs) is one of dapf.c's
- *    dapf_entries, programmed by dapf_init_fdt(): its encoder is left off when that failed;
+ *    dapf_entries: one dapf_init_fdt() programmed is done, one it failed leaves its encoder off,
+ *    and one it skipped (a tree without the "ave" alias, as on T6041) is programmed here;
  *  - dart-ave (the one encoder of the M2 through M5 and T8152) keeps the filter iBoot left
  *    (dapf_ave_filter_inherited());
  *  - every further encoder's (the M1 Max's second, the M1 Ultra's three more) is programmed here;
@@ -5005,7 +5006,8 @@ static int dt_set_ave_dapf(void)
         if (dapf_keeps_inherited(dart) || dapf_ave_filter_inherited(dart) ||
             adt_path_offset(adt, dart) < 0)
             continue;
-        if (dapf_programs(dart) ? !dapf_failed(dart) : dapf_init(dart, 3) >= 0)
+        /* dapf.c programmed it, or did not try (no DT alias): program it here. */
+        if (dapf_programmed(dart) || (!dapf_failed(dart) && dapf_init(dart, 3) >= 0))
             continue;
         /* Node offsets survive reopening the packed tree in place. */
         if ((!edited && fdt_open_into(dt, dt, dt_bufsize)) ||
