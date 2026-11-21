@@ -27,7 +27,11 @@ libfdt. Covered:
      each at its own DART's window, and dart-ave1 is programmed only when the DT enables ave1;
   11. a node is an encoder by its compatible naming the AVE block ("apple,ave" or
      "apple,t<SoC>-ave"), never the decoder or a longer name; every SoC reads its window base
-     from its DART, and an encoder whose DART has no vm-base is disabled (M1 Pro and M2 alike).
+     from its DART, and an encoder whose DART has no vm-base is disabled (M1 Pro and M2 alike);
+  12. with vm-base 0 (the M1 family) the segments must have the live M1 shape: TEXT remapped at
+     its physical address, 16K-aligned offsets inside the 32-bit DART; a node whose fallback
+     compatible is another encoder's first is handed over once; an encoder 0 whose dart-ave0
+     filter dapf.c failed to program is left off, and dart-ave keeps its inherited filter.
 
 The harness also runs one DTB against an ADT modelled from it (`dtb <in> <out> <mode>`), which
 compares two versions of the handoff on a kernel's device trees.
@@ -107,6 +111,21 @@ static int dapf_init(const char *path, int index)
 static bool dapf_keeps_inherited(const char *path)
 {
     return chip_id == T8140 && strcmp(path, "/arm-io/dart-mtp") && strcmp(path, "/arm-io/dart-pmp");
+}
+/* dapf.c's dapf_entries hold encoder 0's filter, dart-ave0; failing_entry models its failure. */
+static const char *failing_entry;
+static bool dapf_programs(const char *path)
+{
+    return !strcmp(path, "/arm-io/dart-ave0");
+}
+static bool dapf_failed(const char *path)
+{
+    return dapf_programs(path) && failing_entry && !strcmp(path, failing_entry);
+}
+/* dapf.c's predicate: dart-ave (one encoder, M2 through M5) keeps the filter iBoot left. */
+static bool dapf_ave_filter_inherited(const char *path)
+{
+    return !strcmp(path, "/arm-io/dart-ave");
 }
 void *adt;
 static struct { u64 phys_base; } cur_boot_args = {0x800000000000ULL};
@@ -278,8 +297,9 @@ static struct anode *add_encoder(const char *name, u64 addr)
     n->nseg = 2;
     /* Each encoder its own copy, below the OS. */
     u64 phys = dram_base + 0x100000000ULL + nanodes * 0x1000000ULL;
-    n->seg[0] = (struct adt_segment_ranges){phys, 0, 0x10000000ULL, 0xd0000, 0};
-    n->seg[1] = (struct adt_segment_ranges){phys + 0x100000, 0xd0000, 0x10100000ULL, 0x128000, 0};
+    /* vm-base 0 (M1 family, live M1 Pro ADT): TEXT's remap is its physical address. */
+    n->seg[0] = (struct adt_segment_ranges){phys, 0, phys, 0xd0000, 0};
+    n->seg[1] = (struct adt_segment_ranges){phys + 0x100000, 0xd0000, 0x1f0000d0000ULL + nanodes * 0x1000000ULL, 0x128000, 0};
     strcpy(n->names, "__TEXT;__DATA");
     n->crc[0] = 0x460c7a7c;
     n->crc[1] = 0x12345678;
@@ -359,6 +379,7 @@ static void tree(int dies)
     logbuf[0] = 0;
     programmed[0] = 0;
     failing_dart = NULL;
+    failing_entry = NULL;
     chip_id = 0;
 }
 
@@ -741,6 +762,46 @@ static int scenarios(void)
     CHECK(!strcmp(status(0, M1_ENC0), "disabled") && strstr(logbuf, "ADT node absent"));
     puts("PASS: only ave and ave<N> are encoders");
 
+    /* 12: vm-base 0 (M1 family) is checked against the shape of every live M1 ADT. */
+    tree(1);
+    encoder(0, "apple,t6000-ave", M1_ENC0, "okay");
+    a = add_encoder("ave0", M1_ENC0);
+    add_dart("dart-ave0", 0);
+    a->seg[0].remap = 0x10000000ULL;
+    CHECK(!dt_set_ave());
+    CHECK(!strcmp(status(0, M1_ENC0), "disabled") &&
+          strstr(logbuf, "ADT remap disagrees with the DART window"));
+    puts("PASS: vm-base 0: TEXT remap other than its physical address: disabled");
+
+    tree(1);
+    encoder(0, "apple,t6000-ave", M1_ENC0, "okay");
+    a = add_encoder("ave0", M1_ENC0);
+    add_dart("dart-ave0", 0);
+    a->seg[1].iova = 0xd2000;
+    CHECK(!dt_set_ave() && !strcmp(status(0, M1_ENC0), "disabled"));
+    puts("PASS: vm-base 0: offset not 16K aligned: disabled");
+
+    tree(1);
+    encoder(0, "apple,t6000-ave", M1_ENC0, "okay");
+    a = add_encoder("ave0", M1_ENC0);
+    add_dart("dart-ave0", 0);
+    a->seg[1].iova = 0xfff00000ULL;
+    CHECK(!dt_set_ave() && !strcmp(status(0, M1_ENC0), "disabled"));
+    puts("PASS: vm-base 0: segment past the 32-bit DART: disabled");
+
+    /* A node whose fallback is another encoder's first compatible is handed over once. */
+    tree(1);
+    encoder(0, "apple,t6000-ave", M1_ENC1, "okay");
+    encoder2(0, "apple,t6001-ave", "apple,t6000-ave", M1_ENC0, "okay");
+    add_encoder("ave0", M1_ENC0); add_dart("dart-ave0", 0);
+    add_encoder("ave1", M1_ENC1); add_dart("dart-ave1", 0);
+    CHECK(!dt_set_ave());
+    {
+        int len0 = 0;
+        CHECK(fdt_getprop(dt, enc(0, M1_ENC0), "memory-region", &len0) && len0 == 8);
+    }
+    puts("PASS: a fallback compatible does not hand an encoder over twice");
+
 #ifndef NO_AVE_DAPF
     /* 8: the CPU DART filters of the encoders after the first */
     tree(1);
@@ -803,6 +864,24 @@ static int scenarios(void)
     CHECK(!dt_set_ave_dapf());
     CHECK(!strcmp(programmed, "/arm-io/dart-ave1 /arm-io/dart-ave2 /arm-io/dart-ave3 "));
     puts("PASS: M1 Ultra: dart-ave1, dart-ave2 and dart-ave3 programmed");
+
+    /* dapf.c failed to program encoder 0's filter (dart-ave0): encoder 0 is left off. */
+    tree(1);
+    encoder(0, "apple,t6000-ave", M1_ENC0, "okay");
+    add_encoder("ave0", M1_ENC0); add_dart("dart-ave0", 0);
+    CHECK(!dt_set_ave() && !fdt_pack(dt));
+    failing_entry = "/arm-io/dart-ave0";
+    CHECK(dt_set_ave_dapf() == 1 && !programmed[0]);
+    CHECK(!strcmp(status(0, M1_ENC0), "disabled"));
+    puts("PASS: dart-ave0 failure in dapf.c leaves encoder 0 off");
+
+    /* The M2 and later single encoder (dart-ave) keeps iBoot's filter: nothing programmed. */
+    tree(1);
+    encoder(0, "apple,t8112-ave", 0x267100000ULL, "okay");
+    add_encoder("ave", 0x267100000ULL); add_dart("dart-ave", 0x800000000ULL);
+    CHECK(!dt_set_ave() && !fdt_pack(dt));
+    CHECK(!dt_set_ave_dapf() && !programmed[0] && !strcmp(status(0, 0x267100000ULL), "okay"));
+    puts("PASS: dart-ave keeps its inherited filter");
 
     tree(1);
     encoder(0, "apple,t8140-ave", 0x289100000ULL, "okay");
@@ -958,4 +1037,4 @@ def test_ave_handoff(tmp_path):
     binary = build(tmp_path, (repo / "src/kboot.c").read_text())
     run = subprocess.run([str(binary)], capture_output=True, text=True)
     assert run.returncode == 0, run.stdout + run.stderr
-    assert run.stdout.count("PASS:") == 28, run.stdout
+    assert run.stdout.count("PASS:") == 34, run.stdout

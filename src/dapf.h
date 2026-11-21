@@ -8,6 +8,9 @@
 int dapf_init_all(void);
 int dapf_init_fdt(const void *fdt);
 bool dapf_keeps_inherited(const char *path);
+bool dapf_programs(const char *path);
+bool dapf_failed(const char *path);
+bool dapf_ave_filter_inherited(const char *path);
 int dapf_init(const char *path, int index);
 bool dapf_j614s_aop_ready(void);
 bool dapf_j614s_isp_ready(void);

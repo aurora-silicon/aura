@@ -62,9 +62,14 @@ static bool dapf_preload_text(const char *path, u64 *start, u64 *end)
     if (!ave || snprintf(encoder, sizeof(encoder), "/arm-io/%s", ave) >= (int)sizeof(encoder))
         return false;
 
-    u32 len;
+    u32 len, preloaded;
     int node = adt_path_offset(adt, encoder);
-    if (node < 0 || !adt_getprop(adt, node, "pre-loaded", &len))
+    const void *pl = node < 0 ? NULL : adt_getprop(adt, node, "pre-loaded", &len);
+    /* The same test as kboot.c's encoder handoff: pre-loaded is 1, not merely present. */
+    if (!pl || len != sizeof(preloaded))
+        return false;
+    memcpy(&preloaded, pl, sizeof(preloaded));
+    if (preloaded != 1)
         return false;
     const struct dapf_segment *seg = adt_getprop(adt, node, "segment-ranges", &len);
     if (!seg || len < sizeof(*seg) || seg[0].size < 4 || (seg[0].phys & 3))
@@ -686,6 +691,38 @@ struct entry dapf_entries[] = {
     {NULL, -1, NULL},
 };
 
+/* The dapf_entries filters dapf_init_fdt() failed to program on this boot. */
+static const char *dapf_failed_paths[8];
+static unsigned int dapf_nfailed;
+
+/* @path is a DART whose filter dapf_init_fdt() programs (it is one of dapf_entries). */
+bool dapf_programs(const char *path)
+{
+    for (const struct entry *e = dapf_entries; e->path; e++)
+        if (!strcmp(e->path, path))
+            return true;
+    return false;
+}
+
+/* dapf_init_fdt() tried to program the filter of the DART at @path on this boot and failed. */
+bool dapf_failed(const char *path)
+{
+    for (unsigned int i = 0; i < dapf_nfailed; i++)
+        if (!strcmp(dapf_failed_paths[i], path))
+            return true;
+    return false;
+}
+
+/*
+ * dart-ave, the CPU DART of the one encoder of the M2 through M5 and T8152 (ADT ave), is in
+ * neither dapf_entries nor programmed by kboot.c: its filter is the one iBoot left, which admits
+ * the encoder's preloaded firmware (rows on M2, M3 and M4).
+ */
+bool dapf_ave_filter_inherited(const char *path)
+{
+    return !strcmp(path, "/arm-io/dart-ave");
+}
+
 /*
  * T8140 programs only its MTP and PMP DART filters and keeps every other filter as inherited
  * (programming the rest raised an SError on a J700). dapf_init_fdt() and the encoder filters in
@@ -799,6 +836,7 @@ int dapf_init_fdt(const void *fdt)
 {
     j614s_aop_ready = false;
     j614s_isp_ready = false;
+    dapf_nfailed = 0;
     if (chip_id == T8132) {
         /* M4 laptops whose trees state the same DAPF handoff contract as the J713. */
         static const char *const boards[] = {"apple,j713", "apple,j604", NULL};
@@ -842,6 +880,9 @@ int dapf_init_fdt(const void *fdt)
             continue;
         }
         if (dapf_init(entry->path, entry->index) < 0) {
+            /* dapf_entries has fewer entries than this has slots. */
+            if (dapf_nfailed < sizeof(dapf_failed_paths) / sizeof(dapf_failed_paths[0]))
+                dapf_failed_paths[dapf_nfailed++] = entry->path;
             ret = -1;
         } else if (dapf_is_j614s() && !strcmp(entry->path, "/arm-io/dart-aop")) {
             j614s_aop_ready = true;

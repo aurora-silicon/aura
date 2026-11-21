@@ -4823,6 +4823,23 @@ static int dt_set_ave_node(int node, const char *compat, u32 phandle)
             goto disable;
         }
     }
+    /*
+     * With vm-base 0 (the M1 family) each segment is reserved at its own ADT offset, so check the
+     * shape that layout has in every live M1 ADT instead: TEXT's remap address is its physical
+     * address, and every offset is 16K aligned with its segment inside the 32-bit DART. Anything
+     * else is left off, as above.
+     */
+    for (size_t i = 0; !dva_base && i < count; i++) {
+        const u64 dart_end = 1ULL << 32;
+        u64 span = ALIGN_UP((u64)seg[i].size, SZ_16K);
+
+        if ((seg[i].iova & (SZ_16K - 1)) || seg[i].iova > dart_end ||
+            span > dart_end - seg[i].iova ||
+            (!strcmp(normalized[i], "text") && seg[i].remap != seg[i].phys)) {
+            reason = "ADT remap disagrees with the DART window";
+            goto disable;
+        }
+    }
     if (dt_reserve_asc_segments_at(node, adt_path, NULL, path, false, dva_base, false)) {
         reason = "firmware reservation failed";
         goto disable;
@@ -4877,6 +4894,22 @@ disable:
 #define AVE_MAX_ENCODERS 8
 
 /*
+ * The next encoder node after @node whose FIRST compatible is @compat.
+ * fdt_node_offset_by_compatible() also matches fallbacks: a node whose fallback is another
+ * encoder's first compatible would otherwise be handed over twice.
+ */
+static int dt_ave_next(int node, const char *compat)
+{
+    for (node = fdt_node_offset_by_compatible(dt, node, compat); node >= 0;
+         node = fdt_node_offset_by_compatible(dt, node, compat)) {
+        const char *first = dt_ave_node_compat(node);
+        if (first && !strcmp(first, compat))
+            return node;
+    }
+    return node;
+}
+
+/*
  * Every encoder node of @compat. A lone node is handed over as it is found. Several (two on the
  * A18 Pro, M1 Max and M5 Pro/Max, four on the M1 Ultra) are each found by their phandle: handing
  * one over moves the others.
@@ -4888,18 +4921,17 @@ static int dt_set_aves(const char *compat)
     bool edited;
     int ret = 0;
 
-    int first = fdt_node_offset_by_compatible(dt, -1, compat);
+    int first = dt_ave_next(-1, compat);
     if (first < 0)
         return 0;
-    if (fdt_node_offset_by_compatible(dt, first, compat) < 0)
+    if (dt_ave_next(first, compat) < 0)
         return dt_set_ave_node(first, compat, 0);
 
     /* A node without a phandle gets one; that moves the nodes, so look again from the start. */
     do {
         edited = false;
         count = 0;
-        for (int node = fdt_node_offset_by_compatible(dt, -1, compat); node >= 0;
-             node = fdt_node_offset_by_compatible(dt, node, compat)) {
+        for (int node = dt_ave_next(-1, compat); node >= 0; node = dt_ave_next(node, compat)) {
             u32 ph = fdt_get_phandle(dt, node);
             if (count == ARRAY_SIZE(phandles)) {
                 /* No SoC has this many; more than are handed over stay off. */
@@ -4943,11 +4975,15 @@ static int dt_set_ave(void)
 }
 
 /*
- * Encoder 0's CPU DART filter (dart-ave0) is programmed with the other coprocessors' (dapf.c's
- * dapf_entries). Every further encoder (the M1 Max's second, the M1 Ultra's three more) fetches
- * its own preloaded __TEXT through its own CPU DART, dart-ave<N>: program the filters of those the
- * next stage gets, after the DT is final, and leave off one whose filter cannot be programmed.
- * A DART filter dapf.c keeps as inherited (dapf_keeps_inherited()) is left alone.
+ * Program the CPU DART filter of every encoder the next stage gets, after the DT is final, and
+ * leave off one whose filter is not programmed. Each encoder fetches its preloaded __TEXT through
+ * its own CPU DART, dart-<ADT name>:
+ *  - dart-ave0 (encoder 0 of the M1 Pro and later multi-encoder SoCs) is one of dapf.c's
+ *    dapf_entries, programmed by dapf_init_fdt(): its encoder is left off when that failed;
+ *  - dart-ave (the one encoder of the M2 through M5 and T8152) keeps the filter iBoot left
+ *    (dapf_ave_filter_inherited());
+ *  - every further encoder's (the M1 Max's second, the M1 Ultra's three more) is programmed here;
+ *  - a filter dapf.c keeps as inherited (dapf_keeps_inherited(), T8140) is left alone.
  *
  * Returns how many encoders were left off, or -1 if one whose filter failed could not be
  * disabled: that encoder would stay on with an unprogrammed filter, so the handoff must stop.
@@ -4963,10 +4999,13 @@ static int dt_set_ave_dapf(void)
         if (!dt_ave_node_compat(node) || dt_ave_node_disabled(node))
             continue;
         const char *adt_path = dt_ave_adt_path(node, adt_buf, sizeof(adt_buf));
-        if (!adt_path || !strcmp(adt_path, "/arm-io/ave") || !strcmp(adt_path, "/arm-io/ave0"))
+        if (!adt_path)
             continue;
         snprintf(dart, sizeof(dart), "/arm-io/dart-%s", adt_path + strlen("/arm-io/"));
-        if (dapf_keeps_inherited(dart) || adt_path_offset(adt, dart) < 0 || dapf_init(dart, 3) >= 0)
+        if (dapf_keeps_inherited(dart) || dapf_ave_filter_inherited(dart) ||
+            adt_path_offset(adt, dart) < 0)
+            continue;
+        if (dapf_programs(dart) ? !dapf_failed(dart) : dapf_init(dart, 3) >= 0)
             continue;
         /* Node offsets survive reopening the packed tree in place. */
         if ((!edited && fdt_open_into(dt, dt, dt_bufsize)) ||
