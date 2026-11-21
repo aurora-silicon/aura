@@ -725,7 +725,8 @@ static bool rtkit_boot_internal(rtkit_dev_t *rtk, u32 timeout_usec, bool warm, u
     u32 msgtype;
     msgtype = FIELD_GET(MGMT_TYPE, msg.msg0);
     if (msgtype != MGMT_MSG_HELLO) {
-        rtkit_printf("expected HELLO but got message with type 0x%02x", msgtype);
+        rtkit_printf("expected HELLO but got message with type 0x%02x (0x%016lx)\n", msgtype,
+                     msg.msg0);
 
         return false;
     }

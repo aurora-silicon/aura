@@ -614,12 +614,26 @@ static bool nvme_ans_power_on(void)
         return false;
     }
     u32 status = asc_cpu_status(nvme_asc);
-    printf("nvme: ANS CPU status 0x%x before the run bit\n", status);
-    if (!(status & NVME_ASC_STATUS_RESET)) {
+    u32 boot = read32(nvme_base + NVME_BOOT_STATUS);
+    printf("nvme: ANS CPU status 0x%x, BOOT_STATUS 0x%x before the run bit\n", status, boot);
+    /*
+     * Stopped mid-idle: the stage that powered ANS off gave up on an idle the busy firmware hadn't
+     * acknowledged yet (Stage 1 1.0.0b13: "IOP power transition timed out ... stopping it
+     * anyway"), and ANS kept its state through that power-off: BOOT_STATUS still reads ready, the
+     * CPU is stopped but not in its reset state. A PMGR reset doesn't put it there either, and no
+     * HELLO follows in 20 s (M4 mini 11-20, hv27 and dcp16b), so let it run on from where it was
+     * stopped first, and log what it says. The reset and a short start remain the retry.
+     */
+    bool resume = !(status & NVME_ASC_STATUS_RESET) && boot == NVME_BOOT_STATUS_OK;
+    if (resume) {
+        printf("nvme: ANS was stopped mid-idle (its state outlived the power-off): running it on, "
+               "no reset first\n");
+    } else if (!(status & NVME_ASC_STATUS_RESET)) {
         printf("nvme: ANS isn't in its reset state: resetting it\n");
         nvme_ans_reset();
     }
-    bool started = nvme_ans_start_warm("before the run bit", true);
+    bool started =
+        nvme_ans_start_warm(resume ? "before running it on" : "before the run bit", true);
     if (!started && !rtkit_has_owned_buffers(nvme_rtkit)) {
         printf("nvme: ANS didn't answer the run bit (status 0x%x): resetting it, one more try\n",
                asc_cpu_status(nvme_asc));
