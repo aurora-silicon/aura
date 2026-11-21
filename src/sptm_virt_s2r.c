@@ -1804,12 +1804,15 @@ void sptm_virt_s2r_setup(bool cdc)
         /* These go through s2r_hook, not the generic coprocessor trace: register the DCP for
          * the RPC record copy here (s2r_hook calls s2r_dcp_watch). */
         /* Registered whatever the switch: s2r_dcp_watch reads it at each access. */
-        {
+        for (unsigned i = 0; i < 2; i++) {
+            static const char *const dcps[] = {"dcp", "dcpext"};
+            char path[24];
             int dp[8];
             u64 dpa, dsz;
-            if (adt_path_offset_trace(adt, "/arm-io/dcp", dp) >= 0 &&
+            snprintf(path, sizeof(path), "/arm-io/%s", dcps[i]);
+            if (adt_path_offset_trace(adt, path, dp) >= 0 &&
                 adt_get_reg(adt, dp, "reg", 0, &dpa, &dsz) >= 0)
-                s2r_dcp_add("dcp", dpa + 0x8000);
+                s2r_dcp_add(dcps[i], dpa + 0x8000);
         }
         /* Without stage 2 in the secure kernel's world these see XNU's side only. */
         s2r_hook_adt("/arm-io/aop-exclave-mailbox", 0, "aopx-mbox", 0, 0);
