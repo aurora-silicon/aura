@@ -100,17 +100,9 @@ struct tz_regs t8142_tz_regs = {
 #define T8142_CACHE_STATUS_TAG_COUNT  GENMASK(14, 8)
 
 /*
- * The one mcc,t6041 layout the firmware-cache path admits (J616s, J614s, J773s): the ADT must
- * describe exactly this, and every plane's cache status must read as expected.
+ * The mcc,t6041 plane cache status (at T8142_PLANE_CACHE_STATUS) as iBoot leaves it, 12 data and
+ * 12 tag ways, on every plane of the J616s, J614s and J773s.
  */
-#define T6041_MCC_REG_IDX         12
-#define T6041_MCC_COUNT           4
-#define T6041_MCC_CHANNELS        4
-#define T6041_MCC_PLANES          4
-#define T6041_MCC_PLANE_STRIDE    0x40000
-#define T6041_MCC_APERTURE_BASE   0x220000000ULL
-#define T6041_MCC_APERTURE_STRIDE 0x2000000ULL
-#define T6041_MCC_APERTURE_SIZE   0x200000
 #define T6041_CACHE_STATUS_MASK   0x1f001f00
 #define T6041_CACHE_STATUS_EXPECT 0x0c000c00
 
@@ -762,79 +754,166 @@ static int mcc_init_m5(int node, int *path)
     return 0;
 }
 
+/*
+ * A firmware-cache MCC (mcc,t8140, mcc,t6041) is set up by iBoot, which owns its cache: aura only
+ * records its AMCCs and, for mcc,t6041, checks the cache status iBoot left. Everything comes from
+ * the ADT: the AMCC count and register index in /arm-io/mcc, which AMCCs and channels are enabled
+ * there (a binned M4 Max has 8 AMCCs with 6 enabled), the planes and their stride in
+ * /chosen/lock-regs/amcc, and each enabled AMCC's register window, which lock-regs lists too.
+ *
+ * - An ADT that contradicts itself fails, before any register is read: a mask that names no AMCC
+ *   or one past amcc-count, more enabled channels than the enabled AMCCs hold, an enabled AMCC
+ *   without a window large enough for its planes, a window lock-regs does not list.
+ * - An ADT that does not give what this needs (a missing property or one of another width, more
+ *   AMCCs or channels than aura tracks, and for the status reads a plane stride from lock-regs)
+ *   leaves the MCC alone, as for a revision with no driver here.
+ * - A cache status other than the one iBoot leaves on the M4 Pro leaves the MCC alone too: this
+ *   path writes no register, and the carveouts come from the ADT list either way.
+ *
+ * Only the enabled AMCCs are recorded and read: a fused-off AMCC's window is never touched.
+ */
+static int mcc_firmware_cache_inconsistent(const char *what)
+{
+    printf("MCC: the ADT contradicts itself: %s\n", what);
+    return -1;
+}
+
 static int mcc_init_firmware_cache(int node, int *path)
 {
-    u32 reg_idx;
-    u64 count = 1, channels = 0, planes = 4, stride = T8103_PLANE_STRIDE;
+    u32 reg_idx, len;
+    u64 count = 1, channels = 0, planes = 4, stride = T8103_PLANE_STRIDE, amcc_mask, aperture_size;
     int lock_node = adt_path_offset(adt, "/chosen/lock-regs/amcc");
     bool t6041 = adt_is_compatible(adt, node, "mcc,t6041");
+    bool lock_stride = false;
+    const u64 *apertures = NULL;
+    u32 aperture_count = 0;
+    int amcc_index[MAX_MCC_INSTANCES];
 
     if (ADT_GETPROP(adt, node, "amcc-reg-idx", &reg_idx) < 0)
-        return -1;
+        return mcc_undriven();
     if (adt_getprop(adt, node, "amcc-count", NULL) && mcc_get_count(node, "amcc-count", &count))
-        return -1;
+        return mcc_undriven();
     if (adt_getprop(adt, node, "dcs-count-per-amcc", NULL) &&
         mcc_get_count(node, "dcs-count-per-amcc", &channels))
-        return -1;
-    if (!count || count > MAX_MCC_INSTANCES || channels > INT32_MAX)
-        return -1;
+        return mcc_undriven();
+    if (!count)
+        return mcc_firmware_cache_inconsistent("amcc-count is 0");
+    if (count > MAX_MCC_INSTANCES || channels > INT32_MAX)
+        return mcc_undriven();
+
+    amcc_mask = BIT(count) - 1;
+    if (adt_getprop(adt, node, "amcc-enable-mask", NULL)) {
+        u64 mask;
+        if (mcc_get_count(node, "amcc-enable-mask", &mask))
+            return mcc_undriven();
+        if (!mask || (mask & ~amcc_mask))
+            return mcc_firmware_cache_inconsistent("amcc-enable-mask is empty or past amcc-count");
+        amcc_mask = mask;
+    }
+    if (adt_getprop(adt, node, "dcs-channel-enable-mask", NULL)) {
+        u64 mask;
+        if (mcc_get_count(node, "dcs-channel-enable-mask", &mask))
+            return mcc_undriven();
+        if (!channels)
+            return mcc_firmware_cache_inconsistent("dcs-channel-enable-mask without channels");
+        if (channels > 64 / count)
+            return mcc_undriven();
+        u64 all = count * channels == 64 ? ~0ULL : BIT(count * channels) - 1;
+        if (!mask || (mask & ~all) ||
+            (u64)__builtin_popcountll(mask) > __builtin_popcountll(amcc_mask) * channels)
+            return mcc_firmware_cache_inconsistent(
+                "dcs-channel-enable-mask is empty, past the channels, or more than the enabled "
+                "AMCCs hold");
+    }
 
     if (lock_node >= 0 && adt_getprop(adt, lock_node, "plane-count", NULL)) {
         if (mcc_get_count(lock_node, "plane-count", &planes))
-            return -1;
+            return mcc_undriven();
     } else if (adt_getprop(adt, node, "amcc-plane-enable-mask", NULL)) {
         u64 mask;
         if (mcc_get_count(node, "amcc-plane-enable-mask", &mask))
-            return -1;
+            return mcc_undriven();
         planes = __builtin_popcountll(mask);
     }
-    if (lock_node >= 0 && adt_getprop(adt, lock_node, "plane-stride", NULL) &&
-        mcc_get_count(lock_node, "plane-stride", &stride))
-        return -1;
-    if (!planes || planes > INT32_MAX || !stride || (stride & 3))
-        return -1;
+    if (lock_node >= 0 && adt_getprop(adt, lock_node, "plane-stride", NULL)) {
+        if (mcc_get_count(lock_node, "plane-stride", &stride))
+            return mcc_undriven();
+        lock_stride = true;
+    }
+    if (planes > INT32_MAX)
+        return mcc_undriven();
+    if (!planes || !stride || (stride & 3))
+        return mcc_firmware_cache_inconsistent("no planes, or a plane stride that is not aligned");
+    if (t6041 && !lock_stride) {
+        printf("MCC: no plane stride in lock-regs to read the cache status at\n");
+        return mcc_undriven();
+    }
+    /* The highest register read in a window: the last plane's cache status (mcc,t6041). */
+    u64 reach = t6041 ? T8142_PLANE_CACHE_STATUS + 4 : 4;
+    if ((planes - 1) > (UINT64_MAX - reach) / stride)
+        return mcc_firmware_cache_inconsistent("plane stride past the address space");
+    reach += (planes - 1) * stride;
 
-    /*
-     * Admit mcc,t6041 by what the ADT describes, not by board or chip: this geometry here, the
-     * apertures and the live cache status below.
-     */
-    if (t6041 && (reg_idx != T6041_MCC_REG_IDX || count != T6041_MCC_COUNT ||
-                  channels != T6041_MCC_CHANNELS || planes != T6041_MCC_PLANES ||
-                  stride != T6041_MCC_PLANE_STRIDE))
-        return -1;
+    /* lock-regs lists the AMCC windows again; where it does, each enabled one must be in it. */
+    aperture_size = 0;
+    if (lock_node >= 0 && (apertures = adt_getprop(adt, lock_node, "aperture-phys-addr", &len))) {
+        u64 listed = 0;
+        aperture_count = len / sizeof(u64);
+        if ((adt_getprop(adt, lock_node, "aperture-count", NULL) &&
+             mcc_get_count(lock_node, "aperture-count", &listed)) ||
+            (adt_getprop(adt, lock_node, "aperture-size", NULL) &&
+             mcc_get_count(lock_node, "aperture-size", &aperture_size)))
+            return mcc_undriven();
+        if (!len || len % sizeof(u64) ||
+            (adt_getprop(adt, lock_node, "aperture-count", NULL) && listed != aperture_count))
+            return mcc_firmware_cache_inconsistent("the lock-regs aperture list");
+    }
 
-    mcc_count = count;
-    for (int i = 0; i < mcc_count; i++) {
+    int enabled = 0;
+    for (int i = 0; i < (int)count; i++) {
         u64 base, size;
+        if (!(amcc_mask & BIT(i)))
+            continue;
         if (reg_idx > (u32)(INT32_MAX - i) ||
-            adt_get_reg(adt, path, "reg", reg_idx + i, &base, &size) || !base ||
-            (planes - 1) > (UINT64_MAX - 4) / stride || (planes - 1) * stride + 4 > size ||
-            (t6041 && (base != T6041_MCC_APERTURE_BASE + i * T6041_MCC_APERTURE_STRIDE ||
-                       size != T6041_MCC_APERTURE_SIZE)))
-            return -1;
-        mcc_regs[i].plane_base = base;
-        mcc_regs[i].plane_stride = stride;
-        mcc_regs[i].plane_count = planes;
-        mcc_regs[i].dcs_count = channels;
-        mcc_regs[i].tz = NULL;
-        mcc_regs[i].has_cache_control = false;
+            adt_get_reg(adt, path, "reg", reg_idx + i, &base, &size) || !base || reach > size)
+            return mcc_firmware_cache_inconsistent("an enabled AMCC without a window for its "
+                                                   "planes");
+        if (apertures) {
+            bool listed = false;
+            for (u32 j = 0; j < aperture_count && !listed; j++) {
+                u64 ap;
+                memcpy(&ap, &apertures[j], sizeof(ap));
+                listed = ap == base;
+            }
+            if (!listed || (aperture_size && size != aperture_size))
+                return mcc_firmware_cache_inconsistent("an AMCC window lock-regs does not list");
+        }
+        mcc_regs[enabled] = (struct mcc_regs){
+            .plane_base = base,
+            .plane_stride = stride,
+            .plane_count = planes,
+            .dcs_count = channels,
+        };
+        amcc_index[enabled++] = i;
     }
 
     if (t6041) {
-        for (int i = 0; i < mcc_count; i++) {
+        for (int i = 0; i < enabled; i++) {
             for (int plane = 0; plane < mcc_regs[i].plane_count; plane++) {
                 u32 status = plane_read32(i, plane, T8142_PLANE_CACHE_STATUS);
                 if ((status & T6041_CACHE_STATUS_MASK) != T6041_CACHE_STATUS_EXPECT) {
-                    printf("MCC: Unexpected cache status on MCC %d plane %d: 0x%x\n", i, plane,
-                           status);
-                    return -1;
+                    printf("MCC: cache status 0x%x on AMCC %d plane %d is not the one iBoot "
+                           "leaves; leaving the firmware-owned MCC alone\n",
+                           status, amcc_index[i], plane);
+                    return MCC_UNSUPPORTED;
                 }
             }
         }
     }
 
-    printf("MCC: Initialized T%x MCCs (%d instances, %d planes, %d channels)\n", chip_id, mcc_count,
-           mcc_regs[0].plane_count, mcc_regs[0].dcs_count);
+    mcc_count = enabled;
+    printf("MCC: Initialized T%x MCCs (%d of %d instances, %d planes, %d channels)\n", chip_id,
+           mcc_count, (int)count, mcc_regs[0].plane_count, mcc_regs[0].dcs_count);
     mcc_initialized = true;
     return 0;
 }
