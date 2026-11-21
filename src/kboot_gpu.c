@@ -2979,13 +2979,17 @@ static int dt_set_gpu_t8122(void *dt)
     return 0;
 }
 
+/*
+ * The most GPU perf states any G17 ADT has today (T8140: 16). The state count itself comes from
+ * the ADT, as it differs between boards of one SoC (T8142: J813 13, J704 14).
+ */
+#define G17_MAX_PERF_STATES 16
+
 /* G17 SoCs whose firmware iBoot loads and whose UAT it sets up for a raw boot object */
 struct g17_soc {
     const char *compat;           /* Linux compatible */
     const char *adt_compat;       /* the ADT's own compatible, also accepted */
     const char *name;             /* for the log */
-    u32 count;                    /* perf-state-count, also the number of OPP entries */
-    u32 num_states;               /* gpu-num-perf-states */
     u32 tables;                   /* perf-state-table-count, 0 for 1; OPPs from the first */
     bool firmware_data;           /* also hand over gfx-data/gfx1-data (the firmware __DATA) */
     bool data_span;               /* gfx-data..gfx1-data end as /reserved-memory/gpu-fw-data */
@@ -2998,8 +3002,6 @@ static const struct g17_soc g17_soc_t8140 = {
     .compat = "apple,agx-t8140",
     .adt_compat = "gpu,t8140",
     .name = "T8140",
-    .count = 16,
-    .num_states = 15,
     .data_span = true,
 };
 
@@ -3058,8 +3060,6 @@ static const struct g17_soc g17_soc_t8142 = {
     .compat = "apple,agx-t8142",
     .adt_compat = "gpu,t8142",
     .name = "T8142",
-    .count = 13,
-    .num_states = 12,
     .firmware_data = true,
     .firmware_known = t8142_gpu_firmware_known,
     .firmware_profile_prop = "aurora,m5-gpu-firmware-profile",
@@ -3071,8 +3071,6 @@ static const struct g17_soc g17_soc_t6050 = {
     .compat = "apple,agx-t6050",
     .adt_compat = "gpu,t6050",
     .name = "T6050",
-    .count = 14,
-    .num_states = 13,
     .tables = 4,
 };
 
@@ -3222,10 +3220,11 @@ static int dt_set_gpu_g17(void *dt, const struct g17_soc *soc)
     const struct perf_state *states, *sram;
     if (sgx < 0 || ADT_GETPROP(adt, sgx, "perf-state-count", &count) != sizeof(count) ||
         ADT_GETPROP(adt, sgx, "gpu-num-perf-states", &num_states) != sizeof(num_states) ||
-        ADT_GETPROP(adt, sgx, "perf-state-table-count", &tables) != sizeof(tables) ||
-        count != soc->count || num_states != soc->num_states ||
+        ADT_GETPROP(adt, sgx, "perf-state-table-count", &tables) != sizeof(tables) || count < 2 ||
+        count > G17_MAX_PERF_STATES || num_states != count - 1 ||
         tables != (soc->tables ? soc->tables : 1))
         goto disable;
+    /* The ADT's perf-state-count is the number of OPP entries the DT must have. */
     states = adt_getprop(adt, sgx, "perf-states", &len);
     if (!states || len != tables * count * sizeof(*states))
         goto disable;
@@ -3246,13 +3245,16 @@ static int dt_set_gpu_g17(void *dt, const struct g17_soc *soc)
     int opp, opp_count = 0;
     fdt_for_each_subnode(opp, dt, table)
     {
-        if ((u32)++opp_count > soc->count || !fdt_getprop(dt, opp, "opp-hz", &ph_len) ||
+        if ((u32)++opp_count > count || !fdt_getprop(dt, opp, "opp-hz", &ph_len) ||
             ph_len != sizeof(u64) || !fdt_getprop(dt, opp, "opp-microvolt", &ph_len) ||
             ph_len != sizeof(u32))
             goto disable;
     }
-    if ((u32)opp_count != soc->count)
+    if ((u32)opp_count != count) {
+        printf("FDT: GPU: %s ADT has %u perf states, the DT %d OPPs\n", soc->name, count,
+               opp_count);
         goto disable;
+    }
 
     static const struct {
         const char *name;
