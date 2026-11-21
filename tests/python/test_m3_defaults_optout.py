@@ -155,7 +155,6 @@ static const struct g15_soc g15_soc_t8122_standin = {"asahi,t8122-gpu"};
 static const struct g15_soc g15_soc_t6031 = {"asahi,t6031-gpu"};
 static const char *selected = "none";
 static void t8122_leak_fuse_export(void *d) {}
-static int dt_set_gpu_t8122(void *d) { selected = "reservation-only"; return 0; }
 static int dt_set_gpu_g15(void *d, const struct g15_soc *soc)
 {
     selected = soc == &g15_soc_t8122_standin ? "g15-standin" :
@@ -456,7 +455,7 @@ def graphics_off(r, board="j613"):
     for name in r.chosen:
         assert not name.startswith(FAMILY[board]), (name, r.stdout)
     if board in ("j613", "j615"):
-        assert r.select == "reservation-only", r.stdout
+        assert r.select == "none", r.stdout
     if board == "j516c":                      # no image read, no identity probe, GPU node disabled
         assert r.select == "t6031-disabled" and not r.probes, r.stdout
 
@@ -558,12 +557,12 @@ def test_the_j514c_manual_line_works_as_before(tools, build, config, lines):
 
 
 @pytest.mark.parametrize("config,armed,select", [
-    (GPU_OFF, set(AIR) - {"asahi,t8122-gpu"}, "reservation-only"),
+    (GPU_OFF, set(AIR) - {"asahi,t8122-gpu"}, "none"),
     (GPU_ON, set(AIR), "g15-standin"),
-    (GPU_ON + GPU_OFF, set(AIR) - {"asahi,t8122-gpu"}, "reservation-only"),
+    (GPU_ON + GPU_OFF, set(AIR) - {"asahi,t8122-gpu"}, "none"),
     (b"chosen.asahi,t8122-dcp=0\n" + GPU_ON, {"asahi,t8122-gpu"}, "g15"),
-    (b"chosen.asahi,t8122-dcp=0\n", set(), "reservation-only"),
-    (b"chosen.asahi,m3-defaults=0\n", set(), "reservation-only"),
+    (b"chosen.asahi,t8122-dcp=0\n", set(), "none"),
+    (b"chosen.asahi,m3-defaults=0\n", set(), "none"),
 ], ids=["gpu-off", "gpu-on", "gpu-on-then-off", "dcp-off-gpu-on", "dcp-off", "master-off"])
 @pytest.mark.parametrize("build", STAGE2)
 def test_owner_lines_are_kept(tools, build, config, armed, select):
@@ -815,7 +814,7 @@ def test_a_mach_o_stage_1_reads_its_own_lines_up_to_the_plist(tools, config, los
         graphics_off(b)
     else:
         booted(b)
-        assert b.chosen["asahi,t8122-gpu"] == "0" and b.select == "reservation-only"
+        assert b.chosen["asahi,t8122-gpu"] == "0" and b.select == "none"
 
 
 # ---- from /etc/m1n1.conf through update-m1n1 ----
@@ -862,7 +861,7 @@ def test_updater_gpu_on_then_off_keeps_the_gpu_off(tools):
     forwarded = stage1(tools, b"chosen.asahi,efi-system-partition=X\n")
     b = run(tools, "stage2", image + forwarded)
     booted(b)
-    assert b.chosen["asahi,t8122-gpu"] == "0" and b.select == "reservation-only"
+    assert b.chosen["asahi,t8122-gpu"] == "0" and b.select == "none"
 
 
 def test_updater_many_owner_lines_overflow_stage_2_and_keep_graphics_off(tools):
