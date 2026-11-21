@@ -120,8 +120,9 @@ Environment (all optional; 1 enables a switch):
                            T8132): aura starts it from off, then hands it over quiesced (XNU
                            wakes it, "quiesced" kept) or stopped (SLEEP and reset, XNU starts it
                            cold). Instead of AURA_ANS_COLD; needs AURA_ANS_SART
-  AURA_ANS_COLDPATH_CLEAR=1  quiesced: clear the stage's own SART entries too (default: kept,
-                           in memory nobody owns, for a firmware that goes on with its buffers)
+  AURA_ANS_COLDPATH_CLEAR=1  quiesced: clear every aura stage's SART entries (default: those in
+                           memory nothing will allocate are kept, for a firmware that goes on with
+                           its buffers; the rest are cleared)
   AURA_ANS_COLDPATH_AUTO=1   last: iBoot's auto-enable back on the APCIe storage/GP power words
   AURA_ANS_SART=<v>        the nvme.sart= value tools/ans_sart.py printed on the stage that
                            powered ANS off (route: the host chainloads this image from its proxy)
@@ -554,11 +555,17 @@ def ans_coldpath_mode(env, ans_off, sart_passed):
     passed on, and never together with AURA_ANS_COLD (the older cold handoff)."""
     mode = env.get("AURA_ANS_COLDPATH", "")
     if not mode:
+        for knob in ("AURA_ANS_COLDPATH_CLEAR", "AURA_ANS_COLDPATH_AUTO"):
+            if env.get(knob):
+                raise SystemExit(f"{knob} needs AURA_ANS_COLDPATH")
         return None
     if mode not in ("quiesced", "stopped"):
         raise SystemExit(f"AURA_ANS_COLDPATH={mode}: quiesced or stopped")
     if env.get("AURA_ANS_COLD"):
         raise SystemExit("AURA_ANS_COLDPATH and AURA_ANS_COLD are two different handoffs: one only")
+    if mode == "quiesced" and "quiesced" in env.get("AURA_ANS_DROP", "").split(","):
+        raise SystemExit("AURA_ANS_COLDPATH=quiesced keeps \"quiesced\" for XNU: not with "
+                         "AURA_ANS_DROP=quiesced")
     if not ans_off:
         raise SystemExit("AURA_ANS_COLDPATH: ANS is on here; it's for an ANS a stage powered off")
     if not sart_passed:
