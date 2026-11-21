@@ -31,6 +31,8 @@ enum exc_guard_t { GUARD_OFF = 0, GUARD_MARK = 2, GUARD_SILENT = 0x100 };
 static volatile int exc_guard, exc_count;
 static int register_reads, at_el1, probe_stuck_cpu = -1;
 static bool in_el2(void) { return !at_el1; }
+/* It only logs. */
+static void ctxr_exec_check_expected(bool confined) { (void)confined; }
 /* The register whose read faults, as an undefined one would under the guard. */
 static const u64 *fault_reg;
 static u64 read_register(const u64 *reg)

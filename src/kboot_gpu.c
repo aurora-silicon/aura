@@ -2717,7 +2717,7 @@ static int dt_set_gpu_t6031(void *dt)
  * T8122 handoff checks. Power is voted on solely for bounded ID/core-mask
  * reads, then voted off before Linux starts. Neither GPU nor mailbox is enabled.
  */
-static void t8122_read_powered_identity(void *dt, int gpu)
+void t8122_read_powered_identity(void *dt, int gpu)
 {
     if (!t8122_power_probe_opted_in(dt))
         return;
@@ -4390,7 +4390,8 @@ int dt_set_gpu(void *dt)
             int dcp = fdt_path_offset(dt, "dcp"), len;
             const fdt32_t *profile =
                 dcp < 0 ? NULL : fdt_getprop(dt, dcp, "apple,j613-25g83-profile", &len);
-            if (profile && len == 4 && fdt32_ld(profile) == 1) {
+            /* 27.2 (26B123) firmware: the handoff publication only; it leaves the GPU disabled. */
+            if ((profile && len == 4 && fdt32_ld(profile) == 1) || os_firmware.version == V27_2) {
                 t8122_leak_fuse_export(dt);
                 return dt_set_gpu_t8122_26(dt);
             }

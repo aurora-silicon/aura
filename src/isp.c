@@ -115,6 +115,21 @@ u64 isp_iova_base(void)
     }
 }
 
+/*
+ * The ISP17a generation (A18 Pro T8140, M5 T8142) is the one the ADT names "isp,isp-generic-ex"
+ * (the others are "isp,isp-generic-1" or "isp,<soc>"). Its power is split between a global and a
+ * local PMGR aperture and it stays powered for the OS handoff, so it takes its own
+ * power-up, heap and handoff path. The revision register can't tell it apart before that
+ * power-up, so the ADT compatible is the key.
+ */
+bool isp_is_isp17a(void)
+{
+    int node = adt_path_offset(adt, "/arm-io/isp");
+    if (node < 0)
+        node = adt_path_offset(adt, "/arm-io/isp0");
+    return node >= 0 && adt_is_compatible(adt, node, "isp,isp-generic-ex");
+}
+
 static int isp_firmware_end(const struct adt_segment_ranges *segments, u32 length, u64 *end)
 {
     if (!segments || length < 2 * sizeof(*segments) || length % sizeof(*segments))
@@ -135,9 +150,9 @@ int isp_init(void)
     isp_initialized = false;
 
     int err = -1;
-    /* T8142 takes the T8140 (ISP17a) path throughout. */
-    bool t8142 = chip_id == T8142;
-    bool t8140 = chip_id == T8140 || t8142;
+    /* Every ISP17a takes the same path; T8142 keeps its own measured constants below. */
+    bool t8140 = isp_is_isp17a();
+    bool t8142 = t8140 && chip_id == T8142;
     bool powered = false;
     unsigned int local_powered = 0;
     unsigned int global_attempted = 0;

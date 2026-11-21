@@ -61,6 +61,9 @@
 
 #define MAX_MEM_REGIONS 32
 
+/* Room kboot_prepare_dt() leaves for its own additions to the tree (272K). */
+#define DT_EDIT_MARGIN (17 * SZ_16K)
+
 static void *dt = NULL;
 static int dt_bufsize = 0;
 static bool dt_ready;
@@ -1320,15 +1323,6 @@ static int dt_set_speaker_safety(void)
         node = next;
     }
 
-    if (chip_id != T8140)
-        return 0;
-
-    int audio = adt_path_offset(adt, "/product/audio");
-    u32 acoustic_id;
-    if (audio < 0 || ADT_GETPROP(adt, audio, "acoustic-id", &acoustic_id) != sizeof(acoustic_id) ||
-        acoustic_id != 44)
-        return 0;
-
     static const struct {
         const char *adt_name;
         const char *dt_name;
@@ -1344,6 +1338,25 @@ static int dt_set_speaker_safety(void)
           {"speaker-cpms-bgd_1s", "asahi,adt-speaker-cpms-bgd-1s-raw"},
           {"speaker-cpms-bgd_inst", "asahi,adt-speaker-cpms-instant-raw"},
       };
+
+    /*
+     * The profile is published wherever /product/audio carries the speaker CPMS background
+     * values (speaker-cpms-bgd_*), whatever the SoC or board. Without them the ADT describes no
+     * such profile and none is published. With any of them, the acoustic ID and the whole set
+     * above must be there: a partial profile stops the boot rather than publish half of it.
+     */
+    int audio = adt_path_offset(adt, "/product/audio");
+    if (audio < 0)
+        return 0;
+    bool described = false;
+    for (size_t i = 0; i < ARRAY_SIZE(longs); i++)
+        described |= adt_getprop(adt, audio, longs[i].adt_name, NULL) != NULL;
+    if (!described)
+        return 0;
+
+    u32 acoustic_id;
+    if (ADT_GETPROP(adt, audio, "acoustic-id", &acoustic_id) != sizeof(acoustic_id))
+        bail("ADT: incomplete speaker safety profile\n");
     u32 word_values[ARRAY_SIZE(words)];
     u64 long_values[ARRAY_SIZE(longs)];
     for (size_t i = 0; i < ARRAY_SIZE(words); i++)
@@ -1353,8 +1366,17 @@ static int dt_set_speaker_safety(void)
         if (ADT_GETPROP(adt, audio, longs[i].adt_name, &long_values[i]) != sizeof(u64))
             bail("ADT: incomplete speaker safety profile\n");
 
+    /*
+     * J700 (acoustic ID 44) keeps the board compatible its binding names first; every
+     * profile also carries the board-independent one.
+     */
+    static const char j700_compatible[] = "asahi,j700-speaker-safety\0asahi,adt-speaker-safety";
+    static const char adt_compatible[] = "asahi,adt-speaker-safety";
     int node = fdt_add_subnode(dt, chosen, "asahi-speaker-safety");
-    if (node < 0 || fdt_setprop_string(dt, node, "compatible", "asahi,j700-speaker-safety") ||
+    if (node < 0 ||
+        (acoustic_id == 44
+             ? fdt_setprop(dt, node, "compatible", j700_compatible, sizeof(j700_compatible))
+             : fdt_setprop(dt, node, "compatible", adt_compatible, sizeof(adt_compatible))) ||
         fdt_setprop_u32(dt, node, "asahi,schema-version", 1) ||
         fdt_setprop_string(dt, node, "asahi,speaker-output-policy", "forbidden") ||
         fdt_setprop_string(dt, node, "asahi,cpms-value-encoding", "opaque-adt-u64") ||
@@ -2600,6 +2622,30 @@ err:
     return ret;
 }
 
+/*
+ * Whether one of the node's compatible strings starts with prefix. The radios are PCI functions,
+ * named by PCI vendor: "pci14e4," is Broadcom, "pci14c3," is MediaTek.
+ */
+static bool dt_compatible_has_prefix(int node, const char *prefix)
+{
+    int count = fdt_stringlist_count(dt, node, "compatible");
+    size_t plen = strlen(prefix);
+
+    for (int i = 0; i < count; i++) {
+        int len;
+        const char *compatible = fdt_stringlist_get(dt, node, "compatible", i, &len);
+        if (compatible && (size_t)len >= plen && !strncmp(compatible, prefix, plen))
+            return true;
+    }
+    return false;
+}
+
+/* The Wi-Fi and Bluetooth calibration and identity below are Broadcom's. */
+static bool dt_is_broadcom_radio(int node)
+{
+    return dt_compatible_has_prefix(node, "pci14e4,") || dt_compatible_has_prefix(node, "brcm,");
+}
+
 static struct {
     const char *alias;
     const char *fdt_property;
@@ -2658,7 +2704,9 @@ static int dt_set_mac_addresses(void)
         if (fdt_setprop(dt, node, mac_address_devices[i].fdt_property, addr, sizeof(addr)))
             bail("FDT: could not set %s MAC address\n", mac_address_devices[i].alias);
 
-        if (chip_id == T8140 && !strcmp(mac_address_devices[i].alias, "wifi0")) {
+        /* A MediaTek radio's driver takes its address from /chosen as well. */
+        if (!strcmp(mac_address_devices[i].alias, "wifi0") &&
+            dt_compatible_has_prefix(node, "pci14c3,")) {
             int chosen = fdt_path_offset(dt, "/chosen");
             if (chosen < 0 || fdt_setprop(dt, chosen, "asahi,wifi-mac-address", addr, sizeof(addr)))
                 bail("FDT: could not set deferred Wi-Fi MAC address\n");
@@ -2684,10 +2732,6 @@ static int dt_set_bluetooth_cal(int anode, int node, const char *adt_name, const
 
 static int dt_set_bluetooth(void)
 {
-    /* J700's Bluetooth function is part of its PCIe MediaTek radio. */
-    if (chip_id == T8140)
-        return 0;
-
     int ret;
     int anode = adt_path_offset(adt, "/arm-io/bluetooth");
 
@@ -2706,6 +2750,10 @@ static int dt_set_bluetooth(void)
 
     int node = fdt_path_offset(dt, path);
     if (node < 0)
+        return 0;
+
+    /* A Bluetooth function of another vendor (J700's MediaTek radio) has no such blobs. */
+    if (!dt_is_broadcom_radio(node))
         return 0;
 
     ret = dt_set_bluetooth_cal(anode, node, "bluetooth-taurus-calibration-bf",
@@ -2881,8 +2929,8 @@ static int dt_set_wifi(void)
     if (node < 0)
         return 0;
 
-    /* The J700 endpoint is MediaTek, not a Broadcom device. */
-    if (chip_id == T8140)
+    /* The SKU, module and antenna facts below are Broadcom's (J700's radio is MediaTek). */
+    if (!dt_is_broadcom_radio(node))
         return 0;
 
     uint8_t info[16];
@@ -3528,6 +3576,8 @@ static int dt_set_pcie_tunables(void)
 
         memset(fdt_alias, 0, sizeof(adt_path));
         snprintf(fdt_alias, sizeof(fdt_alias), "usb4_%d_pcie", i);
+        if (!fdt_get_alias(dt, fdt_alias))
+            snprintf(fdt_alias, sizeof(fdt_alias), "usb4-%d-pcie", i);
 
         dt_copy_pciec_tunables(adt_path, fdt_alias);
     }
@@ -4025,6 +4075,22 @@ struct mem_region {
     u64 size;
 };
 
+/*
+ * A display device that does not resolve. A DT without that alias does not describe the device
+ * (an older DT without display nodes): skip it, as on any chip. An alias that is there but does
+ * not resolve, or an absolute path a caller took from the DT, names a device the DT describes:
+ * reserving its memory without it would hand the OS a device whose DMA view is unknown, so refuse.
+ */
+static int dt_display_node_unresolved(const char *name)
+{
+    if (name[0] != '/' && !fdt_get_alias(dt, name)) {
+        printf("FDT: no '%s' alias, the device tree describes no such display device\n", name);
+        return 0;
+    }
+    printf("FDT: could not resolve '%s', refusing its display reservations\n", name);
+    return -1;
+}
+
 static int dt_add_reserved_regions(const char *dcp_alias, const char *disp_alias,
                                    const char *piodma_alias, const char *compat,
                                    struct disp_mapping *maps, struct mem_region *region,
@@ -4034,15 +4100,14 @@ static int dt_add_reserved_regions(const char *dcp_alias, const char *disp_alias
     dart_dev_t *dart_dcp = NULL, *dart_disp = NULL, *dart_piodma = NULL;
     uint32_t dcp_phandle = 0, disp_phandle = 0, piodma_phandle = 0;
 
-    /* Check for display device aliases, if one is missing assume it is an old DT
-     * without display nodes and return without error.
+    /* Resolve each display device; dt_display_node_unresolved() decides whether a missing
+     * one is an old DT without display nodes (no error) or a broken one (refused).
      * Otherwise init each dart and retrieve the node's phandle.
      */
     if (dcp_alias) {
         int dcp_node = fdt_path_offset(dt, dcp_alias);
         if (dcp_node < 0) {
-            printf("FDT: could not resolve '%s' alias\n", dcp_alias);
-            ret = chip_id == T8140 ? -1 : 0;
+            ret = dt_display_node_unresolved(dcp_alias);
             goto err; // cleanup
         }
         dart_dcp = dt_init_dart_by_node(dcp_node, 0);
@@ -4054,8 +4119,7 @@ static int dt_add_reserved_regions(const char *dcp_alias, const char *disp_alias
     if (disp_alias) {
         int disp_node = fdt_path_offset(dt, disp_alias);
         if (disp_node < 0) {
-            printf("FDT: could not resolve '%s' alias\n", disp_alias);
-            ret = chip_id == T8140 ? -1 : 0;
+            ret = dt_display_node_unresolved(disp_alias);
             goto err; // cleanup
         }
         dart_disp = dt_init_dart_by_node(disp_node, 0);
@@ -4067,8 +4131,7 @@ static int dt_add_reserved_regions(const char *dcp_alias, const char *disp_alias
     if (piodma_alias) {
         int piodma_node = fdt_path_offset(dt, piodma_alias);
         if (piodma_node < 0) {
-            printf("FDT: could not resolve '%s' alias\n", piodma_alias);
-            ret = chip_id == T8140 ? -1 : 0;
+            ret = dt_display_node_unresolved(piodma_alias);
             goto err; // cleanup
         }
 
@@ -5377,9 +5440,12 @@ static bool dt_j713_dcpext_powered(const char *alias)
 /*
  * J713: iBoot starts both external DCPs and leaves them quiesced, as it does the internal one,
  * with their DARTs set up. Reserve their firmware memory and mark each
- * apple,t8132-dcpext node ready for the kernel to adopt the running controller. Only with the
- * boot.bin config line chosen.asahi,j713-dcpext=1, only after the internal DCP was handed over
- * (an external DCP must never cost the panel), and only for a controller iBoot left powered.
+ * apple,t8132-dcpext node ready for the kernel to adopt the running controller. On by default
+ * wherever the tree describes the controller, unless a config line was lost; the boot.bin config
+ * line chosen.asahi,j713-dcpext=0 turns it off (any value other than 1 does). Only after the
+ * internal DCP was handed over (an external DCP must never cost the panel), only for an
+ * apple,t8132-dcpext node, and only for a controller iBoot left powered. Those are the hardware's
+ * conditions, so the board is not checked.
  */
 static void dt_reserve_j713_dcpext(void)
 {
@@ -5387,8 +5453,12 @@ static void dt_reserve_j713_dcpext(void)
     int len = 0;
     const char *opt = chosen < 0 ? NULL : fdt_getprop(dt, chosen, "asahi,j713-dcpext", &len);
     int dcp = fdt_path_offset(dt, "dcp");
-    bool armed = opt && len == 2 && opt[0] == '1' && opt[1] == '\0' && dcp >= 0 &&
-                 fdt_getprop(dt, dcp, "apple,firmware-uuid", NULL);
+    /*
+     * Without a config line the external displays are handed over, unless a line was lost (an
+     * owner's =0 may be among them); with one, only "1" arms.
+     */
+    bool wanted = opt ? len == 2 && opt[0] == '1' && opt[1] == '\0' : !chosen_lost;
+    bool armed = wanted && dcp >= 0 && fdt_getprop(dt, dcp, "apple,firmware-uuid", NULL);
 
     for (size_t n = 0; n < ARRAY_SIZE(dcpext_aliases); n++) {
         const char *alias = dcpext_aliases[n];
@@ -5403,8 +5473,8 @@ static void dt_reserve_j713_dcpext(void)
             continue;
         }
         if (!armed) {
-            printf("FDT: '%s' firmware not reserved (needs chosen.asahi,j713-dcpext=1 and the "
-                   "internal display handoff); kernel gate remains closed\n",
+            printf("FDT: '%s' firmware not reserved (off by chosen.asahi,j713-dcpext, a lost "
+                   "config line, or no internal display handoff); kernel gate remains closed\n",
                    alias);
             continue;
         }
@@ -8918,16 +8988,22 @@ static int dt_set_sep(void)
         bail("FDT: invalid sep alias path\n");
     memcpy(path, alias, alias_len);
 
-    u64 dram_base = 0, dram_size = 0;
-    if (chip_id == T8140) {
-        int chosen = adt_path_offset(adt, "/chosen");
-        if (chosen < 0 || ADT_GETPROP(adt, chosen, "dram-base", &dram_base) != sizeof(dram_base))
-            bail("ADT: invalid DRAM base for SEP\n");
-        if (ADT_GETPROP(adt, chosen, "dram-size", &dram_size) != sizeof(dram_size))
-            dram_size = mem_size_actual;
-        if (!dram_size || dram_base > UINT64_MAX - dram_size)
-            bail("ADT: invalid DRAM extent for SEP\n");
+    /*
+     * The SEP firmware and the boot-object manifests must lie in physical DRAM. The ADT's
+     * /chosen dram-base and dram-size give it; where an ADT lacks them, the DRAM aura itself maps
+     * (the boot arguments' base rounded down to 4 GiB, and the actual memory size) does.
+     */
+    u64 dram_base = ram_base, dram_size = mem_size_actual;
+    int chosen = adt_path_offset(adt, "/chosen");
+    if (chosen >= 0) {
+        u64 value;
+        if (ADT_GETPROP(adt, chosen, "dram-base", &value) == sizeof(value))
+            dram_base = value;
+        if (ADT_GETPROP(adt, chosen, "dram-size", &value) == sizeof(value))
+            dram_size = value;
     }
+    if (!dram_size || dram_base > UINT64_MAX - dram_size)
+        bail("ADT: invalid DRAM extent for SEP\n");
 
     int anode_mmap = adt_path_offset(adt, "/chosen/memory-map");
     if (anode_mmap < 0)
@@ -8936,9 +9012,8 @@ static int dt_set_sep(void)
     u64 phys_map[2];
     int ret = ADT_GETPROP_ARRAY(adt, anode_mmap, "SEPFW", phys_map);
     if (ret != (int)sizeof(phys_map) || !phys_map[0] || !phys_map[1] ||
-        phys_map[0] > UINT64_MAX - phys_map[1] ||
-        (chip_id == T8140 && (phys_map[0] < dram_base || phys_map[0] > dram_base + dram_size ||
-                              phys_map[1] > dram_base + dram_size - phys_map[0])))
+        phys_map[0] > UINT64_MAX - phys_map[1] || phys_map[0] < dram_base ||
+        phys_map[0] > dram_base + dram_size || phys_map[1] > dram_base + dram_size - phys_map[0])
         bail("ADT: could not get sepfw memory\n");
 
     const char *node_name = "sep-firmware";
@@ -8964,8 +9039,8 @@ static int dt_set_sep(void)
         ret = ADT_GETPROP_ARRAY(adt, anode_manifest, adt_names[i], phys_map);
         if (ret != (int)sizeof(phys_map) || !phys_map[0] || !phys_map[1] ||
             phys_map[1] > (u64)dt_bufsize || phys_map[0] > UINT64_MAX - phys_map[1] ||
-            (chip_id == T8140 && (phys_map[0] < dram_base || phys_map[0] > dram_base + dram_size ||
-                                  phys_map[1] > dram_base + dram_size - phys_map[0]))) {
+            phys_map[0] < dram_base || phys_map[0] > dram_base + dram_size ||
+            phys_map[1] > dram_base + dram_size - phys_map[0]) {
             printf("ADT: no usable SEP %s manifest\n", adt_names[i]);
             continue;
         }
@@ -9208,73 +9283,75 @@ static void dt_set_aop_motion_cal(const char *path)
             }
             copied++;
         }
-        printf("FDT: %s/%s: %d of %d calibration properties\n", path, services[i], copied,
-               (int)ARRAY_SIZE(props));
+        if (copied)
+            printf("FDT: %s/%s: %d of %d calibration properties\n", path, services[i], copied,
+                   (int)ARRAY_SIZE(props));
     }
 }
 
 /*
- * The T6040/T6041 AOP runs its __TEXT and __DATA from its own SRAM, but iBoot
- * leaves its external code (__ETEXT) and its log (__OS_LOG) in DRAM. Reserve
- * those segments with the IOVAs the firmware uses for them (their remap
- * addresses), so that the OS maps them in the AOP's DART before it starts the
- * firmware.
+ * The OS AOP node: the enabled node with an "apple,<soc>-aop" compatible.
+ * Every SoC has one AOP, so no table of SoCs is needed to find it.
  */
-/*
- * M1 Pro (T6000) and M2 (T8112): iBoot starts the AOP firmware itself and the
- * OS needs no firmware segments, but the accelerometer and gyroscope services
- * wait for the same calibration as on the M4 Pro. The ADT carries it in the
- * same properties and container format.
- */
-static int dt_set_aop_motion_cal_only(void)
+static int dt_find_aop(char *path, size_t size)
 {
-    const char *compat = chip_id == T8112 ? "apple,t8112-aop" : "apple,t6000-aop";
-    int node = fdt_node_offset_by_compatible(dt, -1, compat);
-    if (node < 0)
-        return 0;
+    for (int node = fdt_next_node(dt, -1, NULL); node >= 0; node = fdt_next_node(dt, node, NULL)) {
+        int count = fdt_stringlist_count(dt, node, "compatible");
+        bool aop = false;
 
-    const char *status = fdt_getprop(dt, node, "status", NULL);
-    if (status && strcmp(status, "okay") && strcmp(status, "ok"))
-        return 0;
+        for (int i = 0; i < count && !aop; i++) {
+            const char *compat = fdt_stringlist_get(dt, node, "compatible", i, NULL);
+            size_t len = compat ? strlen(compat) : 0;
 
-    char path[64];
-    if (fdt_get_path(dt, node, path, sizeof(path))) {
-        printf("FDT: AOP node path too long\n");
-        return 0;
+            aop = len > 10 && !strncmp(compat, "apple,", 6) && !strcmp(compat + len - 4, "-aop");
+        }
+        if (!aop)
+            continue;
+
+        const char *status = fdt_getprop(dt, node, "status", NULL);
+        if (status && strcmp(status, "okay") && strcmp(status, "ok"))
+            return -1;
+        if (fdt_get_path(dt, node, path, size)) {
+            printf("FDT: AOP node path too long\n");
+            return -1;
+        }
+        return node;
     }
-
-    dt_set_aop_motion_cal(path);
-    return 0;
+    return -1;
 }
 
 static int dt_set_aop_firmware(void)
 {
-    if (chip_id == T6000 || chip_id == T8112)
-        return dt_set_aop_motion_cal_only();
+    char path[64];
 
+    if (dt_find_aop(path, sizeof(path)) < 0)
+        return 0;
+
+    /*
+     * The accelerometer and gyroscope services wait for the machine's
+     * calibration wherever the ADT carries it (M1 Pro, M2, M4, M4 Pro, M5:
+     * range-intr-cal, nominal-extr-cal and range-extr-cal in one container
+     * format). Copy whatever this ADT has.
+     */
+    dt_set_aop_motion_cal(path);
+
+    /*
+     * On these SoCs iBoot leaves the AOP stopped and the OS starts it.
+     * Elsewhere iBoot starts it itself and the OS needs nothing more.
+     */
     if (chip_id != T6040 && chip_id != T6041 && chip_id != T8132)
         return 0;
-
-    int node = fdt_node_offset_by_compatible(
-        dt, -1, chip_id == T8132 ? "apple,t8132-aop" : "apple,t6041-aop");
-    if (node < 0)
-        return 0;
-
-    const char *status = fdt_getprop(dt, node, "status", NULL);
-    if (status && strcmp(status, "okay") && strcmp(status, "ok"))
-        return 0;
-
-    char path[64];
-    if (fdt_get_path(dt, node, path, sizeof(path))) {
-        printf("FDT: AOP node path too long\n");
-        return 0;
-    }
-
-    dt_set_aop_motion_cal(path);
 
     if (chip_id == T8132)
         return dt_set_t8132_aop(path);
 
+    /*
+     * The T6040/T6041 AOP runs its __TEXT and __DATA from its own SRAM, but
+     * iBoot leaves its external code (__ETEXT) and its log (__OS_LOG) in
+     * DRAM. Reserve those segments with the IOVAs the firmware uses for them
+     * (their remap addresses), so that the OS maps them in the AOP's DART
+     * before it starts the firmware.
+     */
     u32 len = 0;
     int anode = adt_path_offset(adt, "/arm-io/aop");
     if (anode < 0 || !adt_getprop(adt, anode, "segment-ranges", &len) || !len ||
@@ -9753,8 +9830,8 @@ static int dt_set_isp(void)
                 return -1;
             resv = fdt_path_offset(dt, "/reserved-memory");
         }
-    } else if ((chip_id == T8140 || chip_id == T8142) &&
-               isp_get_heap(&heap_phys, &heap_iova, &heap_size)) {
+    } else if (isp_is_isp17a() && isp_get_heap(&heap_phys, &heap_iova, &heap_size)) {
+        /* An ISP17a that isp_init() did not bring up has no firmware to reserve. */
         if (!dt_set_isp_fwdata())
             return 0;
     } else if (!dt_reserve_asc_firmware("/arm-io/isp", "/arm-io/isp0", "isp", false,
@@ -9865,6 +9942,23 @@ static int dt_set_j713_isp_one(unsigned int unused)
             phys[i] - dram_base > dram_size - size[i])
             bail("ADT: J713 ISP segment %d 0x%lx+0x%lx outside DRAM\n", i, phys[i], size[i]);
     }
+    /*
+     * The firmware's memory ends at the first 2 MiB boundary above DATA (0x13ec000 -> 20 MiB on
+     * 26.6.2). A firmware whose DATA ends past the tree's window (27.2: 0x1aec000) gets the
+     * window grown to that boundary, within the 64 MiB the window may span; it never shrinks.
+     */
+    u64 heap_grow = 0;
+    if (iova[1] >= heap_base && iova[1] - heap_base < 64 * SZ_1M && size[1] <= 64 * SZ_1M &&
+        iova[1] + size[1] > heap_base + heap_size) {
+        u64 top = ALIGN_UP(iova[1] + size[1], 2 * SZ_1M);
+        if (top - heap_base > 64 * SZ_1M)
+            bail("ADT: J713 ISP DATA ends at 0x%lx, past a 64 MiB firmware window\n",
+                 iova[1] + size[1]);
+        printf("FDT: J713 ISP DATA ends at 0x%lx; firmware window 0x%lx -> 0x%lx\n",
+               iova[1] + size[1], heap_size, top - heap_base);
+        heap_grow = top - heap_base;
+        heap_size = heap_grow;
+    }
     /* TEXT at the start of the firmware's memory, DATA right above it, both below the heap top. */
     if (iova[0] != heap_base || iova[1] != iova[0] + size[0] ||
         size[1] > heap_base + heap_size - iova[1] ||
@@ -9913,6 +10007,14 @@ static int dt_set_j713_isp_one(unsigned int unused)
             return -1;
         printf("FDT: J713 ISP %s at 0x%lx (+0x%lx), runs at 0x%lx\n", i ? "DATA" : "TEXT", phys[i],
                size[i], iova[i]);
+    }
+    if (heap_grow) {
+        fdt32_t window[5] = {cpu_to_fdt32(isp_phandle), cpu_to_fdt32(heap_base >> 32),
+                             cpu_to_fdt32((u32)heap_base), cpu_to_fdt32(heap_grow >> 32),
+                             cpu_to_fdt32((u32)heap_grow)};
+        node = fdt_path_offset(dt, paths[2]);
+        if (node < 0 || fdt_setprop(dt, node, "iommu-addresses", window, sizeof(window)))
+            return -1;
     }
     isp = fdt_node_offset_by_phandle(dt, isp_phandle);
     if (isp < 0 || fdt_setprop_u32(dt, isp, "apple,platform-id", sensor))
@@ -11421,6 +11523,40 @@ static int dt_set_fb2_t8152(void)
     return 0;
 }
 
+static int dt_t8152_dram(u64 *dram, u64 *size)
+{
+    int chosen = adt_path_offset(adt, "/chosen");
+    if (chosen < 0 || ADT_GETPROP(adt, chosen, "dram-base", dram) != 8 ||
+        ADT_GETPROP(adt, chosen, "dram-size", size) != 8 || !*size || *dram > UINT64_MAX - *size)
+        bail("FDT: invalid T8152 display DRAM bounds\n");
+    return 0;
+}
+
+/* Reserve both physical views of every firmware segment of a DCP or its nub,
+ * including the nub-only buffers. The firmware's remap field may differ from phys. */
+static int dt_reserve_t8152_dcp_segments(const char *path, u64 dram, u64 size)
+{
+    int node = adt_path_offset(adt, path);
+    u32 len;
+    const struct adt_segment_ranges *seg =
+        node < 0 ? NULL : adt_getprop(adt, node, "segment-ranges", &len);
+    if (!seg || !len || len % sizeof(*seg))
+        bail("FDT: missing T8152 display segments: %s\n", path);
+    for (u32 s = 0; s < len / sizeof(*seg); s++) {
+        u64 addresses[] = {seg[s].phys, seg[s].remap};
+        for (size_t a = 0; a < ARRAY_SIZE(addresses); a++) {
+            u64 base = addresses[a], count = seg[s].size;
+            if (!count || base < dram || base > dram + size || count > dram + size - base)
+                bail("FDT: invalid T8152 DCP segment %u\n", s);
+            u64 start = ALIGN_DOWN(base, SZ_16K);
+            u64 end = ALIGN_UP(base + count, SZ_16K);
+            if (fdt_add_mem_rsv(dt, start, end - start))
+                bail("FDT: couldn't reserve T8152 DCP segment\n");
+        }
+    }
+    return 0;
+}
+
 /*
  * The J873g (T8152) device trees come with their own loader contract (Linux
  * tools/aurora/j873/loader): the machine is brought up in j873g_run_proxy(),
@@ -11429,34 +11565,10 @@ static int dt_set_fb2_t8152(void)
  */
 static int dt_set_display_t8152(void)
 {
-    int chosen = adt_path_offset(adt, "/chosen");
     u64 dram, size;
-    if (chosen < 0 || ADT_GETPROP(adt, chosen, "dram-base", &dram) != 8 ||
-        ADT_GETPROP(adt, chosen, "dram-size", &size) != 8 || !size || dram > UINT64_MAX - size)
-        bail("FDT: invalid T8152 display DRAM bounds\n");
-    /* Reserve both physical views of every firmware segment, including the
-     * nub-only buffers. The firmware's remap field may differ from phys. */
-    const char *paths[] = {"/arm-io/dcp", "/arm-io/dcp/iop-dcp-nub"};
-    for (size_t i = 0; i < ARRAY_SIZE(paths); i++) {
-        int node = adt_path_offset(adt, paths[i]);
-        u32 len;
-        const struct adt_segment_ranges *seg =
-            node < 0 ? NULL : adt_getprop(adt, node, "segment-ranges", &len);
-        if (!seg || !len || len % sizeof(*seg))
-            bail("FDT: missing T8152 display segments: %s\n", paths[i]);
-        for (u32 s = 0; s < len / sizeof(*seg); s++) {
-            u64 addresses[] = {seg[s].phys, seg[s].remap};
-            for (size_t a = 0; a < ARRAY_SIZE(addresses); a++) {
-                u64 base = addresses[a], count = seg[s].size;
-                if (!count || base < dram || base > dram + size || count > dram + size - base)
-                    bail("FDT: invalid T8152 DCP segment %u\n", s);
-                u64 start = ALIGN_DOWN(base, SZ_16K);
-                u64 end = ALIGN_UP(base + count, SZ_16K);
-                if (fdt_add_mem_rsv(dt, start, end - start))
-                    bail("FDT: couldn't reserve T8152 DCP segment\n");
-            }
-        }
-    }
+    if (dt_t8152_dram(&dram, &size) || dt_reserve_t8152_dcp_segments("/arm-io/dcp", dram, size) ||
+        dt_reserve_t8152_dcp_segments("/arm-io/dcp/iop-dcp-nub", dram, size))
+        return -1;
     int trace[8];
     u64 base, count;
     if (adt_path_offset_trace(adt, "/vram", trace) < 0 ||
@@ -11474,6 +11586,105 @@ static int dt_set_display_t8152(void)
     return 0;
 }
 
+/* The apple,t8152-dcp-iboot node whose coprocessor registers start at @coproc. */
+static int dt_t8152_dcp_node(u64 coproc)
+{
+    int node = -1;
+
+    while ((node = fdt_node_offset_by_compatible(dt, node, "apple,t8152-dcp-iboot")) >= 0) {
+        int len, parent = fdt_parent_offset(dt, node);
+        const fdt64_t *reg = fdt_getprop(dt, node, "reg", &len);
+        if (reg && len >= 16 && parent >= 0 && fdt_address_cells(dt, parent) == 2 &&
+            fdt_size_cells(dt, parent) == 2 && fdt64_ld(reg) == coproc)
+            return node;
+    }
+    return -1;
+}
+
+/* One DCPEXT's handoff, in a display transaction: all of it or nothing. */
+static int dt_set_dcpext_t8152_one(unsigned int n)
+{
+    char path[24], nub[48];
+    u64 dram, size, coproc;
+    int trace[8];
+
+    snprintf(path, sizeof(path), "/arm-io/dcpext%u", n);
+    snprintf(nub, sizeof(nub), "%s/iop-dcpext%u-nub", path, n);
+    if (adt_path_offset_trace(adt, path, trace) < 0 ||
+        adt_get_reg(adt, trace, "reg", 0, &coproc, NULL) < 0 || dt_t8152_dram(&dram, &size) ||
+        dt_reserve_t8152_dcp_segments(path, dram, size) ||
+        dt_reserve_t8152_dcp_segments(nub, dram, size))
+        return -1;
+    int node = dt_t8152_dcp_node(coproc);
+    if (node < 0 || fdt_setprop_u32(dt, node, "apple,afk-active-endpoints", 0) ||
+        fdt_setprop_empty(dt, node, "apple,rtkit-wake"))
+        return -1;
+    return 0;
+}
+
+/*
+ * J873g DCPEXT0 and DCPEXT1 that aura did not start: iBoot loaded their firmware
+ * and left the coprocessor running, waiting for the RTKit wake, with no AFK
+ * endpoint started. apple_dcpib wakes such a controller for a USB-C display
+ * once its firmware is reserved and the node carries apple,rtkit-wake and
+ * apple,afk-active-endpoints. Only a controller found in that state gets them;
+ * a promise left in the tree is withdrawn first. Read only: the coprocessor is
+ * read only after its PSD service reads powered, as a read while gated hangs.
+ */
+static void dt_set_dcpext_t8152(void)
+{
+    for (unsigned int n = 0; n < 2; n++) {
+        char path[24];
+        u64 coproc;
+        u32 gate;
+        int trace[8];
+
+        snprintf(path, sizeof(path), "/arm-io/dcpext%u", n);
+        int adt_node = adt_path_offset_trace(adt, path, trace);
+        if (adt_node < 0 || adt_get_reg(adt, trace, "reg", 0, &coproc, NULL) < 0 ||
+            ADT_GETPROP(adt, adt_node, "power-gates", &gate) != sizeof(gate))
+            continue;
+        int node = dt_t8152_dcp_node(coproc);
+        if (node < 0)
+            continue;
+        int ret = fdt_delprop(dt, node, "apple,rtkit-wake");
+        if (ret && ret != -FDT_ERR_NOTFOUND) {
+            printf("FDT: cannot clear the dcpext%u wake handoff\n", n);
+            continue;
+        }
+        /*
+         * An HDMI session aura started is a running one, not one to wake. Its
+         * apple,afk-active-endpoints would describe that session's live
+         * endpoints. Publishing or withdrawing it is the display hand-off's
+         * job (dt_set_display_t8152() runs first), so it is not touched here.
+         */
+        if (n == 0 && display_second_attempted()) {
+            printf("FDT: dcpext0 was started by aura; no RTKit wake handoff\n");
+            continue;
+        }
+        node = dt_t8152_dcp_node(coproc);
+        ret = node < 0 ? node : fdt_delprop(dt, node, "apple,afk-active-endpoints");
+        if (ret && ret != -FDT_ERR_NOTFOUND) {
+            printf("FDT: cannot clear the dcpext%u AFK report\n", n);
+            continue;
+        }
+        u32 state = t8152_psd_state(gate);
+        asc_dev_t *asc = state ? NULL : asc_init(path);
+        bool running = asc && asc_cpu_running(asc);
+        asc_free(asc);
+        if (!running) {
+            printf("FDT: dcpext%u is not waiting for a wake (PSD state %u); kernel gate remains "
+                   "closed\n",
+                   n, state);
+            continue;
+        }
+        if (dt_display_transaction(dt_set_dcpext_t8152_one, n))
+            printf("FDT: dcpext%u firmware not reserved; kernel gate remains closed\n", n);
+        else
+            printf("FDT: dcpext%u firmware reserved, left to the kernel to wake\n", n);
+    }
+}
+
 static int dt_prepare_t8152(void)
 {
     if (fdt_getprop(dt, 0, "aurora,minimal-boot", NULL)) {
@@ -11483,6 +11694,7 @@ static int dt_prepare_t8152(void)
             bail("FDT: T8152 requires the t8122 AIC3 fallback\n");
         if (dt_set_serial_number() || dt_set_display_t8152() || dt_set_gpu(dt))
             return -1;
+        dt_set_dcpext_t8152();
     }
     if (dt_set_cpus())
         return -1;
@@ -11612,26 +11824,15 @@ int kboot_prepare_dt(void *fdt)
     dt_bufsize = fdt_totalsize(fdt);
     assert(dt_bufsize);
 
-    dt_bufsize += 6 * SZ_16K; // Add 96K of buffer for modifications
-    dt_bufsize += SZ_16K;     // and the SMBIOS description U-Boot builds its tables from (about 6K)
-    // A T6030 or T8122 also takes its PMP values
-    if (chip_id == T6030 || chip_id == T8122)
-        dt_bufsize += 2 * SZ_16K;
-    // A T8122 also takes its GPU and PMP facts and the display clock description
-    if (chip_id == T8122)
-        dt_bufsize += 8 * SZ_16K;
-    // A T6030 also takes its display ADT facts (at most 46K, headers and strings included)
-    if (chip_id == T6030)
-        dt_bufsize += 4 * SZ_16K;
-    // A T6031 takes its PMP values (32K) and its display, GPU and firmware handoff (about 16K)
-    if (chip_id == T6031)
-        dt_bufsize += 4 * SZ_16K;
-    // A T6032 takes only its firmware image UUID list (about 16K)
-    if (chip_id == T6032)
-        dt_bufsize += SZ_16K;
-    // A T6040 takes its PMP values (about 38K) and its firmware handoffs
-    if (chip_id == T6040)
-        dt_bufsize += 4 * SZ_16K;
+    /*
+     * Room for what kboot adds to the tree. One margin on every Mac, sized for the largest
+     * addition kboot makes on any SoC today: 96K of general edits, about 6K of SMBIOS description
+     * U-Boot builds its tables from, and up to 160K of handoff data (a T8122's PMP values, GPU and
+     * PMP facts and display clock description; a T6030's PMP values and display ADT facts, at
+     * most 46K; a T6031's or T6040's PMP values and firmware handoffs; a T6032's firmware UUID
+     * list).
+     */
+    dt_bufsize += DT_EDIT_MARGIN;
     dt = memalign(DT_ALIGN, dt_bufsize);
 
     if (fdt_open_into(fdt, dt, dt_bufsize) < 0)

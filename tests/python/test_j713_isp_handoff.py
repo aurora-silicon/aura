@@ -204,13 +204,35 @@ int main(void)
     assert(heap && len == 20 && fdt32_ld(heap + 4) == 0x1400000);
     assert(!fdt_getprop(dt, fdt_path_offset(dt, "/reserved-memory/isp-heap"), "reg", NULL));
 
+    /*
+     * 27.2 (26B123) on this J713: DATA ends at 0x1aec000, past the tree's 20 MiB window. The
+     * window grows to the next 2 MiB boundary (28 MiB) and the ISP is handed over.
+     */
+    world(DTB_PATH);
+    segments[0] = (struct adt_segment_ranges){.phys = 0x10000d78000ULL, .iova = 0,
+        .remap = 0x10000000000ULL, .size = 0xcd0000, .unk = 1};
+    segments[1] = (struct adt_segment_ranges){.phys = 0x10001f5c000ULL, .iova = 0xcd0000,
+        .remap = 0x10000cd0000ULL, .size = 0xe1c000};
+    dt_set_j713_isp();
+    check_region("/reserved-memory/isp-firmware-text", 0x10000d78000ULL, 0x10000000000ULL,
+                 0xcd0000);
+    check_region("/reserved-memory/isp-firmware-data", 0x10001f5c000ULL, 0x10000cd0000ULL,
+                 0xe1c000);
+    assert(!strcmp(status("/soc/isp@48c000000"), "okay"));
+    heap = fdt_getprop(dt, fdt_path_offset(dt, "/reserved-memory/isp-heap"), "iommu-addresses",
+                       &len);
+    assert(heap && len == 20 && fdt32_ld(heap) ==
+           (u32)fdt_get_phandle(dt, fdt_path_offset(dt, "/soc/isp@48c000000")));
+    assert(fdt32_ld(heap + 1) == 0x100 && fdt32_ld(heap + 2) == 0 && fdt32_ld(heap + 3) == 0 &&
+           fdt32_ld(heap + 4) == 0x1c00000);
+
     /* Every refusal leaves the tree exactly as it was: the camera stays off. */
     for (fault = 1; fault <= 12; fault++) {
         world(DTB_PATH);
         if (fault == 1) names = "__TEXT";
         if (fault == 3) segments[1].remap += SZ_16K; /* DATA not right above TEXT */
         if (fault == 4) dram_base = 0x10001000000ULL; /* TEXT below DRAM */
-        if (fault == 5) segments[1].size = 0x800000; /* DATA past the heap top */
+        if (fault == 5) segments[1].size = 0x1500000; /* DATA larger than the whole window */
         if (fault == 6) segments[1].phys = 0x10000d34000ULL; /* overlapping segments */
         if (fault == 7) {
             fdt32_t window[5] = {0};

@@ -162,6 +162,14 @@ static int get_value(int node, const char *name, void *out, size_t cap)
     return len;
 }
 #define ADT_GETPROP(a, n, k, v) get_value(n, k, v, sizeof(*(v)))
+/* As in src/isp.c: an ISP17a is an ADT isp node compatible with isp,isp-generic-ex */
+static bool isp_is_isp17a(void)
+{
+    int node = adt_path_offset(adt, "/arm-io/isp");
+    if (node < 0)
+        node = adt_path_offset(adt, "/arm-io/isp0");
+    return node >= 0 && adt_is_compatible(adt, node, "isp,isp-generic-ex");
+}
 ''' + needs_init + dapf_slices + dapf_ranges + kboot_fn("static bool dt_isp_has_placeholders(") +
         kboot_fn("static int dt_fill_isp_placeholders(") + kboot_fn("static int dt_set_isp_fwdata(") +
         kboot_fn("static int dt_set_isp(") + kboot_fn("static int dt_finish_j614s_isp(") + r'''

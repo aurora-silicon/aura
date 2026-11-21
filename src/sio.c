@@ -184,12 +184,12 @@ static struct copy_rule copy_rules_v10[] = {
 };
 
 /*
- * The T6040/T6041 (M4 Pro/Max) and T8140 (MacBook Neo) SIO firmware also reports protocol 10, but
- * its tables differ from T6030's: only the shim records the ADT describes end in the all-ones
- * selector (the empty slots stay zero), and the response array (key 0x0b) belongs to the OS driver,
- * which publishes it as an entry count along with the segment array. The tables live in the SIO
- * DART's address space, which on these SoCs begins after the preloaded firmware's segments
- * (sio_iova_base()).
+ * The SIO firmware that iBoot remaps above 4 GiB (T6040/T6041, T8140, T6050: sio_segments_high())
+ * also reports protocol 10, but its tables differ from T6030's: only the shim records the ADT
+ * describes end in the all-ones selector (the empty slots stay zero), and the response array (key
+ * 0x0b) belongs to the OS driver, which publishes it as an entry count along with the segment
+ * array. The tables live in the SIO DART's address space, which there begins after the preloaded
+ * firmware's segments (sio_iova_base()).
  */
 static struct copy_rule copy_rules_t6041[] = {
     {
@@ -230,34 +230,59 @@ static struct copy_rule copy_rules_t6041[] = {
 };
 
 /*
- * Where the tables go in the SIO's address space: 0x30000 on earlier SoCs; on T6041 and T8140 the
- * first 16K page past the remapped firmware segments iBoot loaded, inside the SIO DART's window.
+ * iBoot preloads the SIO firmware and describes its segments in the ADT's segment-ranges, with the
+ * address each is remapped to in the SIO's DART. That address says which address space the
+ * firmware runs in, and so where its tables go and which layout it takes:
+ * - on M1 and M2 (T8103, T8112, T600x) the segments sit low (remap 0x200000), and the tables go at
+ *   0x30000, below them, in the earlier layout;
+ * - from the M4 generation on (T6040/T6041, T8140, T6050; the T8132 and T8152 ADTs too) they sit
+ *   at 1 TiB (remap 0x10000000000), where 0x30000 is outside the space, so the tables go on the
+ *   first 16K page past the segments, in the T6041 layout.
+ * Returns 1 for segments above 4 GiB, 0 for low or no segments and -1 for a malformed property,
+ * with the end of the highest segment in *end.
  */
-static int sio_iova_base(int node, u64 *base)
+static int sio_segments_high(int node, u64 *end)
 {
-    if (chip_id != T6040 && chip_id != T6041 && chip_id != T8140 && chip_id != T6050) {
-        *base = 0x30000;
-        return 0;
-    }
-
     u32 len;
     const struct adt_segment_ranges *seg = adt_getprop(adt, node, "segment-ranges", &len);
-    if (!seg || !len || len % sizeof(*seg)) {
-        printf("sio: missing or bad segment-ranges\n");
+
+    *end = 0;
+    if (!seg || !len) {
+        printf("sio: no firmware segments in the ADT\n");
+        return 0;
+    }
+    if (len % sizeof(*seg)) {
+        printf("sio: bad segment-ranges\n");
         return -1;
     }
 
-    u64 end = 0;
+    u64 lowest = UINT64_MAX;
     for (u32 i = 0; i < len / sizeof(*seg); i++) {
         if (!seg[i].remap || !seg[i].size || seg[i].remap > UINT64_MAX - seg[i].size) {
             printf("sio: bad firmware segment %u\n", i);
             return -1;
         }
-        end = max(end, seg[i].remap + seg[i].size);
+        lowest = min(lowest, seg[i].remap);
+        *end = max(*end, seg[i].remap + seg[i].size);
     }
+    return (lowest >> 32) ? 1 : 0;
+}
+
+/*
+ * Where the tables go in the SIO's address space: 0x30000 when the firmware's segments sit low, or
+ * the first 16K page past them when iBoot remapped them into the high window. T6030's firmware
+ * takes them at 0x30000 (7e7981d2, measured on that SoC), so it keeps that address.
+ */
+static int sio_iova_base(int high, u64 end, u64 *base)
+{
+    if (!high || chip_id == T6030) {
+        *base = 0x30000;
+        return 0;
+    }
+
     *base = ALIGN_UP(end, SZ_16K);
     /* Every table address goes to the firmware as a 32-bit page number. */
-    if (!end || *base < end || (*base + SZ_1M) >> 12 > UINT32_MAX) {
+    if (*base < end || (*base + SZ_1M) >> 12 > UINT32_MAX) {
         printf("sio: firmware segments end at %lx, no room for tables\n", end);
         return -1;
     }
@@ -289,19 +314,29 @@ struct sio_data *sio_setup_fwdata(const char *adt_path)
         goto err;
     }
 
-    if (sio_iova_base(node, &siodata->iova_base))
+    u64 segments_end;
+    int high = sio_segments_high(node, &segments_end);
+    if (high < 0 || sio_iova_base(high, segments_end, &siodata->iova_base))
         goto err;
 
     struct copy_rule *rules = copy_rules;
     int nrules = ARRAY_SIZE(copy_rules);
+    const char *layout = "earlier";
 
+    /*
+     * T6030 reports the same protocol 10 as the high-window firmware but takes its own layout
+     * (7e7981d2), and nothing in the ADT tells the two apart.
+     */
     if (chip_id == T6030) {
         rules = copy_rules_v10;
         nrules = ARRAY_SIZE(copy_rules_v10);
-    } else if (chip_id == T6040 || chip_id == T6041 || chip_id == T8140 || chip_id == T6050) {
+        layout = "T6030";
+    } else if (high) {
         rules = copy_rules_t6041;
         nrules = ARRAY_SIZE(copy_rules_t6041);
+        layout = "high-window";
     }
+    printf("sio: %s tables at 0x%lx\n", layout, siodata->iova_base);
 
     for (int i = 0; i < nrules; i++) {
         struct copy_rule *rule = &rules[i];
@@ -321,8 +356,8 @@ struct sio_data *sio_setup_fwdata(const char *adt_path)
         }
 
         if (!rule->keyed) {
-            /* T6050's asio-ascwrap-tunables is empty: no parameter is sent for it. */
-            if (!len && chip_id == T6050)
+            /* An empty property (T6050's asio-ascwrap-tunables) sends no parameter. */
+            if (!len)
                 continue;
             u8 *sio_blob = add_fwdata(siodata, len, rule->fw_param);
             if (!sio_blob)

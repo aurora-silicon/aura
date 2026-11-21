@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-"""ctxr_exec_confined() decides by its probe alone, on every chip."""
+"""ctxr_exec_confined() decides the same way on every chip: an armed CTXR_D, else its probe."""
 
 from test_smp_timeouts import REPO, compile_and_run
 
@@ -25,6 +25,7 @@ typedef uint64_t u64; typedef uint32_t u32;
 #define SZ_16K 16384
 #define T6040 0x6040
 #define T6041 0x6041
+#define T6050 0x6050
 #define T8112 0x8112
 #define T8140 0x8140
 #define T8142 0x8142
@@ -105,15 +106,20 @@ static int run(int chip, int alive, int faults) {
     return ret;
 }
 int main(void) {
-    /* M4 Pro / M4 Max / A18 Pro / M5 with the windows armed. */
+    /* Confined chips (M4 Pro / M4 Max / A18 Pro / M5) whose CTXR_D did not read armed: the
+     * probe faults and decides. */
     int chips[] = { T6040, T6041, T8140, T8142, 0x1234 };
     for (unsigned i = 0; i < sizeof(chips) / sizeof(chips[0]); i++) {
         assert(run(chips[i], 0x2, 1) == 1 && calls == 1 && printed == 1);
     }
-    /* M1 to M3, or any raw boot object: the probe runs and nothing is confined. */
+    /* M1 to M3, or any raw boot object: CTXR_D is not armed, the probe runs, nothing is confined. */
     for (unsigned i = 0; i < sizeof(chips) / sizeof(chips[0]); i++)
-        assert(run(chips[i], 0x2, 0) == 0 && calls == 1 && printed == 0 && !reads);
-    assert(run(T8112, 0xe, 0) == 0 && calls == 1 && !reads);
+        assert(run(chips[i], 0x2, 0) == 0 && calls == 1 && printed == 0 && reads == 2);
+    assert(run(T8112, 0xe, 0) == 0 && calls == 1 && reads == 2);
+    /* Where reading CTXR_D faults (M1 to M3), the probe still runs. */
+    reads_fault = 1;
+    assert(run(T8112, 0x2, 0) == 0 && calls == 1 && printed == 0);
+    reads_fault = 0;
     /* A probe that never ran is not evidence of confinement: say so, do not refuse. */
     chip_id = T8112; alive_mask = 0x2; probe_faults = 0; calls = 0; printed = 0; call_fails = -1;
     assert(ctxr_exec_confined() == 0 && calls == 1 && printed == 1 && probe_stuck_cpu < 0);
@@ -142,6 +148,18 @@ int main(void) {
     assert(run(T6040, 0x1, 1) == 0 && calls == 0 && printed == 1 && !reads);
     assert(strstr(last_format, "not armed"));
     at_el1 = 0;
+    /*
+     * An armed CTXR_D with a secondary running is the answer: no probe is sent, on any chip.
+     * A T6050 secondary hangs on a fetch outside the window instead of faulting.
+     */
+    SYS_IMP_APL_CTXR_D_LWR_EL1 = 0x10006238000; SYS_IMP_APL_CTXR_D_UPR_EL1 = 0x10006577000;
+    int armed_chips[] = { T6040, T6041, T6050, T8112, T8140, T8142, 0x1234 };
+    for (unsigned i = 0; i < sizeof(armed_chips) / sizeof(armed_chips[0]); i++)
+        assert(run(armed_chips[i], 0x2, 0) == 1 && calls == 0 && printed == 1 && reads == 2);
+    /* Without a window for the OS it is still confined; refusing the OS is then left to
+     * ctxr_exec_os_may_start(). */
+    assert(window_problem && run(T6050, 0x6, 1) == 1 && calls == 0);
+    SYS_IMP_APL_CTXR_D_LWR_EL1 = 0; SYS_IMP_APL_CTXR_D_UPR_EL1 = 0;
     puts("ctxr exec probe OK");
     return 0;
 }
@@ -235,7 +253,7 @@ def build(tmp_path, cases_source):
     compile_and_run(tmp_path, "ctxr_exec_probe", HARNESS % body + MAIN)
 
 
-def test_probe_decides_on_every_chip(tmp_path):
+def test_confinement_is_decided_the_same_on_every_chip(tmp_path):
     build(tmp_path, None)
 
 
