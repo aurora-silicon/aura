@@ -48,9 +48,11 @@ u32 chip_id;
 volatile enum exc_guard_t exc_guard;
 volatile int exc_count;
 struct fw_version_info os_firmware;
-const struct fw_version_info fw_versions[V26_6_2 + 1] = {
+const struct fw_version_info fw_versions[V27_2 + 1] = {
     [V14_7] = {V14_7, "14.7", {14, 7, 0}, 3, "iBoot"},
     [V26_6_2] = {V26_6_2, "26.6.2", {26, 6, 2}, 3, "mBoot-18000.161.10"},
+    [V27_0] = {V27_0, "27.0", {27, 0, 0}, 3, "mBoot-20457.1.29"},
+    [V27_2] = {V27_2, "27.2", {27, 2, 0}, 3, "mBoot-20457.41.3"},
 };
 
 /* As src/firmware.c: an iBoot of the 18000.161.10 train loads the 26.6.2 images. */
@@ -868,11 +870,14 @@ static void contract_check(const void *dt)
               status_is(dt, fdt_node_offset_by_phandle(dt, PH_MBOX), "disabled"),
           "published: dcp, display, both DARTs and the mailbox left disabled, piodma untouched");
     const char *uuid = fdt_getprop(dt, dcp, "apple,firmware-uuid", NULL);
-    check(uuid && !strcmp(uuid, DCP_UUID), "published: dcp apple,firmware-uuid is the ADT's");
-    const u32 v26[3] = {26, 6, 2};
-    check(u32s_are(dt, dcp, "apple,firmware-version", v26, 3) &&
-              u32s_are(dt, dcp, "apple,firmware-compat", v26, 3),
-          "published: dcp apple,firmware-version and -compat are the 26.6.2 images");
+    const char *expected_uuid =
+        adt_getprop(adt, adt_path_offset(adt, "/arm-io/dcp/iop-dcp-nub"), "uuid", NULL);
+    check(uuid && expected_uuid && !strcmp(uuid, expected_uuid),
+          "published: dcp apple,firmware-uuid is the ADT's");
+    const u32 *want_ver = fw_versions[firmware_os_components()].num;
+    check(u32s_are(dt, dcp, "apple,firmware-version", want_ver, 3) &&
+              u32s_are(dt, dcp, "apple,firmware-compat", want_ver, 3),
+          "published: dcp apple,firmware-version and -compat match the component release");
 
     check(linked_segments(dt, dcp) == (1u << NSEGS) - 1 && region_count(dt, dcp) == NSEGS,
           "published: every iop-dcp-nub segment is one dcp memory-region");
@@ -932,7 +937,10 @@ static int dt_diff(const void *in, const void *out, const char *const *extra)
                 const void *v = fdt_getprop_by_offset(a, prop, &name, &len);
                 const void *ov = fdt_getprop(b, other, name, &olen);
                 if (!ov || olen != len || memcmp(v, ov, len)) {
-                    printf("     %s: %s %s\n", path, name, ov ? "changed" : pass ? "removed" : "added");
+                    printf("     %s: %s %s\n", path, name,
+                           ov     ? "changed"
+                           : pass ? "removed"
+                                  : "added");
                     diffs++;
                 }
             }
@@ -1001,7 +1009,8 @@ static const struct scenario scenarios[] = {
     {"stale-optin-zero", PUBLISH, "a left-over chosen.asahi,t6041-dcp=0 does not disable it"},
     {"repeat", PUBLISH, "a second call adds nothing"},
     {"oslog-in-memreserve", PUBLISH, "an __OS_LOG wholly inside a /memreserve/ is still described"},
-    {"os-26-7-train", PUBLISH, "26.7.1 booted by an 18000.161.10 train iBoot publishes the 26.6.2 images"},
+    {"os-26-7-train", PUBLISH,
+     "26.7.1 booted by an 18000.161.10 train iBoot publishes the 26.6.2 images"},
     /* chip, board and device tree */
     {"wrong-chip", NOTHING, "chip T6041 with a T6040 device tree"},
     {"wrong-board", NOTHING, "an unsupported T6040 board"},
@@ -1089,11 +1098,11 @@ int main(int argc, char **argv)
     bool j616c = !strncmp(s, "j616c", 5), j614c = !strncmp(s, "j614c", 5);
     _Static_assert(sizeof(J616C) == sizeof(J616S), "root compatibles of equal length");
     _Static_assert(sizeof(J614C) == sizeof(J616S), "root compatibles of equal length");
-    const char *board = is(s, "wrong-board")                            ? OTHER
+    const char *board = is(s, "wrong-board")                              ? OTHER
                         : (is(s, "j614-no-optin") || is(s, "j614-optin")) ? J614S
-                        : j616c                                          ? J616C
-                        : j614c                                          ? J614C
-                                                                         : J616S;
+                        : j616c                                           ? J616C
+                        : j614c                                           ? J614C
+                                                                          : J616S;
     build_dt(dt, board, sizeof(J616S));
     if (is(s, "external") || is(s, "external-refuse") || is(s, "j616c-external") ||
         is(s, "j614c-external")) {
@@ -1128,7 +1137,8 @@ int main(int argc, char **argv)
     if (is(s, "wrong-os") || is(s, "stale-optin-wrong-os"))
         os_firmware = (struct fw_version_info){V14_7, "14.7", {14, 7, 0}, 3, "iBoot"};
     if (is(s, "os-26-7-train"))
-        os_firmware = (struct fw_version_info){V26_7, "26.7", {26, 7, 0}, 3, "mBoot-18000.161.10.701.1"};
+        os_firmware =
+            (struct fw_version_info){V26_7, "26.7", {26, 7, 0}, 3, "mBoot-18000.161.10.701.1"};
     if (is(s, "unknown-os"))
         os_firmware = (struct fw_version_info){V_UNKNOWN, "unknown", {0}, 0, "unknown"};
     if (is(s, "bad-uuid"))
@@ -1177,8 +1187,8 @@ int main(int argc, char **argv)
     if (is(s, "oslog-straddles"))
         OK(fdt_add_mem_rsv(dt, segs[SEG_OSLOG].phys + 0x4000, seg_size(SEG_OSLOG)));
     int chosen = fdt_path_offset(dt, "/chosen");
-    if (is(s, "j614-optin") || is(s, "stale-optin") || is(s, "stale-optin-no-dcp") || is(s, "stale-optin-wrong-disp") ||
-        is(s, "stale-optin-wrong-os"))
+    if (is(s, "j614-optin") || is(s, "stale-optin") || is(s, "stale-optin-no-dcp") ||
+        is(s, "stale-optin-wrong-disp") || is(s, "stale-optin-wrong-os"))
         OK(fdt_setprop_string(dt, chosen, OPTIN, "1"));
     if (is(s, "stale-optin-zero"))
         OK(fdt_setprop_string(dt, chosen, OPTIN, "0"));
@@ -1241,12 +1251,12 @@ int main(int argc, char **argv)
                 check(ready == (i != 0 || !is(s, "external-refuse")),
                       "external memory is ready exactly when its ADT passed");
                 if (ready) {
-                    u64 want_phys = j == 0 ? segs[SEG_TEXT].phys :
-                        j == 1 ? TB + 0x281200000ULL + i * 0x200000 :
-                                 TB + 0x282200000ULL + i * 0x200000;
-                    u64 want_dva = j == 0 ? segs[SEG_TEXT].remap :
-                        j == 1 ? TB + 0x51000000 + i * 0x100000 :
-                                 TB + 0x52000000 + i * 0x100000;
+                    u64 want_phys = j == 0   ? segs[SEG_TEXT].phys
+                                    : j == 1 ? TB + 0x281200000ULL + i * 0x200000
+                                             : TB + 0x282200000ULL + i * 0x200000;
+                    u64 want_dva = j == 0   ? segs[SEG_TEXT].remap
+                                   : j == 1 ? TB + 0x51000000 + i * 0x100000
+                                            : TB + 0x52000000 + i * 0x100000;
                     u64 want_size = j == 0 ? seg_size(SEG_TEXT) : j == 1 ? 0x8000 : 0x10000;
                     const fdt64_t *r = fdt_getprop(dt, region, "reg", &len);
                     fdt64_t map_dva, map_size;

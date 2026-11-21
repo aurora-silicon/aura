@@ -25,7 +25,8 @@ def function(source, name):
 
 
 def macro(source, name):
-    lines = [line for line in source.splitlines() if line.startswith("#define " + name + "(")]
+    lines = [line for line in source.splitlines()
+             if re.match(r"#define " + name + r"[(\s]", line)]
     assert lines, name
     return lines[0]
 
@@ -97,10 +98,13 @@ static size_t ringbuffer_get_used(ringbuffer_t *r) {return r->write - r->read;}
 static size_t ringbuffer_read(void *b, size_t n, ringbuffer_t *r) {size_t k = r->write - r->read; k = k < n ? k : n; memset(b, 0, k); r->read += k; return k;}
 static u64 get_ticks(void) {return now_ms;}
 static u64 ticks_to_msecs(u64 t) {return t;}
-static int close_after = -1, stuck_ms = 0;
+static int close_after = -1, stuck_ms = 0, drain_polls = 0;
 static dwc3_dev_t d;
 static void usb_dwc3_handle_events(dwc3_dev_t *dev) {
     events_polled++; now_ms += stuck_ms;
+    /* A host that reads takes one byte per poll, for drain_polls polls. */
+    ringbuffer_t *tx = dev->pipe[0].device2host;
+    if (drain_polls > 0 && tx->read < tx->write) {tx->read++; drain_polls--;}
     if (close_after >= 0 && events_polled >= close_after) dev->pipe[0].ready = false;
 }
 static void usb_dwc3_cdc_start_bulk_out_xfer(dwc3_dev_t *dev, u8 ep) {(void)dev; assert(ep == 4); out_arms++;}
@@ -112,7 +116,8 @@ static ringbuffer_t rb[4];
 static void setup(void) {
     memset(&d, 0, sizeof(d)); memset(hw_owned, 0, sizeof(hw_owned));
     ends = setup_starts = setup_failures = out_arms = in_kicks = events_polled = 0;
-    address = 29; enabled = 63; now_ms = 0; close_after = -1; stuck_ms = 0; chip_id = T8122;
+    address = 29; enabled = 63; now_ms = 0; close_after = -1; stuck_ms = 0; drain_polls = 0;
+    chip_id = T8122;
     for (int i = 0; i < 2; i++) {
         d.pipe[i].ready = true; d.pipe[i].host2device = &rb[2 * i]; d.pipe[i].device2host = &rb[2 * i + 1];
         rb[2 * i] = (ringbuffer_t){0, 0}; rb[2 * i + 1] = (ringbuffer_t){0, 0};
@@ -157,10 +162,24 @@ int main(void) {
     setup(); rb[1] = (ringbuffer_t){0, 100}; close_after = 3;
     usb_dwc3_flush(&d, 0);
     assert(events_polled == 3 && in_kicks == 3);
-    /* An open pipe whose host never reads is bounded to 3 s on T8122. */
-    setup(); rb[1] = (ringbuffer_t){0, 100}; stuck_ms = 10;
+    /* An open pipe whose host never reads is bounded to CDC_IO_TIMEOUT_MS on every chip, not
+     * only on the ones that once had the bound (T8122, M1 here). */
+    static const u32 chips[] = {T8122, 0x8103};
+    for (unsigned i = 0; i < ARRAY_SIZE(chips); i++) {
+        setup(); chip_id = chips[i]; rb[1] = (ringbuffer_t){0, 100}; stuck_ms = 10;
+        usb_dwc3_flush(&d, 0);
+        assert(now_ms >= CDC_IO_TIMEOUT_MS && now_ms < CDC_IO_TIMEOUT_MS + 100);
+        assert(ringbuffer_get_used(&rb[1]) == 100);
+    }
+    /* A host that keeps reading is not cut off, however long the whole flush takes. */
+    setup(); rb[1] = (ringbuffer_t){0, 100}; stuck_ms = 50; drain_polls = 100;
     usb_dwc3_flush(&d, 0);
-    assert(now_ms >= 3000 && now_ms < 3100);
+    assert(!ringbuffer_get_used(&rb[1]) && now_ms > CDC_IO_TIMEOUT_MS);
+    /* One that stops reading part way is bounded from its last read. */
+    setup(); rb[1] = (ringbuffer_t){0, 100}; stuck_ms = 50; drain_polls = 40;
+    usb_dwc3_flush(&d, 0);
+    assert(ringbuffer_get_used(&rb[1]) == 60);
+    assert(now_ms >= 40 * 50 + CDC_IO_TIMEOUT_MS && now_ms < 40 * 50 + CDC_IO_TIMEOUT_MS + 100);
 
     /* A read in progress returns short when the pipe closes. */
     setup(); rb[0] = (ringbuffer_t){0, 4}; close_after = 2;
@@ -181,7 +200,7 @@ int main(void) {
 
 
 def build(tmp_path, source, name):
-    parts = [macro(source, "CDC_LOOP_READY")] + [
+    parts = [macro(source, "CDC_IO_TIMEOUT_MS"), macro(source, "CDC_LOOP_READY")] + [
         function(source, fn) for fn in (
             "usb_dwc3_handle_event_usbrst", "usb_dwc3_handle_event_connect_done",
             "usb_dwc3_handle_event_dev", "usb_dwc3_flush", "usb_dwc3_read", "usb_dwc3_can_read")]

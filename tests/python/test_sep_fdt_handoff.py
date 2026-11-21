@@ -19,7 +19,6 @@ def test_sep_fdt_handoff(tmp_path):
 #include "libfdt.h"
 typedef uint64_t u64;
 typedef uint32_t u32;
-#define T8140 1
 #define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
 #define bail(...) do { printf(__VA_ARGS__); return -1; } while (0)
 #define ADT_GETPROP(a, n, p, v) adt_get((n), (p), (v), sizeof(*(v)))
@@ -27,9 +26,8 @@ typedef uint32_t u32;
 static unsigned char old_blob[8192], new_blob[8192];
 static void *dt;
 static int dt_bufsize = sizeof(old_blob);
-static int chip_id = T8140;
 static void *adt;
-static u64 mem_size_actual;
+static u64 ram_base, mem_size_actual;
 static unsigned char lpol[] = {1, 2, 3, 4}, ibot[] = {5, 6, 7};
 static int manifest_present, bad_lpol, bad_sepfw, reservations;
 static u64 dram_base, dram_size;

@@ -16,6 +16,13 @@ on:
 permissions:
   contents: read
 
+# A newer push to main supersedes the run for the older main head. PR heads, tags and manual
+# runs get a group of their own and are never cancelled: the merge train needs CI on the exact
+# PR head.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'main-push' || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+
 jobs:
   build:
     runs-on: ubuntu-latest
