@@ -73,7 +73,7 @@ def run(binary, scenario):
     return subprocess.run([str(binary), scenario], capture_output=True, text=True, env=env)
 
 
-SCENARIOS = re.findall(r'^    \{"([a-z0-9-]+)", (?:PUBLISH|NOTHING|REFUSE|REFUSE_NO_OSLOG),',
+SCENARIOS = re.findall(r'^    \{"([a-z0-9-]+)", (?:PUBLISH|HEADLESS|NOTHING|REFUSE|REFUSE_NO_OSLOG),',
                        (ROOT / "tests/t6041_display_host.c").read_text(), re.M)
 
 
@@ -107,6 +107,7 @@ REASONS = {
     "j614c": PUBLISHED,
     "j614c-external": PUBLISHED,
     "j614c-on-t6040": "not a J616C/J614C/J575C (chip 0x6040): nothing done",
+    "j575c-headless": "display subsystem and its DART enabled for the external processors",
     "no-display-dt": NOT_DESCRIBED,
     "no-dcp-alias": NOT_DESCRIBED,
     "wrong-dcp-compat": NOT_DESCRIBED,
