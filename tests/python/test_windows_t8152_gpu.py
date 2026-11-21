@@ -1406,3 +1406,25 @@ def test_g1_read_order_is_recipe_data():
     doc = (REPO / "docs/windows-t8152.md").read_text()
     g1 = doc.split("## G1:", 1)[1].split("\n## ", 1)[0]
     assert "consumes the acknowledge" not in g1 and "does not survive" not in g1
+
+
+@pytest.mark.parametrize("store_mib,pool_mib", [(13312, 256), (11264, 2304), (10240, 3328)])
+def test_g6r6_m6_layout_store_to_pool(store_mib, pool_mib):
+    """G6 r6 (track M): a desktop-sized window (a synthetic 17.5 GiB --windows-guest-ram with the
+    same 32 MiB alignment as the M6 desktop's, the 8 MiB MTP area): every MiB cut from the AHCI RAM store goes to the GPU pool, and Windows
+    keeps exactly the 4352 MiB it had under the r5 layout (13312M store, 256 MiB pool). The pool
+    stays the top of guest RAM, 32 MiB aligned, at most half of it; the PrePi hand-off copies and
+    Mu's 128 MiB UEFI region stay below it."""
+    from aura import windows as w
+    base, window_top = 0x10120000000, 0x10581600000  # synthetic; 0x4461600000 bytes
+    _, top = w.plan_t8152_input_area(window_top)
+    plan = w.plan_t8152_ahci(base, top, store_mib << 20)
+    pool = w.gpu_pool(base, plan.guest_top, pool_mib)
+    assert pool == (plan.guest_top - (pool_mib << 20), pool_mib << 20)
+    assert pool[0] + pool[1] == plan.guest_top
+    assert pool[0] - base == 4352 << 20                        # Windows' RAM unchanged
+    w.gpu_pool_check_layout(pool, base, base + 0x400_0000, w.AHCI_MIN_GUEST)
+    lo, hi = w.J804_HANDOFF
+    assert hi <= pool[0] - w.AHCI_UEFI_TOP
+    with pytest.raises(ValueError, match="more than half"):
+        w.gpu_pool(base, plan.guest_top, ((plan.guest_bytes // 2) >> 20) + 32)
