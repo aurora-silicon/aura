@@ -7476,8 +7476,11 @@ static int dt_set_t8142_dcpext(unsigned int n)
 
     /* The PIODMA stream of the external display's frontend DART. */
     u32 pio_dart = 0, pio_sid = 0;
-    int piodma = fdt_subnode_offset(dt, node, "piodma");
-    prop = piodma < 0 ? NULL : fdt_getprop(dt, piodma, "iommus", &len);
+    char pio_path[160];
+    int piodma = node < 0 ? node : kboot_t8142_dcpext_piodma(dt, alias);
+    if (piodma < 0 || fdt_get_path(dt, piodma, pio_path, sizeof(pio_path)))
+        return -1;
+    prop = fdt_getprop(dt, piodma, "iommus", &len);
     if (prop && len == 8) {
         pio_dart = fdt32_ld(&prop[0]);
         pio_sid = fdt32_ld(&prop[1]);
@@ -7507,6 +7510,11 @@ static int dt_set_t8142_dcpext(unsigned int n)
     dt_reserve_t8142_stream_tables(pio_dart, pio_sid, false);
     dt_reserve_t8142_stream_tables(pio_dart, 0, false);
 
+    /* Every page the three streams map, so a port iBoot lit keeps its scanout buffer. */
+    t8142_dcpext_result = "live display mappings not preserved";
+    if (kboot_t8142_dcpext_preserve(dt, alias, pio_path))
+        return -1;
+
     t8142_dcpext_result = "carveout reservation failed";
     bool second = alias[6] == '1';
     if (dt_carveout_reserved_regions(
@@ -7526,7 +7534,13 @@ static int dt_set_t8142_dcpext(unsigned int n)
     /* The external frontend scans out through the display subsystem. */
     int display = fdt_path_offset(dt, "disp0");
     fdt32_t scanout[2] = {cpu_to_fdt32(pio_dart), 0};
-    if (display < 0 || fdt_appendprop(dt, display, "iommus", scanout, sizeof(scanout)))
+    const fdt32_t *listed = display < 0 ? NULL : fdt_getprop(dt, display, "iommus", &len);
+    bool present = false;
+    /* A tree may list it already (linux#2603's J704 HDMI tree). */
+    for (int i = 0; listed && len > 0 && i + 1 < len / (int)sizeof(*listed); i += 2)
+        present |= fdt32_ld(&listed[i]) == pio_dart && !fdt32_ld(&listed[i + 1]);
+    if (display < 0 ||
+        (!present && fdt_appendprop(dt, display, "iommus", scanout, sizeof(scanout))))
         return -1;
     if (dt_t8142_enable_power_domains(owner, 0) || dt_t8142_enable_power_domains(mbox, 0) ||
         dt_t8142_enable_power_domains(fw_dart, 0) || dt_t8142_enable_power_domains(pio_dart, 0) ||
@@ -8428,8 +8442,9 @@ static int dt_set_display_t8142(void)
     }
     dt_t8142_handoff_result("dcp", result);
 
-    /* Never fatal: a refused external DCP only stays disabled. */
     dt_set_t8142_dcpexts();
+    if (kboot_t8142_display_prune(dt))
+        printf("FDT: disp0: could not drop the external DARTs that stay disabled\n");
     return 0;
 }
 
