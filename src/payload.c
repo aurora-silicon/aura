@@ -246,8 +246,8 @@ static bool config_seen = false;
 static bool config_lost_passed = false;
 
 static const char *const config_names[] = {
-    "chosen.", "chainload=",        "boot=", "nvme.sart=", "display=", "mitigations=",
-    "tso=",    "m1n1.config-lost=", "hib=",
+    "chosen.", "chainload=",        "boot=", "nvme.sart=",    "display=", "mitigations=",
+    "tso=",    "m1n1.config-lost=", "hib=",  "dcp.afk-live=",
 #ifdef SPTM_VIRT_ESP
     "macos=",
 #endif
@@ -314,6 +314,10 @@ static bool check_var(u8 **p)
         /* Started by an earlier aura stage, which has had its host window already. */
         if (nvme_set_sart_var(val))
             stage1_chained = true;
+    } else if (IS_VAR("dcp.afk-live=")) {
+        /* An earlier aura stage's display, adopted here with its live endpoints. */
+        if (!display_set_afk_live(val))
+            printf("Payload: malformed dcp.afk-live=%s\n", val);
     } else if (IS_VAR("nvme.adopt=")) {
         /* An older Stage 1 hands its session on running; nvme_init() finds it by itself. */
         stage1_chained = true;

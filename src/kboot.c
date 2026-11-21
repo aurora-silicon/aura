@@ -11644,6 +11644,45 @@ static int dt_t8152_dcp_node(u64 coproc)
     return -1;
 }
 
+/*
+ * A controller aura brought a display up on reaches Linux live (display_shutdown()),
+ * with the AFK endpoints aura started still running, in this stage or in an earlier
+ * one whose framebuffer this stage adopted (dcp.afk-live=). Report them in
+ * apple,afk-active-endpoints, so that apple_dcpib stops each before it starts it
+ * again: an INIT on a live endpoint asserts in the firmware. An aura-started
+ * dcpext0's report is left to this hand-off by dt_set_dcpext_t8152().
+ */
+static int dt_set_live_afk_t8152(void)
+{
+    static const char *const paths[] = {"/arm-io/dcp", "/arm-io/dcpext0"};
+
+    for (size_t i = 0; i < ARRAY_SIZE(paths); i++) {
+        u32 live = display_live_endpoints(paths[i]);
+        u64 coproc;
+        int trace[8];
+
+        if (!live)
+            continue;
+        /* Advisory: a controller this Mac or its device tree lacks is skipped, not fatal. */
+        if (adt_path_offset_trace(adt, paths[i], trace) < 0 ||
+            adt_get_reg(adt, trace, "reg", 0, &coproc, NULL) < 0) {
+            printf("FDT: no %s in the ADT; its AFK endpoints 0x%x are not reported\n", paths[i],
+                   live);
+            continue;
+        }
+        int node = dt_t8152_dcp_node(coproc);
+        if (node < 0) {
+            printf("FDT: no node for %s; its AFK endpoints 0x%x are not reported\n", paths[i],
+                   live);
+            continue;
+        }
+        if (fdt_setprop_u32(dt, node, "apple,afk-active-endpoints", live))
+            bail("FDT: couldn't report %s's live AFK endpoints\n", paths[i]);
+        printf("FDT: %s hands AFK endpoints 0x%x to Linux running\n", paths[i], live);
+    }
+    return 0;
+}
+
 /* One DCPEXT's handoff, in a display transaction: all of it or nothing. */
 static int dt_set_dcpext_t8152_one(unsigned int n)
 {
@@ -11735,7 +11774,8 @@ static int dt_prepare_t8152(void)
         if (aic < 0 || fdt_node_check_compatible(dt, aic, "apple,t8152-aic3") ||
             fdt_node_check_compatible(dt, aic, "apple,t8122-aic3"))
             bail("FDT: T8152 requires the t8122 AIC3 fallback\n");
-        if (dt_set_serial_number() || dt_set_display_t8152() || dt_set_gpu(dt))
+        if (dt_set_serial_number() || dt_set_display_t8152() || dt_set_live_afk_t8152() ||
+            dt_set_gpu(dt))
             return -1;
         dt_set_dcpext_t8152();
     }
