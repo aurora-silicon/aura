@@ -754,7 +754,7 @@ static int dt_reserve_outside_exec_window(u64 start, u64 size)
     return 0;
 }
 
-/* Windows A to C. One inside the firmware RO range (T8140) is reserved with that range. */
+/* Windows A to C. One inside the firmware RO range is reserved with that range. */
 static int dt_reserve_ctxr_low_windows(void)
 {
     static const enum ctxr_range windows[] = {CTXR_RANGE_A, CTXR_RANGE_B, CTXR_RANGE_C};
@@ -777,7 +777,7 @@ static int dt_reserve_ctxr_low_windows(void)
 }
 
 /*
- * What the secondaries can't write. T8140's firmware RO range is reserved, and kept out of
+ * What the secondaries can't write. The firmware RO range is reserved, and kept out of
  * the linear map, at either EL. On M4 and later the secondaries also enforce CTRR_C and
  * CTRR_D, and Linux crashes writing there from one. Where aura knows the firmware RO range,
  * CTRR_C is that range. CTRR_D: on J813 (M5) it covers the ~1 MiB below the iBoot-loaded image.
