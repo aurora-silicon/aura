@@ -12,6 +12,7 @@
 #include "clk.h"
 #include "ctxr_exec.h"
 #include "dapf.h"
+#include "dart.h"
 #include "devicetree.h"
 #include "display.h"
 #include "dockchannel_uart.h"
@@ -4311,12 +4312,10 @@ static int dt_vram_reserved_region(const char *dcp_alias, const char *disp_alias
 #define DART_T8110_PARAMS3_VA_WIDTH GENMASK(21, 16)
 
 /*
- * The input address width of the T8110-style DART that translates for a device: the FDT
- * node's first iommus entry, which must be the DART the ADT device names in iommu-parent
- * (same registers), read from the DART's PARAMS3 as Linux does. Nonzero when either tree
- * does not describe one.
+ * Find the T8110-style DART named by the device's first FDT iommus entry.
+ * The ADT device's iommu-parent must name the same DART or one of its mappers.
  */
-static int dt_device_dart_va_bits(int fdt_node, int adt_node, u32 *bits)
+static int dt_device_dart_mmio(int fdt_node, int adt_node, u64 *addr, u64 *size)
 {
     int len = 0;
     const fdt32_t *iommus = fdt_getprop(dt, fdt_node, "iommus", &len);
@@ -4356,20 +4355,29 @@ static int dt_device_dart_va_bits(int fdt_node, int adt_node, u32 *bits)
 
         char path[64];
         int trace[8];
-        u64 adt_base, adt_size;
+        u64 adt_base;
         snprintf(path, sizeof(path), "/arm-io/%s", adt_get_name(adt, node));
         if (adt_path_offset_trace(adt, path, trace) < 0 ||
-            adt_get_reg(adt, trace, "reg", 0, &adt_base, &adt_size) < 0 || adt_base != base ||
-            adt_size < DART_T8110_PARAMS3 + 4)
+            adt_get_reg(adt, trace, "reg", 0, &adt_base, size) < 0 || adt_base != base)
             return -1;
 
-        u32 va = FIELD_GET(DART_T8110_PARAMS3_VA_WIDTH, read32(base + DART_T8110_PARAMS3));
-        if (va < 32 || va > 48)
-            return -1;
-        *bits = va;
+        *addr = adt_base;
         return 0;
     }
     return -1;
+}
+
+static int dt_device_dart_va_bits(int fdt_node, int adt_node, u32 *bits)
+{
+    u64 base, size;
+    if (dt_device_dart_mmio(fdt_node, adt_node, &base, &size) || size < DART_T8110_PARAMS3 + 4)
+        return -1;
+
+    u32 va = FIELD_GET(DART_T8110_PARAMS3_VA_WIDTH, read32(base + DART_T8110_PARAMS3));
+    if (va < 32 || va > 48)
+        return -1;
+    *bits = va;
+    return 0;
 }
 
 /*
@@ -9338,6 +9346,14 @@ static int dt_set_aop_firmware(void)
     if (anode < 0 || !adt_getprop(adt, anode, "segment-ranges", &len) || !len ||
         len % sizeof(struct adt_segment_ranges)) {
         printf("ADT: /arm-io/aop has no firmware segments, %s left without them\n", path);
+        return 0;
+    }
+
+    /* Linux keeps the firmware roots when this DART's TTBR/TCR lock is set. */
+    u64 dart_base, dart_size;
+    if (!dt_device_dart_mmio(node, anode, &dart_base, &dart_size) &&
+        dart_t8110_is_locked(dart_base, dart_size)) {
+        printf("FDT: %s: preserving firmware mappings in locked DART\n", path);
         return 0;
     }
 

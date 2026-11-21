@@ -717,15 +717,21 @@ bool dart_adt_locked(const char *path, int instance)
 {
     int dart_path[8];
     int node = adt_path_offset_trace(adt, path, dart_path);
-    u64 base;
-    if (node < 0 || adt_get_reg(adt, dart_path, "reg", instance, &base, NULL) < 0)
+    u64 base, size;
+    if (node < 0 || adt_get_reg(adt, dart_path, "reg", instance, &base, &size) < 0)
         return false;
 
     if (adt_is_compatible(adt, node, "dart,t8020") || adt_is_compatible(adt, node, "dart,t6000"))
         return read32(base + DART_T8020_CONFIG) & DART_T8020_CONFIG_LOCK;
     if (adt_is_compatible(adt, node, "dart,t8110"))
-        return read32(base + DART_T8110_PROTECT) & DART_T8110_PROTECT_TTBR_TCR;
+        return dart_t8110_is_locked(base, size);
     return false;
+}
+
+bool dart_t8110_is_locked(uintptr_t base, u64 size)
+{
+    return size >= DART_T8110_PROTECT + sizeof(u32) &&
+           (read32(base + DART_T8110_PROTECT) & DART_T8110_PROTECT_TTBR_TCR);
 }
 
 void dart_lock_adt(const char *path, int instance)
