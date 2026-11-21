@@ -5,6 +5,7 @@
 #include "chainload.h"
 #include "adt.h"
 #include "boot_options.h"
+#include "display.h"
 #include "dockchannel_uart.h"
 #include "heapblock.h"
 #include "malloc.h"
@@ -458,6 +459,14 @@ int chainload_load(const char *spec, char **vars, size_t *var_cnt, size_t var_ca
     if (ret == 0)
         stage1_log_handoff(vars, var_cnt, var_capacity);
 #endif
+    /* A display handed on live: the next stage adopts it, its live AFK endpoints too. */
+    char *afk_var = display_afk_var();
+    if (ret == 0 && afk_var) {
+        if (*var_cnt < var_capacity)
+            vars[(*var_cnt)++] = afk_var;
+        else
+            printf("chainload: no room for %s\n", afk_var);
+    }
     char saved_cmdline[CMDLINE_LENGTH_RV3];
     size_t saved_vars = *var_cnt;
     bool trial = false;

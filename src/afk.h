@@ -45,6 +45,7 @@ int afk_epic_shutdown(afk_epic_t *afk);
 afk_epic_ep_t *afk_epic_start_ep(afk_epic_t *afk, int endpoint, const afk_epic_service_ops_t *ops,
                                  bool notify);
 int afk_epic_shutdown_ep(afk_epic_ep_t *epic);
+u32 afk_epic_live_endpoints(const afk_epic_t *afk);
 
 int afk_epic_work(afk_epic_t *afk, int endpoint);
 bool afk_epic_is_v2(const afk_epic_ep_t *epic);

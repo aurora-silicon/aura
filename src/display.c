@@ -118,6 +118,24 @@ static bool fb_dva_allocated;
 
 #define USE_DCPEXT 1
 
+/* The controllers whose live AFK endpoints are passed on (dcp.afk-live=). */
+static const char *const display_afk_paths[2] = {"/arm-io/dcp", "/arm-io/dcpext0"};
+/* Endpoints an earlier aura stage left running on them (dcp.afk-live=). */
+static u32 display_afk_inherited[2];
+/* This stage took the earlier stage's display over as it was, and which controllers it
+ * started a session of its own on since: only an adopted, untouched one still runs those. */
+static bool display_afk_adopted;
+static bool display_afk_restarted[2];
+static char display_afk_line[sizeof("dcp.afk-live=ffff,ffff")];
+
+/* This stage starts a session of its own on the controller at @adt_path. */
+static void display_afk_restart(const char *adt_path)
+{
+    for (size_t i = 0; i < ARRAY_SIZE(display_afk_paths); i++)
+        if (!strcmp(display_afk_paths[i], adt_path))
+            display_afk_restarted[i] = true;
+}
+
 static const display_config_t display_config_m2 = {
 #if USE_DCPEXT
     .dcp = "/arm-io/dcpext",
@@ -427,6 +445,7 @@ int display_start_dcp(void)
 
     display_is_dptx = !!disp_cfg->dptx_phy[0];
 
+    display_afk_restart(disp_cfg->dcp);
     dcp = dcp_init(disp_cfg);
     if (!dcp) {
         /* dcp_init() leaves a DCP it booted quiesced, or running if that failed. */
@@ -858,6 +877,74 @@ bool display_second_attempted(void)
     return display_other.cfg;
 }
 
+/*
+ * Whether display_shutdown() hands the display controllers on live, sessions and scanout
+ * intact, at both the Stage 1 and the Linux boundary: Linux owns the live J700/J713/J873
+ * controllers. Elsewhere it stops their endpoints before the next stage runs.
+ */
+static bool display_hands_on_live(void)
+{
+    return chip_id == T8140 || chip_id == T8132 || chip_id == T8152;
+}
+
+/*
+ * The AFK endpoints aura (this stage or an earlier one) started and left running on the
+ * controller at @adt_path, as bits from endpoint 0x20, 0 if none. An earlier stage's count
+ * only where this stage adopted its display and started nothing of its own there. An INIT
+ * on a live endpoint asserts in the firmware, so the next owner must stop these first.
+ */
+u32 display_live_endpoints(const char *adt_path)
+{
+    u32 mask = 0;
+
+    if (dcp && t8152_config && !strcmp(t8152_config->dcp, adt_path))
+        mask |= afk_epic_live_endpoints(dcp->afk);
+    if (display_other.dcp && display_other.cfg && !strcmp(display_other.cfg->dcp, adt_path))
+        mask |= afk_epic_live_endpoints(display_other.dcp->afk);
+    for (size_t i = 0; i < ARRAY_SIZE(display_afk_paths); i++)
+        if (display_afk_adopted && !display_afk_restarted[i] &&
+            !strcmp(display_afk_paths[i], adt_path))
+            mask |= display_afk_inherited[i];
+
+    return mask;
+}
+
+/* dcp.afk-live=XXXX,XXXX from an earlier stage: its live endpoints on /arm-io/dcp, dcpext0. */
+bool display_set_afk_live(const char *val)
+{
+    u32 masks[2] = {0, 0};
+
+    for (size_t i = 0; i < ARRAY_SIZE(masks); i++, val++) {
+        for (int d = 0; d < 4; d++, val++) {
+            char c = *val | 0x20;
+            if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')))
+                return false;
+            masks[i] = masks[i] << 4 | (c <= '9' ? c - '0' : c - 'a' + 10);
+        }
+        if (*val != (i ? '\0' : ','))
+            return false;
+    }
+    memcpy(display_afk_inherited, masks, sizeof(masks));
+    return true;
+}
+
+/*
+ * The variable that passes the live endpoints on to the next aura stage, or NULL if none.
+ * It is built before display_shutdown() runs, so only where that keeps the sessions running.
+ */
+char *display_afk_var(void)
+{
+    u32 live[2];
+
+    for (size_t i = 0; i < ARRAY_SIZE(live); i++)
+        live[i] = display_live_endpoints(display_afk_paths[i]);
+    if (!display_hands_on_live() || !(live[0] | live[1]))
+        return NULL;
+    snprintf(display_afk_line, sizeof(display_afk_line), "dcp.afk-live=%04x,%04x", live[0],
+             live[1]);
+    return display_afk_line;
+}
+
 /* Configure the second display: bring it up on first use with its own
  * framebuffer, or modeset it later (the loader calls this by symbol). */
 int display_configure_second(const char *config)
@@ -916,6 +1003,7 @@ static int display_init_t8152(void)
         !(cur_boot_args.video.width == 640 && cur_boot_args.video.height == 1136)) {
         printf("display: Using firmware framebuffer (%ldx%ld)\n", cur_boot_args.video.width,
                cur_boot_args.video.height);
+        display_afk_adopted = true;
         return 0;
     }
 
@@ -1080,7 +1168,7 @@ int display_shutdown(dcp_shutdown_mode mode)
 {
     /* Linux owns the live J700/J713/J873 controllers. Keep the inherited ASC session
      * and scanout intact at both the Stage 1 and Linux boundaries. */
-    if (chip_id == T8140 || chip_id == T8132 || chip_id == T8152)
+    if (display_hands_on_live())
         return 0;
 
     /* We have no DCP, so just exit */
