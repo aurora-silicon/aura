@@ -3202,7 +3202,7 @@ static int dcpext_nub_segs(const char *name, int nub, u64 vm_base, u64 vm_size,
         return -1;
     ram_end = kboot_ram_base() + kboot_ram_size();
     if (ram_end < kboot_ram_base())
-        return -1;
+        bail("%s: the boot-args RAM range wraps\n", name);
     for (int i = 0; i < DCPEXT6_SEGS; i++) {
         struct adt_segment_ranges r;
         memcpy(&r, &ranges[i], sizeof(r));
@@ -3838,15 +3838,20 @@ int dt_set_dcpext_handoff(void *dt, enum dcp_internal internal)
     u32 len = 0, seg_len = 0, names_len = 0;
     int nub = adt_path_offset(adt, DCP6_NUB);
     const char *uuid = nub < 0 ? NULL : adt_getprop(adt, nub, "uuid", &len);
-    if (!dcp6_is_uuid(uuid, len))
+    if (!dcp6_is_uuid(uuid, len)) {
+        dlog("no image uuid on %s: external processors left to the firmware-ready path\n",
+             DCP6_NUB);
         return 0;
+    }
     for (size_t i = 0; i < ARRAY_SIZE(dcpext_images) && !dcpext_run.uuid; i++)
         if (!strcmp(uuid, dcpext_images[i].uuid)) {
             dcpext_run.uuid = dcpext_images[i].uuid;
             dcpext_run.pipe_clocks = dcpext_images[i].pipe_clocks;
         }
     if (!dcpext_run.uuid) {
-        dlog("no external processor interface known for image %s\n", uuid);
+        dlog("no external processor interface known for image %s: external processors left to "
+             "the firmware-ready path\n",
+             uuid);
         return 0;
     }
     dcpext_run.headless = internal == DCP_INTERNAL_NO_PANEL;
