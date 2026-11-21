@@ -1017,6 +1017,18 @@ int afk_epic_shutdown_ep(afk_epic_ep_t *epic)
     return 0;
 }
 
+/* The endpoints whose sessions run, as bits from endpoint 0x20. */
+u32 afk_epic_live_endpoints(const afk_epic_t *afk)
+{
+    u32 mask = 0;
+
+    for (int i = 0; afk && i < 0x10; i++)
+        if (afk->endpoint[i] && afk->endpoint[i]->started)
+            mask |= BIT(i);
+
+    return mask;
+}
+
 static const afk_epic_service_ops_t *afk_match_service(afk_epic_ep_t *ep, const char *name)
 {
     const afk_epic_service_ops_t *ops;

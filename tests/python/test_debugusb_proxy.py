@@ -397,6 +397,8 @@ static int chainload_image(void *data, size_t size, char **vars, size_t count)
 }
 static void rust_free_image(void *data, size_t size) {}
 static void stage1_log_handoff(char **vars, size_t *var_cnt, size_t var_capacity) {}
+/* display.c: only a display handed on live adds a variable; none here. */
+static char *display_afk_var(void) { return NULL; }
 static bool stage1_recovery_window(void) { return false; }
 /* secboot.c: no image trailer, nothing enforced */
 static int secboot_check_chainload(void *data, size_t *size, char **vars, size_t *var_cnt,

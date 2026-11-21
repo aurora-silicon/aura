@@ -269,6 +269,7 @@ static bool nvme_post_m4_passed_off(void)
 }
 static int display_configure(const char *s) { printf("DISPLAY %s\n", s); return 0; }
 static int display_configure_second(const char *s) { printf("DISPLAY2 %s\n", s); return 0; }
+static bool display_set_afk_live(const char *s) { printf("AFKLIVE %s\n", s); return true; }
 #define T8132 0x8132
 static void mitigations_configure(const char *s) {}
 static int boot_storage_load(const char *spec, struct kernel_header **k, void **f) { return -1; }

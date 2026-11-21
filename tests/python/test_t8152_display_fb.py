@@ -238,6 +238,8 @@ static void iova_free(void *d, u64 dva, size_t size)
 /* DCP lifecycle */
 static bool has_dcp_left_running;
 static bool dcp_left_running(void) { return has_dcp_left_running; }
+/* display.c: the AFK hand-off bookkeeping (test_display_afk_live.py) is out of scope here. */
+static void display_afk_restart(const char *path) { (void)path; }
 static const display_config_t *display_get_config(void) { has_dcp = true; return t8152_config; }
 static dcp_dev_t *dcp_init(const display_config_t *cfg)
 {
