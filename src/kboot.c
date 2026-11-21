@@ -9191,16 +9191,23 @@ static int dt_reserve_t8132_aop_windows(const char *path)
  * DAPF, then reserve both segments at the IOVAs the firmware uses (their remap
  * addresses: EC0p for __ETEXT, the physical address for __OS_LOG) and the
  * DAPF windows. Without all of it the firmware cannot run, so on any failure
- * the AOP is disabled.
+ * the AOP is disabled. No other M4 board's AOP handoff is qualified: there the
+ * AOP is disabled too, without touching it or its DART.
  */
 static int dt_set_t8132_aop(const char *path)
 {
     const char *why;
     int node;
 
+    /*
+     * The J773g (Mac mini) tree states the same handoff contract and its 26.6.2 ADT has the same
+     * AOP, DART and segment layout; its headphone jack's audio runs on the AOP.
+     */
     if (fdt_node_check_compatible(dt, 0, "apple,j713") &&
-        fdt_node_check_compatible(dt, 0, "apple,j604"))
-        return 0; /* No other M4 board's AOP handoff is qualified. */
+        fdt_node_check_compatible(dt, 0, "apple,j604") && !kboot_is_j773g(dt)) {
+        why = "no handoff is qualified for this board";
+        goto disable;
+    }
 
     int chosen = fdt_path_offset(dt, "/chosen");
     if (chosen < 0 ||
@@ -12084,6 +12091,12 @@ int kboot_prepare_dt(void *fdt)
     if (dt_setup_sio())
         return -1;
     if (dt_set_aop_firmware())
+        return -1;
+    /*
+     * Before dt_set_isp(): on a Mac with no ISP in its ADT that disables the ISP but not its
+     * DARTs, and this rule leaves an ISP that is already disabled as it is.
+     */
+    if (dt_disable_t8132_absent_isp(dt))
         return -1;
     if (dt_set_isp())
         return -1;
