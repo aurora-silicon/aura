@@ -84,7 +84,18 @@ static const void *adt_getprop(void *a, int n, const char *p, u32 *len)
     *len = 0;
     return failure == 7 ? NULL : &asc;
 }
-static bool adt_is_compatible(void *a, int n, const char *p) { return true; }
+/* The ADT's ANS node names its ASC wrapper, never the ANS type (as on the J604). */
+static bool adt_is_compatible(void *a, int n, const char *p) { return strncmp(p, "apple,", 6); }
+/* The payload tree's ANS node names the type. */
+static int payload_tree;
+static const void *payload_fdt(void) { return &payload_tree; }
+static int fdt_node_offset_by_compatible(const void *f, int s, const char *c)
+{
+    char type[32];
+
+    snprintf(type, sizeof(type), "apple,t%x-nvme-ans2", chip_id);
+    return strcmp(c, type) ? -1 : 1;
+}
 /* No secure register layout: the T8152 path is not under test here. */
 static const void *adt_get_property(void *a, int n, const char *p) { return NULL; }
 static int adt_get_reg(void *a, int *path, const char *p, int i, u64 *base, u64 *size)
@@ -164,6 +175,7 @@ static bool rtkit_boot_warm(rtkit_dev_t *r, u32 mask)
     cpu_off = false;
     return true;
 }
+static bool rtkit_boot_wait(rtkit_dev_t *r) { return true; }
 static int sart_get_entries(sart_dev_t *s, struct sart_entry *e, int max) { return 1; }
 static bool sart_set_entries(sart_dev_t *s, const struct sart_entry *e, int n) { return true; }
 static sart_dev_t *sart_init(const char *path) { return &sart; }

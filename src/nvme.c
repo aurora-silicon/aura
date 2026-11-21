@@ -6,6 +6,7 @@
 #include "assert.h"
 #include "malloc.h"
 #include "nvme.h"
+#include "payload.h"
 #include "pcie.h"
 #include "pmgr.h"
 #include "rtkit.h"
@@ -13,6 +14,8 @@
 #include "string.h"
 #include "utils.h"
 #include "xnuboot.h"
+
+#include "libfdt/libfdt.h"
 
 #define NVME_TIMEOUT 1000000
 /*
@@ -539,7 +542,51 @@ static bool nvme_ans_power_off(void)
     return true;
 }
 
-/* Post-M4, ANS off: power, the SART entries back, then the firmware's start after a power loss. */
+/*
+ * The ANS types that take a PMGR reset before a cold firmware start, by the compatible Linux's
+ * apple-nvme driver keys cold_reset on. The type is read from the ANS node, never from the chip:
+ * the ADT's /arm-io/ans when it names one, else the ANS node of the payload's device tree. The
+ * ADT node names only its ASC wrapper ("iop,ascwrap-v6" on M4, as AOP and DCP do), so today the
+ * type comes from the payload's tree, which a Stage 2 has picked before it starts ANS. Without a
+ * node naming such a type, there is no cold start.
+ */
+static const char *const nvme_ans_cold_reset_types[] = {
+    "apple,t8132-nvme-ans2",
+};
+
+static bool nvme_ans_cold_reset(void)
+{
+    int node = adt_path_offset(adt, "/arm-io/ans");
+    const void *dt = payload_fdt();
+
+    for (size_t i = 0; i < ARRAY_SIZE(nvme_ans_cold_reset_types); i++) {
+        const char *type = nvme_ans_cold_reset_types[i];
+
+        if ((node >= 0 && adt_is_compatible(adt, node, type)) ||
+            (dt && fdt_node_offset_by_compatible(dt, -1, type) >= 0))
+            return true;
+    }
+    return false;
+}
+
+/*
+ * Post-M4, ANS off: power and the SART entries back, then ONE start chosen from the state the last
+ * owner left, read once with the block powered and before the firmware runs: RUN and CSTS.CFS.
+ * A stopped ANS with a fatal controller (a J604 Stage 2 after a warm reboot read CSTS 0x2 with
+ * RUN=0, and a warm start then got no HELLO) goes straight to the cold start after a PMGR reset
+ * when its type takes one. Anything else gets the warm start every good boot took, with its 1 s
+ * HELLO wait. No HELLO there is the same state seen through the handshake: on an ANS that takes a
+ * cold reset the warm start is undone and the cold start follows once. Nothing else is retried.
+ */
+static bool nvme_ans_cold_started;
+
+static void nvme_ans_log_state(const char *when)
+{
+    printf("nvme: %s: RUN=%d CC=0x%x CSTS=0x%x BOOT_STATUS=0x%x\n", when, asc_cpu_running(nvme_asc),
+           read32(nvme_base + NVME_CC), read32(nvme_base + NVME_CSTS),
+           read32(nvme_base + NVME_BOOT_STATUS));
+}
+
 /*
  * Discard what an earlier owner left in the receive mailbox before the run bit: the warm start's
  * handshake would read it in place of the firmware's HELLO.
@@ -559,29 +606,87 @@ static void nvme_ans_drain(void)
         printf("nvme: discarded %u stale ANS message%s\n", count, count == 1 ? "" : "s");
 }
 
-static bool nvme_ans_power_on(void)
+/* After power-on: the firmware's start, cold after a PMGR reset or warm, then its boot status. */
+static bool nvme_ans_boot(bool cold)
 {
-    bool ok = !pcie_ans_power_on();
-
-    if (!ok)
-        printf("nvme: couldn't power ANS on\n");
-    if (ok)
-        nvme_ans_drain();
-    if (ok && !(ok = sart_set_entries(nvme_sart, nvme_sart_saved, nvme_sart_saved_cnt)))
+    if (cold) {
+        /* Linux's ps_ans; the ADT may call the device ANS2. */
+        pmgr_reset(nvme_die, "ANS");
+        pmgr_reset(nvme_die, "ANS2");
+    }
+    nvme_ans_drain();
+    if (!sart_set_entries(nvme_sart, nvme_sart_saved, nvme_sart_saved_cnt)) {
         printf("nvme: couldn't restore the %d SART entries\n", nvme_sart_saved_cnt);
-    if (ok && !(ok = rtkit_boot_warm(nvme_rtkit, BIT(0))))
-        printf("nvme: no warm handshake (CPU status 0x%x)\n", asc_cpu_status(nvme_asc));
-    if (ok && !(ok = poll32(nvme_base + NVME_BOOT_STATUS, 0xffffffff, NVME_BOOT_STATUS_OK,
-                            USEC_PER_SEC) >= 0))
-        printf("nvme: BOOT_STATUS 0x%x after the handshake\n",
-               read32(nvme_base + NVME_BOOT_STATUS));
-    if (!ok) {
-        printf("nvme: ANS didn't start from off; it stays down until a reboot\n");
         return false;
     }
-    nvme_boot_ticks = get_ticks();
-    printf("nvme: ANS started from off\n");
+    if (!nvme_rtkit && !(nvme_rtkit = rtkit_init("nvme", nvme_asc, NULL, NULL, nvme_sart, false)))
+        return false;
+    if (!(cold ? rtkit_boot_wait(nvme_rtkit) : rtkit_boot_warm(nvme_rtkit, BIT(0)))) {
+        printf("nvme: no %s handshake (CPU status 0x%x)\n", cold ? "cold" : "warm",
+               asc_cpu_status(nvme_asc));
+        return false;
+    }
+    if (poll32(nvme_base + NVME_BOOT_STATUS, 0xffffffff, NVME_BOOT_STATUS_OK, USEC_PER_SEC) < 0) {
+        printf("nvme: BOOT_STATUS 0x%x after the handshake\n",
+               read32(nvme_base + NVME_BOOT_STATUS));
+        return false;
+    }
     return true;
+}
+
+/* Undo a start that failed (CPU stopped, its mail dropped, power off), then the cold start. */
+static bool nvme_ans_restart_cold(const char *why)
+{
+    nvme_ans_log_state(why);
+    if (nvme_rtkit) {
+        /* A failed handshake can own buffers: rtkit_free() keeps those, and they stay. */
+        rtkit_stop(nvme_rtkit);
+        rtkit_free(nvme_rtkit);
+        nvme_rtkit = NULL;
+    } else {
+        asc_cpu_stop(nvme_asc);
+    }
+    if (pcie_ans_power_off())
+        printf("nvme: couldn't power ANS off before the cold start\n");
+    printf("nvme: ANS cold start after a PMGR reset\n");
+    nvme_ans_cold_started = true;
+    return !pcie_ans_power_on() && nvme_ans_boot(true);
+}
+
+static bool nvme_ans_started(void)
+{
+    nvme_boot_ticks = get_ticks();
+    printf("nvme: ANS started from off%s\n", nvme_ans_cold_started ? ", cold after a reset" : "");
+    /* Before any write to CC: whether the controller reports a fault already. */
+    nvme_ans_log_state("started from off");
+    return true;
+}
+
+static bool nvme_ans_power_on(void)
+{
+    bool cold_reset = nvme_ans_cold_reset(), fatal, ok;
+
+    nvme_ans_cold_started = false;
+    if (pcie_ans_power_on()) {
+        printf("nvme: couldn't power ANS on\n");
+        goto failed;
+    }
+    fatal = !asc_cpu_running(nvme_asc) && (read32(nvme_base + NVME_CSTS) & NVME_CSTS_CFS);
+    if (cold_reset && fatal) {
+        nvme_ans_log_state("stopped and fatal at power-on, cold start after a PMGR reset");
+        nvme_ans_cold_started = true;
+        ok = nvme_ans_boot(true);
+    } else {
+        ok = nvme_ans_boot(false);
+        if (!ok && cold_reset)
+            ok = nvme_ans_restart_cold("warm start failed");
+    }
+    if (ok)
+        return nvme_ans_started();
+failed:
+    nvme_ans_log_state("start failed");
+    printf("nvme: ANS didn't start from off; it stays down until a reboot\n");
+    return false;
 }
 
 /* A write or flush, timed: the Stage 1 log then shows how close a marker spend came. */
@@ -843,6 +948,21 @@ setup_controller:
                 goto out_preserve;
             earlier = adopted = false;
             from_off = true;
+            goto setup_controller;
+        }
+        /*
+         * After a warm start from off the firmware can report BOOT_STATUS OK and still never bring
+         * the controller ready, with CSTS.CFS set (J604 Stage 2 parked with CC 0x470000, CSTS 0x2).
+         * That is the fatal state read late: on an ANS that takes a cold reset, act on it once
+         * with the cold start after a PMGR reset, unless this start was already cold. Nothing
+         * was queued yet.
+         */
+        if (from_off && nvme_type == NVME_T8132 && !nvme_secure_regs && !nvme_ans_cold_started &&
+            nvme_ans_cold_reset() && (read32(nvme_base + NVME_CSTS) & NVME_CSTS_CFS)) {
+            nvme_ctrl_disable();
+            if (!nvme_ans_restart_cold("controller fatal after a start from off"))
+                goto out_preserve;
+            nvme_ans_started();
             goto setup_controller;
         }
         goto out_disable_ctrl;

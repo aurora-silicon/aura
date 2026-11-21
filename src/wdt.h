@@ -15,6 +15,9 @@ int wdt_arm_trial(void);
 #define WDT_BOOT_SECONDS 178
 int wdt_arm_boot(void);
 void wdt_host_attached(void);
+/* A stage that can no longer boot (its NVMe session needs a reboot) restarts this much sooner */
+#define WDT_NVME_RESTART_SECONDS 20
+int wdt_boot_watchdog_shorten(unsigned seconds);
 bool wdt_boot_watchdog_armed(void);
 
 #endif

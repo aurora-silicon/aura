@@ -137,6 +137,23 @@ bool wdt_boot_watchdog_armed(void)
     return wdt_boot_armed;
 }
 
+/*
+ * Restart the armed boot watchdog's count with a shorter period. It stays the boot watchdog: a
+ * host that syncs in the meantime still disarms it.
+ */
+int wdt_boot_watchdog_shorten(unsigned seconds)
+{
+    if (!wdt_boot_armed || seconds >= WDT_BOOT_SECONDS)
+        return -1;
+    if (wdt_arm(seconds)) {
+        /* wdt_arm() stops the count before it writes the new period: arm the old one again. */
+        if (wdt_arm(WDT_BOOT_SECONDS))
+            wdt_boot_armed = false;
+        return -1;
+    }
+    return 0;
+}
+
 /* Only the boot watchdog: a trial's or a host-armed one is not ours to disarm. */
 void wdt_host_attached(void)
 {
