@@ -27,6 +27,7 @@
 #include "pcie.h"
 #include "pmgr.h"
 #include "pmu_counter.h"
+#include "proxy_fallback.h"
 #include "secboot.h"
 #include "sep.h"
 #include "smp.h"
@@ -269,19 +270,6 @@ void run_actions(void)
     fb_set_active(true);
 
     printf("No valid payload found\n");
-    /*
-     * An aura-try trial that cannot start its payload must not stop here: nobody may be at the
-     * Mac, and the proxy below is not guaranteed to keep the trial watchdog running. The trial
-     * marker was spent before this image was read, so a reboot lands on the configured Stage 2.
-     * Leave the error on the panel for a few seconds first.
-     */
-    if (aura_trial_enabled()) {
-        printf("\naura-try: the trial could not start its payload; rebooting to the configured "
-               "Stage 2 in 10 s\n");
-        mdelay(10000);
-        pmu_chain_leave();
-        flush_and_reboot();
-    }
     if (stage1_config_target())
         /* Shown on the panel: this is where a user without a USB host ends up. */
         printf("\nStage 1: could not start the configured Stage 2 from the EFI partition.\n"
@@ -310,6 +298,14 @@ void run_actions(void)
         flush_and_reboot();
     }
 
+    /*
+     * An aura-try trial, or a stage whose failed-boot count allows it, reboots after a bounded
+     * wait for a host instead of stopping here (proxy_fallback.c). It listens on the carriers
+     * already up and decides before USB is brought up below: that bring-up may reset a port
+     * controller and arm a watchdog of its own, which a stage on its way to a reboot must not do.
+     */
+    proxy_fallback("no payload could be started");
+
 #ifndef BRINGUP
     /* A proxy window brought USB up already; a second bring-up would register its ports twice. */
     if (!usb_up && !aura_debug_enabled() && !(stage1_window_done && chip_id != T8140)) {
@@ -320,7 +316,6 @@ void run_actions(void)
 
     printf("Running proxy...\n");
 
-    pmu_chain_leave();
     uartproxy_run(NULL);
 }
 
@@ -498,9 +493,11 @@ next_stage:
 
     if (!nvme_shutdown()) {
         printf("NVMe handoff failed; returning to proxy\n");
-        pmu_chain_leave();
-        if (!secboot_host_proxy_allowed())
+        if (!secboot_host_proxy_allowed()) {
+            pmu_chain_leave();
             flush_and_reboot();
+        }
+        proxy_fallback("NVMe handoff failed");
         uartproxy_run(NULL);
         panic("NVMe handoff failed\n");
     }
@@ -518,9 +515,11 @@ next_stage:
         /* Its firmware may still use memory the next stage will reuse. */
         if (display_shutdown(DCP_SLEEP_IF_EXTERNAL) < 0) {
             printf("Display handoff failed; returning to proxy\n");
-            pmu_chain_leave();
-            if (!secboot_host_proxy_allowed())
+            if (!secboot_host_proxy_allowed()) {
+                pmu_chain_leave();
                 flush_and_reboot();
+            }
+            proxy_fallback("Display handoff failed");
             uartproxy_run(NULL);
             panic("Display handoff failed\n");
         }

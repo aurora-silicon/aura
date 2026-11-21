@@ -454,40 +454,14 @@ bool payload_logo(void **custom_128, void **custom_256)
 }
 
 /*
- * Reboot after a failed start while fewer than this many boots in a row have failed: an ANS that
- * a Stage 2 couldn't start from off came up again after one or two reboots each time on the J713
- * (about 1 start in 7 failed, 2026-11-21). iBoot counts each such reset as a failed boot, and no
- * aura stage clears the count until the chain reaches an OS or the proxy (pmu_chain_leave()), so
- * a failure that persists ends in the proxy after this many reboots.
- */
-#define PAYLOAD_NVME_START_REBOOTS 2
-
-/* The decision alone, from the count the earlier stages handed on. */
-static bool payload_nvme_start_reboot(bool passed, u8 failed_boots)
-{
-    return passed && failed_boots < PAYLOAD_NVME_START_REBOOTS;
-}
-
-/*
- * A post-M4 ANS that didn't start from off stays down until a reboot. Rather than stop in the
- * proxy, where only a tether can reboot it, reboot while the chain's failed-boot count allows it.
- * Without a count from an earlier stage nothing bounds the reboots, and the proxy stays.
+ * A post-M4 ANS that didn't start from off stays down until a reboot. The stage ends up where
+ * every stage with no payload does: proxy_fallback() reboots while the chain's failed-boot count
+ * allows it (an ANS that failed to start came up again after one or two reboots each time on the
+ * J713, about 1 start in 7 failing, 2026-11-21) and stops in the proxy after that.
  */
 static void payload_nvme_start_failed(void)
 {
-    u8 failed = 0;
-    bool passed = pmu_failed_boots_passed(&failed);
-
-    if (!payload_nvme_start_reboot(passed, failed)) {
-        if (!passed)
-            printf("nvme: no failed-boot count from an earlier stage: no reboot, proxy\n");
-        else
-            printf("nvme: %u failed boots in a row already: no reboot, proxy\n", failed);
-        return;
-    }
-    printf("nvme: ANS start failed: rebooting (%u failed boots in a row before, limit %u)\n",
-           failed, PAYLOAD_NVME_START_REBOOTS);
-    flush_and_reboot();
+    printf("nvme: ANS didn't start from off\n");
 }
 
 int payload_run(void)
