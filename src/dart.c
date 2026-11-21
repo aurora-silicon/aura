@@ -1404,6 +1404,32 @@ void *dart_translate_silent(dart_dev_t *dart, uintptr_t iova)
 }
 
 /*
+ * A T8110 stream's state for a walk that must not miss a live mapping. Read
+ * only. 1: the DART is locked and the stream translates through a valid root,
+ * which dart_walk_locked_t8110() can walk. 0: idle, the stream has no valid
+ * translating root. -1: neither, which a caller must treat as live and
+ * unwalkable: a SID past the T8110's streams, a window that does not cover the
+ * stream's registers, a bypassed or remapping stream, or a valid root on a
+ * DART that is not locked. DAPF bypass and a remap selector without remap
+ * enable do not change the translation, as for the walk.
+ */
+int dart_t8110_stream_state(uintptr_t base, u64 size, u32 sid)
+{
+    if (sid >= (u32)dart_t8110.sid_count || size < DART_T8110_TTBR_OFF + 4 * ((u64)sid + 1))
+        return -1;
+    u32 protect = read32(base + DART_T8110_PROTECT);
+    u32 tcr = read32(base + DART_T8110_TCR_OFF + 4 * sid);
+    u32 ttbr = read32(base + DART_T8110_TTBR_OFF + 4 * sid);
+    bool root = (tcr & DART_T8110_TCR_TRANSLATE_ENABLE) && (ttbr & DART_T8110_TTBR_VALID);
+    if (!(tcr & (DART_T8110_TCR_BYPASS_DART | DART_T8110_TCR_REMAP_EN)) &&
+        (!root || (protect & DART_T8110_PROTECT_TTBR_TCR)))
+        return root;
+    printf("dart: 0x%lx sid %u: protect %x tcr %x ttbr %x: not idle and not walkable\n", base, sid,
+           protect, tcr, ttbr);
+    return -1;
+}
+
+/*
  * Walk the page tables of a locked T8110 DART stream without touching its
  * state: no stream is enabled, reset or invalidated. The stream must translate
  * through its tables (DAPF bypass and a remap selector without remap enable do

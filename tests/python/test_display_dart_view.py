@@ -915,6 +915,49 @@ static void record_list_full(void)
     assert(at(L2 + 2)[7] == leaf(DATA + 1) && heap_used == 1);
     dart_shutdown(dart);
 }
+/* The T8110 stream state the T8142 display walk keys on: only "no valid root" is idle. */
+static void t8110_stream_state(void)
+{
+    reset(false, 0, 0, false);
+    memset(regs, 0, sizeof(regs));
+    const u64 protect = REGS + DART_T8110_PROTECT;
+    const u64 tcr = REGS + DART_T8110_TCR_OFF + 4 * SID, ttbr = REGS + DART_T8110_TTBR_OFF + 4 * SID;
+    const u64 span = sizeof(regs);
+    /* Unlocked or locked, with no valid root: idle. */
+    assert(dart_t8110_stream_state(REGS, span, SID) == 0);
+    *reg(tcr) = DART_T8110_TCR_TRANSLATE_ENABLE;
+    assert(dart_t8110_stream_state(REGS, span, SID) == 0);
+    *reg(protect) = DART_T8110_PROTECT_TTBR_TCR;
+    assert(dart_t8110_stream_state(REGS, span, SID) == 0);
+    *reg(tcr) = 0;
+    *reg(ttbr) = DART_T8110_TTBR_VALID;
+    assert(dart_t8110_stream_state(REGS, span, SID) == 0);
+    /* Locked and translating, also with DAPF bypass and a remap selector alone. */
+    *reg(tcr) = DART_T8110_TCR_TRANSLATE_ENABLE;
+    assert(dart_t8110_stream_state(REGS, span, SID) == 1);
+    *reg(tcr) |= DART_T8110_TCR_BYPASS_DAPF | FIELD_PREP(DART_T8110_TCR_REMAP, 3);
+    assert(dart_t8110_stream_state(REGS, span, SID) == 1);
+    /* Bypassed or remapping, with or without a root: live and not walkable. */
+    *reg(tcr) = DART_T8110_TCR_TRANSLATE_ENABLE | DART_T8110_TCR_BYPASS_DART;
+    assert(dart_t8110_stream_state(REGS, span, SID) == -1);
+    *reg(tcr) = DART_T8110_TCR_TRANSLATE_ENABLE | DART_T8110_TCR_REMAP_EN;
+    assert(dart_t8110_stream_state(REGS, span, SID) == -1);
+    *reg(tcr) = DART_T8110_TCR_BYPASS_DART;
+    *reg(ttbr) = 0;
+    assert(dart_t8110_stream_state(REGS, span, SID) == -1);
+    /* A valid root on a DART that is not locked. */
+    *reg(protect) = 0;
+    *reg(tcr) = DART_T8110_TCR_TRANSLATE_ENABLE;
+    *reg(ttbr) = DART_T8110_TTBR_VALID;
+    assert(dart_t8110_stream_state(REGS, span, SID) == -1);
+    /* A SID past the 256 streams or a window short of its TTBR, before any read. */
+    *reg(protect) = DART_T8110_PROTECT_TTBR_TCR;
+    unsigned int reads = reg_reads;
+    assert(dart_t8110_stream_state(REGS, span, 256) == -1);
+    assert(dart_t8110_stream_state(REGS, DART_T8110_TTBR_OFF + 4 * SID, SID) == -1);
+    assert(reg_reads == reads && !nwrites);
+}
+
 static void record_unencodable_refused(void)
 {
     /* A page the PTE cannot encode is released before it is cleared or published. */
@@ -957,6 +1000,7 @@ static const struct { const char *name; void (*run)(void); } cases[] = {
     {"gen3-other-chip-immutable", gen3_other_chip_immutable},
     {"record-list-full", record_list_full},
     {"record-unencodable-refused", record_unencodable_refused},
+    {"t8110-stream-state", t8110_stream_state},
 };
 
 int main(int argc, char **argv)
@@ -1007,7 +1051,7 @@ CASES = (
     "map-absent-root-refused", "map-new-l2-in-present-root", "map-conflict-rolls-back",
     "map-misaligned-refused", "shutdown-retains-roots", "setup-refused-on-locked-view",
     "setup-stock-unlocked", "gen3-t8152-tables-writable", "gen3-other-chip-immutable",
-    "record-list-full", "record-unencodable-refused",
+    "record-list-full", "record-unencodable-refused", "t8110-stream-state",
 )
 
 
