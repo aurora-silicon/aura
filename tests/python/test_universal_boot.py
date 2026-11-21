@@ -87,7 +87,7 @@ u8 usb_dwc3_{speed}_getbyte(dwc3_{speed}_dev_t *d,int p) {{return d->marker+p;}}
 void usb_dwc3_{speed}_putbyte(dwc3_{speed}_dev_t *d,int p,u8 v) {{assert(v==d->marker+p);}}
 void usb_dwc3_{speed}_flush(dwc3_{speed}_dev_t *d,int p) {{assert(d->marker=={marker} && p==1);}}
 '''
-        for func in ('read','write','queue'):
+        for func in ('read','write','queue','queue_nonblocking'):
             const = '' if func=='read' else 'const '
             fake += f'size_t usb_dwc3_{speed}_{func}(dwc3_{speed}_dev_t *d,int p,{const}void *b,size_t n) {{(void)b;return d->marker+p+n;}}\n'
     fake += r'''
@@ -104,6 +104,7 @@ int main(void) {
   assert(usb_dwc3_read(d,1,NULL,5)==(size_t)v+6);
   assert(usb_dwc3_write(d,1,NULL,5)==(size_t)v+6);
   assert(usb_dwc3_queue(d,1,NULL,5)==(size_t)v+6);
+  assert(usb_dwc3_queue_nonblocking(d,1,NULL,5)==(size_t)v+6);
  }
  assert(usb_dwc3_shutdown(hs) && usb_dwc3_shutdown(ss) && usb_dwc3_shutdown(NULL));
  assert(hs_shutdown==1 && ss_shutdown==1);
