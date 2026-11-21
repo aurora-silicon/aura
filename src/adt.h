@@ -62,6 +62,10 @@ int adt_get_reg(const void *adt, int *path, const char *prop, int idx, u64 *addr
 bool adt_is_compatible(const void *adt, int nodeoffset, const char *compat);
 bool adt_is_compatible_at(const void *adt, int nodeoffset, const char *compat, size_t index);
 
+/* The base of the /arm-io GPIO controller whose AAPL,phandle is @phandle, and its pin count
+ * (kboot_audio.c) */
+int adt_gpio_by_phandle(const void *adt, u32 phandle, u64 *base, u32 *npins);
+
 #define ADT_FOREACH_CHILD(adt, node)                                                               \
     for (int _child_count = adt_get_child_count(adt, node); _child_count; _child_count = 0)        \
         for (node = adt_first_child_offset(adt, node); _child_count--;                             \

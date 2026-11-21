@@ -1,15 +1,18 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 
 /*
- * J813 (T8142, MacBook Air M5): train the PCIe link to the N1 Wi-Fi/Bluetooth
- * module on apcie port 0, so Linux can use the root port as a generic ECAM
- * host. The sequence follows macOS 25G76 AppleT8142PCIe / APCIECoreRCGen4:
- * AUS5 PHY power-up, root complex, N1 reset, port reset, refclk buffer,
- * PERST, root complex init and LTSSM.
+ * T8142 (M5): train the PCIe link to the radio on apcie port 0, so Linux can
+ * use the root ports as a generic ECAM host. The sequence follows macOS 25G76
+ * AppleT8142PCIe / APCIECoreRCGen4: AUS5 PHY power-up, root complex, radio
+ * reset, port reset, refclk buffer, PERST, root complex init and LTSSM.
+ *
+ * The radio's reset and PERST# lines are the board's: they come from this
+ * boot's ADT (pci-bridge0 function-reset and function-perst), as on J813
+ * (SMC key gP13 and AP GPIO 192) and on every other T8142 board.
  *
  * ADT /arm-io/apcie reg map: 0 config (ECAM),
  * 1 APCIe common (RC), 2 PHY (common block at +0x4000), 3 PHY-PHY, 4 PHY IP,
- * 5 AXI2AF, 8.. port 0 (8 config, 10 PHY glue).
+ * 5 AXI2AF, then six per port from 8 (port n: 8 + 6n config, 10 + 6n PHY glue).
  */
 
 #include "j813_n1.h"
@@ -35,12 +38,10 @@
 
 #define DBI_RO_WR 0x8bc
 
-/* SMC key gP13: ADT pci-bridge0 function-reset = pKW4('gP13', 0x800000). */
-#define SMC_KEY_GP13 0x67503133
-#define N1_RESET_LO  0x800000
+#define REG_PORT(n)      (8 + 6 * (n))
+#define REG_PORT_LANE(n) (10 + 6 * (n))
 
-/* AP GPIO 192 (ADT pci-bridge0 function-perst), driven high as output. */
-#define GPIO_N1_PERST 0x39a000300
+#define GPIO_FOURCC 0x4750494f /* "OIPG" in ADT byte order */
 
 static int j813_reg(int *path, int idx, u64 *addr)
 {
@@ -69,31 +70,63 @@ static int j813_tunables(const char *path, const char *prop, u64 base)
     return 0;
 }
 
-static int j813_n1_reset(void)
+/* The AP GPIO pad pci-bridge0's function-perst names (J813: GPIO(192) of gpio0) */
+static int j813_perst_pad(u64 *pad)
 {
-    smc_dev_t *smc = smc_init();
-    int ret = 0;
+    struct {
+        u32 phandle, fourcc, pin, flags;
+    } fn;
+    u64 base;
+    u32 npins;
+    int node = adt_path_offset(adt, APCIE_PORT);
 
-    if (!smc)
+    if (node < 0 || ADT_GETPROP(adt, node, "function-perst", &fn) != sizeof(fn) ||
+        fn.fourcc != GPIO_FOURCC || adt_gpio_by_phandle(adt, fn.phandle, &base, &npins) ||
+        fn.pin >= npins) {
+        printf("j813-n1: %s has no AP GPIO function-perst\n", APCIE_PORT);
         return -1;
-    for (u32 level = 0; level < 2 && !ret; level++) {
-        ret = smc_write_u32(smc, SMC_KEY_GP13, N1_RESET_LO | level);
-        mdelay(50);
     }
-    smc_shutdown(smc);
-    return ret;
+    *pad = base + 4 * fn.pin;
+    return 0;
 }
 
-static int j813_n1_link(void)
+/* Linux scans every root port the ECAM host has; each must have a link (port 0 is trained here) */
+static int j813_ports_up(void *dt, int host, int *path)
 {
-    int path[8];
-    u64 ecam, rc, phy, phyphy, phyip, axi, port, lane;
+    int child;
 
-    if (adt_path_offset_trace(adt, APCIE, path) < 0)
-        return -1;
+    fdt_for_each_subnode(child, dt, host)
+    {
+        int len;
+        const fdt32_t *reg = fdt_getprop(dt, child, "reg", &len);
+        const char *status = fdt_getprop(dt, child, "status", NULL);
+        u64 port;
+
+        if (!reg || len < 4 || (status && strcmp(status, "okay") && strcmp(status, "ok")))
+            continue;
+        u32 n = (fdt32_ld(reg) >> 11) & 0x1f; /* the root port's device number is its apcie port */
+        if (!n)
+            continue;
+        if (j813_reg(path, REG_PORT(n), &port))
+            return -1;
+        if (!(read32(port + PORT_LINKSTS) & BIT(0))) {
+            printf("j813-n1: root port %s (apcie port %u) has no link\n",
+                   fdt_get_name(dt, child, NULL), n);
+            return -1;
+        }
+        printf("j813-n1: apcie port %u link up (0x%x)\n", n, read32(port + PORT_LINKSTS));
+    }
+    return 0;
+}
+
+static int j813_n1_link(int *path)
+{
+    u64 ecam, rc, phy, phyphy, phyip, axi, port, lane, perst;
+
     if (j813_reg(path, 0, &ecam) || j813_reg(path, 1, &rc) || j813_reg(path, 2, &phy) ||
         j813_reg(path, 3, &phyphy) || j813_reg(path, 4, &phyip) || j813_reg(path, 5, &axi) ||
-        j813_reg(path, 8, &port) || j813_reg(path, 10, &lane))
+        j813_reg(path, REG_PORT(0), &port) || j813_reg(path, REG_PORT_LANE(0), &lane) ||
+        j813_perst_pad(&perst))
         return -1;
     u64 phycommon = phy + PHY_COMMON_OFF;
 
@@ -135,8 +168,10 @@ static int j813_n1_link(void)
     if (j813_wait(rc + 0x58, BIT(0), BIT(0), 250000, "gtb_initialized"))
         return -1;
 
-    if (j813_n1_reset()) {
-        printf("j813-n1: SMC N1 reset release failed\n");
+    int reset = smc_adt_function_reset(APCIE_PORT, 50);
+    if (reset) {
+        printf("j813-n1: %s\n", reset > 0 ? "pci-bridge0 has no SMC function-reset"
+                                          : "SMC radio reset release failed");
         return -1;
     }
     mdelay(100);
@@ -168,7 +203,7 @@ static int j813_n1_link(void)
     udelay(1000); /* t-refclk-to-perst */
 
     set32(port + PORT_PERST, BIT(0));
-    mask32(GPIO_N1_PERST, 0xf, 0x3);
+    mask32(perst, 0xf, 0x3);
     if (j813_wait(port + PORT_PIPE_STS, BIT(0), BIT(0), 100000, "lane pipe reset") ||
         j813_wait(port + PORT_STATUS, BIT(0), BIT(0), 250000, "port RUN") ||
         j813_wait(port + PORT_LINKSTS, BIT(2), 0, 500000, "port idle"))
@@ -191,7 +226,8 @@ static int j813_n1_link(void)
     u32 ident = read32(ecam + 0x100000);
     printf("j813-n1: link up (0x%x), endpoint %04x:%04x\n", read32(port + PORT_LINKSTS),
            ident & 0xffff, ident >> 16);
-    return (ident & 0xffff) == 0x106b ? 0 : -1;
+    /* Any endpoint that answers: the N1 (106b) on J813, a Broadcom radio on others */
+    return (ident & 0xffff) && (ident & 0xffff) != 0xffff ? 0 : -1;
 }
 
 int j813_n1_prepare(void *dt)
@@ -208,10 +244,15 @@ int j813_n1_prepare(void *dt)
     if (status && strcmp(status, "okay") && strcmp(status, "ok"))
         return 0;
 
-    if (!j813_n1_link())
+    int path[8];
+    if (adt_path_offset_trace(adt, APCIE, path) >= 0 && !j813_n1_link(path) &&
+        !j813_ports_up(dt, node, path))
         return 0;
 
-    /* An untrained link would hang Linux's first config access. */
-    printf("j813-n1: N1 PCIe bring-up failed; disabling the ECAM host\n");
+    /*
+     * An untrained link would hang Linux's first config access, and the generic ECAM host scans
+     * the bus behind every root port it has: one port without a link costs the whole host.
+     */
+    printf("j813-n1: PCIe bring-up failed; disabling the ECAM host\n");
     return fdt_setprop_string(dt, node, "status", "disabled") ? -1 : 0;
 }
