@@ -5,6 +5,7 @@
 #include "assert.h"
 #include "cpu_regs.h"
 #include "ctxr_exec.h"
+#include "exception.h"
 #include "fb.h"
 #include "gxf.h"
 #include "malloc.h"
@@ -62,7 +63,8 @@ static int firmware_ro_none;
 int memory_fw_ro_range(u64 *start, u64 *end)
 {
     if (!firmware_ro_checked) {
-        u64 lower, upper, ram_end;
+        u64 lower = 0, upper = 0, ram_end;
+        int exc_before = exc_count;
 
         firmware_ro_checked = true;
         firmware_ro_none = chip_id == T8140 ? -1 : 0;
@@ -71,8 +73,16 @@ int memory_fw_ro_range(u64 *start, u64 *end)
         /* CTRR_C is an EL2 register; an aura guest at EL1 leaves the range to its host. */
         if (chip_id != T8140 && !in_el2())
             return firmware_ro_none;
+        /*
+         * Not every core has CTRR_C, and reading it there faults (see ctxr_range()). Read it under
+         * the guard and take a fault as no range, so the core decides, not the chip id.
+         */
+        exc_guard = GUARD_MARK | GUARD_SILENT;
         lower = mrs(SYS_IMP_APL_CTRR_C_LWR_EL2);
         upper = mrs(SYS_IMP_APL_CTRR_C_UPR_EL2);
+        exc_guard = GUARD_OFF;
+        if (exc_count != exc_before)
+            return firmware_ro_none;
         if ((lower | upper) & (SZ_4K - 1))
             return firmware_ro_none;
         if (!cur_boot_args.mem_size ||
