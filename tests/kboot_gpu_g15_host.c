@@ -1981,6 +1981,166 @@ static void t8122_25_identity_failure(void)
     run(); assert(!strcmp(status_of(dtbuf, "/soc/gpu@292400000"), "disabled"));
     assert(pmgr_enables == 1 && pmgr_disables == 1 && pmgr_off == 1);
 }
+
+/*
+ * OS firmware 27.2 (26B123): iBoot loads the G15G firmware as three segments, the third a 32 KiB
+ * __DATA_SHARED_RO right after __DATA that /arm-io/sgx also names (gfx-data-shared-ro-*). The
+ * shape below is that of a J615's ADT on 26B123. No dcp 25G83 profile: the release routes here.
+ */
+#define T27_TEXT 0x10000944000UL
+#define T27_DATA 0x10001878000UL
+#define T27_TEXT_SIZE 0x64000
+#define T27_DATA_SIZE 0xb4000
+#define T27_RO_SIZE   0x8000
+static void prepare_27(u32 data_flags, u64 ro_gap, u64 ro_prop_size, u64 rw_size, int segments)
+{
+    prepare_j613_standin_fuse(0, 0);
+    static const char air15[] = "apple,j615\0apple,t8122";
+    CHK(fdt_setprop(dtbuf, 0, "compatible", air15, sizeof(air15)));
+    os_firmware = fw_versions[V27_2];
+    hset("/arm-io/sgx", "compatible", "gpu,t8122", sizeof("gpu,t8122"));
+    u64 ro = T27_DATA + T27_DATA_SIZE + ro_gap;
+    struct adt_segment_ranges seg[3] = {
+        {T27_TEXT, FW_VA, T27_TEXT, T27_TEXT_SIZE, 1},
+        {T27_DATA, FW_VA + T27_TEXT_SIZE, T27_DATA, T27_DATA_SIZE, data_flags},
+        {ro, FW_VA + T27_TEXT_SIZE + T27_DATA_SIZE, ro, T27_RO_SIZE, 0},
+    };
+    if (segments == 2)
+        seg[1].unk = 0;
+    hset("/arm-io/gfx-asc", "segment-ranges", seg, segments * sizeof(seg[0]));
+    hset("/arm-io/gfx-asc/iop-gfx-nub", "segment-ranges", seg, segments * sizeof(seg[0]));
+    static const char names3[] = "__TEXT;__DATA;__DATA_SHARED_RO";
+    if (segments == 3)
+        hset("/arm-io/gfx-asc", "segment-names", names3, sizeof(names3));
+    hset_u64("/arm-io/sgx", "gfx-data-shared-ro-base", ro);
+    hset_u64("/arm-io/sgx", "gfx-data-shared-ro-size", ro_prop_size);
+    hset_u64("/arm-io/sgx", "gfx-data-shared-rw-base", 0);
+    hset_u64("/arm-io/sgx", "gfx-data-shared-rw-size", rw_size);
+}
+static u64 t27_region_size(const char *name)
+{
+    int gpu = fdt_path_offset(dtbuf, "/soc/gpu@292400000"), len;
+    int idx = fdt_stringlist_search(dtbuf, gpu, "memory-region-names", name);
+    const fdt32_t *mr = fdt_getprop(dtbuf, gpu, "memory-region", &len);
+    assert(idx >= 0 && mr && (idx + 1) * 4 <= len);
+    int node = fdt_node_offset_by_phandle(dtbuf, fdt32_ld(mr + idx));
+    const fdt64_t *reg = fdt_getprop(dtbuf, node, "reg", &len);
+    assert(reg && len == 16);
+    return fdt64_ld(reg + 1);
+}
+static void t27_refused(void)
+{
+    run();
+    assert(!strcmp(status_of(dtbuf, "/soc/gpu@292400000"), "disabled"));
+    assert(prop_len(dtbuf, "/soc/gpu@292400000", "apple,m3-handoff-version") < 0);
+    assert(log_has("handoff not published; reserving the GPU firmware memory only"));
+    assert(!pmgr_enables);
+}
+static void t8122_27_handoff(void)
+{
+    prepare_27(0x10, 0, T27_RO_SIZE, 0, 3);
+    run();
+    assert(!strcmp(status_of(dtbuf, "/soc/gpu@292400000"), "disabled"));
+    assert(gpu_u32("apple,m3-handoff-version") == 2);
+    int len;
+    const fdt32_t *compat = gpu_prop("apple,firmware-compat", &len);
+    assert(compat && len == 12 && fdt32_ld(compat) == 27 && fdt32_ld(compat + 1) == 2 &&
+           fdt32_ld(compat + 2) == 0);
+    const fdt32_t *flags = gpu_prop("apple,firmware-segment-flags", &len);
+    assert(flags && len == 12 && fdt32_ld(flags) == 1 && fdt32_ld(flags + 1) == 0x10 &&
+           fdt32_ld(flags + 2) == 0);
+    const fdt64_t *vas = (const fdt64_t *)gpu_prop("apple,firmware-segment-vas", &len);
+    assert(vas && len == 24 && fdt64_ld(vas) == FW_VA &&
+           fdt64_ld(vas + 1) == FW_VA + T27_TEXT_SIZE &&
+           fdt64_ld(vas + 2) == FW_VA + T27_TEXT_SIZE + T27_DATA_SIZE);
+    assert(t27_region_size("fw-text") == T27_TEXT_SIZE);
+    assert(t27_region_size("fw-data") == T27_DATA_SIZE + T27_RO_SIZE);
+    assert(prop_len(dtbuf, "/soc/gpu@292400000", "apple,j613-25g83-gpu-handoff") < 0);
+    assert(log_has("handoff version 2 published, GPU left disabled"));
+    /* Nothing powers the GPU or opens its mailbox on 27.2. */
+    assert(!pmgr_enables && strcmp(status_of(dtbuf, "/soc/mbox@292408000"), "okay"));
+}
+static void t8122_27_two_segments(void)
+{
+    /* A two-segment ADT on 27.2 keeps the version-1 description; the GPU stays disabled. */
+    prepare_27(0, 0, T27_RO_SIZE, 0, 2);
+    run();
+    assert(!strcmp(status_of(dtbuf, "/soc/gpu@292400000"), "disabled"));
+    assert(gpu_u32("apple,m3-handoff-version") == 1);
+    int len;
+    assert(gpu_prop("apple,firmware-segment-flags", &len) && len == 8);
+    assert(t27_region_size("fw-data") == T27_DATA_SIZE);
+    assert(!pmgr_enables);
+}
+static void t8122_27_ro_gap(void)
+{
+    prepare_27(0x10, 0x4000, T27_RO_SIZE, 0, 3);
+    t27_refused();
+    assert(log_has("__DATA_SHARED_RO"));
+}
+static void t8122_27_ro_mismatch(void)
+{
+    prepare_27(0x10, 0, 0x4000, 0, 3);
+    t27_refused();
+    assert(log_has("gfx-data-shared-ro does not match"));
+}
+static void t8122_27_shared_rw(void)
+{
+    prepare_27(0x10, 0, T27_RO_SIZE, 0x4000, 3);
+    t27_refused();
+    assert(log_has("gfx-data-shared-rw region"));
+}
+static void t8122_27_data_flags(void)
+{
+    prepare_27(0, 0, T27_RO_SIZE, 0, 3);
+    t27_refused();
+    assert(log_has("segment 1 is not a plain preloaded segment"));
+}
+static void t8122_27_names(void)
+{
+    prepare_27(0x10, 0, T27_RO_SIZE, 0, 3);
+    hset("/arm-io/gfx-asc", "segment-names", "__TEXT;__DATA", sizeof("__TEXT;__DATA"));
+    t27_refused();
+    assert(log_has("segment-names is not __TEXT;__DATA;__DATA_SHARED_RO"));
+}
+static void t8122_27_identity(void)
+{
+    /* chosen.asahi,t8122-gpu-power-diag=1: the bounded identity read, then power off again. */
+    prepare_27(0x10, 0, T27_RO_SIZE, 0, 3);
+    CHK(fdt_setprop_string(dtbuf, fdt_path_offset(dtbuf, "/chosen"), "asahi,t8122-gpu-power-diag",
+                           "1"));
+    run();
+    assert(gpu_u32("apple,m3-handoff-version") == 2);
+    assert(!strcmp(status_of(dtbuf, "/soc/gpu@292400000"), "disabled"));
+    assert(strcmp(status_of(dtbuf, "/soc/mbox@292408000"), "okay"));
+    int n = fdt_path_offset(dtbuf, "/chosen/asahi,t8122-gpu-powered-identity"), len;
+    assert(n >= 0);
+    const fdt32_t *v = fdt_getprop(dtbuf, n, "probe-result", &len);
+    assert(v && len == 4 && fdt32_ld(v) == T8122_ID_PASS);
+    v = fdt_getprop(dtbuf, n, "id-version", &len);
+    assert(v && len == 4 && fdt32_ld(v) == 0x07022000);
+    assert(pmgr_enables == 1 && pmgr_disables == 1 && pmgr_off == 1 && unguarded_faults == 0);
+    assert(log_has("GPU and ASC remain disabled"));
+}
+static void t8122_27_no_identity(void)
+{
+    /* Without the switch: no identity node and the GPU is never powered. */
+    prepare_27(0x10, 0, T27_RO_SIZE, 0, 3);
+    run();
+    assert(fdt_path_offset(dtbuf, "/chosen/asahi,t8122-gpu-powered-identity") < 0);
+    assert(!pmgr_enables && !pmgr_disables);
+}
+static void t8122_25_handoff_v1(void)
+{
+    /* 26.6.2 (two segments) is unchanged: version 1, two VAs and flags <1 0>. */
+    prepare_25(0, 0);
+    run();
+    assert(gpu_u32("apple,m3-handoff-version") == 1);
+    int len;
+    const fdt32_t *flags = gpu_prop("apple,firmware-segment-flags", &len);
+    assert(flags && len == 8 && fdt32_ld(flags) == 1 && fdt32_ld(flags + 1) == 0);
+    assert(log_has("handoff published, GPU left disabled"));
+}
 #endif
 
 #ifdef G15_NEW
@@ -2340,6 +2500,16 @@ static const struct {
     {"t8122-25-wrong-os", t8122_25_wrong_os},
     {"t8122-25-j615-refused", t8122_25_j615_refused},
     {"t8122-25-missing-calibration", t8122_25_missing_calibration},
+    {"t8122-25-handoff-v1", t8122_25_handoff_v1},
+    {"t8122-27-handoff", t8122_27_handoff},
+    {"t8122-27-two-segments", t8122_27_two_segments},
+    {"t8122-27-ro-gap", t8122_27_ro_gap},
+    {"t8122-27-ro-mismatch", t8122_27_ro_mismatch},
+    {"t8122-27-shared-rw", t8122_27_shared_rw},
+    {"t8122-27-data-flags", t8122_27_data_flags},
+    {"t8122-27-names", t8122_27_names},
+    {"t8122-27-identity", t8122_27_identity},
+    {"t8122-27-no-identity", t8122_27_no_identity},
 #endif
     {"t6030-dry", t6030_dry},
     {"t6030-armed", t6030_armed},

@@ -59,6 +59,8 @@ static struct adt_segment_ranges segments[2];
 /* 0: valid; 1: no ISP node; 2: no segment list; 3: empty; 4: partial entry; 5: FDT full */
 static int fault, reservations, fwdata_calls;
 static u64 isp_iova_base(void) { return 0x100000000ULL; }
+/* The ADT names the ISP17a (T8140, T8142) "isp,isp-generic-ex". */
+static bool isp_is_isp17a(void) { return chip_id == T8140 || chip_id == T8142; }
 static bool isp_up = true;
 static int isp_get_heap(u64 *phys, u64 *iova, u64 *size)
 {
