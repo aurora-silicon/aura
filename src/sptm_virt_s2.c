@@ -21,6 +21,7 @@
 #include "nvme.h"
 #include "smp.h"
 #include "sptm_virt_priv.h"
+#include "sptm_virt_trace.h"
 #include "string.h"
 #include "uartproxy.h"
 #include "utils.h"
@@ -623,6 +624,8 @@ void sptm_virt_s2_setup(void)
     sptm_virt_s2r_setup(link_on_usb || link_on_dockchannel);
     sptm_virt_gpu_setup();
     sptm_virt_pmu_setup(); /* after the sleep path, which may own the SPMI page */
+    /* Last: it refuses any page another hook has. */
+    sptm_virt_trace_setup();
 #ifdef AURACTL
     sptm_virt_ctl_s2_setup(); /* splits blocks: before the tree is summed */
 #endif

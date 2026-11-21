@@ -80,6 +80,16 @@ Environment (all optional; 1 enables a switch):
   AURA_GFXPMP_BLK=<pa>,<len>  the block whose every access (SPTM's and XNU's, from the first trap
                            to the window's end) the record keeps apart (default sgx +0xe00000,
                            0x4000: MMIO_PROTECTED); AURA_GFXPMP_BLK_MAX=<n> its records (131072)
+  AURA_TRACE_BLKS=<pa>:<len>[:name],...  record every guest access (XNU's and SPTM's) to these
+                           16 KiB pages, performed exactly as asked, with time, core, PC, width
+                           and value, into a lossless ring (aura/hvtrace.py; sptm_trace.py reads
+                           and drains it at a park). Entries with one name are one block; up to
+                           16 ranges in 8 blocks, 32 pages. The debug link's port is refused
+  AURA_TRACE_MAX=<n>       its records (default 524288, 32 bytes each); AURA_TRACE_PRINT=<n>
+                           print the first n accesses of each block on aura's console
+  AURA_IRQ_TRACE=1         record every IRQ the guest takes through the AIC (its event register's
+                           page trapped; each read performed once); AURA_IRQ_TRACE_MAX=<n> its
+                           records (default 262144)
   AURA_SAMPLE              sample the guest's PC until each core's XNU entry (pre-XNU hangs)
   AURA_SAMPLE_HZ=<n>       samples per second (default 4)
   AURA_SAMPLE_MAX=<n>      stop printing after n samples (default 64)
@@ -219,6 +229,11 @@ KNOWN_ENV = {
     "AURA_GFXPMP_MAX",
     "AURA_GFXPMP_BLK",
     "AURA_GFXPMP_BLK_MAX",
+    "AURA_TRACE_BLKS",
+    "AURA_TRACE_MAX",
+    "AURA_TRACE_PRINT",
+    "AURA_IRQ_TRACE",
+    "AURA_IRQ_TRACE_MAX",
     "AURA_SAMPLE_HZ",
     "AURA_SAMPLE_MAX",
     "AURA_XNU_ENTRY",
@@ -936,6 +951,9 @@ def configure(p, sym, plan, adt, ctl_cookie=0):
     from aura import hvgfxrec
 
     hvgfxrec.configure(p, sym, os.environ)
+    from aura import hvtrace
+
+    hvtrace.configure(p, sym, os.environ)
     if os.environ.get("AURA_GFXPMP"):
         p.write32(sym["sptm_virt_gpu_msg_park"], 0)
         print(f"GPU/PMP record: {os.environ['AURA_GFXPMP']} ms from the named write, which doesn't "
@@ -1054,6 +1072,11 @@ def main():
     from aura import hvgfxrec
 
     refused = hvgfxrec.check_env(os.environ)
+    if refused:
+        raise SystemExit(f"refused before anything was sent: {refused}")
+    from aura import hvtrace
+
+    refused = hvtrace.check_env(os.environ)
     if refused:
         raise SystemExit(f"refused before anything was sent: {refused}")
 
@@ -1182,6 +1205,9 @@ def main():
     if not phys:
         raise SystemExit("no debug-link USB port found in the ADT")
     print("debug-link port" + ("s" if len(phys) > 1 else "") + " hidden:", " ".join(port_nodes))
+    refused = hvtrace.check_link(u.adt, port_nodes, os.environ)
+    if refused:
+        raise SystemExit(f"refused before the guest was loaded: {refused}")
     keep_exclaves = env_on("AURA_KEEP_EXCLAVES")
     # The NVRAM device stays visible (the guest's IOKit stalls without it and its Image4 nonce
     # slots live there); its writes are patched out instead, unless AURA_SHARE_NVRAM lets them

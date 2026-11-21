@@ -14,7 +14,7 @@ from unittest.mock import MagicMock
 import pytest
 
 REPO = Path(__file__).resolve().parents[2]
-TOOLS = ("run_guest_sptm.py", "console_tail.py")
+TOOLS = ("run_guest_sptm.py", "console_tail.py", "sptm_trace.py")
 
 
 def aura_imports(path):

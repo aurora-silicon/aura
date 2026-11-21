@@ -231,6 +231,29 @@ of resetting the Mac. aura's image and carve-out are unmapped, so a stray guest 
 aura with the guest's frame chain. Blocks over the CTRR-class ranges are mapped with pages (those
 ranges refuse a block translation that overlaps them).
 
+### Record-only block and IRQ traces
+
+`AURA_TRACE_BLKS=<pa>:<len>[:name],...` hooks up to 32 16 KiB pages (16 ranges in 8 blocks;
+entries with one name are one block, its offsets from its lowest page). Every guest access to
+them, XNU's and SPTM's GL1 ones, is performed once as the HV decoded it (an LDP/STP of two W
+registers is one 64-bit access, any 128-bit one an LDP/STP of two X registers, a 32-byte one
+fails) and becomes a record: time, core, PA, width, direction, value, guest PC.
+`AURA_IRQ_TRACE=1` hooks the page of the AIC's event register (`aic-iack-offset`): each read is
+performed once, and a nonzero one (an IRQ the guest takes) is a record; FIQs don't go through it. Each trace has its own ring in aura's carve-out that never
+overwrites: when full, an access is counted lost, in all and for its block. Nothing is printed per
+access (`AURA_TRACE_PRINT=<n>` prints the first n of each block).
+
+Before it hooks anything aura refuses the whole list for a page that is RAM, in no `/arm-io` reg,
+another hook's, or the debug link's USB-C port's (its controller, DART, PHY and ATC, USB4 and PCIe
+side, and the buses of its port controller and retimer; with the link unknown, every USB-C
+port's). `run_guest_sptm.py` checks the same against `debug_port()` first.
+
+`proxyclient/tools/sptm_trace.py` asks for a park, reads both rings into a capture directory,
+drains what it saved and resumes the guest, once or every `--every` seconds; it writes
+`summary.txt` (per block, the distinct offset, width and R/W with counts and values; the IRQs by
+number, named from an ADT with `--adt`) and `timeline.txt` (both, merged in time). The traces run
+in the same boot as the GPU/PMP record: the pages differ, and so do the rings.
+
 ## Suspend to RAM
 
 With the proxy on CDC, aura keeps the debug link's power domains on (XNU lowers them about a second
