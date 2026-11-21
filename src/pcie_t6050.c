@@ -113,7 +113,8 @@ struct port_regs {
     u64 perst;
     u32 refclk_to_perst_us;
     u64 dart;
-    u32 bus; /* its root port's secondary bus, once numbered (F) */
+    u32 bus;   /* its root port's secondary bus, once numbered (F) */
+    u32 speed; /* its root port's Target Link Speed, read back (F) */
     bool up;
     bool absent; /* no bridge for it in this board's ADT */
 };
@@ -631,6 +632,8 @@ static int stage_f(struct port_regs *pp)
     TRY(cap);
     u16 lnksta = read16(rp + cap + PCI_EXP_LNKSTA);
     printf("pcie-t6050: port %d link Gen%d x%d\n", pp->p->port, lnksta & 0xf, (lnksta >> 4) & 0x3f);
+    /* What stage D set, or, on an adopted port, what its boot loader set: the tree carries it */
+    pp->speed = read16(rp + cap + PCI_EXP_LNKCTL2) & 0xf;
     /* An adopted port keeps its number; a new one takes the lowest no up port has. Either may
      * change when the up ports are renumbered (pcie_t6050_init). */
     u32 buses = read32(rp + PCI_PRIMARY_BUS);
@@ -889,6 +892,45 @@ static int t6050_port_renumber(void *dt, int rp, u32 bus)
 }
 
 /*
+ * The link speed policy, for Linux to train a port by when it trains one itself (a root-port reset,
+ * a port the boot loader left down): "max-link-speed" on the port's root port node. An up port gets
+ * the target it was trained to, a port this code does not bring up (J775D port 1, the SD reader)
+ * the ADT's speed for it (pcie_adt_link_speed()); a port with neither gets none. The binding's
+ * values stop at 4 (16 GT/s), which a target above it is lowered to. The property is a hint: a
+ * failed write is logged and the boot goes on (Linux then trains the port at 8 GT/s).
+ */
+static void t6050_max_link_speed(void *dt, int port, u32 speed)
+{
+    int rp = t6050_port_node(dt, port);
+
+    if (rp == -FDT_ERR_NOTFOUND || !speed)
+        return;
+    speed = min(speed, 4u);
+    /* A hint: without it Linux trains the port at 8 GT/s, so a failed write never stops the boot */
+    if (rp < 0 || fdt_setprop_u32(dt, rp, "max-link-speed", speed))
+        printf("pcie-t6050: port %d: could not put max-link-speed %u in the tree\n", port, speed);
+    else
+        printf("pcie-t6050: port %d max-link-speed %u in the tree\n", port, speed);
+}
+
+static void t6050_publish_speeds(void *dt)
+{
+    for (int port = 0; port < T6050_GP_PORTS; port++) {
+        char bridge[40];
+        u32 speed = 0;
+
+        for (size_t i = 0; i < ARRAY_SIZE(ports); i++)
+            if (ports[i].port == port && pr[i].up)
+                speed = pr[i].speed;
+        snprintf(bridge, sizeof(bridge), "%s/pci-bridge%d", apcie_path, port);
+        int node = adt_path_offset(adt, bridge);
+        if (!speed && node >= 0 && pcie_adt_link_speed(node, &speed) < 0)
+            speed = 0;
+        t6050_max_link_speed(dt, port, speed);
+    }
+}
+
+/*
  * Make the handed-over tree match the ports as they are. The tree numbers each root port node's
  * bus (its bus-range, its functions' reg, its apcie0 iommu-map entry) for the ports a default boot
  * brings up; Linux numbers the buses itself (see the top of this file). So:
@@ -975,5 +1017,6 @@ int pcie_t6050_handoff_fdt(void *dt)
                    ports[i].port, ports[i].port);
         }
     }
+    t6050_publish_speeds(dt);
     return 0;
 }
