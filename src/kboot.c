@@ -8479,6 +8479,38 @@ static int dt_set_dcp_fw27_clocks(const char *alias, const char *adt_engine)
     return ret;
 }
 
+/*
+ * Headless T8132 boards running the pinned 27.2 DCP image: macOS drives the external ports from
+ * dcpext and parks the internal DCP, so route them through the external-processor handoff of
+ * kboot_display_handoff.c. Decide from the ADT rather than board name or OS release: /arm-io/disp0
+ * has no internal panel (external or absent) and at least one external DCP nub is running that
+ * image. Every other T8132 boot keeps the M4 handoff.
+ */
+static bool dt_t8132_external_display(void)
+{
+    static const char uuid[] = "B3BA603C-3CA7-3E21-B393-44EB20BD2AEF";
+    static const char *const nubs[] = {
+        "/arm-io/dcpext0/iop-dcpext0-nub",
+        "/arm-io/dcpext1/iop-dcpext1-nub",
+    };
+
+    int disp0 = adt_path_offset(adt, "/arm-io/disp0");
+    if (disp0 >= 0 && !adt_getprop(adt, disp0, "external", NULL))
+        return false;
+
+    for (size_t i = 0; i < ARRAY_SIZE(nubs); i++) {
+        int nub = adt_path_offset(adt, nubs[i]);
+        u32 len = 0, rlen = 0, running = 0;
+        const char *got = nub < 0 ? NULL : adt_getprop(adt, nub, "uuid", &len);
+        const void *rp = nub < 0 ? NULL : adt_getprop(adt, nub, "running", &rlen);
+        if (rp && rlen == sizeof(running))
+            memcpy(&running, rp, sizeof(running));
+        if (got && len == sizeof(uuid) && !memcmp(got, uuid, sizeof(uuid)) && running == 1)
+            return true;
+    }
+    return false;
+}
+
 static int dt_set_display(void)
 {
     if (chip_id == T8140)
@@ -8504,6 +8536,8 @@ static int dt_set_display(void)
         disp0_piodma_alias = compat_piodma_alias;
 
     if (chip_id == T8132) {
+        if (dt_t8132_external_display())
+            return dt_set_display_handoff(dt);
         if (dt_set_m4_dcp_handoff())
             printf("FDT: M4 DCP handoff refused; keeping the boot framebuffer\n");
         else
