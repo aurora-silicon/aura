@@ -282,6 +282,12 @@ struct dcp_soc {
 
 static const char *const dcp_boards_t6030[] = {"apple,j516s", "apple,j514s", NULL};
 
+/* T6030 (M3 Pro J514s/J516s) DCP images by OS: the 14.7 native image and the 27.2 image. */
+static const struct dcp_fw dcp_fws_t6030[] = {
+    {.os_fw = V14_7, .os_fw_name = "14.7", .uuid = DCP6_UUID},
+    {.os_fw = V27_2, .os_fw_name = "27.2", .uuid = "94D7C96F-63F6-3D8A-B208-B3D8E2D3621E"},
+};
+
 static const struct dcp_soc dcp_soc_t6030 = {
     .name = "T6030",
     .chip = T6030,
@@ -294,9 +300,10 @@ static const struct dcp_soc dcp_soc_t6030 = {
     .optin = "asahi,t6030-dcp",
     .always = true,
     .ext = true,
+    /* Only read when no build matches: dart-dcp is still locked on every boot, as before. */
     .uuid = DCP6_UUID,
-    .os_fw = V14_7,
-    .os_fw_name = "14.7",
+    .fws = dcp_fws_t6030,
+    .nfws = ARRAY_SIZE(dcp_fws_t6030),
     .coproc = 0x28ec00000UL,
     .dart_dcp = 0x28d30c000UL,
     .dart_disp = 0x28d304000UL,
@@ -393,6 +400,16 @@ static bool dcp25_selected(void *dt)
  */
 static const char *const dcp_boards_t6031[] = {"apple,j514c", "apple,j516c", NULL};
 
+/*
+ * T6031 (M3 Max J514C/J516C) DCP images by OS. The 14.7 arm keeps the long-standing unpinned
+ * behaviour (any_uuid: the running ADT image is published); 27.2 (T603x high-core) pins the
+ * exact 27.2 image UUID, the same exact-UUID whitelist the other refmac SoCs use.
+ */
+static const struct dcp_fw dcp_fws_t6031[] = {
+    {.os_fw = V14_7, .os_fw_name = "14.7", .any_uuid = true},
+    {.os_fw = V27_2, .os_fw_name = "27.2", .uuid = "0C885956-0484-36CA-97D6-0255FA2D4F9E"},
+};
+
 static const struct dcp_soc dcp_soc_t6031 = {
     .name = "T6031",
     .chip = T6031,
@@ -408,8 +425,8 @@ static const struct dcp_soc dcp_soc_t6031 = {
     .board_gate = true,
     .any_uuid = true,
     .log_streams = true,
-    .os_fw = V14_7,
-    .os_fw_name = "14.7",
+    .fws = dcp_fws_t6031,
+    .nfws = ARRAY_SIZE(dcp_fws_t6031),
     .coproc = 0x386c00000UL,
     .dart_dcp = 0x38530c000UL,
     .dart_disp = 0x385304000UL,
