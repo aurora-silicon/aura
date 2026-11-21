@@ -136,11 +136,23 @@ static int dcp_hdmi_dptx_init(dcp_dev_t *dcp, const display_config_t *cfg)
             dcp->hdmi_pwr_gpio = hdmi_pwr.gpio;
 
         if (dcp->dp2hdmi_pwr_gpio && dcp->hdmi_pwr_gpio) {
+            int phy_node = adt_path_offset(adt, cfg->dptx_phy);
+            bool t8132_hdmi = phy_node >= 0 && adt_is_compatible(adt, phy_node, "dptx-phy,t8132");
             smc_dev_t *smc = smc_init();
             if (smc) {
-                smc_write_u32(smc, dcp->dp2hdmi_pwr_gpio, 0x800001);
-                smc_write_u32(smc, dcp->hdmi_pwr_gpio, 0x800001);
-                smc_shutdown(smc);
+                if (t8132_hdmi) {
+                    /* T8132 dedicated HDMI (PS190): enable HDMI power before the
+                     * DP-to-HDMI converter using the macsmc CMD_OUTPUT|1 (0x1000001)
+                     * command (matching Linux drivers/gpio/gpio-macsmc.c). */
+                    smc_write_u32(smc, dcp->hdmi_pwr_gpio, 0x1000001);
+                    smc_write_u32(smc, dcp->dp2hdmi_pwr_gpio, 0x1000001);
+                    smc_shutdown(smc);
+                    mdelay(100);
+                } else {
+                    smc_write_u32(smc, dcp->dp2hdmi_pwr_gpio, 0x800001);
+                    smc_write_u32(smc, dcp->hdmi_pwr_gpio, 0x800001);
+                    smc_shutdown(smc);
+                }
             }
         }
     }
@@ -237,7 +249,7 @@ static int dcp_create_firmware_mappings(const display_config_t *cfg, dcp_dev_t *
     const char *names = adt_getprop(adt, node, "segment-names", &names_len);
 
     for (unsigned int i = 0; i < count; i++) {
-        u64 iova = seg[i].remap & ~asc_dram_mask;
+        u64 iova = seg[i].remap & ~asc_dram_mask & ~dart_dva_base(dcp->dart_dcp);
         if (dart_translate_silent(dcp->dart_dcp, iova))
             continue;
 
@@ -267,23 +279,34 @@ static int dcp_create_firmware_mappings(const display_config_t *cfg, dcp_dev_t *
 dcp_dev_t *dcp_init(const display_config_t *cfg)
 {
     u32 sid;
+    bool protected_cpu = cfg && pmgr_device_is_protected(cfg->pmgr_dev);
 
     dcp_init_quiesced = false;
 
     if (cfg && cfg->dptx_phy[0]) {
+        int phy_node = adt_path_offset(adt, cfg->dptx_phy);
+        bool phy_t8152 = phy_node >= 0 && adt_is_compatible(adt, phy_node, "dptx-phy,t8152");
+        bool phy_t8132 = phy_node >= 0 && adt_is_compatible(adt, phy_node, "dptx-phy,t8132");
+
         /* J873g reports mBoot-20457.1.29, which is not in the OS firmware
-         * table, and the same dptx-port endpoint works on its USB-C route.
-         * Keep the V13_5 restriction for the machines it was written for. */
-        if (os_firmware.version != V13_5 && chip_id != T8152) {
+         * table, and dedicated T8132 HDMI uses firmware 27.2 on dcpext0.
+         * Keep the V13_5 restriction for the older machines it was written for. */
+        if (os_firmware.version != V13_5 && !phy_t8152 &&
+            !(phy_t8132 && os_firmware.version == V27_2) && chip_id != T8152) {
             printf("dcp: dtpx-port is only supported with V13_5 OS firmware.\n");
             return NULL;
         }
 
         strncpy(dcp_pmgr_dev, cfg->pmgr_dev, sizeof(dcp_pmgr_dev));
         dcp_die = cfg->die;
-        pmgr_adt_power_enable(cfg->dcp);
-        int phy_node = adt_path_offset(adt, cfg->dptx_phy);
-        if (phy_node >= 0 && adt_is_compatible(adt, phy_node, "dptx-phy,t8152")) {
+        /* Protected display CPUs (e.g. T8132 DISPEXT0_CPU, which reads
+         * target=15, actual=0 while idle at boot) reject PMGR writes in
+         * pmgr_set_mode(); skip powering them here. */
+        if (!protected_cpu && pmgr_adt_power_enable(cfg->dcp) < 0) {
+            printf("dcp: failed to power on %s\n", cfg->dcp);
+            return NULL;
+        }
+        if (phy_t8152) {
             /* The T8152 dptx-phy node lists gate 5 in power-gates, which is
              * an E-core, not the phy's PMGR device. Enabling it leaves the
              * phy gated and the first register access aborts. */
@@ -344,7 +367,7 @@ dcp_dev_t *dcp_init(const display_config_t *cfg)
         printf("dcp: failed to create firmware mappings\n");
         goto out_iovad;
     }
-    if (ret > 0) {
+    if (ret > 0 && !protected_cpu) {
         pmgr_reset(dcp_die, dcp_pmgr_dev);
     }
 
@@ -360,9 +383,17 @@ dcp_dev_t *dcp_init(const display_config_t *cfg)
         goto out_iovad;
     }
 
-    /* Keep unqualified ASCWrap-v8 firmware from trapping startup in a wait. */
-    bool booted =
-        asc_is_v8(dcp->asc) ? rtkit_boot_timed(dcp->rtkit, 2000000) : rtkit_boot(dcp->rtkit);
+    u64 dva_base = dart_dva_base(dcp->dart_dcp);
+    if (dva_base)
+        rtkit_set_dva_base(dcp->rtkit, dva_base);
+    if (protected_cpu)
+        rtkit_set_oslog_echo(dcp->rtkit, true);
+
+    /* Keep unqualified ASCWrap-v8 or pre-running 27.2 firmware from trapping
+     * startup in an unbounded wait. */
+    bool booted = protected_cpu         ? rtkit_boot_timed(dcp->rtkit, 5000000)
+                  : asc_is_v8(dcp->asc) ? rtkit_boot_timed(dcp->rtkit, 2000000)
+                                        : rtkit_boot(dcp->rtkit);
     if (!booted) {
         printf("dcp: failed to boot RTKit\n");
         if (rtkit_has_owned_buffers(dcp->rtkit))
@@ -407,10 +438,11 @@ out_running:
 
 int dcp_shutdown(dcp_dev_t *dcp, bool sleep)
 {
-    /* The ASCWrap-v8 sleep path needs a PMGR2 reset, which is not implemented
-     * yet. Quiescing has a working RTKit wake/renegotiation path on T8152. */
-    if (sleep && asc_is_v8(dcp->asc)) {
-        printf("dcp: using quiesce instead of sleep without PMGR2 reset\n");
+    /* The ASCWrap-v8 sleep path needs a PMGR2 reset, and protected display CPU
+     * domains cannot be PMGR-reset. Quiescing leaves scanout running and keeps
+     * a clean RTKit wake/renegotiation path for Linux. */
+    if (sleep && (asc_is_v8(dcp->asc) || pmgr_device_is_protected(dcp_pmgr_dev))) {
+        printf("dcp: using quiesce instead of sleep\n");
         sleep = false;
     }
     /* dcp/dcp0 on desktop M2 and M2 Pro/Max devices do not wake from sleep */

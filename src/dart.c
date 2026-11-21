@@ -133,6 +133,7 @@ struct dart_dev {
     enum dart_type_t type;
     const struct dart_params *params;
     u64 vm_base;
+    u64 dva_base;
     uintptr_t tlbi_aperture;
     u8 tlbi_route;
 
@@ -602,8 +603,12 @@ dart_dev_t *dart_init_adt(const char *path, int instance, int device, bool keep_
             printf("dart: unexpected length of vm-base property: %u\n", len);
         }
     }
-    if (dart->locked)
+    if (dart->locked) {
+        /* T8132 display DARTs encode high alias bits above bit 35 in vm-base. */
+        if (chip_id == T8132)
+            dart->dva_base = dart->vm_base & ~((1LLU << 36) - 1);
         dart->vm_base &= (1LLU << 36) - 1;
+    }
 
     return dart;
 }
@@ -1445,6 +1450,54 @@ bool dart_shutdown_checked(dart_dev_t *dart)
     if (!dart || dart->failed)
         return false;
     if (dart->locked || dart->keep) {
+        /* Release empty heap L2 tables aura published into a locked legacy display DART
+         * once every mapping inside them has been unmapped, leaving iBoot's own L2 tables
+         * and any non-empty heap L2 table (such as an active scanout framebuffer) intact. */
+        if (dart->locked && dart->legacy_mutable && dart->type != DART_GEN3) {
+            u64 *to_free[LEGACY_L2_MAX_PAGES];
+            size_t n_free = 0;
+
+            for (int ttbr = 0; ttbr < dart->params->ttbr_count; ++ttbr) {
+                if (!dart->l1[ttbr])
+                    continue;
+                for (int i = 0; i < SZ_16K / 8; ++i) {
+                    u64 entry = dart->l1[ttbr][i];
+                    if (!(entry & DART_PTE_VALID))
+                        continue;
+                    u64 *l2 = (u64 *)(FIELD_GET(dart->params->offset_mask, entry)
+                                      << DART_PTE_OFFSET_SHIFT);
+                    if (!is_heap(l2))
+                        continue;
+                    bool used = false;
+                    for (int j = 0; j < SZ_16K / 8; ++j) {
+                        if (l2[j] & DART_PTE_VALID) {
+                            used = true;
+                            break;
+                        }
+                    }
+                    if (!used && n_free < LEGACY_L2_MAX_PAGES) {
+                        dart->l1[ttbr][i] = 0;
+                        to_free[n_free++] = l2;
+                    }
+                }
+            }
+
+            if (n_free) {
+                dart->params->tlb_invalidate(dart);
+                if (dart->failed)
+                    return false;
+                for (size_t k = 0; k < n_free; ++k) {
+                    u64 page = (u64)to_free[k];
+                    for (size_t r = 0; r < legacy_l2_count; ++r) {
+                        if (legacy_l2_pages[r] == page) {
+                            legacy_l2_pages[r] = legacy_l2_pages[--legacy_l2_count];
+                            break;
+                        }
+                    }
+                    free(to_free[k]);
+                }
+            }
+        }
         free(dart);
         return true;
     }
@@ -1555,4 +1608,9 @@ int dart_reserve_legacy_tables(void *dt, u64 dram_base, u64 dram_size)
 u64 dart_vm_base(dart_dev_t *dart)
 {
     return dart->vm_base;
+}
+
+u64 dart_dva_base(dart_dev_t *dart)
+{
+    return dart ? dart->dva_base : 0;
 }

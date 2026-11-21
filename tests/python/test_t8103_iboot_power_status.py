@@ -185,6 +185,8 @@ static void mmu_map_framebuffer(u64 a, u64 s) { (void)a; (void)s; assert(0); }
 static int adt_path_offset(void *a, const char *p) { (void)a; (void)p; assert(0); return -1; }
 static int adt_setprop(void *a, int n, const char *p, void *v, size_t s) { (void)a; (void)n; (void)p; (void)v; (void)s; assert(0); return -1; }
 static void fb_reinit(void) { assert(0); }
+static u64 dart_dva_base(void *d) { (void)d; return 0; }
+static bool dart_unmap_checked(void *d, u64 a, size_t s) { (void)d; (void)a; (void)s; return true; }
 '''
 
 CASES = r'''

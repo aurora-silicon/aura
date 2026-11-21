@@ -132,6 +132,7 @@ static bool dcp_running;
 static int endpoint_result, afk_result, resets, released, darts, iovads, freed;
 static bool stops, slept, quiesced;
 static bool asc_is_v8(void *asc) { return false; }
+static bool pmgr_device_is_protected(const char *name) { return false; }
 static int dcp_system_shutdown(void *ep) { return endpoint_result; }
 static int dcp_dptx_shutdown(void *ep) { return 0; }
 static int dcp_dpav_shutdown(void *ep) { return 0; }
@@ -305,6 +306,7 @@ static int afk_epic_shutdown_ep(afk_epic_ep_t *epic)
 }
 static int afk_epic_shutdown(afk_epic_t *afk) { return 0; }
 static bool asc_is_v8(void *asc) { return false; }
+static bool pmgr_device_is_protected(const char *name) { return false; }
 static bool rtkit_sleep(void *rtk) { return true; }
 static bool rtkit_quiesce(void *rtk) { return true; }
 static void pmgr_reset(u32 die, const char *name) {}

@@ -48,6 +48,7 @@
 
 #define OSLOG_TYPE                GENMASK(63, 56)
 #define OSLOG_TYPE_BUFFER_REQUEST 1
+#define OSLOG_TYPE_LOG            2
 #define OSLOG_SIZE                GENMASK(55, 36)
 #define OSLOG_IOVA                GENMASK(35, 0)
 
@@ -105,6 +106,7 @@ struct rtkit_dev {
 
     u64 dva_base;
     u32 timeout_usec;
+    bool oslog_echo;
     struct rtkit_buffer oslog_bfr;
 
     enum rtkit_power_state iop_power;
@@ -612,14 +614,26 @@ int rtkit_recv(rtkit_dev_t *rtk, struct rtkit_message *msg)
                         rtkit_printf("unknown ioreport message %x\n", msgtype);
                 }
                 break;
-            case RTKIT_EP_OSLOG:
-                if (asc_is_v8(rtk->asc) &&
-                    FIELD_GET(OSLOG_TYPE, msg->msg) == OSLOG_TYPE_BUFFER_REQUEST) {
-                    ok = ok && rtkit_handle_oslog_request(rtk, msg);
+            case RTKIT_EP_OSLOG: {
+                u8 oslog_type = FIELD_GET(OSLOG_TYPE, msg->msg);
+                if (oslog_type == OSLOG_TYPE_BUFFER_REQUEST) {
+                    if (rtk->oslog_echo && FIELD_GET(OSLOG_IOVA, msg->msg)) {
+                        rtkit_printf("ignoring firmware-owned oslog buffer request %lx\n",
+                                     msg->msg);
+                        break;
+                    }
+                    if (asc_is_v8(rtk->asc) || rtk->oslog_echo) {
+                        ok = ok && rtkit_handle_oslog_request(rtk, msg);
+                        break;
+                    }
+                } else if (oslog_type == OSLOG_TYPE_LOG && rtk->oslog_echo) {
+                    if (!asc_send(rtk->asc, &asc_msg))
+                        rtkit_printf("failed to echo oslog notify %lx\n", msg->msg);
                     break;
                 }
                 rtkit_printf("unknown oslog message %lx\n", msg->msg);
                 break;
+            }
             default:
                 rtkit_printf("message to unknown system endpoint 0x%02x: %lx\n", msg->ep, msg->msg);
         }
@@ -896,6 +910,16 @@ bool rtkit_boot_timed(rtkit_dev_t *rtk, u32 timeout_usec)
 u32 rtkit_get_timeout(rtkit_dev_t *rtk)
 {
     return rtk->timeout_usec;
+}
+
+void rtkit_set_dva_base(rtkit_dev_t *rtk, u64 dva_base)
+{
+    rtk->dva_base = dva_base;
+}
+
+void rtkit_set_oslog_echo(rtkit_dev_t *rtk, bool enable)
+{
+    rtk->oslog_echo = enable;
 }
 
 static bool rtkit_quiesce_ap_power(rtkit_dev_t *rtk, enum rtkit_power_state state)

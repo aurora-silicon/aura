@@ -72,10 +72,20 @@ static bool pmgr_protected_addr(uintptr_t addr);
  * that is already on keeps its word, including the auto bits the OS configured. */
 bool pmgr_keep_configured;
 
+static bool pmgr_protected_name(const char *name)
+{
+    return (chip_id == T8140 || chip_id == T8132) &&
+           (!strncmp(name, "DISP_CPU", 16) || !strncmp(name, "DISPEXT0_CPU", 16));
+}
+
 static bool pmgr_protected_device(const struct pmgr_device *device)
 {
-    return chip_id == T8140 && (!strncmp(device->name, "DISP_CPU", sizeof(device->name)) ||
-                                !strncmp(device->name, "DISPEXT0_CPU", sizeof(device->name)));
+    return pmgr_protected_name(device->name);
+}
+
+bool pmgr_device_is_protected(const char *name)
+{
+    return name && pmgr_protected_name(name);
 }
 
 static uintptr_t pmgr_get_psreg(u8 idx)
@@ -181,7 +191,7 @@ static uintptr_t pmgr_device_get_addr(u8 die, const struct pmgr_device *device)
 
 static bool pmgr_protected_addr(uintptr_t addr)
 {
-    if (chip_id != T8140 || !pmgr_devices)
+    if ((chip_id != T8140 && chip_id != T8132) || !pmgr_devices)
         return false;
     for (size_t i = 0; i < pmgr_devices_len; i++) {
         if (!pmgr_protected_device(&pmgr_devices[i]))

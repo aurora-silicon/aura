@@ -92,6 +92,8 @@ static const void *adt_getprop(void *tree, int node, const char *name, u32 *len)
 }
 static int display_configure(const char *config) { (void)config; configures++; return 0; }
 static int display_init_t8152(void) { return 0; }
+static bool display_is_t8132_hdmi(void) { return false; }
+static int display_init_t8132_hdmi(void) { return 0; }
 static void fb_clear_direct(void) {}
 static bool firmware_sfw_in_range(enum fw_version lo, enum fw_version hi) { (void)lo; (void)hi; return false; }
 

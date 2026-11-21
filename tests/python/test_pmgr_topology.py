@@ -36,6 +36,7 @@ typedef uint64_t u64;
 #define FIELD_GET(f, v) (((v) & (f)) / ((f) & -(f)))
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 #define PACKED __attribute__((packed))
+#define T8132 0x8132
 #define T8140 0x8140
 #define ADT_GETPROP(a, n, p, v) (-1)
 

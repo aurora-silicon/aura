@@ -72,6 +72,7 @@ int pmgr_power_on(int die, const char *name);
 int pmgr_reset_held(int die, const char *name);
 int pmgr_power_is_on(int die, const char *name);
 int pmgr_power_is_requested(int die, const char *name);
+bool pmgr_device_is_protected(const char *name);
 /* Power state register of the real (not virtual) device `name`, 0 if none */
 uintptr_t pmgr_psreg_by_name(int die, const char *name);
 int pmgr_power_steps(int die, const char *name, bool on);
