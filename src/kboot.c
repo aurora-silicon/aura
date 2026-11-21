@@ -8167,9 +8167,15 @@ static int dt_set_display(void)
 
     if (chip_id == T8132) {
         enum dcp_internal internal;
-        if (dt_set_m4_dcp_handoff(&internal))
+        int refused = dt_set_m4_dcp_handoff(&internal);
+        if (refused && internal != DCP_INTERNAL_NO_PANEL)
             printf("FDT: M4 DCP handoff refused; keeping the boot framebuffer\n");
-        else
+        /*
+         * The external processors of an image whose interface kboot_display_handoff.c knows are
+         * handed over from the ADT there, beside a complete internal handoff or with no panel;
+         * those of any other image keep the firmware-ready path.
+         */
+        if (!dt_set_dcpext_handoff(dt, internal) && !refused)
             dt_reserve_j713_dcpext();
         return 0;
     }

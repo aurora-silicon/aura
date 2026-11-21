@@ -88,6 +88,17 @@
  * firmware row pins the DCP image on dcp and dcpext, publishes the /arm-io/disp0 firmware clocks
  * on dcp, and publishes empty apple,clock-ids on dcpext.
  *
+ * External display processors the ADT describes (dt_set_dcpext_handoff(), called by kboot.c's
+ * T8132 path after its internal M4 DCP handoff): no board, chip or OS release is tested. A device
+ * tree node of a known block (dcpext_blocks[], by compatible) is matched to the ADT processor at
+ * its address, its firmware DART stream and window and its display pipe come from the ADT and
+ * are checked against the device tree, and the image it runs must be the internal DCP's, share
+ * its __TEXT and be one whose external interface is known (dcpext_images[], keyed by the image's
+ * uuid; any other image is refused). Each processor is its own transaction and gets its firmware
+ * memory, apple,firmware-uuid/-version/-compat and its pipe's firmware clocks. Only beside a
+ * complete internal handoff (the processors keep their status) or on a board with no panel (the
+ * processors must be disabled, and the display subsystem is enabled for them). No MMIO.
+ *
  * T6050 (M5 Pro/Max): the __OS_LOG buffers of every running display coprocessor are reserved on
  * every boot. When the device tree describes the internal display (aliases dcp and disp0, all its
  * nodes disabled) and every check in t6050_handoff() passes, that handoff is published and those
@@ -3433,6 +3444,472 @@ static void t6041_ext_handoffs(void *dt)
     } else if (!dcp6_commit(dt, scratch)) {
         dlog("display subsystem and its DART enabled for the external processors\n");
     }
+}
+
+/* ---- external display processors the ADT describes ---- */
+
+/*
+ * External display processors whose handoff this boot's ADT describes completely, by block: the
+ * device tree compatible of the processor, and of the display subsystem its pipe joins on a board
+ * with no panel. A later SoC whose processor lists one of these as a fallback compatible is the
+ * same block and needs no entry.
+ */
+static const struct {
+    const char *dcpext, *display;
+} dcpext_blocks[] = {
+    {"apple,t8132-dcpext", "apple,t8132-display-subsystem"},
+};
+
+/*
+ * The external processor interface of a DCP firmware image, by the image's own uuid (iop nub
+ * uuid). This is the image's ABI, what its firmware asks the OS for, not a board or OS release
+ * list: the processors of an image not listed here are not handed over.
+ */
+static const struct {
+    const char *uuid;
+    bool pipe_clocks; /* its firmware is given its pipe's ADT clock-ids as firmware clocks */
+} dcpext_images[] = {
+    /* The T8132 image of macOS 27.2 (26B123), which dcp, dcpext0 and dcpext1 run */
+    {"B3BA603C-3CA7-3E21-B393-44EB20BD2AEF", true},
+};
+
+#define DCPEXT_MAX 8
+
+static const struct dcp_soc dcp_soc_dcpext = {.name = "dcpext"};
+
+/* One external processor, as matched between the device tree and the ADT */
+struct dcpext {
+    char dt_path[DCP6_NAME_LEN * 2];
+    char name[DCP6_NAME_LEN]; /* its ADT node's (dcpext0), or the DT path until matched */
+    const char *display;      /* its block's display subsystem compatible */
+    int adt;                  /* /arm-io/<name> */
+    u32 sid;                  /* its firmware DART stream */
+    u64 coproc, dart, vm_base, vm_size;
+    struct dcp6_clocks clk; /* its pipe's */
+};
+
+/* Per-call state of dt_set_dcpext_handoff() */
+static struct {
+    bool headless;        /* no panel: no internal handoff, the external processors only */
+    const char *uuid;     /* the image the internal DCP's nub runs, which each must run */
+    bool pipe_clocks;     /* that image's interface */
+    struct dcp6_seg text; /* the internal nub's __TEXT, which each must share */
+    int n;
+    struct dcpext ext[DCPEXT_MAX];
+} dcpext_run;
+
+/* An ADT string property (device_type) is `want` */
+static bool dcpext_adt_is(int node, const char *prop, const char *want)
+{
+    u32 len = 0;
+    size_t n = strlen(want);
+    const char *v = adt_getprop(adt, node, prop, &len);
+    return v && len > n && !memcmp(v, want, n) && !v[n];
+}
+
+/* reg[0] of /arm-io/<child>, with the /arm-io ranges applied */
+static int dcpext_adt_reg(int child, u64 *addr)
+{
+    const char *name = adt_get_name(adt, child);
+    char path[DCP6_NAME_LEN * 2];
+    if (!name || snprintf(path, sizeof(path), "/arm-io/%s", name) >= (int)sizeof(path))
+        return -1;
+    return dcp6_adt_reg(path, 0, addr);
+}
+
+/* The /arm-io child or grandchild whose AAPL,phandle is `ph`, and its parent */
+static int dcpext_adt_phandle(u32 ph, int *parent)
+{
+    int io = adt_path_offset(adt, "/arm-io"), child = io;
+    u32 v;
+
+    if (io < 0 || !ph)
+        return -1;
+    ADT_FOREACH_CHILD(adt, child)
+    {
+        if (!dcp6_adt_u32(child, "AAPL,phandle", &v) && v == ph) {
+            *parent = io;
+            return child;
+        }
+        int kid = child;
+        ADT_FOREACH_CHILD(adt, kid)
+        {
+            if (!dcp6_adt_u32(kid, "AAPL,phandle", &v) && v == ph) {
+                *parent = child;
+                return kid;
+            }
+        }
+    }
+    return -1;
+}
+
+/*
+ * A DART stream from an iommu-parent phandle: a dart-mapper whose reg is the stream, under a
+ * dart,t8110 DART. Returns the DART's offset.
+ */
+static int dcpext_adt_stream(u32 ph, u32 *sid)
+{
+    int dart, mapper = dcpext_adt_phandle(ph, &dart);
+    if (mapper < 0 || !dcpext_adt_is(mapper, "device_type", "dart-mapper") ||
+        dcp6_adt_u32(mapper, "reg", sid) || !adt_is_compatible(adt, dart, "dart,t8110"))
+        return -1;
+    return dart;
+}
+
+/*
+ * The DART window of stream `sid`: the DART has that stream (sid-count) and gives vm-base and
+ * vm-size-<sid> (or vm-size when it has no per-stream size).
+ */
+static int dcpext_adt_window(int dart, u32 sid, u64 *vm_base, u64 *vm_size)
+{
+    char prop[24];
+    u32 count;
+
+    snprintf(prop, sizeof(prop), "vm-size-%u", sid);
+    if (dcp6_adt_u32(dart, "sid-count", &count) || sid >= count ||
+        dcp6_adt_u64(dart, "vm-base", vm_base) ||
+        (dcp6_adt_u64(dart, prop, vm_size) && dcp6_adt_u64(dart, "vm-size", vm_size)))
+        return -1;
+    /* One 36-bit DVA window in its alias form (the low 36 bits of the base are the DVA) */
+    return !*vm_size || (*vm_base & DART_DVA_MASK) || (*vm_size & (SZ_16K - 1)) ||
+                   *vm_size > DART_DVA_MASK + 1
+               ? -1
+               : 0;
+}
+
+/* reg[0] of a device tree node whose parent has 2 address and 2 size cells */
+static int dcpext_dt_reg(void *dt, int node, u64 *addr)
+{
+    int len, parent = node < 0 ? node : fdt_parent_offset(dt, node);
+    const fdt64_t *reg = parent < 0 ? NULL : fdt_getprop(dt, node, "reg", &len);
+    if (!reg || len < 2 * (int)sizeof(fdt64_t) || fdt_address_cells(dt, parent) != 2 ||
+        fdt_size_cells(dt, parent) != 2)
+        return -1;
+    *addr = fdt64_ld(reg);
+    return 0;
+}
+
+/*
+ * The processor's ADT node: the one /arm-io child of device_type dcp at its device tree reg[0],
+ * and the ADT's description of its firmware DART stream (iommu-parent), which the device tree's
+ * iommus and DART must match: the same stream, the DART at the ADT DART's address, and an
+ * apple,dma-range equal to the ADT window of that stream.
+ */
+static int dcpext_match(void *dt, struct dcpext *x)
+{
+    int node = fdt_path_offset(dt, x->dt_path), io = adt_path_offset(adt, "/arm-io"), len;
+    int child = io, n = 0;
+    u64 addr;
+
+    if (node < 0 || io < 0 || dcpext_dt_reg(dt, node, &x->coproc))
+        bail("%s: no reg\n", x->name);
+    ADT_FOREACH_CHILD(adt, child)
+    {
+        if (!dcpext_adt_is(child, "device_type", "dcp") || dcpext_adt_reg(child, &addr) ||
+            addr != x->coproc)
+            continue;
+        x->adt = child;
+        n++;
+    }
+    if (n != 1)
+        bail("%s: %d ADT processors at 0x%lx\n", x->name, n, x->coproc);
+    snprintf(x->name, sizeof(x->name), "%s", adt_get_name(adt, x->adt));
+
+    u32 ph;
+    int dart_adt = dcp6_adt_u32(x->adt, "iommu-parent", &ph) ? -1 : dcpext_adt_stream(ph, &x->sid);
+    if (dart_adt < 0 || dcpext_adt_reg(dart_adt, &x->dart) ||
+        dcpext_adt_window(dart_adt, x->sid, &x->vm_base, &x->vm_size))
+        bail("%s: the ADT does not describe its DART stream\n", x->name);
+
+    const fdt32_t *iommus = fdt_getprop(dt, node, "iommus", &len);
+    if (!iommus || len != 2 * (int)sizeof(fdt32_t) || fdt32_ld(&iommus[1]) != x->sid)
+        bail("%s: iommus is not <&dart %u>, the ADT's stream\n", x->name, x->sid);
+    int dart = fdt_node_offset_by_phandle(dt, fdt32_ld(&iommus[0]));
+    if (dart < 0 || fdt_node_check_compatible(dt, dart, "apple,t8110-dart") ||
+        dcpext_dt_reg(dt, dart, &addr) || addr != x->dart)
+        bail("%s: its DART is not the ADT's apple,t8110-dart at 0x%lx\n", x->name, x->dart);
+    const fdt32_t *range = fdt_getprop(dt, dart, "apple,dma-range", &len);
+    if (!range || len != 4 * (int)sizeof(fdt32_t) ||
+        (((u64)fdt32_ld(&range[0]) << 32) | fdt32_ld(&range[1])) != x->vm_base ||
+        (((u64)fdt32_ld(&range[2]) << 32) | fdt32_ld(&range[3])) != x->vm_size)
+        bail("%s: DART apple,dma-range is not the ADT window <0x%lx 0x%lx>\n", x->name, x->vm_base,
+             x->vm_size);
+    char what[sizeof(x->name) + 8];
+    snprintf(what, sizeof(what), "%s DART", x->name);
+    if (dcpext_run.headless &&
+        (dcp6_status_disabled(dt, node, x->name) || dcp6_status_disabled(dt, dart, what)))
+        return -1;
+    return 0;
+}
+
+/*
+ * The processor's display pipe: the one ADT ext-display-subsystem whose iommu-parent includes the
+ * stream of the device tree's piodma child (iommus = <&dart sid>), under the ADT DART at that
+ * DART's address.
+ */
+static int dcpext_pipe(void *dt, struct dcpext *x)
+{
+    char path[sizeof(x->dt_path) + 8];
+    int len, io = adt_path_offset(adt, "/arm-io"), child = io, pipe = -1, n = 0;
+    u64 base, addr;
+
+    snprintf(path, sizeof(path), "%s/piodma", x->dt_path);
+    int piodma = fdt_path_offset(dt, path);
+    const fdt32_t *iommus = piodma < 0 ? NULL : fdt_getprop(dt, piodma, "iommus", &len);
+    int dart = !iommus || len != 2 * (int)sizeof(fdt32_t)
+                   ? -1
+                   : fdt_node_offset_by_phandle(dt, fdt32_ld(&iommus[0]));
+    if (dart < 0 || dcpext_dt_reg(dt, dart, &base) || io < 0)
+        bail("%s: no piodma child on a DART\n", x->name);
+    u32 cell = fdt32_ld(&iommus[1]);
+    ADT_FOREACH_CHILD(adt, child)
+    {
+        u32 plen = 0;
+        const u8 *phs = adt_getprop(adt, child, "iommu-parent", &plen);
+        if (!phs || plen % sizeof(u32) ||
+            !dcpext_adt_is(child, "device_type", "ext-display-subsystem"))
+            continue;
+        for (u32 i = 0; i < plen / sizeof(u32); i++) {
+            u32 ph, sid;
+            memcpy(&ph, phs + i * sizeof(u32), sizeof(ph));
+            int mdart = dcpext_adt_stream(ph, &sid);
+            if (mdart >= 0 && sid == cell && !dcpext_adt_reg(mdart, &addr) && addr == base) {
+                pipe = child;
+                n++;
+                break;
+            }
+        }
+    }
+    if (n != 1)
+        bail("%s: %d ADT display pipes use its piodma stream %u at 0x%lx\n", x->name, n, cell,
+             base);
+    return pipe;
+}
+
+/*
+ * Hand one external processor over, into `dt` (a scratch copy): everything is checked against the
+ * ADT before the first edit. Returns 0 if published, nonzero (with its reason logged) if not.
+ */
+static int dcpext_fill(void *dt, struct dcpext *x)
+{
+    struct dcp6_seg segs[DCPEXT6_SEGS];
+    u32 ph[3], len = 0;
+
+    if (dcpext_match(dt, x))
+        return -1;
+    int node = fdt_path_offset(dt, x->dt_path);
+    if (dcpext_placeholders(dt, node, x->name, ph))
+        return -1;
+
+    char nub_path[DCP6_NAME_LEN * 2 + 16];
+    dcp6_nub_path(nub_path, sizeof(nub_path), x->name);
+    int nub = adt_path_offset(adt, nub_path);
+    const char *uuid = nub < 0 ? NULL : adt_getprop(adt, nub, "uuid", &len);
+    if (!dcp6_is_uuid(uuid, len) || strcmp(uuid, dcpext_run.uuid))
+        bail("%s: does not run the internal DCP's image %s\n", x->name, dcpext_run.uuid);
+    if (dcpext_nub_segs(x->name, nub, x->vm_base, x->vm_size, segs))
+        return -1;
+    if (segs[SEG_TEXT].phys != dcpext_run.text.phys || segs[SEG_TEXT].size != dcpext_run.text.size)
+        bail("%s: __TEXT 0x%lx+0x%lx is not the internal DCP's\n", x->name, segs[SEG_TEXT].phys,
+             segs[SEG_TEXT].size);
+
+    if (dcpext_run.pipe_clocks) {
+        if (fdt_getprop(dt, node, "clocks", NULL) || fdt_getprop(dt, node, "clock-names", NULL) ||
+            fdt_getprop(dt, node, "apple,clock-ids", NULL))
+            bail("%s: already has clocks\n", x->name);
+        int pipe = dcpext_pipe(dt, x);
+        if (pipe < 0 || dcp6_read_clocks(pipe, adt_get_name(adt, pipe), &x->clk))
+            return -1;
+    }
+
+    /*
+     * Beside the internal handoff, __TEXT is its region (kboot.c reserved it as asc-firmware@);
+     * with no panel, the first processor reserves it for both. The reservations are checked here,
+     * so that only a full device tree fails below.
+     */
+    char text_name[64];
+    const struct dcp6_seg *text = &segs[SEG_TEXT];
+    snprintf(text_name, sizeof(text_name),
+             dcpext_run.headless ? "dcp-text@%lx" : "asc-firmware@%lx", text->phys);
+    int shared = dcp6_find_resv(dt, text_name, text->phys, text->size);
+    if (shared == -FDT_ERR_NOTFOUND && dcpext_run.headless) {
+        if (dcp6_resv_conflict(dt, text->phys, text->size, text_name))
+            return -1;
+    } else if (shared < 0 || fdt_node_check_compatible(dt, shared, "apple,asc-mem")) {
+        bail("%s: no apple,asc-mem /reserved-memory/%s for the shared __TEXT\n", x->name,
+             text_name);
+    }
+    if (dcp6_resv_conflict(dt, segs[SEG_DATA].phys, segs[SEG_DATA].size, x->name) ||
+        dcp6_resv_conflict(dt, segs[SEG_3].phys, segs[SEG_3].size, x->name))
+        return -1;
+    if (dcpext_fill_mem(dt, x->dt_path, x->name, segs, ph, text_name, dcpext_run.headless,
+                        x->vm_base) ||
+        fdt_setprop_string(dt, fdt_path_offset(dt, x->dt_path), "apple,firmware-uuid", uuid) ||
+        (dcpext_run.pipe_clocks
+             ? dcp6_publish_clocks(dt, x->dt_path, x->name, &x->clk)
+             : fdt_setprop_empty(dt, fdt_path_offset(dt, x->dt_path), "apple,clock-ids")))
+        bail("%s: no room in the device tree for its handoff\n", x->name);
+    return 0;
+}
+
+/* The device tree's external processors of a known block, by compatible; returns how many */
+static int dcpext_find(void *dt)
+{
+    dcpext_run.n = 0;
+    for (size_t b = 0; b < ARRAY_SIZE(dcpext_blocks); b++) {
+        int node = -1;
+        while ((node = fdt_node_offset_by_compatible(dt, node, dcpext_blocks[b].dcpext)) >= 0) {
+            bool seen = false;
+            for (int i = 0; i < dcpext_run.n; i++)
+                seen |= fdt_path_offset(dt, dcpext_run.ext[i].dt_path) == node;
+            if (seen)
+                continue;
+            if (dcpext_run.n == DCPEXT_MAX) {
+                dlog("more than %d external processors; the rest are not handed over\n",
+                     DCPEXT_MAX);
+                return dcpext_run.n;
+            }
+            struct dcpext *x = &dcpext_run.ext[dcpext_run.n];
+            if (fdt_get_path(dt, node, x->dt_path, sizeof(x->dt_path)))
+                continue;
+            strncpy(x->name, x->dt_path, sizeof(x->name) - 1); /* zeroed: terminated */
+            x->display = dcpext_blocks[b].display;
+            dcpext_run.n++;
+        }
+    }
+    return dcpext_run.n;
+}
+
+/*
+ * The __OS_LOG buffers of the external processors (and, with no panel, of the internal DCP, which
+ * is not handed over) keep being written whatever happens to their handoff: reserve them, as their
+ * own transaction.
+ */
+static void dcpext_reserve_oslogs(void *dt)
+{
+    int io = adt_path_offset(adt, "/arm-io");
+
+    dcp6.nnubs = 0;
+    if (dcpext_run.headless)
+        dcp6.nubs[dcp6.nnubs++] = "dcp";
+    for (int i = 0; i < dcpext_run.n && dcp6.nnubs < DCP6_NUBS_MAX; i++) {
+        int node = fdt_path_offset(dt, dcpext_run.ext[i].dt_path), child = io;
+        u64 coproc, addr;
+        if (io < 0 || dcpext_dt_reg(dt, node, &coproc))
+            continue;
+        ADT_FOREACH_CHILD(adt, child)
+        {
+            if (dcpext_adt_is(child, "device_type", "dcp") && !dcpext_adt_reg(child, &addr) &&
+                addr == coproc && dcp6.nnubs < DCP6_NUBS_MAX)
+                dcp6.nubs[dcp6.nnubs++] = adt_get_name(adt, child);
+        }
+    }
+    dcp6_reserve_oslogs(dt);
+}
+
+/*
+ * kboot.c's M4 handoff, after its internal DCP handoff: hand the external display processors over
+ * from this boot's ADT and device tree, with no board, chip or OS release test and no MMIO.
+ *
+ * Only for an image whose external interface is known (dcpext_images[], by the uuid of the
+ * internal DCP's nub); otherwise nothing is done and 0 is returned. Otherwise 1, whatever was
+ * published: the processors of such an image are this function's. Each processor of a known
+ * block (dcpext_blocks[]) is matched to its ADT node by address and checked against it (DART
+ * stream and window, pipe, image, layout, the shared __TEXT), and is its own transaction: a
+ * refusal is one log line and leaves the device tree as it was for that processor.
+ *
+ * Beside a complete internal handoff (DCP_INTERNAL_COMPLETE, which published this image on dcp
+ * and reserved its __TEXT) the processors share that __TEXT, and their nodes keep their status:
+ * the kernel's display gate admits them. With no panel (DCP_INTERNAL_NO_PANEL) they must be
+ * disabled, share the internal nub's __TEXT, reserved here, and once one is published the display
+ * subsystem and its DART are enabled for them. After any other internal outcome nothing is handed
+ * over: an external processor must never cost the panel.
+ */
+int dt_set_dcpext_handoff(void *dt, enum dcp_internal internal)
+{
+    memset(&dcp6, 0, sizeof(dcp6));
+    memset(&dcpext_run, 0, sizeof(dcpext_run));
+    dcp6.soc = &dcp_soc_dcpext;
+
+    u32 len = 0, seg_len = 0, names_len = 0;
+    int nub = adt_path_offset(adt, DCP6_NUB);
+    const char *uuid = nub < 0 ? NULL : adt_getprop(adt, nub, "uuid", &len);
+    if (!dcp6_is_uuid(uuid, len))
+        return 0;
+    for (size_t i = 0; i < ARRAY_SIZE(dcpext_images) && !dcpext_run.uuid; i++)
+        if (!strcmp(uuid, dcpext_images[i].uuid)) {
+            dcpext_run.uuid = dcpext_images[i].uuid;
+            dcpext_run.pipe_clocks = dcpext_images[i].pipe_clocks;
+        }
+    if (!dcpext_run.uuid) {
+        dlog("no external processor interface known for image %s\n", uuid);
+        return 0;
+    }
+    dcpext_run.headless = internal == DCP_INTERNAL_NO_PANEL;
+    if (!dcpext_find(dt)) {
+        dlog("the device tree describes no external processor\n");
+        return 1;
+    }
+    dcpext_reserve_oslogs(dt);
+
+    if (internal != DCP_INTERNAL_COMPLETE && internal != DCP_INTERNAL_NO_PANEL) {
+        dlog("internal DCP handoff not complete: external processors not handed over\n");
+        return 1;
+    }
+    if (internal == DCP_INTERNAL_COMPLETE) {
+        const char *dcp_path = fdt_get_alias(dt, "dcp");
+        int dcp = dcp_path ? fdt_path_offset(dt, dcp_path) : -1, ulen = 0;
+        const char *published = dcp < 0 ? NULL : fdt_getprop(dt, dcp, "apple,firmware-uuid", &ulen);
+        if (!published || ulen != (int)len || memcmp(published, uuid, len)) {
+            dlog("dcp was not handed over with image %s: external processors not handed over\n",
+                 uuid);
+            return 1;
+        }
+    }
+    const struct adt_segment_ranges *ranges = adt_getprop(adt, nub, "segment-ranges", &seg_len);
+    const char *names = adt_getprop(adt, nub, "segment-names", &names_len);
+    struct adt_segment_ranges r;
+    if (!ranges || seg_len < sizeof(r) || seg_len % sizeof(r) || !names ||
+        !dcp6_seg_name_is(names, names_len, SEG_TEXT, "__TEXT")) {
+        dlog("the internal DCP's nub has no __TEXT: external processors not handed over\n");
+        return 1;
+    }
+    memcpy(&r, &ranges[SEG_TEXT], sizeof(r));
+    dcpext_run.text = (struct dcp6_seg){r.phys, ALIGN_UP((u64)r.size, SZ_16K), r.remap, r.unk};
+    if (r.unk != SEG_FLAGS_TEXT || !r.size || firmware_os_components() == V_UNKNOWN) {
+        dlog("no internal __TEXT or OS firmware release to publish: external processors not "
+             "handed over\n");
+        return 1;
+    }
+
+    const char *display = NULL;
+    for (int i = 0; i < dcpext_run.n; i++) {
+        struct dcpext *x = &dcpext_run.ext[i];
+        void *scratch = dcp6_scratch(dt);
+        if (!scratch)
+            return 1;
+        if (dcpext_fill(scratch, x)) {
+            free(scratch);
+            continue;
+        }
+        if (!dcp6_commit(dt, scratch)) {
+            dlog("%s handed over (image %s, stream %u, %u pipe clocks)\n", x->name, uuid, x->sid,
+                 x->clk.n);
+            display = display ?: x->display;
+        }
+    }
+    if (!dcpext_run.headless || !display)
+        return 1;
+    void *scratch = dcp6_scratch(dt);
+    if (!scratch)
+        return 1;
+    if (dcp6_headless_display(scratch, display)) {
+        dlog("display subsystem not enabled; the external processors stay disabled\n");
+        free(scratch);
+    } else if (!dcp6_commit(dt, scratch)) {
+        dlog("no panel: display subsystem and its DART enabled for the external processors\n");
+    }
+    return 1;
 }
 
 /*
