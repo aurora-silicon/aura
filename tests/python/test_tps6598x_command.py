@@ -114,6 +114,30 @@ def test_reset_wait_fails_when_reset_never_happens(tmp_path):
     assert mode.value == 0
 
 
+def test_reset_wait_fails_when_gaid_is_rejected(tmp_path):
+    """CMD1 reads !CMD: the controller refused Gaid and never resets, so the
+    old firmware's APP in MODE must not count as ready."""
+    lib = command_lib(tmp_path)
+    clock = [0]
+    reads = []
+
+    def read(ctx, reg, data, length):
+        reads.append(reg)
+        ctypes.memmove(data, b"!CMD" if reg == 0x08 else b"APP ", 4)
+        return length
+
+    def delay(ctx, usec):
+        clock[0] += usec // 1000
+
+    ops = Ops(WRITE(lambda ctx, reg, data, length: length), READ(read),
+              NOW(lambda ctx: clock[0]), DELAY(delay))
+    mode = ctypes.c_uint32()
+    assert lib.tps6598x_reset_wait_execute(ctypes.byref(ops), None,
+                                           ctypes.byref(mode)) == -1
+    assert mode.value == 0
+    assert reads == [0x08]
+
+
 def test_stuck_register_selection_uses_whole_command_deadline(tmp_path):
     lib = command_lib(tmp_path)
     clock = [0]

@@ -75,8 +75,11 @@ int tps6598x_reset_wait_execute(const struct tps6598x_command_ops *ops, void *ct
         if (!reset_seen) {
             if (ops->read(ctx, TPS_REG_CMD1, bytes, sizeof(bytes)) != sizeof(bytes))
                 transport_ok = false;
-            if (!transport_ok ||
-                TPS6598X_TAG(bytes[0], bytes[1], bytes[2], bytes[3]) != TPS_CMD_GAID)
+            u32 cmd = transport_ok ? TPS6598X_TAG(bytes[0], bytes[1], bytes[2], bytes[3]) : 0;
+            /* The controller rejected Gaid: it never resets, and MODE still reads the old APP. */
+            if (cmd == TPS_CMD_INVALID)
+                return -1;
+            if (!transport_ok || cmd != TPS_CMD_GAID)
                 reset_seen = true;
         }
         if (reset_seen && transport_ok) {
