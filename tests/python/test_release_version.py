@@ -41,6 +41,17 @@ def label(tmp_path, ref_type, ref_name, version="1.0.0b14"):
     return found[0]
 
 
+# The Stage 1 version pattern of the distributions' Stage 2 updaters (supports_trial() in
+# fedora-aurora packages/update-m1n1/bootchain.py; alarm-aurora and nixos-aurora carry the same
+# function). A tag build whose label it does not match fully would turn off their aura-try trials.
+UPDATER_PATTERN = r"(?:aura[- v]?)?v?(\d+)\.(\d+)\.(\d+)(?:b(\d+))?(?:-(?:[0-9]+-)?g[0-9a-f]+)?(?:-dirty)?"
+
+
+def test_tag_labels_parse_in_the_stage2_updaters(tmp_path):
+    for name in ("v1.0.0b14", "v1.0.0b14.1", "v1.0.0b14.12"):
+        assert re.fullmatch(UPDATER_PATTERN, label(tmp_path, "tag", name)), name
+
+
 def test_release_tag_is_labelled_version(tmp_path):
     assert label(tmp_path, "tag", "v1.0.0b14") == "1.0.0b14"
 
