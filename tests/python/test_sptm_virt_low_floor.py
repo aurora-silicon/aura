@@ -24,10 +24,12 @@ def guard_enum():
 
 HARNESS = r'''
 #include <assert.h>
+#include <stdarg.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 typedef uint64_t u64;
 typedef uint32_t u32;
 #define SZ_4K 0x1000UL
@@ -61,10 +63,26 @@ static bool sptm_virt_carveout_low(void) { return false; }
 static u64 heapblock_high_water(void) { return stub_heap_hw; }
 static u64 heapblock_limit(void) { return stub_heap_lim; }
 #define _end ((void *)stub_end)
-#define printf(...) ((void)0)
+/* Only the line for a rejected CTRR_C pair is kept: how often it came and with which registers. */
+static int rejects;
+static u64 rej_lwr, rej_upr;
+static void stub_printf(const char *fmt, ...)
+{
+    va_list ap;
+
+    if (strncmp(fmt, "MMU: unusable CTRR_C range", 26))
+        return;
+    va_start(ap, fmt);
+    rej_lwr = va_arg(ap, u64);
+    rej_upr = va_arg(ap, u64);
+    va_end(ap);
+    rejects++;
+}
+#define printf(...) stub_printf(__VA_ARGS__)
 static bool firmware_ro_checked, firmware_ro_valid;
 static int firmware_ro_none;
 static u64 firmware_ro_start, firmware_ro_end;
+@RO_REJECT@
 @RO_RANGE@
 @FLOOR@
 #undef printf
@@ -94,6 +112,7 @@ static u64 run(u64 base, bool ctrr_set)
 def build(tmp_path, name, body):
     source = (HARNESS
               .replace("@GUARD@", guard_enum())
+              .replace("@RO_REJECT@", function("src/memory.c", "static int firmware_ro_reject(u64 lower, u64 upper)"))
               .replace("@RO_RANGE@", function("src/memory.c", "int memory_fw_ro_range(u64 *start, u64 *end)"))
               .replace("@FLOOR@", function("src/sptm_virt.c", "static u64 sptm_virt_low_floor(u64 limit)"))
               + body)
@@ -166,6 +185,69 @@ int main(void)
     reads = 0;
     run(base, true);
     assert(reads == 0 && memory_fw_ro_range(NULL, NULL) == 0);
+    return 0;
+}
+''')
+
+
+def test_rejected_ctrr_pair_is_reported_once(tmp_path):
+    build(tmp_path, "floor_reject", r'''
+static int probe(u64 lwr, u64 upr)
+{
+    reg_lwr = lwr;
+    reg_upr = upr;
+    firmware_ro_checked = firmware_ro_valid = false;
+    rejects = 0;
+    rej_lwr = rej_upr = 0;
+    return memory_fw_ro_range(NULL, NULL);
+}
+
+int main(void)
+{
+    u64 base = 0x10005c28000UL, lwr = base + RO_OFF, upr = base + RO_OFF + RO_SIZE - SZ_4K;
+    u64 ram_end = DRAM + 0x400000000UL;
+    const struct {
+        u64 lwr, upr;
+    } bad[] = {
+        {lwr + 0x800, upr},              /* not on a 4 KiB boundary */
+        {lwr, UINT64_MAX - SZ_4K + 1},   /* the end would wrap */
+        {upr + SZ_4K, lwr},              /* ends before it starts */
+        {lwr, 0},                        /* only one register set */
+        {DRAM - SZ_16K, DRAM + SZ_16K},  /* starts below RAM */
+        {lwr, ram_end},                  /* runs past the end of RAM */
+    };
+
+    run(base, true);
+
+    /* An unset pair and a usable pair both say nothing. */
+    assert(probe(0, 0) == 0 && rejects == 0);
+    assert(probe(lwr, upr) == 1 && rejects == 0);
+
+    /* A set pair that fails a check still reads as none, and is printed once with its values. */
+    for (size_t i = 0; i < ARRAY_SIZE(bad); i++) {
+        assert(probe(bad[i].lwr, bad[i].upr) == 0);
+        assert(rejects == 1 && rej_lwr == bad[i].lwr && rej_upr == bad[i].upr);
+        assert(memory_fw_ro_range(NULL, NULL) == 0 && rejects == 1);
+    }
+
+    /* Boot args the pair cannot be checked against count as a reject too. */
+    cur_boot_args.mem_size = 0;
+    assert(probe(lwr, upr) == 0 && rejects == 1 && rej_lwr == lwr && rej_upr == upr);
+    run(base, true);
+    cur_boot_args.top_of_kernel_data = ram_end;
+    assert(probe(lwr, upr) == 0 && rejects == 1 && rej_lwr == lwr && rej_upr == upr);
+    run(base, true);
+
+    /* A core without the registers faults under the guard: no range, and nothing printed. */
+    has_ctrr = false;
+    assert(probe(lwr, upr) == 0 && rejects == 0);
+    has_ctrr = true;
+
+    /* T8140 keeps its error return; the line only adds what the registers held. */
+    chip_id = T8140;
+    assert(probe(lwr, upr) == 1 && rejects == 0);
+    assert(probe(lwr, upr + SZ_16K) == -1 && rejects == 1 && rej_upr == upr + SZ_16K);
+    assert(probe(0, 0) == -1 && rejects == 0);
     return 0;
 }
 ''')
