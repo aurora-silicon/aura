@@ -354,17 +354,52 @@ class UartInterface(Reloadable):
     def set_event_handler(self, event_id, handler):
         self.evt_handlers[event_id] = handler
 
+    @staticmethod
+    def _usb_tty_identity(path):
+        """(USB serial, interface number) of a ttyACM/ttyUSB node, or None."""
+        try:
+            name = os.path.basename(os.path.realpath(path))
+            intf = os.path.realpath(f"/sys/class/tty/{name}/device")
+            with open(os.path.join(intf, "bInterfaceNumber")) as f:
+                num = f.read().strip()
+            with open(os.path.join(os.path.dirname(intf), "serial")) as f:
+                return f.read().strip(), num
+        except OSError:
+            return None
+
+    @staticmethod
+    def _usb_tty_by_identity(ident):
+        """The /dev node of the USB tty interface with this identity, or None."""
+        try:
+            names = os.listdir("/sys/class/tty")
+        except OSError:
+            return None
+        for name in sorted(names):
+            if name.startswith(("ttyACM", "ttyUSB")) and \
+                    UartInterface._usb_tty_identity(f"/dev/{name}") == ident:
+                return f"/dev/{name}"
+        return None
+
     def wait_boot(self):
         try:
             return self.reply(self.REQ_BOOT)
         except:
-            # Over USB, reboots cause a reconnect
+            # Over USB, reboots cause a reconnect. The new enumeration may get another node
+            # (ttyACM2 while a reader still holds the old ones): follow the same USB serial and
+            # interface, not the node name.
+            ident = self.devpath and self._usb_tty_identity(self.devpath)
             self.dev.close()
             print("Waiting for reconnection... ", end="")
             sys.stdout.flush()
             for i in range(200):
                 print(".", end="")
                 sys.stdout.flush()
+                if ident and not os.path.exists(self.dev.port):
+                    node = self._usb_tty_by_identity(ident)
+                    if node and node != self.dev.port:
+                        print(f" [{self.dev.port} is now {node}]", end="")
+                        self.dev.port = node
+                        self.devpath = node
                 try:
                     self.dev.open()
                 except serial.serialutil.SerialException:
