@@ -125,19 +125,6 @@ void dockchannel_uart_putchar(u8 c)
     dockchannel_uart_putbyte(c);
 }
 
-u8 dockchannel_uart_getchar(void)
-{
-    return dockchannel_uart_getbyte();
-}
-
-void dockchannel_uart_puts(const char *s)
-{
-    while (*s)
-        dockchannel_uart_putchar(*(s++));
-
-    dockchannel_uart_putchar('\n');
-}
-
 /*
  * The whole line or nothing, without waiting: for paths that must not stall on a FIFO
  * nobody drains (the S2R wake of a T6040, whose OS keeps the DockChannel off).
@@ -177,21 +164,6 @@ size_t dockchannel_uart_read(void *buf, size_t count)
     }
 
     return recvd;
-}
-
-int dockchannel_uart_printf(const char *fmt, ...)
-{
-    va_list args;
-    char buffer[512];
-    int i;
-
-    va_start(args, fmt);
-    i = vsnprintf(buffer, sizeof(buffer), fmt, args);
-    va_end(args);
-
-    dockchannel_uart_write(buffer, min(i, (int)(sizeof(buffer) - 1)));
-
-    return i;
 }
 
 u32 dockchannel_uart_tx_free(void)

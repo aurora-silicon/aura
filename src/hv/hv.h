@@ -57,7 +57,6 @@ int hv_map(u64 from, u64 to, u64 size, u64 incr);
 int hv_unmap(u64 from, u64 size);
 int hv_map_hw(u64 from, u64 to, u64 size);
 int hv_map_hw_ro(u64 from, u64 to, u64 size);
-int hv_map_sw(u64 from, u64 to, u64 size);
 int hv_map_hook(u64 from, hv_hook_t *hook, u64 size);
 bool hv_pt_is_ram(u64 ipa);
 int hv_pt_set_writable(u64 ipa, bool writable);

@@ -150,31 +150,6 @@ out:
     return ret;
 }
 
-int dptxport_validate_connection(afk_epic_service_t *service, u8 core, u8 atc, u8 die)
-{
-    struct dcpdptx_connection_cmd cmd;
-    struct dcpdptx_connection_reply resp;
-    int ret;
-    u32 target = FIELD_PREP(DCPDPTX_REMOTE_PORT_CORE, core) |
-                 FIELD_PREP(DCPDPTX_REMOTE_PORT_DFP, atc) |
-                 FIELD_PREP(DCPDPTX_REMOTE_PORT_DIE, die) | DCPDPTX_REMOTE_PORT_CONNECTED;
-
-    cmd.target = target;
-    cmd.unk = 0x100;
-    ret = afk_service_call(service, 0, 12, &cmd, sizeof(cmd), 40, &resp, sizeof(resp), 16);
-    if (ret)
-        return ret;
-    if (afk_epic_is_v2(service->epic) && resp.status)
-        return (s32)resp.status;
-
-    if (resp.target != target)
-        return -1;
-    if (resp.unk != 0x100)
-        return -1;
-
-    return 0;
-}
-
 int dptxport_connect(afk_epic_service_t *service, u8 core, u8 atc, u8 die)
 {
     struct dcpdptx_connection_cmd cmd = {0};

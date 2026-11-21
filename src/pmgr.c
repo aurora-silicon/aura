@@ -661,12 +661,6 @@ int pmgr_adt_power_is_off(const char *path)
     return 1;
 }
 
-int pmgr_adt_power_enable_index(const char *path, u32 index)
-{
-    int ret = pmgr_adt_device_set_mode(path, index, PMGR_PS_ACTIVE, true);
-    return ret;
-}
-
 int pmgr_adt_power_disable_index(const char *path, u32 index)
 {
     return pmgr_adt_device_set_mode(path, index, PMGR_PS_PWRGATE, false);
@@ -792,32 +786,6 @@ static int pmgr_reset_device(int die, const struct pmgr_device *dev)
     clear32(addr, PMGR_DEV_DISABLE);
 
     return 0;
-}
-
-int pmgr_adt_reset(const char *path)
-{
-    const u32 *devices;
-    u32 n_devices;
-    int ret = 0;
-
-    if (pmgr_adt_find_devices(path, &devices, &n_devices) < 0)
-        return -1;
-
-    for (u32 i = 0; i < n_devices; ++i) {
-        const struct pmgr_device *device;
-        u16 id = FIELD_GET(PMGR_DEVICE_ID, devices[i]);
-        u8 die = FIELD_GET(PMGR_DIE_ID, devices[i]);
-
-        if (pmgr_find_device(id, &device)) {
-            ret = -1;
-            continue;
-        }
-
-        if (pmgr_reset_device(die, device))
-            ret = -1;
-    }
-
-    return ret;
 }
 
 /* The real device named `name`: a virtual (no_ps) child may share its parent's name (T6050

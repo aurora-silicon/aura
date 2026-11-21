@@ -403,7 +403,6 @@ void get_simd_state(void *state);
 void put_simd_state(void *state);
 
 void hexdump(const void *d, size_t len);
-void regdump(u64 addr, size_t len);
 int snprintf(char *str, size_t size, const char *fmt, ...);
 int debug_printf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 void udelay(u32 d);

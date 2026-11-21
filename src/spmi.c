@@ -217,11 +217,6 @@ int spmi_send_reset(spmi_dev_t *dev, u8 addr)
     return raw_command(dev, addr, SPMI_OPC_RESET, 0, NULL, 0, NULL, 0);
 }
 
-int spmi_send_sleep(spmi_dev_t *dev, u8 addr)
-{
-    return raw_command(dev, addr, SPMI_OPC_SLEEP, 0, NULL, 0, NULL, 0);
-}
-
 int spmi_send_shutdown(spmi_dev_t *dev, u8 addr)
 {
     return raw_command(dev, addr, SPMI_OPC_SHUTDOWN, 0, NULL, 0, NULL, 0);

@@ -47,18 +47,6 @@ void hexdump(const void *d, size_t len)
     }
 }
 
-void regdump(u64 addr, size_t len)
-{
-    u64 i, off;
-    for (off = 0; off < len; off += 32) {
-        printf("%016lx  ", addr + off);
-        for (i = 0; i < 32; i += 4) {
-            printf("%08x ", read32(addr + off + i));
-        }
-        printf("\n");
-    }
-}
-
 int snprintf(char *buffer, size_t size, const char *fmt, ...)
 {
     va_list args;

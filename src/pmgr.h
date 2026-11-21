@@ -48,9 +48,7 @@ struct pmgr_saved_modes {
 
 int pmgr_adt_power_enable_traced_saved(const char *path, struct pmgr_saved_modes *saved);
 void pmgr_restore_modes(struct pmgr_saved_modes *saved);
-int pmgr_adt_power_enable_index(const char *path, u32 index);
 int pmgr_adt_power_disable_index(const char *path, u32 index);
-int pmgr_adt_reset(const char *path);
 
 /* One PMGR device, as an ADT clock-gates/power-gates entry or a parent names it. Read only. */
 struct pmgr_gate {
