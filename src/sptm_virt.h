@@ -110,6 +110,7 @@ extern volatile u8 *sptm_smp_crumbs;
 void sptm_virt_crumb(u8 stage);
 void sptm_virt_crumb_fault(void);
 extern volatile int sptm_virt_parking_cpu;
+extern volatile u64 sptm_virt_parked_mask;
 void sptm_virt_park_others(void);
 void sptm_virt_park_check(void);
 
