@@ -1283,6 +1283,22 @@ void *dart_translate_silent(dart_dev_t *dart, uintptr_t iova)
  * outside DRAM are refused. @visit is called for every valid L2 entry and stops
  * the walk by returning non-zero.
  */
+/*
+ * Whether a T8110 stream is locked and translates through a valid root, which is
+ * what dart_walk_locked_t8110() needs to walk it. Read only.
+ */
+bool dart_t8110_stream_translating(uintptr_t base, u64 size, u8 sid)
+{
+    if (size < DART_T8110_TTBR_OFF + 4 * ((u64)sid + 1))
+        return false;
+    u32 tcr = read32(base + DART_T8110_TCR_OFF + 4 * sid);
+    u32 ttbr = read32(base + DART_T8110_TTBR_OFF + 4 * sid);
+    return (read32(base + DART_T8110_PROTECT) & DART_T8110_PROTECT_TTBR_TCR) &&
+           (tcr & DART_T8110_TCR_TRANSLATE_ENABLE) &&
+           !(tcr & (DART_T8110_TCR_BYPASS_DART | DART_T8110_TCR_REMAP_EN)) &&
+           (ttbr & DART_T8110_TTBR_VALID);
+}
+
 int dart_walk_locked_t8110(uintptr_t base, u64 size, u8 sid, u64 dram_base, u64 dram_size,
                            int (*visit)(u64 iova, u64 paddr, void *opaque), void *opaque)
 {

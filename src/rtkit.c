@@ -545,6 +545,9 @@ int rtkit_recv(rtkit_dev_t *rtk, struct rtkit_message *msg)
                 switch (msgtype) {
                     case MGMT_MSG_IOP_PWR_STATE_ACK:
                         rtk->iop_power = FIELD_GET(MGMT_PWR_STATE, msg->msg);
+                        /* A warm start's only progress report: say what came and when. */
+                        if (rtk->inherited)
+                            rtkit_printf("IOP power state %#x\n", rtk->iop_power);
                         break;
                     case MGMT_MSG_AP_PWR_STATE_ACK:
                         rtk->ap_power = FIELD_GET(MGMT_PWR_STATE, msg->msg);
@@ -663,7 +666,8 @@ static bool rtkit_wait_for_power(rtkit_dev_t *rtk, enum rtkit_power_state *state
             return false;
 
         if (timeout && timeout_expired(timeout)) {
-            rtkit_printf("timed out waiting for %s power state %#x\n", name, target);
+            rtkit_printf("timed out waiting for %s power state %#x (last %#x)\n", name, target,
+                         *state);
             return false;
         }
     }
@@ -845,10 +849,17 @@ bool rtkit_boot(rtkit_dev_t *rtk)
     return rtkit_boot_internal(rtk, 0, false, 0);
 }
 
+/*
+ * The J713's ANS (M4, macOS 27.2 firmware) answered HELLO and the endpoint map, then reported its
+ * IOP power state only just after a 2 s wait gave up. Give the report 6 s: it costs nothing when
+ * the firmware is quick, and a start that gives up early can't be retried cleanly.
+ */
+#define RTKIT_WARM_TIMEOUT_US (6 * USEC_PER_SEC)
+
 bool rtkit_boot_warm(rtkit_dev_t *rtk, u32 last_mask)
 {
     rtk->inherited = true;
-    return rtkit_boot_internal(rtk, 2 * USEC_PER_SEC, true, last_mask);
+    return rtkit_boot_internal(rtk, RTKIT_WARM_TIMEOUT_US, true, last_mask);
 }
 
 /* Boot the IOP, or adopt the session of one a previous stage left running. Such
@@ -963,39 +974,6 @@ static bool rtkit_switch_power_state(rtkit_dev_t *rtk, enum rtkit_power_state ap
             rtkit_printf("IOP died during shutdown\n");
             return false;
         }
-    }
-
-    return true;
-}
-
-/*
- * Stop the IOP sending syslog, ioreport and oslog traffic to the AP while the
- * IOP itself keeps running, for a next stage that uses the coprocessor without
- * servicing its mailbox.
- */
-bool rtkit_quiesce_ap(rtkit_dev_t *rtk)
-{
-    struct rtkit_message msg;
-    int ret;
-
-    if (rtk->crashed)
-        return false;
-
-    while ((ret = rtkit_recv(rtk, &msg)) > 0)
-        rtkit_printf("dropping message to non-system endpoint 0x%02x before AP quiesce: %lx\n",
-                     msg.ep, msg.msg);
-    if (ret < 0 || !rtkit_quiesce_ap_power(rtk, RTKIT_POWER_QUIESCED))
-        return false;
-
-    /* Acknowledge anything the IOP sent along with the transition. */
-    u64 timeout = timeout_calculate(50000);
-    while (!timeout_expired(timeout)) {
-        ret = rtkit_recv(rtk, &msg);
-        if (ret < 0)
-            return false;
-        if (ret > 0)
-            rtkit_printf("dropping message to non-system endpoint 0x%02x after AP quiesce: %lx\n",
-                         msg.ep, msg.msg);
     }
 
     return true;
