@@ -24,7 +24,8 @@ struct smc_adt_function {
 };
 
 /* Read the SMC function in property prop of the ADT node at path: 0 when it is one, 1 when the
- * node or property is missing or is not a pKW4/pKW8 (a GPIO, say). */
+ * node or property is missing, is not a pKW4/pKW8 (a GPIO, say), or its phandle is not that of
+ * /arm-io/smc or a node below it. */
 int smc_adt_function_get(const char *path, const char *prop, struct smc_adt_function *fn);
 int smc_adt_function_write(smc_dev_t *smc, const struct smc_adt_function *fn, u32 level);
 
