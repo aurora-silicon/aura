@@ -81,6 +81,7 @@ extern u64 relocated_from;
 
 int dt_set_gpu(void *dt);
 int dt_set_display_handoff(void *dt);
+bool dt_display_handoff_has_profile(void *dt);
 
 u64 kboot_ram_base(void)
 {
@@ -8146,51 +8147,20 @@ static int dt_set_display(void)
             return 0;
         dt_set_j514s_native();
         return 0;
-    } else if (!fdt_node_check_compatible(dt, 0, "apple,t6030") ||
-               !fdt_node_check_compatible(dt, 0, "apple,t8122") ||
-               !fdt_node_check_compatible(dt, 0, "apple,t6031")) {
+    } else if (dt_display_handoff_has_profile(dt)) {
         /*
-         * Fail-soft handoff (kboot_display_handoff.c): it always returns 0, never uses the
-         * helpers above (they bail out of kboot or enable nodes) and never enables a node.
-         * On T8122 it does nothing unless chosen.asahi,t8122-dcp=1; the external DCP firmware is
-         * reserved only with chosen.asahi,t8122-dcpext=1 and that handoff. On T6031 it does nothing
-         * unless the board is a J514C or J516C, and reserves only __OS_LOG unless
-         * chosen.asahi,t6031-dcp=1 (on a J516C, dt_set_m3_defaults() sets it unless a config line
-         * set it).
+         * The SoCs the profile-driven, fail-soft handoff (kboot_display_handoff.c) has a profile
+         * for (T6030, T8122, T6031, T6040, T6041, T6050). It always returns 0, never uses the
+         * helpers above (they bail out of kboot or enable nodes) and never enables a node; the
+         * profile, the OS firmware and the device tree decide what it hands over. On T8122 the
+         * external DCP firmware is reserved only with chosen.asahi,t8122-dcpext=1 and that
+         * handoff. A SoC without a profile (T6032: its 27.0.1 ADT has no dcp/disp0, the Studio's
+         * displays are dcpext0..7) gets nothing.
          */
         ret = dt_set_display_handoff(dt);
         if (!fdt_node_check_compatible(dt, 0, "apple,t8122"))
             dt_reserve_dcpext_firmware(false);
         return ret;
-    } else if (!fdt_node_check_compatible(dt, 0, "apple,t6040")) {
-        /*
-         * Fail-soft T6041 display block handoff (kboot_display_handoff.c): nothing unless the
-         * board is a J616s whose device tree describes the display block; the display nodes stay
-         * disabled.
-         */
-        return dt_set_display_handoff(dt);
-    } else if (!fdt_node_check_compatible(dt, 0, "apple,t6041")) {
-        /*
-         * The same fail-soft handoff on the M4 Max: nothing unless the board is a J616C or
-         * J614C whose device tree describes the display block; the display nodes stay disabled.
-         */
-        return dt_set_display_handoff(dt);
-    } else if (!fdt_node_check_compatible(dt, 0, "apple,t6032")) {
-        /*
-         * T6032 (J575D): refused until the handoff's firmware ABI exists. The missing pieces:
-         * a dcp6 display-gate profile for T6032 pinned to this OS firmware (27.0/27.0.1,
-         * mBoot-20457.1.29) in kboot_display_handoff.c, and a kernel side T6032 ABI; the 27.0.1
-         * ADT also has no dcp/disp0 processor at all (the Studio's displays are dcpext0..7), so
-         * the T6031 profile cannot be reused as is. Nothing is enabled by default.
-         */
-        printf("FDT: T6032: display handoff refused: no T6032 dcp6 display-gate profile for this "
-               "OS firmware (%s) or kernel ABI exists yet; the ADT also has no dcp/disp0 "
-               "(displays are dcpext0..7)\n",
-               os_firmware.string);
-        return 0;
-    } else if (!fdt_node_check_compatible(dt, 0, "apple,t6050")) {
-        /* Fail-soft (kboot_display_handoff.c): __OS_LOG reservations and the internal panel. */
-        return dt_set_display_handoff(dt);
     } else if (!fdt_node_check_compatible(dt, 0, "apple,t8142")) {
         ret = dt_carveout_reserved_regions("dcp", "disp0", "disp0_piodma",
                                            disp_reserved_regions_t8142,

@@ -4159,6 +4159,15 @@ static T6050_TEXT void t6050_headless_handoff(void *dt, int engine)
 }
 
 /* Always returns 0: nothing here may stop the boot */
+/* Whether the handoff has a SoC profile for this device tree's root */
+bool dt_display_handoff_has_profile(void *dt)
+{
+    for (size_t i = 0; i < ARRAY_SIZE(dcp_socs); i++)
+        if (!fdt_node_check_compatible(dt, 0, dcp_socs[i]->compat))
+            return true;
+    return false;
+}
+
 int dt_set_display_handoff(void *dt)
 {
     memset(&dcp6, 0, sizeof(dcp6));
