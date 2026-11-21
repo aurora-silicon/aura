@@ -121,8 +121,61 @@ static void adt_path_of(char *buf, size_t len, const char *fmt, int i)
 
 /* ---- the ADT ---- */
 
+/*
+ * PMGR: each pipe's CPU domain (the ADT clock-gate of its processor) under its FE and SYS domains,
+ * under a virtual fabric device, as in the T8132 ADT's table. The ids are the J713's; the power
+ * state registers are synthetic. iBoot leaves SYS and FE on and the CPU requested but gated by
+ * the hardware while idle (target active, auto enable, actual off).
+ */
+#define T8132_PMGR 0x3e0000000ULL
+#define PS_ON      0xffu
+#define PS_CPU_REQ (0x1000000fu)
+enum { PM_FABRIC = 32, PM_DISP0_SYS = 10, PM_DISP0_FE, PM_DISP0_CPU };
+static u16 pm_sys(int i)
+{
+    return i ? 137 : 40;
+}
+static u64 ps_reg(u16 id)
+{
+    return T8132_PMGR + 8 * id;
+}
+
+/* DART registers (T8110 layout): PROTECT, then TCR and TTBR of one stream */
+static void dart_regs(u64 base, u32 sid, u32 protect, u32 tcr, u32 ttbr)
+{
+    region_add(base, 0x4000);
+    poke32(base + 0x200, protect);
+    poke32(base + 0x1000 + 4 * sid, tcr);
+    poke32(base + 0x1400 + 4 * sid, ttbr);
+}
+
 static void world_t8132(bool no_panel, const char *uuid)
 {
+    nfdevs = 0;
+    nregions = 0;
+    region_add(T8132_PMGR, 0x1000);
+    fdev_add(PM_FABRIC, "AFISOCNI0", true, 0, 0);
+    fdev_add(PM_DISP0_SYS, "DISP0_SYS", false, ps_reg(PM_DISP0_SYS), PM_FABRIC);
+    fdev_add(PM_DISP0_FE, "DISP0_FE", false, ps_reg(PM_DISP0_FE), PM_DISP0_SYS);
+    fdev_add(PM_DISP0_CPU, "DISP0_CPU", false, ps_reg(PM_DISP0_CPU), PM_DISP0_FE);
+    poke32(ps_reg(PM_DISP0_SYS), PS_ON);
+    poke32(ps_reg(PM_DISP0_FE), PS_ON);
+    poke32(ps_reg(PM_DISP0_CPU), PS_CPU_REQ);
+    static const char *const pm_names[2][3] = {{"DISPEXT0_SYS", "DISPEXT0_FE", "DISPEXT0_CPU"},
+                                               {"DISPEXT1_SYS", "DISPEXT1_FE", "DISPEXT1_CPU"}};
+    for (int i = 0; i < 2; i++) {
+        u16 sys = pm_sys(i);
+        fdev_add(sys, pm_names[i][0], false, ps_reg(sys), PM_FABRIC);
+        fdev_add(sys + 1, pm_names[i][1], false, ps_reg(sys + 1), sys);
+        fdev_add(sys + 2, pm_names[i][2], false, ps_reg(sys + 2), sys + 1);
+        poke32(ps_reg(sys), PS_ON);
+        poke32(ps_reg(sys + 1), PS_ON);
+        poke32(ps_reg(sys + 2), PS_CPU_REQ);
+        /* iBoot locked the firmware DART; stream 23 translates through a valid root */
+        dart_regs(ext_dart[i], 23, 0x1ff, 0x9, 0x40001);
+    }
+    dart_regs(M4_DART_DISP, 0, 0x1f9, 0x9, 0x50001);
+
     chip_id = 0x8132;
     os_firmware = (struct fw_version_info){V27_2, "27.2", {27, 2, 0}, 3, "mBoot-20457.41.3"};
     ram_base = layout272 ? TB + 0xc00000 : TB + 0x800000;
@@ -158,6 +211,10 @@ static void world_t8132(bool no_panel, const char *uuid)
     prop_u32("/arm-io/dart-dcp/mapper-dcp", "reg", 23);
     prop_u32("/arm-io/dart-dcp/mapper-dcp", "AAPL,phandle", APH_MAPPER_DCP);
     prop_str("/arm-io/disp0", "device_type", "display-subsystem");
+    u32 dcp_gate = PM_DISP0_CPU;
+    prop_set("/arm-io/dcp", "clock-gates", &dcp_gate, sizeof(dcp_gate));
+    prop_str("/arm-io/dart-disp0", "compatible", "dart,t8110");
+    reg_add("/arm-io/dart-disp0", M4_DART_DISP, 0xc000);
     if (no_panel)
         prop_u32("/arm-io/disp0", "external", 1);
 
@@ -169,6 +226,8 @@ static void world_t8132(bool no_panel, const char *uuid)
         prop_str(p, "device_type", "dcp");
         prop_str(p, "compatible", "iop,ascwrap-v6");
         reg_add(p, ext_coproc[i], 0x88000);
+        u32 gate = pm_sys(i) + 2; /* the processor's clock-gate: DISPEXTn_CPU */
+        prop_set(p, "clock-gates", &gate, sizeof(gate));
         prop_u32(p, "iommu-parent", aph_mapper_ext(i));
         adt_path_of(p, sizeof(p), "/arm-io/dcpext%d/iop-dcpext%d-nub", i);
         prop_str(p, "compatible", "iop-nub,rtbuddy-v2");
@@ -528,6 +587,13 @@ static const struct t8132_scenario t8132_scenarios[] = {
     {"j713-dma-range-mismatch", "J713: apple,dma-range is not the ADT vm-base/vm-size-23"},
     {"j713-window-too-small", "J713: dcpext0's DART window is smaller than a segment"},
     {"j713-no-mapper", "J713: the ADT has no mapper for the processor"},
+    {"j713-ext-unpowered", "J713: DISPEXT1_FE is off"},
+    {"j713-cpu-not-requested", "J713: DISPEXT0_CPU is neither on nor requested"},
+    {"j713-no-clock-gates", "J713: dcpext1 has no ADT clock-gates"},
+    {"j713-dart-unlocked", "J713: dcpext0's firmware DART is not locked"},
+    {"j713-stream-no-root", "J713: dcpext1's stream 23 has no valid root"},
+    {"j713-stream-bypass", "J713: dcpext0's stream 23 bypasses the DART"},
+    {"j713-dart-read-faults", "J713: reading dcpext1's DART faults"},
     {"j713-no-pipe", "J713: no ADT pipe on the piodma stream"},
     {"j713-two-pipes", "J713: two ADT pipes on the piodma stream"},
     {"j713-no-adt-node", "J713: no ADT processor at the DT address"},
@@ -539,6 +605,8 @@ static const struct t8132_scenario t8132_scenarios[] = {
     {"j773g-headless", "J773g 27.2, no panel: dcpext0 and the display subsystem, same code"},
     {"j773g-both", "J773g with both placeholders: both processors"},
     {"j773g-enabled", "J773g: an enabled processor is refused with no panel"},
+    {"j773g-disp-dart-unlocked", "J773g: disp0's DART is not locked: nothing handed over"},
+    {"j773g-disp-unpowered", "J773g: the internal DCP is not powered: nothing handed over"},
     {"later-soc", "a later board/SoC with the same block, fallback compatible"},
 };
 
@@ -616,6 +684,24 @@ int main(int argc, char **argv)
     }
     if (is(s, "j713-no-mapper"))
         node_drop("/arm-io/dart-dcpext1/mapper-dcpext1");
+    if (is(s, "j713-ext-unpowered"))
+        poke32(ps_reg(pm_sys(1) + 1), 0x0f); /* target on, actual off */
+    if (is(s, "j713-cpu-not-requested"))
+        poke32(ps_reg(pm_sys(0) + 2), 0x0);
+    if (is(s, "j713-no-clock-gates"))
+        prop_drop("/arm-io/dcpext1", "clock-gates");
+    if (is(s, "j713-dart-unlocked"))
+        poke32(ext_dart[0] + 0x200, 0x1e0);
+    if (is(s, "j713-stream-no-root"))
+        poke32(ext_dart[1] + 0x1400 + 4 * 23, 0x40000);
+    if (is(s, "j713-stream-bypass"))
+        poke32(ext_dart[0] + 0x1000 + 4 * 23, 0x3);
+    if (is(s, "j713-dart-read-faults"))
+        regions[2].base = 0x7f0000000ULL; /* dcpext1's DART: nothing answers at its address */
+    if (is(s, "j773g-disp-dart-unlocked"))
+        poke32(M4_DART_DISP + 0x200, 0x1e0);
+    if (is(s, "j773g-disp-unpowered"))
+        poke32(ps_reg(PM_DISP0_CPU), 0x0);
     if (is(s, "j713-pipe-no-clocks"))
         prop_drop("/arm-io/dispext1", "clock-ids");
     if (is(s, "j713-no-pipe"))
@@ -655,7 +741,7 @@ int main(int argc, char **argv)
               "the second call changes nothing");
     }
 
-    check(!mmio_reads && !mmio_writes, "no MMIO (%d reads, %d writes)", mmio_reads, mmio_writes);
+    check(!mmio_writes, "no register written (%d reads, %d writes)", mmio_reads, mmio_writes);
     check(fdt_check_header(dt) == 0, "the device tree is valid");
     check(ret == !unknown, "returns %d (%s)", ret, unknown ? "not ours" : "ours");
 
@@ -676,14 +762,17 @@ int main(int argc, char **argv)
               "the internal __TEXT keeps the dcp's mapping");
     } else if (is(s, "j713-one") || is(s, "j713-refused-uuid") || is(s, "j713-dart-reg-mismatch") ||
                is(s, "j713-no-mapper") || is(s, "j713-no-pipe") || is(s, "j713-no-adt-node") ||
-               is(s, "j713-text-not-shared") || is(s, "j713-pipe-no-clocks")) {
+               is(s, "j713-text-not-shared") || is(s, "j713-pipe-no-clocks") ||
+               is(s, "j713-ext-unpowered") || is(s, "j713-no-clock-gates") ||
+               is(s, "j713-stream-no-root") || is(s, "j713-dart-read-faults")) {
         check_ext(in, dt, 0, false);
         check(ext_untouched(in, dt, 1), "dcpext1 is left as it was");
         check_internal_untouched(in, dt);
         check_display(in, dt, false);
     } else if (is(s, "j713-sid-mismatch") || is(s, "j713-dma-range-mismatch") ||
-               is(s, "j713-window-too-small") || is(s, "j713-bad-layout") ||
-               is(s, "j713-has-clocks") || is(s, "j713-two-pipes")) {
+               is(s, "j713-window-too-small") || is(s, "j713-cpu-not-requested") ||
+               is(s, "j713-dart-unlocked") || is(s, "j713-stream-bypass") ||
+               is(s, "j713-bad-layout") || is(s, "j713-has-clocks") || is(s, "j713-two-pipes")) {
         check(ext_untouched(in, dt, 0), "dcpext0 is left as it was");
         check_ext(in, dt, 1, false);
         check_internal_untouched(in, dt);
@@ -708,7 +797,8 @@ int main(int argc, char **argv)
         check_ext(in, dt, 0, j773g);
         check_ext(in, dt, 1, j773g);
         check_display(in, dt, j773g);
-    } else if (is(s, "j773g-enabled")) {
+    } else if (is(s, "j773g-enabled") || is(s, "j773g-disp-dart-unlocked") ||
+               is(s, "j773g-disp-unpowered")) {
         check(ext_untouched(in, dt, 0) && ext_untouched(in, dt, 1),
               "enabled processors are refused with no panel");
         check_display(in, dt, false);

@@ -43,6 +43,13 @@ REASONS = {
     "j713-dart-reg-mismatch": [H0, "dcpext1: its DART is not the ADT's apple,t8110-dart at 0x48a440000"],
     "j713-dma-range-mismatch": [H1, "dcpext0: DART apple,dma-range is not the ADT window <0x10000000000 0x800000000>"],
     "j713-window-too-small": [H1, "dcpext0: segment 0 0x10280000000+0x10000 at 0x10040000000 is kernel RAM or outside the DVA window"],
+    "j713-ext-unpowered": [H0, "dcpext1: DISPEXT1_FE is not on (0xf)"],
+    "j713-cpu-not-requested": [H1, "dcpext0: DISPEXT0_CPU is not requested (0x0)"],
+    "j713-no-clock-gates": [H0, "dcpext1: no ADT clock-gates to check its power by"],
+    "j713-dart-unlocked": [H1, "dcpext0: DART 0x286340000 is not locked (PROTECT 0x1e0)"],
+    "j713-stream-no-root": [H0, "dcpext1: DART 0x48a340000 stream 23 is not translating through a root (TCR 0x9, TTBR 0x40000)"],
+    "j713-stream-bypass": [H1, "dcpext0: DART 0x286340000 stream 23 is not translating through a root (TCR 0x3, TTBR 0x40001)"],
+    "j713-dart-read-faults": [H0, "dcpext1: reading DART 0x48a340000 faulted"],
     "j713-no-mapper": [H0, "dcpext1: the ADT does not describe its DART stream"],
     "j713-no-pipe": [H0, "dcpext1: 0 ADT display pipes use its piodma stream 16 at 0x48a300000"],
     "j713-two-pipes": [H1, "dcpext0: 2 ADT display pipes use its piodma stream 16 at 0x286300000"],
@@ -56,6 +63,10 @@ REASONS = {
     "j773g-headless": [H0, "dcpext1: no text, data and heap memory-region placeholders",
                        "no panel: display subsystem and its DART enabled for the external processors"],
     "j773g-both": [H0, H1, "no panel: display subsystem and its DART enabled"],
+    "j773g-disp-dart-unlocked": ["the display subsystem: DART 0x30a300000 is not locked (PROTECT 0x1e0)",
+                                 "no panel, and the display subsystem's DART is not as iBoot leaves it"],
+    "j773g-disp-unpowered": ["dcp: DISP0_CPU is not requested (0x0)",
+                             "no panel, and the display subsystem's DART is not as iBoot leaves it"],
     "j773g-enabled": ["dcpext0 is not status \"disabled\"", "dcpext1 is not status \"disabled\""],
     "later-soc": [H0, H1],
 }
@@ -63,7 +74,9 @@ REASONS = {
 ONE_REFUSAL = {"j713-one", "j713-refused-uuid", "j713-sid-mismatch", "j713-dart-reg-mismatch",
                "j713-dma-range-mismatch", "j713-window-too-small", "j713-no-mapper", "j713-no-pipe", "j713-two-pipes",
                "j713-no-adt-node", "j713-text-not-shared", "j713-bad-layout", "j713-has-clocks",
-               "j713-pipe-no-clocks"}
+               "j713-pipe-no-clocks", "j713-ext-unpowered", "j713-cpu-not-requested",
+               "j713-no-clock-gates", "j713-dart-unlocked", "j713-stream-no-root",
+               "j713-stream-bypass", "j713-dart-read-faults"}
 
 
 def test_every_scenario_has_its_reason():

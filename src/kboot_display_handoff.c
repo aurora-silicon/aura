@@ -97,7 +97,8 @@
  * other keeps kboot.c's firmware-ready path). Each processor is its own transaction and gets its
  * firmware memory, apple,firmware-uuid/-version/-compat and its pipe's firmware clocks. Only beside
  * a complete internal handoff (the processors keep their status) or on a board with no panel (the
- * processors must be disabled, and the display subsystem is enabled for them). No MMIO.
+ * processors must be disabled, and the display subsystem is enabled for them). Each processor
+ * must be powered and its firmware DART stream locked, read only (guarded) through the ADT.
  *
  * T6050 (M5 Pro/Max): the __OS_LOG buffers of every running display coprocessor are reserved on
  * every boot. When the device tree describes the internal display (aliases dcp and disp0, all its
@@ -3673,6 +3674,115 @@ static int dcpext_pipe(void *dt, struct dcpext *x)
 }
 
 /*
+ * /arm-io/<name> is powered as iBoot leaves a processor it started: each PMGR device its ADT
+ * clock-gates name is requested (the hardware gates an idle processor's CPU domain by itself), and
+ * each parent above it, up to the first virtual one, is on (DISPEXTn_CPU, then _FE and _SYS on the
+ * T8132). Through the ADT's PMGR table; the power state registers are only read, guarded.
+ */
+static int dcpext_powered(const char *name)
+{
+    struct {
+        u64 addr;
+        const char *name;
+        bool gate;
+    } ps[DCP6_PS_MAX];
+    char path[DCP6_NAME_LEN + 16];
+    u32 val[DCP6_PS_MAX];
+    int n = 0;
+
+    snprintf(path, sizeof(path), "/arm-io/%s", name);
+    for (u32 i = 0; i < DCP6_GATES_MAX; i++) {
+        struct pmgr_gate g;
+        if (pmgr_adt_gate(path, "clock-gates", i, &g) < 0)
+            break;
+        for (int depth = 0;; depth++) {
+            if (!g.found || (!depth && g.virt) || depth >= DCP6_GATE_DEPTH || n >= DCP6_PS_MAX)
+                bail("%s: clock-gates[%u] does not resolve to PMGR power states\n", name, i);
+            if (g.virt)
+                break;
+            if (!g.psreg)
+                bail("%s: %.16s has no power state register\n", name, g.name);
+            ps[n].addr = g.psreg;
+            ps[n].name = g.name;
+            ps[n++].gate = !depth;
+            if (!g.parent[0])
+                break;
+            if (pmgr_device_gate(g.die, g.parent[0], &g) < 0)
+                bail("%s: a parent of clock-gates[%u] is not in the PMGR table\n", name, i);
+        }
+    }
+    if (!n)
+        bail("%s: no ADT clock-gates to check its power by\n", name);
+
+    int guard = dcp6_guard_begin();
+    for (int i = 0; i < n; i++)
+        val[i] = read32(ps[i].addr);
+    if (dcp6_guard_end(guard))
+        bail("%s: reading its power state faulted\n", name);
+    for (int i = 0; i < n; i++)
+        if (ps[i].gate ? !dcp6_ps_on(val[i]) : FIELD_GET(PMGR_PS_ACTUAL, val[i]) != PMGR_PS_ACTIVE)
+            bail("%s: %.16s is not %s (0x%x)\n", name, ps[i].name, ps[i].gate ? "requested" : "on",
+                 val[i]);
+    return 0;
+}
+
+/*
+ * A DART stream as iBoot leaves a running device's: the DART's TTBR/TCR protection set (the
+ * kernel then keeps its tables instead of resetting it), and the stream translating, not
+ * bypassed, through a valid root. Only read, guarded, and only once the DART's power is checked.
+ */
+static int dcpext_stream_locked(u64 dart, u32 sid, const char *what)
+{
+    if (sid >= DART_STREAMS_MAX)
+        bail("%s: stream %u is not a DART stream\n", what, sid);
+    int guard = dcp6_guard_begin();
+    u32 prot = read32(dart + DART_T8110_PROTECT);
+    u32 tcr = read32(dart + DART_T8110_TCR(sid));
+    u32 ttbr = read32(dart + DART_T8110_TTBR(sid));
+    if (dcp6_guard_end(guard))
+        bail("%s: reading DART 0x%lx faulted\n", what, dart);
+    if (!(prot & DART_T8110_PROTECT_TTBR_TCR))
+        bail("%s: DART 0x%lx is not locked (PROTECT 0x%x)\n", what, dart, prot);
+    if (!(tcr & DART_T8110_TCR_TRANSLATE) || (tcr & DART_T8110_TCR_BYPASS_DART) ||
+        !(ttbr & DART_T8110_TTBR_VALID))
+        bail("%s: DART 0x%lx stream %u is not translating through a root (TCR 0x%x, TTBR 0x%x)\n",
+             what, dart, sid, tcr, ttbr);
+    return 0;
+}
+
+/*
+ * With no panel, the display subsystem (alias disp0) is enabled with its DART, which the internal
+ * DCP iBoot started and parked still uses: only if that DART is the ADT's dart,t8110 at its
+ * address, the internal DCP is powered and the DART's scanout stream is locked, so that the kernel
+ * keeps its tables and the boot console. Only read, guarded.
+ */
+static int dcpext_display_locked(void *dt)
+{
+    const char *path = fdt_get_alias(dt, "disp0");
+    int disp = path ? fdt_path_offset(dt, path) : -1, len, io = adt_path_offset(adt, "/arm-io");
+    int child = io, n = 0;
+    const fdt32_t *iommus = disp < 0 ? NULL : fdt_getprop(dt, disp, "iommus", &len);
+    int dart = !iommus || len != 2 * (int)sizeof(fdt32_t)
+                   ? -1
+                   : fdt_node_offset_by_phandle(dt, fdt32_ld(&iommus[0]));
+    u64 base, addr;
+
+    if (dart < 0 || dcpext_dt_reg(dt, dart, &base) || io < 0)
+        bail("the display subsystem has no DART\n");
+    ADT_FOREACH_CHILD(adt, child)
+    {
+        if (adt_is_compatible(adt, child, "dart,t8110") && !dcpext_adt_reg(child, &addr) &&
+            addr == base)
+            n++;
+    }
+    if (n != 1)
+        bail("%d ADT DARTs at the display subsystem's 0x%lx\n", n, base);
+    if (dcpext_powered("dcp"))
+        return -1;
+    return dcpext_stream_locked(base, fdt32_ld(&iommus[1]), "the display subsystem");
+}
+
+/*
  * Hand one external processor over, into `dt` (a scratch copy): everything is checked against the
  * ADT before the first edit. Returns 0 if published, nonzero (with its reason logged) if not.
  */
@@ -3681,7 +3791,8 @@ static int dcpext_fill(void *dt, struct dcpext *x)
     struct dcp6_seg segs[DCPEXT6_SEGS];
     u32 ph[3], len = 0;
 
-    if (dcpext_match(dt, x))
+    if (dcpext_match(dt, x) || dcpext_powered(x->name) ||
+        dcpext_stream_locked(x->dart, x->sid, x->name))
         return -1;
     int node = fdt_path_offset(dt, x->dt_path);
     if (dcpext_placeholders(dt, node, x->name, ph))
@@ -3796,7 +3907,8 @@ static void dcpext_reserve_oslogs(void *dt)
 
 /*
  * kboot.c's M4 handoff, after its internal DCP handoff: hand the external display processors over
- * from this boot's ADT and device tree, with no board, chip or OS release test and no MMIO.
+ * from this boot's ADT and device tree, with no board, chip or OS release test. The only register
+ * accesses are guarded reads of the PMGR power states and DART lock state the ADT points at.
  *
  * Only for an image whose firmware the OS gives its clocks (`fw_clocks`: kboot.c's firmware-27
  * rule, the one it publishes dcp's clocks by; beside the internal handoff, dcp must carry them);
@@ -3875,6 +3987,12 @@ int dt_set_dcpext_handoff(void *dt, enum dcp_internal internal, bool fw_clocks)
     if (r.unk != SEG_FLAGS_TEXT || !r.size || firmware_os_components() == V_UNKNOWN) {
         dlog("no internal __TEXT or OS firmware release to publish: external processors not "
              "handed over\n");
+        return 1;
+    }
+
+    if (dcpext_run.headless && dcpext_display_locked(dt)) {
+        dlog("no panel, and the display subsystem's DART is not as iBoot leaves it: external "
+             "processors not handed over\n");
         return 1;
     }
 
