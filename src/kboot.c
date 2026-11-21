@@ -7946,23 +7946,27 @@ static int dt_set_dcp_fw27_clocks(const char *alias, const char *adt_engine);
 
 /*
  * Publish the inherited DCP firmware mapping without starting a display driver: on the J713
- * on any firmware as before, and on any other M4 Mac with a panel on 26.6.2.
+ * on any firmware as before, and on any other M4 Mac with a panel on 26.6.2. *internal says
+ * what was done, for the external display processors (dt_set_dcpext_handoff()).
  */
-static int dt_set_m4_dcp_handoff(void)
+static int dt_set_m4_dcp_handoff(enum dcp_internal *internal)
 {
+    *internal = DCP_INTERNAL_NONE;
     int dcp_node = fdt_path_offset(dt, "dcp");
     if (dcp_node < 0)
         return 0; /* Older DT with simple-framebuffer only. */
+    /* The Mac mini's disp0 is external: its DCP drives a port, not a panel. */
+    int disp0 = adt_path_offset(adt, "/arm-io/disp0");
+    if (disp0 >= 0 && adt_getprop(adt, disp0, "external", NULL)) {
+        *internal = DCP_INTERNAL_NO_PANEL;
+        bail("FDT: no internal panel, no native DCP handoff\n");
+    }
     bool j713 = !fdt_node_check_compatible(dt, 0, "apple,j713");
     if (chip_id != T8132 || (!j713 && os_firmware.version != V26_6_2) ||
         fdt_node_check_compatible(dt, dcp_node, "apple,t8132-dcp"))
         bail("FDT: unsupported native DCP handoff target\n");
-    /* The Mac mini's disp0 is external: its DCP drives a port, not a panel. */
-    if (!j713) {
-        int disp0 = adt_path_offset(adt, "/arm-io/disp0");
-        if (disp0 < 0 || adt_getprop(adt, disp0, "external", NULL))
-            bail("FDT: no internal panel, no native DCP handoff\n");
-    }
+    if (!j713 && disp0 < 0)
+        bail("FDT: no internal panel, no native DCP handoff\n");
 
     int nub = adt_path_offset(adt, "/arm-io/dcp/iop-dcp-nub");
     if (nub < 0)
@@ -8031,6 +8035,12 @@ static int dt_set_m4_dcp_handoff(void)
      */
     if (maps && dt_set_dcp_fw27_clocks("dcp", "/arm-io/disp0"))
         printf("FDT: M4 DCP firmware clocks not published\n");
+
+    /* Complete: the maps, and the clocks firmware 27 needs (the kernel admits on them). */
+    dcp_node = fdt_path_offset(dt, "dcp");
+    if (maps && (os_firmware.version < V27_0 ||
+                 (dcp_node >= 0 && fdt_getprop(dt, dcp_node, "apple,clock-ids", NULL))))
+        *internal = DCP_INTERNAL_COMPLETE;
 
     printf("FDT: M4 DCP firmware mappings published; display device status unchanged\n");
     return 0;
@@ -8156,7 +8166,8 @@ static int dt_set_display(void)
         disp0_piodma_alias = compat_piodma_alias;
 
     if (chip_id == T8132) {
-        if (dt_set_m4_dcp_handoff())
+        enum dcp_internal internal;
+        if (dt_set_m4_dcp_handoff(&internal))
             printf("FDT: M4 DCP handoff refused; keeping the boot framebuffer\n");
         else
             dt_reserve_j713_dcpext();

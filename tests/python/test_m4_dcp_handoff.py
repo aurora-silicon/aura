@@ -36,6 +36,9 @@ def test_m4_dcp_handoff_follows_the_firmware_and_the_panel(tmp_path):
         maps + function(kboot, "j713_display_page") + function(kboot, "dt_set_j713_display_maps") +
         clocks + function(kboot, "dt_set_m4_dcp_handoff"))
     production = function(firmware, "firmware_set_fdt", "int ") + production
+    header = (ROOT / "src/kboot.h").read_text()
+    start = header.index("enum dcp_internal {")
+    enum = header[start:header.index("\n};", start) + 3] + "\n"
     assert not re.search(r"\bdt_set_j713_dcp_handoff\b", kboot)
 
     source = r'''
@@ -79,7 +82,7 @@ static const struct fw_version_info fw_versions[] = {
     [V27_2] = {V27_2, "27.2", {27, 2, 0}, 3, ""},
 };
 static struct fw_version_info os_firmware;
-''' + layout + r'''
+''' + enum + layout + r'''
 static void *dt, *adt;
 static u32 chip_id = T8132;
 
@@ -324,11 +327,14 @@ static void published(bool piodma)
         assert(hz && len == 4 && fdt32_ld(hz) == rate[i]);
     }
 }
+static enum dcp_internal internal;
 static void handed_over(const struct board *board, enum fw_version fw, bool piodma)
 {
     world(board, fw);
-    assert(!dt_set_m4_dcp_handoff());
+    assert(!dt_set_m4_dcp_handoff(&internal));
     published(piodma);
+    /* Complete only with the maps (and on firmware 27 the clocks the kernel admits on). */
+    assert(internal == (piodma ? DCP_INTERNAL_COMPLETE : DCP_INTERNAL_NONE));
     char name[64];
     snprintf(name, sizeof(name), "%s-%s", board->name, fw_versions[fw].string);
     save(name);
@@ -338,8 +344,9 @@ static void refused(void)
 {
     static unsigned char before[sizeof(blob)];
     memcpy(before, blob, sizeof(blob));
-    assert(dt_set_m4_dcp_handoff() == -1);
+    assert(dt_set_m4_dcp_handoff(&internal) == -1);
     assert(!memcmp(before, blob, sizeof(blob)) && !walks);
+    assert(internal == (b.external > 0 ? DCP_INTERNAL_NO_PANEL : DCP_INTERNAL_NONE));
 }
 int main(int argc, char **argv)
 {
@@ -364,7 +371,7 @@ int main(int argc, char **argv)
      */
     world(&stub, V27_2);
     dart_skew = SZ_16K;
-    assert(!dt_set_m4_dcp_handoff());
+    assert(!dt_set_m4_dcp_handoff(&internal) && internal == DCP_INTERNAL_NONE);
     assert(walks == 1 && status_is("/soc/display-subsystem", "disabled") &&
            status_is("/soc/dcp@30ae00000/piodma", "disabled") &&
            status_is("/soc/iommu@30a300000", "disabled"));
@@ -416,7 +423,10 @@ int main(int argc, char **argv)
     assert(!fdt_delprop(dt, fdt_path_offset(dt, "/aliases"), "dcp"));
     static unsigned char before[sizeof(blob)];
     memcpy(before, blob, sizeof(blob));
-    assert(!dt_set_m4_dcp_handoff() && !memcmp(before, blob, sizeof(blob)));
+    assert(!dt_set_m4_dcp_handoff(&internal) && !memcmp(before, blob, sizeof(blob)));
+    assert(internal == DCP_INTERNAL_NONE);
+    /* The Mac mini on 27.2 too: no panel, whatever the firmware (the external processors'). */
+    world(&j773g, V27_2); refused();
     return 0;
 }
 '''
