@@ -1129,6 +1129,12 @@ u32 pcie_adt_perst_to_config_ms(const char *bridge)
 
     if (node < 0 || ADT_GETPROP(adt, node, "perst-to-config", &ms) < 0)
         ms = 0;
+    /* A function answers config space within PCIE_RESET_READY_MS of reset; a longer ADT value is bad data. */
+    if (ms > PCIE_RESET_READY_MS) {
+        printf("pcie: %s perst-to-config %u ms is over the %u ms reset-ready bound; using %u ms\n",
+               bridge, ms, PCIE_RESET_READY_MS, PCIE_RESET_READY_MS);
+        ms = PCIE_RESET_READY_MS;
+    }
     return max(ms, (u32)PCIE_RESET_TO_CONFIG_MS);
 }
 
