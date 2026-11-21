@@ -968,39 +968,6 @@ static bool rtkit_switch_power_state(rtkit_dev_t *rtk, enum rtkit_power_state ap
     return true;
 }
 
-/*
- * Stop the IOP sending syslog, ioreport and oslog traffic to the AP while the
- * IOP itself keeps running, for a next stage that uses the coprocessor without
- * servicing its mailbox.
- */
-bool rtkit_quiesce_ap(rtkit_dev_t *rtk)
-{
-    struct rtkit_message msg;
-    int ret;
-
-    if (rtk->crashed)
-        return false;
-
-    while ((ret = rtkit_recv(rtk, &msg)) > 0)
-        rtkit_printf("dropping message to non-system endpoint 0x%02x before AP quiesce: %lx\n",
-                     msg.ep, msg.msg);
-    if (ret < 0 || !rtkit_quiesce_ap_power(rtk, RTKIT_POWER_QUIESCED))
-        return false;
-
-    /* Acknowledge anything the IOP sent along with the transition. */
-    u64 timeout = timeout_calculate(50000);
-    while (!timeout_expired(timeout)) {
-        ret = rtkit_recv(rtk, &msg);
-        if (ret < 0)
-            return false;
-        if (ret > 0)
-            rtkit_printf("dropping message to non-system endpoint 0x%02x after AP quiesce: %lx\n",
-                         msg.ep, msg.msg);
-    }
-
-    return true;
-}
-
 bool rtkit_quiesce(rtkit_dev_t *rtk)
 {
     return rtkit_switch_power_state(rtk, RTKIT_POWER_QUIESCED, RTKIT_POWER_QUIESCED);

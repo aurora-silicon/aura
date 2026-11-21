@@ -67,7 +67,6 @@ bool secboot_host_proxy_allowed(void);
 #endif
 
 /* "dev" or "secure" (SECBOOT_FLAVOUR). */
-const char *secboot_flavour(void);
 
 /* Build /chosen/aurora,boot-security in the FDT handed to the next stage. */
 void secboot_export_fdt(void *dt);
