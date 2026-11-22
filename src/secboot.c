@@ -55,8 +55,11 @@ static const char stage_name[] = "aura";
 #define KEY_FLAG_ENFORCE 1u /* key block flags: the installer chose enforce for this Stage 1 */
 
 u32 aura_secboot_verify(const u8 *body, size_t body_len, const u8 *covered, size_t covered_len,
-                        const u8 *pubkey, u32 min_security_version, u8 *digest,
+                        const u8 *pubkey, u32 min_security_version, u32 form, u8 *digest,
                         u32 *security_version, u8 *key_id);
+/* What a record signs, in its signed flags word (rust/src/secboot.rs FORM_*) */
+#define SIG_FORM_PAYLOADS 1
+#define SIG_FORM_IMAGE    2
 void aura_sha256(const void *data, size_t size, u8 digest[32]);
 
 #define SIG_TAG       "aura_sig"
@@ -243,14 +246,14 @@ static const u8 *trusted_key(const u8 *record, u32 *min_secver)
 }
 
 static enum secboot_verdict check_record(const u8 *record, size_t record_size, const u8 *covered,
-                                         size_t covered_len, struct measurement *m)
+                                         size_t covered_len, u32 form, struct measurement *m)
 {
     if (record_size < SIG_TAG_LEN + 4 + SIG_BODY)
         return SECBOOT_BAD_FORMAT;
     u32 min_secver;
     const u8 *key = trusted_key(record, &min_secver);
     u32 v = aura_secboot_verify(record + SIG_TAG_LEN + 4, record_size - SIG_TAG_LEN - 4, covered,
-                                covered_len, key, min_secver, m->sha256, &m->security_version,
+                                covered_len, key, min_secver, form, m->sha256, &m->security_version,
                                 m->key_id);
     m->signed_record = true;
     if (v > SECBOOT_ROLLBACK)
@@ -312,7 +315,7 @@ int secboot_check_payloads(u8 *p, u8 **next)
         memcpy(&covered_len, p + SIG_TAG_LEN + 4 + 24, 8);
     /* Bounded by what an ESP Stage 2 can be; the hash runs over this many bytes from *next. */
     if (covered_len && covered_len <= 0x40000000UL)
-        m->verdict = check_record(p, record_size, *next, covered_len, m);
+        m->verdict = check_record(p, record_size, *next, covered_len, SIG_FORM_PAYLOADS, m);
     if (m->verdict == SECBOOT_VERIFIED || m->verdict == SECBOOT_TEST_KEY)
         covered_end = *next + covered_len;
     return settle(m, "payloads");
@@ -365,10 +368,28 @@ u8 *secboot_payload_next(u8 *p)
 #endif
 }
 
+/* An earlier stage enforced: it would not have started this one otherwise. */
+static bool chain_enforces;
+
+void secboot_note_chosen(const char *line)
+{
+    /* chosen.aurora,measure-N=stage;policy;... */
+    static const char prefix[] = "chosen.aurora,measure-";
+    if (strncmp(line, prefix, sizeof(prefix) - 1))
+        return;
+    const char *f = strchr(line, '=');
+    f = f ? strchr(f, ';') : NULL;
+    if (f && !strncmp(f + 1, "enforce;", 8)) {
+        if (!chain_enforces)
+            printf("secboot: an earlier stage enforced; so does this one\n");
+        chain_enforces = true;
+    }
+}
+
 #ifndef SECBOOT_SECURE_FLAVOUR
 bool secboot_host_proxy_allowed(void)
 {
-    return !secboot_enforcing();
+    return !secboot_enforcing() && !chain_enforces;
 }
 
 bool secboot_unrequested_proxy_allowed(void)
@@ -384,7 +405,7 @@ bool secboot_unrequested_proxy_allowed(void)
 bool secboot_allow_unverified(const char *what)
 {
     all_verified = false;
-    if (secboot_enforcing()) {
+    if (secboot_enforcing() || chain_enforces) {
         printf("secboot: %s cannot be verified; refusing it under policy enforce\n", what);
         return false;
     }
@@ -413,7 +434,7 @@ int secboot_check_chainload(void *image, size_t *size, char **vars, size_t *var_
         if (off < *size - 16 && !memcmp(img + off, SIG_TAG, SIG_TAG_LEN)) {
             covered = off;
 #ifdef SECBOOT_CHECKS
-            m->verdict = check_record(img + off, *size - 16 - off, img, covered, m);
+            m->verdict = check_record(img + off, *size - 16 - off, img, covered, SIG_FORM_IMAGE, m);
 #else
             m->verdict = SECBOOT_MEASURED;
 #endif

@@ -40,6 +40,13 @@ u8 *secboot_payload_next(u8 *p);
 bool secboot_allow_unverified(const char *what);
 
 /*
+ * A chosen. line from the payloads. An earlier stage that enforced passes that on in its
+ * chosen.aurora,measure-N line; this stage then runs no ESP boot= files and gives no USB host
+ * the proxy, whatever it was built with. A forged line can only make a stage stricter.
+ */
+void secboot_note_chosen(const char *line);
+
+/*
  * Check the trailer signature of an image this stage chainloads. Returns 0 to go on, with *size
  * cut to the covered bytes when a trailer is present. Adds the measurement var for the next stage.
  */

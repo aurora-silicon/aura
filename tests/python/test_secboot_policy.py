@@ -71,10 +71,12 @@ void aura_sha256(const void *data, size_t size, u8 digest[32]) { memset(digest, 
 /* The Ed25519 check: answers what the test sets. */
 static u32 verify_verdict = 1; /* bad-format */
 static u8 verify_key_id[8];
+static u32 verify_form;
 u32 aura_secboot_verify(const u8 *body, size_t body_len, const u8 *covered, size_t covered_len,
-                        const u8 *pubkey, u32 min_security_version, u8 *digest,
+                        const u8 *pubkey, u32 min_security_version, u32 form, u8 *digest,
                         u32 *security_version, u8 *key_id)
 {
+    verify_form = form;
     memset(digest, 0x5a, 32);
     *security_version = 1;
     memcpy(key_id, verify_key_id, 8);
@@ -220,3 +222,67 @@ def test_enforcing_and_secure_builds_refuse_the_test_key(tmp_path):
     # Builds that do not enforce keep the default.
     assert make_dry("SECBOOT=audit").returncode == 0
     assert make_dry().returncode == 0
+
+
+FORMS = CHAINLOAD + r"""
+int main(void)
+{
+    static u8 payloads[0x1000 + 64];
+    memcpy(payloads, "aura_sig", 8);
+    u32 size = 0x1000;
+    memcpy(payloads + 8, &size, 4);
+    u64 covered = 64;
+    memcpy(payloads + 12 + 24, &covered, 8);
+    u8 *next;
+    verify_verdict = 0;
+    secboot_check_payloads(payloads, &next);
+    printf("payloads form %u\n", verify_form);
+    chainload();
+    printf("image form %u\n", verify_form);
+    return 0;
+}
+"""
+
+
+def test_each_check_asks_for_its_own_form(tmp_path):
+    out = run(build(tmp_path, "forms", ["CHAINLOADING", "SECBOOT_AUDIT"], FORMS))
+    assert "payloads form 1" in out and "image form 2" in out, out
+
+
+CHAIN = r"""
+/* Older trees ignore the line. */
+void secboot_note_chosen(const char *line) __attribute__((weak));
+int main(int argc, char **argv)
+{
+    char line[200];
+    snprintf(line, sizeof(line), "chosen.aurora,measure-0=stage1;%s;next-stage;verified;"
+             "6ef2bae2eee577cb;1;%064d", argv[1], 0);
+    if (secboot_note_chosen) {
+        secboot_note_chosen("chosen.aurora,stage1-flavour=dev");
+        secboot_note_chosen(line);
+    }
+    printf("boot= %d proxy %d\n", secboot_allow_unverified("an ESP boot= kernel"),
+           secboot_host_proxy_allowed());
+    return 0;
+}
+"""
+
+
+def test_a_stage_started_by_an_enforcing_stage_enforces_too(tmp_path):
+    # Stage 2 as the distributions build it (no SECBOOT), and an audit one.
+    for defines in (["CHAINLOADING", "ESP_STAGE2"], ["CHAINLOADING", "ESP_STAGE2", "SECBOOT_AUDIT"]):
+        binary = build(tmp_path, "-".join(defines), defines, CHAIN)
+        out = subprocess.run([str(binary), "enforce"], capture_output=True, text=True).stdout
+        assert "boot= 0 proxy 0" in out, (defines, out)
+        for policy in ("audit", "off"):
+            out = subprocess.run([str(binary), policy], capture_output=True, text=True).stdout
+            assert "boot= 1 proxy 1" in out, (defines, policy, out)
+
+
+def test_the_payload_scan_hands_chosen_lines_to_secboot():
+    payload = (ROOT / "src/payload.c").read_text()
+    branch = payload[payload.index('if (IS_VAR("chosen.")) {'):]
+    assert branch.index("secboot_note_chosen((char *)*p);") < branch.index("} else if")
+    # boot= and the proxy are decided after the scan that reads the lines.
+    run = payload[payload.index("int payload_run(void)"):]
+    assert run.index("payload_scanned = true;") < run.index("boot_storage_load(")

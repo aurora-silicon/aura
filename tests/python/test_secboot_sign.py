@@ -117,3 +117,59 @@ def test_a_built_stage2_signs(tmp_path):
     src = tmp_path / "boot.bin"
     src.write_bytes(composed(built.read_bytes()))
     assert run("sign-image", "--key", KEY, src, tmp_path / "out.bin").returncode == 0
+
+
+def test_a_record_verifies_only_as_the_form_it_was_signed_for(tmp_path):
+    import struct
+    head, covered = b"\0" * 0x4000, b"dtbs, u-boot and config lines" * 100
+    src = tmp_path / "stage2.bin"
+    src.write_bytes(head + covered)
+    signed = tmp_path / "p.bin"
+    assert run("sign-payloads", "--key", KEY, "--head-len", "0x4000", src, signed).returncode == 0
+    rec = signed.read_bytes()[0x4000:0x5000]
+    # The payload record and its covered bytes, laid out as a signed image.
+    image = tmp_path / "image.bin"
+    image.write_bytes(covered + rec + struct.pack("<Q", len(covered)) + b"AURSIGT1")
+    r = run("verify", "--pub", PUB, image)
+    assert r.returncode != 0 and "bad-format" in r.stdout, r.stdout
+    # And the other way: an image trailer's record in front of the image as payloads.
+    trailer = tmp_path / "t.bin"
+    assert run("sign-image", "--key", KEY, src, trailer).returncode == 0
+    t = trailer.read_bytes()
+    payloads = tmp_path / "payloads.bin"
+    payloads.write_bytes(head + t[len(head + covered):-16] + head + covered)
+    r = run("verify", "--pub", PUB, "--head-len", "0x4000", payloads)
+    assert r.returncode != 0 and "bad-format" in r.stdout, r.stdout
+
+
+def test_a_record_without_a_form_is_refused(tmp_path):
+    import importlib.util
+    import struct
+    spec = importlib.util.spec_from_file_location("secboot_sign", ROOT / "tools/secboot_sign.py")
+    tool = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(tool)
+    seed = KEY.read_bytes()
+    covered = b"an image" * 64
+    # What older signers wrote: flags 0.
+    header = tool.BODY_MAGIC + struct.pack("<IIIIQ", 1, 1, 0, 0, len(covered)) + tool.key_id(tool.pubkey(seed))
+    sig = tool.sign(seed, tool.DOMAIN + header + tool.hashlib.sha256(covered).digest())
+    rec = (tool.TAG + struct.pack("<I", tool.RECORD_SIZE) + header + sig).ljust(tool.RECORD_SIZE, b"\0")
+    image = tmp_path / "old.bin"
+    image.write_bytes(covered + rec + struct.pack("<Q", len(covered)) + b"AURSIGT1")
+    r = run("verify", "--pub", PUB, image)
+    assert r.returncode != 0 and "bad-format" in r.stdout, r.stdout
+
+
+def test_a_caller_from_before_the_form_still_signs_an_image(tmp_path):
+    """aurora-secboot stage2 sign calls make_record(seed, data, secver) and appends the footer."""
+    import importlib.util
+    import struct
+    spec = importlib.util.spec_from_file_location("secboot_sign", ROOT / "tools/secboot_sign.py")
+    tool = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(tool)
+    data = b"a stage 2" * 100
+    rec, _ = tool.make_record(KEY.read_bytes(), data, 2)
+    out = tmp_path / "s2.bin"
+    out.write_bytes(data + rec + struct.pack("<Q", len(data)) + tool.FOOTER)
+    r = run("verify", "--pub", PUB, out)
+    assert r.returncode == 0 and "image trailer: verified" in r.stdout, r.stdout

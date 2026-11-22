@@ -133,14 +133,22 @@ BODY_MAGIC = b"AURSIG01"
 TAG = b"aura_sig"
 FOOTER = b"AURSIGT1"
 RECORD_SIZE = 0x1000  # keeps whatever follows the record 4K-aligned
+# The signed flags word names the form (rust/src/secboot.rs FORM_*): a record of one form never
+# verifies as the other, and a record without one (flags 0, older signers) as neither.
+FORM_MASK = 0xF
+FORM_PAYLOADS = 1
+FORM_IMAGE = 2
 
 
 def key_id(pub):
     return hashlib.sha256(pub).digest()[:8]
 
 
-def make_record(seed, covered, secver, flags=0):
+def make_record(seed, covered, secver, form=FORM_IMAGE):
+    # form defaults to the image trailer for callers from before the form (aurora-secboot
+    # stage2 sign imports this to sign a Stage 2 image).
     pub = pubkey(seed)
+    flags = form
     header = BODY_MAGIC + struct.pack("<IIIIQ", 1, 1, secver, flags, len(covered)) + key_id(pub)
     digest = hashlib.sha256(covered).digest()
     sig = sign(seed, DOMAIN + header + digest)
@@ -148,12 +156,12 @@ def make_record(seed, covered, secver, flags=0):
     return rec + b"\0" * (RECORD_SIZE - len(rec)), digest
 
 
-def check_record(pub, rec, covered):
+def check_record(pub, rec, covered, form):
     if rec[:8] not in (TAG, b"m1n1_sig") or rec[12:20] != BODY_MAGIC:
         return "bad-format", None, None
     version, alg, secver, flags, covered_len = struct.unpack("<IIIIQ", rec[20:44])
     kid = rec[44:52]
-    if version != 1 or alg != 1 or covered_len != len(covered):
+    if version != 1 or alg != 1 or covered_len != len(covered) or flags & FORM_MASK != form:
         return "bad-format", secver, kid
     digest = hashlib.sha256(covered).digest()
     if pub is not None and kid != key_id(pub):
@@ -251,7 +259,7 @@ def main():
             (size,) = struct.unpack("<I", tail[8:12])
             tail = tail[size:]
         forbid_measure_lines(tail)
-        rec, digest = make_record(read_seed(a.key), tail, a.secver)
+        rec, digest = make_record(read_seed(a.key), tail, a.secver, FORM_PAYLOADS)
         open(a.out, "wb").write(head + rec + tail)
         print(f"payloads 0x{len(tail):x} bytes sha256 {digest.hex()} key {key_id(pubkey(read_seed(a.key))).hex()} secver {a.secver}")
     elif a.cmd == "sign-image":
@@ -259,7 +267,7 @@ def main():
         if data[-8:] == FOOTER:
             sys.exit("already signed")
         forbid_measure_lines(data)
-        rec, digest = make_record(read_seed(a.key), data, a.secver)
+        rec, digest = make_record(read_seed(a.key), data, a.secver, FORM_IMAGE)
         open(a.out, "wb").write(data + rec + struct.pack("<Q", len(data)) + FOOTER)
         print(f"image 0x{len(data):x} bytes sha256 {digest.hex()} key {key_id(pubkey(read_seed(a.key))).hex()} secver {a.secver}")
     elif a.cmd == "fill-keys":
@@ -284,14 +292,14 @@ def main():
         pub = open(a.pub, "rb").read() if a.pub else None
         if data[-8:] == FOOTER:
             (off,) = struct.unpack("<Q", data[-16:-8])
-            verdict, secver, kid = check_record(pub, data[off:-16], data[:off])
+            verdict, secver, kid = check_record(pub, data[off:-16], data[:off], FORM_IMAGE)
             covered = data[:off]
             form = "image trailer"
         elif a.head_len is not None:
             rec = data[a.head_len :]
             (size,) = struct.unpack("<I", rec[8:12])
             covered = rec[size:]
-            verdict, secver, kid = check_record(pub, rec[:size], covered)
+            verdict, secver, kid = check_record(pub, rec[:size], covered, FORM_PAYLOADS)
             form = "payload record"
         else:
             sys.exit("no trailer; pass --head-len for a payload record")

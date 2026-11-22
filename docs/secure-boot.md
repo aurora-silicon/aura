@@ -69,6 +69,13 @@ window after a failed boot, not the DebugUSB window, and not the fallbacks when
 no payload starts or a hand-off fails (it leaves a message on the panel and
 reboots).
 
+A stage started by one that enforced does the same, whatever it was built with:
+the earlier stage's `chosen.aurora,measure-N` line names its policy, and a
+stage that reads `enforce` there runs no ESP `boot=` files and gives no USB
+host the proxy. It does not check its own payloads under that policy (the
+earlier stage's image trailer covered them) and records its own policy as
+built. A forged line can only make a stage stricter.
+
 ## Signature forms
 
 Both are made and checked with `tools/secboot_sign.py`.
@@ -89,7 +96,14 @@ Both are made and checked with `tools/secboot_sign.py`.
 The record body is `AURSIG01`, version, algorithm (1 = Ed25519), security
 version, flags, covered length and an 8-byte key id (SHA-256 of the public
 key), then an Ed25519 signature over `AURA-SIG-V1` (padded to 16 bytes), the
-header, and SHA-256 of the covered bytes. The tool refuses to sign an image
+header, and SHA-256 of the covered bytes. The low four bits of the signed
+flags name the form (1 = payload record, 2 = image trailer), and each check
+asks for its own: a record of one form never verifies as the other. A record
+without a form (flags 0, from a signer older than this rule) is `bad-format`
+for both, since its covered bytes could be taken for either: re-sign such
+images before a stage with this rule checks them. Stages older than the rule
+ignore the flags, so a newly signed Stage 2 still verifies under them. The
+other flag bits are signed and reserved. The tool refuses to sign an image
 that carries `chosen.aurora,measure-` lines, which only a loading stage may
 add. In an aura image it searches only what follows the image (from the load
 header's footprint, where `_payload_start` is), since aura's own code holds

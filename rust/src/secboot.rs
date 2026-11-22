@@ -13,6 +13,15 @@ pub const DOMAIN: &[u8; 16] = b"AURA-SIG-V1\0\0\0\0\0";
 pub const BODY_MAGIC: &[u8; 8] = b"AURSIG01";
 pub const ALG_ED25519: u32 = 1;
 
+/// The signed `flags` word says what the record signs, so one form never verifies as the other.
+/// A record without a form (older signers wrote `flags = 0`) is refused: its covered bytes could
+/// be taken for either. The other bits are signed too and left for later use.
+pub const FORM_MASK: u32 = 0xf;
+/// Payloads after an aura head (`secboot_sign.py sign-payloads`).
+pub const FORM_PAYLOADS: u32 = 1;
+/// A whole image, with the trailer the loading stage cuts off (`secboot_sign.py sign-image`).
+pub const FORM_IMAGE: u32 = 2;
+
 /// Signed header, little endian, right after the `aura_sig` tag and its u32 record size.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Header {
@@ -71,13 +80,15 @@ pub enum Verdict {
     Rollback = 4,
 }
 
-/// Check a record body against the covered bytes. `digest` gets SHA-256 of the covered bytes
-/// whenever the body is well formed, so a failed check is still measured.
+/// Check a record body of the given form (`FORM_*`) against the covered bytes. `digest` gets
+/// SHA-256 of the covered bytes whenever the body is well formed, so a failed check is still
+/// measured.
 pub fn verify(
     body: &[u8],
     covered: &[u8],
     pubkey: &[u8; 32],
     min_security_version: u32,
+    form: u32,
     digest: &mut [u8; 32],
 ) -> (Verdict, Option<Header>) {
     let Some(h) = parse_header(body) else {
@@ -90,6 +101,9 @@ pub fn verify(
         return (Verdict::BadFormat, Some(h));
     }
     digest.copy_from_slice(&Sha256::digest(covered));
+    if h.flags & FORM_MASK != form {
+        return (Verdict::BadFormat, Some(h));
+    }
     if h.key_id != key_id(pubkey) {
         return (Verdict::UnknownKey, Some(h));
     }
@@ -108,8 +122,9 @@ pub fn verify(
     (Verdict::Verified, Some(h))
 }
 
-/// C entry: verify an `aura_sig` body over `covered`. Returns a `Verdict` value; fills
-/// `digest` (32 bytes), `security_version` and `key_id` (8 bytes) when the body parses.
+/// C entry: verify an `aura_sig` body of form `form` (`FORM_*`) over `covered`. Returns a
+/// `Verdict` value; fills `digest` (32 bytes), `security_version` and `key_id` (8 bytes) when the
+/// body parses.
 ///
 /// # Safety
 /// Every pointer must be valid for the length given with it (pubkey 32, digest 32, key_id 8).
@@ -121,6 +136,7 @@ pub unsafe extern "C" fn aura_secboot_verify(
     covered_len: usize,
     pubkey: *const u8,
     min_security_version: u32,
+    form: u32,
     digest: *mut u8,
     security_version: *mut u32,
     key_id_out: *mut u8,
@@ -132,7 +148,7 @@ pub unsafe extern "C" fn aura_secboot_verify(
     let covered = unsafe { core::slice::from_raw_parts(covered, covered_len) };
     let pubkey: &[u8; 32] = unsafe { &*(pubkey as *const [u8; 32]) };
     let mut d = [0u8; 32];
-    let (v, h) = verify(body, covered, pubkey, min_security_version, &mut d);
+    let (v, h) = verify(body, covered, pubkey, min_security_version, form, &mut d);
     unsafe { core::ptr::copy_nonoverlapping(d.as_ptr(), digest, 32) };
     if let Some(h) = h {
         if !security_version.is_null() {
@@ -151,12 +167,16 @@ mod tests {
     use ed25519_compact::{KeyPair, Seed};
 
     fn sign(kp: &KeyPair, covered: &[u8], secver: u32) -> Vec<u8> {
+        sign_flags(kp, covered, secver, FORM_PAYLOADS)
+    }
+
+    fn sign_flags(kp: &KeyPair, covered: &[u8], secver: u32, flags: u32) -> Vec<u8> {
         let mut body = Vec::new();
         body.extend_from_slice(BODY_MAGIC);
         body.extend_from_slice(&1u32.to_le_bytes());
         body.extend_from_slice(&ALG_ED25519.to_le_bytes());
         body.extend_from_slice(&secver.to_le_bytes());
-        body.extend_from_slice(&0u32.to_le_bytes());
+        body.extend_from_slice(&flags.to_le_bytes());
         body.extend_from_slice(&(covered.len() as u64).to_le_bytes());
         body.extend_from_slice(&key_id(&kp.pk));
         let mut d = [0u8; 32];
@@ -174,23 +194,84 @@ mod tests {
         let body = sign(&kp, data, 3);
         let pk: [u8; 32] = *kp.pk;
         let mut d = [0u8; 32];
-        assert_eq!(verify(&body, data, &pk, 0, &mut d).0, Verdict::Verified);
-        assert_eq!(verify(&body, data, &pk, 4, &mut d).0, Verdict::Rollback);
         assert_eq!(
-            verify(&body, b"dtb and u-boot bytez", &pk, 0, &mut d).0,
+            verify(&body, data, &pk, 0, FORM_PAYLOADS, &mut d).0,
+            Verdict::Verified
+        );
+        assert_eq!(
+            verify(&body, data, &pk, 4, FORM_PAYLOADS, &mut d).0,
+            Verdict::Rollback
+        );
+        assert_eq!(
+            verify(
+                &body,
+                b"dtb and u-boot bytez",
+                &pk,
+                0,
+                FORM_PAYLOADS,
+                &mut d
+            )
+            .0,
             Verdict::BadSignature
         );
         assert_eq!(
-            verify(&body, &data[1..], &pk, 0, &mut d).0,
+            verify(&body, &data[1..], &pk, 0, FORM_PAYLOADS, &mut d).0,
             Verdict::BadFormat
         );
         let opk: [u8; 32] = *other.pk;
-        assert_eq!(verify(&body, data, &opk, 0, &mut d).0, Verdict::UnknownKey);
+        assert_eq!(
+            verify(&body, data, &opk, 0, FORM_PAYLOADS, &mut d).0,
+            Verdict::UnknownKey
+        );
         let mut bad = body.clone();
-        bad[20] ^= 1; // the signed flags word
-        assert_eq!(verify(&bad, data, &pk, 0, &mut d).0, Verdict::BadSignature);
+        bad[21] ^= 1; // the signed flags word, outside the form
+        assert_eq!(
+            verify(&bad, data, &pk, 0, FORM_PAYLOADS, &mut d).0,
+            Verdict::BadSignature
+        );
     }
-    /// A record tools/secboot_sign.py made with the published test key over "aura" * 1000.
+    /// A record of one form never verifies as the other, and a record without a form verifies
+    /// as neither.
+    #[test]
+    fn forms_are_distinct() {
+        let kp = KeyPair::from_seed(Seed::new([7u8; 32]));
+        let pk: [u8; 32] = *kp.pk;
+        let data = b"dtb and u-boot bytes";
+        let mut d = [0u8; 32];
+        let payloads = sign_flags(&kp, data, 0, FORM_PAYLOADS);
+        let image = sign_flags(&kp, data, 0, FORM_IMAGE);
+        let unformed = sign_flags(&kp, data, 0, 0);
+        assert_eq!(
+            verify(&payloads, data, &pk, 0, FORM_PAYLOADS, &mut d).0,
+            Verdict::Verified
+        );
+        assert_eq!(
+            verify(&payloads, data, &pk, 0, FORM_IMAGE, &mut d).0,
+            Verdict::BadFormat
+        );
+        assert_eq!(
+            verify(&image, data, &pk, 0, FORM_IMAGE, &mut d).0,
+            Verdict::Verified
+        );
+        assert_eq!(
+            verify(&image, data, &pk, 0, FORM_PAYLOADS, &mut d).0,
+            Verdict::BadFormat
+        );
+        for form in [FORM_PAYLOADS, FORM_IMAGE] {
+            assert_eq!(
+                verify(&unformed, data, &pk, 0, form, &mut d).0,
+                Verdict::BadFormat
+            );
+        }
+        // Bits outside the form are signed but do not change it.
+        let later = sign_flags(&kp, data, 0, FORM_IMAGE | 0x100);
+        assert_eq!(
+            verify(&later, data, &pk, 0, FORM_IMAGE, &mut d).0,
+            Verdict::Verified
+        );
+    }
+
+    /// A payload record tools/secboot_sign.py made with the published test key over "aura" * 1000.
     #[test]
     fn python_signer_interop() {
         let body: Vec<u8> = (0..VECTOR.len() / 2)
@@ -199,10 +280,10 @@ mod tests {
         let pk: &[u8; 32] = include_bytes!("../../data/secboot/test-ed25519.pub");
         let covered = b"aura".repeat(1000);
         let mut d = [0u8; 32];
-        let (v, h) = verify(&body, &covered, pk, 0, &mut d);
+        let (v, h) = verify(&body, &covered, pk, 0, FORM_PAYLOADS, &mut d);
         assert_eq!(v, Verdict::Verified);
         assert_eq!(h.unwrap().security_version, 5);
     }
 
-    const VECTOR: &str = "415552534947303101000000010000000500000000000000a00f0000000000006ef2bae2eee577cbafa4941675dfe6c78abc88f9a9475d7ca6837d24eacd1a7097ad9c9e2a7199e5be55967c7354932412513315b3ba59c1d578936c6272e52a12e4e4b99411830f";
+    const VECTOR: &str = "415552534947303101000000010000000500000001000000a00f0000000000006ef2bae2eee577cbaff3c8b77bdfb4614770d9c48467ce339480f50142501c9d10bf45430ab63c3336c17d2d749553727a6f67e5bf25185256fc9f3a57a97f182229a088b3167f06";
 }
