@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: MIT
+# SPDX-License-Identifier: GPL-2.0-only
 """Host source rules for the T8152 (J804) OS-phase timer PPI, after M3 run 2.
 
 M3 run 2 (2026-11-17): from about 1.5 s after ExitBootServices the boot CPU took ~8.4k

@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 
 /*
  * D4: identity map builder and walker for the usb-drd Gen3 DARTs.  See hv_usb_dart.h for the

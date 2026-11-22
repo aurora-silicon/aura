@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * Host replay of src/hv/windows/mtp_scm.c (the T8152 MTP SCM transport, pure).  Built by
  * tests/python/test_windows_t8152_input_mtp.py with ASan/UBSan.  Synthetic frames only.

@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * Host model of the hardware behind hv_gpu.c's G1 code (HV_GPU_HOST_TEST): a synthetic PSD
  * recipe and three PSD blocks that behave as the recipe describes (request, acknowledge after a

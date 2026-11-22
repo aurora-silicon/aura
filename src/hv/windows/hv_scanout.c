@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 
 /*
  * G6-S carrier glue for the scanout service model.  See hv_scanout.h for the contract.  Written

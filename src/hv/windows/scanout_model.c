@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 
 /*
  * G6-S scanout service model.  See scanout_model.h.  Written on this branch from the carrier's

@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 
 /*
  * I1: the T8152 MTP bring-up and run-time service.  See mtp_bringup.h for the sequence and

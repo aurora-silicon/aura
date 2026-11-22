@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: MIT
+# SPDX-License-Identifier: GPL-2.0-only
 """Host lifecycle of the T8152 (J804) Windows launch against a recording proxy model.
 
 Runs the real HV.init / load_raw / start of proxyclient/aura/hv against a synthetic

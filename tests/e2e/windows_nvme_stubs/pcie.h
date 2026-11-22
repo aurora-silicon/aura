@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 #pragma once
 #include "types.h"
 /* nvme.c powers ANS through its own gates on post-M4 chips; the simulated T8152 never asks. */

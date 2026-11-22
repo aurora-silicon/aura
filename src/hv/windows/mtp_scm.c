@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 
 /*
  * I1: the T8152 MTP SCM transport, pure.  See mtp_scm.h for the contract and the facts it rests

@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 
 #ifndef HV_SCANOUT_H
 #define HV_SCANOUT_H

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 #pragma once
 #include "types.h"
 #include "hv_ahci.h"

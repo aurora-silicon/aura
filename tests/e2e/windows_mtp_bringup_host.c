@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * Host replay of src/hv/windows/mtp_bringup.c against a fake T8152 MTP written for this test.
  * The fake keeps its own PA space (the reserved area and the dart-sbr root), resolves every

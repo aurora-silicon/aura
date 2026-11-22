@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * Host replay of src/hv/windows/mtp_dart_t8152.c over a fake sparse PA space.
  *

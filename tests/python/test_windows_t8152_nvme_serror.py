@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: MIT
+# SPDX-License-Identifier: GPL-2.0-only
 """j804-windows-nvme-serror: a forwarded guest SError on a D5 (NVMe-backed AHCI) carrier.
 
 2026-11-17, carrier 353b3cf5 (D5, read-write): the guest took an SError, the carrier forwarded

@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 
 /*
  * D5 GPT checks.  See gpt_check.h for the scope; written from UEFI 2.10 section 5 only.

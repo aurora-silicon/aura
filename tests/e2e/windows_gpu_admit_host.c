@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * Host driver for src/hv/windows/gpu_t8152_admit.c (G0 admission, range table, handoff page).
  * Driven by tests/python/test_windows_t8152_gpu.py with a synthetic binary ADT, synthetic TEXT

@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 
 /*
  * I0 input device model.  See input_model.h for the contract and windows-m6/INPUT-DESIGN.md

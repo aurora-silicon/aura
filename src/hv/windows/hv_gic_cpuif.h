@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 
 #ifndef HV_GIC_CPUIF_H
 #define HV_GIC_CPUIF_H

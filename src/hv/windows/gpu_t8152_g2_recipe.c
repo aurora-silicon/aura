@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 
 /*
  * G2: the private recipe (gpu_t8152_g2.h).  Its values are not kept in this repository: the

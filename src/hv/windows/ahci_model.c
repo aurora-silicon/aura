@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 
 /*
  * Software AHCI 1.3.1 HBA, one port, one ATA disk.  See ahci_model.h for the scope and the

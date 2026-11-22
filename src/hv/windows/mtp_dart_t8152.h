@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 
 #ifndef MTP_DART_T8152_H
 #define MTP_DART_T8152_H

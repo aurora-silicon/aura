@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: MIT
+# SPDX-License-Identifier: GPL-2.0-only
 """G6 r3: the proxy console and the Windows vUART share one DWC3 controller and one lock.
 
 G6 session 230552 ended about 440 s after guest entry on an EL2 SError (ESR 0xbe000000) on

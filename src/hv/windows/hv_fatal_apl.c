@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 
 /*
  * G6 r5: Apple's implementation-defined error-status registers for the T8152 fatal report

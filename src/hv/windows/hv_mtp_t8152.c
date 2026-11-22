@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 
 /*
  * I1/I2: hardware glue for the T8152 MTP keyboard and trackpad.  See hv_mtp_t8152.h for the rules and

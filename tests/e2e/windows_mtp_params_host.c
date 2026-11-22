@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * The launcher's trackpad parameter page (proxyclient/aura/windows.py input_params()) read by
  * the carrier's own parser (src/hv/windows/mtp_bringup.c mtp_params_parse()).  Arguments: the

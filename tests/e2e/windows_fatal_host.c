@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * Host replay of the T8152 fatal-exception context, src/hv/windows/hv_fatal.c, compiled
  * unchanged (it is #included below) against stub headers that

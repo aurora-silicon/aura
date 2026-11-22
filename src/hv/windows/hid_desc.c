@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 
 /*
  * HID report descriptor walker.  See hid_desc.h.  Written on this branch from the HID 1.11

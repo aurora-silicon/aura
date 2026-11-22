@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * G6 r3: one DWC3 controller, two iodevs.  The proxy console (a USB iodev with USAGE_CONSOLE) and
  * the Windows vUART (IODEV_USB_VUART) are two CDC interfaces of the same controller.  A printf on

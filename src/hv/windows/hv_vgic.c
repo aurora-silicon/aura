@@ -12,10 +12,11 @@
  *     m1n1 in hypervisor mode.
  *
  * License:
- *     SPDX-License-Identifier: (BSD-2-Clause-Patent OR MIT)
+ *     SPDX-License-Identifier: GPL-2.0-only AND (BSD-2-Clause-Patent OR MIT)
  *
- *     Inspiration borrowed from the KVM vGIC driver in the Linux source tree. Original copyright
- * notice below.
+ *     Design and portions inspired by the Linux KVM ARM vGIC driver (arch/arm64/kvm/vgic),
+ *     Copyright (C) ARM Ltd. and Linux KVM contributors, licensed under GPL-2.0-only
+ *     (see LICENSES/GPL-2.0-only.txt).
  *
  */
 

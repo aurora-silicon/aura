@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: MIT
+# SPDX-License-Identifier: GPL-2.0-only
 """Host test of the T8152 (J804) Windows carrier safety policy, src/hv/windows/hv_t8152.c.
 
 The production file is compiled unchanged against small stand-in headers (a fake ADT,

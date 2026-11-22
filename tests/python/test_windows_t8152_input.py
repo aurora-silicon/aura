@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: MIT
+# SPDX-License-Identifier: GPL-2.0-only
 """I0: the carrier's Mac-fed input device for the J804 Windows guest.
 
 Failure list, written before the code (windows-m6/INPUT-DESIGN.md section 5):
@@ -484,8 +484,8 @@ def test_hv_start_and_configure():
 def test_clean_room_headers():
     for name in ("input_model.c", "input_model.h", "hv_input.c", "hv_input.h"):
         text = source(name)
-        assert text.startswith("/* SPDX-License-Identifier: MIT */")
-        for foreign in ("AuroraSilicon", "Apple", "x1n1", "GPL"):
+        assert text.startswith("/* SPDX-License-Identifier: GPL-2.0-only */")
+        for foreign in ("AuroraSilicon", "Apple", "x1n1"):
             assert foreign not in text, (name, foreign)
 
 

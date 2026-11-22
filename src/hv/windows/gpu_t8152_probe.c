@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 
 /* G1 mediated forwarding decisions and the access map.  See gpu_t8152_probe.h. */
 

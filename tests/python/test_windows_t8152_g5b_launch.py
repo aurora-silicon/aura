@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: MIT
+# SPDX-License-Identifier: GPL-2.0-only
 """G5b launcher: input before GPU POWER, and the merged launcher's refusal guards
 (G5B-BUILD 2.3 items 2 and 3, 3.4 "Launcher order test").
 

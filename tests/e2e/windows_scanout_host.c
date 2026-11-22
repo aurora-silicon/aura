@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 
 /*
  * G6-S host replay of src/hv/windows/scanout_model.c and the carrier glue hv_scanout.c, both

@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * D5 host tests: a simulated T8152 ANS NVMe controller (windows-m6/D5-NVME-DESIGN.md 14.1).
  *

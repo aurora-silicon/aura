@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: MIT
+# SPDX-License-Identifier: GPL-2.0-only
 """D5 gates R0 and W0 (windows-m6/D5-NVME-DESIGN.md section 13), no guest.
 
   r0      attach the Windows partition READ-ONLY twice (NVMe wake, Identify, outer and inner GPT,

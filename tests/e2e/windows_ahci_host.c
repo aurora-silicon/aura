@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * Host replay of the carrier's AHCI disk model (src/hv/windows/ahci_model.c) and of the
  * carrier-emulated SPI routing (src/hv/windows/hv_vdev_spi.c), both compiled unchanged.

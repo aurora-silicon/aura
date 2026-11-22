@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: MIT
+# SPDX-License-Identifier: GPL-2.0-only
 """Host source rules for the T8152 (J804) Mu timer route and the 1 Hz guest report.
 
 First M2 run (2026-11-16): Mu's serial stopped mid line after TimerDxe armed CNTP (10 ms

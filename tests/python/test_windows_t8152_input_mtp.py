@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: MIT
+# SPDX-License-Identifier: GPL-2.0-only
 """I1/I2: the M6's internal keyboard and trackpad over the T8152 MTP, carrier side (host tests).
 
 The pure files are compiled for the host (clang, -std=gnu11 -Wall -Wextra -Werror, ASan and
@@ -454,15 +454,15 @@ def test_param_page_read_by_the_carrier(tmp_path):
 def test_provenance_of_new_files():
     for name in NEW_FILES:
         text = source(name)
-        assert text.startswith("/* SPDX-License-Identifier: MIT */"), name
-        for foreign in ("Copyright", "GPL", "AuroraSilicon", "x1n1", "Neo", "/Users/",
+        assert text.startswith("/* SPDX-License-Identifier: GPL-2.0-only */"), name
+        for foreign in ("Copyright", "AuroraSilicon", "x1n1", "Neo", "/Users/",
                         "j804-private-data", "HIDF"):
             assert foreign not in text, (name, foreign)
     for name in ("windows_mtp_scm_host.c", "windows_mtp_dart_host.c",
                  "windows_input_kbd_host.c", "windows_mtp_bringup_host.c",
                  "windows_input_tp_host.c", "windows_mtp_params_host.c"):
         text = (REPO / "tests/e2e" / name).read_text()
-        assert text.startswith("/* SPDX-License-Identifier: MIT */")
+        assert text.startswith("/* SPDX-License-Identifier: GPL-2.0-only */")
         for foreign in ("Copyright", "/Users/", "j804-private-data", "HIDF"):
             assert foreign not in text, (name, foreign)
 

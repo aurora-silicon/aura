@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * Host stand-in for aura's ADT reader (rust/src/adt.rs) over a real binary ADT blob, for the
  * G0 GPU host tests.  It walks the same layout (node header, 32-byte property names, values

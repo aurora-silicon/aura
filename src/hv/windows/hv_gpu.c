@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 
 /*
  * G0 + G1 + G2 GPU passthrough, carrier side.  See hv_gpu.h and windows-m6/G0-CARRIER-CONTRACT.md.

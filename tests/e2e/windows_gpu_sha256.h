@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* SHA-256 (FIPS 180-4) for the G0 GPU host tests: the stand-in for aura_sha256(). */
 #ifndef WINDOWS_GPU_SHA256_H
 #define WINDOWS_GPU_SHA256_H

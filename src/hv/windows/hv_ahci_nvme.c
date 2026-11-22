@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 
 /*
  * D5 carrier glue: the AHCI disk's NVMe backend.  See hv_ahci_nvme.h for the contract and

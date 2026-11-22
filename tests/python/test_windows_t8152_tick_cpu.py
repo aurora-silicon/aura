@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: MIT
+# SPDX-License-Identifier: GPL-2.0-only
 """SError A/B: the host tick on another CPU (run_guest --windows-tick-cpu), host only.
 
 All four T8152 SErrors so far (D3 run 1 at EL2; i0 session 2, D5c and G5 S9 forwarded from the

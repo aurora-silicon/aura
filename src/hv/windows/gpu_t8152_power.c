@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 
 /*
  * G1 GPU power-on and the boot-wide marker record.  See gpu_t8152_power.h.  No value of the

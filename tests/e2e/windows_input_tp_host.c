@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * Host replay of src/hv/windows/input_tp.c with synthetic finger records written for this test
  * (the 0x75 layout of INPUT-I1I2-BUILD.md section 1; no trackpad capture exists on this Mac).

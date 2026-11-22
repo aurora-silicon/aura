@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 
 /*
  * I1 keyboard translation.  See input_kbd.h.  Written on this branch from the HID 1.11

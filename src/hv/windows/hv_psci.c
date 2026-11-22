@@ -14,6 +14,9 @@
  * (https://github.com/ARM-software/arm-trusted-firmware) as reinventing the wheel here is not very
  * fun.
  *
+ * Upstream notice: Arm Trusted Firmware-A (TF-A), Copyright (c) Arm Limited and Contributors,
+ * licensed under BSD-3-Clause (https://spdx.org/licenses/BSD-3-Clause.html).
+ *
  * License: SPDX-License-Identifier: MIT OR BSD-3-Clause
  */
 

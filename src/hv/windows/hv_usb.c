@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 
 /*
  * D4 carrier glue: usb-drd1 (and optionally usb-drd3) xHCI passthrough for the J804 Windows

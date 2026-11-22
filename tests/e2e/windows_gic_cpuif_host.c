@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * Host replay of the software GICv3 CPU interface (src/hv/windows/hv_gic_cpuif.c),
  * compiled unchanged.  Expected values follow Arm IHI 0069 (ICC_*_EL1 register

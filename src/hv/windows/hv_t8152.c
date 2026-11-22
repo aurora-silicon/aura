@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 
 /*
  * T8152 (J804) safety policy for the Windows carrier.  See hv_t8152.h.

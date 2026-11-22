@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: MIT
+# SPDX-License-Identifier: GPL-2.0-only
 """Host source rules for the T8152 (J804) absent-PMUv3 recovery and the stray-CNTV fix.
 
 M3 run 1 (2026-11-16): the Windows boot manager executed "mrs x9, PMCCNTR_EL0" (0xd53b9d09)

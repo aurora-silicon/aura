@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 
 /*
  * D5: the AHCI disk's NVMe backend, pure part.  See ahci_nvme.h.  Written on this branch from

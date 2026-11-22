@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 #pragma once
 #include "types.h"
 typedef struct asc_dev asc_dev_t;

@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: MIT
+# SPDX-License-Identifier: GPL-2.0-only
 """Host run of aura's production spin_lock()/spin_unlock() (src/utils.c), B6.
 
 On the T8152 Windows carrier spin_lock() must wait without WFE: a WFE that really sleeps

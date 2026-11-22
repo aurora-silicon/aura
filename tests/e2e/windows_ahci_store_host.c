@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * Host replay of the carrier's AHCI store glue, src/hv/windows/hv_ahci.c, compiled unchanged
  * (it is #included below so each simulated carrier session can reset its file-scope state)

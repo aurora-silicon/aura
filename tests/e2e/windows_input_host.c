@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * I0 host replay of the carrier's input device model (src/hv/windows/input_model.c) and of the
  * carrier-emulated SPI table (src/hv/windows/hv_vdev_spi.c), both compiled unchanged under

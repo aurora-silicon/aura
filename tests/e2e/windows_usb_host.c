@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 
 /*
  * D4 host replay of the carrier glue src/hv/windows/hv_usb.c, compiled unchanged (with

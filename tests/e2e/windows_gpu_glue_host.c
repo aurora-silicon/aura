@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * Host driver for src/hv/windows/hv_gpu.c (G0 carrier glue), compiled with HV_GPU_HOST_TEST
  * against stand-ins for the stage-2 policy and the HV map calls, which record what the glue

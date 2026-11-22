@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 #pragma once
 #include "types.h"
 bool hv_t8152_guest_ram(u64 *base, u64 *size);

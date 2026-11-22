@@ -1,5 +1,5 @@
 #!/bin/sh
-# SPDX-License-Identifier: MIT
+# SPDX-License-Identifier: GPL-2.0-only
 #
 # j804-build-aura.sh: build J804's aura boot objects from one committed revision.
 #

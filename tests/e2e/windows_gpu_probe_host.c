@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * Host driver for the G1 part of src/hv/windows/hv_gpu.c (POWER, the boot marker, PROBE, STOP),
  * compiled with HV_GPU_HOST_TEST against the stand-ins of windows_gpu_glue_stubs.h and the

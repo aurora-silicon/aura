@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 #pragma once
 #include "rtkit.h"
 sart_dev_t *sart_init(const char *adt_path);

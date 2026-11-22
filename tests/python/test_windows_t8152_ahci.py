@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: MIT
+# SPDX-License-Identifier: GPL-2.0-only
 """D1: the carrier-emulated AHCI disk on T8152 (J804), host only.
 
 Failure modes F1-F18 are listed in windows-m6/D1-AHCI-DESIGN.md section 7; each test names
@@ -309,7 +309,7 @@ def test_clean_room_citations():
     for name in ("ahci_model.c", "ahci_model.h", "hv_ahci.c", "hv_ahci.h", "hv_vdev_spi.c",
                  "hv_vdev_spi.h"):
         text = source(name)
-        assert text.startswith("/* SPDX-License-Identifier: MIT */"), name
+        assert text.startswith("/* SPDX-License-Identifier: GPL-2.0-only */"), name
         for foreign in ("qemu", "QEMU", "libahci", "libata", "Copyright"):
             assert foreign not in text.replace("QEMU hw/ide", "").replace(
                 "Linux libahci/libata", ""), (name, foreign)

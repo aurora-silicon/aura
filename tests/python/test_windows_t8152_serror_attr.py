@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: MIT
+# SPDX-License-Identifier: GPL-2.0-only
 """i0 session 2: the guest SError attribution and the launcher's SError policy, host only.
 
 i0 session 2 (2026-11-17) ended ~500 s after entry on a lower-EL SError (ESR ISS 0) on the

@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 
 #ifndef HV_VDEV_SPI_H
 #define HV_VDEV_SPI_H

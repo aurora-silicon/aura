@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: MIT
+# SPDX-License-Identifier: GPL-2.0-only
 """P_HV_WINDOWS_CAPS2: one meaning per bit, the same on both sides.
 
 gpu3 (G2) and D5 (NVMe disk) both claimed bit 5 and a plain merge kept both constants without a

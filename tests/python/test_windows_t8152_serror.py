@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: MIT
+# SPDX-License-Identifier: GPL-2.0-only
 """D3 run 1: the T8152 EL2 SError on the host tick, host only.
 
 D3 run 1 (2026-11-17) died 388 s after entry with "Exception: SError / taken from EL2h" on

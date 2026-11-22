@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: MIT
+# SPDX-License-Identifier: GPL-2.0-only
 """G0 (windows-m6/WINDOWS-GPU-PLAN.md H2/H3): GPU admission port, range table, handoff page and
 the carrier glue for the J804 Windows guest, host only.
 

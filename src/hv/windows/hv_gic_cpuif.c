@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 
 /*
  * Software GICv3 CPU interface.  See hv_gic_cpuif.h for the model and its

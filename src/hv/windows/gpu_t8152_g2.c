@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 
 /*
  * G2 carrier additions: recipe checks, the fw-mmio declarations, the boot-control location check

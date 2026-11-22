@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 
 /*
  * I1: static dart-sbr stream 4 translations for the T8152 MTP.  See mtp_dart_t8152.h.  Written

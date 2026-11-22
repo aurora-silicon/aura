@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * Host replay of src/hv/windows/hid_desc.c and input_kbd.c.  Synthetic descriptors written for
  * this test from the HID 1.11 specification and the HID Usage Tables (no device capture exists

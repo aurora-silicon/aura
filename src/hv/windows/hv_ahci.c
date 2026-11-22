@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 
 /*
  * D1 carrier glue for the AHCI disk model.  See hv_ahci.h for the contract and

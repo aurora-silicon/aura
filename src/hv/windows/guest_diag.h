@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 #ifndef HV_WINDOWS_GUEST_DIAG_H
 #define HV_WINDOWS_GUEST_DIAG_H
 

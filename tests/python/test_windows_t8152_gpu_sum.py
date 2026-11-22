@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: MIT
+# SPDX-License-Identifier: GPL-2.0-only
 """G5b C-2: the once-a-minute "HV: GPU SUM" line (G5B-BUILD 3.1).
 
 Failure modes written down before the code:

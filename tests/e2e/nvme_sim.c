@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * D5 host tests: the simulated T8152 ANS NVMe controller and the platform stubs aura's
  * src/nvme.c needs on the host (MMIO, time, ADT, RTKit, SART, PMGR, heap).  See nvme_sim.h.

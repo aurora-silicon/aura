@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 
 #ifndef GPU_T8152_UAT_H
 #define GPU_T8152_UAT_H

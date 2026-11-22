@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 
 /* G2: the carrier's audit of the GPU page tables.  See gpu_t8152_uat.h. */
 

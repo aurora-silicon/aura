@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 
 /*
  * G0 GPU admission port and range table for the T8152 (J804) Windows carrier.  See

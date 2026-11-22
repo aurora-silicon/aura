@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * Stand-ins shared by the hv_gpu.c host drivers (windows_gpu_glue_host.c for G0,
  * windows_gpu_probe_host.c for G1): the stage-2 policy and HV map calls, which record what the

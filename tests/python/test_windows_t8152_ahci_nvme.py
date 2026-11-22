@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: MIT
+# SPDX-License-Identifier: GPL-2.0-only
 """D5: Windows' AHCI disk on a dedicated internal-NVMe partition (J804), host only.
 
 The failure list comes first: windows-m6/D5-NVME-DESIGN.md section 10 (N1-N22) and the cases of

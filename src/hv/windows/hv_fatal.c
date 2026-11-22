@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 
 /*
  * T8152 fatal-exception context.  See hv_fatal.h for what is recorded and why, and

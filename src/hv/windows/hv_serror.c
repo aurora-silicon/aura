@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 
 /*
  * T8152 guest SError attribution.  See hv_serror.h.  Written on this branch from the Arm ARM

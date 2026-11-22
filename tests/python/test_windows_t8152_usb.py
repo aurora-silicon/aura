@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: MIT
+# SPDX-License-Identifier: GPL-2.0-only
 """D4: usb-drd1 (and drd3) xHCI passthrough for the J804 Windows guest, host only.
 
 Failure modes F1-F14 are listed in windows-m6/D4-USB-DESIGN.md section 9; the tests name the
@@ -959,7 +959,7 @@ def test_configure_proxy_and_build_agree():
 def test_clean_room_headers():
     for name in ("hv_usb.c", "hv_usb.h", "hv_usb_dart.c", "hv_usb_dart.h"):
         text = source(name)
-        assert text.startswith("/* SPDX-License-Identifier: MIT */"), name
+        assert text.startswith("/* SPDX-License-Identifier: GPL-2.0-only */"), name
         assert "Copyright" not in text, name
     dart = source("hv_usb_dart.c")
     assert set(re.findall(r'#include "([^"]+)"', dart)) == {"hv_usb_dart.h"}

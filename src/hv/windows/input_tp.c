@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 
 /*
  * I2a: trackpad finger records to a relative mouse.  See input_tp.h for the facts and the

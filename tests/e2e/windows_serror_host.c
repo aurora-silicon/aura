@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * Host replay of the T8152 guest SError attribution, src/hv/windows/hv_serror.c, compiled
  * unchanged (it is #included below, with HV_SERROR_HOST_TEST) against stub headers that

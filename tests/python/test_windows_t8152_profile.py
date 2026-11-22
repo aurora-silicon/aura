@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: MIT
+# SPDX-License-Identifier: GPL-2.0-only
 """Host checks of the T8152 (J804) Windows launch rules in proxyclient/aura/windows.py.
 
 Synthetic values only: no ADT, boot_args or address from a real machine.

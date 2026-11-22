@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: MIT
+# SPDX-License-Identifier: GPL-2.0-only
 """G6-S: the carrier's scanout service (virtual vblank and flips) for the J804 Windows guest.
 
 Failure list, written with the code (docs/windows-t8152.md "G6-S"):

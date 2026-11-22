@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: MIT
+# SPDX-License-Identifier: GPL-2.0-only
 """G5b C-3: the console never waits on the host link (G5B-BUILD 3.2).
 
 d5c: cpu6 froze 705 s inside the host tick's printout, holding the big lock, while the Mac slept

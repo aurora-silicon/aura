@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: MIT
+# SPDX-License-Identifier: GPL-2.0-only
 """Host tests of the T8152 (J804) software GICv3 CPU interface (blocker B1).
 
 1. The model, src/hv/windows/hv_gic_cpuif.c, is compiled unchanged with the host clang

@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * D5 host E2E: Windows' AHCI disk on an internal NVMe partition, end to end on the host.
  *
