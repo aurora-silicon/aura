@@ -99,6 +99,7 @@ static int dcp_hdmi_dptx_init(dcp_dev_t *dcp, const display_config_t *cfg)
         printf("dcp: failed to find dp2hdmi-gpio node '%s'\n", cfg->dp2hdmi_gpio);
         return -1;
     }
+    dcp->hpd_on_ap = adt_getprop(adt, node, "function-hdmi_hpd", NULL) != NULL;
     struct adt_function_smc_gpio dp2hdmi_pwr, hdmi_pwr;
     u32 pw8_size;
     const struct adt_function_smc_pw8 *pw8_dp2hdmi =
@@ -192,6 +193,16 @@ static int dcp_hdmi_dptx_init(dcp_dev_t *dcp, const display_config_t *cfg)
 #endif
 
     return 0;
+}
+
+/*
+ * Whether the firmware has to be told about HPD. When the converter's HPD reaches an AP gpio
+ * (function-hdmi_hpd on its dp2hdmi-gpio node) instead of the phy, a dptx-port service that speaks
+ * AFKv2 brings the port up only once the AP reports HPD. The older format never needed it.
+ */
+bool dcp_dptx_needs_ap_hpd(dcp_dev_t *dcp)
+{
+    return dcp->hpd_on_ap && dcp_dptx_is_afkv2(dcp->dptx_ep);
 }
 
 int dcp_connect_dptx(dcp_dev_t *dcp)

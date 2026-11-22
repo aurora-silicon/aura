@@ -277,6 +277,8 @@ static int display_shutdown(dcp_shutdown_mode mode)
 }
 static int dcp_connect_dptx(dcp_dev_t *d) { (void)d; return 0; }
 static int dcp_dptx_hpd(void *ep, u32 port, bool hpd) { (void)ep; (void)port; assert(hpd); hpd_pokes++; return 0; }
+/* The J873g ADT gives dp2hdmi-gpio0 function-hdmi_hpd and its dptx-port speaks AFKv2. */
+static bool dcp_dptx_needs_ap_hpd(dcp_dev_t *d) { (void)d; return chip_id == T8152; }
 static int dcp_work(dcp_dev_t *d) { (void)d; return 0; }
 static void mdelay(unsigned ms) { (void)ms; }
 static u64 get_ticks(void) { return 0; }

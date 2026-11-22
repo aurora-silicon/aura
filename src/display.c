@@ -595,11 +595,8 @@ int display_configure(const char *config)
         ret = dcp_connect_dptx(dcp);
         if (ret < 0)
             return ret;
-        /* The T8152 DCP only brings the port up once HPD is asserted. On the
-         * J873g HDMI path the sink's HPD reaches the AP gpio, so tell the
-         * firmware. */
-        if (chip_id == T8152)
-            dcp_dptx_hpd(dcp->dptx_ep, 0, true);
+        if (dcp_dptx_needs_ap_hpd(dcp) && dcp_dptx_hpd(dcp->dptx_ep, 0, true))
+            printf("display: telling the dptx-port about HPD failed\n");
     }
 
     if (!display_is_external) {
