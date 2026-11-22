@@ -4298,6 +4298,33 @@ static T6050_TEXT void t6050_headless_handoff(void *dt, int engine)
     dlog("display handoff refused; the boot framebuffer keeps the display\n");
 }
 
+/*
+ * Headless T8132 boots running a qualified external-only DCP image: macOS drives the external
+ * ports from dcpext and parks the internal DCP, so kboot routes them to dt_set_display_handoff().
+ * Uses the same dcp6_adt_headless(), dcp6_select_fw() and t8132_exts[] table as the handoff so
+ * routing and handoff cannot disagree on the OS firmware row or pinned image UUID.
+ */
+bool dt_t8132_external_display(void)
+{
+    if (chip_id != dcp_soc_t8132.chip || !dcp6_adt_headless())
+        return false;
+
+    const struct dcp_fw *fw = dcp6_select_fw(&dcp_soc_t8132);
+    if (!fw || !fw->uuid)
+        return false;
+
+    size_t uuid_len = strlen(fw->uuid) + 1;
+    for (int i = 0; i < dcp_soc_t8132.nexts; i++) {
+        int nub = adt_path_offset(adt, dcp_soc_t8132.exts[i].nub_path);
+        u32 len = 0, running = 0;
+        const char *got = nub < 0 ? NULL : adt_getprop(adt, nub, "uuid", &len);
+        if (got && len == uuid_len && !memcmp(got, fw->uuid, uuid_len) &&
+            !dcp6_adt_u32(nub, "running", &running) && running == 1)
+            return true;
+    }
+    return false;
+}
+
 /* Always returns 0: nothing here may stop the boot */
 int dt_set_display_handoff(void *dt)
 {
