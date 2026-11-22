@@ -41,7 +41,6 @@ struct uartproxy_msg_start {
 };
 
 int uartproxy_run(struct uartproxy_msg_start *start);
-bool uartproxy_wait_dockchannel(unsigned int timeout_ms);
 enum stage1_proxy_result uartproxy_wait_stage1(unsigned int timeout_ms);
 int uartproxy_run_presynced(void);
 void uartproxy_send_event(u16 event_type, void *data, u16 length);

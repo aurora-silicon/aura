@@ -61,6 +61,8 @@ static int reset_delay, pll, auspma, port_run, fail_tunable;
 static int common_mode, rc_ready, port_tunables;
 static int bad_common;
 static u32 reg_len_override;
+/* pci-bridge0's apcie-port and reg (phys.hi first), each with its length; 0 is absent. */
+static u32 bridge_port, bridge_port_len, bridge_reg[5], bridge_reg_len;
 static u32 phy_ctrl, port_ctrl, appclk;
 static int adt_path_offset(const void *a, const char *path)
 {
@@ -79,6 +81,10 @@ static bool adt_is_compatible(const void *a, int node, const char *compat)
 }
 static const void *adt_getprop(const void *a, int node, const char *prop, u32 *len)
 {
+    if (node == 2 && !strcmp(prop, "reg")) {
+        if (len) *len = bridge_reg_len;
+        return bridge_reg_len ? bridge_reg : NULL;
+    }
     if (!strcmp(prop, "apcie-common-tunables")) return bad_common ? regs : NULL;
     if (len) *len = reg_len_override ? reg_len_override : sizeof(regs);
     return regs;
@@ -88,6 +94,9 @@ static int adt_getprop_copy(const void *a, int node, const char *prop, void *out
     assert(len == 4);
     if (!strcmp(prop, "#ports")) *(u32 *)out = 3;
     else if (!strcmp(prop, "maximum-link-speed")) *(u32 *)out = 2;
+    /* Absent, or not the size asked for, is a miss, as in adt_getprop_copy. */
+    else if (!strcmp(prop, "apcie-port") && node == 2 && bridge_port_len == len)
+        *(u32 *)out = bridge_port;
     else return -1;
     return 4;
 }
@@ -211,6 +220,11 @@ static void reset_model(void)
     common_mode = rc_ready = port_tunables = 0;
     bad_common = 0;
     reg_len_override = 0;
+    /* As on T8132 (J604): pci-bridge0 has apcie-port 0 and no reg. */
+    bridge_port = 0;
+    bridge_port_len = 4;
+    memset(bridge_reg, 0, sizeof(bridge_reg));
+    bridge_reg_len = 0;
     regs[1][1] = 0x4000;
     regs[7][1] = 0x8000;
     phy_ctrl = port_ctrl = 0x10;
@@ -298,6 +312,41 @@ int main(void)
     assert(!strcmp(steps, "ANS+ APCIE_SYS_ST0+ APCIE_SYS_ST1+ APHY_ST0_AUS5_A+ APHY_ST1_AUS5_A+ "
                           "APHY_ST0_AUS5+ APHY_ST1_AUS5+ "));
     assert(powered == 0 && accesses == 0);
+
+    /*
+     * The bridge check: apcie-port first, else reg's device number, else one "has neither"
+     * line. Port 0 is set up the same way in each case; the lines are checked below.
+     */
+    static const struct {
+        u32 port, port_len, phys_hi, reg_len;
+    } bridges[] = {
+        {0, 4, 0, 0},       /* apcie-port 0, no reg (T8132): silent */
+        {1, 4, 0, 0},       /* apcie-port 1 */
+        {0, 4, 0x1000, 20}, /* apcie-port 0 is read before reg's device 2: silent */
+        {0, 0, 0, 20},      /* no apcie-port, reg device 0: silent */
+        {0, 0, 0x1000, 20}, /* no apcie-port, reg device 2 */
+        {0, 2, 0, 0},       /* a 2-byte apcie-port is a miss, and no reg */
+        {0, 0, 0, 2},       /* no apcie-port, a 2-byte reg */
+        {0, 0, 0, 0},       /* neither */
+    };
+    int first_accesses = 0, first_polls = 0;
+    for (unsigned i = 0; i < ARRAY_SIZE(bridges); i++) {
+        reset_model();
+        chip_id = 0x8132;
+        controller_compat = "apcie,t8132";
+        bridge_port = bridges[i].port;
+        bridge_port_len = bridges[i].port_len;
+        bridge_reg[0] = bridges[i].phys_hi;
+        bridge_reg_len = bridges[i].reg_len;
+        printf("bridge case %u\n", i);
+        assert(pcie_init() == 0 && pll == 1 && auspma == 1 && port_run);
+        /* The same MMIO accesses and polls whatever the bridge carries. */
+        if (!i) {
+            first_accesses = accesses;
+            first_polls = polls;
+        }
+        assert(accesses == first_accesses && polls == first_polls);
+    }
     return 0;
 }
 '''
@@ -307,4 +356,19 @@ int main(void)
          "-x", "c", "-", "-o", str(binary)],
         input=harness, text=True, check=True,
     )
-    subprocess.run([str(binary)], check=True)
+    out = subprocess.run([str(binary)], check=True, capture_output=True,
+                         text=True).stdout
+    bridge = "pcie: /arm-io/apcie/pci-bridge0 has "
+    lines = [line for line in out.splitlines()
+             if line.startswith(("bridge case ", bridge))]
+    neither = bridge + "neither apcie-port nor reg"
+    assert lines == [
+        "bridge case 0",
+        "bridge case 1", bridge + "apcie-port 1",
+        "bridge case 2",
+        "bridge case 3",
+        "bridge case 4", bridge + "reg device 2",
+        "bridge case 5", neither,
+        "bridge case 6", neither,
+        "bridge case 7", neither,
+    ]

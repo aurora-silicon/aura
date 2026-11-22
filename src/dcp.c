@@ -33,27 +33,36 @@ struct adt_function_smc_pw8 {
 };
 
 /* T8152 PMGR2 PSD service blocks (as in t8152-j873-gpu.dtsi): request at
- * +0x90, acknowledge bit 0 at +0xbc, state at +0x80 (read after the ACK). */
-#define T8152_PSD_BASE    0x303a10000
-#define T8152_PSD_STRIDE  0x100
-#define T8152_PSD_STATE   0x80
-#define T8152_PSD_REQUEST 0x90
-#define T8152_PSD_ACK     0xbc
+ * +0x90, acknowledge bit 0 at +0xbc, state at +0x80 (read after the ACK)
+ * with the current power state in bits 2:0, 0 when powered and 6 idle. */
+#define T8152_PSD_BASE      0x303a10000
+#define T8152_PSD_STRIDE    0x100
+#define T8152_PSD_STATE     0x80
+#define T8152_PSD_STATE_CUR GENMASK(2, 0)
+#define T8152_PSD_REQUEST   0x90
+#define T8152_PSD_ACK       0xbc
 
 static int t8152_psd_power_on(u32 service)
 {
     u64 base = T8152_PSD_BASE + service * T8152_PSD_STRIDE;
 
-    if (!read32(base + T8152_PSD_STATE))
+    if (!t8152_psd_state(service))
         return 0;
     write32(base + T8152_PSD_REQUEST, 0);
     if (poll32(base + T8152_PSD_ACK, 1, 1, 1000000)) {
         printf("dcp: PSD service %u did not acknowledge power on\n", service);
         return -1;
     }
-    u32 state = read32(base + T8152_PSD_STATE);
+    u32 state = t8152_psd_state(service);
     printf("dcp: PSD service %u state %u\n", service, state);
     return state ? -1 : 0;
+}
+
+/* A T8152 PSD service's current state, 0 when powered. Read only. */
+u32 t8152_psd_state(u32 service)
+{
+    return FIELD_GET(T8152_PSD_STATE_CUR,
+                     read32(T8152_PSD_BASE + service * T8152_PSD_STRIDE + T8152_PSD_STATE));
 }
 
 static char dcp_pmgr_dev[16] = "DISP0_CPU0";
@@ -72,6 +81,15 @@ static void dcp_mark_running(void)
 bool dcp_left_running(void)
 {
     return dcp_running;
+}
+
+/* Set when the last dcp_init() booted the DCP's RTKit, failed a later step and
+ * quiesced it again. */
+static bool dcp_init_quiesced;
+
+bool dcp_init_left_quiesced(void)
+{
+    return dcp_init_quiesced;
 }
 
 static int dcp_hdmi_dptx_init(dcp_dev_t *dcp, const display_config_t *cfg)
@@ -250,6 +268,8 @@ dcp_dev_t *dcp_init(const display_config_t *cfg)
 {
     u32 sid;
 
+    dcp_init_quiesced = false;
+
     if (cfg && cfg->dptx_phy[0]) {
         /* J873g reports mBoot-20457.1.29, which is not in the OS firmware
          * table, and the same dptx-port endpoint works on its USB-C route.
@@ -370,6 +390,7 @@ out_afk:
 out_rtkit:
     if (!rtkit_quiesce(dcp->rtkit))
         goto out_running;
+    dcp_init_quiesced = true;
     rtkit_free(dcp->rtkit);
 out_iovad:
     iovad_shutdown(dcp->iovad_dcp, dcp->dart_dcp);
@@ -382,6 +403,36 @@ out_free:
 out_running:
     dcp_mark_running();
     return NULL;
+}
+
+/*
+ * Stop every AFK endpoint but leave RTKit running, with its buffers and DART mappings: the next
+ * owner adopts the running core and starts the endpoints again. An interface whose endpoint
+ * stopped is freed; one that did not stays allocated and keeps its AFK endpoint, so
+ * afk_epic_live_endpoints() still reports it. The AFK context goes once every endpoint has
+ * stopped (afk_epic_shutdown() frees it), and is then no longer referenced. -1 if any did not
+ * stop.
+ */
+int dcp_handoff(dcp_dev_t *dcp)
+{
+    int ret = 0;
+    if (dcp_system_shutdown(dcp->system_ep) < 0)
+        ret = -1;
+    else
+        dcp->system_ep = NULL;
+    if (dcp_dptx_shutdown(dcp->dptx_ep) < 0)
+        ret = -1;
+    else
+        dcp->dptx_ep = NULL;
+    if (dcp_dpav_shutdown(dcp->dpav_ep) < 0)
+        ret = -1;
+    else
+        dcp->dpav_ep = NULL;
+    if (afk_epic_shutdown(dcp->afk) < 0)
+        ret = -1;
+    else
+        dcp->afk = NULL;
+    return ret;
 }
 
 int dcp_shutdown(dcp_dev_t *dcp, bool sleep)

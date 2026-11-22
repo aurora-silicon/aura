@@ -413,7 +413,16 @@ void aura_main(void)
 #ifndef BRINGUP
     if (supports_gxf())
         gxf_init();
-    if (mcc_init() && (chip_id == T8140 || chip_id == T6040))
+    /*
+     * This runs before the trial watchdog is armed, so a failure here resets the Mac with no
+     * trial fallback. No MCC driver fails on what the ADT says: an unknown revision, an ADT that
+     * does not give a driver its counts (4 or 8 bytes) or register windows, or that contradicts
+     * itself, and a firmware-owned cache in a state aura does not know leave the MCC alone
+     * (MCC_UNSUPPORTED), as does a SoC with no MCC in the ADT (MCC_ABSENT).
+     * mcc_unmap_carveouts() then takes the carveouts from the ADT list, which it requires, and
+     * kboot_boot() refuses a T8140 whose MCC was left alone.
+     */
+    if (mcc_init() < 0)
         panic("MCC initialization failed\n");
     mmu_init();
     aic_init();
@@ -458,9 +467,14 @@ void aura_main(void)
 #if defined(CHAINLOADING) && !defined(ESP_STAGE2)
     stage1_read_boot_record();
 #endif
-    /* T6040, T8140, T6050: nothing else in an aura chain clears iBoot's failed-boot count. */
-    if (chip_id == T6040 || chip_id == T8140 || chip_id == T6050)
-        pmu_clear_panic_counter();
+    /*
+     * Nothing else in an aura chain clears iBoot's failed-boot count, on any chip: a test kernel
+     * that hangs, or a proxy session that ends in a reset, counts as a failed boot, and enough of
+     * them end in recoveryOS. The primary PMU's info-leg_scrpad in the ADT locates the count on
+     * every SoC; one without it is left alone, and the Stage 1 recovery window has already read
+     * the record.
+     */
+    pmu_clear_panic_counter();
 
     printf("Initialization complete.\n");
 

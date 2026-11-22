@@ -7,9 +7,12 @@
 #include "malloc.h"
 #include "memory.h"
 #include "smp.h"
+#include "soc.h"
 #include "string.h"
 #include "utils.h"
 #include "xnuboot.h"
+
+#include "../build/execute_window.h" /* execute_window_expected(), data/execute-window.json */
 
 /*
  * A boot object with no __TEXT_BOOT_EXEC (kcbz 0) runs without SPTM, but iBoot
@@ -100,17 +103,21 @@ static void ctxr_exec_warn_unprobed(const char *why)
 }
 
 /*
- * Ask a secondary to run code outside the boot object. This is the whole test:
- * it is not limited to the chips where the confinement was first seen (T8140,
- * then T8142), because any Mac whose iBoot entered a kcbz-0 boot object may
- * leave the windows armed, and one that did not (M1 to M3, or a raw boot
- * object) runs the probe and is not confined.
+ * Whether the secondaries can execute only inside CTXR_D. The answer is the same on every chip:
+ * any Mac whose iBoot entered a kcbz-0 boot object may leave the windows armed (first seen on
+ * T8140, then T8142), and one that did not (M1 to M3, or a raw boot object) is not confined.
+ *
+ * An armed CTXR_D is the answer itself. It is read first, under an exception guard, because a
+ * probe outside an armed window is exactly what can hang: a T6050 secondary that fetches outside
+ * CTXR_D hangs instead of faulting. Only when CTXR_D is unarmed or unreadable (M1 to M3 fault on
+ * the read) is a secondary asked to run code outside the boot object.
  */
 static const char *ctxr_exec_problem(void);
 
 bool ctxr_exec_confined(void)
 {
     static int confined = -1;
+    u64 lower, upper;
 
     if (confined >= 0)
         return confined;
@@ -119,19 +126,25 @@ bool ctxr_exec_confined(void)
     for (cpu = 0; cpu < MAX_CPUS; cpu++)
         if (cpu != boot_cpu_idx && smp_is_alive(cpu))
             break;
-    if (cpu == MAX_CPUS) {
-        u64 lower, upper;
 
+    if (ctxr_range(CTXR_RANGE_D, &lower, &upper)) {
         /*
          * The boot core runs outside CTXR_D now, but a reset brings it back like a secondary
-         * (an S2R wake). It can't run the OS there unless the OS is in the window.
+         * (an S2R wake). With no secondary running and no window for the OS, the OS still
+         * starts, outside the window, on the boot CPU alone.
          */
-        if (ctxr_range(CTXR_RANGE_D, &lower, &upper) && !ctxr_exec_problem()) {
-            printf("CTXR exec: no secondary is running; CTXR_D is armed, so a core leaving reset, "
-                   "the boot core's too, is taken as confined\n");
-            confined = 1;
-            return true;
+        if (cpu == MAX_CPUS && ctxr_exec_problem()) {
+            ctxr_exec_warn_unprobed("no secondary is running");
+            return false;
         }
+        printf("CTXR exec: CTXR_D is armed at [0x%lx, 0x%lx): secondaries are confined at EL2%s\n",
+               lower, upper,
+               cpu == MAX_CPUS ? "; with no secondary running, the boot core's reset is too" : "");
+        confined = 1;
+        return true;
+    }
+
+    if (cpu == MAX_CPUS) {
         ctxr_exec_warn_unprobed("no secondary is running to probe");
         return false;
     }
@@ -193,6 +206,28 @@ bool ctxr_exec_confined(void)
                "confined at EL2\n",
                cpu, exc_last_esr);
     return confined;
+}
+
+/*
+ * The installer, the payload assembler and aurora-secboot choose a padded or an unpadded Stage 1
+ * from data/execute-window.json before aura runs. The probe is the hardware's answer, so check the
+ * file against it, once a boot. A confined chip the file leaves out is enrolled unpadded and can't
+ * start an OS; a listed chip that is not confined is expected only under a raw or a proxy-only
+ * boot object.
+ */
+static void ctxr_exec_check_expected(bool confined)
+{
+    static bool checked;
+    bool expected = execute_window_expected(chip_id);
+
+    if (checked)
+        return;
+    checked = true;
+    if (confined && !expected)
+        printf("CTXR exec: WARNING: chip 0x%x is confined but not in data/execute-window.json\n",
+               chip_id);
+    else if (!confined && expected)
+        printf("CTXR exec: chip 0x%x is in data/execute-window.json but not confined\n", chip_id);
 }
 
 /*
@@ -392,6 +427,7 @@ bool ctxr_exec_os_may_start(void)
     /* ctxr_exec_confined() said why on the panel. */
     if (probe_stuck_cpu >= 0)
         return false;
+    ctxr_exec_check_expected(confined);
     if (!confined || !ctxr_exec_problem())
         return true;
 
