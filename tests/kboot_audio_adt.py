@@ -86,10 +86,25 @@ def adt(buses, extra=None):
                 [Node("arm-io", arm_io, [gpio_controller()] + (extra or []) + buses)])
 
 
-def dts(amps, stale=None, chosen=""):
-    """A device tree with one ti,sn012776 node per (bus, addr); stale: {(bus, addr): props}"""
+def dts(amps, stale=None, chosen="", compatible=None, card=None):
+    """A device tree with one ti,sn012776 node per (bus, addr); stale: {(bus, addr): props}
+
+    card: (codec addrs in the dai-link's order, {codec index: TDM idle mask}) for a sound card
+    whose speaker dai-link lists those amps, as macaudio's trees do."""
     out = ["/dts-v1/;", "/ {", "\t#address-cells = <2>;", "\t#size-cells = <2>;",
            "\tchosen { %s};" % chosen]
+    if compatible:
+        out.insert(2, "\tcompatible = %s;" % ", ".join('"%s"' % c for c in compatible))
+    if card:
+        order, masks = card
+        out += ["\tsound {", "\t\tdai-link@0 {", "\t\t\treg = <0>;"]
+        for i, m in sorted(masks.items()):
+            out += ['\t\t\tdai-tdm-idle-mode-%d = "zero";' % i,
+                    "\t\t\tdai-tdm-slot-tx-idle-mask-%d = <0x%x>;" % (i, m)]
+        bus = {a: b for b, a in reversed(amps)}
+        out += ["\t\t\tcodec { sound-dai = %s; };" %
+                ", ".join("<&amp_%x_%x>" % (bus[a], a) for a in order),
+                "\t\t};", "\t};"]
     buses = sorted({b for b, _ in amps})
     for b in buses:
         out += ["\ti2c@%x {" % (0x100000 * (b + 1)), "\t\treg = <0x0 0x%x 0x0 0x4000>;" %
@@ -97,8 +112,9 @@ def dts(amps, stale=None, chosen=""):
         for bb, a in amps:
             if bb != b:
                 continue
-            out += ["\t\tcodec@%x {" % a, '\t\t\tcompatible = "ti,sn012776", "ti,tas2764";',
-                    "\t\t\treg = <0x%x>;" % a]
+            out += ["\t\tamp_%x_%x: codec@%x {" % (b, a, a),
+                    '\t\t\tcompatible = "ti,sn012776", "ti,tas2764";',
+                    "\t\t\treg = <0x%x>;" % a, "\t\t\t#sound-dai-cells = <0>;"]
             for k, v in (stale or {}).get((b, a), {}).items():
                 out.append("\t\t\t%s = [%s];" % (k, " ".join("%02x" % x for x in v)))
             out.append("\t\t};")
@@ -173,6 +189,60 @@ def scenario(name):
              Node("i2c1", {}, [amp("audio-speaker-a", 0x41, 0x11)])]
     if name == "group":
         return adt(group), dts(three, {(1, 0x41): STALE})
+    # The made-up rows Z0, Z1, Z2 of amps 0x40, 0x41, 0x42 as slot masks
+    z0, z1, z2 = (int.from_bytes(ZD[8 * i:8 * i + 4], "little") for i in range(3))
+    if name == "card-masks-agree":
+        # As on the 14"/16" Pros: the card's masks are the rows (amp 0x41's on its first two
+        # bytes only, all its mask spans); amp 0x42 has no mask
+        return adt(group), dts(three, card=([0x40, 0x41, 0x42], {0: z0, 1: z1 & 0xffff}))
+    if name == "card-mask-contradicts":
+        # Amp 0x41's row disagrees with the card's mask: the card's mask applies to it alone
+        return adt(group), dts(three, {(1, 0x41): STALE},
+                               card=([0x40, 0x41, 0x42], {0: z0, 1: z1 ^ 0x100}))
+    if name == "card-mask-contradicts-t8122":
+        # The same on an M3 tree: decided by the masks, not by the SoC
+        return adt(group), dts(three, card=([0x40, 0x41, 0x42], {0: z0, 1: z1 ^ 0x100}),
+                               compatible=["apple,j613", "apple,t8122", "apple,arm-platform"])
+    if name == "card-masks-agree-t8122":
+        return adt(group), dts(three, card=([0x40, 0x41, 0x42], {0: z0, 1: z1}),
+                               compatible=["apple,j613", "apple,t8122", "apple,arm-platform"])
+    if name == "card-masks-two-links-disagree":
+        # A second dai-link gives amp 0x40 another mask (one its row agrees with, on the two bytes
+        # it spans): the card does not say one thing, so no row for it
+        tree = dts(three, card=([0x40, 0x41, 0x42], {0: z0}))
+        extra = ("\tsound2 {\n\t\tdai-link@0 {\n\t\t\treg = <0>;\n"
+                 "\t\t\tdai-tdm-idle-mode-1 = \"zero\";\n\t\t\tdai-tdm-slot-tx-idle-mask-1 = <0x%x>;\n"
+                 "\t\t\tcodec { sound-dai = <&amp_1_41>, <&amp_0_40>; };\n\t\t};\n\t};\n" % (z0 & 0xffff))
+        return adt(group), tree.replace("\tsound {", extra + "\tsound {", 1)
+    if name == "card-mask-not-zero-mode":
+        # A mask without the "zero" idle mode is one macaudio does not apply: rows go on
+        tree = dts(three, card=([0x40, 0x41, 0x42], {0: z0, 1: z1 ^ 0x100}))
+        return adt(group), tree.replace('dai-tdm-idle-mode-1 = "zero";', 'dai-tdm-idle-mode-1 = "pulldown";')
+    if name == "card-mask-short-rows":
+        # Too short a speaker-config and amp-tx-zd-config, beside a card mask: neither goes on
+        g = dict(GROUP3)
+        g["speaker-config"] = ROWS[:8]
+        g["amp-tx-zd-config"] = ZD[:12]
+        short = [Node("i2c0", {}, [amp("audio-speaker", 0x40, 0x10, g),
+                                    amp("audio-speaker-b", 0x42, 0x12)]),
+                 Node("i2c1", {}, [amp("audio-speaker-a", 0x41, 0x11)])]
+        return adt(short), dts(three, card=([0x40, 0x41, 0x42], {0: z0, 1: z1 ^ 0x100}))
+    if name == "card-codecs-not-bare":
+        # A codec list whose entries are not one phandle each: its masks cannot be matched to
+        # amps, so every row is passed on as without a card
+        tree = dts(three, card=([0x40, 0x41, 0x42], {0: z0, 1: z1 ^ 0x100}))
+        at = tree.index("amp_0_42: codec@42")
+        cells = tree.index("#sound-dai-cells = <0>;", at)
+        return adt(group), tree[:cells] + "#sound-dai-cells = <1>;" + tree[cells + 23:]
+    if name == "j613":
+        # The 13" M3 Air's woofer rows and card masks (left woofer 0x40 is codec 0, right woofer
+        # 0x42 codec 2): each row is the complement of its mask, so neither goes to the kernel
+        g = dict(GROUP3)
+        g["amp-tx-zd-config"] = bytes.fromhex("f0f0f0ff00000000" "0000000000000000" "0f0f0fff00000000")
+        j613 = [Node("i2c0", {}, [amp("audio-speaker", 0x40, 0x10, g),
+                                   amp("audio-speaker-b", 0x42, 0x12)]),
+                Node("i2c1", {}, [amp("audio-speaker-a", 0x41, 0x11)])]
+        return adt(j613), dts(three, card=([0x40, 0x41, 0x42, ], {0: 0x0f0f, 2: 0xf0f0}))
     if name == "no-dcblocker":
         g = dict(GROUP3)
         del g["amp-dcblocker-config"]
@@ -220,7 +290,8 @@ def scenario(name):
     raise SystemExit("unknown scenario %s" % name)
 
 
-SCENARIOS = ["group", "no-dcblocker", "six-amps", "short-speaker-config", "single-amp", "amp-missing-in-dt", "amp-not-unique-in-dt",
+SCENARIOS = ["group", "card-masks-agree", "card-mask-contradicts", "card-mask-contradicts-t8122",
+             "card-masks-agree-t8122", "card-masks-two-links-disagree", "card-codecs-not-bare", "card-mask-not-zero-mode", "card-mask-short-rows", "j613", "no-dcblocker", "six-amps", "short-speaker-config", "single-amp", "amp-missing-in-dt", "amp-not-unique-in-dt",
              "dangling-phandle", "no-amps"] + list(SPEAKER_ID_SCENARIOS)
 
 

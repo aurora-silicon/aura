@@ -18,6 +18,16 @@
  *   speaker-config        -> apple,speaker-config        (4 bytes: operating level and slots)
  *   amp-tx-zd-config      -> apple,amp-tx-zd-config      (8 bytes: sense output idle slots)
  *
+ * An amp-tx-zd-config row is the amp's SDOUT slots to drive zeros on when idle (the first four
+ * bytes, slot 0 in bit 0), and the kernel's amp driver uses it in place of the sound card's idle
+ * mask for that amp: dai-tdm-slot-tx-idle-mask-<n>, with dai-tdm-idle-mode-<n> "zero", on the
+ * dai-link that lists the amp n-th. On most Macs the row and the mask are the same slots. Where
+ * the card has a mask for the amp and the row disagrees with it on the slots the mask spans, the
+ * row is not passed on and the card's mask stays in charge, as before the rows were passed on.
+ * The 13" M3 Air (J613) is such a Mac: its rows are the complement of the masks its speakers
+ * work with, and with the rows speakersafetyd reports bad IV sense (no speaker protection,
+ * silent speakers).
+ *
  * A property the group does not have (or one without a row for every amp) is
  * removed from its amps, so the kernel never sees a value that did not come from this Mac. Amps
  * are matched to the DT's ti,sn012776 nodes by I2C address, which must name exactly one node. A
@@ -108,6 +118,95 @@ static int dt_amp_by_addr(const void *dt, u32 addr)
     return found;
 }
 
+/*
+ * The sound card's TDM idle mask for the DT amp @amp: dai-tdm-slot-tx-idle-mask-<n>, in idle
+ * mode "zero", of each dai-link whose codec list names the amp as its n-th codec. 1 with *mask set when the card has
+ * one, 0 when it has none or its codec list is not one phandle per amp, -1 when two dai-links
+ * give the amp different masks.
+ */
+static int dt_card_idle_mask(const void *dt, int amp, u32 *mask)
+{
+    u32 phandle = fdt_get_phandle(dt, amp);
+    int found = 0;
+
+    if (!phandle)
+        return 0;
+    for (int codec = fdt_next_node(dt, -1, NULL); codec >= 0;
+         codec = fdt_next_node(dt, codec, NULL)) {
+        const char *name = fdt_get_name(dt, codec, NULL);
+        int len, n;
+        const fdt32_t *dais;
+
+        if (!name || strcmp(name, "codec"))
+            continue;
+        dais = fdt_getprop(dt, codec, "sound-dai", &len);
+        if (!dais || len <= 0 || len % (int)sizeof(*dais))
+            continue;
+        n = len / sizeof(*dais);
+        /* The index is the codec's place in the list only if every entry is a bare phandle */
+        bool bare = true;
+        for (int k = 0; k < n && bare; k++) {
+            int dai = fdt_node_offset_by_phandle(dt, fdt32_to_cpu(dais[k]));
+            const fdt32_t *cells = dai < 0 ? NULL : fdt_getprop(dt, dai, "#sound-dai-cells", &len);
+            bare = cells && len == sizeof(*cells) && !fdt32_to_cpu(*cells);
+        }
+        if (!bare)
+            continue;
+        for (int k = 0; k < n; k++) {
+            char prop[40];
+            const fdt32_t *m;
+
+            if (fdt32_to_cpu(dais[k]) != phandle)
+                continue;
+            const char *mode;
+            int link = fdt_parent_offset(dt, codec);
+
+            /* The mask takes effect only in the "zero" idle mode */
+            snprintf(prop, sizeof(prop), "dai-tdm-idle-mode-%d", k);
+            mode = fdt_getprop(dt, link, prop, &len);
+            if (!mode || len != sizeof("zero") || memcmp(mode, "zero", sizeof("zero")))
+                continue;
+            snprintf(prop, sizeof(prop), "dai-tdm-slot-tx-idle-mask-%d", k);
+            m = fdt_getprop(dt, link, prop, &len);
+            if (!m || len != sizeof(*m))
+                continue;
+            if (found && *mask != fdt32_to_cpu(*m))
+                return -1;
+            *mask = fdt32_to_cpu(*m);
+            found = 1;
+        }
+    }
+    return found;
+}
+
+/*
+ * Whether the amp-tx-zd-config @row for the DT amp at @addr may go to the kernel: not when the
+ * sound card has an idle mask for the amp that the row's slot mask contradicts on the bytes (eight
+ * slots each) up to the mask's highest set slot.
+ */
+static bool tx_zd_row_ok(const void *dt, const char *name, u32 addr, const u8 *row)
+{
+    u32 zd = row[0] | row[1] << 8 | row[2] << 16 | (u32)row[3] << 24, mask = 0, span;
+    int node = dt_amp_by_addr(dt, addr);
+    int ret = node < 0 ? 0 : dt_card_idle_mask(dt, node, &mask);
+
+    if (ret < 0) {
+        printf("kboot: audio: %s: amp at 0x%x has two different card idle masks: "
+               "amp-tx-zd-config not passed on\n",
+               name, addr);
+        return false;
+    }
+    if (!ret)
+        return true;
+    span = mask >> 24 ? 0xffffffff : mask >> 16 ? 0xffffff : mask >> 8 ? 0xffff : 0xff;
+    if (!((zd ^ mask) & span))
+        return true;
+    printf("kboot: audio: %s: amp at 0x%x: amp-tx-zd-config slots 0x%08x contradict the card's "
+           "idle mask 0x%x: not passed on, the card's mask applies\n",
+           name, addr, zd, mask);
+    return false;
+}
+
 /* Set @name on the DT amp at @addr to @val (remove it when @val is NULL) */
 static int dt_amp_setprop(void *dt, u32 addr, const char *name, const void *val, u32 len)
 {
@@ -185,6 +284,16 @@ static int setup_amp_group(void *dt, const void *adt, int arm_io, int group)
         }
     }
 
+    /* The amp-tx-zd-config rows the card's idle masks allow, decided before any row is written */
+    bool zd_ok[MAX_GROUP_AMPS];
+    {
+        u32 len = 0;
+        const u8 *zd = adt_getprop(adt, group, "amp-tx-zd-config", &len);
+
+        for (int i = 0; i < n; i++)
+            zd_ok[i] = !zd || len < (u32)n * 8 || tx_zd_row_ok(dt, name, addrs[i], zd + i * 8);
+    }
+
     /* One row per amp, in the group's order */
     for (size_t p = 0; p < ARRAY_SIZE(amp_row_props); p++) {
         u32 len = 0;
@@ -196,9 +305,11 @@ static int setup_amp_group(void *dt, const void *adt, int arm_io, int group)
                    amp_row_props[p].adt, len, n);
             rows = NULL;
         }
+        bool zd = !strcmp(amp_row_props[p].adt, "amp-tx-zd-config");
         for (int i = 0; i < n; i++) {
-            if (dt_amp_setprop(dt, addrs[i], amp_row_props[p].dt, rows ? rows + i * row : NULL,
-                               row))
+            const u8 *val = rows && (!zd || zd_ok[i]) ? rows + i * row : NULL;
+
+            if (dt_amp_setprop(dt, addrs[i], amp_row_props[p].dt, val, row))
                 return -1;
         }
     }
