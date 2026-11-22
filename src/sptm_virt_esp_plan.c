@@ -662,6 +662,8 @@ AURA_XTEXT static u32 aw_node(struct aw *w, u32 off, char *path, u32 plen, int d
     bool xbar = !strncmp(path, "/arm-io/display-crossbar", 24) && !strchr(path + 8, '/');
     bool seen[ESP_MAX_REGIONS] = {0}, seen24 = false;
     bool mp = in->m->love[0] && !strcmp(path, "/chosen/manifest-properties"), love = false;
+    /* Set /chosen/mix-n-match-prevention-status to 0 (or inject it), matching plan_boot. */
+    bool chosen = !strcmp(path, "/chosen"), mix = false;
 
     aw_hdr(w, 0, 0);
     u32 p = off + 8;
@@ -710,6 +712,14 @@ AURA_XTEXT static u32 aw_node(struct aw *w, u32 off, char *path, u32 plen, int d
             }
             aw_prop(w, name, in->m->love, n + 1, fl);
             love = true;
+            continue;
+        }
+        if (chosen && !strcmp(name, "mix-n-match-prevention-status") && len >= 4 &&
+            len < sizeof(aw_val)) {
+            memcpy(aw_val, v, len);
+            memset(aw_val, 0, 4);
+            aw_prop(w, name, aw_val, len, fl);
+            mix = true;
             continue;
         }
         if (w->have_ph && !strcmp(path, "/defaults") && !strcmp(name, "serial-device")) {
@@ -765,6 +775,11 @@ AURA_XTEXT static u32 aw_node(struct aw *w, u32 off, char *path, u32 plen, int d
                 aw_region(w, pl->region[k].name, pl->region[k].pa, pl->region[k].size);
                 onp++;
             }
+    if (chosen && !mix) {
+        static const u8 zero[4];
+        aw_prop(w, "mix-n-match-prevention-status", zero, sizeof(zero), 0);
+        onp++;
+    }
     if (mp && !love) {
         aw_prop(w, "love", in->m->love, strlen(in->m->love) + 1, 0);
         onp++;
@@ -827,9 +842,14 @@ AURA_XTEXT int esp_plan(const struct esp_plan_in *in, struct esp_plan *out, u8 *
                  esp_seglen(xi, "__TEXT") + esp_seglen(xi, "__PRELINK_TEXT") +
                  esp_seglen(xi, "__DATA_CONST") + esp_seglen(xi, "__DATA_SPTM") + cl4_total +
                  adt_space + tc_size + PAGE;
-    if ((xi->virtlo & L2_INDEX_MASK) <= before)
+    /* With exclaves and a large device tree (the M5 Ultra's) the pieces below SPTM can exceed the
+     * BootKC's L2 index. That lead only sets the layout when the blob starts at the DRAM base;
+     * above it, the placement shift below moves the blob to SPTM's first mapped block and
+     * supersedes it, as plan_boot does. */
+    u64 l2_index = xi->virtlo & L2_INDEX_MASK;
+    if (l2_index <= before && in->phys_base <= in->dram_base)
         FAIL("plan: the BootKC L2 index leaves no room below SPTM");
-    c.head += (xi->virtlo & L2_INDEX_MASK) - before;
+    c.head += l2_index > before ? l2_index - before : 0;
     c.tail = c.head;
     u64 first_mapped = (in->phys_base + BLOCK) & ~(BLOCK - 1);
     if (in->phys_base > c.head) {
