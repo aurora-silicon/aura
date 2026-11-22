@@ -29,6 +29,12 @@ void kboot_delete_chosen(const char *name);
 void kboot_set_config_lost(void);
 int kboot_set_uboot(const char *name, const char *value);
 int dt_gpu_t8122_26_calibrate(void *dt);
+#define T8122_27_VALUES 2
+int dt_gpu_t8122_27_machine_values_read(u32 val[T8122_27_VALUES]);
+struct t8122_27_value {
+    const char *path, *adt, *dt;
+};
+extern const struct t8122_27_value t8122_27_values[T8122_27_VALUES];
 void t8122_read_powered_identity(void *dt, int gpu);
 int dt_set_gpu_t8122_26(void *dt);
 

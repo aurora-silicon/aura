@@ -2057,7 +2057,8 @@ static void t8122_27_handoff(void)
     assert(t27_region_size("fw-data") == T27_DATA_SIZE + T27_RO_SIZE);
     assert(prop_len(dtbuf, "/soc/gpu@292400000", "apple,j613-25g83-gpu-handoff") < 0);
     assert(log_has("handoff version 2 published, GPU left disabled"));
-    /* Nothing powers the GPU or opens its mailbox on 27.2. */
+    /* Without the GPU's power domain in the DT the start is not described: nothing powers the
+     * GPU or opens its mailbox. */
     assert(!pmgr_enables && strcmp(status_of(dtbuf, "/soc/mbox@292408000"), "okay"));
 }
 static void t8122_27_two_segments(void)
@@ -2129,6 +2130,184 @@ static void t8122_27_no_identity(void)
     run();
     assert(fdt_path_offset(dtbuf, "/chosen/asahi,t8122-gpu-powered-identity") < 0);
     assert(!pmgr_enables && !pmgr_disables);
+}
+/*
+ * 27.2 with the GPU start described: an AGX ASC mailbox, the T8122 PMP node and the GPU's power
+ * domain in the DT. The calibration then runs and the GPU is handed to Linux.
+ */
+#define T27_PMP_PHANDLE 40
+#define T27_PS_PHANDLE  41
+static void prepare_27_start(void)
+{
+    prepare_27(0x10, 0, T27_RO_SIZE, 0, 3);
+    int soc = fdt_path_offset(dtbuf, "/soc");
+    int pmp = fdt_add_subnode(dtbuf, soc, "pmp@2d0500000");
+    CHK(pmp);
+    static const char pmp_compat[] = "apple,t8122-pmp-v2\0apple,t6000-pmp-v2";
+    CHK(fdt_setprop(dtbuf, pmp, "compatible", pmp_compat, sizeof(pmp_compat)));
+    CHK(fdt_setprop_u32(dtbuf, pmp, "phandle", T27_PMP_PHANDLE));
+    CHK(fdt_setprop_string(dtbuf, pmp, "status", "disabled"));
+    int ps = fdt_add_subnode(dtbuf, fdt_path_offset(dtbuf, "/soc"), "power-controller@gfx");
+    CHK(ps);
+    CHK(fdt_setprop_string(dtbuf, ps, "compatible", "apple,t8122-pmgr-pwrstate"));
+    CHK(fdt_setprop_u32(dtbuf, ps, "phandle", T27_PS_PHANDLE));
+    CHK(fdt_setprop_u32(dtbuf, fdt_path_offset(dtbuf, "/soc/gpu@292400000"), "power-domains",
+                        T27_PS_PHANDLE));
+    hset_u32("/arm-io/sgx", "gpu-fast-die0-target", 88);
+    hset_u32("/arm-io/gfx-asc/iop-gfx-nub", "coredump-copy-buffer", 0x8000);
+}
+static int t27_no_auto_pm(void)
+{
+    return prop_len(dtbuf, "/soc/power-controller@gfx", "apple,no-auto-pm");
+}
+static void t27_start_refused(void)
+{
+    run();
+    assert(!strcmp(status_of(dtbuf, "/soc/gpu@292400000"), "disabled"));
+    assert(strcmp(status_of(dtbuf, "/soc/mbox@292408000"), "okay"));
+    assert(gpu_u32("apple,m3-handoff-version") == 2);
+    assert(prop_len(dtbuf, "/soc/gpu@292400000", "apple,pmp") < 0);
+    assert(prop_len(dtbuf, "/soc/gpu@292400000", "apple,fast-die0-target") < 0);
+    assert(prop_len(dtbuf, "/soc/gpu@292400000", "apple,coredump-copy-buffer") < 0);
+    assert(prop_len(dtbuf, "/soc/gpu@292400000", "apple,gpu-power-model") < 0);
+    assert(t27_no_auto_pm() < 0);
+    assert(fdt_path_offset(dtbuf, "/chosen/asahi,t8122-gpu-powered-identity") < 0);
+    assert(log_has("handoff version 2 published, GPU left disabled"));
+}
+static void t8122_27_start(void)
+{
+    prepare_27_start();
+    run();
+    assert(!strcmp(status_of(dtbuf, "/soc/gpu@292400000"), "okay"));
+    assert(!strcmp(status_of(dtbuf, "/soc/mbox@292408000"), "okay"));
+    assert(gpu_u32("apple,m3-handoff-version") == 2);
+    /* The 27.2 start takes no PMP link. */
+    assert(prop_len(dtbuf, "/soc/gpu@292400000", "apple,pmp") < 0);
+    assert(t27_no_auto_pm() == 0);
+    /* The PMP itself is left as the DT has it. */
+    assert(!strcmp(status_of(dtbuf, "/soc/pmp@2d0500000"), "disabled"));
+    assert(gpu_u32("apple,fast-die0-target") == 88);
+    assert(gpu_u32("apple,coredump-copy-buffer") == 0x8000);
+    assert(gpu_u32("apple,gpu-power-model") == 1);
+    int len;
+    const fdt32_t *sram =
+        fdt_getprop(dtbuf, fdt_path_offset(dtbuf, "/opp-table-gpu/opp01"), "opp-microvolt-sram", &len);
+    assert(sram && len == 4 && fdt32_ld(sram) == 790000);
+    assert(identity_u32("probe-result") == T8122_ID_PASS);
+    assert(prop_len(dtbuf, "/soc/gpu@292400000", "apple,j613-25g83-gpu-handoff") < 0);
+    /* One bounded power-on for the identity, released before Linux starts. */
+    assert(pmgr_enables == 1 && pmgr_disables == 1 && pmgr_off == 1 && !unguarded_faults);
+    assert(log_has("27.2 machine values: fast-die0 target 88 C, coredump copy buffer 0x8000 bytes"));
+    assert(log_has("handoff version 2 published, GPU enabled (27.2 firmware"));
+}
+static void t8122_27_start_t8122_mailbox(void)
+{
+    prepare_27_start();
+    CHK(fdt_setprop_string(dtbuf, fdt_path_offset(dtbuf, "/soc/mbox@292408000"), "compatible",
+                           "apple,t8122-agx-asc-mailbox"));
+    run();
+    assert(!strcmp(status_of(dtbuf, "/soc/gpu@292400000"), "okay"));
+    assert(!strcmp(status_of(dtbuf, "/soc/mbox@292408000"), "okay"));
+}
+static void t8122_27_start_values_absent(void)
+{
+    /* Both machine values are required: without them the GPU stays off and is never powered. */
+    prepare_27_start();
+    hdel("/arm-io/sgx", "gpu-fast-die0-target");
+    hdel("/arm-io/gfx-asc/iop-gfx-nub", "coredump-copy-buffer");
+    t27_start_refused();
+    assert(log_has("gpu-fast-die0-target absent, GPU left disabled"));
+    assert(!pmgr_enables && !pmgr_disables);
+}
+static void t8122_27_start_fast_die_absent(void)
+{
+    prepare_27_start();
+    hdel("/arm-io/sgx", "gpu-fast-die0-target");
+    t27_start_refused();
+    assert(log_has("gpu-fast-die0-target absent, GPU left disabled"));
+    assert(!pmgr_enables && !pmgr_disables);
+}
+static void t8122_27_start_coredump_absent(void)
+{
+    prepare_27_start();
+    hdel("/arm-io/gfx-asc/iop-gfx-nub", "coredump-copy-buffer");
+    t27_start_refused();
+    assert(log_has("coredump-copy-buffer absent, GPU left disabled"));
+    assert(!pmgr_enables && !pmgr_disables);
+}
+static void t8122_27_start_value_malformed(void)
+{
+    prepare_27_start();
+    u64 wide = 0x8000;
+    hset("/arm-io/gfx-asc/iop-gfx-nub", "coredump-copy-buffer", &wide, sizeof(wide));
+    t27_start_refused();
+    assert(log_has("malformed coredump-copy-buffer"));
+    /* Refused from the ADT alone: nothing was powered. */
+    assert(!pmgr_enables && !pmgr_disables);
+}
+static void t8122_27_start_value_zero(void)
+{
+    prepare_27_start();
+    hset_u32("/arm-io/sgx", "gpu-fast-die0-target", 0);
+    t27_start_refused();
+    assert(log_has("malformed gpu-fast-die0-target"));
+    assert(!pmgr_enables && !pmgr_disables);
+}
+static void t8122_27_start_no_pmp(void)
+{
+    /* The 27.2 start needs no PMP: without the PMP node the GPU is still handed over. */
+    prepare_27_start();
+    CHK(fdt_del_node(dtbuf, fdt_path_offset(dtbuf, "/soc/pmp@2d0500000")));
+    run();
+    assert(!strcmp(status_of(dtbuf, "/soc/gpu@292400000"), "okay"));
+    assert(prop_len(dtbuf, "/soc/gpu@292400000", "apple,pmp") < 0);
+}
+static void t8122_27_start_no_power_domain(void)
+{
+    prepare_27_start();
+    CHK(fdt_delprop(dtbuf, fdt_path_offset(dtbuf, "/soc/gpu@292400000"), "power-domains"));
+    t27_start_refused();
+    assert(log_has("no single power domain"));
+    assert(!pmgr_enables);
+}
+static void t8122_27_start_other_mailbox(void)
+{
+    prepare_27_start();
+    CHK(fdt_setprop_string(dtbuf, fdt_path_offset(dtbuf, "/soc/mbox@292408000"), "compatible",
+                           "apple,asc-mailbox-v3"));
+    t27_start_refused();
+    assert(log_has("not an AGX ASC mailbox"));
+    assert(!pmgr_enables);
+}
+static void t8122_27_start_owner_off(void)
+{
+    /* chosen.asahi,t8122-gpu unset (an owner's 0): the calibration refuses before power-on. */
+    prepare_27_start();
+    CHK(fdt_delprop(dtbuf, fdt_path_offset(dtbuf, "/chosen"), "asahi,t8122-gpu"));
+    t27_start_refused();
+    assert(log_has("calibration from this Mac's ADT failed"));
+    assert(!pmgr_enables);
+}
+static void t8122_27_start_identity_mismatch(void)
+{
+    prepare_27_start();
+    mmio_set(SGX_BASE + G15_SGX_ID_VERSION, 0, 1);
+    t27_start_refused();
+    assert(pmgr_enables == 1 && pmgr_disables == 1 && pmgr_off == 1);
+}
+static void t8122_27_start_refused_diag(void)
+{
+    /* A refused start keeps chosen.asahi,t8122-gpu-power-diag=1 as before. */
+    prepare_27_start();
+    CHK(fdt_delprop(dtbuf, fdt_path_offset(dtbuf, "/soc/gpu@292400000"), "power-domains"));
+    CHK(fdt_setprop_string(dtbuf, fdt_path_offset(dtbuf, "/chosen"), "asahi,t8122-gpu-power-diag",
+                           "1"));
+    run();
+    assert(!strcmp(status_of(dtbuf, "/soc/gpu@292400000"), "disabled"));
+    assert(strcmp(status_of(dtbuf, "/soc/mbox@292408000"), "okay"));
+    assert(identity_u32("probe-result") == T8122_ID_PASS);
+    assert(pmgr_enables == 1 && pmgr_disables == 1 && pmgr_off == 1);
+    assert(log_has("GPU and ASC remain disabled"));
 }
 static void t8122_25_handoff_v1(void)
 {
@@ -2606,6 +2785,19 @@ static const struct {
     {"t8122-27-names", t8122_27_names},
     {"t8122-27-identity", t8122_27_identity},
     {"t8122-27-no-identity", t8122_27_no_identity},
+    {"t8122-27-start", t8122_27_start},
+    {"t8122-27-start-t8122-mailbox", t8122_27_start_t8122_mailbox},
+    {"t8122-27-start-values-absent", t8122_27_start_values_absent},
+    {"t8122-27-start-fast-die-absent", t8122_27_start_fast_die_absent},
+    {"t8122-27-start-coredump-absent", t8122_27_start_coredump_absent},
+    {"t8122-27-start-value-malformed", t8122_27_start_value_malformed},
+    {"t8122-27-start-value-zero", t8122_27_start_value_zero},
+    {"t8122-27-start-no-pmp", t8122_27_start_no_pmp},
+    {"t8122-27-start-no-power-domain", t8122_27_start_no_power_domain},
+    {"t8122-27-start-other-mailbox", t8122_27_start_other_mailbox},
+    {"t8122-27-start-owner-off", t8122_27_start_owner_off},
+    {"t8122-27-start-identity-mismatch", t8122_27_start_identity_mismatch},
+    {"t8122-27-start-refused-diag", t8122_27_start_refused_diag},
 #endif
     {"t6030-dry", t6030_dry},
     {"t6030-armed", t6030_armed},

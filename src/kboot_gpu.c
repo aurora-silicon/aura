@@ -2212,6 +2212,33 @@ int dt_gpu_t8122_26_calibrate(void *dt)
                               "g15s-fuse-scaled-experimental");
 }
 
+/*
+ * 27.2 start values the kernel takes from the GPU node rather than its own literals. Both are
+ * required: without either one in this Mac's ADT the 27.2 GPU is not handed over.
+ * - apple,fast-die0-target: /arm-io/sgx gpu-fast-die0-target (degrees C);
+ * - apple,coredump-copy-buffer: /arm-io/gfx-asc/iop-gfx-nub coredump-copy-buffer (bytes, the
+ *   host's firmware crash-copy buffer).
+ * dt_gpu_t8122_27_machine_values_read() reads the ADT only, so the start can refuse before
+ * anything is powered; t8122_gpu_enable_27() copies them to the GPU node as they are.
+ */
+const struct t8122_27_value t8122_27_values[T8122_27_VALUES] = {
+    {"/arm-io/sgx", "gpu-fast-die0-target", "apple,fast-die0-target"},
+    {"/arm-io/gfx-asc/iop-gfx-nub", "coredump-copy-buffer", "apple,coredump-copy-buffer"},
+};
+
+int dt_gpu_t8122_27_machine_values_read(u32 val[T8122_27_VALUES])
+{
+    for (size_t i = 0; i < T8122_27_VALUES; i++) {
+        int node = adt_path_offset(adt, t8122_27_values[i].path);
+        u32 len = 0;
+        if (node < 0 || !adt_getprop(adt, node, t8122_27_values[i].adt, &len))
+            bail("ADT: GPU: T8122 27.2: %s absent, GPU left disabled\n", t8122_27_values[i].adt);
+        if (g15_adt_u32(node, t8122_27_values[i].adt, &val[i]) || !val[i])
+            bail("ADT: GPU: T8122 malformed %s (len %u)\n", t8122_27_values[i].adt, len);
+    }
+    return 0;
+}
+
 /* Whether /chosen has `name` = "1" */
 static bool g15_optin(void *dt, const char *name)
 {
@@ -3909,15 +3936,63 @@ int dt_set_gpu_m4(void *dt);
 /*
  * T6041 (M4 Max).
  *
- * The driver runs a static profile per loaded firmware build on T6041, so only what differs
- * between units and boots comes from here: the operating points (one voltage per cluster), the
- * CS and AFR tables, the UAT and firmware regions (from the same ADT properties as on T6040) and
- * the OS firmware version. The GPU is neither powered nor read.
+ * Publishes all verified per-unit and per-boot GPU handoff data (apple,t6041-handoff-version = 1):
+ * - Operating points (16 OPPs, one voltage per cluster), CS and AFR tables, the six UAT/firmware
+ *   regions (including optional 27.2 __DATA_SHARED_RO tail) and OS firmware version.
+ * - Verified ADT hardware properties: /arm-io/sgx active-mcc-bit-vector (0x3f for 6 MCCs on J616C;
+ *   accepts any nonzero 8-bit mask), gpu-perf-base-pstate (default 1), and the five GPU/SoC
+ *   temperature-source rows (g0TR..g3TR, r0TR) from /arm-io/aon-ptd ptd_data_table.
+ * - Verified SGX registers (powering /arm-io/sgx around the reads and restoring every PMGR mode):
+ *   the 40-bit enabled core mask (sgx+0xe01500..0xe01508, published as a u64 apple,core-mask on
+ *   T6041 vs u32 on T6040), both 11-state performance maps (sgx+0xe01400 and sgx+0xe01480), and
+ *   the relative frequency ladder computed from perf-states.
+ *
+ * Efuse leakage (apple,{core,sram,cs,afr}-leak-coef), apple,max-power-mw and apple,perf-relative-a
+ * are intentionally NOT emitted yet (reserved for handoff version 2): while /arm-io/pmgr reg[46]
+ * on J616C maps the same 0x508374000 efuse page as T6040, T6041 has four GPU clusters rather than
+ * two so the exact bit offsets inside 0x508374c00..0x508374c40 and the T6041 CS dynamic power
+ * constant must be read-verified on live J616C hardware rather than guessed from T6040.
  *
  * The fill runs only when the device tree enables the GPU. Anything unexpected disables the GPU
- * node again, and the regions stay disabled unless everything was published.
+ * node again, and the regions and handoff version stay unpublished unless everything succeeded.
  */
 #define T6041_CLUSTERS 4
+#define T6041_AON_ROWS 5
+
+static int t6041_aon_table(u32 out[T6041_AON_ROWS * 3])
+{
+    static const u32 want[T6041_AON_ROWS] = {
+        0x67305452, /* g0TR */
+        0x67315452, /* g1TR */
+        0x67325452, /* g2TR */
+        0x67335452, /* g3TR */
+        0x72305452, /* r0TR */
+    };
+    int aon = adt_path_offset(adt, "/arm-io/aon-ptd");
+    if (aon < 0)
+        return -1;
+    u32 len;
+    const u8 *raw = adt_getprop(adt, aon, "ptd_data_table", &len);
+    if (!raw || !len || (len % 12))
+        return -1;
+    u32 found = 0, nrows = len / 12;
+    for (u32 i = 0; i < nrows; i++) {
+        u32 row[3];
+        memcpy(row, raw + i * 12, sizeof(row));
+        for (u32 k = 0; k < T6041_AON_ROWS; k++) {
+            if (row[0] == want[k]) {
+                if (found & (1U << k))
+                    return -1;
+                out[k * 3] = row[0];
+                out[k * 3 + 1] = row[1];
+                out[k * 3 + 2] = row[2];
+                found |= 1U << k;
+                break;
+            }
+        }
+    }
+    return found == ((1U << T6041_AON_ROWS) - 1) ? 0 : -1;
+}
 
 static int dt_set_gpu_t6041(void *dt)
 {
@@ -3933,14 +4008,24 @@ static int dt_set_gpu_t6041(void *dt)
         return 0;
     }
 
+    /* Written last, so an older loader or an interrupted fill cannot leave a partial handoff. */
+    int ret = fdt_delprop(dt, gpu, "apple,t6041-handoff-version");
+    if (ret && ret != -FDT_ERR_NOTFOUND)
+        return -1;
+
     size_t touched = 0;
-    int sgx = adt_path_offset(adt, "/arm-io/sgx");
-    u32 count, tables, num_states, len;
-    if (sgx < 0 || ADT_GETPROP(adt, sgx, "perf-state-count", &count) != sizeof(count) ||
+    int sgx_path[8];
+    int sgx = adt_path_offset_trace(adt, "/arm-io/sgx", sgx_path);
+    u32 count, tables, num_states, active_mcc, len;
+    u64 sgx_base;
+    if (sgx < 0 || adt_get_reg(adt, sgx_path, "reg", 0, &sgx_base, NULL) < 0 ||
+        ADT_GETPROP(adt, sgx, "perf-state-count", &count) != sizeof(count) ||
         ADT_GETPROP(adt, sgx, "perf-state-table-count", &tables) != sizeof(tables) ||
         ADT_GETPROP(adt, sgx, "gpu-num-perf-states", &num_states) != sizeof(num_states) ||
-        count != T6040_OPPS || num_states != count - 1 || tables != T6041_CLUSTERS) {
-        printf("FDT: GPU: invalid T6041 raw OPP counts\n");
+        ADT_GETPROP(adt, sgx, "active-mcc-bit-vector", &active_mcc) != sizeof(active_mcc) ||
+        count != T6040_OPPS || num_states != count - 1 || tables != T6041_CLUSTERS || !active_mcc ||
+        (active_mcc & ~0xffU)) {
+        printf("FDT: GPU: invalid T6041 raw OPP or MCC counts\n");
         goto disable;
     }
 
@@ -3970,6 +4055,22 @@ static int dt_set_gpu_t6041(void *dt)
                 aux[j]->states[i].volt > 1300000)
                 goto disable;
     }
+
+    u32 base_pstate = 1;
+    const u32 *base_prop = adt_getprop(adt, sgx, "gpu-perf-base-pstate", &len);
+    if (base_prop) {
+        if (len != sizeof(base_pstate))
+            goto disable;
+        memcpy(&base_pstate, base_prop, sizeof(base_pstate));
+    }
+    if (base_pstate != 1) {
+        printf("FDT: GPU: invalid T6041 gpu-perf-base-pstate\n");
+        goto disable;
+    }
+
+    u32 aon_table[T6041_AON_ROWS * 3];
+    if (t6041_aon_table(aon_table))
+        goto disable;
 
     struct gpu_fw_layout fw;
     if (gpu_fw_layout(sgx, &fw))
@@ -4011,6 +4112,49 @@ static int dt_set_gpu_t6041(void *dt)
         t6040_opp_table(dt, gpu, "apple,afr-opp", aux[1]->count, sizeof(u32)) < 0)
         goto disable;
 
+    /*
+     * The 40-bit core mask and A/B performance-state maps live in SGX MMIO (verified identical
+     * offsets to T6040). Power /arm-io/sgx only around the reads and restore every PMGR mode.
+     */
+    struct pmgr_saved_modes sgx_power;
+    if (pmgr_adt_power_enable_traced_saved("/arm-io/sgx", &sgx_power) < 0)
+        goto disable;
+    u32 masks[3], index_a[16], index_b[16];
+    int read_failed = 0;
+    for (int i = 0; i < 3; i++)
+        read_failed |= t6040_read32(sgx_base + 0xe01500 + 4 * i, &masks[i]);
+    int n = read_failed ? -1 : t6040_perf_map(sgx_base + 0xe01400, index_a);
+    int n_b = n < 0 ? -1 : t6040_perf_map(sgx_base + 0xe01480, index_b);
+    pmgr_restore_modes(&sgx_power);
+    if (n < 0 || n_b != n)
+        goto disable;
+
+    if (masks[2] || (masks[1] >> (T6041_CLUSTERS * T6040_CORES - 32)))
+        goto disable;
+    u64 core_mask = ((u64)masks[1] << 32) | masks[0];
+    u32 active[T6041_CLUSTERS];
+    for (int c = 0; c < T6041_CLUSTERS; c++) {
+        active[c] = __builtin_popcount((u32)((core_mask >> (T6040_CORES * c)) & MASK(T6040_CORES)));
+        if (!active[c])
+            goto disable;
+    }
+
+    for (int i = 2; i < n; i++)
+        if (states[index_a[i]].freq <= states[index_a[i - 1]].freq ||
+            states[index_b[i]].freq <= states[index_b[i - 1]].freq)
+            goto disable;
+
+    u32 freq[T6040_MAP_STATES] = {0};
+    for (int i = 1; i < n; i++)
+        freq[i] = states[index_a[i]].freq / 1000000;
+    u32 rel_b[T6040_OPPS] = {0};
+    u64 span_f = freq[n - 1] - freq[base_pstate];
+    if (!span_f)
+        goto disable;
+    for (int i = 0; i < n; i++)
+        rel_b[i] =
+            i < (int)base_pstate ? 0 : (u32)(100ULL * (freq[i] - freq[base_pstate]) / span_f);
+
     /* Everything is validated. Fill the GPU node, then publish the reserved regions last. */
     int opp;
     u32 i = 0;
@@ -4028,7 +4172,14 @@ static int dt_set_gpu_t6041(void *dt)
         fdt_set_aux_opp(dt, gpu, "apple,afr-opp", aux[1], 1))
         goto disable;
     gpu = fdt_path_offset(dt, "gpu");
-    if (gpu < 0 || firmware_set_fdt(dt, gpu, "apple,firmware-version", &os_firmware))
+    if (gpu < 0 || firmware_set_fdt(dt, gpu, "apple,firmware-version", &os_firmware) ||
+        fdt_setprop_u32(dt, gpu, "apple,active-mcc-bit-vector", active_mcc) ||
+        t6040_set_u32s(dt, gpu, "apple,aon-table", aon_table, ARRAY_SIZE(aon_table)) ||
+        t6040_set_u32s(dt, gpu, "apple,perf-map-a", index_a, count) ||
+        t6040_set_u32s(dt, gpu, "apple,perf-map-b", index_b, count) ||
+        t6040_set_u32s(dt, gpu, "apple,perf-relative-b", rel_b, count) ||
+        fdt_setprop_u32(dt, gpu, "apple,perf-base-pstate", base_pstate) ||
+        fdt_setprop_u64(dt, gpu, "apple,core-mask", core_mask))
         goto disable;
 
     while (touched < ARRAY_SIZE(t6040_regions)) {
@@ -4037,7 +4188,12 @@ static int dt_set_gpu_t6041(void *dt)
             goto disable;
     }
 
-    printf("FDT: GPU: T6041 top state %u MHz, OS firmware %s\n", states[count - 1].freq / 1000000,
+    gpu = fdt_path_offset(dt, "gpu");
+    if (gpu < 0 || fdt_setprop_u32(dt, gpu, "apple,t6041-handoff-version", 1))
+        goto disable;
+
+    printf("FDT: GPU: T6041 cores %u+%u+%u+%u, MCC mask %#x, top state %u MHz, OS firmware %s\n",
+           active[0], active[1], active[2], active[3], active_mcc, states[count - 1].freq / 1000000,
            os_firmware.string);
     return 0;
 
@@ -4051,7 +4207,7 @@ disable:
     gpu = fdt_path_offset(dt, "gpu");
     if (gpu >= 0 && fdt_setprop_string(dt, gpu, "status", "disabled"))
         return -1;
-    printf("FDT: GPU: invalid T6041 ADT data, disabling GPU\n");
+    printf("FDT: GPU: invalid T6041 ADT or SGX data, disabling GPU\n");
     return 0;
 }
 
@@ -4402,7 +4558,7 @@ int dt_set_gpu(void *dt)
             int dcp = fdt_path_offset(dt, "dcp"), len;
             const fdt32_t *profile =
                 dcp < 0 ? NULL : fdt_getprop(dt, dcp, "apple,j613-25g83-profile", &len);
-            /* 27.2 (26B123) firmware: the handoff publication only; it leaves the GPU disabled. */
+            /* 27.2 (26B123) firmware: the handoff publication, and the GPU start when described. */
             if ((profile && len == 4 && fdt32_ld(profile) == 1) || os_firmware.version == V27_2) {
                 t8122_leak_fuse_export(dt);
                 return dt_set_gpu_t8122_26(dt);

@@ -632,6 +632,28 @@ static int dcp6_adt_u32(int node, const char *name, u32 *val)
     return 0;
 }
 
+/*
+ * Panel user-accessible SDR maximum in nits (16.16 fixed point in ADT /backlight-override or
+ * /backlight), or 0 when absent or out of range (1..10000). When /backlight-override carries the
+ * property, its value decides so an invalid override does not fall back to /backlight.
+ */
+static u32 dcp6_adt_max_nits(void)
+{
+    static const char *const paths[] = {"/backlight-override", "/backlight"};
+
+    for (size_t i = 0; i < ARRAY_SIZE(paths); i++) {
+        int bl = adt_path_offset(adt, paths[i]);
+        if (bl < 0 || !adt_getprop(adt, bl, "user-accessible-max-nits", NULL))
+            continue;
+        u32 val;
+        if (dcp6_adt_u32(bl, "user-accessible-max-nits", &val))
+            return 0;
+        u32 nits = val >> 16;
+        return nits && nits <= 10000 ? nits : 0;
+    }
+    return 0;
+}
+
 static int dcp6_adt_u64(int node, const char *name, u64 *val)
 {
     u32 len = 0;
@@ -2563,6 +2585,16 @@ static int dcp6_publish(void *dt, const struct dcp6_dt *n)
         return -1;
     if (dcp6.fw && dcp6.fw->disp0_clocks && dcp6_publish_disp0_clocks(dt, n->dcp))
         return -1;
+    u32 nits = dcp6_adt_max_nits();
+    if (nits) {
+        dcp = fdt_path_offset(dt, n->dcp);
+        if (dcp < 0)
+            return -1;
+        int panel = fdt_subnode_offset(dt, dcp, "panel");
+        if (panel >= 0 && !fdt_getprop(dt, panel, "apple,max-brightness", NULL) &&
+            fdt_setprop_u32(dt, panel, "apple,max-brightness", nits))
+            return -1;
+    }
     return 0;
 }
 
@@ -3565,11 +3597,9 @@ static T6050_INIT int t6050_check_adt(void)
     }
 
     /* The panel's brightness scale, in nits (16.16) */
-    int bl = adt_path_offset(adt, "/backlight-override");
-    if (bl < 0 || dcp6_adt_u32(bl, "user-accessible-max-nits", &val) || !(val >> 16) ||
-        (val >> 16) > 10000)
+    t6050.nits = dcp6_adt_max_nits();
+    if (!t6050.nits)
         bail("no panel user-accessible-max-nits\n");
-    t6050.nits = val >> 16;
 
     int product = adt_path_offset(adt, "/product");
     t6050.gamut = product < 0 ? NULL : adt_getprop(adt, product, "artwork-display-gamut", &len);

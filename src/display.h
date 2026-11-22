@@ -11,6 +11,8 @@ typedef enum _dcp_shutdown_mode {
     DCP_QUIESCED = 0,
     DCP_SLEEP_IF_EXTERNAL = 1,
     DCP_SLEEP = 2,
+    /* T8152: display off, AFK endpoints stopped, RTKit left running for the next owner. */
+    DCP_HANDOFF = 3,
 } dcp_shutdown_mode;
 
 extern bool display_is_external;
@@ -21,6 +23,9 @@ int display_configure(const char *config);
 int display_configure_second(const char *config);
 bool display_second_attempted(void);
 int display_dcp_handoff_state(void);
+u32 display_live_endpoints(const char *adt_path);
+bool display_set_afk_live(const char *val);
+char *display_afk_var(void);
 int display_shutdown(dcp_shutdown_mode mode);
 const display_config_t *display_get_config(void);
 bool display_dart_tables_inherited(void);
