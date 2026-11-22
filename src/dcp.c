@@ -405,6 +405,36 @@ out_running:
     return NULL;
 }
 
+/*
+ * Stop every AFK endpoint but leave RTKit running, with its buffers and DART mappings: the next
+ * owner adopts the running core and starts the endpoints again. An interface whose endpoint
+ * stopped is freed; one that did not stays allocated and keeps its AFK endpoint, so
+ * afk_epic_live_endpoints() still reports it. The AFK context goes once every endpoint has
+ * stopped (afk_epic_shutdown() frees it), and is then no longer referenced. -1 if any did not
+ * stop.
+ */
+int dcp_handoff(dcp_dev_t *dcp)
+{
+    int ret = 0;
+    if (dcp_system_shutdown(dcp->system_ep) < 0)
+        ret = -1;
+    else
+        dcp->system_ep = NULL;
+    if (dcp_dptx_shutdown(dcp->dptx_ep) < 0)
+        ret = -1;
+    else
+        dcp->dptx_ep = NULL;
+    if (dcp_dpav_shutdown(dcp->dpav_ep) < 0)
+        ret = -1;
+    else
+        dcp->dpav_ep = NULL;
+    if (afk_epic_shutdown(dcp->afk) < 0)
+        ret = -1;
+    else
+        dcp->afk = NULL;
+    return ret;
+}
+
 int dcp_shutdown(dcp_dev_t *dcp, bool sleep)
 {
     /* The ASCWrap-v8 sleep path needs a PMGR2 reset, which is not implemented
