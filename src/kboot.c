@@ -12055,6 +12055,8 @@ static int dt_prepare_t8152(void)
         return -1;
     if (dt_set_fb2_t8152())
         return -1;
+    if (dart_reserve_legacy_tables(dt, cur_boot_args.phys_base, cur_boot_args.mem_size))
+        bail("FDT: couldn't reserve inherited display translation tables\n");
     if (dt_set_memory())
         return -1;
     if (fdt_pack(dt))
@@ -12200,9 +12202,6 @@ int kboot_prepare_dt(void *fdt)
 
     if (fdt_add_mem_rsv(dt, (u64)dt, dt_bufsize))
         bail("FDT: couldn't add reservation for the devtree\n");
-
-    if (dart_reserve_legacy_tables(dt, cur_boot_args.phys_base, cur_boot_args.mem_size))
-        bail("FDT: couldn't reserve inherited display translation tables\n");
 
     u64 image_end = (u64)_end;
     if (display_dart_tables_inherited()) {
@@ -12470,6 +12469,13 @@ int kboot_prepare_dt(void *fdt)
         fdt_node_check_compatible(dt, 0, "apple,t6021") == 0 ||
         fdt_node_check_compatible(dt, 0, "apple,t6022") == 0)
         dt_fixup_t6020_compat(dt);
+
+    /*
+     * Emit reservations for any heap L2 tables kept in locked DARTs after all
+     * dt_set_*() handoffs have released or retained their display DARTs.
+     */
+    if (dart_reserve_legacy_tables(dt, cur_boot_args.phys_base, cur_boot_args.mem_size))
+        bail("FDT: couldn't reserve inherited display translation tables\n");
 
     /*
      * Set the /memory node late since we might be allocating from the top of memory

@@ -88,7 +88,11 @@ def extract_if_block(path, if_marker):
     return text[s:text.index("{", s)] + brace_body(text, s)
 
 # Read real bodies and spans so source changes are reflected in the tests.
+BODY_UNTRACK = extract_func(DART_C, r"static void dart_untrack_legacy_l2\s*\(")
+BODY_IS_TRACKED = extract_func(DART_C, r"static bool dart_is_tracked_legacy_l2\s*\(")
 BODY_GET_L2 = extract_func(DART_C, r"static u64 \*dart_get_l2\s*\(")
+BODY_RELEASE_LOCKED = extract_func(DART_C, r"static bool dart_release_locked_l2\s*\(")
+BODY_SHUTDOWN_CHECKED = extract_func(DART_C, r"bool dart_shutdown_checked\s*\(")
 BODY_RESERVE = extract_func(DART_C, r"int dart_reserve_legacy_tables\s*\(")
 BODY_HAS_OWNED = extract_func(RTKIT_C, r"bool rtkit_has_owned_buffers\s*\(")
 DCP_IFBOOTED = extract_if_block(DCP_C, "if (!booted) {")
@@ -102,13 +106,126 @@ _text = _read(DCP_C)
 _or = _text.index("out_running:")
 _ret = _text.index("return NULL;", _or)
 DCP_LABELS = _text[_text.index("out_afk:"):_ret + len("return NULL;")]
-# verbatim kboot guard (the two lines that call the reserve + bail)
-KBOOT_GUARD = extract_span(
-    KBOOT_C,
-    "if (dart_reserve_legacy_tables(dt, cur_boot_args.phys_base, cur_boot_args.mem_size))",
-    'bail("FDT: couldn\'t reserve inherited display translation tables\\n");',
-    include_end=True,
-)
+
+KBOOT_GUARD_START = "if (dart_reserve_legacy_tables(dt, cur_boot_args.phys_base, cur_boot_args.mem_size))"
+KBOOT_GUARD_END = 'bail("FDT: couldn\'t reserve inherited display translation tables\\n");'
+
+
+def _strip_c_comments(text):
+    """Replace C block and line comments with spaces while preserving strings."""
+    out = []
+    i = 0
+    n = len(text)
+    while i < n:
+        c = text[i]
+        if c == '"' or c == "'":
+            quote = c
+            out.append(c)
+            i += 1
+            while i < n:
+                ch = text[i]
+                out.append(ch)
+                i += 1
+                if ch == "\\" and i < n:
+                    out.append(text[i])
+                    i += 1
+                elif ch == quote:
+                    break
+        elif c == "/" and i + 1 < n and text[i + 1] == "/":
+            while i < n and text[i] != "\n":
+                out.append(" ")
+                i += 1
+        elif c == "/" and i + 1 < n and text[i + 1] == "*":
+            out.append("  ")
+            i += 2
+            while i + 1 < n and not (text[i] == "*" and text[i + 1] == "/"):
+                out.append("\n" if text[i] == "\n" else " ")
+                i += 1
+            if i + 1 < n:
+                out.append("  ")
+                i += 2
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
+
+
+def _depth1_code(func_body):
+    """Return only characters at brace depth 1 inside a brace-delimited function body."""
+    out = []
+    depth = 0
+    i = 0
+    n = len(func_body)
+    while i < n:
+        c = func_body[i]
+        if c == '"' or c == "'":
+            quote = c
+            if depth == 1:
+                out.append(c)
+            i += 1
+            while i < n:
+                ch = func_body[i]
+                if depth == 1:
+                    out.append(ch)
+                i += 1
+                if ch == "\\" and i < n:
+                    if depth == 1:
+                        out.append(func_body[i])
+                    i += 1
+                elif ch == quote:
+                    break
+            continue
+        if c == "{":
+            depth += 1
+            if depth == 1:
+                out.append(c)
+        elif c == "}":
+            if depth == 1:
+                out.append(c)
+            depth -= 1
+        elif depth == 1:
+            out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def extract_kboot_reserve_guards(kboot_text):
+    """Find every function in kboot.c that calls dt_set_memory() and verify each
+    unconditionally runs the dart_reserve_legacy_tables() + bail guard before it."""
+    stripped = _strip_c_comments(kboot_text)
+    guards = {}
+    func_re = re.compile(r"^(?:static\s+)?[a-zA-Z_][\w\s\*]*?\b([a-zA-Z_]\w*)\s*\([^;{}]*\)\s*\n?\{", re.M)
+    for m in func_re.finditer(stripped):
+        name = m.group(1)
+        body_start = m.end() - 1
+        body = brace_body(stripped, body_start)
+        if not re.search(r"\bdt_set_memory\s*\(", body):
+            continue
+        top = _depth1_code(body)
+        mem_m = re.search(r"\bdt_set_memory\s*\(", top)
+        if not mem_m:
+            raise AssertionError(
+                f"{name}() calls dt_set_memory() inside a nested block without top-level guard check"
+            )
+        prefix = top[:mem_m.start()]
+        if KBOOT_GUARD_START not in prefix:
+            raise AssertionError(
+                f"{name}() calls dt_set_memory() without calling dart_reserve_legacy_tables() before it"
+            )
+        g_start = prefix.index(KBOOT_GUARD_START)
+        if KBOOT_GUARD_END not in prefix[g_start:]:
+            raise AssertionError(
+                f"{name}() calls dart_reserve_legacy_tables() without the expected bail() before dt_set_memory()"
+            )
+        g_end = prefix.index(KBOOT_GUARD_END, g_start) + len(KBOOT_GUARD_END)
+        guards[name] = prefix[g_start:g_end]
+    for required in ("dt_prepare_t8152", "kboot_prepare_dt"):
+        if required not in guards:
+            raise AssertionError(f"expected dt_set_memory() caller {required}() not found in kboot.c")
+    return guards
+
+
+KBOOT_GUARDS = extract_kboot_reserve_guards(_read(KBOOT_C))
 
 # ---------------------------------------------------------------------------
 # shared C preamble (aura-faithful macros/types)
@@ -119,8 +236,9 @@ PRE = r"""
 #include <stdlib.h>
 #include <stddef.h>
 #include <stdbool.h>
-typedef uint8_t u8; typedef uint16_t u16; typedef uint32_t u32; typedef uint64_t u64;
-typedef int32_t s32; typedef int64_t s64;
+/* Match aura's aarch64 LP64 u64 (unsigned long) so %lx format checks pass on macOS too. */
+typedef uint8_t u8; typedef uint16_t u16; typedef uint32_t u32; typedef unsigned long u64;
+typedef int32_t s32; typedef long s64;
 #define BIT(x)                 (1UL << (x))
 #define GENMASK(msb, lsb)      ((BIT((msb + 1) - (lsb)) - 1) << (lsb))
 #define _FIELD_LSB(field)      ((field) & ~(field - 1))
@@ -146,6 +264,8 @@ struct dart_dev;
 struct dart_params { int ttbr_count; u64 offset_mask; void (*tlb_invalidate)(struct dart_dev *); };
 typedef struct dart_dev {
     bool locked; bool keep; bool legacy_mutable;
+    uintptr_t regs;
+    u8 device;
     struct dart_params *params;
     u64 *l1[DART_MAX_TTBR_COUNT];
 } dart_dev_t;
@@ -247,6 +367,36 @@ int main(void) {
     CHECK(g_free_calls == frA, "get_l2.handles.no_frees_across_handles");
     (void)before;
 
+    /* (6) locked-only DART (legacy_mutable = false, locked = true): e.g. writable locked Gen3 */
+    static u64 l1C[2048];
+    dart_dev_t C = { .locked = true, .keep = true, .legacy_mutable = false,
+                     .regs = 0x2f0000000UL, .device = 23, .params = &P };
+    C.l1[0] = l1C;
+    size_t c6 = legacy_l2_count; int ma6 = g_memalign_calls, fr6 = g_free_calls;
+    u64 *tc = dart_get_l2(&C, 3);
+    CHECK(tc != NULL, "get_l2.locked_only.alloc_returns_table");
+    CHECK(legacy_l2_count == c6 + 1, "get_l2.locked_only.count_incremented");
+    CHECK(legacy_l2_pages[legacy_l2_count - 1] == (u64)tc, "get_l2.locked_only.page_recorded");
+    CHECK((l1C[3] & DART_PTE_VALID) != 0 && decode(l1C[3]) == (u64)tc, "get_l2.locked_only.published");
+    CHECK(in_record((u64)tc), "get_l2.locked_only.published_implies_recorded");
+    CHECK(g_free_calls == fr6 && g_memalign_calls == ma6 + 1, "get_l2.locked_only.one_alloc_no_free");
+
+    /* locked-only overflow: cap is enforced without allocating or publishing */
+    size_t saved6 = legacy_l2_count; legacy_l2_count = LEGACY_L2_MAX_PAGES;
+    int ma6_of = g_memalign_calls;
+    CHECK(dart_get_l2(&C, 4) == NULL, "get_l2.locked_only.overflow_returns_null");
+    CHECK((l1C[4] & DART_PTE_VALID) == 0, "get_l2.locked_only.overflow_not_published");
+    CHECK(g_memalign_calls == ma6_of, "get_l2.locked_only.overflow_no_alloc");
+    legacy_l2_count = saved6;
+
+    /* locked-only round-trip reject: unencodable phys -> free + NULL, not recorded or published */
+    g_force_phys = 0x10000000000UL;
+    size_t c6_rt = legacy_l2_count; int fr6_rt = g_free_calls;
+    CHECK(dart_get_l2(&C, 5) == NULL, "get_l2.locked_only.roundtrip_rejects");
+    CHECK(legacy_l2_count == c6_rt, "get_l2.locked_only.roundtrip_not_recorded");
+    CHECK((l1C[5] & DART_PTE_VALID) == 0, "get_l2.locked_only.roundtrip_not_published");
+    CHECK(g_free_calls == fr6_rt + 1, "get_l2.locked_only.roundtrip_frees_rejected");
+
     printf("RESULT %d %d\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }
@@ -266,8 +416,8 @@ static size_t legacy_l2_count;
 """ + BODY_RESERVE + r"""
 
 #define DRAM_BASE 0x800000000UL
-static char big[65536];
-static char small[256];
+_Alignas(8) static char big[65536];
+_Alignas(8) static char small[256];
 
 static void fresh(void *buf, int sz) { int r = fdt_create_empty_tree(buf, sz); if (r) { printf("FATAL fdt_create_empty_tree=%d\n", r); exit(2);} }
 static void set_pages(const u64 *p, size_t n) { legacy_l2_count = n; for (size_t i = 0; i < n; i++) legacy_l2_pages[i] = p[i]; }
@@ -350,7 +500,7 @@ int main(void) {
 """
 
 # ---------------------------------------------------------------------------
-# C3 : kboot caller contract -- verbatim guard + verbatim bail macro
+# C3 : kboot caller contract -- verbatim guards from EVERY dt_set_memory() path
 # ---------------------------------------------------------------------------
 C_KBOOT = PRE + r"""
 /* verbatim aura bail() macro (src/kboot.c) */
@@ -360,33 +510,47 @@ C_KBOOT = PRE + r"""
         return -1;                                                                                 \
     } while (0)
 
-static int   g_reached_after = 0;
+static int   g_seq = 0;
+static int   g_reserve_seq = 0, g_set_memory_seq = 0;
 static u64   g_seen_base = 0, g_seen_size = 0;
 static int   g_reserve_ret = 0;
-static int dart_reserve_legacy_tables(void *dt, u64 b, u64 s) { (void)dt; g_seen_base = b; g_seen_size = s; return g_reserve_ret; }
+static int dart_reserve_legacy_tables(void *dt, u64 b, u64 s) {
+    (void)dt; g_seen_base = b; g_seen_size = s; g_reserve_seq = ++g_seq; return g_reserve_ret;
+}
+static int dt_set_memory(void) { g_set_memory_seq = ++g_seq; return 0; }
 static struct { u64 phys_base; u64 mem_size; } cur_boot_args = { 0xAAAA0000UL, 0xBBBB0000UL };
 static void *dt = (void *)0x1234;
 
-static int prepare_dt(void) {
-""" + "    " + KBOOT_GUARD + r"""
-    g_reached_after = 1;
-    return 0;
+static int prepare_dt_main(void) {
+""" + "    " + KBOOT_GUARDS["kboot_prepare_dt"] + r"""
+    return dt_set_memory();
 }
 
-int main(void) {
-    /* reserve fails -> caller bails: returns -1 and code AFTER the guard never runs */
-    g_reserve_ret = -1; g_reached_after = 0;
-    int r = prepare_dt();
-    CHECK(r == -1, "kboot.bail.returns_-1_on_reserve_failure");
-    CHECK(g_reached_after == 0, "kboot.bail.aborts_before_rest_of_prepare_dt");
+static int prepare_dt_t8152(void) {
+""" + "    " + KBOOT_GUARDS["dt_prepare_t8152"] + r"""
+    return dt_set_memory();
+}
+
+static void check_path(const char *tag, int (*fn)(void)) {
+    /* reserve fails -> caller bails: returns -1 and dt_set_memory() never runs */
+    g_reserve_ret = -1; g_seq = g_reserve_seq = g_set_memory_seq = 0;
+    g_seen_base = g_seen_size = 0;
+    int r = fn();
+    CHECK(r == -1, tag);
+    CHECK(g_set_memory_seq == 0, "kboot.bail.aborts_before_dt_set_memory");
     CHECK(g_seen_base == cur_boot_args.phys_base, "kboot.args.phys_base_threaded");
     CHECK(g_seen_size == cur_boot_args.mem_size, "kboot.args.mem_size_threaded");
 
-    /* reserve ok -> prepare_dt continues past the guard */
-    g_reserve_ret = 0; g_reached_after = 0;
-    r = prepare_dt();
+    /* reserve ok -> dart_reserve_legacy_tables() runs strictly before dt_set_memory() */
+    g_reserve_ret = 0; g_seq = g_reserve_seq = g_set_memory_seq = 0;
+    r = fn();
     CHECK(r == 0, "kboot.ok.continues");
-    CHECK(g_reached_after == 1, "kboot.ok.reaches_rest_of_prepare_dt");
+    CHECK(g_reserve_seq == 1 && g_set_memory_seq == 2, "kboot.ok.reserve_before_dt_set_memory");
+}
+
+int main(void) {
+    check_path("kboot.main.bail", prepare_dt_main);
+    check_path("kboot.t8152.bail", prepare_dt_t8152);
 
     printf("RESULT %d %d\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
@@ -483,6 +647,157 @@ int main(void) {
 """
 
 # ---------------------------------------------------------------------------
+# C5 : locked-only DART (legacy_mutable=false, locked=true, e.g. Gen3) end-to-end
+#      allocate -> shutdown -> libfdt reserve + pool-full fallback diagnostic
+# ---------------------------------------------------------------------------
+C_LOCKED_SHUTDOWN = PRE + r"""
+#include <string.h>
+#include "libfdt.h"
+#define DART_PTE_OFFSET_SHIFT     14
+#define DART_PTE_VALID            BIT(0)
+#define DART_MAX_TTBR_COUNT 4
+#define LEGACY_L2_MAX_PAGES 32
+/* 52-bit host-safe offset mask so static aligned pages round-trip on Linux & macOS */
+#define HOST_PTE_OFFSET           GENMASK(51, 14)
+
+struct dart_dev;
+struct dart_params {
+    int ttbr_count;
+    u64 offset_mask;
+    u32 tcr_disabled;
+    void (*tlb_invalidate)(struct dart_dev *);
+};
+typedef struct dart_dev {
+    bool failed;
+    bool locked;
+    bool keep;
+    bool legacy_mutable;
+    uintptr_t regs;
+    u8 device;
+    const struct dart_params *params;
+    u64 *l1[DART_MAX_TTBR_COUNT];
+} dart_dev_t;
+
+static u64 legacy_l2_pages[LEGACY_L2_MAX_PAGES];
+static size_t legacy_l2_count;
+
+static u64 l2_pool[4][SZ_16K / 8] __attribute__((aligned(SZ_16K)));
+static u64 l1_root[2048];
+static size_t g_pool_next = 0;
+static int g_l2_frees = 0, g_tlbi_calls = 0;
+
+static bool is_heap(const void *p) {
+    return (const u8 *)p >= (const u8 *)l2_pool &&
+           (const u8 *)p < (const u8 *)l2_pool + sizeof(l2_pool);
+}
+static void *mock_memalign(size_t a, size_t s) {
+    (void)a; (void)s;
+    if (g_pool_next >= 4)
+        return NULL;
+    return l2_pool[g_pool_next++];
+}
+static void mock_free(void *p) {
+    if (!p)
+        return;
+    if (is_heap(p)) {
+        g_l2_frees++;
+        return;
+    }
+    free(p);
+}
+static void write32(u64 a, u32 v) { (void)a; (void)v; }
+#define DART_TCR(d)     ((void)(d), 0UL)
+#define DART_TTBR(d, i) ((void)(d), (void)(i), 0UL)
+
+#define memalign mock_memalign
+#define free     mock_free
+
+""" + BODY_UNTRACK + "\n" + BODY_IS_TRACKED + "\n" + BODY_GET_L2 + "\n" + BODY_RELEASE_LOCKED + "\n" + BODY_SHUTDOWN_CHECKED + "\n" + BODY_RESERVE + r"""
+
+#undef memalign
+#undef free
+
+static void mock_tlbi(dart_dev_t *dart) { (void)dart; g_tlbi_calls++; }
+static const struct dart_params P_HOST = {
+    .ttbr_count = 1,
+    .offset_mask = HOST_PTE_OFFSET,
+    .tcr_disabled = 0,
+    .tlb_invalidate = mock_tlbi,
+};
+_Alignas(8) static char fdt_buf[65536];
+
+static void reset_state(void) {
+    legacy_l2_count = 0;
+    memset(legacy_l2_pages, 0, sizeof(legacy_l2_pages));
+    memset(l2_pool, 0, sizeof(l2_pool));
+    memset(l1_root, 0, sizeof(l1_root));
+    g_pool_next = 0;
+    g_l2_frees = 0;
+    g_tlbi_calls = 0;
+}
+
+static dart_dev_t *make_locked_gen3(void) {
+    dart_dev_t *d = calloc(1, sizeof(*d));
+    d->locked = true;
+    d->keep = true;
+    d->legacy_mutable = false;
+    d->regs = 0x2f0000000UL;
+    d->device = 23;
+    d->params = &P_HOST;
+    d->l1[0] = l1_root;
+    return d;
+}
+
+int main(void) {
+    /* (1) locked-only DART with mapped L2: tracked on alloc, kept on shutdown, reserved in FDT */
+    reset_state();
+    dart_dev_t *d = make_locked_gen3();
+    u64 *l2 = dart_get_l2(d, 2);
+    CHECK(l2 != NULL, "locked_shutdown.mapped.alloc_ok");
+    CHECK(legacy_l2_count == 1 && legacy_l2_pages[0] == (u64)l2, "locked_shutdown.mapped.tracked_on_alloc");
+    l2[0] = DART_PTE_VALID;
+    CHECK(dart_shutdown_checked(d), "locked_shutdown.mapped.shutdown_ok");
+    CHECK((l1_root[2] & DART_PTE_VALID) != 0, "locked_shutdown.mapped.l1_kept");
+    CHECK(g_l2_frees == 0, "locked_shutdown.mapped.not_freed");
+    CHECK(legacy_l2_count == 1 && legacy_l2_pages[0] == (u64)l2, "locked_shutdown.mapped.stays_tracked");
+    CHECK(fdt_create_empty_tree(fdt_buf, sizeof(fdt_buf)) == 0, "locked_shutdown.mapped.fdt_init");
+    CHECK(dart_reserve_legacy_tables(fdt_buf, (u64)l2_pool, sizeof(l2_pool)) == 0,
+          "locked_shutdown.mapped.reserve_ok");
+    CHECK(fdt_num_mem_rsv(fdt_buf) == 1, "locked_shutdown.mapped.one_rsv");
+    uint64_t raddr = 0, rsize = 0;
+    fdt_get_mem_rsv(fdt_buf, 0, &raddr, &rsize);
+    CHECK(raddr == (uint64_t)(uintptr_t)l2 && rsize == SZ_16K, "locked_shutdown.mapped.rsv_matches_l2");
+
+    /* (2) locked-only DART with empty L2: unlinked, TLBI'd, untracked and freed on shutdown */
+    reset_state();
+    d = make_locked_gen3();
+    u64 *l2e = dart_get_l2(d, 5);
+    CHECK(l2e != NULL && legacy_l2_count == 1, "locked_shutdown.empty.tracked_on_alloc");
+    CHECK(dart_shutdown_checked(d), "locked_shutdown.empty.shutdown_ok");
+    CHECK(g_tlbi_calls == 1, "locked_shutdown.empty.one_tlbi");
+    CHECK(l1_root[5] == 0, "locked_shutdown.empty.l1_cleared");
+    CHECK(g_l2_frees == 1, "locked_shutdown.empty.freed");
+    CHECK(legacy_l2_count == 0, "locked_shutdown.empty.untracked");
+
+    /* (3) untracked mapped heap L2 when pool is full: fails closed and logs diagnostic */
+    reset_state();
+    for (size_t i = 0; i < LEGACY_L2_MAX_PAGES; i++)
+        legacy_l2_pages[i] = 0x800000000UL + (u64)i * SZ_16K;
+    legacy_l2_count = LEGACY_L2_MAX_PAGES;
+    d = make_locked_gen3();
+    l2_pool[1][0] = DART_PTE_VALID;
+    l1_root[6] = FIELD_PREP(HOST_PTE_OFFSET, ((u64)l2_pool[1]) >> DART_PTE_OFFSET_SHIFT) | DART_PTE_VALID;
+    CHECK(!dart_shutdown_checked(d), "locked_shutdown.pool_full.fails_closed");
+    CHECK((l1_root[6] & DART_PTE_VALID) != 0 && g_l2_frees == 0, "locked_shutdown.pool_full.table_kept");
+    CHECK(legacy_l2_count == LEGACY_L2_MAX_PAGES, "locked_shutdown.pool_full.count_capped");
+    free(d);
+
+    printf("RESULT %d %d\n", g_pass, g_fail);
+    return g_fail ? 1 : 0;
+}
+"""
+
+# ---------------------------------------------------------------------------
 # build + run
 # ---------------------------------------------------------------------------
 def build_run(name, src, extra_srcs=(), includes=()):
@@ -530,15 +845,16 @@ def _fdt_srcs():
     return [os.path.join(LIBFDT, x) for x in
             ("fdt.c", "fdt_ro.c", "fdt_rw.c", "fdt_wip.c", "fdt_sw.c", "fdt_empty_tree.c", "fdt_strerror.c")]
 
-CASE_NAMES = ["c1_get_l2", "c2_reserve", "c3_kboot", "c4_dcp"]
+CASE_NAMES = ["c1_get_l2", "c2_reserve", "c3_kboot", "c4_dcp", "c5_locked_shutdown"]
 
 def _case(name):
     # name -> (C source, extra link srcs, include dirs)
     return {
-        "c1_get_l2": (C_GET_L2, (), ()),
-        "c2_reserve": (C_RESERVE, tuple(_fdt_srcs()), (LIBFDT,)),
-        "c3_kboot":  (C_KBOOT, (), ()),
-        "c4_dcp":    (C_DCP, (), ()),
+        "c1_get_l2":          (C_GET_L2, (), ()),
+        "c2_reserve":         (C_RESERVE, tuple(_fdt_srcs()), (LIBFDT,)),
+        "c3_kboot":           (C_KBOOT, (), ()),
+        "c4_dcp":             (C_DCP, (), ()),
+        "c5_locked_shutdown": (C_LOCKED_SHUTDOWN, tuple(_fdt_srcs()), (LIBFDT,)),
     }[name]
 
 # ---- pytest entry points (so CI actually runs the harness, incl. macos matrix) ----
@@ -557,6 +873,54 @@ def test_actual_body(name):
     fails = [l for l in r["lines"] if l.startswith("FAIL")]
     assert r["fail"] == 0, "assertion failures:\n" + "\n".join(fails)
 
+
+def test_kboot_every_dt_set_memory_path_reserves():
+    kboot_text = _read(KBOOT_C)
+    guards = extract_kboot_reserve_guards(kboot_text)
+    assert "dt_prepare_t8152" in guards and "kboot_prepare_dt" in guards
+
+    # Mutate dt_prepare_t8152() to drop its reservation guard -> must fail.
+    t8152_body = extract_func(KBOOT_C, r"static int dt_prepare_t8152\s*\(")
+    assert guards["dt_prepare_t8152"] in t8152_body
+    mutated_drop_t8152 = kboot_text.replace(
+        t8152_body, t8152_body.replace(guards["dt_prepare_t8152"], "", 1), 1
+    )
+    with pytest.raises(AssertionError, match="dt_prepare_t8152"):
+        extract_kboot_reserve_guards(mutated_drop_t8152)
+
+    # Mutate dt_prepare_t8152() to run dart_reserve_legacy_tables() AFTER dt_set_memory() -> must fail.
+    mem_stmt = "    if (dt_set_memory())\n        return -1;"
+    assert mem_stmt in t8152_body
+    reordered_body = t8152_body.replace(guards["dt_prepare_t8152"], "", 1).replace(
+        mem_stmt, mem_stmt + "\n    " + guards["dt_prepare_t8152"], 1
+    )
+    mutated_after_t8152 = kboot_text.replace(t8152_body, reordered_body, 1)
+    with pytest.raises(AssertionError, match="dt_prepare_t8152"):
+        extract_kboot_reserve_guards(mutated_after_t8152)
+
+    # Mutate kboot_prepare_dt() to drop its reservation guard -> must fail.
+    main_body = extract_func(KBOOT_C, r"int kboot_prepare_dt\s*\(")
+    assert guards["kboot_prepare_dt"] in main_body
+    mutated_drop_main = kboot_text.replace(
+        main_body, main_body.replace(guards["kboot_prepare_dt"], "", 1), 1
+    )
+    with pytest.raises(AssertionError, match="kboot_prepare_dt"):
+        extract_kboot_reserve_guards(mutated_drop_main)
+
+
+@pytest.mark.skipif(CC is None, reason="no C compiler (cc/clang/gcc) on PATH")
+def test_pool_full_diagnostics():
+    for name, needle in (
+        ("c1_get_l2", "legacy L2 reservation pool full"),
+        ("c5_locked_shutdown", "legacy L2 reservation pool full"),
+    ):
+        src, extra, inc = _case(name)
+        r = build_run("diag_" + name, src, extra_srcs=extra, includes=inc)
+        assert _ok(r), r
+        out = "\n".join(r["lines"])
+        assert needle in out, f"{name} did not log {needle!r}:\n{out}"
+
+
 @pytest.mark.skipif(CC is None, reason="no C compiler (cc/clang/gcc) on PATH")
 def test_mutants_all_killed():
     k, n = run_mutants()
@@ -573,6 +937,10 @@ def run_mutants():
         # name, template, find, replace, extra_srcs, includes
         ("get_l2: drop the record write", C_GET_L2,
          "legacy_l2_pages[legacy_l2_count++] = (u64)tbl;", "(void)0;", (), ()),
+        ("get_l2: drop || dart->locked", C_GET_L2,
+         "dart->legacy_mutable || dart->locked", "dart->legacy_mutable", (), ()),
+        ("locked_shutdown: drop || dart->locked", C_LOCKED_SHUTDOWN,
+         "dart->legacy_mutable || dart->locked", "dart->legacy_mutable", fdt_srcs, (LIBFDT,)),
         ("get_l2: overflow off-by-one (>= -> >)", C_GET_L2,
          "legacy_l2_count >= LEGACY_L2_MAX_PAGES", "legacy_l2_count > LEGACY_L2_MAX_PAGES", (), ()),
         # runtime wrong-free: keep the free (so mock_free stays referenced and the
