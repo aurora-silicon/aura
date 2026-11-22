@@ -187,6 +187,9 @@ static u32 asc_cpu_status(asc_dev_t *a) { return 0x6a; }
 static bool rtkit_quiesce(rtkit_dev_t *r) { assert(r); quiesces++; return true; }
 static void rtkit_free(rtkit_dev_t *r) {}
 static void pmgr_reset(u8 die, const char *name) { resets++; event('R'); }
+/* The post-M4 start from off always works here (rtkit_boot_warm()), so it is never retried. */
+static bool rtkit_has_owned_buffers(const rtkit_dev_t *r) { return false; }
+static int pmgr_reset_held(u8 die, const char *name) { assert(0); return -1; }
 static int poll32(u64 a, u32 mask, u32 value, unsigned timeout) { return 0; }
 static bool nvme_ctrl_disable(void)
 { disable_calls++; return failure != 2 && !(shutdown_fault == 4 && disable_calls == 2); }

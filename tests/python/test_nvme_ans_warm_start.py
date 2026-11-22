@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: GPL-2.0-only
 """A post-M4 ANS started from off: stale messages in the receive mailbox are dropped before the run
-bit, and a failed start says which step failed."""
+bit, a start that fails is made again from a reset ANS (warm, then cold, then after a power cycle),
+and a failed start says which step failed."""
 
 from pathlib import Path
 import os
@@ -11,19 +12,25 @@ import pytest
 from host_compiler import host_cc
 
 CASES = {
-    # name: (stale messages, power on fails, SART fails, handshake fails, BOOT_STATUS fails, expected)
-    "clean": (0, 0, 0, 0, 0, "ok drained=0 boots=1"),
-    "stale-at-start": (3, 0, 0, 0, 0, "ok drained=3 boots=1"),
-    "power-on-fails": (0, 1, 0, 0, 0, "fail drained=0 boots=0 why=power"),
-    "sart-fails": (0, 0, 1, 0, 0, "fail drained=0 boots=0 why=sart"),
-    "no-handshake": (0, 0, 0, 1, 0, "fail drained=0 boots=1 why=handshake"),
-    "boot-status": (0, 0, 0, 0, 1, "fail drained=0 boots=1 why=boot_status"),
+    # name: (stale messages, power on fails, SART fails, failed warm handshakes, failed BOOT_STATUS
+    #        polls, failed cold starts, reset fails, buffers granted, expected)
+    "clean": (0, 0, 0, 0, 0, 0, 0, 0, "ok drained=0 boots=1 resets=0 cycles=0"),
+    "stale-at-start": (3, 0, 0, 0, 0, 0, 0, 0, "ok drained=3 boots=1 resets=0 cycles=0"),
+    "power-on-fails": (0, 1, 0, 0, 0, 0, 0, 0, "fail drained=0 boots=0 resets=0 cycles=0 why=power"),
+    "sart-fails": (0, 0, 1, 0, 0, 0, 0, 0, "fail drained=0 boots=0 resets=0 cycles=0 why=sart"),
+    "warm-after-reset": (0, 0, 0, 1, 0, 0, 0, 0, "ok drained=0 boots=2 resets=1 cycles=0"),
+    "boot-status-after-reset": (0, 0, 0, 0, 1, 0, 0, 0, "ok drained=0 boots=2 resets=1 cycles=0"),
+    "cold-after-reset": (0, 0, 0, 99, 0, 0, 0, 0, "ok drained=0 boots=3 resets=2 cycles=0"),
+    "after-power-cycle": (0, 0, 0, 99, 0, 1, 0, 0, "ok drained=0 boots=5 resets=4 cycles=1"),
+    "never": (0, 0, 0, 99, 0, 99, 0, 0, "fail drained=0 boots=5 resets=4 cycles=1 why=cold"),
+    "reset-fails": (0, 0, 0, 1, 0, 0, 1, 0, "fail drained=0 boots=1 resets=1 cycles=0 why=reset"),
+    "buffers-granted": (0, 0, 0, 1, 0, 0, 0, 1, "fail drained=0 boots=1 resets=0 cycles=0 why=buffers"),
 }
 
 
 @pytest.mark.parametrize("case", sorted(CASES))
 def test_ans_warm_start(tmp_path, case):
-    stale, pwr, sart, hs, bs, expected = CASES[case]
+    stale, pwr, sart, hs, bs, cs, rst, own, expected = CASES[case]
     source = Path(os.environ.get("NVME_SOURCE", Path(__file__).resolve().parents[2] / "src/nvme.c")).read_text()
     start = source.index("/*\n * Discard what an earlier owner left in the receive mailbox")
     body = source[start:source.index("/* A write or flush, timed:")]
@@ -53,7 +60,9 @@ static sart_dev_t *nvme_sart = &sart;
 static struct sart_entry nvme_sart_saved[16];
 static int nvme_sart_saved_cnt = 9;
 static u64 nvme_base, nvme_boot_ticks;
-static int stale = @STALE@, drained, boots;
+static u8 nvme_die;
+static int stale = @STALE@, drained, boots, resets, cycles;
+static int warm_fails = @HS@, poll_fails = @BS@, cold_fails = @CS@;
 static const char *why = "";
 static u64 get_ticks(void) { return 1; }
 static u32 read32(u64 a) { return 0; }
@@ -69,23 +78,45 @@ static bool asc_recv(asc_dev_t *a, struct asc_message *m)
 static int pcie_ans_power_on(void) { if (@PWR@) why = "power"; return @PWR@; }
 static bool sart_set_entries(sart_dev_t *s, const struct sart_entry *e, int n)
 { if (@SART@) why = "sart"; return !@SART@; }
+static int pcie_ans_power_off(void) { cycles++; return 0; }
 static bool rtkit_boot_warm(rtkit_dev_t *r, u32 mask)
 {
     boots++;
     /* A queued message is read in place of HELLO. */
-    if (stale || @HS@) { why = "handshake"; return false; }
+    if (stale || warm_fails) { warm_fails -= !stale; why = "handshake"; return false; }
     return true;
 }
-static int poll32(u64 a, u32 m, u32 v, unsigned t) { if (@BS@) why = "boot_status"; return @BS@ ? -1 : 0; }
+static bool rtkit_boot(rtkit_dev_t *r)
+{
+    boots++;
+    if (cold_fails) { cold_fails--; why = "cold"; return false; }
+    return true;
+}
+static bool rtkit_has_owned_buffers(const rtkit_dev_t *r) { if (@OWN@) why = "buffers"; return @OWN@; }
+static void rtkit_stop(rtkit_dev_t *r) {}
+static void rtkit_free(rtkit_dev_t *r) {}
+static rtkit_dev_t *rtkit_init(const char *n, asc_dev_t *a, void *m, void *h, sart_dev_t *s, bool f)
+{ return &rtkit; }
+static int pmgr_reset_held(int die, const char *name)
+{ resets++; if (@RST@) why = "reset"; return @RST@; }
+static int poll32(u64 a, u32 m, u32 v, unsigned t)
+{
+    if (!poll_fails)
+        return 0;
+    poll_fails--; why = "boot_status";
+    return -1;
+}
 ''' + body + r'''
 int main(void)
 {
     bool ok = nvme_ans_power_on();
-    printf("%s drained=%d boots=%d%s%s\n", ok ? "ok" : "fail", drained, boots, *why ? " why=" : "", why);
+    printf("%s drained=%d boots=%d resets=%d cycles=%d%s%s\n", ok ? "ok" : "fail", drained, boots,
+           resets, cycles, ok ? "" : " why=", ok ? "" : why);
     return 0;
 }
 '''
-    for k, v in (("@STALE@", stale), ("@PWR@", pwr), ("@SART@", sart), ("@HS@", hs), ("@BS@", bs)):
+    for k, v in (("@STALE@", stale), ("@PWR@", pwr), ("@SART@", sart), ("@HS@", hs), ("@BS@", bs),
+                 ("@CS@", cs), ("@RST@", rst), ("@OWN@", own)):
         harness = harness.replace(k, str(v))
     c = tmp_path / "t.c"
     c.write_text(harness)
