@@ -65,6 +65,7 @@ static int dart_map(dart_dev_t *d, unsigned long iova, void *pa, size_t size)
 }
 static u64 dart_find_iova(dart_dev_t *d, s64 start, size_t size) { (void)d; (void)size; return start; }
 static u64 dart_vm_base(dart_dev_t *d) { (void)d; return 0; }
+static u64 dart_dva_base(dart_dev_t *d) { (void)d; return 0; }
 static void reset(void)
 {
     disp = (dart_dev_t){.id = 0, .params = &params};
@@ -125,6 +126,10 @@ int main(void)
     assert "dart_unmap(" not in configure
     # Every IOVA release in the modeset sits behind a confirmed unmap.
     assert re.search(r"if \(display_unmap_fb\(tmp_dva, size\)\)\n\s+iova_free\(dcp->iovad_dcp, "
-                     r"tmp_dva, size\);", configure)
+                     r"tmp_dva(?: & ~dart_dva_base\(dcp->dart_dcp\))?, size\);", configure)
     old = configure.index("if (!display_unmap_fb(fb_dva, fb_size))")
-    assert old < configure.index("iova_free(dcp->iovad_dcp, fb_dva, fb_size)")
+    free_old = re.search(
+        r"iova_free\(dcp->iovad_dcp, fb_dva(?: & ~dart_dva_base\(dcp->dart_dcp\))?, fb_size\)",
+        configure,
+    )
+    assert free_old and old < free_old.start()

@@ -36,9 +36,18 @@ typedef unsigned long u64; /* as in aura: printed as long */
 #define UNUSED(x) (void)(x)
 #define FB_DEPTH_FLAG_RETINA 0x10000
 %(chips)s
-enum fw_version { V15_0B1 = 1, V_UNKNOWN = 2 };
+enum fw_version { V15_0B1 = 1, V27_2 = 2, V_UNKNOWN = 3 };
 #define FW_MAX V_UNKNOWN
-typedef struct { const char *dcp, *dcp_dart, *disp_dart; } display_config_t;
+typedef struct {
+    const char *dcp, *dcp_dart, *disp_dart, *dp2hdmi_gpio, *dptx_phy;
+} display_config_t;
+static const display_config_t display_config_t8132_hdmi_ext = {
+    .dcp = "/arm-io/dcpext0",
+    .dcp_dart = "/arm-io/dart-dcpext0",
+    .disp_dart = "/arm-io/dart-dispext0",
+    .dp2hdmi_gpio = "/arm-io/dp2hdmi-gpio0",
+    .dptx_phy = "/arm-io/dptx-phy",
+};
 
 static u32 chip_id, board_id;
 static bool is_mac = true;
@@ -47,15 +56,23 @@ static struct { struct { u64 base, width, height, depth; } video; } cur_boot_arg
 static struct { enum fw_version version; } os_firmware = {V15_0B1};
 static int dummy_adt;
 static void *adt = &dummy_adt;
-static unsigned configures, t8152_inits, dart_queries, config_queries, adt_queries;
+static bool is_t8132_hdmi;
+static unsigned configures, t8152_inits, t8132_hdmi_inits, dart_queries, config_queries, adt_queries;
 
 static bool adt_is_compatible(void *tree, int node, const char *compat)
 {
-    (void)tree; (void)node; (void)compat;
+    (void)tree; (void)node;
     adt_queries++;
-    return false;
+    return is_t8132_hdmi && !strcmp(compat, "dptx-phy,t8132");
 }
-static int adt_path_offset(void *tree, const char *path) { (void)tree; (void)path; adt_queries++; return 1; }
+static int adt_path_offset(void *tree, const char *path)
+{
+    (void)tree;
+    adt_queries++;
+    if (!strcmp(path, "/arm-io/disp0"))
+        return 1;
+    return is_t8132_hdmi ? 2 : -1;
+}
 static int adt_getprop_copy(void *tree, int node, const char *name, void *out, size_t len)
 {
     (void)tree; (void)node; (void)name;
@@ -65,14 +82,19 @@ static int adt_getprop_copy(void *tree, int node, const char *name, void *out, s
 #define ADT_GETPROP(adt, node, name, val) adt_getprop_copy(adt, node, name, (val), sizeof(*(val)))
 static const void *adt_getprop(void *tree, int node, const char *name, u32 *len)
 {
-    (void)tree; (void)node; (void)name; (void)len;
+    (void)tree; (void)len;
+    if (is_t8132_hdmi && node == 1 && !strcmp(name, "external"))
+        return &dummy_adt;
+    if (is_t8132_hdmi && node == 2 && !strcmp(name, "dp2hdmi-gpio-parent"))
+        return &dummy_adt;
     return NULL;
 }
 static int display_configure(const char *config) { (void)config; configures++; return 0; }
 static int display_init_t8152(void) { t8152_inits++; return 0; }
+static int display_init_t8132_hdmi(void) { t8132_hdmi_inits++; return 0; }
 static void fb_clear_direct(void) {}
 static bool firmware_sfw_in_range(enum fw_version lo, enum fw_version hi) { (void)lo; (void)hi; return false; }
-static const display_config_t m1 = {"/arm-io/dcp", "/arm-io/dart-dcp", "/arm-io/dart-disp0"};
+static const display_config_t m1 = {"/arm-io/dcp", "/arm-io/dart-dcp", "/arm-io/dart-disp0", "", ""};
 static const display_config_t *display_get_config(void) { config_queries++; return &m1; }
 static bool dart_locked = true;
 static bool dart_adt_locked(const char *path, int instance) { (void)path; (void)instance; dart_queries++; return dart_locked; }
@@ -84,11 +106,14 @@ static bool dart_adt_locked(const char *path, int instance) { (void)path; (void)
 static void boot(u32 chip)
 {
     chip_id = chip;
+    board_id = 0;
+    os_firmware.version = V15_0B1;
+    is_t8132_hdmi = false;
     cur_boot_args.video.base = 0x10000000;
     cur_boot_args.video.width = 640;
     cur_boot_args.video.height = 1136;
     cur_boot_args.video.depth = 30;
-    configures = t8152_inits = dart_queries = config_queries = adt_queries = 0;
+    configures = t8152_inits = t8132_hdmi_inits = dart_queries = config_queries = adt_queries = 0;
 }
 
 int main(void)
@@ -97,10 +122,22 @@ int main(void)
     for (unsigned i = 0; i < 2; i++) {
         boot(inherited_only[i]);
         assert(display_init() == 0);
-        assert(!configures && !t8152_inits);
+        assert(!configures && !t8152_inits && !t8132_hdmi_inits);
         assert(!display_dart_tables_inherited());
         assert(!dart_queries && !config_queries);
     }
+    /* T8132 laptop on 27.2 (internal disp0, no external prop) stays inherited-only. */
+    boot(T8132);
+    os_firmware.version = V27_2;
+    assert(display_init() == 0 && !t8132_hdmi_inits && !configures);
+    assert(!display_dart_tables_inherited() && !dart_queries && !config_queries);
+    /* Headless T8132 with dptx-phy,t8132 + dp2hdmi-gpio-parent uses early HDMI on dcpext0
+     * regardless of firmware version and inherits locked display DART tables. */
+    boot(T8132);
+    os_firmware.version = V_UNKNOWN;
+    is_t8132_hdmi = true;
+    assert(display_init() == 0 && t8132_hdmi_inits == 1 && !configures);
+    assert(display_dart_tables_inherited() && dart_queries == 1 && config_queries == 1);
     /* Positive control: the same dummy framebuffer starts the DCP on T6000,
      * and the inherited-table question goes to its display DARTs. */
     boot(T6000);
@@ -120,6 +157,7 @@ def test_t8140_t8132_return_before_the_dart_path(tmp_path):
     soc = (SOURCE / "src/soc.h").read_text()
     chips = "\n".join(re.findall(r"^#define (?:T8140|T8132|T8152|T6000|T6040|T6041|S5L8960X)\s+0x[0-9a-fA-F]+\s*$",
                                  soc, re.M))
+    t8132_hdmi = function(display, "static bool display_is_t8132_hdmi(")
     panel = function(display, "static bool display_internal_panel_absent(")
     init = function(display, "int display_init(void)")
     inherited = function(display, "bool display_dart_tables_inherited(void)")
@@ -129,7 +167,7 @@ def test_t8140_t8132_return_before_the_dart_path(tmp_path):
     line = display[:display.index(init)].count("\n") + init[:early].count("\n") + 1
     print(f"display_init() returns early for T8140/T8132 at src/display.c:{line}")
     code = tmp_path / "inherited-only.c"
-    code.write_text(HARNESS % {"chips": chips, "display_init": panel + "\n" + init,
+    code.write_text(HARNESS % {"chips": chips, "display_init": t8132_hdmi + "\n" + panel + "\n" + init,
                                "inherited": inherited})
     binary = tmp_path / "inherited-only"
     compiled = subprocess.run([os.environ.get("CC", "cc"), "-std=gnu11", "-O1", "-Wall", "-Wextra",

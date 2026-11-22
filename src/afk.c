@@ -715,7 +715,10 @@ static int afkv2_handle_command(afk_epic_ep_t *epic, const struct afkv2_hdr *hdr
     memcpy(rcall, call, body_size);
     u32 status = service->ops->call_v2(service, call->group, call->command, call + 1, call->length,
                                        rcall + 1, call->length);
-    memcpy(rcall + 1, &status, sizeof(status));
+    /* Only overwrite the leading status word on error; on success, call_v2 owns the reply
+     * layout (some firmware 27.2 calls place a payload word at +0x00 and status later). */
+    if (status)
+        memcpy(rcall + 1, &status, sizeof(status));
     if (status)
         printf("AFKV2: service callback group %u command %u status %#x\n", call->group,
                call->command, status);

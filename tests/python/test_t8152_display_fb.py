@@ -241,6 +241,7 @@ static bool has_dcp_left_running;
 static bool dcp_left_running(void) { return has_dcp_left_running; }
 static bool has_dcp_init_left_quiesced;
 static bool dcp_init_left_quiesced(void) { return has_dcp_init_left_quiesced; }
+static u64 dart_dva_base(dart_dev_t *d) { (void)d; return 0; }
 static const display_config_t *display_get_config(void) { has_dcp = true; return t8152_config; }
 static bool fail_dcp_init, dcp_init_leaves_running;
 static dcp_dev_t *dcp_init(const display_config_t *cfg)

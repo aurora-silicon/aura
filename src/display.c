@@ -115,6 +115,8 @@ static bool display_mode_max;
 /* fb_dva came from iova_alloc() (a T8152 framebuffer that grew) and goes back
  * to the allocator when it is replaced. */
 static bool fb_dva_allocated;
+/* fb_dva was mapped by display_start_dcp() (not inherited from iBoot). */
+static bool fb_dva_mapped;
 
 #define USE_DCPEXT 1
 
@@ -175,6 +177,37 @@ static const display_config_t display_config_m2_ultra = {
     .num_dptxports = 2,
     .die = 1,
 };
+
+/* Dedicated T8132-class HDMI path: driven through DCPEXT0 (dispext0, source
+ * select 1) and a dptx-phy,t8132 PHY wired to dp2hdmi-gpio0. DISPEXT0_CPU is
+ * protected in pmgr.c so DCP is quiesced without PMGR reset. */
+static const display_config_t display_config_t8132_hdmi_ext = {
+    .dcp = "/arm-io/dcpext0",
+    .dcp_dart = "/arm-io/dart-dcpext0",
+    .disp_dart = "/arm-io/dart-dispext0",
+    .dp2hdmi_gpio = "/arm-io/dp2hdmi-gpio0",
+    .dptx_phy = "/arm-io/dptx-phy",
+    .pmgr_dev = "DISPEXT0_CPU",
+    .dcp_alias = "dcpext0",
+    .dcp_index = 1,
+    .num_dptxports = 2,
+};
+
+/* Select the dedicated T8132-class HDMI path from the ADT hardware topology:
+ * no internal panel (/arm-io/disp0 absent or external), /arm-io/dcpext0,
+ * /arm-io/dp2hdmi-gpio0, and a dptx-phy,t8132 node with dp2hdmi-gpio-parent. */
+static bool display_is_t8132_hdmi(void)
+{
+    int disp0 = adt_path_offset(adt, "/arm-io/disp0");
+    if (disp0 >= 0 && !adt_getprop(adt, disp0, "external", NULL))
+        return false;
+    if (adt_path_offset(adt, display_config_t8132_hdmi_ext.dcp) < 0 ||
+        adt_path_offset(adt, display_config_t8132_hdmi_ext.dp2hdmi_gpio) < 0)
+        return false;
+    int phy = adt_path_offset(adt, display_config_t8132_hdmi_ext.dptx_phy);
+    return phy >= 0 && adt_is_compatible(adt, phy, "dptx-phy,t8132") &&
+           adt_getprop(adt, phy, "dp2hdmi-gpio-parent", NULL);
+}
 
 #define abs(x) ((x) >= 0 ? (x) : -(x))
 
@@ -277,15 +310,20 @@ int display_get_vram(u64 *paddr, u64 *size)
 /* True only when both DARTs dropped the range; otherwise keep its IOVA and memory. */
 static bool display_unmap_fb(uintptr_t iova, size_t size)
 {
-    if (!dart_unmap_checked(dcp->dart_disp, iova, size))
+    u64 disp_iova = iova & ~dart_dva_base(dcp->dart_disp);
+    u64 dcp_iova = iova & ~dart_dva_base(dcp->dart_dcp);
+
+    if (!dart_unmap_checked(dcp->dart_disp, disp_iova, size))
         return false;
-    return dart_unmap_checked(dcp->dart_dcp, iova, size);
+    return dart_unmap_checked(dcp->dart_dcp, dcp_iova, size);
 }
 
 static uintptr_t display_map_fb(uintptr_t iova, u64 paddr, u64 size)
 {
     if (dart_has_failed(dcp->dart_disp) || dart_has_failed(dcp->dart_dcp))
         return DART_PTR_ERR;
+    u64 dva_base = dart_dva_base(dcp->dart_disp);
+    iova &= ~dva_base;
     if (iova == 0) {
         u64 iova_disp0 = 0;
         u64 iova_dcp = 0;
@@ -337,7 +375,7 @@ static uintptr_t display_map_fb(uintptr_t iova, u64 paddr, u64 size)
         return DART_PTR_ERR;
     }
 
-    return iova;
+    return iova | dva_base;
 }
 
 const display_config_t *display_get_config(void)
@@ -350,6 +388,8 @@ const display_config_t *display_get_config(void)
         conf = &display_config_m2_pro_max;
     else if (adt_is_compatible(adt, 0, "J180dAP") || adt_is_compatible(adt, 0, "J475dAP"))
         conf = &display_config_m2_ultra;
+    else if (display_is_t8132_hdmi())
+        conf = &display_config_t8132_hdmi_ext;
     else if (chip_id == T8152)
         conf = t8152_config;
     else
@@ -365,13 +405,15 @@ const display_config_t *display_get_config(void)
 
 /*
  * Whether this stage or an earlier one may have mapped into the inherited tables
- * of a locked display DART (dart_init_adt_display()). T8140 and T8132 never get
- * that far: display_init() returns before any DCP or DART work on them, in every
- * stage, and kboot keeps their retained heap separately.
+ * of a locked display DART (dart_init_adt_display()). T8140 and other T8132
+ * machines never get that far: display_init() returns before any DCP or DART
+ * work on them, in every stage, and kboot keeps their retained heap separately.
+ * Headless T8132 with dedicated dptx-phy,t8132 HDMI brings up HDMI on dcpext0
+ * and maps its scanout framebuffer into locked dart-dispext0.
  */
 bool display_dart_tables_inherited(void)
 {
-    if (chip_id == T8140 || chip_id == T8132)
+    if (chip_id == T8140 || (chip_id == T8132 && !display_is_t8132_hdmi()))
         return false;
 
     const display_config_t *conf = display_get_config();
@@ -456,22 +498,37 @@ int display_start_dcp(void)
     }
 
     // Find the framebuffer DVA
+    u64 dva_base = dart_dva_base(dcp->dart_disp);
     fb_dva_allocated = false;
+    fb_dva_mapped = false;
     fb_dva = dart_search(dcp->dart_disp, (void *)cur_boot_args.video.base);
-    // framebuffer is not mapped on the M1 Ultra Mac Studio
-    if (DART_IS_ERR(fb_dva) || !fb_dva)
+    if (!DART_IS_ERR(fb_dva) && fb_dva)
+        fb_dva |= dva_base;
+    // framebuffer is not mapped on the M1 Ultra Mac Studio or J773g dcpext0
+    if (DART_IS_ERR(fb_dva) || !fb_dva) {
         fb_dva = display_map_fb(0, pa, size);
+        if (!DART_IS_ERR(fb_dva))
+            fb_dva_mapped = true;
+    }
     if (DART_IS_ERR(fb_dva)) {
         printf("display: failed to find display DVA\n");
         fb_dva = 0;
         display_stop_failed_dcp();
+        if (!dcp_left_running())
+            dcp = NULL;
         return -1;
     }
 
     iboot = dcp_ib_init(dcp);
     if (!iboot) {
         printf("display: failed to initialize DCP iBoot interface\n");
+        if (fb_dva_mapped && fb_dva && fb_size)
+            (void)display_unmap_fb(fb_dva, fb_size);
+        fb_dva = 0;
+        fb_dva_mapped = false;
         display_stop_failed_dcp();
+        if (!dcp_left_running())
+            dcp = NULL;
         return -1;
     }
 
@@ -523,7 +580,7 @@ int display_parse_mode(const char *config, dcp_timing_mode_t *mode, struct displ
     return mode->valid;
 }
 
-static int display_swap(u64 iova, u32 stride, u32 width, u32 height)
+static int display_swap(u64 iova, u32 stride, u32 width, u32 height, u32 surface_fmt)
 {
     int ret;
 
@@ -536,7 +593,7 @@ static int display_swap(u64 iova, u32 stride, u32 width, u32 height)
         .plane_cnt = 1,
         .width = width,
         .height = height,
-        .surface_fmt = chip_id == T8152 ? FMT_BGRA : FMT_w30r,
+        .surface_fmt = surface_fmt,
         .colorspace = 2,
         .eotf = EOTF_GAMMA_SDR,
         .transform = XFRM_NONE,
@@ -667,6 +724,10 @@ int display_configure(const char *config)
     size_t size =
         ALIGN_UP(tbest.width * tbest.height * ((cbest.bpp + 7) / 8) + 24 * SZ_16K, SZ_16K);
 
+    u32 depth = cbest.bpp == 32 ? 32 : 30;
+    u32 surface_fmt = depth == 32 ? FMT_BGRA : FMT_w30r;
+    bool keep_grown_dva = chip_id == T8152 || dart_dva_base(dcp->dart_disp) != 0;
+
     if (fb_size < size) {
         printf("display: current framebuffer is too small for new mode\n");
 
@@ -693,7 +754,7 @@ int display_configure(const char *config)
 
         // Swap!
         u32 stride = tbest.width * 4;
-        ret = display_swap(tmp_dva, stride, tbest.width, tbest.height);
+        ret = display_swap(tmp_dva, stride, tbest.width, tbest.height, surface_fmt);
         if (ret < 0)
             return ret;
 
@@ -705,13 +766,13 @@ int display_configure(const char *config)
             return -1;
         }
 
-        if (chip_id == T8152) {
+        if (keep_grown_dva) {
             /* The DCP already scans out the new framebuffer at tmp_dva; a
              * second swap after moving it back to fb_dva times out here.
              * tmp_dva becomes the framebuffer DVA, so it is no longer
              * temporary: the cleanup below must not unmap or free it. */
             if (fb_dva_allocated)
-                iova_free(dcp->iovad_dcp, fb_dva, fb_size);
+                iova_free(dcp->iovad_dcp, fb_dva & ~dart_dva_base(dcp->dart_dcp), fb_size);
             fb_dva = tmp_dva;
             fb_dva_allocated = true;
             tmp_dva = 0;
@@ -750,10 +811,10 @@ int display_configure(const char *config)
     u32 stride = tbest.width * 4;
     /* A reused framebuffer still holds the previous console at another
      * stride (the stage before left 640x1136 text there). */
-    if (chip_id == T8152 && !swapped)
+    if (keep_grown_dva && !swapped)
         memset((void *)fb_pa, 0, (size_t)stride * tbest.height);
     if (!swapped) {
-        ret = display_swap(fb_dva, stride, tbest.width, tbest.height);
+        ret = display_swap(fb_dva, stride, tbest.width, tbest.height, surface_fmt);
         if (ret < 0)
             return ret;
 
@@ -767,13 +828,12 @@ int display_configure(const char *config)
     bool reinit = false;
     if (fb_pa != cur_boot_args.video.base || cur_boot_args.video.stride != stride ||
         cur_boot_args.video.width != tbest.width || cur_boot_args.video.height != tbest.height ||
-        (cur_boot_args.video.depth & FB_DEPTH_MASK) != (chip_id == T8152 ? 32 : 30)) {
+        (cur_boot_args.video.depth & FB_DEPTH_MASK) != depth) {
         cur_boot_args.video.base = fb_pa;
         cur_boot_args.video.stride = stride;
         cur_boot_args.video.width = tbest.width;
         cur_boot_args.video.height = tbest.height;
-        cur_boot_args.video.depth =
-            (chip_id == T8152 ? 32 : 30) | (opts.retina ? FB_DEPTH_FLAG_RETINA : 0);
+        cur_boot_args.video.depth = depth | (opts.retina ? FB_DEPTH_FLAG_RETINA : 0);
         reinit = true;
     }
 
@@ -792,9 +852,19 @@ int display_configure(const char *config)
      * DARTs confirmed the unmap; otherwise keep it reserved. */
     if (tmp_dva) {
         if (display_unmap_fb(tmp_dva, size))
-            iova_free(dcp->iovad_dcp, tmp_dva, size);
+            iova_free(dcp->iovad_dcp, tmp_dva & ~dart_dva_base(dcp->dart_dcp), size);
         else
             printf("display: keeping the temporary framebuffer IOVA mapped\n");
+    }
+
+    /* On T8132 27.2 (non-zero DVA base), dispext0 (dart-dispext0 SID 0) scans
+     * out the framebuffer; drop the alias from dart-dcpext0 (SID 23) so
+     * dcp_shutdown leaves SID 23 with zero aura mappings or heap L2 tables for
+     * Linux's dcpext0 driver. */
+    if (dart_dva_base(dcp->dart_dcp) && fb_dva && fb_size) {
+        u64 dcp_iova = fb_dva & ~dart_dva_base(dcp->dart_dcp);
+        if (!dart_unmap_checked(dcp->dart_dcp, dcp_iova, fb_size))
+            printf("display: failed to drop framebuffer alias from dart-dcp\n");
     }
 
     u64 msecs = ticks_to_msecs(get_ticks() - start_time);
@@ -997,12 +1067,53 @@ static bool display_internal_panel_absent(int node, int product)
     return !adt_getprop(adt, product, "raw-panel-serial-number", NULL);
 }
 
+static int display_init_t8132_hdmi(void)
+{
+    /* Adopt any real non-dummy framebuffer already configured by iBoot or an
+     * earlier aura stage unchanged. */
+    if (cur_boot_args.video.base && cur_boot_args.video.width && cur_boot_args.video.height &&
+        !(cur_boot_args.video.width == 640 && cur_boot_args.video.height == 1136)) {
+        printf("display: Using firmware framebuffer (%ldx%ld)\n", cur_boot_args.video.width,
+               cur_boot_args.video.height);
+        return 0;
+    }
+
+#ifdef NO_DISPLAY
+    return 0;
+#endif
+
+    display_is_external = true;
+
+    printf("display: T8132 early HDMI bring-up on dcpext0\n");
+    int ret = display_configure(NULL);
+    if (ret <= 0) {
+        printf("display: T8132 HDMI initialization %s (ret=%d)\n",
+               ret < 0 ? "failed" : "found no connected monitor", ret);
+        if (dcp) {
+            if (fb_dva_mapped && fb_dva && fb_size)
+                (void)display_unmap_fb(fb_dva, fb_size);
+            display_shutdown(DCP_QUIESCED);
+        }
+        if (!dcp_left_running())
+            dcp = NULL;
+        iboot = NULL;
+        fb_dva = 0;
+        fb_size = 0;
+        fb_dva_mapped = false;
+    }
+
+    return ret < 0 ? ret : (ret > 0 ? 1 : 0);
+}
+
 int display_init(void)
 {
     if (chip_id == T8152) {
         display_is_external = true;
         return display_init_t8152();
     }
+
+    if (display_is_t8132_hdmi())
+        return display_init_t8132_hdmi();
 
     const char *disp_path;
     if (adt_is_compatible(adt, 0, "J180dAP") || adt_is_compatible(adt, 0, "J475dAP"))
@@ -1079,8 +1190,10 @@ int display_init(void)
 int display_shutdown(dcp_shutdown_mode mode)
 {
     /* Linux owns the live J700/J713/J873 controllers. Keep the inherited ASC session
-     * and scanout intact at both the Stage 1 and Linux boundaries. */
-    if (chip_id == T8140 || chip_id == T8132 || chip_id == T8152)
+     * and scanout intact at both the Stage 1 and Linux boundaries. Headless T8132
+     * with dedicated dptx-phy,t8132 HDMI quiesces dcpext0 cleanly via
+     * dcp_shutdown(..., false) without PMGR reset. */
+    if (chip_id == T8140 || (chip_id == T8132 && !display_is_t8132_hdmi()) || chip_id == T8152)
         return 0;
 
     /* We have no DCP, so just exit */
@@ -1109,6 +1222,8 @@ int display_shutdown(dcp_shutdown_mode mode)
                 break;
         }
         iboot = NULL;
+        if (!dcp_left_running())
+            dcp = NULL;
     }
 
     /* A DCP that did not stop at any point may still use its buffers. */

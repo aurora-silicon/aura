@@ -92,6 +92,8 @@ typedef struct dptx_port {
     afk_epic_service_t *service;
     dptx_phy_t *phy;
     u32 link_rate, pending_link_rate;
+    dptx_drive_settings_t drive_settings[4];
+    u32 drive_count;
 } dptx_port_t;
 
 typedef struct dcp_dptx_if {
@@ -175,7 +177,7 @@ int dptxport_validate_connection(afk_epic_service_t *service, u8 core, u8 atc, u
     return 0;
 }
 
-int dptxport_connect(afk_epic_service_t *service, u8 core, u8 atc, u8 die)
+int dptxport_connect(afk_epic_service_t *service, u8 core, u8 atc, u8 die, bool supports_hpd)
 {
     struct dcpdptx_connection_cmd cmd = {0};
     struct dcpdptx_connection_reply resp = {0};
@@ -186,7 +188,7 @@ int dptxport_connect(afk_epic_service_t *service, u8 core, u8 atc, u8 die)
 
     cmd.target = target;
     if (afk_epic_is_v2(service->epic))
-        cmd.unk = 0x100; /* IODPTXPortAttributes supportsHPD */
+        cmd.unk = supports_hpd ? 0x100 : 0; /* IODPTXPortAttributes supportsHPD */
     ret = afk_service_call(service, 0, 11, &cmd, sizeof(cmd), 24, &resp, sizeof(resp), 0);
     if (ret)
         return ret;
@@ -195,7 +197,7 @@ int dptxport_connect(afk_epic_service_t *service, u8 core, u8 atc, u8 die)
 
     if (resp.target != target)
         return -1;
-    if (resp.unk != 0x100)
+    if (resp.unk != cmd.unk && resp.unk != 0x100)
         return -1;
 
     return 0;
@@ -533,10 +535,17 @@ static void dptxport_init(afk_epic_service_t *service, const char *name, const c
     }
 }
 
+static void dptxport_reply_ok(void *reply, size_t reply_size)
+{
+    if (reply_size >= sizeof(u32))
+        memset(reply, 0, sizeof(u32));
+}
+
 static u32 dptxport_call_v2(afk_epic_service_t *service, u16 group, u32 command, const void *data,
                             size_t data_size, void *reply, size_t reply_size)
 {
-    if (group && !(group == 1 && command == DPTX_APCALL_SET_DRIVE_SETTINGS))
+    if (group && !(group == 1 && (command == DPTX_APCALL_SET_DRIVE_SETTINGS ||
+                                  command == DPTX_APCALL_GET_DRIVE_SETTINGS)))
         return 0xe00002c7; /* kIOReturnUnsupported */
 
     dptx_port_t *port = service->cookie;
@@ -547,28 +556,30 @@ static u32 dptxport_call_v2(afk_epic_service_t *service, u16 group, u32 command,
          command == DPTX_APCALL_WILL_CHANGE_LINKG_CONFIG ||
          command == DPTX_APCALL_DID_CHANGE_LINK_CONFIG || command == DPTX_APCALL_SET_LINK_RATE ||
          command == DPTX_APCALL_SET_DOWN_SPREAD || command == DPTX_APCALL_SET_ACTIVE_LANE_COUNT ||
-         command == DPTX_APCALL_SET_DRIVE_SETTINGS || command == DPTX_APCALL_GET_LINK_RATE ||
-         command == DPTX_APCALL_GET_ACTIVE_LANE_COUNT))
+         command == DPTX_APCALL_SET_DRIVE_SETTINGS || command == DPTX_APCALL_GET_DRIVE_SETTINGS ||
+         command == DPTX_APCALL_GET_LINK_RATE || command == DPTX_APCALL_GET_ACTIVE_LANE_COUNT))
         return 0xe00002d8; /* kIOReturnNotReady */
-    /* Only the hardware-qualified HBR/four-lane configuration is exposed.
-     * Training changes still require their own implementation. */
     u64 value;
     switch (command) {
         case DPTX_APCALL_ACTIVATE:
             if (dptx_phy_activate(port->phy))
                 return 0xe00002bc; /* kIOReturnError */
-            port->link_rate = port->pending_link_rate = LINK_RATE_HBR;
+            port->link_rate = port->pending_link_rate =
+                dptx_phy_needs_validate(port->phy) ? 0 : LINK_RATE_HBR;
+            dptxport_reply_ok(reply, reply_size);
             return 0;
         case DPTX_APCALL_DEACTIVATE:
             if (dptx_phy_deactivate(port->phy))
                 return 0xe00002bc;
             port->link_rate = port->pending_link_rate = 0;
+            dptxport_reply_ok(reply, reply_size);
             return 0;
         case DPTX_APCALL_WILL_CHANGE_LINKG_CONFIG:
         case DPTX_APCALL_DID_CHANGE_LINK_CONFIG:
-            return dptx_phy_set_route(port->phy, command == DPTX_APCALL_DID_CHANGE_LINK_CONFIG)
-                       ? 0xe00002bc
-                       : 0;
+            if (dptx_phy_set_route(port->phy, command == DPTX_APCALL_DID_CHANGE_LINK_CONFIG))
+                return 0xe00002bc;
+            dptxport_reply_ok(reply, reply_size);
+            return 0;
         case DPTX_APCALL_GET_MAX_LINK_RATE:
             value = port->phy ? dptx_phy_max_link_rate(port->phy) / 270 : LINK_RATE_HBR;
             break;
@@ -589,6 +600,7 @@ static u32 dptxport_call_v2(afk_epic_service_t *service, u16 group, u32 command,
             if (dptx_phy_set_link_rate(port->phy, rate * 270))
                 return 0xe00002bc;
             port->link_rate = rate;
+            dptxport_reply_ok(reply, reply_size);
             return 0;
         }
         case DPTX_APCALL_GET_MAX_LANE_COUNT:
@@ -603,16 +615,23 @@ static u32 dptxport_call_v2(afk_epic_service_t *service, u16 group, u32 command,
                 return 0xe00002c2;
             memcpy(&count, data + 16, sizeof(count));
             printf("DPTXV2: active lane count %u\n", count);
-            return dptx_phy_set_active_lane_count(port->phy, count) ? 0xe00002c2 : 0;
+            if (dptx_phy_set_active_lane_count(port->phy, count))
+                return 0xe00002c2;
+            dptxport_reply_ok(reply, reply_size);
+            return 0;
         }
         case DPTX_APCALL_GET_MAX_DRIVE_SETTINGS: {
             const dptx_drive_settings_t maximum = {0, 3, 3};
             if (reply_size < 32)
                 return 0xe00002c2;
+            dptxport_reply_ok(reply, reply_size);
             memcpy(reply + 16, &maximum, sizeof(maximum));
             return 0;
         }
         case DPTX_APCALL_SET_DRIVE_SETTINGS: {
+            /* Group 1 AP call layout (macOS 27.2 DCP firmware / Linux dptxep.c):
+             * SET_DRIVE_SETTINGS puts status at +0x00, count at +0x10, tuples at +0x20;
+             * GET_DRIVE_SETTINGS puts count at +0x00, status at +0x10, tuples at +0x20. */
             u32 count;
             dptx_drive_settings_t settings[4];
             if (group != 1)
@@ -623,14 +642,47 @@ static u32 dptxport_call_v2(afk_epic_service_t *service, u16 group, u32 command,
             if (count > 4 || data_size < 32 + count * sizeof(*settings))
                 return 0xe00002c2;
             memcpy(settings, data + 32, count * sizeof(*settings));
-            return dptx_phy_set_drive_settings(port->phy, settings, count) ? 0xe00002bc : 0;
+            if (dptx_phy_set_drive_settings(port->phy, settings, count))
+                return 0xe00002bc;
+            memcpy(port->drive_settings, settings, count * sizeof(*settings));
+            port->drive_count = count;
+            if (dptx_phy_needs_validate(port->phy)) {
+                if (reply_size < 32 + count * sizeof(*settings))
+                    return 0xe00002c2;
+                memset(reply, 0, reply_size);
+                memcpy(reply + 16, &count, sizeof(count));
+                memcpy(reply + 32, settings, count * sizeof(*settings));
+            } else {
+                dptxport_reply_ok(reply, reply_size);
+            }
+            return 0;
+        }
+        case DPTX_APCALL_GET_DRIVE_SETTINGS: {
+            u32 count;
+            if (group != 1)
+                return 0xe00002c7;
+            if (!data || data_size < 32 || reply_size < 32)
+                return 0xe00002c2;
+            memcpy(&count, data, sizeof(count));
+            if (count > 4 || reply_size < 32 + count * sizeof(port->drive_settings[0]))
+                return 0xe00002c2;
+            memset(reply, 0, reply_size);
+            memcpy(reply, &count, sizeof(count));
+            /* Status word at +0x10 stays 0 (kIOReturnSuccess). */
+            u32 copy = min(count, port->drive_count);
+            if (copy)
+                memcpy(reply + 32, port->drive_settings, copy * sizeof(port->drive_settings[0]));
+            return 0;
         }
         case DPTX_APCALL_SET_DOWN_SPREAD:
             if (!data || data_size < 17)
                 return 0xe00002c2;
             /* Matching ATC port code records this request for the following
              * rate setup. The qualified setup uses downspread disabled. */
-            return ((const u8 *)data)[16] ? 0xe00002c7 : 0;
+            if (((const u8 *)data)[16])
+                return 0xe00002c7;
+            dptxport_reply_ok(reply, reply_size);
+            return 0;
         case DPTX_APCALL_GET_SUPPORTS_DOWN_SPREAD:
         case DPTX_APCALL_GET_DOWN_SPREAD:
         case DPTX_APCALL_GET_SUPPORTS_LANE_MAPPING:
@@ -638,35 +690,49 @@ static u32 dptxport_call_v2(afk_epic_service_t *service, u16 group, u32 command,
             value = 0;
             break;
         case DPTX_APCALL_GET_SUPPORTS_HPD:
-            value = 1;
+            value = dptx_phy_supports_hpd(port ? port->phy : NULL) ? 1 : 0;
             break;
+        case DPTX_APCALL_FORCE_HOTPLUG_DETECT:
+        case DPTX_APCALL_SET_RESOURCE_AVAILABLE:
+            if (!dptx_phy_needs_validate(port ? port->phy : NULL))
+                return 0xe00002c7;
+            memcpy(reply, data, min(reply_size, data_size));
+            dptxport_reply_ok(reply, reply_size);
+            return 0;
         case DPTX_APCALL_INACTIVE_SINK_DETECTED:
         case DPTX_APCALL_DEVICE_NOT_RESPONDING:
         case DPTX_APCALL_DEVICE_BUSY_TIMEOUT:
         case DPTX_APCALL_DEVICE_NOT_STARTED:
-            /* Link fault reports: the native T8152 client acknowledges them
-             * with a zeroed retcode; they are not requests we can answer.
-             * Other machines keep answering them as unsupported. */
-            if (chip_id != T8152)
+            /* Link fault reports: acknowledge them with a zeroed retcode; they
+             * are not requests we can answer. Other machines keep answering
+             * them as unsupported. */
+            if (chip_id != T8152 && !dptx_phy_needs_validate(port ? port->phy : NULL))
                 return 0xe00002c7;
             dprintf("DPTXPort: firmware reports link fault %u\n", command);
             memcpy(reply, data, min(reply_size, data_size));
-            if (reply_size > 4)
-                memset(reply, 0, 4);
+            dptxport_reply_ok(reply, reply_size);
             return 0;
-        case DPTX_APCALL_SET_TILED_DISPLAY_HINTS: {
+        case DPTX_APCALL_SET_TILED_DISPLAY_HINTS:
+            if (reply_size >= 160 && data_size >= 160) {
+                /* 160-byte tiled-display hints (macOS 27.2 DCP ABI) place allocation
+                 * fields at +0x70..+0x8f and the status word at +0x90, leaving +0x00
+                 * intact. Select purely on payload size. */
+                memcpy(reply, data, min(reply_size, data_size));
+                memset((u8 *)reply + 0x70, 0, 0x20);
+                memset((u8 *)reply + 0x90, 0, sizeof(u32));
+                return 0;
+            }
             if (chip_id != T8152)
                 return 0xe00002c7;
-            u32 retcode = 1;
             memcpy(reply, data, min(reply_size, data_size));
-            memcpy(reply, &retcode, min(reply_size, sizeof(retcode)));
+            dptxport_reply_ok(reply, reply_size);
             return 0;
-        }
         default:
             return 0xe00002c7;
     }
     if (reply_size < 32)
         return 0xe00002c2; /* kIOReturnBadArgument */
+    dptxport_reply_ok(reply, reply_size);
     memcpy(reply + 16, &value, sizeof(value));
     return 0;
 }
@@ -692,7 +758,15 @@ int dcp_dptx_connect(dcp_dptx_if_t *dptx, dptx_phy_t *phy, u32 die, u32 port)
 
     dptx->port[port].phy = dptx->phy = phy;
 
-    int ret = dptxport_connect(dptx->port[port].service, 0, dptx_phy_dcp_output(phy), die);
+    u8 output = dptx_phy_dcp_output(phy);
+    int ret;
+    if (dptx_phy_needs_validate(phy)) {
+        ret = dptxport_validate_connection(dptx->port[port].service, 0, output, die);
+        if (ret)
+            return ret;
+    }
+
+    ret = dptxport_connect(dptx->port[port].service, 0, output, die, dptx_phy_supports_hpd(phy));
     if (ret)
         return ret;
     return dptxport_request_display(dptx->port[port].service);
