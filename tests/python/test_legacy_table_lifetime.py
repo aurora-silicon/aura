@@ -236,8 +236,9 @@ PRE = r"""
 #include <stdlib.h>
 #include <stddef.h>
 #include <stdbool.h>
-typedef uint8_t u8; typedef uint16_t u16; typedef uint32_t u32; typedef uint64_t u64;
-typedef int32_t s32; typedef int64_t s64;
+/* Match aura's aarch64 LP64 u64 (unsigned long) so %lx format checks pass on macOS too. */
+typedef uint8_t u8; typedef uint16_t u16; typedef uint32_t u32; typedef unsigned long u64;
+typedef int32_t s32; typedef long s64;
 #define BIT(x)                 (1UL << (x))
 #define GENMASK(msb, lsb)      ((BIT((msb + 1) - (lsb)) - 1) << (lsb))
 #define _FIELD_LSB(field)      ((field) & ~(field - 1))
