@@ -10,10 +10,10 @@ Checked: the description lands on the DCP's node even though the buffer reservat
 tree first, with the RTKit handoff properties other handed-over co-processors use
 (apple,rtkit-handoff "dcp-live-v1", apple,rtkit-buffers in <ep dva_hi dva_lo size is_mapped>
 tuples) plus apple,rtkit-version and apple,rtkit-epmap; every loader-owned buffer gets a
-reserved-memory region whose iommu-addresses name the DCP and the buffer's IOVA, referenced from
+no-map reserved-memory region whose iommu-addresses name the DCP and the buffer's IOVA, referenced from
 the DCP's memory-region; a firmware-placed buffer gets none and is_mapped 1; and a loader-owned
-buffer outside the reserved range fails the boot (the DCP is already running and DMAs into it)
-without describing anything.
+buffer outside the reserved range, or not in whole 16K pages, fails the boot (the DCP is already
+running and DMAs into it) without describing anything.
 """
 from pathlib import Path
 import os
@@ -42,6 +42,7 @@ typedef uint32_t u32;
 typedef uint64_t u64;
 #define RTKIT_LIVE_MAX_BUFFERS 4
 #define RTKIT_LIVE_BUFFER_OWNED 1
+#define SZ_16K 0x4000
 struct rtkit_live_buffer { u32 ep; u32 flags; u64 iova; u64 phys; u64 size; };
 struct rtkit_live_state {
     u32 version;
@@ -51,7 +52,7 @@ struct rtkit_live_state {
 };
 #define bail(...) do { printf(__VA_ARGS__); return -1; } while (0)
 static void *dt;
-static const struct rtkit_live_state session = {
+static struct rtkit_live_state session = {
     12, {0x11f, 0x821fff}, 3,
     {{1, 0, 0x802424000, 0x9e5010000, 0x10000},
      {2, 1, 0x810004000, 0x80696c000, 0x4000},
@@ -74,6 +75,8 @@ int main(int argc, char **argv)
     dt = malloc(1 << 20);
     if (fdt_open_into(in, dt, 1 << 20))
         return 2;
+    if (argc > 5) /* move the syslog buffer */
+        session.buffers[1].phys = strtoull(argv[5], NULL, 0);
     int ret = dt_publish_live_rtkit(strtoull(argv[3], NULL, 0), strtoull(argv[4], NULL, 0));
     if (fdt_check_full(dt, fdt_totalsize(dt)))
         return 3;
@@ -178,7 +181,8 @@ def test_description_and_buffer_regions(harness):
         assert _fdt_cells(out, node, "iommu-addresses") == [phandle[0], iova >> 32,
                                                              iova & 0xffffffff, 0, 0x4000]
         assert _fdt_cells(out, node, "phandle")[0] in regions
-        assert _fdt_cells(out, node, "no-map") is None
+        # no-map: the kernel maps the pages write-combined, never also in its linear map
+        assert _fdt_cells(out, node, "no-map") == []
     # The firmware-placed crashlog lives in a carveout the DT already describes
     assert _fdt_cells(out, "/reserved-memory/dcpext-rtkit-ep1@9e5010000", "reg") is None
 
@@ -207,3 +211,15 @@ def test_missing_node_fails_the_boot(harness):
                          capture_output=True, text=True)
     assert run.returncode == 1, run.stdout
     assert "no node for alias dcpext" in run.stdout
+
+
+def test_unaligned_owned_buffer_fails_the_boot(harness):
+    exe, dtb, tmp = harness
+    out = tmp / "unaligned.dtb"
+    # A no-map region that is not whole pages would unmap the kernel's neighbouring pages too
+    run = subprocess.run([str(exe), str(dtb), str(out), "0x806000000", "0x807000000",
+                          "0x80696e000"], capture_output=True, text=True)
+    assert run.returncode == 1, run.stdout
+    assert "buffer ep 2 [0x80696e000+0x4000) not 16K aligned" in run.stdout
+    assert _fdt_cells(out, "/soc/dcp@271c00000", "apple,rtkit-handoff") is None
+    assert _fdt_cells(out, "/soc/dcp@271c00000", "memory-region") is None

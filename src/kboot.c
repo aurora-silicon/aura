@@ -805,7 +805,7 @@ static int dt_reserve_retained_span(u64 start, u64 end)
  *   apple,rtkit-epmap     <8 cells>  endpoint map the IOP announced; cell i holds endpoints
  *                                    32 * i to 32 * i + 31 (application endpoints included; all
  *                                    are stopped at handoff)
- * Each loader-allocated buffer also gets a reserved-memory region with iommu-addresses
+ * Each loader-allocated buffer also gets a no-map reserved-memory region with iommu-addresses
  * (dt_reserve_live_rtkit_buffer()), so its IOVA stays mapped when the kernel rebuilds the
  * display DART from those regions. The DCP is already running and DMAs into these buffers, so
  * this is fail-hard: a loader-allocated buffer outside the reserved range [@lo, @hi), or any
@@ -843,6 +843,12 @@ static int dt_publish_live_rtkit(u64 lo, u64 hi)
         if (owned && (b->phys < lo || b->size > hi - lo || b->phys - lo > hi - lo - b->size)) {
             printf("FDT: live RTKit: %s buffer ep %u [0x%lx+0x%lx) outside [0x%lx, 0x%lx)\n", alias,
                    b->ep, b->phys, b->size, lo, hi);
+            return -1;
+        }
+        /* Its region is no-map: whole pages only, or the kernel unmaps its neighbours too */
+        if (owned && ((b->phys | b->size) & (SZ_16K - 1))) {
+            printf("FDT: live RTKit: %s buffer ep %u [0x%lx+0x%lx) not 16K aligned\n", alias, b->ep,
+                   b->phys, b->size);
             return -1;
         }
         fdt32_t *c = &bufs[i * 5];
@@ -4090,7 +4096,11 @@ static int dt_reserve_live_rtkit_buffer(const char *path, const char *alias,
     snprintf(node_name, sizeof(node_name), "%s-rtkit-ep%u@%lx", alias, b->ep, b->phys);
     snprintf(region_name, sizeof(region_name), "rtkit-ep%u", b->ep);
 
-    int mem = dt_get_or_add_reserved_mem(node_name, "apple,asc-mem", false, b->phys, b->size);
+    /*
+     * no-map: the kernel maps these pages write-combined for the DCP, so they must not also sit
+     * in its cacheable linear map.
+     */
+    int mem = dt_get_or_add_reserved_mem(node_name, "apple,asc-mem", true, b->phys, b->size);
     if (mem < 0)
         return mem;
     uint32_t mem_phandle = fdt_get_phandle(dt, mem);
