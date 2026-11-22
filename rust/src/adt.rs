@@ -311,8 +311,13 @@ pub fn get_reg_container(
             let parent_addr = get_cells_u8(pa_ref);
             let child_size = get_cells_u8(cs_ref);
 
-            if addr >= child_addr && (addr + size) <= (child_addr + child_size) {
-                addr = addr - child_addr + parent_addr;
+            // The entry must hold all of [addr, addr + size). Compare offsets
+            // into it rather than end addresses, which can pass 2^64.
+            let Some(offset) = addr.checked_sub(child_addr) else {
+                continue;
+            };
+            if offset <= child_size && size <= child_size - offset {
+                addr = parent_addr.checked_add(offset).ok_or(AdtError::BadValue)?;
                 break;
             }
         }

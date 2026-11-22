@@ -57,6 +57,94 @@ fn install(blob: Vec<u8>, size: usize) -> *const c_void {
     }
 }
 
+fn u64s(words: &[u64]) -> Vec<u8> {
+    words.iter().flat_map(|w| w.to_le_bytes()).collect()
+}
+
+fn translate(reg: u64, size: u64, child: u64, parent: u64, span: u64) -> Result<u64, i32> {
+    let two = 2u32.to_le_bytes();
+    let mut blob = Vec::new();
+    node(
+        &mut blob,
+        &[
+            ("name", b"device-tree\0"),
+            ("#address-cells", &two),
+            ("#size-cells", &two),
+        ],
+        1,
+    );
+    let bus = node(
+        &mut blob,
+        &[
+            ("name", b"bus\0"),
+            ("#address-cells", &two),
+            ("#size-cells", &two),
+            ("ranges", &u64s(&[child, parent, span])),
+        ],
+        1,
+    );
+    let dev = node(
+        &mut blob,
+        &[("name", b"dev\0"), ("reg", &u64s(&[reg, size]))],
+        0,
+    );
+    let len = blob.len();
+    let adt_ptr = install(blob, len);
+    let mut path = [bus, dev, 0, 0, 0, 0, 0, 0];
+    let prop = CString::new("reg").unwrap();
+    let (mut addr, mut out_size) = (0, 0);
+    let ret = unsafe {
+        parser::adt_get_reg(
+            adt_ptr,
+            path.as_mut_ptr(),
+            prop.as_ptr(),
+            0,
+            &mut addr,
+            &mut out_size,
+        )
+    };
+    if ret < 0 {
+        return Err(ret);
+    }
+    assert_eq!(out_size, size);
+    Ok(addr)
+}
+
+/// A ranges entry or reg window that ends at or past 2^64 is compared without
+/// wrapping; aura's release build has no overflow checks to catch it.
+fn ranges_near_the_top() {
+    // A window that ends exactly at 2^64 still translates what lies inside it.
+    assert_eq!(
+        translate(
+            0xffff_ffff_ffff_f800,
+            0x100,
+            0xffff_ffff_ffff_f000,
+            0x1000,
+            0x1000
+        ),
+        Ok(0x1800)
+    );
+    // A reg window that wraps past 2^64 is not inside a window at 0.
+    assert_eq!(
+        translate(0xffff_ffff_ffff_ff00, 0x200, 0, 0x5000, 0x1000),
+        Ok(0xffff_ffff_ffff_ff00)
+    );
+    // A translation past 2^64 is a bad value, not a wrapped address.
+    assert_eq!(
+        translate(0x900, 0x10, 0, 0xffff_ffff_ffff_f800, 0x1000),
+        Err(-15)
+    );
+    // Inside and outside an ordinary window.
+    assert_eq!(
+        translate(0x1800, 0x100, 0x1000, 0x2_0000_0000, 0x1000),
+        Ok(0x2_0000_0800)
+    );
+    assert_eq!(
+        translate(0x1f80, 0x100, 0x1000, 0x2_0000_0000, 0x1000),
+        Ok(0x1f80)
+    );
+}
+
 /// A property's value is its own `size` bytes: a string without a NUL inside
 /// them must not run on into what follows the property.
 fn value_ends_at_its_size() {
@@ -341,4 +429,5 @@ fn main() {
     register_paths();
     c_api_errors_instead_of_panics();
     value_ends_at_its_size();
+    ranges_near_the_top();
 }
