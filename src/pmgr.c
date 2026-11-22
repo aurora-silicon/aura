@@ -848,8 +848,14 @@ int pmgr_reset(int die, const char *name)
  */
 int pmgr_reset_held(int die, const char *name)
 {
-    const struct pmgr_device *dev = pmgr_find_device_by_name(name);
+    const struct pmgr_device *dev = NULL;
 
+    for (unsigned int i = 0; i < pmgr_devices_len; ++i) {
+        if (strncmp(pmgr_devices[i].name, name, 0x10) == 0) {
+            dev = &pmgr_devices[i];
+            break;
+        }
+    }
     if (!dev || die < 0 || die >= pmgr_dies)
         return -1;
     uintptr_t addr = pmgr_device_get_addr(die, dev);
