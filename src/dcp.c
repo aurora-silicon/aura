@@ -15,6 +15,9 @@
 
 #include "dcp/dptx_phy.h"
 
+/* Linux drivers/gpio/gpio-macsmc.c: CMD_OUTPUT (bit 24) sets an SMC GPIO output value. */
+#define SMC_GPIO_CMD_OUTPUT BIT(24)
+
 struct adt_function_smc_gpio {
     u32 phandle;
     char four_cc[4];
@@ -141,11 +144,10 @@ static int dcp_hdmi_dptx_init(dcp_dev_t *dcp, const display_config_t *cfg)
             smc_dev_t *smc = smc_init();
             if (smc) {
                 if (t8132_hdmi) {
-                    /* T8132 dedicated HDMI (PS190): enable HDMI power before the
-                     * DP-to-HDMI converter using the macsmc CMD_OUTPUT|1 (0x1000001)
-                     * command (matching Linux drivers/gpio/gpio-macsmc.c). */
-                    smc_write_u32(smc, dcp->hdmi_pwr_gpio, 0x1000001);
-                    smc_write_u32(smc, dcp->dp2hdmi_pwr_gpio, 0x1000001);
+                    /* Dedicated dptx-phy,t8132 HDMI (PS190): enable HDMI power before the
+                     * DP-to-HDMI converter using macsmc CMD_OUTPUT|1 (0x01000001). */
+                    smc_write_u32(smc, dcp->hdmi_pwr_gpio, SMC_GPIO_CMD_OUTPUT | 1);
+                    smc_write_u32(smc, dcp->dp2hdmi_pwr_gpio, SMC_GPIO_CMD_OUTPUT | 1);
                     smc_shutdown(smc);
                     mdelay(100);
                 } else {
@@ -280,19 +282,18 @@ dcp_dev_t *dcp_init(const display_config_t *cfg)
 {
     u32 sid;
     bool protected_cpu = cfg && pmgr_device_is_protected(cfg->pmgr_dev);
+    bool phy_t8132 = false;
 
     dcp_init_quiesced = false;
 
     if (cfg && cfg->dptx_phy[0]) {
         int phy_node = adt_path_offset(adt, cfg->dptx_phy);
         bool phy_t8152 = phy_node >= 0 && adt_is_compatible(adt, phy_node, "dptx-phy,t8152");
-        bool phy_t8132 = phy_node >= 0 && adt_is_compatible(adt, phy_node, "dptx-phy,t8132");
+        phy_t8132 = phy_node >= 0 && adt_is_compatible(adt, phy_node, "dptx-phy,t8132");
 
-        /* J873g reports mBoot-20457.1.29, which is not in the OS firmware
-         * table, and dedicated T8132 HDMI uses firmware 27.2 on dcpext0.
-         * Keep the V13_5 restriction for the older machines it was written for. */
-        if (os_firmware.version != V13_5 && !phy_t8152 &&
-            !(phy_t8132 && os_firmware.version == V27_2) && chip_id != T8152) {
+        /* Key newer DPTX support on the PHY compatible (dptx-phy,t8152 / dptx-phy,t8132);
+         * keep the V13_5 restriction for the older machines it was written for. */
+        if (os_firmware.version != V13_5 && !phy_t8152 && !phy_t8132 && chip_id != T8152) {
             printf("dcp: dtpx-port is only supported with V13_5 OS firmware.\n");
             return NULL;
         }
@@ -300,9 +301,15 @@ dcp_dev_t *dcp_init(const display_config_t *cfg)
         strncpy(dcp_pmgr_dev, cfg->pmgr_dev, sizeof(dcp_pmgr_dev));
         dcp_die = cfg->die;
         /* Protected display CPUs (e.g. T8132 DISPEXT0_CPU, which reads
-         * target=15, actual=0 while idle at boot) reject PMGR writes in
-         * pmgr_set_mode(); skip powering them here. */
-        if (!protected_cpu && pmgr_adt_power_enable(cfg->dcp) < 0) {
+         * target=15, actual=0 with AUTO_ENABLE while idle at boot) reject PMGR
+         * writes; verify read-only that iBoot left the domain requested active
+         * instead of calling pmgr_adt_power_enable(). */
+        if (protected_cpu) {
+            if (pmgr_power_is_requested(dcp_die, cfg->pmgr_dev) != 1) {
+                printf("dcp: protected %s is not powered\n", cfg->pmgr_dev);
+                return NULL;
+            }
+        } else if (pmgr_adt_power_enable(cfg->dcp) < 0) {
             printf("dcp: failed to power on %s\n", cfg->dcp);
             return NULL;
         }
@@ -349,6 +356,8 @@ dcp_dev_t *dcp_init(const display_config_t *cfg)
         printf("dcp: failed to initialize DCP DART\n");
         goto out_free;
     }
+    if (phy_t8132)
+        dart_preserve_dva_base(dcp->dart_dcp);
     u64 vm_base = dart_vm_base(dcp->dart_dcp);
     dart_setup_pt_region(dcp->dart_dcp, cfg->dcp_dart, sid, vm_base);
 
@@ -357,6 +366,8 @@ dcp_dev_t *dcp_init(const display_config_t *cfg)
         printf("dcp: failed to initialize DISP DART\n");
         goto out_dart_dcp;
     }
+    if (phy_t8132)
+        dart_preserve_dva_base(dcp->dart_disp);
     // set disp0's page tables at dart-dcp's vm-base
     dart_setup_pt_region(dcp->dart_disp, cfg->disp_dart, 0, vm_base);
 

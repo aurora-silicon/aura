@@ -85,6 +85,8 @@ static const void *adt_getprop(void *tree, int node, const char *name, u32 *len)
     (void)tree; (void)len;
     if (is_t8132_hdmi && node == 1 && !strcmp(name, "external"))
         return &dummy_adt;
+    if (is_t8132_hdmi && node == 2 && !strcmp(name, "dp2hdmi-gpio-parent"))
+        return &dummy_adt;
     return NULL;
 }
 static int display_configure(const char *config) { (void)config; configures++; return 0; }
@@ -129,9 +131,10 @@ int main(void)
     os_firmware.version = V27_2;
     assert(display_init() == 0 && !t8132_hdmi_inits && !configures);
     assert(!display_dart_tables_inherited() && !dart_queries && !config_queries);
-    /* Headless T8132 on 27.2 uses early HDMI on dcpext0 and inherits locked display DART tables. */
+    /* Headless T8132 with dptx-phy,t8132 + dp2hdmi-gpio-parent uses early HDMI on dcpext0
+     * regardless of firmware version and inherits locked display DART tables. */
     boot(T8132);
-    os_firmware.version = V27_2;
+    os_firmware.version = V_UNKNOWN;
     is_t8132_hdmi = true;
     assert(display_init() == 0 && t8132_hdmi_inits == 1 && !configures);
     assert(display_dart_tables_inherited() && dart_queries == 1 && config_queries == 1);

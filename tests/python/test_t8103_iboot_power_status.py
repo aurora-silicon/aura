@@ -176,7 +176,7 @@ static u64 get_ticks(void) { return 0; }
 static u64 ticks_to_msecs(u64 t) { return t; }
 /* Framebuffer remap leaves follow the timing query, which every case fails. */
 static uintptr_t display_map_fb(uintptr_t iova, u64 pa, u64 size) { (void)iova; (void)pa; (void)size; assert(0); return 0; }
-static int display_swap(u64 iova, u32 stride, u32 w, u32 h) { (void)iova; (void)stride; (void)w; (void)h; assert(0); return -1; }
+static int display_swap(u64 iova, u32 stride, u32 w, u32 h, u32 fmt) { (void)iova; (void)stride; (void)w; (void)h; (void)fmt; assert(0); return -1; }
 static u64 top_of_memory_alloc(size_t s) { (void)s; assert(0); return 0; }
 static u64 iova_alloc(void *d, size_t s) { (void)d; (void)s; assert(0); return 0; }
 static void iova_free(void *d, u64 a, size_t s) { (void)d; (void)a; (void)s; assert(0); }

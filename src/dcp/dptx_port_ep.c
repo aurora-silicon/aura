@@ -629,6 +629,9 @@ static u32 dptxport_call_v2(afk_epic_service_t *service, u16 group, u32 command,
             return 0;
         }
         case DPTX_APCALL_SET_DRIVE_SETTINGS: {
+            /* Group 1 AP call layout (macOS 27.2 DCP firmware / Linux dptxep.c):
+             * SET_DRIVE_SETTINGS puts status at +0x00, count at +0x10, tuples at +0x20;
+             * GET_DRIVE_SETTINGS puts count at +0x00, status at +0x10, tuples at +0x20. */
             u32 count;
             dptx_drive_settings_t settings[4];
             if (group != 1)
@@ -709,21 +712,21 @@ static u32 dptxport_call_v2(afk_epic_service_t *service, u16 group, u32 command,
             memcpy(reply, data, min(reply_size, data_size));
             dptxport_reply_ok(reply, reply_size);
             return 0;
-        case DPTX_APCALL_SET_TILED_DISPLAY_HINTS: {
-            if (chip_id != T8152 && !dptx_phy_needs_validate(port ? port->phy : NULL))
-                return 0xe00002c7;
-            memcpy(reply, data, min(reply_size, data_size));
+        case DPTX_APCALL_SET_TILED_DISPLAY_HINTS:
             if (reply_size >= 160 && data_size >= 160) {
-                /* Firmware 27.2 tiled-display hints place allocation fields at
-                 * +0x70..+0x8f and the status word at +0x90, leaving +0x00 intact. */
+                /* 160-byte tiled-display hints (macOS 27.2 DCP ABI) place allocation
+                 * fields at +0x70..+0x8f and the status word at +0x90, leaving +0x00
+                 * intact. Select purely on payload size. */
+                memcpy(reply, data, min(reply_size, data_size));
                 memset((u8 *)reply + 0x70, 0, 0x20);
                 memset((u8 *)reply + 0x90, 0, sizeof(u32));
                 return 0;
             }
-            u32 retcode = 1;
-            memcpy(reply, &retcode, min(reply_size, sizeof(retcode)));
+            if (chip_id != T8152)
+                return 0xe00002c7;
+            memcpy(reply, data, min(reply_size, data_size));
+            dptxport_reply_ok(reply, reply_size);
             return 0;
-        }
         default:
             return 0xe00002c7;
     }

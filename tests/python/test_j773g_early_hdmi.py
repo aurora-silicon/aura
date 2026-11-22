@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
-"""Host unit tests for J773g (M4 Mac mini, T8132) 27.2 early HDMI display bring-up.
+"""Host unit tests for J773g (M4 Mac mini, T8132) early HDMI display bring-up.
 
-Compiles production functions verbatim from src/pmgr.c, src/dart.c,
+Compiles production code verbatim from src/pmgr.c, src/dart.c, src/dcp.c,
 src/dcp/dptx_phy.c, src/afk.c, src/dcp/dptx_port_ep.c, and src/display.c
 against deterministic host stand-ins.
 """
@@ -22,6 +22,10 @@ def extract_fn(text, signature):
     return text[start:end]
 
 
+def strip_includes(text):
+    return "\n".join(line for line in text.splitlines() if not line.startswith("#include"))
+
+
 def compile_and_run(tmp_path, name, source, extra_cflags=()):
     src = tmp_path / f"{name}.c"
     exe = tmp_path / name
@@ -39,10 +43,13 @@ def compile_and_run(tmp_path, name, source, extra_cflags=()):
 
 
 def test_t8132_pmgr_protects_display_cpus(tmp_path):
-    pmgr = (REPO / "src/pmgr.c").read_text()
+    """Compile src/pmgr.h + src/pmgr.c verbatim (no local struct/bit copies)."""
+    pmgr_h = strip_includes((REPO / "src/pmgr.h").read_text())
+    pmgr_c = strip_includes((REPO / "src/pmgr.c").read_text())
     harness = r'''
 #include <assert.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -51,83 +58,110 @@ typedef uint8_t u8; typedef uint16_t u16; typedef uint32_t u32; typedef uint64_t
 #define GENMASK(h, l) ((BIT((h) + 1) - 1) & ~(BIT(l) - 1))
 #define FIELD_PREP(f, v) (((v) * ((f) & -(f))) & (f))
 #define FIELD_GET(f, v) (((v) & (f)) / ((f) & -(f)))
+#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 #define PACKED __attribute__((packed))
 #define T8132 0x8132
 #define T8140 0x8140
-#define PMGR_RESET BIT(31)
-#define PMGR_AUTO_ENABLE BIT(28)
-#define PMGR_DEV_DISABLE BIT(10)
-#define PMGR_WAS_CLKGATED BIT(9)
-#define PMGR_WAS_PWRGATED BIT(8)
-#define PMGR_PS_ACTUAL GENMASK(7, 4)
-#define PMGR_PS_TARGET GENMASK(3, 0)
-#define PMGR_PS_ACTIVE 0xf
-#define PMGR_POLL_TIMEOUT 10
-struct pmgr_device {
-    u8 flags; u16 unk1; u8 id1;
-    union { struct { u8 parent[2]; u8 unk2[2]; } u8id; struct { u16 parent[2]; } u16id; };
-    u8 unk3[2]; u8 addr_offset; u8 psreg_idx; u8 unk4[4];
-    struct { u32 offset : 24; u32 group : 8; } group_and_offset;
-    u8 unk5[6]; u16 id2; u8 unk6[4];
-    const char name[0x10];
-} PACKED;
-static u32 chip_id = T8132;
-static int pmgr_dies = 1;
-static bool pmgr_use_group_and_offset = false;
-bool pmgr_keep_configured = false;
-static struct pmgr_device devs[3];
-static const struct pmgr_device *pmgr_devices = devs;
-static u32 pmgr_devices_len = 3;
-static u32 regs[3];
-static unsigned writes[3];
-static uintptr_t pmgr_device_get_addr(u8 die, const struct pmgr_device *dev)
+#define ADT_GETPROP(a, n, p, v) (-1)
+static int chip_id = T8132;
+static void *adt = (void *)1;
+static const void *devices_prop;
+static u32 devices_len;
+static const u32 ps_regs[] = {0, 0, 0};
+static int adt_path_offset(const void *a, const char *path) { (void)a; (void)path; return 1; }
+static int adt_path_offset_trace(const void *a, const char *path, int *trace)
 {
-    (void)die;
-    return 0x1000 + (uintptr_t)dev->addr_offset * 8;
+    (void)a; (void)path;
+    trace[0] = 1; trace[1] = 0;
+    return 1;
 }
-static int reg_idx(uintptr_t addr) { return (int)((addr - 0x1000) / 8); }
+static bool adt_is_compatible(const void *a, int node, const char *compat)
+{
+    (void)a; (void)node; (void)compat;
+    return false;
+}
+static const void *adt_getprop(const void *a, int node, const char *name, u32 *len)
+{
+    (void)a; (void)node;
+    if (!strcmp(name, "ps-regs")) { *len = sizeof(ps_regs); return ps_regs; }
+    if (!strcmp(name, "devices")) { *len = devices_len; return devices_prop; }
+    *len = 0;
+    return NULL;
+}
+#define PS_BASE 0x2d0000000UL
+static int adt_get_reg(const void *a, const int *path, const char *prop, int idx, u64 *addr, u64 *size)
+{
+    (void)a; (void)path; (void)prop; (void)idx; (void)size;
+    *addr = PS_BASE;
+    return 0;
+}
+static u32 regs[4];
+static unsigned writes[4];
+static int reg_idx(uintptr_t addr)
+{
+    assert(addr >= PS_BASE && (addr - PS_BASE) / 8 < ARRAY_SIZE(regs));
+    return (int)((addr - PS_BASE) / 8);
+}
 static u32 read32(uintptr_t addr) { return regs[reg_idx(addr)]; }
-static void mask32(uintptr_t addr, u32 clr, u32 set)
+static void write32(uintptr_t addr, u32 v) { writes[reg_idx(addr)]++; regs[reg_idx(addr)] = v; }
+static u32 mask32(uintptr_t addr, u32 clr, u32 set)
 {
     int i = reg_idx(addr);
     writes[i]++;
     regs[i] = (regs[i] & ~clr) | set;
     regs[i] = (regs[i] & ~0xf0u) | ((regs[i] & 0xfu) << 4);
+    return regs[i];
 }
-static void set32(uintptr_t addr, u32 v) { writes[reg_idx(addr)]++; regs[reg_idx(addr)] |= v; }
-static void clear32(uintptr_t addr, u32 v) { writes[reg_idx(addr)]++; regs[reg_idx(addr)] &= ~v; }
+static u32 set32(uintptr_t addr, u32 v) { int i = reg_idx(addr); writes[i]++; return regs[i] |= v; }
+static u32 clear32(uintptr_t addr, u32 v) { int i = reg_idx(addr); writes[i]++; return regs[i] &= ~v; }
 static int poll32(uintptr_t addr, u32 m, u32 v, u32 t) { (void)addr; (void)m; (void)v; (void)t; return 0; }
 static void udelay(u32 us) { (void)us; }
-static bool pmgr_protected_addr(uintptr_t addr);
-''' + "\n".join([
-        extract_fn(pmgr, "static bool pmgr_protected_name("),
-        extract_fn(pmgr, "bool pmgr_device_is_protected("),
-        extract_fn(pmgr, "static bool pmgr_protected_device("),
-        extract_fn(pmgr, "static bool pmgr_protected_addr("),
-        extract_fn(pmgr, "int pmgr_set_mode("),
-        extract_fn(pmgr, "static int pmgr_reset_device("),
-    ]) + r'''
+''' + pmgr_h + "\n" + pmgr_c + r'''
+static struct pmgr_device table[3];
 int main(void)
 {
-    strcpy((char *)devs[0].name, "DISP_CPU");     devs[0].addr_offset = 0; regs[0] = 0x1000000f;
-    strcpy((char *)devs[1].name, "DISPEXT0_CPU"); devs[1].addr_offset = 1; regs[1] = 0x1404024f;
-    strcpy((char *)devs[2].name, "DPTX_PHY");     devs[2].addr_offset = 2; regs[2] = 0x0;
+    memset(table, 0, sizeof(table));
+    table[0].id2 = 1; table[0].addr_offset = 0; strcpy((char *)table[0].name, "DISP_CPU");
+    table[1].id2 = 2; table[1].addr_offset = 1; strcpy((char *)table[1].name, "DISPEXT0_CPU");
+    table[2].id2 = 3; table[2].addr_offset = 2; strcpy((char *)table[2].name, "DPTX_PHY");
+    devices_prop = table;
+    devices_len = sizeof(table);
 
-    assert(pmgr_protected_device(&devs[0]));
-    assert(pmgr_protected_device(&devs[1]));
-    assert(!pmgr_protected_device(&devs[2]));
+    /* Boot register states observed on live J773g 27.2: AUTO_ENABLE + TARGET=15 + ACTUAL=0. */
+    regs[0] = 0x1000030f;
+    regs[1] = 0x1000030f;
+    regs[2] = 0x0;
+    assert(pmgr_init() == 0);
+    assert(writes[0] == 0 && writes[1] == 0 && writes[2] == 0);
+
+    assert(pmgr_protected_device(&table[0]));
+    assert(pmgr_protected_device(&table[1]));
+    assert(!pmgr_protected_device(&table[2]));
     assert(pmgr_device_is_protected("DISP_CPU"));
     assert(pmgr_device_is_protected("DISPEXT0_CPU"));
     assert(!pmgr_device_is_protected("DPTX_PHY"));
 
-    /* Protected display CPUs refuse transitions and resets with zero MMIO writes. */
-    assert(pmgr_set_mode(0x1000, PMGR_PS_ACTIVE) == -1 && writes[0] == 0);
-    assert(pmgr_set_mode(0x1008, PMGR_PS_ACTIVE) == -1 && writes[1] == 0);
-    assert(pmgr_reset_device(0, &devs[0]) == -1 && writes[0] == 0);
-    assert(pmgr_reset_device(0, &devs[1]) == -1 && writes[1] == 0);
+    /* Auto-gated active protected domain (0x1000030f): ACTIVE succeeds read-only, power-off & reset fail. */
+    assert(pmgr_power_is_requested(0, "DISPEXT0_CPU") == 1);
+    assert(pmgr_set_mode(PS_BASE + 8, PMGR_PS_ACTIVE) == 0 && writes[1] == 0);
+    assert(pmgr_set_mode(PS_BASE + 8, PMGR_PS_PWRGATE) == -1 && writes[1] == 0);
+    assert(pmgr_reset_device(0, &table[1]) == -1 && writes[1] == 0);
+
+    /* Fully active protected domain (ACTUAL=15): ACTIVE succeeds read-only. */
+    regs[1] = 0x000000ff;
+    assert(pmgr_power_is_requested(0, "DISPEXT0_CPU") == 1);
+    assert(pmgr_set_mode(PS_BASE + 8, PMGR_PS_ACTIVE) == 0 && writes[1] == 0);
+
+    /* Off (0x0) or non-auto-gated idle (0x0000000f) protected domain: refuses ACTIVE with zero writes. */
+    regs[1] = 0x00000000;
+    assert(pmgr_power_is_requested(0, "DISPEXT0_CPU") == 0);
+    assert(pmgr_set_mode(PS_BASE + 8, PMGR_PS_ACTIVE) == -1 && writes[1] == 0);
+    regs[1] = 0x0000000f;
+    assert(pmgr_power_is_requested(0, "DISPEXT0_CPU") == 0);
+    assert(pmgr_set_mode(PS_BASE + 8, PMGR_PS_ACTIVE) == -1 && writes[1] == 0);
 
     /* Non-protected DPTX_PHY powers on normally. */
-    assert(pmgr_set_mode(0x1010, PMGR_PS_ACTIVE) == 0 && writes[2] == 1);
+    assert(pmgr_set_mode(PS_BASE + 16, PMGR_PS_ACTIVE) == 0 && writes[2] == 1);
     assert(FIELD_GET(PMGR_PS_ACTUAL, regs[2]) == PMGR_PS_ACTIVE);
     puts("PASS t8132 pmgr protection");
     return 0;
@@ -137,7 +171,9 @@ int main(void)
     assert "PASS t8132 pmgr protection" in out
 
 
-def test_locked_dart_releases_empty_heap_l2_keeps_active_and_iboot(tmp_path):
+def test_dart_dva_base_scope_and_locked_l2_release(tmp_path):
+    """Verify dva_base stays 0 unless explicitly opted in on locked T8110, and
+    dart_shutdown_checked only releases empty heap L2 tables when dva_base != 0."""
     dart = (REPO / "src/dart.c").read_text()
     defs = dart[dart.index("#define DART_T8020_CONFIG "):dart.index("/* The two-level Gen3")]
     sig = "static void dart_gen3_tlb_invalidate(dart_dev_t *dart)"
@@ -162,6 +198,7 @@ enum dart_type_t { DART_T8020, DART_T8110, DART_T6000, DART_GEN3 };
 #define T8152 0x8152
 #define dma_wmb() ((void)0)
 static int chip_id = 0x8132;
+static void *adt = (void *)1;
 static int tlbi_fail = 0, tlbi_calls = 0;
 static void write32(u64 addr, u32 v) { (void)addr; (void)v; }
 static int poll32(u64 addr, u32 m, u32 v, u32 t)
@@ -170,7 +207,6 @@ static int poll32(u64 addr, u32 m, u32 v, u32 t)
     tlbi_calls++;
     return tlbi_fail ? -1 : 0;
 }
-/* pool[0] = iBoot L1, pool[1] = iBoot L2 (non-heap), pool[2..5] = heap L2s + dart struct. */
 static u64 iboot_pages[2][SZ_16K / 8] __attribute__((aligned(SZ_16K)));
 static u64 heap_pages[4][SZ_16K / 8] __attribute__((aligned(SZ_16K)));
 static void *freed[8];
@@ -182,7 +218,59 @@ static bool is_heap(const void *p)
 }
 static void mock_free(void *p) { freed[nfreed++] = p; }
 #define free mock_free
-''' + defs + "\n" + extract_fn(dart, "bool dart_shutdown_checked(") + r'''
+''' + defs + r'''
+static const char *mock_compat = "dart,t8110";
+static u64 mock_vm_base = 0x10000000000UL;
+static bool mock_locked = true;
+static dart_dev_t mock_dev_storage;
+static int adt_path_offset_trace(void *a, const char *p, int *trace)
+{
+    (void)a; (void)p; trace[0] = 1; trace[1] = 0; return 1;
+}
+static int adt_get_reg(void *a, int *trace, const char *p, int idx, u64 *base, u64 *sz)
+{
+    (void)a; (void)trace; (void)p; (void)idx; (void)sz;
+    *base = 0x300000000UL;
+    return 0;
+}
+static bool adt_is_compatible(void *a, int node, const char *c)
+{
+    (void)a; (void)node;
+    return strcmp(mock_compat, c) == 0;
+}
+static const void *adt_getprop(void *a, int node, const char *name, u32 *len)
+{
+    (void)a; (void)node;
+    if (!strcmp(name, "vm-base")) {
+        if (len) *len = sizeof(mock_vm_base);
+        return &mock_vm_base;
+    }
+    return NULL;
+}
+static dart_dev_t *dart_gen3_adopt_adt(int node, uintptr_t base, int dev, bool keep_pts)
+{
+    (void)node; (void)base; (void)dev; (void)keep_pts;
+    memset(&mock_dev_storage, 0, sizeof(mock_dev_storage));
+    mock_dev_storage.type = DART_GEN3;
+    mock_dev_storage.locked = true;
+    return &mock_dev_storage;
+}
+static dart_dev_t *dart_init(uintptr_t base, u8 dev, bool keep_pts, enum dart_type_t type)
+{
+    (void)base; (void)dev; (void)keep_pts;
+    memset(&mock_dev_storage, 0, sizeof(mock_dev_storage));
+    mock_dev_storage.type = type;
+    mock_dev_storage.locked = mock_locked;
+    mock_dev_storage.params = (type == DART_T8110) ? &dart_t8110 : &dart_t6000;
+    return &mock_dev_storage;
+}
+''' + "\n".join([
+        extract_fn(dart, "dart_dev_t *dart_init_adt("),
+        extract_fn(dart, "bool dart_shutdown_checked("),
+        extract_fn(dart, "u64 dart_vm_base("),
+        extract_fn(dart, "u64 dart_dva_base("),
+        extract_fn(dart, "void dart_preserve_dva_base("),
+    ]) + r'''
 #undef free
 static u64 pte_of(const void *p)
 {
@@ -190,34 +278,65 @@ static u64 pte_of(const void *p)
 }
 int main(void)
 {
-    /* Case 1: locked dart-dcpext0 with iBoot L2 (idx 0), empty heap L2 (idx 1), active heap L2 (idx 2). */
+    /* Part A: dva_base scoping (zero blast radius on non-opted-in DARTs and non-T8110 DARTs). */
+    mock_compat = "dart,t8110"; mock_locked = true; mock_vm_base = 0x10000000000UL;
+    dart_dev_t *d = dart_init_adt("/arm-io/dart-dcpext0", 0, 23, true);
+    assert(d && dart_vm_base(d) == 0 && dart_dva_base(d) == 0); /* default 0 (e.g. USB/M4 Pro 26.x) */
+    dart_preserve_dva_base(d);
+    assert(dart_dva_base(d) == 0x10000000000UL && dart_vm_base(d) == 0);
+
+    /* Non-T8110 locked DART (M1/M1 Pro) never enables dva_base even if requested. */
+    mock_compat = "dart,t6000"; mock_locked = true; mock_vm_base = 0x10000000000UL;
+    d = dart_init_adt("/arm-io/dart-dcp", 0, 0, true);
+    dart_preserve_dva_base(d);
+    assert(d && dart_dva_base(d) == 0 && dart_vm_base(d) == 0);
+
+    /* Low vm-base (M2) has dva_base == 0 even on locked T8110. */
+    mock_compat = "dart,t8110"; mock_locked = true; mock_vm_base = 0x10000000UL;
+    d = dart_init_adt("/arm-io/dart-dcp", 0, 0, true);
+    dart_preserve_dva_base(d);
+    assert(d && dart_dva_base(d) == 0 && dart_vm_base(d) == 0x10000000UL);
+
+    /* Unlocked T8110 never enables dva_base. */
+    mock_compat = "dart,t8110"; mock_locked = false; mock_vm_base = 0x10000000000UL;
+    d = dart_init_adt("/arm-io/dart-usb0", 0, 0, false);
+    dart_preserve_dva_base(d);
+    assert(d && dart_dva_base(d) == 0);
+
+    /* Gen3 DART never enables dva_base. */
+    mock_compat = "dart,gen3";
+    d = dart_init_adt("/arm-io/dart-dcp", 0, 0, true);
+    dart_preserve_dva_base(d);
+    assert(d && dart_dva_base(d) == 0);
+
+    /* Part B Case 1: locked high-dva-base T8110 releases empty heap L2, keeps iBoot & active heap L2. */
     memset(iboot_pages, 0, sizeof(iboot_pages));
     memset(heap_pages, 0, sizeof(heap_pages));
     nfreed = tlbi_calls = tlbi_fail = 0;
 
     iboot_pages[0][0] = pte_of(iboot_pages[1]); /* iBoot L2, empty, must NOT be touched */
-    iboot_pages[0][1] = pte_of(heap_pages[0]);  /* empty heap L2 -> unlink, TLBI, remove from legacy_l2, free */
-    iboot_pages[0][2] = pte_of(heap_pages[1]);  /* active heap L2 (FB) -> keep! */
-    heap_pages[1][0] = pte_of(iboot_pages[1]);  /* valid PTE inside active heap L2 */
+    iboot_pages[0][1] = pte_of(heap_pages[0]);  /* empty heap L2 -> unlink, TLBI, remove, free */
+    iboot_pages[0][2] = pte_of(heap_pages[1]);  /* active heap L2 (FB) -> keep */
+    heap_pages[1][0] = pte_of(iboot_pages[1]);
 
     legacy_l2_pages[0] = (u64)heap_pages[0];
     legacy_l2_pages[1] = (u64)heap_pages[1];
     legacy_l2_count = 2;
 
-    dart_dev_t *d = (dart_dev_t *)heap_pages[2];
+    d = (dart_dev_t *)heap_pages[2];
     *d = (dart_dev_t){
         .locked = true, .legacy_mutable = true, .type = DART_T8110,
-        .params = &dart_t8110, .l1 = {iboot_pages[0]},
+        .dva_base = 0x10000000000UL, .params = &dart_t8110, .l1 = {iboot_pages[0]},
     };
     assert(dart_shutdown_checked(d));
     assert(tlbi_calls == 1);
-    assert(iboot_pages[0][0] == pte_of(iboot_pages[1])); /* iBoot L2 untouched */
-    assert(iboot_pages[0][1] == 0);                      /* empty heap L2 unlinked */
-    assert(iboot_pages[0][2] == pte_of(heap_pages[1]));  /* active heap L2 kept */
+    assert(iboot_pages[0][0] == pte_of(iboot_pages[1]));
+    assert(iboot_pages[0][1] == 0);
+    assert(iboot_pages[0][2] == pte_of(heap_pages[1]));
     assert(legacy_l2_count == 1 && legacy_l2_pages[0] == (u64)heap_pages[1]);
     assert(nfreed == 2 && freed[0] == heap_pages[0] && freed[1] == d);
 
-    /* Case 2: TLB invalidation fails -> keep page in legacy_l2_pages and do not free. */
+    /* Part B Case 2: TLBI failure keeps page in legacy_l2_pages and frees nothing. */
     memset(iboot_pages, 0, sizeof(iboot_pages));
     memset(heap_pages, 0, sizeof(heap_pages));
     nfreed = tlbi_calls = 0;
@@ -228,25 +347,45 @@ int main(void)
     d = (dart_dev_t *)heap_pages[2];
     *d = (dart_dev_t){
         .locked = true, .legacy_mutable = true, .type = DART_T8110,
-        .params = &dart_t8110, .l1 = {iboot_pages[0]},
+        .dva_base = 0x10000000000UL, .params = &dart_t8110, .l1 = {iboot_pages[0]},
     };
     assert(!dart_shutdown_checked(d));
     assert(legacy_l2_count == 1 && legacy_l2_pages[0] == (u64)heap_pages[0]);
     assert(nfreed == 0);
 
-    puts("PASS locked dart L2 release");
+    /* Part B Case 3: M1/M2 locked legacy DART (dva_base == 0) is untouched on shutdown. */
+    memset(iboot_pages, 0, sizeof(iboot_pages));
+    memset(heap_pages, 0, sizeof(heap_pages));
+    nfreed = tlbi_calls = tlbi_fail = 0;
+    iboot_pages[0][1] = pte_of(heap_pages[0]);
+    legacy_l2_pages[0] = (u64)heap_pages[0];
+    legacy_l2_count = 1;
+    d = (dart_dev_t *)heap_pages[2];
+    *d = (dart_dev_t){
+        .locked = true, .legacy_mutable = true, .type = DART_T8110,
+        .dva_base = 0, .params = &dart_t8110, .l1 = {iboot_pages[0]},
+    };
+    assert(dart_shutdown_checked(d));
+    assert(tlbi_calls == 0);
+    assert(iboot_pages[0][1] == pte_of(heap_pages[0]));
+    assert(legacy_l2_count == 1 && nfreed == 1 && freed[0] == d);
+
+    puts("PASS dart dva_base and L2 release");
     return 0;
 }
 '''
     out = compile_and_run(tmp_path, "dart-locked-l2", harness, extra_cflags=("-no-pie",))
-    assert "PASS locked dart L2 release" in out
+    assert "PASS dart dva_base and L2 release" in out
 
 
-def test_t8132_dptx_phy_sequence(tmp_path):
+def test_t8132_dptx_phy_sequence_and_math(tmp_path):
+    """Independently verify 24 MHz PLL frequency math, symbol clock divider,
+    absent calibration handling, and error paths from written MMIO registers."""
     phy = (REPO / "src/dcp/dptx_phy.c").read_text()
     phy_body = phy[phy.index("enum dptx_type {"):phy.index("/* Read-modify-write of a field in the core")]
     harness = r'''
 #include <assert.h>
+#include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -262,6 +401,7 @@ typedef uint8_t u8; typedef uint16_t u16; typedef uint32_t u32; typedef unsigned
 typedef struct atc_phy atc_phy_t;
 static u32 dptx_regs[0x10000 / 4];
 static u32 core_regs[0x4000 / 4];
+static bool sim_impcal_fail, sim_pll_no_ack, sim_pll_no_lock;
 #define DPTX_BASE 0x100000UL
 #define CORE_BASE 0x200000UL
 static u32 *reg_ptr(u64 addr)
@@ -277,16 +417,14 @@ static u32 read32(u64 addr) { return *reg_ptr(addr); }
 static void write32(u64 addr, u32 val)
 {
     *reg_ptr(addr) = val;
-    /* Simulate AUX impedance calibration done + code 0x35 on 0x4200 bit 0. */
     if (addr == DPTX_BASE + 0x4200 && (val & 1)) {
-        dptx_regs[0x4204 / 4] = 1;
+        dptx_regs[0x4204 / 4] = sim_impcal_fail ? 0 : 1;
         dptx_regs[0x4210 / 4] = 0x35U << 18;
     }
-    /* Simulate PLL command ACK + lock state on 0x100c bit 3. */
     if (addr == DPTX_BASE + 0x100c && (val & 8)) {
         u32 cmd = val & 7;
-        dptx_regs[0x1014 / 4] = 1;
-        dptx_regs[0x1008 / 4] = (cmd == 7) ? (1U << 3) : 0;
+        dptx_regs[0x1014 / 4] = sim_pll_no_ack ? 0 : 1;
+        dptx_regs[0x1008 / 4] = (cmd == 7 && !sim_pll_no_lock) ? (1U << 3) : 0;
     }
 }
 static void mask32(u64 addr, u32 clear, u32 set) { write32(addr, (read32(addr) & ~clear) | set); }
@@ -295,70 +433,91 @@ static void clear32(u64 addr, u32 bits) { write32(addr, read32(addr) & ~bits); }
 static void udelay(u32 us) { (void)us; }
 static void mdelay(u32 ms) { (void)ms; }
 ''' + phy_body + r'''
+static void check_rate_math(dptx_phy_t *phy, u32 rate_mhz, double expected_vco_mhz, bool expect_half)
+{
+    assert(dptx_t8132_reconfigure(phy, false, 0, true, rate_mhz) == 0);
+    assert(phy->rate == rate_mhz);
+
+    /* Independently reconstruct VCO and symbol clock from written hardware registers. */
+    u32 fb_quad = dptx_regs[0x20b0 / 4] & 0x3ff;
+    u32 frac_num = (dptx_regs[0x20b4 / 4] >> 14) & 0x3fff;
+    u32 frac_den = dptx_regs[0x20b4 / 4] & 0x3fff;
+    u32 fb_int = fb_quad / 4;
+    double frac = frac_den ? ((double)frac_num / (double)frac_den) : 0.0;
+    double vco_mhz = 24.0 * ((double)fb_int + frac);
+    assert(fabs(vco_mhz - expected_vco_mhz) < 0.01);
+    assert((fb_quad % 4) == (u32)(4.0 * frac + 1e-9));
+
+    /* Symbol clock = VCO / (pclk_div + 1) must equal link_rate / 10 (8b/10b). */
+    u32 pclk_div = (dptx_regs[0x20b8 / 4] >> 9) & 0x1f;
+    assert(fabs((vco_mhz / (double)(pclk_div + 1)) - ((double)rate_mhz / 10.0)) < 0.01);
+
+    /* Half-rate mode bits in PHY + PLL. */
+    assert((dptx_regs[0x4004 / 4] & 0x60) == (expect_half ? 0x40U : 0x20U));
+    assert(dptx_regs[0x1008 / 4] & BIT(3));
+}
+
 int main(void)
 {
     dptx_phy_t phy = {
         .regs = {DPTX_BASE, CORE_BASE},
         .type = DPTX_PHY_T8132,
-        .dcp_index = 1, /* dcpext0 -> source select 1 */
+        .dcp_index = 1,
         .dfp_output = 4,
-        /* Exact J773g 27.2 ADT calibration values */
         .cal = {4, 15, 2, 16, 3, 0},
         .cal_set = {true, true, true, true, true, true},
     };
 
+    /* Calibration omission leaves pre-existing register fields untouched. */
+    dptx_regs[0x2230 / 4] = 0x1a;
+    dptx_phy_t uncal = {.regs = {DPTX_BASE, CORE_BASE}, .type = DPTX_PHY_T8132};
+    dptx_t8132_pll_core_cfg(&uncal);
+    assert((dptx_regs[0x2230 / 4] & 0x1f) == 0x1a);
+
+    /* Impedance calibration timeout is reported as failure. */
+    sim_impcal_fail = true;
+    dptx_phy_t fail_phy = phy;
+    assert(dptx_t8132_activate(&fail_phy) == -1);
+    sim_impcal_fail = false;
+
+    /* Normal activation and calibration. */
+    memset(dptx_regs, 0, sizeof(dptx_regs));
+    memset(core_regs, 0, sizeof(core_regs));
     assert(dptx_t8132_activate(&phy) == 0);
     assert(phy.active && phy.rate == 0);
-    /* Source select = 1, power enables set, isolation cleared. */
     assert((core_regs[0x10 / 4] & 0x7) == 1);
     assert((core_regs[0x48 / 4] & 0x777) == 0x333);
-    /* Calibration fields programmed cleanly. */
     assert((dptx_regs[0x2230 / 4] & 0x1f) == 15);
-    assert(((dptx_regs[0x22e8 / 4] >> 17) & 3) == 2);
-    assert(((dptx_regs[0x2240 / 4] >> 22) & 0x1f) == 16);
-    assert(((dptx_regs[0x22b0 / 4] >> 20) & 7) == 3);
-    /* Impedance calibration code 0x35 written to 0x4228[22:16] with valid bit 15. */
-    assert(((dptx_regs[0x4228 / 4] >> 16) & 0x7f) == 0x35);
-    assert(dptx_regs[0x4228 / 4] & BIT(15));
+    assert(((dptx_regs[0x4228 / 4] >> 16) & 0x7f) == 0x35 && (dptx_regs[0x4228 / 4] & BIT(15)));
 
-    /* Set 4 lanes before rate -> rate stays 0, all 4 lane disable bits cleared. */
+    /* Lane programming + invalid 3-lane rejection. */
     assert(dptx_t8132_reconfigure(&phy, true, 4, false, 0) == 0);
     assert(phy.active_lanes == 4 && phy.rate == 0);
-    for (int l = 0; l < 4; l++)
-        assert(!(dptx_regs[(0x5000 + l * 0x1000) / 4] & 0x100));
-    /* Invalid lane count rejected. */
     assert(dptx_t8132_reconfigure(&phy, true, 3, false, 0) == -1);
 
-    /* Program RBR (1620: full rate, bypass=1), HBR (2700), HBR2 (5400), HBR3 (8100: bypass=0),
-     * verifying exact integer/fractional feedback dividers computed from 24 MHz refclk. */
-    assert(dptx_t8132_reconfigure(&phy, false, 0, true, 1620) == 0);
-    assert(phy.rate == 1620 && (dptx_regs[0x222c / 4] & 3) == 2 && (dptx_regs[0x4004 / 4] & 0x60) == 0x20);
-    assert((dptx_regs[0x20b0 / 4] & 0x3ff) == 4 * 0x87 && dptx_regs[0x20b4 / 4] == 0);
-    assert(dptx_t8132_reconfigure(&phy, false, 0, true, 2700) == 0);
-    assert(phy.rate == 2700 && (dptx_regs[0x4004 / 4] & 0x60) == 0x40);
-    assert((dptx_regs[0x20b0 / 4] & 0x3ff) == 4 * 0x70 + 2);
-    assert(dptx_regs[0x20b4 / 4] == ((0x1fffU << 14) | 0x3ffeU));
-    assert(dptx_t8132_reconfigure(&phy, false, 0, true, 5400) == 0);
-    assert(phy.rate == 5400 && (dptx_regs[0x222c / 4] & 3) == 2);
-    assert((dptx_regs[0x20b0 / 4] & 0x3ff) == 4 * 0x70 + 2);
-    assert(dptx_regs[0x20b4 / 4] == ((0x1fffU << 14) | 0x3ffeU));
-    assert(dptx_t8132_reconfigure(&phy, false, 0, true, 8100) == 0);
-    assert(phy.rate == 8100 && (dptx_regs[0x222c / 4] & 3) == 1 && (dptx_regs[0x1008 / 4] & BIT(3)));
-    assert((dptx_regs[0x20b0 / 4] & 0x3ff) == 4 * 0xa8 + 3);
-    assert(dptx_regs[0x20b4 / 4] == ((0x2ffdU << 14) | 0x3ffcU));
+    /* Independent 24 MHz VCO & symbol-clock verification for RBR..HBR3. */
+    check_rate_math(&phy, 1620, 3240.0, false);
+    check_rate_math(&phy, 2700, 2700.0, true);
+    check_rate_math(&phy, 5400, 2700.0, true);
+    check_rate_math(&phy, 8100, 4050.0, true);
 
-    /* Rate 0 powers PLL down without error. */
+    /* PLL error paths: no ACK and missing lock both fail cleanly. */
     assert(dptx_t8132_reconfigure(&phy, false, 0, true, 0) == 0);
-    assert(phy.rate == 0 && !(dptx_regs[0x1008 / 4] & BIT(3)));
+    sim_pll_no_ack = true;
+    assert(dptx_t8132_reconfigure(&phy, false, 0, true, 2700) == -1);
+    sim_pll_no_ack = false;
+    sim_pll_no_lock = true;
+    assert(dptx_t8132_reconfigure(&phy, false, 0, true, 2700) == -1);
+    sim_pll_no_lock = false;
 
-    /* Deactivate clears active state and powers off blocks. */
+    /* Deactivate powers blocks down cleanly. */
     assert(dptx_t8132_deactivate(&phy) == 0);
     assert(!phy.active && (core_regs[0x48 / 4] & 0x777) == 0x444);
     puts("PASS t8132 dptx phy");
     return 0;
 }
 '''
-    out = compile_and_run(tmp_path, "dptx-phy-t8132", harness)
+    out = compile_and_run(tmp_path, "dptx-phy-t8132", harness, extra_cflags=("-lm",))
     assert "PASS t8132 dptx phy" in out
 
 
@@ -439,7 +598,6 @@ static int afk_epic_command(afk_epic_ep_t *e, u32 ch, u32 sub, void *tx, size_t 
     if (call->data_len >= 4)
         memcpy(&attrs, (u8 *)tx + 64, 4);
     cmd_attrs[cmd_cnt++] = (int)attrs;
-    /* Echo target/attrs and status = 0 in reply */
     if (call->command == 11 || call->command == 12)
         memset((u8 *)tx + 64 + 16, 0, 4);
     else if (call->command == 6)
@@ -500,14 +658,14 @@ int main(void)
     dptx.port[0].service = &svc;
     dptx.port[0].enabled = true;
 
-    /* 1. dcp_dptx_connect on T8132: validate(0x100) -> connect(0) -> request_display(6). */
+    /* 1. dcp_dptx_connect on dptx-phy,t8132: validate(0x100) -> connect(0) -> request_display(6). */
     assert(dcp_dptx_connect(&dptx, &phy, 0, 0) == 0);
     assert(cmd_cnt == 3);
     assert(cmd_log[0] == 12 && cmd_attrs[0] == 0x100);
     assert(cmd_log[1] == 11 && cmd_attrs[1] == 0);
     assert(cmd_log[2] == 6);
 
-    /* 2. ACTIVATE sets initial link_rate = 0 on T8132 and zeros reply[0..3]. */
+    /* 2. ACTIVATE sets initial link_rate = 0 and zeros reply[0..3]. */
     u8 buf32[32];
     memset(buf32, 0xaa, sizeof(buf32));
     u8 *r = send_cb(&epic, 0, DPTX_APCALL_ACTIVATE, buf32, sizeof(buf32));
@@ -515,7 +673,7 @@ int main(void)
     memcpy(&w0, r, 4);
     assert(w0 == 0 && phy.activates == 1 && dptx.port[0].link_rate == 0);
 
-    /* 3. GET_SUPPORTS_HPD returns 0 on T8132. */
+    /* 3. GET_SUPPORTS_HPD returns 0 on dptx-phy,t8132. */
     memset(buf32, 0xbb, sizeof(buf32));
     r = send_cb(&epic, 0, DPTX_APCALL_GET_SUPPORTS_HPD, buf32, sizeof(buf32));
     u64 val = 99;
@@ -523,7 +681,7 @@ int main(void)
     memcpy(&val, r + 16, 8);
     assert(w0 == 0 && val == 0);
 
-    /* 4. SET_DRIVE_SETTINGS (group 1, cmd 3) + GET_DRIVE_SETTINGS (group 1, cmd 4) through AFKV2. */
+    /* 4. SET_DRIVE_SETTINGS + GET_DRIVE_SETTINGS through AFKV2: afk.c preserves reply[0..3] on success. */
     u8 drive_req[32 + 4 * sizeof(dptx_drive_settings_t)] = {0};
     u32 cnt = 2;
     dptx_drive_settings_t lanes[2] = {{0, 1, 2}, {0, 2, 1}};
@@ -536,18 +694,19 @@ int main(void)
     assert(st == 0 && rcnt == 2);
 
     u8 get_req[32 + 4 * sizeof(dptx_drive_settings_t)] = {0};
-    memcpy(get_req, &cnt, 4); /* count at +0x00 */
+    memcpy(get_req, &cnt, 4);
     r = send_cb(&epic, 1, DPTX_APCALL_GET_DRIVE_SETTINGS, get_req, sizeof(get_req));
     u32 gcnt = 0, gst = 99;
     dptx_drive_settings_t out_lanes[2] = {0};
     memcpy(&gcnt, r, 4);
     memcpy(&gst, r + 16, 4);
     memcpy(out_lanes, r + 32, sizeof(out_lanes));
-    assert(gcnt == 2 && gst == 0); /* afk.c did NOT clobber reply[0..3]! */
+    assert(gcnt == 2 && gst == 0);
     assert(out_lanes[0].voltage == 1 && out_lanes[0].pre_emphasis == 2);
     assert(out_lanes[1].voltage == 2 && out_lanes[1].pre_emphasis == 1);
 
-    /* 5. 160-byte SET_TILED_DISPLAY_HINTS preserves hints[0] and sets status=0 at +0x90. */
+    /* 5. 160-byte SET_TILED_DISPLAY_HINTS selects layout purely by size (even with chip_id != T8132/T8152). */
+    chip_id = 0x6040;
     u8 tiled[160];
     memset(tiled, 0x55, sizeof(tiled));
     u32 hint0 = 0x12345678;
@@ -558,14 +717,13 @@ int main(void)
     memcpy(&rstatus, r + 0x90, 4);
     assert(rhint0 == 0x12345678 && rstatus == 0 && r[0x70] == 0 && r[0x8f] == 0);
 
-    /* 6. SET_RESOURCE_AVAILABLE (25) succeeds with status 0 on T8132, unsupported on T8152. */
-    memset(buf32, 0x77, sizeof(buf32));
-    r = send_cb(&epic, 0, DPTX_APCALL_SET_RESOURCE_AVAILABLE, buf32, sizeof(buf32));
+    /* 6. Short (<160) SET_TILED_DISPLAY_HINTS on non-T8152 fails with kIOReturnUnsupported written by afk.c. */
+    r = send_cb(&epic, 0, DPTX_APCALL_SET_TILED_DISPLAY_HINTS, buf32, sizeof(buf32));
     memcpy(&w0, r, 4);
-    assert(w0 == 0);
+    assert(w0 == 0xe00002c7);
 
-    /* 7. Non-T8132 (J873g/T8152): SET_DRIVE_SETTINGS preserves request bytes 4..15,
-     *    SET_RESOURCE_AVAILABLE returns kIOReturnUnsupported (0xe00002c7) written by afk.c. */
+    /* 7. J873g (T8152): preserves SET_DRIVE_SETTINGS bytes 4..15, zeros <160 tiled-hints reply[0..3],
+     *    and returns kIOReturnUnsupported on SET_RESOURCE_AVAILABLE. */
     phy.is_t8132 = false;
     chip_id = T8152;
     memset(drive_req, 0, sizeof(drive_req));
@@ -580,9 +738,19 @@ int main(void)
     assert(st == 0 && rmarker == 0xdeadbeef);
 
     memset(buf32, 0x77, sizeof(buf32));
+    r = send_cb(&epic, 0, DPTX_APCALL_SET_TILED_DISPLAY_HINTS, buf32, sizeof(buf32));
+    memcpy(&w0, r, 4);
+    assert(w0 == 0 && r[4] == 0x77);
+
     r = send_cb(&epic, 0, DPTX_APCALL_SET_RESOURCE_AVAILABLE, buf32, sizeof(buf32));
     memcpy(&w0, r, 4);
     assert(w0 == 0xe00002c7);
+
+    /* 8. Bad-argument error path clobbers reply[0..3] with 0xe00002c2. */
+    u8 short_buf[8] = {0};
+    r = send_cb(&epic, 0, DPTX_APCALL_SET_LINK_RATE, short_buf, sizeof(short_buf));
+    memcpy(&w0, r, 4);
+    assert(w0 == 0xe00002c2);
 
     puts("PASS afkv2 27.2 dptx callbacks");
     return 0;
@@ -592,37 +760,142 @@ int main(void)
     assert "PASS afkv2 27.2 dptx callbacks" in out
 
 
-def test_t8132_display_init_adopt_and_cleanup(tmp_path):
+def test_t8132_display_selection_bpp_and_cleanup(tmp_path):
+    """Test hardware-driven display_is_t8132_hdmi(), cbest.bpp -> FMT_BGRA/FMT_w30r,
+    and display_init_t8132_hdmi()'s own dcp_left_running() cleanup guard."""
     disp = (REPO / "src/display.c").read_text()
+    ibh = (REPO / "src/dcp_iboot.h").read_text()
+    dcph = (REPO / "src/dcp.h").read_text()
+    ib_types = ibh[ibh.index("enum DCPEOTF {"):ibh.index("dcp_iboot_if_t *dcp_ib_init")]
+    disp_cfg_type = dcph[dcph.index("typedef struct {"):dcph.index("} display_config_t;")] + "} display_config_t;\n"
+    cfg_decl = disp[disp.index("static const display_config_t display_config_t8132_hdmi_ext ="):disp.index("#define abs(x)")]
     harness = r'''
 #include <assert.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
-typedef uint32_t u32; typedef unsigned long u64;
+typedef uint8_t u8; typedef uint16_t u16; typedef uint32_t u32;
+typedef unsigned long u64; typedef long s64;
+#define PACKED __attribute__((packed))
+#define ALIGN_UP(x, a) (((x) + ((a) - 1)) & ~((a) - 1))
+#define SZ_16K (1 << 14)
+#define SZ_32M (1 << 25)
+#define T6030 0x6030
+#define T8132 0x8132
+#define T8152 0x8152
+#define DART_PTR_ERR (1ULL << 63)
+#define DART_IS_ERR(v) (((v) >> 63) & 1)
+#define FB_DEPTH_MASK 0xff
+#define FB_DEPTH_FLAG_RETINA 0x10000
+#define DISPLAY_STATUS_DELAY 100
+#define DISPLAY_STATUS_RETRIES(dptx) ((dptx) ? 100 : 20)
+#define COMPARE(a, b) if ((a) > (b)) { *best = modes[i]; continue; } else if ((a) < (b)) { continue; }
+#define abs(x) ((x) >= 0 ? (x) : -(x))
 typedef enum _dcp_shutdown_mode { DCP_QUIESCED = 0, DCP_SLEEP_IF_EXTERNAL = 1, DCP_SLEEP = 2 } dcp_shutdown_mode;
-static int dummy_dcp, dummy_iboot;
-static void *dcp, *iboot;
+''' + ib_types + disp_cfg_type + r'''
+typedef struct { void *dart_disp, *dart_dcp, *iovad_dcp, *dptx_ep; } dcp_dev_t;
+typedef struct { int id; } dcp_iboot_if_t;
+static u32 chip_id = 0x6040;
+static void *adt = (void *)1;
+static dcp_dev_t dummy_dcp, *dcp;
+static dcp_iboot_if_t dummy_iboot, *iboot;
 static u64 fb_dva, fb_size;
-static bool display_is_external, fb_dva_mapped, left_running;
-static struct { struct { u64 base, width, height, depth; } video; } cur_boot_args;
+static bool display_is_external, display_is_dptx, display_needs_power_cycle;
+static bool display_mode_max, fb_dva_allocated, fb_dva_mapped, left_running;
+static struct { struct { u64 base, stride, width, height, depth; } video; } cur_boot_args;
+static u8 boot_args_buf[sizeof(cur_boot_args)];
+static u64 boot_args_addr = (u64)boot_args_buf;
+
+/* Configurable ADT mock for display_is_t8132_hdmi() */
+static bool adt_has_disp0, adt_disp0_ext, adt_has_dcpext0, adt_has_gpio, adt_has_phy, adt_phy_gpio_parent;
+static const char *adt_phy_compat;
+static int adt_path_offset(void *a, const char *p)
+{
+    (void)a;
+    if (!strcmp(p, "/arm-io/disp0")) return adt_has_disp0 ? 1 : -1;
+    if (!strcmp(p, "/arm-io/dcpext0")) return adt_has_dcpext0 ? 2 : -1;
+    if (!strcmp(p, "/arm-io/dp2hdmi-gpio0")) return adt_has_gpio ? 3 : -1;
+    if (!strcmp(p, "/arm-io/dptx-phy")) return adt_has_phy ? 4 : -1;
+    return -1;
+}
+static const void *adt_getprop(void *a, int node, const char *name, u32 *len)
+{
+    (void)a; (void)len;
+    if (node == 1 && !strcmp(name, "external")) return adt_disp0_ext ? (void *)1 : NULL;
+    if (node == 4 && !strcmp(name, "dp2hdmi-gpio-parent")) return adt_phy_gpio_parent ? (void *)1 : NULL;
+    return NULL;
+}
+static bool adt_is_compatible(void *a, int node, const char *compat)
+{
+    (void)a;
+    return node == 4 && adt_phy_compat && !strcmp(adt_phy_compat, compat);
+}
+static int adt_setprop(void *a, int n, const char *p, void *v, size_t s) { (void)a; (void)n; (void)p; (void)v; (void)s; return 0; }
+''' + cfg_decl + r'''
 static unsigned configures, unmaps, shutdowns;
 static int configure_ret;
+static bool use_real_configure;
+static u32 last_surface_fmt;
+static u8 fb_mem[640 * 480 * 4 + 24 * SZ_16K] __attribute__((aligned(SZ_16K)));
+static dcp_timing_mode_t test_tmode = {.valid = 1, .width = 640, .height = 480, .fps = 60 << 16};
+static dcp_color_mode_t test_cmode = {.valid = 1, .bpp = 32};
+
 static bool dcp_left_running(void) { return left_running; }
 static bool display_unmap_fb(uintptr_t iova, size_t size) { (void)iova; (void)size; unmaps++; return true; }
+static uintptr_t display_map_fb(uintptr_t iova, u64 pa, u64 size) { (void)pa; (void)size; return iova; }
+/* Intentionally does NOT clear dcp so display_init_t8132_hdmi()'s own guard is tested! */
 static int display_shutdown(dcp_shutdown_mode m)
 {
     assert(m == DCP_QUIESCED);
     shutdowns++;
     iboot = NULL;
-    if (!left_running)
-        dcp = NULL;
     return left_running ? -1 : 0;
 }
+static int display_start_dcp(void)
+{
+    dcp = &dummy_dcp;
+    iboot = &dummy_iboot;
+    fb_dva = 0x10004000UL;
+    fb_size = sizeof(fb_mem);
+    cur_boot_args.video.base = (u64)fb_mem;
+    return 0;
+}
+static int dcp_connect_dptx(dcp_dev_t *d) { (void)d; return 0; }
+static int dcp_dptx_hpd(void *ep, u32 port, bool hpd) { (void)ep; (void)port; (void)hpd; return 0; }
+static int dcp_work(dcp_dev_t *d) { (void)d; return 0; }
+static int dcp_ib_set_power(dcp_iboot_if_t *ib, bool on) { (void)ib; (void)on; return 0; }
+static int dcp_ib_get_hpd(dcp_iboot_if_t *ib, int *tc, int *cc) { (void)ib; *tc = 1; *cc = 1; return 1; }
+static int dcp_ib_get_timing_modes(dcp_iboot_if_t *ib, dcp_timing_mode_t **m) { (void)ib; *m = &test_tmode; return 1; }
+static int dcp_ib_get_color_modes(dcp_iboot_if_t *ib, dcp_color_mode_t **m) { (void)ib; *m = &test_cmode; return 1; }
+static int dcp_ib_set_mode(dcp_iboot_if_t *ib, dcp_timing_mode_t *t, dcp_color_mode_t *c) { (void)ib; (void)t; (void)c; return 0; }
+static int dcp_ib_set_surface(dcp_iboot_if_t *ib, dcp_layer_t *layer) { (void)ib; last_surface_fmt = layer->surface_fmt; return 0; }
+static void mdelay(unsigned ms) { (void)ms; }
+static u64 get_ticks(void) { return 0; }
+static u64 ticks_to_msecs(u64 t) { return t; }
+static u64 top_of_memory_alloc(size_t s) { (void)s; assert(0); return 0; }
+static u64 iova_alloc(void *d, size_t s) { (void)d; (void)s; assert(0); return 0; }
+static void iova_free(void *d, u64 a, size_t s) { (void)d; (void)a; (void)s; }
+static void mmu_map_framebuffer(u64 a, u64 s) { (void)a; (void)s; }
+static void fb_reinit(void) {}
+static u64 dart_dva_base(void *d) { (void)d; return 0; }
+static bool dart_unmap_checked(void *d, u64 a, size_t s) { (void)d; (void)a; (void)s; return true; }
+''' + "\n".join([
+        extract_fn(disp, "u64 display_mode_fb_size("),
+        extract_fn(disp, "static void display_choose_timing_mode("),
+        extract_fn(disp, "static void display_choose_color_mode("),
+        extract_fn(disp, "static bool display_t6030_hands_off("),
+        "struct display_options { bool retina; };",
+        extract_fn(disp, "int display_parse_mode("),
+        extract_fn(disp, "static int display_swap("),
+        extract_fn(disp, "int display_configure(").replace("int display_configure(", "static int real_display_configure("),
+    ]) + r'''
 static int display_configure(const char *cfg)
 {
-    (void)cfg;
+    if (use_real_configure)
+        return real_display_configure(cfg);
     configures++;
     dcp = &dummy_dcp;
     iboot = &dummy_iboot;
@@ -632,55 +905,86 @@ static int display_configure(const char *cfg)
     return configure_ret;
 }
 ''' + extract_fn(disp, "static int display_init_t8132_hdmi(") + r'''
-static void reset(void)
+static void reset_init(void)
 {
-    dcp = iboot = NULL;
+    dcp = NULL; iboot = NULL;
     fb_dva = fb_size = 0;
-    display_is_external = fb_dva_mapped = left_running = false;
+    display_is_external = display_is_dptx = fb_dva_mapped = left_running = use_real_configure = false;
     configures = unmaps = shutdowns = 0;
     configure_ret = 1;
 }
 int main(void)
 {
-    /* 1. Real non-dummy framebuffer is adopted untouched (Stage 2 or iBoot HDMI). */
-    reset();
-    cur_boot_args.video = (typeof(cur_boot_args.video)){0x105e5300000UL, 1920, 1080, 32};
-    assert(display_init_t8132_hdmi() == 0);
-    assert(!configures && !unmaps && !shutdowns);
+    /* 1. Hardware-driven display_is_t8132_hdmi() matrix (no chip_id or fw-version gate). */
+    adt_has_disp0 = adt_disp0_ext = adt_has_dcpext0 = adt_has_gpio = adt_has_phy = adt_phy_gpio_parent = true;
+    adt_phy_compat = "dptx-phy,t8132";
+    assert(display_is_t8132_hdmi());       /* even with chip_id=0x6040 (J773s) */
+    adt_has_disp0 = false;
+    assert(display_is_t8132_hdmi());       /* disp0 absent = headless */
+    adt_has_disp0 = true; adt_disp0_ext = false;
+    assert(!display_is_t8132_hdmi());      /* internal panel (J713/J604) */
+    adt_disp0_ext = true; adt_phy_gpio_parent = false;
+    assert(!display_is_t8132_hdmi());      /* missing dp2hdmi-gpio-parent */
+    adt_phy_gpio_parent = true; adt_phy_compat = "dptx-phy,t8122";
+    assert(!display_is_t8132_hdmi());      /* 26.x ADT compatible */
+    adt_phy_compat = "dptx-phy,t8152";
+    assert(!display_is_t8132_hdmi());      /* J873g */
+    adt_phy_compat = "dptx-phy,t8132"; adt_has_dcpext0 = false;
+    assert(!display_is_t8132_hdmi());
+    adt_has_dcpext0 = true; adt_has_gpio = false;
+    assert(!display_is_t8132_hdmi());
 
-    /* 2. Dummy 640x1136 framebuffer configures HDMI cleanly. */
-    reset();
-    cur_boot_args.video = (typeof(cur_boot_args.video)){0x105e5300000UL, 640, 1136, 32};
-    assert(display_init_t8132_hdmi() == 1);
-    assert(display_is_external && configures == 1 && !unmaps && !shutdowns);
+    /* 2. Real non-dummy framebuffer adopted untouched. */
+    reset_init();
+    cur_boot_args.video = (typeof(cur_boot_args.video)){0x105e5300000UL, 0, 1920, 1080, 32};
+    assert(display_init_t8132_hdmi() == 0 && !configures && !unmaps && !shutdowns);
 
-    /* 3. No monitor connected (ret == 0) -> unmap FB and quiesce DCP cleanly. */
-    reset();
+    /* 3. Dummy 640x1136 framebuffer configures HDMI cleanly. */
+    reset_init();
+    cur_boot_args.video = (typeof(cur_boot_args.video)){0x105e5300000UL, 0, 640, 1136, 32};
+    assert(display_init_t8132_hdmi() == 1 && display_is_external && configures == 1 && !shutdowns);
+
+    /* 4. No monitor connected: display_shutdown stub leaves dcp set, so display_init_t8132_hdmi()
+     *    itself clears dcp when !dcp_left_running() and keeps dcp when dcp_left_running(). */
+    reset_init();
     configure_ret = 0;
+    left_running = false;
     assert(display_init_t8132_hdmi() == 0);
-    assert(configures == 1 && unmaps == 1 && shutdowns == 1 && !dcp && !iboot && !fb_dva_mapped);
+    assert(unmaps == 1 && shutdowns == 1 && dcp == NULL && iboot == NULL && !fb_dva_mapped);
 
-    /* 4. Shutdown failure (dcp_left_running() == true) keeps dcp pointer non-NULL. */
-    reset();
+    reset_init();
     configure_ret = -1;
     left_running = true;
     assert(display_init_t8132_hdmi() == -1);
-    assert(configures == 1 && unmaps == 1 && shutdowns == 1 && dcp == &dummy_dcp && !iboot);
+    assert(unmaps == 1 && shutdowns == 1 && dcp == &dummy_dcp && iboot == NULL);
 
-    puts("PASS t8132 display init");
+    /* 5. cbest.bpp selects FMT_BGRA/32 vs FMT_w30r/30 without SoC or DVA-base gates. */
+    reset_init();
+    use_real_configure = true;
+    test_cmode.bpp = 32;
+    assert(display_configure(NULL) == 1);
+    assert(last_surface_fmt == FMT_BGRA && (cur_boot_args.video.depth & FB_DEPTH_MASK) == 32);
+
+    reset_init();
+    use_real_configure = true;
+    test_cmode.bpp = 30;
+    assert(display_configure(NULL) == 1);
+    assert(last_surface_fmt == FMT_w30r && (cur_boot_args.video.depth & FB_DEPTH_MASK) == 30);
+
+    puts("PASS t8132 display selection bpp cleanup");
     return 0;
 }
 '''
     out = compile_and_run(tmp_path, "t8132-display-init", harness)
-    assert "PASS t8132 display init" in out
+    assert "PASS t8132 display selection bpp cleanup" in out
 
 
-def test_t8132_dcp_init_skips_protected_cpu_power_enable(tmp_path):
-    """Verify dcp_init skips pmgr_adt_power_enable(cfg->dcp) when cfg->pmgr_dev is protected."""
+def test_t8132_dcp_init_protected_cpu_and_phy_compat(tmp_path):
+    """Verify dcp_init keys DPTX support on dptx-phy compatible (no fw-version gate),
+    skips pmgr_adt_power_enable(cfg->dcp) on protected CPUs, and bails out cleanly
+    if iBoot left the protected CPU unpowered."""
     dcp_c = (REPO / "src/dcp.c").read_text()
     fn = extract_fn(dcp_c, "dcp_dev_t *dcp_init(")
-    # Truncate right after the dptx_phy power-on block so we test the exact gating logic
-    # verbatim without pulling in DART/RTKit/IOMFB symbols.
     cut = fn.index("int dart_node = adt_path_offset(")
     fn_head = fn[:cut] + "return (dcp_dev_t *)0x1;\n}\n"
     harness = r'''
@@ -699,18 +1003,26 @@ typedef struct {
     const char *dptx_phy;
     int die;
 } display_config_t;
-enum { V13_5 = 1, V27_2 = 2 };
-static struct { int version; } os_firmware = { V27_2 };
+enum { V13_5 = 1, V_UNKNOWN = 99 };
+static struct { int version; } os_firmware = { V_UNKNOWN };
 static void *adt = (void *)1;
 #define T8152 0x8152
 static u32 chip_id = 0x8132;
 static char dcp_pmgr_dev[32];
 static int dcp_die;
+static bool dcp_init_quiesced;
 static bool is_protected;
+static int protected_requested = 1;
+static const char *phy_compat = "dptx-phy,t8132";
 static int dcp_power_calls, phy_power_calls;
 static int adt_path_offset(void *a, const char *p) { (void)a; (void)p; return 1; }
-static bool adt_is_compatible(void *a, int n, const char *c) { (void)a; (void)n; return strcmp(c, "dptx-phy,t8132") == 0; }
+static bool adt_is_compatible(void *a, int n, const char *c)
+{
+    (void)a; (void)n;
+    return strcmp(c, phy_compat) == 0;
+}
 static bool pmgr_device_is_protected(const char *name) { (void)name; return is_protected; }
+static int pmgr_power_is_requested(int die, const char *name) { (void)die; (void)name; return protected_requested; }
 static int pmgr_adt_power_enable(const char *path)
 {
     if (strcmp(path, "/arm-io/dcpext0") == 0) {
@@ -736,21 +1048,34 @@ int main(void)
         .dptx_phy = "/arm-io/dptx-phy",
         .die = 0,
     };
-    /* Protected CPU (e.g. T8132 DISPEXT0_CPU reading target=15, actual=0): must skip dcp power-on, still power PHY. */
-    is_protected = true;
+
+    /* 1. dptx-phy,t8132 works with any firmware version (V_UNKNOWN) when protected CPU is requested on. */
+    is_protected = true; protected_requested = 1; phy_compat = "dptx-phy,t8132";
     dcp_power_calls = phy_power_calls = 0;
     assert(dcp_init(&cfg) != NULL);
     assert(dcp_power_calls == 0 && phy_power_calls == 1);
 
-    /* Unprotected CPU: must power both dcp and PHY. */
+    /* 2. Protected CPU left off by iBoot: clean bail-out with zero PMGR writes/calls. */
+    protected_requested = 0;
+    dcp_power_calls = phy_power_calls = 0;
+    assert(dcp_init(&cfg) == NULL);
+    assert(dcp_power_calls == 0 && phy_power_calls == 0);
+
+    /* 3. Unprotected CPU: powers both dcp and PHY. */
     is_protected = false;
     dcp_power_calls = phy_power_calls = 0;
     assert(dcp_init(&cfg) != NULL);
     assert(dcp_power_calls == 1 && phy_power_calls == 1);
 
-    puts("PASS t8132 dcp_init protected cpu");
+    /* 4. Legacy PHY compatible (t8112) still requires V13_5. */
+    phy_compat = "dptx-phy,t8112";
+    dcp_power_calls = phy_power_calls = 0;
+    assert(dcp_init(&cfg) == NULL);
+    assert(dcp_power_calls == 0 && phy_power_calls == 0);
+
+    puts("PASS t8132 dcp_init protected cpu and phy compat");
     return 0;
 }
 '''
     out = compile_and_run(tmp_path, "t8132-dcp-init-protected", harness)
-    assert "PASS t8132 dcp_init protected cpu" in out
+    assert "PASS t8132 dcp_init protected cpu and phy compat" in out

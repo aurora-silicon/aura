@@ -133,6 +133,7 @@ struct dart_dev {
     enum dart_type_t type;
     const struct dart_params *params;
     u64 vm_base;
+    u64 vm_base_hi;
     u64 dva_base;
     uintptr_t tlbi_aperture;
     u8 tlbi_route;
@@ -604,9 +605,7 @@ dart_dev_t *dart_init_adt(const char *path, int instance, int device, bool keep_
         }
     }
     if (dart->locked) {
-        /* T8132 display DARTs encode high alias bits above bit 35 in vm-base. */
-        if (chip_id == T8132)
-            dart->dva_base = dart->vm_base & ~((1LLU << 36) - 1);
+        dart->vm_base_hi = dart->vm_base & ~((1LLU << 36) - 1);
         dart->vm_base &= (1LLU << 36) - 1;
     }
 
@@ -1450,10 +1449,10 @@ bool dart_shutdown_checked(dart_dev_t *dart)
     if (!dart || dart->failed)
         return false;
     if (dart->locked || dart->keep) {
-        /* Release empty heap L2 tables aura published into a locked legacy display DART
-         * once every mapping inside them has been unmapped, leaving iBoot's own L2 tables
-         * and any non-empty heap L2 table (such as an active scanout framebuffer) intact. */
-        if (dart->locked && dart->legacy_mutable && dart->type != DART_GEN3) {
+        /* Release empty heap L2 tables aura published into a locked high-DVA-base
+         * T8110 display DART once every mapping inside them has been unmapped, leaving
+         * iBoot's own L2 tables, non-empty heap L2 tables, and M1/M2 handoff intact. */
+        if (dart->locked && dart->legacy_mutable && dart->type == DART_T8110 && dart->dva_base) {
             u64 *to_free[LEGACY_L2_MAX_PAGES];
             size_t n_free = 0;
 
@@ -1613,4 +1612,10 @@ u64 dart_vm_base(dart_dev_t *dart)
 u64 dart_dva_base(dart_dev_t *dart)
 {
     return dart ? dart->dva_base : 0;
+}
+
+void dart_preserve_dva_base(dart_dev_t *dart)
+{
+    if (dart && dart->locked && dart->type == DART_T8110)
+        dart->dva_base = dart->vm_base_hi;
 }

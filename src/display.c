@@ -178,10 +178,9 @@ static const display_config_t display_config_m2_ultra = {
     .die = 1,
 };
 
-/* Headless T8132 (M4 desktop) on macOS 27.2: HDMI is driven through DCPEXT0
- * (dispext0, source select 1) and the dedicated dptx-phy (dptx-phy,t8132) via
- * dp2hdmi-gpio0. DISPEXT0_CPU is protected in pmgr.c so DCP is quiesced without
- * PMGR reset. */
+/* Dedicated T8132-class HDMI path: driven through DCPEXT0 (dispext0, source
+ * select 1) and a dptx-phy,t8132 PHY wired to dp2hdmi-gpio0. DISPEXT0_CPU is
+ * protected in pmgr.c so DCP is quiesced without PMGR reset. */
 static const display_config_t display_config_t8132_hdmi_ext = {
     .dcp = "/arm-io/dcpext0",
     .dcp_dart = "/arm-io/dart-dcpext0",
@@ -194,13 +193,11 @@ static const display_config_t display_config_t8132_hdmi_ext = {
     .num_dptxports = 2,
 };
 
-/* Select the dedicated T8132 HDMI path from the ADT hardware topology rather
- * than a board allowlist: headless T8132 (/arm-io/disp0 absent or external)
- * with dcpext0, dp2hdmi-gpio0, and dptx-phy,t8132 on firmware 27.2. */
+/* Select the dedicated T8132-class HDMI path from the ADT hardware topology:
+ * no internal panel (/arm-io/disp0 absent or external), /arm-io/dcpext0,
+ * /arm-io/dp2hdmi-gpio0, and a dptx-phy,t8132 node with dp2hdmi-gpio-parent. */
 static bool display_is_t8132_hdmi(void)
 {
-    if (chip_id != T8132 || os_firmware.version != V27_2)
-        return false;
     int disp0 = adt_path_offset(adt, "/arm-io/disp0");
     if (disp0 >= 0 && !adt_getprop(adt, disp0, "external", NULL))
         return false;
@@ -208,7 +205,8 @@ static bool display_is_t8132_hdmi(void)
         adt_path_offset(adt, display_config_t8132_hdmi_ext.dp2hdmi_gpio) < 0)
         return false;
     int phy = adt_path_offset(adt, display_config_t8132_hdmi_ext.dptx_phy);
-    return phy >= 0 && adt_is_compatible(adt, phy, "dptx-phy,t8132");
+    return phy >= 0 && adt_is_compatible(adt, phy, "dptx-phy,t8132") &&
+           adt_getprop(adt, phy, "dp2hdmi-gpio-parent", NULL);
 }
 
 #define abs(x) ((x) >= 0 ? (x) : -(x))
@@ -410,8 +408,8 @@ const display_config_t *display_get_config(void)
  * of a locked display DART (dart_init_adt_display()). T8140 and other T8132
  * machines never get that far: display_init() returns before any DCP or DART
  * work on them, in every stage, and kboot keeps their retained heap separately.
- * Headless T8132 on 27.2 brings up HDMI on dcpext0 and maps its scanout
- * framebuffer into locked dart-dispext0.
+ * Headless T8132 with dedicated dptx-phy,t8132 HDMI brings up HDMI on dcpext0
+ * and maps its scanout framebuffer into locked dart-dispext0.
  */
 bool display_dart_tables_inherited(void)
 {
@@ -582,7 +580,7 @@ int display_parse_mode(const char *config, dcp_timing_mode_t *mode, struct displ
     return mode->valid;
 }
 
-static int display_swap(u64 iova, u32 stride, u32 width, u32 height)
+static int display_swap(u64 iova, u32 stride, u32 width, u32 height, u32 surface_fmt)
 {
     int ret;
 
@@ -595,8 +593,7 @@ static int display_swap(u64 iova, u32 stride, u32 width, u32 height)
         .plane_cnt = 1,
         .width = width,
         .height = height,
-        .surface_fmt =
-            (chip_id == T8152 || dart_dva_base(dcp->dart_disp) != 0) ? FMT_BGRA : FMT_w30r,
+        .surface_fmt = surface_fmt,
         .colorspace = 2,
         .eotf = EOTF_GAMMA_SDR,
         .transform = XFRM_NONE,
@@ -727,7 +724,9 @@ int display_configure(const char *config)
     size_t size =
         ALIGN_UP(tbest.width * tbest.height * ((cbest.bpp + 7) / 8) + 24 * SZ_16K, SZ_16K);
 
-    bool bgra_32bpp = chip_id == T8152 || dart_dva_base(dcp->dart_disp) != 0;
+    u32 depth = cbest.bpp == 32 ? 32 : 30;
+    u32 surface_fmt = depth == 32 ? FMT_BGRA : FMT_w30r;
+    bool keep_grown_dva = chip_id == T8152 || dart_dva_base(dcp->dart_disp) != 0;
 
     if (fb_size < size) {
         printf("display: current framebuffer is too small for new mode\n");
@@ -755,7 +754,7 @@ int display_configure(const char *config)
 
         // Swap!
         u32 stride = tbest.width * 4;
-        ret = display_swap(tmp_dva, stride, tbest.width, tbest.height);
+        ret = display_swap(tmp_dva, stride, tbest.width, tbest.height, surface_fmt);
         if (ret < 0)
             return ret;
 
@@ -767,7 +766,7 @@ int display_configure(const char *config)
             return -1;
         }
 
-        if (bgra_32bpp) {
+        if (keep_grown_dva) {
             /* The DCP already scans out the new framebuffer at tmp_dva; a
              * second swap after moving it back to fb_dva times out here.
              * tmp_dva becomes the framebuffer DVA, so it is no longer
@@ -812,10 +811,10 @@ int display_configure(const char *config)
     u32 stride = tbest.width * 4;
     /* A reused framebuffer still holds the previous console at another
      * stride (the stage before left 640x1136 text there). */
-    if (bgra_32bpp && !swapped)
+    if (keep_grown_dva && !swapped)
         memset((void *)fb_pa, 0, (size_t)stride * tbest.height);
     if (!swapped) {
-        ret = display_swap(fb_dva, stride, tbest.width, tbest.height);
+        ret = display_swap(fb_dva, stride, tbest.width, tbest.height, surface_fmt);
         if (ret < 0)
             return ret;
 
@@ -827,7 +826,6 @@ int display_configure(const char *config)
     }
 
     bool reinit = false;
-    u32 depth = bgra_32bpp ? 32 : 30;
     if (fb_pa != cur_boot_args.video.base || cur_boot_args.video.stride != stride ||
         cur_boot_args.video.width != tbest.width || cur_boot_args.video.height != tbest.height ||
         (cur_boot_args.video.depth & FB_DEPTH_MASK) != depth) {
@@ -1086,7 +1084,7 @@ static int display_init_t8132_hdmi(void)
 
     display_is_external = true;
 
-    printf("display: T8132 27.2 early HDMI bring-up on dcpext0\n");
+    printf("display: T8132 early HDMI bring-up on dcpext0\n");
     int ret = display_configure(NULL);
     if (ret <= 0) {
         printf("display: T8132 HDMI initialization %s (ret=%d)\n",
@@ -1192,8 +1190,9 @@ int display_init(void)
 int display_shutdown(dcp_shutdown_mode mode)
 {
     /* Linux owns the live J700/J713/J873 controllers. Keep the inherited ASC session
-     * and scanout intact at both the Stage 1 and Linux boundaries. Headless T8132 on
-     * 27.2 quiesces dcpext0 cleanly via dcp_shutdown(..., false) without PMGR reset. */
+     * and scanout intact at both the Stage 1 and Linux boundaries. Headless T8132
+     * with dedicated dptx-phy,t8132 HDMI quiesces dcpext0 cleanly via
+     * dcp_shutdown(..., false) without PMGR reset. */
     if (chip_id == T8140 || (chip_id == T8132 && !display_is_t8132_hdmi()) || chip_id == T8152)
         return 0;
 

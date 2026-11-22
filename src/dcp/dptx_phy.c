@@ -118,6 +118,9 @@ static void dptx_t8132_pll_core_cfg(dptx_phy_t *phy)
     if (set[T8132_RODCOROLEAKCOMP])
         DPTX_T8132_D(phy, 0x2240, 19, 0x180000, v[T8132_RODCOROLEAKCOMP]);
 
+    /* Fixed PLL core tunables from Linux drivers/phy/apple/dptx.c
+     * t6050_pll_core_cfg() (commit c0e42a1852a6, captured from macOS
+     * AppleDPTXPhy on T8122/T8132/T6050). */
     DPTX_T8132_D(phy, 0x22e8, 0, 0x1, 1);
     DPTX_T8132_D(phy, 0x2240, 3, 0x8, 1);
     DPTX_T8132_D(phy, 0x2240, 0, 0x1, 1);
@@ -152,6 +155,8 @@ static int dptx_t8132_impedance_calibration(dptx_phy_t *phy)
     mdelay(1);
     DPTX_T8132_D(phy, 0x4224, 0, 0x1, 1);
     udelay(1);
+    /* AUX impedance calibration target/enable mask (0x3c in bits 9:4, matching
+     * T8152's 0x1c00[9:4]=0x3c and Linux t6050_impedance_calibration()). */
     DPTX_T8132_D(phy, 0x4200, 4, 0x3f0, 0x3c);
     udelay(1);
     DPTX_T8132_D(phy, 0x4200, 0, 0x1, 1);
@@ -273,13 +278,21 @@ static int dptx_t8132_set_lanes(dptx_phy_t *phy, u32 n)
 }
 
 /*
- * T8132/T6050 dedicated HDMI PHY PLL configuration (register map and analog
- * fields match Linux drivers/phy/apple/dptx.c, commit c0e42a1852a6 "phy: apple:
- * dptx: Add the T6050 variant"). The integer/fractional feedback divider
- * derives from the 24 MHz reference clock: RBR runs full-rate at VCO = 2 * rate
- * (3240 MHz = 135 * 24), HBR runs half-rate at VCO = rate (2700 MHz = 112.5 * 24),
- * and HBR2/HBR3 run half-rate with tx_div_sel = 1 at VCO = rate / 2
- * (2700 MHz = 112.5 * 24 and 4050 MHz = 168.75 * 24).
+ * T8132/T6050 dedicated HDMI PHY PLL configuration (register map and per-rate
+ * analog tunables match Linux drivers/phy/apple/dptx.c, commit c0e42a1852a6
+ * "phy: apple: dptx: Add the T6050 variant", derived from macOS AppleDPTXPhy
+ * register captures).
+ *
+ * Feedback dividers are computed from the 24 MHz reference clock:
+ *   - RBR  (1620 MHz): full-rate, VCO = 2 * rate = 3240 MHz = 135 * 24
+ *   - HBR  (2700 MHz): half-rate, VCO = rate     = 2700 MHz = 112.5 * 24
+ *   - HBR2 (5400 MHz): half-rate + tx_div_sel=1, VCO = rate / 2 = 2700 MHz = 112.5 * 24
+ *   - HBR3 (8100 MHz): half-rate + tx_div_sel=1, VCO = rate / 2 = 4050 MHz = 168.75 * 24
+ * The symbol-clock divider pclk_div (0x20b8[13:9]) is (vco_mhz / (rate_mhz / 10)) - 1.
+ * Remaining analog fields come from the macOS AppleDPTXPhy per-rate capture:
+ *   - pre_div (0x20b8[21:20]), tx_div_sel (0x20b8[22]), post_div (0x20b8[15:14])
+ *   - vco_band (0x20b8[19:16]), lpf_cfg (0x2234[31:23]), dco_cfg (0x2244[15:0])
+ *   - bypass (0x222c[1:0], PLL output divider bypass for VCO <= 3240 MHz).
  */
 #define DPTX_T8132_REF_MHZ 24U
 
@@ -290,17 +303,16 @@ struct dptx_t8132_pll_cfg {
     u8 tx_div_sel;
     u8 post_div;
     u8 vco_band;
-    u8 pclk_div;
     u16 lpf_cfg;
     u16 dco_cfg;
     bool bypass;
 };
 
 static const struct dptx_t8132_pll_cfg dptx_t8132_pll_cfgs[] = {
-    {1620, 3240, 1, 0, 1, 5, 0x13, 0x80, 0x8804, true},
-    {2700, 2700, 1, 0, 1, 5, 0x09, 0x80, 0x8804, true},
-    {5400, 2700, 1, 1, 1, 5, 0x04, 0x100, 0x8984, true},
-    {8100, 4050, 1, 1, 1, 6, 0x04, 0x100, 0x8984, false},
+    {1620, 3240, 1, 0, 1, 5, 0x80, 0x8804, true},
+    {2700, 2700, 1, 0, 1, 5, 0x80, 0x8804, true},
+    {5400, 2700, 1, 1, 1, 5, 0x100, 0x8984, true},
+    {8100, 4050, 1, 1, 1, 6, 0x100, 0x8984, false},
 };
 
 static void dptx_t8132_shadow_update(dptx_phy_t *phy)
@@ -346,6 +358,7 @@ static int dptx_t8132_program_rate(dptx_phy_t *phy, u32 rate)
     }
     u32 fb_quad = 4 * fb_int + (fb_frac_den ? (4 * fb_frac_num) / fb_frac_den : 0);
     u32 frac_den_reg = fb_frac_num > 1 ? fb_frac_den : 0;
+    u32 pclk_div = (c->vco_mhz / (c->rate_mhz / 10)) - 1;
     bool half = rate >= 2000;
 
     DPTX_T8132_D(phy, 0x222c, 1, 0x2, c->bypass);
@@ -356,7 +369,7 @@ static int dptx_t8132_program_rate(dptx_phy_t *phy, u32 rate)
     DPTX_T8132_D(phy, 0x20b0, 10, 0x400, 0);
     DPTX_T8132_D(phy, 0x20b4, 14, 0x0fffc000, fb_frac_num);
     DPTX_T8132_D(phy, 0x20b4, 0, 0x3fff, frac_den_reg);
-    DPTX_T8132_D(phy, 0x20b8, 9, 0x3e00, c->pclk_div);
+    DPTX_T8132_D(phy, 0x20b8, 9, 0x3e00, pclk_div);
     DPTX_T8132_D(phy, 0x20b8, 14, 0xc000, c->post_div);
     DPTX_T8132_D(phy, 0x20b8, 16, 0xf0000, c->vco_band);
     DPTX_T8132_D(phy, 0x20b8, 20, 0x300000, c->pre_div);
