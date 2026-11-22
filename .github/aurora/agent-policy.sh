@@ -16,7 +16,14 @@
 # This script works only with paths, modes and object ids. It never reads
 # the contents of an assistant instruction file and never checks one out.
 #
-# Usage: agent-policy.sh push <branch> | sweep | pr <ref-or-sha>
+# In pr mode the check runs on the merge result when GitHub has one
+# (refs/pull/N/merge), else on the head. There the policy file must exist
+# and every copy must exist and equal the policy file on the default
+# branch. A pull request that changes the policy file itself passes only
+# with POLICY_CHANGE_OK=1 (the workflow sets it from a maintainer-applied
+# label), and then its copies may also equal its own policy file.
+#
+# Usage: agent-policy.sh push <branch> | sweep | pr <ref-or-sha> [<fallback-ref>]
 #
 # Environment:
 #   DEFAULT_BRANCH   default branch name (required)
@@ -25,6 +32,7 @@
 #   LOCAL=1          operate on local refs/heads/* (bare clone testing),
 #                    no fetch and no push
 #   REMOTE           remote name (default: origin)
+#   POLICY_CHANGE_OK=1  pr mode: the pull request may change the policy file
 set -u -o pipefail
 
 MODE=${1:-}
@@ -91,14 +99,18 @@ is_allowed() {
 	return 1
 }
 
-# Print "mode type oid<TAB>path" for each violation in commit $1.
-# Print "missing<TAB>path" for each copy path that is absent (policy use).
+# scan_commit <commit> <expected-oid> <trust-own>
+# Print "mode type oid<TAB>path" for each violation in the commit: copies
+# must be regular files with blob <expected-oid>. With <trust-own> = 1 (a
+# branch that is not a policy branch), a copy of the commit's own policy
+# file is accepted too: it is a consistent older snapshot of the default
+# branch. Print "missing<TAB>path" for each copy path that is absent.
 scan_commit() {
-	local commit=$1 meta mode type oid path c own
+	local commit=$1 expect=$2 trust=$3 meta mode type oid path c own=
 	declare -A seen=()
-	# The branch's own policy file: copies of it are a consistent older
-	# snapshot of the default branch, not a violation.
-	own=$(git rev-parse -q --verify "$commit:$CANON_PATH" 2>/dev/null || true)
+	if [ "$trust" = 1 ]; then
+		own=$(git rev-parse -q --verify "$commit:$CANON_PATH" 2>/dev/null || true)
+	fi
 	# One awk pass picks the candidates: assistant files at any depth and
 	# assistant directories (whose contents are not listed separately).
 	while IFS=$'\t' read -r meta path; do
@@ -108,7 +120,7 @@ scan_commit() {
 			[ "$path" = "$CANON_PATH" ] && continue
 			if is_copy_path "$path"; then
 				seen[$path]=1
-				if [ "$mode" = 100644 ] && { { [ -n "$CANON" ] && [ "$oid" = "$CANON" ]; } ||
+				if [ "$mode" = 100644 ] && { { [ -n "$expect" ] && [ "$oid" = "$expect" ]; } ||
 					{ [ -n "$own" ] && [ "$oid" = "$own" ]; }; }; then
 					continue
 				fi
@@ -131,7 +143,7 @@ heal() {
 	local b=$1 tip policy=0 out viol=() missing=() line idx newtree commit msg p
 	tip=$(git rev-parse -q --verify "$NS/$b^{commit}") || { log "$b: no such branch"; return 0; }
 	is_policy_branch "$b" && policy=1
-	out=$(scan_commit "$tip")
+	out=$(scan_commit "$tip" "$CANON" $((1 - policy)))
 	while IFS= read -r line; do
 		[ -z "$line" ] && continue
 		if [ "${line%%$'\t'*}" = missing ]; then missing+=("${line#*$'\t'}")
@@ -225,15 +237,42 @@ sweep)
 	;;
 pr)
 	[ -n "$ARG" ] || { log "pr needs a ref"; exit 2; }
+	FALLBACK=${3:-}
 	fetch_heads "$DEFAULT_BRANCH"
 	if [ "$LOCAL" != 1 ]; then
-		git fetch -q --no-tags --depth=1 --filter=blob:none "$REMOTE" "+$ARG:refs/aurora/pr-head"
+		# The merge result is what lands; an unmergeable pull request has
+		# none, so check its head then.
+		if git fetch -q --no-tags --depth=1 --filter=blob:none "$REMOTE" "+$ARG:refs/aurora/pr-head" 2>/dev/null; then
+			log "checking $ARG"
+		elif [ -n "$FALLBACK" ] &&
+			git fetch -q --no-tags --depth=1 --filter=blob:none "$REMOTE" "+$FALLBACK:refs/aurora/pr-head"; then
+			log "no $ARG (the pull request does not merge cleanly), checking $FALLBACK"
+			log "if this fails on files you did not touch, update the branch from $DEFAULT_BRANCH"
+		else
+			log "cannot fetch $ARG"; exit 2
+		fi
 		head=refs/aurora/pr-head
 	else
 		head=$ARG
 	fi
 	load_canonical
-	scan=$(scan_commit "$head")
+	[ -n "$CANON" ] || { log "no $CANON_PATH on $DEFAULT_BRANCH; nothing to check"; exit 0; }
+	trust=0
+	pr_canon=$(git rev-parse -q --verify "$head:$CANON_PATH" 2>/dev/null || true)
+	if [ -z "$pr_canon" ]; then
+		log "This pull request deletes $CANON_PATH."
+		exit 1
+	fi
+	if [ "$pr_canon" != "$CANON" ]; then
+		if [ "${POLICY_CHANGE_OK:-0}" != 1 ]; then
+			log "This pull request changes $CANON_PATH. A maintainer must review"
+			log "the policy change and label the pull request agent-policy-change."
+			exit 1
+		fi
+		log "policy change approved by label; copies may match the new policy file"
+		trust=1
+	fi
+	scan=$(scan_commit "$head" "$CANON" "$trust")
 	out=$(printf '%s\n' "$scan" | awk -F'\t' 'NF && $1 != "missing"')
 	if [ -n "$out" ]; then
 		log "Assistant instruction files that are not Aurora policy copies:"
@@ -241,21 +280,17 @@ pr)
 		log "Remove them. Aurora's policy lives in $CANON_PATH on $DEFAULT_BRANCH."
 		exit 1
 	fi
-	# A head that carries the policy file but not its copies deletes the
-	# copies from $DEFAULT_BRANCH when it is merged.
-	if git cat-file -e "$head:$CANON_PATH" 2>/dev/null; then
-		out=$(printf '%s\n' "$scan" | awk -F'\t' '$1 == "missing" { print $2 }')
-		if [ -n "$out" ]; then
-			log "This head deletes Aurora policy copies:"
-			log "$out"
-			log "Restore them from $DEFAULT_BRANCH, e.g. git checkout origin/$DEFAULT_BRANCH -- ${COPIES[*]}"
-			exit 1
-		fi
+	out=$(printf '%s\n' "$scan" | awk -F'\t' '$1 == "missing" { print $2 }')
+	if [ -n "$out" ]; then
+		log "This pull request deletes Aurora policy copies:"
+		log "$out"
+		log "Restore them from $DEFAULT_BRANCH, e.g. git checkout origin/$DEFAULT_BRANCH -- ${COPIES[*]}"
+		exit 1
 	fi
-	log "PR head is clean"
+	log "PR is clean"
 	;;
 *)
-	log "usage: $0 push <branch> | sweep | pr <ref>"
+	log "usage: $0 push <branch> | sweep | pr <ref> [<fallback-ref>]"
 	exit 2
 	;;
 esac
