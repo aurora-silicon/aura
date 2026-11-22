@@ -40,10 +40,13 @@ typedef struct dcp_dev {
     u32 dp2hdmi_pwr_gpio;
     u32 hdmi_pwr_gpio;
     bool hpd_on_ap; /* the converter's HPD reaches an AP gpio (ADT function-hdmi_hpd) */
+    u64 hpd_reg;    /* that gpio's pin register, 0 when it is not an AP-visible pin */
+    bool hpd_active_high;
 } dcp_dev_t;
 
 int dcp_connect_dptx(dcp_dev_t *dcp);
 bool dcp_dptx_needs_ap_hpd(dcp_dev_t *dcp);
+int dcp_hdmi_hpd_level(dcp_dev_t *dcp);
 int dcp_work(dcp_dev_t *dcp);
 
 dcp_dev_t *dcp_init(const display_config_t *config);
