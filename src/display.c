@@ -607,9 +607,10 @@ int display_configure(const char *config)
         if (ret < 0)
             return ret;
         if (dcp_dptx_needs_ap_hpd(dcp)) {
-            /* The sink drives HPD. When the pin says nothing is attached, the firmware will not
-             * find a display however long it is asked, so tell it the truth and skip the status
-             * wait. An unreadable pin keeps the old report (HPD asserted) and the wait. */
+            /* The sink drives HPD. When the pin says nothing is attached (it reads low although
+             * the connector's 5 V was on before this stage), the firmware will not find a
+             * display however long it is asked, so tell it the truth and skip the status wait.
+             * A pin that cannot tell yet keeps the old report (HPD asserted) and the wait. */
             int level = dcp_hdmi_hpd_level(dcp);
 
             if (dcp_dptx_hpd(dcp->dptx_ep, 0, level != 0))

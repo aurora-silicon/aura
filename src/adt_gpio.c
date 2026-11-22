@@ -36,3 +36,30 @@ int adt_gpio_by_phandle(const void *adt, u32 phandle, u64 *base, u32 *npins)
     }
     return -1;
 }
+
+int adt_gpio_function_pin(const void *adt, int node, const char *prop, struct adt_gpio_pin *pin)
+{
+    struct adt_function_gpio fn;
+    u32 len, npins;
+    u64 base;
+
+    if (!adt_getprop(adt, node, prop, &len))
+        return 1;
+    if (ADT_GETPROP(adt, node, prop, &fn) != sizeof(fn) || fn.fourcc != ADT_GPIO_FOURCC ||
+        adt_gpio_by_phandle(adt, fn.phandle, &base, &npins) || fn.pin >= npins)
+        return -1;
+    pin->reg = base + 4 * fn.pin;
+    pin->active_high = FIELD_GET(ADT_GPIO_CTRL_POLARITY, fn.control) != 0;
+    return 0;
+}
+
+int adt_gpio_pin_sample(const struct adt_gpio_pin *pin, u32 *cfg)
+{
+    u32 val = read32(pin->reg);
+
+    *cfg = val;
+    if (FIELD_GET(ADT_GPIO_PIN_MODE, val) == ADT_GPIO_PIN_MODE_OUT ||
+        FIELD_GET(ADT_GPIO_PIN_PERIPH, val) || !(val & ADT_GPIO_PIN_INPUT_EN))
+        return -1;
+    return !!(val & ADT_GPIO_PIN_DATA) == pin->active_high;
+}

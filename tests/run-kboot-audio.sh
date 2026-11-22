@@ -109,7 +109,7 @@ expect() { # expect <scenario>: the amp lines that scenario must give (tree orde
         amp 40 - - - -
         amp 42 - - - -
         amp 41 $STALE_BOP $STALE_DCB $STALE_ROW $STALE_ZD ;;
-    speaker-id-*) expect group ;;
+    speaker-id-*|hpd-*) expect group ;;
     *) fail "no expected result for $1" ;;
     esac
 }
@@ -118,6 +118,7 @@ expect() { # expect <scenario>: the amp lines that scenario must give (tree orde
 # a pin register with the input stage on (mode 7: input, interrupt off; bit 9: input enable)
 GPIO=0x201000000
 IN=0x0000020e
+HPDIN=0x00000208
 pin() { # pin <pin> <register> <pad level>: one KBOOT_AUDIO_GPIO entry
     printf '0x%x:%s:%s' $((GPIO + 4 * $1)) "$2" "$3"
 }
@@ -135,6 +136,14 @@ gpio_env() { # gpio_env <scenario>: the pins that scenario models
     speaker-id-inverted) echo "$(pin 0x34 $IN 0),$(pin 0x35 $IN 1)" ;;
     speaker-id-one-strap) echo "$(pin 0x34 $IN 1),$(pin 0x35 $IN 1)" ;;
     speaker-id-third-strap-ignored) echo "$(pin 0x30 $IN 1),$(pin 0x31 $IN 0),$(pin 0x32 $IN 1)" ;;
+    # The HPD pin (0x31) as the converter's owner leaves it: an interrupt input (mode 4, input
+    # stage on) whose pad the sink drives
+    hpd-high|hpd-inverted-high-pad) echo "$(pin 0x34 $IN 1),$(pin 0x35 $IN 1),$(pin 0x31 $HPDIN 1)" ;;
+    hpd-low|hpd-inverted-low-pad|hpd-absent|hpd-not-gpio|hpd-bad-phandle|hpd-pin-out-of-range)
+        echo "$(pin 0x34 $IN 1),$(pin 0x35 $IN 1),$(pin 0x31 $HPDIN 0)" ;;
+    hpd-output-pin) echo "$(pin 0x34 $IN 1),$(pin 0x35 $IN 1),$(pin 0x31 0x00000203 1)" ;;
+    hpd-peripheral-pin) echo "$(pin 0x34 $IN 1),$(pin 0x35 $IN 1),$(pin 0x31 0x00000228 1)" ;;
+    hpd-input-stage-off) echo "$(pin 0x34 $IN 1),$(pin 0x35 $IN 1),$(pin 0x31 0x00000008 1)" ;;
     *) echo "" ;;
     esac
 }
@@ -143,7 +152,7 @@ left() { # left <pin> <register>: a modelled pin as the code must leave it
 }
 expect_id() { # expect_id <scenario>: the speaker-id line, then every modelled pin as left
     case $1 in
-    speaker-id-3|speaker-id-inverted|speaker-id-upper-control-bytes) echo "speaker-id 3" ;;
+    speaker-id-3|speaker-id-inverted|speaker-id-upper-control-bytes|hpd-*) echo "speaker-id 3" ;;
     speaker-id-0) echo "speaker-id 0" ;;
     # Read as plain GPIO inputs, like macOS, and left that way
     speaker-id-no-input-stage|speaker-id-output-pin|speaker-id-peripheral-pin) echo "speaker-id 3" ;;
@@ -164,7 +173,14 @@ expect_id() { # expect_id <scenario>: the speaker-id line, then every modelled p
     speaker-id-peripheral-pin) # the data bit it read back is written with the input setup
         left 0x34 0x0000020f
         left 0x35 $IN ;;
-    *) # pins already inputs, or never read, stay as they were
+    *) # pins already inputs, or never read, stay as they were; the HPD pin is only read
+        case $1 in
+        hpd-high|hpd-inverted-low-pad) echo "hpd 1" ;;
+        hpd-low|hpd-inverted-high-pad) echo "hpd 0" ;;
+        hpd-output-pin|hpd-peripheral-pin|hpd-input-stage-off) echo "hpd -1" ;;
+        hpd-absent) echo "hpd absent" ;;
+        hpd-not-gpio|hpd-bad-phandle|hpd-pin-out-of-range) echo "hpd unresolved" ;;
+        esac
         for e in $(gpio_env "$1" | tr ',' ' '); do
             r=${e#*:}
             printf 'gpio %s 0x%08x\n' "${e%%:*}" $((${r%%:*}))
@@ -178,14 +194,14 @@ for s in $(python3 -I tests/kboot_audio_adt.py scenarios); do
     ${DTC:-dtc} -q -I dts -O dtb -o "$tmp/$s.dtb" "$tmp/$s.dts"
     KBOOT_AUDIO_GPIO=$(gpio_env "$s") "$tmp/kboot-audio-host" "$tmp/$s.adt" "$tmp/$s.dtb" \
         > "$tmp/$s.out" 2>&1 || { cat "$tmp/$s.out"; fail "$s: host run"; }
-    grep -E '^(amp|speaker-id|gpio) ' "$tmp/$s.out" > "$tmp/$s.got" || true
+    grep -E '^(amp|speaker-id|hpd|gpio) ' "$tmp/$s.out" > "$tmp/$s.got" || true
     { expect "$s"; expect_id "$s"; } > "$tmp/$s.want"
     if ! cmp -s "$tmp/$s.got" "$tmp/$s.want"; then
         cat "$tmp/$s.out"
         diff -u "$tmp/$s.want" "$tmp/$s.got" || true
         fail "$s"
     fi
-    echo "ok $s: $(grep -v -E '^(amp|speaker-id|gpio) ' "$tmp/$s.out" | tail -n 1)"
+    echo "ok $s: $(grep -v -E '^(amp|speaker-id|hpd|gpio) ' "$tmp/$s.out" | tail -n 1)"
     n=$((n + 1))
 done
 [ "$n" -gt 0 ] || fail "no scenarios ran"

@@ -31,4 +31,23 @@ struct adt_function_gpio {
 /* The base of the /arm-io GPIO controller whose AAPL,phandle is @phandle, and its pin count */
 int adt_gpio_by_phandle(const void *adt, u32 phandle, u64 *base, u32 *npins);
 
+/* A function-* property resolved to its pin register and the level that means asserted */
+struct adt_gpio_pin {
+    u64 reg;
+    bool active_high;
+};
+
+/*
+ * Resolve @node's function-* GPIO property @prop to its pin register. 0 when it names a pin of an
+ * /arm-io GPIO controller, 1 when @prop is absent, -1 when it is present but is not such a pin.
+ */
+int adt_gpio_function_pin(const void *adt, int node, const char *prop, struct adt_gpio_pin *pin);
+
+/*
+ * Sample a resolved pin without touching its configuration: 1 asserted, 0 not asserted, -1 when
+ * the pin is not configured so that its level can be read (an output, muxed to a peripheral
+ * function, or its input stage off). @cfg receives the pin register as read.
+ */
+int adt_gpio_pin_sample(const struct adt_gpio_pin *pin, u32 *cfg);
+
 #endif
