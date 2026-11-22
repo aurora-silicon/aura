@@ -60,6 +60,7 @@ static int dcp_hand_on(dcp_dev_t *d)
 }
 static bool dcp_handed_on_live(void) { return handed_on; }
 static bool dcp_left_running(void) { return running; }
+int display_shutdown(dcp_shutdown_mode mode);
 """
 
 MAIN = r"""
@@ -94,6 +95,14 @@ int main(void)
     reset(&internal, &ib, false, false);
     assert(display_shutdown(DCP_SLEEP_IF_EXTERNAL) == 0 && !strcmp(calls, "ib quiesce "));
 
+    /* A modeset after main's initial shutdown still hands off before kboot measures the heap. */
+    reset(&d2, &ib, true, true);
+    assert(!handed_on);
+    assert(display_prepare_live_handoff() == 0);
+    assert(handed_on && !iboot && !strcmp(calls, "ib hand-on "));
+    reset(&d1, &ib, true, true);
+    assert(display_prepare_live_handoff() == 0 && !handed_on && !calls[0]);
+
     /* An endpoint that does not stop fails the hand-on, then and at the next boundary. */
     reset(&stuck, &ib, true, true);
     assert(display_shutdown(DCP_SLEEP_IF_EXTERNAL) == -1 && !strcmp(calls, "ib hand-on "));
@@ -108,11 +117,12 @@ def test_afkv2_dptx_dcp_is_handed_on_running(tmp_path):
     disp = (SOURCE / "src/display.c").read_text()
     source = HARNESS + "".join(function(disp, signature) for signature in (
         "static bool display_dptx_hands_on(",
-        "int display_shutdown(dcp_shutdown_mode mode)",
+        "int display_prepare_live_handoff(void)",
+        "int display_shutdown(dcp_shutdown_mode mode)\n",
     )) + MAIN
     exe = tmp_path / "hand-on"
     subprocess.run(["cc", "-std=gnu11", "-Wall", "-Wextra", "-Werror", "-Wno-unused-function", "-Wno-switch",
                     "-x", "c", "-", "-o", str(exe)], input=source, text=True, check=True)
     out = subprocess.run([str(exe)], capture_output=True, text=True, check=True).stdout
-    assert out.count("handing the DCP on running") == 2
+    assert out.count("handing the DCP on running") == 3
     assert out.endswith("ok\n")

@@ -418,13 +418,24 @@ static void display_stop_failed_dcp(void)
         display_dcp_state = !stopped;
 }
 
+bool display_inherited_live_heap(u64 *start)
+{
+    int chosen = adt_path_offset(adt, "/chosen");
+    u64 base;
+    if (chosen < 0 || ADT_GETPROP(adt, chosen, DISPLAY_LIVE_ADT_PROP, &base) != sizeof(base))
+        return false;
+    if (start)
+        *start = base;
+    return true;
+}
+
 int display_start_dcp(void)
 {
     if (iboot)
         return 0;
 
-    if (dcp_left_running()) {
-        printf("display: a DCP did not stop; not starting it again\n");
+    if (dcp_left_running() || display_inherited_live_heap(NULL)) {
+        printf("display: a DCP is still running; not starting it again\n");
         return -1;
     }
 
@@ -1123,6 +1134,12 @@ int display_init(void)
     else
         printf("display: Display is internal\n");
 
+    if (display_inherited_live_heap(NULL)) {
+        printf("display: preserving live display from the previous stage (%ldx%ld)\n",
+               cur_boot_args.video.width, cur_boot_args.video.height);
+        return 0;
+    }
+
     if (chip_id == T8140 || chip_id == T8132 ||
         (chip_id == T6040 && board_id == 4 && adt_is_compatible(adt, 0, "J614sAP")) ||
         /* J575c: iBoot leaves the internal DCP running with no panel and a dummy framebuffer;
@@ -1215,6 +1232,21 @@ static int display_handoff_t8152(void)
 static bool display_dptx_hands_on(void)
 {
     return display_is_dptx && dcp && dcp_dptx_is_afkv2(dcp->dptx_ep);
+}
+
+bool display_needs_live_receiver(void)
+{
+    return dcp_handed_on_live() || display_inherited_live_heap(NULL) ||
+           (iboot && display_dptx_hands_on() && !display_hands_on_live());
+}
+
+/* Stop the endpoints before callers lay out the next image or measure its reservations. */
+int display_prepare_live_handoff(void)
+{
+    if (!iboot || !display_dptx_hands_on())
+        return 0;
+
+    return display_shutdown(DCP_SLEEP_IF_EXTERNAL);
 }
 
 /* Whether a DCP was handed on running; its buffers stay in this stage's heap. */
