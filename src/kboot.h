@@ -72,6 +72,18 @@ void kboot_loaded_file_part(u64 *base, u64 *size);
 /* The node at an absolute path or alias, matching each node name exactly (see kboot.c) */
 int kboot_fdt_path_exact(const void *fdt, const char *path);
 
+/*
+ * What kboot.c's M4 internal DCP handoff did, for the external display processors' handoff
+ * (kboot_display_handoff.c), which acts only beside a complete one or on a board with no panel.
+ */
+enum dcp_internal {
+    DCP_INTERNAL_NONE,     /* refused, or published without its display maps or firmware clocks */
+    DCP_INTERNAL_COMPLETE, /* published whole: the inherited display maps and, on firmware 27, the
+                              firmware clocks */
+    DCP_INTERNAL_NO_PANEL, /* not attempted: ADT /arm-io/disp0 is external (no panel) */
+};
+int dt_set_dcpext_handoff(void *dt, enum dcp_internal internal, bool fw_clocks);
+
 // from rust/usb4.rs
 u64 rust_usb4_router_uuid(void);
 int rust_platform_uuid(u8 *out);
