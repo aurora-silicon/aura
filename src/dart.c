@@ -1081,8 +1081,11 @@ static u64 *dart_get_l2(dart_dev_t *dart, u32 idx)
 
     bool track_l2 = dart->legacy_mutable || dart->locked;
 
-    if (track_l2 && legacy_l2_count >= LEGACY_L2_MAX_PAGES)
+    if (track_l2 && legacy_l2_count >= LEGACY_L2_MAX_PAGES) {
+        printf("dart[%lx %u]: legacy L2 reservation pool full (%zu/%d); refusing L1[%d][%u]\n",
+               dart->regs, dart->device, legacy_l2_count, LEGACY_L2_MAX_PAGES, ttbr, idx);
         return NULL;
+    }
 
     u64 *tbl = memalign(SZ_16K, SZ_16K);
     if (!tbl)
@@ -1496,6 +1499,11 @@ static bool dart_release_locked_l2(dart_dev_t *dart)
                 if (!dart_is_tracked_legacy_l2(l2)) {
                     if (legacy_l2_count < LEGACY_L2_MAX_PAGES)
                         legacy_l2_pages[legacy_l2_count++] = (u64)l2;
+                    else
+                        printf("dart[%lx %u]: legacy L2 reservation pool full (%zu/%d); "
+                               "kept L1[%d][%d] heap L2 %p is unreserved\n",
+                               dart->regs, dart->device, legacy_l2_count, LEGACY_L2_MAX_PAGES, ttbr,
+                               i, l2);
                     kept_untracked = true;
                 }
                 continue;

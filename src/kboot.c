@@ -11950,6 +11950,8 @@ static int dt_prepare_t8152(void)
         return -1;
     if (dt_set_fb2_t8152())
         return -1;
+    if (dart_reserve_legacy_tables(dt, cur_boot_args.phys_base, cur_boot_args.mem_size))
+        bail("FDT: couldn't reserve inherited display translation tables\n");
     if (dt_set_memory())
         return -1;
     if (fdt_pack(dt))
