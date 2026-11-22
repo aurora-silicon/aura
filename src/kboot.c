@@ -9521,7 +9521,9 @@ static const struct {
 } t6050_isp_boards[] = {
     {"apple,j716c", 0x75, V27_0},
     {"apple,j714s", 0x74, V27_0},
-    {"apple,k114c", 0xb9, V27_2},
+    /* K114c: sensor type and segment ranges identify the hand-off; any
+     * firmware version is accepted (V_UNKNOWN = no gate). */
+    {"apple,k114c", 0xb9, V_UNKNOWN},
     /*
      * K116s: ADT isp0 of 27.2 (26B8125). Firmware uuid 980F533B-34EA-3FBA-878C-809F6AF57345,
      * the IPSW's isp_bni/adc-nyx-sck11pm; its K116 connection table has one FrontRGB IMX958.
@@ -9542,7 +9544,8 @@ static int dt_set_t6050_isp(const char **why)
     for (unsigned int i = 0; i < ARRAY_SIZE(t6050_isp_boards); i++) {
         if (fdt_node_check_compatible(dt, 0, t6050_isp_boards[i].compat))
             continue;
-        if (os_firmware.version != t6050_isp_boards[i].fw)
+        if (t6050_isp_boards[i].fw != V_UNKNOWN &&
+            os_firmware.version != t6050_isp_boards[i].fw)
             return -1;
         want = t6050_isp_boards[i].sensor_type;
     }
