@@ -11,8 +11,10 @@
  * (ext-display-subsystem) whose iommu-parent mappers live under /arm-io/dart-dispextN (streams 0
  * and 16), and the pipes' clock-ids indexing /arm-io clock-frequencies. Register addresses,
  * stream numbers, clock ids and the image uuid are the T8132 ADT's; physical addresses of firmware
- * segments are synthetic. No Apple firmware data. The fake ADT, PMGR and MMIO are
- * t6041_display_host.c's, whose MMIO has no region mapped here: any register access fails.
+ * segments and DART tables are synthetic. No Apple firmware data. The fake ADT, PMGR and MMIO are
+ * t6041_display_host.c's; only the PMGR power states, the DARTs (PROTECT, stream count, enable
+ * bits, TCR/TTBR) and their tables are mapped, so any other register access fails, and every
+ * write is counted (none is expected).
  *
  *   t8132-dcpext-host list
  *   t8132-dcpext-host <scenario>
@@ -140,20 +142,67 @@ static u64 ps_reg(u16 id)
     return T8132_PMGR + 8 * id;
 }
 
-/* DART registers (T8110 layout): PROTECT, then TCR and TTBR of one stream */
+/*
+ * DART page tables, in DRAM above the RAM the OS gets (in both layouts): one root and one L2 page
+ * per stream, at TABLES + 0x8000 * slot. A scenario moves them into usable RAM by TABLES_SHIFT.
+ */
+#define TABLES      (TB + 0x3f0000000ULL)
+#define TABLES_SIZE 0x80000
+static int table_slots;
+
+/* A two-level translation: TTBR -> root, root[1] -> L2, L2[0] -> one page; returns the TTBR */
+static u32 dart_tables(u64 at)
+{
+    u64 root = at, l2 = at + 0x4000;
+    poke64(root + 8, (l2 >> 4) | 1);
+    poke64(l2, ((TB + 0x280000000ULL) >> 4) | 1);
+    return (u32)((root >> 14) << 2) | 1;
+}
+
+/*
+ * DART registers (T8110 layout): PROTECT, the stream count, and one enabled stream's TCR and TTBR.
+ * A translating stream (TCR bit 0) with a valid TTBR gets its own tables; TTBR 1 asks for them.
+ */
 static void dart_regs(u64 base, u32 sid, u32 protect, u32 tcr, u32 ttbr)
 {
-    region_add(base, 0x4000);
+    if (!mem(base, 4)) {
+        region_add(base, 0x4000);
+        poke32(base + 0xc, 32);
+    }
     poke32(base + 0x200, protect);
+    poke32(base + 0xc00 + 4 * (sid / 32), peek32(base + 0xc00 + 4 * (sid / 32)) | 1u << (sid % 32));
+    if (ttbr == 1)
+        ttbr = dart_tables(TABLES + 0x8000 * table_slots++);
     poke32(base + 0x1000 + 4 * sid, tcr);
     poke32(base + 0x1400 + 4 * sid, ttbr);
+}
+
+static struct region *region_of(u64 base)
+{
+    for (int i = 0; i < nregions; i++)
+        if (regions[i].base == base)
+            return &regions[i];
+    abort();
+}
+
+static u32 dart_ttbr(u64 base, u32 sid)
+{
+    return peek32(base + 0x1400 + 4 * sid);
+}
+
+/* The root page a stream's TTBR points at */
+static u64 ttbr_root(u32 ttbr)
+{
+    return (u64)((ttbr >> 2) & 0xfffffff) << 14;
 }
 
 static void world_t8132(bool no_panel, const char *uuid)
 {
     nfdevs = 0;
     nregions = 0;
+    table_slots = 0;
     region_add(T8132_PMGR, 0x1000);
+    region_add(TABLES, TABLES_SIZE);
     fdev_add(PM_FABRIC, "AFISOCNI0", true, 0, 0);
     fdev_add(PM_DISP0_SYS, "DISP0_SYS", false, ps_reg(PM_DISP0_SYS), PM_FABRIC);
     fdev_add(PM_DISP0_FE, "DISP0_FE", false, ps_reg(PM_DISP0_FE), PM_DISP0_SYS);
@@ -171,10 +220,17 @@ static void world_t8132(bool no_panel, const char *uuid)
         poke32(ps_reg(sys), PS_ON);
         poke32(ps_reg(sys + 1), PS_ON);
         poke32(ps_reg(sys + 2), PS_CPU_REQ);
-        /* iBoot locked the firmware DART; stream 23 translates through a valid root */
-        dart_regs(ext_dart[i], 23, 0x1ff, 0x9, 0x40001);
+        /* iBoot locked the firmware DART; stream 23 translates through two-level tables */
+        dart_regs(ext_dart[i], 23, 0x1ff, 0x1, 1);
     }
-    dart_regs(M4_DART_DISP, 0, 0x1f9, 0x9, 0x50001);
+    /* The display subsystem's DART: scanout (0) and piodma (16), locked */
+    dart_regs(M4_DART_DISP, 0, 0x1f9, 0x1, 1);
+    dart_regs(M4_DART_DISP, 16, 0x1f9, 0x1, 1);
+    /* The pipes' DARTs: locked, scanout and piodma set up */
+    for (int i = 0; i < 2; i++) {
+        dart_regs(pipe_dart[i], 0, 0x1ff, 0x1, 1);
+        dart_regs(pipe_dart[i], 16, 0x1ff, 0x1, 1);
+    }
 
     chip_id = 0x8132;
     os_firmware = (struct fw_version_info){V27_2, "27.2", {27, 2, 0}, 3, "mBoot-20457.41.3"};
@@ -607,8 +663,42 @@ static const struct t8132_scenario t8132_scenarios[] = {
     {"j773g-enabled", "J773g: an enabled processor is refused with no panel"},
     {"j773g-disp-dart-unlocked", "J773g: disp0's DART is not locked: nothing handed over"},
     {"j773g-disp-unpowered", "J773g: the internal DCP is not powered: nothing handed over"},
+    {"j713-tables-in-ram", "J713: dcpext0's and dispext1's DART tables in usable RAM: reserved"},
+    {"j713-pipe-dart-idle", "J713: dispext1's DART unlocked and idle: nothing to keep"},
+    {"j713-pipe-dart-live", "J713: dispext1's DART unlocked with a live stream"},
+    {"j713-four-level", "J713: dcpext0's stream 23 is a four-level translation"},
+    {"j713-l2-outside-dram", "J713: a dispext1 L1 entry points outside DRAM"},
+    {"j713-pipe-dart-faults", "J713: reading dispext0's DART faults"},
+    {"j713-second-parent-off", "J713: DISPEXT1_CPU's second PMGR parent is off"},
+    {"j773g-disp-tables-in-ram", "J773g: disp0's DART tables in usable RAM: reserved"},
+    {"j773g-disp-piodma-bypass", "J773g: disp0's piodma stream bypasses its DART"},
     {"later-soc", "a later board/SoC with the same block, fallback compatible"},
 };
+
+/* A page of usable RAM for the scenarios that put tables there */
+#define RAM_TABLES (TB + 0x100000000ULL)
+
+static bool resv_page(void *dt, u64 page)
+{
+    char path[64];
+    snprintf(path, sizeof(path), "/reserved-memory/dcpext-tables@%llx", (unsigned long long)page);
+    int node = fdt_path_offset(dt, path), len;
+    const fdt64_t *reg = node < 0 ? NULL : fdt_getprop(dt, node, "reg", &len);
+    return reg && len == 16 && fdt64_ld(&reg[0]) == page && fdt64_ld(&reg[1]) == 0x4000 &&
+           fdt_getprop(dt, node, "no-map", NULL) &&
+           !fdt_node_check_compatible(dt, node, "apple,asc-mem");
+}
+
+static int resv_tables(void *dt)
+{
+    int resv = fdt_path_offset(dt, "/reserved-memory"), node, n = 0;
+    fdt_for_each_subnode(node, dt, resv)
+    {
+        if (!strncmp(fdt_get_name(dt, node, NULL), "dcpext-tables@", 14))
+            n++;
+    }
+    return n;
+}
 
 int main(int argc, char **argv)
 {
@@ -697,7 +787,7 @@ int main(int argc, char **argv)
     if (is(s, "j713-stream-bypass"))
         poke32(ext_dart[0] + 0x1000 + 4 * 23, 0x3);
     if (is(s, "j713-dart-read-faults"))
-        regions[2].base = 0x7f0000000ULL; /* dcpext1's DART: nothing answers at its address */
+        region_of(ext_dart[1])->base = 0x7f0000000ULL; /* dcpext1's DART: nothing answers */
     if (is(s, "j773g-disp-dart-unlocked"))
         poke32(M4_DART_DISP + 0x200, 0x1e0);
     if (is(s, "j773g-disp-unpowered"))
@@ -728,6 +818,36 @@ int main(int argc, char **argv)
     }
     if (is(s, "j713-dt-full"))
         OK(fdt_pack(dt));
+    if (is(s, "j713-tables-in-ram") || is(s, "j773g-disp-tables-in-ram")) {
+        region_add(RAM_TABLES, 0x10000);
+        if (j773g) {
+            poke32(M4_DART_DISP + 0x1400 + 4 * 16, dart_tables(RAM_TABLES));
+        } else {
+            poke32(ext_dart[0] + 0x1400 + 4 * 23, dart_tables(RAM_TABLES));
+            poke32(pipe_dart[1] + 0x1400 + 4 * 16, dart_tables(RAM_TABLES + 0x8000));
+        }
+    }
+    if (is(s, "j713-pipe-dart-idle") || is(s, "j713-pipe-dart-live")) {
+        poke32(pipe_dart[1] + 0x200, 0x1e0);
+        poke32(pipe_dart[1] + 0x1000, 0);
+        poke32(pipe_dart[1] + 0x1000 + 4 * 16, is(s, "j713-pipe-dart-live") ? 0x1 : 0);
+    }
+    if (is(s, "j713-four-level"))
+        poke32(ext_dart[0] + 0x1000 + 4 * 23, 0x9);
+    if (is(s, "j713-l2-outside-dram"))
+        poke64(ttbr_root(dart_ttbr(pipe_dart[1], 0)) + 16, (0x7f0000000ULL >> 4) | 1);
+    if (is(s, "j713-pipe-dart-faults"))
+        region_of(pipe_dart[0])->base = 0x7e0000000ULL;
+    if (is(s, "j713-second-parent-off")) {
+        u16 cpu = pm_sys(1) + 2, aux = pm_sys(1) + 3;
+        fdev_add(aux, "DISPEXT1_AUX", false, ps_reg(aux), 0);
+        for (int i = 0; i < nfdevs; i++)
+            if (fdevs[i].id == cpu)
+                fdevs[i].parent[1] = aux;
+        poke32(ps_reg(aux), 0x0);
+    }
+    if (is(s, "j773g-disp-piodma-bypass"))
+        poke32(M4_DART_DISP + 0x1000 + 4 * 16, 0x3);
 
     memcpy(in, dt, fdt_totalsize(dt));
     mmio_reads = mmio_writes = 0;
@@ -746,6 +866,7 @@ int main(int argc, char **argv)
     check(ret == !unknown, "returns %d (%s)", ret, unknown ? "not ours" : "ours");
 
     if (is(s, "j713-both") || is(s, "j713-repeat") || layout272 || is(s, "j713-other-image")) {
+        check(!resv_tables(dt), "tables outside usable RAM are not reserved (%d)", resv_tables(dt));
         check_ext(in, dt, 0, false);
         check_ext(in, dt, 1, false);
         check_oslogs(dt, true, true, false);
@@ -764,7 +885,9 @@ int main(int argc, char **argv)
                is(s, "j713-no-mapper") || is(s, "j713-no-pipe") || is(s, "j713-no-adt-node") ||
                is(s, "j713-text-not-shared") || is(s, "j713-pipe-no-clocks") ||
                is(s, "j713-ext-unpowered") || is(s, "j713-no-clock-gates") ||
-               is(s, "j713-stream-no-root") || is(s, "j713-dart-read-faults")) {
+               is(s, "j713-stream-no-root") || is(s, "j713-dart-read-faults") ||
+               is(s, "j713-pipe-dart-live") || is(s, "j713-l2-outside-dram") ||
+               is(s, "j713-second-parent-off")) {
         check_ext(in, dt, 0, false);
         check(ext_untouched(in, dt, 1), "dcpext1 is left as it was");
         check_internal_untouched(in, dt);
@@ -772,7 +895,8 @@ int main(int argc, char **argv)
     } else if (is(s, "j713-sid-mismatch") || is(s, "j713-dma-range-mismatch") ||
                is(s, "j713-window-too-small") || is(s, "j713-cpu-not-requested") ||
                is(s, "j713-dart-unlocked") || is(s, "j713-stream-bypass") ||
-               is(s, "j713-bad-layout") || is(s, "j713-has-clocks") || is(s, "j713-two-pipes")) {
+               is(s, "j713-bad-layout") || is(s, "j713-has-clocks") || is(s, "j713-two-pipes") ||
+               is(s, "j713-four-level") || is(s, "j713-pipe-dart-faults")) {
         check(ext_untouched(in, dt, 0), "dcpext0 is left as it was");
         check_ext(in, dt, 1, false);
         check_internal_untouched(in, dt);
@@ -797,8 +921,25 @@ int main(int argc, char **argv)
         check_ext(in, dt, 0, j773g);
         check_ext(in, dt, 1, j773g);
         check_display(in, dt, j773g);
+    } else if (is(s, "j713-tables-in-ram") || is(s, "j713-pipe-dart-idle")) {
+        check_ext(in, dt, 0, false);
+        check_ext(in, dt, 1, false);
+        check_internal_untouched(in, dt);
+        if (is(s, "j713-tables-in-ram"))
+            check(resv_page(dt, RAM_TABLES) && resv_page(dt, RAM_TABLES + 0x4000) &&
+                      resv_page(dt, RAM_TABLES + 0x8000) && resv_page(dt, RAM_TABLES + 0xc000) &&
+                      resv_tables(dt) == 4,
+                  "exactly the four table pages in usable RAM are reserved (%d)", resv_tables(dt));
+        else
+            check(!resv_tables(dt), "no table page is reserved (%d)", resv_tables(dt));
+    } else if (is(s, "j773g-disp-tables-in-ram")) {
+        check_ext(in, dt, 0, true);
+        check_display(in, dt, true);
+        check(resv_page(dt, RAM_TABLES) && resv_page(dt, RAM_TABLES + 0x4000) &&
+                  resv_tables(dt) == 2,
+              "disp0's two table pages in usable RAM are reserved (%d)", resv_tables(dt));
     } else if (is(s, "j773g-enabled") || is(s, "j773g-disp-dart-unlocked") ||
-               is(s, "j773g-disp-unpowered")) {
+               is(s, "j773g-disp-unpowered") || is(s, "j773g-disp-piodma-bypass")) {
         check(ext_untouched(in, dt, 0) && ext_untouched(in, dt, 1),
               "enabled processors are refused with no panel");
         check_display(in, dt, false);

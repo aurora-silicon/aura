@@ -16,7 +16,11 @@ tree's src/kboot_display_handoff.c and runs each scenario. The trees have the T8
   be disabled, share the internal nub's __TEXT (reserved once, as dcp-text@), and once one is
   handed over the display subsystem and its DART are enabled on the boot framebuffer.
 - a later board and SoC whose processor lists apple,t8132-dcpext as a fallback compatible.
-No register is read or written in any scenario.
+- the DARTs each processor uses (its firmware DART and its pipe's) and, with no panel, the display
+  subsystem's DART: an unlocked one must be idle; a locked one's streams must translate through
+  two-level tables in DRAM, whose pages in usable RAM are reserved (no-map). The PMGR power
+  states follow both parents of each device.
+Registers are only read (the fake MMIO counts writes: none in any scenario).
 """
 import re
 
@@ -47,8 +51,8 @@ REASONS = {
     "j713-cpu-not-requested": [H1, "dcpext0: DISPEXT0_CPU is not requested (0x0)"],
     "j713-no-clock-gates": [H0, "dcpext1: no ADT clock-gates to check its power by"],
     "j713-dart-unlocked": [H1, "dcpext0: DART 0x286340000 is not locked (PROTECT 0x1e0)"],
-    "j713-stream-no-root": [H0, "dcpext1: DART 0x48a340000 stream 23 is not translating through a root (TCR 0x9, TTBR 0x40000)"],
-    "j713-stream-bypass": [H1, "dcpext0: DART 0x286340000 stream 23 is not translating through a root (TCR 0x3, TTBR 0x40001)"],
+    "j713-stream-no-root": [H0, "dcpext1: DART 0x48a340000 stream 23 is not translating through a root (TCR 0x1, TTBR 0x40000)"],
+    "j713-stream-bypass": [H1, "dcpext0: DART 0x286340000 stream 23 is not translating through a root (TCR 0x3, TTBR "],
     "j713-dart-read-faults": [H0, "dcpext1: reading DART 0x48a340000 faulted"],
     "j713-no-mapper": [H0, "dcpext1: the ADT does not describe its DART stream"],
     "j713-no-pipe": [H0, "dcpext1: 0 ADT display pipes use its piodma stream 16 at 0x48a300000"],
@@ -69,6 +73,18 @@ REASONS = {
                              "no panel, and the display subsystem's DART is not as iBoot leaves it"],
     "j773g-enabled": ["dcpext0 is not status \"disabled\"", "dcpext1 is not status \"disabled\""],
     "later-soc": [H0, H1],
+    "j713-tables-in-ram": [H0, H1, "dcpext0: DART 0x286340000 locked, 1 translating stream(s), 2 table page(s)",
+                           "dcpext1: DART 0x48a300000 locked, 2 translating stream(s), 4 table page(s)"],
+    "j713-pipe-dart-idle": [H0, H1, "dcpext1: DART 0x48a300000 unlocked and idle, 0 translating stream(s), 0 table page(s)"],
+    "j713-pipe-dart-live": [H0, "dcpext1: DART 0x48a300000 is not locked (PROTECT 0x1e0) and stream 16 is live (TCR 0x1)"],
+    "j713-four-level": [H1, "dcpext0: DART 0x286340000 stream 23 is not a two-level translation (TCR 0x9, "],
+    "j713-l2-outside-dram": [H0, "dcpext1: DART 0x48a300000 stream 0 L2 table 0x7f0000000 is not in DRAM"],
+    "j713-pipe-dart-faults": [H1, "dcpext0: reading DART 0x286300000 or its tables faulted"],
+    "j713-second-parent-off": [H0, "dcpext1: DISPEXT1_AUX is not on (0x0)"],
+    "j773g-disp-tables-in-ram": [H0, H1, "the display subsystem: DART 0x30a300000 locked, 2 translating stream(s), 4 table page(s)",
+                                 "no panel: display subsystem and its DART enabled"],
+    "j773g-disp-piodma-bypass": ["the display subsystem: DART 0x30a300000 stream 16 is not a two-level translation (TCR 0x3, ",
+                                 "no panel, and the display subsystem's DART is not as iBoot leaves it"],
 }
 # Scenarios in which exactly one processor is refused: its refusal is one log line.
 ONE_REFUSAL = {"j713-one", "j713-refused-uuid", "j713-sid-mismatch", "j713-dart-reg-mismatch",
@@ -76,7 +92,9 @@ ONE_REFUSAL = {"j713-one", "j713-refused-uuid", "j713-sid-mismatch", "j713-dart-
                "j713-no-adt-node", "j713-text-not-shared", "j713-bad-layout", "j713-has-clocks",
                "j713-pipe-no-clocks", "j713-ext-unpowered", "j713-cpu-not-requested",
                "j713-no-clock-gates", "j713-dart-unlocked", "j713-stream-no-root",
-               "j713-stream-bypass", "j713-dart-read-faults"}
+               "j713-stream-bypass", "j713-dart-read-faults", "j713-pipe-dart-live",
+               "j713-four-level", "j713-l2-outside-dram", "j713-pipe-dart-faults",
+               "j713-second-parent-off"}
 
 
 def test_every_scenario_has_its_reason():
@@ -125,5 +143,5 @@ def test_t8132_dcpext_handoff(host, scenario):
     if scenario in ONE_REFUSAL:
         refusals = [line for line in result.stdout.splitlines()
                     if line.startswith("DCP: dcpext: ") and "handed over" not in line
-                    and "__OS_LOG" not in line]
+                    and "__OS_LOG" not in line and " translating stream(s), " not in line]
         assert len(refusals) == 1, refusals

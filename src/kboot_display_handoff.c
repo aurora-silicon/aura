@@ -174,6 +174,11 @@
 #define DART_T8110_TTBR_ADDR        GENMASK(29, 2)
 #define DART_T8110_TTBR_SHIFT       14
 #define DART_T8110_STREAMS          16 /* T6030, T8122, T6031 */
+#define DART_T8110_PARAMS4          0xc
+#define DART_T8110_PARAMS4_NUM_SIDS GENMASK(8, 0)
+#define DART_T8110_TCR_REMAP_EN     BIT(7)
+#define DART_T8110_ENABLE_STREAMS   0xc00
+#define DART_T8110_STREAMS_REG_MAX  256 /* TCR(sid) and TTBR(sid) are 0x400 apart */
 #define DART_STREAMS_MAX            32
 
 /* Two-level tables of 16K pages cover the 36-bit DVA space: 2048 x 32 MiB, 2048 x 16 KiB */
@@ -3512,6 +3517,14 @@ struct dcpext {
     struct dcp6_clocks clk; /* its pipe's */
 };
 
+#define DCPEXT_TABLES_MAX 256
+
+/* The page-table pages of the DARTs an external processor uses, as iBoot left them */
+struct dcpext_tables {
+    int n;
+    u64 page[DCPEXT_TABLES_MAX];
+};
+
 /* Per-call state of dt_set_dcpext_handoff() */
 static struct {
     bool headless;        /* no panel: no internal handoff, the external processors only */
@@ -3519,6 +3532,8 @@ static struct {
     struct dcp6_seg text; /* the internal nub's __TEXT, which each must share */
     int n;
     struct dcpext ext[DCPEXT_MAX];
+    struct dcpext_tables tables;      /* scratch for one processor's DARTs */
+    struct dcpext_tables disp_tables; /* with no panel: the display subsystem DART's */
 } dcpext_run;
 
 /* An ADT string property (device_type) is `want` */
@@ -3813,11 +3828,156 @@ static int dcpext_stream_locked(u64 dart, u32 sid, const char *what)
     return 0;
 }
 
+/* A 16K table page inside the ADT's DRAM */
+static bool dcpext_table_in_dram(u64 page, u64 dram_base, u64 dram_size)
+{
+    return dram_size >= SZ_16K && !(page & (SZ_16K - 1)) && page >= dram_base &&
+           page - dram_base <= dram_size - SZ_16K;
+}
+
+/* Why dcpext_dart_tables() refused, printed once its guarded reads are known not to have faulted */
+static char dcpext_why[192];
+#define refuse(...)                                                                                \
+    do {                                                                                           \
+        snprintf(dcpext_why, sizeof(dcpext_why), __VA_ARGS__);                                     \
+        return -1;                                                                                 \
+    } while (0)
+
+static int dcpext_table_add(struct dcpext_tables *t, u64 page, const char *what, u64 dart)
+{
+    for (int i = 0; i < t->n; i++)
+        if (t->page[i] == page)
+            return 0;
+    if (t->n >= DCPEXT_TABLES_MAX)
+        refuse("%s: DART 0x%lx has more than %d table pages to keep\n", what, dart,
+               DCPEXT_TABLES_MAX);
+    t->page[t->n++] = page;
+    return 0;
+}
+
+static int dcpext_dart_tables_inner(u64 dart, const char *what, struct dcpext_tables *t,
+                                    u64 dram_base, u64 dram_size)
+{
+    u32 protect = read32(dart + DART_T8110_PROTECT);
+    u32 sids = FIELD_GET(DART_T8110_PARAMS4_NUM_SIDS, read32(dart + DART_T8110_PARAMS4));
+    bool locked = protect & DART_T8110_PROTECT_TTBR_TCR;
+    int before = t->n, live = 0;
+
+    if (!sids || sids > DART_T8110_STREAMS_REG_MAX)
+        refuse("%s: DART 0x%lx reports %u streams\n", what, dart, sids);
+    for (u32 sid = 0; sid < sids; sid++) {
+        if (!(read32(dart + DART_T8110_ENABLE_STREAMS + 4 * (sid / 32)) & BIT(sid % 32)))
+            continue; /* traffic on a disabled stream is dropped: its TCR/TTBR are leftovers */
+        u32 tcr = read32(dart + DART_T8110_TCR(sid));
+        u32 ttbr = read32(dart + DART_T8110_TTBR(sid));
+        if (!locked) {
+            /* The kernel resets an unlocked DART: only an idle one is safe to hand it */
+            if (tcr & (DART_T8110_TCR_TRANSLATE | DART_T8110_TCR_BYPASS_DART |
+                       DART_T8110_TCR_BYPASS_DAPF | DART_T8110_TCR_REMAP_EN))
+                refuse("%s: DART 0x%lx is not locked (PROTECT 0x%x) and stream %u is live "
+                       "(TCR 0x%x)\n",
+                       what, dart, protect, sid, tcr);
+            continue;
+        }
+        if (!tcr)
+            continue;
+        if (!(tcr & DART_T8110_TCR_TRANSLATE) ||
+            (tcr &
+             (DART_T8110_TCR_BYPASS_DART | DART_T8110_TCR_REMAP_EN | DART_T8110_TCR_FOUR_LEVEL)) ||
+            !(ttbr & DART_T8110_TTBR_VALID))
+            refuse("%s: DART 0x%lx stream %u is not a two-level translation (TCR 0x%x, TTBR "
+                   "0x%x)\n",
+                   what, dart, sid, tcr, ttbr);
+        u64 l1 = (u64)FIELD_GET(DART_T8110_TTBR_ADDR, ttbr) << DART_T8110_TTBR_SHIFT;
+        if (!dcpext_table_in_dram(l1, dram_base, dram_size))
+            refuse("%s: DART 0x%lx stream %u root 0x%lx is not in DRAM\n", what, dart, sid, l1);
+        if (dcpext_table_add(t, l1, what, dart))
+            return -1;
+        for (u64 i = 0; i < DART_ENTRIES; i++) {
+            u64 e1 = read64(l1 + 8 * i);
+            if (!(e1 & DART_PTE_VALID))
+                continue;
+            u64 l2 = (e1 & DART_PTE_ADDR) << DART_PTE_SHIFT;
+            if (!dcpext_table_in_dram(l2, dram_base, dram_size) || l2 == l1)
+                refuse("%s: DART 0x%lx stream %u L2 table 0x%lx is not in DRAM\n", what, dart, sid,
+                       l2);
+            if (dcpext_table_add(t, l2, what, dart))
+                return -1;
+        }
+        live++;
+    }
+    snprintf(dcpext_why, sizeof(dcpext_why),
+             "%s: DART 0x%lx %s, %d translating stream(s), %d table page(s)\n", what, dart,
+             locked ? "locked" : "unlocked and idle", live, t->n - before);
+    return 0;
+}
+
+/*
+ * The tables of a DART that iBoot may have left running, before the processor behind it is
+ * promised to the kernel. Unlocked, the kernel reprograms it: every enabled stream must be idle,
+ * and there is nothing to keep. Locked, the kernel keeps its tables: every enabled stream that is
+ * set up must translate through two-level tables in DRAM, whose pages (root and L2) are added to
+ * `t` for a reservation. Anything else refuses. Only read, guarded.
+ */
+static int dcpext_dart_tables(u64 dart, const char *what, struct dcpext_tables *t)
+{
+    u64 dram_base, dram_size;
+    if (dcp6_dram(&dram_base, &dram_size))
+        return -1;
+    dcpext_why[0] = 0;
+    int guard = dcp6_guard_begin();
+    int ret = dcpext_dart_tables_inner(dart, what, t, dram_base, dram_size);
+    if (dcp6_guard_end(guard))
+        bail("%s: reading DART 0x%lx or its tables faulted\n", what, dart);
+    dlog("%s", dcpext_why); /* the refusal, or what was found */
+    return ret;
+}
+
+#undef refuse
+
+/*
+ * Keep the table pages in `t` from the OS: a page in the RAM the OS gets is reserved (no-map,
+ * named by its address, as kboot.c's dcpext handoff names them); one outside it is not the OS's.
+ */
+static int dcpext_reserve_tables(void *dt, const struct dcpext_tables *t, const char *what)
+{
+    u64 ram_min = kboot_ram_base(), ram_max = kboot_ram_base() + kboot_ram_size();
+
+    for (int i = 0; i < t->n; i++) {
+        u64 page = t->page[i];
+        char name[48];
+        if (page + SZ_16K <= ram_min || page >= ram_max)
+            continue;
+        snprintf(name, sizeof(name), "dcpext-tables@%lx", page);
+        int node = dcp6_find_resv(dt, name, page, SZ_16K);
+        if (node >= 0)
+            continue;
+        if (node != -FDT_ERR_NOTFOUND || dcp6_resv_conflict(dt, page, SZ_16K, name) ||
+            !dcp6_add_resv(dt, name, page, SZ_16K, "apple,asc-mem"))
+            bail("%s: cannot reserve DART table page 0x%lx\n", what, page);
+    }
+    return 0;
+}
+
+/* The DART a device tree node's single iommus entry names, by its reg[0] */
+static int dcpext_iommu_reg(void *dt, int node, u64 *base)
+{
+    int len;
+    const fdt32_t *iommus = node < 0 ? NULL : fdt_getprop(dt, node, "iommus", &len);
+    int dart = !iommus || len != 2 * (int)sizeof(fdt32_t)
+                   ? -1
+                   : fdt_node_offset_by_phandle(dt, fdt32_ld(&iommus[0]));
+    if (dart < 0 || fdt_node_check_compatible(dt, dart, "apple,t8110-dart"))
+        return -1;
+    return dcpext_dt_reg(dt, dart, base);
+}
+
 /*
  * With no panel, the display subsystem (alias disp0) is enabled with its DART, which the internal
  * DCP iBoot started and parked still uses: only if that DART is the ADT's dart,t8110 at its
  * address, the internal DCP is powered and the DART's scanout stream is locked, so that the kernel
- * keeps its tables and the boot console. Only read, guarded.
+ * keeps its tables and the boot console. The table pages of every stream set up on it (scanout and
+ * piodma) are collected, to be reserved when the subsystem is enabled. Only read, guarded.
  */
 static int dcpext_display_locked(void *dt)
 {
@@ -3840,9 +4000,11 @@ static int dcpext_display_locked(void *dt)
     }
     if (n != 1)
         bail("%d ADT DARTs at the display subsystem's 0x%lx\n", n, base);
-    if (dcpext_powered("dcp"))
+    if (dcpext_powered("dcp") ||
+        dcpext_stream_locked(base, fdt32_ld(&iommus[1]), "the display subsystem"))
         return -1;
-    return dcpext_stream_locked(base, fdt32_ld(&iommus[1]), "the display subsystem");
+    dcpext_run.disp_tables.n = 0;
+    return dcpext_dart_tables(base, "the display subsystem", &dcpext_run.disp_tables);
 }
 
 /*
@@ -3858,6 +4020,17 @@ static int dcpext_fill(void *dt, struct dcpext *x)
         dcpext_stream_locked(x->dart, x->sid, x->name))
         return -1;
     int node = fdt_path_offset(dt, x->dt_path);
+
+    /* Its firmware DART and its pipe's (piodma's): tables to keep, or refused */
+    char piodma_path[sizeof(x->dt_path) + 8];
+    u64 pipe_dart;
+    snprintf(piodma_path, sizeof(piodma_path), "%s/piodma", x->dt_path);
+    dcpext_run.tables.n = 0;
+    if (dcpext_iommu_reg(dt, fdt_path_offset(dt, piodma_path), &pipe_dart))
+        bail("%s: no piodma child on a DART\n", x->name);
+    if (dcpext_dart_tables(x->dart, x->name, &dcpext_run.tables) ||
+        (pipe_dart != x->dart && dcpext_dart_tables(pipe_dart, x->name, &dcpext_run.tables)))
+        return -1;
     if (dcpext_placeholders(dt, node, x->name, ph))
         return -1;
 
@@ -3904,6 +4077,8 @@ static int dcpext_fill(void *dt, struct dcpext *x)
     }
     if (dcp6_resv_conflict(dt, segs[SEG_DATA].phys, segs[SEG_DATA].size, x->name) ||
         dcp6_resv_conflict(dt, segs[SEG_3].phys, segs[SEG_3].size, x->name))
+        return -1;
+    if (dcpext_reserve_tables(dt, &dcpext_run.tables, x->name))
         return -1;
     if (dcpext_fill_mem(dt, x->dt_path, x->name, segs, ph, text_name, dcpext_run.headless,
                         x->vm_base) ||
@@ -3971,7 +4146,8 @@ static void dcpext_reserve_oslogs(void *dt)
 /*
  * kboot.c's M4 handoff, after its internal DCP handoff: hand the external display processors over
  * from this boot's ADT and device tree, with no board, chip or OS release test. The only register
- * accesses are guarded reads of the PMGR power states and DART lock state the ADT points at.
+ * accesses are guarded reads of the PMGR power states, the DART state and the page tables of the
+ * locked DARTs the ADT and the device tree point at; the table pages in the OS's RAM are reserved.
  *
  * Only for an image whose firmware the OS gives its clocks (`fw_clocks`: kboot.c's firmware-27
  * rule, the one it publishes dcp's clocks by; beside the internal handoff, dcp must carry them);
@@ -4080,7 +4256,8 @@ int dt_set_dcpext_handoff(void *dt, enum dcp_internal internal, bool fw_clocks)
     void *scratch = dcp6_scratch(dt);
     if (!scratch)
         return 1;
-    if (dcp6_headless_display(scratch, display)) {
+    if (dcpext_reserve_tables(scratch, &dcpext_run.disp_tables, "the display subsystem") ||
+        dcp6_headless_display(scratch, display)) {
         dlog("display subsystem not enabled; the external processors stay disabled\n");
         free(scratch);
     } else if (!dcp6_commit(dt, scratch)) {
