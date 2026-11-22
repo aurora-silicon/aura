@@ -527,12 +527,12 @@ u32 dptx_phy_get_active_lane_count(dptx_phy_t *phy)
 
 int dptx_phy_set_drive_settings(dptx_phy_t *phy, const dptx_drive_settings_t *settings, u32 count)
 {
-    /* The HDMI phy is not reprogrammed for drive settings; the request is
-     * only accepted. */
-    if (phy && phy->type == DPTX_PHY_T8152_HDMI)
-        return 0;
-    if (!phy || phy->type != DPTX_PHY_T8152_ATC)
+    if (!phy)
         return -1;
+    /* Only the ATC phy is reprogrammed. A dedicated dptx-phy only accepts the request, as the
+     * pre-AFKv2 dptx-port handler does for every phy. */
+    if (phy->type != DPTX_PHY_T8152_ATC)
+        return 0;
     return atc_phy_set_drive_settings(phy->atc, settings, count);
 }
 
@@ -739,8 +739,14 @@ int dptx_phy_set_link_rate(dptx_phy_t *phy, u32 link_rate)
 
 int dptx_phy_deactivate(dptx_phy_t *phy)
 {
-    if (!phy || phy->type != DPTX_PHY_T8152_ATC)
+    if (!phy)
         return -1;
+    /* Only the ATC phy is powered down per link. A dedicated dptx-phy stays set up for its
+     * display-crossbar slot; the request is only accepted, as the pre-AFKv2 handler does. */
+    if (phy->type != DPTX_PHY_T8152_ATC) {
+        phy->active_lanes = 0;
+        return 0;
+    }
     int ret = atc_phy_deactivate(phy->atc);
     if (!ret)
         phy->active_lanes = 0;
@@ -749,11 +755,12 @@ int dptx_phy_deactivate(dptx_phy_t *phy)
 
 int dptx_phy_set_route(dptx_phy_t *phy, bool enable)
 {
-    /* The dedicated HDMI phy has no per-link route to switch. */
-    if (phy && phy->type == DPTX_PHY_T8152_HDMI)
-        return 0;
-    if (!phy || phy->type != DPTX_PHY_T8152_ATC)
+    if (!phy)
         return -1;
+    /* Only a phy behind an ATC port switches its route per link. A dedicated dptx-phy is wired to
+     * its display-crossbar slot once, when it is set up. */
+    if (phy->type != DPTX_PHY_T8152_ATC)
+        return 0;
     return atc_phy_set_route(phy->atc, enable);
 }
 
