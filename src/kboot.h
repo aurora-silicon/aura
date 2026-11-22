@@ -29,6 +29,7 @@ void kboot_delete_chosen(const char *name);
 void kboot_set_config_lost(void);
 int kboot_set_uboot(const char *name, const char *value);
 int dt_gpu_t8122_26_calibrate(void *dt);
+int dt_gpu_t8122_27_machine_values(void *dt);
 void t8122_read_powered_identity(void *dt, int gpu);
 int dt_set_gpu_t8122_26(void *dt);
 
