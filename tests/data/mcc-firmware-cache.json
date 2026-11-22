@@ -1,0 +1,108 @@
+{
+  "SPDX-License-Identifier": "GPL-2.0-only OR MIT",
+  "description": "Factual hardware values the firmware-cache MCC path (mcc,t6041, mcc,t8140) reads, reduced from Mac IODeviceTrees: /arm-io/mcc counts and masks, the AMCC register windows (reg[amcc-reg-idx + i], translated by the arm-io ranges) and /chosen/lock-regs/amcc. A null is a property the source does not have. No serials, UUIDs, ECID, MAC addresses, user names or live register values.",
+  "profiles": {
+    "j616c-binned": {
+      "source": "J616C (M4 Max, binned: 14 CPUs, 6 of 8 AMCCs), live ADT dump posted by AxxzyWasTaken on aurora-silicon/aura#406 (comment 7054961263). That dump truncates reg and has no lock-regs; the windows are the J616cAP DeviceTree's in the macOS 27.2.1 IPSW, the same on every M4 Max tree.",
+      "chip_id": "0x6041",
+      "compatible": "mcc,t6041",
+      "amcc_reg_idx": 12,
+      "amcc_count": 8,
+      "dcs_count_per_amcc": 4,
+      "amcc_enable_mask": "0x3f",
+      "dcs_channel_enable_mask": "0xffffff",
+      "amcc_plane_enable_mask": null,
+      "lock_regs": null,
+      "apertures": [
+        ["0x220000000", "0x200000"], ["0x222000000", "0x200000"],
+        ["0x224000000", "0x200000"], ["0x226000000", "0x200000"],
+        ["0x228000000", "0x200000"], ["0x22a000000", "0x200000"],
+        ["0x22c000000", "0x200000"], ["0x22e000000", "0x200000"]
+      ]
+    },
+    "j616c": {
+      "source": "J616c (Mac16,5, M4 Max, 12P+4E), macOS 26.6.2 IODeviceTree, GravityLinux/adt-collection 26.6.2/t6041-j616c.txt (public domain).",
+      "chip_id": "0x6041",
+      "compatible": "mcc,t6041",
+      "amcc_reg_idx": 12,
+      "amcc_count": 8,
+      "dcs_count_per_amcc": 4,
+      "amcc_enable_mask": "0xff",
+      "dcs_channel_enable_mask": "0xffffffff",
+      "amcc_plane_enable_mask": null,
+      "lock_regs": {
+        "aperture_count": 8,
+        "aperture_size": "0x200000",
+        "aperture_phys_addr": ["0x220000000", "0x222000000", "0x224000000", "0x226000000",
+                               "0x228000000", "0x22a000000", "0x22c000000", "0x22e000000"],
+        "plane_count": 4,
+        "plane_stride": "0x40000"
+      },
+      "apertures": [
+        ["0x220000000", "0x200000"], ["0x222000000", "0x200000"],
+        ["0x224000000", "0x200000"], ["0x226000000", "0x200000"],
+        ["0x228000000", "0x200000"], ["0x22a000000", "0x200000"],
+        ["0x22c000000", "0x200000"], ["0x22e000000", "0x200000"]
+      ]
+    },
+    "j614c": {
+      "source": "J614c (M4 Max), J614cAP DeviceTree in the macOS 27.2.1 IPSW, before iBoot adds the enable masks and lock-regs.",
+      "chip_id": "0x6041",
+      "compatible": "mcc,t6041",
+      "amcc_reg_idx": 12,
+      "amcc_count": 8,
+      "dcs_count_per_amcc": 4,
+      "amcc_enable_mask": null,
+      "dcs_channel_enable_mask": null,
+      "amcc_plane_enable_mask": null,
+      "lock_regs": null,
+      "apertures": [
+        ["0x220000000", "0x200000"], ["0x222000000", "0x200000"],
+        ["0x224000000", "0x200000"], ["0x226000000", "0x200000"],
+        ["0x228000000", "0x200000"], ["0x22a000000", "0x200000"],
+        ["0x22c000000", "0x200000"], ["0x22e000000", "0x200000"]
+      ]
+    },
+    "j773s": {
+      "source": "J773s (Mac16,11, M4 Pro), macOS 26.6.2 IODeviceTree, GravityLinux/adt-collection 26.6.2/t6040-j773s.txt (public domain). Its lock-regs aperture-phys-addr is redacted in that dump, so it is left out.",
+      "chip_id": "0x6040",
+      "compatible": "mcc,t6041",
+      "amcc_reg_idx": 12,
+      "amcc_count": 4,
+      "dcs_count_per_amcc": 4,
+      "amcc_enable_mask": "0xf",
+      "dcs_channel_enable_mask": "0xffff",
+      "amcc_plane_enable_mask": null,
+      "lock_regs": {
+        "aperture_count": 4,
+        "aperture_size": "0x200000",
+        "aperture_phys_addr": null,
+        "plane_count": 4,
+        "plane_stride": "0x40000"
+      },
+      "apertures": [
+        ["0x220000000", "0x200000"], ["0x222000000", "0x200000"],
+        ["0x224000000", "0x200000"], ["0x226000000", "0x200000"]
+      ]
+    },
+    "j700": {
+      "source": "J700 (T8140), IODeviceTree, GravityLinux/adt-collection 26.6.2/t8140-j700.txt (public domain).",
+      "chip_id": "0x8140",
+      "compatible": "mcc,t8140",
+      "amcc_reg_idx": 2,
+      "amcc_count": 1,
+      "dcs_count_per_amcc": 4,
+      "amcc_enable_mask": "0x1",
+      "dcs_channel_enable_mask": "0xf",
+      "amcc_plane_enable_mask": "0xf",
+      "lock_regs": {
+        "aperture_count": 1,
+        "aperture_size": "0x140000",
+        "aperture_phys_addr": ["0x220000000"],
+        "plane_count": 4,
+        "plane_stride": "0x40000"
+      },
+      "apertures": [["0x220000000", "0x140000"]]
+    }
+  }
+}

@@ -418,6 +418,7 @@ static void rtkit_free(void *r) { (void)r; c_rtkit_free++; }
 static bool rtkit_quiesce(void *r) { (void)r; c_rtkit_quiesce++; return true; }
 static int  afk_epic_shutdown(void *a) { (void)a; c_afk_shutdown++; return 0; }
 static void dcp_mark_running(void) { c_mark_running++; }
+static bool dcp_init_quiesced; /* set by the verbatim out_rtkit label */
 #define free(p) do { (void)(p); c_free_dcp++; } while (0)
 
 static void reset_counts(void) {

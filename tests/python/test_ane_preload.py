@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: MIT
-"""The M4 Pro, M5 Pro and A18 Pro ANE preload handoff: reservations, memory regions and firmware
-IOVAs.
+"""The M4, M4 Pro, M5 Pro and A18 Pro ANE preload handoff: reservations, memory regions and
+firmware IOVAs.
 
 Runs kboot.c's dt_set_ane_firmware(), dt_set_ane_node(), dt_ane_fill_region() and
 dt_get_or_add_reserved_mem() as they are, on real FDTs built with aura's libfdt, against a
-fake ADT. Segment values are the J616s 26.6.2 /arm-io/ane0, the Neo (J700) 26.6.2 /arm-io/ane
-and the J714s 27.0 /arm-io/ane0 segment-ranges. The J714s DT also has a soc@200000000 ahead of
+fake ADT. Segment values are the J616s 26.6.2 /arm-io/ane0, the Neo (J700) 26.6.2 /arm-io/ane,
+the J713 26.6.2 /arm-io/ane and the J714s 27.0 /arm-io/ane0 segment-ranges. The J714s DT also has a soc@200000000 ahead of
 the /soc that holds the ANE, which libfdt resolves "/soc" to.
 """
 
@@ -22,6 +22,8 @@ BOARDS = {
                   text=0x100009D8000, data=0x1000196C000, phys_base=0x10002000000, sibling=0),
     "j700": dict(compat="apple,t8140-ane", node="ane@400000000", adt="/arm-io/ane",
                  text=0x10000768000, data=0x100019A0000, phys_base=0x10002000000, sibling=0),
+    "j713": dict(compat="apple,t8132-ane", node="ane@500000000", adt="/arm-io/ane",
+                 text=0x10000AC8000, data=0x10001A2C000, phys_base=0x10002000000, sibling=0),
     "j714s": dict(compat="apple,t6050-ane", node="neural-processor@508000000",
                   adt="/arm-io/ane0", text=0x10000DC0000, data=0x10002114000,
                   phys_base=0x10003B40000, sibling=1),

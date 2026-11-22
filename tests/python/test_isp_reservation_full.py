@@ -36,11 +36,14 @@ typedef uint32_t u32;
 static u32 chip_id;
 static unsigned int mappings, links;
 #define ALIGN_UP(x, a) (((x) + (a) - 1) & ~((a) - 1))
-/* Stub: the T6041 ISP handoff isn't exercised here. */
-__attribute__((unused)) static int dt_set_isp_t6041(int node) { (void)node; return 0; }
+/* Stub: placeholder-based ISP handoff isn't exercised here. */
+__attribute__((unused)) static bool dt_isp_has_placeholders(void) { return false; }
+__attribute__((unused)) static int dt_fill_isp_placeholders(int node, bool req)
+{ (void)node; (void)req; return 0; }
 #define V13_5 0
 #define V13_6_1 1
 #define bail(...) do { return -1; } while (0)
+static int dt_device_dart_va_bits(int fdt_node, int adt_node, u32 *bits) { (void)fdt_node; (void)adt_node; (void)bits; return -1; }
 struct fw_version_info { int version; };
 static struct fw_version_info os_firmware = {0}, fw_versions[2];
 #define PACKED __attribute__((packed))
