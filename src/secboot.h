@@ -66,6 +66,21 @@ static inline bool secboot_host_proxy_allowed(void)
 bool secboot_host_proxy_allowed(void);
 #endif
 
+/*
+ * Whether a USB host nobody asked for may get the proxy: the Stage 1 recovery window after a
+ * failed boot, and the fallbacks when no payload starts or a hand-off fails. Nobody asked for
+ * those, so a Stage 1 offers them only when built for a lab (LAB_PROXY=1). Windows the
+ * owner asks for (the configured window, aura-proxy) go by secboot_host_proxy_allowed() alone.
+ */
+#ifdef SECBOOT_SECURE_FLAVOUR
+static inline bool secboot_unrequested_proxy_allowed(void)
+{
+    return false;
+}
+#else
+bool secboot_unrequested_proxy_allowed(void);
+#endif
+
 /* "dev" or "secure" (SECBOOT_FLAVOUR). */
 
 /* Build /chosen/aurora,boot-security in the FDT handed to the next stage. */

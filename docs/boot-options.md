@@ -21,7 +21,9 @@ The boot-argument tokens are matched exactly:
   the rest of `aura-debug`. `aura-debug` keeps it too.
 
 The options may be combined. `aura-debug` alone does not request a proxy pause.
-Normal payload failure still follows the existing recovery fallback.
+When no payload starts, a Stage 1 reboots; one built with `LAB_PROXY=1` falls
+back to the proxy instead, and also opens a 10 second window for a host after
+a boot that stopped before an OS (see `docs/secure-boot.md`).
 
 The `tso=` payload setting controls the Mach-O handoff's TSO setup.
 
@@ -180,10 +182,11 @@ reason followed by `kernel gate remains closed`.
 
 Stage 1: `make RELEASE=1 CHAINLOADING=1 BUILTIN_LOGO=aurora`.
 Stage 2: add `ESP_STAGE2=1` to that command. Preserve each stage before rebuilding.
+A lab Stage 1 adds `LAB_PROXY=1`.
 These profiles are shared across boards. The embedded ESP configuration is
 consumed on every supported chip, and normal boot attempts its payload before
-initializing the USB proxy. An explicit proxy request or missing payload starts
-the platform's USB transport; `aura-debug` retains DebugUSB instead.
+initializing the USB proxy. An explicit proxy request, or in a lab Stage 1 a
+missing payload, starts the platform's USB transport; `aura-debug` retains DebugUSB instead.
 
 The former Neo CDC/KIS make switches and Neo Stage 2 alias have been removed.
 The raw image links both USB protocol engines; the PHY chooses the engine at

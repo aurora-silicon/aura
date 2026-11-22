@@ -161,7 +161,7 @@ static void stage1_read_boot_record(void)
 bool stage1_recovery_window(void)
 {
     if (stage1_window_done || stage1_chained || !stage1_boot_record_valid ||
-        !secboot_host_proxy_allowed() ||
+        !secboot_unrequested_proxy_allowed() ||
         !stage1_previous_boot_stopped_early(stage1_boot_counts, stage1_boot_error_stage))
         return false;
     stage1_window_done = true;
@@ -285,23 +285,24 @@ void run_actions(void)
                "  Check that the file this Stage 1 names exists on its EFI partition.\n"
                "  Hold the power button to shut down, then hold it again to choose another "
                "system.\n");
-    if (stage1_config_target() && wdt_boot_watchdog_armed())
+    if (stage1_config_target() && wdt_boot_watchdog_armed() && secboot_unrequested_proxy_allowed())
         printf("  Without a host, this Mac restarts by itself within %u s to try again.\n",
                WDT_BOOT_SECONDS);
 
     if (payload_action == STAGE1_PAYLOAD_HALT)
         panic("Stage 1: no safe proxy carrier after CDC failure\n");
 
-    if (!secboot_host_proxy_allowed()) {
-        /* Shown on the panel. No proxy: a host could run anything through it. */
+    if (!secboot_unrequested_proxy_allowed()) {
         /*
-         * Shown on the panel. Never stop here: nobody may be at the Mac. A Stage 1 reboots into
-         * the same check (the owner can choose another system at startup); a Stage 2 reboots to
-         * Stage 1, which boots its configured image.
+         * Shown on the panel. No proxy: a host could run anything through it. Never stop here:
+         * nobody may be at the Mac. A Stage 1 reboots into the same check (the owner can choose
+         * another system at startup); a Stage 2 reboots to Stage 1, which boots its configured
+         * image.
          */
-        printf("\nSecure boot: no verified next stage could be started, and this build gives\n"
-               "  no USB host a proxy. Rebooting in 10 s. To stop, hold the power button and\n"
-               "  choose another system; then reinstall a signed Stage 2.\n");
+        printf("\nNo next stage could be started, and this build gives no USB host a proxy.\n"
+               "  Rebooting in 10 s. To stop, hold the power button and choose another\n"
+               "  system; then reinstall %sStage 2.\n",
+               secboot_enforcing() ? "a signed " : "");
         mdelay(10000);
         flush_and_reboot();
     }
@@ -379,9 +380,9 @@ static void j873g_run_proxy(void)
         }
         printf("No valid payload found\n");
     }
-    if (!secboot_host_proxy_allowed()) {
-        printf("\nSecure boot: no verified next stage could be started, and this build gives\n"
-               "  no USB host a proxy. Rebooting in 10 s.\n");
+    if (!proxy_request && !secboot_unrequested_proxy_allowed()) {
+        printf("\nNo next stage could be started, and this build gives no USB host a proxy.\n"
+               "  Rebooting in 10 s.\n");
         mdelay(10000);
         flush_and_reboot();
     }
@@ -490,7 +491,7 @@ next_stage:
 
     if (!nvme_shutdown()) {
         printf("NVMe handoff failed; returning to proxy\n");
-        if (!secboot_host_proxy_allowed())
+        if (!secboot_unrequested_proxy_allowed())
             flush_and_reboot();
         uartproxy_run(NULL);
         panic("NVMe handoff failed\n");
@@ -509,7 +510,7 @@ next_stage:
         /* Its firmware may still use memory the next stage will reuse. */
         if (display_shutdown(DCP_SLEEP_IF_EXTERNAL) < 0) {
             printf("Display handoff failed; returning to proxy\n");
-            if (!secboot_host_proxy_allowed())
+            if (!secboot_unrequested_proxy_allowed())
                 flush_and_reboot();
             uartproxy_run(NULL);
             panic("Display handoff failed\n");

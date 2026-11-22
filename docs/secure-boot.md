@@ -16,8 +16,8 @@ Both are build options; a default build only writes the record.
 - `SECBOOT_MIN_SECURITY_VERSION` (a `-D` define): the lowest security version
   a signature may carry. Signatures below it are refused as rollbacks.
 - `SECBOOT_FLAVOUR=dev|secure` (default `dev`): `dev` keeps the USB host
-  windows a lab needs (the recovery window after a failed boot, `aura-proxy`,
-  DebugUSB) while the stage does not enforce. `secure` never gives a USB host
+  windows someone asks for (the configured window, `aura-proxy`, DebugUSB)
+  while the stage does not enforce. `secure` never gives a USB host
   the proxy, whatever the policy: no window, and a failed hand-off or a boot
   with no payload reboots instead of falling back to the proxy. `secure` needs
   `SECBOOT=audit` or `enforce` and refuses `DEBUGUSB_PROXY=1`. Its image
@@ -25,6 +25,12 @@ Both are build options; a default build only writes the record.
   keeps a `secure` Stage 1 well below the DCP log buffer (`aura-raw.ld`) on
   every distribution's toolchain. `tools/stage1_room.py` reports how much room
   a Stage 1 build has left; CI checks it for each flavour (`stage1-size.yml`).
+- `LAB_PROXY=1` (a `dev` Stage 1 for lab Macs): also give a USB host that
+  nobody asked for the proxy, in the recovery window after a boot that stopped
+  before an OS, and when no payload starts or a hand-off fails. Anyone with a
+  cable could take those, so a Stage 1 built without it leaves a message on
+  the panel and reboots instead. Later stages keep these fallbacks while they
+  do not enforce.
 
 The usual pair is a `secure` Stage 1 built with `SECBOOT=audit` for users and a
 `dev` one for development Macs. Both report and boot by default; enforcing is

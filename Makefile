@@ -130,8 +130,9 @@ ifneq ($(filter audit enforce,$(SECBOOT)),)
 CFG += SECBOOT_$(shell echo $(SECBOOT) | tr a-z A-Z)
 endif
 SECBOOT_PUBKEY ?= data/secboot/test-ed25519.pub
-# SECBOOT_FLAVOUR=dev (default) keeps the USB host windows a lab needs (recovery window, aura-proxy,
-# DebugUSB) unless the stage enforces; SECBOOT_FLAVOUR=secure never opens one and needs SECBOOT.
+# SECBOOT_FLAVOUR=dev (default) keeps the USB host windows someone asks for (aura-proxy, the
+# configured window, DebugUSB) unless the stage enforces; SECBOOT_FLAVOUR=secure never opens one and
+# needs SECBOOT.
 SECBOOT_FLAVOUR ?= dev
 ifeq ($(SECBOOT_FLAVOUR),secure)
 ifeq ($(filter audit enforce,$(SECBOOT)),)
@@ -143,6 +144,16 @@ endif
 CFG += SECBOOT_SECURE_FLAVOUR
 else ifneq ($(SECBOOT_FLAVOUR),dev)
 $(error SECBOOT_FLAVOUR must be dev or secure)
+endif
+
+# Lab Stage 1 builds only: also give the proxy to a USB host nobody asked for, in the recovery
+# window after a failed boot and when no payload starts or a hand-off fails (docs/secure-boot.md).
+# Without it a Stage 1 reboots instead.
+ifeq ($(LAB_PROXY),1)
+ifeq ($(SECBOOT_FLAVOUR),secure)
+$(error SECBOOT_FLAVOUR=secure cannot have LAB_PROXY=1)
+endif
+CFG += LAB_PROXY
 endif
 
 # Development builds only: a boot started by a VDM `reboot debugusb` with a host reading the

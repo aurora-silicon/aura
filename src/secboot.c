@@ -358,6 +358,15 @@ bool secboot_host_proxy_allowed(void)
 {
     return !secboot_enforcing();
 }
+
+bool secboot_unrequested_proxy_allowed(void)
+{
+#if defined(CHAINLOADING) && !defined(ESP_STAGE2) && !defined(LAB_PROXY)
+    return false;
+#else
+    return secboot_host_proxy_allowed();
+#endif
+}
 #endif
 
 bool secboot_allow_unverified(const char *what)
