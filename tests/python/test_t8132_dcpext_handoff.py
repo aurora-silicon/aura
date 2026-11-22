@@ -98,6 +98,9 @@ REASONS = {
     "j713-iommu-cells-2": [H1, "dcpext0: piodma iommus[0] is not a one-cell apple,t8110-dart"],
     "j713-self-parent": [H0, H1],
     "j773g-tables-display-fails": [H0, H1, "display subsystem not enabled; the external processors stay disabled"],
+    "j713-fw27-no-uuid": ["no image uuid on /arm-io/dcp/iop-dcp-nub: external processors not handed over"],
+    "j713-26-6-2-no-uuid": ["image (none) is not given its clocks by the OS: external processors left to the "
+                            "firmware-ready path"],
     "j773g-disp-piodma-bypass": ["the display subsystem: DART 0x30a300000 stream 16 is not a two-level translation (TCR 0x3, ",
                                  "no panel, and the display subsystem's DART is not as iBoot leaves it"],
 }
@@ -118,7 +121,7 @@ ONE_REFUSAL = {"j713-one", "j713-refused-uuid", "j713-sid-mismatch", "j713-dart-
 def test_every_scenario_has_its_reason():
     assert sorted(REASONS) == sorted(SCENARIOS)
     for required in ("j713-both", "j713-one", "j713-refused-uuid", "j713-internal-walk-failed",
-                     "j713-26-6-2", "j773g-headless"):
+                     "j713-26-6-2", "j773g-headless", "j713-fw27-no-uuid"):
         assert required in SCENARIOS
 
 

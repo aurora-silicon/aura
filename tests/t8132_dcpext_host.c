@@ -689,6 +689,8 @@ static const struct t8132_scenario t8132_scenarios[] = {
     {"j713-self-parent", "J713: DISPEXT1_CPU lists itself as its second parent"},
     {"j773g-tables-display-fails", "J773g: disp0 tables in RAM, display subsystem not enabled"},
     {"later-soc", "a later board/SoC with the same block, fallback compatible"},
+    {"j713-fw27-no-uuid", "J713 27.2, internal nub without uuid: refused, no 26.6.2 marker"},
+    {"j713-26-6-2-no-uuid", "J713 26.6.2, no uuid on the internal nub: the firmware-ready path's"},
 };
 
 /* A page of usable RAM for the scenarios that put tables there */
@@ -747,7 +749,7 @@ int main(int argc, char **argv)
     printf("%s: %s\n", s, sc->what);
 
     bool j773g = !strncmp(s, "j773g", 5), later = is(s, "later-soc");
-    bool unknown = is(s, "j713-26-6-2");
+    bool unknown = is(s, "j713-26-6-2") || is(s, "j713-26-6-2-no-uuid");
     if (is(s, "j713-other-image"))
         image = UUID_X;
     if (unknown)
@@ -943,6 +945,9 @@ int main(int argc, char **argv)
         OK(fdt_setprop_string(dt, alias_node(dt, "disp0"), "status", "okay"));
     }
 
+    if (is(s, "j713-fw27-no-uuid") || is(s, "j713-26-6-2-no-uuid"))
+        prop_drop("/arm-io/dcp/iop-dcp-nub", "uuid");
+
     memcpy(in, dt, fdt_totalsize(dt));
     mmio_reads = mmio_writes = 0;
     bool fw_clocks = os_firmware.version >= V27_0; /* kboot.c's dt_dcp_fw_clocks() */
@@ -1002,6 +1007,11 @@ int main(int argc, char **argv)
         check_display(in, dt, false);
         if (!is(s, "j713-dt-full"))
             check_oslogs(dt, true, true, false);
+    } else if (is(s, "j713-fw27-no-uuid")) {
+        check(ext_untouched(in, dt, 0) && ext_untouched(in, dt, 1),
+              "no external processor is published (no uuid, clocks or 26.6.2 marker)");
+        check_internal_untouched(in, dt);
+        check_oslogs(dt, true, true, false);
     } else if (unknown) {
         check(fdt_totalsize(in) == fdt_totalsize(dt) && !memcmp(in, dt, fdt_totalsize(dt)),
               "the device tree is byte for byte unchanged");

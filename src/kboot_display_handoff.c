@@ -4236,8 +4236,10 @@ static void dcpext_reserve_oslogs(void *dt)
  *
  * Only for an image whose firmware the OS gives its clocks (`fw_clocks`: kboot.c's firmware-27
  * rule, the one it publishes dcp's clocks by; beside the internal handoff, dcp must carry them);
- * otherwise nothing is done and 0 is returned, and kboot.c keeps the firmware-ready path. Otherwise
- * 1, whatever was published: the processors of such an image are this function's. Which images
+ * otherwise nothing is done and 0 is returned, and kboot.c keeps the firmware-ready path. That is
+ * decided first, from `fw_clocks` alone: a boot of such firmware never gets that path, whatever its
+ * ADT lacks. Otherwise 1, whatever was published: the processors of such an image are this
+ * function's. Which images
  * the kernel drives is its own decision, by the apple,firmware-uuid published here. Each processor
  * of a known block (dcpext_blocks[]) is matched to its ADT node by address and checked against it
  * (DART stream and window, pipe, image, layout, the shared __TEXT), and is its own transaction: a
@@ -4259,24 +4261,24 @@ int dt_set_dcpext_handoff(void *dt, enum dcp_internal internal, bool fw_clocks)
     u32 len = 0, seg_len = 0, names_len = 0;
     int nub = adt_path_offset(adt, DCP6_NUB);
     const char *uuid = nub < 0 ? NULL : adt_getprop(adt, nub, "uuid", &len);
-    if (!dcp6_is_uuid(uuid, len)) {
-        dlog("no image uuid on %s: external processors left to the firmware-ready path\n",
-             DCP6_NUB);
-        return 0;
-    }
+    /* Decided from fw_clocks alone: firmware 27 never gets the firmware-ready path */
     if (!fw_clocks) {
         dlog("image %s is not given its clocks by the OS: external processors left to the "
              "firmware-ready path\n",
-             uuid);
+             dcp6_is_uuid(uuid, len) ? uuid : "(none)");
         return 0;
     }
-    dcpext_run.uuid = uuid;
     dcpext_run.headless = internal == DCP_INTERNAL_NO_PANEL;
     if (!dcpext_find(dt)) {
         dlog("the device tree describes no external processor\n");
         return 1;
     }
     dcpext_reserve_oslogs(dt);
+    if (!dcp6_is_uuid(uuid, len)) {
+        dlog("no image uuid on %s: external processors not handed over\n", DCP6_NUB);
+        return 1;
+    }
+    dcpext_run.uuid = uuid;
 
     if (internal != DCP_INTERNAL_COMPLETE && internal != DCP_INTERNAL_NO_PANEL) {
         dlog("internal DCP handoff not complete: external processors not handed over\n");
