@@ -805,8 +805,12 @@ static int dt_reserve_retained_span(u64 start, u64 end)
  *                                            reserved range [@lo, @hi)), IOVA (2), physical
  *                                            address (2), size (2) of each system buffer
  * A loader-owned buffer outside that range is not described and the node gets no description,
- * so the kernel keeps its normal boot path.
+ * so the kernel keeps its normal boot path. Each loader-owned buffer also gets a reserved-memory
+ * region with iommu-addresses (dt_reserve_live_rtkit_buffer()), so that its IOVA stays mapped.
  */
+static int dt_reserve_live_rtkit_buffer(const char *path, const char *alias,
+                                        const struct rtkit_live_buffer *b);
+
 static int dt_publish_live_rtkit(u64 lo, u64 hi)
 {
     const char *alias = NULL;
@@ -846,11 +850,20 @@ static int dt_publish_live_rtkit(u64 lo, u64 hi)
         c[6] = cpu_to_fdt32(b->size >> 32);
         c[7] = cpu_to_fdt32(b->size);
     }
+    /* The names below must not contain a path separator */
+    if (strchr(alias, '/'))
+        alias = "dcp";
+    for (u32 i = 0; i < st->n_buffers; i++)
+        if ((st->buffers[i].flags & RTKIT_LIVE_BUFFER_OWNED) &&
+            dt_reserve_live_rtkit_buffer(path, alias, &st->buffers[i]))
+            return -1;
+
     fdt32_t epmap[8];
     for (int i = 0; i < 8; i++)
         epmap[i] = cpu_to_fdt32(st->epmap[i]);
 
-    if (fdt_setprop_u32(dt, node, "apple,rtkit-version", st->version) ||
+    /* The reservations above moved the tree: find the node again for every write */
+    if (fdt_setprop_u32(dt, fdt_path_offset(dt, path), "apple,rtkit-version", st->version) ||
         fdt_setprop(dt, fdt_path_offset(dt, path), "apple,rtkit-epmap", epmap, sizeof(epmap)) ||
         fdt_setprop(dt, fdt_path_offset(dt, path), "apple,rtkit-live-buffers", bufs,
                     st->n_buffers * 8 * sizeof(fdt32_t)) ||
@@ -4050,6 +4063,38 @@ static int dt_device_add_mem_region(const char *alias, uint32_t phandle, const c
         bail("FDT: failed to append to 'memory-region-names' property\n");
 
     return 0;
+}
+
+/*
+ * Keep a loader-owned live buffer mapped for the kernel: a reserved-memory region for its pages
+ * whose iommu-addresses give the IOVA the IOP uses, referenced from the DCP's memory-region. The
+ * kernel rebuilds a display DART's translations from these regions when it takes the stream over,
+ * so a buffer without one is no longer mapped once it does.
+ */
+static int dt_reserve_live_rtkit_buffer(const char *path, const char *alias,
+                                        const struct rtkit_live_buffer *b)
+{
+    char node_name[64], region_name[32];
+    int dev = fdt_path_offset(dt, path);
+    uint32_t dev_phandle = dev < 0 ? 0 : fdt_get_phandle(dt, dev);
+
+    /* iommu-addresses names the device by phandle; give it one if the DT did not */
+    if (dev >= 0 && !dev_phandle &&
+        (fdt_generate_phandle(dt, &dev_phandle) ||
+         fdt_setprop_u32(dt, dev, "phandle", dev_phandle)))
+        dev_phandle = 0;
+    if (!dev_phandle)
+        bail("FDT: live RTKit: no phandle for %s\n", path);
+    snprintf(node_name, sizeof(node_name), "%s-rtkit-ep%u@%lx", alias, b->ep, b->phys);
+    snprintf(region_name, sizeof(region_name), "rtkit-ep%u", b->ep);
+
+    int mem = dt_get_or_add_reserved_mem(node_name, "apple,asc-mem", false, b->phys, b->size);
+    if (mem < 0)
+        return mem;
+    uint32_t mem_phandle = fdt_get_phandle(dt, mem);
+    if (dt_device_set_reserved_mem(mem, node_name, dev_phandle, b->iova, b->size))
+        return -1;
+    return dt_device_add_mem_region(path, mem_phandle, region_name);
 }
 
 static int dt_set_dcp_firmware(const char *alias)
