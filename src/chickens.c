@@ -124,11 +124,8 @@ const struct midr_part_features features_m3 = {
 // XXX figure out what features are actually available on M4
 const struct midr_part_features features_m4 = {
     .sleep_mode = SLEEP_NONE, // XXX probably new mode required
-#ifdef SPTM_VIRT
-    /* The virtualized SPTM needs aura's own GL2 (SPRR and GXF), which iBoot leaves writable for a
-     * kcbz=0 boot object. apple_sysregs_unlocked stays false: CYC_OVRD is locked. */
-    .mmu_sprr = true,
-#endif
+    /* SPTM_VIRT builds program SPRR from GXF (mmu_uses_sprr()). apple_sysregs_unlocked stays
+     * false: CYC_OVRD is locked. */
     .fast_ipi = true,
     .siq_cfg = SIQ_CFG_ROUTE_0,
     .actlr_el2 = true,

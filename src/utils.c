@@ -214,9 +214,23 @@ bool supports_arch_retention(void)
     return mrs(AIDR_EL1) & AIDR_EL1_ARCH_RETENTION;
 }
 
+/*
+ * Whether aura programs SPRR on this core: when its feature set says so and, in an SPTM_VIRT build,
+ * on every core that reports GXF. The virtualized SPTM needs aura's own GL2 (SPRR and GXF), which
+ * iBoot leaves writable for a kcbz=0 boot object, whatever the core's other features.
+ */
+bool mmu_uses_sprr(void)
+{
+#ifdef SPTM_VIRT
+    if (mrs(AIDR_EL1) & AIDR_EL1_GXF)
+        return true;
+#endif
+    return cpu_features->mmu_sprr;
+}
+
 bool supports_gxf(void)
 {
-    return (mrs(AIDR_EL1) & AIDR_EL1_GXF) && cpu_features->mmu_sprr;
+    return (mrs(AIDR_EL1) & AIDR_EL1_GXF) && mmu_uses_sprr();
 }
 
 bool supports_pan(void)
