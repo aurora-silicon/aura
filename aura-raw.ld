@@ -146,7 +146,12 @@ SECTIONS {
      * start.S has copied it, so everything before the pixel data must end below it. Past
      * _file_end the image is only zeros (.bss), as before.
      */
-    _file_limit = 0x120000;
+    /*
+     * FILE_LIMIT=... (Makefile) raises it for a board whose DCP log lies further out: on J804
+     * (T8152) the panel DCP's __OS_LOG is 0x234000 past the installed stage 1's base (ADT
+     * /arm-io/dcp segment-ranges), so its builds use 0x200000.
+     */
+    _file_limit = DEFINED(_file_limit_override) ? _file_limit_override : 0x120000;
     ASSERT(_file_vital_end - _base <= _file_limit,
            "Code and data reach the DCP log buffer after stage 1!")
 

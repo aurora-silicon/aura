@@ -201,6 +201,11 @@ LDFLAGS := -EL -maarch64elf --no-undefined -X -Bsymbolic \
 	-z notext --no-apply-dynamic-relocs --orphan-handling=warn \
 	-z nocopyreloc --gc-sections -pie
 
+# Board builds: raise the stage 2 file-part limit (see _file_limit in aura-raw.ld).
+ifneq ($(FILE_LIMIT),)
+LDFLAGS += --defsym=_file_limit_override=$(FILE_LIMIT)
+endif
+
 MINILZLIB_OBJECTS := $(patsubst %,minilzlib/%, \
 	dictbuf.o inputbuf.o lzma2dec.o lzmadec.o rangedec.o xzstream.o)
 
