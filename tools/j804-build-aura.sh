@@ -36,7 +36,8 @@
 #   - the Mach-O is MH_FILESET (filetype 12), carries stage1-aura.bin byte for byte at file
 #     offset 0x10000 and has no __TEXT_BOOT_EXEC segment;
 #   - each raw image has its AURALOAD load header, and Stage 2's footprint (code, data, .bss
-#     and stacks) is at most 16 MiB, the slot below the CTXR execute window;
+#     and stacks) is at most 16 MiB, the slot below the CTXR execute window, and equal to the
+#     size of stage2-aura.bin (payloads appended to Stage 2 are found at _end, the footprint);
 #   - both images carry the T8152 no-trial guard of rust_load_image().
 set -eu
 
@@ -178,6 +179,10 @@ s1 = load_header("stage1-aura.bin", stage1)
 s2 = load_header("stage2-aura.bin", stage2)
 if s2["footprint"] > SLOT:
     fail(f"stage2-aura.bin: footprint {s2['footprint']} is over 16 MiB")
+if s2["footprint"] != len(stage2):
+    # aura's payload walk starts at _end: a file shorter than its footprint puts the DTB inside
+    # .bss, a longer one leaves bytes before the DTB.
+    fail(f"stage2-aura.bin: footprint {s2['footprint']} differs from file size {len(stage2)}")
 for name, data in (("stage1-aura.bin", stage1), ("stage2-aura.bin", stage2)):
     if GUARD not in data:
         fail(f"{name} lacks the T8152 no-trial guard")
