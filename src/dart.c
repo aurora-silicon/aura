@@ -67,6 +67,7 @@
 #define DART_T8110_TCR_OFF              0x1000
 #define DART_T8110_TCR_REMAP            GENMASK(11, 8)
 #define DART_T8110_TCR_REMAP_EN         BIT(7)
+#define DART_T8110_TCR_FOUR_LEVEL       BIT(3)
 #define DART_T8110_TCR_BYPASS_DAPF      BIT(2)
 #define DART_T8110_TCR_BYPASS_DART      BIT(1)
 #define DART_T8110_TCR_TRANSLATE_ENABLE BIT(0)
@@ -888,12 +889,15 @@ int dart_collect_native_t8110(uintptr_t base, u8 sid, u64 dram_base, u64 dram_si
     u32 ttbr = read32(base + DART_T8110_TTBR_OFF + 4 * sid);
     printf("dart: native table collection sid=%u protect=%x tcr=%x ttbr=%x\n", sid, protect, tcr,
            ttbr);
+    /* The walk below reads two levels: four-level tables are refused. DAPF bypass is not: the
+     * stream still translates through the tables collected here. */
     if (!(protect & DART_T8110_PROTECT_TTBR_TCR) || !(tcr & DART_T8110_TCR_TRANSLATE_ENABLE) ||
-        (tcr & (DART_T8110_TCR_BYPASS_DART | DART_T8110_TCR_REMAP_EN)) ||
+        (tcr &
+         (DART_T8110_TCR_BYPASS_DART | DART_T8110_TCR_REMAP_EN | DART_T8110_TCR_FOUR_LEVEL)) ||
         !(ttbr & DART_T8110_TTBR_VALID)) {
         snprintf(detail, detail_size,
                  "substep=controls protect=%x tcr=%x ttbr=%x "
-                 "expected=locked,translate,!bypass,!remap,valid-root",
+                 "expected=locked,translate,!bypass,!remap,two-level,valid-root",
                  protect, tcr, ttbr);
         printf("dart: native table collection refused: %s\n", detail);
         return -3;
@@ -955,6 +959,12 @@ int dart_collect_native_t8110(uintptr_t base, u8 sid, u64 dram_base, u64 dram_si
     return 0;
 }
 
+/* A stream's bit in ENABLE_STREAMS (one word per 32 streams). */
+static bool dart_t8110_stream_enabled(uintptr_t base, u32 sid)
+{
+    return read32(base + DART_T8110_ENABLE_STREAMS + 4 * (sid >> 5)) & BIT(sid & 31);
+}
+
 /*
  * Inspect a T8110 DART that an earlier boot stage may have left set up, before a kernel is
  * promised the processor behind it. Unlocked with every stream idle, the kernel programs it
@@ -962,6 +972,10 @@ int dart_collect_native_t8110(uintptr_t base, u8 sid, u64 dram_base, u64 dram_si
  * remaps refuses. Locked, every enabled stream must translate through tables in DRAM,
  * which are collected for a reservation; a locked stream that bypasses, remaps or has no valid
  * root, or tables that cannot all be collected, refuse (nonzero).
+ *
+ * "Enabled" is the stream's bit in ENABLE_STREAMS. The DART drops traffic on a stream whose bit
+ * is clear whatever its TCR/TTBR hold, and those registers are not reset, so a disabled stream's
+ * TCR/TTBR are leftovers and are not judged.
  */
 int dart_collect_inherited_t8110(uintptr_t base, u64 dram_base, u64 dram_size, u64 *pages,
                                  size_t capacity, size_t *count, char *detail, size_t detail_size)
@@ -980,18 +994,27 @@ int dart_collect_inherited_t8110(uintptr_t base, u64 dram_base, u64 dram_size, u
         /* Unlocked: the kernel reprograms it, but a stream still translating would walk tables
          * nothing keeps until then. */
         for (u32 sid = 0; sid < sids; sid++) {
+            if (!dart_t8110_stream_enabled(base, sid))
+                continue;
             u32 tcr = read32(base + DART_T8110_TCR_OFF + 4 * sid);
             if (tcr & (DART_T8110_TCR_TRANSLATE_ENABLE | DART_T8110_TCR_BYPASS_DART |
-                       DART_T8110_TCR_REMAP_EN)) {
-                snprintf(detail, detail_size, "unlocked protect=%x streams=%u live sid=%u tcr=%x",
-                         protect, sids, sid, tcr);
+                       DART_T8110_TCR_BYPASS_DAPF | DART_T8110_TCR_REMAP_EN)) {
+                snprintf(detail, detail_size,
+                         "unlocked protect=%x streams=%u enable=%x live sid=%u tcr=%x", protect,
+                         sids, read32(base + DART_T8110_ENABLE_STREAMS), sid, tcr);
                 return -8;
             }
         }
-        snprintf(detail, detail_size, "unlocked protect=%x streams=%u idle", protect, sids);
+        snprintf(detail, detail_size, "unlocked protect=%x streams=%u enable=%x idle", protect,
+                 sids, read32(base + DART_T8110_ENABLE_STREAMS));
         return 0;
     }
+    for (u32 word = 0; word < (sids + 31) / 32; word++)
+        printf("dart: locked protect=%x streams=%u enable[%u]=%x\n", protect, sids, word,
+               read32(base + DART_T8110_ENABLE_STREAMS + 4 * word));
     for (u32 sid = 0; sid < sids; sid++) {
+        if (!dart_t8110_stream_enabled(base, sid))
+            continue;
         if (!read32(base + DART_T8110_TCR_OFF + 4 * sid))
             continue;
         size_t found = 0;
@@ -1001,7 +1024,8 @@ int dart_collect_inherited_t8110(uintptr_t base, u64 dram_base, u64 dram_size, u
             return ret;
         *count += found;
     }
-    snprintf(detail, detail_size, "locked protect=%x streams=%u tables=%zu", protect, sids, *count);
+    snprintf(detail, detail_size, "locked protect=%x streams=%u enable=%x tables=%zu", protect,
+             sids, read32(base + DART_T8110_ENABLE_STREAMS), *count);
     return 0;
 }
 

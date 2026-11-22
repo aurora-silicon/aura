@@ -26,7 +26,7 @@ typedef unsigned long u64;typedef uint32_t u32;typedef uint16_t u16;typedef uint
 MMIO = r'''
 #define DART_A 0x319304000UL
 #define DART_B 0x31930c000UL
-static u32 protect[2], tcr[2][16], ttbr[2][16], sids = 0x00100010;
+static u32 protect[2], tcr[2][16], ttbr[2][16], enable[2], sids = 0x00100010;
 static int faulting = -1;
 static int exc_count;
 static u32 read32(uintptr_t a) {
@@ -36,6 +36,7 @@ static u32 read32(uintptr_t a) {
  if (d == faulting) exc_count++;
  if (off == DART_T8110_PROTECT) return protect[d];
  if (off == DART_T8110_PARAMS4) return sids;
+ if (off == DART_T8110_ENABLE_STREAMS) return enable[d];
  if (off >= DART_T8110_TCR_OFF && off < DART_T8110_TCR_OFF + 0x400) {
   unsigned s = (off - DART_T8110_TCR_OFF) / 4; return s < 16 ? tcr[d][s] : 0; }
  if (off >= DART_T8110_TTBR_OFF && off < DART_T8110_TTBR_OFF + 0x400) {
@@ -90,12 +91,15 @@ static int dt_get_or_add_reserved_mem(const char *name, const char *compat, bool
  assert(pa >= dram_base && pa < dram_base + dram_size); reserved++; return 1;
 }
 ''' + function(dart, 'dart_table_in_dram') + \
-        function(dart, 'dart_collect_native_t8110') + function(dart, 'dart_collect_inherited_t8110') + \
+        function(dart, 'dart_collect_native_t8110') + function(dart, 'dart_t8110_stream_enabled') + \
+        function(dart, 'dart_collect_inherited_t8110') + \
         function(kboot, 'dt_node_power') + '\n#define fdt_next_node next_node\n' + function(kboot, 'dt_dcpext_inherited_darts') + r'''
 static unsigned char blob[8192];
 static u64 *root;
 static void world(void) {
  memset(protect, 0, sizeof(protect)); memset(tcr, 0, sizeof(tcr)); memset(ttbr, 0, sizeof(ttbr));
+ /* Every stream enabled unless a case says otherwise. */
+ enable[0] = enable[1] = 0xffff;
  sids = 0x00100010; faulting = -1; exc_count = 0; reserved = 0; ps_state = 0xff; next_fault = 0;
  memset(root, 0, 4 * SZ_16K);
  assert(!fdt_create_empty_tree(blob, sizeof(blob))); dt = blob;
@@ -171,6 +175,23 @@ int main(void) {
  world(); lock_stream(1, 5); ttbr[1][5] = 0; assert(dt_dcpext_inherited_darts("dcpext"));
  world(); lock_stream(1, 5); tcr[1][9] = 1; /* a second live stream without tables */
  assert(dt_dcpext_inherited_darts("dcpext"));
+ /* Locked, four-level tables on an enabled stream: refused (the walk reads two levels). */
+ world(); lock_stream(1, 5); tcr[1][5] |= DART_T8110_TCR_FOUR_LEVEL; assert(dt_dcpext_inherited_darts("dcpext"));
+ /* Only ENABLE_STREAMS streams are judged. The M3 Air's dcpext DART after iBoot: locked, stream 5
+  * translating with tables, the other streams disabled with leftover TCR/TTBR (one with bypass
+  * bits): accepted, and only stream 5's tables are kept. */
+ world(); lock_stream(1, 5); enable[1] = BIT(5);
+ for (int s = 0; s < 16; s++) if (s != 5) { tcr[1][s] = 0x401; ttbr[1][s] = 0x28d448cc; }
+ tcr[1][14] = 0x406; ttbr[1][14] = 0x200840;
+ assert(!dt_dcpext_inherited_darts("dcpext") && reserved == 2);
+ /* ... but if the bypass stream is enabled, refused. */
+ world(); lock_stream(1, 5); enable[1] = BIT(5) | BIT(14); tcr[1][14] = 0x406;
+ assert(dt_dcpext_inherited_darts("dcpext"));
+ /* ... and stream 5 itself disabled: nothing to keep from that DART. */
+ world(); lock_stream(1, 5); enable[1] = 0; assert(!dt_dcpext_inherited_darts("dcpext") && reserved == 0);
+ /* Unlocked: a disabled stream's leftovers are not live; an enabled one that is, refuses. */
+ world(); tcr[0][4] = DART_T8110_TCR_BYPASS_DART; enable[0] = 0; assert(!dt_dcpext_inherited_darts("dcpext"));
+ world(); tcr[0][4] = DART_T8110_TCR_BYPASS_DAPF; assert(dt_dcpext_inherited_darts("dcpext"));
  /* Locked without a stream count, an MMIO fault, a table outside DRAM: refused. */
  world(); protect[0] = 1; sids = 0; assert(dt_dcpext_inherited_darts("dcpext"));
  world(); faulting = 1; assert(dt_dcpext_inherited_darts("dcpext"));
