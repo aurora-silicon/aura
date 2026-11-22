@@ -3,7 +3,8 @@
 
 The production iova.c is compiled unchanged against small host stand-ins for
 aura's headers, then driven through fixed cases and a seeded random
-alloc/free/reserve sequence checked against a page bitmap model.
+alloc/free/reserve sequence checked against a page bitmap model: reserve must
+succeed exactly when every page of the range is free and inside the domain.
 """
 from pathlib import Path
 import shutil
@@ -229,7 +230,7 @@ static void test_random(void)
 {
     iova_domain_t *d = iovad_init(0, NPAGES * (u64)PG);
     struct live live[NPAGES];
-    unsigned nlive = 0, allocs = 0, failed = 0;
+    unsigned nlive = 0, allocs = 0, failed = 0, reserved = 0, refused = 0;
     memset(used, 0, sizeof(used));
     used[0] = 1;
 
@@ -240,6 +241,23 @@ static void test_random(void)
                 used[live[i].iova / PG + p] = 0;
             iova_free(d, live[i].iova, live[i].pages * (u64)PG - rnd(PG));
             live[i] = live[--nlive];
+        } else if (!rnd(6)) {
+            /* reserve n pages from p (may run past the end), unaligned start */
+            unsigned p = 1 + rnd(NPAGES - 1), n = 1 + rnd(8);
+            u64 off = rnd(PG);
+            bool want = p + n <= NPAGES;
+            for (unsigned q = p; want && q < p + n; q++)
+                want = !used[q];
+            bool ok = iova_reserve(d, p * (u64)PG + off, n * (u64)PG - off);
+            assert(ok == want);
+            if (!ok) {
+                refused++;
+            } else {
+                for (unsigned q = p; q < p + n; q++)
+                    used[q] = 1;
+                live[nlive++] = (struct live){p * (u64)PG, n};
+                reserved++;
+            }
         } else {
             unsigned pages = 1 + rnd(rnd(4) ? 4 : 32);
             u64 iova = iova_alloc(d, pages * (u64)PG - rnd(PG));
@@ -272,10 +290,21 @@ static void test_random(void)
     check_list(d);
     assert(blocks(d) == 1);
     assert(iova_alloc(d, (NPAGES - 1) * (u64)PG) == PG);
-    printf("random: %u allocations, %u refused\n", allocs, failed);
-    assert(allocs > 10000 && failed > 100);
+    printf("random: %u allocations, %u refused; %u reserves, %u refused\n", allocs, failed,
+           reserved, refused);
+    assert(allocs > 10000 && failed > 100 && reserved > 1000 && refused > 1000);
     iovad_shutdown(d, NULL);
 }
+
+#define EXPECT_PANIC(call)                                                                         \
+    do {                                                                                           \
+        expect_panic = 1;                                                                          \
+        if (!setjmp(panic_jmp)) {                                                                  \
+            call;                                                                                  \
+            assert(!"no panic: " #call);                                                           \
+        }                                                                                          \
+        expect_panic = 0;                                                                          \
+    } while (0)
 
 static void test_double_free_panics(void)
 {
@@ -283,12 +312,93 @@ static void test_double_free_panics(void)
     u64 a = iova_alloc(d, PG);
     (void)iova_alloc(d, PG);
     iova_free(d, a, PG);
-    expect_panic = 1;
-    if (!setjmp(panic_jmp)) {
-        iova_free(d, a, PG);
-        assert(!"double free accepted");
-    }
-    expect_panic = 0;
+    EXPECT_PANIC(iova_free(d, a, PG));
+    iovad_shutdown(d, NULL);
+
+    /* A free that covers a used page and the start of the next free block. */
+    d = iovad_init(0, 16 * PG);
+    a = iova_alloc(d, PG);
+    u64 b = iova_alloc(d, PG);
+    assert(a == PG && b == 2 * PG && d->free_list->iova == 3 * PG);
+    EXPECT_PANIC(iova_free(d, b, 2 * PG));
+    iovad_shutdown(d, NULL);
+}
+
+static void test_free_outside_domain_panics(void)
+{
+    iova_domain_t *d = iovad_init(0, 4 * PG);
+    assert(iova_alloc(d, PG) == PG); /* the free list is not empty */
+    EXPECT_PANIC(iova_free(d, 100 * PG, PG));
+    EXPECT_PANIC(iova_free(d, 0, PG));                  /* page 0 is not in the domain */
+    EXPECT_PANIC(iova_free(d, PG, (size_t)-PG));        /* wraps */
+    EXPECT_PANIC(iova_free(d, (1ull << 40) | PG, PG));  /* a stray high bit */
+    check_list(d);
+    assert(blocks(d) == 1 && d->free_list->iova == 2 * PG);
+    iova_free(d, PG, PG);
+    assert(blocks(d) == 1 && d->free_list->iova == PG);
+    iovad_shutdown(d, NULL);
+
+    /* With every page in use no free block can catch these as overlaps. */
+    d = iovad_init(0, 4 * PG);
+    assert(iova_alloc(d, 3 * PG) == PG && !d->free_list);
+    EXPECT_PANIC(iova_free(d, 3 * PG, 2 * PG));         /* ends past the limit */
+    EXPECT_PANIC(iova_free(d, 3 * PG, PG + 1));         /* rounds up past the limit */
+    EXPECT_PANIC(iova_free(d, PG + 1, PG));             /* not page aligned */
+    assert(!d->free_list);
+    iova_free(d, 3 * PG, PG - 1);                       /* the last page */
+    check_list(d);
+    assert(blocks(d) == 1 && d->free_list->iova == 3 * PG && d->free_list->sz == PG);
+    iovad_shutdown(d, NULL);
+
+    d = iovad_init(2 * (u64)SZ_32M, 3 * (u64)SZ_32M);
+    assert(iova_alloc(d, PG) == 2 * (u64)SZ_32M);
+    EXPECT_PANIC(iova_free(d, PG, PG));                 /* below the base */
+    EXPECT_PANIC(iova_free(d, 3 * (u64)SZ_32M, PG));    /* at the limit */
+    iova_free(d, 2 * (u64)SZ_32M, PG);
+    assert(blocks(d) == 1);
+    iovad_shutdown(d, NULL);
+}
+
+static void test_zero_size(void)
+{
+    iova_domain_t *d = iovad_init(0, 16 * PG);
+    for (int i = 1; i <= 3; i++)
+        assert(iova_alloc(d, PG) == i * (u64)PG);
+    /* page 2 touches no free block: a zero-size free must not add one */
+    iova_free(d, 2 * PG, 0);
+    check_list(d);
+    assert(blocks(d) == 1 && d->free_list->iova == 4 * PG);
+
+    assert(iova_reserve(d, 0, 0));
+    assert(iova_reserve(d, 8 * PG, 0));
+    check_list(d);
+    assert(blocks(d) == 1 && d->free_list->iova == 4 * PG && d->free_list->sz == 12 * PG);
+    iovad_shutdown(d, NULL);
+}
+
+static void test_reserve_wrap_and_straddle(void)
+{
+    iova_domain_t *d = iovad_init(0, 16 * PG);
+    /* ranges whose end wraps are refused and leave the list alone */
+    assert(!iova_reserve(d, PG, (size_t)-PG));
+    assert(!iova_reserve(d, 0, (size_t)-1));
+    assert(!iova_reserve(d, (u64)-PG, PG));
+    assert(!iova_reserve(d, (u64)-1, 1));
+    check_list(d);
+    assert(blocks(d) == 1 && d->free_list->iova == PG && d->free_list->sz == 15 * PG);
+    assert(iova_alloc(d, PG) == PG);
+
+    /* an unaligned range across a page boundary takes both pages */
+    assert(iova_reserve(d, 4 * PG - 1, 2)); /* pages 3 and 4 */
+    check_list(d);
+    assert(d->free_list->iova == 2 * PG && d->free_list->sz == PG);
+    assert(d->free_list->next->iova == 5 * PG);
+    /* a range ending inside page 0 reserves nothing */
+    assert(iova_reserve(d, 0, PG - 1));
+    assert(iova_reserve(d, 0, PG));
+    check_list(d);
+    assert(blocks(d) == 2);
+    iovad_shutdown(d, NULL);
 }
 
 int main(void)
@@ -299,6 +409,9 @@ int main(void)
     test_reserve();
     test_random();
     test_double_free_panics();
+    test_free_outside_domain_panics();
+    test_zero_size();
+    test_reserve_wrap_and_straddle();
     puts("iova: ok");
     return 0;
 }

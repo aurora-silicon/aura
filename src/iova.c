@@ -70,15 +70,23 @@ void iovad_shutdown(iova_domain_t *iovad, dart_dev_t *dart)
 
 bool iova_reserve(iova_domain_t *iovad, u64 iova, size_t sz)
 {
-    iova = ALIGN_DOWN(iova, SZ_16K);
-    sz = ALIGN_UP(sz, SZ_16K);
-
-    if (iova == 0) {
-        iova += SZ_16K;
-        sz -= SZ_16K;
+    /* Widen to whole pages from the range's end, so an unaligned range that
+     * straddles a page boundary keeps both pages. */
+    const u64 top = ALIGN_DOWN(UINT64_MAX, SZ_16K);
+    if (sz > top || iova > top - sz) {
+        printf("iova_reserve: [%lx; +%lx] wraps\n", iova, sz);
+        return false;
     }
-    if (sz == 0)
+    u64 end = ALIGN_UP(iova + sz, SZ_16K);
+    iova = ALIGN_DOWN(iova, SZ_16K);
+
+    /* page 0 is never handed out */
+    if (iova == 0)
+        iova = SZ_16K;
+    /* nothing left: a zero-size range, or one inside page 0 */
+    if (end <= iova)
         return true;
+    sz = end - iova;
 
     if (!iovad->free_list) {
         printf("iova_reserve: trying to reserve iova range but empty free list\n");
@@ -89,7 +97,7 @@ bool iova_reserve(iova_domain_t *iovad, u64 iova, size_t sz)
     struct iova_block *blk_prev = NULL;
     while (blk != NULL) {
         if (iova >= blk->iova && iova < (blk->iova + blk->sz)) {
-            if (iova + sz > (blk->iova + blk->sz)) {
+            if (sz > blk->iova + blk->sz - iova) {
                 printf("iova_reserve: tried to reserve [%lx; +%lx] but block in free list has "
                        "range [%lx; +%lx]\n",
                        iova, sz, blk->iova, blk->sz);
@@ -175,6 +183,17 @@ u64 iova_alloc(iova_domain_t *iovad, size_t sz)
 
 void iova_free(iova_domain_t *iovad, u64 iova, size_t sz)
 {
+    if (sz == 0)
+        return;
+
+    /* Only ranges iova_alloc() can have handed out may come back: anything
+     * else would put addresses outside the domain on the free list. */
+    u64 first = iovad->base ? iovad->base : SZ_16K;
+    if (iova != ALIGN_DOWN(iova, SZ_16K) || iova < first || iova >= iovad->limit ||
+        sz > iovad->limit - iova)
+        panic("iova_free: [%lx; +%lx] is outside the domain [%lx; %lx)\n", iova, sz, first,
+              iovad->limit);
+    /* limit is page aligned, so the rounded size still ends inside it */
     sz = ALIGN_UP(sz, SZ_16K);
 
     /* The free list is sorted and coalesced: find the blocks around the range. */
