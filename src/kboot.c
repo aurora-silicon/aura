@@ -122,22 +122,25 @@ void kboot_loaded_file_part(u64 *base, u64 *size)
         goto err;                                                                                  \
     } while (0)
 
-void get_notchless_fb(u64 *fb_base, u64 *fb_height)
+static bool adt_panel_has_notch(int product)
+{
+    u32 val;
+
+    return product >= 0 && ADT_GETPROP(adt, product, "partially-occluded-display", &val) >= 0 &&
+           val;
+}
+
+static void get_notchless_fb(u64 *fb_base, u64 *fb_height, int product, bool panel_has_notch)
 {
     *fb_base = cur_boot_args.video.base;
     *fb_height = cur_boot_args.video.height;
 
-    int node = adt_path_offset(adt, "/product");
-
-    if (node < 0) {
+    if (product < 0) {
         printf("FDT: /product node not found\n");
         return;
     }
 
-    u32 val;
-
-    if ((ADT_GETPROP(adt, node, "partially-occluded-display", &val) < 0 || !val) &&
-        (chip_id != T8015 || (board_id != 0x6 && board_id != 0xe))) {
+    if (!panel_has_notch && (chip_id != T8015 || (board_id != 0x6 && board_id != 0xe))) {
         printf("FDT: No notch detected\n");
         return;
     }
@@ -154,28 +157,22 @@ void get_notchless_fb(u64 *fb_base, u64 *fb_height)
 
     u64 offset = cur_boot_args.video.height - new_height;
 
-    printf("display: Hiding notch, %lux%lu -> %lux%lu (+%lu, 16:%lu)\n", cur_boot_args.video.width,
-           cur_boot_args.video.height, cur_boot_args.video.width, new_height, offset, hfrac);
+    printf("display: Notch-free geometry, %lux%lu -> %lux%lu (+%lu, 16:%lu)\n",
+           cur_boot_args.video.width, cur_boot_args.video.height, cur_boot_args.video.width,
+           new_height, offset, hfrac);
 
     *fb_base += cur_boot_args.video.stride * offset;
     *fb_height = new_height;
 }
 
-/*
- * chosen.asahi,show-notch=1 (aura config): the OS drives the full panel, notch rows
- * included (appledrm.show_notch=1). Keep iBoot's full framebuffer then, so
- * the boot framebuffer covers the same rows as the display driver later does and early
- * users (fbcon, Plymouth) do not shift by the notch height at the handoff.
- */
-static bool kboot_show_notch(void)
+/* Keep the boot framebuffer and the OS scanout at the same panel height. */
+static bool kboot_show_notch(bool panel_has_notch)
 {
-    for (int i = 0; i < MAX_CHOSEN_PARAMS; i++) {
-        if (!chosen_params[i][0])
-            break;
+    for (int i = 0; i < MAX_CHOSEN_PARAMS && chosen_params[i][0]; i++)
         if (!strcmp(chosen_params[i][0], "asahi,show-notch"))
             return chosen_params[i][1] && !strcmp(chosen_params[i][1], "1");
-    }
-    return false;
+
+    return panel_has_notch;
 }
 
 static int dt_set_rng_seed_sep(int node)
@@ -300,9 +297,13 @@ static int dt_set_fb(void)
     }
 
     u64 fb_base, fb_height;
-    get_notchless_fb(&fb_base, &fb_height);
+    int product = adt_path_offset(adt, "/product");
+    bool panel_has_notch = adt_panel_has_notch(product);
+    get_notchless_fb(&fb_base, &fb_height, product, panel_has_notch);
     u64 notch_height = cur_boot_args.video.height - fb_height;
-    if (notch_height && kboot_show_notch()) {
+    bool show_notch = notch_height && kboot_show_notch(panel_has_notch);
+
+    if (show_notch) {
         printf("display: keeping the notch rows (chosen.asahi,show-notch=1), %lux%lu\n",
                cur_boot_args.video.width, cur_boot_args.video.height);
         fb_base = cur_boot_args.video.base;
@@ -355,6 +356,10 @@ static int dt_set_fb(void)
 
     // We do not need to reserve the framebuffer, as it will be excluded from the usable RAM
     // range already.
+
+    if (show_notch &&
+        fdt_setprop_string(dt, fdt_path_offset(dt, "/chosen"), "asahi,show-notch", "1"))
+        bail("FDT: couldn't set chosen.asahi,show-notch property\n");
 
     // save notch height in the dcp node if present (also when the notch rows are kept,
     // so that a display driver hiding the notch still can)
