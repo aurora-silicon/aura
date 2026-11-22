@@ -88,12 +88,23 @@ int fuzz_disable_missing_devs(void *dt, const char *adt_prefix, const char *dt_p
 /* Room for what the builders add, as kboot leaves DT_EDIT_MARGIN */
 #define DT_MARGIN (64 * 1024)
 
+/*
+ * dt_get_address() walks up from a node with fdt_parent_offset(), which scans the tree from its
+ * start, so a pass over every node of a real tree takes seconds. Take the nodes aura asks about,
+ * the root's and its buses' children (two levels down), and a bounded number of them.
+ */
+#define TRANSLATE_DEPTH 2
+#define TRANSLATE_NODES 96
+
 static void translate(void *dt)
 {
-    int depth = 0;
+    int depth = 0, count = 0;
 
-    for (int node = fdt_next_node(dt, -1, &depth); node >= 0;
+    for (int node = fdt_next_node(dt, -1, &depth); node >= 0 && count < TRANSLATE_NODES;
          node = fdt_next_node(dt, node, &depth)) {
+        if (depth > TRANSLATE_DEPTH)
+            continue;
+        count++;
         sink += dt_get_address(dt, node);
 
         if (!fdt_getprop(dt, node, "ranges", NULL))
@@ -147,8 +158,8 @@ int LLVMFuzzerTestOneInput(const u8 *data, size_t size)
     memcpy(fdt, data + alen, dlen);
     void *dt = NULL, *selected;
 
-    if (adt_check_header(adt) || dlen < sizeof(struct fdt_header) ||
-        fdt_magic(fdt) != FDT_MAGIC || fdt_totalsize(fdt) > dlen)
+    if (adt_check_header(adt) || dlen < sizeof(struct fdt_header) || fdt_magic(fdt) != FDT_MAGIC ||
+        fdt_totalsize(fdt) > dlen)
         goto out;
     fuzz_os_26_6_2 = flags & 16;
     if (!fuzz_load_fdt(fdt, (flags & 32) ? dlen : 0, &selected))
