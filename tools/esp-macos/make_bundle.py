@@ -60,6 +60,10 @@ def main():
     ap.add_argument("--no-video", action="store_true", help="don't hand XNU the boot video")
     ap.add_argument("--gzip-kernelcache", action="store_true", help="smaller on the ESP, slower to boot")
     ap.add_argument("--build-tag", default="26A428")
+    ap.add_argument("--root-from", type=pathlib.Path,
+                    help="boot another volume group's root: a file of /chosen 'name = value' lines "
+                         "(boot-uuid, apfs-preboot-uuid, boot-objects-path, root-snapshot-name as text; "
+                         "boot-manifest-hash and optional asmb/lp-spih as hex)")
     a = ap.parse_args()
 
     if a.out.exists() and any(a.out.iterdir()):
@@ -80,7 +84,8 @@ def main():
             bootargs=a.bootargs, flags=tuple(a.flag) if a.flag else esp_macos.DEFAULT_FLAGS,
             s2r=dict(a.s2r) if a.s2r else None,
             ans_drop=[("/arm-io/ans/iop-ans-nub", p) for p in a.ans_drop],
-            keep_video=not a.no_video, gzip_kc=a.gzip_kernelcache, build_tag=a.build_tag)
+            keep_video=not a.no_video, gzip_kc=a.gzip_kernelcache, build_tag=a.build_tag,
+            chosen=esp_macos.root_props(a.root_from) if a.root_from else None)
     except esp_macos.BundleError as e:
         raise SystemExit(f"cannot build the bundle: {e}")
 

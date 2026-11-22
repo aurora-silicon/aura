@@ -10,6 +10,8 @@ the same regions, loads, device tree and boot_args. Runs when given the real inp
                  BuildIdentity.plist, stock/Firmware/...)
   AURA_ESP_TC    the native trust cache
   AURA_ESP_ADTS  live device trees of the Mac, ':'-separated
+  AURA_ESP_ROOT  optional: another volume group's root properties (make_bundle.py --root-from),
+                 compared as well
 
 Standalone: python3 tests/python/test_esp_macos.py
 """
@@ -88,9 +90,9 @@ def c_plan(bundle, adt, lens, tc, copies, video):
     return regions, loads, (d / "adt.bin").read_bytes(), (d / "boot_args.bin").read_bytes(), info
 
 
-def compare(sptm, txm, xnu, tc, adt, exclave, love, *, video=VIDEO, ans_drop=()):
+def compare(sptm, txm, xnu, tc, adt, exclave, love, *, video=VIDEO, ans_drop=(), chosen=None):
     b = esp_macos.build(sptm, txm, xnu, tc, adt, exclave=exclave, love=love, keep_video=bool(video),
-                        ans_drop=ans_drop)
+                        ans_drop=ans_drop, chosen=chosen)
     hide, _phys = esp_macos.hide_nodes(adt, xnu)
     cl4, ce, cv, exic, extc = exclave
     py = plan_mod.plan_boot(
@@ -98,7 +100,8 @@ def compare(sptm, txm, xnu, tc, adt, exclave, love, *, video=VIDEO, ans_drop=())
         cmdline=esp_macos.runner().DEFAULT_BOOTARGS, blob_base=PHYS, trustcache=tc,
         iboot_copies=copies_from(adt), hide_nodes=hide, diag_record=False, drop_props=ans_drop,
         xnu_serial="/arm-io/uart0", os_long_version=love, video=video, cl4_regions=cl4.regions,
-        cl4_entry=ce, cl4_virt=cv, exclave_integrity=exic, exclave_trustcache=extc)
+        cl4_entry=ce, cl4_virt=cv, exclave_integrity=exic, exclave_trustcache=extc,
+        chosen_props=chosen)
     lens = {"sptm": len(sptm), "txm": len(txm), "xnu": len(xnu), "tc": len(tc),
             "cl4": len(cl4.payload), "exic": len(exic), "extc": len(extc)}
     regions, loads, c_adt, c_ba, info = c_plan(b, adt, lens, tc, copies_from(adt), video)
@@ -173,9 +176,12 @@ def test_real_plan_matches_python():
     if not real:
         return "skipped: real inputs not given"
     (sptm, txm, xnu), tc, adts, ex, love = real
+    root = os.environ.get("AURA_ESP_ROOT")
     for adt in adts:
         compare(sptm, txm, xnu, tc, adt, ex, love)
         compare(sptm, txm, xnu, tc, adt, ex, love, video=None, ans_drop=ANS_DROP)
+        if root:
+            compare(sptm, txm, xnu, tc, adt, ex, love, chosen=esp_macos.root_props(root))
     return None
 
 
