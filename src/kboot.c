@@ -435,8 +435,9 @@ static int dt_set_t8140_wfx_args(int node)
  * (which also passes the PMP values), the GPU, and the stand-in power model with this Mac's
  * leakage fuse. It wrote the GPU lines only beside a display line of 1, so an owner's
  * chosen.asahi,t8122-dcp=0 keeps the default GPU switches off as well; an owner's own GPU line
- * still counts. chosen.asahi,t8122-dcpext stays off. The Pro switches are its display handoff
- * and GPU; its external display handoffs (t6030-dcpext, t6030-dispext) keep their own lines.
+ * still counts. chosen.asahi,t8122-dcpext gets no default here (dt_t8122_dcpext_armed() decides).
+ * The Pro switches are its display handoff and GPU; its external display handoffs (t6030-dcpext,
+ * t6030-dispext) keep their own lines.
  *
  * The J516C switches are its display handoff and GPU, each on its own as on the Pro: an owner's
  * chosen.asahi,t6031-gpu=0 keeps the GPU off and the display default still goes in, and
@@ -5650,6 +5651,163 @@ static int dt_ext26_reserve(const char *alias)
     return dt_set_dcp_firmware(alias);
 }
 
+/*
+ * Power of a DT node's first power domain (an apple,t8103-pmgr-pwrstate register): 1 when it is
+ * on, 0 when it is off, -1 for any other state or a domain that cannot be read.
+ */
+static int dt_node_power(int node)
+{
+    int len = 0;
+    const fdt32_t *pd = fdt_getprop(dt, node, "power-domains", &len);
+    int ps = pd && len >= 4 ? fdt_node_offset_by_phandle(dt, fdt32_ld(pd)) : -1;
+    const fdt32_t *reg = ps < 0 ? NULL : fdt_getprop(dt, ps, "reg", &len);
+    if (!reg || len < 4 || fdt_node_check_compatible(dt, ps, "apple,t8103-pmgr-pwrstate"))
+        return -1;
+    u64 pmgr = dt_get_address(dt, fdt_parent_offset(dt, ps));
+    if (!pmgr)
+        return -1;
+    u32 actual = (read32(pmgr + fdt32_ld(reg)) >> 4) & 15;
+    return actual == 15 ? 1 : actual == 0 ? 0 : -1;
+}
+
+/*
+ * Fail closed on the DARTs of the external processor at @alias before it is promised to the
+ * kernel: every DART its DT node and children reference (iommus) is read. A DART whose own power
+ * domain is off holds nothing for the kernel to keep; one that is on is read under the exception
+ * guard (dart_collect_inherited_t8110()): unlocked and idle, nothing to keep; locked, the tables
+ * an earlier stage left are reserved. Anything else (a domain neither on nor off, a live unlocked
+ * stream, tables that cannot be collected, an MMIO fault, a tree that cannot be walked) refuses
+ * the processor; the panel is not affected. So does a description that cannot be read whole: an
+ * empty iommus, one that is not a list of (DART, stream) pairs, a provider that does not take one
+ * cell, or no DART at all on the processor and its children.
+ */
+static int dt_dcpext_inherited_darts(const char *alias)
+{
+    int chosen = adt_path_offset(adt, "/chosen");
+    u64 dram, size;
+    if (chosen < 0 || ADT_GETPROP(adt, chosen, "dram-base", &dram) != sizeof(dram) ||
+        ADT_GETPROP(adt, chosen, "dram-size", &size) != sizeof(size))
+        return -1;
+
+    int owner = fdt_path_offset(dt, alias);
+    if (owner < 0)
+        return -1;
+    u64 *tables = malloc(256 * sizeof(*tables));
+    if (!tables)
+        return -1;
+    int result = 0, device = owner, depth = 0;
+    size_t total = 0, darts = 0;
+    int previous = exc_guard, faults = exc_count;
+    exc_guard = GUARD_MARK | GUARD_SILENT;
+    /* The processor node, then its children (piodma). Read only: no tree writes in the walk. */
+    do {
+        int len = 0;
+        const fdt32_t *iommus = fdt_getprop(dt, device, "iommus", &len);
+        /* One phandle and one stream cell per DART: anything else is not read in part. */
+        if (iommus && (len <= 0 || len % (2 * (int)sizeof(*iommus))))
+            result = -1;
+        for (int i = 0; !result && iommus && i + 1 < len / (int)sizeof(*iommus); i += 2) {
+            int provider = fdt_node_offset_by_phandle(dt, fdt32_ld(&iommus[i]));
+            u64 base = provider < 0 ? 0 : dt_get_address(dt, provider);
+            int cells_len = 0;
+            const fdt32_t *cells =
+                provider < 0 ? NULL : fdt_getprop(dt, provider, "#iommu-cells", &cells_len);
+            char detail[160] = "";
+            size_t count = 0;
+            if (!base || fdt_node_check_compatible(dt, provider, "apple,t8110-dart") || !cells ||
+                cells_len != sizeof(*cells) || fdt32_ld(cells) != 1) {
+                result = -1;
+                break;
+            }
+            darts++;
+            int power = dt_node_power(provider);
+            if (power > 0)
+                result = dart_collect_inherited_t8110(base, dram, size, tables + total, 256 - total,
+                                                      &count, detail, sizeof(detail));
+            else
+                result = power;
+            sysop("dsb sy");
+            sysop("isb");
+            if (exc_count != faults)
+                result = -1;
+            printf("FDT: '%s' DART %lx: power %s %s%s\n", alias, base,
+                   power > 0 ? "on"
+                   : power   ? "unknown"
+                             : "off",
+                   detail, result ? " (refused)" : "");
+            total += count;
+        }
+        device = fdt_next_node(dt, device, &depth);
+        if (device < 0 && device != -FDT_ERR_NOTFOUND)
+            result = -1;
+    } while (!result && device >= 0 && depth > 0);
+    exc_guard = previous;
+    if (!result && !darts)
+        result = -1;
+    if (result)
+        printf("FDT: '%s': %zu DART(s) inspected, refused\n", alias, darts);
+    for (size_t t = 0; !result && t < total; t++) {
+        char name[48];
+        snprintf(name, sizeof(name), "dcpext-tables@%lx", tables[t]);
+        if (dt_get_or_add_reserved_mem(name, "apple,asc-mem", true, tables[t], SZ_16K) < 0)
+            result = -1;
+    }
+    free(tables);
+    return result;
+}
+
+/*
+ * Where the external processor runs the handed-over image, the internal handoff already reserved
+ * its text (and its __OS_LOG) with exact no-map nodes: give this processor those nodes, its text
+ * at its own IOVA and the log physical as the internal DCP uses it, instead of reserving the same
+ * pages a second time. Any other overlap refuses; a segment nothing reserved yet gets its own
+ * node, as before.
+ */
+static int dt_t8122_dcpext_reserve(const char *nub_path, const char *alias)
+{
+    int nub = adt_path_offset(adt, nub_path), owner = fdt_path_offset(dt, alias);
+    u32 len = 0;
+    const struct adt_segment_ranges *seg =
+        nub < 0 ? NULL : adt_getprop(adt, nub, "segment-ranges", &len);
+    if (!seg || !len || len % sizeof(*seg) || owner < 0)
+        return -1;
+    u32 phandle = fdt_get_phandle(dt, owner);
+    if (!phandle &&
+        (fdt_generate_phandle(dt, &phandle) || fdt_setprop_u32(dt, owner, "phandle", phandle)))
+        return -1;
+    for (u32 i = 0; i < len / sizeof(*seg); i++) {
+        u64 bytes = ALIGN_UP((u64)seg[i].size, SZ_16K);
+        bool log = seg[i].unk == 0xa;
+        int found =
+            dt_ext26_existing_reservation(seg[i].phys, bytes, !i || log /* text, __OS_LOG */);
+        if (found == -FDT_ERR_INTERNAL) {
+            printf("FDT: '%s' segment %u at %lx overlaps another reservation\n", alias, i,
+                   seg[i].phys);
+            return -1;
+        }
+        bool reused = found >= 0;
+        if (!reused) {
+            char name[64];
+            snprintf(name, sizeof(name), "asc-firmware@%lx", seg[i].phys);
+            found = dt_get_or_add_reserved_mem(name, "apple,asc-mem", true, seg[i].phys, bytes);
+        }
+        u32 mem = found < 0 ? 0 : fdt_get_phandle(dt, found);
+        if (!mem)
+            return -1;
+        if (reused)
+            printf("FDT: '%s' segment %u shares %s\n", alias, i, fdt_get_name(dt, found, NULL));
+        /* The log is a physical buffer, never mapped (as the internal DCP's): no IOVA. */
+        if (log ? (reused ? fdt_getprop(dt, found, "iommu-addresses", NULL) != NULL
+                          : fdt_setprop_empty(dt, found, "apple,dcp-os-log") < 0)
+                : dt_device_set_reserved_mem(found, "dcpext", phandle, seg[i].remap, bytes) < 0)
+            return -1;
+        owner = fdt_path_offset(dt, alias);
+        if (owner < 0 || fdt_appendprop_u32(dt, owner, "memory-region", mem))
+            return -1;
+    }
+    return dt_set_dcp_firmware(alias);
+}
+
 static int dt_reserve_dcpext_ready(unsigned int n, const char *marker, bool native26)
 {
     if (n >= ARRAY_SIZE(dcpext_aliases))
@@ -5685,8 +5843,9 @@ static int dt_reserve_dcpext_ready(unsigned int n, const char *marker, bool nati
         native26 && ext >= 0 && fdt_getprop(dt, ext, "apple,j613-25g83-dcpext-handoff", NULL);
     if (native)
         dt_ext26_step("firmware-memory-reservations");
-    if (native
-            ? dt_ext26_reserve(alias)
+    if (native ? dt_ext26_reserve(alias)
+        : native26
+            ? dt_dcpext_inherited_darts(alias) || dt_t8122_dcpext_reserve(path, alias)
             : (dt_reserve_asc_firmware(path, NULL, alias, true, 0) || dt_set_dcp_firmware(alias)))
         return -1;
     if (native) {
@@ -5806,13 +5965,56 @@ static void dt_reserve_j713_dcpext(void)
 }
 
 /*
- * T8122: reserve the external DCP firmware for the kernel's gate only with the boot.bin config
- * line chosen.asahi,t8122-dcpext=1, and only when the internal display was handed over
- * (apple,t8122-handoff on dcp), the one case where the kernel would enable it. Off by default:
- * on an M3 Air with 14.x firmware, a published marker lets the kernel enable dcpext, and the
- * internal DCP then crashes after disp0 DART faults, leaving the panel dark.
+ * The first firmware segment of the ADT nub at @path: where the processor's image (its text) sits.
  */
-static bool dt_t8122_dcpext_armed(void)
+static bool adt_nub_first_segment(const char *path, u64 *phys, u32 *size, const char **uuid)
+{
+    int nub = adt_path_offset(adt, path);
+    u32 len = 0, uuid_len = 0;
+    const struct adt_segment_ranges *seg =
+        nub < 0 ? NULL : adt_getprop(adt, nub, "segment-ranges", &len);
+
+    /* Segment 0 must be the text (flags 1). */
+    if (!seg || len < sizeof(*seg) || len % sizeof(*seg) || !seg[0].size || seg[0].unk != 1)
+        return false;
+    *uuid = adt_getprop(adt, nub, "uuid", &uuid_len);
+    if (!*uuid || !uuid_len || (*uuid)[uuid_len - 1] || uuid_len != strlen(*uuid) + 1)
+        return false;
+    *phys = seg[0].phys;
+    *size = seg[0].size;
+    return true;
+}
+
+/*
+ * Does the external processor at @alias run the image the internal display handoff pinned? iBoot
+ * then loads no image of its own for it: its nub names the internal DCP's image (same uuid) and its
+ * first segment is the internal DCP's text (seen with macOS 27.2 on the J615). The kernel starts
+ * it on that image, beside the panel, in the panel's DMA window.
+ */
+static bool dt_t8122_dcpext_shares_image(const char *alias)
+{
+    char path[48];
+    u64 ext_phys, dcp_phys;
+    u32 ext_size, dcp_size;
+    const char *ext_uuid, *dcp_uuid;
+
+    snprintf(path, sizeof(path), "/arm-io/%s/iop-%s-nub", alias, alias);
+    return adt_nub_first_segment(path, &ext_phys, &ext_size, &ext_uuid) &&
+           adt_nub_first_segment("/arm-io/dcp/iop-dcp-nub", &dcp_phys, &dcp_size, &dcp_uuid) &&
+           ext_phys == dcp_phys && ext_size == dcp_size && !strcmp(ext_uuid, dcp_uuid);
+}
+
+/*
+ * T8122: reserve the external DCP firmware for the kernel's gate only when the internal display
+ * was handed over (apple,t8122-handoff on dcp), the one case where the kernel would enable it.
+ * With the boot.bin config line chosen.asahi,t8122-dcpext=1 it is armed; any other value turns it
+ * off. Without a line it is on by default where the external processor runs the image the
+ * internal handoff pinned (dt_t8122_dcpext_shares_image()), unless a config line was lost (an
+ * owner's =0 may be among them). Otherwise it stays off without the line: on an M3 Air with 14.x
+ * firmware a published marker lets the kernel enable dcpext, and the internal DCP then crashes
+ * after disp0 DART faults, leaving the panel dark.
+ */
+static bool dt_t8122_dcpext_armed(const char *alias)
 {
     int chosen = fdt_path_offset(dt, "/chosen");
     int len = 0;
@@ -5822,10 +6024,13 @@ static bool dt_t8122_dcpext_armed(void)
     if (native)
         opt = chosen < 0 ? NULL : fdt_getprop(dt, chosen, "asahi,j613-25g83-dcpext", &len);
 
-    if (!opt || len != 2 || opt[0] != '1' || opt[1] != '\0')
+    if (native)
+        return opt && len == 2 && opt[0] == '1' && opt[1] == '\0';
+    if (panel < 0 || !fdt_getprop(dt, panel, "apple,t8122-handoff", NULL))
         return false;
-    int dcp = fdt_path_offset(dt, "dcp");
-    return native || (dcp >= 0 && fdt_getprop(dt, dcp, "apple,t8122-handoff", NULL));
+    if (opt)
+        return len == 2 && opt[0] == '1' && opt[1] == '\0';
+    return !chosen_lost && dt_t8122_dcpext_shares_image(alias);
 }
 
 /*
@@ -5865,11 +6070,12 @@ static int dt_reserve_dcpext_firmware(bool enable)
                 os_firmware.version == V26_6_2 && !fdt_node_check_compatible(dt, 0, "apple,j613");
             if (native26)
                 dt_ext26_step("native-switch-and-internal-handoff");
-            if (!dt_t8122_dcpext_armed()) {
+            if (!dt_t8122_dcpext_armed(dcpext_alias)) {
                 if (native26)
                     dt_ext26_result(-1);
-                printf("FDT: '%s' firmware not reserved (needs chosen.asahi,t8122-dcpext=1 "
-                       "and the internal display handoff); kernel gate remains closed\n",
+                printf("FDT: '%s' firmware not reserved (needs the internal display handoff, and "
+                       "chosen.asahi,t8122-dcpext=1 unless it runs the handed-over image); "
+                       "kernel gate remains closed\n",
                        dcpext_alias);
                 continue;
             }
@@ -8594,7 +8800,7 @@ static int dt_set_display(void)
          * Fail-soft handoff (kboot_display_handoff.c): it always returns 0, never uses the
          * helpers above (they bail out of kboot or enable nodes) and never enables a node.
          * On T8122 it does nothing unless chosen.asahi,t8122-dcp=1; the external DCP firmware is
-         * reserved only with chosen.asahi,t8122-dcpext=1 and that handoff. On T6031 it does nothing
+         * reserved only after that handoff (dt_t8122_dcpext_armed()). On T6031 it does nothing
          * unless the board is a J514C or J516C, and reserves only __OS_LOG unless
          * chosen.asahi,t6031-dcp=1 (on a J516C, dt_set_m3_defaults() sets it unless a config line
          * set it).
