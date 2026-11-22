@@ -680,6 +680,8 @@ static const struct t8132_scenario t8132_scenarios[] = {
     {"j713-shared-table", "J713: two dispext1 streams share their tables: kept once"},
     {"j713-table-in-reservation", "J713: dcpext0's tables inside an existing no-map reservation"},
     {"j713-table-partial-reservation", "J713: dcpext0's root straddles an existing reservation"},
+    {"j713-table-small-reservation", "J713: a no-map reservation smaller than a page starts at dcpext0's root"},
+    {"j713-table-small-memreserve", "J713: a /memreserve/ smaller than a page starts at dcpext0's root"},
     {"j713-tables-in-ram-refused", "J713: dcpext0 refused after collecting its tables: no leak"},
     {"j713-table-in-carveout", "J713: dcpext0's root page is in a memory carveout"},
     {"j713-extra-child-dart", "J713: a second dcpext1 child on an unlocked, live DART"},
@@ -898,6 +900,14 @@ int main(int argc, char **argv)
         else
             resv_add(dt, "fw-test@10100002000", RAM_TABLES + 0x2000, 0x4000);
     }
+    if (is(s, "j713-table-small-reservation") || is(s, "j713-table-small-memreserve")) {
+        region_add(RAM_TABLES, 0x10000);
+        poke32(ext_dart[0] + 0x1400 + 4 * 23, dart_tables(RAM_TABLES));
+        if (is(s, "j713-table-small-reservation"))
+            resv_add(dt, "fw-test@10100000000", RAM_TABLES, 0x2000);
+        else
+            OK(fdt_add_mem_rsv(dt, RAM_TABLES, 0x2000));
+    }
     if (is(s, "j713-tables-in-ram-refused")) {
         region_add(RAM_TABLES, 0x10000);
         poke32(ext_dart[0] + 0x1400 + 4 * 23, dart_tables(RAM_TABLES));
@@ -1018,6 +1028,7 @@ int main(int argc, char **argv)
         check_internal_untouched(in, dt);
     } else if (is(s, "j713-iommu-cells-2") || is(s, "j713-too-many-tables") ||
                is(s, "j713-table-partial-reservation") || is(s, "j713-tables-in-ram-refused") ||
+               is(s, "j713-table-small-reservation") || is(s, "j713-table-small-memreserve") ||
                is(s, "j713-table-in-carveout")) {
         check(ext_untouched(in, dt, 0), "dcpext0 is left as it was");
         check_ext(in, dt, 1, false);

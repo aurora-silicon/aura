@@ -3952,7 +3952,7 @@ static int dcpext_table_kept(void *dt, u64 page, const char *what)
         u64 a, sz;
         if (fdt_get_mem_rsv(dt, i, &a, &sz) || !dcp6_overlaps(page, SZ_16K, a, sz))
             continue;
-        if (page < a || page - a > sz - SZ_16K)
+        if (sz < SZ_16K || page < a || page - a > sz - SZ_16K)
             bail("%s: DART table page 0x%lx straddles /memreserve/ 0x%lx+0x%lx\n", what, page, a,
                  sz);
         kept = 1;
@@ -3971,7 +3971,8 @@ static int dcpext_table_kept(void *dt, u64 page, const char *what)
             u64 a = fdt64_ld(&reg[k]), sz = fdt64_ld(&reg[k + 1]);
             if (!dcp6_overlaps(page, SZ_16K, a, sz))
                 continue;
-            if (page < a || page - a > sz - SZ_16K || !fdt_getprop(dt, node, "no-map", NULL))
+            if (sz < SZ_16K || page < a || page - a > sz - SZ_16K ||
+                !fdt_getprop(dt, node, "no-map", NULL))
                 bail("%s: DART table page 0x%lx overlaps /reserved-memory/%s\n", what, page,
                      fdt_get_name(dt, node, NULL));
             kept = 1;

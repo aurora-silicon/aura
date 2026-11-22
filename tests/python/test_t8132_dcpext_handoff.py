@@ -90,6 +90,8 @@ REASONS = {
     "j713-shared-table": [H0, H1, "dcpext1: DART 0x48a300000 locked, 2 translating stream(s), 2 table page(s)"],
     "j713-table-in-reservation": [H0, H1],
     "j713-table-partial-reservation": [H1, "dcpext0: DART table page 0x10100000000 overlaps /reserved-memory/fw-test@10100002000"],
+    "j713-table-small-reservation": [H1, "dcpext0: DART table page 0x10100000000 overlaps /reserved-memory/fw-test@10100000000"],
+    "j713-table-small-memreserve": [H1, "dcpext0: DART table page 0x10100000000 straddles /memreserve/ 0x10100000000+0x2000"],
     "j713-tables-in-ram-refused": [H1, "dcpext0: already has clocks"],
     "j713-table-in-carveout": [H1, "dcpext0: DART 0x286340000 table page 0x103f0000000 is in memory carveout 0x103f0000000+0x4000"],
     "j713-extra-child-dart": [H0, "dcpext1: DART 0x48a380000 is not locked (PROTECT 0x1e0) and stream 3 is live (TCR 0x1)"],
@@ -108,7 +110,8 @@ ONE_REFUSAL = {"j713-one", "j713-refused-uuid", "j713-sid-mismatch", "j713-dart-
                "j713-stream-bypass", "j713-dart-read-faults", "j713-pipe-dart-live",
                "j713-four-level", "j713-l2-outside-dram", "j713-pipe-dart-faults",
                "j713-second-parent-off", "j713-zero-streams", "j713-too-many-tables",
-               "j713-table-partial-reservation", "j713-tables-in-ram-refused", "j713-table-in-carveout",
+               "j713-table-partial-reservation", "j713-table-small-reservation",
+               "j713-table-small-memreserve", "j713-tables-in-ram-refused", "j713-table-in-carveout",
                "j713-extra-child-dart", "j713-iommu-cells-2"}
 
 
