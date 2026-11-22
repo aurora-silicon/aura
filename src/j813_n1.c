@@ -108,14 +108,20 @@ static int j813_perst(const char *bridge, u64 *addr)
 static int j813_port0_endpoint(struct j813_endpoint *ep)
 {
     const char *path = APCIE_PORT, *prop = "function-reset";
+    int ret = smc_adt_function_get(path, prop, &ep->reset);
 
-    if (smc_adt_function_get(path, prop, &ep->reset)) {
+    /* A function-reset aimed elsewhere (logged by smc_adt_function_get()) is a mismatch with
+     * what this code expects of J813/J815: leave the port off rather than try /amfm. */
+    if (ret < 0)
+        return -1;
+    if (ret) {
         path = "/amfm";
         prop = "function-reg_on";
-        if (smc_adt_function_get(path, prop, &ep->reset)) {
+        ret = smc_adt_function_get(path, prop, &ep->reset);
+        if (ret > 0)
             printf("j813-n1: no SMC %s function-reset or /amfm function-reg_on\n", APCIE_PORT);
+        if (ret)
             return -1;
-        }
     }
     printf("j813-n1: radio reset %s %s = %c%c%c%c 0x%x\n", path, prop, ep->reset.key >> 24,
            ep->reset.key >> 16, ep->reset.key >> 8, ep->reset.key, ep->reset.lo);

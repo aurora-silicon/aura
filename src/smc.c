@@ -213,21 +213,20 @@ struct smc_adt_function_prop {
     u32 hi; /* pKW8 only */
 };
 
-/* Whether phandle names node or a node below it, at most depth levels down. The functions point
- * at the SMC's PMU (J704: /arm-io/smc/iop-smc-nub/smc-pmu), not at /arm-io/smc itself. */
-static bool smc_adt_node_has_phandle(int node, u32 phandle, int depth)
+/* Whether phandle names node or any node below it. The functions point at the SMC's PMU (J704:
+ * /arm-io/smc/iop-smc-nub/smc-pmu), not at /arm-io/smc itself; the whole (finite) subtree is
+ * searched, so no particular layout is assumed. */
+static bool smc_adt_node_has_phandle(int node, u32 phandle)
 {
     u32 own;
 
     if (ADT_GETPROP(adt, node, "AAPL,phandle", &own) >= 0 && own == phandle)
         return true;
-    if (depth == 0)
-        return false;
 
     int child = node;
     ADT_FOREACH_CHILD(adt, child)
     {
-        if (smc_adt_node_has_phandle(child, phandle, depth - 1))
+        if (smc_adt_node_has_phandle(child, phandle))
             return true;
     }
     return false;
@@ -247,8 +246,13 @@ int smc_adt_function_get(const char *path, const char *prop, struct smc_adt_func
     if (!(wide && len == 20) && !(!memcmp(raw.four_cc, "4WKp", 4) && len == 16))
         return 1; /* a GPIO or other non-SMC function */
     int smc_node = adt_path_offset(adt, "/arm-io/smc");
-    if (smc_node < 0 || !smc_adt_node_has_phandle(smc_node, raw.phandle, 2))
-        return 1; /* a pKW4/pKW8 aimed at a controller other than the SMC */
+    if (smc_node < 0 || !smc_adt_node_has_phandle(smc_node, raw.phandle)) {
+        /* A pKW4/pKW8 aimed at a controller other than the SMC: present but unusable, so the
+         * caller must not treat it as "no function". */
+        printf("SMC: %s %s names phandle %u, not /arm-io/smc or a node below it: refused\n", path,
+               prop, raw.phandle);
+        return -1;
+    }
 
     *fn = (struct smc_adt_function){.key = raw.key, .lo = raw.lo, .hi = raw.hi, .wide = wide};
     return 0;
@@ -263,14 +267,14 @@ int smc_adt_function_write(smc_dev_t *smc, const struct smc_adt_function *fn, u3
 int smc_adt_function_reset(const char *path, u32 settle_ms)
 {
     struct smc_adt_function fn;
+    int ret = smc_adt_function_get(path, "function-reset", &fn);
 
-    if (smc_adt_function_get(path, "function-reset", &fn))
-        return 1;
+    if (ret)
+        return ret;
 
     smc_dev_t *smc = smc_init();
     if (!smc)
         return -1;
-    int ret = 0;
     for (u32 level = 0; level < 2 && !ret; level++) {
         ret = smc_adt_function_write(smc, &fn, level);
         mdelay(settle_ms);

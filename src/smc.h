@@ -24,8 +24,8 @@ struct smc_adt_function {
 };
 
 /* Read the SMC function in property prop of the ADT node at path: 0 when it is one, 1 when the
- * node or property is missing, is not a pKW4/pKW8 (a GPIO, say), or its phandle is not that of
- * /arm-io/smc or a node below it. */
+ * node or property is missing or is not a pKW4/pKW8 (a GPIO, say), negative (and logged) when it
+ * is a pKW4/pKW8 whose phandle is not that of /arm-io/smc or a node below it. */
 int smc_adt_function_get(const char *path, const char *prop, struct smc_adt_function *fn);
 int smc_adt_function_write(smc_dev_t *smc, const struct smc_adt_function *fn, u32 level);
 
@@ -33,7 +33,7 @@ int smc_adt_function_write(smc_dev_t *smc, const struct smc_adt_function *fn, u3
  * Release the reset an ADT node's "function-reset" names through the SMC: pKW4(key, lo) is a
  * four-byte write of lo | level, pKW8(key, lo, hi) an eight-byte write of (hi << 32) | lo | level,
  * level 0 then 1, settle_ms after each. 1 when the node has no SMC function-reset, 0 once released,
- * negative on failure.
+ * negative on failure or when the function names a controller other than the SMC.
  */
 int smc_adt_function_reset(const char *path, u32 settle_ms);
 void smc_shutdown(smc_dev_t *smc);
