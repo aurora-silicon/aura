@@ -83,6 +83,19 @@ REASONS = {
     "j713-second-parent-off": [H0, "dcpext1: DISPEXT1_AUX is not on (0x0)"],
     "j773g-disp-tables-in-ram": [H0, H1, "the display subsystem: DART 0x30a300000 locked, 2 translating stream(s), 4 table page(s)",
                                  "no panel: display subsystem and its DART enabled"],
+    "j713-stream-word1": [H0, H1, "dcpext1: DART 0x48a300000 locked, 3 translating stream(s), 6 table page(s)"],
+    "j713-disabled-live": [H0, H1, "dcpext0: DART 0x286340000 locked, 1 translating stream(s), 2 table page(s)"],
+    "j713-zero-streams": [H0, "dcpext1: DART 0x48a340000 reports 0 streams"],
+    "j713-too-many-tables": [H1, "dcpext0: DART 0x286340000 has more than 256 table pages to keep"],
+    "j713-shared-table": [H0, H1, "dcpext1: DART 0x48a300000 locked, 2 translating stream(s), 2 table page(s)"],
+    "j713-table-in-reservation": [H0, H1],
+    "j713-table-partial-reservation": [H1, "dcpext0: DART table page 0x10100000000 overlaps /reserved-memory/fw-test@10100002000"],
+    "j713-tables-in-ram-refused": [H1, "dcpext0: already has clocks"],
+    "j713-table-in-carveout": [H1, "dcpext0: DART 0x286340000 table page 0x103f0000000 is in memory carveout 0x103f0000000+0x4000"],
+    "j713-extra-child-dart": [H0, "dcpext1: DART 0x48a380000 is not locked (PROTECT 0x1e0) and stream 3 is live (TCR 0x1)"],
+    "j713-iommu-cells-2": [H1, "dcpext0: piodma iommus[0] is not a one-cell apple,t8110-dart"],
+    "j713-self-parent": [H0, H1],
+    "j773g-tables-display-fails": [H0, H1, "display subsystem not enabled; the external processors stay disabled"],
     "j773g-disp-piodma-bypass": ["the display subsystem: DART 0x30a300000 stream 16 is not a two-level translation (TCR 0x3, ",
                                  "no panel, and the display subsystem's DART is not as iBoot leaves it"],
 }
@@ -94,7 +107,9 @@ ONE_REFUSAL = {"j713-one", "j713-refused-uuid", "j713-sid-mismatch", "j713-dart-
                "j713-no-clock-gates", "j713-dart-unlocked", "j713-stream-no-root",
                "j713-stream-bypass", "j713-dart-read-faults", "j713-pipe-dart-live",
                "j713-four-level", "j713-l2-outside-dram", "j713-pipe-dart-faults",
-               "j713-second-parent-off"}
+               "j713-second-parent-off", "j713-zero-streams", "j713-too-many-tables",
+               "j713-table-partial-reservation", "j713-tables-in-ram-refused", "j713-table-in-carveout",
+               "j713-extra-child-dart", "j713-iommu-cells-2"}
 
 
 def test_every_scenario_has_its_reason():

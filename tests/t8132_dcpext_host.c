@@ -65,7 +65,8 @@ enum {
     PH_PLACE = 110,
     PH_M4_DART_DCP = 120,
     PH_M4_DART_DISP,
-    PH_M4_TEXT
+    PH_M4_TEXT,
+    PH_EXTRA_DART
 };
 
 /* The internal nub: __TEXT (shared by all three processors), __DATA, __OS_LOG, a heap */
@@ -672,6 +673,19 @@ static const struct t8132_scenario t8132_scenarios[] = {
     {"j713-second-parent-off", "J713: DISPEXT1_CPU's second PMGR parent is off"},
     {"j773g-disp-tables-in-ram", "J773g: disp0's DART tables in usable RAM: reserved"},
     {"j773g-disp-piodma-bypass", "J773g: disp0's piodma stream bypasses its DART"},
+    {"j713-stream-word1", "J713: dispext1 stream 40 set up (ENABLE_STREAMS word 1)"},
+    {"j713-disabled-live", "J713: a disabled stream with live TCR/TTBR leftovers is not judged"},
+    {"j713-zero-streams", "J713: dcpext1's DART reports no streams"},
+    {"j713-too-many-tables", "J713: dcpext0's stream 23 has 257 table pages"},
+    {"j713-shared-table", "J713: two dispext1 streams share their tables: kept once"},
+    {"j713-table-in-reservation", "J713: dcpext0's tables inside an existing no-map reservation"},
+    {"j713-table-partial-reservation", "J713: dcpext0's root straddles an existing reservation"},
+    {"j713-tables-in-ram-refused", "J713: dcpext0 refused after collecting its tables: no leak"},
+    {"j713-table-in-carveout", "J713: dcpext0's root page is in a memory carveout"},
+    {"j713-extra-child-dart", "J713: a second dcpext1 child on an unlocked, live DART"},
+    {"j713-iommu-cells-2", "J713: dispext0's DART takes two iommu cells"},
+    {"j713-self-parent", "J713: DISPEXT1_CPU lists itself as its second parent"},
+    {"j773g-tables-display-fails", "J773g: disp0 tables in RAM, display subsystem not enabled"},
     {"later-soc", "a later board/SoC with the same block, fallback compatible"},
 };
 
@@ -687,6 +701,14 @@ static bool resv_page(void *dt, u64 page)
     return reg && len == 16 && fdt64_ld(&reg[0]) == page && fdt64_ld(&reg[1]) == 0x4000 &&
            fdt_getprop(dt, node, "no-map", NULL) &&
            !fdt_node_check_compatible(dt, node, "apple,asc-mem");
+}
+
+/* An existing no-map reservation, as an earlier boot stage or handoff leaves one */
+static void resv_add(void *dt, const char *name, u64 base, u64 size)
+{
+    int node = OK(fdt_add_subnode(dt, fdt_path_offset(dt, "/reserved-memory"), name));
+    reg2(dt, node, base, size);
+    OK(fdt_setprop_empty(dt, node, "no-map"));
 }
 
 static int resv_tables(void *dt)
@@ -848,6 +870,68 @@ int main(int argc, char **argv)
     }
     if (is(s, "j773g-disp-piodma-bypass"))
         poke32(M4_DART_DISP + 0x1000 + 4 * 16, 0x3);
+    if (is(s, "j713-stream-word1")) {
+        poke32(pipe_dart[1] + 0xc, 64);
+        dart_regs(pipe_dart[1], 40, 0x1ff, 0x1, 1);
+    }
+    if (is(s, "j713-disabled-live")) {
+        /* stream 5: translating through a root outside DRAM, but its enable bit is clear */
+        poke32(ext_dart[0] + 0x1000 + 4 * 5, 0x1);
+        poke32(ext_dart[0] + 0x1400 + 4 * 5, 0x7);
+    }
+    if (is(s, "j713-zero-streams"))
+        poke32(ext_dart[1] + 0xc, 0);
+    if (is(s, "j713-too-many-tables")) {
+        u64 base = TB + 0x3f8000000ULL;
+        region_add(base, 258 * 0x4000);
+        for (int i = 0; i < 256; i++)
+            poke64(base + 8 * i, ((base + 0x4000 * (u64)(i + 1)) >> 4) | 1);
+        poke32(ext_dart[0] + 0x1400 + 4 * 23, (u32)((base >> 14) << 2) | 1);
+    }
+    if (is(s, "j713-shared-table"))
+        poke32(pipe_dart[1] + 0x1400 + 4 * 16, dart_ttbr(pipe_dart[1], 0));
+    if (is(s, "j713-table-in-reservation") || is(s, "j713-table-partial-reservation")) {
+        region_add(RAM_TABLES, 0x10000);
+        poke32(ext_dart[0] + 0x1400 + 4 * 23, dart_tables(RAM_TABLES));
+        if (is(s, "j713-table-in-reservation"))
+            resv_add(dt, "fw-test@10100000000", RAM_TABLES, 0x8000);
+        else
+            resv_add(dt, "fw-test@10100002000", RAM_TABLES + 0x2000, 0x4000);
+    }
+    if (is(s, "j713-tables-in-ram-refused")) {
+        region_add(RAM_TABLES, 0x10000);
+        poke32(ext_dart[0] + 0x1400 + 4 * 23, dart_tables(RAM_TABLES));
+        poke32(pipe_dart[1] + 0x1400 + 4 * 16, dart_tables(RAM_TABLES + 0x8000));
+        char path[96];
+        ext_path(path, sizeof(path), 0);
+        OK(fdt_setprop_u32(dt, fdt_path_offset(dt, path), "clocks", 7));
+    }
+    if (is(s, "j713-table-in-carveout")) {
+        mcc_carveouts[0] = (struct mcc_carveout){ttbr_root(dart_ttbr(ext_dart[0], 23)), 0x4000};
+        mcc_carveout_count = 1;
+    }
+    if (is(s, "j713-extra-child-dart")) {
+        const u64 extra = 0x48a380000ULL;
+        dart_regs(extra, 3, 0x1e0, 0x1, 0);
+        t8132_dart(dt, fdt_path_offset(dt, "/soc"), extra, 0x4000, PH_EXTRA_DART, "disabled");
+        char path[96];
+        ext_path(path, sizeof(path), 1);
+        int child = OK(fdt_add_subnode(dt, fdt_path_offset(dt, path), "extra"));
+        iommus(dt, child, PH_EXTRA_DART, 3);
+    }
+    if (is(s, "j713-iommu-cells-2"))
+        OK(fdt_setprop_u32(dt, fdt_node_offset_by_phandle(dt, PH_PIPE_DART), "#iommu-cells", 2));
+    if (is(s, "j713-self-parent")) {
+        u16 cpu = pm_sys(1) + 2;
+        for (int i = 0; i < nfdevs; i++)
+            if (fdevs[i].id == cpu)
+                fdevs[i].parent[1] = cpu;
+    }
+    if (is(s, "j773g-tables-display-fails")) {
+        region_add(RAM_TABLES, 0x10000);
+        poke32(M4_DART_DISP + 0x1400 + 4 * 16, dart_tables(RAM_TABLES));
+        OK(fdt_setprop_string(dt, alias_node(dt, "disp0"), "status", "okay"));
+    }
 
     memcpy(in, dt, fdt_totalsize(dt));
     mmio_reads = mmio_writes = 0;
@@ -921,6 +1005,35 @@ int main(int argc, char **argv)
         check_ext(in, dt, 0, j773g);
         check_ext(in, dt, 1, j773g);
         check_display(in, dt, j773g);
+    } else if (is(s, "j713-stream-word1") || is(s, "j713-disabled-live") ||
+               is(s, "j713-shared-table") || is(s, "j713-table-in-reservation") ||
+               is(s, "j713-self-parent")) {
+        check_ext(in, dt, 0, false);
+        check_ext(in, dt, 1, false);
+        check_internal_untouched(in, dt);
+        check(!resv_tables(dt), "no table page is reserved (%d)", resv_tables(dt));
+    } else if (is(s, "j713-zero-streams") || is(s, "j713-extra-child-dart")) {
+        check_ext(in, dt, 0, false);
+        check(ext_untouched(in, dt, 1), "dcpext1 is left as it was");
+        check_internal_untouched(in, dt);
+    } else if (is(s, "j713-iommu-cells-2") || is(s, "j713-too-many-tables") ||
+               is(s, "j713-table-partial-reservation") || is(s, "j713-tables-in-ram-refused") ||
+               is(s, "j713-table-in-carveout")) {
+        check(ext_untouched(in, dt, 0), "dcpext0 is left as it was");
+        check_ext(in, dt, 1, false);
+        check_internal_untouched(in, dt);
+        if (is(s, "j713-tables-in-ram-refused"))
+            check(!resv_page(dt, RAM_TABLES) && !resv_page(dt, RAM_TABLES + 0x4000) &&
+                      resv_page(dt, RAM_TABLES + 0x8000) && resv_page(dt, RAM_TABLES + 0xc000) &&
+                      resv_tables(dt) == 2,
+                  "only the handed-over processor's table pages are reserved (%d)",
+                  resv_tables(dt));
+        else
+            check(!resv_tables(dt), "no table page is reserved (%d)", resv_tables(dt));
+    } else if (is(s, "j773g-tables-display-fails")) {
+        check(!resv_tables(dt), "disp0's tables are not reserved without the display (%d)",
+              resv_tables(dt));
+        check(node_same(in, dt, "/soc/iommu@30a300000"), "disp0's DART is untouched");
     } else if (is(s, "j713-tables-in-ram") || is(s, "j713-pipe-dart-idle")) {
         check_ext(in, dt, 0, false);
         check_ext(in, dt, 1, false);

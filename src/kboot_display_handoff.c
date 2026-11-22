@@ -3757,7 +3757,7 @@ static int dcpext_ps_add(struct dcpext_ps *ps, int *n, const struct pmgr_gate *g
     }
     for (int p = 0; p < 2; p++) {
         struct pmgr_gate parent;
-        if (!g->parent[p])
+        if (!g->parent[p] || g->parent[p] == g->id) /* a device listed as its own parent */
             continue;
         if (pmgr_device_gate(g->die, g->parent[p], &parent) < 0)
             bail("%s: a parent of clock-gates[%u] is not in the PMGR table\n", name, i);
@@ -3845,6 +3845,11 @@ static char dcpext_why[192];
 
 static int dcpext_table_add(struct dcpext_tables *t, u64 page, const char *what, u64 dart)
 {
+    /* A memory-controller carveout is not DART table memory, and need not read back as it is */
+    for (size_t j = 0; j < mcc_carveout_count; j++)
+        if (dcp6_overlaps(page, SZ_16K, mcc_carveouts[j].base, mcc_carveouts[j].size))
+            refuse("%s: DART 0x%lx table page 0x%lx is in memory carveout 0x%lx+0x%lx\n", what,
+                   dart, page, mcc_carveouts[j].base, mcc_carveouts[j].size);
     for (int i = 0; i < t->n; i++)
         if (t->page[i] == page)
             return 0;
@@ -3936,8 +3941,49 @@ static int dcpext_dart_tables(u64 dart, const char *what, struct dcpext_tables *
 #undef refuse
 
 /*
- * Keep the table pages in `t` from the OS: a page in the RAM the OS gets is reserved (no-map,
- * named by its address, as kboot.c's dcpext handoff names them); one outside it is not the OS's.
+ * Whether a table page is already kept from the OS: 1 if a /memreserve/ entry or an enabled no-map
+ * /reserved-memory node holds all of it, 0 if nothing overlaps it, -1 (logged) on a partial overlap
+ * or an overlap with a reservation the OS may map.
+ */
+static int dcpext_table_kept(void *dt, u64 page, const char *what)
+{
+    int n = fdt_num_mem_rsv(dt), kept = 0;
+    for (int i = 0; i < n; i++) {
+        u64 a, sz;
+        if (fdt_get_mem_rsv(dt, i, &a, &sz) || !dcp6_overlaps(page, SZ_16K, a, sz))
+            continue;
+        if (page < a || page - a > sz - SZ_16K)
+            bail("%s: DART table page 0x%lx straddles /memreserve/ 0x%lx+0x%lx\n", what, page, a,
+                 sz);
+        kept = 1;
+    }
+    int resv = fdt_path_offset(dt, "/reserved-memory"), node;
+    if (resv < 0)
+        return kept;
+    fdt_for_each_subnode(node, dt, resv)
+    {
+        const char *status = fdt_getprop(dt, node, "status", NULL);
+        int len;
+        const fdt64_t *reg = fdt_getprop(dt, node, "reg", &len);
+        if ((status && !strcmp(status, "disabled")) || !reg || len <= 0)
+            continue;
+        for (int k = 0; (k + 2) * (int)sizeof(fdt64_t) <= len; k += 2) {
+            u64 a = fdt64_ld(&reg[k]), sz = fdt64_ld(&reg[k + 1]);
+            if (!dcp6_overlaps(page, SZ_16K, a, sz))
+                continue;
+            if (page < a || page - a > sz - SZ_16K || !fdt_getprop(dt, node, "no-map", NULL))
+                bail("%s: DART table page 0x%lx overlaps /reserved-memory/%s\n", what, page,
+                     fdt_get_name(dt, node, NULL));
+            kept = 1;
+        }
+    }
+    return kept;
+}
+
+/*
+ * Keep the table pages in `t` from the OS: a page in the RAM the OS gets that no reservation
+ * holds yet is reserved (no-map, named by its address, as kboot.c's dcpext handoff names them);
+ * one outside that RAM is not the OS's.
  */
 static int dcpext_reserve_tables(void *dt, const struct dcpext_tables *t, const char *what)
 {
@@ -3948,28 +3994,74 @@ static int dcpext_reserve_tables(void *dt, const struct dcpext_tables *t, const 
         char name[48];
         if (page + SZ_16K <= ram_min || page >= ram_max)
             continue;
-        snprintf(name, sizeof(name), "dcpext-tables@%lx", page);
-        int node = dcp6_find_resv(dt, name, page, SZ_16K);
-        if (node >= 0)
+        int kept = dcpext_table_kept(dt, page, what);
+        if (kept < 0)
+            return -1;
+        if (kept)
             continue;
-        if (node != -FDT_ERR_NOTFOUND || dcp6_resv_conflict(dt, page, SZ_16K, name) ||
-            !dcp6_add_resv(dt, name, page, SZ_16K, "apple,asc-mem"))
+        snprintf(name, sizeof(name), "dcpext-tables@%lx", page);
+        if (!dcp6_add_resv(dt, name, page, SZ_16K, "apple,asc-mem"))
             bail("%s: cannot reserve DART table page 0x%lx\n", what, page);
     }
     return 0;
 }
 
-/* The DART a device tree node's single iommus entry names, by its reg[0] */
-static int dcpext_iommu_reg(void *dt, int node, u64 *base)
+#define DCPEXT_DARTS_MAX 8
+
+/*
+ * Every DART the device tree node at `node` and its children (piodma) reference, by reg[0], each
+ * once: each iommus must be a list of (DART, stream) pairs on apple,t8110-dart DARTs that take one
+ * cell. Returns how many, -1 (logged) if the description cannot be read whole.
+ */
+static int dcpext_node_darts(void *dt, int node, const char *what, u64 *darts)
 {
-    int len;
-    const fdt32_t *iommus = node < 0 ? NULL : fdt_getprop(dt, node, "iommus", &len);
-    int dart = !iommus || len != 2 * (int)sizeof(fdt32_t)
-                   ? -1
-                   : fdt_node_offset_by_phandle(dt, fdt32_ld(&iommus[0]));
-    if (dart < 0 || fdt_node_check_compatible(dt, dart, "apple,t8110-dart"))
+    int n = 0, depth = 0, dev = node;
+    if (node < 0)
+        bail("%s: no device tree node\n", what);
+    do {
+        int len = 0;
+        const fdt32_t *iommus = fdt_getprop(dt, dev, "iommus", &len);
+        if (iommus && (len <= 0 || len % (2 * (int)sizeof(*iommus))))
+            bail("%s: %s iommus is not a list of (DART, stream) pairs\n", what,
+                 fdt_get_name(dt, dev, NULL));
+        for (int i = 0; iommus && i + 1 < len / (int)sizeof(*iommus); i += 2) {
+            int dart = fdt_node_offset_by_phandle(dt, fdt32_ld(&iommus[i])), clen = 0;
+            const fdt32_t *cells = dart < 0 ? NULL : fdt_getprop(dt, dart, "#iommu-cells", &clen);
+            u64 base;
+            if (dart < 0 || fdt_node_check_compatible(dt, dart, "apple,t8110-dart") || !cells ||
+                clen != sizeof(*cells) || fdt32_ld(cells) != 1 || dcpext_dt_reg(dt, dart, &base))
+                bail("%s: %s iommus[%d] is not a one-cell apple,t8110-dart\n", what,
+                     fdt_get_name(dt, dev, NULL), i / 2);
+            int k;
+            for (k = 0; k < n && darts[k] != base; k++)
+                ;
+            if (k < n)
+                continue;
+            if (n == DCPEXT_DARTS_MAX)
+                bail("%s: more than %d DARTs\n", what, DCPEXT_DARTS_MAX);
+            darts[n++] = base;
+        }
+        dev = fdt_next_node(dt, dev, &depth);
+    } while (dev >= 0 && depth > 0);
+    if (dev < 0 && dev != -FDT_ERR_NOTFOUND)
+        bail("%s: the device tree cannot be walked\n", what);
+    return n;
+}
+
+/* The tables of every DART the node at `node` and its children use, into `t` */
+static int dcpext_node_tables(void *dt, int node, const char *what, struct dcpext_tables *t)
+{
+    u64 darts[DCPEXT_DARTS_MAX];
+    int n = dcpext_node_darts(dt, node, what, darts);
+    if (n < 0)
         return -1;
-    return dcpext_dt_reg(dt, dart, base);
+    if (!n)
+        bail("%s: no DART in the device tree\n", what);
+    t->n = 0;
+    for (int i = 0; i < n; i++)
+        if (dcpext_dart_tables(darts[i], what, t))
+            return -1;
+    return 0;
 }
 
 /*
@@ -4003,8 +4095,7 @@ static int dcpext_display_locked(void *dt)
     if (dcpext_powered("dcp") ||
         dcpext_stream_locked(base, fdt32_ld(&iommus[1]), "the display subsystem"))
         return -1;
-    dcpext_run.disp_tables.n = 0;
-    return dcpext_dart_tables(base, "the display subsystem", &dcpext_run.disp_tables);
+    return dcpext_node_tables(dt, disp, "the display subsystem", &dcpext_run.disp_tables);
 }
 
 /*
@@ -4021,15 +4112,8 @@ static int dcpext_fill(void *dt, struct dcpext *x)
         return -1;
     int node = fdt_path_offset(dt, x->dt_path);
 
-    /* Its firmware DART and its pipe's (piodma's): tables to keep, or refused */
-    char piodma_path[sizeof(x->dt_path) + 8];
-    u64 pipe_dart;
-    snprintf(piodma_path, sizeof(piodma_path), "%s/piodma", x->dt_path);
-    dcpext_run.tables.n = 0;
-    if (dcpext_iommu_reg(dt, fdt_path_offset(dt, piodma_path), &pipe_dart))
-        bail("%s: no piodma child on a DART\n", x->name);
-    if (dcpext_dart_tables(x->dart, x->name, &dcpext_run.tables) ||
-        (pipe_dart != x->dart && dcpext_dart_tables(pipe_dart, x->name, &dcpext_run.tables)))
+    /* Every DART it and its children (piodma) use: tables to keep, or refused */
+    if (dcpext_node_tables(dt, node, x->name, &dcpext_run.tables))
         return -1;
     if (dcpext_placeholders(dt, node, x->name, ph))
         return -1;
@@ -4251,6 +4335,11 @@ int dt_set_dcpext_handoff(void *dt, enum dcp_internal internal, bool fw_clocks)
             display = display ?: x->display;
         }
     }
+    /*
+     * With no panel, a processor committed above keeps its table reservations even if the display
+     * subsystem is not enabled below and the processor stays disabled: its DARTs still run as
+     * iBoot left them.
+     */
     if (!dcpext_run.headless || !display)
         return 1;
     void *scratch = dcp6_scratch(dt);
