@@ -37,6 +37,7 @@
 
 /* Rows per band.  A 3024-pixel row is ~2.3 us of repacking (hv.h: 5.2 GB/s measured). */
 #define HV_SCANOUT_IDLE_ROWS 160u /* a CPU about to park: the converter's own idle slice */
+#define HV_SCANOUT_IDLE_STEP 32u  /* step size for interrupt-aware idle copy (~75 us) */
 #define HV_SCANOUT_FAST_ROWS 32u  /* the 1 kHz FIQ fast path: ~75 us stolen from a busy CPU */
 #define HV_SCANOUT_TICK_ROWS 16u  /* the 5 kHz tick, under the big lock: a floor only */
 /* Refresh rates ATTACH accepts, in mHz. */
@@ -100,6 +101,9 @@ void hv_scanout_guest_exited(int status);
 void hv_scanout_tick(void);
 /* An unlocked path with time to spare: at most one band of `rows`.  True if it copied. */
 bool hv_scanout_work(u32 rows);
+/* Idle path: copy up to HV_SCANOUT_IDLE_ROWS in HV_SCANOUT_IDLE_STEP bands, stopping if an
+ * interrupt becomes pending (ISR_EL1).  True if any band was copied. */
+bool hv_scanout_work_idle(void);
 /* Does the flip path own the panel?  hv_fb_convert_slice() stands down while it does. */
 bool hv_scanout_owns_panel(void);
 

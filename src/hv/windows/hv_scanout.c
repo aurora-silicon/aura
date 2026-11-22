@@ -176,6 +176,19 @@ bool hv_scanout_work(u32 rows)
     return true;
 }
 
+bool hv_scanout_work_idle(void)
+{
+    bool copied = false;
+    for (u32 done = 0; done < HV_SCANOUT_IDLE_ROWS; done += HV_SCANOUT_IDLE_STEP) {
+        if (mrs(ISR_EL1))
+            break;
+        if (!hv_scanout_work(HV_SCANOUT_IDLE_STEP))
+            break;
+        copied = true;
+    }
+    return copied;
+}
+
 void hv_scanout_tick(void)
 {
     if (!attached || !entered || exited)

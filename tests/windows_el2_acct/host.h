@@ -19,6 +19,10 @@ typedef uint32_t u32;
 
 #define MAX_CPUS 10
 #define T8142 0x8142
+#define T8152 0x8152
+#define HV_SCANOUT_FAST_ROWS 32u
+#define HV_FATAL_TRAP_FIQ 1
+#define HV_FATAL_TRAP_FIQ_FAST 2
 #define ENABLE_NATIVE_AIC_PASSTHROUGH 1
 #define ALIGNED(x) __attribute__((aligned(x)))
 #define BIT(x) (1UL << (x))
@@ -164,6 +168,16 @@ static bool hv_native_aic_mu_timer_active(void) { return false; }
 static void hv_set_spsr(u64 v) { (void)v; }
 static void hv_set_elr(u64 v) { (void)v; }
 static void hv_windows_mtp_poll(void) {}
+static void hv_input_idle_poll(void) {}
+static bool hv_scanout_work(u32 rows) { (void)rows; return false; }
+static bool hv_scanout_work_idle(void) { return false; }
+static void hv_guest_diag_note_fiq(void) {}
+static int hv_tick_owner(void) { return boot_cpu_idx; }
+static void hv_fatal_note_trap(int kind, u64 esr, u64 elr, u64 spsr, u64 far)
+{
+    (void)kind; (void)esr; (void)elr; (void)spsr; (void)far;
+}
+static bool hv_fast_ipi(void) { return cpu_features->fast_ipi; }
 static void hv_fb_convert_slice(unsigned lines) { clock_now[cpu] += lines * cost_fb_line; fb_lines_converted += lines; }
 /* Pacing is exercised by tests/windows_fb_path; here every idle step is due. */
 static bool hv_fb_idle_due(void) { return true; }

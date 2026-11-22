@@ -379,11 +379,13 @@ void hv_report_t8142_el2_acct(void)
     u64 freq = mrs(CNTFRQ_EL0);
     u64 now = hv_host_counter();
 
-    if (chip_id != T8142 || !freq)
+    if ((chip_id != T8142 && chip_id != T8152) || !freq)
         return;
-    /* Housekeeping is 1 Hz on T8142; never let a faster caller flood the console. */
+    /* Housekeeping is 1 Hz on T8142 (5 kHz on T8152); never let a faster caller flood the console. */
     bool baseline = !have_baseline;
     if (!baseline && now - last_report < freq / 2)
+        return;
+    if (!baseline && chip_id == T8152 && now - last_report < freq)
         return;
     u64 window = now - last_report;
     last_report = now;
@@ -2888,6 +2890,8 @@ static bool hv_handle_t8152_gic_cpuif(u64 reg, bool is_read, u64 rt, u64 regs[32
     bool icc = key == GICV3_ICC_PMR || (crn == 12 && crm >= 8 && crm <= 12);
     if (op0 != 3 || op1 != 0 || !icc || cpu >= MAX_CPUS)
         return false;
+
+    hv_el2_cause(HV_EL2_IRQ);
 
     /*
      * Not owned yet: the Mu phase (ICH_HCR_EL2 0, HCR_EL2.IMO clear, FMO set).
@@ -7488,10 +7492,10 @@ static bool hv_handle_wfx(struct exc_info *ctx)
          * more than an order of magnitude.
          */
         if (chip_id == T8152) {
-            /* G6-S: a flip in flight first (one band), else the shadow sweep (which stands
-             * down while flips own the panel). */
-            if (!hv_scanout_work(HV_SCANOUT_IDLE_ROWS))
-                hv_fb_convert_slice(HV_FB_SLICE_IDLE);
+            /* G6-S: a flip in flight first (interrupt-aware bands), else the shadow sweep (which
+             * stands down while flips own the panel and also stops on a pending interrupt). */
+            if (!hv_scanout_work_idle())
+                hv_fb_convert_idle();
         } else {
             hv_fb_convert_idle();
         }

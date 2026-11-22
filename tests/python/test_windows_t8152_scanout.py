@@ -91,6 +91,7 @@ extern u64 stub_cntpct, stub_cntfrq, stub_cntvoff;
 #define stub_mrs_CNTPCT_EL0 stub_cntpct
 #define stub_mrs_CNTFRQ_EL0 stub_cntfrq
 #define stub_mrs_CNTVOFF_EL2 stub_cntvoff
+#define stub_mrs_ISR_EL1 0UL
 #define mrs(reg) (stub_mrs_##reg)
 typedef struct { int held; } spinlock_t;
 #define DECLARE_SPINLOCK(name) spinlock_t name = {0}
@@ -228,9 +229,9 @@ def test_wiring():
     exc = source("hv_exc.c")
     live = function_body(exc, "static bool hv_t8152_vspi_live(u32 intid)")
     assert "hv_scanout_enabled() ? VDEV_SPI_DEV_SCANOUT : 0" in live
-    # T8152's idle path (T8142 keeps j813-windows' hv_fb_convert_idle()).
-    assert re.search(r"if \(chip_id == T8152\) \{\n(?:\s*/?\*.*\n)*\s*if \(!hv_scanout_work\("
-                     r"HV_SCANOUT_IDLE_ROWS\)\)\n\s*hv_fb_convert_slice\(HV_FB_SLICE_IDLE\);", exc)
+    # T8152's idle path uses interrupt-aware scanout bands, falling back to hv_fb_convert_idle().
+    assert re.search(r"if \(chip_id == T8152\) \{\n(?:\s*/?\*.*\n)*\s*if \(!hv_scanout_work_idle\(\)"
+                     r"\)\n\s*hv_fb_convert_idle\(\);", exc)
     fiq = function_body(exc, "void hv_exc_fiq(struct exc_info *ctx)")
     fast = fiq[:fiq.index("// Slow (single threaded) path")]
     assert fast.index("hv_update_fiq(ctx);") < fast.index("hv_scanout_work(HV_SCANOUT_FAST_ROWS);") \
