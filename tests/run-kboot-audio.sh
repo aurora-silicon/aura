@@ -37,7 +37,7 @@ RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-1.89.0} rustc --edition 2021 --crate-type s
 
 # The code under test and its headers next to the host stand-ins, so that their #include "types.h"
 # and "utils.h" find them
-cp src/kboot_audio.c src/kboot_audio.h src/adt.h tests/kboot_audio_host/*.h tests/kboot_audio_host.c "$tmp/src/"
+cp src/kboot_audio.c src/kboot_audio.h src/adt.h src/adt_gpio.c src/adt_gpio.h tests/kboot_audio_host/*.h tests/kboot_audio_host.c "$tmp/src/"
 ${CC:-cc} -std=gnu11 -D_GNU_SOURCE -O1 -g -Wall -Wextra -Wno-unused-parameter -Wno-sign-compare \
     -fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=undefined \
     -I"$tmp/src" -I"$root/src" -I"$root" \
