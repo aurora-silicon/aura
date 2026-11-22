@@ -370,11 +370,57 @@ def test_contract_constants_agree():
     proxy_h = (REPO / "src/proxy.h").read_text()
     proxy_py = (REPO / "proxyclient/aura/proxy.py").read_text()
     assert "P_HV_WINDOWS_INPUT = 0xc89," in proxy_h and "P_HV_WINDOWS_INPUT = 0xc89" in proxy_py
-    assert "0xc88" not in re.sub(r"/\*.*?\*/", "", proxy_h, flags=re.S)  # the GPU branch's
-    assert "HV_WINDOWS_CAPS2_USB |\n                            HV_WINDOWS_CAPS2_INPUT" in proxy_c
+    assert "P_HV_WINDOWS_GPU = 0xc88," in proxy_h  # G0's op, merged in j804-windows-next
+    assert "HV_WINDOWS_CAPS2_USB |\n                            HV_WINDOWS_CAPS2_GPU | " \
+        "HV_WINDOWS_CAPS2_INPUT" in proxy_c
     assert "hv_input_proxy(request->args[0], request->args[1], request->args[2]," in proxy_c
     # CAPS keeps its ABI 1 value.
     assert "reply->retval = 0x4157494e0001ffdfULL;" in proxy_c
+
+
+def test_merged_feature_numbers_are_distinct():
+    # j804-windows-next carries D1, D4, G0 and I0 together: proxy ops, CAPS2 bits, configure
+    # flags, FD markers, emulated SPIs and the launcher's CAPS2/config constants must not clash.
+    proxy_h = re.sub(r"/\*.*?\*/", "", (REPO / "src/proxy.h").read_text(), flags=re.S)
+    ops = re.findall(r"(P_HV_WINDOWS_\w+) = (0x[0-9a-f]+),", proxy_h)
+    values = [int(v, 16) for _, v in ops]
+    assert len(values) == len(set(values))
+    assert dict(ops)["P_HV_WINDOWS_GPU"] == "0xc88" and dict(ops)["P_HV_WINDOWS_INPUT"] == "0xc89"
+    py = (REPO / "proxyclient/aura/proxy.py").read_text()
+    assert "P_HV_WINDOWS_GPU = 0xc88" in py and "P_HV_WINDOWS_INPUT = 0xc89" in py
+    caps2 = {}
+    for name in ("ahci", "usb", "gpu", "input"):
+        hdr = (WIN / f"hv_{name}.h").read_text()
+        caps2[name] = int(re.search(r"#define HV_WINDOWS_CAPS2_%s\s+BIT\((\d+)\)" % name.upper(),
+                                    hdr).group(1))
+    assert caps2 == {"ahci": 0, "usb": 1, "gpu": 2, "input": 3}
+    assert (w.CAPS2_AHCI, w.CAPS2_USB, w.CAPS2_GPU, w.CAPS2_INPUT) == (1, 2, 4, 8)
+    proxy_c = (REPO / "src/proxy.c").read_text()
+    for name in caps2:
+        assert f"HV_WINDOWS_CAPS2_{name.upper()}" in proxy_c
+    hv_h = (WIN / "hv.h").read_text()
+    flags = dict(re.findall(r"#define (HV_WINDOWS_T8152_\w+) BIT\((\d+)\)", hv_h))
+    assert len(set(flags.values())) == len(flags)
+    assert (flags["HV_WINDOWS_T8152_AHCI"], flags["HV_WINDOWS_T8152_USB"],
+            flags["HV_WINDOWS_T8152_INPUT"]) == ("8", "9", "10")
+    assert (w.CONFIG_T8152_AHCI, w.CONFIG_T8152_USB, w.CONFIG_T8152_INPUT) == \
+        (0x100, 0x200, 0x400)
+    # FD markers: AHCI 0x110, USB 0x120 (two 16-byte slots), input 0x140; G0 has none (Mu's GPU0
+    # comes from the handoff page the 16-byte /chosen property points at).
+    markers = [(w.AHCI_FD_MARKER_OFFSET, w.AHCI_FD_MARKER), *w.USB_FD_MARKER.values(),
+               (w.INPUT_FD_MARKER_OFFSET, w.INPUT_FD_MARKER)]
+    assert markers == [(0x110, b"J804AHC1"), (0x120, b"J804USB1"), (0x130, b"J804USB3"),
+                       (0x140, b"J804INP1")]
+    spans = sorted((off, off + 16) for off, _ in markers)
+    assert all(a[1] <= b[0] for a, b in zip(spans, spans[1:]))
+    # Emulated SPIs 990/991 and the USB aliases 995/997 sit in the carrier block that the G0
+    # alias slots refuse; the four /chosen handshakes have distinct names.
+    assert len({990, w.INPUT_GSIV, *w.USB_GSIV.values()}) == 4
+    alias = (WIN / "hv_aic_alias.c").read_text()
+    assert "#define T8152_CARRIER_SPI_LO 980" in alias and \
+        "#define T8152_CARRIER_SPI_HI 1000" in alias
+    assert len({w.USB_HANDSHAKE_PROPERTY, w.GPU_HANDSHAKE_PROPERTY,
+                w.INPUT_HANDSHAKE_PROPERTY}) == 3
 
 
 def test_vspi_is_gated_per_device():
@@ -645,11 +691,12 @@ def test_run_guest_input_order_and_refusals():
         t8152.index("hv.init()")
     assert t8152.index('hv.windows_input = "+".join(input_sources) if input_sources else "off"') \
         < t8152.index("hv.init()")
+    # G5b order: input ATTACH (the MTP bring-up, which can refuse) before the GPU's ADMIT/POWER.
     assert t8152.index("windows_t8152_usb_attach(hv, usb_ports, ahci)") < \
-        t8152.index("windows_t8152_input_attach(hv, input_sources)") < \
-        t8152.index("windows_t8152_gpu_admit(hv, gpu_mode, usb_ports, ahci)") < \
-        t8152.index("windows_t8152_input_attach(hv, input_sources, usb_ports, input_mtp)") < \
-        t8152.index("windows_t8152_input_attach(hv, input_sources, usb_ports, gpu_mode)") < \
+        t8152.index("windows_t8152_input_attach(hv, input_sources, usb_ports, input_mtp, "
+                    "gpu_mode)") < \
+        t8152.index("windows_t8152_gpu_admit(hv, gpu_mode, usb_ports, ahci, input_sources, "
+                    "input_mtp)") < \
         t8152.index("result = hv.start()") < \
         t8152.index("windows_t8152_input_status(input_sources)")
     plan = src[src.index("def windows_t8152_input_plan"):
@@ -663,9 +710,6 @@ def test_run_guest_input_order_and_refusals():
         attach.index("mask = w.input_attach_mask(sources, args.windows_input_fn_default)") < \
         attach.index("w.INPUT_OP_ATTACH, mask") < \
         attach.index("if result != 0:") < \
-        attach.index("hv.set_windows_input_handshake(w.input_handshake(sources, features))")
-    failed = attach[attach.index("except ValueError as exc:\n        p.hv_windows_input"):]
-    assert failed.index("w.INPUT_OP_DETACH") < failed.index("sys.exit(")
         attach.index("features = p.hv_windows_input(w.INPUT_OP_QUERY, w.INPUT_Q[\"features\"])") \
         < attach.index("hv.set_windows_input_handshake(w.input_handshake(sources, features))")
     # I1/I2: Q_SOURCES first, then the firmware and the page into the area, then ATTACH.

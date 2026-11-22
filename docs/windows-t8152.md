@@ -1049,7 +1049,6 @@ handshake `/chosen/aura,windows-input-v1`: 24 bytes `<QIIII>` = page base 0xF500
 0x4000, GSIV 991, feature mask (report bits 0-3, attached sources in bits 16-23; 0x1000F for
 host), version 1. STATUS is printed after the guest exits.
 
-### The Mu side (contract; not in Mu yet)
 With G0 in the same launch (`j804-windows-next`), the order is AHCI attach -> USB attach ->
 GPU ADMIT (and HOOK) -> input ATTACH -> `hv.start()`, and every input refusal detaches USB
 first, as the GPU refusals do (a failed input DETACH after a refused handshake does not skip

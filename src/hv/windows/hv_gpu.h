@@ -180,13 +180,6 @@ enum hv_gpu_err {
 /* P_HV_WINDOWS_GPU. */
 u64 hv_gpu_proxy(u64 op, u64 a1, u64 a2);
 
-/*
- * The EL2 fatal report's GPU part (guest SError attribution): the session state, the handoff
- * page and pool, how many admitted firmware ranges there are (registered identity exceptions,
- * never mapped in G0), and the logging hooks' hit count with the last access.  Recorded values
- * only, no locks, no MMIO.
- */
-void hv_gpu_fatal_report(void);
 /* Every exit path of a guest session (hv_start()); idempotent; never touches PSD or the ASCs. */
 void hv_gpu_teardown(const char *why);
 /* flush_and_reboot(): lock-free, forwarding off before the reset. */

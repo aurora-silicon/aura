@@ -587,12 +587,14 @@ def windows_t8152_gpu_plan(u):
     return mode
 
 
-def windows_t8152_gpu_admit(hv, mode, usb_ports=(), ahci=None):
-    """After USB, before hv.start(): the resident admits the GPU firmware and builds the
-    handoff page (and, for "log", hooks the sgx window).  Only then does the guest ADT get Mu's
-    /chosen/aura,windows-gpu-v1.  A refusal stops the launch: the session is used up.  USB was
-    attached first, so every refusal here detaches it again, as the USB and hv.start() failure
-    paths do: no xHCI passthrough or DART map of guest RAM outlives a launch with no guest."""
+def windows_t8152_gpu_admit(hv, mode, usb_ports=(), ahci=None, input_sources=(), mtp=None):
+    """After USB and input (G5b order), before hv.start(): the resident admits the GPU firmware
+    and builds the handoff page (and, for "log", hooks the sgx window).  Only then does the
+    guest ADT get Mu's /chosen/aura,windows-gpu-v1.  A refusal stops the launch: the session is
+    used up.  USB and input were attached first, so every refusal here detaches them again, as
+    the USB and hv.start() failure paths do: no xHCI passthrough or DART map of guest RAM
+    outlives a launch with no guest.  With the internal keyboard/trackpad the MTP keeps running
+    after the input DETACH: the only way out is then a reboot through the carrier (P_REBOOT)."""
     from aura import windows as w
     if mode == "off":
         return
@@ -603,6 +605,15 @@ def windows_t8152_gpu_admit(hv, mode, usb_ports=(), ahci=None):
                 p.hv_windows_gpu(w.GPU_OP_STOP)   # idempotent; never touches the GPU itself
             except ProxyRemoteError:
                 pass
+        if input_sources:
+            try:
+                p.hv_windows_input(w.INPUT_OP_DETACH)
+            except ProxyRemoteError:
+                pass
+            message += " Input was detached again."
+            if mtp:
+                message += (" The MTP stays running and DMAing into its area: leave only by a "
+                            "reboot through the carrier (P_REBOOT).")
         if usb_ports:
             try:
                 p.hv_windows_usb(w.USB_OP_DETACH)
@@ -794,9 +805,6 @@ def windows_t8152_input_plan(payload, u):
     return sources
 
 
-def windows_t8152_input_attach(hv, sources):
-    """After USB, before hv.start(): QUERY the contract, ATTACH, then (only then) write Mu's
-    /chosen/aura,windows-input-v1.  A refusal stops the launch."""
 def windows_t8152_scanout_plan(payload, u):
     """G6-S: check --windows-scanout against the chip, the board, the resident and the FD
     (both directions) before anything is uploaded.  Returns the refresh in mHz (0 when off)."""
@@ -875,15 +883,15 @@ def windows_t8152_input_area(top):
     return new_top, mtp
 
 
-def windows_t8152_input_attach(hv, sources, usb_ports=(), mtp=None):
-def windows_t8152_input_attach(hv, sources, usb_ports=(), gpu_mode="off"):
+def windows_t8152_input_attach(hv, sources, usb_ports=(), mtp=None, gpu_mode="off"):
     """After USB (and G0), before hv.start(): QUERY the contract, ATTACH, then (only then)
     write Mu's /chosen/aura,windows-input-v1.  A refusal stops the launch.  USB was attached
     first, so every refusal here detaches it again, as the GPU and hv.start() failure paths
     do: no xHCI passthrough or DART map of guest RAM outlives a launch with no guest.  With
     the internal keyboard/trackpad, the parameter page and the firmware go into the area first
-    and ATTACH brings the MTP up (seconds, no link timeout)."""
-    --windows-gpu probe the GPU forwarding is already on, so a refusal also runs GPU STOP."""
+    and ATTACH brings the MTP up (seconds, no link timeout).  G5b order: input attaches
+    BEFORE the GPU is admitted or powered, so an input refusal never spends the boot's GPU
+    firmware session; the GPU STOP in the refusal is then a no-op (kept for any other order)."""
     from aura import windows as w
     if not sources:
         return
@@ -906,13 +914,6 @@ def windows_t8152_input_attach(hv, sources, usb_ports=(), gpu_mode="off"):
         features = w.validate_input_contract(
             lambda name: p.hv_windows_input(w.INPUT_OP_QUERY, w.INPUT_Q[name]))
     except (ValueError, ProxyRemoteError) as exc:
-        sys.exit(f"T8152: the resident's input device is not this launcher's contract: {exc}. "
-                 "No guest was started; the carrier session is used up: reload the carrier.")
-    result = p.hv_windows_input(w.INPUT_OP_ATTACH, w.input_source_mask(sources))
-    if result != 0:
-        sys.exit(f"T8152: the resident refused the input device: "
-                 f"{w.describe_input_attach(result)} (its console says why). The carrier "
-                 "session is used up: reload the carrier. No guest was started.")
         refuse(f"T8152: the resident's input device is not this launcher's contract: {exc}. "
                "No guest was started; the carrier session is used up: reload the carrier.")
     mask = w.input_attach_mask(sources, args.windows_input_fn_default)
@@ -958,9 +959,6 @@ def windows_t8152_input_attach(hv, sources, usb_ports=(), gpu_mode="off"):
     try:
         hv.set_windows_input_handshake(w.input_handshake(sources, features))
     except ValueError as exc:
-        p.hv_windows_input(w.INPUT_OP_DETACH)
-        sys.exit(f"T8152: input attached but the Mu handshake was refused: {exc}. The resident "
-                 "now refuses guest entry; reload the carrier. No guest was started.")
         # Best effort: a failed DETACH must not skip the USB detach below.
         try:
             p.hv_windows_input(w.INPUT_OP_DETACH)
@@ -1239,9 +1237,6 @@ def run_windows_t8152(caps):
         windows_t8152_ahci_nvme_attach(hv, u, ahci)
     elif ahci:
         windows_t8152_ahci_attach(hv, u, ahci)
-    windows_t8152_usb_attach(hv, usb_ports, ahci)
-    windows_t8152_gpu_admit(hv, gpu_mode, usb_ports, ahci)
-    windows_t8152_input_attach(hv, input_sources)
     try:
         if scanout_mhz:
             # G6-S first: it only hooks a page, so its refusal leaves nothing else attached
@@ -1253,9 +1248,13 @@ def run_windows_t8152(caps):
                          "reload the carrier.")
             print(f"T8152 scanout: attached; /chosen/aura,windows-scanout-v1 written")
         windows_t8152_usb_attach(hv, usb_ports, ahci)
-        windows_t8152_gpu_admit(hv, gpu_mode, usb_ports, ahci)
-        windows_t8152_input_attach(hv, input_sources, usb_ports, input_mtp)
+        # G5b order: input ATTACH (the MTP bring-up, which can refuse) comes before the GPU's
+        # ADMIT/POWER, so an input refusal never spends this boot's GPU firmware session.  The
+        # GPU refusals below detach input again (the MTP keeps running: leave by P_REBOOT).
+        windows_t8152_input_attach(hv, input_sources, usb_ports, input_mtp, gpu_mode)
         probe_only = windows_t8152_input_probe(input_sources)
+        if not probe_only:
+            windows_t8152_gpu_admit(hv, gpu_mode, usb_ports, ahci, input_sources, input_mtp)
     except BaseException:
         if nvme:
             # D5: the NVMe disk is attached; never leave it owning the controller.
@@ -1274,7 +1273,6 @@ def run_windows_t8152(caps):
                  f"{'The NVMe disk did NOT close CLEAN: do not hard-reset. ' if not clean else ''}"
                  "The MTP stays running and DMAing into its area: leave only by a reboot through "
                  "the carrier (P_REBOOT).")
-    windows_t8152_input_attach(hv, input_sources, usb_ports, gpu_mode)
     try:
         result = hv.start()
     except (ProxyRemoteError, WindowsGuestAborted, WindowsGuestExitTimeout) as exc:
@@ -1286,6 +1284,15 @@ def run_windows_t8152(caps):
         if stuck:
             print(f"\x1b[31mT8152: {exc}. The carrier may still be inside the guest exit; "
                   "USB and input are left as they are.\x1b[0m")
+        elif isinstance(exc, WindowsGuestAborted):
+            # Ctrl-C (or a guest exception forwarded to Python): the resident left the guest
+            # through hv_start()'s normal exit, which already ran the USB and GPU teardown, and
+            # the proxy keeps running.  Read the device counters and the G1 access map before
+            # anything is detached: with the GPU powered Ctrl-C is the normal way out.
+            print(f"Guest stopped from the host: {exc}")
+            windows_t8152_usb_status(usb_ports)
+            windows_t8152_gpu_status(gpu_mode)
+            windows_t8152_input_status(input_sources)
         if usb_ports and not stuck:
             # hv_start() tears USB down on every exit itself; DETACH is idempotent.
             try:
@@ -1313,18 +1320,6 @@ def run_windows_t8152(caps):
                  "its console says why. USB and input (if any) were detached; a GPU "
                  "admission has no release and lasts until the carrier is reloaded.")
     print(f"Guest exit status: {result} (1 SYSTEM_OFF, 2 SYSTEM_RESET)")
-                 "its console says why.")
-    except RuntimeError as exc:
-        if hv.windows_abort_reason is None:
-            raise
-        # Ctrl-C (or a guest exception forwarded to Python): the resident left the guest
-        # through hv_start()'s normal exit, which already ran the USB and GPU teardown, and the
-        # proxy keeps running.  Read the device counters and the G1 access map anyway: on the
-        # M6 probe build Ctrl-C is the only way out.
-        print(f"Guest stopped from the host: {exc}")
-        result = None
-    else:
-        print(f"Guest exit status: {result} (1 SYSTEM_OFF, 2 SYSTEM_RESET)")
     windows_t8152_usb_status(usb_ports)
     windows_t8152_gpu_status(gpu_mode)
     windows_t8152_input_status(input_sources)
