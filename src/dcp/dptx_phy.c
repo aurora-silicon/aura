@@ -764,11 +764,25 @@ int dptx_phy_set_route(dptx_phy_t *phy, bool enable)
     return atc_phy_set_route(phy->atc, enable);
 }
 
-/* Highest link rate in MHz: the HDMI phy has PLL configurations up to HBR3
- * (macOS trains the PS190 at HBR3); everything else is qualified at HBR. */
+/*
+ * Highest link rate in MHz. The T8152 HDMI phy has PLL configurations up to HBR3 (macOS trains the
+ * PS190 at HBR3). The T8112 dptx-phy runs the one setup dptx_phy_set_link_rate() replays from a
+ * macOS trace, which trains at HBR2 (macOS trains the M2 Mac mini's HDMI converter at HBR2; HBR
+ * fails clock recovery on every lane). Everything else is qualified at HBR.
+ */
 u32 dptx_phy_max_link_rate(dptx_phy_t *phy)
 {
-    return phy && phy->type == DPTX_PHY_T8152_HDMI ? 8100 : 2700;
+    if (phy && phy->type == DPTX_PHY_T8152_HDMI)
+        return 8100;
+    if (phy && phy->type == DPTX_PHY_T8112)
+        return 5400;
+    return 2700;
+}
+
+/* Whether the phy runs at its highest rate only (every phy without its own PLL configurations). */
+bool dptx_phy_single_rate(dptx_phy_t *phy)
+{
+    return !phy || phy->type != DPTX_PHY_T8152_HDMI;
 }
 
 u32 dptx_phy_dcp_output(dptx_phy_t *phy)
