@@ -55,10 +55,23 @@ struct hv_aic_alias {
  * published number that is also a real line would deliver some other device's
  * interrupts under this INTID.
  */
+/*
+ * gfx-mbox (0x582608000, primary G17G GPU ASC) and gfx1-mbox (0x582e08000,
+ * secondary G17G GPU ASC) carry recv-not-empty level-high lines 1126 and 1130
+ * in t8142-j813-gpu.dtsi, both above the Windows 1020 GSIV arbiter ceiling.
+ * 998 and 999 are free in the unused 990..999 block (same ADT walk as 995-997).
+ *
+ * dcp-mbox (0x286e08000) carries recv-not-empty level-high line 779 in
+ * t8142-j813-display.dtsi, already below 1020; an identity entry grants
+ * ownership in hv_aic_alias_is_owned() without consuming an extra alias slot.
+ */
 static const struct hv_aic_alias hv_aic_aliases_t8142[] = {
     {995, 1277}, /* dockchannel-mtp: keyboard + trackpad */
     {996, 1155}, /* ans: internal NVMe storage */
     {997, 1511}, /* usb-drd0: left Type-C port, xHCI host */
+    {998, 1126}, /* gfx-mbox: primary G17G GPU ASC recv-not-empty */
+    {999, 1130}, /* gfx1-mbox: secondary G17G GPU ASC recv-not-empty */
+    {779, 779},  /* dcp-mbox: display coprocessor ASC recv-not-empty */
 };
 
 static const struct hv_aic_alias *hv_aic_alias_table(u32 *count)
