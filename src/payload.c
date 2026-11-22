@@ -158,13 +158,23 @@ static void *decompress_xz(void *p, size_t size)
 
 static void *load_fdt(void *p, size_t size)
 {
+    /*
+     * The tree comes from the payload. libfdt's read and open functions only probe the magic and
+     * version and leave the block offsets and sizes to fdt_check_header(); where the payload
+     * gives the tree's size, the header must agree with it too. A tree that fails ends the
+     * payload: nothing says where whatever follows it starts.
+     */
+    if (fdt_check_header(p) || (size && size != fdt_totalsize(p))) {
+        printf("Ignoring an invalid devicetree at %p\n", p);
+        return NULL;
+    }
+
     int rank = payload_profile_rank(p, firmware_os_components() == V26_6_2);
     if (rank && rank >= fdt_rank && fdt_node_check_compatible(p, 0, expect_compatible) == 0) {
         printf("Found a devicetree for %s at %p\n", expect_compatible, p);
         fdt = p;
         fdt_rank = rank;
     }
-    assert(!size || size == fdt_totalsize(p));
     return ((u8 *)p) + fdt_totalsize(p);
 }
 
