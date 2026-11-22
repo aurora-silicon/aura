@@ -17,12 +17,13 @@ sys.path.insert(0, str(REPO / "proxyclient"))
 
 from aura import windows  # noqa: E402
 
-CAPS_OLD = 0x4157494E000107FF  # every capability before the T8152 policy bit
-CAPS_T8152_V1 = CAPS_OLD | windows.T8152_POLICY  # 6bdac9ee: no 12-live-CPU refusal
-CAPS_T8152_V2 = CAPS_T8152_V1 | windows.T8152_LIVE_CPUS  # cd5b10f1: no guest-WFE trap
-CAPS_T8152_V3 = CAPS_T8152_V2 | windows.T8152_WFE_PLACEMENT  # 618d6d40: Apple ACTLR alias
-CAPS_T8152_V4 = CAPS_T8152_V3 | windows.T8152_ACTLR_ARCH  # 32555bf9: hardware GIC cpuif
-CAPS_T8152 = CAPS_T8152_V4 | windows.T8152_GIC_TRAPALL
+CAPS_OLD = 0x4157494E00017FFF  # base Windows ABI 1 capabilities (T8152 rules live in CAPS2)
+CAPS2_OLD = windows.CAPS2_MAGIC  # no T8152 rule bits
+CAPS2_T8152_V1 = CAPS2_OLD | windows.T8152_POLICY  # 6bdac9ee: no 12-live-CPU refusal
+CAPS2_T8152_V2 = CAPS2_T8152_V1 | windows.T8152_LIVE_CPUS  # cd5b10f1: no guest-WFE trap
+CAPS2_T8152_V3 = CAPS2_T8152_V2 | windows.T8152_WFE_PLACEMENT  # 618d6d40: Apple ACTLR alias
+CAPS2_T8152_V4 = CAPS2_T8152_V3 | windows.T8152_ACTLR_ARCH  # 32555bf9: hardware GIC cpuif
+CAPS2_T8152 = CAPS2_T8152_V4 | windows.T8152_GIC_TRAPALL
 GIB = 1 << 30
 
 
@@ -99,32 +100,33 @@ def test_t8152_fields_are_t8152_only(tmp_path):
 
 def test_older_resident_never_runs_a_t8152_guest():
     with pytest.raises(ValueError, match="T8152 stage-2 policy"):
-        windows.validate_capabilities(CAPS_OLD, "bgra-shadow", t8152=True)
+        windows.validate_capabilities(CAPS_OLD, "bgra-shadow", t8152=True, caps2=CAPS2_OLD)
     with pytest.raises(ValueError, match="T8152 stage-2 policy"):
-        windows.validate_capabilities(CAPS_OLD, ipi="fast")
+        windows.validate_capabilities(CAPS_OLD, ipi="fast", caps2=CAPS2_OLD)
     with pytest.raises(ValueError, match="T8152 stage-2 policy"):
-        windows.validate_capabilities(CAPS_OLD, gic_cpuif="software")
-    assert windows.validate_capabilities(CAPS_T8152, "bgra-shadow", t8152=True, ipi="fast") & \
-        windows.T8152_POLICY
+        windows.validate_capabilities(CAPS_OLD, gic_cpuif="software", caps2=CAPS2_OLD)
+    assert windows.validate_capabilities(CAPS_OLD, "bgra-shadow", t8152=True, ipi="fast",
+                                         caps2=CAPS2_T8152) == 0x7FFF
     # A T8152-policy resident without the 12-live-CPU refusal (6bdac9ee) is refused too.
     with pytest.raises(ValueError, match="12-live-CPU refusal"):
-        windows.validate_capabilities(CAPS_T8152_V1, "bgra-shadow", t8152=True)
+        windows.validate_capabilities(CAPS_OLD, "bgra-shadow", t8152=True, caps2=CAPS2_T8152_V1)
     # Nor one without the guest-WFE trap and the code placement rule (cd5b10f1).
     with pytest.raises(ValueError, match="guest-WFE trap and code placement"):
-        windows.validate_capabilities(CAPS_T8152_V2, "bgra-shadow", t8152=True)
+        windows.validate_capabilities(CAPS_OLD, "bgra-shadow", t8152=True, caps2=CAPS2_T8152_V2)
     # Nor one that still writes the implementation-defined ACTLR alias (618d6d40).
     with pytest.raises(ValueError, match="architectural ACTLR_EL12"):
-        windows.validate_capabilities(CAPS_T8152_V3, "bgra-shadow", t8152=True)
+        windows.validate_capabilities(CAPS_OLD, "bgra-shadow", t8152=True, caps2=CAPS2_T8152_V3)
     # Nor one without the trapped software GIC CPU interface (32555bf9 and older).
     with pytest.raises(ValueError, match="trapped software GIC CPU interface"):
-        windows.validate_capabilities(CAPS_T8152_V4, "bgra-shadow", t8152=True)
+        windows.validate_capabilities(CAPS_OLD, "bgra-shadow", t8152=True, caps2=CAPS2_T8152_V4)
     with pytest.raises(ValueError, match="trapped software GIC CPU interface"):
-        windows.validate_capabilities(CAPS_T8152_V4, gic_cpuif="software")
+        windows.validate_capabilities(CAPS_OLD, gic_cpuif="software", caps2=CAPS2_T8152_V4)
     # A T8152 launch never takes the hardware CPU interface path, whatever the resident.
     with pytest.raises(ValueError, match="GIC_CPUIF_UNDEF"):
-        windows.validate_capabilities(CAPS_T8152, "bgra-shadow", t8152=True, gic_cpuif="carrier")
-    assert windows.validate_capabilities(CAPS_T8152, "bgra-shadow", t8152=True,
-                                         gic_cpuif="software") & windows.T8152_GIC_TRAPALL
+        windows.validate_capabilities(CAPS_OLD, "bgra-shadow", t8152=True, gic_cpuif="carrier",
+                                      caps2=CAPS2_T8152)
+    assert windows.validate_capabilities(CAPS_OLD, "bgra-shadow", t8152=True,
+                                         gic_cpuif="software", caps2=CAPS2_T8152) == 0x7FFF
     # Not a T8152 launch: the older resident stays valid.
     windows.validate_capabilities(CAPS_OLD, "bgra-shadow")
 
@@ -222,11 +224,10 @@ def test_c_and_python_agree_on_abi():
     proxy_c = (REPO / "src/proxy.c").read_text()
     proxy_h = (REPO / "src/proxy.h").read_text()
     hv_h = (REPO / "src/hv/windows/hv.h").read_text()
-    # This branch builds no N1 producer: the resident clears N1_HANDOFF (bit 5).
-    assert "0x4157494e0001ffdfULL" in proxy_c
-    assert CAPS_T8152 & ~windows.N1_HANDOFF == 0x4157494E0001FFDF
+    assert "0x4157494e00017fffULL" in proxy_c
+    assert CAPS2_T8152 == windows.CAPS2_MAGIC | windows.T8152_RULES
     assert "P_HV_WINDOWS_GUEST_RAM = 0xc8c" in proxy_h
-    assert "HV_WINDOWS_T8152_FAST_IPI BIT(5)" in hv_h and windows.CONFIG_T8152_FAST_IPI == 1 << 5
-    assert "HV_WINDOWS_T8152_SOFT_GIC BIT(6)" in hv_h and windows.CONFIG_T8152_SOFT_GIC == 1 << 6
-    assert "HV_WINDOWS_T8152_WFI BIT(7)" in hv_h and windows.CONFIG_T8152_WFI == 1 << 7
+    assert "HV_WINDOWS_T8152_FAST_IPI BIT(16)" in hv_h and windows.CONFIG_T8152_FAST_IPI == 1 << 16
+    assert "HV_WINDOWS_T8152_SOFT_GIC BIT(17)" in hv_h and windows.CONFIG_T8152_SOFT_GIC == 1 << 17
+    assert "HV_WINDOWS_T8152_WFI BIT(18)" in hv_h and windows.CONFIG_T8152_WFI == 1 << 18
     assert "HV_WINDOWS_GUEST_COMPAT   BIT(0)" in hv_h and windows.CONFIG_GUEST_COMPAT == 1 << 0

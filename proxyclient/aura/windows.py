@@ -28,22 +28,31 @@ MTP_HANDOFF = 0x0400
 CPUFREQ_OWNERSHIP = 0x0800
 XFER = 0x2000  # HvXfer bulk channel: P_HV_MAP_XFER + HV_XFER events (src/hv/windows/hv_xfer.c)
 ECPU_BOOT_STATE = 0x4000  # P_HV_WINDOWS_ECPU_BOOT_STATE (docs/t8142-ecpu-stepup.md)
+# The T8152 carrier rules are P_HV_WINDOWS_CAPS2 bits 8-12 (they were CAPS bits 11-15, which
+# j813-windows uses for CPU frequency ownership, N1 acquire, HvXfer and the E boot state).
 # T8152 stage-2 allowlist policy, the guest RAM window op and the T8152 Fast IPI
 # opt-in. A resident without it must never run a J804 guest.
-T8152_POLICY = 0x0800
+CAPS2_T8152_POLICY = 0x0100
+T8152_POLICY = CAPS2_T8152_POLICY
 # The resident refuses a T8152 launch unless all 12 CPUs are live in its dispatch loop.
 # A resident without it must never run one.
-T8152_LIVE_CPUS = 0x1000
+CAPS2_T8152_LIVE_CPUS = 0x0200
+T8152_LIVE_CPUS = CAPS2_T8152_LIVE_CPUS
 # The resident traps and completes guest WFE on T8152 (HCR_EL2.TWE) and keeps its code below
 # the CTXR exec window and CTXR_D's last 32 MiB block. A resident without it must never run one.
-T8152_WFE_PLACEMENT = 0x2000
+CAPS2_T8152_WFE_PLACEMENT = 0x0400
+T8152_WFE_PLACEMENT = CAPS2_T8152_WFE_PLACEMENT
 # The resident reaches the guest's ACTLR_EL1 on T8152 only through the architectural ACTLR_EL12;
 # a resident without it writes the implementation-defined alias, which UNDEFs at EL2 there.
-T8152_ACTLR_ARCH = 0x4000
+CAPS2_T8152_ACTLR_ARCH = 0x0800
+T8152_ACTLR_ARCH = CAPS2_T8152_ACTLR_ARCH
 # The resident runs a T8152 guest OS with every ICC_* access trapped to EL2 (ICH_HCR_EL2
 # En|TC|TALL0|TALL1) and a software GICv3 CPU interface (Phase 3 measurement (f):
 # GIC_CPUIF_UNDEF in the hardware-interface configuration). Without it, never run one.
-T8152_GIC_TRAPALL = 0x8000
+CAPS2_T8152_GIC_TRAPALL = 0x1000
+T8152_GIC_TRAPALL = CAPS2_T8152_GIC_TRAPALL
+T8152_RULES = (T8152_POLICY | T8152_LIVE_CPUS | T8152_WFE_PLACEMENT | T8152_ACTLR_ARCH |
+               T8152_GIC_TRAPALL)
 T8152_CPUS = 12
 CONFIG_T8142_EXPERIMENTAL = 0x0001
 # The same resident bit on T8152: the absent-PMUv3 UNDEF recovery only (M3 run 1: bootmgr's
@@ -108,7 +117,9 @@ def number(value, label):
 def validate_capabilities(value, framebuffer="native", guest_compatibility="none", n1="disabled",
                           reserved_memory=False, serial="disabled", mtp="disabled", cpufreq="disabled",
                           xfer=False, ecpu_boot_state=0, t8152=False, ipi="poll",
-                          gic_cpuif=None):
+                          gic_cpuif=None, caps2=None):
+    """CAPS (P_HV_WINDOWS_CAPS) against the launch; a T8152 launch also needs CAPS2
+    (P_HV_WINDOWS_CAPS2) with the T8152 carrier rules (bits 8-12)."""
     require(isinstance(value, int) and value >> 32 == CAPS_MAGIC >> 32,
             "resident is not an explicit Windows Aura personality")
     require((value >> 16) & 0xffff == CAPS_ABI, "unsupported Windows Aura capability ABI")
@@ -145,15 +156,16 @@ def validate_capabilities(value, framebuffer="native", guest_compatibility="none
         require(gic_cpuif == "software", "T8152: gic_cpuif carrier is refused (measurement (f): "
                 "GIC_CPUIF_UNDEF); the software CPU interface is required")
     if t8152 or ipi != "poll" or gic_cpuif != "carrier":
-        require(value & T8152_POLICY, "resident lacks the T8152 stage-2 policy; "
+        rules = caps2 if isinstance(caps2, int) and caps2 >> 32 == CAPS2_MAGIC >> 32 else 0
+        require(rules & T8152_POLICY, "resident lacks the T8152 stage-2 policy; "
                 "never run a J804 guest on it")
-        require(value & T8152_LIVE_CPUS, "resident lacks the T8152 12-live-CPU refusal; "
+        require(rules & T8152_LIVE_CPUS, "resident lacks the T8152 12-live-CPU refusal; "
                 "never run a J804 guest on it")
-        require(value & T8152_WFE_PLACEMENT, "resident lacks the T8152 guest-WFE trap and code "
+        require(rules & T8152_WFE_PLACEMENT, "resident lacks the T8152 guest-WFE trap and code "
                 "placement rule; never run a J804 guest on it")
-        require(value & T8152_ACTLR_ARCH, "resident lacks the T8152 architectural ACTLR_EL12 "
+        require(rules & T8152_ACTLR_ARCH, "resident lacks the T8152 architectural ACTLR_EL12 "
                 "rule; never run a J804 guest on it")
-        require(value & T8152_GIC_TRAPALL, "resident lacks the T8152 trapped software GIC CPU "
+        require(rules & T8152_GIC_TRAPALL, "resident lacks the T8152 trapped software GIC CPU "
                 "interface; never run a J804 guest on it")
         require(value & CONFIGURATION, "resident lacks explicit Windows configuration")
     return value & 0xffff
@@ -2209,6 +2221,9 @@ class HardwareSession:
     def capabilities(self):
         return self.proxy.hv_windows_capabilities()
 
+    def capabilities2(self):
+        return self.proxy.hv_windows_capabilities2()
+
     def validate_serial_transport(self, plan):
         if plan.serial != "cdc":
             return None
@@ -2247,7 +2262,8 @@ class HardwareSession:
                               bool(plan.reserved_memory), plan.serial, plan.mtp, plan.cpufreq,
                               xfer=plan.xfer is not None, ecpu_boot_state=plan.ecpu_boot_state,
                               t8152=plan.chip_id == T8152_CHIP, ipi=getattr(plan, "ipi", "poll"),
-                              gic_cpuif=getattr(plan, "gic_cpuif", "carrier"))
+                              gic_cpuif=getattr(plan, "gic_cpuif", "carrier"),
+                              caps2=self.capabilities2() if plan.chip_id == T8152_CHIP else None)
         self.validate_serial_transport(plan)
         if plan.serial == "capture":
             from .windows_serial import WindowsSerialRecorder
@@ -2415,7 +2431,10 @@ def launch_profile(filename, device, output, session_factory=HardwareSession, gu
                                   ecpu_boot_state=plan.ecpu_boot_state,
                                   t8152=plan.chip_id == T8152_CHIP,
                                   ipi=getattr(plan, "ipi", "poll"),
-                                  gic_cpuif=getattr(plan, "gic_cpuif", "carrier"))
+                                  gic_cpuif=getattr(plan, "gic_cpuif", "carrier"),
+                                  caps2=(session.capabilities2()
+                                         if plan.chip_id == T8152_CHIP and
+                                         hasattr(session, "capabilities2") else None))
             identity = session.identity()
             require(identity["chip_id"] == plan.chip_id and identity["model"] == plan.model,
                     "target identity does not match the Windows profile")

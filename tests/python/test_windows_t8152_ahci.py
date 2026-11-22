@@ -333,13 +333,13 @@ def test_contract_constants_agree():
     assert (w.AHCI_DESC_SIZE, w.AHCI_STORE_ALIGN, w.AHCI_MIN_GUEST) == \
         (0x10000, 32 << 20, 4 << 30)
     assert w.CAPS2_MAGIC == 0x4157493200000000 and w.CAPS2_AHCI == 1
-    assert re.search(r"#define HV_WINDOWS_T8152_AHCI BIT\(8\)", source("hv.h"))
-    assert w.CONFIG_T8152_AHCI == 1 << 8
+    assert re.search(r"#define HV_WINDOWS_T8152_AHCI BIT\(19\)", source("hv.h"))
+    assert w.CONFIG_T8152_AHCI == 1 << 19
     # CAPS keeps its ABI 1 value; CAPS2 and the AHCI op are new opcodes on both sides.
     proxy_c = (REPO / "src/proxy.c").read_text()
     proxy_h = (REPO / "src/proxy.h").read_text()
     proxy_py = (REPO / "proxyclient/aura/proxy.py").read_text()
-    assert "reply->retval = 0x4157494e0001ffdfULL;" in proxy_c
+    assert "reply->retval = 0x4157494e00017fffULL;" in proxy_c
     assert "P_HV_WINDOWS_CAPS2 = 0xc8d," in proxy_h and "P_HV_WINDOWS_AHCI = 0xc8e," in proxy_h
     assert "P_HV_WINDOWS_CAPS2 = 0xc8d" in proxy_py and "P_HV_WINDOWS_AHCI = 0xc8e" in proxy_py
     assert "HV_WINDOWS_CAPS2_MAGIC | HV_WINDOWS_CAPS2_AHCI" in proxy_c

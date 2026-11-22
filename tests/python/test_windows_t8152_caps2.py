@@ -19,6 +19,8 @@ WIN = REPO / "src/hv/windows"
 G5B_CAPS2 = 0x415749320000007F
 # G6-S adds bit 7 (the scanout service): a G6 session gate pins this value instead.
 G6S_CAPS2 = G5B_CAPS2 | 1 << 7
+# On j813-windows the T8152 carrier rules moved from CAPS bits 11-15 to CAPS2 bits 8-12.
+J813_CAPS2 = G6S_CAPS2 | 0x1F00
 
 
 def _c_bits():
@@ -72,8 +74,8 @@ def test_windows_caps2_resident_value():
     value = 0x4157493200000000
     for n in names[1:]:
         value |= 1 << c[n][0]
-    assert value == G6S_CAPS2, hex(value)
+    assert value == J813_CAPS2, hex(value)
     from aura import windows as w
-    assert w.CAPS2_MAGIC | sum(1 << b for b in _py_bits().values()) == G6S_CAPS2
+    assert w.CAPS2_MAGIC | sum(1 << b for b in _py_bits().values()) == J813_CAPS2
     assert w.CAPS2_AHCI_NVME == 1 << 5 and w.CAPS2_GPU_G2 == 1 << 6
     assert w.CAPS2_SCANOUT == 1 << 7

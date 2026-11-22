@@ -30,6 +30,17 @@
 
 /* P_HV_WINDOWS_CAPS2: 'AWI2' in the top half, feature bits below. */
 #define HV_WINDOWS_CAPS2_MAGIC 0x4157493200000000ULL
+/*
+ * CAPS2 bits 8-12: the T8152 carrier rules a launcher must find before it runs a J804 guest.
+ * They were CAPS bits 11-15 before this branch was rebased on j813-windows, which uses CAPS bits
+ * 11-14 for CPU frequency ownership, N1 acquire, HvXfer and the E-cluster boot state; CAPS bits
+ * 16-31 are the ABI number, so CAPS has no free bit left for them.
+ */
+#define HV_WINDOWS_CAPS2_T8152_POLICY        BIT(8)  /* stage-2 policy, guest RAM op, Fast IPI */
+#define HV_WINDOWS_CAPS2_T8152_LIVE_CPUS     BIT(9)  /* refuses a launch without 12 live CPUs */
+#define HV_WINDOWS_CAPS2_T8152_WFE_PLACEMENT BIT(10) /* guest WFE trapped, code below CTXR */
+#define HV_WINDOWS_CAPS2_T8152_ACTLR_ARCH    BIT(11) /* ACTLR_EL12 only, never the Apple alias */
+#define HV_WINDOWS_CAPS2_T8152_GIC_TRAPALL   BIT(12) /* every ICC_* trapped, software cpuif */
 #define HV_WINDOWS_CAPS2_AHCI  BIT(0) /* AHCI RAM store v1 (this file) */
 /*
  * D5: the AHCI disk on an internal NVMe partition (hv_ahci_nvme.c), v1: ops 5-8, the backend

@@ -162,11 +162,12 @@ def test_tid3_space_answered_on_t8152():
 
 def test_capability_bit_15():
     proxy_c = (REPO / "src/proxy.c").read_text()
-    assert "reply->retval = 0x4157494e0001ffdfULL;" in proxy_c
+    assert "reply->retval = 0x4157494e00017fffULL;" in proxy_c
+    assert "HV_WINDOWS_CAPS2_T8152_GIC_TRAPALL" in proxy_c
     import sys
     sys.path.insert(0, str(REPO / "proxyclient"))
     from aura import windows
-    assert windows.T8152_GIC_TRAPALL == 0x8000 and 0x0001ffdf & windows.T8152_GIC_TRAPALL
+    assert windows.T8152_GIC_TRAPALL == 0x1000 and windows.T8152_RULES & windows.T8152_GIC_TRAPALL
 
 
 def test_model_built_into_the_windows_resident():

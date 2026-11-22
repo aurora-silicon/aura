@@ -181,15 +181,15 @@ def test_contract_constants_agree():
     assert re.search(r"#define HV_SCANOUT_INTID\s+992u", hdr)
     assert re.search(r"#define HV_VDEV_SPI_SCANOUT 992u", spi)
     assert re.search(r"#define HV_WINDOWS_CAPS2_SCANOUT BIT\(7\)", hdr)
-    assert re.search(r"#define HV_WINDOWS_T8152_SCANOUT BIT\(11\)", source("hv.h"))
+    assert re.search(r"#define HV_WINDOWS_T8152_SCANOUT BIT\(22\)", source("hv.h"))
     assert re.search(r"#define SCANOUT_ID_VALUE\s+0x4f53364du", model)
     assert struct.pack("<I", 0x4f53364d) == b"M6SO"
     assert (w.SCANOUT_BASE, w.SCANOUT_SIZE, w.SCANOUT_GSIV, w.CAPS2_SCANOUT,
-            w.CONFIG_T8152_SCANOUT) == (0xF60000000, 0x4000, 992, 1 << 7, 1 << 11)
+            w.CONFIG_T8152_SCANOUT) == (0xF60000000, 0x4000, 992, 1 << 7, 1 << 22)
     assert "P_HV_WINDOWS_SCANOUT = 0xc8b," in (REPO / "src/proxy.h").read_text()
     assert "P_HV_WINDOWS_SCANOUT = 0xc8b" in (REPO / "proxyclient/aura/proxy.py").read_text()
     proxy_c = (REPO / "src/proxy.c").read_text()
-    assert "HV_WINDOWS_CAPS2_GPU_G2 | HV_WINDOWS_CAPS2_SCANOUT;" in proxy_c
+    assert "HV_WINDOWS_CAPS2_GPU_G2 | HV_WINDOWS_CAPS2_SCANOUT |" in proxy_c
     assert "hv_scanout_proxy(request->args[0], request->args[1], request->args[2]," in proxy_c
     query = dict(re.findall(r"HV_SCANOUT_Q_(\w+) = (\d+),", hdr))
     assert {k.lower(): int(v) for k, v in query.items()} == w.SCANOUT_Q

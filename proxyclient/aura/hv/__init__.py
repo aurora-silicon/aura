@@ -1797,7 +1797,9 @@ class HV(Reloadable):
                                          xfer=self.windows_xfer,
                                          ecpu_boot_state=self.windows_ecpu_boot_state,
                                          t8152=self.windows_t8152, ipi=self.windows_ipi,
-                                         gic_cpuif=self.windows_gic_cpuif)
+                                         gic_cpuif=self.windows_gic_cpuif,
+                                         caps2=(self.p.hv_windows_capabilities2()
+                                                if self.windows_t8152 else None))
             if self.windows_t8152:
                 if self.windows_wfi != "poll":
                     raise ValueError("T8152: WFI does not preserve state (measurement (a): "

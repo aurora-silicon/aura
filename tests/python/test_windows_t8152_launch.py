@@ -30,9 +30,9 @@ AIC = (0x2a0000000, 0x100000)
 QSPI = 0x2b0000000
 VALID = 1
 CAPS = (windows.CAPS_MAGIC | 1 << 16 | windows.REQUIRED_CAPS | windows.CONFIGURATION |
-        windows.FRAMEBUFFER_SHADOW | windows.SERIAL_CDC_ISOLATED | windows.T8152_POLICY |
-        windows.T8152_LIVE_CPUS | windows.T8152_WFE_PLACEMENT | windows.T8152_ACTLR_ARCH |
-        windows.T8152_GIC_TRAPALL)
+        windows.FRAMEBUFFER_SHADOW | windows.SERIAL_CDC_ISOLATED)
+# The T8152 carrier rules are CAPS2 bits 8-12.
+CAPS2 = windows.CAPS2_MAGIC | windows.T8152_RULES
 
 
 def u64_pair(node, name, value):
@@ -101,19 +101,22 @@ def run(case="success"):
     class Proxy:
         def hv_windows_capabilities(self):
             trace.append("caps")
-            if case == "old-resident":
-                return CAPS & ~(windows.T8152_POLICY | windows.T8152_LIVE_CPUS |
-                                windows.T8152_WFE_PLACEMENT)
-            if case == "no-live-cpu-refusal":
-                return CAPS & ~(windows.T8152_LIVE_CPUS | windows.T8152_WFE_PLACEMENT)
-            if case == "no-wfe-trap":
-                return CAPS & ~(windows.T8152_WFE_PLACEMENT | windows.T8152_ACTLR_ARCH |
-                                windows.T8152_GIC_TRAPALL)
-            if case == "apple-actlr":
-                return CAPS & ~(windows.T8152_ACTLR_ARCH | windows.T8152_GIC_TRAPALL)
-            if case == "hardware-gic-cpuif":
-                return CAPS & ~windows.T8152_GIC_TRAPALL
             return CAPS
+
+        def hv_windows_capabilities2(self):
+            if case == "old-resident":
+                return CAPS2 & ~(windows.T8152_POLICY | windows.T8152_LIVE_CPUS |
+                                 windows.T8152_WFE_PLACEMENT)
+            if case == "no-live-cpu-refusal":
+                return CAPS2 & ~(windows.T8152_LIVE_CPUS | windows.T8152_WFE_PLACEMENT)
+            if case == "no-wfe-trap":
+                return CAPS2 & ~(windows.T8152_WFE_PLACEMENT | windows.T8152_ACTLR_ARCH |
+                                 windows.T8152_GIC_TRAPALL)
+            if case == "apple-actlr":
+                return CAPS2 & ~(windows.T8152_ACTLR_ARCH | windows.T8152_GIC_TRAPALL)
+            if case == "hardware-gic-cpuif":
+                return CAPS2 & ~windows.T8152_GIC_TRAPALL
+            return CAPS2
 
         def smp_is_alive(self, cpu):
             trace.append(("alive", cpu))

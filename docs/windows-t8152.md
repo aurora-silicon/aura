@@ -78,14 +78,14 @@ FWB is clear, stage 2 and the SMC trap are on, `framebuffer=bgra-shadow` is sele
   SIMD/FP registers are live in hardware) waits without WFE on T8152 under `WINDOWS=1`: it
   re-reads the lock instead. Aura's dispatch loop still uses WFE at EL2 (no guest state
   live there); a measurement of a sleeping WFE (no SEVL) is still wanted before any WFE with
-  guest state live. Capability bit 13 (0x2000) marks a resident with the WFE trap and the
+  guest state live. CAPS2 bit 10 (0x400) marks a resident with the WFE trap and the
   code-placement rule; the launcher requires it on T8152.
 - The guest's ACTLR_EL1 is saved, restored and emulated only through the architectural
   `ACTLR_EL12` (`hv_t8152_guest_actlr_*`; the M6 CPU parts set `actlr_el2`). Phase 3
   measurement (h) read the EL1 view there on E, P and M cores, and a write to the
   implementation-defined alias UNDEFs at EL2 on all of them, so the carrier never accesses
   that alias on T8152. A restore of the value the register already holds issues no write,
-  because an `ACTLR_EL12` write is not yet measured. Capability bit 14 (0x4000) marks such a
+  because an `ACTLR_EL12` write is not yet measured. CAPS2 bit 11 (0x800) marks such a
   resident; the launcher requires it on T8152.
 - Guest serial (the vUART hook on uart0's first page) goes only to the USB CDC vUART
   interface and, when enabled, the framed capture. On T8152 the emulation never writes the
@@ -135,7 +135,7 @@ FWB is clear, stage 2 and the SMC trap are on, `framebuffer=bgra-shadow` is sele
     delivered even if the guest disabled it (as on T8142).
   - The native AIC handoff (an AIC HAL extension's ready call) is ignored once the guest
     owns the GIC: J804 publishes no AIC CSRT.
-  - Capability bit 15 (0x8000) marks such a resident; the launcher requires it on T8152 and
+  - CAPS2 bit 12 (0x1000) marks such a resident; the launcher requires it on T8152 and
     refuses `gic_cpuif: carrier` there, and the resident's configure step refuses a T8152
     configuration without the software-interface bit.
 - Mu-phase timer: EL0/EL1 CNTP accesses trap (`CNTHCTL_EL2` = EL1PCTEN only, so
@@ -206,9 +206,9 @@ FWB is clear, stage 2 and the SMC trap are on, `framebuffer=bgra-shadow` is sele
   take no `reserved_memory`, N1 or MTP. Optional: `ipi` (`poll`/`fast`), `gic_cpuif`
   (`software` only, the default), `wfi` (`poll` only), `on_reset` (`stay`/`reboot`),
   `guest_compatibility` (`none`, the default, or `t8152-pmu-undef`).
-- A resident must report capability bits 0x0800 (T8152 policy), 0x1000 (12-live-CPU
-  refusal), 0x2000 (guest-WFE trap and code placement), 0x4000 (architectural
-  `ACTLR_EL12` only) and 0x8000 (trapped software GIC CPU interface) for any of this.
+- A resident must report CAPS2 bits 0x100 (T8152 policy), 0x200 (12-live-CPU
+  refusal), 0x400 (guest-WFE trap and code placement), 0x800 (architectural
+  `ACTLR_EL12` only) and 0x1000 (trapped software GIC CPU interface) for any of this.
 - Before `hv_init`, the launcher reads `P_SMP_IS_ALIVE` for cpu0-11 (read-only) and stops
   with the list of CPUs that are not live; the resident checks the same again.
 - The guest ADT drops `qspi`, `i2c*`, `aop*`, `admac*`, `*audio*` and every `nvram,nor`
@@ -278,12 +278,12 @@ denylist, so no later map and no leaf at entry (`hv_t8152_verify`) can reach it.
 `hv_start()` additionally refuses unless the store is READY and every leaf of the ABAR page
 is this hook (`hv_ahci_verify`).
 
-Resident ABI: `P_HV_WINDOWS_CAPS` is unchanged (0x4157494e0001ffdf, ABI 1).
+Resident ABI: `P_HV_WINDOWS_CAPS` is unchanged (0x4157494e00017fff, ABI 1).
 `P_HV_WINDOWS_CAPS2` (0xc8d) returns `'AWI2' << 32 | 1` (bit 0: AHCI RAM store v1).
 `P_HV_WINDOWS_AHCI` (0xc8e): op 0 QUERY (0 version, 1 ABAR, 2 ABAR size, 3 INTID, 4 CAP,
 5 minimum guest RAM, 6 store alignment, 7 descriptor size), 1 ATTACH(store_base, TOP,
 disk_bytes, flags: 1 keep, 2 accept unsealed (with keep), 4 overwrite (fresh only)),
-2 SEAL_UPLOAD(host CRC-32), 3 SEAL_EXIT, 4 STATUS. Configure flag BIT(8) (`CONFIG_T8152_AHCI`), only with the software GIC.
+2 SEAL_UPLOAD(host CRC-32), 3 SEAL_EXIT, 4 STATUS. Configure flag BIT(19) (`CONFIG_T8152_AHCI`), only with the software GIC.
 Descriptor states: EMPTY, LOADING (fresh, zeroed), READY (upload or kept store verified),
 RUNNING (written just before guest entry), SEALED (after a PSCI exit, with the disk CRC-32
 and generation + 1). `alive_cntpct` (+0x38) is the CNTPCT_EL0 at the last state change and,
@@ -616,7 +616,7 @@ CLEAN or FAILED); an SError the host does not answer with EXIT_GUEST or HANDLED 
 - `--windows-serror` and the D5 options (`--windows-ahci-backend nvme`,
   `--windows-ahci-partition`, `--windows-ahci-nvme-access`) are independent and combine.
 
-Capabilities are unchanged by the SError work: `P_HV_WINDOWS_CAPS` = `0x4157494e0001ffdf`
+Capabilities are unchanged by the SError work: `P_HV_WINDOWS_CAPS` = `0x4157494e00017fff`
 ('AWIN', ABI 1, bits 0-4 and 6-15; bit 5 clear), `P_HV_WINDOWS_CAPS2` = `0x415749320000002f`
 ('AWI2'; bit 0 D1 AHCI RAM store, 1 D4 USB, 2 G0 GPU, 3 I0 input, 5 D5 NVMe disk; bit 4
 reserved for GPU wave 2). The G5b merge (D5 + I1/I2 + tick CPU + G1/G2) reports
@@ -656,7 +656,7 @@ What the guest gets, and nothing more:
 - **Interrupt**: AIC 1692 (usb-drd1 `interrupts[0]`, level) published as **SPI 995**;
   usb-drd3 1834 as 997. The alias exists only while the port is attached
   (`hv_aic_alias_t8152_usb()`), so with USB off a guest enable of 995 cannot unmask 1692.
-  On launches with USB configured (BIT(9)), the T8152 IRQ path pends a hardware line only
+  On launches with USB configured (BIT(20)), the T8152 IRQ path pends a hardware line only
   through an owned alias (`hv_aic_alias_lookup_physical()`); any other line is masked,
   counted and logged once. Launches without USB keep the D3-validated path unchanged (the
   line is pended under `hv_aic_alias_to_published()`, its own number when not aliased). The
@@ -681,7 +681,7 @@ What the guest gets, and nothing more:
 
 ATTACH (`P_HV_WINDOWS_USB` 0xc87, op 1, port mask bit 1 = drd1, bit 3 = drd3) runs after the
 guest RAM window and the AHCI store are set and before `hv_start()`. It refuses, writing
-nothing, unless: configure BIT(9) was given (T8152, soft GIC, board 0x22); the mask names only
+nothing, unless: configure BIT(20) was given (T8152, soft GIC, board 0x22); the mask names only
 drd1/drd3 (drd0 is refused by mask and by address); `j804_usb_port_state()` says the port is
 up and the UTMI event counter runs; the ADT names the same controller, line 1692 and Gen3
 DARTs; both DART instances read PARAMS1 16 KiB pages, PARAMS3 PA/VA width 42 and version 3.0
@@ -1028,7 +1028,7 @@ a move of at most 255 one-byte slot numbers; the reports themselves never move. 
 stream into a driver that stopped popping costs at most a few hundred steps per report under
 the input lock.
 
-Resident ABI: configure **BIT(10)** (`HV_WINDOWS_T8152_INPUT`; T8152, software GIC, board
+Resident ABI: configure **BIT(21)** (`HV_WINDOWS_T8152_INPUT`; T8152, software GIC, board
 0x22), **CAPS2 bit 3**, **`P_HV_WINDOWS_INPUT` 0xc89** (0xc88 and CAPS2 bit 2 are
 `j804-windows-gpu`'s; re-check both at merge): op 0 QUERY (0 version 1, 1 base, 2 size, 3
 INTID, 4 features 0x1000F, 5 accepted sources 0x1), op 1 ATTACH (a1 sources: bit 0 host; bits
@@ -1036,7 +1036,7 @@ INTID, 4 features 0x1000F, 5 accepted sources 0x1), op 1 ATTACH (a1 sources: bit
 STATUS (0-15 the counters, 16 attached sources, 17 CTRL, 18 depth, 19 DROPPED, 20 LEDs, 21
 line, 22 RX owned), op 3 DETACH (before entry only; `hv_start()` then refuses). ATTACH
 results: 0, -1 state (flag, chip, board, after entry, or a second ATTACH this carrier load),
--2 sources, -3 area, -4 hook. `hv_start()` refuses with BIT(10) set unless ATTACH succeeded
+-2 sources, -3 area, -4 hook. `hv_start()` refuses with BIT(21) set unless ATTACH succeeded
 and the page is wholly this hook.
 
 Launcher (`run_guest.py --windows-input {off,host}`, default off), before anything is
@@ -1055,8 +1055,8 @@ first, as the GPU refusals do (a failed input DETACH after a refused handshake d
 that). If `hv.start()` itself refuses before entry, the launcher detaches USB and input (the
 vUART RX goes back to the console); a GPU admission has no release and lasts until the
 carrier is reloaded. The four features do not share a number: proxy ops 0xc8e AHCI,
-0xc87 USB, 0xc88 GPU, 0xc89 input; CAPS2 bits 0-3 in that order; configure BIT(8) AHCI, BIT(9)
-USB, BIT(10) input (G0 has no configure flag); FD markers 0x110 `J804AHC1`, 0x120 `J804USB1`,
+0xc87 USB, 0xc88 GPU, 0xc89 input; CAPS2 bits 0-3 in that order; configure BIT(19) AHCI, BIT(20)
+USB, BIT(21) input (G0 has no configure flag); FD markers 0x110 `J804AHC1`, 0x120 `J804USB1`,
 0x130 `J804USB3`, 0x140 `J804INP1` (G0 has none: Mu's GPU0 comes from the handoff page); SPIs
 990 AHCI and 991 input (emulated), 995/997 USB (aliases), and the GPU alias slots refuse the
 whole 980..999 carrier block.
@@ -1345,7 +1345,7 @@ framebuffer is a BGRA shadow that the carrier repacks into that surface from idl
 (`hv_fb_convert_slice`), a free-running sweep with no frames.
 
 **What G6-S adds.** One hooked page and one level SPI, off unless the launcher passes
-`--windows-scanout on|HZ|MHZ` (configure `BIT(11)`, CAPS2 bit 7, `P_HV_WINDOWS_SCANOUT 0xc8b`):
+`--windows-scanout on|HZ|MHZ` (configure `BIT(22)`, CAPS2 bit 7, `P_HV_WINDOWS_SCANOUT 0xc8b`):
 
 - page IPA `0xF60000000`, 16 KiB, never mapped (`hv_scanout.c`, model `scanout_model.c`);
 - SPI GSIV 992, level, no AIC line, live only with the scanout flag (`hv_vdev_spi`);
@@ -1376,3 +1376,22 @@ and whose `_DSD` names `aura,scanout-ipa`, `aura,scanout-gsiv`, `aura,scanout-re
 
 The register map and buffer rules for the driver are in the G6 interface note kept with the
 build outputs (out/g6-scanout/INTERFACE.md); `scanout_model.h` is the authority.
+
+## Resident ABI on j813-windows
+
+This branch carries the T8152 carrier on top of j813-windows, whose own Windows work uses the
+same proxy ABI. Where the two used one number for different things, the T8152 side moved:
+
+| What | Before | Now |
+|---|---|---|
+| `P_HV_WINDOWS_GUEST_RAM` | 0xc84 (j813-windows: N1_ACQUIRE) | 0xc8c |
+| `P_HV_WINDOWS_CAPS2` | 0xc85 (j813-windows: reserved EXIT_SNAPSHOT) | 0xc8d |
+| `P_HV_WINDOWS_AHCI` | 0xc86 (j813-windows: ECPU_BOOT_STATE) | 0xc8e |
+| configure FAST_IPI, SOFT_GIC, WFI, AHCI, USB, INPUT, SCANOUT | BIT(5)-BIT(11) (BIT(5): CPUFREQ) | BIT(16)-BIT(22) |
+| T8152 policy, 12 live CPUs, WFE/placement, ACTLR_EL12, trapped ICC_* | CAPS bits 11-15 | CAPS2 bits 8-12 |
+
+`P_HV_WINDOWS_CAPS` is j813-windows' value, 0x4157494e00017fff: bits 16-31 are the ABI
+number, so CAPS has no room for the T8152 rules, and a launcher reads them from CAPS2. The
+other T8152 ops (0xc87 USB, 0xc88 GPU, 0xc89 input, 0xc8a tick CPU, 0xc8b scanout) and the
+CAPS2 feature bits 0-7 are unchanged. A launcher and a resident from before the move refuse
+each other.

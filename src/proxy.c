@@ -656,11 +656,8 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
 #ifdef AURA_WINDOWS
             /* Bit 13 (0x2000): HvXfer bulk channel, P_HV_MAP_XFER.
              * Bit 14 (0x4000): explicit J813 E boot state, P_HV_WINDOWS_ECPU_BOOT_STATE.
-             * Bit 11 also stands for the T8152 stage-2 policy, guest RAM window op and T8152
-             * Fast IPI opt-in, bits 12-14 for the other T8152 rules, until the T8152 bits
-             * move to CAPS2.
-             * Bit 15: T8152 runs the guest OS with every ICC_* access trapped. */
-            reply->retval = 0x4157494e0001ffffULL;
+             * Bit 15 is free.  The T8152 carrier rules are P_HV_WINDOWS_CAPS2 bits 8-12. */
+            reply->retval = 0x4157494e00017fffULL;
 #else
             reply->retval = 0;
 #endif
@@ -698,10 +695,10 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
             /*
              * Read-only.  'AWI2' and feature bits, so P_HV_WINDOWS_CAPS keeps its ABI 1 value
              * (its free bit 5 means the N1 handoff to every older launcher).  Bit 0: the D1
-             * AHCI RAM-store disk (hv_ahci.c, P_HV_WINDOWS_AHCI, configure flag BIT(8)).
-             * Bit 1: D4 USB passthrough v1 (hv_usb.c, P_HV_WINDOWS_USB, configure BIT(9)).
+             * AHCI RAM-store disk (hv_ahci.c, P_HV_WINDOWS_AHCI, configure flag BIT(19)).
+             * Bit 1: D4 USB passthrough v1 (hv_usb.c, P_HV_WINDOWS_USB, configure BIT(20)).
              * Bit 2: G0 GPU admission and logging hooks (hv_gpu.c, P_HV_WINDOWS_GPU).
-             * Bit 3: I0 input v1 (hv_input.c, P_HV_WINDOWS_INPUT, configure BIT(10)).
+             * Bit 3: I0 input v1 (hv_input.c, P_HV_WINDOWS_INPUT, configure BIT(21)).
              * Bit 4: G1 GPU power-on, boot marker and mediated forwarding (hv_gpu.c POWER,
              * PROBE, STOP); the recipe itself may be absent (STATUS HV_GPU_S_POWER_RECIPE).
              * Bit 5: D5 AHCI disk on an NVMe partition (hv_ahci_nvme.c; P_HV_WINDOWS_AHCI ops
@@ -709,14 +706,19 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
              * Bit 6: G2 guards, grants and the UAT audit (hv_gpu.c G2); the private G2 recipe may
              * be absent (STATUS HV_GPU_S_G2_RECIPE).  An earlier build had G2 on bit 5.
              * Bit 7: G6-S scanout service v1 (hv_scanout.c, P_HV_WINDOWS_SCANOUT, configure
-             * BIT(11)).
+             * BIT(22)).
+             * Bits 8-12: the T8152 carrier rules (hv_ahci.h HV_WINDOWS_CAPS2_T8152_*): stage-2
+             * policy, 12 live CPUs, guest WFE and code placement, ACTLR_EL12, trapped ICC_*.
              * Every bit has one meaning: tests/python/test_windows_t8152_caps2.py.
              */
 #ifdef AURA_WINDOWS
             reply->retval = HV_WINDOWS_CAPS2_MAGIC | HV_WINDOWS_CAPS2_AHCI | HV_WINDOWS_CAPS2_USB |
                             HV_WINDOWS_CAPS2_GPU | HV_WINDOWS_CAPS2_INPUT |
                             HV_WINDOWS_CAPS2_GPU_PROBE | HV_WINDOWS_CAPS2_AHCI_NVME |
-                            HV_WINDOWS_CAPS2_GPU_G2 | HV_WINDOWS_CAPS2_SCANOUT;
+                            HV_WINDOWS_CAPS2_GPU_G2 | HV_WINDOWS_CAPS2_SCANOUT |
+                            HV_WINDOWS_CAPS2_T8152_POLICY | HV_WINDOWS_CAPS2_T8152_LIVE_CPUS |
+                            HV_WINDOWS_CAPS2_T8152_WFE_PLACEMENT |
+                            HV_WINDOWS_CAPS2_T8152_ACTLR_ARCH | HV_WINDOWS_CAPS2_T8152_GIC_TRAPALL;
 #else
             reply->retval = 0;
 #endif

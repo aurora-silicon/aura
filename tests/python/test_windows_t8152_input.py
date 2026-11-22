@@ -341,9 +341,9 @@ def test_contract_constants_agree():
     assert re.search(r"#define INPUT_ID_VALUE\s+0x4e49364du", model)
     assert re.search(r"#define INPUT_HOST_SYNC0\s+0x4du", model)
     assert re.search(r"#define INPUT_HOST_SYNC1\s+0x36u", model)
-    assert re.search(r"#define HV_WINDOWS_T8152_INPUT BIT\(10\)", source("hv.h"))
+    assert re.search(r"#define HV_WINDOWS_T8152_INPUT BIT\(21\)", source("hv.h"))
     assert (w.INPUT_BASE, w.INPUT_SIZE, w.INPUT_GSIV, w.CAPS2_INPUT, w.CONFIG_T8152_INPUT) == \
-        (0xF50000000, 0x4000, 991, 1 << 3, 1 << 10)
+        (0xF50000000, 0x4000, 991, 1 << 3, 1 << 21)
     assert w.INPUT_SYNC == b"M6" and w.INPUT_MAX_PAYLOAD == 64 and w.INPUT_WATCHDOG_S == 2.0
     types = dict(re.findall(r"INPUT_HOST_(\w+) = (0x[0-9a-f]+),", model))
     assert {k: int(v, 16) for k, v in types.items()} == {
@@ -375,7 +375,7 @@ def test_contract_constants_agree():
         "HV_WINDOWS_CAPS2_INPUT" in proxy_c
     assert "hv_input_proxy(request->args[0], request->args[1], request->args[2]," in proxy_c
     # CAPS keeps its ABI 1 value.
-    assert "reply->retval = 0x4157494e0001ffdfULL;" in proxy_c
+    assert "reply->retval = 0x4157494e00017fffULL;" in proxy_c
 
 
 def test_merged_feature_numbers_are_distinct():
@@ -402,9 +402,9 @@ def test_merged_feature_numbers_are_distinct():
     flags = dict(re.findall(r"#define (HV_WINDOWS_T8152_\w+) BIT\((\d+)\)", hv_h))
     assert len(set(flags.values())) == len(flags)
     assert (flags["HV_WINDOWS_T8152_AHCI"], flags["HV_WINDOWS_T8152_USB"],
-            flags["HV_WINDOWS_T8152_INPUT"]) == ("8", "9", "10")
+            flags["HV_WINDOWS_T8152_INPUT"]) == ("19", "20", "21")
     assert (w.CONFIG_T8152_AHCI, w.CONFIG_T8152_USB, w.CONFIG_T8152_INPUT) == \
-        (0x100, 0x200, 0x400)
+        (0x80000, 0x100000, 0x200000)
     # FD markers: AHCI 0x110, USB 0x120 (two 16-byte slots), input 0x140; G0 has none (Mu's GPU0
     # comes from the handoff page the 16-byte /chosen property points at).
     markers = [(w.AHCI_FD_MARKER_OFFSET, w.AHCI_FD_MARKER), *w.USB_FD_MARKER.values(),

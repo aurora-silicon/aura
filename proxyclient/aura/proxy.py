@@ -1369,8 +1369,8 @@ class AuraProxy(Reloadable):
         return self.request(self.P_HV_WINDOWS_GUEST_RAM, base, size, host_top, signed=True)
 
     def hv_windows_capabilities2(self):
-        # Read-only: 'AWI2' magic and feature bits (bit 0: D1 AHCI RAM store).  An older
-        # resident answers Bad Command (ProxyCommandError).
+        # Read-only: 'AWI2' magic and feature bits (bit 0: D1 AHCI RAM store; bits 8-12: the
+        # T8152 carrier rules).  An older resident answers Bad Command (ProxyCommandError).
         return self.request(self.P_HV_WINDOWS_CAPS2)
 
     def hv_windows_ahci(self, op, a1=0, a2=0, a3=0, a4=0):

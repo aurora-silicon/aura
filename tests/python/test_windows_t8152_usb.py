@@ -926,7 +926,7 @@ def test_streams_and_dart_registers_match_the_design():
 
 def test_configure_proxy_and_build_agree():
     hv_h, hv_c = source("hv.h"), source("hv.c")
-    assert re.search(r"#define HV_WINDOWS_T8152_USB BIT\(9\)", hv_h)
+    assert re.search(r"#define HV_WINDOWS_T8152_USB BIT\(20\)", hv_h)
     conf = function_body(hv_c, "int hv_windows_configure(u64 flags)")
     # The accepted-flags mask ends with USB (I0 appends its own flag after it).
     assert re.search(r"HV_WINDOWS_T8152_USB(?: \| HV_WINDOWS_T8152_INPUT(?: \| HV_WINDOWS_T8152_SCANOUT)?)?\)\)\n        return -1;",
@@ -940,7 +940,7 @@ def test_configure_proxy_and_build_agree():
     assert "HV_WINDOWS_CAPS2_MAGIC | HV_WINDOWS_CAPS2_AHCI | HV_WINDOWS_CAPS2_USB" in proxy_c
     assert "hv_usb_proxy(request->args[0], request->args[1], request->args[2])" in proxy_c
     assert re.search(r"#define HV_WINDOWS_CAPS2_USB BIT\(1\)", source("hv_usb.h"))
-    assert (w.CAPS2_USB, w.CONFIG_T8152_USB) == (1 << 1, 1 << 9)
+    assert (w.CAPS2_USB, w.CONFIG_T8152_USB) == (1 << 1, 1 << 20)
     assert (w.USB_OP_ATTACH, w.USB_OP_STATUS, w.USB_OP_DETACH) == (1, 2, 3)
     hdr = source("hv_usb.h")
     for name, index in w.USB_STATUS.items():
