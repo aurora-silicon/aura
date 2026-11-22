@@ -842,21 +842,14 @@ int pmgr_reset(int die, const char *name)
     return pmgr_reset_device(die, dev);
 }
 
-#ifdef SPTM_VIRT
 /*
  * A device's reset, with the device held on for it (an idle one won't take a reset), then its
  * target and auto-enable as they were.
  */
 int pmgr_reset_held(int die, const char *name)
 {
-    const struct pmgr_device *dev = NULL;
+    const struct pmgr_device *dev = pmgr_find_device_by_name(name);
 
-    for (unsigned int i = 0; i < pmgr_devices_len; ++i) {
-        if (strncmp(pmgr_devices[i].name, name, 0x10) == 0) {
-            dev = &pmgr_devices[i];
-            break;
-        }
-    }
     if (!dev || die < 0 || die >= pmgr_dies)
         return -1;
     uintptr_t addr = pmgr_device_get_addr(die, dev);
@@ -868,11 +861,10 @@ int pmgr_reset_held(int die, const char *name)
     if (!ret)
         ret = pmgr_reset_device(die, dev);
     mask32(addr, PMGR_AUTO_ENABLE | PMGR_PS_TARGET, was & (PMGR_AUTO_ENABLE | PMGR_PS_TARGET));
-    printf("pmgr: %d.%s 0x%x before, 0x%x after%s\n", die, dev->name, was, read32(addr),
+    printf("pmgr: %d.%.16s 0x%x before, 0x%x after%s\n", die, dev->name, was, read32(addr),
            ret ? ", NOT reset" : "");
     return ret;
 }
-#endif /* SPTM_VIRT */
 
 uintptr_t pmgr_psreg_by_name(int die, const char *name)
 {
