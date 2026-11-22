@@ -83,6 +83,15 @@ bool dcp_left_running(void)
     return dcp_running;
 }
 
+/* Set when the last dcp_init() booted the DCP's RTKit, failed a later step and
+ * quiesced it again. */
+static bool dcp_init_quiesced;
+
+bool dcp_init_left_quiesced(void)
+{
+    return dcp_init_quiesced;
+}
+
 static int dcp_hdmi_dptx_init(dcp_dev_t *dcp, const display_config_t *cfg)
 {
     int node = adt_path_offset(adt, cfg->dp2hdmi_gpio);
@@ -259,6 +268,8 @@ dcp_dev_t *dcp_init(const display_config_t *cfg)
 {
     u32 sid;
 
+    dcp_init_quiesced = false;
+
     if (cfg && cfg->dptx_phy[0]) {
         /* J873g reports mBoot-20457.1.29, which is not in the OS firmware
          * table, and the same dptx-port endpoint works on its USB-C route.
@@ -379,6 +390,7 @@ out_afk:
 out_rtkit:
     if (!rtkit_quiesce(dcp->rtkit))
         goto out_running;
+    dcp_init_quiesced = true;
     rtkit_free(dcp->rtkit);
 out_iovad:
     iovad_shutdown(dcp->iovad_dcp, dcp->dart_dcp);
@@ -391,6 +403,36 @@ out_free:
 out_running:
     dcp_mark_running();
     return NULL;
+}
+
+/*
+ * Stop every AFK endpoint but leave RTKit running, with its buffers and DART mappings: the next
+ * owner adopts the running core and starts the endpoints again. An interface whose endpoint
+ * stopped is freed; one that did not stays allocated and keeps its AFK endpoint, so
+ * afk_epic_live_endpoints() still reports it. The AFK context goes once every endpoint has
+ * stopped (afk_epic_shutdown() frees it), and is then no longer referenced. -1 if any did not
+ * stop.
+ */
+int dcp_handoff(dcp_dev_t *dcp)
+{
+    int ret = 0;
+    if (dcp_system_shutdown(dcp->system_ep) < 0)
+        ret = -1;
+    else
+        dcp->system_ep = NULL;
+    if (dcp_dptx_shutdown(dcp->dptx_ep) < 0)
+        ret = -1;
+    else
+        dcp->dptx_ep = NULL;
+    if (dcp_dpav_shutdown(dcp->dpav_ep) < 0)
+        ret = -1;
+    else
+        dcp->dpav_ep = NULL;
+    if (afk_epic_shutdown(dcp->afk) < 0)
+        ret = -1;
+    else
+        dcp->afk = NULL;
+    return ret;
 }
 
 int dcp_shutdown(dcp_dev_t *dcp, bool sleep)

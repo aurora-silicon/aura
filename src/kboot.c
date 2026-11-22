@@ -8317,25 +8317,24 @@ static int dt_set_j713_display_maps(const struct adt_segment_ranges *segments, u
     return 0;
 }
 
+static int dt_set_dcp_fw27_clocks(const char *alias, const char *adt_engine);
+
 /*
- * Publish the inherited DCP firmware mapping without starting a display driver: on the J713
- * on any firmware as before, and on any other M4 Mac with a panel on 26.6.2.
+ * Publish the inherited DCP firmware mapping without starting a display driver, on any M4 Mac
+ * whose ADT describes an internal panel on disp0, whatever its firmware. The kernel picks the
+ * display backend from the firmware the DCP runs.
  */
 static int dt_set_m4_dcp_handoff(void)
 {
     int dcp_node = fdt_path_offset(dt, "dcp");
     if (dcp_node < 0)
         return 0; /* Older DT with simple-framebuffer only. */
-    bool j713 = !fdt_node_check_compatible(dt, 0, "apple,j713");
-    if (chip_id != T8132 || (!j713 && os_firmware.version != V26_6_2) ||
-        fdt_node_check_compatible(dt, dcp_node, "apple,t8132-dcp"))
+    if (chip_id != T8132 || fdt_node_check_compatible(dt, dcp_node, "apple,t8132-dcp"))
         bail("FDT: unsupported native DCP handoff target\n");
-    /* The Mac mini's disp0 is external: its DCP drives a port, not a panel. */
-    if (!j713) {
-        int disp0 = adt_path_offset(adt, "/arm-io/disp0");
-        if (disp0 < 0 || adt_getprop(adt, disp0, "external", NULL))
-            bail("FDT: no internal panel, no native DCP handoff\n");
-    }
+    /* A Mac mini's disp0 is external: its DCP drives a port, not a panel. */
+    int disp0 = adt_path_offset(adt, "/arm-io/disp0");
+    if (disp0 < 0 || adt_getprop(adt, disp0, "external", NULL))
+        bail("FDT: no internal panel, no native DCP handoff\n");
 
     int nub = adt_path_offset(adt, "/arm-io/dcp/iop-dcp-nub");
     if (nub < 0)
@@ -8381,13 +8380,28 @@ static int dt_set_m4_dcp_handoff(void)
     if (ret)
         return ret;
 
+    bool maps = false;
     dcp_node = fdt_path_offset(dt, "dcp");
     if (fdt_getprop(dt, dcp_node, "apple,j713-native-piodma", NULL)) {
-        /* The DCP image is per firmware, the same on every M4 Mac. */
-        if (os_firmware.version != V26_6_2 ||
-            dt_set_j713_display_maps(segments, count, dram_start, dram_size))
+        /*
+         * The walk checks every inherited SID0/SID16 page against the segments of the image
+         * the DCP runs and publishes nothing unless all of them match, so it needs no list of
+         * firmware versions.
+         */
+        if (dt_set_j713_display_maps(segments, count, dram_start, dram_size))
             printf("FDT: M4 PIODMA handoff unqualified; retaining disabled device\n");
+        else
+            maps = true;
     }
+
+    /*
+     * Firmware 27 is given its clocks by the OS (/arm-io/disp0 clock-ids); without them it
+     * does not start, but the rest of the boot does. Nothing is published on 26.6.2.
+     * The kernel admits a firmware-27 DCP on apple,clock-ids, so they go out only together
+     * with the inherited display maps: a DCP adopted without them faults on its DART.
+     */
+    if (maps && dt_set_dcp_fw27_clocks("dcp", "/arm-io/disp0"))
+        printf("FDT: M4 DCP firmware clocks not published\n");
 
     printf("FDT: M4 DCP firmware mappings published; display device status unchanged\n");
     return 0;
@@ -8422,17 +8436,26 @@ static int dt_set_dcp_fw27_clocks(const char *alias, const char *adt_engine)
         return 0;
     }
 
+    /*
+     * A tree written for older firmware has the display clock alone; one written for a
+     * processor that only ever ran firmware-27-style interfaces (T8132) has no clocks at all.
+     */
     int clen = 0;
     const fdt32_t *display = fdt_getprop(dt, node, "clocks", &clen);
-    if (!display || clen != sizeof(fdt32_t) || fdt_getprop(dt, node, "clock-names", NULL)) {
+    if ((display && clen != sizeof(fdt32_t)) || fdt_getprop(dt, node, "clock-names", NULL)) {
         printf("FDT: %s: unexpected clock properties; firmware clocks not published\n", alias);
         return 0;
     }
 
     fdt32_t clocks[9], ids[8];
     char names[9 * 12];
-    int names_len = snprintf(names, sizeof(names), "display") + 1;
-    clocks[0] = *display;
+    u32 first = 0;
+    int names_len = 0;
+    if (display) {
+        names_len = snprintf(names, sizeof(names), "display") + 1;
+        clocks[0] = *display;
+        first = 1;
+    }
     for (u32 i = 0; i < nclk; i++) {
         u32 id, hz;
         memcpy(&id, raw_ids + i * sizeof(u32), sizeof(id));
@@ -8461,7 +8484,7 @@ static int dt_set_dcp_fw27_clocks(const char *alias, const char *adt_engine)
         ret = ret ?: fdt_setprop_u32(dt, clk, "phandle", ph);
         if (ret)
             return ret;
-        clocks[i + 1] = cpu_to_fdt32(ph);
+        clocks[i + first] = cpu_to_fdt32(ph);
         ids[i] = cpu_to_fdt32(id);
         names_len += snprintf(names + names_len, sizeof(names) - names_len, "firmware-%u", i) + 1;
     }
@@ -8469,7 +8492,7 @@ static int dt_set_dcp_fw27_clocks(const char *alias, const char *adt_engine)
     node = fdt_path_offset(dt, path);
     if (node < 0)
         return node;
-    int ret = fdt_setprop(dt, node, "clocks", clocks, (nclk + 1) * sizeof(*clocks));
+    int ret = fdt_setprop(dt, node, "clocks", clocks, (nclk + first) * sizeof(*clocks));
     node = fdt_path_offset(dt, path);
     ret = ret ?: fdt_setprop(dt, node, "clock-names", names, names_len);
     node = fdt_path_offset(dt, path);
@@ -11954,6 +11977,45 @@ static int dt_t8152_dcp_node(u64 coproc)
     return -1;
 }
 
+/*
+ * Report in apple,afk-active-endpoints the AFK endpoints of a controller aura brought a display
+ * up on that are still running at the hand-off, in this stage or in an earlier one whose
+ * framebuffer this stage adopted (dcp.afk-live=), so that apple_dcpib stops each before it
+ * starts it again. display_shutdown(DCP_HANDOFF) stops them on T8152 before this runs, so only
+ * an endpoint that did not stop is left to report. An aura-started dcpext0's report is left to
+ * this hand-off by dt_set_dcpext_t8152().
+ */
+static int dt_set_live_afk_t8152(void)
+{
+    static const char *const paths[] = {"/arm-io/dcp", "/arm-io/dcpext0"};
+
+    for (size_t i = 0; i < ARRAY_SIZE(paths); i++) {
+        u32 live = display_live_endpoints(paths[i]);
+        u64 coproc;
+        int trace[8];
+
+        if (!live)
+            continue;
+        /* Advisory: a controller this Mac or its device tree lacks is skipped, not fatal. */
+        if (adt_path_offset_trace(adt, paths[i], trace) < 0 ||
+            adt_get_reg(adt, trace, "reg", 0, &coproc, NULL) < 0) {
+            printf("FDT: no %s in the ADT; its AFK endpoints 0x%x are not reported\n", paths[i],
+                   live);
+            continue;
+        }
+        int node = dt_t8152_dcp_node(coproc);
+        if (node < 0) {
+            printf("FDT: no node for %s; its AFK endpoints 0x%x are not reported\n", paths[i],
+                   live);
+            continue;
+        }
+        if (fdt_setprop_u32(dt, node, "apple,afk-active-endpoints", live))
+            bail("FDT: couldn't report %s's live AFK endpoints\n", paths[i]);
+        printf("FDT: %s hands AFK endpoints 0x%x to Linux running\n", paths[i], live);
+    }
+    return 0;
+}
+
 /* One DCPEXT's handoff, in a display transaction: all of it or nothing. */
 static int dt_set_dcpext_t8152_one(unsigned int n)
 {
@@ -12038,6 +12100,22 @@ static void dt_set_dcpext_t8152(void)
     }
 }
 
+/*
+ * The internal DCP's RTKit state at the hand-off, for apple_dcpib: 1 when it runs, 0 when
+ * aura quiesced it after a failed display setup. Omitted when aura never started it.
+ */
+static int dt_set_dcp_state_t8152(void)
+{
+    int state = display_dcp_handoff_state();
+    if (state < 0)
+        return 0;
+    int chosen = fdt_path_offset(dt, "/chosen");
+    if (chosen < 0 || fdt_setprop_u32(dt, chosen, "apple,dcp-rtkit-running", state))
+        bail("FDT: couldn't set apple,dcp-rtkit-running\n");
+    printf("FDT: internal DCP %s at the hand-off\n", state ? "running" : "stopped");
+    return 0;
+}
+
 static int dt_prepare_t8152(void)
 {
     if (fdt_getprop(dt, 0, "aurora,minimal-boot", NULL)) {
@@ -12045,10 +12123,13 @@ static int dt_prepare_t8152(void)
         if (aic < 0 || fdt_node_check_compatible(dt, aic, "apple,t8152-aic3") ||
             fdt_node_check_compatible(dt, aic, "apple,t8122-aic3"))
             bail("FDT: T8152 requires the t8122 AIC3 fallback\n");
-        if (dt_set_serial_number() || dt_set_display_t8152() || dt_set_gpu(dt))
+        if (dt_set_serial_number() || dt_set_display_t8152() || dt_set_live_afk_t8152() ||
+            dt_set_gpu(dt))
             return -1;
         dt_set_dcpext_t8152();
     }
+    if (dt_set_dcp_state_t8152())
+        return -1;
     if (dt_set_cpus())
         return -1;
     if (dt_set_mac_addresses())
