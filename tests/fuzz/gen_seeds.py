@@ -107,17 +107,19 @@ def mac(ac=2, sc=2, ranges=True, cpus=4):
         "firmware-version": cstr("mBoot-18000.101.7"), "system-firmware-version": cstr("mBoot-18000.101.7"),
         "dram-vendor-id": u32(1), "chip-id": u32(0x8103), "board-id": u32(0x24),
         "random-seed": bytes(range(64)), "bootp-response": b"\x00" * 3,
-        "dram-type": cstr("LPDDR5"), "dram-vendor": cstr("Vendor"),
+        "dram-type": cstr("LPDDR5"), "dram-vendor": cstr("Vendor"), "dram-base": u64(0x800000000),
+        "dram-size": u64(0x200000000),
     }, [memory_map, Node("carveout-memory-map", {"region-id-24": u64(0x10000000000, 0x1000000)})])
-    product = Node("product", {"product-name": cstr("Synthetic Mac"), "product-description": cstr("Test"),
-                               "product-soc-name": cstr("M0")})
+    product = Node("product", {"product-name": cstr("Synthetic Mac (14-inch, 2026)"),
+                               "product-description": cstr("Test"),
+                               "product-soc-name": cstr("Apple M0")})
     root_props = {
         "compatible": cstr("J000AP", "Mac00,0", "AppleARM"), "model": cstr("Mac00,0"),
         "target-type": cstr("J000"), "serial-number": b"\0" * 32, "clock-frequency": u32(24000000),
         "device_type": cstr("bootrom"), "manufacturer": cstr("Vendor Inc."),
         "model-number": b"Z0000" + b"\0" * 27, "platform-name": b"t8103" + b"\0" * 27,
         "region-info": b"LL/A" + b"\0" * 28, "regulatory-model-number": b"A0000" + b"\0" * 27,
-        "mlb-serial-number": b"\0" * 32,
+        "mlb-serial-number": b"FUZZ0000000" + b"\0" * 21,
     }
     root_props.update(cells(ac, sc))
     return Node("device-tree", root_props, [arm_io, cpus_node, chosen, product,
@@ -203,7 +205,8 @@ def dtb(root):
     return header + rsv + bytes(body) + bytes(strings)
 
 
-def payload_dt(soc_cells=2, missing_usb=2, cpus=4):
+def payload_dt(soc_cells=2, missing_usb=2, cpus=4, model=b"Vendor Synthetic Mac (14-inch, M0)\0",
+               chassis=b"laptop\0"):
     cpu_nodes = [
         FNode("cpu@%d" % i, {"device_type": b"cpu\0", "compatible": b"apple,icestorm\0",
                              "reg": be(0, i), "operating-points-v2": be(0x20 + i // 2),
@@ -241,9 +244,11 @@ def payload_dt(soc_cells=2, missing_usb=2, cpus=4):
                                        "apple,bop-config": b"\xee"}) for a in (0x38, 0x39, 0x3A)]),
         FNode("cio@381f00000", {"reg": reg(0x381f00000, 0x4000)}),
     ] + usb)
-    return FNode("", {"compatible": b"apple,j000\0apple,t8103\0apple,arm-platform\0",
-                      "model": b"Synthetic Mac\0", "chassis-type": b"laptop\0",
-                      "#address-cells": be(2), "#size-cells": be(2)}, [
+    root_props = {"compatible": b"apple,j000\0apple,t8103\0apple,arm-platform\0",
+                  "chassis-type": chassis, "#address-cells": be(2), "#size-cells": be(2)}
+    if model:
+        root_props["model"] = model
+    return FNode("", root_props, [
         FNode("chosen", {"bootargs": b"\0", "asahi,m1n1-stage1-version": b"1.0\0"}),
         FNode("clock-ref", {"compatible": b"fixed-clock\0", "clock-frequency": be(24000000),
                             "#clock-cells": be(0)}),
@@ -262,6 +267,8 @@ def dt_seeds():
     yield "mac-sme", dt_pair(mac(), payload_dt(), 1 | 2)
     yield "mac-1cell", dt_pair(mac(1, 1), payload_dt(soc_cells=1))
     yield "mac-acio1", dt_pair(mac(ranges=False), payload_dt(missing_usb=6), 4)
+    yield "mac-nomodel-desktop", dt_pair(mac(), payload_dt(model=None, chassis=b"desktop\0"))
+    yield "mac-server", dt_pair(mac(cpus=8), payload_dt(cpus=8, chassis=b"server\0"), 16 | 32)
     yield "minimal", dt_pair(Node("device-tree"), FNode("", {}))
 
 
@@ -280,7 +287,19 @@ def pmgr_device(dev_id, name, parents=(0, 0), psreg=0, offset=0, flags=0, u8id=F
     return out
 
 
-def pmgr_adt(u8id=False, groups=False, dies=1, cycle=False):
+# The PMGR register layout the sleep path looks for (sptm_virt_s2r_soc.c), as made-up addresses:
+# the PS area A (the first ps-regs group), the always-on area B (the first other group), and the
+# blocks at their offsets from those.
+PS_AREA, AON_AREA = 0x3B700000, 0x3C000000
+S2R_REGS = [
+    (PS_AREA, 0x14000), (AON_AREA, 0x80000), (PS_AREA + 0x30000, 0x14000),
+    (AON_AREA + 0x50000, 0x8000), (PS_AREA + 0x24000, 0x4000), (PS_AREA + 0x68000, 0x4000),
+    (PS_AREA + 0x80000, 0x4000), (AON_AREA - 0x27C000, 0x1000), (PS_AREA - 0x700000, 0x60000),
+    (0x3D000000, 0x1000000), (PS_AREA, 0x18000), (0x3E000000, 0x8000),
+]
+
+
+def pmgr_adt(u8id=False, groups=False, dies=1, cycle=False, s2r=False, compat="pmgr1,t8103"):
     names = ["SOC_DPE", "SIO_BUSIF", "SIO", "UART0", "AIC", "DISP_CPU", "USB2HOST0", "ATC0_USB",
              "DART_USB0", "ANS2", "SPMI0", "VIRT"]
     parents = {2: (1, 0), 3: (2, 0), 4: (1, 0), 5: (1, 0), 7: (6, 1), 8: (7, 0), 9: (1, 4),
@@ -292,9 +311,10 @@ def pmgr_adt(u8id=False, groups=False, dies=1, cycle=False):
         devices += pmgr_device(i, n, parents.get(i, (0, 0)), psreg=i % 3, offset=i,
                                flags=0x10 if n == "VIRT" else 0, u8id=u8id,
                                group=(i % 3, 8 * i) if groups else None)
-    pmgr_props = {"compatible": cstr("pmgr1,t8103"), "#address-cells": u32(2), "#size-cells": u32(2),
-                  "reg": u64(0x3B700000, 0x14000, 0x3B000000, 0x8000, 0x3B800000, 0x4000),
-                  "devices": devices, "cpu-features": u32(1)}
+    reg = (u64(*[w for r in S2R_REGS for w in r]) if s2r else
+           u64(0x3B700000, 0x14000, 0x3B000000, 0x8000, 0x3B800000, 0x4000))
+    pmgr_props = {"compatible": cstr(compat), "#address-cells": u32(2), "#size-cells": u32(2),
+                  "reg": reg, "devices": devices, "cpu-features": u32(1)}
     pmgr_props["ps-groups" if groups else "ps-regs"] = u32(0, 0x0, 0, 1, 0x100, 0, 2, 0x0, 0)
     if dies > 1:
         pmgr_props["die-stride"] = u64(0x2000000000)
@@ -306,8 +326,13 @@ def pmgr_adt(u8id=False, groups=False, dies=1, cycle=False):
         dev("uart0", ["uart-1,samsung"], u64(0x35200000, 0x4000), {"clock-gates": u32(4)}),
         dev("aic", ["aic,1"], u64(0x3B100000, 0x8000), {"clock-gates": u32(5)}),
         dev("usb-drd0", ["usb-drd,t8103"], u64(0x382280000, 0x100000),
-            {"clock-gates": u32(7, 8), "power-gates": u32(7)}),
-        dev("dart-usb0", ["dart,t8020"], u64(0x382f00000, 0x4000), {"clock-gates": u32(9)}),
+            {"clock-gates": u32(7, 8), "power-gates": u32(7), "atc-phy-parent": u32(0x10),
+             "iommu-parent": u32(0x31)}),
+        Node("dart-usb0", {"compatible": cstr("dart,t8020"), "reg": u64(0x382f00000, 0x4000),
+                           "clock-gates": u32(9), "AAPL,phandle": u32(0x30)},
+             [Node("mapper-usb0", {"AAPL,phandle": u32(0x31), "reg": u32(1)})]),
+        dev("atc-phy0", ["atc-phy,t8103"], u64(0x383000000, 0x4000),
+            {"clock-gates": u32(7), "AAPL,phandle": u32(0x10)}),
         dev("ans", ["iop,ascwrap-v4"], u64(0x27bc00000, 0x4000), {"clock-gates": u32(10, 99)}),
         dev("nub-spmi0", ["spmi,gen0"], u64(0x23d0d9300, 0x100), {"clock-gates": u32(11)}),
         dev("disp0", ["disp0,t8103"], u64(0x231c00000, 0x4000), {"clock-gates": u32(6)}),
@@ -317,9 +342,9 @@ def pmgr_adt(u8id=False, groups=False, dies=1, cycle=False):
     ]
     cpus = Node("cpus", cells(1, 0), [
         Node("cpu%d" % i, {"cpu-id": u32(i), "reg": u32(i), "state": cstr("running"),
-                           "cpu-impl-reg": u64(0x210050000 + 0x100000 * i, 0x1000),
-                           "acc-impl-reg": u64(0x211050000 + 0x100000 * i, 0x1000),
-                           "cpm-impl-reg": u64(0x212050000 + 0x100000 * i, 0x1000)})
+                           "cpu-impl-reg": u64(0x210050000 + 0x100000 * i, 0x4000),
+                           "acc-impl-reg": u64(0x211000000, 0x4000),
+                           "cpm-impl-reg": u64(0x212000000, 0x4000)})
         for i in range(2)])
     root = Node("device-tree", dict(cells(2, 2), compatible=cstr("J000AP", "AppleARM")),
                 [Node("arm-io", arm_io_props, gated), cpus])
@@ -334,6 +359,8 @@ def pmgr_seeds():
     yield "pmgr-2die", b"\x08" + regs + pmgr_adt(dies=2).encode()
     yield "pmgr-stuck", b"\x01" + regs + pmgr_adt().encode()
     yield "pmgr-cycle", b"\x00" + regs + pmgr_adt(cycle=True).encode()
+    yield "pmgr-s2r", b"\x00" + regs + pmgr_adt(s2r=True).encode()
+    yield "pmgr-s2r-timer", b"\x00" + regs + pmgr_adt(s2r=True, compat="pmgr1,t6050").encode()
 
 
 def main():
