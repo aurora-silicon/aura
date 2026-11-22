@@ -50,6 +50,13 @@ struct usb_drd_regs {
 
 static tps6598x_irq_state_t tps6598x_irq_state[USB_IODEV_COUNT];
 static bool usb_is_initialized = false;
+/* Sticky even when bring-up fails before an IODEV can be registered. */
+static bool atc0_controller_used;
+
+bool usb_atc0_used(void)
+{
+    return atc0_controller_used;
+}
 
 /* USB2 PHY regs */
 #define USB2PHY_USBCTL           0x00
@@ -195,7 +202,7 @@ static int usb_t6050_get_regs(struct usb_t6050_regs *regs)
         adt_get_reg(adt, drd_path, "reg", 0, &regs->dwc, &dwc_size) < 0 ||
         adt_get_reg(adt, drd_path, "reg", 3, &regs->pipe, &regs->pipe_size) < 0 ||
         adt_get_reg(adt, dart_path, "reg", 1, &dart_base, &dart_size) < 0 ||
-        regs->phy_size < 0x20 || digital_size < 0x24 || dwc_size < DWC3_DSTS + 4 ||
+        regs->phy_size < 0x20 || digital_size < 0x24 || dwc_size < DWC3_DALEPENA + 4 ||
         regs->pipe_size < 0x48 || dart_size < 0x1800 ||
         tunables_validate_compact("/arm-io/atc-phy0", "tunable_USB2PHY_DFLT", regs->phy_size) ||
         tunables_validate_compact("/arm-io/atc-phy0", "tunable_USB2PHY_DEV", regs->phy_size))
@@ -211,6 +218,7 @@ static int usb_t6050_get_regs(struct usb_t6050_regs *regs)
  * Device-role values come from this machine's ADT, not the host-role table. */
 static dwc3_dev_t *usb_t6050_init(void (*set_step)(unsigned step))
 {
+    atc0_controller_used = true;
     struct usb_t6050_regs regs;
     if (usb_t6050_get_regs(&regs)) {
         printf("CDC USB2: unsupported T6050 ADT layout\n");
@@ -371,6 +379,30 @@ static int usb_drd_get_regs(u32 idx, struct usb_drd_regs *regs)
     return 0;
 }
 
+/* An earlier stage is not covered by this image's controller-use record. */
+bool usb_atc0_quiescent(void)
+{
+    struct usb_t6050_regs regs;
+
+    if (chip_id != T6050 || !adt_is_compatible(adt, 0, "J714sAP") || usb_atc0_used())
+        return false;
+    if (usb_t6050_get_regs(&regs) || pmgr_adt_is_powered("/arm-io/atc-phy0") != 1 ||
+        pmgr_adt_is_powered("/arm-io/usb-drd0") != 1)
+        return false;
+    if (!(read32(regs.pipe + PIPEHANDLER_AON_GEN) & PIPEHANDLER_AON_GEN_DWC3_RESET_N))
+        return true;
+
+    /* The same retired-device check used before T6050 CDC takes the PIPE. */
+    u32 mux = read32(regs.pipe + PIPEHANDLER_MUX_CTRL) & 0x73;
+    if (mux != 0x22 && mux != 0x42)
+        return false;
+    return (read32(regs.dwc + DWC3_GCTL) & DWC3_GCTL_PRTCAPDIR(DWC3_GCTL_PRTCAP_OTG)) ==
+               DWC3_GCTL_PRTCAPDIR(DWC3_GCTL_PRTCAP_DEVICE) &&
+           !(read32(regs.dwc + DWC3_DCTL) & DWC3_DCTL_RUN_STOP) &&
+           (read32(regs.dwc + DWC3_DSTS) & DWC3_DSTS_DEVCTRLHLT) &&
+           !read32(regs.dwc + DWC3_DEVTEN) && !read32(regs.dwc + DWC3_DALEPENA);
+}
+
 int usb_phy_bringup(u32 idx)
 {
     char path[24];
@@ -426,6 +458,8 @@ dwc3_dev_t *usb_iodev_bringup(u32 idx)
     if (usb_device_mode_disabled(idx))
         return NULL;
 
+    if (idx == 0)
+        atc0_controller_used = true;
     dart_dev_t *usb_dart = usb_dart_init(idx);
     if (!usb_dart)
         return NULL;
