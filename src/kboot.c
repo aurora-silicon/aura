@@ -792,6 +792,76 @@ static int dt_reserve_retained_span(u64 start, u64 end)
     return 0;
 }
 
+/*
+ * A DCP handed on running (display_shutdown()) keeps its RTKit session: the next owner must not
+ * repeat HELLO/EPMAP, which a running IOP does not answer. Describe that session on the DCP's own
+ * node so the kernel can adopt it:
+ *   apple,rtkit-live          <1>            version of this description
+ *   apple,rtkit-version       <n>            RTKit protocol version the session runs
+ *   apple,rtkit-epmap         <8 cells>      endpoint map the IOP announced; cell i holds
+ *                                            endpoints 32 * i to 32 * i + 31 (application
+ *                                            endpoints included; all are stopped at handoff)
+ *   apple,rtkit-live-buffers  <8 cells each> ep, flags (bit 0: loader-owned, inside the
+ *                                            reserved range [@lo, @hi)), IOVA (2), physical
+ *                                            address (2), size (2) of each system buffer
+ * A loader-owned buffer outside that range is not described and the node gets no description,
+ * so the kernel keeps its normal boot path.
+ */
+static int dt_publish_live_rtkit(u64 lo, u64 hi)
+{
+    const char *alias = NULL;
+    const struct rtkit_live_state *st = display_live_rtkit_state(&alias);
+    if (!st)
+        return 0;
+
+    /* A copy: setting properties moves the rest of the tree, the alias string included. */
+    char path[128];
+    const char *apath = fdt_get_alias(dt, alias);
+    int node = -1;
+    if (apath && strlen(apath) < sizeof(path)) {
+        strcpy(path, apath);
+        node = fdt_path_offset(dt, path);
+    }
+    if (node < 0) {
+        printf("FDT: live RTKit: no node for alias %s\n", alias);
+        return 0;
+    }
+
+    fdt32_t bufs[RTKIT_LIVE_MAX_BUFFERS * 8];
+    for (u32 i = 0; i < st->n_buffers; i++) {
+        const struct rtkit_live_buffer *b = &st->buffers[i];
+        if ((b->flags & RTKIT_LIVE_BUFFER_OWNED) &&
+            (b->phys < lo || b->size > hi - lo || b->phys - lo > hi - lo - b->size)) {
+            printf("FDT: live RTKit: %s buffer ep %u [0x%lx+0x%lx) not reserved; not described\n",
+                   alias, b->ep, b->phys, b->size);
+            return 0;
+        }
+        fdt32_t *c = &bufs[i * 8];
+        c[0] = cpu_to_fdt32(b->ep);
+        c[1] = cpu_to_fdt32(b->flags);
+        c[2] = cpu_to_fdt32(b->iova >> 32);
+        c[3] = cpu_to_fdt32(b->iova);
+        c[4] = cpu_to_fdt32(b->phys >> 32);
+        c[5] = cpu_to_fdt32(b->phys);
+        c[6] = cpu_to_fdt32(b->size >> 32);
+        c[7] = cpu_to_fdt32(b->size);
+    }
+    fdt32_t epmap[8];
+    for (int i = 0; i < 8; i++)
+        epmap[i] = cpu_to_fdt32(st->epmap[i]);
+
+    if (fdt_setprop_u32(dt, node, "apple,rtkit-version", st->version) ||
+        fdt_setprop(dt, fdt_path_offset(dt, path), "apple,rtkit-epmap", epmap, sizeof(epmap)) ||
+        fdt_setprop(dt, fdt_path_offset(dt, path), "apple,rtkit-live-buffers", bufs,
+                    st->n_buffers * 8 * sizeof(fdt32_t)) ||
+        fdt_setprop_u32(dt, fdt_path_offset(dt, path), "apple,rtkit-live", 1))
+        return -1;
+
+    printf("FDT: %s: live RTKit session v%u, %u system buffer(s), epmap %08x %08x\n", alias,
+           st->version, st->n_buffers, st->epmap[0], st->epmap[1]);
+    return 0;
+}
+
 /* Windows A to C. One inside the firmware RO range (T8140) is reserved with that range. */
 static int dt_reserve_ctxr_low_windows(void)
 {
@@ -12591,6 +12661,8 @@ int kboot_prepare_dt(void *fdt)
                 bail("FDT: couldn't reserve retained heap\n");
             image_end = heap_start;
             printf("FDT: retained heap [0x%lx, 0x%lx)\n", heap_start, heap_end);
+            if (local_dcp && dt_publish_live_rtkit(image_start, heap_end))
+                bail("FDT: couldn't describe the live DCP RTKit session\n");
         }
     }
     if (dt_reserve_retained_span(image_start, image_end))

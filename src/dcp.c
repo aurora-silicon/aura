@@ -457,8 +457,13 @@ static bool dcp_handed_on;
  * buffers and DART mappings and the scanout left running. It counts as running from here on, so
  * it is not started again and the next stage keeps its memory (kboot reserves the heap).
  */
+static struct rtkit_live_state dcp_live_state;
+static bool dcp_live_state_valid;
+
 int dcp_hand_on(dcp_dev_t *dcp)
 {
+    /* Stopping the endpoints changes neither the endpoint map nor the system buffers. */
+    dcp_live_state_valid = rtkit_get_live_state(dcp->rtkit, &dcp_live_state);
     int ret = dcp_handoff(dcp);
     dcp_running = true;
     dcp_handed_on = !ret;
@@ -468,6 +473,12 @@ int dcp_hand_on(dcp_dev_t *dcp)
 bool dcp_handed_on_live(void)
 {
     return dcp_handed_on;
+}
+
+/* The RTKit session of the DCP handed on running, if this stage negotiated it. */
+const struct rtkit_live_state *dcp_live_rtkit_state(void)
+{
+    return dcp_handed_on && dcp_live_state_valid ? &dcp_live_state : NULL;
 }
 
 int dcp_shutdown(dcp_dev_t *dcp, bool sleep)

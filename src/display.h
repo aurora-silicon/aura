@@ -32,6 +32,8 @@ bool display_dart_tables_inherited(void);
 bool display_needs_live_receiver(void);
 int display_prepare_live_handoff(void);
 bool display_handed_on_live(void);
+struct rtkit_live_state;
+const struct rtkit_live_state *display_live_rtkit_state(const char **alias);
 
 #define DISPLAY_LIVE_ADT_PROP "aurora,dcp-retained-heap"
 bool display_inherited_live_heap(u64 *start);

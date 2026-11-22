@@ -121,6 +121,11 @@ struct rtkit_dev {
     bool no_hello;
     /* Started warm: the firmware keeps the buffers an earlier owner gave it. */
     bool inherited;
+
+    /* The negotiated session, for a later owner (rtkit_get_live_state()). */
+    u32 version;
+    u32 epmap[8];
+    bool have_epmap;
 };
 
 struct syslog_log {
@@ -731,6 +736,9 @@ static bool rtkit_boot_internal(rtkit_dev_t *rtk, u32 timeout_usec, bool warm, u
     }
 
     rtkit_printf("booting with version %d\n", want_ver);
+    rtk->version = want_ver;
+    memset(rtk->epmap, 0, sizeof(rtk->epmap));
+    rtk->have_epmap = false;
 
     msg.msg0 = FIELD_PREP(MGMT_TYPE, MGMT_MSG_HELLO_ACK);
     msg.msg0 |= FIELD_PREP(MGMT_MSG_HELLO_MINVER, want_ver);
@@ -768,6 +776,7 @@ static bool rtkit_boot_internal(rtkit_dev_t *rtk, u32 timeout_usec, bool warm, u
 
         u32 bitmap = FIELD_GET(MGMT_MSG_EPMAP_BITMAP, msg.msg0);
         u32 base = FIELD_GET(MGMT_MSG_EPMAP_BASE, msg.msg0);
+        rtk->epmap[base] |= bitmap;
         for (unsigned int i = 0; i < 32; i++) {
             if (bitmap & (1U << i)) {
                 u8 ep_idx = 32 * base + i;
@@ -797,8 +806,10 @@ static bool rtkit_boot_internal(rtkit_dev_t *rtk, u32 timeout_usec, bool warm, u
             }
         }
 
-        if (msg.msg0 & MGMT_MSG_EPMAP_DONE)
+        if (msg.msg0 & MGMT_MSG_EPMAP_DONE) {
             got_epmap = true;
+            rtk->have_epmap = true;
+        }
 
         msg.msg0 = FIELD_PREP(MGMT_TYPE, MGMT_MSG_EPMAP_REPLY);
         msg.msg0 |= FIELD_PREP(MGMT_MSG_EPMAP_BASE, base);
@@ -841,6 +852,35 @@ static bool rtkit_boot_internal(rtkit_dev_t *rtk, u32 timeout_usec, bool warm, u
         !rtkit_wait_for_power(rtk, &rtk->ap_power, RTKIT_POWER_ON, timeout_usec, "AP"))
         return false;
 
+    return true;
+}
+
+static void rtkit_live_add(struct rtkit_live_state *st, u32 ep, const struct rtkit_buffer *bfr,
+                           u64 dva_base)
+{
+    if (!bfr->bfr || !bfr->sz || st->n_buffers >= RTKIT_LIVE_MAX_BUFFERS)
+        return;
+    struct rtkit_live_buffer *b = &st->buffers[st->n_buffers++];
+    b->ep = ep;
+    b->flags = bfr->owned ? RTKIT_LIVE_BUFFER_OWNED : 0;
+    b->iova = bfr->dva | dva_base;
+    b->phys = (u64)bfr->bfr;
+    b->size = bfr->sz;
+}
+
+/* Only a session whose endpoint map this owner received completely can be described. */
+bool rtkit_get_live_state(rtkit_dev_t *rtk, struct rtkit_live_state *st)
+{
+    memset(st, 0, sizeof(*st));
+    if (!rtk || !rtk->have_epmap || rtk->crashed)
+        return false;
+
+    st->version = rtk->version;
+    memcpy(st->epmap, rtk->epmap, sizeof(st->epmap));
+    rtkit_live_add(st, RTKIT_EP_CRASHLOG, &rtk->crashlog_bfr, rtk->dva_base);
+    rtkit_live_add(st, RTKIT_EP_SYSLOG, &rtk->syslog_bfr, rtk->dva_base);
+    rtkit_live_add(st, RTKIT_EP_IOREPORT, &rtk->ioreport_bfr, rtk->dva_base);
+    rtkit_live_add(st, RTKIT_EP_OSLOG, &rtk->oslog_bfr, rtk->dva_base);
     return true;
 }
 

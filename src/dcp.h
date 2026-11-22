@@ -52,6 +52,7 @@ int dcp_shutdown(dcp_dev_t *dcp, bool sleep);
 int dcp_handoff(dcp_dev_t *dcp);
 int dcp_hand_on(dcp_dev_t *dcp);
 bool dcp_handed_on_live(void);
+const struct rtkit_live_state *dcp_live_rtkit_state(void);
 bool dcp_left_running(void);
 u32 t8152_psd_state(u32 service);
 bool dcp_init_left_quiesced(void);

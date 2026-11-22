@@ -1255,6 +1255,18 @@ bool display_handed_on_live(void)
     return dcp_handed_on_live();
 }
 
+/* The RTKit session of the DCP this stage handed on running, and that DCP's DT alias. */
+const struct rtkit_live_state *display_live_rtkit_state(const char **alias)
+{
+    const struct rtkit_live_state *st = dcp_live_rtkit_state();
+    const display_config_t *conf = st ? display_get_config() : NULL;
+
+    if (!conf)
+        return NULL;
+    *alias = conf->dcp_alias;
+    return st;
+}
+
 int display_shutdown(dcp_shutdown_mode mode)
 {
     if (chip_id == T8152 && mode == DCP_HANDOFF)
