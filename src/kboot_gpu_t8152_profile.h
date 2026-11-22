@@ -1,6 +1,15 @@
 /* SPDX-License-Identifier: MIT */
 /* Pinned G18G identities per firmware build; tools/g18g_firmware_identity.py
  * prints each entry. 26A428 (macOS 27.0, 27.0.1) and 26B123 (macOS 27.2). */
+/* J804 (MacBook Pro 14-inch M6), macOS 27.2 (26B7124), RTKit 3514.41.1: the same receipt,
+ * TEXT sizes and TLV sequence as 26B123, but not the same images. Its two identities (role,
+ * uuid, TEXT size, patchbay offset, SHA-256) are measured from the firmware of the user's own
+ * macOS and are not kept in this repository: the Makefile turns
+ * $(J804_PRIVATE_DATA)/aura/g18g-j804-gpu-profile.h into J804_GPU_PROFILES in
+ * build/j804_gpu_profile.h. Without that file J804_GPU_PROFILES_AVAILABLE is 0, no J804 entry
+ * is built, and J804's firmware is refused as any build that is not pinned. */
+#include "../build/j804_gpu_profile.h"
+
 static const struct gpu_build builds[] = {
     {"G18G-RTKit-3514.0.15.release",
      {
@@ -36,6 +45,9 @@ static const struct gpu_build builds[] = {
            0x6c, 0xf6, 0xb0, 0x9a, 0x79, 0x44, 0x09, 0xc0, 0x1c, 0x65, 0x27,
            0xc6, 0x9d, 0x8b, 0x5e, 0x5e, 0x4c, 0x2f, 0xfd, 0xdb, 0x38}},
      }},
+#if J804_GPU_PROFILES_AVAILABLE
+    {"G18G-RTKit-3514.41.1.release", {J804_GPU_PROFILES}},
+#endif
 };
 static const struct gpu_tlv tlvs[] = {
     {"GKTS", 8, true},  {"BPxG", 8, false}, {"SPxG", 8, false}, {"DILS", 8, true},

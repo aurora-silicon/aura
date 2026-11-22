@@ -461,6 +461,31 @@ build-cfg src/../build/build_cfg.h &:
 	$(QUIET)cmp -s build/build_cfg.h build/build_cfg.tmp 2>/dev/null || \
 	( mv -f build/build_cfg.tmp build/build_cfg.h && echo "  CFG   build/build_cfg.h" )
 
+# J804's G18G firmware identities (src/kboot_gpu_t8152_profile.h) are measured from the user's
+# own macOS firmware and are not kept in this repository. They are read at build time from
+# J804_PRIVATE_DATA (by default the folder j804-private-data next to this checkout; a relative
+# path is taken from the top of this checkout). The file holds the {"gfx-asc", ...} and
+# {"gfx1-asc", ...} profile initializers in the format of builds[] in
+# src/kboot_gpu_t8152_profile.h: role, firmware LC_UUID (the uuid of the ADT gfx-asc / gfx1-asc
+# nub), TEXT segment size, patchbay offset inside TEXT and the SHA-256 that
+# src/kboot_gpu_t8152.c computes over TEXT (tools/g18g_firmware_identity.py prints them), with
+# no // comments. Without it the build goes on with no J804 entry.
+J804_PRIVATE_DATA ?= ../j804-private-data
+J804_GPU_PROFILE = $(J804_PRIVATE_DATA)/aura/g18g-j804-gpu-profile.h
+
+build/kboot_gpu_t8152.o: build/j804_gpu_profile.h
+build/j804_gpu_profile.h: always_rebuild
+	$(QUIET)mkdir -p build
+	$(QUIET)if [ -f "$(J804_GPU_PROFILE)" ]; then \
+	  { echo '#define J804_GPU_PROFILES_AVAILABLE 1'; echo '#define J804_GPU_PROFILES \'; \
+	    sed 's/$$/ \\/' "$(J804_GPU_PROFILE)"; echo ''; } > $@.tmp; \
+	  msg=""; \
+	else \
+	  echo '#define J804_GPU_PROFILES_AVAILABLE 0' > $@.tmp; \
+	  msg=" (no $(J804_GPU_PROFILE): no J804 G18G entry)"; \
+	fi; \
+	if cmp -s $@.tmp $@; then rm -f $@.tmp; else mv -f $@.tmp $@ && echo "  J804  $@$$msg"; fi
+
 # The built-in boot logos are linked gzip-compressed; fb.c inflates them on first use.
 # They are only read, so they go in .rodata. aura-raw.ld links them with the fonts past
 # _file_vital_end instead, where the DCP log buffer may overwrite them: fb.c then finds a bad gzip
