@@ -3,7 +3,12 @@
 #
 # The canonical policy is .github/aurora/AGENTS.md on the default branch.
 # AGENTS.md, CLAUDE.md, GEMINI.md and .github/copilot-instructions.md may
-# exist only as byte-identical regular-file copies of it. Every other
+# exist only as byte-identical regular-file copies of it. On a branch that
+# is not a policy branch, a copy of the branch's own .github/aurora/AGENTS.md
+# is also accepted: that branch forked from an older default branch and
+# merging it brings the copies forward with the policy file. A copy path
+# that holds anything else is rewritten to the policy file, never deleted,
+# so a heal commit cannot conflict with the default branch. Every other
 # assistant instruction file (any directory depth) is a violation, except
 # paths listed one per line in .github/aurora/agent-policy-allow on the
 # default branch.
@@ -89,8 +94,11 @@ is_allowed() {
 # Print "mode type oid<TAB>path" for each violation in commit $1.
 # Print "missing<TAB>path" for each copy path that is absent (policy use).
 scan_commit() {
-	local commit=$1 meta mode type oid path c
+	local commit=$1 meta mode type oid path c own
 	declare -A seen=()
+	# The branch's own policy file: copies of it are a consistent older
+	# snapshot of the default branch, not a violation.
+	own=$(git rev-parse -q --verify "$commit:$CANON_PATH" 2>/dev/null || true)
 	# One awk pass picks the candidates: assistant files at any depth and
 	# assistant directories (whose contents are not listed separately).
 	while IFS=$'\t' read -r meta path; do
@@ -100,7 +108,8 @@ scan_commit() {
 			[ "$path" = "$CANON_PATH" ] && continue
 			if is_copy_path "$path"; then
 				seen[$path]=1
-				if [ -n "$CANON" ] && [ "$mode" = 100644 ] && [ "$oid" = "$CANON" ]; then
+				if [ "$mode" = 100644 ] && { { [ -n "$CANON" ] && [ "$oid" = "$CANON" ]; } ||
+					{ [ -n "$own" ] && [ "$oid" = "$own" ]; }; }; then
 					continue
 				fi
 			fi
@@ -142,6 +151,12 @@ heal() {
 	git read-tree "$tip"
 	for line in "${viol[@]+"${viol[@]}"}"; do
 		p=${line#*$'\t'}
+		if is_copy_path "$p" && [ "$(printf '%s' "$line" | cut -d' ' -f2)" != tree ]; then
+			# Never delete a copy: sync it to the policy file on the
+			# default branch. Without a policy file, leave it alone.
+			[ -n "$CANON" ] && git update-index --add --cacheinfo "100644,$CANON,$p"
+			continue
+		fi
 		if [ "$(printf '%s' "$line" | cut -d' ' -f2)" = tree ]; then
 			git ls-tree -r -z --full-tree --name-only "$tip" -- "$p" | while IFS= read -r -d '' f; do
 				printf '0 %s\t%s\n' "$ZERO" "$f"
@@ -162,7 +177,7 @@ heal() {
 		log "$b: nothing to change"
 		return 0
 	fi
-	msg=$(printf 'gfya\n\nAurora agent policy: remove assistant instruction files that are\nnot copies of %s on %s, and keep the copies on policy\nbranches identical to it.\n' "$CANON_PATH" "$DEFAULT_BRANCH")
+	msg=$(printf 'agent-policy: sync assistant instruction files to %s\n\nAurora agent policy: remove assistant instruction files that are not\npolicy copies, and sync AGENTS.md, CLAUDE.md, GEMINI.md and\n.github/copilot-instructions.md to %s on %s.\n' "$CANON_PATH" "$CANON_PATH" "$DEFAULT_BRANCH")
 	commit=$(GIT_AUTHOR_NAME=$BOT_NAME GIT_AUTHOR_EMAIL=$BOT_EMAIL \
 		GIT_COMMITTER_NAME=$BOT_NAME GIT_COMMITTER_EMAIL=$BOT_EMAIL \
 		git commit-tree "$newtree" -p "$tip" -m "$msg")
