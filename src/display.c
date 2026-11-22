@@ -90,6 +90,21 @@ static struct {
     struct boot_video video;
 } display_other;
 struct boot_video display_second_video;
+
+/* T8152: the internal DCP's RTKit at the hand-off, for apple,dcp-rtkit-running: -1 aura
+ * never started it, 1 running, 0 quiesced after a failed start. Only the internal DCP's
+ * own state, not the second display's while that one is swapped in. */
+static int display_dcp_state = -1;
+
+static bool display_internal_active(void)
+{
+    return chip_id == T8152 && !strcmp(t8152_config->dcp, "/arm-io/dcp");
+}
+
+int display_dcp_handoff_state(void)
+{
+    return display_dcp_state;
+}
 /* Framebuffer size display_start_dcp maps instead of /vram (the first
  * display's memory) when bringing up the second display. */
 static u64 display_fb_override_size;
@@ -102,6 +117,24 @@ static bool display_mode_max;
 static bool fb_dva_allocated;
 
 #define USE_DCPEXT 1
+
+/* The controllers whose live AFK endpoints are passed on (dcp.afk-live=). */
+static const char *const display_afk_paths[2] = {"/arm-io/dcp", "/arm-io/dcpext0"};
+/* Endpoints an earlier aura stage left running on them (dcp.afk-live=). */
+static u32 display_afk_inherited[2];
+/* This stage took the earlier stage's display over as it was, and which controllers it
+ * started a session of its own on since: only an adopted, untouched one still runs those. */
+static bool display_afk_adopted;
+static bool display_afk_restarted[2];
+static char display_afk_line[sizeof("dcp.afk-live=ffff,ffff")];
+
+/* This stage starts a session of its own on the controller at @adt_path. */
+static void display_afk_restart(const char *adt_path)
+{
+    for (size_t i = 0; i < ARRAY_SIZE(display_afk_paths); i++)
+        if (!strcmp(display_afk_paths[i], adt_path))
+            display_afk_restarted[i] = true;
+}
 
 static const display_config_t display_config_m2 = {
 #if USE_DCPEXT
@@ -376,6 +409,15 @@ static bool display_t6030_hands_off(const char *what)
     return true;
 }
 
+/* Stop a DCP that did not come up, and record the internal DCP's state. */
+static void display_stop_failed_dcp(void)
+{
+    bool stopped = !dcp_shutdown(dcp, false);
+
+    if (display_internal_active())
+        display_dcp_state = !stopped;
+}
+
 int display_start_dcp(void)
 {
     if (iboot)
@@ -403,11 +445,21 @@ int display_start_dcp(void)
 
     display_is_dptx = !!disp_cfg->dptx_phy[0];
 
+    display_afk_restart(disp_cfg->dcp);
     dcp = dcp_init(disp_cfg);
     if (!dcp) {
+        /* dcp_init() leaves a DCP it booted quiesced, or running if that failed. */
+        if (display_internal_active()) {
+            if (dcp_left_running())
+                display_dcp_state = 1;
+            else if (dcp_init_left_quiesced())
+                display_dcp_state = 0;
+        }
         printf("display: failed to initialize DCP\n");
         return -1;
     }
+    if (display_internal_active())
+        display_dcp_state = 1;
 
     // determine frame buffer PA and size from "/vram"
     u64 pa, size;
@@ -431,14 +483,14 @@ int display_start_dcp(void)
     if (DART_IS_ERR(fb_dva)) {
         printf("display: failed to find display DVA\n");
         fb_dva = 0;
-        dcp_shutdown(dcp, false);
+        display_stop_failed_dcp();
         return -1;
     }
 
     iboot = dcp_ib_init(dcp);
     if (!iboot) {
         printf("display: failed to initialize DCP iBoot interface\n");
-        dcp_shutdown(dcp, false);
+        display_stop_failed_dcp();
         return -1;
     }
 
@@ -819,6 +871,84 @@ static void display_swap_state(void)
 #undef SWAP
 }
 
+/* Whether aura ever started DCPEXT0 for the second display, successfully or not. */
+bool display_second_attempted(void)
+{
+    return display_other.cfg;
+}
+
+/*
+ * Whether display_shutdown() hands the display controllers on live, sessions and scanout
+ * intact, at both the Stage 1 and the Linux boundary: Linux owns the live J700/J713
+ * controllers. On T8152 that holds for every mode but DCP_HANDOFF, which the stage that
+ * started a session runs at both boundaries (display_handoff_t8152()), so its endpoints are
+ * stopped by then and nothing is reported or passed on. Elsewhere display_shutdown() stops the
+ * endpoints before the next stage runs.
+ */
+static bool display_hands_on_live(void)
+{
+    return chip_id == T8140 || chip_id == T8132 || chip_id == T8152;
+}
+
+/*
+ * The AFK endpoints aura (this stage or an earlier one) started and left running on the
+ * controller at @adt_path, as bits from endpoint 0x20, 0 if none. An earlier stage's count
+ * only where this stage adopted its display and started nothing of its own there. An INIT
+ * on a live endpoint asserts in the firmware, so the next owner must stop these first.
+ */
+u32 display_live_endpoints(const char *adt_path)
+{
+    u32 mask = 0;
+
+    if (dcp && t8152_config && !strcmp(t8152_config->dcp, adt_path))
+        mask |= afk_epic_live_endpoints(dcp->afk);
+    if (display_other.dcp && display_other.cfg && !strcmp(display_other.cfg->dcp, adt_path))
+        mask |= afk_epic_live_endpoints(display_other.dcp->afk);
+    for (size_t i = 0; i < ARRAY_SIZE(display_afk_paths); i++)
+        if (display_afk_adopted && !display_afk_restarted[i] &&
+            !strcmp(display_afk_paths[i], adt_path))
+            mask |= display_afk_inherited[i];
+
+    return mask;
+}
+
+/* dcp.afk-live=XXXX,XXXX from an earlier stage: its live endpoints on /arm-io/dcp, dcpext0. */
+bool display_set_afk_live(const char *val)
+{
+    u32 masks[2] = {0, 0};
+
+    for (size_t i = 0; i < ARRAY_SIZE(masks); i++, val++) {
+        for (int d = 0; d < 4; d++, val++) {
+            char c = *val | 0x20;
+            if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')))
+                return false;
+            masks[i] = masks[i] << 4 | (c <= '9' ? c - '0' : c - 'a' + 10);
+        }
+        if (*val != (i ? '\0' : ','))
+            return false;
+    }
+    memcpy(display_afk_inherited, masks, sizeof(masks));
+    return true;
+}
+
+/*
+ * The variable that passes the live endpoints on to the next aura stage, or NULL if none: only
+ * where display_shutdown() keeps the sessions running. On T8152 chainload_load() runs
+ * display_shutdown(DCP_HANDOFF) first, so it carries only an endpoint that did not stop.
+ */
+char *display_afk_var(void)
+{
+    u32 live[2];
+
+    for (size_t i = 0; i < ARRAY_SIZE(live); i++)
+        live[i] = display_live_endpoints(display_afk_paths[i]);
+    if (!display_hands_on_live() || !(live[0] | live[1]))
+        return NULL;
+    snprintf(display_afk_line, sizeof(display_afk_line), "dcp.afk-live=%04x,%04x", live[0],
+             live[1]);
+    return display_afk_line;
+}
+
 /* Configure the second display: bring it up on first use with its own
  * framebuffer, or modeset it later (the loader calls this by symbol). */
 int display_configure_second(const char *config)
@@ -877,6 +1007,7 @@ static int display_init_t8152(void)
         !(cur_boot_args.video.width == 640 && cur_boot_args.video.height == 1136)) {
         printf("display: Using firmware framebuffer (%ldx%ld)\n", cur_boot_args.video.width,
                cur_boot_args.video.height);
+        display_afk_adopted = true;
         return 0;
     }
 
@@ -1037,11 +1168,54 @@ int display_init(void)
     }
 }
 
+/*
+ * Hand one T8152 display controller over as iBoot would: display powered off, AFK endpoints
+ * stopped, RTKit running. The next owner, an aura stage or Linux, starts its own session on the
+ * running core. A session handed on live fails there: the firmware asks the new owner for a
+ * buffer it never mapped and crashes before any endpoint can be stopped (aura#419). A stage
+ * that only adopted the display has nothing to hand over here (iboot is NULL); the stage that
+ * started the session ran this at its own boundary.
+ */
+static int display_handoff_one_t8152(const char *what)
+{
+    if (!iboot)
+        return 0;
+    /* The next owner starts a new iBoot session, which drops the surface: a pipe still
+     * running then fetches from a null base and the DCP takes an NMI. Power it off first. */
+    if (dcp_ib_set_power(iboot, false) < 0)
+        printf("display: failed to power off the %s display for the hand-off\n", what);
+    /* An endpoint that does not stop stays registered and is reported as live. */
+    dcp_ib_shutdown(iboot);
+    iboot = NULL;
+    printf("display: stopping the %s DCP's endpoints, RTKit stays on\n", what);
+    if (dcp_handoff(dcp) < 0) {
+        printf("display: a %s DCP endpoint did not stop\n", what);
+        return -1;
+    }
+    return 0;
+}
+
+static int display_handoff_t8152(void)
+{
+    int ret = display_handoff_one_t8152("first");
+
+    if (display_other.dcp) {
+        display_swap_state();
+        if (display_handoff_one_t8152("second") < 0)
+            ret = -1;
+        display_swap_state();
+    }
+    return ret;
+}
+
 int display_shutdown(dcp_shutdown_mode mode)
 {
-    /* Linux owns the live J700/J713/J873 controllers. Keep the inherited ASC session
-     * and scanout intact at both the Stage 1 and Linux boundaries. */
-    if (chip_id == T8140 || chip_id == T8132 || chip_id == T8152)
+    if (chip_id == T8152 && mode == DCP_HANDOFF)
+        return display_handoff_t8152();
+
+    /* Linux owns the live J700/J713 controllers, and T8152's outside DCP_HANDOFF. Keep the
+     * inherited ASC session and scanout intact at both the Stage 1 and Linux boundaries. */
+    if (display_hands_on_live())
         return 0;
 
     /* We have no DCP, so just exit */

@@ -1,0 +1,8 @@
+{
+  "comment": "Chips whose iBoot leaves the CTXR windows armed on the secondaries for a kcbz-0 boot object, so the Stage 1 boot object is padded for the execute window. Read by tools/execute_window.py. Aura checks it against the CTXR probe on every boot and warns when they disagree. See docs/macho-boot-object.md#which-chips-pad-the-boot-object.",
+  "version": 1,
+  "chip_id_ranges": [
+    ["0x8130", "0x8fff"],
+    ["0x6040", "0x6fff"]
+  ]
+}

@@ -11,10 +11,10 @@
 
 #ifdef SMP_HEAP_STACKS
 /* Allocated by smp_init() (smp_asm.h) */
-extern u8 *secondary_stacks[MAX_CPUS];
+extern u8 *secondary_stacks[SECONDARY_STACKS];
 extern u8 *secondary_stacks_el3[MAX_EL3_CPUS];
 #else
-extern u8 secondary_stacks[MAX_CPUS][SECONDARY_STACK_SIZE];
+extern u8 secondary_stacks[SECONDARY_STACKS][SECONDARY_STACK_SIZE];
 extern u8 secondary_stacks_el3[MAX_EL3_CPUS][SECONDARY_STACK_SIZE];
 #endif
 

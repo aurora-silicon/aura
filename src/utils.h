@@ -508,7 +508,7 @@ enum cpufeat_uncore_version {
 enum cpufeat_siq_cfg {
     SIQ_CFG_KEEP = 0,    // no write
     SIQ_CFG_ROUTE_2 = 1, // route 2 (M1-M3)
-    SIQ_CFG_ROUTE_0 = 2, // route 0, as the native OS's kernel writes on M5
+    SIQ_CFG_ROUTE_0 = 2, // route 0, as the native OS's kernel writes (M4 and later)
 };
 
 /* The proxy reads this layout (proxyclient/aura/proxy.py CPUFeatures). */

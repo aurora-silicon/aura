@@ -31,6 +31,9 @@ typedef uint32_t u32;
 #define SZ_16K 16384
 #define ALIGN_UP(v,a) (((v)+(a)-1)&~((a)-1))
 static void *dt;
+static bool chosen_lost;
+static bool shares_image;
+static bool dt_t8122_dcpext_shares_image(const char *alias) { (void)alias; return shares_image; }
 static const char *ext26_step;
 static char ext26_detail[256];
 ''' + seg_type + page_type + function('dt_ext26_page', 'int') +
@@ -47,21 +50,21 @@ int main(void) {
  assert(!fdt_setprop_string(dt,aliases,"dcp","/panel"));
  int panel=fdt_add_subnode(dt,0,"panel"); assert(panel>=0);
  int chosen=fdt_add_subnode(dt,0,"chosen"); assert(chosen>=0);
- assert(!dt_t8122_dcpext_armed());
+ assert(!dt_t8122_dcpext_armed("dcpext"));
  assert(!fdt_setprop_string(dt,chosen,"asahi,t8122-dcpext","1"));
- assert(!dt_t8122_dcpext_armed());
+ assert(!dt_t8122_dcpext_armed("dcpext"));
  panel=fdt_path_offset(dt,"dcp");
  assert(!fdt_setprop_u32(dt,panel,"apple,t8122-handoff",1));
- assert(dt_t8122_dcpext_armed());
+ assert(dt_t8122_dcpext_armed("dcpext"));
  assert(!fdt_setprop_u32(dt,panel,"apple,j613-25g83-mapping-handoff",1));
- assert(!dt_t8122_dcpext_armed()); /* Old opt-in cannot arm native26. */
+ assert(!dt_t8122_dcpext_armed("dcpext")); /* Old opt-in cannot arm native26. */
  chosen=fdt_path_offset(dt,"/chosen");
  assert(!fdt_setprop_string(dt,chosen,"asahi,j613-25g83-dcpext","1"));
- assert(dt_t8122_dcpext_armed());
+ assert(dt_t8122_dcpext_armed("dcpext"));
  const char *bad[]={"", "0", "true", "11"};
  for (unsigned i=0;i<4;i++) {
   assert(!fdt_setprop_string(dt,chosen,"asahi,j613-25g83-dcpext",bad[i]));
-  assert(!dt_t8122_dcpext_armed());
+  assert(!dt_t8122_dcpext_armed("dcpext"));
  }
  struct adt_segment_ranges segments[4] = {0};
  segments[0].phys=0x100000; segments[0].remap=0x800000000; segments[0].size=32768;

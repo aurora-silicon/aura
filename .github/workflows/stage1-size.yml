@@ -15,6 +15,13 @@ on:
 permissions:
   contents: read
 
+# A newer push to main supersedes the run for the older main head. PR heads, tags and manual
+# runs get a group of their own and are never cancelled: the merge train needs CI on the exact
+# PR head.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'main-push' || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+
 jobs:
   gcc:
     runs-on: ubuntu-24.04
@@ -45,6 +52,10 @@ jobs:
         run: |
           export MAKE=gmake NM="$(brew --prefix llvm)/bin/llvm-nm"
           sh tools/stage1_size.sh clang-macos BUILTIN_LOGO=aurora
+      - name: Link the ESP Stage 2
+        run: |
+          gmake clean
+          gmake -j3 RELEASE=1 CHAINLOADING=1 ESP_STAGE2=1 BUILTIN_LOGO=aurora
 
   fedora:
     # As fedora-aurora's aura.spec builds it: Fedora clang and Rust, core built from rust-src.
@@ -73,7 +84,14 @@ jobs:
             sed -i -e "s/^CheckSpace/#CheckSpace/" -e "/^\[options\]/a DisableSandbox" /etc/pacman.conf
             pacman-key --init >/dev/null
             pacman-key --populate archlinuxarm >/dev/null
-            pacman -Syu --noconfirm --needed clang lld llvm rustup make python >/dev/null
+            # mirror.archlinuxarm.org stalls now and then ("Operation too slow"); a stalled
+            # download fails the whole transaction, so try it again before giving up.
+            for try in 1 2 3; do
+              pacman -Syu --noconfirm --needed clang lld llvm rustup make python >/dev/null && break
+              [ "$try" = 3 ] && exit 1
+              echo "pacman: download failed (try $try of 3), retrying in 60 s"
+              sleep 60
+            done
             # The toolchain alarm-aurora packages/aura/PKGBUILD pins.
             rustup toolchain install 1.99.0 --profile minimal --target aarch64-unknown-none-softfloat >/dev/null
             export RUSTUP_TOOLCHAIN=1.99.0
