@@ -42,14 +42,28 @@ static void *dt;
 void *adt;
 static char logbuf[8192];
 static size_t loglen;
+static int log_vprintf(const char *fmt, va_list ap)
+{
+    int n = vsnprintf(logbuf + loglen, sizeof(logbuf) - loglen, fmt, ap);
+    if (n > 0)
+        loglen += (size_t)n < sizeof(logbuf) - loglen ? (size_t)n : sizeof(logbuf) - loglen - 1;
+    return n;
+}
 static int log_printf(const char *fmt, ...)
 {
     va_list ap;
     va_start(ap, fmt);
-    int n = vsnprintf(logbuf + loglen, sizeof(logbuf) - loglen, fmt, ap);
+    int n = log_vprintf(fmt, ap);
     va_end(ap);
-    if (n > 0)
-        loglen += (size_t)n < sizeof(logbuf) - loglen ? (size_t)n : sizeof(logbuf) - loglen - 1;
+    return n;
+}
+/* src/devicetree.c logs through utils.h's printf, which is debug_printf. */
+int debug_printf(const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    int n = log_vprintf(fmt, ap);
+    va_end(ap);
     return n;
 }
 #define printf log_printf
