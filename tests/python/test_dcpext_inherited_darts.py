@@ -117,6 +117,7 @@ static void world(void) {
   assert(!fdt_setprop_string(dt, d, "compatible", "apple,t8110-dart"));
   assert(!fdt_setprop_u32(dt, d, "phandle", i + 1));
   assert(!fdt_setprop_u32(dt, d, "power-domains", 50));
+  assert(!fdt_setprop_u32(dt, d, "#iommu-cells", 1));
  }
  soc = fdt_path_offset(dt, "/soc");
  /* A node after the processor (libfdt adds a subnode first): it must not be inspected. */
@@ -177,6 +178,26 @@ int main(void) {
  dram_size = 4 * SZ_16K;
  /* A provider that is not a T8110 DART: refused. */
  world(); assert(!fdt_setprop_string(dt, fdt_path_offset(dt, "/soc/iommu@319304000"), "compatible", "apple,t8103-dart"));
+ assert(dt_dcpext_inherited_darts("dcpext"));
+ /* A description that cannot be read whole fails closed. No iommus on the processor or piodma: */
+ world(); assert(!fdt_delprop(dt, fdt_path_offset(dt, "/soc/dcp@31ac00000"), "iommus"));
+ assert(!fdt_delprop(dt, fdt_path_offset(dt, "/soc/dcp@31ac00000/piodma"), "iommus"));
+ assert(dt_dcpext_inherited_darts("dcpext") && !reserved);
+ /* ... only piodma's DART described still passes (one DART inspected). */
+ world(); assert(!fdt_delprop(dt, fdt_path_offset(dt, "/soc/dcp@31ac00000"), "iommus"));
+ assert(!dt_dcpext_inherited_darts("dcpext"));
+ /* An empty iommus, or one with a trailing cell: refused. */
+ world(); assert(!fdt_setprop(dt, fdt_path_offset(dt, "/soc/dcp@31ac00000"), "iommus", NULL, 0));
+ assert(dt_dcpext_inherited_darts("dcpext"));
+ {
+  fdt32_t three[3] = {cpu_to_fdt32(2), cpu_to_fdt32(5), cpu_to_fdt32(1)};
+  world(); assert(!fdt_setprop(dt, fdt_path_offset(dt, "/soc/dcp@31ac00000"), "iommus", three, sizeof(three)));
+  assert(dt_dcpext_inherited_darts("dcpext"));
+ }
+ /* A provider without #iommu-cells, or with two: refused. */
+ world(); assert(!fdt_delprop(dt, fdt_path_offset(dt, "/soc/iommu@319304000"), "#iommu-cells"));
+ assert(dt_dcpext_inherited_darts("dcpext"));
+ world(); assert(!fdt_setprop_u32(dt, fdt_path_offset(dt, "/soc/iommu@31930c000"), "#iommu-cells", 2));
  assert(dt_dcpext_inherited_darts("dcpext"));
  puts("PASS dcpext DART inspection");
  return 0;

@@ -5372,7 +5372,9 @@ static int dt_node_power(int node)
  * guard (dart_collect_inherited_t8110()): unlocked and idle, nothing to keep; locked, the tables
  * an earlier stage left are reserved. Anything else (a domain neither on nor off, a live unlocked
  * stream, tables that cannot be collected, an MMIO fault, a tree that cannot be walked) refuses
- * the processor; the panel is not affected.
+ * the processor; the panel is not affected. So does a description that cannot be read whole: an
+ * empty iommus, one that is not a list of (DART, stream) pairs, a provider that does not take one
+ * cell, or no DART at all on the processor and its children.
  */
 static int dt_dcpext_inherited_darts(const char *alias)
 {
@@ -5389,22 +5391,30 @@ static int dt_dcpext_inherited_darts(const char *alias)
     if (!tables)
         return -1;
     int result = 0, device = owner, depth = 0;
-    size_t total = 0;
+    size_t total = 0, darts = 0;
     int previous = exc_guard, faults = exc_count;
     exc_guard = GUARD_MARK | GUARD_SILENT;
     /* The processor node, then its children (piodma). Read only: no tree writes in the walk. */
     do {
         int len = 0;
         const fdt32_t *iommus = fdt_getprop(dt, device, "iommus", &len);
+        /* One phandle and one stream cell per DART: anything else is not read in part. */
+        if (iommus && (len <= 0 || len % (2 * (int)sizeof(*iommus))))
+            result = -1;
         for (int i = 0; !result && iommus && i + 1 < len / (int)sizeof(*iommus); i += 2) {
             int provider = fdt_node_offset_by_phandle(dt, fdt32_ld(&iommus[i]));
             u64 base = provider < 0 ? 0 : dt_get_address(dt, provider);
+            int cells_len = 0;
+            const fdt32_t *cells =
+                provider < 0 ? NULL : fdt_getprop(dt, provider, "#iommu-cells", &cells_len);
             char detail[160] = "";
             size_t count = 0;
-            if (!base || fdt_node_check_compatible(dt, provider, "apple,t8110-dart")) {
+            if (!base || fdt_node_check_compatible(dt, provider, "apple,t8110-dart") || !cells ||
+                cells_len != sizeof(*cells) || fdt32_ld(cells) != 1) {
                 result = -1;
                 break;
             }
+            darts++;
             int power = dt_node_power(provider);
             if (power > 0)
                 result = dart_collect_inherited_t8110(base, dram, size, tables + total, 256 - total,
@@ -5427,6 +5437,10 @@ static int dt_dcpext_inherited_darts(const char *alias)
             result = -1;
     } while (!result && device >= 0 && depth > 0);
     exc_guard = previous;
+    if (!result && !darts)
+        result = -1;
+    if (result)
+        printf("FDT: '%s': %zu DART(s) inspected, refused\n", alias, darts);
     for (size_t t = 0; !result && t < total; t++) {
         char name[48];
         snprintf(name, sizeof(name), "dcpext-tables@%lx", tables[t]);
