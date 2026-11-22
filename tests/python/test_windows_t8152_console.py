@@ -17,6 +17,7 @@ Failure modes written down before the code:
 These run src/iodev.c itself on the host against a model CDC device.
 """
 import pathlib
+import re
 import shutil
 import subprocess
 
@@ -41,7 +42,8 @@ STUBS = {
                "static inline u64 ticks_to_usecs(u64 t) { return t; }\n"
                "static inline u64 timeout_calculate(u32 us) { return fake_now + us; }\n"
                "static inline bool timeout_expired(u64 t) { return fake_now > t; }\n"
-               "static inline bool is_boot_cpu(void) { return true; }\n",
+               "static inline bool is_boot_cpu(void) { return true; }\n"
+               "#define sysop(op) __asm__ volatile(\"\" ::: \"memory\")\n",
     "memory.h": "#pragma once\nstatic inline bool mmu_active(void) { return true; }\n",
     "string.h": "#pragma once\n#include <string.h>\n",
 }
@@ -209,7 +211,8 @@ def test_console_usb_write_has_no_host_wait():
         assert banned not in fn, banned
     assert "ringbuffer_write(buf, take, device2host)" in fn
     usb = (SRC / "usb.c").read_text()
-    ops = usb.split("static struct iodev_ops iodev_usb_ops = {", 1)[1].split("};", 1)[0]
+    ops = re.split(r"(?:static )?struct iodev_ops iodev_usb_ops = \{", usb, maxsplit=1)[1]
+    ops = ops.split("};", 1)[0]
     assert ".write = usb_0_write," in ops
     assert "#ifdef AURA_WINDOWS\n    .write_nonblocking = usb_0_write_nonblocking,\n#endif" in ops
     wrapper = usb.split("static ssize_t usb_0_write_nonblocking(", 1)[1].split("\n}\n", 1)[0]

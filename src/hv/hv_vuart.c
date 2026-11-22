@@ -59,12 +59,12 @@ static iodev_id_t vuart_tx_mirror = IODEV_MAX;
  */
 static ssize_t vuart_rx_queued(void)
 {
-    if (vuart_tx_only)
-        return 0;
 #ifdef AURA_WINDOWS
     if (hv_input_owns_vuart_rx())
         return 0;
 #endif
+    if (vuart_tx_only)
+        return 0;
     return iodev_can_read(IODEV_USB_VUART);
 }
 

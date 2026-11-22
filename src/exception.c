@@ -598,20 +598,19 @@ void exc_fiq(u64 *regs)
 
 void exc_serr(u64 *regs)
 {
-#ifdef SPTM_VIRT
-    sptm_virt_park_check();
-#endif
-#ifdef SPTM_VIRT
-    if (nv2_handle_async(regs, 3))
-        return;
-#endif
-
 #ifdef AURA_WINDOWS
     /*
      * First, before anything can run AT: if the SError interrupted hv_translate() between its
      * AT and the PAR read (D3 run 1), PAR_EL1 still holds that walk's result.
      */
     u64 par_at_entry = mrs(PAR_EL1);
+#endif
+#ifdef SPTM_VIRT
+    sptm_virt_park_check();
+#endif
+#ifdef SPTM_VIRT
+    if (nv2_handle_async(regs, 3))
+        return;
 #endif
     if (!(exc_guard & GUARD_SILENT))
         printf("Exception: SError\n");

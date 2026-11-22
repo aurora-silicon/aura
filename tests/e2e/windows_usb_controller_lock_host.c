@@ -72,6 +72,7 @@ static void spin_unlock(spinlock_t *l)
     if (--l->count == 0)
         __atomic_store_n(&l->lock, -1, __ATOMIC_RELEASE);
 }
+#define sysop(op) __asm__ volatile("" ::: "memory")
 static bool mmu_active(void)
 {
     return true;

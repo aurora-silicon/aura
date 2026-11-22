@@ -44,3 +44,5 @@ static inline int poll32(u64 addr, u32 mask, u32 target, u32 timeout)
     }
     return -1;
 }
+#define min(a, b) (((a) < (b)) ? (a) : (b))
+u64 ticks_to_usecs(u64 ticks);

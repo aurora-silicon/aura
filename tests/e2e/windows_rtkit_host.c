@@ -138,6 +138,16 @@ bool asc_cpu_running(asc_dev_t *a)
 {
     return a->running;
 }
+/* j813-windows' rtkit.c: the I2A gate and the idle wait of rtkit_idle(), never reached here. */
+void asc_i2a_enable(asc_dev_t *a, bool on)
+{
+    (void)a;
+    (void)on;
+}
+bool asc_cpu_idle(asc_dev_t *a)
+{
+    return !a->running;
+}
 bool asc_can_recv(asc_dev_t *a)
 {
     (void)a;
@@ -217,6 +227,16 @@ void dart_unmap(dart_dev_t *d, uintptr_t v, size_t n)
     (void)n;
     assert(!quiet_boundary);
     unmaps++;
+}
+bool dart_unmap_checked(dart_dev_t *d, uintptr_t v, size_t n)
+{
+    dart_unmap(d, v, n);
+    return true;
+}
+bool dart_has_failed(dart_dev_t *d)
+{
+    (void)d;
+    return false;
 }
 void *dart_translate(dart_dev_t *d, uintptr_t v)
 {

@@ -20,3 +20,14 @@ bool rtkit_sleep(rtkit_dev_t *rtk);
 void rtkit_stop(rtkit_dev_t *rtk);
 void rtkit_free(rtkit_dev_t *rtk);
 int rtkit_recv(rtkit_dev_t *rtk, struct rtkit_message *msg);
+struct asc_message {
+    u64 msg0;
+    u32 msg1;
+};
+bool asc_cpu_idle(asc_dev_t *asc);
+void asc_i2a_enable(asc_dev_t *asc, bool on);
+u32 asc_cpu_status(asc_dev_t *asc);
+bool asc_recv(asc_dev_t *asc, struct asc_message *msg);
+bool rtkit_idle(rtkit_dev_t *rtk);
+int rtkit_probe_hello(asc_dev_t *asc);
+bool rtkit_boot_warm(rtkit_dev_t *rtk, u32 last_mask);

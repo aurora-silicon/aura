@@ -50,7 +50,8 @@ def test_one_predicate_names_the_absent_pmuv3_chips():
     conf = function_body(hv, "int hv_windows_configure(u64 flags)")
     assert "if ((flags & HV_WINDOWS_GUEST_COMPAT) && !hv_absent_pmuv3())" in conf
     # MTP stays a J813 feature.
-    assert "if ((flags & HV_WINDOWS_MTP) && (chip_id != T8142 || board_id != 0x24))" in conf
+    assert ("if ((flags & (HV_WINDOWS_MTP | HV_WINDOWS_CPUFREQ)) && (chip_id != T8142 || "
+            "board_id != 0x24))") in conf
 
 
 @pytest.mark.parametrize("signature", [
@@ -174,7 +175,7 @@ def test_bootmgr_pmu_encodings_reach_the_software_pmu(insn):
 def test_m6_profile_keeps_the_software_pmu():
     chickens = (REPO / "src/chickens.c").read_text()
     m6 = chickens[chickens.index("features_m6"):]
-    m6 = m6[:m6.index("};")]
+    m6 = re.sub(r"/\*.*?\*/", "", m6[:m6.index("};")], flags=re.S)
     assert "apple_sysregs_unlocked" not in m6
 
 

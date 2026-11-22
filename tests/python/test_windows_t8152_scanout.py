@@ -228,8 +228,9 @@ def test_wiring():
     exc = source("hv_exc.c")
     live = function_body(exc, "static bool hv_t8152_vspi_live(u32 intid)")
     assert "hv_scanout_enabled() ? VDEV_SPI_DEV_SCANOUT : 0" in live
-    assert "if (!hv_scanout_work(HV_SCANOUT_IDLE_ROWS))\n            hv_fb_convert_slice(" \
-        "HV_FB_SLICE_IDLE);" in exc
+    # T8152's idle path (T8142 keeps j813-windows' hv_fb_convert_idle()).
+    assert re.search(r"if \(chip_id == T8152\) \{\n(?:\s*/?\*.*\n)*\s*if \(!hv_scanout_work\("
+                     r"HV_SCANOUT_IDLE_ROWS\)\)\n\s*hv_fb_convert_slice\(HV_FB_SLICE_IDLE\);", exc)
     fiq = function_body(exc, "void hv_exc_fiq(struct exc_info *ctx)")
     fast = fiq[:fiq.index("// Slow (single threaded) path")]
     assert fast.index("hv_update_fiq(ctx);") < fast.index("hv_scanout_work(HV_SCANOUT_FAST_ROWS);") \

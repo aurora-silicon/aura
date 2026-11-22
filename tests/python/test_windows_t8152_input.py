@@ -454,7 +454,10 @@ def test_vuart_rx_belongs_to_the_feed():
     urxh = handler[handler.index("case URXH:"):]
     assert urxh.index("if (vuart_rx_queued()) {") < urxh.index("iodev_read(IODEV_USB_VUART")
     # Only the tick's service reads the RX for the feed, after the vUART poll took the events.
-    tick = function_body(source("hv.c"), "void hv_tick(struct exc_info *ctx)")
+    hv = source("hv.c")
+    tick = function_body(hv, "void hv_tick(struct exc_info *ctx)").replace(
+        "hv_tick_host_io(ctx);",
+        function_body(hv, "static void hv_tick_host_io(struct exc_info *ctx)"))
     assert tick.index("hv_vuart_poll();") < tick.index("hv_input_poll();") < \
         tick.index("HV_FATAL_STAGE_DONE")
 

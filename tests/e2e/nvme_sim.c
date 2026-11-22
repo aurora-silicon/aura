@@ -671,3 +671,84 @@ int pmgr_reset(int die, const char *name)
     (void)name;
     return 0;
 }
+/* Upstream nvme.c's post-M4 and cold-handoff paths: never taken by the simulated T8152. */
+u64 ticks_to_usecs(u64 ticks)
+{
+    return ticks;
+}
+bool asc_cpu_idle(struct asc_dev *asc)
+{
+    (void)asc;
+    return false;
+}
+void asc_i2a_enable(struct asc_dev *asc, bool on)
+{
+    (void)asc;
+    (void)on;
+}
+u32 asc_cpu_status(struct asc_dev *asc)
+{
+    (void)asc;
+    return 0;
+}
+bool asc_recv(struct asc_dev *asc, struct asc_message *msg)
+{
+    (void)asc;
+    (void)msg;
+    return false;
+}
+bool rtkit_idle(struct rtkit_dev *r)
+{
+    (void)r;
+    return true;
+}
+int rtkit_probe_hello(struct asc_dev *asc)
+{
+    (void)asc;
+    return 0;
+}
+bool rtkit_boot_warm(struct rtkit_dev *r, u32 last_mask)
+{
+    (void)last_mask;
+    return rtkit_boot(r);
+}
+bool sart_get_allowed(struct sart_dev *s, int index, u64 *paddr, size_t *sz)
+{
+    (void)s;
+    (void)index;
+    (void)paddr;
+    (void)sz;
+    return false;
+}
+bool sart_clear_entry(struct sart_dev *s, int index)
+{
+    (void)s;
+    (void)index;
+    return true;
+}
+bool sart_set_allowed(struct sart_dev *s, int index, u64 paddr, size_t sz)
+{
+    (void)s;
+    (void)index;
+    (void)paddr;
+    (void)sz;
+    return true;
+}
+void sart_release(struct sart_dev *s)
+{
+    (void)s;
+}
+int sart_get_entries(struct sart_dev *s, struct sart_entry *entries, int max)
+{
+    (void)s;
+    (void)entries;
+    (void)max;
+    return 0;
+}
+bool sart_set_entries(struct sart_dev *s, const struct sart_entry *entries, int count)
+{
+    (void)s;
+    (void)entries;
+    (void)count;
+    return true;
+}

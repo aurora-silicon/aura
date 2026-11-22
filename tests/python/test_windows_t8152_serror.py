@@ -384,13 +384,19 @@ TICK_ORDER = [
 
 
 def test_t4_every_tick_stage_is_fenced_and_named():
-    tick = code(function_body(source("src/hv/windows/hv.c"), "void hv_tick(struct exc_info *ctx)"))
+    hv = source("src/hv/windows/hv.c")
+    io = function_body(hv, "static void hv_tick_host_io(struct exc_info *ctx)")
+    tick = code(function_body(hv, "void hv_tick(struct exc_info *ctx)").replace(
+        "hv_tick_host_io(ctx);", io))
     pos = 0
     for stage, call in TICK_ORDER:
         mark = tick.index(f"hv_fatal_stage({stage});", pos)
         work = tick.index(call, mark)
         pos = work
-    assert tick.rstrip().endswith("hv_fatal_stage(HV_FATAL_STAGE_DONE);")
+    # After DONE only the T8142 tick-deadline bookkeeping (j813-windows) may follow.
+    done = tick.rindex("hv_fatal_stage(HV_FATAL_STAGE_DONE);")
+    assert tick[done:].replace("hv_fatal_stage(HV_FATAL_STAGE_DONE);", "").split() in (
+        [], "if (chip_id == T8142) hv_tick_deadline_complete(state, hv_host_counter());".split())
     stage = code(function_body(source("src/hv/windows/hv_fatal.c"), "void hv_fatal_stage(u64 stage)"))
     assert stage.index('sysop("dsb sy");') < stage.index("c->stage = stage;")
     assert "if (chip_id != T8152)\n        return;" in stage

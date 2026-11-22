@@ -252,14 +252,14 @@ HV_OBJECTS := $(patsubst %,hv/%, \
 ifeq ($(WINDOWS),1)
 HV_OBJECTS := $(patsubst %,hv/windows/%, \
 	hv.o hv_aic.o hv_asm.o hv_exc.o hv_vgic.o hv_psci.o \
-	hv_aic_alias.o hv_t8152.o hv_gic_cpuif.o fb_capture.o windows_compat.o windows_n1.o \
-	serial_capture.o mtp_handoff.o hv_xfer.o ahci_model.o hv_ahci.o hv_vdev_spi.o \
-	hv_fatal.o hv_usb.o hv_usb_dart.o gpu_t8152_admit.o hv_gpu.o input_model.o hv_input.o \
-	ahci_nvme.o gpt_check.o hv_ahci_nvme.o hv_serror.o \
-	mtp_scm.o mtp_dart_t8152.o hid_desc.o input_kbd.o mtp_bringup.o hv_mtp_t8152.o input_tp.o \
-	gpu_t8152_power.o gpu_t8152_power_recipe.o gpu_t8152_probe.o \
-	gpu_t8152_g2.o gpu_t8152_g2_recipe.o gpu_t8152_uat.o hv_status.o \
-	scanout_model.o hv_scanout.o hv_fatal_apl.o) \
+	windows_n1.o hv_xfer.o \
+	hv_aic_alias.o hv_t8152.o hv_gic_cpuif.o fb_capture.o windows_compat.o serial_capture.o mtp_handoff.o hv_serror.o hv_status.o hv_fatal_apl.o \
+	ahci_model.o hv_ahci.o hv_vdev_spi.o hv_fatal.o hv_usb.o hv_usb_dart.o \
+	ahci_nvme.o gpt_check.o hv_ahci_nvme.o \
+	gpu_t8152_admit.o gpu_t8152_power.o gpu_t8152_power_recipe.o gpu_t8152_probe.o \
+	gpu_t8152_g2.o gpu_t8152_g2_recipe.o gpu_t8152_uat.o hv_gpu.o \
+	input_model.o hv_input.o scanout_model.o hv_scanout.o \
+	mtp_scm.o mtp_dart_t8152.o hid_desc.o input_kbd.o input_tp.o mtp_bringup.o hv_mtp_t8152.o) \
 	hv/hv_vm.o hv/hv_virtio.o hv/hv_vuart.o hv/hv_wdt.o hv/hv_sprr.o
 endif
 

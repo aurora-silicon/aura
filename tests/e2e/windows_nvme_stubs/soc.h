@@ -8,3 +8,4 @@
 #define T6040 0x6040
 #define T6041 0x6041
 extern u32 chip_id;
+#define T6050 0x6050
