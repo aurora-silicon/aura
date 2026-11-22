@@ -4889,6 +4889,77 @@ void hv_track_t8142_undef_vector(struct exc_info *ctx)
     hv_patch_t8142_undef_vector(HV_VECTOR_SYNC_CURRENT_SPX);
 }
 
+/*
+ * Guest TLBI traps by kind, for the one line hv_start() prints at guest exit;
+ * see docs/windows-tlbi-trap-count.md.  Diagnostic only: the unlocked MSR
+ * handler calls the counter first, with the trap's encoding by value, and then
+ * dispatches exactly as before, so the OS-to-IS rewrite below is unchanged.
+ *
+ * Each record has one writer, its CPU, and its own 64-byte line, as in
+ * struct hv_el2_acct.  The boot CPU only reads them, once, after the join.
+ */
+struct hv_tlbi_traps {
+    u64 os;    /* the four forms the rewrite handles: VMALLE1OS, VAE1OS, ASIDE1OS, RVAE1OS */
+    u64 is;    /* EL1 inner-shareable: op1 0, CRn 8, CRm 3 or the range forms' CRm 2 */
+    u64 other; /* every other TLBI or TLBI nXS encoding (op0 1, CRn 8 or 9) */
+} ALIGNED(64);
+
+static struct hv_tlbi_traps hv_tlbi_traps[MAX_CPUS];
+
+static inline void hv_count_tlbi_trap(u64 reg)
+{
+    u64 crn = FIELD_GET(ESR_ISS_MSR_CRn, reg);
+
+    if (FIELD_GET(ESR_ISS_MSR_OP0, reg) != 1 || (crn != 8 && crn != 9))
+        return;
+
+    u32 cpu = smp_id();
+
+    if (cpu >= MAX_CPUS)
+        return;
+
+    struct hv_tlbi_traps *t = &hv_tlbi_traps[cpu];
+    u64 *kind;
+
+    switch (reg) {
+        case SYSREG_ISS(sys_reg(1, 0, 8, 1, 0)): /* VMALLE1OS */
+        case SYSREG_ISS(sys_reg(1, 0, 8, 1, 1)): /* VAE1OS */
+        case SYSREG_ISS(sys_reg(1, 0, 8, 1, 2)): /* ASIDE1OS */
+        case SYSREG_ISS(sys_reg(1, 0, 8, 5, 1)): /* RVAE1OS */
+            kind = &t->os;
+            break;
+        default: {
+            u64 crm = FIELD_GET(ESR_ISS_MSR_CRm, reg);
+
+            if (crn == 8 && FIELD_GET(ESR_ISS_MSR_OP1, reg) == 0 && (crm == 2 || crm == 3))
+                kind = &t->is;
+            else
+                kind = &t->other;
+        }
+    }
+
+    /* Single writer: a relaxed store keeps the boot CPU's later load untorn. */
+    __atomic_store_n(kind, *kind + 1, __ATOMIC_RELAXED);
+}
+
+void hv_report_tlbi_traps(void)
+{
+    static bool reported;
+    u64 os = 0, is = 0, other = 0;
+
+    if (reported)
+        return;
+    reported = true;
+
+    for (int cpu = 0; cpu < MAX_CPUS; cpu++) {
+        os += __atomic_load_n(&hv_tlbi_traps[cpu].os, __ATOMIC_RELAXED);
+        is += __atomic_load_n(&hv_tlbi_traps[cpu].is, __ATOMIC_RELAXED);
+        other += __atomic_load_n(&hv_tlbi_traps[cpu].other, __ATOMIC_RELAXED);
+    }
+
+    printf("HV TLBI TRAPS os=%lu is=%lu other=%lu\n", os, is, other);
+}
+
 static bool hv_handle_msr_unlocked(struct exc_info *ctx, u64 iss)
 {
     u64 reg = iss & (ESR_ISS_MSR_OP0 | ESR_ISS_MSR_OP2 | ESR_ISS_MSR_OP1 | ESR_ISS_MSR_CRn |
@@ -4899,6 +4970,8 @@ static bool hv_handle_msr_unlocked(struct exc_info *ctx, u64 iss)
     u64 *regs = ctx->regs;
 
     regs[31] = 0;
+
+    hv_count_tlbi_trap(reg);
 
     if (hv_handle_software_pmu(reg, is_read, rt, regs))
         return true;

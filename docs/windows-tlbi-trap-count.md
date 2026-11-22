@@ -126,3 +126,18 @@ Ways the count could be wrong:
   changed E boot-state trace would mean the change reached further than
   intended. Rule: same warning set as 187846f1, default image byte-identical
   with the tag pinned, E boot replay trace byte-identical.
+
+## Desk test
+
+    python3 tests/windows_tlbi_count/run.py --output NEW_FOLDER
+
+It compiles the production record, counter, report and ISS macros verbatim,
+with the rewrite's own case labels and the handler's own ISS mask statement
+read out of `hv_handle_msr_unlocked()`, under ASan/UBSan, and models only the
+CPU number and the console. It checks the call sites in the source text (F2,
+F3, F8, F9, F12, F13), drives every encoding in both directions across all CPU
+slots (F10, F11, F14), out-of-range CPUs (F5), eight concurrent writers (F14)
+and the printed line (F7, F9, F19), and requires nine mutants to be rejected.
+It writes `result.json` with the hashes of every input and artifact. It does
+not run the hypervisor, Mu or Windows, and says nothing about whether the
+instructions trap on hardware.

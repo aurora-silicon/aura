@@ -1267,6 +1267,8 @@ int hv_start(void *entry, u64 regs[4])
         hv_windows_serial_finish();
         printf("HV: All CPUs exited\n");
     }
+    /* Once, drained or not; see docs/windows-tlbi-trap-count.md. */
+    hv_report_tlbi_traps();
     return result ? result : __atomic_load_n(&hv_windows_exit_reason, __ATOMIC_ACQUIRE);
 }
 

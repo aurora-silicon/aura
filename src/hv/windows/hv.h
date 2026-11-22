@@ -201,6 +201,8 @@ void hv_report_t8142_gic_activity(void);
 void hv_el2_enter(u64 cause);
 void hv_el2_exit(void);
 void hv_report_t8142_el2_acct(void);
+/* Guest TLBI trap totals, printed once at guest exit; docs/windows-tlbi-trap-count.md. */
+void hv_report_tlbi_traps(void);
 void hv_check_t8142_bugcheck(void);
 void hv_dump_t8142_bugcheck_stack(struct exc_info *ctx);
 
