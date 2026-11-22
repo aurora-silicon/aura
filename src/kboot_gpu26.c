@@ -424,7 +424,8 @@ static int t8122_gpu_phandle_node(void *dt, const char *prop)
 
 /*
  * Hand the GPU to Linux on 27.2, on the copy t8122_gpu_publish_27() passes: everything is
- * checked in the DT first, then the 26.6.2 path's calibration runs (OPPs and SRAM voltages from
+ * checked in the DT and both start values are read from the ADT first (nothing is powered for a
+ * refusal), then the 26.6.2 path's calibration runs (OPPs and SRAM voltages from
  * this Mac's ADT, the bounded powered identity, every power vote released), and only then are
  * the mailbox and the GPU node enabled. Any failure discards the copy.
  */
@@ -439,10 +440,21 @@ static int t8122_gpu_enable_27(void *dt, void *arg)
     if (t8122_gpu_phandle_node(dt, "power-domains") < 0)
         bail("FDT: GPU: T8122 27.2: GPU node has no single power domain\n");
 
+    /* Both start values from this Mac's ADT, read before anything is powered. */
+    u32 values[T8122_27_VALUES];
+    if (dt_gpu_t8122_27_machine_values_read(values))
+        return -1;
+
     if (dt_gpu_t8122_26_calibrate(dt))
         bail("FDT: GPU: T8122 27.2: calibration from this Mac's ADT failed\n");
-    if (dt_gpu_t8122_27_machine_values(dt))
-        return -1;
+    for (size_t i = 0; i < T8122_27_VALUES; i++) {
+        int gpu = t8122_gpu_node(dt);
+        if (gpu < 0 || fdt_setprop_u32(dt, gpu, t8122_27_values[i].dt, values[i]))
+            bail("FDT: GPU: T8122 27.2: cannot set %s\n", t8122_27_values[i].dt);
+    }
+    printf("FDT: GPU: T8122 27.2 machine values: fast-die0 target %u C, coredump copy buffer "
+           "0x%x bytes\n",
+           values[0], values[1]);
 
     mailbox = t8122_gpu_phandle_node(dt, "mboxes");
     if (mailbox < 0 || fdt_setprop_string(dt, mailbox, "status", "okay"))
@@ -468,8 +480,8 @@ static int t8122_gpu_enable_27(void *dt, void *arg)
  * has a single power domain, and the 26.6.2 path's calibration (OPPs and SRAM
  * voltages from this Mac's ADT, the bounded powered identity the kernel's admission checks, every
  * power vote released before Linux starts) succeeds under the M3 Air's chosen.asahi,t8122-gpu
- * switch. Then the GPU node gets the 27.2 start values this Mac's ADT has
- * (dt_gpu_t8122_27_machine_values()), the mailbox is enabled, the GPU's power domain gets
+ * switch, and this Mac's ADT has both 27.2 start values. Then the GPU node gets them
+ * (dt_gpu_t8122_27_machine_values_read()), the mailbox is enabled, the GPU's power domain gets
  * apple,no-auto-pm (the 27.2 start takes no PMP link), and the GPU node is enabled; the kernel
  * admits and starts the loaded firmware. Any failure leaves the GPU node and the mailbox disabled,
  * as before; then only with chosen.asahi,t8122-gpu-power-diag=1 the bounded powered identity probe

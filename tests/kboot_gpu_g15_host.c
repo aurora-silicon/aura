@@ -2211,15 +2211,29 @@ static void t8122_27_start_t8122_mailbox(void)
 }
 static void t8122_27_start_values_absent(void)
 {
-    /* Both machine values are optional: absent in the ADT, absent on the GPU node. */
+    /* Both machine values are required: without them the GPU stays off and is never powered. */
     prepare_27_start();
     hdel("/arm-io/sgx", "gpu-fast-die0-target");
     hdel("/arm-io/gfx-asc/iop-gfx-nub", "coredump-copy-buffer");
-    run();
-    assert(!strcmp(status_of(dtbuf, "/soc/gpu@292400000"), "okay"));
-    assert(prop_len(dtbuf, "/soc/gpu@292400000", "apple,fast-die0-target") < 0);
-    assert(prop_len(dtbuf, "/soc/gpu@292400000", "apple,coredump-copy-buffer") < 0);
-    assert(log_has("27.2 machine values: fast-die0 target absent, coredump copy buffer absent"));
+    t27_start_refused();
+    assert(log_has("gpu-fast-die0-target absent, GPU left disabled"));
+    assert(!pmgr_enables && !pmgr_disables);
+}
+static void t8122_27_start_fast_die_absent(void)
+{
+    prepare_27_start();
+    hdel("/arm-io/sgx", "gpu-fast-die0-target");
+    t27_start_refused();
+    assert(log_has("gpu-fast-die0-target absent, GPU left disabled"));
+    assert(!pmgr_enables && !pmgr_disables);
+}
+static void t8122_27_start_coredump_absent(void)
+{
+    prepare_27_start();
+    hdel("/arm-io/gfx-asc/iop-gfx-nub", "coredump-copy-buffer");
+    t27_start_refused();
+    assert(log_has("coredump-copy-buffer absent, GPU left disabled"));
+    assert(!pmgr_enables && !pmgr_disables);
 }
 static void t8122_27_start_value_malformed(void)
 {
@@ -2228,8 +2242,16 @@ static void t8122_27_start_value_malformed(void)
     hset("/arm-io/gfx-asc/iop-gfx-nub", "coredump-copy-buffer", &wide, sizeof(wide));
     t27_start_refused();
     assert(log_has("malformed coredump-copy-buffer"));
-    /* Refused after the calibration: its power vote was still released. */
-    assert(pmgr_enables == 1 && pmgr_disables == 1 && pmgr_off == 1);
+    /* Refused from the ADT alone: nothing was powered. */
+    assert(!pmgr_enables && !pmgr_disables);
+}
+static void t8122_27_start_value_zero(void)
+{
+    prepare_27_start();
+    hset_u32("/arm-io/sgx", "gpu-fast-die0-target", 0);
+    t27_start_refused();
+    assert(log_has("malformed gpu-fast-die0-target"));
+    assert(!pmgr_enables && !pmgr_disables);
 }
 static void t8122_27_start_no_pmp(void)
 {
@@ -2766,7 +2788,10 @@ static const struct {
     {"t8122-27-start", t8122_27_start},
     {"t8122-27-start-t8122-mailbox", t8122_27_start_t8122_mailbox},
     {"t8122-27-start-values-absent", t8122_27_start_values_absent},
+    {"t8122-27-start-fast-die-absent", t8122_27_start_fast_die_absent},
+    {"t8122-27-start-coredump-absent", t8122_27_start_coredump_absent},
     {"t8122-27-start-value-malformed", t8122_27_start_value_malformed},
+    {"t8122-27-start-value-zero", t8122_27_start_value_zero},
     {"t8122-27-start-no-pmp", t8122_27_start_no_pmp},
     {"t8122-27-start-no-power-domain", t8122_27_start_no_power_domain},
     {"t8122-27-start-other-mailbox", t8122_27_start_other_mailbox},

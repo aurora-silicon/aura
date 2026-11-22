@@ -2213,43 +2213,29 @@ int dt_gpu_t8122_26_calibrate(void *dt)
 }
 
 /*
- * 27.2 start values the kernel takes from the GPU node rather than its own literals, each copied
- * as it is and only when this Mac's ADT has it (one cell when present; a malformed one fails):
+ * 27.2 start values the kernel takes from the GPU node rather than its own literals. Both are
+ * required: without either one in this Mac's ADT the 27.2 GPU is not handed over.
  * - apple,fast-die0-target: /arm-io/sgx gpu-fast-die0-target (degrees C);
  * - apple,coredump-copy-buffer: /arm-io/gfx-asc/iop-gfx-nub coredump-copy-buffer (bytes, the
  *   host's firmware crash-copy buffer).
+ * dt_gpu_t8122_27_machine_values_read() reads the ADT only, so the start can refuse before
+ * anything is powered; t8122_gpu_enable_27() copies them to the GPU node as they are.
  */
-int dt_gpu_t8122_27_machine_values(void *dt)
+const struct t8122_27_value t8122_27_values[T8122_27_VALUES] = {
+    {"/arm-io/sgx", "gpu-fast-die0-target", "apple,fast-die0-target"},
+    {"/arm-io/gfx-asc/iop-gfx-nub", "coredump-copy-buffer", "apple,coredump-copy-buffer"},
+};
+
+int dt_gpu_t8122_27_machine_values_read(u32 val[T8122_27_VALUES])
 {
-    static const struct {
-        const char *path, *adt, *dt, *what;
-    } values[] = {
-        {"/arm-io/sgx", "gpu-fast-die0-target", "apple,fast-die0-target", "fast-die0 target"},
-        {"/arm-io/gfx-asc/iop-gfx-nub", "coredump-copy-buffer", "apple,coredump-copy-buffer",
-         "coredump copy buffer"},
-    };
-    bool have[ARRAY_SIZE(values)];
-    u32 val[ARRAY_SIZE(values)];
-    for (size_t i = 0; i < ARRAY_SIZE(values); i++) {
-        int node = adt_path_offset(adt, values[i].path);
+    for (size_t i = 0; i < T8122_27_VALUES; i++) {
+        int node = adt_path_offset(adt, t8122_27_values[i].path);
         u32 len = 0;
-        have[i] = node >= 0 && adt_getprop(adt, node, values[i].adt, &len) != NULL;
-        if (have[i] && g15_adt_u32(node, values[i].adt, &val[i]))
-            bail("ADT: GPU: T8122 malformed %s (len %u)\n", values[i].adt, len);
-        int gpu = fdt_path_offset(dt, "gpu");
-        if (gpu < 0 || (have[i] && fdt_setprop_u32(dt, gpu, values[i].dt, val[i])))
-            bail("FDT: GPU: T8122 cannot set %s\n", values[i].dt);
+        if (node < 0 || !adt_getprop(adt, node, t8122_27_values[i].adt, &len))
+            bail("ADT: GPU: T8122 27.2: %s absent, GPU left disabled\n", t8122_27_values[i].adt);
+        if (g15_adt_u32(node, t8122_27_values[i].adt, &val[i]) || !val[i])
+            bail("ADT: GPU: T8122 malformed %s (len %u)\n", t8122_27_values[i].adt, len);
     }
-    printf("FDT: GPU: T8122 27.2 machine values: %s ", values[0].what);
-    if (have[0])
-        printf("%u C", val[0]);
-    else
-        printf("absent");
-    printf(", %s ", values[1].what);
-    if (have[1])
-        printf("0x%x bytes\n", val[1]);
-    else
-        printf("absent\n");
     return 0;
 }
 
@@ -4572,7 +4558,7 @@ int dt_set_gpu(void *dt)
             int dcp = fdt_path_offset(dt, "dcp"), len;
             const fdt32_t *profile =
                 dcp < 0 ? NULL : fdt_getprop(dt, dcp, "apple,j613-25g83-profile", &len);
-            /* 27.2 (26B123) firmware: the handoff publication only; it leaves the GPU disabled. */
+            /* 27.2 (26B123) firmware: the handoff publication, and the GPU start when described. */
             if ((profile && len == 4 && fdt32_ld(profile) == 1) || os_firmware.version == V27_2) {
                 t8122_leak_fuse_export(dt);
                 return dt_set_gpu_t8122_26(dt);
