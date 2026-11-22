@@ -682,15 +682,26 @@ static const struct t8132_scenario t8132_scenarios[] = {
     {"j713-table-partial-reservation", "J713: dcpext0's root straddles an existing reservation"},
     {"j713-table-small-reservation", "J713: a no-map reservation smaller than a page starts at dcpext0's root"},
     {"j713-table-small-memreserve", "J713: a /memreserve/ smaller than a page starts at dcpext0's root"},
-    {"j713-tables-in-ram-refused", "J713: dcpext0 refused after collecting its tables: no leak"},
+    {"j713-tables-in-ram-refused", "J713: dcpext0 refused after collecting its tables: kept"},
     {"j713-table-in-carveout", "J713: dcpext0's root page is in a memory carveout"},
     {"j713-extra-child-dart", "J713: a second dcpext1 child on an unlocked, live DART"},
     {"j713-iommu-cells-2", "J713: dispext0's DART takes two iommu cells"},
     {"j713-self-parent", "J713: DISPEXT1_CPU lists itself as its second parent"},
     {"j773g-tables-display-fails", "J773g: disp0 tables in RAM, display subsystem not enabled"},
     {"later-soc", "a later board/SoC with the same block, fallback compatible"},
-    {"j713-fw27-no-uuid", "J713 27.2, internal nub without uuid: refused, no 26.6.2 marker"},
+    {"j713-refused-segs-kept", "J713: dcpext1's __DATA and heap in kernel RAM: refused, kept"},
+    {"j713-refused-pipe-kept", "J713: dcpext1 refused by its pipe: its DART tables in RAM kept"},
+    {"j713-refused-power-kept", "J713: DISPEXT1_FE targeted on but off: refused, memory kept"},
+    {"j713-refused-image-kept", "J713: dcpext1 runs another image: refused, memory kept"},
+    {"j713-refused-unlocked-kept", "J713: dcpext0's live, unlocked DART: refused, its tables kept"},
+    {"j713-off-nothing-kept", "J713: DISPEXT1_CPU power-gated: not running, nothing kept"},
+    {"j713-auto-off-kept", "J713: DISPEXT1_CPU gated but under auto power: memory kept"},
+    {"j713-internal-incomplete-kept", "J713: internal handoff incomplete: both kept, none published"},
+    {"j713-fw27-no-uuid", "J713 27.2, internal nub without uuid: refused, kept, no 26.6.2 marker"},
     {"j713-26-6-2-no-uuid", "J713 26.6.2, no uuid on the internal nub: the firmware-ready path's"},
+    {"j713-no-dt-ext-kept", "J713: the device tree has no external processor: the ADT's kept"},
+    {"j713-no-adt-node-kept", "J713: dcpext1's DT address matches no ADT processor: ADT one kept"},
+    {"j773g-refused-kept", "J773g: disp0's DART unlocked, nothing handed over: both kept"},
 };
 
 /* A page of usable RAM for the scenarios that put tables there */
@@ -724,6 +735,76 @@ static int resv_tables(void *dt)
             n++;
     }
     return n;
+}
+
+/* Usable RAM for the scenarios that put a processor's __DATA and heap there */
+#define RAM_SEGS (TB + 0x120000000ULL)
+
+/* Move segment k of external processor i to `phys` in its ADT nub */
+static void ext_seg_move(int i, int k, u64 phys)
+{
+    char nub[64];
+    struct seg es[4];
+    adt_path_of(nub, sizeof(nub), "/arm-io/dcpext%d/iop-dcpext%d-nub", i);
+    u32 len = 0;
+    const struct seg *cur = adt_getprop(adt, adt_path_offset(adt, nub), "segment-ranges", &len);
+    memcpy(es, cur, sizeof(es));
+    es[k].phys = phys;
+    prop_set(nub, "segment-ranges", es, sizeof(es));
+}
+
+/* External processor i's __DATA and heap moved into usable RAM */
+static void ext_segs_in_ram(int i)
+{
+    ext_seg_move(i, 1, RAM_SEGS + 0x1000000ULL * i);
+    ext_seg_move(i, 3, RAM_SEGS + 0x1000000ULL * i + 0x100000);
+}
+
+/* External processor i's firmware DART and pipe DART tables in usable RAM (four pages) */
+static void ext_tables_in_ram(int i)
+{
+    region_add(RAM_TABLES + 0x10000 * i, 0x10000);
+    poke32(ext_dart[i] + 0x1400 + 4 * 23, dart_tables(RAM_TABLES + 0x10000 * i));
+    poke32(pipe_dart[i] + 0x1400 + 4 * 16, dart_tables(RAM_TABLES + 0x10000 * i + 0x8000));
+}
+
+static int resv_count(void *dt, const char *prefix)
+{
+    int resv = fdt_path_offset(dt, "/reserved-memory"), node, n = 0;
+    fdt_for_each_subnode(node, dt, resv)
+    {
+        if (!strncmp(fdt_get_name(dt, node, NULL), prefix, strlen(prefix)))
+            n++;
+    }
+    return n;
+}
+
+/* /reserved-memory/dcpext-firmware@<base>: exactly base+size, no-map, apple,asc-mem */
+static bool resv_firmware(void *dt, u64 base, u64 size)
+{
+    char path[64];
+    snprintf(path, sizeof(path), "/reserved-memory/dcpext-firmware@%llx", (unsigned long long)base);
+    int node = fdt_path_offset(dt, path), len;
+    const fdt64_t *reg = node < 0 ? NULL : fdt_getprop(dt, node, "reg", &len);
+    return reg && len == 16 && fdt64_ld(&reg[0]) == base && fdt64_ld(&reg[1]) == size &&
+           fdt_getprop(dt, node, "no-map", NULL) &&
+           !fdt_node_check_compatible(dt, node, "apple,asc-mem");
+}
+
+/* External processor i's __DATA (2 pages) and heap (4 pages) in RAM are kept */
+static bool ext_segs_kept(void *dt, int i)
+{
+    return resv_firmware(dt, RAM_SEGS + 0x1000000ULL * i, 0x8000) &&
+           resv_firmware(dt, RAM_SEGS + 0x1000000ULL * i + 0x100000, 0x10000);
+}
+
+/* External processor i's four table pages in RAM (ext_tables_in_ram()) are kept */
+static bool ext_tables_kept(void *dt, int i)
+{
+    bool all = true;
+    for (int k = 0; k < 4; k++)
+        all &= resv_page(dt, RAM_TABLES + 0x10000 * i + 0x4000 * k);
+    return all;
 }
 
 int main(int argc, char **argv)
@@ -768,14 +849,14 @@ int main(int argc, char **argv)
     size_t size = DT_SIZE;
     const char *root = j773g ? J773G : later ? J9XX : J713;
     build_t8132(dt, root, j773g ? sizeof(J773G) : sizeof(J713), size);
-    for (int i = 0; i < 2; i++)
+    for (int i = 0; i < 2 && !is(s, "j713-no-dt-ext-kept"); i++)
         build_t8132_ext(dt, i, later ? T8140_EXT : T8132_EXT,
                         later ? sizeof(T8140_EXT) : sizeof(T8132_EXT),
                         !j773g || is(s, "j773g-enabled"), !is(s, "j773g-headless") || i == 0);
     enum dcp_internal internal = j773g ? DCP_INTERNAL_NO_PANEL : DCP_INTERNAL_COMPLETE;
     if (!j773g && !is(s, "j713-dcp-uuid-missing"))
         m4_handoff(dt, image, !unknown && !is(s, "j713-dcp-no-clocks"));
-    if (is(s, "j713-internal-walk-failed"))
+    if (is(s, "j713-internal-walk-failed") || is(s, "j713-internal-incomplete-kept"))
         internal = DCP_INTERNAL_NONE;
 
     /* ADT changes */
@@ -945,8 +1026,48 @@ int main(int argc, char **argv)
         OK(fdt_setprop_string(dt, alias_node(dt, "disp0"), "status", "okay"));
     }
 
+    /* A refused processor's memory in the RAM the OS gets */
+    if (is(s, "j713-refused-segs-kept"))
+        ext_segs_in_ram(1);
+    if (is(s, "j713-refused-pipe-kept")) {
+        node_drop("/arm-io/dispext1");
+        ext_tables_in_ram(1);
+    }
+    if (is(s, "j713-refused-power-kept") || is(s, "j713-off-nothing-kept") ||
+        is(s, "j713-auto-off-kept")) {
+        ext_segs_in_ram(1);
+        ext_tables_in_ram(1);
+        u16 sys = pm_sys(1);
+        if (is(s, "j713-refused-power-kept"))
+            poke32(ps_reg(sys + 1), 0x0f); /* FE: target on, actual off */
+        else
+            poke32(ps_reg(sys + 2), is(s, "j713-auto-off-kept") ? 0x10000000u : 0x0);
+    }
+    if (is(s, "j713-refused-image-kept")) {
+        prop_str("/arm-io/dcpext1/iop-dcpext1-nub", "uuid", UUID_X);
+        ext_segs_in_ram(1);
+        ext_tables_in_ram(1);
+    }
+    if (is(s, "j713-refused-unlocked-kept")) {
+        ext_tables_in_ram(0);
+        poke32(ext_dart[0] + 0x200, 0x1e0);
+    }
+    if (is(s, "j713-internal-incomplete-kept") || is(s, "j713-fw27-no-uuid") ||
+        is(s, "j713-26-6-2-no-uuid") || is(s, "j713-no-dt-ext-kept") ||
+        is(s, "j773g-refused-kept")) {
+        for (int i = 0; i < 2; i++) {
+            ext_segs_in_ram(i);
+            ext_tables_in_ram(i);
+        }
+    }
     if (is(s, "j713-fw27-no-uuid") || is(s, "j713-26-6-2-no-uuid"))
         prop_drop("/arm-io/dcp/iop-dcp-nub", "uuid");
+    if (is(s, "j713-no-adt-node-kept")) {
+        node_get("/arm-io/dcpext1")->reg[0][0] = 0x50ae00000ULL;
+        ext_segs_in_ram(1);
+    }
+    if (is(s, "j773g-refused-kept"))
+        poke32(M4_DART_DISP + 0x200, 0x1e0);
 
     memcpy(in, dt, fdt_totalsize(dt));
     mmio_reads = mmio_writes = 0;
@@ -1007,11 +1128,6 @@ int main(int argc, char **argv)
         check_display(in, dt, false);
         if (!is(s, "j713-dt-full"))
             check_oslogs(dt, true, true, false);
-    } else if (is(s, "j713-fw27-no-uuid")) {
-        check(ext_untouched(in, dt, 0) && ext_untouched(in, dt, 1),
-              "no external processor is published (no uuid, clocks or 26.6.2 marker)");
-        check_internal_untouched(in, dt);
-        check_oslogs(dt, true, true, false);
     } else if (unknown) {
         check(fdt_totalsize(in) == fdt_totalsize(dt) && !memcmp(in, dt, fdt_totalsize(dt)),
               "the device tree is byte for byte unchanged");
@@ -1044,10 +1160,15 @@ int main(int argc, char **argv)
         check_ext(in, dt, 1, false);
         check_internal_untouched(in, dt);
         if (is(s, "j713-tables-in-ram-refused"))
-            check(!resv_page(dt, RAM_TABLES) && !resv_page(dt, RAM_TABLES + 0x4000) &&
+            check(resv_page(dt, RAM_TABLES) && resv_page(dt, RAM_TABLES + 0x4000) &&
                       resv_page(dt, RAM_TABLES + 0x8000) && resv_page(dt, RAM_TABLES + 0xc000) &&
-                      resv_tables(dt) == 2,
-                  "only the handed-over processor's table pages are reserved (%d)",
+                      resv_tables(dt) == 4,
+                  "the handed-over and the refused processor's table pages are reserved (%d)",
+                  resv_tables(dt));
+        else if (is(s, "j713-table-small-reservation") || is(s, "j713-table-small-memreserve"))
+            check(!resv_page(dt, RAM_TABLES) && resv_page(dt, RAM_TABLES + 0x4000) &&
+                      resv_tables(dt) == 1,
+                  "the refused processor's L2 page is kept, its part-held root is not (%d)",
                   resv_tables(dt));
         else
             check(!resv_tables(dt), "no table page is reserved (%d)", resv_tables(dt));
@@ -1077,6 +1198,64 @@ int main(int argc, char **argv)
         check(ext_untouched(in, dt, 0) && ext_untouched(in, dt, 1),
               "enabled processors are refused with no panel");
         check_display(in, dt, false);
+    }
+    if (is(s, "j713-refused-segs-kept") || is(s, "j713-refused-pipe-kept") ||
+        is(s, "j713-refused-power-kept") || is(s, "j713-refused-image-kept") ||
+        is(s, "j713-off-nothing-kept") || is(s, "j713-auto-off-kept") ||
+        is(s, "j713-no-adt-node-kept")) {
+        bool off = is(s, "j713-off-nothing-kept");
+        check_ext(in, dt, 0, false);
+        check(ext_untouched(in, dt, 1), "dcpext1 is not published (no uuid, version, clocks, "
+                                        "memory-region or 26.6.2 marker)");
+        check_internal_untouched(in, dt);
+        /* No device tree node at the ADT processor's address: its __OS_LOG is kept as firmware */
+        bool unmatched = is(s, "j713-no-adt-node-kept");
+        check_oslogs(dt, true, !unmatched, false);
+        if (is(s, "j713-refused-segs-kept") || is(s, "j713-refused-power-kept") ||
+            is(s, "j713-refused-image-kept") || is(s, "j713-auto-off-kept") || unmatched)
+            check(ext_segs_kept(dt, 1) && resv_count(dt, "dcpext-firmware@") == 2 + unmatched,
+                  "dcpext1's __DATA and heap in RAM are reserved, no-map (%d)",
+                  resv_count(dt, "dcpext-firmware@"));
+        else
+            check(!resv_count(dt, "dcpext-firmware@"), "no firmware page is reserved (%d)",
+                  resv_count(dt, "dcpext-firmware@"));
+        if (is(s, "j713-refused-pipe-kept") || is(s, "j713-refused-image-kept"))
+            check(ext_tables_kept(dt, 1) && resv_tables(dt) == 4,
+                  "dcpext1's four DART table pages in RAM are reserved (%d)", resv_tables(dt));
+        else /* not running, or not fully powered: its DARTs are not read */
+            check(!resv_tables(dt), "no table page is reserved (%d)", resv_tables(dt));
+        if (off)
+            check(!resv_count(dt, "dcpext-"), "a processor that is not running keeps nothing");
+    } else if (is(s, "j713-refused-unlocked-kept")) {
+        check(ext_untouched(in, dt, 0), "dcpext0 is not published");
+        check_ext(in, dt, 1, false);
+        check(ext_tables_kept(dt, 0) && resv_tables(dt) == 4,
+              "the unlocked DART's live tables are reserved (%d)", resv_tables(dt));
+    } else if (is(s, "j713-internal-incomplete-kept") || is(s, "j713-fw27-no-uuid") ||
+               is(s, "j713-no-dt-ext-kept") || is(s, "j773g-refused-kept")) {
+        if (!is(s, "j713-no-dt-ext-kept"))
+            check(ext_untouched(in, dt, 0) && ext_untouched(in, dt, 1),
+                  "no external processor is published (no uuid, clocks or 26.6.2 marker)");
+        /* With no device tree node there is no dcp-oslog@ reservation: __OS_LOG is kept too */
+        int fw_nodes = is(s, "j713-no-dt-ext-kept") ? 6 : 4;
+        check(ext_segs_kept(dt, 0) && ext_segs_kept(dt, 1) &&
+                  resv_count(dt, "dcpext-firmware@") == fw_nodes,
+              "both processors' __DATA and heap in RAM are reserved (%d)",
+              resv_count(dt, "dcpext-firmware@"));
+        bool tables = !is(s, "j713-no-dt-ext-kept");
+        check(tables ? ext_tables_kept(dt, 0) && ext_tables_kept(dt, 1) && resv_tables(dt) == 8
+                     : resv_page(dt, RAM_TABLES) && resv_page(dt, RAM_TABLES + 0x10000) &&
+                           resv_tables(dt) == 4,
+              "their DART table pages in RAM are reserved (%d; with no device tree node, the ADT "
+              "DART's only)",
+              resv_tables(dt));
+        if (!is(s, "j773g-refused-kept"))
+            check_internal_untouched(in, dt);
+        else
+            check_display(in, dt, false);
+    } else if (is(s, "j713-26-6-2-no-uuid")) {
+        check(fdt_totalsize(in) == fdt_totalsize(dt) && !memcmp(in, dt, fdt_totalsize(dt)),
+              "the device tree is byte for byte unchanged");
     }
     if (failures) {
         printf("%s: %d check(s) failed\n", s, failures);

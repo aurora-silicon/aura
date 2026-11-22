@@ -20,6 +20,11 @@ tree's src/kboot_display_handoff.c and runs each scenario. The trees have the T8
   subsystem's DART: an unlocked one must be idle; a locked one's streams must translate through
   two-level tables in DRAM, whose pages in usable RAM are reserved (no-map). The PMGR power
   states follow both parents of each device.
+- every ADT external processor that is not handed over on firmware given its clocks (refused for
+  any reason, an incomplete internal handoff, no uuid on the internal nub, no device tree node)
+  keeps its memory: its firmware segments and the table pages of its DARTs in usable RAM are
+  reserved no-map and nothing is published for it (no uuid, clocks or 26.6.2 marker), unless its
+  clock-gates show it is not running (power-gated, not under auto power).
 Registers are only read (the fake MMIO counts writes: none in any scenario).
 """
 import re
@@ -32,6 +37,13 @@ SCENARIOS = re.findall(r'^    \{"([a-z0-9-]+)", "', (ROOT / "tests" / HOST).read
 
 H0 = "dcpext: dcpext0 handed over (image B3BA603C-3CA7-3E21-B393-44EB20BD2AEF, stream 23, 2 pipe clocks)"
 H1 = "dcpext: dcpext1 handed over (image B3BA603C-3CA7-3E21-B393-44EB20BD2AEF, stream 23, 2 pipe clocks)"
+
+
+def K(n, firmware, tables):
+    return (f"dcpext{n} memory: not handed over, may run: {firmware} firmware and {tables} DART table "
+            "page(s)")
+
+
 REASONS = {
     "j713-both": [H0, H1],
     "j713-adt272-layout": [H0, H1],
@@ -98,9 +110,27 @@ REASONS = {
     "j713-iommu-cells-2": [H1, "dcpext0: piodma iommus[0] is not a one-cell apple,t8110-dart"],
     "j713-self-parent": [H0, H1],
     "j773g-tables-display-fails": [H0, H1, "display subsystem not enabled; the external processors stay disabled"],
-    "j713-fw27-no-uuid": ["no image uuid on /arm-io/dcp/iop-dcp-nub: external processors not handed over"],
+    # A processor that is not handed over keeps its memory: K(n, firmware pages, table pages)
+    "j713-refused-segs-kept": [H0, "dcpext1: segment 1 0x10121000000+0x8000 at 0x10051100000 is kernel RAM",
+                               K(1, 6, 0)],
+    "j713-refused-pipe-kept": [H0, "dcpext1: 0 ADT display pipes use its piodma stream 16", K(1, 0, 4)],
+    "j713-refused-power-kept": [H0, "dcpext1: DISPEXT1_FE is not on (0xf)", "dcpext1 memory: DISPEXT1_FE is not on",
+                                "dcpext1 memory: not fully powered: its 2 DART(s) not read", K(1, 6, 0)],
+    "j713-refused-image-kept": [H0, "dcpext1: does not run the internal DCP's image B3BA603C-", K(1, 6, 4)],
+    "j713-refused-unlocked-kept": [H1, "dcpext0: DART 0x286340000 is not locked (PROTECT 0x1e0)", K(0, 0, 4)],
+    "j713-off-nothing-kept": [H0, "dcpext1: DISPEXT1_CPU is not requested (0x0)",
+                              "dcpext1 memory: not running (its clock-gates are off): nothing to keep"],
+    "j713-auto-off-kept": [H0, "dcpext1: DISPEXT1_CPU is not requested (0x10000000)", K(1, 6, 0)],
+    "j713-internal-incomplete-kept": ["internal DCP handoff not complete: external processors not handed over",
+                                      K(0, 6, 4), K(1, 6, 4)],
+    "j713-fw27-no-uuid": ["no image uuid on /arm-io/dcp/iop-dcp-nub: external processors not handed over",
+                          K(0, 6, 4), K(1, 6, 4)],
     "j713-26-6-2-no-uuid": ["image (none) is not given its clocks by the OS: external processors left to the "
                             "firmware-ready path"],
+    "j713-no-dt-ext-kept": ["the device tree describes no external processor", K(0, 7, 2), K(1, 7, 2)],
+    "j713-no-adt-node-kept": [H0, "/soc/dcp@48ae00000: 0 ADT processors at 0x48ae00000", K(1, 7, 0)],
+    "j773g-refused-kept": ["no panel, and the display subsystem's DART is not as iBoot leaves it",
+                           K(0, 6, 4), K(1, 6, 4)],
     "j773g-disp-piodma-bypass": ["the display subsystem: DART 0x30a300000 stream 16 is not a two-level translation (TCR 0x3, ",
                                  "no panel, and the display subsystem's DART is not as iBoot leaves it"],
 }
@@ -115,13 +145,17 @@ ONE_REFUSAL = {"j713-one", "j713-refused-uuid", "j713-sid-mismatch", "j713-dart-
                "j713-second-parent-off", "j713-zero-streams", "j713-too-many-tables",
                "j713-table-partial-reservation", "j713-table-small-reservation",
                "j713-table-small-memreserve", "j713-tables-in-ram-refused", "j713-table-in-carveout",
-               "j713-extra-child-dart", "j713-iommu-cells-2"}
+               "j713-extra-child-dart", "j713-iommu-cells-2", "j713-refused-segs-kept",
+               "j713-refused-pipe-kept", "j713-refused-power-kept", "j713-refused-image-kept",
+               "j713-refused-unlocked-kept", "j713-off-nothing-kept", "j713-auto-off-kept",
+               "j713-no-adt-node-kept"}
+# Processors that are not handed over keep their memory, with their own lines (" memory: ")
 
 
 def test_every_scenario_has_its_reason():
     assert sorted(REASONS) == sorted(SCENARIOS)
     for required in ("j713-both", "j713-one", "j713-refused-uuid", "j713-internal-walk-failed",
-                     "j713-26-6-2", "j773g-headless", "j713-fw27-no-uuid"):
+                     "j713-26-6-2", "j773g-headless", "j713-fw27-no-uuid", "j713-off-nothing-kept"):
         assert required in SCENARIOS
 
 
@@ -135,17 +169,36 @@ def test_no_board_chip_or_release_test_in_the_adt_path():
         assert banned not in path, banned
 
 
+def function_body(code, signature):
+    start = code.index(signature)
+    return code[start:code.index("\n}\n", start)]
+
+
 def test_no_silent_early_return():
-    """Every way out of dt_set_dcpext_handoff() before a handoff says why, in one line."""
+    """Every way out of the handoff before a handoff says why, in one line."""
     code = (ROOT / "src/kboot_display_handoff.c").read_text()
-    start = code.index("int dt_set_dcpext_handoff(void *dt")
-    body = code[start:code.index("\n}\n", start)].splitlines()
-    for n, line in enumerate(body):
-        if line.strip() not in ("return 0;", "return 1;"):
-            continue
-        before = "\n".join(body[max(0, n - 6):n])
-        assert "dlog(" in before or "dcp6_scratch(dt)" in before or "display" in before, \
-            (n, before)
+    for signature in ("static void dcpext_hand_over(void *dt", "int dt_set_dcpext_handoff(void *dt"):
+        body = function_body(code, signature).splitlines()
+        for n, line in enumerate(body):
+            if line.strip() not in ("return;", "return 0;", "return 1;"):
+                continue
+            before = "\n".join(body[max(0, n - 6):n])
+            assert "dlog(" in before or "dcp6_scratch(dt)" in before or "display" in before or \
+                "dcpext_keep_rest(dt);" in before, (signature, n, before)
+
+
+def test_every_firmware_27_outcome_keeps_memory():
+    """Once the firmware is given its clocks, the handoff always ends in dcpext_keep_rest() (every
+    processor not handed over keeps its memory) and returns 1: the only 0 (kboot.c's 26.6.2
+    firmware-ready path) is decided from fw_clocks before anything else."""
+    code = re.sub(r"/\*.*?\*/", "", (ROOT / "src/kboot_display_handoff.c").read_text(), flags=re.S)
+    body = function_body(code, "int dt_set_dcpext_handoff(void *dt")
+    head, tail = body.split("if (!fw_clocks) {", 1)
+    assert "return" not in head and "adt_getprop" not in head.split("dcp6.soc")[1]
+    first, rest = tail.split("return 0;\n    }", 1)
+    assert "return" not in first
+    assert [line.strip() for line in rest.strip().splitlines()] == \
+        ["dcpext_hand_over(dt, internal);", "dcpext_keep_rest(dt);", "return 1;"]
 
 
 @pytest.fixture(scope="module")
@@ -164,5 +217,6 @@ def test_t8132_dcpext_handoff(host, scenario):
     if scenario in ONE_REFUSAL:
         refusals = [line for line in result.stdout.splitlines()
                     if line.startswith("DCP: dcpext: ") and "handed over" not in line
-                    and "__OS_LOG" not in line and " translating stream(s), " not in line]
+                    and "__OS_LOG" not in line and " translating stream(s), " not in line
+                    and " memory: " not in line]
         assert len(refusals) == 1, refusals
