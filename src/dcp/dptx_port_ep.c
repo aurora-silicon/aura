@@ -716,6 +716,11 @@ int dcp_dptx_disconnect(dcp_dptx_if_t *dptx, u32 port)
     return dptxport_set_hpd(dptx->port[port].service, false);
 }
 
+bool dcp_dptx_is_afkv2(const dcp_dptx_if_t *dptx)
+{
+    return dptx && afk_epic_is_v2(dptx->epic);
+}
+
 dcp_dptx_if_t *dcp_dptx_init(dcp_dev_t *dcp, u32 num_dptxports)
 {
     dcp_dptx_if_t *dptx = calloc(1, sizeof(dcp_dptx_if_t));

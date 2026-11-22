@@ -166,6 +166,18 @@ static int dcp_hdmi_dptx_init(dcp_dev_t *dcp, const display_config_t *cfg)
         return -1;
     }
 
+    /*
+     * The firmware announces which message format its dptx-port service speaks. The AFKv2
+     * format is the same on every firmware that has it. The older format's layouts were only
+     * checked against the 13.5 firmware, so other firmware with that format is not driven.
+     */
+    if (!dcp_dptx_is_afkv2(dcp->dptx_ep) && os_firmware.version != V13_5) {
+        printf("dcp: dptx-port uses the pre-AFKv2 format, checked on 13.5 firmware only\n");
+        dcp_dptx_shutdown(dcp->dptx_ep);
+        dcp_dpav_shutdown(dcp->dpav_ep);
+        return -1;
+    }
+
 #ifdef RTKIT_SYSLOG
     // start system endpoint when extended logging is requested
     dcp->system_ep = dcp_system_init(dcp);
@@ -271,14 +283,6 @@ dcp_dev_t *dcp_init(const display_config_t *cfg)
     dcp_init_quiesced = false;
 
     if (cfg && cfg->dptx_phy[0]) {
-        /* J873g reports mBoot-20457.1.29, which is not in the OS firmware
-         * table, and the same dptx-port endpoint works on its USB-C route.
-         * Keep the V13_5 restriction for the machines it was written for. */
-        if (os_firmware.version != V13_5 && chip_id != T8152) {
-            printf("dcp: dtpx-port is only supported with V13_5 OS firmware.\n");
-            return NULL;
-        }
-
         strncpy(dcp_pmgr_dev, cfg->pmgr_dev, sizeof(dcp_pmgr_dev));
         dcp_die = cfg->die;
         pmgr_adt_power_enable(cfg->dcp);
