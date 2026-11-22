@@ -98,9 +98,13 @@ def build(tmp_path, name, defines, test, key=None):
         (stubs / f).write_text(text)
     (src.parent / "build/build_cfg.h").write_text("".join(f"#define {d} 1\n" for d in defines))
     pub = key or ROOT / "data/secboot/test-ed25519.pub"
-    header = subprocess.run(
-        ["python3", "-I", str(ROOT / "tools/secboot_sign.py"), "c-header", str(pub)],
-        capture_output=True, text=True, check=True).stdout
+    tool = ["python3", "-I", str(ROOT / "tools/secboot_sign.py"), "c-header", str(pub)]
+    # As the Makefile makes it: with the id of the published test key.
+    made = subprocess.run(tool + ["--test-pub", str(ROOT / "data/secboot/test-ed25519.pub")],
+                          capture_output=True, text=True)
+    if made.returncode:  # an older signer
+        made = subprocess.run(tool, capture_output=True, text=True, check=True)
+    header = made.stdout
     (src.parent / "build/secboot_key.h").write_text(header)
     (src / "test.c").write_text(STUBS + test)
     binary = src.parent / name
@@ -149,3 +153,70 @@ def test_only_a_lab_stage1_gives_an_unrequested_proxy(tmp_path):
     for name, (defines, want) in cases.items():
         out = run(build(tmp_path, name, defines, UNREQUESTED))
         assert want in out, (name, out)
+
+
+TEST_KEY_ID = "0x6e, 0xf2, 0xba, 0xe2, 0xee, 0xe5, 0x77, 0xcb"  # key_id(test-ed25519.pub)
+
+CHAINLOAD = r"""
+/* An image with an aura_sig trailer; the stubbed check answers verify_verdict. */
+static int chainload(void)
+{
+    static u8 img[0x100 + 0x1000 + 16];
+    size_t size = sizeof(img);
+    memcpy(img + 0x100, "aura_sig", 8);
+    u64 off = 0x100;
+    memcpy(img + size - 16, &off, 8);
+    memcpy(img + size - 8, "AURSIGT1", 8);
+    char *vars[4];
+    size_t n = 0;
+    return secboot_check_chainload(img, &size, vars, &n, 4);
+}
+"""
+
+TEST_KEY = CHAINLOAD + r"""
+int main(int argc, char **argv)
+{
+    static const u8 test_id[8] = {TEST_KEY_ID};
+    static const u8 other_id[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+    verify_verdict = 0;
+    memcpy(verify_key_id, argv[1][0] == 't' ? test_id : other_id, 8);
+    printf("ret %d\n", chainload());
+    return 0;
+}
+""".replace("TEST_KEY_ID", TEST_KEY_ID)
+
+
+def test_a_test_key_signature_is_not_reported_as_verified(tmp_path):
+    (tmp_path / "own.pub").write_bytes(bytes(range(32)))
+    for defines in (["CHAINLOADING", "SECBOOT_ENFORCE"], ["CHAINLOADING", "SECBOOT_AUDIT"],
+                    ["CHAINLOADING", "ESP_STAGE2", "SECBOOT_ENFORCE"]):
+        binary = build(tmp_path, "-".join(defines), defines, TEST_KEY)
+        out = subprocess.run([str(binary), "test"], capture_output=True, text=True).stdout
+        # The trusted key signed it: it runs, but as test-key, not verified.
+        assert "next stage: test-key" in out and "ret 0" in out, out
+        # Another trusted key: verified, as before.
+        other = build(tmp_path, "-".join(defines) + "-own", defines, TEST_KEY,
+                      key=tmp_path / "own.pub")
+        out = subprocess.run([str(other), "own"], capture_output=True, text=True).stdout
+        assert "next stage: verified" in out and "ret 0" in out, out
+
+
+def make_dry(*args):
+    return subprocess.run(["make", "-n", "-C", str(ROOT), "CHAINLOADING=1", *args, "build-cfg"],
+                          capture_output=True, text=True)
+
+
+def test_enforcing_and_secure_builds_refuse_the_test_key(tmp_path):
+    own = tmp_path / "own.pub"
+    own.write_bytes(bytes(range(32)))
+    for build_args in (["SECBOOT=enforce"], ["SECBOOT=audit", "SECBOOT_FLAVOUR=secure"],
+                       ["SECBOOT=enforce", "SECBOOT_FLAVOUR=secure"],
+                       ["SECBOOT=enforce", f"SECBOOT_PUBKEY={ROOT}/data/secboot/test-ed25519.pub"]):
+        r = make_dry(*build_args)
+        assert r.returncode != 0 and "published test key" in r.stderr, (build_args, r.stderr)
+        assert make_dry(*build_args, "SECBOOT_TEST_KEY=1").returncode == 0, build_args
+        own_key = [a for a in build_args if not a.startswith("SECBOOT_PUBKEY=")]
+        assert make_dry(*own_key, f"SECBOOT_PUBKEY={own}").returncode == 0, build_args
+    # Builds that do not enforce keep the default.
+    assert make_dry("SECBOOT=audit").returncode == 0
+    assert make_dry().returncode == 0

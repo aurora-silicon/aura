@@ -45,8 +45,9 @@ check() {
 # warns below WARN.
 check stage1 4096 yes "$@"
 # The secure flavour that aurora-secboot fills with the owner's key.
-check stage1-secure-audit 8192 yes "$@" SECBOOT=audit SECBOOT_FLAVOUR=secure
-check stage1-secure-enforce 8192 yes "$@" SECBOOT=enforce SECBOOT_FLAVOUR=secure
+# Built with the test key: only the size matters here (distributions build in a key of their own).
+check stage1-secure-audit 8192 yes "$@" SECBOOT=audit SECBOOT_FLAVOUR=secure SECBOOT_TEST_KEY=1
+check stage1-secure-enforce 8192 yes "$@" SECBOOT=enforce SECBOOT_FLAVOUR=secure SECBOOT_TEST_KEY=1
 # Lab builds: signature checks with the USB host windows kept.
 check stage1-dev-audit 0 no "$@" SECBOOT=audit
 

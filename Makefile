@@ -129,7 +129,17 @@ endif
 ifneq ($(filter audit enforce,$(SECBOOT)),)
 CFG += SECBOOT_$(shell echo $(SECBOOT) | tr a-z A-Z)
 endif
-SECBOOT_PUBKEY ?= data/secboot/test-ed25519.pub
+SECBOOT_TEST_PUBKEY := data/secboot/test-ed25519.pub
+SECBOOT_PUBKEY ?= $(SECBOOT_TEST_PUBKEY)
+# Anyone can sign with the test key (its private half is in data/secboot), so a build that
+# enforces or is the secure flavour refuses it unless SECBOOT_TEST_KEY=1 says this is a test build.
+ifneq ($(filter enforce,$(SECBOOT))$(filter secure,$(SECBOOT_FLAVOUR)),)
+ifneq ($(SECBOOT_TEST_KEY),1)
+ifeq ($(shell cmp -s $(SECBOOT_PUBKEY) $(SECBOOT_TEST_PUBKEY) && echo same),same)
+$(error SECBOOT=enforce or SECBOOT_FLAVOUR=secure needs SECBOOT_PUBKEY=<your key>: $(SECBOOT_PUBKEY) is the published test key (SECBOOT_TEST_KEY=1 builds with it anyway, for tests))
+endif
+endif
+endif
 # SECBOOT_FLAVOUR=dev (default) keeps the USB host windows someone asks for (aura-proxy, the
 # configured window, DebugUSB) unless the stage enforces; SECBOOT_FLAVOUR=secure never opens one and
 # needs SECBOOT.
@@ -437,7 +447,7 @@ build-tag src/../build/build_tag.h &:
 
 build-cfg src/../build/build_cfg.h &:
 	$(QUIET)mkdir -p build
-	$(QUIET)python3 tools/secboot_sign.py c-header $(SECBOOT_PUBKEY) > build/secboot_key.tmp
+	$(QUIET)python3 tools/secboot_sign.py c-header $(SECBOOT_PUBKEY) --test-pub $(SECBOOT_TEST_PUBKEY) > build/secboot_key.tmp
 	$(QUIET)cmp -s build/secboot_key.h build/secboot_key.tmp 2>/dev/null || \
 	( mv -f build/secboot_key.tmp build/secboot_key.h && echo "  KEY   build/secboot_key.h" )
 	$(QUIET)python3 tools/execute_window.py c-header > build/execute_window.tmp

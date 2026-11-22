@@ -16,6 +16,7 @@ enum secboot_verdict {
     SECBOOT_ROLLBACK = 4,
     SECBOOT_UNSIGNED = 5,
     SECBOOT_MEASURED = 6, /* hashed only: covered by a signature checked elsewhere, or none */
+    SECBOOT_TEST_KEY = 7, /* a good signature, but by the published test key: proves nothing */
 };
 
 /* Record a measurement (SHA-256 of data) for the hand-off record this stage builds. */

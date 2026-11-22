@@ -100,6 +100,8 @@ static const char *verdict_name(enum secboot_verdict v)
             return "rollback";
         case SECBOOT_UNSIGNED:
             return "unsigned";
+        case SECBOOT_TEST_KEY:
+            return "test-key";
         case SECBOOT_MEASURED:
         default:
             return "measured";
@@ -251,7 +253,14 @@ static enum secboot_verdict check_record(const u8 *record, size_t record_size, c
                                 covered_len, key, min_secver, m->sha256, &m->security_version,
                                 m->key_id);
     m->signed_record = true;
-    return v <= SECBOOT_ROLLBACK ? (enum secboot_verdict)v : SECBOOT_BAD_FORMAT;
+    if (v > SECBOOT_ROLLBACK)
+        return SECBOOT_BAD_FORMAT;
+#ifdef SECBOOT_HAVE_TEST_KEY_ID
+    /* Anyone can sign with the published test key: say so instead of "verified". */
+    if (v == SECBOOT_VERIFIED && !memcmp(m->key_id, secboot_test_key_id, 8))
+        return SECBOOT_TEST_KEY;
+#endif
+    return (enum secboot_verdict)v;
 }
 #endif
 
@@ -267,6 +276,9 @@ static int settle(struct measurement *m, const char *what)
         return 0;
     }
     all_verified = false;
+    /* The key this stage trusts signed it: run it, but nothing about it is verified. */
+    if (m->verdict == SECBOOT_TEST_KEY)
+        return 0;
     if (secboot_enforcing()) {
         printf("secboot: refusing %s\n", what);
         return -1;
@@ -301,7 +313,7 @@ int secboot_check_payloads(u8 *p, u8 **next)
     /* Bounded by what an ESP Stage 2 can be; the hash runs over this many bytes from *next. */
     if (covered_len && covered_len <= 0x40000000UL)
         m->verdict = check_record(p, record_size, *next, covered_len, m);
-    if (m->verdict == SECBOOT_VERIFIED)
+    if (m->verdict == SECBOOT_VERIFIED || m->verdict == SECBOOT_TEST_KEY)
         covered_end = *next + covered_len;
     return settle(m, "payloads");
 #else
@@ -547,7 +559,9 @@ static int import_previous(void *dt, int chosen, int node, int *idx, bool *prev_
             continue;
         struct measurement m = {0};
         strncpy(m.component, f[2], sizeof(m.component) - 1);
-        m.verdict = !strcmp(f[3], "verified") ? SECBOOT_VERIFIED : SECBOOT_UNSIGNED;
+        m.verdict = !strcmp(f[3], "verified")   ? SECBOOT_VERIFIED
+                    : !strcmp(f[3], "test-key") ? SECBOOT_TEST_KEY
+                                                : SECBOOT_UNSIGNED;
         if (!unhex(f[6], 32, m.sha256))
             continue;
         if (strlen(f[4]) == 16 && unhex(f[4], 8, m.key_id) && strcmp(f[3], "unsigned"))

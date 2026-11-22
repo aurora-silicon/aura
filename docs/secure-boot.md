@@ -12,7 +12,11 @@ Both are build options; a default build only writes the record.
 - `SECBOOT_PUBKEY=<file>`: the raw 32-byte Ed25519 public key built into the
   stage. The default, `data/secboot/test-ed25519.pub`, is a published test
   key (its private half is in the same directory), so a build with it proves
-  nothing about who signed an image.
+  nothing about who signed an image. A `SECBOOT=enforce` or `secure` build
+  refuses to build with it unless `SECBOOT_TEST_KEY=1` is given (test builds).
+  Whatever key a stage trusts, a good signature by the test key is recorded as
+  `test-key`, not `verified`: the stage runs it, and the chain is not called
+  verified.
 - `SECBOOT_MIN_SECURITY_VERSION` (a `-D` define): the lowest security version
   a signature may carry. Signatures below it are refused as rollbacks.
 - `SECBOOT_FLAVOUR=dev|secure` (default `dev`): `dev` keeps the USB host
@@ -107,8 +111,8 @@ that builds the OS device tree writes `/chosen/aurora,boot-security`:
   and `apple,secure-boot`, `apple,effective-security-mode-ap` and related
   `/chosen` properties, copied as they are;
 - `measurement@N`: `stage`, `policy`, `component`, `verdict` (`verified`,
-  `unsigned`, `measured`, `bad-signature`, `unknown-key`, `rollback`,
-  `bad-format`), `sha256`, and for signed items `key-id` and
+  `test-key`, `unsigned`, `measured`, `bad-signature`, `unknown-key`,
+  `rollback`, `bad-format`), `sha256`, and for signed items `key-id` and
   `security-version`.
 
 U-Boot (`EFI_AURORA_MEASURE`) adds an entry for every EFI image it loads.
