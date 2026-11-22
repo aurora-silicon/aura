@@ -634,6 +634,10 @@ int payload_run(void)
          */
         panic("payload: Linux kboot path is gated out of SPTM_VIRT_ESP builds\n");
 #else
+        /* T8152: hand the display controllers this stage started to Linux powered off, with
+         * their endpoints stopped and RTKit running, before the device tree reports them. */
+        if (chip_id == T8152 && display_shutdown(DCP_HANDOFF) < 0)
+            printf("display: a DCP endpoint did not stop; Linux is told which\n");
         if (kboot_prepare_dt(fdt)) {
             printf("Failed to prepare FDT!\n");
             goto boot_failed;

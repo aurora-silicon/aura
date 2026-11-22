@@ -11978,12 +11978,12 @@ static int dt_t8152_dcp_node(u64 coproc)
 }
 
 /*
- * A controller aura brought a display up on reaches Linux live (display_shutdown()),
- * with the AFK endpoints aura started still running, in this stage or in an earlier
- * one whose framebuffer this stage adopted (dcp.afk-live=). Report them in
- * apple,afk-active-endpoints, so that apple_dcpib stops each before it starts it
- * again: an INIT on a live endpoint asserts in the firmware. An aura-started
- * dcpext0's report is left to this hand-off by dt_set_dcpext_t8152().
+ * Report in apple,afk-active-endpoints the AFK endpoints of a controller aura brought a display
+ * up on that are still running at the hand-off, in this stage or in an earlier one whose
+ * framebuffer this stage adopted (dcp.afk-live=), so that apple_dcpib stops each before it
+ * starts it again. display_shutdown(DCP_HANDOFF) stops them on T8152 before this runs, so only
+ * an endpoint that did not stop is left to report. An aura-started dcpext0's report is left to
+ * this hand-off by dt_set_dcpext_t8152().
  */
 static int dt_set_live_afk_t8152(void)
 {

@@ -11,6 +11,8 @@ typedef enum _dcp_shutdown_mode {
     DCP_QUIESCED = 0,
     DCP_SLEEP_IF_EXTERNAL = 1,
     DCP_SLEEP = 2,
+    /* T8152: display off, AFK endpoints stopped, RTKit left running for the next owner. */
+    DCP_HANDOFF = 3,
 } dcp_shutdown_mode;
 
 extern bool display_is_external;

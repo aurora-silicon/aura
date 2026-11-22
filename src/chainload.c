@@ -459,6 +459,12 @@ int chainload_load(const char *spec, char **vars, size_t *var_cnt, size_t var_ca
     if (ret == 0)
         stage1_log_handoff(vars, var_cnt, var_capacity);
 #endif
+    /*
+     * T8152: the next stage cannot stop a session it only adopts, so this one hands its display
+     * controllers over now, as it would to Linux (display_shutdown(DCP_HANDOFF)).
+     */
+    if (ret == 0 && chip_id == T8152 && display_shutdown(DCP_HANDOFF) < 0)
+        printf("chainload: a DCP endpoint did not stop; the next stage is told which\n");
     /* A display handed on live: the next stage adopts it, its live AFK endpoints too. */
     char *afk_var = display_afk_var();
     if (ret == 0 && afk_var) {

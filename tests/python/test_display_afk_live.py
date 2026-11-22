@@ -214,3 +214,217 @@ def test_a_missing_controller_is_skipped_not_fatal(tmp_path):
     assert out.count("no /arm-io/dcpext0 in the ADT; its AFK endpoints 0x10 are not reported") == 1
     assert out.count("no node for /arm-io/dcpext0; its AFK endpoints 0x10 are not reported") == 1
     assert out.endswith("ok\n")
+
+
+HANDOFF_HARNESS = r"""
+#include <assert.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <string.h>
+typedef struct { const char *name; bool endpoint_fails; } dcp_dev_t;
+typedef struct { const char *name; bool power_fails; } dcp_iboot_if_t;
+static dcp_dev_t *dcp;
+static dcp_iboot_if_t *iboot;
+static struct { dcp_dev_t *dcp; dcp_iboot_if_t *iboot; } display_other;
+static char calls[512];
+static void call(const char *what, const char *name)
+{
+    strcat(calls, what);
+    strcat(calls, ":");
+    strcat(calls, name);
+    strcat(calls, " ");
+}
+static int dcp_ib_set_power(dcp_iboot_if_t *ib, bool power)
+{
+    assert(!power);
+    call("off", ib->name);
+    return ib->power_fails ? -1 : 0;
+}
+static int dcp_ib_shutdown(dcp_iboot_if_t *ib)
+{
+    call("ib", ib->name);
+    return 0;
+}
+static int dcp_handoff(dcp_dev_t *d)
+{
+    call("eps", d->name);
+    return d->endpoint_fails ? -1 : 0;
+}
+/* display.c's swaps more state; these two are what the hand-off uses. */
+static void display_swap_state(void)
+{
+    dcp_dev_t *d = dcp;
+    dcp_iboot_if_t *i = iboot;
+    dcp = display_other.dcp;
+    iboot = display_other.iboot;
+    display_other.dcp = d;
+    display_other.iboot = i;
+}
+"""
+
+HANDOFF_MAIN = r"""
+int main(void)
+{
+    dcp_dev_t first = {"dcp", false}, second = {"dcpext0", false};
+    dcp_iboot_if_t ib1 = {"dcp", false}, ib2 = {"dcpext0", false};
+
+    /* A stage that only adopted the display: nothing of its own to hand over. */
+    assert(display_handoff_t8152() == 0 && !calls[0]);
+
+    /* Both displays this stage started: each powered off, then its iBoot interface and the
+     * other endpoints stopped, the first display's state swapped back in afterwards. */
+    dcp = &first;
+    iboot = &ib1;
+    display_other.dcp = &second;
+    display_other.iboot = &ib2;
+    assert(display_handoff_t8152() == 0);
+    assert(!strcmp(calls, "off:dcp ib:dcp eps:dcp off:dcpext0 ib:dcpext0 eps:dcpext0 "));
+    assert(dcp == &first && !iboot && display_other.dcp == &second && !display_other.iboot);
+
+    /* Once is enough: the chainload and the Linux boundary may both ask. */
+    calls[0] = 0;
+    assert(display_handoff_t8152() == 0 && !calls[0]);
+
+    /* A display that does not power off is still stopped; an endpoint that does not stop
+     * fails the hand-off but not the other display's. */
+    calls[0] = 0;
+    iboot = &ib1;
+    display_other.iboot = &ib2;
+    ib1.power_fails = true;
+    second.endpoint_fails = true;
+    assert(display_handoff_t8152() == -1);
+    assert(!strcmp(calls, "off:dcp ib:dcp eps:dcp off:dcpext0 ib:dcpext0 eps:dcpext0 "));
+
+    /* Only the first display. */
+    calls[0] = 0;
+    iboot = &ib1;
+    ib1.power_fails = false;
+    display_other.dcp = NULL;
+    assert(display_handoff_t8152() == 0 && !strcmp(calls, "off:dcp ib:dcp eps:dcp "));
+    puts("ok");
+    return 0;
+}
+"""
+
+
+def test_t8152_handoff_stops_what_this_stage_started(tmp_path):
+    disp = (SOURCE / "src/display.c").read_text()
+    source = HANDOFF_HARNESS + "".join(function(disp, signature) for signature in (
+        "static int display_handoff_one_t8152(",
+        "static int display_handoff_t8152(",
+    )) + HANDOFF_MAIN
+    exe = tmp_path / "handoff"
+    subprocess.run(["cc", "-std=gnu11", "-Wall", "-Wextra", "-Werror", "-x", "c", "-", "-o",
+                    str(exe)], input=source, text=True, check=True)
+    out = subprocess.run([str(exe)], capture_output=True, text=True, check=True).stdout
+    assert out.count("failed to power off the first display for the hand-off") == 1
+    assert out.count("a second DCP endpoint did not stop") == 1
+    assert out.endswith("ok\n")
+
+
+REAL_HANDOFF_HARNESS = r"""
+#include <assert.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+typedef uint32_t u32;
+#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
+#define BIT(n) (1u << (n))
+#define T8140 0x8140
+#define T8132 0x8132
+#define T8152 0x8152
+static u32 chip_id = T8152;
+typedef struct rtkit_dev rtkit_dev_t;
+typedef struct afk_epic_ep afk_epic_ep_t;
+struct afk_epic {
+    rtkit_dev_t *rtk;
+    afk_epic_ep_t *endpoint[0x10];
+};
+typedef struct afk_epic afk_epic_t;
+struct afk_epic_ep { int ep; afk_epic_t *afk; bool started; bool stuck; };
+/* afk.c's sends SHUTDOWN and polls; here an endpoint stops unless it is stuck. */
+static int afk_epic_shutdown_ep(afk_epic_ep_t *epic)
+{
+    if (epic->stuck)
+        return -1;
+    epic->afk->endpoint[epic->ep - 0x20] = NULL;
+    free(epic);
+    return 0;
+}
+typedef struct { int unused; } dcp_system_if_t, dcp_dptx_if_t, dcp_dpav_if_t;
+static int dcp_system_shutdown(dcp_system_if_t *s) { (void)s; return 0; }
+static int dcp_dptx_shutdown(dcp_dptx_if_t *s) { (void)s; return 0; }
+static int dcp_dpav_shutdown(dcp_dpav_if_t *s) { (void)s; return 0; }
+typedef struct {
+    afk_epic_t *afk;
+    dcp_system_if_t *system_ep;
+    dcp_dpav_if_t *dpav_ep;
+    dcp_dptx_if_t *dptx_ep;
+} dcp_dev_t;
+typedef struct { const char *dcp; } display_config_t;
+static dcp_dev_t *dcp;
+static const display_config_t *t8152_config;
+static struct { dcp_dev_t *dcp; const display_config_t *cfg; } display_other;
+"""
+
+REAL_HANDOFF_MAIN = r"""
+static afk_epic_t *context(u32 started, u32 stuck)
+{
+    afk_epic_t *afk = calloc(1, sizeof(*afk));
+    for (int i = 0; i < 0x10; i++) {
+        if (!(started & BIT(i)))
+            continue;
+        afk->endpoint[i] = calloc(1, sizeof(*afk->endpoint[i]));
+        *afk->endpoint[i] = (afk_epic_ep_t){0x20 + i, afk, true, !!(stuck & BIT(i))};
+    }
+    return afk;
+}
+
+int main(void)
+{
+    static const display_config_t hdmi = {"/arm-io/dcp"};
+    dcp_dev_t d = {context(0x419, 0), NULL, NULL, NULL};
+    dcp = &d;
+    t8152_config = &hdmi;
+
+    /* Every endpoint stops: the context is freed, and nothing reads it afterwards. */
+    assert(display_live_endpoints("/arm-io/dcp") == 0x419);
+    assert(dcp_handoff(&d) == 0 && !d.afk);
+    assert(!display_live_endpoints("/arm-io/dcp") && !display_afk_var());
+
+    /* One does not: the context stays, and that endpoint is reported and passed on. */
+    d.afk = context(0x419, 0x8);
+    assert(dcp_handoff(&d) == -1 && d.afk);
+    assert(display_live_endpoints("/arm-io/dcp") == 0x8);
+    assert(!strcmp(display_afk_var(), "dcp.afk-live=0008,0000"));
+    free(d.afk->endpoint[3]);
+    free(d.afk);
+    puts("ok");
+    return 0;
+}
+"""
+
+
+def test_dcp_handoff_leaves_no_freed_afk_context(tmp_path):
+    disp = (SOURCE / "src/display.c").read_text()
+    afk = (SOURCE / "src/afk.c").read_text()
+    dcpc = (SOURCE / "src/dcp.c").read_text()
+    state = disp[disp.index("/* The controllers whose live AFK endpoints"):
+                 disp.index("/* This stage starts a session of its own")]
+    source = REAL_HANDOFF_HARNESS + "".join(function(afk, signature) for signature in (
+        "int afk_epic_shutdown(",
+        "u32 afk_epic_live_endpoints(",
+    )) + function(dcpc, "int dcp_handoff(") + function(
+        disp, "static bool display_hands_on_live(") + state + "".join(
+        function(disp, signature) for signature in (
+            "u32 display_live_endpoints(",
+            "char *display_afk_var(",
+        )) + REAL_HANDOFF_MAIN
+    exe = tmp_path / "real_handoff"
+    subprocess.run(["cc", "-std=gnu11", "-Wall", "-Wextra", "-Werror", "-g",
+                    "-fsanitize=address,undefined", "-fno-sanitize-recover=all", "-x", "c", "-",
+                    "-o", str(exe)], input=source, text=True, check=True)
+    assert subprocess.run([str(exe)], capture_output=True, text=True,
+                          check=True).stdout == "ok\n"

@@ -879,8 +879,11 @@ bool display_second_attempted(void)
 
 /*
  * Whether display_shutdown() hands the display controllers on live, sessions and scanout
- * intact, at both the Stage 1 and the Linux boundary: Linux owns the live J700/J713/J873
- * controllers. Elsewhere it stops their endpoints before the next stage runs.
+ * intact, at both the Stage 1 and the Linux boundary: Linux owns the live J700/J713
+ * controllers. On T8152 that holds for every mode but DCP_HANDOFF, which the stage that
+ * started a session runs at both boundaries (display_handoff_t8152()), so its endpoints are
+ * stopped by then and nothing is reported or passed on. Elsewhere display_shutdown() stops the
+ * endpoints before the next stage runs.
  */
 static bool display_hands_on_live(void)
 {
@@ -929,8 +932,9 @@ bool display_set_afk_live(const char *val)
 }
 
 /*
- * The variable that passes the live endpoints on to the next aura stage, or NULL if none.
- * It is built before display_shutdown() runs, so only where that keeps the sessions running.
+ * The variable that passes the live endpoints on to the next aura stage, or NULL if none: only
+ * where display_shutdown() keeps the sessions running. On T8152 chainload_load() runs
+ * display_shutdown(DCP_HANDOFF) first, so it carries only an endpoint that did not stop.
  */
 char *display_afk_var(void)
 {
@@ -1164,10 +1168,53 @@ int display_init(void)
     }
 }
 
+/*
+ * Hand one T8152 display controller over as iBoot would: display powered off, AFK endpoints
+ * stopped, RTKit running. The next owner, an aura stage or Linux, starts its own session on the
+ * running core. A session handed on live fails there: the firmware asks the new owner for a
+ * buffer it never mapped and crashes before any endpoint can be stopped (aura#419). A stage
+ * that only adopted the display has nothing to hand over here (iboot is NULL); the stage that
+ * started the session ran this at its own boundary.
+ */
+static int display_handoff_one_t8152(const char *what)
+{
+    if (!iboot)
+        return 0;
+    /* The next owner starts a new iBoot session, which drops the surface: a pipe still
+     * running then fetches from a null base and the DCP takes an NMI. Power it off first. */
+    if (dcp_ib_set_power(iboot, false) < 0)
+        printf("display: failed to power off the %s display for the hand-off\n", what);
+    /* An endpoint that does not stop stays registered and is reported as live. */
+    dcp_ib_shutdown(iboot);
+    iboot = NULL;
+    printf("display: stopping the %s DCP's endpoints, RTKit stays on\n", what);
+    if (dcp_handoff(dcp) < 0) {
+        printf("display: a %s DCP endpoint did not stop\n", what);
+        return -1;
+    }
+    return 0;
+}
+
+static int display_handoff_t8152(void)
+{
+    int ret = display_handoff_one_t8152("first");
+
+    if (display_other.dcp) {
+        display_swap_state();
+        if (display_handoff_one_t8152("second") < 0)
+            ret = -1;
+        display_swap_state();
+    }
+    return ret;
+}
+
 int display_shutdown(dcp_shutdown_mode mode)
 {
-    /* Linux owns the live J700/J713/J873 controllers. Keep the inherited ASC session
-     * and scanout intact at both the Stage 1 and Linux boundaries. */
+    if (chip_id == T8152 && mode == DCP_HANDOFF)
+        return display_handoff_t8152();
+
+    /* Linux owns the live J700/J713 controllers, and T8152's outside DCP_HANDOFF. Keep the
+     * inherited ASC session and scanout intact at both the Stage 1 and Linux boundaries. */
     if (display_hands_on_live())
         return 0;
 

@@ -95,6 +95,13 @@ static void rust_free_image(void *data, size_t size)
 static void stage1_log_handoff(char **vars, size_t *var_cnt, size_t var_capacity) {}
 /* display.c: only a display handed on live adds a variable; none here. */
 static char *display_afk_var(void) { return NULL; }
+/* display.c: the T8152 display hand-off before a chainload; not this chip. */
+#ifndef T8152
+#define T8152 0x8152
+#endif
+typedef enum { DCP_HANDOFF = 3 } dcp_shutdown_mode;
+static int display_shutdown(dcp_shutdown_mode mode) { (void)mode; return 0; }
+static int chip_id;
 /* secboot.c: no image trailer, nothing enforced */
 static int secboot_check_chainload(void *data, size_t *size, char **vars, size_t *var_cnt,
                                    size_t var_capacity)
