@@ -747,7 +747,7 @@ static void ext_seg_move(int i, int k, u64 phys)
     struct seg es[4];
     adt_path_of(nub, sizeof(nub), "/arm-io/dcpext%d/iop-dcpext%d-nub", i);
     u32 len = 0;
-    const struct seg *cur = adt_getprop(adt, adt_path_offset(adt, nub), "segment-ranges", &len);
+    const void *cur = adt_getprop(adt, adt_path_offset(adt, nub), "segment-ranges", &len);
     memcpy(es, cur, sizeof(es));
     es[k].phys = phys;
     prop_set(nub, "segment-ranges", es, sizeof(es));
