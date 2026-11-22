@@ -9,6 +9,7 @@ typedef unsigned long u64;
 _Static_assert(sizeof(u64)==8,"64-bit host required");
 typedef uint32_t u32;
 static void *dt, *adt;
+#define ARRAY_SIZE(s) (sizeof(s) / sizeof((s)[0]))
 #define bail_cleanup(...) do { fprintf(stderr,__VA_ARGS__); goto err; } while(0)
 #define bail(...) do { fprintf(stderr,__VA_ARGS__); return -1; } while(0)
 #define ADT_GETPROP(a,b,c,d) (-1)
