@@ -89,7 +89,7 @@ bool iova_reserve(iova_domain_t *iovad, u64 iova, size_t sz)
     struct iova_block *blk_prev = NULL;
     while (blk != NULL) {
         if (iova >= blk->iova && iova < (blk->iova + blk->sz)) {
-            if (iova + sz >= (blk->iova + blk->sz)) {
+            if (iova + sz > (blk->iova + blk->sz)) {
                 printf("iova_reserve: tried to reserve [%lx; +%lx] but block in free list has "
                        "range [%lx; +%lx]\n",
                        iova, sz, blk->iova, blk->sz);
@@ -102,7 +102,7 @@ bool iova_reserve(iova_domain_t *iovad, u64 iova, size_t sz)
                 if (blk_prev)
                     blk_prev->next = blk->next;
                 else
-                    iovad->free_list = NULL;
+                    iovad->free_list = blk->next;
 
                 free(blk);
                 return true;
@@ -177,60 +177,42 @@ void iova_free(iova_domain_t *iovad, u64 iova, size_t sz)
 {
     sz = ALIGN_UP(sz, SZ_16K);
 
+    /* The free list is sorted and coalesced: find the blocks around the range. */
     struct iova_block *blk_prev = NULL;
     struct iova_block *blk = iovad->free_list;
-
-    /* create a new free list if it's empty */
-    if (!blk) {
-        blk = calloc(1, sizeof(*blk));
-        if (!blk)
-            panic("out of memory in iovad_free");
-        blk->iova = iova;
-        blk->sz = sz;
-        blk->next = NULL;
-        iovad->free_list = blk;
-        return;
-    }
-
-    while (blk != NULL) {
-        if ((iova + sz) == blk->iova) {
-            /* extend the block at the beginning */
-            blk->iova -= sz;
-            blk->sz += sz;
-
-            /* if we have just extended the start of the free list we're already done */
-            if (!blk_prev)
-                return;
-
-            /* check if we can merge two blocks otherwise */
-            if ((blk_prev->iova + blk_prev->sz) == blk->iova) {
-                blk_prev->sz += blk->sz;
-                blk_prev->next = blk->next;
-                free(blk);
-            }
-
-            return;
-        } else if ((iova + sz) < blk->iova) {
-            /* create a new block */
-            struct iova_block *blk_new = calloc(1, sizeof(*blk_new));
-            if (!blk_new)
-                panic("iova_free: out of memory\n");
-
-            blk_new->iova = iova;
-            blk_new->sz = sz;
-            blk_new->next = blk;
-
-            if (blk_prev)
-                blk_prev->next = blk_new;
-            else
-                iovad->free_list = blk_new;
-
-            return;
-        }
-
+    while (blk && blk->iova < iova + sz) {
         blk_prev = blk;
         blk = blk->next;
     }
 
-    panic("iovad_free: corruption detected, unable to insert freed range\n");
+    /* The range must not overlap a free block (double free or corruption). */
+    if (blk_prev && blk_prev->iova + blk_prev->sz > iova)
+        panic("iova_free: [%lx; +%lx] is already free\n", iova, sz);
+
+    bool join_prev = blk_prev && blk_prev->iova + blk_prev->sz == iova;
+    bool join_next = blk && iova + sz == blk->iova;
+
+    if (join_prev && join_next) {
+        blk_prev->sz += sz + blk->sz;
+        blk_prev->next = blk->next;
+        free(blk);
+    } else if (join_prev) {
+        blk_prev->sz += sz;
+    } else if (join_next) {
+        blk->iova = iova;
+        blk->sz += sz;
+    } else {
+        struct iova_block *blk_new = calloc(1, sizeof(*blk_new));
+        if (!blk_new)
+            panic("iova_free: out of memory\n");
+
+        blk_new->iova = iova;
+        blk_new->sz = sz;
+        blk_new->next = blk;
+
+        if (blk_prev)
+            blk_prev->next = blk_new;
+        else
+            iovad->free_list = blk_new;
+    }
 }

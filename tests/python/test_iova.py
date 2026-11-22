@@ -1,0 +1,332 @@
+# SPDX-License-Identifier: MIT
+"""Host tests for the IOVA allocator (src/iova.c).
+
+The production iova.c is compiled unchanged against small host stand-ins for
+aura's headers, then driven through fixed cases and a seeded random
+alloc/free/reserve sequence checked against a page bitmap model.
+"""
+from pathlib import Path
+import shutil
+import subprocess
+
+from host_compiler import host_cc
+
+ROOT = Path(__file__).resolve().parents[2]
+
+STUBS = {
+    "types.h": r'''
+#pragma once
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+typedef uint64_t u64;
+typedef uint32_t u32;
+''',
+    "dart.h": r'''
+#pragma once
+#include "types.h"
+typedef struct dart_dev dart_dev_t;
+void dart_free_l2(dart_dev_t *dart, u64 iova);
+''',
+    "malloc.h": "#pragma once\n#include <stdlib.h>\n",
+    "string.h": "#pragma once\n#include_next <string.h>\n",
+    "utils.h": r'''
+#pragma once
+#include <stdio.h>
+#include "types.h"
+#define SZ_16K (16 * 1024)
+#define SZ_32M (32 * 1024 * 1024)
+#define ALIGN_UP(x, a) (((x) + ((a) - 1)) & ~((u64)(a) - 1))
+#define ALIGN_DOWN(x, a) ((x) & ~((u64)(a) - 1))
+#define printf(...) ((void)0)
+_Noreturn void panic(const char *fmt, ...);
+''',
+}
+
+HARNESS = r'''
+#include <assert.h>
+#include <setjmp.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "iova.h"
+
+#define SZ_16K (16 * 1024)
+#define SZ_32M (32 * 1024 * 1024)
+
+struct iova_block {
+    u64 iova;
+    size_t sz;
+    struct iova_block *next;
+};
+
+struct iova_domain {
+    u64 base;
+    u64 limit;
+    struct iova_block *free_list;
+};
+
+static jmp_buf panic_jmp;
+static int expect_panic;
+
+_Noreturn void panic(const char *fmt, ...)
+{
+    if (expect_panic)
+        longjmp(panic_jmp, 1);
+    fprintf(stderr, "unexpected panic: %s\n", fmt);
+    abort();
+}
+
+static unsigned l2_frees;
+void dart_free_l2(dart_dev_t *dart, u64 iova)
+{
+    (void)dart;
+    assert(iova % SZ_32M == 0);
+    l2_frees++;
+}
+
+#define PG SZ_16K
+
+/* The free list must be sorted, non-empty blocks, never touching. */
+static void check_list(iova_domain_t *d)
+{
+    u64 end = 0;
+    for (struct iova_block *b = d->free_list; b; b = b->next) {
+        assert(b->sz && b->sz % PG == 0 && b->iova % PG == 0);
+        assert(b->iova >= (d->base ? d->base : PG));
+        assert(b->iova + b->sz <= d->limit);
+        if (end)
+            assert(b->iova > end); /* sorted and coalesced */
+        end = b->iova + b->sz;
+    }
+}
+
+static unsigned blocks(iova_domain_t *d)
+{
+    unsigned n = 0;
+    for (struct iova_block *b = d->free_list; b; b = b->next)
+        n++;
+    return n;
+}
+
+static void test_init(void)
+{
+    /* base must be 32M aligned, limit 16K aligned and above the first page */
+    assert(!iovad_init(SZ_16K, SZ_32M));
+    assert(!iovad_init(0, SZ_16K));
+    assert(!iovad_init(0, SZ_32M + 1));
+    assert(!iovad_init(SZ_32M, SZ_32M));
+
+    iova_domain_t *d = iovad_init(0, 4 * PG);
+    assert(d);
+    /* page 0 is never handed out */
+    assert(iova_alloc(d, 1) == PG);
+    assert(iova_alloc(d, PG) == 2 * PG);
+    assert(iova_alloc(d, PG + 1) == 0); /* rounds to 2 pages, only 1 left */
+    assert(iova_alloc(d, PG) == 3 * PG);
+    assert(iova_alloc(d, PG) == 0);
+    assert(!d->free_list);
+    iovad_shutdown(d, NULL);
+
+    d = iovad_init(2 * (u64)SZ_32M, 4 * (u64)SZ_32M);
+    assert(d);
+    assert(iova_alloc(d, 1) == 2 * (u64)SZ_32M);
+    l2_frees = 0;
+    iovad_shutdown(d, (dart_dev_t *)1);
+    assert(l2_frees == 2);
+}
+
+static void test_free_coalescing(void)
+{
+    iova_domain_t *d = iovad_init(0, 64 * PG);
+    u64 a = iova_alloc(d, PG), b = iova_alloc(d, PG), c = iova_alloc(d, PG);
+    assert(a == PG && b == 2 * PG && c == 3 * PG);
+
+    /* in front of the remaining block, with a gap */
+    iova_free(d, a, PG);
+    check_list(d);
+    assert(blocks(d) == 2);
+    /* directly after a free block and with a gap before the next one */
+    iova_free(d, b, PG);
+    check_list(d);
+    assert(blocks(d) == 2);
+    /* closes the gap: everything is one block again */
+    iova_free(d, c, PG);
+    check_list(d);
+    assert(blocks(d) == 1);
+    assert(iova_alloc(d, 63 * PG) == PG);
+    iovad_shutdown(d, NULL);
+}
+
+static void test_free_after_last_block(void)
+{
+    iova_domain_t *d = iovad_init(0, 4 * PG);
+    u64 a = iova_alloc(d, PG);
+    u64 rest = iova_alloc(d, 2 * PG); /* takes the tail: the list is empty */
+    assert(a == PG && rest == 2 * PG && !d->free_list);
+    iova_free(d, a, PG);
+    /* the freed range lies after the only free block */
+    iova_free(d, rest, 2 * PG);
+    check_list(d);
+    assert(blocks(d) == 1);
+    assert(iova_alloc(d, 3 * PG) == PG);
+    iovad_shutdown(d, NULL);
+}
+
+static void test_reserve(void)
+{
+    iova_domain_t *d = iovad_init(0, 16 * PG);
+
+    /* page 0 is not part of the domain: reserving it is a no-op */
+    assert(iova_reserve(d, 0, PG));
+    /* middle split */
+    assert(iova_reserve(d, 4 * PG, 2 * PG));
+    check_list(d);
+    assert(blocks(d) == 2);
+    /* front cut */
+    assert(iova_reserve(d, PG, PG));
+    /* up to the exact end of a block (2..3 of [2,4)) */
+    assert(iova_reserve(d, 3 * PG, PG));
+    check_list(d);
+    /* a whole block that is first in the list; the rest of the list stays */
+    assert(iova_reserve(d, 2 * PG, PG));
+    check_list(d);
+    assert(d->free_list && d->free_list->iova == 6 * PG);
+    /* tail of the domain */
+    assert(iova_reserve(d, 14 * PG, 2 * PG));
+    check_list(d);
+    assert(d->free_list->iova == 6 * PG && d->free_list->sz == 8 * PG);
+    /* already used, or crossing a block boundary */
+    assert(!iova_reserve(d, 4 * PG, PG));
+    assert(!iova_reserve(d, 13 * PG, 2 * PG));
+    /* unaligned requests are widened to whole pages */
+    assert(iova_reserve(d, 6 * PG + 1, 1));
+    assert(d->free_list->iova == 7 * PG);
+    assert(iova_alloc(d, 7 * PG) == 7 * PG);
+    assert(!d->free_list);
+    assert(!iova_reserve(d, 8 * PG, PG));
+    iovad_shutdown(d, NULL);
+}
+
+/* Seeded random sequence against a page bitmap model. */
+#define NPAGES 256
+static unsigned char used[NPAGES];
+static unsigned long long rng = 0x9e3779b97f4a7c15ull;
+static unsigned rnd(unsigned n)
+{
+    rng ^= rng << 13;
+    rng ^= rng >> 7;
+    rng ^= rng << 17;
+    return (unsigned)(rng % n);
+}
+
+struct live {
+    u64 iova;
+    unsigned pages;
+};
+
+static void test_random(void)
+{
+    iova_domain_t *d = iovad_init(0, NPAGES * (u64)PG);
+    struct live live[NPAGES];
+    unsigned nlive = 0, allocs = 0, failed = 0;
+    memset(used, 0, sizeof(used));
+    used[0] = 1;
+
+    for (int step = 0; step < 200000; step++) {
+        if (nlive && (rnd(2) || nlive > 64)) {
+            unsigned i = rnd(nlive);
+            for (unsigned p = 0; p < live[i].pages; p++)
+                used[live[i].iova / PG + p] = 0;
+            iova_free(d, live[i].iova, live[i].pages * (u64)PG - rnd(PG));
+            live[i] = live[--nlive];
+        } else {
+            unsigned pages = 1 + rnd(rnd(4) ? 4 : 32);
+            u64 iova = iova_alloc(d, pages * (u64)PG - rnd(PG));
+            /* the allocator is first fit: it fails only if no run is free */
+            unsigned run = 0, first = 0;
+            for (unsigned p = 1; p < NPAGES && !first; p++) {
+                run = used[p] ? 0 : run + 1;
+                if (run == pages)
+                    first = p + 1 - pages;
+            }
+            if (!iova) {
+                assert(!first);
+                failed++;
+                continue;
+            }
+            assert(iova == first * (u64)PG);
+            for (unsigned p = 0; p < pages; p++) {
+                assert(!used[first + p]);
+                used[first + p] = 1;
+            }
+            live[nlive++] = (struct live){iova, pages};
+            allocs++;
+        }
+        check_list(d);
+    }
+    while (nlive) {
+        iova_free(d, live[nlive - 1].iova, live[nlive - 1].pages * (u64)PG);
+        nlive--;
+    }
+    check_list(d);
+    assert(blocks(d) == 1);
+    assert(iova_alloc(d, (NPAGES - 1) * (u64)PG) == PG);
+    printf("random: %u allocations, %u refused\n", allocs, failed);
+    assert(allocs > 10000 && failed > 100);
+    iovad_shutdown(d, NULL);
+}
+
+static void test_double_free_panics(void)
+{
+    iova_domain_t *d = iovad_init(0, 16 * PG);
+    u64 a = iova_alloc(d, PG);
+    (void)iova_alloc(d, PG);
+    iova_free(d, a, PG);
+    expect_panic = 1;
+    if (!setjmp(panic_jmp)) {
+        iova_free(d, a, PG);
+        assert(!"double free accepted");
+    }
+    expect_panic = 0;
+}
+
+int main(void)
+{
+    test_init();
+    test_free_coalescing();
+    test_free_after_last_block();
+    test_reserve();
+    test_random();
+    test_double_free_panics();
+    puts("iova: ok");
+    return 0;
+}
+'''
+
+
+def build(tmp_path, source=None):
+    # The stand-ins live in their own include directory so the string.h
+    # wrapper can #include_next the host header.
+    inc = tmp_path / "inc"
+    inc.mkdir(exist_ok=True)
+    for name, text in STUBS.items():
+        (inc / name).write_text(text)
+    shutil.copy(ROOT / "src/iova.h", tmp_path / "iova.h")
+    (tmp_path / "iova.c").write_text(source or (ROOT / "src/iova.c").read_text())
+    (tmp_path / "harness.c").write_text(HARNESS)
+    binary = tmp_path / "iova-host"
+    subprocess.run(
+        [*host_cc(), "-std=gnu11", "-O1", "-g", "-Wall", "-Wextra", "-Werror",
+         "-Wno-unused-parameter", "-fsanitize=address,undefined",
+         "-fno-sanitize-recover=all", "-I", str(inc),
+         str(tmp_path / "iova.c"), str(tmp_path / "harness.c"), "-o", str(binary)],
+        check=True,
+    )
+    return binary
+
+
+def test_iova_allocator(tmp_path):
+    result = subprocess.run([str(build(tmp_path))], capture_output=True, text=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "iova: ok" in result.stdout
