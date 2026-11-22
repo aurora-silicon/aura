@@ -376,14 +376,16 @@ static bool rtkit_handle_buffer_request(rtkit_dev_t *rtk, struct rtkit_message *
     } else if (addr) {
         if (!rtk->dart)
             return false;
-        bfr->dva = addr & ~rtk->dva_base;
-        bfr->sz = sz;
-        bfr->owned = false;
-        bfr->bfr = dart_translate(rtk->dart, bfr->dva & IOVA_MASK);
-        if (!bfr->bfr) {
-            rtkit_printf("failed to translate pre-allocated buffer (ep 0x%x)\n", msg->ep);
+        u64 dva = addr & ~rtk->dva_base;
+        void *phys = dart_translate_range(rtk->dart, dva & IOVA_MASK, sz);
+        if (!phys) {
+            rtkit_printf("pre-allocated buffer (ep 0x%x) isn't mapped contiguously\n", msg->ep);
             return false;
         }
+        bfr->dva = dva;
+        bfr->bfr = phys;
+        bfr->sz = sz;
+        bfr->owned = false;
         return true;
 
     } else {
@@ -432,22 +434,16 @@ static bool rtkit_handle_oslog_request(rtkit_dev_t *rtk, struct rtkit_message *m
             rtkit_printf("pre-allocated oslog buffer (phys %#lx, size %#zx)\n", addr, sz);
             return true;
         }
-        if (rtk->dart && sz && addr <= UINT64_MAX - sz) {
+        if (rtk->dart && sz) {
             u64 dva = addr & ~rtk->dva_base;
-            u64 page = ALIGN_DOWN(dva, SZ_16K);
-            u64 end = ALIGN_UP(dva + sz, SZ_16K);
-            void *phys = dart_translate(rtk->dart, page & IOVA_MASK);
-            if (!phys)
-                return false;
             /* The RTKit buffer API requires one contiguous host mapping. */
-            for (u64 next = page + SZ_16K; next < end; next += SZ_16K) {
-                if (dart_translate(rtk->dart, next & IOVA_MASK) != phys + (next - page)) {
-                    rtkit_printf("oslog DART buffer is not contiguous\n");
-                    return false;
-                }
+            void *phys = dart_translate_range(rtk->dart, dva & IOVA_MASK, sz);
+            if (!phys) {
+                rtkit_printf("oslog DART buffer is not mapped contiguously\n");
+                return false;
             }
             bfr->dva = dva;
-            bfr->bfr = phys + (dva - page);
+            bfr->bfr = phys;
             bfr->sz = sz;
             rtkit_printf("pre-allocated oslog buffer (dva %#lx, phys %p, size %#zx)\n", dva,
                          bfr->bfr, sz);
@@ -484,33 +480,61 @@ static bool rtkit_handle_oslog_request(rtkit_dev_t *rtk, struct rtkit_message *m
 
 static void rtkit_crashed(rtkit_dev_t *rtk)
 {
-    struct crashlog_hdr *hdr = rtk->crashlog_bfr.bfr;
+    const u8 *base = rtk->crashlog_bfr.bfr;
     rtk->crashed = true;
 
     rtkit_printf("IOP crashed!\n");
 
     /* A warm-started session's crash log is in a buffer an earlier owner gave. */
-    if (!hdr)
+    if (!base)
         return;
 
-    if (hdr->type != 'CLHE') {
-        rtkit_printf("bad crashlog header 0x%x @ %p\n", hdr->type, hdr);
+    /* The firmware writes the log; every read stays inside the buffer it was given. */
+    struct crashlog_hdr hdr;
+    if (rtk->crashlog_bfr.sz < sizeof(hdr)) {
+        rtkit_printf("crashlog buffer too small (%#zx)\n", rtk->crashlog_bfr.sz);
+        return;
+    }
+    memcpy(&hdr, base, sizeof(hdr));
+    if (hdr.type != 'CLHE') {
+        rtkit_printf("bad crashlog header 0x%x @ %p\n", hdr.type, base);
         return;
     }
 
-    struct crashlog_entry *p = (void *)(hdr + 1);
+    const u8 *end = base + rtk->crashlog_bfr.sz;
+    const u8 *cur = base + sizeof(hdr);
 
     rtkit_printf("== CRASH INFO ==\n");
-    while (p->type != 'CLHE') {
-        switch (p->type) {
-            case 'Cstr':
-                rtkit_printf("  Message %d: %s\n", p->payload[0], &p->payload[4]);
+    while ((size_t)(end - cur) >= sizeof(struct crashlog_entry)) {
+        struct crashlog_entry e;
+        memcpy(&e, cur, sizeof(e));
+        if (e.type == 'CLHE')
+            break;
+
+        size_t room = (size_t)(end - cur);
+        if (e.len < sizeof(e) || e.len > room) {
+            rtkit_printf("  bad crashlog entry length %#x @ %p\n", e.len, cur);
+            break;
+        }
+        switch (e.type) {
+            case 'Cstr': {
+                size_t n = e.len - sizeof(e);
+
+                if (n > 4) {
+                    size_t max_len = n - 4;
+                    if (max_len > INT_MAX)
+                        max_len = INT_MAX;
+                    rtkit_printf("  Message %d: %.*s\n", cur[sizeof(e)],
+                                 (int)strnlen((const char *)(cur + sizeof(e) + 4), max_len),
+                                 cur + sizeof(e) + 4);
+                }
                 break;
+            }
             default:
-                rtkit_printf("  0x%x\n", p->type);
+                rtkit_printf("  0x%x\n", e.type);
                 break;
         }
-        p = ((void *)p) + p->len;
+        cur += e.len;
     }
 }
 
