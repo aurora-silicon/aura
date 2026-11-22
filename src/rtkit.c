@@ -855,15 +855,15 @@ static bool rtkit_boot_internal(rtkit_dev_t *rtk, u32 timeout_usec, bool warm, u
     return true;
 }
 
-static void rtkit_live_add(struct rtkit_live_state *st, u32 ep, const struct rtkit_buffer *bfr,
-                           u64 dva_base)
+/* The IOVA is the DART input address: asc-dram-mask is only part of what the IOP is told. */
+static void rtkit_live_add(struct rtkit_live_state *st, u32 ep, const struct rtkit_buffer *bfr)
 {
     if (!bfr->bfr || !bfr->sz || st->n_buffers >= RTKIT_LIVE_MAX_BUFFERS)
         return;
     struct rtkit_live_buffer *b = &st->buffers[st->n_buffers++];
     b->ep = ep;
     b->flags = bfr->owned ? RTKIT_LIVE_BUFFER_OWNED : 0;
-    b->iova = bfr->dva | dva_base;
+    b->iova = bfr->dva;
     b->phys = (u64)bfr->bfr;
     b->size = bfr->sz;
 }
@@ -877,10 +877,10 @@ bool rtkit_get_live_state(rtkit_dev_t *rtk, struct rtkit_live_state *st)
 
     st->version = rtk->version;
     memcpy(st->epmap, rtk->epmap, sizeof(st->epmap));
-    rtkit_live_add(st, RTKIT_EP_CRASHLOG, &rtk->crashlog_bfr, rtk->dva_base);
-    rtkit_live_add(st, RTKIT_EP_SYSLOG, &rtk->syslog_bfr, rtk->dva_base);
-    rtkit_live_add(st, RTKIT_EP_IOREPORT, &rtk->ioreport_bfr, rtk->dva_base);
-    rtkit_live_add(st, RTKIT_EP_OSLOG, &rtk->oslog_bfr, rtk->dva_base);
+    rtkit_live_add(st, RTKIT_EP_CRASHLOG, &rtk->crashlog_bfr);
+    rtkit_live_add(st, RTKIT_EP_SYSLOG, &rtk->syslog_bfr);
+    rtkit_live_add(st, RTKIT_EP_IOREPORT, &rtk->ioreport_bfr);
+    rtkit_live_add(st, RTKIT_EP_OSLOG, &rtk->oslog_bfr);
     return true;
 }
 

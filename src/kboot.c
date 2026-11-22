@@ -795,18 +795,23 @@ static int dt_reserve_retained_span(u64 start, u64 end)
 /*
  * A DCP handed on running (display_shutdown()) keeps its RTKit session: the next owner must not
  * repeat HELLO/EPMAP, which a running IOP does not answer. Describe that session on the DCP's own
- * node so the kernel can adopt it:
- *   apple,rtkit-live          <1>            version of this description
- *   apple,rtkit-version       <n>            RTKit protocol version the session runs
- *   apple,rtkit-epmap         <8 cells>      endpoint map the IOP announced; cell i holds
- *                                            endpoints 32 * i to 32 * i + 31 (application
- *                                            endpoints included; all are stopped at handoff)
- *   apple,rtkit-live-buffers  <8 cells each> ep, flags (bit 0: loader-owned, inside the
- *                                            reserved range [@lo, @hi)), IOVA (2), physical
- *                                            address (2), size (2) of each system buffer
- * A loader-owned buffer outside that range is not described and the node gets no description,
- * so the kernel keeps its normal boot path. Each loader-owned buffer also gets a reserved-memory
- * region with iommu-addresses (dt_reserve_live_rtkit_buffer()), so that its IOVA stays mapped.
+ * node so the kernel can adopt it, with the RTKit handoff properties other handed-over
+ * co-processors use (apple,rtkit-handoff + apple,rtkit-buffers) plus what a DCP needs on top:
+ *   apple,rtkit-handoff   "dcp-live-v1"
+ *   apple,rtkit-buffers   <ep dva_hi dva_lo size is_mapped> per system buffer: the DART input
+ *                         address, the size, and 1 if the firmware supplied the address (0 if
+ *                         this loader allocated it)
+ *   apple,rtkit-version   <n>        RTKit protocol version the session runs
+ *   apple,rtkit-epmap     <8 cells>  endpoint map the IOP announced; cell i holds endpoints
+ *                                    32 * i to 32 * i + 31 (application endpoints included; all
+ *                                    are stopped at handoff)
+ * Each loader-allocated buffer also gets a reserved-memory region with iommu-addresses
+ * (dt_reserve_live_rtkit_buffer()), so its IOVA stays mapped when the kernel rebuilds the
+ * display DART from those regions. The DCP is already running and DMAs into these buffers, so
+ * this is fail-hard: a loader-allocated buffer outside the reserved range [@lo, @hi), or any
+ * failure to describe it, stops the Linux boot instead of handing over unmapped live DMA.
+ * Called after dt_set_display(), whose handoff paths treat a DCP node that already has a
+ * memory-region as described elsewhere.
  */
 static int dt_reserve_live_rtkit_buffer(const char *path, const char *alias,
                                         const struct rtkit_live_buffer *b);
@@ -821,34 +826,31 @@ static int dt_publish_live_rtkit(u64 lo, u64 hi)
     /* A copy: setting properties moves the rest of the tree, the alias string included. */
     char path[128];
     const char *apath = fdt_get_alias(dt, alias);
-    int node = -1;
-    if (apath && strlen(apath) < sizeof(path)) {
-        strcpy(path, apath);
-        node = fdt_path_offset(dt, path);
-    }
-    if (node < 0) {
+    if (!apath || strlen(apath) >= sizeof(path) || fdt_path_offset(dt, apath) < 0) {
         printf("FDT: live RTKit: no node for alias %s\n", alias);
-        return 0;
+        return -1;
     }
+    strcpy(path, apath);
 
-    fdt32_t bufs[RTKIT_LIVE_MAX_BUFFERS * 8];
+    fdt32_t bufs[RTKIT_LIVE_MAX_BUFFERS * 5];
     for (u32 i = 0; i < st->n_buffers; i++) {
         const struct rtkit_live_buffer *b = &st->buffers[i];
-        if ((b->flags & RTKIT_LIVE_BUFFER_OWNED) &&
-            (b->phys < lo || b->size > hi - lo || b->phys - lo > hi - lo - b->size)) {
-            printf("FDT: live RTKit: %s buffer ep %u [0x%lx+0x%lx) not reserved; not described\n",
-                   alias, b->ep, b->phys, b->size);
-            return 0;
+        bool owned = b->flags & RTKIT_LIVE_BUFFER_OWNED;
+        if (!b->size || b->size > UINT32_MAX) {
+            printf("FDT: live RTKit: %s buffer ep %u size 0x%lx\n", alias, b->ep, b->size);
+            return -1;
         }
-        fdt32_t *c = &bufs[i * 8];
+        if (owned && (b->phys < lo || b->size > hi - lo || b->phys - lo > hi - lo - b->size)) {
+            printf("FDT: live RTKit: %s buffer ep %u [0x%lx+0x%lx) outside [0x%lx, 0x%lx)\n", alias,
+                   b->ep, b->phys, b->size, lo, hi);
+            return -1;
+        }
+        fdt32_t *c = &bufs[i * 5];
         c[0] = cpu_to_fdt32(b->ep);
-        c[1] = cpu_to_fdt32(b->flags);
-        c[2] = cpu_to_fdt32(b->iova >> 32);
-        c[3] = cpu_to_fdt32(b->iova);
-        c[4] = cpu_to_fdt32(b->phys >> 32);
-        c[5] = cpu_to_fdt32(b->phys);
-        c[6] = cpu_to_fdt32(b->size >> 32);
-        c[7] = cpu_to_fdt32(b->size);
+        c[1] = cpu_to_fdt32(b->iova >> 32);
+        c[2] = cpu_to_fdt32(b->iova);
+        c[3] = cpu_to_fdt32(b->size);
+        c[4] = cpu_to_fdt32(!owned);
     }
     /* The names below must not contain a path separator */
     if (strchr(alias, '/'))
@@ -865,9 +867,9 @@ static int dt_publish_live_rtkit(u64 lo, u64 hi)
     /* The reservations above moved the tree: find the node again for every write */
     if (fdt_setprop_u32(dt, fdt_path_offset(dt, path), "apple,rtkit-version", st->version) ||
         fdt_setprop(dt, fdt_path_offset(dt, path), "apple,rtkit-epmap", epmap, sizeof(epmap)) ||
-        fdt_setprop(dt, fdt_path_offset(dt, path), "apple,rtkit-live-buffers", bufs,
-                    st->n_buffers * 8 * sizeof(fdt32_t)) ||
-        fdt_setprop_u32(dt, fdt_path_offset(dt, path), "apple,rtkit-live", 1))
+        fdt_setprop(dt, fdt_path_offset(dt, path), "apple,rtkit-buffers", bufs,
+                    st->n_buffers * 5 * sizeof(fdt32_t)) ||
+        fdt_setprop_string(dt, fdt_path_offset(dt, path), "apple,rtkit-handoff", "dcp-live-v1"))
         return -1;
 
     printf("FDT: %s: live RTKit session v%u, %u system buffer(s), epmap %08x %08x\n", alias,
@@ -12611,6 +12613,8 @@ int kboot_prepare_dt(void *fdt)
 
     bool local_dcp = display_handed_on_live();
     u64 display_heap_end = heapblock_high_water();
+    /* The range kept for a live DCP's buffers, see dt_publish_live_rtkit() */
+    u64 live_rtkit_lo = 0, live_rtkit_hi = 0;
 
     /* Before the tree and anything kboot reserves are allocated */
     kboot_decide_hibernate_layout();
@@ -12705,11 +12709,13 @@ int kboot_prepare_dt(void *fdt)
             if (heap_end > ram_end || dt_reserve_retained_span(heap_start, heap_end))
                 bail("FDT: couldn't reserve retained heap\n");
             image_end = heap_start;
+            live_rtkit_hi = heap_end;
             printf("FDT: retained heap [0x%lx, 0x%lx)\n", heap_start, heap_end);
-            if (local_dcp && dt_publish_live_rtkit(image_start, heap_end))
-                bail("FDT: couldn't describe the live DCP RTKit session\n");
         }
     }
+    /* The loader-allocated buffers of a DCP handed on running must lie in what is kept. */
+    live_rtkit_lo = image_start;
+    live_rtkit_hi = max(live_rtkit_hi, image_end);
     if (dt_reserve_retained_span(image_start, image_end))
         bail("FDT: couldn't add reservation for aura and inherited high-water\n");
 
@@ -12862,6 +12868,9 @@ int kboot_prepare_dt(void *fdt)
                 return -1;
         }
     }
+    /* After dt_set_display(): see dt_publish_live_rtkit() */
+    if (local_dcp && dt_publish_live_rtkit(live_rtkit_lo, live_rtkit_hi))
+        bail("FDT: couldn't describe the live DCP RTKit session\n");
     /*
      * The first core of a cluster has a power-gate slot here, and iBoot leaves the boot core's
      * clear, so that core and its cluster never power off. macOS sets it at every boot. T6040

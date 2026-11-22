@@ -7,9 +7,13 @@ stand-in with the shape the M2 Mac mini's dcpext hands on: a firmware-placed cra
 loader-owned buffers (syslog, ioreport).
 
 Checked: the description lands on the DCP's node even though the buffer reservations move the
-tree first; every loader-owned buffer gets a reserved-memory region whose iommu-addresses name
-the DCP and the buffer's IOVA, referenced from the DCP's memory-region; a firmware-placed buffer
-gets none; and a loader-owned buffer outside the reserved range leaves the tree untouched.
+tree first, with the RTKit handoff properties other handed-over co-processors use
+(apple,rtkit-handoff "dcp-live-v1", apple,rtkit-buffers in <ep dva_hi dva_lo size is_mapped>
+tuples) plus apple,rtkit-version and apple,rtkit-epmap; every loader-owned buffer gets a
+reserved-memory region whose iommu-addresses name the DCP and the buffer's IOVA, referenced from
+the DCP's memory-region; a firmware-placed buffer gets none and is_mapped 1; and a loader-owned
+buffer outside the reserved range fails the boot (the DCP is already running and DMAs into it)
+without describing anything.
 """
 from pathlib import Path
 import os
@@ -154,10 +158,15 @@ def test_description_and_buffer_regions(harness):
                          capture_output=True, text=True)
     assert run.returncode == 0, run.stdout
     dcp = "/soc/dcp@271c00000"
-    assert _fdt_cells(out, dcp, "apple,rtkit-live") == [1]
+    assert _fdt_strings(out, dcp, "apple,rtkit-handoff") == ["dcp-live-v1"]
     assert _fdt_cells(out, dcp, "apple,rtkit-version") == [12]
     assert _fdt_cells(out, dcp, "apple,rtkit-epmap") == [0x11f, 0x821fff, 0, 0, 0, 0, 0, 0]
-    assert len(_fdt_cells(out, dcp, "apple,rtkit-live-buffers")) == 3 * 8
+    assert _fdt_cells(out, dcp, "apple,rtkit-buffers") == [
+        1, 0x8, 0x02424000, 0x10000, 1,
+        2, 0x8, 0x10004000, 0x4000, 0,
+        4, 0x8, 0x10000000, 0x4000, 0]
+    assert _fdt_cells(out, dcp, "apple,rtkit-live") is None
+    assert _fdt_cells(out, dcp, "apple,rtkit-live-buffers") is None
     phandle = _fdt_cells(out, dcp, "phandle")
     assert phandle and phandle[0]
     assert _fdt_strings(out, dcp, "memory-region-names") == ["rtkit-ep2", "rtkit-ep4"]
@@ -174,13 +183,27 @@ def test_description_and_buffer_regions(harness):
     assert _fdt_cells(out, "/reserved-memory/dcpext-rtkit-ep1@9e5010000", "reg") is None
 
 
-def test_unreserved_owned_buffer_leaves_the_tree_alone(harness):
+def test_unreserved_owned_buffer_fails_the_boot(harness):
     exe, dtb, tmp = harness
     out = tmp / "unreserved.dtb"
     # The reserved range misses the syslog buffer
     run = subprocess.run([str(exe), str(dtb), str(out), "0x80695c000", "0x806960000"],
                          capture_output=True, text=True)
-    assert run.returncode == 0, run.stdout
-    assert "not reserved; not described" in run.stdout
-    assert _fdt_cells(out, "/soc/dcp@271c00000", "apple,rtkit-live") is None
+    assert run.returncode == 1, run.stdout
+    assert "buffer ep 2 [0x80696c000+0x4000) outside [0x80695c000, 0x806960000)" in run.stdout
+    assert _fdt_cells(out, "/soc/dcp@271c00000", "apple,rtkit-handoff") is None
     assert _fdt_cells(out, "/soc/dcp@271c00000", "memory-region") is None
+
+
+def test_missing_node_fails_the_boot(harness):
+    exe, dtb, tmp = harness
+    out = tmp / "nonode.dtb"
+    nodts = tmp / "nonode.dts"
+    nodts.write_text(DTS.replace('dcpext = "/soc/dcp@271c00000";', 'dcpext = "/soc/dcp@0";'))
+    nodtb = tmp / "nonode.dtb.in"
+    subprocess.run(["dtc", "-q", "-I", "dts", "-O", "dtb", "-o", str(nodtb), str(nodts)],
+                   check=True)
+    run = subprocess.run([str(exe), str(nodtb), str(out), "0x806000000", "0x807000000"],
+                         capture_output=True, text=True)
+    assert run.returncode == 1, run.stdout
+    assert "no node for alias dcpext" in run.stdout
