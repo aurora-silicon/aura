@@ -57,6 +57,45 @@ fn install(blob: Vec<u8>, size: usize) -> *const c_void {
     }
 }
 
+/// A property's value is its own `size` bytes: a string without a NUL inside
+/// them must not run on into what follows the property.
+fn value_ends_at_its_size() {
+    let mut blob = Vec::new();
+    node(&mut blob, &[("name", b"abcd")], 0);
+    let size = blob.len();
+    // What follows the ADT image in memory holds a NUL.
+    blob.extend_from_slice(b"XYZ\0");
+    let adt_ptr = install(blob, size);
+    unsafe {
+        assert!(parser::adt_get_name(adt_ptr, 0).is_null());
+        let name = CString::new("name").unwrap();
+        let mut len = 0;
+        let value = parser::adt_getprop(adt_ptr, 0, name.as_ptr(), &mut len);
+        assert!(!value.is_null());
+        assert_eq!(len, 4);
+    }
+
+    let mut blob = Vec::new();
+    node(
+        &mut blob,
+        &[("name", b"ok\0\0"), ("compatible", b"a\0bcd")],
+        0,
+    );
+    let size = blob.len();
+    blob.extend_from_slice(b"\0\0\0\0");
+    let adt_ptr = install(blob, size);
+    unsafe {
+        assert_eq!(
+            CStr::from_ptr(parser::adt_get_name(adt_ptr, 0)).to_bytes(),
+            b"ok"
+        );
+        let a = CString::new("a").unwrap();
+        let bcd = CString::new("bcd").unwrap();
+        assert!(parser::adt_is_compatible_at(adt_ptr, 0, a.as_ptr(), 0));
+        assert!(!parser::adt_is_compatible_at(adt_ptr, 0, bcd.as_ptr(), 1));
+    }
+}
+
 /// The C entry points return their error value for an offset that is not a
 /// node or property, or a node they cannot read, instead of panicking (which
 /// reboots aura), so that the ADT_FOREACH_* loops can stop on it.
@@ -301,4 +340,5 @@ fn main() {
     }
     register_paths();
     c_api_errors_instead_of_panics();
+    value_ends_at_its_size();
 }

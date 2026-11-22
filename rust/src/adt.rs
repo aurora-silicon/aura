@@ -587,17 +587,16 @@ impl ADTProperty {
     /// Create a Rust fat pointer to the ADTProperty at ptr.
     ///
     /// We need to do this manually since we do not know the size of
-    /// ADTProperty.value beforehand.
+    /// ADTProperty.value beforehand. The metadata of a pointer to a struct
+    /// whose last field is a slice is the length of that slice, so it is the
+    /// size of the value alone, not of the whole property.
     fn fat_ptr(ptr: *const u8) -> *mut ADTProperty {
         // SAFETY: This function is only ever called when we can guarantee that
         // ptr points to a valid ADTProperty.
         unsafe {
-            let sp: *const [u8] = core::slice::from_raw_parts(
+            let sp: *const [u8] = core::ptr::slice_from_raw_parts(
                 ptr,
-                // Size of name, size of size, size of value
-                size_of::<[c_char; 32]>()
-                    + size_of::<u32>()
-                    + core::ptr::read_unaligned(ptr.add(32) as *const u32) as usize,
+                core::ptr::read_unaligned(ptr.add(32) as *const u32) as usize,
             );
 
             sp as *mut ADTProperty
