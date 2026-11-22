@@ -3709,19 +3709,59 @@ static int dcpext_pipe(void *dt, struct dcpext *x)
     return pipe;
 }
 
+/* The power states a processor's clock-gates resolve to: each gate, then its parents */
+struct dcpext_ps {
+    u64 addr;
+    const char *name;
+    bool gate; /* the processor's own device: requested is enough */
+};
+
+/*
+ * Add gate g and every parent above it (both PMGR parents of each device) up to the first virtual
+ * one. A register seen both as a gate and as a parent must be on.
+ */
+static int dcpext_ps_add(struct dcpext_ps *ps, int *n, const struct pmgr_gate *g, int depth,
+                         const char *name, u32 i)
+{
+    if (!g->found || (!depth && g->virt) || depth >= DCP6_GATE_DEPTH)
+        bail("%s: clock-gates[%u] does not resolve to PMGR power states\n", name, i);
+    if (g->virt)
+        return 0;
+    if (!g->psreg)
+        bail("%s: %.16s has no power state register\n", name, g->name);
+    int k;
+    for (k = 0; k < *n && ps[k].addr != g->psreg; k++)
+        ;
+    if (k == *n) {
+        if (*n >= DCP6_PS_MAX)
+            bail("%s: clock-gates[%u] resolves to more than %d power states\n", name, i,
+                 DCP6_PS_MAX);
+        ps[(*n)++] = (struct dcpext_ps){g->psreg, g->name, !depth};
+    } else if (depth) {
+        ps[k].gate = false;
+    }
+    for (int p = 0; p < 2; p++) {
+        struct pmgr_gate parent;
+        if (!g->parent[p])
+            continue;
+        if (pmgr_device_gate(g->die, g->parent[p], &parent) < 0)
+            bail("%s: a parent of clock-gates[%u] is not in the PMGR table\n", name, i);
+        if (dcpext_ps_add(ps, n, &parent, depth + 1, name, i))
+            return -1;
+    }
+    return 0;
+}
+
 /*
  * /arm-io/<name> is powered as iBoot leaves a processor it started: each PMGR device its ADT
  * clock-gates name is requested (the hardware gates an idle processor's CPU domain by itself), and
- * each parent above it, up to the first virtual one, is on (DISPEXTn_CPU, then _FE and _SYS on the
- * T8132). Through the ADT's PMGR table; the power state registers are only read, guarded.
+ * each parent above it, through both parents of every device, up to the first virtual one, is on
+ * (DISPEXTn_CPU, then _FE and _SYS on the T8132). Through the ADT's PMGR table; the power state
+ * registers are only read, guarded.
  */
 static int dcpext_powered(const char *name)
 {
-    struct {
-        u64 addr;
-        const char *name;
-        bool gate;
-    } ps[DCP6_PS_MAX];
+    struct dcpext_ps ps[DCP6_PS_MAX];
     char path[DCP6_NAME_LEN + 16];
     u32 val[DCP6_PS_MAX];
     int n = 0;
@@ -3731,21 +3771,8 @@ static int dcpext_powered(const char *name)
         struct pmgr_gate g;
         if (pmgr_adt_gate(path, "clock-gates", i, &g) < 0)
             break;
-        for (int depth = 0;; depth++) {
-            if (!g.found || (!depth && g.virt) || depth >= DCP6_GATE_DEPTH || n >= DCP6_PS_MAX)
-                bail("%s: clock-gates[%u] does not resolve to PMGR power states\n", name, i);
-            if (g.virt)
-                break;
-            if (!g.psreg)
-                bail("%s: %.16s has no power state register\n", name, g.name);
-            ps[n].addr = g.psreg;
-            ps[n].name = g.name;
-            ps[n++].gate = !depth;
-            if (!g.parent[0])
-                break;
-            if (pmgr_device_gate(g.die, g.parent[0], &g) < 0)
-                bail("%s: a parent of clock-gates[%u] is not in the PMGR table\n", name, i);
-        }
+        if (dcpext_ps_add(ps, &n, &g, 0, name, i))
+            return -1;
     }
     if (!n)
         bail("%s: no ADT clock-gates to check its power by\n", name);
