@@ -365,14 +365,12 @@ static void j873g_run_proxy(void)
     j873_pcie_prep();
     printf("Initialization complete.\n");
 
-    /* An appended payload (or boot= from storage) boots directly. */
-#ifdef SECBOOT_SECURE_FLAVOUR
-    /* The secure flavour has no proxy (secboot_host_proxy_allowed()): always boot the payload. */
-    const bool check_payloads = true;
-#else
-    const bool check_payloads = !aura_proxy_enabled();
-#endif
-    if (check_payloads) {
+    /*
+     * An appended payload (or boot= from storage) boots directly, unless aura-proxy asks for the
+     * proxy first and this stage may give one: never in the secure flavour or while enforcing.
+     */
+    const bool proxy_request = aura_proxy_enabled() && secboot_host_proxy_allowed();
+    if (!proxy_request) {
         printf("Checking for payloads...\n");
         if (payload_run() == 0) {
             printf("Valid payload found\n");
@@ -381,16 +379,15 @@ static void j873g_run_proxy(void)
         }
         printf("No valid payload found\n");
     }
-#ifdef SECBOOT_SECURE_FLAVOUR
-    printf("\nSecure boot: no verified next stage could be started, and this build gives\n"
-           "  no USB host a proxy. Rebooting in 10 s.\n");
-    mdelay(10000);
-    flush_and_reboot();
-#else
+    if (!secboot_host_proxy_allowed()) {
+        printf("\nSecure boot: no verified next stage could be started, and this build gives\n"
+               "  no USB host a proxy. Rebooting in 10 s.\n");
+        mdelay(10000);
+        flush_and_reboot();
+    }
     j873g_debugport_check();
     printf("Running proxy...\n");
     uartproxy_run(NULL);
-#endif
 }
 
 void aura_main(void)
