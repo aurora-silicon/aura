@@ -450,6 +450,26 @@ int dcp_handoff(dcp_dev_t *dcp)
     return ret;
 }
 
+static bool dcp_handed_on;
+
+/*
+ * Hand a running DCP on to the next stage: its endpoints stopped (dcp_handoff()), RTKit, its
+ * buffers and DART mappings and the scanout left running. It counts as running from here on, so
+ * it is not started again and the next stage keeps its memory (kboot reserves the heap).
+ */
+int dcp_hand_on(dcp_dev_t *dcp)
+{
+    int ret = dcp_handoff(dcp);
+    dcp_running = true;
+    dcp_handed_on = !ret;
+    return ret;
+}
+
+bool dcp_handed_on_live(void)
+{
+    return dcp_handed_on;
+}
+
 int dcp_shutdown(dcp_dev_t *dcp, bool sleep)
 {
     /* The ASCWrap-v8 sleep path needs a PMGR2 reset, which is not implemented

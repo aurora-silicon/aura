@@ -1205,6 +1205,24 @@ static int display_handoff_t8152(void)
     return ret;
 }
 
+/*
+ * Once a dptx-port that speaks AFKv2 has been connected, its DCP acknowledges no power request:
+ * on the M2 Mac mini with the 27.2 firmware neither AP QUIESCED or IDLE nor IOP SLEEP is answered,
+ * even after the display is released and powered off. It cannot be slept or quiesced, so it is
+ * handed on running, as the T8152 and T8132 displays are, with the display left lit: the next
+ * stage keeps showing the framebuffer.
+ */
+static bool display_dptx_hands_on(void)
+{
+    return display_is_dptx && dcp && dcp_dptx_is_afkv2(dcp->dptx_ep);
+}
+
+/* Whether a DCP was handed on running; its buffers stay in this stage's heap. */
+bool display_handed_on_live(void)
+{
+    return dcp_handed_on_live();
+}
+
 int display_shutdown(dcp_shutdown_mode mode)
 {
     if (chip_id == T8152 && mode == DCP_HANDOFF)
@@ -1223,6 +1241,11 @@ int display_shutdown(dcp_shutdown_mode mode)
         /* An endpoint that does not stop stays registered, so dcp_shutdown()
          * retries it with the rest and reports the DCP as still running. */
         dcp_ib_shutdown(iboot);
+        if (display_dptx_hands_on()) {
+            printf("display: handing the DCP on running (its dptx-port speaks AFKv2)\n");
+            iboot = NULL;
+            return dcp_hand_on(dcp) < 0 ? -1 : 0;
+        }
         switch (mode) {
             case DCP_QUIESCED:
                 printf("display: Quiescing DCP (unconditional)\n");
@@ -1243,6 +1266,7 @@ int display_shutdown(dcp_shutdown_mode mode)
         iboot = NULL;
     }
 
-    /* A DCP that did not stop at any point may still use its buffers. */
-    return dcp_left_running() ? -1 : 0;
+    /* A DCP that did not stop at any point may still use its buffers; one handed on running
+     * keeps them on purpose. */
+    return dcp_left_running() && !dcp_handed_on_live() ? -1 : 0;
 }

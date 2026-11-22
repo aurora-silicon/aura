@@ -12514,7 +12514,8 @@ int kboot_prepare_dt(void *fdt)
      * or powered off: they must stay out of Linux's allocator (J616C: ANS syslog lines in
      * page-cache pages at the SART-allowed heap addresses).
      */
-    if (nvme_post_m4()) {
+    /* A DCP handed on running keeps its RTKit buffers in this stage's heap too. */
+    if (nvme_post_m4() || display_handed_on_live()) {
         u64 ram_end, inherited = cur_boot_args.top_of_kernel_data;
         u64 high_water = heapblock_high_water();
 
